@@ -454,6 +454,7 @@ static placement_plan make_plan_from_kv_info(const placement_kv_info & kv, int d
     plan.planner_n_ubatch   = kv.n_ubatch;
     plan.planner_n_seq_max  = kv.n_seq_max;
     plan.planner_kv_unified = kv.kv_unified;
+    plan.planner_swa_full   = kv.swa_full;
     return plan;
 }
 
@@ -650,6 +651,153 @@ static void test_tier_manager_truth_exceeding_buffer_warns_and_falls_back() {
     check_eq("over-size: device bytes equal the buffer, not the truth", device_bytes_in_mask(layout, mask), total);
 }
 
+// ---------------------------------------------------------------------------
+// llama.cpp-uajm: llama_context_default_params() sets swa_full=true (full-size
+// SWA cache) while common/common.h defaults it false, so every CLI tool runs
+// window-sized SWA caches and never exercised the planner against the raw-API
+// default. With swa_full, llama_kv_cache_iswa::llama_kv_cache_iswa()
+// (src/llama-kv-cache-iswa.cpp) sets size_swa = size_base -- an SWA layer's
+// cache is then n_ctx_seq cells per stream, i.e. byte-identical to a FULL
+// layer of the same width -- and the planned window-sized slab overflows at
+// context init: "[KV-REMAP] ERROR: cache_k_l0 overflows layer alloc!
+// off_in_layer=0 + nbytes=4194304 > la.size=1572864" on GPT-OSS 20B at
+// -c 4096 -ub 512 (4194304 = 4096 cells * 512 * 2 B, K alone; 1572864 =
+// 768 cells * 1024 * 2 B, the windowed K+V slab). Cases (l)-(o) pin that the
+// plan describes what llama actually allocates in BOTH modes.
+// ---------------------------------------------------------------------------
+
+// (l) placement_kv_info::kv_bytes_for_layer() honours swa_full: the exact
+//     shape from the ticket (GPT-OSS 20B, n_ctx=4096, n_ubatch=512,
+//     n_seq_max=1, kv_unified=false). swa_full=false keeps the windowed
+//     1572864; swa_full=true must be the full-layer 8388608 (K 4194304 + V
+//     4194304). FULL layers are unaffected either way.
+static void test_gptoss_swa_full_sizes_swa_layers_as_full() {
+    printf("(l) gpt-oss-20b, swa_full honoured by kv_bytes_for_layer(), n_ctx=4096 n_ubatch=512 n_seq_max=1\n");
+    placement_kv_info kv = make_gptoss_20b(4096, 512, 1, /*kv_unified=*/false);
+
+    kv.swa_full = false;
+    check_eq("(l) gpt-oss l0 (SWA), swa_full=false", kv.kv_bytes_for_layer(0), 1572864u);
+    check_eq("(l) gpt-oss l1 (FULL), swa_full=false", kv.kv_bytes_for_layer(1), 8388608u);
+    check_eq("(l) aggregate kv_bytes_per_swa_layer(), swa_full=false", kv.kv_bytes_per_swa_layer(), 1572864u);
+
+    kv.swa_full = true;
+    check_eq("(l) gpt-oss l0 (SWA), swa_full=true", kv.kv_bytes_for_layer(0), 8388608u);
+    check_eq("(l) gpt-oss l0 (SWA) equals a FULL layer when swa_full", kv.kv_bytes_for_layer(0),
+             kv.kv_bytes_for_layer(1));
+    check_eq("(l) gpt-oss l1 (FULL), swa_full=true", kv.kv_bytes_for_layer(1), 8388608u);
+    check_eq("(l) aggregate kv_bytes_per_swa_layer(), swa_full=true", kv.kv_bytes_per_swa_layer(), 8388608u);
+
+    // Multi-stream (kv_unified=false, n_seq_max=4): size_swa = size_base =
+    // n_ctx_seq = 1024 per stream, 4 streams -> 4096 cells total -- still
+    // the FULL byte count, in both kv_unified modes.
+    for (bool kv_unified : { false, true }) {
+        placement_kv_info kv4 = make_gptoss_20b(4096, 512, 4, kv_unified);
+        kv4.swa_full          = true;
+        char label[96];
+        snprintf(label, sizeof(label), "(l) gpt-oss l0 (SWA), swa_full=true, n_seq_max=4, kv_unified=%d",
+                 (int) kv_unified);
+        check_eq(label, kv4.kv_bytes_for_layer(0), 8388608u);
+    }
+
+    // SHARED layers stay at 0 regardless of swa_full (Gemma 4 E4B l24).
+    placement_kv_info g = make_gemma4_e4b(4096, 512, 1, /*kv_unified=*/false);
+    g.swa_full          = true;
+    check_eq("(l) gemma4 l24 (SHARED), swa_full=true", g.kv_bytes_for_layer(24), 0u);
+    check_eq("(l) gemma4 l0 (SWA, width 512), swa_full=true", g.kv_bytes_for_layer(0), 4096ull * 1024 * 2);
+}
+
+// (m) placement_plan::kv_size_for_layer() -- the function the runtime
+//     transaction body and the tier manager actually query -- must honour
+//     planner_swa_full the same way, and agree with kv_bytes_for_layer()
+//     layer-for-layer in both modes.
+static void test_plan_kv_size_for_layer_honours_swa_full() {
+    printf("(m) placement_plan::kv_size_for_layer() honours planner_swa_full\n");
+    for (bool swa_full : { false, true }) {
+        placement_kv_info kv = make_gptoss_20b(4096, 512, 1, /*kv_unified=*/false);
+        kv.swa_full          = swa_full;
+        // make_plan_from_kv_info() mirrors every planner_* field, swa_full
+        // included, the way compute_placement_plan() does.
+        placement_plan plan  = make_plan_from_kv_info(kv, /*device=*/0);
+
+        char label[96];
+        snprintf(label, sizeof(label), "(m) plan l0 (SWA), planner_swa_full=%d", (int) swa_full);
+        check_eq(label, plan.kv_size_for_layer(0), swa_full ? 8388608u : 1572864u);
+        for (uint32_t il = 0; il < kv.n_layer; ++il) {
+            snprintf(label, sizeof(label), "(m) layer %u, swa_full=%d agrees with kv_info", il, (int) swa_full);
+            check_eq(label, plan.kv_size_for_layer(il), kv.kv_bytes_for_layer(il));
+        }
+    }
+}
+
+// (n) kv_tier_manager::configure_from_plan() sizes each SWA layer from the
+//     plan's swa_full-aware truth: an SWA buffer llama allocated at
+//     swa_full=true is 12 x 8388608 B on GPT-OSS 20B; the truth must match
+//     it exactly (no "[KV-TIER] per-layer KV truth ... under-sizes" WARN,
+//     no fallback to the slice), and every SWA layer's tier size must be the
+//     full-layer 8388608, never the windowed 1572864 the defect reserved.
+static void test_tier_manager_honours_swa_full() {
+    printf("(n) kv_tier_manager::configure_from_plan() sizes SWA layers from the swa_full-aware plan\n");
+    placement_kv_info kv = make_gptoss_20b(4096, 512, 1, /*kv_unified=*/false);
+    kv.swa_full          = true;
+    placement_plan plan  = make_plan_from_kv_info(kv, /*device=*/0);
+    plan.swa_layer_mask.assign(kv.n_layer, false);
+    for (uint32_t il = 0; il < kv.n_layer; ++il) {
+        plan.swa_layer_mask[il] = kv.layer_kind[il] == GGML_SYCL_KV_LAYER_SWA;
+    }
+
+    const auto   mask  = kv_buffer_mask(kv, GGML_SYCL_KV_LAYER_SWA);
+    const size_t total = 12u * 8388608u;  // what llama_kv_cache_iswa allocates with swa_full
+    check_eq("(n) SWA buffer: mask covers 12 layers", count_mask(mask), 12u);
+    const auto slice = kv_slice_size::from_layer_mask(total, 12);
+
+    g_log.clear();
+    kv_tier_manager mgr;
+    mgr.configure_from_plan(0, plan, kv.n_layer, slice, &mask);
+
+    check_eq("(n) SWA buffer, swa_full=true: l0 tier size", mgr.kv_layer_size(0), 8388608u);
+    check_eq("(n) SWA buffer, swa_full=true: l1 (FULL) tier size", mgr.kv_layer_size(1), 8388608u);
+    for (uint32_t il = 0; il < kv.n_layer; ++il) {
+        if (mask[il]) {
+            check_eq("(n) SWA buffer, swa_full=true: every SWA layer", mgr.kv_layer_size(il), 8388608u);
+        }
+    }
+    const auto layout = mgr.compute_region_layout(total);
+    check_eq("(n) SWA buffer, swa_full=true: device bytes reserved equal the buffer",
+             device_bytes_in_mask(layout, mask), total);
+    check_true("(n) SWA buffer, swa_full=true: no sizing WARN -- the truth matches the buffer",
+               g_log.find("[KV-TIER] per-layer KV truth") == std::string::npos);
+}
+
+// (o) The regression guard for the mode every CLI tool runs: the same
+//     buffer allocated at swa_full=false is 12 x 1572864 B, and the plan at
+//     planner_swa_full=false must match it exactly -- honouring swa_full must
+//     not move the windowed answer.
+static void test_tier_manager_swa_full_false_unchanged() {
+    printf("(o) configure_from_plan() at swa_full=false keeps the windowed sizes\n");
+    placement_kv_info kv = make_gptoss_20b(4096, 512, 1, /*kv_unified=*/false);
+    kv.swa_full          = false;
+    placement_plan plan  = make_plan_from_kv_info(kv, /*device=*/0);
+    plan.swa_layer_mask.assign(kv.n_layer, false);
+    for (uint32_t il = 0; il < kv.n_layer; ++il) {
+        plan.swa_layer_mask[il] = kv.layer_kind[il] == GGML_SYCL_KV_LAYER_SWA;
+    }
+
+    const auto   mask  = kv_buffer_mask(kv, GGML_SYCL_KV_LAYER_SWA);
+    const size_t total = 12u * 1572864u;
+    const auto   slice = kv_slice_size::from_layer_mask(total, 12);
+
+    g_log.clear();
+    kv_tier_manager mgr;
+    mgr.configure_from_plan(0, plan, kv.n_layer, slice, &mask);
+
+    check_eq("(o) SWA buffer, swa_full=false: l0 tier size", mgr.kv_layer_size(0), 1572864u);
+    const auto layout = mgr.compute_region_layout(total);
+    check_eq("(o) SWA buffer, swa_full=false: device bytes reserved equal the buffer",
+             device_bytes_in_mask(layout, mask), total);
+    check_true("(o) SWA buffer, swa_full=false: no sizing WARN",
+               g_log.find("[KV-TIER] per-layer KV truth") == std::string::npos);
+}
+
 int main() {
     // Hermetic: GGML_SYCL_KV_HOT_LAYERS short-circuits configure_from_plan()
     // before any per-layer sizing, so a stray value in the environment would
@@ -678,6 +826,12 @@ int main() {
     test_tier_manager_legacy_split_without_truth();
     test_tier_manager_truth_under_sizing_buffer_falls_back();
     test_tier_manager_truth_exceeding_buffer_warns_and_falls_back();
+
+    printf("=== swa_full honoured: SWA layers sized as FULL when llama allocates them so (llama.cpp-uajm) ===\n");
+    test_gptoss_swa_full_sizes_swa_layers_as_full();
+    test_plan_kv_size_for_layer_honours_swa_full();
+    test_tier_manager_honours_swa_full();
+    test_tier_manager_swa_full_false_unchanged();
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     if (g_fail > 0) {

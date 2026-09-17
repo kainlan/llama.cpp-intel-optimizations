@@ -566,11 +566,12 @@ TEST(atomic_write) {
 // ever running against the real cache directory unsandboxed.
 // =============================================================================
 
-// Test: CACHE_VERSION was bumped to 3 (llama.cpp-3aos, UbatchCacheKey::
-// kv_unified) -- v1 stays reserved for the pre-existing matmul
-// dispatch-tuning format alone, v2 for the pre-kv_unified ubatch key shape.
-TEST(cache_version_is_3) {
-    ASSERT(CACHE_VERSION == 3);
+// Test: CACHE_VERSION was bumped to 4 (llama.cpp-uajm, UbatchCacheKey::
+// swa_full) -- v1 stays reserved for the pre-existing matmul
+// dispatch-tuning format alone, v2 for the pre-kv_unified ubatch key shape,
+// v3 (llama.cpp-3aos) for the pre-swa_full one.
+TEST(cache_version_is_4) {
+    ASSERT(CACHE_VERSION == 4);
     return true;
 }
 
@@ -641,6 +642,15 @@ TEST(ubatch_key_equality) {
     b.kv_unified = !a.kv_unified;
     ASSERT(a != b);
 
+    // llama.cpp-uajm: swa_full must independently affect equality too --
+    // added in CACHE_VERSION 4 once SWA-layer KV sizing started depending
+    // on it (an SWA layer is sized as FULL when llama allocates it so).
+    a.swa_full = false;
+    b          = a;
+    ASSERT(a == b);
+    b.swa_full = !a.swa_full;
+    ASSERT(a != b);
+
     return true;
 }
 
@@ -651,7 +661,7 @@ TEST(ubatch_kv_mode_json_roundtrip) {
         "{\"device_key\":\"Dev@1.0\",\"model_name\":\"mode-regression\","
         "\"model_size\":4096,\"model_hash\":17,\"n_ctx\":4096,\"n_batch\":2048,"
         "\"flash_attn\":true,\"n_seq_max\":4,\"type_k\":1,\"type_v\":1,"
-        "\"device_set_hash\":23,\"kv_unified\":";
+        "\"device_set_hash\":23,\"swa_full\":false,\"kv_unified\":";
     const UbatchCacheKey separate = ubatch_key_from_json(prefix + "false}");
     const UbatchCacheKey unified  = ubatch_key_from_json(prefix + "true}");
     // Positive parse controls must pass before the mode distinction is tested.
@@ -668,6 +678,37 @@ TEST(ubatch_kv_mode_json_roundtrip) {
     ASSERT(separate_restored == separate);
     ASSERT(unified_restored == unified);
     ASSERT(separate_restored != unified_restored);
+    return true;
+}
+
+// llama.cpp-uajm: the swa_full half of the persisted key boundary. A raw-API
+// context (llama_context_default_params(): swa_full=true) and a CLI run
+// (common's default: swa_full=false) differ ONLY in this field, and their
+// plans' KV bytes differ (an SWA layer is sized as FULL under swa_full), so
+// the two must parse, round-trip, and compare as distinct keys.
+TEST(ubatch_swa_full_json_roundtrip) {
+    const std::string prefix =
+        "{\"device_key\":\"Dev@1.0\",\"model_name\":\"swa-full-regression\","
+        "\"model_size\":4096,\"model_hash\":17,\"n_ctx\":4096,\"n_batch\":2048,"
+        "\"flash_attn\":true,\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,"
+        "\"device_set_hash\":23,\"kv_unified\":false,\"swa_full\":";
+    const UbatchCacheKey windowed = ubatch_key_from_json(prefix + "false}");
+    const UbatchCacheKey full     = ubatch_key_from_json(prefix + "true}");
+    ASSERT(windowed.model_name == "swa-full-regression");
+    ASSERT(windowed.swa_full == false);
+    ASSERT(full.swa_full == true);
+    ASSERT(full.n_ctx == windowed.n_ctx && full.kv_unified == windowed.kv_unified);
+    ASSERT(windowed != full);
+
+    const UbatchCacheKey windowed_restored = ubatch_key_from_json("{" + ubatch_key_to_json(windowed) + "}");
+    const UbatchCacheKey full_restored     = ubatch_key_from_json("{" + ubatch_key_to_json(full) + "}");
+    ASSERT(windowed_restored == windowed);
+    ASSERT(full_restored == full);
+    ASSERT(windowed_restored != full_restored);
+    // The serialized form must carry the field by name -- a writer that
+    // silently dropped it would still round-trip through the default.
+    ASSERT(ubatch_key_to_json(full).find("\"swa_full\":true") != std::string::npos);
+    ASSERT(ubatch_key_to_json(windowed).find("\"swa_full\":false") != std::string::npos);
     return true;
 }
 
@@ -822,6 +863,40 @@ TEST(ubatch_cache_v2_file_rejected) {
     ASSERT(loaded.empty());
 
     std::remove(path.c_str());
+    return true;
+}
+
+// Test: a v3 ubatch cache file (the pre-llama.cpp-uajm shape: entries with
+// a "kv_unified" key but no "swa_full" key) is rejected now that
+// CACHE_VERSION is 4 -- the RED case this bump exists for: without it a v3
+// entry written by a CLI run (swa_full=false, the field absent) would parse
+// with swa_full defaulting to false and could then falsely MATCH a real
+// swa_full=false lookup, or be consulted for a swa_full=true raw-API context
+// whose KV bytes it was never validated against.
+TEST(ubatch_cache_v3_file_rejected) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_v3_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchV3Device_" + std::to_string(getpid());
+
+    create_dir_recursive(cache_dir);
+    std::string   path = get_ubatch_cache_file(cache_dir, device_name);
+    std::ofstream f(path);
+    f << "{\n";
+    f << "  \"version\": 3,\n";
+    f << "  \"device\": \"" << device_name << "\",\n";
+    f << "  \"entries\": [{\"key\":{\"device_key\":\"Dev@1.0\",\"model_name\":\"m\",\"model_size\":0,"
+      << "\"model_hash\":0,\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":false,\"n_seq_max\":1,"
+      << "\"type_k\":0,\"type_v\":0,\"device_set_hash\":0,\"kv_unified\":false},\"n_ubatch\":512,"
+      << "\"reason\":\"ladder\",\"created\":\"2026-09-17T06:00:00Z\"}]\n";
+    f << "}\n";
+    f.close();
+
+    std::vector<UbatchCacheEntry> loaded;
+    bool                          result = load_ubatch_cache(cache_dir, device_name, loaded);
+    ASSERT(result == false);
+    ASSERT(loaded.empty());
+
+    std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
     return true;
 }
 
@@ -1198,13 +1273,15 @@ int main() {
     RUN_TEST(parse_string_edge_cases);
     RUN_TEST(atomic_write);
 
-    RUN_TEST(cache_version_is_3);
+    RUN_TEST(cache_version_is_4);
     RUN_TEST(ubatch_key_equality);
     RUN_TEST(ubatch_kv_mode_json_roundtrip);
+    RUN_TEST(ubatch_swa_full_json_roundtrip);
     RUN_TEST(ubatch_entry_serialization);
     RUN_TEST(ubatch_cache_file_roundtrip);
     RUN_TEST(ubatch_cache_v1_file_rejected);
     RUN_TEST(ubatch_cache_v2_file_rejected);
+    RUN_TEST(ubatch_cache_v3_file_rejected);
     RUN_TEST(ubatch_cache_unwritable_dir);
     RUN_TEST(ubatch_cache_load_missing_file);
     RUN_TEST(ubatch_cache_string_escaping_roundtrip);

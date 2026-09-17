@@ -88,7 +88,12 @@ inline long sycl_tuning_getpid() {
 // the v1->v2 bump already fixed for n_seq_max/type_k/type_v/device_set_hash.
 // Bumping the shared version rejects every v2 (and v1) file of either kind
 // cleanly, same mechanism as above.
-constexpr int CACHE_VERSION = 3;
+// v4 (llama.cpp-uajm): adds UbatchCacheKey::swa_full. Same shape again: a
+// v3 entry has no "swa_full" key, would parse as swa_full=false, and could
+// then match a real swa_full=false lookup (or be the only entry consulted
+// for a swa_full=true raw-API context) although it was written before SWA
+// layers were sized by that flag at all.
+constexpr int CACHE_VERSION = 4;
 
 // =============================================================================
 // Path Utilities
@@ -551,12 +556,21 @@ struct UbatchCacheKey {
     // so a pre-existing v2 entry, which has no opinion on this field,
     // cannot silently match either).
     bool        kv_unified      = false;
+    // llama.cpp-uajm: llama_context_params::swa_full -- an SWA layer's KV
+    // bytes are the window's with it false and a FULL layer's with it true
+    // (kv_layer_bytes_for_kind(), unified-cache.hpp), so a CLI run
+    // (common's default false) and a raw-API context
+    // (llama_context_default_params()'s true) have different KV demand and
+    // must not share one cache entry (CACHE_VERSION bumped to 4 above so a
+    // v3 entry, which has no opinion on this field, cannot silently match).
+    bool        swa_full        = false;
 
     bool operator==(const UbatchCacheKey & other) const {
         return device_key == other.device_key && model_name == other.model_name && model_size == other.model_size &&
                model_hash == other.model_hash && n_ctx == other.n_ctx && n_batch == other.n_batch &&
                flash_attn == other.flash_attn && n_seq_max == other.n_seq_max && type_k == other.type_k &&
-               type_v == other.type_v && device_set_hash == other.device_set_hash && kv_unified == other.kv_unified;
+               type_v == other.type_v && device_set_hash == other.device_set_hash && kv_unified == other.kv_unified &&
+               swa_full == other.swa_full;
     }
 
     bool operator!=(const UbatchCacheKey & other) const { return !(*this == other); }
@@ -642,7 +656,8 @@ inline std::string ubatch_key_to_json(const UbatchCacheKey & k) {
        << "\"type_k\":" << k.type_k << ","
        << "\"type_v\":" << k.type_v << ","
        << "\"device_set_hash\":" << k.device_set_hash << ","
-       << "\"kv_unified\":" << (k.kv_unified ? "true" : "false");
+       << "\"kv_unified\":" << (k.kv_unified ? "true" : "false") << ","
+       << "\"swa_full\":" << (k.swa_full ? "true" : "false");
     return ss.str();
 }
 
@@ -660,6 +675,7 @@ inline UbatchCacheKey ubatch_key_from_json(const std::string & json) {
     k.type_v          = static_cast<int32_t>(parse_int(json, "type_v"));
     k.device_set_hash = static_cast<uint32_t>(parse_u64(json, "device_set_hash"));
     k.kv_unified      = parse_bool(json, "kv_unified");
+    k.swa_full        = parse_bool(json, "swa_full");
     return k;
 }
 

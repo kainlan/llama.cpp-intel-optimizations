@@ -27328,6 +27328,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     // later by ggml_sycl_run_runtime_context_transaction() mutating a COPY
     // of this plan directly, not by recomputing it through this function.
     plan.planner_kv_unified                  = kv_info.kv_unified;
+    // llama.cpp-uajm: swa_full, same treatment as kv_unified just above.
+    plan.planner_swa_full                    = kv_info.swa_full;
     plan.planner_n_ctx_is_runtime            = kv_info.n_ctx_is_runtime;
     plan.planner_n_head_ctx_max              = kv_info.n_head_ctx_max;
     plan.planner_n_head_swa_max              = kv_info.n_head_swa_max;
@@ -28646,6 +28648,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     // comment above -- no envelope override, the real value is set later by
     // the runtime transaction mutating a plan copy directly.
     plan.planner_kv_unified       = kv_info.kv_unified;
+    plan.planner_swa_full         = kv_info.swa_full;
     plan.planner_n_ctx_is_runtime = kv_info.n_ctx_is_runtime;
     plan.planner_n_head_ctx_max   = kv_info.n_head_ctx_max;
     plan.planner_n_head_swa_max   = kv_info.n_head_swa_max;

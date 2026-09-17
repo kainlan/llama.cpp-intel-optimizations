@@ -1036,7 +1036,9 @@ def test_header_declares_the_ubatch_cache_key_and_four_accessors():
                    "uint32_t\\s+n_seq_max\\s*;", "int32_t\\s+type_k\\s*;", "int32_t\\s+type_v\\s*;",
                    "uint32_t\\s+device_set_hash\\s*;",
                    # llama.cpp-3aos: kv_unified, added once KV sizing depended on it.
-                   "bool\\s+kv_unified\\s*;"):
+                   "bool\\s+kv_unified\\s*;",
+                   # llama.cpp-uajm: swa_full, same reason (SWA layers sized as FULL under it).
+                   "bool\\s+swa_full\\s*;"):
         assert re.search(member, GGML_SYCL_H_CODE), f"ggml_sycl_ubatch_cache_key is missing a member matching {member!r}"
 
     assert re.search(r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_enabled\s*\(\s*void\s*\)\s*;",
@@ -1296,6 +1298,18 @@ def test_cache_key_populates_kv_unified():
     body_norm = _normalize_ws(_trial_body())
     assert re.search(r"cache_key\.kv_unified\s*=\s*cparams\.kv_unified\s*;", body_norm), (
         "missing cache_key.kv_unified = cparams.kv_unified; assignment"
+    )
+
+
+def test_cache_key_populates_swa_full():
+    """llama.cpp-uajm: cache_key.swa_full must be assigned from
+    cparams.swa_full -- same shape as kv_unified above: a CLI run
+    (swa_full=false) and a raw-API context (llama_context_default_params()'s
+    swa_full=true) size every SWA layer differently, so a stale
+    (always-false) field would let the two collide on one cache entry."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(r"cache_key\.swa_full\s*=\s*cparams\.swa_full\s*;", body_norm), (
+        "missing cache_key.swa_full = cparams.swa_full; assignment"
     )
 
 

@@ -52,6 +52,11 @@ struct llama_cparams {
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
+    // llama.cpp-uajm: llama_context_params::swa_full, recorded here so the
+    // SYCL runtime-context calls (llama-context.cpp) can forward it the way
+    // they forward kv_unified -- the SYCL KV planner sizes an SWA layer as
+    // FULL when it is set, matching llama_kv_cache_iswa's own allocation.
+    bool swa_full;
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

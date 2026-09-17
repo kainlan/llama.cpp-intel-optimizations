@@ -1187,9 +1187,11 @@ int main() {
     // makes the callee return NULL_OUTPUT before that parameter is ever
     // consulted; false is passed only to keep this call well-formed.
     // llama.cpp-3aos: kv_unified is irrelevant for the same
-    // reason -- false keeps the call well-formed.
+    // reason -- false keeps the call well-formed. llama.cpp-uajm: swa_full
+    // likewise.
     if (CALL_SYCL(ggml_backend_sycl_activate_model_plan)(zero) != GGML_SYCL_LIFECYCLE_STALE_IDENTITY ||
         CALL_SYCL(ggml_backend_sycl_set_runtime_context_for_model)(nullptr, zero, 0, 0, 0, /*kv_unified=*/false,
+                                                                   /*swa_full=*/false,
                                                                    /*flash_attn_enabled=*/false) !=
             GGML_SYCL_LIFECYCLE_NULL_OUTPUT) {
         std::fprintf(stderr, "activation/runtime API signature or invalid-input result mismatch\n");

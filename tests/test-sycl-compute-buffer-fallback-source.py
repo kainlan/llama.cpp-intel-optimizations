@@ -632,9 +632,10 @@ def test_shared_body_call_sites_have_a_mutation_witness():
     raw = GGML_SYCL_CPP
     # llama.cpp-tsfl round 1 F6: the probe now dispatches the shared body's
     # ggml_sycl_txn_result through a switch, not a bare bool.
+    # llama.cpp-uajm: swa_full sits between kv_unified and flash_attn_enabled.
     probe_call = (
         "    const ggml_sycl_txn_result result = ggml_sycl_run_runtime_context_transaction(\n"
-        "        backend, n_ctx, n_ubatch, n_seq_max, kv_unified, flash_attn_enabled, /*probe_mode=*/true, out);\n"
+        "        backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full, flash_attn_enabled, /*probe_mode=*/true, out);\n"
     )
     assert probe_call in raw, "mutation target not found -- update this witness to match the real source"
     mutated_raw = raw.replace(probe_call, "", 1)

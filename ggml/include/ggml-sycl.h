@@ -417,11 +417,15 @@ GGML_BACKEND_API void ggml_backend_sycl_set_placement_envelope(ggml_backend_t   
 // (which forwards its own caller's real kv_unified), and the legacy
 // ggml_backend_sycl_set_runtime_n_ctx() (which, like its own n_seq_max=1,
 // passes false -- it has no way to learn a real kv_unified either).
+// llama.cpp-uajm: swa_full -- see ggml_backend_sycl_set_runtime_context_for_model()'s
+// declaration; threaded exactly like kv_unified, and the legacy entry point
+// passes false for it too (common's default, the pre-existing behaviour).
 GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                                             uint32_t       n_ctx,
                                                             uint32_t       n_ubatch,
                                                             uint32_t       n_seq_max,
                                                             bool           kv_unified,
+                                                            bool           swa_full,
                                                             bool           flash_attn_enabled);
 
 // llama.cpp-tsfl (round 1 F10; round 4 Q1/Q6): per-device count of
@@ -484,7 +488,11 @@ GGML_BACKEND_API bool ggml_backend_sycl_auto_ubatch_enabled(void);
 // cparams.kv_unified -- once KV sizing depends on it (see
 // kv_layer_bytes_for_kind(), unified-cache.hpp), two contexts differing
 // only in that flag need different auto n_ubatch candidates, so they must
-// not share one cache entry either. All pointer fields are borrowed: valid
+// not share one cache entry either. `swa_full` (llama.cpp-uajm) is
+// llama_context_params::swa_full for the same reason: with it true every
+// SWA layer is sized as a FULL layer, so a CLI run (common's default,
+// false) and a raw-API context (llama_context_default_params()'s true)
+// have different KV demand. All pointer fields are borrowed: valid
 // only for the duration of the call, never retained.
 struct ggml_sycl_ubatch_cache_key {
     int          device;
@@ -499,6 +507,7 @@ struct ggml_sycl_ubatch_cache_key {
     int32_t      type_v;
     uint32_t     device_set_hash;
     bool         kv_unified;
+    bool         swa_full;
 };
 
 // Whether the persisted auto n_ubatch cache is enabled -- GGML_SYCL_TUNING_CACHE,
@@ -1223,6 +1232,15 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_activate_mode
 // stream shared by all n_seq_max sequences, and ITS window scales with
 // n_seq_max. See kv_layer_bytes_for_kind() (unified-cache.hpp) for the full
 // derivation against src/llama-context.cpp/llama-kv-cache-iswa.cpp.
+//
+// llama.cpp-uajm: swa_full mirrors llama_context_params::swa_full
+// (include/llama.h; llama_context_default_params() sets TRUE, common's
+// default is false). With it set, llama_kv_cache_iswa allocates every SWA
+// layer at the non-SWA cache's size (n_ctx_seq cells per stream), so the
+// plan must size an SWA layer as a FULL layer or the K tensor overflows the
+// planned slab at context init ("[KV-REMAP] ERROR: cache_k_l0 overflows
+// layer alloc!" on GPT-OSS 20B for any raw-API consumer keeping the
+// default). Same derivation reference as kv_unified above.
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(
     ggml_backend_t               backend,
     struct ggml_sycl_model_token model,
@@ -1230,6 +1248,7 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_c
     uint32_t                     n_ubatch,
     uint32_t                     n_seq_max,
     bool                         kv_unified,
+    bool                         swa_full,
     bool                         flash_attn_enabled);
 
 // llama.cpp-tsfl (nphx comment c-wgxn): result of
@@ -1306,7 +1325,7 @@ struct ggml_sycl_runtime_context_probe {
 // declaration above for the full rationale. The probe must be given the
 // SAME kv_unified the candidate would actually publish with, or its
 // accept/reject decision (and would_demote_kv/host_kv_bytes) answers for
-// the wrong KV shape.
+// the wrong KV shape. llama.cpp-uajm: the same holds for swa_full.
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(
     ggml_backend_t                           backend,
     struct ggml_sycl_model_token             model,
@@ -1314,6 +1333,7 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime
     uint32_t                                 n_ubatch,
     uint32_t                                 n_seq_max,
     bool                                     kv_unified,
+    bool                                     swa_full,
     bool                                     flash_attn_enabled,
     struct ggml_sycl_runtime_context_probe * out);
 
