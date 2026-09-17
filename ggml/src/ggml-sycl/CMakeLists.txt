@@ -463,6 +463,21 @@ if (BUILD_TESTING)
     # Deliberately NOT labelled "cache": that label is in the memory-hazard
     # denylist the full sweep excludes, and this gate allocates nothing.
     set_tests_properties(sycl-weight-key-identity-policy PROPERTIES LABELS "sycl;weight-key;host;source-contract")
+    # llama.cpp-glkg: pins the host-zone ordering/agreement/wiring fixes for
+    # the pinned-pool-capacity bug (host zones configured lazily at
+    # S1-PRELOAD, long after weight loading already spent the pool's budget
+    # through the pre-zone runtime fallback). --self-test for the usual
+    # reason: this text-only check would otherwise be vacuous if the anchors
+    # it searches for ever stopped matching real code.
+    add_test(NAME sycl-host-zone-config-source-contract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-host-zone-config-source-contract.py
+            --self-test)
+    # Deliberately NOT labelled "cache"/"mem-handle": text-only, allocates
+    # nothing, opens no device -- must not be excluded from the throttled
+    # sweep's memory-hazard denylist (see CLAUDE.md's ctest denylist warning).
+    set_tests_properties(sycl-host-zone-config-source-contract PROPERTIES
+        LABELS "sycl;host-arena;host;source-contract")
     add_test(NAME sycl-private-cpu-traits-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-cpu-traits-source.py)
     add_test(NAME sycl-fallback-propagation
