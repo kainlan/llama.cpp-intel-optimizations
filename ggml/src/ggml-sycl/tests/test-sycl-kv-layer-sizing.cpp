@@ -49,22 +49,74 @@
 // corrected are recorded in the commit bodies of this ticket's own history
 // (llama.cpp-3aos), not reproduced here.
 
+// llama.cpp-7yv9 (cases (h)-(k) below): the tier manager that turns the plan
+// into per-layer allocations -- kv_tier_manager::configure_from_plan()
+// (kv-tier-manager.cpp) -- kept sizing layers from the uniform per-buffer
+// scalars (the LAYER_MASK slice average, then plan.kv_per_swa_layer, which
+// is computed at the GLOBAL fallback width) after every other consumer had
+// moved to placement_plan::kv_size_for_layer(). On Gemma 4 E4B at
+// -c 4096 -np 4 every SWA layer was therefore allocated 16 MB instead of
+// 8 MB (2x VRAM over-reservation), and a single KV buffer that mixed
+// attention kinds would have been mis-sized outright. This file exercises
+// the REAL kv_tier_manager (kv-tier-manager.cpp is compiled into this
+// target) -- the same arrangement as test-kv-slice-sizing.cpp.
+
+#include "../kv-tier-manager.hpp"
 #include "../unified-cache.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
+using ggml_sycl::kv_slice_size;
+using ggml_sycl::kv_tier_manager;
+using ggml_sycl::layer_region;
 using ggml_sycl::placement_kv_info;
 using ggml_sycl::placement_plan;
 
+// Seam: kv-tier-manager.cpp's configure_with_weights() asks unified-cache for
+// per-layer weight residency. configure_from_plan(), the only entry point this
+// file drives, never calls it -- but the symbol must resolve for the link, and
+// linking libggml-sycl instead would drag a device runtime into a host-only
+// test (see the CMake comment on test-kv-slice-sizing).
+namespace ggml_sycl {
+size_t unified_cache_get_layer_vram_bytes(int device, int layer_id) {
+    (void) device;
+    (void) layer_id;
+    return 0;
+}
+}  // namespace ggml_sycl
+
 static int g_checks = 0;
 static int g_fail   = 0;
+
+// Everything the code under test logs, so a case can assert that a WARN was
+// (or was not) emitted instead of trusting that the sizing decision it
+// describes happened. Echoed to stdout as well so a failing run still shows
+// the [KV-TIER] lines next to the FAIL that cites them.
+static std::string g_log;
+
+static void capture_log(ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    (void) user_data;
+    g_log += text;
+    fputs(text, stdout);
+}
 
 static void check_eq(const char * what, size_t got, size_t want) {
     g_checks++;
     if (got != want) {
         g_fail++;
         printf("  FAIL: %s: got %zu, want %zu\n", what, got, want);
+    }
+}
+
+static void check_true(const char * what, bool cond) {
+    g_checks++;
+    if (!cond) {
+        g_fail++;
+        printf("  FAIL: %s\n", what);
     }
 }
 
@@ -374,7 +426,240 @@ static void test_plan_kv_size_for_layer_matches_kv_info() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// llama.cpp-7yv9: the tier manager must consume the plan's per-layer truth.
+// ---------------------------------------------------------------------------
+
+// The plan compute_placement_plan() (unified-cache.cpp) builds from a
+// kv_info: per-layer truth mirrored, the legacy uniform split filled from the
+// aggregate estimators -- so kv_per_swa_layer is at the GLOBAL fallback width
+// (16 MB for E4B @ -np 4, the exact number the defect reads) -- and every
+// layer's KV assigned to `device`. swa_layer_mask follows hparams.is_swa()'s
+// raw "full every 6th" pattern for all 42 layers, as llama-model.cpp reports
+// it, i.e. it also flags the SHARED layers 24-41 that hold no KV of their own.
+static placement_plan make_plan_from_kv_info(const placement_kv_info & kv, int device) {
+    placement_plan plan{};
+    plan.kv_per_layer     = kv.kv_bytes_per_layer();
+    plan.kv_per_swa_layer = kv.kv_bytes_per_swa_layer();
+    plan.swa_layer_mask.assign(kv.n_layer, false);
+    for (uint32_t il = 0; il < kv.n_layer; ++il) {
+        plan.swa_layer_mask[il]              = (il % 6) != 5;
+        plan.kv_device[static_cast<int>(il)] = device;
+    }
+    plan.layer_kind         = kv.layer_kind;
+    plan.layer_k_width      = kv.layer_k_width;
+    plan.layer_v_width      = kv.layer_v_width;
+    plan.planner_n_ctx      = kv.n_ctx;
+    plan.planner_n_swa      = kv.n_swa;
+    plan.planner_n_ubatch   = kv.n_ubatch;
+    plan.planner_n_seq_max  = kv.n_seq_max;
+    plan.planner_kv_unified = kv.kv_unified;
+    return plan;
+}
+
+// llama_kv_cache_iswa gives one KV buffer per attention kind; this is the
+// layer mask llama-kv-cache.cpp pushes for the buffer holding `kind`.
+static std::vector<uint8_t> kv_buffer_mask(const placement_kv_info & kv, uint8_t kind) {
+    std::vector<uint8_t> mask(kv.n_layer, 0);
+    for (uint32_t il = 0; il < kv.n_layer; ++il) {
+        mask[il] = kv.layer_kind[il] == kind ? 1 : 0;
+    }
+    return mask;
+}
+
+static uint32_t count_mask(const std::vector<uint8_t> & mask) {
+    uint32_t n = 0;
+    for (uint8_t m : mask) {
+        n += m ? 1 : 0;
+    }
+    return n;
+}
+
+// What tiered_kv_buft_alloc_buffer (ggml-sycl.cpp) ends up reserving on the
+// device for this buffer: layout[l].size summed over the buffer's own layers
+// that landed on device (it zeroes every other region before allocating).
+static size_t device_bytes_in_mask(const std::vector<layer_region> & layout, const std::vector<uint8_t> & mask) {
+    size_t sum = 0;
+    for (const auto & r : layout) {
+        if (r.layer_id < mask.size() && mask[r.layer_id] && r.on_device) {
+            sum += r.size;
+        }
+    }
+    return sum;
+}
+
+// ---------------------------------------------------------------------------
+// (h) Gemma 4 E4B @ -c 4096 -np 4, kv_unified=false, both of llama's KV
+//     buffers. Each layer's tier size must be placement_plan::
+//     kv_size_for_layer(il): 16 MB FULL / 8 MB SWA / 0 SHARED, and the
+//     device bytes reserved for a buffer must equal the buffer.
+//
+//     RED on the pre-fix code, SWA buffer: every SWA layer reports 16777216
+//     (plan.kv_per_swa_layer, global width) against the buffer's real 8388608,
+//     so the buffer's device bytes come out at 335544320 for a 167772160 B
+//     buffer -- the 2x over-reservation the lead's archived run showed
+//     ("[KV-ALLOC] kv_per_layer=8.0 MB" followed by size=16777216 allocs).
+// ---------------------------------------------------------------------------
+static void test_tier_manager_sizes_layers_from_plan_truth() {
+    printf("(h) kv_tier_manager::configure_from_plan() sizes each layer from kv_size_for_layer()\n");
+    placement_kv_info kv   = make_gemma4_e4b(4096, 512, 4, /*kv_unified=*/false);
+    placement_plan    plan = make_plan_from_kv_info(kv, /*device=*/0);
+    check_eq("precondition: plan.kv_per_swa_layer is the global-width 16 MB the defect reads", plan.kv_per_swa_layer,
+             16777216u);
+    check_eq("precondition: plan.kv_per_layer", plan.kv_per_layer, 16777216u);
+
+    // SWA buffer: 20 layers x 8 MB.
+    {
+        const auto   mask  = kv_buffer_mask(kv, GGML_SYCL_KV_LAYER_SWA);
+        const size_t total = 20u * 8388608u;
+        check_eq("SWA buffer: mask covers 20 layers", count_mask(mask), 20u);
+        const auto slice = kv_slice_size::from_layer_mask(total, 20);
+
+        kv_tier_manager mgr;
+        mgr.configure_from_plan(0, plan, kv.n_layer, slice, &mask);
+
+        check_eq("SWA buffer: l0 (SWA) tier size", mgr.kv_layer_size(0), 8388608u);
+        check_eq("SWA buffer: l5 (FULL) tier size", mgr.kv_layer_size(5), 16777216u);
+        check_eq("SWA buffer: l24 (SHARED) tier size", mgr.kv_layer_size(24), 0u);
+        check_eq("SWA buffer: l29 (SHARED, pattern says full) tier size", mgr.kv_layer_size(29), 0u);
+        for (uint32_t il = 0; il < 24; ++il) {
+            if (mask[il]) {
+                check_eq("SWA buffer: every SWA layer", mgr.kv_layer_size(il), 8388608u);
+            }
+        }
+
+        const auto layout = mgr.compute_region_layout(total);
+        check_eq("SWA buffer: layout entries", layout.size(), 42u);
+        check_eq("SWA buffer: device bytes reserved for the buffer's layers", device_bytes_in_mask(layout, mask),
+                 total);
+        check_true("SWA buffer: no sizing WARN for a buffer that matches its truth",
+                   g_log.find("[KV-TIER] per-layer KV truth") == std::string::npos);
+    }
+
+    // FULL buffer: 4 layers x 16 MB. Homogeneous, so the LAYER_MASK average
+    // already got these layers right pre-fix; what was wrong is every OTHER
+    // layer's recorded size (SWA at 16 MB, SHARED at 16 MB).
+    {
+        g_log.clear();
+        const auto   mask  = kv_buffer_mask(kv, GGML_SYCL_KV_LAYER_FULL);
+        const size_t total = 4u * 16777216u;
+        check_eq("FULL buffer: mask covers 4 layers", count_mask(mask), 4u);
+        const auto slice = kv_slice_size::from_layer_mask(total, 4);
+
+        kv_tier_manager mgr;
+        mgr.configure_from_plan(0, plan, kv.n_layer, slice, &mask);
+
+        check_eq("FULL buffer: l5 (FULL) tier size", mgr.kv_layer_size(5), 16777216u);
+        check_eq("FULL buffer: l0 (SWA) tier size", mgr.kv_layer_size(0), 8388608u);
+        check_eq("FULL buffer: l24 (SHARED) tier size", mgr.kv_layer_size(24), 0u);
+
+        const auto layout = mgr.compute_region_layout(total);
+        check_eq("FULL buffer: device bytes reserved for the buffer's layers", device_bytes_in_mask(layout, mask),
+                 total);
+        check_true("FULL buffer: no sizing WARN for a buffer that matches its truth",
+                   g_log.find("[KV-TIER] per-layer KV truth") == std::string::npos);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (i) No per-layer truth on the plan (an inventory built before llama.cpp-
+//     3aos, or a homogeneous model that never populated it): the legacy
+//     ranking must be untouched -- LAYER_MASK slice for non-SWA layers,
+//     plan.kv_per_swa_layer for SWA layers. Passes before and after the fix;
+//     it is here so the fallback cannot be lost while adding the truth path.
+// ---------------------------------------------------------------------------
+static void test_tier_manager_legacy_split_without_truth() {
+    printf("(i) configure_from_plan() keeps the legacy uniform split when the plan has no per-layer truth\n");
+    placement_kv_info kv   = make_gemma4_e4b(4096, 512, 4, /*kv_unified=*/false);
+    placement_plan    plan = make_plan_from_kv_info(kv, 0);
+    plan.layer_kind.clear();
+    plan.layer_k_width.clear();
+    plan.layer_v_width.clear();
+
+    const auto   mask  = kv_buffer_mask(kv, GGML_SYCL_KV_LAYER_SWA);
+    const size_t total = 20u * 8388608u;
+    const auto   slice = kv_slice_size::from_layer_mask(total, 20);
+
+    kv_tier_manager mgr;
+    mgr.configure_from_plan(0, plan, kv.n_layer, slice, &mask);
+
+    check_eq("legacy: SWA layer takes plan.kv_per_swa_layer", mgr.kv_layer_size(0), plan.kv_per_swa_layer);
+    check_eq("legacy: non-SWA layer takes the slice", mgr.kv_layer_size(5), slice.bytes());
+    check_eq("legacy: kv_per_layer() is the slice", mgr.kv_per_layer(), slice.bytes());
+}
+
+// ---------------------------------------------------------------------------
+// (j) The buffer is the ground truth about what llama allocated. If the
+//     plan's per-layer sum comes out SMALLER than the buffer by more than
+//     alignment slack, the plan is stale or wrong, and sizing layers from it
+//     would under-allocate them -- the exact "[KV-REMAP] ERROR: overflows
+//     layer alloc!" failure. configure_from_plan() must WARN naming both
+//     numbers and fall back to the slice (which is derived from the buffer
+//     and therefore fits), never proceed with the under-sized truth.
+// ---------------------------------------------------------------------------
+static void test_tier_manager_truth_under_sizing_buffer_falls_back() {
+    printf("(j) per-layer truth that under-sizes the buffer is refused with a WARN and the slice wins\n");
+    placement_kv_info kv   = make_gemma4_e4b(4096, 512, 4, /*kv_unified=*/false);
+    placement_plan    plan = make_plan_from_kv_info(kv, 0);
+
+    const auto   mask  = kv_buffer_mask(kv, GGML_SYCL_KV_LAYER_SWA);
+    const size_t total = 20u * 16777216u;  // llama allocated 16 MB/layer; truth says 8 MB
+    const auto   slice = kv_slice_size::from_layer_mask(total, 20);
+
+    g_log.clear();
+    kv_tier_manager mgr;
+    mgr.configure_from_plan(0, plan, kv.n_layer, slice, &mask);
+
+    check_eq("under-size: SWA layer falls back to the slice", mgr.kv_layer_size(0), 16777216u);
+    check_true("under-size: WARN names the truth sum and the buffer",
+               g_log.find("[KV-TIER] per-layer KV truth sum 167772160 B under-sizes this buffer's 335544320 B") !=
+                   std::string::npos);
+    const auto layout = mgr.compute_region_layout(total);
+    check_eq("under-size: device bytes still cover the buffer", device_bytes_in_mask(layout, mask), total);
+}
+
+// ---------------------------------------------------------------------------
+// (k) The other direction: a per-layer sum LARGER than the buffer. The
+//     planner's formula is fp16 (kv_layer_bytes_for_kind() multiplies by
+//     sizeof(ggml_fp16_t)), so this is every run with a quantized KV cache
+//     (-ctk/-ctv q8_0 halves the real buffer), not just a stale plan.
+//     Keeping the truth would reserve ~2x the buffer on the device; the
+//     slice is exact for the buffer llama actually allocated, so the truth is
+//     refused -- never silently: a WARN names both numbers. (No clamping of
+//     the per-layer sizes to fit: a clamp would hide a planner/allocator
+//     disagreement as a working run.)
+// ---------------------------------------------------------------------------
+static void test_tier_manager_truth_exceeding_buffer_warns_and_falls_back() {
+    printf("(k) per-layer truth that exceeds the buffer is refused with a WARN and the slice wins\n");
+    placement_kv_info kv   = make_gemma4_e4b(4096, 512, 4, /*kv_unified=*/false);
+    placement_plan    plan = make_plan_from_kv_info(kv, 0);
+
+    const auto   mask  = kv_buffer_mask(kv, GGML_SYCL_KV_LAYER_SWA);
+    const size_t total = 20u * 4194304u;  // buffer is 4 MB/layer; truth says 8 MB
+    const auto   slice = kv_slice_size::from_layer_mask(total, 20);
+
+    g_log.clear();
+    kv_tier_manager mgr;
+    mgr.configure_from_plan(0, plan, kv.n_layer, slice, &mask);
+
+    check_eq("over-size: SWA layer falls back to the slice", mgr.kv_layer_size(0), 4194304u);
+    check_true("over-size: WARN names the truth sum and the buffer",
+               g_log.find("[KV-TIER] per-layer KV truth sum 167772160 B exceeds this buffer's 83886080 B") !=
+                   std::string::npos);
+    const auto layout = mgr.compute_region_layout(total);
+    check_eq("over-size: device bytes equal the buffer, not the truth", device_bytes_in_mask(layout, mask), total);
+}
+
 int main() {
+    // Hermetic: GGML_SYCL_KV_HOT_LAYERS short-circuits configure_from_plan()
+    // before any per-layer sizing, so a stray value in the environment would
+    // quietly change what cases (h)-(k) measure.
+    if (const char * env = std::getenv("GGML_SYCL_KV_HOT_LAYERS")) {
+        printf("unsetting GGML_SYCL_KV_HOT_LAYERS=%s for a hermetic run\n", env);
+        unsetenv("GGML_SYCL_KV_HOT_LAYERS");
+    }
+    ggml_log_set(capture_log, nullptr);
+
     printf("=== SYCL KV planner per-layer sizing (llama.cpp-3aos) ===\n");
 
     test_gemma4_non_unified_n_seq_max_4();
@@ -387,6 +672,12 @@ int main() {
     test_aggregate_uses_n_seq_max_and_kv_unified();
     test_fallback_without_per_layer_arrays();
     test_plan_kv_size_for_layer_matches_kv_info();
+
+    printf("=== kv_tier_manager consumes the plan's per-layer sizes (llama.cpp-7yv9) ===\n");
+    test_tier_manager_sizes_layers_from_plan_truth();
+    test_tier_manager_legacy_split_without_truth();
+    test_tier_manager_truth_under_sizing_buffer_falls_back();
+    test_tier_manager_truth_exceeding_buffer_warns_and_falls_back();
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     if (g_fail > 0) {

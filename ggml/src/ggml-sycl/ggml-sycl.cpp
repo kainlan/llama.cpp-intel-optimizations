@@ -38059,7 +38059,15 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     }
 
     if (kv_plan) {
-        mgr.configure_from_plan(device, *kv_plan, n_layers, kv_slice);
+        // Which model layers this buffer holds, however that was decided
+        // above (llama's explicit mask, or the size-matched buffer kind), so
+        // the tier manager sizes each of them from the plan's per-layer truth
+        // and bounds their sum by this buffer alone (llama.cpp-7yv9).
+        std::vector<uint8_t> buffer_layer_mask(n_layers, 0);
+        for (uint32_t l = 0; l < n_layers; ++l) {
+            buffer_layer_mask[l] = layer_in_this_kv_buffer(l) ? 1 : 0;
+        }
+        mgr.configure_from_plan(device, *kv_plan, n_layers, kv_slice, &buffer_layer_mask);
     } else {
         mgr.configure_with_weights(device, n_layers, kv_vram_cap, kv_slice);
     }

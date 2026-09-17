@@ -936,6 +936,15 @@ struct placement_plan {
         return it == layer_device.end() ? -1 : it->second;
     }
 
+    // True when kv_size_for_layer(layer_id) answers from the per-layer truth
+    // (kind + width) rather than the legacy uniform split. Mirrors
+    // placement_kv_info::has_per_layer_kv_truth(); consumers that must know
+    // WHICH answer they are getting (kv_tier_manager::configure_from_plan(),
+    // llama.cpp-7yv9) ask this instead of re-deriving the predicate.
+    bool has_per_layer_kv_truth(uint32_t layer_id) const {
+        return layer_id < layer_kind.size() && layer_id < layer_k_width.size() && layer_id < layer_v_width.size();
+    }
+
     size_t kv_size_for_layer(uint32_t layer_id) const {
         // llama.cpp-3aos: prefer the per-layer truth (kind + width) copied
         // in from placement_kv_info at plan-build time -- see
@@ -946,7 +955,7 @@ struct placement_plan {
         // transaction body that sets planner_n_seq_max), so this stays
         // correct across a runtime context update without re-deriving
         // anything from kv_info.
-        if (layer_id < layer_kind.size() && layer_id < layer_k_width.size() && layer_id < layer_v_width.size()) {
+        if (has_per_layer_kv_truth(layer_id)) {
             return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],
                                            planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,
                                            planner_kv_unified);

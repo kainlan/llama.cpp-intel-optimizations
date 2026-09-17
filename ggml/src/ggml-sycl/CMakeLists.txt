@@ -1648,11 +1648,15 @@ set_tests_properties(sycl-kv-slice-sizing PROPERTIES
 # full/shared-KV layers and n_seq_max scaling for --parallel > 1. Same shape
 # as test-kv-slice-sizing above: needs -fsycl only because unified-cache.hpp
 # pulls in SYCL headers, no device kernel and no queue, so
-# SYCL_LINK_ONLY_TEST_OPTIONS + ggml-base alone. Unlike test-kv-slice-sizing
-# it needs no second .cpp -- placement_kv_info/placement_plan's methods under
-# test are all inline in the header.
+# SYCL_LINK_ONLY_TEST_OPTIONS + ggml-base alone. placement_kv_info/
+# placement_plan's methods under test are inline in the header; kv-tier-
+# manager.cpp is compiled in (llama.cpp-7yv9) because the test also drives
+# the real kv_tier_manager::configure_from_plan() that turns those per-layer
+# sizes into allocations, stubbing unified_cache_get_layer_vram_bytes() the
+# same way test-kv-slice-sizing does.
 add_executable(test-sycl-kv-layer-sizing
     tests/test-sycl-kv-layer-sizing.cpp
+    kv-tier-manager.cpp
 )
 target_include_directories(test-sycl-kv-layer-sizing PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
