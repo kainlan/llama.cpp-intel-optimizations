@@ -642,39 +642,44 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
 
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Calculate how many chunks we need to add
-    size_t chunks_needed = (additional_bytes + chunk_size_ - 1) / chunk_size_;
-    if (chunks_needed == 0) {
+    if (additional_bytes == 0) {
         return true;
     }
 
-    // Check budget before allocating
-    if (total_allocated_ + chunks_needed * chunk_size_ > budget_) {
+    // llama.cpp-nsl3: grow by ONE chunk sized to the request. zone_alloc()
+    // hands out a contiguous pointer from a single chunk's TLSF, so a request
+    // larger than chunk_size_ can only be served by a chunk at least that
+    // large; N fixed chunk_size_ chunks add aggregate capacity that no
+    // single-chunk allocation can consume (Gemma 4 E4B: a 2856 MB host-placed
+    // embedding against 2048 MB chunks grew the WEIGHT zone by two more
+    // 2048 MB chunks and still failed model load). grow() already sizes a
+    // chunk as max(chunk_size_, align_up(min_size)) -- the rule the runtime
+    // path (allocate_from_chunks) has always used -- so the zone path follows
+    // it, and the budget is checked against the bytes that chunk actually
+    // commits (grow_into() adds one DEFAULT_ALIGNMENT header per chunk).
+    const size_t chunk_bytes   = std::max(chunk_size_, align_up(additional_bytes, DEFAULT_ALIGNMENT));
+    const size_t backing_bytes = chunk_bytes + DEFAULT_ALIGNMENT;
+    if (total_allocated_ + backing_bytes > budget_) {
         GGML_LOG_WARN(
             "[SYCL] Pinned pool grow_zone: budget exhausted for zone %zu "
-            "(need %zu chunks, budget=%.1f GB, used=%.1f GB)\n",
-            zi, chunks_needed, budget_ / (1024.0 * 1024.0 * 1024.0), total_allocated_ / (1024.0 * 1024.0 * 1024.0));
+            "(need %.1f MB, budget=%.1f GB, used=%.1f GB)\n",
+            zi, backing_bytes / (1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
+            total_allocated_ / (1024.0 * 1024.0 * 1024.0));
         return false;
     }
 
-    // Record the old end of the pool (where new chunks will start)
-    size_t old_chunk_count = chunks_.size();
+    // Record the old end of the pool (where the new chunk will start)
+    const size_t old_chunk_count = chunks_.size();
 
-    // Allocate new chunks
-    for (size_t i = 0; i < chunks_needed; i++) {
-        if (!grow(chunk_size_)) {
-            GGML_LOG_WARN("[SYCL] Pinned pool grow_zone: grow failed at chunk %zu/%zu\n", i, chunks_needed);
-            break;
-        }
+    if (!grow(chunk_bytes)) {
+        GGML_LOG_WARN("[SYCL] Pinned pool grow_zone: grow failed for zone %zu (%.1f MB chunk)\n", zi,
+                      chunk_bytes / (1024.0 * 1024.0));
+        return false;
     }
 
-    size_t new_chunks_added = chunks_.size() - old_chunk_count;
+    const size_t new_chunks_added = chunks_.size() - old_chunk_count;
     if (new_chunks_added == 0) {
         return false;
-    }
-    if (new_chunks_added < chunks_needed) {
-        GGML_LOG_WARN("[HOST-POOL] grow_zone: partial growth %zu/%zu chunks for zone %zu\n", new_chunks_added,
-                      chunks_needed, zi);
     }
 
     // Compute the logical cursor for the new chunks (just past the existing logical space).
@@ -683,7 +688,10 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
         logical_cursor = std::max(logical_cursor, span.logical_start + span.span_size);
     }
 
-    // Extend flat_spans_ and add per-zone TLSF allocators for the new chunks.
+    // Extend flat_spans_ and add per-zone TLSF allocators for the new chunks,
+    // accumulating the zone's added capacity from the chunks actually added
+    // rather than from chunk_size_, which under-reports an oversize chunk.
+    size_t additional_capacity = 0;
     for (size_t i = old_chunk_count; i < chunks_.size(); i++) {
         flat_spans_.push_back({ logical_cursor, i, 0ULL, chunks_[i].size });
         logical_cursor += chunks_[i].size;
@@ -694,10 +702,10 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
         zcs.zone_size  = chunks_[i].size;
         zcs.allocator  = std::make_unique<tlsf_allocator>(chunks_[i].size);
         zone_allocators_[zi].push_back(std::move(zcs));
+        additional_capacity += chunks_[i].size;
     }
 
     // Extend the zone's capacity to include the new chunks.
-    size_t additional_capacity = new_chunks_added * chunk_size_;
     zones_[zi].size += additional_capacity;
 
     GGML_LOG_INFO(

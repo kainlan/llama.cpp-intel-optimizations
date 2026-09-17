@@ -14999,17 +14999,23 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 }
                 // Fragmentation path: the zone has enough aggregate free bytes
                 // somewhere (possibly across multiple chunks) but no single
-                // chunk has `alloc_size` contiguous. Grow the zone by at least
-                // one chunk to add a fresh TLSF arena whose `largest_free_block`
-                // covers the request, then retry.
-                const size_t largest = ucache->host_zone_largest_free_block(zone);
-                // `largest_free_block()` is byte-capacity only; TLSF alignment
-                // can still reject an allocation that nominally fits.  A failed
-                // first attempt means the zone cannot currently hand out this
-                // contiguous pointer, so grow a fresh chunk and retry instead
-                // of surfacing a false zone-capacity failure.
-                const size_t need = largest < alloc_size ? alloc_size - largest + pinned_chunk_pool::DEFAULT_ALIGNMENT :
-                                                           alloc_size + pinned_chunk_pool::DEFAULT_ALIGNMENT;
+                // chunk has `alloc_size` contiguous. Grow the zone by one
+                // fresh chunk whose TLSF arena covers the whole request, then
+                // retry. `largest_free_block()` is byte-capacity only; TLSF
+                // alignment can still reject an allocation that nominally
+                // fits, so a failed first attempt means the zone cannot
+                // currently hand out this contiguous pointer regardless of
+                // its free total.
+                //
+                // llama.cpp-nsl3: the growth must be sized to the REQUEST, not
+                // to the shortfall against the largest free block. A fresh
+                // chunk serves this allocation alone, so growing by
+                // `alloc_size - largest` produced a chunk too small for the
+                // request it was grown for (Gemma 4 E4B: 2856 MB against
+                // 2048 MB chunks). grow_zone() sizes the chunk as
+                // max(chunk_size_, align_up(need)); the alignment slack keeps
+                // the aligned request inside the arena.
+                const size_t need = alloc_size + std::max(alignment, pinned_chunk_pool::DEFAULT_ALIGNMENT);
                 if (!ucache->host_zone_grow(zone, need)) {
                     return nullptr;
                 }
