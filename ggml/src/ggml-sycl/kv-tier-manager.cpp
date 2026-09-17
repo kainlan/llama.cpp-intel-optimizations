@@ -14,6 +14,11 @@ size_t unified_cache_get_layer_vram_bytes(int device, int layer_id);
 
 static std::array<kv_tier_manager, GGML_SYCL_MAX_DEVICES> g_kv_tier_managers;
 
+// Per-layer region alignment used by compute_region_layout(); also the
+// per-layer slack a buffer may carry over its layers' raw byte sum (each K/V
+// tensor is padded to the buffer type's alignment, which is smaller).
+static constexpr size_t kv_layer_align_bytes = 512;
+
 kv_tier_manager & get_kv_tier_manager(int device) {
     return g_kv_tier_managers[device];
 }
@@ -140,7 +145,7 @@ std::vector<layer_region> kv_tier_manager::compute_region_layout(size_t total_by
     size_t                    host_offset   = 0;
     for (uint32_t l = 0; l < total_layers_; l++) {
         const size_t raw_size     = kv_layer_size(l);
-        const size_t aligned_size = (raw_size + 511) & ~size_t(511);
+        const size_t aligned_size = (raw_size + kv_layer_align_bytes - 1) & ~(kv_layer_align_bytes - 1);
         regions[l].layer_id  = l;
         regions[l].size      = aligned_size;
         regions[l].on_device = is_hot(l);
@@ -243,10 +248,11 @@ void kv_tier_manager::configure_with_weights(int                   device,
         host_bytes / (1024.0 * 1024.0));
 }
 
-void kv_tier_manager::configure_from_plan(int                    device,
-                                          const placement_plan & plan,
-                                          uint32_t               n_layers,
-                                          const kv_slice_size &  slice) {
+void kv_tier_manager::configure_from_plan(int                          device,
+                                          const placement_plan &       plan,
+                                          uint32_t                     n_layers,
+                                          const kv_slice_size &        slice,
+                                          const std::vector<uint8_t> * buffer_layer_mask) {
     device_       = device;
     total_layers_ = n_layers;
 
@@ -297,8 +303,7 @@ void kv_tier_manager::configure_from_plan(int                    device,
         }
     }
 
-    // Build per-layer placement and heterogeneous KV sizes.
-    // Full-attention layers use plan.kv_per_layer; SWA layers use plan.kv_per_swa_layer.
+    // Build per-layer placement.
     layer_on_device_.assign(n_layers, false);
     // assign(), not resize(): kv_tier_manager is a per-device singleton reused
     // across models, and resize() would leave a shorter previous model's
@@ -311,19 +316,96 @@ void kv_tier_manager::configure_from_plan(int                    device,
         if (on_device) {
             hot_layers_++;
         }
-        // Assign heterogeneous per-layer size when SWA info is available.
-        if (plan.kv_per_swa_layer > 0 && !plan.swa_layer_mask.empty()) {
+    }
+
+    active_ = (hot_layers_ < total_layers_);
+
+    // Per-layer KV sizes (llama.cpp-7yv9).  The plan's per-layer truth --
+    // placement_plan::kv_size_for_layer(): FULL / SWA / SHARED kind and that
+    // layer's own K/V width -- is what every other consumer of the KV budget
+    // sizes from; sizing here from the uniform scalars instead gave every SWA
+    // layer of a Gemma 4 E4B buffer plan.kv_per_swa_layer (computed at the
+    // global full-attention width) and reserved 2x its real bytes.
+    //
+    // The buffer is the ground truth about what llama allocated, so the
+    // truth is used only when it accounts for this buffer's layers: the sum
+    // over the buffer's members must match slice.total_bytes() up to
+    // per-layer alignment slack.  A sum that exceeds the buffer (a plan whose
+    // fp16 formula does not match a quantized KV cache, or a stale plan) or
+    // under-sizes it (which would under-allocate layers and overflow --
+    // "[KV-REMAP] ERROR: ... overflows layer alloc!") is refused with a WARN
+    // naming both numbers, and the slice -- exact by construction for a
+    // homogeneous buffer -- sizes the layers as before.  Never a silent clamp.
+    const auto in_buffer = [&](uint32_t l) {
+        return buffer_layer_mask == nullptr || (l < buffer_layer_mask->size() && (*buffer_layer_mask)[l] != 0);
+    };
+    bool     truth_covers_buffer = true;
+    size_t   truth_sum           = 0;
+    uint32_t buffer_layers       = 0;
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        if (!in_buffer(l)) {
+            continue;
+        }
+        buffer_layers++;
+        if (!plan.has_per_layer_kv_truth(l)) {
+            truth_covers_buffer = false;
+            break;
+        }
+        truth_sum += plan.kv_size_for_layer(l);
+    }
+
+    bool use_truth     = truth_covers_buffer && buffer_layers > 0 && truth_sum > 0;
+    bool truth_refused = false;
+    if (use_truth) {
+        const size_t total = slice.total_bytes();
+        const size_t slack = static_cast<size_t>(buffer_layers) * kv_layer_align_bytes;
+        if (truth_sum > total) {
+            GGML_LOG_WARN(
+                "[KV-TIER] per-layer KV truth sum %zu B exceeds this buffer's %zu B (%u layers); "
+                "sizing every layer from the slice (%zu B/layer) instead (llama.cpp-7yv9)\n",
+                truth_sum, total, buffer_layers, kv_per_layer_);
+            truth_refused = true;
+        } else if (total - truth_sum > slack) {
+            GGML_LOG_WARN(
+                "[KV-TIER] per-layer KV truth sum %zu B under-sizes this buffer's %zu B by %zu B (> %u layers x %zu B "
+                "alignment slack); sizing every layer from the slice (%zu B/layer) instead (llama.cpp-7yv9)\n",
+                truth_sum, total, total - truth_sum, buffer_layers, kv_layer_align_bytes, kv_per_layer_);
+            truth_refused = true;
+        }
+        use_truth = !truth_refused;
+    }
+
+    if (use_truth) {
+        // Every layer with truth, not only this buffer's: kv_layer_size(l) is
+        // then right for any layer asked about, and the caller zeroes the
+        // regions of layers outside the buffer before allocating.
+        for (uint32_t l = 0; l < n_layers; ++l) {
+            if (plan.has_per_layer_kv_truth(l)) {
+                per_layer_kv_bytes_[l] = plan.kv_size_for_layer(l);
+            }
+        }
+    } else if (truth_refused) {
+        // The plan's KV arithmetic does not describe this buffer, so its
+        // other scalar (kv_per_swa_layer, same formula) is not trusted either:
+        // every layer keeps the ranked slice already assigned above, which is
+        // derived from the buffer llama actually allocated.
+    } else if (plan.kv_per_swa_layer > 0 && !plan.swa_layer_mask.empty()) {
+        // Legacy uniform-per-class split (no per-layer truth on the plan):
+        // full-attention layers use the ranked kv_per_layer_, SWA layers
+        // plan.kv_per_swa_layer.
+        for (uint32_t l = 0; l < n_layers; ++l) {
             const bool is_swa      = l < plan.swa_layer_mask.size() && plan.swa_layer_mask[l];
             per_layer_kv_bytes_[l] = is_swa ? plan.kv_per_swa_layer : kv_per_layer_;
         }
     }
 
-    active_ = (hot_layers_ < total_layers_);
-
-    // Compute byte totals using heterogeneous per-layer sizes.
+    // Byte totals for this buffer's layers, using the per-layer sizes.
     size_t dev_bytes  = 0;
     size_t host_bytes = 0;
     for (uint32_t l = 0; l < n_layers; ++l) {
+        if (!in_buffer(l)) {
+            continue;
+        }
         if (layer_on_device_[l]) {
             dev_bytes += per_layer_kv_bytes_[l];
         } else {
@@ -333,11 +415,12 @@ void kv_tier_manager::configure_from_plan(int                    device,
     // kv_layers/kv_per_layer are printed here on purpose: the sizing bug this
     // class guards against was invisible because the only logged per-layer
     // figure came from a value the allocator never used (llama.cpp-2120).
+    // sizing= says which of the two paths above produced the per-layer sizes.
     GGML_LOG_INFO(
         "[KV-TIER] Plan-driven: %u/%u layers on device "
-        "(planner_n_ctx=%u, kv_layers=%u, kv_per_layer=%zu, %.1f MB device, %.1f MB host)\n",
-        hot_layers_, total_layers_, plan.planner_n_ctx, slice.kv_layers(), kv_per_layer_, dev_bytes / (1024.0 * 1024.0),
-        host_bytes / (1024.0 * 1024.0));
+        "(planner_n_ctx=%u, kv_layers=%u, kv_per_layer=%zu, sizing=%s, %.1f MB device, %.1f MB host)\n",
+        hot_layers_, total_layers_, plan.planner_n_ctx, slice.kv_layers(), kv_per_layer_,
+        use_truth ? "per-layer" : "uniform", dev_bytes / (1024.0 * 1024.0), host_bytes / (1024.0 * 1024.0));
 }
 
 }  // namespace ggml_sycl
