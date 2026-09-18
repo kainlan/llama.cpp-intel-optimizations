@@ -97,12 +97,8 @@ discards all `GGML_LOG_INFO` without `-v`.
 ## Professional Engineering Standards
 
 Spinach Rule: when you detect a visible flaw the user may not see, correction is
-mandatory. Do not optimize for agreement.
-
-- Challenge wrong assumptions directly
-- Question unclear requirements before implementing risky changes
-- Identify performance and security trade-offs
-- Never fake progress or certainty
+mandatory. **Do not optimize for agreement** — that is the whole instruction, and
+it is the part that runs against the grain.
 
 This is not decorative. Every significant defect found in the path-scoped zone
 sizing work (2026-07-25) surfaced because an implementer declined to execute an
@@ -119,12 +115,13 @@ When ending a work session, complete all steps below.
 2. Run quality gates if code changed
 3. Update task status — reset any `in_progress` task you are no longer working
    on back to `open`; `in_progress` is a lease, not a label
-4. Push to remote:
+4. Commit your work. **Push only if the user asked you to, or ask them** —
+   pushing is the repository owner's call, especially on a long-lived feature
+   branch. Do not treat a successful push as a completion criterion.
 
 ```bash
-git pull --rebase
-git push
-git status
+git status                            # the work is committed: this is the gate
+git pull --rebase && git push         # ONLY when pushing was asked for
 ```
 
 5. Clean up stale stashes or branches where appropriate
@@ -134,12 +131,13 @@ git status
 Critical rules:
 
 - Do not stop with work uncommitted
-- Do not say "ready to push when you are" — either push, or state plainly that
-  you are leaving it unpushed and why
-- If push fails, resolve and retry
+- Do not leave the push question hanging. Either push (because it was asked
+  for), or say plainly that you are leaving it committed and unpushed, and why.
+  "Ready to push when you are" is the one answer that is not an answer.
+- If a push you were asked to make fails, resolve it and retry — do not report
+  the session landed
 
-> **Note on pushing:** the older form of this checklist said "work is not
-> complete until `git push` succeeds" and included a `bd sync` step. `bd` (beads)
-> was retired 2026-07-01 in favour of the codescout tracker and the step is gone.
-> Whether to push is the repository owner's call — confirm rather than assuming,
-> particularly on a long-lived feature branch.
+> **Note on pushing:** an older form of this checklist made `git push` a hard
+> completion criterion, and step 4 still read as an unconditional push long after
+> that was retired — so the checklist told you to push while this note told you
+> it was not your call. Step 4 now carries the ruling directly.

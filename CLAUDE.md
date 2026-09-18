@@ -138,12 +138,19 @@ the single binary this file separately forbids running unattended (see Hard-Won
 Rules: 50–224 GB of TTM shmem, two OOM kills). At the `-j 4` this file then
 prescribed, it would have started alongside three other tests.
 
-The cause is structural, not a typo: `tests/CMakeLists.txt:2150` (post-b10630
-merge; the line drifts — verify with a grep) registers it as
+The cause is structural, not a typo: `tests/CMakeLists.txt` registers it as
 a bare `llama_build_and_test(test-backend-ops.cpp)` with **no labels**, so it
-inherits only the default `main` and no label denylist can reach it. Verify
-rather than assume — a label filter is silently permissive toward anything
-nobody remembered to tag, so it fails *open*:
+inherits only the default `main` and no label denylist can reach it. Locate the
+registration rather than trusting a line number written down anywhere — this
+file pinned `:2150` until a post-b10630 merge moved it ~700 lines (it is 2846
+today), which is why it no longer pins one at all:
+
+```bash
+cat tests/CMakeLists.txt | grep -n 'test-backend-ops'
+```
+
+Verify rather than assume — a label filter is silently permissive toward
+anything nobody remembered to tag, so it fails *open*:
 
 ```bash
 # Always confirm what a filtered sweep will actually run before running it.
@@ -685,6 +692,28 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
   B70, CPU-optimal for host-pinned); routes consume the materialized layout,
   never advertise past it, and only advertise (type, layout) pairs whose kernels
   exist. AOS fallback is a correctness stopgap, not the design.
+  ⚠️ **Dispatch-side sharpening (owner ruling 2026-09-18): THE LOADED LAYOUT IS THE
+  ANSWER, NOT A QUESTION TO ASK AGAIN.** The planner and the unified cache decide
+  layout, per device, and what they materialized into VRAM/RAM **is correct by
+  definition** — it is the fact, not a preference some later code may re-derive.
+  So dispatch selects the **kernel** from the layout the operand is already in,
+  exactly as it selects the **device** from where the operand already lives. Both
+  come from the same authority: placement. Re-deriving layout at dispatch from a
+  policy function is the defect, even when the policy is "right", because two
+  sources for one fact will disagree eventually — which is precisely
+  `llama.cpp-l9i1` (`route_layout=soa` vs `src0_layout=aos` on the same tensor;
+  forcing them to agree turned NaN into a verified pass, measured 2026-09-18).
+  The general shape is the `t98c`/`l9i1` family: **one fact, two sources.** If you
+  find code asking a selector for something the operand already knows, delete the
+  question, do not tune the answer.
+  **Corollary — a missing kernel for the materialized layout is a SUPPORT GAP TO
+  CLOSE, not a routing problem to work around.** When dispatch finds no kernel for
+  the (type, layout) actually loaded, the fix is to write that kernel. It is *not*
+  to re-route to another executor, silently convert the operand, refuse the op, or
+  widen a policy so the planner picks a layout the kernel already has — all of
+  which preserve the gap while hiding it. Advertising honestly (above) is how you
+  avoid producing wrong numbers in the meantime; it is not the fix, and a
+  capability refusal left standing is a ticket, not a resolution.
 - **The VRAM budget calc is correct by design for DISCRETE cards** (`min(total*pct, free_at_init)`). Low free VRAM is a system problem (other GPUs active, driver overhead), not an app bug to "fix" by ignoring free VRAM — fix the root cause at the system level.
   ⚠️ **It is catastrophically wrong for an INTEGRATED GPU, and that is the cause of this host's OOM history** (`llama.cpp-403s`, measured 2026-08-01). The Arrow Lake-S iGPU reports `global_mem_size` = **231.7 GB** — 94 % of the host's 246.9 GB — because for an integrated GPU "VRAM" *is* system RAM. `ggml-sycl.cpp:10043-10049` feeds that into the same budget path as a discrete card at a **default of 100 %**, and neither `ggml-sycl.cpp` nor `unified-cache.cpp` contains a single occurrence of `host_unified` or `is_integrated`. So the backend claims the machine.
   Isolated with one variable — same 19 MB model, same single-threaded `llama-completion`, only the selector changed: `level_zero:0` → peak `Shmem` **2.4 GB**; `level_zero:0,1` → **2.4 GB**; selector unset (adds the iGPU) → **127.8 GB**.
@@ -880,9 +909,40 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
 # the in-process server path that the chat gate uses.
 # POST-b10630 MERGE (2026-08-26): the gate re-verified green on the landed tree
 # in the form below MINUS `-cnv` and WITH `-c 4096` (digit line count=1, rc=0).
-# `-cnv` still exists post-merge; the -c pin remains required per llama.cpp-uize.
+# The -c pin remains required per llama.cpp-uize. Re-verified green again
+# 2026-09-18 on a restored tree: rc=0, 0 aborts, Shmem flat at 0.96 GB.
 #   > Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
 #   1, 2, 3, 4, 5
+# ⚠️ SCORE IT WITH `grep -cx`, NOT `grep -c` -- "count=1" above is only true of
+# the exact-line form. The prompt echo on the "> " line ENDS with the same digit
+# sequence, so a loose grep returns **2** on a passing gate (measured 2026-09-18);
+# anyone scoring for 1 reads green as red. This is the same trap as the stale
+# ": 1, 2, 3, 4, 5" colon form noted below -- the prompt contains the answer.
+#   cat <log> | grep -cx '1, 2, 3, 4, 5'   # 1 = pass (the ANSWER line alone)
+# Negative control, so the scorer is not taken on faith -- the echo line alone
+# must score 0:
+#   echo '> Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
+#     | grep -cx '1, 2, 3, 4, 5'           # 0
+# ⚠️ `-cnv` IS NOT VALID ON llama-cli AND HAS BEEN REMOVED FROM THE COMMAND BELOW
+# (verified 2026-09-18, llama.cpp-9p6c). Passing it gives
+# `error: invalid argument: -cnv`. This note previously said "`-cnv` still exists
+# post-merge", which is true of the PARSER and false of this BINARY -- the exact
+# trap the GGML_ABORT entry above warns about, one level up.
+# `common/arg.cpp:1908-1918` registers {"-cnv","--conversation"} (and -no-cnv)
+# with `.set_examples({LLAMA_EXAMPLE_COMPLETION})` -- COMPLETION only. Its
+# neighbours show the filter is deliberate, not an oversight: `-sp` carries
+# {COMPLETION, CLI, SERVER} and `-st` carries {COMPLETION, CLI}, which is why
+# `-st` below still works. So grepping arg.cpp for "-cnv" returns a REAL hit for
+# a flag `llama-cli` will still reject; `set_examples()` is a per-tool visibility
+# filter applied after registration.
+# The reason is the upstream main split: `llama-cli` IS the conversation tool
+# (conversation is not a mode you enable there, it is what the binary does),
+# while `llama-completion` does raw completion and needs `-cnv` to opt IN /
+# `-no-cnv` to opt OUT -- which is how ci/run.sh and tools/quantize/tests.sh use
+# it. Do not "restore" `-cnv` here; it would break the gate again.
+# Ask the BINARY, never the parser source -- `--help` is generated from the
+# filtered option set, so it cannot lie about this:
+#   ./build/bin/llama-cli --help | grep -c cnv     # 0 = correctly absent
 # The gate is the digit sequence. (An older note here said the output starts
 # ": 1, 2, 3, 4, 5" — that colon was the tail of the echoed PROMPT, which itself
 # ends "...only: 1, 2, 3, 4, 5", captured in a pre-`--no-display-prompt` form.
@@ -890,8 +950,8 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
 # Use the GGUF tokenizer.chat_template metadata. Do not force
 # `--chat-template gpt-oss`; that selects the older native formatter.
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
-  -cnv -st --simple-io --no-display-prompt \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -c 4096 \
+  -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
   -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
@@ -966,8 +1026,10 @@ canonical contract §5 still apply.
 
 ### GPT-OSS Prompt Template Rule
 
-Use `llama-cli -cnv` (the GPT-OSS gate above) so the CLI applies the model's
-embedded GGUF/Jinja chat template. Do **not** pass `--chat-template gpt-oss` (it
+Use `llama-cli` (the GPT-OSS gate above) so the CLI applies the model's
+embedded GGUF/Jinja chat template. `llama-cli` is conversational by default, so
+no `-cnv` is needed — and passing it fails outright; see the gate block above for
+why. Do **not** pass `--chat-template gpt-oss` (it
 selects the older native formatter) or hand-render a raw Harmony prompt. Always
 pin `reasoning_effort=medium` via `--chat-template-kwargs` so template metadata,
 CLI defaults, or harness changes can't move the prompt across regression
@@ -1163,7 +1225,7 @@ driver 26.27:
 
 | card | model | PP512 | TG128 |
 |------|-------|------:|------:|
-| Arc Pro B70 (`level_zero:0`) | GPT-OSS 20B MXFP4 | ~1415 | ~44 |
+| Arc Pro B70 (`level_zero:0`) | GPT-OSS 20B MXFP4 | ~1415 | ~44 on 26.27 — **~39-40 on 26.31, see Regression Baselines** |
 | Arc Pro B70 (`level_zero:0`) | Mistral 7B Q4_0 | ~2495 | ~108 |
 | Arc Pro B50 (`level_zero:1`) | GPT-OSS 20B MXFP4 | ~894 | ~32 |
 | Arc Pro B50 (`level_zero:1`) | Mistral 7B Q4_0 | ~1188 | ~47 |
@@ -1228,7 +1290,17 @@ card or an older driver. Allow the stated spread: B70 tg is noisy (±10% between
 single runs means nothing), the B50 is steady.
 
 - **B50 GPT-OSS 20B MXFP4 FA-on:** ~894 PP512 / ~32 TG128, count gate passing.
-- **B70 GPT-OSS 20B MXFP4 FA-on:** ~1415 PP512 / ~44 TG128, count gate passing.
+- **B70 GPT-OSS 20B MXFP4 FA-on:** ~1415 PP512 / **~39-40** TG128, count gate
+  passing.
+  ⚠️ **This line carried `~44 TG128` until 2026-09-17 and it was stale in exactly
+  the way the `≥1100` story below describes.** `docs/backend/sycl-perf-baselines.md`
+  — the document this section defers to — states in the notes under its pp512
+  table: *"The documented ~44 B70 GPT-OSS tg floor predates driver 26.31; ~39-40
+  is what this tree does."* Every measurement since 2026-08-18 ran on 26.31 (see
+  the stale-pin correction under Patched compute-runtime). Scored against ~44, a
+  healthy B70 reads as a ~10% regression — and B70 tg is the noisy axis, so a
+  single run cannot tell you which it is. If you find ~44 quoted as a gate
+  anywhere else, it is wrong there too.
 - **B50 / B70 Mistral 7B Q4_0:** ~1188 / ~2495 PP512, ~47 / ~108 TG128.
 
 ⚠️ **A `≥1100 PP512, ~50+ TG128` B50 GPT-OSS guardrail appeared here until

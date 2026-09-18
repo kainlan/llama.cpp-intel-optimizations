@@ -586,6 +586,18 @@ else()
     message(STATUS "ggml-sycl: Battlemage AOT disabled; JIT only (-fsycl-targets=spir64) [ocloc not found or GGML_SYCL_BMG_AOT=OFF]")
     set(GGML_SYCL_INTEL_TARGETS "spir64")
 endif()
+if (GGML_SYCL_CPU_DEVICE)
+    # AOT-compile an x86_64 device image so the OpenCL CPU device has one of its own
+    # (llama.cpp-16of). Without it the CPU device JITs the spir64 image, and that image
+    # carries -cl-intel-greater-than-4GB-buffer-required in its recorded build options
+    # (see the GPU-scoped option further down), which Intel's OpenCL CPU compiler rejects
+    # outright -- so GGML_SYCL_CPU_OFFLOAD=1 could not compile a single kernel and threw
+    # on the first op submitted to the CPU queue.
+    # This MUST be appended here rather than via a second -fsycl-targets at the use site:
+    # the flag is not additive, and a duplicate is dropped with a -Woffload-target warning.
+    set(GGML_SYCL_INTEL_TARGETS "${GGML_SYCL_INTEL_TARGETS},spir64_x86_64")
+    message(STATUS "ggml-sycl: CPU device image enabled (-fsycl-targets=${GGML_SYCL_INTEL_TARGETS})")
+endif()
 
 # Enable SPIR-V split barrier extension for cooperative ESIMD kernels on Arc GPUs
 # Split barriers allow non-blocking arrival + deferred wait, improving performance
@@ -601,6 +613,17 @@ if (GGML_SYCL_BMG_AOT_ENABLED)
     target_link_options(ggml-sycl PRIVATE
         "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
         "SHELL:-Xspirv-translator=intel_gpu_bmg_g31 -spirv-ext=+SPV_INTEL_split_barrier")
+endif()
+if (GGML_SYCL_CPU_DEVICE)
+    # Same per-target rule as the BMG entries above: the CPU image is a separate
+    # -fsycl-targets entry, so it needs its own -Xspirv-translator invocation or the
+    # device link fails with "RequiresExtension: Feature requires the following SPIR-V
+    # extension: SPV_INTEL_split_barrier" and llvm-spirv exit code 18. Measured
+    # 2026-09-18: omitting this failed the link of libggml-sycl and 7 test binaries
+    # AFTER a full 44-minute recompile, because the miss only surfaces at device-link
+    # time -- every translation unit compiles clean first.
+    target_link_options(ggml-sycl PRIVATE
+        "SHELL:-Xspirv-translator=spir64_x86_64 -spirv-ext=+SPV_INTEL_split_barrier")
 endif()
 
 # Link against oneDNN (primary math backend for Intel targets)
@@ -741,7 +764,30 @@ if (GGML_SYCL_TARGET STREQUAL "INTEL")
     # Enable stateless addressing for >4GB device allocations (required for VRAM arena).
     # Without this, kernels use 32-bit offsets and hang when reading beyond 4GB.
     # See: https://github.com/intel/compute-runtime/blob/master/programmers-guide/ALLOCATIONS_GREATER_THAN_4GB.md
-    target_link_options(ggml-sycl PRIVATE  -Xs   "-cl-intel-greater-than-4GB-buffer-required")
+    #
+    # The option MUST be scoped to the GPU target rather than passed with -Xs
+    # (llama.cpp-16of). -Xs applies it to EVERY device target, which records it in the
+    # SPIR-V module's build options; those options are replayed at JIT time on whatever
+    # device loads the module, and Intel's OpenCL CPU compiler rejects the option outright
+    # ("Unrecognized build options: -cl-intel-greater-than-4GB-buffer-required" ->
+    # "Compilation failed"). That made GGML_SYCL_CPU_OFFLOAD=1 unable to compile a single
+    # kernel: the CPU device initialised fine and then threw on the first op submitted to
+    # it, so the whole cpu-dispatch path was dead while looking merely misconfigured.
+    # Isolated 2026-09-18 with a 12-line SYCL program: identical source, flag present ->
+    # CPU FAIL / both GPUs PASS; flag scoped as below -> CPU PASS / both GPUs PASS.
+    # spir64 is named explicitly because -Xsycl-target-backend needs a target to attach
+    # to; it is already in GGML_SYCL_INTEL_TARGETS (computed above) in every
+    # configuration, AOT or JIT-only. Do NOT add another -fsycl-targets here: every
+    # consumer derives its target list from GGML_SYCL_INTEL_TARGETS, and a second
+    # -fsycl-targets is silently dropped ("offloading target 'spir64' is similar to
+    # target 'spir64' already specified; will be ignored"), taking any extra target with
+    # it -- so the build goes green having built no new device image at all. Change the
+    # variable at its computation site instead. Find every consumer with
+    #   cat ggml/src/ggml-sycl/CMakeLists.txt | grep -n 'fsycl-targets=\${GGML_SYCL_INTEL_TARGETS}'
+    # (there are several -- ggml-sycl itself plus per-test targets); an earlier revision
+    # of this comment pinned two line numbers and they were stale within one edit.
+    target_link_options(ggml-sycl PRIVATE
+        -Xsycl-target-backend=spir64 "-cl-intel-greater-than-4GB-buffer-required")
 elseif (GGML_SYCL_TARGET STREQUAL "NVIDIA")
     add_compile_definitions(GGML_SYCL_WARP_SIZE=32)
 elseif (GGML_SYCL_TARGET STREQUAL "AMD")

@@ -252,6 +252,11 @@ option(GGML_SYCL_HOST_MEM_FALLBACK          "ggml: allow host memory fallback in
 option(GGML_SYCL_SUPPORT_LEVEL_ZERO_API     "ggml: use Level Zero API in SYCL backend"  ON)
 option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
 option(GGML_SYCL_OUT_OF_ORDER               "ggml: use out-of-order queues (experimental)"    OFF)
+# OFF because it does not build yet -- see llama.cpp-16of. The flag plumbing below is
+# correct and verified; what blocks it is that the SYCL kernel set contains GPU-only
+# kernels (XMX joint_matrix -> AMX, cooperative ESIMD) which cannot compile into an
+# x86_64 device image on a CPU without AMX. Turning this ON fails the device link.
+option(GGML_SYCL_CPU_DEVICE                 "ggml: AOT-build a CPU device image so GGML_SYCL_CPU_OFFLOAD=1 can run (llama.cpp-16of; DOES NOT BUILD YET)" OFF)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
 set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
