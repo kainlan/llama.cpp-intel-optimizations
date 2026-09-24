@@ -51002,12 +51002,18 @@ static bool ggml_sycl_publish_f16_attention_dst_handle(ggml_tensor *           d
         }
         published_handle = std::move(*owned_handle);
     } else {
+        // The producer wrote into the buffer this slot already publishes (a routed
+        // op whose dst was published by an earlier graph, reused in place). Keep
+        // THAT handle: it may be the allocation's only owner. Re-minting it via
+        // from_chunk_ptr() yields a non-owning alias for an EXTERNAL_EXACT staging
+        // buffer (see llama.cpp-1df8), and moving the alias into the slot dropped
+        // the last owner -- the buffer was freed while tensor->data still named it,
+        // and the next consumer faulted the GPU (llama.cpp-49lj layer 4).
         const auto & existing_handle = extra->data_handle[target_device];
         auto         existing =
             existing_handle.is_weight() ? ggml_sycl::resolved_ptr{} : existing_handle.resolve(target_device);
         if (existing && existing.ptr == produced_base) {
-            published_handle =
-                ggml_sycl::mem_handle::from_chunk_ptr(existing.ptr, target_device, existing.layout, existing.on_device);
+            published_handle = existing_handle;
         }
     }
 
