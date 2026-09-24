@@ -394,7 +394,14 @@ struct placement_entry {
     int                expert_id         = -1;  // -1 for dense weights, >=0 for individual MoE experts
     expert_tensor_role expert_role       = expert_tensor_role::UNKNOWN;  // gate/up/down for MoE expert tensors
     ggml_layout_mode   layout            = GGML_LAYOUT_AOS;         // Materialized device layout planned for this entry
-    std::vector<placement_alternate_layout> alternate_layouts;      // Additional cache-owned executable layouts
+    // Two meanings, two fields (llama.cpp-21jd). alternate_layouts: layouts a device
+    // holds as a REPLICA, materialized there instead of the primary (multi-device
+    // and no-P2P candidates, MoE PP/i8 variants; readers filter per alternate by
+    // target). extra_layouts: a dense layout held AS WELL as the on-device primary,
+    // on the same device -- today only the oneDNN WOQ second copy. Folding the extra
+    // copy into alternate_layouts once made S1-PRELOAD stage every primary as WOQ.
+    std::vector<placement_alternate_layout> alternate_layouts;
+    std::vector<placement_alternate_layout> extra_layouts;          // target_device always -1 (same device)
     bool                                    on_device     = false;  // true = VRAM (any device), false = host
     int                                     target_device = -1;     // Target GPU device_id (-1 = host/CPU)
     size_t vram_charge_size = 0;  // Bytes consumed by zone_alloc(WEIGHT) after allocator rounding
@@ -1245,6 +1252,24 @@ struct placement_plan {
                 if (out != nullptr) {
                     *out = alt;
                 }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Did the plan promise a dense extra (same-device, additional) copy in `layout`?
+    bool dense_extra_layout_on_device(const std::string & name, int dev_id, ggml_layout_mode layout) const {
+        auto it = name_index_.find(name);
+        if (it == name_index_.end()) {
+            return false;
+        }
+        const placement_entry & e = entries[it->second];
+        if (e.expert_id >= 0 || !e.on_device || e.target_device != dev_id) {
+            return false;
+        }
+        for (const placement_alternate_layout & extra : e.extra_layouts) {
+            if (extra.layout == layout) {
                 return true;
             }
         }

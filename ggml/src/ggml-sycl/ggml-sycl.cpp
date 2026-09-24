@@ -16319,19 +16319,22 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             if (entry.on_device) {
                 device_bytes += entry.dst_size;
                 device_count++;
-                // llama.cpp-21jd: count alternate layouts too (today: the dense
-                // oneDNN WOQ second copy, populated by add_dense_woq_alternates()
-                // in unified-cache.cpp). Without this, PLACE-4 reported only the
-                // primary copy while S1-PRELOAD staged the alternate as well, so
-                // the two lines this ticket is about could never agree -- see
-                // ggml_sycl_dense_woq_alternate_eligible's comment for the fuller
-                // history.
+                // llama.cpp-21jd: count every extra copy this device holds too --
+                // same-device alternates (MoE PP/i8 variants) and dense extra
+                // layouts (the oneDNN WOQ second copy, add_dense_woq_alternates()
+                // in unified-cache.cpp). Without them PLACE-4 reported only the
+                // primary while S1-PRELOAD staged the copies as well, so the two
+                // totals could never agree.
                 for (const auto & alt : entry.alternate_layouts) {
                     const int alt_target = alt.target_device >= 0 ? alt.target_device : entry.target_device;
                     if (alt_target == entry.target_device) {
                         device_bytes += alt.dst_size;
                         device_count++;
                     }
+                }
+                for (const auto & extra : entry.extra_layouts) {
+                    device_bytes += extra.dst_size;
+                    device_count++;
                 }
             } else {
                 host_bytes += entry.dst_size;
@@ -32794,16 +32797,15 @@ static void ggml_sycl_preload_model_weights() {
         size_t                                    moe_cached        = 0;
         size_t                                    moe_failed        = 0;
         size_t                                    total_bytes       = 0;
-        // llama.cpp-21jd #2e: counts a WOQ alternate the plan's own
-        // add_dense_woq_alternates() predicted (see its comment) but
-        // materialization declined anyway -- e.g. the runtime headroom guard
-        // near its increment site found less room than the plan-time
-        // snapshot did. Distinct from the planner's own skipped_capacity
-        // count (predicted, at plan time); this one is what actually
-        // happened. Declared here (not inside the per-layer block below) so
-        // it survives to the async-bulk summary printed once for the whole
-        // preload, not reset every layer.
-        size_t                                    dense_woq_alt_materialize_skipped = 0;
+        // llama.cpp-21jd #2e: dense oneDNN WOQ second copies, classified against
+        // the plan's own promise (placement_entry::extra_layouts, written by
+        // add_dense_woq_alternates()). planned_declined and staged_unplanned
+        // are plan/runtime DISAGREEMENTS; unplanned_declined is expected (the
+        // planner's [PLACE-4-WOQ] skipped_capacity already said so). Declared
+        // here so they survive to the summary printed once for the preload.
+        size_t                                    dense_woq_planned_declined   = 0;
+        size_t                                    dense_woq_staged_unplanned   = 0;
+        size_t                                    dense_woq_unplanned_declined = 0;
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_device_bytes{};
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_host_bytes{};
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_device_count{};
@@ -32987,6 +32989,10 @@ static void ggml_sycl_preload_model_weights() {
                 layout_mode           layout;
                 const ggml_tensor *   tensor;
                 ggml_sycl::mem_handle handle;
+                // Bytes staged for THIS layout. key.nbytes is the tensor's source size and is
+                // shared by the primary and its WOQ copy, so summing it under-counted the
+                // Pinned line against async bulk (Mistral PCT=60: 6377.7 vs 6787.6 MB).
+                size_t                staged_bytes = 0;
             };
 
             std::vector<dense_pin_info> dense_pin_keys;
@@ -34078,8 +34084,8 @@ static void ggml_sycl_preload_model_weights() {
                         dense_primary_staged_bytes += dst_size;
                         weight_device_bytes[device] += dst_size;
                         weight_device_count[device]++;
-                        dense_pin_keys.push_back({ cache_key, preload_layout, tensor, std::move(handle) });
-                        dense_layout_pin_keys.push_back({ cache_key, preload_layout, tensor, {} });
+                        dense_pin_keys.push_back({ cache_key, preload_layout, tensor, std::move(handle), dst_size });
+                        dense_layout_pin_keys.push_back({ cache_key, preload_layout, tensor, {}, dst_size });
                         s1_push_event(result.event,
                                       std::string(tensor->name ? tensor->name : "?") +
                                           " action=stage-dense layout=" + ggml_sycl_layout_mode_name(preload_layout),
@@ -34126,6 +34132,10 @@ static void ggml_sycl_preload_model_weights() {
                                                                  plan_owner->vram_bytes - dense_primary_staged_bytes :
                                                                  0) :
                                                             512ull * 1024ull * 1024ull;
+                            // Same authority as the guard: did the plan promise this copy?
+                            const bool   woq_planned =
+                                plan_owner && !dense_name.empty() &&
+                                plan_owner->dense_extra_layout_on_device(dense_name, device, GGML_LAYOUT_ONEDNN_WOQ);
                             if (woq_size > 0 && cache->zone_largest_free(ggml_sycl::vram_zone_id::WEIGHT) >= woq_size &&
                                 cache->zone_available(ggml_sycl::vram_zone_id::WEIGHT) >= woq_size + woq_headroom) {
                                 ggml_sycl_onednn_woq_fill_ctx woq_ctx{};
@@ -34138,12 +34148,15 @@ static void ggml_sycl_preload_model_weights() {
                                     device, cache_key, src_ptr, src_size, woq_size, GGML_LAYOUT_ONEDNN_WOQ,
                                     ggml_sycl_fill_onednn_woq, &woq_ctx, s1_preload_q, &woq_handle);
                                 if (woq_result.ok && woq_result.ptr) {
+                                    if (!woq_planned) {
+                                        dense_woq_staged_unplanned++;
+                                    }
                                     dense_cached++;
                                     total_bytes += woq_size;
                                     weight_device_bytes[device] += woq_size;
                                     weight_device_count[device]++;
                                     dense_layout_pin_keys.push_back(
-                                        { cache_key, GGML_LAYOUT_ONEDNN_WOQ, tensor, std::move(woq_handle) });
+                                        { cache_key, GGML_LAYOUT_ONEDNN_WOQ, tensor, std::move(woq_handle), woq_size });
                                     s1_push_event(woq_result.event,
                                                   std::string(tensor->name ? tensor->name : "?") +
                                                       " action=stage-dense-alt layout=onednn_woq",
@@ -34153,12 +34166,10 @@ static void ggml_sycl_preload_model_weights() {
                                         "[S1-PRELOAD] dense ONEDNN_WOQ materialization fill failed; aborting before "
                                         "inference with incomplete device placement");
                                 }
+                            } else if (woq_planned) {
+                                dense_woq_planned_declined++;
                             } else {
-                                // llama.cpp-21jd #2e: eligible but declined by the
-                                // runtime headroom guard -- counted so the run's own
-                                // summary can say so, instead of this being invisible
-                                // the way it was before this ticket.
-                                dense_woq_alt_materialize_skipped++;
+                                dense_woq_unplanned_declined++;
                             }
                         }
 #endif
@@ -34177,8 +34188,9 @@ static void ggml_sycl_preload_model_weights() {
                             dense_primary_staged_bytes += src_size;
                             weight_device_bytes[device] += src_size;
                             weight_device_count[device]++;
-                            dense_pin_keys.push_back({ cache_key, GGML_LAYOUT_AOS, tensor, std::move(aos_handle) });
-                            dense_layout_pin_keys.push_back({ cache_key, GGML_LAYOUT_AOS, tensor, {} });
+                            dense_pin_keys.push_back(
+                                { cache_key, GGML_LAYOUT_AOS, tensor, std::move(aos_handle), src_size });
+                            dense_layout_pin_keys.push_back({ cache_key, GGML_LAYOUT_AOS, tensor, {}, src_size });
                             s1_push_event(aos_result.event,
                                           std::string(tensor->name ? tensor->name : "?") +
                                               " action=stage-dense-fallback layout=AOS",
@@ -34636,6 +34648,17 @@ static void ggml_sycl_preload_model_weights() {
                             "extra->data_handle[]/preload_model_weights(dense-pin)");
                         extra->data_device[device]      = resolved.ptr;
                         extra->data_device_size[device] = pin_info.key.nbytes;
+                        // Record the layout these bytes are in alongside the pointer. Without
+                        // this, extra->layout kept the AOS default from set_tensor while
+                        // data_device pointed at SOA bytes -- every reader that took the layout
+                        // from extra decoded them as AOS (llama.cpp-pzu9: Qwen1.5-MoE
+                        // ffn_down_shexp). Only the layouts that need no tile/pack metadata;
+                        // anything else keeps the previous behaviour.
+                        if (pin_info.layout == GGML_LAYOUT_AOS || pin_info.layout == GGML_LAYOUT_SOA ||
+                            pin_info.layout == GGML_LAYOUT_COALESCED) {
+                            ggml_sycl_update_layout_from_cache(extra, pin_info.tensor, device, pin_info.layout,
+                                                               resolved.ptr, pin_info.staged_bytes, {}, 0);
+                        }
                     }
                 }
             }
@@ -34656,7 +34679,7 @@ static void ggml_sycl_preload_model_weights() {
                     if (cache->is_cached(pin_info.key, pin_info.layout)) {
                         cache->pin(pin_info.key, pin_info.layout);
                         pinned_count++;
-                        pinned_bytes += pin_info.key.nbytes;
+                        pinned_bytes += pin_info.staged_bytes;
                     }
                 }
             }
@@ -34683,17 +34706,18 @@ static void ggml_sycl_preload_model_weights() {
         const auto t_end   = std::chrono::steady_clock::now();
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
 
-        // llama.cpp-21jd #2e: WARN (survives default verbosity, unlike the
-        // GGML_LOG_INFO summary below) whenever the plan promised a WOQ
-        // alternate that materialization actually declined. Compare against
-        // add_dense_woq_alternates()'s own [PLACE-4-WOQ] skipped_capacity (-v
-        // only) to see whether the plan-time prediction and the runtime
-        // outcome agree.
-        if (dense_woq_alt_materialize_skipped > 0) {
+        // llama.cpp-21jd #2e: WARN (survives default verbosity) only when the
+        // runtime disagreed with the plan. Copies the plan itself skipped are
+        // already reported by the planner's [PLACE-4-WOQ] WARN.
+        if (dense_woq_planned_declined > 0 || dense_woq_staged_unplanned > 0) {
             GGML_LOG_WARN(
-                "[S1-PRELOAD] %zu dense oneDNN WOQ alternate(s) planned but declined at materialization time "
-                "(WEIGHT zone headroom); PP throughput reduced for those tensors\n",
-                dense_woq_alt_materialize_skipped);
+                "[S1-PRELOAD] dense oneDNN WOQ copies disagree with the plan: %zu planned but declined (WEIGHT "
+                "zone headroom; PP throughput reduced for those tensors), %zu staged but not planned\n",
+                dense_woq_planned_declined, dense_woq_staged_unplanned);
+        }
+        if (dense_woq_unplanned_declined > 0) {
+            GGML_LOG_INFO("[S1-PRELOAD] %zu dense oneDNN WOQ copies eligible but not planned; declined as planned\n",
+                          dense_woq_unplanned_declined);
         }
 
         GGML_LOG_INFO(
@@ -44933,7 +44957,10 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
             if (src0->type != GGML_TYPE_F16) {
                 scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
                                                      " : converting src0 to fp16");
-                const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst);
+                // AOS explicitly: without GGML_SYCL_DNNL, ggml_sycl_select_preferred_kernel
+                // routes only ONEDNN_AOS here, so src0_dd_i is AOS. Do not let extra's
+                // layout record choose the kernel (see the DNNL branch's full_tensor=false).
+                const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl_for_layout(src0->type, GGML_LAYOUT_AOS);
 
                 GGML_ASSERT(to_fp16_sycl != nullptr);
                 size_t ne = row_diff * ne00;
@@ -90379,10 +90406,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (!resolved) {
                 continue;
             }
-            // Select dequant function based on resolved layout
-            const bool           is_reordered = (resolved.layout != GGML_LAYOUT_AOS);
-            const to_fp16_sycl_t dequant_fn =
-                ggml_get_to_fp16_sycl(src0->type, const_cast<ggml_tensor *>(node), is_reordered);
+            // Select the dequant from the layout the bytes were resolved in, never from
+            // src0->extra: the two can disagree (Qwen1.5-MoE ffn_down_shexp resolves SOA
+            // while extra records AOS), and the extra-derived kernel then decodes SOA bytes
+            // as AOS (llama.cpp-pzu9). nullptr = no kernel decodes this layout; skip it.
+            const to_fp16_sycl_t dequant_fn = ggml_get_to_fp16_sycl_for_layout(src0->type, resolved.layout);
             if (!dequant_fn) {
                 continue;
             }

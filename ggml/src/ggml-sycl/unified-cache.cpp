@@ -27296,7 +27296,9 @@ static const char * placement_kv_layer_label(const placement_kv_info & kv_info, 
 // exactly why compute_placement_plan's charge (surfaced by ggml-sycl.cpp's
 // [PLACE-4] line) could promise 3917.9 MB while S1-PRELOAD staged 7732.2 MB
 // on Mistral-7B Q4_0 (c-udh2/c-e9go on this ticket) -- 225 oneDNN WOQ second
-// copies with no representation in the plan at all.
+// copies with no representation in the plan at all. They are recorded in
+// entry.extra_layouts (held as well as the primary), never alternate_layouts
+// (held instead of it) -- see placement_entry.
 //
 // Deliberately informational-only: this does NOT touch `remaining`,
 // `plan.vram_bytes`, or `plan.weight_vram_bytes`, and it runs strictly AFTER
@@ -27350,7 +27352,11 @@ static size_t add_dense_woq_alternates(placement_plan & plan, size_t remaining, 
             continue;
         }
         eligible++;
-        if (planner_entry_has_alternate_layout_on_device(entry, GGML_LAYOUT_ONEDNN_WOQ, device_id)) {
+        bool already_extra = false;
+        for (const placement_alternate_layout & extra : entry.extra_layouts) {
+            already_extra = already_extra || extra.layout == GGML_LAYOUT_ONEDNN_WOQ;
+        }
+        if (already_extra) {
             continue;
         }
         const size_t woq_size = ggml_sycl_layout_bytes_onednn_woq_for_dims(entry.type, entry.ne[0], entry.ne[1]);
@@ -27363,7 +27369,13 @@ static size_t add_dense_woq_alternates(placement_plan & plan, size_t remaining, 
             skipped_capacity++;
             continue;
         }
-        planner_entry_add_alternate_layout_on_device(entry, GGML_LAYOUT_ONEDNN_WOQ, device_id, woq_size, woq_charge);
+        // extra_layouts, not alternate_layouts: this copy is held AS WELL as the primary.
+        placement_alternate_layout extra;
+        extra.layout           = GGML_LAYOUT_ONEDNN_WOQ;
+        extra.dst_size         = woq_size;
+        extra.vram_charge_size = woq_charge;
+        extra.target_device    = -1;
+        entry.extra_layouts.push_back(extra);
         remaining -= woq_charge;
         charged_bytes += woq_charge;
         added++;
@@ -27851,11 +27863,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
     }
 
-    // llama.cpp-21jd: single-device dense WOQ alternates, scoped to this path
-    // only -- the multi-device dense packing path (see the device_budgets
-    // loops further below / in the sibling compute_placement_plan overloads)
-    // is not exercised by this ticket's acceptance evidence (all of it is
-    // single-GPU B50) and is left untouched rather than changed unverified.
+    // llama.cpp-21jd: dense WOQ extra copies for this single-device plan
+    // (compute_multi_device_plan makes the same per-device call).
     //
     // Runs AFTER MoE packing, on the budget the experts left: a WOQ copy is an
     // optional second layout, and S1-PRELOAD stages one only into headroom
@@ -29970,6 +29979,14 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         reserve_no_p2p_candidate_runtime_headroom(remaining, device_budgets, candidate_runtime_reserve);
         add_no_p2p_candidate_dense_alternates(plan, remaining, device_budgets);
         add_no_p2p_candidate_moe_alternates(plan, remaining, device_budgets);
+    }
+
+    // Dense oneDNN WOQ extra copies, per device, from what that device has left
+    // after its own packing and the candidate reservations above -- the same
+    // ordering the single-device plan uses (llama.cpp-21jd). Informational: the
+    // by-value `remaining` is not written back.
+    for (size_t d = 0; d < n_devs; d++) {
+        add_dense_woq_alternates(plan, remaining[d], device_budgets[d].device_id);
     }
 
     // Log multi-device placement summary
