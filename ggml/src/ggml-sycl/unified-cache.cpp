@@ -27301,7 +27301,8 @@ static const char * placement_kv_layer_label(const placement_kv_info & kv_info, 
 // Deliberately informational-only: this does NOT touch `remaining`,
 // `plan.vram_bytes`, or `plan.weight_vram_bytes`, and it runs strictly AFTER
 // every dense layer's own on/off-device decision above has already been made
-// from those same totals. Two reasons, not one:
+// from those same totals -- and after the MoE triplet pass too, so it sees
+// only what the experts left. Two reasons, not one:
 //
 //   1. It must not perturb the primary packing decision this ticket's own
 //      acceptance test (#2b, already green) depends on -- that decision uses
@@ -27748,13 +27749,6 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         }
     }
 
-    // llama.cpp-21jd: single-device dense WOQ alternates, scoped to this path
-    // only -- the multi-device dense packing path (see the device_budgets
-    // loops further below / in the sibling compute_placement_plan overloads)
-    // is not exercised by this ticket's acceptance evidence (all of it is
-    // single-GPU B50) and is left untouched rather than changed unverified.
-    add_dense_woq_alternates(plan, remaining, device_id);
-
     // MoE expert entries: budget-aware placement at (layer, expert) triplet
     // granularity.  A layer executor consumes gate/up/down for the same routed
     // expert together; splitting the roles across device and host creates the
@@ -27856,6 +27850,21 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
     }
+
+    // llama.cpp-21jd: single-device dense WOQ alternates, scoped to this path
+    // only -- the multi-device dense packing path (see the device_budgets
+    // loops further below / in the sibling compute_placement_plan overloads)
+    // is not exercised by this ticket's acceptance evidence (all of it is
+    // single-GPU B50) and is left untouched rather than changed unverified.
+    //
+    // Runs AFTER MoE packing, on the budget the experts left: a WOQ copy is an
+    // optional second layout, and S1-PRELOAD stages one only into headroom
+    // beyond plan.vram_bytes, which already includes every expert this plan
+    // put on device. Predicting before the MoE pass promised copies from space
+    // the experts then took -- Qwen1.5-MoE Q4_0 at PCT=60 planned all 169
+    // (966.5 MB) and preload declined all 169, so [PLACE-4] over-stated device
+    // bytes by exactly that amount (llama.cpp-21jd #2d).
+    add_dense_woq_alternates(plan, remaining, device_id);
 
     plan_moe_mmid_workspaces(plan, tensor_inventory, kv_info.n_expert_used);
     validate_moe_mmid_execution_owners(plan);
