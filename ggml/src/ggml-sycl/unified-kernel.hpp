@@ -1827,7 +1827,7 @@ constexpr int XMX_K_TILE_LOADING = 32;  // K dimension alignment for dpas
  * @param block  Pointer to Q4_0 block
  * @param output Output array of UNIFIED_QK4_0 half values
  */
-SYCL_EXTERNAL inline void dequant_q4_0_to_half(const block_q4_0_unified * block, sycl::half * output) {
+inline void dequant_q4_0_to_half(const block_q4_0_unified * block, sycl::half * output) {
     const sycl::half d = block->d;
 
 #pragma unroll
@@ -1849,7 +1849,7 @@ SYCL_EXTERNAL inline void dequant_q4_0_to_half(const block_q4_0_unified * block,
  * @param e E8M0 exponent byte
  * @return Float scale factor (already halved for MXFP4)
  */
-SYCL_EXTERNAL inline float e8m0_to_float_half(uint8_t e) {
+inline float e8m0_to_float_half(uint8_t e) {
     uint32_t bits;
     if (e < 2) {
         // Denormal/small exponent cases (matches reference ggml_e8m0_to_fp32_half):
@@ -1877,7 +1877,7 @@ SYCL_EXTERNAL inline float e8m0_to_float_half(uint8_t e) {
  * @param block  Pointer to MXFP4 block
  * @param output Output array of UNIFIED_QK_MXFP4 half values
  */
-SYCL_EXTERNAL inline void dequant_mxfp4_to_half(const block_mxfp4_unified * block, sycl::half * output) {
+inline void dequant_mxfp4_to_half(const block_mxfp4_unified * block, sycl::half * output) {
     // Get scale factor (already halved via e8m0_to_float_half)
     const float scale = e8m0_to_float_half(block->e);
 
@@ -1919,7 +1919,7 @@ SYCL_EXTERNAL inline void dequant_mxfp4_to_half(const block_mxfp4_unified * bloc
  * @param e       E8M0 shared exponent.
  * @param slm_row Pointer to 32 contiguous halves to fill.
  */
-SYCL_EXTERNAL inline void dequant_mxfp4_block_half8(const uint8_t * qs, uint8_t e, sycl::half * slm_row) {
+inline void dequant_mxfp4_block_half8(const uint8_t * qs, uint8_t e, sycl::half * slm_row) {
     const float scale = e8m0_to_float_half(e);
 
     // Note: plain multiply (no `-8` bias like Q4_0's `d*nibble + dm` FMA form).
@@ -2004,7 +2004,7 @@ SYCL_EXTERNAL inline void dequant_mxfp4_block_half8(const uint8_t * qs, uint8_t 
  * helper above is the reference-only companion that assumes aligned
  * qs — see its doc-comment for the scope split.
  */
-SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_unaligned(const uint8_t * qs, uint8_t e, sycl::half * slm_row) {
+inline void dequant_mxfp4_block_half8_unaligned(const uint8_t * qs, uint8_t e, sycl::half * slm_row) {
     const float scale = e8m0_to_float_half(e);
 
     uint32_t w0;
@@ -2068,7 +2068,7 @@ SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_unaligned(const uint8_t * qs
  * variant. Matches the Q4_0 AOS wrapper pattern (dequant_q4_0_block_half8_aos
  * → dequant_q4_0_block_half8_unaligned) in unified-kernel.cpp:588.
  */
-SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_aos(const block_mxfp4_unified * block, sycl::half * slm_row) {
+inline void dequant_mxfp4_block_half8_aos(const block_mxfp4_unified * block, sycl::half * slm_row) {
     dequant_mxfp4_block_half8_unaligned(block->qs, block->e, slm_row);
 }
 

@@ -261,7 +261,7 @@ class unified_dmmv_kernel_name;
  * @param i     Index within block (0..31)
  * @return Dequantized float value
  */
-SYCL_EXTERNAL inline float dequant_q4_0(const block_q4_0_unified * block, int i) {
+inline float dequant_q4_0(const block_q4_0_unified * block, int i) {
     const float d = static_cast<float>(block->d);
     int         qs_val;
     if (i < 16) {
@@ -283,7 +283,7 @@ SYCL_EXTERNAL inline float dequant_q4_0(const block_q4_0_unified * block, int i)
  * @param i     Index within block (0..31)
  * @return Dequantized float value
  */
-SYCL_EXTERNAL inline float dequant_mxfp4(const block_mxfp4_unified * block, int i) {
+inline float dequant_mxfp4(const block_mxfp4_unified * block, int i) {
     const float scale = e8m0_to_float_half(block->e);
     int8_t      kval;
     if (i < 16) {
@@ -301,7 +301,7 @@ SYCL_EXTERNAL inline float dequant_mxfp4(const block_mxfp4_unified * block, int 
  * @param i     Index within block (0..31)
  * @return Dequantized half value
  */
-SYCL_EXTERNAL inline sycl::half dequant_q4_0_half(const block_q4_0_unified * block, int i) {
+inline sycl::half dequant_q4_0_half(const block_q4_0_unified * block, int i) {
     const sycl::half d = block->d;
     int              qs_val;
     if (i < 16) {
@@ -321,7 +321,7 @@ SYCL_EXTERNAL inline sycl::half dequant_q4_0_half(const block_q4_0_unified * blo
  * @param i     Index within block (0..31)
  * @return Dequantized half value
  */
-SYCL_EXTERNAL inline sycl::half dequant_mxfp4_half(const block_mxfp4_unified * block, int i) {
+inline sycl::half dequant_mxfp4_half(const block_mxfp4_unified * block, int i) {
     const float scale = e8m0_to_float_half(block->e);
     int8_t      kval;
     if (i < 16) {
@@ -345,12 +345,12 @@ SYCL_EXTERNAL inline sycl::half dequant_mxfp4_half(const block_mxfp4_unified * b
  * @param idx_in_blk  Index within block (0..31)
  * @return Dequantized half value
  */
-SYCL_EXTERNAL inline sycl::half dequant_q4_0_half_soa(const uint8_t *    qs_base,
-                                                      const sycl::half * d_base,
-                                                      int64_t            row,
-                                                      int                k_blocks,
-                                                      int                block_idx,
-                                                      int                idx_in_blk) {
+inline sycl::half dequant_q4_0_half_soa(const uint8_t *    qs_base,
+                                        const sycl::half * d_base,
+                                        int64_t            row,
+                                        int                k_blocks,
+                                        int                block_idx,
+                                        int                idx_in_blk) {
     // Each row has k_blocks * 16 bytes of quantized values
     const int          row_qs_bytes = k_blocks * 16;
     const uint8_t *    qs_row       = qs_base + row * row_qs_bytes;
@@ -394,7 +394,7 @@ SYCL_EXTERNAL inline sycl::half dequant_q4_0_half_soa(const uint8_t *    qs_base
 // aligned from the slm_row base.
 // `qs` MUST be 4-byte aligned (SOA qs buffers are; AOS block_q4_0_unified->qs is
 // 2-byte aligned — use `dequant_q4_0_block_half8_unaligned` for that case).
-SYCL_EXTERNAL inline void dequant_q4_0_block_half8(const uint8_t * qs, sycl::half d_h, sycl::half * slm_row) {
+inline void dequant_q4_0_block_half8(const uint8_t * qs, sycl::half d_h, sycl::half * slm_row) {
     const uint32_t * qs32 = reinterpret_cast<const uint32_t *>(qs);
     const uint32_t   w0   = qs32[0];
     const uint32_t   w1   = qs32[1];
@@ -443,7 +443,7 @@ SYCL_EXTERNAL inline void dequant_q4_0_block_half8(const uint8_t * qs, sycl::hal
 // path the compiler uses for `memcpy(&u32, qs, 4)`: two aligned u16 reads then
 // shift+or. Measured on Arc B580: benchmark validation passes with this path
 // (unlike a raw uint32 load which corrupts output for AOS weights).
-SYCL_EXTERNAL inline void dequant_q4_0_block_half8_unaligned(const uint8_t * qs, sycl::half d_h, sycl::half * slm_row) {
+inline void dequant_q4_0_block_half8_unaligned(const uint8_t * qs, sycl::half d_h, sycl::half * slm_row) {
     const uint16_t * qs16   = reinterpret_cast<const uint16_t *>(qs);
     auto             mk_u32 = [](uint16_t lo, uint16_t hi) -> uint32_t {
         return uint32_t(lo) | (uint32_t(hi) << 16);
@@ -485,17 +485,17 @@ SYCL_EXTERNAL inline void dequant_q4_0_block_half8_unaligned(const uint8_t * qs,
 
 // AOS wrapper: block_q4_0_unified = { half d; uint8_t qs[16]; }
 // `blk->qs` is at struct offset 2 (half-aligned), so use the unaligned variant.
-SYCL_EXTERNAL inline void dequant_q4_0_block_half8_aos(const block_q4_0_unified * blk, sycl::half * slm_row) {
+inline void dequant_q4_0_block_half8_aos(const block_q4_0_unified * blk, sycl::half * slm_row) {
     dequant_q4_0_block_half8_unaligned(blk->qs, blk->d, slm_row);
 }
 
 // SOA wrapper: separate qs_base (16 bytes/block) and d_base (half/block)
-SYCL_EXTERNAL inline void dequant_q4_0_block_half8_soa(const uint8_t *    qs_base,
-                                                       const sycl::half * d_base,
-                                                       int64_t            row,
-                                                       int                k_blocks,
-                                                       int                block_idx,
-                                                       sycl::half *       slm_row) {
+inline void dequant_q4_0_block_half8_soa(const uint8_t *    qs_base,
+                                         const sycl::half * d_base,
+                                         int64_t            row,
+                                         int                k_blocks,
+                                         int                block_idx,
+                                         sycl::half *       slm_row) {
     const int        row_qs_bytes = k_blocks * 16;
     const uint8_t *  qs           = qs_base + row * row_qs_bytes + block_idx * 16;
     const sycl::half d            = d_base[row * k_blocks + block_idx];
@@ -550,12 +550,23 @@ namespace sycl_xmx = sycl::ext::oneapi::experimental::matrix;
  * @tparam TILE_N  N tile size (must be multiple of 16)
  * @tparam TILE_K  K tile size (must be multiple of XMX_TILE_K=16)
  */
+//
+// static, not SYCL_EXTERNAL: both callers are kernels in this TU. Under
+// -fsycl-device-code-split=per_kernel with -fsycl-allow-device-image-dependencies
+// a SYCL_EXTERNAL device function is an exported symbol that each kernel image
+// IMPORTS instead of carrying a copy -- and nothing guaranteed some AOT image
+// exported it, so the launch threw "No device image found for external symbol
+// ...unified_matmul_xmx_kernel_impl<8,16,32>" on the first prompt matmul routed
+// here (llama.cpp-ze5y). `inline` does not help: dequant_mxfp4_block_half8_aos
+// was SYCL_EXTERNAL inline and failed the same way next. Device helpers with a
+// visible definition need no SYCL_EXTERNAL -- the kernel call graph pulls them
+// into device code -- so none of this file's or unified-kernel.hpp's carry it.
 template <int TILE_M, int TILE_N, int TILE_K>
-SYCL_EXTERNAL void unified_matmul_xmx_kernel_impl(sycl::nd_item<2>                    item,
-                                                  const UnifiedKernelArgs             args,
-                                                  sycl::local_accessor<sycl::half, 1> slm_weights,
-                                                  sycl::local_accessor<sycl::half, 1> slm_activations,
-                                                  sycl::local_accessor<float, 1>      slm_acc_out) {
+static void unified_matmul_xmx_kernel_impl(sycl::nd_item<2>                    item,
+                                           const UnifiedKernelArgs             args,
+                                           sycl::local_accessor<sycl::half, 1> slm_weights,
+                                           sycl::local_accessor<sycl::half, 1> slm_activations,
+                                           sycl::local_accessor<float, 1>      slm_acc_out) {
     auto sg = item.get_sub_group();
 
     // Tile coordinates
@@ -817,10 +828,10 @@ SYCL_EXTERNAL void unified_matmul_xmx_kernel_impl(sycl::nd_item<2>              
 // read of slm_weights[0] (conditional on an unreachable sentinel) prevents the
 // compiler from eliding the SLM stores. Used only when GGML_SYCL_XMX_DETAIL=1.
 template <int TILE_M, int TILE_N, int TILE_K>
-SYCL_EXTERNAL void unified_matmul_xmx_slm_only_kernel_impl(sycl::nd_item<2>                    item,
-                                                           const UnifiedKernelArgs             args,
-                                                           sycl::local_accessor<sycl::half, 1> slm_weights,
-                                                           sycl::local_accessor<sycl::half, 1> slm_activations) {
+static void unified_matmul_xmx_slm_only_kernel_impl(sycl::nd_item<2>                    item,
+                                                    const UnifiedKernelArgs             args,
+                                                    sycl::local_accessor<sycl::half, 1> slm_weights,
+                                                    sycl::local_accessor<sycl::half, 1> slm_activations) {
     const int tile_row = item.get_group(0);
     const int tile_col = item.get_group(1);
 

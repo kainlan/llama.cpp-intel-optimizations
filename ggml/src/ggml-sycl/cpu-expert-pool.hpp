@@ -73,6 +73,10 @@ class CpuExpertPool {
 
   private:
     void worker_thread();
+    // Signal and join the workers. Touches no unified-cache state, so it is
+    // safe during static destruction; shutdown() does this and then releases
+    // the ring buffer.
+    void stop_workers();
 
     std::vector<std::thread>          threads_;
     std::queue<std::function<void()>> work_queue_;

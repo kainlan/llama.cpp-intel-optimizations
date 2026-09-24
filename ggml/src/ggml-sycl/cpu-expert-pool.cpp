@@ -175,11 +175,7 @@ void CpuExpertPool::release_staging(int slot_id) {
     ring_[slot_id].in_use = false;
 }
 
-void CpuExpertPool::shutdown() {
-    if (!active_.load(std::memory_order_acquire)) {
-        return;
-    }
-
+void CpuExpertPool::stop_workers() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         shutting_down_.store(true, std::memory_order_release);
@@ -196,6 +192,14 @@ void CpuExpertPool::shutdown() {
         }
     }
     threads_.clear();
+}
+
+void CpuExpertPool::shutdown() {
+    if (!active_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    stop_workers();
     active_.store(false, std::memory_order_release);
 
     ring_handle_ = {};
@@ -213,7 +217,15 @@ CpuExpertPool::~CpuExpertPool() {
     // (g_runtime_alloc_registry etc.) may already be destroyed.
     if (!ggml_sycl_is_shutting_down()) {
         shutdown();
+        return;
     }
+    // The workers still have to stop, and that touches no cache state. Leaving
+    // them parked in cv_.wait_for() makes the member destructors below hang the
+    // process: glibc's pthread_cond_destroy() waits for every waiter, and a
+    // joinable std::thread would std::terminate() after it. Reached whenever a
+    // run exits without freeing its backend -- e.g. a failed decode
+    // (llama.cpp-ze5y: exit hung in ~CpuExpertPool until `timeout` killed it).
+    stop_workers();
 }
 
 }  // namespace ggml_sycl

@@ -19,10 +19,10 @@
 
 #define XMX_TEST_STANDALONE 1
 
-// Pull in the types and SYCL_EXTERNAL inline helpers. All MXFP4 helpers
+// Pull in the types and inline device helpers. All MXFP4 helpers
 // (including the new vectorized ones) live in unified-kernel.hpp alongside
 // block_mxfp4_unified, kvalues_mxfp4_unified, and e8m0_to_float_half.
-// Since they are SYCL_EXTERNAL inline and the test is host-only, the
+// Since they are plain inline functions and the test is host-only, the
 // inline definitions are directly host-callable.
 #include "unified-kernel.hpp"
 
