@@ -2736,8 +2736,28 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst, bool ful
     // This only works when k == full tensor size. For row slices, use standard kernels.
     const ggml_tensor_extra_gpu * extra =
         dst->src[0]->extra ? static_cast<const ggml_tensor_extra_gpu *>(dst->src[0]->extra) : nullptr;
-    const bool use_reorder   = full_tensor && ggml_sycl_layout_is_soa(extra);
-    const bool use_coalesced = full_tensor && ggml_sycl_layout_is_coalesced(extra);
+    layout_mode layout = GGML_LAYOUT_AOS;
+    if (full_tensor && ggml_sycl_layout_is_soa(extra)) {
+        layout = GGML_LAYOUT_SOA;
+    } else if (full_tensor && ggml_sycl_layout_is_coalesced(extra)) {
+        layout = GGML_LAYOUT_COALESCED;
+    }
+    return ggml_get_to_fp16_sycl_for_layout(type, layout);
+}
+
+// llama.cpp-pzu9: the kernel is chosen from the layout the bytes are in. The wrapper
+// above derives that from tensor->extra, which can disagree with the layout the unified
+// cache actually materialized -- Qwen1.5-MoE's ffn_down_shexp resolved SOA while extra
+// still said AOS, so oneDNN PP dequantized SOA bytes as AOS blocks and decoded garbage.
+to_fp16_sycl_t ggml_get_to_fp16_sycl_for_layout(ggml_type type, layout_mode layout) {
+    // No kernel below decodes any other layout (XMX_TILED, ONEDNN_WOQ, ...). Returning
+    // the AOS kernel for those would read the bytes wrong without saying so; nullptr
+    // tells the caller there is no dequant for what it holds.
+    if (layout != GGML_LAYOUT_AOS && layout != GGML_LAYOUT_SOA && layout != GGML_LAYOUT_COALESCED) {
+        return nullptr;
+    }
+    const bool use_reorder   = layout == GGML_LAYOUT_SOA;
+    const bool use_coalesced = layout == GGML_LAYOUT_COALESCED;
 
     switch (type) {
         case GGML_TYPE_Q1_0:

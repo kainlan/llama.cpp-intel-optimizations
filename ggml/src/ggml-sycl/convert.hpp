@@ -23,6 +23,10 @@ typedef to_t_sycl_t<sycl::half> to_fp16_sycl_t;
 // full_tensor: Set to false when processing row slices to disable SoA-aware kernels
 // (SoA kernels compute d_offset from k, which is wrong for row slices)
 to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst, bool full_tensor = true);
+// Select the dequant for bytes known to be in `layout` -- the layout the operand was
+// resolved in, not the one tensor->extra records. Use this wherever the caller holds a
+// resolved view (ggml_sycl_resolve), so the kernel follows the materialized bytes.
+to_fp16_sycl_t ggml_get_to_fp16_sycl_for_layout(ggml_type type, layout_mode layout);
 to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor * dst, bool full_tensor = true);
 
 #ifdef GGML_SYCL_HAS_BF16

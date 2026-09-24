@@ -64485,15 +64485,16 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                             bool used_onednn_fp16 = false;
                             if (onednn_pp_candidate) {
                                 // Get dequantization function matching the actual data layout.
-                                // When src0 is in a reordered layout (SOA), use the
-                                // layout-aware dequant kernel. ggml_get_to_fp16_sycl inspects the
-                                // tensor extra to select the correct dequant.
-                                auto * extra_pp          = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-                                bool   src0_is_reordered = ggml_sycl_layout_is_soa_or_coalesced(extra_pp) &&
-                                                         requested_layout != GGML_LAYOUT_AOS;
+                                // src0_data is resolved.ptr, so its bytes are in requested_layout
+                                // (resolved.layout); the dequant must follow that and nothing else.
+                                // Asking src0->extra as well was a second source for the same fact:
+                                // Qwen1.5-MoE's ffn_down_shexp resolved SOA while extra said AOS, and
+                                // the AOS dequant of SOA bytes decoded garbage (llama.cpp-pzu9).
+                                const bool src0_is_reordered =
+                                    requested_layout == GGML_LAYOUT_SOA || requested_layout == GGML_LAYOUT_COALESCED;
                                 const bool           src0_is_coalesced = (requested_layout == GGML_LAYOUT_COALESCED);
                                 const to_fp16_sycl_t dequant_to_fp16 =
-                                    ggml_get_to_fp16_sycl(src0->type, dst, src0_is_reordered);
+                                    ggml_get_to_fp16_sycl_for_layout(src0->type, requested_layout);
                                 if (ggml_sycl_mul_mat_route_trace_enabled()) {
                                     static std::atomic<int> unified_trace_count{ 0 };
                                     const int trace_idx = unified_trace_count.fetch_add(1, std::memory_order_relaxed);
