@@ -120,6 +120,21 @@ static bool llama_model_sycl_hooks_enabled() {
     return llama_model_sycl_hooks_enabled(llama_model_sycl_hooks());
 }
 
+// llama.cpp-30h4: gate for the dev_layer()/dev_output() staleness fix below.
+// Default ON (the fix is the shipping behaviour). Only the EXPLICIT literal
+// "0" or "false" disables it and restores today's stale-dev_layer behaviour --
+// mirrors the established default-ON/opt-out idiom this codebase already uses
+// for the same shape of switch (e.g. ggml_sycl_fa_onednn_d512_enabled(),
+// fattn.cpp: "return !(env && (strcmp(env, \"0\") == 0 || strcmp(env, \"false\") == 0));").
+// Deliberately not atoi()-based: atoi() folds any unparseable or unexpected
+// value ("xyz", a typo, empty string) to 0 as well, which would silently pick
+// the disabled branch nobody asked for. That is the exact failure shape
+// llama.cpp-80w9 recorded for GGML_SYCL_KV_HOST, so it is not repeated here.
+static bool llama_model_sycl_dev_layer_sync_enabled() {
+    const char * env = std::getenv("GGML_SYCL_DEV_LAYER_SYNC");
+    return !(env != nullptr && (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0));
+}
+
 static bool llama_model_dev_is_sycl(ggml_backend_dev_t dev) {
     const auto hooks = llama_model_sycl_hooks();
     return llama_model_sycl_hooks_enabled(hooks) && dev != nullptr && ggml_backend_dev_backend_reg(dev) == hooks.reg;
@@ -2393,6 +2408,152 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool sycl_model_backend = sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft;
     if (sycl_model_backend) {
         llama_model_sycl_set_late_inventory(ml, hparams, __func__);
+
+        // llama.cpp-30h4: dev_layer(il)/dev_output() go stale the moment a
+        // layer is tiered to host by any route OTHER than -ngl. get_layer_buft_list()
+        // above only ever marks the CPU-side prefix [0, i_gpu_start) -- it has no
+        // way to see a decision the SYCL planner makes later, inside the LATE
+        // replan that llama_model_sycl_set_late_inventory() just triggered
+        // (budget-percent tiering, -ot, -nkvo, ...). Two real consumers then act
+        // on the stale value as though the weight were still device-resident:
+        // the FA executor placement read at llama-context.cpp:1236 and the KV
+        // buft selection at llama-kv-cache.cpp:57-75/287.
+        //
+        // [REVISED, llama.cpp-30h4 Gate 0 retry] This originally asked the
+        // planner -- ggml_backend_sycl_planned_target_device(), the
+        // weight-side mirror of the KV-side
+        // ggml_backend_sycl_kv_layer_on_device_from_dev() -- which device
+        // each layer's tensors landed on, name-indexed against the plan's own
+        // dense-entry table. That query is void for exactly the case this fix
+        // exists for: a layer the planner tiers to host by DEFAULT (since
+        // llama.cpp-ir18) gets create_tensor'd straight onto CPU_REPACK, a
+        // ggml-cpu buft that is not SYCL-backend-owned and is therefore
+        // excluded from the LATE inventory (llama_model_sycl_set_late_inventory()
+        // above filters ml.ctx_map on !llama_model_buft_backend_is_sycl()).
+        // Its tensor names never entered the plan's dense-entry index at all,
+        // so the query returned GGML_SYCL_PLANNED_NO_PLAN for every one of
+        // them -- never -1 -- and the -1-only check, correct against the
+        // query's own contract, was structurally unreachable. Measured: 0
+        // corrections in every arm, including default-on (c-pj9b).
+        //
+        // Ask the artifact instead of the planner: by this point every
+        // tensor in this model has already been create_tensor'd into a
+        // specific ggml_context, and ml.ctx_map buckets each context by the
+        // buft it was actually given -- that assignment is a settled fact,
+        // not a plan to look up. Walk it directly rather than asking a second
+        // source that has no entry for a tensor already excluded from its
+        // own bookkeeping.
+        if (llama_model_sycl_dev_layer_sync_enabled()) {
+            // llama_model_buft_is_sycl()/llama_model_buft_backend_is_sycl()
+            // (the same OR this file already uses just above to decide
+            // has_sycl_weight_buft) test the buft's own name and its
+            // device's backend registration -- both TRUE for SYCL0/SYCL1
+            // (device-resident) and for SYCL_Host (host-pinned staging
+            // memory the SYCL backend still owns, where the GPU still
+            // executes the op -- NOT a host-execution marker). Only a truly
+            // foreign, ggml-cpu-owned buft such as CPU_REPACK fails both,
+            // which is exactly the "this layer now runs on the host" signal
+            // this fix needs, and it cannot conflate SYCL_Host with that
+            // because SYCL_Host passes the same test a device buft does.
+            //
+            // Skip "_exps" tensor names specifically: MoE per-expert weights
+            // are placed by a separate per-expert decision (the live
+            // CpuExpertPool path), not by the per-LAYER decision dev_layer(il)
+            // records -- a layer with GPU-resident attention/dense weights
+            // but host-resident experts must not be marked host here, or
+            // this would silently break FA/KV routing on every MoE model
+            // that legitimately spills experts to host.
+            std::vector<int> host_layer_ids;
+            ggml_tensor *    host_output_tensor = nullptr;
+            for (const auto & it : ml.ctx_map) {
+                ggml_backend_buffer_type_t buft = it.first;
+                if (llama_model_buft_is_sycl(buft) || llama_model_buft_backend_is_sycl(buft)) {
+                    continue;  // still SYCL-owned (device or SYCL_Host) -- GPU still executes this
+                }
+                ggml_context * ctx = it.second.get();
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (output != nullptr && t == output) {
+                        host_output_tensor = t;
+                        continue;
+                    }
+                    const char * name = ggml_get_name(t);
+                    if (name == nullptr || std::strncmp(name, "blk.", 4) != 0 ||
+                        std::strstr(name, "_exps") != nullptr) {
+                        continue;
+                    }
+                    const std::string name_str(name);
+                    const size_t      dot = name_str.find('.', 4);
+                    if (dot == std::string::npos) {
+                        continue;
+                    }
+                    int il = -1;
+                    try {
+                        il = std::stoi(name_str.substr(4, dot - 4));
+                    } catch (const std::exception &) {
+                        continue;
+                    }
+                    if (il >= 0 && il < n_layer_all) {
+                        host_layer_ids.push_back(il);
+                    }
+                }
+            }
+
+            int corrected_layers = 0;
+            for (int il : host_layer_ids) {
+                if (pimpl->dev_layer[il].dev != cpu_dev) {
+                    // Mutate .dev ONLY, never .buft_list. This syncs the device
+                    // record the scheduler and KV path actually read
+                    // (llama-context.cpp:1236, llama-kv-cache.cpp:57-75/287) to
+                    // where the weight really landed; it deliberately does not
+                    // touch the buft CANDIDATE list, because the weight is
+                    // already materialized and .buft_list is no longer the
+                    // authority over where it lives -- create_tensor's own
+                    // buft selection (llama-model-loader.cpp) already ran for
+                    // every tensor in this model, above, and the tensor's own
+                    // buft (just read from ml.ctx_map, right here) already
+                    // correctly reflects where the bytes really are.
+                    // Rewriting .buft_list here would not change an
+                    // already-created tensor's buffer -- it would just move
+                    // today's disagreement from (dev vs buft_list) to
+                    // (buft_list vs actual allocation), which is worse: it
+                    // would misinform the one other reader of buft_list
+                    // (control-vector attachment) about where the tensor's
+                    // bytes really are. So this deliberately leaves a second,
+                    // narrower one-fact-two-sources site: dev_layer[il].dev now
+                    // says CPU while .buft_list still names the original GPU
+                    // list. Re-check this if .buft_list grows a new reader.
+                    pimpl->dev_layer[il].dev = cpu_dev;
+                    corrected_layers++;
+                }
+            }
+
+            // dev_output: output.weight may not exist under that literal name --
+            // tied embeddings reuse tok_embd's tensor and name -- so this
+            // matches the tensor OBJECT actually created (above, inside the
+            // ctx_map walk) rather than reconstructing a name.
+            bool corrected_output = false;
+            if (host_output_tensor != nullptr && pimpl->dev_output.dev != cpu_dev) {
+                pimpl->dev_output.dev = cpu_dev;
+                corrected_output      = true;
+            }
+
+            // WARN, not INFO/DEBUG: dev_layer's own per-layer assignment log
+            // (get_layer_buft_list() above) is LLAMA_LOG_DEBUG, and INFO is
+            // already dropped at default verbosity in every tool on this tree
+            // (CLAUDE.md, "llama-bench traps"). Without a WARN-level line, a
+            // default-verbosity capture of this fix flipping cannot be told
+            // apart from the fix never running -- fires only when it actually
+            // changed something, so it doubles as the positive control for
+            // GGML_SYCL_DEV_LAYER_SYNC=0 (which skips this whole block and so
+            // can never print it).
+            if (corrected_layers > 0 || corrected_output) {
+                LLAMA_LOG_WARN(
+                    "%s: [SYCL] dev_layer sync: corrected %d layer(s)%s from a stale device record to CPU "
+                    "(the SYCL planner tiered them to host after create_tensor; GGML_SYCL_DEV_LAYER_SYNC=0 "
+                    "restores the pre-fix stale behaviour)\n",
+                    __func__, corrected_layers, corrected_output ? " + output" : "");
+            }
+        }
     }
     if (sycl_model_backend && ml.use_mmap) {
         LLAMA_LOG_INFO("%s: disabling mmap for SYCL weight layout upload\n", __func__);

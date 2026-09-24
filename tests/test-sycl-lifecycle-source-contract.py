@@ -576,8 +576,20 @@ checks = {
         # ggml_sycl_cache_plan_owner(cache) read is passed straight into
         # the two-arg overload that the guarded inventory path calls with
         # the exact candidate captured under g_tensor_inventory_mutex
-        # (12 - 1). Census reconciled by llama.cpp-nsl3.
-        "ggml_sycl_cache_plan_owner": 119,
+        # (12 - 1). Census reconciled by llama.cpp-nsl3. llama.cpp-y2zx then
+        # added one reader back: the overflow site that decides to stream a
+        # dense model larger than the VRAM budget used to register ALL layers
+        # with the layer-stream manager without ever consulting the placement
+        # plan, so it claimed the ~15 layers the planner had deliberately
+        # tiered to host -- and which ggml_backend_sched was ALREADY executing
+        # on the CPU backend regardless (measured with GGML_SCHED_DEBUG=2 on
+        # 2026-09-18: MUL_MAT assignment is identical with and without the
+        # filter, so this read buys placement correctness, not throughput).
+        # It now reads the cache plan owner once to filter those layers out
+        # of the inventory it hands to build_layer_map(), which is the single
+        # authority for that fact -- the read is the fix, not an extra
+        # source (119 + 1).
+        "ggml_sycl_cache_plan_owner": 120,
         "ggml_sycl_global_plan_owner": 16,
         "ggml_sycl_global_plan_snapshot": 12,
         "ggml_sycl_has_global_plan": 26,

@@ -131,4 +131,41 @@ inline bool moe_mmvq_capability_supports_layout(enum ggml_type type, enum ggml_l
     }
 }
 
+// Whether MUL_MAT_ID *admission* (ggml_backend_sycl_device_supports_op) may
+// claim this src0 type at all -- the question "is there an MMID executor for
+// this type", asked on both axes the tables describe.
+//
+// Why admission needs its own predicate instead of the dense MUL_MAT allowlist
+// (llama.cpp-yitq): ggml_sycl_mul_mat_type_supported() answers "can this
+// backend multiply this type", which is true for F32/F16/IQ1_S..IQ4_XS because
+// they have real dense kernels. None of them has an _id kernel family. Sharing
+// that allowlist therefore admitted 11 types whose MMID route the oracle then
+// refuses one layer down, and per the header comment above that refusal escapes
+// as a discarded GGML_STATUS_FAILED -- so the op reported wrong numbers instead
+// of falling back to the CPU backend. Admission must key on MMID coverage.
+//
+// Both axes, because each alone fails open in a different direction: a type
+// could have an _id kernel family while the capability query advertises no
+// layout for it (admitted, then refused at route time -- the bug above), or a
+// layout could be advertised for a type with no executor (the subset invariant
+// this header already gates). Requiring both keeps admission, capability, and
+// the executor tables in one shape.
+//
+// The layout scan walks the contiguous enum range rather than restating the
+// list. A layout APPENDED after the current last one is not scanned, which can
+// only withhold admission, never grant it -- fail-closed, same reasoning as
+// all_layouts() in tests/test-sycl-moe-mmvq-tables.cpp. A layout inserted
+// mid-enum is caught by that test's shape assertion.
+inline bool moe_mmvq_admission_supports_type(enum ggml_type type) {
+    if (!moe_mmvq_batched_dispatch_supports_type(type)) {
+        return false;
+    }
+    for (int layout = 0; layout <= (int) GGML_LAYOUT_MXFP4_DPAS; ++layout) {
+        if (moe_mmvq_capability_supports_layout(type, (enum ggml_layout_mode) layout)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 #endif  // GGML_SYCL_MOE_MMVQ_TABLES_HPP

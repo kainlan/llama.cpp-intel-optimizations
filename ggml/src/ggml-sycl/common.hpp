@@ -2402,6 +2402,14 @@ sycl::event ggml_sycl_pp_stage_transfer(int          src_device,
                                         queue_ptr    src_queue,
                                         queue_ptr    dst_queue);
 
+// llama.cpp-21jd: shared with the planner (unified-cache.cpp) so "does this
+// dense tensor get an unbudgeted oneDNN WOQ second copy" has one
+// implementation instead of a copy on each side of the TU boundary that can
+// drift apart. Definitions live in ggml-sycl.cpp; see
+// ggml_sycl_dense_woq_alternate_eligible's own comment for the history.
+bool   ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous);
+size_t ggml_sycl_layout_bytes_onednn_woq_for_dims(ggml_type type, int64_t ncols, int64_t nrows);
+
 // Check if PP is enabled
 bool ggml_sycl_pp_enabled();
 

@@ -167,7 +167,7 @@ static size_t                ggml_sycl_layout_bytes_onednn_packed_for_dims(ggml_
                                                                            int64_t   nrows,
                                                                            int       device,
                                                                            int64_t   batch_m);
-static size_t                ggml_sycl_layout_bytes_onednn_woq_for_dims(ggml_type type, int64_t ncols, int64_t nrows);
+size_t                        ggml_sycl_layout_bytes_onednn_woq_for_dims(ggml_type type, int64_t ncols, int64_t nrows);
 static sycl::event           ggml_sycl_submit_queue_sync_event(sycl::queue & q);
 static ggml_sycl::mem_handle ggml_sycl_copy_handle_for_raw_ptr(void *           ptr,
                                                                ggml_layout_mode layout,
@@ -16319,6 +16319,20 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             if (entry.on_device) {
                 device_bytes += entry.dst_size;
                 device_count++;
+                // llama.cpp-21jd: count alternate layouts too (today: the dense
+                // oneDNN WOQ second copy, populated by add_dense_woq_alternates()
+                // in unified-cache.cpp). Without this, PLACE-4 reported only the
+                // primary copy while S1-PRELOAD staged the alternate as well, so
+                // the two lines this ticket is about could never agree -- see
+                // ggml_sycl_dense_woq_alternate_eligible's comment for the fuller
+                // history.
+                for (const auto & alt : entry.alternate_layouts) {
+                    const int alt_target = alt.target_device >= 0 ? alt.target_device : entry.target_device;
+                    if (alt_target == entry.target_device) {
+                        device_bytes += alt.dst_size;
+                        device_count++;
+                    }
+                }
             } else {
                 host_bytes += entry.dst_size;
                 host_count++;
@@ -16456,7 +16470,79 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
     const bool   is_moe                = g_moe_n_experts_total > 0;
     if ((model_size_exceeds_budget && !is_moe) || streaming_forced) {
         auto & mgr = ggml_sycl::get_layer_stream_manager(ctx->device);
-        mgr.build_layer_map(g_tensor_inventory.data(), g_tensor_inventory.size());
+
+        // llama.cpp-y2zx: streaming must not claim a layer the PLANNER placed on the
+        // host. build_layer_map() used to run over the whole inventory and register all
+        // 64 layers of an over-budget dense model -- including the 15 the planner had
+        // just marked layer_device[l] < 0 -- so the plan's own host placement was
+        // overridden by the mechanism the owner ruling forbids outright ("no weight
+        // streaming", CLAUDE.md § PLACEMENT DECIDES THE EXECUTOR).
+        //
+        // ⚠️ What this filter does NOT do, because the first version of this comment
+        // claimed it did. It does not "enable" CPU execution of those layers: measured
+        // 2026-09-18 with GGML_SCHED_DEBUG=2 on Qwen3.6-27B/B50, ggml_backend_sched
+        // ALREADY assigns every MUL_MAT of the planner-host layers (49-63) to the CPU
+        // backend, with or without this filter -- 1276 CPU / 4191 SYCL0 MUL_MAT nodes,
+        // identical either way. Nor does it buy throughput: pp256 was 21.38/21.41 with
+        // the filter against 21.43/21.29 without, in one binary, palindrome-ordered.
+        // The earlier "+10.7%" belongs to `-ot <pat>=CPU`, which wins by giving ggml-cpu
+        // a CPU_REPACK (AVX-repacked) copy -- a LAYOUT difference, not an executor one.
+        // And "0 [SYCL-CPU] MUL_MAT routed to CPU lines" measured only the in-backend
+        // cpu_mul_mat() route, which is dead because the scheduler splits first; it was
+        // never evidence about CPU execution in general.
+        //
+        // What it does do is stop staging 3649 MB of weights onto a device that never
+        // executes them, and shrink max_layer_size_ (which sizes the two staging
+        // buffers) to cover only the layers actually staged. That is correctness with
+        // respect to the placement ruling, on no measured throughput evidence.
+        //
+        // Filter the INVENTORY rather than skipping register_host_ptr() below: the
+        // manager then never learns those names, so layer_streaming_get_weight_ptr()
+        // misses and the resolver falls through to the host pointer, whereas a
+        // registered entry with a null host_ptr would look streamable-but-broken.
+        // register_host_ptr() needs no change -- it early-returns for any name absent
+        // from name_to_location_.
+        const std::pair<std::string, size_t> *      stream_inventory       = g_tensor_inventory.data();
+        size_t                                      stream_inventory_count = g_tensor_inventory.size();
+        std::vector<std::pair<std::string, size_t>> stream_inventory_filtered;
+        {
+            auto *     cache      = ggml_sycl::get_unified_cache_for_device(ctx->device);
+            const auto plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;
+            if (plan_owner && !plan_owner->entries.empty()) {
+                const auto & plan = *plan_owner;
+                size_t       excluded_bytes = 0;
+                size_t       excluded_count = 0;
+                stream_inventory_filtered.reserve(g_tensor_inventory.size());
+                for (const auto & item : g_tensor_inventory) {
+                    const int layer_id = ggml_sycl::extract_layer_id(item.first.c_str());
+                    // A non-layer tensor (embeddings, output) has no layer_device entry
+                    // and build_layer_map() skips it anyway -- keep it so the filtered
+                    // inventory stays a faithful subset rather than a reshaped one.
+                    if (layer_id >= 0) {
+                        const auto it = plan.layer_device.find(layer_id);
+                        if (it != plan.layer_device.end() && it->second < 0) {
+                            excluded_bytes += item.second;
+                            excluded_count++;
+                            continue;
+                        }
+                    }
+                    stream_inventory_filtered.push_back(item);
+                }
+                if (excluded_count > 0) {
+                    // WARN so it survives default verbosity: this line is the only
+                    // evidence that the plan's host placement was honoured, and a
+                    // silent honouring is indistinguishable from the old silent
+                    // override.
+                    GGML_LOG_WARN(
+                        "[SYCL-CPU] layer streaming excludes %zu planner-host tensors (%.1f MB); the CPU "
+                        "backend executes those layers\n",
+                        excluded_count, excluded_bytes / (1024.0 * 1024.0));
+                    stream_inventory       = stream_inventory_filtered.data();
+                    stream_inventory_count = stream_inventory_filtered.size();
+                }
+            }
+        }
+        mgr.build_layer_map(stream_inventory, stream_inventory_count);
         {
             std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
             for (const auto & entry : g_sycl_host_weight_extras) {
@@ -26812,6 +26898,22 @@ static bool ggml_sycl_onednn_pp_skip_type(ggml_type type) {
     return skip_q4_0 && type == GGML_TYPE_Q4_0;
 }
 
+// llama.cpp-21jd: the single predicate for "does this dense tensor get an
+// unbudgeted oneDNN WOQ second copy", shared by S1-PRELOAD staging below and
+// by the planner in unified-cache.cpp (which cannot see this TU's static
+// helpers, hence non-static + declared in common.hpp). Before this, the
+// staging site computed this boolean inline and the planner had no analogue
+// at all -- compute_placement_plan charged every dense weight once, at
+// src_size, so [PLACE-4]'s printed total could never match what preload
+// actually allocated (c-udh2/c-e9go on llama.cpp-21jd: 3917.9 MB planned vs
+// 7732.2 MB staged on Mistral-7B Q4_0). One implementation now backs both the
+// plan's charge and the staging decision, so they cannot drift apart the way
+// two independent copies of this boolean eventually would.
+bool ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous) {
+    return is_contiguous && ggml_sycl_onednn_pp_enabled() && !ggml_sycl_onednn_pp_skip_type(type) &&
+           ggml_sycl_onednn_pp_safe_for_current_placement() && ggml_sycl_onednn_woq_supported_type(type);
+}
+
 static bool ggml_sycl_onednn_pp_candidate(const ggml_tensor * src0,
                                           const ggml_tensor * src1,
                                           const ggml_tensor * dst,
@@ -32692,6 +32794,16 @@ static void ggml_sycl_preload_model_weights() {
         size_t                                    moe_cached        = 0;
         size_t                                    moe_failed        = 0;
         size_t                                    total_bytes       = 0;
+        // llama.cpp-21jd #2e: counts a WOQ alternate the plan's own
+        // add_dense_woq_alternates() predicted (see its comment) but
+        // materialization declined anyway -- e.g. the runtime headroom guard
+        // near its increment site found less room than the plan-time
+        // snapshot did. Distinct from the planner's own skipped_capacity
+        // count (predicted, at plan time); this one is what actually
+        // happened. Declared here (not inside the per-layer block below) so
+        // it survives to the async-bulk summary printed once for the whole
+        // preload, not reset every layer.
+        size_t                                    dense_woq_alt_materialize_skipped = 0;
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_device_bytes{};
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_host_bytes{};
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_device_count{};
@@ -32881,6 +32993,13 @@ static void ggml_sycl_preload_model_weights() {
             dense_pin_keys.reserve(indices.size());
             std::vector<dense_pin_info> dense_layout_pin_keys;
             dense_layout_pin_keys.reserve(indices.size() * 2);
+
+            // Planned (primary) dense bytes staged into the WEIGHT zone so far, used
+            // below to reserve what the plan still owes before admitting an optional
+            // alternate layout. Deliberately NOT total_bytes: that counter also
+            // accumulates alternate layouts, so it cannot answer "how much of the
+            // plan is still outstanding?".
+            size_t dense_primary_staged_bytes = 0;
 
             // S1-PRELOAD uses direct_stage_weight/direct_stage_expert which
             // handle arena allocation + fill + lookup registration atomically.
@@ -33874,7 +33993,13 @@ static void ggml_sycl_preload_model_weights() {
                     // even though GET_ROWS is a row-gather consumer.
                     const tensor_usage usage          = ggml_sycl_get_tensor_usage(tensor);
                     layout_mode        preload_layout = layout_policy::get_with_override(tensor->type, usage, device);
-                    if (dense_alternate_on_this_device) {
+                    // A same-device alternate replaces the staged layout only when this
+                    // device holds the tensor SOLELY as an alternate (a replica of another
+                    // device's primary). When the primary is also planned here, the alternate
+                    // is an ADDITIONAL copy (llama.cpp-21jd's dense oneDNN WOQ) and must not
+                    // displace it: staging the primary as WOQ left the canonical layout
+                    // unmaterialized and the Mistral gate emitted "###" at every budget.
+                    if (dense_alternate_on_this_device && !dense_planned_on_this_device) {
                         preload_layout =
                             ggml_sycl_adjust_layout_for_tensor(tensor, dense_alternate_layout.layout, device);
                     }
@@ -33950,6 +34075,7 @@ static void ggml_sycl_preload_model_weights() {
                     if (result.ok && result.ptr) {
                         dense_cached++;
                         total_bytes += dst_size;
+                        dense_primary_staged_bytes += dst_size;
                         weight_device_bytes[device] += dst_size;
                         weight_device_count[device]++;
                         dense_pin_keys.push_back({ cache_key, preload_layout, tensor, std::move(handle) });
@@ -33959,16 +34085,47 @@ static void ggml_sycl_preload_model_weights() {
                                           " action=stage-dense layout=" + ggml_sycl_layout_mode_name(preload_layout),
                                       dst_size);
 #if GGML_SYCL_DNNL
-                        const bool stage_woq_alt = tensor->type == GGML_TYPE_Q4_0 && is_contiguous &&
-                                                   preload_layout != GGML_LAYOUT_ONEDNN_WOQ &&
-                                                   ggml_sycl_onednn_pp_enabled() &&
-                                                   !ggml_sycl_onednn_pp_skip_type(tensor->type) &&
-                                                   ggml_sycl_onednn_pp_safe_for_current_placement() &&
-                                                   ggml_sycl_onednn_woq_supported_type(tensor->type);
+                        // llama.cpp-21jd: shared predicate -- see
+                        // ggml_sycl_dense_woq_alternate_eligible's own comment. The
+                        // planner (unified-cache.cpp) calls the identical function to
+                        // decide what to charge/report; this call must never grow a
+                        // condition the planner doesn't also see, or the two are back
+                        // to being two sources for one fact.
+                        const bool stage_woq_alt = preload_layout != GGML_LAYOUT_ONEDNN_WOQ &&
+                                                   ggml_sycl_dense_woq_alternate_eligible(tensor->type, is_contiguous);
                         if (stage_woq_alt) {
                             const size_t woq_size = ggml_sycl_layout_bytes_onednn_woq_for_dims(
                                 tensor->type, tensor->ne[0], ggml_nrows(tensor));
-                            const size_t woq_headroom = 512ull * 1024ull * 1024ull;
+                            // llama.cpp-21jd: an OPTIONAL alternate layout must not consume
+                            // zone space that the PLAN still owes. compute_placement_plan
+                            // charges each dense weight exactly once, at src_size, and has
+                            // no dense analogue of the MoE alternate_layouts accounting, so
+                            // every byte staged here is unbudgeted -- at PCT=60/40/25 the
+                            // flat 512 MB guess below let WOQ starve a planned primary and
+                            // the run aborted at "planned dense materialization failed".
+                            //
+                            // Reserve what the plan still owes instead. vram_bytes (not
+                            // weight_vram_bytes) is the right total because WEIGHT and KV
+                            // share ONE allocator in single-chunk mode -- see
+                            // unified_cache::zone_available/zone_largest_free, which
+                            // delegate WEIGHT to KV's allocator -- and KV is allocated
+                            // later, at context creation, so weights-only accounting would
+                            // let WOQ eat the KV cache's space. Fail closed to the previous
+                            // constant when no plan owner is available.
+                            //
+                            // Cache-local reader on purpose: it is the same authority
+                            // direct_stage_weight consults (unified-cache.cpp:6049) to decide
+                            // whether it is in plan mode, so this guard and the allocator
+                            // agree by construction. The file-local ggml_sycl_cache_plan_owner
+                            // wrapper reads the broader POLICY plan, which can be non-null
+                            // when the cache-local one is not -- that would reserve against a
+                            // plan the allocator is not honouring.
+                            const auto   plan_owner   = ggml_sycl::coherent_cache_placement_plan_owner(cache);
+                            const size_t woq_headroom = plan_owner ?
+                                                            (plan_owner->vram_bytes > dense_primary_staged_bytes ?
+                                                                 plan_owner->vram_bytes - dense_primary_staged_bytes :
+                                                                 0) :
+                                                            512ull * 1024ull * 1024ull;
                             if (woq_size > 0 && cache->zone_largest_free(ggml_sycl::vram_zone_id::WEIGHT) >= woq_size &&
                                 cache->zone_available(ggml_sycl::vram_zone_id::WEIGHT) >= woq_size + woq_headroom) {
                                 ggml_sycl_onednn_woq_fill_ctx woq_ctx{};
@@ -33996,6 +34153,12 @@ static void ggml_sycl_preload_model_weights() {
                                         "[S1-PRELOAD] dense ONEDNN_WOQ materialization fill failed; aborting before "
                                         "inference with incomplete device placement");
                                 }
+                            } else {
+                                // llama.cpp-21jd #2e: eligible but declined by the
+                                // runtime headroom guard -- counted so the run's own
+                                // summary can say so, instead of this being invisible
+                                // the way it was before this ticket.
+                                dense_woq_alt_materialize_skipped++;
                             }
                         }
 #endif
@@ -34011,6 +34174,7 @@ static void ggml_sycl_preload_model_weights() {
                         if (aos_result.ok && aos_result.ptr) {
                             dense_cached++;
                             total_bytes += src_size;
+                            dense_primary_staged_bytes += src_size;
                             weight_device_bytes[device] += src_size;
                             weight_device_count[device]++;
                             dense_pin_keys.push_back({ cache_key, GGML_LAYOUT_AOS, tensor, std::move(aos_handle) });
@@ -34518,6 +34682,19 @@ static void ggml_sycl_preload_model_weights() {
 
         const auto t_end   = std::chrono::steady_clock::now();
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+
+        // llama.cpp-21jd #2e: WARN (survives default verbosity, unlike the
+        // GGML_LOG_INFO summary below) whenever the plan promised a WOQ
+        // alternate that materialization actually declined. Compare against
+        // add_dense_woq_alternates()'s own [PLACE-4-WOQ] skipped_capacity (-v
+        // only) to see whether the plan-time prediction and the runtime
+        // outcome agree.
+        if (dense_woq_alt_materialize_skipped > 0) {
+            GGML_LOG_WARN(
+                "[S1-PRELOAD] %zu dense oneDNN WOQ alternate(s) planned but declined at materialization time "
+                "(WEIGHT zone headroom); PP throughput reduced for those tensors\n",
+                dense_woq_alt_materialize_skipped);
+        }
 
         GGML_LOG_INFO(
             "[S1-PRELOAD] async bulk: dense cached=%zu failed=%zu "
@@ -41443,7 +41620,52 @@ struct sycl_host_buf_ctx {
     void *                ptr;
     size_t                size;
     ggml_sycl::mem_handle buffer_handle;
+    // Device whose queues DMA into and out of this pinned USM allocation, and
+    // the CPU buffer iface this buffer was built from. Both exist so the
+    // host-access accessors below can order against the GPU before delegating.
+    int                   device = -1;
+    ggml_backend_buffer_i cpu_iface{};
 };
+
+// llama.cpp-30h4: order host-side access to this pinned USM against the GPU
+// work that DMAs into and out of it.
+//
+// ggml_backend_sycl_host_buffer_type_alloc_buffer builds this buffer from
+// ggml_backend_cpu_buffer_from_ptr and then overrides only get_base,
+// free_buffer and clear -- so set_tensor / get_tensor / cpy_tensor /
+// memset_tensor stayed plain CPU memcpy against memory the GPU writes, with
+// .is_host true, which is also what lets ggml_backend_cpu_buffer_cpy_tensor
+// memcpy straight out of it. The SYCL DEVICE buffer's get_tensor has waited
+// its stream since the change whose comment reads "This fixes GPU speculative
+// verification failures where tensor reads saw stale data": one side of that
+// fork was hardened against this bug class and the other was not.
+//
+// THIS IS NOT A TOTAL DRAIN, and must not be read as one. It waits the queue
+// this buffer was allocated on plus the device's default queue -- which is what
+// ggml_sycl_ctx::stream(device, 0) resolves to, and therefore what ordinary
+// compute submits on. Work submitted on streams 1..GGML_SYCL_MAX_STREAMS-1, on
+// a shared-context queue, or on the deferred-decode path is NOT covered.
+// GGML_SYCL_SAFE_MODE's per-op wait has exactly that gap and is likewise not a
+// superset of the synchronization this path needs; widen this deliberately,
+// against a measurement, rather than by assuming coverage.
+static void ggml_backend_sycl_host_buffer_sync(const sycl_host_buf_ctx * ctx) {
+    if (!ctx || ctx->device < 0) {
+        return;
+    }
+    try {
+        sycl::queue * alloc_queue = nullptr;
+        if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
+            alloc_queue = &cache->get_queue();
+            alloc_queue->wait_and_throw();
+        }
+        sycl::queue & device_queue = ggml_sycl_get_device(ctx->device).default_queue();
+        if (&device_queue != alloc_queue) {
+            device_queue.wait_and_throw();
+        }
+    } catch (const sycl::exception & e) {
+        GGML_LOG_ERROR("[SYCL] host buffer sync failed on device %d: %s\n", ctx->device, e.what());
+    }
+}
 
 static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<sycl_host_buf_ctx *>(buffer->context);
@@ -41464,7 +41686,54 @@ static void * ggml_backend_sycl_host_buffer_get_base(ggml_backend_buffer_t buffe
 static void ggml_backend_sycl_host_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     auto * ctx = static_cast<sycl_host_buf_ctx *>(buffer->context);
     GGML_ASSERT(ctx && ctx->ptr);
+    ggml_backend_sycl_host_buffer_sync(ctx);
     memset(ctx->ptr, value, buffer->size);
+}
+
+// The four data-access accessors below exist only to place that wait in front
+// of the CPU implementation this buffer already carries; they add no copy
+// semantics of their own. A read waits because the GPU may still be writing
+// (RAW); a write waits because the GPU may still be reading (WAR).
+static void ggml_backend_sycl_host_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                     ggml_tensor *         tensor,
+                                                     const void *          data,
+                                                     size_t                offset,
+                                                     size_t                size) {
+    auto * ctx = static_cast<sycl_host_buf_ctx *>(buffer->context);
+    GGML_ASSERT(ctx && ctx->cpu_iface.set_tensor);
+    ggml_backend_sycl_host_buffer_sync(ctx);
+    ctx->cpu_iface.set_tensor(buffer, tensor, data, offset, size);
+}
+
+static void ggml_backend_sycl_host_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                     const ggml_tensor *   tensor,
+                                                     void *                data,
+                                                     size_t                offset,
+                                                     size_t                size) {
+    auto * ctx = static_cast<sycl_host_buf_ctx *>(buffer->context);
+    GGML_ASSERT(ctx && ctx->cpu_iface.get_tensor);
+    ggml_backend_sycl_host_buffer_sync(ctx);
+    ctx->cpu_iface.get_tensor(buffer, tensor, data, offset, size);
+}
+
+static void ggml_backend_sycl_host_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+                                                        ggml_tensor *         tensor,
+                                                        uint8_t               value,
+                                                        size_t                offset,
+                                                        size_t                size) {
+    auto * ctx = static_cast<sycl_host_buf_ctx *>(buffer->context);
+    GGML_ASSERT(ctx && ctx->cpu_iface.memset_tensor);
+    ggml_backend_sycl_host_buffer_sync(ctx);
+    ctx->cpu_iface.memset_tensor(buffer, tensor, value, offset, size);
+}
+
+static bool ggml_backend_sycl_host_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
+                                                     const ggml_tensor *   src,
+                                                     ggml_tensor *         dst) {
+    auto * ctx = static_cast<sycl_host_buf_ctx *>(buffer->context);
+    GGML_ASSERT(ctx && ctx->cpu_iface.cpy_tensor);
+    ggml_backend_sycl_host_buffer_sync(ctx);
+    return ctx->cpu_iface.cpy_tensor(buffer, src, dst);
 }
 
 static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
@@ -41514,8 +41783,14 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
 
     // Use the wrapper struct as buffer context so free_buffer knows which
     // deallocation path to take.  Override get_base to extract the raw pointer.
-    auto *                ctx    = new sycl_host_buf_ctx{ ptr, size, std::move(buffer_handle) };
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    if (!buffer) {
+        return nullptr;
+    }
+
+    // Capture the CPU iface BEFORE overriding it: the accessors below delegate
+    // to these exact implementations after waiting the GPU (llama.cpp-30h4).
+    auto * ctx = new sycl_host_buf_ctx{ ptr, size, std::move(buffer_handle), exact_device, buffer->iface };
 
     if (!ggml_backend_buffer_set_type(buffer, buft)) {
         ggml_backend_buffer_free(buffer);
@@ -41526,6 +41801,20 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     buffer->iface.get_base    = ggml_backend_sycl_host_buffer_get_base;
     buffer->iface.free_buffer = ggml_backend_sycl_host_buffer_free_buffer;
     buffer->iface.clear       = ggml_backend_sycl_host_buffer_clear;
+    // Only wrap the accessors the CPU buffer actually implements; leaving an
+    // absent one null keeps ggml-backend's own fallbacks reachable.
+    if (ctx->cpu_iface.set_tensor) {
+        buffer->iface.set_tensor = ggml_backend_sycl_host_buffer_set_tensor;
+    }
+    if (ctx->cpu_iface.get_tensor) {
+        buffer->iface.get_tensor = ggml_backend_sycl_host_buffer_get_tensor;
+    }
+    if (ctx->cpu_iface.memset_tensor) {
+        buffer->iface.memset_tensor = ggml_backend_sycl_host_buffer_memset_tensor;
+    }
+    if (ctx->cpu_iface.cpy_tensor) {
+        buffer->iface.cpy_tensor = ggml_backend_sycl_host_buffer_cpy_tensor;
+    }
     return buffer;
 }
 
@@ -54326,7 +54615,11 @@ static size_t ggml_sycl_layout_bytes_onednn_packed_for_dims(ggml_type type,
 #endif
 }
 
-static size_t ggml_sycl_layout_bytes_onednn_woq_for_dims(ggml_type type, int64_t ncols, int64_t nrows) {
+// llama.cpp-21jd: non-static (cross-TU) so the planner in unified-cache.cpp can
+// compute the identical byte count this staging site uses, instead of
+// re-deriving its own WOQ size formula -- a second formula for the same fact
+// is exactly the drift risk the fork calls out ("one fact, two sources").
+size_t ggml_sycl_layout_bytes_onednn_woq_for_dims(ggml_type type, int64_t ncols, int64_t nrows) {
     if (!ggml_sycl_onednn_woq_supported_type(type)) {
         return 0;
     }
@@ -74091,6 +74384,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                            moe_hybrid_active;
     // All decode uses the retained executor, including all-local placement
     // plans and no-plan/nonhybrid residency. Prompt route selection is unchanged.
+    //
+    // The ne12 == 1 disjunct is unconditional and type-blind ON PURPOSE. Do not
+    // add a type carve-out here to route a decode case around a capability the
+    // executor refuses: the else-branch below is prompt-only. Its expert->route
+    // index (retained_prompt_groups) is populated solely under `if (ne12 != 1)`,
+    // and nothing in it ever reads the decode batch result, so a decode case
+    // steered there resolves no route and dies at "selected prompt expert
+    // unresolved before submit" -- strictly worse than the honest
+    // capability-unsupported refusal that the retained partition loop below
+    // already produces through its shared dispatch helper. Tried and
+    // withdrawn for Q1_0/NVFP4 (llama.cpp-t98c); the closed capability, not the
+    // routing, is what those cases are waiting on.
     const bool moe_hybrid_with_plan  = ne12 == 1 || selected_hybrid_route;
     const bool route_host_experts_to_cpu =
         !exact_layout_override && (has_placement_plan ? plan_has_cpu_experts : use_expert_cache);
@@ -105306,8 +105611,30 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         // this gate instead, because the MoE executor computes wrong answers
         // on them (q2_0 MMID: ERR up to 90 vs 5e-4), which is not a refusal.
         const ggml_type indexed_a_type = op->src[0]->type;
-        if (indexed_a_type != GGML_TYPE_Q1_0 && indexed_a_type != GGML_TYPE_NVFP4 &&
-            !ggml_sycl_mul_mat_type_supported(indexed_a_type)) {
+        if (op->op == GGML_OP_MUL_MAT_ID) {
+            // MUL_MAT_ID admission keys on MMID coverage, NOT on the dense
+            // MUL_MAT allowlist the two branches used to share (llama.cpp-yitq).
+            // ggml_sycl_mul_mat_type_supported() is true for F32/F16 and the
+            // whole IQ1_S..IQ4_XS family because they have real *dense* kernels;
+            // none of them has an _id kernel family, so admitting them handed
+            // the scheduler an op this backend cannot compute. The route oracle
+            // did refuse it, but that refusal escapes as ggml_sycl_fallback_error
+            // -> GGML_STATUS_FAILED, which ggml_backend_compare_graph_backend
+            // discards -- so the op reported uncorrelated numbers (ERR 86-99)
+            // instead of falling back to the CPU backend, for 234 census cases.
+            // moe_mmvq_admission_supports_type() asks the MMID tables instead;
+            // Q1_0/NVFP4 are in those tables, so their deliberate admit-then-
+            // refuse-at-the-oracle behaviour is preserved without a special case.
+            //
+            // ADD_ID must NOT be gated on these tables: its src[0] is the F32
+            // activation (ggml_add_id -> ggml_dup_tensor(ctx, a)), not an expert
+            // weight, so an MMID expert-weight coverage table would refuse every
+            // MoE bias-add to the CPU backend. It keeps the allowlist below.
+            if (!moe_mmvq_admission_supports_type(indexed_a_type)) {
+                return false;
+            }
+        } else if (indexed_a_type != GGML_TYPE_Q1_0 && indexed_a_type != GGML_TYPE_NVFP4 &&
+                   !ggml_sycl_mul_mat_type_supported(indexed_a_type)) {
             return false;
         }
         return true;
@@ -107105,6 +107432,14 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_has_active_placement_plan") == 0) {
         return (void *) ggml_backend_sycl_has_active_placement_plan;
+    }
+    // llama.cpp-ir18: the model loader asks the placement plan, pre-create_tensor,
+    // which dense weights are destined for the host, so it can give those to the CPU
+    // backend's repacking buft instead of SYCL_Host. Exported here rather than linked
+    // directly because the loader reaches this backend only through proc addresses
+    // under GGML_BACKEND_DL.
+    if (strcmp(name, "ggml_backend_sycl_planned_target_device") == 0) {
+        return (void *) ggml_backend_sycl_planned_target_device;
     }
     if (strcmp(name, "ggml_backend_sycl_weights_evictable") == 0) {
         return (void *) ggml_backend_sycl_weights_evictable;

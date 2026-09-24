@@ -2956,8 +2956,25 @@ bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t 
     if (num_test_nodes != 0) {
         GGML_ASSERT(test_nodes);
         // Compute the whole graph and only test the output for specific tensors
-        ggml_backend_graph_compute(backend1, g1);
-        ggml_backend_graph_compute(backend2, g2);
+        //
+        // The status is not optional. A backend may refuse at runtime an op it
+        // advertised through supports_op -- the SYCL MoE routes do exactly this,
+        // returning GGML_STATUS_FAILED from a capability refusal raised during
+        // route partition, before anything is dispatched. Discarding the status
+        // here then compared a dst the backend never wrote, which is the random
+        // fill the caller put there, and reported it as a large numeric error.
+        // That reads as wrong arithmetic and sends the reader hunting for a
+        // kernel bug instead of a refusal. Surface it: the caller already
+        // distinguishes this as "compare failed" from a genuine "test failed".
+        const enum ggml_status s1 = ggml_backend_graph_compute(backend1, g1);
+        const enum ggml_status s2 = ggml_backend_graph_compute(backend2, g2);
+        if (s1 != GGML_STATUS_SUCCESS || s2 != GGML_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("%s: graph compute failed, not comparing (%s status=%d, %s status=%d)\n",
+                           __func__, ggml_backend_name(backend1), (int) s1,
+                           ggml_backend_name(backend2), (int) s2);
+            ggml_backend_graph_copy_free(copy);
+            return false;
+        }
 
         bool verified = false;
         for (int i = 0; i < g1->n_nodes; i++) {
@@ -2979,8 +2996,22 @@ bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t 
             struct ggml_cgraph g1v = ggml_graph_view(g1, i, i + 1);
             struct ggml_cgraph g2v = ggml_graph_view(g2, i, i + 1);
 
-            ggml_backend_graph_compute(backend1, &g1v);
-            ggml_backend_graph_compute(backend2, &g2v);
+            // See the status comment in the num_test_nodes branch above: a
+            // refusal reported as a numeric error is strictly worse than a
+            // refusal reported as a refusal. Named per node, because this loop
+            // computes one op at a time and the node index plus op name are the
+            // only self-describing attribution available here.
+            const enum ggml_status s1 = ggml_backend_graph_compute(backend1, &g1v);
+            const enum ggml_status s2 = ggml_backend_graph_compute(backend2, &g2v);
+            if (s1 != GGML_STATUS_SUCCESS || s2 != GGML_STATUS_SUCCESS) {
+                GGML_LOG_ERROR("%s: graph compute failed at node %d (%s), not comparing "
+                               "(%s status=%d, %s status=%d)\n",
+                               __func__, i, ggml_op_name(t1->op),
+                               ggml_backend_name(backend1), (int) s1,
+                               ggml_backend_name(backend2), (int) s2);
+                ggml_backend_graph_copy_free(copy);
+                return false;
+            }
 
             if (ggml_is_view_op(t1->op)) {
                 continue;

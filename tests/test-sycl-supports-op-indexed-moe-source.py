@@ -185,7 +185,7 @@ def contract(text: str) -> bool:
     return (
         function_body_open < early < early_close < router_flag < planner < planner_close < switch
         and executable_body(function[function_body_open + 1 : early]) == EXPECTED_PRE_INDEXED_GUARD_PREFIX
-        and executable_body(early_body) == "constggml_typeindexed_a_type=op->src[0]->type;if(indexed_a_type!=GGML_TYPE_Q1_0&&indexed_a_type!=GGML_TYPE_NVFP4&&!ggml_sycl_mul_mat_type_supported(indexed_a_type)){returnfalse;}returntrue;"
+        and executable_body(early_body) == "constggml_typeindexed_a_type=op->src[0]->type;if(op->op==GGML_OP_MUL_MAT_ID){if(!moe_mmvq_admission_supports_type(indexed_a_type)){returnfalse;}}elseif(indexed_a_type!=GGML_TYPE_Q1_0&&indexed_a_type!=GGML_TYPE_NVFP4&&!ggml_sycl_mul_mat_type_supported(indexed_a_type)){returnfalse;}returntrue;"
         and "GGML_OP_ADD_ID" in function[early : early_close + 1]
         and "GGML_OP_MUL_MAT_ID" in function[early : early_close + 1]
         and router_residency_exception ==
@@ -379,10 +379,19 @@ def test_decision_parser_rejects_else_and_unknown_statements() -> None:
 # oracle (the sanctioned c-wps7 fail-closed class); every other type outside
 # the MUL_MAT allowlist is refused here before it can compute wrong answers.
 EARLY_RETURN = "return true;"
+# The ADD_ID arm of the branch. Since llama.cpp-yitq this is the `else` of a
+# MUL_MAT_ID-only guard, so it carries `} else if` and a deeper continuation
+# indent than the standalone `if` it replaced. ADD_ID must keep this dense
+# allowlist: its src[0] is the F32 activation, not an expert weight, so gating it
+# on the MMID coverage tables would refuse every MoE bias-add to the CPU backend.
 EARLY_TYPE_GUARD = (
-    "if (indexed_a_type != GGML_TYPE_Q1_0 && indexed_a_type != GGML_TYPE_NVFP4 &&\n"
-    "            !ggml_sycl_mul_mat_type_supported(indexed_a_type)) {"
+    "} else if (indexed_a_type != GGML_TYPE_Q1_0 && indexed_a_type != GGML_TYPE_NVFP4 &&\n"
+    "                   !ggml_sycl_mul_mat_type_supported(indexed_a_type)) {"
 )
+# The MUL_MAT_ID arm added by llama.cpp-yitq. Wiring is gated in its own file,
+# tests/test-sycl-mmid-admission-source.py; pinned here so this gate's own
+# mutations cannot silently stop covering the branch they rewrite.
+EARLY_MMID_GUARD = "if (op->op == GGML_OP_MUL_MAT_ID) {"
 
 
 def test_removing_only_early_return_is_rejected() -> None:

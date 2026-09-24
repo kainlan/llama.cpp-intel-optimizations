@@ -27,6 +27,7 @@ static const size_t GiB = 1024*MiB;
 struct llama_model_loader_sycl_hooks {
     ggml_backend_reg_t                                       reg                         = nullptr;
     decltype(&ggml_backend_sycl_weights_evictable)           weights_evictable           = nullptr;
+    decltype(&ggml_backend_sycl_planned_target_device)        planned_target_device       = nullptr;
     decltype(&ggml_backend_sycl_host_buffer_type_for_device) host_buffer_type_for_device = nullptr;
     decltype(&ggml_backend_sycl_register_host_weight_tensor) register_host_weight        = nullptr;
     decltype(&ggml_backend_sycl_register_weight_identity)    register_identity           = nullptr;
@@ -46,6 +47,7 @@ static llama_model_loader_sycl_hooks llama_model_loader_sycl_hooks_for(ggml_back
 #    define LOAD_SYCL_PROC(field, name) \
         hooks.field = reinterpret_cast<decltype(hooks.field)>(ggml_backend_reg_get_proc_address(hooks.reg, name))
     LOAD_SYCL_PROC(weights_evictable, "ggml_backend_sycl_weights_evictable");
+    LOAD_SYCL_PROC(planned_target_device, "ggml_backend_sycl_planned_target_device");
     LOAD_SYCL_PROC(host_buffer_type_for_device, "ggml_backend_sycl_host_buffer_type_for_device");
     LOAD_SYCL_PROC(register_host_weight, "ggml_backend_sycl_register_host_weight_tensor");
     LOAD_SYCL_PROC(register_identity, "ggml_backend_sycl_register_weight_identity");
@@ -1148,6 +1150,73 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+// llama.cpp-ir18. Pick the best buffer type in `buft_list` that is OWNED BY THE CPU
+// BACKEND, skipping the host buffer types that other backends expose.
+//
+// The distinction the caller needs is NOT ggml_backend_buft_is_host(): SYCL_Host is
+// host memory too, which is exactly why `-ot <pat>=CPU` silently resolves to it (see
+// the llama.cpp-lufn counter below). Host-ness says where the bytes live; the owning
+// DEVICE says who materializes and repacks them. Only the CPU device's extra buffer
+// types repack a weight into the AVX layout its kernels want, and make_cpu_buft_list()
+// orders those extras ahead of the plain CPU buft, so a first-match walk here yields
+// CPU_REPACK when one applies and plain CPU otherwise.
+//
+// GGML_SYCL_HOST_WEIGHT_LAYOUT selects among three behaviours so that a correctness
+// failure can be attributed to the right one of them without rebuilding:
+//   "cpu"   (default) -- first supporting CPU-device buft, i.e. CPU_REPACK where it
+//                        applies. This is the layout the CPU kernels want.
+//   "plain" -- last supporting CPU-device buft, i.e. the un-repacked plain CPU buft.
+//              Still CPU-device-owned, so it isolates the REPACK from the OWNERSHIP.
+//   "off"   -- do not intervene at all; the planner's host intent is served by
+//              SYCL_Host exactly as it was before llama.cpp-ir18. The control arm.
+enum llama_host_weight_layout {
+    LLAMA_HOST_WEIGHT_LAYOUT_OFF,
+    LLAMA_HOST_WEIGHT_LAYOUT_PLAIN,
+    LLAMA_HOST_WEIGHT_LAYOUT_CPU,
+};
+
+static llama_host_weight_layout host_weight_layout() {
+    static const llama_host_weight_layout cached = []() {
+        const char * v = getenv("GGML_SYCL_HOST_WEIGHT_LAYOUT");
+        if (v == nullptr) {
+            return LLAMA_HOST_WEIGHT_LAYOUT_CPU;
+        }
+        if (strcmp(v, "off") == 0 || strcmp(v, "0") == 0) {
+            return LLAMA_HOST_WEIGHT_LAYOUT_OFF;
+        }
+        if (strcmp(v, "plain") == 0) {
+            return LLAMA_HOST_WEIGHT_LAYOUT_PLAIN;
+        }
+        return LLAMA_HOST_WEIGHT_LAYOUT_CPU;
+    }();
+    return cached;
+}
+
+static ggml_backend_buffer_type_t select_weight_buft_cpu_owned(const llama_hparams & hparams,
+                                                               ggml_tensor *         tensor,
+                                                               ggml_op               op,
+                                                               const buft_list_t *   buft_list,
+                                                               bool                  prefer_extras) {
+    ggml_backend_buffer_type_t last = nullptr;
+    for (const auto & cur : *buft_list) {
+        ggml_backend_dev_t         cur_dev  = cur.first;
+        ggml_backend_buffer_type_t cur_buft = cur.second;
+        if (cur_dev == nullptr || ggml_backend_dev_type(cur_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        if (!weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
+            continue;
+        }
+        if (prefer_extras) {
+            return cur_buft;
+        }
+        // make_cpu_buft_list() orders the repacking extras ahead of the plain CPU
+        // buft, so the LAST supporting CPU-device entry is the un-repacked one.
+        last = cur_buft;
+    }
+    return last;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1286,6 +1355,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        // llama.cpp-lufn: honour it or say so. buft_list_cpu leads with the
+                        // GPU's host buffer type, so this resolves to SYCL_Host for every op
+                        // the SYCL device accepts and the request is silently not honoured.
+                        // Ask which DEVICE owns the result -- not ggml_backend_buft_is_host(),
+                        // which is true of SYCL_Host too and would report every downgrade as a
+                        // success. Placement itself is left alone (owner decision: loud refusal
+                        // only); this only makes the no-op visible.
+                        if (buft) {
+                            ggml_backend_dev_t ovr_dev = ggml_backend_buft_get_device(buft);
+                            if (ovr_dev == nullptr ||
+                                ggml_backend_dev_type(ovr_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                                if (n_cpu_override_downgraded == 0) {
+                                    first_cpu_override_downgraded_name = tensor_name;
+                                    first_cpu_override_downgraded_buft = buft;
+                                }
+                                n_cpu_override_downgraded++;
+                                cpu_override_downgraded_bytes += ggml_nbytes(t_meta);
+                            }
+                        }
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1302,6 +1390,49 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             ggml_backend_buft_name(buft));
                     break;
                 }
+            }
+        }
+
+        // llama.cpp-ir18: LAYOUT FOLLOWS RESIDENCY for planner-host dense weights.
+        //
+        // The SYCL placement plan is computed BEFORE create_tensor (llama-model.cpp's
+        // "SYCL early placement plan ... (computed pre-create_tensor)"), so by the time
+        // we choose a buffer type the planner has already decided which dense weights
+        // live on the host -- and ggml_backend_sched then executes those layers on the
+        // CPU backend, measured, without any further prompting. What was missing is the
+        // companion half of the owner ruling: a weight the CPU executes must be
+        // materialized in the CPU's layout. Left in SYCL_Host it is laid out for the
+        // GPU and ggml-cpu reads it through generic type traits; handed to the CPU
+        // device's repacking buft it arrives in the AVX layout its kernels want. That
+        // layout difference -- not the choice of processor -- is what `-ot <pat>=CPU`
+        // was actually buying (measured 21.4 -> 23.42 pp256, Qwen3.6-27B/B50).
+        //
+        // Ask the plan, never a local heuristic: it is the single authority for
+        // placement, and re-deriving residency here would be the "one fact, two
+        // sources" defect the fork's dispatch ruling names. A user `-ot` override is
+        // honoured ahead of this, so an explicit request still wins. MoE experts are
+        // not name-indexed in the plan and return NO_PLAN, so they fall through
+        // untouched to the CpuExpertPool path.
+        if (!buft && layer_sycl_hooks.reg && layer_sycl_hooks.planned_target_device &&
+            host_weight_layout() != LLAMA_HOST_WEIGHT_LAYOUT_OFF) {
+            const int  planned_dev   = layer_sycl_hooks.planned_target_device(tn.str().c_str());
+            const bool want_repacked = host_weight_layout() == LLAMA_HOST_WEIGHT_LAYOUT_CPU;
+            if (planned_dev == -1) {
+                ggml_backend_buffer_type_t cpu_buft =
+                    select_weight_buft_cpu_owned(hparams, t_meta, op, buft_list_cpu, want_repacked);
+                if (cpu_buft) {
+                    if (n_host_planned_cpu_owned == 0) {
+                        first_host_planned_cpu_owned_name = tn.str();
+                        first_host_planned_cpu_owned_buft = cpu_buft;
+                    }
+                    n_host_planned_cpu_owned++;
+                    host_planned_cpu_owned_bytes += ggml_nbytes(t_meta);
+                    buft = cpu_buft;
+                }
+                // cpu_buft == nullptr means no CPU-owned buffer type can hold this
+                // weight; fall through to the normal selection rather than failing the
+                // load, and the planner's host intent is then served by SYCL_Host as
+                // before -- correct, just not CPU-optimal.
             }
         }
 
@@ -1645,6 +1776,31 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
             __func__, first_tensor_moved_name.c_str(), first_tensor_moved_type_name.c_str(), n_tensors_moved - 1,
             ggml_backend_buft_name(first_moved_from_buft), ggml_backend_buft_name(first_moved_to_buft));
+    }
+
+    // llama.cpp-lufn. WARN, not INFO: GGML_LOG_INFO/LLAMA_LOG_INFO is below the default
+    // verbosity threshold in every tool, so an INFO here would leave the unhonoured request
+    // exactly as invisible as it is today -- which is the whole defect.
+    // llama.cpp-ir18. INFO, not WARN: this is the design working, and it sits beside
+    // llama.cpp's own model-buffer-size lines, which are INFO too. The independent
+    // evidence that it took effect is a CPU_REPACK entry in those buffer lines -- so
+    // this line is a convenience, not the proof, and `-v` shows both together.
+    if (n_host_planned_cpu_owned > 0) {
+        LLAMA_LOG_INFO("%s: %zu planner-host dense tensor(s) (%.1f MiB) materialized in '%s' so the CPU "
+            "backend that executes them also owns their layout (first: '%s')\n",
+            __func__, n_host_planned_cpu_owned, host_planned_cpu_owned_bytes / (1024.0 * 1024.0),
+            ggml_backend_buft_name(first_host_planned_cpu_owned_buft),
+            first_host_planned_cpu_owned_name.c_str());
+    }
+
+    if (n_cpu_override_downgraded > 0) {
+        LLAMA_LOG_WARN("%s: -ot ...=CPU NOT HONOURED for %zu tensor(s) (%.1f MiB) -- they were placed in "
+            "'%s', which belongs to a non-CPU device, so the GPU still executes them from pinned host "
+            "memory. The CPU override list leads with that device's host buffer type; pass --no-host to "
+            "drop it and reach the CPU backend. First affected tensor: '%s'\n",
+            __func__, n_cpu_override_downgraded, cpu_override_downgraded_bytes / (1024.0 * 1024.0),
+            ggml_backend_buft_name(first_cpu_override_downgraded_buft),
+            first_cpu_override_downgraded_name.c_str());
     }
 }
 

@@ -24183,6 +24183,19 @@ static bool planner_moe_gateup_bundle4_enabled() {
     return enabled;
 }
 
+// GGML_SYCL_KV_PIN_DEVICE=1 (diagnostic, default off, llama.cpp-h8hw): decouple
+// the weight/KV co-assignment in the dense-layer packing loop below so an
+// attention layer's KV can be charged and placed independently of that same
+// layer's dense weights, instead of the two being summed into one on/off-device
+// decision. Default off reproduces today's combined-charge behavior exactly.
+static bool planner_kv_pin_device_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_KV_PIN_DEVICE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static size_t planner_layout_bytes_xmx_tiled_for_dims(ggml_type type, int64_t ncols, int64_t nrows, int device_id) {
     if (type != GGML_TYPE_MXFP4 || ncols <= 0 || nrows <= 0 || device_id < 0 ||
         device_id >= ggml_sycl_info().device_count) {
@@ -27277,6 +27290,99 @@ static const char * placement_kv_layer_label(const placement_kv_info & kv_info, 
     return kv_info.is_swa_layer(layer_id) ? "swa" : "full";
 }
 
+// llama.cpp-21jd: dense analogue of add_single_moe_pp_executable_alternates()
+// above -- MoE experts get opportunistic PP alternate layouts charged and
+// recorded via entry.alternate_layouts; dense weights never did, which is
+// exactly why compute_placement_plan's charge (surfaced by ggml-sycl.cpp's
+// [PLACE-4] line) could promise 3917.9 MB while S1-PRELOAD staged 7732.2 MB
+// on Mistral-7B Q4_0 (c-udh2/c-e9go on this ticket) -- 225 oneDNN WOQ second
+// copies with no representation in the plan at all.
+//
+// Deliberately informational-only: this does NOT touch `remaining`,
+// `plan.vram_bytes`, or `plan.weight_vram_bytes`, and it runs strictly AFTER
+// every dense layer's own on/off-device decision above has already been made
+// from those same totals. Two reasons, not one:
+//
+//   1. It must not perturb the primary packing decision this ticket's own
+//      acceptance test (#2b, already green) depends on -- that decision uses
+//      `remaining` too, and folding an opportunistic extra in before it runs
+//      would risk tiering a layer to host over the last few hundred MB of an
+//      OPTIONAL format, trading a real regression for better bookkeeping.
+//      (The alternative -- fold the alternate into the same on/off-device
+//      call -- is a legitimate design and may still be the better one; #2d's
+//      revised acceptance test flags it explicitly for the ticket owner's
+//      judgment rather than deciding it here.)
+//   2. S1-PRELOAD's own runtime headroom guard (ggml-sycl.cpp, the
+//      `woq_headroom` computed from `plan_owner->vram_bytes -
+//      dense_primary_staged_bytes`) reads `vram_bytes` too. If this pass
+//      charged alternates into that same total, the staging-time guard would
+//      see an inflated `vram_bytes` and refuse alternates the plan just
+//      promised -- the two mechanisms would fight over the same budget twice.
+//      Keeping this pass non-mutating means the staging site's arithmetic
+//      (unchanged, still the guard the ticket owner said to leave alone) and
+//      this prediction both start from the identical `remaining` snapshot,
+//      so they agree without needing to coordinate.
+//
+// Order caveat: this predicts staging's outcome by replaying the same
+// eligibility + cumulative-budget check S1-PRELOAD applies, in `plan.entries`
+// order (priority ASC, layer_id ASC, dst_size DESC -- set earlier in
+// compute_placement_plan). S1-PRELOAD stages in the model's own tensor
+// enumeration order, which is layer-sequential but not guaranteed identical
+// within a layer. Away from a capacity boundary (e.g. PCT=100, where the
+// whole WOQ demand fits) order cannot matter. Near one (e.g. PCT=60) a
+// same-total, different-tensor mismatch is possible; this has not been
+// measured against a live run and is flagged rather than assumed away.
+static size_t add_dense_woq_alternates(placement_plan & plan, size_t remaining, int device_id) {
+    size_t considered       = 0;
+    size_t eligible         = 0;
+    size_t added            = 0;
+    size_t skipped_capacity = 0;
+    size_t no_layout_bytes  = 0;
+    size_t charged_bytes    = 0;
+
+    for (placement_entry & entry : plan.entries) {
+        if (entry.expert_id >= 0 || !entry.on_device || entry.target_device != device_id) {
+            continue;
+        }
+        considered++;
+        if (!ggml_sycl_dense_woq_alternate_eligible(entry.type, /*is_contiguous=*/true)) {
+            continue;
+        }
+        eligible++;
+        if (planner_entry_has_alternate_layout_on_device(entry, GGML_LAYOUT_ONEDNN_WOQ, device_id)) {
+            continue;
+        }
+        const size_t woq_size = ggml_sycl_layout_bytes_onednn_woq_for_dims(entry.type, entry.ne[0], entry.ne[1]);
+        if (woq_size == 0) {
+            no_layout_bytes++;
+            continue;
+        }
+        const size_t woq_charge = placement_vram_charge_bytes(woq_size);
+        if (woq_charge > remaining) {
+            skipped_capacity++;
+            continue;
+        }
+        planner_entry_add_alternate_layout_on_device(entry, GGML_LAYOUT_ONEDNN_WOQ, device_id, woq_size, woq_charge);
+        remaining -= woq_charge;
+        charged_bytes += woq_charge;
+        added++;
+    }
+
+    // WARN, not INFO: GGML_LOG_INFO is dropped at default verbosity in every
+    // tool in this repo (CLAUDE.md), so an INFO-only report of dropped
+    // alternates would be invisible in exactly the runs a reader would use it
+    // for. This is llama.cpp-21jd's #2e: a capability the plan cannot deliver
+    // must be a logged, counted decision, not a silent one.
+    if (considered > 0 && eligible > 0) {
+        GGML_LOG_WARN(
+            "[PLACE-4-WOQ] dense oneDNN WOQ alternates: device=%d eligible=%zu added=%zu skipped_capacity=%zu "
+            "no_layout_bytes=%zu charged=%.1f MB remaining=%.1f MB\n",
+            device_id, eligible, added, skipped_capacity, no_layout_bytes, charged_bytes / (1024.0 * 1024.0),
+            remaining / (1024.0 * 1024.0));
+    }
+    return charged_bytes;
+}
+
 placement_plan compute_placement_plan(const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                       size_t                                              vram_budget,
                                       int                                                 device_id,
@@ -27540,23 +27646,89 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         // uniform-charging workaround is no longer needed.
         const size_t kv_cost =
             layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
-        const size_t total_cost = weight_charge + kv_cost;
-        const bool   on_device  = total_cost <= remaining;
-        const int    target     = on_device ? device_id : -1;
 
-        if (on_device) {
-            remaining -= total_cost;
-            plan.weight_vram_bytes += weight_charge;
-            plan.kv_vram_bytes += kv_cost;
-            plan.vram_bytes += total_cost;
+        bool on_device;
+        int  target;
+        bool kv_on_device;
+
+        if (planner_kv_pin_device_enabled()) {
+            // Diagnostic split (llama.cpp-h8hw): charge this layer's KV
+            // against the arena on its own, ahead of the weight decision, so
+            // the weight decision sees the true remainder. KV still tiers to
+            // host if it alone does not fit -- this lever reorders which of
+            // the two axes gets first claim on `remaining`, it does not grow
+            // the budget or force an over-budget placement. This DOES charge
+            // kv_cost against `remaining`/`plan.vram_bytes` (the ticket's
+            // sketch), not leave it uncharged -- deliberately, so a pinned
+            // layer's true device footprint is still reflected in the
+            // budget totals. Giving KV first CLAIM on `remaining` (tested
+            // and, if it fits, subtracted before the weight decision even
+            // runs) rather than forcing it on-device unconditionally is why
+            // this cannot overcommit: kv_on_device is only true when
+            // kv_cost already fit inside whatever `remaining` was at that
+            // point, so the bytes actually charged for this layer never
+            // exceed what was available. The WARN below fires whenever that
+            // charging order actually changes an outcome (KV and weight
+            // disagree on device) and restates the choice made here.
+            kv_on_device = kv_cost <= remaining;
+            if (kv_on_device) {
+                remaining -= kv_cost;
+                plan.kv_vram_bytes += kv_cost;
+                plan.vram_bytes += kv_cost;
+            } else if (kv_cost > 0) {
+                plan.kv_host_bytes += kv_cost;
+                plan.host_bytes += kv_cost;
+            }
+
+            on_device = weight_charge <= remaining;
+            target    = on_device ? device_id : -1;
+            if (on_device) {
+                remaining -= weight_charge;
+                plan.weight_vram_bytes += weight_charge;
+                plan.vram_bytes += weight_charge;
+            } else {
+                plan.weight_host_bytes += weight_bytes;
+                plan.host_bytes += weight_bytes;
+            }
+
+            // Proof-of-binding (llama.cpp-h8hw, required by lead review
+            // c-lx54): GGML_SYCL_KV_HOST=0 was once proposed and nearly run
+            // as a treatment while being a structural no-op -- a lever that
+            // cannot be shown to have bound is how that happens. WARN, not
+            // INFO: GGML_LOG_INFO is dropped at default verbosity in every
+            // tool in this repo, so an INFO line about a diagnostic override
+            // would be invisible in exactly the runs that use it. Fires only
+            // when the override actually changed this layer's outcome (KV
+            // and weight disagree on device) -- the cell this lever exists
+            // to produce.
+            if (kv_cost > 0 && kv_on_device != on_device) {
+                GGML_LOG_WARN(
+                    "[KV-PIN] GGML_SYCL_KV_PIN_DEVICE override: layer %d KV forced to %s while its dense "
+                    "weights stay %s (kv_cost=%.2f MB charged against the arena ahead of the weight "
+                    "decision)\n",
+                    layer_id, kv_on_device ? "device" : "host", on_device ? "device" : "host",
+                    kv_cost / (1024.0 * 1024.0));
+            }
         } else {
-            plan.weight_host_bytes += weight_bytes;
-            plan.kv_host_bytes += kv_cost;
-            plan.host_bytes += total_cost;
+            const size_t total_cost = weight_charge + kv_cost;
+            on_device               = total_cost <= remaining;
+            target                  = on_device ? device_id : -1;
+            kv_on_device            = on_device;
+
+            if (on_device) {
+                remaining -= total_cost;
+                plan.weight_vram_bytes += weight_charge;
+                plan.kv_vram_bytes += kv_cost;
+                plan.vram_bytes += total_cost;
+            } else {
+                plan.weight_host_bytes += weight_bytes;
+                plan.kv_host_bytes += kv_cost;
+                plan.host_bytes += total_cost;
+            }
         }
 
         plan.layer_device[layer_id] = target;
-        plan.kv_device[layer_id]    = kv_cost > 0 ? target : -1;
+        plan.kv_device[layer_id]    = (kv_cost > 0 && kv_on_device) ? device_id : -1;
 
         size_t kv_anchor = indices.front();
         if (kv_cost > 0) {
@@ -27575,6 +27747,13 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             entry.kv_size       = idx == kv_anchor ? kv_cost : 0;
         }
     }
+
+    // llama.cpp-21jd: single-device dense WOQ alternates, scoped to this path
+    // only -- the multi-device dense packing path (see the device_budgets
+    // loops further below / in the sibling compute_placement_plan overloads)
+    // is not exercised by this ticket's acceptance evidence (all of it is
+    // single-GPU B50) and is left untouched rather than changed unverified.
+    add_dense_woq_alternates(plan, remaining, device_id);
 
     // MoE expert entries: budget-aware placement at (layer, expert) triplet
     // granularity.  A layer executor consumes gate/up/down for the same routed

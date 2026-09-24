@@ -179,9 +179,21 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "ID admission failure propagates":
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID expert ID admission failed\")",
         "shared retained dispatch helper": "append_retained_operand",
-        "decode CPU-TG fast gate": "if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced)",
+        # Re-pinned: the source gained `&& !pp_onednn_batched_route` (llama.cpp-dboi),
+        # which made this pin stale. It is an ORDER pin, and token_sequence_index()
+        # RAISES when it misses, so the stale literal aborted violations() before any
+        # mutation witness in this file could run -- the gate was red at HEAD and
+        # every witness behind it was unreachable. Found while re-pinning the decode
+        # gate for llama.cpp-t98c.
+        "decode CPU-TG fast gate":
+            "if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced && !pp_onednn_batched_route)",
         "decode GPU fast gate": "if (ne12 != 1) { if (!pp_cpu_reference_force_router",
         "decode precomputed gate": "src1 && src1->ne[2] != 1 && ggml_sycl_moe_precomputed_skip_contains",
+        # Deliberately unconditional and type-blind; see the comment on the gate
+        # itself in ggml-sycl.cpp. A type carve-out here was tried and withdrawn
+        # (llama.cpp-t98c): it steers decode into the prompt-only else-branch,
+        # which resolves no route and reports a worse error than the honest
+        # capability refusal it was trying to avoid.
         "all-local decode retained gate": "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route",
         "CPU-TG retains selected routing semantics":
             "const bool cpu_expert_tg_active = selected_hybrid_route && !prompt_batch",
@@ -336,8 +348,12 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
 
     # Token-wise boundaries prevent comments, formatting, or a dead nested block
     # from hiding authority reacquisition in the complete active pair path.
+    # Same literal as required_source["decode CPU-TG fast gate"], referenced rather
+    # than repeated: the two copies drifted apart (this one kept the pre-dboi
+    # spelling) and, because token_sequence_index() raises, the stale copy aborted
+    # every mutation witness below it. One definition, one failure mode.
     pair_start_tokens = token_sequence_index(
-        mmid_tokens, "if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced)", prompt_admission_tokens)
+        mmid_tokens, required_source["decode CPU-TG fast gate"], prompt_admission_tokens)
     pair_end_tokens = token_sequence_index(mmid_tokens, "auto record_moe_gpu_path", pair_start_tokens)
     pair_path_tokens = mmid_tokens[pair_start_tokens:pair_end_tokens]
     down_table_tokens = token_sequence_index(pair_path_tokens, "auto down_table")

@@ -128,6 +128,29 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t first_moved_from_buft = nullptr;
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
+    // llama.cpp-lufn: `-ot <pattern>=CPU` is resolved through make_cpu_buft_list(), whose
+    // FIRST entry is the first device's host buffer type -- SYCL_Host on this fork -- ahead
+    // of the CPU_REPACK extras and the plain CPU buft. select_weight_buft() returns the
+    // first entry whose device accepts the op, so a CPU override silently lands in pinned
+    // host memory that the GPU still executes from, and reaches the CPU backend only for the
+    // ops the SYCL device declines. Nothing said so: two runs asking for 96 and 144 layers
+    // both put the same 45 MB on CPU. Count the downgrades here so done_getting_tensors()
+    // can refuse loudly. Note `ggml_backend_buft_is_host()` cannot be the discriminator --
+    // SYCL_Host IS host memory; the question is which DEVICE owns the buffer type.
+    size_t                     n_cpu_override_downgraded      = 0;
+    size_t                     cpu_override_downgraded_bytes  = 0;
+    std::string                first_cpu_override_downgraded_name;
+    ggml_backend_buffer_type_t first_cpu_override_downgraded_buft = nullptr;
+
+    // llama.cpp-ir18: dense weights the SYCL planner destined for the host that we
+    // therefore materialized in a CPU-BACKEND-owned buffer type (CPU_REPACK where it
+    // applies) instead of SYCL_Host, so the processor that executes them also chose
+    // their layout. Reported once by done_getting_tensors().
+    size_t                     n_host_planned_cpu_owned     = 0;
+    size_t                     host_planned_cpu_owned_bytes = 0;
+    std::string                first_host_planned_cpu_owned_name;
+    ggml_backend_buffer_type_t first_host_planned_cpu_owned_buft = nullptr;
+
     llama_model_loader(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,

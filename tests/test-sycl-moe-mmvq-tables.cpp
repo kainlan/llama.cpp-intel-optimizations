@@ -194,6 +194,98 @@ int main() {
         }
     }
 
+    // 6. MUL_MAT_ID ADMISSION population (llama.cpp-yitq).
+    //    ggml_backend_sycl_device_supports_op's MUL_MAT_ID branch used to gate on
+    //    ggml_sycl_mul_mat_type_supported() -- the DENSE MUL_MAT allowlist. That
+    //    allowlist is legitimately true for F32/F16/IQ1_S..IQ4_XS (they have real
+    //    dense kernels) and none of them has an _id kernel family, so admission
+    //    handed the scheduler 234 census cases this backend cannot compute. The
+    //    route oracle refused them, but per the header comment that refusal is
+    //    discarded and resurfaces as ERR 86-99 instead of a CPU fallback.
+    //
+    //    Pinned as an exact PARTITION of GGML_TYPE_COUNT, not as two spot lists:
+    //    a spot check passes while a newly added type silently joins neither set.
+    //    The cardinality assertion below is what makes the lists load-bearing --
+    //    identity plus population, because either alone fails open.
+    const ggml_type admission_expected[] = {
+        GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_Q4_1,
+        GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,  GGML_TYPE_Q2_K,
+        GGML_TYPE_Q3_K,
+    };
+    //    The exact set that regressed: dense MUL_MAT kernels exist, _id does not.
+    //    BF16/q2_0/tq2_0 are absent on purpose -- 186348705 already refuses them
+    //    by leaving them out of the dense allowlist, so they never reached here.
+    const ggml_type admission_refused[] = {
+        GGML_TYPE_F32,     GGML_TYPE_F16,    GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,  GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+        GGML_TYPE_IQ2_S,   GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
+    };
+
+    for (const ggml_type type : admission_expected) {
+        if (!moe_mmvq_admission_supports_type(type)) {
+            std::printf("FAIL: type=%d has _id coverage but MUL_MAT_ID admission refuses it\n", static_cast<int>(type));
+            ++failures;
+        }
+    }
+    for (const ggml_type type : admission_refused) {
+        if (moe_mmvq_admission_supports_type(type)) {
+            std::printf(
+                "FAIL: type=%d admitted for MUL_MAT_ID with no _id kernel family -- this is the "
+                "yitq regression (wrong numbers instead of CPU fallback)\n",
+                static_cast<int>(type));
+            ++failures;
+        }
+    }
+    //    Cardinality: nothing outside admission_expected may be admitted. Catches
+    //    a type added to the dispatch tables without being added to the list here.
+    int admitted_total = 0;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        if (moe_mmvq_admission_supports_type(static_cast<ggml_type>(t))) {
+            ++admitted_total;
+        }
+    }
+    const int admission_expected_count = static_cast<int>(sizeof(admission_expected) / sizeof(admission_expected[0]));
+    if (admitted_total != admission_expected_count) {
+        std::printf(
+            "FAIL: MUL_MAT_ID admission population is %d, expected %d. A type gained (or lost) _id "
+            "coverage without this list moving in the same change.\n",
+            admitted_total, admission_expected_count);
+        ++failures;
+    }
+    //    Sensitivity, stated honestly. Measured by mutating the predicate
+    //    (2026-09-17): admitting F32, admitting an IQ type, dropping a covered
+    //    type, and admitting everything are all CAUGHT by the checks above.
+    //    Dropping the predicate's capability axis entirely is NOT caught, and
+    //    cannot be, because moe_mmvq_batched_dispatch_supports_type and the
+    //    capability table cover exactly the same 13 types today -- so the two
+    //    axes are indistinguishable by population. The second axis is therefore
+    //    defensive, not gated here; what keeps the sets coinciding is the subset
+    //    invariant in section 3. Do not add a control that "proves" the axis by
+    //    reimplementing the predicate over injected tables: that would exercise
+    //    the replica, not the function, and pass while the real one is broken.
+    //    If a future wave ever gives a type an _id executor without advertising
+    //    a layout for it, the axis becomes observable -- add the case then.
+    //
+    //    What IS checkable now is the premise that makes the two axes agree:
+    //    every admitted type must be advertised for at least one layout. If this
+    //    fails, the sets have diverged and the note above is stale.
+    for (const ggml_type type : admission_expected) {
+        bool advertised = false;
+        for (const ggml_layout_mode layout : all_layouts()) {
+            if (moe_mmvq_capability_supports_layout(type, layout)) {
+                advertised = true;
+                break;
+            }
+        }
+        if (!advertised) {
+            std::printf(
+                "FAIL: type=%d is admitted for MUL_MAT_ID but advertised for no layout -- the two "
+                "admission axes have diverged; the capability axis is now load-bearing and needs "
+                "its own case here\n",
+                static_cast<int>(type));
+            ++failures;
+        }
+    }
+
     if (failures != 0) {
         std::printf("test-sycl-moe-mmvq-tables: FAILED (%d)\n", failures);
         return 1;
