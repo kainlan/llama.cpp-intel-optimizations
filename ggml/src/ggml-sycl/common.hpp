@@ -2408,6 +2408,11 @@ sycl::event ggml_sycl_pp_stage_transfer(int          src_device,
 // drift apart. Definitions live in ggml-sycl.cpp; see
 // ggml_sycl_dense_woq_alternate_eligible's own comment for the history.
 bool   ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous);
+// Same predicate, with placement safety judged for `plan` rather than the current global
+// plan -- the planner's form, since the plan it is building is not global yet.
+bool   ggml_sycl_dense_woq_alternate_eligible_for_plan(ggml_type                         type,
+                                                       bool                              is_contiguous,
+                                                       const ggml_sycl::placement_plan & plan);
 size_t ggml_sycl_layout_bytes_onednn_woq_for_dims(ggml_type type, int64_t ncols, int64_t nrows);
 
 // Check if PP is enabled
@@ -4667,8 +4672,14 @@ inline bool ggml_sycl_direct_handle_trust_ok(const ggml_tensor * tensor, const g
     // WEIGHT/ARENA/CHUNK_LEASE handle (the overwhelming majority of resolves)
     // an atomic RMW they don't need. Semantically identical to checking
     // valid() first; only the hot-path cost changes.
+    //
+    // An OWNING DIRECT handle (from_owned_alloc) is trusted too: the 2gag hazard
+    // is a raw alias whose allocation was released and re-dealt, and an owning
+    // handle holds its allocation until the last copy dies. Refusing it made
+    // every cross-device routed op (simple consumer route: activations staged
+    // onto the weight-owning device) resolve to null there and fault the GPU.
     return handle.kind() != ggml_sycl::mem_handle_kind::DIRECT || !handle.valid() ||
-           (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+           (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0 || handle.owns_allocation();
 }
 
 // Hot path: 2 dereferences + 1 null check for common case (model fits in VRAM)
@@ -5544,6 +5555,28 @@ inline bool ggml_sycl_weight_is_planned_on_host(const ggml_tensor * tensor, int 
 
 inline bool ggml_sycl_weight_is_planned_on_device(const ggml_tensor * tensor, int device) {
     return ggml_sycl_get_planned_weight_residency(tensor, device) == ggml_sycl_planned_weight_residency::DEVICE;
+}
+
+// True when a multi-device plan places this dense weight on a DIFFERENT device.
+// Placement decides the executor: `device` never executes that weight (the
+// dense weight-owner route runs the op on the owner), so no path may stream,
+// stage, or materialize a copy of it for `device`.
+inline bool ggml_sycl_weight_is_planned_on_other_device(const ggml_tensor * tensor, int device) {
+    if (!tensor || tensor->name[0] == '\0' || !ggml_sycl_tensor_is_weight(tensor) ||
+        !ggml_sycl_valid_device_index(device)) {
+        return false;
+    }
+    auto *     cache      = ggml_sycl::get_unified_cache_for_device(device);
+    const auto plan_owner = ggml_sycl::coherent_placement_plan_owner(cache);
+    if (!plan_owner || !plan_owner->multi_device) {
+        return false;
+    }
+    const std::string name(tensor->name);
+    if (!plan_owner->has_dense_entry(name)) {
+        return false;
+    }
+    const int target = plan_owner->get_target_device(name);
+    return target >= 0 && target != device;
 }
 
 // Full range check for the same reason as

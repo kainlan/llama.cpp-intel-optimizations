@@ -11856,36 +11856,43 @@ static void ggml_sycl_execution_reset_backend_binding_state(ggml_backend_sycl_co
     ctx->execution_root_slot_generation = 0;
 }
 
-static void ggml_sycl_execution_sync_binding_devices(ggml_backend_sycl_context * backend, const std::vector<int> & devices) {
-    if (!backend) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
-    auto it = g_execution_backend_bindings.find(backend);
-    if (it == g_execution_backend_bindings.end() || !it->second || it->second->context_id == 0 || it->second->draining) {
-        return;
-    }
-    std::lock_guard<std::mutex> state_lock(backend->execution_state_mutex);
-    if (backend->execution_context_id != it->second->context_id || backend->execution_participant_id != it->second->participant_id) {
-        return;
-    }
+// covered_devices and the registry's bound_device_refs record the same fact
+// (which devices this binding participates on): begin_invocation validates the
+// aggregate device set against the registry, and teardown unbinds every covered
+// device. Every covered_devices change must therefore go through here so the
+// two cannot diverge -- a plan-driven multi-device aggregate that only rewrote
+// covered_devices left the secondary device unbound and failed every graph
+// with MISMATCH. Caller holds g_execution_backend_binding_mutex and
+// backend->execution_state_mutex. Only devices the registry accepted are
+// recorded, so teardown never unbinds a device that was not bound.
+static void ggml_sycl_execution_sync_binding_devices_locked(ggml_sycl_execution_backend_binding & binding,
+                                                            const std::vector<int> &              devices) {
     std::vector<int> next = devices;
     std::sort(next.begin(), next.end());
     next.erase(std::unique(next.begin(), next.end()), next.end());
-    std::vector<int> prev = it->second->covered_devices;
+    std::vector<int> prev = binding.covered_devices;
     std::sort(prev.begin(), prev.end());
     prev.erase(std::unique(prev.begin(), prev.end()), prev.end());
+    std::vector<int> covered;
     for (int d : next) {
-        if (std::find(prev.begin(), prev.end(), d) == prev.end()) {
-            (void) ggml_sycl::execution::global_registry().bind_backend({ it->second->context_id }, d);
+        if (std::find(prev.begin(), prev.end(), d) != prev.end()) {
+            covered.push_back(d);
+            continue;
+        }
+        const auto rc = ggml_sycl::execution::global_registry().bind_backend({ binding.context_id }, d);
+        if (rc == ggml_sycl::execution::error::OK) {
+            covered.push_back(d);
+        } else {
+            GGML_LOG_WARN("[SYCL] execution binding: failed to bind device %d to context_id=%llu: error=%s\n", d,
+                          (unsigned long long) binding.context_id, ggml_sycl_execution_error_name(rc));
         }
     }
     for (int d : prev) {
         if (std::find(next.begin(), next.end(), d) == next.end()) {
-            (void) ggml_sycl::execution::global_registry().unbind_backend({ it->second->context_id }, d);
+            (void) ggml_sycl::execution::global_registry().unbind_backend({ binding.context_id }, d);
         }
     }
-    it->second->covered_devices = next;
+    binding.covered_devices = covered;
 }
 
 static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) {
@@ -16521,9 +16528,13 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
                     // A non-layer tensor (embeddings, output) has no layer_device entry
                     // and build_layer_map() skips it anyway -- keep it so the filtered
                     // inventory stays a faithful subset rather than a reshaped one.
+                    // Layers the plan put on ANOTHER device are excluded for the
+                    // same reason: this device never executes them, and their
+                    // host_ptr is not a registered streaming source here.
                     if (layer_id >= 0) {
                         const auto it = plan.layer_device.find(layer_id);
-                        if (it != plan.layer_device.end() && it->second < 0) {
+                        if (it != plan.layer_device.end() &&
+                            (it->second < 0 || (plan.multi_device && it->second != ctx->device))) {
                             excluded_bytes += item.second;
                             excluded_count++;
                             continue;
@@ -16537,8 +16548,8 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
                     // silent honouring is indistinguishable from the old silent
                     // override.
                     GGML_LOG_WARN(
-                        "[SYCL-CPU] layer streaming excludes %zu planner-host tensors (%.1f MB); the CPU "
-                        "backend executes those layers\n",
+                        "[SYCL-CPU] layer streaming excludes %zu tensors (%.1f MB) the plan placed on the host "
+                        "or on another device; their owner executes those layers\n",
                         excluded_count, excluded_bytes / (1024.0 * 1024.0));
                     stream_inventory       = stream_inventory_filtered.data();
                     stream_inventory_count = stream_inventory_filtered.size();
@@ -18249,8 +18260,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                     backend_ctx->execution_root_load_txn_id = token.load.value;
                     backend_ctx->execution_root_slot = token.owner.slot;
                     backend_ctx->execution_root_slot_generation = token.owner.generation;
+                    // Keep the plan's full set as the aggregate: a device the
+                    // registry refused to bind must fail begin_invocation
+                    // loudly, not silently drop out of tracking.
+                    ggml_sycl_execution_sync_binding_devices_locked(*binding_it->second, aggregate_devices);
                     backend_ctx->execution_aggregate_devices = aggregate_devices;
-                    binding_it->second->covered_devices = aggregate_devices;
                 }
             }
         }
@@ -23274,6 +23288,15 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
         }
     }
 
+    // A weight the plan placed on another device has no pointer on this one:
+    // staging a host copy for it here is the weight streaming the placement
+    // ruling forbids (the dense weight-owner route runs the op on the owner).
+    if (ggml_sycl_weight_is_planned_on_other_device(tensor, device)) {
+        GGML_SYCL_DEBUG("ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, planned on another device; no pointer\n",
+                        tensor->name, device);
+        return nullptr;
+    }
+
     // Check per-graph pointer cache before expensive resolution.
     // resolve() re-validates WEIGHT handles via generation counter; DIRECT handles
     // always return their stored pointer.  If resolve() returns null (weight evicted),
@@ -26807,17 +26830,25 @@ static bool ggml_sycl_moe_secondary_dispatch_supports_layout(ggml_type type, lay
 
 static int ggml_sycl_routable_device_count();
 
-static bool ggml_sycl_onednn_pp_safe_for_current_placement() {
+// `plan` is the placement the question is about: the global plan at runtime, or
+// the plan under construction when the planner predicts WOQ copies. The planner
+// used to ask this about the PREVIOUS global plan, so a two-card split predicted
+// copies that staging -- asking about the split -- then never made (llama.cpp-21jd).
+static bool ggml_sycl_onednn_pp_safe_for_placement(const ggml_sycl::placement_plan * plan) {
     const bool single_routable_device = ggml_sycl_routable_device_count() <= 1;
     if (!single_routable_device && g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
         return false;
     }
-    const auto plan_owner = ggml_sycl_global_plan_owner();
-    if (ggml_sycl_has_global_plan() && plan_owner->multi_device &&
-        ggml_sycl_placement_plan_needs_secondary_devices(*plan_owner) && !single_routable_device) {
+    if (plan && plan->multi_device && ggml_sycl_placement_plan_needs_secondary_devices(*plan) &&
+        !single_routable_device) {
         return false;
     }
     return true;
+}
+
+static bool ggml_sycl_onednn_pp_safe_for_current_placement() {
+    const auto plan_owner = ggml_sycl_global_plan_owner();
+    return ggml_sycl_onednn_pp_safe_for_placement(ggml_sycl_has_global_plan() ? plan_owner.get() : nullptr);
 }
 
 static int ggml_sycl_onednn_pp_min_batch() {
@@ -26912,9 +26943,21 @@ static bool ggml_sycl_onednn_pp_skip_type(ggml_type type) {
 // 7732.2 MB staged on Mistral-7B Q4_0). One implementation now backs both the
 // plan's charge and the staging decision, so they cannot drift apart the way
 // two independent copies of this boolean eventually would.
+static bool ggml_sycl_dense_woq_alternate_eligible_impl(ggml_type type, bool is_contiguous, bool placement_safe) {
+    return is_contiguous && ggml_sycl_onednn_pp_enabled() && !ggml_sycl_onednn_pp_skip_type(type) && placement_safe &&
+           ggml_sycl_onednn_woq_supported_type(type);
+}
+
 bool ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous) {
-    return is_contiguous && ggml_sycl_onednn_pp_enabled() && !ggml_sycl_onednn_pp_skip_type(type) &&
-           ggml_sycl_onednn_pp_safe_for_current_placement() && ggml_sycl_onednn_woq_supported_type(type);
+    return ggml_sycl_dense_woq_alternate_eligible_impl(type, is_contiguous,
+                                                       ggml_sycl_onednn_pp_safe_for_current_placement());
+}
+
+bool ggml_sycl_dense_woq_alternate_eligible_for_plan(ggml_type                         type,
+                                                     bool                              is_contiguous,
+                                                     const ggml_sycl::placement_plan & plan) {
+    return ggml_sycl_dense_woq_alternate_eligible_impl(type, is_contiguous,
+                                                       ggml_sycl_onednn_pp_safe_for_placement(&plan));
 }
 
 static bool ggml_sycl_onednn_pp_candidate(const ggml_tensor * src0,
@@ -34170,6 +34213,15 @@ static void ggml_sycl_preload_model_weights() {
                                 dense_woq_planned_declined++;
                             } else {
                                 dense_woq_unplanned_declined++;
+                            }
+                        } else if (preload_layout != GGML_LAYOUT_ONEDNN_WOQ && !dense_name.empty()) {
+                            // Ineligible at staging time. If the plan promised a copy anyway, that is
+                            // a disagreement too -- this branch is how the two-card split's 17 promised
+                            // copies went unstaged without a word.
+                            const auto woq_plan_owner = ggml_sycl::coherent_cache_placement_plan_owner(cache);
+                            if (woq_plan_owner && woq_plan_owner->dense_extra_layout_on_device(
+                                                      dense_name, device, GGML_LAYOUT_ONEDNN_WOQ)) {
+                                dense_woq_planned_declined++;
                             }
                         }
 #endif
@@ -47003,6 +47055,12 @@ static void ggml_sycl_ensure_weight_on_device(const ggml_tensor * src0, int devi
     if (ggml_sycl_weight_is_planned_on_host(src0, device)) {
         GGML_SYCL_DEBUG("[SYCL-PLAN] refusing ensure_weight_on_device for planned host weight %s on device %d\n",
                         src0->name ? src0->name : "(unnamed)", device);
+        return;
+    }
+    if (ggml_sycl_weight_is_planned_on_other_device(src0, device)) {
+        GGML_SYCL_DEBUG(
+            "[SYCL-PLAN] refusing ensure_weight_on_device for weight %s planned on another device than %d\n",
+            src0->name, device);
         return;
     }
 

@@ -27348,7 +27348,7 @@ static size_t add_dense_woq_alternates(placement_plan & plan, size_t remaining, 
             continue;
         }
         considered++;
-        if (!ggml_sycl_dense_woq_alternate_eligible(entry.type, /*is_contiguous=*/true)) {
+        if (!ggml_sycl_dense_woq_alternate_eligible_for_plan(entry.type, /*is_contiguous=*/true, plan)) {
             continue;
         }
         eligible++;

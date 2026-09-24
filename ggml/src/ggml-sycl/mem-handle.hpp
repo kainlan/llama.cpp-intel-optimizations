@@ -437,6 +437,15 @@ class mem_handle {
     // Access the handle kind.
     mem_handle_kind kind() const { return kind_; }
 
+    // True if this handle carries a ref-counted runtime allocation owner
+    // (from_owned_alloc).  Such a handle keeps its allocation alive for as long
+    // as it -- or any copy -- exists, so its pointer cannot be re-dealt to
+    // another tenant underneath it.
+    bool owns_allocation() const {
+        mem_handle_lock_guard g(lock_);
+        return static_cast<bool>(owned_alloc_);
+    }
+
     // True if this is a cache-managed WEIGHT handle (not a raw DIRECT pointer).
     bool is_weight() const { return kind_ == mem_handle_kind::WEIGHT; }
 
