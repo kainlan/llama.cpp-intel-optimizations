@@ -223,7 +223,7 @@ static void test_split_decode_ranges() {
     }
 }
 
-// Hazard 4: the final norm's name carries no layer, and its source is layer
+// The final norm's name carries no layer, and its source is layer
 // 3's output. It stays with its producer; result_norm follows the output norm
 // weight's placement, not the name of anything.
 static void test_tail_follows_weight_placement() {
@@ -295,7 +295,7 @@ static void test_noop_keeps_predecessor_device() {
     }
 }
 
-// Hazard 11: SET_ROWS writes the KV cache where placement put it. When layer
+// SET_ROWS writes the KV cache where placement put it. When layer
 // 2's KV is not on device 1, the write goes to device 0 and splits layer 2 in
 // pieces -- too many ranges. With the range limit lifted, the attention that
 // reads that KV on device 1 is refused rather than staged.
@@ -455,8 +455,7 @@ static void test_plan_invariants() {
     {
         dense_exec_plan bad = p;
         bad.io[1].stage_in.push_back(bad.io[1].copy_out[0].to_slice);
-        const char * got = dense_exec_plan_violation(b.g, bad);
-        check(got != nullptr, "an unpublished stage-in is caught");
+        expect_violation(b.g, bad, "a staged slice is not published");
     }
     {
         dense_exec_plan bad = p;
@@ -521,6 +520,31 @@ static void test_violation_original_range_writes_executor_result() {
     expect_violation(b.g, p, "an original-device node writes an executor range's result");
 }
 
+// A control leaf the executor device can already read in place is published
+// by nobody and copied by nobody.
+static void test_control_resident_on_executor_is_not_staged() {
+    graph_builder b;
+    b.g.original_device = 0;
+    b.g.blocks          = {
+        { 0, 0, 0, 0, false },
+        { 1, 1, 1, 1, false },
+    };
+    const int w0   = b.root("w0", DENSE_EXEC_ROOT_WEIGHT, DEV0);
+    const int w1   = b.root("w1", DENSE_EXEC_ROOT_WEIGHT, DEV1);
+    const int both = b.root("ctl-both", DENSE_EXEC_ROOT_CONTROL, DEV0 | DEV1);
+    const int dev0 = b.root("ctl-dev0", DENSE_EXEC_ROOT_CONTROL, DEV0);
+    const int a0   = b.op("a-0", 0, { both, w0 });
+    b.op("a-1", 1, { a0, both, dev0, w1 });
+    b.op("out", 0, { b.root_index("a-1"), w0 });
+
+    dense_exec_plan p;
+    check(dense_exec_build_plan(b.g, p) == DENSE_EXEC_GATE_NONE, "plans");
+    check(p.ranges.size() == 3 && p.ranges[1].executor, "one executor range");
+    check(slice_for(p, both, 1) < 0, "a control leaf resident on device 1 gets no slice");
+    check(contains(p.io[1].stage_in, slice_for(p, dev0, 1)), "a device-0-only control leaf is staged");
+    check(p.io[1].stage_in.size() == 2, "a-0 and ctl-dev0 are the only stage-ins");
+}
+
 int main() {
     struct test_case {
         const char * name;
@@ -528,20 +552,21 @@ int main() {
     };
 
     const test_case cases[] = {
-        { "precheck-gates",                            test_precheck_gates                                  },
-        { "split-decode-ranges",                       test_split_decode_ranges                             },
-        { "tail-follows-weight-placement",             test_tail_follows_weight_placement                   },
-        { "boundary-io",                               test_boundary_io                                     },
-        { "noop-keeps-predecessor-device",             test_noop_keeps_predecessor_device                   },
-        { "kv-not-on-executor-device",                 test_kv_not_on_executor_device                       },
-        { "host-weight-runs-on-original-device",       test_host_weight_runs_on_original_device             },
-        { "in-place-write-into-foreign-root",          test_in_place_write_into_foreign_root                },
-        { "arena-layout",                              test_arena_layout                                    },
-        { "single-device-graph",                       test_single_device_graph                             },
-        { "same-device-reuse-across-ranges",           test_same_device_reuse_across_ranges                 },
-        { "plan-invariants",                           test_plan_invariants                                 },
-        { "original-range-writes-executor-result",     test_original_range_writes_executor_result           },
-        { "violation-original-writes-executor-result", test_violation_original_range_writes_executor_result },
+        { "precheck-gates",                             test_precheck_gates                                  },
+        { "split-decode-ranges",                        test_split_decode_ranges                             },
+        { "tail-follows-weight-placement",              test_tail_follows_weight_placement                   },
+        { "boundary-io",                                test_boundary_io                                     },
+        { "noop-keeps-predecessor-device",              test_noop_keeps_predecessor_device                   },
+        { "kv-not-on-executor-device",                  test_kv_not_on_executor_device                       },
+        { "host-weight-runs-on-original-device",        test_host_weight_runs_on_original_device             },
+        { "in-place-write-into-foreign-root",           test_in_place_write_into_foreign_root                },
+        { "arena-layout",                               test_arena_layout                                    },
+        { "single-device-graph",                        test_single_device_graph                             },
+        { "same-device-reuse-across-ranges",            test_same_device_reuse_across_ranges                 },
+        { "plan-invariants",                            test_plan_invariants                                 },
+        { "original-range-writes-executor-result",      test_original_range_writes_executor_result           },
+        { "violation-original-writes-executor-result",  test_violation_original_range_writes_executor_result },
+        { "control-resident-on-executor-is-not-staged", test_control_resident_on_executor_is_not_staged      },
     };
 
     int failed = 0;

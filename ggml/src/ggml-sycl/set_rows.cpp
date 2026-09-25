@@ -1,6 +1,5 @@
 #include "set_rows.hpp"
 
-#include "block-exec-dense.hpp"
 #include "common.hpp"
 #include "cpy.hpp"
 #include "fattn.hpp"
@@ -11,6 +10,10 @@
 #include <cstdlib>
 #include <utility>
 #include <vector>
+
+// True while the dense block executor runs a node range on that range's own
+// device (llama.cpp-tf8m). Defined in ggml-sycl.cpp.
+bool ggml_sycl_block_exec_dense_active();
 
 static constexpr int GGML_SYCL_SET_ROWS_UNKNOWN_DEVICE_USM = -2;
 

@@ -1,6 +1,6 @@
 //
 // Dense-split layer-block executor: which device runs each node, and what
-// must cross between devices (llama.cpp-tf8m, design S4a).
+// must cross between devices (llama.cpp-tf8m).
 //
 // A dense model split over two cards (Mistral 7B: B70 layers 0-29, B50 layers
 // 30-31) used to run every op of the second card through a per-op route: stage
@@ -26,10 +26,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
-
-// True while the dense executor runs a node range on that range's own device.
-// Defined in ggml-sycl.cpp.
-bool ggml_sycl_block_exec_dense_active();
 
 namespace ggml_sycl {
 
