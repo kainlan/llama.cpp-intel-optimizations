@@ -88830,6 +88830,35 @@ struct ggml_sycl_block_exec_dense_state {
     ggml_sycl::mem_handle                          arena[GGML_SYCL_MAX_DEVICES];
     size_t                                         arena_bytes[GGML_SYCL_MAX_DEVICES] = {};
 
+#ifdef GGML_SYCL_GRAPH
+    // One recorded command graph per range of a decode graph, replayed on the
+    // range's own device queue. A graph bakes raw pointers, so it holds every
+    // handle it bakes -- arena slices, the Q8 activation backing, the weights,
+    // and what the recording sink collected -- until the graph is destroyed.
+    struct range_graph {
+        uint64_t                                                                  signature   = 0;
+        int                                                                       n_nodes     = 0;
+        int                                                                       device      = -1;
+        size_t                                                                    q8_identity = 0;
+        std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec;
+        std::vector<ggml_sycl::mem_handle>                                        retained;
+        std::vector<ggml_backend_sycl_context::fa_graph_ptr_snapshot>             fa_ptrs;
+        uint64_t                                                                  records = 0;
+        uint64_t                                                                  replays = 0;
+    };
+
+    uint64_t                 graphs_key = 0;  // plan, ranges, slices and arenas the graphs were recorded for
+    std::vector<range_graph> graphs;          // indexed by range
+    bool                     graphs_disabled = false;
+
+    // Destroys every range graph. Each device a graph ran on is drained first:
+    // decode returns with a replay possibly still in flight, and destroying an
+    // executable graph under its own submission is the llama.cpp-dkw0 defect
+    // #4 double free. Pool scratch the recordings retained is released last,
+    // and only when no other graph of this context can still hold it.
+    void drop_graphs(ggml_backend_sycl_context & ctx);
+#endif
+
     // Kernels of an earlier graph may still read an arena (decode can return
     // with work in flight). Growing or dropping one therefore drains its
     // device's execution queue -- the only queue that reads or writes it, see
@@ -88849,6 +88878,57 @@ struct ggml_sycl_block_exec_dense_state {
         arena_bytes[device] = 0;
     }
 };
+
+#ifdef GGML_SYCL_GRAPH
+void ggml_sycl_block_exec_dense_state::drop_graphs(ggml_backend_sycl_context & ctx) {
+    if (graphs.empty()) {
+        return;
+    }
+    bool used[GGML_SYCL_MAX_DEVICES] = {};
+    for (const range_graph & g : graphs) {
+        if (g.exec && g.device >= 0 && g.device < GGML_SYCL_MAX_DEVICES) {
+            used[g.device] = true;
+        }
+    }
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        if (!used[d]) {
+            continue;
+        }
+        try {
+            ggml_sycl_block_exec_dense_queue(ctx, d)->wait_and_throw();
+        } catch (const std::exception & e) {
+            GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] drain before dropping range graphs failed on device %d: %s", d,
+                       e.what());
+        }
+    }
+    graphs.clear();
+    graphs_key = 0;
+    if (ctx.exec_graph || ctx.moe_segments_valid) {
+        return;
+    }
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        if (!used[d]) {
+            continue;
+        }
+        if (ctx.pools[d]) {
+            ctx.pools[d]->release_graph_retained();
+        }
+        for (auto & entry : ctx.routed_pools[d]) {
+            if (entry.second) {
+                entry.second->release_graph_retained();
+            }
+        }
+        if (ctx.host_pools[d]) {
+            ctx.host_pools[d]->release_graph_retained();
+        }
+        for (auto & entry : ctx.routed_host_pools[d]) {
+            if (entry.second) {
+                entry.second->release_graph_retained();
+            }
+        }
+    }
+}
+#endif
 
 static std::mutex g_ggml_sycl_block_exec_dense_states_mutex;
 static std::unordered_map<const ggml_backend_sycl_context *, std::unique_ptr<ggml_sycl_block_exec_dense_state>>
@@ -88874,17 +88954,37 @@ static void ggml_sycl_block_exec_dense_release(ggml_backend_sycl_context * ctx) 
         state = std::move(it->second);
         g_ggml_sycl_block_exec_dense_states.erase(it);
     }
+#ifdef GGML_SYCL_GRAPH
+    state->drop_graphs(*ctx);
+#endif
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
         state->drop_arena(*ctx, d);
     }
 }
+
+#ifdef GGML_SYCL_GRAPH
+static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph);
+static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph);
+static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph);
+
+// GGML_SYCL_BLOCK_EXEC_DENSE_GRAPH=0 keeps every range on direct dispatch.
+static bool ggml_sycl_block_exec_dense_graph_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_BLOCK_EXEC_DENSE_GRAPH");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+#endif
 
 // Drives the node loop of ggml_backend_sycl_graph_compute_impl over contiguous
 // node ranges. Without the executor there is one range, the whole graph, and
 // the loop runs exactly as it always has. With it, each executor range runs on
 // its own device: its inputs are copied in and published before it runs, the
 // per-op routes are off while it runs, and what later ranges read is copied
-// back to the backend's device when it ends. Every copy is synchronous.
+// back to the backend's device when it ends. Every copy is synchronous. In
+// decode each range's node loop is recorded once as a command graph on its
+// device's queue and replayed after that; the copies stay outside the graphs.
 class ggml_sycl_block_exec_dense_run {
   public:
     ggml_sycl_block_exec_dense_run(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, bool unsupported_mode) :
@@ -88895,6 +88995,11 @@ class ggml_sycl_block_exec_dense_run {
         const auto t0    = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         gate_            = prepare(unsupported_mode);
         trace_result();
+#ifdef GGML_SYCL_GRAPH
+        if (gate_ == ggml_sycl::DENSE_EXEC_GATE_NONE) {
+            prepare_graphs();
+        }
+#endif
         phase_trace_ = trace && gate_ == ggml_sycl::DENSE_EXEC_GATE_NONE;
         if (phase_trace_) {
             t_start_    = t0;
@@ -88904,11 +89009,18 @@ class ggml_sycl_block_exec_dense_run {
     }
 
     ~ggml_sycl_block_exec_dense_run() {
+#ifdef GGML_SYCL_GRAPH
+        // Only an exception leaves a recording open.
+        abandon_recording();
+#endif
         g_ggml_sycl_block_exec_dense_active = false;
         restore(range_publications_);
         scope_.reset();
         restore(graph_publications_);
         trace_phases();
+#ifdef GGML_SYCL_GRAPH
+        trace_graphs();
+#endif
     }
 
     // True when the node loop sees range views rather than the whole graph:
@@ -88936,6 +89048,9 @@ class ggml_sycl_block_exec_dense_run {
         view_                                     = ggml_graph_view(cgraph_, range.begin, range.end);
         if (!range.executor) {
             mark_range_start();
+#ifdef GGML_SYCL_GRAPH
+            begin_range_graph(static_cast<size_t>(idx));
+#endif
             return true;
         }
         if (phase_trace_) {
@@ -88965,6 +89080,10 @@ class ggml_sycl_block_exec_dense_run {
             ranges_.back().executor = false;
             view_                   = ggml_graph_view(cgraph_, ranges_.back().begin, ranges_.back().end);
             gate_                   = ggml_sycl::DENSE_EXEC_GATE_STAGE_FAILED;
+#ifdef GGML_SYCL_GRAPH
+            graphs_on_  = false;
+            graphs_off_ = "stage-failed";
+#endif
             trace_result();
             return true;
         }
@@ -88974,15 +89093,24 @@ class ggml_sycl_block_exec_dense_run {
         scope_.emplace(ctx_, range.device);
         g_ggml_sycl_block_exec_dense_active = true;
         mark_range_start();
+#ifdef GGML_SYCL_GRAPH
+        begin_range_graph(static_cast<size_t>(idx));
+#endif
         return true;
     }
 
-    // The graph the node loop iterates for the range just entered.
+    // The graph the node loop iterates for the range just entered. A replayed
+    // range has already been submitted, so its view is empty.
     ggml_cgraph * range_graph() { return ranges_active() ? &view_ : cgraph_; }
 
     // Leaving an executor range drains its device, copies back what later
     // ranges read, and restores the backend's device.
     void leave_range(int idx) {
+#ifdef GGML_SYCL_GRAPH
+        if (idx >= 0 && static_cast<size_t>(idx) < range_modes_.size()) {
+            end_range_graph(static_cast<size_t>(idx));
+        }
+#endif
         if (phase_trace_ && idx >= 0 && static_cast<size_t>(idx) < phases_.size()) {
             phases_[static_cast<size_t>(idx)].submit_us = elapsed_us(t_range_);
         }
@@ -89109,6 +89237,319 @@ class ggml_sycl_block_exec_dense_run {
     publications                                     graph_publications_;
     std::optional<ggml_sycl_block_exec_device_scope> scope_;
     int                                              executed_ranges_ = 0;
+
+#ifdef GGML_SYCL_GRAPH
+    enum class range_graph_mode { DIRECT, RECORD, REPLAY };
+
+    using recorded_range = ggml_sycl_block_exec_dense_state::range_graph;
+
+    // What a recording replaced, put back when it ends.
+    struct recording_saved {
+        std::vector<ggml_backend_sycl_context::fa_graph_ptr_snapshot> fa_ptrs;
+        bool                                                          fa_valid     = false;
+        bool                                                          fa_recording = false;
+        bool                                                          dispatch     = false;
+    };
+
+    bool                                                                    graphs_on_  = false;
+    const char *                                                            graphs_off_ = "not-prepared";
+    std::vector<range_graph_mode>                                           range_modes_;
+    uint64_t                                                                recording_signature_ = 0;
+    std::optional<sycl_ex::command_graph<sycl_ex::graph_state::modifiable>> recording_;
+    size_t                                                                  recording_range_ = 0;
+    bool                                                                    recording_open_  = false;
+    recording_saved                                                         recording_saved_;
+
+    ggml_sycl_block_exec_dense_state & state() { return ggml_sycl_block_exec_dense_state_for(ctx_); }
+
+    // Identity of everything the recorded graphs of this plan bake besides
+    // the per-range facts: the cut, the slice layout, and each arena. A new
+    // plan drops the arenas, so it changes the arena identities too.
+    uint64_t graphs_key() {
+        uint64_t h   = 1469598103934665603ULL;
+        auto     mix = [&h](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ULL;
+        };
+        for (const ggml_sycl::dense_exec_range & r : ranges_) {
+            mix(static_cast<uint64_t>(r.begin));
+            mix(static_cast<uint64_t>(r.end));
+            mix(static_cast<uint64_t>(r.device));
+            mix(r.executor ? 1 : 0);
+        }
+        for (const ggml_sycl::dense_exec_slice & s : plan_.slices) {
+            mix(static_cast<uint64_t>(s.root));
+            mix(static_cast<uint64_t>(s.device));
+            mix(static_cast<uint64_t>(s.offset));
+            mix(static_cast<uint64_t>(s.bytes));
+        }
+        const ggml_sycl_block_exec_dense_state & st = state();
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            if (st.arena[d].valid()) {
+                mix(static_cast<uint64_t>(d));
+                mix(static_cast<uint64_t>(st.arena[d].stable_identity_hash()));
+                mix(static_cast<uint64_t>(st.arena_bytes[d]));
+            }
+        }
+        return h;
+    }
+
+    size_t q8_identity(int device) const {
+        const ggml_sycl::mem_handle backing = ctx_.mmvq_q8_activation_cache.handle(device);
+        return backing.valid() ? backing.stable_identity_hash() : 0;
+    }
+
+    // Decides whether this graph's ranges record or replay, with the same
+    // predicates whole-graph decode replay uses, and refreshes the graph
+    // inputs the way that path does.
+    void prepare_graphs() {
+        graphs_on_ = false;
+
+        bool is_decode = false;
+        for (int i = 0; i < cgraph_->n_nodes; i++) {
+            if (cgraph_->nodes[i]->op == GGML_OP_MUL_MAT && cgraph_->nodes[i]->src[1]) {
+                is_decode = cgraph_->nodes[i]->src[1]->ne[1] == 1;
+                break;
+            }
+        }
+        if (!ggml_sycl_block_exec_dense_graph_enabled()) {
+            graphs_off_ = "env";
+        } else if (g_ggml_sycl_disable_graph) {
+            graphs_off_ = "disable-graph";
+        } else if (g_sycl_graph_multithreaded.load(std::memory_order_relaxed)) {
+            graphs_off_ = "multithreaded";
+        } else if (ctx_.graphs_disabled || state().graphs_disabled) {
+            graphs_off_ = "disabled";
+        } else if (!is_decode) {
+            graphs_off_ = "not-decode";
+        } else if (ggml_sycl_graph_has_host_inputs(cgraph_) &&
+                   getenv("GGML_SYCL_DISABLE_DECODE_GRAPH_HOST_INPUTS") != nullptr) {
+            graphs_off_ = "host-inputs";
+        } else if (ggml_sycl_graph_has_op(cgraph_, GGML_OP_FLASH_ATTN_EXT)) {
+            // The whole-graph gate: every decode FA dispatch this context has
+            // seen -- on either device, the device scope keeps this context --
+            // reached a kernel verified replay-safe, and mask/sinks refresh.
+            const ggml_sycl_fa_graph_allow_mode mode = ggml_sycl_flash_attn_graph_allow_mode();
+            const bool                          engage =
+                mode == ggml_sycl_fa_graph_allow_mode::FORCE_ON ||
+                (mode == ggml_sycl_fa_graph_allow_mode::AUTO && ctx_.fa_decode_kernel_obs.all_verified_safe() &&
+                 ggml_sycl_fa_mask_sinks_refresh_safe(cgraph_));
+            graphs_off_ = engage ? nullptr : "fa-unverified";
+        } else {
+            graphs_off_ = nullptr;
+        }
+        if (graphs_off_ != nullptr) {
+            return;
+        }
+
+        ggml_sycl_block_exec_dense_state & st  = state();
+        const uint64_t                     key = graphs_key();
+        if (st.graphs_key != key || st.graphs.size() != ranges_.size()) {
+            st.drop_graphs(ctx_);
+            st.graphs.resize(ranges_.size());
+            st.graphs_key             = key;
+            ctx_.input_tensors_cached = false;
+        }
+        bool any_missing = false;
+        for (const recorded_range & g : st.graphs) {
+            any_missing = any_missing || !g.exec;
+        }
+        if (any_missing && !check_graph_compatibility(ctx_, cgraph_)) {
+            graphs_off_ = "incompatible";
+            return;
+        }
+        // Stable device staging for host INPUT leaves before any recording,
+        // then this token's values into it -- on the backend's device, which
+        // is the only device whose ranges read an input directly: an executor
+        // range reads its staged copy.
+        if (any_missing) {
+            graph_prestage_leaf_tensors(&ctx_, cgraph_);
+        }
+        graph_refresh_input_tensors(&ctx_, cgraph_);
+        range_modes_.assign(ranges_.size(), range_graph_mode::DIRECT);
+        graphs_on_ = true;
+    }
+
+    // After the range's inputs are staged and published and its device is
+    // current: replay its graph when everything it baked is unchanged,
+    // otherwise start recording its node loop.
+    void begin_range_graph(size_t idx) {
+        if (!graphs_on_ || idx >= range_modes_.size()) {
+            return;
+        }
+        ggml_sycl_block_exec_dense_state &  st    = state();
+        recorded_range &                    g     = st.graphs[idx];
+        const ggml_sycl::dense_exec_range & range = ranges_[idx];
+        sycl::queue *                       q     = ggml_sycl_block_exec_dense_queue(ctx_, range.device);
+        const uint64_t                      sig   = ggml_sycl_graph_signature(&view_);
+
+        bool match = g.exec && g.signature == sig && g.n_nodes == view_.n_nodes && g.device == range.device &&
+                     g.q8_identity == q8_identity(range.device);
+        if (match) {
+            std::swap(ctx_.fa_graph_ptrs, g.fa_ptrs);
+            match = graph_fa_ptrs_match(ctx_, &view_);
+            std::swap(ctx_.fa_graph_ptrs, g.fa_ptrs);
+        }
+        if (match) {
+            q->ext_oneapi_graph(*g.exec);
+            g.replays++;
+            range_modes_[idx] = range_graph_mode::REPLAY;
+            // The Q8 entry describes what the direct or recorded loop last
+            // quantized, not what the replay just wrote.
+            ctx_.mmvq_q8_activation_cache.slot(range.device).invalidate();
+            view_ = ggml_graph_view(cgraph_, range.begin, range.begin);
+            return;
+        }
+        if (g.exec) {
+            // Re-recording: the old graph may still be running.
+            q->wait_and_throw();
+            g.exec.reset();
+            g.retained.clear();
+            g.fa_ptrs.clear();
+        }
+
+        recording_signature_ = sig;
+        recording_range_     = idx;
+        recording_.emplace(*q, sycl::property_list{ sycl_ex::property::graph::assume_buffer_outlives_graph{} });
+        recording_saved_.fa_ptrs.swap(ctx_.fa_graph_ptrs);
+        recording_saved_.fa_valid     = ctx_.fa_graph_ptrs_valid;
+        recording_saved_.fa_recording = ctx_.fa_graph_ptrs_recording;
+        recording_saved_.dispatch     = ctx_.graph_recording_dispatch;
+        ctx_.fa_graph_ptrs.clear();
+        ctx_.fa_graph_ptrs_recording = true;
+        ctx_.fa_graph_ptrs_valid     = false;
+        g_ggml_sycl_graph_recording_depth.fetch_add(1, std::memory_order_acq_rel);
+        ggml_sycl::set_graph_retained_handle_sink(&g.retained);
+        g_ggml_sycl_graph_recording   = true;
+        g_recording_graph_ptr         = &*recording_;
+        g_recording_queue_ptr         = q;
+        ctx_.graph_recording_dispatch = true;
+        range_modes_[idx]             = range_graph_mode::RECORD;
+        recording_open_               = true;
+        recording_->begin_recording(*q);
+    }
+
+    // Undoes begin_range_graph's recording state, in the order the
+    // whole-graph recorder does.
+    void stop_recording() {
+        if (!recording_open_) {
+            return;
+        }
+        recording_open_       = false;
+        g_recording_graph_ptr = nullptr;
+        g_recording_queue_ptr = nullptr;
+        ggml_sycl::set_graph_retained_handle_sink(nullptr);
+        ctx_.graph_recording_dispatch = recording_saved_.dispatch;
+        g_ggml_sycl_graph_recording   = false;
+        g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
+        ctx_.fa_graph_ptrs_recording = recording_saved_.fa_recording;
+    }
+
+    // Finishes a recording and submits it, which is what runs the range.
+    void end_range_graph(size_t idx) {
+        if (range_modes_[idx] != range_graph_mode::RECORD || !recording_) {
+            return;
+        }
+        ggml_sycl_block_exec_dense_state &  st    = state();
+        recorded_range &                    g     = st.graphs[idx];
+        const ggml_sycl::dense_exec_range & range = ranges_[idx];
+        sycl::queue *                       q     = ggml_sycl_block_exec_dense_queue(ctx_, range.device);
+
+        recording_->end_recording();
+        stop_recording();
+        auto exec = recording_->finalize();
+        recording_.reset();
+        g.exec = std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
+        g.fa_ptrs.swap(ctx_.fa_graph_ptrs);
+        ctx_.fa_graph_ptrs.swap(recording_saved_.fa_ptrs);
+        ctx_.fa_graph_ptrs_valid = recording_saved_.fa_valid;
+        g.signature              = recording_signature_;
+        g.n_nodes                = view_.n_nodes;
+        g.device                 = range.device;
+        g.q8_identity            = q8_identity(range.device);
+
+        // Everything the graph baked a pointer to lives as long as it does.
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            if (st.arena[d].valid()) {
+                g.retained.push_back(st.arena[d]);
+            }
+        }
+        g.retained.insert(g.retained.end(), slices_.begin(), slices_.end());
+        const ggml_sycl::mem_handle q8 = ctx_.mmvq_q8_activation_cache.handle(range.device);
+        if (q8.valid()) {
+            g.retained.push_back(q8);
+        }
+        for (int i = 0; i < view_.n_nodes; ++i) {
+            const ggml_tensor * node = view_.nodes[i];
+            for (int s = 0; node != nullptr && s < GGML_MAX_SRC; ++s) {
+                size_t              offs = 0;
+                const ggml_tensor * root =
+                    node->src[s] != nullptr ? ggml_sycl_view_root_and_offset(node->src[s], offs) : nullptr;
+                if (root == nullptr || !ggml_sycl_tensor_is_weight(root)) {
+                    continue;
+                }
+                const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(root->extra);
+                if (extra != nullptr && extra->data_handle[range.device].valid()) {
+                    g.retained.push_back(extra->data_handle[range.device]);
+                }
+            }
+        }
+
+        q->ext_oneapi_graph(*g.exec);
+        g.records++;
+    }
+
+    // An exception inside a recorded node loop: close the recording, keep no
+    // graph for the range, and stop recording ranges on this context.
+    void abandon_recording() {
+        if (!recording_) {
+            return;
+        }
+        try {
+            recording_->end_recording();
+        } catch (...) {
+        }
+        stop_recording();
+        recording_.reset();
+        ctx_.fa_graph_ptrs.swap(recording_saved_.fa_ptrs);
+        ctx_.fa_graph_ptrs_valid              = recording_saved_.fa_valid;
+        ggml_sycl_block_exec_dense_state & st = state();
+        if (recording_range_ < st.graphs.size()) {
+            st.graphs[recording_range_].exec.reset();
+            st.graphs[recording_range_].retained.clear();
+            st.graphs[recording_range_].fa_ptrs.clear();
+        }
+        st.graphs_disabled = true;
+        GGML_LOG_WARN(
+            "[SYCL-BLOCK-EXEC-DENSE] dense range graph record failed: range %zu; range graphs are off for "
+            "this context\n",
+            recording_range_);
+    }
+
+    void trace_graphs() {
+        if (cgraph_ == nullptr || !ggml_sycl_block_exec_plan_trace_enabled() ||
+            gate_ != ggml_sycl::DENSE_EXEC_GATE_NONE) {
+            return;
+        }
+        if (!graphs_on_) {
+            fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE-GRAPH] off reason=%s\n", graphs_off_ ? graphs_off_ : "?");
+            fflush(stderr);
+            return;
+        }
+        static const char * const                mode_names[] = { "direct", "record", "replay" };
+        const ggml_sycl_block_exec_dense_state & st           = state();
+        std::string                              line;
+        char                                     buf[128];
+        for (size_t r = 0; r < range_modes_.size() && r < st.graphs.size(); ++r) {
+            snprintf(buf, sizeof(buf), " r%zu(dev=%d mode=%s rec=%llu rep=%llu)", r, ranges_[r].device,
+                     mode_names[static_cast<int>(range_modes_[r])], (unsigned long long) st.graphs[r].records,
+                     (unsigned long long) st.graphs[r].replays);
+            line += buf;
+        }
+        fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE-GRAPH] on%s\n", line.c_str());
+        fflush(stderr);
+    }
+#endif
 
     // Restores in reverse order of publication, so every slot gets back
     // exactly the handle it held before. A slot that no longer holds the
