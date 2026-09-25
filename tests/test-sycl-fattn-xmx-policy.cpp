@@ -2,6 +2,12 @@
 #include "ggml-sycl/fattn.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
 
 static bool expect_eq(int got, int want, const char * name) {
     if (got != want) {
@@ -75,8 +81,115 @@ static fattn_params decode_params(int h_q, int h_kv) {
     return decode_params_dim(h_q, h_kv, 128);
 }
 
+static bool expect_simple_pp_xmx_v1(const char * env, bool want, const char * name) {
+    const bool got = ggml_sycl_fattn_simple_pp_xmx_v1_enabled(env);
+    if (got != want) {
+        std::fprintf(stderr, "FAIL: %s got %d want %d\n", name, (int) got, (int) want);
+        return false;
+    }
+    return true;
+}
+
+static std::string find_repo_root() {
+    std::vector<std::string> roots;
+    if (const char * env = std::getenv("LLAMA_CPP_REPO_ROOT")) {
+        roots.emplace_back(env);
+    }
+    const std::string source_file = __FILE__;
+    const std::string suffix      = "/tests/test-sycl-fattn-xmx-policy.cpp";
+    const size_t      pos         = source_file.rfind(suffix);
+    if (pos != std::string::npos) {
+        roots.emplace_back(source_file.substr(0, pos));
+    }
+    for (const char * rel : { ".", "..", "../..", "../../..", "../../../.." }) {
+        roots.emplace_back(rel);
+    }
+    for (const std::string & root : roots) {
+        if (std::filesystem::is_regular_file(root + "/ggml/src/ggml-sycl/fattn.cpp")) {
+            return root;
+        }
+    }
+    return std::string();
+}
+
+static std::string read_file(const std::filesystem::path & path) {
+    std::ifstream      in(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+static int count_occurrences(const std::string & haystack, const std::string & needle) {
+    int count = 0;
+    for (size_t at = haystack.find(needle); at != std::string::npos; at = haystack.find(needle, at + 1)) {
+        ++count;
+    }
+    return count;
+}
+
+// The simple-PP v1 opt-in is parsed in exactly one place, through the helper,
+// so the pinned default above is the default the dispatcher actually runs.
+static bool check_simple_pp_xmx_v1_source_contract() {
+    const std::string root = find_repo_root();
+    if (root.empty()) {
+        std::fprintf(stderr, "FAIL: could not locate ggml/src/ggml-sycl/fattn.cpp; set LLAMA_CPP_REPO_ROOT\n");
+        return false;
+    }
+
+    const std::string env_literal = "\"GGML_SYCL_FA_XMX_V1_PP\"";
+    const std::string helper_call = "ggml_sycl_fattn_simple_pp_xmx_v1_enabled(std::getenv(" + env_literal + "))";
+
+    bool ok        = true;
+    bool saw_fattn = false;
+    int  n_sources = 0;
+    for (const auto & entry : std::filesystem::recursive_directory_iterator(root + "/ggml/src/ggml-sycl")) {
+        const std::string ext = entry.path().extension().string();
+        if (!entry.is_regular_file() || (ext != ".cpp" && ext != ".hpp" && ext != ".h")) {
+            continue;
+        }
+        ++n_sources;
+        const std::string src      = read_file(entry.path());
+        const int         literals = count_occurrences(src, env_literal);
+        if (entry.path().filename() == "fattn.cpp") {
+            saw_fattn             = true;
+            const int    calls    = count_occurrences(src, helper_call);
+            const size_t use_path = src.find("const bool use_xmx_v1_path");
+            if (calls != 1 || literals != 1) {
+                std::fprintf(stderr,
+                             "FAIL: fattn.cpp must read GGML_SYCL_FA_XMX_V1_PP only via %s: helper calls=%d, "
+                             "env literals=%d, want 1 and 1\n",
+                             helper_call.c_str(), calls, literals);
+                ok = false;
+            } else if (use_path == std::string::npos || src.find(helper_call) > use_path) {
+                std::fprintf(stderr, "FAIL: the helper call must precede and feed use_xmx_v1_path in fattn.cpp\n");
+                ok = false;
+            }
+        } else if (literals != 0) {
+            std::fprintf(stderr, "FAIL: %s re-derives GGML_SYCL_FA_XMX_V1_PP (%d literals); only fattn.cpp may\n",
+                         entry.path().string().c_str(), literals);
+            ok = false;
+        }
+    }
+    if (!saw_fattn || n_sources < 50) {
+        std::fprintf(stderr, "FAIL: scanned only %d ggml-sycl sources under %s; the scan proves nothing\n", n_sources,
+                     root.c_str());
+        ok = false;
+    }
+    return ok;
+}
+
 int main() {
     bool ok = true;
+
+    // XMX-v1 gives non-deterministic, intermittently wrong output on simple
+    // D=128 prompt processing, so v2 is the default and only "1" opts into v1.
+    ok &= expect_simple_pp_xmx_v1(nullptr, false, "GGML_SYCL_FA_XMX_V1_PP unset selects v2");
+    ok &= expect_simple_pp_xmx_v1("0", false, "GGML_SYCL_FA_XMX_V1_PP=0 selects v2");
+    ok &= expect_simple_pp_xmx_v1("", false, "GGML_SYCL_FA_XMX_V1_PP empty selects v2");
+    ok &= expect_simple_pp_xmx_v1("2", false, "GGML_SYCL_FA_XMX_V1_PP=2 selects v2");
+    ok &= expect_simple_pp_xmx_v1("yes", false, "GGML_SYCL_FA_XMX_V1_PP=yes selects v2");
+    ok &= expect_simple_pp_xmx_v1("1", true, "GGML_SYCL_FA_XMX_V1_PP=1 opts into v1");
+    ok &= check_simple_pp_xmx_v1_source_contract();
 
     ok &= expect_eq(ggml_sycl_fattn_xmx_v1_select_batch_kv(/*D=*/128, /*ncols=*/8, /*local_mem_size=*/96 * 1024), 48,
                     "D128 ncols8 uses larger batch when local memory permits");
