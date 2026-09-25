@@ -38,6 +38,7 @@ using ggml_sycl::kv_residency_input;
 using ggml_sycl::kv_residency_needs_refit;
 using ggml_sycl::kv_shape;
 using ggml_sycl::kv_shape_changed;
+using ggml_sycl::kv_vram_available;
 using ggml_sycl::kv_weight_capacity;
 using ggml_sycl::layer_block_kv_device;
 using ggml_sycl::plan_device_kv_fit;
@@ -412,6 +413,13 @@ int main() {
         CHECK(kv_buffer_layer_owner(true, -1, true, 0, false) == -1, "case 20: a demoted layer is host memory");
         CHECK(kv_buffer_layer_owner(false, -1, true, 0, false) == 0, "case 20: without a plan the layout decides");
         CHECK(kv_buffer_layer_owner(true, 0, true, 0, true) == -1, "case 20: GGML_SYCL_KV_HOST=1 is host memory");
+    }
+    // 21. A full arena KV zone leaves no KV headroom; only a device without an
+    // arena uses the budget-based headroom.
+    {
+        CHECK_EQ(kv_vram_available(true, 0, 4096), 0, "case 21: a full KV zone is not a missing arena");
+        CHECK_EQ(kv_vram_available(true, 512, 4096), 512, "case 21: the arena's KV zone");
+        CHECK_EQ(kv_vram_available(false, 0, 4096), 4096, "case 21: no arena, the budget headroom");
     }
     std::printf("test-kv-runtime-demotion: all ok\n");
     return 0;

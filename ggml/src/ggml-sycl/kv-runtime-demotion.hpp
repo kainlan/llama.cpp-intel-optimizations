@@ -65,6 +65,13 @@ kv_demotion_result plan_runtime_kv_demotion(const kv_demotion_input & in);
 // shared_zone_capacity == 0 means no arena zone: the budget is the limit.
 size_t kv_weight_capacity(size_t vram_budget, size_t shared_zone_capacity);
 
+// Live KV headroom from its two sources: with an active arena, the KV zone's
+// free space, where 0 means the zone is full and never falls back to the budget
+// path; without an arena, the budget-based compute headroom.
+inline size_t kv_vram_available(bool has_arena, size_t zone_available, size_t budget_available) {
+    return has_arena ? zone_available : budget_available;
+}
+
 // Headroom runtime KV admission reserves per device-resident layer, so that a
 // set of layers admitted against the allocator's live headroom still fits when
 // the tiered KV allocator places them one allocation at a time, possibly across

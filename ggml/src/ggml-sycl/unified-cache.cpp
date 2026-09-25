@@ -21095,20 +21095,13 @@ size_t unified_cache_kv_weight_capacity(int device_id, size_t vram_budget, bool 
 }
 
 size_t unified_cache_kv_vram_available(int device_id) {
-    // Same lookup the tiered KV allocator placed KV with: the arena's KV zone
-    // (in single-chunk mode, the shared KV+weight allocator's free space),
-    // else the budget-based compute headroom.
-    size_t available = 0;
-    if (vram_arena_enabled()) {
-        auto * cache = get_unified_cache_for_device(device_id);
-        if (cache && cache->arena_active()) {
-            available = cache->zone_available(vram_zone_id::KV);
-        }
-    }
-    if (available == 0) {
-        available = unified_cache_available_for_compute(device_id);
-    }
-    return available;
+    // With an active arena, the KV zone's free space (in single-chunk mode, the
+    // shared KV+weight allocator's). A full zone reads 0 there, which is not
+    // "no arena": it must not fall back to the budget-based headroom.
+    auto *     cache     = vram_arena_enabled() ? get_unified_cache_for_device(device_id) : nullptr;
+    const bool has_arena = cache && cache->arena_active();
+    return kv_vram_available(has_arena, has_arena ? cache->zone_available(vram_zone_id::KV) : 0,
+                             has_arena ? 0 : unified_cache_available_for_compute(device_id));
 }
 
 size_t unified_cache_kv_arena_used(int device_id) {
