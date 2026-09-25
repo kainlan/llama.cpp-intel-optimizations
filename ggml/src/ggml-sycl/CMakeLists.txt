@@ -5294,6 +5294,24 @@ set_tests_properties(sycl-moe-scratch-admission PROPERTIES
     TIMEOUT 30
 )
 
+# Dense two-card split decode policies (llama.cpp-m1or): which simple-consumer
+# sources the route must stage, and which gate stopped the block executor. Both
+# headers are dependency-free, so this target takes no -fsycl and links nothing.
+add_executable(test-sycl-split-exec-policy
+    tests/test-sycl-split-exec-policy.cpp
+)
+target_include_directories(test-sycl-split-exec-policy PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-sycl-split-exec-policy PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-split-exec-policy COMMAND test-sycl-split-exec-policy)
+set_tests_properties(sycl-split-exec-policy PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never touches a device.
+    LABELS "sycl;host-only"
+    TIMEOUT 30
+)
+
 # test-sycl-pp-moe-scratch-lifecycle was DELETED by llama.cpp-u2mz. It was
 # described as "the only executable proof of the claim/release protocol", but it
 # included ZERO project headers and its target had one source plus
