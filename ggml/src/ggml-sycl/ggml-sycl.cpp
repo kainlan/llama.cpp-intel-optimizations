@@ -89282,6 +89282,13 @@ class ggml_sycl_block_exec_dense_run {
         double submit_us    = 0.0;
         double drain_out_us = 0.0;
         double copy_out_us  = 0.0;
+        // stage_us, split: the crossing's d2h submits, its one wait, the host
+        // memcpy, the h2d submits, then the publications.
+        double stage_d2h_us     = 0.0;
+        double stage_wait_us    = 0.0;
+        double stage_host_us    = 0.0;
+        double stage_h2d_us     = 0.0;
+        double stage_publish_us = 0.0;
     };
 
     // Where prepare= goes: consecutive laps between the constructor's steps.
@@ -89330,13 +89337,15 @@ class ggml_sycl_block_exec_dense_run {
             return;
         }
         std::string line;
-        char        buf[256];
+        char        buf[384];
         for (size_t r = 0; r < phases_.size() && r < ranges_.size(); ++r) {
             const dense_phase & p = phases_[r];
             snprintf(buf, sizeof(buf),
-                     " r%zu(dev=%d nodes=%d drain_in=%.0f stage=%.0f submit=%.0f drain_out=%.0f copy_out=%.0f)", r,
-                     ranges_[r].device, ranges_[r].end - ranges_[r].begin, p.drain_in_us, p.stage_us, p.submit_us,
-                     p.drain_out_us, p.copy_out_us);
+                     " r%zu(dev=%d nodes=%d drain_in=%.0f stage=%.0f[d2h=%.0f wait=%.0f host=%.0f h2d=%.0f pub=%.0f] "
+                     "submit=%.0f drain_out=%.0f copy_out=%.0f)",
+                     r, ranges_[r].device, ranges_[r].end - ranges_[r].begin, p.drain_in_us, p.stage_us, p.stage_d2h_us,
+                     p.stage_wait_us, p.stage_host_us, p.stage_h2d_us, p.stage_publish_us, p.submit_us, p.drain_out_us,
+                     p.copy_out_us);
             line += buf;
         }
         const prepare_split & p = split_;
@@ -89770,7 +89779,14 @@ class ggml_sycl_block_exec_dense_run {
         size_t                bytes       = 0;
     };
 
-    void cross(int from, int to, const std::vector<crossing_span> & spans) {
+    void cross(int from, int to, const std::vector<crossing_span> & spans, dense_phase * laps = nullptr) {
+        auto t   = laps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        auto lap = [&](double & bucket) {
+            if (laps) {
+                bucket += elapsed_us(t);
+                t = std::chrono::steady_clock::now();
+            }
+        };
         ggml_sycl_block_exec_dense_state & st     = ggml_sycl_block_exec_dense_state_for(ctx_);
         sycl::queue *                      q_from = ggml_sycl_block_exec_dense_queue(ctx_, from);
         sycl::queue *                      q_to   = ggml_sycl_block_exec_dense_queue(ctx_, to);
@@ -89785,13 +89801,18 @@ class ggml_sycl_block_exec_dense_run {
         if (packed == 0) {
             return;
         }
+        double unused = 0.0;
+        lap(laps ? laps->stage_d2h_us : unused);
         q_from->wait_and_throw();
         st.host_stage_read[to].wait_and_throw();
+        lap(laps ? laps->stage_wait_us : unused);
         ggml_sycl::mem_copy(st.host_stage[to], 0, st.host_stage[from], 0, packed, *q_to);
+        lap(laps ? laps->stage_host_us : unused);
         for (const crossing_span & span : spans) {
             st.host_stage_read[to] =
                 ggml_sycl::mem_copy_async(span.dst, 0, st.host_stage[to], span.host_offset, span.bytes, *q_to);
         }
+        lap(laps ? laps->stage_h2d_us : unused);
     }
 
     bool stage_range(size_t idx) {
@@ -89811,17 +89832,22 @@ class ggml_sycl_block_exec_dense_run {
             spans.push_back(
                 crossing_span{ std::move(src), slices_[static_cast<size_t>(s)], io.stage_in_host[k], slice.bytes });
         }
+        dense_phase * laps = phase_trace_ ? &phases_[idx] : nullptr;
         try {
-            cross(original_device_, range.device, spans);
+            cross(original_device_, range.device, spans, laps);
         } catch (const std::exception & e) {
             GGML_LOG_WARN("[SYCL-BLOCK-EXEC-DENSE] staging into range %zu (device %d) failed: %s\n", idx, range.device,
                           e.what());
             return false;
         }
+        const auto t_publish = laps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         for (int s : io.publish) {
             if (!publish(plan_.slices[static_cast<size_t>(s)], static_cast<size_t>(s), range_publications_)) {
                 return false;
             }
+        }
+        if (laps) {
+            laps->stage_publish_us += elapsed_us(t_publish);
         }
         return true;
     }
@@ -89999,6 +90025,19 @@ class ggml_sycl_block_exec_dense_run {
             for (const auto & range : ranges_) {
                 fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE]   range [%d,%d) device=%d executor=%d first=%s\n", range.begin,
                         range.end, range.device, range.executor ? 1 : 0, cgraph_->nodes[range.begin]->name);
+            }
+            // What each crossing moves, once per prepared plan.
+            for (size_t r = 0; plan_cache_ != plan_cache_result::HIT && r < plan_.io.size(); ++r) {
+                for (int s : plan_.io[r].stage_in) {
+                    const ggml_sycl::dense_exec_slice & slice = plan_.slices[static_cast<size_t>(s)];
+                    fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE]   r%zu stage_in %s bytes=%zu\n", r,
+                            roots_[static_cast<size_t>(slice.root)]->name, slice.bytes);
+                }
+                for (const ggml_sycl::dense_exec_copy & c : plan_.io[r].copy_out) {
+                    const ggml_sycl::dense_exec_slice & slice = plan_.slices[static_cast<size_t>(c.from_slice)];
+                    fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE]   r%zu copy_out %s bytes=%zu\n", r,
+                            roots_[static_cast<size_t>(slice.root)]->name, slice.bytes);
+                }
             }
             fflush(stderr);
         }
