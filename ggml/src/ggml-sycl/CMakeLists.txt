@@ -1753,6 +1753,21 @@ set_tests_properties(sycl-kv-runtime-demotion PROPERTIES
     TIMEOUT 60
 )
 
+# Layer-streaming auto-activation gate (llama.cpp-40j4). Same arrangement as
+# test-kv-runtime-demotion above: layer-streaming-gate.hpp is header-only and
+# includes no SYCL header, so this target builds without -fsycl or ggml-base.
+add_executable(test-layer-streaming-gate
+    tests/test-layer-streaming-gate.cpp
+)
+target_include_directories(test-layer-streaming-gate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME sycl-layer-streaming-gate COMMAND test-layer-streaming-gate)
+set_tests_properties(sycl-layer-streaming-gate PROPERTIES
+    LABELS "sycl;streaming;hostonly"
+    TIMEOUT 60
+)
+
 # TKV-13 (B2) step 1: the DAG-consumption check that will let the SYCL
 # backend defer a pending host-computed demoted-layer attention result
 # instead of blocking on it (docs/plans/2026-08-27-tkv13-b2-addendum.md

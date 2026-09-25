@@ -153,6 +153,7 @@
 #include "ggml-sycl/kv-tier-manager.hpp"
 #include "ggml-sycl/l2-prefetch.hpp"
 #include "ggml-sycl/layer-prefetch.hpp"
+#include "ggml-sycl/layer-streaming-gate.hpp"
 #include "ggml-sycl/layer-streaming.hpp"
 #include "ggml-sycl/persistent-tg-kernel.hpp"
 #include "ggml-sycl/unified-kernel.hpp"
@@ -16478,7 +16479,45 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
     const bool   streaming_forced      = force_stream && std::atoi(force_stream) == 1;
     const bool   cpu_offload_available = ggml_sycl_cpu_offload_enabled() && ggml_sycl_info().has_cpu_device;
     const bool   is_moe                = g_moe_n_experts_total > 0;
-    if ((model_size_exceeds_budget && !is_moe) || streaming_forced) {
+    std::shared_ptr<const ggml_sycl::placement_plan> stream_plan_owner;
+    {
+        auto * cache      = ggml_sycl::get_unified_cache_for_device(ctx->device);
+        stream_plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;
+        if (stream_plan_owner && stream_plan_owner->entries.empty()) {
+            stream_plan_owner.reset();
+        }
+    }
+    // llama.cpp-40j4: model_size_exceeds_budget compares the WHOLE model with
+    // this device's budget, so on a dense two-card split it turned streaming on
+    // for a model the plan holds resident across both cards -- 2 x 118 MB of
+    // stage buffers nothing read, taken from the shared KV+WEIGHT zone the KV
+    // cache then could not fit into. Ask the plan instead.
+    ggml_sycl::layer_streaming_gate_inputs stream_gate_in;
+    stream_gate_in.forced        = streaming_forced;
+    stream_gate_in.is_moe        = is_moe;
+    stream_gate_in.model_bytes   = g_tensor_inventory_total_size;
+    stream_gate_in.weight_budget = weight_budget;
+    if (stream_plan_owner) {
+        std::vector<int> stream_layer_ids;
+        stream_layer_ids.reserve(g_tensor_inventory.size());
+        for (const auto & item : g_tensor_inventory) {
+            stream_layer_ids.push_back(ggml_sycl::extract_layer_id(item.first.c_str()));
+        }
+        stream_gate_in.plan_multi_device = stream_plan_owner->multi_device;
+        stream_gate_in.residency =
+            ggml_sycl::plan_layer_residency_count(stream_layer_ids, stream_plan_owner->layer_device);
+    }
+    const ggml_sycl::layer_streaming_gate stream_gate = ggml_sycl::layer_streaming_gate_decide(stream_gate_in);
+    if (stream_gate == ggml_sycl::layer_streaming_gate::OFF_PLAN_RESIDENT) {
+        // WARN so the decision survives default verbosity: the absence of a
+        // [LAYER-STREAM] allocation line is otherwise the only evidence.
+        GGML_LOG_WARN(
+            "[SYCL-BUDGET] Layer streaming not enabled on device %d: multi-device plan holds all %zu layer "
+            "tensors resident on their owners (whole model %.1f MB > this device's weight budget %.1f MB)\n",
+            ctx->device, stream_gate_in.residency.layer_tensors, g_tensor_inventory_total_size / (1024.0 * 1024.0),
+            weight_budget / (1024.0 * 1024.0));
+    }
+    if (ggml_sycl::layer_streaming_gate_enabled(stream_gate)) {
         auto & mgr = ggml_sycl::get_layer_stream_manager(ctx->device);
 
         // llama.cpp-y2zx: streaming must not claim a layer the PLANNER placed on the
@@ -16516,10 +16555,8 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
         size_t                                      stream_inventory_count = g_tensor_inventory.size();
         std::vector<std::pair<std::string, size_t>> stream_inventory_filtered;
         {
-            auto *     cache      = ggml_sycl::get_unified_cache_for_device(ctx->device);
-            const auto plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;
-            if (plan_owner && !plan_owner->entries.empty()) {
-                const auto & plan = *plan_owner;
+            if (stream_plan_owner) {
+                const auto & plan           = *stream_plan_owner;
                 size_t       excluded_bytes = 0;
                 size_t       excluded_count = 0;
                 stream_inventory_filtered.reserve(g_tensor_inventory.size());
