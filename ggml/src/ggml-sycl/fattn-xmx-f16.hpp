@@ -10,6 +10,7 @@
 #include "fattn-common.hpp"
 
 #include <cfloat>
+#include <cstdlib>
 #include <cstring>
 #include <sycl/sycl.hpp>
 
@@ -28,6 +29,13 @@
 // unset or any other value keeps XMX-v2. Pure so host tests can pin it.
 static inline bool ggml_sycl_fattn_simple_pp_select_xmx_v1(const char * env, bool xmx_v1_supported) {
     return xmx_v1_supported && env != nullptr && std::strcmp(env, "1") == 0;
+}
+
+// Parse of GGML_SYCL_FA_XMX_V1, the A/B opt-in that forces the XMX-v1 kernel
+// for every shape can_use_xmx_v1_runtime() accepts: any value atoi() reads as
+// nonzero enables it; unset or zero keeps XMX-v2 (llama.cpp-b1ov).
+static inline bool ggml_sycl_fattn_force_xmx_v1_enabled(const char * env) {
+    return env != nullptr && std::atoi(env) != 0;
 }
 
 #if SYCL_XMX_AVAILABLE

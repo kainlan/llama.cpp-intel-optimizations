@@ -3194,10 +3194,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     //   GGML_SYCL_FA_XMX_V1=1     any shape can_use_xmx_v1_runtime() accepts
     //   GGML_SYCL_FA_XMX_V1_PP=1  simple D=128 PP
     if (use_xmx) {
-        static const bool force_xmx_v1 = []() {
-            const char * env = std::getenv("GGML_SYCL_FA_XMX_V1");
-            return env && std::atoi(env) != 0;
-        }();
+        static const bool force_xmx_v1 = ggml_sycl_fattn_force_xmx_v1_enabled(std::getenv("GGML_SYCL_FA_XMX_V1"));
         static const char * const simple_pp_xmx_v1_env = std::getenv("GGML_SYCL_FA_XMX_V1_PP");
 
         const bool xmx_v1_supported = can_use_xmx_v1_runtime();
