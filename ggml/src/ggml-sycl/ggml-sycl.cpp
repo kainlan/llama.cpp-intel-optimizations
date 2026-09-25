@@ -64672,10 +64672,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                             // =============================================================
                             g_fp16_cache.init_once();
 
-                            const bool onednn_pp_candidate =
-                                !ggml_sycl_onednn_pp_skip_type(src0->type) && ggml_sycl_onednn_pp_enabled() &&
-                                M >= ggml_sycl_onednn_pp_min_batch() && ggml_is_quantized(src0->type) &&
-                                ggml_is_contiguous(src0) && ggml_sycl_onednn_pp_executable_on_device(src0, ctx.device);
+                            // The one admission check, not an inline copy of it: the copy
+                            // that stood here was the gate a dense split actually hit, and
+                            // being a copy it never reached ONEDNN_PP_TRACE (llama.cpp-1d0n).
+                            // src1 and dst are F32 on this path (read/written as float).
+                            const bool onednn_pp_candidate = ggml_sycl_onednn_pp_candidate(src0, src1, dst, ctx.device);
 
                             bool used_onednn_fp16 = false;
                             if (onednn_pp_candidate) {
