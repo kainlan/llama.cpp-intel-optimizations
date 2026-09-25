@@ -89078,8 +89078,11 @@ class ggml_sycl_block_exec_dense_run {
         original_device_(ctx.device) {
         const bool trace = ggml_sycl_block_exec_plan_trace_enabled();
         const auto t0    = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        split_on_        = trace;
+        split_t_         = t0;
         gate_            = prepare(unsupported_mode);
         trace_result();
+        split_lap(split_.trace_us);
 #ifdef GGML_SYCL_GRAPH
         if (gate_ == ggml_sycl::DENSE_EXEC_GATE_NONE) {
             prepare_graphs();
@@ -89281,6 +89284,31 @@ class ggml_sycl_block_exec_dense_run {
         double copy_out_us  = 0.0;
     };
 
+    // Where prepare= goes: consecutive laps between the constructor's steps.
+    struct prepare_split {
+        double precheck_us    = 0.0;  // placement plan lookup and prechecks
+        double signature_us   = 0.0;  // ggml_sycl_graph_signature
+        double cache_us       = 0.0;  // plan-cache compare and copy; on a miss, the whole planner
+        double queue_order_us = 0.0;  // check_queue_order on a hit
+        double trace_us       = 0.0;  // this trace's own prints
+        double facts_us       = 0.0;  // range-graph off-reason facts
+        double key_us         = 0.0;  // range-graph key, and prestaging on a record
+        double refresh_us     = 0.0;  // graph_refresh_input_tensors
+    };
+
+    bool                                  split_on_ = false;
+    std::chrono::steady_clock::time_point split_t_{};
+    prepare_split                         split_;
+
+    void split_lap(double & bucket) {
+        if (!split_on_) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        bucket += std::chrono::duration<double, std::micro>(now - split_t_).count();
+        split_t_ = now;
+    }
+
     bool                                  phase_trace_ = false;
     double                                prepare_us_  = 0.0;
     std::chrono::steady_clock::time_point t_start_{};
@@ -89311,8 +89339,12 @@ class ggml_sycl_block_exec_dense_run {
                      p.drain_out_us, p.copy_out_us);
             line += buf;
         }
-        fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE-PHASE] nodes=%d prepare=%.0f%s total=%.0f us\n", cgraph_->n_nodes,
-                prepare_us_, line.c_str(), elapsed_us(t_start_));
+        const prepare_split & p = split_;
+        fprintf(stderr,
+                "[SYCL-BLOCK-EXEC-DENSE-PHASE] nodes=%d prepare=%.0f split(pre=%.0f sig=%.0f cache=%.0f qord=%.0f "
+                "trace=%.0f facts=%.0f key=%.0f refresh=%.0f)%s total=%.0f us\n",
+                cgraph_->n_nodes, prepare_us_, p.precheck_us, p.signature_us, p.cache_us, p.queue_order_us, p.trace_us,
+                p.facts_us, p.key_us, p.refresh_us, line.c_str(), elapsed_us(t_start_));
         fflush(stderr);
     }
 
@@ -89442,6 +89474,7 @@ class ggml_sycl_block_exec_dense_run {
             f.fa_mask_sinks_safe = ggml_sycl_fa_mask_sinks_refresh_safe(cgraph_);
         }
         graphs_off_ = ggml_sycl::dense_exec_graph_first_off(f);
+        split_lap(split_.facts_us);
         if (graphs_off_ != ggml_sycl::DENSE_GRAPH_OFF_NONE) {
             return;
         }
@@ -89469,7 +89502,9 @@ class ggml_sycl_block_exec_dense_run {
         if (any_missing) {
             graph_prestage_leaf_tensors(&ctx_, cgraph_);
         }
+        split_lap(split_.key_us);
         graph_refresh_input_tensors(&ctx_, cgraph_);
+        split_lap(split_.refresh_us);
         range_modes_.assign(ranges_.size(), range_graph_mode::DIRECT);
         graphs_on_ = true;
     }
@@ -89818,16 +89853,21 @@ class ggml_sycl_block_exec_dense_run {
             return gate;
         }
 
+        split_lap(split_.precheck_us);
         ggml_sycl_block_exec_dense_state & st        = ggml_sycl_block_exec_dense_state_for(ctx_);
         const uint64_t                     signature = ggml_sycl_graph_signature(cgraph_);
+        split_lap(split_.signature_us);
         if (reuse_prepared(st, plan_owner, signature)) {
             plan_cache_ = plan_cache_result::HIT;
+            split_lap(split_.cache_us);
             check_queue_order(original_device_);
             for (const ggml_sycl::dense_exec_range & range : plan_.ranges) {
                 check_queue_order(range.device);
             }
             ranges_ = plan_.ranges;
+            split_lap(split_.queue_order_us);
             trace_prepare();
+            split_lap(split_.trace_us);
             return ggml_sycl::DENSE_EXEC_GATE_NONE;
         }
         plan_cache_ = plan_cache_result::MISS;
@@ -89867,7 +89907,9 @@ class ggml_sycl_block_exec_dense_run {
         }
         ranges_ = plan_.ranges;
         store_prepared(st, plan_owner, signature);
+        split_lap(split_.cache_us);
         trace_prepare();
+        split_lap(split_.trace_us);
         return ggml_sycl::DENSE_EXEC_GATE_NONE;
     }
 
