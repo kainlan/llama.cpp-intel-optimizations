@@ -14,7 +14,8 @@
 // (tests/test-sycl-dense-block-exec.cpp):
 //   - dense_exec_first_failing_precheck: may the executor run this graph?
 //     Split into the context gates and the block gates, whose verdict
-//     dense_exec_block_memo keeps per placement plan.
+//     dense_exec_block_memo keeps per placement plan. The composed form is
+//     the reference ordering; the backend runs the two halves separately.
 //   - dense_exec_build_plan: node devices, ranges, per-range copies and the
 //     layout of the persistent per-device arena.
 //   - dense_exec_graph_first_off: do the ranges of a decode graph record and
@@ -102,7 +103,8 @@ inline const char * dense_exec_gate_name(dense_exec_gate gate) {
 }
 
 // Parses GGML_SYCL_BLOCK_EXEC_DENSE, given its value or nullptr when unset.
-// On by default; 0 is the opt-out. The per-graph gates below, not this
+// On by default; any value atoi reads as 0 is the opt-out, including an empty
+// value and words such as "off" or "true". The per-graph gates below, not this
 // variable, keep the executor off graphs it does not handle.
 inline bool dense_exec_env_enabled(const char * env) {
     return env == nullptr || std::atoi(env) != 0;
@@ -123,6 +125,8 @@ struct dense_exec_precheck_inputs {
     bool                          graph_recording  = false;
     bool                          unsupported_mode = false;
     bool                          has_plan         = false;
+    // Read only by the composed dense_exec_first_failing_precheck; the backend
+    // takes the blocks from dense_exec_block_memo instead of filling this.
     std::vector<dense_exec_block> blocks;
 };
 
@@ -168,7 +172,9 @@ inline dense_exec_gate dense_exec_first_failing_block_precheck(const std::vector
 }
 
 // The first gate, among those decidable from the plan alone, that stops the
-// executor; DENSE_EXEC_GATE_NONE when all of them pass.
+// executor; DENSE_EXEC_GATE_NONE when all of them pass. This is the reference
+// ordering: the backend's prepare() mirrors it in two steps, the context
+// gates per graph and then the block verdict from dense_exec_block_memo.
 inline dense_exec_gate dense_exec_first_failing_precheck(const dense_exec_precheck_inputs & in) {
     const dense_exec_gate gate = dense_exec_first_failing_context_precheck(in);
     return gate != DENSE_EXEC_GATE_NONE ? gate : dense_exec_first_failing_block_precheck(in.blocks);

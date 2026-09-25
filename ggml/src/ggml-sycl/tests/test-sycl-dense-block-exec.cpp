@@ -176,6 +176,10 @@ static void test_env_default() {
     check(dense_exec_env_enabled(nullptr), "unset enables the executor");
     check(dense_exec_env_enabled("1"), "1 enables the executor");
     check(!dense_exec_env_enabled("0"), "0 disables the executor");
+    // atoi reads both as 0. Unlike variables that treat an empty value as
+    // unset, an empty value here is an explicit opt-out.
+    check(!dense_exec_env_enabled(""), "an empty value disables the executor");
+    check(!dense_exec_env_enabled("true"), "a non-numeric value disables the executor");
 }
 
 static void test_precheck_gates() {
@@ -263,8 +267,10 @@ static void test_block_memo() {
     check(memo.gate == DENSE_EXEC_GATE_NOT_DENSE, "a MoE plan is rejected");
     check(!dense_exec_block_memo_current(memo, plan_a), "a store replaces the judged plan");
 
-    // A replan frees the judged plan; its successor is judged afresh even if
-    // it reuses the address.
+    // A replan frees the judged plan; its successor is judged afresh. A memo
+    // keyed on the raw address could see that address reused here; the weak
+    // owner keeps the old allocation alive and never compares equal to a new
+    // plan.
     plan_b.reset();
     auto plan_c = std::make_shared<const int>(3);
     check(!dense_exec_block_memo_current(memo, plan_c), "a freed plan's verdict does not carry over");
