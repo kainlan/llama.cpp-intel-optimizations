@@ -294,16 +294,7 @@ std::vector<profile_row> collect_rows_locked(const profiler_state & state) {
         if (lhs.total_ns != rhs.total_ns) {
             return lhs.total_ns > rhs.total_ns;
         }
-        if (lhs.key.name != rhs.key.name) {
-            return lhs.key.name < rhs.key.name;
-        }
-        if (lhs.key.category != rhs.key.category) {
-            return lhs.key.category < rhs.key.category;
-        }
-        if (lhs.key.metadata != rhs.key.metadata) {
-            return lhs.key.metadata < rhs.key.metadata;
-        }
-        return lhs.key.device < rhs.key.device;
+        return lhs.key < rhs.key;
     });
 
     return rows;
