@@ -1753,6 +1753,21 @@ set_tests_properties(sycl-kv-runtime-demotion PROPERTIES
     TIMEOUT 60
 )
 
+# oneDNN PP placement answers (llama.cpp-1d0n): which devices may run oneDNN PP
+# on a multi-device plan, and whether the plan may add WOQ second copies.
+# onednn-pp-placement.hpp is header-only and SYCL-free, like the gate below.
+add_executable(test-onednn-pp-placement
+    tests/test-onednn-pp-placement.cpp
+)
+target_include_directories(test-onednn-pp-placement PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME sycl-onednn-pp-placement COMMAND test-onednn-pp-placement)
+set_tests_properties(sycl-onednn-pp-placement PROPERTIES
+    LABELS "sycl;onednn;hostonly"
+    TIMEOUT 60
+)
+
 # Layer-streaming auto-activation gate (llama.cpp-40j4). Same arrangement as
 # test-kv-runtime-demotion above: layer-streaming-gate.hpp is header-only and
 # includes no SYCL header, so this target builds without -fsycl or ggml-base.

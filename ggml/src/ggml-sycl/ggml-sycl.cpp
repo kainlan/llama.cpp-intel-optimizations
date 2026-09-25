@@ -158,6 +158,7 @@
 #include "ggml-sycl/layer-prefetch.hpp"
 #include "ggml-sycl/layer-streaming-gate.hpp"
 #include "ggml-sycl/layer-streaming.hpp"
+#include "ggml-sycl/onednn-pp-placement.hpp"
 #include "ggml-sycl/persistent-tg-kernel.hpp"
 #include "ggml-sycl/unified-kernel.hpp"
 
@@ -26874,21 +26875,46 @@ static int ggml_sycl_routable_device_count();
 // the plan under construction when the planner predicts WOQ copies. The planner
 // used to ask this about the PREVIOUS global plan, so a two-card split predicted
 // copies that staging -- asking about the split -- then never made (llama.cpp-21jd).
-static bool ggml_sycl_onednn_pp_safe_for_placement(const ggml_sycl::placement_plan * plan) {
-    const bool single_routable_device = ggml_sycl_routable_device_count() <= 1;
-    if (!single_routable_device && g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
-        return false;
-    }
-    if (plan && plan->multi_device && ggml_sycl_placement_plan_needs_secondary_devices(*plan) &&
-        !single_routable_device) {
-        return false;
-    }
-    return true;
+static ggml_sycl::onednn_pp_placement ggml_sycl_onednn_pp_placement_for(const ggml_sycl::placement_plan * plan) {
+    ggml_sycl::onednn_pp_placement_inputs in;
+    in.multiple_routable_devices = ggml_sycl_routable_device_count() > 1;
+    in.moe_multi_gpu_active      = g_moe_multi_gpu_active.load(std::memory_order_acquire);
+    in.plan_needs_secondaries = plan && plan->multi_device && ggml_sycl_placement_plan_needs_secondary_devices(*plan);
+    return ggml_sycl::onednn_pp_placement_decide(in);
 }
 
-static bool ggml_sycl_onednn_pp_safe_for_current_placement() {
+static ggml_sycl::onednn_pp_placement ggml_sycl_onednn_pp_current_placement() {
     const auto plan_owner = ggml_sycl_global_plan_owner();
-    return ggml_sycl_onednn_pp_safe_for_placement(ggml_sycl_has_global_plan() ? plan_owner.get() : nullptr);
+    return ggml_sycl_onednn_pp_placement_for(ggml_sycl_has_global_plan() ? plan_owner.get() : nullptr);
+}
+
+// May the plan add dense ONEDNN_WOQ second copies? Not on a split.
+static bool ggml_sycl_onednn_pp_woq_alternates_allowed_for_placement(const ggml_sycl::placement_plan * plan) {
+    return ggml_sycl::onednn_pp_woq_alternates_allowed(ggml_sycl_onednn_pp_placement_for(plan));
+}
+
+static bool ggml_sycl_onednn_pp_woq_alternates_allowed_for_current_placement() {
+    return ggml_sycl::onednn_pp_woq_alternates_allowed(ggml_sycl_onednn_pp_current_placement());
+}
+
+// May `device` run oneDNN PP for weight `src0`? On a split, only when the
+// weight is resident on that device: placement decides the executor, and the
+// oneDNN PP paths dequantize the resident layout into scratch on `device`.
+// Before llama.cpp-1d0n a split refused this outright, which put every B70
+// layer of a dense split on mmq_generic (9.2x the matmul time).
+// `placement_out`, when given, receives the placement the answer came from.
+static bool ggml_sycl_onednn_pp_executable_on_device(const ggml_tensor *              src0,
+                                                     int                              device,
+                                                     ggml_sycl::onednn_pp_placement * placement_out = nullptr) {
+    const ggml_sycl::onednn_pp_placement placement = ggml_sycl_onednn_pp_current_placement();
+    if (placement_out) {
+        *placement_out = placement;
+    }
+    if (placement != ggml_sycl::onednn_pp_placement::SPLIT_RESIDENT_WEIGHTS) {
+        return ggml_sycl::onednn_pp_executable(placement, /*weight_resident_on_device=*/false);
+    }
+    const bool resident = src0 && device >= 0 && ggml_sycl_resolve(src0, device).on_device;
+    return ggml_sycl::onednn_pp_executable(placement, resident);
 }
 
 static int ggml_sycl_onednn_pp_min_batch() {
@@ -26989,22 +27015,21 @@ static bool ggml_sycl_dense_woq_alternate_eligible_impl(ggml_type type, bool is_
 }
 
 bool ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous) {
-    return ggml_sycl_dense_woq_alternate_eligible_impl(type, is_contiguous,
-                                                       ggml_sycl_onednn_pp_safe_for_current_placement());
+    return ggml_sycl_dense_woq_alternate_eligible_impl(
+        type, is_contiguous, ggml_sycl_onednn_pp_woq_alternates_allowed_for_current_placement());
 }
 
 bool ggml_sycl_dense_woq_alternate_eligible_for_plan(ggml_type                         type,
                                                      bool                              is_contiguous,
                                                      const ggml_sycl::placement_plan & plan) {
     return ggml_sycl_dense_woq_alternate_eligible_impl(type, is_contiguous,
-                                                       ggml_sycl_onednn_pp_safe_for_placement(&plan));
+                                                       ggml_sycl_onednn_pp_woq_alternates_allowed_for_placement(&plan));
 }
 
 static bool ggml_sycl_onednn_pp_candidate(const ggml_tensor * src0,
                                           const ggml_tensor * src1,
                                           const ggml_tensor * dst,
                                           int                 device) {
-    GGML_UNUSED(device);
 #if GGML_SYCL_DNNL
     auto trace_reject = [&](const char * reason) {
         if (!ggml_sycl_onednn_pp_trace_enabled()) {
@@ -27044,13 +27069,20 @@ static bool ggml_sycl_onednn_pp_candidate(const ggml_tensor * src0,
         trace_reject("not-contiguous-quant");
         return false;
     }
-    const bool safe = ggml_sycl_onednn_pp_safe_for_current_placement();
-    trace_reject(safe ? "accepted" : "unsafe-placement");
-    return safe;
+    ggml_sycl::onednn_pp_placement placement  = ggml_sycl::onednn_pp_placement::ALLOWED;
+    const bool                     executable = ggml_sycl_onednn_pp_executable_on_device(src0, device, &placement);
+    // Name the refusal: a MoE multi-GPU refusal and a split weight that is not
+    // resident on `device` are different defects.
+    trace_reject(executable ? "accepted" :
+                 placement == ggml_sycl::onednn_pp_placement::SPLIT_RESIDENT_WEIGHTS ?
+                              "split-weight-not-resident" :
+                              ggml_sycl::onednn_pp_placement_name(placement));
+    return executable;
 #else
     GGML_UNUSED(src0);
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);
+    GGML_UNUSED(device);
     return false;
 #endif
 }
@@ -63432,7 +63464,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                 src0->name ? src0->name : "?", ggml_type_name(src0->type), (int) data_layout,
                                 (long long) M, (long long) K, (long long) N, (long long) ne02, (long long) ne12,
                                 (long long) ne13, (long long) n_batch, (long long) i02_divisor,
-                                ggml_sycl_onednn_pp_safe_for_current_placement() ? 1 : 0);
+                                ggml_sycl_onednn_pp_executable_on_device(src0, ctx.device) ? 1 : 0);
                     }
                 }
 
@@ -63450,7 +63482,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                     bool       used_onednn   = false;
 #if GGML_SYCL_DNNL
                     if (M >= 2 && data_layout == ggml_sycl_unified::LayoutMode::SOA &&
-                        ggml_sycl_onednn_pp_safe_for_current_placement()) {
+                        ggml_sycl_onednn_pp_executable_on_device(src0, ctx.device)) {
                         const to_fp16_sycl_t f32_to_fp16 =
                             ggml_get_to_fp16_sycl(GGML_TYPE_F32, dst, /*full_tensor=*/false);
                         const size_t src0_elems = static_cast<size_t>(N) * static_cast<size_t>(K);
@@ -63622,7 +63654,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                     // For TG (M == 1), use unified kernel (MMVQ fast-path).
                     bool used_onednn = false;
 #if GGML_SYCL_DNNL
-                    if (M >= 2 && ggml_sycl_onednn_pp_safe_for_current_placement()) {
+                    if (M >= 2 && ggml_sycl_onednn_pp_executable_on_device(src0, ctx.device)) {
                         // Dequant MXFP4→FP16, convert F32→FP16, oneDNN GEMM
                         const to_fp16_sycl_t dequant_fn = ggml_get_to_fp16_sycl(src0->type, dst, /*full_tensor=*/false);
                         const to_fp16_sycl_t f32_to_fp16 =
@@ -64655,10 +64687,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                             // =============================================================
                             g_fp16_cache.init_once();
 
-                            const bool onednn_pp_candidate =
-                                !ggml_sycl_onednn_pp_skip_type(src0->type) && ggml_sycl_onednn_pp_enabled() &&
-                                M >= ggml_sycl_onednn_pp_min_batch() && ggml_is_quantized(src0->type) &&
-                                ggml_is_contiguous(src0) && ggml_sycl_onednn_pp_safe_for_current_placement();
+                            // The one admission check, not an inline copy of it: the copy
+                            // that stood here was the gate a dense split actually hit, and
+                            // being a copy it never reached ONEDNN_PP_TRACE (llama.cpp-1d0n).
+                            // src1 and dst are F32 on this path (read/written as float).
+                            const bool onednn_pp_candidate = ggml_sycl_onednn_pp_candidate(src0, src1, dst, ctx.device);
 
                             bool used_onednn_fp16 = false;
                             if (onednn_pp_candidate) {
