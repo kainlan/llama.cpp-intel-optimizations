@@ -88912,6 +88912,7 @@ struct ggml_sycl_block_exec_dense_state {
     ggml_sycl::mem_handle host_stage[GGML_SYCL_MAX_DEVICES];
     size_t                host_stage_bytes[GGML_SYCL_MAX_DEVICES] = {};
     sycl::event           host_stage_read[GGML_SYCL_MAX_DEVICES];
+
     // The spans of the crossing being built. Reused so a token allocates
     // nothing for them; emptied after each crossing, never shrunk.
     std::vector<ggml_sycl_block_exec_dense_crossing_span> crossing_spans;
@@ -89259,7 +89260,7 @@ class ggml_sycl_block_exec_dense_run {
                 phases_[static_cast<size_t>(idx)].drain_out_us = elapsed_us(t_copy);
                 t_copy                                         = std::chrono::steady_clock::now();
             }
-            crossing_spans_scope         scope(ggml_sycl_block_exec_dense_state_for(ctx_).crossing_spans);
+            crossing_spans_scope         scope(state().crossing_spans);
             std::vector<crossing_span> & spans = scope.spans;
             for (size_t k = 0; k < io.copy_out.size(); ++k) {
                 const ggml_sycl::dense_exec_copy &  copy = io.copy_out[k];
@@ -89408,6 +89409,8 @@ class ggml_sycl_block_exec_dense_run {
     std::optional<ggml_sycl_block_exec_device_scope> scope_;
     int                                              executed_ranges_ = 0;
 
+    ggml_sycl_block_exec_dense_state & state() { return ggml_sycl_block_exec_dense_state_for(ctx_); }
+
 #ifdef GGML_SYCL_GRAPH
     enum class range_graph_mode { DIRECT, RECORD, REPLAY };
 
@@ -89433,7 +89436,6 @@ class ggml_sycl_block_exec_dense_run {
     // Each pool's graph-retained count when the open recording began.
     std::vector<std::pair<ggml_sycl_pool *, size_t>>                        pool_baseline_;
 
-    ggml_sycl_block_exec_dense_state & state() { return ggml_sycl_block_exec_dense_state_for(ctx_); }
 
     // Identity of everything the recorded graphs of this plan bake besides
     // the per-range facts: the cut, the slice layout, and each arena. A new
@@ -89912,7 +89914,7 @@ class ggml_sycl_block_exec_dense_run {
     bool stage_range(size_t idx) {
         const ggml_sycl::dense_exec_range &    range = ranges_[idx];
         const ggml_sycl::dense_exec_range_io & io    = plan_.io[idx];
-        crossing_spans_scope                   scope(ggml_sycl_block_exec_dense_state_for(ctx_).crossing_spans);
+        crossing_spans_scope                   scope(state().crossing_spans);
         std::vector<crossing_span> &           spans = scope.spans;
         for (size_t k = 0; k < io.stage_in.size(); ++k) {
             const int                           s     = io.stage_in[k];
