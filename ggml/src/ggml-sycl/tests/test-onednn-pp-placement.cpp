@@ -87,6 +87,20 @@ int main() {
         CHECK(onednn_pp_woq_alternates_allowed(p), "case 4: WOQ alternates allowed");
     }
 
+    // 5. MoE multi-GPU on its own, with no plan secondaries: still refused.
+    //    Case 3 sets both flags, so it cannot tell a refusal keyed on MoE from
+    //    one that only fires inside the split branch.
+    {
+        onednn_pp_placement_inputs in;
+        in.multiple_routable_devices = true;
+        in.moe_multi_gpu_active      = true;
+        in.plan_needs_secondaries    = false;
+        const onednn_pp_placement p  = onednn_pp_placement_decide(in);
+        CHECK_PLACEMENT(p, onednn_pp_placement::REFUSED_MOE_MULTI_GPU, "case 5: moe multi-gpu without secondaries");
+        CHECK(!onednn_pp_executable(p, true), "case 5: moe multi-gpu refuses a resident weight");
+        CHECK(!onednn_pp_woq_alternates_allowed(p), "case 5: moe multi-gpu refuses WOQ alternates");
+    }
+
     std::printf("test-onednn-pp-placement: all cases passed\n");
     return 0;
 }

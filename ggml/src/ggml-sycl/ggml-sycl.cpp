@@ -26901,8 +26901,14 @@ static bool ggml_sycl_onednn_pp_woq_alternates_allowed_for_current_placement() {
 // oneDNN PP paths dequantize the resident layout into scratch on `device`.
 // Before llama.cpp-1d0n a split refused this outright, which put every B70
 // layer of a dense split on mmq_generic (9.2x the matmul time).
-static bool ggml_sycl_onednn_pp_executable_on_device(const ggml_tensor * src0, int device) {
+// `placement_out`, when given, receives the placement the answer came from.
+static bool ggml_sycl_onednn_pp_executable_on_device(const ggml_tensor *              src0,
+                                                     int                              device,
+                                                     ggml_sycl::onednn_pp_placement * placement_out = nullptr) {
     const ggml_sycl::onednn_pp_placement placement = ggml_sycl_onednn_pp_current_placement();
+    if (placement_out) {
+        *placement_out = placement;
+    }
     if (placement != ggml_sycl::onednn_pp_placement::SPLIT_RESIDENT_WEIGHTS) {
         return ggml_sycl::onednn_pp_executable(placement, /*weight_resident_on_device=*/false);
     }
@@ -27062,8 +27068,14 @@ static bool ggml_sycl_onednn_pp_candidate(const ggml_tensor * src0,
         trace_reject("not-contiguous-quant");
         return false;
     }
-    const bool executable = ggml_sycl_onednn_pp_executable_on_device(src0, device);
-    trace_reject(executable ? "accepted" : "unsafe-placement");
+    ggml_sycl::onednn_pp_placement placement  = ggml_sycl::onednn_pp_placement::ALLOWED;
+    const bool                     executable = ggml_sycl_onednn_pp_executable_on_device(src0, device, &placement);
+    // Name the refusal: a MoE multi-GPU refusal and a split weight that is not
+    // resident on `device` are different defects.
+    trace_reject(executable ? "accepted" :
+                 placement == ggml_sycl::onednn_pp_placement::SPLIT_RESIDENT_WEIGHTS ?
+                              "split-weight-not-resident" :
+                              ggml_sycl::onednn_pp_placement_name(placement));
     return executable;
 #else
     GGML_UNUSED(src0);
