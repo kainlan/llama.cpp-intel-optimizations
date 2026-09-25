@@ -220,6 +220,28 @@ int main() {
     CHECK(contains(ggml_sycl_kernel_profile_format_csv_for_test(), "unit.wrapper.submit,unit,case=enabled"),
           "enabled wrapper did not record test row");
 
+    // A split run launches the same label on both cards; each card must keep its own row.
+    ggml_sycl_kernel_profile_reset_for_test();
+    ggml_sycl_kernel_profile_set_config_for_test(enabled_cfg);
+    ggml_sycl_profile_label split_label{};
+    split_label.name       = "unit.device.split";
+    split_label.category   = "unit";
+    split_label.queue_kind = "compute";
+    split_label.metadata   = "case=split";
+    split_label.device     = 0;
+    ggml_sycl_kernel_profile_add_sample_for_test(split_label, 100);
+    ggml_sycl_kernel_profile_add_sample_for_test(split_label, 300);
+    split_label.device = 1;
+    ggml_sycl_kernel_profile_add_sample_for_test(split_label, 900);
+
+    const std::string split_csv = ggml_sycl_kernel_profile_format_csv_for_test();
+    CHECK(contains(split_csv, "unit.device.split,unit,case=split,0,compute,2,400,200,100,100,100,300,0,0,0"),
+          "device-0 aggregate row missing or merged with device 1");
+    CHECK(contains(split_csv, "unit.device.split,unit,case=split,1,compute,1,900,900,900,900,900,900,0,0,0"),
+          "device-1 aggregate row missing or merged with device 0");
+    CHECK(contains(ggml_sycl_kernel_profile_format_summary_for_test(0), "900 1 900 0 1 unit.device.split"),
+          "summary does not name the device of each row");
+
     ggml_sycl_kernel_profile_reset_for_test();
     return 0;
 }
