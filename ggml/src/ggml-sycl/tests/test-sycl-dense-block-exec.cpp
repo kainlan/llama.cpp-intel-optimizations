@@ -609,6 +609,24 @@ static void test_host_stage_layout() {
     }
 }
 
+// A range graph takes the pool scratch freed while it recorded: only what the
+// pool gained since the recording began, in order, and nothing from before.
+static void test_take_since() {
+    std::vector<int> pool  = { 1, 2, 3, 4, 5 };
+    std::vector<int> graph = { 9 };
+    check(dense_exec_take_since(pool, 2, graph) == 3, "moves the three entries after the baseline");
+    check(pool == std::vector<int>({ 1, 2 }), "the pool keeps what it held before the baseline");
+    check(graph == std::vector<int>({ 9, 3, 4, 5 }), "the graph appends the moved entries in order");
+
+    check(dense_exec_take_since(pool, 2, graph) == 0, "nothing new since the baseline moves nothing");
+    check(pool.size() == 2 && graph.size() == 4, "an empty move changes neither side");
+
+    std::vector<int> drained = { 7 };
+    std::vector<int> other;
+    check(dense_exec_take_since(drained, 3, other) == 1, "a pool drained since the baseline gives up all it holds");
+    check(drained.empty() && other == std::vector<int>({ 7 }), "and it ends empty");
+}
+
 // dev0 | dev1 | dev0 | dev1. Range 1 produces r-1; a device-0 node in range 2
 // writes r-1 in place; range 3 reads r-1 on device 1. Range 3 could only
 // re-publish range 1's device-1 slice -- the value from before the write --
@@ -715,6 +733,7 @@ int main() {
         { "graph-off-reasons",                          test_graph_off_reasons                               },
         { "graph-off-debug-envs",                       test_graph_off_debug_envs                            },
         { "host-stage-layout",                          test_host_stage_layout                               },
+        { "take-since",                                 test_take_since                                      },
     };
 
     int failed = 0;

@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <utility>
 #include <vector>
 
@@ -827,6 +828,21 @@ inline const char * dense_exec_plan_violation(const dense_exec_graph & g, const 
         }
     }
     return nullptr;
+}
+
+// A pool frees scratch that a recording used into its own retained list, not
+// into the recording's sink. When a range graph finishes recording, the
+// entries appended since its recording began are moved into that graph, so the
+// graph owns the scratch it baked. What the pool held before the baseline
+// stays. A pool drained since the baseline gives up everything it now holds.
+// Returns the number of entries moved.
+template <typename T> inline size_t dense_exec_take_since(std::vector<T> & from, size_t baseline, std::vector<T> & to) {
+    const size_t first = baseline <= from.size() ? baseline : 0;
+    const size_t moved = from.size() - first;
+    to.insert(to.end(), std::make_move_iterator(from.begin() + static_cast<std::ptrdiff_t>(first)),
+              std::make_move_iterator(from.end()));
+    from.resize(first);
+    return moved;
 }
 
 }  // namespace ggml_sycl

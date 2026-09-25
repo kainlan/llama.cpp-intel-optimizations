@@ -2825,6 +2825,16 @@ struct ggml_sycl_pool {
     virtual void   free(void * ptr, size_t size)            = 0;
 
     virtual void release_graph_retained() {}
+
+    // Scratch freed under graph recording that this pool retains; a range
+    // graph moves what it freed into its own retained handles.
+    virtual size_t graph_retained_count() { return 0; }
+
+    virtual size_t take_graph_retained_since(size_t baseline, std::vector<ggml_sycl::mem_handle> & out) {
+        (void) baseline;
+        (void) out;
+        return 0;
+    }
 };
 
 // Allocation tracing (optional). Enable with GGML_SYCL_ALLOC_TRACE=1.

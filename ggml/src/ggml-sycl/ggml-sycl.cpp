@@ -42922,6 +42922,16 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         }
         GGML_SYCL_DEBUG("[POOL-LEG] released %zu graph-retained scratch mem_handles\n", retired.size());
     }
+
+    size_t graph_retained_count() override {
+        std::lock_guard<std::mutex> lock(arena_handles_mutex);
+        return graph_retained_handles.size();
+    }
+
+    size_t take_graph_retained_since(size_t baseline, std::vector<ggml_sycl::mem_handle> & out) override {
+        std::lock_guard<std::mutex> lock(arena_handles_mutex);
+        return ggml_sycl::dense_exec_take_since(graph_retained_handles, baseline, out);
+    }
 };
 
 struct ggml_sycl_pool_host : public ggml_sycl_pool {
@@ -88898,7 +88908,8 @@ struct ggml_sycl_block_exec_dense_state {
     // One recorded command graph per range of a decode graph, replayed on the
     // range's own device queue. A graph bakes raw pointers, so it holds every
     // handle it bakes -- arena slices, the Q8 activation backing, the weights,
-    // and what the recording sink collected -- until the graph is destroyed.
+    // what the recording sink collected, and the pool scratch freed while it
+    // recorded -- until the graph is destroyed.
     struct range_graph {
         uint64_t                                                                  signature   = 0;
         int                                                                       n_nodes     = 0;
@@ -88918,8 +88929,8 @@ struct ggml_sycl_block_exec_dense_state {
     // Destroys every range graph. Each device a graph ran on is drained first:
     // decode returns with a replay possibly still in flight, and destroying an
     // executable graph under its own submission is the llama.cpp-dkw0 defect
-    // #4 double free. Pool scratch the recordings retained is released last,
-    // and only when no other graph of this context can still hold it.
+    // #4 double free. The pool scratch a recording used is among each graph's
+    // retained handles, so it goes with the graph.
     void drop_graphs(ggml_backend_sycl_context & ctx);
 #endif
 
@@ -88962,6 +88973,30 @@ struct ggml_sycl_block_exec_dense_state {
 };
 
 #ifdef GGML_SYCL_GRAPH
+// Every scratch pool of the context, on every device.
+static std::vector<ggml_sycl_pool *> ggml_sycl_block_exec_dense_pools(ggml_backend_sycl_context & ctx) {
+    std::vector<ggml_sycl_pool *> out;
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        if (ctx.pools[d]) {
+            out.push_back(ctx.pools[d].get());
+        }
+        for (auto & entry : ctx.routed_pools[d]) {
+            if (entry.second) {
+                out.push_back(entry.second.get());
+            }
+        }
+        if (ctx.host_pools[d]) {
+            out.push_back(ctx.host_pools[d].get());
+        }
+        for (auto & entry : ctx.routed_host_pools[d]) {
+            if (entry.second) {
+                out.push_back(entry.second.get());
+            }
+        }
+    }
+    return out;
+}
+
 void ggml_sycl_block_exec_dense_state::drop_graphs(ggml_backend_sycl_context & ctx) {
     if (graphs.empty()) {
         return;
@@ -88985,30 +89020,6 @@ void ggml_sycl_block_exec_dense_state::drop_graphs(ggml_backend_sycl_context & c
     }
     graphs.clear();
     graphs_key = 0;
-    if (ctx.exec_graph || ctx.moe_segments_valid) {
-        return;
-    }
-    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
-        if (!used[d]) {
-            continue;
-        }
-        if (ctx.pools[d]) {
-            ctx.pools[d]->release_graph_retained();
-        }
-        for (auto & entry : ctx.routed_pools[d]) {
-            if (entry.second) {
-                entry.second->release_graph_retained();
-            }
-        }
-        if (ctx.host_pools[d]) {
-            ctx.host_pools[d]->release_graph_retained();
-        }
-        for (auto & entry : ctx.routed_host_pools[d]) {
-            if (entry.second) {
-                entry.second->release_graph_retained();
-            }
-        }
-    }
 }
 #endif
 
@@ -89395,6 +89406,8 @@ class ggml_sycl_block_exec_dense_run {
     size_t                                                                  recording_range_ = 0;
     bool                                                                    recording_open_  = false;
     recording_saved                                                         recording_saved_;
+    // Each pool's graph-retained count when the open recording began.
+    std::vector<std::pair<ggml_sycl_pool *, size_t>>                        pool_baseline_;
 
     ggml_sycl_block_exec_dense_state & state() { return ggml_sycl_block_exec_dense_state_for(ctx_); }
 
@@ -89558,6 +89571,10 @@ class ggml_sycl_block_exec_dense_run {
 
         recording_signature_ = sig;
         recording_range_     = idx;
+        pool_baseline_.clear();
+        for (ggml_sycl_pool * pool : ggml_sycl_block_exec_dense_pools(ctx_)) {
+            pool_baseline_.emplace_back(pool, pool->graph_retained_count());
+        }
         recording_.emplace(*q, sycl::property_list{ sycl_ex::property::graph::assume_buffer_outlives_graph{} });
         recording_saved_.fa_ptrs.swap(ctx_.fa_graph_ptrs);
         recording_saved_.fa_valid     = ctx_.fa_graph_ptrs_valid;
@@ -89642,6 +89659,29 @@ class ggml_sycl_block_exec_dense_run {
                 }
             }
         }
+        // A pool free under recording retains the scratch in the pool, not in
+        // the sink. Left there, the next graph_compute boundary would release
+        // it while this graph still replays into it.
+        size_t pool_scratch = 0;
+        size_t pool_left    = 0;
+        for (ggml_sycl_pool * pool : ggml_sycl_block_exec_dense_pools(ctx_)) {
+            size_t baseline = 0;
+            for (const auto & b : pool_baseline_) {
+                if (b.first == pool) {
+                    baseline = b.second;
+                    break;
+                }
+            }
+            pool_scratch += pool->take_graph_retained_since(baseline, g.retained);
+            pool_left += pool->graph_retained_count();
+        }
+        pool_baseline_.clear();
+        if (ggml_sycl_block_exec_plan_trace_enabled()) {
+            fprintf(stderr,
+                    "[SYCL-BLOCK-EXEC-DENSE-GRAPH] r%zu record dev=%d retained=%zu pool_scratch=%zu pool_left=%zu\n",
+                    idx, range.device, g.retained.size(), pool_scratch, pool_left);
+            fflush(stderr);
+        }
 
         q->ext_oneapi_graph(*g.exec);
         g.records++;
@@ -89659,6 +89699,7 @@ class ggml_sycl_block_exec_dense_run {
         }
         stop_recording();
         recording_.reset();
+        pool_baseline_.clear();
         ctx_.fa_graph_ptrs.swap(recording_saved_.fa_ptrs);
         ctx_.fa_graph_ptrs_valid              = recording_saved_.fa_valid;
         ggml_sycl_block_exec_dense_state & st = state();
