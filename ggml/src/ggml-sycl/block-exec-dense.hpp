@@ -38,7 +38,7 @@ enum dense_exec_gate {
     DENSE_EXEC_GATE_UNSUPPORTED_MODE,  // CPU offload or tensor parallelism is active
     DENSE_EXEC_GATE_NO_PLAN,           // no placement plan visible to the device
     DENSE_EXEC_GATE_FEW_BLOCKS,        // fewer than 2 active layer blocks
-    DENSE_EXEC_GATE_NOT_DENSE,         // a block carries MoE expert weights
+    DENSE_EXEC_GATE_NOT_DENSE,         // a block carries MoE expert weights, or the graph has a MUL_MAT_ID
     DENSE_EXEC_GATE_KV_DEVICE,         // a block's KV cache is not on its execution device
     DENSE_EXEC_GATE_SINGLE_DEVICE,     // every node of this graph runs on the backend's own device
     DENSE_EXEC_GATE_TOO_MANY_RANGES,   // the device assignment interleaves more than the plan allows

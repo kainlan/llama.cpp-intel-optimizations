@@ -82178,8 +82178,6 @@ static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, 
 // another device and then drain its queue -- have nothing to do there.
 static thread_local bool g_ggml_sycl_block_exec_dense_active = false;
 
-bool ggml_sycl_block_exec_dense_active();  // also declared where set_rows.cpp needs it
-
 bool ggml_sycl_block_exec_dense_active() {
     return g_ggml_sycl_block_exec_dense_active;
 }
@@ -88913,9 +88911,11 @@ class ggml_sycl_block_exec_dense_run {
         trace_phases();
     }
 
-    // True when the graph runs as dense ranges, i.e. the node loop sees range
-    // views rather than the whole graph.
-    bool ranges_active() const { return gate_ == ggml_sycl::DENSE_EXEC_GATE_NONE; }
+    // True when the node loop sees range views rather than the whole graph:
+    // the executor ran, or it fell back after staging failed.
+    bool ranges_active() const {
+        return gate_ == ggml_sycl::DENSE_EXEC_GATE_NONE || gate_ == ggml_sycl::DENSE_EXEC_GATE_STAGE_FAILED;
+    }
 
     ggml_sycl_block_exec_dense_run(const ggml_sycl_block_exec_dense_run &)             = delete;
     ggml_sycl_block_exec_dense_run & operator=(const ggml_sycl_block_exec_dense_run &) = delete;
@@ -88978,10 +88978,7 @@ class ggml_sycl_block_exec_dense_run {
     }
 
     // The graph the node loop iterates for the range just entered.
-    ggml_cgraph * range_graph() {
-        return gate_ == ggml_sycl::DENSE_EXEC_GATE_NONE || gate_ == ggml_sycl::DENSE_EXEC_GATE_STAGE_FAILED ? &view_ :
-                                                                                                              cgraph_;
-    }
+    ggml_cgraph * range_graph() { return ranges_active() ? &view_ : cgraph_; }
 
     // Leaving an executor range drains its device, copies back what later
     // ranges read, and restores the backend's device.
@@ -89004,7 +89001,7 @@ class ggml_sycl_block_exec_dense_run {
             GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] no execution queue to leave range %d (device %d)", idx, range.device);
         }
         try {
-            auto t_copy = std::chrono::steady_clock::now();
+            auto t_copy = phase_trace_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (phase_trace_) {
                 // Trace only: the range's own work, separated from the copies.
                 q_exec->wait_and_throw();

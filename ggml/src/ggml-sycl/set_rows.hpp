@@ -18,4 +18,9 @@ bool ggml_sycl_plan_set_rows(const ggml_tensor * dst, int fallback_device, ggml_
 
 void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst);
 
+// True while the dense block executor runs a node range on that range's own
+// device (llama.cpp-tf8m). Defined in ggml-sycl.cpp; SET_ROWS refuses to stage
+// inside such a range.
+bool ggml_sycl_block_exec_dense_active();
+
 #endif  // GGML_SYCL_SET_ROWS_HPP
