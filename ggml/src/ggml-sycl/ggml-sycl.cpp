@@ -38513,6 +38513,20 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
             planned_device_bytes += runtime_kv_plan.kv_size_for_layer(l);
         }
 
+        // The runtime-context transaction admitted this KV against this same
+        // headroom (unified_cache_kv_vram_available), so a device-planned
+        // layer that no longer fits is an accounting mismatch, not a
+        // placement choice. Refuse instead of demoting it to host memory
+        // under a device buffer, where attention would read it over PCIe
+        // (the zero-copy route). GGML_SYCL_KV_HOST=1 keeps the old behaviour.
+        if (planned_device_bytes > kv_vram_cap && kv_host_val != 1) {
+            GGML_LOG_ERROR(
+                "[KV-TIER] device %d: device-planned KV %.1f MB exceeds the %.1f MB free for KV, although the "
+                "runtime-context transaction admitted it against that headroom; refusing to place device-planned KV "
+                "in host memory. Reduce -c.\n",
+                device, planned_device_bytes / (1024.0 * 1024.0), kv_vram_cap / (1024.0 * 1024.0));
+            return nullptr;
+        }
         if (planned_device_bytes > kv_vram_cap) {
             size_t   replanned_device_bytes = 0;
             uint32_t demoted_layers         = 0;
@@ -38607,6 +38621,43 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     }
     ggml_sycl_log_load_summary(device, planned_kv_device, planned_kv_host, planned_device_layers, planned_host_layers,
                                "planned");
+
+    // Demoted KV belongs in the SYCL_KV_Host buffer type, whose attention the
+    // scheduler gives to the CPU. Host memory inside THIS device buffer is
+    // read by device kernels over PCIe (the zero-copy route), so it is only
+    // allowed under an explicit debug override, and then never silently.
+    // Counted exactly as the allocation loop below decides each layer: the
+    // plan's KV owner when there is a plan (another device's layer is
+    // allocated on that device, not in host memory), else the tier layout.
+    uint32_t host_kv_layers = 0;
+    size_t   host_kv_bytes  = 0;
+    for (uint32_t l = 0; l < n_layers && l < layout.size(); ++l) {
+        if (!layer_in_this_kv_buffer(l) || layout[l].size == 0) {
+            continue;
+        }
+        const int owner = kv_plan ? kv_plan->get_kv_device(static_cast<int>(l)) : (layout[l].on_device ? device : -1);
+        if (owner < 0 || kv_host_val == 1) {
+            host_kv_layers++;
+            host_kv_bytes += layout[l].size;
+        }
+    }
+    const bool host_kv_override =
+        kv_host_val == 1 || hot_pct_env != nullptr || std::getenv("GGML_SYCL_KV_HOT_LAYERS") != nullptr;
+    if (host_kv_layers > 0) {
+        if (!host_kv_override) {
+            GGML_LOG_ERROR(
+                "[KV-TIER] device %d: %u KV layer(s) (%.1f MB) of this device KV buffer would live in host memory "
+                "and be read by device kernels over PCIe; refusing. Demoted KV must be placed in SYCL_KV_Host by "
+                "the runtime-context transaction.\n",
+                device, host_kv_layers, host_kv_bytes / (1024.0 * 1024.0));
+            return nullptr;
+        }
+        GGML_LOG_WARN(
+            "[KV-TIER] device %d: %u KV layer(s) (%.1f MB) of this device KV buffer are in host memory by debug "
+            "override (GGML_SYCL_KV_HOST / GGML_SYCL_KV_HOT_PCT / GGML_SYCL_KV_HOT_LAYERS); device kernels read "
+            "them over PCIe\n",
+            device, host_kv_layers, host_kv_bytes / (1024.0 * 1024.0));
+    }
 
     const bool all_layers_on_device =
         std::all_of(layout.begin(), layout.end(), [&](const ggml_sycl::layer_region & region) {
