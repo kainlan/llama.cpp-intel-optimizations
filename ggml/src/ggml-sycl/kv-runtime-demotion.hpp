@@ -97,10 +97,18 @@ size_t kv_device_demand(const std::vector<int> &    kv_device,
 //    shape while the first one's KV is allocated) no longer fits the published
 //    residency: demand[i] (kv_device_demand() of it) exceeds the live headroom
 //    available[i] on some device.
-// A context that was already admitted keeps its residency on a same-shape
-// republish (the auto micro-batch trial) even when demand exceeds the live
-// headroom, because its own KV is already allocated and taken out of that
-// headroom; re-fitting would demote KV that already sits on the device.
+// An admitted context never re-fits on a same-shape republish (the auto
+// micro-batch trial): live available already excludes this context's own
+// allocated KV, so comparing its demand against it would demote KV that is
+// already resident and contradict its own buffer.
+//
+// An admitted context whose shape changes would re-fit with its old KV still
+// counted as used. llama_context fixes n_ctx, n_seq_max, kv_unified and
+// swa_full before its first publish and never republishes another shape, so
+// that case is unreachable for a single context; the runtime-context
+// transaction WARNs if it ever happens. Constructing two contexts on one device
+// with interleaved publishes can reach it: that is same-device concurrent
+// contexts, which are unsupported (canonical memory contract §5).
 bool kv_residency_needs_refit(const kv_shape &            published,
                               const kv_shape &            next,
                               bool                        context_admitted,
@@ -112,6 +120,23 @@ bool kv_residency_needs_refit(const kv_shape &            published,
 // refuses rather than silently demoting (llama.cpp-17ea).
 inline bool kv_admission_mismatch(size_t planned_device_bytes, size_t kv_vram_cap) {
     return planned_device_bytes > kv_vram_cap;
+}
+
+// Where the tiered KV allocator puts one layer of a KV buffer created for
+// `device`: the device whose VRAM holds it, or -1 for host memory. With a plan
+// that is the plan's KV owner, so a layer another device owns is in that
+// device's VRAM, not host memory; without one, the tier layout decides.
+// force_host (GGML_SYCL_KV_HOST=1) puts every layer in host memory. The
+// allocation loop, the host-memory refusal and the load summary all count by
+// this.
+inline int kv_buffer_layer_owner(bool have_plan, int plan_owner, bool layout_on_device, int device, bool force_host) {
+    if (force_host) {
+        return -1;
+    }
+    if (have_plan) {
+        return plan_owner;
+    }
+    return layout_on_device ? device : -1;
 }
 
 // Runtime KV residency for a new KV shape.

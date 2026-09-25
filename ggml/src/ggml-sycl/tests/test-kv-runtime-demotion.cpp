@@ -30,6 +30,7 @@
 
 using ggml_sycl::kv_admission_mismatch;
 using ggml_sycl::kv_alloc_slack_per_layer;
+using ggml_sycl::kv_buffer_layer_owner;
 using ggml_sycl::kv_demotion_input;
 using ggml_sycl::kv_demotion_result;
 using ggml_sycl::kv_device_demand;
@@ -380,6 +381,16 @@ int main() {
               "case 19: a new context that still fits keeps the residency");
         CHECK(kv_residency_needs_refit(shape, shape, false, demand, tight),
               "case 19: a new context that does not fit re-fits");
+    }
+    // 20. A layer of device 0's KV buffer that the plan gives to device 1 is in
+    // device 1's VRAM, although device 0's tier layout marks it off-device.
+    {
+        CHECK(kv_buffer_layer_owner(true, 1, false, 0, false) == 1,
+              "case 20: another device's layer is device VRAM, not host memory");
+        CHECK(kv_buffer_layer_owner(true, 0, true, 0, false) == 0, "case 20: this device's layer");
+        CHECK(kv_buffer_layer_owner(true, -1, true, 0, false) == -1, "case 20: a demoted layer is host memory");
+        CHECK(kv_buffer_layer_owner(false, -1, true, 0, false) == 0, "case 20: without a plan the layout decides");
+        CHECK(kv_buffer_layer_owner(true, 0, true, 0, true) == -1, "case 20: GGML_SYCL_KV_HOST=1 is host memory");
     }
     std::printf("test-kv-runtime-demotion: all ok\n");
     return 0;

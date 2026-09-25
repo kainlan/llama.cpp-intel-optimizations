@@ -17670,9 +17670,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // KV allocator places against, so a KV buffer this transaction admits is
     // never resized behind its back. Overflow re-places that device's latest
     // full-attention layers to the host tier, where llama_kv_cache allocates
-    // them in SYCL_KV_Host. Which processor then runs their attention is
-    // llama.cpp-mnqa's open question: measured on the split, prefill attention
-    // still runs on the GPU reading that host KV over PCIe (llama.cpp-qx1r).
+    // them in SYCL_KV_Host. supports_op declines any op with a SYCL_KV_Host
+    // operand unless GGML_SYCL_ATTN_HOST_DISPATCH is set, so the scheduler
+    // runs their KV writes and attention on the CPU backend, in extra graph
+    // splits. Whether that is the right executor is llama.cpp-mnqa's question;
+    // host KV left inside a device KV buffer is instead read by the GPU over
+    // PCIe (llama.cpp-qx1r).
     //
     // Two live contexts: the later publish replaces kv_device for everyone.
     // An earlier context's KV buffers keep the layout they were allocated
@@ -17714,9 +17717,26 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     if (ggml_sycl::kv_residency_needs_refit(published_shape, next_shape, ctx->runtime_kv_admitted, published_demand,
                                             in.available)) {
         const bool shape_changed = ggml_sycl::kv_shape_changed(published_shape, next_shape);
-        GGML_LOG_INFO("[SYCL-PLAN] %sKV residency re-fit for n_ctx=%u: %s\n", probe_mode ? "probe: " : "", n_ctx,
-                      shape_changed ? "KV shape changed" :
-                                      "a new context no longer fits the published residency in the live headroom");
+        if (shape_changed && ctx->runtime_kv_admitted) {
+            // Unreachable for a single context (see kv_residency_needs_refit): its
+            // own KV is still allocated, so the headroom below counts it as
+            // used and the re-fit may demote more than it needs to.
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] KV shape changed for a context whose KV is already allocated (n_ctx %u -> %u); "
+                "the re-fit counts that KV as used\n",
+                published_shape.n_ctx, n_ctx);
+        }
+        if (shape_changed) {
+            GGML_LOG_INFO("[SYCL-PLAN] %sKV residency re-fit for n_ctx=%u: KV shape changed\n",
+                          probe_mode ? "probe: " : "", n_ctx);
+        } else {
+            // WARN, not INFO: default verbosity drops INFO in every tool, and
+            // this is the only sign that a second context was re-placed.
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] %sKV residency re-fit for n_ctx=%u: a new context no longer fits the published "
+                "residency in the live headroom\n",
+                probe_mode ? "probe: " : "", n_ctx);
+        }
         next_plan.kv_device = next_plan.load_kv_device;
         next_plan.refresh_kv_byte_totals();
         const size_t                         n_layers  = n_kv_layers;
@@ -38601,23 +38621,32 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         }
     }
 
+    // Counted exactly as the allocation loop below places each layer
+    // (kv_buffer_layer_owner): a layer another device owns is in that
+    // device's VRAM, not host memory.
     uint32_t planned_device_layers = 0;
-    uint32_t planned_buffer_layers = 0;
+    uint32_t host_kv_layers        = 0;
     size_t   planned_kv_device     = 0;
-    for (const auto & region : layout) {
-        if (!layer_in_this_kv_buffer(region.layer_id)) {
+    size_t   host_kv_bytes         = 0;
+    for (uint32_t l = 0; l < n_layers && l < layout.size(); ++l) {
+        if (!layer_in_this_kv_buffer(l) || layout[l].size == 0) {
             continue;
         }
-        planned_buffer_layers++;
-        if (region.on_device) {
+        const int owner = ggml_sycl::kv_buffer_layer_owner(kv_plan != nullptr,
+                                                           kv_plan ? kv_plan->get_kv_device(static_cast<int>(l)) : -1,
+                                                           layout[l].on_device, device, kv_host_val == 1);
+        if (owner >= 0) {
             planned_device_layers++;
-            planned_kv_device += region.size;
+            planned_kv_device += layout[l].size;
+        } else {
+            host_kv_layers++;
+            host_kv_bytes += layout[l].size;
         }
     }
-    planned_kv_device = std::min<size_t>(planned_kv_device, size);
-    const uint32_t planned_host_layers =
-        planned_buffer_layers > planned_device_layers ? planned_buffer_layers - planned_device_layers : 0;
-    const size_t planned_kv_host = size > planned_kv_device ? size - planned_kv_device : 0;
+    planned_kv_device                    = std::min<size_t>(planned_kv_device, size);
+    const uint32_t planned_host_layers   = host_kv_layers;
+    const uint32_t planned_buffer_layers = planned_device_layers + planned_host_layers;
+    const size_t   planned_kv_host       = size > planned_kv_device ? size - planned_kv_device : 0;
     if (planned_kv_host > 0 && plan_cache && plan_cache->host_zones_configured()) {
         const size_t used = plan_cache->host_zone_used(ggml_sycl::host_zone_id::KV);
         const size_t cap  = plan_cache->host_zone_capacity(ggml_sycl::host_zone_id::KV);
@@ -38641,21 +38670,6 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     // scheduler gives to the CPU. Host memory inside THIS device buffer is
     // read by device kernels over PCIe (the zero-copy route), so it is only
     // allowed under an explicit debug override, and then never silently.
-    // Counted exactly as the allocation loop below decides each layer: the
-    // plan's KV owner when there is a plan (another device's layer is
-    // allocated on that device, not in host memory), else the tier layout.
-    uint32_t host_kv_layers = 0;
-    size_t   host_kv_bytes  = 0;
-    for (uint32_t l = 0; l < n_layers && l < layout.size(); ++l) {
-        if (!layer_in_this_kv_buffer(l) || layout[l].size == 0) {
-            continue;
-        }
-        const int owner = kv_plan ? kv_plan->get_kv_device(static_cast<int>(l)) : (layout[l].on_device ? device : -1);
-        if (owner < 0 || kv_host_val == 1) {
-            host_kv_layers++;
-            host_kv_bytes += layout[l].size;
-        }
-    }
     const bool host_kv_override =
         kv_host_val == 1 || hot_pct_env != nullptr || std::getenv("GGML_SYCL_KV_HOT_LAYERS") != nullptr;
     if (host_kv_layers > 0) {
@@ -38832,13 +38846,14 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         if (!layer_in_this_kv_buffer(l) || layer_size == 0) {
             continue;
         }
-        const int  planned_owner        = kv_plan ? kv_plan->get_kv_device(static_cast<int>(l)) :
-                                                    ((l < layout.size() && layout[l].on_device) ? device : -1);
+        const int planned_owner = ggml_sycl::kv_buffer_layer_owner(
+            kv_plan != nullptr, kv_plan ? kv_plan->get_kv_device(static_cast<int>(l)) : -1,
+            l < layout.size() && layout[l].on_device, device, kv_host_val == 1);
         const bool planned_device_layer = planned_owner >= 0;
         char       tag[64];
         snprintf(tag, sizeof(tag), "kv_tier:layer_%u", l);
 
-        if (planned_device_layer && kv_host_val != 1 && (!kv_plan || total_device + layer_size <= kv_device_budget)) {
+        if (planned_device_layer && (!kv_plan || total_device + layer_size <= kv_device_budget)) {
             // P5: Prefer arena KV zone for device layers — avoids individual
             // sycl::malloc_device calls during context creation.
             const bool owner_is_buffer_device = planned_owner == device;
