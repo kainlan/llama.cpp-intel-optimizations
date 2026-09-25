@@ -89436,7 +89436,6 @@ class ggml_sycl_block_exec_dense_run {
     // Each pool's graph-retained count when the open recording began.
     std::vector<std::pair<ggml_sycl_pool *, size_t>>                        pool_baseline_;
 
-
     // Identity of everything the recorded graphs of this plan bake besides
     // the per-range facts: the cut, the slice layout, and each arena. A new
     // plan drops the arenas, so it changes the arena identities too.
