@@ -7,6 +7,7 @@
 // passes its own slot and owner types; each carries a movable owning handle
 // with valid().
 
+#include <cassert>
 #include <cstddef>
 #include <unordered_map>
 #include <utility>
@@ -33,8 +34,10 @@ enum class pool_legacy_release_result {
 // and released when the graph is dropped, as the arena path does.
 //
 // A DROPPED owner is moved into dropped rather than released here, so the
-// caller can release it (a unified-cache free) after unlocking whatever guards
-// these containers.
+// caller can release it (a unified-cache free) outside the lock that guards
+// graph_retained. dropped must be empty on entry. The free-list containers
+// (slots, active) are not guarded by that lock: pool_leg's arena-off alloc()
+// reads and writes them unlocked, relying on one thread driving each pool.
 template <typename Slot, typename Owned, typename Handle>
 pool_legacy_release_result pool_legacy_release(void *                              ptr,
                                                bool                                graph_recording,
@@ -44,6 +47,7 @@ pool_legacy_release_result pool_legacy_release(void *                           
                                                std::vector<Handle> &               graph_retained,
                                                Handle &                            dropped,
                                                size_t &                            pool_size) {
+    assert(!dropped.valid());
     auto it = active.find(ptr);
     // Ownership must have been retained at allocation time. A metadata lookup
     // is observation-only and cannot mint it here.
@@ -52,8 +56,9 @@ pool_legacy_release_result pool_legacy_release(void *                           
     }
 
     if (graph_recording) {
-        pool_size -= it->second.size;
+        // Push first: if it throws, the block is still active and counted.
         graph_retained.push_back(std::move(it->second.handle));
+        pool_size -= it->second.size;
         active.erase(it);
         return pool_legacy_release_result::GRAPH_RETAINED;
     }

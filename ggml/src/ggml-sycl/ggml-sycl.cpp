@@ -42900,7 +42900,8 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                 ggml_sycl::pool_legacy_release(ptr, ggml_sycl_graph_recording_active(), buffer_pool, MAX_SYCL_BUFFERS,
                                                active_handles, graph_retained_handles, dropped, pool_size);
         }
-        // dropped's owner is released after unlocking, as the arena path does.
+        // Released outside the lock, like the arena path's owner. Unlike the
+        // arena path, this release is immediate, not deferred to a marker event.
         dropped = {};
         if (released == ggml_sycl::pool_legacy_release_result::MISSING_OWNER) {
             GGML_ASSERT(false && "device pool free without unified allocation mem_handle");

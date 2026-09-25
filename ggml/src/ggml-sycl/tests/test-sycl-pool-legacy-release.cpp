@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,13 +19,24 @@ using namespace ggml_sycl;
 namespace {
 
 struct counted_handle {
+    // Makes the next move construction throw before it takes ownership, the
+    // way a failed push_back leaves its argument untouched.
+    static bool fail_next_move;
+
     int * live = nullptr;
 
     counted_handle() = default;
 
     explicit counted_handle(int * live_) : live(live_) { ++*live; }
 
-    counted_handle(counted_handle && other) noexcept : live(other.live) { other.live = nullptr; }
+    counted_handle(counted_handle && other) : live(other.live) {
+        if (fail_next_move) {
+            fail_next_move = false;
+            live           = nullptr;
+            throw std::runtime_error("move failed");
+        }
+        other.live = nullptr;
+    }
 
     counted_handle & operator=(counted_handle && other) noexcept {
         if (this != &other) {
@@ -46,6 +58,8 @@ struct counted_handle {
 
     bool valid() const { return live != nullptr; }
 };
+
+bool counted_handle::fail_next_move = false;
 
 struct slot {
     void *         ptr  = nullptr;
@@ -166,6 +180,29 @@ void test_full_free_list_during_recording_is_retained_not_dropped() {
     check(pool.pool_size == kSlots * 256, "full free list: pool accounting is off");
 }
 
+// If parking the owner throws, the block must stay active and counted, so the
+// pool's accounting still balances when it is torn down.
+void test_failed_retain_leaves_the_block_accounted() {
+    legacy_pool pool;
+    void *      ptr = pool.alloc(0x5000, 1024);
+
+    counted_handle::fail_next_move = true;
+    bool threw                     = false;
+    try {
+        pool.release(ptr, true);
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    counted_handle::fail_next_move = false;
+
+    check(threw, "failed retain: the injected failure did not reach the caller");
+    check(pool.graph_retained.empty(), "failed retain: a handle was parked anyway");
+    check(pool.active.count(ptr) == 1 && pool.active[ptr].handle.valid(),
+          "failed retain: the block is no longer tracked as active");
+    check(pool.pool_size == 1024, "failed retain: pool accounting dropped a block that is still active");
+    check(pool.live == 1, "failed retain: the owner was released");
+}
+
 // A free the pool never handed out has no owner to route; the caller asserts.
 void test_free_without_owner_fails_closed() {
     for (bool recording : { false, true }) {
@@ -184,6 +221,7 @@ int main() {
     test_free_outside_recording_is_cached();
     test_free_during_recording_is_retained_with_the_graph();
     test_full_free_list_during_recording_is_retained_not_dropped();
+    test_failed_retain_leaves_the_block_accounted();
     test_free_without_owner_fails_closed();
 
     if (failures != 0) {

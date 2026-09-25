@@ -96,8 +96,31 @@ def pool_leg_violations(source: str) -> list[str]:
                 f"free() passes `{calls[0]}` as graph_recording, not ggml_sycl_graph_recording_active() -- "
                 "a block freed during graph recording would go back on the free list"
             )
-        if re.search(r"buffer_pool\s*\[", free_code):
-            found.append("free() writes buffer_pool directly instead of through pool_legacy_release()")
+        # The one buffer_pool token allowed is the helper's slots argument;
+        # any other (an index, a range-for) touches the free list directly.
+        if len(re.findall(r"\bbuffer_pool\b", free_code)) != 1 or not re.search(
+            r"ggml_sycl::pool_legacy_release\(\s*ptr\s*,[^,]+,\s*buffer_pool\s*,", free_code
+        ):
+            found.append("free() uses buffer_pool other than as pool_legacy_release()'s slots argument")
+
+        # The dropped owner is released (a unified-cache free) after the lock
+        # scope around the helper call closes, not inside it.
+        call_at = free_code.find("ggml_sycl::pool_legacy_release(")
+        lock_block_end = -1
+        for m in re.finditer(r"\{\s*std::lock_guard<std::mutex>\s+lock\(arena_handles_mutex\);", free_code):
+            end = matching_brace(free_code, m.start())
+            if m.start() < call_at < end:
+                lock_block_end = end
+                break
+        if lock_block_end < 0:
+            found.append("free() does not call pool_legacy_release() inside a lock_guard block")
+        else:
+            releases = [m.start() for m in re.finditer(r"\bdropped\s*=\s*\{\s*\}\s*;", free_code)]
+            if len(releases) != 1 or releases[0] < lock_block_end:
+                found.append(
+                    "free() does not release dropped (`dropped = {};`) exactly once after the lock block closes -- "
+                    "the unified-cache free would run under arena_handles_mutex"
+                )
 
     if DTOR_FN not in pool_leg:
         found.append("pool_leg has no destructor")
@@ -145,3 +168,27 @@ def test_destructor_mutation_is_witnessed() -> None:
     assert any("release_graph_retained() before" in v for v in violations), (
         f"mutation was not witnessed: {violations}"
     )
+
+
+def test_free_list_bypass_mutation_is_witnessed() -> None:
+    """Touch the free list with a range-for, which an index-only check missed."""
+    source = SOURCE.read_text()
+    anchor = "        ggml_sycl::mem_handle                 dropped;\n"
+    assert source.count(anchor) == 1, "bypass mutation anchor not found"
+    mutated = source.replace(anchor, "        for (auto & b : buffer_pool) {\n            (void) b;\n        }\n" + anchor, 1)
+    violations = pool_leg_violations(mutated)
+    assert any("slots argument" in v for v in violations), f"mutation was not witnessed: {violations}"
+
+
+def test_release_under_lock_mutation_is_witnessed() -> None:
+    """Move `dropped = {};` inside the lock block."""
+    source = SOURCE.read_text()
+    call_end = "active_handles, graph_retained_handles, dropped, pool_size);\n"
+    assert source.count(call_end) == 1, "lock mutation anchor not found"
+    mutated = source.replace(call_end, call_end + "            dropped = {};\n", 1)
+    mutated = re.sub(r"(\n        \}\n(?:        //[^\n]*\n)*)        dropped = \{\};\n", r"\1", mutated, count=1)
+    assert mutated != source and mutated.count("dropped = {};") == source.count("dropped = {};"), (
+        "lock mutation did not move the release"
+    )
+    violations = pool_leg_violations(mutated)
+    assert any("after the lock block closes" in v for v in violations), f"mutation was not witnessed: {violations}"
