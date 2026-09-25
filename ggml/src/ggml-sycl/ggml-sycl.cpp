@@ -88864,6 +88864,25 @@ struct ggml_sycl_block_exec_dense_state {
     ggml_sycl::mem_handle                          arena[GGML_SYCL_MAX_DEVICES];
     size_t                                         arena_bytes[GGML_SYCL_MAX_DEVICES] = {};
 
+    // The last plan prepared, reused while the graph is the same one: decode
+    // rebuilds an identical graph every token. The key is the placement plan,
+    // the arenas, the graph signature and the host tensor structs -- each
+    // node, its view_src and its sources, compared element-wise. The slices
+    // are views of the arenas, so the entry is replaced on any miss and
+    // dropped with any arena.
+    struct prepared_plan {
+        std::weak_ptr<const ggml_sycl::placement_plan> owner;
+        uint64_t                                       signature                             = 0;
+        size_t                                         arena_identity[GGML_SYCL_MAX_DEVICES] = {};
+        size_t                                         arena_bytes[GGML_SYCL_MAX_DEVICES]    = {};
+        std::vector<const ggml_tensor *>               tensors;  // per node: node, view_src, src[0..GGML_MAX_SRC)
+        ggml_sycl::dense_exec_plan                     plan;
+        std::vector<ggml_tensor *>                     roots;
+        std::vector<ggml_sycl::mem_handle>             slices;
+    };
+
+    std::optional<prepared_plan> prepared;
+
 #ifdef GGML_SYCL_GRAPH
     // One recorded command graph per range of a decode graph, replayed on the
     // range's own device queue. A graph bakes raw pointers, so it holds every
@@ -88908,6 +88927,7 @@ struct ggml_sycl_block_exec_dense_state {
         } catch (const std::exception & e) {
             GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] drain before arena release failed on device %d: %s", device, e.what());
         }
+        prepared.reset();  // its slices view this arena
         arena[device]       = ggml_sycl::mem_handle{};
         arena_bytes[device] = 0;
     }
@@ -88995,6 +89015,8 @@ static void ggml_sycl_block_exec_dense_release(ggml_backend_sycl_context * ctx) 
         state->drop_arena(*ctx, d);
     }
 }
+
+static uint64_t ggml_sycl_graph_signature(const ggml_cgraph * cgraph);
 
 #ifdef GGML_SYCL_GRAPH
 static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph);
@@ -89108,6 +89130,7 @@ class ggml_sycl_block_exec_dense_run {
             // Nothing has run on another device yet: the rest of the graph
             // takes the per-op path on the backend's device.
             restore(range_publications_);
+            ggml_sycl_block_exec_dense_state_for(ctx_).prepared.reset();
             ranges_.resize(static_cast<size_t>(idx) + 1);
             ranges_.back().end      = cgraph_->n_nodes;
             ranges_.back().device   = original_device_;
@@ -89266,6 +89289,8 @@ class ggml_sycl_block_exec_dense_run {
     std::vector<ggml_sycl::dense_exec_range>         ranges_;
     std::vector<ggml_tensor *>                       roots_;
     std::vector<ggml_sycl::mem_handle>               slices_;
+    enum class plan_cache_result { NONE, HIT, MISS };
+    plan_cache_result                                plan_cache_ = plan_cache_result::NONE;
     ggml_cgraph                                      view_{};
     publications                                     range_publications_;
     publications                                     graph_publications_;
@@ -89699,6 +89724,21 @@ class ggml_sycl_block_exec_dense_run {
             return gate;
         }
 
+        ggml_sycl_block_exec_dense_state & st        = ggml_sycl_block_exec_dense_state_for(ctx_);
+        const uint64_t                     signature = ggml_sycl_graph_signature(cgraph_);
+        if (reuse_prepared(st, plan_owner, signature)) {
+            plan_cache_ = plan_cache_result::HIT;
+            check_queue_order(original_device_);
+            for (const ggml_sycl::dense_exec_range & range : plan_.ranges) {
+                check_queue_order(range.device);
+            }
+            ranges_ = plan_.ranges;
+            trace_prepare();
+            return ggml_sycl::DENSE_EXEC_GATE_NONE;
+        }
+        plan_cache_ = plan_cache_result::MISS;
+        st.prepared.reset();
+
         // The node loop's MoE direct-dispatch state indexes the whole graph;
         // a range view would corrupt it. Dense means no MUL_MAT_ID at all.
         for (int i = 0; i < cgraph_->n_nodes; ++i) {
@@ -89732,6 +89772,78 @@ class ggml_sycl_block_exec_dense_run {
             return ggml_sycl::DENSE_EXEC_GATE_PREPARE_FAILED;
         }
         ranges_ = plan_.ranges;
+        store_prepared(st, plan_owner, signature);
+        trace_prepare();
+        return ggml_sycl::DENSE_EXEC_GATE_NONE;
+    }
+
+    // True when the cache entry was prepared for this graph, placement plan
+    // and arenas; plan_, roots_ and slices_ are then taken from it.
+    bool reuse_prepared(const ggml_sycl_block_exec_dense_state &                 state,
+                        const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner,
+                        uint64_t                                                 signature) {
+        if (!state.prepared) {
+            return false;
+        }
+        const ggml_sycl_block_exec_dense_state::prepared_plan & p = *state.prepared;
+        if (p.owner.owner_before(plan_owner) || plan_owner.owner_before(p.owner) || p.owner.expired() ||
+            p.signature != signature) {
+            return false;
+        }
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            const size_t identity = state.arena[d].valid() ? state.arena[d].stable_identity_hash() : 0;
+            if (p.arena_identity[d] != identity || p.arena_bytes[d] != state.arena_bytes[d]) {
+                return false;
+            }
+        }
+        const size_t stride = 2 + GGML_MAX_SRC;
+        if (p.tensors.size() != static_cast<size_t>(cgraph_->n_nodes) * stride) {
+            return false;
+        }
+        for (int i = 0; i < cgraph_->n_nodes; ++i) {
+            const ggml_tensor *         node = cgraph_->nodes[i];
+            const ggml_tensor * const * t    = p.tensors.data() + static_cast<size_t>(i) * stride;
+            if (t[0] != node || t[1] != node->view_src) {
+                return false;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (t[2 + s] != node->src[s]) {
+                    return false;
+                }
+            }
+        }
+        plan_   = p.plan;
+        roots_  = p.roots;
+        slices_ = p.slices;
+        return true;
+    }
+
+    void store_prepared(ggml_sycl_block_exec_dense_state &                       state,
+                        const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner,
+                        uint64_t                                                 signature) const {
+        ggml_sycl_block_exec_dense_state::prepared_plan p{};
+        p.owner     = plan_owner;
+        p.signature = signature;
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            p.arena_identity[d] = state.arena[d].valid() ? state.arena[d].stable_identity_hash() : 0;
+            p.arena_bytes[d]    = state.arena_bytes[d];
+        }
+        p.tensors.reserve(static_cast<size_t>(cgraph_->n_nodes) * (2 + GGML_MAX_SRC));
+        for (int i = 0; i < cgraph_->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph_->nodes[i];
+            p.tensors.push_back(node);
+            p.tensors.push_back(node->view_src);
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                p.tensors.push_back(node->src[s]);
+            }
+        }
+        p.plan         = plan_;
+        p.roots        = roots_;
+        p.slices       = slices_;
+        state.prepared = std::move(p);
+    }
+
+    void trace_prepare() const {
         if (ggml_sycl_block_exec_plan_trace_enabled()) {
             size_t n_stage = 0, n_publish = 0, n_copy_out = 0;
             for (const auto & io : plan_.io) {
@@ -89754,7 +89866,6 @@ class ggml_sycl_block_exec_dense_run {
             }
             fflush(stderr);
         }
-        return ggml_sycl::DENSE_EXEC_GATE_NONE;
     }
 
     void gather_facts(ggml_sycl::dense_exec_graph & g) {
@@ -89879,9 +89990,12 @@ class ggml_sycl_block_exec_dense_run {
             gate_ == ggml_sycl::DENSE_EXEC_GATE_DISABLED) {
             return;
         }
-        fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE-RESULT] graph nodes=%d executor=%s gate=%s ranges=%zu\n",
+        const char * plan_cache = plan_cache_ == plan_cache_result::HIT  ? "hit" :
+                                  plan_cache_ == plan_cache_result::MISS ? "miss" :
+                                                                           "none";
+        fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE-RESULT] graph nodes=%d executor=%s gate=%s ranges=%zu plan_cache=%s\n",
                 cgraph_->n_nodes, gate_ == ggml_sycl::DENSE_EXEC_GATE_NONE ? "executed" : "inactive",
-                ggml_sycl::dense_exec_gate_name(gate_), ranges_.size());
+                ggml_sycl::dense_exec_gate_name(gate_), ranges_.size(), plan_cache);
         fflush(stderr);
     }
 };
