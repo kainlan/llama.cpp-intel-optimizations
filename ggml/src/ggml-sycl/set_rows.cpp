@@ -11,10 +11,6 @@
 #include <utility>
 #include <vector>
 
-// True while the dense block executor runs a node range on that range's own
-// device (llama.cpp-tf8m). Defined in ggml-sycl.cpp.
-bool ggml_sycl_block_exec_dense_active();
-
 static constexpr int GGML_SYCL_SET_ROWS_UNKNOWN_DEVICE_USM = -2;
 
 static ggml_sycl_profile_label make_set_rows_profile_label(sycl::queue & queue,

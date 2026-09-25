@@ -2825,6 +2825,16 @@ struct ggml_sycl_pool {
     virtual void   free(void * ptr, size_t size)            = 0;
 
     virtual void release_graph_retained() {}
+
+    // Scratch freed under graph recording that this pool retains; a range
+    // graph moves what it freed into its own retained handles.
+    virtual size_t graph_retained_count() { return 0; }
+
+    virtual size_t take_graph_retained_since(size_t baseline, std::vector<ggml_sycl::mem_handle> & out) {
+        (void) baseline;
+        (void) out;
+        return 0;
+    }
 };
 
 // Allocation tracing (optional). Enable with GGML_SYCL_ALLOC_TRACE=1.
@@ -5644,6 +5654,9 @@ inline sycl::queue * ggml_sycl_execution_queue_for_device(int device) {
     return nullptr;
 }
 
+// Kernel name for the marker that retires a grown MMVQ Q8 activation backing.
+struct ggml_sycl_mmvq_q8_retire_marker_kernel;
+
 struct ggml_backend_sycl_context {
     // Retained by MMID queue capabilities so an exact queue binding cannot
     // outlive the backend context that selected it.
@@ -6557,50 +6570,74 @@ struct ggml_backend_sycl_context {
     // Per-context Q8_1 activation cache for repeated MMVQ inputs.
     // This is scratch reuse, not weight ownership: unified cache owns the
     // backing allocation and the mem_handle is the stable identity.
+    // One backing and one cached entry per device: a dense split runs MMVQ on
+    // several devices in one graph (llama.cpp-tf8m), and a single backing was
+    // reallocated at every device switch, so its pointer never stayed put.
     struct mmvq_q8_activation_cache_t {
-        ggml_sycl::mem_handle backing_handle;
-        size_t                backing_capacity = 0;
-        int                   backing_device   = -1;
+        struct slot_t {
+            ggml_sycl::mem_handle backing_handle;
+            size_t                backing_capacity = 0;
 
-        void *                cached_q8_1        = nullptr;
-        const ggml_tensor *   cached_tensor      = nullptr;
-        ggml_sycl::mem_handle cached_src_handle  = {};
-        size_t                cached_src_identity = 0;
-        size_t                cached_src_offset   = 0;
-        int64_t               cached_ne10         = 0;
-        int64_t               cached_rows         = 0;
-        int64_t               cached_padded       = 0;
-        size_t                cached_size         = 0;
-        bool                  cached_soa_y        = false;
-        bool                  valid               = false;
+            void *                cached_q8_1         = nullptr;
+            const ggml_tensor *   cached_tensor       = nullptr;
+            ggml_sycl::mem_handle cached_src_handle   = {};
+            size_t                cached_src_identity = 0;
+            size_t                cached_src_offset   = 0;
+            int64_t               cached_ne10         = 0;
+            int64_t               cached_rows         = 0;
+            int64_t               cached_padded       = 0;
+            size_t                cached_size         = 0;
+            bool                  cached_soa_y        = false;
+            bool                  valid               = false;
+
+            void invalidate() {
+                cached_tensor       = nullptr;
+                cached_src_handle   = {};
+                cached_src_identity = 0;
+                cached_src_offset   = 0;
+                cached_ne10         = 0;
+                cached_rows         = 0;
+                cached_padded       = 0;
+                cached_size         = 0;
+                cached_soa_y        = false;
+                valid               = false;
+            }
+        };
+
+        std::array<slot_t, GGML_SYCL_MAX_DEVICES> slots;
+
+        slot_t & slot(int device) {
+            GGML_ASSERT(device >= 0 && device < GGML_SYCL_MAX_DEVICES);
+            return slots[device];
+        }
+
+        const slot_t & slot(int device) const {
+            GGML_ASSERT(device >= 0 && device < GGML_SYCL_MAX_DEVICES);
+            return slots[device];
+        }
 
         void invalidate() {
-            cached_tensor      = nullptr;
-            cached_src_handle  = {};
-            cached_src_identity = 0;
-            cached_src_offset   = 0;
-            cached_ne10         = 0;
-            cached_rows         = 0;
-            cached_padded       = 0;
-            cached_size         = 0;
-            cached_soa_y        = false;
-            valid               = false;
+            for (slot_t & s : slots) {
+                s.invalidate();
+            }
         }
 
         void release() {
-            invalidate();
-            cached_q8_1      = nullptr;
-            backing_handle   = {};
-            backing_capacity = 0;
-            backing_device   = -1;
+            for (slot_t & s : slots) {
+                s.invalidate();
+                s.cached_q8_1      = nullptr;
+                s.backing_handle   = {};
+                s.backing_capacity = 0;
+            }
         }
 
         void * ensure_buffer(size_t required_size, int device, sycl::queue & queue) {
             if (required_size == 0) {
                 return nullptr;
             }
-            if (backing_handle.valid() && backing_capacity >= required_size && backing_device == device) {
-                auto resolved = backing_handle.resolve(device);
+            slot_t & s = slot(device);
+            if (s.backing_handle.valid() && s.backing_capacity >= required_size) {
+                auto resolved = s.backing_handle.resolve(device);
                 return resolved ? resolved.ptr : nullptr;
             }
 
@@ -6626,57 +6663,71 @@ struct ggml_backend_sycl_context {
             if (!resolved.ptr || !resolved.on_device) {
                 return nullptr;
             }
-            backing_handle   = std::move(replacement);
-            backing_capacity = allocation_size;
-            backing_device   = device;
+            if (s.backing_handle.valid()) {
+                // Growth: kernels already queued on this device may still read the
+                // old backing, so it lives until the queue passes this marker.
+                ggml_sycl::retain_handles_until_event(
+                    { std::move(s.backing_handle) },
+                    ggml_sycl_submit_marker<ggml_sycl_mmvq_q8_retire_marker_kernel>(queue));
+            }
+            s.invalidate();
+            s.cached_q8_1      = nullptr;
+            s.backing_handle   = std::move(replacement);
+            s.backing_capacity = allocation_size;
             return resolved.ptr;
         }
 
-        ggml_sycl::mem_handle handle() const { return backing_handle; }
+        ggml_sycl::mem_handle handle(int device) const { return slot(device).backing_handle; }
 
-        bool matches(const ggml_tensor * tensor,
+        void * cached_q8_1(int device) const { return slot(device).cached_q8_1; }
+
+        bool matches(int                           device,
+                     const ggml_tensor *           tensor,
                      const ggml_sycl::mem_handle & src_handle,
-                     size_t                          src_offset,
-                     int64_t                         ne10,
-                     int64_t                         rows,
-                     int64_t                         padded,
-                     size_t                          size,
-                     bool                            soa_y) const {
+                     size_t                        src_offset,
+                     int64_t                       ne10,
+                     int64_t                       rows,
+                     int64_t                       padded,
+                     size_t                        size,
+                     bool                          soa_y) const {
             if (!src_handle.valid()) {
                 return false;
             }
-            const size_t src_identity = src_handle.stable_identity_hash();
-            return valid && cached_tensor == tensor && cached_src_identity == src_identity &&
-                   cached_src_handle.stable_identity_equal(src_handle) && cached_src_offset == src_offset &&
-                   cached_ne10 == ne10 && cached_rows == rows && cached_padded == padded && cached_size >= size &&
-                   cached_soa_y == soa_y;
+            const slot_t & s            = slot(device);
+            const size_t   src_identity = src_handle.stable_identity_hash();
+            return s.valid && s.cached_tensor == tensor && s.cached_src_identity == src_identity &&
+                   s.cached_src_handle.stable_identity_equal(src_handle) && s.cached_src_offset == src_offset &&
+                   s.cached_ne10 == ne10 && s.cached_rows == rows && s.cached_padded == padded &&
+                   s.cached_size >= size && s.cached_soa_y == soa_y;
         }
 
-        void store(const ggml_tensor * tensor,
+        void store(int                           device,
+                   const ggml_tensor *           tensor,
                    const ggml_sycl::mem_handle & src_handle,
-                   size_t                          src_offset,
-                   void *                          q8_1,
-                   int64_t                         ne10,
-                   int64_t                         rows,
-                   int64_t                         padded,
-                   size_t                          size,
-                   bool                            soa_y) {
+                   size_t                        src_offset,
+                   void *                        q8_1,
+                   int64_t                       ne10,
+                   int64_t                       rows,
+                   int64_t                       padded,
+                   size_t                        size,
+                   bool                          soa_y) {
+            slot_t & s = slot(device);
             if (!src_handle.valid()) {
-                invalidate();
-                cached_q8_1 = nullptr;
+                s.invalidate();
+                s.cached_q8_1 = nullptr;
                 return;
             }
-            cached_tensor      = tensor;
-            cached_src_handle  = src_handle;
-            cached_src_identity = src_handle.stable_identity_hash();
-            cached_src_offset   = src_offset;
-            cached_q8_1        = q8_1;
-            cached_ne10        = ne10;
-            cached_rows        = rows;
-            cached_padded      = padded;
-            cached_size        = size;
-            cached_soa_y       = soa_y;
-            valid              = q8_1 != nullptr;
+            s.cached_tensor       = tensor;
+            s.cached_src_handle   = src_handle;
+            s.cached_src_identity = src_handle.stable_identity_hash();
+            s.cached_src_offset   = src_offset;
+            s.cached_q8_1         = q8_1;
+            s.cached_ne10         = ne10;
+            s.cached_rows         = rows;
+            s.cached_padded       = padded;
+            s.cached_size         = size;
+            s.cached_soa_y        = soa_y;
+            s.valid               = q8_1 != nullptr;
         }
     } mmvq_q8_activation_cache;
 

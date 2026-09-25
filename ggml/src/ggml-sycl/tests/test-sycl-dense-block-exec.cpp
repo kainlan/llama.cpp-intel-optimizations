@@ -205,6 +205,99 @@ static void test_precheck_gates() {
     }
 }
 
+// Whether a graph's ranges record or replay command graphs, and the first
+// reason when they do not. The FA gate is the whole-graph decode gate.
+static void test_graph_off_reasons() {
+    dense_graph_facts f{};
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_ENV, "env is the first reason");
+    f.enabled       = true;
+    f.disable_graph = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_DISABLE_GRAPH, "GGML_SYCL_DISABLE_GRAPH");
+    f.disable_graph = false;
+    f.multithreaded = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_MULTITHREADED, "multithreaded compute");
+    f.multithreaded = false;
+    f.disabled      = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_DISABLED, "graphs disabled on the context");
+    f.disabled = false;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NOT_DECODE, "prefill never records");
+    f.is_decode           = true;
+    f.host_inputs_blocked = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_HOST_INPUTS, "host inputs blocked by env");
+    f.host_inputs_blocked = false;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NONE, "a decode graph without FA records");
+
+    f.has_fa = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_FA_UNVERIFIED, "FA with nothing observed");
+    f.fa_observed_safe = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_FA_UNVERIFIED, "FA whose mask/sinks cannot refresh");
+    f.fa_mask_sinks_safe = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NONE, "FA observed safe and refreshable");
+    f.fa_mode = DENSE_GRAPH_FA_FORCE_OFF;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_FA_UNVERIFIED, "force-off wins over observation");
+    f.fa_mode            = DENSE_GRAPH_FA_FORCE_ON;
+    f.fa_observed_safe   = false;
+    f.fa_mask_sinks_safe = false;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NONE, "force-on skips the observation");
+    f.is_decode = false;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NOT_DECODE, "force-on does not reach prefill");
+
+    for (int r = DENSE_GRAPH_OFF_NONE; r <= DENSE_GRAPH_OFF_LAST; ++r) {
+        const char * name = dense_exec_graph_off_name(static_cast<dense_graph_off>(r));
+        check(name != nullptr && std::strcmp(name, "unknown") != 0, "every reason has a name: " + std::to_string(r));
+        for (int q = DENSE_GRAPH_OFF_NONE; q < r; ++q) {
+            check(std::strcmp(name, dense_exec_graph_off_name(static_cast<dense_graph_off>(q))) != 0,
+                  "reason names are distinct: " + std::to_string(r));
+        }
+    }
+}
+
+// A diagnostic env that waits on or reads back from the queue inside the node
+// loop cannot run while that loop is being recorded: the eval would fail. Each
+// keeps the ranges on direct dispatch, ahead of every graph-shape reason.
+static void test_graph_off_debug_envs() {
+    auto decode = [] {
+        dense_graph_facts f{};
+        f.enabled   = true;
+        f.is_decode = true;
+        return f;
+    };
+    check(dense_exec_graph_first_off(decode()) == DENSE_GRAPH_OFF_NONE, "the base facts record");
+
+    dense_graph_facts f = decode();
+    f.safe_mode         = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_SAFE_MODE, "GGML_SYCL_SAFE_MODE");
+    f.disable_graph = true;  // what SAFE_MODE sets at init; the older reason names it
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_DISABLE_GRAPH, "SAFE_MODE's implied disable_graph");
+
+    f           = decode();
+    f.op_timing = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_OP_TIMING, "GGML_SYCL_OP_TIMING");
+
+    f            = decode();
+    f.debug_sync = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_DEBUG_SYNC, "GGML_SYCL_DEBUG_SYNC(_OPS|_NAMES)");
+
+    f           = decode();
+    f.nan_check = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NAN_CHECK, "GGML_SYCL_NAN_CHECK");
+
+    f              = decode();
+    f.tensor_trace = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_TENSOR_TRACE, "tensor readback traces");
+
+    // Ahead of the reasons that depend on the graph: a diagnostic run names
+    // the diagnostic even on prefill or with the context's graphs disabled.
+    f               = decode();
+    f.op_timing     = true;
+    f.is_decode     = false;
+    f.disabled      = true;
+    f.multithreaded = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_OP_TIMING, "a diagnostic outranks the graph reasons");
+    f.enabled = false;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_ENV, "the kill switch still comes first");
+}
+
 // The case the executor exists for: three ranges, layers 2-3 plus the final
 // norm on device 1, the output head back on device 0.
 static void test_split_decode_ranges() {
@@ -464,6 +557,76 @@ static void test_plan_invariants() {
     }
 }
 
+// Each direction of a crossing moves through one host staging buffer per
+// device: its copies pack into disjoint aligned spans, so a range's copies
+// can be submitted together and waited on once.
+static void test_host_stage_layout() {
+    graph_builder b = make_split_graph();
+    for (dense_exec_root & r : b.g.roots) {
+        r.bytes = 1000;
+    }
+    dense_exec_plan p;
+    check(dense_exec_build_plan(b.g, p) == DENSE_EXEC_GATE_NONE, "plans");
+    check(dense_exec_plan_violation(b.g, p) == nullptr, "a built plan is clean");
+    check(!p.io[1].stage_in.empty() && !p.io[1].copy_out.empty(), "range 1 crosses both ways");
+
+    size_t widest = 0;
+    for (const dense_exec_range_io & io : p.io) {
+        check(io.stage_in_host.size() == io.stage_in.size(), "one host offset per staged slice");
+        check(io.copy_out_host.size() == io.copy_out.size(), "one host offset per copy out");
+        size_t expect = 0;
+        for (size_t k = 0; k < io.stage_in.size(); ++k) {
+            check(io.stage_in_host[k] == expect, "staged slices pack in order");
+            check(io.stage_in_host[k] % dense_exec_slice_alignment == 0, "host spans are aligned");
+            expect += dense_exec_align(p.slices[static_cast<size_t>(io.stage_in[k])].bytes);
+        }
+        widest = std::max(widest, expect);
+        expect = 0;
+        for (size_t k = 0; k < io.copy_out.size(); ++k) {
+            check(io.copy_out_host[k] == expect, "copies out pack in order");
+            expect += dense_exec_align(p.slices[static_cast<size_t>(io.copy_out[k].from_slice)].bytes);
+        }
+        widest = std::max(widest, expect);
+    }
+    check(p.host_stage_bytes == widest, "the host buffer holds the widest direction of any range");
+    check(p.io[1].stage_in.size() > 1 && p.host_stage_bytes == 1024 * p.io[1].stage_in.size(),
+          "1000-byte roots take 1024 host bytes each");
+
+    {
+        dense_exec_plan bad            = p;
+        bad.io[1].stage_in_host.back() = bad.io[1].stage_in_host.front();
+        expect_violation(b.g, bad, "host staging spans overlap or leave the buffer");
+    }
+    {
+        dense_exec_plan bad  = p;
+        bad.host_stage_bytes = bad.io[1].stage_in_host.back() + 999;  // one byte short of the last span
+        expect_violation(b.g, bad, "host staging spans overlap or leave the buffer");
+    }
+    {
+        dense_exec_plan bad = p;
+        bad.io[1].copy_out_host.clear();
+        expect_violation(b.g, bad, "host staging spans overlap or leave the buffer");
+    }
+}
+
+// A range graph takes the pool scratch freed while it recorded: only what the
+// pool gained since the recording began, in order, and nothing from before.
+static void test_take_since() {
+    std::vector<int> pool  = { 1, 2, 3, 4, 5 };
+    std::vector<int> graph = { 9 };
+    check(dense_exec_take_since(pool, 2, graph) == 3, "moves the three entries after the baseline");
+    check(pool == std::vector<int>({ 1, 2 }), "the pool keeps what it held before the baseline");
+    check(graph == std::vector<int>({ 9, 3, 4, 5 }), "the graph appends the moved entries in order");
+
+    check(dense_exec_take_since(pool, 2, graph) == 0, "nothing new since the baseline moves nothing");
+    check(pool.size() == 2 && graph.size() == 4, "an empty move changes neither side");
+
+    std::vector<int> drained = { 7 };
+    std::vector<int> other;
+    check(dense_exec_take_since(drained, 3, other) == 1, "a pool drained since the baseline gives up all it holds");
+    check(drained.empty() && other == std::vector<int>({ 7 }), "and it ends empty");
+}
+
 // dev0 | dev1 | dev0 | dev1. Range 1 produces r-1; a device-0 node in range 2
 // writes r-1 in place; range 3 reads r-1 on device 1. Range 3 could only
 // re-publish range 1's device-1 slice -- the value from before the write --
@@ -567,6 +730,10 @@ int main() {
         { "original-range-writes-executor-result",      test_original_range_writes_executor_result           },
         { "violation-original-writes-executor-result",  test_violation_original_range_writes_executor_result },
         { "control-resident-on-executor-is-not-staged", test_control_resident_on_executor_is_not_staged      },
+        { "graph-off-reasons",                          test_graph_off_reasons                               },
+        { "graph-off-debug-envs",                       test_graph_off_debug_envs                            },
+        { "host-stage-layout",                          test_host_stage_layout                               },
+        { "take-since",                                 test_take_since                                      },
     };
 
     int failed = 0;
