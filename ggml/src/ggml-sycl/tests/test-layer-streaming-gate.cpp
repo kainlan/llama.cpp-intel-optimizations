@@ -173,6 +173,19 @@ int main() {
         CHECK_GATE(layer_streaming_gate_decide(in), layer_streaming_gate::OFF_FITS, "case 9: fits");
     }
 
+    // 10. MoE on a resident multi-device split: the MoE exclusion decides
+    //     first, so the answer is off-moe, not off-plan-resident.
+    {
+        layer_streaming_gate_inputs in;
+        in.is_moe            = true;
+        in.model_bytes       = 12000 * MB;
+        in.weight_budget     = 8000 * MB;
+        in.plan_multi_device = true;
+        in.residency         = plan_layer_residency_count(ids, make_split(32, 30));
+        CHECK_GATE(layer_streaming_gate_decide(in), layer_streaming_gate::OFF_MOE,
+                   "case 10: moe on a resident split is off-moe");
+    }
+
     std::printf("test-layer-streaming-gate: all cases passed\n");
     return 0;
 }
