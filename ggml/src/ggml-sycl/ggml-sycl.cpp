@@ -38628,6 +38628,9 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         kv_plan = &runtime_kv_plan;
     }
 
+    // Configure a copy of the device's tier manager and commit it only once
+    // this buffer is accepted, so the refusal below has no side effects.
+    ggml_sycl::kv_tier_manager staged = mgr;
     if (kv_plan) {
         // Which model layers this buffer holds, however that was decided
         // above (llama's explicit mask, or the size-matched buffer kind), so
@@ -38637,13 +38640,13 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         for (uint32_t l = 0; l < n_layers; ++l) {
             buffer_layer_mask[l] = layer_in_this_kv_buffer(l) ? 1 : 0;
         }
-        mgr.configure_from_plan(device, *kv_plan, n_layers, kv_slice, &buffer_layer_mask);
+        staged.configure_from_plan(device, *kv_plan, n_layers, kv_slice, &buffer_layer_mask);
     } else {
-        mgr.configure_with_weights(device, n_layers, kv_vram_cap, kv_slice);
+        staged.configure_with_weights(device, n_layers, kv_vram_cap, kv_slice);
     }
 
     // Compute per-layer layout from the tier manager.
-    auto layout = mgr.compute_region_layout(size);
+    auto layout = staged.compute_region_layout(size);
     for (auto & region : layout) {
         if (!layer_in_this_kv_buffer(region.layer_id)) {
             region.size      = 0;
@@ -38688,24 +38691,6 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     const uint32_t planned_host_layers   = host_kv_layers;
     const uint32_t planned_buffer_layers = planned_device_layers + planned_host_layers;
     const size_t   planned_kv_host       = size > planned_kv_device ? size - planned_kv_device : 0;
-    if (planned_kv_host > 0 && plan_cache && plan_cache->host_zones_configured()) {
-        const size_t used = plan_cache->host_zone_used(ggml_sycl::host_zone_id::KV);
-        const size_t cap  = plan_cache->host_zone_capacity(ggml_sycl::host_zone_id::KV);
-        if (used + planned_kv_host > cap) {
-            const size_t grow_by = used + planned_kv_host - cap;
-            if (plan_cache->host_zone_grow(ggml_sycl::host_zone_id::KV, grow_by)) {
-                GGML_LOG_INFO(
-                    "[KV-TIER] Grew host KV zone by %.1f MB for runtime context (used=%.1f MB, planned_host=%.1f "
-                    "MB)\n",
-                    grow_by / (1024.0 * 1024.0), used / (1024.0 * 1024.0), planned_kv_host / (1024.0 * 1024.0));
-            } else {
-                GGML_LOG_WARN("[KV-TIER] Host KV zone needs %.1f MB but capacity is %.1f MB and growth failed\n",
-                              (used + planned_kv_host) / (1024.0 * 1024.0), cap / (1024.0 * 1024.0));
-            }
-        }
-    }
-    ggml_sycl_log_load_summary(device, planned_kv_device, planned_kv_host, planned_device_layers, planned_host_layers,
-                               "planned");
 
     // Demoted KV belongs in the SYCL_KV_Host buffer type, whose attention the
     // scheduler gives to the CPU. Host memory inside THIS device buffer is
@@ -38728,6 +38713,27 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
             "them over PCIe\n",
             device, host_kv_layers, host_kv_bytes / (1024.0 * 1024.0));
     }
+
+    mgr = staged;
+
+    if (planned_kv_host > 0 && plan_cache && plan_cache->host_zones_configured()) {
+        const size_t used = plan_cache->host_zone_used(ggml_sycl::host_zone_id::KV);
+        const size_t cap  = plan_cache->host_zone_capacity(ggml_sycl::host_zone_id::KV);
+        if (used + planned_kv_host > cap) {
+            const size_t grow_by = used + planned_kv_host - cap;
+            if (plan_cache->host_zone_grow(ggml_sycl::host_zone_id::KV, grow_by)) {
+                GGML_LOG_INFO(
+                    "[KV-TIER] Grew host KV zone by %.1f MB for runtime context (used=%.1f MB, planned_host=%.1f "
+                    "MB)\n",
+                    grow_by / (1024.0 * 1024.0), used / (1024.0 * 1024.0), planned_kv_host / (1024.0 * 1024.0));
+            } else {
+                GGML_LOG_WARN("[KV-TIER] Host KV zone needs %.1f MB but capacity is %.1f MB and growth failed\n",
+                              (used + planned_kv_host) / (1024.0 * 1024.0), cap / (1024.0 * 1024.0));
+            }
+        }
+    }
+    ggml_sycl_log_load_summary(device, planned_kv_device, planned_kv_host, planned_device_layers, planned_host_layers,
+                               "planned");
 
     const bool all_layers_on_device =
         std::all_of(layout.begin(), layout.end(), [&](const ggml_sycl::layer_region & region) {
