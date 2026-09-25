@@ -16877,13 +16877,46 @@ static uint32_t ggml_sycl_largest_fitting_n_ctx(const ggml_sycl::placement_plan 
     return static_cast<uint32_t>((cells / 256) * 256);
 }
 
-// The whole plan against its VRAM budget.
-static uint32_t ggml_sycl_largest_fitting_n_ctx(const ggml_sycl::placement_plan &    plan,
-                                                const ggml_sycl::placement_kv_info & kv_info) {
-    if (plan.vram_bytes < plan.kv_vram_bytes) {
-        return 0;  // would underflow the subtraction below; nothing useful to suggest
+// Largest all-VRAM n_ctx against the live KV headroom runtime KV admission
+// uses (unified_cache_kv_vram_available), including kv_alloc_slack_per_layer
+// per resident layer, so every "-c" hint quotes the number admission applies.
+// Counts the load-time residency (what fits with no demotion). `device` limits
+// it to one device; -1 takes the smallest answer over the devices holding KV.
+// `admitted` is the published plan of a context whose KV is already allocated
+// (its micro-batch trial): the live headroom excludes that KV, so it is added
+// back.
+static uint32_t ggml_sycl_largest_fitting_n_ctx_live(const ggml_sycl::placement_plan &    plan,
+                                                     const ggml_sycl::placement_kv_info & kv_info,
+                                                     int                                  device,
+                                                     const ggml_sycl::placement_plan *    admitted) {
+    ggml_sycl::placement_plan all_vram = plan;
+    if (plan.load_kv_device_valid) {
+        all_vram.kv_device = plan.load_kv_device;
     }
-    return ggml_sycl_largest_fitting_n_ctx(plan, kv_info, -1, plan.vram_budget, plan.vram_bytes - plan.kv_vram_bytes);
+    std::vector<int> devices = plan.multi_device ? plan.devices : std::vector<int>{ plan.device_id };
+    if (device >= 0) {
+        devices = { device };
+    }
+    bool     any  = false;
+    uint32_t best = 0;
+    for (int d : devices) {
+        size_t n_resident = 0;
+        for (const auto & [layer, owner] : all_vram.kv_device) {
+            n_resident += owner == d && layer >= 0 && all_vram.kv_size_for_layer(static_cast<uint32_t>(layer)) > 0;
+        }
+        if (n_resident == 0) {
+            continue;
+        }
+        size_t capacity = ggml_sycl::unified_cache_kv_vram_available(d);
+        if (admitted) {
+            capacity += admitted->device_kv_vram_bytes(d);
+        }
+        const uint32_t fits = ggml_sycl_largest_fitting_n_ctx(all_vram, kv_info, d, capacity,
+                                                              n_resident * ggml_sycl::kv_alloc_slack_per_layer);
+        best                = any ? std::min(best, fits) : fits;
+        any                 = true;
+    }
+    return best;
 }
 
 // llama.cpp-tsfl: incremented by ggml_backend_sycl_buffer_type_alloc_buffer()
@@ -17710,6 +17743,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     for (int device : in.devices) {
         in.available.push_back(ggml_sycl::unified_cache_kv_vram_available(device));
     }
+    // An admitted context's own allocated KV, which the live headroom in the
+    // "-c" hints below already excludes.
+    const ggml_sycl::placement_plan * admitted_kv = ctx->runtime_kv_admitted ? current->plan.get() : nullptr;
     if (ggml_sycl::kv_residency_needs_refit(published_shape, next_shape, ctx->runtime_kv_admitted)) {
         const bool shape_changed = ggml_sycl::kv_shape_changed(published_shape, next_shape);
         if (shape_changed && ctx->runtime_kv_admitted) {
@@ -17759,9 +17795,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             for (int l : fit.demoted_layers) {
                 demoted_swa += (size_t) l < in.swa_layer_mask.size() && in.swa_layer_mask[l] != 0 ? 1 : 0;
             }
-            // What fits with NO demotion, so read before kv_device changes.
+            // What fits with NO demotion.
             const uint32_t fits_ctx =
-                ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info, device, in.available[i], 0);
+                ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, device, admitted_kv);
             if (probe_mode) {
                 GGML_LOG_INFO(
                     "[SYCL-PLAN] probe: KV overflow would be re-placed to host tier: %zu layer(s), %zu SWA (%.1f MB "
@@ -17851,11 +17887,10 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         if (ggml_sycl_try_demote_runtime_kv(
                 demoted_plan, old_mmid_charges, g_tensor_inventory_detail, next_kv_info.n_expert_used, n_ctx,
                 current->plan->moe_mmid_device_pool_bytes, &demotion_result, &demote_reason, probe_mode)) {
-            // The "-c" figure describes what fits without ANY demotion, so it
-            // must read the pre-demotion next_plan, not demoted_plan: the
-            // demoted layers no longer count against budget in
-            // ggml_sycl_largest_fitting_n_ctx, which would overstate the
-            // all-VRAM figure if read from the post-demotion plan.
+            // The "-c" figure describes what fits without ANY demotion; it
+            // counts the load-time residency against the live KV headroom
+            // (ggml_sycl_largest_fitting_n_ctx_live), the number the re-fit
+            // quotes too.
             //
             // llama.cpp-tsfl (round 1 F2): in probe mode nothing was actually
             // demoted -- demoted_plan is a scratch copy this branch is about
@@ -17876,11 +17911,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                     "(%.1f MB host KV) for n_ctx=%u; attention for those layers runs on CPU. "
                     "Largest all-VRAM context is about -c %u\n",
                     demotion_result.demoted_layers.size(), demotion_result.host_kv_bytes_added / (1024.0 * 1024.0),
-                    n_ctx, ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info));
+                    n_ctx, ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, -1, admitted_kv));
             }
             kv_was_demoted = true;
             kv_demoted_host_bytes += demotion_result.host_kv_bytes_added;
             next_plan = std::move(demoted_plan);
+            // A block whose KV is now partly on the host tier must read as
+            // mixed, as after the re-fit, so the dense block executor declines it.
+            next_plan.refresh_layer_block_kv_devices();
             replan_ok = true;
         } else if (demote_reason != ggml_sycl::moe_mmid_runtime_reason::OK) {
             // The demotion actually moved KV and re-validated through the
@@ -17937,7 +17975,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             next_plan.vram_bytes > next_plan.vram_budget ? (next_plan.vram_bytes - next_plan.vram_budget) / mb : 0.0);
         if (replan_reason == ggml_sycl::moe_mmid_runtime_reason::BUDGET_EXCEEDED ||
             replan_reason == ggml_sycl::moe_mmid_runtime_reason::GROWTH_BUDGET_EXCEEDED) {
-            const uint32_t fits = ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info);
+            const uint32_t fits = ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, -1, admitted_kv);
             if (fits >= 256) {
                 GGML_SYCL_RUNTIME_TXN_REFUSAL(
                     probe_mode,
