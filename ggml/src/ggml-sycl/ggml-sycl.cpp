@@ -17669,8 +17669,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // unified_cache_kv_vram_available() -- the same live number the tiered
     // KV allocator places against, so a KV buffer this transaction admits is
     // never resized behind its back. Overflow re-places that device's latest
-    // full-attention layers to the host tier, where llama_kv_cache allocates
-    // them in SYCL_KV_Host. supports_op declines any op with a SYCL_KV_Host
+    // full-attention layers, then (never shrink context) its latest SWA layers,
+    // to the host tier, where llama_kv_cache allocates them in SYCL_KV_Host. supports_op declines any op with a SYCL_KV_Host
     // operand unless GGML_SYCL_ATTN_HOST_DISPATCH is set, so the scheduler
     // runs their KV writes and attention on the CPU backend, in extra graph
     // splits. Whether that is the right executor is llama.cpp-mnqa's question;
@@ -17744,29 +17744,37 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                 GGML_SYCL_RUNTIME_TXN_REFUSAL(
                     probe_mode,
                     "[SYCL-PLAN] runtime KV update rejected: device %d has %.1f MB free for KV, and its KV does not "
-                    "fit even with every full-attention layer demoted to host -- n_ctx=%u n_ubatch=%u\n",
+                    "fit even with every layer demoted to host -- n_ctx=%u n_ubatch=%u\n",
                     device, in.available[i] / mb, n_ctx, next_kv_info.n_ubatch);
                 return refuse("KV exceeds the device's KV headroom");
             }
             if (fit.demoted_layers.empty()) {
                 continue;
             }
+            // Full-attention layers are demoted first, then SWA layers, each
+            // latest first, so the list is not one contiguous range.
+            const int demoted_lo  = *std::min_element(fit.demoted_layers.begin(), fit.demoted_layers.end());
+            const int demoted_hi  = *std::max_element(fit.demoted_layers.begin(), fit.demoted_layers.end());
+            size_t    demoted_swa = 0;
+            for (int l : fit.demoted_layers) {
+                demoted_swa += (size_t) l < in.swa_layer_mask.size() && in.swa_layer_mask[l] != 0 ? 1 : 0;
+            }
             // What fits with NO demotion, so read before kv_device changes.
             const uint32_t fits_ctx =
                 ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info, device, in.available[i], 0);
             if (probe_mode) {
                 GGML_LOG_INFO(
-                    "[SYCL-PLAN] probe: KV overflow would be re-placed to host tier: %zu layer(s) (%.1f MB host KV, "
-                    "layers %d..%d) on device %d for n_ctx=%u\n",
-                    fit.demoted_layers.size(), fit.host_kv_bytes_added / mb, fit.demoted_layers.back(),
-                    fit.demoted_layers.front(), device, n_ctx);
+                    "[SYCL-PLAN] probe: KV overflow would be re-placed to host tier: %zu layer(s), %zu SWA (%.1f MB "
+                    "host KV, layers %d..%d) on device %d for n_ctx=%u\n",
+                    fit.demoted_layers.size(), demoted_swa, fit.host_kv_bytes_added / mb, demoted_lo, demoted_hi,
+                    device, n_ctx);
             } else {
                 GGML_LOG_WARN(
-                    "[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted (%.1f MB host KV, layers "
-                    "%d..%d) on device %d for n_ctx=%u; the device has %.1f MB free for KV. Their KV lives in "
-                    "host memory. Largest all-VRAM context is about -c %u\n",
-                    fit.demoted_layers.size(), fit.host_kv_bytes_added / mb, fit.demoted_layers.back(),
-                    fit.demoted_layers.front(), device, n_ctx, in.available[i] / mb, fits_ctx);
+                    "[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted, %zu SWA (%.1f MB host KV, "
+                    "layers %d..%d) on device %d for n_ctx=%u; the device has %.1f MB free for KV. Their KV lives "
+                    "in host memory. Largest all-VRAM context is about -c %u\n",
+                    fit.demoted_layers.size(), demoted_swa, fit.host_kv_bytes_added / mb, demoted_lo, demoted_hi,
+                    device, n_ctx, in.available[i] / mb, fits_ctx);
             }
             kv_was_demoted = true;
             kv_demoted_host_bytes += fit.host_kv_bytes_added;

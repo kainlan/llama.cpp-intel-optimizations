@@ -279,8 +279,9 @@ int main() {
         CHECK(small.fits, "case 15: n_ctx=512 fits");
         CHECK(small.kv_device == in.load_kv_device, "case 15: the load-time residency comes back");
     }
-    // 16. KV that cannot fit even with every full-attention layer demoted
-    // (only SWA left) names the device instead of claiming a fit.
+    // 16. KV that does not fit with every full-attention layer demoted places
+    // its SWA layers on the host tier too, full-attention first, instead of
+    // refusing the context. When full-attention demotion is enough, SWA stays.
     {
         kv_residency_input in;
         in.load_kv_device = { 0, 0 };
@@ -289,8 +290,15 @@ int main() {
         in.devices        = { 0 };
         in.available      = { 50 + 2 * kv_alloc_slack_per_layer };
         auto r            = plan_runtime_kv_residency(in);
-        CHECK(!r.fits, "case 16: SWA KV over headroom cannot fit");
-        CHECK_EQ(r.refused_device, 0, "case 16: the refusal names device 0");
+        CHECK(r.fits, "case 16: SWA KV over headroom is placed on the host tier, not refused");
+        CHECK(r.per_device[0].demoted_layers == std::vector<int>({ 1, 0 }),
+              "case 16: full-attention layer first, then the SWA layer");
+        CHECK(r.kv_device == std::vector<int>({ -1, -1 }), "case 16: both layers on the host tier");
+
+        in.available = { 100 + 2 * kv_alloc_slack_per_layer };
+        auto enough  = plan_runtime_kv_residency(in);
+        CHECK(enough.fits && enough.kv_device == std::vector<int>({ 0, -1 }),
+              "case 16: the SWA layer stays when full-attention demotion is enough");
     }
     // 17. The slack is enough for the arena allocator: layers admitted against
     // exactly sum(bytes) + n * slack of headroom all place, one allocation at a

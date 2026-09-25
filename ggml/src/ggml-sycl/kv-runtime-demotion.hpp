@@ -35,7 +35,10 @@ struct kv_demotion_input {
     // placement_plan::kv_device are represented here as -1 (the caller adapts
     // the plan's sparse map into this dense vector before calling).
     std::vector<int>     kv_device;
-    std::vector<uint8_t> swa_layer_mask;  // 1 = SWA layer (never demoted)
+    std::vector<uint8_t> swa_layer_mask;  // 1 = SWA layer
+    // Demote SWA layers too, after every full-attention layer, when that is
+    // not enough. Off: SWA layers are never demoted.
+    bool                 demote_swa = false;
 };
 
 struct kv_demotion_result {
@@ -45,10 +48,10 @@ struct kv_demotion_result {
     bool             fits                = false;  // vram_bytes_after <= vram_budget
 };
 
-// Pure decision: which device-resident full-attention KV layers must move to the
-// host tier so vram_bytes fits vram_budget. Latest layers first. SWA layers,
-// already-host layers, and layers with 0 recorded bytes (nothing to move) are
-// never touched. Does NOT mutate any plan -- the caller (ggml-sycl.cpp runtime
+// Pure decision: which device-resident KV layers must move to the host tier so
+// vram_bytes fits vram_budget. Full-attention layers first, latest first; then,
+// with demote_swa, SWA layers, latest first. Already-host layers and layers
+// with 0 recorded bytes (nothing to move) are never touched. Does NOT mutate any plan -- the caller (ggml-sycl.cpp runtime
 // update) applies the result to placement_plan::kv_device.
 kv_demotion_result plan_runtime_kv_demotion(const kv_demotion_input & in);
 
@@ -149,8 +152,9 @@ struct kv_residency_result {
 };
 
 // Starts from load_kv_device and demotes each device's latest full-attention
-// layers to the host tier until its KV, plus per_layer_slack per resident
-// layer, fits that device's headroom.
+// layers, then its latest SWA layers, to the host tier until its KV, plus
+// per_layer_slack per resident layer, fits that device's headroom. It refuses
+// only when even that cannot fit.
 kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in);
 
 // One device's view of a (possibly multi-device) plan for the zone-fit pass.
@@ -163,11 +167,12 @@ struct kv_device_fit_input {
     std::vector<size_t>  layer_kv_bytes;
     std::vector<int>     kv_device;
     std::vector<uint8_t> swa_layer_mask;
+    bool                 demote_swa = false;  // see kv_demotion_input
 };
 
-// Which of `device`'s full-attention KV layers must move to the host tier so
-// its weights plus KV fit `capacity`. Latest layers first, same rules as
-// plan_runtime_kv_demotion(), which it delegates to.
+// Which of `device`'s KV layers must move to the host tier so its weights plus
+// KV fit `capacity`. Same rules as plan_runtime_kv_demotion(), which it
+// delegates to.
 kv_demotion_result plan_device_kv_fit(const kv_device_fit_input & in);
 
 // The KV owner of layers [start_layer, end_layer]: the device every layer that
