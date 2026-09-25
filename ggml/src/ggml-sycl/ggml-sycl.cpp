@@ -42887,11 +42887,21 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         }
 
         // A free during graph recording is parked with the graph, not put back
-        // on the free list; see pool_legacy_release().
-        std::lock_guard<std::mutex>                 lock(arena_handles_mutex);
-        const ggml_sycl::pool_legacy_release_result released =
-            ggml_sycl::pool_legacy_release(ptr, ggml_sycl_graph_recording_active(), buffer_pool, MAX_SYCL_BUFFERS,
-                                           active_handles, graph_retained_handles, pool_size);
+        // on the free list; see pool_legacy_release(). The process-wide
+        // predicate matches the arena path above. A free on a thread that is
+        // not itself recording only over-retains, and only into this pool's
+        // own list, which this pool's context releases at its next graph
+        // release or teardown.
+        ggml_sycl::mem_handle                 dropped;
+        ggml_sycl::pool_legacy_release_result released;
+        {
+            std::lock_guard<std::mutex> lock(arena_handles_mutex);
+            released =
+                ggml_sycl::pool_legacy_release(ptr, ggml_sycl_graph_recording_active(), buffer_pool, MAX_SYCL_BUFFERS,
+                                               active_handles, graph_retained_handles, dropped, pool_size);
+        }
+        // dropped's owner is released after unlocking, as the arena path does.
+        dropped = {};
         if (released == ggml_sycl::pool_legacy_release_result::MISSING_OWNER) {
             GGML_ASSERT(false && "device pool free without unified allocation mem_handle");
         } else if (released == ggml_sycl::pool_legacy_release_result::DROPPED) {

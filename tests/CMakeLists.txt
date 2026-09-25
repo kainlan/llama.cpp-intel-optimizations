@@ -2081,6 +2081,13 @@ if (NOT WIN32)
     )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-pool-legacy-release-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;graph;mutation"
+        TIMEOUT 120
+    )
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-rmsnorm-fusion-route-decline-source.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert;mulmat;fusion;mutation"

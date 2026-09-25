@@ -17,7 +17,7 @@ namespace ggml_sycl {
 enum class pool_legacy_release_result {
     CACHED,          // on the free list; the next alloc() may hand it out
     GRAPH_RETAINED,  // parked with the recording graph's retained handles
-    DROPPED,         // free list full; its owner was released
+    DROPPED,         // free list full; its owner was moved into dropped
     MISSING_OWNER,   // no allocation-time owner; the caller must fail closed
 };
 
@@ -31,6 +31,10 @@ enum class pool_legacy_release_result {
 // points into it; dropped, the memory itself would be freed under the graph.
 // So a block freed during recording is parked in graph_retained with its owner
 // and released when the graph is dropped, as the arena path does.
+//
+// A DROPPED owner is moved into dropped rather than released here, so the
+// caller can release it (a unified-cache free) after unlocking whatever guards
+// these containers.
 template <typename Slot, typename Owned, typename Handle>
 pool_legacy_release_result pool_legacy_release(void *                              ptr,
                                                bool                                graph_recording,
@@ -38,6 +42,7 @@ pool_legacy_release_result pool_legacy_release(void *                           
                                                int                                 n_slots,
                                                std::unordered_map<void *, Owned> & active,
                                                std::vector<Handle> &               graph_retained,
+                                               Handle &                            dropped,
                                                size_t &                            pool_size) {
     auto it = active.find(ptr);
     // Ownership must have been retained at allocation time. A metadata lookup
@@ -65,7 +70,7 @@ pool_legacy_release_result pool_legacy_release(void *                           
     }
 
     pool_size -= it->second.size;
-    it->second.handle = {};
+    dropped = std::move(it->second.handle);
     active.erase(it);
     return pool_legacy_release_result::DROPPED;
 }

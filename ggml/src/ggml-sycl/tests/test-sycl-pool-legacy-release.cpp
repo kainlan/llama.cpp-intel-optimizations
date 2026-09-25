@@ -65,6 +65,7 @@ struct legacy_pool {
     slot                              slots[kSlots];
     std::unordered_map<void *, owned> active;
     std::vector<counted_handle>       graph_retained;
+    counted_handle                    dropped;
     size_t                            pool_size = 0;
     int                               live      = 0;
 
@@ -76,7 +77,7 @@ struct legacy_pool {
     }
 
     pool_legacy_release_result release(void * ptr, bool recording) {
-        return pool_legacy_release(ptr, recording, slots, kSlots, active, graph_retained, pool_size);
+        return pool_legacy_release(ptr, recording, slots, kSlots, active, graph_retained, dropped, pool_size);
     }
 
     bool on_free_list(void * ptr) const {
@@ -134,8 +135,9 @@ void test_free_during_recording_is_retained_with_the_graph() {
     check(pool.live == 0, "graph dropped: the retained owner was not released");
 }
 
-// With the free list full, outside recording the owner is released at once;
-// during recording that would free memory under the graph.
+// With the free list full, outside recording the owner is handed back for the
+// caller to release after unlocking; during recording releasing it would free
+// memory under the graph.
 void test_full_free_list_during_recording_is_retained_not_dropped() {
     legacy_pool pool;
     for (int i = 0; i < kSlots; ++i) {
@@ -147,11 +149,19 @@ void test_full_free_list_during_recording_is_retained_not_dropped() {
     void * dropped = pool.alloc(0x20000, 512);
     check(pool.release(dropped, false) == pool_legacy_release_result::DROPPED,
           "full free list, outside recording: result is not DROPPED");
-    check(pool.live == cached_live, "full free list, outside recording: the owner was not released");
+    check(pool.dropped.valid() && pool.live == cached_live + 1,
+          "full free list, outside recording: the owner was not handed back to the caller");
+    check(pool.active.empty() && !pool.on_free_list(dropped),
+          "full free list, outside recording: the block is still tracked");
+    pool.dropped.reset();
+    check(pool.live == cached_live,
+          "full free list, outside recording: releasing the handed-back owner did not free it");
 
     void * kept = pool.alloc(0x30000, 512);
     check(pool.release(kept, true) == pool_legacy_release_result::GRAPH_RETAINED,
           "full free list, during recording: the owner was dropped, freeing memory a recorded graph references");
+    check(!pool.dropped.valid() && pool.graph_retained.size() == 1,
+          "full free list, during recording: the owner was not parked with the graph");
     check(pool.live == cached_live + 1, "full free list, during recording: the owner is not alive");
     check(pool.pool_size == kSlots * 256, "full free list: pool accounting is off");
 }
