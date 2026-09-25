@@ -2,10 +2,10 @@
 // in which order.
 //
 // Host-only: no SYCL queue, no device, no graph. The scope works on references
-// to the recording state, so here they point at a fake. The sink setter is the
-// one slot the scope reaches through a call, which lets the fake photograph
-// every other slot at the moment the sink attaches and detaches -- that is how
-// the order is observed.
+// to the recording state, so here they point at a fake. The scope reaches two
+// slots through calls, the sink setter and the depth counter, and the fake
+// photographs every other slot at each of those calls -- that is how the order
+// is observed.
 
 #include "graph-recorder-scope.hpp"
 
@@ -32,7 +32,8 @@ struct fake_queue {};
 
 using fake_sink = std::vector<int>;
 
-// Every slot, as the scope's sink call saw it.
+// Every slot, as the scope's sink or depth call saw it (depth before the call
+// changes it).
 struct snapshot {
     fake_sink *  sink;
     bool         recording;
@@ -43,28 +44,66 @@ struct snapshot {
     bool         fa_recording;
 };
 
+struct fake_state;
+
+snapshot photograph(const fake_state & s);
+
+// The recording depth, with std::atomic<int>'s calls, photographing the other
+// slots whenever the scope moves it.
+struct fake_depth {
+    fake_state *          owner = nullptr;
+    int                   value = 0;
+    std::vector<snapshot> adds;
+    std::vector<snapshot> subs;
+
+    int fetch_add(int n, std::memory_order) {
+        adds.push_back(photograph(*owner));
+        const int old = value;
+        value += n;
+        return old;
+    }
+
+    int fetch_sub(int n, std::memory_order) {
+        subs.push_back(photograph(*owner));
+        const int old = value;
+        value -= n;
+        return old;
+    }
+
+    int load() const { return value; }
+
+    void store(int v) { value = v; }
+};
+
 struct fake_state {
     bool                  recording = false;
-    std::atomic<int>      depth{ 0 };
+    fake_depth            depth;
     fake_graph *          graph        = nullptr;
     fake_queue *          queue        = nullptr;
     fake_sink *           sink         = nullptr;
     bool                  dispatch     = false;
     bool                  fa_recording = false;
     std::vector<snapshot> sink_calls;
+
+    fake_state() { depth.owner = this; }
 };
+
+snapshot photograph(const fake_state & s) {
+    return { s.sink, s.recording, s.depth.value, s.graph, s.queue, s.dispatch, s.fa_recording };
+}
 
 // The sink setter is a plain function pointer, as the backend's is, so it
 // reaches the fake through a global.
 fake_state * g_state = nullptr;
 
 void fake_set_sink(fake_sink * sink) {
-    g_state->sink_calls.push_back({ sink, g_state->recording, g_state->depth.load(), g_state->graph, g_state->queue,
-                                    g_state->dispatch, g_state->fa_recording });
+    snapshot s = photograph(*g_state);
+    s.sink     = sink;
+    g_state->sink_calls.push_back(s);
     g_state->sink = sink;
 }
 
-using scope = graph_recorder_scope<fake_graph, fake_queue, fake_sink>;
+using scope = graph_recorder_scope<fake_graph, fake_queue, fake_sink, fake_depth>;
 
 scope::slots slots_of(fake_state & s) {
     return { s.recording, s.depth, s.graph, s.queue, fake_set_sink, s.dispatch, s.fa_recording };
@@ -116,18 +155,31 @@ void test_leave_restores() {
     check_idle(f.state, 0, false, "after leave");
 }
 
-// The depth counts every thread's recordings, so the scope adds and removes
-// exactly its own one. The FA capture flag goes back to what it was, not to
-// off.
+// Leaving puts back what entry found in every slot, not false or null. The
+// depth counts every thread's recordings, so the scope adds and removes
+// exactly its own one. Only the sink goes to none rather than to a saved one.
 void test_leave_restores_what_it_found() {
-    fixture f;
+    fixture    f;
+    fake_graph found_graph;
+    fake_queue found_queue;
+    f.state.recording = true;
     f.state.depth.store(2);
+    f.state.graph        = &found_graph;
+    f.state.queue        = &found_queue;
+    f.state.dispatch     = true;
     f.state.fa_recording = true;
     {
         scope rec(slots_of(f.state), &f.graph, &f.queue, &f.sink, true);
         check(f.state.depth.load() == 3, "depth adds one to the other threads' recordings");
+        check(f.state.graph == &f.graph && f.state.queue == &f.queue, "the scope's graph and queue while open");
     }
-    check_idle(f.state, 2, true, "after the scope");
+    check(f.state.recording, "the recording flag is back to what entry found");
+    check(f.state.depth.load() == 2, "depth is back to the other threads' recordings");
+    check(f.state.graph == &found_graph, "the graph is back to what entry found");
+    check(f.state.queue == &found_queue, "the queue is back to what entry found");
+    check(f.state.dispatch, "the dispatch flag is back to what entry found");
+    check(f.state.fa_recording, "the FA capture flag is back to what entry found");
+    check(f.state.sink == nullptr, "the sink is detached");
 }
 
 // Entry order: FA capture, depth, sink, then the recording flag, graph, queue
@@ -145,6 +197,11 @@ void test_enter_order() {
     check(!s.recording, "the recording flag turns on after the sink attaches");
     check(s.graph == nullptr && s.queue == nullptr, "graph and queue are set after the sink attaches");
     check(!s.dispatch, "the dispatch flag turns on after the sink attaches");
+
+    check(f.state.depth.adds.size() == 1, "entry adds to the depth once");
+    const snapshot & d = f.state.depth.adds[0];
+    check(d.fa_recording, "FA capture is on before depth counts the recording");
+    check(d.sink == nullptr, "the sink attaches after depth counts the recording");
 }
 
 // Leaving is entry in reverse: the dispatch flag, queue, graph and recording
@@ -164,6 +221,11 @@ void test_leave_order() {
     check(!s.recording, "the recording flag is off before the sink detaches");
     check(s.depth == 1, "depth still counts the recording when the sink detaches");
     check(s.fa_recording, "FA capture is still on when the sink detaches");
+
+    check(f.state.depth.subs.size() == 1, "leaving takes from the depth once");
+    const snapshot & d = f.state.depth.subs[0];
+    check(d.sink == nullptr, "the sink detaches before depth drops");
+    check(d.fa_recording, "FA capture is still on when depth drops");
 }
 
 // An explicit leave() on the success path, then the destructor at scope exit:

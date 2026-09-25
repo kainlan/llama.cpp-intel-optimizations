@@ -23,8 +23,17 @@
 // finds the recording through active(), the innermost open scope on this
 // thread; only the constructor and destructor change it.
 //
+// The scope owns the flag that turns FA pointer capture on, not the snapshot
+// it captures (the context's fa_graph_ptrs and fa_graph_ptrs_valid). The
+// snapshot is what the recording produces, and the two recorders keep it in
+// different places: whole-graph recording leaves it on the context and marks
+// it valid, while a dense range moves it into the range's graph and gives the
+// context back the snapshot it had. So each caller clears, commits or
+// discards it.
+//
 // The slots are references, so this header needs no SYCL and a host test can
-// point it at fakes (tests/test-sycl-graph-recorder-scope.cpp). A thread_local
+// point it at fakes (tests/test-sycl-graph-recorder-scope.cpp); the depth
+// counter's type is a parameter for the same reason. A thread_local
 // slot binds to the constructing thread's copy, so a scope is entered and left
 // on one thread.
 //
@@ -39,19 +48,20 @@
 
 namespace ggml_sycl {
 
-template <typename Graph, typename Queue, typename Sink> struct graph_recording_slots {
-    bool &             recording;  // this thread records
-    std::atomic<int> & depth;      // recordings open in the process, on any thread
-    Graph *&           graph;      // the graph dispatch code records into
-    Queue *&           queue;      // the queue that graph records from
-    void (*set_sink)(Sink *);      // where handles released while recording go
-    bool & dispatch;               // the context dispatches as recording
-    bool & fa_recording;           // FA dispatch snapshots its pointers
+template <typename Graph, typename Queue, typename Sink, typename Depth = std::atomic<int>>
+struct graph_recording_slots {
+    bool &   recording;        // this thread records
+    Depth &  depth;            // recordings open in the process, on any thread
+    Graph *& graph;            // the graph dispatch code records into
+    Queue *& queue;            // the queue that graph records from
+    void (*set_sink)(Sink *);  // where handles released while recording go
+    bool & dispatch;           // the context dispatches as recording
+    bool & fa_recording;       // FA dispatch snapshots its pointers
 };
 
-template <typename Graph, typename Queue, typename Sink> class graph_recorder_scope {
+template <typename Graph, typename Queue, typename Sink, typename Depth = std::atomic<int>> class graph_recorder_scope {
   public:
-    using slots = graph_recording_slots<Graph, Queue, Sink>;
+    using slots = graph_recording_slots<Graph, Queue, Sink, Depth>;
 
     // capture_fa: the recording snapshots FA pointers. Without it the scope
     // does not own the FA flag and leaves it alone.
