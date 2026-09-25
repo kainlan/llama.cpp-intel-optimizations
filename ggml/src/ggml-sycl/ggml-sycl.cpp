@@ -93353,6 +93353,9 @@ gpu_dispatch:
                 ggml_sycl_graph_recorder * const recorder = ggml_sycl_graph_recorder::active();
                 g_recording_graph_ptr->end_recording();
                 recorder->pause();
+                if (ggml_sycl_graph_diag_enabled()) {
+                    fprintf(stderr, "[GRAPH-DIAG] recording paused for MUL_MAT_ID node=%s\n", node->name);
+                }
 
                 std::string                                   node_timeline_metadata;
                 std::optional<ggml_sycl::sycl_timeline_scope> node_timeline_scope;
