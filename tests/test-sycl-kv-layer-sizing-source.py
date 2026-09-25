@@ -655,7 +655,7 @@ def test_mutation_n_embd_v_gqa_reverts_to_layer0_form_is_witnessed() -> None:
 # ---------------------------------------------------------------------------
 
 TIERED_KV_ALLOC_SIGNATURE = "static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer"
-HOST_KV_REFUSAL = "refusing. Demoted KV must be placed in SYCL_KV_Host"
+HOST_KV_REFUSAL = "and be read by device kernels over PCIe; refusing."
 
 
 def strip_comments(text: str) -> str:
@@ -824,7 +824,7 @@ def test_mutation_tier_manager_configured_in_place_is_witnessed() -> None:
 def test_mutation_host_zone_grown_before_refusal_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
     body = function(cpp, TIERED_KV_ALLOC_SIGNATURE)
-    grow_at = body.index("    if (planned_kv_host > 0 && plan_cache && plan_cache->host_zones_configured()) {")
+    grow_at = body.index("    if (host_kv_bytes > 0 && plan_cache && plan_cache->host_zones_configured()) {")
     grow_end = body.index("\n    }\n", body.index("host_zone_grow(", grow_at)) + len("\n    }\n")
     grow = body[grow_at:grow_end]
     rest = body[:grow_at] + body[grow_end:]
@@ -832,3 +832,352 @@ def test_mutation_host_zone_grown_before_refusal_is_witnessed() -> None:
     new_body = rest[:refusal_at] + grow + "\n" + rest[refusal_at:]
     _assert_witnessed(cpp, cpp.replace(body, new_body, 1), tiered_kv_refusal_order_violations,
                       "host_zone_grow( runs before the host-KV refusal decides", "host KV zone grown before refusal")
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp-17ea: one live KV headroom. test-kv-runtime-demotion case 21 pins
+# kv_vram_available() itself, but its inputs are constants; what makes it the
+# admission number is that the transaction, the allocator and the -c hints all
+# reach it through unified_cache_kv_vram_available(), and that function keeps
+# the has-arena branch. Those call sites are pinned here.
+# ---------------------------------------------------------------------------
+
+KV_DEMOTION_HPP = ROOT / "ggml/src/ggml-sycl/kv-runtime-demotion.hpp"
+KV_HEADROOM_SIGNATURE = "size_t unified_cache_kv_vram_available("
+KV_WEIGHT_CAPACITY_SIGNATURE = "size_t unified_cache_kv_weight_capacity("
+LIVE_HINT_SIGNATURE = "static uint32_t ggml_sycl_largest_fitting_n_ctx_live"
+TRY_DEMOTE_SIGNATURE = "static bool ggml_sycl_try_demote_runtime_kv"
+CTX_HINT_SIGNATURE = "static std::string ggml_sycl_all_vram_ctx_hint"
+LLAMA_CONTEXT_CTOR_SIGNATURE = "llama_context::llama_context("
+RESYNC_SIGNATURE = "void llama_context::sycl_resync_runtime_context_flash_attn()"
+PLAN_OWNED_BLOCK = "if (kv_plan && kv_geometry.valid()) {"
+
+
+def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
+    found: list[str] = []
+    txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
+    if not re.search(r"in\.available\.push_back\(\s*ggml_sycl::unified_cache_kv_vram_available\(", txn):
+        found.append("the transaction's in.available is not the live KV headroom")
+
+    alloc = strip_comments(function(sycl_cpp, TIERED_KV_ALLOC_SIGNATURE))
+    caps = re.findall(r"\bkv_vram_cap\s*=(?!=)([^;]*);", alloc)
+    if len(caps) != 1 or "ggml_sycl::unified_cache_kv_vram_available(" not in caps[0]:
+        found.append("the allocator's kv_vram_cap is not the live KV headroom")
+    backstop = re.search(r"if\s*\(\s*ggml_sycl::kv_admission_mismatch\(\s*planned_device_bytes\s*,\s*kv_vram_cap\s*\)"
+                         r"\s*\)\s*\{[^{}]*return\s+nullptr\s*;", alloc)
+    block = alloc.find(PLAN_OWNED_BLOCK)
+    staged = alloc.find("ggml_sycl::kv_tier_manager staged = mgr;")
+    if backstop is None:
+        found.append("the allocator's kv_admission_mismatch backstop is missing or does not refuse")
+    elif block < 0 or not block < backstop.start() < staged or re.search(r"\breturn\s+nullptr\b|\bgoto\b",
+                                                                          alloc[block:backstop.start()]):
+        found.append("the allocator's backstop is not reached on every planned allocation")
+    if re.search(r"runtime_kv_plan\.kv_device\[[^\]]*\]\s*=\s*-1", alloc):
+        found.append("the allocator demotes device-planned KV itself")
+
+    live = strip_comments(function(sycl_cpp, LIVE_HINT_SIGNATURE))
+    if "ggml_sycl::unified_cache_kv_vram_available(" not in live:
+        found.append("the -c hint does not read the live KV headroom")
+
+    probe_calls = re.findall(r"ggml_sycl_run_runtime_context_transaction\(([^;]*)\);", strip_comments(sycl_cpp))
+    if not any(re.search(r",\s*true\s*,\s*out\s*$", c) for c in probe_calls):
+        found.append("the probe does not run the transaction body")
+
+    body = function_or_none(cache_cpp, KV_HEADROOM_SIGNATURE)
+    if body is None:
+        return found + ["unified_cache_kv_vram_available is missing"]
+    code = strip_comments(body)
+    if not re.search(r"return\s+kv_vram_available\(\s*has_arena\s*,\s*has_arena\s*\?\s*cache->zone_available\("
+                     r"\s*vram_zone_id::KV\s*\)\s*:\s*0\s*,\s*has_arena\s*\?\s*0\s*:", code):
+        found.append("unified_cache_kv_vram_available lost its has-arena branch")
+    if re.search(r"==\s*0\s*\)", code):
+        found.append("unified_cache_kv_vram_available falls back to the budget when the KV zone reads 0")
+    if "get_unified_cache_for_device(" in code:
+        found.append("unified_cache_kv_vram_available can create a cache (under g_tensor_inventory_mutex)")
+    for sig, name in ((KV_HEADROOM_SIGNATURE, "unified_cache_kv_vram_available"),
+                      (KV_WEIGHT_CAPACITY_SIGNATURE, "unified_cache_kv_weight_capacity")):
+        fn = function_or_none(cache_cpp, sig)
+        if fn is None or not re.search(r"kv_reads_device_arena\(\s*multi_device\s*,", strip_comments(fn)):
+            found.append(f"{name} does not apply the multi-device GLOBAL special case")
+    return found
+
+
+def kv_refit_announcement_violations(sycl_cpp: str) -> list[str]:
+    found: list[str] = []
+    txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
+    refit = re.search(r"plan_runtime_kv_residency\(in\)(.*?)rebuild_runtime_per_device_vram\(\)", txn, re.S)
+    if refit is None:
+        return ["the re-fit is missing"]
+    if not re.search(r"load_it\s*=\s*next_plan\.load_kv_device\.find\(", txn) or \
+            "next_plan.kv_device = next_plan.load_kv_device;" not in refit.group(1):
+        found.append("the re-fit does not restart from the load residency")
+    announce = re.search(r"const\s+bool\s+announce\s*=\s*!probe_mode\s*&&\s*next_plan\.kv_device\s*!=\s*"
+                         r"current->plan->kv_device\s*;", refit.group(1))
+    warn = refit.group(1).find("KV overflow re-placed to host tier")
+    gate = refit.group(1).find("if (!announce)")
+    if announce is None or gate < 0 or not announce.start() < gate < warn:
+        found.append("the re-fit WARN is not gated on a change to the published residency")
+    refused = refit.group(1).find("if (!residency.fits)")
+    if refused < 0 or (0 <= warn < refused):
+        found.append("a refused re-fit can log KV it re-placed")
+    return found
+
+
+def kv_publish_order_violations(ctx_cpp: str) -> list[str]:
+    found: list[str] = []
+    ctor = strip_comments(function(ctx_cpp, LLAMA_CONTEXT_CTOR_SIGNATURE))
+    publish = ctor.find("sycl_resync_runtime_context_flash_attn();")
+    memory = ctor.find("memory.reset(model.create_memory(")
+    ladder = ctor.find("sycl_select_auto_ubatch(")
+    if min(publish, memory, ladder) < 0 or not publish < memory < ladder:
+        found.append("a backend's first publish can run after the context's KV is allocated")
+    resync = strip_comments(function(ctx_cpp, RESYNC_SIGNATURE))
+    skips = re.findall(r"if\s*\(([^)]*)\)\s*\{\s*continue;", resync)
+    if skips != ["owner.model_id == 0 || owner.load_txn_id == 0"] or resync.count("continue;") != 1:
+        found.append("the constructor's publish can skip one SYCL backend of a context")
+    return found
+
+
+def kv_demotion_message_violations(sycl_cpp: str) -> list[str]:
+    found: list[str] = []
+    demote = strip_comments(function(sycl_cpp, TRY_DEMOTE_SIGNATURE))
+    if not re.search(r"kv_demotion_in\.demote_swa\s*=\s*true\s*;", demote):
+        found.append("the budget-path demotion never demotes SWA")
+    txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
+    if "Largest all-VRAM context is about -c %u" in txn:
+        found.append("a demotion WARN prints the -c hint unguarded")
+    hint = function_or_none(sycl_cpp, CTX_HINT_SIGNATURE)
+    if hint is None or "fits >= 256" not in strip_comments(hint):
+        found.append("the -c hint helper does not drop an answer of 0")
+    over = re.search(r"const\s+bool\s+plan_over_budget\s*=\s*replan_reason\s*==\s*"
+                     r"ggml_sycl::moe_mmid_runtime_reason::BUDGET_EXCEEDED\s*;", txn)
+    if over is None or not re.search(r"if\s*\(\s*plan_over_budget\s*\)\s*\{\s*const\s+uint32_t\s+fits\s*=", txn):
+        found.append("the budget refusal quotes -c for a constraint -c does not cure")
+    if not re.search(r"runtime KV update rejected: %s \(%s\)", txn):
+        found.append("the budget refusal does not name its constraint")
+    alloc = strip_comments(function(sycl_cpp, TIERED_KV_ALLOC_SIGNATURE))
+    if "Reduce -c" in alloc:
+        found.append("the allocator backstop blames the context size")
+    override = re.search(r"const\s+bool\s+host_kv_override\s*=([^;]*);", alloc)
+    if override is None or "kv_hot_layers_override_active(" not in override.group(1) or \
+            "!kv_plan" not in override.group(1) or "!= nullptr ||" in override.group(1).split("!kv_plan")[0]:
+        found.append("the HOT_* overrides are read by presence or license host layers under a plan")
+    return found
+
+
+def test_kv_headroom_wiring() -> None:
+    assert kv_headroom_wiring_violations(GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()) == []
+
+
+def test_kv_refit_announcement() -> None:
+    assert kv_refit_announcement_violations(GGML_SYCL_CPP.read_text()) == []
+
+
+def test_kv_publish_order() -> None:
+    assert kv_publish_order_violations(LLAMA_CONTEXT_CPP.read_text()) == []
+
+
+def test_kv_demotion_messages() -> None:
+    assert kv_demotion_message_violations(GGML_SYCL_CPP.read_text()) == []
+
+
+def _headroom_checker(cache_cpp: str):
+    return lambda sycl_cpp: kv_headroom_wiring_violations(sycl_cpp, cache_cpp)
+
+
+def _cache_checker(sycl_cpp: str):
+    return lambda cache_cpp: kv_headroom_wiring_violations(sycl_cpp, cache_cpp)
+
+
+def test_mutation_headroom_reverts_to_zero_means_no_arena_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    body = function(cache, KV_HEADROOM_SIGNATURE)
+    old = body[:body.index("{") + 1] + """
+    size_t available = 0;
+    if (vram_arena_enabled()) {
+        auto * cache = get_unified_cache_for_device(device_id);
+        if (cache && cache->arena_active()) {
+            available = cache->zone_available(vram_zone_id::KV);
+        }
+    }
+    if (available == 0) {
+        available = unified_cache_available_for_compute(device_id);
+    }
+    return available;
+}"""
+    _assert_witnessed(cache, cache.replace(body, old, 1), _cache_checker(cpp),
+                      "falls back to the budget when the KV zone reads 0", "cc1381a71's body reverted")
+
+
+def test_mutation_allocator_inline_cap_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    mutated = re.sub(r"const size_t kv_vram_cap =\s*kv_host_val != 1 \? ggml_sycl::unified_cache_kv_vram_available\("
+                     r"device, kv_multi_device\) : 0;", """size_t kv_vram_cap = 0;
+    if (kv_host_val != 1) {
+        if (ggml_sycl::vram_arena_enabled()) {
+            auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+            if (cache && cache->arena_active()) {
+                kv_vram_cap = cache->zone_available(ggml_sycl::vram_zone_id::KV);
+            }
+        }
+        if (kv_vram_cap == 0) {
+            kv_vram_cap = ggml_sycl::unified_cache_available_for_compute(device);
+        }
+    }""", cpp, count=1)
+    _assert_witnessed(cpp, mutated, _headroom_checker(cache), "the allocator's kv_vram_cap is not the live KV headroom",
+                      "the old inline cap restored")
+
+
+def test_mutation_available_from_budgets_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    mutated = cpp.replace("in.available.push_back(ggml_sycl::unified_cache_kv_vram_available(device, "
+                          "next_plan.multi_device));",
+                          "in.available.push_back(next_plan.per_device_vram_budgets[device]);", 1)
+    _assert_witnessed(cpp, mutated, _headroom_checker(cache), "the transaction's in.available is not the live KV headroom",
+                      "in.available pointed at per_device_vram_budgets")
+
+
+def test_mutation_backstop_removed_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    mutated = cpp.replace("if (ggml_sycl::kv_admission_mismatch(planned_device_bytes, kv_vram_cap)) {",
+                          "if (false) {", 1)
+    _assert_witnessed(cpp, mutated, _headroom_checker(cache), "backstop is missing or does not refuse",
+                      "backstop disabled")
+
+
+def test_mutation_backstop_bypassed_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    body = function(cpp, TIERED_KV_ALLOC_SIGNATURE)
+    at = body.index("        // Counted by the allocation loop's owner rule")
+    new_body = body[:at] + "        if (kv_vram_cap > 0) {\n            return nullptr;\n        }\n" + body[at:]
+    _assert_witnessed(cpp, cpp.replace(body, new_body, 1), _headroom_checker(cache),
+                      "backstop is not reached on every planned allocation", "an early return ahead of the backstop")
+
+
+def test_mutation_allocator_resize_restored_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    mutated = cpp.replace("        kv_plan = &runtime_kv_plan;",
+                          "        runtime_kv_plan.kv_device[0] = -1;\n        kv_plan = &runtime_kv_plan;", 1)
+    _assert_witnessed(cpp, mutated, _headroom_checker(cache), "the allocator demotes device-planned KV itself",
+                      "the allocator's own resize restored")
+
+
+def test_mutation_headroom_creates_cache_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    body = function(cache, KV_HEADROOM_SIGNATURE)
+    new_body = body.replace("get_existing_cache_for_device(device_id)", "get_unified_cache_for_device(device_id)", 1)
+    _assert_witnessed(cache, cache.replace(body, new_body, 1), _cache_checker(cpp), "can create a cache",
+                      "the creating lookup restored")
+
+
+def test_mutation_headroom_ignores_global_mode_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    body = function(cache, KV_HEADROOM_SIGNATURE)
+    new_body = re.sub(r"kv_reads_device_arena\(multi_device, get_effective_mode\(\) == unified_cache_mode::GLOBAL\)",
+                      "true", body, count=1)
+    _assert_witnessed(cache, cache.replace(body, new_body, 1), _cache_checker(cpp),
+                      "unified_cache_kv_vram_available does not apply the multi-device GLOBAL special case",
+                      "the GLOBAL special case dropped")
+
+
+def test_mutation_refit_warn_ungated_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("const bool announce = !probe_mode && next_plan.kv_device != current->plan->kv_device;",
+                          "const bool announce = !probe_mode;", 1)
+    _assert_witnessed(cpp, mutated, kv_refit_announcement_violations,
+                      "the re-fit WARN is not gated on a change to the published residency",
+                      "every re-fit announced")
+
+
+def test_mutation_refit_sticky_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("next_plan.kv_device = next_plan.load_kv_device;\n        for (size_t l = 0; l < n_kv_layers",
+                          "for (size_t l = 0; l < n_kv_layers", 1)
+    _assert_witnessed(cpp, mutated, kv_refit_announcement_violations, "does not restart from the load residency",
+                      "the re-fit starts from the published residency")
+
+
+def test_mutation_refit_logs_before_refusal_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    body = function(cpp, TRANSACTION_SIGNATURE)
+    refusal_at = body.index("        if (!residency.fits) {")
+    refusal_end = body.index("        }\n", body.index("return refuse(", refusal_at)) + len("        }\n")
+    refusal = body[refusal_at:refusal_end]
+    rest = body[:refusal_at] + body[refusal_end:]
+    at = rest.index("        // A second backend of a context re-fits")
+    loop_end = rest.index("\n    }\n", rest.index("KV overflow re-placed to host tier", at))
+    new_body = rest[:loop_end] + "\n" + refusal + rest[loop_end:]
+    _assert_witnessed(cpp, cpp.replace(body, new_body, 1), kv_refit_announcement_violations,
+                      "a refused re-fit can log KV it re-placed", "refusal checked after the WARNs")
+
+
+def test_mutation_publish_after_kv_allocation_is_witnessed() -> None:
+    ctx = LLAMA_CONTEXT_CPP.read_text()
+    ctor = function(ctx, LLAMA_CONTEXT_CTOR_SIGNATURE)
+    first = ctor.index("        sycl_resync_runtime_context_flash_attn();\n")
+    moved = ctor[:first] + ctor[first + len("        sycl_resync_runtime_context_flash_attn();\n"):]
+    at = moved.index("        memory.reset(model.create_memory(params_mem, cparams));\n")
+    at += len("        memory.reset(model.create_memory(params_mem, cparams));\n")
+    moved = moved[:at] + "        sycl_resync_runtime_context_flash_attn();\n" + moved[at:]
+    _assert_witnessed(ctx, ctx.replace(ctor, moved, 1), kv_publish_order_violations,
+                      "a backend's first publish can run after the context's KV is allocated",
+                      "the constructor publishes after creating the KV cache")
+
+
+def test_mutation_publish_skips_a_backend_is_witnessed() -> None:
+    ctx = LLAMA_CONTEXT_CPP.read_text()
+    mutated = ctx.replace("        if (runtime_context_fn) {\n            const auto & owner = model.get_sycl_model_token();",
+                          "        if (runtime_context_fn) {\n            if (backend != backends.front()) {\n"
+                          "                continue;\n            }\n"
+                          "            const auto & owner = model.get_sycl_model_token();", 1)
+    _assert_witnessed(ctx, mutated, kv_publish_order_violations, "can skip one SYCL backend of a context",
+                      "one backend skipped")
+
+
+def test_mutation_budget_path_swa_off_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("    kv_demotion_in.demote_swa  = true;\n", "", 1)
+    _assert_witnessed(cpp, mutated, kv_demotion_message_violations, "never demotes SWA", "budget path SWA off")
+
+
+def test_mutation_unguarded_hint_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace('"in host memory.%s\\n",', '"in host memory. Largest all-VRAM context is about -c %u\\n",', 1)
+    _assert_witnessed(cpp, mutated, kv_demotion_message_violations, "prints the -c hint unguarded",
+                      "the old unguarded -c print")
+
+
+def test_mutation_hint_quotes_zero_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("return fits >= 256 ?", "return fits >= 0 ?", 1)
+    _assert_witnessed(cpp, mutated, kv_demotion_message_violations, "does not drop an answer of 0", "0 quoted")
+
+
+def test_mutation_mmid_refusal_quotes_c_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("        if (plan_over_budget) {\n            const uint32_t fits",
+                          "        if (true) {\n            const uint32_t fits", 1)
+    _assert_witnessed(cpp, mutated, kv_demotion_message_violations, "quotes -c for a constraint -c does not cure",
+                      "-c quoted for MMID growth")
+
+
+def test_mutation_backstop_blames_context_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("device-planned KV in host memory.\\n\",", "device-planned KV in host memory. Reduce -c.\\n\",", 1)
+    _assert_witnessed(cpp, mutated, kv_demotion_message_violations, "blames the context size",
+                      "the old Reduce -c text")
+
+
+def test_mutation_hot_layers_by_presence_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace('ggml_sycl::kv_hot_layers_override_active(std::getenv("GGML_SYCL_KV_HOT_LAYERS"))',
+                          'std::getenv("GGML_SYCL_KV_HOT_LAYERS") != nullptr', 1)
+    _assert_witnessed(cpp, mutated, kv_demotion_message_violations, "read by presence", "HOT_LAYERS by presence")
+
+
+def test_mutation_probe_skips_transaction_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    mutated = cpp.replace("flash_attn_enabled, /*probe_mode=*/true, out);", "flash_attn_enabled, /*probe_mode=*/false, out);",
+                          1)
+    _assert_witnessed(cpp, mutated, _headroom_checker(cache), "the probe does not run the transaction body",
+                      "the probe runs the publishing path")
