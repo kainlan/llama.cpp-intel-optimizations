@@ -108,6 +108,7 @@
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/onednn-woq.hpp"
 #include "ggml-sycl/orchestrator.hpp"
+#include "ggml-sycl/pool-legacy-release.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
@@ -42546,10 +42547,10 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         arena_mode_(ggml_sycl::vram_arena_enabled()) {}
 
     ~ggml_sycl_pool_leg() {
+        release_graph_retained();
         // When arena is active, no buffers should be in the free list —
         // all allocations came from the compute arena and were never cached.
         if (arena_mode_) {
-            release_graph_retained();
             return;
         }
 
@@ -42885,33 +42886,17 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             return;
         }
 
-        for (int i = 0; i < MAX_SYCL_BUFFERS; ++i) {
-            ggml_sycl_buffer & b = buffer_pool[i];
-            if (b.ptr == nullptr) {
-                auto it = active_handles.find(ptr);
-                // Ownership must have been retained at allocation time. A
-                // metadata lookup is observation-only and cannot mint it here.
-                if (it == active_handles.end() || !it->second.handle.valid()) {
-                    GGML_ASSERT(false && "device pool free without unified allocation mem_handle");
-                    return;
-                }
-                b.ptr    = ptr;
-                b.size   = it->second.size;
-                b.handle = std::move(it->second.handle);
-                active_handles.erase(it);
-                return;
-            }
-        }
-        GGML_LOG_WARN("WARNING: sycl buffer pool full, increase MAX_sycl_BUFFERS\n");
-        auto it = active_handles.find(ptr);
-        // Fail closed when the allocation-time owner was not retained.
-        if (it == active_handles.end() || !it->second.handle.valid()) {
+        // A free during graph recording is parked with the graph, not put back
+        // on the free list; see pool_legacy_release().
+        std::lock_guard<std::mutex>                 lock(arena_handles_mutex);
+        const ggml_sycl::pool_legacy_release_result released =
+            ggml_sycl::pool_legacy_release(ptr, ggml_sycl_graph_recording_active(), buffer_pool, MAX_SYCL_BUFFERS,
+                                           active_handles, graph_retained_handles, pool_size);
+        if (released == ggml_sycl::pool_legacy_release_result::MISSING_OWNER) {
             GGML_ASSERT(false && "device pool free without unified allocation mem_handle");
-            return;
+        } else if (released == ggml_sycl::pool_legacy_release_result::DROPPED) {
+            GGML_LOG_WARN("WARNING: sycl buffer pool full, increase MAX_sycl_BUFFERS\n");
         }
-        pool_size -= it->second.size;
-        it->second.handle = {};
-        active_handles.erase(it);
     }
 
     void release_graph_retained() override {
