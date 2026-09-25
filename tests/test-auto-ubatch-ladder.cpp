@@ -21,8 +21,8 @@
 #include <cstdio>
 
 // The trial's own ladder, so the cases below run on the real rungs.
-static const uint32_t * ladder   = llama_auto_ubatch_ladder;
-static const size_t     n_ladder = llama_auto_ubatch_ladder_size;
+static const uint32_t * const ladder   = llama_auto_ubatch_ladder;
+static const size_t           n_ladder = llama_auto_ubatch_ladder_size;
 
 static int g_failures = 0;
 

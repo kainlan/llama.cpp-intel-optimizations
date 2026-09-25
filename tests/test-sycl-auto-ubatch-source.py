@@ -299,7 +299,7 @@ def test_candidate_cap_uses_n_batch_and_n_ctx():
     ladder_idx = body_norm.find("const auto & ladder = llama_auto_ubatch_ladder;")
     loop_idx = body_norm.find("for (uint32_t c : ladder)")
     assert cap_idx != -1 and ladder_idx != -1 and loop_idx != -1
-    assert ladder_idx < cap_idx < loop_idx, "cap must be computed after the ladder literal and before the loop"
+    assert ladder_idx < cap_idx < loop_idx, "cap must be computed after `ladder` is bound to llama_auto_ubatch_ladder and before the loop"
 
     assert re.search(r"if\s*\(\s*c\s*>\s*cap\s*\)\s*\{\s*break\s*;\s*\}", body_norm), (
         "the loop must break on the first candidate exceeding cap"
