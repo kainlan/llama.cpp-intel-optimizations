@@ -79,12 +79,40 @@ struct kv_shape {
     bool     swa_full   = false;
 };
 
-// True when a runtime-context update must decide KV residency again. Only a new
-// KV shape does: a same-shape republish (the auto micro-batch trial) runs after
-// the context's KV is allocated, so its residency is already fixed and the
-// allocator's headroom already has that KV taken out of it. n_ubatch is not
-// part of the shape for that reason.
+// True when the KV shape differs from the published one (or the published plan
+// is still the load-time one). n_ubatch is not part of the shape: it does not
+// change KV size.
 bool kv_shape_changed(const kv_shape & published, const kv_shape & next);
+
+// Bytes runtime KV admission reserves on `device` for a residency: the KV of
+// every layer resident there plus per_layer_slack for each.
+size_t kv_device_demand(const std::vector<int> &    kv_device,
+                        const std::vector<size_t> & layer_kv_bytes,
+                        int                         device,
+                        size_t                      per_layer_slack = kv_alloc_slack_per_layer);
+
+// True when a runtime-context update must decide KV residency again:
+//  - the KV shape changed, or
+//  - a context not yet admitted (a new context, e.g. a second one of the same
+//    shape while the first one's KV is allocated) no longer fits the published
+//    residency: demand[i] (kv_device_demand() of it) exceeds the live headroom
+//    available[i] on some device.
+// A context that was already admitted keeps its residency on a same-shape
+// republish (the auto micro-batch trial) even when demand exceeds the live
+// headroom, because its own KV is already allocated and taken out of that
+// headroom; re-fitting would demote KV that already sits on the device.
+bool kv_residency_needs_refit(const kv_shape &            published,
+                              const kv_shape &            next,
+                              bool                        context_admitted,
+                              const std::vector<size_t> & demand,
+                              const std::vector<size_t> & available);
+
+// The tiered KV allocator's backstop: device-planned KV for one buffer larger
+// than the headroom it sees means admission and allocation disagreed. It
+// refuses rather than silently demoting (llama.cpp-17ea).
+inline bool kv_admission_mismatch(size_t planned_device_bytes, size_t kv_vram_cap) {
+    return planned_device_bytes > kv_vram_cap;
+}
 
 // Runtime KV residency for a new KV shape.
 struct kv_residency_input {

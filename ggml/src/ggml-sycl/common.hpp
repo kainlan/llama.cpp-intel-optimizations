@@ -5676,6 +5676,10 @@ struct ggml_backend_sycl_context {
     uint64_t                             execution_root_load_txn_id = 0;
     uint32_t                             execution_root_slot = GGML_SYCL_MODEL_SLOT_NONE;
     uint64_t                             execution_root_slot_generation = 0;
+    // Set once this context's runtime-context transaction published: its KV
+    // was admitted (and is then allocated), so a later same-shape republish
+    // keeps the published residency (kv_residency_needs_refit).
+    bool                                 runtime_kv_admitted = false;
     // Device capability: does this device support SoA weight layout optimization?
     // This is NOT tensor state - it's a static capability of the GPU.
     // Tensor state is tracked per-tensor in ggml_tensor_extra_gpu::optimized_feature
