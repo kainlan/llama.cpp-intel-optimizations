@@ -51590,23 +51590,17 @@ static bool ggml_sycl_deferred_copy_endpoint_for_tensor(const ggml_tensor *     
 }
 
 // True when `ptr` is host USM of the SYCL context that kernels for `device`
-// are submitted to, so such a kernel can read it in place. The queue is chosen
-// in the order ctx.stream(device, 0) uses (TP queue, unified-cache owner queue,
-// default queue); any other context answers "unknown" and the caller stages.
+// are submitted to, so such a kernel can read it in place. The queue comes from
+// ggml_sycl_execution_queue_for_device(), the function ctx.stream() itself
+// uses, so the probe and the kernel cannot disagree about the context. Host USM
+// of any other context answers "unknown", and with no execution queue yet the
+// answer is false: either way the caller stages.
 static bool ggml_sycl_host_ptr_addressable_on_device(const void * ptr, int device) {
     if (!ptr || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return false;
     }
-    sycl::queue * queue = ggml_sycl_get_tp_queue(device);
-    if (!queue) {
-        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
-            queue = &cache->get_queue();
-        }
-    }
-    if (!queue) {
-        queue = &ggml_sycl_get_device(device).default_queue();
-    }
-    return ggml_sycl_probe_alloc_type_on_queue(ptr, queue) == sycl::usm::alloc::host;
+    sycl::queue * queue = ggml_sycl_execution_queue_for_device(device);
+    return queue && ggml_sycl_probe_alloc_type_on_queue(ptr, queue) == sycl::usm::alloc::host;
 }
 
 static bool ggml_sycl_plan_simple_consumer_device(const ggml_tensor *                     dst,
@@ -88424,6 +88418,23 @@ static bool ggml_sycl_block_exec_dispatch_node_on_device(ggml_backend_sycl_conte
     return true;
 }
 
+// The placement plan the block executor and classifier see from `device`: the
+// device cache's plan when it has one, else the global plan. The owner keeps
+// the plan alive for the caller; empty when neither exists.
+static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_block_exec_visible_plan(int device) {
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (cache) {
+        auto cache_plan = ggml_sycl_cache_plan_owner(cache);
+        if (cache_plan && !cache_plan->entries.empty()) {
+            return cache_plan;
+        }
+    }
+    if (ggml_sycl_has_global_plan()) {
+        return ggml_sycl_global_plan_owner();
+    }
+    return {};
+}
+
 // Returns true when the executor ran the graph. *gate_out receives the first
 // gate that stopped it (BLOCK_EXEC_GATE_NONE when it ran), so the caller's
 // report is the decision itself rather than a separate guess at it.
@@ -88444,22 +88455,14 @@ static bool ggml_sycl_try_execute_candidate_layer_blocks(ggml_backend_sycl_conte
         gate = ggml_sycl::block_exec_first_failing_precheck(precheck);
         if (trace) {
             fprintf(stderr, "[SYCL-BLOCK-EXEC] skip candidate execute enabled=%d graph=%p recording=%d\n",
-                    ggml_sycl_block_exec_execute_enabled() ? 1 : 0, (void *) cgraph,
-                    g_ggml_sycl_graph_recording ? 1 : 0);
+                    precheck.execute_enabled ? 1 : 0, (void *) cgraph, precheck.graph_recording ? 1 : 0);
             fflush(stderr);
         }
         return false;
     }
 
-    ggml_sycl::unified_cache *        cache             = ggml_sycl::get_unified_cache_for_device(ctx.device);
-    const auto                        cache_plan_owner  = ggml_sycl_cache_plan_owner(cache);
-    const auto                        global_plan_owner = ggml_sycl_global_plan_owner();
-    const ggml_sycl::placement_plan * plan              = nullptr;
-    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-        plan = cache_plan_owner.get();
-    } else if (ggml_sycl_has_global_plan()) {
-        plan = global_plan_owner.get();
-    }
+    const auto                        plan_owner = ggml_sycl_block_exec_visible_plan(ctx.device);
+    const ggml_sycl::placement_plan * plan       = plan_owner.get();
     precheck.has_plan         = plan != nullptr;
     precheck.candidate_blocks = plan ? plan->candidate_layer_blocks.size() : 0;
     precheck.active_blocks    = active_stats.blocks;
@@ -88961,7 +88964,7 @@ static block_exec_graph_plan_stats ggml_sycl_classify_block_exec_graph_for_block
 
     // Diagnostics only: printed under GGML_SYCL_BLOCK_EXEC_TRACE, never per
     // token by default. Whether the executor ran is reported after it decides
-    // (see the executor= line at the call site); the classifier cannot know.
+    // ([SYCL-BLOCK-EXEC-RESULT] at the call site); the classifier cannot know.
     if (dump_plan) {
         fprintf(stderr,
                 "[SYCL-BLOCK-EXEC-%s] graph nodes=%d blocks=%zu active_blocks=%zu layer_nodes=%zu "
@@ -89075,19 +89078,12 @@ static block_exec_graph_plan_stats ggml_sycl_classify_block_exec_graph(ggml_back
                                                                        const ggml_cgraph *         cgraph,
                                                                        bool                        dump_plan) {
     block_exec_graph_plan_stats stats{};
-    ggml_sycl::unified_cache *  cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
     if (!cgraph) {
         return stats;
     }
 
-    const auto                        cache_plan_owner  = ggml_sycl_cache_plan_owner(cache);
-    const auto                        global_plan_owner = ggml_sycl_global_plan_owner();
-    const ggml_sycl::placement_plan * plan_ptr          = nullptr;
-    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-        plan_ptr = cache_plan_owner.get();
-    } else if (ggml_sycl_has_global_plan()) {
-        plan_ptr = global_plan_owner.get();
-    }
+    const auto                        plan_owner = ggml_sycl_block_exec_visible_plan(ctx.device);
+    const ggml_sycl::placement_plan * plan_ptr   = plan_owner.get();
     if (!plan_ptr) {
         if (dump_plan) {
             fprintf(stderr, "[SYCL-BLOCK-EXEC] no active placement plan visible at graph compute device=%d nodes=%d\n",
@@ -89129,15 +89125,23 @@ static block_exec_graph_plan_stats ggml_sycl_classify_block_exec_graph(ggml_back
 //     not classify at all;
 //   - otherwise: reuse the result while the placement plan, the backend
 //     context and the graph's node set are unchanged.
+// On a cache hit only the structural fields are current -- have_plan, blocks,
+// active_blocks, the layer/edge counts and safe_for_block_executor, which
+// follow from the plan and the node set. The storage-readiness fields
+// (external_leaf_*, boundary_*_ready/missing, runtime_context_input_*, ...)
+// describe the graph that populated the entry and may be stale. The executor
+// reads only `blocks`.
 struct block_exec_classify_cache {
     bool                                           valid      = false;
     const ggml_backend_sycl_context *              ctx        = nullptr;
     const ggml_cgraph *                            cgraph     = nullptr;
     int                                            n_nodes    = -1;
     uint64_t                                       nodes_hash = 0;
-    const ggml_sycl::placement_plan *              plan_ptr   = nullptr;
     // Held weakly so a replan that frees the old plan cannot alias a new plan
-    // allocated at the same address.
+    // allocated at the same address. has_plan separates "classified with no
+    // plan" from "classified with a plan that has since been freed", which an
+    // expired weak_ptr alone cannot.
+    bool                                           has_plan   = false;
     std::weak_ptr<const ggml_sycl::placement_plan> plan;
     block_exec_graph_plan_stats                    stats{};
 };
@@ -89151,13 +89155,7 @@ static block_exec_graph_plan_stats ggml_sycl_classify_block_exec_graph_cached(gg
         return {};
     }
 
-    ggml_sycl::unified_cache *                       cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-    std::shared_ptr<const ggml_sycl::placement_plan> plan;
-    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-        plan = ggml_sycl_cache_plan_owner(cache);
-    } else if (ggml_sycl_has_global_plan()) {
-        plan = ggml_sycl_global_plan_owner();
-    }
+    const std::shared_ptr<const ggml_sycl::placement_plan> plan       = ggml_sycl_block_exec_visible_plan(ctx.device);
     const uint64_t nodes_hash = cgraph->n_nodes > 0 ?
                                     ggml_sycl_fnv1a64(reinterpret_cast<const uint8_t *>(cgraph->nodes),
                                                       static_cast<size_t>(cgraph->n_nodes) * sizeof(cgraph->nodes[0])) :
@@ -89165,7 +89163,7 @@ static block_exec_graph_plan_stats ggml_sycl_classify_block_exec_graph_cached(gg
 
     static thread_local block_exec_classify_cache cached;
     if (cached.valid && cached.ctx == &ctx && cached.cgraph == cgraph && cached.n_nodes == cgraph->n_nodes &&
-        cached.nodes_hash == nodes_hash && cached.plan_ptr == plan.get() && cached.plan.lock() == plan) {
+        cached.nodes_hash == nodes_hash && cached.has_plan == (plan != nullptr) && cached.plan.lock() == plan) {
         return cached.stats;
     }
     cached.stats      = ggml_sycl_classify_block_exec_graph(ctx, cgraph, /*dump_plan=*/false);
@@ -89174,7 +89172,7 @@ static block_exec_graph_plan_stats ggml_sycl_classify_block_exec_graph_cached(gg
     cached.cgraph     = cgraph;
     cached.n_nodes    = cgraph->n_nodes;
     cached.nodes_hash = nodes_hash;
-    cached.plan_ptr   = plan.get();
+    cached.has_plan   = plan != nullptr;
     cached.plan       = plan;
     return cached.stats;
 }
@@ -90699,7 +90697,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     const bool                 block_exec_graph_executed =
         ggml_sycl_try_execute_candidate_layer_blocks(*sycl_ctx, cgraph, block_exec_stats, &block_exec_gate);
     if (block_exec_stats.have_plan && ggml_sycl_block_exec_plan_trace_enabled()) {
-        fprintf(stderr, "[SYCL-BLOCK-EXEC-ACTIVE] graph nodes=%d blocks=%zu executor=%s gate=%s\n", cgraph->n_nodes,
+        fprintf(stderr, "[SYCL-BLOCK-EXEC-RESULT] graph nodes=%d blocks=%zu executor=%s gate=%s\n", cgraph->n_nodes,
                 block_exec_stats.blocks, block_exec_graph_executed ? "executed" : "inactive",
                 ggml_sycl::block_exec_gate_name(block_exec_gate));
         fflush(stderr);

@@ -34,7 +34,10 @@ enum block_exec_gate {
     BLOCK_EXEC_GATE_PREPARE_CONTEXT,       // per-graph execution context could not be prepared
     BLOCK_EXEC_GATE_SMALL_BOUNDARY,        // largest boundary below GGML_SYCL_BLOCK_EXEC_MIN_BOUNDARY_BYTES
     BLOCK_EXEC_GATE_SECONDARY_PROMPT_MOE,  // prompt MoE on a secondary device is unsupported
-    BLOCK_EXEC_GATE_EXECUTION_REJECTED,    // a node failed after execution began
+    // The execution loop rejected the graph: an invalid block range or a failed
+    // preblock-input staging, node dispatch, drain or boundary copy. Some of
+    // these fire before any node has been dispatched, others after.
+    BLOCK_EXEC_GATE_EXECUTION_REJECTED,
 };
 
 struct block_exec_precheck_inputs {

@@ -5628,6 +5628,22 @@ inline bool ggml_sycl_weight_is_currently_device_resident(const ggml_tensor * te
 
 namespace sycl_ex = sycl::ext::oneapi::experimental;
 
+// The queue kernels for `device` are submitted to once the backend is running:
+// the TP shared-context queue when TP is enabled, else the device's
+// unified-cache owner queue (so resolved mem_handles, scratch and graph staging
+// share one SYCL context). nullptr before either exists. This is the single
+// source for that order: ggml_backend_sycl_context::stream() caches its answer,
+// and route planning probes USM ownership against the same context.
+inline sycl::queue * ggml_sycl_execution_queue_for_device(int device) {
+    if (sycl::queue * tp_queue = ggml_sycl_get_tp_queue(device)) {
+        return tp_queue;
+    }
+    if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
+        return &cache->get_queue();
+    }
+    return nullptr;
+}
+
 struct ggml_backend_sycl_context {
     // Retained by MMID queue capabilities so an exact queue binding cannot
     // outlive the backend context that selected it.
@@ -5773,27 +5789,14 @@ struct ggml_backend_sycl_context {
     ggml_backend_sycl_context & operator=(const ggml_backend_sycl_context &) = delete;
 
     queue_ptr stream(int device, int stream) {
-        // In TP mode, ALWAYS use the shared-context queue so all devices can access
-        // memory allocated in the shared context. Check every time since TP may be
-        // enabled after queues were first accessed.
-        sycl::queue * tp_queue = ggml_sycl_get_tp_queue(device);
-        if (tp_queue != nullptr) {
-            if (qptrs[device][stream] != tp_queue) {
-                qptrs[device][stream] = tp_queue;
-                GGML_SYCL_DEBUG("Using shared-context queue for device %d stream %d\n", device, stream);
+        // Re-evaluated every call: TP may be enabled, and the unified cache
+        // created, after queues were first accessed.
+        if (sycl::queue * execution_queue = ggml_sycl_execution_queue_for_device(device)) {
+            if (qptrs[device][stream] != execution_queue) {
+                qptrs[device][stream] = execution_queue;
+                GGML_SYCL_DEBUG("Using execution queue for device %d stream %d\n", device, stream);
             }
-            return tp_queue;
-        }
-        // Unified-cache owns allocation placement and lifetime.  If a cache
-        // already exists for this logical device, execute on its owner queue so
-        // resolved mem_handles, scratch, and graph staging use one SYCL context.
-        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
-            sycl::queue * cache_queue = &cache->get_queue();
-            if (qptrs[device][stream] != cache_queue) {
-                qptrs[device][stream] = cache_queue;
-                GGML_SYCL_DEBUG("Using unified-cache queue for device %d stream %d\n", device, stream);
-            }
-            return cache_queue;
+            return execution_queue;
         }
         // Before cache creation, fall back to the device default queue.
         if (qptrs[device][stream] == nullptr) {

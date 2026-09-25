@@ -110,7 +110,7 @@ static void test_unchanged_edges() {
     intermediate.owner   = -1;
     intermediate.is_leaf = false;
     check(!simple_consumer_src_needs_staging(intermediate, 0, 0, true),
-          "ownerless-intermediate-is-not-staged-by-the-leaf-rule");
+          "ownerless-intermediate-is-not-staged: the host-leaf rule applies only to graph leaves");
 }
 
 static block_exec_precheck_inputs all_prechecks_pass() {

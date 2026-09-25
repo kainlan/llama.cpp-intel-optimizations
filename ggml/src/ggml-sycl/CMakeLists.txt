@@ -5308,7 +5308,7 @@ set_target_properties(test-sycl-split-exec-policy PROPERTIES
 add_test(NAME sycl-split-exec-policy COMMAND test-sycl-split-exec-policy)
 set_tests_properties(sycl-split-exec-policy PROPERTIES
     # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never touches a device.
-    LABELS "sycl;host-only"
+    LABELS "sycl;host-only;tsan-capable"
     TIMEOUT 30
 )
 
