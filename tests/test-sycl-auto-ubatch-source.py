@@ -65,6 +65,11 @@ TEST_TUNING_CACHE_IO_CPP = (ROOT / "tests/test-tuning-cache-io.cpp").read_text()
 # llama.cpp-pyu4: the env-var catalog row this task's doc clause
 # lands in.
 SYCL_ENV_VARS_MD = (ROOT / "docs/backend/sycl-env-vars.md").read_text()
+# llama.cpp-pyu4: the pure helper behind the early exit before the ladder
+# loop, the host test that executes it, and that test's registration.
+LLAMA_AUTO_UBATCH_H = (ROOT / "src/llama-auto-ubatch.h").read_text()
+TEST_AUTO_UBATCH_LADDER_CPP = (ROOT / "tests/test-auto-ubatch-ladder.cpp").read_text()
+TESTS_CMAKELISTS = (ROOT / "tests/CMakeLists.txt").read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -1018,36 +1023,97 @@ def test_cache_hit_floor_has_a_mutation_witness():
     )
 
 
-def test_fallback_above_every_rung_exits_before_the_loop_with_no_warn():
-    """llama.cpp-pyu4: the floor-skip above means a raw-API caller whose
-    explicit n_ubatch (fallback_ubatch) already exceeds every ladder rung
-    (e.g. 8192 with n_ubatch_auto and cap >= 8192) would otherwise walk an
-    entirely-skipped ladder loop, leaving `tried` empty and reaching the
-    [SYCL-PLAN] auto n_ubatch= WARN with a "ladder exhausted" reason that
-    never actually ran a ladder -- exactly the shape
-    test_cap_below_first_rung_exits_before_the_loop_with_no_warn already
-    forbids at the OTHER edge. This early exit must be positioned AFTER
-    the tuning-cache lookup (so a persisted value at or above the floor
-    can still be revalidated and reported) and BEFORE the ladder loop, and
-    gated on `tried.empty()` so a genuine cache attempt this trial still
-    gets its normal outcome WARN."""
+_HAS_CANDIDATE_BOTH_BOUNDS_RE = (
+    r"inline\s+bool\s+llama_auto_ubatch_ladder_has_candidate\s*\(\s*const\s+uint32_t\s*\*\s*ladder\s*,\s*"
+    r"size_t\s+n_ladder\s*,\s*uint32_t\s+ubatch_floor\s*,\s*uint32_t\s+ubatch_cap\s*\)\s*\{\s*"
+    r"for\s*\(\s*size_t\s+i\s*=\s*0\s*;\s*i\s*<\s*n_ladder\s*;\s*\+\+i\s*\)\s*\{\s*"
+    r"if\s*\(\s*ladder\[i\]\s*>=\s*ubatch_floor\s*&&\s*ladder\[i\]\s*<=\s*ubatch_cap\s*\)\s*\{\s*"
+    r"return\s+true\s*;\s*\}\s*\}\s*return\s+false\s*;\s*\}"
+)
+
+_EARLY_EXIT_RE = (
+    r"if\s*\(\s*tried\.empty\s*\(\s*\)\s*&&\s*!\s*llama_auto_ubatch_ladder_has_candidate\s*\(\s*ladder\s*,\s*"
+    r"sizeof\s*\(\s*ladder\s*\)\s*/\s*sizeof\s*\(\s*ladder\[0\]\s*\)\s*,\s*fallback_ubatch\s*,\s*cap\s*\)\s*"
+    r"\)\s*\{"
+)
+
+
+def test_ladder_has_candidate_checks_both_bounds():
+    """llama.cpp-pyu4 (G1): llama_auto_ubatch_ladder_has_candidate()
+    (src/llama-auto-ubatch.h) must count a rung only when floor <= rung <=
+    cap. The ladder loop skips rungs under the floor AND breaks at the
+    first rung over the cap, so dropping either half readmits a shape in
+    which the loop tries nothing. tests/test-auto-ubatch-ladder.cpp
+    executes the helper on those shapes; this pins the text it runs."""
+    assert re.search(_HAS_CANDIDATE_BOTH_BOUNDS_RE, _normalize_ws(strip_comments(LLAMA_AUTO_UBATCH_H))), (
+        "llama_auto_ubatch_ladder_has_candidate must return true only when some rung satisfies "
+        "ubatch_floor <= rung <= ubatch_cap"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutant",
+    [
+        "        if (ladder[i] >= ubatch_floor) {\n",
+        "        if (ladder[i] <= ubatch_cap) {\n",
+    ],
+    ids=["no-cap-bound", "no-floor-bound"],
+)
+def test_ladder_has_candidate_one_bound_mutants_have_a_witness(mutant):
+    """Mutation witness for the check above: dropping either bound must
+    make it fail."""
+    raw = LLAMA_AUTO_UBATCH_H
+    line = "        if (ladder[i] >= ubatch_floor && ladder[i] <= ubatch_cap) {\n"
+    assert raw.count(line) == 1, f"mutation target not unique -- found {raw.count(line)}"
+    mutated_raw = raw.replace(line, mutant, 1)
+    assert mutated_raw != raw
+    assert not re.search(_HAS_CANDIDATE_BOTH_BOUNDS_RE, _normalize_ws(strip_comments(mutated_raw))), (
+        "mutation witness is broken: dropping a bound should make the both-bounds check fail"
+    )
+
+
+def test_ladder_has_candidate_host_test_is_registered_and_uses_the_trial_ladder():
+    """The executable witness must actually run under ctest, and its cases
+    are only meaningful against the trial's own rungs (the 600/1000 case
+    needs 512 and 1024 to be adjacent rungs)."""
+    assert re.search(r"^\s*llama_build_and_test\(\s*test-auto-ubatch-ladder\.cpp\b", TESTS_CMAKELISTS, re.M), (
+        "tests/CMakeLists.txt must register test-auto-ubatch-ladder.cpp with llama_build_and_test"
+    )
+    assert re.search(
+        r"static\s+const\s+uint32_t\s+ladder\s*\[\s*\]\s*=\s*\{\s*512\s*,\s*1024\s*,\s*2048\s*,\s*4096\s*\}\s*;",
+        TEST_AUTO_UBATCH_LADDER_CPP,
+    ), "the host test's ladder must equal the trial's { 512, 1024, 2048, 4096 }"
+    assert '#include "../src/llama-auto-ubatch.h"' in TEST_AUTO_UBATCH_LADDER_CPP
+
+
+def test_no_candidate_rung_exits_before_the_loop_with_no_warn():
+    """llama.cpp-pyu4 (G1): the trial must exit before the ladder loop
+    when no rung lies in [fallback_ubatch, cap] and no cache candidate was
+    tried this trial -- gated on tried.empty() &&
+    !llama_auto_ubatch_ladder_has_candidate(ladder, ..., fallback_ubatch,
+    cap). Not only when fallback_ubatch exceeds the largest rung: with
+    n_batch=1000 and n_ubatch=600 the floor is 600 and the cap 1000, so 512
+    is skipped and 1024 breaks the loop; and a MoE routing ceiling can
+    narrow cap below an explicit n_ubatch. Either would otherwise reach the
+    [SYCL-PLAN] auto n_ubatch= WARN with an empty `tried` list and persist
+    a terminal cache entry for a ladder that never ran -- the shape
+    test_cap_below_first_rung_exits_before_the_loop_with_no_warn forbids at
+    the other edge. The exit comes AFTER the tuning-cache lookup (a
+    persisted value at or above the floor can still be revalidated) and
+    BEFORE the loop."""
     body_norm = _normalize_ws(_trial_body())
-    cache_warn_idx = body_norm.find('[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)')
+    cache_warn_idx = body_norm.find("[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)")
     loop_idx = body_norm.find("for (uint32_t c : ladder)")
     warn_idx = body_norm.find("[SYCL-PLAN] auto n_ubatch=")
     assert cache_warn_idx != -1 and loop_idx != -1 and warn_idx != -1
 
-    exit_match = re.search(
-        r"if\s*\(\s*tried\.empty\s*\(\s*\)\s*&&\s*fallback_ubatch\s*>\s*"
-        r"ladder\[\s*sizeof\s*\(\s*ladder\s*\)\s*/\s*sizeof\s*\(\s*ladder\[0\]\s*\)\s*-\s*1\s*\]\s*\)\s*\{",
-        body_norm,
-    )
+    exit_match = re.search(_EARLY_EXIT_RE, body_norm)
     assert exit_match is not None, (
-        "there must be an early exit gated on tried.empty() && fallback_ubatch > the ladder's last rung"
+        "there must be an early exit gated on tried.empty() && "
+        "!llama_auto_ubatch_ladder_has_candidate(ladder, sizeof(ladder) / sizeof(ladder[0]), fallback_ubatch, cap)"
     )
     assert cache_warn_idx < exit_match.start() < loop_idx, (
-        "the fallback-above-every-rung early exit must come after the tuning-cache WARN and before the ladder "
-        "loop"
+        "the no-candidate early exit must come after the tuning-cache WARN and before the ladder loop"
     )
     assert exit_match.start() < warn_idx, "the WARN literal must not appear before this early exit"
 
@@ -1057,24 +1123,48 @@ def test_fallback_above_every_rung_exits_before_the_loop_with_no_warn():
     )
 
 
-def test_fallback_above_every_rung_early_exit_has_a_mutation_witness():
-    """Mutation witness for the check above: proves it would actually
-    catch the early exit being deleted (falling through into a ladder that
-    can try nothing, with `tried` staying empty)."""
-    raw = LLAMA_CONTEXT_CPP
-    early_exit_block = (
+_EARLY_EXIT_BLOCK = (
+    "    if (tried.empty() &&\n"
+    "        !llama_auto_ubatch_ladder_has_candidate(ladder, sizeof(ladder) / sizeof(ladder[0]), "
+    "fallback_ubatch, cap)) {\n"
+    "        sched_reserve();\n"
+    "        return;\n"
+    "    }\n"
+)
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        # deleted outright: the loop runs with nothing to try
+        "",
+        # the narrower last-rung form, which misses the 600/1000 and MoE shapes
         "    if (tried.empty() && fallback_ubatch > ladder[sizeof(ladder) / sizeof(ladder[0]) - 1]) {\n"
         "        sched_reserve();\n"
         "        return;\n"
-        "    }\n"
+        "    }\n",
+        # the cap argument swapped for the largest rung
+        "    if (tried.empty() &&\n"
+        "        !llama_auto_ubatch_ladder_has_candidate(ladder, sizeof(ladder) / sizeof(ladder[0]), "
+        "fallback_ubatch, 4096)) {\n"
+        "        sched_reserve();\n"
+        "        return;\n"
+        "    }\n",
+    ],
+    ids=["deleted", "last-rung-form", "cap-replaced-by-4096"],
+)
+def test_no_candidate_early_exit_mutants_have_a_witness(replacement):
+    """Mutation witness for the check above."""
+    raw = LLAMA_CONTEXT_CPP
+    assert raw.count(_EARLY_EXIT_BLOCK) == 1, (
+        "mutation target not found -- update this witness to match the real source"
     )
-    assert early_exit_block in raw, "mutation target not found -- update this witness to match the real source"
-    mutated_raw = raw.replace(early_exit_block, "", 1)
+    mutated_raw = raw.replace(_EARLY_EXIT_BLOCK, replacement, 1)
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    assert "fallback_ubatch > ladder[" not in mutated_body_norm, (
-        "mutation witness is broken: deleting the block should remove the early-exit check"
+    assert not re.search(_EARLY_EXIT_RE, mutated_body_norm), (
+        "mutation witness is broken: the mutant should make the early-exit check fail"
     )
 
 

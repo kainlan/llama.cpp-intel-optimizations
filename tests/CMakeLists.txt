@@ -3300,6 +3300,13 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-pyu4: executes llama_auto_ubatch_ladder_has_candidate()
+# (src/llama-auto-ubatch.h), the predicate behind the trial's early exit
+# before its ladder loop, on the shapes where no rung lies in
+# [fallback_ubatch, cap]. Header-only and pure integers: no device, no model,
+# no allocation, so it builds and runs in every configuration.
+llama_build_and_test(test-auto-ubatch-ladder.cpp)
+
 # llama.cpp-9goq: source gate over ggml/src/ggml-sycl/CMakeLists.txt itself --
 # (A) every target_link_libraries(...) naming the bare `ggml-sycl` MODULE
 # target must sit under a guard that guarantees GGML_BACKEND_DL is off (the

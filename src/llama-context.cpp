@@ -6,6 +6,7 @@
 #    include "ggml-sycl.h"
 #endif
 #include "llama-arch.h"
+#include "llama-auto-ubatch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -1776,20 +1777,23 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)\n", cache_state, cache_report_ubatch,
                    cache_paren.c_str());
 
-    // llama.cpp-pyu4: mirrors the cap < ladder[0] early exit above, for the
-    // OPPOSITE edge -- a raw-API caller whose explicit n_ubatch
-    // (fallback_ubatch) already exceeds every ladder rung leaves the
-    // floor-skip below unable to try anything, which would otherwise reach
-    // the [SYCL-PLAN] auto n_ubatch= WARN with an empty `tried` list and a
-    // "ladder exhausted" reason that never actually ran a ladder -- exactly
-    // the shape that early exit exists to prevent. Placed AFTER the cache
-    // lookup (not before it) so a persisted value at or above the floor can
-    // still be revalidated and reported; gated on tried.empty() so a
-    // genuine cache attempt this trial (a hit, or a lost cache candidate)
-    // still gets its normal outcome WARN and, on a hit, its store skip
-    // logic, same as today. No `[SYCL-PLAN] auto n_ubatch=` WARN and no
-    // cache store here, matching the other silent pre-trial exits.
-    if (tried.empty() && fallback_ubatch > ladder[sizeof(ladder) / sizeof(ladder[0]) - 1]) {
+    // llama.cpp-pyu4: the general form of the cap < ladder[0] early exit
+    // above. The loop below skips every rung under fallback_ubatch and stops
+    // at the first rung over cap, so with no rung in [fallback_ubatch, cap]
+    // it tries nothing, and the [SYCL-PLAN] auto n_ubatch= WARN would report
+    // an empty `tried` list and a stop reason for a ladder that never ran,
+    // then persist that reason as a terminal cache entry. Two ordinary
+    // shapes reach this with fallback_ubatch well under the largest rung:
+    // n_batch=1000 with n_ubatch=600 (512 is under the floor, 1024 over the
+    // cap), and a MoE model whose routing ceiling narrows cap below an
+    // explicit n_ubatch (nothing clamps fallback_ubatch to that ceiling).
+    // Placed AFTER the cache lookup so a persisted value at or above the
+    // floor can still be revalidated and reported; gated on tried.empty() so
+    // a cache attempt this trial (a hit, or a lost cache candidate) still
+    // gets its normal outcome WARN and store logic. No WARN and no cache
+    // store here, matching the other silent pre-trial exits.
+    if (tried.empty() &&
+        !llama_auto_ubatch_ladder_has_candidate(ladder, sizeof(ladder) / sizeof(ladder[0]), fallback_ubatch, cap)) {
         sched_reserve();
         return;
     }
