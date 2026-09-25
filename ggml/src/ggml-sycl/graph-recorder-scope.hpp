@@ -31,6 +31,15 @@
 // context back the snapshot it had. So each caller clears, commits or
 // discards it.
 //
+// The snapshot is a list of raw addresses the graph baked into its FA
+// kernels. It owns nothing: the buffers behind those addresses stay alive
+// through the graph's retained handles, the sink above. It describes the
+// graph it came from and is read only while that graph exists. On the
+// context it stays until the next recording, a drift check or a failed
+// recording clears it, and it outlives a cleared graph there only as dead
+// data. In a dense range entry it stays until the range is re-recorded or
+// abandoned, or its graphs are dropped.
+//
 // The slots are references, so this header needs no SYCL and a host test can
 // point it at fakes (tests/test-sycl-graph-recorder-scope.cpp); the depth
 // counter's type is a parameter for the same reason. A thread_local
