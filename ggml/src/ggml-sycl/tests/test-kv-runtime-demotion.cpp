@@ -1,4 +1,5 @@
 #include "../kv-runtime-demotion.hpp"
+#include "../tlsf-allocator.hpp"
 
 #include <cstdio>
 #include <vector>
@@ -27,9 +28,19 @@
         }                                                                                                              \
     } while (0)
 
+using ggml_sycl::kv_alloc_slack_per_layer;
 using ggml_sycl::kv_demotion_input;
 using ggml_sycl::kv_demotion_result;
+using ggml_sycl::kv_device_fit_input;
+using ggml_sycl::kv_residency_input;
+using ggml_sycl::kv_shape;
+using ggml_sycl::kv_shape_changed;
+using ggml_sycl::kv_weight_capacity;
+using ggml_sycl::layer_block_kv_device;
+using ggml_sycl::plan_device_kv_fit;
 using ggml_sycl::plan_runtime_kv_demotion;
+using ggml_sycl::plan_runtime_kv_residency;
+using ggml_sycl::tlsf_allocator;
 
 // Helper: n_layers alternating geometry like GPT-OSS (even = full-attn, odd = SWA).
 //
@@ -133,6 +144,171 @@ int main() {
         CHECK(r.demoted_layers == (std::vector<int>{ 2 }), "case 8: layer 4 (0 bytes) skipped, layer 2 demoted");
         CHECK_EQ(r.vram_bytes_after, 950, "case 8: vram_bytes_after reduced by layer 2's real bytes");
         CHECK_EQ(r.host_kv_bytes_added, 100, "case 8: host_kv_bytes_added == layer 2's bytes, not layer 4's 0");
+    }
+    // 9. The KV+weight capacity of a device is the shared arena zone when one
+    // exists, never the larger budget the zone was carved from: the B70 at
+    // GGML_SYCL_VRAM_BUDGET_PCT=22 has a 5136 MB budget but a 3856 MB zone.
+    {
+        const size_t mb = 1024 * 1024;
+        CHECK_EQ(kv_weight_capacity(5136 * mb, 3856 * mb), 3856 * mb, "case 9: zone below budget wins");
+        CHECK_EQ(kv_weight_capacity(3000 * mb, 3856 * mb), 3000 * mb, "case 9: budget below zone wins");
+        CHECK_EQ(kv_weight_capacity(5136 * mb, 0), 5136 * mb, "case 9: no arena zone -> budget");
+    }
+    // 10. The measured split (Mistral 7B, n_ctx=2048): device 0 holds layers
+    // 0-29 with 3683.8 MB of weights in a 3856 MB zone, device 1 holds 30-31.
+    // 172.2 MB of room fits 21 of device 0's 8 MB layers, so exactly 21..29
+    // demote, and device 1's layers are never touched by device 0's pass.
+    {
+        const size_t        mb = 1024 * 1024;
+        kv_device_fit_input in;
+        in.device       = 0;
+        in.capacity     = 3856 * mb;
+        in.non_kv_bytes = 3683 * mb + 819 * mb / 1000;
+        in.layer_kv_bytes.assign(32, 8 * mb);
+        in.kv_device.assign(32, 0);
+        in.kv_device[30] = 1;
+        in.kv_device[31] = 1;
+        in.swa_layer_mask.assign(32, 0);
+        auto r = plan_device_kv_fit(in);
+        CHECK(r.fits, "case 10: device 0 fits after demotion");
+        CHECK_EQ(r.demoted_layers.size(), 9, "case 10: nine layers demoted");
+        CHECK_EQ(r.demoted_layers.front(), 29, "case 10: latest device-0 layer first");
+        CHECK_EQ(r.demoted_layers.back(), 21, "case 10: stops at layer 21");
+        CHECK_EQ(r.host_kv_bytes_added, 72 * mb, "case 10: 72 MB of KV moves to host");
+
+        in.device       = 1;
+        in.capacity     = 676 * mb;
+        in.non_kv_bytes = 234 * mb;
+        auto r1         = plan_device_kv_fit(in);
+        CHECK(r1.fits, "case 10: device 1 fits");
+        CHECK(r1.demoted_layers.empty(), "case 10: device 1 demotes nothing");
+    }
+    // 11. The same split at n_ctx=1024 (4 MB layers) fits with no demotion.
+    {
+        const size_t        mb = 1024 * 1024;
+        kv_device_fit_input in;
+        in.device       = 0;
+        in.capacity     = 3856 * mb;
+        in.non_kv_bytes = 3683 * mb + 819 * mb / 1000;
+        in.layer_kv_bytes.assign(32, 4 * mb);
+        in.kv_device.assign(32, 0);
+        in.kv_device[30] = 1;
+        in.kv_device[31] = 1;
+        in.swa_layer_mask.assign(32, 0);
+        auto r = plan_device_kv_fit(in);
+        CHECK(r.fits, "case 11: fits");
+        CHECK(r.demoted_layers.empty(), "case 11: nothing demoted");
+    }
+    // 12. Weights alone over capacity: demoting every full-attention layer
+    // cannot help, and the result says so instead of claiming a fit.
+    {
+        kv_device_fit_input in;
+        in.device       = 0;
+        in.capacity     = 100;
+        in.non_kv_bytes = 150;
+        in.layer_kv_bytes.assign(2, 10);
+        in.kv_device.assign(2, 0);
+        in.swa_layer_mask.assign(2, 0);
+        auto r = plan_device_kv_fit(in);
+        CHECK(!r.fits, "case 12: cannot fit");
+    }
+    // 13. A block's KV owner: the one device every KV-holding layer uses, -2
+    // when they disagree (a demoted layer inside a device block), -1 with no
+    // KV at all. Layers with no KV of their own do not vote.
+    {
+        std::vector<int>    kv_dev   = { 0, 0, -1, 0, 1, 1 };
+        std::vector<size_t> kv_bytes = { 8, 8, 8, 0, 8, 8 };
+        CHECK_EQ(layer_block_kv_device(kv_dev, kv_bytes, 0, 1), 0, "case 13: uniform block");
+        CHECK_EQ(layer_block_kv_device(kv_dev, kv_bytes, 0, 2), -2, "case 13: demoted layer makes it mixed");
+        CHECK_EQ(layer_block_kv_device(kv_dev, kv_bytes, 3, 3), -1, "case 13: no KV -> -1");
+        CHECK_EQ(layer_block_kv_device(kv_dev, kv_bytes, 3, 5), 1, "case 13: KV-less layer does not vote");
+        CHECK_EQ(layer_block_kv_device(kv_dev, kv_bytes, 4, 9), 1, "case 13: range clamped to the vectors");
+    }
+    // 14. Only a new KV shape re-decides residency. The load-time plan always
+    // does; a republish that changes nothing the KV size depends on (the auto
+    // micro-batch trial) keeps the published residency.
+    {
+        kv_shape published;
+        published.runtime   = true;
+        published.n_ctx     = 2048;
+        published.n_seq_max = 1;
+        kv_shape next       = published;
+        CHECK(!kv_shape_changed(published, next), "case 14: same shape keeps residency");
+        kv_shape load = published;
+        load.runtime  = false;
+        CHECK(kv_shape_changed(load, next), "case 14: the load-time plan is always re-decided");
+        next.n_ctx = 512;
+        CHECK(kv_shape_changed(published, next), "case 14: n_ctx");
+        next           = published;
+        next.n_seq_max = 4;
+        CHECK(kv_shape_changed(published, next), "case 14: n_seq_max");
+        next            = published;
+        next.kv_unified = true;
+        CHECK(kv_shape_changed(published, next), "case 14: kv_unified");
+        next          = published;
+        next.swa_full = true;
+        CHECK(kv_shape_changed(published, next), "case 14: swa_full");
+    }
+    // 15. Demote at a large context, then a small one gets the load-time
+    // residency back: the split with 172.2 MB of live headroom on device 0.
+    // The slack (30 resident layers x 64 KiB) does not change the count.
+    {
+        const size_t       mb = 1024 * 1024;
+        kv_residency_input in;
+        in.load_kv_device.assign(32, 0);
+        in.load_kv_device[30] = 1;
+        in.load_kv_device[31] = 1;
+        in.swa_layer_mask.assign(32, 0);
+        in.devices   = { 0, 1 };
+        in.available = { 172 * mb + 205 * mb / 1000, 442 * mb };
+        in.layer_kv_bytes.assign(32, 8 * mb);
+        auto big = plan_runtime_kv_residency(in);
+        CHECK(big.fits, "case 15: n_ctx=2048 fits after demotion");
+        CHECK_EQ(big.per_device[0].demoted_layers.size(), 9, "case 15: nine layers demoted on device 0");
+        CHECK(big.per_device[1].demoted_layers.empty(), "case 15: device 1 keeps its layers");
+        for (int l = 0; l < 32; ++l) {
+            const int want = l >= 21 && l <= 29 ? -1 : in.load_kv_device[l];
+            CHECK_EQ(big.kv_device[l], want, "case 15: layers 21..29 on host, the rest where the planner put them");
+        }
+
+        in.layer_kv_bytes.assign(32, 2 * mb);  // n_ctx=512
+        auto small = plan_runtime_kv_residency(in);
+        CHECK(small.fits, "case 15: n_ctx=512 fits");
+        CHECK(small.kv_device == in.load_kv_device, "case 15: the load-time residency comes back");
+    }
+    // 16. KV that cannot fit even with every full-attention layer demoted
+    // (only SWA left) names the device instead of claiming a fit.
+    {
+        kv_residency_input in;
+        in.load_kv_device = { 0, 0 };
+        in.layer_kv_bytes = { 100, 100 };
+        in.swa_layer_mask = { 1, 0 };
+        in.devices        = { 0 };
+        in.available      = { 50 + 2 * kv_alloc_slack_per_layer };
+        auto r            = plan_runtime_kv_residency(in);
+        CHECK(!r.fits, "case 16: SWA KV over headroom cannot fit");
+        CHECK_EQ(r.refused_device, 0, "case 16: the refusal names device 0");
+    }
+    // 17. The slack is enough for the arena allocator: layers admitted against
+    // exactly sum(bytes) + n * slack of headroom all place, one allocation at a
+    // time and in two KV buffers, at the tiered allocator's 512-byte alignment.
+    {
+        const size_t        mb     = 1024 * 1024;
+        std::vector<size_t> layers = { 8 * mb + 1, 8 * mb + 511, 128 * mb + 300, 3 * mb / 2 + 7, 1, 256 };
+        size_t              sum    = 0;
+        for (size_t b : layers) {
+            sum += b;
+        }
+        tlsf_allocator arena(sum + layers.size() * kv_alloc_slack_per_layer);
+        for (size_t pass = 0; pass < 2; ++pass) {  // full-attention buffer, then SWA buffer
+            for (size_t i = pass; i < layers.size(); i += 2) {
+                const size_t request = (layers[i] + 511) & ~size_t(511);
+                const size_t before  = arena.used();
+                CHECK(arena.allocate(request) != SIZE_MAX, "case 17: an admitted layer places");
+                CHECK(arena.used() - before <= layers[i] + kv_alloc_slack_per_layer,
+                      "case 17: one allocation costs at most its bytes plus the slack");
+            }
+        }
     }
     std::printf("test-kv-runtime-demotion: all ok\n");
     return 0;

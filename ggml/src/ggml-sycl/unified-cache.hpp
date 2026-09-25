@@ -10,6 +10,7 @@
 #include "device-pool.hpp"
 #include "dpct/helper.hpp"
 #include "ggml-sycl.h"
+#include "kv-runtime-demotion.hpp"
 #include "mem-handle.hpp"
 #include "moe-control-plan.hpp"
 #include "moe-mmid-workspace.hpp"
@@ -961,6 +962,13 @@ struct placement_plan {
     // KV cache for a layer lives on the same device as its dense weights.
     std::unordered_map<int, int> kv_device;
 
+    // kv_device as the load-time planner left it, captured by the first
+    // runtime-context transaction. Every KV-shape change re-decides residency
+    // from here, so a context that demoted KV at a large n_ctx does not leave
+    // a later, smaller context on the host tier.
+    std::unordered_map<int, int> load_kv_device;
+    bool                         load_kv_device_valid = false;
+
     // layer_device[layer_id] = device_id (-1 = host/CPU) for the dense
     // execution unit of the layer. This is the authoritative placement for the
     // layer's shared dense weights; MoE experts remain separately placeable.
@@ -974,6 +982,43 @@ struct placement_plan {
     int get_layer_device(int layer_id) const {
         auto it = layer_device.find(layer_id);
         return it == layer_device.end() ? -1 : it->second;
+    }
+
+    // The KV owner of layers [start_layer, end_layer] (-2 = mixed, -1 =
+    // none), from the same per-layer KV bytes every other consumer sizes from.
+    int layer_range_kv_device(int start_layer, int end_layer) const {
+        const size_t        n_layers = end_layer >= 0 ? static_cast<size_t>(end_layer) + 1 : 0;
+        std::vector<int>    owners(n_layers, -1);
+        std::vector<size_t> bytes(n_layers, 0);
+        for (size_t l = 0; l < n_layers; ++l) {
+            owners[l] = get_kv_device(static_cast<int>(l));
+            bytes[l]  = kv_size_for_layer(static_cast<uint32_t>(l));
+        }
+        return layer_block_kv_device(owners, bytes, start_layer, end_layer);
+    }
+
+    // Sum of KV bytes placed on `device` -- the KV the runtime-context
+    // transaction admitted there. Pairs with unified_cache_kv_vram_available().
+    size_t device_kv_vram_bytes(int device) const {
+        size_t total = 0;
+        for (const auto & [layer, owner] : kv_device) {
+            if (owner == device && layer >= 0) {
+                total += kv_size_for_layer(static_cast<uint32_t>(layer));
+            }
+        }
+        return total;
+    }
+
+    // Re-derive every block's KV owner after kv_device changed, so a block
+    // whose KV was partly demoted reads as mixed and the block executor,
+    // which requires kv_device == execution_device, declines it.
+    void refresh_layer_block_kv_devices() {
+        for (layer_block & block : layer_blocks) {
+            block.kv_device = layer_range_kv_device(block.start_layer, block.end_layer);
+        }
+        for (layer_block & block : candidate_layer_blocks) {
+            block.kv_device = layer_range_kv_device(block.start_layer, block.end_layer);
+        }
     }
 
     // True when kv_size_for_layer(layer_id) answers from the per-layer truth
@@ -6551,6 +6596,24 @@ size_t unified_cache_compute_arena_used(int device_id);
 // Query KV arena zone capacity and usage.
 size_t unified_cache_kv_arena_capacity(int device_id);
 size_t unified_cache_kv_arena_used(int device_id);
+
+// Two different questions about the shared KV+weight zone, answered by two
+// functions on purpose:
+//
+// unified_cache_kv_weight_capacity(): how many bytes of weights plus KV the
+// device CAN hold -- kv_weight_capacity() of its budget and the zone. It is a
+// before-materialization question, so the planners pack weights against it.
+// `multi_device` mirrors the multi-device planner, which does not read a
+// per-device zone out of the single GLOBAL cache.
+//
+// unified_cache_kv_vram_available(): how many bytes of KV fit on the device
+// NOW -- the zone's live free space after every weight actually materialized
+// and every zone grew. The planned weight bytes under-count that
+// (llama.cpp-jehw), so KV is never admitted against the capacity above: the
+// runtime-context transaction, its non-publishing probe and the tiered KV
+// allocator all admit against this one number.
+size_t unified_cache_kv_weight_capacity(int device_id, size_t vram_budget, bool multi_device);
+size_t unified_cache_kv_vram_available(int device_id);
 
 // Sum of zone_used(KV) + zone_used(ONEDNN) + zone_used(RUNTIME) + zone_used(SCRATCH).
 // Returns 0 when arena is inactive.

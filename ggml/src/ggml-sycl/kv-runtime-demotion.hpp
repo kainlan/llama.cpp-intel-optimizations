@@ -52,4 +52,88 @@ struct kv_demotion_result {
 // update) applies the result to placement_plan::kv_device.
 kv_demotion_result plan_runtime_kv_demotion(const kv_demotion_input & in);
 
+// How many bytes of weights plus KV one device can hold before anything is
+// materialized: with the VRAM arena active, weights and KV share one zone that
+// is smaller than the device budget (the budget also pays for the SCRATCH,
+// RUNTIME and ONEDNN zones). The planners pack weights against this. It is not
+// what runtime KV admission asks: once weights are materialized, what is left
+// for KV is the allocator's live headroom (unified_cache_kv_vram_available()),
+// which also sees layout copies and zone growth the plan never charged.
+// shared_zone_capacity == 0 means no arena zone: the budget is the limit.
+size_t kv_weight_capacity(size_t vram_budget, size_t shared_zone_capacity);
+
+// Headroom runtime KV admission reserves per device-resident layer, so that a
+// set of layers admitted against the allocator's live headroom still fits when
+// the tiered KV allocator places them one allocation at a time, possibly across
+// two KV buffers. It covers the arena allocator rounding every allocation up to
+// its 256-byte block and the tiered allocator's 512-byte layer alignment, with
+// room to spare; test-kv-runtime-demotion pins it against the allocator itself.
+constexpr size_t kv_alloc_slack_per_layer = 64 * 1024;
+
+// The KV cache's shape as far as its size is concerned.
+struct kv_shape {
+    bool     runtime    = false;  // false: the load-time plan, before any runtime context
+    uint32_t n_ctx      = 0;
+    uint32_t n_seq_max  = 0;
+    bool     kv_unified = false;
+    bool     swa_full   = false;
+};
+
+// True when a runtime-context update must decide KV residency again. Only a new
+// KV shape does: a same-shape republish (the auto micro-batch trial) runs after
+// the context's KV is allocated, so its residency is already fixed and the
+// allocator's headroom already has that KV taken out of it. n_ubatch is not
+// part of the shape for that reason.
+bool kv_shape_changed(const kv_shape & published, const kv_shape & next);
+
+// Runtime KV residency for a new KV shape.
+struct kv_residency_input {
+    // The planner's residency before any runtime demotion, so a smaller context
+    // gets back the device residency a larger one gave up. Same conventions as
+    // kv_demotion_input::kv_device.
+    std::vector<int>     load_kv_device;
+    std::vector<size_t>  layer_kv_bytes;  // at the new shape
+    std::vector<uint8_t> swa_layer_mask;
+    std::vector<int>     devices;         // devices to fit, in order
+    std::vector<size_t>  available;       // live KV headroom of devices[i]
+    size_t               per_layer_slack = kv_alloc_slack_per_layer;
+};
+
+struct kv_residency_result {
+    bool                            fits           = true;
+    int                             refused_device = -1;  // the device that cannot fit even with KV demoted
+    std::vector<int>                kv_device;            // the new residency
+    std::vector<kv_demotion_result> per_device;           // same indexing as devices
+};
+
+// Starts from load_kv_device and demotes each device's latest full-attention
+// layers to the host tier until its KV, plus per_layer_slack per resident
+// layer, fits that device's headroom.
+kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in);
+
+// One device's view of a (possibly multi-device) plan for the zone-fit pass.
+struct kv_device_fit_input {
+    int                  device       = -1;
+    size_t               capacity     = 0;  // kv_weight_capacity() for this device
+    size_t               non_kv_bytes = 0;  // weights and other non-KV charges in the shared zone
+    // Indexed by layer id, same conventions as kv_demotion_input. Layers owned
+    // by other devices (or already on host) are never touched.
+    std::vector<size_t>  layer_kv_bytes;
+    std::vector<int>     kv_device;
+    std::vector<uint8_t> swa_layer_mask;
+};
+
+// Which of `device`'s full-attention KV layers must move to the host tier so
+// its weights plus KV fit `capacity`. Latest layers first, same rules as
+// plan_runtime_kv_demotion(), which it delegates to.
+kv_demotion_result plan_device_kv_fit(const kv_device_fit_input & in);
+
+// The KV owner of layers [start_layer, end_layer]: the device every layer that
+// holds KV uses, -2 when they disagree, -1 when none holds KV. Layers with 0
+// recorded bytes do not vote. The range is clamped to the vectors.
+int layer_block_kv_device(const std::vector<int> &    kv_device,
+                          const std::vector<size_t> & layer_kv_bytes,
+                          int                         start_layer,
+                          int                         end_layer);
+
 }  // namespace ggml_sycl
