@@ -20,8 +20,10 @@
 // back on around work that must run outside the graph, keeping the graph,
 // queue and context flags. The scope tracks whether it holds its depth, so an
 // exception inside a pause does not take the depth twice. Code that pauses
-// finds the recording through active(), the innermost open scope on this
-// thread; only the constructor and destructor change it.
+// finds the recording through active(), the innermost live scope on this
+// thread (constructed and not yet destroyed); only the constructor and
+// destructor change it. That scope may already have left, so callers check
+// open() before pausing.
 //
 // The scope owns the flag that turns FA pointer capture on, not the snapshot
 // it captures (the context's fa_graph_ptrs and fa_graph_ptrs_valid). The
@@ -38,8 +40,18 @@
 // addresses valid is elsewhere: Q, K, V, mask and dst live in the KV cache and
 // compute buffers the llama context owns (sinks in the model's weights),
 // staged inputs in the backend context's input staging, and the graph's
-// scratch in its retained handles.
+// scratch in its retained handles. block_table and seq_lens (paged attention
+// only) resolve like the other activations: through the input staging when
+// they are staged graph inputs, otherwise to the context buffer that holds
+// the tensor.
 // The sink above only collects handles released during recording.
+// One exception: when sinks, or a mask that is not a staged input, resolve
+// to non-device memory, FA bakes its thread_local weight-staging slot
+// (g_tl_fattn_weight_stage, fattn.cpp) instead. Neither the model nor the
+// retained handles own that slot, and it can be regrown or freed
+// independently of the graph. Such a graph is kept from replaying only
+// because the drift check compares the tensor's own address with the staged
+// one, which never match, so every such call records again.
 // On the context the snapshot stays until the next recording, a drift check or
 // a failed recording clears it, and it outlives a cleared graph there only as
 // dead data. In a dense range entry it stays until the range is re-recorded or
