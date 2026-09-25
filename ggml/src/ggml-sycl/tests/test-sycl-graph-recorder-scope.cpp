@@ -372,18 +372,15 @@ void test_exception_after_resume() {
 // active() is the innermost scope alive on this thread: set by construction,
 // handed back by destruction, and unchanged by leave(). A left scope is still
 // active() but no longer open(), which is why the MUL_MAT_ID pause site checks
-// both before pausing.
+// both before pausing. Two scopes are alive at once only in the shape the
+// backend allows: the idle-entry assert forbids opening a scope while another
+// is open, so the outer one has left before the inner one is made.
 void test_active_scope() {
     fixture f;
     check(scope::active() == nullptr, "no scope is active before one exists");
     {
         scope outer(slots_of(f.state), &f.graph, &f.queue, &f.sink, true);
         check(scope::active() == &outer, "a new scope is active");
-        {
-            scope inner(slots_of(f.state), &f.graph, &f.queue, &f.sink, false);
-            check(scope::active() == &inner, "the innermost scope is active");
-        }
-        check(scope::active() == &outer, "destroying the inner scope hands back the outer one");
         check(scope::active()->open(), "the active scope is open before it leaves");
         outer.pause();
         check(scope::active()->open(), "a paused scope is still open");
@@ -391,6 +388,14 @@ void test_active_scope() {
         outer.leave();
         check(scope::active() == &outer, "leave() does not change the active scope");
         check(!scope::active()->open(), "a left scope is active but not open");
+        check_idle(f.state, 0, false, "after the outer scope leaves");
+        {
+            scope inner(slots_of(f.state), &f.graph, &f.queue, &f.sink, false);
+            check(scope::active() == &inner, "a scope made after the outer one left is active");
+            check(scope::active()->open(), "and it is open");
+        }
+        check(scope::active() == &outer, "destroying the inner scope hands back the left outer one");
+        check(!scope::active()->open(), "which is still not open");
     }
     check(scope::active() == nullptr, "no scope is active after the last one");
 

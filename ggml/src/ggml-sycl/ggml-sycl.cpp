@@ -422,9 +422,10 @@ using ggml_sycl_graph_recorder =
 // recording starts at the top of graph_compute, and the dense executor refuses
 // to run while a graph records. The recorder puts back what it found, so this
 // check is what makes that the idle state. Only state leaked by an earlier
-// recording that skipped its own cleanup can fail it. The MoE segment and block
-// recorders set the flag and graph/queue pointers by hand and put them back only
-// on std exceptions; after any other, graph_compute's catch (...) resets them.
+// recording that skipped its own cleanup can fail it. The MoE segment, block and
+// descriptor-dispatch recorders set the flag and graph/queue pointers by hand
+// and put them back on success and on std exceptions; after any other
+// exception, graph_compute's catch (...) resets them.
 static ggml_sycl_graph_recorder::slots ggml_sycl_graph_recorder_slots(ggml_backend_sycl_context & ctx) {
     GGML_ASSERT(!g_ggml_sycl_graph_recording && g_recording_graph_ptr == nullptr && g_recording_queue_ptr == nullptr &&
                 !ctx.graph_recording_dispatch && !ctx.fa_graph_ptrs_recording &&

@@ -31,13 +31,18 @@
 // context back the snapshot it had. So each caller clears, commits or
 // discards it.
 //
-// The snapshot is a list of raw addresses the graph baked into its FA
-// kernels. It owns nothing: the buffers behind those addresses stay alive
-// through the graph's retained handles, the sink above. It describes the
-// graph it came from and is read only while that graph exists. On the
-// context it stays until the next recording, a drift check or a failed
-// recording clears it, and it outlives a cleared graph there only as dead
-// data. In a dense range entry it stays until the range is re-recorded or
+// The snapshot is a list of the addresses and extents the graph baked into
+// its FA kernels. It is only compared, never dereferenced: graph_fa_ptrs_match
+// checks the current tensors' addresses and extents against it, so it owns
+// nothing and needs nothing kept alive. What keeps the graph's baked
+// addresses valid is elsewhere: Q, K, V, mask and dst live in the KV cache and
+// compute buffers the llama context owns (sinks in the model's weights),
+// staged inputs in the backend context's input staging, and the graph's
+// scratch in its retained handles.
+// The sink above only collects handles released during recording.
+// On the context the snapshot stays until the next recording, a drift check or
+// a failed recording clears it, and it outlives a cleared graph there only as
+// dead data. In a dense range entry it stays until the range is re-recorded or
 // abandoned, or its graphs are dropped.
 //
 // The slots are references, so this header needs no SYCL and a host test can
