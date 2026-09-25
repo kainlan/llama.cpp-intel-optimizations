@@ -46,9 +46,11 @@
 // The sink above only collects handles released during recording.
 // One exception: when sinks, or a mask that is not a staged input, resolve
 // to non-device memory, FA normally bakes its thread_local weight-staging
-// slot (g_tl_fattn_weight_stage, fattn.cpp) instead. It keeps the resolved,
-// model-owned host-pinned address when the tensor has zero bytes or staging
-// cannot allocate; that address matches the drift check and is safe to replay.
+// slot (g_tl_fattn_weight_stage, fattn.cpp) instead. It keeps the resolved
+// address instead (the model's weight for sinks, the context's compute buffer
+// for a mask) when the tensor has zero bytes or staging cannot allocate; that
+// address matches the drift check and its owner above keeps it valid, so such
+// a graph is safe to replay.
 // Neither the model nor the retained handles own the slot, and it can be
 // regrown or freed independently of the graph. A graph that baked the slot
 // is kept from replaying only because the drift check compares the tensor's
