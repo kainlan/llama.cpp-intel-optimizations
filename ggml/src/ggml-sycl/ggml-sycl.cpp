@@ -43088,6 +43088,7 @@ void ggml_sycl::SdpaCacheDeleter::operator()(void * ptr) const {
 static void graph_unpin_moe_experts(ggml_backend_sycl_context * ctx);
 static void graph_unpin_weights(ggml_backend_sycl_context * ctx);
 static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ctx);
+static void ggml_sycl_block_exec_dense_release(ggml_backend_sycl_context * ctx);
 
 ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     // graph_compute may return with work still in flight when async exit is
@@ -43116,6 +43117,7 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
         }
     }
     ggml_sycl::drain_retained_handles(true);
+    ggml_sycl_block_exec_dense_release(this);
     mmvq_q8_activation_cache.release();
     for (auto & [tensor, extra] : runtime_tensor_extras) {
         (void) tensor;
@@ -88416,6 +88418,42 @@ static bool ggml_sycl_block_exec_copy_boundaries_from_block(ggml_backend_sycl_co
     return true;
 }
 
+// Makes `device` the one the node loop dispatches to (scheduler-visible
+// device, ctx.device, SOA capability) and restores the previous device on
+// destruction. Shared by the candidate and dense block executors.
+struct ggml_sycl_block_exec_device_scope {
+    ggml_backend_sycl_context & ctx;
+    int                         prev_device      = -1;
+    int                         prev_dpct_device = -1;
+    bool                        prev_soa         = false;
+
+    ggml_sycl_block_exec_device_scope(ggml_backend_sycl_context & ctx, int device) :
+        ctx(ctx),
+        prev_device(ctx.device),
+        prev_soa(ctx.supports_soa_reorder) {
+        prev_dpct_device = get_current_device_id();
+        SYCL_CHECK(ggml_sycl_set_scheduler_visible_device(device));
+        ctx.device               = device;
+        ctx.supports_soa_reorder = ggml_sycl_info().devices[device].supports_soa_reorder;
+        ggml_sycl_data_ptr_cache_new_graph();
+    }
+
+    ~ggml_sycl_block_exec_device_scope() {
+        if (prev_dpct_device >= 0) {
+            try {
+                dpct::select_device(static_cast<unsigned int>(prev_dpct_device));
+            } catch (...) {
+            }
+        }
+        ctx.device               = prev_device;
+        ctx.supports_soa_reorder = prev_soa;
+        ggml_sycl_data_ptr_cache_new_graph();
+    }
+
+    ggml_sycl_block_exec_device_scope(const ggml_sycl_block_exec_device_scope &)             = delete;
+    ggml_sycl_block_exec_device_scope & operator=(const ggml_sycl_block_exec_device_scope &) = delete;
+};
+
 static bool ggml_sycl_block_exec_dispatch_node_on_device(ggml_backend_sycl_context &    ctx,
                                                          ggml_tensor *                  node,
                                                          int                            device,
@@ -88433,35 +88471,7 @@ static bool ggml_sycl_block_exec_dispatch_node_on_device(ggml_backend_sycl_conte
         return false;
     };
 
-    struct device_scope {
-        ggml_backend_sycl_context & ctx;
-        int                         prev_device      = -1;
-        int                         prev_dpct_device = -1;
-        bool                        prev_soa         = false;
-
-        device_scope(ggml_backend_sycl_context & ctx, int device) :
-            ctx(ctx),
-            prev_device(ctx.device),
-            prev_soa(ctx.supports_soa_reorder) {
-            prev_dpct_device = get_current_device_id();
-            SYCL_CHECK(ggml_sycl_set_scheduler_visible_device(device));
-            ctx.device               = device;
-            ctx.supports_soa_reorder = ggml_sycl_info().devices[device].supports_soa_reorder;
-            ggml_sycl_data_ptr_cache_new_graph();
-        }
-
-        ~device_scope() {
-            if (prev_dpct_device >= 0) {
-                try {
-                    dpct::select_device(static_cast<unsigned int>(prev_dpct_device));
-                } catch (...) {
-                }
-            }
-            ctx.device               = prev_device;
-            ctx.supports_soa_reorder = prev_soa;
-            ggml_sycl_data_ptr_cache_new_graph();
-        }
-    } scope(ctx, device);
+    ggml_sycl_block_exec_device_scope scope(ctx, device);
 
     if (exec_ctx) {
         if (!ggml_sycl_block_exec_republish_planned_output(ctx, node, device, *exec_ctx)) {
@@ -88748,26 +88758,468 @@ static bool ggml_sycl_try_execute_candidate_layer_blocks(ggml_backend_sycl_conte
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Dense-split block executor (llama.cpp-tf8m). The decisions live in
+// block-exec-dense.hpp; this is the part that touches devices.
+// ---------------------------------------------------------------------------
+
+static bool ggml_sycl_block_exec_dense_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_BLOCK_EXEC_DENSE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static size_t ggml_sycl_block_exec_dense_max_arena_bytes() {
+    static const size_t bytes = [] {
+        const char * env = std::getenv("GGML_SYCL_BLOCK_EXEC_DENSE_MAX_ARENA_MB");
+        const long   mb  = env != nullptr ? std::atol(env) : 1024;
+        return static_cast<size_t>(mb > 0 ? mb : 1024) * 1024 * 1024;
+    }();
+    return bytes;
+}
+
+static sycl::queue * ggml_sycl_block_exec_dense_queue(ggml_backend_sycl_context & ctx, int device) {
+    if (sycl::queue * q = ggml_sycl_execution_queue_for_device(device)) {
+        return q;
+    }
+    return ctx.stream(device, 0);
+}
+
+// Per backend context: one device arena per device the executor stages into.
+// An arena only grows, and is dropped when the placement plan changes. Each
+// arena is a mem_handle; the slices a graph publishes are retained views of
+// it, so no published storage can outlive its owner.
+struct ggml_sycl_block_exec_dense_state {
+    std::weak_ptr<const ggml_sycl::placement_plan> plan;
+    ggml_sycl::mem_handle                          arena[GGML_SYCL_MAX_DEVICES];
+    size_t                                         arena_bytes[GGML_SYCL_MAX_DEVICES] = {};
+
+    // Kernels of an earlier graph may still read an arena: drain its device
+    // before letting go of it.
+    void drop_arena(ggml_backend_sycl_context * ctx, int device) {
+        if (!arena[device].valid()) {
+            return;
+        }
+        sycl::queue * q = ggml_sycl_execution_queue_for_device(device);
+        if (!q && ctx) {
+            q = ctx->stream(device, 0);
+        }
+        if (q) {
+            try {
+                q->wait_and_throw();
+            } catch (const std::exception & e) {
+                GGML_LOG_WARN("[SYCL-BLOCK-EXEC-DENSE] drain before arena release failed device=%d: %s\n", device,
+                              e.what());
+            }
+        }
+        arena[device]       = ggml_sycl::mem_handle{};
+        arena_bytes[device] = 0;
+    }
+};
+
+static std::mutex g_ggml_sycl_block_exec_dense_states_mutex;
+static std::unordered_map<const ggml_backend_sycl_context *, std::unique_ptr<ggml_sycl_block_exec_dense_state>>
+    g_ggml_sycl_block_exec_dense_states;
+
+static ggml_sycl_block_exec_dense_state & ggml_sycl_block_exec_dense_state_for(const ggml_backend_sycl_context & ctx) {
+    std::lock_guard<std::mutex> lock(g_ggml_sycl_block_exec_dense_states_mutex);
+    auto &                      state = g_ggml_sycl_block_exec_dense_states[&ctx];
+    if (!state) {
+        state = std::make_unique<ggml_sycl_block_exec_dense_state>();
+    }
+    return *state;
+}
+
+static void ggml_sycl_block_exec_dense_release(ggml_backend_sycl_context * ctx) {
+    std::unique_ptr<ggml_sycl_block_exec_dense_state> state;
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_sycl_block_exec_dense_states_mutex);
+        auto                        it = g_ggml_sycl_block_exec_dense_states.find(ctx);
+        if (it == g_ggml_sycl_block_exec_dense_states.end()) {
+            return;
+        }
+        state = std::move(it->second);
+        g_ggml_sycl_block_exec_dense_states.erase(it);
+    }
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        state->drop_arena(ctx, d);
+    }
+}
+
 // Drives the node loop of ggml_backend_sycl_graph_compute_impl over contiguous
-// node ranges. With no range plan there is one range, the whole graph, and the
-// loop runs exactly as it always has.
+// node ranges. Without the executor there is one range, the whole graph, and
+// the loop runs exactly as it always has. With it, each executor range runs on
+// its own device: its inputs are copied in and published before it runs, the
+// per-op routes are off while it runs, and what later ranges read is copied
+// back to the backend's device when it ends. Every copy is synchronous.
 class ggml_sycl_block_exec_dense_run {
   public:
-    explicit ggml_sycl_block_exec_dense_run(ggml_cgraph * cgraph) : cgraph_(cgraph) {}
+    ggml_sycl_block_exec_dense_run(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, bool unsupported_mode) :
+        ctx_(ctx),
+        cgraph_(cgraph),
+        original_device_(ctx.device) {
+        gate_ = prepare(unsupported_mode);
+        trace_result();
+    }
 
-    // False once `idx` is past the last range.
-    bool enter_range(int idx) { return cgraph_ != nullptr && idx == 0; }
+    ~ggml_sycl_block_exec_dense_run() {
+        g_ggml_sycl_block_exec_dense_active = false;
+        restore(range_publications_);
+        scope_.reset();
+        restore(graph_publications_);
+    }
+
+    ggml_sycl_block_exec_dense_run(const ggml_sycl_block_exec_dense_run &)             = delete;
+    ggml_sycl_block_exec_dense_run & operator=(const ggml_sycl_block_exec_dense_run &) = delete;
+
+    // False once `idx` is past the last range. Entering an executor range
+    // stages and publishes its inputs and switches to its device.
+    bool enter_range(int idx) {
+        if (cgraph_ == nullptr) {
+            return false;
+        }
+        if (gate_ != ggml_sycl::DENSE_EXEC_GATE_NONE) {
+            return idx == 0;
+        }
+        if (idx < 0 || static_cast<size_t>(idx) >= ranges_.size()) {
+            return false;
+        }
+        const ggml_sycl::dense_exec_range & range = ranges_[static_cast<size_t>(idx)];
+        view_                                     = ggml_graph_view(cgraph_, range.begin, range.end);
+        if (!range.executor) {
+            return true;
+        }
+        if (!stage_range(static_cast<size_t>(idx))) {
+            if (executed_ranges_ > 0) {
+                GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] staging range %d on device %d failed after an earlier range ran",
+                           idx, range.device);
+            }
+            // Nothing has run on another device yet: the rest of the graph
+            // takes the per-op path on the backend's device.
+            restore(range_publications_);
+            ranges_.resize(static_cast<size_t>(idx) + 1);
+            ranges_.back().end      = cgraph_->n_nodes;
+            ranges_.back().device   = original_device_;
+            ranges_.back().executor = false;
+            view_                   = ggml_graph_view(cgraph_, ranges_.back().begin, ranges_.back().end);
+            gate_                   = ggml_sycl::DENSE_EXEC_GATE_STAGE_FAILED;
+            trace_result();
+            return true;
+        }
+        scope_.emplace(ctx_, range.device);
+        g_ggml_sycl_block_exec_dense_active = true;
+        return true;
+    }
 
     // The graph the node loop iterates for range `idx`.
     ggml_cgraph * range_graph(int idx) {
         (void) idx;
-        return cgraph_;
+        return gate_ == ggml_sycl::DENSE_EXEC_GATE_NONE || gate_ == ggml_sycl::DENSE_EXEC_GATE_STAGE_FAILED ? &view_ :
+                                                                                                              cgraph_;
     }
 
-    void leave_range(int idx) { (void) idx; }
+    // Leaving an executor range drains its device, copies back what later
+    // ranges read, and restores the backend's device.
+    void leave_range(int idx) {
+        if (gate_ != ggml_sycl::DENSE_EXEC_GATE_NONE || idx < 0 || static_cast<size_t>(idx) >= ranges_.size() ||
+            !ranges_[static_cast<size_t>(idx)].executor) {
+            return;
+        }
+        const ggml_sycl::dense_exec_range & range = ranges_[static_cast<size_t>(idx)];
+        g_ggml_sycl_block_exec_dense_active       = false;
+        executed_ranges_++;
+
+        const ggml_sycl::dense_exec_range_io & io     = plan_.io[static_cast<size_t>(idx)];
+        sycl::queue *                          q_orig = ggml_sycl_block_exec_dense_queue(ctx_, original_device_);
+        sycl::queue *                          q_exec = ggml_sycl_block_exec_dense_queue(ctx_, range.device);
+        if (!q_orig || !q_exec) {
+            GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] no execution queue to leave range %d (device %d)", idx, range.device);
+        }
+        try {
+            for (const ggml_sycl::dense_exec_copy & copy : io.copy_out) {
+                const ggml_sycl::dense_exec_slice & from = plan_.slices[static_cast<size_t>(copy.from_slice)];
+                if (from.bytes == 0) {
+                    continue;
+                }
+                ggml_sycl::mem_copy(slices_[static_cast<size_t>(copy.to_slice)], 0,
+                                    slices_[static_cast<size_t>(copy.from_slice)], 0, from.bytes, *q_orig);
+            }
+            q_exec->wait_and_throw();
+        } catch (const std::exception & e) {
+            GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] boundary copy out of range %d (device %d) failed: %s", idx,
+                       range.device, e.what());
+        }
+
+        restore(range_publications_);
+        scope_.reset();
+
+        // The copies are the storage of their roots on the backend's device
+        // for the rest of the graph.
+        for (const ggml_sycl::dense_exec_copy & copy : io.copy_out) {
+            const ggml_sycl::dense_exec_slice & to = plan_.slices[static_cast<size_t>(copy.to_slice)];
+            if (!publish(to, static_cast<size_t>(copy.to_slice), graph_publications_)) {
+                GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] publishing %s on device %d after range %d failed",
+                           roots_[static_cast<size_t>(to.root)]->name, to.device, idx);
+            }
+        }
+    }
 
   private:
-    ggml_cgraph * cgraph_ = nullptr;
+    using publications = std::vector<std::unique_ptr<block_exec_scoped_tensor_storage_publication>>;
+
+    ggml_backend_sycl_context &                      ctx_;
+    ggml_cgraph *                                    cgraph_          = nullptr;
+    int                                              original_device_ = -1;
+    ggml_sycl::dense_exec_gate                       gate_            = ggml_sycl::DENSE_EXEC_GATE_DISABLED;
+    ggml_sycl::dense_exec_plan                       plan_;
+    std::vector<ggml_sycl::dense_exec_range>         ranges_;
+    std::vector<ggml_tensor *>                       roots_;
+    std::vector<ggml_sycl::mem_handle>               slices_;
+    ggml_cgraph                                      view_{};
+    publications                                     range_publications_;
+    publications                                     graph_publications_;
+    std::optional<ggml_sycl_block_exec_device_scope> scope_;
+    int                                              executed_ranges_ = 0;
+
+    static void restore(publications & pubs) {
+        for (auto it = pubs.rbegin(); it != pubs.rend(); ++it) {
+            if (*it) {
+                (void) (*it)->restore();
+            }
+        }
+        pubs.clear();
+    }
+
+    bool publish(const ggml_sycl::dense_exec_slice & slice, size_t slice_idx, publications & pubs) {
+        auto scoped = std::make_unique<block_exec_scoped_tensor_storage_publication>();
+        if (!scoped->publish(roots_[static_cast<size_t>(slice.root)], slice.device, slices_[slice_idx], &ctx_)) {
+            return false;
+        }
+        pubs.push_back(std::move(scoped));
+        return true;
+    }
+
+    bool stage_range(size_t idx) {
+        const ggml_sycl::dense_exec_range &    range = ranges_[idx];
+        const ggml_sycl::dense_exec_range_io & io    = plan_.io[idx];
+        sycl::queue *                          q     = ggml_sycl_block_exec_dense_queue(ctx_, range.device);
+        if (!q) {
+            return false;
+        }
+        for (int s : io.stage_in) {
+            const ggml_sycl::dense_exec_slice & slice = plan_.slices[static_cast<size_t>(s)];
+            if (slice.bytes == 0) {
+                continue;
+            }
+            // Synchronous: across the two cards mem_copy bounces through the
+            // host and waits both queues, after the producer's kernels.
+            if (!ggml_sycl_copy_tensor_span_to_device(ctx_, roots_[static_cast<size_t>(slice.root)], original_device_,
+                                                      range.device, slices_[static_cast<size_t>(s)], 0, slice.bytes,
+                                                      false, q)) {
+                return false;
+            }
+        }
+        for (int s : io.publish) {
+            if (!publish(plan_.slices[static_cast<size_t>(s)], static_cast<size_t>(s), range_publications_)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ggml_sycl::dense_exec_gate prepare(bool unsupported_mode) {
+        ggml_sycl::dense_exec_precheck_inputs precheck{};
+        precheck.enabled = ggml_sycl_block_exec_dense_enabled();
+        if (!precheck.enabled) {
+            return ggml_sycl::DENSE_EXEC_GATE_DISABLED;  // nothing else is consulted
+        }
+        const auto plan_owner     = ggml_sycl_block_exec_visible_plan(original_device_);
+        precheck.has_graph        = cgraph_ != nullptr;
+        precheck.graph_recording  = g_ggml_sycl_graph_recording;
+        precheck.unsupported_mode = unsupported_mode;
+        precheck.has_plan         = plan_owner != nullptr;
+        if (plan_owner) {
+            for (const auto & block : plan_owner->layer_blocks) {
+                ggml_sycl::dense_exec_block b{};
+                b.start_layer      = block.start_layer;
+                b.end_layer        = block.end_layer;
+                b.execution_device = block.execution_device;
+                b.kv_device        = block.kv_device;
+                b.has_moe_weights  = block.moe_device_weight_bytes + block.moe_host_weight_bytes > 0;
+                precheck.blocks.push_back(b);
+            }
+        }
+        ggml_sycl::dense_exec_gate gate = ggml_sycl::dense_exec_first_failing_precheck(precheck);
+        if (gate != ggml_sycl::DENSE_EXEC_GATE_NONE) {
+            return gate;
+        }
+
+        ggml_sycl::dense_exec_graph g{};
+        g.blocks          = precheck.blocks;
+        g.original_device = original_device_;
+        g.max_arena_bytes = ggml_sycl_block_exec_dense_max_arena_bytes();
+        gather_facts(g);
+
+        gate = ggml_sycl::dense_exec_build_plan(g, plan_);
+        if (gate != ggml_sycl::DENSE_EXEC_GATE_NONE) {
+            trace_reject(gate);
+            return gate;
+        }
+        if (!allocate(plan_owner)) {
+            trace_reject(ggml_sycl::DENSE_EXEC_GATE_PREPARE_FAILED);
+            return ggml_sycl::DENSE_EXEC_GATE_PREPARE_FAILED;
+        }
+        ranges_ = plan_.ranges;
+        if (ggml_sycl_block_exec_plan_trace_enabled()) {
+            size_t n_stage = 0, n_publish = 0, n_copy_out = 0;
+            for (const auto & io : plan_.io) {
+                n_stage += io.stage_in.size();
+                n_publish += io.publish.size();
+                n_copy_out += io.copy_out.size();
+            }
+            fprintf(stderr,
+                    "[SYCL-BLOCK-EXEC-DENSE] prepare nodes=%d ranges=%zu stage_in=%zu publish=%zu copy_out=%zu "
+                    "arena_dev0=%zu arena_dev1=%zu\n",
+                    cgraph_->n_nodes, ranges_.size(), n_stage, n_publish, n_copy_out, plan_.arena_bytes[0],
+                    plan_.arena_bytes[1]);
+            for (const auto & range : ranges_) {
+                fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE]   range [%d,%d) device=%d executor=%d first=%s\n", range.begin,
+                        range.end, range.device, range.executor ? 1 : 0, cgraph_->nodes[range.begin]->name);
+            }
+            fflush(stderr);
+        }
+        return ggml_sycl::DENSE_EXEC_GATE_NONE;
+    }
+
+    void gather_facts(ggml_sycl::dense_exec_graph & g) {
+        const int n_devices = std::min(ggml_sycl_routable_device_count(), ggml_sycl::dense_exec_max_devices);
+
+        std::unordered_map<const ggml_tensor *, int> producer;
+        for (int i = 0; i < cgraph_->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph_->nodes[i];
+            if (node && node->view_src == nullptr && !ggml_sycl_is_noop(node)) {
+                producer.emplace(node, i);
+            }
+        }
+
+        std::unordered_map<const ggml_tensor *, int> root_index;
+        auto                                         root_of = [&](const ggml_tensor * t) -> int {
+            size_t              offs = 0;
+            const ggml_tensor * root = ggml_sycl_view_root_and_offset(t, offs);
+            auto                it   = root_index.find(root);
+            if (it == root_index.end()) {
+                ggml_sycl::dense_exec_root r{};
+                r.bytes       = ggml_nbytes(root);
+                auto produced = producer.find(root);
+                if (produced != producer.end()) {
+                    r.kind     = ggml_sycl::DENSE_EXEC_ROOT_NODE;
+                    r.producer = produced->second;
+                } else {
+                    if (ggml_sycl_tensor_is_weight(root)) {
+                        r.kind = ggml_sycl::DENSE_EXEC_ROOT_WEIGHT;
+                    } else if (root->flags & GGML_TENSOR_FLAG_INPUT) {
+                        r.kind = ggml_sycl::DENSE_EXEC_ROOT_CONTROL;
+                    } else {
+                        r.kind = ggml_sycl::DENSE_EXEC_ROOT_STATE;
+                    }
+                    for (int d = 0; d < n_devices; ++d) {
+                        if (ggml_sycl_tensor_metadata_owner(root, d) == d) {
+                            r.resident_mask |= uint32_t{ 1 } << d;
+                        }
+                    }
+                }
+                it = root_index.emplace(root, static_cast<int>(g.roots.size())).first;
+                g.roots.push_back(r);
+                roots_.push_back(const_cast<ggml_tensor *>(root));
+            }
+            if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                g.roots[static_cast<size_t>(it->second)].is_output = true;
+            }
+            return it->second;
+        };
+
+        g.nodes.resize(static_cast<size_t>(cgraph_->n_nodes));
+        for (int i = 0; i < cgraph_->n_nodes; ++i) {
+            const ggml_tensor *          node = cgraph_->nodes[i];
+            ggml_sycl::dense_exec_node & n    = g.nodes[static_cast<size_t>(i)];
+            n.own_layer                       = extract_layer_index(node->name);
+            n.is_noop                         = ggml_sycl_is_noop(node);
+            if (n.is_noop) {
+                (void) root_of(node);  // carries a view's OUTPUT flag to its root
+                continue;
+            }
+            n.dst_root = root_of(node);
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (node->src[s] != nullptr) {
+                    n.src_roots.push_back(root_of(node->src[s]));
+                }
+            }
+        }
+    }
+
+    bool allocate(const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner) {
+        ggml_sycl_block_exec_dense_state & state = ggml_sycl_block_exec_dense_state_for(ctx_);
+        const bool plan_changed = state.plan.owner_before(plan_owner) || plan_owner.owner_before(state.plan);
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            const size_t need = d < ggml_sycl::dense_exec_max_devices ? plan_.arena_bytes[static_cast<size_t>(d)] : 0;
+            if (plan_changed || (need > state.arena_bytes[d] && state.arena[d].valid())) {
+                state.drop_arena(&ctx_, d);
+            }
+            if (need == 0 || state.arena[d].valid()) {
+                continue;
+            }
+            // Headroom so a context that grows by a KV step does not
+            // reallocate on every graph.
+            const size_t                    granule = size_t{ 4 } << 20;
+            const size_t                    bytes   = (need + need / 4 + granule - 1) / granule * granule;
+            ggml_sycl_scoped_staging_handle arena{};
+            if (!arena.allocate(ggml_sycl_block_exec_dense_queue(ctx_, d), d, bytes)) {
+                GGML_LOG_WARN("[SYCL-BLOCK-EXEC-DENSE] arena allocation failed device=%d bytes=%zu\n", d, bytes);
+                return false;
+            }
+            state.arena[d]       = std::move(arena.handle);
+            state.arena_bytes[d] = bytes;
+        }
+        state.plan = plan_owner;
+
+        slices_.clear();
+        slices_.reserve(plan_.slices.size());
+        for (const ggml_sycl::dense_exec_slice & slice : plan_.slices) {
+            ggml_sycl::mem_handle h =
+                state.arena[slice.device].slice(slice.offset, slice.bytes != 0 ? slice.bytes : size_t{ 1 });
+            if (!h.valid()) {
+                return false;
+            }
+            slices_.push_back(std::move(h));
+        }
+        return true;
+    }
+
+    void trace_reject(ggml_sycl::dense_exec_gate gate) const {
+        if (!ggml_sycl_block_exec_plan_trace_enabled()) {
+            return;
+        }
+        const int           i    = plan_.failing_node;
+        const ggml_tensor * node = i >= 0 && i < cgraph_->n_nodes ? cgraph_->nodes[i] : nullptr;
+        fprintf(
+            stderr, "[SYCL-BLOCK-EXEC-DENSE] reject gate=%s node=%d op=%s name=%s device=%d\n",
+            ggml_sycl::dense_exec_gate_name(gate), i, node ? ggml_op_name(node->op) : "-", node ? node->name : "-",
+            node && static_cast<size_t>(i) < plan_.node_device.size() ? plan_.node_device[static_cast<size_t>(i)] : -1);
+        fflush(stderr);
+    }
+
+    void trace_result() const {
+        if (cgraph_ == nullptr || !ggml_sycl_block_exec_plan_trace_enabled() ||
+            gate_ == ggml_sycl::DENSE_EXEC_GATE_DISABLED) {
+            return;
+        }
+        fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE-RESULT] graph nodes=%d executor=%s gate=%s ranges=%zu\n",
+                cgraph_->n_nodes, gate_ == ggml_sycl::DENSE_EXEC_GATE_NONE ? "executed" : "inactive",
+                ggml_sycl::dense_exec_gate_name(gate_), ranges_.size());
+        fflush(stderr);
+    }
 };
 
 static block_exec_graph_plan_stats ggml_sycl_classify_block_exec_graph_for_blocks(
@@ -90798,7 +91250,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 ggml_sycl::block_exec_gate_name(block_exec_gate));
         fflush(stderr);
     }
-    ggml_sycl_block_exec_dense_run dense_run(block_exec_graph_executed ? nullptr : cgraph);
+    ggml_sycl_block_exec_dense_run dense_run(
+        *sycl_ctx, block_exec_graph_executed ? nullptr : cgraph,
+        cpu_offload_active || (g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1));
     for (int range_idx = 0; dense_run.enter_range(range_idx); ++range_idx) {
         // Shadows the whole graph: inside the node loop `cgraph` is this
         // range's nodes, so no fusion looks ahead past the range's end.
