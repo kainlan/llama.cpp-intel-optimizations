@@ -645,3 +645,190 @@ def test_mutation_n_embd_v_gqa_reverts_to_layer0_form_is_witnessed() -> None:
     _assert_witnessed(src, mutated, n_embd_gqa_max_violations,
                       "inventory.n_embd_v_gqa is not assigned from hparams.n_embd_v_gqa_max()",
                       "n_embd_v_gqa reverts to the layer-0 (non-_max) accessor")
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp-17ea: runtime KV admission wiring. The residency decisions are
+# pinned numerically by test-kv-runtime-demotion; what that host test cannot
+# see is whether the transaction and the tiered KV allocator are wired to
+# them, so these pin the wiring on the source.
+# ---------------------------------------------------------------------------
+
+TIERED_KV_ALLOC_SIGNATURE = "static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer"
+HOST_KV_REFUSAL = "refusing. Demoted KV must be placed in SYCL_KV_Host"
+
+
+def strip_comments(text: str) -> str:
+    """Drop // and /* */ comments, keeping string and char literals intact."""
+    out: list[str] = []
+    state = "code"
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                state = "line"
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block"
+                i += 2
+                continue
+            if ch in "\"'":
+                state = "string" if ch == '"' else "char"
+            out.append(ch)
+        elif state == "line":
+            if ch == "\n":
+                state = "code"
+                out.append(ch)
+        elif state == "block":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+                continue
+        else:
+            out.append(ch)
+            quote = '"' if state == "string" else "'"
+            if ch == "\\":
+                out.append(nxt)
+                i += 2
+                continue
+            if ch == quote:
+                state = "code"
+        i += 1
+    return "".join(out)
+
+
+def runtime_kv_admission_violations(source: str) -> list[str]:
+    body = function_or_none(source, TRANSACTION_SIGNATURE)
+    if body is None:
+        return ["the runtime-context transaction is missing"]
+    code = strip_comments(body)
+    found: list[str] = []
+
+    if not re.search(r"kv_residency_needs_refit\(\s*published_shape\s*,\s*next_shape\s*,\s*ctx->runtime_kv_admitted\s*\)",
+                     code):
+        found.append("the re-fit trigger does not receive ctx->runtime_kv_admitted")
+
+    sets = [m.start() for m in re.finditer(r"runtime_kv_admitted\s*=\s*true\s*;", strip_comments(source))]
+    tail = re.search(r"ctx->runtime_kv_admitted\s*=\s*true\s*;\s*return\s+ggml_sycl_txn_result::ACCEPTED\s*;\s*}\s*$",
+                     code)
+    if not sets:
+        found.append("runtime_kv_admitted is never set true")
+    elif len(sets) != 1 or tail is None:
+        found.append("runtime_kv_admitted is set true somewhere other than the publish tail")
+
+    refit = re.search(r"plan_runtime_kv_residency\(in\)(.*?)rebuild_runtime_per_device_vram\(\)", code, re.S)
+    if refit is None or "next_plan.refresh_layer_block_kv_devices();" not in refit.group(1):
+        found.append("the re-fit does not refresh the layer blocks' KV owners")
+    demoted = re.search(r"next_plan\s*=\s*std::move\(demoted_plan\);(.*?)replan_ok\s*=\s*true;", code, re.S)
+    if demoted is None or "next_plan.refresh_layer_block_kv_devices();" not in demoted.group(1):
+        found.append("the budget-path demotion does not refresh the layer blocks' KV owners")
+
+    if re.search(r"ggml_sycl_largest_fitting_n_ctx\(", code):
+        found.append("a -c hint is not derived from the live KV headroom (ggml_sycl_largest_fitting_n_ctx_live)")
+    return found
+
+
+def tiered_kv_refusal_order_violations(source: str) -> list[str]:
+    body = function_or_none(source, TIERED_KV_ALLOC_SIGNATURE)
+    if body is None:
+        return ["the tiered KV allocator is missing"]
+    code = strip_comments(body)
+    found: list[str] = []
+    refusal = code.find(HOST_KV_REFUSAL)
+    commit = code.find("mgr = staged;")
+    if refusal < 0 or commit < 0:
+        return ["the host-KV refusal or the tier manager commit is missing"]
+    before = code[:commit]
+    if re.search(r"\bmgr\.(configure_from_plan|configure_with_weights|compute_region_layout)\(", before):
+        found.append("the device's tier manager is configured before the host-KV refusal")
+    for side_effect in ("host_zone_grow(", "ggml_sycl_log_load_summary(device, planned_kv_device"):
+        at = code.find(side_effect)
+        if at < 0 or at < refusal or at < commit:
+            found.append(f"{side_effect} runs before the host-KV refusal decides")
+    if refusal > commit:
+        found.append("the tier manager is committed before the host-KV refusal decides")
+    return found
+
+
+def test_runtime_kv_admission_wiring() -> None:
+    assert runtime_kv_admission_violations(GGML_SYCL_CPP.read_text()) == []
+
+
+def test_tiered_kv_refusal_has_no_side_effects() -> None:
+    assert tiered_kv_refusal_order_violations(GGML_SYCL_CPP.read_text()) == []
+
+
+def test_mutation_admitted_flag_never_set_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = re.sub(r"\n\s*ctx->runtime_kv_admitted\s*=\s*true;", "", cpp, count=1)
+    _assert_witnessed(cpp, mutated, runtime_kv_admission_violations, "runtime_kv_admitted is never set true",
+                      "the publish tail no longer sets runtime_kv_admitted")
+
+
+def test_mutation_admitted_flag_set_early_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = re.sub(r"\n(\s*)ctx->runtime_kv_admitted\s*=\s*true;", "", cpp, count=1)
+    mutated = mutated.replace("    bool   kv_was_demoted        = false;\n",
+                              "    bool   kv_was_demoted        = false;\n    ctx->runtime_kv_admitted = true;\n", 1)
+    _assert_witnessed(cpp, mutated, runtime_kv_admission_violations,
+                      "runtime_kv_admitted is set true somewhere other than the publish tail",
+                      "runtime_kv_admitted set before the transaction can still refuse")
+
+
+def test_mutation_refit_ignores_admission_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = re.sub(r"(kv_residency_needs_refit\(\s*published_shape\s*,\s*next_shape\s*,\s*)ctx->runtime_kv_admitted",
+                     r"\1false", cpp, count=1)
+    _assert_witnessed(cpp, mutated, runtime_kv_admission_violations,
+                      "the re-fit trigger does not receive ctx->runtime_kv_admitted", "trigger passed a constant")
+
+
+def test_mutation_refit_refresh_dropped_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    body = function(cpp, TRANSACTION_SIGNATURE)
+    at = body.index("plan_runtime_kv_residency(in)")
+    new_body = body[:at] + body[at:].replace("next_plan.refresh_layer_block_kv_devices();\n", "", 1)
+    _assert_witnessed(cpp, cpp.replace(body, new_body, 1), runtime_kv_admission_violations,
+                      "the re-fit does not refresh the layer blocks' KV owners", "re-fit refresh dropped")
+
+
+def test_mutation_budget_path_refresh_dropped_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    body = function(cpp, TRANSACTION_SIGNATURE)
+    at = body.index("next_plan = std::move(demoted_plan);")
+    new_body = body[:at] + body[at:].replace("next_plan.refresh_layer_block_kv_devices();\n", "", 1)
+    _assert_witnessed(cpp, cpp.replace(body, new_body, 1), runtime_kv_admission_violations,
+                      "the budget-path demotion does not refresh the layer blocks' KV owners",
+                      "budget-path refresh dropped")
+
+
+def test_mutation_budget_hint_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, -1, admitted_kv)",
+                          "ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info, -1, 0, 0)", 1)
+    _assert_witnessed(cpp, mutated, runtime_kv_admission_violations,
+                      "a -c hint is not derived from the live KV headroom", "a hint bypasses the live headroom")
+
+
+def test_mutation_tier_manager_configured_in_place_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("staged.configure_from_plan(", "mgr.configure_from_plan(", 1)
+    _assert_witnessed(cpp, mutated, tiered_kv_refusal_order_violations,
+                      "the device's tier manager is configured before the host-KV refusal",
+                      "tier manager configured in place")
+
+
+def test_mutation_host_zone_grown_before_refusal_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    body = function(cpp, TIERED_KV_ALLOC_SIGNATURE)
+    grow_at = body.index("    if (planned_kv_host > 0 && plan_cache && plan_cache->host_zones_configured()) {")
+    grow_end = body.index("\n    }\n", body.index("host_zone_grow(", grow_at)) + len("\n    }\n")
+    grow = body[grow_at:grow_end]
+    rest = body[:grow_at] + body[grow_end:]
+    refusal_at = rest.index("    // Demoted KV belongs in the SYCL_KV_Host buffer type")
+    new_body = rest[:refusal_at] + grow + "\n" + rest[refusal_at:]
+    _assert_witnessed(cpp, cpp.replace(body, new_body, 1), tiered_kv_refusal_order_violations,
+                      "host_zone_grow( runs before the host-KV refusal decides", "host KV zone grown before refusal")
