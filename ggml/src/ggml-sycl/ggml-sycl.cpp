@@ -88796,8 +88796,10 @@ struct ggml_sycl_block_exec_dense_state {
     ggml_sycl::mem_handle                          arena[GGML_SYCL_MAX_DEVICES];
     size_t                                         arena_bytes[GGML_SYCL_MAX_DEVICES] = {};
 
-    // Kernels of an earlier graph may still read an arena: drain its device
-    // before letting go of it.
+    // Kernels of an earlier graph may still read an arena (decode can return
+    // with work in flight). Growing or dropping one therefore drains its
+    // device's execution queue -- the only queue that reads or writes it, see
+    // check_queue_order -- before the handle is released: drain, then swap.
     void drop_arena(ggml_backend_sycl_context * ctx, int device) {
         if (!arena[device].valid()) {
             return;
@@ -88967,7 +88969,14 @@ class ggml_sycl_block_exec_dense_run {
     }
 
   private:
-    using publications = std::vector<std::unique_ptr<block_exec_scoped_tensor_storage_publication>>;
+    // A scoped publication of one plan slice as its root's storage. The
+    // scoped object captured the slot it overwrote and puts exactly that back.
+    struct dense_publication {
+        std::unique_ptr<block_exec_scoped_tensor_storage_publication> scoped;
+        size_t                                                        slice = 0;
+    };
+
+    using publications = std::vector<dense_publication>;
 
     ggml_backend_sycl_context &                      ctx_;
     ggml_cgraph *                                    cgraph_          = nullptr;
@@ -88983,11 +88992,25 @@ class ggml_sycl_block_exec_dense_run {
     std::optional<ggml_sycl_block_exec_device_scope> scope_;
     int                                              executed_ranges_ = 0;
 
-    static void restore(publications & pubs) {
+    // Restores in reverse order of publication, so every slot gets back
+    // exactly the handle it held before. A slot that no longer holds the
+    // slice published into it was re-published by someone else while the
+    // publication was live; restoring over it would drop that owner, which is
+    // the llama.cpp-49lj layer 4/5 defect, so it aborts instead.
+    void restore(publications & pubs) {
         for (auto it = pubs.rbegin(); it != pubs.rend(); ++it) {
-            if (*it) {
-                (void) (*it)->restore();
+            const ggml_sycl::dense_exec_slice & slice = plan_.slices[it->slice];
+            const ggml_tensor *                 root  = roots_[static_cast<size_t>(slice.root)];
+            const auto *                        extra = static_cast<const ggml_tensor_extra_gpu *>(root->extra);
+            const void *                        ours  = slices_[it->slice].resolve(slice.device).ptr;
+            if (extra == nullptr || extra->data_device[slice.device] != ours ||
+                extra->data_handle[slice.device].resolve(slice.device).ptr != ours) {
+                GGML_ABORT(
+                    "[SYCL-BLOCK-EXEC-DENSE] storage of %s on device %d was replaced while published; "
+                    "restoring would drop its new owner",
+                    root->name, slice.device);
             }
+            (void) it->scoped->restore();
         }
         pubs.clear();
     }
@@ -88997,8 +89020,24 @@ class ggml_sycl_block_exec_dense_run {
         if (!scoped->publish(roots_[static_cast<size_t>(slice.root)], slice.device, slices_[slice_idx], &ctx_)) {
             return false;
         }
-        pubs.push_back(std::move(scoped));
+        pubs.push_back(dense_publication{ std::move(scoped), slice_idx });
         return true;
+    }
+
+    // Every copy into a slice is written on the execution queue of the
+    // slice's device -- mem_copy's cross-device branch submits through the
+    // unified cache's queue, which is ctx.stream()'s queue -- and every kernel
+    // that reads the slice runs on that same queue. The queue is in order, so
+    // a later graph's write into a reused slice starts only after an earlier
+    // graph's readers finished, even when that graph returned with kernels in
+    // flight. Asserted, not assumed.
+    void check_queue_order(int device) {
+        sycl::queue *              q     = ggml_sycl_execution_queue_for_device(device);
+        ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+        if (q == nullptr || cache == nullptr || q != &cache->get_queue() || q != ctx_.stream(device, 0) ||
+            !q->is_in_order()) {
+            GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] device %d: copies and kernels must share one in-order queue", device);
+        }
     }
 
     bool stage_range(size_t idx) {
@@ -89066,6 +89105,13 @@ class ggml_sycl_block_exec_dense_run {
         if (gate != ggml_sycl::DENSE_EXEC_GATE_NONE) {
             trace_reject(gate);
             return gate;
+        }
+        if (const char * violation = ggml_sycl::dense_exec_plan_violation(g, plan_)) {
+            GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] plan breaks an ownership invariant: %s", violation);
+        }
+        check_queue_order(original_device_);
+        for (const ggml_sycl::dense_exec_range & range : plan_.ranges) {
+            check_queue_order(range.device);
         }
         if (!allocate(plan_owner)) {
             trace_reject(ggml_sycl::DENSE_EXEC_GATE_PREPARE_FAILED);

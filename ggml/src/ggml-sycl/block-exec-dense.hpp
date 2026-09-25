@@ -536,4 +536,71 @@ inline dense_exec_gate dense_exec_build_plan(const dense_exec_graph & g, dense_e
     return DENSE_EXEC_GATE_NONE;
 }
 
+// The ownership invariants the runner relies on when it publishes and
+// restores slices; nullptr when the plan keeps all of them, else the first
+// one it breaks.
+//   - one slice per (root, device), so two publications of one root on one
+//     device can never name different storage;
+//   - an executor range publishes only slices on its own device, at most one
+//     per root; a staged input is among them;
+//   - a staged input is never a root the same range produces: a source
+//     override may not sit on the root of a result the range publishes
+//     (the llama.cpp-kw7x clobber);
+//   - a copy out goes from the producing range's device to the original
+//     device, between two slices of the same root.
+inline const char * dense_exec_plan_violation(const dense_exec_graph & g, const dense_exec_plan & p) {
+    for (size_t a = 0; a < p.slices.size(); ++a) {
+        for (size_t b = a + 1; b < p.slices.size(); ++b) {
+            if (p.slices[a].root == p.slices[b].root && p.slices[a].device == p.slices[b].device) {
+                return "two slices for one root on one device";
+            }
+        }
+    }
+    if (p.io.size() != p.ranges.size()) {
+        return "io does not match ranges";
+    }
+    for (size_t r = 0; r < p.ranges.size(); ++r) {
+        const dense_exec_range &    range = p.ranges[r];
+        const dense_exec_range_io & io    = p.io[r];
+        if (!range.executor) {
+            if (!io.stage_in.empty() || !io.publish.empty() || !io.copy_out.empty()) {
+                return "an original-device range carries io";
+            }
+            continue;
+        }
+        for (size_t a = 0; a < io.publish.size(); ++a) {
+            const dense_exec_slice & sa = p.slices[static_cast<size_t>(io.publish[a])];
+            if (sa.device != range.device) {
+                return "a range publishes a slice of another device";
+            }
+            for (size_t b = a + 1; b < io.publish.size(); ++b) {
+                if (sa.root == p.slices[static_cast<size_t>(io.publish[b])].root) {
+                    return "a range publishes one root twice";
+                }
+            }
+        }
+        for (int s : io.stage_in) {
+            bool published = false;
+            for (int q : io.publish) {
+                published = published || q == s;
+            }
+            if (!published) {
+                return "a staged slice is not published";
+            }
+            const dense_exec_root & root = g.roots[static_cast<size_t>(p.slices[static_cast<size_t>(s)].root)];
+            if (root.kind == DENSE_EXEC_ROOT_NODE && root.producer >= range.begin && root.producer < range.end) {
+                return "a range stages over a root it produces";
+            }
+        }
+        for (const dense_exec_copy & c : io.copy_out) {
+            const dense_exec_slice & from = p.slices[static_cast<size_t>(c.from_slice)];
+            const dense_exec_slice & to   = p.slices[static_cast<size_t>(c.to_slice)];
+            if (from.root != to.root || from.device != range.device || to.device != g.original_device) {
+                return "a copy out does not go from the range's device to the original device";
+            }
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace ggml_sycl

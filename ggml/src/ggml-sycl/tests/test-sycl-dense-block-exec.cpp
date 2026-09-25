@@ -394,6 +394,7 @@ static void test_same_device_reuse_across_ranges() {
     (void) a3;
     dense_exec_plan p;
     check(dense_exec_build_plan(b.g, p) == DENSE_EXEC_GATE_NONE, "plans");
+    check(dense_exec_plan_violation(b.g, p) == nullptr, "a four-range plan is clean");
     check(p.ranges.size() == 4, "four ranges");
     const int s = slice_for(p, a1, 1);
     check(s >= 0 && contains(p.io[3].publish, s), "a-1 is republished on device 1");
@@ -402,6 +403,66 @@ static void test_same_device_reuse_across_ranges() {
     check(p.io[1].copy_out.size() == 1 && p.slices[static_cast<size_t>(p.io[1].copy_out[0].to_slice)].root == a1,
           "a-1 is copied back once for device 0's a-2");
     check(contains(p.io[1].stage_in, slice_for(p, in, 1)) == false, "a control leaf only reaches consumers' ranges");
+}
+
+static void expect_violation(const dense_exec_graph & g, const dense_exec_plan & p, const char * expected) {
+    const char * got = dense_exec_plan_violation(g, p);
+    check(got != nullptr && std::strcmp(got, expected) == 0,
+          std::string("expected violation '") + expected + "', got '" + (got ? got : "none") + "'");
+}
+
+// Every plan the planner builds keeps the publication invariants, and the
+// check is not vacuous: each corruption below is a way a plan could drop or
+// alias a live owner, and each is caught.
+static void test_plan_invariants() {
+    graph_builder   b = make_split_graph();
+    dense_exec_plan p;
+    check(dense_exec_build_plan(b.g, p) == DENSE_EXEC_GATE_NONE, "plans");
+    const char * clean = dense_exec_plan_violation(b.g, p);
+    check(clean == nullptr, std::string("a built plan is clean, got ") + (clean ? clean : ""));
+
+    {
+        dense_exec_plan  bad  = p;
+        dense_exec_slice copy = bad.slices[static_cast<size_t>(bad.io[1].publish[0])];
+        bad.slices.push_back(copy);
+        expect_violation(b.g, bad, "two slices for one root on one device");
+    }
+    {
+        // A source override on the root of a result the range publishes.
+        dense_exec_plan bad = p;
+        bad.io[1].stage_in.push_back(slice_for(bad, b.root_index("ffn_inp-3"), 1));
+        expect_violation(b.g, bad, "a range stages over a root it produces");
+    }
+    {
+        dense_exec_plan bad = p;
+        bad.io[1].publish.push_back(bad.io[1].publish[0]);
+        expect_violation(b.g, bad, "a range publishes one root twice");
+    }
+    {
+        dense_exec_plan  bad = p;
+        dense_exec_slice foreign{};
+        foreign.root   = b.root_index("attn_q.weight-2");
+        foreign.device = 0;
+        bad.slices.push_back(foreign);
+        bad.io[1].publish.push_back(static_cast<int>(bad.slices.size()) - 1);
+        expect_violation(b.g, bad, "a range publishes a slice of another device");
+    }
+    {
+        dense_exec_plan bad = p;
+        std::swap(bad.io[1].copy_out[0].from_slice, bad.io[1].copy_out[0].to_slice);
+        expect_violation(b.g, bad, "a copy out does not go from the range's device to the original device");
+    }
+    {
+        dense_exec_plan bad = p;
+        bad.io[1].stage_in.push_back(bad.io[1].copy_out[0].to_slice);
+        const char * got = dense_exec_plan_violation(b.g, bad);
+        check(got != nullptr, "an unpublished stage-in is caught");
+    }
+    {
+        dense_exec_plan bad = p;
+        bad.io[0].publish.push_back(bad.io[1].publish[0]);
+        expect_violation(b.g, bad, "an original-device range carries io");
+    }
 }
 
 int main() {
@@ -422,6 +483,7 @@ int main() {
         { "arena-layout",                        test_arena_layout                        },
         { "single-device-graph",                 test_single_device_graph                 },
         { "same-device-reuse-across-ranges",     test_same_device_reuse_across_ranges     },
+        { "plan-invariants",                     test_plan_invariants                     },
     };
 
     int failed = 0;
