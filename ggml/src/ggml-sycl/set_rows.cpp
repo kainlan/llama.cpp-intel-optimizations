@@ -11,6 +11,10 @@
 #include <utility>
 #include <vector>
 
+// True while the dense block executor runs a node range on that range's own
+// device (llama.cpp-tf8m). Defined in ggml-sycl.cpp.
+bool ggml_sycl_block_exec_dense_active();
+
 static constexpr int GGML_SYCL_SET_ROWS_UNKNOWN_DEVICE_USM = -2;
 
 static ggml_sycl_profile_label make_set_rows_profile_label(sycl::queue & queue,
@@ -1075,6 +1079,17 @@ void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                 plan.index_needs_staging ? 1 : 0, plan.index_device, plan.dst_ptr);
     }
     GGML_ASSERT(plan_ok);
+    // Inside a dense executor range the KV cache is on the range's device and
+    // every other operand was published there: a write must land in the cache
+    // directly. Staging here would mean the executor planned the range wrong.
+    if (ggml_sycl_block_exec_dense_active() &&
+        (plan.owner_device != ctx.device || plan.src0_needs_staging || plan.index_needs_staging)) {
+        GGML_ABORT(
+            "[SYCL-BLOCK-EXEC-DENSE] SET_ROWS dst=%s would stage inside a dense range: ctx_device=%d owner=%d "
+            "src0_stage=%d index_stage=%d",
+            dst.raw()->name, ctx.device, plan.owner_device, plan.src0_needs_staging ? 1 : 0,
+            plan.index_needs_staging ? 1 : 0);
+    }
 
     ggml_sycl_set_rows_staged_handle_guard staged_handles;
     if (plan.src0_needs_staging) {
