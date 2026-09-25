@@ -88883,6 +88883,17 @@ struct ggml_sycl_block_exec_dense_state {
 
     std::optional<prepared_plan> prepared;
 
+    // Host staging, one pinned buffer per device in that device's context. A
+    // crossing packs its copies into the source device's buffer and waits
+    // once, moves them on the host to the destination device's buffer, and
+    // copies them in from there without waiting: the destination's in-order
+    // queue orders them before the kernels that read them. host_stage_read
+    // is the last of those copies per buffer; the host waits on it before it
+    // writes the buffer again.
+    ggml_sycl::mem_handle host_stage[GGML_SYCL_MAX_DEVICES];
+    size_t                host_stage_bytes[GGML_SYCL_MAX_DEVICES] = {};
+    sycl::event           host_stage_read[GGML_SYCL_MAX_DEVICES];
+
 #ifdef GGML_SYCL_GRAPH
     // One recorded command graph per range of a decode graph, replayed on the
     // range's own device queue. A graph bakes raw pointers, so it holds every
@@ -88930,6 +88941,23 @@ struct ggml_sycl_block_exec_dense_state {
         prepared.reset();  // its slices view this arena
         arena[device]       = ggml_sycl::mem_handle{};
         arena_bytes[device] = 0;
+    }
+
+    // As drop_arena: the copies in from a host buffer run on its device's
+    // execution queue, so that queue drains before the buffer is released.
+    void drop_host_stage(ggml_backend_sycl_context & ctx, int device) {
+        if (!host_stage[device].valid()) {
+            return;
+        }
+        try {
+            ggml_sycl_block_exec_dense_queue(ctx, device)->wait_and_throw();
+        } catch (const std::exception & e) {
+            GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] drain before host stage release failed on device %d: %s", device,
+                       e.what());
+        }
+        host_stage[device]       = ggml_sycl::mem_handle{};
+        host_stage_bytes[device] = 0;
+        host_stage_read[device]  = sycl::event{};
     }
 };
 
@@ -89013,6 +89041,7 @@ static void ggml_sycl_block_exec_dense_release(ggml_backend_sycl_context * ctx) 
 #endif
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
         state->drop_arena(*ctx, d);
+        state->drop_host_stage(*ctx, d);
     }
 }
 
@@ -89193,14 +89222,20 @@ class ggml_sycl_block_exec_dense_run {
                 phases_[static_cast<size_t>(idx)].drain_out_us = elapsed_us(t_copy);
                 t_copy                                         = std::chrono::steady_clock::now();
             }
-            for (const ggml_sycl::dense_exec_copy & copy : io.copy_out) {
+            std::vector<crossing_span> spans;
+            for (size_t k = 0; k < io.copy_out.size(); ++k) {
+                const ggml_sycl::dense_exec_copy &  copy = io.copy_out[k];
                 const ggml_sycl::dense_exec_slice & from = plan_.slices[static_cast<size_t>(copy.from_slice)];
                 if (from.bytes == 0) {
                     continue;
                 }
-                ggml_sycl::mem_copy(slices_[static_cast<size_t>(copy.to_slice)], 0,
-                                    slices_[static_cast<size_t>(copy.from_slice)], 0, from.bytes, *q_orig);
+                spans.push_back(crossing_span{ slices_[static_cast<size_t>(copy.from_slice)],
+                                               slices_[static_cast<size_t>(copy.to_slice)], io.copy_out_host[k],
+                                               from.bytes });
             }
+            cross(range.device, original_device_, spans);
+            // The range's own work is done before the next graph can reuse
+            // its arena slices, whether or not anything crossed back.
             q_exec->wait_and_throw();
             if (phase_trace_) {
                 phases_[static_cast<size_t>(idx)].copy_out_us = elapsed_us(t_copy);
@@ -89669,25 +89704,84 @@ class ggml_sycl_block_exec_dense_run {
         }
     }
 
+    // The root's storage on the original device as a handle: the tensor's own
+    // data handle when it resolves to the same storage, else a view of it.
+    ggml_sycl::mem_handle root_source(const ggml_tensor * t) const {
+        void * ptr = ggml_sycl_resolve_or_host_tensor_ptr(t, original_device_);
+        if (!ptr) {
+            return {};
+        }
+        if (t->extra != nullptr) {
+            const auto & own = static_cast<ggml_tensor_extra_gpu *>(t->extra)->data_handle[original_device_];
+            if (own.valid() &&
+                (own.device() == original_device_ || own.device() == ggml_sycl::mem_handle::HOST_DEVICE)) {
+                const auto resolved = own.resolve(original_device_);
+                if (resolved && resolved.ptr == ptr) {
+                    return own;
+                }
+            }
+        }
+        return make_data_ptr_handle(t, original_device_, ptr);
+    }
+
+    // One crossing from `from` to `to`: every span is copied into from's host
+    // buffer, waited on once, moved to to's host buffer, and copied out of it
+    // on to's queue without a wait. spans are (source, destination, host
+    // offset, bytes).
+    struct crossing_span {
+        ggml_sycl::mem_handle src;
+        ggml_sycl::mem_handle dst;
+        size_t                host_offset = 0;
+        size_t                bytes       = 0;
+    };
+
+    void cross(int from, int to, const std::vector<crossing_span> & spans) {
+        ggml_sycl_block_exec_dense_state & st     = ggml_sycl_block_exec_dense_state_for(ctx_);
+        sycl::queue *                      q_from = ggml_sycl_block_exec_dense_queue(ctx_, from);
+        sycl::queue *                      q_to   = ggml_sycl_block_exec_dense_queue(ctx_, to);
+        if (!q_from || !q_to || !st.host_stage[from].valid() || !st.host_stage[to].valid()) {
+            throw std::runtime_error("no queue or host stage for the crossing");
+        }
+        size_t packed = 0;
+        for (const crossing_span & span : spans) {
+            ggml_sycl::mem_copy_async(st.host_stage[from], span.host_offset, span.src, 0, span.bytes, *q_from);
+            packed = std::max(packed, span.host_offset + span.bytes);
+        }
+        if (packed == 0) {
+            return;
+        }
+        q_from->wait_and_throw();
+        st.host_stage_read[to].wait_and_throw();
+        ggml_sycl::mem_copy(st.host_stage[to], 0, st.host_stage[from], 0, packed, *q_to);
+        for (const crossing_span & span : spans) {
+            st.host_stage_read[to] =
+                ggml_sycl::mem_copy_async(span.dst, 0, st.host_stage[to], span.host_offset, span.bytes, *q_to);
+        }
+    }
+
     bool stage_range(size_t idx) {
         const ggml_sycl::dense_exec_range &    range = ranges_[idx];
         const ggml_sycl::dense_exec_range_io & io    = plan_.io[idx];
-        sycl::queue *                          q     = ggml_sycl_block_exec_dense_queue(ctx_, range.device);
-        if (!q) {
-            return false;
-        }
-        for (int s : io.stage_in) {
+        std::vector<crossing_span>             spans;
+        for (size_t k = 0; k < io.stage_in.size(); ++k) {
+            const int                           s     = io.stage_in[k];
             const ggml_sycl::dense_exec_slice & slice = plan_.slices[static_cast<size_t>(s)];
             if (slice.bytes == 0) {
                 continue;
             }
-            // Synchronous: across the two cards mem_copy bounces through the
-            // host and waits both queues, after the producer's kernels.
-            if (!ggml_sycl_copy_tensor_span_to_device(ctx_, roots_[static_cast<size_t>(slice.root)], original_device_,
-                                                      range.device, slices_[static_cast<size_t>(s)], 0, slice.bytes,
-                                                      false, q)) {
+            ggml_sycl::mem_handle src = root_source(roots_[static_cast<size_t>(slice.root)]);
+            if (!src.valid()) {
                 return false;
             }
+            spans.push_back(
+                crossing_span{ std::move(src), slices_[static_cast<size_t>(s)], io.stage_in_host[k], slice.bytes });
+        }
+        try {
+            cross(original_device_, range.device, spans);
+        } catch (const std::exception & e) {
+            GGML_LOG_WARN("[SYCL-BLOCK-EXEC-DENSE] staging into range %zu (device %d) failed: %s\n", idx, range.device,
+                          e.what());
+            return false;
         }
         for (int s : io.publish) {
             if (!publish(plan_.slices[static_cast<size_t>(s)], static_cast<size_t>(s), range_publications_)) {
@@ -89956,6 +90050,31 @@ class ggml_sycl_block_exec_dense_run {
             }
             state.arena[d]       = std::move(arena.handle);
             state.arena_bytes[d] = bytes;
+        }
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            const bool crosses = d == original_device_ || [&] {
+                for (const ggml_sycl::dense_exec_range & range : plan_.ranges) {
+                    if (range.executor && range.device == d) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
+            if (!crosses || plan_.host_stage_bytes == 0 || state.host_stage_bytes[d] >= plan_.host_stage_bytes) {
+                continue;
+            }
+            state.drop_host_stage(ctx_, d);
+            const size_t          granule = size_t{ 64 } << 10;
+            const size_t          bytes   = (plan_.host_stage_bytes + granule - 1) / granule * granule;
+            ggml_sycl::mem_handle stage;
+            if (!ggml_sycl::alloc_pinned_stage_handle_terminal(bytes, *ggml_sycl_block_exec_dense_queue(ctx_, d), d,
+                                                               "block-exec-dense-host-stage",
+                                                               /*require_host_usm_base=*/true, &stage)) {
+                GGML_LOG_WARN("[SYCL-BLOCK-EXEC-DENSE] host stage allocation failed device=%d bytes=%zu\n", d, bytes);
+                return false;
+            }
+            state.host_stage[d]       = std::move(stage);
+            state.host_stage_bytes[d] = bytes;
         }
         state.plan = plan_owner;
 

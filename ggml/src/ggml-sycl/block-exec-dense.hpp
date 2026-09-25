@@ -25,8 +25,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace ggml_sycl {
@@ -372,6 +374,12 @@ struct dense_exec_range_io {
     // original device reads. Each destination slice stays published as its
     // root's storage on the original device until the graph ends.
     std::vector<dense_exec_copy> copy_out;
+    // Byte offsets, parallel to stage_in and copy_out, of each copy's span in
+    // the host staging buffer of either device it crosses between. Each
+    // direction packs its copies into one buffer so they are submitted
+    // together and waited on once.
+    std::vector<size_t>          stage_in_host;
+    std::vector<size_t>          copy_out_host;
 };
 
 struct dense_exec_plan {
@@ -380,7 +388,8 @@ struct dense_exec_plan {
     std::vector<dense_exec_range_io> io;           // one per range
     std::vector<dense_exec_slice>    slices;
     std::vector<size_t>              arena_bytes;  // indexed by device
-    int                              failing_node = -1;
+    size_t                           host_stage_bytes = 0;  // the widest direction of any range
+    int                              failing_node     = -1;
 };
 
 inline size_t dense_exec_align(size_t bytes) {
@@ -673,6 +682,20 @@ inline dense_exec_gate dense_exec_build_plan(const dense_exec_graph & g, dense_e
         slice.offset   = total;
         total += dense_exec_align(slice.bytes != 0 ? slice.bytes : 1);
     }
+    out.host_stage_bytes = 0;
+    for (dense_exec_range_io & io : out.io) {
+        size_t in_bytes = 0;
+        for (int s : io.stage_in) {
+            io.stage_in_host.push_back(in_bytes);
+            in_bytes += dense_exec_align(out.slices[static_cast<size_t>(s)].bytes);
+        }
+        size_t out_bytes = 0;
+        for (const dense_exec_copy & c : io.copy_out) {
+            io.copy_out_host.push_back(out_bytes);
+            out_bytes += dense_exec_align(out.slices[static_cast<size_t>(c.from_slice)].bytes);
+        }
+        out.host_stage_bytes = std::max(out.host_stage_bytes, std::max(in_bytes, out_bytes));
+    }
     if (g.max_arena_bytes != 0) {
         for (size_t total : out.arena_bytes) {
             if (total > g.max_arena_bytes) {
@@ -770,6 +793,37 @@ inline const char * dense_exec_plan_violation(const dense_exec_graph & g, const 
         const dense_exec_range * producer = range_of_node(dst.producer);
         if (producer != nullptr && producer->executor) {
             return "an original-device node writes an executor range's result";
+        }
+    }
+
+    // Each direction's copies land in disjoint spans inside the host buffer.
+    auto spans_fit = [&](std::vector<std::pair<size_t, size_t>> spans) {  // (offset, bytes)
+        std::sort(spans.begin(), spans.end());
+        size_t end = 0;
+        for (const auto & span : spans) {
+            if (span.second == 0) {
+                continue;
+            }
+            if (span.first < end || span.first + span.second > p.host_stage_bytes) {
+                return false;
+            }
+            end = span.first + span.second;
+        }
+        return true;
+    };
+    for (const dense_exec_range_io & io : p.io) {
+        if (io.stage_in_host.size() != io.stage_in.size() || io.copy_out_host.size() != io.copy_out.size()) {
+            return "host staging spans overlap or leave the buffer";
+        }
+        std::vector<std::pair<size_t, size_t>> in, out;
+        for (size_t k = 0; k < io.stage_in.size(); ++k) {
+            in.emplace_back(io.stage_in_host[k], p.slices[static_cast<size_t>(io.stage_in[k])].bytes);
+        }
+        for (size_t k = 0; k < io.copy_out.size(); ++k) {
+            out.emplace_back(io.copy_out_host[k], p.slices[static_cast<size_t>(io.copy_out[k].from_slice)].bytes);
+        }
+        if (!spans_fit(std::move(in)) || !spans_fit(std::move(out))) {
+            return "host staging spans overlap or leave the buffer";
         }
     }
     return nullptr;

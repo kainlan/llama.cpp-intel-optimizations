@@ -557,6 +557,58 @@ static void test_plan_invariants() {
     }
 }
 
+// Each direction of a crossing moves through one host staging buffer per
+// device: its copies pack into disjoint aligned spans, so a range's copies
+// can be submitted together and waited on once.
+static void test_host_stage_layout() {
+    graph_builder b = make_split_graph();
+    for (dense_exec_root & r : b.g.roots) {
+        r.bytes = 1000;
+    }
+    dense_exec_plan p;
+    check(dense_exec_build_plan(b.g, p) == DENSE_EXEC_GATE_NONE, "plans");
+    check(dense_exec_plan_violation(b.g, p) == nullptr, "a built plan is clean");
+    check(!p.io[1].stage_in.empty() && !p.io[1].copy_out.empty(), "range 1 crosses both ways");
+
+    size_t widest = 0;
+    for (const dense_exec_range_io & io : p.io) {
+        check(io.stage_in_host.size() == io.stage_in.size(), "one host offset per staged slice");
+        check(io.copy_out_host.size() == io.copy_out.size(), "one host offset per copy out");
+        size_t expect = 0;
+        for (size_t k = 0; k < io.stage_in.size(); ++k) {
+            check(io.stage_in_host[k] == expect, "staged slices pack in order");
+            check(io.stage_in_host[k] % dense_exec_slice_alignment == 0, "host spans are aligned");
+            expect += dense_exec_align(p.slices[static_cast<size_t>(io.stage_in[k])].bytes);
+        }
+        widest = std::max(widest, expect);
+        expect = 0;
+        for (size_t k = 0; k < io.copy_out.size(); ++k) {
+            check(io.copy_out_host[k] == expect, "copies out pack in order");
+            expect += dense_exec_align(p.slices[static_cast<size_t>(io.copy_out[k].from_slice)].bytes);
+        }
+        widest = std::max(widest, expect);
+    }
+    check(p.host_stage_bytes == widest, "the host buffer holds the widest direction of any range");
+    check(p.io[1].stage_in.size() > 1 && p.host_stage_bytes == 1024 * p.io[1].stage_in.size(),
+          "1000-byte roots take 1024 host bytes each");
+
+    {
+        dense_exec_plan bad            = p;
+        bad.io[1].stage_in_host.back() = bad.io[1].stage_in_host.front();
+        expect_violation(b.g, bad, "host staging spans overlap or leave the buffer");
+    }
+    {
+        dense_exec_plan bad  = p;
+        bad.host_stage_bytes = bad.io[1].stage_in_host.back() + 999;  // one byte short of the last span
+        expect_violation(b.g, bad, "host staging spans overlap or leave the buffer");
+    }
+    {
+        dense_exec_plan bad = p;
+        bad.io[1].copy_out_host.clear();
+        expect_violation(b.g, bad, "host staging spans overlap or leave the buffer");
+    }
+}
+
 // dev0 | dev1 | dev0 | dev1. Range 1 produces r-1; a device-0 node in range 2
 // writes r-1 in place; range 3 reads r-1 on device 1. Range 3 could only
 // re-publish range 1's device-1 slice -- the value from before the write --
@@ -662,6 +714,7 @@ int main() {
         { "control-resident-on-executor-is-not-staged", test_control_resident_on_executor_is_not_staged      },
         { "graph-off-reasons",                          test_graph_off_reasons                               },
         { "graph-off-debug-envs",                       test_graph_off_debug_envs                            },
+        { "host-stage-layout",                          test_host_stage_layout                               },
     };
 
     int failed = 0;
