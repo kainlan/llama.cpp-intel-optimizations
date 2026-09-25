@@ -46261,11 +46261,11 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                     use_q8_activation_cache ? 1 : 0, src1_on_device ? 1 : 0, src1_is_contiguous ? 1 : 0,
                     (void *) dev[i].src1_ddf);
             }
-            if (use_q8_activation_cache &&
-                ctx.mmvq_q8_activation_cache.matches(src1, dev[i].src1_ddf_handle, dev[i].src1_ddf_handle_offset, ne10,
-                                                     nrows1, src1_padded_row_size, required_size, q8_1_soa_format)) {
-                dev[i].src1_ddq               = static_cast<char *>(ctx.mmvq_q8_activation_cache.cached_q8_1);
-                dev[i].src1_ddq_handle        = ctx.mmvq_q8_activation_cache.handle();
+            if (use_q8_activation_cache && ctx.mmvq_q8_activation_cache.matches(
+                                               i, src1, dev[i].src1_ddf_handle, dev[i].src1_ddf_handle_offset, ne10,
+                                               nrows1, src1_padded_row_size, required_size, q8_1_soa_format)) {
+                dev[i].src1_ddq               = static_cast<char *>(ctx.mmvq_q8_activation_cache.cached_q8_1(i));
+                dev[i].src1_ddq_handle        = ctx.mmvq_q8_activation_cache.handle(i);
                 dev[i].src1_ddq_handle_offset = 0;
                 using_cached_q8_activation    = dev[i].src1_ddq != nullptr;
                 GGML_SYCL_DEBUG("[MMVQ-Q8-CACHE] HIT src1=%s ptr=%p q8=%p ne10=%lld rows=%lld padded=%lld\n",
@@ -46276,7 +46276,7 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                 void * stable_q8 = ctx.mmvq_q8_activation_cache.ensure_buffer(required_size, i, *stream);
                 if (stable_q8) {
                     dev[i].src1_ddq               = static_cast<char *>(stable_q8);
-                    dev[i].src1_ddq_handle        = ctx.mmvq_q8_activation_cache.handle();
+                    dev[i].src1_ddq_handle        = ctx.mmvq_q8_activation_cache.handle(i);
                     dev[i].src1_ddq_handle_offset = 0;
                     cache_q8_activation           = true;
                     GGML_SYCL_DEBUG("[MMVQ-Q8-CACHE] BUFFER ptr=%p size=%zu src1=%s ne10=%lld rows=%lld padded=%lld\n",
@@ -46430,7 +46430,7 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                     std::exit(1);
                 }
                 if (cache_q8_activation) {
-                    ctx.mmvq_q8_activation_cache.store(src1, dev[i].src1_ddf_handle, dev[i].src1_ddf_handle_offset,
+                    ctx.mmvq_q8_activation_cache.store(i, src1, dev[i].src1_ddf_handle, dev[i].src1_ddf_handle_offset,
                                                        dev[i].src1_ddq, ne10, nrows1, src1_padded_row_size,
                                                        required_size, q8_1_soa_format);
                     GGML_SYCL_DEBUG("[MMVQ-Q8-CACHE] STORE src1=%s ptr=%p q8=%p ne10=%lld rows=%lld padded=%lld\n",
