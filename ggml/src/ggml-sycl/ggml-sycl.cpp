@@ -96,6 +96,7 @@
 #include "ggml-sycl/fattn.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
+#include "ggml-sycl/graph-recorder-scope.hpp"
 #include "ggml-sycl/host-weight-alias.hpp"
 #include "ggml-sycl/kernel-selection.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
@@ -409,6 +410,19 @@ std::atomic<int>        g_ggml_sycl_graph_recording_depth{ 0 };
 static std::atomic<int> g_sycl_barrier_count_during_recording{ 0 };  // DIAG: barrier counter during graph recording
 std::atomic<int>        g_sycl_submit_count_during_recording{ 0 };   // DIAG: operation dispatches during recording
 std::atomic<int>        g_sycl_extra_submit_count_during_recording{ 0 };  // DIAG: extra markers/events during recording
+#ifdef GGML_SYCL_GRAPH
+using ggml_sycl_graph_recorder =
+    ggml_sycl::graph_recorder_scope<sycl_ex::command_graph<sycl_ex::graph_state::modifiable>,
+                                    sycl::queue,
+                                    std::vector<ggml_sycl::mem_handle>>;
+
+// The state a command graph recorded on `ctx` turns on, as this thread sees it.
+static ggml_sycl_graph_recorder::slots ggml_sycl_graph_recorder_slots(ggml_backend_sycl_context & ctx) {
+    return { g_ggml_sycl_graph_recording, g_ggml_sycl_graph_recording_depth,         g_recording_graph_ptr,
+             g_recording_queue_ptr,       ggml_sycl::set_graph_retained_handle_sink, ctx.graph_recording_dispatch,
+             ctx.fa_graph_ptrs_recording };
+}
+#endif
 
 // Graph replay diagnostic variables removed — the memcpy().wait() calls they
 // performed on the graph queue between refresh and replay corrupted L0 state.
@@ -89416,12 +89430,11 @@ class ggml_sycl_block_exec_dense_run {
 
     using recorded_range = ggml_sycl_block_exec_dense_state::range_graph;
 
-    // What a recording replaced, put back when it ends.
+    // The context's FA pointer snapshot a recording replaced, put back when it
+    // ends.
     struct recording_saved {
         std::vector<ggml_backend_sycl_context::fa_graph_ptr_snapshot> fa_ptrs;
-        bool                                                          fa_valid     = false;
-        bool                                                          fa_recording = false;
-        bool                                                          dispatch     = false;
+        bool                                                          fa_valid = false;
     };
 
     bool                       graphs_on_  = false;
@@ -89430,8 +89443,8 @@ class ggml_sycl_block_exec_dense_run {
     std::vector<range_graph_mode>                                           range_modes_;
     uint64_t                                                                recording_signature_ = 0;
     std::optional<sycl_ex::command_graph<sycl_ex::graph_state::modifiable>> recording_;
+    std::optional<ggml_sycl_graph_recorder>                                 recorder_;
     size_t                                                                  recording_range_ = 0;
-    bool                                                                    recording_open_  = false;
     recording_saved                                                         recording_saved_;
     // Each pool's graph-retained count when the open recording began.
     std::vector<std::pair<ggml_sycl_pool *, size_t>>                        pool_baseline_;
@@ -89597,37 +89610,12 @@ class ggml_sycl_block_exec_dense_run {
         }
         recording_.emplace(*q, sycl::property_list{ sycl_ex::property::graph::assume_buffer_outlives_graph{} });
         recording_saved_.fa_ptrs.swap(ctx_.fa_graph_ptrs);
-        recording_saved_.fa_valid     = ctx_.fa_graph_ptrs_valid;
-        recording_saved_.fa_recording = ctx_.fa_graph_ptrs_recording;
-        recording_saved_.dispatch     = ctx_.graph_recording_dispatch;
+        recording_saved_.fa_valid = ctx_.fa_graph_ptrs_valid;
         ctx_.fa_graph_ptrs.clear();
-        ctx_.fa_graph_ptrs_recording = true;
-        ctx_.fa_graph_ptrs_valid     = false;
-        g_ggml_sycl_graph_recording_depth.fetch_add(1, std::memory_order_acq_rel);
-        ggml_sycl::set_graph_retained_handle_sink(&g.retained);
-        g_ggml_sycl_graph_recording   = true;
-        g_recording_graph_ptr         = &*recording_;
-        g_recording_queue_ptr         = q;
-        ctx_.graph_recording_dispatch = true;
-        range_modes_[idx]             = range_graph_mode::RECORD;
-        recording_open_               = true;
+        ctx_.fa_graph_ptrs_valid = false;
+        recorder_.emplace(ggml_sycl_graph_recorder_slots(ctx_), &*recording_, q, &g.retained, true);
+        range_modes_[idx] = range_graph_mode::RECORD;
         recording_->begin_recording(*q);
-    }
-
-    // Undoes begin_range_graph's recording state, in the order the
-    // whole-graph recorder does.
-    void stop_recording() {
-        if (!recording_open_) {
-            return;
-        }
-        recording_open_       = false;
-        g_recording_graph_ptr = nullptr;
-        g_recording_queue_ptr = nullptr;
-        ggml_sycl::set_graph_retained_handle_sink(nullptr);
-        ctx_.graph_recording_dispatch = recording_saved_.dispatch;
-        g_ggml_sycl_graph_recording   = false;
-        g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
-        ctx_.fa_graph_ptrs_recording = recording_saved_.fa_recording;
     }
 
     // Finishes a recording and submits it, which is what runs the range.
@@ -89641,7 +89629,7 @@ class ggml_sycl_block_exec_dense_run {
         sycl::queue *                       q     = ggml_sycl_block_exec_dense_queue(ctx_, range.device);
 
         recording_->end_recording();
-        stop_recording();
+        recorder_.reset();
         auto exec = recording_->finalize();
         recording_.reset();
         g.exec = std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
@@ -89747,7 +89735,7 @@ class ggml_sycl_block_exec_dense_run {
             recording_->end_recording();
         } catch (...) {
         }
-        stop_recording();
+        recorder_.reset();
         recording_.reset();
         pool_baseline_.clear();
         ctx_.fa_graph_ptrs.swap(recording_saved_.fa_ptrs);
@@ -106258,37 +106246,23 @@ normal_dispatch:
             sycl_ctx->exec_graph.reset();
             sycl_exec_graph_release_pool_retained(sycl_ctx);
             sycl_ctx->active_exec_graph.valid = false;
-            bool recording_depth_incremented  = false;
+
+            // The recorder scope inside the try has put the recording state
+            // back by the time this runs, so the sink is detached before the
+            // retained handles are dropped.
             struct recording_exception_guard {
                 ggml_backend_sycl_context * ctx;
-                bool & depth;
-                bool committed = false;
-                bool old_recording = g_ggml_sycl_graph_recording;
-                bool old_dispatch;
-                bool old_fa_recording;
-                decltype(g_recording_graph_ptr) old_graph = g_recording_graph_ptr;
-                decltype(g_recording_queue_ptr) old_queue = g_recording_queue_ptr;
-                recording_exception_guard(ggml_backend_sycl_context * ctx, bool & depth) :
-                    ctx(ctx), depth(depth), old_dispatch(ctx->graph_recording_dispatch),
-                    old_fa_recording(ctx->fa_graph_ptrs_recording) {}
+                bool                        committed = false;
+
                 ~recording_exception_guard() noexcept {
-                    g_ggml_sycl_graph_recording = old_recording;
-                    g_recording_graph_ptr = old_graph;
-                    g_recording_queue_ptr = old_queue;
-                    ggml_sycl::set_graph_retained_handle_sink(nullptr);
-                    ctx->graph_recording_dispatch = old_dispatch;
-                    ctx->fa_graph_ptrs_recording = old_fa_recording;
-                    if (depth) {
-                        g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
-                        depth = false;
-                    }
                     if (!committed) {
                         try { ctx->graph_retained_handles.clear(); } catch (...) {}
                         ctx->fa_graph_ptrs_valid = false;
                         try { ctx->fa_graph_ptrs.clear(); } catch (...) {}
                     }
                 }
-            } recording_guard(sycl_ctx, recording_depth_incremented);
+            } recording_guard{ sycl_ctx };
+
             try {
                 sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()),
                                                         { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
@@ -106301,13 +106275,10 @@ normal_dispatch:
                 // Clear stale eviction guard (same reason as first-time recording path)
                 ggml_sycl::unified_cache_set_graph_compute_active(false);
 
-                g_ggml_sycl_graph_recording_depth.fetch_add(1, std::memory_order_acq_rel);
-                recording_depth_incremented = true;
-                ggml_sycl::set_graph_retained_handle_sink(&sycl_ctx->graph_retained_handles);
-                g_ggml_sycl_graph_recording        = true;
-                g_recording_graph_ptr              = &model_sycl_graph;
-                g_recording_queue_ptr              = sycl_ctx->stream();
-                sycl_ctx->graph_recording_dispatch = true;
+                // Re-recording does not re-capture FA pointers: the first
+                // recording's snapshot stays.
+                ggml_sycl_graph_recorder recorder(ggml_sycl_graph_recorder_slots(*sycl_ctx), &model_sycl_graph,
+                                                  sycl_ctx->stream(), &sycl_ctx->graph_retained_handles, false);
                 model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
                 g_graph_memcpy_count_during_recording.store(0, std::memory_order_relaxed);
                 compute_impl();
@@ -106318,13 +106289,7 @@ normal_dispatch:
                         fprintf(stderr, "[GRAPH-MEMCPY] Total memcpy nodes during recording: %d\n", mc);
                     }
                 }
-                g_recording_graph_ptr = nullptr;
-                g_recording_queue_ptr = nullptr;
-                ggml_sycl::set_graph_retained_handle_sink(nullptr);
-                sycl_ctx->graph_recording_dispatch = false;
-                g_ggml_sycl_graph_recording        = false;
-                g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
-                recording_depth_incremented = false;
+                recorder.leave();
 
                 // Re-finalize: L0 Mutable Command List cannot update() when the
                 // runtime inserts implicit memcpy nodes (e.g. for USM argument
@@ -106351,15 +106316,7 @@ normal_dispatch:
                     sycl_exec_graph_clear_active(sycl_ctx, "replay-futility");
                 }
             } catch (const sycl::exception & exc) {
-                g_ggml_sycl_graph_recording = false;
-                g_recording_graph_ptr       = nullptr;
-                g_recording_queue_ptr       = nullptr;
-                ggml_sycl::set_graph_retained_handle_sink(nullptr);
-                sycl_ctx->graph_recording_dispatch = false;
-                if (recording_depth_incremented) {
-                    g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
-                    recording_depth_incremented = false;
-                }
+                // Unwinding has already put the recording state back.
                 GGML_LOG_ERROR("[SYCL-GRAPH] re-record+re-finalize failed: %s, falling back\n", exc.what());
                 g_graph_diag_counters.rerecord_failures.fetch_add(1, std::memory_order_relaxed);
                 // Invalidate and force re-record on next call
@@ -106394,37 +106351,23 @@ normal_dispatch:
 
             GGML_SYCL_DEBUG("[SYCL-GRAPH-DEBUG] Creating command_graph for %d nodes...\n", cgraph->n_nodes);
             g_graph_diag_counters.full_record_attempts.fetch_add(1, std::memory_order_relaxed);
-            bool recording_depth_incremented = false;
+
+            // The recorder scope inside the try has put the recording state
+            // back by the time this runs, so the sink is detached before the
+            // retained handles are dropped.
             struct recording_exception_guard {
                 ggml_backend_sycl_context * ctx;
-                bool & depth;
-                bool committed = false;
-                bool old_recording = g_ggml_sycl_graph_recording;
-                bool old_dispatch;
-                bool old_fa_recording;
-                decltype(g_recording_graph_ptr) old_graph = g_recording_graph_ptr;
-                decltype(g_recording_queue_ptr) old_queue = g_recording_queue_ptr;
-                recording_exception_guard(ggml_backend_sycl_context * ctx, bool & depth) :
-                    ctx(ctx), depth(depth), old_dispatch(ctx->graph_recording_dispatch),
-                    old_fa_recording(ctx->fa_graph_ptrs_recording) {}
+                bool                        committed = false;
+
                 ~recording_exception_guard() noexcept {
-                    g_ggml_sycl_graph_recording = old_recording;
-                    g_recording_graph_ptr = old_graph;
-                    g_recording_queue_ptr = old_queue;
-                    ggml_sycl::set_graph_retained_handle_sink(nullptr);
-                    ctx->graph_recording_dispatch = old_dispatch;
-                    ctx->fa_graph_ptrs_recording = old_fa_recording;
-                    if (depth) {
-                        g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
-                        depth = false;
-                    }
                     if (!committed) {
                         try { ctx->graph_retained_handles.clear(); } catch (...) {}
                         ctx->fa_graph_ptrs_valid = false;
                         try { ctx->fa_graph_ptrs.clear(); } catch (...) {}
                     }
                 }
-            } recording_guard(sycl_ctx, recording_depth_incremented);
+            } recording_guard{ sycl_ctx };
+
             try {
                 sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()),
 
@@ -106462,18 +106405,12 @@ normal_dispatch:
 
                 GGML_SYCL_DEBUG("[SYCL-GRAPH-DEBUG] begin_recording...\n");
                 sycl_ctx->fa_graph_ptrs.clear();
-                sycl_ctx->fa_graph_ptrs_recording = true;
-                sycl_ctx->fa_graph_ptrs_valid     = false;
-                g_ggml_sycl_graph_recording_depth.fetch_add(1, std::memory_order_acq_rel);
-                recording_depth_incremented = true;
+                sycl_ctx->fa_graph_ptrs_valid = false;
                 g_sycl_barrier_count_during_recording.store(0);
                 g_sycl_submit_count_during_recording.store(0);
                 g_sycl_extra_submit_count_during_recording.store(0);
-                ggml_sycl::set_graph_retained_handle_sink(&sycl_ctx->graph_retained_handles);
-                g_ggml_sycl_graph_recording        = true;  // Mark recording state
-                g_recording_graph_ptr              = &model_sycl_graph;
-                g_recording_queue_ptr              = sycl_ctx->stream();
-                sycl_ctx->graph_recording_dispatch = true;
+                ggml_sycl_graph_recorder recorder(ggml_sycl_graph_recorder_slots(*sycl_ctx), &model_sycl_graph,
+                                                  sycl_ctx->stream(), &sycl_ctx->graph_retained_handles, true);
                 g_graph_memcpy_count_during_recording.store(0, std::memory_order_relaxed);
                 model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
                 GGML_SYCL_DEBUG("[SYCL-GRAPH-DEBUG] calling compute_impl...\n");
@@ -106486,20 +106423,12 @@ normal_dispatch:
                         fprintf(stderr, "[GRAPH-MEMCPY] Total memcpy nodes during first recording: %d\n", mc);
                     }
                 }
-                g_recording_graph_ptr = nullptr;
-                g_recording_queue_ptr = nullptr;
-                ggml_sycl::set_graph_retained_handle_sink(nullptr);
+                recorder.leave();
                 GGML_SYCL_DEBUG("[GRAPH-DIAG] barriers: %d  ops_dispatched: %d  extra_submits: %d  nodes: %d\n",
                                 g_sycl_barrier_count_during_recording.load(),
                                 g_sycl_submit_count_during_recording.load(),
                                 g_sycl_extra_submit_count_during_recording.load(), cgraph->n_nodes);
-                sycl_ctx->fa_graph_ptrs_recording  = false;
-                sycl_ctx->fa_graph_ptrs_valid      = true;
-                sycl_ctx->graph_recording_dispatch = false;
-                g_ggml_sycl_graph_recording        = false;  // Clear recording state
-
-                g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
-                recording_depth_incremented = false;
+                sycl_ctx->fa_graph_ptrs_valid = true;
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] finalize (new graph)...\n");
                 // Finalize as updatable when re-record will be needed (MoE or explicit rerecord_mode).
                 // This allows subsequent tokens to use update() instead of full re-finalization.
@@ -106526,19 +106455,9 @@ normal_dispatch:
 
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] execute done\n");
             } catch (const sycl::exception & exc) {
-                g_ggml_sycl_graph_recording = false;
-                g_recording_graph_ptr       = nullptr;
-                g_recording_queue_ptr       = nullptr;
-                ggml_sycl::set_graph_retained_handle_sink(nullptr);
-                sycl_ctx->graph_recording_dispatch = false;
-                sycl_ctx->fa_graph_ptrs_recording  = false;
-
+                // Unwinding has already put the recording state back.
                 sycl_ctx->fa_graph_ptrs_valid = false;
                 sycl_ctx->fa_graph_ptrs.clear();
-                if (recording_depth_incremented) {
-                    g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
-                    recording_depth_incremented = false;
-                }
                 GGML_LOG_WARN("[SYCL-GRAPH] recording failed, disabling graphs: %s\n", exc.what());
                 g_graph_diag_counters.full_record_failures.fetch_add(1, std::memory_order_relaxed);
                 sycl_ctx->graphs_disabled = true;
