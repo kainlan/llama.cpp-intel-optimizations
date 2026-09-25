@@ -15,6 +15,8 @@
 //   - dense_exec_first_failing_precheck: may the executor run this graph?
 //   - dense_exec_build_plan: node devices, ranges, per-range copies and the
 //     layout of the persistent per-device arena.
+//   - dense_exec_graph_first_off: do the ranges of a decode graph record and
+//     replay command graphs?
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -142,6 +144,105 @@ inline dense_exec_gate dense_exec_first_failing_precheck(const dense_exec_preche
         }
     }
     return DENSE_EXEC_GATE_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// Range command graphs
+// ---------------------------------------------------------------------------
+
+// Why the ranges of a graph the executor runs are dispatched directly instead
+// of recorded once and replayed. Listed in evaluation order; the last two are
+// decided after this check, by the backend. NONE means they record or replay.
+enum dense_graph_off {
+    DENSE_GRAPH_OFF_NONE = 0,
+    DENSE_GRAPH_OFF_ENV,            // GGML_SYCL_BLOCK_EXEC_DENSE_GRAPH=0
+    DENSE_GRAPH_OFF_DISABLE_GRAPH,  // GGML_SYCL_DISABLE_GRAPH
+    DENSE_GRAPH_OFF_MULTITHREADED,  // graphs computed from several threads
+    DENSE_GRAPH_OFF_DISABLED,       // graphs disabled on the context, or a range recording failed
+    DENSE_GRAPH_OFF_NOT_DECODE,     // only decode graphs record
+    DENSE_GRAPH_OFF_HOST_INPUTS,    // GGML_SYCL_DISABLE_DECODE_GRAPH_HOST_INPUTS and the graph has host inputs
+    DENSE_GRAPH_OFF_FA_UNVERIFIED,  // the whole-graph FA gate refuses
+    DENSE_GRAPH_OFF_INCOMPATIBLE,   // check_graph_compatibility refuses
+    DENSE_GRAPH_OFF_STAGE_FAILED,   // the executor fell back to the per-op path
+};
+
+inline const char * dense_exec_graph_off_name(dense_graph_off reason) {
+    switch (reason) {
+        case DENSE_GRAPH_OFF_NONE:
+            return "none";
+        case DENSE_GRAPH_OFF_ENV:
+            return "env";
+        case DENSE_GRAPH_OFF_DISABLE_GRAPH:
+            return "disable-graph";
+        case DENSE_GRAPH_OFF_MULTITHREADED:
+            return "multithreaded";
+        case DENSE_GRAPH_OFF_DISABLED:
+            return "disabled";
+        case DENSE_GRAPH_OFF_NOT_DECODE:
+            return "not-decode";
+        case DENSE_GRAPH_OFF_HOST_INPUTS:
+            return "host-inputs";
+        case DENSE_GRAPH_OFF_FA_UNVERIFIED:
+            return "fa-unverified";
+        case DENSE_GRAPH_OFF_INCOMPATIBLE:
+            return "incompatible";
+        case DENSE_GRAPH_OFF_STAGE_FAILED:
+            return "stage-failed";
+    }
+    return "unknown";
+}
+
+// GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW, as the whole-graph decode gate reads it.
+enum dense_graph_fa_mode {
+    DENSE_GRAPH_FA_AUTO = 0,
+    DENSE_GRAPH_FA_FORCE_ON,
+    DENSE_GRAPH_FA_FORCE_OFF,
+};
+
+struct dense_graph_facts {
+    bool                enabled             = false;
+    bool                disable_graph       = false;
+    bool                multithreaded       = false;
+    bool                disabled            = false;
+    bool                is_decode           = false;
+    bool                host_inputs_blocked = false;
+    bool                has_fa              = false;
+    dense_graph_fa_mode fa_mode             = DENSE_GRAPH_FA_AUTO;
+    // Every decode FA dispatch the context has observed, on any device,
+    // reached a kernel verified replay-safe (and at least one was observed).
+    bool                fa_observed_safe    = false;
+    bool                fa_mask_sinks_safe  = false;
+};
+
+// The first reason, among those decidable before recording, that keeps the
+// ranges on direct dispatch; DENSE_GRAPH_OFF_NONE when none applies.
+inline dense_graph_off dense_exec_graph_first_off(const dense_graph_facts & f) {
+    if (!f.enabled) {
+        return DENSE_GRAPH_OFF_ENV;
+    }
+    if (f.disable_graph) {
+        return DENSE_GRAPH_OFF_DISABLE_GRAPH;
+    }
+    if (f.multithreaded) {
+        return DENSE_GRAPH_OFF_MULTITHREADED;
+    }
+    if (f.disabled) {
+        return DENSE_GRAPH_OFF_DISABLED;
+    }
+    if (!f.is_decode) {
+        return DENSE_GRAPH_OFF_NOT_DECODE;
+    }
+    if (f.host_inputs_blocked) {
+        return DENSE_GRAPH_OFF_HOST_INPUTS;
+    }
+    if (f.has_fa) {
+        const bool engage = f.fa_mode == DENSE_GRAPH_FA_FORCE_ON ||
+                            (f.fa_mode == DENSE_GRAPH_FA_AUTO && f.fa_observed_safe && f.fa_mask_sinks_safe);
+        if (!engage) {
+            return DENSE_GRAPH_OFF_FA_UNVERIFIED;
+        }
+    }
+    return DENSE_GRAPH_OFF_NONE;
 }
 
 // ---------------------------------------------------------------------------

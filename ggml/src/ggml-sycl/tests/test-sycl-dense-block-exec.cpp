@@ -205,6 +205,53 @@ static void test_precheck_gates() {
     }
 }
 
+// Whether a graph's ranges record or replay command graphs, and the first
+// reason when they do not. The FA gate is the whole-graph decode gate.
+static void test_graph_off_reasons() {
+    dense_graph_facts f{};
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_ENV, "env is the first reason");
+    f.enabled       = true;
+    f.disable_graph = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_DISABLE_GRAPH, "GGML_SYCL_DISABLE_GRAPH");
+    f.disable_graph = false;
+    f.multithreaded = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_MULTITHREADED, "multithreaded compute");
+    f.multithreaded = false;
+    f.disabled      = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_DISABLED, "graphs disabled on the context");
+    f.disabled = false;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NOT_DECODE, "prefill never records");
+    f.is_decode           = true;
+    f.host_inputs_blocked = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_HOST_INPUTS, "host inputs blocked by env");
+    f.host_inputs_blocked = false;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NONE, "a decode graph without FA records");
+
+    f.has_fa = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_FA_UNVERIFIED, "FA with nothing observed");
+    f.fa_observed_safe = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_FA_UNVERIFIED, "FA whose mask/sinks cannot refresh");
+    f.fa_mask_sinks_safe = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NONE, "FA observed safe and refreshable");
+    f.fa_mode = DENSE_GRAPH_FA_FORCE_OFF;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_FA_UNVERIFIED, "force-off wins over observation");
+    f.fa_mode            = DENSE_GRAPH_FA_FORCE_ON;
+    f.fa_observed_safe   = false;
+    f.fa_mask_sinks_safe = false;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NONE, "force-on skips the observation");
+    f.is_decode = false;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NOT_DECODE, "force-on does not reach prefill");
+
+    for (int r = DENSE_GRAPH_OFF_NONE; r <= DENSE_GRAPH_OFF_STAGE_FAILED; ++r) {
+        const char * name = dense_exec_graph_off_name(static_cast<dense_graph_off>(r));
+        check(name != nullptr && std::strcmp(name, "unknown") != 0, "every reason has a name: " + std::to_string(r));
+        for (int q = DENSE_GRAPH_OFF_NONE; q < r; ++q) {
+            check(std::strcmp(name, dense_exec_graph_off_name(static_cast<dense_graph_off>(q))) != 0,
+                  "reason names are distinct: " + std::to_string(r));
+        }
+    }
+}
+
 // The case the executor exists for: three ranges, layers 2-3 plus the final
 // norm on device 1, the output head back on device 0.
 static void test_split_decode_ranges() {
@@ -567,6 +614,7 @@ int main() {
         { "original-range-writes-executor-result",      test_original_range_writes_executor_result           },
         { "violation-original-writes-executor-result",  test_violation_original_range_writes_executor_result },
         { "control-resident-on-executor-is-not-staged", test_control_resident_on_executor_is_not_staged      },
+        { "graph-off-reasons",                          test_graph_off_reasons                               },
     };
 
     int failed = 0;

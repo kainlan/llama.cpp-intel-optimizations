@@ -89082,7 +89082,7 @@ class ggml_sycl_block_exec_dense_run {
             gate_                   = ggml_sycl::DENSE_EXEC_GATE_STAGE_FAILED;
 #ifdef GGML_SYCL_GRAPH
             graphs_on_  = false;
-            graphs_off_ = "stage-failed";
+            graphs_off_ = ggml_sycl::DENSE_GRAPH_OFF_STAGE_FAILED;
 #endif
             trace_result();
             return true;
@@ -89251,8 +89251,9 @@ class ggml_sycl_block_exec_dense_run {
         bool                                                          dispatch     = false;
     };
 
-    bool                                                                    graphs_on_  = false;
-    const char *                                                            graphs_off_ = "not-prepared";
+    bool                       graphs_on_  = false;
+    ggml_sycl::dense_graph_off graphs_off_ = ggml_sycl::DENSE_GRAPH_OFF_NONE;
+
     std::vector<range_graph_mode>                                           range_modes_;
     uint64_t                                                                recording_signature_ = 0;
     std::optional<sycl_ex::command_graph<sycl_ex::graph_state::modifiable>> recording_;
@@ -89305,40 +89306,40 @@ class ggml_sycl_block_exec_dense_run {
     void prepare_graphs() {
         graphs_on_ = false;
 
-        bool is_decode = false;
+        ggml_sycl::dense_graph_facts f{};
         for (int i = 0; i < cgraph_->n_nodes; i++) {
             if (cgraph_->nodes[i]->op == GGML_OP_MUL_MAT && cgraph_->nodes[i]->src[1]) {
-                is_decode = cgraph_->nodes[i]->src[1]->ne[1] == 1;
+                f.is_decode = cgraph_->nodes[i]->src[1]->ne[1] == 1;
                 break;
             }
         }
-        if (!ggml_sycl_block_exec_dense_graph_enabled()) {
-            graphs_off_ = "env";
-        } else if (g_ggml_sycl_disable_graph) {
-            graphs_off_ = "disable-graph";
-        } else if (g_sycl_graph_multithreaded.load(std::memory_order_relaxed)) {
-            graphs_off_ = "multithreaded";
-        } else if (ctx_.graphs_disabled || state().graphs_disabled) {
-            graphs_off_ = "disabled";
-        } else if (!is_decode) {
-            graphs_off_ = "not-decode";
-        } else if (ggml_sycl_graph_has_host_inputs(cgraph_) &&
-                   getenv("GGML_SYCL_DISABLE_DECODE_GRAPH_HOST_INPUTS") != nullptr) {
-            graphs_off_ = "host-inputs";
-        } else if (ggml_sycl_graph_has_op(cgraph_, GGML_OP_FLASH_ATTN_EXT)) {
+        f.enabled       = ggml_sycl_block_exec_dense_graph_enabled();
+        f.disable_graph = g_ggml_sycl_disable_graph != 0;
+        f.multithreaded = g_sycl_graph_multithreaded.load(std::memory_order_relaxed);
+        f.disabled      = ctx_.graphs_disabled || state().graphs_disabled;
+        f.host_inputs_blocked =
+            getenv("GGML_SYCL_DISABLE_DECODE_GRAPH_HOST_INPUTS") != nullptr && ggml_sycl_graph_has_host_inputs(cgraph_);
+        f.has_fa = ggml_sycl_graph_has_op(cgraph_, GGML_OP_FLASH_ATTN_EXT);
+        if (f.has_fa) {
             // The whole-graph gate: every decode FA dispatch this context has
             // seen -- on either device, the device scope keeps this context --
             // reached a kernel verified replay-safe, and mask/sinks refresh.
-            const ggml_sycl_fa_graph_allow_mode mode = ggml_sycl_flash_attn_graph_allow_mode();
-            const bool                          engage =
-                mode == ggml_sycl_fa_graph_allow_mode::FORCE_ON ||
-                (mode == ggml_sycl_fa_graph_allow_mode::AUTO && ctx_.fa_decode_kernel_obs.all_verified_safe() &&
-                 ggml_sycl_fa_mask_sinks_refresh_safe(cgraph_));
-            graphs_off_ = engage ? nullptr : "fa-unverified";
-        } else {
-            graphs_off_ = nullptr;
+            switch (ggml_sycl_flash_attn_graph_allow_mode()) {
+                case ggml_sycl_fa_graph_allow_mode::AUTO:
+                    f.fa_mode = ggml_sycl::DENSE_GRAPH_FA_AUTO;
+                    break;
+                case ggml_sycl_fa_graph_allow_mode::FORCE_ON:
+                    f.fa_mode = ggml_sycl::DENSE_GRAPH_FA_FORCE_ON;
+                    break;
+                case ggml_sycl_fa_graph_allow_mode::FORCE_OFF:
+                    f.fa_mode = ggml_sycl::DENSE_GRAPH_FA_FORCE_OFF;
+                    break;
+            }
+            f.fa_observed_safe   = ctx_.fa_decode_kernel_obs.all_verified_safe();
+            f.fa_mask_sinks_safe = ggml_sycl_fa_mask_sinks_refresh_safe(cgraph_);
         }
-        if (graphs_off_ != nullptr) {
+        graphs_off_ = ggml_sycl::dense_exec_graph_first_off(f);
+        if (graphs_off_ != ggml_sycl::DENSE_GRAPH_OFF_NONE) {
             return;
         }
 
@@ -89355,7 +89356,7 @@ class ggml_sycl_block_exec_dense_run {
             any_missing = any_missing || !g.exec;
         }
         if (any_missing && !check_graph_compatibility(ctx_, cgraph_)) {
-            graphs_off_ = "incompatible";
+            graphs_off_ = ggml_sycl::DENSE_GRAPH_OFF_INCOMPATIBLE;
             return;
         }
         // Stable device staging for host INPUT leaves before any recording,
@@ -89532,7 +89533,8 @@ class ggml_sycl_block_exec_dense_run {
             return;
         }
         if (!graphs_on_) {
-            fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE-GRAPH] off reason=%s\n", graphs_off_ ? graphs_off_ : "?");
+            fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE-GRAPH] off reason=%s\n",
+                    ggml_sycl::dense_exec_graph_off_name(graphs_off_));
             fflush(stderr);
             return;
         }
