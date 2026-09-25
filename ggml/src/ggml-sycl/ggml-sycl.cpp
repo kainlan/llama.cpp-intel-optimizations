@@ -88862,8 +88862,15 @@ class ggml_sycl_block_exec_dense_run {
         ctx_(ctx),
         cgraph_(cgraph),
         original_device_(ctx.device) {
-        gate_ = prepare(unsupported_mode);
+        const auto t0 = std::chrono::steady_clock::now();
+        gate_         = prepare(unsupported_mode);
         trace_result();
+        phase_trace_ = gate_ == ggml_sycl::DENSE_EXEC_GATE_NONE && ggml_sycl_block_exec_plan_trace_enabled();
+        if (phase_trace_) {
+            t_start_    = t0;
+            prepare_us_ = elapsed_us(t0);
+            phases_.assign(ranges_.size(), dense_phase{});
+        }
     }
 
     ~ggml_sycl_block_exec_dense_run() {
@@ -88871,6 +88878,7 @@ class ggml_sycl_block_exec_dense_run {
         restore(range_publications_);
         scope_.reset();
         restore(graph_publications_);
+        trace_phases();
     }
 
     ggml_sycl_block_exec_dense_run(const ggml_sycl_block_exec_dense_run &)             = delete;
@@ -88891,8 +88899,18 @@ class ggml_sycl_block_exec_dense_run {
         const ggml_sycl::dense_exec_range & range = ranges_[static_cast<size_t>(idx)];
         view_                                     = ggml_graph_view(cgraph_, range.begin, range.end);
         if (!range.executor) {
+            mark_range_start();
             return true;
         }
+        if (phase_trace_) {
+            // Trace only: finish the original device's pending work first, so
+            // the staging copies below are timed without it. The first copy
+            // would wait for the same work on the same in-order queue.
+            const auto t = std::chrono::steady_clock::now();
+            ggml_sycl_block_exec_dense_queue(ctx_, original_device_)->wait_and_throw();
+            phases_[static_cast<size_t>(idx)].drain_in_us = elapsed_us(t);
+        }
+        const auto t_stage = std::chrono::steady_clock::now();
         if (!stage_range(static_cast<size_t>(idx))) {
             if (executed_ranges_ > 0) {
                 GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] staging range %d on device %d failed after an earlier range ran",
@@ -88910,8 +88928,12 @@ class ggml_sycl_block_exec_dense_run {
             trace_result();
             return true;
         }
+        if (phase_trace_) {
+            phases_[static_cast<size_t>(idx)].stage_us = elapsed_us(t_stage);
+        }
         scope_.emplace(ctx_, range.device);
         g_ggml_sycl_block_exec_dense_active = true;
+        mark_range_start();
         return true;
     }
 
@@ -88925,6 +88947,9 @@ class ggml_sycl_block_exec_dense_run {
     // Leaving an executor range drains its device, copies back what later
     // ranges read, and restores the backend's device.
     void leave_range(int idx) {
+        if (phase_trace_ && idx >= 0 && static_cast<size_t>(idx) < phases_.size()) {
+            phases_[static_cast<size_t>(idx)].submit_us = elapsed_us(t_range_);
+        }
         if (gate_ != ggml_sycl::DENSE_EXEC_GATE_NONE || idx < 0 || static_cast<size_t>(idx) >= ranges_.size() ||
             !ranges_[static_cast<size_t>(idx)].executor) {
             return;
@@ -88940,6 +88965,13 @@ class ggml_sycl_block_exec_dense_run {
             GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] no execution queue to leave range %d (device %d)", idx, range.device);
         }
         try {
+            auto t_copy = std::chrono::steady_clock::now();
+            if (phase_trace_) {
+                // Trace only: the range's own work, separated from the copies.
+                q_exec->wait_and_throw();
+                phases_[static_cast<size_t>(idx)].drain_out_us = elapsed_us(t_copy);
+                t_copy                                         = std::chrono::steady_clock::now();
+            }
             for (const ggml_sycl::dense_exec_copy & copy : io.copy_out) {
                 const ggml_sycl::dense_exec_slice & from = plan_.slices[static_cast<size_t>(copy.from_slice)];
                 if (from.bytes == 0) {
@@ -88949,6 +88981,9 @@ class ggml_sycl_block_exec_dense_run {
                                     slices_[static_cast<size_t>(copy.from_slice)], 0, from.bytes, *q_orig);
             }
             q_exec->wait_and_throw();
+            if (phase_trace_) {
+                phases_[static_cast<size_t>(idx)].copy_out_us = elapsed_us(t_copy);
+            }
         } catch (const std::exception & e) {
             GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] boundary copy out of range %d (device %d) failed: %s", idx,
                        range.device, e.what());
@@ -88977,6 +89012,53 @@ class ggml_sycl_block_exec_dense_run {
     };
 
     using publications = std::vector<dense_publication>;
+
+    // GGML_SYCL_BLOCK_EXEC_TRACE: host wall time of each phase of a range.
+    // submit is the node loop (on an executor range, including waits inside
+    // ops); drain_in/drain_out are the devices finishing queued work; stage
+    // and copy_out are the boundary copies alone.
+    struct dense_phase {
+        double drain_in_us  = 0.0;
+        double stage_us     = 0.0;
+        double submit_us    = 0.0;
+        double drain_out_us = 0.0;
+        double copy_out_us  = 0.0;
+    };
+
+    bool                                  phase_trace_ = false;
+    double                                prepare_us_  = 0.0;
+    std::chrono::steady_clock::time_point t_start_{};
+    std::chrono::steady_clock::time_point t_range_{};
+    std::vector<dense_phase>              phases_;
+
+    static double elapsed_us(std::chrono::steady_clock::time_point since) {
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - since).count();
+    }
+
+    void mark_range_start() {
+        if (phase_trace_) {
+            t_range_ = std::chrono::steady_clock::now();
+        }
+    }
+
+    void trace_phases() const {
+        if (!phase_trace_) {
+            return;
+        }
+        std::string line;
+        char        buf[256];
+        for (size_t r = 0; r < phases_.size() && r < ranges_.size(); ++r) {
+            const dense_phase & p = phases_[r];
+            snprintf(buf, sizeof(buf),
+                     " r%zu(dev=%d nodes=%d drain_in=%.0f stage=%.0f submit=%.0f drain_out=%.0f copy_out=%.0f)", r,
+                     ranges_[r].device, ranges_[r].end - ranges_[r].begin, p.drain_in_us, p.stage_us, p.submit_us,
+                     p.drain_out_us, p.copy_out_us);
+            line += buf;
+        }
+        fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE-PHASE] nodes=%d prepare=%.0f%s total=%.0f us\n", cgraph_->n_nodes,
+                prepare_us_, line.c_str(), elapsed_us(t_start_));
+        fflush(stderr);
+    }
 
     ggml_backend_sycl_context &                      ctx_;
     ggml_cgraph *                                    cgraph_          = nullptr;
