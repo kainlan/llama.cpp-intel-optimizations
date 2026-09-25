@@ -52092,13 +52092,13 @@ static bool ggml_sycl_try_route_simple_consumer(ggml_backend_sycl_context & ctx,
     // the publish just filled, and the dtor restoring the pre-route handle there
     // would drop the published owner -- freeing the buffer root->data now names,
     // so the next consumer faults (llama.cpp-kw7x). The publish supersedes it.
-    const auto * dst_root_extra = static_cast<ggml_tensor_extra_gpu *>(ggml_sycl_attention_root(dst)->extra);
+    const auto * dst_root_extra = ensure_root_extra(dst);
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         if (src_ov[i].active && src_ov[i].extra == dst_root_extra) {
             src_ov[i].dismiss();
         }
     }
-    if (route_trace) {
+    if (route_trace && dst_root_extra) {
         fprintf(stderr, "[SYCL-SIMPLE-ROUTE-PUBLISH] op=%s dst=%s target=%d base=%p bytes=%zu owning=%d\n",
                 ggml_op_name(dst->op), dst->name ? dst->name : "", plan.execution_device, produced_base,
                 dst_span + dst_view_offs, dst_root_extra->data_handle[plan.execution_device].owns_allocation() ? 1 : 0);
@@ -52396,11 +52396,6 @@ static bool ggml_sycl_try_route_flash_attn_ext(ggml_backend_sycl_context & ctx, 
     const bool stage_k    = !ggml_sycl_resolved_ptr_gpu_accessible(k_target, target);
     const bool stage_v    = !ggml_sycl_resolved_ptr_gpu_accessible(v_target, target);
     const bool stage_dst  = !ggml_sycl_resolved_ptr_gpu_accessible(dst_target, target);
-    if (const char * route_trace_env = std::getenv("GGML_SYCL_ROUTE_TRACE");
-        route_trace_env && std::atoi(route_trace_env) != 0) {
-        fprintf(stderr, "[SYCL-FA-ROUTE-SRC] dst=%s target=%d q=%s q_ptr=%p stage_q=%d\n", dst->name ? dst->name : "",
-                target, q->name ? q->name : "", q_target.ptr, stage_q ? 1 : 0);
-    }
 
     const bool has_remote_owner = (route.src0_owner >= 0 && route.src0_owner != ctx.device) ||
                                   (route.src1_owner >= 0 && route.src1_owner != ctx.device) ||
@@ -52412,6 +52407,14 @@ static bool ggml_sycl_try_route_flash_attn_ext(ggml_backend_sycl_context & ctx, 
 
     if (target == ctx.device && !stage_q && !stage_k && !stage_v && !stage_dst) {
         return false;
+    }
+    if (const char * route_trace_env = std::getenv("GGML_SYCL_ROUTE_TRACE");
+        route_trace_env && std::atoi(route_trace_env) != 0) {
+        fprintf(stderr,
+                "[SYCL-FA-ROUTE-SRC] dst=%s target=%d q=%s q_ptr=%p stage_q=%d k_ptr=%p stage_k=%d v_ptr=%p "
+                "stage_v=%d dst_ptr=%p stage_dst=%d\n",
+                dst->name ? dst->name : "", target, q->name ? q->name : "", q_target.ptr, stage_q ? 1 : 0, k_target.ptr,
+                stage_k ? 1 : 0, v_target.ptr, stage_v ? 1 : 0, dst_target.ptr, stage_dst ? 1 : 0);
     }
 
     if (handled) {
