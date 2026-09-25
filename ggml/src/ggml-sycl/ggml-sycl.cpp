@@ -422,7 +422,9 @@ using ggml_sycl_graph_recorder =
 // recording starts at the top of graph_compute, and the dense executor refuses
 // to run while a graph records. The recorder puts back what it found, so this
 // check is what makes that the idle state. Only state leaked by an earlier
-// recording that skipped its own cleanup can fail it.
+// recording that skipped its own cleanup can fail it. The MoE segment and block
+// recorders set the flag and graph/queue pointers by hand and put them back only
+// on std exceptions; after any other, graph_compute's catch (...) resets them.
 static ggml_sycl_graph_recorder::slots ggml_sycl_graph_recorder_slots(ggml_backend_sycl_context & ctx) {
     GGML_ASSERT(!g_ggml_sycl_graph_recording && g_recording_graph_ptr == nullptr && g_recording_queue_ptr == nullptr &&
                 !ctx.graph_recording_dispatch && !ctx.fa_graph_ptrs_recording &&
@@ -93342,9 +93344,12 @@ gpu_dispatch:
             // which is incompatible with graph recording.  Pause recording, dispatch
             // the MoE op normally, then resume.  Non-MoE ops stay in the graph.
             // The recorder scope owns the pause, so an exception from the MoE
-            // dispatch cannot take the recording's depth twice.
+            // dispatch cannot take the recording's depth twice. A scope that
+            // has already left stays active() until it is destroyed, so it must
+            // also be open.
             if (g_ggml_sycl_graph_recording && node->op == GGML_OP_MUL_MAT_ID && ggml_sycl_graph_recorder::active() &&
-                g_recording_graph_ptr && g_recording_queue_ptr && !g_moe_descriptor_dispatch_graph_recording_active) {
+                ggml_sycl_graph_recorder::active()->open() && g_recording_graph_ptr && g_recording_queue_ptr &&
+                !g_moe_descriptor_dispatch_graph_recording_active) {
                 ggml_sycl_graph_recorder * const recorder = ggml_sycl_graph_recorder::active();
                 g_recording_graph_ptr->end_recording();
                 recorder->pause();
@@ -93369,7 +93374,7 @@ gpu_dispatch:
                 sycl_ctx->moe_graph_rerecord = true;
                 continue;
             } else if (g_ggml_sycl_graph_recording && node->op == GGML_OP_MUL_MAT_ID) {
-                GGML_ASSERT(false && "graph recording active but no recorder scope or recording pointers");
+                GGML_ASSERT(false && "graph recording active but no open recorder scope or recording pointers");
             }
 #endif
             // Fused MoE pair/layer executors may produce later MUL_MAT_ID results while handling the first

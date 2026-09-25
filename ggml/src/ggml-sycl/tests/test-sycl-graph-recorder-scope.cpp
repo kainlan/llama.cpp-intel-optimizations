@@ -370,7 +370,9 @@ void test_exception_after_resume() {
 }
 
 // active() is the innermost scope alive on this thread: set by construction,
-// handed back by destruction, and unchanged by leave().
+// handed back by destruction, and unchanged by leave(). A left scope is still
+// active() but no longer open(), which is why the MUL_MAT_ID pause site checks
+// both before pausing.
 void test_active_scope() {
     fixture f;
     check(scope::active() == nullptr, "no scope is active before one exists");
@@ -382,8 +384,13 @@ void test_active_scope() {
             check(scope::active() == &inner, "the innermost scope is active");
         }
         check(scope::active() == &outer, "destroying the inner scope hands back the outer one");
+        check(scope::active()->open(), "the active scope is open before it leaves");
+        outer.pause();
+        check(scope::active()->open(), "a paused scope is still open");
+        outer.resume();
         outer.leave();
         check(scope::active() == &outer, "leave() does not change the active scope");
+        check(!scope::active()->open(), "a left scope is active but not open");
     }
     check(scope::active() == nullptr, "no scope is active after the last one");
 
