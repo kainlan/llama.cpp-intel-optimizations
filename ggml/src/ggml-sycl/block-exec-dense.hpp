@@ -225,9 +225,10 @@ struct dense_exec_copy {
 };
 
 struct dense_exec_range_io {
-    // Executor ranges only. Slices filled before the range runs: a NODE root
-    // is copied from wherever its producer on the original device wrote it, a
-    // CONTROL root from its host bytes.
+    // Executor ranges only. Slices filled before the range runs, each copied
+    // from the root's storage on the original device: for a NODE root, where
+    // its producer there wrote it; for a CONTROL root, the device copy the
+    // host inputs were uploaded into.
     std::vector<int>             stage_in;
     // Slices published as their root's storage on the range's device while
     // the range runs, and unpublished when it ends.
@@ -495,6 +496,17 @@ inline dense_exec_gate dense_exec_build_plan(const dense_exec_graph & g, dense_e
         if (out.ranges[static_cast<size_t>(cr)].executor || g.nodes[i].is_noop) {
             continue;
         }
+        // Writing such a root in place on the original device would leave
+        // the executor device's slice stale: a later range on that device
+        // re-publishes the slice without re-staging it.
+        if (g.nodes[i].dst_root >= 0) {
+            const dense_exec_root & dst = g.roots[static_cast<size_t>(g.nodes[i].dst_root)];
+            const int               pr  = dst.kind == DENSE_EXEC_ROOT_NODE ? range_of_root(dst) : -1;
+            if (pr >= 0 && out.ranges[static_cast<size_t>(pr)].executor) {
+                out.failing_node = static_cast<int>(i);
+                return DENSE_EXEC_GATE_IN_PLACE;
+            }
+        }
         std::vector<int> touched = g.nodes[i].src_roots;
         if (g.nodes[i].dst_root >= 0) {
             touched.push_back(g.nodes[i].dst_root);
@@ -547,7 +559,9 @@ inline dense_exec_gate dense_exec_build_plan(const dense_exec_graph & g, dense_e
 //     override may not sit on the root of a result the range publishes
 //     (the llama.cpp-kw7x clobber);
 //   - a copy out goes from the producing range's device to the original
-//     device, between two slices of the same root.
+//     device, between two slices of the same root;
+//   - no original-device node writes a root an executor range produced, which
+//     would leave that range device's slice stale for a later range there.
 inline const char * dense_exec_plan_violation(const dense_exec_graph & g, const dense_exec_plan & p) {
     for (size_t a = 0; a < p.slices.size(); ++a) {
         for (size_t b = a + 1; b < p.slices.size(); ++b) {
@@ -598,6 +612,29 @@ inline const char * dense_exec_plan_violation(const dense_exec_graph & g, const 
             if (from.root != to.root || from.device != range.device || to.device != g.original_device) {
                 return "a copy out does not go from the range's device to the original device";
             }
+        }
+    }
+    auto range_of_node = [&](int node) -> const dense_exec_range * {
+        for (const dense_exec_range & range : p.ranges) {
+            if (node >= range.begin && node < range.end) {
+                return &range;
+            }
+        }
+        return nullptr;
+    };
+    for (size_t i = 0; i < g.nodes.size(); ++i) {
+        const dense_exec_node &  node  = g.nodes[i];
+        const dense_exec_range * range = range_of_node(static_cast<int>(i));
+        if (node.is_noop || node.dst_root < 0 || range == nullptr || range->executor) {
+            continue;
+        }
+        const dense_exec_root & dst = g.roots[static_cast<size_t>(node.dst_root)];
+        if (dst.kind != DENSE_EXEC_ROOT_NODE) {
+            continue;
+        }
+        const dense_exec_range * producer = range_of_node(dst.producer);
+        if (producer != nullptr && producer->executor) {
+            return "an original-device node writes an executor range's result";
         }
     }
     return nullptr;

@@ -88808,13 +88808,15 @@ struct ggml_sycl_block_exec_dense_state {
         if (!q && ctx) {
             q = ctx->stream(device, 0);
         }
-        if (q) {
-            try {
-                q->wait_and_throw();
-            } catch (const std::exception & e) {
-                GGML_LOG_WARN("[SYCL-BLOCK-EXEC-DENSE] drain before arena release failed device=%d: %s\n", device,
-                              e.what());
-            }
+        // Releasing memory a queue may still use is what the ownership rules
+        // forbid: if the drain cannot be proven, stop instead.
+        if (!q) {
+            GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] no queue to drain before releasing the arena on device %d", device);
+        }
+        try {
+            q->wait_and_throw();
+        } catch (const std::exception & e) {
+            GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] drain before arena release failed on device %d: %s", device, e.what());
         }
         arena[device]       = ggml_sycl::mem_handle{};
         arena_bytes[device] = 0;
@@ -91381,6 +91383,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     ggml_sycl_block_exec_dense_run dense_run(
         *sycl_ctx, block_exec_graph_executed ? nullptr : cgraph,
         cpu_offload_active || (g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1));
+    // The whole graph's last node slot, for per-graph (not per-range) bookkeeping.
+    ggml_tensor * const * const graph_last_node = cgraph->n_nodes > 0 ? &cgraph->nodes[cgraph->n_nodes - 1] : nullptr;
     for (int range_idx = 0; dense_run.enter_range(range_idx); ++range_idx) {
         // Shadows the whole graph: inside the node loop `cgraph` is this
         // range's nodes, so no fusion looks ahead past the range's end.
@@ -92556,8 +92560,9 @@ gpu_dispatch:
                             src1_dbg ? (long long) src1_dbg->ne[2] : 0, src1_dbg ? (long long) src1_dbg->ne[3] : 0);
                 }
 
-                // Dump summary at end of graph (last node)
-                if (i == cgraph->n_nodes - 1) {
+                // Dump summary at end of graph (last node of the whole graph,
+                // not of the range: a range view shares the graph's node array)
+                if (&cgraph->nodes[i] == graph_last_node) {
                     op_graph_count++;
                     graphs_in_window++;
                     // Nothing is skipped -- op_stats accumulates from graph 1
