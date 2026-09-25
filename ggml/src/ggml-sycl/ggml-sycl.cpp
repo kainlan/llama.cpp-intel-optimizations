@@ -88841,10 +88841,7 @@ static bool ggml_sycl_try_execute_candidate_layer_blocks(ggml_backend_sycl_conte
 // ---------------------------------------------------------------------------
 
 static bool ggml_sycl_block_exec_dense_enabled() {
-    static const bool enabled = [] {
-        const char * env = std::getenv("GGML_SYCL_BLOCK_EXEC_DENSE");
-        return env != nullptr && std::atoi(env) != 0;
-    }();
+    static const bool enabled = ggml_sycl::dense_exec_env_enabled(std::getenv("GGML_SYCL_BLOCK_EXEC_DENSE"));
     return enabled;
 }
 

@@ -169,6 +169,14 @@ static int slice_for(const dense_exec_plan & p, int root, int device) {
 
 }  // namespace
 
+// The executor is on unless GGML_SYCL_BLOCK_EXEC_DENSE is 0; the per-graph
+// gates, not the variable, keep it off single-card and MoE graphs.
+static void test_env_default() {
+    check(dense_exec_env_enabled(nullptr), "unset enables the executor");
+    check(dense_exec_env_enabled("1"), "1 enables the executor");
+    check(!dense_exec_env_enabled("0"), "0 disables the executor");
+}
+
 static void test_precheck_gates() {
     dense_exec_precheck_inputs in{};
     check(dense_exec_first_failing_precheck(in) == DENSE_EXEC_GATE_DISABLED, "disabled is the first gate");
@@ -715,6 +723,7 @@ int main() {
     };
 
     const test_case cases[] = {
+        { "env-default",                                test_env_default                                     },
         { "precheck-gates",                             test_precheck_gates                                  },
         { "split-decode-ranges",                        test_split_decode_ranges                             },
         { "tail-follows-weight-placement",              test_tail_follows_weight_placement                   },

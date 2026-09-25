@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <utility>
 #include <vector>
@@ -37,7 +38,7 @@ namespace ggml_sycl {
 // Listed in evaluation order. NONE means the executor ran the graph.
 enum dense_exec_gate {
     DENSE_EXEC_GATE_NONE = 0,
-    DENSE_EXEC_GATE_DISABLED,          // GGML_SYCL_BLOCK_EXEC_DENSE unset or 0
+    DENSE_EXEC_GATE_DISABLED,          // GGML_SYCL_BLOCK_EXEC_DENSE=0
     DENSE_EXEC_GATE_NO_GRAPH,          // no cgraph to execute
     DENSE_EXEC_GATE_GRAPH_RECORDING,   // a SYCL command graph is being recorded
     DENSE_EXEC_GATE_UNSUPPORTED_MODE,  // CPU offload or tensor parallelism is active
@@ -95,6 +96,13 @@ inline const char * dense_exec_gate_name(dense_exec_gate gate) {
             return "stage-failed";
     }
     return "unknown";
+}
+
+// Parses GGML_SYCL_BLOCK_EXEC_DENSE, given its value or nullptr when unset.
+// On by default; 0 is the opt-out. The per-graph gates below, not this
+// variable, keep the executor off graphs it does not handle.
+inline bool dense_exec_env_enabled(const char * env) {
+    return env == nullptr || std::atoi(env) != 0;
 }
 
 // One active layer block of the placement plan.
