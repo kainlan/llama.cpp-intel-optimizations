@@ -230,6 +230,112 @@ void test_consecutive_scopes() {
     check(f.state.sink_calls.size() == 4, "each range attached and detached its sink once");
 }
 
+// The MUL_MAT_ID site pauses a whole-graph recording to dispatch the MoE op
+// directly. An exception from that dispatch must not take the recording's
+// depth twice: once for the pause, once when the scope unwinds.
+void test_exception_in_pause_window() {
+    fixture f;
+    try {
+        scope rec(slots_of(f.state), &f.graph, &f.queue, &f.sink, true);
+        rec.pause();
+        throw std::runtime_error("MoE dispatch failed while paused");
+    } catch (const std::runtime_error &) {
+    }
+    check_idle(f.state, 0, false, "after an exception while paused");
+}
+
+// A pause takes off the recording flag, the sink and the depth, in leave()'s
+// order, and keeps the graph, queue and context flags for the resume.
+void test_pause_resume() {
+    fixture f;
+    scope   rec(slots_of(f.state), &f.graph, &f.queue, &f.sink, true);
+
+    rec.pause();
+    check(rec.paused(), "a paused scope says so");
+    check(!f.state.recording, "paused: the thread does not record");
+    check(f.state.sink == nullptr, "paused: sink detached");
+    check(f.state.depth.load() == 0, "paused: depth does not count the recording");
+    check(f.state.graph == &f.graph && f.state.queue == &f.queue, "paused: graph and queue kept for the resume");
+    check(f.state.dispatch && f.state.fa_recording, "paused: context flags kept");
+    const snapshot & p = f.state.sink_calls.back();
+    check(!p.recording && p.depth == 1, "pause: recording off before the sink detaches, depth after");
+
+    rec.resume();
+    check(!rec.paused(), "a resumed scope is not paused");
+    const snapshot & r = f.state.sink_calls.back();
+    check(r.sink == &f.sink, "resume attaches the scope's own sink");
+    check(r.depth == 1 && !r.recording, "resume: depth before the sink attaches, recording after");
+    check(f.state.recording && f.state.depth.load() == 1, "resumed: recording again");
+
+    rec.leave();
+    check_idle(f.state, 0, false, "after pause, resume and leave");
+}
+
+// Pausing twice or resuming an unpaused scope cannot move the depth past what
+// the scope holds; neither can pausing or resuming a left scope.
+void test_pause_resume_idempotent() {
+    fixture f;
+    {
+        scope rec(slots_of(f.state), &f.graph, &f.queue, &f.sink, true);
+        rec.resume();
+        check(f.state.depth.load() == 1, "resume without a pause does nothing");
+        rec.pause();
+        rec.pause();
+        check(f.state.depth.load() == 0, "a second pause does nothing");
+        rec.resume();
+        rec.resume();
+        check(f.state.depth.load() == 1, "a second resume does nothing");
+        rec.leave();
+        rec.pause();
+        rec.resume();
+        check_idle(f.state, 0, false, "pause and resume after leave");
+    }
+    check_idle(f.state, 0, false, "after the scope");
+}
+
+// A resume that is followed by an exception (the graph's begin_recording
+// failing, say): the scope holds its depth again, and unwinding returns it.
+void test_exception_after_resume() {
+    fixture f;
+    try {
+        scope rec(slots_of(f.state), &f.graph, &f.queue, &f.sink, true);
+        rec.pause();
+        rec.resume();
+        throw std::runtime_error("begin_recording failed on resume");
+    } catch (const std::runtime_error &) {
+    }
+    check_idle(f.state, 0, false, "after an exception after resume");
+}
+
+// active() is the innermost scope alive on this thread: set by construction,
+// handed back by destruction, and unchanged by leave().
+void test_active_scope() {
+    fixture f;
+    check(scope::active() == nullptr, "no scope is active before one exists");
+    {
+        scope outer(slots_of(f.state), &f.graph, &f.queue, &f.sink, true);
+        check(scope::active() == &outer, "a new scope is active");
+        {
+            scope inner(slots_of(f.state), &f.graph, &f.queue, &f.sink, false);
+            check(scope::active() == &inner, "the innermost scope is active");
+        }
+        check(scope::active() == &outer, "destroying the inner scope hands back the outer one");
+        outer.leave();
+        check(scope::active() == &outer, "leave() does not change the active scope");
+    }
+    check(scope::active() == nullptr, "no scope is active after the last one");
+
+    std::optional<scope> rec;
+    rec.emplace(slots_of(f.state), &f.graph, &f.queue, &f.sink, true);
+    check(scope::active() == &*rec, "an emplaced member scope is active");
+    rec.reset();
+    check(scope::active() == nullptr, "resetting it clears the active scope");
+    rec.emplace(slots_of(f.state), &f.graph, &f.queue, &f.sink, true);
+    check(scope::active() == &*rec, "the next range's scope is active");
+    rec.reset();
+    check(scope::active() == nullptr, "and cleared again");
+}
+
 }  // namespace
 
 int main() {
@@ -248,6 +354,11 @@ int main() {
         { "exception-leaves",             test_exception_leaves             },
         { "without-fa-capture",           test_without_fa_capture           },
         { "consecutive-scopes",           test_consecutive_scopes           },
+        { "exception-in-pause-window",    test_exception_in_pause_window    },
+        { "pause-resume",                 test_pause_resume                 },
+        { "pause-resume-idempotent",      test_pause_resume_idempotent      },
+        { "exception-after-resume",       test_exception_after_resume       },
+        { "active-scope",                 test_active_scope                 },
     };
 
     int failed = 0;

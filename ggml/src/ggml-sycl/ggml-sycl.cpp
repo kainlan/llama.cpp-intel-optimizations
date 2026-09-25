@@ -93332,12 +93332,13 @@ gpu_dispatch:
             // Selective graph recording: MoE ops (MUL_MAT_ID) require host sync
             // which is incompatible with graph recording.  Pause recording, dispatch
             // the MoE op normally, then resume.  Non-MoE ops stay in the graph.
-            if (g_ggml_sycl_graph_recording && node->op == GGML_OP_MUL_MAT_ID && g_recording_graph_ptr &&
-                g_recording_queue_ptr && !g_moe_descriptor_dispatch_graph_recording_active) {
+            // The recorder scope owns the pause, so an exception from the MoE
+            // dispatch cannot take the recording's depth twice.
+            if (g_ggml_sycl_graph_recording && node->op == GGML_OP_MUL_MAT_ID && ggml_sycl_graph_recorder::active() &&
+                g_recording_graph_ptr && g_recording_queue_ptr && !g_moe_descriptor_dispatch_graph_recording_active) {
+                ggml_sycl_graph_recorder * const recorder = ggml_sycl_graph_recorder::active();
                 g_recording_graph_ptr->end_recording();
-                g_ggml_sycl_graph_recording = false;
-                ggml_sycl::set_graph_retained_handle_sink(nullptr);
-                g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
+                recorder->pause();
 
                 std::string                                   node_timeline_metadata;
                 std::optional<ggml_sycl::sycl_timeline_scope> node_timeline_scope;
@@ -93354,14 +93355,12 @@ gpu_dispatch:
                 }
                 GGML_ASSERT(ok);
 
-                g_ggml_sycl_graph_recording_depth.fetch_add(1, std::memory_order_acq_rel);
-                ggml_sycl::set_graph_retained_handle_sink(&sycl_ctx->graph_retained_handles);
-                g_ggml_sycl_graph_recording = true;
+                recorder->resume();
                 g_recording_graph_ptr->begin_recording(*g_recording_queue_ptr);
                 sycl_ctx->moe_graph_rerecord = true;
                 continue;
             } else if (g_ggml_sycl_graph_recording && node->op == GGML_OP_MUL_MAT_ID) {
-                GGML_ASSERT(false && "graph recording active but recording pointers are null");
+                GGML_ASSERT(false && "graph recording active but no recorder scope or recording pointers");
             }
 #endif
             // Fused MoE pair/layer executors may produce later MUL_MAT_ID results while handling the first

@@ -16,6 +16,13 @@
 // and before leave(), because what a failed end_recording calls for differs by
 // caller.
 //
+// pause() and resume() take the recording flag, the sink and the depth off and
+// back on around work that must run outside the graph, keeping the graph,
+// queue and context flags. The scope tracks whether it holds its depth, so an
+// exception inside a pause does not take the depth twice. Code that pauses
+// finds the recording through active(), the innermost open scope on this
+// thread; only the constructor and destructor change it.
+//
 // The slots are references, so this header needs no SYCL and a host test can
 // point it at fakes (tests/test-sycl-graph-recorder-scope.cpp). A thread_local
 // slot binds to the constructing thread's copy, so a scope is entered and left
@@ -55,7 +62,9 @@ template <typename Graph, typename Queue, typename Sink> class graph_recorder_sc
         saved_graph_(s.graph),
         saved_queue_(s.queue),
         saved_dispatch_(s.dispatch),
-        saved_fa_recording_(s.fa_recording) {
+        saved_fa_recording_(s.fa_recording),
+        sink_(sink),
+        prev_active_(active_) {
         if (capture_fa_) {
             s_.fa_recording = true;
         }
@@ -65,9 +74,20 @@ template <typename Graph, typename Queue, typename Sink> class graph_recorder_sc
         s_.graph     = graph;
         s_.queue     = queue;
         s_.dispatch  = true;
+        active_      = this;
     }
 
-    ~graph_recorder_scope() { leave(); }
+    // Scopes on a thread end in reverse order of construction, so this hands
+    // active() back to the enclosing scope, or to none.
+    ~graph_recorder_scope() {
+        leave();
+        if (active_ == this) {
+            active_ = prev_active_;
+        }
+    }
+
+    // The innermost scope constructed on this thread and not yet destroyed.
+    static graph_recorder_scope * active() { return active_; }
 
     graph_recorder_scope(const graph_recorder_scope &)             = delete;
     graph_recorder_scope & operator=(const graph_recorder_scope &) = delete;
@@ -86,13 +106,42 @@ template <typename Graph, typename Queue, typename Sink> class graph_recorder_sc
         s_.graph     = saved_graph_;
         s_.recording = saved_recording_;
         s_.set_sink(nullptr);
-        s_.depth.fetch_sub(1, std::memory_order_acq_rel);
+        if (holds_depth_) {
+            holds_depth_ = false;
+            s_.depth.fetch_sub(1, std::memory_order_acq_rel);
+        }
         if (capture_fa_) {
             s_.fa_recording = saved_fa_recording_;
         }
     }
 
+    // Stops recording on this thread until resume(). Does nothing on a scope
+    // that is left or already paused.
+    void pause() noexcept {
+        if (!open_ || !holds_depth_) {
+            return;
+        }
+        s_.recording = false;
+        s_.set_sink(nullptr);
+        holds_depth_ = false;
+        s_.depth.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    // Undoes pause(), with the scope's own sink. Does nothing on a scope that
+    // is left or not paused.
+    void resume() noexcept {
+        if (!open_ || holds_depth_) {
+            return;
+        }
+        s_.depth.fetch_add(1, std::memory_order_acq_rel);
+        holds_depth_ = true;
+        s_.set_sink(sink_);
+        s_.recording = true;
+    }
+
     bool open() const { return open_; }
+
+    bool paused() const { return open_ && !holds_depth_; }
 
   private:
     slots         s_;
@@ -103,6 +152,11 @@ template <typename Graph, typename Queue, typename Sink> class graph_recorder_sc
     Queue * const saved_queue_;
     const bool    saved_dispatch_;
     const bool    saved_fa_recording_;
+    Sink * const  sink_;
+    bool          holds_depth_ = true;
+
+    graph_recorder_scope * const                      prev_active_;
+    static inline thread_local graph_recorder_scope * active_ = nullptr;
 };
 
 }  // namespace ggml_sycl
