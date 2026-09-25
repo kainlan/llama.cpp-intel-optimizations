@@ -33,7 +33,6 @@ using ggml_sycl::kv_alloc_slack_per_layer;
 using ggml_sycl::kv_buffer_layer_owner;
 using ggml_sycl::kv_demotion_input;
 using ggml_sycl::kv_demotion_result;
-using ggml_sycl::kv_device_demand;
 using ggml_sycl::kv_device_fit_input;
 using ggml_sycl::kv_residency_input;
 using ggml_sycl::kv_residency_needs_refit;
@@ -315,9 +314,9 @@ int main() {
         }
     }
     // 18. Two same-shape contexts against one device. The first is admitted
-    // and allocates its KV; the second, not yet admitted, no longer fits the
-    // published residency, so it re-fits and places its overflow on the host
-    // tier through the plan -- and the allocator's backstop never fires.
+    // and allocates its KV; the second, not yet admitted, re-fits against the
+    // headroom A left and places its overflow on the host tier through the
+    // plan -- and the allocator's backstop never fires.
     {
         const size_t       mb = 1024 * 1024;
         kv_residency_input in;
@@ -332,9 +331,17 @@ int main() {
         shape.n_ctx     = 2048;
         shape.n_seq_max = 1;
 
+        // Admission's demand on device 0: every resident layer plus its slack.
+        auto demand = [&](const std::vector<int> & kv_device) {
+            size_t bytes = 0;
+            for (size_t l = 0; l < kv_device.size(); ++l) {
+                bytes += kv_device[l] == 0 ? in.layer_kv_bytes[l] + kv_alloc_slack_per_layer : 0;
+            }
+            return bytes;
+        };
+
         // Context A: the load-time plan is re-decided and all 32 layers fit.
-        std::vector<size_t> demand_a = { kv_device_demand(in.load_kv_device, in.layer_kv_bytes, 0) };
-        CHECK(kv_residency_needs_refit(load, shape, false, demand_a, in.available), "case 18: A is decided");
+        CHECK(kv_residency_needs_refit(load, shape, false), "case 18: A is decided");
         auto a = plan_runtime_kv_residency(in);
         CHECK(a.fits && a.per_device[0].demoted_layers.empty(), "case 18: A keeps every layer on the device");
         size_t a_bytes = 0;
@@ -344,12 +351,10 @@ int main() {
         const size_t shared_available = in.available[0] - a_bytes;  // A's KV is allocated
 
         // Context B: same shape, published residency is A's.
-        std::vector<size_t> demand_b = { kv_device_demand(a.kv_device, in.layer_kv_bytes, 0) };
-        std::vector<size_t> avail_b  = { shared_available };
-        const bool          refit    = kv_residency_needs_refit(shape, shape, false, demand_b, avail_b);
-        std::vector<int>    b_kv     = a.kv_device;
+        const bool       refit = kv_residency_needs_refit(shape, shape, false);
+        std::vector<int> b_kv  = a.kv_device;
         if (refit) {
-            in.available = avail_b;
+            in.available = { shared_available };
             auto b       = plan_runtime_kv_residency(in);
             CHECK(b.fits, "case 18: B fits after demotion");
             b_kv = b.kv_device;
@@ -360,27 +365,35 @@ int main() {
         }
         CHECK(!kv_admission_mismatch(b_bytes, shared_available), "case 18: the allocator backstop never fires");
         CHECK(refit, "case 18: the second same-shape context re-fits");
-        CHECK(kv_device_demand(b_kv, in.layer_kv_bytes, 0) <= shared_available, "case 18: B's admitted demand fits");
+        CHECK(demand(b_kv) <= shared_available, "case 18: B's admitted demand fits");
         CHECK(b_bytes < a_bytes, "case 18: B's overflow is on the host tier");
     }
-    // 19. No re-fit on a same-shape republish that keeps the residency: the
-    // admitted context's own micro-batch trial (its KV is allocated, so the
-    // live headroom no longer covers it), and a new context that still fits.
+    // 19. An admitted context's same-shape republish (its micro-batch trial;
+    // its KV is allocated, so the live headroom no longer covers it) keeps its
+    // residency. A new context always re-fits, from the load-time residency,
+    // so it gets full device residency when that fits even if the published
+    // residency is more demoted.
     {
         kv_shape shape;
         shape.runtime   = true;
         shape.n_ctx     = 2048;
         shape.n_seq_max = 1;
-
-        const std::vector<size_t> demand = { 258 };
-        const std::vector<size_t> tight  = { 44 };
-        const std::vector<size_t> roomy  = { 300 };
-        CHECK(!kv_residency_needs_refit(shape, shape, true, demand, tight),
+        CHECK(!kv_residency_needs_refit(shape, shape, true),
               "case 19: an admitted context's republish keeps its residency");
-        CHECK(!kv_residency_needs_refit(shape, shape, false, demand, roomy),
-              "case 19: a new context that still fits keeps the residency");
-        CHECK(kv_residency_needs_refit(shape, shape, false, demand, tight),
-              "case 19: a new context that does not fit re-fits");
+        CHECK(kv_residency_needs_refit(shape, shape, false), "case 19: a new context re-fits");
+
+        kv_residency_input in;
+        in.load_kv_device = { 0, 0, 0, 0 };
+        in.layer_kv_bytes = { 64, 64, 64, 64 };
+        in.swa_layer_mask = { 0, 0, 0, 0 };
+        in.devices        = { 0 };
+        in.available      = { 256 + 4 * kv_alloc_slack_per_layer };
+
+        const std::vector<int> published = { 0, 0, -1, -1 };  // an earlier, larger context's residency
+        auto                   r         = plan_runtime_kv_residency(in);
+        CHECK(r.fits && r.kv_device == in.load_kv_device,
+              "case 19: a new context that fits gets full device residency");
+        CHECK(r.kv_device != published, "case 19: it does not inherit the published residency");
     }
     // 20. A layer of device 0's KV buffer that the plan gives to device 1 is in
     // device 1's VRAM, although device 0's tier layout marks it off-device.

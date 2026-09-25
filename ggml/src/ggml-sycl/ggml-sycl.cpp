@@ -17654,12 +17654,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     size_t kv_demoted_host_bytes = 0;
 
     // KV residency is re-decided (kv_residency_needs_refit) when the KV shape
-    // changes (n_ctx, n_seq_max, kv_unified, swa_full), or when a context not
-    // yet admitted -- e.g. a second context of the same shape, while the
-    // first one's KV is allocated -- no longer fits the published residency
-    // in the live headroom. A same-shape republish by an admitted context (the
-    // auto micro-batch ladder, which runs after its KV buffers exist) keeps
-    // the published residency, because the zone's live free space no longer
+    // changes (n_ctx, n_seq_max, kv_unified, swa_full) and for every context
+    // not yet admitted -- e.g. a second context of the same shape, while the
+    // first one's KV is allocated -- so no context inherits another's
+    // residency. A same-shape republish by an admitted context (the auto
+    // micro-batch ladder, which runs after its KV buffers exist) keeps the
+    // published residency, because the zone's live free space no longer
     // includes that KV and re-fitting against it would demote KV that is
     // already allocated on the device.
     //
@@ -17694,28 +17694,23 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     const ggml_sycl::kv_shape next_shape{ true, n_ctx, n_seq_max, kv_unified, swa_full };
     const size_t              n_kv_layers = next_plan.kv_layer_count();
     ggml_sycl::kv_residency_input in;
-    std::vector<int>              published_kv_device(n_kv_layers);
     in.load_kv_device.resize(n_kv_layers);
     in.layer_kv_bytes.resize(n_kv_layers);
     in.swa_layer_mask.assign(next_plan.swa_layer_mask.begin(), next_plan.swa_layer_mask.end());
     for (size_t l = 0; l < n_kv_layers; ++l) {
-        const auto load_it     = next_plan.load_kv_device.find((int) l);
-        published_kv_device[l] = next_plan.get_kv_device((int) l);
-        in.load_kv_device[l]   = load_it == next_plan.load_kv_device.end() ? -1 : load_it->second;
-        in.layer_kv_bytes[l]   = next_plan.kv_size_for_layer(static_cast<uint32_t>(l));  // at the next shape
+        const auto load_it   = next_plan.load_kv_device.find((int) l);
+        in.load_kv_device[l] = load_it == next_plan.load_kv_device.end() ? -1 : load_it->second;
+        in.layer_kv_bytes[l] = next_plan.kv_size_for_layer(static_cast<uint32_t>(l));  // at the next shape
     }
     if (next_plan.multi_device) {
         in.devices = next_plan.devices;
     } else {
         in.devices = { next_plan.device_id };
     }
-    std::vector<size_t> published_demand;
     for (int device : in.devices) {
         in.available.push_back(ggml_sycl::unified_cache_kv_vram_available(device));
-        published_demand.push_back(ggml_sycl::kv_device_demand(published_kv_device, in.layer_kv_bytes, device));
     }
-    if (ggml_sycl::kv_residency_needs_refit(published_shape, next_shape, ctx->runtime_kv_admitted, published_demand,
-                                            in.available)) {
+    if (ggml_sycl::kv_residency_needs_refit(published_shape, next_shape, ctx->runtime_kv_admitted)) {
         const bool shape_changed = ggml_sycl::kv_shape_changed(published_shape, next_shape);
         if (shape_changed && ctx->runtime_kv_admitted) {
             // Unreachable for a single context (see kv_residency_needs_refit): its
@@ -17733,8 +17728,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             // WARN, not INFO: default verbosity drops INFO in every tool, and
             // this is the only sign that a second context was re-placed.
             GGML_LOG_WARN(
-                "[SYCL-PLAN] %sKV residency re-fit for n_ctx=%u: a new context no longer fits the published "
-                "residency in the live headroom\n",
+                "[SYCL-PLAN] %sKV residency re-fit for n_ctx=%u: a new context is fitted against the live "
+                "headroom\n",
                 probe_mode ? "probe: " : "", n_ctx);
         }
         next_plan.kv_device = next_plan.load_kv_device;

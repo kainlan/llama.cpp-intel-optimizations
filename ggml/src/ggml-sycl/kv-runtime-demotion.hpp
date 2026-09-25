@@ -84,23 +84,16 @@ struct kv_shape {
 // change KV size.
 bool kv_shape_changed(const kv_shape & published, const kv_shape & next);
 
-// Bytes runtime KV admission reserves on `device` for a residency: the KV of
-// every layer resident there plus per_layer_slack for each.
-size_t kv_device_demand(const std::vector<int> &    kv_device,
-                        const std::vector<size_t> & layer_kv_bytes,
-                        int                         device,
-                        size_t                      per_layer_slack = kv_alloc_slack_per_layer);
-
-// True when a runtime-context update must decide KV residency again:
-//  - the KV shape changed, or
-//  - a context not yet admitted (a new context, e.g. a second one of the same
-//    shape while the first one's KV is allocated) no longer fits the published
-//    residency: demand[i] (kv_device_demand() of it) exceeds the live headroom
-//    available[i] on some device.
+// True when a runtime-context update must decide KV residency again: the KV
+// shape changed, or the context is not admitted yet. Every new context is
+// fitted from the load-time residency against the live headroom, so none
+// inherits an earlier context's residency, which may be more demoted than it
+// needs.
+//
 // An admitted context never re-fits on a same-shape republish (the auto
 // micro-batch trial): live available already excludes this context's own
-// allocated KV, so comparing its demand against it would demote KV that is
-// already resident and contradict its own buffer.
+// allocated KV, so fitting against it would demote KV that is already resident
+// and contradict its own buffer.
 //
 // An admitted context whose shape changes would re-fit with its old KV still
 // counted as used. llama_context fixes n_ctx, n_seq_max, kv_unified and
@@ -109,11 +102,7 @@ size_t kv_device_demand(const std::vector<int> &    kv_device,
 // transaction WARNs if it ever happens. Constructing two contexts on one device
 // with interleaved publishes can reach it: that is same-device concurrent
 // contexts, which are unsupported (canonical memory contract §5).
-bool kv_residency_needs_refit(const kv_shape &            published,
-                              const kv_shape &            next,
-                              bool                        context_admitted,
-                              const std::vector<size_t> & demand,
-                              const std::vector<size_t> & available);
+bool kv_residency_needs_refit(const kv_shape & published, const kv_shape & next, bool context_admitted);
 
 // The tiered KV allocator's backstop: device-planned KV for one buffer larger
 // than the headroom it sees means admission and allocation disagreed. It

@@ -83,39 +83,8 @@ bool kv_shape_changed(const kv_shape & published, const kv_shape & next) {
            published.kv_unified != next.kv_unified || published.swa_full != next.swa_full;
 }
 
-size_t kv_device_demand(const std::vector<int> &    kv_device,
-                        const std::vector<size_t> & layer_kv_bytes,
-                        int                         device,
-                        size_t                      per_layer_slack) {
-    size_t demand = 0;
-    for (size_t l = 0; l < kv_device.size() && l < layer_kv_bytes.size(); ++l) {
-        if (kv_device[l] != device || layer_kv_bytes[l] == 0) {
-            continue;
-        }
-        const size_t layer =
-            layer_kv_bytes[l] > SIZE_MAX - per_layer_slack ? SIZE_MAX : layer_kv_bytes[l] + per_layer_slack;
-        demand = demand > SIZE_MAX - layer ? SIZE_MAX : demand + layer;
-    }
-    return demand;
-}
-
-bool kv_residency_needs_refit(const kv_shape &            published,
-                              const kv_shape &            next,
-                              bool                        context_admitted,
-                              const std::vector<size_t> & demand,
-                              const std::vector<size_t> & available) {
-    if (kv_shape_changed(published, next)) {
-        return true;
-    }
-    if (context_admitted) {
-        return false;
-    }
-    for (size_t i = 0; i < demand.size(); ++i) {
-        if (demand[i] > (i < available.size() ? available[i] : 0)) {
-            return true;
-        }
-    }
-    return false;
+bool kv_residency_needs_refit(const kv_shape & published, const kv_shape & next, bool context_admitted) {
+    return kv_shape_changed(published, next) || !context_admitted;
 }
 
 kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in) {
