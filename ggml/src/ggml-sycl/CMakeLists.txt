@@ -5327,6 +5327,24 @@ set_tests_properties(sycl-split-exec-policy PROPERTIES
     TIMEOUT 30
 )
 
+# Dense-split layer-block executor planning (llama.cpp-tf8m): node devices,
+# ranges, boundary copies and arena layout. The header is dependency-free, so
+# this target takes no -fsycl and links nothing.
+add_executable(test-sycl-dense-block-exec
+    tests/test-sycl-dense-block-exec.cpp
+)
+target_include_directories(test-sycl-dense-block-exec PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-sycl-dense-block-exec PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-dense-block-exec COMMAND test-sycl-dense-block-exec)
+set_tests_properties(sycl-dense-block-exec PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never touches a device.
+    LABELS "sycl;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
 # test-sycl-pp-moe-scratch-lifecycle was DELETED by llama.cpp-u2mz. It was
 # described as "the only executable proof of the claim/release protocol", but it
 # included ZERO project headers and its target had one source plus

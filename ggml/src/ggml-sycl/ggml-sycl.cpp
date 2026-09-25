@@ -86,6 +86,7 @@
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/alloc-registry.hpp"
 #include "ggml-sycl/backend.hpp"
+#include "ggml-sycl/block-exec-dense.hpp"
 #include "ggml-sycl/block-exec-gate.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/convert.hpp"
@@ -82135,6 +82136,17 @@ static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, 
     return ggml_sycl_dispatch_host_flash_attn_sync(ctx, dst);
 }
 
+// True while the dense layer-block executor runs a node range on that range's
+// own device (llama.cpp-tf8m). Every operand of such a range was placed on, or
+// copied to, that device before the range started, so the per-op routes in
+// ggml_sycl_compute_forward_impl -- which exist to move one op's operands to
+// another device and then drain its queue -- have nothing to do there.
+static thread_local bool g_ggml_sycl_block_exec_dense_active = false;
+
+bool ggml_sycl_block_exec_dense_active() {
+    return g_ggml_sycl_block_exec_dense_active;
+}
+
 static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
     if (!g_sycl_loaded) {
         fprintf(stderr, "[SYCL] compute_forward false: backend not loaded op=%s dst=%s ctx=%d\n",
@@ -82376,9 +82388,10 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
     if (dt.enabled) {
         dt.resolve_us = dt.elapsed_us();
     }
+    const bool per_op_routes = !g_ggml_sycl_block_exec_dense_active;
     {
         bool simple_consumer_handled = false;
-        if (ggml_sycl_try_route_simple_consumer(ctx, dst, &simple_consumer_handled)) {
+        if (per_op_routes && ggml_sycl_try_route_simple_consumer(ctx, dst, &simple_consumer_handled)) {
             e2e_record_early_handled_route();
             return true;
         }
@@ -82393,7 +82406,7 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
     }
     {
         bool flash_attn_handled = false;
-        if (ggml_sycl_try_route_flash_attn_ext(ctx, dst, &flash_attn_handled)) {
+        if (per_op_routes && ggml_sycl_try_route_flash_attn_ext(ctx, dst, &flash_attn_handled)) {
             e2e_record_early_handled_route();
             return true;
         }
@@ -82408,7 +82421,7 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
     }
     {
         bool mul_mat_weight_handled = false;
-        if (ggml_sycl_try_route_mul_mat_weight_owner(ctx, dst, &mul_mat_weight_handled)) {
+        if (per_op_routes && ggml_sycl_try_route_mul_mat_weight_owner(ctx, dst, &mul_mat_weight_handled)) {
             e2e_record_early_handled_route();
             return true;
         }
@@ -82423,7 +82436,7 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
     }
     {
         bool mul_mat_activation_handled = false;
-        if (ggml_sycl_try_route_mul_mat_activation(ctx, dst, &mul_mat_activation_handled)) {
+        if (per_op_routes && ggml_sycl_try_route_mul_mat_activation(ctx, dst, &mul_mat_activation_handled)) {
             e2e_record_early_handled_route();
             return true;
         }
@@ -88735,6 +88748,28 @@ static bool ggml_sycl_try_execute_candidate_layer_blocks(ggml_backend_sycl_conte
     return true;
 }
 
+// Drives the node loop of ggml_backend_sycl_graph_compute_impl over contiguous
+// node ranges. With no range plan there is one range, the whole graph, and the
+// loop runs exactly as it always has.
+class ggml_sycl_block_exec_dense_run {
+  public:
+    explicit ggml_sycl_block_exec_dense_run(ggml_cgraph * cgraph) : cgraph_(cgraph) {}
+
+    // False once `idx` is past the last range.
+    bool enter_range(int idx) { return cgraph_ != nullptr && idx == 0; }
+
+    // The graph the node loop iterates for range `idx`.
+    ggml_cgraph * range_graph(int idx) {
+        (void) idx;
+        return cgraph_;
+    }
+
+    void leave_range(int idx) { (void) idx; }
+
+  private:
+    ggml_cgraph * cgraph_ = nullptr;
+};
+
 static block_exec_graph_plan_stats ggml_sycl_classify_block_exec_graph_for_blocks(
     ggml_backend_sycl_context &                                 ctx,
     const ggml_cgraph *                                         cgraph,
@@ -90763,7 +90798,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 ggml_sycl::block_exec_gate_name(block_exec_gate));
         fflush(stderr);
     }
-    if (!block_exec_graph_executed) {
+    ggml_sycl_block_exec_dense_run dense_run(block_exec_graph_executed ? nullptr : cgraph);
+    for (int range_idx = 0; dense_run.enter_range(range_idx); ++range_idx) {
+        // Shadows the whole graph: inside the node loop `cgraph` is this
+        // range's nodes, so no fusion looks ahead past the range's end.
+        ggml_cgraph * cgraph = dense_run.range_graph(range_idx);
         for (int i = 0; i < cgraph->n_nodes; i++) {
             GGML_SYCL_DEBUG("[DEBUG-IMPL] Node %d/%d: ", i, cgraph->n_nodes);
             g_preclassified_node_idx = i;
@@ -92531,6 +92570,7 @@ gpu_dispatch:
                 }
             }
         }
+        dense_run.leave_range(range_idx);
     }
 
     impl_phase_log("node_loop");

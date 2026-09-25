@@ -1,0 +1,539 @@
+//
+// Dense-split layer-block executor: which device runs each node, and what
+// must cross between devices (llama.cpp-tf8m, design S4a).
+//
+// A dense model split over two cards (Mistral 7B: B70 layers 0-29, B50 layers
+// 30-31) used to run every op of the second card through a per-op route: stage
+// the operands, run, drain the target queue, publish. The executor instead cuts
+// the graph into contiguous node ranges, one per device, and runs each range
+// through the ordinary node loop on its own device. Only the tensors that cross
+// a range edge are copied, once per graph.
+//
+// This header holds the decisions, as pure functions of facts the backend
+// gathers, so they are testable on a host with no GPU
+// (tests/test-sycl-dense-block-exec.cpp):
+//   - dense_exec_first_failing_precheck: may the executor run this graph?
+//   - dense_exec_build_plan: node devices, ranges, per-range copies and the
+//     layout of the persistent per-device arena.
+//
+// MIT license
+// Copyright (C) 2024-2026 Intel Corporation
+// SPDX-License-Identifier: MIT
+//
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+// True while the dense executor runs a node range on that range's own device.
+// Defined in ggml-sycl.cpp.
+bool ggml_sycl_block_exec_dense_active();
+
+namespace ggml_sycl {
+
+// Listed in evaluation order. NONE means the executor ran the graph.
+enum dense_exec_gate {
+    DENSE_EXEC_GATE_NONE = 0,
+    DENSE_EXEC_GATE_DISABLED,          // GGML_SYCL_BLOCK_EXEC_DENSE unset or 0
+    DENSE_EXEC_GATE_NO_GRAPH,          // no cgraph to execute
+    DENSE_EXEC_GATE_GRAPH_RECORDING,   // a SYCL command graph is being recorded
+    DENSE_EXEC_GATE_UNSUPPORTED_MODE,  // CPU offload or tensor parallelism is active
+    DENSE_EXEC_GATE_NO_PLAN,           // no placement plan visible to the device
+    DENSE_EXEC_GATE_FEW_BLOCKS,        // fewer than 2 active layer blocks
+    DENSE_EXEC_GATE_NOT_DENSE,         // a block carries MoE expert weights
+    DENSE_EXEC_GATE_KV_DEVICE,         // a block's KV cache is not on its execution device
+    DENSE_EXEC_GATE_SINGLE_DEVICE,     // every node of this graph runs on the backend's own device
+    DENSE_EXEC_GATE_TOO_MANY_RANGES,   // the device assignment interleaves more than the plan allows
+    DENSE_EXEC_GATE_OPERAND,           // a node reads an operand its device cannot reach
+    DENSE_EXEC_GATE_IN_PLACE,          // a node writes into storage produced outside its range
+    DENSE_EXEC_GATE_OUTPUT,            // a tensor produced on another device is a graph output
+    DENSE_EXEC_GATE_ARENA_TOO_LARGE,   // a device arena exceeds GGML_SYCL_BLOCK_EXEC_DENSE_MAX_ARENA_MB
+    DENSE_EXEC_GATE_PREPARE_FAILED,    // arena allocation or slicing failed
+    // Copying the operands into a range failed before that range ran any
+    // node. The rest of the graph ran on the per-op path instead.
+    DENSE_EXEC_GATE_STAGE_FAILED,
+};
+
+inline const char * dense_exec_gate_name(dense_exec_gate gate) {
+    switch (gate) {
+        case DENSE_EXEC_GATE_NONE:
+            return "none";
+        case DENSE_EXEC_GATE_DISABLED:
+            return "disabled";
+        case DENSE_EXEC_GATE_NO_GRAPH:
+            return "no-graph";
+        case DENSE_EXEC_GATE_GRAPH_RECORDING:
+            return "graph-recording";
+        case DENSE_EXEC_GATE_UNSUPPORTED_MODE:
+            return "unsupported-mode";
+        case DENSE_EXEC_GATE_NO_PLAN:
+            return "no-plan";
+        case DENSE_EXEC_GATE_FEW_BLOCKS:
+            return "few-blocks";
+        case DENSE_EXEC_GATE_NOT_DENSE:
+            return "not-dense";
+        case DENSE_EXEC_GATE_KV_DEVICE:
+            return "kv-device";
+        case DENSE_EXEC_GATE_SINGLE_DEVICE:
+            return "single-device";
+        case DENSE_EXEC_GATE_TOO_MANY_RANGES:
+            return "too-many-ranges";
+        case DENSE_EXEC_GATE_OPERAND:
+            return "operand";
+        case DENSE_EXEC_GATE_IN_PLACE:
+            return "in-place";
+        case DENSE_EXEC_GATE_OUTPUT:
+            return "output";
+        case DENSE_EXEC_GATE_ARENA_TOO_LARGE:
+            return "arena-too-large";
+        case DENSE_EXEC_GATE_PREPARE_FAILED:
+            return "prepare-failed";
+        case DENSE_EXEC_GATE_STAGE_FAILED:
+            return "stage-failed";
+    }
+    return "unknown";
+}
+
+// One active layer block of the placement plan.
+struct dense_exec_block {
+    int  start_layer      = -1;
+    int  end_layer        = -1;
+    int  execution_device = -1;
+    int  kv_device        = -1;
+    bool has_moe_weights  = false;
+};
+
+struct dense_exec_precheck_inputs {
+    bool                          enabled          = false;
+    bool                          has_graph        = false;
+    bool                          graph_recording  = false;
+    bool                          unsupported_mode = false;
+    bool                          has_plan         = false;
+    std::vector<dense_exec_block> blocks;
+};
+
+// The first gate, among those decidable from the plan alone, that stops the
+// executor; DENSE_EXEC_GATE_NONE when all of them pass.
+inline dense_exec_gate dense_exec_first_failing_precheck(const dense_exec_precheck_inputs & in) {
+    if (!in.enabled) {
+        return DENSE_EXEC_GATE_DISABLED;
+    }
+    if (!in.has_graph) {
+        return DENSE_EXEC_GATE_NO_GRAPH;
+    }
+    if (in.graph_recording) {
+        return DENSE_EXEC_GATE_GRAPH_RECORDING;
+    }
+    if (in.unsupported_mode) {
+        return DENSE_EXEC_GATE_UNSUPPORTED_MODE;
+    }
+    if (!in.has_plan) {
+        return DENSE_EXEC_GATE_NO_PLAN;
+    }
+    if (in.blocks.size() < 2) {
+        return DENSE_EXEC_GATE_FEW_BLOCKS;
+    }
+    for (const dense_exec_block & block : in.blocks) {
+        if (block.has_moe_weights) {
+            return DENSE_EXEC_GATE_NOT_DENSE;
+        }
+    }
+    for (const dense_exec_block & block : in.blocks) {
+        if (block.execution_device < 0 || block.kv_device != block.execution_device) {
+            return DENSE_EXEC_GATE_KV_DEVICE;
+        }
+    }
+    return DENSE_EXEC_GATE_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// Graph facts
+// ---------------------------------------------------------------------------
+
+// Storage is tracked by root: a view reads and writes its view_src chain's
+// root, so every edge below names the root it touches, never a view.
+enum dense_exec_root_kind {
+    DENSE_EXEC_ROOT_NODE,     // produced by a node of this graph
+    DENSE_EXEC_ROOT_WEIGHT,   // a model weight leaf
+    DENSE_EXEC_ROOT_CONTROL,  // a per-graph host input leaf (positions, masks, row ids)
+    DENSE_EXEC_ROOT_STATE,    // any other leaf: the KV cache, recurrent state
+};
+
+struct dense_exec_root {
+    dense_exec_root_kind kind          = DENSE_EXEC_ROOT_NODE;
+    int                  producer      = -1;  // NODE: index of the node that produces it
+    size_t               bytes         = 0;
+    bool                 is_output     = false;
+    // Leaves: bit d is set when device d reads the leaf in place as a device
+    // operand. Placement put it there; the executor never moves a weight or
+    // the KV cache.
+    uint32_t             resident_mask = 0;
+};
+
+struct dense_exec_node {
+    // Layer index from the node's own name ("attn_norm-30"), -1 when the name
+    // carries none. A source's name is deliberately not consulted: the final
+    // "norm" would inherit the last layer's index from its source, although the
+    // output norm weight lives on another card.
+    int              own_layer = -1;
+    // Views, reshapes, permutes and transposes: no kernel runs.
+    bool             is_noop   = false;
+    // Root this node writes; -1 for a no-op. A node that writes into a view
+    // (SET_ROWS into the KV cache, an in-place op) names that view's root.
+    int              dst_root  = -1;
+    std::vector<int> src_roots;
+};
+
+struct dense_exec_graph {
+    std::vector<dense_exec_node>  nodes;
+    std::vector<dense_exec_root>  roots;
+    std::vector<dense_exec_block> blocks;
+    int                           original_device = 0;  // the backend context's device
+    size_t                        max_ranges      = 0;  // 0: 2 * blocks + 1
+    size_t                        max_arena_bytes = 0;  // per device; 0: unlimited
+};
+
+// ---------------------------------------------------------------------------
+// Plan
+// ---------------------------------------------------------------------------
+
+constexpr size_t dense_exec_slice_alignment = 256;
+constexpr int    dense_exec_max_devices     = 32;
+
+// Nodes [begin, end) on `device`. A range on the original device runs exactly
+// as a graph without the executor does; any other range is an executor range.
+struct dense_exec_range {
+    int  begin    = 0;
+    int  end      = 0;
+    int  device   = -1;
+    bool executor = false;
+};
+
+// Storage for one root on one device, inside that device's persistent arena.
+struct dense_exec_slice {
+    int    root   = -1;
+    int    device = -1;
+    size_t offset = 0;
+    size_t bytes  = 0;
+};
+
+struct dense_exec_copy {
+    int from_slice = -1;
+    int to_slice   = -1;
+};
+
+struct dense_exec_range_io {
+    // Executor ranges only. Slices filled before the range runs: a NODE root
+    // is copied from wherever its producer on the original device wrote it, a
+    // CONTROL root from its host bytes.
+    std::vector<int>             stage_in;
+    // Slices published as their root's storage on the range's device while
+    // the range runs, and unpublished when it ends.
+    std::vector<int>             publish;
+    // After the range: copies of roots it produced that a later range on the
+    // original device reads. Each destination slice stays published as its
+    // root's storage on the original device until the graph ends.
+    std::vector<dense_exec_copy> copy_out;
+};
+
+struct dense_exec_plan {
+    std::vector<int>                 node_device;
+    std::vector<dense_exec_range>    ranges;
+    std::vector<dense_exec_range_io> io;           // one per range
+    std::vector<dense_exec_slice>    slices;
+    std::vector<size_t>              arena_bytes;  // indexed by device
+    int                              failing_node = -1;
+};
+
+inline size_t dense_exec_align(size_t bytes) {
+    return (bytes + dense_exec_slice_alignment - 1) / dense_exec_slice_alignment * dense_exec_slice_alignment;
+}
+
+inline int dense_exec_block_device(const std::vector<dense_exec_block> & blocks, int layer) {
+    if (layer < 0) {
+        return -1;
+    }
+    for (const dense_exec_block & block : blocks) {
+        if (layer >= block.start_layer && layer <= block.end_layer) {
+            return block.execution_device;
+        }
+    }
+    return -1;
+}
+
+// The device each node runs on.
+//   1. A no-op runs nowhere; it takes its predecessor's device so it never
+//      splits a range.
+//   2. Otherwise the preferred device is the node's own layer's block, else
+//      the device of its first source produced by another node, else the
+//      original device.
+//   3. Placement then decides: when the node reads weights, or writes into a
+//      leaf such as the KV cache, it runs where all of those reside -- the
+//      preferred device when they reside there too. Host-resident weights run
+//      on the original device, whose per-op path already serves them.
+inline std::vector<int> dense_exec_assign_devices(const dense_exec_graph & g) {
+    std::vector<int> node_device(g.nodes.size(), g.original_device);
+    for (size_t i = 0; i < g.nodes.size(); ++i) {
+        const dense_exec_node & node = g.nodes[i];
+        if (node.is_noop) {
+            node_device[i] = i > 0 ? node_device[i - 1] : g.original_device;
+            continue;
+        }
+
+        int preferred = dense_exec_block_device(g.blocks, node.own_layer);
+        if (preferred < 0) {
+            for (int r : node.src_roots) {
+                const dense_exec_root & root = g.roots[static_cast<size_t>(r)];
+                if (root.kind == DENSE_EXEC_ROOT_NODE && root.producer >= 0 && static_cast<size_t>(root.producer) < i) {
+                    preferred = node_device[static_cast<size_t>(root.producer)];
+                    break;
+                }
+            }
+        }
+        if (preferred < 0) {
+            preferred = g.original_device;
+        }
+
+        bool     placed      = false;
+        uint32_t placed_mask = ~uint32_t{ 0 };
+        for (int r : node.src_roots) {
+            const dense_exec_root & root = g.roots[static_cast<size_t>(r)];
+            if (root.kind == DENSE_EXEC_ROOT_WEIGHT) {
+                placed = true;
+                placed_mask &= root.resident_mask;
+            }
+        }
+        if (node.dst_root >= 0) {
+            const dense_exec_root & root = g.roots[static_cast<size_t>(node.dst_root)];
+            if (root.kind == DENSE_EXEC_ROOT_STATE) {
+                placed = true;
+                placed_mask &= root.resident_mask;
+            }
+        }
+
+        int device = preferred;
+        if (placed) {
+            if (preferred >= dense_exec_max_devices || (placed_mask & (uint32_t{ 1 } << preferred)) == 0) {
+                device = g.original_device;
+                for (int d = 0; d < dense_exec_max_devices; ++d) {
+                    if (placed_mask & (uint32_t{ 1 } << d)) {
+                        device = d;
+                        break;
+                    }
+                }
+            }
+        }
+        node_device[i] = device;
+    }
+    return node_device;
+}
+
+inline std::vector<dense_exec_range> dense_exec_build_ranges(const std::vector<int> & node_device,
+                                                             int                      original_device) {
+    std::vector<dense_exec_range> ranges;
+    for (size_t i = 0; i < node_device.size(); ++i) {
+        if (ranges.empty() || ranges.back().device != node_device[i]) {
+            dense_exec_range range{};
+            range.begin    = static_cast<int>(i);
+            range.device   = node_device[i];
+            range.executor = node_device[i] != original_device;
+            ranges.push_back(range);
+        }
+        ranges.back().end = static_cast<int>(i) + 1;
+    }
+    return ranges;
+}
+
+// Builds the whole plan, or returns the gate that rejects the graph (with
+// out.failing_node naming the node when one is to blame).
+inline dense_exec_gate dense_exec_build_plan(const dense_exec_graph & g, dense_exec_plan & out) {
+    out = dense_exec_plan{};
+    if (g.original_device < 0 || g.original_device >= dense_exec_max_devices) {
+        return DENSE_EXEC_GATE_SINGLE_DEVICE;
+    }
+
+    out.node_device = dense_exec_assign_devices(g);
+    out.ranges      = dense_exec_build_ranges(out.node_device, g.original_device);
+
+    bool any_executor = false;
+    for (const dense_exec_range & range : out.ranges) {
+        if (range.executor) {
+            if (range.device < 0 || range.device >= dense_exec_max_devices) {
+                out.failing_node = range.begin;
+                return DENSE_EXEC_GATE_OPERAND;
+            }
+            any_executor = true;
+        }
+    }
+    if (!any_executor) {
+        return DENSE_EXEC_GATE_SINGLE_DEVICE;
+    }
+    const size_t max_ranges = g.max_ranges != 0 ? g.max_ranges : 2 * g.blocks.size() + 1;
+    if (out.ranges.size() > max_ranges) {
+        return DENSE_EXEC_GATE_TOO_MANY_RANGES;
+    }
+
+    std::vector<int> node_range(g.nodes.size(), -1);
+    for (size_t r = 0; r < out.ranges.size(); ++r) {
+        for (int i = out.ranges[r].begin; i < out.ranges[r].end; ++i) {
+            node_range[static_cast<size_t>(i)] = static_cast<int>(r);
+        }
+    }
+    auto range_of_root = [&](const dense_exec_root & root) {
+        return root.producer >= 0 && static_cast<size_t>(root.producer) < node_range.size() ?
+                   node_range[static_cast<size_t>(root.producer)] :
+                   -1;
+    };
+
+    // slice_of[root * devices + device]: index into out.slices, -1 if none.
+    std::vector<int> slice_of(g.roots.size() * dense_exec_max_devices, -1);
+    auto             ensure_slice = [&](int root, int device) {
+        int & idx = slice_of[static_cast<size_t>(root) * dense_exec_max_devices + static_cast<size_t>(device)];
+        if (idx < 0) {
+            dense_exec_slice slice{};
+            slice.root   = root;
+            slice.device = device;
+            slice.bytes  = g.roots[static_cast<size_t>(root)].bytes;
+            idx          = static_cast<int>(out.slices.size());
+            out.slices.push_back(slice);
+        }
+        return idx;
+    };
+    auto push_unique = [](std::vector<int> & v, int x) {
+        for (int y : v) {
+            if (y == x) {
+                return;
+            }
+        }
+        v.push_back(x);
+    };
+
+    out.io.resize(out.ranges.size());
+    for (size_t r = 0; r < out.ranges.size(); ++r) {
+        const dense_exec_range & range = out.ranges[r];
+        if (!range.executor) {
+            continue;
+        }
+        const int             d    = range.device;
+        const uint32_t        bit  = uint32_t{ 1 } << d;
+        dense_exec_range_io & io   = out.io[r];
+        auto                  fail = [&](int node, dense_exec_gate gate) {
+            out.failing_node = node;
+            return gate;
+        };
+
+        for (int i = range.begin; i < range.end; ++i) {
+            const dense_exec_node & node = g.nodes[static_cast<size_t>(i)];
+            if (node.is_noop) {
+                continue;
+            }
+
+            for (int s : node.src_roots) {
+                const dense_exec_root & root = g.roots[static_cast<size_t>(s)];
+                switch (root.kind) {
+                    case DENSE_EXEC_ROOT_NODE:
+                        {
+                            const int pr = range_of_root(root);
+                            if (pr == static_cast<int>(r)) {
+                                break;  // produced earlier in this range: already published
+                            }
+                            if (pr < 0) {
+                                return fail(i, DENSE_EXEC_GATE_OPERAND);
+                            }
+                            const dense_exec_range & producer_range = out.ranges[static_cast<size_t>(pr)];
+                            if (!producer_range.executor) {
+                                // Re-staged for every executor range: a later
+                                // original-device node may have rewritten it.
+                                const int slice = ensure_slice(s, d);
+                                push_unique(io.stage_in, slice);
+                                push_unique(io.publish, slice);
+                            } else if (producer_range.device == d) {
+                                push_unique(io.publish, ensure_slice(s, d));
+                            } else {
+                                return fail(i, DENSE_EXEC_GATE_OPERAND);
+                            }
+                            break;
+                        }
+                    case DENSE_EXEC_ROOT_CONTROL:
+                        if ((root.resident_mask & bit) == 0) {
+                            const int slice = ensure_slice(s, d);
+                            push_unique(io.stage_in, slice);
+                            push_unique(io.publish, slice);
+                        }
+                        break;
+                    case DENSE_EXEC_ROOT_WEIGHT:
+                    case DENSE_EXEC_ROOT_STATE:
+                        if ((root.resident_mask & bit) == 0) {
+                            return fail(i, DENSE_EXEC_GATE_OPERAND);
+                        }
+                        break;
+                }
+            }
+
+            if (node.dst_root >= 0) {
+                const dense_exec_root & root = g.roots[static_cast<size_t>(node.dst_root)];
+                if (root.kind == DENSE_EXEC_ROOT_NODE && range_of_root(root) == static_cast<int>(r)) {
+                    if (root.is_output) {
+                        return fail(i, DENSE_EXEC_GATE_OUTPUT);
+                    }
+                    push_unique(io.publish, ensure_slice(node.dst_root, d));
+                } else if (root.kind == DENSE_EXEC_ROOT_STATE && (root.resident_mask & bit) != 0) {
+                    // Written in place where placement put it.
+                } else {
+                    return fail(i, DENSE_EXEC_GATE_IN_PLACE);
+                }
+            }
+        }
+    }
+
+    // Copies back to the original device: every root an executor range
+    // produced that a node of a later original-device range reads or writes.
+    for (size_t i = 0; i < g.nodes.size(); ++i) {
+        const int cr = node_range[i];
+        if (out.ranges[static_cast<size_t>(cr)].executor || g.nodes[i].is_noop) {
+            continue;
+        }
+        std::vector<int> touched = g.nodes[i].src_roots;
+        if (g.nodes[i].dst_root >= 0) {
+            touched.push_back(g.nodes[i].dst_root);
+        }
+        for (int s : touched) {
+            const dense_exec_root & root = g.roots[static_cast<size_t>(s)];
+            if (root.kind != DENSE_EXEC_ROOT_NODE) {
+                continue;
+            }
+            const int pr = range_of_root(root);
+            if (pr < 0 || pr >= cr || !out.ranges[static_cast<size_t>(pr)].executor) {
+                continue;
+            }
+            const int from = ensure_slice(s, out.ranges[static_cast<size_t>(pr)].device);
+            const int to   = ensure_slice(s, g.original_device);
+            bool      seen = false;
+            for (const dense_exec_copy & c : out.io[static_cast<size_t>(pr)].copy_out) {
+                seen = seen || c.to_slice == to;
+            }
+            if (!seen) {
+                out.io[static_cast<size_t>(pr)].copy_out.push_back(dense_exec_copy{ from, to });
+            }
+        }
+    }
+
+    out.arena_bytes.assign(dense_exec_max_devices, 0);
+    for (dense_exec_slice & slice : out.slices) {
+        size_t & total = out.arena_bytes[static_cast<size_t>(slice.device)];
+        slice.offset   = total;
+        total += dense_exec_align(slice.bytes != 0 ? slice.bytes : 1);
+    }
+    if (g.max_arena_bytes != 0) {
+        for (size_t total : out.arena_bytes) {
+            if (total > g.max_arena_bytes) {
+                return DENSE_EXEC_GATE_ARENA_TOO_LARGE;
+            }
+        }
+    }
+    return DENSE_EXEC_GATE_NONE;
+}
+
+}  // namespace ggml_sycl
