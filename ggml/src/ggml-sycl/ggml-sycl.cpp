@@ -88864,6 +88864,15 @@ static sycl::queue * ggml_sycl_block_exec_dense_queue(ggml_backend_sycl_context 
     return ctx.stream(device, 0);
 }
 
+// One copy of a crossing between devices: source, destination, offset in the
+// host staging buffers, bytes.
+struct ggml_sycl_block_exec_dense_crossing_span {
+    ggml_sycl::mem_handle src;
+    ggml_sycl::mem_handle dst;
+    size_t                host_offset = 0;
+    size_t                bytes       = 0;
+};
+
 // Per backend context: one device arena per device the executor stages into.
 // An arena only grows, and is dropped when the placement plan changes. It is
 // allocated with the STAGING role for now; its own role is S4b work. Each
@@ -88903,6 +88912,9 @@ struct ggml_sycl_block_exec_dense_state {
     ggml_sycl::mem_handle host_stage[GGML_SYCL_MAX_DEVICES];
     size_t                host_stage_bytes[GGML_SYCL_MAX_DEVICES] = {};
     sycl::event           host_stage_read[GGML_SYCL_MAX_DEVICES];
+    // The spans of the crossing being built. Reused so a token allocates
+    // nothing for them; emptied after each crossing, never shrunk.
+    std::vector<ggml_sycl_block_exec_dense_crossing_span> crossing_spans;
 
 #ifdef GGML_SYCL_GRAPH
     // One recorded command graph per range of a decode graph, replayed on the
@@ -89057,6 +89069,17 @@ static void ggml_sycl_block_exec_dense_release(ggml_backend_sycl_context * ctx) 
 }
 
 static uint64_t ggml_sycl_graph_signature(const ggml_cgraph * cgraph);
+
+// A decode graph: its first MUL_MAT multiplies a single row. The scan stops at
+// the first MUL_MAT, so it is O(1) in practice.
+static bool ggml_sycl_graph_is_decode(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->src[1]) {
+            return cgraph->nodes[i]->src[1]->ne[1] == 1;
+        }
+    }
+    return false;
+}
 
 #ifdef GGML_SYCL_GRAPH
 static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph);
@@ -89236,7 +89259,8 @@ class ggml_sycl_block_exec_dense_run {
                 phases_[static_cast<size_t>(idx)].drain_out_us = elapsed_us(t_copy);
                 t_copy                                         = std::chrono::steady_clock::now();
             }
-            std::vector<crossing_span> spans;
+            crossing_spans_scope         scope(ggml_sycl_block_exec_dense_state_for(ctx_).crossing_spans);
+            std::vector<crossing_span> & spans = scope.spans;
             for (size_t k = 0; k < io.copy_out.size(); ++k) {
                 const ggml_sycl::dense_exec_copy &  copy = io.copy_out[k];
                 const ggml_sycl::dense_exec_slice & from = plan_.slices[static_cast<size_t>(copy.from_slice)];
@@ -89455,12 +89479,7 @@ class ggml_sycl_block_exec_dense_run {
         graphs_on_ = false;
 
         ggml_sycl::dense_graph_facts f{};
-        for (int i = 0; i < cgraph_->n_nodes; i++) {
-            if (cgraph_->nodes[i]->op == GGML_OP_MUL_MAT && cgraph_->nodes[i]->src[1]) {
-                f.is_decode = cgraph_->nodes[i]->src[1]->ne[1] == 1;
-                break;
-            }
-        }
+        f.is_decode     = ggml_sycl_graph_is_decode(cgraph_);
         f.enabled       = ggml_sycl_block_exec_dense_graph_enabled();
         f.disable_graph = g_ggml_sycl_disable_graph != 0;
         // The diagnostics that wait on or read back from the queue inside the
@@ -89552,7 +89571,7 @@ class ggml_sycl_block_exec_dense_run {
             std::swap(ctx_.fa_graph_ptrs, g.fa_ptrs);
         }
         if (match) {
-            q->ext_oneapi_graph(*g.exec);
+            submit_range_graph(idx, *g.exec, *q, "replay");
             g.replays++;
             range_modes_[idx] = range_graph_mode::REPLAY;
             // The Q8 entry describes what the direct or recorded loop last
@@ -89683,8 +89702,38 @@ class ggml_sycl_block_exec_dense_run {
             fflush(stderr);
         }
 
-        q->ext_oneapi_graph(*g.exec);
+        submit_range_graph(idx, *g.exec, *q, "record");
         g.records++;
+    }
+
+    // Submits a range graph. A graph that fails to submit would fail again on
+    // every later token, so the failure turns range graphs off for this
+    // context and drops the cached ones (drop_graphs drains first) before it
+    // propagates. It is not a fallback: once a range ran, later ranges cannot
+    // take another path.
+    void submit_range_graph(size_t                                                     idx,
+                            sycl_ex::command_graph<sycl_ex::graph_state::executable> & exec,
+                            sycl::queue &                                              q,
+                            const char *                                               what) {
+        try {
+            q.ext_oneapi_graph(exec);
+        } catch (const std::exception & e) {
+            disable_range_graphs(idx, what, e.what());
+            throw;
+        } catch (...) {
+            disable_range_graphs(idx, what, "unknown exception");
+            throw;
+        }
+    }
+
+    void disable_range_graphs(size_t idx, const char * what, const char * why) {
+        GGML_LOG_WARN(
+            "[SYCL-BLOCK-EXEC-DENSE] dense range graph %s failed: range %zu: %s; range graphs are off for "
+            "this context\n",
+            what, idx, why);
+        ggml_sycl_block_exec_dense_state & st = state();
+        st.graphs_disabled                    = true;
+        st.drop_graphs(ctx_);
     }
 
     // An exception inside a recorded node loop: close the recording, keep no
@@ -89811,13 +89860,17 @@ class ggml_sycl_block_exec_dense_run {
 
     // One crossing from `from` to `to`: every span is copied into from's host
     // buffer, waited on once, moved to to's host buffer, and copied out of it
-    // on to's queue without a wait. spans are (source, destination, host
-    // offset, bytes).
-    struct crossing_span {
-        ggml_sycl::mem_handle src;
-        ggml_sycl::mem_handle dst;
-        size_t                host_offset = 0;
-        size_t                bytes       = 0;
+    // on to's queue without a wait.
+    using crossing_span = ggml_sycl_block_exec_dense_crossing_span;
+
+    // Empties the context's reused span list on entry, and again on exit,
+    // which releases the spans' handles.
+    struct crossing_spans_scope {
+        std::vector<crossing_span> & spans;
+
+        explicit crossing_spans_scope(std::vector<crossing_span> & v) : spans(v) { spans.clear(); }
+
+        ~crossing_spans_scope() { spans.clear(); }
     };
 
     void cross(int from, int to, const std::vector<crossing_span> & spans, dense_phase * laps = nullptr) {
@@ -89859,7 +89912,8 @@ class ggml_sycl_block_exec_dense_run {
     bool stage_range(size_t idx) {
         const ggml_sycl::dense_exec_range &    range = ranges_[idx];
         const ggml_sycl::dense_exec_range_io & io    = plan_.io[idx];
-        std::vector<crossing_span>             spans;
+        crossing_spans_scope                   scope(ggml_sycl_block_exec_dense_state_for(ctx_).crossing_spans);
+        std::vector<crossing_span> &           spans = scope.spans;
         for (size_t k = 0; k < io.stage_in.size(); ++k) {
             const int                           s     = io.stage_in[k];
             const ggml_sycl::dense_exec_slice & slice = plan_.slices[static_cast<size_t>(s)];
@@ -93942,8 +93996,8 @@ gpu_dispatch:
                 }
             }
             {
-                const char *        tensor_trace_pattern = ggml_sycl_tensor_trace_pattern();
-                static const int    tensor_trace_limit   = [] {
+                const char *     tensor_trace_pattern = ggml_sycl_tensor_trace_pattern();
+                static const int tensor_trace_limit   = [] {
                     const char * env = std::getenv("GGML_SYCL_TENSOR_TRACE_LIMIT");
                     return env ? std::atoi(env) : 256;
                 }();
@@ -104323,15 +104377,8 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     // Phase detection: always recompute — n_nodes is the same for PP and TG
     // when GPU prefix mode truncates the graph, so caching by n_nodes alone
     // returns stale PP phase during TG, causing graph replay with wrong shapes.
-    // This scan is O(1) in practice (finds first MUL_MAT in the graph).
     // Computed BEFORE arena reset so per-PP profiling can include reset cost.
-    bool cached_is_decode = false;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->src[1]) {
-            cached_is_decode = (cgraph->nodes[i]->src[1]->ne[1] == 1);
-            break;
-        }
-    }
+    const bool cached_is_decode = ggml_sycl_graph_is_decode(cgraph);
     ggml_sycl::offload_stats_set_phase(cached_is_decode ? ggml_sycl::offload_phase::TG : ggml_sycl::offload_phase::PP);
     const bool arena_pp_profile_active = ggml_sycl::arena_pp_profile_begin(sycl_ctx->device, !cached_is_decode);
     pp_scratch_profile_begin(!cached_is_decode);
