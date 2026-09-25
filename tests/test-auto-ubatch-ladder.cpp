@@ -11,9 +11,9 @@
 // for a MoE model. A causal context already has n_batch <= n_ctx, so without
 // the MoE ceiling cap is n_batch and floor <= cap.
 //
-// The two cases the narrower "floor above the ladder's largest rung" form gets
-// wrong also run that form and require it to DISAGREE, so each is known to
-// discriminate between the two.
+// The three cases the narrower "floor above the ladder's largest rung" form
+// gets wrong also run that form and require it to DISAGREE, so each is known
+// to discriminate between the two.
 // No device, no model, no allocation.
 
 #include "../src/llama-auto-ubatch.h"
@@ -68,7 +68,7 @@ int main() {
     // -c 256 (llama-bench pp128/tg128 rows): cap below the first rung. The
     // trial's own `cap < ladder[0]` exit handles this before the cache
     // lookup; the predicate agrees.
-    check_case("cap below the first rung", 256, 256, false);
+    check_case("cap below the first rung", 256, 256, false, true);
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d case(s) failed\n", g_failures);

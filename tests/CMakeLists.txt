@@ -3279,8 +3279,9 @@ endif()
 # {512, 1024, 2048, 4096} ladder and its n_batch/n_ctx/MoE-ceiling caps, the
 # per-candidate probe (BUSY backoff, STALE_IDENTITY, would_demote_kv),
 # publish-before-reserve ordering, the host-fallback query consulted after
-# reserve, the settle step, the stop-reason strings (eight since
-# llama.cpp-7n6n added "cached" -- see below), and exactly one [SYCL-PLAN]
+# reserve, the settle step, the nine stop-reason strings (including "cached"
+# for a tuning-cache hit, see below, and "compute buffers did not fit" for a
+# candidate whose compute-buffer reserve throws), and exactly one [SYCL-PLAN]
 # auto n_ubatch= WARN. Host-only, reads the sources as text. Same
 # registration shape as test-sycl-compute-buffer-fallback-source above.
 #

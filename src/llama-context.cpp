@@ -1790,8 +1790,10 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // Placed AFTER the cache lookup so a persisted value at or above the
     // floor can still be revalidated and reported; gated on tried.empty() so
     // a cache attempt this trial (a hit, or a lost cache candidate) still
-    // gets its normal outcome WARN and store logic. No WARN and no cache
-    // store here, matching the other silent pre-trial exits.
+    // gets its normal outcome WARN and store logic. Skips only the
+    // [SYCL-PLAN] auto n_ubatch= WARN and the cache store: the tuning cache
+    // WARN above has already printed its miss/disabled line, unlike the
+    // earlier pre-trial exits, which all return before the cache lookup.
     if (tried.empty() &&
         !llama_auto_ubatch_ladder_has_candidate(ladder, sizeof(ladder) / sizeof(ladder[0]), fallback_ubatch, cap)) {
         sched_reserve();
