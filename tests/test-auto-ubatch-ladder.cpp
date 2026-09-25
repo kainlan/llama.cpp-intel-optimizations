@@ -20,10 +20,9 @@
 
 #include <cstdio>
 
-// The trial's ladder (src/llama-context.cpp; tests/test-sycl-auto-ubatch-source.py
-// pins the literal there).
-static const uint32_t ladder[] = { 512, 1024, 2048, 4096 };
-static const size_t   n_ladder = sizeof(ladder) / sizeof(ladder[0]);
+// The trial's own ladder, so the cases below run on the real rungs.
+static const uint32_t * ladder   = llama_auto_ubatch_ladder;
+static const size_t     n_ladder = llama_auto_ubatch_ladder_size;
 
 static int g_failures = 0;
 

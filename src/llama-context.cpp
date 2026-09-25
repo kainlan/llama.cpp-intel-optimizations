@@ -1417,7 +1417,7 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     }
 #    endif
 
-    static const uint32_t ladder[] = { 512, 1024, 2048, 4096 };
+    const auto & ladder = llama_auto_ubatch_ladder;
 
     uint32_t     cap  = std::min(cparams.n_batch, cparams.n_ctx);
     const char * stop = "ladder exhausted";
@@ -1605,7 +1605,14 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;
         try {
             sched_reserve();
-        } catch (const std::exception &) {
+        } catch (const std::exception & e) {
+            // One stop reason covers every throw from this reserve
+            // (graph_reserve failure, a flash-attn/non-FA scratch recheck
+            // refusal, memory-module init), so name the actual cause here
+            // at INFO, like the per-candidate refusals. Swallowing a
+            // recheck refusal is safe only because published_any is
+            // already true, which forces the settle's full publish.
+            LLAMA_LOG_INFO("[SYCL-PLAN] auto n_ubatch candidate %u: compute buffer reserve failed: %s\n", c, e.what());
             cparams.pipeline_parallel = pipeline_parallel_before_reserve;
             sched_matches_last_good   = false;
             return "compute buffers did not fit";
@@ -1795,7 +1802,7 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // WARN above has already printed its miss/disabled line, unlike the
     // earlier pre-trial exits, which all return before the cache lookup.
     if (tried.empty() &&
-        !llama_auto_ubatch_ladder_has_candidate(ladder, sizeof(ladder) / sizeof(ladder[0]), fallback_ubatch, cap)) {
+        !llama_auto_ubatch_ladder_has_candidate(ladder, llama_auto_ubatch_ladder_size, fallback_ubatch, cap)) {
         sched_reserve();
         return;
     }
@@ -1881,33 +1888,42 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // the same value again would be a redundant runtime-context transaction
     // with no state change (the scenario this finding reported).
     //
-    // llama.cpp-pyu4: a first-rung loss on the host-fallback check
-    // leaves last_good == fallback_ubatch == the rung that just lost (the
-    // "last_good == 0" branch above sets last_good to fallback_ubatch,
-    // which is also c), so this gate still fires (sched_matches_last_good
-    // is false) and re-publishes/re-reserves the identical value -- one
-    // wasted transaction+reserve cycle, not a wrong one. This is
-    // deliberately NOT narrowed to also skip whenever cparams.n_ubatch ==
-    // last_good: sched_matches_last_good is also set false by a partial
-    // multi-device publish failure (a losing candidate's publish can throw
-    // after already succeeding on an earlier device -- see try_candidate()'s
-    // own comment on that), and in that case cparams.n_ubatch can
-    // coincidentally equal last_good while the sched genuinely does NOT
-    // describe it consistently across every backend. The value alone
-    // cannot distinguish those two cases without also carrying which reason
-    // set the flag false, so this gate stays conservative and only skips
-    // when sched_matches_last_good is actually true -- the settle-skipped
-    // condition must still imply the ring and plan describe the winner.
+    // llama.cpp-pyu4: the first rung tried is the smallest rung >=
+    // fallback_ubatch (the loop skips rungs under the floor), so it equals
+    // fallback_ubatch only when fallback_ubatch is itself a rung. In that
+    // case a first-rung loss on the host-fallback check leaves last_good ==
+    // fallback_ubatch == the rung that just lost (the "last_good == 0"
+    // branch above), so this gate still fires (sched_matches_last_good is
+    // false) and re-publishes/re-reserves the identical value -- one wasted
+    // transaction+reserve cycle, not a wrong one. When fallback_ubatch sits
+    // between rungs, that losing rung was published above it, so the same
+    // cycle is needed to put fallback_ubatch back. This is deliberately NOT
+    // narrowed to also skip whenever cparams.n_ubatch == last_good:
+    // sched_matches_last_good is also set false by a partial multi-device
+    // publish failure (a losing candidate's publish can throw after already
+    // succeeding on an earlier device -- see try_candidate()'s own comment
+    // on that), and in that case cparams.n_ubatch can coincidentally equal
+    // last_good while the sched genuinely does NOT describe it consistently
+    // across every backend. The value alone cannot distinguish those two
+    // cases without also carrying which reason set the flag false, so this
+    // gate stays conservative and only skips when sched_matches_last_good
+    // is actually true -- the settle-skipped condition must still imply the
+    // ring and plan describe the winner.
     //
-    // llama.cpp-pyu4: the ring's correctness after the probe
-    // rollback-failure path (llama.cpp-jumy) here is ARITHMETIC, not
-    // something this gate has to know about structurally: a 512 rollback
-    // failure leaves last_good at 512, which is the winner anyway, so the settle
-    // reserve below just re-confirms it; a 1024+ rollback failure has
-    // already set published_any true earlier in the trial, so need_publish
-    // is true and the settle republishes and re-plans regardless. The
-    // settle's own publish gate never inspects the ring directly -- it does
-    // not need to.
+    // llama.cpp-pyu4: the ring's state after the probe rollback-failure
+    // path (llama.cpp-jumy) is ARITHMETIC, not something this gate has to
+    // know about structurally. A rollback failure on the first rung tried
+    // leaves the ring sized for that rung with published_any still false.
+    // When fallback_ubatch is a rung, that rung is fallback_ubatch == the
+    // last_good this settle reserves, so the ring describes the winner. When
+    // fallback_ubatch sits between rungs, need_publish is false (nothing
+    // was published and cparams.n_ubatch is still fallback_ubatch), so the
+    // settle re-reserves fallback_ubatch without republishing and the ring
+    // stays sized for the larger rung -- oversized, never undersized. A
+    // rollback failure on any later rung has already set published_any true
+    // earlier in the trial, so need_publish is true and the settle
+    // republishes and re-plans regardless. The settle's own publish gate
+    // never inspects the ring directly -- it does not need to.
     if (!sched_matches_last_good || cparams.n_ubatch != last_good) {
         const bool need_publish = published_any || cparams.n_ubatch != fallback_ubatch;
         cparams.n_ubatch        = last_good;

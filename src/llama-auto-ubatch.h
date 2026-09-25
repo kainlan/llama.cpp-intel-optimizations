@@ -8,6 +8,11 @@
 // touch no context or backend state, so tests/test-auto-ubatch-ladder.cpp
 // executes them on the host.
 
+// The trial's candidate micro-batch sizes, ascending.
+static const uint32_t llama_auto_ubatch_ladder[] = { 512, 1024, 2048, 4096 };
+static const size_t   llama_auto_ubatch_ladder_size =
+    sizeof(llama_auto_ubatch_ladder) / sizeof(llama_auto_ubatch_ladder[0]);
+
 // True iff some rung of `ladder` lies in [ubatch_floor, ubatch_cap]. The
 // trial's ladder loop skips every rung below `ubatch_floor` (the caller's own
 // n_ubatch, which the trial never shrinks) and stops at the first rung above

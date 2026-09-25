@@ -252,30 +252,39 @@ def test_call_site_gate_has_a_mutation_witness():
 # ---------------------------------------------------------------------------
 
 
+_LADDER_LITERAL_RE = (
+    r"static\s+const\s+uint32_t\s+llama_auto_ubatch_ladder\s*\[\s*\]\s*=\s*"
+    r"\{\s*512\s*,\s*1024\s*,\s*2048\s*,\s*4096\s*\}\s*;"
+)
+
+
 def test_ladder_literal_is_512_1024_2048_4096():
     """The candidate ladder must be exactly {512, 1024, 2048, 4096},
-    ascending, per the task spec and the Task 3 spike."""
-    body_norm = _normalize_ws(_trial_body())
-    assert re.search(
-        r"static\s+const\s+uint32_t\s+ladder\s*\[\s*\]\s*=\s*\{\s*512\s*,\s*1024\s*,\s*2048\s*,\s*4096\s*\}\s*;",
-        body_norm,
-    ), "the ladder literal must be exactly { 512, 1024, 2048, 4096 }"
+    ascending, per the task spec and the Task 3 spike. It lives in
+    src/llama-auto-ubatch.h so the trial and tests/test-auto-ubatch-
+    ladder.cpp read the same array; the trial binds it by reference."""
+    assert re.search(_LADDER_LITERAL_RE, _normalize_ws(strip_comments(LLAMA_AUTO_UBATCH_H))), (
+        "src/llama-auto-ubatch.h's llama_auto_ubatch_ladder must be exactly { 512, 1024, 2048, 4096 }"
+    )
+    assert re.search(r"const\s+auto\s*&\s*ladder\s*=\s*llama_auto_ubatch_ladder\s*;", _trial_body()), (
+        "the trial must bind `ladder` to llama_auto_ubatch_ladder, not keep a literal of its own"
+    )
+    assert not re.search(r"uint32_t\s+ladder\s*\[", _trial_body()), "the trial must not declare its own ladder array"
 
 
 def test_ladder_literal_has_a_mutation_witness():
     """Mutation witness for the ladder check above: proves it would
     actually catch a rung being changed (4096 -> 8192)."""
-    raw = LLAMA_CONTEXT_CPP
-    ladder_line = "    static const uint32_t ladder[] = { 512, 1024, 2048, 4096 };\n"
+    raw = LLAMA_AUTO_UBATCH_H
+    ladder_line = "static const uint32_t llama_auto_ubatch_ladder[] = { 512, 1024, 2048, 4096 };\n"
     assert raw.count(ladder_line) == 1, f"mutation target not unique -- found {raw.count(ladder_line)}"
-    mutated_raw = raw.replace(ladder_line, "    static const uint32_t ladder[] = { 512, 1024, 2048, 8192 };\n", 1)
+    mutated_raw = raw.replace(
+        ladder_line, "static const uint32_t llama_auto_ubatch_ladder[] = { 512, 1024, 2048, 8192 };\n", 1
+    )
     assert mutated_raw != raw
-
-    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    assert not re.search(
-        r"static\s+const\s+uint32_t\s+ladder\s*\[\s*\]\s*=\s*\{\s*512\s*,\s*1024\s*,\s*2048\s*,\s*4096\s*\}\s*;",
-        mutated_body_norm,
-    ), "mutation witness is broken: changing the last rung should make the literal check fail"
+    assert not re.search(_LADDER_LITERAL_RE, _normalize_ws(strip_comments(mutated_raw))), (
+        "mutation witness is broken: changing the last rung should make the literal check fail"
+    )
 
 
 def test_candidate_cap_uses_n_batch_and_n_ctx():
@@ -287,7 +296,7 @@ def test_candidate_cap_uses_n_batch_and_n_ctx():
     ), "cap must be computed as std::min(cparams.n_batch, cparams.n_ctx)"
 
     cap_idx = body_norm.find("uint32_t cap = std::min(cparams.n_batch, cparams.n_ctx);")
-    ladder_idx = body_norm.find("static const uint32_t ladder[]")
+    ladder_idx = body_norm.find("const auto & ladder = llama_auto_ubatch_ladder;")
     loop_idx = body_norm.find("for (uint32_t c : ladder)")
     assert cap_idx != -1 and ladder_idx != -1 and loop_idx != -1
     assert ladder_idx < cap_idx < loop_idx, "cap must be computed after the ladder literal and before the loop"
@@ -627,10 +636,11 @@ def test_publish_happens_before_reserve_in_try_candidate():
 
 def test_publish_reserve_order_has_a_mutation_witness():
     """Mutation witness for the ordering check above: proves it would
-    actually catch the publish's try/catch block and the reserve calls
-    being swapped."""
+    actually catch the publish's try/catch block being moved below the
+    reserve. Anchored on code lines only, so rewording a comment between
+    the two cannot disarm it."""
     raw = LLAMA_CONTEXT_CPP
-    try_catch_block = (
+    publish_block = (
         "        try {\n"
         "            sycl_resync_runtime_context_flash_attn();\n"
         "        } catch (const std::exception &) {\n"
@@ -638,58 +648,11 @@ def test_publish_reserve_order_has_a_mutation_witness():
         '            return "transaction refused";\n'
         "        }\n"
     )
-    reserve_block = (
-        "        // llama.cpp-xojq (quality round 1 Q2b): this publish just took\n"
-        "        // effect on every SYCL backend (the try above did not throw), so\n"
-        "        // device state may now differ from fallback_ubatch even if this\n"
-        "        // candidate goes on to lose the host-fallback check below -- the\n"
-        "        // settle step's own publish gate reads this flag to know whether\n"
-        "        // it must correct that state back.\n"
-        "        published_any      = true;\n"
-        "        sched_need_reserve = true;\n"
-    )
-    # llama.cpp-pyu4: the in-loop reserve is now wrapped in its own
-    # try/catch (with its own explanatory comment block) and a
-    # pipeline_parallel save right before it -- all included here verbatim
-    # (not just the bare `sched_reserve();` this witness used to target) so
-    # swapping the two blocks below still produces a string that actually
-    # appears once, unmodified, in the real source.
-    n1_n2_block = (
-        "        // llama.cpp-pyu4: this reserve was unguarded while the\n"
-        "        // candidate publish right above it already is -- sched_reserve()\n"
-        '        // throws "failed to allocate compute pp/tg buffers" when\n'
-        "        // graph_reserve() fails even after its own host-pinned-retry\n"
-        "        // fallback (ggml-sycl.cpp's ggml_backend_sycl_buffer_type_alloc_\n"
-        "        // buffer path), and can also throw from inside resolve_fused_ops()'s\n"
-        "        // call to sycl_recheck_runtime_context_flash_attn(). A candidate the\n"
-        "        // probe accepted but whose reserve throws must lose like any other\n"
-        "        // candidate, not abort context creation outright -- the pre-trial\n"
-        "        // fallback_ubatch path would otherwise have succeeded. The settle\n"
-        "        // step below still recovers to last_good; the settle's OWN reserve\n"
-        "        // stays unguarded, matching today's behaviour for a context that\n"
-        "        // does not fit at all.\n"
-        "        //\n"
-        "        // llama.cpp-pyu4: sched_reserve()'s own pipeline-parallel\n"
-        '        // fallback (its "retrying without pipeline parallelism" branch\n'
-        "        // below) sets cparams.pipeline_parallel = false PERMANENTLY the\n"
-        "        // moment a reserve needs it, win or lose. Save it here, immediately\n"
-        "        // before the call that can flip it, and restore it on every path\n"
-        "        // where THIS candidate goes on to lose -- so a losing candidate's\n"
-        "        // fallback never leaves pipeline parallelism disabled for last_good,\n"
-        "        // which may never have needed it.\n"
-        "        const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;\n"
-        "        try {\n"
-        "            sched_reserve();\n"
-        "        } catch (const std::exception &) {\n"
-        "            cparams.pipeline_parallel = pipeline_parallel_before_reserve;\n"
-        "            sched_matches_last_good   = false;\n"
-        '            return "compute buffers did not fit";\n'
-        "        }\n"
-    )
-    original_block = try_catch_block + reserve_block + n1_n2_block
-    assert original_block in raw, "mutation target not found -- update this witness to match the real source"
-    mutated_block = reserve_block + n1_n2_block + try_catch_block
-    mutated_raw = raw.replace(original_block, mutated_block, 1)
+    reserve_end = '            return "compute buffers did not fit";\n        }\n'
+    assert raw.count(publish_block) == 1, "mutation target not found -- update this witness to match the real source"
+    assert raw.count(reserve_end) == 1, "mutation anchor not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(publish_block, "", 1)
+    mutated_raw = mutated_raw.replace(reserve_end, reserve_end + publish_block, 1)
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
@@ -697,7 +660,7 @@ def test_publish_reserve_order_has_a_mutation_witness():
     mutated_reserve_idx = mutated_body_norm.find("sched_reserve();")
     assert mutated_publish_idx != -1 and mutated_reserve_idx != -1
     assert not (mutated_publish_idx < mutated_reserve_idx), (
-        "mutation witness is broken: swapping the two blocks should make the ordering check fail"
+        "mutation witness is broken: moving the publish below the reserve should make the ordering check fail"
     )
 
 
@@ -795,6 +758,14 @@ def test_host_fallback_query_has_a_mutation_witness():
 # ---------------------------------------------------------------------------
 
 
+_IN_LOOP_RESERVE_WRAP_RE = (
+    r"try\s*\{\s*sched_reserve\s*\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*&\s*e\s*\)\s*\{\s*"
+    r"LLAMA_LOG_INFO\s*\([^;]*\be\.what\s*\(\s*\)\s*\)\s*;\s*"
+    r"cparams\.pipeline_parallel\s*=\s*pipeline_parallel_before_reserve\s*;\s*sched_matches_last_good\s*=\s*"
+    r'false\s*;\s*return\s*"compute buffers did not fit"\s*;\s*\}'
+)
+
+
 def test_in_loop_reserve_is_wrapped_in_try_catch():
     """llama.cpp-pyu4: the candidate's own sched_reserve() call -- distinct from the
     settle step's own reserve, which must stay unguarded (see
@@ -804,53 +775,56 @@ def test_in_loop_reserve_is_wrapped_in_try_catch():
     false. sched_reserve() throws "failed to allocate compute pp/tg
     buffers" when graph_reserve() fails even after its own host-pinned
     retry, and can also throw from inside resolve_fused_ops()'s call to
-    sycl_recheck_runtime_context_flash_attn() -- either must make this
-    candidate lose cleanly, not escape as an uncaught exception."""
+    sycl_recheck_runtime_context_flash_attn() or from memory-module
+    initialization -- any of these must make this candidate lose cleanly,
+    not escape as an uncaught exception. Because one stop reason covers
+    all of them, the catch must log e.what() (at INFO) before losing."""
     body_norm = _normalize_ws(_try_candidate_body())
-    assert re.search(
-        r"try\s*\{\s*sched_reserve\s*\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*&\s*\)\s*\{\s*"
-        r"cparams\.pipeline_parallel\s*=\s*pipeline_parallel_before_reserve\s*;\s*sched_matches_last_good\s*=\s*"
-        r'false\s*;\s*return\s*"compute buffers did not fit"\s*;\s*\}',
-        body_norm,
-    ), (
+    assert re.search(_IN_LOOP_RESERVE_WRAP_RE, body_norm), (
         "the in-loop candidate reserve must be wrapped in try { sched_reserve(); } catch (const std::exception "
-        '&) { ...; sched_matches_last_good = false; return "compute buffers did not fit"; }'
+        '& e) { LLAMA_LOG_INFO(..., e.what()); ...; sched_matches_last_good = false; '
+        'return "compute buffers did not fit"; }'
     )
 
 
-def test_in_loop_reserve_try_catch_has_a_mutation_witness():
+@pytest.mark.parametrize("mutation", ["unwrapped", "cause-not-logged"])
+def test_in_loop_reserve_try_catch_has_a_mutation_witness(mutation):
     """Mutation witness for the check above: proves it would actually
-    catch the try/catch being deleted, leaving a bare, unprotected
-    sched_reserve() call that would let a reserve failure escape as an
-    uncaught exception instead of a clean "compute buffers did not fit"
-    stop."""
+    catch the try/catch being deleted (a bare sched_reserve() that lets a
+    reserve failure escape), and the cause no longer being logged."""
     raw = LLAMA_CONTEXT_CPP
-    wrapped_block = (
-        "        const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;\n"
-        "        try {\n"
-        "            sched_reserve();\n"
-        "        } catch (const std::exception &) {\n"
-        "            cparams.pipeline_parallel = pipeline_parallel_before_reserve;\n"
-        "            sched_matches_last_good   = false;\n"
-        '            return "compute buffers did not fit";\n'
-        "        }\n"
-        "        sched_matches_last_good = true;\n"
+    wrapped = re.compile(
+        r"        try \{\n            sched_reserve\(\);\n        \} catch \(const std::exception & e\) \{\n"
+        r'.*?            return "compute buffers did not fit";\n        \}\n',
+        re.DOTALL,
     )
-    assert wrapped_block in raw, "mutation target not found -- update this witness to match the real source"
-    mutated_raw = raw.replace(
-        wrapped_block,
-        "        const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;\n"
-        "        sched_reserve();\n"
-        "        sched_matches_last_good = true;\n",
-        1,
-    )
+    assert len(wrapped.findall(raw)) == 1, "mutation target not found -- update this witness to match the real source"
+    if mutation == "unwrapped":
+        mutated_raw = wrapped.sub("        sched_reserve();\n", raw, count=1)
+    else:
+        log_call = re.compile(r"            LLAMA_LOG_INFO\(\"\[SYCL-PLAN\] auto n_ubatch candidate [^;]*;\n")
+        assert len(log_call.findall(raw)) == 1, "mutation target not found -- update this witness"
+        mutated_raw = log_call.sub("", raw, count=1)
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
-    assert not re.search(
-        r"try\s*\{\s*sched_reserve\s*\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*&\s*\)\s*\{",
-        mutated_body_norm,
-    ), "mutation witness is broken: deleting the try/catch should make the wrapped-reserve check fail"
+    assert not re.search(_IN_LOOP_RESERVE_WRAP_RE, mutated_body_norm), (
+        "mutation witness is broken: the mutant should make the wrapped-reserve check fail"
+    )
+
+
+def _settle_block(body_norm: str) -> str:
+    """The settle step: from its own gate up to the auto n_ubatch WARN."""
+    settle_start = body_norm.find("if (!sched_matches_last_good")
+    assert settle_start != -1, "could not find the settle step's own gate"
+    settle_end = body_norm.find('LLAMA_LOG_WARN("[SYCL-PLAN] auto n_ubatch=', settle_start)
+    assert settle_end != -1, "could not find the auto n_ubatch WARN after the settle step"
+    return body_norm[settle_start:settle_end]
+
+
+def _settle_reserve_is_unguarded(body_norm: str) -> bool:
+    settle = _settle_block(body_norm)
+    return "sched_reserve();" in settle and "try" not in settle and "catch" not in settle
 
 
 def test_settle_reserve_is_not_wrapped_in_try_catch():
@@ -859,14 +833,30 @@ def test_settle_reserve_is_not_wrapped_in_try_catch():
     propagate, matching today's behaviour for a context that does not fit
     at all (the same asymmetry test_settle_publish_is_not_wrapped_in_try_
     catch already pins for the settle's publish)."""
-    body_norm = _normalize_ws(_trial_body())
-    settle_start = body_norm.find("if (!sched_matches_last_good")
-    assert settle_start != -1, "could not find the settle step's own gate"
-    settle_block = body_norm[settle_start:]
-    settle_reserve_idx = settle_block.rfind("sched_reserve();")
-    assert settle_reserve_idx != -1, "could not find the settle step's own reserve call"
-    assert "try {" not in settle_block[:settle_reserve_idx + 40], (
+    assert _settle_reserve_is_unguarded(_normalize_ws(_trial_body())), (
         "the settle reserve must NOT be wrapped in try/catch -- its failure must propagate"
+    )
+
+
+def test_settle_reserve_unguarded_check_has_a_mutation_witness():
+    """Mutation witness for the check above: wrapping the settle's reserve
+    in try/catch must make it fail."""
+    raw = LLAMA_CONTEXT_CPP
+    settle_reserve = "        sched_need_reserve = true;\n        sched_reserve();\n    }\n"
+    assert raw.count(settle_reserve) == 1, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(
+        settle_reserve,
+        "        sched_need_reserve = true;\n"
+        "        try {\n"
+        "            sched_reserve();\n"
+        "        } catch (const std::exception &) {\n"
+        "        }\n"
+        "    }\n",
+        1,
+    )
+    assert mutated_raw != raw
+    assert not _settle_reserve_is_unguarded(_body_of(mutated_raw, _TRIAL_START, _TRIAL_END)), (
+        "mutation witness is broken: wrapping the settle reserve should make the unguarded check fail"
     )
 
 
@@ -957,40 +947,48 @@ def test_pipeline_parallel_restore_has_a_mutation_witness():
 # ---------------------------------------------------------------------------
 
 
-def test_ladder_skips_rungs_below_fallback_ubatch():
-    """llama.cpp-pyu4: the ladder loop must skip every rung strictly below
-    fallback_ubatch -- a rung the ladder never tries can never become
-    last_good, so this is what actually enforces the "never silently
-    shrink" contract for a raw-API caller's explicit n_ubatch."""
-    body_norm = _normalize_ws(_trial_body())
+def _floor_skip_precedes_the_attempt(body_norm: str) -> bool:
     loop_idx = body_norm.find("for (uint32_t c : ladder)")
     assert loop_idx != -1
     skip_idx = body_norm.find("if (c < fallback_ubatch) { continue; }", loop_idx)
-    assert skip_idx != -1, "the ladder loop must skip rungs strictly below fallback_ubatch"
+    tried_idx = body_norm.find("tried += (tried.empty() ? \"\" : \",\") + std::to_string(c);", loop_idx)
+    attempt_idx = body_norm.find("try_candidate(c)", loop_idx)
+    assert tried_idx != -1 and attempt_idx != -1, "could not find the loop's tried += and try_candidate(c)"
+    return skip_idx != -1 and skip_idx < tried_idx and skip_idx < attempt_idx
 
-    cache_resume_skip_idx = body_norm.find("if (c <= cache_resume_above) { continue; }", loop_idx)
-    assert cache_resume_skip_idx != -1 and cache_resume_skip_idx < skip_idx, (
-        "the fallback_ubatch floor skip must come after the cache_resume_above skip"
+
+def test_ladder_skips_rungs_below_fallback_ubatch():
+    """llama.cpp-pyu4: the ladder loop must skip every rung strictly below
+    fallback_ubatch BEFORE the rung is recorded in `tried` or attempted --
+    a rung the ladder never tries can never become last_good, so this is
+    what actually enforces the "never silently shrink" contract for a
+    raw-API caller's explicit n_ubatch, and a skip placed after `tried +=`
+    would also list rungs in the outcome WARN that were never tried."""
+    assert _floor_skip_precedes_the_attempt(_normalize_ws(_trial_body())), (
+        "the ladder loop must skip rungs strictly below fallback_ubatch before `tried +=` and try_candidate(c)"
     )
 
 
-def test_ladder_floor_skip_has_a_mutation_witness():
-    """Mutation witness for the check above: proves it would actually
-    catch the floor-skip being deleted (which would let the ladder pick a
-    rung below the caller's explicit n_ubatch, silently shrinking it)."""
+@pytest.mark.parametrize("mutation", ["deleted", "moved-below-tried"])
+def test_ladder_floor_skip_has_a_mutation_witness(mutation):
+    """Mutation witness for the check above: deleting the floor skip, or
+    moving it below `tried +=`, must make it fail."""
     raw = LLAMA_CONTEXT_CPP
     skip_block = (
         "        if (c < fallback_ubatch) {\n"
         "            continue;\n"
         "        }\n"
     )
-    assert skip_block in raw, "mutation target not found -- update this witness to match the real source"
+    tried_line = '        tried += (tried.empty() ? "" : ",") + std::to_string(c);\n'
+    assert raw.count(skip_block) == 1, "mutation target not found -- update this witness to match the real source"
+    assert raw.count(tried_line) == 1, "mutation anchor not found -- update this witness to match the real source"
     mutated_raw = raw.replace(skip_block, "", 1)
+    if mutation == "moved-below-tried":
+        mutated_raw = mutated_raw.replace(tried_line, tried_line + skip_block, 1)
     assert mutated_raw != raw
 
-    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    assert "if (c < fallback_ubatch)" not in mutated_body_norm, (
-        "mutation witness is broken: deleting the block should remove the floor-skip check"
+    assert not _floor_skip_precedes_the_attempt(_body_of(mutated_raw, _TRIAL_START, _TRIAL_END)), (
+        "mutation witness is broken: the mutant should make the floor-skip ordering check fail"
     )
 
 
@@ -1033,13 +1031,13 @@ _HAS_CANDIDATE_BOTH_BOUNDS_RE = (
 
 _EARLY_EXIT_RE = (
     r"if\s*\(\s*tried\.empty\s*\(\s*\)\s*&&\s*!\s*llama_auto_ubatch_ladder_has_candidate\s*\(\s*ladder\s*,\s*"
-    r"sizeof\s*\(\s*ladder\s*\)\s*/\s*sizeof\s*\(\s*ladder\[0\]\s*\)\s*,\s*fallback_ubatch\s*,\s*cap\s*\)\s*"
+    r"llama_auto_ubatch_ladder_size\s*,\s*fallback_ubatch\s*,\s*cap\s*\)\s*"
     r"\)\s*\{"
 )
 
 
 def test_ladder_has_candidate_checks_both_bounds():
-    """llama.cpp-pyu4 (G1): llama_auto_ubatch_ladder_has_candidate()
+    """llama.cpp-pyu4: llama_auto_ubatch_ladder_has_candidate()
     (src/llama-auto-ubatch.h) must count a rung only when floor <= rung <=
     cap. The ladder loop skips rungs under the floor AND breaks at the
     first rung over the cap, so dropping either half readmits a shape in
@@ -1075,19 +1073,22 @@ def test_ladder_has_candidate_one_bound_mutants_have_a_witness(mutant):
 def test_ladder_has_candidate_host_test_is_registered_and_uses_the_trial_ladder():
     """The executable witness must actually run under ctest, and its cases
     are only meaningful against the trial's own rungs (the 600/1000 case
-    needs 512 and 1024 to be adjacent rungs)."""
+    needs 512 and 1024 to be adjacent rungs), so it must read the header's
+    ladder rather than carry a copy."""
     assert re.search(r"^\s*llama_build_and_test\(\s*test-auto-ubatch-ladder\.cpp\b", TESTS_CMAKELISTS, re.M), (
         "tests/CMakeLists.txt must register test-auto-ubatch-ladder.cpp with llama_build_and_test"
     )
-    assert re.search(
-        r"static\s+const\s+uint32_t\s+ladder\s*\[\s*\]\s*=\s*\{\s*512\s*,\s*1024\s*,\s*2048\s*,\s*4096\s*\}\s*;",
-        TEST_AUTO_UBATCH_LADDER_CPP,
-    ), "the host test's ladder must equal the trial's { 512, 1024, 2048, 4096 }"
-    assert '#include "../src/llama-auto-ubatch.h"' in TEST_AUTO_UBATCH_LADDER_CPP
+    code = strip_comments(TEST_AUTO_UBATCH_LADDER_CPP)
+    assert '#include "../src/llama-auto-ubatch.h"' in code
+    assert re.search(r"=\s*llama_auto_ubatch_ladder\s*;", code), "the host test must use llama_auto_ubatch_ladder"
+    assert re.search(r"=\s*llama_auto_ubatch_ladder_size\s*;", code), (
+        "the host test must use llama_auto_ubatch_ladder_size"
+    )
+    assert not re.search(r"\{\s*512\s*,", code), "the host test must not carry its own copy of the ladder"
 
 
 def test_no_candidate_rung_exits_before_the_loop_with_no_warn():
-    """llama.cpp-pyu4 (G1): the trial must exit before the ladder loop
+    """llama.cpp-pyu4: the trial must exit before the ladder loop
     when no rung lies in [fallback_ubatch, cap] and no cache candidate was
     tried this trial -- gated on tried.empty() &&
     !llama_auto_ubatch_ladder_has_candidate(ladder, ..., fallback_ubatch,
@@ -1110,7 +1111,7 @@ def test_no_candidate_rung_exits_before_the_loop_with_no_warn():
     exit_match = re.search(_EARLY_EXIT_RE, body_norm)
     assert exit_match is not None, (
         "there must be an early exit gated on tried.empty() && "
-        "!llama_auto_ubatch_ladder_has_candidate(ladder, sizeof(ladder) / sizeof(ladder[0]), fallback_ubatch, cap)"
+        "!llama_auto_ubatch_ladder_has_candidate(ladder, llama_auto_ubatch_ladder_size, fallback_ubatch, cap)"
     )
     assert cache_warn_idx < exit_match.start() < loop_idx, (
         "the no-candidate early exit must come after the tuning-cache WARN and before the ladder loop"
@@ -1125,8 +1126,7 @@ def test_no_candidate_rung_exits_before_the_loop_with_no_warn():
 
 _EARLY_EXIT_BLOCK = (
     "    if (tried.empty() &&\n"
-    "        !llama_auto_ubatch_ladder_has_candidate(ladder, sizeof(ladder) / sizeof(ladder[0]), "
-    "fallback_ubatch, cap)) {\n"
+    "        !llama_auto_ubatch_ladder_has_candidate(ladder, llama_auto_ubatch_ladder_size, fallback_ubatch, cap)) {\n"
     "        sched_reserve();\n"
     "        return;\n"
     "    }\n"
@@ -1139,14 +1139,13 @@ _EARLY_EXIT_BLOCK = (
         # deleted outright: the loop runs with nothing to try
         "",
         # the narrower last-rung form, which misses the 600/1000 and MoE shapes
-        "    if (tried.empty() && fallback_ubatch > ladder[sizeof(ladder) / sizeof(ladder[0]) - 1]) {\n"
+        "    if (tried.empty() && fallback_ubatch > ladder[llama_auto_ubatch_ladder_size - 1]) {\n"
         "        sched_reserve();\n"
         "        return;\n"
         "    }\n",
         # the cap argument swapped for the largest rung
         "    if (tried.empty() &&\n"
-        "        !llama_auto_ubatch_ladder_has_candidate(ladder, sizeof(ladder) / sizeof(ladder[0]), "
-        "fallback_ubatch, 4096)) {\n"
+        "        !llama_auto_ubatch_ladder_has_candidate(ladder, llama_auto_ubatch_ladder_size, fallback_ubatch, 4096)) {\n"
         "        sched_reserve();\n"
         "        return;\n"
         "    }\n",
