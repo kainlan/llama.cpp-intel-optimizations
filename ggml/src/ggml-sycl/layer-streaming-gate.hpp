@@ -8,7 +8,6 @@
 // placement plan, so test-layer-streaming-gate can exercise it host-only.
 
 #include <cstddef>
-#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
