@@ -1559,10 +1559,13 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         // candidate before device 1 refused), so the published plan can
         // no longer be trusted to describe last_good on ANY device --
         // marking sched_matches_last_good false forces the settle step
-        // below to unconditionally re-publish last_good on every device,
-        // not just the one that refused. Nothing new is logged here at
-        // WARN or above -- the transaction's own publish path already
-        // logged its ERROR for the refusal.
+        // below to re-reserve last_good, and to re-publish it on every
+        // device (not just the one that refused) whenever need_publish
+        // holds. need_publish is false only when this candidate was
+        // fallback_ubatch itself, and then every device's plan -- partially
+        // published or not -- still describes fallback_ubatch. Nothing new
+        // is logged here at WARN or above -- the transaction's own publish
+        // path already logged its ERROR for the refusal.
         try {
             sycl_resync_runtime_context_flash_attn();
         } catch (const std::exception &) {
@@ -1881,43 +1884,42 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // the same value again would be a redundant runtime-context transaction
     // with no state change (the scenario this finding reported).
     //
-    // The first rung tried is the smallest rung >=
-    // fallback_ubatch (the loop skips rungs under the floor), so it equals
-    // fallback_ubatch only when fallback_ubatch is itself a rung. In that
-    // case a first-rung loss on the host-fallback check leaves last_good ==
-    // fallback_ubatch == the rung that just lost (the "last_good == 0"
-    // branch above), so this gate still fires (sched_matches_last_good is
-    // false) and re-publishes/re-reserves the identical value -- one wasted
-    // transaction+reserve cycle, not a wrong one. When fallback_ubatch sits
-    // between rungs, that losing rung was published above it, so the same
-    // cycle is needed to put fallback_ubatch back. This is deliberately NOT
-    // narrowed to also skip whenever cparams.n_ubatch == last_good:
-    // sched_matches_last_good is also set false by a partial multi-device
-    // publish failure (a losing candidate's publish can throw after already
-    // succeeding on an earlier device -- see try_candidate()'s own comment
-    // on that), and in that case cparams.n_ubatch can coincidentally equal
-    // last_good while the sched genuinely does NOT describe it consistently
-    // across every backend. The value alone cannot distinguish those two
-    // cases without also carrying which reason set the flag false, so this
-    // gate stays conservative and only skips when sched_matches_last_good
-    // is actually true -- the settle-skipped condition must still imply the
-    // ring and plan describe the winner.
+    // The first rung tried is the smallest rung >= fallback_ubatch (the loop
+    // skips rungs under the floor), so it equals fallback_ubatch only when
+    // fallback_ubatch is itself a rung. In that case a first-rung loss on the
+    // host-fallback check leaves last_good == fallback_ubatch == the rung that
+    // just lost (the "last_good == 0" branch above), so this gate still fires
+    // (sched_matches_last_good is false) and re-publishes/re-reserves the
+    // identical value -- one wasted transaction+reserve cycle, not a wrong one.
+    // When fallback_ubatch sits between rungs, that losing rung was published
+    // above it, so the same cycle is needed to put fallback_ubatch back. This
+    // is deliberately NOT narrowed to also skip whenever cparams.n_ubatch ==
+    // last_good: sched_matches_last_good is also set false by a partial
+    // multi-device publish failure (a losing candidate's publish can throw
+    // after already succeeding on an earlier device -- see try_candidate()'s
+    // own comment on that), and in that case cparams.n_ubatch can
+    // coincidentally equal last_good while the sched genuinely does NOT
+    // describe it consistently across every backend. The value alone cannot
+    // distinguish those two cases without also carrying which reason set the
+    // flag false, so this gate stays conservative and only skips when
+    // sched_matches_last_good is actually true -- the settle-skipped condition
+    // must still imply the ring and plan describe the winner.
     //
-    // The ring's state after a probe whose rollback failed is ARITHMETIC,
-    // not something this gate has to know about structurally. Every
-    // candidate tried, cached or ladder, is >= fallback_ubatch (the cache
-    // lookup rejects a smaller value and the loop skips rungs below it), so
-    // such a failure leaves the ring sized for a value >= fallback_ubatch.
-    // If need_publish is false (nothing published and cparams.n_ubatch
-    // still fallback_ubatch), no candidate won, so last_good is
-    // fallback_ubatch and the settle re-reserves it without republishing:
-    // the ring is exact when the failed candidate was fallback_ubatch and
-    // oversized, never undersized, otherwise. When need_publish is true the
-    // settle republishes and re-plans regardless -- including after a
-    // candidate's publish threw, which leaves published_any false but
-    // cparams.n_ubatch at that candidate (it is set before the publish). The
-    // settle's own publish gate never inspects the ring directly -- it does
-    // not need to.
+    // The ring's state after a probe whose rollback failed is ARITHMETIC, not
+    // something this gate has to know about structurally. Every candidate
+    // tried, cached or ladder, is >= fallback_ubatch (the cache lookup rejects
+    // a smaller value and the loop skips rungs below it), so such a failure
+    // leaves the ring sized for a value >= fallback_ubatch. If need_publish is
+    // false (published_any false and cparams.n_ubatch still fallback_ubatch --
+    // at most a partial publish of fallback_ubatch itself), no candidate won,
+    // so last_good is fallback_ubatch and the settle re-reserves it without
+    // republishing: the ring is exact when the failed candidate was
+    // fallback_ubatch and oversized, never undersized, otherwise. When
+    // need_publish is true the settle republishes and re-plans regardless --
+    // including after the publish of a candidate above fallback_ubatch threw,
+    // which leaves published_any false but cparams.n_ubatch at that candidate
+    // (it is set before the publish). The settle's own publish gate never
+    // inspects the ring directly -- it does not need to.
     if (!sched_matches_last_good || cparams.n_ubatch != last_good) {
         const bool need_publish = published_any || cparams.n_ubatch != fallback_ubatch;
         cparams.n_ubatch        = last_good;
