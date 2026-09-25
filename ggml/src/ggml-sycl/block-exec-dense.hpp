@@ -157,6 +157,13 @@ enum dense_graph_off {
     DENSE_GRAPH_OFF_NONE = 0,
     DENSE_GRAPH_OFF_ENV,            // GGML_SYCL_BLOCK_EXEC_DENSE_GRAPH=0
     DENSE_GRAPH_OFF_DISABLE_GRAPH,  // GGML_SYCL_DISABLE_GRAPH
+    // Diagnostics that wait on or read back from the queue inside the node
+    // loop, which a recording queue refuses (the eval would fail).
+    DENSE_GRAPH_OFF_SAFE_MODE,      // GGML_SYCL_SAFE_MODE (also implies DISABLE_GRAPH at init)
+    DENSE_GRAPH_OFF_OP_TIMING,      // GGML_SYCL_OP_TIMING: a queue wait around every op
+    DENSE_GRAPH_OFF_DEBUG_SYNC,     // GGML_SYCL_DEBUG_SYNC, _OPS or _NAMES: a wait after the matched ops
+    DENSE_GRAPH_OFF_NAN_CHECK,      // GGML_SYCL_NAN_CHECK: a readback after every float op
+    DENSE_GRAPH_OFF_TENSOR_TRACE,   // GGML_SYCL_TENSOR_TRACE, _TG_TRACE_HASH, _TG_DUMP_*: readbacks
     DENSE_GRAPH_OFF_MULTITHREADED,  // graphs computed from several threads
     DENSE_GRAPH_OFF_DISABLED,       // graphs disabled on the context, or a range recording failed
     DENSE_GRAPH_OFF_NOT_DECODE,     // only decode graphs record
@@ -164,6 +171,7 @@ enum dense_graph_off {
     DENSE_GRAPH_OFF_FA_UNVERIFIED,  // the whole-graph FA gate refuses
     DENSE_GRAPH_OFF_INCOMPATIBLE,   // check_graph_compatibility refuses
     DENSE_GRAPH_OFF_STAGE_FAILED,   // the executor fell back to the per-op path
+    DENSE_GRAPH_OFF_LAST = DENSE_GRAPH_OFF_STAGE_FAILED,
 };
 
 inline const char * dense_exec_graph_off_name(dense_graph_off reason) {
@@ -174,6 +182,16 @@ inline const char * dense_exec_graph_off_name(dense_graph_off reason) {
             return "env";
         case DENSE_GRAPH_OFF_DISABLE_GRAPH:
             return "disable-graph";
+        case DENSE_GRAPH_OFF_SAFE_MODE:
+            return "safe-mode";
+        case DENSE_GRAPH_OFF_OP_TIMING:
+            return "op-timing";
+        case DENSE_GRAPH_OFF_DEBUG_SYNC:
+            return "debug-sync";
+        case DENSE_GRAPH_OFF_NAN_CHECK:
+            return "nan-check";
+        case DENSE_GRAPH_OFF_TENSOR_TRACE:
+            return "tensor-trace";
         case DENSE_GRAPH_OFF_MULTITHREADED:
             return "multithreaded";
         case DENSE_GRAPH_OFF_DISABLED:
@@ -202,6 +220,11 @@ enum dense_graph_fa_mode {
 struct dense_graph_facts {
     bool                enabled             = false;
     bool                disable_graph       = false;
+    bool                safe_mode           = false;
+    bool                op_timing           = false;
+    bool                debug_sync          = false;
+    bool                nan_check           = false;
+    bool                tensor_trace        = false;
     bool                multithreaded       = false;
     bool                disabled            = false;
     bool                is_decode           = false;
@@ -222,6 +245,21 @@ inline dense_graph_off dense_exec_graph_first_off(const dense_graph_facts & f) {
     }
     if (f.disable_graph) {
         return DENSE_GRAPH_OFF_DISABLE_GRAPH;
+    }
+    if (f.safe_mode) {
+        return DENSE_GRAPH_OFF_SAFE_MODE;
+    }
+    if (f.op_timing) {
+        return DENSE_GRAPH_OFF_OP_TIMING;
+    }
+    if (f.debug_sync) {
+        return DENSE_GRAPH_OFF_DEBUG_SYNC;
+    }
+    if (f.nan_check) {
+        return DENSE_GRAPH_OFF_NAN_CHECK;
+    }
+    if (f.tensor_trace) {
+        return DENSE_GRAPH_OFF_TENSOR_TRACE;
     }
     if (f.multithreaded) {
         return DENSE_GRAPH_OFF_MULTITHREADED;

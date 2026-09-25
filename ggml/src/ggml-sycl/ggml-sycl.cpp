@@ -80088,6 +80088,40 @@ static bool ggml_sycl_selective_debug_sync_enabled(const ggml_tensor * node) {
     return ggml_sycl_env_list_matches(names, node->name);
 }
 
+// Whether any node can take the debug sync after it: the global switch, or a
+// non-empty GGML_SYCL_DEBUG_SYNC_OPS / _NAMES list.
+static bool ggml_sycl_debug_sync_any_enabled() {
+    const char * ops   = std::getenv("GGML_SYCL_DEBUG_SYNC_OPS");
+    const char * names = std::getenv("GGML_SYCL_DEBUG_SYNC_NAMES");
+    return g_ggml_sycl_debug_sync != 0 || (ops && *ops) || (names && *names);
+}
+
+// GGML_SYCL_OP_TIMING: 0 off, 1 a queue wait around every op, 2 also per-op detail.
+static int ggml_sycl_op_timing_mode() {
+    static const int mode = [] {
+        const char * env = std::getenv("GGML_SYCL_OP_TIMING");
+        return env ? std::atoi(env) : 0;
+    }();
+    return mode;
+}
+
+// GGML_SYCL_NAN_CHECK: read every float node back after it runs. Opt-in,
+// because it adds device->host copies per node.
+static bool ggml_sycl_nan_check_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_NAN_CHECK");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// GGML_SYCL_TENSOR_TRACE: the node-name substring whose output is read back
+// and summarised; nullptr when unset.
+static const char * ggml_sycl_tensor_trace_pattern() {
+    static const char * pattern = std::getenv("GGML_SYCL_TENSOR_TRACE");
+    return pattern && *pattern ? pattern : nullptr;
+}
+
 static bool ggml_sycl_non_fa_attn_sync_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_NON_FA_ATTN_SYNC");
@@ -89315,6 +89349,15 @@ class ggml_sycl_block_exec_dense_run {
         }
         f.enabled       = ggml_sycl_block_exec_dense_graph_enabled();
         f.disable_graph = g_ggml_sycl_disable_graph != 0;
+        // The diagnostics that wait on or read back from the queue inside the
+        // node loop; recording would turn each into a failed eval.
+        init_sycl_tg_trace();
+        f.safe_mode    = g_ggml_sycl_safe_mode != 0;
+        f.op_timing    = ggml_sycl_op_timing_mode() != 0;
+        f.debug_sync   = ggml_sycl_debug_sync_any_enabled();
+        f.nan_check    = ggml_sycl_nan_check_enabled();
+        f.tensor_trace = ggml_sycl_tensor_trace_pattern() != nullptr || g_sycl_tg_trace_hash || g_sycl_tg_dump_rms ||
+                         g_sycl_tg_dump_matmul || g_sycl_tg_dump_mul || g_sycl_tg_dump_add;
         f.multithreaded = g_sycl_graph_multithreaded.load(std::memory_order_relaxed);
         f.disabled      = ctx_.graphs_disabled || state().graphs_disabled;
         f.host_inputs_blocked =
@@ -91561,17 +91604,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     if (g_sycl_tp_config.is_multiprocess && g_ggml_sycl_tp_debug) {
         fprintf(stderr, "[RANK %d] GRAPH_COMPUTE_IMPL: starting node loop\n", g_sycl_tp_config.mpi_rank);
     }
-    // Optional NaN-first-occurrence debugging. This is intentionally gated behind
-    // an environment variable because it adds device->host copies per node.
-    auto nan_check_enabled = []() {
-        static int enabled = -1;
-        if (enabled < 0) {
-            const char * env = std::getenv("GGML_SYCL_NAN_CHECK");
-            enabled          = (env != nullptr && std::atoi(env) != 0) ? 1 : 0;
-        }
-        return enabled != 0;
-    };
-    const bool do_nan_check = nan_check_enabled();
+    // Optional NaN-first-occurrence debugging.
+    const bool do_nan_check = ggml_sycl_nan_check_enabled();
     GGML_SYCL_DEBUG("[DEBUG-IMPL] Starting node loop, n_nodes=%d\n", cgraph->n_nodes);
     // One-shot graph histogram (first TG-sized graph only), opt-in diagnostic.
     if (const char * env = std::getenv("GGML_SYCL_GRAPH_HIST"); env && std::atoi(env) != 0) {
@@ -92949,10 +92983,7 @@ gpu_dispatch:
             // Per-op timing: GGML_SYCL_OP_TIMING=1 forces queue sync after each op
             // to measure GPU execution time.  Destroys pipeline parallelism — use
             // only for profiling, never in production.
-            static const int op_timing_mode = [] {
-                const char * env = std::getenv("GGML_SYCL_OP_TIMING");
-                return env ? std::atoi(env) : 0;
-            }();
+            const int op_timing_mode = ggml_sycl_op_timing_mode();
 
             std::chrono::high_resolution_clock::time_point t_op_start;
             if (op_timing_mode) {
@@ -93556,7 +93587,7 @@ gpu_dispatch:
                 }
             }
             {
-                static const char * tensor_trace_pattern = std::getenv("GGML_SYCL_TENSOR_TRACE");
+                const char *        tensor_trace_pattern = ggml_sycl_tensor_trace_pattern();
                 static const int    tensor_trace_limit   = [] {
                     const char * env = std::getenv("GGML_SYCL_TENSOR_TRACE_LIMIT");
                     return env ? std::atoi(env) : 256;

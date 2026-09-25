@@ -242,7 +242,7 @@ static void test_graph_off_reasons() {
     f.is_decode = false;
     check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NOT_DECODE, "force-on does not reach prefill");
 
-    for (int r = DENSE_GRAPH_OFF_NONE; r <= DENSE_GRAPH_OFF_STAGE_FAILED; ++r) {
+    for (int r = DENSE_GRAPH_OFF_NONE; r <= DENSE_GRAPH_OFF_LAST; ++r) {
         const char * name = dense_exec_graph_off_name(static_cast<dense_graph_off>(r));
         check(name != nullptr && std::strcmp(name, "unknown") != 0, "every reason has a name: " + std::to_string(r));
         for (int q = DENSE_GRAPH_OFF_NONE; q < r; ++q) {
@@ -250,6 +250,52 @@ static void test_graph_off_reasons() {
                   "reason names are distinct: " + std::to_string(r));
         }
     }
+}
+
+// A diagnostic env that waits on or reads back from the queue inside the node
+// loop cannot run while that loop is being recorded: the eval would fail. Each
+// keeps the ranges on direct dispatch, ahead of every graph-shape reason.
+static void test_graph_off_debug_envs() {
+    auto decode = [] {
+        dense_graph_facts f{};
+        f.enabled   = true;
+        f.is_decode = true;
+        return f;
+    };
+    check(dense_exec_graph_first_off(decode()) == DENSE_GRAPH_OFF_NONE, "the base facts record");
+
+    dense_graph_facts f = decode();
+    f.safe_mode         = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_SAFE_MODE, "GGML_SYCL_SAFE_MODE");
+    f.disable_graph = true;  // what SAFE_MODE sets at init; the older reason names it
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_DISABLE_GRAPH, "SAFE_MODE's implied disable_graph");
+
+    f           = decode();
+    f.op_timing = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_OP_TIMING, "GGML_SYCL_OP_TIMING");
+
+    f            = decode();
+    f.debug_sync = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_DEBUG_SYNC, "GGML_SYCL_DEBUG_SYNC(_OPS|_NAMES)");
+
+    f           = decode();
+    f.nan_check = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_NAN_CHECK, "GGML_SYCL_NAN_CHECK");
+
+    f              = decode();
+    f.tensor_trace = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_TENSOR_TRACE, "tensor readback traces");
+
+    // Ahead of the reasons that depend on the graph: a diagnostic run names
+    // the diagnostic even on prefill or with the context's graphs disabled.
+    f               = decode();
+    f.op_timing     = true;
+    f.is_decode     = false;
+    f.disabled      = true;
+    f.multithreaded = true;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_OP_TIMING, "a diagnostic outranks the graph reasons");
+    f.enabled = false;
+    check(dense_exec_graph_first_off(f) == DENSE_GRAPH_OFF_ENV, "the kill switch still comes first");
 }
 
 // The case the executor exists for: three ranges, layers 2-3 plus the final
@@ -615,6 +661,7 @@ int main() {
         { "violation-original-writes-executor-result",  test_violation_original_range_writes_executor_result },
         { "control-resident-on-executor-is-not-staged", test_control_resident_on_executor_is_not_staged      },
         { "graph-off-reasons",                          test_graph_off_reasons                               },
+        { "graph-off-debug-envs",                       test_graph_off_debug_envs                            },
     };
 
     int failed = 0;
