@@ -81,10 +81,7 @@ kv_demotion_result plan_device_kv_fit(const kv_device_fit_input & in) {
         one.layer_kv_bytes[l] = bytes;
         kv_bytes += bytes;
     }
-    if (in.non_kv_bytes > SIZE_MAX - kv_bytes) {
-        return overflow;
-    }
-    one.vram_bytes = in.non_kv_bytes + kv_bytes;
+    one.vram_bytes = kv_bytes;
     return plan_runtime_kv_demotion(one);
 }
 

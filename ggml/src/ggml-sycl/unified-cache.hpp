@@ -989,8 +989,8 @@ struct placement_plan {
     int layer_range_kv_device(int start_layer, int end_layer) const {
         const size_t        n_layers = end_layer >= 0 ? static_cast<size_t>(end_layer) + 1 : 0;
         std::vector<int>    owners(n_layers, -1);
-        std::vector<size_t> bytes(n_layers, 0);
-        for (size_t l = 0; l < n_layers; ++l) {
+        std::vector<size_t> bytes(n_layers, 0);  // 0: layers before start_layer do not vote
+        for (size_t l = static_cast<size_t>(std::max(start_layer, 0)); l < n_layers; ++l) {
             owners[l] = get_kv_device(static_cast<int>(l));
             bytes[l]  = kv_size_for_layer(static_cast<uint32_t>(l));
         }
@@ -6611,9 +6611,11 @@ size_t unified_cache_kv_arena_used(int device_id);
 // and every zone grew. The planned weight bytes under-count that
 // (llama.cpp-jehw), so KV is never admitted against the capacity above: the
 // runtime-context transaction, its non-publishing probe and the tiered KV
-// allocator all admit against this one number.
+// allocator all admit against this one number. `multi_device` is the same
+// flag: a multi-device plan in GLOBAL mode has no per-device zone to read
+// (kv_reads_device_arena()), so it gets the budget-based headroom.
 size_t unified_cache_kv_weight_capacity(int device_id, size_t vram_budget, bool multi_device);
-size_t unified_cache_kv_vram_available(int device_id);
+size_t unified_cache_kv_vram_available(int device_id, bool multi_device);
 
 // Sum of zone_used(KV) + zone_used(ONEDNN) + zone_used(RUNTIME) + zone_used(SCRATCH).
 // Returns 0 when arena is inactive.

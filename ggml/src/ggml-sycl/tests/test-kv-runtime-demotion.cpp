@@ -34,6 +34,8 @@ using ggml_sycl::kv_buffer_layer_owner;
 using ggml_sycl::kv_demotion_input;
 using ggml_sycl::kv_demotion_result;
 using ggml_sycl::kv_device_fit_input;
+using ggml_sycl::kv_hot_layers_override_active;
+using ggml_sycl::kv_reads_device_arena;
 using ggml_sycl::kv_residency_input;
 using ggml_sycl::kv_residency_needs_refit;
 using ggml_sycl::kv_shape;
@@ -160,14 +162,15 @@ int main() {
     }
     // 10. The measured split (Mistral 7B, n_ctx=2048): device 0 holds layers
     // 0-29 with 3683.8 MB of weights in a 3856 MB zone, device 1 holds 30-31.
-    // 172.2 MB of room fits 21 of device 0's 8 MB layers, so exactly 21..29
-    // demote, and device 1's layers are never touched by device 0's pass.
+    // As plan_runtime_kv_residency() calls it, the capacity is the live KV
+    // headroom the weights left (172.2 MB) less the slack of the 30 resident
+    // layers, which fits 21 of device 0's 8 MB layers: exactly 21..29 demote,
+    // and device 1's layers are never touched by device 0's pass.
     {
         const size_t        mb = 1024 * 1024;
         kv_device_fit_input in;
-        in.device       = 0;
-        in.capacity     = 3856 * mb;
-        in.non_kv_bytes = 3683 * mb + 819 * mb / 1000;
+        in.device   = 0;
+        in.capacity = (3856 * mb - (3683 * mb + 819 * mb / 1000)) - 30 * kv_alloc_slack_per_layer;
         in.layer_kv_bytes.assign(32, 8 * mb);
         in.kv_device.assign(32, 0);
         in.kv_device[30] = 1;
@@ -180,10 +183,9 @@ int main() {
         CHECK_EQ(r.demoted_layers.back(), 21, "case 10: stops at layer 21");
         CHECK_EQ(r.host_kv_bytes_added, 72 * mb, "case 10: 72 MB of KV moves to host");
 
-        in.device       = 1;
-        in.capacity     = 676 * mb;
-        in.non_kv_bytes = 234 * mb;
-        auto r1         = plan_device_kv_fit(in);
+        in.device   = 1;
+        in.capacity = (676 * mb - 234 * mb) - 2 * kv_alloc_slack_per_layer;
+        auto r1     = plan_device_kv_fit(in);
         CHECK(r1.fits, "case 10: device 1 fits");
         CHECK(r1.demoted_layers.empty(), "case 10: device 1 demotes nothing");
     }
@@ -191,9 +193,8 @@ int main() {
     {
         const size_t        mb = 1024 * 1024;
         kv_device_fit_input in;
-        in.device       = 0;
-        in.capacity     = 3856 * mb;
-        in.non_kv_bytes = 3683 * mb + 819 * mb / 1000;
+        in.device   = 0;
+        in.capacity = (3856 * mb - (3683 * mb + 819 * mb / 1000)) - 30 * kv_alloc_slack_per_layer;
         in.layer_kv_bytes.assign(32, 4 * mb);
         in.kv_device.assign(32, 0);
         in.kv_device[30] = 1;
@@ -203,18 +204,20 @@ int main() {
         CHECK(r.fits, "case 11: fits");
         CHECK(r.demoted_layers.empty(), "case 11: nothing demoted");
     }
-    // 12. Weights alone over capacity: demoting every full-attention layer
-    // cannot help, and the result says so instead of claiming a fit.
+    // 12. No KV headroom left at all (the weights filled the zone): every layer
+    // moves to the host tier and the context still fits, with no KV on the
+    // device -- never shrink context.
     {
         kv_device_fit_input in;
-        in.device       = 0;
-        in.capacity     = 100;
-        in.non_kv_bytes = 150;
+        in.device   = 0;
+        in.capacity = 0;
         in.layer_kv_bytes.assign(2, 10);
         in.kv_device.assign(2, 0);
         in.swa_layer_mask.assign(2, 0);
         auto r = plan_device_kv_fit(in);
-        CHECK(!r.fits, "case 12: cannot fit");
+        CHECK(r.fits, "case 12: fits with every layer on the host tier");
+        CHECK_EQ(r.demoted_layers.size(), 2, "case 12: both layers demoted");
+        CHECK_EQ(r.vram_bytes_after, 0, "case 12: no KV left on the device");
     }
     // 13. A block's KV owner: the one device every KV-holding layer uses, -2
     // when they disagree (a demoted layer inside a device block), -1 with no
@@ -420,6 +423,48 @@ int main() {
         CHECK_EQ(kv_vram_available(true, 0, 4096), 0, "case 21: a full KV zone is not a missing arena");
         CHECK_EQ(kv_vram_available(true, 512, 4096), 512, "case 21: the arena's KV zone");
         CHECK_EQ(kv_vram_available(false, 0, 4096), 4096, "case 21: no arena, the budget headroom");
+    }
+    // 22. On a split, each device's backend publishes the same context, and
+    // each backend is not yet admitted, so each re-fits. All of them publish
+    // before llama_kv_cache allocates that KV, so every re-fit restarts from the
+    // load residency against the same headroom and gets the same answer: the
+    // second demotes no more than the first. Were one to run after the KV is
+    // allocated, the headroom would no longer include it and it would demote
+    // more; that ordering is pinned on the source
+    // (test-sycl-kv-layer-sizing-source.py).
+    {
+        kv_residency_input in;
+        in.load_kv_device = { 0, 0, 0, 1, 1, 1 };
+        in.layer_kv_bytes = { 64, 64, 64, 64, 64, 64 };
+        in.swa_layer_mask = { 0, 0, 0, 0, 0, 0 };
+        in.devices        = { 0, 1 };
+        in.available      = { 128 + 3 * kv_alloc_slack_per_layer, 192 + 3 * kv_alloc_slack_per_layer };
+        auto first        = plan_runtime_kv_residency(in);
+        auto second       = plan_runtime_kv_residency(in);
+        CHECK(first.fits && second.fits, "case 22: both re-fits fit");
+        CHECK(first.kv_device == second.kv_device, "case 22: the second backend's re-fit keeps the first's residency");
+        CHECK_EQ(first.per_device[0].demoted_layers.size(), 1, "case 22: device 0 demotes one layer");
+
+        in.available[0] -= 2 * 64;  // after allocation: the headroom no longer includes the two resident layers
+        auto late = plan_runtime_kv_residency(in);
+        CHECK(late.per_device[0].demoted_layers.size() > first.per_device[0].demoted_layers.size(),
+              "case 22: a re-fit after allocation would demote more");
+    }
+    // 23. GGML_SYCL_KV_HOT_LAYERS is read by value, as the tier manager reads
+    // it: a count >= 0 overrides, -1 (or unset) does not.
+    {
+        CHECK(!kv_hot_layers_override_active(nullptr), "case 23: unset");
+        CHECK(!kv_hot_layers_override_active("-1"), "case 23: -1 means off");
+        CHECK(kv_hot_layers_override_active("0"), "case 23: 0 hot layers is an override");
+        CHECK(kv_hot_layers_override_active("16"), "case 23: 16 hot layers");
+    }
+    // 24. Only a multi-device plan in GLOBAL cache mode reads no per-device
+    // arena; every other combination reads the device's own zones.
+    {
+        CHECK(!kv_reads_device_arena(true, true), "case 24: multi-device GLOBAL has one zone for all devices");
+        CHECK(kv_reads_device_arena(true, false), "case 24: multi-device PER_DEVICE");
+        CHECK(kv_reads_device_arena(false, true), "case 24: single-device GLOBAL");
+        CHECK(kv_reads_device_arena(false, false), "case 24: single-device PER_DEVICE");
     }
     std::printf("test-kv-runtime-demotion: all ok\n");
     return 0;

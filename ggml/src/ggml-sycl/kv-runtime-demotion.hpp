@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace ggml_sycl {
@@ -51,8 +52,9 @@ struct kv_demotion_result {
 // Pure decision: which device-resident KV layers must move to the host tier so
 // vram_bytes fits vram_budget. Full-attention layers first, latest first; then,
 // with demote_swa, SWA layers, latest first. Already-host layers and layers
-// with 0 recorded bytes (nothing to move) are never touched. Does NOT mutate any plan -- the caller (ggml-sycl.cpp runtime
-// update) applies the result to placement_plan::kv_device.
+// with 0 recorded bytes (nothing to move) are never touched. Does NOT mutate
+// any plan -- the caller (ggml-sycl.cpp runtime update) applies the result to
+// placement_plan::kv_device.
 kv_demotion_result plan_runtime_kv_demotion(const kv_demotion_input & in);
 
 // How many bytes of weights plus KV one device can hold before anything is
@@ -72,12 +74,22 @@ inline size_t kv_vram_available(bool has_arena, size_t zone_available, size_t bu
     return has_arena ? zone_available : budget_available;
 }
 
-// Headroom runtime KV admission reserves per device-resident layer, so that a
-// set of layers admitted against the allocator's live headroom still fits when
-// the tiered KV allocator places them one allocation at a time, possibly across
-// two KV buffers. It covers the arena allocator rounding every allocation up to
-// its 256-byte block and the tiered allocator's 512-byte layer alignment, with
-// room to spare; test-kv-runtime-demotion pins it against the allocator itself.
+// Whether a device's KV capacity and headroom come from its own arena zones. A
+// multi-device plan in GLOBAL cache mode has one cache, and so one KV zone, for
+// every device: reading it per device would admit each device independently
+// against the same zone, so both KV questions use the budget path instead.
+inline bool kv_reads_device_arena(bool multi_device, bool global_cache_mode) {
+    return !(multi_device && global_cache_mode);
+}
+
+// Headroom runtime KV admission reserves per device-resident layer for the
+// tiered KV allocator placing them one allocation at a time, possibly across
+// two KV buffers: the arena allocator rounds every allocation up to its 256-byte
+// block and the tiered allocator aligns each layer to 512 bytes;
+// test-kv-runtime-demotion pins it against the allocator itself. Admission is a
+// byte count over zone_available(), so a fragmented or multi-chunk zone whose
+// largest free extent is smaller than a layer can still refuse, loudly, at
+// per-layer allocation.
 constexpr size_t kv_alloc_slack_per_layer = 64 * 1024;
 
 // The KV cache's shape as far as its size is concerned.
@@ -113,6 +125,12 @@ bool kv_shape_changed(const kv_shape & published, const kv_shape & next);
 // with interleaved publishes can reach it: that is same-device concurrent
 // contexts, which are unsupported (canonical memory contract §5).
 bool kv_residency_needs_refit(const kv_shape & published, const kv_shape & next, bool context_admitted);
+
+// GGML_SYCL_KV_HOT_LAYERS by value: a count >= 0 overrides the tier layout;
+// unset or negative (-1) leaves it to the tier manager (kv-tier-manager.cpp).
+inline bool kv_hot_layers_override_active(const char * value) {
+    return value != nullptr && std::atoi(value) >= 0;
+}
 
 // The tiered KV allocator's backstop: device-planned KV for one buffer larger
 // than the headroom it sees means admission and allocation disagreed. It
@@ -166,9 +184,8 @@ kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in);
 
 // One device's view of a (possibly multi-device) plan for the zone-fit pass.
 struct kv_device_fit_input {
-    int                  device       = -1;
-    size_t               capacity     = 0;  // kv_weight_capacity() for this device
-    size_t               non_kv_bytes = 0;  // weights and other non-KV charges in the shared zone
+    int                  device   = -1;
+    size_t               capacity = 0;  // KV bytes the device can hold: its live KV headroom less the slack
     // Indexed by layer id, same conventions as kv_demotion_input. Layers owned
     // by other devices (or already on host) are never touched.
     std::vector<size_t>  layer_kv_bytes;
@@ -177,8 +194,8 @@ struct kv_device_fit_input {
     bool                 demote_swa = false;  // see kv_demotion_input
 };
 
-// Which of `device`'s KV layers must move to the host tier so its weights plus
-// KV fit `capacity`. Same rules as plan_runtime_kv_demotion(), which it
+// Which of `device`'s KV layers must move to the host tier so its KV fits
+// `capacity`. Same rules as plan_runtime_kv_demotion(), which it
 // delegates to.
 kv_demotion_result plan_device_kv_fit(const kv_device_fit_input & in);
 

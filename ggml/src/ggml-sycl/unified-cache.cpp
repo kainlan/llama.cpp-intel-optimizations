@@ -21087,18 +21087,23 @@ size_t unified_cache_kv_weight_capacity(int device_id, size_t vram_budget, bool 
     if (!vram_arena_enabled()) {
         return vram_budget;
     }
-    auto *       cache       = multi_device && get_effective_mode() == unified_cache_mode::GLOBAL ?
-                                   nullptr :
-                                   get_existing_cache_for_device(device_id);
+    auto *       cache       = kv_reads_device_arena(multi_device, get_effective_mode() == unified_cache_mode::GLOBAL) ?
+                                   get_existing_cache_for_device(device_id) :
+                                   nullptr;
     const size_t shared_zone = cache && cache->arena_active() ? cache->zone_capacity(vram_zone_id::WEIGHT) : 0;
     return kv_weight_capacity(vram_budget, shared_zone);
 }
 
-size_t unified_cache_kv_vram_available(int device_id) {
+size_t unified_cache_kv_vram_available(int device_id, bool multi_device) {
     // With an active arena, the KV zone's free space (in single-chunk mode, the
     // shared KV+weight allocator's). A full zone reads 0 there, which is not
-    // "no arena": it must not fall back to the budget-based headroom.
-    auto *     cache     = vram_arena_enabled() ? get_unified_cache_for_device(device_id) : nullptr;
+    // "no arena": it must not fall back to the budget-based headroom. Looks the
+    // cache up without creating it: the runtime-context transaction calls this
+    // under g_tensor_inventory_mutex.
+    auto *     cache     = vram_arena_enabled() &&
+                           kv_reads_device_arena(multi_device, get_effective_mode() == unified_cache_mode::GLOBAL) ?
+                               get_existing_cache_for_device(device_id) :
+                               nullptr;
     const bool has_arena = cache && cache->arena_active();
     return kv_vram_available(has_arena, has_arena ? cache->zone_available(vram_zone_id::KV) : 0,
                              has_arena ? 0 : unified_cache_available_for_compute(device_id));
