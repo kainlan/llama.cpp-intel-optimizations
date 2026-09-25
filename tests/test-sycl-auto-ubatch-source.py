@@ -62,8 +62,8 @@ UBATCH_TUNING_CACHE_CPP = (ROOT / "ggml/src/ggml-sycl/ubatch-tuning-cache.cpp").
 # test_boundary_literals_are_pinned_in_the_unit_test below) -- not otherwise
 # parsed by this file's checks.
 TEST_TUNING_CACHE_IO_CPP = (ROOT / "tests/test-tuning-cache-io.cpp").read_text()
-# llama.cpp-pyu4: the env-var catalog row this task's doc clause
-# lands in.
+# llama.cpp-pyu4: the env-var catalog, whose GGML_SYCL_AUTO_UBATCH row is
+# pinned below.
 SYCL_ENV_VARS_MD = (ROOT / "docs/backend/sycl-env-vars.md").read_text()
 # llama.cpp-pyu4: the pure helper behind the early exit before the ladder
 # loop, the host test that executes it, and that test's registration.
@@ -406,10 +406,10 @@ def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap(
     narrowed to ggml_backend_sycl_moe_gpu_ubatch_max() -- comment c-s747 /
     llama.cpp-ohkx -- and the "MoE GPU routing ceiling" stop reason reported
     whenever that ceiling BINDS, i.e. moe_cap <= cap, not only when it is
-    STRICTLY smaller (llama.cpp-pyu4: a MoE context whose batch/ctx cap
-    already equals moe_cap, e.g. cap == 512, is bound by the ceiling exactly
-    as much as one where moe_cap is smaller, and used to silently report
-    "ladder exhausted" instead). The 512 constant itself must NOT be
+    STRICTLY smaller (a MoE context whose batch/ctx cap already equals
+    moe_cap, e.g. cap == 512, is bound by the ceiling exactly as much as one
+    where moe_cap is smaller, so "ladder exhausted" would misreport why the
+    ladder stopped). The 512 constant itself must NOT be
     hardcoded in llama-context.cpp; it must come from the accessor.
 
     The condition must also be gated on moe_cap_available -- the
@@ -727,9 +727,9 @@ def test_host_fallback_query_has_a_mutation_witness():
     removes every fallback_fn( occurrence in the whole trial body, not just
     the loop's own copy."""
     raw = LLAMA_CONTEXT_CPP
-    # llama.cpp-pyu4: the block now also restores cparams.pipeline_
-    # parallel before returning the loss -- included verbatim so this
-    # witness still matches the real source exactly.
+    # The block restores cparams.pipeline_parallel before returning the
+    # loss; it is included verbatim so this witness matches the real source
+    # exactly.
     fallback_block = (
         "        for (auto & sb : sycl_backends) {\n"
         "            if (fallback_fn(sb.dev_index) > 0) {\n"
@@ -1168,8 +1168,8 @@ def test_no_candidate_early_exit_mutants_have_a_witness(replacement):
 
 
 # ---------------------------------------------------------------------------
-# llama.cpp-pyu4: comment inaccuracy -- residue-freedom is the sched.reset()
-# inside sched_reserve(), not ggml-alloc.c's realloc-on-shrink-no-op.
+# Residue-freedom comes from the sched.reset() inside sched_reserve(), not
+# ggml-alloc.c's realloc-on-shrink-no-op, and the trial's comment must say so.
 # ---------------------------------------------------------------------------
 
 

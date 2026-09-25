@@ -1361,22 +1361,20 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 // only when the cache store below actually runs and returns false --
 // not on every start. The third (the pre-existing one) is
 // `[SYCL-PLAN] auto n_ubatch=...`, with one of these nine stop reasons:
-// "ladder exhausted" (no candidate lost -- either the cap stopped the
-// ladder or all four rungs were accepted), "MoE GPU routing ceiling" (the
-// MoE cap bound, whether it narrowed a larger batch/ctx cap or merely
-// matched it), "transaction refused", "transaction busy"
-// (BUSY persisted past the backoff), "not the published model"
-// (GGML_SYCL_LIFECYCLE_STALE_IDENTITY -- a second model published after
-// this one loaded), "KV would be demoted", "compute buffer fell back to
-// host", "compute buffers did not fit" (the in-loop candidate's own
-// sched_reserve() threw -- e.g. its host-pinned retry inside
+// "ladder exhausted" (no candidate lost -- either the cap stopped the ladder or
+// all four rungs were accepted), "MoE GPU routing ceiling" (the MoE cap bound,
+// whether it narrowed a larger batch/ctx cap or merely matched it),
+// "transaction refused", "transaction busy" (BUSY persisted past the backoff),
+// "not the published model" (GGML_SYCL_LIFECYCLE_STALE_IDENTITY -- a second
+// model published after this one loaded), "KV would be demoted", "compute
+// buffer fell back to host", "compute buffers did not fit" (the in-loop
+// candidate's own sched_reserve() threw -- e.g. its host-pinned retry inside
 // graph_reserve() also failed -- caught like the candidate publish;
-// non-terminal, so a later start can still resume the
-// ladder above the cached rung), or "cached" (a persisted value passed the
-// same per-candidate validation a ladder rung uses, so the ladder never
-// ran). Candidate refusals inside the probe itself log at GGML_LOG_INFO,
-// not ERROR (Task 2), so a multi-candidate trial does not print one scary
-// refusal per losing candidate.
+// non-terminal, so a later start can still resume the ladder above the cached
+// rung), or "cached" (a persisted value passed the same per-candidate
+// validation a ladder rung uses, so the ladder never ran). Candidate refusals
+// inside the probe itself log at GGML_LOG_INFO, not ERROR (Task 2), so a
+// multi-candidate trial does not print one scary refusal per losing candidate.
 void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     struct sycl_probe_backend {
@@ -1581,25 +1579,23 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         sched_need_reserve = true;
         // Guarded like the candidate publish right above it: sched_reserve()
         // throws "failed to allocate compute pp/tg buffers" when
-        // graph_reserve() fails even after its own host-pinned-retry
-        // fallback (ggml-sycl.cpp's ggml_backend_sycl_buffer_type_alloc_
-        // buffer path), and can also throw from inside resolve_fused_ops()'s
-        // call to sycl_recheck_runtime_context_flash_attn(). A candidate the
-        // probe accepted but whose reserve throws must lose like any other
-        // candidate, not abort context creation outright -- the pre-trial
-        // fallback_ubatch path would otherwise have succeeded. The settle
-        // step below still recovers to last_good; the settle's OWN reserve
-        // stays unguarded, matching today's behaviour for a context that
-        // does not fit at all.
+        // graph_reserve() fails even after its own host-pinned-retry fallback
+        // (ggml-sycl.cpp's ggml_backend_sycl_buffer_type_alloc_buffer path),
+        // and can also throw from inside resolve_fused_ops()'s call to
+        // sycl_recheck_runtime_context_flash_attn(). A candidate the probe
+        // accepted but whose reserve throws must lose like any other candidate,
+        // not abort context creation outright -- the pre-trial fallback_ubatch
+        // path would otherwise have succeeded. The settle step below still
+        // recovers to last_good; the settle's OWN reserve stays unguarded,
+        // matching today's behaviour for a context that does not fit at all.
         //
-        // sched_reserve()'s own pipeline-parallel
-        // fallback (its "retrying without pipeline parallelism" branch
-        // below) sets cparams.pipeline_parallel = false PERMANENTLY the
-        // moment a reserve needs it, win or lose. Save it here, immediately
-        // before the call that can flip it, and restore it on every path
-        // where THIS candidate goes on to lose -- so a losing candidate's
-        // fallback never leaves pipeline parallelism disabled for last_good,
-        // which may never have needed it.
+        // sched_reserve()'s own pipeline-parallel fallback (its "retrying
+        // without pipeline parallelism" branch below) sets
+        // cparams.pipeline_parallel = false PERMANENTLY the moment a reserve
+        // needs it, win or lose. Save it here, immediately before the call that
+        // can flip it, and restore it on every path where THIS candidate goes
+        // on to lose -- so a losing candidate's fallback never leaves pipeline
+        // parallelism disabled for last_good, which may never have needed it.
         const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;
         try {
             sched_reserve();
@@ -1730,9 +1726,10 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     if (cache_available) {
         uint32_t cached_ubatch         = 0;
         char     cached_reason_buf[64] = { 0 };
-        // A cached value below fallback_ubatch must not win either -- see the ladder loop's own floor-skip comment
-        // below for why (the "never silently shrink" contract applies to a
-        // cached hit exactly as much as to a fresh ladder rung).
+        // A cached value below fallback_ubatch must not win either -- see the
+        // ladder loop's own floor-skip comment below for why (the "never
+        // silently shrink" contract applies to a cached hit exactly as much as
+        // to a fresh ladder rung).
         if (!cache_lookup_fn(&cache_key, &cached_ubatch, cached_reason_buf, sizeof(cached_reason_buf)) ||
             cached_ubatch < ladder[0] || cached_ubatch > cap || cached_ubatch < fallback_ubatch) {
             cache_state = "miss";
@@ -1782,23 +1779,22 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)\n", cache_state, cache_report_ubatch,
                    cache_paren.c_str());
 
-    // The general form of the cap < ladder[0] early exit
-    // above. The loop below skips every rung under fallback_ubatch and stops
-    // at the first rung over cap, so with no rung in [fallback_ubatch, cap]
-    // it tries nothing, and the [SYCL-PLAN] auto n_ubatch= WARN would report
-    // an empty `tried` list and a stop reason for a ladder that never ran,
-    // then persist that reason as a terminal cache entry. Two ordinary
-    // shapes reach this with fallback_ubatch well under the largest rung:
-    // n_batch=1000 with n_ubatch=600 (512 is under the floor, 1024 over the
-    // cap), and a MoE model whose routing ceiling narrows cap below an
-    // explicit n_ubatch (nothing clamps fallback_ubatch to that ceiling).
-    // Placed AFTER the cache lookup so a persisted value at or above the
-    // floor can still be revalidated and reported; gated on tried.empty() so
-    // a cache attempt this trial (a hit, or a lost cache candidate) still
-    // gets its normal outcome WARN and store logic. Skips only the
-    // [SYCL-PLAN] auto n_ubatch= WARN and the cache store: the tuning cache
-    // WARN above has already printed its miss/disabled line, unlike the
-    // earlier pre-trial exits, which all return before the cache lookup.
+    // The general form of the cap < ladder[0] early exit above. The loop below
+    // skips every rung under fallback_ubatch and stops at the first rung over
+    // cap, so with no rung in [fallback_ubatch, cap] it tries nothing, and the
+    // [SYCL-PLAN] auto n_ubatch= WARN would report an empty `tried` list and a
+    // stop reason for a ladder that never ran, then persist that reason as a
+    // terminal cache entry. Two ordinary shapes reach this with fallback_ubatch
+    // well under the largest rung: n_batch=1000 with n_ubatch=600 (512 is under
+    // the floor, 1024 over the cap), and a MoE model whose routing ceiling
+    // narrows cap below an explicit n_ubatch (nothing clamps fallback_ubatch to
+    // that ceiling). Placed AFTER the cache lookup so a persisted value at or
+    // above the floor can still be revalidated and reported; gated on
+    // tried.empty() so a cache attempt this trial (a hit, or a lost cache
+    // candidate) still gets its normal outcome WARN and store logic. Skips only
+    // the [SYCL-PLAN] auto n_ubatch= WARN and the cache store: the tuning cache
+    // WARN above has already printed its miss/disabled line, unlike the earlier
+    // pre-trial exits, which all return before the cache lookup.
     if (tried.empty() &&
         !llama_auto_ubatch_ladder_has_candidate(ladder, llama_auto_ubatch_ladder_size, fallback_ubatch, cap)) {
         sched_reserve();
@@ -1818,17 +1814,16 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         if (c <= cache_resume_above) {
             continue;
         }
-        // Never let the ladder pick something SMALLER
-        // than the caller's own explicit n_ubatch (fallback_ubatch) -- a
-        // raw-API caller can set llama_context_params.n_ubatch above the
-        // ladder's first rung together with n_ubatch_auto=true, and the
-        // "never silently shrink" gotcha (docs/plans/2026-09-10-auto-
-        // ubatch.md) applies to that value too, not only to a rung the
-        // trial itself already accepted. A rung the ladder never tries can
-        // never become last_good, so this cannot introduce a value BELOW
-        // fallback_ubatch; if nothing at or above it wins, last_good falls
-        // through to fallback_ubatch itself below, which was always safe --
-        // it is exactly today's pre-trial default.
+        // Never let the ladder pick something SMALLER than the caller's own
+        // explicit n_ubatch (fallback_ubatch) -- a raw-API caller can set
+        // llama_context_params.n_ubatch above the ladder's first rung together
+        // with n_ubatch_auto=true, and the "never silently shrink" gotcha
+        // (docs/plans/2026-09-10-auto-ubatch.md) applies to that value too,
+        // not only to a rung the trial itself already accepted. A rung the
+        // ladder never tries can never become last_good, so this cannot
+        // introduce a value BELOW fallback_ubatch; if nothing at or above it
+        // wins, last_good falls through to fallback_ubatch itself below, which
+        // was always safe -- it is exactly today's pre-trial default.
         if (c < fallback_ubatch) {
             continue;
         }
@@ -1913,14 +1908,16 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // candidate tried, cached or ladder, is >= fallback_ubatch (the cache
     // lookup rejects a smaller value and the loop skips rungs below it), so
     // such a failure leaves the ring sized for a value >= fallback_ubatch.
-    // If nothing was published this trial, no candidate won, so last_good
-    // is fallback_ubatch, need_publish is false (cparams.n_ubatch is still
-    // fallback_ubatch), and the settle re-reserves it without republishing:
+    // If need_publish is false (nothing published and cparams.n_ubatch
+    // still fallback_ubatch), no candidate won, so last_good is
+    // fallback_ubatch and the settle re-reserves it without republishing:
     // the ring is exact when the failed candidate was fallback_ubatch and
-    // oversized, never undersized, otherwise. If anything was published,
-    // need_publish is true and the settle republishes and re-plans
-    // regardless. The settle's own publish gate never inspects the ring
-    // directly -- it does not need to.
+    // oversized, never undersized, otherwise. When need_publish is true the
+    // settle republishes and re-plans regardless -- including after a
+    // candidate's publish threw, which leaves published_any false but
+    // cparams.n_ubatch at that candidate (it is set before the publish). The
+    // settle's own publish gate never inspects the ring directly -- it does
+    // not need to.
     if (!sched_matches_last_good || cparams.n_ubatch != last_good) {
         const bool need_publish = published_any || cparams.n_ubatch != fallback_ubatch;
         cparams.n_ubatch        = last_good;
