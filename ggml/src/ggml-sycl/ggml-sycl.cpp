@@ -89945,6 +89945,28 @@ class ggml_sycl_block_exec_dense_run {
         return true;
     }
 
+    // The block gates' verdict on `plan`, judged once per plan and thread; the
+    // blocks stay valid until this thread judges another plan.
+    static const ggml_sycl::dense_exec_block_memo & judge_blocks(
+        const std::shared_ptr<const ggml_sycl::placement_plan> & plan) {
+        static thread_local ggml_sycl::dense_exec_block_memo memo;
+        if (!ggml_sycl::dense_exec_block_memo_current(memo, plan)) {
+            std::vector<ggml_sycl::dense_exec_block> blocks;
+            blocks.reserve(plan->layer_blocks.size());
+            for (const auto & block : plan->layer_blocks) {
+                ggml_sycl::dense_exec_block b{};
+                b.start_layer      = block.start_layer;
+                b.end_layer        = block.end_layer;
+                b.execution_device = block.execution_device;
+                b.kv_device        = block.kv_device;
+                b.has_moe_weights  = block.moe_device_weight_bytes + block.moe_host_weight_bytes > 0;
+                blocks.push_back(b);
+            }
+            ggml_sycl::dense_exec_block_memo_store(memo, plan, std::move(blocks));
+        }
+        return memo;
+    }
+
     ggml_sycl::dense_exec_gate prepare(bool unsupported_mode) {
         ggml_sycl::dense_exec_precheck_inputs precheck{};
         precheck.enabled = ggml_sycl_block_exec_dense_enabled();
@@ -89956,20 +89978,14 @@ class ggml_sycl_block_exec_dense_run {
         precheck.graph_recording  = g_ggml_sycl_graph_recording;
         precheck.unsupported_mode = unsupported_mode;
         precheck.has_plan         = plan_owner != nullptr;
-        if (plan_owner) {
-            for (const auto & block : plan_owner->layer_blocks) {
-                ggml_sycl::dense_exec_block b{};
-                b.start_layer      = block.start_layer;
-                b.end_layer        = block.end_layer;
-                b.execution_device = block.execution_device;
-                b.kv_device        = block.kv_device;
-                b.has_moe_weights  = block.moe_device_weight_bytes + block.moe_host_weight_bytes > 0;
-                precheck.blocks.push_back(b);
-            }
-        }
-        ggml_sycl::dense_exec_gate gate = ggml_sycl::dense_exec_first_failing_precheck(precheck);
+
+        ggml_sycl::dense_exec_gate gate = ggml_sycl::dense_exec_first_failing_context_precheck(precheck);
         if (gate != ggml_sycl::DENSE_EXEC_GATE_NONE) {
             return gate;
+        }
+        const ggml_sycl::dense_exec_block_memo & judged = judge_blocks(plan_owner);
+        if (judged.gate != ggml_sycl::DENSE_EXEC_GATE_NONE) {
+            return judged.gate;
         }
 
         split_lap(split_.precheck_us);
@@ -90003,7 +90019,7 @@ class ggml_sycl_block_exec_dense_run {
         }
 
         ggml_sycl::dense_exec_graph g{};
-        g.blocks          = precheck.blocks;
+        g.blocks          = judged.blocks;
         g.original_device = original_device_;
         g.max_arena_bytes = ggml_sycl_block_exec_dense_max_arena_bytes();
         gather_facts(g);

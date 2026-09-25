@@ -10,6 +10,7 @@
 
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -211,6 +212,62 @@ static void test_precheck_gates() {
                   "gate names are distinct: " + std::to_string(g));
         }
     }
+}
+
+// The backend runs the context gates on every graph and takes the block gates
+// from a per-plan verdict, so the two halves must add up to the whole.
+static void test_precheck_parts() {
+    dense_exec_precheck_inputs in{};
+    in.enabled   = true;
+    in.has_graph = true;
+    in.has_plan  = true;
+    check(dense_exec_first_failing_context_precheck(in) == DENSE_EXEC_GATE_NONE, "context gates ignore the blocks");
+    in.has_plan = false;
+    in.blocks.push_back(dense_exec_block{ 0, 29, 0, 0, false });
+    in.blocks.push_back(dense_exec_block{ 30, 31, 1, 1, false });
+    check(dense_exec_first_failing_context_precheck(in) == DENSE_EXEC_GATE_NO_PLAN, "no plan is a context gate");
+    check(dense_exec_first_failing_precheck(in) == DENSE_EXEC_GATE_NO_PLAN, "context gates come first");
+
+    in.has_plan = true;
+    check(dense_exec_first_failing_block_precheck(in.blocks) == DENSE_EXEC_GATE_NONE, "the split's blocks pass");
+    check(dense_exec_first_failing_precheck(in) == DENSE_EXEC_GATE_NONE, "a dense two-card split passes");
+    check(dense_exec_first_failing_block_precheck({}) == DENSE_EXEC_GATE_FEW_BLOCKS, "no blocks");
+    in.blocks[0].has_moe_weights = true;
+    in.blocks[1].kv_device       = -1;
+    check(dense_exec_first_failing_block_precheck(in.blocks) == DENSE_EXEC_GATE_NOT_DENSE, "MoE before KV");
+    check(dense_exec_first_failing_precheck(in) == DENSE_EXEC_GATE_NOT_DENSE, "the whole agrees");
+}
+
+static void test_block_memo() {
+    const std::vector<dense_exec_block> split = {
+        dense_exec_block{ 0,  29, 0, 0, false },
+        dense_exec_block{ 30, 31, 1, 1, false },
+    };
+    const std::vector<dense_exec_block> moe = {
+        dense_exec_block{ 0,  11, 0, 0, true },
+        dense_exec_block{ 12, 23, 1, 1, true },
+    };
+    dense_exec_block_memo memo;
+    check(!dense_exec_block_memo_current(memo, nullptr), "no plan is never judged");
+
+    auto plan_a = std::make_shared<const int>(1);
+    check(!dense_exec_block_memo_current(memo, plan_a), "a fresh memo judged nothing");
+    dense_exec_block_memo_store(memo, plan_a, split);
+    check(dense_exec_block_memo_current(memo, plan_a), "the judged plan is current");
+    check(memo.gate == DENSE_EXEC_GATE_NONE && memo.blocks.size() == 2, "the split passes and keeps its blocks");
+    check(!dense_exec_block_memo_current(memo, nullptr), "no plan is never judged, even after a store");
+
+    auto plan_b = std::make_shared<const int>(2);
+    check(!dense_exec_block_memo_current(memo, plan_b), "another plan is not judged");
+    dense_exec_block_memo_store(memo, plan_b, moe);
+    check(memo.gate == DENSE_EXEC_GATE_NOT_DENSE, "a MoE plan is rejected");
+    check(!dense_exec_block_memo_current(memo, plan_a), "a store replaces the judged plan");
+
+    // A replan frees the judged plan; its successor is judged afresh even if
+    // it reuses the address.
+    plan_b.reset();
+    auto plan_c = std::make_shared<const int>(3);
+    check(!dense_exec_block_memo_current(memo, plan_c), "a freed plan's verdict does not carry over");
 }
 
 // Whether a graph's ranges record or replay command graphs, and the first
@@ -725,6 +782,8 @@ int main() {
     const test_case cases[] = {
         { "env-default",                                test_env_default                                     },
         { "precheck-gates",                             test_precheck_gates                                  },
+        { "precheck-parts",                             test_precheck_parts                                  },
+        { "block-memo",                                 test_block_memo                                      },
         { "split-decode-ranges",                        test_split_decode_ranges                             },
         { "tail-follows-weight-placement",              test_tail_follows_weight_placement                   },
         { "boundary-io",                                test_boundary_io                                     },

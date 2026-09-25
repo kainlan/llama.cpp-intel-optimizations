@@ -13,6 +13,8 @@
 // gathers, so they are testable on a host with no GPU
 // (tests/test-sycl-dense-block-exec.cpp):
 //   - dense_exec_first_failing_precheck: may the executor run this graph?
+//     Split into the context gates and the block gates, whose verdict
+//     dense_exec_block_memo keeps per placement plan.
 //   - dense_exec_build_plan: node devices, ranges, per-range copies and the
 //     layout of the persistent per-device arena.
 //   - dense_exec_graph_first_off: do the ranges of a decode graph record and
@@ -30,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iterator>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -123,9 +126,10 @@ struct dense_exec_precheck_inputs {
     std::vector<dense_exec_block> blocks;
 };
 
-// The first gate, among those decidable from the plan alone, that stops the
-// executor; DENSE_EXEC_GATE_NONE when all of them pass.
-inline dense_exec_gate dense_exec_first_failing_precheck(const dense_exec_precheck_inputs & in) {
+// The first of the gates that need no plan blocks: the switch, the graph, the
+// mode and whether a plan exists. DENSE_EXEC_GATE_NONE when all of them pass;
+// `in.blocks` is not read.
+inline dense_exec_gate dense_exec_first_failing_context_precheck(const dense_exec_precheck_inputs & in) {
     if (!in.enabled) {
         return DENSE_EXEC_GATE_DISABLED;
     }
@@ -141,20 +145,57 @@ inline dense_exec_gate dense_exec_first_failing_precheck(const dense_exec_preche
     if (!in.has_plan) {
         return DENSE_EXEC_GATE_NO_PLAN;
     }
-    if (in.blocks.size() < 2) {
+    return DENSE_EXEC_GATE_NONE;
+}
+
+// The first of the gates decided by the plan's layer blocks alone. They depend
+// on nothing else, so the backend judges a plan once (dense_exec_block_memo).
+inline dense_exec_gate dense_exec_first_failing_block_precheck(const std::vector<dense_exec_block> & blocks) {
+    if (blocks.size() < 2) {
         return DENSE_EXEC_GATE_FEW_BLOCKS;
     }
-    for (const dense_exec_block & block : in.blocks) {
+    for (const dense_exec_block & block : blocks) {
         if (block.has_moe_weights) {
             return DENSE_EXEC_GATE_NOT_DENSE;
         }
     }
-    for (const dense_exec_block & block : in.blocks) {
+    for (const dense_exec_block & block : blocks) {
         if (block.execution_device < 0 || block.kv_device != block.execution_device) {
             return DENSE_EXEC_GATE_KV_DEVICE;
         }
     }
     return DENSE_EXEC_GATE_NONE;
+}
+
+// The first gate, among those decidable from the plan alone, that stops the
+// executor; DENSE_EXEC_GATE_NONE when all of them pass.
+inline dense_exec_gate dense_exec_first_failing_precheck(const dense_exec_precheck_inputs & in) {
+    const dense_exec_gate gate = dense_exec_first_failing_context_precheck(in);
+    return gate != DENSE_EXEC_GATE_NONE ? gate : dense_exec_first_failing_block_precheck(in.blocks);
+}
+
+// The blocks of the last placement plan judged, and their verdict. Graphs the
+// block gates reject (one card, MoE) are computed every token; with the memo
+// they cost an identity check instead of rebuilding the blocks. The plan is
+// held weakly, so a replan that frees it cannot alias its successor.
+struct dense_exec_block_memo {
+    std::weak_ptr<const void>     plan;
+    std::vector<dense_exec_block> blocks;
+    dense_exec_gate               gate = DENSE_EXEC_GATE_NONE;
+};
+
+// True when `memo` was judged for `plan`, which must be the live owner.
+inline bool dense_exec_block_memo_current(const dense_exec_block_memo &       memo,
+                                          const std::shared_ptr<const void> & plan) {
+    return plan != nullptr && memo.plan.lock() == plan;
+}
+
+inline void dense_exec_block_memo_store(dense_exec_block_memo &             memo,
+                                        const std::shared_ptr<const void> & plan,
+                                        std::vector<dense_exec_block>       blocks) {
+    memo.plan   = plan;
+    memo.blocks = std::move(blocks);
+    memo.gate   = dense_exec_first_failing_block_precheck(memo.blocks);
 }
 
 // ---------------------------------------------------------------------------
