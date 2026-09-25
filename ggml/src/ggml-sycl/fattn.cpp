@@ -3190,7 +3190,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     // path for every shape not claimed by the proven fast paths above,
     // including simple D=128 PP. XMX-v1 gives non-deterministic, intermittently
     // wrong output there (bit-identical inputs produce a different dst on every
-    // call), so it runs only behind the A/B opt-ins below:
+    // call; llama.cpp-b1ov), so it runs only behind the A/B opt-ins below:
     //   GGML_SYCL_FA_XMX_V1=1     any shape can_use_xmx_v1_runtime() accepts
     //   GGML_SYCL_FA_XMX_V1_PP=1  simple D=128 PP
     if (use_xmx) {
@@ -3198,10 +3198,10 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             const char * env = std::getenv("GGML_SYCL_FA_XMX_V1");
             return env && std::atoi(env) != 0;
         }();
-        static const bool simple_pp_xmx_v1_opt_in =
-            ggml_sycl_fattn_simple_pp_xmx_v1_enabled(std::getenv("GGML_SYCL_FA_XMX_V1_PP"));
+        static const char * const simple_pp_xmx_v1_env = std::getenv("GGML_SYCL_FA_XMX_V1_PP");
+
         const bool xmx_v1_supported = can_use_xmx_v1_runtime();
-        const bool simple_pp_xmx_v1 = simple_pp_xmx_v1_opt_in && xmx_v1_supported;
+        const bool simple_pp_xmx_v1 = ggml_sycl_fattn_simple_pp_select_xmx_v1(simple_pp_xmx_v1_env, xmx_v1_supported);
         const bool use_xmx_v1_path  = xmx_v1_supported && (force_xmx_v1 || simple_pp_xmx_v1);
         if (force_xmx_v1 && !xmx_v1_supported && dispatch_debug_enabled) {
             fprintf(stderr,
@@ -3212,9 +3212,9 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 
         if (use_xmx_v1_path) {
             // v1 kernel — A/B comparison only. It is faster than v2 on simple
-            // D=128 PP but its output is not deterministic, so it is never the
-            // default. can_use_xmx_v1_runtime() keeps it off sink/softcap/FP8
-            // and every decode shape.
+            // D=128 PP but its output is not deterministic (llama.cpp-b1ov), so
+            // it is never the default. can_use_xmx_v1_runtime() keeps it off
+            // sink/softcap/FP8 and every decode shape.
             if (ne01 <= 1) {
                 GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=1 ne01=%d", D, ne01);
                 dispatch_debug_kernel("xmx_v1_f16_ncols1");

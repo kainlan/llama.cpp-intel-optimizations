@@ -21,12 +21,13 @@
 #    define SYCL_XMX_AVAILABLE 0
 #endif
 
-// Parse of GGML_SYCL_FA_XMX_V1_PP, the A/B opt-in for running simple D=128
-// prompt processing through the XMX-v1 kernel. v1 gives non-deterministic,
-// intermittently wrong output on that shape, so only an explicit "1" selects
-// it; unset or any other value keeps XMX-v2. Pure so host tests can pin it.
-static inline bool ggml_sycl_fattn_simple_pp_xmx_v1_enabled(const char * env) {
-    return env != nullptr && std::strcmp(env, "1") == 0;
+// Whether simple D=128 prompt processing runs the XMX-v1 kernel. env is the
+// value of GGML_SYCL_FA_XMX_V1_PP and xmx_v1_supported is
+// can_use_xmx_v1_runtime(). v1 gives non-deterministic, intermittently wrong
+// output on that shape (llama.cpp-b1ov), so only an explicit "1" selects it;
+// unset or any other value keeps XMX-v2. Pure so host tests can pin it.
+static inline bool ggml_sycl_fattn_simple_pp_select_xmx_v1(const char * env, bool xmx_v1_supported) {
+    return xmx_v1_supported && env != nullptr && std::strcmp(env, "1") == 0;
 }
 
 #if SYCL_XMX_AVAILABLE

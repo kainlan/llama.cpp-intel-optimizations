@@ -81,13 +81,25 @@ static fattn_params decode_params(int h_q, int h_kv) {
     return decode_params_dim(h_q, h_kv, 128);
 }
 
-static bool expect_simple_pp_xmx_v1(const char * env, bool want, const char * name) {
-    const bool got = ggml_sycl_fattn_simple_pp_xmx_v1_enabled(env);
-    if (got != want) {
-        std::fprintf(stderr, "FAIL: %s got %d want %d\n", name, (int) got, (int) want);
-        return false;
+// XMX-v1 gives non-deterministic, intermittently wrong output on simple D=128
+// prompt processing (llama.cpp-b1ov), so v2 is the default and only "1" opts
+// into v1, and then only for a shape can_use_xmx_v1_runtime() accepts.
+static bool check_simple_pp_select_xmx_v1() {
+    const char * const envs[] = { nullptr, "0", "", "2", "yes", "1 ", "1" };
+    bool               ok     = true;
+    for (const char * env : envs) {
+        for (const bool supported : { false, true }) {
+            const bool want = supported && env != nullptr && std::string(env) == "1";
+            const bool got  = ggml_sycl_fattn_simple_pp_select_xmx_v1(env, supported);
+            if (got != want) {
+                std::fprintf(stderr, "FAIL: GGML_SYCL_FA_XMX_V1_PP=%s%s%s xmx_v1_supported=%d selects %s, want %s\n",
+                             env ? "\"" : "", env ? env : "<unset>", env ? "\"" : "", (int) supported,
+                             got ? "v1" : "v2", want ? "v1" : "v2");
+                ok = false;
+            }
+        }
     }
-    return true;
+    return ok;
 }
 
 static std::string find_repo_root() {
@@ -119,6 +131,21 @@ static std::string read_file(const std::filesystem::path & path) {
     return ss.str();
 }
 
+static bool is_identifier_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+static int count_identifier(const std::string & src, const std::string & name) {
+    int count = 0;
+    for (size_t at = src.find(name); at != std::string::npos; at = src.find(name, at + 1)) {
+        const size_t end = at + name.size();
+        if ((at == 0 || !is_identifier_char(src[at - 1])) && (end == src.size() || !is_identifier_char(src[end]))) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 static int count_occurrences(const std::string & haystack, const std::string & needle) {
     int count = 0;
     for (size_t at = haystack.find(needle); at != std::string::npos; at = haystack.find(needle, at + 1)) {
@@ -127,8 +154,57 @@ static int count_occurrences(const std::string & haystack, const std::string & n
     return count;
 }
 
-// The simple-PP v1 opt-in is parsed in exactly one place, through the helper,
-// so the pinned default above is the default the dispatcher actually runs.
+// fattn.cpp reads GGML_SYCL_FA_XMX_V1_PP once, and the simple-PP term of
+// use_xmx_v1_path is exactly ggml_sycl_fattn_simple_pp_select_xmx_v1()'s
+// result, so the default pinned above is the default the dispatcher runs.
+// Each line below is matched verbatim: a reflow fails closed.
+static bool check_fattn_simple_pp_xmx_v1_wiring(const std::string & src) {
+    const char * const chain[] = {
+        "static const char * const simple_pp_xmx_v1_env = std::getenv(\"GGML_SYCL_FA_XMX_V1_PP\");",
+        "const bool simple_pp_xmx_v1 = ggml_sycl_fattn_simple_pp_select_xmx_v1(simple_pp_xmx_v1_env, "
+        "xmx_v1_supported);",
+        "const bool use_xmx_v1_path  = xmx_v1_supported && (force_xmx_v1 || simple_pp_xmx_v1);",
+        "if (use_xmx_v1_path) {",
+    };
+    bool   ok   = true;
+    size_t prev = 0;
+    for (const char * line : chain) {
+        const int    n  = count_occurrences(src, line);
+        const size_t at = src.find(line);
+        if (n != 1) {
+            std::fprintf(stderr, "FAIL: fattn.cpp must contain exactly once (found %d): %s\n", n, line);
+            ok = false;
+        } else if (at < prev) {
+            std::fprintf(stderr, "FAIL: fattn.cpp has this line out of order: %s\n", line);
+            ok = false;
+        } else {
+            prev = at;
+        }
+    }
+
+    // Each name is defined once and consumed once, so nothing between the
+    // definition and the consumer can substitute another value.
+    struct identifier_uses {
+        const char * name;
+        int          want;
+    };
+
+    const identifier_uses uses[] = {
+        { "simple_pp_xmx_v1_env",                    2 },
+        { "simple_pp_xmx_v1",                        2 },
+        { "use_xmx_v1_path",                         2 },
+        { "ggml_sycl_fattn_simple_pp_select_xmx_v1", 1 },
+    };
+    for (const identifier_uses & use : uses) {
+        const int n = count_identifier(src, use.name);
+        if (n != use.want) {
+            std::fprintf(stderr, "FAIL: fattn.cpp mentions %s %d times, want %d\n", use.name, n, use.want);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 static bool check_simple_pp_xmx_v1_source_contract() {
     const std::string root = find_repo_root();
     if (root.empty()) {
@@ -137,7 +213,6 @@ static bool check_simple_pp_xmx_v1_source_contract() {
     }
 
     const std::string env_literal = "\"GGML_SYCL_FA_XMX_V1_PP\"";
-    const std::string helper_call = "ggml_sycl_fattn_simple_pp_xmx_v1_enabled(std::getenv(" + env_literal + "))";
 
     bool ok        = true;
     bool saw_fattn = false;
@@ -151,19 +226,12 @@ static bool check_simple_pp_xmx_v1_source_contract() {
         const std::string src      = read_file(entry.path());
         const int         literals = count_occurrences(src, env_literal);
         if (entry.path().filename() == "fattn.cpp") {
-            saw_fattn             = true;
-            const int    calls    = count_occurrences(src, helper_call);
-            const size_t use_path = src.find("const bool use_xmx_v1_path");
-            if (calls != 1 || literals != 1) {
-                std::fprintf(stderr,
-                             "FAIL: fattn.cpp must read GGML_SYCL_FA_XMX_V1_PP only via %s: helper calls=%d, "
-                             "env literals=%d, want 1 and 1\n",
-                             helper_call.c_str(), calls, literals);
-                ok = false;
-            } else if (use_path == std::string::npos || src.find(helper_call) > use_path) {
-                std::fprintf(stderr, "FAIL: the helper call must precede and feed use_xmx_v1_path in fattn.cpp\n");
+            saw_fattn = true;
+            if (literals != 1) {
+                std::fprintf(stderr, "FAIL: fattn.cpp reads GGML_SYCL_FA_XMX_V1_PP %d times, want 1\n", literals);
                 ok = false;
             }
+            ok &= check_fattn_simple_pp_xmx_v1_wiring(src);
         } else if (literals != 0) {
             std::fprintf(stderr, "FAIL: %s re-derives GGML_SYCL_FA_XMX_V1_PP (%d literals); only fattn.cpp may\n",
                          entry.path().string().c_str(), literals);
@@ -181,14 +249,7 @@ static bool check_simple_pp_xmx_v1_source_contract() {
 int main() {
     bool ok = true;
 
-    // XMX-v1 gives non-deterministic, intermittently wrong output on simple
-    // D=128 prompt processing, so v2 is the default and only "1" opts into v1.
-    ok &= expect_simple_pp_xmx_v1(nullptr, false, "GGML_SYCL_FA_XMX_V1_PP unset selects v2");
-    ok &= expect_simple_pp_xmx_v1("0", false, "GGML_SYCL_FA_XMX_V1_PP=0 selects v2");
-    ok &= expect_simple_pp_xmx_v1("", false, "GGML_SYCL_FA_XMX_V1_PP empty selects v2");
-    ok &= expect_simple_pp_xmx_v1("2", false, "GGML_SYCL_FA_XMX_V1_PP=2 selects v2");
-    ok &= expect_simple_pp_xmx_v1("yes", false, "GGML_SYCL_FA_XMX_V1_PP=yes selects v2");
-    ok &= expect_simple_pp_xmx_v1("1", true, "GGML_SYCL_FA_XMX_V1_PP=1 opts into v1");
+    ok &= check_simple_pp_select_xmx_v1();
     ok &= check_simple_pp_xmx_v1_source_contract();
 
     ok &= expect_eq(ggml_sycl_fattn_xmx_v1_select_batch_kv(/*D=*/128, /*ncols=*/8, /*local_mem_size=*/96 * 1024), 48,
