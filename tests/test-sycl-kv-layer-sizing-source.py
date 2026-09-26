@@ -1307,7 +1307,7 @@ REFUSAL_ANCHORS = (
     "    if (!ggml_sycl_check_nonfa_attn_scratch(",
     "    if (ring_replan_result == ggml_sycl_ring_replan_result::RELEASE_REFUSED) {",
     "    if (next->version == 0) {",
-    "    if (!stable_mmid && !ggml_sycl_materialize_published_mmid_workspaces(",
+    "    if (!stable_mmid && mmid_route_reachable &&",
     "    if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {",
 )
 

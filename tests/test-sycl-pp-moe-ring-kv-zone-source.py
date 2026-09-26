@@ -16,6 +16,8 @@ and acts on the answer, which is what this file pins:
   * the arena refusal is the admission's answer, the placement is published
     before the ceiling and restored with it on a refusal;
   * the KV-zone bytes are charged to the plan's vram_bytes;
+  * the MMID pools, placed in the RUNTIME zone after the ring, are materialized
+    only for a route that can run them, and otherwise the ring leaves them room;
   * the cache allocates a flagged slot from the KV zone, never spilling past
     the arena, and does not size the RUNTIME zone for it.
 
@@ -178,6 +180,18 @@ def transaction_violations(sycl_cpp: str) -> list[str]:
     refused = txn.find('return refuse("PP MoE oneDNN scratch ring does not fit");')
     if charge is None or not 0 <= refused < charge.start() < probe_at:
         found.append("the ring's KV-zone bytes are not charged to the plan's vram_bytes")
+
+    if not re.search(r"const\s+bool\s+mmid_route_reachable\s*=\s*ggml_sycl_moe_mmid_route_reachable\(\s*\*ctx\s*\)\s*;",
+                     txn):
+        found.append("the transaction does not ask whether the MMID route is reachable")
+    if not re.search(r"if\s*\(\s*!stable_mmid\s*&&\s*mmid_route_reachable\s*&&\s*"
+                     r"!ggml_sycl_materialize_published_mmid_workspaces\(", txn):
+        found.append("the MMID pools are materialized for a route that cannot run them")
+    pending = re.search(r"if\s*\(\s*mmid_route_reachable\s*&&\s*!ggml_sycl_same_mmid_workspace_plan\(\s*\*current->plan"
+                        r"\s*,\s*next_plan\s*\)\s*\)\s*\{[^{}]*\{\s*if\s*\(\s*workspace\.owner_device\s*==\s*ctx->device"
+                        r"\s*\)\s*\{\s*ring_kv_zone\.runtime_pending_bytes\s*\+=\s*workspace\.device_pool_bytes\s*;", txn)
+    if pending is None or pending.start() > call_at:
+        found.append("the ring does not leave the RUNTIME zone room for the MMID pools placed after it")
     return found
 
 
@@ -202,7 +216,9 @@ def replan_violations(sycl_cpp: str) -> list[str]:
                 (r"kv_admitted_bytes\s*=\s*kv_zone\s*\?\s*kv_zone->kv_bytes\s*:\s*0\s*;", "the plan's KV"),
                 (r"compute_reserve_bytes_per_row\s*=\s*kv_zone\s*\?\s*k_pp_moe_ring_compute_reserve_bytes_per_row\s*:"
                  r"\s*0\s*;", "the compute-buffer reserve"),
-                (r"runtime_available_bytes\s*=\s*capacity_bytes\s*;", "the RUNTIME zone's capacity")):
+                (r"runtime_pending\s*=\s*kv_zone\s*\?\s*kv_zone->runtime_pending_bytes\s*:\s*0\s*;.*"
+                 r"runtime_available_bytes\s*=\s*capacity_bytes\s*>\s*runtime_pending\s*\?\s*capacity_bytes\s*-\s*"
+                 r"runtime_pending\s*:\s*0\s*;", "the RUNTIME zone less what follows the ring")):
             if not re.search(pattern, inputs, re.S):
                 found.append(f"the admission is not given {what}")
 
@@ -333,6 +349,12 @@ MUTATIONS = [
     ("no vram_bytes charge", "sycl",
      "            next_plan.vram_bytes += charge;\n", "",
      "the ring's KV-zone bytes are not charged to the plan's vram_bytes"),
+    ("MMID ungated", "sycl",
+     "if (!stable_mmid && mmid_route_reachable &&", "if (!stable_mmid &&",
+     "the MMID pools are materialized for a route that cannot run them"),
+    ("no MMID room", "sycl",
+     "                ring_kv_zone.runtime_pending_bytes += workspace.device_pool_bytes;\n", "",
+     "the ring does not leave the RUNTIME zone room for the MMID pools placed after it"),
     ("idempotent despite a re-fit", "sycl",
      " &&\n        !(kv_zone && kv_zone->readmit)) {", ") {",
      "the idempotent early return ignores a forced re-admission"),

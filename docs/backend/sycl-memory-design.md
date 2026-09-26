@@ -2244,6 +2244,11 @@ runtime `n_ubatch` through `pp_moe_onednn_admit_ring()`
 - Each ubatch-scaled slot kind stays in the RUNTIME zone if it still fits there,
   larger kind first (with two kinds that keeps the most bytes in RUNTIME).
   Otherwise it goes to the shared KV/weight zone.
+- The RUNTIME zone is counted without what the transaction still places there
+  after the ring: the MoE MMID workspace pools, when this update materializes
+  them. It materializes them only for a route that can run them, the predicate
+  `load_end` and the context-bind hook already use. In an ordinary build that
+  route is closed, so this is 0.
 - The KV-zone part may use only `headroom - reserve`. `headroom` is the device's
   KV capacity less the plan's device KV (with the allocator's per-layer slack).
   The capacity is `ggml_sycl_kv_capacity_live()`, the one number the KV re-fit

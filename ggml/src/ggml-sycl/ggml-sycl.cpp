@@ -17439,9 +17439,10 @@ static constexpr size_t k_pp_moe_ring_compute_reserve_bytes_per_row = 1024 * 102
 // it has admitted KV. Without it (the rollbacks) the ring is restored to a
 // size that fit before, and its KV-zone part is not re-admitted.
 struct ggml_sycl_ring_kv_zone_inputs {
-    size_t kv_capacity_bytes = 0;      // ggml_sycl_kv_capacity_live() on the device, the ring counted as free
-    size_t kv_bytes          = 0;      // the plan's device KV there, with the allocator's per-layer slack
-    bool   readmit           = false;  // the KV re-fit counted the ring's KV-zone slots as free
+    size_t kv_capacity_bytes     = 0;      // ggml_sycl_kv_capacity_live() on the device, the ring counted as free
+    size_t kv_bytes              = 0;      // the plan's device KV there, with the allocator's per-layer slack
+    size_t runtime_pending_bytes = 0;      // RUNTIME bytes the transaction places after the ring
+    bool   readmit               = false;  // the KV re-fit counted the ring's KV-zone slots as free
 };
 
 // The plan's device-resident KV on `device`, with the tiered allocator's
@@ -17554,16 +17555,19 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
     // pp_moe_onednn_admit_ring()'s answer: the weight slots stay in the RUNTIME
     // zone, and an ubatch-scaled slot kind the RUNTIME zone cannot also hold
     // goes to the shared KV zone, admitted against what KV leaves free there
-    // less the compute-buffer reserve. A rollback restores a ring that fit
-    // before, so its KV-zone part is not re-admitted.
+    // less the compute-buffer reserve. The RUNTIME zone is counted without what
+    // the transaction still places there after the ring. A rollback restores a
+    // ring that fit before, so its KV-zone part is not re-admitted.
     ggml_sycl::pp_moe_onednn_ring_admission admission;
     if (arena) {
+        const size_t runtime_pending = kv_zone ? kv_zone->runtime_pending_bytes : 0;
+
         ggml_sycl::pp_moe_onednn_ring_admission_inputs admit_in;
         admit_in.kv_zone_available_bytes = kv_zone ? kv_zone->kv_capacity_bytes : std::numeric_limits<size_t>::max();
         admit_in.kv_admitted_bytes       = kv_zone ? kv_zone->kv_bytes : 0;
         admit_in.compute_reserve_bytes_per_row = kv_zone ? k_pp_moe_ring_compute_reserve_bytes_per_row : 0;
-        admit_in.runtime_available_bytes       = capacity_bytes;
-        admit_in.weight_slot_bytes             = weight_slot_bytes;
+        admit_in.runtime_available_bytes = capacity_bytes > runtime_pending ? capacity_bytes - runtime_pending : 0;
+        admit_in.weight_slot_bytes       = weight_slot_bytes;
         admit_in.activation_bytes_per_row =
             ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device);
         admit_in.output_bytes_per_row = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device);
@@ -18269,11 +18273,23 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(ctx->device);
     // The ring is re-planned after KV is admitted, so the part of it the
     // RUNTIME zone cannot hold is admitted against what KV leaves free in the
-    // shared KV zone, and never displaces KV.
+    // shared KV zone, and never displaces KV. The MoE MMID workspace pools are
+    // placed in the RUNTIME zone after the ring, and only for a route that can
+    // run them -- the same predicate load_end and the context-bind hook use --
+    // so the ring leaves them that room.
+    const bool mmid_route_reachable = ggml_sycl_moe_mmid_route_reachable(*ctx);
+
     ggml_sycl_ring_kv_zone_inputs ring_kv_zone;
     ring_kv_zone.kv_capacity_bytes = ggml_sycl_kv_capacity_live(next_plan, ctx->device, admitted_kv, ctx->device);
     ring_kv_zone.kv_bytes          = ggml_sycl_device_kv_bytes_with_slack(next_plan, ctx->device);
     ring_kv_zone.readmit           = ring_readmit;
+    if (mmid_route_reachable && !ggml_sycl_same_mmid_workspace_plan(*current->plan, next_plan)) {
+        for (const auto & workspace : next_plan.moe_mmid_workspaces) {
+            if (workspace.owner_device == ctx->device) {
+                ring_kv_zone.runtime_pending_bytes += workspace.device_pool_bytes;
+            }
+        }
+    }
     // llama.cpp-jumy: RELEASE_REFUSED is a transient failure to release the
     // ring's OLD physical backing (still claimed by an in-flight dispatch)
     // -- nothing about the requested size was evaluated, so a caller may
@@ -18378,7 +18394,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         return refuse("publication ID exhausted");
     }
     ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
-    if (!stable_mmid && !ggml_sycl_materialize_published_mmid_workspaces(current_token, next, &mmid_reason)) {
+    if (!stable_mmid && mmid_route_reachable &&
+        !ggml_sycl_materialize_published_mmid_workspaces(current_token, next, &mmid_reason)) {
         ggml_sycl_moe_mmid_report_refusal("runtime-kv-update", mmid_reason, next->plan->device_id,
                                           next->plan->moe_mmid_device_pool_bytes, next->plan->moe_mmid_host_pool_bytes);
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: MMID workspace materialization failed\n");
