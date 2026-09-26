@@ -176,6 +176,9 @@ on_signal() {
     build_pid="${build_pid:-$(jobs -p | head -n 1)}"
     if [[ -n "${build_pid}" ]]; then
         kill "-${sig}" -- "-${build_pid}" 2>/dev/null || true
+        # A stopped build (SIGTTOU/SIGTTIN as a background job, or an explicit
+        # STOP) would hold the forwarded signal pending and never exit.
+        kill -CONT -- "-${build_pid}" 2>/dev/null || true
         wait "${build_pid}" 2>/dev/null || true
         while kill -0 -- "-${build_pid}" 2>/dev/null; do
             sleep 0.1

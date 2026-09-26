@@ -46,7 +46,18 @@ if [[ "$1" == "--build" ]]; then
         # its ninja child in the same process group takes a while to reap its
         # jobs and clean up.
         "${MOCK_BIN}/mock-ninja" "${MOCK_NINJA_READY}" "${MOCK_NINJA_DONE}" &
-        until [[ -e "${MOCK_NINJA_READY}" ]]; do sleep 0.01; done
+        ninja_pid=$!
+        # Bounded, and inside signal_case's 5 s wait for it: the mock runs in
+        # the script's build group, out of reach of the test's exit and
+        # ctest's TIMEOUT, so it must not spin forever.
+        for _ in $(seq 200); do
+            [[ -e "${MOCK_NINJA_READY}" ]] && break
+            sleep 0.01
+        done
+        if [[ ! -e "${MOCK_NINJA_READY}" ]]; then
+            kill -KILL "${ninja_pid}" 2>/dev/null
+            exit 91
+        fi
         echo "$$" > "${MOCK_PID_FILE}"
         wait
         exit 0
@@ -148,8 +159,10 @@ expect_private_tmp_removed
 # build in flight, ends the script with the conventional status and still
 # removes its temporaries, but only once the whole build has stopped: the mock
 # cmake dies at once, and its ninja child needs another second to clean up.
+# With "stopped", the build group is SIGSTOPped first (as a background job
+# writing under stty tostop would be); the signal must still end it.
 signal_case() {
-    local sig="$1" want_rc="$2" pid build_pid rc=0 start_ms elapsed_ms
+    local sig="$1" want_rc="$2" stopped="${3:-}" pid build_pid child rc=0 start_ms elapsed_ms
     : > "${CMAKE_LOG}"
     : > "${CONFIGURE_LOG}"
     rm -f "${TMP}/build.pid" "${TMP}/ninja.ready" "${TMP}/ninja.done"
@@ -167,10 +180,29 @@ signal_case() {
         [[ -s "${TMP}/build.pid" ]] && break
         sleep 0.05
     done
-    [[ -s "${TMP}/build.pid" ]] || fail "SIG${sig}: the build never started"
+    if [[ ! -s "${TMP}/build.pid" ]]; then
+        # The script and its build run in process groups of their own, which
+        # neither this test's exit nor ctest's TIMEOUT reaches.
+        for child in $(pgrep -P "${pid}"); do
+            kill -KILL -- "-${child}" 2>/dev/null || true
+        done
+        kill -KILL -- "-${pid}" 2>/dev/null || true
+        fail "SIG${sig}: the build never started: $(cat "${TMP}/out.log")"
+    fi
     build_pid="$(cat "${TMP}/build.pid")"
+    if [[ -n "${stopped}" ]]; then
+        kill -STOP -- "-${build_pid}"
+    fi
     start_ms=$(( $(date +%s%N) / 1000000 ))
     kill "-${sig}" "${pid}"
+    for _ in $(seq 100); do
+        kill -0 "${pid}" 2>/dev/null || break
+        sleep 0.05
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+        kill -KILL -- "-${build_pid}" "-${pid}" 2>/dev/null || true
+        fail "SIG${sig}${stopped:+ (build stopped)}: the script did not return within 5 s"
+    fi
     wait "${pid}" || rc=$?
     elapsed_ms=$(( $(date +%s%N) / 1000000 - start_ms ))
     [[ -e "${TMP}/ninja.done" ]] ||
@@ -188,6 +220,7 @@ signal_case() {
 signal_case INT 130
 signal_case TERM 143
 signal_case HUP 129
+signal_case INT 130 stopped
 
 # An unknown option is refused before anything runs, pointing at "--": passed
 # through bare, a value-taking one such as "-k 0" would split into an option
