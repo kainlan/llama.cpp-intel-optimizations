@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.4. Author: impl-moua, 2026-09-26. The revisions answer seven reviews:
+Design, revision 7.5. Author: impl-moua, 2026-09-26. The revisions answer seven reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -27,7 +27,8 @@ Design, revision 7.4. Author: impl-moua, 2026-09-26. The revisions answer seven 
   recorded in §6.8. Revision 7.2 is one commit on top of `b30321a6f`. Revision 7.3 answers
   design-moua-r6's rewrite of its verdict (0 Critical, 7 Important, 11 Minor) and adopts the
   lead's rulings file, recorded in §6.9. Revision 7.4 makes L0 process-global (rulings §E.2),
-  also recorded in §6.9.
+  and revision 7.5 withdraws step 8′ (rulings §B.2) and adopts §D15 and §D16, all recorded in
+  §6.9.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §R, §RING, §E, §REC, §T, §L6, §GA, §FM,
@@ -1417,23 +1418,15 @@ contribution. It never re-fits KV and never yields.
     The table is not opened here; (e) checks it before anything is moved out of it. The reap's
     owner list (d) is read from the table's handles, which nobody mutates once it is taken.
     (c) is rulings §B steps 7 and 8.
-  - **(c′) Release this context's backend-cache references (rulings §B.1 step 8′; zhcn row
-    13).** With no lock held, on the context's own thread, between §B step 8 and step 9,
-    `ggml_backend_sycl_release_buffer_refs(backend, owners)` runs for this context's backend,
-    with the same owner list the reap takes. It erases the owner-matched entries from a fixed,
-    named list of per-context backend caches, and from nothing else:
-    - the MMVQ q8 activation cache's `cached_src_handle` (`common.hpp:6587` at `11faace69`);
-    - the MoE q8 cache's `cached_src_handle` (`common.hpp:7015`);
-    - the `moe_ids_cache` keys (`moe_ids_cache_key`, `common.hpp:5713`);
-    - `runtime_tensor_extras`.
-
-    The list is the fourth holder class, and it is **closed**: H7ag and zhcn's gate 27 name each
-    member, any other non-store park still fails, and adding a cache to the list needs a lead
-    ruling (the default fix for a new holder is to retain through the store). The thread-local
-    `g_data_ptr_cache` is not in the list, because a re-plan thread cannot clear another
-    thread's instance. It holds no owning `mem_handle` of a tenant slice: it keys on the
-    handle's stable identity plus the tenant publish generation, so a stale entry misses. That
-    is a code change in zhcn's scope, gated there.
+  - **No step 8′ (rulings §B.2, superseding §B.1).** Revision 7.4 had a step (c′) here that
+    erased this context's entries from four backend caches. It is deleted: every one of those
+    caches only compares identity (`stable_identity_equal`, `common.hpp:6706` and `:7040` at
+    master `3d9414c8c`), so an owning handle held there is a holder to fix at the producer, not
+    to exempt. The MMVQ and MoE q8 `cached_src_handle` fields and the `moe_ids_cache` keys
+    become a non-owning `mem_handle_identity`, `g_data_ptr_cache` keys on identity plus the
+    tenant publish generation, and every `runtime_tensor_extras` publisher restores at scope
+    exit; all of that is zhcn's scope, specified in rulings §B.2 and not restated here. So (d)
+    follows (c) directly, and the three §B holder classes stand (e).
   - **(d) The reap, with no L1-L5 lock held (lead ruling "B"; r6 I-1, I-2, m-3, m-5; zhcn rev
     5).** zhcn's mem-handle call, shared with llama.cpp-uwlx's yield (jehw), is
     `retained_reap_result release_retained_referencing(const retained_reap_request &)`. The
@@ -1496,11 +1489,11 @@ contribution. It never re-fits KV and never yields.
     never an overlap. After (d)
     it means a reference held **outside the retained store**, which the protocol does not
     allow: a tenant slice may be retained only by a claim, by the retained store, by a
-    per-context graph container that (a) clears, or by a member of (c′)'s closed cache list
-    (rulings §B, §B.1; H7ag; r6 I-3). Two kinds of holder are design errors to fix in their
-    producers, never to exempt:
-    - a per-op cache outside (c′)'s list that keeps a slice past submission, such as the oneDNN
-      Graph scratch park, or any park beni's conversions leave;
+    per-context graph container that (a) clears (rulings §B, §B.2; H7ag; r6 I-3). Two kinds of
+    holder are design errors to fix in their producers, never to exempt:
+    - a per-op cache that keeps an owning handle of a slice past submission, such as the oneDNN
+      Graph scratch park, or any park beni's conversions leave. A cache that only compares
+      identity holds a non-owning `mem_handle_identity` instead (rulings §B.2);
     - a `host_task` lambda that captures a tenant-slot handle instead of publishing its
       retention through the store (zhcn rev 5).
 
@@ -1752,12 +1745,18 @@ inventory. What differs, because it is not in the device geometry:
   outside any inference phase: it allocates the tenant set's host slots with
   `forbid_host_zone_growth = false`, and records that capacity as the context's host-tier
   reservation. Every later tenant-only republish allocates with `forbid_host_zone_growth =
-  true` against the reservation, so a post-decode republish never grows the pool. A host need
-  above the reservation is a **candidate refusal** with the tenants-alone message, never a
-  growth under the gate. The reservation is a figure, not held room: since the old host slots
-  now stay until the commit, a republish needs free room beside them in the chunks the pool
-  already committed, and a concurrent host fill (expert-cache host fills, host weight staging)
-  can take that room. Both end in a refusal before anything is released, never in a growth.
+  true` against the reservation, so a post-decode republish never grows the pool.
+  - **The reservation covers the plan's maximum tenant demand (rulings §D15).** The first
+    publish reserves host-slot room for the top ladder candidate the plan admits, not only for
+    the first candidate, and holds it. So a republish within the plan, including its old+new
+    host peak, never competes with expert-cache host fills or host weight staging, neither of
+    which takes L0.
+  - A host need above the reservation is a genuine shortfall: a **candidate refusal** with the
+    tenants-alone message at rulings §B step 4, before anything is released, never a growth
+    under the gate and never a transient.
+  - Expert-cache host fills are themselves planned capacity (P4; 1oxa r3 I5); host growth the
+    plan does not account for is a plan bug, not a race to tolerate.
+
   §3.1 H4 carries the cases.
 
 **The record (r3 I2, I7; r4 I1, I4, m12).**
@@ -3131,21 +3130,17 @@ L7 documents this limit, and pattern #2 remains the remedy.
     `release_graph_retained_handles` nor `ggml_sycl_cpu_staging_cache_clear` is reachable from
     the tenant-only path's step (i), and (a)'s own-context clear runs only behind the
     recorded-graph gate. Mutation witness: (a) calling `sycl_exec_graph_clear_active`;
-  - (ag) **a tenant slice has four permitted holders, the fourth a closed list (rulings §B,
-    §B.1; r6 I-3).** A CONTEXT tenant slice is retained only by a claim, by
-    `retain_handles_until_event` or the graph sink, by a per-context graph container that (a)
-    clears, or by a member of the closed list that (c′)'s
-    `ggml_backend_sycl_release_buffer_refs` erases. The gate names each member: the MMVQ q8
-    `cached_src_handle` (`common.hpp:6587`), the MoE q8 `cached_src_handle` (`:7015`), the
-    `moe_ids_cache` keys, and `runtime_tensor_extras`; it checks that the function erases
-    exactly those, and that (c′) runs between §B step 8 and step 9. No `host_task` lambda
-    captures a tenant-slot handle (zhcn rev 5), and `g_data_ptr_cache` holds no owning
-    `mem_handle` (zhcn's gate). The gate runs over every converted claim site. **Any other
-    non-store park of a tenant slice fails** (rulings §B.1; r6 I-3): the oneDNN Graph scratch
-    park, and any per-op cache beni converts, each keeping a slice past submission anywhere but
-    the store or the list. Mutation witnesses: a beni-style park in a per-op cache off the list,
-    a fifth cache added to the erase function without a ruling, a listed cache left out of it,
-    and a `host_task` capture;
+  - (ag) **a tenant slice has three permitted holders (rulings §B, §B.2; r6 I-3).** A CONTEXT
+    tenant slice is retained only by a claim, by `retain_handles_until_event` or the graph sink,
+    or by a per-context graph container that (a) clears. No `host_task` lambda captures a
+    tenant-slot handle (zhcn rev 5). The gate runs over every converted claim site. **Any other
+    park that owns a handle of a tenant slice fails** (rulings §B.2; r6 I-3): the oneDNN Graph
+    scratch park, any per-op cache beni converts, and the four former §B.1 members (the MMVQ and
+    MoE q8 `cached_src_handle`, the `moe_ids_cache` keys, `runtime_tensor_extras`) if they still
+    own one. The identity type's no-recycling test and the `runtime_tensor_extras` publisher
+    census are zhcn's gate 27 (rulings §B.2). Mutation witnesses: a beni-style owning park in a
+    per-op cache, an owning `cached_src_handle` restored, a
+    `ggml_backend_sycl_release_buffer_refs` step reintroduced, and a `host_task` capture;
   - (ah) **step 2's ring-lock section precedes the snapshot (r6 I-5).** The copy of
     `ring_plan_gen` and of the ring's slots, with the `pinned[slot]` increments, is taken before
     the geometry snapshot, and the fit's ring input is that copy. Mutation witness: revision
@@ -4063,7 +4058,7 @@ claimed ring slot is step 7's occupancy bug.
 | 6c | covered slots reused in place; only the growing ones released | **Held** (rulings §B step 4; §2.4.2). This design also releases an index the candidate no longer uses on the (i) path, since §B step 4 reuses only a slot the candidate still has. The all-covered fast path keeps unused indexes as held room, as zhcn's does. |
 | 8 | GA −726.9, G2 spare 41.1 | **Held** from revision 7.2 (rulings §GA). |
 | 12 | (c) empties the table object, then resets the cached pointers | **Differs, and follows rulings §B step 8 and the lead's I-3 wording:** (c) takes the table pointers, and (e) checks the table's `use_count()` before opening it. Emptying a table that another holder may still read would be the mutation r6 I-3 warned about. The end state is the same. |
-| 13 | a new step (c′), `ggml_backend_sycl_release_buffer_refs(backend, owners)`, that erases owner-matched entries from backend-context caches, plus a holder scan when (e) fails | **Adopted as ruled (rulings §B.1), revision 7.4.** (c′) is §B's step 8′, between step 8 and step 9 (§2.4.2 (i)). It erases from a closed list: the MMVQ q8 `cached_src_handle` (`common.hpp:6587`), the MoE q8 `cached_src_handle` (`:7015`), the `moe_ids_cache` keys and `runtime_tensor_extras`. H7ag names each member, and any other non-store park still fails. `g_data_ptr_cache` is not in the list: it holds no owning handle, and keys on identity plus the publish generation (zhcn's change). The holder scan is adopted (§2.4.2 (e)). |
+| 13 | a new step (c′), `ggml_backend_sycl_release_buffer_refs(backend, owners)`, that erases owner-matched entries from backend-context caches, plus a holder scan when (e) fails | **Superseded by rulings §B.2 (revision 7.5).** Revision 7.4 adopted (c′) as §B.1's step 8′; §B.2 withdrew it, because every listed cache only compares identity. The fields become a non-owning `mem_handle_identity` at the producer, which is zhcn's scope (§2.4.2 (i), "No step 8′"). The holder scan is kept (§2.4.2 (e)). |
 | 14 | the `graph_unwaitable` scan after the yield, `unwaitable_dropped` | **Held** from revision 7.2 (rulings §R). |
 | 15 | (a) gated on recorded state; context-scoped clear | **Held** from revision 7.2, plus rulings §B step 5's "never unpin". |
 | 16 | (c)'s "never its claim" contradicts record mode | **Fixed** (§2.4.2 (i)(c)): a record-mode claim lasts for its graph's life (rulings §REC), and (a) vacated it on an eager event before (c). |
@@ -4084,7 +4079,30 @@ device the plan covers" was not closed under a publish that adds a device. Chang
   concurrent test now covers one device, two devices, and a re-plan racing a load.
 - The teardown release proc's retention move-out to `retain_handles_until_event` is confirmed
   by the lead (§2.4.2 "Teardown").
-- **Rulings §B.1 (zhcn row 13), in the same revision:** step 8′ is (c′) in §2.4.2 (i), with the
-  closed four-member cache list; (e)'s holder rule and H7ag name the fourth class; the §6.9 row
-  13 disposition is updated. The earlier text that called the q8 activation cache (`:6648`) a
-  forbidden park is withdrawn: its `cached_src_handle` is on the list.
+- **Rulings §B.1 (zhcn row 13), in the same revision (superseded in revision 7.5 by §B.2,
+  below):** step 8′ is (c′) in §2.4.2 (i), with the closed four-member cache list; (e)'s holder
+  rule and H7ag name the fourth class; the §6.9 row 13 disposition is updated. The earlier text
+  that called the q8 activation cache (`:6648`) a forbidden park is withdrawn: its
+  `cached_src_handle` is on the list.
+
+**Revision 7.5 (rulings §B.2, §D15, §D16; master is now `3d9414c8c`, which contains jehw).**
+- **§B.2 supersedes §B.1.** Step 8′ (c′) and the fourth holder class are deleted; the holder
+  classes are §B's three (§2.4.2 (i), (e); H7ag). The q8 `cached_src_handle` fields and the
+  `moe_ids_cache` keys become a non-owning `mem_handle_identity`, at the producer, in zhcn's
+  scope. The withdrawal of "the `:6648` activation cache is a forbidden park" stands, for a new
+  reason: it stops being a park because it no longer owns a handle, not because it is on a list.
+- **zhcn rows 6c, 16, 17, as resent with 5.1 (`1e3f54b`), adopted; none conflicts with the
+  rulings.** 6c: on the growth path only replaced device slots go into the batch, and covered
+  device slots go back into the registry entry with the host slots, for the commit's new table
+  (§2.4.2 (e), "Device slots are reused per slot"). 16: a record-mode claim lasts for its
+  graph's life and (a) vacated it (§2.4.2 (c)). 17: without STRICT, (e) logs, drops the batch
+  and continues behind the live-TLSF belt.
+- **§D15:** the first publish reserves and holds host-slot room for the plan's maximum tenant
+  demand; a need beyond it is a step-4 refusal (§2.4.3).
+- **§D16:** the backstop count is carried in the `[CONTEXT-PLAN-BUG]` line and a
+  PRIVATE_TESTING counter; §R's five-field result stands (§2.4.2 (i)(d)).
+- **Line numbers.** jehw landed, so jehw `c41fed119` citations now map to master `3d9414c8c`.
+  The five §E.2 sites are, at `3d9414c8c`: `:17867` (stale identity), `:17881` (live-update
+  lease), `:17886` (plan changed while acquiring L1), `:18122` (the relock), `:18646` (the lost
+  CAS), and `:18515` is the superseded ring `busy`. The other jehw citations keep their
+  `c41fed119` lines, named as such.
