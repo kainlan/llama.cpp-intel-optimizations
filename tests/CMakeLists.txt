@@ -3147,6 +3147,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# llama.cpp-je3b: source gate -- "may oneDNN PP run here" has one source,
+# ggml_sycl_onednn_pp_candidate. The MXFP4 direct oneDNN arms ask it (with the
+# MXFP4_DIRECT route, which moves only the batch floor) instead of admitting
+# themselves with M >= 2 && executable_on_device. Host-only, reads the sources
+# as text. Same registration shape as test-sycl-onednn-woq-q8-source.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-onednn-pp-admission-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-onednn-pp-admission-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
 # llama.cpp-pktr: source gate -- the Q8_0 dense-weight coalesced/SOA
 # tile-alignment predicate must be defined exactly once
 # (q8-dense-layout-rule.hpp) and every chokepoint that resolves a dense Q8_0
@@ -3299,8 +3312,9 @@ endif()
 # {512, 1024, 2048, 4096} ladder and its n_batch/n_ctx/MoE-ceiling caps, the
 # per-candidate probe (BUSY backoff, STALE_IDENTITY, would_demote_kv),
 # publish-before-reserve ordering, the host-fallback query consulted after
-# reserve, the settle step, the stop-reason strings (eight since
-# llama.cpp-7n6n added "cached" -- see below), and exactly one [SYCL-PLAN]
+# reserve, the settle step, the nine stop-reason strings (including "cached"
+# for a tuning-cache hit, see below, and "compute buffers did not fit" for a
+# candidate whose compute-buffer reserve throws), and exactly one [SYCL-PLAN]
 # auto n_ubatch= WARN. Host-only, reads the sources as text. Same
 # registration shape as test-sycl-compute-buffer-fallback-source above.
 #
@@ -3319,6 +3333,15 @@ if (Python3_Interpreter_FOUND)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()
+
+# llama.cpp-pyu4: executes the pure helpers in src/llama-auto-ubatch.h --
+# llama_auto_ubatch_ladder_has_candidate(), the predicate behind the trial's
+# early exit before its ladder loop, on the shapes where no rung lies in
+# [fallback_ubatch, cap]; and llama_auto_ubatch_settle_needs_publish(), the
+# settle step's republish decision, including a publish that threw after
+# landing on some devices. Header-only and pure integers: no device, no
+# model, no allocation, so it builds and runs in every configuration.
+llama_build_and_test(test-auto-ubatch-ladder.cpp)
 
 # llama.cpp-9goq: source gate over ggml/src/ggml-sycl/CMakeLists.txt itself --
 # (A) every target_link_libraries(...) naming the bare `ggml-sycl` MODULE
