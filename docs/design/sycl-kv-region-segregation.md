@@ -1,10 +1,12 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 2. Author: impl-moua, 2026-09-26. This revision answers two reviews:
+Design, revision 3. Author: impl-moua, 2026-09-26. The revisions answer three reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
-- the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2.
+- the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
+- design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3.
 
-Both reviews read revision 1.
+r1 and the audit read revision 1. r2 read revision 2 at `19f7f08bf`, before the audit fold
+(`1972b32b0`) reached it; §6.3 re-checks each audit row it names against the folded text.
 
 Revisions cited:
 - `master` = `401ff76cc`, the base of `task/moua`.
@@ -30,13 +32,28 @@ Every file:line below names its revision.
   - A context's buffers find it through a llama-side, ContextId-keyed **region scope**.
   - The fit and the reservation run the same pure function over the same geometry,
     re-checked under the lock.
+  - Inside the transaction (which already holds L1), the order is:
+    1. release the u1bb ring;
+    2. plan;
+    3. yield;
+    4. run the byte-budget steps;
+    5. commit-carve;
+    6. re-admit the ring.
+
+    A guard declared before L1 rolls back on any refusal, and the registry entry is published
+    only after the plan's CAS (§2.4.2).
 - **Error path:** a device-planned KV layer that does not land in its region is a planner
   bug. It is refused with `[KV-PLAN-BUG]` at ERROR, and aborts under
   `GGML_SYCL_STRICT_KV_PLAN=1`. It is never admitted and then spilled.
 - **Holes:** weight-side holes and buried optional tenants are usable region extents
   (regions are multi-extent). Only holes smaller than one slot are a limit (§2.9).
-- **Landing:** L1 is done (`eab1ebeb6`, `9e0a708dc`, with the review fixes in `97315421b`). L2 is folded into L6, so no interim
-  guard turns today's spills into refusals. L3-L7 need jehw and u1bb merged.
+- **KV shape (r2 N-C1):** slot sizes come from the shape llama will actually allocate
+  (`type_k`, `type_v`, `v_trans`, and the per-context KV layer set), which llama sends through
+  a new publish entry point. One function computes a layer's bytes for the fit, the
+  reservation and the tiered claim (§2.4.4).
+- **Landing:** L1 is done and approved (`eab1ebeb6`, `9e0a708dc`, review fixes `97315421b`
+  and `456650c01`). L2 is folded into L6, so no interim guard turns today's spills into
+  refusals. L3-L7 need jehw and u1bb merged.
 
 ## 0.1 Acceptance conditions: the four principles
 
@@ -46,9 +63,9 @@ that enforces the principle and the check that shows it.
 | | principle | enforced by | shown by |
 |---|---|---|---|
 | **P1** | The unified cache is the only allocator. There is no out-of-arena fallback for planned KV. | KV regions are carved from the arena TLSF (§2.4). The tiered device branch issues no `unified_alloc` (§2.6). A region reservation never falls through to `unified_cache_malloc_device_tracked` (§2.8). | H7a/b; C1 counts **zero** KV-role EXT-ALLOC lines, and total EXT-ALLOC bytes no higher than the base run (§3.3). |
-| **P2** | `mem_handle` / `alloc_owner` are the only ownership surfaces. | A region is an owner-first `CACHE_SUBALLOCATION`. The registry, each KV buffer, and each layer's view hold its `mem_handle`. Slots are views on that handle, not allocations. Retained holes have no owner and are never handed out (§2.3). | G1 checks `arena_owns` and the handle refcounts. H7f checks that no raw pointer is stored as region state. |
+| **P2** | `mem_handle` / `alloc_owner` are the only ownership surfaces. | Each region **extent** is an owner-first `CACHE_SUBALLOCATION` with its own `mem_handle`. The registry, each KV buffer, and each layer's view hold the extent handles they touch. A slot is `extent_handle.slice()`, not an allocation. Retained holes have no owner and are never handed out (§2.3). Final handle drops never happen under a listed lock (§2.4.2). | G1 checks `arena_owns` and the handle refcounts. H7f checks that no raw pointer is stored as region state. |
 | **P3** | Placement decides the executor. | Residency is still decided per layer by the planner. Host-tier layers keep executing on the CPU exactly as today, and only the capacity input changes (§2.5). | C2/C3 gates; the demotion WARN names the layers. |
-| **P4** | Plan == reality. A KV region that does not fit is a planner bug: refused, never admitted and then spilled. | One function, `kv_region_fit`, decides "fits" for the planner, the reservation (re-run under the lock), the ring admission and the `-c` hint. Every second source of "fits" is deleted or rederived (§2.2). The carve commits exactly the extents the fit named. | H2 property test (fit ⇔ carve), H7d (one source), G1 forced mismatch ⇒ `[KV-PLAN-BUG]`. |
+| **P4** | Plan == reality. A KV region that does not fit is a planner bug: refused, never admitted and then spilled. | One function, `kv_region_fit`, decides "fits" for the planner, the reservation (re-run under the lock), the ring admission and the `-c` hint. One function, `kv_layer_tensor_bytes`, sizes a layer for the fit and for the claim, from the shape llama allocates (§2.4.4). Llama's residency answers come from the registry (§2.5). Every second source of "fits" is deleted or rederived (§2.2), and the capacity primitives are allowlisted (H7d). The carve commits exactly the extents the fit named. | H2 property test (fit ⇔ carve), H2/H3 shape cases (q8_0, `v_trans`, MTP), H7d (one source), G1 forced mismatch ⇒ `[KV-PLAN-BUG]`. |
 
 ## 1. Root cause (the 32K case)
 
@@ -142,23 +159,58 @@ offset 0                                                                        
                                            ^ weight frontier     ^ context frontier
 ```
 
-A request's **lifetime class** is derived from `alloc_role`. The zone it names does not
-decide it, because many non-weight requests name `vram_zone_id::WEIGHT` only to stay out of
-the B50 tail zones (r1 C3). Examples: master `ggml-sycl.cpp:46120`, the per-op MMVQ scratch,
-whose comment reads *"Keep tiny MMVQ Q8 activation scratch out of arena tail zones on B50"*;
-and `ggml-sycl.cpp:97965`, the SOA-graph Q8_1.
+A request's **lifetime class** is carried explicitly (r2 m3). L4 adds a
+`shared_zone_lifetime lifetime` field to `alloc_constraints`, with UNSET as its default, and threads it
+into `zone_alloc`. `zone_alloc` has no role parameter today (master `unified-cache.cpp:22479`).
+- When the field is UNSET, the class is derived from `alloc_role`: WEIGHT gives WEIGHT, and
+  every other role gives TRANSIENT.
+- The call sites that know better set it: the optional pass sets OPTIONAL; the
+  KV region carve sets KV_REGION; the u1bb ring and `backend-buffer-kv-zone` set CONTEXT.
+  CONTEXT and TRANSIENT are both `alloc_role::COMPUTE`, so the role alone cannot separate them.
+- The zone a request names does not decide its class. Many non-weight requests name
+  `vram_zone_id::WEIGHT` only to stay out of the B50 tail zones (r1 C3). Examples: master
+  `ggml-sycl.cpp:46120`, the per-op MMVQ scratch (*"Keep tiny MMVQ Q8 activation scratch out
+  of arena tail zones on B50"*), and `ggml-sycl.cpp:97965`, the SOA-graph Q8_1.
 
 | class | who | side | placement |
 |---|---|---|---|
-| `WEIGHT` | `alloc_role::WEIGHT`, including `EXPERT_CACHE` (vram-pool.cpp:81, unified-cache.cpp:18484: on-demand expert rows, which are real weights) | weight | TLSF `allocate` (today's behaviour), tag `TAG_WEIGHT`; after the optional ladder exists, first a weight-side hole, then the gap front (§2.3.3) |
+| `WEIGHT` | `alloc_role::WEIGHT`. That includes the runtime expert-cache fills, which are `alloc_role::WEIGHT` with `runtime_category::EXPERT_CACHE` (vram-pool.cpp:81, unified-cache.cpp:18484): on-demand expert rows, which are real weights. It also includes a `SYCL<n>` weight buffer that overflows RUNTIME into the shared zone (r2 m2, below). | weight | TLSF `allocate` (today's behaviour), tag `TAG_WEIGHT`; after the optional ladder exists, first a weight-side hole, then the gap front (§2.3.3) |
 | `OPTIONAL` | optional layout copies (jehw's `optional_layout`) | weight frontier | `allocate_gap_front`, tag `TAG_OPTIONAL` |
 | `KV_REGION` | the per-(ContextId, device) KV region | context | the extents chosen by `kv_region_fit` (§2.4) |
-| `CONTEXT` | u1bb ring KV-zone slots, `backend-buffer-kv-zone` compute overflow | context | `context_side_place` (§2.3.2) |
+| `CONTEXT` | u1bb ring KV-zone slots; the `backend-buffer-kv-zone` overflow of a **compute** buffer | context | `context_side_place` (§2.3.2) |
 | `TRANSIENT` | every **non-WEIGHT role** that names `WEIGHT` or `KV`: COMPUTE/STAGING scratch (ggml-sycl.cpp:46120, :97965; mmvq.cpp:16863; unified-cache.cpp:21455; common.hpp:6658), persistent buffers (unified-kernel.cpp:4890), scratch_pool (unified-cache.cpp:20629), and the fattn packed-K/sidecar KV-role requests (fattn.cpp:569, :1640) | context | `context_side_place`, bounded by the planned transient reserve (§2.4.3) |
 
-The TRANSIENT class stays in the shared chunk, so it keeps the reason those callers chose
-`WEIGHT` (the chunk is not a tail zone). Moving it off the weight side fixes three of r1's
-C3 consequences:
+**`backend-buffer-kv-zone` keeps its buffer's role (r2 m2).** Standard `SYCL<n>` buffers carry
+both model weights and scheduler compute buffers. `alloc_role` is WEIGHT for a weight buffer
+(master `ggml-sycl.cpp:37164-37166`, `should_use_runtime` at `:37184`). The KV-zone fallback
+then hard-labels every request `role=COMPUTE` (`:37231-37236`). Under class-from-role, that
+would put a model's weights on the context side for the model's lifetime. L4 makes the
+fallback pass the buffer's own `alloc_role`: a weight buffer is WEIGHT-class, and a compute
+buffer is CONTEXT-class.
+
+**The B50 tail-zone quirk (r2 N-I8, corrected).** Revision 2 said TRANSIENT "keeps the reason
+those callers chose `WEIGHT` (the chunk is not a tail zone)". That was false. In single-chunk
+mode the ONEDNN, RUNTIME and SCRATCH tail zones are **in the same chunk**, at high offsets
+(master `unified-cache.cpp:22124-22160`). The quirk is positional, and it is uncharacterised.
+The workaround's own comment grounds it in the low end: *"Weight-zone pointers are already
+exercised by S1-preloaded weights"* (master `common.hpp:6655-6657`).
+- This design moves TRANSIENT, and the KV regions, to the **top** of the shared zone,
+  directly below ONEDNN. Those pages are not the S1-exercised ones. Today a small model at
+  the default PCT never touches them.
+- It is therefore an acceptance item, not an argument: **C2a, B50 MMVQ/STAGING first submit**
+  (§3.3). It is the Mistral B50 gate on `level_zero:1` at the default PCT, where the region
+  and the per-op scratch sit at the top of a mostly empty shared zone.
+- **The fallback lever**, if C2a fails. The two call sites that carry the B50 comment
+  (master `ggml-sycl.cpp:46120` MMVQ Q8 scratch, and `common.hpp:6658` STAGING) set
+  `lifetime = WEIGHT_SIDE_TRANSIENT`. That places them first-fit from offset 0, as today, into
+  the pages the S1 weights exercise.
+  - Its cost is today's C3(i): they can bury the ladder.
+  - The class exists only for those two sites and is gated by H7 (no third site), so the rest
+    of TRANSIENT stays on the context side.
+  - L6 lands the lever dark, with an env override `GGML_SYCL_B50_SCRATCH_WEIGHT_SIDE=1` to test
+    it. It becomes the default for those two sites only if C2a fails.
+
+Moving TRANSIENT off the weight side fixes three of r1's C3 consequences:
 - **C3(i), burying:** it can no longer front-carve above the optional ladder and bury it.
 - **C3(iii), churn:** per-op churn never touches the weight side. The generation counter it
   used to bump is gone anyway (§2.4.2).
@@ -173,6 +225,9 @@ enough.
 **What can still bury the ladder.** A `WEIGHT`-class allocation made after the optional pass
 that fits no weight-side hole: a runtime expert-cache fill, a re-layout, or a second model's
 load. That front-carves above the ladder, and `frontier_walk` then stops at it.
+- **On GPT-OSS this is the main path, not a corner (r2 m1).** Runtime expert-cache fills are
+  WEIGHT-class and arrive after the optional pass. They take weight-side holes first
+  (§2.3.3), and bury the ladder only when none fits. H5 covers it with an EXPERT_CACHE fill.
 - **This is not a P4 hazard.** The fit reads the actual block list, so what it reports is
   what lands.
 - **It costs little capacity.** Buried lease-free optional tenants still yield when a
@@ -183,8 +238,20 @@ load. That front-carves above the ladder, and `frontier_walk` then stops at it.
 
 ### 2.2 One fact: every source of "fits"
 
-Every site that decides whether device KV fits is listed here with what it becomes. H7d
-enforces this list, with a mutation witness per row (r1 I1).
+Every site that decides whether device KV fits, or which layers are device-resident, is
+listed here with what it becomes (r1 I1; r2 N-I4 added the rows marked r2).
+
+A list of rows fails open to any site nobody listed, so H7d does not check rows. It
+**forbids the capacity primitives themselves** outside an allowlist:
+- the primitives are `unified_cache_kv_vram_available`, `zone_available(KV|WEIGHT)`,
+  `zone_largest_free`, `largest_free_block`, `ggml_sycl_kv_capacity_live`, and
+  `kv_zone_snapshot`/`fit_capacity`;
+- the allowlist holds their definitions, the no-arena branches (each marked with a comment
+  H7d matches), log-only readers that feed no decision, and test code
+  (`kv_zone_snapshot`/`fit_capacity` survive only as a test oracle, §4 seams).
+
+Every other occurrence in `ggml-sycl.cpp`, `unified-cache.cpp` and `fattn.cpp` fails the gate.
+Each allowlist entry and each forbidden primitive has a mutation witness.
 
 | site (master unless marked) | today | becomes |
 |---|---|---|
@@ -196,6 +263,12 @@ enforces this list, with a mutation witness per row (r1 I1).
 | `-c` hint, `ggml_sycl_largest_fitting_n_ctx_live` | bytes | `kv_region_fit` |
 | the demotion WARN's "free for KV" | bytes | the region capacity the fit computed |
 | `largest_free_block()` anywhere in a fit decision | approximate (the head of the highest SL list) | never; fits read `frontier_walk` / `gap_below`, which are exact (L1, `9e0a708dc`) |
+| (r2) MMID budget demotion: `ggml_sycl_try_demote_runtime_kv` on `BUDGET_EXCEEDED` / `GROWTH_BUDGET_EXCEEDED`, master `:17919-17960`, and its `-c` hint via `ggml_sycl_largest_fitting_n_ctx_live` | byte budget, after the re-fit, so it can demote layers the region already holds slots for | it keeps its constraint, which is a different fact (the device's total VRAM budget, including RUNTIME demand), but it runs **before the carve**. The commit re-fit starts from its residency and can only demote further (§2.4.2 step 5). Its `-c` hint reads `kv_region_fit`. |
+| (r2) `rebuild_runtime_per_device_vram` (`:17868`) and `moe_mmid_reaccount_replacement` (`:17881`) | byte accounting refusals | arena devices: their KV term is the fit's region bytes (Σ slot sizes), the same number the carve takes. Their refusals roll back through the transaction guard (§2.4.2). |
+| (r2) u1bb ring admission: `kv_capacity_bytes = ggml_sycl_kv_capacity_live(...)` and `kv_bytes = ggml_sycl_device_kv_bytes_with_slack(...)` (u1bb `:18334-18335`; the function at `:16958-16970`); u1bb's re-fit capacity (`:18009`) | live bytes, counting the live ring's KV-zone bytes as free | the ring is released before the fit (§2.4.2 step 2) and re-admitted by `context_side_place` on the post-region geometry. Both u1bb reads are deleted for arena devices, and the re-fit reads `kv_region_fit`. |
+| (r2) `ggml_backend_sycl_kv_layer_on_device_from_dev` (master `:107332-107343`), llama's residency hook | the process-global plan snapshot | under an open region scope, the registry entry for this ContextId (§2.5, r2 N-I5). Outside a scope, as today. |
+| (r2) `GGML_SYCL_BLOCK_EXEC_CANDIDATE_KV` (master `:38623-38649`, opt-in) | reassigns `kv_device` at buffer-alloc time | arena devices: ignored with one WARN per process, like `GGML_SYCL_VMEM_KV` (§2.6). If it is ever wanted there, the reassignment moves into the fit's input. |
+| (r2 N-C1) the tiered slice's per-layer size, `kv_slice` (master `:38593-38612`), and `update_runtime_kv_sizes` at alloc time (`:38625`) | the actual buffer size divided evenly across its layers; the plan re-sized from the geometry | arena devices: the slot table, sized by `kv_layer_tensor_bytes` from the published shape (§2.4.4). The claim checks the buffer size against the table's sum. |
 
 ### 2.3 The context side (unified-cache, L4)
 
@@ -210,23 +283,42 @@ Every read and write of `context_side` and of the TLSF runs under
 (r1 044k; L1 documents the contract at `9e0a708dc`). The snapshot copies out a POD
 `shared_zone_geometry` and releases the lock. The pure fit then runs on the copy.
 
-Lock order, in canonical contract §12.5's ranks:
+**Locks, in canonical contract §12.5's ranks (r2 N-I1).**
 
-```
-L3 kv_region_mutex_ (new; per device)  ->  L4 direct_stage_mutex_, rw_mutex_  ->  L5 arena_allocator_group_mutex(zone)
-```
+What already runs under L1:
+- The runtime-context transaction takes `g_tensor_inventory_mutex` (L1) and holds it for
+  its whole body (jehw `ggml-sycl.cpp:17687` to the function's end at `:18401`; master
+  `:17673` to `:18306`).
+- On jehw that body includes the optional-layout yield. It includes the yield's reader-barrier
+  wait (jehw `unified-cache.cpp:7835`, `readers_done.wait_and_throw`) and its final drop of the
+  deferred-free handles (`:7860`, `released.clear()`).
+- Both are things §12.5 forbids under **any** listed lock. They are pre-existing on jehw, and
+  moua does not widen them: it adds no wait and no final-handle drop under L1, or under its
+  own lock.
+- The consequence for moua: region **reservations are already globally serialised by L1**,
+  because every reservation happens inside the transaction. `kv_region_mutex_` exists only
+  because two paths touch the registry without L1: the claim (inside `create_memory`) and
+  teardown (the exec-context close, §2.4.2).
 
-- `kv_region_mutex_` is a new lock. §12.5 says *"an unclassified lock is a failing census
-  item"*, so it is ranked **L3**: a keyed-registry lock beside `g_pending_kv_layer_masks_mutex`
-  and the planned keyed `context_graph_mutex[ContextId]`, with ascending device ID as the
-  tie-break.
-- L4 adds it to the §12.5 table in the same commit that introduces it.
+**`kv_region_mutex_`** (new, one per device):
+- **Rank L3**, beside `g_pending_kv_layer_masks_mutex`, with ascending device ID as the
+  same-rank tie-break. So L1 → L3 is legal, and it sits below L4 `direct_stage_mutex_`.
+  L4 adds it to the §12.5 table in the commit that introduces it.
+- **Strictly leaf**, in the same sense as `moe_discovery_registry::mutex_`: it is never held
+  while any other lock is acquired, and never across a wait, an allocation, a callback or
+  the destruction of a final `mem_handle`.
+- Every registry access is a short copy-in or copy-out:
+  - lookups copy handles out (a refcount increment, never a final drop);
+  - inserts move handles in;
+  - erases **move the entry out, unlock, and only then drop it**: on rollback, on a shape
+    change, and on teardown.
+- It is never held across the yield, the carve or the ring re-admission (§2.4.2).
 
+**The group mutex** `arena_allocator_group_mutex(zone)` is L5. It is held only for the
+geometry snapshot copy-out and for the carve, and never across the yield or a wait.
 - The existing order `cache locks -> group lock` (staging calls `zone_alloc` under the cache
   locks) is preserved.
-- `kv_region_mutex_` serialises region reservations and registry edits on a device. It is
-  never taken by the yield path, `zone_free` or staging, so it adds no cycle.
-- **No code holds the group mutex while calling the yield** (r1 C2, §2.4.2).
+- No code holds the group mutex while calling the yield (r1 C2, §2.4.2).
 
 #### 2.3.2 Placement
 
@@ -259,10 +351,16 @@ L3 kv_region_mutex_ (new; per device)  ->  L4 direct_stage_mutex_, rw_mutex_  ->
      (`arena_unregister_exact`) *before* the block is marked RETAINED. This is the same order
      a normal `zone_free` follows. A stale pointer into the run then resolves to nothing in
      `unified_lookup`, never to the dead owner.
-  2. **Reuse is owner-first.** The M3 sequence above mints the new block's control (a fresh
-     `alloc_owner`, class derived from the request, §2.10) before the carve. It registers the
-     carved extent with `arena_register_exact` under the new `allocation_id`. The re-retained
-     remainder is registered to no one.
+  2. **Reuse is owner-first, through `zone_alloc`'s own protocol (r2 m5).** No new minting
+     code:
+     - The new block's `allocation_id` is minted **before** the group lock, as `zone_alloc`
+       already does (master `unified-cache.cpp:22490-22494`: *"Mint before taking the
+       physical allocator-group lock"*).
+     - The carve and `arena_register_exact` then run under that lock, with the existing
+       failure path that frees the block if registration fails (`:22543-22546`).
+     - The context-side placements (the M3 sequence, the region carve) are new branches
+       inside `zone_alloc`'s locked section. They are not a separate hand-minted path.
+     - The re-retained remainder is registered to no one.
   3. **Rebuild and destroy treat retained runs as free.** The arena rebuild/destroy and
      settle paths decide "live" by registered allocations, which retained runs never are.
      Every place that reads a shared TLSF's `used()` as "live bytes" subtracts
@@ -301,6 +399,15 @@ region may span extents on several TLSFs, and within one TLSF it may use several
 (§2.4.1). The fit packs slots across all of them with the same greedy rule, so N-chunk is
 not a separate policy.
 
+**Which context side takes a CONTEXT or TRANSIENT request (r2 m7).** The zone the request
+names picks the TLSF:
+- `WEIGHT` goes to the **last** weight chunk's TLSF. Its frontier is the one the S1 staging
+  reached last, so it is the least likely to hold a ladder a later weight would bury.
+- `KV` goes to the tail chunk's KV TLSF.
+
+`transient_reserve` (§2.4.3) is computed per TLSF from the same routing, and the fit keeps
+each TLSF's share free on that TLSF. H6 pins the routing.
+
 C0 decides on hardware whether the B70 exercises this path. B50 at PCT≤100 is single-chunk
 (§1.1).
 
@@ -323,13 +430,17 @@ kv_region_fit(const shared_zone_geometry & g, const kv_region_request & r) -> kv
   weight that buried them, each with the free run their release would form. This needs a
   whole-TLSF block census from the snapshot, which is a second L4 read primitive beside
   `frontier_walk`;
-- `self_extents`: this ContextId's existing region on this device, when the request is a
-  same-shape republish (§2.5).
+- `self_extents`: the extents this ContextId carved earlier in the **same** transaction call,
+  on a retry of the commit loop (§2.4.2 step 6). A same-shape republish never re-fits (step 1),
+  and a shape change's old region is still occupied, so neither is a self extent.
 
 The request `r`:
-- the slot sizes, from `kv_layer_alloc_bytes()` (jehw's single definition), grouped
-  full-attention first, then SWA, each group in layer order;
-- the planned `transient_reserve` (§2.4.3).
+- the slot sizes, `kv_layer_alloc_bytes(kv_layer_tensor_bytes(...))` over the published KV
+  shape (§2.4.4), for the layers the shape says hold KV. They are grouped full-attention
+  first, then SWA, each group in layer order;
+- `forced_host`: layers an earlier step of the same transaction already demoted (the MMID
+  budget demotion, §2.4.2 step 5). The fit may demote further but never promotes them;
+- the planned `transient_reserve` per TLSF (§2.4.3).
 
 **Output.**
 - `fits`;
@@ -389,96 +500,278 @@ The request `r`:
 
 #### 2.4.2 `reserve_kv_region` and the transaction step (L4 + L6)
 
-For each device `d` of a context `c` in publish mode, with `kv_region_mutex_(d)` held:
+The runtime-context transaction runs under L1 (§2.3.1). For a context `c` in publish mode,
+the region work sits inside it as follows.
 
-1. **Idempotence (r1 C1).**
-   - If the registry has `(c, d)` with the **same shape key** (n_ctx, n_seq_max, kv_unified,
-     swa_full, type_k/type_v, the slot table), return it. There is no re-fit and no side
-     effect. This is today's `admitted_kv` rule, *"a same-shape republish by an admitted
-     context keeps the published residency"* (jehw `ggml-sycl.cpp:17785` block, master
-     `:17771`), made physical.
-   - It makes the split case safe: every backend's run of the transaction re-fits every
-     device (master `:17771-17772`, *"each re-fits, because admission is per backend"*).
-     The first run to reach `(c, d)` reserves, and every later one finds it.
-   - It also makes the auto micro-batch ladder safe: master `llama-context.cpp` republishes
-     via `sycl_resync_runtime_context_flash_attn()` per candidate (`:1571`) and at the settle
-     (`:1936`), with only `n_ubatch` changed, which does not change the KV shape.
-2. **Plan, with no lock held.**
-   - Snapshot the geometry: copy it out under the group mutex, then release.
-   - Run `kv_region_fit`. That yields the residency, the yield prefix and the extents.
-3. **Yield, with no lock held (r1 C2).**
+**The transaction guard (r2 N-I3).** L6 declares a `kv_region_txn` guard **before** the
+transaction's L1 `lock_guard`. Reverse destruction order therefore runs the guard's
+destructor after L1 is released, which is the same technique contract §12.5 records for the
+zone-reset audit's site-visit guard. The guard owns everything this call has done and not
+yet published:
+- every extent handle this call carved;
+- every pending registry edit: new entries, and old entries replaced by a shape change;
+- the u1bb ring's pre-transaction `n_ubatch`, when step 2 released the ring.
+
+On **any** return other than a committed publish, the destructor rolls all of it back. That
+covers a `refuse()`, a `busy()`, or an exception, from any step. The pending edits are
+discarded, the carved handles are dropped (outside L1 and outside `kv_region_mutex_`, so
+their `zone_free` runs lock-clean), and the ring is re-admitted at its old `n_ubatch` with
+u1bb's existing rollback call.
+- Yields already performed are **not** undone. They released optional tenants, which costs
+  prompt-processing performance, never correctness, and the yield WARN names them.
+
+**Steps.**
+
+1. **Idempotence (r1 C1; r2 N-I9, m10).**
+   - For each device `d`, look up `(c, d)`: copy it out under `kv_region_mutex_`, then unlock.
+     If an entry exists with the **same shape key**, reuse it: no fit, no side effect. If every
+     device matches, steps 2-6 are skipped, and the transaction continues at step 7 exactly as
+     today.
+   - **The key is built from request inputs only, never from fit outputs.** It is
+     `(n_ctx, n_seq_max, kv_unified, swa_full, the published KV shape's digest)`. The digest
+     covers `type_k`, `type_v`, `v_trans`, `no_alloc` and the per-layer descriptors (§2.4.4).
+     It holds no slot table and no residency.
+   - **`n_ubatch` is excluded.** SWA slot bytes depend on it (the SWA branch of
+     `kv_layer_bytes_for_kind`, master `unified-cache.hpp:580`), but llama allocates the KV
+     once, at `create_memory` (master `llama-context.cpp:869`), with the `n_ubatch` of the
+     constructor's first publish (`:810`). The auto micro-batch ladder republishes with other
+     values after the KV exists (`:1039` → `:1571`, `:1936`). A region's slot sizes are
+     therefore **frozen at the reservation's `n_ubatch`**, which is the value llama used. A
+     ladder republish matches the key and never reserves a second region. That is the B50
+     GPT-OSS `-ub 1024` case in C3.
+   - This is today's `admitted_kv` rule, *"a same-shape republish by an admitted context keeps
+     the published residency"* (master `ggml-sycl.cpp:17738-17747`, jehw `:17752-17760`), made
+     physical.
+   - It makes the split case safe. Every backend's run of the transaction re-fits every device
+     (*"each re-fits, because admission is per backend"*, the comment block that follows). The
+     first run to reach `(c, d)` reserves and publishes the entry. L1 serialises the runs, and
+     every later one finds it.
+2. **Release the ring first (r2 N-I6).**
+   - When a reservation is needed on `d` and the u1bb PP MoE oneDNN ring holds KV-zone slots
+     there, release those slots **before** the snapshot. L6 splits u1bb's
+     `ggml_sycl_replan_pp_moe_onednn_ring` into its release half and its admit half.
+   - `RELEASE_REFUSED` (a slot claimed by an in-flight dispatch) returns `busy` here, before
+     anything is carved.
+   - This is u1bb's own order, *"KV wins over them, and that transaction re-admits the ring
+     after KV"* (u1bb `ggml-sycl.cpp:16950-16953`), made physical. The ring's blocks are then
+     simply free in the geometry, and nothing counts them twice.
+   - On a same-shape republish (step 1 matched), the ring is not released here. u1bb's own
+     tail re-plan handles an `n_ubatch` change, exactly as today.
+3. **Plan.** Snapshot the geometry (a copy-out under the group mutex, then release), and run
+   `kv_region_fit`. That yields the residency, the yield prefix, and the extents.
+4. **Yield.** Neither the group mutex nor `kv_region_mutex_` is held; L1 is held, as it
+   already is on jehw.
    - Call `yield_optional_prefix(d, k)`. This is jehw's `yield_optional_layouts` (jehw
-     `unified-cache.cpp:7737-7880`) with a strict-prefix selection.
-   - It takes `direct_stage_mutex_` and `rw_mutex_` itself, waits on its barrier with no lock
-     held, and drops the deferred rows with no lock held. That drop is what reaches
-     `zone_free` and the group mutex.
-   - `kv_region_mutex_` is still held, but the yield never takes it, so there is no cycle.
-   - The rewrite keeps jehw's reader barrier gate and the optional-layout epoch bump
-     unchanged (audit m4). It only changes *which* copies are picked: the strict frontier
-     prefix plus the buried tenants the fit chose.
-   - A yielded copy is never lazily re-staged at dispatch. Dispatch reads the primary's
-     materialized layout (P3, "the loaded layout is the answer"). H7 carries a source check
-     for this.
-   - Inherited, not widened: jehw's oneDNN WOQ copy readers take no lease, and recorded exec
-     graphs bake the copies' pointers (610516bd7's own message). That is a P2 migration site
-     moua inherits. The barrier gate and epoch bump are what make the release safe today,
-     and moua keeps both.
-4. **Commit, under the group mutex.**
-   - Re-snapshot, and re-run `kv_region_fit` on the live geometry.
-   - If the result equals step 2's (same residency, same extents), carve each extent
-     owner-first (one control per extent) and register
-     `(c, d) -> {extent mem_handles, shape key, layout}`.
-   - If it differs, release the lock and go back to step 2. This replaces revision 1's
-     global `geometry_generation`, which every per-op scratch alloc/free would have bumped
-     (r1 I5, C3(iii)). Staleness is decided by re-running the fit and comparing its result,
-     not by a counter.
-5. **Shortfall is a runtime outcome, not a planner bug (r1 C2).**
-   - The yield may return `freed < picked`, via jehw's `pending_bytes`, or when its barrier
-     wait fails (the frees stay queued).
-   - The re-fit in step 4 then sees less space, and the loop re-plans with the real geometry:
-     it demotes more layers.
-   - Demotion always terminates, because all layers on the host always fit. The loop is
-     bounded at 3 iterations. After that the transaction refuses with a named cause
-     (`region geometry kept moving`), never PLAN_BUG.
-6. **PLAN_BUG is only this:** the step-4 re-fit said `fits`, and carving those extents
-   failed. That is an allocator bug by construction. §2.8 covers it.
+     `unified-cache.cpp:7737-7880`) with a strict-prefix selection, plus the buried tenants the
+     fit chose (§2.9).
+   - It keeps jehw's reader barrier gate unchanged.
+   - **The optional-layout epoch bump stays where jehw has it: in the transaction, not in the
+     yield** (audit m4). After a yield that retired anything, the transaction calls
+     `ggml_sycl_optional_layouts_retired()` (jehw `ggml-sycl.cpp:17904`, which bumps
+     `g_ggml_sycl_optional_layout_epoch`, `:17606-17609`). Graph compute compares against that
+     epoch before replaying (`:105557-105565`).
+   - **A yielded copy is never lazily re-staged.** Dispatch reads the primary's materialized
+     layout (P3, "the loaded layout is the answer"), and H7h gates it.
+   - Inherited, not widened:
+     - jehw's oneDNN WOQ copy readers take no lease, and recorded exec graphs bake the
+       copies' pointers (610516bd7's own message). That is a P2 migration site moua inherits.
+       The barrier gate and the epoch bump are what make the release safe today, and moua
+       keeps both.
+     - The yield's wait and final drops under L1 (§2.3.1).
+5. **The byte-budget steps, in their existing order (r2 N-I4).** These are
+   `rebuild_runtime_per_device_vram`, `moe_mmid_reaccount_replacement`, and the MMID re-plan
+   with its `ggml_sycl_try_demote_runtime_kv` fallback.
+   - Under an arena, their KV term is the fit's region bytes.
+   - A demotion here only removes device layers. It becomes the fit's `forced_host` input, so
+     the carve reflects it, and the carve never holds slots for a layer this step demoted.
+   - A refusal here rolls back through the guard. So far there is nothing to roll back
+     except the ring.
+6. **Commit the carve, under the group mutex (r2 N-I7).**
+   - Re-snapshot, and re-run `kv_region_fit` on the live geometry with `forced_host`.
+   - If it fits **with no further yield**, carve its extents owner-first (one control per
+     extent, through `zone_alloc`'s mint-before-lock protocol, §2.3.2). The handles go into the
+     guard. The extents may differ from step 3's, because live TRANSIENT churn below the anchor
+     moves them, and that is fine.
+     - If its residency differs from step 3's with no further yield needed (a shortfall),
+       commit that residency too. Re-planning on the same geometry would compute the same
+       answer, so looping would change nothing.
+   - If it needs **more yield**, release the group mutex and go back to step 3.
+   - The loop is bounded at 3 iterations. After that the transaction refuses with a named
+     cause (`region geometry kept moving`), never `[KV-PLAN-BUG]`.
+   - Across devices, carves run in device order. A later device's refusal rolls back the
+     earlier ones through the guard. On a retry, the fit counts `c`'s own carves from this call
+     through `self_extents`, so a retry never competes with itself.
+7. **Re-admit the ring, and the rest of the transaction.**
+   - If step 2 released the ring, its admit half runs through `context_side_place` on the
+     post-region geometry. Otherwise u1bb's own tail re-plan runs as today, placing through
+     the same function. Failure is u1bb's existing refusal (*"PP MoE oneDNN scratch ring does
+     not fit"*), and the guard rolls the region back.
+   - The remaining steps run as today, and any refusal among them rolls back the same way:
+     the non-FA scratch check, the MMID workspace materialization, and the publication CAS
+     (master `:18223-18258`).
+8. **Publish.** Only after the publication CAS succeeds does the guard commit. Commit cannot
+   fail, and it is the last step:
+   - under `kv_region_mutex_`, insert the new entries and move out the shape-replaced ones;
+   - unlock;
+   - the moved-out handles stay in the guard and drop in its destructor, after L1.
+   - This is where a shape change takes effect. The old region stays alive through the old KV
+     buffers' references until llama frees them. The fit never counted it as a self extent,
+     because it is still physically occupied. The existing WARN ("the re-fit counts
+     still-allocated KV as used") stays.
 
-**Multi-device atomicity (r1 I5).**
-- Devices are reserved in device order. When device `j` refuses, the transaction erases every
-  registry entry it created for `c` in this call. No buffer references those regions yet, so
-  erasing drops the last reference and returns the extents. Entries found in step 1
-  (pre-existing) are left alone.
-- Yields already performed are **not** undone. They released optional tenants, which is a
-  prompt-processing performance cost, never a correctness one. The yield WARN names them.
-- A retry within the loop counts `c`'s own just-created regions through `self_extents`, so a
-  retry never competes with itself.
+**Shortfall is a runtime outcome, not a planner bug (r1 C2).** The yield may return
+`freed < picked`, through jehw's `pending_bytes`, or because its barrier wait failed (the frees
+stay queued). Step 6's re-fit then sees less space: it either asks for more yield (loop) or
+demotes more (commit). Demotion always terminates, because all layers on the host always fit.
 
-**Shape change.**
-- A different shape key for an existing `(c, d)` erases the old entry. The old region stays
-  alive through the old KV buffers' references and is released when llama frees them.
-- The fit does **not** count it as a self extent, because it is still physically occupied.
-  The existing WARN ("the re-fit counts still-allocated KV as used") stays.
+**`[KV-PLAN-BUG]` is only this:** step 6's re-fit said `fits`, and carving exactly those
+extents under the same lock failed. That is an allocator bug by construction; §2.8 covers it.
 
-**Probe mode** runs step 2 only, with no side effects.
+**Probe mode** runs steps 1 and 3 only: no ring release, no yield, no carve, no side effects.
 
-**Teardown.** The exec-context close path erases `c`'s registry entries. That path is master
-`llama-context.cpp`'s `llama_context_sycl_exec_drain_and_close` and its backend drain; the
-buffers themselves go with llama's memory. The last `mem_handle` reference frees the region
-through `zone_free`, which runs the §2.3.2 free rule.
+**`no_alloc` contexts (r2 m6).** When the published shape has `no_alloc` set (llama's
+dummy-buffer contexts, master `llama-kv-cache.cpp:389-393`), the transaction publishes the
+residency and reserves nothing, and the claim is skipped for their size-0 buffers.
 
-#### 2.4.3 The transient reserve
+**Teardown, in both close paths (r2 N-I3(b)).** The registry erase lives in the backend,
+at the one point both close paths reach: `ggml_sycl_execution_clear_bindings_for_context`,
+which runs on success in both of the following:
+- `ggml_backend_sycl_execution_context_close_if_idle` (master `ggml-sycl.cpp:15152-15161`),
+  which is the construction-unwind path (llama `llama-context.cpp:741-753`), including a
+  `[KV-PLAN-BUG]` refusal inside `create_memory`;
+- `ggml_backend_sycl_execution_context_finish_drain` (`:15117-15138`), which is the end of
+  `llama_context_sycl_exec_drain_and_close`.
+
+The erase follows the leaf rule: under `kv_region_mutex_`, move every `(c, *)` entry out,
+unlock, then drop. The last `mem_handle` reference (the registry's, or the KV buffers',
+whichever goes last) frees each extent through `zone_free`, which runs the §2.3.2 free rule.
+
+#### 2.4.3 The transient reserve (owner question (c), conditions per r2)
 
 The TRANSIENT and CONTEXT tenants (§2.1) have no plan today. llama.cpp-zhcn covers the
 compute overflow, and llama.cpp-23mk the other non-KV out-of-arena allocations. This design
-does not plan them; it **reserves room** for them so KV cannot starve them:
-- `transient_reserve(d)` is a named pure function in L3. It returns the u1bb ring's admitted
-  KV-zone bytes, plus u1bb's compute-overflow estimate (`k_pp_moe_ring_compute_reserve_bytes_per_row`
-  × rows, the existing interim number), plus a fixed per-device scratch floor.
-  - The floor is initially the largest single TRANSIENT request observed in the A2 and
-    GPT-OSS gate logs, rounded up. L3 records the measurement it came from.
-- The fit leaves at least that much in the frontier extent.
-- A TRANSIENT request that still misses behaves as it does today; that is 23mk's scope.
-  C1 checks that moua does not make it worse (§3.3).
+does not plan them; it **reserves room** for them so KV cannot starve them. The reserve
+follows the r2 reviewer's conditions, and the owner's yes/no is still pending (§5).
+
+- **The statistic is the peak of the concurrently live TRANSIENT bytes that are not yet
+  live** at fit time. Revision 2 used "the largest single request", which was wrong:
+  scratch_pool, persistent buffers, per-op MMVQ scratch, STAGING and MoE graph scratch
+  coexist. Tenants that are already live are in the geometry, and counting them again would
+  double-charge them (the same flaw as r2 N-I6).
+- **What is computable is computed. Only the remainder is a floor.**
+  `transient_reserve(d, tlsf)` is a named pure function in L3:
+  ```
+  transient_reserve = moe_graph_scratch_pending            (u1bb's compute-overflow estimate,
+                                                             k_pp_moe_ring_compute_reserve_bytes_per_row
+                                                             x rows, until zhcn plans it)
+                    + q8_1_scratch(max_ne, n_ubatch)        (the MMVQ Q8 / SOA Q8_1 activation
+                                                             scratch, ggml-sycl.cpp:46120, :97965)
+                    + scratch_pool_and_persistent_pending   (sizes known at load:
+                                                             unified-cache.cpp:20629,
+                                                             unified-kernel.cpp:4890)
+                    + max(0, floor(d) - live_transient_bytes(d, tlsf))
+  ```
+  Each computable term counts only the part that is not yet allocated. The ring is **not** in
+  the reserve: it is released before the fit and re-admitted after it, because KV wins over
+  it (§2.4.2 steps 2 and 7).
+- **The floor is measured, not grepped.** `context_side` keeps a per-TLSF high-water counter
+  of live TRANSIENT bytes, plus a count of TRANSIENT requests that missed the context side.
+  Both are exposed through a `GGML_SYCL_PRIVATE_TESTING` accessor and printed in the
+  `[VRAM-ARENA]` summary. L3 sets the initial floor from the counter's high-water on the A2
+  and GPT-OSS gate runs, minus the computed terms, and records the run it came from.
+- **A miss is loud.** The first TRANSIENT request per device that misses the context side
+  logs one WARN, with its size, role, cohort and the current reserve. C1's non-KV EXT-ALLOC
+  byte check stays.
+- **The estimate is biased small.** An under-estimate costs a raw EXT-ALLOC on the
+  pre-existing path, which is a P1 cost and 23mk's scope, not a correctness one. An
+  over-estimate costs a needless KV demotion, which takes VRAM from KV (P4). So the floor
+  takes the measured high-water, with no safety margin added.
+- **Removal is tied to zhcn and 23mk.** When those tickets plan these tenants, each planned
+  tenant's term moves from the estimate into the plan, and the floor is deleted. L7 records
+  that dependency on both tickets.
+- The fit leaves at least the reserve in the frontier extent of each TLSF.
+
+#### 2.4.4 The KV shape: one per-layer byte function (r2 N-C1)
+
+**The defect in revision 2.** Revision 2 sized slots with the planner's shape, and that
+shape is not what llama allocates:
+- `kv_layer_bytes_for_kind` hard-codes `sizeof(ggml_fp16_t)` (master `unified-cache.hpp:582`,
+  `:591`).
+- The publish passes only `n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full, flash_attn`
+  (master `llama-context.cpp:1147-1148`).
+- The actual per-layer size is decided elsewhere, from the actual buffer: *"The slice is the
+  ONE place the per-layer KV size is decided"* (master `ggml-sycl.cpp:38593-38612`).
+
+Once a region physically reserves a slot, three configurations that work today would break:
+- `-ctk`/`-ctv q8_0` (slot ≠ actual, so `[KV-PLAN-BUG]`);
+- FA-off models with variable V width, which llama pads to `n_embd_v_gqa_max()` under
+  `v_trans` (master `llama-kv-cache.cpp:226-229`, `:277-279`; actual > slot);
+- contexts whose layer set is not the model's. These are the MTP filter, the GEMMA4
+  assistant's shared layers, and GEMMA3N/GEMMA4 reuse (master `llama-model.cpp` create_memory,
+  its `filter`/`reuse`/`mem_other` lambdas). Such a context would reserve slots it never
+  claims.
+
+**The shape crosses the ABI once, from llama, which is the side that knows it.**
+- A new publish entry point, `ggml_backend_sycl_set_runtime_context_for_model_kv(backend,
+  token, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full, flash_attn, const
+  ggml_sycl_runtime_kv_shape * shape)`. It is resolved by proc address like its sibling, and
+  the old entry point stays.
+- `ggml_sycl_runtime_kv_shape` is
+  `{ uint32_t struct_size; uint32_t layer_desc_size; int32_t type_k; int32_t type_v;
+  uint8_t v_trans; uint8_t no_alloc; uint32_t n_layer; const ggml_sycl_kv_layer_desc * layers; }`.
+- Each `ggml_sycl_kv_layer_desc` is `{ uint32_t n_embd_k_gqa; uint32_t n_embd_v_gqa; uint8_t has_kv;
+  uint8_t is_swa; }`:
+  - the widths are exactly the ones llama passes to `ggml_new_tensor_3d` (master
+    `llama-kv-cache.cpp:347-348`). `n_embd_v_gqa` is taken after the `[TAG_V_CACHE_VARIABLE]`
+    padding, and is 0 when the model has no V (MLA);
+  - `has_kv = 0` marks a filtered, shared or reused layer.
+- The backend reads `layers[i]` at the stride `layer_desc_size`, and refuses an unknown
+  `struct_size`. Both libraries are built together, but this array crosses the dlopen
+  boundary, where an appended field would otherwise silently move the stride.
+- If libllama publishes through the old entry point while an arena device has device-planned
+  KV, the transaction refuses with a named cause (`no KV shape published: libllama and
+  libggml-sycl are out of step`). It does not guess the shape.
+
+**On the llama side, one function produces the shape.**
+- `llama_kv_layer_shapes(model, params_mem, cparams)` is factored out of two places:
+  `create_memory`'s filter/reuse/share decisions and `llama_kv_cache`'s per-layer width
+  decision. Both of them, and the publish, call it. It covers iSWA's two caches, and the
+  attention half of the hybrid memories. Recurrent state does not use the tiered KV buft and
+  is out of scope.
+- **Frozen once computed.** llama computes it at the constructor's first publish (master
+  `llama-context.cpp:810`, before `create_memory` at `:869`), stores it in `llama_context`, and
+  every later republish sends the stored copy: the ladder (`:1571`, `:1936`) and the FA recheck.
+  This matters because auto-FA resolves after the memory exists (`:1283`), and a recomputed
+  `v_trans` would change the key (§2.4.2 step 1) for a KV that did not change.
+
+**On the backend side, one function sizes a layer.**
+- It is `kv_layer_tensor_bytes(desc, type_k, type_v, cells)`:
+  - K's bytes are `ggml_row_size(type_k, n_embd_k_gqa) × cells`, and V's are the same with
+    `type_v` and `n_embd_v_gqa`;
+  - each is padded by the rule ggml's context allocator applies for the tiered buft (its
+    alignment and `get_alloc_size`).
+- `cells` comes from `kv_layer_cells(kind, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
+  n_swa)`, the cell arithmetic factored out of `kv_layer_bytes_for_kind` unchanged.
+- The fit's slot size is `kv_layer_alloc_bytes(kv_layer_tensor_bytes(...))`.
+- The tiered claim computes each claimed layer's bytes with the same call on the same stored
+  shape. It checks that the buffer's size equals the sum over its layers, and that each slot
+  equals its layer's bytes. For arena devices this replaces the even division at master
+  `:38593-38612`.
+- `kv_layer_bytes_for_kind` keeps only the **load-time** estimate. No context exists at load
+  time, so it calls the same function with an f16 shape. It never sizes a region.
+
+**Tests.**
+- H2/H3 add these cases:
+  - K and V at q8_0;
+  - `v_trans` with variable V width, and MLA (no V);
+  - an MTP context and a GEMMA4-assistant context, whose layer sets exclude layers (no slot
+    for them);
+  - GEMMA3N reuse;
+  - a same-shape ladder republish, which reuses the region. Its n_ubatch-only key change must
+    not re-reserve (r2 N-I9).
+- L6 adds a CPU-buft-only llama test. For synthetic hparams covering those cases, the
+  function's descriptors must equal the tensors `llama_kv_cache` creates (`ggml_nbytes` per
+  layer).
 
 ### 2.5 The region registry and the region scope (r1 I2; decision (d) revised)
 
@@ -499,9 +792,12 @@ used as the key. Master `llama-context.cpp` creates it and binds it to every SYC
 `ctx->execution_context_id` (master `ggml-sycl.cpp:11852`), and it is fixed for the
 context's lifetime.
 
-**Registry** (`unified_cache`, per device, under `kv_region_mutex_`):
-`ContextId -> {mem_handle region, shape key, kv_region_layout}`. The transaction writes it
-(§2.4.2), the claim reads it, and teardown erases it.
+**Registry** (`unified_cache`, per device, under `kv_region_mutex_`, a leaf lock, §2.3.1):
+`ContextId -> {extent mem_handles[], shape key, frozen n_ubatch, kv_region_layout}`, where
+`kv_region_layout` maps each device layer to `(extent index, slot_offset, slot_size)`. There
+is one `mem_handle` per extent, each its own owner-first control (r2 N-I2; §2.4.1). The
+transaction publishes entries at its commit step (§2.4.2 step 8), the claim and the residency
+hook read them, and teardown erases them.
 
 **Scope (the llama-side change).** Two new exported procs, resolved the same way as the other
 `llama_context_sycl_*` procs (DL-safe, absent means no-op):
@@ -522,9 +818,29 @@ guard, so the scope ends on a throw as well. The backend keeps the scope in a
 - For each device-planned layer `l` with planned owner `o`, the claim looks up
   `registry(o)[ContextId]` and takes slot `l`. It reaches the owner's region even when the
   buffer's device differs.
-- The KV-mask handoff is unchanged and still carries llama's residency view. The claim checks
-  **mask == slot table**, and a mismatch is `[KV-PLAN-BUG]` naming both. So the mask is
-  verified against the one source, not trusted as a second one.
+- The KV-mask handoff is unchanged. The claim checks **mask == slot table**, and a mismatch
+  is `[KV-PLAN-BUG]` naming both.
+
+**Llama's residency answer comes from the registry (r2 N-I5).**
+`llama_kv_cache` decides host vs device per layer through
+`ggml_backend_sycl_kv_layer_on_device_from_dev` (master `ggml-sycl.cpp:107332-107343`), and
+that builds the mask. Today the hook reads the **process-global** plan snapshot (*"the placement
+plan is process-global"*). The transaction and `create_memory` are not atomic together, so
+another context's transaction, or another model's publish, can land between them:
+A's transaction, then B's (B's fit sees A's region and demotes more), then A's `create_memory`
+reads B's `kv_device`. A's mask then disagrees with A's slot table, and A is refused.
+
+Under an open region scope, the hook therefore answers from the registry: layer `il` is
+device-resident iff some device's entry for the scope's ContextId has a slot for `il`. The
+mask and the slot table then have one source, and the mask check becomes a check of llama's
+mask assembly, not of two plans. Outside a scope (no arena, or a device with no reservation),
+the hook reads the plan as today.
+- H8 adds this interleaving: publish A, publish B, then create A, with the shared plan
+  mutated in between. A's mask must equal A's slot table.
+- What stays process-global is pre-existing and unchanged: compute-time readers of the plan,
+  such as `ggml_sycl_op_is_planned_on_host`, and the single published plan per model. KV
+  *allocation* becomes context-keyed. Contexts with different residency on one model and
+  device remain the contract's §5.3 limitation.
 
 **No scope.** An arena device with device-planned layers and no open scope is a caller
 contract violation. It is refused with `[KV-PLAN-BUG] ... no KV region scope`. L6
@@ -536,7 +852,9 @@ through a `GGML_SYCL_PRIVATE_TESTING` hook.
 
 The device-planned branch (master `ggml-sycl.cpp` ~38590-39200):
 1. **Resolve the scope, and for each owner device the registry entry.** Check that every
-   device-planned layer has a slot whose size equals `kv_layer_alloc_bytes(layer)`, and that
+   device-planned layer has a slot whose size equals
+   `kv_layer_alloc_bytes(kv_layer_tensor_bytes(...))` for that layer, from the entry's stored
+   shape (§2.4.4). Check that the buffer's size equals the sum of its layers' bytes, and that
    mask == slot table.
 2. **Set `layer_allocs[l]` to a slice.** `kv_layer_alloc::set_owner` takes a legacy
    `alloc_handle` today (master `ggml-sycl.cpp:37727`). L6 adds a `mem_handle` overload
@@ -564,6 +882,10 @@ The device-planned branch (master `ggml-sycl.cpp` ~38590-39200):
      `[SYCL] GGML_SYCL_VMEM_KV is ignored while the VRAM arena is active: planned KV is
      reserved in the arena (llama.cpp-moua); pattern #2 (llama.cpp-1oxa) replaces vmem-kv`.
    - With no arena, vmem-kv behaves as today. 1oxa deletes it.
+5. **`GGML_SYCL_BLOCK_EXEC_CANDIDATE_KV` is ignored under an arena (r2 N-I4).** Its buffer-time
+   `kv_device` reassignment (master `:38623-38649`) would be a second residency source beside
+   the slot table. It gets the same treatment as VMEM_KV: one WARN per process, and the region
+   decides.
 
 No device layer issues a per-layer `unified_alloc` any more. The host-tier branch is
 unchanged. The arena-device uses of `kv_admission_mismatch`, `kv_vram_cap` and
@@ -572,9 +894,12 @@ unchanged. The arena-device uses of `kv_admission_mismatch`, `kv_vram_cap` and
 ### 2.7 u1bb ring, MMID pools, RUNTIME, compute overflow (r1 M9 corrected)
 
 - **The ring's KV-zone slots** are CONTEXT-class and placed by `context_side_place`. The
-  ring's admission reads the same function (§2.2, row "u1bb ring contiguity").
+  ring's admission reads the same function (§2.2, rows "u1bb ring").
+  - When a region is reserved, the ring is released before the fit and re-admitted after the
+    carve (§2.4.2 steps 2 and 7). That is u1bb's own "KV wins, then re-admit the ring" order,
+    made physical.
 - **Revision 1's claim that ring slots "cascade because they are lowest" was false.** The
-  compute-buffer overflow (`backend-buffer-kv-zone`, master `ggml-sycl.cpp:37313-37342`) is
+  compute-buffer overflow (`backend-buffer-kv-zone`, master `ggml-sycl.cpp:37235`) is
   allocated by `sched_reserve` *after* the publish, so it sits below the ring. When the
   auto-ubatch ladder republishes, u1bb releases and re-admits the ring while the previous
   candidate's overflow is still live below it. The ring's old slots become RETAINED runs.
@@ -596,7 +921,7 @@ unchanged. The arena-device uses of `kv_admission_mismatch`, `kv_vram_cap` and
 Refuse is the default; `GGML_SYCL_STRICT_KV_PLAN=1` aborts instead, mirroring
 `GGML_SYCL_STRICT_LEASES`. The rule applies **only at region-backed sites**:
 
-1. **`reserve_kv_region` step 6:** the fit said `fits` under the lock, and the carve failed.
+1. **§2.4.2 step 6, the commit carve:** the fit said `fits` under the lock, and the carve failed.
    ```
    [KV-PLAN-BUG] device 0 ctx 7: the region fit placed 23 slots (2944.0 MB) in 1 extent(s)
      [gap 84.4 MB + 21 optional tenant(s) 2869.8 MB] and the carve failed at extent 0
@@ -623,8 +948,17 @@ admitted it"* on every dispatch, which is false, and STRICT would abort inferenc
 
 Those requests are TRANSIENT (§2.1). They get `forbid_vram_zone_spill`, set silently, so a
 miss returns failure into fattn's existing non-packed fallback
-(`!allocation || tier != DEVICE_VRAM`). That is P1-compliant. It is a behaviour change only
-when the context side is full, and C6 is there to catch any throughput effect.
+(`!allocation || tier != DEVICE_VRAM`). That is P1-compliant.
+- **Production never reaches them (r2 m4).** The sidecar is opt-in only:
+  `GGML_SYCL_PACKED_K_SIDECAR`, or `GGML_SYCL_FA_FORCE_PATH=split-packed` (master
+  `fattn.cpp:151-157`). So the routing matters only under those flags, and C6 has no fattn
+  clause.
+- **A latent defect becomes more reachable.** When an earlier update's sidecar allocation
+  missed, a later `set_rows` can create the sidecar, zero-fill it, and pack only its own rows
+  (`fattn.cpp:560-590`). The lookup (`:412-444`) has no completeness check, so it serves stale
+  packed K. Forbid-spill makes the miss-then-create sequence more likely under those flags.
+  This is filed as **llama.cpp-cxgg**: invalidate the sidecar on any update miss. It is
+  pre-existing, and moua does not fix it. It should land before anyone relies on the flag.
 
 **L2 is folded into L6.** Landing a refusal before the region path exists would turn
 today's working spills into refused contexts (r1 I3: u1bb's ring slots, allocated in the
@@ -659,6 +993,15 @@ every second-model load, whether or not any context ever needs the space. That c
 1's prompt-processing layouts for nothing. The lazy form above releases them only when a
 context's KV actually needs the room, which is exactly "KV beats optional layouts".
 
+The r2 reviewer offered a second alternative (N-I10): a WEIGHT-class allocation that would bury
+the ladder yields the bottom ladder tenants it needs instead. It keeps the ladder contiguous,
+but it pays a yield (and a barrier wait) on every burying load, including every runtime
+expert-cache fill on GPT-OSS, whether or not any context's KV ever needs the room. It also
+moves a yield into the weight staging path, under that path's cache locks. The lazy form
+yields only at a reservation, where the transaction already yields, so it is kept. If C1-C3
+ever show the buried-tenant census costing measurable fit time, the eager form is the
+fallback.
+
 **What remains a limit, and its diagnostic.** A hole smaller than one slot cannot hold KV;
 slots are never split. Whenever the demotion loop demotes a layer while the geometry holds
 weight-side free bytes, log at WARN:
@@ -678,25 +1021,30 @@ confirmation, not an owner ruling: it only removes a limit, and it adds no polic
     slots are `slice()`s of their extent's handle.
   - **The new entry points are added to §3's allowlist** (audit m2): `reserve_kv_region`,
     `zone_alloc_optional`, and `context_side_place`'s allocating wrapper.
-  - The allocation class of each is **derived from the request**
-    (`role` plus `prefer_vram_zone`, plus the §2.1 lifetime class) by the existing
-    classifier. It is never hand-set at the call site.
+  - The allocation class of each is **derived from the request** (its `role`,
+    `prefer_vram_zone`, and the §2.1 `lifetime` field) by the existing classifier. It is never
+    hand-set at the call site.
+  - The new publish entry point (§2.4.4) allocates nothing. It carries the shape only.
   - No new raw allocation site is added, and no new `CACHE_BACKING` mint.
   - The one route by which planned KV reached `unified_cache_malloc_device_tracked` under an
     arena (the per-layer tiered `unified_alloc`) is removed.
 - **§1.1 planner authority.** The planner decides residency per layer, as today. Its capacity
-  input is the allocator's geometry, and an admission is a reservation, so "planned device"
-  means physically reserved.
+  input is the allocator's geometry, its size input is the shape llama allocates (§2.4.4), and
+  an admission is a reservation, so "planned device" means physically reserved.
 - **`mem_handle` lifetime.**
-  - A region is freed only when its last handle drops: the registry entry plus the KV buffers
-    and layer views.
+  - Each region extent is freed only when its last handle drops: the registry entry's, the
+    KV buffers', the layer views', or a fill event's slices.
   - There is no forced eviction. The yield takes only optional tenants that pass jehw's lease
     predicate, and a leased tenant truncates the ladder.
   - Retained runs are TLSF-allocated storage with no owner and no registration (§2.3.2,
     audit I3). They are kept off the TLSF's free lists so that weights cannot take them.
     They are not leaked handles, and every "live bytes" reader subtracts them.
-- **§12.5 locking.** The new `kv_region_mutex_` is ranked L3, and the order is L3 → L4 → L5
-  (§2.3.1). No L5 lock is held across a wait or across the L4 yield (§2.4.2).
+- **§12.5 locking.** The new `kv_region_mutex_` is ranked L3 and is strictly leaf (§2.3.1).
+  - Every final region-handle drop happens after every listed lock is released. The
+    transaction guard drops after L1, and the registry erase drops after `kv_region_mutex_`.
+  - No L5 lock is held across a wait or across the yield (§2.4.2).
+  - The yield's wait and final drops under L1 are pre-existing on jehw and are not widened.
+    §2.3.1 states them, for jehw's owner to resolve.
 - **§12.6 event leases.** The KV clear's fill events retain the slices they write (§2.6).
 - **§5.2/§5.3.** KV becomes context-keyed per (ContextId, device), which is half of the
   "context-keyed KV/RUNTIME arena reservation" §5.2 lists as missing. RUNTIME stays per
@@ -729,8 +1077,8 @@ confirmation, not an owner ruling: it only removes a limit, and it adds no polic
 
 ### 3.1 Host tests (no GPU; subagents can run them)
 
-- **H1 `test-tlsf-allocator`** (L1, done at `eab1ebeb6`). Registered as `hostonly`, with 22
-  cases.
+- **H1 `test-tlsf-allocator`** (L1, done and approved: `eab1ebeb6` … `456650c01`). Registered
+  as `hostonly`, with 24 cases, including `allocate(SIZE_MAX)`'s refusal.
   - The A2 shape on the real header lands **0/23 interleaved and 23/23 segregated**.
   - L4 adds `allocate_excluding` cases.
   - `TAG_OPTIONAL != 0` is a `static_assert` where the tags are defined (r1 M6), because
@@ -750,6 +1098,12 @@ confirmation, not an owner ruling: it only removes a limit, and it adds no polic
     request, `kv_region_fit(snapshot).fits` must hold exactly when the carve succeeds, and
     the carved extents and slot offsets must equal the fit's. jehw's `kv_zone_snapshot`
     simulation is the second oracle for the byte totals.
+  - **Commit under churn (r2 N-I7).** Between plan and commit, TRANSIENT tenants are
+    allocated below the anchor. The commit re-fit must succeed with moved extents and no
+    further yield, and must not loop. A variant that needs more yield loops once, then
+    commits. A variant that keeps moving refuses after 3 with the named cause.
+  - **Shape cases (r2 N-C1, N-I9):** see §2.4.4 (q8_0, `v_trans`, MLA, MTP, the assistant,
+    reuse, and the ladder republish).
 - **H3 heterogeneous slots.** SWA plus full layers; per-layer truth (gemma-like); split K/V
   dims. Checks:
   - the slot table groups full attention first, then SWA;
@@ -788,15 +1142,17 @@ confirmation, not an owner ruling: it only removes a limit, and it adds no polic
     - A hole smaller than one slot stays unused, and the sub-slot WARN fires.
     - A leased buried copy splits its run and is never released.
 - **H6 N-chunk.** Two weight TLSFs plus the tail KV TLSF, checking greedy packing across
-  TLSFs and extents, and fit == carve.
+  TLSFs and extents, fit == carve, and the TRANSIENT routing: WEIGHT-naming requests go to the
+  last weight chunk, KV-naming ones to the KV TLSF, each TLSF keeping its own reserve (r2 m7).
 - **H7 source gates** (python; the kv-layer-sizing family plus a new
   `test-sycl-kv-region-source.py`, each check with a mutation witness):
   - (a) the region reservation never reaches `unified_cache_malloc_device_tracked`;
   - (b) the tiered device-planned branch issues no per-layer `unified_alloc`;
   - (c) the optional pass runs after all S1 staging, dense *and* expert/DPAS;
-  - (d) **one source**: every row of the §2.2 table reads `kv_region_fit` /
-    `context_side_place`, and the deleted arena-device uses of `kv_admission_mismatch`,
-    `kv_vram_cap` and `kv_device_budget` stay deleted;
+  - (d) **one source, by primitive (r2 N-I4)**: the capacity primitives listed in §2.2 occur
+    only at allowlisted sites. The deleted arena-device uses of `kv_admission_mismatch`,
+    `kv_vram_cap` and `kv_device_budget` stay deleted. The one byte function
+    `kv_layer_tensor_bytes` is the only per-layer KV sizer that feeds the fit or the claim;
   - (e) `[KV-PLAN-BUG]` is logged at ERROR at both sites, and STRICT aborts;
   - (f) no raw pointer is stored as region state;
   - (g) `reserve_kv_region` does not hold the group mutex across the yield call (C2);
@@ -805,7 +1161,15 @@ confirmation, not an owner ruling: it only removes a limit, and it adds no polic
   - (i) the slot view's pointer comes from `slice().resolve()`, and `set_owner` has the
     `mem_handle` overload (audit m1);
   - (j) the new entry points appear in contract §3's allowlist, and their allocation class
-    is derived, not hand-set (audit m2).
+    is derived, not hand-set (audit m2);
+  - (k) `kv_region_mutex_` is leaf: no lock is acquired, and no `mem_handle` is destroyed,
+    inside its scopes (r2 N-I1);
+  - (l) the transaction's `kv_region_txn` guard is declared before its L1 `lock_guard`, and
+    the registry commit follows the publication CAS (r2 N-I3);
+  - (m) the registry erase sits in `ggml_sycl_execution_clear_bindings_for_context`, which
+    both close paths reach (r2 N-I3(b));
+  - (n) `WEIGHT_SIDE_TRANSIENT` appears at exactly the two B50-commented sites (r2 N-I8);
+  - (o) llama's later publishes send the stored KV shape, never a recomputed one (r2 N-I9).
   RED: every check fires on the pre-change tree, and the count is recorded.
 - **H8 region scope under concurrency (r1 I6, third point).**
   - The registry and scope logic is factored into a SYCL-free header, `kv-region-registry.hpp`.
@@ -818,6 +1182,20 @@ confirmation, not an owner ruling: it only removes a limit, and it adds no polic
   - The existing `g_test_block_next_kv_push` hook drives the KV-mask handoff, which this
     design no longer uses to find regions. The new hook plays the same role for the scope.
   - Positive control: a variant that shares one global (non-thread-local) scope must fail.
+  - **Plan race (r2 N-I5):** publish A, publish B with a different residency (the shared
+    plan changes), then run A's `create_memory` attach. A's residency hook answers and A's
+    mask must equal A's slot table. The positive control answers from the shared plan and
+    must fail.
+- **H9 transaction guard (r2 N-I3; SYCL-free, in `kv-region-registry.hpp`).** A host model of
+  the §2.4.2 steps, with a failpoint at every refusing step (after the ring release, after
+  the carve of device 0 of 2, at the MMID step, at the ring re-admit, and at the CAS). At
+  each failpoint it asserts:
+  - the registry is unchanged;
+  - every carved extent's handle is dropped, and dropped only after the instrumented L1 and
+    registry locks are released;
+  - the ring re-admit callback ran with the old `n_ubatch`.
+
+  After a success, a teardown through either close path empties `(c, *)`.
 
 ### 3.2 GPU test binary (the lead runs it, pinned selector, once)
 
@@ -838,7 +1216,13 @@ confirmation, not an owner ruling: it only removes a limit, and it adds no polic
   own extent and that each extent is released only when its last slice drops;
 - **VMEM precedence (audit I4):** with `GGML_SYCL_VMEM_KV=1` under the arena, the region is
   used, no vmem pages are mapped (vmem pool empty), and the ignored-flag WARN reaches the
-  log callback exactly once.
+  log callback exactly once;
+- **rollback and teardown on a real cache (r2 N-I3):**
+  - a forced refusal after the carve leaves `arena_owns` false for the extents, and the
+    zone's live bytes back at their pre-call value;
+  - `close_if_idle` on a never-run context erases its entries and frees its extents;
+- **the TRANSIENT high-water counter** moves when per-op scratch is allocated, and the
+  once-per-device miss WARN fires on a forced context-side miss (§2.4.3).
 
 Command:
 `ONEAPI_DEVICE_SELECTOR=level_zero:1 ctest --test-dir build -R '^test-sycl-kv-region$' --output-on-failure`.
@@ -871,30 +1255,44 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
   - Predicted: 23 device layers in the region, 9 on the host, and output starting
     `1, 2, 3, 4, 5, 6, 7, 8, 9, 10`.
 - **C2 Mistral gate:** B50 and B70, the CLAUDE.md command.
+- **C2a B50 MMVQ/STAGING first submit (r2 N-I8), a named acceptance item.** The C2 B50 run,
+  on `level_zero:1` at the **default** PCT (no `GGML_SYCL_VRAM_BUDGET_PCT`), is where the
+  region and the per-op MMVQ/STAGING scratch sit at the top of a mostly empty shared zone,
+  directly below ONEDNN.
+  - Pass: rc=0, the digit output, zero aborts, and no `UR_RESULT_ERROR` in stderr.
+  - Its positive control is the base tree, where those pages are untouched. On a failure,
+    rerun with `GGML_SYCL_B50_SCRATCH_WEIGHT_SIDE=1` (§2.1's lever). A pass there makes the
+    lever the default for the two B50 sites.
 - **C3 GPT-OSS B50 gate:** `llama-cli ... -c 4096`, scored `grep -cx '1, 2, 3, 4, 5'` = 1. It
   is also run once with u1bb's `-ub 1024` acceptance form, to cover the ring and the ladder.
+  - With `GGML_SYCL_KV_REGION_TRACE=1`, a WARN line per reservation that is off by default,
+    the ladder run must show exactly **one** reservation for the device, however many ladder
+    candidates republish (r2 N-I9).
+  - C3 is also the default-PCT half of C2a for STAGING.
 - **C4 G1** (§3.2).
 - **C5 multi-context:** `test-thread-safety` with `ONEAPI_DEVICE_SELECTOR=level_zero:0,1`,
   ONE run, only if it is green on the base first. It is known-crashy (oze0), so compare
   against the base. H8 is the primary coverage, and C5 is corroboration.
 - **C6 perf sanity:** B50 Mistral pp512/tg128 and GPT-OSS pp512, ABBA ×3 against the base.
-  - The expected delta is 0.
-  - The places to look if it is not zero:
-    - the TRANSIENT reclassification: scratch addresses move from the weight side to the
-      context side, in the same chunk;
-    - fattn sidecar `forbid_vram_zone_spill` falling back to the non-packed kernel when the
-      context side is full.
+  - It adds a **no-replay decode arm** (r2 m8): Mistral tg128 with
+    `GGML_SYCL_DISABLE_GRAPH=1`. In that mode every per-op TRANSIENT allocation pays a
+    best-fit walk of the retained runs plus up to 3 TLSF operations under the group mutex,
+    where replay hides it.
+  - The expected delta is 0 on every arm.
+  - If it is not zero, look at the TRANSIENT reclassification: scratch addresses move from
+    the weight side to the context side, and each placement costs the walk above.
+  - There is no fattn clause: the sidecar is opt-in only (§2.8, r2 m4).
 
 ## 4. Decomposition, effort, landing order
 
 | id | work | files | effort | depends on | lands |
 |----|------|-------|--------|------------|-------|
-| L1 | TLSF placement primitives, tags, frontier walk; H1 | `tlsf-allocator.hpp`, `tests/test-tlsf-allocator.cpp`, CMake | high | none | **done:** `eab1ebeb6`, `9e0a708dc` (in review) |
-| L3 | pure `kv_region_fit` (multi-extent, self extents, strict prefix, carve mirroring, transient reserve), `context_side_place`, `transient_reserve`, `kv-region-registry.hpp` (registry and scope logic); H2, H3, H6, H8 | `kv-runtime-demotion.{hpp,cpp}`, `kv-region-registry.hpp`, their tests | xhigh | L1, jehw merged | after jehw |
-| L4 | `context_side` (classes by role, retained runs, atomic reuse, settle reset), `allocate_excluding` and a whole-TLSF block census (L1 follow-ups), retained-run registration hygiene and the `live_bytes` readers, per-extent owner-first carve, `kv_region_mutex_` added to contract §12.5 (L3), locked geometry snapshot, `reserve_kv_region` with the §2.4.2 lock discipline, strict-prefix `yield_optional_prefix`, removal of the dead `KV_AUTO` reclaim and of the `arena_reserve` KV reclaim, N-chunk; H4, H4b, H5 | `unified-cache.{hpp,cpp}`, `tlsf-allocator.hpp` (one primitive) | xhigh | L1, L3, jehw merged | after jehw |
+| L1 | TLSF placement primitives, tags, frontier walk; H1 | `tlsf-allocator.hpp`, `shared-zone-tags.hpp`, `tests/test-tlsf-allocator.cpp`, CMake | high | none | **done, approved:** `eab1ebeb6`, `9e0a708dc`, `97315421b`, `456650c01` |
+| L3 | pure `kv_region_fit` (multi-extent, self extents, `forced_host`, strict prefix, carve mirroring, per-TLSF transient reserve), `context_side_place`, `transient_reserve` with its computed terms, `kv_layer_cells` + `kv_layer_tensor_bytes` (the one byte function), `kv-region-registry.hpp` (registry, scope, residency answer, `kv_region_txn` guard model); H2, H3, H6, H8, H9 | `kv-runtime-demotion.{hpp,cpp}`, `kv-region-registry.hpp`, `unified-cache.hpp` (`kv_layer_bytes_for_kind` delegates), their tests | xhigh | L1, jehw merged | after jehw |
+| L4 | `context_side` (explicit `lifetime` field threaded into `zone_alloc`, retained runs, atomic reuse, settle reset, TRANSIENT high-water counter and miss WARN), `allocate_excluding` and a whole-TLSF block census (L1 follow-ups), retained-run registration hygiene and the `live_bytes` readers, per-extent owner-first carve inside `zone_alloc`'s mint-before-lock protocol, leaf `kv_region_mutex_` added to contract §12.5 (L3), locked geometry snapshot, `reserve_kv_region`, strict-prefix `yield_optional_prefix`, `backend-buffer-kv-zone` passing its buffer's role, removal of the dead `KV_AUTO` reclaim and of the `arena_reserve` KV reclaim, N-chunk routing; H4, H4b, H5 | `unified-cache.{hpp,cpp}`, `tlsf-allocator.hpp` (one primitive), `ggml-sycl.cpp` (the kv-zone fallback's role) | xhigh | L1, L3, jehw merged | after jehw |
 | L5 | the optional pass after all S1 staging (dense + expert/DPAS); `zone_alloc_optional` | `ggml-sycl.cpp` S1 block | medium | L4 | with L4/L6 |
-| L6 | transaction step (idempotent registry, plan/yield/commit loop, multi-device rollback, VMEM skip), llama-side scope procs + RAII guard, tiered claim + `set_owner(mem_handle)` slice views + per-extent clear with event-held slices, VMEM_KV precedence, second sources deleted (§2.2), both ERROR sites + `GGML_SYCL_STRICT_KV_PLAN`, TRANSIENT routing incl. fattn sidecars, ring admission via `context_side_place`; H7, G1. **Absorbs revision 1's L2.** | `ggml-sycl.cpp`, `unified-cache.cpp`, `fattn.cpp`, `src/llama-context.cpp`, tests | xhigh | L3, L4, L5, **u1bb merged** | last |
-| L7 | docs: memory-design section, contract §3/§5.2/§5.3, arena comment, limits (§2.9), lock order | docs, `unified-cache.hpp` comment | medium | L6 | with L6 |
+| L6 | llama side: `llama_kv_layer_shapes` factored out of `create_memory`/`llama_kv_cache`, stored at the first publish, the new `..._for_model_kv` publish, and the scope procs with an RAII guard. Backend side: the transaction steps of §2.4.2 (guard, idempotent key without `n_ubatch`, u1bb ring release/re-admit split, plan/yield/byte-budget/commit order, commit after the CAS), teardown erase in `clear_bindings_for_context`, the residency hook answering from the registry, the tiered claim with `set_owner(mem_handle)` slice views, the per-extent clear with event-held slices, VMEM_KV and BLOCK_EXEC_CANDIDATE_KV ignored under an arena, the second sources deleted (§2.2), both ERROR sites plus `GGML_SYCL_STRICT_KV_PLAN`, TRANSIENT routing including fattn sidecars, the dark B50 lever, `GGML_SYCL_KV_REGION_TRACE`; H7, the CPU-buft llama shape test, G1. **Absorbs revision 1's L2.** | `ggml-sycl.cpp`, `ggml-sycl.h`, `unified-cache.cpp`, `fattn.cpp`, `common.hpp`, `src/llama-context.{h,cpp}`, `src/llama-model.cpp`, `src/llama-kv-cache.{h,cpp}`, tests | xhigh | L3, L4, L5, **u1bb merged** | last |
+| L7 | docs: memory-design section, contract §3/§5.2/§5.3/§12.5, arena comment, limits (§2.9), lock order, the transient floor's tie to zhcn/23mk | docs, `unified-cache.hpp` comment | medium | L6 | with L6 |
 
 - L3 through L7 form one series in one worktree, so there is one first build and the
   follow-ups reuse it.
@@ -904,8 +1302,15 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
   - **jehw:** retire `select_optional_layout_yield`'s pruning in favour of the strict prefix,
     retire `kv_zone_snapshot`/`fit_capacity` from production (they stay as a test oracle),
     and reuse `kv_layer_alloc_bytes`.
-  - **u1bb:** the ring admission reads `context_side_place` instead of `zone_largest_free(KV)`,
-    and its KV-zone slots become CONTEXT-class.
+  - **u1bb:** the ring admission reads `context_side_place` instead of `zone_largest_free(KV)`
+    and `ggml_sycl_kv_capacity_live`. Its KV-zone slots become CONTEXT-class, and
+    `ggml_sycl_replan_pp_moe_onednn_ring` splits into release and admit halves, so the
+    transaction can release before the fit and re-admit after the carve (§2.4.2 steps 2 and 7).
+  - **jehw, for its owner (not a moua change):** the yield's reader-barrier wait and its
+    final-handle drops run under L1 (§2.3.1). moua's plan/yield/commit structure is the
+    snapshot/revalidate shape that would let the yield run outside L1. But releasing L1
+    mid-transaction lets concurrent context creations interleave and return BUSY, so it
+    needs its own decision.
 
 ## 5. Decisions and open questions
 
@@ -914,15 +1319,33 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
 - **(b) Yield order:** a strict address-ordered prefix, highest first (§2.4.1). This is a
   smaller change to jehw HEAD than revision 1 framed (r1 M7). The two-pass staging lands in
   the same series (L5).
-- **(c) Weight holes:** **revised, pending the lead's confirmation.** With multi-extent
+- **(c) Weight holes:** **revised; the lead provisionally agrees.** With multi-extent
   regions, weight holes and buried optional tenants become region extents, and only
-  sub-slot holes remain a limit, with a WARN (§2.9). This is the fix for audit I5.
+  sub-slot holes remain a limit, with a WARN (§2.9).
+  - This is the fix for audit I5 (r2 N-I10): KV beats buried optional copies lazily, only when
+    a context needs the room.
+  - The reviewer's alternative, a burying WEIGHT allocation yielding the bottom ladder tenants
+    it needs instead, is weighed in §2.9. It pays the yield on every burying load, whether
+    or not KV ever needs the room.
 - **(d) Handoff:** **revised.** A dedicated ContextId-keyed registry plus a thread-local
   region scope, which is a llama-side change (§2.5). The KV-mask handoff is kept and
   verified against the slot table.
-- **Open (owner):** the transient reserve's fixed scratch floor (§2.4.3) is an estimate until
-  zhcn/23mk plan those tenants. Is an estimate acceptable in the interim, as u1bb's
-  1 MiB/row is?
+- **(e) Open (owner): the transient floor.** The r2 reviewer recommends it only with
+  conditions, and they are now in the design (§2.4.3):
+  - the peak concurrent not-yet-live statistic;
+  - computed terms, with a floor only for the remainder;
+  - a high-water counter;
+  - a once-per-device miss WARN;
+  - a bias toward small;
+  - removal tied to zhcn/23mk.
+
+  u1bb's 1 MiB/row is the precedent. The lead takes the yes/no to the owner. If the answer
+  is no, the reserve keeps only its computed terms, and the uncovered remainder misses the
+  context side (the WARN and C1's non-KV byte check report it) until zhcn/23mk plan those
+  tenants.
+- **(f) The KV shape crosses the ABI (r2 N-C1).** This is a llama-side ABI addition: a new
+  publish entry point with a versioned struct, and the old entry point kept (§2.4.4). It is
+  the lead's call, not the owner's, since it only threads facts llama already has.
 
 ## 6. Review dispositions
 
@@ -931,7 +1354,7 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
 | id | finding | disposition |
 |----|---------|-------------|
 | C1 | a split reserves twice per device; a same-shape republish re-reserves | **Changed.** The registry is keyed `(ContextId, device)`, reservation is idempotent on the same shape key, and every backend's run finds the entry (§2.4.2 step 1). The same-shape republish keeps the region, matching `admitted_kv`. |
-| C2 | yield under the group lock deadlocks (self-lock and ABBA); `freed < retained` misreported as PLAN_BUG | **Changed.** Plan with no lock, yield with no lock, then commit under the group mutex with a re-fit. The lock order is written down, and a shortfall re-plans and demotes (§2.4.2 steps 2-5; H7g). |
+| C2 | yield under the group lock deadlocks (self-lock and ABBA); `freed < retained` misreported as PLAN_BUG | **Changed.** Plan with no lock, yield with no lock, then commit under the group mutex with a re-fit. The lock order is written down, and a shortfall re-plans and demotes (§2.4.2 steps 3-6, renumbered in revision 3; H7g). |
 | C3 | many non-weight requests target WEIGHT: burying, raw misses, churn, MoE ordering | **Changed.** The lifetime class comes from the role (§2.1): TRANSIENT goes to the context side, budgeted by `transient_reserve` (§2.4.3). The optional pass runs after all S1 staging. Residual burying by real weights is exact for the fit, reduced by `allocate_excluding`, and WARNed. The generation counter is removed. |
 | I1 | live second sources of "fits" | **Changed.** §2.2 enumerates every site with its disposition, and H7d enforces it. |
 | I2 | the KV-mask handoff is the wrong carrier | **Changed** (decision (d) revised). ContextId registry plus thread-local scope with attach semantics, owner-device lookup, and mask == slot-table check (§2.5). |
@@ -962,5 +1385,51 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
 | m1 | `set_owner` needs a `mem_handle` overload | **Changed.** The overload stores the slice, and `ptr` comes from `slice.resolve()` (§2.6). |
 | m2 | allowlist the new entry points and derive their class | **Changed** (§2.10, H7j). |
 | m3 | slot slices must outlive the clear's fill event | **Changed.** The fill's event lease holds the slices (§2.6, §2.10). |
-| m4 | keep the barrier and epoch; never lazily re-stage a yielded copy | **Changed** (§2.4.2 step 3, H7h). The inherited P2 site (WOQ copy readers take no lease; recorded graphs bake pointers) is named and not widened. |
+| m4 | keep the barrier and epoch; never lazily re-stage a yielded copy | **Changed** (§2.4.2 step 4 as renumbered in revision 3, H7h). The inherited P2 site (WOQ copy readers take no lease; recorded graphs bake pointers) is named and not widened. |
 | pre-existing | the raw fallback, backend-buffer-kv-zone, onednn_weights_scratch and STAGING EXT-ALLOCs are named but not tracked | **Tracked.** llama.cpp-23mk already covers backend-buffer-kv-zone, onednn_weights_scratch and STAGING (plus c-m2jh). The fail-open raw fallback mechanism is new ticket **llama.cpp-gxur**, cross-referenced on 23mk (§2.11). |
+
+### 6.3 Design review r2 (design-moua-r2, read `19f7f08bf`)
+
+**Audit rows the reviewer found missing, re-checked against `1972b32b0`** (the audit fold it
+did not see):
+
+| audit id | r2 said | in `1972b32b0` | revision 3 |
+|---|---|---|---|
+| I1 | partial (same as C2) | locks named, but the L1 facts were missing | **Changed** under N-I1 below. |
+| I2 | not resolved | one owner per extent in §2.4.1 and §2.6. But §0.1 P2 still said "a region is an owner-first CACHE_SUBALLOCATION", and §2.5 said `{mem_handle region}` | **Fixed.** Both are now per-extent handles. The carve goes through `zone_alloc`'s protocol (m5). |
+| I3 | partial | unregister at retain, a fresh owner and exact registration on reuse, and rebuild/destroy/settle counting retained runs as free: all present (§2.3.2) | **Kept**, and minting now goes through `zone_alloc`'s protocol (m5). |
+| I4 | partial | the region takes precedence under an arena, and VMEM_KV is ignored with a WARN, so the fit decides "fits" and no vmem pages exist (§2.6) | **Kept.** BLOCK_EXEC_CANDIDATE_KV gets the same treatment (N-I4). |
+| I5 | not resolved | lazy yield of buried optional tenants, and their runs as hole extents (§2.9, §6.2) | **Kept**, and the reviewer's eager alternative is weighed (§2.9, N-I10). |
+| m1 | not resolved | `set_owner(mem_handle)` stores `extent_handle.slice()`, and `ptr` comes from `slice.resolve()` (§2.6) | **Kept.** |
+| m2 | not resolved | the new entry points are in the §3 allowlist, with a derived class (§2.10, H7j) | **Kept.** |
+| m3 | not resolved | fill-event leases hold the slices (§2.6 step 3) | **Kept.** |
+| m4 | partial | the barrier and "no lazy re-stage" were present, but the epoch bump was described as part of the yield | **Fixed.** The bump stays in the transaction (jehw `:17904`), not the yield (§2.4.2 step 4). |
+
+**New findings:**
+
+| id | finding | disposition |
+|----|---------|-------------|
+| N-C1 | slot sizes come from the planner's fp16 shape; the publish carries no `type_k`/`type_v`/`v_trans`/layer set | **Changed.** New publish entry point with a versioned shape struct. `llama_kv_layer_shapes` is factored out and frozen at the first publish. One backend byte function (`kv_layer_tensor_bytes`) serves the fit and the claim, replacing the even slice division for arena devices. H2/H3 add q8_0, `v_trans`, MLA, MTP, assistant and reuse cases, plus a CPU-buft llama test (§2.4.4). |
+| N-I1 | the transaction holds L1 across the yield's wait and final drops; `kv_region_mutex_` unranked and held across them | **Changed.** The L1 facts are stated (§2.3.1). `kv_region_mutex_` is L3 and strictly leaf, never held across the yield, a carve or a drop. Erases move out, unlock, then drop. The guard drops after L1. The jehw wait under L1 is named for its owner (§4 seams). H7k. |
+| N-I2 | one owner cannot own N extents | **Confirmed** from `1972b32b0`, and the two stale sentences are fixed (audit I2 row above). |
+| N-I3 | rollback covers only the device loop; construction unwind leaks via `close_if_idle` | **Changed.** A `kv_region_txn` guard, declared before L1, rolls back on any non-committed return, including the byte-budget, MMID, ring and CAS refusals. Registry commit is the last step, after the CAS. The erase sits in `clear_bindings_for_context`, which both close paths reach (§2.4.2). H9, H7l/m, G1. |
+| N-I4 | §2.2 misses the MMID demotion, the accounting refusals, u1bb's `kv_capacity_live`/`with_slack`, `kv_layer_on_device` and BLOCK_EXEC_CANDIDATE_KV; H7d row-based | **Changed.** Six rows added (§2.2). H7d now forbids the capacity primitives outside an allowlist. The MMID demotion runs before the carve and feeds `forced_host`. |
+| N-I5 | the residency hook reads the global plan; a racing transaction makes A's mask disagree with A's slot table | **Changed.** Under a scope, the hook answers from the registry for the scope's ContextId (§2.5). H8 adds the interleaving with a positive control. The global plan's remaining readers are named as pre-existing (§5.3). |
+| N-I6 | the ring is live at the carve, and the reserve double-counts it | **Changed.** The ring is released before the fit and re-admitted after the carve (§2.4.2 steps 2 and 7), and it is not in the reserve (§2.4.3). u1bb seam: release/admit split. |
+| N-I7 | "same extents or loop" turns TRANSIENT churn into refusals | **Changed.** Commit whenever the re-fit needs no further yield, even with moved extents or more demotion. Loop only for more yield (§2.4.2 step 6). H2 churn case. |
+| N-I8 | the B50 rationale is false: the tail zones share the chunk at high offsets | **Changed.** The rationale is withdrawn (§2.1). C2a is a named acceptance item at the default PCT on `level_zero:1`, with a documented dark lever (`WEIGHT_SIDE_TRANSIENT` for the two B50 sites, `GGML_SYCL_B50_SCRATCH_WEIGHT_SIDE=1`). H7n. |
+| N-I9 | the key includes `n_ubatch`-dependent slot bytes; the SWA ladder double-reserves | **Changed.** The key is built from request inputs, without `n_ubatch`. Slot sizes are frozen at the reserving `n_ubatch`, and later publishes send llama's stored shape (§2.4.2 step 1, §2.4.4). C3 counts one reservation. H7o. |
+| N-I10 | audit I5 still open | **Fixed** in `1972b32b0` (§2.9, §6.2). Revision 3 weighs the reviewer's eager alternative (§2.9, §5 (c)). |
+| N-I11 | §6 had no audit rows | **Fixed** in `1972b32b0` (§6.2), and re-checked above. |
+| m1 | EXPERT_CACHE is a category, not a role; it is GPT-OSS's main burying path | **Changed.** Table wording, and a note that it is the main path (§2.1). H5. |
+| m2 | `backend-buffer-kv-zone` hard-labels weight buffers COMPUTE | **Changed.** It passes its buffer's own role, so a weight buffer is WEIGHT-class and a compute buffer is CONTEXT-class (§2.1, L4). |
+| m3 | `zone_alloc` has no role; CONTEXT vs TRANSIENT is not role-derivable | **Changed.** An explicit `lifetime` field in `alloc_constraints`, threaded into `zone_alloc` (§2.1). |
+| m4 | the fattn sidecar is env-gated; a latent stale sidecar | **Changed.** C6's fattn clause is removed. The latent bug is filed as **llama.cpp-cxgg** (§2.8). |
+| m5 | hand-minting the region owner | **Changed.** The mint and registration go through `zone_alloc`'s mint-before-lock protocol (§2.3.2). |
+| m6 | `no_alloc` contexts would reserve | **Changed.** `no_alloc` is in the shape, and no region is reserved (§2.4.2). |
+| m7 | N-chunk TRANSIENT routing unspecified | **Changed.** WEIGHT-naming requests go to the last weight chunk and KV-naming ones to the KV TLSF, with a per-TLSF reserve (§2.3.5). H6. |
+| m8 | per-op TRANSIENT cost under the group mutex | **Changed.** C6 adds a no-replay decode arm. |
+| m9 | citation drift | **Fixed.** `admitted_kv` is at master `:17738-17747` (jehw `:17752-17760`), and `backend-buffer-kv-zone` is at `:37235`. |
+| m10 | the key must come from request inputs only | **Changed** (§2.4.2 step 1). |
+| (c) | transient floor, with conditions | **Conditions adopted** (§2.4.3). The owner's yes/no is pending (§5 (e)). |
+| M9 (r1) citation | `:37313-37342` | **Fixed** to `:37235` (§2.7). |
