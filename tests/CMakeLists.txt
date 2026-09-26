@@ -991,9 +991,10 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-tmp-leak-report.sh
     )
+    # Scans all of /proc twice; 33 s measured at load 51.
     set_tests_properties(test-sycl-tmp-leak-report PROPERTIES
         LABELS "sycl;build;hostonly"
-        TIMEOUT 60
+        TIMEOUT 180
     )
     llama_test_cmd(
         bash

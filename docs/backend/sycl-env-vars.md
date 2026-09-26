@@ -17,6 +17,24 @@ The output includes every matching literal, including names retained only for
 compatibility, diagnostics, comments, or removal notices; confirm a live read
 before treating any result as an active setting.
 
+## Build time (device link and build script)
+
+Read at build time by `ggml/src/ggml-sycl/sycl-device-link.sh` (the launcher
+every SYCL device link runs under) and `scripts/sycl-build.sh`, not by the
+backend. The CMake side is `GGML_SYCL_DEVICE_LINK_JOBS`, `GGML_SYCL_OCLOC_CACHE`
+and `GGML_SYCL_DEVICE_LINK_POOL` (`docs/backend/SYCL.md`, notes 2 and 3).
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `GGML_SYCL_OCLOC_CACHE_ROOT` | `${XDG_CACHE_HOME:-~/.cache}/ggml-sycl-ocloc` | Root of the persistent ocloc cache; one directory per toolchain key below it. A link keeps its own key and the most recently used other one and removes older ones. |
+| `GGML_SYCL_OCLOC_CACHE_MAX_SIZE` | 4294967296 (4 GiB) | Per-key cap, passed to NEO as `NEO_CACHE_MAX_SIZE`; NEO evicts to stay under it. |
+| `GGML_SYCL_OCLOC_CACHE_MIN_FREE` | 4294967296 (4 GiB) | Below this much free space on the cache filesystem a link warns and uses a throwaway cache in its private `TMPDIR`. |
+| `GGML_SYCL_OCLOC_KEY_FILES` | the IGC and ocloc libraries (`ldconfig -p`) | Colon list of files whose path, size and mtime enter the toolchain key. |
+| `GGML_SYCL_OCLOC_KEY_PKGS` | `libigc2 intel-ocloc libze-intel-gpu1` | Packages whose dpkg version enters the toolchain key. |
+| `GGML_SYCL_DEVICE_LINK_INVENTORY=<file>` | unset | Append one row per ocloc invocation (device, SPIR-V md5, binary md5, size) to `<file>`; the byte-identity evidence `scripts/sycl-device-image-inventory.sh` compares. |
+| `IGC_*`, `NEOReadDebugKeys` | unset | Not ours, but read here: with any set, a link neither reads nor writes the persistent cache (they change or dump the ISA, and no cache key covers the environment) and warns once naming them. |
+| `GGML_SYCL_CCACHE_BASE_DIR=1` | unset (off) | `scripts/sycl-build.sh`: run ccache with `base_dir` at the tree so another checkout path reuses its entries. Pending verification; see `docs/backend/SYCL.md`. Ignored for a `GGML_SYCL_PROFILING_DEBUG` build and for ccache older than 4.8. |
+
 ## Performance-critical (all default ON, opt-out)
 
 | Variable | Default | Effect |

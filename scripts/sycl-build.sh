@@ -23,6 +23,11 @@ Options:
 Compiler and device-link temporaries go to a private directory under
 ${TMPDIR:-/tmp} that is removed when the script exits.
 
+Environment:
+  GGML_SYCL_CCACHE_BASE_DIR=1   run ccache with base_dir at this tree, so a
+                                checkout at another path reuses its entries
+                                (pending verification; see docs/backend/SYCL.md)
+
 Examples:
   ./scripts/sycl-build.sh
   ./scripts/sycl-build.sh llama-completion
@@ -146,7 +151,8 @@ mkdir -p "${BUILD_DIR}"
 build_tmp="$(mktemp -d "${TMPDIR:-/tmp}/sycl-build.XXXXXX")"
 trap 'rm -rf "${build_tmp}"' EXIT
 trap 'exit 130' INT
-trap 'exit 143' TERM HUP
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 export TMPDIR="${build_tmp}"
 
 cmake_input_changed() {
@@ -223,16 +229,27 @@ configure_args=(
 compiler_launcher=""
 if command -v ccache >/dev/null 2>&1; then
     compiler_launcher="ccache"
-    # base_dir makes ccache rewrite absolute paths under this tree relative to
-    # the build directory, so a checkout at another path -- a worktree -- hits
-    # the entries this one stored instead of recompiling from cold. It also
-    # makes __FILE__ relative ("../ggml/src/..."); tests that locate the tree
-    # get the absolute LLAMA_CPP_SOURCE_ROOT, which ccache does not rewrite.
-    # `ccache KEY=VALUE compiler` needs ccache 4.8.
-    ccache_version="$(ccache --version 2>/dev/null | sed -n '1s/^ccache version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
-    if [[ -n "${ccache_version}" ]] && read -r ccache_major ccache_minor <<< "${ccache_version}" &&
-        (( ccache_major > 4 || (ccache_major == 4 && ccache_minor >= 8) )); then
-        compiler_launcher="ccache;base_dir=${ROOT_DIR}"
+    # Opt-in, GGML_SYCL_CCACHE_BASE_DIR=1, until verified on a real SYCL build
+    # (llama.cpp-vuy0). base_dir makes ccache rewrite absolute paths under this
+    # tree relative to the build directory, so a checkout at another path -- a
+    # worktree -- hits the entries this one stored instead of recompiling from
+    # cold. It also makes __FILE__ relative ("../ggml/src/..."); tests that
+    # locate the tree get the absolute LLAMA_CPP_SOURCE_ROOT, which ccache
+    # does not rewrite. `ccache KEY=VALUE compiler` needs ccache 4.8.
+    #
+    # A GGML_SYCL_PROFILING_DEBUG build (-g) keeps plain ccache: base_dir would
+    # make its DWARF include directories relative, which
+    # scripts/parse-sycl-zebin-line-table.py cannot match against absolute
+    # paths, and ccache hashes the build directory into -g entries anyway.
+    if [[ "${GGML_SYCL_CCACHE_BASE_DIR:-0}" == 1 ]]; then
+        ccache_version="$(ccache --version 2>/dev/null | sed -n '1s/^ccache version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
+        if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] &&
+            grep -Eq '^GGML_SYCL_PROFILING_DEBUG:BOOL=(ON|1|TRUE|YES)$' "${BUILD_DIR}/CMakeCache.txt"; then
+            echo "[sycl-build] GGML_SYCL_PROFILING_DEBUG is on; keeping plain ccache (no base_dir)"
+        elif [[ -n "${ccache_version}" ]] && read -r ccache_major ccache_minor <<< "${ccache_version}" &&
+            (( ccache_major > 4 || (ccache_major == 4 && ccache_minor >= 8) )); then
+            compiler_launcher="ccache;base_dir=${ROOT_DIR}"
+        fi
     fi
     configure_args+=(
         "-DCMAKE_C_COMPILER_LAUNCHER=${compiler_launcher}"

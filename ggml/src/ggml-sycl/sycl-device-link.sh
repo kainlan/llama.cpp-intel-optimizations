@@ -11,7 +11,10 @@
 #    and ocloc's per-image outputs directly in $TMPDIR. A link that is killed
 #    leaves all of it behind; before this launcher 150 such directories had
 #    piled up in one TMPDIR. Everything now lands in one directory that is
-#    removed when the link exits, fails, or is signalled.
+#    removed when the link exits, fails, or is signalled. The link runs in
+#    its own process group, so a signal to the launcher stops all of it; a
+#    SIGKILL to the launcher cannot be passed on and leaves the link running
+#    and its directory behind (scripts/sycl-tmp-leak-report.sh lists those).
 #
 # 2. --ocloc-cache. ocloc is ~97% of the device link, and the SPIR-V it
 #    compiles is almost always byte-identical to the previous link's (measured
@@ -25,6 +28,12 @@
 #    is chosen here, keyed on the toolchain: a different compiler, ocloc or IGC
 #    can never read an entry another one wrote, whether or not NEO's own key
 #    would have told them apart.
+#
+#    The key covers the toolchain, not the environment, and neither does
+#    NEO's own key. IGC_* regkeys and NEOReadDebugKeys change or dump the ISA,
+#    so with any of them set a link neither reads nor writes the persistent
+#    cache: it would serve an image built without the key (a dump run dumps
+#    nothing), or store one built with it for every later build.
 #
 #    Disk: a full libggml-sycl link stores ~190 MB. At most two key
 #    directories are kept (the current toolchain's and the last other one),
@@ -133,7 +142,9 @@ prune_cache_keys() {
         [[ "${dir}" == "${current}" ]] && continue
         [[ "${dir}" =~ ^ocloc-.*_[0-9a-f]{16}$ && -f "${root}/${dir}/KEY" ]] || continue
         if (( kept )); then
-            rm -rf -- "${root:?}/${dir}"
+            # Hygiene must never fail a link: another toolchain's link may be
+            # writing into this directory right now.
+            rm -rf -- "${root:?}/${dir}" 2>/dev/null || true
         else
             kept=1
         fi
@@ -160,6 +171,8 @@ cleanup() {
 # launcher; the launcher passes it on.
 on_signal() {
     local status="$1" waited=0
+    # A signal between starting the link and recording its pid still finds it.
+    child="${child:-$(jobs -p | head -n 1)}"
     if [[ -n "${child}" ]]; then
         kill -TERM -- "-${child}" 2>/dev/null || true
         while kill -0 -- "-${child}" 2>/dev/null && (( waited < 50 )); do
@@ -185,14 +198,25 @@ if (( ocloc_cache )); then
     min_free="${GGML_SYCL_OCLOC_CACHE_MIN_FREE:-4294967296}"
     mkdir -p "${cache_root}"
     prune_cache_keys "${cache_root}" "${cache_name}"
+    debug_keys=()
+    for name in $(compgen -e); do
+        case "${name}" in
+            IGC_*|NEOReadDebugKeys) debug_keys+=("${name}") ;;
+        esac
+    done
     free_kb="$(df -Pk -- "${cache_root}" | awk 'NR == 2 { print $4 }')"
-    if (( ${free_kb:-0} * 1024 < min_free )); then
-        # Too little room to grow the cache. The link still runs with a NEO
-        # cache so -allow_caching has somewhere to write (without one ocloc
-        # leaves an empty ./ocloc_cache in the build directory), but a
-        # throwaway one that goes with the private TMPDIR.
-        echo "sycl-device-link.sh: $(( free_kb / 1024 )) MB free under ${cache_root}," \
-            "below GGML_SYCL_OCLOC_CACHE_MIN_FREE=${min_free}; linking without the persistent ocloc cache" >&2
+    bypass=""
+    if (( ${#debug_keys[@]} )); then
+        bypass="${debug_keys[*]} set"
+    elif (( ${free_kb:-0} * 1024 < min_free )); then
+        bypass="$(( free_kb / 1024 )) MB free under ${cache_root}, below GGML_SYCL_OCLOC_CACHE_MIN_FREE=${min_free}"
+    fi
+    if [[ -n "${bypass}" ]]; then
+        # The link still runs with a NEO cache so -allow_caching has somewhere
+        # to write (without one ocloc leaves an empty ./ocloc_cache in the
+        # build directory), but a throwaway one that goes with the private
+        # TMPDIR.
+        echo "sycl-device-link.sh: ${bypass}; linking without the persistent ocloc cache" >&2
         cache_dir="${link_tmp}/ocloc-cache"
         mkdir -p "${cache_dir}"
     else
@@ -229,7 +253,7 @@ while [[ \$# -gt 0 ]]; do
     esac
 done
 "${real_ocloc}" "\${args[@]}"
-if [[ -n "\${output}" && -f "\${output}" ]]; then
+if [[ -n "\${input}" && -f "\${input}" && -n "\${output}" && -f "\${output}" ]]; then
     printf '%s\t%s\t%s\t%s\n' "\${device}" "\$(md5sum < "\${input}" | cut -d' ' -f1)" \\
         "\$(md5sum < "\${output}" | cut -d' ' -f1)" "\$(stat -c %s "\${output}")" \\
         >> "${GGML_SYCL_DEVICE_LINK_INVENTORY}"

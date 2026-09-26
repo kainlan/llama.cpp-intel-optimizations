@@ -105,6 +105,19 @@ def main():
         jobs = 1
 
     bad = []
+    # The object-directory criterion fails open on a rename, so each directory
+    # it names must exist. The Q1 route objects are built for tests only, and
+    # not under GGML_BACKEND_DL.
+    def on(name, default):
+        return cache.get(name, default).upper() in ("ON", "1", "TRUE", "YES", "Y")
+    with open(build_ninja, encoding="utf-8", errors="replace") as f:
+        ninja_text = f.read()
+    for obj_dir in BACKEND_OBJECT_DIRS:
+        if obj_dir == "/ggml-sycl-q1-route-test-objects.dir/" and (
+                not on("BUILD_TESTING", "ON") or on("GGML_BACKEND_DL", "OFF")):
+            continue
+        if obj_dir not in ninja_text:
+            bad.append(f"no {obj_dir} in build.ninja: the backend-object criterion names a directory that does not exist")
     for edge in device_links:
         target = edge["outputs"][0]
         if edge["vars"].get("pool") != POOL:

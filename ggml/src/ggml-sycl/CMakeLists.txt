@@ -661,6 +661,11 @@ option(GGML_SYCL_OCLOC_CACHE
     "Reuse ocloc binaries for unchanged SYCL device images across links (toolchain-keyed persistent cache)" ON)
 set(GGML_SYCL_DEVICE_LINK_POOL "2" CACHE STRING
     "Maximum concurrent SYCL device links under Ninja")
+foreach(_var GGML_SYCL_DEVICE_LINK_JOBS GGML_SYCL_DEVICE_LINK_POOL)
+    if (NOT "${${_var}}" MATCHES "^[1-9][0-9]*$")
+        message(FATAL_ERROR "${_var} must be a positive integer, got '${${_var}}'")
+    endif()
+endforeach()
 
 set(_ggml_sycl_device_link_options)
 if (GGML_SYCL_DEVICE_LINK_JOBS GREATER 1)
@@ -700,12 +705,23 @@ if (NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
     # device link (-fsycl-targets in its link options, e.g. the
     # GGML_SYCL_BUILD_XMX_TESTS executables) inherits neither, so it also gets
     # the link options. tests/test-sycl-device-link-routing.py checks the result
-    # against build.ninja using the same -fsycl-targets criterion.
+    # against build.ninja using the same -fsycl-targets criterion. Only this
+    # project's targets are touched: when it is embedded, the walk from the top
+    # directory also meets the parent project's own SYCL executables.
     function(ggml_sycl_route_fixture_device_links dir)
+        get_property(root GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_ROUTE_ROOT)
+        if (NOT root)
+            message(FATAL_ERROR "ggml-sycl: no device-link route root")
+        endif()
         get_property(_targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
         foreach(_target IN LISTS _targets)
             get_target_property(_type ${_target} TYPE)
             if (NOT _type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
+                continue()
+            endif()
+            get_target_property(_source_dir ${_target} SOURCE_DIR)
+            string(FIND "${_source_dir}/" "${root}/" _pos)
+            if (NOT _pos EQUAL 0)
                 continue()
             endif()
             get_target_property(_routed ${_target} CXX_LINKER_LAUNCHER)
@@ -729,6 +745,14 @@ if (NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
     endfunction()
 
     ggml_sycl_route_device_link(ggml-sycl)
+    # llama.cpp when ggml is built inside it, otherwise ggml itself. A global
+    # property, because a deferred call expands its arguments where it runs
+    # (the top directory), not here.
+    if (DEFINED llama.cpp_SOURCE_DIR)
+        set_property(GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_ROUTE_ROOT "${llama.cpp_SOURCE_DIR}")
+    else()
+        set_property(GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_ROUTE_ROOT "${ggml_SOURCE_DIR}")
+    endif()
     cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
         CALL ggml_sycl_route_fixture_device_links "${CMAKE_SOURCE_DIR}")
 endif()

@@ -45,6 +45,10 @@ if [[ -n "${MOCK_RUN_OCLOC:-}" ]]; then
     ocloc -output "${TMPDIR}/img_0.out" -file "${TMPDIR}/img_0.spv" \
         -output_no_suffix -spirv_input -device bmg_g21 -allow_caching || exit 9
 fi
+if [[ -n "${MOCK_RUN_OCLOC_NO_FILE:-}" ]]; then
+    # An ocloc call without -file (e.g. a query), as the driver can make.
+    ocloc -output "${TMPDIR}/query.out" -device bmg_g21 || exit 9
+fi
 if [[ -n "${MOCK_SLEEP:-}" ]]; then
     sleep "${MOCK_SLEEP}" &
     echo "$! $$" > "${MOCK_PID_FILE}.tmp"
@@ -54,20 +58,36 @@ fi
 exit "${MOCK_RC:-0}"
 EOF
 
+# The mock ocloc behaves like NEO's persistent cache: with
+# NEO_CACHE_PERSISTENT=1 and -allow_caching it serves a stored binary for the
+# same input (logging "hit") or compiles and stores one ("miss").
 cat > "${MOCK_BIN}/ocloc" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--version" ]]; then
     echo "${MOCK_OCLOC_VERSION:-26.31.1}"
     exit 0
 fi
-out=""
+out="" in="" caching=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -output) out="$2"; shift 2 ;;
+        -file) in="$2"; shift 2 ;;
+        -allow_caching) caching=1; shift ;;
         *) shift ;;
     esac
 done
-printf 'aot-binary' > "${out}"
+entry=""
+if [[ "${NEO_CACHE_PERSISTENT:-}" == 1 && ${caching} -eq 1 && -n "${in}" ]]; then
+    entry="${NEO_CACHE_DIR}/$(md5sum < "${in}" | cut -d' ' -f1).bin"
+fi
+if [[ -n "${entry}" && -f "${entry}" ]]; then
+    cp "${entry}" "${out}"
+    echo hit >> "${MOCK_OCLOC_LOG:-/dev/null}"
+else
+    printf 'aot-binary' > "${out}"
+    [[ -z "${entry}" ]] || cp "${out}" "${entry}"
+    echo miss >> "${MOCK_OCLOC_LOG:-/dev/null}"
+fi
 EOF
 chmod +x "${MOCK_BIN}/mock-icpx" "${MOCK_BIN}/ocloc"
 
@@ -248,5 +268,61 @@ assert_parent_tmp_empty "low space"
 launch env GGML_SYCL_OCLOC_CACHE_ROOT="${LOW_ROOT}" GGML_SYCL_OCLOC_CACHE_MIN_FREE=0 \
     "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" || fail "floor-0 run failed"
 grep -q "^NEO_CACHE_DIR=${LOW_ROOT}/$(key)$" "${LOG}/env" || fail "floor 0: persistent cache not used"
+
+# 9. IGC and NEO debug keys change or dump the ISA, and neither NEO's cache key
+#    nor the launcher's covers the environment. With one set, a warm
+#    persistent cache must not be read (a dump run would dump nothing) and
+#    must not be written (a non-default image would be served to later
+#    builds): the link gets a throwaway cache and one warning naming the key.
+DBG_ROOT="${TMP}/dbg-cache"
+ocloc_log="${LOG}/ocloc"
+launch env GGML_SYCL_OCLOC_CACHE_ROOT="${DBG_ROOT}" MOCK_RUN_OCLOC=1 MOCK_OCLOC_LOG="${ocloc_log}" \
+    "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" || fail "warm-up run failed"
+launch env GGML_SYCL_OCLOC_CACHE_ROOT="${DBG_ROOT}" MOCK_RUN_OCLOC=1 MOCK_OCLOC_LOG="${ocloc_log}" \
+    "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" || fail "warm run failed"
+[[ "$(paste -sd' ' "${ocloc_log}")" == "miss hit" ]] ||
+    fail "positive control: warm cache did not hit: $(paste -sd' ' "${ocloc_log}")"
+snapshot() { (cd "${DBG_ROOT}" && find . -type f -exec md5sum {} + | sort; find . | sort) | md5sum; }
+for debug_env in IGC_ShaderDumpEnable=1 NEOReadDebugKeys=1; do
+    before="$(snapshot)"
+    : > "${ocloc_log}"
+    launch env GGML_SYCL_OCLOC_CACHE_ROOT="${DBG_ROOT}" MOCK_RUN_OCLOC=1 MOCK_OCLOC_LOG="${ocloc_log}" \
+        "${debug_env}" "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" 2> "${LOG}/dbg-stderr" ||
+        fail "${debug_env}: link failed"
+    [[ "$(paste -sd' ' "${ocloc_log}")" == "miss" ]] ||
+        fail "${debug_env}: persistent cache was read: $(paste -sd' ' "${ocloc_log}")"
+    [[ "$(snapshot)" == "${before}" ]] || fail "${debug_env}: persistent cache changed"
+    grep -q "^NEO_CACHE_DIR=${PARENT_TMP}/sycl-device-link\.[^/]*/" "${LOG}/env" ||
+        fail "${debug_env}: cache not in the private TMPDIR: $(cat "${LOG}/env")"
+    [[ "$(grep -c "${debug_env%%=*}" "${LOG}/dbg-stderr")" -eq 1 ]] ||
+        fail "${debug_env}: want one warning naming it: $(cat "${LOG}/dbg-stderr")"
+    assert_parent_tmp_empty "${debug_env}"
+done
+
+# 10. An ocloc call without -file (a query) is not an image: inventory mode
+#     records nothing for it, rather than a row with an empty input md5 and an
+#     error on stderr, and the call still succeeds.
+inv_nofile="${TMP}/inventory-nofile.tsv"
+launch env MOCK_RUN_OCLOC_NO_FILE=1 GGML_SYCL_DEVICE_LINK_INVENTORY="${inv_nofile}" \
+    "${LAUNCHER}" -- "${MOCK_BIN}/mock-icpx" 2> "${LOG}/inv-stderr" ||
+    fail "inventory mode failed an ocloc call without -file"
+[[ ! -s "${inv_nofile}" ]] || fail "inventory recorded a row for a call without -file: $(cat "${inv_nofile}")"
+[[ ! -s "${LOG}/inv-stderr" ]] || fail "inventory mode wrote to stderr: $(cat "${LOG}/inv-stderr")"
+
+# 11. A stale key directory that cannot be removed (EACCES here; a link on a
+#     third toolchain writing into it in practice) does not fail the link.
+STUCK_ROOT="${TMP}/stuck-cache"
+for d in ocloc-1.0_00000000000000e1 ocloc-1.0_00000000000000e2; do
+    mkdir -p "${STUCK_ROOT}/${d}/locked"
+    echo key > "${STUCK_ROOT}/${d}/KEY"
+    echo entry > "${STUCK_ROOT}/${d}/locked/entry"
+    chmod 555 "${STUCK_ROOT}/${d}/locked"
+done
+touch -d '1 day ago' "${STUCK_ROOT}/ocloc-1.0_00000000000000e1"
+touch -d '2 days ago' "${STUCK_ROOT}/ocloc-1.0_00000000000000e2"
+rc=0
+launch env GGML_SYCL_OCLOC_CACHE_ROOT="${STUCK_ROOT}" "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" || rc=$?
+chmod -R u+w "${STUCK_ROOT}"
+[[ ${rc} -eq 0 ]] || fail "an unremovable stale cache directory failed the link (rc ${rc})"
 
 echo "test-sycl-device-link-launcher: PASS" >&2
