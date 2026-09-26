@@ -52,8 +52,9 @@ Design, revision 7.11. Author: impl-moua, 2026-09-26. The revisions answer eleve
   7 Minor), the lead's rulings on it (§M11), §M10, and design-1oxa-r7's I-3 (§X7, the load's
   room is admitted at the early stage), recorded in §6.13. Revision 7.11 is one commit on top
   of 7.10 (`9d4d826b3`). Revision 7.11a is one commit on top of 7.11 (`c445f3c46`): §M11a (the
-  term filter on the clear and the fit), design-23mk-r6's H1 arm, and zhcn 5.7's and
-  f6218f3's relays, recorded in §6.13.
+  term filter on the clear and the fit), design-23mk-r6's H1 arm, zhcn 5.7's and f6218f3's
+  relays, and the lead's decisions on m-6 and m-5, recorded in §6.13; it is two commits,
+  `0fc9f8c5e` and the decisions.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
@@ -6028,7 +6029,7 @@ into this round.
 | m-3 | three MMID source gates quote deleted code | **Fixed.** `tests/test-sycl-mmid-deferral-contract.py` (ctest `sycl-mmid-deferral-contract`), `tests/test-sycl-pp-moe-ring-kv-zone-source.py:199-207` and `tests/test-sycl-moe-resolved-batch-source.py:476-488` join the re-anchor list (§2.4.2 step 7). |
 | m-4 | H4 (a) can pass without a growth; H4 (b)'s vehicle is the resync zhcn deletes | **Fixed.** (a) fills the pinned pool to capacity first and asserts a growth happened; (b) uses `sched_reserve_impl`'s ALLOC with the host fallback forced; both run on the landing tree (§3.1 H4). |
 | m-5 | the shared invariant is worded differently in the two designs | **Fixed.** Verbatim in both: "no TRANSACTION token is held at gallocr ALLOC or at alloc_buffer's host fallback"; `alloc_buffer`'s entry asserts it for buffers outside a bound load, and the fallback asserts it too. |
-| m-6 | F2's preload window is unstated | **Fixed**, with the conflict noted below: during `load_end`'s preload the predicate answers **not in load**, as master's flag does (cleared at `:12449` before the preload). |
+| m-6 | F2's preload window is unstated | **Fixed**, and the lead has since ruled to follow master (noted below): during `load_end`'s preload the predicate answers **not in load**, as master's flag does (cleared at `:12449` before the preload). |
 | m-7 | `load_enter_nested`'s flag write is unnamed | **Fixed.** `:12894`'s `loading_effects(true, false)` store to the flag (`:12414`) is a no-op under the keyed predicate and is deleted; the phase store (`:12415`) stays (llama.cpp-dhpw). |
 
 | item | disposition |
@@ -6041,7 +6042,9 @@ into this round.
   flag answers not in load there.** `load_end` clears the Registry's `in_load` bit at
   `:12449`, before the arena reserve and the preload, so on master every preload read is "not
   in load". 7.11 follows master. If the ruling means "in load", it is a one-line move of the
-  clear after the preload, and the H7ap T2 arm's expectation flips with it.
+  clear after the preload, and the H7ap T2 arm's expectation flips with it. **Decided (lead,
+  after 7.11):** follow master. The ruling's "in load" wording was wrong on the fact; the
+  predicate answers not in load during the preload, and H7ap's T2 arm stands as written.
 - The signatures sent to impl-23mk for one primitive: the `pending_term` enum;
   `allocate_within(owner, term, size, align, tag, consume)`; `size_t retag_pending(pending_owner
   owner, pending_term_mask term_filter, pending_owner new_owner)`; the commit order (retag
@@ -6049,7 +6052,9 @@ into this round.
   the clear; `clear_pending` clears every term. *Superseded by 7.11a (below):* the clear takes
   a term filter, and the fit query `pending_bytes` joins them.
 - m-5 leaves two peer differences for the lead to reconcile, not this design: zhcn's kind count
-  and its `into_empty` arity.
+  and its `into_empty` arity. **Closed (lead, after 7.11):** zhcn 5.7 / f6218f3 uses the same
+  three kinds (`held(TRANSACTION)` at the pool gates, `held(LOAD)` at `:33769`) and
+  `into_empty(cache, owner)` (its m-14), so the two designs agree on both.
 - Nothing was built for 7.11; it is a document change only.
 
 **Revision 7.11a: §M11a, design-23mk-r6's H1 arm, zhcn 5.7 and f6218f3.** These arrived after
@@ -6069,4 +6074,6 @@ into this round.
   primitive and a result field, and never meet in one scope, so I kept the ruled name. If you
   would rather rename one, the query is the easier rename.
 - I sent the three signatures to impl-23mk again, with the filter on the clear and the fit.
+- The lead's two decisions on 7.11's notes (m-6: follow master; m-5: closed on zhcn's side)
+  are recorded at those notes above.
 - Nothing was built for 7.11a; it is a document change only.
