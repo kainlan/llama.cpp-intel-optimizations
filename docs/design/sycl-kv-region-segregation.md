@@ -1,9 +1,11 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 3. Author: impl-moua, 2026-09-26. The revisions answer three reviews:
+Design, revision 4. Author: impl-moua, 2026-09-26. The revisions answer three reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
-- design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3.
+- design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
+- design-moua-r2's addendum on `1972b32b0` (2 Important, 5 conditions, 2 Minor), recorded in
+  §6.4, together with the owner's ruling on the transient reserve.
 
 r1 and the audit read revision 1. r2 read revision 2 at `19f7f08bf`, before the audit fold
 (`1972b32b0`) reached it; §6.3 re-checks each audit row it names against the folded text.
@@ -42,6 +44,9 @@ Every file:line below names its revision.
 
     A guard declared before L1 rolls back on any refusal, and the registry entry is published
     only after the plan's CAS (§2.4.2).
+- **Context-side tenants are planned exactly (owner ruling 2026-09-26).** The room the fit
+  leaves for CONTEXT/TRANSIENT tenants is the sum of their planned demands, which
+  llama.cpp-zhcn and llama.cpp-23mk produce. There is no estimate and no floor (§2.4.3).
 - **Error path:** a device-planned KV layer that does not land in its region is a planner
   bug. It is refused with `[KV-PLAN-BUG]` at ERROR, and aborts under
   `GGML_SYCL_STRICT_KV_PLAN=1`. It is never admitted and then spilled.
@@ -244,8 +249,8 @@ listed here with what it becomes (r1 I1; r2 N-I4 added the rows marked r2).
 A list of rows fails open to any site nobody listed, so H7d does not check rows. It
 **forbids the capacity primitives themselves** outside an allowlist:
 - the primitives are `unified_cache_kv_vram_available`, `zone_available(KV|WEIGHT)`,
-  `zone_largest_free`, `largest_free_block`, `ggml_sycl_kv_capacity_live`, and
-  `kv_zone_snapshot`/`fit_capacity`;
+  `zone_largest_free`, `largest_free_block`, `ggml_sycl_kv_capacity_live`,
+  `kv_zone_snapshot`/`fit_capacity`, and the new `live_bytes()` (§2.3.2);
 - the allowlist holds their definitions, the no-arena branches (each marked with a comment
   H7d matches), log-only readers that feed no decision, and test code
   (`kv_zone_snapshot`/`fit_capacity` survive only as a test oracle, §4 seams).
@@ -304,6 +309,11 @@ What already runs under L1:
 - **Rank L3**, beside `g_pending_kv_layer_masks_mutex`, with ascending device ID as the
   same-rank tie-break. So L1 → L3 is legal, and it sits below L4 `direct_stage_mutex_`.
   L4 adds it to the §12.5 table in the commit that introduces it.
+- **Never co-held with `g_pending_kv_layer_masks_mutex` (addendum).** Both are L3, and §12.5
+  forbids co-holding a global/transitional lock with another lock of the same rank. The
+  tiered claim uses both: it pops the KV mask under `g_pending_kv_layer_masks_mutex`,
+  releases it, and only then reads the registry under `kv_region_mutex_`. The two are
+  **sequential, never nested**, and H7k checks that neither scope contains the other.
 - **Strictly leaf**, in the same sense as `moe_discovery_registry::mutex_`: it is never held
   while any other lock is acquired, and never across a wait, an allocation, a callback or
   the destruction of a final `mem_handle`.
@@ -361,12 +371,22 @@ geometry snapshot copy-out and for the carve, and never across the yield or a wa
      - The context-side placements (the M3 sequence, the region carve) are new branches
        inside `zone_alloc`'s locked section. They are not a separate hand-minted path.
      - The re-retained remainder is registered to no one.
-  3. **Rebuild and destroy treat retained runs as free.** The arena rebuild/destroy and
-     settle paths decide "live" by registered allocations, which retained runs never are.
-     Every place that reads a shared TLSF's `used()` as "live bytes" subtracts
-     `context_side.retained_bytes`: `zone_used`/`zone_available` reports, the settle
-     precondition, and leak and quiescence checks. L4 enumerates those readers, and H4
-     asserts them.
+  3. **Rebuild, destroy and quiescence treat retained runs as not live, but capacity does
+     not treat them as free (addendum NEW-1).** These are two separate numbers, and each
+     has its own reader:
+     - **`zone_available` is unchanged**: it is `tlsf_allocator::available()`, which counts
+       retained runs as used. They sit off the free lists, and only `context_side_place` can
+       use them. A plain `allocate` never can, so a byte reader that counted them as free
+       would be reading bytes it cannot place, which is A2's "bytes, not extents" defect.
+       Revision 2's text subtracted them here, and that is withdrawn.
+     - **A new `live_bytes()`** = `used() − context_side.retained_bytes`. It is read only by
+       the arena rebuild/destroy decision, the settle precondition, and the leak and
+       quiescence checks. Those paths already decide "live" by registered allocations, which
+       retained runs never are.
+     - No fit decision reads either one. H7d forbids `zone_available` in any fit decision
+       (§2.2), and `live_bytes` is on H7d's primitive list too, so it cannot become the next
+       byte-based fit.
+     - L4 enumerates the `live_bytes` readers, and H4 asserts both numbers at every step.
 
 #### 2.3.3 Weight-side placement after the optional pass
 
@@ -374,8 +394,12 @@ geometry snapshot copy-out and for the carve, and never across the yield or a wa
 1. first-fit into a weight-side hole: a free block that is **not** the gap block;
 2. only then the gap front, with the burying WARN of §2.1.
 
-This needs one new L1-level primitive, `allocate_excluding(anchor, size, align, tag)`. It
-takes the gap block out of the free lists, calls `allocate`, and reinserts the gap. It lands
+Both steps skip free blocks that intersect a pending reservation range (§2.4.2 step 4,
+addendum (b)).
+
+This needs one new L1-level primitive, `allocate_excluding(excluded ranges, size, align,
+tag)`. It takes every free block that intersects an excluded range (the gap block, and any
+pending ranges) out of the free lists, calls `allocate`, and reinserts them. It lands
 in L4 as an L1 follow-up, with its own host test.
 
 #### 2.3.4 Reset, settle, and the dead KV reclaim
@@ -428,8 +452,9 @@ kv_region_fit(const shared_zone_geometry & g, const kv_region_request & r) -> kv
   are **usable as region extents** (audit I5, below). They were reported-only in revision 1;
 - `buried_optional`: lease-free `TAG_OPTIONAL` blocks outside the frontier walk, i.e. below a
   weight that buried them, each with the free run their release would form. This needs a
-  whole-TLSF block census from the snapshot, which is a second L4 read primitive beside
-  `frontier_walk`;
+  whole-TLSF block census, a second L4 read primitive beside `frontier_walk`. Like
+  `frontier_walk` (L1's 044k contract, `9e0a708dc`), it runs **only under the group mutex**,
+  inside the snapshot copy-out (addendum (d));
 - `self_extents`: the extents this ContextId carved earlier in the **same** transaction call,
   on a retry of the commit loop (§2.4.2 step 6). A same-shape republish never re-fits (step 1),
   and a shape change's old region is still occupied, so neither is a self extent.
@@ -457,8 +482,28 @@ The request `r`:
   - **hole** extents on the weight side: a weight hole, or the run formed by releasing
     buried optional tenants.
 
-  Slots are packed greedily in slot-table order: best-fit retained and hole extents first,
-  then the frontier. A slot is never split.
+  **The pack is cost-ordered (addendum NEW-2).** Revision 2 packed "best-fit retained and
+  hole extents first, then the frontier". Hole extents included runs formed by releasing
+  buried optional tenants, so that order yielded buried copies even when the gap alone would
+  have held the slots. That contradicted §2.9's "only when KV needs the room". It also put KV
+  on the weight side while the gap was free.
+
+  Slots are placed in slot-table order, each into the cheapest tier that still has room.
+  Within a tier, best fit decides. A slot is never split. The tiers, cheapest first:
+  1. **RETAINED runs** on the context side: no cost.
+  2. **The frontier gap, with no yield**: no cost, and segregation is kept.
+  3. **Free weight-side holes**: no layout is lost, but the context's KV pins a weight-side
+     hole for its lifetime (§2.9 (c)). Hence tier 3, after the gap.
+  4. **Yields, ranked by optional-layout bytes lost per slot gained.** The candidates are the
+     next strict-prefix step at the frontier (the smallest `k` more ladder entries that gains a
+     slot) and each buried-tenant run (only the tenants that intersect the smallest carved
+     range). The cheapest candidate goes first, and a tie goes to the frontier, which keeps
+     segregation. Repeat until the slots fit or no candidate is left. Then the demotion loop
+     takes over.
+
+  So a buried tenant is released only when tiers 1-3 cannot hold the slot, and only when it
+  costs less layout per slot than growing the frontier prefix. This is the ordering that the
+  owner-visible line on llama.cpp-moua states (§2.9 (e)).
   - A hole extent is carved from the top of its run with `allocate_below(the allocated block
     above it)`. Only the buried optional tenants that intersect the carved range are
     released.
@@ -565,6 +610,23 @@ u1bb's existing rollback call.
      `unified-cache.cpp:7737-7880`) with a strict-prefix selection, plus the buried tenants the
      fit chose (§2.9).
    - It keeps jehw's reader barrier gate unchanged.
+   - **Released ranges are held for this reservation (addendum (b)).** Before the yield, the
+     transaction records the **extents the fit chose** as `pending_ranges(c, d)` on the TLSF,
+     under the group mutex. Those are the exact ranges step 6 will carve: the top of the gap
+     below the anchor, grown by the prefix, and the carved part of each chosen buried-tenant
+     run. Freed bytes outside them, such as the gap front, stay available to weights as today.
+     - Until step 6 carves them, or the guard rolls back, weight-side placement skips any
+       free block that intersects a pending range. That is `zone_alloc(WEIGHT)` both in a
+       hole and at the gap front (§2.3.3).
+     - Without this, a concurrent WEIGHT allocation (an expert-cache fill, or another model's
+       staging, neither of which takes L1) would take the freed block first. The commit
+       re-fit would then differ, the yielded layout would be lost for nothing, and after
+       three iterations the context would be refused.
+     - A WEIGHT request that fits **only** inside a pending range gets the zone miss it would
+       get a moment later, once the region is carved there. That is the post-commit state, so
+       this adds no new behaviour class.
+     - Pending ranges are cleared by the commit carve, and by the guard's rollback. The guard
+       owns them, like everything else it owns, so no exit path leaves one behind.
    - **The optional-layout epoch bump stays where jehw has it: in the transaction, not in the
      yield** (audit m4). After a yield that retired anything, the transaction calls
      `ggml_sycl_optional_layouts_retired()` (jehw `ggml-sycl.cpp:17904`, which bumps
@@ -646,50 +708,69 @@ The erase follows the leaf rule: under `kv_region_mutex_`, move every `(c, *)` e
 unlock, then drop. The last `mem_handle` reference (the registry's, or the KV buffers',
 whichever goes last) frees each extent through `zone_free`, which runs the §2.3.2 free rule.
 
-#### 2.4.3 The transient reserve (owner question (c), conditions per r2)
+#### 2.4.3 Planned context-side demand (owner ruling 2026-09-26: "plan them exactly first")
 
-The TRANSIENT and CONTEXT tenants (§2.1) have no plan today. llama.cpp-zhcn covers the
-compute overflow, and llama.cpp-23mk the other non-KV out-of-arena allocations. This design
-does not plan them; it **reserves room** for them so KV cannot starve them. The reserve
-follows the r2 reviewer's conditions, and the owner's yes/no is still pending (§5).
+**The ruling.** The owner ruled on the question revision 3 left open: **plan them exactly
+first**. There is no interim estimate, no fixed floor and no fallback constant.
+- llama.cpp-zhcn (the compute buffer, and the fattn K/V conversion buffers, sized from the
+  graph shape) and llama.cpp-23mk (the remaining out-of-arena cohorts, routed through planned
+  zones) produce the numbers.
+- Both block moua L4 onward (tracker deps, moua comment c-2yg4).
+- Revision 3's estimate-plus-floor formula, its measured floor and its once-per-device miss
+  WARN are all withdrawn.
 
-- **The statistic is the peak of the concurrently live TRANSIENT bytes that are not yet
-  live** at fit time. Revision 2 used "the largest single request", which was wrong:
-  scratch_pool, persistent buffers, per-op MMVQ scratch, STAGING and MoE graph scratch
-  coexist. Tenants that are already live are in the geometry, and counting them again would
-  double-charge them (the same flaw as r2 N-I6).
-- **What is computable is computed. Only the remainder is a floor.**
-  `transient_reserve(d, tlsf)` is a named pure function in L3:
-  ```
-  transient_reserve = moe_graph_scratch_pending            (u1bb's compute-overflow estimate,
-                                                             k_pp_moe_ring_compute_reserve_bytes_per_row
-                                                             x rows, until zhcn plans it)
-                    + q8_1_scratch(max_ne, n_ubatch)        (the MMVQ Q8 / SOA Q8_1 activation
-                                                             scratch, ggml-sycl.cpp:46120, :97965)
-                    + scratch_pool_and_persistent_pending   (sizes known at load:
-                                                             unified-cache.cpp:20629,
-                                                             unified-kernel.cpp:4890)
-                    + max(0, floor(d) - live_transient_bytes(d, tlsf))
-  ```
-  Each computable term counts only the part that is not yet allocated. The ring is **not** in
-  the reserve: it is released before the fit and re-admitted after it, because KV wins over
-  it (§2.4.2 steps 2 and 7).
-- **The floor is measured, not grepped.** `context_side` keeps a per-TLSF high-water counter
-  of live TRANSIENT bytes, plus a count of TRANSIENT requests that missed the context side.
-  Both are exposed through a `GGML_SYCL_PRIVATE_TESTING` accessor and printed in the
-  `[VRAM-ARENA]` summary. L3 sets the initial floor from the counter's high-water on the A2
-  and GPT-OSS gate runs, minus the computed terms, and records the run it came from.
-- **A miss is loud.** The first TRANSIENT request per device that misses the context side
-  logs one WARN, with its size, role, cohort and the current reserve. C1's non-KV EXT-ALLOC
-  byte check stays.
-- **The estimate is biased small.** An under-estimate costs a raw EXT-ALLOC on the
-  pre-existing path, which is a P1 cost and 23mk's scope, not a correctness one. An
-  over-estimate costs a needless KV demotion, which takes VRAM from KV (P4). So the floor
-  takes the measured high-water, with no safety margin added.
-- **Removal is tied to zhcn and 23mk.** When those tickets plan these tenants, each planned
-  tenant's term moves from the estimate into the plan, and the floor is deleted. L7 records
-  that dependency on both tickets.
-- The fit leaves at least the reserve in the frontier extent of each TLSF.
+**The interface (proposed to impl-zhcn and impl-23mk on 2026-09-26, pending their answers).**
+Every planned tenant that can land on a shared TLSF's context side publishes one record per
+device:
+```
+struct context_side_demand {
+    int                  device;
+    vram_zone_id         zone;      // WEIGHT or KV: which TLSF's context side (§2.3.5 routing)
+    shared_zone_lifetime lifetime;  // CONTEXT or TRANSIENT (§2.1)
+    const char *         cohort;    // the cohort_id its allocations carry
+    size_t               bytes;     // planned PEAK concurrently-live bytes on this device
+};
+```
+- **Producers** are pure, host-testable functions, one per owning ticket, called by the
+  runtime-context transaction:
+  - zhcn: the compute buffer, which is the `backend-buffer-kv-zone` overflow, and the fattn
+    K/V conversion buffers;
+  - 23mk: every census cohort it routes into a shared zone's context side;
+  - a cohort routed into a tail zone (ONEDNN/RUNTIME/SCRATCH are separate TLSFs) is outside
+    this interface.
+- **The consumer** is `transient_reserve(d, tlsf)` in L3:
+  `Σ max(0, demand.bytes − live_bytes(cohort, d, tlsf))` over the demands routed to that
+  TLSF. Bytes a cohort already holds live are in the geometry, so they are never charged
+  twice (r2's statistic point).
+  - The u1bb ring is not a demand. It is released before the fit and re-admitted after the
+    carve, because KV wins over it (§2.4.2 steps 2 and 7).
+- **Timing.** Every number must exist when the transaction runs, which is under L1, before
+  `create_memory` and before `sched_reserve`. So a size that ggml only learns at
+  `sched_reserve` must be derived beforehand from the graph shape. The other option, a
+  republish after `sched_reserve` that re-fits, is less attractive: it would add a
+  post-memory re-reservation to §2.4.2's idempotence rule. The interface asks zhcn which of
+  the two applies.
+- **Plan == reality at allocation time.** `context_side` meters live bytes per
+  `(device, TLSF, cohort)`:
+  - An allocation that takes its cohort past the planned bytes is a plan violation. It logs
+    `[KV-PLAN-BUG]`-class ERROR once per `(device, cohort)`, with planned vs actual, and
+    aborts under `GGML_SYCL_STRICT_KV_PLAN=1`.
+  - A context-side miss for a planned cohort is the same error.
+  - An allocation on the context side whose cohort has **no** demand record is a census
+    failure. H7p gates it in source, and at runtime it logs the same ERROR.
+  - The meter is exposed through a `GGML_SYCL_PRIVATE_TESTING` accessor, and G1 reads it.
+- **Scope gap, raised with 23mk and the lead.** The in-arena TRANSIENT scratch that already
+  lands in the shared zone today appears in neither ticket's description:
+  - the per-op MMVQ Q8 scratch (master `ggml-sycl.cpp:46120`) and the SOA Q8_1 (`:97965`);
+  - STAGING (`common.hpp:6658`, `unified-cache.cpp:21455`, `mmvq.cpp:16863`);
+  - persistent buffers (`unified-kernel.cpp:4890`) and `scratch_pool` (`unified-cache.cpp:20629`);
+  - the opt-in fattn packed-K sidecar and materialize requests (`fattn.cpp:569`, `:1640`), which
+    are KV-role and TRANSIENT (§2.8). These sit closest to zhcn's fattn conversion work.
+
+  23mk's census (200 request sites) may already cover them. If it does not, moua L3 takes
+  them, with exact demand functions of the shapes known at context time. Any of them that
+  has no exact function is escalated to the lead as a blocker, never floored.
+- The fit leaves each TLSF's `transient_reserve` in that TLSF's frontier extent.
 
 #### 2.4.4 The KV shape: one per-layer byte function (r2 N-C1)
 
@@ -881,7 +962,14 @@ The device-planned branch (master `ggml-sycl.cpp` ~38590-39200):
      The vmem branch is skipped, and `GGML_SYCL_VMEM_KV=1` produces one WARN per process:
      `[SYCL] GGML_SYCL_VMEM_KV is ignored while the VRAM arena is active: planned KV is
      reserved in the arena (llama.cpp-moua); pattern #2 (llama.cpp-1oxa) replaces vmem-kv`.
-   - With no arena, vmem-kv behaves as today. 1oxa deletes it.
+   - **After L6, `GGML_SYCL_VMEM_KV=1` is effectively inert everywhere (addendum, VMEM wording).**
+     Revision 2 said "with no arena, vmem-kv behaves as today", which was false. The vmem
+     branch is itself gated on `ggml_sycl::vram_arena_enabled()` (master `ggml-sycl.cpp:38856`),
+     so it never runs without an arena.
+     - The one case left is a device where the arena is **enabled but not active**, because
+       its reservation failed. There vmem-kv still runs, as today.
+     - L6 keeps that residual branch rather than widening its scope. llama.cpp-1oxa deletes
+       vmem-kv outright (pattern #2 replaces it), so moua does not carry a second deletion.
 5. **`GGML_SYCL_BLOCK_EXEC_CANDIDATE_KV` is ignored under an arena (r2 N-I4).** Its buffer-time
    `kv_device` reassignment (master `:38623-38649`) would be a second residency source beside
    the slot table. It gets the same treatment as VMEM_KV: one WARN per process, and the region
@@ -978,9 +1066,18 @@ once a later weight buried them. Two consequences followed, and both reviews fla
 
 Revision 1 needed the limit only because a region was one extent. Now that regions are
 multi-extent (r1 I4, §2.4.1), both go away:
-- **Weight holes are region extents.** The fit packs whole slots into any weight hole that
-  holds at least one. This is safe: the hole extent returns to the weight side when the
-  context ends, and it never sits inside the frontier walk.
+- **Weight holes are region extents, as a last resort before any yield.** The fit packs
+  whole slots into a weight hole only after the context side (retained runs and the free gap)
+  cannot hold them (tier 3 of §2.4.1's cost-ordered pack). The hole extent returns to the
+  weight side when the context ends, and it never sits inside the frontier walk.
+  - **Its cost, stated plainly (addendum (c)).** A hole extent pins that weight-side hole for
+    the context's lifetime, which is lifetime mixing on the weight side. The server-swap
+    pattern shows it: model 1 is unloaded, a model-2 context's KV takes model 1's old hole,
+    then model 3 loads. Model 3's weights cannot use the hole, so they bury the ladder (they
+    take the gap front).
+  - The fit stays exact, so P4 holds, and the burying WARN fires. But the segregation the
+    design exists for is relaxed for as long as that context lives. H5 replays this second
+    swap and asserts the fit is still exact and the WARN still fires.
 - **Buried optional tenants yield like frontier ones.** The fit treats a lease-free buried
   `TAG_OPTIONAL` block as releasable, together with its free neighbours, as a hole extent.
   The yield releases only the ones the chosen extents intersect, through the same
@@ -1011,8 +1108,15 @@ weight-side free bytes, log at WARN:
 ```
 L7 documents this limit, and pattern #2 remains the remedy.
 
-**This supersedes lead decision (c)** ("accept the limit"). It needs the lead's
-confirmation, not an owner ruling: it only removes a limit, and it adds no policy.
+**This supersedes lead decision (c)** ("accept the limit"). The lead provisionally agrees.
+- **It does relax the owner's segregation invariant, so the owner sees it (addendum (e)).**
+  Letting context-lifetime KV into weight-side holes is a policy change. Revision 2 said it
+  "adds no policy", and that was wrong.
+- With the cost-ordered pack it is a strict last resort before any yield. The one line for
+  the owner is on llama.cpp-moua: *"KV may occupy a weight-side hole only when the context
+  side (retained runs and the free gap) cannot hold it; optional copies are yielded only
+  after that, cheapest layout loss first, and a buried copy only when it is cheaper than
+  growing the frontier prefix."*
 
 ### 2.10 The canonical memory contract
 
@@ -1123,7 +1227,8 @@ confirmation, not an owner ruling: it only removes a limit, and it adds no polic
     - retaining B removes B's exact record before the RETAINED mark;
     - a lookup of B's old base resolves to nothing;
     - D's reuse registers D under a fresh `allocation_id`;
-    - `live_bytes = used() − retained_bytes` at every step.
+    - `live_bytes() = used() − retained_bytes` and `zone_available() = available()` (retained
+      counted as used) at every step (addendum NEW-1).
 - **H4b auto-ubatch ladder replay (r1 M9).** Replays `publish(ring_k) -> sched_reserve(overflow_k)`
   for the candidates, then the settle. It asserts:
   - the RETAINED run count stays at or below the number of candidates;
@@ -1141,6 +1246,18 @@ confirmation, not an owner ruling: it only removes a limit, and it adds no polic
     - Out-of-order unload leaves a weight hole that holds two slots, and the region uses it.
     - A hole smaller than one slot stays unused, and the sub-slot WARN fires.
     - A leased buried copy splits its run and is never released.
+  - **Cost-ordered pack (addendum NEW-2), RED first:** a gap that fits the region, plus a
+    lease-free buried tenant. The buried tenant must **stay resident** and nothing may be
+    yielded. On revision 2's pack order this fails: the buried tenant is released. Further cases:
+    - a free weight hole is used only when the gap cannot hold the slot;
+    - when both yield candidates exist, the one with less layout bytes lost per slot goes
+      first, and a tie goes to the frontier.
+  - **Second server swap (addendum (c)):** model 1 unloads, a model-2 context's KV takes model
+    1's hole, then model 3 loads. Model 3's weights bury the ladder, the WARN fires, and the
+    fit stays exact.
+  - **Pending ranges (addendum (b)):** between the yield and the carve, a WEIGHT allocation
+    that would fit the pending extent is placed elsewhere or misses. The commit re-fit
+    succeeds with no loop, and a rollback clears the ranges.
 - **H6 N-chunk.** Two weight TLSFs plus the tail KV TLSF, checking greedy packing across
   TLSFs and extents, fit == carve, and the TRANSIENT routing: WEIGHT-naming requests go to the
   last weight chunk, KV-naming ones to the KV TLSF, each TLSF keeping its own reserve (r2 m7).
@@ -1163,13 +1280,17 @@ confirmation, not an owner ruling: it only removes a limit, and it adds no polic
   - (j) the new entry points appear in contract §3's allowlist, and their allocation class
     is derived, not hand-set (audit m2);
   - (k) `kv_region_mutex_` is leaf: no lock is acquired, and no `mem_handle` is destroyed,
-    inside its scopes (r2 N-I1);
+    inside its scopes, and no `g_pending_kv_layer_masks_mutex` scope contains one (r2 N-I1,
+    addendum);
   - (l) the transaction's `kv_region_txn` guard is declared before its L1 `lock_guard`, and
     the registry commit follows the publication CAS (r2 N-I3);
   - (m) the registry erase sits in `ggml_sycl_execution_clear_bindings_for_context`, which
     both close paths reach (r2 N-I3(b));
   - (n) `WEIGHT_SIDE_TRANSIENT` appears at exactly the two B50-commented sites (r2 N-I8);
-  - (o) llama's later publishes send the stored KV shape, never a recomputed one (r2 N-I9).
+  - (o) llama's later publishes send the stored KV shape, never a recomputed one (r2 N-I9);
+  - (p) every context-side allocation site carries a cohort that has a `context_side_demand`
+    producer, and no estimate constant or floor exists in `transient_reserve` (owner ruling,
+    §2.4.3).
   RED: every check fires on the pre-change tree, and the count is recorded.
 - **H8 region scope under concurrency (r1 I6, third point).**
   - The registry and scope logic is factored into a SYCL-free header, `kv-region-registry.hpp`.
@@ -1221,8 +1342,9 @@ confirmation, not an owner ruling: it only removes a limit, and it adds no polic
   - a forced refusal after the carve leaves `arena_owns` false for the extents, and the
     zone's live bytes back at their pre-call value;
   - `close_if_idle` on a never-run context erases its entries and frees its extents;
-- **the TRANSIENT high-water counter** moves when per-op scratch is allocated, and the
-  once-per-device miss WARN fires on a forced context-side miss (§2.4.3).
+- **the per-cohort meter** (§2.4.3): it moves when per-op scratch is allocated. A forced
+  over-plan allocation and a forced context-side miss each log the plan-violation ERROR once
+  per `(device, cohort)`, and STRICT aborts in a subprocess.
 
 Command:
 `ONEAPI_DEVICE_SELECTOR=level_zero:1 ctest --test-dir build -R '^test-sycl-kv-region$' --output-on-failure`.
@@ -1288,11 +1410,11 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
 | id | work | files | effort | depends on | lands |
 |----|------|-------|--------|------------|-------|
 | L1 | TLSF placement primitives, tags, frontier walk; H1 | `tlsf-allocator.hpp`, `shared-zone-tags.hpp`, `tests/test-tlsf-allocator.cpp`, CMake | high | none | **done, approved:** `eab1ebeb6`, `9e0a708dc`, `97315421b`, `456650c01` |
-| L3 | pure `kv_region_fit` (multi-extent, self extents, `forced_host`, strict prefix, carve mirroring, per-TLSF transient reserve), `context_side_place`, `transient_reserve` with its computed terms, `kv_layer_cells` + `kv_layer_tensor_bytes` (the one byte function), `kv-region-registry.hpp` (registry, scope, residency answer, `kv_region_txn` guard model); H2, H3, H6, H8, H9 | `kv-runtime-demotion.{hpp,cpp}`, `kv-region-registry.hpp`, `unified-cache.hpp` (`kv_layer_bytes_for_kind` delegates), their tests | xhigh | L1, jehw merged | after jehw |
-| L4 | `context_side` (explicit `lifetime` field threaded into `zone_alloc`, retained runs, atomic reuse, settle reset, TRANSIENT high-water counter and miss WARN), `allocate_excluding` and a whole-TLSF block census (L1 follow-ups), retained-run registration hygiene and the `live_bytes` readers, per-extent owner-first carve inside `zone_alloc`'s mint-before-lock protocol, leaf `kv_region_mutex_` added to contract §12.5 (L3), locked geometry snapshot, `reserve_kv_region`, strict-prefix `yield_optional_prefix`, `backend-buffer-kv-zone` passing its buffer's role, removal of the dead `KV_AUTO` reclaim and of the `arena_reserve` KV reclaim, N-chunk routing; H4, H4b, H5 | `unified-cache.{hpp,cpp}`, `tlsf-allocator.hpp` (one primitive), `ggml-sycl.cpp` (the kv-zone fallback's role) | xhigh | L1, L3, jehw merged | after jehw |
+| L3 | pure `kv_region_fit` (multi-extent, self extents, `forced_host`, strict prefix, carve mirroring, per-TLSF transient reserve), `context_side_place`, `transient_reserve` summing the `context_side_demand` records (no constant), the cost-ordered pack, `kv_layer_cells` + `kv_layer_tensor_bytes` (the one byte function), `kv-region-registry.hpp` (registry, scope, residency answer, `kv_region_txn` guard model); H2, H3, H6, H8, H9 | `kv-runtime-demotion.{hpp,cpp}`, `kv-region-registry.hpp`, `unified-cache.hpp` (`kv_layer_bytes_for_kind` delegates), their tests | xhigh | L1, jehw merged, the zhcn/23mk demand interface agreed | after jehw |
+| L4 | `context_side` (explicit `lifetime` field threaded into `zone_alloc`, retained runs, atomic reuse, settle reset, the per-cohort meter and plan-violation ERROR, pending reservation ranges, `live_bytes()` beside an unchanged `zone_available`), `allocate_excluding` and a whole-TLSF block census (L1 follow-ups), retained-run registration hygiene and the `live_bytes` readers, per-extent owner-first carve inside `zone_alloc`'s mint-before-lock protocol, leaf `kv_region_mutex_` added to contract §12.5 (L3), locked geometry snapshot, `reserve_kv_region`, strict-prefix `yield_optional_prefix`, `backend-buffer-kv-zone` passing its buffer's role, removal of the dead `KV_AUTO` reclaim and of the `arena_reserve` KV reclaim, N-chunk routing; H4, H4b, H5 | `unified-cache.{hpp,cpp}`, `tlsf-allocator.hpp` (one primitive), `ggml-sycl.cpp` (the kv-zone fallback's role) | xhigh | L1, L3, jehw merged, **llama.cpp-zhcn and llama.cpp-23mk** (owner ruling; comment c-2yg4) | after jehw, zhcn, 23mk |
 | L5 | the optional pass after all S1 staging (dense + expert/DPAS); `zone_alloc_optional` | `ggml-sycl.cpp` S1 block | medium | L4 | with L4/L6 |
 | L6 | llama side: `llama_kv_layer_shapes` factored out of `create_memory`/`llama_kv_cache`, stored at the first publish, the new `..._for_model_kv` publish, and the scope procs with an RAII guard. Backend side: the transaction steps of §2.4.2 (guard, idempotent key without `n_ubatch`, u1bb ring release/re-admit split, plan/yield/byte-budget/commit order, commit after the CAS), teardown erase in `clear_bindings_for_context`, the residency hook answering from the registry, the tiered claim with `set_owner(mem_handle)` slice views, the per-extent clear with event-held slices, VMEM_KV and BLOCK_EXEC_CANDIDATE_KV ignored under an arena, the second sources deleted (§2.2), both ERROR sites plus `GGML_SYCL_STRICT_KV_PLAN`, TRANSIENT routing including fattn sidecars, the dark B50 lever, `GGML_SYCL_KV_REGION_TRACE`; H7, the CPU-buft llama shape test, G1. **Absorbs revision 1's L2.** | `ggml-sycl.cpp`, `ggml-sycl.h`, `unified-cache.cpp`, `fattn.cpp`, `common.hpp`, `src/llama-context.{h,cpp}`, `src/llama-model.cpp`, `src/llama-kv-cache.{h,cpp}`, tests | xhigh | L3, L4, L5, **u1bb merged** | last |
-| L7 | docs: memory-design section, contract §3/§5.2/§5.3/§12.5, arena comment, limits (§2.9), lock order, the transient floor's tie to zhcn/23mk | docs, `unified-cache.hpp` comment | medium | L6 | with L6 |
+| L7 | docs: memory-design section, contract §3/§5.2/§5.3/§12.5, arena comment, limits (§2.9), lock order, the `context_side_demand` interface, the owner-visible weight-hole line | docs, `unified-cache.hpp` comment | medium | L6 | with L6 |
 
 - L3 through L7 form one series in one worktree, so there is one first build and the
   follow-ups reuse it.
@@ -1330,19 +1452,14 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
 - **(d) Handoff:** **revised.** A dedicated ContextId-keyed registry plus a thread-local
   region scope, which is a llama-side change (§2.5). The KV-mask handoff is kept and
   verified against the slot table.
-- **(e) Open (owner): the transient floor.** The r2 reviewer recommends it only with
-  conditions, and they are now in the design (§2.4.3):
-  - the peak concurrent not-yet-live statistic;
-  - computed terms, with a floor only for the remainder;
-  - a high-water counter;
-  - a once-per-device miss WARN;
-  - a bias toward small;
-  - removal tied to zhcn/23mk.
-
-  u1bb's 1 MiB/row is the precedent. The lead takes the yes/no to the owner. If the answer
-  is no, the reserve keeps only its computed terms, and the uncovered remainder misses the
-  context side (the WARN and C1's non-KV byte check report it) until zhcn/23mk plan those
-  tenants.
+- **(e) Decided (owner, 2026-09-26): "Plan them exactly first."** There is no interim
+  estimate and no floor.
+  - `transient_reserve` sums the planned `context_side_demand` records that zhcn and 23mk
+    produce (§2.4.3).
+  - zhcn and 23mk block moua L4+ (c-2yg4).
+  - The interface is proposed to impl-zhcn and impl-23mk and is pending their answers. The
+    open points are when each size is known relative to the publish, which cohorts land in
+    the shared zone, and who owns the in-arena per-op scratch that neither ticket names.
 - **(f) The KV shape crosses the ABI (r2 N-C1).** This is a llama-side ABI addition: a new
   publish entry point with a versioned struct, and the old entry point kept (§2.4.4). It is
   the lead's call, not the owner's, since it only threads facts llama already has.
@@ -1431,5 +1548,30 @@ did not see):
 | m8 | per-op TRANSIENT cost under the group mutex | **Changed.** C6 adds a no-replay decode arm. |
 | m9 | citation drift | **Fixed.** `admitted_kv` is at master `:17738-17747` (jehw `:17752-17760`), and `backend-buffer-kv-zone` is at `:37235`. |
 | m10 | the key must come from request inputs only | **Changed** (§2.4.2 step 1). |
-| (c) | transient floor, with conditions | **Conditions adopted** (§2.4.3). The owner's yes/no is pending (§5 (e)). |
+| (c) | transient floor, with conditions | **Superseded by the owner's ruling** ("plan them exactly first"): no floor. `transient_reserve` consumes zhcn/23mk's planned demands (§2.4.3, §5 (e)). |
 | M9 (r1) citation | `:37313-37342` | **Fixed** to `:37235` (§2.7). |
+
+### 6.4 design-moua-r2 addendum on `1972b32b0`, and the owner's ruling
+
+The addendum reviewed `1972b32b0` and did not see revision 3 (`0eba7875b`). The "rev 3" column
+says what revision 3 already covered.
+
+| id | finding | rev 3 (`0eba7875b`) | revision 4 |
+|----|---------|---------------------|------------|
+| audit I1 | L1 and `kv_region_mutex_` held across the jehw wait | **covered**: L1 facts stated, and `kv_region_mutex_` is leaf and never held across the yield (§2.3.1) | kept |
+| L3 co-hold | `kv_region_mutex_` must never be co-held with `g_pending_kv_layer_masks_mutex` | not covered | **Changed.** Sequential, never nested: pop the mask, release, then read the registry (§2.3.1, H7k). |
+| audit I4 wording | "with no arena, vmem-kv behaves as today" is false: the branch is arena-gated (`:38856`) | not covered | **Fixed.** Inert after L6, except where the arena is enabled but not active. 1oxa deletes it (§2.6). |
+| NEW-1 | subtracting retained runs from `zone_available` counts unplaceable bytes as free | not covered (rule 3 still said it) | **Changed.** `zone_available` is unchanged (retained counted as used). A separate `live_bytes()` serves only rebuild, destroy, settle and leak checks. Both are H7d primitives, and H4 asserts both (§2.3.2). |
+| NEW-2 | the pack released buried tenants before using the free gap | not covered | **Changed.** The pack is cost-ordered: retained, then the gap, then free weight holes, then yields ranked by layout bytes lost per slot, ties to the frontier (§2.4.1). H5 RED: a fitting gap keeps the buried tenant resident. The order puts the gap before free holes, a deliberate change from the addendum's literal list, so that (e)'s rule, holes only when the context side cannot hold it, holds. |
+| (a) | buried yields must be a last resort ranked by cost | not covered | **Changed** (NEW-2). |
+| (b) | a yield-to-carve race hands the freed block to a concurrent WEIGHT allocation | step-4 extent equality relaxed (N-I7), but the race remained | **Changed.** The fit's extents are recorded as pending ranges before the yield, and weight placement skips them until the carve or a rollback (§2.4.2 step 4, §2.3.3, H5). |
+| (c) | state the weight-hole lifetime cost; replay a second swap | not covered | **Changed** (§2.9, H5). |
+| (d) | leased buried tenants split runs; the census runs under the group mutex | the split was covered; the lock was not stated | **Changed** (§2.4.1 inputs). |
+| (e) | the owner should see one line: KV in weight holes only when the frontier cannot hold it | not covered ("adds no policy") | **Changed.** The claim is withdrawn, and the line is on llama.cpp-moua as comment **c-2vv1** (§2.9). |
+| r2 N-C1, N-I1..N-I9 | still open at `1972b32b0` | **all covered** in revision 3 (§6.3) | kept |
+
+**The owner's ruling on §5 (e), 2026-09-26: "Plan them exactly first."** Revision 3's
+estimate-plus-floor reserve is withdrawn. `transient_reserve` sums the planned
+`context_side_demand` records from zhcn and 23mk, with no constant. An over-plan or a missed
+planned cohort is a plan-violation ERROR, and it aborts under STRICT (§2.4.3). zhcn and
+23mk block L4+. The interface is proposed and pending both implementers' answers (§5 (e)).
