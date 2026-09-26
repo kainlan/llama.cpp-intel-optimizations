@@ -3532,6 +3532,69 @@ set_tests_properties(test-sycl-fattn-tile-d512-decode PROPERTIES
 endif() # static SYCL backend fixture
 
 if (NOT GGML_BACKEND_DL)
+# Flash-attention guard: a -inf-masked KV cell holding NaN/Inf in K or V must
+# not reach the output. Compares every live FA kernel family (selected by
+# shape and GGML_SYCL_FA_* environment) against the CPU reference path. GPU
+# test: it allocates device buffers and runs kernels, so it is not host-only.
+add_executable(test-sycl-fattn-masked-nonfinite
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fattn-masked-nonfinite.cpp
+)
+target_include_directories(test-sycl-fattn-masked-nonfinite PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-fattn-masked-nonfinite PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-fattn-masked-nonfinite PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-fattn-masked-nonfinite PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-fattn-masked-nonfinite PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-fattn-masked-nonfinite PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+# One ctest per arm. Each arm pins its GGML_SYCL_FA_* environment and names
+# itself in GGML_SYCL_FATTN_TEST_EXPECT, so the test verifies that environment
+# and fails any case that does not reach the arm's expected kernel (see the
+# ARMS table in the test source). RUN_SERIAL: every arm runs on the same B50,
+# so a parallel ctest must not start two of them (or another GPU test) at once.
+function(ggml_sycl_add_fattn_masked_arm arm)
+    set(name test-sycl-fattn-masked-nonfinite-${arm})
+    set(env
+        "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        "GGML_SYCL_FATTN_TEST_EXPECT=${arm}"
+        ${ARGN})
+    add_test(NAME ${name} COMMAND test-sycl-fattn-masked-nonfinite)
+    set_tests_properties(${name} PROPERTIES
+        LABELS "sycl;fattn;masked;numerics;tdd"
+        ENVIRONMENT "${env}"
+        TIMEOUT 300
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+    )
+endfunction()
+
+ggml_sycl_add_fattn_masked_arm(noonednn GGML_SYCL_FA_ONEDNN=0)
+ggml_sycl_add_fattn_masked_arm(v1pp GGML_SYCL_FA_ONEDNN=0 GGML_SYCL_FA_XMX_V1_PP=1)
+ggml_sycl_add_fattn_masked_arm(noesimd GGML_SYCL_FA_ESIMD=0)
+ggml_sycl_add_fattn_masked_arm(force-v2-decode GGML_SYCL_FA_FORCE_PATH=xmx-v2-decode)
+ggml_sycl_add_fattn_masked_arm(force-v2-gqa GGML_SYCL_FA_FORCE_PATH=xmx-v2-gqa)
+ggml_sycl_add_fattn_masked_arm(force-v2-gqa-split-packed GGML_SYCL_FA_FORCE_PATH=xmx-v2-gqa-split-packed)
+ggml_sycl_add_fattn_masked_arm(force-tile GGML_SYCL_FA_FORCE_PATH=tile)
+
+# The default arm routes D=128 and D=256 prefill to oneDNN SDPA, which still
+# adds the -inf mask to the score and multiplies masked V by 0, so its
+# poisoned cases fail by design until llama.cpp-t0f4 fixes that path. It is
+# registered DISABLED so it shows as "Not Run (Disabled)" rather than green;
+# t0f4's acceptance removes the DISABLED property.
+ggml_sycl_add_fattn_masked_arm(default)
+set_tests_properties(test-sycl-fattn-masked-nonfinite-default PROPERTIES DISABLED TRUE)
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-kernel-selection
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-kernel-selection.cpp
 )

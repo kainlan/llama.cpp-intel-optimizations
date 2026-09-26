@@ -254,8 +254,7 @@ static void flash_attn_tile_f16_kernel(
                     // maskh indexing: maskh[query * ne30 + kv_pos] (ne30 is the KV dimension stride)
                     if (maskh) {
                         // Use ne30 (not ne11) for the KV stride in mask
-                        float mask_val = static_cast<float>(maskh[q_idx * ne30 + kv_start + k_idx]);
-                        dot += slope * mask_val;
+                        dot = fattn_mask_apply(dot, slope, maskh[q_idx * ne30 + kv_start + k_idx]);
                     }
 
                     KQ_shared[q_idx * config::BATCH_KV + k_idx] = dot;
@@ -316,6 +315,15 @@ static void flash_attn_tile_f16_kernel(
             // Compute softmax weights and accumulate V
             for (int k = 0; k < kv_count; ++k) {
                 const float kq_val = KQ_shared[j * config::BATCH_KV + k];
+                // Skip a dead cell rather than weight it by 0: its V may be
+                // non-finite. Dead is read from the mask (the same element the
+                // score step selected on), never inferred from kq_val: a
+                // visible cell whose QK^T is -inf still meets its V (see
+                // fattn_weight_mark_dead). Every thread reads the same element, so
+                // the branch is uniform.
+                if (maskh && fattn_mask_is_dead(maskh[j * ne30 + kv_start + k])) {
+                    continue;
+                }
                 const float w = sycl::exp(kq_val - KQ_max[j]);
                 KQ_sum[j] += w;
 
@@ -393,8 +401,7 @@ static void flash_attn_tile_f16_kernel(
         for (int i = 0; i < D_per_thread; ++i) {
             const int d_idx = tid + i * nthreads;
             if (d_idx < D) {
-                float val = VKQ[j][i] * inv_sum;
-                dst_row[d_idx] = sycl::isfinite(val) ? val : 0.0f;
+                dst_row[d_idx] = VKQ[j][i] * inv_sum;
             }
         }
 
