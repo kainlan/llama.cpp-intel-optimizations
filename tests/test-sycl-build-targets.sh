@@ -159,8 +159,8 @@ expect_private_tmp_removed
 # build in flight, ends the script with the conventional status and still
 # removes its temporaries, but only once the whole build has stopped: the mock
 # cmake dies at once, and its ninja child needs another second to clean up.
-# With "stopped", the build group is SIGSTOPped first (as a background job
-# writing under stty tostop would be); the signal must still end it.
+# With "stopped", the build group is SIGSTOPped first (as an explicit
+# kill -STOP to the build group would); the signal must still end it.
 signal_case() {
     local sig="$1" want_rc="$2" stopped="${3:-}" pid build_pid child rc=0 start_ms elapsed_ms
     : > "${CMAKE_LOG}"
@@ -182,9 +182,12 @@ signal_case() {
     done
     if [[ ! -s "${TMP}/build.pid" ]]; then
         # The script and its build run in process groups of their own, which
-        # neither this test's exit nor ctest's TIMEOUT reaches.
+        # neither this test's exit nor ctest's TIMEOUT reaches. Stop the script
+        # first so it cannot fork the build between the listing and the kill.
+        kill -STOP "${pid}" 2>/dev/null || true
         for child in $(pgrep -P "${pid}"); do
             kill -KILL -- "-${child}" 2>/dev/null || true
+            kill -KILL "${child}" 2>/dev/null || true
         done
         kill -KILL -- "-${pid}" 2>/dev/null || true
         fail "SIG${sig}: the build never started: $(cat "${TMP}/out.log")"

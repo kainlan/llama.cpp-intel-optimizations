@@ -157,7 +157,9 @@ mkdir -p "${BUILD_DIR}"
 # this script's process group reaches the build only through on_signal:
 # INT/TERM/HUP are forwarded, but Ctrl-Z (SIGTSTP) pauses only this script
 # while the build keeps compiling, and a group SIGKILL (a harness, timeout -k)
-# leaves ninja running on unowned in the build directory.
+# leaves ninja running on unowned in the build directory. Being a background
+# group of the terminal, the build also stops at its first write to it under
+# `stty tostop` (SIGTTOU) and makes no progress; tostop is off by default.
 build_tmp="$(mktemp -d "${TMPDIR:-/tmp}/sycl-build.XXXXXX")"
 build_pid=""
 
@@ -176,8 +178,9 @@ on_signal() {
     build_pid="${build_pid:-$(jobs -p | head -n 1)}"
     if [[ -n "${build_pid}" ]]; then
         kill "-${sig}" -- "-${build_pid}" 2>/dev/null || true
-        # A stopped build (SIGTTOU/SIGTTIN as a background job, or an explicit
-        # STOP) would hold the forwarded signal pending and never exit.
+        # A build group stopped by an explicit STOP/TSTP sent to it would hold
+        # the forwarded signal pending and never exit. (A tty stop under
+        # stty tostop recurs at ninja's next write; CONT does not cure that.)
         kill -CONT -- "-${build_pid}" 2>/dev/null || true
         wait "${build_pid}" 2>/dev/null || true
         while kill -0 -- "-${build_pid}" 2>/dev/null; do
