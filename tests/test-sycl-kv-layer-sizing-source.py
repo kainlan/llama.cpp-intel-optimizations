@@ -858,19 +858,28 @@ def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
     txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
     if not re.search(r"in\.available\.push_back\(\s*ggml_sycl::unified_cache_kv_vram_available\(", txn):
         found.append("the transaction's in.available is not the live KV headroom")
+    elif not re.search(r"unified_cache_kv_vram_available\(\s*device\s*,\s*next_plan\.multi_device\s*\)", txn):
+        found.append("the transaction's KV headroom is not asked for the plan's multi_device")
 
     alloc = strip_comments(function(sycl_cpp, TIERED_KV_ALLOC_SIGNATURE))
     caps = re.findall(r"\bkv_vram_cap\s*=(?!=)([^;]*);", alloc)
     if len(caps) != 1 or "ggml_sycl::unified_cache_kv_vram_available(" not in caps[0]:
         found.append("the allocator's kv_vram_cap is not the live KV headroom")
+    elif not re.search(r"unified_cache_kv_vram_available\(\s*device\s*,\s*kv_multi_device\s*\)", caps[0]) or \
+            not re.search(r"\bkv_multi_device\s*=\s*lifecycle_owner\s*&&\s*lifecycle_owner->plan\s*&&\s*"
+                          r"lifecycle_owner->plan->multi_device\s*;", alloc):
+        found.append("the allocator's KV headroom is not asked for the plan's multi_device")
+    counted = alloc[alloc.find("size_t planned_device_bytes = 0;"):alloc.find("kv_admission_mismatch(")]
+    if not re.search(r"kv_buffer_layer_owner\([^;]*,\s*kv_host_val\s*==\s*1\s*\)\s*;", counted):
+        found.append("planned_device_bytes does not count GGML_SYCL_KV_HOST=1 as host-owned")
     backstop = re.search(r"if\s*\(\s*ggml_sycl::kv_admission_mismatch\(\s*planned_device_bytes\s*,\s*kv_vram_cap\s*\)"
                          r"\s*\)\s*\{[^{}]*return\s+nullptr\s*;", alloc)
     block = alloc.find(PLAN_OWNED_BLOCK)
     staged = alloc.find("ggml_sycl::kv_tier_manager staged = mgr;")
     if backstop is None:
         found.append("the allocator's kv_admission_mismatch backstop is missing or does not refuse")
-    elif block < 0 or not block < backstop.start() < staged or re.search(r"\breturn\s+nullptr\b|\bgoto\b",
-                                                                          alloc[block:backstop.start()]):
+    elif block < 0 or not block < backstop.start() < staged or \
+            re.search(r"\breturn\s+nullptr\b|\bgoto\b", alloc[block:backstop.start()]):
         found.append("the allocator's backstop is not reached on every planned allocation")
     if re.search(r"runtime_kv_plan\.kv_device\[[^\]]*\]\s*=\s*-1", alloc):
         found.append("the allocator demotes device-planned KV itself")
@@ -878,6 +887,8 @@ def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
     live = strip_comments(function(sycl_cpp, LIVE_HINT_SIGNATURE))
     if "ggml_sycl::unified_cache_kv_vram_available(" not in live:
         found.append("the -c hint does not read the live KV headroom")
+    elif not re.search(r"unified_cache_kv_vram_available\(\s*d\s*,\s*plan\.multi_device\s*\)", live):
+        found.append("the -c hint's KV headroom is not asked for the plan's multi_device")
 
     probe_calls = re.findall(r"ggml_sycl_run_runtime_context_transaction\(([^;]*)\);", strip_comments(sycl_cpp))
     if not any(re.search(r",\s*true\s*,\s*out\s*$", c) for c in probe_calls):
@@ -897,7 +908,8 @@ def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
     for sig, name in ((KV_HEADROOM_SIGNATURE, "unified_cache_kv_vram_available"),
                       (KV_WEIGHT_CAPACITY_SIGNATURE, "unified_cache_kv_weight_capacity")):
         fn = function_or_none(cache_cpp, sig)
-        if fn is None or not re.search(r"kv_reads_device_arena\(\s*multi_device\s*,", strip_comments(fn)):
+        if fn is None or not re.search(r"kv_reads_device_arena\(\s*multi_device\s*,\s*get_effective_mode\(\)\s*==\s*"
+                                       r"unified_cache_mode::GLOBAL\s*\)", strip_comments(fn)):
             found.append(f"{name} does not apply the multi-device GLOBAL special case")
     return found
 
@@ -911,15 +923,22 @@ def kv_refit_announcement_violations(sycl_cpp: str) -> list[str]:
     if not re.search(r"load_it\s*=\s*next_plan\.load_kv_device\.find\(", txn) or \
             "next_plan.kv_device = next_plan.load_kv_device;" not in refit.group(1):
         found.append("the re-fit does not restart from the load residency")
-    announce = re.search(r"const\s+bool\s+announce\s*=\s*!probe_mode\s*&&\s*next_plan\.kv_device\s*!=\s*"
-                         r"current->plan->kv_device\s*;", refit.group(1))
-    warn = refit.group(1).find("KV overflow re-placed to host tier")
-    gate = refit.group(1).find("if (!announce)")
-    if announce is None or gate < 0 or not announce.start() < gate < warn:
-        found.append("the re-fit WARN is not gated on a change to the published residency")
     refused = refit.group(1).find("if (!residency.fits)")
-    if refused < 0 or (0 <= warn < refused):
+    recorded = refit.group(1).find("kv_host_demotions.push_back(")
+    if refused < 0 or recorded < 0 or recorded < refused:
         found.append("a refused re-fit can log KV it re-placed")
+    # Both demotion paths only record; the one WARN reads the final residency,
+    # after the budget path and its refusal, and only when it changed.
+    announce = re.search(r"const\s+bool\s+announce\s*=\s*!probe_mode\s*&&\s*next_plan\.kv_device\s*!=\s*"
+                         r"current->plan->kv_device\s*;", txn)
+    records = [m.start() for m in re.finditer(r"kv_host_demotions\.push_back\(", txn)]
+    replan_refused = txn.find("if (!replan_ok) {")
+    if announce is None or len(records) != 2 or not max(records + [replan_refused]) < announce.start():
+        found.append("the demotion announcement does not read the final residency")
+    warns = [m.start() for m in re.finditer(r"GGML_LOG_WARN\(\s*\"\[SYCL-PLAN\] KV overflow", txn)]
+    gate = txn.find("if (!announce)")
+    if len(warns) != 1 or announce is None or gate < 0 or not announce.start() < gate < warns[0]:
+        found.append("a demotion WARN is not gated on a change to the published residency")
     return found
 
 
@@ -960,7 +979,7 @@ def kv_demotion_message_violations(sycl_cpp: str) -> list[str]:
         found.append("the allocator backstop blames the context size")
     override = re.search(r"const\s+bool\s+host_kv_override\s*=([^;]*);", alloc)
     if override is None or "kv_hot_layers_override_active(" not in override.group(1) or \
-            "!kv_plan" not in override.group(1) or "!= nullptr ||" in override.group(1).split("!kv_plan")[0]:
+            not re.search(r"^\s*kv_host_val\s*==\s*1\s*\|\|\s*\(\s*!kv_plan\s*&&\s*\(", override.group(1)):
         found.append("the HOT_* overrides are read by presence or license host layers under a plan")
     return found
 
@@ -1080,13 +1099,61 @@ def test_mutation_headroom_ignores_global_mode_is_witnessed() -> None:
                       "the GLOBAL special case dropped")
 
 
+def test_mutation_weight_capacity_ignores_global_mode_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    body = function(cache, KV_WEIGHT_CAPACITY_SIGNATURE)
+    new_body = body.replace("get_effective_mode() == unified_cache_mode::GLOBAL",
+                            "get_effective_mode() != unified_cache_mode::GLOBAL", 1)
+    _assert_witnessed(cache, cache.replace(body, new_body, 1), _cache_checker(cpp),
+                      "unified_cache_kv_weight_capacity does not apply the multi-device GLOBAL special case",
+                      "the GLOBAL test inverted")
+
+
+def test_mutation_headroom_global_inverted_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    body = function(cache, KV_HEADROOM_SIGNATURE)
+    new_body = body.replace("get_effective_mode() == unified_cache_mode::GLOBAL",
+                            "get_effective_mode() != unified_cache_mode::GLOBAL", 1)
+    _assert_witnessed(cache, cache.replace(body, new_body, 1), _cache_checker(cpp),
+                      "unified_cache_kv_vram_available does not apply the multi-device GLOBAL special case",
+                      "the GLOBAL test inverted")
+
+
+def test_mutation_headroom_multi_device_dropped_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    for old, expected in (("unified_cache_kv_vram_available(device, next_plan.multi_device)", "the transaction's"),
+                          ("unified_cache_kv_vram_available(device, kv_multi_device)", "the allocator's"),
+                          ("unified_cache_kv_vram_available(d, plan.multi_device)", "the -c hint's"),
+                          ("lifecycle_owner && lifecycle_owner->plan && lifecycle_owner->plan->multi_device;",
+                           "the allocator's")):
+        new = re.sub(r"\((device|d), [^)]*\)$", r"(\1, false)", old) if old.endswith(")") else "false;"
+        _assert_witnessed(cpp, cpp.replace(old, new, 1), _headroom_checker(cache),
+                          expected + " KV headroom is not asked for the plan's multi_device", f"{old} -> {new}")
+
+
+def test_mutation_planned_bytes_ignore_kv_host_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    old = "false, device, kv_host_val == 1);\n            if (layer_in_this_kv_buffer(l) && owner == device)"
+    mutated = cpp.replace(old, old.replace("kv_host_val == 1", "false", 1), 1)
+    _assert_witnessed(cpp, mutated, _headroom_checker(cache),
+                      "planned_device_bytes does not count GGML_SYCL_KV_HOST=1 as host-owned",
+                      "KV_HOST=1 ignored by the planned-bytes count")
+
+
+def test_mutation_hot_overrides_or_plan_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("(!kv_plan &&\n         (hot_pct_env", "(!kv_plan ||\n         (hot_pct_env", 1)
+    _assert_witnessed(cpp, mutated, kv_demotion_message_violations,
+                      "license host layers under a plan", "!kv_plan && turned into ||")
+
+
 def test_mutation_refit_warn_ungated_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
     mutated = cpp.replace("const bool announce = !probe_mode && next_plan.kv_device != current->plan->kv_device;",
                           "const bool announce = !probe_mode;", 1)
     _assert_witnessed(cpp, mutated, kv_refit_announcement_violations,
-                      "the re-fit WARN is not gated on a change to the published residency",
-                      "every re-fit announced")
+                      "a demotion WARN is not gated on a change to the published residency",
+                      "every demotion announced")
 
 
 def test_mutation_refit_sticky_is_witnessed() -> None:
@@ -1104,11 +1171,34 @@ def test_mutation_refit_logs_before_refusal_is_witnessed() -> None:
     refusal_end = body.index("        }\n", body.index("return refuse(", refusal_at)) + len("        }\n")
     refusal = body[refusal_at:refusal_end]
     rest = body[:refusal_at] + body[refusal_end:]
-    at = rest.index("        // A second backend of a context re-fits")
-    loop_end = rest.index("\n    }\n", rest.index("KV overflow re-placed to host tier", at))
-    new_body = rest[:loop_end] + "\n" + refusal + rest[loop_end:]
+    record = rest.index("kv_host_demotions.push_back({ in.devices[i]")
+    loop_end = rest.index("\n        }\n", record) + len("\n        }\n")
+    new_body = rest[:loop_end] + refusal + rest[loop_end:]
     _assert_witnessed(cpp, cpp.replace(body, new_body, 1), kv_refit_announcement_violations,
-                      "a refused re-fit can log KV it re-placed", "refusal checked after the WARNs")
+                      "a refused re-fit can log KV it re-placed", "refusal checked after the re-fit records")
+
+
+def test_mutation_budget_demotion_warns_ungated_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    anchor = "                                          \"the plan exceeded the device's VRAM budget\" });\n"
+    warn = ("            GGML_LOG_WARN(\"[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted\\n\",\n"
+            "                          demotion_result.demoted_layers.size());\n")
+    mutated = cpp.replace(anchor, anchor + warn, 1)
+    _assert_witnessed(cpp, mutated, kv_refit_announcement_violations,
+                      "a demotion WARN is not gated on a change to the published residency",
+                      "the budget path's own WARN restored")
+
+
+def test_mutation_announce_before_budget_path_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    body = function(cpp, TRANSACTION_SIGNATURE)
+    decl = "    const bool announce = !probe_mode && next_plan.kv_device != current->plan->kv_device;\n"
+    rest = body.replace(decl, "", 1)
+    at = rest.index("    if (!replan_ok && (replan_reason ==")
+    new_body = rest[:at] + decl + rest[at:]
+    _assert_witnessed(cpp, cpp.replace(body, new_body, 1), kv_refit_announcement_violations,
+                      "the demotion announcement does not read the final residency",
+                      "announce computed before the budget demotion")
 
 
 def test_mutation_publish_after_kv_allocation_is_witnessed() -> None:
@@ -1142,7 +1232,7 @@ def test_mutation_budget_path_swa_off_is_witnessed() -> None:
 
 def test_mutation_unguarded_hint_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
-    mutated = cpp.replace('"in host memory.%s\\n",', '"in host memory. Largest all-VRAM context is about -c %u\\n",', 1)
+    mutated = cpp.replace('"CPU.%s\\n",', '"CPU. Largest all-VRAM context is about -c %u\\n",', 1)
     _assert_witnessed(cpp, mutated, kv_demotion_message_violations, "prints the -c hint unguarded",
                       "the old unguarded -c print")
 

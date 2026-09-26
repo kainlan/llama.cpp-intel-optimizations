@@ -17693,6 +17693,16 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // inherently probe-safe: nothing to roll back either way.
     bool   kv_was_demoted        = false;
     size_t kv_demoted_host_bytes = 0;
+    // Each device's KV re-placed to the host tier by either pass, logged once
+    // the final residency is known (after the over-budget demotion).
+    struct kv_host_demotion {
+        int              device;
+        std::vector<int> layers;
+        size_t           host_bytes;
+        std::string      cause;  // what ran out
+    };
+
+    std::vector<kv_host_demotion> kv_host_demotions;
 
     // KV residency is re-decided (kv_residency_needs_refit) when the KV shape
     // changes (n_ctx, n_seq_max, kv_unified, swa_full) and for every context
@@ -17714,9 +17724,10 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // to the host tier, where llama_kv_cache allocates them in SYCL_KV_Host.
     // supports_op declines any op with a SYCL_KV_Host operand unless
     // GGML_SYCL_ATTN_HOST_DISPATCH is set, so the scheduler runs their KV
-    // writes and attention on the CPU backend, in extra graph splits. Whether that is the right executor is llama.cpp-mnqa's question;
-    // host KV left inside a device KV buffer is instead read by the GPU over
-    // PCIe (llama.cpp-qx1r).
+    // writes and attention on the CPU backend, in extra graph splits. Whether
+    // that is the right executor is llama.cpp-mnqa's question; host KV left
+    // inside a device KV buffer is instead read by the GPU over PCIe
+    // (llama.cpp-qx1r).
     //
     // Two live contexts: the later publish replaces kv_device for everyone.
     // An earlier context's KV buffers keep the layout they were allocated
@@ -17728,9 +17739,13 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     //
     // On a split, every device's backend publishes the same context and each
     // re-fits, because admission is per backend. llama_context publishes on
-    // every backend before it creates the KV cache, so those re-fits see the
-    // same headroom and reach the same residency; only a re-fit that changes
-    // the published residency is announced at WARN.
+    // every backend before it creates the KV cache, so with an arena those
+    // re-fits read the same KV zone headroom and reach the same residency.
+    // Without one, the headroom is the budget path's free VRAM, which an
+    // earlier backend's publish tail (its direct-device PP MoE ring) lowers:
+    // real memory, so a later re-fit may demote more. Either way, the demotion
+    // is announced at WARN only when the transaction's final residency (re-fit
+    // plus any budget-path demotion) differs from the published one.
     if (!next_plan.load_kv_device_valid) {
         next_plan.load_kv_device       = next_plan.kv_device;
         next_plan.load_kv_device_valid = true;
@@ -17792,42 +17807,16 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         next_plan.refresh_kv_byte_totals();
         next_plan.refresh_layer_block_kv_devices();
 
-        // A second backend of a context re-fits to the residency the first
-        // one published (see above): not news, so INFO.
-        const bool announce = !probe_mode && next_plan.kv_device != current->plan->kv_device;
         for (size_t i = 0; i < residency.per_device.size(); ++i) {
-            const ggml_sycl::kv_demotion_result & fit    = residency.per_device[i];
-            const int                             device = in.devices[i];
+            const ggml_sycl::kv_demotion_result & fit = residency.per_device[i];
             if (fit.demoted_layers.empty()) {
                 continue;
             }
             kv_was_demoted = true;
             kv_demoted_host_bytes += fit.host_kv_bytes_added;
-            // Full-attention layers are demoted first, then SWA layers, each
-            // latest first, so the list is not one contiguous range.
-            const int demoted_lo  = *std::min_element(fit.demoted_layers.begin(), fit.demoted_layers.end());
-            const int demoted_hi  = *std::max_element(fit.demoted_layers.begin(), fit.demoted_layers.end());
-            size_t    demoted_swa = 0;
-            for (int l : fit.demoted_layers) {
-                demoted_swa += (size_t) l < in.swa_layer_mask.size() && in.swa_layer_mask[l] != 0 ? 1 : 0;
-            }
-            if (!announce) {
-                GGML_LOG_INFO(
-                    "[SYCL-PLAN] %sKV overflow %s on the host tier: %zu layer(s), %zu SWA (%.1f MB host KV, layers "
-                    "%d..%d) on device %d for n_ctx=%u\n",
-                    probe_mode ? "probe: " : "", probe_mode ? "would be re-placed" : "stays", fit.demoted_layers.size(),
-                    demoted_swa, fit.host_kv_bytes_added / mb, demoted_lo, demoted_hi, device, n_ctx);
-                continue;
-            }
-            // What fits with NO demotion.
-            const uint32_t fits_ctx =
-                ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, device, admitted_kv);
-            GGML_LOG_WARN(
-                "[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted, %zu SWA (%.1f MB host KV, "
-                "layers %d..%d) on device %d for n_ctx=%u; the device has %.1f MB free for KV. Their KV lives "
-                "in host memory.%s\n",
-                fit.demoted_layers.size(), demoted_swa, fit.host_kv_bytes_added / mb, demoted_lo, demoted_hi, device,
-                n_ctx, in.available[i] / mb, ggml_sycl_all_vram_ctx_hint(fits_ctx).c_str());
+            char cause[64];
+            snprintf(cause, sizeof(cause), "the device has %.1f MB free for KV", in.available[i] / mb);
+            kv_host_demotions.push_back({ in.devices[i], fit.demoted_layers, fit.host_kv_bytes_added, cause });
         }
     }
 
@@ -17894,34 +17883,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         if (ggml_sycl_try_demote_runtime_kv(
                 demoted_plan, old_mmid_charges, g_tensor_inventory_detail, next_kv_info.n_expert_used, n_ctx,
                 current->plan->moe_mmid_device_pool_bytes, &demotion_result, &demote_reason, probe_mode)) {
-            // The "-c" figure describes what fits without ANY demotion; it
-            // counts the load-time residency against the live KV headroom
-            // (ggml_sycl_largest_fitting_n_ctx_live), the number the re-fit
-            // quotes too.
-            //
-            // llama.cpp-tsfl (round 1 F2): in probe mode nothing was actually
-            // demoted -- demoted_plan is a scratch copy this branch is about
-            // to discard into next_plan, never published -- so the WARN
-            // below (which reads as a completed, durable action) would be a
-            // false claim at default verbosity. Report the SAME numbers at
-            // INFO instead, worded as a prediction ("would be"); the publish
-            // path's WARN text is unchanged.
-            if (probe_mode) {
-                GGML_LOG_INFO(
-                    "[SYCL-PLAN] probe: KV overflow would be re-placed to host tier: %zu layer(s) "
-                    "(%.1f MB host KV) for n_ctx=%u\n",
-                    demotion_result.demoted_layers.size(), demotion_result.host_kv_bytes_added / (1024.0 * 1024.0),
-                    n_ctx);
-            } else {
-                GGML_LOG_WARN(
-                    "[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted "
-                    "(%.1f MB host KV) for n_ctx=%u; attention for those layers runs on CPU.%s\n",
-                    demotion_result.demoted_layers.size(), demotion_result.host_kv_bytes_added / (1024.0 * 1024.0),
-                    n_ctx,
-                    ggml_sycl_all_vram_ctx_hint(
-                        ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, -1, admitted_kv))
-                        .c_str());
-            }
+            // Only a single-device plan reaches this path (see
+            // ggml_sycl_try_demote_runtime_kv).
+            kv_host_demotions.push_back({ demoted_plan.device_id, demotion_result.demoted_layers,
+                                          demotion_result.host_kv_bytes_added,
+                                          "the plan exceeded the device's VRAM budget" });
             kv_was_demoted = true;
             kv_demoted_host_bytes += demotion_result.host_kv_bytes_added;
             next_plan = std::move(demoted_plan);
@@ -18004,6 +17970,40 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             }
         }
         return refuse(ggml_sycl::moe_mmid_runtime_reason_name(replan_reason));
+    }
+
+    // The residency is final here. It is announced at WARN only when it
+    // differs from the published one: on a split, the second backend of a
+    // context reaches the residency the first published, re-fit and budget
+    // demotion included (see the re-fit above), which is not news. A probe
+    // re-places nothing, so it only predicts, at INFO (llama.cpp-tsfl).
+    const bool announce = !probe_mode && next_plan.kv_device != current->plan->kv_device;
+    for (const kv_host_demotion & d : kv_host_demotions) {
+        // Full-attention layers are demoted first, then SWA layers, each
+        // latest first, so the list is not one contiguous range.
+        const int lo  = *std::min_element(d.layers.begin(), d.layers.end());
+        const int hi  = *std::max_element(d.layers.begin(), d.layers.end());
+        size_t    swa = 0;
+        for (int l : d.layers) {
+            swa += (size_t) l < next_plan.swa_layer_mask.size() && next_plan.swa_layer_mask[l] != 0 ? 1 : 0;
+        }
+        const double mb = 1024.0 * 1024.0;
+        if (!announce) {
+            GGML_LOG_INFO(
+                "[SYCL-PLAN] %sKV overflow %s on the host tier: %zu layer(s), %zu SWA (%.1f MB host KV, layers "
+                "%d..%d) on device %d for n_ctx=%u; %s\n",
+                probe_mode ? "probe: " : "", probe_mode ? "would be re-placed" : "stays", d.layers.size(), swa,
+                d.host_bytes / mb, lo, hi, d.device, n_ctx, d.cause.c_str());
+            continue;
+        }
+        // What fits with NO demotion.
+        const uint32_t fits_ctx = ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, d.device, admitted_kv);
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted, %zu SWA (%.1f MB host KV, layers "
+            "%d..%d) on device %d for n_ctx=%u; %s. Their KV lives in host memory and their attention runs on the "
+            "CPU.%s\n",
+            d.layers.size(), swa, d.host_bytes / mb, lo, hi, d.device, n_ctx, d.cause.c_str(),
+            ggml_sycl_all_vram_ctx_hint(fits_ctx).c_str());
     }
 
     // llama.cpp-oyfl: the KV/MMID replan above fits the device budget, but a
