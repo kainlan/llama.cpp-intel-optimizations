@@ -272,12 +272,14 @@ expect_launcher "${base_dir_launcher}" "default"
 # 1, on, true or yes asks for the default.
 for value in 0 off OFF False no; do
     rm -f "${BUILD_DIR}/CMakeCache.txt" "${BUILD_DIR}/build.ninja"
-    GGML_SYCL_CCACHE_BASE_DIR="${value}" run_script
+    GGML_SYCL_CCACHE_BASE_DIR="${value}" run_script ||
+        fail "opt-out '${value}': script exited $?: $(cat "${TMP}/out.log")"
     expect_launcher ccache "opt-out '${value}'"
 done
 for value in 1 ON true Yes; do
     rm -f "${BUILD_DIR}/CMakeCache.txt" "${BUILD_DIR}/build.ninja"
-    GGML_SYCL_CCACHE_BASE_DIR="${value}" run_script
+    GGML_SYCL_CCACHE_BASE_DIR="${value}" run_script ||
+        fail "opt-in '${value}': script exited $?: $(cat "${TMP}/out.log")"
     expect_launcher "${base_dir_launcher}" "opt-in '${value}'"
 done
 
@@ -307,13 +309,17 @@ expect_launcher ccache "base_dir -> opt-out"
 
 # ccache before 4.8 has no KEY=VALUE syntax and would take base_dir=... for the
 # compiler; it keeps the plain launcher, and says so. So does a ccache whose
-# version cannot be read.
+# version cannot be read, with its own note rather than a made-up version.
 for version in 4.7.4 unknown; do
+    case "${version}" in
+        unknown) note='could not read the ccache version; keeping plain ccache (no base_dir)' ;;
+        *) note='ccache 4.7 predates 4.8 (no KEY=VALUE launcher); keeping plain ccache (no base_dir)' ;;
+    esac
     rm -f "${BUILD_DIR}/CMakeCache.txt" "${BUILD_DIR}/build.ninja"
     MOCK_CCACHE_VERSION="${version}" run_script
     expect_launcher ccache "ccache ${version}"
-    grep -Fq 'keeping plain ccache (no base_dir)' "${TMP}/out.log" ||
-        fail "ccache ${version}: no note about keeping plain ccache: $(cat "${TMP}/out.log")"
+    grep -Fq "${note}" "${TMP}/out.log" ||
+        fail "ccache ${version}: no note '${note}': $(cat "${TMP}/out.log")"
 done
 
 # A GGML_SYCL_PROFILING_DEBUG build (-g) keeps plain ccache: its DWARF paths
