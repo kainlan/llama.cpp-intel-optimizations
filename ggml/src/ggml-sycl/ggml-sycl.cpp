@@ -17702,7 +17702,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         std::vector<int> layers;
         size_t           host_bytes;
         std::string      cause;     // what ran out
-        std::string      ctx_hint;  // the all-VRAM "-c" hint, from the headroom admission read
+        std::string      ctx_hint;  // all-VRAM "-c" hint, read before the publish tail moves the headroom
     };
 
     std::vector<kv_host_demotion> kv_host_demotions;
@@ -17994,12 +17994,13 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // Announces the recorded demotions, once, against the final plan. Called
     // only after the plan is published, or at the probe's exit, so a refused
     // transaction announces nothing. It only prints: everything it reports,
-    // including the "-c" hint, was computed before ownership changed. A device's demotion is a WARN only when
-    // its residency differs from the published plan's: on a split, the second
-    // backend of a context reaches the residency the first published, re-fit
-    // and budget demotion included, which is not news, and a demotion on one
-    // device is not re-announced when another device changes. A probe re-places
-    // nothing, so it only predicts, at INFO (llama.cpp-tsfl).
+    // including the "-c" hint, was computed before ownership changed. A
+    // device's demotion is a WARN only when its residency differs from the
+    // published plan's: on a split, the second backend of a context reaches
+    // the residency the first published, re-fit and budget demotion included,
+    // which is not news, and a demotion on one device is not re-announced when
+    // another device changes. A probe re-places nothing, so it only predicts,
+    // at INFO (llama.cpp-tsfl).
     auto announce_kv_host_demotions = [&](const ggml_sycl::placement_plan & final_plan) {
         for (const kv_host_demotion & rec : kv_host_demotions) {
             // Full-attention layers are demoted first, then SWA layers, each

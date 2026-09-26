@@ -964,15 +964,18 @@ def kv_overflow_announcement_violations(sycl_cpp: str) -> list[str]:
                 "GGML_LOG_WARN(" in other or "GGML_LOG_INFO(" not in other:
             found.append("the overflow WARN is not confined to the changed-residency branch")
 
-    # The announcement only prints: the "-c" hint reads the headroom admission
-    # read, before the publish tail moves it, and nothing that allocates runs
-    # after ownership changes.
+    # The announcement does not compute the -c hint: each record's hint is
+    # read where the record is made, before the publish tail moves the
+    # headroom.
     if re.search(r"ggml_sycl_largest_fitting_n_ctx_live\(|ggml_sycl_all_vram_ctx_hint\(", lam):
         found.append("the announcement computes the -c hint after publication")
-    hints = [m.start() for m in re.finditer(r"ggml_sycl_all_vram_ctx_hint\(", txn)]
-    cas_at = txn.find("if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {")
-    if len(hints) != 2 or cas_at < 0 or any(h > cas_at for h in hints):
-        found.append("a demotion record's -c hint is not taken before the CAS")
+    budget_at = txn.find("ggml_sycl_try_demote_runtime_kv(")
+    budget_end = txn.find("next_plan = std::move(demoted_plan);", budget_at)
+    budget = txn[budget_at:budget_end] if 0 <= budget_at < budget_end else ""
+    hint = r"ggml_sycl_all_vram_ctx_hint\("
+    if len(re.findall(hint, txn)) != 2 or len(re.findall(hint, refit.group(1))) != 1 or \
+            len(re.findall(hint, budget)) != 1:
+        found.append("a demotion record's -c hint is not taken where the record is made")
 
     # Announced once per exit that accepts: at the probe's exit after its ring
     # rollback, and after a successful publish. Never before a refusal.
@@ -1311,7 +1314,20 @@ def test_mutation_hint_taken_after_cas_is_witnessed() -> None:
     at = body.index(PUBLISH_ANNOUNCE)
     new_body = body[:at] + extra + body[at:]
     _assert_witnessed(cpp, cpp.replace(body, new_body, 1), kv_overflow_announcement_violations,
-                      "is not taken before the CAS", "a hint taken after the CAS")
+                      "is not taken where the record is made", "a hint taken after the CAS")
+
+
+def test_mutation_hint_filled_after_ring_replan_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("fit.host_kv_bytes_added, cause,\n"
+                          "                                          ggml_sycl_all_vram_ctx_hint(fits) });",
+                          "fit.host_kv_bytes_added, cause, std::string() });", 1)
+    probe_exit = "\n    if (probe_mode) {\n        // llama.cpp-tsfl: every candidate check"
+    assert cpp.count(probe_exit) == 1
+    mutated = mutated.replace(probe_exit, "\n    for (kv_host_demotion & rec : kv_host_demotions) {\n"
+                              "        rec.ctx_hint = ggml_sycl_all_vram_ctx_hint(0);\n    }" + probe_exit, 1)
+    _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations, "is not taken where the record is made",
+                      "the re-fit hint filled by a loop after the ring re-plan")
 
 
 def test_mutation_bare_refusal_after_announce_is_witnessed() -> None:
