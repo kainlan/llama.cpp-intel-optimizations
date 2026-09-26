@@ -8,9 +8,23 @@ skip is sound only while nothing else has written or replaced that copy, which
 the context's graph_input_staging_generation tells it. So:
 
   1. every member function that writes or replaces a staging entry bumps the
-     generation, and nothing outside those functions touches the map;
+     generation -- on each path that touches the entry -- and nothing in any
+     ggml-sycl source outside those functions touches the map;
   2. the executor takes the moved-only refresh only on a plan-cache hit that
-     records nothing, and checks the generation and the input list first.
+     records nothing, checks the generation and the input list first, and
+     skips exactly the inputs whose bytes did not move and that no node
+     writes.
+
+What makes the skip sound is (1): no node writes a staging copy. Kernels
+only read them, through graph_input_stage_lookup, and a node that writes a
+graph input writes the tensor's own storage, not its staging copy. So a
+copy's content changes only through the members in (1), or through the
+executor's own copy, which it records. The executor's `written` flag, which
+it sets for written graph-input (CONTROL) roots, is an extra margin on top
+of that and not what the skip relies on, which is why it does not have to
+cover every input, such as an INPUT-flagged view of a non-input root.
+Lookups hand a caller the copy's handle, so every caller that takes the
+handle, rather than only the pointer, is listed here and must be a reader.
 
 Crossings (item C). The planner lays each crossing's slices out next to each
 other in the arena and hands out runs (block-exec-dense.hpp,
@@ -29,9 +43,10 @@ map is empty, so:
   5. the cache is cleared only when it holds something, and nothing on the
      publish/restore path fills it, so a batch clears it once.
 
-Runs under pytest and as a plain script. GGML_SYCL_2LXW_BACKEND_SOURCE and
-GGML_SYCL_2LXW_COMMON_SOURCE point it at other copies (to see it fail on a
-broken tree). No SYCL device or build is touched.
+Runs under pytest and as a plain script. GGML_SYCL_2LXW_BACKEND_SOURCE,
+GGML_SYCL_2LXW_COMMON_SOURCE and GGML_SYCL_2LXW_SYCL_DIR (the other ggml-sycl
+sources) point it at other copies (to see it fail on a broken tree). No SYCL
+device or build is touched.
 """
 
 import os
@@ -44,6 +59,24 @@ COMMON = Path(os.environ.get("GGML_SYCL_2LXW_COMMON_SOURCE", str(ROOT / "ggml/sr
 
 backend = BACKEND.read_text()
 common = COMMON.read_text()
+
+SYCL_DIR = Path(os.environ.get("GGML_SYCL_2LXW_SYCL_DIR", str(ROOT / "ggml/src/ggml-sycl")))
+
+
+def sycl_sources():
+    """Every ggml-sycl source, with the backend and common overrides applied."""
+    out = {}
+    for path in sorted(SYCL_DIR.rglob("*")):
+        if path.suffix not in (".cpp", ".hpp", ".h") or not path.is_file():
+            continue
+        rel = path.relative_to(SYCL_DIR).as_posix()
+        if rel == "ggml-sycl.cpp":
+            out[rel] = backend
+        elif rel == "common.hpp":
+            out[rel] = common
+        else:
+            out[rel] = path.read_text(errors="replace")
+    return out
 
 GENERATION = "graph_input_staging_generation"
 
@@ -131,6 +164,15 @@ def test_every_staging_writer_bumps_the_generation():
     reuse = stage.find("mem_copy(it->second.handle")
     assert reuse >= 0, "graph_input_stage no longer reuses an entry in place"
     assert GENERATION + "++" in stage[reuse : stage.find("return", reuse)], "reusing an entry must bump the generation"
+    # The create/replace path resets any old entry, then may give up (the
+    # allocation or its resolve fails) before it stores a new one. The bump
+    # must come between the reset and the first way out after it.
+    reset = re.search(r"it->second\.handle\s*=\s*ggml_sycl::mem_handle\{\}", stage)
+    assert reset, "graph_input_stage no longer resets the entry it replaces"
+    first_exit = stage.find("return", reset.end())
+    assert first_exit > 0 and GENERATION + "++" in stage[reset.end() : first_exit], (
+        "replacing or creating an entry must bump the generation before any return"
+    )
 
 
 def test_no_other_code_touches_the_staging_map():
@@ -141,10 +183,56 @@ def test_no_other_code_touches_the_staging_map():
     touches = re.findall(r"\bgraph_input_staging\b(?!_)", rest)
     # The declaration itself is the only remaining mention.
     assert len(touches) == 1, f"graph_input_staging is touched outside its members ({len(touches)} mentions)"
-    for path, text in (("ggml-sycl.cpp", backend),):
+    sources = sycl_sources()
+    assert len(sources) > 50 and "ggml-sycl.cpp" in sources and "getrows.cpp" in sources, "ggml-sycl sources not found"
+    for path, text in sources.items():
+        if path == "common.hpp":
+            continue
         assert not re.search(r"\bgraph_input_staging\b(?!_)", strip_comments(text)), (
             f"{path} touches graph_input_staging directly; go through the context's members"
         )
+
+
+# Lookups that take the staging copy's handle, not only its pointer. Each is
+# a reader, except the executor's memo, which writes through its handle and
+# records what it wrote. A new one is a writer until someone shows otherwise:
+# add it here only if it reads, or make it bump the generation.
+LOOKUP_HANDLE_TAKERS = {
+    ("getrows.cpp", "&out_handle"),  # pre-staged get_rows indices, read by the kernel
+    ("ggml-sycl.cpp", "&in.dst"),  # the executor's memo
+}
+
+
+def test_every_lookup_that_takes_the_handle_is_known():
+    found = set()
+    for path, text in sycl_sources().items():
+        code = strip_comments(text)
+        if path == "common.hpp":
+            # The staging members themselves: the writers bump, the lookup is
+            # the definition.
+            for name in STAGING_WRITERS + STAGING_READERS:
+                code = code.replace(strip_comments(member_body(text, name)), "")
+        for m in re.finditer(r"\bgraph_input_stage_lookup\s*\(", code):
+            depth, i, args, arg = 1, m.end(), [], ""
+            while depth:
+                ch = code[i]
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    depth -= 1
+                if depth == 1 and ch == ",":
+                    args.append(arg.strip())
+                    arg = ""
+                elif depth:
+                    arg += ch
+                i += 1
+            args.append(arg.strip())
+            assert len(args) == 5, f"{path}: unexpected graph_input_stage_lookup call {args}"
+            if args[3] != "nullptr":
+                found.add((path, args[3]))
+    unknown = found - LOOKUP_HANDLE_TAKERS
+    assert not unknown, f"a lookup takes a staging copy's handle and may write through it: {sorted(unknown)}"
+    assert found == LOOKUP_HANDLE_TAKERS, f"a listed handle taker is gone; update the list: {sorted(LOOKUP_HANDLE_TAKERS - found)}"
 
 
 def test_moved_only_refresh_is_gated_on_a_recordless_plan_cache_hit():
@@ -163,8 +251,15 @@ def test_moved_only_refresh_is_gated_on_a_recordless_plan_cache_hit():
     for fact in (GENERATION, "cached_input_tensors", "input_tensors_cached"):
         assert fact in moved, f"refresh_moved_inputs must check {fact} before trusting its list"
     assert moved.find(GENERATION) < moved.find("mem_copy_async"), "check the generation before copying"
-    assert "dense_exec_input_moved" in moved, "only moved inputs are copied"
-    assert "in.written" in moved, "an input a node writes is copied every graph"
+    skip = re.findall(
+        r"if\s*\(\s*!\s*in\.written\s*&&\s*!\s*ggml_sycl::dense_exec_input_moved\(\s*in\.snapshot\s*,\s*t->data\s*,"
+        r"\s*in\.bytes\s*\)\s*\)\s*\{\s*refresh_skipped_\+\+\s*;\s*continue\s*;\s*\}",
+        moved,
+    )
+    assert len(skip) == 1, "skip exactly the inputs that no node writes and whose bytes did not move"
+    assert moved.count("refresh_skipped_++") == 1 and moved.count("continue") == 2, (
+        "the unmoved skip and the full refresh are the only ways past the copy"
+    )
 
 
 def test_crossings_copy_whole_runs():
@@ -228,6 +323,36 @@ def test_data_ptr_cache_clears_only_when_filled():
         assert "get_data_ptr" not in body and "g_data_ptr_cache[" not in body, (
             "the publish/restore path must not fill the data-pointer cache"
         )
+
+    # One call level down: every function those bodies call, in every
+    # ggml-sycl source that defines it (all overloads). The map is static in
+    # ggml-sycl.cpp, so code elsewhere can fill it only through get_data_ptr.
+    local = {"capture", "restore", "publish", "ensure_extra", "block_exec_scoped_tensor_storage_publication",
+             "ggml_sycl_data_ptr_cache_new_graph", "ggml_nbytes"}
+    keywords = {"if", "for", "while", "switch", "return", "sizeof", "static_cast", "const_cast", "reinterpret_cast"}
+    callees = set()
+    for body in batch:
+        body = re.sub(r'"(?:\\.|[^"\\])*"', '""', strip_comments(body))
+        callees |= {m.group(1) for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", body)}
+    callees -= local | keywords
+    for known in ("ggml_sycl_init_layout_info", "release_extra_gpu", "ggml_sycl_view_root_and_offset", "resolve"):
+        assert known in callees, f"the publish/restore path no longer calls {known}; re-check this census"
+    sources = {path: strip_comments(text) for path, text in sycl_sources().items()}
+    for name in sorted(callees):
+        definition = re.compile(
+            r"^[ \t]*(?:(?:static|inline|constexpr|virtual|explicit|friend)\s+)*[A-Za-z_][\w:<>,\*&\s]*?[\s\*&:]"
+            r"(?:\w+::)*" + re.escape(name) + r"\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?(?:override\s*)?\{",
+            re.M,
+        )
+        defined = 0
+        for path, code in sources.items():
+            for m in definition.finditer(code):
+                defined += 1
+                callee = code[m.start() : matching_brace(code, m.end() - 1) + 1]
+                assert "get_data_ptr" not in callee and "g_data_ptr_cache[" not in callee, (
+                    f"{name} ({path}), called while publishing or restoring, fills the data-pointer cache"
+                )
+        assert defined, f"no definition of {name}, called while publishing or restoring, in the ggml-sycl sources"
 
 
 if __name__ == "__main__":

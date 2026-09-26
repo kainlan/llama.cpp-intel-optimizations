@@ -88935,7 +88935,7 @@ struct ggml_sycl_block_exec_dense_state {
         std::vector<ggml_tensor *>                     roots;
         std::vector<ggml_sycl::mem_handle>             slices;
         std::vector<ggml_sycl_block_exec_dense_range_runs> runs;
-        // Graph input leaves some node of the graph writes.
+        // Graph input (CONTROL) roots some node of the graph writes.
         std::vector<const ggml_tensor *>               written_inputs;
 
         // What the last input refresh copied, so a later graph with this
@@ -88945,7 +88945,7 @@ struct ggml_sycl_block_exec_dense_state {
             ggml_tensor *                        tensor = nullptr;
             size_t                               bytes  = 0;
             ggml_sycl::mem_handle                dst;              // the input's device copy; empty: refreshed in full
-            bool                                 written = false;  // a node writes it: copied every graph
+            bool                                 written = false;  // its root is written: copied every graph
             ggml_sycl::dense_exec_input_snapshot snapshot;
         };
 
@@ -89654,6 +89654,14 @@ class ggml_sycl_block_exec_dense_run {
 
     // False when the remembered refresh no longer describes the context's
     // inputs; the caller then refreshes them all.
+    //
+    // Skipping an input whose bytes did not move is sound because nothing
+    // but the staging members (which bump the generation) and this copy
+    // writes a staging copy: kernels only read them through lookups, and a
+    // node that writes a graph input writes the tensor's own storage. The
+    // `written` flag is a margin on top of that, not the guarantee, so it
+    // need not cover every input (an INPUT-flagged view of a non-input root
+    // is not marked).
     bool refresh_moved_inputs() {
         ggml_sycl_block_exec_dense_state & st = state();
         if (!st.prepared) {
