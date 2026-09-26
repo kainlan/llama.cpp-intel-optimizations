@@ -812,8 +812,13 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
 | GGML_SYCL_DNN      | ON *(default)* \|OFF *(Optional)*     | Enable build with oneDNN.                   |
 | CMAKE_C_COMPILER   | `icx` *(Linux)*, `icx/cl` *(Windows)* | Set `icx` compiler for SYCL code path.      |
 | CMAKE_CXX_COMPILER | `icpx` *(Linux)*, `icx` *(Windows)*   | Set `icpx/icx` compiler for SYCL code path. |
+| GGML_SYCL_DEVICE_LINK_JOBS | 8 *(default)*                  | Parallel llvm-spirv/ocloc jobs per SYCL device link (`-fsycl-max-parallel-link-jobs`). (2.) |
+| GGML_SYCL_OCLOC_CACHE | ON *(default)* \| OFF              | Reuse ocloc binaries for unchanged device images across links. (2.) (3.) |
+| GGML_SYCL_DEVICE_LINK_POOL | 2 *(default)*                  | Ninja only: maximum concurrent SYCL device links. (2.) |
 
 1. FP16 is recommended for better prompt processing performance on quantized models. Performance is equivalent in text generation but set `GGML_SYCL_F16=OFF` if you are experiencing issues with FP16 builds.
+2. The device link -- libggml-sycl and every test executable that embeds the backend objects -- is almost all ocloc AOT-compiling ~112 split images per Battlemage target. These three settings change only how those compiles are scheduled and reused, never what they produce. Every device link runs through `ggml/src/ggml-sycl/sycl-device-link.sh`, which also gives it a private `TMPDIR` that it removes on exit. Measured on the libggml-sycl link: 1519 s serial, 643 s with 8 jobs, 27 s with a warm cache. Size the pool by memory: one link peaks at roughly 8 jobs x 1.4 GB. `./scripts/sycl-build.sh --dev [target...]` builds only llama-bench, llama-cli, llama-completion and the named targets, which skips the ~48 test-executable device links a bare build pays for.
+3. The cache lives in `${GGML_SYCL_OCLOC_CACHE_ROOT:-~/.cache/ggml-sycl-ocloc}`, one directory per toolchain (icpx, ocloc, the IGC libraries and their package versions), so a compiler or driver upgrade never reads an older entry. A hit returns the stored binary bit for bit. **The first variant cached sticks:** IGC's codegen for some images (the ESIMD flash-attention kernels and the MXFP4 MoE DPAS kernels, on ocloc 26.31) differs from one uncached compile to the next, so without the cache every rebuild re-rolls that machine code; with it, the variant stored first is what every later link embeds until the toolchain or that image's SPIR-V changes. To draw a fresh variant, delete the toolchain's cache directory or configure with `-DGGML_SYCL_OCLOC_CACHE=OFF`. `scripts/sycl-device-image-inventory.sh` compares the device images of two builds.
 
 #### Runtime
 
