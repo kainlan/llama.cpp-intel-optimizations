@@ -813,6 +813,14 @@ reclaims one physical layout of a tensor, not the tensor:
   The transaction then takes the lock again. If a newer plan was published in
   between, the transaction reports busy, and the retired copies' room is there
   for the retry.
+- **Beside the PP MoE oneDNN ring.** The KV fit reads
+  `ggml_sycl_kv_capacity_live()`, which counts the ring's KV-zone slots as
+  free: the ring is released and re-admitted after KV (llama.cpp-u1bb). The
+  yield models the zone before that release, so it sees those slots as used.
+  On a device holding both copies and ring slots, the fit therefore holds KV
+  to fewer layers than the ring's room would take. The error is toward
+  demotion, never toward a layer outside the arena. Only a MoE model whose
+  dense weights are Q4_0 (the one WOQ type) has both.
 
 ## Where a weight's provenance comes from
 
@@ -2249,6 +2257,141 @@ zone-capacity-only or compute-buffer-regrowth-only predicate without
 new hardware evidence that k1ev's consumer is understood and bounded
 — the reasoning behind each retired predicate was sound in isolation
 and still wrong in practice, which is the whole lesson of this subsection.
+
+### A context-time consumer: the PP MoE oneDNN ring above the RUNTIME zone
+
+The PP MoE oneDNN scratch ring is one weight slot plus two slots that scale with
+`n_ubatch` (activation, output), times the ring depth. On GPT-OSS 20B it is
+404.5 MB at `-ub 512` and 674.5 MB at `-ub 1024`. The RUNTIME zone is 512 MB.
+So on the B50 `-ub 1024` was refused at the runtime-context update ("the
+RUNTIME zone has 505.3 MB available; the largest -ub that fits is about 672",
+`llama.cpp-ibj0`), even with ~1.6 GB of the shared KV/weight zone free.
+
+**Why the RUNTIME zone is not grown at load (`llama.cpp-u1bb`).** Growing it at
+model load looks natural and is wrong. The arena is one chunk with fixed zones,
+`[shared KV+WEIGHT][ONEDNN][RUNTIME][SCRATCH]`, each with its own TLSF sized
+when the arena is reserved. `ensure_planned_arena_zones()` resizes a zone only by
+rebuilding an arena that holds nothing, and at context time the weights are
+live. So a load-time growth G is subtracted from the shared zone for the
+model's lifetime. The runtime-context transaction admits KV against that zone's
+live free space (`unified_cache_kv_vram_available()`), and only then re-plans
+the ring. Shrinking the ring then frees RUNTIME bytes, which KV cannot use. For
+any G > 0 there is a `-c` whose KV fits in VRAM with the 512 MB zone and is
+demoted to the host with the grown one. That is the micro-batch beating KV,
+which the owner ruling forbids ("KV all-VRAM wins over a larger micro-batch").
+The real `n_ctx` is not known at load (`llama.cpp-fkpg`), so no load-time amount
+is safe.
+
+**The rule: decide at context time, after KV.** The transaction admits KV first.
+`ggml_sycl_replan_pp_moe_onednn_ring()` then places and admits the ring for the
+runtime `n_ubatch` through `pp_moe_onednn_admit_ring()`
+(`moe-scratch-admission.cpp`, a pure function):
+
+- The weight slot(s) stay in the RUNTIME zone. If they do not fit, no `-ub` fits.
+- Each ubatch-scaled slot kind stays in the RUNTIME zone if it still fits there,
+  larger kind first (with two kinds that keeps the most bytes in RUNTIME).
+  Otherwise it goes to the shared KV/weight zone.
+- The RUNTIME zone is counted without what the transaction still places there
+  after the ring: the MoE MMID workspace pools, when this update materializes
+  them. It materializes them only for a route that can run them, the predicate
+  `load_end` and the context-bind hook already use. In an ordinary build that
+  route is closed, so this is 0.
+- The KV-zone part may use only `headroom - reserve`. `headroom` is the device's
+  KV capacity less the plan's device KV (with the allocator's per-layer slack).
+  The capacity is `ggml_sycl_kv_capacity_live()`, the one number the KV re-fit
+  and the all-VRAM `-c` hints also read: the live KV headroom
+  (`unified_cache_kv_vram_available()`, read now, so after anything that yielded
+  VRAM to KV), plus an admitted context's already-allocated KV, plus this
+  device's ring slots in the KV zone. A refusal names the largest `-ub`
+  (multiple of 32) that fits, as before.
+
+B50 GPT-OSS figures, with 370.8 MB of RUNTIME left after the weight slot:
+
+| `-ub` | activation | output | goes to the KV zone |
+|------:|-----------:|-------:|--------------------:|
+|   512 |      90 MB |  180 MB | nothing |
+|  1024 |     180 MB |  360 MB | activation, 180 MB |
+|  2048 |     360 MB |  720 MB | output, 720 MB |
+|  4096 |     720 MB | 1440 MB | both, 2160 MB |
+
+**KV wins, in both directions.** The ring never moves KV. It is admitted after KV
+and refused rather than kept when it no longer fits. A later KV re-fit (a second
+context, or a changed KV shape) counts this device's ring slots in the KV zone as
+free, so the ring cannot be why KV is demoted. The re-fit then forces the ring to
+be released and re-admitted after KV, even at an unchanged `n_ubatch`. The
+all-VRAM `-c` hints count those slots as free too.
+
+**Planned, charged, and inside the arena.** The planned placement is stored per
+device next to the planned slot sizes. `reserve_pp_moe_onednn_scratch()` reads
+it on every call, including the executor's per-dispatch re-reserve. It allocates
+a flagged slot from the KV zone with `forbid_vram_zone_spill`, so a slot that
+does not fit fails instead of spilling past the arena. The RUNTIME zone
+requirement counts only the slots that live in RUNTIME. The transaction charges
+the KV-zone bytes to the plan's `vram_bytes`, which the weight stager reserves
+against. So the KV-zone part is admitted against the budget too: it must fit
+what `vram_budget` leaves on the device once KV and the MMID pools are charged.
+That room is read after the MMID budget check and before the charge, so the
+published `vram_bytes` stays within `vram_budget`. A refused
+re-plan restores the old placement with the old ring. A rollback of an accepted
+one restores a ring that fit before, so it is not re-admitted against the
+headroom. A rollback to an unchanged `n_ubatch` keeps a re-admitted placement:
+it fits, but the published plan's charge is for the one before it until the next
+transaction.
+
+**What the ring holds is read from the ring.** The planned placement says where
+the next reserve puts each slot. What the ring holds in the KV zone now comes
+from its slots: each records the zone it was allocated from
+(`unified_cache_get_pp_moe_onednn_kv_zone_bytes_held()`). The KV capacity, the
+re-fit's forced re-admission and the `vram_bytes` charge all read that. The two
+facts differ across a model load. The arena and the physical ring outlive a
+model, and a load resets the planned placement to RUNTIME. So a load releases a
+ring that still holds KV-zone bytes, because the reserve's "already sufficient"
+path would otherwise keep it. A slot claimed by an in-flight dispatch refuses
+that release, and it is never forced. The ring is then kept, KV still counts
+what it holds, and the next re-fit re-admits it.
+
+**Contiguity.** Each KV-zone slot is one allocation. So the whole KV-zone part
+must also fit the zone's largest free block, read after the old ring is
+released. That is an estimate, not a guarantee. The TLSF allocator's
+`largest_free_block()` returns the head of its highest size class rather than a
+scanned maximum. With two or more KV-zone slots (ring depth above 1, or both
+kinds in the zone), a later allocation can take the exact-class fallback and
+miss. The check covers the single-allocation case. For the rest, the reserve
+fails, and the refusal says the allocator could not place the slots rather than
+naming the size it just refused. An automatic `-ub` then keeps its last
+accepted size; an explicit one fails context creation.
+
+**The compute-buffer reserve is a known gap, not a solved term.** Neither the
+compute buffers nor the flash-attention K/V conversion buffers are in the
+placement plan (`llama.cpp-zhcn`). A compute buffer that misses the RUNTIME
+zone does not go straight to the KV zone. Its RUNTIME request does not forbid a
+spill, so it first falls through to raw device memory outside the arena, when
+the physical-VRAM overcommit guard allows that. It reaches the KV zone ("Arena
+RUNTIME zone full, runtime buffer ... allocated from KV zone") only when the
+guard refuses. The guard decides which, not the plan (`llama.cpp-23mk`). When
+the ring fills RUNTIME, GPT-OSS's compute buffer (about 404 MiB at `-ub 512`)
+misses it and goes down that chain. `ggml-alloc` sizes
+compute buffers from the graph at `graph_reserve`, which runs after the
+transaction, and they are not in the plan's `vram_bytes`. So the transaction
+cannot know their size. It holds back `k_pp_moe_ring_compute_reserve_bytes_per_row`
+= 1 MiB per micro-batch row: the GPT-OSS figure (0.79 MiB per row) rounded up,
+and scaled linearly with `n_ubatch` like the buffer. It keeps KV-zone room for
+the case where the guard sends the buffer there. The reserve applies only when
+part of the ring goes to the KV zone. The admission line names it at WARN:
+
+```
+[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=1024 puts its activation slots (180.0 MB) in the shared
+KV zone: <free> MB free there after KV, 1024.0 MB compute-buffer reserve (an estimate of 1.0 MB per
+micro-batch row; compute buffers are not in the plan)
+```
+
+The honest fix is for the compute buffer to enter the plan. Until then the
+reserve is a margin, not a measurement, and a model whose compute buffer grows
+faster than 1 MiB per row can still find the KV zone short at `graph_reserve`.
+
+Host tests: `ggml/src/ggml-sycl/tests/test-pp-moe-ring-admission.cpp` pins the
+arithmetic. `tests/test-sycl-pp-moe-ring-kv-zone-source.py` pins the wiring, with
+a mutation witness per check.
 
 ### Known limits (load-bearing — read before changing any of this)
 
