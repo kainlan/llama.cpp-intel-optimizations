@@ -147,8 +147,9 @@ entries owned by any live model even when `in_use_count == 0`, and unattributed
 entries when the current reclaim mode and live-model mask require it. It reclaims
 only entries for which `weight_entry_reclaimable()` returns true. That
 predicate is the only authority for weight reclaim. Its fourth mode,
-`OPTIONAL_LAYOUT_YIELD`, is used only by `yield_optional_layouts()` at KV
-admission. It reclaims an `optional_layout` copy, which is a second physical
+`OPTIONAL_LAYOUT_YIELD`, is used only by the optional-layout yield
+(`yield_optional_layouts_begin()`, releasing the copies the KV fit picked) at
+KV admission. It reclaims an `optional_layout` copy, which is a second physical
 layout beside a resident primary, even when a live model or buffer owns the
 tensor, because those owners dispatch on the primary. A primary is never
 reclaimable in that mode, and neither is a copy with any lease other than the

@@ -833,9 +833,13 @@ struct allocation_owner_internal_access {
     static void abandon(alloc_owner_control * control) noexcept { if (control) control->abandon(); }
 };
 
+static std::atomic<uint64_t> g_alloc_owner_control_ids{ 0 };
+
 alloc_owner_control::alloc_owner_control(std::shared_ptr<allocation_release_coordinator> coordinator,
                                          allocation_control_class ownership_class) noexcept :
-    ownership_class_(ownership_class), coordinator_(std::move(coordinator)) {}
+    control_id_(g_alloc_owner_control_ids.fetch_add(1, std::memory_order_relaxed) + 1),
+    ownership_class_(ownership_class),
+    coordinator_(std::move(coordinator)) {}
 
 void alloc_owner_control::retain() noexcept {
     const uint32_t previous = refs_.fetch_add(1, std::memory_order_acq_rel);
@@ -903,6 +907,9 @@ const alloc_metadata & shared_alloc_owner::metadata() const noexcept {
 }
 uint32_t shared_alloc_owner::use_count() const noexcept {
     return control_ ? control_->use_count() : 0;
+}
+uint64_t shared_alloc_owner::control_id() const noexcept {
+    return control_ ? control_->control_id() : 0;
 }
 release_attempt shared_alloc_owner::reset() noexcept {
     alloc_owner_control * control = std::exchange(control_, nullptr);
@@ -7724,6 +7731,12 @@ bool unified_cache::optional_layout_yieldable_locked(const unified_cache_key &  
         entry.host_resident || entry.state != cache_entry_state::READY || entry.device_ptr == nullptr) {
         return false;
     }
+    // The yield finds what still references a copy's storage by its owner
+    // control (release_retained_referencing()), and counts it freed only once
+    // that owner releases; a copy without one could be neither.
+    if (entry.direct_alloc_owner.owner_control_id() == 0) {
+        return false;
+    }
     // The cache's own direct-stage mirror is the one lease the yield holds
     // itself and withdraws; any other is a reader the copy is not freed under.
     const auto mirror   = direct_weight_entries_.find(key.id);
@@ -7746,6 +7759,25 @@ size_t unified_cache::optional_layout_bytes() const {
         }
     }
     return bytes;
+}
+
+optional_layout_snapshot unified_cache::optional_layouts_snapshot() {
+    optional_layout_snapshot  snapshot;
+    std::vector<const void *> ptrs;
+    {
+        std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+        for (const auto & pair : entries_) {
+            if (optional_layout_yieldable_locked(pair.first, pair.second)) {
+                snapshot.picks.push_back({ pair.first, pair.second.replacement_identity() });
+                snapshot.fit.bytes.push_back(pair.second.size);
+                ptrs.push_back(pair.second.device_ptr);
+            }
+        }
+    }
+    snapshot.fit.zone = kv_zone_snapshot(ptrs, &snapshot.fit.copies);
+    return snapshot;
 }
 
 kv_zone_model unified_cache::kv_zone_snapshot(const std::vector<const void *> & ptrs,
@@ -7796,113 +7828,88 @@ size_t unified_cache::kv_layers_allocatable(const std::vector<size_t> & layer_by
 }
 
 optional_layout_yield_result unified_cache::yield_optional_layouts(const std::vector<size_t> & layer_bytes) {
-    optional_layout_release release = yield_optional_layouts_begin(layer_bytes);
+    const optional_layout_snapshot snapshot = optional_layouts_snapshot();
+    const kv_optional_layout_yield picks    = plan_optional_layout_yield(snapshot.fit, layer_bytes);
+    optional_layout_release        release  = yield_optional_layouts_begin(snapshot.pick_groups(picks));
     return yield_optional_layouts_finish(release, layer_bytes);
 }
 
-optional_layout_release unified_cache::yield_optional_layouts_begin(const std::vector<size_t> & layer_bytes) {
+optional_layout_release unified_cache::yield_optional_layouts_begin(
+    const std::vector<optional_layout_pick_group> & groups) {
     optional_layout_release release;
     release.cache                         = this;
     optional_layout_yield_result & result = release.result;
-    if (layer_bytes.empty()) {
+    if (groups.empty()) {
         return release;
     }
-    // Which copies to release is decided on a copy of the zone's allocators,
-    // not by bytes: KV is placed one allocation a layer, and a copy staged
-    // between two live weights frees into a hole that holds a layer only if
-    // the layer is no larger. Releasing a copy no layer can use would lose its
-    // layout and give the KV nothing.
-    std::vector<unified_cache_key> keys;
-    std::vector<const void *>      ptrs;
-    std::vector<size_t>            sizes;
-    {
-        std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
-        std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
-        std::lock(direct_lock, cache_lock);
-        for (const auto & pair : entries_) {
-            if (optional_layout_yieldable_locked(pair.first, pair.second)) {
-                keys.push_back(pair.first);
-                ptrs.push_back(pair.second.device_ptr);
-                sizes.push_back(pair.second.size);
-            }
-        }
-    }
-    std::vector<kv_zone_block> blocks;
-    const kv_zone_model        zone  = kv_zone_snapshot(ptrs, &blocks);
-    const std::vector<size_t>  picks = select_optional_layout_yield(zone, blocks, layer_bytes);
-    if (picks.empty()) {
-        result.kv_layers = kv_layers_allocatable(layer_bytes);
-        return release;
-    }
-
+    // Which copies to release is the fit's decision, made on a copy of the
+    // zone's allocators (plan_optional_layout_yield()): a group frees an
+    // extent a layer lands in only whole, so a group is released whole or not
+    // at all. Each of its copies must still be the yieldable copy the fit read
+    // -- same key, same generation, and optional_layout_yieldable_locked() --
+    // or the group is skipped, and the refit holds the KV to what the zone
+    // places without it rather than this picking again.
+    //
     // A copy's reader holds its lease until the read completes
     // (acquire_layout_handle() plus retain_handles_until_event(); a recorded
     // graph holds it for the graph's life), so a copy being read is not
-    // yieldable and is never picked. The barrier below is defence in depth: a
-    // barrier over every queue the cache orders frees against -- every context
-    // on this device submits to queue_ -- replaces the staging write event as
-    // each retired copy's free gate. It is submitted in the same critical
-    // section that retires the copies: from there on no lookup resolves them.
+    // yieldable. The barrier below is defence in depth: a barrier over every
+    // queue the cache orders frees against -- every context on this device
+    // submits to queue_ -- replaces the staging write event as each retired
+    // copy's free gate. It is submitted in the same critical section that
+    // retires the copies: from there on no lookup resolves them.
     //
     // Otherwise the same withdrawal as retire_expert_entry_exact(): take the
     // cache's own mirror lease out and retire the entry under both locks, and
-    // destroy the mirror handles with neither held. A pick is retired only if
-    // it is still the same yieldable copy it was when the zone was modelled.
+    // destroy the mirror handles with neither held.
     //
-    // Nothing here waits or drops a handle: the withdrawn mirror handles move
-    // into the release, and finish -- which its caller runs with no L1 lock
-    // held (canonical memory contract §12.5) -- waits on the barrier and drops
-    // them.
-    std::vector<std::shared_ptr<mem_handle>> & released_mirrors = release.mirrors;
-    std::vector<const void *> &                retired_ptrs     = release.ptrs;
-    std::vector<size_t> &                      retired_sizes    = release.sizes;
-    sycl::event &                              readers_done     = release.readers_done;
-    {
-        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
-        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
-        std::lock(direct_lock, cache_lock);
+    // Nothing here waits or drops a handle: the withdrawn mirror handles, and
+    // a reference to each retired copy's allocation owner, move into the
+    // release, and finish -- which its caller runs with no L1 lock held
+    // (canonical memory contract §12.5) -- waits on the barrier, reaps and
+    // drops them.
+    std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+    std::lock(direct_lock, cache_lock);
 
-        std::vector<size_t> still;
-        for (size_t i : picks) {
-            const auto it = entries_.find(keys[i]);
-            if (it != entries_.end() && it->second.device_ptr == ptrs[i] &&
-                optional_layout_yieldable_locked(it->first, it->second)) {
-                still.push_back(i);
-            }
+    bool gated = false;
+    for (const optional_layout_pick_group & group : groups) {
+        bool whole = !group.empty();
+        for (size_t p = 0; whole && p < group.size(); ++p) {
+            const auto it = entries_.find(group[p].key);
+            whole         = it != entries_.end() && it->second.replacement_identity() == group[p].generation &&
+                    optional_layout_yieldable_locked(it->first, it->second);
         }
-        bool gated = !still.empty();
-        if (gated) {
+        if (whole && !gated) {
             try {
-                readers_done = submit_barrier_all();
+                release.readers_done = submit_barrier_all();
+                gated                = true;
             } catch (...) {
                 // No gate, no release: every copy stays resident and routable.
-                gated = false;
+                whole = false;
             }
         }
-        if (!gated) {
-            cache_lock.unlock();
-            direct_lock.unlock();
-            result.kv_layers = kv_layers_allocatable(layer_bytes);
-            return release;
+        if (!whole) {
+            ++result.skipped_groups;
+            continue;
         }
-        for (size_t i : still) {
-            const unified_cache_key & key    = keys[i];
-            unified_cache_entry &     entry  = entries_.find(key)->second;
-            auto                      mirror = direct_weight_entries_.find(key.id);
+        for (const optional_layout_pick & pick : group) {
+            unified_cache_entry & entry  = entries_.find(pick.key)->second;
+            auto                  mirror = direct_weight_entries_.find(pick.key.id);
             if (mirror != direct_weight_entries_.end() && mirror->second.layout == entry.layout &&
                 mirror->second.ptr == entry.device_ptr) {
-                released_mirrors.push_back(std::move(mirror->second.handle));
+                release.mirrors.push_back(std::move(mirror->second.handle));
                 direct_weight_entries_.erase(mirror);
             }
-            entry.last_write_event = readers_done;
+            release.owners.push_back(entry.direct_alloc_owner);
+            release.sizes.push_back(entry.size);
+            entry.last_write_event = release.readers_done;
             entry.has_write_event  = true;
             (void) transition_to_retired_locked(entry);
-            remap_or_erase_id_mapping_locked(key.id, key);
-            retired_ptrs.push_back(entry.device_ptr);
-            retired_sizes.push_back(sizes[i]);
+            remap_or_erase_id_mapping_locked(pick.key.id, pick.key);
         }
     }
-    result.retired = retired_ptrs.size();
+    result.retired = release.owners.size();
     return release;
 }
 
@@ -7912,12 +7919,16 @@ optional_layout_yield_result unified_cache::yield_optional_layouts_finish(option
     // The withdrawn mirrors go first, with no lock held: their release runs
     // mem_handle destructors.
     release.mirrors.clear();
-    if (release.ptrs.empty()) {
-        return result;
+    if (!release.owners.empty()) {
+        finish_optional_layout_release(release, result);
     }
-    const std::vector<const void *> & retired_ptrs  = release.ptrs;
-    const std::vector<size_t> &       retired_sizes = release.sizes;
+    // Read from the live zone, after the frees: what the KV can have now.
+    result.kv_layers = kv_layers_allocatable(layer_bytes);
+    return result;
+}
 
+void unified_cache::finish_optional_layout_release(optional_layout_release &      release,
+                                                   optional_layout_yield_result & result) {
     // One host wait per context admission that needed room, never on a
     // dispatch path. If it fails, the frees stay queued behind the barrier and
     // return with the next deferred-free pass, and none is counted as freed.
@@ -7928,10 +7939,29 @@ optional_layout_yield_result unified_cache::yield_optional_layouts_finish(option
         readers_finished = false;
     }
 
+    // With every queue past the barrier, the copies' fills and reads are
+    // complete, but a retained handle bound to one of those events may still
+    // be queued, or in the drain worker's hands, holding a reference to the
+    // copy's allocation owner. Reap them now, rather than leave the copy's
+    // bytes to whenever the worker gets there.
+    const size_t         n_owners = release.owners.size();
+    retained_reap_result reaped;
+    if (readers_finished) {
+        retained_reap_request request;
+        request.owners   = release.owners.data();
+        request.n_owners = n_owners;
+        request.pre      = RETAINED_REAP_QUERY_EVENT_STATUS;
+        request.reason   = "optional-layout-yield";
+        reaped           = release_retained_referencing(request);
+    }
+
     // finalize queues each copy's allocation owner as a deferred free gated on
     // the barrier; taking those rows out here and dropping them with no lock
-    // held is what returns the storage to its zone before this returns, rather
-    // than at some later graph boundary.
+    // held leaves the yield's own reference the last one.
+    std::vector<uint64_t> owner_ids;
+    for (const mem_handle & owner : release.owners) {
+        owner_ids.push_back(owner.owner_control_id());
+    }
     std::vector<deferred_free_entry> released;
     {
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
@@ -7939,27 +7969,51 @@ optional_layout_yield_result unified_cache::yield_optional_layouts_finish(option
         if (readers_finished) {
             std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);
             for (auto it = deferred_frees_.begin(); it != deferred_frees_.end();) {
-                const auto own = std::find(retired_ptrs.begin(), retired_ptrs.end(), it->ptr);
-                if (own == retired_ptrs.end() || !it->managed || !it->handle.owner.valid() ||
+                if (!it->managed || !it->handle.owner.valid() ||
+                    std::find(owner_ids.begin(), owner_ids.end(), it->handle.owner.owner_control_id()) ==
+                        owner_ids.end() ||
                     (it->has_event && !event_complete(it->event))) {
                     ++it;
                     continue;
                 }
-                result.freed++;
-                result.freed_bytes += retired_sizes[static_cast<size_t>(own - retired_ptrs.begin())];
                 released.push_back(std::move(*it));
                 it = deferred_frees_.erase(it);
             }
         }
     }
     released.clear();
-    for (size_t size : retired_sizes) {
-        result.pending_bytes += size;
+
+    // A copy is freed when dropping that last reference returns its storage
+    // to the zone; one still referenced, or whose release is retried, is not.
+    size_t retired_bytes = 0;
+    size_t still_held    = 0;
+    for (size_t i = 0; i < n_owners; ++i) {
+        retired_bytes += release.sizes[i];
+        if (release.owners[i].reset_owned_allocation().released()) {
+            result.freed++;
+            result.freed_bytes += release.sizes[i];
+        } else {
+            ++still_held;
+        }
     }
-    result.pending_bytes -= result.freed_bytes;
-    // Read from the live zone, after the frees: what the KV can have now.
-    result.kv_layers = kv_layers_allocatable(layer_bytes);
-    return result;
+    result.pending_bytes = retired_bytes - result.freed_bytes;
+    release.owners.clear();
+
+    // Past the barrier nothing the context plan knows of still reads these
+    // copies, so a reference left after the reap is state the plan does not
+    // account for, not a free still on its way.
+    if (readers_finished && still_held > 0) {
+        if (strict_plan_checks_enabled()) {
+            GGML_ABORT(
+                "[CONTEXT-PLAN-BUG] optional-layout yield: %zu retired copies (%.1f MB) still referenced "
+                "after the reap (%zu retained entries pending) (GGML_SYCL_STRICT_PLAN=1)",
+                still_held, result.pending_bytes / (1024.0 * 1024.0), reaped.entries_pending);
+        }
+        GGML_LOG_WARN(
+            "[CONTEXT-PLAN-BUG] optional-layout yield: %zu retired copies (%.1f MB) still referenced after the "
+            "reap (%zu retained entries pending); their bytes return with the last reference, not to this KV\n",
+            still_held, result.pending_bytes / (1024.0 * 1024.0), reaped.entries_pending);
+    }
 }
 
 size_t unified_cache::drop_expert_entries_for_tensor_layout(const std::vector<ggml_sycl_cache_id> & expert_keys,
@@ -13186,6 +13240,20 @@ bool unified_cache::test_mark_entry_touched_by_load(ggml_sycl_cache_id key,
     tag_mirror(direct_weight_entries_);
     tag_mirror(direct_expert_entries_);
     return found;
+}
+
+bool unified_cache::test_retain_owner_until_event(ggml_sycl_cache_id key, ggml_layout_mode layout, sycl::event event) {
+    mem_handle owner;
+    {
+        std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_);
+        const auto it = entries_.find(make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key, layout));
+        if (it == entries_.end() || !it->second.direct_alloc_owner.valid()) {
+            return false;
+        }
+        owner = it->second.direct_alloc_owner;
+    }
+    retain_handles_until_event({ std::move(owner) }, std::move(event));
+    return true;
 }
 
 uint64_t unified_cache::test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const {
@@ -21542,27 +21610,28 @@ static unified_cache * optional_layout_cache_for_kv(int device_id, bool multi_de
                nullptr;
 }
 
-size_t unified_cache_optional_layout_bytes(int device_id, bool multi_device) {
+optional_layout_snapshot unified_cache_optional_layouts_snapshot(int device_id, bool multi_device) {
     auto * cache = optional_layout_cache_for_kv(device_id, multi_device);
-    return cache ? cache->optional_layout_bytes() : 0;
+    return cache ? cache->optional_layouts_snapshot() : optional_layout_snapshot{};
 }
 
-optional_layout_release unified_cache_yield_optional_layouts_begin(int                         device_id,
-                                                                   bool                        multi_device,
-                                                                   const std::vector<size_t> & layer_bytes) {
+optional_layout_release unified_cache_yield_optional_layouts_begin(
+    int                                             device_id,
+    bool                                            multi_device,
+    const std::vector<optional_layout_pick_group> & groups) {
     auto * cache = optional_layout_cache_for_kv(device_id, multi_device);
     if (!cache) {
-        optional_layout_release none;
-        none.result.kv_layers = layer_bytes.size();  // no cache, no zone to hold the KV to
-        return none;
+        return optional_layout_release{};
     }
-    return cache->yield_optional_layouts_begin(layer_bytes);
+    return cache->yield_optional_layouts_begin(groups);
 }
 
 optional_layout_yield_result unified_cache_yield_optional_layouts_finish(optional_layout_release &   release,
                                                                          const std::vector<size_t> & layer_bytes) {
     if (!release.cache) {
-        return release.result;
+        optional_layout_yield_result none = release.result;
+        none.kv_layers                    = layer_bytes.size();  // no cache, no zone to hold the KV to
+        return none;
     }
     return release.cache->yield_optional_layouts_finish(release, layer_bytes);
 }

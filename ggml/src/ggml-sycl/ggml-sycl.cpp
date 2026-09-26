@@ -18042,10 +18042,13 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             in.layer_kv_bytes[l] = next_plan.kv_size_for_layer(static_cast<uint32_t>(l));  // at the next shape
         }
         in.devices = next_plan.multi_device ? next_plan.devices : std::vector<int>{ next_plan.device_id };
+        std::vector<ggml_sycl::optional_layout_snapshot> optional_layouts;
         for (int device : in.devices) {
             // No admitted plan: KV still allocated counts as used (see above).
             in.available.push_back(ggml_sycl_kv_capacity_live(next_plan, device, nullptr, ctx->device));
-            in.yieldable.push_back(ggml_sycl::unified_cache_optional_layout_bytes(device, next_plan.multi_device));
+            optional_layouts.push_back(
+                ggml_sycl::unified_cache_optional_layouts_snapshot(device, next_plan.multi_device));
+            in.optional_layouts.push_back(optional_layouts.back().fit);
         }
         ring_readmit = ring_kv_zone_bytes > 0;
 
@@ -18056,11 +18059,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         //
         // Headroom in bytes is not what the KV gets, though: each layer is one
         // allocation, and a copy staged between two live weights frees into a
-        // hole a layer fits only if it is no larger. So the cache releases only
-        // copies whose room lets another of this device's layers land, and
-        // reports how many of them its zone can place; the fit is then redone
-        // against the live headroom with nothing left to count, held to what
-        // lands. Without that hold a layer the zone cannot place is not
+        // hole a layer fits only if it is no larger. So the fit, on the
+        // snapshot of each device's zone taken above, picks only copies whose
+        // room lets another of this device's layers land, in groups that free
+        // an extent together (residency.yields); the cache releases each group
+        // whole if its copies are still the ones the snapshot read, and skips
+        // it otherwise, and reports how many layers its zone can place. The
+        // fit is then redone against the live headroom with nothing left to
+        // count, held to what lands, so a skipped group is a refit shortfall. Without that hold a layer the zone cannot place is not
         // refused -- it goes to raw device memory outside the arena
         // (llama.cpp-moua). Layers are modelled in allocation order, which is
         // the order the fit keeps them in for a model without SWA layers; with
@@ -18095,14 +18101,10 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                 if (residency.yield_bytes[i] == 0) {
                     continue;
                 }
-                refit = true;
-                for (size_t l = 0; l < n_kv_layers; ++l) {
-                    if (in.load_kv_device[l] == in.devices[i] && in.layer_kv_bytes[l] > 0) {
-                        device_layer_bytes[i].push_back(ggml_sycl::kv_layer_alloc_bytes(in.layer_kv_bytes[l]));
-                    }
-                }
-                releases[i] = ggml_sycl::unified_cache_yield_optional_layouts_begin(
-                    in.devices[i], next_plan.multi_device, device_layer_bytes[i]);
+                refit                 = true;
+                device_layer_bytes[i] = ggml_sycl::kv_device_layer_alloc_bytes(in, in.devices[i]);
+                releases[i]           = ggml_sycl::unified_cache_yield_optional_layouts_begin(
+                    in.devices[i], next_plan.multi_device, optional_layouts[i].pick_groups(residency.yields[i]));
                 retired_any = retired_any || releases[i].result.retired > 0;
             }
             if (retired_any) {
@@ -18128,14 +18130,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                 }
                 const std::vector<size_t> &                   layer_bytes = device_layer_bytes[i];
                 const ggml_sycl::optional_layout_yield_result released    = yields[i];
-                size_t                                        placeable   = 0;
-                for (size_t l = 0, n = 0; l < n_kv_layers && n < released.kv_layers; ++l) {
-                    if (in.load_kv_device[l] == in.devices[i] && in.layer_kv_bytes[l] > 0) {
-                        placeable += in.layer_kv_bytes[l];
-                        ++n;
-                    }
+                in.fit_capacity[i] = ggml_sycl::kv_device_leading_layer_bytes(in, in.devices[i], released.kv_layers);
+                if (released.skipped_groups > 0) {
+                    GGML_LOG_WARN(
+                        "[SYCL-PLAN] KV admission on device %d for n_ctx=%u: %zu of the optional layout copy groups "
+                        "its fit picked were no longer yieldable and stay resident; its KV is held to what the zone "
+                        "places without them\n",
+                        in.devices[i], n_ctx, released.skipped_groups);
                 }
-                in.fit_capacity[i] = placeable;
                 if (released.kv_layers < layer_bytes.size()) {
                     GGML_LOG_WARN(
                         "[SYCL-PLAN] KV admission on device %d for n_ctx=%u: its zone can place %zu of %zu KV layers "
@@ -18152,8 +18154,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                 if (released.freed < released.retired) {
                     GGML_LOG_WARN(
                         "[SYCL-PLAN] KV admission retired %zu more optional oneDNN WOQ layout copies (%.1f MB) on "
-                        "device %d for n_ctx=%u, but their free has not completed: they no longer serve any op, and "
-                        "their bytes return to the zone with a later deferred-free pass, not to this context's KV\n",
+                        "device %d for n_ctx=%u, but their storage is still referenced: they no longer serve any op, "
+                        "and their bytes return to the zone with the last reference, not to this context's KV\n",
                         released.retired - released.freed, released.pending_bytes / mb, in.devices[i], n_ctx);
                 }
             }
@@ -18161,7 +18163,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                 for (size_t i = 0; i < in.devices.size(); ++i) {
                     in.available[i] = ggml_sycl_kv_capacity_live(next_plan, in.devices[i], nullptr, ctx->device);
                 }
-                in.yieldable.clear();
+                in.optional_layouts.clear();
                 residency = ggml_sycl::plan_runtime_kv_residency(in);
             }
         }

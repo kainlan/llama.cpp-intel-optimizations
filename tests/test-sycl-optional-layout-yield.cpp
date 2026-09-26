@@ -19,7 +19,14 @@
 //     the arena and went to raw device memory ([EXT-ALLOC]
 //     cohort=kv-tier-layer-device-zone, llama.cpp-moua);
 //   - adjacent copies free into one extent, so a layer larger than any one
-//     copy lands once enough of them go.
+//     copy lands once enough of them go;
+//   - a copy's fill retains a reference to its allocation until the drain
+//     worker sees the fill complete, which can be well after the fill did; the
+//     yield reaps that reference rather than leave the bytes to the worker, and
+//     a reference it cannot reap -- one the context plan does not know of -- is
+//     reported as a [CONTEXT-PLAN-BUG] and not counted freed;
+//   - the fit's picks come in groups released whole or not at all: a group
+//     with a copy that is no longer the one the fit read is skipped entire.
 // And the ownership class's limits: a copy someone other than the cache's own
 // direct-stage mirror leases -- including a reader whose work is still queued
 // -- is not released until that lease drops, a live model's ownership does not
@@ -47,6 +54,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <list>
+#include <mutex>
+#include <string>
 #include <sycl/sycl.hpp>
 #include <thread>
 #include <vector>
@@ -87,12 +96,14 @@ struct staged {
 // Stages a weight in `layout`, the way S1-PRELOAD stages a primary or its WOQ
 // copy; a WOQ copy is also marked optional, as S1-PRELOAD marks it. `lease`
 // (optional) receives a lease of its own, as S1-PRELOAD's out_handle does while
-// it is still pinning.
+// it is still pinning. `drain` false leaves the fill's retained reference to
+// whenever the drain worker gets to it, as S1-PRELOAD does.
 bool stage(unified_cache *         cache,
            sycl::queue *           queue,
            ggml_layout_mode        layout,
            staged *                out,
-           ggml_sycl::mem_handle * lease = nullptr) {
+           ggml_sycl::mem_handle * lease = nullptr,
+           bool                    drain = true) {
     g_weights.emplace_back(COPY_BYTES, static_cast<uint8_t>(g_weights.size() + 1));
     const std::vector<uint8_t> & data = g_weights.back();
     out->key                          = ggml_sycl::test_make_cache_id(data.data());
@@ -107,7 +118,7 @@ bool stage(unified_cache *         cache,
     // which can be after the wait above returns. A yield that ran while it was
     // still held would drop the cache's references and find the bytes still
     // allocated, so a case would race the worker instead of testing the yield.
-    if (!ggml_sycl::drain_retained_handles(true)) {
+    if (drain && !ggml_sycl::drain_retained_handles(true)) {
         return false;
     }
     out->ptr = result.ptr;
@@ -314,6 +325,171 @@ void test_adjacent_copies_are_yielded_together(unified_cache *       cache,
     check(result.kv_layers == layers.size(), "and the 8 MB layer lands in the extent they free");
 }
 
+// Work on a queue of its own that runs until the test lets it: a queue the
+// yield's barrier does not cover.
+struct held_work {
+    std::atomic<bool> done{ false };
+    sycl::queue       side;
+    sycl::event       event;
+
+    explicit held_work(sycl::queue * queue) : side(queue->get_context(), queue->get_device()) {
+        event = side.submit([this](sycl::handler & h) {
+            h.host_task([this] {
+                while (!done.load()) {
+                    std::this_thread::yield();
+                }
+            });
+        });
+    }
+
+    void finish() {
+        done.store(true);
+        event.wait();
+    }
+
+    ~held_work() {
+        if (!done.load()) {
+            finish();
+        }
+    }
+};
+
+std::mutex  g_log_mutex;
+std::string g_log;
+
+void capture_log(ggml_log_level, const char * text, void *) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    g_log += text;
+    fputs(text, stderr);
+}
+
+// S1-PRELOAD does not drain the retained handles after staging, so a copy's
+// fill can still be referenced from the drain worker's queue when a context
+// is admitted. Here the worker is held on a record of its own, so the fill's
+// reference is certainly still queued: the yield's reap drops it (its event
+// is complete) and the copy's bytes are in the zone when the yield returns.
+void test_queued_fill_reference_is_reaped(unified_cache * cache, sycl::queue * queue) {
+    printf("a copy whose fill the drain worker has not yet released is freed by the yield:\n");
+    held_work blocker(queue);
+    ggml_sycl::retain_handles_until_event({ ggml_sycl::mem_handle{} }, blocker.event);
+    staged copy;
+    if (!stage(cache, queue, GGML_LAYOUT_ONEDNN_WOQ, &copy, nullptr, /*drain=*/false)) {
+        check(false, "staged and marked a WOQ copy");
+        return;
+    }
+    size_t       placeable = 0;
+    const auto   layers    = one_more_layer(cache, COPY_BYTES, &placeable);
+    const size_t staged    = cache->zone_available(vram_zone_id::WEIGHT);
+    const auto   result    = cache->yield_optional_layouts(layers);
+    const size_t after     = cache->zone_available(vram_zone_id::WEIGHT);
+    printf(
+        "  yield: retired=%zu freed=%zu freed_bytes=%zu pending_bytes=%zu kv_layers=%zu; zone_available %zu -> %zu\n",
+        result.retired, result.freed, result.freed_bytes, result.pending_bytes, result.kv_layers, staged, after);
+    check(result.retired == 1 && result.freed == 1 && result.freed_bytes == COPY_BYTES,
+          "the yield reports the copy freed though the worker never reached its fill");
+    check(after >= staged + COPY_BYTES, "and its bytes are back in the zone");
+    check(result.kv_layers == layers.size(), "and the extra layer lands");
+    blocker.finish();
+    check(ggml_sycl::drain_retained_handles(true), "the held record drains");
+}
+
+// A reference nothing in the context plan accounts for -- here a retained
+// handle bound to work on a queue the yield's barrier does not cover -- is left
+// by the reap, which drops only what is known complete. The yield then does not
+// count the copy freed, says so as a plan bug, and the bytes come back with
+// that last reference.
+void test_unplanned_reference_is_reported(unified_cache * cache, sycl::queue * queue) {
+    printf("a copy still referenced after the reap is not counted freed, and is reported:\n");
+    staged copy;
+    if (!stage(cache, queue, GGML_LAYOUT_ONEDNN_WOQ, &copy)) {
+        check(false, "staged and marked a WOQ copy");
+        return;
+    }
+    held_work reader(queue);
+    check(cache->test_retain_owner_until_event(copy.key, GGML_LAYOUT_ONEDNN_WOQ, reader.event),
+          "an unplanned reference to the copy's allocation is retained");
+
+    size_t       placeable = 0;
+    const auto   layers    = one_more_layer(cache, COPY_BYTES, &placeable);
+    const size_t staged    = cache->zone_available(vram_zone_id::WEIGHT);
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        g_log.clear();
+    }
+    ggml_log_set(capture_log, nullptr);
+    const auto result = cache->yield_optional_layouts(layers);
+    ggml_log_set(nullptr, nullptr);
+    const size_t after = cache->zone_available(vram_zone_id::WEIGHT);
+    printf("  yield: retired=%zu freed=%zu pending_bytes=%zu kv_layers=%zu; zone_available %zu -> %zu\n",
+           result.retired, result.freed, result.pending_bytes, result.kv_layers, staged, after);
+    bool reported = false;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        reported = g_log.find("[CONTEXT-PLAN-BUG] optional-layout yield") != std::string::npos;
+    }
+    check(result.retired == 1 && result.freed == 0 && result.pending_bytes == COPY_BYTES,
+          "the copy is retired, not counted freed, and its bytes pending");
+    check(after < staged + COPY_BYTES, "its bytes are not in the zone");
+    check(reported, "the yield reports the leftover reference as a plan bug");
+    check(!cache->is_cached(copy.key, GGML_LAYOUT_ONEDNN_WOQ), "the copy no longer resolves");
+
+    reader.finish();
+    check(ggml_sycl::drain_retained_handles(true), "the reference drains once its work completes");
+    check(cache->zone_available(vram_zone_id::WEIGHT) >= staged + COPY_BYTES,
+          "and the bytes return to the zone with it");
+}
+
+// The fit's picks, as groups a yield releases whole or not at all. Two
+// adjacent copies free one extent an 8 MB layer needs both of, so they are one
+// group; a group whose copy is leased, or whose pick names a generation the
+// copy no longer has, is skipped entire.
+void test_group_released_whole_or_not_at_all(unified_cache *       cache,
+                                             sycl::queue *         queue,
+                                             std::vector<staged> * primaries) {
+    printf("a pick group is released whole or not at all:\n");
+    std::vector<staged> copies(2);
+    staged              seal;
+    if (!stage(cache, queue, GGML_LAYOUT_ONEDNN_WOQ, &copies[0]) ||
+        !stage(cache, queue, GGML_LAYOUT_ONEDNN_WOQ, &copies[1]) || !stage(cache, queue, GGML_LAYOUT_AOS, &seal)) {
+        check(false, "staged two adjacent copies and a sealing primary");
+        return;
+    }
+    primaries->push_back(seal);
+    size_t     placeable = 0;
+    const auto layers    = one_more_layer(cache, 2 * COPY_BYTES, &placeable);
+
+    const ggml_sycl::optional_layout_snapshot snapshot = cache->optional_layouts_snapshot();
+    const ggml_sycl::kv_optional_layout_yield picks    = ggml_sycl::plan_optional_layout_yield(snapshot.fit, layers);
+    auto                                      groups   = snapshot.pick_groups(picks);
+    check(groups.size() == 1 && groups[0].size() == 2, "the fit picks both copies as one group");
+    if (groups.size() != 1 || groups[0].size() != 2) {
+        return;
+    }
+
+    ggml_sycl::mem_handle lease = cache->acquire_layout_handle(copies[1].key, GGML_LAYOUT_ONEDNN_WOQ, 0);
+    auto                  held  = cache->yield_optional_layouts_begin(groups);
+    auto                  r     = cache->yield_optional_layouts_finish(held, layers);
+    check(lease.valid() && r.retired == 0 && r.skipped_groups == 1, "a group with a leased copy is skipped");
+    check(cache->is_cached(copies[0].key, GGML_LAYOUT_ONEDNN_WOQ) &&
+              cache->is_cached(copies[1].key, GGML_LAYOUT_ONEDNN_WOQ),
+          "and neither copy is released, the unleased one included");
+    check(r.kv_layers == placeable, "and the zone says the extra layer still does not land");
+    lease = {};
+
+    auto stale = groups;
+    stale[0][0].generation += 1;
+    held = cache->yield_optional_layouts_begin(stale);
+    r    = cache->yield_optional_layouts_finish(held, layers);
+    check(r.retired == 0 && r.skipped_groups == 1, "a group naming a generation its copy no longer has is skipped");
+
+    held = cache->yield_optional_layouts_begin(groups);
+    r    = cache->yield_optional_layouts_finish(held, layers);
+    printf("  yield: retired=%zu freed=%zu skipped_groups=%zu kv_layers=%zu\n", r.retired, r.freed, r.skipped_groups,
+           r.kv_layers);
+    check(r.retired == 2 && r.freed == 2 && r.skipped_groups == 0, "the fit's group, still current, is released whole");
+    check(r.kv_layers == layers.size(), "and the extra layer lands");
+}
+
 }  // namespace
 
 int main(int, char ** argv) {
@@ -354,6 +530,9 @@ int main(int, char ** argv) {
         // two can only pick the copy under test.
         test_copy_being_read_is_not_yielded(cache, queue);
         test_owned_copy_is_yielded(cache, queue);
+        test_queued_fill_reference_is_reaped(cache, queue);
+        test_unplanned_reference_is_reported(cache, queue);
+        test_group_released_whole_or_not_at_all(cache, queue, &primaries);
         test_holes_between_primaries_are_not_yielded(cache, queue, &primaries);
         test_adjacent_copies_are_yielded_together(cache, queue, &primaries);
 

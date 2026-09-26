@@ -2613,6 +2613,39 @@ set_tests_properties(test-sycl-mem-handle-concurrent-resolve PROPERTIES
     TIMEOUT 120
 )
 
+# Test: release_retained_referencing() drops the retained handles that still
+# reference an allocation owner -- queued, in the drain worker's hands, or
+# parked for command-graph lifetime -- by owner-control identity, keeps what
+# is not known complete, and never frees under an incomplete event. Owners
+# come from the private fixture factory and incomplete events from a
+# host_task on the CPU SYCL device, so the selector is pinned to it: no GPU.
+add_executable(test-sycl-retained-reap
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-retained-reap.cpp
+)
+target_include_directories(test-sycl-retained-reap PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-retained-reap PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-retained-reap PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-retained-reap PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-retained-reap PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-retained-reap PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-retained-reap COMMAND test-sycl-retained-reap)
+set_tests_properties(test-sycl-retained-reap PROPERTIES
+    LABELS "sycl;handle;hostonly;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 # Test: retain_handles_until_event() must route a handle by THIS thread's
 # recording state (llama.cpp-oze0).  Its guard was
 # ggml_sycl_graph_recording_active(), true whenever ANY thread records, while

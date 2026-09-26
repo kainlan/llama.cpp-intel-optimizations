@@ -82,6 +82,7 @@ class shared_alloc_owner {
     explicit operator bool() const noexcept { return control_ != nullptr; }
     const alloc_metadata & metadata() const noexcept;
     uint32_t use_count() const noexcept;
+    uint64_t control_id() const noexcept;
     release_attempt reset() noexcept;
 
   private:
@@ -445,6 +446,19 @@ class mem_handle {
         mem_handle_lock_guard g(lock_);
         return static_cast<bool>(owned_alloc_);
     }
+
+    // Identity of the allocation owner control this handle retains: the one
+    // from_owned_alloc() adopted, shared by every copy and slice of it. It is
+    // minted once per control and never reused, so it cannot name a later
+    // allocation at a recycled address. 0 when the handle retains no owner.
+    uint64_t owner_control_id() const;
+
+    // Drop this handle, and report what dropping its allocation owner
+    // reference did: RELEASED when it was the last reference and the bytes
+    // went back to their allocator, RETAINED when another reference remains,
+    // RETRY_SCHEDULED when the allocator refused and queued the release, and
+    // INVALID when the handle retained no owner. The handle is empty after.
+    release_attempt reset_owned_allocation() noexcept;
 
     // True if this is a cache-managed WEIGHT handle (not a raw DIRECT pointer).
     bool is_weight() const { return kind_ == mem_handle_kind::WEIGHT; }
@@ -836,6 +850,90 @@ bool drain_retained_handles(bool wait_all = false, uint32_t timeout_ms = 10000);
 // is invalidated. These handles are not event-waitable, so drain_retained_handles()
 // intentionally does not touch them.
 void release_graph_retained_handles();
+
+// === Reaping the retained store for released owners ===
+//
+// release_retained_referencing() drops what the retained store (event-bound
+// records, the drain worker's in-hand record, and graph_unwaitable) holds of a
+// set of allocation owners, so a caller releasing those owners can tell when
+// their bytes are back. It matches by owner-control identity
+// (mem_handle::owner_control_id()), never by address, so slices and copies of
+// an owner match it too.
+//
+// The retained-store mutex is the only lock it takes, a leaf; call it with no
+// lock that a handle destructor can take. Matches are swapped out under the
+// mutex, then waited and dropped after it is released.
+// GGML_SYCL_STRICT_PLAN=1: a [CONTEXT-PLAN-BUG] -- state the context plan
+// says cannot exist -- aborts instead of logging a WARN. Read once.
+bool strict_plan_checks_enabled();
+
+enum retained_reap_precondition {
+    // The caller has synchronized every queue that can reach the owners, so
+    // every matching event is complete. A matching record, the in-hand one
+    // (the reap yields until the worker is done with it) and a matching
+    // graph_unwaitable handle are all dropped. An event found incomplete is a
+    // missed queue: it is waited on, never freed early, counted, and reported
+    // as a [CONTEXT-PLAN-BUG] -- a WARN, or an abort under
+    // GGML_SYCL_STRICT_PLAN=1.
+    RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER,
+    // The caller vouches for nothing. Only a matching entry whose event is
+    // complete is dropped (a complete in-hand record by yielding to the
+    // worker); the rest are kept and reported pending. graph_unwaitable
+    // handles cannot be queried, so they are always kept. Nothing waits on
+    // device work and nothing is reported as a bug.
+    RETAINED_REAP_QUERY_EVENT_STATUS,
+};
+
+struct retained_reap_request {
+    const mem_handle *         owners        = nullptr;  // the owners to match
+    size_t                     n_owners      = 0;
+    retained_reap_precondition pre           = RETAINED_REAP_QUERY_EVENT_STATUS;
+    const char *               reason        = "";  // printed in any report
+    // Optional, n_owners entries: set for every owner a kept entry matches.
+    bool *                     owner_pending = nullptr;
+};
+
+// An entry is one queued record, the in-hand record, or one handle in
+// graph_unwaitable (a flat list, so each handle is its own entry).
+//  - entries_dropped: entries removed and dropped, unwaitable ones included;
+//  - entries_pending: entries kept because they are not known complete (QUERY
+//    only; 0 in COMPLETE);
+//  - pending_bytes: the sizes of the distinct owners that still have a
+//    matching kept entry, each counted once however many entries hold it (the
+//    owner handle's size()); 0 in COMPLETE;
+//  - in_hand_yields: waits on the worker's in-hand record;
+//  - unwaitable_dropped: entries dropped without a wait because their event
+//    cannot be queried -- graph_unwaitable handles, and queued records whose
+//    event is a command graph's (COMPLETE only), a subset of entries_dropped.
+struct retained_reap_result {
+    size_t entries_dropped    = 0;
+    size_t entries_pending    = 0;
+    size_t pending_bytes      = 0;
+    size_t in_hand_yields     = 0;
+    size_t unwaitable_dropped = 0;
+};
+
+retained_reap_result release_retained_referencing(const retained_reap_request & request);
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Records the COMPLETE-mode backstop found still in flight, process-wide.
+size_t retained_reap_backstop_incomplete();
+
+// Drain worker pause points for the reap's handoff tests: AFTER_POP holds the
+// worker with its record in hand, before it waits on the record's event;
+// AFTER_DROP holds it after it dropped the record's handles, before it clears
+// the in-hand record. retained_drain_test_parked() says whether it is held.
+enum retained_drain_test_point : uint8_t {
+    RETAINED_DRAIN_TEST_POINT_NONE,
+    RETAINED_DRAIN_TEST_POINT_AFTER_POP,
+    RETAINED_DRAIN_TEST_POINT_AFTER_DROP,
+};
+
+void retained_drain_test_hold(retained_drain_test_point point);
+bool retained_drain_test_parked();
+// The worker's next event wait throws as a recorded command graph's does.
+void retained_drain_test_fail_next_wait_as_command_graph();
+#endif
 
 // How many handles are currently parked for command-graph lifetime. Exposed so a
 // test can assert WHERE retain_handles_until_event() routed a handle: a handle

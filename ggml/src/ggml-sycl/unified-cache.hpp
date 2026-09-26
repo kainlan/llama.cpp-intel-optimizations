@@ -2256,33 +2256,68 @@ enum class expert_retire_status : uint8_t {
 // What yield_optional_layouts() did. `retired` copies are hidden from routing
 // at once. `freed`/`freed_bytes` are the ones whose storage is back in its zone
 // when the call returns; the rest (`retired - freed`, `pending_bytes`) are
-// still held by a lease or an unfinished free and return later. `kv_layers` is
-// how many of the requested layers the zone can place as the call returns,
-// yield or not.
+// still held by a lease or an unfinished free and return later.
+// `skipped_groups` are pick groups not released because one of their copies
+// was no longer the yieldable copy the fit picked. `kv_layers` is how many of
+// the requested layers the zone can place as the call returns, yield or not.
 struct optional_layout_yield_result {
-    size_t retired       = 0;
-    size_t freed         = 0;
-    size_t freed_bytes   = 0;
-    size_t pending_bytes = 0;
-    size_t kv_layers     = 0;
+    size_t retired        = 0;
+    size_t freed          = 0;
+    size_t freed_bytes    = 0;
+    size_t pending_bytes  = 0;
+    size_t skipped_groups = 0;
+    size_t kv_layers      = 0;
+};
+
+// One optional layout copy a yield may release, as the fit read it: the
+// entry's key and its replacement generation
+// (unified_cache_entry::replacement_identity()), so a copy staged again since
+// is not taken for the one the fit modelled.
+struct optional_layout_pick {
+    unified_cache_key key;
+    uint64_t          generation = 0;
+};
+
+// Copies released whole or not at all (kv_optional_layout_yield::groups).
+using optional_layout_pick_group = std::vector<optional_layout_pick>;
+
+// A device's optional layout copies as its fit reads them
+// (unified_cache::optional_layouts_snapshot()): the zone model the fit plans
+// on, and picks[i] naming fit.copies[i].
+struct optional_layout_snapshot {
+    kv_optional_layouts               fit;
+    std::vector<optional_layout_pick> picks;
+
+    // The fit's groups (indices into fit.copies) as the yield's pick list.
+    std::vector<optional_layout_pick_group> pick_groups(const kv_optional_layout_yield & yield) const {
+        std::vector<optional_layout_pick_group> groups;
+        for (const std::vector<size_t> & group : yield.groups) {
+            groups.emplace_back();
+            for (size_t i : group) {
+                groups.back().push_back(picks[i]);
+            }
+        }
+        return groups;
+    }
 };
 
 // A yield split at its one wait, so a caller can hold an L1 lock through the
 // decision and through none of the wait (canonical memory contract §12.5).
-// yield_optional_layouts_begin() picks and retires the copies and submits the
+// yield_optional_layouts_begin() retires the picked copies and submits the
 // barrier that gates their frees; it waits on nothing and drops no handle --
-// the direct-stage mirror handles it withdraws move in here. Finishing waits
-// on the barrier, returns the copies' storage to their zone and drops those
-// handles, so it runs with no L1 lock held. A release dropped unfinished
-// drops the handles in its destructor and leaves the frees to a later
-// deferred-free pass. `result` holds `retired`, and `kv_layers` when nothing
-// was retired; the rest is filled by the finish.
+// the direct-stage mirror handles it withdraws, and a reference to each
+// retired copy's allocation owner, move in here. Finishing waits on the
+// barrier, reaps what still references those owners, returns the copies'
+// storage to their zone and drops those handles, so it runs with no L1 lock
+// held. A release dropped unfinished drops the handles in its destructor and
+// leaves the frees to a later deferred-free pass. `result` holds `retired`
+// and `skipped_groups`; the rest is filled by the finish.
 struct optional_layout_release {
     unified_cache *                          cache = nullptr;
     optional_layout_yield_result             result;
     std::vector<std::shared_ptr<mem_handle>> mirrors;
-    std::vector<const void *>                ptrs;
-    std::vector<size_t>                      sizes;
+    std::vector<mem_handle>                  owners;  // each retired copy's direct_alloc_owner
+    std::vector<size_t>                      sizes;   // same indexing as owners
     sycl::event                              readers_done;
 };
 
@@ -2966,25 +3001,31 @@ class unified_cache {
 
     // Optional layout copies (unified_cache_entry::optional_layout).
     // mark_optional_layout() tags a dense weight's staged copy in `layout`.
-    // optional_layout_bytes() is what yield_optional_layouts() could release
-    // now: device-resident, non-retired copies weight_entry_reclaimable()
-    // accepts under OPTIONAL_LAYOUT_YIELD -- nobody but the cache's own
-    // direct-stage mirror leases them. yield_optional_layouts() retires the ones
-    // that let more of `layer_bytes` (KV layer allocations, in the order the
-    // tiered KV allocator makes them) land in the zone -- a copy whose hole no
-    // layer can use stays (select_optional_layout_yield()) -- waits once for
-    // every queue the cache orders frees against, and returns their storage to
-    // its zone before it returns. A reader holds its copy's lease until its
-    // work completes (acquire_layout_handle()), so a copy being read is never
-    // picked; the wait is defence in depth. Primaries are never touched.
-    // kv_layers_allocatable() is how many of `layer_bytes` the zone can place
-    // now. Cold, context-admission-time calls: not for a dispatch path.
-    // yield_optional_layouts() is begin plus finish (optional_layout_release),
-    // for a caller holding no L1 lock.
+    // optional_layout_bytes() is what a yield could release now:
+    // device-resident, non-retired copies weight_entry_reclaimable() accepts
+    // under OPTIONAL_LAYOUT_YIELD -- nobody but the cache's own direct-stage
+    // mirror leases them. optional_layouts_snapshot() is those copies as the
+    // fit reads them: a copy of the zone KV is carved from, where each copy
+    // sits in it, and each copy's pick. The fit (plan_runtime_kv_residency())
+    // picks which to release, in groups; yield_optional_layouts_begin()
+    // retires each group whole, if every copy in it is still the yieldable
+    // copy the snapshot read, and skips it otherwise -- the refit then holds
+    // the KV to what the zone places without it. The finish waits once for
+    // every queue the cache orders frees against, reaps the retained handles
+    // that still reference the copies' allocations (release_retained_referencing())
+    // and returns their storage to its zone before it returns. A reader holds
+    // its copy's lease until its work completes (acquire_layout_handle()), so a
+    // copy being read is never yieldable; the wait is defence in depth.
+    // Primaries are never touched. kv_layers_allocatable() is how many of
+    // `layer_bytes` the zone can place now. Cold, context-admission-time
+    // calls: not for a dispatch path. yield_optional_layouts() is snapshot,
+    // plan_optional_layout_yield(), begin and finish in one, for a caller
+    // holding no L1 lock.
     bool                         mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout);
     size_t                       optional_layout_bytes() const;
+    optional_layout_snapshot     optional_layouts_snapshot();
     optional_layout_yield_result yield_optional_layouts(const std::vector<size_t> & layer_bytes);
-    optional_layout_release      yield_optional_layouts_begin(const std::vector<size_t> & layer_bytes);
+    optional_layout_release      yield_optional_layouts_begin(const std::vector<optional_layout_pick_group> & groups);
     optional_layout_yield_result yield_optional_layouts_finish(optional_layout_release &   release,
                                                                const std::vector<size_t> & layer_bytes);
     size_t                       kv_layers_allocatable(const std::vector<size_t> & layer_bytes);
@@ -3538,6 +3579,10 @@ class unified_cache {
     void test_mark_all_entries_touched_by_load(uint64_t load_txn_id);
     bool     test_mark_entry_touched_by_load(ggml_sycl_cache_id key, ggml_layout_mode layout, uint64_t load_txn_id);
     uint64_t test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const;
+    // Retain a reference to a staged weight's allocation owner until `event`,
+    // as a retained handle the context plan knows nothing of: what a yield
+    // finds still referencing a copy after its reap.
+    bool     test_retain_owner_until_event(ggml_sycl_cache_id key, ggml_layout_mode layout, sycl::event event);
     size_t   retired_pending_count_for_test() const noexcept {
         return retired_pending_count_.load(std::memory_order_acquire);
     }
@@ -4583,9 +4628,12 @@ class unified_cache {
     // A copy of the allocators KV is carved from (kv_zone_model), and where
     // each of `ptrs` sits in it when `blocks` is given.
     kv_zone_model kv_zone_snapshot(const std::vector<const void *> & ptrs, std::vector<kv_zone_block> * blocks);
-    // May yield_optional_layouts() release this entry now? Caller holds
-    // direct_stage_mutex_ and rw_mutex_ (either mode).
+    // May a yield release this entry now? Caller holds direct_stage_mutex_ and
+    // rw_mutex_ (either mode).
     bool optional_layout_yieldable_locked(const unified_cache_key & key, const unified_cache_entry & entry) const;
+    // yield_optional_layouts_finish() for a release that retired copies: wait
+    // on its barrier, reap, free, and count what reached the zone. No L1 lock.
+    void finish_optional_layout_release(optional_layout_release & release, optional_layout_yield_result & result);
     using zone_registry_commit_fn = bool (*)(void *, const arena_authority::allocation_record &, void *) noexcept;
     bool arena_register_exact(vram_zone_id zone, uint64_t allocation_id, size_t offset, size_t extent) noexcept;
     void arena_unregister_exact(vram_zone_id zone, size_t offset) noexcept;
@@ -5813,6 +5861,9 @@ class alloc_owner_control final {
     const alloc_metadata & metadata() const noexcept { return metadata_; }
     allocation_control_class ownership_class() const noexcept { return ownership_class_; }
     uint32_t use_count() const noexcept { return refs_.load(std::memory_order_acquire); }
+    // Minted once per control from a process-wide counter: never 0, never
+    // reused, so it cannot name a later control at a recycled address.
+    uint64_t control_id() const noexcept { return control_id_; }
 
   private:
     friend class alloc_owner;
@@ -5830,6 +5881,7 @@ class alloc_owner_control final {
     void abandon() noexcept;
 
     std::atomic<uint32_t> refs_{ 1 };
+    uint64_t control_id_ = 0;
     alloc_metadata metadata_{};
     allocation_control_class ownership_class_ = allocation_control_class::EXTERNAL_EXACT;
     std::shared_ptr<allocation_release_coordinator> coordinator_;
@@ -6748,18 +6800,19 @@ bool   unified_cache_mode_is_global();
 
 // Optional layout copies yield to runtime KV (see
 // unified_cache_entry::optional_layout). S1-PRELOAD marks each copy it stages
-// as well as a primary; the runtime-context transaction counts
-// unified_cache_optional_layout_bytes() as KV headroom and, before it demotes
-// any KV layer, releases what the KV needs: it begins the yield under its
-// inventory lock and finishes it after releasing that lock
+// as well as a primary; the runtime-context transaction hands its fit each
+// device's unified_cache_optional_layouts_snapshot(), and before it demotes
+// any KV layer releases the copies the fit picked: it begins the yield under
+// its inventory lock and finishes it after releasing that lock
 // (optional_layout_release), and the finish says how many of the device's KV
 // layers its zone can place. `multi_device` reads the device's cache as
 // unified_cache_kv_vram_available() does, so the numbers come from the same
 // zone.
-size_t                       unified_cache_optional_layout_bytes(int device_id, bool multi_device);
-optional_layout_release      unified_cache_yield_optional_layouts_begin(int                         device_id,
-                                                                        bool                        multi_device,
-                                                                        const std::vector<size_t> & layer_bytes);
+optional_layout_snapshot unified_cache_optional_layouts_snapshot(int device_id, bool multi_device);
+optional_layout_release  unified_cache_yield_optional_layouts_begin(
+     int                                             device_id,
+     bool                                            multi_device,
+     const std::vector<optional_layout_pick_group> & groups);
 optional_layout_yield_result unified_cache_yield_optional_layouts_finish(optional_layout_release &   release,
                                                                          const std::vector<size_t> & layer_bytes);
 

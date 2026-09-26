@@ -1566,8 +1566,9 @@ YIELDABLE_SIGNATURE = "bool unified_cache::optional_layout_yieldable_locked("
 def optional_layout_yield_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
     found: list[str] = []
     txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
-    if "in.yieldable.push_back(ggml_sycl::unified_cache_optional_layout_bytes(device, next_plan.multi_device));" \
-            not in txn:
+    snapshot = txn.find("ggml_sycl::unified_cache_optional_layouts_snapshot(device, next_plan.multi_device)")
+    fed = txn.find("in.optional_layouts.push_back(optional_layouts.back().fit);", max(snapshot, 0))
+    if snapshot < 0 or fed < 0:
         found.append("the fit does not count optional layouts as KV headroom")
     yields = [m.start() for m in re.finditer(r"unified_cache_yield_optional_layouts_begin\(", txn)]
     first_fit = txn.find("plan_runtime_kv_residency(in)")
@@ -1582,7 +1583,7 @@ def optional_layout_yield_violations(sycl_cpp: str, cache_cpp: str) -> list[str]
         found.append("optional layouts are released after KV demotion is decided")
     refit = re.search(r"in\.available\[i\]\s*=\s*ggml_sycl_kv_capacity_live\(\s*next_plan\s*,\s*in\.devices\[i\]\s*,"
                       r"\s*nullptr\s*,\s*ctx->device\s*\);.*?"
-                      r"in\.yieldable\.clear\(\);\s*residency\s*=\s*ggml_sycl::plan_runtime_kv_residency\(in\);",
+                      r"in\.optional_layouts\.clear\(\);\s*residency\s*=\s*ggml_sycl::plan_runtime_kv_residency\(in\);",
                       txn[yields[0]:demote], re.S)
     if refit is None:
         found.append("the fit is not redone against the live headroom after a yield")
@@ -1634,7 +1635,7 @@ def _cache_mutation(old: str, new: str, expected: str, label: str) -> None:
 
 
 def test_mutation_yieldable_not_counted_is_witnessed() -> None:
-    _sycl_mutation("in.yieldable.push_back(ggml_sycl::unified_cache_optional_layout_bytes(device, next_plan.multi_device));",
+    _sycl_mutation("in.optional_layouts.push_back(optional_layouts.back().fit);",
                    "", "does not count optional layouts", "yieldable dropped")
 
 
@@ -1649,7 +1650,7 @@ def test_mutation_yield_without_fit_is_witnessed() -> None:
 
 
 def test_mutation_no_refit_after_yield_is_witnessed() -> None:
-    _sycl_mutation("                in.yieldable.clear();\n                residency = ggml_sycl::plan_runtime_kv_residency(in);\n",
+    _sycl_mutation("                in.optional_layouts.clear();\n                residency = ggml_sycl::plan_runtime_kv_residency(in);\n",
                    "", "not redone against the live headroom", "refit dropped")
 
 
@@ -1711,8 +1712,10 @@ def test_mutation_dense_woq_knob_dropped_is_witnessed() -> None:
 # a copy under a reader that took no lease, and must not leave a recorded graph
 # baking a retired copy's pointer.
 GRAPH_COMPUTE_SIGNATURE = "static ggml_status ggml_backend_sycl_graph_compute_unchecked("
-YIELD_SIGNATURE = "optional_layout_release unified_cache::yield_optional_layouts_begin(const std::vector<size_t> & layer_bytes) {"
+YIELD_SIGNATURE = "optional_layout_release unified_cache::yield_optional_layouts_begin("
 YIELD_FINISH_SIGNATURE = "optional_layout_yield_result unified_cache::yield_optional_layouts_finish("
+YIELD_FINISH_RELEASE_SIGNATURE = "void unified_cache::finish_optional_layout_release("
+OPTIONAL_SNAPSHOT_SIGNATURE = "optional_layout_snapshot unified_cache::optional_layouts_snapshot() {"
 
 
 def optional_layout_release_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
@@ -1729,17 +1732,32 @@ def optional_layout_release_violations(sycl_cpp: str, cache_cpp: str) -> list[st
     if clear < 0 or (replay >= 0 and replay < clear):
         found.append("graph compute can replay before dropping graphs recorded before a yield")
 
-    body = strip_comments(function(cache_cpp, YIELD_SIGNATURE) + function(cache_cpp, YIELD_FINISH_SIGNATURE))
+    body = strip_comments(function(cache_cpp, YIELD_SIGNATURE) + function(cache_cpp, YIELD_FINISH_SIGNATURE) +
+                          function(cache_cpp, YIELD_FINISH_RELEASE_SIGNATURE))
     retire = body.find("transition_to_retired_locked(entry);")
-    gate = body.find("entry.last_write_event = readers_done;")
-    barrier = body.find("readers_done = submit_barrier_all();")
+    gate = body.find("entry.last_write_event = release.readers_done;")
+    barrier = body.find("release.readers_done = submit_barrier_all();")
     if min(retire, gate, barrier) < 0 or not barrier < gate < retire:
         found.append("a retired copy's free is not gated on a barrier over every queue")
     wait = body.find("release.readers_done.wait_and_throw();")
+    reap = body.find("reaped           = release_retained_referencing(request);")
     drain = body.find("it = deferred_frees_.erase(it);")
     finalize = body.find("finalize_retired_entries_locked();")
     if min(wait, drain, finalize) < 0 or not wait < finalize < drain:
         found.append("a yield returns before the retired copies' storage is back in its zone")
+    # A retained handle bound to a copy's fill still references its owner after
+    # the barrier; the reap drops it (QUERY: only what is known complete).
+    if reap < 0 or not wait < reap < finalize or "request.pre      = RETAINED_REAP_QUERY_EVENT_STATUS;" not in body:
+        found.append("a yield frees without reaping the retained handles that reference its copies")
+    # freed is what reached the zone: the yield's own owner reference, the last
+    # one once the reap and the deferred rows are gone, releasing.
+    counted = re.search(r"if \(release\.owners\[i\]\.reset_owned_allocation\(\)\.released\(\)\) \{\s*"
+                        r"result\.freed\+\+;", body)
+    if counted is None or counted.start() < drain:
+        found.append("a yield counts a copy freed that did not reach its zone")
+    if not re.search(r"if \(readers_finished && still_held > 0\) \{\s*if \(strict_plan_checks_enabled\(\)\) \{\s*"
+                     r"GGML_ABORT\(\s*\"\[CONTEXT-PLAN-BUG\] optional-layout yield", body):
+        found.append("a copy still referenced after the reap is not reported as a plan bug")
     return found
 
 
@@ -1770,8 +1788,30 @@ def test_mutation_graphs_not_dropped_is_witnessed() -> None:
 
 
 def test_mutation_free_gated_on_write_event_is_witnessed() -> None:
-    _release_cache_mutation("            entry.last_write_event = readers_done;\n", "",
+    _release_cache_mutation("            entry.last_write_event = release.readers_done;\n", "",
                             "not gated on a barrier", "barrier gate dropped")
+
+
+def test_mutation_yield_without_reap_is_witnessed() -> None:
+    _release_cache_mutation("        reaped           = release_retained_referencing(request);\n", "",
+                            "without reaping the retained handles", "reap dropped")
+
+
+def test_mutation_yield_reap_waits_is_witnessed() -> None:
+    _release_cache_mutation("        request.pre      = RETAINED_REAP_QUERY_EVENT_STATUS;\n",
+                            "        request.pre      = RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER;\n",
+                            "without reaping the retained handles", "reap mode changed")
+
+
+def test_mutation_freed_counted_unreleased_is_witnessed() -> None:
+    _release_cache_mutation("if (release.owners[i].reset_owned_allocation().released()) {",
+                            "if ((release.owners[i].reset_owned_allocation(), true)) {",
+                            "counts a copy freed that did not reach its zone", "freed counted per retired row")
+
+
+def test_mutation_leftover_reference_silent_is_witnessed() -> None:
+    _release_cache_mutation("    if (readers_finished && still_held > 0) {\n", "    if (false) {\n",
+                            "not reported as a plan bug", "plan-bug report dropped")
 
 
 def test_mutation_free_left_deferred_is_witnessed() -> None:
@@ -1789,22 +1829,43 @@ def test_mutation_no_reader_wait_is_witnessed() -> None:
 # copy of the zone's allocators, and the re-fit is held to the layers the zone
 # can place: a device-planned layer it cannot place is not refused but lands in
 # raw device memory outside the arena (llama.cpp-moua).
-def kv_fit_hold_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
+KV_DEMOTION_CPP = ROOT / "ggml/src/ggml-sycl/kv-runtime-demotion.cpp"
+RESIDENCY_FIT_SIGNATURE = "kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in) {"
+
+
+def kv_fit_hold_violations(sycl_cpp: str, cache_cpp: str, fit_cpp: str | None = None) -> list[str]:
+    if fit_cpp is None:
+        fit_cpp = KV_DEMOTION_CPP.read_text()
     found: list[str] = []
     txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
     begin = re.search(r"unified_cache_yield_optional_layouts_begin\(\s*in\.devices\[i\],\s*next_plan\.multi_device,"
-                      r"\s*device_layer_bytes\[i\]\)", txn)
+                      r"\s*optional_layouts\[i\]\.pick_groups\(residency\.yields\[i\]\)\)", txn)
     at = begin.start() if begin else -1
-    hold = txn.find("in.fit_capacity[i] = placeable;")
+    hold = txn.find("in.fit_capacity[i] = ggml_sycl::kv_device_leading_layer_bytes(in, in.devices[i], "
+                    "released.kv_layers);")
     refit = txn.find("residency = ggml_sycl::plan_runtime_kv_residency(in);", max(hold, 0))
     if at < 0 or hold < at or refit < 0 or refit > txn.find("if (!residency.fits)"):
         found.append("the re-fit is not held to the KV layers the zone can place")
 
-    body = strip_comments(function(cache_cpp, YIELD_SIGNATURE))
-    model = body.find("kv_zone_snapshot(ptrs, &blocks)")
-    pick = body.find("select_optional_layout_yield(zone, blocks, layer_bytes)")
-    if model < 0 or pick < model:
+    # The fit picks, on the zone model the snapshot copied, and holds the KV
+    # to what lands once its picks go; the cache only re-checks and retires.
+    fit = strip_comments(function(fit_cpp, RESIDENCY_FIT_SIGNATURE))
+    pick = fit.find("plan_optional_layout_yield(in.optional_layouts[i], kv_device_layer_alloc_bytes(in, fit.device));")
+    capped = fit.find("fit.capacity = std::min(fit.capacity, kv_device_leading_layer_bytes(in, fit.device, "
+                      "picks.kv_layers));", max(pick, 0))
+    if pick < 0 or capped < 0:
         found.append("copies are picked without modelling where a KV layer lands")
+    snapshot = strip_comments(function(cache_cpp, OPTIONAL_SNAPSHOT_SIGNATURE))
+    if "snapshot.fit.zone = kv_zone_snapshot(ptrs, &snapshot.fit.copies);" not in snapshot or \
+            "snapshot.picks.push_back({ pair.first, pair.second.replacement_identity() });" not in snapshot:
+        found.append("the fit's zone model is not the snapshot its picks name")
+    begin_body = strip_comments(function(cache_cpp, YIELD_SIGNATURE))
+    if re.search(r"plan_optional_layout_yield\(|kv_zone_snapshot\(|select_optional_layout_yield\(", begin_body):
+        found.append("the yield decides its own picks instead of taking the fit's")
+    if "it->second.replacement_identity() == group[p].generation" not in begin_body:
+        found.append("a pick is released without checking it is the copy the fit read")
+    if not re.search(r"if \(!whole\) \{\s*\+\+result\.skipped_groups;\s*continue;", begin_body):
+        found.append("a group is released in part")
     return found
 
 
@@ -1818,16 +1879,38 @@ def _hold_sycl_mutation(old: str, new: str, expected: str, label: str) -> None:
 
 
 def test_mutation_refit_not_held_is_witnessed() -> None:
-    _hold_sycl_mutation("                in.fit_capacity[i] = placeable;\n", "", "not held to the KV layers",
-                        "hold dropped")
+    _hold_sycl_mutation(
+        "                in.fit_capacity[i] = ggml_sycl::kv_device_leading_layer_bytes(in, in.devices[i], released.kv_layers);\n",
+        "", "not held to the KV layers", "hold dropped")
 
 
 def test_mutation_yield_by_bytes_is_witnessed() -> None:
+    cpp, cache, fit = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text(), KV_DEMOTION_CPP.read_text()
+    mutated = fit.replace("fit.capacity = std::min(fit.capacity, kv_device_leading_layer_bytes(in, fit.device, "
+                          "picks.kv_layers));", "(void) picks;", 1)
+    _assert_witnessed(fit, mutated, lambda f: kv_fit_hold_violations(cpp, cache, f), "without modelling",
+                      "zone hold dropped from the fit")
+
+
+def _hold_cache_mutation(old: str, new: str, expected: str, label: str) -> None:
     cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
-    mutated = cache.replace("select_optional_layout_yield(zone, blocks, layer_bytes)",
-                            "std::vector<size_t>(keys.size(), 0)", 1)
-    _assert_witnessed(cache, mutated, lambda c: kv_fit_hold_violations(cpp, c), "without modelling",
-                      "zone model dropped")
+    _assert_witnessed(cache, cache.replace(old, new, 1), lambda c: kv_fit_hold_violations(cpp, c), expected, label)
+
+
+def test_mutation_stale_pick_released_is_witnessed() -> None:
+    _hold_cache_mutation("it->second.replacement_identity() == group[p].generation &&", "",
+                         "without checking it is the copy the fit read", "generation check dropped")
+
+
+def test_mutation_group_released_in_part_is_witnessed() -> None:
+    _hold_cache_mutation("        if (!whole) {\n            ++result.skipped_groups;\n            continue;\n        }\n",
+                         "", "released in part", "skip dropped")
+
+
+def test_mutation_snapshot_picks_unnamed_is_witnessed() -> None:
+    _hold_cache_mutation("snapshot.picks.push_back({ pair.first, pair.second.replacement_identity() });",
+                         "snapshot.picks.push_back({ pair.first, 0 });", "not the snapshot its picks name",
+                         "generation not recorded")
 
 
 # Weight reclaim has one authority, weight_entry_reclaimable() (CLAUDE.md, SYCL
@@ -1949,6 +2032,7 @@ def optional_layout_reclaim_violations(hpp: str, cache_cpp: str, sycl_cpp: str) 
                      yieldable) or re.search(r"entry\.(optional_layout|in_use_count)", yieldable):
         found.append("the yield decides reclaim outside weight_entry_reclaimable()")
     users = strip_comments(definition(cache_cpp, OPTIONAL_BYTES_SIGNATURE) or "") + \
+        strip_comments(definition(cache_cpp, OPTIONAL_SNAPSHOT_SIGNATURE) or "") + \
         strip_comments(definition(cache_cpp, YIELD_SIGNATURE) or "")
     if users.count("optional_layout_yieldable_locked(") != 3:
         found.append("a yield path picks copies without the reclaim predicate")
@@ -2017,8 +2101,8 @@ def test_mutation_yield_bypasses_predicate_is_witnessed() -> None:
 
 
 def test_mutation_yield_path_unchecked_is_witnessed() -> None:
-    _reclaim_mutation(UNIFIED_CACHE_CPP, "                optional_layout_yieldable_locked(it->first, it->second)) {",
-                      "                true) {", "without the reclaim predicate", "revalidation dropped")
+    _reclaim_mutation(UNIFIED_CACHE_CPP, "                    optional_layout_yieldable_locked(it->first, it->second);",
+                      "                    true;", "without the reclaim predicate", "revalidation dropped")
 
 
 def test_mutation_reclaim_loop_accepts_mode_is_witnessed() -> None:
@@ -2071,9 +2155,10 @@ def yield_lock_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
     if re.search(r"\bwait(_and_throw)?\(|\.clear\(\)", started):
         found.append("the yield's begin waits or drops handles")
     finished = strip_comments(function(cache_cpp, YIELD_FINISH_SIGNATURE))
-    early = re.search(r"if \(release\.ptrs\.empty\(\)\) \{\s*return result;", finished)
-    wait = finished.find("wait_and_throw(")
-    if early is None or wait < 0 or early.start() > wait:
+    helper = strip_comments(function(cache_cpp, YIELD_FINISH_RELEASE_SIGNATURE))
+    guarded = re.search(r"if \(!release\.owners\.empty\(\)\) \{\s*finish_optional_layout_release\(release, result\);",
+                        finished)
+    if guarded is None or "wait" in finished or "wait_and_throw(" not in helper:
         found.append("the yield's finish waits when nothing was retired")
     return found
 
@@ -2102,17 +2187,18 @@ def test_mutation_no_plan_recheck_is_witnessed() -> None:
 
 
 def test_mutation_begin_waits_is_witnessed() -> None:
-    _lock_mutation(UNIFIED_CACHE_CPP, "    result.retired = retired_ptrs.size();\n    return release;\n",
-                   "    result.retired = retired_ptrs.size();\n    readers_done.wait_and_throw();\n    return release;\n",
+    _lock_mutation(UNIFIED_CACHE_CPP, "    result.retired = release.owners.size();\n    return release;\n",
+                   "    result.retired = release.owners.size();\n    release.readers_done.wait_and_throw();\n    return release;\n",
                    "begin waits or drops handles", "wait moved into begin")
 
 
 def test_mutation_begin_drops_mirrors_is_witnessed() -> None:
-    _lock_mutation(UNIFIED_CACHE_CPP, "    result.retired = retired_ptrs.size();\n    return release;\n",
-                   "    released_mirrors.clear();\n    result.retired = retired_ptrs.size();\n    return release;\n",
+    _lock_mutation(UNIFIED_CACHE_CPP, "    result.retired = release.owners.size();\n    return release;\n",
+                   "    release.mirrors.clear();\n    result.retired = release.owners.size();\n    return release;\n",
                    "begin waits or drops handles", "mirror drop moved into begin")
 
 
 def test_mutation_finish_waits_unretired_is_witnessed() -> None:
-    _lock_mutation(UNIFIED_CACHE_CPP, "    if (release.ptrs.empty()) {\n        return result;\n    }\n", "",
-                   "waits when nothing was retired", "early return dropped")
+    _lock_mutation(UNIFIED_CACHE_CPP, "    if (!release.owners.empty()) {\n        finish_optional_layout_release(release, result);\n    }\n",
+                   "    finish_optional_layout_release(release, result);\n",
+                   "waits when nothing was retired", "guard dropped")
