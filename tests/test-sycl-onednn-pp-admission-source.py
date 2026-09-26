@@ -279,19 +279,29 @@ EXPRESSION_KEYWORDS = {"return", "co_return", "co_yield", "throw", "case", "not"
 
 
 def writes_of(text, lo, hi, var):
-    """Offsets in text[lo:hi] where `var` is declared (preceded by a type
-    word, or by a type word and `&`/`*`/`>`) or assigned (followed by `=` or
-    a compound assignment). Over-approximates on purpose: `x & var` or
-    `x > var` count as writes, which fails closed."""
+    """Offsets in text[lo:hi] where `var` is declared or assigned. A
+    declaration is `var` preceded by a type word (or a type word and
+    `&`/`*`/`>`), followed by `(` or `{` (a bool is not callable, so that is
+    an initializer -- this also catches `a = x, var(y)` and
+    `decltype(M) var{1}`), or named in an `auto [...]` structured binding.
+    An assignment is `var`, possibly inside parens, followed by `=` or a
+    compound assignment. Leans towards counting: `x & var` or `x > var`
+    count as writes, which fails closed. Known misses: a parenthesised
+    declarator `bool (var){true}` (telling it from the guard
+    `if (var) {` needs a parser), and bindings outside `auto [...]`."""
     sites = []
     for m in re.finditer(r"\b" + re.escape(var) + r"\b", text[lo:hi]):
         s = lo + m.start()
         before = text[max(lo, s - 200) : s].rstrip()
+        after = text[lo + m.end() : hi]
         word = re.search(r"(\w+)$", before)
-        declares = (word is not None and word.group(1) not in EXPRESSION_KEYWORDS) or bool(
-            re.search(r"(?:\w|>)\s*(?:(?<!&)&|\*|>)$", before)
+        declares = (
+            (word is not None and word.group(1) not in EXPRESSION_KEYWORDS)
+            or re.search(r"(?:\w|>)\s*(?:(?<!&)&|\*|>)$", before) is not None
+            or re.match(r"\s*[({]", after) is not None
+            or re.search(r"\bauto\s*&{0,2}\s*\[[\w\s,]*$", before + " ") is not None
         )
-        assigns = re.match(r"\s*(?:(?:<<|>>|[-+*/%&|^])?=(?!=))", text[lo + m.end() : hi]) is not None
+        assigns = re.match(r"[\s)]*(?:(?:<<|>>|[-+*/%&|^])?=(?!=))", after) is not None
         if declares or assigns:
             sites.append(s)
     return sites
@@ -382,8 +392,9 @@ def test_every_mxfp4_direct_onednn_gemm_is_admitted_by_the_candidate():
     # assignment would put an unchecked value under the guards below.
     fn_lo, fn_hi = function_span(backend, "ggml_sycl_mul_mat")
     decl = lo + cands[0].start(1)
-    others = [s for s in writes_of(backend, fn_lo, fn_hi, var) if s != decl]
-    assert decl in writes_of(backend, fn_lo, fn_hi, var) and not others, (
+    writes = writes_of(backend, fn_lo, fn_hi, var)
+    others = [s for s in writes if s != decl]
+    assert decl in writes and not others, (
         f"`{var}` is declared or assigned again in ggml_sycl_mul_mat at line(s) "
         f"{[line_of(backend, s) for s in others]}; the checked initializer must be its only write"
     )
