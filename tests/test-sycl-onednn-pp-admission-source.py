@@ -207,27 +207,72 @@ _CMP = r"(?:>=|<=|!=|==|>|<)"
 BATCH_COMPARISON = re.compile(_BATCH + r"(?:\s*\))*\s*" + _CMP + r"|" + _CMP + r"\s*" + _BATCH)
 
 
-def top_level_conjuncts(expr):
-    """Split `expr` on && outside any parentheses, after peeling parens
-    that wrap the whole expression. `!(a && b)` stays one conjunct."""
+def peel(expr):
+    """`expr` without parens that wrap all of it."""
     expr = expr.strip()
     while expr.startswith("(") and matching(expr, 0, "(", ")") == len(expr) - 1:
         expr = expr[1:-1].strip()
+    return expr
+
+
+def split_top_level(expr, sep):
+    """`expr` split on `sep` outside (), [] and {}."""
     parts, depth, start, i = [], 0, 0, 0
     while i < len(expr):
         ch = expr[i]
-        if ch == "(":
+        if ch in "([{":
             depth += 1
-        elif ch == ")":
+        elif ch in ")]}":
             depth -= 1
-        elif depth == 0 and expr.startswith("&&", i):
+        elif depth == 0 and expr.startswith(sep, i):
             parts.append(expr[start:i].strip())
-            start = i + 2
-            i += 2
+            start = i + len(sep)
+            i += len(sep)
             continue
         i += 1
     parts.append(expr[start:].strip())
     return parts
+
+
+def top_level_conjuncts(expr):
+    """The && operands of `expr` outside any brackets, each with its own
+    wrapping parens peeled, after peeling parens that wrap all of `expr`.
+    `a && (b)` gives [a, b]; `!(a && b)` stays one conjunct."""
+    return [peel(c) for c in split_top_level(peel(expr), "&&")]
+
+
+def bare_conjunct_violation(expr, target):
+    """None when `expr` binds `target` as one whole top-level && conjunct,
+    else why not. The one rule for both the answer's initializer and every
+    GEMM guard, so the two checks cannot drift apart. Wrapping parens are
+    ignored (per conjunct and overall); anything else around `target` --
+    !, a comparison, a cast, ?:, ||, a lambda or braced init, the comma
+    operator -- means `expr` is not bound by it."""
+    flat = " ".join(expr.split())
+    for token, what in (("?", "?:"), ("||", "||"), ("{", "a lambda or braced init"), (";", "a statement")):
+        if token in flat:
+            return f"it contains {what}"
+    conjuncts = top_level_conjuncts(flat)
+    if any(len(split_top_level(c, ",")) > 1 for c in conjuncts):
+        return "a conjunct uses the comma operator"
+    if target not in conjuncts:
+        return f"`{target}` is not one whole conjunct (negated, compared, cast or nested)"
+    return None
+
+
+def statement_end(text, pos):
+    """Offset of the `;` that ends the statement containing `pos`, skipping
+    any inside brackets (a lambda body's statements, for instance)."""
+    depth = 0
+    for i in range(pos, len(text)):
+        ch = text[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            return i
+    raise AssertionError("unterminated statement")
 
 
 def mxfp4_direct_span():
@@ -282,14 +327,15 @@ def test_every_mxfp4_direct_onednn_gemm_is_admitted_by_the_candidate():
     )
     var = cands[0].group(1)
     call_open = lo + cands[0].end() - 1
-    init = backend[lo + cands[0].start(2) : backend.index(";", call_open)]
+    init_open = lo + cands[0].start(2)
+    init = backend[init_open : statement_end(backend, init_open)]
     init_flat = " ".join(init.split())
     call_start = backend.rindex("ggml_sycl_onednn_pp_candidate", 0, call_open + 1)
     call_flat = " ".join(backend[call_start : matching(backend, call_open, "(", ")") + 1].split())
-    conjuncts = top_level_conjuncts(init_flat)
-    assert "?" not in init_flat and "||" not in init_flat and call_flat in conjuncts, (
+    why = bare_conjunct_violation(init, call_flat)
+    assert why is None, (
         f"`{var}` is initialised as `{init_flat}`: the candidate's call must be one whole && conjunct of it, "
-        "with no ||, no ?:, and nothing negating or comparing it"
+        f"but {why}"
     )
     assert not BATCH_COMPARISON.search(init), (
         f"`{var}` is initialised as `{init_flat}`, which compares the batch itself; the floor is the candidate's"
@@ -311,14 +357,13 @@ def test_every_mxfp4_direct_onednn_gemm_is_admitted_by_the_candidate():
         conds = enclosing_if_conditions(backend, lo, hi, g)
         guards = [c for c in conds if re.search(r"\b" + re.escape(var) + r"\b", c)]
         assert guards, f"oneDNN GEMM at line {line_of(backend, g)} is not guarded by the candidate's answer `{var}`"
-        # `var` must be a plain conjunct of its guard: `var || x` or `!var`
-        # names the answer without being bound by it.
+        # `var` must be a whole conjunct of its guard: `var || x`, `!var` or
+        # `!(x && var)` names the answer without being bound by it.
         for c in guards:
-            flat = " ".join(c.split())
-            conjuncts = [t.strip() for t in flat.split("&&")]
-            assert "||" not in flat and var in conjuncts, (
-                f"oneDNN GEMM at line {line_of(backend, g)} is guarded by `{flat}`; `{var}` must be a bare "
-                "conjunct of that guard, with no `||`"
+            why = bare_conjunct_violation(c, var)
+            assert why is None, (
+                f"oneDNN GEMM at line {line_of(backend, g)} is guarded by `{' '.join(c.split())}`; `{var}` must "
+                f"be one whole && conjunct of that guard, but {why}"
             )
         adhoc = [c for c in conds if BATCH_COMPARISON.search(c)]
         assert not adhoc, (
