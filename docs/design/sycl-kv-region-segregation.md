@@ -1394,8 +1394,11 @@ contribution. It never re-fits KV and never yields.
     each slot's **atomic claimed flag only**, and never takes the per-slot spin lock under the
     leaf (r6 m-8). A current tenant slot that is still claimed is `[CONTEXT-PLAN-BUG]` (a
     buffer outlived its scheduler). There is no legitimate in-flight occupier (zhcn's question,
-    answered): queued work and recorded graphs hold a slot's **lifetime** through retained
-    slices, never its **claim**, which ends at submission. The one state on master that looked
+    answered): queued eager work holds a slot's **lifetime** through retained slices, never its
+    **claim**, which ends at submission. A record-mode claim does last for its graph's life
+    (rulings §REC; §2.3.2 "Per execution mode"), but (a) destroyed this context's executable
+    graphs, which vacated those claims on an eager event, so none is left at (c). The one state
+    on master that looked
     like an in-flight occupier, u1bb's ring slot kept `busy` until its `done_event` completes, is
     vacant-with-event under §2.7's conversion. Otherwise:
     - **take every holder of the published slot table (rulings §B step 8; r6 I-3):** move the
@@ -1461,7 +1464,12 @@ contribution. It never re-fits KV and never yields.
     - each old ring slot must have `use_count() ≤ 1 + P[slot]`, the guard pins snapshotted at
       the ring's move-out ("The ring", below; r6 I-4).
 
-    Anything else is `[CONTEXT-PLAN-BUG]`, aborting under `GGML_SYCL_STRICT_PLAN=1`. After (d)
+    Anything else is `[CONTEXT-PLAN-BUG]`, aborting under `GGML_SYCL_STRICT_PLAN=1`. The BUG
+    line is followed by a holder scan over the census containers (zhcn rev 5 row 13), so it
+    names who holds the reference. Without STRICT, the call logs, drops the batch and continues
+    (zhcn rev 5 row 17): the extra holder keeps its block allocated through its own reference,
+    and (ii)'s live-TLSF fit counts that block as allocated, so the worst case is a refusal,
+    never an overlap. After (d)
     it means a reference held **outside the retained store**, which the protocol does not
     allow: a tenant slice may be retained only by a claim, by the retained store, or by a
     per-context graph container that (a) clears (H7ag; r6 I-3; lead ruling). Two kinds of holder
@@ -2645,8 +2653,12 @@ L7 documents this limit, and pattern #2 remains the remedy.
     the lock, allocate unlocked and owner-first, install and revalidate under the lock), which is
     pre-existing work and not moua's to implement.
   - **L7 census row: the re-plan transaction mutex (rulings §E.1).** `replan_txn_mutex[d]`,
-    one per device, is **L0**: taken before L1, never under L1-L5, and in device-index order
-    when a transaction takes several. It is held across the transaction, including its own
+    one per device, is **L0**: taken before L1, never under L1-L5, and in ascending device
+    index, all before L1, when an operation takes several. Its holders: the full and tenant-only
+    transactions, the probe, the teardown release proc, every other ring mutator outside decode,
+    model load and jehw's optional-layout pass (on every backing, USM and VM, for every device
+    the operation draws from). Loads never nest inside a transaction, and a transaction never
+    triggers a load. It is held across the transaction, including its own
     synchronize and its unlocked yield or driver window, which is a wait on this transaction's
     own work only. Decode and graph compute never take it. The deadlock rule, and teardown's
     path to it, are in §2.4.2.
@@ -4009,3 +4021,16 @@ ascending order. That closes all five, which then become `[CONTEXT-PLAN-BUG]`, a
 cost, since re-plans and loads are rare. The alternative is to make the plan check per device,
 which is jehw's code. The ring's own `busy` at `:18274` is not on this list: after (s), a
 claimed ring slot is step 7's occupancy bug.
+
+**zhcn rev 5 (`0089dc6`) §3.8 deltas, checked against `b30321a6f`.**
+
+| row | delta | disposition |
+|-----|-------|-------------|
+| 6c | covered slots reused in place; only the growing ones released | **Held** (rulings §B step 4; §2.4.2). This design also releases an index the candidate no longer uses on the (i) path, since §B step 4 reuses only a slot the candidate still has. The all-covered fast path keeps unused indexes as held room, as zhcn's does. |
+| 8 | GA −726.9, G2 spare 41.1 | **Held** from revision 7.2 (rulings §GA). |
+| 12 | (c) empties the table object, then resets the cached pointers | **Differs, and follows rulings §B step 8 and the lead's I-3 wording:** (c) takes the table pointers, and (e) checks the table's `use_count()` before opening it. Emptying a table that another holder may still read would be the mutation r6 I-3 warned about. The end state is the same. |
+| 13 | a new step (c′), `ggml_backend_sycl_release_buffer_refs(backend, owners)`, that erases owner-matched entries from backend-context caches (the MMVQ and MoE q8 `cached_src_handle`, `common.hpp:6587`, `:7015` at `11faace69`; the `moe_ids_cache` keys; `runtime_tensor_extras`; the thread-local `g_data_ptr_cache`), plus a holder scan when (e) fails | **Holder scan adopted** (§2.4.2 (e)). **(c′) is not folded in and goes to the lead.** Rulings §B allows a tenant slice only three holders: a claim, the retained store, or a graph container that step 5 clears. It calls anything else "a design error to fix, not an exemption", and H7ag fails a non-store park. (c′) keeps those caches as holders and erases them at re-plan. That is a fourth holder class, unless the lead rules these caches are per-context containers that the re-plan clears, as step 5 clears graphs. Until then, each is a producer to convert under H7ag. |
+| 14 | the `graph_unwaitable` scan after the yield, `unwaitable_dropped` | **Held** from revision 7.2 (rulings §R). |
+| 15 | (a) gated on recorded state; context-scoped clear | **Held** from revision 7.2, plus rulings §B step 5's "never unpin". |
+| 16 | (c)'s "never its claim" contradicts record mode | **Fixed** (§2.4.2 (i)(c)): a record-mode claim lasts for its graph's life (rulings §REC), and (a) vacated it on an eager event before (c). |
+| 17 | non-STRICT (e): log, drop the batch, continue | **Adopted** (§2.4.2 (e)); the live-TLSF belt makes it safe. |
