@@ -18,12 +18,19 @@
 #    112/112 images across two trees, 109/112 across a week of commits). The
 #    NEO compiler cache returns the stored binary for identical input, bit for
 #    bit. (IGC itself is not deterministic for every image: the ESIMD fattn
-#    and MXFP4 MoE images differ from one uncached compile to the next.) ocloc only uses it when BOTH NEO_CACHE_PERSISTENT=1 is in its
-#    environment AND -allow_caching is on its command line; CMake adds the
-#    flag, this sets the environment. NEO_CACHE_DIR overrides ocloc's
-#    -cache_dir, so the directory is chosen here, keyed on the toolchain: a
-#    different compiler, ocloc or IGC can never read an entry another one
-#    wrote, whether or not NEO's own key would have told them apart.
+#    and MXFP4 MoE images differ from one uncached compile to the next.) ocloc
+#    only uses it when BOTH NEO_CACHE_PERSISTENT=1 is in its environment AND
+#    -allow_caching is on its command line; CMake adds the flag, this sets the
+#    environment. NEO_CACHE_DIR overrides ocloc's -cache_dir, so the directory
+#    is chosen here, keyed on the toolchain: a different compiler, ocloc or IGC
+#    can never read an entry another one wrote, whether or not NEO's own key
+#    would have told them apart.
+#
+#    Disk: a full libggml-sycl link stores ~190 MB. At most two key
+#    directories are kept (the current toolchain's and the last other one),
+#    each capped at GGML_SYCL_OCLOC_CACHE_MAX_SIZE, so the cache stays under
+#    2 x 4 GiB by default. Below GGML_SYCL_OCLOC_CACHE_MIN_FREE free on its
+#    filesystem a link does not add to it.
 #
 # 3. GGML_SYCL_DEVICE_LINK_INVENTORY=<file> appends one row per ocloc
 #    invocation -- device, md5 of the SPIR-V in, md5 of the binary out, size
@@ -32,7 +39,9 @@
 #
 # Environment:
 #   GGML_SYCL_OCLOC_CACHE_ROOT      cache root (default ~/.cache/ggml-sycl-ocloc)
-#   GGML_SYCL_OCLOC_CACHE_MAX_SIZE  bytes per key directory (default 8 GiB)
+#   GGML_SYCL_OCLOC_CACHE_MAX_SIZE  bytes per key directory (default 4 GiB)
+#   GGML_SYCL_OCLOC_CACHE_MIN_FREE  free bytes needed on the cache filesystem to
+#                                   use the cache (default 4 GiB)
 #   GGML_SYCL_OCLOC_KEY_FILES       colon list of files whose identity enters
 #                                   the key (default: IGC and ocloc libraries)
 #   GGML_SYCL_OCLOC_KEY_PKGS        packages whose dpkg version enters the key
@@ -115,6 +124,22 @@ cache_key() {
     echo "ocloc-${ocloc_version:-none}_${hash}"
 }
 
+# Keep the current key's directory and the most recently used other one (the
+# toolchain a rollback returns to); remove older ones. Only directories this
+# launcher made are touched: named ocloc-*_<16 hex> with a KEY file inside.
+prune_cache_keys() {
+    local root="$1" current="$2" dir kept=0
+    while IFS= read -r dir; do
+        [[ "${dir}" == "${current}" ]] && continue
+        [[ "${dir}" =~ ^ocloc-.*_[0-9a-f]{16}$ && -f "${root}/${dir}/KEY" ]] || continue
+        if (( kept )); then
+            rm -rf -- "${root:?}/${dir}"
+        else
+            kept=1
+        fi
+    done < <(ls -t -- "${root}")
+}
+
 if (( print_key )); then
     cache_key "$1"
     exit 0
@@ -128,29 +153,59 @@ cleanup() {
     rm -rf -- "${link_tmp}"
 }
 
+# The link runs in its own process group (set -m below), so the whole of it --
+# icpx, llvm-foreach and up to N ocloc jobs -- stops together rather than
+# leaving ocloc orphaned and writing into a deleted directory. Ninja runs each
+# command as a process-group leader and signals that group, which reaches this
+# launcher; the launcher passes it on.
 on_signal() {
+    local status="$1" waited=0
     if [[ -n "${child}" ]]; then
-        kill -TERM "${child}" 2>/dev/null || true
+        kill -TERM -- "-${child}" 2>/dev/null || true
+        while kill -0 -- "-${child}" 2>/dev/null && (( waited < 50 )); do
+            sleep 0.1
+            waited=$(( waited + 1 ))
+        done
+        kill -KILL -- "-${child}" 2>/dev/null || true
         wait "${child}" 2>/dev/null || true
     fi
     cleanup
-    exit 143
+    exit "${status}"
 }
 
 trap cleanup EXIT
-trap on_signal INT TERM HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+trap 'on_signal 129' HUP
 
 if (( ocloc_cache )); then
     cache_root="${GGML_SYCL_OCLOC_CACHE_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/ggml-sycl-ocloc}"
-    cache_dir="${cache_root}/$(cache_key "$1")"
-    mkdir -p "${cache_dir}"
-    if [[ ! -f "${cache_dir}/KEY" ]]; then
-        cache_key_description "$1" > "${link_tmp}/KEY"
-        mv -f "${link_tmp}/KEY" "${cache_dir}/KEY"
+    cache_name="$(cache_key "$1")"
+    cache_dir="${cache_root}/${cache_name}"
+    min_free="${GGML_SYCL_OCLOC_CACHE_MIN_FREE:-4294967296}"
+    mkdir -p "${cache_root}"
+    prune_cache_keys "${cache_root}" "${cache_name}"
+    free_kb="$(df -Pk -- "${cache_root}" | awk 'NR == 2 { print $4 }')"
+    if (( ${free_kb:-0} * 1024 < min_free )); then
+        # Too little room to grow the cache. The link still runs with a NEO
+        # cache so -allow_caching has somewhere to write (without one ocloc
+        # leaves an empty ./ocloc_cache in the build directory), but a
+        # throwaway one that goes with the private TMPDIR.
+        echo "sycl-device-link.sh: $(( free_kb / 1024 )) MB free under ${cache_root}," \
+            "below GGML_SYCL_OCLOC_CACHE_MIN_FREE=${min_free}; linking without the persistent ocloc cache" >&2
+        cache_dir="${link_tmp}/ocloc-cache"
+        mkdir -p "${cache_dir}"
+    else
+        mkdir -p "${cache_dir}"
+        touch "${cache_dir}"
+        if [[ ! -f "${cache_dir}/KEY" ]]; then
+            cache_key_description "$1" > "${link_tmp}/KEY"
+            mv -f "${link_tmp}/KEY" "${cache_dir}/KEY"
+        fi
     fi
     export NEO_CACHE_PERSISTENT=1
     export NEO_CACHE_DIR="${cache_dir}"
-    export NEO_CACHE_MAX_SIZE="${GGML_SYCL_OCLOC_CACHE_MAX_SIZE:-8589934592}"
+    export NEO_CACHE_MAX_SIZE="${GGML_SYCL_OCLOC_CACHE_MAX_SIZE:-4294967296}"
 fi
 
 if [[ -n "${GGML_SYCL_DEVICE_LINK_INVENTORY:-}" ]]; then
@@ -186,8 +241,13 @@ fi
 
 export TMPDIR="${link_tmp}"
 
+# Job control gives the link its own process group, and also keeps bash from
+# starting it with SIGINT and SIGQUIT ignored, as it does for background
+# commands in a non-interactive shell.
+set -m
 "$@" &
 child=$!
+set +m
 rc=0
 wait "${child}" || rc=$?
 child=""

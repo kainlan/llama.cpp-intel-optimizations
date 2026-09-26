@@ -7,11 +7,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT="${ROOT_DIR}/scripts/sycl-tmp-leak-report.sh"
 TMP="$(mktemp -d)"
 holder=""
+env_holder=""
 cleanup() {
-    if [[ -n "${holder}" ]]; then
-        kill "${holder}" 2>/dev/null || true
-        wait "${holder}" 2>/dev/null || true
-    fi
+    local pid
+    for pid in ${holder} ${env_holder}; do
+        kill "${pid}" 2>/dev/null || true
+        wait "${pid}" 2>/dev/null || true
+    done
     rm -rf "${TMP}"
 }
 trap cleanup EXIT
@@ -24,7 +26,7 @@ fail() {
 D="${TMP}/tmpdir"
 mkdir -p "${D}/icpx-0123456789/sub" "${D}/icpx3fa9c2" "${D}/icpx-held/work" \
     "${D}/icpx-young" "${D}/sycl-device-link.AbCdEf" "${D}/sycl-build.GhIjKl" \
-    "${D}/project-scratch"
+    "${D}/sycl-build.EnvHld" "${D}/project-scratch"
 echo x > "${D}/icpx-0123456789/sub/img.out"
 head -c 4096 /dev/zero > "${D}/ggml-sycl-bmg_g21-0ed5da-32c8d7.out"
 echo x > "${D}/test-foo-48370c-04ef8e.out"
@@ -44,6 +46,19 @@ for _ in $(seq 100); do
     sleep 0.05
 done
 [[ "$(readlink "/proc/${holder}/cwd")" == "${D}/icpx-held/work" ]] || fail "holder did not start"
+
+# A live process that only names a stale-looking directory as its TMPDIR, the
+# way sycl-build.sh hands its private directory to the whole build: its cwd,
+# command line and open files point elsewhere.
+(cd "${TMP}" && TMPDIR="${D}/sycl-build.EnvHld" exec sleep 300) &
+env_holder=$!
+for _ in $(seq 100); do
+    tr '\0' '\n' < "/proc/${env_holder}/environ" 2>/dev/null |
+        grep -qxF "TMPDIR=${D}/sycl-build.EnvHld" && break
+    sleep 0.05
+done
+tr '\0' '\n' < "/proc/${env_holder}/environ" | grep -qxF "TMPDIR=${D}/sycl-build.EnvHld" ||
+    fail "env holder did not start"
 
 before="$(find "${D}" | sort | md5sum)"
 out="$(bash "${REPORT}" "${D}")"
@@ -77,6 +92,9 @@ out0="$(bash "${REPORT}" "${D}" 60)"
 printf '%s\n' "${out0}" | grep -qF "${D}/icpx-young" || fail "min-age 60 misses a 2 h old dir"
 if printf '%s\n' "${out0}" | grep -qF "${D}/icpx-held"; then
     fail "listed a directory a live process is using"
+fi
+if printf '%s\n' "${out0}" | grep -qF "${D}/sycl-build.EnvHld"; then
+    fail "listed a directory a live process has as its TMPDIR"
 fi
 
 echo "test-sycl-tmp-leak-report: PASS"

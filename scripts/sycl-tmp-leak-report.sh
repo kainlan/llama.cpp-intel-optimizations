@@ -15,7 +15,9 @@
 #                           named by clang's temporary-file pattern
 # A candidate is reported only if it is older than min-age AND no process
 # visible to this user refers to it through its command line, working
-# directory or open files -- an in-flight build is never listed.
+# directory, open files or TMPDIR/TMP/TEMP environment -- an in-flight build is
+# never listed, including one between steps that holds nothing open in its
+# private TMPDIR yet.
 # Output: <size-MB>\t<age-hours>\t<path> per entry, then a total.
 set -euo pipefail
 
@@ -29,6 +31,7 @@ trap 'rm -rf "${work}"' EXIT
 for proc in /proc/[0-9]*; do
     tr '\0' '\n' 2>/dev/null < "${proc}/cmdline" || true
     readlink "${proc}/cwd" 2>/dev/null || true
+    sed -z -n 's/^\(TMPDIR\|TMP\|TEMP\)=//p' 2>/dev/null < "${proc}/environ" | tr '\0' '\n' || true
     find "${proc}/fd" -mindepth 1 -maxdepth 1 -printf '%l\n' 2>/dev/null || true
 done | awk -v d="${dir}/" '{
     i = index($0, d)

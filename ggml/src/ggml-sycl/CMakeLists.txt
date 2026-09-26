@@ -648,8 +648,10 @@ endif()
 #    NEO_CACHE_PERSISTENT=1 in its environment, which the launcher below sets
 #    together with a toolchain-keyed NEO_CACHE_DIR. Without that environment
 #    the flag caches nothing, so it is only added where the launcher runs.
-# 3. A Ninja pool bounding concurrent device links. A full build otherwise
-#    starts ~48 whole-backend links at once, which all miss the cache together.
+# 3. A Ninja pool bounding concurrent device links. A full build has ~49 of
+#    them, and without the pool only ninja -j (nproc by default) caps how many
+#    run at once; with it the pool depth does. Links started together also
+#    miss the cache together.
 #    Memory, not cores, sets the depth: one link is N ocloc jobs x ~1.4 GB plus
 #    the whole-module llvm-link/sycl-post-link, ~12-13 GB at N=8, so the default
 #    depth of 2 bounds device linking at ~26 GB of this host's 246 GB.
@@ -660,8 +662,9 @@ option(GGML_SYCL_OCLOC_CACHE
 set(GGML_SYCL_DEVICE_LINK_POOL "2" CACHE STRING
     "Maximum concurrent SYCL device links under Ninja")
 
+set(_ggml_sycl_device_link_options)
 if (GGML_SYCL_DEVICE_LINK_JOBS GREATER 1)
-    target_link_options(ggml-sycl PRIVATE "-fsycl-max-parallel-link-jobs=${GGML_SYCL_DEVICE_LINK_JOBS}")
+    list(APPEND _ggml_sycl_device_link_options "-fsycl-max-parallel-link-jobs=${GGML_SYCL_DEVICE_LINK_JOBS}")
 endif()
 
 # The launcher (sycl-device-link.sh) also gives each link a private TMPDIR that
@@ -671,12 +674,13 @@ if (NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
     set(_ggml_sycl_device_link_launcher "${CMAKE_CURRENT_SOURCE_DIR}/sycl-device-link.sh")
     if (GGML_SYCL_OCLOC_CACHE AND GGML_SYCL_BMG_AOT_ENABLED)
         list(APPEND _ggml_sycl_device_link_launcher --ocloc-cache)
-        target_link_options(ggml-sycl PRIVATE
+        list(APPEND _ggml_sycl_device_link_options
             "SHELL:-Xsycl-target-backend=intel_gpu_bmg_g21 -allow_caching"
             "SHELL:-Xsycl-target-backend=intel_gpu_bmg_g31 -allow_caching")
     endif()
     list(APPEND _ggml_sycl_device_link_launcher --)
     set_property(GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_LAUNCHER "${_ggml_sycl_device_link_launcher}")
+    set_property(GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_OPTIONS "${_ggml_sycl_device_link_options}")
     if (CMAKE_GENERATOR MATCHES "Ninja")
         set_property(GLOBAL APPEND PROPERTY JOB_POOLS ggml_sycl_device_link=${GGML_SYCL_DEVICE_LINK_POOL})
     endif()
@@ -692,8 +696,11 @@ if (NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
     # Consumers of ggml-sycl-private-fixtures inherit the backend objects and
     # its link options through an INTERFACE target, which cannot carry these
     # target properties, and they are declared in several directories. Route
-    # them once every directory has been processed. tests/
-    # test-sycl-device-link-routing.py checks the result against build.ninja.
+    # them once every directory has been processed. A target that does its own
+    # device link (-fsycl-targets in its link options, e.g. the
+    # GGML_SYCL_BUILD_XMX_TESTS executables) inherits neither, so it also gets
+    # the link options. tests/test-sycl-device-link-routing.py checks the result
+    # against build.ninja using the same -fsycl-targets criterion.
     function(ggml_sycl_route_fixture_device_links dir)
         get_property(_targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
         foreach(_target IN LISTS _targets)
@@ -701,8 +708,17 @@ if (NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
             if (NOT _type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
                 continue()
             endif()
+            get_target_property(_routed ${_target} CXX_LINKER_LAUNCHER)
+            if (_routed)
+                continue()
+            endif()
             get_target_property(_libs ${_target} LINK_LIBRARIES)
+            get_target_property(_link_options ${_target} LINK_OPTIONS)
             if (_libs AND "ggml-sycl-private-fixtures" IN_LIST _libs)
+                ggml_sycl_route_device_link(${_target})
+            elseif (_link_options AND _link_options MATCHES "-fsycl-targets=")
+                get_property(_options GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_OPTIONS)
+                target_link_options(${_target} PRIVATE ${_options})
                 ggml_sycl_route_device_link(${_target})
             endif()
         endforeach()
@@ -716,6 +732,7 @@ if (NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
     cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
         CALL ggml_sycl_route_fixture_device_links "${CMAKE_SOURCE_DIR}")
 endif()
+target_link_options(ggml-sycl PRIVATE ${_ggml_sycl_device_link_options})
 
 # Link against oneDNN (primary math backend for Intel targets)
 set(GGML_SYCL_DNNL 0)

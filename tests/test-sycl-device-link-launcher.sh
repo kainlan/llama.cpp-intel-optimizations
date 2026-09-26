@@ -24,7 +24,8 @@ mkdir -p "${MOCK_BIN}" "${PARENT_TMP}" "${CACHE_ROOT}" "${LOG}"
 # The mock compiler records what the launcher handed it, then behaves as asked:
 # `--version` prints ${MOCK_COMPILER_VERSION}; otherwise it creates a file in
 # its TMPDIR (as icpx does), optionally runs ocloc like llvm-foreach would,
-# optionally sleeps so a signal can land, and exits ${MOCK_RC}.
+# optionally waits on a sleeping grandchild (as icpx waits on llvm-foreach and
+# ocloc) so a signal can land, and exits ${MOCK_RC}.
 cat > "${MOCK_BIN}/mock-icpx" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--version" ]]; then
@@ -45,8 +46,10 @@ if [[ -n "${MOCK_RUN_OCLOC:-}" ]]; then
         -output_no_suffix -spirv_input -device bmg_g21 -allow_caching || exit 9
 fi
 if [[ -n "${MOCK_SLEEP:-}" ]]; then
-    echo "$$" > "${MOCK_PID_FILE}"
-    sleep "${MOCK_SLEEP}"
+    sleep "${MOCK_SLEEP}" &
+    echo "$! $$" > "${MOCK_PID_FILE}.tmp"
+    mv "${MOCK_PID_FILE}.tmp" "${MOCK_PID_FILE}"
+    wait
 fi
 exit "${MOCK_RC:-0}"
 EOF
@@ -153,28 +156,97 @@ grep -Pq "^bmg_g21\t${spv_md5}\t${out_md5}\t" "${inventory}" || fail "inventory 
 assert_parent_tmp_empty "inventory"
 
 # 6. A signal to the launcher (ninja interrupted, a harness kill) stops the
-#    link and still removes the private temp directory -- the leak this
-#    launcher exists to close.
-pid_file="${TMP}/child.pid"
-# Started directly rather than through launch(): a backgrounded shell
-# function runs in a subshell, and $! would name that subshell, not the
-# launcher.
-env "${LAUNCH_ENV[@]}" MOCK_SLEEP=30 MOCK_PID_FILE="${pid_file}" "${LAUNCHER}" -- "${MOCK_BIN}/mock-icpx" &
-launcher_pid=$!
-for _ in $(seq 100); do
-    [[ -s "${pid_file}" ]] && break
-    sleep 0.1
+#    whole link -- icpx and the llvm-foreach/ocloc processes under it, up to
+#    8 x 1.4 GB of them -- exits with the signal's conventional status, and
+#    still removes the private temp directory, the leak this launcher exists
+#    to close.
+signal_case() {
+    local sig="$1" want_rc="$2" pid_file="${TMP}/child-$1.pid" launcher_pid rc=0 grandchild_pid child_pid pid
+    # Started directly rather than through launch(): a backgrounded shell
+    # function runs in a subshell, and $! would name that subshell, not the
+    # launcher. set -m starts it with default signal dispositions, as ninja
+    # does; a plain background job would inherit SIGINT ignored, and bash
+    # cannot trap a signal that was ignored on entry.
+    set -m
+    env "${LAUNCH_ENV[@]}" MOCK_SLEEP=30 MOCK_PID_FILE="${pid_file}" "${LAUNCHER}" -- "${MOCK_BIN}/mock-icpx" &
+    launcher_pid=$!
+    set +m
+    for _ in $(seq 100); do
+        [[ -s "${pid_file}" ]] && break
+        sleep 0.1
+    done
+    [[ -s "${pid_file}" ]] || fail "${sig}: mock link never started"
+    read -r grandchild_pid child_pid < "${pid_file}"
+    local start_ms elapsed_ms
+    start_ms=$(( $(date +%s%N) / 1000000 ))
+    kill "-${sig}" "${launcher_pid}"
+    wait "${launcher_pid}" || rc=$?
+    elapsed_ms=$(( $(date +%s%N) / 1000000 - start_ms ))
+    [[ ${rc} -eq ${want_rc} ]] || fail "${sig}: launcher exited ${rc}, want ${want_rc}"
+    # The mock link dies on the first TERM; waiting out its 30 s sleep, or the
+    # launcher's 5 s KILL fallback, means the signal did not reach the group.
+    (( elapsed_ms < 3000 )) || fail "${sig}: launcher took ${elapsed_ms} ms to stop the link"
+    for pid in "${child_pid}" "${grandchild_pid}"; do
+        if kill -0 "${pid}" 2>/dev/null; then
+            kill -KILL "${child_pid}" "${grandchild_pid}" 2>/dev/null || true
+            fail "${sig}: process ${pid} of the link survived the launcher (child ${child_pid}, grandchild ${grandchild_pid})"
+        fi
+    done
+    assert_parent_tmp_empty "SIG${sig}"
+}
+signal_case TERM 143
+signal_case INT 130
+signal_case HUP 129
+
+# 7. Each toolchain key gets its own directory, so an upgrade strands the old
+#    one. A link keeps its own key and the most recently used other one (a
+#    rollback target) and removes the rest -- only launcher-made directories,
+#    recognised by name and KEY file.
+PRUNE_ROOT="${TMP}/prune-cache"
+mkdir -p "${PRUNE_ROOT}/ocloc-26.20.1_00000000000000aa" "${PRUNE_ROOT}/ocloc-26.22.1_00000000000000bb" \
+    "${PRUNE_ROOT}/ocloc-26.18.1_00000000000000cc" "${PRUNE_ROOT}/ocloc-26.10.1_00000000000000dd" \
+    "${PRUNE_ROOT}/notes"
+for d in ocloc-26.20.1_00000000000000aa ocloc-26.22.1_00000000000000bb ocloc-26.18.1_00000000000000cc; do
+    echo key > "${PRUNE_ROOT}/${d}/KEY"
 done
-[[ -s "${pid_file}" ]] || fail "mock link never started"
-child_pid="$(cat "${pid_file}")"
-kill -TERM "${launcher_pid}"
-rc=0
-wait "${launcher_pid}" || rc=$?
-[[ ${rc} -ne 0 ]] || fail "interrupted launcher reported success"
-if kill -0 "${child_pid}" 2>/dev/null; then
-    kill -KILL "${child_pid}"
-    fail "link process survived the launcher's SIGTERM"
-fi
-assert_parent_tmp_empty "SIGTERM"
+touch -d '5 days ago' "${PRUNE_ROOT}/ocloc-26.20.1_00000000000000aa"
+touch -d '1 day ago' "${PRUNE_ROOT}/ocloc-26.22.1_00000000000000bb"
+touch -d '9 days ago' "${PRUNE_ROOT}/ocloc-26.18.1_00000000000000cc"
+touch -d '9 days ago' "${PRUNE_ROOT}/ocloc-26.10.1_00000000000000dd"
+launch env GGML_SYCL_OCLOC_CACHE_ROOT="${PRUNE_ROOT}" "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" ||
+    fail "prune run failed"
+kept="$(cd "${PRUNE_ROOT}" && ls | sort | tr '\n' ' ')"
+want="$(printf '%s\n' "$(key)" ocloc-26.22.1_00000000000000bb ocloc-26.10.1_00000000000000dd notes | sort | tr '\n' ' ')"
+[[ "${kept}" == "${want}" ]] || fail "prune kept '${kept}', want '${want}'"
+
+# "Most recently used" is use, not creation: a link refreshes its own key's
+# directory, so after the next toolchain change that one is the one kept.
+touch -d '10 days ago' "${PRUNE_ROOT}/$(key)"
+launch env GGML_SYCL_OCLOC_CACHE_ROOT="${PRUNE_ROOT}" "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" ||
+    fail "prune reuse run failed"
+launch env GGML_SYCL_OCLOC_CACHE_ROOT="${PRUNE_ROOT}" MOCK_COMPILER_VERSION='mock icpx 2.0' \
+    "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" || fail "prune upgrade run failed"
+kept="$(cd "${PRUNE_ROOT}" && ls | sort | tr '\n' ' ')"
+want="$(printf '%s\n' "$(key env MOCK_COMPILER_VERSION='mock icpx 2.0')" "$(key)" \
+    ocloc-26.10.1_00000000000000dd notes | sort | tr '\n' ' ')"
+[[ "${kept}" == "${want}" ]] || fail "after upgrade prune kept '${kept}', want '${want}'"
+
+# 8. Below the free-space floor the link still gets a working NEO cache, but
+#    a throwaway one inside its private TMPDIR, so nothing grows on the full
+#    filesystem and no stray ./ocloc_cache appears; it says so on stderr.
+LOW_ROOT="${TMP}/low-cache"
+launch env GGML_SYCL_OCLOC_CACHE_ROOT="${LOW_ROOT}" GGML_SYCL_OCLOC_CACHE_MIN_FREE=1152921504606846976 \
+    "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" 2> "${LOG}/low-stderr" || fail "low-space run failed"
+grep -q '^NEO_CACHE_PERSISTENT=1$' "${LOG}/env" || fail "low space: NEO cache not set up"
+grep -q "^NEO_CACHE_DIR=${PARENT_TMP}/sycl-device-link\.[^/]*/" "${LOG}/env" ||
+    fail "low space: cache not in the private TMPDIR: $(cat "${LOG}/env")"
+[[ -z "$(ls -A "${LOW_ROOT}" 2>/dev/null)" ]] || fail "low space: cache root grew: $(ls -A "${LOW_ROOT}")"
+grep -q 'free' "${LOG}/low-stderr" || fail "low space: no warning: $(cat "${LOG}/low-stderr")"
+assert_parent_tmp_empty "low space"
+
+# ...and at a floor of 0 the same root is used normally.
+launch env GGML_SYCL_OCLOC_CACHE_ROOT="${LOW_ROOT}" GGML_SYCL_OCLOC_CACHE_MIN_FREE=0 \
+    "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" || fail "floor-0 run failed"
+grep -q "^NEO_CACHE_DIR=${LOW_ROOT}/$(key)$" "${LOG}/env" || fail "floor 0: persistent cache not used"
 
 echo "test-sycl-device-link-launcher: PASS" >&2

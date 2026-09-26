@@ -10,8 +10,14 @@ and fails if any device-linking edge escaped that pass -- for instance a new
 consumer that links the objects some other way.
 
 A link edge is device-linking when its link flags carry -fsycl-targets or its
-inputs include ggml-sycl backend objects. Exit 77 when the build directory is
-not a Ninja SYCL build.
+inputs include ggml-sycl backend objects. Each such edge must also carry the
+link options the speed-up rests on:
+  - -fsycl-max-parallel-link-jobs=<GGML_SYCL_DEVICE_LINK_JOBS> when that is > 1;
+  - -allow_caching for both BMG targets exactly when its launcher runs with
+    --ocloc-cache. Without the launcher's NEO environment the flag caches
+    nothing and leaves an empty ./ocloc_cache behind; without the flag the
+    launcher's cache is never consulted.
+Exit 77 when the build directory is not a Ninja SYCL build.
 """
 
 import os
@@ -19,6 +25,7 @@ import re
 import sys
 
 POOL = "ggml_sycl_device_link"
+ALLOW_CACHING = tuple(f"-Xsycl-target-backend=intel_gpu_bmg_{t} -allow_caching" for t in ("g21", "g31"))
 LAUNCHER = "sycl-device-link.sh"
 BACKEND_OBJECT_DIRS = ("/ggml-sycl.dir/", "/ggml-sycl-q1-route-test-objects.dir/")
 
@@ -62,6 +69,18 @@ def is_device_link(edge):
     return any(d in inp for inp in edge["inputs"] for d in BACKEND_OBJECT_DIRS)
 
 
+def cmake_cache(build_dir):
+    values = {}
+    path = os.path.join(build_dir, "CMakeCache.txt")
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(r"^([A-Za-z0-9_]+):[A-Z]+=(.*)$", line.rstrip("\n"))
+                if m:
+                    values[m.group(1)] = m.group(2)
+    return values
+
+
 def main():
     build_dir = sys.argv[1] if len(sys.argv) > 1 else "."
     build_ninja = os.path.join(build_dir, "build.ninja")
@@ -79,6 +98,12 @@ def main():
         print(f"SKIP: no SYCL device-link edges in {build_ninja}")
         return 77
 
+    cache = cmake_cache(build_dir)
+    try:
+        jobs = int(cache.get("GGML_SYCL_DEVICE_LINK_JOBS", "1"))
+    except ValueError:
+        jobs = 1
+
     bad = []
     for edge in device_links:
         target = edge["outputs"][0]
@@ -87,6 +112,15 @@ def main():
         command = rules.get(edge["rule"], "")
         if not re.search(r"\S*" + re.escape(LAUNCHER) + r"\b", command):
             bad.append(f"{target}: rule {edge['rule']} does not run {LAUNCHER}")
+        flags = edge["vars"].get("LINK_FLAGS", "")
+        if jobs > 1 and f"-fsycl-max-parallel-link-jobs={jobs}" not in flags:
+            bad.append(f"{target}: missing -fsycl-max-parallel-link-jobs={jobs}")
+        cached = "--ocloc-cache" in command
+        caching_flags = [f for f in ALLOW_CACHING if f in flags]
+        if cached and len(caching_flags) != len(ALLOW_CACHING):
+            bad.append(f"{target}: launcher runs --ocloc-cache but the link lacks -allow_caching for both BMG targets")
+        if caching_flags and not cached:
+            bad.append(f"{target}: -allow_caching without the launcher's --ocloc-cache environment")
 
     pooled = [e for e in edges if e["vars"].get("pool") == POOL]
     stray = [e["outputs"][0] for e in pooled if not is_device_link(e)]
