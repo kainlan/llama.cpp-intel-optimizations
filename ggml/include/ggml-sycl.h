@@ -469,22 +469,24 @@ GGML_BACKEND_API bool ggml_backend_sycl_auto_ubatch_enabled(void);
 // ~/.cache/llama.cpp/sycl-tuning/<sanitized device name>-ubatch.json (see
 // tuning-cache-io.hpp's "Ubatch Cache Entry (v2)" section for the format)
 // that lets a repeat start of the SAME device+model+context shape skip
-// sycl_select_auto_ubatch()'s ladder entirely. `device` is the same logical
-// SYCL device index used throughout this header (indexes
-// ggml_sycl_info().devices[]); the device name and driver version making up
-// the on-disk key are read from there, never passed in, so callers never
-// duplicate that lookup. `model_name`/`model_size`/`model_hash` identify the
+// sycl_select_auto_ubatch()'s ladder entirely. `devices[0..n_devices)` are
+// the logical SYCL device indices (ggml_sycl_info().devices[]) of every SYCL
+// backend the context has, in order; the entry is filed under devices[0].
+// The backend extends that list with any GPU the scheduler hides but the
+// placement planner may still use (a level_zero:0,1 run without
+// GGML_SYCL_SPLIT_RATIO/TENSOR_SPLIT exposes only device 0, yet places
+// layers and KV on device 1), and keys each participating device's name,
+// driver version, VRAM budget percentage and external headroom. None of
+// those are passed in, so callers never duplicate that lookup; keying on the
+// context's own backends alone made such a split and its first card alone
+// share one entry. `model_name`/`model_size`/`model_hash` identify the
 // exact set of loaded tensors (GGUF general.name, llama_model::size()'s
 // total tensor bytes, and a cheap FNV-1a hash over each tensor's (name,
 // byte size)) -- the same model file copied elsewhere hits; a re-quantised
 // file changes tensor byte sizes and so misses. `n_seq_max`/`type_k`/
 // `type_v` round out the shapes that can change which
 // ladder candidates fit without changing anything the rest of the key
-// tracks. `device_set_hash` (same finding) is a hash over every SYCL
-// device's dev_index this context actually uses, in order -- `device`
-// alone names only the FIRST one, so a single-GPU and a multi-GPU run that
-// both start with the same device 0 would otherwise share one entry even
-// though the real demand differs. `kv_unified` (llama.cpp-3aos) is
+// tracks. `kv_unified` (llama.cpp-3aos) is
 // cparams.kv_unified -- once KV sizing depends on it (see
 // kv_layer_bytes_for_kind(), unified-cache.hpp), two contexts differing
 // only in that flag need different auto n_ubatch candidates, so they must
@@ -495,7 +497,8 @@ GGML_BACKEND_API bool ggml_backend_sycl_auto_ubatch_enabled(void);
 // have different KV demand. All pointer fields are borrowed: valid
 // only for the duration of the call, never retained.
 struct ggml_sycl_ubatch_cache_key {
-    int          device;
+    const int *  devices;
+    uint32_t     n_devices;
     const char * model_name;
     uint64_t     model_size;
     uint64_t     model_hash;
@@ -505,7 +508,6 @@ struct ggml_sycl_ubatch_cache_key {
     uint32_t     n_seq_max;
     int32_t      type_k;
     int32_t      type_v;
-    uint32_t     device_set_hash;
     bool         kv_unified;
     bool         swa_full;
 };
@@ -535,7 +537,7 @@ GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_path(int device, char * buf
 // routing ceiling") from one that merely lost a transient race, and decides
 // from that whether to trust the cached value outright or resume searching
 // above it. Returns false (leaving *n_ubatch and reason_buf untouched) on a
-// cache miss, a disabled cache, an out-of-range device, or an
+// cache miss, a disabled cache, an empty or out-of-range device list, or an
 // unreadable/corrupt/wrong-version file -- the caller's ladder trial
 // tolerates every one of those identically (a cold cache), so this never
 // throws and never distinguishes them.
@@ -553,8 +555,8 @@ GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_lookup(const struct ggml_sy
 // transient one. That caller never passes "cached" (a hit that produces an
 // unchanged outcome does not re-store at all) or "transaction busy"/"not
 // the published model" (pure races it explicitly skips storing). Returns
-// false (never throws) on a disabled cache, an out-of-range device, or a
-// write failure -- the caller logs one WARN and continues; a failed store
+// false (never throws) on a disabled cache, an empty or out-of-range device
+// list, or a write failure -- the caller logs one WARN and continues; a failed store
 // never blocks inference.
 GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_store(const struct ggml_sycl_ubatch_cache_key * key,
                                                            uint32_t                                  n_ubatch,

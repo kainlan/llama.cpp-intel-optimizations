@@ -566,12 +566,13 @@ TEST(atomic_write) {
 // ever running against the real cache directory unsandboxed.
 // =============================================================================
 
-// Test: CACHE_VERSION was bumped to 4 (llama.cpp-uajm, UbatchCacheKey::
-// swa_full) -- v1 stays reserved for the pre-existing matmul
-// dispatch-tuning format alone, v2 for the pre-kv_unified ubatch key shape,
-// v3 (llama.cpp-3aos) for the pre-swa_full one.
-TEST(cache_version_is_4) {
-    ASSERT(CACHE_VERSION == 4);
+// Test: CACHE_VERSION was bumped to 5 (llama.cpp-1oa3, a device_key that
+// names every participating device and its budget) -- v1 stays reserved for
+// the pre-existing matmul dispatch-tuning format alone, v2 for the
+// pre-kv_unified ubatch key shape, v3 (llama.cpp-3aos) for the pre-swa_full
+// one, v4 (llama.cpp-uajm) for the single-device device_key.
+TEST(cache_version_is_5) {
+    ASSERT(CACHE_VERSION == 5);
     return true;
 }
 
@@ -613,13 +614,12 @@ TEST(ubatch_key_equality) {
     b.flash_attn = !a.flash_attn;
     ASSERT(a != b);
 
-    // llama.cpp-7n6n: the four fields added to UbatchCacheKey must each
+    // llama.cpp-7n6n: the fields added to UbatchCacheKey must each
     // independently affect equality too.
-    a.n_seq_max       = 1;
-    a.type_k          = 1;  // GGML_TYPE_F16
-    a.type_v          = 1;
-    a.device_set_hash = 0xdeadbeefu;
-    b                 = a;
+    a.n_seq_max = 1;
+    a.type_k    = 1;  // GGML_TYPE_F16
+    a.type_v    = 1;
+    b           = a;
     ASSERT(a == b);
 
     b.n_seq_max = a.n_seq_max + 1;
@@ -629,9 +629,6 @@ TEST(ubatch_key_equality) {
     ASSERT(a != b);
     b        = a;
     b.type_v = a.type_v + 1;
-    ASSERT(a != b);
-    b                 = a;
-    b.device_set_hash = a.device_set_hash ^ 1u;
     ASSERT(a != b);
 
     // llama.cpp-3aos: kv_unified must independently affect equality too --
@@ -661,7 +658,7 @@ TEST(ubatch_kv_mode_json_roundtrip) {
         "{\"device_key\":\"Dev@1.0\",\"model_name\":\"mode-regression\","
         "\"model_size\":4096,\"model_hash\":17,\"n_ctx\":4096,\"n_batch\":2048,"
         "\"flash_attn\":true,\"n_seq_max\":4,\"type_k\":1,\"type_v\":1,"
-        "\"device_set_hash\":23,\"swa_full\":false,\"kv_unified\":";
+        "\"swa_full\":false,\"kv_unified\":";
     const UbatchCacheKey separate = ubatch_key_from_json(prefix + "false}");
     const UbatchCacheKey unified  = ubatch_key_from_json(prefix + "true}");
     // Positive parse controls must pass before the mode distinction is tested.
@@ -691,7 +688,7 @@ TEST(ubatch_swa_full_json_roundtrip) {
         "{\"device_key\":\"Dev@1.0\",\"model_name\":\"swa-full-regression\","
         "\"model_size\":4096,\"model_hash\":17,\"n_ctx\":4096,\"n_batch\":2048,"
         "\"flash_attn\":true,\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,"
-        "\"device_set_hash\":23,\"kv_unified\":false,\"swa_full\":";
+        "\"kv_unified\":false,\"swa_full\":";
     const UbatchCacheKey windowed = ubatch_key_from_json(prefix + "false}");
     const UbatchCacheKey full     = ubatch_key_from_json(prefix + "true}");
     ASSERT(windowed.model_name == "swa-full-regression");
@@ -887,6 +884,38 @@ TEST(ubatch_cache_v3_file_rejected) {
       << "\"model_hash\":0,\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":false,\"n_seq_max\":1,"
       << "\"type_k\":0,\"type_v\":0,\"device_set_hash\":0,\"kv_unified\":false},\"n_ubatch\":512,"
       << "\"reason\":\"ladder\",\"created\":\"2026-09-17T06:00:00Z\"}]\n";
+    f << "}\n";
+    f.close();
+
+    std::vector<UbatchCacheEntry> loaded;
+    bool                          result = load_ubatch_cache(cache_dir, device_name, loaded);
+    ASSERT(result == false);
+    ASSERT(loaded.empty());
+
+    std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// Test: a v4 ubatch cache file (the pre-llama.cpp-1oa3 shape: a device_key
+// naming one card, plus an index-only device_set_hash) is rejected now that
+// CACHE_VERSION is 5. Without the bump, the entry a level_zero:0 run stored
+// would still be read back for a collapsed level_zero:0,1 split: both runs
+// file under the first card, and v4 keyed them identically.
+TEST(ubatch_cache_v4_file_rejected) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_v4_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchV4Device_" + std::to_string(getpid());
+
+    create_dir_recursive(cache_dir);
+    std::string   path = get_ubatch_cache_file(cache_dir, device_name);
+    std::ofstream f(path);
+    f << "{\n";
+    f << "  \"version\": 4,\n";
+    f << "  \"device\": \"" << device_name << "\",\n";
+    f << "  \"entries\": [{\"key\":{\"device_key\":\"Dev@1.0\",\"model_name\":\"m\",\"model_size\":0,"
+      << "\"model_hash\":0,\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":false,\"n_seq_max\":1,"
+      << "\"type_k\":0,\"type_v\":0,\"device_set_hash\":84696351,\"kv_unified\":false,\"swa_full\":false},"
+      << "\"n_ubatch\":2048,\"reason\":\"ladder exhausted\",\"created\":\"2026-09-25T00:00:00Z\"}]\n";
     f << "}\n";
     f.close();
 
@@ -1128,7 +1157,7 @@ TEST(ubatch_cache_oversized_digit_no_ub) {
              "  \"entries\": [\n"
              "    {\"device_key\":\"Dev@1.0\",\"model_name\":\"m\",\"model_size\":0,\"model_hash\":0,"
              "\"n_ctx\":123456789012345678901234567890,\"n_batch\":2048,\"flash_attn\":false,"
-             "\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,\"device_set_hash\":0,"
+             "\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,"
              "\"n_ubatch\":512,\"reason\":\"ladder exhausted\",\"created\":\"2026-09-12T00:00:00Z\"}\n"
              "  ]\n"
              "}\n";
@@ -1228,6 +1257,123 @@ TEST(ubatch_cache_u64_hash_boundary_roundtrip) {
     return true;
 }
 
+// The participating-device-set half of the key. The identities below mirror
+// this host: logical 0 = B70, logical 1 = B50 (logical 1 is the iGPU in the
+// "different second card" case). A level_zero:0,1 run without
+// GGML_SYCL_SPLIT_RATIO/TENSOR_SPLIT exposes only device 0 to the scheduler,
+// while the placement planner still puts layers and KV on device 1.
+static UbatchDeviceIdentity ubatch_test_identity(const char * name, int budget_pct) {
+    UbatchDeviceIdentity id;
+    id.device_name       = name;
+    id.driver_version    = "1.17.39395+13";
+    id.budget_pct        = budget_pct;
+    id.external_headroom = 2048ull << 20;
+    return id;
+}
+
+static UbatchDeviceTopology ubatch_test_topology(std::vector<int> scheduler_devices,
+                                                 int              scheduler_visible_count,
+                                                 int              total_gpu_count,
+                                                 bool             hidden_gpus_participate) {
+    UbatchDeviceTopology topo;
+    topo.scheduler_devices       = std::move(scheduler_devices);
+    topo.scheduler_visible_count = scheduler_visible_count;
+    topo.total_gpu_count         = total_gpu_count;
+    topo.hidden_gpus_participate = hidden_gpus_participate;
+    return topo;
+}
+
+static const char * const k_b70  = "Intel(R) Arc(TM) Pro B70 Graphics";
+static const char * const k_b50  = "Intel(R) Arc(TM) Pro B50 Graphics";
+static const char * const k_igpu = "Intel(R) Graphics";
+
+// Test: a collapsed two-card split and the first card alone are different
+// device sets, at the same budget percentage. This is the dense case too:
+// the hidden-GPU gate (ggml_backend_sycl_moe_multi_gpu_requested()) is
+// total_gpu_count >= 2 whatever the model, so a dense Mistral
+// level_zero:0,1 run has hidden_gpus_participate=true and places a layer
+// block on the B50. test-sycl-auto-ubatch-source pins that gate's model
+// independence.
+TEST(ubatch_device_set_key_split_differs_from_first_card_alone) {
+    const std::string alone =
+        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, 1, false), { ubatch_test_identity(k_b70, 100) });
+    const std::string split =
+        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, 2, true),
+                              { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_b50, 100) });
+    ASSERT(!alone.empty());
+    ASSERT(split != alone);
+    return true;
+}
+
+// Test: the same device set under a different VRAM budget percentage (or a
+// different external headroom) fits differently, so it is a different key.
+TEST(ubatch_device_set_key_includes_budget) {
+    const UbatchDeviceTopology alone_topo = ubatch_test_topology({ 0 }, 1, 1, false);
+    const std::string          at_100     = ubatch_device_set_key(alone_topo, { ubatch_test_identity(k_b70, 100) });
+    const std::string          at_22      = ubatch_device_set_key(alone_topo, { ubatch_test_identity(k_b70, 22) });
+    ASSERT(at_100 != at_22);
+
+    UbatchDeviceIdentity other_headroom = ubatch_test_identity(k_b70, 100);
+    other_headroom.external_headroom += 1ull << 20;
+    ASSERT(ubatch_device_set_key(alone_topo, { other_headroom }) != at_100);
+
+    // A budget change on the SECOND card alone must move the key too.
+    const UbatchDeviceTopology split_topo = ubatch_test_topology({ 0 }, 1, 2, true);
+    const std::string          both_22 =
+        ubatch_device_set_key(split_topo, { ubatch_test_identity(k_b70, 22), ubatch_test_identity(k_b50, 22) });
+    const std::string b50_at_30 =
+        ubatch_device_set_key(split_topo, { ubatch_test_identity(k_b70, 22), ubatch_test_identity(k_b50, 30) });
+    ASSERT(both_22 != b50_at_30);
+    return true;
+}
+
+// Test: every participating device's identity is keyed, not just its index --
+// [B70, B50] and [B70, iGPU] share indices [0, 1].
+TEST(ubatch_device_set_key_identifies_every_device) {
+    const UbatchDeviceTopology visible_pair = ubatch_test_topology({ 0, 1 }, 2, 2, true);
+    const std::string          with_b50 =
+        ubatch_device_set_key(visible_pair, { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_b50, 100) });
+    const std::string with_igpu =
+        ubatch_device_set_key(visible_pair, { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_igpu, 100) });
+    ASSERT(with_b50 != with_igpu);
+    return true;
+}
+
+// Test: order is part of the set's identity, and identical inputs give an
+// identical key (the property a cache hit depends on).
+TEST(ubatch_device_set_key_order_and_stability) {
+    const std::vector<UbatchDeviceIdentity> ids = { ubatch_test_identity(k_b70, 100),
+                                                    ubatch_test_identity(k_b50, 100) };
+    const std::string forward  = ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, 2, true), ids);
+    const std::string reversed = ubatch_device_set_key(ubatch_test_topology({ 1, 0 }, 2, 2, true), ids);
+    ASSERT(forward != reversed);
+    ASSERT(forward == ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, 2, true), ids));
+    return true;
+}
+
+// Test: a hidden GPU that the placement planner does not use (multi-GPU
+// placement disabled) is not part of the set, so that run shares the
+// first-card-alone entry.
+TEST(ubatch_device_set_key_idle_hidden_gpu_is_not_keyed) {
+    const std::string alone =
+        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, 1, false), { ubatch_test_identity(k_b70, 100) });
+    const std::string idle_split =
+        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, 2, false),
+                              { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_b50, 100) });
+    ASSERT(idle_split == alone);
+    return true;
+}
+
+// Test: the participating list is the scheduler devices in order, then each
+// hidden physical GPU in index order, without repeating one.
+TEST(ubatch_participating_devices_order) {
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 1, 2, true)) == std::vector<int>{ 0, 1 }));
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 1, 3, true)) == std::vector<int>{ 0, 1, 2 }));
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 1, 2, false)) == std::vector<int>{ 0 }));
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 1, 0 }, 2, 2, true)) == std::vector<int>{ 1, 0 }));
+    return true;
+}
+
 // =============================================================================
 // Main test runner
 // =============================================================================
@@ -1273,7 +1419,7 @@ int main() {
     RUN_TEST(parse_string_edge_cases);
     RUN_TEST(atomic_write);
 
-    RUN_TEST(cache_version_is_4);
+    RUN_TEST(cache_version_is_5);
     RUN_TEST(ubatch_key_equality);
     RUN_TEST(ubatch_kv_mode_json_roundtrip);
     RUN_TEST(ubatch_swa_full_json_roundtrip);
@@ -1282,6 +1428,7 @@ int main() {
     RUN_TEST(ubatch_cache_v1_file_rejected);
     RUN_TEST(ubatch_cache_v2_file_rejected);
     RUN_TEST(ubatch_cache_v3_file_rejected);
+    RUN_TEST(ubatch_cache_v4_file_rejected);
     RUN_TEST(ubatch_cache_unwritable_dir);
     RUN_TEST(ubatch_cache_load_missing_file);
     RUN_TEST(ubatch_cache_string_escaping_roundtrip);
@@ -1291,6 +1438,12 @@ int main() {
     RUN_TEST(ubatch_cache_oversized_digit_no_ub);
     RUN_TEST(parse_u64_rejects_overflow);
     RUN_TEST(ubatch_cache_u64_hash_boundary_roundtrip);
+    RUN_TEST(ubatch_device_set_key_split_differs_from_first_card_alone);
+    RUN_TEST(ubatch_device_set_key_includes_budget);
+    RUN_TEST(ubatch_device_set_key_identifies_every_device);
+    RUN_TEST(ubatch_device_set_key_order_and_stability);
+    RUN_TEST(ubatch_device_set_key_idle_hidden_gpu_is_not_keyed);
+    RUN_TEST(ubatch_participating_devices_order);
 
     std::cout << "\n=== Summary ===\n";
     std::cout << "Passed: " << g_passed << ", Failed: " << g_failed << "\n";

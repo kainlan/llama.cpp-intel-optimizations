@@ -93,7 +93,14 @@ inline long sycl_tuning_getpid() {
 // then match a real swa_full=false lookup (or be the only entry consulted
 // for a swa_full=true raw-API context) although it was written before SWA
 // layers were sized by that flag at all.
-constexpr int CACHE_VERSION = 4;
+// v5 (llama.cpp-1oa3): UbatchCacheKey::device_key names every device whose
+// budget decides the fit -- including a GPU the scheduler hides but the
+// placement planner uses -- with each one's budget percentage and external
+// headroom, and device_set_hash (an index hash over the scheduler-visible
+// backends only) is gone. A v4 entry's device_key names one card, so a v4
+// B70-alone entry would still be read back for a collapsed level_zero:0,1
+// split; bumping rejects every v4 file instead.
+constexpr int CACHE_VERSION = 5;
 
 // =============================================================================
 // Path Utilities
@@ -517,9 +524,82 @@ inline TuningEntry entry_from_json(const std::string& json) {
 // load_cache() above.
 // =============================================================================
 
+// One participating device's budget-relevant identity. The device name fixes
+// the card's total VRAM, the driver version invalidates an entry across a
+// driver upgrade, and budget_pct/external_headroom are the two stable inputs
+// of that device's resolved VRAM budget (vram_budget_authority,
+// unified-cache.hpp). The third input, free VRAM at init, is deliberately
+// left out: it moves with every other tenant on the card, so keying on it
+// would make nearly every start a miss.
+struct UbatchDeviceIdentity {
+    std::string device_name;  // raw; sanitized when composed into the key
+    std::string driver_version;
+    int         budget_pct        = 100;
+    uint64_t    external_headroom = 0;  // bytes
+};
+
+// The device topology a context runs on, as indices into
+// ggml_sycl_info().devices[].
+struct UbatchDeviceTopology {
+    // Every SYCL backend the context has, in order.
+    std::vector<int> scheduler_devices;
+    // ggml_sycl_info().device_count and total_gpu_count. A multi-GPU run
+    // without GGML_SYCL_SPLIT_RATIO/TENSOR_SPLIT exposes only device 0 to the
+    // scheduler, so devices [scheduler_visible_count, total_gpu_count) are
+    // hidden from the context's backend list.
+    int              scheduler_visible_count = 0;
+    int              total_gpu_count         = 0;
+    // Whether the placement planner may put layers, KV or experts on those
+    // hidden GPUs (ggml_backend_sycl_moe_multi_gpu_requested(), the gate the
+    // multi-device plan itself uses).
+    bool             hidden_gpus_participate = false;
+};
+
+// The devices whose budgets decide which n_ubatch fits: the scheduler devices
+// in order, then (when the planner may use them) each hidden physical GPU in
+// index order. Keying on the scheduler devices alone made a collapsed
+// level_zero:0,1 split and level_zero:0 alone the same set, [0].
+inline std::vector<int> ubatch_participating_devices(const UbatchDeviceTopology & topo) {
+    std::vector<int> devices = topo.scheduler_devices;
+    if (!topo.hidden_gpus_participate) {
+        return devices;
+    }
+    for (int d = topo.scheduler_visible_count; d < topo.total_gpu_count; ++d) {
+        if (std::find(devices.begin(), devices.end(), d) == devices.end()) {
+            devices.push_back(d);
+        }
+    }
+    return devices;
+}
+
+// Compose the participating device set's key:
+// "<sanitized name>@<driver>/pct=<p>/headroom=<bytes>" per device, in order,
+// joined by ','. `identities` is indexed by device index. Returns an empty
+// string when a participating index has no identity, which the caller treats
+// as "no key" rather than composing one that under-describes the set.
+inline std::string ubatch_device_set_key(const UbatchDeviceTopology &              topo,
+                                         const std::vector<UbatchDeviceIdentity> & identities) {
+    const std::vector<int> devices = ubatch_participating_devices(topo);
+    std::string            key;
+    for (int d : devices) {
+        if (d < 0 || static_cast<size_t>(d) >= identities.size()) {
+            return std::string();
+        }
+        const UbatchDeviceIdentity & id = identities[static_cast<size_t>(d)];
+        if (!key.empty()) {
+            key += ',';
+        }
+        key += sanitize_device_name(id.device_name) + "@" + id.driver_version +
+               "/pct=" + std::to_string(id.budget_pct) + "/headroom=" + std::to_string(id.external_headroom);
+    }
+    return key;
+}
+
 struct UbatchCacheKey {
-    // sanitize_device_name(name) + "@" + driver_version -- both queried at
-    // device init (ggml-sycl.cpp's ggml_sycl_info() builder) and carried in
+    // ubatch_device_set_key() over every participating device, in order:
+    // each one's sanitized name, driver version, budget percentage and
+    // external headroom. The name and driver are queried at device init
+    // (ggml-sycl.cpp's ggml_sycl_info() builder) and carried in
     // sycl_device_info next to device_name (common.hpp). No PCI id: it
     // moves across boots on this host (see CLAUDE.md's device-topology
     // note), so it cannot be part of a stable key.
@@ -542,13 +622,6 @@ struct UbatchCacheKey {
     uint32_t    n_seq_max       = 0;  // cparams.n_seq_max, passed to the probe on every candidate
     int32_t     type_k          = 0;  // params.type_k -- KV element type drives would_demote_kv
     int32_t     type_v          = 0;  // params.type_v -- ditto
-    // FNV-1a 32-bit hash over the ORDERED dev_index sequence of every SYCL
-    // backend this context has, not just the first -- level_zero:0 and
-    // level_zero:0,1 both put device 0 first, so keying only on the first
-    // device made those two selector shapes share one cache entry even
-    // though the actual runtime demand (and so which candidates fit)
-    // differs between a single-GPU and a multi-GPU run.
-    uint32_t    device_set_hash = 0;
     // llama.cpp-3aos: cparams.kv_unified -- once KV sizing depends on it
     // (kv_layer_bytes_for_kind(), unified-cache.hpp), two contexts
     // differing only in this flag need different auto n_ubatch candidates
@@ -569,8 +642,7 @@ struct UbatchCacheKey {
         return device_key == other.device_key && model_name == other.model_name && model_size == other.model_size &&
                model_hash == other.model_hash && n_ctx == other.n_ctx && n_batch == other.n_batch &&
                flash_attn == other.flash_attn && n_seq_max == other.n_seq_max && type_k == other.type_k &&
-               type_v == other.type_v && device_set_hash == other.device_set_hash && kv_unified == other.kv_unified &&
-               swa_full == other.swa_full;
+               type_v == other.type_v && kv_unified == other.kv_unified && swa_full == other.swa_full;
     }
 
     bool operator!=(const UbatchCacheKey & other) const { return !(*this == other); }
@@ -655,7 +727,6 @@ inline std::string ubatch_key_to_json(const UbatchCacheKey & k) {
        << "\"n_seq_max\":" << k.n_seq_max << ","
        << "\"type_k\":" << k.type_k << ","
        << "\"type_v\":" << k.type_v << ","
-       << "\"device_set_hash\":" << k.device_set_hash << ","
        << "\"kv_unified\":" << (k.kv_unified ? "true" : "false") << ","
        << "\"swa_full\":" << (k.swa_full ? "true" : "false");
     return ss.str();
@@ -673,7 +744,6 @@ inline UbatchCacheKey ubatch_key_from_json(const std::string & json) {
     k.n_seq_max       = static_cast<uint32_t>(parse_int(json, "n_seq_max"));
     k.type_k          = static_cast<int32_t>(parse_int(json, "type_k"));
     k.type_v          = static_cast<int32_t>(parse_int(json, "type_v"));
-    k.device_set_hash = static_cast<uint32_t>(parse_u64(json, "device_set_hash"));
     k.kv_unified      = parse_bool(json, "kv_unified");
     k.swa_full        = parse_bool(json, "swa_full");
     return k;

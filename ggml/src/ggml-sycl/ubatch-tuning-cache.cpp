@@ -14,10 +14,13 @@
 //   - the two env-var accessors (GGML_SYCL_TUNING_CACHE,
 //     GGML_SYCL_TUNING_CACHE_DIR), memoized the same way
 //     unified_cache_auto_ubatch_enabled() is (unified-cache.cpp);
-//   - composing the on-disk device_key (sanitize_device_name(name) + "@" +
-//     driver_version) from ggml_sycl_info().devices[device] -- callers pass
-//     only a logical device index, never the raw strings, so this
-//     composition happens in exactly one place;
+//   - composing the on-disk device_key (ubatch_device_set_key() over every
+//     participating device: the context's own SYCL devices plus any GPU the
+//     scheduler hides but the placement planner uses, each with its name,
+//     driver version and VRAM budget) from ggml_sycl_info() and each
+//     device's budget authority -- callers pass only logical device indices,
+//     never the raw strings, so this composition happens in exactly one
+//     place;
 //   - the ISO-8601 timestamp stamped on every store.
 //
 // GGML_SYCL_TUNING_CACHE=0 disables both lookup and store: every call below
@@ -31,6 +34,7 @@
 #include "ggml-sycl.h"
 #include "tuning-cache-io.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -80,19 +84,68 @@ std::string ubatch_tuning_cache_dir() {
     return override_dir.empty() ? get_cache_dir() : override_dir;
 }
 
-// Resolve `device`'s raw (unsanitized) name and driver version from
-// ggml_sycl_info(), and compose the on-disk device_key
-// (sanitize_device_name(name) + "@" + driver_version -- see
-// UbatchCacheKey::device_key's comment for why no PCI id). Returns false
-// (out untouched) for an out-of-range device -- the one thing every public
-// entry point below must check before touching ggml_sycl_info().devices[].
-bool resolve_device_key(int device, std::string & out_device_name, std::string & out_device_key) {
+// Resolve a scheduler-visible `device`'s raw (unsanitized) name -- the name
+// its cache file is filed under. Returns false (out untouched) for an
+// out-of-range device -- the one thing every public entry point below must
+// check before touching ggml_sycl_info().devices[].
+bool resolve_file_device_name(int device, std::string & out_device_name) {
     const auto & info = ggml_sycl_info();
     if (device < 0 || device >= info.device_count) {
         return false;
     }
     out_device_name = info.devices[device].device_name;
-    out_device_key  = sanitize_device_name(out_device_name) + "@" + info.devices[device].driver_version;
+    return true;
+}
+
+// Compose the on-disk device_key for `c_key`'s device list and resolve the
+// name its entry is filed under (devices[0]). The participating set is
+// derived here, not by the caller: a level_zero:0,1 run without
+// GGML_SYCL_SPLIT_RATIO/TENSOR_SPLIT gives the context ONE SYCL backend
+// (device 0), while the placement planner still puts layers and KV on the
+// hidden device 1 whenever ggml_backend_sycl_moe_multi_gpu_requested() --
+// the same gate the multi-device plan uses. Each device's budget comes from
+// ggml_sycl_device_budget_authority(), which reads the live cache's resolved
+// authority when there is one. Returns false for an empty or out-of-range
+// device list.
+bool resolve_device_set_key(const ggml_sycl_ubatch_cache_key & c_key,
+                            std::string &                      out_device_name,
+                            std::string &                      out_device_key) {
+    if (c_key.devices == nullptr || c_key.n_devices == 0) {
+        return false;
+    }
+    const auto & info = ggml_sycl_info();
+
+    UbatchDeviceTopology topo;
+    for (uint32_t i = 0; i < c_key.n_devices; ++i) {
+        const int device = c_key.devices[i];
+        if (device < 0 || device >= info.device_count) {
+            return false;
+        }
+        topo.scheduler_devices.push_back(device);
+    }
+    topo.scheduler_visible_count = info.device_count;
+    topo.total_gpu_count         = std::min(info.total_gpu_count, GGML_SYCL_MAX_DEVICES);
+    topo.hidden_gpus_participate = ggml_backend_sycl_moe_multi_gpu_requested();
+
+    // ggml_sycl_info()'s init fills devices[] for every physical GPU, hidden
+    // ones included, so a hidden participant's name and driver are real.
+    std::vector<UbatchDeviceIdentity> identities(std::max(info.device_count, topo.total_gpu_count));
+    for (int device : ubatch_participating_devices(topo)) {
+        const auto &                           dev    = info.devices[device];
+        const ggml_sycl::vram_budget_authority budget = ggml_sycl::ggml_sycl_device_budget_authority(
+            device, dev.total_vram, dev.free_vram_at_init, /*default_pct=*/100);
+        UbatchDeviceIdentity & id = identities[device];
+        id.device_name            = dev.device_name;
+        id.driver_version         = dev.driver_version;
+        id.budget_pct             = budget.budget_pct;
+        id.external_headroom      = budget.external_headroom;
+    }
+
+    out_device_key = ubatch_device_set_key(topo, identities);
+    if (out_device_key.empty()) {
+        return false;
+    }
+    out_device_name = info.devices[topo.scheduler_devices.front()].device_name;
     return true;
 }
 
@@ -108,7 +161,6 @@ UbatchCacheKey to_internal_key(const std::string & device_key, const ggml_sycl_u
     k.n_seq_max       = c_key.n_seq_max;
     k.type_k          = c_key.type_k;
     k.type_v          = c_key.type_v;
-    k.device_set_hash = c_key.device_set_hash;
     k.kv_unified      = c_key.kv_unified;
     k.swa_full        = c_key.swa_full;
     return k;
@@ -137,13 +189,10 @@ bool ggml_backend_sycl_ubatch_cache_path(int device, char * buf, size_t buf_size
     if (buf == nullptr || buf_size == 0) {
         return false;
     }
-    std::string device_name, device_key;
-    if (!resolve_device_key(device, device_name, device_key)) {
+    std::string device_name;
+    if (!resolve_file_device_name(device, device_name)) {
         return false;
     }
-    // resolve_device_key() is shared with _lookup/_store below, which DO
-    // need device_key; a path-only caller has no use for it.
-    (void) device_key;
     std::string path = get_ubatch_cache_file(ubatch_tuning_cache_dir(), device_name);
     // `path.size() >= buf_size` would truncate --
     // refuse instead of silently handing back a wrong (truncated) path.
@@ -163,7 +212,7 @@ bool ggml_backend_sycl_ubatch_cache_lookup(const ggml_sycl_ubatch_cache_key * ke
         return false;
     }
     std::string device_name, device_key;
-    if (!resolve_device_key(key->device, device_name, device_key)) {
+    if (!resolve_device_set_key(*key, device_name, device_key)) {
         return false;
     }
     const UbatchCacheKey lookup_key = to_internal_key(device_key, *key);
@@ -192,7 +241,7 @@ bool ggml_backend_sycl_ubatch_cache_store(const ggml_sycl_ubatch_cache_key * key
         return false;
     }
     std::string device_name, device_key;
-    if (!resolve_device_key(key->device, device_name, device_key)) {
+    if (!resolve_device_set_key(*key, device_name, device_key)) {
         return false;
     }
     const UbatchCacheKey store_key = to_internal_key(device_key, *key);

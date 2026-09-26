@@ -1614,12 +1614,12 @@ def test_header_declares_the_ubatch_cache_key_and_four_accessors():
     assert re.search(r"struct\s+ggml_sycl_ubatch_cache_key\s*\{", GGML_SYCL_H_CODE), (
         "ggml_sycl_ubatch_cache_key must be declared in ggml-sycl.h"
     )
-    for member in ("int\\s+device\\s*;", "const\\s+char\\s*\\*\\s*model_name\\s*;", "uint64_t\\s+model_size\\s*;",
+    for member in ("const\\s+int\\s*\\*\\s*devices\\s*;", "uint32_t\\s+n_devices\\s*;",
+                   "const\\s+char\\s*\\*\\s*model_name\\s*;", "uint64_t\\s+model_size\\s*;",
                    "uint64_t\\s+model_hash\\s*;", "uint32_t\\s+n_ctx\\s*;", "uint32_t\\s+n_batch\\s*;",
                    "bool\\s+flash_attn\\s*;",
                    # quality round 1, Q4: the four fields added this round.
                    "uint32_t\\s+n_seq_max\\s*;", "int32_t\\s+type_k\\s*;", "int32_t\\s+type_v\\s*;",
-                   "uint32_t\\s+device_set_hash\\s*;",
                    # llama.cpp-3aos: kv_unified, added once KV sizing depended on it.
                    "bool\\s+kv_unified\\s*;",
                    # llama.cpp-uajm: swa_full, same reason (SWA layers sized as FULL under it).
@@ -1861,15 +1861,16 @@ def test_sycl_select_auto_ubatch_takes_type_k_and_type_v():
 
 
 def test_cache_key_populates_the_four_new_fields():
-    """quality round 1, Q4: n_seq_max/type_k/type_v/device_set_hash must
-    all be assigned into cache_key -- declaring the struct fields (covered
-    elsewhere) is not enough if nothing ever fills them in."""
+    """n_seq_max/type_k/type_v and the device list must all be assigned into
+    cache_key -- declaring the struct fields (covered elsewhere) is not
+    enough if nothing ever fills them in."""
     body_norm = _normalize_ws(_trial_body())
     for assignment in (
         r"cache_key\.n_seq_max\s*=\s*cparams\.n_seq_max\s*;",
         r"cache_key\.type_k\s*=\s*static_cast<int32_t>\s*\(\s*type_k\s*\)\s*;",
         r"cache_key\.type_v\s*=\s*static_cast<int32_t>\s*\(\s*type_v\s*\)\s*;",
-        r"cache_key\.device_set_hash\s*=\s*device_set_hash\s*;",
+        r"cache_key\.devices\s*=\s*cache_devices\.data\s*\(\s*\)\s*;",
+        r"cache_key\.n_devices\s*=\s*static_cast<uint32_t>\s*\(\s*cache_devices\.size\s*\(\s*\)\s*\)\s*;",
     ):
         assert re.search(assignment, body_norm), f"missing cache_key field assignment matching {assignment!r}"
 
@@ -1898,26 +1899,86 @@ def test_cache_key_populates_swa_full():
     )
 
 
-def test_device_set_hash_is_computed_over_every_sycl_backend():
-    """quality round 1, Q4: device_set_hash must be an FNV-1a accumulation
-    over EVERY entry of sycl_backends (not just the first, which is what
-    cache_key.device itself already names) -- level_zero:0 and
-    level_zero:0,1 both start with device 0, so a hash over only the first
-    entry would not tell the two selector shapes apart."""
+def test_cache_devices_list_every_sycl_backend_in_order():
+    """cache_devices must hold EVERY entry of sycl_backends, in order, and be
+    filled before it is handed to cache_key -- a list of only the first
+    backend would name one card for a scheduler-visible split."""
     body_norm = _normalize_ws(_trial_body())
-    hash_idx = body_norm.find("uint32_t device_set_hash")
-    assert hash_idx != -1, "could not find the device_set_hash declaration"
-    loop_idx = body_norm.find("for (auto & sb : sycl_backends)", hash_idx)
-    assert loop_idx != -1, "device_set_hash must be computed via a loop over sycl_backends"
-    cache_key_idx = body_norm.find("cache_key.device_set_hash", loop_idx)
-    assert cache_key_idx != -1, "device_set_hash must be computed before it is assigned into cache_key"
+    decl_idx = body_norm.find("std::vector<int> cache_devices;")
+    assert decl_idx != -1, "could not find the cache_devices declaration"
+    loop_idx = body_norm.find("for (auto & sb : sycl_backends)", decl_idx)
+    assert loop_idx != -1, "cache_devices must be filled via a loop over sycl_backends"
+    cache_key_idx = body_norm.find("cache_key.devices", loop_idx)
+    assert cache_key_idx != -1, "cache_devices must be filled before it is assigned into cache_key"
     loop_body = body_norm[loop_idx:cache_key_idx]
-    assert re.search(r"device_set_hash\s*\^=\s*static_cast<uint32_t>\s*\(\s*sb\.dev_index\s*\)\s*;", loop_body), (
-        "the loop must XOR in each backend's dev_index"
+    assert re.search(r"cache_devices\.push_back\s*\(\s*sb\.dev_index\s*\)\s*;", loop_body), (
+        "the loop must append each backend's dev_index"
     )
-    assert re.search(r"device_set_hash\s*\*=\s*0x01000193u\s*;", loop_body), (
-        "the loop must multiply by the FNV-1a 32-bit prime after each XOR"
+
+
+def test_device_set_hash_is_gone():
+    """The index-only device_set_hash hashed the scheduler-visible backends
+    alone, which is [0] for both a collapsed level_zero:0,1 split and
+    level_zero:0 alone. It must not come back beside the device list."""
+    for name, code in (("ggml-sycl.h", GGML_SYCL_H_CODE), ("llama-context.cpp", LLAMA_CONTEXT_CPP_CODE),
+                       ("ubatch-tuning-cache.cpp", UBATCH_TUNING_CACHE_CPP_CODE)):
+        assert "device_set_hash" not in code, f"{name} still carries device_set_hash"
+
+
+def test_backend_extends_the_device_set_with_hidden_planner_gpus():
+    """ubatch-tuning-cache.cpp must compose the key over the PARTICIPATING
+    set: the context's devices plus the GPUs the scheduler hides, gated on
+    the same ggml_backend_sycl_moe_multi_gpu_requested() the multi-device
+    plan uses, with each device's budget from its budget authority."""
+    code = _normalize_ws(UBATCH_TUNING_CACHE_CPP_CODE)
+    for pattern, what in (
+        (r"topo\.scheduler_visible_count\s*=\s*info\.device_count\s*;", "the scheduler-visible count"),
+        (r"topo\.total_gpu_count\s*=\s*std::min\s*\(\s*info\.total_gpu_count\s*,", "the physical GPU count"),
+        (r"topo\.hidden_gpus_participate\s*=\s*ggml_backend_sycl_moe_multi_gpu_requested\s*\(\s*\)\s*;",
+         "the planner's own multi-GPU gate"),
+        (r"for\s*\(\s*int\s+device\s*:\s*ubatch_participating_devices\s*\(\s*topo\s*\)\s*\)",
+         "a walk over the participating devices"),
+        (r"ggml_sycl::ggml_sycl_device_budget_authority\s*\(", "each device's budget authority"),
+        (r"id\.budget_pct\s*=\s*budget\.budget_pct\s*;", "the budget percentage"),
+        (r"id\.external_headroom\s*=\s*budget\.external_headroom\s*;", "the external headroom"),
+        (r"out_device_key\s*=\s*ubatch_device_set_key\s*\(\s*topo\s*,\s*identities\s*\)\s*;",
+         "the composed device-set key"),
+    ):
+        assert re.search(pattern, code), f"resolve_device_set_key() must use {what} ({pattern!r})"
+    # lookup and store both key through it; the path accessor needs only the file name.
+    assert len(re.findall(r"resolve_device_set_key\s*\(\s*\*\s*key\s*,", code)) == 2, (
+        "both lookup and store must resolve their key through resolve_device_set_key()"
     )
+    # The gate above is only right while the planner uses the same one.
+    assert re.search(
+        r"info\.total_gpu_count\s*>=\s*2\s*&&\s*ggml_backend_sycl_moe_multi_gpu_requested\s*\(\s*\)",
+        _normalize_ws(GGML_SYCL_CPP_CODE),
+    ), "the multi-device placement plan must still be gated on ggml_backend_sycl_moe_multi_gpu_requested()"
+
+
+def test_hidden_gpu_gate_holds_for_a_dense_model():
+    """The hidden-GPU gate is named for MoE but is not MoE-specific: with
+    GGML_SYCL_MOE_MULTI_GPU unset it is just total_gpu_count >= 2, which is
+    why a dense Mistral level_zero:0,1 run takes the multi-device plan and
+    places a layer block on the B50. If it ever starts consulting the model
+    (an expert count, is_moe), a dense split would silently key as its
+    first card alone again."""
+    code = _normalize_ws(GGML_SYCL_CPP_CODE)
+    start = code.find("bool ggml_backend_sycl_moe_multi_gpu_requested() {")
+    assert start != -1, "could not find ggml_backend_sycl_moe_multi_gpu_requested()'s definition"
+    open_idx = code.index("{", start)
+    depth, end = 0, -1
+    for i in range(open_idx, len(code)):
+        depth += {"{": 1, "}": -1}.get(code[i], 0)
+        if depth == 0:
+            end = i
+            break
+    body = code[open_idx + 1:end]
+    assert re.search(r"return\s+ggml_sycl_info\s*\(\s*\)\.total_gpu_count\s*>=\s*2\s*;\s*$", body.strip()), (
+        "with no env set, the gate must be total_gpu_count >= 2 alone"
+    )
+    for model_term in ("n_expert", "is_moe", "g_moe_n_experts_total"):
+        assert model_term not in body, f"the hidden-GPU gate must not depend on the model ({model_term})"
 
 
 def test_cache_hit_reads_the_stored_reason():
@@ -2150,7 +2211,8 @@ def test_cache_path_return_is_checked_and_substituted():
     silently-truncated or stale path."""
     body_norm = _normalize_ws(_trial_body())
     assert re.search(
-        r"if\s*\(\s*have_cache_accessors\s*&&\s*!cache_path_fn\s*\(\s*cache_key\.device\s*,\s*cache_path_buf\s*,\s*"
+        r"if\s*\(\s*have_cache_accessors\s*&&\s*!cache_path_fn\s*\(\s*cache_devices\.front\s*\(\s*\)\s*,\s*"
+        r"cache_path_buf\s*,\s*"
         r"sizeof\s*\(\s*cache_path_buf\s*\)\s*\)\s*\)\s*\{", body_norm
     ), "the cache_path_fn(...) call must be negated and checked"
     assert '"(cache path unavailable)"' in body_norm, (
