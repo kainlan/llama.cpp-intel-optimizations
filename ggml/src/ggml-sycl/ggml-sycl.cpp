@@ -27297,9 +27297,27 @@ static bool ggml_sycl_onednn_pp_skip_type(ggml_type type) {
 // 7732.2 MB staged on Mistral-7B Q4_0). One implementation now backs both the
 // plan's charge and the staging decision, so they cannot drift apart the way
 // two independent copies of this boolean eventually would.
+//
+// GGML_SYCL_DENSE_WOQ_ALTERNATES=0 turns the copies off at both sites at once,
+// so their PP benefit can be measured against the VRAM they duplicate: those
+// weights' prompt processing then takes the dequant-fp16 oneDNN path over the
+// primary, as a copy that did not fit already does.
+static bool ggml_sycl_dense_woq_alternates_enabled() {
+    static const bool enabled = []() {
+        const bool on = get_sycl_env("GGML_SYCL_DENSE_WOQ_ALTERNATES", 1) != 0;
+        if (!on) {
+            GGML_LOG_WARN(
+                "[SYCL] GGML_SYCL_DENSE_WOQ_ALTERNATES=0: no dense oneDNN WOQ second copies are planned or "
+                "staged\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
 static bool ggml_sycl_dense_woq_alternate_eligible_impl(ggml_type type, bool is_contiguous, bool placement_safe) {
-    return is_contiguous && ggml_sycl_onednn_pp_enabled() && !ggml_sycl_onednn_pp_skip_type(type) && placement_safe &&
-           ggml_sycl_onednn_woq_supported_type(type);
+    return ggml_sycl_dense_woq_alternates_enabled() && is_contiguous && ggml_sycl_onednn_pp_enabled() &&
+           !ggml_sycl_onednn_pp_skip_type(type) && placement_safe && ggml_sycl_onednn_woq_supported_type(type);
 }
 
 bool ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous) {

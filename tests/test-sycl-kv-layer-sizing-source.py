@@ -1665,3 +1665,26 @@ def test_mutation_optional_release_latches_is_witnessed() -> None:
 def test_mutation_leased_copy_yieldable_is_witnessed() -> None:
     _cache_mutation("optional_layout_external_leases(key, entry, mirrors) == 0;", "true;",
                     "someone else leases", "lease check dropped")
+
+
+# GGML_SYCL_DENSE_WOQ_ALTERNATES=0 measures the copies' PP value. It must sit in
+# the one predicate both the planner and S1-PRELOAD read, or the disabled arm
+# would plan no copies and still stage them (or the reverse) and measure neither.
+WOQ_ELIGIBLE_IMPL_SIGNATURE = "static bool ggml_sycl_dense_woq_alternate_eligible_impl("
+
+
+def dense_woq_knob_violations(sycl_cpp: str) -> list[str]:
+    impl = strip_comments(function(sycl_cpp, WOQ_ELIGIBLE_IMPL_SIGNATURE))
+    if not re.search(r"return\s+ggml_sycl_dense_woq_alternates_enabled\(\)\s*&&", impl):
+        return ["the dense WOQ copies knob is not in the shared eligibility predicate"]
+    return []
+
+
+def test_dense_woq_knob_in_shared_predicate() -> None:
+    assert dense_woq_knob_violations(GGML_SYCL_CPP.read_text()) == []
+
+
+def test_mutation_dense_woq_knob_dropped_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("return ggml_sycl_dense_woq_alternates_enabled() && is_contiguous &&", "return is_contiguous &&", 1)
+    _assert_witnessed(cpp, mutated, dense_woq_knob_violations, "not in the shared eligibility predicate", "knob dropped")
