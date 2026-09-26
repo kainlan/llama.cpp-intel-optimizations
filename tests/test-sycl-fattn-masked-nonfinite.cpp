@@ -33,8 +33,8 @@
 // tile on the matrix engine, and "dead" is decided per work-group tile, so a
 // cell visible to any row of the tile keeps its V and 0 * NaN reaches the rows
 // of that tile that mask it. For those kernels, and for the V variants only
-// (v_partial, and v_underflow below), a SYCL-non-finite row where the CPU row
-// is finite is reported and allowed.
+// (v_partial, and v_underflow and neginf_qk below), a SYCL-non-finite row
+// where the CPU row is finite is reported and allowed.
 // This differs from the CPU there, and it is acceptable: the NaN is a genuine
 // non-finite visible input, so the batch already reports NaN for the rows that
 // see it; zeroing it instead would hide it from those rows as well. K needs no
@@ -48,6 +48,13 @@
 // A kernel that skips a cell because its weight is 0, rather than because its
 // mask is -inf, hides that NaN (hidden_rows > 0). Only a -inf mask means the
 // cell does not exist. The XMX tile allowance above applies here too.
+//
+// neginf_qk is the same test reached through K instead of the mask: the cell's
+// K row holds -Inf in element 0, every Q row is made positive there, so QK^T
+// is exactly -inf for each row that sees the cell, and its V row is NaN. The
+// mask is 0 there, so the cell is visible, and the CPU still adds its V (0 * V,
+// or NaN * V when it comes first) and reports NaN. A kernel that treats a -inf
+// SCORE as a dead cell, rather than a -inf MASK, hides that NaN.
 //
 // The CPU backend runs with use_ref: its tiled multi-query path adds the mask to
 // the score and multiplies masked V by 0 exactly like the kernels under test, so
@@ -130,6 +137,7 @@ enum poison_kind {
     POISON_K_PARTIAL,
     POISON_V_PARTIAL,
     POISON_V_UNDERFLOW,
+    POISON_NEGINF_QK,
 };
 
 // The finite mask value the v_underflow variant gives its visible cell: large
@@ -150,6 +158,8 @@ static const char * poison_name(poison_kind p) {
             return "v_partial";
         case POISON_V_UNDERFLOW:
             return "v_underflow";
+        case POISON_NEGINF_QK:
+            return "neginf_qk";
     }
     return "?";
 }
@@ -206,7 +216,12 @@ static bool poison_is_partial(poison_kind p) {
 
 // Variants whose CPU output has NaN rows by design, scored row by row.
 static bool poison_is_rowwise(poison_kind p) {
-    return poison_is_partial(p) || p == POISON_V_UNDERFLOW;
+    return poison_is_partial(p) || p == POISON_V_UNDERFLOW || p == POISON_NEGINF_QK;
+}
+
+// Variants that put NaN in the V row of a cell visible to some rows.
+static bool poison_has_visible_nan_v(poison_kind p) {
+    return p == POISON_V_PARTIAL || p == POISON_V_UNDERFLOW || p == POISON_NEGINF_QK;
 }
 
 static float poison_value(size_t i) {
@@ -293,6 +308,21 @@ static fa_inputs make_inputs(const fa_case & c, poison_kind poison) {
                 if (ggml_fp16_to_fp32(m) == 0.0f) {
                     m = ggml_fp32_to_fp16(UNDERFLOW_MASK);
                 }
+            }
+        }
+        if (poison == POISON_NEGINF_QK) {
+            // Q[0] > 0 everywhere and K[cell][0] = -Inf make QK^T = -inf.
+            for (size_t row = 0; row < (size_t) c.ne01 * c.H_q; ++row) {
+                if (c.q_f32) {
+                    float & q = in.q_f32[row * c.D];
+                    q         = std::max(std::fabs(q), 0.25f);
+                } else {
+                    ggml_fp16_t & q = in.q_f16[row * c.D];
+                    q               = ggml_fp32_to_fp16(std::max(std::fabs(ggml_fp16_to_fp32(q)), 0.25f));
+                }
+            }
+            for (int h = 0; h < c.H_kv; ++h) {
+                in.k[((size_t) h * c.n_kv + cells[0]) * c.D] = ggml_fp32_to_fp16(-INFINITY);
             }
         }
         for (size_t i = 0; i < cells.size(); ++i) {
@@ -718,6 +748,7 @@ static void run_case(ggml_backend_t  sycl,
     size_t       zeroed_rows   = 0;  // SYCL all-zero where CPU is not
     size_t       stray_rows    = 0;  // SYCL non-zero where CPU is all-zero (fully masked row)
     size_t       sentinel_rows = 0;
+    size_t       compared_rows = 0;  // rows finite on both sides, the only rows the NMSE can see
     double       mse_diff      = 0.0;
     double       mse_ref       = 0.0;
     double       max_diff      = 0.0;
@@ -765,6 +796,7 @@ static void run_case(ggml_backend_t  sycl,
         stray_rows += (ref_zero && !got_zero && !sentinel) ? 1 : 0;
         sentinel_rows += sentinel ? 1 : 0;
         if (ref_finite && got_finite) {
+            ++compared_rows;
             cmp_diff += row_diff;
             cmp_ref += row_ref;
             cmp_max_diff = std::max(cmp_max_diff, row_max_diff);
@@ -803,7 +835,7 @@ static void run_case(ggml_backend_t  sycl,
     // tile that mask it.
     const bool xmx_tile = kernel.rfind("xmx_v1", 0) == 0 || kernel.rfind("xmx_v2_f16_ncols", 0) == 0 ||
                           kernel.rfind("xmx_v2_f16_pp_ncols", 0) == 0;
-    const bool spill_allowed = (poison == POISON_V_PARTIAL || poison == POISON_V_UNDERFLOW) && xmx_tile;
+    const bool spill_allowed = poison_has_visible_nan_v(poison) && xmx_tile;
 
     // With no visible cell at all the CPU output is legitimately all zero. A
     // row-wise variant needs NaN rows (the cell is visible somewhere), and with
@@ -824,11 +856,17 @@ static void run_case(ggml_backend_t  sycl,
     const char * status = !ok ? "FAIL" : (spill_rows > 0 ? "OK-DEVIATION" : "OK");
 
     std::printf(
-        "%s [%s] kernel=%s nmse=%.3e (max %.1e%s) max_diff=%.3e sycl_nonfinite=%zu zeroed_rows=%zu/%zu "
-        "stray_rows=%zu sentinel_rows=%zu cpu_nonfinite=%zu\n",
+        "%s [%s] kernel=%s nmse=%.3e (max %.1e%s) max_diff=%.3e compared_rows=%zu/%zu sycl_nonfinite=%zu "
+        "zeroed_rows=%zu/%zu stray_rows=%zu sentinel_rows=%zu cpu_nonfinite=%zu\n",
         status, label, kernel.empty() ? "<none: no dispatch line captured>" : kernel.c_str(), nmse, NMSE_MAX,
-        nmse_gated ? "" : ", not gated", max_diff, gpu_nonfinite, zeroed_rows, n_rows, stray_rows, sentinel_rows,
-        cpu_nonfinite);
+        nmse_gated ? "" : ", not gated", max_diff, compared_rows, n_rows, gpu_nonfinite, zeroed_rows, n_rows,
+        stray_rows, sentinel_rows, cpu_nonfinite);
+    if (ok && compared_rows == 0 && !expect_all_zero) {
+        // Every row is non-finite on one side, so the NMSE above compared
+        // nothing; the pass rests on the row-level checks alone.
+        std::printf("  NOTE [%s]: compared_rows=0, no numeric comparison was made; this pass is structural only\n",
+                    label);
+    }
     if (rejected) {
         std::printf(
             "  REJECTED [%s]: the dispatcher refused %s and fell back without naming the fallback, so this run "
@@ -918,8 +956,8 @@ int main(int, char ** argv) {
         { "d512_decode",      512, 8,  2, 1,  256, 72, false, true,  false },
         { "d512_mq4",         512, 8,  2, 4,  256, 72, false, true,  false },
     };
-    const poison_kind variants[] = { POISON_NONE,      POISON_K,         POISON_V,
-                                     POISON_K_PARTIAL, POISON_V_PARTIAL, POISON_V_UNDERFLOW };
+    const poison_kind variants[] = { POISON_NONE,      POISON_K,           POISON_V,        POISON_K_PARTIAL,
+                                     POISON_V_PARTIAL, POISON_V_UNDERFLOW, POISON_NEGINF_QK };
 
     for (const fa_case & c : cases) {
         const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
