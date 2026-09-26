@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.10. Author: impl-moua, 2026-09-26. The revisions answer ten reviews:
+Design, revision 7.11. Author: impl-moua, 2026-09-26. The revisions answer eleven reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -47,13 +47,17 @@ Design, revision 7.10. Author: impl-moua, 2026-09-26. The revisions answer ten r
   7.7a (`f8a628420`). It is numbered 7.9 because `85635feee` was committed as "7.8".
   Revision 7.10 is one commit on top of 7.9 (`53908bce5`). It answers design-moua-r9's
   addendum on 7.7a (I-5 and m-12 to m-14, rulings §M9a), 23mk's four additions to the
-  pending-range primitive (rev 4.4 §8.1) and zhcn 5.5's four relays, recorded in §6.12.
+  pending-range primitive (rev 4.4 §8.1) and zhcn 5.5's four relays, recorded in §6.12;
+- design review r10 (design-moua-r10 on `85635feee..9d4d826b3`: 0 Critical, 6 Important,
+  7 Minor), the lead's rulings on it (§M11), §M10, and design-1oxa-r7's I-3 (§X7, the load's
+  room is admitted at the early stage), recorded in §6.13. Revision 7.11 is one commit on top
+  of 7.10 (`9d4d826b3`).
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
 §E.1, §E.2, §L0R, §M7, §REC, §T, §L6, §GA, §FM, §STRICT, §D15, §D16, §Z3, §Z42, §Z52, §D20
-(superseded), §D20.1, §M76, §M76a, §ZR5, §M8, §Z43, §Z5, §Z6, §M77, §M9, §M9a). This document
-cites it as "rulings §X". **Where this document paraphrases a ruling
+(superseded), §D20.1, §M76, §M76a, §ZR5, §M8, §Z43, §Z5, §Z6, §M77, §M9, §M9a, §M10, §Z6x,
+§X7, §M11). This document cites it as "rulings §X". **Where this document paraphrases a ruling
 and differs from the file, the file wins.**
 
 Revisions cited:
@@ -758,20 +762,28 @@ property of the primitive rather than of matching two search policies. H1 adds i
 exact interior, exact at either end, a range that crosses two blocks (refused), and a
 sub-`MIN_BLOCK_SIZE` remainder.
 
-**The pending-range primitive and its owners (rulings §Z5 IMP-6, §Z43.3, §M9 I-4; 23mk rev
-4.4 §8.1).** There is **one** pending-range primitive, shared with 23mk, and this design's
-names are the canonical ones: `pending_ranges(c, d)`, `allocate_excluding` and `allocate_at`.
-23mk retires its `zone_hold`, carve-from-hold and drop-hold names and specifies four additions
-as extensions of this primitive, adopted here as written:
-- **A1, the owner.** Every pending range carries `pending_owner{kind, uint64_t id}`:
+**The pending-range primitive, its owners and its terms (rulings §Z5 IMP-6, §Z43.3, §M9 I-4,
+§M10, §M11 I-A; 23mk rev 4.4 §8.1).** There is **one** pending-range primitive, shared with
+23mk, and this design's names are the canonical ones: `pending_ranges(c, d)`,
+`allocate_excluding` and `allocate_at`. 23mk retires its `zone_hold`, carve-from-hold and
+drop-hold names and specifies four additions as extensions of this primitive, adopted here as
+written:
+- **A1, the owner and the term.** Every pending range carries `pending_owner{kind, uint64_t
+  id}` **and a term tag**, `pending_term` (rulings §M11 I-A): what the range holds room for.
+  The terms are `WEIGHT` (a load's planned device weights, this design's), `SCRATCH` (23mk's
+  LOAD hold), `MODEL_TERM` and `DEVICE_TERM` (23mk's model-lifetime and per-device terms),
+  `ARENA` (reserved by the ruling for a compute-arena range; no arena device records one, (b)
+  "The compute arena"), and `REGION` (a context's extents and head slots, this design's).
+  The owner kinds:
   - `LOAD`, id = `lifecycle::LoadTxnId::value`, minted by the Registry from `next_load_id_`
     (`model-lifecycle.hpp:425` at `3d9414c8c`), monotonic and never reused. It lives from the
-    late `stage_inventory_plan` to `load_end`'s commit or any rollback (§2.4.2 (b));
+    **early** `stage_inventory_plan` to `load_end`'s commit or any rollback (§2.4.2 (b);
+    rulings §X7 I-3);
   - `MODEL`, id = `lifecycle::ModelId::value`, from the commit (A4) to the unload (23mk's);
   - `CONTEXT`, id = the backend context's `execution_context_id` (`common.hpp:5667`, set at
     `ggml-sycl.cpp:14841` and `:14873`), from the context's transaction to its destruction.
-    This design's transaction ranges ((0) and step 5) are `CONTEXT` ranges, and the commit
-    re-fit's `own_ranges` are the ranges whose owner is this context;
+    This design's transaction ranges ((0) and step 5) are `CONTEXT` ranges with term
+    `REGION`, and the commit re-fit's `own_ranges` are the ranges whose owner is this context;
   - `DEVICE`, id = the device index, from the first load (by retag) to the last unload
     (23mk's).
 
@@ -782,14 +794,15 @@ as extensions of this primitive, adopted here as written:
   `token.load` (it can run on another thread, rulings §M9 F2), and a dispatch or transaction
   site from its context's `execution_context_id`. An allocation whose caller fills nothing is
   not anyone's own, whatever thread it runs on. `pending_ranges()` returns each range with its
-  owner; a fit passes its own as `own_ranges` and treats every other as allocated.
-- **A2, drawing inside one's own ranges.** `allocate_within(owner, size, align, tag,
-  consume)` is a first fit over the free parts of the owner's ranges, carved with `allocate_at`
-  semantics, so remainders stay whole and coalesced (r5 m-c):
+  owner and term; a fit passes its own as `own_ranges` and treats every other as allocated.
+- **A2, drawing inside one's own ranges.** `allocate_within(owner, term, size, align, tag,
+  consume)` is a first fit over the free parts of the owner's ranges **of that term**, carved
+  with `allocate_at` semantics, so remainders stay whole and coalesced (r5 m-c). The term keeps
+  a weight draw out of 23mk's `SCRATCH` hold of the same load, and the reverse:
   - `consume = false` (temporaries) leaves the range record untrimmed, so a freed block returns
     to the TLSF free lists but stays inside the range, excluded from every other allocator and
     reusable by its owner for the range's whole life;
-  - `consume = true` (weights, the SYCL<n> weight buffers, the compute-arena reserve, a lazy
+  - `consume = true` (weights: the SYCL<n> weight buffers and the preload's staging; a lazy
     term materializing) trims the carved part from the record: this design's "cleared as
     consumed";
   - a free is the ordinary handle release; a range record is not a TLSF block, so coalescing
@@ -797,8 +810,8 @@ as extensions of this primitive, adopted here as written:
   - a miss inside the owner's own ranges is that owner's plan bug and never falls through to
     `allocate_excluding` outside them: `[KV-PLAN-BUG]` for a context's KV carve (§2.8), 23mk's
     `[ZONE-PLAN-BUG]` for its terms and for a load's weight draw (its WEIGHT-zone miss row);
-  - `clear_pending(owner)` is idempotent and clears that owner's ranges on every TLSF of the
-    device.
+  - `clear_pending(owner)` is idempotent and clears **all** of that owner's ranges, of every
+    term, on every TLSF of the device.
 
   The commit's planned carves keep `allocate_at` at the offsets the re-fit chose (fit ==
   carve, above), which is `allocate_within` with the offset fixed, and trim the same way.
@@ -811,17 +824,31 @@ as extensions of this primitive, adopted here as written:
   the rest of `old`'s block as one remainder block owned by the returned remainder handle, and
   trims the consumed range parts; a failure at either carve restores `old`'s block and
   registration. No other allocator sees `old`'s block free. This design has no caller.
-- **A4, `retag_pending(from, to)`** under the group mutex. `load_end`'s commit moves 23mk's
-  MODEL terms from `{LOAD, txn}` to `{MODEL, id}` and its DMA staging to `{DEVICE, dev}`; a
-  rollback runs `clear_pending({LOAD, txn})` instead. **Order at the commit:** the retag runs
-  first, then this design's `clear_pending({LOAD, txn})` of whatever weight and arena ranges
-  the load left undrawn (§2.4.2 (b), "Lifetime"), so the clear cannot drop 23mk's terms.
+- **A4, `size_t retag_pending(pending_owner owner, pending_term_mask term_filter,
+  pending_owner new_owner)`** under the group mutex (rulings §M11 I-A). It moves **only**
+  `owner`'s ranges whose term is in `term_filter` to `new_owner`, and returns how many it
+  moved. 7.10 took 23mk's `retag_pending(from, to)`, which moved every range of `from`: this
+  design's undrawn `WEIGHT` leftovers and 23mk's `SCRATCH` hold went with the MODEL terms, the
+  clear that followed found nothing, and the leftovers stayed allocated for B's whole life
+  (r10 I-A, P4). **At `load_end`'s commit**, in this order:
+  1. 23mk's `retag_pending({LOAD, txn}, MODEL_TERM, {MODEL, id})`;
+  2. 23mk's `retag_pending({LOAD, txn}, DEVICE_TERM, {DEVICE, dev})` (row 118's DMA
+     staging, §Z6x 4);
+  3. `clear_pending({LOAD, txn})`, which drops everything the load still holds: this design's
+     undrawn `WEIGHT` ranges and 23mk's `SCRATCH` hold.
+
+  A rollback runs only step 3. So after B's commit nothing of B's is `{LOAD, txn}`, and a
+  later load C records and draws its own `SCRATCH` hold against a TLSF that holds only B's
+  retagged model and device terms. The exact signatures go to impl-23mk, so both designs name
+  one primitive (§6.13).
 
 Whichever design lands first implements them in the one primitive (L4 here); 23mk's §4
 depends on them. H1 adds `allocate_within` (both `consume` forms, reuse after a free inside an
-unconsumed range, a miss reported and not fallen through), `clear_pending` idempotence, the
-retag-then-clear order, and `replace_within`'s refusal at `owner_use_count() != 1` and its
-restore on a failed carve, each with `check_invariants()` after.
+unconsumed range, a miss reported and not fallen through, and a `WEIGHT` draw that never lands
+in a `SCRATCH` range of the same owner), `clear_pending` idempotence, the term-filtered retag
+(only the named terms move) then the clear (every leftover goes), and `replace_within`'s refusal
+at `owner_use_count() != 1` and its restore on a failed carve, each with `check_invariants()`
+after.
 
 #### 2.3.4 Reset, settle, and the dead KV reclaim
 
@@ -1178,7 +1205,13 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     (`test-sycl-nonfa-attn-scratch-guard-source.py:116-121`, `:163`, `:280`, `:334`, `:439`,
     `:466-473`, `:519`; `test-sycl-compute-buffer-fallback-source.py:126`, `:142`, `:532-535`,
     `:587-602`; `test-sycl-ubatch-ring-replan-source.py:144`) are re-anchored on the wrapper in
-    L6, and the header comment at `ggml-sycl.h:405-420` is rewritten;
+    L6, and the header comment at `ggml-sycl.h:405-420` is rewritten. **The probe's side
+    channel goes with them (rulings §M11 m-1).** The probe wrapper arms the same two
+    `thread_local`s before it calls the body (`probe_expected_model_guard`,
+    `:18794-18805`: `g_runtime_expected_model = model; g_runtime_expected_model_set = true`,
+    cleared by the guard's destructor). With the side channels turned into parameters, the
+    probe passes its `model` as the body's expected-model parameter, and the guard and both
+    assignments are deleted;
   - the probe wrapper, `ggml_backend_sycl_probe_runtime_context_for_model` (`:18728`), and the
     FA recheck, `ggml_backend_sycl_recheck_runtime_context_flash_attn` (`:19024`);
   - `ggml_backend_sycl_activate_model_plan` (`:15228`, publish at `:15259`);
@@ -1199,20 +1232,31 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     torn-down plan, so it is an L0 holder like unload; module reactivation takes L0 too. So no
     publishing entry can overlap either, and a publishing entry that finds the module not ACTIVE
     while it holds L0 is a caller lifecycle violation: `[CONTEXT-PLAN-BUG]`, with no retry and
-    no `BUSY` (below). **`ggml_backend_sycl_can_unload` (`:109358`) takes L0 too** (zhcn 5.5
-    row 32, r6 m-6). It is what closes module admission: it moves `ACTIVE` to
-    `RETRY_CLOSED`, reserves the Registry's shutdown, and waits up to 5 s for the module's
-    in-flight mutations to drain (`wait_for`, `:109390-109392`), reopening on a timeout. It is
-    distinct from shutdown (`:109666`). Without L0, a publishing entry that already holds L0
-    could see admission close under it, and the `[CONTEXT-PLAN-BUG]` below would fire on a
-    legal `can_unload`. Its wait under L0 cannot deadlock: every publishing entry takes L0
-    before the module guard that counts it as a mutation, so the mutations it waits for are
-    ones that never need L0. `ggml_backend_sycl_cancel_unload` only reopens admission, which
-    cannot turn an entry's check into a false bug, and takes no token. Shutdown joins the TP
-    worker, the CPU worker, the prestage thread and the
-    watchdog while it holds L0 (r9 m-5); none of them takes L0, since their work is graph
-    compute and dispatch, which never take it, and H7ai walks each thread's entry function as a
-    root to prove it;
+    no `BUSY` (below). **`ggml_backend_sycl_can_unload` (`:109358`) holds L0, taken by a
+    TRY-lock (zhcn 5.5 row 32, r6 m-6; rulings §M11 I-F).** It is what closes module admission:
+    it moves `ACTIVE` to `RETRY_CLOSED`, reserves the Registry's shutdown, and waits up to 5 s
+    for the module's in-flight mutations to drain (`wait_for`, `:109390-109392`), reopening on a
+    timeout. It is distinct from shutdown (`:109666`). Without L0, a publishing entry that
+    already holds L0 could see admission close under it, and the `[CONTEXT-PLAN-BUG]` below
+    would fire on a legal `can_unload`. **It never blocks on L0:** it takes a `LIFECYCLE` token
+    with `try_lock`, and when another thread holds L0 it returns `false` at once, which
+    `ggml_backend_unload_checked` reports as `BUSY` (`ggml-backend-reg.cpp:745-749`); a nested
+    acquire on a thread that already holds L0 succeeds as usual. 7.10 took L0 with a blocking
+    acquire, which hangs `test-sycl-lifecycle-runtime-wrapper.cpp:1476-1492` (r10 I-F): the test
+    holds a live-update lease with no L0 (`test_hold_live_update`), starts the async
+    `unloaded_token`, which takes L0 and waits for that lease, then calls
+    `ggml_backend_unload_checked` on the lease-holding thread, which reaches `can_unload`; a
+    blocking acquire there waits for the unload's L0, the unload waits for the lease, and
+    `test_release_live_update`, which comes after the call returns, is never reached. With the
+    try-lock the call returns `BUSY`, the test releases the lease, and the unload completes, so
+    the test is unchanged. Once it holds L0, its drain wait cannot deadlock: every publishing
+    entry takes L0 before the module guard that counts it as a mutation, so the mutations it
+    waits for are ones that never need L0. `ggml_backend_sycl_cancel_unload` only reopens
+    admission, which cannot turn an entry's check into a false bug, and takes no token. The
+    token type gains that one `try_lock` form, used only here. H9 runs the would-be hang (§3.1).
+    Shutdown joins the TP worker, the CPU worker, the prestage thread and the watchdog while it
+    holds L0 (r9 m-5); none of them takes L0, since their work is graph compute and dispatch,
+    which never take it, and H7ai walks each thread's entry function as a root to prove it;
   - **not** the exported test hook `ggml_backend_sycl_test_hold_live_update` (`:12772`, which
     calls `acquire_live_update` at `:12779`; proc address `:110029`). 7.7 put a token at its top
     "so that a test holding a lease models a real L0 holder". It does not (r9 m-4): the hook
@@ -1265,13 +1309,15 @@ L0, and a failed revalidation under L0 is a bug, not a race.
   each public backend load entry, not across the whole load:
   - `ggml_backend_sycl_model_load_begin` (`:12728`);
   - `ggml_backend_sycl_stage_inventory_plan` (`:16775`), the inventory entry llama calls
-    (`llama-model.cpp`). Its early form (`early` true) reaches
-    `ggml_backend_sycl_compute_placement_plan_early` (`:16473`, made static above) at `:16824`,
-    which computes and publishes nothing. Its late form, llama's
-    `llama_model_sycl_set_late_inventory` (`llama-model.cpp:2408-2410`), reaches
-    `ggml_sycl_set_tensor_inventory_impl` (`:16491`, static) at `:16826` and provisions the host
-    zones before the loader allocates weight buffers; it is **the stage that records the load
-    pending ranges** ((b) below);
+    (`llama-model.cpp`). Its early form (`early` true; llama calls it at
+    `llama-model.cpp:657`, before `create_tensor` picks each tensor's buffer type from the plan)
+    reaches `ggml_backend_sycl_compute_placement_plan_early` (`:16473`, made static above) at
+    `:16824`, which computes and publishes nothing; it is **the stage that admits B's room and
+    records the load pending ranges** ((b) below; rulings §X7 I-3). Its late form, llama's
+    `llama_model_sycl_set_late_inventory` (`llama-model.cpp:2408-2410`, reaching `:709`),
+    reaches `ggml_sycl_set_tensor_inventory_impl` (`:16491`, static) at `:16826`, consumes the
+    admitted plan by its identity, and provisions the host zones before the loader allocates
+    weight buffers;
   - `ggml_backend_sycl_model_load_end` (`:13096`, publish at `:13205`). The weight preload,
     `ggml_sycl_preload_model_weights` (`:33515`, static), runs inside it (`:13124` → `:12476`,
     and `:13267` → `:12933`), so its republish (`:33769`) is under `load_end`'s hold; it is not
@@ -1321,7 +1367,22 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     calling thread is bound to an active load**: its bound candidate
     (`ggml_sycl_bound_load_candidate`, `:2681`), which `load_begin` binds and `load_end`'s scope
     re-binds on whichever thread runs it, names a load the Registry still holds as active. A
-    thread whose candidate names an ended load reads false. The readers:
+    thread whose candidate names an ended load reads false. **The answer's window matches
+    master's (rulings §M11 m-6).** The Registry's load record carries an `in_load` bit, set
+    where master sets the flag (`load_begin` → `:12414`) and cleared where master clears it:
+    `load_end`'s exit effects (`:12449`), before the compute arena and the preload, and
+    `load_begin`'s unwind (`:12753`). The predicate is "bound to an active load whose `in_load`
+    bit is set". So during the compute-arena reserve and the preload, on `load_end`'s thread,
+    it answers **not in load**, as master's flag does. Neither reader below is reached on that
+    path: the preload allocates through `unified_alloc` directly (`:34169-34177`), not through
+    the SYCL_Host buft, and nothing there reads the caps; the window is pinned so the answer
+    is defined, not because anything observes it. **`load_enter_nested`'s write (rulings §M11
+    m-7).** `ggml_backend_sycl_model_load_enter_nested` (`:12875`) calls
+    `ggml_sycl_model_loading_effects(true, false)` (`:12894`), which stores the flag true
+    (`:12414`) and the phase LOAD (`:12415`). Under the binding model the flag store is a
+    no-op and is deleted: the nested entry binds the same load's candidate (`:12886`), whose
+    `in_load` bit `load_begin` already set, and a nested exit clears nothing (`outer` false).
+    The phase store stays; it is process-global and llama.cpp-dhpw's. The readers:
     - the SYCL_Host buft's role (`:42629`, `:42644-42645`): `WEIGHT` only for an allocation on a
       thread bound to an active load (or under evictable weights, as today);
     - the device caps' `async` (`:107796`), read by llama's loader on the loading thread
@@ -1339,61 +1400,105 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     in `load_end`'s preload. An A transaction in between could carve its regions and head slots
     into room B's plan counted on, and B's preload would then miss and spill: admit-then-spill
     against the plan B publishes at `:13205` (P4). **B's plan holds its weight room as pending
-    ranges (§M8 I-3(b); rulings §M9 I-4),** by the mechanism of (0)'s pending ranges and 23mk's
-    fit-and-hold (rulings §Z42.1), in the **one** pending-range primitive (rulings §Z5 IMP-6):
-    - **The recording stage** is the late stage: `stage_inventory_plan` with `early` false,
-      llama's `llama_model_sycl_set_late_inventory` (`llama-model.cpp:2408-2410`), on the
-      `ggml_sycl_set_tensor_inventory_impl` branch (`:16826`), after its
-      `candidate_is_current()` check and beside the host-zone provisioning, which the code
-      already runs "synchronous before the loader allocates weight buffers". Per device, under
-      that entry's L0 hold, it places on the TLSF's weight side the bytes B's plan puts on that
-      device (its device weights, by the plan's own per-device count, at TLSF granularity and
-      alignment) plus the `load_end` compute-arena reserve (below), and records them as **load
-      pending ranges**. The early stage (`:16824`) records nothing.
-    - **"B's own" is defined by identity (rulings §M9 I-4).** Each range carries the owner
-      `{LOAD, B's LoadTxnId}` (§2.3.3 A1, 23mk's addition to the primitive). An allocation is
-      B's own when its request carries that owner, which the caller fills for B's planned
-      draws only: on the loading thread from `Registry::bound_candidate()`, and in `load_end`
-      from its ticket's `token.load`, since `load_end` can run on another thread (§M9 F2). The
-      allocator reads no thread state. An own draw goes through `allocate_within` (A2) and
-      never lands outside B's ranges; every other allocation honours them through
-      `allocate_excluding` (§2.3.3); and every transaction's snapshot sees them as allocated,
-      so A's fit plans around them.
-    - **The loader's own weight buffers are B's own.** Between the late stage and `load_end`,
-      llama allocates the SYCL<n> weight buffers on the loading thread
-      (`ggml_backend_alloc_ctx_tensors_from_buft`, `llama-model.cpp:2634`), which reach
+    ranges (§M8 I-3(b); rulings §M9 I-4, §X7 I-3, §M11 I-A to I-C),** by the mechanism of
+    (0)'s pending ranges and 23mk's fit-and-hold (rulings §Z42.1), in the **one**
+    pending-range primitive (rulings §Z5 IMP-6; §2.3.3). All of it is on arena devices; a
+    non-arena device has no zone TLSF and no pending range, and keeps master's placement
+    (§2.11):
+    - **The admitting stage is the early stage (rulings §X7 I-3).** llama calls
+      `stage_inventory_plan` twice: early at `llama-model.cpp:657`, where `create_tensor` then
+      picks each tensor's buffer type from the early plan, and late at `:709` (through
+      `llama_model_sycl_set_late_inventory`, `:2408-2410`). 7.10 recorded at the late stage,
+      so a transaction between the two could change the room the late plan saw after the
+      buffer types were already chosen: one fact, two sources. So B's room is **admitted at
+      the early stage**. On the `compute_placement_plan_early` branch (`:16824`), under that
+      entry's L0 hold, per device, it places on the TLSF's weight side the bytes B's plan puts
+      on that device (its device weights, by the plan's own per-device count, at TLSF
+      granularity and alignment) and records them as load pending ranges, owner `{LOAD, B's
+      LoadTxnId}`, term `WEIGHT`. It stores the admitted plan, with its identity, in B's
+      inventory record (§M76a). Placement that does not fit is the early stage's refusal, by
+      name, before any buffer type is chosen.
+    - **The late stage consumes the admitted plan by its identity.** The
+      `ggml_sycl_set_tensor_inventory_impl` branch (`:16826`) no longer re-packs placement
+      against a live budget (it reads `compute_vram_budget_for_plan`'s free memory today). It
+      derives only what the late inventory adds (layer streaming, which needs
+      `g_sycl_host_weight_extras` from `create_tensor`, and the host-zone provisioning it
+      already runs "synchronous before the loader allocates weight buffers") against the
+      admitted placement. If the late inventory would change any tensor's device or tier, the
+      stage refuses the load by name (`[LOAD-PLAN] the late inventory changes the placement
+      admitted at the early stage`, naming the first tensor and both placements), and never
+      re-plans silently. An interleaved transaction plans around B's ranges (below), so it
+      cannot cause that refusal.
+    - **"B's own" is defined by identity (rulings §M9 I-4).** An allocation is B's own when
+      its request carries the owner `{LOAD, B's LoadTxnId}` (§2.3.3 A1, 23mk's addition to the
+      primitive), which the caller fills for B's planned draws only: on the loading thread from
+      `Registry::bound_candidate()`, and in `load_end` from its ticket's `token.load`, since
+      `load_end` can run on another thread (§M9 F2). The allocator reads no thread state. An
+      own draw goes through `allocate_within(owner, WEIGHT, ...)` (A2) and never lands outside
+      B's `WEIGHT` ranges; every other allocation honours them through `allocate_excluding`
+      (§2.3.3); and every transaction's snapshot sees them as allocated, so A's fit plans
+      around them.
+    - **The loader's weight buffers draw from B's ranges FIRST (rulings §M11 I-C).** Between
+      the late stage and `load_end`, llama allocates the SYCL<n> weight buffers on the loading
+      thread (`ggml_backend_alloc_ctx_tensors_from_buft`, `llama-model.cpp:2634`). They reach
       `ggml_backend_sycl_buffer_type_alloc_buffer` (`:37570`) with role `WEIGHT`
-      (`:37615-37617`) and the arena. They are the first device allocations after the ranges
-      are recorded, and they draw from B's ranges (`allocate_within`, `consume = true`; the
-      buffer type fills the owner from the bound candidate). 7.7 named only the preload, so
-      as not-own they would have been excluded from the room B's plan reserved for them and
-      spilled to RUNTIME or the shared zone, or failed at `llama-model.cpp:2637` (P4).
-    - **Each planned byte is drawn once.** The preload stages device copies only under
-      evictable weights (it returns at `:33526-33528` otherwise), so a device weight byte is
-      drawn either by a SYCL<n> weight buffer or by the preload's staging, never both, and the
-      ranges hold the plan's per-device count once. H7ap asserts, in both weight modes, that the
-      draws sum to that count.
-    - **The compute-arena reserve.** `load_end`'s load-exit effects reserve a compute arena per
-      managed device (512 MB by default, `GGML_SYCL_COMPUTE_ARENA_MB`; `:12455-12474`) before
-      the preload, and abort on failure (`GGML_ABORT`, `:12470`). An A transaction between B's
-      stage and B's `load_end` could take that room. It becomes a range of B's own, recorded at
-      the stage with the weights and consumed by `unified_cache_reserve_compute_arena` through
-      `allocate_within` (`consume = true`, owner from `load_end`'s ticket); a stage that
-      cannot place it refuses the load by name (`[COMPUTE-ARENA] the model-load compute
-      scratch does not fit`), and the `GGML_ABORT` becomes that named refusal, returned
-      through `load_end`'s result.
-    - **Lifetime.** Each range is trimmed as it is consumed. `load_end` runs 23mk's retag
-      (A4) and then `clear_pending({LOAD, txn})` for what is left, under its L0 hold, after the
-      preload; a load that aborts runs the same clear on its unwind, in the load transaction's
-      rollback. A draw that misses inside B's own ranges is a plan-versus-materialized-bytes
-      mismatch in B's own plan, 23mk's WEIGHT-zone miss row (`[ZONE-PLAN-BUG]`); no other
-      transaction can cause it any more;
+      (`:37615-37617`: not a compute buft, not a KV buft). On master, with the arena active,
+      that function tries the RUNTIME zone first (as role `COMPUTE`, cohort
+      `backend-buffer-runtime-zone`, `:37642-37673`), then the KV zone and the SCRATCH zone
+      (`:37675-37740`), then the legacy path. Under a bound load that chain is not reached
+      for such a buffer: when the arena is active, the buffer's role is `WEIGHT`, its memory
+      type is device, and the calling thread is bound to an active load, the function's first
+      step is `allocate_within({LOAD, txn}, WEIGHT, size, GGML_SYCL_BUFFER_BASE_ALIGNMENT,
+      ..., consume = true)`, with the owner from the bound candidate. **That is a stated
+      placement change:** these buffers leave RUNTIME and the KV-zone fallback and land in the
+      weight-side room B's plan counted them in. A failed draw is a named refusal, logged as
+      23mk's WEIGHT-zone miss row (`[ZONE-PLAN-BUG]`, naming the buffer, its size and B's
+      remaining `WEIGHT` room on the device), and the buffer allocation returns null, so the
+      load fails at `llama-model.cpp:2637` by name. It never falls through to the RUNTIME-first
+      chain, which would change placement a second time. Every other SYCL<n> buffer, the
+      scheduler's compute buffers included, is allocated outside a bound load and keeps the
+      chain. 7.10 said the buffers "draw from B's ranges" without saying where in that chain,
+      which left three readings open (r10 I-C).
+    - **Each planned byte is drawn once, because the tensor sets are disjoint (rulings §M11
+      I-C).** A device weight tensor is in exactly one of two sets: the tensors `create_tensor`
+      gave a SYCL<n> buffer type, which the SYCL<n> weight buffers back, and the host-extra
+      tensors (`g_sycl_host_weight_extras`), which the preload stages to the device. A tensor
+      has one buffer, so the sets do not overlap, and the ranges hold the plan's per-device
+      count once. The preload's early return (`:33526-33528`) matters only when weights are
+      not evictable; in the default evictable mode (`ggml_backend_sycl_weights_evictable`,
+      `:13591`) the preload runs and iterates the host-extra set. 7.10 attributed the
+      disjointness to that early return, which is the wrong invariant. H7ap asserts, in both
+      weight modes, that the draws sum to the per-device count and that no tensor is drawn
+      twice.
+    - **The compute arena: no range on an arena device (rulings §M11 I-B).** `load_end`'s
+      load-exit effects reserve a compute arena per managed device (512 MB by default,
+      `GGML_SYCL_COMPUTE_ARENA_MB`; `:12455-12474`) before the preload, and abort on failure
+      (`GGML_ABORT`, `:12470`). With the arena active, `reserve_compute_arena` allocates
+      nothing: it points the compute arena at the SCRATCH zone's base when
+      `zone_capacity(SCRATCH) >= arena_bytes` ("Budget already charged",
+      `unified-cache.cpp:20707-20740`), and refuses otherwise. So on an arena device **the
+      SCRATCH zone is the hold**, and 7.10's "range of B's own" was a phantom that no draw would
+      ever consume (r10 I-B). The early stage checks `zone_capacity(SCRATCH) >= arena_bytes`
+      arithmetically, records no range, and refuses the load by name when it fails
+      (`[COMPUTE-ARENA] the model-load compute scratch (%zu MB) exceeds the SCRATCH zone
+      (%zu MB)`). On a non-arena device the reserve is the real `COMPUTE` allocation it is on
+      master (`:20757-20790`), drawn at `load_end` from no range, since non-arena devices have
+      none. On both, the `GGML_ABORT` becomes that named refusal, returned through `load_end`'s
+      result.
+    - **Lifetime.** Each range is trimmed as it is consumed. At `load_end`'s commit, under its
+      L0 hold and after the preload, 23mk's two term-filtered retags run and then
+      `clear_pending({LOAD, txn})` drops what is left: B's undrawn `WEIGHT` ranges and 23mk's
+      `SCRATCH` hold (§2.3.3 A4). A load that aborts runs only the clear, on its unwind, in the
+      load transaction's rollback. A draw that misses inside B's own ranges is a
+      plan-versus-materialized-bytes mismatch in B's own plan, 23mk's WEIGHT-zone miss row
+      (`[ZONE-PLAN-BUG]`); no other transaction can cause it any more;
   - **(c) Identity.** The load's own identity is its bound candidate
     (`ggml_sycl_bound_load_candidate`, `:2681`; thread-local, `model-lifecycle.hpp:305`,
     `model-lifecycle.cpp:318-333`), never the published plan, and its publish at `load_end` is
     under L0.
 
-  H9 carries the interleaving: A's transaction between B's stage and B's `load_end` (§3.1).
+  H9 carries the interleaving: A's transaction between B's early stage and B's `load_end`,
+  including between the two stages (§3.1).
 - **Per-model plan state (rulings §M76a; the inventory globals).** The transaction and the
   probe read the process-global inventory at `:18245`, `:18265` and `:18666-18675` (the
   `g_placement_kv_info` log), and the preload reads `g_model_n_layer` at `:35535-35568`; every
@@ -1431,7 +1536,12 @@ L0, and a failed revalidation under L0 is a bug, not a race.
   is `static` and has no caller at `3d9414c8c`: its name occurs only at its forward
   declaration (`:29455`) and its definition (`:60062`). So it goes with its declaration, by the
   orphan rule above, and three live sites remain. (Its body's call of
-  `ensure_moe_secondary_queues_for_plan` at `:60115` goes with it.)
+  `ensure_moe_secondary_queues_for_plan` at `:60115` goes with it.) The deletion also removes
+  the function-local `static std::atomic<int> planned_layout_log`, which is row 648 of
+  `docs/backend/sycl-static-storage-inventory.csv` (rulings §M10, §M11 m-2). The same commit
+  regenerates the CSV with `scripts/audit-sycl-static-storage.py`, so the row goes, and
+  `tests/test-sycl-static-storage-audit.py --check` must return 0 on the result; it passes on
+  master today (the lead's check), so a failure after the deletion is the stale row.
 
   The three live sites instead call
   **`ggml_sycl_republish_current_plan_into_empty(cache, owner)`**, never the full helper (zhcn
@@ -1576,7 +1686,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     load on the other device, and a re-plan racing an unload;
   - A in a transaction, then B loads, then A's probe and FA recheck, with zero STALE_IDENTITY,
     and with A's residency, not B's, in the probe's answer;
-  - A's transaction between B's stage and B's `load_end`;
+  - A's transaction between B's early stage and B's `load_end`, and between B's two stages;
   - every exported publisher §2.4.2 lists, against a parked holder, and the allowlisted
     republish against a concurrent L0 committer;
   - a covered read against a parked L0 holder that runs an unload, a quarantine restore and a
@@ -1742,7 +1852,7 @@ prompt-processing performance, never correctness, and the yield WARN names them.
    - **Probes see no other re-plan's pending ranges, and do see a load's (r4 m13; rulings
      §E.2; r9 m-11).** A probe holds L0, so no other re-plan transaction can be mid-yield while
      it runs, and the spurious refusal that r4 m13 accepted is unreachable. A load's pending
-     ranges are different: they outlive L0 across B's load span, from B's late stage to B's
+     ranges are different: they outlive L0 across B's load span, from B's early stage to B's
      `load_end` ((b) above), and a probe **does** see them as allocated, correctly, since they
      hold room B's plan counted on.
 5. **Record the pending ranges, then yield (addendum (b); r3 C2(a); r4 I8).**
@@ -1841,9 +1951,8 @@ prompt-processing performance, never correctness, and the yield WARN names them.
      each context's pools are its own: a device pool per device the route reaches and one host
      carve, held in **that context's** registry entry, bound to that context's queue, and
      released by their handles at that context's destruction (the release proc). The registry
-     keys them by model token, ContextId and queue cookie; the plan version leaves the key, so a
-     re-plan that keeps the pools keeps the entry. MODEL scope remains for model-lifetime terms
-     (§2.4.3 "Scopes"), not for MMID pools;
+     re-key that makes this true is designed below ("The registry, re-keyed by context"). MODEL
+     scope remains for model-lifetime terms (§2.4.3 "Scopes"), not for MMID pools;
    - **only a reachable route is planned (rulings §M9 I-2; P4).** The fit takes master's
      predicate, `ggml_sycl_moe_mmid_route_reachable(ctx)` (`:11541`; its compile-time half is
      `k_moe_mmid_route_reachable_compiled`, `:11537`, and `k_moe_mmid_direct_route_validated`
@@ -1876,14 +1985,114 @@ prompt-processing performance, never correctness, and the yield WARN names them.
      failure there is a candidate refusal before anything is released, never a refusal at
      (ii) after (i) has released, the class §M7 closed;
    - **step 7 materializes into those carves and allocates nothing.** An allocation there, or a
-     carve too small, is `[CONTEXT-PLAN-BUG]`, never a refusal;
-   - **the other two sites are deleted.** `load_end` materializes nothing (`:13181-13191` go):
-     the first materialization is inside the owning context's carve, at its first publish,
-     which also removes the binding of B's pools to `contexts.back()`. The wrapper's
-     post-transaction materialization (`:18978-18990`) goes too. After the inner transaction,
-     where the route is reachable, the registry must answer `ALREADY_PUBLISHED` for this
-     context on every device the route reaches; anything else is `[CONTEXT-PLAN-BUG]`. H7am
-     enumerates the call sites and passes only when step 7 is the one left.
+     carve too small, is `[CONTEXT-PLAN-BUG]`, never a refusal. The registry's allocator
+     callback (`unified-cache.cpp:16201-16233`), which today calls `unified_allocate` for each
+     pool, instead hands out slices of the context's carves: the device pool is a slice of
+     step 6's head-slot carve, the host pool a slice of the context's held host carve, each a
+     `mem_handle` slice whose `shared_ptr` becomes the blob's `owner`;
+   - **step 7 takes the owning context explicitly (rulings §M11 I-D).** On master the
+     materializer binds each pool's queue through `ggml_sycl_get_backend_context_for_device`
+     (`:13054`), which returns `contexts.back()` (`:25980-25985`), and step 7 calls that same
+     materializer. So deleting `load_end`'s site does not remove the binding to the latest
+     context, as 7.10 claimed (r10 I-D): if C1 re-plans after C2 exists, step 7 in C1's
+     transaction binds C1's pools to C2's queue. The materializer becomes
+     `ggml_sycl_materialize_context_mmid_workspaces(ggml_backend_sycl_context & ctx, token,
+     snapshot, reason)`, called by step 7 with the transaction's own `ctx`, and it never
+     resolves a context itself. For a route whose pools span several devices, the pool on
+     `owner_device` binds the queue of **the same llama context's** backend on that device,
+     found by `(ctx.execution_context_id, owner_device)` in the backend-context registry
+     (`g_backend_context_by_device`, `:25983`), never by device alone; no such backend is
+     `[CONTEXT-PLAN-BUG]`, since the fit planned a pool the context cannot bind.
+     `ggml_sycl_get_backend_context_for_device` loses this caller;
+   - **the trigger is "this context has no pools, or needs larger ones" (rulings §M11 I-E(1)).**
+     Master's step 7 runs under `if (!stable_mmid && mmid_route_reachable && !materialize(...))`
+     (`:18613`), where `stable_mmid` compares the model plan's MMID workspaces before and after
+     (`ggml_sycl_same_mmid_workspace_plan`, `:18595`). At a first publish that is "stable", so
+     master skips it and relies on `load_end` having materialized. With that site deleted, the
+     first publish of a route-testing build would materialize nothing, and the post-transaction
+     check below would report `[CONTEXT-PLAN-BUG]` on every first publish. The trigger becomes
+     `mmid_route_reachable && ggml_sycl_context_mmid_needs_materialize(ctx, next->plan)`: true
+     when the registry holds no accepting entry for `(model token, ctx.execution_context_id,
+     submit device)`, or when the candidate's workspace exceeds the entry's recorded geometry
+     on any device the route reaches (the in-context growth above). `stable_mmid` keeps its
+     other use, the version reuse at `:18596`, unchanged;
+   - **the registry, re-keyed by context (rulings §M9 I-3, §M11 I-E(2)).** Today an entry
+     (`registry_context`, `moe-mmid-workspace.cpp:593-604`) is keyed by the model token, the
+     submit device and the plan (its version and exact snapshot pointer). Each entry gains
+     `context_id` (the backend context's `execution_context_id`), and the key becomes `(model
+     token, context_id, submit device)`. The plan leaves the key: an entry records the
+     geometry of the pools it holds, and admission already checks the request against the
+     pool's own geometry (`out.lease.admitted_geometry_ = pool->geometry`, `:1134`). Every
+     site, with its new argument:
+     - **materialize** (`:976-1075`, through `unified_cache_materialize_moe_mmid_workspaces`,
+       `unified-cache.cpp:16250-16262`) takes `context_id`. Its dedup loop (`:1061-1073`)
+       compares entries with the same `(token, context_id, submit device)` only. An existing
+       accepting entry with the same geometry answers `ALREADY_PUBLISHED`; one with a smaller
+       geometry makes the candidate this context's prepared replacement (non-accepting), as
+       `has_active` does today but scoped to the context. So a second context of the same
+       model, even with the same plan version, gets its own accepting entry, not the
+       non-accepting "prepared replacement" master gives it (r10 I-E(2));
+     - **the swap at the CAS**: `lifecycle_replace_placement_plan` calls the registry's
+       `replace_plan` (`unified-cache.cpp:316-322`) with the model's expected and replacement
+       snapshots. It takes the committing context's `context_id` too and touches only that
+       context's entries: its prepared replacement becomes accepting and its old entry is
+       retired (into `retired_contexts` while a lease is outstanding, as today). Other
+       contexts' entries are untouched by another context's publish, since the plan is no
+       longer their key. The `stable_workspace` in-place branch goes: a context whose geometry
+       did not grow has no prepared entry and nothing to swap;
+     - **acquire** (`:1081-1154`) and **the cookie check** (`:1114`) take `context_id` in
+       place of `plan_identity`, and match the accepting entry of `(token, context_id, submit
+       device)`, then the pool on `owner_device`. The cookie check is unchanged: the pool's
+       cookie is the owning context's queue cookie, so C1's dispatch matches C1's pools and
+       C2's matches C2's;
+     - **exact_queue** (`:1484-1498`, the dispatch at `ggml-sycl.cpp:75071`) takes
+       `ctx.execution_context_id` in place of the plan snapshot pointer; **admit** (`:1337`,
+       the dispatch at `:75198`) checks that the authority's entry is still the accepting one
+       for its `(token, context_id, submit device)`, where it compares the plan identity today;
+     - **retire** (`:1652-1690`) takes `(token, context_id)`, with `context_id == 0` meaning
+       every context of the token. The call sites:
+       - unload (`:12321`) retires every entry of the token. Contexts are gone by then (a live
+         context pins its model), so an entry still present is one whose context did not
+         retire it at destruction: `[CONTEXT-PLAN-BUG]` naming the ownerless entry, the
+         CLAUDE.md "owner is gone" leak class, and it is retired;
+       - `load_end`'s cleanup and failure paths (`:13209`, `:13245`) are deleted: with
+         `load_end`'s materialization gone, no entry of a loading token can exist, and H7am
+         asserts none does at `load_end`;
+       - the lost CAS (`:18635`) retires **this context's prepared replacement**, not every
+         entry at the new version;
+       - the published CAS (`:18650`) retires **this context's superseded entry**, not every
+         entry at the old version;
+       - **context destruction** (new): the release proc, under its `LIFECYCLE` token, first
+         runs `recover_quarantined(token, context_id, wait = true)` for this context, then
+         retires every entry of `(token, context_id)` (below);
+     - **recover** (`recover_quarantined`, `:1572-1650`) takes `context_id` in place of
+       `plan_identity`: the dispatch's recovery (`:75299`, in `ggml_sycl_mul_mat_id`) passes
+       its `ctx.execution_context_id`, and `ggml_sycl_recover_exact_mmid_after_drain`
+       (`:84283`, the call at `:84289`) passes its `ctx`'s;
+   - **release at context destruction goes through the handle (rulings §M11 I-E(3); P2).** A
+     pool's `device_pool.owner` and `host_pool.owner` are `shared_ptr<mem_handle>`s that the
+     slices (`retained_subrange`, `:654-664`), the authorities and every outstanding lease
+     share (`unified-cache.cpp:16229-16235`). So the memory is released when the last of them
+     drops, by the `mem_handle` destructor, never by the retire itself. The release proc's
+     order is: the context's last event has completed (rulings §Z6x 3), so its leases are
+     terminal; `recover_quarantined(wait = true)` clears any quarantined slot; the retire
+     removes the registry's references; then the region entry drops the carve handles the
+     pools are slices of. A reference still alive after that (a lease or slice someone kept)
+     is a holder the release proc's holder check reports as `[CONTEXT-PLAN-BUG]` naming the
+     MMID registry, never something it frees. Without the context-destroy retire, a destroyed
+     context's pools would stay in the registry with no owner (r10 I-E(3));
+   - **the other two sites are deleted.** `load_end` materializes nothing (`:13181-13191` go).
+     The wrapper's post-transaction materialization (`:18978-18990`) goes too. After the inner
+     transaction, where the route is reachable, the registry must answer `ALREADY_PUBLISHED`
+     for this context on every device the route reaches; anything else is
+     `[CONTEXT-PLAN-BUG]`. H7am enumerates the call sites and passes only when step 7 is the
+     one left. **The source gates that name the deleted or changed sites are re-anchored in
+     the same change (r10 m-3):** `tests/test-sycl-mmid-deferral-contract.py` (ctest
+     `sycl-mmid-deferral-contract`, `ggml/src/ggml-sycl/CMakeLists.txt:5700`; its
+     `LOAD_END_CALL` and `TRIPWIRE_SITE` `"context-bind"` name the two deleted sites),
+     `tests/test-sycl-pp-moe-ring-kv-zone-source.py:199-207` (the `!stable_mmid` trigger), and
+     `tests/test-sycl-moe-resolved-batch-source.py:476-488` (the materializer's
+     `get_backend_context_for_device` binding).
 
    Any refusal still rolls back through the guard, which leaves the old ring, the old slots and
    the context's old pools untouched.
@@ -2010,23 +2219,30 @@ contribution. It never re-fits KV and never yields.
   without L0: the covered path does not write it at all. zhcn 5.4 decides coverage through this
   same read-only query and names 5.3's key-record write as its RED (row 26), so the r8 m-1
   difference is closed (§6.11; r9 addendum m-12).
-- **The scope closes before `sched_reserve` (rulings §M9a; r9 addendum I-5(b)).** llama closes
-  the replan scope once the guard's second phase has run, and only then calls `sched_reserve`
-  to rebuild the scheduler that (b) destroyed. `sched_reserve`'s `graph_reserve` allocates the
-  SYCL compute buffers, and its failure path is a host-pinned retry
+- **The scope closes before `sched_reserve_impl`'s ALLOC (rulings §M9a, §M11 m-5; r9
+  addendum I-5(b)).** llama closes the replan scope once the guard's second phase has run, and
+  only then calls `sched_reserve` to rebuild the scheduler that (b) destroyed; in particular it
+  is closed before `sched_reserve_impl` reaches gallocr's ALLOC. That ALLOC (`graph_reserve`)
+  allocates the SYCL compute buffers, and its failure path is a host-pinned retry
   (`ggml_backend_sycl_buffer_type_alloc_buffer`; `llama-context.cpp:1587-1589` at
-  `3d9414c8c`). That growth is unplanned inference-time work on the decoding thread; on the
-  resync path (`:1571`) the phase is genuinely TG. So it must never run under a `TRANSACTION`
-  token, whose holder the pool phase gates exempt (§2.4.3). The same holds for the wrapper on
-  the constructor and ladder paths: its token is an RAII local, released when it returns,
-  before llama's `sched_reserve`. Two debug assertions make it structural:
-  - `ggml_backend_sycl_buffer_type_alloc_buffer`'s host-pinned fallback asserts
-    `!ggml_sycl_replan_token_held(TRANSACTION)`;
+  `3d9414c8c`). That growth is unplanned inference-time work on the decoding thread, where the
+  phase is genuinely TG. So it must never run under a `TRANSACTION` token, whose holder the
+  pool phase gates exempt (§2.4.3). The same holds for the wrapper on the constructor and
+  ladder paths: its token is an RAII local, released when it returns, before llama's
+  `sched_reserve`. **The shared invariant, worded identically in zhcn's design:** "no
+  TRANSACTION token is held at gallocr ALLOC or at alloc_buffer's host fallback". Two debug
+  assertions make it structural, and a third check keeps graph compute out of every scope:
+  - `ggml_backend_sycl_buffer_type_alloc_buffer`, at its entry, for any buffer allocated
+    outside a bound load (the buffers gallocr's ALLOC requests), asserts
+    `!ggml_sycl_replan_token_held(TRANSACTION)`: that is where gallocr's ALLOC reaches this
+    backend;
+  - its host-pinned fallback asserts `!ggml_sycl_replan_token_held(TRANSACTION)`;
   - graph compute (`ggml_backend_sycl_graph_compute`) asserts `!ggml_sycl_replan_token_held()`
     (any kind): graph compute never takes L0 and never runs inside a scope.
 
-  The FA recheck that `sched_reserve` reaches through `resolve_fused_ops` (`:1298`) then takes
-  its own `LIFECYCLE` token as an outermost hold.
+  zhcn's in-`sched_reserve` fixpoint scope, also `TRANSACTION`, closes before the same ALLOC
+  (rulings §Z7 I-3). The FA recheck that `sched_reserve` reaches through `resolve_fused_ops`
+  (`:1298`) takes its own `LIFECYCLE` token as an outermost hold.
 - **The guard is declared before (s)**, so steps (s), (0), (i) and (ii) all run inside its
   lifetime (r5 I-A(d)). Its first phase is where RELEASING is cleared on any exit that did not
   publish.
@@ -4018,20 +4234,29 @@ L7 documents this limit, and pattern #2 remains the remedy.
         asserts. REDs: today's phase-only gate, which asserts on the second context's first
         publish, and a reset of `g_offload_phase` around the transaction, under which the
         concurrent fill no longer asserts;
-      - **negative (a), a load spill is not exempt (r9 addendum I-5(a)):** context A is in TG
-        (the modelled phase reads TG). Model B loads, and B's preload misses VRAM and grows the
-        pinned pool for a host-tier expert, under `load_end`'s `LOAD` token, at
-        `GGML_SYCL_HOST_ALLOC_PHASE_GATE=1`. The WARN fires, exactly once per growth, and its
-        `site=` field names B's load weight fill (role `WEIGHT`), not a context carve; no
-        abort is expected at gate 1. RED: 7.7a's held-any exemption, under which the WARN is
-        silent;
-      - **negative (b), `sched_reserve`'s fallback is not exempt (I-5(b)):** a modelled decode
-        resync runs the growth path (scope, wrapper, guard) and then `sched_reserve`, whose
-        compute-buffer allocation takes the host-pinned fallback. At gate 2 the fallback
-        asserts, since no `TRANSACTION` token is held there; the arm checks that the scope
-        closed first (`ggml_sycl_replan_token_held()` false at the fallback). RED: a scope that
-        encloses `sched_reserve`, under which the fallback is exempt and silent, and which the
-        fallback's debug assertion (§2.4.2) also catches;
+      - **negative (a), a load spill is not exempt (r9 addendum I-5(a); rulings §M11 m-4):**
+        context A is in TG (the modelled phase reads TG). The pinned pool is filled to its
+        current capacity first, so any host allocation must grow it; the arm asserts the pool
+        grew (a growth counter moves by at least one), since without a growth the WARN cannot
+        fire and the arm would pass vacuously. Model B then loads, and B's preload misses VRAM
+        and places a host-tier expert through the pinned pool, under `load_end`'s `LOAD`
+        token, at `GGML_SYCL_HOST_ALLOC_PHASE_GATE=1`. The WARN fires, exactly once per
+        growth, and its `site=` field names B's load weight fill (role `WEIGHT`), not a context
+        carve; no abort is expected at gate 1. RED: 7.7a's held-any exemption, under which the
+        WARN is silent;
+      - **negative (b), gallocr's ALLOC is not exempt (I-5(b); §M11 m-4, m-5):** the vehicle
+        is `sched_reserve_impl`'s ALLOC, which exists before and after zhcn lands, not the
+        resync, which zhcn deletes (zhcn :293). A modelled growth runs the path (scope,
+        wrapper, guard) and closes the scope; then `sched_reserve_impl` reaches ALLOC with the
+        RUNTIME, KV and SCRATCH zones filled so the compute buffer takes the host-pinned
+        fallback. At gate 2 the fallback asserts, since no `TRANSACTION` token is held, and the
+        arm checks `ggml_sycl_replan_token_held()` is false at ALLOC's entry. RED: a scope left
+        open across ALLOC, under which the fallback is exempt and silent, and which the
+        alloc-entry and fallback assertions (§2.4.2 "The scope closes") both catch;
+      - **the tree each runs on:** both arms run on the landing tree, moua L4-L6 over zhcn
+        (the landing order in §4), where the resync is gone and zhcn's in-`sched_reserve`
+        scope exists; arm (b) also runs zhcn's scope as the open-scope RED. Neither depends on
+        a code state the other's landing removes;
       - **the kinds nest as ruled:** a nested `TRANSACTION` under a `LOAD` token and a nested
         `LOAD` under a `TRANSACTION` token each hit the debug assertion; a nested `LIFECYCLE`
         under either is legal and leaves the outermost kind unchanged (the gate still exempts
@@ -4299,22 +4524,43 @@ L7 documents this limit, and pattern #2 remains the remedy.
     recorded as pending ranges before any release, and (ii) re-fits only inside them. Mutation
     witness: the recording moved after (f);
   - (am) **the MMID pools are materialized only inside the owning context's carve (rulings §M7
-    I-5(b), §M8 I-5(a), §M9 I-2, I-3).** The gate enumerates every call site of
-    `ggml_sycl_materialize_published_mmid_workspaces` and
-    `unified_cache_materialize_moe_mmid_workspaces` and fails on any call site it does not
+    I-5(b), §M8 I-5(a), §M9 I-2, I-3, §M11 I-D, I-E).** The gate enumerates every call site of
+    `ggml_sycl_materialize_context_mmid_workspaces`, of the deleted
+    `ggml_sycl_materialize_published_mmid_workspaces` and of
+    `unified_cache_materialize_moe_mmid_workspaces`, and fails on any call site it does not
     classify, so it cannot pass by not looking at one. On the target tree the one site is step
-    7, which takes its device pool from step 6's carve and its host pool from the context's held
-    carve, and no `unified_alloc`, `unified_allocate_owner` or pool growth is reachable from it;
-    the wrapper, after the inner transaction, only checks that the registry answers
-    `ALREADY_PUBLISHED`; and the fit plans a pool slot only under
-    `ggml_sycl_moe_mmid_route_reachable(ctx)`. GREEN arms: an ordinary build, where the route is
-    unreachable, plans no MMID slot and carves nothing for it; and, in a route-testing build,
-    two contexts of one model each hold their own pools bound to their own queues, and each
-    admits at its top rung with no cookie mismatch. Mutation witnesses: master's allocation
-    restored at `:18614`; master's `load_end` materialization restored at `:13181`, and the
-    wrapper's at `:18980`, each of which the enumeration must report as unclassified; a fit that
-    plans the slot without the predicate; and pools keyed by the model token alone, under which
-    the second context's admission fails the cookie check (`moe-mmid-workspace.cpp:1114`);
+    7, which receives its `ggml_backend_sycl_context &` as a parameter, takes its device pool
+    from step 6's carve and its host pool from the context's held carve, and reaches no
+    `unified_alloc`, `unified_allocate_owner` or pool growth; the wrapper, after the inner
+    transaction, only checks that the registry answers `ALREADY_PUBLISHED` for this context;
+    and the fit plans a pool slot only under `ggml_sycl_moe_mmid_route_reachable(ctx)`. GREEN
+    arms:
+    - an ordinary build, where the route is unreachable, plans no MMID slot and carves nothing
+      for it;
+    - in a route-testing build, two contexts of one model (one plan identity) each hold their
+      own accepting registry entry, keyed by (token, context, device), with pools bound to
+      their own queues, and each admits at its top rung with no cookie mismatch;
+    - **C1 re-plans after C2 exists (I-D):** C1 is created, then C2, then C1 runs a growth
+      republish; C1's pools are rebuilt on C1's queue (its `execution_context_id`), and C2's
+      entry and pools are untouched;
+    - **the first publish is not a bug (I-E(1)):** in a route-testing build, the constructor's
+      first publish of a fresh context reports `PUBLISHED`, with zero `[CONTEXT-PLAN-BUG]`
+      lines, and an unchanged republish with the same geometry reports `ALREADY_PUBLISHED`
+      and rebuilds nothing;
+    - **context destruction (I-E(2)):** destroying C1 while a C1 dispatch holds a pool lease
+      retires C1's entry, drains through `recover` with `wait = true`, and the pool memory is
+      released only by the last handle's destructor, after the lease drops (the blob's owner is
+      shared with its slices); C2 still admits;
+    - **load_end** leaves no MMID entry for the loading token.
+    Mutation witnesses: master's allocation restored at `:18614`; master's `load_end`
+    materialization restored at `:13181`, and the wrapper's at `:18980`, each of which the
+    enumeration must report as unclassified; a fit that plans the slot without the predicate;
+    the `get_backend_context_for_device` binding restored (C1's re-plan binds C2's queue,
+    since `contexts.back()` is C2, and C1's next admit fails the exact-queue check); the
+    `!stable_mmid` trigger restored (the first publish reports `[CONTEXT-PLAN-BUG]`); a
+    registry keyed by plan identity (the second context's materialization dedups onto the
+    first's entry, whose cookie fails its admission at `moe-mmid-workspace.cpp:1114`); and a
+    context destroy with no retire (the entry and its pools outlive the context);
   - (an) **the host tier allocates only at the first publish, one held carve per slot index
     (rulings §D15, §ZR5 I-1, I-2; r7 I-6).** Each host slot is its own contiguous owner-first
     reservation, sized at that index's maximum over every rung, and no tenant-only path reaches
@@ -4338,24 +4584,50 @@ L7 documents this limit, and pattern #2 remains the remedy.
     changing the check. Mutation witnesses: the `:18245` read of `g_tensor_inventory_detail`
     restored in the MMID re-plan, the `:15347` write restored in the publish, and the preload's
     `g_model_n_layer` read restored;
-  - (ap) **a load's state is its own (rulings §M8 I-3, §M9 I-4, F2).** The load flag is keyed
-    by the load's identity: the host-buft role and the caps' `async` ask whether the calling
-    thread is bound to an active load. The late stage records the plan's device weight bytes
-    and the compute-arena reserve as load pending ranges tagged with B's owning-load identity
-    before it returns; the loader's SYCL<n> weight buffers and the preload draw from them as
-    B's own, and `load_end` or the load's rollback clears the rest. Arms: `load_begin` on
-    thread T1 and `load_end` on T2 (the candidate API's re-bind) — during `load_end` T2's
-    preload sees the load, and after it T1's SYCL_Host allocations (weights not evictable) are
-    `STAGING` and its caps
-    report `async` true; a context constructed on a third thread during B's load reads `async`
-    true (`llama-context.cpp:997`); in both weight modes the draws on B's ranges sum to the
-    plan's per-device count, each byte once; and an A transaction between B's stage and B's
-    `load_end` that fills every free byte leaves B's compute-arena reserve and weight buffers
-    in place. Mutation witnesses: the flag made a process-wide atomic again; 7.7's
-    `thread_local` flag, under which the T1/T2 arm leaves T1 classifying `WEIGHT`; the load
-    pending ranges recorded at `load_end` instead of at the stage; the weight buffers
-    classified as not-own, which spill; and the compute-arena reserve left out of the ranges,
-    which reaches the old `GGML_ABORT` and is now a named refusal instead;
+  - (ap) **a load's state is its own (rulings §M8 I-3, §M9 I-4, F2, §M11 I-A..I-C; §X7
+    I-3).** The load flag is keyed by the load's identity: the host-buft role and the caps'
+    `async` ask whether the calling thread is bound to an active load. The **early** stage
+    (`llama-model.cpp:657`) admits B's plan and records its device weight bytes as load pending
+    ranges, `{LOAD, txn}` with term `WEIGHT`, before it returns; the late stage (`:709`)
+    consumes that plan by identity. The loader's SYCL<n> weight buffers draw first from those
+    ranges, and `load_end` retags what 23mk names, then clears the rest. Arms:
+    - `load_begin` on thread T1 and `load_end` on T2 (the candidate API's re-bind): during
+      `load_end`'s preload the predicate answers **not in load**, as on master (the Registry's
+      `in_load` bit is cleared before the preload, §2.4.2 F2), and after `load_end` T1's
+      SYCL_Host allocations (weights not evictable) are `STAGING` and its caps report `async`
+      true; a context constructed on a third thread during B's load reads `async` true
+      (`llama-context.cpp:997`);
+    - **a transaction between the stages (§X7 I-3):** A's transaction runs between B's `:657`
+      and `:709` and fills every free byte it can; B's late stage then finds its admitted plan
+      by identity, with zero `TERMINAL` misses and no device plan placed on the host;
+    - **a late placement change is refused:** a modelled late inventory that moves one tensor to
+      another device or tier gets the named refusal ("the late inventory changes the placement
+      admitted at the early stage"), and nothing is re-planned;
+    - **the SYCL<n> buffer lands in B's range (I-C):** with a load bound, each SYCL<n> weight
+      buffer's offset lies inside a `{LOAD, txn}` `WEIGHT` range, and the RUNTIME zone's used
+      bytes do not move; a buffer larger than B's remaining range gets the named
+      `[ZONE-PLAN-BUG]` refusal and a null buffer, never a RUNTIME allocation;
+    - **each byte once:** in both weight modes the draws on B's ranges sum to the plan's
+      per-device count, and the SYCL<n> buffer tensors and `g_sycl_host_weight_extras` are
+      disjoint sets;
+    - **the compute arena has no range (I-B):** on an arena device B's pending ranges carry no
+      arena term, and a modelled `SCRATCH` capacity below `arena_bytes` gets the stage's
+      named refusal, with no `GGML_ABORT` reached; on a non-arena device the arena is the real
+      `COMPUTE` allocation, outside every range;
+    - **one primitive, term-filtered (I-A):** B carries `WEIGHT` and `MODEL_TERM` ranges and a
+      context C holds a `SCRATCH` range; B's commit retags only `MODEL_TERM` to `{MODEL, id}`
+      and then clears `{LOAD, txn}`; after it, B's `WEIGHT` leftovers are gone, and C's
+      `SCRATCH` hold is admitted at its full size.
+    Mutation witnesses: the flag made a process-wide atomic again; 7.7's `thread_local` flag,
+    under which the T1/T2 arm leaves T1 classifying `WEIGHT`; the ranges recorded at the late
+    stage (the interleaved transaction takes B's room, and B's late plan misses as
+    `TERMINAL` or places a device tensor on the host); a late stage that re-plans silently;
+    master's RUNTIME-first chain for a bound load (the buffer lands in RUNTIME); a fall-through
+    after a failed draw (the refusal arm allocates); a compute-arena range (the arena bytes are
+    counted twice against `SCRATCH`, and the `SCRATCH` cap arm admits a load it must refuse);
+    an unfiltered retag that moves every term (C's hold is refused, since B's `WEIGHT`
+    leftovers survive under `{MODEL, id}`); and the `in_load` bit left set through the preload
+    (the T2 arm reads "in load");
   - (aq) **one fit computation (rulings §M8 I-5(c)).** On the arena path the MMID re-plan's
     `BUDGET_EXCEEDED` demotion is unreachable, and (0) and (ii) call the same sizing-then-fit
     function. Mutation witnesses: the demotion restored on the arena path, and a (0) that skips
@@ -4445,18 +4717,27 @@ L7 documents this limit, and pattern #2 remains the remedy.
     REDs: master's probe and recheck, which compare A's token with the one global snapshot and
     answer STALE_IDENTITY; and 7.6's form, whose entry passes per model while the body reads the
     global snapshot at `:17852`, finds B, and reports `[CONTEXT-PLAN-BUG]`.
-  - **A's transaction between B's stage and B's `load_end` (rulings §M8 I-3).** Model B's
-    `load_begin` and stage entries run; then A's context creation and a growth republish run
-    their transactions; then B's `load_end` runs the preload. A's MMID workspaces are planned
+  - **A's transaction between B's early stage and B's `load_end` (rulings §M8 I-3, §X7 I-3).**
+    Model B's `load_begin` and early stage run; then A's context creation and a growth
+    republish run their transactions, once between B's two stages and once between the late
+    stage and `load_end`; then B's `load_end` runs the preload. A's MMID workspaces are planned
     from A's own inventory (the same as with no B), A's output buffer is not classified as a
     weight, and A's fit plans around B's load pending ranges. Every B weight then lands inside
     B's own ranges, where B's plan put it, with zero spills, and B's publish succeeds. REDs:
     master's process-global inventory (A's MMID re-plan reads B's tensors, or an empty
     inventory between B's `load_begin` and stage), the process-wide `g_sycl_in_model_load` (A's
     output buffer takes role `WEIGHT`), a stage that records no load ranges (A carves into
-    B's planned room and B's preload spills), and ranges that do not cover B's SYCL<n> weight
-    buffers or its compute-arena reserve (B's buffer allocation spills or fails at
-    `llama-model.cpp:2637`, or `load_end` aborts).
+    B's planned room and B's preload spills), ranges recorded only at the late stage (the
+    first interleave takes B's room), and ranges that do not cover B's SYCL<n> weight buffers
+    (B's buffer allocation is refused and the load fails at `llama-model.cpp:2637`).
+  - **`can_unload` against a pending unload (rulings §M11 I-F).** The arm replays
+    `test-sycl-lifecycle-runtime-wrapper.cpp:1476-1492`, unchanged: thread T holds a live-update
+    lease with no L0 (`test_hold_live_update`), starts the async `unloaded_token`, which takes
+    L0 and waits for the lease, then calls `ggml_backend_unload_checked`, which reaches
+    `can_unload`. Expected: the call returns `BUSY` at once, T releases the lease, and the
+    unload completes. A 5 s watchdog fails the arm instead of hanging it. RED: 7.10's blocking
+    acquire, under which the call waits for the unload's L0 and the watchdog fires. A second
+    arm, with L0 free, takes the `try_lock` and closes admission as before.
   - **Load B while A contributes (llama.cpp-r7fz; rulings §M7 I-4).** Model A's context is a
     ring contributor with a claimed-then-vacated ring on device 0; model B loads on device 0.
     After B's load A's ring handles, sizes, depth, split flags and contribution are unchanged,
@@ -4734,6 +5015,26 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
   `materialize_moe_tensor_planned_layout` deleted (§ZR5 I-3, §Z6 I-C; zhcn 5.4 row 30, 5.5 row
   35); and the
   deletion of the wrapper's post-transaction MMID materialization.
+
+**Revision 7.11's additions to the rows (r10; rulings §M11, §M10, §X7 I-3).**
+- **L4:** the pending range's term tag and the term-filtered `retag_pending(owner,
+  term_filter, new_owner)`, the one primitive shared with 23mk (I-A; H1, H7ap); the stage's
+  `SCRATCH`-capacity check against `arena_bytes` on arena devices, with the named refusal
+  replacing `GGML_ABORT` (I-B); the MMID registry re-keyed by (token, context, device) through
+  dedup, the prepared replacement, `acquire`, the cookie, `admit`, `retire` and `recover`
+  (I-E(2); H7am); and the `in_load` window matching master's (m-6; H7ap).
+- **L6:** the load ranges recorded at the early stage and consumed by plan identity at the
+  late stage, with its named refusal (§X7 I-3; H7ap, H9); a bound load's SYCL<n> weight
+  buffers drawn first from B's `WEIGHT` range, with the named refusal and no fall-through (I-C;
+  H7ap); step 7 taking its `ggml_backend_sycl_context &` explicitly and binding by the
+  context's `execution_context_id` (I-D; H7am); the trigger redefined, the retire sites
+  `:12321`, `:18635`, `:18650` changed and `:13209`, `:13245` deleted, and a retire at context
+  destruction (I-E; H7am); `can_unload`'s `try_lock` (I-F; H9); the probe side channel at
+  `:18794-18805` deleted (m-1); `load_enter_nested`'s flag write at `:12894` deleted (m-7);
+  the alloc-entry and host-fallback assertions of the shared invariant (m-5; H4); the three
+  MMID source gates re-anchored (m-3); and, with the dead function's deletion, row 648 of
+  `docs/backend/sycl-static-storage-inventory.csv` regenerated so
+  `tests/test-sycl-static-storage-audit.py --check` returns 0 (§M10, m-2).
 
 **Landing order (lead ruling; r4 I10).** jehw lands on master first (u1bb already has). Then:
 1. moua L1-L3 (pure, host-tested; L1 is done). zhcn and beni need L3's record type,
@@ -5601,7 +5902,7 @@ census command, the (c) table text, the phase gate) are in 7.7a and are not repe
 | I-1 | the exported `set_runtime_context` has no model identity, so the global read comes back through the entry | **Changed (rulings §M9 I-1).** It stops being exported and is folded into the wrapper, which calls the body with the per-model snapshot it selected; its four `thread_local` side channels become parameters and the return. Whole-tree callers: the wrapper and the deleted `set_runtime_n_ctx` only; the source gates that quote it are re-anchored. H7ai: "A re-plans while B published last", and a witness restoring the exported entry. |
 | I-2 | a third MMID site at `load_end` (`:13181`); the fit ignores route reachability; H7am cannot pass | **Changed (rulings §M9 I-2).** Three sites listed; `load_end`'s and the wrapper's are deleted; the fit plans a pool only under `ggml_sycl_moe_mmid_route_reachable(ctx)`. H7am gains GREEN arms (unreachable route plans nothing; two contexts each admit) and witnesses restoring `:13181` and `:18980`. |
 | I-3 | MODEL scope contradicts the queue-bound registry | **Changed (rulings §M9 I-3, amending §M8 I-5(b)).** MMID pools are CONTEXT scope: held in the context's carve, bound to its queue, keyed by model token, ContextId and queue cookie, released at the context's destruction; supersession only within the context. The "a second context is covered" claim is deleted; MODEL scope keeps model-lifetime terms only; the covered-safety bullet, §2.4.3, §2.7, the owner list and §4 follow. |
-| I-4 | "B's own" undefined; the loader's SYCL<n> weight buffers and the compute-arena reserve fall between | **Changed (rulings §M9 I-4).** Ownership is B's owning-load identity on each range (23mk's §Z5 IMP-6 addition, one primitive). The late stage (`:16826`) records the ranges; the SYCL<n> weight buffers (`llama-model.cpp:2634`) are B's own and draw from them; each byte is drawn once (the preload stages only under evictable weights, `:33526-33528`); the compute-arena reserve is a range of B's own and its `GGML_ABORT` (`:12470`) becomes a named refusal. H7ap and H9 arms. |
+| I-4 | "B's own" undefined; the loader's SYCL<n> weight buffers and the compute-arena reserve fall between | **Changed (rulings §M9 I-4).** Ownership is B's owning-load identity on each range (23mk's §Z5 IMP-6 addition, one primitive). The late stage (`:16826`) records the ranges; the SYCL<n> weight buffers (`llama-model.cpp:2634`) are B's own and draw from them; each byte is drawn once (the preload stages only under evictable weights, `:33526-33528`); the compute-arena reserve is a range of B's own and its `GGML_ABORT` (`:12470`) becomes a named refusal. H7ap and H9 arms. *Superseded in 7.11 (§6.13, I-B, I-C, §X7 I-3):* the early stage records; the compute arena has no range; the SYCL<n> buffers draw first; "drawn once" rests on the tensor sets. |
 | F2 / m-1 | `thread_local` needs a same-thread precondition; readers unnamed; the offload phase | **Changed (rulings §M9 F2).** The load flag is keyed by the load's identity: readers ask whether the calling thread is bound to an active load, which survives `load_end` on another thread (`:13110`). Readers named, `llama-context.cpp:997` included; the phase stays process-global and is llama.cpp-dhpw. H7ap's T1/T2 arm. |
 | F5 / m-10 | the H9 every-publisher RED needs "B published last" | **Fixed.** Stated in the arm, with why it is void otherwise. |
 | m-2 | `compute_placement_plan_early` publishes nothing | **Fixed.** Off the publisher lists; made static (its one caller is the stage). |
@@ -5639,7 +5940,7 @@ I-4 and the 85635feee Minors are the ones 7.9 answered (table above); the new it
 | id | finding | disposition |
 |----|---------|-------------|
 | I-5 (a) | the exemption covers `load_end`'s preload: expert host fills, host-zone configuration and the VRAM-pressure fallbacks (`:34169-34177`, `:33888`, `:33530`) | **Changed (rulings §M9a).** The token has a kind (`TRANSACTION`, `LOAD`, `LIFECYCLE`) recorded for the outermost hold, read through the same accessor with a kind argument; the gates skip only on `TRANSACTION`. Load-time growth stays gated; its false positive while another model is in TG is llama.cpp-dhpw's. 7.9's r9 F3 exemption is withdrawn. H4 negative arm (a) at gate 1: the WARN fires and its `site=` names B's load. |
-| I-5 (b) | llama's replan scope has no stated end relative to `sched_reserve` | **Changed.** The scope closes after the guard's second phase and before `sched_reserve`; `alloc_buffer`'s host-pinned fallback asserts no `TRANSACTION` token, graph compute asserts no token at all. H4 negative arm (b): the resync's `sched_reserve` fallback asserts at gate 2. |
+| I-5 (b) | llama's replan scope has no stated end relative to `sched_reserve` | **Changed.** The scope closes after the guard's second phase and before `sched_reserve`; `alloc_buffer`'s host-pinned fallback asserts no `TRANSACTION` token, graph compute asserts no token at all. H4 negative arm (b): the resync's `sched_reserve` fallback asserts at gate 2. *Superseded in 7.11 (m-4):* the vehicle is `sched_reserve_impl`'s ALLOC, since zhcn deletes the resync. |
 | m-12 | a stale "open (r8 m-1)" paragraph | **Fixed.** Restated as closed: zhcn 5.4 uses the read-only query (row 26). |
 | m-13 | the census misdescribes `_impl` | **Fixed.** `_impl` is the late stage's computation (`:16826`); `compute_placement_plan_early` computes directly (`:16473-16489`); `tiered-verdict-contract.py:22` joins the comment hits. |
 | m-14 | the accessor is unnamed and has no definition site | **Fixed.** Named, with its signature; declared in `unified-cache.hpp` beside `offload_stats_phase()`, which `pinned-pool.cpp` already reaches, and defined in `unified-cache.cpp` with the mutex, the `thread_local` state and the token type, which is the state's only writer. |
@@ -5647,11 +5948,11 @@ I-4 and the 85635feee Minors are the ones 7.9 answered (table above); the new it
 | item | disposition |
 |------|-------------|
 | 23mk A1 (owner identity: `LOAD`, `MODEL`, `CONTEXT`, `DEVICE`; carried in `alloc_constraints::pending_owner`) | **Adopted** (§2.3.3 "The pending-range primitive"). "B's own" in (b) is `{LOAD, B's LoadTxnId}`, filled by the caller, never read from a thread-local inside the allocator; this design's transaction ranges are `CONTEXT` ranges. |
-| 23mk A2 (`allocate_within`, `consume`, `clear_pending`) | **Adopted.** The SYCL<n> weight buffers, the preload and the compute-arena reserve draw with `consume = true`; a miss is the owner's plan bug and never falls through. |
+| 23mk A2 (`allocate_within`, `consume`, `clear_pending`) | **Adopted.** The SYCL<n> weight buffers, the preload and the compute-arena reserve draw with `consume = true`; a miss is the owner's plan bug and never falls through. *7.11:* the compute arena draws nothing (I-B), and each call names a term (I-A). |
 | 23mk A3 (`replace_within`) | **Adopted** into the primitive; this design has no caller. |
-| 23mk A4 (`retag_pending`) | **Adopted**, with one ordering rule of this design's: at `load_end`'s commit the retag runs before this design's `clear_pending({LOAD, txn})`, so the clear cannot drop 23mk's terms. |
+| 23mk A4 (`retag_pending`) | **Adopted**, with one ordering rule of this design's: at `load_end`'s commit the retag runs before this design's `clear_pending({LOAD, txn})`, so the clear cannot drop 23mk's terms. *Superseded in 7.11 (I-A):* the retag takes a term filter. |
 | zhcn 5.5 row 35 (`into_empty(cache, owner)`) | **Adopted.** The owner is `ggml_sycl_execution_current_owner(ctx)`'s token, threaded through `ensure_moe_secondary_queues_for_plan` from its callers; an unbound context skips the call; `has_global_plan()` goes at these sites; a null selection is `[CONTEXT-PLAN-BUG]`. **Found while checking the callers:** `:60125`'s function, `materialize_moe_tensor_planned_layout`, is `static` with no caller at `3d9414c8c` (only `:29455` and `:60062` name it), so it is deleted as dead code and three live sites remain. |
-| zhcn 5.5 row 32 (`can_unload` closes admission) | **Adopted.** `ggml_backend_sycl_can_unload` (`:109358`) takes a `LIFECYCLE` token; its drain wait under L0 cannot deadlock, since publishing entries take L0 before the module guard. |
+| zhcn 5.5 row 32 (`can_unload` closes admission) | **Adopted.** `ggml_backend_sycl_can_unload` (`:109358`) takes a `LIFECYCLE` token; its drain wait under L0 cannot deadlock, since publishing entries take L0 before the module guard. *Superseded in 7.11 (I-F):* the token is taken by `try_lock`. |
 | zhcn 5.5 row 37 (`site=` in both phase WARNs) | **Adopted**, fed from the request's cohort, or its role and tag. |
 | zhcn 5.5 row 27 (the shadow-key cite) | Already `:21130-21131` in 7.9. |
 
@@ -5664,3 +5965,45 @@ I-4 and the 85635feee Minors are the ones 7.9 answered (table above); the new it
 - The dead `materialize_moe_tensor_planned_layout` deletion reaches zhcn's row 35 list
   (`:60125`, `:60115`); I am telling zhcn.
 - Nothing was built for 7.10; it is a document change only.
+
+### 6.13 Revision 7.11: design-moua-r10, the rulings (§M11, §M10), and §X7 I-3
+
+design-moua-r10 reviewed `85635feee..9d4d826b3` and gave NOT READY: 0 Critical, 6 Important,
+7 Minor. The lead ruled on every item in §M11 and queued design-1oxa-r7's I-3 (§X7) and §M10
+into this round.
+
+| id | finding | disposition |
+|----|---------|-------------|
+| I-A | 7.10's `retag_pending(from, to)` moves every term, so a later load's `SCRATCH` hold meets B's undrawn leftovers retagged as model terms | **Changed (rulings §M11 I-A).** Each pending range carries a term tag (`WEIGHT`, `SCRATCH`, `MODEL_TERM`, `DEVICE_TERM`, `ARENA`, `REGION`) beside its owner. `retag_pending(owner, term_filter, new_owner)` moves only the terms 23mk names (`MODEL_TERM` to `{MODEL, id}`, `DEVICE_TERM` to `{DEVICE, dev}`); `clear_pending(owner)` then drops the rest; a rollback runs only the clear. One primitive, the same in both designs (§2.3.3). H7ap arm: after commit B's leftovers are gone and C's `SCRATCH` hold is admitted; witness: an unfiltered retag. |
+| I-B | the compute-arena "own range" does not exist: on arena devices the arena is `SCRATCH` itself | **Changed (§M11 I-B).** On an arena device `reserve_compute_arena` points at `SCRATCH` and allocates nothing (`unified-cache.cpp:20707-20740`), so there is no range: the early stage checks `zone_capacity(SCRATCH) >= arena_bytes` and refuses by name, replacing the `GGML_ABORT` (`:12470`). On a non-arena device it is a real `COMPUTE` allocation (`:20757-20790`) and draws on no range. H7ap arm and witness. |
+| I-C | where the SYCL<n> weight buffer draws is unstated, and master's chain is RUNTIME first | **Changed (§M11 I-C).** With a load bound, `alloc_buffer` for a SYCL<n> weight buffer calls `allocate_within({LOAD, txn}, WEIGHT, ..., consume = true)` first; a miss is `[ZONE-PLAN-BUG]` and a null buffer (the load fails at `llama-model.cpp:2637`), never the RUNTIME-first chain (`:37642-37673`). This is a stated placement change from master. "Drawn once" rests on the disjoint tensor sets (the SYCL<n> buffers' tensors and `g_sycl_host_weight_extras`), not on the preload's early return. H7ap arms. |
+| I-D | deleting `load_end`'s site does not remove the `contexts.back()` binding: step 7 calls the same materializer | **Changed (§M11 I-D).** The materializer takes `ggml_backend_sycl_context &` from step 7 and binds by `(ctx.execution_context_id, owner_device)`; it never resolves a context itself. H7am arm: C1 re-plans after C2 exists and binds C1's queue; witness: the `get_backend_context_for_device` binding restored. |
+| I-E | the `!stable_mmid` trigger skips the first publish; the plan-keyed registry cannot hold per-context entries; no retire at context destruction | **Changed (§M11 I-E).** (1) The trigger is `mmid_route_reachable && ggml_sycl_context_mmid_needs_materialize(ctx, next->plan)`, so the first publish materializes and reports `PUBLISHED`. (2) The registry key is `(token, context_id, submit device)`, designed through dedup and the prepared replacement, `replace_plan`, `acquire`, the cookie, `exact_queue`, `admit`, `recover` (`:75299`, `:84289`) and `retire` at every site (`:12321` retires all and reports an ownerless entry; `:13209`, `:13245` deleted; `:18635`, `:18650` scoped to the context; a new retire at context destruction). (3) Release is by the `mem_handle` destructor only, since `blob.owner` is shared with the slices and leases (P2). §2.4.2 step 7; H7am arms and witnesses. |
+| I-F | `can_unload` under a blocking L0 acquire hangs `test-sycl-lifecycle-runtime-wrapper.cpp:1476-1492` | **Changed (§M11 I-F).** A `LIFECYCLE` token by `try_lock`; on contention it returns `false`, which `ggml_backend_unload_checked` reports as `BUSY` (`ggml-backend-reg.cpp:745-749`). The test is unchanged. H9 arm replays it under a watchdog; RED: the blocking acquire. |
+| m-1 | the probe's `thread_local` side channel (`:18794-18805`) survives | **Fixed.** Deleted; the probe passes its model as a parameter. |
+| m-2 | §M10's CSV row and the audit gate are unnamed | **Fixed.** The dead function's deletion regenerates `docs/backend/sycl-static-storage-inventory.csv` (row 648, `planned_layout_log`) with `scripts/audit-sycl-static-storage.py`, and `tests/test-sycl-static-storage-audit.py --check` must return 0 (§2.4.2 "The allowlist"; §4 L6). |
+| m-3 | three MMID source gates quote deleted code | **Fixed.** `tests/test-sycl-mmid-deferral-contract.py` (ctest `sycl-mmid-deferral-contract`), `tests/test-sycl-pp-moe-ring-kv-zone-source.py:199-207` and `tests/test-sycl-moe-resolved-batch-source.py:476-488` join the re-anchor list (§2.4.2 step 7). |
+| m-4 | H4 (a) can pass without a growth; H4 (b)'s vehicle is the resync zhcn deletes | **Fixed.** (a) fills the pinned pool to capacity first and asserts a growth happened; (b) uses `sched_reserve_impl`'s ALLOC with the host fallback forced; both run on the landing tree (§3.1 H4). |
+| m-5 | the shared invariant is worded differently in the two designs | **Fixed.** Verbatim in both: "no TRANSACTION token is held at gallocr ALLOC or at alloc_buffer's host fallback"; `alloc_buffer`'s entry asserts it for buffers outside a bound load, and the fallback asserts it too. |
+| m-6 | F2's preload window is unstated | **Fixed**, with the conflict noted below: during `load_end`'s preload the predicate answers **not in load**, as master's flag does (cleared at `:12449` before the preload). |
+| m-7 | `load_enter_nested`'s flag write is unnamed | **Fixed.** `:12894`'s `loading_effects(true, false)` store to the flag (`:12414`) is a no-op under the keyed predicate and is deleted; the phase store (`:12415`) stays (llama.cpp-dhpw). |
+
+| item | disposition |
+|------|-------------|
+| §X7 I-3 (the load's room is admitted at the early stage) | **Adopted.** B's ranges are recorded at `llama-model.cpp:657`, through `compute_placement_plan_early` (`:16824`), under `{LOAD, txn}`; the late stage (`:709`, `_impl` at `:16826`) consumes the admitted plan by plan identity, and a placement change there is the named refusal "the late inventory changes the placement admitted at the early stage", never a silent re-plan. H7ap arm (a transaction between `:657` and `:709`: no `TERMINAL` miss, no host-placed device plan) and H9's interleave. |
+| §M10 (three kinds; delete the dead function with its CSV row and gate) | **Adopted**, with m-2 above. |
+
+**Noted for the lead (7.11).**
+- **§M11 m-6 says "the flag answers 'in load' during the preload, matching master"; master's
+  flag answers not in load there.** `load_end` clears the Registry's `in_load` bit at
+  `:12449`, before the arena reserve and the preload, so on master every preload read is "not
+  in load". 7.11 follows master. If the ruling means "in load", it is a one-line move of the
+  clear after the preload, and the H7ap T2 arm's expectation flips with it.
+- The signatures sent to impl-23mk for one primitive: the `pending_term` enum;
+  `allocate_within(owner, term, size, align, tag, consume)`; `size_t retag_pending(pending_owner
+  owner, pending_term_mask term_filter, pending_owner new_owner)`; the commit order (retag
+  `MODEL_TERM`, retag `DEVICE_TERM`, then `clear_pending({LOAD, txn})`); a rollback runs only
+  the clear; `clear_pending` clears every term.
+- m-5 leaves two peer differences for the lead to reconcile, not this design: zhcn's kind count
+  and its `into_empty` arity.
+- Nothing was built for 7.11; it is a document change only.
