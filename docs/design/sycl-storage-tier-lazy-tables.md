@@ -115,24 +115,31 @@ The consumer contract that a model implements is §9.1.
 | steady-state decode tokens with zero misses | Qwen, 512 MiB: prose 32%, mixed 63%. DeepSeek, 8 GiB: prose 20%, mixed 55% (48 rows must all hit) |
 | `llama-bench` prompts | uniform random tokens, so **always cold**, at any cache size (§8.5) |
 
-**What the planner will choose on this host** (§4.5, with the host weights at
-their **exact** bytes, `llama.cpp-rnh3`, not the 1.2x ratio the fork charges
-today). The host budget follows `MemAvailable`, which read 171.4-190.4 GiB
-today, so `host_budget` = **163.4-182.4 GiB**.
+**What the planner will choose on this host** (§4.5). The host weights are
+counted at their **exact** bytes (`llama.cpp-rnh3`), not at the 1.2x ratio the
+fork charges today, and the host zones at the bytes the sizing code actually
+commits (§2.3), `dma_staging_pool` and the RUNTIME pool included. The host
+budget follows `MemAvailable`, which read 171.4-190.4 GiB today, so
+`host_budget` = **163.4-182.4 GiB**. Under the default EXPERT mode the B50
+holds no routed expert, so these are B70-alone numbers (`llama.cpp-9g22`
+phase 1, `level_zero:0`).
 
-- **Qwen:** host experts, host zones and the context envelope need
-  90.7-100.5 GiB; the 50.66 GiB table fits at every reading, with 12-41 GiB
-  left over. The table is **HOST**. It flips to STORAGE only below a
-  `MemAvailable` of ~149-159 GiB.
-- **DeepSeek Q2_K (the owner's primary rung):** host experts (146.3-152.3 GiB,
-  exact) plus the host zones need 154.0-160.4 GiB before any table. **Stated
-  plainly: DeepSeek Q2_K does not fit this host robustly.** With no draft, host
-  zones counted once and floor-sized row caches it fits at every reading today,
-  but with only **0.5 GiB** to spare at the lowest reading. Add the DSpark draft
-  (+7.9 GiB), or a second set of host zones from the second card's cache
-  (+7.4 GiB), or the gate protocol's 2 GiB row caches (+4 GiB), and it is
-  refused at the lowest reading. This goes back to the owner as a D8 re-check
-  (§13).
+- **Qwen:** host experts, one set of host zones (≈ 6.9 GiB) and the context
+  envelope need 105.2-108.6 GiB; the 50.66 GiB table fits at every reading,
+  with 4.2-26.6 GiB left over. The table is **HOST**. It flips to STORAGE
+  only below a `MemAvailable` of ~164-167 GiB.
+- **DeepSeek Q2_K (the owner's primary rung):** host experts (157.3-160.3 GiB,
+  exact) plus one set of host zones (≈ 14.8 GiB) need 172.4-175.8 GiB before
+  any table. **Stated plainly: DeepSeek Q2_K's phase 1 does not fit this host
+  at three of today's four readings.** With no draft and floor-sized row
+  caches it needs a `MemAvailable` of 182.9-186.3 GiB: refused at 171.4 and
+  181.8, at 183.7 only
+  at the low corner, and it fits at 190.4 with 4.1-7.5 GiB to spare. With the
+  gate protocol's 2 GiB row caches it fits only at 190.4; with the DSpark
+  draft it fits at none. Rev 2 said it fitted at every reading, because it
+  left out ~7.4 GiB of zone terms and put experts on the B50. This goes back
+  to the owner as a D8 re-check (§13). T2 also depends on `llama.cpp-sgc5`:
+  today a two-card run commits a second full zone set, WEIGHT included.
 
 STORAGE speed on this box is dominated by the filesystem's 60x amplification.
 Plain NVMe is not an option here (D3), so for DeepSeek that filesystem is the
@@ -332,13 +339,43 @@ shard 2 (tensors); Appendix A.1:
   (`76c7f6548 ggml/src/ggml-sycl/ggml-sycl.cpp:5615-5645`). On DeepSeek Q2_K
   that ratio alone adds ~30 GiB of slack nobody can name. `llama.cpp-rnh3`
   replaces it with exact bytes plus named terms; T2 depends on it (§4.2).
-- **The STAGING and SCRATCH zones scale with the largest tensor.** STAGING is
-  `s1_in_flight x (2 x max_tensor + 2 MiB)` plus small terms, with
-  `s1_in_flight = 1` (`unified-cache.hpp:5539`, `unified-cache.cpp:27676-27707`);
-  SCRATCH starts at `max_tensor + 32 MiB + moe_cpu_expert_staging`, the latter
-  being the largest MoE tensor (`:27374-27376`, `:27716-27742`). A 30 GiB
-  engram table counted as `max_tensor` would make STAGING alone ~60 GiB, so the
-  lazy tables must stay out of that inventory (§4.1).
+- **The STAGING and SCRATCH zones, and a separate RUNTIME pool, scale with the
+  largest tensor.** All three are host-pinned, from the same pool budget.
+  - STAGING is `s1_in_flight x (2 x max_tensor + 2 MiB)`, with
+    `s1_in_flight = 1` (`unified-cache.hpp:5539`), plus 16 MiB, the expert
+    bias, `moe_routing_ids` (`384 x 4 x n_ctx`) and the MMID host pool
+    (`unified-cache.cpp:27676-27707`).
+  - SCRATCH is the sum of `max_tensor`, 32 MiB, `onednn_reorder`,
+    `moe_q8_workspace`, `moe_cpu_expert_staging` (the largest MoE tensor) plus
+    `moe_host_recipe_workspace`, `moe_vram_runtime`, `tp_vram_runtime`,
+    **`dma_staging_pool`**, `pp_pipeline_scratch` and `pp_moe_onednn_scratch`
+    (`:27716-27742`). `ggml_sycl_configure_host_zones_for_plan()` raises it
+    to at least the oneDNN scratch sizes plus `max_tensor + 32 MiB`
+    (`ggml-sycl.cpp:5634-5636`).
+  - `dma_staging_pool` is `2 x` the largest DMA-streamed tensor. It is sized
+    **unconditionally**, whether or not weight streaming can engage; the code's
+    own note says so and points at `llama.cpp-iaqm` (`:27522-27541`).
+  - The **RUNTIME pool** is a separate pinned pool:
+    `pre_allocate_runtime_chunks(onednn_scratchpad + dma_staging_pool +
+    pp_pipeline_scratch + pp_moe_onednn_scratch)` on the cache's host arena
+    (`ggml-sycl.cpp:5649-5653`, `unified-cache.cpp:20479-20483`). So the DMA
+    staging pool is charged twice, once in SCRATCH and once here.
+    `llama.cpp-s4ip` (comment `c-rbwa`) covers removing both copies where no
+    host reader exists.
+  - `cpu_quant_buffer_bytes` is **not** a host term. The code states it is
+    diagnostic-only: no allocation is sized from it (`:27436-27446`).
+
+  On DeepSeek Q2_K (`max_tensor` 1.81 GiB) one zone set is STAGING 3.64 +
+  SCRATCH >= 7.39 + RUNTIME >= 3.72 (committed as 4.0) + KV 0.06 ≈ **14.8
+  GiB** of non-weight host memory (§4.5). A 30 GiB engram table counted as
+  `max_tensor` would make STAGING alone ~60 GiB and move SCRATCH and RUNTIME
+  by as much again, so the lazy tables must stay out of that inventory (§4.1).
+- **Every participating cache builds its own zone set, WEIGHT included**
+  (`llama.cpp-sgc5`). A two-card run gives every cache the same plan snapshot
+  (`ggml-sycl.cpp:15325-15352`), and the S1 preload calls
+  `ggml_sycl_configure_host_zones_for_plan()` for each device (`:33709-33888`).
+  For a host-expert plan the second cache would commit a second ~150 GiB WEIGHT
+  zone. T2 depends on sgc5 (§4.2).
 - **CPU-buffer weights.** A weight in a CPU-owned buffer leaves the SYCL
   inventory, and the post-`create_tensor` replan treats its layer as host.
   The canonical contract §8 items 2 and 4 place CPU-buffer tensors outside the
@@ -695,23 +732,57 @@ struct placement_lazy_table {
 ```
 
 <a id="th32-host-fit"></a>
-**T2's definition** (it depends on `llama.cpp-rnh3`):
+**T2's definition** (it depends on `llama.cpp-rnh3` and `llama.cpp-sgc5`):
 
-`host_planned_bytes` =
-  the host weights at their **exact** materialized bytes (`rnh3`: the same
-  function as `ggml_sycl_weight_alloc_bytes`, including layout padding, with
-  **no** ratio)
-+ `rnh3`'s named terms (the WEIGHT runtime reserve, `HOST_COMPUTE` requests such
-  as `output_reserve`'s logits and the server's prompt-checkpoint reads, and a
-  TLSF fragmentation bound derived from the block count)
-+ the host KV
-+ the host STAGING, SCRATCH and KV zones **of every cache that carves them**
-  (in `PER_DEVICE` mode, both caches' zones are counted if both carve them)
+`host_planned_bytes` is what the sizing code will commit, not a second
+estimate of it. Its zone terms are the bytes `populate_host_zone_sizing()`
+and `ggml_sycl_configure_host_zones_for_plan()` produce, term for term (§2.3):
+
+  the WEIGHT zone: the host weights at their **exact** materialized bytes
+  (`rnh3`: the same function as `ggml_sycl_weight_alloc_bytes`, including
+  layout padding, with **no** ratio), plus `rnh3`'s named terms (the 64 MiB
+  WEIGHT runtime reserve, `HOST_COMPUTE` requests such as `output_reserve`'s
+  logits and the server's prompt-checkpoint reads, and a TLSF fragmentation
+  bound derived from the block count)
++ the KV zone: the host KV, at least 64 MiB
++ the STAGING zone, as sized at `unified-cache.cpp:27676-27707`
++ the SCRATCH zone, as sized at `:27716-27742` and raised at
+  `ggml-sycl.cpp:5634-5636`: every term §2.3 lists, `dma_staging_pool`
+  included
++ the RUNTIME pool that `pre_allocate_runtime_chunks` commits
+  (`ggml-sycl.cpp:5649-5653`)
++ each pool's rounding up to its commit chunk (2 GiB for the pinned pools),
+  because the ledger charges committed chunks
 + the **context envelope**: per context, the host tenants a context adds (the
   CPU backend's `SYCL_Host` compute buffer, which `llama.cpp-zhcn` plans; host
   KV growth; the lazy tables' landing slabs, block ring and output slots),
   times the planned context count
 + every lazy table's `host_resident_bytes`.
+
+Two terms are deliberately absent. `cpu_quant_buffer_bytes` is
+diagnostic-only (`:27436-27446`), and `moe_cpu_expert_staging` is counted once,
+inside SCRATCH.
+
+**One zone set per plan (`llama.cpp-sgc5`).** Today every participating cache
+builds a full zone set, WEIGHT included, from the one plan (§2.3). T2 does not
+sum that. It counts the WEIGHT zone once, in the cache whose `CpuExpertPool`
+leases the host experts, and STAGING, SCRATCH and RUNTIME once per cache that
+sgc5's fix still gives them (from that device's own maxima). Until sgc5 lands,
+the ledger's sum cap turns the duplicate WEIGHT zone from an OOM into a
+refusal that no lever can clear. So T2's enforcing phase waits for sgc5.
+Phase 1 of `llama.cpp-9g22` runs on the B70 alone (`level_zero:0`), which has
+one cache and one zone set whether or not sgc5 has landed.
+
+**One source for the number** (proposed). `llama.cpp-9g22` proposes T27, a
+host-only plan dry-run: `compute_multi_device_plan`,
+`populate_host_zone_sizing` and the `configure_host_zones` sizing, run over the
+GGUF header inventory and recorded device budgets, with no GPU. This design
+proposes that T2 compute `host_planned_bytes` through the same functions T27
+runs, so that T2's number, T27's printout and `9g22`'s `expected_host` are one
+computation. Hand arithmetic, including §4.5's, is an estimate that T27
+replaces. It has already missed terms twice: the r1 text charged the
+diagnostic-only `cpu_quant_buffer_bytes`, and the r2 text left out the DMA
+staging pool and the RUNTIME pool.
 
 ### 4.3 The decision, in order
 
@@ -781,70 +852,95 @@ that it can be checked against any reading.
 | Qwen3.8-Flash-Next Q8_0 | 119.53 GiB (largest tensor `blk.0.ffn_down_exps` 850 MiB) | 5.09 GiB (dense 3.83, `token_embd` 0.63, `output` 0.64) | 50.66 GiB | 175.29 GiB |
 | DeepSeek-V4.1-Flash Q2_K | 183.25 GiB (4.58 GiB per layer; largest tensor `ffn_down_exps` 1856.25 MiB) | 3.01 GiB (dense 2.30, `token_embd` 0.20, `output` 0.51) | 60.08 GiB | 246.34 GiB |
 
-**The device side** (estimates; the gate-1 plan lines are the witness). With
-`-sm layer` and each layer's experts on that layer's card (`llama.cpp-9g22`
-§4.5.1), the B70's placement budget is ~29 GiB and the B50's 14828 MB. After
-dense weights, attention state and fixed zones, the cards hold **31-37 GiB** of
-DeepSeek experts and, by the same arithmetic with Qwen's 1.46 GiB more dense
-weight, **29.5-35.5 GiB** of Qwen's.
+**The device side: the B70 holds every device expert** (estimates; the gate-1
+plan lines are the witness). Under the default EXPERT multi-GPU mode the fork
+places no routed expert on the B50 at all. The static secondary route returns
+`false` for every type (`unified-cache.cpp:24961-24974`, pending a PP
+secondary-route equivalence gate), and the secondary executor exists only for
+MXFP4, Q4_0 and Q6_K (`:24943-24958`). So `llama.cpp-9g22`'s phase 1 pins
+`level_zero:0`, the B70 alone (its §4.5.1), and the same holds for Qwen's
+Q8_0 experts. With a placement budget of ~29.9 GiB, and after dense weights
+(DeepSeek ~2.8 GiB), attention state and device zones of 1.5-4 GiB, the B70
+holds **23-26 GiB** of DeepSeek experts and, with Qwen's 1.46 GiB more dense
+weight, **21.5-24.5 GiB** of Qwen's. A two-card run is `9g22`'s T25, after
+sgc5; there the cards hold ~31-38 GiB of DeepSeek experts.
 
-**The terms, per T2's definition** (GiB):
+**The terms, per T2's definition** (GiB; `max_tensor` is 1.81 GiB for DeepSeek
+and 0.83 GiB for Qwen, both `blk.0.ffn_down_exps`):
 
 | term | source | Qwen | DeepSeek Q2_K |
 |---|---|---:|---:|
-| host experts, exact | total minus device experts | 84.0-90.0 | 146.3-152.3 |
+| host experts, exact | total minus B70 experts | 95.0-98.0 | 157.3-160.3 |
 | other host weights (`token_embd`, CPU `get_rows`) | header | 0.63 | 0.20 |
 | `rnh3` named terms | WEIGHT reserve 64 MiB (`unified-cache.cpp:27103`) + `HOST_COMPUTE`; the TLSF bound is not yet defined | 0.1-0.5 | 0.1-0.5 |
-| host KV | Qwen: attention on the cards at the gate contexts; DeepSeek: the dsv41 module is non-demotable (`9g22` §2.4) | 0 | 0 |
-| STAGING zone | `2 x max_tensor + 2 MiB + 16 MiB` (§2.3) | 1.68 | 3.64 |
-| SCRATCH zone | `max_tensor + 32 MiB + largest MoE tensor` + runtime terms | 1.69 + runtime | 3.66 + runtime |
-| KV zone minimum | `:27674` | 0.06 | 0.06 |
-| **step 2, zones counted once** | | **88.2-94.6** | **154.0-160.4** |
-| step 2, zones counted twice (both `PER_DEVICE` caches carve them) | + one more set | 91.6-98.0 | 161.3-167.7 |
+| host KV | Qwen: attention on the card at the gate contexts; DeepSeek: the dsv41 module is non-demotable (`9g22` §2.4) | 0 | 0 |
+| STAGING zone | `2 x max_tensor + 2 MiB + 16 MiB` + routing ids (6 MiB at `-c 4096`) + MMID pool (§2.3) | 1.68 | 3.64 |
+| SCRATCH zone | `2 x max_tensor + 32 MiB` (`max_tensor` + `moe_cpu_expert_staging`) + `dma_staging_pool` (`2 x max_tensor`) + oneDNN reorder ≈ 0.08 + `moe_q8` ≈ 0.03, + `moe_vram_runtime` and PP terms (not yet known) | 3.46+ | 7.39+ |
+| RUNTIME pool | oneDNN scratchpad ≈ 0.09 + `dma_staging_pool` a second time, + PP terms | 1.75+ | 3.72+ |
+| KV zone minimum | `:27673` | 0.06 | 0.06 |
+| **non-weight host, one zone set** | | **≈ 6.9** | **≈ 14.8** |
+| chunk rounding | pinned pools commit 2 GiB chunks (RUNTIME: 1.75 → 2.0, 3.72 → 4.0) | up to ~2.3 | up to ~2.3 |
+| **step 2, one zone set** (before rounding) | | **102.7-106.1** | **172.4-175.8** |
 | `host_reserve` + context envelope | 2 GiB + <= 0.5 GiB (DeepSeek: output slots 48 MiB, landing slabs 3.9 MiB, ring 0.5 MiB, `SYCL_Host` compute buffer) | 2.5 | 2.5 |
 | DSpark draft, host | `9g22` §10.3 | - | +7.9 |
 
-**Qwen: HOST at every reading.**
+The DeepSeek non-weight terms agree with `9g22` rev 4 §4.5.2, and the step-2
+figure plus 4 GiB of row caches is its `expected_host` of 176.4-179.8 GiB. The
+MoE oneDNN and Q8 figures are `9g22`'s estimates for DeepSeek, reused for Qwen
+for want of better. T27's dry-run replaces all of them. The rows below exclude
+chunk rounding, so each requirement can be up to ~2.3 GiB higher.
+
+**Qwen: HOST at every reading on one card.**
 
 | case | needed before the table | + table (HOST) | `MemAvailable` needed | leftover at 171.4 / 190.4 |
 |---|---:|---:|---:|---|
-| zones once | 90.7-97.1 | 141.3-147.7 | **149.3-155.7** | 15.7-22.1 / 34.7-41.1 |
-| zones twice | 94.1-100.5 | 144.8-151.2 | **152.8-159.2** | 12.2-18.6 / 31.2-37.6 |
+| B70 alone, one zone set | 105.2-108.6 | 155.8-159.2 | **163.8-167.2** | 4.2-7.6 / 23.2-26.6 |
+| two caches, non-weight zones twice (after sgc5) | 112.1-115.5 | 162.8-166.2 | **170.8-174.2** | -2.8 to 0.6 / 16.2-19.6 |
 
-The table flips to STORAGE only when `MemAvailable` at load drops below
-~149-159 GiB. The leftover becomes other tenants' headroom; Qwen has no row
-cache while its table is HOST.
+On one card the table flips to STORAGE only when `MemAvailable` at load drops
+below ~164-167 GiB, which the lowest reading clears by 4.2-7.6 GiB. The leftover
+becomes other tenants' headroom; Qwen has no row cache while its table is
+HOST. If a two-card run keeps a second set of non-weight zones, the table
+flips at the lowest reading.
 
-**DeepSeek Q2_K: both tables are STORAGE, and the fit is not robust.**
+**DeepSeek Q2_K: both tables are STORAGE, and phase 1 does not fit at today's
+readings.**
 
 | case | requirement | `MemAvailable` needed | 171.4 | 181.8 | 183.7 | 190.4 |
 |---|---:|---:|---|---|---|---|
-| A: no draft, zones once, floor caches | 156.5-162.9 | **164.5-170.9** | fits (0.5-6.9 left) | fits | fits | fits (19.5-25.9 left) |
-| B: A + gate-protocol caches (2 GiB per table, index included) | 160.5-166.9 | 168.5-174.9 | **refused** at the high corner | fits | fits | fits |
-| C: A + DSpark draft | 164.4-170.8 | 172.4-178.8 | **refused** | fits | fits | fits |
-| D: A with zones twice | 163.9-170.3 | 171.9-178.3 | **refused** | fits | fits | fits |
-| E: draft and zones twice | 171.8-178.2 | 179.8-186.2 | **refused** | refused at the high corner | refused at the high corner | fits |
+| A: phase 1 (B70 alone), no draft, floor caches | 174.9-178.3 | **182.9-186.3** | refused | refused | low corner only (0.8 left) | fits (4.1-7.5 left) |
+| B: A + gate-protocol caches (2 GiB per table, index included) | 178.9-182.3 | 186.9-190.3 | refused | refused | refused | fits (0.1-3.5 left) |
+| C: A + DSpark draft | 182.8-186.2 | 190.8-194.2 | refused | refused | refused | refused |
+| D: two cards after sgc5 and `9g22` T25, one zone set | 162.9-170.3 | 170.9-178.3 | low corner only (0.5 left) | fits (3.5-10.9 left) | fits (5.4-12.8 left) | fits (12.1-19.5 left) |
+| E: two cards, non-weight zones twice, WEIGHT once | 177.7-185.1 | 185.7-193.1 | refused | refused | refused | low corner only (4.7 left) |
+| F: two cards, code as it is today (WEIGHT twice) | ≈ 323-338 | ≈ 331-346 | refused (T2) or OOM without T2 | | | |
 
 ("Leftover" is what step 5 would give the two row caches together.)
 
-**Stated plainly** (C1): after exact accounting, DeepSeek Q2_K fits the
-planner at every reading today only in case A, and with **0.5 GiB** to spare at
-the lowest reading. Every other case is refused at the lowest reading. The
-fit is decided by the other tenants' memory at load time, not by this model.
-Per *lead ruling §T1* (C1), this goes back to the owner as a **D8 re-check**
-(§13). `llama.cpp-9g22`'s stricter gate envelope (predicted post-load
-`MemAvailable` >= 24 GiB) fails at every reading taken today (its §4.5.2).
+**Stated plainly** (C1): with the code's own terms, DeepSeek Q2_K's phase 1
+does not fit the planner at three of today's four readings. It fits at the
+highest reading (190.4 GiB) with 4.1-7.5 GiB to spare, and at 183.7 only at
+the low corner. Rev 2 of this document said case A fitted at every reading;
+that figure left out ~7.4 GiB of zone terms (the DMA staging pool twice, and
+the small SCRATCH terms) and assumed the B50 held experts. Every other phase-1
+case is refused at every reading but the highest, and the draft is refused at
+all four. The fit is decided by the other tenants' memory at load time, not by
+this model. Per *lead ruling §T1* (C1), this goes back to the owner as a **D8
+re-check** (§13). `9g22` rev 4 §4.5.2 reaches the same verdict through its P3
+envelope and lists the levers (its lever (b), `llama.cpp-s4ip`, recovers
+~12.6 GiB per zone set, ~7.25 of it the two DMA staging copies).
 
 Where the row caches land on the hit-rate curves (§6.2.2), when the model does
 fit:
 
-- **At the floor** (case A at the lowest reading), the caches hold a few
-  ubatches' rows: effectively the cold rows of §6.2.2.
+- **At the floor** (case A), the caches hold a few ubatches' rows:
+  effectively the cold rows of §6.2.2.
 - **At the 2 GiB gate cap** (case B), each table has ~1.7 GiB of 84 B slots
   after its index (44 M slots together). In the simulation's units (110 B
   slots) that is ~4.5 GiB, between the 2 GiB and 8 GiB columns.
-- **At 190.4 GiB** (case A), the caches get 19.5-25.9 GiB together, past the
-  8 GiB column's knee on every corpus.
+- **At 190.4 GiB** (case A), the caches get 4.1-7.5 GiB together, around the
+  2 GiB-per-table column. Case D at the same reading gives 12.1-19.5 GiB,
+  past the 8 GiB column's knee on every corpus.
 
 ---
 
@@ -1234,10 +1330,12 @@ Prose keeps gaining up to 8 GiB (wiki train: 34% at 512 MiB, 46% at 8 GiB),
 and the distinct-row sets are 0.9-11.5 GiB. What Q2_K gets on this host depends
 on the tenants' memory at load (§4.5): from the floor (effectively the cold
 rows above) in case A at the lowest reading, through ~4.5 GiB in simulation
-units under the gate protocol's 2 GiB-per-table cap, to 19.5-25.9 GiB at the
-highest reading, past every corpus's knee. So on DeepSeek the cache size
-matters only at the low end; at the high end the compulsory misses, and the
-IOPS that serve them, are the limit.
+units under the gate protocol's 2 GiB-per-table cap, to 4.1-7.5 GiB at the
+highest reading on one card (case A). Only a two-card run after
+`llama.cpp-sgc5` (case D, 12.1-19.5 GiB at the highest reading) gets past
+every corpus's knee. So on phase 1 the cache size matters: it sits at or below
+the 2 GiB-per-table column, and the hit rates of that column are the
+operating point.
 
 **Which corpora a target may quote** (M4). The code and docs corpora are this
 fork's own sources, and the decode and perplexity vehicles in §8 would run on
@@ -1681,9 +1779,10 @@ Expressed as throughput: `pp_S >= 512 / (512/pp_H + T_stall)`.
 ### 8.4 DeepSeek Q2_K (the harder case)
 
 **Where it runs.** Inside `llama.cpp-9g22`'s real-model gate protocol, P0-P7 of
-its §5.2 (`2e5c98889`), after gates 1-4 pass: caches capped at 2 GiB per table
-by the §8.1 lever, no DSpark draft, P3's launch precondition honoured. §4.5
-states when the model fits at all. Two gathers per ubatch; `T(a..b)` is the
+its §5.2 (`3604061db`, rev 4), after gates 1-4 pass: phase 1 on
+`level_zero:0` (the B70 alone), caches capped at 2 GiB per table by the §8.1
+lever, no DSpark draft, P3's launch precondition honoured. §4.5 states when
+the model fits at all. Two gathers per ubatch; `T(a..b)` is the
 measured time of blocks `a..b` for the same ubatch; `U` is the unique miss rows
 of the ubatch, both tables together.
 
@@ -1749,12 +1848,12 @@ position; these arms test that decision rather than assume it:
   over the 10 pairs beats A's by >= 2%**. Anything less is a tie, and a tie
   goes to the arm with fewer host waits, which is A.
 
-**DSpark** (I9). The draft adds +7.9 GiB of host memory (`9g22` §10.3), which is
-§4.5's case C: it is refused at the lowest measured reading. Verify steps carry
-up to 6 tokens, so up to 288 rows per step: 74 ms mean, 131 ms p99 cold on the
-Q3_K_M extent (§9.2.3). The DSpark arm gets its own targets from a Q2_K
-re-measurement when `9g22`'s gates 1-4 have passed; this document sets none
-now.
+**DSpark** (I9). The draft adds +7.9 GiB of host memory (`9g22` §10.3), which
+is §4.5's case C: on one card it is refused at every reading taken today.
+Verify steps carry up to 6 tokens, so up to 288 rows per step: 74 ms mean, 131
+ms p99 cold on the Q3_K_M extent (§9.2.3). The DSpark arm gets its own targets
+from a Q2_K re-measurement when `9g22`'s gates 1-4 have passed; this document
+sets none now.
 
 ### 8.5 Runtime against simulation, and the traps
 
@@ -1994,7 +2093,7 @@ Each ticket names the RED that must fail before its code exists (*lead ruling
 | # | ticket | depends on | RED (fails first) | notes |
 |---|---|---|---|---|
 | T1 | `alloc_tier::HOST_CPU`: raw wrapper (`mmap` + `MADV_HUGEPAGE` + `mlock`), `must_host_cpu`, `device_mappable()`, the 36-site tier census (§3.1); `lazy_residency`; `cache_location`/`expert_resolve_tier` gain reported `STORAGE`; roles `LAZY_ROW_CACHE`/`LAZY_STAGING`/`LAZY_OUTPUT`; canonical contract §3/§4/§12.5 edits | - | a host test that requests `HOST_CPU` under `RLIMIT_MEMLOCK` = 1 page and expects the typed refusal `host-cpu-lock-failed` naming `errno` and the bytes; a census test that a `HOST_CPU` allocation appears in the registry and the shutdown census | header change first: every other ticket includes it |
-| T2 | the process-global host ledger: one budget function, pools capped by their sum, `NO_PINNED` and `RESERVE_MB` semantics, `host_planned_bytes` per §4.2, the plan's host fields, `host-budget-exceeded`, `[HOST-PLAN-BUG]` | T1, **`llama.cpp-rnh3`**, `llama.cpp-moua` (the shared publish struct and lifetime order), `llama.cpp-zhcn` (the `SYCL_Host` compute buffer as a planned tenant) | a planner fixture whose host weights exceed the budget expects `host-budget-exceeded` with each term; a `PER_DEVICE` fixture with two caches expects their pools capped by the **sum** | **changes behaviour for every model.** Lands in two phases: (a) WARN-only, logging what it would refuse; (b) enforcing, only after the regression gates pass: GPT-OSS 120B (host experts, `level_zero:0`), Qwen3.5-35B-A3B on the B50, the `glkg` 1% VRAM fixture, and the Mistral gate, all still admitted (GPU) |
+| T2 | the process-global host ledger: one budget function, pools capped by their sum, `NO_PINNED` and `RESERVE_MB` semantics, `host_planned_bytes` per §4.2, the plan's host fields, `host-budget-exceeded`, `[HOST-PLAN-BUG]` | T1, **`llama.cpp-rnh3`**, `llama.cpp-moua` (the shared publish struct and lifetime order), `llama.cpp-zhcn` (the `SYCL_Host` compute buffer as a planned tenant), **`llama.cpp-sgc5`** (one zone set per plan); computed through the functions `9g22`'s T27 runs (proposed) | a planner fixture whose host weights exceed the budget expects `host-budget-exceeded` with each term; a Q2_K-shaped fixture expects `host_planned_bytes`' zone terms to equal what `populate_host_zone_sizing` and the `configure_host_zones` sizing produce (≈ 14.8 GiB before chunk rounding, `dma_staging_pool` and the RUNTIME pool included, `cpu_quant_buffer_bytes` excluded); a `PER_DEVICE` fixture with two caches expects their pools capped by the **sum** | **changes behaviour for every model.** Lands in two phases: (a) WARN-only, logging what it would refuse; (b) enforcing, only after the regression gates pass: GPT-OSS 120B (host experts, `level_zero:0`), Qwen3.5-35B-A3B on the B50, the `glkg` 1% VRAM fixture, and the Mistral gate, all still admitted (GPU) |
 | T3 | `placement_lazy_table_info` inventory class, excluded from `max_tensor` and every inventory maximum; the residency decision (§4.3); the plan lines (§10) | T2 | a Q2_K-shaped inventory fixture asserts a STAGING zone of **3.64 GiB** (it is ~60 GiB if a table counts as `max_tensor`) and the residencies of §4.5 at a fixed budget | |
 | T4 | the `lazy_table` object: refcount, descriptor buffer type, HOST body load (eager, locked, D1), STORAGE fd, row cache (CLOCK, sharded, 13.3 B/slot index, 256 MiB yieldable chunks), the activation check | T1, T3 | an activation-check mismatch fixture (one extra chunk) must refuse naming both numbers; a yield fixture must free a chunk with no wait while rows remain gatherable | |
 | T5 | the IO engine: pread pool, priority classes, per-context fairness, in-flight dedup, tickets with epochs, landing slabs, block ring | T4 | the abort-mid-ubatch fixture of §5.3 (slot 0 must hold ticket B's rows exactly); a head-of-line fixture (the `batch_probe3 hol` shape against a file fixture) where class-0 completion must not wait for class-0 reads of another context queued earlier | CPU-only |
@@ -2010,6 +2109,14 @@ Each ticket names the RED that must fail before its code exists (*lead ruling
 **Existing tickets this design depends on or leaves open:**
 
 - `llama.cpp-rnh3`: exact host weights plus named terms; T2 depends on it.
+- `llama.cpp-sgc5`: every participating cache builds a full host zone set,
+  WEIGHT included, from one plan (§2.3). T2 depends on it (§4.2): without it,
+  the sum cap refuses a two-card host-expert load that no lever can clear.
+- `llama.cpp-s4ip` (comment `c-rbwa`): the host SCRATCH and RUNTIME pool terms
+  with no host reader, `dma_staging_pool` twice among them. Not on T2's path;
+  T2 counts whatever the sizing code commits, before or after it.
+- `llama.cpp-9g22` T27 (proposed there): the host-only plan dry-run that this
+  design proposes as the one computation behind `host_planned_bytes` (§4.2).
 - `llama.cpp-moua`: lifetime segregation and the shared publish struct; T2.
 - `llama.cpp-zhcn`: the `SYCL_Host` compute buffer as a planned host tenant,
   which holds the HOST gather's output (§7.3); T2.
@@ -2129,14 +2236,19 @@ back only at the next plan publish.
 
 **D8. DeepSeek-V4.1-Flash rung. Decided by the owner** (2026-09-26): Q2_K is
 the primary; its experts fit VRAM plus host, and only the engram tables use
-STORAGE. **Re-check required** (*lead ruling §T1*, C1): through T2's exact
-accounting, Q2_K fits this host's planner at every reading taken today only
-without the draft, with zones counted once and minimal caches, and then with
-**0.5 GiB** to spare at the lowest reading (§4.5, case A). Adding the gate
-protocol's 2 GiB caches, the DSpark draft (+7.9 GiB), or a second set of
-zones is refused at the lowest reading, and `9g22`'s 24 GiB launch envelope
-fails at every reading. Whether the model fits is decided by the other
-tenants' memory at load time. The lead takes this back to the owner.
+STORAGE. **Re-check required** (*lead ruling §T1*, C1). Through T2's
+accounting, with the zone terms taken from the sizing code (§2.3, §4.2) and
+phase 1 on the B70 alone, Q2_K without the draft and with floor caches needs a
+`MemAvailable` of 182.9-186.3 GiB at load (§4.5, case A). That is refused at
+171.4 and 181.8 GiB, fits only at the low corner at 183.7, and fits at 190.4
+with 4.1-7.5 GiB to spare. The gate protocol's 2 GiB caches fit only at 190.4,
+and the DSpark draft (+7.9 GiB) fits at no reading. Rev 2's "fits at every
+reading, 0.5 GiB spare" is withdrawn: it left out ~7.4 GiB of zone terms and
+put ~11 GiB of experts on the B50, which holds none under EXPERT mode.
+`9g22` rev 4 §4.5.2 reaches the same verdict through its P3 envelope and lists
+the levers; `llama.cpp-s4ip` (its lever (b)) recovers ~12.6 GiB per zone set.
+Whether the model fits is decided by the other tenants' memory at load time.
+The lead takes this back to the owner.
 
 **DQ. The HOST gather's output is read by the GPU in place** (a question for
 the lead, §7.3). The consuming SYCL op reads the F32 activation from the CPU
