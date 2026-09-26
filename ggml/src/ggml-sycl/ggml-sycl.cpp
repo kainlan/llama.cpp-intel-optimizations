@@ -18721,8 +18721,13 @@ static thread_local std::
     unordered_map<ggml_sycl_data_ptr_cache_key, ggml_sycl::mem_handle, ggml_sycl_data_ptr_cache_key_hash>
         g_data_ptr_cache;
 
+// Called on every storage publish and restore, often with the map already
+// empty. clear() still walks the whole bucket array, which never shrinks, so
+// an empty map is left alone.
 void ggml_sycl_data_ptr_cache_new_graph() {
-    g_data_ptr_cache.clear();
+    if (!g_data_ptr_cache.empty()) {
+        g_data_ptr_cache.clear();
+    }
 }
 
 struct ggml_sycl_tensor_storage_handle {

@@ -21,6 +21,14 @@ dense_exec_coalesce), so:
   4. leaving a range waits on its queue only when the crossing did not, and
      the crossing reports that it waited only after it has.
 
+Publications (item A-lite). Every storage publish and restore starts a new
+data-pointer cache, and a split token publishes and restores dozens of
+slices. unordered_map::clear() writes the whole bucket array even when the
+map is empty, so:
+
+  5. the cache is cleared only when it holds something, and nothing on the
+     publish/restore path fills it, so a batch clears it once.
+
 Runs under pytest and as a plain script. GGML_SYCL_2LXW_BACKEND_SOURCE and
 GGML_SYCL_2LXW_COMMON_SOURCE point it at other copies (to see it fail on a
 broken tree). No SYCL device or build is touched.
@@ -102,6 +110,13 @@ def member_body(text, name):
     assert m, f"missing definition: {name}"
     open_idx = m.end() - 1
     return text[m.start() : matching_brace(text, open_idx) + 1]
+
+
+def struct_body(text, name):
+    """Body of the struct `name` defined in `text` (not a forward declaration)."""
+    m = re.search(r"\bstruct\s+" + re.escape(name) + r"\s*\{", text)
+    assert m, f"missing definition: struct {name}"
+    return text[m.start() : matching_brace(text, m.end() - 1) + 1]
 
 
 def test_every_staging_writer_bumps_the_generation():
@@ -186,6 +201,33 @@ def test_leaving_a_range_waits_once():
     assert wait >= 0, "a crossing waits for its source queue"
     assert "return true" in cross and cross.find("return true") > wait, "cross reports a wait only after it"
     assert all(m.start() < wait for m in re.finditer(r"return false", cross)), "cross must not report false after waiting"
+
+
+def test_data_ptr_cache_clears_only_when_filled():
+    body = strip_comments(member_body(backend, "void ggml_sycl_data_ptr_cache_new_graph("))
+    clears = [m.start() for m in re.finditer(r"g_data_ptr_cache\.clear\(\)", body)]
+    assert len(clears) == 1, f"one clear of the data-pointer cache ({len(clears)})"
+    guard = re.search(r"if\s*\(\s*!\s*g_data_ptr_cache\.empty\(\)\s*\)\s*\{", body)
+    assert guard and guard.end() <= clears[0] < matching_brace(body, guard.end() - 1), (
+        "the data-pointer cache must be cleared only when it holds something"
+    )
+    code = strip_comments(backend)
+    assert len(re.findall(r"g_data_ptr_cache\.clear\(\)", code)) == 1, (
+        "every clear of the data-pointer cache goes through ggml_sycl_data_ptr_cache_new_graph"
+    )
+
+    # One clear per batch holds only while publishing and restoring fill
+    # nothing: the cache is filled by ggml_sycl_get_data_ptr_slow alone.
+    batch = [
+        member_body(backend, "static bool ggml_sycl_publish_existing_storage_handle_for_device("),
+        struct_body(backend, "block_exec_tensor_storage_slot_snapshot"),
+        struct_body(backend, "block_exec_scoped_tensor_storage_publication"),
+    ]
+    for body in batch:
+        body = strip_comments(body)
+        assert "get_data_ptr" not in body and "g_data_ptr_cache[" not in body, (
+            "the publish/restore path must not fill the data-pointer cache"
+        )
 
 
 if __name__ == "__main__":
