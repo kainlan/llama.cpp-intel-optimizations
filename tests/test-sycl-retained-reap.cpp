@@ -179,11 +179,38 @@ struct reaper {
         }
     }
 
+    // Whether the reap returns within `limit`: a bound on a wait for an
+    // outcome, not an ordering.
+    bool returns_within(std::chrono::milliseconds limit) const {
+        const auto deadline = std::chrono::steady_clock::now() + limit;
+        while (!done.load()) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                return false;
+            }
+            std::this_thread::yield();
+        }
+        return true;
+    }
+
     retained_reap_result join() {
         thread.join();
         return r;
     }
 };
+
+// Opens `g` once the backstop counter has moved past `before`, so the reap
+// cannot have seen its event complete. If it never moves (a reap that skips
+// the backstop), the gate opens after 10 s so the case fails instead of
+// hanging.
+std::thread open_after_backstop(gate & g, size_t before) {
+    return std::thread([&g, before] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (retained_reap_backstop_incomplete() == before && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        g.open();
+    });
+}
 
 retained_reap_result reap(const std::vector<mem_handle> & owners,
                           retained_reap_precondition      pre,
@@ -282,7 +309,9 @@ void test_in_hand_incomplete(sycl::queue & q) {
 }
 
 // A handle the worker parked for command-graph lifetime is pending in QUERY
-// mode and dropped, as unwaitable, in COMPLETE mode.
+// mode and dropped, as unwaitable, in COMPLETE mode. COMPLETE takes only the
+// parked handles its owners name: it never releases graph_unwaitable as a
+// whole (release_graph_retained_handles()).
 void test_parked() {
     mem_handle a = make_owner(900);
     mem_handle b = make_owner(50);
@@ -298,9 +327,11 @@ void test_parked() {
     CHECK(pending, "parked-query: owner marked");
     CHECK_EQ(r.pending_bytes, 900, "parked-query: its bytes");
 
-    r = reap({ a }, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER);
+    const size_t parked = graph_retained_handle_count();
+    r                   = reap({ a }, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER);
     CHECK_EQ(r.entries_dropped, 1, "parked-complete: dropped");
     CHECK_EQ(r.unwaitable_dropped, 1, "parked-complete: as unwaitable");
+    CHECK_EQ(parked - graph_retained_handle_count(), 1, "parked-complete: only a's handle left graph_unwaitable");
     CHECK(only_reference(a), "parked-complete: a is free");
     CHECK(!only_reference(b), "parked-complete: b, not named, stays parked");
     release_graph_retained_handles();
@@ -394,8 +425,8 @@ void test_kept_shared(sycl::queue & q) {
     CHECK(only_reference(blocker), "kept-shared: blocker drained");
 }
 
-// In hand with an event QUERY cannot query: it is pending, and the reap does
-// not wait for the worker to find out what the event is.
+// In hand with an event whose status query throws: an event-bound record not
+// known complete, so QUERY keeps it pending and does not wait on the worker.
 void test_in_hand_unqueryable() {
     retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_AFTER_POP);
     mem_handle a = make_owner(750);
@@ -408,7 +439,7 @@ void test_in_hand_unqueryable() {
     const bool yielded = t.yields();
     retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
     const retained_reap_result r = t.join();
-    CHECK(!yielded, "in-hand-unqueryable: QUERY does not wait on a record it cannot query");
+    CHECK(!yielded, "in-hand-unqueryable: QUERY does not wait on a record it cannot query complete");
     CHECK_EQ(r.in_hand_yields, 0, "in-hand-unqueryable: no yield");
     CHECK_EQ(r.entries_pending, 1, "in-hand-unqueryable: pending");
     CHECK_EQ(r.pending_bytes, 750, "in-hand-unqueryable: its bytes");
@@ -439,6 +470,115 @@ void test_ownerless_owner() {
     CHECK(only_reference(a), "ownerless: a is free");
 }
 
+// R11c: which entries go unwaited is fixed at retention. A queued record is
+// event-bound, so a status query that throws on it means "not known
+// complete": COMPLETE reports the backstop and waits for it, and does not
+// drop it as unwaitable. The positive control is a graph-lifetime entry -- a
+// handle the worker parked -- which COMPLETE drops unwaited, with no backstop.
+void test_query_throw_is_incomplete(sycl::queue & q) {
+    mem_handle   blocker = hold_worker();
+    mem_handle   a       = make_owner(820);
+    gate         g(q);
+    const size_t before = retained_reap_backstop_incomplete();
+    retain_handles_until_event({ a }, g.event);
+    retained_reap_test_fail_next_query();
+    std::thread                opener         = open_after_backstop(g, before);
+    const retained_reap_result r              = reap({ a }, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER);
+    const bool                 open_at_return = g.is_open.load();
+    opener.join();
+    CHECK(open_at_return, "query-throws: the reap waited for the record's event");
+    CHECK_EQ(retained_reap_backstop_incomplete() - before, 1, "query-throws: the backstop is reported");
+    CHECK_EQ(r.unwaitable_dropped, 0, "query-throws: an event-bound record is not dropped as unwaitable");
+    CHECK_EQ(r.entries_dropped, 1, "query-throws: dropped after the wait");
+    CHECK(only_reference(a), "query-throws: a is free");
+    release_worker();
+    CHECK(only_reference(blocker), "query-throws: blocker drained");
+
+    mem_handle c = make_owner(410);
+    retained_drain_test_fail_next_wait_as_command_graph();
+    retain_handles_until_event({ c }, sycl::event{});
+    (void) drain_retained_handles(true);
+    const size_t               control_before = retained_reap_backstop_incomplete();
+    const retained_reap_result control        = reap({ c }, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER);
+    CHECK_EQ(control.unwaitable_dropped, 1, "query-throws control: a parked handle is dropped unwaited");
+    CHECK_EQ(retained_reap_backstop_incomplete() - control_before, 0, "query-throws control: no backstop");
+    CHECK(only_reference(c), "query-throws control: c is free");
+}
+
+// A record whose wait fails is parked whatever the exception says: its
+// handles are kept for graph lifetime, never freed early.
+void test_wait_failure_parks() {
+    mem_handle   a      = make_owner(450);
+    const size_t before = graph_retained_handle_count();
+    retained_drain_test_fail_next_wait(RETAINED_DRAIN_TEST_WAIT_DEVICE_ERROR);
+    retain_handles_until_event({ a }, sycl::event{});
+    (void) drain_retained_handles(true);
+    CHECK_EQ(graph_retained_handle_count() - before, 1, "wait-failure: a failed wait parks the record's handle");
+    const retained_reap_result r = reap({ a }, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER);
+    CHECK_EQ(r.unwaitable_dropped, 1, "wait-failure: COMPLETE drops it as graph-lifetime");
+    CHECK(only_reference(a), "wait-failure: a is free after the reap");
+}
+
+// R11b: the in-hand backstop. The worker is inside its wait on a gated event,
+// so the record is in hand and not complete. COMPLETE reports the backstop
+// once and returns only after the gate opens and the worker drops it.
+void test_in_hand_backstop(sycl::queue & q) {
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_AFTER_POP);
+    mem_handle a = make_owner(850);
+    gate       g(q);
+    retain_handles_until_event({ a }, g.event);
+    wait_parked(true);
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);  // on into its wait, still in hand
+
+    const size_t               before         = retained_reap_backstop_incomplete();
+    std::thread                opener         = open_after_backstop(g, before);
+    const retained_reap_result r              = reap({ a }, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER);
+    const bool                 open_at_return = g.is_open.load();
+    opener.join();
+    CHECK(open_at_return, "in-hand-backstop: the reap returned only after the gate opened");
+    CHECK_EQ(retained_reap_backstop_incomplete() - before, 1, "in-hand-backstop: reported once");
+    CHECK_EQ(r.in_hand_yields, 1, "in-hand-backstop: it yielded to the worker");
+    CHECK(only_reference(a), "in-hand-backstop: the worker's reference is gone at return");
+    (void) drain_retained_handles(true);
+}
+
+// R13b: the yield is bounded by the in-hand record's sequence. The reap
+// snapshots record A in hand and stops at REAPER_AFTER_SNAPSHOT; the worker
+// drops A and pops an unrelated record B on a gated event. Let go, the reap
+// returns while B is still in hand, never waiting on B's work.
+void test_seq_bound(sycl::queue & q) {
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_AFTER_POP);
+    mem_handle a = make_owner(310);
+    mem_handle b = make_owner(620);
+    gate       g(q);
+    retain_handles_until_event({ a }, sycl::event{});
+    wait_parked(true);
+    retain_handles_until_event({ b }, g.event);
+
+    retained_reap_test_hold_after_snapshot(true);
+    reaper t([&] { return reap({ a }, RETAINED_REAP_QUERY_EVENT_STATUS); });
+    while (!retained_reap_test_parked() && !t.done.load()) {
+        std::this_thread::yield();
+    }
+    CHECK(retained_reap_test_parked(), "seq-bound: the reap stopped after its snapshot of A");
+    const uint64_t parks = retained_drain_test_parks();
+    retained_drain_test_release_once();  // the worker drops A and stops with B in hand
+    while (retained_drain_test_parks() == parks) {
+        std::this_thread::yield();
+    }
+    retained_reap_test_hold_after_snapshot(false);
+    const bool returned = t.returns_within(std::chrono::seconds(10));
+    CHECK(returned, "seq-bound: the reap returned while an unrelated record was in hand");
+
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
+    g.open();
+    const retained_reap_result r = t.join();
+    CHECK_EQ(r.in_hand_yields, 1, "seq-bound: it yielded to A");
+    CHECK(only_reference(a), "seq-bound: a is free");
+    (void) drain_retained_handles(true);
+    CHECK(only_reference(b), "seq-bound: b went with the worker once complete");
+}
+
 // COMPLETE with an event the caller did not finish: the backstop waits for it
 // instead of freeing early, and reports the plan bug.
 void test_backstop(sycl::queue & q) {
@@ -447,14 +587,7 @@ void test_backstop(sycl::queue & q) {
     gate         g(q);
     const size_t before = retained_reap_backstop_incomplete();
     retain_handles_until_event({ a }, g.event);
-    // Opened once the reap has reported the record incomplete, so it cannot
-    // have seen it complete; it returns only after the gate opens.
-    std::thread                opener([&] {
-        while (retained_reap_backstop_incomplete() == before) {
-            std::this_thread::yield();
-        }
-        g.open();
-    });
+    std::thread                opener         = open_after_backstop(g, before);
     const retained_reap_result r              = reap({ a }, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER);
     const bool                 open_at_return = g.is_open.load();
     opener.join();
@@ -533,6 +666,10 @@ int main(int argc, char ** argv) {
     test_ownerless_owner();
     test_parked();
     test_yield_then_parked();
+    test_query_throw_is_incomplete(q);
+    test_wait_failure_parks();
+    test_in_hand_backstop(q);
+    test_seq_bound(q);
     test_backstop(q);
     test_strict_aborts(argv[0], "strict-child", "[CONTEXT-PLAN-BUG] retained-reap backstop");
     test_strict_aborts(argv[0], "strict-ownerless-child", "has no owner control");

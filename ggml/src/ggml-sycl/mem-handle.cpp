@@ -84,20 +84,28 @@ std::once_flag                         g_retained_drain_worker_once;
 std::atomic<bool> g_fail_next_retained_handle_publication{ false };
 #endif
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-std::atomic<size_t>  g_retained_reap_backstop_incomplete{ 0 };
-std::atomic<uint8_t> g_retained_drain_test_hold{ 0 };
-std::atomic<bool>    g_retained_drain_test_parked{ false };
-std::atomic<bool>    g_retained_drain_test_command_graph{ false };
-std::atomic<bool>    g_retained_reap_test_unqueryable{ false };
-std::atomic<size_t>  g_retained_reap_test_yielding{ 0 };
-thread_local int     g_retained_store_lock_depth = 0;
+std::atomic<size_t>   g_retained_reap_backstop_incomplete{ 0 };
+std::atomic<uint8_t>  g_retained_drain_test_hold{ 0 };
+std::atomic<bool>     g_retained_drain_test_parked{ false };
+std::atomic<uint64_t> g_retained_drain_test_parks{ 0 };
+std::atomic<uint64_t> g_retained_drain_test_releases{ 0 };
+std::atomic<uint8_t>  g_retained_drain_test_fail_wait{ 0 };  // retained_drain_test_wait_failure
+std::atomic<bool>     g_retained_reap_test_query_throws{ false };
+std::atomic<size_t>   g_retained_reap_test_yielding{ 0 };
+std::atomic<bool>     g_retained_reap_test_hold{ false };
+std::atomic<bool>     g_retained_reap_test_parked{ false };
+thread_local int      g_retained_store_lock_depth = 0;
 
+// Held while the hold names `point`, until the hold moves or one
+// retained_drain_test_release_once() lets this pause go.
 void retained_drain_test_pause_at(uint8_t point) {
     if (g_retained_drain_test_hold.load() != point) {
         return;
     }
+    const uint64_t releases = g_retained_drain_test_releases.load();
     g_retained_drain_test_parked.store(true);
-    while (g_retained_drain_test_hold.load() == point) {
+    ++g_retained_drain_test_parks;
+    while (g_retained_drain_test_hold.load() == point && g_retained_drain_test_releases.load() == releases) {
         std::this_thread::yield();
     }
     g_retained_drain_test_parked.store(false);
@@ -158,7 +166,7 @@ thread_local graph_recording_sink_state g_graph_recording_sink;
 //
 // A non-recording thread's event is a real, waitable event, so the normal
 // event-bound path releases it naturally. If that turns out to be a recorded
-// event after all, the drain worker's "command graph" catch below parks it in
+// event after all, its wait fails and the drain worker parks it in
 // graph_unwaitable anyway -- so this narrowing fails safe.
 bool graph_lifetime_retention_active() {
     return g_graph_retained_handle_sink != nullptr || g_ggml_sycl_graph_recording;
@@ -214,6 +222,8 @@ void retained_handle_drain_loop() {
 #endif
 
         sycl::event done_event;
+        const char * failure = nullptr;
+        std::string  failure_text;
         try {
             struct event_wait_watchdog_guard {
                 event_wait_watchdog_guard() {
@@ -227,33 +237,42 @@ void retained_handle_drain_loop() {
 
             record.event.wait_and_throw();
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-            if (g_retained_drain_test_command_graph.exchange(false)) {
-                throw std::runtime_error("event is not waitable: it belongs to a command graph (test)");
+            switch (g_retained_drain_test_fail_wait.exchange(RETAINED_DRAIN_TEST_WAIT_OK)) {
+                case RETAINED_DRAIN_TEST_WAIT_COMMAND_GRAPH:
+                    throw std::runtime_error("event is not waitable: it belongs to a command graph (test)");
+                case RETAINED_DRAIN_TEST_WAIT_DEVICE_ERROR:
+                    throw std::runtime_error("device lost (test)");
+                default:
+                    break;
             }
 #endif
         } catch (const std::exception & e) {
-            const std::string msg = e.what();
-            if (msg.find("command graph") != std::string::npos || msg.find("Command Graph") != std::string::npos) {
-                auto &              state = *g_retained_handles_state;
-                retained_store_lock lock(state);
-                state.graph_unwaitable.insert(state.graph_unwaitable.end(),
-                                              std::make_move_iterator(record.handles.begin()),
-                                              std::make_move_iterator(record.handles.end()));
-                state.graph_unwaitable_ids.insert(state.graph_unwaitable_ids.end(), record.ids.begin(),
-                                                  record.ids.end());
-                record.handles.clear();
-                // Parked and no longer in hand, in one critical section: a
-                // reaper that sees in_hand_valid clear finds them here.
-                state.in_hand_valid = false;
-                std::swap(done_event, state.in_hand_event);
-                GGML_SYCL_DEBUG(
-                    "[MEM-HANDLE] retained %zu leases for command-graph lifetime; graph events are not waitable\n",
-                    state.graph_unwaitable.size());
-            } else {
-                GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed: %s\n", e.what());
-            }
+            failure_text = e.what();
+            failure      = failure_text.c_str();
         } catch (...) {
-            GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed with unknown exception\n");
+            failure = "unknown exception";
+        }
+        if (failure) {
+            // The wait did not show the record's work complete -- a recorded
+            // command graph's event cannot be waited on, nor can a lost
+            // device's -- so its handles are kept for graph lifetime, never
+            // freed early. What the exception says is not read: the record
+            // was retained as event-bound, and a failed wait parks it
+            // whatever the reason.
+            auto &              state = *g_retained_handles_state;
+            retained_store_lock lock(state);
+            state.graph_unwaitable.insert(state.graph_unwaitable.end(), std::make_move_iterator(record.handles.begin()),
+                                          std::make_move_iterator(record.handles.end()));
+            state.graph_unwaitable_ids.insert(state.graph_unwaitable_ids.end(), record.ids.begin(), record.ids.end());
+            record.handles.clear();
+            // Parked and no longer in hand, in one critical section: a
+            // reaper that sees in_hand_valid clear finds them here.
+            state.in_hand_valid = false;
+            std::swap(done_event, state.in_hand_event);
+            GGML_LOG_WARN(
+                "[MEM-HANDLE] event-bound lease wait failed (%s); its %zu leases are kept for graph lifetime "
+                "(%zu parked) rather than freed early\n",
+                failure, record.ids.size(), state.graph_unwaitable.size());
         }
         record.handles.clear();
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -2193,21 +2212,21 @@ bool strict_plan_checks_enabled() {
 
 namespace {
 
-// Whether `event` has completed, without waiting on it. A recorded command
-// graph's event cannot be queried; `queryable` says so.
-bool retained_event_complete(const sycl::event & event, bool * queryable) {
-    *queryable = true;
-#if defined(GGML_SYCL_PRIVATE_TESTING)
-    if (g_retained_reap_test_unqueryable.exchange(false)) {
-        *queryable = false;
-        return false;
-    }
-#endif
+// Whether an event-bound record's event is known complete, without waiting
+// on it. Queued and in-hand records are event-bound (a graph-lifetime entry
+// is in graph_unwaitable and is never queried), so a status query that
+// throws means only "not known complete": the record is treated as still
+// running, never as one that may be dropped without a wait.
+bool retained_event_complete(const sycl::event & event) {
     try {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        if (g_retained_reap_test_query_throws.exchange(false)) {
+            throw std::runtime_error("status query failed (test)");
+        }
+#endif
         return event.get_info<sycl::info::event::command_execution_status>() ==
                sycl::info::event_command_status::complete;
     } catch (...) {
-        *queryable = false;
         return false;
     }
 }
@@ -2335,38 +2354,48 @@ retained_reap_result release_retained_referencing(const retained_reap_request & 
     }
 
     // Queried with the mutex released: a Level Zero status query can block.
+    // Queued and in-hand records are event-bound, so one not known complete
+    // is still running: QUERY keeps it, COMPLETE reports the backstop and
+    // waits for it. Only graph_unwaitable entries go unwaited.
     std::vector<retained_handle_record> kept;
-    std::vector<uint8_t>                unqueryable(matched.size(), 0);
     std::vector<uint8_t>                keep(matched.size(), 0);
     for (size_t r = 0; r < matched.size(); ++r) {
-        bool       queryable = true;
-        const bool done      = retained_event_complete(matched[r].event, &queryable);
-        unqueryable[r]       = queryable ? 0 : 1;
+        const bool done = retained_event_complete(matched[r].event);
         if (!complete && !done) {
             (void) retained_ids_match(owner_ids, matched[r].ids, &pending);
             keep[r] = 1;
             kept.push_back(std::move(matched[r]));
             ++result.entries_pending;
-        } else if (complete && queryable && !done) {
+        } else if (complete && !done) {
             report_retained_reap_backstop(reason, "queued record");
         }
     }
 
     bool yield_in_hand = false;
     if (in_hand_match) {
-        bool       queryable = true;
-        const bool done      = retained_event_complete(in_hand_event, &queryable);
-        if (complete && queryable && !done) {
+        const bool done = retained_event_complete(in_hand_event);
+        if (complete && !done) {
             report_retained_reap_backstop(reason, "in-hand record");
         }
-        // A QUERY caller does not wait on device work: an in-hand record whose
-        // event is still running, or cannot be queried, stays pending. One
-        // queried complete is waited for -- only the worker's drop is left. A
-        // COMPLETE caller waits for the worker whatever the event: it drops
-        // the record, or parks a graph event's in graph_unwaitable.
-        yield_in_hand = complete || (queryable && done);
+        // A QUERY caller does not wait on device work: an in-hand record not
+        // known complete stays pending. One queried complete is waited for --
+        // only the worker's drop is left. A COMPLETE caller waits for the
+        // worker whatever the event: it drops the record, or parks it in
+        // graph_unwaitable if its wait fails, where the scan below finds it.
+        yield_in_hand = complete || done;
     }
     in_hand_event = sycl::event{};
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // REAPER_AFTER_SNAPSHOT: the in-hand record is snapshotted and queried,
+    // and the mutex is not yet taken again.
+    if (g_retained_reap_test_hold.load()) {
+        g_retained_reap_test_parked.store(true);
+        while (g_retained_reap_test_hold.load()) {
+            std::this_thread::yield();
+        }
+        g_retained_reap_test_parked.store(false);
+    }
+#endif
 
     {
         retained_store_lock lock(state);
@@ -2410,15 +2439,15 @@ retained_reap_result release_retained_referencing(const retained_reap_request & 
 
     // Wait (COMPLETE's backstop) and drop, with the mutex released: a dropped
     // handle's destructor may free memory or publish retention of its own.
+    // A COMPLETE caller has synchronized every queue that reaches these
+    // owners and destroyed its own graphs, so a wait that fails after the
+    // backstop is reported is not a reason to keep the record.
     for (size_t r = 0; r < matched.size(); ++r) {
         retained_handle_record & record = matched[r];
         if (keep[r]) {
             continue;
         }
-        if (complete && unqueryable[r]) {
-            // A graph event the caller's own graph teardown made unreachable.
-            ++result.unwaitable_dropped;
-        } else if (complete) {
+        if (complete) {
             try {
                 record.event.wait_and_throw();
             } catch (const std::exception & e) {
@@ -2458,12 +2487,32 @@ bool retained_drain_test_parked() {
     return g_retained_drain_test_parked.load();
 }
 
+void retained_drain_test_release_once() {
+    ++g_retained_drain_test_releases;
+}
+
+uint64_t retained_drain_test_parks() {
+    return g_retained_drain_test_parks.load();
+}
+
+void retained_drain_test_fail_next_wait(retained_drain_test_wait_failure failure) {
+    g_retained_drain_test_fail_wait.store(static_cast<uint8_t>(failure));
+}
+
 void retained_drain_test_fail_next_wait_as_command_graph() {
-    g_retained_drain_test_command_graph.store(true);
+    retained_drain_test_fail_next_wait(RETAINED_DRAIN_TEST_WAIT_COMMAND_GRAPH);
 }
 
 void retained_reap_test_fail_next_query() {
-    g_retained_reap_test_unqueryable.store(true);
+    g_retained_reap_test_query_throws.store(true);
+}
+
+void retained_reap_test_hold_after_snapshot(bool hold) {
+    g_retained_reap_test_hold.store(hold);
+}
+
+bool retained_reap_test_parked() {
+    return g_retained_reap_test_parked.load();
 }
 
 size_t retained_reap_test_yielding() {

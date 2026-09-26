@@ -868,25 +868,35 @@ void release_graph_retained_handles();
 // handle into or out of the store takes that handle's spinlock under the
 // mutex, but nothing is released under it: matches are moved out under the
 // mutex, then waited on and dropped after it is released.
+//
+// Which entries are waited on is fixed when they are retained, never read from
+// an exception: queued and in-hand records are event-bound, published while
+// no graph was recording on the publishing thread, so their event is a real
+// one; graph_unwaitable holds the graph-lifetime entries -- retained while
+// graph_lifetime_retention_active(), or parked by the drain worker when a
+// record's wait failed -- and they are never queried or waited on. A status
+// query that throws on an event-bound record means only "not known complete".
 // GGML_SYCL_STRICT_PLAN=1: a [CONTEXT-PLAN-BUG] -- state the context plan
 // says cannot exist -- aborts instead of logging a WARN. Read once.
 bool strict_plan_checks_enabled();
 
 enum retained_reap_precondition {
-    // The caller has synchronized every queue that can reach the owners, so
-    // every matching event is complete. A matching record, the in-hand one
-    // (the reap yields until the worker is done with it) and a matching
-    // graph_unwaitable handle are all dropped. An event found incomplete is a
-    // missed queue: it is waited on, never freed early, counted, and reported
-    // as a [CONTEXT-PLAN-BUG] -- a WARN, or an abort under
-    // GGML_SYCL_STRICT_PLAN=1.
+    // The caller has synchronized every queue that can reach the owners, and
+    // destroyed its own graphs, so every matching event is complete. A
+    // matching record, the in-hand one (the reap yields until the worker is
+    // done with it) and a matching graph_unwaitable handle are all dropped;
+    // graph_unwaitable handles no owner names stay parked
+    // (release_graph_retained_handles() is never called). An event-bound
+    // event not known complete is a missed queue: it is waited on, never
+    // freed early, counted, and reported as a [CONTEXT-PLAN-BUG] -- a WARN,
+    // or an abort under GGML_SYCL_STRICT_PLAN=1.
     RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER,
-    // The caller vouches for nothing. Only a matching entry whose event is
+    // The caller vouches for nothing. Only a matching record whose event is
     // queried complete is dropped (a complete in-hand record by yielding to
-    // the worker); the rest are kept and reported pending. An entry whose
-    // event cannot be queried -- graph_unwaitable handles, a command graph's
-    // record -- is never waited for: it is kept. Nothing waits on device work,
-    // and only an owner with no owner control is reported as a bug.
+    // the worker); the rest -- records not known complete, and every
+    // graph_unwaitable handle -- are kept and reported pending. Nothing waits
+    // on device work, and only an owner with no owner control is reported as
+    // a bug.
     RETAINED_REAP_QUERY_EVENT_STATUS,
 };
 
@@ -910,9 +920,9 @@ struct retained_reap_request {
 //    owner handle's size()), plus those of owners with no owner control; so 0
 //    in COMPLETE unless an owner has none;
 //  - in_hand_yields: waits on the worker's in-hand record;
-//  - unwaitable_dropped: entries dropped without a wait because their event
-//    cannot be queried -- graph_unwaitable handles, and queued records whose
-//    event is a command graph's (COMPLETE only), a subset of entries_dropped.
+//  - unwaitable_dropped: entries dropped without a wait because they are
+//    graph-lifetime -- graph_unwaitable handles (COMPLETE only), a subset of
+//    entries_dropped.
 struct retained_reap_result {
     size_t entries_dropped    = 0;
     size_t entries_pending    = 0;
@@ -930,23 +940,39 @@ size_t retained_reap_backstop_incomplete();
 // Drain worker pause points for the reap's handoff tests: AFTER_POP holds the
 // worker with its record in hand, before it waits on the record's event;
 // AFTER_DROP holds it after it dropped the record's handles, before it clears
-// the in-hand record. retained_drain_test_parked() says whether it is held.
+// the in-hand record. retained_drain_test_parked() says whether it is held,
+// retained_drain_test_parks() how many times it has been, and
+// retained_drain_test_release_once() lets one pause go with the hold kept.
 enum retained_drain_test_point : uint8_t {
     RETAINED_DRAIN_TEST_POINT_NONE,
     RETAINED_DRAIN_TEST_POINT_AFTER_POP,
     RETAINED_DRAIN_TEST_POINT_AFTER_DROP,
 };
 
-void   retained_drain_test_hold(retained_drain_test_point point);
-bool   retained_drain_test_parked();
-// The worker's next event wait throws as a recorded command graph's does.
-void   retained_drain_test_fail_next_wait_as_command_graph();
-// The reap's next event status query fails as a recorded command graph's does.
-void   retained_reap_test_fail_next_query();
+// How the worker's next event wait fails.
+enum retained_drain_test_wait_failure : uint8_t {
+    RETAINED_DRAIN_TEST_WAIT_OK,
+    RETAINED_DRAIN_TEST_WAIT_COMMAND_GRAPH,  // as a recorded command graph's
+    RETAINED_DRAIN_TEST_WAIT_DEVICE_ERROR,   // any other exception
+};
+
+void     retained_drain_test_hold(retained_drain_test_point point);
+bool     retained_drain_test_parked();
+uint64_t retained_drain_test_parks();
+void     retained_drain_test_release_once();
+void     retained_drain_test_fail_next_wait(retained_drain_test_wait_failure failure);
+void     retained_drain_test_fail_next_wait_as_command_graph();
+// The reap's next event status query throws.
+void     retained_reap_test_fail_next_query();
+// The reap's REAPER_AFTER_SNAPSHOT pause point: while held, a reap stops after
+// it snapshotted and queried the in-hand record, before it takes the mutex
+// again to yield. retained_reap_test_parked() says whether one is stopped.
+void     retained_reap_test_hold_after_snapshot(bool hold);
+bool     retained_reap_test_parked();
 // How many reaps are waiting on the drain worker's in-hand record now.
-size_t retained_reap_test_yielding();
+size_t   retained_reap_test_yielding();
 // Whether this thread holds the retained-store mutex.
-bool   retained_store_mutex_held();
+bool     retained_store_mutex_held();
 #endif
 
 // How many handles are currently parked for command-graph lifetime. Exposed so a
