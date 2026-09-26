@@ -94,15 +94,18 @@ inline long sycl_tuning_getpid() {
 // for a swa_full=true raw-API context) although it was written before SWA
 // layers were sized by that flag at all.
 // v5 (llama.cpp-1oa3): UbatchCacheKey::device_key names every device whose
-// budget decides the fit -- including, under the planner's multi-device
-// plan, every GPU the scheduler does not list, marked "hidden:" -- with each
-// one's budget percentage and external headroom, whether that plan ran
-// ("|plan=multi"), and the multi-GPU placement knobs that are set, and
-// device_set_hash (an index hash over the scheduler-visible
+// budget decides the fit -- including a GPU the scheduler hides but the
+// placement planner uses -- with each one's budget percentage and external
+// headroom, and device_set_hash (an index hash over the scheduler-visible
 // backends only) is gone. A v4 entry's device_key names one card, so a v4
 // B70-alone entry would still be read back for a collapsed level_zero:0,1
 // split; bumping rejects every v4 file instead.
-constexpr int CACHE_VERSION = 5;
+// v6 (llama.cpp-1oa3): the device_key also records whether the planner's
+// multi-device plan ran ("|plan=multi") and, under it, keys every physical
+// GPU the scheduler does not list. A v5 "B70,B50" entry written under that
+// plan spells exactly what a v6 key spells for the single-device plan over
+// the same two scheduler-visible cards, so every v5 file is rejected.
+constexpr int CACHE_VERSION = 6;
 
 // =============================================================================
 // Path Utilities

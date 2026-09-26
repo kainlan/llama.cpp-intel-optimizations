@@ -1987,10 +1987,58 @@ def test_backend_extends_the_device_set_with_hidden_planner_gpus():
         "both lookup and store must resolve their key through resolve_device_set_key()"
     )
     # The gate above is only right while the planner uses the same one.
-    assert re.search(
-        r"info\.total_gpu_count\s*>=\s*2\s*&&\s*ggml_backend_sycl_moe_multi_gpu_requested\s*\(\s*\)",
-        _normalize_ws(GGML_SYCL_CPP_CODE),
-    ), "the multi-device placement plan must still be gated on ggml_backend_sycl_moe_multi_gpu_requested()"
+    _assert_planner_branches_on_the_gate(_normalize_ws(GGML_SYCL_CPP_CODE))
+
+
+def _brace_block(code: str, open_idx: int) -> str:
+    depth = 0
+    for i in range(open_idx, len(code)):
+        depth += {"{": 1, "}": -1}.get(code[i], 0)
+        if depth == 0:
+            return code[open_idx + 1:i]
+    raise AssertionError("unbalanced braces")
+
+
+_PLANNER_FN = "static void compute_and_store_plan_for_inventory("
+_PLANNER_GATE = "if (info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()) {"
+
+
+def _assert_planner_branches_on_the_gate(code: str) -> None:
+    """compute_and_store_plan_for_inventory() must reach
+    compute_multi_device_plan() only inside the branch taken on
+    ggml_backend_sycl_moe_multi_gpu_requested() -- the predicate the key
+    reads to decide |plan=multi."""
+    fn = code.find(_PLANNER_FN)
+    assert fn != -1, "could not find compute_and_store_plan_for_inventory()"
+    fn_body = _brace_block(code, code.index("{", fn))
+    gate = fn_body.find(_PLANNER_GATE)
+    assert gate != -1, (
+        "compute_and_store_plan_for_inventory() must branch on "
+        "`info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()`"
+    )
+    gate_block = _brace_block(fn_body, gate + len(_PLANNER_GATE) - 1)
+    assert "compute_multi_device_plan(" in gate_block, (
+        "compute_multi_device_plan() must be called inside the multi-device gate's branch"
+    )
+    assert "compute_multi_device_plan(" not in fn_body[:gate], (
+        "compute_multi_device_plan() must not be reachable before the multi-device gate"
+    )
+
+
+def test_planner_gate_check_has_a_mutation_witness():
+    """Mutation witness for the planner-gate check: dropping the
+    ggml_backend_sycl_moe_multi_gpu_requested() call from the branch
+    condition must fail it, since the key would then describe a plan the
+    planner no longer gates the same way."""
+    raw = GGML_SYCL_CPP
+    fn = raw.find(_PLANNER_FN)
+    assert fn != -1, "mutation target not found -- update this witness to match the real source"
+    target = "    if (info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()) {\n"
+    at = raw.find(target, fn)
+    assert at != -1, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw[:at] + "    if (info.total_gpu_count >= 2) {\n" + raw[at + len(target):]
+    with pytest.raises(AssertionError, match="must branch on"):
+        _assert_planner_branches_on_the_gate(_normalize_ws(strip_comments(mutated_raw)))
 
 
 def test_hidden_gpu_gate_holds_for_a_dense_model():

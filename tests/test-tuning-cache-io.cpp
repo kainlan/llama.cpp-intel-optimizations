@@ -566,13 +566,15 @@ TEST(atomic_write) {
 // ever running against the real cache directory unsandboxed.
 // =============================================================================
 
-// Test: CACHE_VERSION was bumped to 5 (llama.cpp-1oa3, a device_key that
-// names every participating device and its budget) -- v1 stays reserved for
-// the pre-existing matmul dispatch-tuning format alone, v2 for the
-// pre-kv_unified ubatch key shape, v3 (llama.cpp-3aos) for the pre-swa_full
-// one, v4 (llama.cpp-uajm) for the single-device device_key.
-TEST(cache_version_is_5) {
-    ASSERT(CACHE_VERSION == 5);
+// Test: CACHE_VERSION was bumped to 6 (llama.cpp-1oa3, a device_key that
+// names every participating device and its budget, whether the multi-device
+// plan ran, and the placement knobs) -- v1 stays reserved for the
+// pre-existing matmul dispatch-tuning format alone, v2 for the pre-kv_unified
+// ubatch key shape, v3 (llama.cpp-3aos) for the pre-swa_full one, v4
+// (llama.cpp-uajm) for the single-device device_key, v5 for the device-set
+// key before it recorded the multi-device plan.
+TEST(cache_version_is_6) {
+    ASSERT(CACHE_VERSION == 6);
     return true;
 }
 
@@ -923,6 +925,54 @@ TEST(ubatch_cache_v4_file_rejected) {
     bool                          result = load_ubatch_cache(cache_dir, device_name, loaded);
     ASSERT(result == false);
     ASSERT(loaded.empty());
+
+    std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// Test: a v5 ubatch cache file is rejected, and the next store replaces it
+// with a current-version file. v5's device_key did not record whether the
+// multi-device plan ran, so a v5 "B70,B50" entry written under that plan
+// (GGML_SYCL_MOE_MULTI_GPU unset) spells exactly what a current key spells
+// for the single-device plan (GGML_SYCL_MOE_MULTI_GPU=0) over the same two
+// scheduler-visible cards -- a terminal entry from one would be trusted by
+// the other.
+TEST(ubatch_cache_v5_file_rejected_then_replaced) {
+    std::string       cache_dir   = "/tmp/llama_test_ubatch_cache_v5_" + std::to_string(getpid());
+    std::string       device_name = "TestUbatchV5Device_" + std::to_string(getpid());
+    const std::string device_key =
+        "IntelR_ArcTM_Pro_B70_Graphics@1.17.39395+13/pct=100/headroom=2147483648,"
+        "IntelR_ArcTM_Pro_B50_Graphics@1.17.39395+13/pct=100/headroom=2147483648";
+
+    create_dir_recursive(cache_dir);
+    std::string   path = get_ubatch_cache_file(cache_dir, device_name);
+    std::ofstream f(path);
+    f << "{\n";
+    f << "  \"version\": 5,\n";
+    f << "  \"device\": \"" << device_name << "\",\n";
+    f << "  \"entries\": [{\"key\":{\"device_key\":\"" << device_key << "\",\"model_name\":\"m\",\"model_size\":0,"
+      << "\"model_hash\":0,\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":false,\"n_seq_max\":1,"
+      << "\"type_k\":0,\"type_v\":0,\"kv_unified\":false,\"swa_full\":false},"
+      << "\"n_ubatch\":2048,\"reason\":\"ladder exhausted\",\"created\":\"2026-09-26T00:00:00Z\"}]\n";
+    f << "}\n";
+    f.close();
+
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded) == false);
+    ASSERT(loaded.empty());
+
+    UbatchCacheEntry fresh;
+    fresh.key.device_key = device_key;
+    fresh.key.model_name = "m";
+    fresh.key.n_ctx      = 4096;
+    fresh.key.n_batch    = 2048;
+    fresh.key.n_seq_max  = 1;
+    fresh.n_ubatch       = 1024;
+    fresh.reason         = "ladder exhausted";
+    ASSERT(save_ubatch_cache(cache_dir, device_name, { fresh }));
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 1 && loaded[0].n_ubatch == 1024);
 
     std::remove(path.c_str());
     rmdir(cache_dir.c_str());
@@ -1501,7 +1551,7 @@ int main() {
     RUN_TEST(parse_string_edge_cases);
     RUN_TEST(atomic_write);
 
-    RUN_TEST(cache_version_is_5);
+    RUN_TEST(cache_version_is_6);
     RUN_TEST(ubatch_key_equality);
     RUN_TEST(ubatch_kv_mode_json_roundtrip);
     RUN_TEST(ubatch_swa_full_json_roundtrip);
@@ -1511,6 +1561,7 @@ int main() {
     RUN_TEST(ubatch_cache_v2_file_rejected);
     RUN_TEST(ubatch_cache_v3_file_rejected);
     RUN_TEST(ubatch_cache_v4_file_rejected);
+    RUN_TEST(ubatch_cache_v5_file_rejected_then_replaced);
     RUN_TEST(ubatch_cache_unwritable_dir);
     RUN_TEST(ubatch_cache_load_missing_file);
     RUN_TEST(ubatch_cache_string_escaping_roundtrip);
