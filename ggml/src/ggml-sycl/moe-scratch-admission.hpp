@@ -172,8 +172,11 @@ inline bool pp_moe_onednn_reserve_if_admitted(const pp_moe_onednn_scratch_shape 
 // that fits the RUNTIME zone competes with none of them.
 //
 // Each KV-zone slot is one allocation, so free space in pieces cannot hold it.
-// The whole KV-zone part must fit the zone's largest free block: sufficient,
-// not necessary, so a -ub the refusal names can be placed.
+// The whole KV-zone part must fit the zone's largest free block. That is an
+// estimate: the allocator reports the head of its largest size class, not a
+// scanned maximum, and with two or more KV-zone slots the later allocations
+// can still miss. It covers the single-allocation case; for the rest, a failed
+// reserve refuses the ring, which an automatic -ub steps down from.
 struct pp_moe_onednn_ring_admission_inputs {
     size_t   kv_zone_available_bytes       = 0;  // KV bytes the device can still hold (live allocator figure)
     size_t   kv_admitted_bytes             = 0;  // KV the transaction admitted on this device

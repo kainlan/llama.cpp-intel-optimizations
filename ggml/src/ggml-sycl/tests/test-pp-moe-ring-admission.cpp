@@ -225,6 +225,22 @@ void test_kv_zone_part_must_fit_the_largest_free_block() {
     pp_moe_onednn_ring_admission_inputs runtime_only = b50_inputs(512, 0);
     runtime_only.kv_zone_largest_block_bytes         = 0;
     check(pp_moe_onednn_admit_ring(runtime_only).admit, "-ub 512 fits the RUNTIME zone: the KV-zone block is moot");
+
+    // Ring depth 2 puts two 180 MB output slots in the KV zone. A block that
+    // holds one of them but not both is refused: the admission counts their sum.
+    pp_moe_onednn_ring_admission_inputs two = b50_inputs(512, 16384ull * kMiB);
+    two.ring_depth                          = 2;
+    two.kv_zone_largest_block_bytes         = 2 * out_slot(512);
+    r                                       = pp_moe_onednn_admit_ring(two);
+    check(r.admit && r.output_in_kv_zone, "depth 2: a block holding both output slots admits them");
+    two.kv_zone_largest_block_bytes = out_slot(512);
+    r                               = pp_moe_onednn_admit_ring(two);
+    check(!r.admit, "depth 2: a block holding only one output slot is refused");
+    // At 320 rows both output slots fit the RUNTIME zone and the two 56.25 MB
+    // activation slots, 112.5 MB together, go to the KV zone. Past 336 rows the
+    // output slots go there, and two of them no longer fit the 180 MB block.
+    check(r.largest_fitting_n_ubatch == 320,
+          "and the -ub it names (320) puts two activation slots in the KV zone that fit the block together");
 }
 
 void test_degenerate_and_overflow() {

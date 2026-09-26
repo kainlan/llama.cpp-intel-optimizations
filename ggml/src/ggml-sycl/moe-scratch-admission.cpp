@@ -171,6 +171,7 @@ static bool pp_moe_onednn_admit_ring_at(const pp_moe_onednn_ring_admission_input
     if (kv_zone_bytes == 0) {
         return true;
     }
+    // The largest-block term is an estimate (see the header); a failed reserve is the backstop.
     return out->compute_reserve_bytes <= out->kv_zone_headroom_bytes &&
            kv_zone_bytes <= out->kv_zone_headroom_bytes - out->compute_reserve_bytes &&
            kv_zone_bytes <= in.kv_zone_largest_block_bytes;

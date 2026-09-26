@@ -2303,9 +2303,14 @@ what it holds, and the next re-fit re-admits it.
 
 **Contiguity.** Each KV-zone slot is one allocation. So the whole KV-zone part
 must also fit the zone's largest free block, read after the old ring is
-released. That is sufficient rather than necessary, so a `-ub` a refusal names
-can be placed. If the allocator still cannot place an admitted ring, the
-refusal says so rather than naming the size it just refused.
+released. That is an estimate, not a guarantee. The TLSF allocator's
+`largest_free_block()` returns the head of its highest size class rather than a
+scanned maximum. With two or more KV-zone slots (ring depth above 1, or both
+kinds in the zone), a later allocation can take the exact-class fallback and
+miss. The check covers the single-allocation case. For the rest, the reserve
+fails, and the refusal says the allocator could not place the slots rather than
+naming the size it just refused. An automatic `-ub` then keeps its last
+accepted size; an explicit one fails context creation.
 
 **The compute-buffer reserve is a known gap, not a solved term.** Neither the
 compute buffers nor the flash-attention K/V conversion buffers are in the
