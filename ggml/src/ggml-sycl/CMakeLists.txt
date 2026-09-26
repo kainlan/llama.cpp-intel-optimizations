@@ -5360,6 +5360,43 @@ set_tests_properties(sycl-dense-block-exec PROPERTIES
     TIMEOUT 30
 )
 
+# Legacy device-pool release rule (VRAM arena off): a block freed while a
+# command graph is recording is parked with the graph, never put back on the
+# free list. The header is dependency-free, so this target takes no -fsycl and
+# links nothing.
+add_executable(test-sycl-pool-legacy-release
+    tests/test-sycl-pool-legacy-release.cpp
+)
+target_include_directories(test-sycl-pool-legacy-release PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-sycl-pool-legacy-release PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-pool-legacy-release COMMAND test-sycl-pool-legacy-release)
+set_tests_properties(sycl-pool-legacy-release PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never touches a device.
+    LABELS "sycl;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
+# Command-graph recorder scope (llama.cpp-5udh): the order in which recording
+# state is turned on and put back. The header is dependency-free, so this
+# target takes no -fsycl and links nothing.
+add_executable(test-sycl-graph-recorder-scope
+    tests/test-sycl-graph-recorder-scope.cpp
+)
+target_include_directories(test-sycl-graph-recorder-scope PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-sycl-graph-recorder-scope PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-graph-recorder-scope COMMAND test-sycl-graph-recorder-scope)
+set_tests_properties(sycl-graph-recorder-scope PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never touches a device.
+    LABELS "sycl;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
 # test-sycl-pp-moe-scratch-lifecycle was DELETED by llama.cpp-u2mz. It was
 # described as "the only executable proof of the claim/release protocol", but it
 # included ZERO project headers and its target had one source plus
