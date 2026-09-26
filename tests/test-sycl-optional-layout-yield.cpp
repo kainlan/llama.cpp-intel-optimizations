@@ -278,9 +278,12 @@ void test_holes_between_primaries_are_not_yielded(unified_cache *       cache,
     }
     primaries->push_back(seal);
 
-    size_t       placeable = 0;
-    const auto   layers    = one_more_layer(cache, 2 * COPY_BYTES, &placeable);
-    const size_t optional  = cache->optional_layout_bytes();
+    size_t     placeable = 0;
+    const auto layers    = one_more_layer(cache, 2 * COPY_BYTES, &placeable);
+    size_t     optional  = 0;
+    for (size_t bytes : cache->optional_layouts_snapshot().fit.bytes) {
+        optional += bytes;
+    }
     // The byte count the fit reads says the layer fits once the copies go;
     // without this the case would not show that a byte count is wrong here.
     check(optional >= 3 * COPY_BYTES && optional >= layers.back(),

@@ -1866,6 +1866,10 @@ def kv_fit_hold_violations(sycl_cpp: str, cache_cpp: str, fit_cpp: str | None = 
         found.append("a pick is released without checking it is the copy the fit read")
     if not re.search(r"if \(!whole\) \{\s*\+\+result\.skipped_groups;\s*continue;", begin_body):
         found.append("a group is released in part")
+    # A barrier that cannot be submitted is its own cause, not a stale pick.
+    if not re.search(r"if \(whole && gate_failed\) \{\s*\+\+result\.ungated_groups;\s*continue;", begin_body) or \
+            "released.ungated_groups > 0" not in strip_comments(sycl_cpp):
+        found.append("a group the barrier failed for is reported as no longer yieldable")
     return found
 
 
@@ -1907,6 +1911,11 @@ def test_mutation_group_released_in_part_is_witnessed() -> None:
                          "", "released in part", "skip dropped")
 
 
+def test_mutation_ungated_group_reported_stale_is_witnessed() -> None:
+    _hold_cache_mutation("            ++result.ungated_groups;\n", "            ++result.skipped_groups;\n",
+                         "reported as no longer yieldable", "barrier failure counted as a stale pick")
+
+
 def test_mutation_snapshot_picks_unnamed_is_witnessed() -> None:
     _hold_cache_mutation("snapshot.picks.push_back({ pair.first, pair.second.replacement_identity() });",
                          "snapshot.picks.push_back({ pair.first, 0 });", "not the snapshot its picks name",
@@ -1923,7 +1932,6 @@ def test_mutation_snapshot_picks_unnamed_is_witnessed() -> None:
 # so the lease -- not the yield's barrier -- is what makes the free correct.
 PREDICATE_SIGNATURE = "static bool weight_entry_reclaimable("
 RECLAIM_LOOP_SIGNATURE = "size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t slot) {"
-OPTIONAL_BYTES_SIGNATURE = "size_t unified_cache::optional_layout_bytes() const {"
 ACQUIRE_LAYOUT_SIGNATURE = "static ggml_sycl::mem_handle ggml_sycl_acquire_weight_layout("
 
 PREDICATE_HARNESS = r"""
@@ -2031,11 +2039,14 @@ def optional_layout_reclaim_violations(hpp: str, cache_cpp: str, sycl_cpp: str) 
     if not re.search(r"return\s+weight_entry_reclaimable\(\s*entry\s*,\s*weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD\s*,",
                      yieldable) or re.search(r"entry\.(optional_layout|in_use_count)", yieldable):
         found.append("the yield decides reclaim outside weight_entry_reclaimable()")
-    users = strip_comments(definition(cache_cpp, OPTIONAL_BYTES_SIGNATURE) or "") + \
-        strip_comments(definition(cache_cpp, OPTIONAL_SNAPSHOT_SIGNATURE) or "") + \
+    users = strip_comments(definition(cache_cpp, OPTIONAL_SNAPSHOT_SIGNATURE) or "") + \
         strip_comments(definition(cache_cpp, YIELD_SIGNATURE) or "")
-    if users.count("optional_layout_yieldable_locked(") != 3:
+    if users.count("optional_layout_yieldable_locked(") != 2:
         found.append("a yield path picks copies without the reclaim predicate")
+    # The fit's snapshot is the one reader of what yields (the definition, the
+    # snapshot and begin's re-check): a second reader could disagree with it.
+    if strip_comments(cache_cpp).count("optional_layout_yieldable_locked(") != 3:
+        found.append("something besides the fit's snapshot reads what a yield could release")
 
     loop = strip_comments(definition(cache_cpp, RECLAIM_LOOP_SIGNATURE) or "")
     if not re.search(r"if \(mode == weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD\) \{\s*GGML_ABORT\(", loop):

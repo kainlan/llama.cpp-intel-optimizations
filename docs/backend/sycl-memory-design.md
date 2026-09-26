@@ -816,8 +816,12 @@ reclaims one physical layout of a tensor, not the tensor:
   `g_tensor_inventory_mutex` (L1), and §12.5 of the canonical contract allows
   no wait and no destructor-running release under that lock. The yield is
   therefore split in two (`optional_layout_release`):
-  - **Begin**, under the lock: pick the copies, retire them, and submit the
-    barrier that gates their frees. It waits on nothing and drops no handle.
+  - **Begin**, under the lock: check each group the fit picked against the
+    live cache, retire the groups that are still whole, and submit the barrier
+    that gates their frees. It picks nothing, waits on nothing and drops no
+    handle. If the barrier cannot be submitted, no group is released and the
+    transaction says so in its own WARN, apart from groups that were no longer
+    yieldable.
   - **Finish**, with the lock released: wait on the barrier, reap the
     retained handles that still reference the copies' allocation owners
     (`release_retained_referencing()`, QUERY mode: a copy's fill retains its

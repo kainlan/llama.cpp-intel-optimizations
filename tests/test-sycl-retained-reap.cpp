@@ -8,12 +8,16 @@
 // "released" below is the owner's last reference actually going. Incomplete
 // events come from a host_task on the CPU SYCL device, held on a gate the test
 // opens; the drain worker is paused at its test points to put a record in its
-// hands. Nothing here touches a GPU (the registration pins the selector to
+// hands, and a reap on another thread is known to be waiting on it when
+// retained_reap_test_yielding() says so -- no case orders threads by sleeping.
+// Every owner release checks that its thread does not hold the retained-store
+// mutex. Nothing here touches a GPU (the registration pins the selector to
 // the OpenCL CPU device).
 //
 // Usage:
-//   ./build/bin/test-sycl-retained-reap                 # every case
-//   ./build/bin/test-sycl-retained-reap strict-child    # the STRICT abort child
+//   ./build/bin/test-sycl-retained-reap                          # every case
+//   ./build/bin/test-sycl-retained-reap strict-child             # STRICT backstop child
+//   ./build/bin/test-sycl-retained-reap strict-ownerless-child   # STRICT ownerless child
 
 #include "mem-handle.hpp"
 #include "unified-cache.hpp"
@@ -54,9 +58,13 @@ int g_failures = 0;
 
 std::atomic<uint64_t> g_next_id{ 1000 };
 std::atomic<int>      g_released{ 0 };
+std::atomic<int>      g_released_under_store_mutex{ 0 };
 
 release_attempt count_release(const alloc_metadata &, void *) noexcept {
     g_released.fetch_add(1);
+    if (retained_store_mutex_held()) {
+        g_released_under_store_mutex.fetch_add(1);
+    }
     return { release_attempt_status::RELEASED };
 }
 
@@ -79,6 +87,14 @@ mem_handle make_owner(size_t size) {
         std::exit(1);
     }
     return mem_handle::from_owned_alloc(std::move(fixture.result.owner));
+}
+
+// A handle with no owner control: an ownerless DIRECT view of 64 host bytes.
+constexpr size_t OWNERLESS_BYTES = 64;
+
+mem_handle make_ownerless() {
+    static unsigned char buf[OWNERLESS_BYTES];
+    return mem_handle::from_direct(buf, GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE, sizeof(buf));
 }
 
 // Whether the test's handle is now the owner's last reference: resetting it
@@ -136,6 +152,38 @@ void release_worker() {
     wait_parked(false);
     (void) drain_retained_handles(true);
 }
+
+// A reap on its own thread. yields() waits until it is waiting on the drain
+// worker's in-hand record (true) or has returned without (false).
+struct reaper {
+    retained_reap_result r;
+    std::atomic<bool>    done{ false };
+    std::thread          thread;
+
+    template <typename F>
+    explicit reaper(F f) :
+        thread([this, f] {
+            r = f();
+            done.store(true);
+        }) {}
+
+    bool yields() const {
+        for (;;) {
+            if (retained_reap_test_yielding() > 0) {
+                return true;
+            }
+            if (done.load()) {
+                return false;
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    retained_reap_result join() {
+        thread.join();
+        return r;
+    }
+};
 
 retained_reap_result reap(const std::vector<mem_handle> & owners,
                           retained_reap_precondition      pre,
@@ -203,11 +251,11 @@ void test_in_hand_yield() {
     retain_handles_until_event({ a }, sycl::event{});
     wait_parked(true);
 
-    retained_reap_result r;
-    std::thread          reaper([&] { r = reap({ a }, RETAINED_REAP_QUERY_EVENT_STATUS); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // let the reaper reach the yield
+    reaper     t([&] { return reap({ a }, RETAINED_REAP_QUERY_EVENT_STATUS); });
+    const bool yielded = t.yields();
     retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
-    reaper.join();
+    const retained_reap_result r = t.join();
+    CHECK(yielded, "in-hand: the reap waited on the worker's record");
     CHECK_EQ(r.in_hand_yields, 1, "in-hand: the reap yielded to the worker");
     CHECK_EQ(r.entries_pending, 0, "in-hand: nothing pending");
     CHECK(only_reference(a), "in-hand: the worker's reference is gone when the reap returns");
@@ -267,15 +315,128 @@ void test_yield_then_parked() {
     retain_handles_until_event({ a }, sycl::event{});
     wait_parked(true);
 
-    retained_reap_result r;
-    std::thread          reaper([&] { r = reap({ a }, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    reaper     t([&] { return reap({ a }, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER); });
+    const bool yielded = t.yields();
     retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
-    reaper.join();
+    const retained_reap_result r = t.join();
+    CHECK(yielded, "yield-parked: the reap waited on the worker's record");
     CHECK_EQ(r.in_hand_yields, 1, "yield-parked: yielded");
     CHECK_EQ(r.unwaitable_dropped, 1, "yield-parked: found parked after the yield");
     CHECK(only_reference(a), "yield-parked: a is free");
     (void) drain_retained_handles(true);
+}
+
+// The worker has dropped its in-hand record's handles and not yet cleared the
+// record (its AFTER_DROP point): the record is still in hand, so a reap still
+// waits on it. It is cleared only after the drop, never before, so a reap
+// that finds nothing in hand finds the handles gone.
+void test_mid_drop() {
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_AFTER_DROP);
+    mem_handle a = make_owner(600);
+    retain_handles_until_event({ a }, sycl::event{});
+    wait_parked(true);
+
+    reaper     t([&] { return reap({ a }, RETAINED_REAP_QUERY_EVENT_STATUS); });
+    const bool yielded = t.yields();
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
+    const retained_reap_result r = t.join();
+    CHECK(yielded, "mid-drop: a dropped record is still in hand until the worker clears it");
+    CHECK_EQ(r.in_hand_yields, 1, "mid-drop: the reap yielded to it");
+    CHECK(only_reference(a), "mid-drop: a is free");
+    (void) drain_retained_handles(true);
+}
+
+// Two owners: b's record is in the worker's hands on a running event, a's is
+// queued and complete. QUERY drops a's and keeps b's, marking only b.
+void test_two_owners_one_in_hand(sycl::queue & q) {
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_AFTER_POP);
+    mem_handle a = make_owner(1100);
+    mem_handle b = make_owner(2200);
+    gate       g(q);
+    retain_handles_until_event({ b }, g.event);
+    wait_parked(true);
+    retain_handles_until_event({ a }, sycl::event{});
+
+    bool                       pending[2] = { true, false };
+    const retained_reap_result r          = reap({ a, b }, RETAINED_REAP_QUERY_EVENT_STATUS, pending);
+    CHECK(!pending[0] && pending[1], "two-owner in-hand: owner_pending is {false, true}");
+    CHECK_EQ(r.entries_dropped, 1, "two-owner in-hand: a's queued record is dropped");
+    CHECK_EQ(r.entries_pending, 1, "two-owner in-hand: b's in-hand record is pending");
+    CHECK_EQ(r.pending_bytes, 2200, "two-owner in-hand: b's bytes");
+    CHECK_EQ(r.in_hand_yields, 0, "two-owner in-hand: no yield on a running event");
+    CHECK(only_reference(a), "two-owner in-hand: a is free");
+
+    g.open();
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
+    (void) drain_retained_handles(true);
+    CHECK(only_reference(b), "two-owner in-hand: b went with the worker once complete");
+}
+
+// A kept record naming two owners marks both, and counts both owners' bytes.
+void test_kept_shared(sycl::queue & q) {
+    mem_handle blocker = hold_worker();
+    mem_handle a       = make_owner(1300);
+    mem_handle b       = make_owner(2600);
+    gate       g(q);
+    retain_handles_until_event({ a, b }, g.event);
+
+    bool                       pending[2] = { false, false };
+    const retained_reap_result r          = reap({ a, b }, RETAINED_REAP_QUERY_EVENT_STATUS, pending);
+    CHECK(pending[0] && pending[1], "kept-shared: both owners of the kept record are marked");
+    CHECK_EQ(r.entries_pending, 1, "kept-shared: one entry");
+    CHECK_EQ(r.pending_bytes, 3900, "kept-shared: both owners' bytes");
+    CHECK_EQ(r.entries_dropped, 0, "kept-shared: nothing dropped");
+
+    g.open();
+    release_worker();
+    CHECK(only_reference(a), "kept-shared: a went with the worker once complete");
+    CHECK(only_reference(b), "kept-shared: b too");
+    CHECK(only_reference(blocker), "kept-shared: blocker drained");
+}
+
+// In hand with an event QUERY cannot query: it is pending, and the reap does
+// not wait for the worker to find out what the event is.
+void test_in_hand_unqueryable() {
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_AFTER_POP);
+    mem_handle a = make_owner(750);
+    retain_handles_until_event({ a }, sycl::event{});
+    wait_parked(true);
+
+    retained_reap_test_fail_next_query();
+    bool       pending = false;
+    reaper     t([&] { return reap({ a }, RETAINED_REAP_QUERY_EVENT_STATUS, &pending); });
+    const bool yielded = t.yields();
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
+    const retained_reap_result r = t.join();
+    CHECK(!yielded, "in-hand-unqueryable: QUERY does not wait on a record it cannot query");
+    CHECK_EQ(r.in_hand_yields, 0, "in-hand-unqueryable: no yield");
+    CHECK_EQ(r.entries_pending, 1, "in-hand-unqueryable: pending");
+    CHECK_EQ(r.pending_bytes, 750, "in-hand-unqueryable: its bytes");
+    CHECK(pending, "in-hand-unqueryable: owner marked");
+    (void) drain_retained_handles(true);
+    CHECK(only_reference(a), "in-hand-unqueryable: the worker dropped it");
+}
+
+// An owner with no owner control cannot be matched, so it is never reported
+// clean: it is marked pending with its size, beside an owner that is clean.
+void test_ownerless_owner() {
+    mem_handle a         = make_owner(1500);
+    mem_handle ownerless = make_ownerless();
+    CHECK_EQ(ownerless.owner_control_id(), 0, "ownerless: the handle has no owner control");
+    retain_handles_until_event({ a }, sycl::event{});
+    (void) drain_retained_handles(true);
+
+    bool                       pending[2] = { true, false };
+    const retained_reap_result r          = reap({ a, ownerless }, RETAINED_REAP_QUERY_EVENT_STATUS, pending);
+    CHECK(!pending[0] && pending[1], "ownerless: owner_pending is {false, true}");
+    CHECK_EQ(r.pending_bytes, OWNERLESS_BYTES, "ownerless: its size is pending");
+    CHECK_EQ(r.entries_pending, 0, "ownerless: no entry is pending");
+
+    bool                       alone   = false;
+    const retained_reap_result r_alone = reap({ ownerless }, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER, &alone);
+    CHECK(alone, "ownerless: alone, it is still not clean");
+    CHECK_EQ(r_alone.pending_bytes, OWNERLESS_BYTES, "ownerless: alone, its size is pending");
+    CHECK(only_reference(a), "ownerless: a is free");
 }
 
 // COMPLETE with an event the caller did not finish: the backstop waits for it
@@ -286,8 +447,12 @@ void test_backstop(sycl::queue & q) {
     gate         g(q);
     const size_t before = retained_reap_backstop_incomplete();
     retain_handles_until_event({ a }, g.event);
+    // Opened once the reap has reported the record incomplete, so it cannot
+    // have seen it complete; it returns only after the gate opens.
     std::thread                opener([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        while (retained_reap_backstop_incomplete() == before) {
+            std::this_thread::yield();
+        }
         g.open();
     });
     const retained_reap_result r              = reap({ a }, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER);
@@ -307,6 +472,8 @@ int strict_child(sycl::queue & q) {
     mem_handle a       = make_owner(800);
     gate       g(q);
     retain_handles_until_event({ a }, g.event);
+    // Not an ordering: the abort comes before any wait. Only a child that
+    // fails to abort reaches the backstop wait, and this lets it finish.
     std::thread opener([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
         g.open();
@@ -317,8 +484,15 @@ int strict_child(sycl::queue & q) {
     return 0;
 }
 
-void test_strict_aborts(const char * self) {
-    const std::string cmd = std::string("GGML_SYCL_STRICT_PLAN=1 ") + self + " strict-child 2>&1";
+// Under GGML_SYCL_STRICT_PLAN=1 an owner with no owner control aborts.
+int strict_ownerless_child() {
+    (void) reap({ make_ownerless() }, RETAINED_REAP_QUERY_EVENT_STATUS);
+    std::printf("strict-child: returned without aborting\n");
+    return 0;
+}
+
+void test_strict_aborts(const char * self, const char * child, const char * line) {
+    const std::string cmd = std::string("GGML_SYCL_STRICT_PLAN=1 ") + self + " " + child + " 2>&1";
     FILE *            p   = popen(cmd.c_str(), "r");
     CHECK(p != nullptr, "strict: child started");
     if (!p) {
@@ -331,9 +505,11 @@ void test_strict_aborts(const char * self) {
     }
     const int status = pclose(p);
     CHECK(status != 0, "strict: the child did not exit 0");
-    CHECK(out.find("[CONTEXT-PLAN-BUG] retained-reap backstop") != std::string::npos,
-          "strict: the child printed the plan-bug line");
+    CHECK(out.find(line) != std::string::npos, "strict: the child printed the plan-bug line");
     CHECK(out.find("returned without aborting") == std::string::npos, "strict: the child aborted in the reap");
+    if (status == 0 || out.find(line) == std::string::npos) {
+        std::fprintf(stderr, "strict: %s printed:\n%s", child, out.c_str());
+    }
 }
 
 }  // namespace
@@ -343,14 +519,26 @@ int main(int argc, char ** argv) {
     if (argc > 1 && std::strcmp(argv[1], "strict-child") == 0) {
         return strict_child(q);
     }
+    if (argc > 1 && std::strcmp(argv[1], "strict-ownerless-child") == 0) {
+        return strict_ownerless_child();
+    }
     test_queued_query(q);
     test_shared_and_non_owner();
     test_in_hand_yield();
     test_in_hand_incomplete(q);
+    test_mid_drop();
+    test_two_owners_one_in_hand(q);
+    test_kept_shared(q);
+    test_in_hand_unqueryable();
+    test_ownerless_owner();
     test_parked();
     test_yield_then_parked();
     test_backstop(q);
-    test_strict_aborts(argv[0]);
+    test_strict_aborts(argv[0], "strict-child", "[CONTEXT-PLAN-BUG] retained-reap backstop");
+    test_strict_aborts(argv[0], "strict-ownerless-child", "has no owner control");
+    // Every owner released above, by the worker, a reap or the test, was
+    // released with the retained-store mutex not held by its thread.
+    CHECK_EQ(g_released_under_store_mutex.load(), 0, "no owner is released under the retained-store mutex");
     if (g_failures != 0) {
         std::fprintf(stderr, "test-sycl-retained-reap: %d failure(s)\n", g_failures);
         return 1;

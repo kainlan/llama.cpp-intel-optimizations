@@ -1453,7 +1453,7 @@ The target lock inventory and mandatory order is concrete:
 | L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
 | L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
 | L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()` | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
-| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), and graph-local `arena_handles_mutex` | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
+| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, the zone-reset audit's `zone_audit_state::mutex` (`unified-cache.cpp`), and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
@@ -1496,6 +1496,31 @@ two L3 locks are never co-held. The source contract
 `tests/test-sycl-moe-bias-owner-contract.py` gates both halves of the leaf
 property: that every accessor takes the lock, and that none takes another while
 holding it.
+
+The retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`,
+`uwlx`) guards the event-bound record queue, the drain worker's in-hand record
+and `graph_unwaitable`. It is **last in L5: no L1-L5 lock is taken under it.**
+The one lock that is taken under it is a `mem_handle`'s own spinlock: moving a
+handle into or out of the store (publication, the worker's pop and park,
+`release_retained_referencing()` taking matches out and putting kept records
+back) takes that handle's spinlock with the store mutex held. So the order is
+**store mutex > handle spinlock**, and no code takes the store mutex while
+holding a handle's spinlock. Owner-control identities are read at publication,
+before the mutex is taken, so a reap matches under it without asking a handle.
+
+What moves under it are live handles and moved-from shells; **nothing is
+released under it.** The worker drops a record after the pop's critical section,
+`release_retained_referencing()` waits and drops its matches after unlocking,
+and `release_graph_retained_handles()` swaps the list out and drops it after
+unlocking. A final `mem_handle` destructor can free memory or publish retention
+of its own, so releasing under the mutex would be the forbidden
+final-destructor-under-a-listed-lock case below. The drain worker and the reap's
+in-hand yield wait on the store's own condition variable, which releases the
+mutex while waiting; their callers hold no other listed lock.
+`test-sycl-retained-reap` gates the no-release half: every owner release in it
+records whether its thread holds the store mutex (`retained_store_mutex_held()`,
+a `GGML_SYCL_PRIVATE_TESTING` witness kept by the mutex's one lock type,
+`retained_store_lock`), and the run fails if any did.
 
 The zone-reset escape audit's `zone_audit_state::mutex` (`unified-cache.cpp`,
 `iiff` Phase 0) guards the per-site inventory the `GGML_SYCL_ZONE_RESET_AUDIT`

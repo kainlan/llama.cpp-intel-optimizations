@@ -2258,14 +2258,17 @@ enum class expert_retire_status : uint8_t {
 // when the call returns; the rest (`retired - freed`, `pending_bytes`) are
 // still held by a lease or an unfinished free and return later.
 // `skipped_groups` are pick groups not released because one of their copies
-// was no longer the yieldable copy the fit picked. `kv_layers` is how many of
-// the requested layers the zone can place as the call returns, yield or not.
+// was no longer the yieldable copy the fit picked; `ungated_groups` are the
+// ones not released because the barrier that gates their frees could not be
+// submitted. `kv_layers` is how many of the requested layers the zone can
+// place as the call returns, yield or not.
 struct optional_layout_yield_result {
     size_t retired        = 0;
     size_t freed          = 0;
     size_t freed_bytes    = 0;
     size_t pending_bytes  = 0;
     size_t skipped_groups = 0;
+    size_t ungated_groups = 0;
     size_t kv_layers      = 0;
 };
 
@@ -2310,8 +2313,8 @@ struct optional_layout_snapshot {
 // barrier, reaps what still references those owners, returns the copies'
 // storage to their zone and drops those handles, so it runs with no L1 lock
 // held. A release dropped unfinished drops the handles in its destructor and
-// leaves the frees to a later deferred-free pass. `result` holds `retired`
-// and `skipped_groups`; the rest is filled by the finish.
+// leaves the frees to a later deferred-free pass. `result` holds `retired`,
+// `skipped_groups` and `ungated_groups`; the rest is filled by the finish.
 struct optional_layout_release {
     unified_cache *                          cache = nullptr;
     optional_layout_yield_result             result;
@@ -3001,12 +3004,12 @@ class unified_cache {
 
     // Optional layout copies (unified_cache_entry::optional_layout).
     // mark_optional_layout() tags a dense weight's staged copy in `layout`.
-    // optional_layout_bytes() is what a yield could release now:
-    // device-resident, non-retired copies weight_entry_reclaimable() accepts
-    // under OPTIONAL_LAYOUT_YIELD -- nobody but the cache's own direct-stage
-    // mirror leases them. optional_layouts_snapshot() is those copies as the
-    // fit reads them: a copy of the zone KV is carved from, where each copy
-    // sits in it, and each copy's pick. The fit (plan_runtime_kv_residency())
+    // A yield can release the device-resident, non-retired copies
+    // weight_entry_reclaimable() accepts under OPTIONAL_LAYOUT_YIELD -- nobody
+    // but the cache's own direct-stage mirror leases them.
+    // optional_layouts_snapshot() is those copies as the fit reads them: a
+    // copy of the zone KV is carved from, where each copy sits in it, and each
+    // copy's pick. The fit (plan_runtime_kv_residency())
     // picks which to release, in groups; yield_optional_layouts_begin()
     // retires each group whole, if every copy in it is still the yieldable
     // copy the snapshot read, and skips it otherwise -- the refit then holds
@@ -3022,7 +3025,6 @@ class unified_cache {
     // plan_optional_layout_yield(), begin and finish in one, for a caller
     // holding no L1 lock.
     bool                         mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout);
-    size_t                       optional_layout_bytes() const;
     optional_layout_snapshot     optional_layouts_snapshot();
     optional_layout_yield_result yield_optional_layouts(const std::vector<size_t> & layer_bytes);
     optional_layout_release      yield_optional_layouts_begin(const std::vector<optional_layout_pick_group> & groups);

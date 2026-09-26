@@ -50,8 +50,8 @@ bool valid_cache_device_id(int device) {
 struct retained_handle_record {
     std::vector<mem_handle> handles;
     sycl::event             event;
-    // handles[i].owner_control_id(), read when the record is published: the
-    // store mutex is a leaf, so nothing under it takes a handle's lock.
+    // handles[i].owner_control_id(), read when the record is published, so a
+    // reap matches under the store mutex without asking any handle.
     std::vector<uint64_t>   ids;
 };
 
@@ -88,6 +88,9 @@ std::atomic<size_t>  g_retained_reap_backstop_incomplete{ 0 };
 std::atomic<uint8_t> g_retained_drain_test_hold{ 0 };
 std::atomic<bool>    g_retained_drain_test_parked{ false };
 std::atomic<bool>    g_retained_drain_test_command_graph{ false };
+std::atomic<bool>    g_retained_reap_test_unqueryable{ false };
+std::atomic<size_t>  g_retained_reap_test_yielding{ 0 };
+thread_local int     g_retained_store_lock_depth = 0;
 
 void retained_drain_test_pause_at(uint8_t point) {
     if (g_retained_drain_test_hold.load() != point) {
@@ -100,6 +103,28 @@ void retained_drain_test_pause_at(uint8_t point) {
     g_retained_drain_test_parked.store(false);
 }
 #endif
+
+// The retained-store mutex, held (canonical memory contract §12.5: last in
+// L5). Moving a handle into or out of the store under it takes that handle's
+// spinlock; releasing one under it is forbidden -- a final handle is dropped
+// only after it is released. Tests check that through
+// retained_store_mutex_held().
+struct retained_store_lock {
+    std::unique_lock<std::mutex> lock;
+
+    explicit retained_store_lock(retained_handle_state & state) : lock(state.mutex) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        ++g_retained_store_lock_depth;
+#endif
+    }
+
+    ~retained_store_lock() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        --g_retained_store_lock_depth;
+#endif
+    }
+};
+
 struct graph_recording_sink_state {
     std::vector<mem_handle> * sink     = nullptr;
     uint64_t                  epoch_id = 0;
@@ -163,7 +188,7 @@ void retain_handles_for_current_graph(std::vector<mem_handle> handles) {
 
     const std::vector<uint64_t> ids   = owner_control_ids(handles);
     auto &                      state = *g_retained_handles_state;
-    std::lock_guard<std::mutex> lock(state.mutex);
+    retained_store_lock         lock(state);
     state.graph_unwaitable.insert(state.graph_unwaitable.end(), std::make_move_iterator(handles.begin()),
                                   std::make_move_iterator(handles.end()));
     state.graph_unwaitable_ids.insert(state.graph_unwaitable_ids.end(), ids.begin(), ids.end());
@@ -173,9 +198,9 @@ void retained_handle_drain_loop() {
     for (;;) {
         retained_handle_record record;
         {
-            auto &                       state = *g_retained_handles_state;
-            std::unique_lock<std::mutex> lock(state.mutex);
-            state.cv.wait(lock, [&state] { return !state.queue.empty(); });
+            auto &              state = *g_retained_handles_state;
+            retained_store_lock lock(state);
+            state.cv.wait(lock.lock, [&state] { return !state.queue.empty(); });
             record = std::move(state.queue.front());
             state.queue.pop_front();
             ++state.active;
@@ -209,8 +234,8 @@ void retained_handle_drain_loop() {
         } catch (const std::exception & e) {
             const std::string msg = e.what();
             if (msg.find("command graph") != std::string::npos || msg.find("Command Graph") != std::string::npos) {
-                auto &                      state = *g_retained_handles_state;
-                std::lock_guard<std::mutex> lock(state.mutex);
+                auto &              state = *g_retained_handles_state;
+                retained_store_lock lock(state);
                 state.graph_unwaitable.insert(state.graph_unwaitable.end(),
                                               std::make_move_iterator(record.handles.begin()),
                                               std::make_move_iterator(record.handles.end()));
@@ -236,8 +261,8 @@ void retained_handle_drain_loop() {
 #endif
 
         {
-            auto &                      state = *g_retained_handles_state;
-            std::lock_guard<std::mutex> lock(state.mutex);
+            auto &              state = *g_retained_handles_state;
+            retained_store_lock lock(state);
             --state.active;
             if (state.in_hand_valid) {
                 state.in_hand_valid = false;
@@ -1984,8 +2009,8 @@ bool build_layer_handles(int device, int layer_id, layer_weight_handles & out) {
 }
 
 retained_handle_publish_ticket begin_retained_handle_publish() {
-    auto &                      state = *g_retained_handles_state;
-    std::lock_guard<std::mutex> lock(state.mutex);
+    auto &              state = *g_retained_handles_state;
+    retained_store_lock lock(state);
     ++state.publishers;
     return retained_handle_publish_ticket(true);
 }
@@ -2118,7 +2143,7 @@ void retained_handle_publish_ticket::reset() noexcept {
     active_ = false;
     auto & state = *g_retained_handles_state;
     {
-        std::lock_guard<std::mutex> lock(state.mutex);
+        retained_store_lock lock(state);
         GGML_ASSERT(state.publishers > 0);
         --state.publishers;
     }
@@ -2133,16 +2158,15 @@ bool drain_retained_handles(bool wait_all, uint32_t timeout_ms) {
         return true;
     }
 
-    auto &                       state = *g_retained_handles_state;
-    std::unique_lock<std::mutex> lock(state.mutex);
-    return state.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&state] {
-        return state.queue.empty() && state.active == 0 && state.publishers == 0;
-    });
+    auto &              state = *g_retained_handles_state;
+    retained_store_lock lock(state);
+    return state.cv.wait_for(lock.lock, std::chrono::milliseconds(timeout_ms),
+                             [&state] { return state.queue.empty() && state.active == 0 && state.publishers == 0; });
 }
 
 size_t graph_retained_handle_count() {
-    auto &                      state = *g_retained_handles_state;
-    std::lock_guard<std::mutex> lock(state.mutex);
+    auto &              state = *g_retained_handles_state;
+    retained_store_lock lock(state);
     return state.graph_unwaitable.size();
 }
 
@@ -2150,8 +2174,8 @@ void release_graph_retained_handles() {
     std::vector<mem_handle> released;
     size_t                  n = 0;
     {
-        auto &                      state = *g_retained_handles_state;
-        std::lock_guard<std::mutex> lock(state.mutex);
+        auto &              state = *g_retained_handles_state;
+        retained_store_lock lock(state);
         n = state.graph_unwaitable.size();
         released.swap(state.graph_unwaitable);
         state.graph_unwaitable_ids.clear();
@@ -2173,6 +2197,12 @@ namespace {
 // graph's event cannot be queried; `queryable` says so.
 bool retained_event_complete(const sycl::event & event, bool * queryable) {
     *queryable = true;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (g_retained_reap_test_unqueryable.exchange(false)) {
+        *queryable = false;
+        return false;
+    }
+#endif
     try {
         return event.get_info<sycl::info::event::command_execution_status>() ==
                sycl::info::event_command_status::complete;
@@ -2205,6 +2235,22 @@ void report_retained_reap_backstop(const char * reason, const char * entry) {
         reason, entry, count);
 }
 
+// An owner with no owner control (an arena, WEIGHT or ownerless DIRECT
+// handle): nothing the store holds of it can be matched, so the reap cannot
+// say it is clean.
+void report_retained_reap_ownerless(const char * reason, size_t owner) {
+    if (strict_plan_checks_enabled()) {
+        GGML_ABORT(
+            "[CONTEXT-PLAN-BUG] retained-reap %s: owner %zu has no owner control, so what the retained store holds "
+            "of it cannot be found (GGML_SYCL_STRICT_PLAN=1)",
+            reason, owner);
+    }
+    GGML_LOG_WARN(
+        "[CONTEXT-PLAN-BUG] retained-reap %s: owner %zu has no owner control, so what the retained store holds of it "
+        "cannot be found; it is reported pending, never clean\n",
+        reason, owner);
+}
+
 // Which owners `ids` names; true if any. `marks` (optional) gets each one set.
 bool retained_ids_match(const std::vector<uint64_t> & owner_ids,
                         const std::vector<uint64_t> & ids,
@@ -2234,7 +2280,26 @@ retained_reap_result release_retained_referencing(const retained_reap_request & 
     for (size_t i = 0; i < request.n_owners; ++i) {
         owner_ids[i] = request.owners[i].owner_control_id();
         any_owner    = any_owner || owner_ids[i] != 0;
+        if (owner_ids[i] == 0) {
+            report_retained_reap_ownerless(reason, i);
+            pending[i] = 1;
+        }
     }
+    // Each owner still pending, with the size of each distinct one: an owner
+    // with no owner control is its own, since id 0 names none.
+    auto report_pending = [&request, &owner_ids, &pending, &result] {
+        std::vector<uint64_t> counted;
+        for (size_t i = 0; i < request.n_owners; ++i) {
+            if (request.owner_pending) {
+                request.owner_pending[i] = pending[i] != 0;
+            }
+            if (pending[i] &&
+                (owner_ids[i] == 0 || std::find(counted.begin(), counted.end(), owner_ids[i]) == counted.end())) {
+                counted.push_back(owner_ids[i]);
+                result.pending_bytes += request.owners[i].size();
+            }
+        }
+    };
 
     auto &                              state = *g_retained_handles_state;
     std::vector<retained_handle_record> matched;
@@ -2244,7 +2309,7 @@ retained_reap_result release_retained_referencing(const retained_reap_request & 
     uint64_t                            in_hand_seq   = 0;
     bool                                in_hand_match = false;
     if (any_owner) {
-        std::lock_guard<std::mutex> lock(state.mutex);
+        retained_store_lock lock(state);
         for (auto it = state.queue.begin(); it != state.queue.end();) {
             if (retained_ids_match(owner_ids, it->ids, nullptr)) {
                 matched.push_back(std::move(*it));
@@ -2265,9 +2330,7 @@ retained_reap_result release_retained_referencing(const retained_reap_request & 
         ++state.publishers;
     }
     if (!any_owner) {
-        for (size_t i = 0; request.owner_pending && i < request.n_owners; ++i) {
-            request.owner_pending[i] = false;
-        }
+        report_pending();
         return result;
     }
 
@@ -2297,20 +2360,27 @@ retained_reap_result release_retained_referencing(const retained_reap_request & 
             report_retained_reap_backstop(reason, "in-hand record");
         }
         // A QUERY caller does not wait on device work: an in-hand record whose
-        // event is still running stays pending. One that is done, or whose
-        // graph event the worker is about to park, is waited for -- only the
-        // worker's drop or park is left.
-        yield_in_hand = complete || done || !queryable;
+        // event is still running, or cannot be queried, stays pending. One
+        // queried complete is waited for -- only the worker's drop is left. A
+        // COMPLETE caller waits for the worker whatever the event: it drops
+        // the record, or parks a graph event's in graph_unwaitable.
+        yield_in_hand = complete || (queryable && done);
     }
     in_hand_event = sycl::event{};
 
     {
-        std::unique_lock<std::mutex> lock(state.mutex);
-        auto                         still_in_hand = [&state, in_hand_seq] {
+        retained_store_lock lock(state);
+        auto                still_in_hand = [&state, in_hand_seq] {
             return state.in_hand_valid && state.in_hand_seq == in_hand_seq;
         };
         if (in_hand_match && yield_in_hand) {
-            state.cv.wait(lock, [&still_in_hand] { return !still_in_hand(); });
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            ++g_retained_reap_test_yielding;
+#endif
+            state.cv.wait(lock.lock, [&still_in_hand] { return !still_in_hand(); });
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            --g_retained_reap_test_yielding;
+#endif
             ++result.in_hand_yields;
         } else if (in_hand_match && still_in_hand()) {
             (void) retained_ids_match(owner_ids, in_hand_ids, &pending);
@@ -2365,22 +2435,13 @@ retained_reap_result release_retained_referencing(const retained_reap_request & 
     matched.clear();
     unwaitable.clear();
     {
-        std::lock_guard<std::mutex> lock(state.mutex);
+        retained_store_lock lock(state);
         GGML_ASSERT(state.publishers > 0);
         --state.publishers;
     }
     state.cv.notify_all();
 
-    std::vector<uint64_t> counted;
-    for (size_t i = 0; i < request.n_owners; ++i) {
-        if (request.owner_pending) {
-            request.owner_pending[i] = pending[i] != 0;
-        }
-        if (pending[i] && std::find(counted.begin(), counted.end(), owner_ids[i]) == counted.end()) {
-            counted.push_back(owner_ids[i]);
-            result.pending_bytes += request.owners[i].size();
-        }
-    }
+    report_pending();
     return result;
 }
 
@@ -2399,6 +2460,18 @@ bool retained_drain_test_parked() {
 
 void retained_drain_test_fail_next_wait_as_command_graph() {
     g_retained_drain_test_command_graph.store(true);
+}
+
+void retained_reap_test_fail_next_query() {
+    g_retained_reap_test_unqueryable.store(true);
+}
+
+size_t retained_reap_test_yielding() {
+    return g_retained_reap_test_yielding.load();
+}
+
+bool retained_store_mutex_held() {
+    return g_retained_store_lock_depth > 0;
 }
 #endif
 
@@ -2422,8 +2495,8 @@ static void publish_handles_until_event(std::vector<mem_handle> handles, sycl::e
 
     std::vector<uint64_t> ids = owner_control_ids(handles);
     {
-        auto &                      state = *g_retained_handles_state;
-        std::lock_guard<std::mutex> lock(state.mutex);
+        auto &              state = *g_retained_handles_state;
+        retained_store_lock lock(state);
         state.queue.push_back({ std::move(handles), std::move(event), std::move(ids) });
     }
     g_retained_handles_state->cv.notify_one();

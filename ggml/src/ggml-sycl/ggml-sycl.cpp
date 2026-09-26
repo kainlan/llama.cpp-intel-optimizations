@@ -18066,11 +18066,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         // whole if its copies are still the ones the snapshot read, and skips
         // it otherwise, and reports how many layers its zone can place. The
         // fit is then redone against the live headroom with nothing left to
-        // count, held to what lands, so a skipped group is a refit shortfall. Without that hold a layer the zone cannot place is not
-        // refused -- it goes to raw device memory outside the arena
-        // (llama.cpp-moua). Layers are modelled in allocation order, which is
-        // the order the fit keeps them in for a model without SWA layers; with
-        // them the hold is approximate. The PP MoE oneDNN ring's KV-zone slots,
+        // count, held to what lands, so a skipped group is a refit shortfall.
+        // Without that hold a layer the zone cannot place is not refused -- it
+        // goes to raw device memory outside the arena (llama.cpp-moua). Layers
+        // are modelled in allocation order, which is the order the fit keeps
+        // them in for a model without SWA layers; with them the hold is
+        // approximate. The PP MoE oneDNN ring's KV-zone slots,
         // which the fit counts as free, are still held while the zone is
         // modelled (the ring is released and re-admitted after KV, below), so
         // on a device holding both the hold places fewer layers than the ring's
@@ -18137,6 +18138,13 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                         "its fit picked were no longer yieldable and stay resident; its KV is held to what the zone "
                         "places without them\n",
                         in.devices[i], n_ctx, released.skipped_groups);
+                }
+                if (released.ungated_groups > 0) {
+                    GGML_LOG_WARN(
+                        "[SYCL-PLAN] KV admission on device %d for n_ctx=%u: the barrier that gates the optional "
+                        "layout copies' frees could not be submitted, so %zu of the groups its fit picked stay "
+                        "resident; its KV is held to what the zone places without them\n",
+                        in.devices[i], n_ctx, released.ungated_groups);
                 }
                 if (released.kv_layers < layer_bytes.size()) {
                     GGML_LOG_WARN(

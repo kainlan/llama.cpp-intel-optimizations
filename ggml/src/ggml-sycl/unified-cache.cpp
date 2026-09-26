@@ -7748,19 +7748,6 @@ bool unified_cache::optional_layout_yieldable_locked(const unified_cache_key &  
                                     buffer_owned && live_buffer_owners_.count(key.id.model_id) != 0, own_leases);
 }
 
-size_t unified_cache::optional_layout_bytes() const {
-    std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
-    std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
-    std::lock(direct_lock, cache_lock);
-    size_t bytes = 0;
-    for (const auto & pair : entries_) {
-        if (optional_layout_yieldable_locked(pair.first, pair.second)) {
-            bytes += pair.second.size;
-        }
-    }
-    return bytes;
-}
-
 optional_layout_snapshot unified_cache::optional_layouts_snapshot() {
     optional_layout_snapshot  snapshot;
     std::vector<const void *> ptrs;
@@ -7872,7 +7859,8 @@ optional_layout_release unified_cache::yield_optional_layouts_begin(
     std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
     std::lock(direct_lock, cache_lock);
 
-    bool gated = false;
+    bool gated       = false;
+    bool gate_failed = false;
     for (const optional_layout_pick_group & group : groups) {
         bool whole = !group.empty();
         for (size_t p = 0; whole && p < group.size(); ++p) {
@@ -7880,14 +7868,18 @@ optional_layout_release unified_cache::yield_optional_layouts_begin(
             whole         = it != entries_.end() && it->second.replacement_identity() == group[p].generation &&
                     optional_layout_yieldable_locked(it->first, it->second);
         }
-        if (whole && !gated) {
+        if (whole && !gated && !gate_failed) {
             try {
                 release.readers_done = submit_barrier_all();
                 gated                = true;
             } catch (...) {
-                // No gate, no release: every copy stays resident and routable.
-                whole = false;
+                gate_failed = true;
             }
+        }
+        if (whole && gate_failed) {
+            // No gate, no release: every copy stays resident and routable.
+            ++result.ungated_groups;
+            continue;
         }
         if (!whole) {
             ++result.skipped_groups;
