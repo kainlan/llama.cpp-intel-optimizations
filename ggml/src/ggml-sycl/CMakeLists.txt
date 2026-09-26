@@ -5345,9 +5345,11 @@ set_tests_properties(sycl-split-exec-policy PROPERTIES
 
 # Dense-split layer-block executor planning (llama.cpp-tf8m): node devices,
 # ranges, boundary copies and arena layout. The header is dependency-free, so
-# this target takes no -fsycl and links nothing.
+# this target takes no -fsycl and links nothing; kv-runtime-demotion.cpp is
+# SYCL-free too and supplies the block KV owner the precheck gates on.
 add_executable(test-sycl-dense-block-exec
     tests/test-sycl-dense-block-exec.cpp
+    kv-runtime-demotion.cpp
 )
 target_include_directories(test-sycl-dense-block-exec PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
