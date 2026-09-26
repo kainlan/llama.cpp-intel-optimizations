@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.13. Author: impl-moua, 2026-09-26. The revisions answer thirteen reviews:
+Design, revision 7.13a. Author: impl-moua, 2026-09-26. The revisions answer thirteen reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -63,9 +63,12 @@ Design, revision 7.13. Author: impl-moua, 2026-09-26. The revisions answer thirt
   interim (§Z10.1), 1oxa r8's I-D (§X9), 23mk r7's I-A (§Z11), zhcn `8a58ad4`'s H4h hooks and
   ldvb's ownership of row 648, recorded in §6.14.
 - design review r12 (design-moua-r12 on `c66848c26..7f4808729`: 1 Critical, 3 Important, 15
-  Minor), the lead's rulings on it (§M14, §M15), §Z13.1, the late-stage string's term slot zhcn
-  5.9's H4h vehicle (`4f8ff34`) and §Z14.2, recorded in §6.15. Revision 7.13 is two commits on
-  top of 7.12a (`7f4808729`): `79abac034`, and a second that folds §M15 and §Z14.2.
+  Minor), the lead's rulings on it (§M14, §M15), §Z13.1, the late-stage string's term slot, zhcn
+  5.9's H4h vehicle (`4f8ff34`) and §Z14.2, recorded in §6.15. Revision 7.13 is one commit on
+  top of 7.12a (`7f4808729`), and revision 7.13a is two commits on top of 7.13 (`79abac034`):
+  `7fb6afc2a` (committed as "7.13, second commit" before the lead named the round 7.13a) and
+  this one. They fold §M15 and §Z14.2, which crossed 7.13; this one adds §Z14.2's reason and the
+  name.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
@@ -4732,7 +4735,11 @@ L7 documents this limit, and pattern #2 remains the remedy.
         backend copy, and under `GGML_BACKEND_DL=ON` it is a disabled placeholder that exits 77,
         which is a skip, never a pass. **It is lead-run (rulings §Z14.2):** on `level_zero:1`,
         with the ctest label `cache|mem-handle` and the selector pinned by the registration's
-        `ENVIRONMENT` property, like zhcn's H4h; no CPU-device admission is added to ggml-sycl:
+        `ENVIRONMENT` property, like zhcn's H4h; no CPU-device admission is added to ggml-sycl.
+        It cannot run over a CPU device: ggml-sycl's devices are GPU-only
+        (`ggml-sycl.cpp:25059-25072`), so a CPU-device run finds no device and its one-device
+        control would exit 77 forever (zhcn r10 I-3 (b)). The exit-77 path under
+        `GGML_BACKEND_DL=ON` stays:
         1. the fallback is reached through zhcn's forcing hook,
            `ggml_sycl_test_host_fallback_scope` (thread-local RAII). Its safe-max override,
            `ggml_sycl_test_override_safe_max_alloc_size(1 MiB)`, makes the real `alloc_buffer`
@@ -5693,7 +5700,7 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
   with `compute_and_store_plan_for_inventory` returning `bool` (C-1; H7ap); and H4 (b) on zhcn
   `8a58ad4`'s hooks.
 
-**Revision 7.13's additions to the rows (r12; rulings §M14, §Z13.1).**
+**Revision 7.13's and 7.13a's additions to the rows (r12; rulings §M14, §Z13.1, §M15, §Z14.2).**
 - **L4:** `ensure_planned_arena_zones`' named refusal arguments (m-7); the guard's one clear
   form (m-8); `retag_pending` as `noexcept` (m-2); and the eviction re-record of a planned
   weight's block (m-11).
@@ -6780,7 +6787,7 @@ the r12 review covers `c66848c26` to this head.
   design names the draw site, and this design states only the owner and the term.
 - Nothing was built for 7.12a; it is a document change only.
 
-### 6.15 Revision 7.13: design-moua-r12, the rulings (§M14), and the post-r12 queue
+### 6.15 Revisions 7.13 and 7.13a: design-moua-r12, rulings §M14 and §M15, the post-r12 queue
 
 design-moua-r12 reviewed `c66848c26..7f4808729` (7.12 and 7.12a) and gave NOT READY: 1 Critical,
 3 Important, 15 Minor. The lead ruled in §M14, queued §Z13.1 and zhcn 5.9's vehicle into this
@@ -6794,7 +6801,7 @@ round, and then asked for a term slot in the late refusal.
 | I-3 | `pending_bytes_excluding` names a removed consumer; the MMID RUNTIME bytes are counted twice | **Changed (§M14 I-3).** The consumer is 23mk's A fit, excluding `({CONTEXT, id}, ONEDNN_PP_A)`; A's step sits between step 5's recording and the yield; on arena devices the MMID bytes have one source, and `runtime_pending` / `mmid_runtime_pending_bytes` are zero there. H1 exact-fit arm. |
 | m-1 | the exit-effects refusal's wording could commit a failed load | **Fixed.** `finalize_end(ticket, false)`: `QUARANTINED`, `EFFECT_FAILED`; H7ap asserts not LIVE. |
 | m-2 | where the retags sit, and `noexcept` | **Fixed.** The first statements of `if (result.committed)` (`:13219`), `noexcept`; H7ap throw arm. |
-| m-3 | the rollback's signature | **Fixed (rulings §M15).** The rollback passes the `LoadTxnId` to `onednn_w_rollback_pending(txn)`, which erases W's `PENDING` entry by the txn recorded on W's contribution; no model argument and no registry lookup, since `txns_` may already be finalized at the validate-failed exit. 7.13's first commit added `Registry::token_for_txn` for this; §M15 withdrew it. W's rollback has two idempotent call sites. |
+| m-3 | the rollback's signature | **Fixed (rulings §M15).** The rollback passes the `LoadTxnId` to `onednn_w_rollback_pending(txn)`, which erases W's `PENDING` entry by the txn recorded on W's contribution; no model argument and no registry lookup, since `txns_` may already be finalized at the validate-failed exit. 7.13 added `Registry::token_for_txn` for this; §M15 withdrew it, and 7.13a removes it. W's rollback has two idempotent call sites. |
 | m-4 | per-iteration recording on single-device plans | **Fixed.** Recorded once, after the loop, from the admitted plan; a device absent from it records nothing. H7ap arm. |
 | m-5 | one contiguous range per key | **Declared limitation**, refused by name (`[LOAD-PLAN] no contiguous WEIGHT extent`), with an H7ap arm; a range set is the follow-up. |
 | m-6 | the order of the two late zone refusals | **Fixed.** The late stage compares and never ensures, so only `[LOAD-PLAN]` is reachable there. |
@@ -6813,7 +6820,7 @@ round, and then asked for a term slot in the late refusal.
 | §Z13.1 (the late-stage check) | **Adopted** (§2.4.2 (b)): larger late is refused by name, smaller late is admitted with 23mk's WARN and `late_term_shrink_admitted`. H7ap arm. |
 | the late refusal's term slot (lead, after §M14) | **Changed.** The string now names the term, its zone, the device and both sizes: `[LOAD-PLAN] the late inventory changes the zones admitted at the early stage: term %s in zone %s on device %d, early %zu B, late %zu B (refused)`. It is this design's string; 23mk accepted it and mirrors it byte for byte once 7.13 lands (rulings §M15). The WARN is 23mk's `cc0e6e1d8` text, mirrored byte for byte. |
 | §M15 (W's rollback; the late string) | **Adopted.** W's rollback is 23mk's txn form (the m-3 row); the widened string stands as written. |
-| §Z14.2 (zhcn r10): who runs H4 (b) | **Adopted** in H4 (b): lead-run on `level_zero:1`, label `cache\|mem-handle`, selector pinned by the registration's `ENVIRONMENT`; no CPU-device admission in ggml-sycl. |
+| §Z14.2 (zhcn r10 I-3 (b)): who runs H4 (b) | **Adopted** in H4 (b) (7.13a): ggml-sycl's devices are GPU-only (`ggml-sycl.cpp:25059-25072`), so a CPU-device run would exit 77 forever; lead-run on `level_zero:1`, label `cache\|mem-handle`, selector pinned by the registration's `ENVIRONMENT`; no CPU-device admission in ggml-sycl. |
 | zhcn 5.9 (`4f8ff34`): the H4h vehicle | **Adopted** in H4 (b): `test-sycl-growth-fallback-vehicle`, one backend copy, exit 77 under `GGML_BACKEND_DL`, `GGML_SYCL_WITNESS_CHECKS=1` explicit. |
 | r12 seams | **Relayed**: to 23mk (C-1's order, the refusal string, m-3, m-7, I-3); 1oxa (I-1, m-11) and zhcn (m-9) through the lead. |
 
@@ -6829,4 +6836,4 @@ round, and then asked for a term slot in the late refusal.
 - m-11's re-record on eviction is new mechanism in the free path; 1oxa owns the site.
 - 23mk accepted the widened refusal string (rev 4.6c, `4ffb34aa3`) and adopted A's placement;
   §M15 settles both. 23mk mirrors the string once 7.13 lands.
-- Nothing was built for 7.13; it is a document change only.
+- Nothing was built for 7.13 or 7.13a; both are document changes only.
