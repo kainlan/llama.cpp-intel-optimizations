@@ -102,6 +102,14 @@ bool stage(unified_cache *         cache,
         return false;
     }
     result.event.wait();
+    // The fill's copy retains its destination -- a reference to the copy's
+    // allocation -- until the background drain worker sees the fill complete,
+    // which can be after the wait above returns. A yield that ran while it was
+    // still held would drop the cache's references and find the bytes still
+    // allocated, so a case would race the worker instead of testing the yield.
+    if (!ggml_sycl::drain_retained_handles(true)) {
+        return false;
+    }
     out->ptr = result.ptr;
     return layout != GGML_LAYOUT_ONEDNN_WOQ || cache->mark_optional_layout(out->key, GGML_LAYOUT_ONEDNN_WOQ);
 }
@@ -228,6 +236,8 @@ void test_owned_copy_is_yielded(unified_cache * cache, sycl::queue * queue) {
     size_t     placeable = 0;
     const auto layers    = one_more_layer(cache, COPY_BYTES, &placeable);
     const auto result    = cache->yield_optional_layouts(layers);
+    printf("  placeable before=%zu; yield: retired=%zu freed=%zu freed_bytes=%zu pending_bytes=%zu kv_layers=%zu\n",
+           placeable, result.retired, result.freed, result.freed_bytes, result.pending_bytes, result.kv_layers);
     check(result.freed == 1 && result.freed_bytes == COPY_BYTES, "a yield frees it");
     check(result.kv_layers == layers.size(), "and the extra layer lands");
     cache->set_live_model_mask(before);
