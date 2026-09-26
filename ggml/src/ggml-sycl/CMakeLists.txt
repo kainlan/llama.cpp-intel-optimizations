@@ -3531,6 +3531,39 @@ set_tests_properties(test-sycl-fattn-tile-d512-decode PROPERTIES
 endif() # static SYCL backend fixture
 
 if (NOT GGML_BACKEND_DL)
+# Flash-attention guard: a -inf-masked KV cell holding NaN/Inf in K or V must
+# not reach the output. Compares every live FA kernel family (selected by
+# shape and GGML_SYCL_FA_* environment) against the CPU reference path. GPU
+# test: it allocates device buffers and runs kernels, so it is not host-only.
+add_executable(test-sycl-fattn-masked-nonfinite
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fattn-masked-nonfinite.cpp
+)
+target_include_directories(test-sycl-fattn-masked-nonfinite PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-fattn-masked-nonfinite PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-fattn-masked-nonfinite PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-fattn-masked-nonfinite PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-fattn-masked-nonfinite PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-fattn-masked-nonfinite PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-fattn-masked-nonfinite COMMAND test-sycl-fattn-masked-nonfinite)
+set_tests_properties(test-sycl-fattn-masked-nonfinite PROPERTIES
+    LABELS "sycl;fattn;masked;numerics;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
+    SKIP_RETURN_CODE 77
+)
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-kernel-selection
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-kernel-selection.cpp
 )
