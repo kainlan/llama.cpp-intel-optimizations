@@ -23,6 +23,23 @@
 // Dead cells are both interleaved with visible ones and in the tail pad
 // (n_kv=256 with only 72 cells in use, the shape of a short prompt).
 //
+// Multi-row cases add two PARTIAL variants, k_partial / v_partial: NaN in the
+// whole K (resp. V) row of one cell that the causal mask hides from the first
+// half of the query rows and shows to the second half. The CPU writes NaN rows
+// for the second half and finite rows for the first. A kernel must not hide the
+// visible NaN (a finite SYCL row where the CPU row is non-finite fails), and
+// the finite rows are scored as usual.
+//   Documented deviation: the XMX v1 and v2 tile kernels multiply a whole V
+// tile on the matrix engine, and "dead" is decided per work-group tile, so a
+// cell visible to any row of the tile keeps its V and 0 * NaN reaches the rows
+// of that tile that mask it. For those kernels, and for v_partial only, a
+// SYCL-non-finite row where the CPU row is finite is reported and allowed.
+// This differs from the CPU there, and it is acceptable: the NaN is a genuine
+// non-finite visible input, so the batch already reports NaN for the rows that
+// see it; zeroing it instead would hide it from those rows as well. K needs no
+// such allowance, because the mask is a per-element select that runs before
+// the softmax.
+//
 // The CPU backend runs with use_ref: its tiled multi-query path adds the mask to
 // the score and multiplies masked V by 0 exactly like the kernels under test, so
 // it is only an oracle in reference mode.
@@ -76,6 +93,8 @@ enum poison_kind {
     POISON_NONE,
     POISON_K,
     POISON_V,
+    POISON_K_PARTIAL,
+    POISON_V_PARTIAL,
 };
 
 static const char * poison_name(poison_kind p) {
@@ -86,6 +105,10 @@ static const char * poison_name(poison_kind p) {
             return "k_poison";
         case POISON_V:
             return "v_poison";
+        case POISON_K_PARTIAL:
+            return "k_partial";
+        case POISON_V_PARTIAL:
+            return "v_partial";
     }
     return "?";
 }
@@ -127,6 +150,17 @@ static std::vector<int> poison_cells(int n_kv, int n_used) {
     }
     cells.push_back(n_kv - 1);
     return cells;
+}
+
+// The cell the partial variants poison: visible to query rows >= ne01 / 2 and
+// masked for the rows before them (see build_mask). If a shape ever made it an
+// interleaved dead cell, the CPU output would be finite and the case VOID.
+static int partial_cell(const fa_case & c) {
+    return c.n_used - c.ne01 + c.ne01 / 2;
+}
+
+static bool poison_is_partial(poison_kind p) {
+    return p == POISON_K_PARTIAL || p == POISON_V_PARTIAL;
 }
 
 static float poison_value(size_t i) {
@@ -203,10 +237,12 @@ static fa_inputs make_inputs(const fa_case & c, poison_kind poison) {
     }
 
     if (poison != POISON_NONE) {
-        std::vector<ggml_fp16_t> & dst   = poison == POISON_K ? in.k : in.v;
-        const std::vector<int>     cells = poison_cells(c.n_kv, c.n_used);
+        const bool                 is_k    = poison == POISON_K || poison == POISON_K_PARTIAL;
+        const bool                 partial = poison_is_partial(poison);
+        std::vector<ggml_fp16_t> & dst     = is_k ? in.k : in.v;
+        const std::vector<int> cells = partial ? std::vector<int>{ partial_cell(c) } : poison_cells(c.n_kv, c.n_used);
         for (size_t i = 0; i < cells.size(); ++i) {
-            const ggml_fp16_t val = ggml_fp32_to_fp16(poison_value(i));
+            const ggml_fp16_t val = ggml_fp32_to_fp16(partial ? NAN : poison_value(i));
             for (int h = 0; h < c.H_kv; ++h) {
                 for (int d = 0; d < c.D; ++d) {
                     dst[((size_t) h * c.n_kv + cells[i]) * c.D + d] = val;
@@ -445,47 +481,81 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
     }
 
     // dst is [D, H_q, ne01]: one row per (query, head).
+    const bool   partial       = poison_is_partial(poison);
     const size_t n_rows        = ref.size() / (size_t) c.D;
     size_t       cpu_nonfinite = 0;
     size_t       gpu_nonfinite = 0;
+    size_t       cpu_nf_rows   = 0;  // rows the CPU reports non-finite
+    size_t       hidden_rows   = 0;  // SYCL finite where the CPU row is not: a visible NaN hidden
+    size_t       spill_rows    = 0;  // SYCL non-finite where the CPU row is finite
     size_t       zeroed_rows   = 0;  // SYCL all-zero where CPU is not
     size_t       stray_rows    = 0;  // SYCL non-zero where CPU is all-zero (fully masked row)
     size_t       sentinel_rows = 0;
     double       mse_diff      = 0.0;
     double       mse_ref       = 0.0;
     double       max_diff      = 0.0;
+    double       cmp_diff      = 0.0;  // partial variants: over rows finite on both sides
+    double       cmp_ref       = 0.0;
+    double       cmp_max_diff  = 0.0;
     for (size_t r = 0; r < n_rows; ++r) {
-        bool ref_zero = true;
-        bool got_zero = true;
-        bool sentinel = false;
+        bool   ref_zero     = true;
+        bool   got_zero     = true;
+        bool   sentinel     = false;
+        bool   ref_finite   = true;
+        bool   got_finite   = true;
+        double row_diff     = 0.0;
+        double row_ref      = 0.0;
+        double row_max_diff = 0.0;
         for (int d = 0; d < c.D; ++d) {
             const float a = ref[r * c.D + d];
             const float b = got[r * c.D + d];
             cpu_nonfinite += std::isfinite(a) ? 0 : 1;
             gpu_nonfinite += std::isfinite(b) ? 0 : 1;
-            ref_zero = ref_zero && a == 0.0f;
-            got_zero = got_zero && b == 0.0f;
-            sentinel = sentinel || b == DST_SENTINEL;
+            ref_finite = ref_finite && std::isfinite(a);
+            got_finite = got_finite && std::isfinite(b);
+            ref_zero   = ref_zero && a == 0.0f;
+            got_zero   = got_zero && b == 0.0f;
+            sentinel   = sentinel || b == DST_SENTINEL;
             // The reference norm must not depend on the SYCL values: summing
             // it only where both sides are finite made a fully non-finite
             // SYCL result look like an all-zero oracle.
             if (std::isfinite(a)) {
                 mse_ref += (double) a * (double) a;
+                row_ref += (double) a * (double) a;
             }
             if (std::isfinite(a) && std::isfinite(b)) {
                 const double diff = (double) b - (double) a;
                 mse_diff += diff * diff;
-                max_diff = std::max(max_diff, std::fabs(diff));
+                row_diff += diff * diff;
+                max_diff     = std::max(max_diff, std::fabs(diff));
+                row_max_diff = std::max(row_max_diff, std::fabs(diff));
             }
         }
+        cpu_nf_rows += ref_finite ? 0 : 1;
+        hidden_rows += (!ref_finite && got_finite) ? 1 : 0;
+        spill_rows += (ref_finite && !got_finite) ? 1 : 0;
         zeroed_rows += (got_zero && !ref_zero) ? 1 : 0;
         stray_rows += (ref_zero && !got_zero && !sentinel) ? 1 : 0;
         sentinel_rows += sentinel ? 1 : 0;
+        if (ref_finite && got_finite) {
+            cmp_diff += row_diff;
+            cmp_ref += row_ref;
+            cmp_max_diff = std::max(cmp_max_diff, row_max_diff);
+        }
     }
     // A non-finite SYCL value has no finite distance to the reference, so it
-    // must never be summarised as a small error.
+    // must never be summarised as a small error. The partial variants expect
+    // non-finite rows, check them row by row above, and measure the error over
+    // the rows both sides report finite.
     double nmse = 0.0;
-    if (gpu_nonfinite > 0) {
+    if (partial) {
+        max_diff = cmp_max_diff;
+        if (cmp_ref > 0.0) {
+            nmse = cmp_diff / cmp_ref;
+        } else if (cmp_diff > 0.0) {
+            nmse = INFINITY;
+        }
+    } else if (gpu_nonfinite > 0) {
         nmse     = INFINITY;
         max_diff = INFINITY;
     } else if (mse_ref > 0.0) {
@@ -501,10 +571,21 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
     // rows, unwritten rows); the NMSE is still printed.
     const bool nmse_gated = kernel.rfind("xmx_v1", 0) != 0;
 
-    // With no visible cell at all the CPU output is legitimately all zero.
+    // The documented tile-kernel deviation (see the file header): a V cell
+    // visible to some rows of an XMX work-group tile reaches the rows of that
+    // tile that mask it.
+    const bool xmx_tile = kernel.rfind("xmx_v1", 0) == 0 || kernel.rfind("xmx_v2_f16_ncols", 0) == 0 ||
+                          kernel.rfind("xmx_v2_f16_pp_ncols", 0) == 0;
+    const bool spill_allowed = poison == POISON_V_PARTIAL && xmx_tile;
+
+    // With no visible cell at all the CPU output is legitimately all zero. A
+    // partial variant needs both NaN rows (the cell is visible somewhere) and
+    // finite rows (it is masked somewhere), or it tests nothing.
     const bool expect_all_zero = c.n_used == 0;
-    const bool oracle_ok       = cpu_nonfinite == 0 && (expect_all_zero ? mse_ref == 0.0 : mse_ref > 0.0);
-    const bool ok = oracle_ok && !kernel.empty() && gpu_nonfinite == 0 && zeroed_rows == 0 && stray_rows == 0 &&
+    const bool oracle_ok       = partial ? (cpu_nf_rows > 0 && cpu_nf_rows < n_rows && mse_ref > 0.0) :
+                                           (cpu_nonfinite == 0 && (expect_all_zero ? mse_ref == 0.0 : mse_ref > 0.0));
+    const bool finite_ok = partial ? (hidden_rows == 0 && (spill_rows == 0 || spill_allowed)) : gpu_nonfinite == 0;
+    const bool ok        = oracle_ok && !kernel.empty() && finite_ok && zeroed_rows == 0 && stray_rows == 0 &&
                     sentinel_rows == 0 && (!nmse_gated || nmse <= NMSE_MAX);
 
     std::printf(
@@ -513,6 +594,11 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
         ok ? "OK" : "FAIL", label, kernel.empty() ? "<none: no dispatch line captured>" : kernel.c_str(), nmse,
         NMSE_MAX, nmse_gated ? "" : ", not gated", max_diff, gpu_nonfinite, zeroed_rows, n_rows, stray_rows,
         sentinel_rows, cpu_nonfinite);
+    if (partial) {
+        std::printf("  rows [%s]: cpu_nonfinite_rows=%zu hidden_rows=%zu spill_rows=%zu%s\n", label, cpu_nf_rows,
+                    hidden_rows, spill_rows,
+                    spill_rows == 0 ? "" : (spill_allowed ? " (allowed: XMX tile deviation)" : " (not allowed)"));
+    }
     if (!oracle_ok) {
         std::printf(
             "  VOID [%s]: the CPU reference is non-finite or has the wrong all-zero state, so this case proves "
@@ -582,11 +668,15 @@ int main(int, char ** argv) {
         { "d512_decode",      512, 8,  2, 1,  256, 72, false, true,  false },
         { "d512_mq4",         512, 8,  2, 4,  256, 72, false, true,  false },
     };
-    const poison_kind variants[] = { POISON_NONE, POISON_K, POISON_V };
+    const poison_kind variants[] = { POISON_NONE, POISON_K, POISON_V, POISON_K_PARTIAL, POISON_V_PARTIAL };
 
     for (const fa_case & c : cases) {
         std::printf("== %s ==\n", c.name);
         for (poison_kind p : variants) {
+            // A single query row sees every cell or none: no partial mask.
+            if (poison_is_partial(p) && c.ne01 == 1) {
+                continue;
+            }
             run_case(sycl, cpu, c, p);
         }
     }
