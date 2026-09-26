@@ -1,10 +1,11 @@
 // Host-only gate for the pure helpers in src/llama-auto-ubatch.h.
 //
 // llama_auto_ubatch_ladder_has_candidate() is the predicate behind the SYCL
-// auto micro-batch trial's early exit before its ladder loop. When it returns false the loop would skip every rung, leave the
-// `tried` list empty, and still log the [SYCL-PLAN] auto n_ubatch= outcome and
-// persist a terminal tuning-cache entry for a ladder that never ran -- so the
-// trial must take the silent pre-trial path instead.
+// auto micro-batch trial's early exit before its ladder loop. When it returns
+// false the loop would skip every rung, leave the `tried` list empty, and
+// still log the [SYCL-PLAN] auto n_ubatch= outcome and persist a terminal
+// tuning-cache entry for a ladder that never ran -- so the trial must take
+// the silent pre-trial path instead.
 //
 // Each case gives the trial's two bounds as the constructor and the trial
 // derive them: floor = fallback_ubatch = min(n_batch, n_ubatch), and
@@ -95,6 +96,9 @@ int main() {
     // the constructor's own: the constructor's publish still describes it.
     check_publish("nothing attempted, value unchanged", false, false, 512, 512, false);
     check_publish("a candidate's publish took effect", true, false, 512, 512, true);
+    // The helper's contract, not an input the trial can produce: the trial
+    // writes n_ubatch only just before a publish attempt, which always sets
+    // one of the two flags. This pins the defensive n_ubatch term on its own.
     check_publish("last candidate left a different value", false, false, 1024, 512, true);
 
     // Two SYCL backends, fallback 512, cached 1024: the cached publish lands

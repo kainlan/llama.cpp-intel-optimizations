@@ -1497,11 +1497,12 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // cache call site puts it in its own separate WARN parenthetical
     // (below). Returns nullptr on a full pass (accepted, published,
     // reserved, and no host-pinned fallback); otherwise the stop-reason
-    // string that lost. Mutates `cparams.n_ubatch`, `published_any`,
-    // `publish_dirty`, and `sched_matches_last_good` exactly as the two pre-refactor copies each
-    // did inline -- callers must not assume `cparams.n_ubatch` is unchanged
-    // after a losing call, since the probe stage can already have set it via
-    // the publish before the host-fallback stage fails.
+    // string that lost. Mutates `cparams.n_ubatch`, `published_any`, and
+    // `sched_matches_last_good` exactly as the two pre-refactor copies each
+    // did inline, and additionally sets `publish_dirty` when the publish
+    // throws -- callers must not assume `cparams.n_ubatch` is unchanged
+    // after a losing call, since the probe stage can already have set it
+    // via the publish before the host-fallback stage fails.
     auto try_candidate = [&](uint32_t c) -> const char * {
         for (auto & sb : sycl_backends) {
             ggml_sycl_runtime_context_probe probe{};
@@ -1882,11 +1883,14 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // took effect (published_any) or one that threw partway through the
     // backends (publish_dirty) -- forces a republish of last_good on every
     // device, whatever candidate was tried last. It is skipped only when no
-    // such attempt happened AND cparams.n_ubatch (as the loop left it, before
-    // being reset to last_good just below) already equals fallback_ubatch --
-    // the plan the constructor's own earlier publish already put in place is
-    // then still correct, and republishing the same value would be a redundant
-    // runtime-context transaction with no state change.
+    // such attempt happened -- the plan the constructor's own earlier publish
+    // already put in place is then still correct, and republishing the same
+    // value would be a redundant runtime-context transaction with no state
+    // change. The flags already cover a changed cparams.n_ubatch:
+    // try_candidate() writes it only immediately before a publish attempt,
+    // which always sets one of them. The helper's own n_ubatch !=
+    // fallback_ubatch term is a defensive backstop for a future writer that
+    // skips the publish, not a case this call site can reach today.
     //
     // The first rung tried is the smallest rung >= fallback_ubatch (the loop
     // skips rungs under the floor), so it equals fallback_ubatch only when
@@ -1917,18 +1921,17 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // true whenever any candidate publish took effect (published_any) or threw
     // (publish_dirty -- it may have landed on some devices before one refused),
     // and then the settle republishes and re-plans last_good on every device.
-    // Otherwise no publish was attempted that could have landed, no candidate
-    // won, last_good is fallback_ubatch, and cparams.n_ubatch is
-    // fallback_ubatch unless the last candidate lost at its probe after an
-    // earlier one set it -- which also forces a republish. Without a republish
-    // the settle only re-reserves fallback_ubatch: the ring is exact when the
-    // failed candidate was fallback_ubatch and oversized, never undersized,
-    // otherwise. The settle's own publish gate never inspects the ring directly
-    // -- it does not need to.
+    // Otherwise every candidate lost at its probe, before cparams.n_ubatch was
+    // ever written, so no candidate won, last_good is fallback_ubatch,
+    // cparams.n_ubatch still equals it, and no device plan changed. Without a
+    // republish the settle only re-reserves fallback_ubatch: the ring is exact
+    // when the failed candidate was fallback_ubatch and oversized, never
+    // undersized, otherwise. The settle's own publish gate never inspects the
+    // ring directly -- it does not need to.
     if (!sched_matches_last_good || cparams.n_ubatch != last_good) {
         const bool need_publish =
             llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty, cparams.n_ubatch, fallback_ubatch);
-        cparams.n_ubatch        = last_good;
+        cparams.n_ubatch = last_good;
         if (need_publish) {
             sycl_resync_runtime_context_flash_attn();
         }
