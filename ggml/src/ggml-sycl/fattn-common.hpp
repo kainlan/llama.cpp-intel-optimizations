@@ -36,7 +36,17 @@ static inline float fattn_apply_mask(float score, float slope, sycl::half mask_v
 // True when all n_rows query rows mask KV cell kv with -inf. Kernels that
 // multiply a whole V tile on the matrix engine cannot select per element;
 // such a cell has weight 0 for every row of the tile, so zeroing its V there
-// is exact.
+// is exact. The rows are the ones the calling work-group covers, so "dead" is
+// decided per tile at run time, never globally.
+//
+// A cell masked for only SOME rows of the tile (a causal mask in prefill) is
+// not dead, and its V is kept. If that V is non-finite, the rows that see it
+// get NaN, as on the CPU, and the tile multiply also carries the NaN into the
+// rows of the same tile that mask it, where the CPU is finite. This is a
+// deliberate deviation. The alternative, zeroing the value, would give the
+// rows that see it a finite, wrong result and hide real garbage in the
+// cache. The spill keeps it visible, and it is confined to one tile of rows
+// that already contains a NaN answer.
 static inline bool fattn_kv_dead_for_rows(const sycl::half * mask, int64_t row_stride, int n_rows, int kv) {
     if (mask == nullptr || n_rows <= 0) {
         return false;

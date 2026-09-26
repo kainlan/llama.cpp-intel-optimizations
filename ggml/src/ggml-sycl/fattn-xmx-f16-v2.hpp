@@ -713,6 +713,8 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
             // still meets its V row (0 * NaN is NaN). A cell masked for every
             // query row of this work-group contributes nothing, so zeroing its
             // non-finite V is exact; the mask is read only for such a value.
+            // A partially masked cell keeps its V; see fattn_kv_dead_for_rows
+            // for why that NaN is allowed to spill within the tile.
             if (!sycl::isfinite(static_cast<float>(v_val)) &&
                 fattn_kv_dead_for_rows(maskh, ne30, sycl::min(ncols, ne01 - ic0), kv_pos)) {
                 v_val = sycl::half(0.0f);

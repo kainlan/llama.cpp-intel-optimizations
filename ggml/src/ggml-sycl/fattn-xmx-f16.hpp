@@ -766,7 +766,9 @@ static void flash_attn_xmx_f16_kernel(
         // S @ V multiplies whole tiles, so a dead cell's weight-0 column still
         // meets its V row (0 * NaN is NaN). A cell masked for every query row
         // of this work-group contributes nothing, so zeroing its non-finite V
-        // is exact; the mask is read only for such a value.
+        // is exact; the mask is read only for such a value. A partially
+        // masked cell keeps its V; see fattn_kv_dead_for_rows for why that
+        // NaN is allowed to spill within the tile.
         const int v_dead_rows = sycl::min(ncols, ne01 - ic0);
         if constexpr (kv_is_fp8) {
             // FP8 E4M3: element-by-element dequantization (can't vectorize)
@@ -1037,7 +1039,11 @@ static void flash_attn_xmx_f16_kernel(
                 for (int k = 0; k < kv_count; ++k) {
                     const float kq_val       = QK_acc[j * batch_kv + k];
                     const float diff         = kq_val - KQ_max[j];
-                    const float w            = diff >= SOFTMAX_FTZ_THRESHOLD ? sycl::exp(diff) : 0.0f;
+                    // `diff < T ? 0 : exp` lets a NaN score (a visible cell
+                    // with a non-finite K) propagate like the CPU reference;
+                    // the `>=` form flushed it to weight 0 and hid it. A dead
+                    // cell is exactly -inf here and still flushes to 0.
+                    const float w            = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : sycl::exp(diff);
                     tile_S[j * S_STRIDE + k] = sycl::half(w);
                     batch_sum += w;
                 }

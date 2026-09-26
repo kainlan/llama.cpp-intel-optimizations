@@ -350,16 +350,20 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                         // Online softmax update - V was prefetched above
                         simd<float, D> v_row = convert<float>(v_row_h);
 
+                        // The flush-to-zero test is written `diff < T ? 0 : exp`
+                        // so that a NaN diff (a visible cell with a non-finite
+                        // K) propagates like the CPU reference instead of being
+                        // flushed to a weight of 0 and hidden.
                         if (score <= max_score) {
                             // Use FTZ threshold to avoid numerical issues
                             float diff      = score - max_score;
-                            float exp_score = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float exp_score = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                             acc_v           = acc_v + v_row * exp_score;
                             softmax_sum += exp_score;
                         } else {
                             // Use FTZ threshold to avoid numerical issues
                             float diff       = max_score - score;
-                            float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float exp_factor = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                             acc_v            = acc_v * exp_factor + v_row;
                             softmax_sum      = softmax_sum * exp_factor + 1.0f;
                             max_score        = score;
@@ -400,12 +404,12 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                         // Online softmax merge with FTZ threshold
                         if (p_max <= my_max) {
                             float diff       = p_max - my_max;
-                            float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float exp_factor = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                             my_acc           = my_acc + p_acc * exp_factor;
                             my_sum += p_sum * exp_factor;
                         } else {
                             float diff       = my_max - p_max;
-                            float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float exp_factor = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                             my_acc           = my_acc * exp_factor + p_acc;
                             my_sum           = my_sum * exp_factor + p_sum;
                             my_max           = p_max;
@@ -430,7 +434,7 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                         const float sink         = sinks_ptr[head];
                         const float new_max      = std::max(sink, final_max);
                         float       diff         = final_max - new_max;
-                        float       max_scale    = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                        float       max_scale    = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                         float       sink_softmax = esimd::exp(sink - new_max);
                         final_acc                = final_acc * max_scale;
                         final_sum                = final_sum * max_scale + sink_softmax;
@@ -1109,17 +1113,20 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                             score += static_cast<float>(mask_row[kv_pos]);
                         }
 
-                        // Online softmax update
+                        // Online softmax update. The flush-to-zero test is
+                        // written `diff < T ? 0 : exp` so that a NaN diff (a
+                        // visible cell with a non-finite K) propagates like the
+                        // CPU reference instead of being flushed to 0 and hidden.
                         if constexpr (D == 128) {
                             if (score <= max_score[j]) {
                                 float diff      = score - max_score[j];
-                                float exp_score = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                float exp_score = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                                 acc_v_h1[j]     = acc_v_h1[j] + v_vec_h1 * exp_score;
                                 acc_v_h2[j]     = acc_v_h2[j] + v_vec_h2 * exp_score;
                                 softmax_sum[j] += exp_score;
                             } else {
                                 float diff       = max_score[j] - score;
-                                float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                float exp_factor = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                                 acc_v_h1[j]      = acc_v_h1[j] * exp_factor + v_vec_h1;
                                 acc_v_h2[j]      = acc_v_h2[j] * exp_factor + v_vec_h2;
                                 softmax_sum[j]   = softmax_sum[j] * exp_factor + 1.0f;
@@ -1128,12 +1135,12 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                         } else {
                             if (score <= max_score[j]) {
                                 float diff      = score - max_score[j];
-                                float exp_score = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                float exp_score = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                                 acc_v[j]        = acc_v[j] + v_vec * exp_score;
                                 softmax_sum[j] += exp_score;
                             } else {
                                 float diff       = max_score[j] - score;
-                                float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                float exp_factor = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                                 acc_v[j]         = acc_v[j] * exp_factor + v_vec;
                                 softmax_sum[j]   = softmax_sum[j] * exp_factor + 1.0f;
                                 max_score[j]     = score;
@@ -1212,13 +1219,13 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                             if constexpr (D == 128) {
                                 if (p_max <= final_max) {
                                     float diff       = p_max - final_max;
-                                    float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                    float exp_factor = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                                     final_acc_h1     = final_acc_h1 + p_acc_h1 * exp_factor;
                                     final_acc_h2     = final_acc_h2 + p_acc_h2 * exp_factor;
                                     final_sum += p_sum * exp_factor;
                                 } else {
                                     float diff       = final_max - p_max;
-                                    float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                    float exp_factor = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                                     final_acc_h1     = final_acc_h1 * exp_factor + p_acc_h1;
                                     final_acc_h2     = final_acc_h2 * exp_factor + p_acc_h2;
                                     final_sum        = final_sum * exp_factor + p_sum;
@@ -1228,12 +1235,12 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                                 // Native D-element merge for D=64 and all other D
                                 if (p_max <= final_max) {
                                     float diff       = p_max - final_max;
-                                    float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                    float exp_factor = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                                     final_acc        = final_acc + p_acc * exp_factor;
                                     final_sum += p_sum * exp_factor;
                                 } else {
                                     float diff       = final_max - p_max;
-                                    float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                    float exp_factor = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                                     final_acc        = final_acc * exp_factor + p_acc;
                                     final_sum        = final_sum * exp_factor + p_sum;
                                     final_max        = p_max;
@@ -1246,7 +1253,7 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                             const float sink         = sinks_ptr[head];
                             const float new_max      = std::max(sink, final_max);
                             float       diff         = final_max - new_max;
-                            float       max_scale    = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float       max_scale    = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : esimd::exp(diff);
                             float       sink_softmax = esimd::exp(sink - new_max);
                             if constexpr (D == 128) {
                                 final_acc_h1 = final_acc_h1 * max_scale;
