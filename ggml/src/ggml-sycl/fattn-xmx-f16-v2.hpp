@@ -1240,9 +1240,9 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
             const int slot     = i - half_id * XMX_V2_DECODE_SLOTS;
             const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
             if (lane < XMX_V2_DECODE_ACTIVE_LANES) {
-                const float p      = sycl::exp(lane_scores[i] - new_max);
+                const float p      = fattn_mark_dead(lane_scores[i], sycl::exp(lane_scores[i] - new_max));
                 tile_S_f[kv_local] = p;
-                local_sum += p;
+                local_sum += fattn_weight_sum_term(p);
             }
         }
         const float tile_sum = sycl::reduce_over_group(sg, local_sum, sycl::plus<float>{});
@@ -1256,9 +1256,9 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
             float     acc = 0.0f;
 #    pragma unroll
             for (int k = 0; k < XMX_V2_DECODE_BATCH_KV; ++k) {
-                // Weight 0 is a dead cell whose V may be non-finite: skip it.
+                // A dead cell's V may be non-finite: skip it (see fattn_mark_dead).
                 const float s = tile_S_f[k];
-                if (kv_start + k < ne11 && s != 0.0f) {
+                if (kv_start + k < ne11 && !fattn_weight_is_dead(s)) {
                     acc += s * static_cast<float>(tile_V[k * D + d]);
                 }
             }
@@ -1564,9 +1564,9 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
             const int slot     = i - half_id * XMX_V2_DECODE_SLOTS;
             const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
             if (active && lane < XMX_V2_DECODE_ACTIVE_LANES) {
-                const float p                                       = sycl::exp(lane_scores[i] - new_max);
+                const float p = fattn_mark_dead(lane_scores[i], sycl::exp(lane_scores[i] - new_max));
                 tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + kv_local] = p;
-                local_sum += p;
+                local_sum += fattn_weight_sum_term(p);
             }
         }
         const float tile_sum = sycl::reduce_over_group(sg, local_sum, sycl::plus<float>{});
@@ -1581,9 +1581,9 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
                 float     acc = 0.0f;
 #    pragma unroll
                 for (int k = 0; k < XMX_V2_DECODE_BATCH_KV; ++k) {
-                    // Weight 0 is a dead cell whose V may be non-finite: skip it.
+                    // A dead cell's V may be non-finite: skip it (see fattn_mark_dead).
                     const float s = tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + k];
-                    if (kv_start + k < ne11 && s != 0.0f) {
+                    if (kv_start + k < ne11 && !fattn_weight_is_dead(s)) {
                         acc += s * static_cast<float>(tile_V[k * D + d]);
                     }
                 }
@@ -1861,11 +1861,11 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
         const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
         lane_probs[i]      = 0.0f;
         if (active && lane < XMX_V2_DECODE_ACTIVE_LANES) {
-            lane_probs[i] = sycl::exp(lane_scores[i] - KQ_max);
+            lane_probs[i] = fattn_mark_dead(lane_scores[i], sycl::exp(lane_scores[i] - KQ_max));
             if constexpr (!DIRECT_PV) {
                 tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + kv_local] = lane_probs[i];
             }
-            local_sum += lane_probs[i];
+            local_sum += fattn_weight_sum_term(lane_probs[i]);
         }
     }
     KQ_sum = sycl::reduce_over_group(sg, local_sum, sycl::plus<float>{});
@@ -1889,10 +1889,10 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
                         const int kv_local =
                             half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + src_lane;
                         if (kv_start + kv_local < ne11) {
-                            // Uniform across the sub-group; weight 0 is a dead
-                            // cell whose V may be non-finite: skip it.
+                            // Uniform across the sub-group. A dead cell's V may
+                            // be non-finite: skip it (see fattn_mark_dead).
                             const float p = sycl::select_from_group(sg, lane_probs[i], src_lane);
-                            if (p != 0.0f) {
+                            if (!fattn_weight_is_dead(p)) {
                                 acc += p * static_cast<float>(tile_V[kv_local * D + d]);
                             }
                         }
@@ -1901,9 +1901,9 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
             } else {
 #    pragma unroll
                 for (int k = 0; k < XMX_V2_DECODE_BATCH_KV; ++k) {
-                    // Weight 0 is a dead cell whose V may be non-finite: skip it.
+                    // A dead cell's V may be non-finite: skip it (see fattn_mark_dead).
                     const float s = tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + k];
-                    if (kv_start + k < ne11 && s != 0.0f) {
+                    if (kv_start + k < ne11 && !fattn_weight_is_dead(s)) {
                         acc += s * static_cast<float>(tile_V[k * D + d]);
                     }
                 }

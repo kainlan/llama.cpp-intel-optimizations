@@ -621,12 +621,13 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             float KQ_sum_add = 0.0f;
 #pragma unroll
             for (int i0 = 0; i0 < nbatch_fa; i0 += np*warp_size) {
+                const float KQ_val = (float) KQ_acc[(i0 / (np * warp_size)) * cpw + jc];
                 const float val =
                     !oob_check || i0 + (item_ct1.get_local_id(1) % np) * warp_size + item_ct1.get_local_id(2) <
                                       static_cast<uint32_t>(k_VKQ_sup) ?
-                        sycl::native::exp((float) (KQ_acc[(i0 / (np * warp_size)) * cpw + jc] - KQ_max[jc])) :
+                        fattn_mark_dead(KQ_val, sycl::native::exp(KQ_val - (float) KQ_max[jc])) :
                         0.0f;
-                KQ_sum_add += val;
+                KQ_sum_add += fattn_weight_sum_term(val);
                 tmp[i0/(np*warp_size)][jc1] = val;
             }
             KQ_sum[jc] = KQ_sum[jc]*KQ_max_scale + KQ_sum_add;
@@ -699,9 +700,10 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
 #pragma unroll
                 for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
-                    // Weight 0 is a dead cell whose V may be non-finite; skip
-                    // it rather than add 0 * V. KQ_k is the same across the warp.
-                    if (KQ_k[jc_VKQ_0].x() == sycl::half(0.0f)) {
+                    // A dead cell's V may be non-finite; skip it rather than
+                    // add 0 * V (see fattn_mark_dead). KQ_k is the same across
+                    // the warp.
+                    if (fattn_weight_is_dead(static_cast<float>(KQ_k[jc_VKQ_0].x()))) {
                         continue;
                     }
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x() +=
@@ -734,8 +736,8 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
 #pragma unroll
                 for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
-                    // Weight 0 is a dead cell whose V may be non-finite; skip it.
-                    if (KQ_k[jc_VKQ_0] == 0.0f) {
+                    // A dead cell's V may be non-finite; skip it (see fattn_mark_dead).
+                    if (fattn_weight_is_dead(KQ_k[jc_VKQ_0])) {
                         continue;
                     }
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x() += V_k[i0/warp_size].x()*KQ_k[jc_VKQ_0];

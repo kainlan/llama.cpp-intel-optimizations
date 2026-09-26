@@ -59,6 +59,28 @@ static inline bool fattn_kv_dead_for_rows(const sycl::half * mask, int64_t row_s
     return true;
 }
 
+// Softmax weight slots read back by a scalar P x V loop. A dead cell (score
+// exactly -inf) is stored as FATTN_DEAD_WEIGHT, which no exp() produces, so
+// the V loop skips exactly the dead cells. It must not skip on weight 0: a
+// VISIBLE cell whose weight underflowed to 0 still meets its V on the CPU
+// reference (0 * V is added), and 0 * NaN is NaN there.
+static constexpr float FATTN_DEAD_WEIGHT = -1.0f;
+
+static inline float fattn_mark_dead(float score, float weight) {
+    return score == -INFINITY ? FATTN_DEAD_WEIGHT : weight;
+}
+
+// A NaN weight (a visible non-finite score) compares false, so it is never
+// skipped and propagates as on the CPU.
+static inline bool fattn_weight_is_dead(float weight) {
+    return weight < 0.0f;
+}
+
+// The weight's contribution to the softmax denominator.
+static inline float fattn_weight_sum_term(float weight) {
+    return fattn_weight_is_dead(weight) ? 0.0f : weight;
+}
+
 // Default thread configuration for flash attention vector kernel
 #define FATTN_VEC_NTHREADS    128
 
