@@ -23,12 +23,15 @@
 // Dead cells are both interleaved with visible ones and in the tail pad
 // (n_kv=256 with only 72 cells in use, the shape of a short prompt).
 //
-// Multi-row cases add two PARTIAL variants, k_partial / v_partial: NaN in the
-// whole K (resp. V) row of one cell that the causal mask hides from the first
-// half of the query rows and shows to the second half. The CPU writes NaN rows
-// for the second half and finite rows for the first. A kernel must not hide the
-// visible NaN (a finite SYCL row where the CPU row is non-finite fails), and
-// the finite rows are scored as usual.
+// Two PARTIAL variants, k_partial / v_partial, put NaN in the whole K (resp.
+// V) row of one cell that the causal mask hides from the first half of the
+// query rows and shows to the second half. The CPU writes NaN rows for the
+// second half and finite rows for the first. A kernel must not hide the visible
+// NaN (a finite SYCL row where the CPU row is non-finite fails), and the finite
+// rows are scored as usual. With a single query row the cell is simply visible,
+// so the decode cases run them too: that is the only place a decode kernel
+// meets a non-finite K in a VISIBLE cell, where a NaN score must propagate
+// rather than be flushed to weight 0.
 //   Documented deviation: the XMX v1 and v2 tile kernels multiply a whole V
 // tile on the matrix engine, and "dead" is decided per work-group tile, so a
 // cell visible to any row of the tile keeps its V and 0 * NaN reaches the rows
@@ -64,7 +67,9 @@
 // CPU row is non-zero (the sanitizer signature), a row left holding the dst
 // sentinel (an unwritten row), or NMSE above test-backend-ops' FLASH_ATTN_EXT
 // bound (reported but not gated for the nondeterministic XMX v1 kernel). The
-// CPU output must itself be finite, or the case is void.
+// CPU output must itself be finite for clean and k_poison / v_poison; for the
+// row-wise variants it must be non-finite exactly in the rows that see the
+// poisoned cell. Otherwise the case is void.
 //
 // KERNEL COVERAGE: the kernel is chosen by the dispatcher from the shape and
 // the environment. The test sets GGML_SYCL_FA_DISPATCH_DEBUG (unless already
@@ -188,8 +193,8 @@ static bool is_interleaved_dead(int cell, int n_used) {
 // live window (a previous request's decode cells), and two deep in the pad.
 static std::vector<int> poison_cells(int n_kv, int n_used) {
     std::vector<int> cells;
-    for (int c = 0; c < n_used; ++c) {
-        if (is_interleaved_dead(c, n_used) && (c == 17 || c == 41)) {
+    for (int c : { 17, 41 }) {  // both are 5 mod 12: interleaved dead cells
+        if (c < n_used) {
             cells.push_back(c);
         }
     }
@@ -430,6 +435,10 @@ struct stderr_capture {
         }
         saved = dup(STDERR_FILENO);
         if (saved < 0 || dup2(fileno(tmp), STDERR_FILENO) < 0) {
+            if (saved >= 0) {
+                close(saved);
+                saved = -1;
+            }
             std::fclose(tmp);
             tmp = nullptr;
             return false;
@@ -593,6 +602,9 @@ static const expect_kernel expected_kernels[] = {
     { "v1pp",                      "d128_pp72_row1_masked",       "xmx_v1_f16_ncols8_large_kv"           },
     { "v1pp",                      "d256_pp16",                   "xmx_v2_f16_ncols16"                   },
 
+    // noesimd leaves out d128_pp72, d256_pp16 and d128_pp72_row1_masked: oneDNN
+    // still routes them under this arm, and they stay red until llama.cpp-t0f4.
+    // noonednn and v1pp cover their native kernels.
     { "noesimd",                   "d128_decode",                 "vec_f16"                              },
     { "noesimd",                   "d64_sinks_decode",            "vec_f16"                              },
     { "noesimd",                   "d128_decode_all_masked",      "vec_f16"                              },
@@ -601,8 +613,6 @@ static const expect_kernel expected_kernels[] = {
     { "noesimd",                   "d512_decode_all_masked",      "tile_d512"                            },
     { "noesimd",                   "d64_sinks_mq4",               "xmx_v2_f16_ncols8"                    },
     { "noesimd",                   "d64_sinks_mq4_row1_masked",   "xmx_v2_f16_ncols8"                    },
-    // oneDNN still routes the D=128 and D=256 prefill cases, which stay red
-    // until llama.cpp-t0f4; noonednn and v1pp cover their native kernels.
     { "noesimd",                   "d128_mq4",                    "tile_f16_ncols4"                      },
     { "noesimd",                   "d128_mq4_row1_masked",        "tile_f16_ncols4"                      },
     { "noesimd",                   "d64_sinks_pp72",              "xmx_v2_f16_pp_ncols32"                },
@@ -700,6 +710,10 @@ static bool select_arm() {
     }
     std::printf("FAIL: unknown GGML_SYCL_FATTN_TEST_EXPECT=%s\n", name);
     return false;
+}
+
+static bool starts_with(const std::string & s, const char * prefix) {
+    return s.rfind(prefix, 0) == 0;
 }
 
 static bool ends_with(const std::string & s, const char * suffix) {
@@ -828,13 +842,13 @@ static void run_case(ggml_backend_t  sycl,
     // error magnitude therefore cannot tell poison from noise, so for v1 only
     // the structural signatures of this defect gate (non-finite values, zeroed
     // rows, unwritten rows); the NMSE is still printed.
-    const bool nmse_gated = kernel.rfind("xmx_v1", 0) != 0;
+    const bool nmse_gated = !starts_with(kernel, "xmx_v1");
 
     // The documented tile-kernel deviation (see the file header): a V cell
     // visible to some rows of an XMX work-group tile reaches the rows of that
     // tile that mask it.
-    const bool xmx_tile = kernel.rfind("xmx_v1", 0) == 0 || kernel.rfind("xmx_v2_f16_ncols", 0) == 0 ||
-                          kernel.rfind("xmx_v2_f16_pp_ncols", 0) == 0;
+    const bool xmx_tile = starts_with(kernel, "xmx_v1") || starts_with(kernel, "xmx_v2_f16_ncols") ||
+                          starts_with(kernel, "xmx_v2_f16_pp_ncols");
     const bool spill_allowed = poison_has_visible_nan_v(poison) && xmx_tile;
 
     // With no visible cell at all the CPU output is legitimately all zero. A
@@ -882,10 +896,17 @@ static void run_case(ggml_backend_t  sycl,
                     spill_rows == 0 ? "" : (spill_allowed ? " (allowed: XMX tile deviation)" : " (not allowed)"));
     }
     if (!oracle_ok) {
-        std::printf(
-            "  VOID [%s]: the CPU reference is non-finite or has the wrong all-zero state, so this case proves "
-            "nothing\n",
-            label);
+        if (rowwise) {
+            std::printf(
+                "  VOID [%s]: the CPU reference has no non-finite row, or (with several query rows) no finite one, "
+                "so the poisoned cell is not visible where this variant needs it and the case proves nothing\n",
+                label);
+        } else {
+            std::printf(
+                "  VOID [%s]: the CPU reference is non-finite or has the wrong all-zero state, so this case proves "
+                "nothing\n",
+                label);
+        }
     }
     if (!ok) {
         ++g_failures;
@@ -968,10 +989,6 @@ int main(int, char ** argv) {
         std::printf("== %s ==\n", c.name);
         ++n_run;
         for (poison_kind p : variants) {
-            // A single query row sees every cell or none: no partial mask.
-            if (poison_is_partial(p) && c.ne01 == 1) {
-                continue;
-            }
             run_case(sycl, cpu, c, p, expected);
         }
     }
