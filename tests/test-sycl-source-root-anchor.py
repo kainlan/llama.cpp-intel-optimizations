@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Source-reading tests must not depend on an absolute __FILE__.
 
-With GGML_SYCL_CCACHE_BASE_DIR=1, scripts/sycl-build.sh runs ccache with
+Unless GGML_SYCL_CCACHE_BASE_DIR=0, scripts/sycl-build.sh runs ccache with
 base_dir (llama.cpp-vuy0), which rewrites each source path -- and so __FILE__
 -- relative to the build directory. A test that recovers the repo root from
 __FILE__ then finds it only when run from a directory that happens to line up,

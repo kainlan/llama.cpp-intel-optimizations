@@ -4,7 +4,8 @@
 # whether the build passed or failed, stops the build and exits 130/143/129 on
 # INT/TERM/HUP, refuses options it does not know, and
 # configures ccache with base_dir set to the tree -- so another checkout path
-# reuses its entries -- only when GGML_SYCL_CCACHE_BASE_DIR=1 (llama.cpp-vuy0).
+# reuses its entries -- unless GGML_SYCL_CCACHE_BASE_DIR=0 (llama.cpp-vuy0,
+# llama.cpp-7mqd).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -257,42 +258,43 @@ expect_launcher() {
     done
 }
 base_dir_launcher="ccache;base_dir=${ROOT_DIR}"
+# The caller's own setting must not decide what "default" means below.
+unset GGML_SYCL_CCACHE_BASE_DIR
 
-# By default ccache runs plain: base_dir is opt-in until it is verified on a
-# real SYCL build.
+# By default ccache runs with base_dir at the tree root, for both compilers.
 rm -f "${BUILD_DIR}/CMakeCache.txt" "${BUILD_DIR}/build.ninja"
 run_script
-expect_launcher ccache "default"
+expect_launcher "${base_dir_launcher}" "default"
 
-# GGML_SYCL_CCACHE_BASE_DIR=1 sets base_dir at the tree root, for both compilers.
+# GGML_SYCL_CCACHE_BASE_DIR=0 keeps plain ccache.
 rm -f "${BUILD_DIR}/CMakeCache.txt" "${BUILD_DIR}/build.ninja"
-GGML_SYCL_CCACHE_BASE_DIR=1 run_script
-expect_launcher "${base_dir_launcher}" "opt-in"
+GGML_SYCL_CCACHE_BASE_DIR=0 run_script
+expect_launcher ccache "opt-out"
 
 # An existing build is moved onto whichever launcher is asked for, and left
 # alone when it already has it.
 write_cache "${base_dir_launcher}"
-GGML_SYCL_CCACHE_BASE_DIR=1 run_script
+run_script
 [[ ! -s "${CONFIGURE_LOG}" ]] || fail "reconfigured a build already on '${base_dir_launcher}'"
 write_cache ccache
-GGML_SYCL_CCACHE_BASE_DIR=1 run_script
-expect_launcher "${base_dir_launcher}" "plain -> opt-in"
+run_script
+expect_launcher "${base_dir_launcher}" "plain -> default"
 grep -Fq 'refreshing compiler launcher: ccache ->' "${TMP}/out.log" ||
     fail "no launcher refresh message: $(cat "${TMP}/out.log")"
 write_cache "${base_dir_launcher}"
-run_script
-expect_launcher ccache "base_dir -> default"
+GGML_SYCL_CCACHE_BASE_DIR=0 run_script
+expect_launcher ccache "base_dir -> opt-out"
 
 # ccache before 4.8 has no KEY=VALUE syntax and would take base_dir=... for the
 # compiler; it keeps the plain launcher.
 rm -f "${BUILD_DIR}/CMakeCache.txt" "${BUILD_DIR}/build.ninja"
-GGML_SYCL_CCACHE_BASE_DIR=1 MOCK_CCACHE_VERSION=4.7.4 run_script
+MOCK_CCACHE_VERSION=4.7.4 run_script
 expect_launcher ccache "ccache 4.7"
 
 # A GGML_SYCL_PROFILING_DEBUG build (-g) keeps plain ccache: its DWARF paths
 # would become relative, and the zebin line-table tooling matches absolute ones.
 write_cache ccache ON
-GGML_SYCL_CCACHE_BASE_DIR=1 run_script
+run_script
 [[ ! -s "${CONFIGURE_LOG}" ]] || fail "moved a profiling-debug build onto base_dir"
 grep -Fq 'GGML_SYCL_PROFILING_DEBUG' "${TMP}/out.log" ||
     fail "no note about keeping plain ccache for profiling debug: $(cat "${TMP}/out.log")"

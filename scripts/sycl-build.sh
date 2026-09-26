@@ -24,9 +24,10 @@ Compiler and device-link temporaries go to a private directory under
 ${TMPDIR:-/tmp} that is removed when the script exits.
 
 Environment:
-  GGML_SYCL_CCACHE_BASE_DIR=1   run ccache with base_dir at this tree, so a
-                                checkout at another path reuses its entries
-                                (pending verification; see docs/backend/SYCL.md)
+  GGML_SYCL_CCACHE_BASE_DIR=0   run plain ccache instead of ccache with base_dir
+                                at this tree (the default, which lets a checkout
+                                at another path reuse its entries; see
+                                docs/backend/SYCL.md)
 
 Examples:
   ./scripts/sycl-build.sh
@@ -270,11 +271,12 @@ configure_args=(
 compiler_launcher=""
 if command -v ccache >/dev/null 2>&1; then
     compiler_launcher="ccache"
-    # Opt-in, GGML_SYCL_CCACHE_BASE_DIR=1, until verified on a real SYCL build
-    # (llama.cpp-vuy0). base_dir makes ccache rewrite absolute paths under this
-    # tree relative to the build directory, so a checkout at another path -- a
-    # worktree -- hits the entries this one stored instead of recompiling from
-    # cold. It also makes __FILE__ relative ("../ggml/src/..."); tests that
+    # On unless GGML_SYCL_CCACHE_BASE_DIR=0 (llama.cpp-vuy0, llama.cpp-7mqd).
+    # base_dir makes ccache rewrite absolute paths under this tree relative to
+    # the build directory, so a checkout at another path -- a worktree -- hits
+    # the entries this one stored instead of recompiling from cold; the objects
+    # and libggml-sycl it links are byte-identical to a fresh compile there.
+    # It also makes __FILE__ relative ("../ggml/src/..."); tests that
     # locate the tree get the absolute LLAMA_CPP_SOURCE_ROOT, which ccache
     # does not rewrite. `ccache KEY=VALUE compiler` needs ccache 4.8.
     #
@@ -282,7 +284,7 @@ if command -v ccache >/dev/null 2>&1; then
     # make its DWARF include directories relative, which
     # scripts/parse-sycl-zebin-line-table.py cannot match against absolute
     # paths, and ccache hashes the build directory into -g entries anyway.
-    if [[ "${GGML_SYCL_CCACHE_BASE_DIR:-0}" == 1 ]]; then
+    if [[ "${GGML_SYCL_CCACHE_BASE_DIR:-1}" != 0 ]]; then
         ccache_version="$(ccache --version 2>/dev/null | sed -n '1s/^ccache version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
         if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] &&
             grep -Eq '^GGML_SYCL_PROFILING_DEBUG:BOOL=(ON|1|TRUE|YES)$' "${BUILD_DIR}/CMakeCache.txt"; then

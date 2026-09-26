@@ -3201,8 +3201,8 @@ set(RESIDENCY_TEST_SYCL_OPTIONS
 # commit message and docs/backend/sycl-test-inventory.md.
 # Tests that read repo sources at run time locate the tree through
 # LLAMA_CPP_SOURCE_ROOT (candidate_roots() in each). It is an absolute -D because
-# when scripts/sycl-build.sh runs ccache with base_dir (opt-in,
-# GGML_SYCL_CCACHE_BASE_DIR=1), ccache rewrites the source path -- and so
+# when scripts/sycl-build.sh runs ccache with base_dir (the default; off with
+# GGML_SYCL_CCACHE_BASE_DIR=0), ccache rewrites the source path -- and so
 # __FILE__ -- relative to the build directory; it leaves -D values alone
 # (llama.cpp-vuy0).
 get_filename_component(GGML_SYCL_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
