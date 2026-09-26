@@ -246,18 +246,55 @@ def bare_conjunct_violation(expr, target):
     else why not. The one rule for both the answer's initializer and every
     GEMM guard, so the two checks cannot drift apart. Wrapping parens are
     ignored (per conjunct and overall); anything else around `target` --
-    !, a comparison, a cast, ?:, ||, a lambda or braced init, the comma
-    operator -- means `expr` is not bound by it."""
+    !, a comparison, a cast, a lambda or braced init, or an operator that
+    binds looser than && (||, `or`, ?:, assignment, the comma operator) --
+    means `expr` is not bound by it.
+
+    This deliberately does not track <> depth: `<` is also less-than, so
+    doing so would open a fail-open of its own. A template argument list's
+    comma (`std::is_same<int, int>::value`) therefore fails as "comma
+    operator" -- a false FAIL, i.e. closed, and the admission sites carry
+    no template arguments. Do not "fix" it by counting angle brackets."""
     flat = " ".join(expr.split())
     for token, what in (("?", "?:"), ("||", "||"), ("{", "a lambda or braced init"), (";", "a statement")):
         if token in flat:
             return f"it contains {what}"
+    if re.search(r"\bor\b", flat):
+        return "it contains `or`"
+    if ASSIGNMENT_OP.search(flat):
+        return "it contains an assignment"
     conjuncts = top_level_conjuncts(flat)
     if any(len(split_top_level(c, ",")) > 1 for c in conjuncts):
         return "a conjunct uses the comma operator"
     if target not in conjuncts:
         return f"`{target}` is not one whole conjunct (negated, compared, cast or nested)"
     return None
+
+
+# `=` and the compound assignments, but not ==, !=, <= or >=.
+ASSIGNMENT_OP = re.compile(r"(?:<<|>>)=|(?<![=!<>])=(?!=)")
+# Words that may precede a name in an expression; any other word before it
+# is a type, i.e. the name is being declared.
+EXPRESSION_KEYWORDS = {"return", "co_return", "co_yield", "throw", "case", "not", "and", "or", "sizeof", "delete"}
+
+
+def writes_of(text, lo, hi, var):
+    """Offsets in text[lo:hi] where `var` is declared (preceded by a type
+    word, or by a type word and `&`/`*`/`>`) or assigned (followed by `=` or
+    a compound assignment). Over-approximates on purpose: `x & var` or
+    `x > var` count as writes, which fails closed."""
+    sites = []
+    for m in re.finditer(r"\b" + re.escape(var) + r"\b", text[lo:hi]):
+        s = lo + m.start()
+        before = text[max(lo, s - 200) : s].rstrip()
+        word = re.search(r"(\w+)$", before)
+        declares = (word is not None and word.group(1) not in EXPRESSION_KEYWORDS) or bool(
+            re.search(r"(?:\w|>)\s*(?:(?<!&)&|\*|>)$", before)
+        )
+        assigns = re.match(r"\s*(?:(?:<<|>>|[-+*/%&|^])?=(?!=))", text[lo + m.end() : hi]) is not None
+        if declares or assigns:
+            sites.append(s)
+    return sites
 
 
 def statement_end(text, pos):
@@ -339,6 +376,16 @@ def test_every_mxfp4_direct_onednn_gemm_is_admitted_by_the_candidate():
     )
     assert not BATCH_COMPARISON.search(init), (
         f"`{var}` is initialised as `{init_flat}`, which compares the batch itself; the floor is the candidate's"
+    )
+    # The checked initializer must be the answer's only write in the whole
+    # function: a second declaration (a shadow in an inner block) or a later
+    # assignment would put an unchecked value under the guards below.
+    fn_lo, fn_hi = function_span(backend, "ggml_sycl_mul_mat")
+    decl = lo + cands[0].start(1)
+    others = [s for s in writes_of(backend, fn_lo, fn_hi, var) if s != decl]
+    assert decl in writes_of(backend, fn_lo, fn_hi, var) and not others, (
+        f"`{var}` is declared or assigned again in ggml_sycl_mul_mat at line(s) "
+        f"{[line_of(backend, s) for s in others]}; the checked initializer must be its only write"
     )
     call_args = backend[call_open : matching(backend, call_open, "(", ")") + 1]
     assert re.search(r"onednn_pp_route\s*::\s*MXFP4_DIRECT\b", call_args), (
