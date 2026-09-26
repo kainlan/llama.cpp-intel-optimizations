@@ -941,7 +941,9 @@ def kv_overflow_announcement_violations(sycl_cpp: str) -> list[str]:
     if not re.search(r"load_it\s*=\s*next_plan\.load_kv_device\.find\(", txn) or \
             "next_plan.kv_device = next_plan.load_kv_device;" not in refit.group(1):
         found.append("the re-fit does not restart from the load residency")
-    if len(re.findall(r"kv_host_demotions\.push_back\(", txn)) != 2:
+    # The records are only ever appended, once by each path: any other
+    # member call, index or assignment on the vector is a violation.
+    if re.findall(r"\bkv_host_demotions\s*(?:\.\s*\w+\s*\(|\[|=)", txn) != ["kv_host_demotions.push_back("] * 2:
         found.append("the re-fit and the budget path do not both record their demotions")
 
     # The one overflow WARN lives in the announcement, in the branch taken only
@@ -986,8 +988,16 @@ def kv_overflow_announcement_violations(sycl_cpp: str) -> list[str]:
         if not re.search(r"ggml_sycl_all_vram_ctx_hint\(\s*fits\s*\)", region):
             found.append("a demotion record's -c hint is not the fit computed for it")
             break
-    if re.search(r"\.ctx_hint\s*=(?!=)", txn):
-        found.append("a demotion record's -c hint is assigned outside its record")
+    # A whitelist, not a blacklist of writes: ctx_hint appears exactly twice,
+    # as the field declaration and as the announcement's .c_str() read. Any
+    # other mention fires, even a harmless read -- deliberately, so no
+    # respelling of a write (+=, assign(), clear(), an alias, swap) gets by.
+    uses = list(re.finditer(r"\bctx_hint\b", txn))
+    decl = re.search(r"std::string\s+ctx_hint\s*;", txn)
+    if len(uses) != 2 or decl is None or uses[0].start() != decl.start() + decl.group(0).index("ctx_hint") or \
+            not lam_at <= uses[1].start() < lam_at + len(lam) or \
+            not re.match(r"ctx_hint\s*\.\s*c_str\(\s*\)", txn[uses[1].start():]):
+        found.append("a demotion record's -c hint is used outside its record and its announcement")
 
     # Announced once per exit that accepts: at the probe's exit after its ring
     # rollback, and after a successful publish. Never before a refusal.
@@ -1353,7 +1363,34 @@ def test_mutation_hint_overwritten_before_probe_exit_is_witnessed() -> None:
                           "                                                 admitted_kv)) + \".\";\n"
                           "    }" + probe_exit, 1)
     _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations,
-                      "is assigned outside its record", "every hint overwritten after the ring re-plan")
+                      "is used outside its record and its announcement",
+                      "every hint overwritten after the ring re-plan")
+
+
+PROBE_EXIT = "\n    if (probe_mode) {\n        // llama.cpp-tsfl: every candidate check"
+
+
+def _only(violations: list[str], expected: str, label: str) -> None:
+    assert len(violations) == 1 and expected in violations[0], f"{label}: {violations!r}"
+
+
+def test_mutation_hint_respelled_write_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    assert cpp.count(PROBE_EXIT) == 1
+    mutated = cpp.replace(PROBE_EXIT, "\n    for (kv_host_demotion & rec : kv_host_demotions) {\n"
+                          "        rec.ctx_hint.assign(\" x\");\n    }" + PROBE_EXIT, 1)
+    assert mutated != cpp
+    _only(kv_overflow_announcement_violations(mutated), "is used outside its record and its announcement",
+          "ctx_hint.assign() before the probe exit")
+
+
+def test_mutation_third_record_emplaced_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    assert cpp.count(PROBE_EXIT) == 1
+    mutated = cpp.replace(PROBE_EXIT, "\n    kv_host_demotions.emplace_back();" + PROBE_EXIT, 1)
+    assert mutated != cpp
+    _only(kv_overflow_announcement_violations(mutated), "do not both record their demotions",
+          "a third record via emplace_back")
 
 
 def test_mutation_hint_ignores_its_fit_is_witnessed() -> None:
