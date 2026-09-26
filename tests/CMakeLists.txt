@@ -2853,6 +2853,20 @@ if(GGML_SYCL)
     )
 endif()
 
+# test-tlsf-allocator: the arena sub-allocator's bookkeeping, including the
+# position-anchored placement calls the lifetime-segregated KV layout uses
+# (llama.cpp-moua). tlsf-allocator.hpp is standard C++ with host-side
+# metadata only, so this links nothing and touches no device. Gated on
+# GGML_SYCL only because the header uses GCC/Clang builtins.
+if(GGML_SYCL)
+    add_executable(test-tlsf-allocator test-tlsf-allocator.cpp)
+    add_test(NAME test-tlsf-allocator COMMAND $<TARGET_FILE:test-tlsf-allocator>)
+    set_tests_properties(test-tlsf-allocator PROPERTIES
+        LABELS "sycl;tlsf;hostonly"
+        TIMEOUT 60
+    )
+endif()
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
