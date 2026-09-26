@@ -1457,10 +1457,10 @@ def test_settle_publish_is_gated_on_settle_needs_publish():
 def test_settle_publish_gate_has_a_mutation_witness():
     """Mutation witness for the two checks above: proves they would
     actually catch the settle publish reverting to unconditional (always
-    publishing, even when nothing changed), AND (quality round 2 R3) that
-    the guard-body check specifically would catch the guard being emptied
-    with the call moved below it -- a mutant the ordering assertion alone
-    cannot see (ordering is satisfied textually either way)."""
+    publishing, even when nothing changed), AND that the guard-body check
+    specifically would catch the guard being emptied with the call moved
+    below it -- a mutant the ordering assertion alone cannot see (ordering
+    is satisfied textually either way)."""
     raw = LLAMA_CONTEXT_CPP
     original_settle = (
         "    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {\n"
@@ -1488,13 +1488,10 @@ def test_settle_publish_gate_has_a_mutation_witness():
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    mutated_settle_idx = mutated_body_norm.find("if (!sched_matches_last_good")
-    assert mutated_settle_idx != -1
-    assert "need_publish" not in mutated_body_norm[mutated_settle_idx:], (
-        "mutation witness is broken: reverting to an unconditional publish should remove need_publish entirely"
-    )
+    with pytest.raises(AssertionError, match="the settle block must compute need_publish"):
+        _assert_settle_publish_gate(mutated_body_norm)
 
-    # Second mutant (quality round 2 R3): keeps need_publish and its
+    # Second mutant: keeps need_publish and its
     # ordering intact, but EMPTIES the guard's body and moves the publish
     # call to just after it -- passes the positional ordering assertion
     # above (need_publish < assign < guard < call < reserve still holds
