@@ -153,19 +153,33 @@ mkdir -p "${BUILD_DIR}"
 # a build is interrupted; give this build its own directory and remove it on
 # exit. Only SIGKILL escapes this -- scripts/sycl-tmp-leak-report.sh lists
 # what is left behind.
+# The build runs in its own process group (see on_signal), so a signal sent to
+# this script's process group reaches the build only through on_signal:
+# INT/TERM/HUP are forwarded, but Ctrl-Z (SIGTSTP) pauses only this script
+# while the build keeps compiling, and a group SIGKILL (a harness, timeout -k)
+# leaves ninja running on unowned in the build directory.
 build_tmp="$(mktemp -d "${TMPDIR:-/tmp}/sycl-build.XXXXXX")"
 build_pid=""
 
 # bash runs a trap only once a foreground command returns, so a signal sent to
 # this script's pid alone would wait out the whole build. The build therefore
 # runs as a background job in its own process group, and a signal is passed on
-# to that group: ninja relays it to each job's process group and waits for
-# them, so their temporaries are gone before build_tmp is removed.
+# to that group. cmake --build dies of it at once; ninja, in the same group,
+# relays it to each job's process group and reaps them (a device link can take
+# ~5 s to stop), then deletes the outputs of interrupted edges. So the script
+# waits for the group to empty, not just for cmake, before build_tmp is
+# removed and the build directory is handed back. No KILL fallback: it could
+# reach only cmake and ninja, not the jobs, and would orphan them.
 on_signal() {
     local status="$1" sig="$2"
+    # A signal between starting the build and recording its pid still finds it.
+    build_pid="${build_pid:-$(jobs -p | head -n 1)}"
     if [[ -n "${build_pid}" ]]; then
         kill "-${sig}" -- "-${build_pid}" 2>/dev/null || true
         wait "${build_pid}" 2>/dev/null || true
+        while kill -0 -- "-${build_pid}" 2>/dev/null; do
+            sleep 0.1
+        done
     fi
     exit "${status}"
 }

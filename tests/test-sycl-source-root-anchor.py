@@ -3,11 +3,11 @@
 
 With GGML_SYCL_CCACHE_BASE_DIR=1, scripts/sycl-build.sh runs ccache with
 base_dir (llama.cpp-vuy0), which rewrites each source path -- and so __FILE__
--- relative to the build directory. A test that recovers the repo root from __FILE__ then finds it only
-when run from a directory that happens to line up, and these binaries are run
-from anywhere (some are install()ed). Each such locator therefore also takes
-the absolute LLAMA_CPP_SOURCE_ROOT the build defines; ccache leaves -D values
-alone.
+-- relative to the build directory. A test that recovers the repo root from
+__FILE__ then finds it only when run from a directory that happens to line up,
+and these binaries are run from anywhere (some are install()ed). Each such
+locator therefore also takes the absolute LLAMA_CPP_SOURCE_ROOT the build
+defines; ccache leaves -D values alone.
 
 Checks, for every C++ source whose candidate_roots() anchors on __FILE__:
   1. the locator consults LLAMA_CPP_SOURCE_ROOT before the __FILE__ anchor;

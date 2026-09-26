@@ -42,8 +42,14 @@ if [[ "$1" == "--build" ]]; then
     printf '%s\n' "$@" >> "${CMAKE_LOG}"
     [[ -d "${TMPDIR}" ]] || exit 90
     if [[ -n "${MOCK_PID_FILE:-}" ]]; then
+        # Like cmake --build: no handler, so the signal kills it at once, while
+        # its ninja child in the same process group takes a while to reap its
+        # jobs and clean up.
+        "${MOCK_BIN}/mock-ninja" "${MOCK_NINJA_READY}" "${MOCK_NINJA_DONE}" &
+        until [[ -e "${MOCK_NINJA_READY}" ]]; do sleep 0.01; done
         echo "$$" > "${MOCK_PID_FILE}"
-        exec sleep "${MOCK_BUILD_SLEEP:-0}"
+        wait
+        exit 0
     fi
     sleep "${MOCK_BUILD_SLEEP:-0}"
     : > "${TMPDIR}/icpx-stranded.out"
@@ -62,6 +68,25 @@ for tool in ninja icx icpx; do
     chmod +x "${MOCK_BIN}/${tool}"
 done
 chmod +x "${MOCK_BIN}/cmake"
+# Python, not bash: an async child of a non-interactive shell starts with
+# SIGINT ignored, which bash cannot trap but Python can override -- real
+# ninja is exec'd by cmake with default dispositions.
+cat > "${MOCK_BIN}/mock-ninja" <<'EOF'
+#!/usr/bin/env python3
+import os, signal, sys, time
+ready, done = sys.argv[1], sys.argv[2]
+def stop(signum, frame):
+    time.sleep(1)
+    with open(done, "w") as f:
+        f.write(str(os.getpid()))
+    sys.exit(1)
+for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(s, stop)
+open(ready, "w").close()
+while True:
+    time.sleep(0.1)
+EOF
+chmod +x "${MOCK_BIN}/mock-ninja"
 
 run_script() {
     : > "${CMAKE_LOG}"
@@ -121,18 +146,20 @@ expect_private_tmp_removed
 
 # A signal to the script's pid alone -- not its process group -- stops the
 # build in flight, ends the script with the conventional status and still
-# removes its temporaries.
+# removes its temporaries, but only once the whole build has stopped: the mock
+# cmake dies at once, and its ninja child needs another second to clean up.
 signal_case() {
     local sig="$1" want_rc="$2" pid build_pid rc=0 start_ms elapsed_ms
     : > "${CMAKE_LOG}"
     : > "${CONFIGURE_LOG}"
-    rm -f "${TMP}/build.pid"
+    rm -f "${TMP}/build.pid" "${TMP}/ninja.ready" "${TMP}/ninja.done"
     # set -m: default dispositions, as from a terminal; a plain background job
     # would start with SIGINT ignored.
     set -m
     env ONEAPI_SETVARS="${TMP}/setvars.sh" MOCK_BIN="${MOCK_BIN}" TEST_CCL_ROOT="${CCL_ROOT_FIXTURE}" \
         CMAKE_LOG="${CMAKE_LOG}" CONFIGURE_LOG="${CONFIGURE_LOG}" CMAKE_BUILD_PARALLEL_LEVEL=1 \
-        TMPDIR="${OUTER_TMP}" MOCK_BUILD_SLEEP=30 MOCK_PID_FILE="${TMP}/build.pid" \
+        TMPDIR="${OUTER_TMP}" MOCK_PID_FILE="${TMP}/build.pid" \
+        MOCK_NINJA_READY="${TMP}/ninja.ready" MOCK_NINJA_DONE="${TMP}/ninja.done" \
         "${BUILD_SCRIPT}" -B "${BUILD_DIR}" llama-cli > "${TMP}/out.log" 2>&1 &
     pid=$!
     set +m
@@ -146,13 +173,15 @@ signal_case() {
     kill "-${sig}" "${pid}"
     wait "${pid}" || rc=$?
     elapsed_ms=$(( $(date +%s%N) / 1000000 - start_ms ))
+    [[ -e "${TMP}/ninja.done" ]] ||
+        fail "SIG${sig}: the script returned while ninja was still cleaning up"
     [[ ${rc} -eq ${want_rc} ]] || fail "SIG${sig}: script exited ${rc}, want ${want_rc}"
-    # The mock build sleeps 30 s; finishing near that means the signal waited
-    # for the build instead of stopping it.
+    # The mock build runs until signalled and stops within ~1 s; much longer
+    # means the signal waited for the build instead of stopping it.
     (( elapsed_ms < 3000 )) || fail "SIG${sig}: the script took ${elapsed_ms} ms to stop the build"
-    if kill -0 "${build_pid}" 2>/dev/null; then
-        kill -KILL "${build_pid}" 2>/dev/null || true
-        fail "SIG${sig}: the build (pid ${build_pid}) outlived the script"
+    if kill -0 -- "-${build_pid}" 2>/dev/null; then
+        kill -KILL -- "-${build_pid}" 2>/dev/null || true
+        fail "SIG${sig}: the build's process group ${build_pid} outlived the script"
     fi
     expect_private_tmp_removed
 }

@@ -9,7 +9,7 @@
 #
 # Host-only: configures small fixture projects that include the real routing
 # module, ggml/src/ggml-sycl/sycl-device-link-routing.cmake, with the host C
-# compiler. Nothing is compiled or linked.
+# compiler. No project target is built; only CMake's compiler probe compiles.
 # Usage: test-sycl-device-link-embedding.sh [cmake] [generator] [make program]
 set -euo pipefail
 
@@ -32,7 +32,7 @@ fail() {
 # and the parent's own SYCL executable, declared after the embedding.
 fixture() {
     local dir="$1" name="$2"
-    mkdir -p "${dir}/${name}/ggml" "${dir}/${name}-foo"
+    mkdir -p "${dir}/${name}/ggml" "${dir}/${name}/tests" "${dir}/${name}-foo"
     : > "${dir}/main.c"
     cat > "${dir}/CMakeLists.txt" <<EOF
 cmake_minimum_required(VERSION 3.21)
@@ -61,6 +61,7 @@ function(check_routing)
     expect_untouched(sibling-sycl)
     expect_routed(embedded-xmx)
     expect_routed(embedded-fixture-consumer)
+    expect_routed(embedded-late-consumer)
     get_target_property(options embedded-xmx LINK_OPTIONS)
     if (NOT "-fsycl-max-parallel-link-jobs=8" IN_LIST options)
         message(FATAL_ERROR "EMBED-CHECK: embedded-xmx did not get the device-link options: '\${options}'")
@@ -73,6 +74,13 @@ EOF
     cat > "${dir}/${name}/CMakeLists.txt" <<EOF
 project(${name} C)
 add_subdirectory(ggml)
+add_subdirectory(tests)
+EOF
+    # Declared after the routing call, as tests/ is in the real tree: only a
+    # deferred call sees it.
+    cat > "${dir}/${name}/tests/CMakeLists.txt" <<EOF
+add_executable(embedded-late-consumer ../../main.c)
+target_link_libraries(embedded-late-consumer PRIVATE ggml-sycl-private-fixtures)
 EOF
     cat > "${dir}/${name}/ggml/CMakeLists.txt" <<EOF
 set_property(GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_LAUNCHER "mock-launcher;--")
