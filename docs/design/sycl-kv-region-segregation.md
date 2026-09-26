@@ -1000,7 +1000,8 @@ serialization:
 - **Who holds it.** It is held for the whole of:
   - a full-context transaction, from before step 1 to after the guard's second phase;
   - a probe;
-  - a tenant-only transaction, from before (s) to after the guard's second phase. Because llama
+  - a tenant-only transaction's growth path, from before (s) to after the guard's second phase
+    (the two fast paths take it only around a ring-contribution update, §2.4.2). Because llama
     drives that sequence, the backend gives llama an RAII scope for it,
     `ggml_backend_sycl_replan_scope`, declared before the transaction guard, so the guard's
     phases run inside it;
@@ -1301,6 +1302,11 @@ contribution. It never re-fits KV and never yields.
   the host tier (r6 m-10), so such a republish pays neither the old+new host peak nor a refusal
   under the growth-forbidden host zone. Only a candidate with a slot that outgrows its published
   cap, or with a new index, takes the path below.
+- **L0 on the two fast paths (rulings §E.2; zhcn rev 5.1).** The equal-key no-op takes no L0.
+  The covered path takes none either, unless its candidate changes this context's recorded ring
+  contribution (a smaller `n_ubatch` served by the existing ring): that update of the ring
+  record is a ring mutator outside decode, so it takes L0 around it. The growth path below
+  takes L0 before (s) and holds it to the guard's second phase.
 - **The guard is declared before (s)**, so steps (s), (0), (i) and (ii) all run inside its
   lifetime (r5 I-A(d)). Its first phase is where RELEASING is cleared on any exit that did not
   publish.
@@ -1310,15 +1316,22 @@ contribution. It never re-fits KV and never yields.
   - each device's execution queue. `ggml_backend_sycl_synchronize` (`ggml-sycl.cpp:84085-84141`)
     waits `stream(device, 0)` only, and on the deferred-decode path only `last_graph_event`
     (`:84096-84099`), so the step waits the queue itself;
-  - the split secondary queue (`g_split_secondary_queue_owner`, `:62143`);
+  - the split queues: secondary, merge and coord (`g_split_secondary_queue_owner`,
+    `g_split_merge_queue_owner`, `g_split_coord_queue_owner`, `:62143-62145`);
   - the MoE shared-context queues (`ggml_sycl_ensure_moe_secondary_queues_for_plan`, `:5852`);
   - the cache's queues (`cache->get_queue()` and `get_bcs_queue()`, waited at `:4805` and
     `:4814-4815` today);
-  - the MMID exact queue (`:74943`, `ctx.stream()` on that path, whose submits and host tasks
-    are at `:75040-75060`);
+  - the MMID exact queue needs no wait of its own: it is `ctx.stream()` (`:74943`), so the
+    execution-queue wait covers its submits and host tasks (`:75040-75060`);
   - the CPU-dispatch queue (`ggml_sycl_get_cpu_queue`, `cpu-dispatch.cpp:4771`, submitted
     through `cpu_submit_async`, `:252-266`);
-  - each device's TP queue when TP is on (`ggml_sycl_get_tp_queue`, `common.cpp:194`).
+  - each device's TP queue when TP is on (`ggml_sycl_get_tp_queue`, `common.cpp:194`), and the
+    TP device-1 worker's own queue (`:47946`);
+  - each device's PP pipeline copy queue when `GGML_SYCL_PP_PIPELINE` is on
+    (`g_pipeline_copy_queue`, `:23299`).
+
+  The last two are not in zhcn rev 5.1's list; zhcn is asked to add them (they submit on
+  queues the device wait does not cover).
 
   A queue added later must join the list. If one is missed, (d)'s backstop makes the miss a
   loud `[CONTEXT-PLAN-BUG]`, never a free under queued work. **Nothing between (s) and (d)
