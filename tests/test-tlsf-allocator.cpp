@@ -9,6 +9,7 @@
 // for VRAM; the allocator never touches that memory.
 // Validates O(1) alloc/free semantics, coalescing, reset, and stress.
 
+#include "../ggml/src/ggml-sycl/shared-zone-tags.hpp"
 #include "../ggml/src/ggml-sycl/tlsf-allocator.hpp"
 
 #include <algorithm>
@@ -20,13 +21,11 @@
 #include <map>
 #include <vector>
 
-// This test signals failure ONLY through bare assert(). The project builds
-// Release with CMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG", which compiles every
-// one of them out and leaves `return 0` as the sole exit path -- a program
-// that cannot fail. Verified by mutation: with all assertions forced false,
-// the binary still exits 0 under -DNDEBUG and 134 without it.
-//
-// UNVERIFIED: not measured (GPU.lock contention). Only 1 assertion.
+// Every check goes through REQUIRE below, which aborts whether or not NDEBUG
+// is defined: the project builds Release with -DNDEBUG, which would compile a
+// bare assert() out and leave a test that cannot fail. The test is host-only
+// (the allocator keeps all metadata on the host) and runs as the hostonly
+// ctest test-tlsf-allocator.
 //
 // Must precede <cassert>, which binds assert at include time.
 #undef NDEBUG
@@ -413,9 +412,9 @@ static void test_splitting() {
 // (unified_cache::arena_allocator_group_mutex, llama.cpp-044k).  That is a
 // property of the zone wrappers that call these, and belongs to their tests.
 // ---------------------------------------------------------------------------
-static constexpr uint8_t TAG_WEIGHT   = 1;
-static constexpr uint8_t TAG_OPTIONAL = 2;
-static constexpr uint8_t TAG_CONTEXT  = 3;
+static constexpr uint8_t TAG_WEIGHT   = SHARED_ZONE_TAG_WEIGHT;
+static constexpr uint8_t TAG_OPTIONAL = SHARED_ZONE_TAG_OPTIONAL;
+static constexpr uint8_t TAG_CONTEXT  = SHARED_ZONE_TAG_CONTEXT;
 
 // 13. allocate_top carves the upper end of the physically last block.
 static void test_allocate_top() {
@@ -632,8 +631,12 @@ static void test_frontier_walk_stops_at_weight() {
 }
 
 // 21. Randomized: every carve lands where an interval model predicts, gap_below
-//     agrees for every anchor, and tags persist. This exercises the physical
-//     last-block tracking through splits and coalescing in both directions.
+//     and frontier_walk agree with the model for every anchor, tags persist,
+//     and check_invariants() holds after every step.  allocate() and free() of
+//     allocate()'d blocks are in the mix, because the weight side (allocate)
+//     and the context side (carves) share one allocator: a carve that leaves a
+//     stale free-list entry shows up as allocate() handing out a live block,
+//     or as a failed invariant, not in any physical-list read.
 static void test_carve_against_interval_model() {
     const size_t   size = ONE_MB;
     tlsf_allocator alloc(size);
@@ -659,6 +662,24 @@ static void test_carve_against_interval_model() {
         }
         return hi - lo;
     };
+    auto model_walk = [&](size_t anchor, uint8_t pass_tag) {
+        std::vector<tlsf_allocator::extent> walk;
+        size_t                              hi = anchor == tlsf_allocator::no_anchor ? size : anchor;
+        while (true) {
+            auto         it       = model.lower_bound(hi);  // first block at or above hi
+            const bool   has_prev = it != model.begin();
+            const size_t lo       = has_prev ? std::prev(it)->first + std::prev(it)->second.size : 0;
+            if (lo < hi) {
+                walk.push_back({ lo, hi - lo, true, 0 });
+            }
+            if (!has_prev || std::prev(it)->second.tag != pass_tag) {
+                return walk;
+            }
+            --it;
+            walk.push_back({ it->first, it->second.size, false, it->second.tag });
+            hi = it->first;
+        }
+    };
     auto pick_anchor = [&]() -> size_t {
         if (model.empty() || next() % 4 == 0) {
             return tlsf_allocator::no_anchor;
@@ -668,13 +689,32 @@ static void test_carve_against_interval_model() {
         return it->first;
     };
 
+    int n_allocate = 0;
     for (int step = 0; step < 4000; ++step) {
-        const uint32_t op = next() % 3;
+        const uint32_t op = next() % 4;
         if (op == 2 && !model.empty()) {
             auto it = model.begin();
             std::advance(it, next() % model.size());
             alloc.free(it->first);
             model.erase(it);
+        } else if (op == 3) {
+            const size_t  req  = 256 * (1 + next() % 64);
+            const uint8_t tag  = static_cast<uint8_t>(1 + next() % 3);
+            const size_t  used = alloc.used();
+            const size_t  got  = alloc.allocate(req, 256, tag);
+            if (got == SIZE_MAX) {
+                REQUIRE(alloc.used() == used && "a refused allocate() changes nothing");
+            } else {
+                const size_t bytes = alloc.used() - used;
+                REQUIRE(got % 256 == 0 && got + bytes <= size && bytes >= req && bytes < req + 256);
+                auto above = model.lower_bound(got);
+                REQUIRE((above == model.end() || got + bytes <= above->first) &&
+                        "allocate() returned a block overlapping a live block above it");
+                REQUIRE((above == model.begin() || std::prev(above)->first + std::prev(above)->second.size <= got) &&
+                        "allocate() returned a block overlapping a live block below it");
+                model[got] = { bytes, tag };
+                n_allocate++;
+            }
         } else {
             const size_t  anchor = pick_anchor();
             const size_t  req    = 256 * (1 + next() % 64);
@@ -698,6 +738,7 @@ static void test_carve_against_interval_model() {
             }
         }
 
+        REQUIRE(alloc.check_invariants());
         size_t used = 0;
         for (const auto & kv : model) {
             used += kv.second.size;
@@ -708,9 +749,63 @@ static void test_carve_against_interval_model() {
         REQUIRE(alloc.used() == used);
         size_t lo = 0;
         REQUIRE(alloc.gap_below(tlsf_allocator::no_anchor) == model_gap(tlsf_allocator::no_anchor, lo));
+
+        const size_t  walk_anchor = pick_anchor();
+        const uint8_t pass_tag    = static_cast<uint8_t>(1 + next() % 3);
+        const auto    walk        = alloc.frontier_walk(walk_anchor, pass_tag);
+        const auto    expect      = model_walk(walk_anchor, pass_tag);
+        REQUIRE(walk.size() == expect.size() && "frontier_walk length differs from the model");
+        for (size_t i = 0; i < walk.size(); ++i) {
+            REQUIRE(walk[i].offset == expect[i].offset && walk[i].size == expect[i].size &&
+                    walk[i].free == expect[i].free && walk[i].tag == expect[i].tag);
+        }
     }
+    REQUIRE(n_allocate > 100 && "the random mix exercised allocate()");
 
     std::cout << "test_carve_against_interval_model: PASSED\n";
+}
+
+// 21b. Placement after reset(): reset() must re-establish the physical last
+//      block, or allocate_top() finds no gap.
+static void test_carve_after_reset() {
+    test_arena arena;
+
+    (void) arena.alloc->allocate(4096, 256, TAG_WEIGHT);
+    (void) arena.alloc->allocate_top(8192, 256, TAG_CONTEXT);
+    arena.alloc->reset();
+    REQUIRE(arena.alloc->check_invariants());
+
+    const size_t top = arena.alloc->allocate_top(8192, 256, TAG_CONTEXT);
+    REQUIRE(top == arena.size - 8192 && "allocate_top after reset() carves the top of the whole region");
+    REQUIRE(arena.alloc->check_invariants());
+
+    std::cout << "test_carve_after_reset: PASSED\n";
+}
+
+// 21c. Refusals change nothing: a size whose rounding would wrap, and a top
+//      carve of a region whose end is off the MIN_BLOCK_SIZE grid.
+static void test_carve_refusals() {
+    test_arena arena;
+
+    const size_t anchor = arena.alloc->allocate_top(8192, 256, TAG_CONTEXT);
+    const size_t used   = arena.alloc->used();
+    REQUIRE(arena.alloc->allocate_top(SIZE_MAX - 10) == SIZE_MAX);
+    REQUIRE(arena.alloc->allocate_below(anchor, SIZE_MAX) == SIZE_MAX);
+    REQUIRE(arena.alloc->allocate_gap_front(anchor, SIZE_MAX - 100) == SIZE_MAX);
+    REQUIRE(arena.alloc->used() == used && arena.alloc->check_invariants());
+    REQUIRE(arena.alloc->tag_at(anchor) == TAG_CONTEXT && "the anchor's own record is untouched");
+    arena.alloc->free(anchor);
+    REQUIRE(arena.alloc->used() == 0 && "the anchor is still freeable");
+
+    // A region of ONE_MB + 100 bytes: its last block ends off the grid.
+    tlsf_allocator odd(ONE_MB + 100);
+    REQUIRE(odd.allocate_top(4096) == SIZE_MAX && "a top carve would start off the grid; refuse, do not abort");
+    REQUIRE(odd.used() == 0 && odd.check_invariants());
+    // Front carves and a whole-gap top take start on the grid, so they still work.
+    REQUIRE(odd.allocate_gap_front(tlsf_allocator::no_anchor, 4096) == 0);
+    REQUIRE(odd.check_invariants());
+
+    std::cout << "test_carve_refusals: PASSED\n";
 }
 
 // 22. The llama.cpp-moua A2 shape: B50, GGML_SYCL_VRAM_BUDGET_PCT=60, Mistral
@@ -720,6 +815,10 @@ static void test_carve_against_interval_model() {
 //     small for one 128 MiB KV layer (the 23 EXT-ALLOC lines on hardware).
 //     When the copies are staged after every primary at the gap front, the
 //     same release gives a gap that holds all 23 layers, top-carved.
+//     What the segregated arm proves is the two-pass ORDERING: during a load
+//     there is one free block, so allocate() would place those copies at the
+//     same addresses allocate_gap_front() does.  The difference between the
+//     two calls shows only with several free blocks, which case 21 covers.
 static void test_segregated_layout_a2_shape() {
     const size_t MiB    = ONE_MB;
     const size_t shared = 6872 * MiB;
@@ -839,6 +938,8 @@ int main() {
     test_frontier_walk_interior_free();
     test_frontier_walk_stops_at_weight();
     test_carve_against_interval_model();
+    test_carve_after_reset();
+    test_carve_refusals();
     test_segregated_layout_a2_shape();
 
     std::cout << "\nAll tlsf_allocator tests PASSED!\n";

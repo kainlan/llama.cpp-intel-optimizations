@@ -50,8 +50,10 @@ class tlsf_allocator {
     // O(1) allocation. Returns OFFSET into the managed region.
     // Returns SIZE_MAX on failure.
     // Caller computes device_ptr = arena_base + offset.
-    // alignment must be a power of 2 and >= min_alloc_size.
+    // alignment must be a power of 2 and <= MIN_BLOCK_SIZE (256); every
+    // returned offset is a multiple of MIN_BLOCK_SIZE.
     // tag is an opaque caller label kept with the block until it is freed.
+    // 0 means "untagged" (see frontier_walk()).
     size_t allocate(size_t size, size_t alignment = 256, uint8_t tag = 0);
 
     // ------------------------------------------------------------------
@@ -63,7 +65,9 @@ class tlsf_allocator {
     // at offset `anchor`, or the physical end of the region when the anchor
     // is no_anchor.  The GAP below an anchor is the free block immediately
     // under it, if there is one.  All of them round like allocate() and
-    // return SIZE_MAX, changing nothing, when the gap is missing or too small.
+    // return SIZE_MAX, changing nothing, when the gap is missing or too small,
+    // when the size overflows the rounding, or when a top carve would end at a
+    // region end that is not a multiple of MIN_BLOCK_SIZE.
     //
     // Like every member of this class they are unsynchronized, and that
     // includes the const reads: gap_below(), tag_at() and frontier_walk()
@@ -108,7 +112,18 @@ class tlsf_allocator {
     // one is free or carries `pass_tag`.  The walk stops at the first block
     // that is neither, so the entries are exactly what releasing every
     // `pass_tag` block in the walk would merge into the gap below `anchor`.
+    // pass_tag must not be 0: tag 0 is "untagged", which every allocate()
+    // caller that passes no tag gets, so it never passes.
     std::vector<extent> frontier_walk(size_t anchor, uint8_t pass_tag) const;
+
+    // Check every internal invariant: the physical block list tiles
+    // [0, size) and ends at the tracked last block, no two free blocks are
+    // adjacent, every free block sits exactly once in the free list of its
+    // size class and no allocated block sits in any, the bitmaps match the
+    // non-empty lists, used() is the allocated sum, and the offset map holds
+    // exactly the allocated offsets.  Prints the first violation to stderr and
+    // returns false.  O(blocks); for tests and debugging, not hot paths.
+    bool check_invariants() const;
 
     // O(1) free with automatic coalescing of physically adjacent blocks.
     // offset must have been returned by allocate().
@@ -606,17 +621,27 @@ inline size_t tlsf_allocator::carve_gap(size_t anchor, size_t size, size_t align
     // reason: every block offset must stay a multiple of MIN_BLOCK_SIZE, and a
     // top carve places its block at (end - size), so size must be a multiple too.
     const size_t granularity = alignment > MIN_BLOCK_SIZE ? alignment : MIN_BLOCK_SIZE;
-    size                     = (size + granularity - 1) & ~(granularity - 1);
+    if (size > SIZE_MAX - granularity) {
+        return SIZE_MAX;  // the rounding below would wrap to a zero-size block
+    }
+    size = (size + granularity - 1) & ~(granularity - 1);
     TLSF_ASSERT(alignment <= MIN_BLOCK_SIZE && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
 
     int gap_id = gap_block(anchor);
     if (gap_id < 0 || blocks_[gap_id].size < size) {
         return SIZE_MAX;
     }
+    const bool split_top = from_top && blocks_[gap_id].size >= size + MIN_BLOCK_SIZE;
+    if (split_top && ((blocks_[gap_id].offset + blocks_[gap_id].size) % MIN_BLOCK_SIZE) != 0) {
+        // Only the physically last block can end off the grid (a region whose
+        // size is not a multiple of MIN_BLOCK_SIZE); a block carved at its top
+        // would start off the grid too.
+        return SIZE_MAX;
+    }
     remove_free(gap_id);
 
     int carved_id = gap_id;
-    if (from_top && blocks_[gap_id].size >= size + MIN_BLOCK_SIZE) {
+    if (split_top) {
         // Read values before alloc_block_id() — it may reallocate blocks_ vector.
         size_t gap_offset = blocks_[gap_id].offset;
         size_t gap_size   = blocks_[gap_id].size;
@@ -675,6 +700,7 @@ inline uint8_t tlsf_allocator::tag_at(size_t offset) const {
 }
 
 inline std::vector<tlsf_allocator::extent> tlsf_allocator::frontier_walk(size_t anchor, uint8_t pass_tag) const {
+    TLSF_ASSERT(pass_tag != 0 && "tag 0 is untagged and never passes a frontier walk");
     std::vector<extent> walk;
     int                 id = -1;
     if (anchor == no_anchor) {
@@ -692,6 +718,97 @@ inline std::vector<tlsf_allocator::extent> tlsf_allocator::frontier_walk(size_t 
         id = b.prev_block;
     }
     return walk;
+}
+
+inline bool tlsf_allocator::check_invariants() const {
+#define TLSF_CHECK(cond, ...)                                         \
+    do {                                                              \
+        if (!(cond)) {                                                \
+            fprintf(stderr, "TLSF invariant violated: " __VA_ARGS__); \
+            fprintf(stderr, "\n");                                    \
+            return false;                                             \
+        }                                                             \
+    } while (0)
+
+    const int n_ids = static_cast<int>(blocks_.size());
+    if (total_size_ < MIN_BLOCK_SIZE) {
+        TLSF_CHECK(last_block_ < 0 && used_ == 0 && offset_to_block_.empty(),
+                   "an arena below MIN_BLOCK_SIZE has blocks");
+        return true;
+    }
+    TLSF_CHECK(last_block_ >= 0 && last_block_ < n_ids, "last_block_=%d is not a block id", last_block_);
+
+    // Walk the physical list from the tracked last block down to offset 0.
+    std::vector<char> in_walk(n_ids, 0);
+    size_t            end        = total_size_;
+    size_t            used_sum   = 0;
+    size_t            n_alloc    = 0;
+    size_t            n_free     = 0;
+    bool              above_free = false;
+    int               next       = -1;
+    for (int id = last_block_; id >= 0; id = blocks_[id].prev_block) {
+        TLSF_CHECK(id < n_ids && !in_walk[id], "the physical walk revisits block %d", id);
+        in_walk[id]          = 1;
+        const block_meta & b = blocks_[id];
+        TLSF_CHECK(b.next_block == next, "block %d next_block=%d, expected %d", id, b.next_block, next);
+        TLSF_CHECK(b.size > 0 && b.offset + b.size == end, "block %d [%zu, +%zu) does not end at %zu", id, b.offset,
+                   b.size, end);
+        TLSF_CHECK(b.offset % MIN_BLOCK_SIZE == 0, "block %d offset %zu is off the MIN_BLOCK_SIZE grid", id, b.offset);
+        TLSF_CHECK(!(b.free && above_free), "free blocks %d and %d are adjacent", id, next);
+        if (b.free) {
+            n_free++;
+        } else {
+            used_sum += b.size;
+            n_alloc++;
+            auto it = offset_to_block_.find(b.offset);
+            TLSF_CHECK(it != offset_to_block_.end() && it->second == id, "allocated block %d at %zu is not mapped", id,
+                       b.offset);
+        }
+        above_free = b.free;
+        end        = b.offset;
+        next       = id;
+    }
+    TLSF_CHECK(end == 0, "the physical walk stops at %zu, not 0", end);
+    TLSF_CHECK(used_sum == used_, "used_=%zu, allocated blocks sum to %zu", used_, used_sum);
+    TLSF_CHECK(offset_to_block_.size() == n_alloc, "offset map holds %zu entries for %zu allocated blocks",
+               offset_to_block_.size(), n_alloc);
+
+    // Every free block exactly once in its own class's list; nothing else listed.
+    std::vector<char> listed(n_ids, 0);
+    size_t            n_listed = 0;
+    uint32_t          fl_seen  = 0;
+    for (int fl = 0; fl < FL_COUNT; ++fl) {
+        uint32_t sl_seen = 0;
+        for (int sl = 0; sl < SL_COUNT; ++sl) {
+            int prev = -1;
+            for (int id = free_lists_[fl][sl]; id >= 0; id = blocks_[id].next_free) {
+                TLSF_CHECK(id < n_ids && in_walk[id], "list (%d,%d) holds block %d outside the physical list", fl, sl,
+                           id);
+                TLSF_CHECK(!listed[id], "block %d is listed twice", id);
+                TLSF_CHECK(blocks_[id].free, "allocated block %d is in free list (%d,%d)", id, fl, sl);
+                TLSF_CHECK(blocks_[id].prev_free == prev, "block %d prev_free=%d, expected %d", id,
+                           blocks_[id].prev_free, prev);
+                int mfl, msl;
+                mapping(blocks_[id].size, mfl, msl);
+                TLSF_CHECK(mfl == fl && msl == sl, "block %d of %zu B is in list (%d,%d), belongs in (%d,%d)", id,
+                           blocks_[id].size, fl, sl, mfl, msl);
+                listed[id] = 1;
+                n_listed++;
+                prev = id;
+            }
+            if (free_lists_[fl][sl] >= 0) {
+                sl_seen |= 1u << sl;
+            }
+        }
+        TLSF_CHECK(sl_bitmap_[fl] == sl_seen, "sl_bitmap_[%d]=0x%x, non-empty lists 0x%x", fl, sl_bitmap_[fl], sl_seen);
+        if (sl_seen != 0) {
+            fl_seen |= 1u << fl;
+        }
+    }
+    TLSF_CHECK(fl_bitmap_ == fl_seen, "fl_bitmap_=0x%x, non-empty classes 0x%x", fl_bitmap_, fl_seen);
+    TLSF_CHECK(n_listed == n_free, "%zu blocks listed, %zu free blocks in the physical list", n_listed, n_free);
+#undef TLSF_CHECK
+    return true;
 }
 
 }  // namespace ggml_sycl
