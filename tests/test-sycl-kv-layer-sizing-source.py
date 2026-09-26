@@ -1529,3 +1529,139 @@ def test_mutation_probe_skips_transaction_is_witnessed() -> None:
                           1)
     _assert_witnessed(cpp, mutated, _headroom_checker(cache), "the probe does not run the transaction body",
                       "the probe runs the publishing path")
+
+
+# ---------------------------------------------------------------------------
+# Optional layout copies yield to runtime KV.
+#
+# S1-PRELOAD stages dense oneDNN WOQ second copies into the room the load-time
+# KV sizing (n_ctx=512) leaves. A larger runtime context needs that room back:
+# the transaction counts the copies as KV headroom and, only when it is really
+# admitting (not probing) a context that fits with them, releases what the KV
+# needs before any layer is demoted, then redoes the fit against live headroom.
+# A released copy must not stay reachable through extra->layout or be
+# advertised as a route, a leased copy must never be picked, and a release must
+# not latch has_evictions_ (which disables graph replay and persistent TG).
+# ---------------------------------------------------------------------------
+
+PRELOAD_SIGNATURE = "static void ggml_sycl_preload_model_weights() {"
+WEIGHT_LAYOUT_PTR_SIGNATURE = ("void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, "
+                               "layout_mode target, bool prefer_host) {")
+CAN_USE_LAYOUT_SIGNATURE = ("static bool ggml_sycl_can_use_layout_for_kernel(const ggml_tensor * tensor, "
+                            "layout_mode layout, int device) {")
+FINALIZE_RETIRED_SIGNATURE = "size_t unified_cache::finalize_retired_entries_locked() {"
+YIELDABLE_SIGNATURE = "static bool optional_layout_yieldable("
+
+
+def optional_layout_yield_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
+    found: list[str] = []
+    txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
+    if "in.yieldable.push_back(ggml_sycl::unified_cache_optional_layout_bytes(device, next_plan.multi_device));" \
+            not in txn:
+        found.append("the fit does not count optional layouts as KV headroom")
+    yields = [m.start() for m in re.finditer(r"unified_cache_yield_optional_layouts\(", txn)]
+    first_fit = txn.find("plan_runtime_kv_residency(in)")
+    demote = txn.find("if (!residency.fits)")
+    if len(yields) != 1 or first_fit < 0 or demote < 0:
+        found.append("the transaction does not release optional layouts exactly once")
+        return found
+    guard = txn.rfind("if (residency.fits && !probe_mode) {", first_fit, yields[0])
+    if guard < 0:
+        found.append("optional layouts are released outside a fitting, non-probe admission")
+    if yields[0] > demote:
+        found.append("optional layouts are released after KV demotion is decided")
+    refit = re.search(r"in\.available\[i\]\s*=\s*ggml_sycl::unified_cache_kv_vram_available\([^;]*;.*?"
+                      r"in\.yieldable\.clear\(\);\s*residency\s*=\s*ggml_sycl::plan_runtime_kv_residency\(in\);",
+                      txn[yields[0]:demote], re.S)
+    if refit is None:
+        found.append("the fit is not redone against the live headroom after a yield")
+
+    preload = strip_comments(function(sycl_cpp, PRELOAD_SIGNATURE))
+    if "cache->mark_optional_layout(cache_key, GGML_LAYOUT_ONEDNN_WOQ);" not in preload:
+        found.append("S1-PRELOAD does not mark its WOQ copies optional")
+
+    ptr = strip_comments(function(sycl_cpp, WEIGHT_LAYOUT_PTR_SIGNATURE))
+    if not re.search(r"resolved\s*!=\s*GGML_LAYOUT_ONEDNN_WOQ\s*&&\s*extra->layout\.data_ptr\s*!=\s*nullptr", ptr):
+        found.append("the fast path trusts extra->layout for a yieldable WOQ copy")
+
+    can_use = strip_comments(function(sycl_cpp, CAN_USE_LAYOUT_SIGNATURE))
+    if not re.search(r"\(\s*layout\s*!=\s*GGML_LAYOUT_ONEDNN_WOQ\s*\|\|\s*"
+                     r"ggml_sycl_weight_layout_cached\(\s*tensor\s*,\s*device\s*,\s*layout\s*\)\s*\)", can_use):
+        found.append("a WOQ route is advertised without asking the cache")
+
+    finalize = strip_comments(function(cache_cpp, FINALIZE_RETIRED_SIGNATURE))
+    latch = re.search(r"if\s*\(([^{]*)\)\s*{\s*has_evictions_\.store\(true", finalize)
+    if latch is None or "!entry.optional_layout" not in latch.group(1):
+        found.append("an optional layout release latches has_evictions_")
+
+    yieldable = strip_comments(function(cache_cpp, YIELDABLE_SIGNATURE))
+    if not re.search(r"optional_layout_external_leases\(\s*key\s*,\s*entry\s*,\s*mirrors\s*\)\s*==\s*0", yieldable):
+        found.append("an optional copy someone else leases can be picked to yield")
+    return found
+
+
+def test_optional_layout_yield_wiring() -> None:
+    assert optional_layout_yield_violations(GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()) == []
+
+
+def _yield_checker_sycl(cache_cpp: str):
+    return lambda sycl_cpp: optional_layout_yield_violations(sycl_cpp, cache_cpp)
+
+
+def _yield_checker_cache(sycl_cpp: str):
+    return lambda cache_cpp: optional_layout_yield_violations(sycl_cpp, cache_cpp)
+
+
+def _sycl_mutation(old: str, new: str, expected: str, label: str) -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    _assert_witnessed(cpp, cpp.replace(old, new, 1), _yield_checker_sycl(cache), expected, label)
+
+
+def _cache_mutation(old: str, new: str, expected: str, label: str) -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    _assert_witnessed(cache, cache.replace(old, new, 1), _yield_checker_cache(cpp), expected, label)
+
+
+def test_mutation_yieldable_not_counted_is_witnessed() -> None:
+    _sycl_mutation("in.yieldable.push_back(ggml_sycl::unified_cache_optional_layout_bytes(device, next_plan.multi_device));",
+                   "", "does not count optional layouts", "yieldable dropped")
+
+
+def test_mutation_probe_yields_is_witnessed() -> None:
+    _sycl_mutation("if (residency.fits && !probe_mode) {", "if (residency.fits) {", "outside a fitting, non-probe",
+                   "a probe releases copies")
+
+
+def test_mutation_yield_without_fit_is_witnessed() -> None:
+    _sycl_mutation("if (residency.fits && !probe_mode) {", "if (!probe_mode) {", "outside a fitting, non-probe",
+                   "a non-fitting admission releases copies")
+
+
+def test_mutation_no_refit_after_yield_is_witnessed() -> None:
+    _sycl_mutation("                in.yieldable.clear();\n                residency = ggml_sycl::plan_runtime_kv_residency(in);\n",
+                   "", "not redone against the live headroom", "refit dropped")
+
+
+def test_mutation_preload_does_not_mark_is_witnessed() -> None:
+    _sycl_mutation("(void) cache->mark_optional_layout(cache_key, GGML_LAYOUT_ONEDNN_WOQ);", "",
+                   "does not mark its WOQ copies", "mark dropped")
+
+
+def test_mutation_fast_path_trusts_woq_is_witnessed() -> None:
+    _sycl_mutation("if (resolved != GGML_LAYOUT_ONEDNN_WOQ && extra->layout.data_ptr != nullptr &&",
+                   "if (extra->layout.data_ptr != nullptr &&", "trusts extra->layout", "fast path reverted")
+
+
+def test_mutation_woq_advertised_blind_is_witnessed() -> None:
+    _sycl_mutation("(layout != GGML_LAYOUT_ONEDNN_WOQ || ggml_sycl_weight_layout_cached(tensor, device, layout))",
+                   "true", "advertised without asking the cache", "route check dropped")
+
+
+def test_mutation_optional_release_latches_is_witnessed() -> None:
+    _cache_mutation("!entry.host_resident && !entry.optional_layout) {", "!entry.host_resident) {",
+                    "latches has_evictions_", "latch exemption dropped")
+
+
+def test_mutation_leased_copy_yieldable_is_witnessed() -> None:
+    _cache_mutation("optional_layout_external_leases(key, entry, mirrors) == 0;", "true;",
+                    "someone else leases", "lease check dropped")

@@ -493,6 +493,82 @@ int main() {
         CHECK(kv_device_residency_changed(load, published, more, 0), "case 25: device 0 demoted one more layer");
         CHECK(kv_device_residency_changed(load, more, published, 0), "case 25: device 0 got a layer back");
     }
+    // 26. Optional layout copies yield before any KV layer demotes. The B50
+    // Mistral Q4_0 run at GGML_SYCL_VRAM_BUDGET_PCT=60, -c 2048: 32 layers of
+    // 8 MB, 84.4 MB of live headroom left beside 2869.8 MB of oneDNN WOQ
+    // copies. Without the copies counted it demotes 22 layers, as that run did.
+    {
+        const size_t       mb = 1024 * 1024;
+        kv_residency_input in;
+        in.load_kv_device.assign(32, 0);
+        in.swa_layer_mask.assign(32, 0);
+        in.layer_kv_bytes.assign(32, 8 * mb);
+        in.devices   = { 0 };
+        in.available = { 84 * mb + 4 * mb / 10 };
+
+        auto without = plan_runtime_kv_residency(in);
+        CHECK(without.fits, "case 26: fits without the copies, by demotion");
+        CHECK_EQ(without.per_device[0].demoted_layers.size(), 22, "case 26: 22 layers demoted without the copies");
+
+        in.yieldable = { 2869 * mb + 8 * mb / 10 };
+        auto r       = plan_runtime_kv_residency(in);
+        CHECK(r.fits, "case 26: fits");
+        CHECK(r.per_device[0].demoted_layers.empty(), "case 26: no KV layer demotes while copies can yield");
+        CHECK(r.kv_device == in.load_kv_device, "case 26: all 32 layers stay on the device");
+        CHECK_EQ(r.yield_bytes.size(), 1, "case 26: one yield per device");
+        CHECK_EQ(r.yield_bytes[0], 32 * 8 * mb + 32 * kv_alloc_slack_per_layer - in.available[0],
+                 "case 26: yields exactly the shortfall");
+    }
+    // 27. The same device at -c 32768 (128 MB a layer): every copy yields and
+    // only what is still over demotes -- 9 layers instead of all 32.
+    {
+        const size_t       mb = 1024 * 1024;
+        kv_residency_input in;
+        in.load_kv_device.assign(32, 0);
+        in.swa_layer_mask.assign(32, 0);
+        in.layer_kv_bytes.assign(32, 128 * mb);
+        in.devices   = { 0 };
+        in.available = { 84 * mb + 4 * mb / 10 };
+
+        auto without = plan_runtime_kv_residency(in);
+        CHECK_EQ(without.per_device[0].demoted_layers.size(), 32, "case 27: every layer demoted without the copies");
+
+        in.yieldable = { 2869 * mb + 8 * mb / 10 };
+        auto r       = plan_runtime_kv_residency(in);
+        CHECK(r.fits, "case 27: fits");
+        CHECK_EQ(r.yield_bytes[0], in.yieldable[0], "case 27: every copy yields");
+        CHECK_EQ(r.per_device[0].demoted_layers.size(), 9, "case 27: only the rest demotes");
+    }
+    // 28. Nothing yields while the KV fits, and a device without a shortfall
+    // keeps its copies while another device yields.
+    {
+        const size_t       mb = 1024 * 1024;
+        kv_residency_input in;
+        in.load_kv_device = { 0, 0, 1, 1 };
+        in.swa_layer_mask.assign(4, 0);
+        in.layer_kv_bytes.assign(4, 8 * mb);
+        in.devices   = { 0, 1 };
+        in.available = { 100 * mb, 10 * mb };
+        in.yieldable = { 500 * mb, 500 * mb };
+        auto r       = plan_runtime_kv_residency(in);
+        CHECK(r.fits, "case 28: fits");
+        CHECK_EQ(r.yield_bytes[0], 0, "case 28: device 0 fits, nothing yields");
+        CHECK_EQ(r.yield_bytes[1], 16 * mb + 2 * kv_alloc_slack_per_layer - 10 * mb,
+                 "case 28: device 1 yields its shortfall");
+        CHECK(r.kv_device == in.load_kv_device, "case 28: no layer demotes");
+    }
+    // 29. Which copies yield: largest first, until the bytes are covered.
+    {
+        using ggml_sycl::select_optional_layout_yield;
+        const std::vector<size_t> sizes = { 10, 30, 20 };
+        CHECK(select_optional_layout_yield(sizes, 0).empty(), "case 29: nothing asked, nothing yields");
+        CHECK(select_optional_layout_yield(sizes, 25) == std::vector<size_t>({ 1 }), "case 29: the largest covers 25");
+        CHECK(select_optional_layout_yield(sizes, 35) == std::vector<size_t>({ 1, 2 }), "case 29: 30 + 20 cover 35");
+        CHECK(select_optional_layout_yield(sizes, 100) == std::vector<size_t>({ 1, 2, 0 }),
+              "case 29: all of them when short");
+        const std::vector<size_t> ties = { 20, 20 };
+        CHECK(select_optional_layout_yield(ties, 20) == std::vector<size_t>({ 0 }), "case 29: ties keep input order");
+    }
     std::printf("test-kv-runtime-demotion: all ok\n");
     return 0;
 }

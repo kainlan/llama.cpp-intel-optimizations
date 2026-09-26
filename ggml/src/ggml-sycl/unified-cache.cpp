@@ -7636,6 +7636,117 @@ expert_retire_status unified_cache::retire_expert_entry_exact(ggml_sycl_cache_id
                                                   expert_retire_status::NOT_FOUND;
 }
 
+bool unified_cache::mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout) {
+    if (!key.valid) {
+        return false;
+    }
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    auto it = entries_.find(make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key, layout));
+    if (it == entries_.end() || it->second.retired || it->second.layout != layout) {
+        return false;
+    }
+    it->second.optional_layout = true;
+    return true;
+}
+
+// The leases on an optional copy that are not the cache's own direct-stage
+// mirror: the mirror is the cache holding its own entry, which yielding
+// withdraws; any other lease is a user the copy must not be freed under.
+// Caller holds direct_stage_mutex_ and rw_mutex_ (either mode).
+template <typename mirror_map>
+static uint32_t optional_layout_external_leases(const unified_cache_key &   key,
+                                                const unified_cache_entry & entry,
+                                                const mirror_map &          mirrors) {
+    const uint32_t leases = entry.in_use_count.load();
+    const auto     mirror = mirrors.find(key.id);
+    const bool     held   = mirror != mirrors.end() && mirror->second.handle && mirror->second.layout == entry.layout &&
+                      mirror->second.ptr == entry.device_ptr;
+    return held && leases > 0 ? leases - 1 : leases;
+}
+
+template <typename mirror_map>
+static bool optional_layout_yieldable(const unified_cache_key &   key,
+                                      const unified_cache_entry & entry,
+                                      const mirror_map &          mirrors) {
+    return entry.optional_layout && !entry.retired && key.type == cache_entry_type::DENSE_WEIGHT &&
+           entry.location == cache_location::DEVICE && !entry.host_resident &&
+           entry.state == cache_entry_state::READY && entry.device_ptr != nullptr &&
+           optional_layout_external_leases(key, entry, mirrors) == 0;
+}
+
+size_t unified_cache::optional_layout_bytes() const {
+    std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+    std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+    std::lock(direct_lock, cache_lock);
+    size_t bytes = 0;
+    for (const auto & pair : entries_) {
+        if (optional_layout_yieldable(pair.first, pair.second, direct_weight_entries_)) {
+            bytes += pair.second.size;
+        }
+    }
+    return bytes;
+}
+
+size_t unified_cache::yield_optional_layouts(size_t bytes, size_t * n_yielded) {
+    if (n_yielded) {
+        *n_yielded = 0;
+    }
+    if (bytes == 0) {
+        return 0;
+    }
+    // Same withdrawal as retire_expert_entry_exact(): under both locks, take
+    // the cache's own mirror lease out and retire the entry, so no new lookup
+    // resolves it; destroy the mirror handles with neither lock held; then let
+    // finalize free what no other lease or pending write still holds.
+    std::vector<std::shared_ptr<mem_handle>> released_mirrors;
+    std::vector<unified_cache_key>           retired_keys;
+    std::vector<size_t>                      retired_sizes;
+    {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+
+        std::vector<unified_cache_key> keys;
+        std::vector<size_t>            sizes;
+        for (const auto & pair : entries_) {
+            if (optional_layout_yieldable(pair.first, pair.second, direct_weight_entries_)) {
+                keys.push_back(pair.first);
+                sizes.push_back(pair.second.size);
+            }
+        }
+        for (size_t i : select_optional_layout_yield(sizes, bytes)) {
+            const unified_cache_key & key    = keys[i];
+            unified_cache_entry &     entry  = entries_.find(key)->second;
+            auto                      mirror = direct_weight_entries_.find(key.id);
+            if (mirror != direct_weight_entries_.end() && mirror->second.layout == entry.layout &&
+                mirror->second.ptr == entry.device_ptr) {
+                released_mirrors.push_back(std::move(mirror->second.handle));
+                direct_weight_entries_.erase(mirror);
+            }
+            (void) transition_to_retired_locked(entry);
+            remap_or_erase_id_mapping_locked(key.id, key);
+            retired_keys.push_back(key);
+            retired_sizes.push_back(sizes[i]);
+        }
+    }
+    released_mirrors.clear();
+
+    size_t freed = 0;
+    {
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
+        (void) finalize_retired_entries_locked();
+        for (size_t i = 0; i < retired_keys.size(); ++i) {
+            if (entries_.find(retired_keys[i]) == entries_.end()) {
+                freed += retired_sizes[i];
+                if (n_yielded) {
+                    ++*n_yielded;
+                }
+            }
+        }
+    }
+    return freed;
+}
+
 size_t unified_cache::drop_expert_entries_for_tensor_layout(const std::vector<ggml_sycl_cache_id> & expert_keys,
                                                             ggml_layout_mode                        layout,
                                                             const char *                            reason) {
@@ -12263,7 +12374,14 @@ size_t unified_cache::finalize_retired_entries_locked() {
         }
 
         release_entry_allocation_locked(entry);
-        if (!entry.storage_owner && entry.device_ptr && !entry.host_resident) {
+        // An optional layout copy is released only when a new context's KV
+        // needs its bytes (yield_optional_layouts()), before that context has
+        // recorded anything, and persistent TG never bakes it (decode reads
+        // the primary). Latching here would disable graph replay and
+        // persistent TG for the whole weight population to protect pointers
+        // no replay holds -- except another live context's on the same
+        // device, which is unsupported (canonical memory contract §5).
+        if (!entry.storage_owner && entry.device_ptr && !entry.host_resident && !entry.optional_layout) {
             has_evictions_.store(true, std::memory_order_release);
         }
         const unified_cache_key key = it->first;
@@ -21115,6 +21233,30 @@ bool unified_cache_mode_is_global() {
     return get_effective_mode() == unified_cache_mode::GLOBAL;
 }
 
+// The cache whose zone unified_cache_kv_vram_available() reads for this
+// device, so a yield frees bytes where KV admission looks for them.
+static unified_cache * optional_layout_cache_for_kv(int device_id, bool multi_device) {
+    return kv_reads_device_arena(multi_device, get_effective_mode() == unified_cache_mode::GLOBAL) ?
+               get_existing_cache_for_device(device_id) :
+               nullptr;
+}
+
+size_t unified_cache_optional_layout_bytes(int device_id, bool multi_device) {
+    auto * cache = optional_layout_cache_for_kv(device_id, multi_device);
+    return cache ? cache->optional_layout_bytes() : 0;
+}
+
+size_t unified_cache_yield_optional_layouts(int device_id, bool multi_device, size_t bytes, size_t * n_yielded) {
+    auto * cache = optional_layout_cache_for_kv(device_id, multi_device);
+    if (!cache) {
+        if (n_yielded) {
+            *n_yielded = 0;
+        }
+        return 0;
+    }
+    return cache->yield_optional_layouts(bytes, n_yielded);
+}
+
 size_t unified_cache_kv_arena_used(int device_id) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (!cache || !cache->arena_active()) {
@@ -27358,6 +27500,15 @@ static const char * placement_kv_layer_label(const placement_kv_info & kv_info, 
 //      this prediction both start from the identical `remaining` snapshot,
 //      so they agree without needing to coordinate.
 //
+// Out of vram_bytes is not out of the plan: what this pass records is the
+// plan's optional_layout_vram_bytes(), printed on the [PLACEMENT] Totals line,
+// so plan weights plus optional copies are what S1-PRELOAD materializes. The
+// copies fill the room the load-time KV sizing (n_ctx=512) leaves, which a
+// larger runtime context needs back: S1-PRELOAD marks each staged copy
+// optional (unified_cache_entry::optional_layout) and the runtime-context
+// transaction releases as many as that context's KV needs before it demotes
+// any KV layer to the host tier.
+//
 // Order caveat: this predicts staging's outcome by replaying the same
 // eligibility + cumulative-budget check S1-PRELOAD applies, in `plan.entries`
 // order (priority ASC, layer_id ASC, dst_size DESC -- set earlier in
@@ -28001,9 +28152,12 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         "[PLACEMENT] KV sizing: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB\n",
         kv_info.n_layer, kv_info.n_embd_k_gqa, kv_info.n_embd_v_gqa, kv_info.n_ctx,
         kv_info.n_ctx_is_runtime ? "runtime" : "conservative", plan.kv_per_layer / (1024.0 * 1024.0));
-    GGML_LOG_INFO("[PLACEMENT] Totals: weights=%.1f MB device + %.1f MB host, kv=%.1f MB device + %.1f MB host\n",
-                  plan.weight_vram_bytes / (1024.0 * 1024.0), plan.weight_host_bytes / (1024.0 * 1024.0),
-                  plan.kv_vram_bytes / (1024.0 * 1024.0), plan.kv_host_bytes / (1024.0 * 1024.0));
+    GGML_LOG_INFO(
+        "[PLACEMENT] Totals: weights=%.1f MB device + %.1f MB host, kv=%.1f MB device + %.1f MB host, optional "
+        "layouts=%.1f MB device (yield to KV)\n",
+        plan.weight_vram_bytes / (1024.0 * 1024.0), plan.weight_host_bytes / (1024.0 * 1024.0),
+        plan.kv_vram_bytes / (1024.0 * 1024.0), plan.kv_host_bytes / (1024.0 * 1024.0),
+        plan.optional_layout_vram_bytes(-1) / (1024.0 * 1024.0));
     GGML_LOG_INFO("[PLACEMENT] Total: %.1f MB device + %.1f MB host (budget=%.1f MB)\n",
                   plan.vram_bytes / (1024.0 * 1024.0), plan.host_bytes / (1024.0 * 1024.0),
                   vram_budget / (1024.0 * 1024.0));
@@ -30064,9 +30218,12 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         "[PLACEMENT-MULTI] KV sizing: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB\n",
         kv_info.n_layer, kv_info.n_embd_k_gqa, kv_info.n_embd_v_gqa, kv_info.n_ctx,
         kv_info.n_ctx_is_runtime ? "runtime" : "conservative", plan.kv_per_layer / (1024.0 * 1024.0));
-    GGML_LOG_INFO("[PLACEMENT-MULTI] Totals: weights=%.1f MB device + %.1f MB host, kv=%.1f MB device + %.1f MB host\n",
-                  plan.weight_vram_bytes / (1024.0 * 1024.0), plan.weight_host_bytes / (1024.0 * 1024.0),
-                  plan.kv_vram_bytes / (1024.0 * 1024.0), plan.kv_host_bytes / (1024.0 * 1024.0));
+    GGML_LOG_INFO(
+        "[PLACEMENT-MULTI] Totals: weights=%.1f MB device + %.1f MB host, kv=%.1f MB device + %.1f MB host, optional "
+        "layouts=%.1f MB device (yield to KV)\n",
+        plan.weight_vram_bytes / (1024.0 * 1024.0), plan.weight_host_bytes / (1024.0 * 1024.0),
+        plan.kv_vram_bytes / (1024.0 * 1024.0), plan.kv_host_bytes / (1024.0 * 1024.0),
+        plan.optional_layout_vram_bytes(-1) / (1024.0 * 1024.0));
     GGML_LOG_INFO("[PLACEMENT-MULTI] Total: %.1f MB device + %.1f MB host (budget=%.1f MB)\n",
                   plan.vram_bytes / (1024.0 * 1024.0), plan.host_bytes / (1024.0 * 1024.0),
                   plan.vram_budget / (1024.0 * 1024.0));

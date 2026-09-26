@@ -1303,6 +1303,23 @@ struct placement_plan {
         return false;
     }
 
+    // VRAM the plan's dense extra copies take on `dev_id` (-1: every device).
+    // Not part of weight_vram_bytes or vram_bytes: an extra copy is optional
+    // and yields to runtime KV (unified_cache_yield_optional_layouts()), so it
+    // is accounted for on its own rather than as weight the plan must keep.
+    size_t optional_layout_vram_bytes(int dev_id) const {
+        size_t bytes = 0;
+        for (const placement_entry & e : entries) {
+            if (e.expert_id >= 0 || !e.on_device || (dev_id >= 0 && e.target_device != dev_id)) {
+                continue;
+            }
+            for (const placement_alternate_layout & extra : e.extra_layouts) {
+                bytes += extra.vram_charge_size;
+            }
+        }
+        return bytes;
+    }
+
     // Did the plan promise a dense extra (same-device, additional) copy in `layout`?
     bool dense_extra_layout_on_device(const std::string & name, int dev_id, ggml_layout_mode layout) const {
         auto it = name_index_.find(name);
@@ -2470,6 +2487,12 @@ struct unified_cache_entry {
     uint32_t              owner_mask            = 0;
     bool                  owner_tagged          = false;
     uint64_t              pending_load_txn_id   = 0;
+    // An optional layout copy, held as well as the tensor's primary (a dense
+    // oneDNN WOQ copy): it serves no op the primary cannot, so a live model's
+    // ownership does not keep it resident against runtime KV. Only
+    // yield_optional_layouts() acts on it, and only while no one but the
+    // cache's own direct-stage mirror holds a lease. Never set on a primary.
+    bool                  optional_layout       = false;
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
     // entry -- a distinct string literal stamped at each of the ~16 sites that
     // bump in_use_count, whether directly or through acquire_entry_lease().
@@ -2879,6 +2902,19 @@ class unified_cache {
     expert_retire_status retire_expert_entry_exact(ggml_sycl_cache_id key,
                                                    ggml_layout_mode   layout,
                                                    const char *       reason = nullptr);
+
+    // Optional layout copies (unified_cache_entry::optional_layout).
+    // mark_optional_layout() tags a dense weight's staged copy in `layout`.
+    // optional_layout_bytes() is what yield_optional_layouts() could release
+    // now: device-resident, non-retired copies nobody but the cache's own
+    // direct-stage mirror leases. yield_optional_layouts() retires those,
+    // largest first, until at least `bytes` are freed, and returns the bytes
+    // it freed: a copy whose lease outlives the retirement is hidden from
+    // routing at once but freed only when that lease drops, so it is not
+    // counted. Primaries are never touched.
+    bool   mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout);
+    size_t optional_layout_bytes() const;
+    size_t yield_optional_layouts(size_t bytes, size_t * n_yielded = nullptr);
 
     // Fast O(1) lookup for inference-time weight resolution.
     // Returns nullptr if not staged.  No allocation, no state machine.
@@ -6621,6 +6657,17 @@ size_t unified_cache_kv_vram_available(int device_id, bool multi_device);
 // Whether the effective cache mode (AUTO resolved) is GLOBAL, so the runtime-
 // context transaction can warn that a multi-device plan is unsupported there.
 bool   unified_cache_mode_is_global();
+
+// Optional layout copies yield to runtime KV (see
+// unified_cache_entry::optional_layout). S1-PRELOAD marks each copy it stages
+// as well as a primary; the runtime-context transaction counts
+// unified_cache_optional_layout_bytes() as KV headroom and, before it demotes
+// any KV layer, releases what the KV needs with
+// unified_cache_yield_optional_layouts(). `multi_device` reads the device's
+// cache as unified_cache_kv_vram_available() does, so the two numbers come
+// from the same zone.
+size_t unified_cache_optional_layout_bytes(int device_id, bool multi_device);
+size_t unified_cache_yield_optional_layouts(int device_id, bool multi_device, size_t bytes, size_t * n_yielded);
 
 // Sum of zone_used(KV) + zone_used(ONEDNN) + zone_used(RUNTIME) + zone_used(SCRATCH).
 // Returns 0 when arena is inactive.

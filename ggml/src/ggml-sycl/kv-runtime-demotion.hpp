@@ -182,6 +182,9 @@ struct kv_residency_input {
     std::vector<uint8_t> swa_layer_mask;
     std::vector<int>     devices;         // devices to fit, in order
     std::vector<size_t>  available;       // live KV headroom of devices[i]
+    // Bytes of optional layout copies devices[i] can release for its KV
+    // (unified_cache_optional_layout_bytes()); empty means none.
+    std::vector<size_t>  yieldable;
     size_t               per_layer_slack = kv_alloc_slack_per_layer;
 };
 
@@ -190,13 +193,22 @@ struct kv_residency_result {
     int                             refused_device = -1;  // the device that cannot fit even with KV demoted
     std::vector<int>                kv_device;            // the new residency
     std::vector<kv_demotion_result> per_device;           // same indexing as devices
+    std::vector<size_t>             yield_bytes;          // optional layout bytes devices[i] must release
 };
 
-// Starts from load_kv_device and demotes each device's latest full-attention
-// layers, then its latest SWA layers, to the host tier until its KV, plus
-// per_layer_slack per resident layer, fits that device's headroom. It refuses
-// only when even that cannot fit.
+// Starts from load_kv_device. A device whose KV, plus per_layer_slack per
+// resident layer, exceeds its headroom first counts up to its yieldable bytes
+// as headroom (yield_bytes, which the caller must release before the KV is
+// allocated): an optional layout copy never outranks KV for VRAM. Only what is
+// still over then demotes the device's latest full-attention layers, then its
+// latest SWA layers, to the host tier. It refuses only when even that cannot
+// fit.
 kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in);
+
+// Which optional layout copies to release, given their sizes, so at least
+// `bytes` are freed: largest first, so the fewest tensors lose their copy.
+// Returns indices into `sizes`; all of them when their total is short.
+std::vector<size_t> select_optional_layout_yield(const std::vector<size_t> & sizes, size_t bytes);
 
 // One device's view of a (possibly multi-device) plan for the zone-fit pass.
 struct kv_device_fit_input {

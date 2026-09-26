@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <numeric>
 
 namespace ggml_sycl {
 
@@ -122,15 +123,22 @@ kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in) {
         fit.kv_device = r.kv_device;
 
         size_t n_resident = 0;
+        size_t kv_bytes   = 0;
         for (size_t l = 0; l < r.kv_device.size(); ++l) {
             if (r.kv_device[l] == fit.device && l < in.layer_kv_bytes.size() && in.layer_kv_bytes[l] > 0) {
                 ++n_resident;
+                kv_bytes += std::min(in.layer_kv_bytes[l], SIZE_MAX - kv_bytes);
             }
         }
         const bool   overflow  = in.per_layer_slack > 0 && n_resident > SIZE_MAX / in.per_layer_slack;
         const size_t slack     = overflow ? SIZE_MAX : n_resident * in.per_layer_slack;
+        const size_t demand    = kv_bytes + std::min(slack, SIZE_MAX - kv_bytes);
         const size_t available = i < in.available.size() ? in.available[i] : 0;
-        fit.capacity           = available > slack ? available - slack : 0;
+        const size_t yieldable = i < in.yieldable.size() ? in.yieldable[i] : 0;
+        const size_t yield     = demand > available ? std::min(demand - available, yieldable) : 0;
+        const size_t headroom  = available + std::min(yield, SIZE_MAX - available);
+        fit.capacity           = headroom > slack ? headroom - slack : 0;
+        r.yield_bytes.push_back(yield);
 
         const kv_demotion_result demotion = plan_device_kv_fit(fit);
         for (int l : demotion.demoted_layers) {
@@ -144,6 +152,22 @@ kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in) {
         }
     }
     return r;
+}
+
+std::vector<size_t> select_optional_layout_yield(const std::vector<size_t> & sizes, size_t bytes) {
+    std::vector<size_t> order(sizes.size());
+    std::iota(order.begin(), order.end(), size_t{ 0 });
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return sizes[a] > sizes[b]; });
+    std::vector<size_t> picked;
+    size_t              freed = 0;
+    for (size_t i : order) {
+        if (freed >= bytes) {
+            break;
+        }
+        picked.push_back(i);
+        freed += std::min(sizes[i], SIZE_MAX - freed);
+    }
+    return picked;
 }
 
 int layer_block_kv_device(const std::vector<int> &    kv_device,

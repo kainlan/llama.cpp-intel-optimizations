@@ -17827,8 +17827,41 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         in.devices = next_plan.multi_device ? next_plan.devices : std::vector<int>{ next_plan.device_id };
         for (int device : in.devices) {
             in.available.push_back(ggml_sycl::unified_cache_kv_vram_available(device, next_plan.multi_device));
+            in.yieldable.push_back(ggml_sycl::unified_cache_optional_layout_bytes(device, next_plan.multi_device));
         }
-        const ggml_sycl::kv_residency_result residency = ggml_sycl::plan_runtime_kv_residency(in);
+        ggml_sycl::kv_residency_result residency = ggml_sycl::plan_runtime_kv_residency(in);
+        // Optional layout copies (S1-PRELOAD's dense oneDNN WOQ second copies)
+        // never outrank KV: the fit counted them as headroom, so release what
+        // it needs now, before the KV is allocated. A probe only counts. The
+        // fit is then redone against the live headroom with nothing left to
+        // count: copies are released whole, so more may come back than asked,
+        // and a copy someone still leases is hidden from routing but not freed
+        // yet, so less may.
+        if (residency.fits && !probe_mode) {
+            bool yielded = false;
+            for (size_t i = 0; i < in.devices.size(); ++i) {
+                const size_t want = residency.yield_bytes[i];
+                if (want == 0) {
+                    continue;
+                }
+                size_t       n_yielded = 0;
+                const size_t freed     = ggml_sycl::unified_cache_yield_optional_layouts(
+                    in.devices[i], next_plan.multi_device, want, &n_yielded);
+                GGML_LOG_WARN(
+                    "[SYCL-PLAN] KV admission released %zu optional oneDNN WOQ layout copies (%.1f MB) on device %d "
+                    "for n_ctx=%u so its KV stays in VRAM; those tensors' prompt processing uses the resident "
+                    "primary layout\n",
+                    n_yielded, freed / mb, in.devices[i], n_ctx);
+                yielded = true;
+            }
+            if (yielded) {
+                for (size_t i = 0; i < in.devices.size(); ++i) {
+                    in.available[i] = ggml_sycl::unified_cache_kv_vram_available(in.devices[i], next_plan.multi_device);
+                }
+                in.yieldable.clear();
+                residency = ggml_sycl::plan_runtime_kv_residency(in);
+            }
+        }
         if (!residency.fits) {
             GGML_SYCL_RUNTIME_TXN_REFUSAL(
                 probe_mode,
@@ -34518,6 +34551,9 @@ static void ggml_sycl_preload_model_weights() {
                                     device, cache_key, src_ptr, src_size, woq_size, GGML_LAYOUT_ONEDNN_WOQ,
                                     ggml_sycl_fill_onednn_woq, &woq_ctx, s1_preload_q, &woq_handle);
                                 if (woq_result.ok && woq_result.ptr) {
+                                    // A second copy of a weight whose primary is resident:
+                                    // it yields to runtime KV (unified_cache_entry::optional_layout).
+                                    (void) cache->mark_optional_layout(cache_key, GGML_LAYOUT_ONEDNN_WOQ);
                                     if (!woq_planned) {
                                         dense_woq_staged_unplanned++;
                                     }
@@ -35391,10 +35427,15 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     // (line ~33306's own guard), which is mutually exclusive with this
     // rule's src_is_device requirement, so the ordering does not change
     // which case reaches the host-placement branch versus this one.
+    //
+    // extra->layout is the last layout resolved for the tensor, not a lease: a
+    // ONEDNN_WOQ copy there may since have yielded to runtime KV
+    // (unified_cache_yield_optional_layouts) and its bytes be KV now, so WOQ
+    // residency is always asked of the cache below.
     if (src_is_device && !request_prefer_host) {
         if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
-            if (extra->layout.data_ptr != nullptr && extra->layout.mode == resolved &&
-                extra->layout.device_id == device && extra->layout.size >= dst_size) {
+            if (resolved != GGML_LAYOUT_ONEDNN_WOQ && extra->layout.data_ptr != nullptr &&
+                extra->layout.mode == resolved && extra->layout.device_id == device && extra->layout.size >= dst_size) {
                 ggml_sycl_update_layout_from_cache(extra, tensor, device, resolved, extra->layout.data_ptr,
                                                    extra->layout.size, xmx_info, onednn_pack_m);
                 return extra->layout.data_ptr;
@@ -61607,6 +61648,16 @@ static bool ggml_sycl_layout_override_active(layout_mode & override_layout) {
     return false;
 }
 
+// Whether the unified cache holds `tensor` in `layout` on `device` right now.
+// For a layout that can be released at runtime (an optional ONEDNN_WOQ copy,
+// unified_cache_yield_optional_layouts) this, not extra->layout, is the fact.
+static bool ggml_sycl_weight_layout_cached(const ggml_tensor * tensor, int device, layout_mode layout) {
+    sycl::queue &              q     = ggml_sycl_get_device(device).default_queue();
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(q);
+    const ggml_sycl_cache_id   key   = ggml_backend_sycl_get_weight_cache_key(tensor, device);
+    return cache && key.valid && cache->is_cached(key, layout);
+}
+
 static bool ggml_sycl_can_use_layout_for_kernel(const ggml_tensor * tensor, layout_mode layout, int device) {
     if (!tensor) {
         return false;
@@ -61628,7 +61679,8 @@ static bool ggml_sycl_can_use_layout_for_kernel(const ggml_tensor * tensor, layo
     }
     const ggml_tensor_layout * info = ggml_sycl_get_layout_info(tensor);
     if (info && info->data_ptr != nullptr && (info->device_id < 0 || info->device_id == device) &&
-        info->mode == layout) {
+        info->mode == layout &&
+        (layout != GGML_LAYOUT_ONEDNN_WOQ || ggml_sycl_weight_layout_cached(tensor, device, layout))) {
         return true;
     }
     if (ggml_backend_sycl_weights_evictable() && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer)) {
