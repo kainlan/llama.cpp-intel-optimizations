@@ -7146,6 +7146,16 @@ struct vram_budget_authority {
 vram_budget_authority ggml_sycl_device_budget_authority(int device, size_t total_mem, size_t free_mem,
                                                          int default_pct);
 
+// The same answer as ggml_sycl_device_budget_authority() above, but never
+// constructs a cache: a device with none yet (e.g. a hidden GPU the planner
+// did not register) gets the fresh computation. For callers that only need
+// to READ a device's budget identity, where creating a cache as a side
+// effect would be wrong.
+vram_budget_authority ggml_sycl_device_budget_authority_existing(int    device,
+                                                                 size_t total_mem,
+                                                                 size_t free_mem,
+                                                                 int    default_pct);
+
 vram_budget_authority compute_vram_budget_authority(bool   host_unified,
                                                     size_t total_mem_in,
                                                     size_t free_mem_in,

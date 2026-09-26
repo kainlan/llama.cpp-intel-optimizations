@@ -110109,11 +110109,11 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_ubatch_cache_path") == 0) {
         return (void *) ggml_backend_sycl_ubatch_cache_path;
     }
-    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_lookup") == 0) {
-        return (void *) ggml_backend_sycl_ubatch_cache_lookup;
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_lookup_layout1") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_lookup_layout1;
     }
-    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_store") == 0) {
-        return (void *) ggml_backend_sycl_ubatch_cache_store;
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_store_layout1") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_store_layout1;
     }
     if (strcmp(name, "ggml_backend_sycl_execution_context_create") == 0) {
         return (void *) ggml_backend_sycl_execution_context_create;
