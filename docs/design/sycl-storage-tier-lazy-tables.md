@@ -83,8 +83,10 @@ gather sits in the graph is the **provider's** decision, not the model's
   split, and the first SYCL op reads its output where it lies, exactly as it
   reads `inp_embd` today (§7.3).
 - **STORAGE** tables are gathered by the **SYCL backend**, which owns the node
-  and runs it as a CPU `host_task`: it waits for its IO ticket on a runtime
-  thread, and dequantizes into a planned pinned slot; the copy of that F32
+  and runs it as a CPU `host_task`, submitted at prefetch with no device
+  dependency (a cross-queue dependency would block the submitting thread,
+  `llama.cpp-c6ah`): it waits for its IO ticket on a runtime thread, and
+  dequantizes into a planned pinned slot; the copy of that F32
   activation to the device is enqueued just before the consumer, with an event
   edge on the host task. There is no scheduler split and no host wait on
   the GPU path, which removes `llama.cpp-x1xd` and `llama.cpp-jhxq` from this
@@ -951,7 +953,8 @@ landing slot { uint32 epoch; ticket * owner; }   // depth 2 per table per contex
   row, 84-170 B. That removes any window in which another context could evict
   it. A **miss** registers a waiter in the in-flight table, joining a pending
   read or queuing a new one. `outstanding` is the number of waiters this ticket
-  registered.
+  registered. For a STORAGE table `prefetch` then submits the gather's host
+  task (§7.2, step 1), with no device dependency.
 - **The reaper**, the worker whose read completed (or the io_uring CQ reader),
   removes the entry from the in-flight table, then handles each waiter: if the
   waiter's epoch still equals its slot's epoch and its ticket is not
@@ -1027,9 +1030,14 @@ landing slot { uint32 epoch; ticket * owner; }   // depth 2 per table per contex
    place. §7.2 pre-registers four probes (HT-1 to HT-4) that T7 runs first,
    through the lead; HT-3 is this case. If any fails, the completion signal
    moves to the reaper and a host-signalled Level Zero event (D6-M, §13).
-7. **The output slot's reuse check** (§7.2): the side thread, never the
+7. **The output slot's reuse check** (§7.2): the host task's thread, never the
    submitting thread, waits for the device, and only when the device runs two
    ubatches behind the host.
+8. **The landing slot's reuse check** (§7.2): `prefetch(k+2)` waits on the
+   submitting thread for ubatch `k`'s host task to consume its slot, which
+   happens only when ubatch `k`'s storage IO is still outstanding two ubatches
+   later. It is a wait on storage IO, not on the GPU, and `slot_wait_ns`
+   counts it.
 
 <a id="th32-windows"></a>
 ### 5.4 The prefetch window
@@ -1037,11 +1045,10 @@ landing slot { uint32 epoch; ticket * owner; }   // depth 2 per table per contex
 - **When the IO starts.** Every table's reads are issued by `lazy_prefetch()`
   right after `set_inputs()` (§7.5), before the graph is submitted.
 - **When it must be done.** With the SYCL-owned gather, the deadline is the
-  moment the device reaches the consumer's event edge (§7.2). The node's
-  position in the graph decides only when the dequant runs, not when the IO
-  starts, so the provider places the node at the **head of the consumer
-  device's first split** (§7.2). The dequant then overlaps the preceding blocks
-  too.
+  moment the device reaches the copy before the consumer (§7.2). The host task
+  that dequantizes is submitted at prefetch too, with no device dependency, so
+  the dequant runs as soon as the rows have landed and overlaps the preceding
+  blocks as well. The node's position in the graph affects neither.
 
   | table | residency here | issued | needed before | window |
   |---|---|---|---|---|
@@ -1351,20 +1358,30 @@ ggml_tensor * llm_graph_context::build_lazy_get_rows(ggml_tensor * lazy, ggml_te
   against it. So the layer loop gets a `lazy_expand_for_layer(il)` call at the
   top of each iteration, and the helper defers the expand to the first layer
   on the consumer device. No new split is created in either case.
-- **The window does not depend on the position.** The IO was issued at
-  `set_input` (§5.4), and the device waits only at the consumer (§7.2), so
-  heading the split costs `blk.14` nothing.
+- **The window does not depend on the position.** The IO and the host task
+  that dequantizes it are both started at prefetch (§5.4, §7.2), and the
+  device waits only at the copy before the consumer, so the node's position
+  changes nothing that runs; it only has to keep the split structure intact.
 
 ### 7.2 The SYCL-owned STORAGE gather (*lead ruling §T1*, D6(c))
 
-When the backend reaches the gather node, it submits:
-
-1. **A `host_task` on a per-context, per-device side queue** (in-order, same
-   SYCL context as the main queue), with **no** `depends_on`. It waits for its
-   ticket (§5.3), then dequantizes the landing slab's rows into the
-   context's pinned `LAZY_OUTPUT` slot (§3.3) through the type's `to_float`
-   trait. Nothing else runs on the side queue.
-2. Nothing more at that point. The main queue proceeds with block 0 at once.
+1. **At prefetch time, a `host_task` on a per-context, per-device
+   out-of-order host queue** (same SYCL context as the main queue), with
+   **no** `depends_on`. `prefetch` (§5.3) submits it right after it has
+   queued the table's reads, from `lazy_prefetch()`, before the graph is
+   submitted (§7.5). Its inputs are host data that is complete at `set_input`,
+   so it has nothing on the device to depend on. It waits for its ticket, then
+   dequantizes the landing slab's rows into the context's pinned `LAZY_OUTPUT`
+   slot (§3.3) through the type's `to_float` trait. Nothing else runs on that
+   queue. A `host_task` whose `depends_on` names an in-flight event from
+   another queue blocks the *submitting* thread until that event completes
+   (measured on both cards for `llama.cpp-c6ah`, 2026-09-09, 6/6 reps). Had
+   `blk.14`'s host task depended on device work, submitting it would have held
+   the host until blocks 0-13 finished, and blocks 14-39 would have been
+   submitted late. This construction never gives it a device dependency.
+2. **The gather node itself dispatches nothing**, in direct and in record
+   mode: its work was submitted at prefetch, and its `dst` is written by the
+   copy below. The main queue proceeds with block 0 at once.
 
 Before the **first node (or fused group) that reads the gather's `dst`**, the
 backend enqueues, on the **main in-order queue**:
@@ -1380,17 +1397,25 @@ Rules around it:
 
 - **The output slot is reused only after its copy completed.** It has depth 2
   (§3.3), and slot `k` is written again by ubatch `k+2`'s host task on the
-  side queue. Nothing orders that host task after ubatch `k`'s copy on the
+  host queue. Nothing orders that host task after ubatch `k`'s copy on the
   main queue, and the host may run two ubatches ahead of the device, so T7
   adds the edge. It must not do that with a
-  `depends_on`: a `host_task` whose `depends_on` names an in-flight event from
-  another queue blocks the *submitting* thread until that event completes
-  (measured on both cards for `llama.cpp-c6ah`, 2026-09-09). Instead, a device
+  `depends_on`, for the reason in step 1. Instead, a device
   **marker** kernel after the copy writes the slot's epoch into a host-USM word
   (pinned, from the same `LAZY_OUTPUT` allocation), and the host task checks
   that word before it writes. It is set by the time it is read unless the
-  device runs two ubatches behind the host; then the side thread, never the
-  submitting thread, waits for it. That is a named wait (§5.3, item 7).
+  device runs two ubatches behind the host; then the host task's thread, never
+  the submitting thread, waits for it. That is the CPU executor waiting on its
+  own output slot, a named wait (§5.3, item 7).
+- **The landing slot is reused only after its host task consumed it.** Slot
+  `k mod 2` of the landing slab is reassigned by `prefetch(k+2)`, which copies
+  that ubatch's hits into it at once (§5.3). The host task of ubatch `k` sets
+  the slot's `consumed_epoch` (a host atomic) when its dequant is done, and
+  `prefetch(k+2)` checks it before writing. If ubatch `k`'s IO is still
+  outstanding two ubatches later, `prefetch` waits for it on the submitting
+  thread. That is a wait on **storage IO** through the CPU executor, never on
+  the GPU, and it is counted (`slot_wait_ns`, §10) and named (§5.3, item 8).
+  With a phase-2 lookahead slot in use the same rule applies to depth 2.
 - **Fusion.** The fusion matchers skip a node whose source is a lazy
   gather's `dst` until its copy has been enqueued, and never fuse the gather
   node itself.
@@ -1427,9 +1452,9 @@ program with no model, a few seconds long, on `level_zero:0` and then
 
 | probe | construction | pass |
 |---|---|---|
-| HT-1 | side queue: host task sleeping 200 ms, no deps. Main queue: kernel K1 (~1 ms), copy `depends_on(host task)`, then kernels K2..K50 | every `submit`, including K2..K50's, returns in < 1 ms (the host thread is not held by the pending dependency); K1 completes at ~1 ms, not ~200 ms; K2 starts after the host task |
+| HT-1 | host queue: host task sleeping 200 ms, no deps. Main queue: kernel K1 (~1 ms), copy `depends_on(host task)`, a kernel K1b also `depends_on(host task)`, then kernels K2..K50 | every `submit`, including the copy's, K1b's and K2..K50's, returns in < 1 ms (a device command that depends on a host task does not hold the submitting thread); K1 completes at ~1 ms, not ~200 ms; K2 starts after the host task |
 | HT-2 | HT-1 with a recorded command graph replayed on the main queue after the copy | the replay's submit returns in < 1 ms; its kernels run after the copy |
-| HT-3 | two side queues: host task A sleeps 2 s, host task B 10 ms, submitted A then B | B completes at ~10 ms. If not, the runtime's host-task pool is 1 thread and a cold PP gather would stall another context's decode gather |
+| HT-3 | one out-of-order host queue and a second one: host task A sleeps 2 s, host task B 10 ms, submitted A then B, both on the same queue and then on different queues | B completes at ~10 ms in both. If not, the runtime's host-task pool is 1 thread and a cold PP gather would stall another table's or another context's gather |
 | HT-4 | HT-1 repeated 10000 times | no crash, no Level Zero error, no event-handle anomaly (the `:32755` failure), `Shmem` flat |
 
 - If all four pass, T7 builds on `host_task`, as ruled.
@@ -1500,13 +1525,13 @@ segment boundary.**
   replays with directly dispatched nodes (`ggml-sycl.cpp:97186-97270`, the
   `MUL_MAT_ID` boundaries collected by `moe_graph_collect_dispatch_indices`).
   T7 widens that collector to a **boundary set** = the MoE dispatch indices
-  plus, for each STORAGE gather, the gather node and the first node that
-  reads its `dst`. At a gather boundary the backend submits §7.2 step 1; at a
-  consumer boundary, step 3; the segments between replay as today.
-- **What it costs.** Nothing on DeepSeek. The gather heads its split, so its
-  boundary cuts off an empty segment, and the consumer boundary falls inside
-  a segment that already ends at the previous layer's `MUL_MAT_ID`, so it adds
-  one segment per consumer (two per graph). The replay-count cap
+  plus, for each STORAGE gather, the first node that reads its `dst`. At that
+  boundary the backend submits §7.2 step 3; the gather node itself is a no-op
+  in both modes (its host task was submitted at prefetch), and the segments
+  between boundaries replay as today.
+- **What it costs.** On DeepSeek, one extra segment per consumer (two per
+  graph): each consumer boundary falls inside a segment that already ends at
+  the previous layer's `MUL_MAT_ID`. The replay-count cap
   (`MAX_PROFITABLE_SEGMENT_GRAPHS = 8`, `:97249`) applies to the total, and T7
   must show the DeepSeek decode graph stays under it or raise the cap with a
   measurement.
@@ -1520,7 +1545,12 @@ segment boundary.**
     warm-up value;
   - `full_replay` and `seg_replay` are not both zero on a decode run;
   - zero `[SYCL-GRAPH] replay futility` WARN lines;
-  - T8's `lazy_boundary_dispatches` counter equals `2 x tables x graphs`.
+  - T8's `lazy_boundary_dispatches` counter equals `tables x graphs`;
+  - **submission runs ahead** (the `llama.cpp-c6ah` failure mode): the first
+    kernel of block 15 is *submitted* before block 13 *completes*, from host
+    submit timestamps against the profiled completion of block 13's last
+    kernel, on at least 95% of decode graphs. A host task that picked up a
+    device dependency, or a copy whose submit blocks, fails this.
 
   A run that fails any of these is scored as record mode disengaged, and its
   timing is not used.
@@ -1571,8 +1601,8 @@ and never reaches `llama-bench` or `llama-perplexity`).
   - **S-warm**: steady state after at least 25% of a same-domain stream.
   - **S-hot**: the same text replayed with a cache at least as large as its
     distinct rows.
-- **The DeepSeek position arms** A, B, C (§8.4), selected at run time by a
-  diagnostic variable `GGML_SYCL_LAZY_GATHER_ARM=A|B|C` (default A), documented
+- **The DeepSeek executor arms** A and C (§8.4), selected at run time by a
+  diagnostic variable `GGML_SYCL_LAZY_GATHER_ARM=A|C` (default A), documented
   in `docs/backend/sycl-env-vars.md` and removed once T9d has decided. It
   changes the graph, not the build.
 
@@ -1588,7 +1618,7 @@ engagement is shown, because an absence of work looks exactly like success:
 
 **Correctness gate, every arm.** Greedy decode (`--temp 0 --seed 42`, 64
 tokens) must be **token-identical** across H, S and `--lazy-mode off` for Qwen,
-and across A, B, C for DeepSeek. All paths dequantize the same rows through the
+and across A and C for DeepSeek. All paths dequantize the same rows through the
 same `to_float` trait, so the F32 activations are bitwise equal and any token
 difference is a defect, not noise. DeepSeek additionally passes `9g22`'s CPU
 oracle gate.
@@ -1700,20 +1730,23 @@ position; these arms test that decision rather than assume it:
 
 | arm | STORAGE gather | host waits on the path | predicted |
 |---|---|---|---|
-| **A** (the design) | SYCL gather at the head of the consumer device's first split (§7.1) | none (§5.3) | best or tied |
-| B | SYCL gather expanded right before its consumer block | none; adds one segment boundary mid-graph | ties A within noise: the IO starts at `set_input` either way, and only the dequant moves |
+| **A** (the design) | SYCL-owned gather (§7.2): host task at prefetch, event-edged copy before the consumer | none on the GPU path (§5.3) | best or tied |
 | C | upstream order: the gather as the CPU op in the leading split, the HOST executor applied to STORAGE | the submitting thread waits for the IO before layer 0 is submitted | loses the whole window: ~7-11 ms per cold token; wins nothing on a fully hot cache |
 
-- **Witness on every arm**: the §7.4 record-mode witness (C has no SYCL gather,
-  so its witness is the same counters with `lazy_boundary_dispatches == 0`),
-  plus the scheduler's split count per graph (`GGML_SCHED_DEBUG`), which must
-  be the same for A, B and C: none of them may add a split.
+- **No arm B.** r1's B ("expand right before the consumer") is identical to A
+  now: the host task is submitted at prefetch whatever the node's position,
+  and the copy always sits before the consumer, so moving the node changes
+  nothing that runs.
+- **Witness on every arm**: the §7.4 record-mode witness, including its
+  submission-runs-ahead check (C has no SYCL gather, so its witness is the
+  same counters with `lazy_boundary_dispatches == 0`), plus the scheduler's
+  split count per graph (`GGML_SCHED_DEBUG`), which must be the same for A
+  and C: neither may add a split.
 - **Protocol**: S-warm prose (wikitext-2 test through `llama-perplexity` for
-  PP, the §8.5 decode vehicle for tg), **5 ABBA quads** per comparison (A vs B,
-  A vs C), one process per run under P0-P7, B70 tg being the noisy axis (cv
-  3.3%).
-- **Decision rule, fixed now**: B or C replaces A only if its **median paired
-  tg over the 10 pairs beats A's by >= 2%**. Anything less is a tie, and a tie
+  PP, the §8.5 decode vehicle for tg), **5 ABBA quads** of A against C, one
+  process per run under P0-P7, B70 tg being the noisy axis (cv 3.3%).
+- **Decision rule, fixed now**: C replaces A only if its **median paired tg
+  over the 10 pairs beats A's by >= 2%**. Anything less is a tie, and a tie
   goes to the arm with fewer host waits, which is A.
 
 **DSpark** (I9). The draft adds +7.9 GiB of host memory (`9g22` §10.3), which is
@@ -1823,7 +1856,7 @@ consumes this contract and links here for it; this section is the one source.
    model does **not** choose where the gather sits or what runs it. The
    helper places a HOST gather in the leading split as a CPU op, and a STORAGE
    gather at the head of the consumer device's first split as a SYCL-owned op
-   (§7.1), and §8.4's arms may move it. A consumer must not hard-code "before
+   (§7.1), and §8.4's arms test that choice. A consumer must not hard-code "before
    block N": that is the r1 contract, withdrawn.
 6. **Optional lookahead.** `peek_rows(next_ubatch, tail)` returns the next
    ubatch's rows from the model's sequence state, so the IO of ubatch `k+1`
@@ -1836,9 +1869,9 @@ The SYCL side of the same interface:
 |---|---|---|
 | `lazy_table` | model-scoped unified-cache object, keyed by the weight's `ggml_sycl_cache_id`; refcounted by the descriptor buffer and every outstanding ticket; llama holds only the descriptor buffer, never a row pointer | the unified cache (§3.2) |
 | descriptor buffer | `ggml_backend_sycl_lazy_buffer_type(consumer device)`: sentinel base, nominal size, `WEIGHTS` usage | the model, like any weight buffer (§3.2) |
-| `lazy_gather_ctx` | per context, per table: the landing slab, the output slot (STORAGE), the side queue, the current ticket | its `mem_handle`s, released in its destructor |
+| `lazy_gather_ctx` | per context, per table: the landing slab, the output slot (STORAGE), the host queue, the current ticket | its `mem_handle`s, released in its destructor |
 | block ring | per context, shared by its tables | a `mem_handle` |
-| `prefetch(gather_ctx, rows, n, class) -> ticket` | called by `lazy_prefetch()` after `set_inputs()` (§7.5) | |
+| `prefetch(gather_ctx, rows, n, class) -> ticket` | called by `lazy_prefetch()` after `set_inputs()` (§7.5); for STORAGE it also submits the gather's host task, with no device dependency (§7.2) | |
 | the gather | HOST: CPU custom op (§7.1). STORAGE: SYCL host task + event-edged copy (§7.2) | th32 owns it (*lead ruling §T1*, D6(c)) |
 
 ### 9.2 Hosting cold routed experts later (not phase 1)
@@ -1932,7 +1965,7 @@ own targets from this measurement when DSpark lands.
   `rows_requested`, `rows_hit`, `rows_miss`, `rows_joined`, `blocks_read`,
   `bytes_read`, `stall_ns_total` (`T_ticket`), `stall_ns_max`,
   `gather_ns_total` (`T_gather`), `ubatches`, `tickets_cancelled`,
-  `chunks_yielded`, `lazy_boundary_dispatches`. Per pool: `class0_reads`,
+  `chunks_yielded`, `lazy_boundary_dispatches`, `slot_wait_ns`. Per pool: `class0_reads`,
   `class1_reads`, `inflight_joins`.
 - **Definitions** (M5), chosen so that runtime counts match the simulation's
   per-reference counting:
@@ -1967,11 +2000,11 @@ Each ticket names the RED that must fail before its code exists (*lead ruling
 | T5 | the IO engine: pread pool, priority classes, per-context fairness, in-flight dedup, tickets with epochs, landing slabs, block ring | T4 | the abort-mid-ubatch fixture of §5.3 (slot 0 must hold ticket B's rows exactly); a head-of-line fixture (the `batch_probe3 hol` shape against a file fixture) where class-0 completion must not wait for class-0 reads of another context queued earlier | CPU-only |
 | T6 | llama side: loader SYCL branch for `TENSOR_READ_LAZY` (independent of `mmap_support`, resolved before upstream's `AUTO`->`OFF`), SYCL device reports `mmap_support = true`, `lazy_table_info` declaration, `build_lazy_get_rows` + HOST custom op + `lazy_expand_for_layer` + `lazy_prefetch()` + the post-build consumer scan, gemma4's const-row input class; qwen4exp and gemma4 declarations | T4, T5, `llama.cpp-n77l` | (a) with `AUTO` and a device reporting `mmap_support = false`, the dual-card config still prints `[PLACEMENT] lazy ... residency=`; (b) a graph with a `ggml_view_1d` of a lazy tensor fails the build naming it | `deepseek41` follows the §9.1 contract in `llama.cpp-9g22`'s own tickets |
 | T6b | llama handling of the descriptor buffer: memory breakdown and model size report resident bytes, `load_all_data` skips the tensor in its mapping branch, including the mlock growth there (`694ec2354 src/llama-model-loader.cpp:1640-1662`, whose `lazy.has(cur)` tests the mmap lazy set this design no longer fills) | T6 | a load of a lazy-table fixture reports model size equal to the resident bytes, and `load_all_data` reads zero bytes of the table | |
-| T7 | the SYCL-owned STORAGE gather: lazy `GET_ROWS` recognition, the side-queue host task, the event-edged copy, the output-slot reuse marker, fusion exclusion, the record-mode segment boundary (§7.4) | T5, T6 | **first the four probes HT-1..HT-4 (§7.2), lead-run, GPU**; then a record-mode fixture: a graph with a lazy gather must replay with `seg_replay > 0`, zero futility WARNs, and `lazy_boundary_dispatches == 2 x graphs` | if a probe fails, D6-M (b) replaces the host task before anything else is built |
+| T7 | the SYCL-owned STORAGE gather: lazy `GET_ROWS` recognition, the side-queue host task, the event-edged copy, the output-slot reuse marker, fusion exclusion, the record-mode segment boundary (§7.4) | T5, T6 | **first the four probes HT-1..HT-4 (§7.2), lead-run, GPU**; then a record-mode fixture: a graph with a lazy gather must replay with `seg_replay > 0`, zero futility WARNs, and `lazy_boundary_dispatches == graphs` per table; and the §7.4 submission-runs-ahead check on a two-table fixture | if a probe fails, D6-M (b) replaces the host task before anything else is built |
 | T8 | counters (unconditional), their definitions (§10), and CPU-only unit tests, with both hash harnesses of Appendix B as fixtures | T5, T6 | a counter test where a repeated row in one ubatch counts as a join and a hit, and a same-block different row counts as a miss with no extra read | |
 | T9q | Qwen acceptance against §8.2-8.3: H, S-cold, S-warm, S-hot, the correctness gate, the positive and negative controls, the engine ratio (GPU) | T7, T8 | an `--lazy-mode off` run must fail the engagement check (the negative control proves the check can fail) | |
 | T10 | `peek_rows` lookahead (class 1, depth 2) | T9q | a lookahead fixture where rows missed by ubatch `k` and `k+1` are read once | required for DeepSeek (D9) |
-| T9d | DeepSeek acceptance against §8.4: S arms, position arms A/B/C, bucketed decode, the runtime-vs-simulation match, inside `9g22`'s P0-P7 (GPU) | T10, the `deepseek41` runtime (`9g22` T6, T11), `9g22` gates 1-4 | the §8.4 witness must fail on an arm run with `GGML_SYCL_DISABLE_GRAPH=1` (record mode off: `seg_replay == 0`) | only if §4.5 lets the model load (D8) |
+| T9d | DeepSeek acceptance against §8.4: S arms, executor arms A/C, the submission-runs-ahead check, bucketed decode, the runtime-vs-simulation match, inside `9g22`'s P0-P7 (GPU) | T10, the `deepseek41` runtime (`9g22` T6, T11), `9g22` gates 1-4 | the §8.4 witness must fail on an arm run with `GGML_SYCL_DISABLE_GRAPH=1` (record mode off: `seg_replay == 0`) | only if §4.5 lets the model load (D8) |
 | T11 | optional: `io_uring` engine | T9q | engine ratio on the ext4 NVMe reference must exceed the pool's | |
 
 **Existing tickets this design depends on or leaves open:**
@@ -2066,7 +2099,7 @@ owner's filesystem policy, and this design does not propose it for v1.
 **D5. Where is each gather placed? Ruled** (*lead ruling §T1*, C2): the
 provider decides, by residency. HOST gathers stay in the leading `inp_embd`
 split as a CPU op; STORAGE gathers head the consumer device's first split as a
-SYCL-owned op (§7.1). §8.4's arms A/B/C test the STORAGE position with a fixed
+SYCL-owned op (§7.1). §8.4's arms A and C test the STORAGE executor with a fixed
 decision rule. r1's "expand before each consumer block" is withdrawn.
 
 **D6. Who executes the STORAGE gather? Ruled** (*lead ruling §T1*, D6(c)): the
