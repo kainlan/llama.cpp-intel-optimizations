@@ -1248,9 +1248,12 @@ vram_budget_authority compute_vram_budget_authority(bool   host_unified,
 // auto-calculate path: those getters silently return default-initialized
 // values in that case, not a resolved authority. This is now the only
 // place that distinction is checked.
-vram_budget_authority ggml_sycl_device_budget_authority(int device, size_t total_mem, size_t free_mem,
-                                                         int default_pct) {
-    if (unified_cache * cache = get_unified_cache_for_device(device); cache && cache->authority_resolved()) {
+static vram_budget_authority device_budget_authority_from(unified_cache * cache,
+                                                          int             device,
+                                                          size_t          total_mem,
+                                                          size_t          free_mem,
+                                                          int             default_pct) {
+    if (cache && cache->authority_resolved()) {
         vram_budget_authority result;
         result.budget_pct        = cache->budget_pct();
         result.base_mem          = cache->authority_base_mem();
@@ -1261,6 +1264,21 @@ vram_budget_authority ggml_sycl_device_budget_authority(int device, size_t total
     const bool host_unified =
         (device >= 0 && device < GGML_SYCL_MAX_DEVICES) && ggml_sycl_info().devices[device].host_unified_memory;
     return compute_vram_budget_authority(host_unified, total_mem, free_mem, /*free_vram_at_init_in=*/0, default_pct);
+}
+
+vram_budget_authority ggml_sycl_device_budget_authority(int    device,
+                                                        size_t total_mem,
+                                                        size_t free_mem,
+                                                        int    default_pct) {
+    return device_budget_authority_from(get_unified_cache_for_device(device), device, total_mem, free_mem, default_pct);
+}
+
+vram_budget_authority ggml_sycl_existing_device_budget_authority(int    device,
+                                                                 size_t total_mem,
+                                                                 size_t free_mem,
+                                                                 int    default_pct) {
+    return device_budget_authority_from(get_existing_unified_cache_for_device(device), device, total_mem, free_mem,
+                                        default_pct);
 }
 
 static uint32_t pp_moe_onednn_effective_ring_depth(uint32_t requested_ring_depth) {

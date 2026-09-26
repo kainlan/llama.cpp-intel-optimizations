@@ -1351,6 +1351,42 @@ TEST(ubatch_device_set_key_order_and_stability) {
     return true;
 }
 
+// Test: a collapsed split (scheduler [0], device 1 hidden) and a
+// SPLIT_RATIO/TENSOR_SPLIT split (scheduler [0, 1]) involve the same devices
+// but not the same demand -- only the latter puts compute buffers on device
+// 1 -- so they must not share a key.
+TEST(ubatch_device_set_key_collapsed_split_differs_from_visible_split) {
+    const std::vector<UbatchDeviceIdentity> ids       = { ubatch_test_identity(k_b70, 100),
+                                                          ubatch_test_identity(k_b50, 100) };
+    const UbatchDeviceTopology              collapsed = ubatch_test_topology({ 0 }, 1, 2, true);
+    const UbatchDeviceTopology              visible   = ubatch_test_topology({ 0, 1 }, 2, 2, true);
+    ASSERT(ubatch_participating_devices(collapsed) == ubatch_participating_devices(visible));
+    const std::string collapsed_key = ubatch_device_set_key(collapsed, ids);
+    const std::string visible_key   = ubatch_device_set_key(visible, ids);
+    ASSERT(!collapsed_key.empty());
+    ASSERT(collapsed_key != visible_key);
+    ASSERT(collapsed_key.find("hidden:") != std::string::npos);
+    ASSERT(visible_key.find("hidden:") == std::string::npos);
+    return true;
+}
+
+// Test: the multi-GPU placement knobs divide work across the same devices
+// differently, so each set value is keyed; an unset one adds nothing, which
+// keeps a single-device key free of them.
+TEST(ubatch_device_set_key_includes_placement_config) {
+    const std::vector<UbatchDeviceIdentity> ids       = { ubatch_test_identity(k_b70, 100),
+                                                          ubatch_test_identity(k_b50, 100) };
+    UbatchDeviceTopology                    layer     = ubatch_test_topology({ 0 }, 1, 2, true);
+    UbatchDeviceTopology                    hybrid    = layer;
+    const std::string                       unset_key = ubatch_device_set_key(layer, ids);
+    layer.placement_config                            = "mode=layer";
+    hybrid.placement_config                           = "mode=hybrid";
+    ASSERT(ubatch_device_set_key(layer, ids) != unset_key);
+    ASSERT(ubatch_device_set_key(layer, ids) != ubatch_device_set_key(hybrid, ids));
+    ASSERT(unset_key.find('|') == std::string::npos);
+    return true;
+}
+
 // Test: a hidden GPU that the placement planner does not use (multi-GPU
 // placement disabled) is not part of the set, so that run shares the
 // first-card-alone entry.
@@ -1442,6 +1478,8 @@ int main() {
     RUN_TEST(ubatch_device_set_key_includes_budget);
     RUN_TEST(ubatch_device_set_key_identifies_every_device);
     RUN_TEST(ubatch_device_set_key_order_and_stability);
+    RUN_TEST(ubatch_device_set_key_collapsed_split_differs_from_visible_split);
+    RUN_TEST(ubatch_device_set_key_includes_placement_config);
     RUN_TEST(ubatch_device_set_key_idle_hidden_gpu_is_not_keyed);
     RUN_TEST(ubatch_participating_devices_order);
 

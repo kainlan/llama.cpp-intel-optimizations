@@ -385,16 +385,16 @@ static decltype(&ggml_backend_sycl_ubatch_cache_path) llama_context_sycl_ubatch_
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_path"));
 }
 
-static decltype(&ggml_backend_sycl_ubatch_cache_lookup) llama_context_sycl_ubatch_cache_lookup_proc(
+static decltype(&ggml_backend_sycl_ubatch_cache_lookup_v5) llama_context_sycl_ubatch_cache_lookup_proc(
     ggml_backend_dev_t dev) {
-    return reinterpret_cast<decltype(&ggml_backend_sycl_ubatch_cache_lookup)>(
-        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_lookup"));
+    return reinterpret_cast<decltype(&ggml_backend_sycl_ubatch_cache_lookup_v5)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_lookup_v5"));
 }
 
-static decltype(&ggml_backend_sycl_ubatch_cache_store) llama_context_sycl_ubatch_cache_store_proc(
+static decltype(&ggml_backend_sycl_ubatch_cache_store_v5) llama_context_sycl_ubatch_cache_store_proc(
     ggml_backend_dev_t dev) {
-    return reinterpret_cast<decltype(&ggml_backend_sycl_ubatch_cache_store)>(
-        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_store"));
+    return reinterpret_cast<decltype(&ggml_backend_sycl_ubatch_cache_store_v5)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_store_v5"));
 }
 #endif
 
@@ -1635,8 +1635,8 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
 #    ifdef GGML_USE_SYCL
     auto cache_enabled_fn = &ggml_backend_sycl_ubatch_cache_enabled;
     auto cache_path_fn    = &ggml_backend_sycl_ubatch_cache_path;
-    auto cache_lookup_fn  = &ggml_backend_sycl_ubatch_cache_lookup;
-    auto cache_store_fn   = &ggml_backend_sycl_ubatch_cache_store;
+    auto cache_lookup_fn  = &ggml_backend_sycl_ubatch_cache_lookup_v5;
+    auto cache_store_fn   = &ggml_backend_sycl_ubatch_cache_store_v5;
 #    else
     auto cache_enabled_fn = llama_context_sycl_ubatch_cache_enabled_proc(first_dev);
     auto cache_path_fn    = llama_context_sycl_ubatch_cache_path_proc(first_dev);

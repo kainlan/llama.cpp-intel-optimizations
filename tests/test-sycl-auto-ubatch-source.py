@@ -1636,19 +1636,19 @@ def test_header_declares_the_ubatch_cache_key_and_four_accessors():
     # quality round 1, Q2: lookup gained a reason_buf/reason_buf_size pair so
     # the caller can tell a TERMINAL cached outcome from a transient one.
     assert re.search(
-        r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_lookup\s*\(\s*const\s+struct\s+"
+        r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_lookup_v5\s*\(\s*const\s+struct\s+"
         r"ggml_sycl_ubatch_cache_key\s*\*\s*key\s*,\s*uint32_t\s*\*\s*n_ubatch\s*,\s*char\s*\*\s*reason_buf\s*,"
         r"\s*size_t\s+reason_buf_size\s*\)\s*;",
         GGML_SYCL_H_CODE,
     ), (
-        "ggml_backend_sycl_ubatch_cache_lookup(const ggml_sycl_ubatch_cache_key*, uint32_t*, char*, size_t) must "
+        "ggml_backend_sycl_ubatch_cache_lookup_v5(const ggml_sycl_ubatch_cache_key*, uint32_t*, char*, size_t) must "
         "be declared"
     )
     assert re.search(
-        r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_store\s*\(\s*const\s+struct\s+"
+        r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_store_v5\s*\(\s*const\s+struct\s+"
         r"ggml_sycl_ubatch_cache_key\s*\*\s*key\s*,\s*uint32_t\s+n_ubatch\s*,\s*const\s+char\s*\*\s*reason\s*\)\s*;",
         GGML_SYCL_H_CODE,
-    ), "ggml_backend_sycl_ubatch_cache_store(const ggml_sycl_ubatch_cache_key*, uint32_t, const char*) must be declared"
+    ), "ggml_backend_sycl_ubatch_cache_store_v5(const ggml_sycl_ubatch_cache_key*, uint32_t, const char*) must be declared"
 
 
 def test_proc_address_registers_the_four_ubatch_cache_accessors():
@@ -1658,8 +1658,8 @@ def test_proc_address_registers_the_four_ubatch_cache_accessors():
     for symbol in (
         "ggml_backend_sycl_ubatch_cache_enabled",
         "ggml_backend_sycl_ubatch_cache_path",
-        "ggml_backend_sycl_ubatch_cache_lookup",
-        "ggml_backend_sycl_ubatch_cache_store",
+        "ggml_backend_sycl_ubatch_cache_lookup_v5",
+        "ggml_backend_sycl_ubatch_cache_store_v5",
     ):
         assert re.search(
             rf'strcmp\(\s*name\s*,\s*"{symbol}"\s*\)\s*==\s*0\s*\)\s*\{{\s*'
@@ -1722,13 +1722,13 @@ def test_ubatch_cache_disabled_by_env_var_zero():
         UBATCH_TUNING_CACHE_CPP_CODE,
     ), 'GGML_SYCL_TUNING_CACHE="0" must return false (disabled) from the memoized accessor'
     assert re.search(
-        r"ggml_backend_sycl_ubatch_cache_lookup[\s\S]{0,400}?ubatch_tuning_cache_env_enabled\s*\(\s*\)",
+        r"ggml_backend_sycl_ubatch_cache_lookup_v5[\s\S]{0,400}?ubatch_tuning_cache_env_enabled\s*\(\s*\)",
         UBATCH_TUNING_CACHE_CPP_CODE,
-    ), "ggml_backend_sycl_ubatch_cache_lookup must consult the enabled accessor before doing anything else"
+    ), "ggml_backend_sycl_ubatch_cache_lookup_v5 must consult the enabled accessor before doing anything else"
     assert re.search(
-        r"ggml_backend_sycl_ubatch_cache_store[\s\S]{0,400}?ubatch_tuning_cache_env_enabled\s*\(\s*\)",
+        r"ggml_backend_sycl_ubatch_cache_store_v5[\s\S]{0,400}?ubatch_tuning_cache_env_enabled\s*\(\s*\)",
         UBATCH_TUNING_CACHE_CPP_CODE,
-    ), "ggml_backend_sycl_ubatch_cache_store must consult the enabled accessor before doing anything else"
+    ), "ggml_backend_sycl_ubatch_cache_store_v5 must consult the enabled accessor before doing anything else"
 
 
 def test_ubatch_cache_lookup_and_store_have_mutation_witnesses():
@@ -1938,13 +1938,22 @@ def test_backend_extends_the_device_set_with_hidden_planner_gpus():
          "the planner's own multi-GPU gate"),
         (r"for\s*\(\s*int\s+device\s*:\s*ubatch_participating_devices\s*\(\s*topo\s*\)\s*\)",
          "a walk over the participating devices"),
-        (r"ggml_sycl::ggml_sycl_device_budget_authority\s*\(", "each device's budget authority"),
+        (r"ggml_sycl::ggml_sycl_existing_device_budget_authority\s*\(",
+         "each device's budget authority, read without constructing a cache"),
         (r"id\.budget_pct\s*=\s*budget\.budget_pct\s*;", "the budget percentage"),
         (r"id\.external_headroom\s*=\s*budget\.external_headroom\s*;", "the external headroom"),
         (r"out_device_key\s*=\s*ubatch_device_set_key\s*\(\s*topo\s*,\s*identities\s*\)\s*;",
          "the composed device-set key"),
     ):
         assert re.search(pattern, code), f"resolve_device_set_key() must use {what} ({pattern!r})"
+    # A key read must never create a cache for a hidden GPU as a side effect.
+    assert not re.search(r"ggml_sycl::ggml_sycl_device_budget_authority\s*\(", code), (
+        "resolve_device_set_key() must use the non-creating budget authority"
+    )
+    # The split itself is keyed: mode and ratio change each card's share.
+    for env in ("GGML_SYCL_MULTI_GPU_MODE", "GGML_SYCL_SPLIT_RATIO", "GGML_SYCL_TENSOR_SPLIT"):
+        assert f'"{env}"' in code, f"the placement config in the key must include {env}"
+    assert re.search(r"topo\.placement_config\s*\+=", code), "the placement config must be composed into topo"
     # lookup and store both key through it; the path accessor needs only the file name.
     assert len(re.findall(r"resolve_device_set_key\s*\(\s*\*\s*key\s*,", code)) == 2, (
         "both lookup and store must resolve their key through resolve_device_set_key()"
@@ -1963,7 +1972,10 @@ def test_hidden_gpu_gate_holds_for_a_dense_model():
     places a layer block on the B50. If it ever starts consulting the model
     (an expert count, is_moe), a dense split would silently key as its
     first card alone again."""
-    code = _normalize_ws(GGML_SYCL_CPP_CODE)
+    _assert_hidden_gpu_gate_model_independent(_normalize_ws(GGML_SYCL_CPP_CODE))
+
+
+def _assert_hidden_gpu_gate_model_independent(code: str) -> None:
     start = code.find("bool ggml_backend_sycl_moe_multi_gpu_requested() {")
     assert start != -1, "could not find ggml_backend_sycl_moe_multi_gpu_requested()'s definition"
     open_idx = code.index("{", start)
@@ -1979,6 +1991,21 @@ def test_hidden_gpu_gate_holds_for_a_dense_model():
     )
     for model_term in ("n_expert", "is_moe", "g_moe_n_experts_total"):
         assert model_term not in body, f"the hidden-GPU gate must not depend on the model ({model_term})"
+
+
+def test_hidden_gpu_gate_holds_for_a_dense_model_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually catch
+    the gate starting to consult the model's expert count -- the change that
+    would make a dense level_zero:0,1 split key as its first card alone."""
+    raw = GGML_SYCL_CPP
+    target = "    return ggml_sycl_info().total_gpu_count >= 2;\n}\n\n// backend device"
+    assert raw.count(target) == 1, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(
+        target, "    return ggml_sycl_info().total_gpu_count >= 2 && g_moe_n_experts_total > 0;\n}\n\n// backend device", 1
+    )
+    assert mutated_raw != raw
+    with pytest.raises(AssertionError):
+        _assert_hidden_gpu_gate_model_independent(_normalize_ws(strip_comments(mutated_raw)))
 
 
 def test_cache_hit_reads_the_stored_reason():

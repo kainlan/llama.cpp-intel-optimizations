@@ -95,8 +95,9 @@ inline long sycl_tuning_getpid() {
 // layers were sized by that flag at all.
 // v5 (llama.cpp-1oa3): UbatchCacheKey::device_key names every device whose
 // budget decides the fit -- including a GPU the scheduler hides but the
-// placement planner uses -- with each one's budget percentage and external
-// headroom, and device_set_hash (an index hash over the scheduler-visible
+// placement planner uses, marked "hidden:" -- with each one's budget
+// percentage and external headroom, plus the multi-GPU placement knobs that
+// are set, and device_set_hash (an index hash over the scheduler-visible
 // backends only) is gone. A v4 entry's device_key names one card, so a v4
 // B70-alone entry would still be read back for a collapsed level_zero:0,1
 // split; bumping rejects every v4 file instead.
@@ -553,6 +554,11 @@ struct UbatchDeviceTopology {
     // hidden GPUs (ggml_backend_sycl_moe_multi_gpu_requested(), the gate the
     // multi-device plan itself uses).
     bool             hidden_gpus_participate = false;
+    // The multi-GPU placement knobs that are set (GGML_SYCL_MULTI_GPU_MODE,
+    // GGML_SYCL_SPLIT_RATIO, GGML_SYCL_TENSOR_SPLIT), as "name=value" joined
+    // by ';'; empty when none is. They change how work is divided across the
+    // same devices, and so which n_ubatch fits.
+    std::string      placement_config;
 };
 
 // The devices whose budgets decide which n_ubatch fits: the scheduler devices
@@ -574,9 +580,14 @@ inline std::vector<int> ubatch_participating_devices(const UbatchDeviceTopology 
 
 // Compose the participating device set's key:
 // "<sanitized name>@<driver>/pct=<p>/headroom=<bytes>" per device, in order,
-// joined by ','. `identities` is indexed by device index. Returns an empty
-// string when a participating index has no identity, which the caller treats
-// as "no key" rather than composing one that under-describes the set.
+// joined by ','. A device the scheduler hides is prefixed "hidden:": a
+// collapsed level_zero:0,1 split (scheduler [0], device 1 hidden) and a
+// SPLIT_RATIO/TENSOR_SPLIT split (scheduler [0,1]) have the same devices but
+// different demand, since only the latter puts compute buffers on device 1.
+// A non-empty placement_config is appended after '|'. `identities` is
+// indexed by device index. Returns an empty string when a participating
+// index has no identity, which the caller treats as "no key" rather than
+// composing one that under-describes the set.
 inline std::string ubatch_device_set_key(const UbatchDeviceTopology &              topo,
                                          const std::vector<UbatchDeviceIdentity> & identities) {
     const std::vector<int> devices = ubatch_participating_devices(topo);
@@ -589,8 +600,16 @@ inline std::string ubatch_device_set_key(const UbatchDeviceTopology &           
         if (!key.empty()) {
             key += ',';
         }
+        const bool hidden =
+            std::find(topo.scheduler_devices.begin(), topo.scheduler_devices.end(), d) == topo.scheduler_devices.end();
+        if (hidden) {
+            key += "hidden:";
+        }
         key += sanitize_device_name(id.device_name) + "@" + id.driver_version +
                "/pct=" + std::to_string(id.budget_pct) + "/headroom=" + std::to_string(id.external_headroom);
+    }
+    if (!key.empty() && !topo.placement_config.empty()) {
+        key += "|" + topo.placement_config;
     }
     return key;
 }
@@ -598,7 +617,8 @@ inline std::string ubatch_device_set_key(const UbatchDeviceTopology &           
 struct UbatchCacheKey {
     // ubatch_device_set_key() over every participating device, in order:
     // each one's sanitized name, driver version, budget percentage and
-    // external headroom. The name and driver are queried at device init
+    // external headroom, whether the scheduler hides it, and the multi-GPU
+    // placement knobs. The name and driver are queried at device init
     // (ggml-sycl.cpp's ggml_sycl_info() builder) and carried in
     // sycl_device_info next to device_name (common.hpp). No PCI id: it
     // moves across boots on this host (see CLAUDE.md's device-topology

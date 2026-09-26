@@ -127,12 +127,37 @@ bool resolve_device_set_key(const ggml_sycl_ubatch_cache_key & c_key,
     topo.total_gpu_count         = std::min(info.total_gpu_count, GGML_SYCL_MAX_DEVICES);
     topo.hidden_gpus_participate = ggml_backend_sycl_moe_multi_gpu_requested();
 
+    // How the work is divided across that set is as budget-relevant as the
+    // set itself: the same two cards at a different split ratio put a
+    // different share of weights and KV on each.
+    static const char * const placement_env[] = {
+        "GGML_SYCL_MULTI_GPU_MODE",
+        "GGML_SYCL_SPLIT_RATIO",
+        "GGML_SYCL_TENSOR_SPLIT",
+    };
+    for (const char * name : placement_env) {
+        const char * value = std::getenv(name);
+        if (value == nullptr) {
+            continue;
+        }
+        if (!topo.placement_config.empty()) {
+            topo.placement_config += ';';
+        }
+        topo.placement_config += std::string(name) + "=" + value;
+    }
+
     // ggml_sycl_info()'s init fills devices[] for every physical GPU, hidden
     // ones included, so a hidden participant's name and driver are real.
     std::vector<UbatchDeviceIdentity> identities(std::max(info.device_count, topo.total_gpu_count));
+    //
+    // The budget read must not construct a cache: a lookup for a hidden GPU
+    // the planner never registered would otherwise create one as a side
+    // effect. Under GGML_SYCL_UNIFIED_CACHE_MODE=global every device shares
+    // device 0's cache, so device 1 reports device 0's pct and headroom --
+    // deterministic for a given configuration, which is all a key needs.
     for (int device : ubatch_participating_devices(topo)) {
         const auto &                           dev    = info.devices[device];
-        const ggml_sycl::vram_budget_authority budget = ggml_sycl::ggml_sycl_device_budget_authority(
+        const ggml_sycl::vram_budget_authority budget = ggml_sycl::ggml_sycl_existing_device_budget_authority(
             device, dev.total_vram, dev.free_vram_at_init, /*default_pct=*/100);
         UbatchDeviceIdentity & id = identities[device];
         id.device_name            = dev.device_name;
@@ -204,10 +229,10 @@ bool ggml_backend_sycl_ubatch_cache_path(int device, char * buf, size_t buf_size
     return true;
 }
 
-bool ggml_backend_sycl_ubatch_cache_lookup(const ggml_sycl_ubatch_cache_key * key,
-                                           uint32_t *                         n_ubatch,
-                                           char *                             reason_buf,
-                                           size_t                             reason_buf_size) {
+bool ggml_backend_sycl_ubatch_cache_lookup_v5(const ggml_sycl_ubatch_cache_key * key,
+                                              uint32_t *                         n_ubatch,
+                                              char *                             reason_buf,
+                                              size_t                             reason_buf_size) {
     if (key == nullptr || n_ubatch == nullptr || !ubatch_tuning_cache_env_enabled()) {
         return false;
     }
@@ -234,9 +259,9 @@ bool ggml_backend_sycl_ubatch_cache_lookup(const ggml_sycl_ubatch_cache_key * ke
     return false;
 }
 
-bool ggml_backend_sycl_ubatch_cache_store(const ggml_sycl_ubatch_cache_key * key,
-                                          uint32_t                           n_ubatch,
-                                          const char *                       reason) {
+bool ggml_backend_sycl_ubatch_cache_store_v5(const ggml_sycl_ubatch_cache_key * key,
+                                             uint32_t                           n_ubatch,
+                                             const char *                       reason) {
     if (key == nullptr || !ubatch_tuning_cache_env_enabled()) {
         return false;
     }
