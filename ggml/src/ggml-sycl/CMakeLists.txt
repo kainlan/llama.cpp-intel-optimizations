@@ -1754,7 +1754,8 @@ set_tests_properties(sycl-kv-runtime-demotion PROPERTIES
 )
 
 # oneDNN PP placement answers (llama.cpp-1d0n): which devices may run oneDNN PP
-# on a multi-device plan, and whether the plan may add WOQ second copies.
+# on a multi-device plan, and whether the plan may add WOQ second copies; and
+# the admission predicate plus per-route batch floor (llama.cpp-je3b).
 # onednn-pp-placement.hpp is header-only and SYCL-free, like the gate below.
 add_executable(test-onednn-pp-placement
     tests/test-onednn-pp-placement.cpp

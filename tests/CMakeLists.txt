@@ -3147,6 +3147,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# llama.cpp-je3b: source gate -- "may oneDNN PP run here" has one source,
+# ggml_sycl_onednn_pp_candidate. The MXFP4 direct oneDNN arms ask it (with the
+# MXFP4_DIRECT route, which moves only the batch floor) instead of admitting
+# themselves with M >= 2 && executable_on_device. Host-only, reads the sources
+# as text. Same registration shape as test-sycl-onednn-woq-q8-source.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-onednn-pp-admission-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-onednn-pp-admission-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
 # llama.cpp-pktr: source gate -- the Q8_0 dense-weight coalesced/SOA
 # tile-alignment predicate must be defined exactly once
 # (q8-dense-layout-rule.hpp) and every chokepoint that resolves a dense Q8_0

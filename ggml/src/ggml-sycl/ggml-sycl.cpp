@@ -27053,10 +27053,17 @@ bool ggml_sycl_dense_woq_alternate_eligible_for_plan(ggml_type                  
                                                        ggml_sycl_onednn_pp_woq_alternates_allowed_for_placement(&plan));
 }
 
-static bool ggml_sycl_onednn_pp_candidate(const ggml_tensor * src0,
-                                          const ggml_tensor * src1,
-                                          const ggml_tensor * dst,
-                                          int                 device) {
+// The one answer to "may oneDNN PP run this op on `device`". Every oneDNN PP
+// arm asks it, so GGML_SYCL_ONEDNN_PP, GGML_SYCL_SKIP_ONEDNN_Q4_0 and the batch
+// floor bind everywhere (llama.cpp-je3b: the MXFP4 direct arms used to admit
+// themselves with `M >= 2 && executable_on_device`). `route` names the asking
+// arm; it moves only the batch floor (onednn_pp_min_batch_for).
+static bool ggml_sycl_onednn_pp_candidate(
+    const ggml_tensor *        src0,
+    const ggml_tensor *        src1,
+    const ggml_tensor *        dst,
+    int                        device,
+    ggml_sycl::onednn_pp_route route = ggml_sycl::onednn_pp_route::DENSE_DISPATCH) {
 #if GGML_SYCL_DNNL
     auto trace_reject = [&](const char * reason) {
         if (!ggml_sycl_onednn_pp_trace_enabled()) {
@@ -27080,20 +27087,16 @@ static bool ggml_sycl_onednn_pp_candidate(const ggml_tensor * src0,
         trace_reject("missing-src");
         return false;
     }
-    if (ggml_sycl_onednn_pp_skip_type(src0->type) || !ggml_sycl_onednn_pp_enabled()) {
-        trace_reject("disabled-or-skip-type");
-        return false;
-    }
-    if (src1->ne[1] < ggml_sycl_onednn_pp_min_batch()) {
-        trace_reject("batch-under-threshold");
-        return false;
-    }
-    if (src1->type != GGML_TYPE_F32 || (dst && dst->type != GGML_TYPE_F32)) {
-        trace_reject("type");
-        return false;
-    }
-    if (!ggml_is_quantized(src0->type) || !ggml_is_contiguous(src0)) {
-        trace_reject("not-contiguous-quant");
+    ggml_sycl::onednn_pp_admission_inputs admission;
+    admission.enabled                     = ggml_sycl_onednn_pp_enabled();
+    admission.skip_type                   = ggml_sycl_onednn_pp_skip_type(src0->type);
+    admission.batch                       = src1->ne[1];
+    admission.min_batch                   = ggml_sycl::onednn_pp_min_batch_for(route, ggml_sycl_onednn_pp_min_batch());
+    admission.f32_operands                = src1->type == GGML_TYPE_F32 && (!dst || dst->type == GGML_TYPE_F32);
+    admission.contiguous_quantized_weight = ggml_is_quantized(src0->type) && ggml_is_contiguous(src0);
+    const ggml_sycl::onednn_pp_refusal refusal = ggml_sycl::onednn_pp_admission_decide(admission);
+    if (refusal != ggml_sycl::onednn_pp_refusal::NONE) {
+        trace_reject(ggml_sycl::onednn_pp_refusal_name(refusal));
         return false;
     }
     ggml_sycl::onednn_pp_placement placement  = ggml_sycl::onednn_pp_placement::ALLOWED;
@@ -27110,6 +27113,7 @@ static bool ggml_sycl_onednn_pp_candidate(const ggml_tensor * src0,
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);
     GGML_UNUSED(device);
+    GGML_UNUSED(route);
     return false;
 #endif
 }
@@ -63488,6 +63492,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 const size_t  src0_plane_bytes = static_cast<size_t>(N) * ggml_row_size(src0->type, K);
                 const int64_t src1_plane_elems = M * K;
                 const int64_t dst_plane_elems  = M * N;
+                // May the SOA/AOS arms below take oneDNN PP? The candidate
+                // answers, as for every other arm; MXFP4_DIRECT moves only
+                // the batch floor (llama.cpp-je3b).
+                const bool    onednn_pp_admitted = ggml_sycl_onednn_pp_candidate(src0, src1, dst, ctx.device,
+                                                                                 ggml_sycl::onednn_pp_route::MXFP4_DIRECT);
                 if (ggml_sycl_onednn_pp_trace_enabled()) {
                     static std::atomic<int> onednn_pp_direct_trace{ 0 };
                     const int               trace_idx = onednn_pp_direct_trace.fetch_add(1, std::memory_order_relaxed);
@@ -63498,7 +63507,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                 src0->name ? src0->name : "?", ggml_type_name(src0->type), (int) data_layout,
                                 (long long) M, (long long) K, (long long) N, (long long) ne02, (long long) ne12,
                                 (long long) ne13, (long long) n_batch, (long long) i02_divisor,
-                                ggml_sycl_onednn_pp_executable_on_device(src0, ctx.device) ? 1 : 0);
+                                onednn_pp_admitted ? 1 : 0);
                     }
                 }
 
@@ -63515,8 +63524,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                     const bool split_timing  = pp_split_timing_enabled();
                     bool       used_onednn   = false;
 #if GGML_SYCL_DNNL
-                    if (M >= 2 && data_layout == ggml_sycl_unified::LayoutMode::SOA &&
-                        ggml_sycl_onednn_pp_executable_on_device(src0, ctx.device)) {
+                    if (onednn_pp_admitted && data_layout == ggml_sycl_unified::LayoutMode::SOA) {
                         const to_fp16_sycl_t f32_to_fp16 =
                             ggml_get_to_fp16_sycl(GGML_TYPE_F32, dst, /*full_tensor=*/false);
                         const size_t src0_elems = static_cast<size_t>(N) * static_cast<size_t>(K);
@@ -63688,7 +63696,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                     // For TG (M == 1), use unified kernel (MMVQ fast-path).
                     bool used_onednn = false;
 #if GGML_SYCL_DNNL
-                    if (M >= 2 && ggml_sycl_onednn_pp_executable_on_device(src0, ctx.device)) {
+                    if (onednn_pp_admitted) {
                         // Dequant MXFP4→FP16, convert F32→FP16, oneDNN GEMM
                         const to_fp16_sycl_t dequant_fn = ggml_get_to_fp16_sycl(src0->type, dst, /*full_tensor=*/false);
                         const to_fp16_sycl_t f32_to_fp16 =
