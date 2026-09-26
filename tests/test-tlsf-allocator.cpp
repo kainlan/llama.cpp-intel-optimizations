@@ -206,6 +206,15 @@ static void test_alloc_failure() {
     REQUIRE(offset == SIZE_MAX && "allocation from tiny arena should fail");
     (void) offset;
 
+    // A size whose granularity rounding would wrap to 0 is refused, not
+    // handed back as a zero-size block at offset 0 that the next allocation
+    // then aliases.
+    test_arena big;
+    REQUIRE(big.alloc->allocate(SIZE_MAX) == SIZE_MAX && "a wrapping size must be refused");
+    REQUIRE(big.alloc->used() == 0 && big.alloc->check_invariants());
+    REQUIRE(big.alloc->allocate(4096) == 0 && "the arena is still whole after the refusal");
+    REQUIRE(big.alloc->check_invariants());
+
     std::cout << "test_alloc_failure: PASSED\n";
 }
 

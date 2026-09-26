@@ -147,13 +147,13 @@ class tlsf_allocator {
     // No data is written to the managed region.
     // ------------------------------------------------------------------
     struct block_meta {
-        size_t offset;      // Start offset in the managed region
-        size_t size;        // Usable size (excludes metadata overhead)
-        bool   free;        // Is this block free?
-        int    prev_block;  // Index of physically previous block (-1 if first)
-        int    next_block;  // Index of physically next block (-1 if last)
-        int    next_free;   // Index of next block in same (fl,sl) free list (-1 if tail)
-        int    prev_free;   // Index of prev block in same (fl,sl) free list (-1 if head)
+        size_t  offset;      // Start offset in the managed region
+        size_t  size;        // Usable size (excludes metadata overhead)
+        bool    free;        // Is this block free?
+        int     prev_block;  // Index of physically previous block (-1 if first)
+        int     next_block;  // Index of physically next block (-1 if last)
+        int     next_free;   // Index of next block in same (fl,sl) free list (-1 if tail)
+        int     prev_free;   // Index of prev block in same (fl,sl) free list (-1 if head)
         uint8_t tag;         // Caller label of an allocated block (0 when free)
     };
 
@@ -454,7 +454,10 @@ inline size_t tlsf_allocator::allocate(size_t size, size_t alignment, uint8_t ta
     // promises (llama.cpp-f8ws).  Rounding by the larger of the two also
     // satisfies any alignment <= MIN_BLOCK_SIZE for free.
     const size_t granularity = alignment > MIN_BLOCK_SIZE ? alignment : MIN_BLOCK_SIZE;
-    size                     = (size + granularity - 1) & ~(granularity - 1);
+    if (size > SIZE_MAX - granularity) {
+        return SIZE_MAX;  // the rounding below would wrap to a zero-size block
+    }
+    size = (size + granularity - 1) & ~(granularity - 1);
 
     // Offsets carry MIN_BLOCK_SIZE alignment and no more, so a larger request
     // cannot be honoured here; such callers must align above this allocator.
