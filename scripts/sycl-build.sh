@@ -27,7 +27,9 @@ Environment:
   GGML_SYCL_CCACHE_BASE_DIR=0   run plain ccache instead of ccache with base_dir
                                 at this tree (the default, which lets a checkout
                                 at another path reuse its entries; see
-                                docs/backend/SYCL.md)
+                                docs/backend/SYCL.md). Also off/false/no; any
+                                value other than those and 1/on/true/yes is an
+                                error.
 
 Examples:
   ./scripts/sycl-build.sh
@@ -91,6 +93,23 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Like an unknown option, an unknown value is refused rather than guessed at:
+# read as "on", GGML_SYCL_CCACHE_BASE_DIR=disable would do the opposite of what
+# it says.
+case "${GGML_SYCL_CCACHE_BASE_DIR:-1}" in
+    1|[Oo][Nn]|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss])
+        ccache_base_dir=1
+        ;;
+    0|[Oo][Ff][Ff]|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo])
+        ccache_base_dir=0
+        ;;
+    *)
+        echo "error: GGML_SYCL_CCACHE_BASE_DIR='${GGML_SYCL_CCACHE_BASE_DIR}' is not" \
+            "1/on/true/yes or 0/off/false/no" >&2
+        exit 2
+        ;;
+esac
 
 ONEAPI_SETVARS="${ONEAPI_SETVARS:-/opt/intel/oneapi/setvars.sh}"
 if [[ ! -f "${ONEAPI_SETVARS}" ]]; then
@@ -271,27 +290,35 @@ configure_args=(
 compiler_launcher=""
 if command -v ccache >/dev/null 2>&1; then
     compiler_launcher="ccache"
-    # On unless GGML_SYCL_CCACHE_BASE_DIR=0 (llama.cpp-vuy0, llama.cpp-7mqd).
-    # base_dir makes ccache rewrite absolute paths under this tree relative to
-    # the build directory, so a checkout at another path -- a worktree -- hits
-    # the entries this one stored instead of recompiling from cold; the objects
-    # and libggml-sycl it links are byte-identical to a fresh compile there.
-    # It also makes __FILE__ relative ("../ggml/src/..."); tests that
-    # locate the tree get the absolute LLAMA_CPP_SOURCE_ROOT, which ccache
-    # does not rewrite. `ccache KEY=VALUE compiler` needs ccache 4.8.
+    # On unless GGML_SYCL_CCACHE_BASE_DIR is 0/off/false/no (llama.cpp-vuy0,
+    # llama.cpp-7mqd). base_dir makes ccache rewrite absolute paths under this
+    # tree relative to the build directory, so a checkout at another path -- a
+    # worktree -- hits the entries this one stored instead of recompiling from
+    # cold; the objects and libggml-sycl it links are byte-identical to a fresh
+    # compile there. Diagnostics would then name "../ggml/src/..." files that
+    # do not resolve from the tree root, so absolute_paths_in_stderr turns them
+    # back into absolute paths when ccache prints them; the cached text stays
+    # relative. __FILE__ stays relative too; tests that locate the tree get the
+    # absolute LLAMA_CPP_SOURCE_ROOT, which ccache does not rewrite.
+    # `ccache KEY=VALUE compiler` needs ccache 4.8.
     #
     # A GGML_SYCL_PROFILING_DEBUG build (-g) keeps plain ccache: base_dir would
     # make its DWARF include directories relative, which
     # scripts/parse-sycl-zebin-line-table.py cannot match against absolute
     # paths, and ccache hashes the build directory into -g entries anyway.
-    if [[ "${GGML_SYCL_CCACHE_BASE_DIR:-1}" != 0 ]]; then
+    if (( ccache_base_dir )); then
         ccache_version="$(ccache --version 2>/dev/null | sed -n '1s/^ccache version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
         if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] &&
             grep -Eq '^GGML_SYCL_PROFILING_DEBUG:BOOL=(ON|1|TRUE|YES)$' "${BUILD_DIR}/CMakeCache.txt"; then
             echo "[sycl-build] GGML_SYCL_PROFILING_DEBUG is on; keeping plain ccache (no base_dir)"
         elif [[ -n "${ccache_version}" ]] && read -r ccache_major ccache_minor <<< "${ccache_version}" &&
             (( ccache_major > 4 || (ccache_major == 4 && ccache_minor >= 8) )); then
-            compiler_launcher="ccache;base_dir=${ROOT_DIR}"
+            compiler_launcher="ccache;base_dir=${ROOT_DIR};absolute_paths_in_stderr=true"
+        elif [[ -n "${ccache_version}" ]]; then
+            echo "[sycl-build] ccache ${ccache_version/ /.} predates 4.8 (no KEY=VALUE launcher);" \
+                "keeping plain ccache (no base_dir)"
+        else
+            echo "[sycl-build] could not read the ccache version; keeping plain ccache (no base_dir)"
         fi
     fi
     configure_args+=(
