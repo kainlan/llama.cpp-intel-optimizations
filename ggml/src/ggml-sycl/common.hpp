@@ -6334,6 +6334,11 @@ struct ggml_backend_sycl_context {
     };
 
     std::unordered_map<const ggml_tensor *, graph_input_staging_entry> graph_input_staging;
+    // Bumped whenever an entry is created, replaced, dropped or written
+    // through the functions below, so a caller that holds an entry's handle
+    // and copies into it itself can tell the entry is still the input's
+    // device copy and still holds what that caller last copied.
+    uint64_t                                                           graph_input_staging_generation = 0;
 
     bool graph_input_stage_lookup(const ggml_tensor *     owner,
                                   size_t                  nbytes,
@@ -6384,6 +6389,7 @@ struct ggml_backend_sycl_context {
                 ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
                     const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
                 ggml_sycl::mem_copy(it->second.handle, src_handle, nbytes, q);
+                graph_input_staging_generation++;
                 return resolved.ptr;
             }
         }
@@ -6392,6 +6398,7 @@ struct ggml_backend_sycl_context {
             it->second.handle   = ggml_sycl::mem_handle{};
             it->second.capacity = 0;
         }
+        graph_input_staging_generation++;
 
         ggml_sycl::alloc_request req{};
         req.queue                          = &q;
@@ -6437,6 +6444,7 @@ struct ggml_backend_sycl_context {
         ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
             const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
         (void) ggml_sycl::mem_copy_async(dst_handle, src_handle, nbytes, q);
+        graph_input_staging_generation++;
         return true;
     }
 
@@ -6450,6 +6458,7 @@ struct ggml_backend_sycl_context {
     void graph_input_staging_clear(sycl::queue & q) {
         GGML_UNUSED(q);
         graph_input_staging.clear();
+        graph_input_staging_generation++;
     }
 
     // Pre-allocated buffers for MoE graph recording

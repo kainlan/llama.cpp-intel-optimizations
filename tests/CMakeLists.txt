@@ -3156,6 +3156,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# llama.cpp-2lxw: source gate for the dense split executor's host-side trims
+# (moved-only input refresh on a plan-cache hit and the staging generation it
+# relies on). Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-dense-exec-host-trims-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-dense-exec-host-trims-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
 # llama.cpp-dfo0 (plan task L1): source gate for the env-gated leak probe in
 # ggml_backend_sycl_buffer_reset's COMPUTE early return -- probe present,
 # WARN level, env-gated, zero-cost when unset. Host-only, reads the sources

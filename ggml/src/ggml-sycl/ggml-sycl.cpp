@@ -88921,6 +88921,24 @@ struct ggml_sycl_block_exec_dense_state {
         ggml_sycl::dense_exec_plan                     plan;
         std::vector<ggml_tensor *>                     roots;
         std::vector<ggml_sycl::mem_handle>             slices;
+        // Graph input leaves some node of the graph writes.
+        std::vector<const ggml_tensor *>               written_inputs;
+
+        // What the last input refresh copied, so a later graph with this
+        // plan copies only the inputs that moved. Built from the context's
+        // input list and staging generation, and valid while both hold.
+        struct refresh_input {
+            ggml_tensor *                        tensor = nullptr;
+            size_t                               bytes  = 0;
+            ggml_sycl::mem_handle                dst;              // the input's device copy; empty: refreshed in full
+            bool                                 written = false;  // a node writes it: copied every graph
+            ggml_sycl::dense_exec_input_snapshot snapshot;
+        };
+
+        bool                       refresh_valid      = false;
+        uint64_t                   refresh_generation = 0;
+        std::vector<ggml_tensor *> refresh_list;
+        std::vector<refresh_input> refresh;
     };
 
     std::optional<prepared_plan> prepared;
@@ -89109,6 +89127,7 @@ static bool ggml_sycl_graph_is_decode(const ggml_cgraph * cgraph) {
 static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph);
 static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph);
 static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph);
+static bool graph_refresh_input_tensor(ggml_backend_sycl_context * ctx, ggml_tensor * tensor, sycl::queue & q);
 
 // GGML_SYCL_BLOCK_EXEC_DENSE_GRAPH=0 keeps every range on direct dispatch.
 static bool ggml_sycl_block_exec_dense_graph_enabled() {
@@ -89449,6 +89468,12 @@ class ggml_sycl_block_exec_dense_run {
     bool                       graphs_on_  = false;
     ggml_sycl::dense_graph_off graphs_off_ = ggml_sycl::DENSE_GRAPH_OFF_NONE;
 
+    // Inputs the last refresh copied, found unmoved, and refreshed in full;
+    // refresh_copied_ < 0 when every input was refreshed in full.
+    int refresh_copied_  = -1;
+    int refresh_skipped_ = 0;
+    int refresh_full_    = 0;
+
     std::vector<range_graph_mode>                                           range_modes_;
     uint64_t                                                                recording_signature_ = 0;
     std::optional<sycl_ex::command_graph<sycl_ex::graph_state::modifiable>> recording_;
@@ -89567,10 +89592,83 @@ class ggml_sycl_block_exec_dense_run {
             graph_prestage_leaf_tensors(&ctx_, cgraph_);
         }
         split_lap(split_.key_us);
-        graph_refresh_input_tensors(&ctx_, cgraph_);
+        // On a plan-cache hit that records nothing, copy only the inputs
+        // that moved; otherwise refresh them all and remember what went.
+        if (plan_cache_ != plan_cache_result::HIT || any_missing || !refresh_moved_inputs()) {
+            graph_refresh_input_tensors(&ctx_, cgraph_);
+            remember_refresh();
+        }
         split_lap(split_.refresh_us);
         range_modes_.assign(ranges_.size(), range_graph_mode::DIRECT);
         graphs_on_ = true;
+    }
+
+    // The inputs a full refresh just went through, each with its stable
+    // device copy when it has one. No bytes are recorded here: the first
+    // refresh from this list copies every input and records what it copied,
+    // so a snapshot only ever describes a copy this path made.
+    void remember_refresh() {
+        ggml_sycl_block_exec_dense_state & st = state();
+        if (!st.prepared) {
+            return;
+        }
+        auto & p             = *st.prepared;
+        p.refresh_valid      = ctx_.input_tensors_cached;
+        p.refresh_generation = ctx_.graph_input_staging_generation;
+        p.refresh_list       = ctx_.cached_input_tensors;
+        p.refresh.clear();
+        p.refresh.reserve(p.refresh_list.size());
+        for (ggml_tensor * t : p.refresh_list) {
+            size_t              offs = 0;
+            const ggml_tensor * root = t != nullptr ? ggml_sycl_view_root_and_offset(t, offs) : nullptr;
+            ggml_sycl_block_exec_dense_state::prepared_plan::refresh_input in{};
+            in.tensor  = t;
+            in.bytes   = t != nullptr ? ggml_nbytes(t) : 0;
+            in.written = std::find(p.written_inputs.begin(), p.written_inputs.end(), root) != p.written_inputs.end();
+            void * dst_ptr = nullptr;
+            if (t == nullptr || t->data == nullptr || t->name[0] == '\0' ||
+                !ctx_.graph_input_stage_lookup(t, in.bytes, original_device_, &in.dst, &dst_ptr)) {
+                in.dst = ggml_sycl::mem_handle{};
+            }
+            p.refresh.push_back(std::move(in));
+        }
+    }
+
+    // False when the remembered refresh no longer describes the context's
+    // inputs; the caller then refreshes them all.
+    bool refresh_moved_inputs() {
+        ggml_sycl_block_exec_dense_state & st = state();
+        if (!st.prepared) {
+            return false;
+        }
+        auto & p = *st.prepared;
+        if (!p.refresh_valid || !ctx_.input_tensors_cached ||
+            p.refresh_generation != ctx_.graph_input_staging_generation ||
+            p.refresh_list != ctx_.cached_input_tensors) {
+            return false;
+        }
+        sycl::queue & q  = *ctx_.stream();
+        refresh_copied_  = 0;
+        refresh_skipped_ = 0;
+        refresh_full_    = 0;
+        for (auto & in : p.refresh) {
+            ggml_tensor * t = in.tensor;
+            if (!in.dst.valid() || t == nullptr || t->data == nullptr || ggml_nbytes(t) != in.bytes) {
+                in.snapshot = ggml_sycl::dense_exec_input_snapshot{};
+                refresh_full_ += graph_refresh_input_tensor(&ctx_, t, q) ? 1 : 0;
+                continue;
+            }
+            if (!in.written && !ggml_sycl::dense_exec_input_moved(in.snapshot, t->data, in.bytes)) {
+                refresh_skipped_++;
+                continue;
+            }
+            const ggml_sycl::mem_handle src = ggml_sycl::mem_handle::from_direct(
+                t->data, GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, in.bytes);
+            (void) ggml_sycl::mem_copy_async(in.dst, src, in.bytes, q);
+            ggml_sycl::dense_exec_input_record(in.snapshot, t->data, in.bytes);
+            refresh_copied_++;
+        }
+        return true;
     }
 
     // After the range's inputs are staged and published and its device is
@@ -89781,6 +89879,13 @@ class ggml_sycl_block_exec_dense_run {
             snprintf(buf, sizeof(buf), " r%zu(dev=%d mode=%s rec=%llu rep=%llu)", r, ranges_[r].device,
                      mode_names[static_cast<int>(range_modes_[r])], (unsigned long long) st.graphs[r].records,
                      (unsigned long long) st.graphs[r].replays);
+            line += buf;
+        }
+        if (refresh_copied_ < 0) {
+            line += " refresh=all";
+        } else {
+            snprintf(buf, sizeof(buf), " refresh(copied=%d unmoved=%d full=%d)", refresh_copied_, refresh_skipped_,
+                     refresh_full_);
             line += buf;
         }
         fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE-GRAPH] on%s\n", line.c_str());
@@ -90032,6 +90137,13 @@ class ggml_sycl_block_exec_dense_run {
         if (const char * violation = ggml_sycl::dense_exec_plan_violation(g, plan_)) {
             GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] plan breaks an ownership invariant: %s", violation);
         }
+        std::vector<const ggml_tensor *> written_inputs;
+        const std::vector<bool>          written = ggml_sycl::dense_exec_written_roots(g);
+        for (size_t r = 0; r < g.roots.size(); ++r) {
+            if (written[r] && g.roots[r].kind == ggml_sycl::DENSE_EXEC_ROOT_CONTROL) {
+                written_inputs.push_back(roots_[r]);
+            }
+        }
         check_queue_order(original_device_);
         for (const ggml_sycl::dense_exec_range & range : plan_.ranges) {
             check_queue_order(range.device);
@@ -90041,7 +90153,7 @@ class ggml_sycl_block_exec_dense_run {
             return ggml_sycl::DENSE_EXEC_GATE_PREPARE_FAILED;
         }
         ranges_ = plan_.ranges;
-        store_prepared(st, plan_owner, signature);
+        store_prepared(st, plan_owner, signature, std::move(written_inputs));
         split_lap(split_.cache_us);
         trace_prepare();
         split_lap(split_.trace_us);
@@ -90091,7 +90203,8 @@ class ggml_sycl_block_exec_dense_run {
 
     void store_prepared(ggml_sycl_block_exec_dense_state &                       state,
                         const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner,
-                        uint64_t                                                 signature) const {
+                        uint64_t                                                 signature,
+                        std::vector<const ggml_tensor *>                         written_inputs) const {
         ggml_sycl_block_exec_dense_state::prepared_plan p{};
         p.owner     = plan_owner;
         p.signature = signature;
@@ -90108,10 +90221,11 @@ class ggml_sycl_block_exec_dense_run {
                 p.tensors.push_back(node->src[s]);
             }
         }
-        p.plan         = plan_;
-        p.roots        = roots_;
-        p.slices       = slices_;
-        state.prepared = std::move(p);
+        p.plan           = plan_;
+        p.roots          = roots_;
+        p.slices         = slices_;
+        p.written_inputs = std::move(written_inputs);
+        state.prepared   = std::move(p);
     }
 
     void trace_prepare() const {
@@ -98110,6 +98224,49 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         skipped_control);
 }
 
+// Refreshes one input tensor's device copy from its host bytes on `q`. True
+// when a copy was submitted; false when the tensor reads its host storage in
+// place or has nothing to copy.
+static bool graph_refresh_input_tensor(ggml_backend_sycl_context * ctx, ggml_tensor * tensor, sycl::queue & q) {
+    if (!tensor || !tensor->data) {
+        return false;
+    }
+    // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
+    // comment on graph_input_staging in common.hpp. The name check
+    // stays as a cheap pre-filter (an unnamed leaf was never staged).
+    if (tensor->name && tensor->name[0] != '\0' &&
+        ctx->graph_input_refresh(tensor, tensor->data, ggml_nbytes(tensor), q)) {
+        return true;
+    }
+    ggml_sycl_tensor_storage_handle dst_storage{};
+    ggml_sycl::mem_handle           dst_handle{};
+    size_t                          dst_offset = 0;
+    if (ggml_sycl_find_tensor_storage_handle(tensor, ctx->device, &dst_storage) && dst_storage.handle.valid()) {
+        const auto resolved = dst_storage.handle.resolve(ctx->device);
+        if (!resolved.ptr) {
+            GGML_ABORT("[SYCL-GRAPH] input tensor %s smart storage handle could not resolve on device %d",
+                       tensor->name ? tensor->name : "?", ctx->device);
+        }
+        void * dst_ptr = static_cast<char *>(resolved.ptr) + dst_storage.view_offset;
+        if (dst_ptr == tensor->data) {
+            return false;
+        }
+        dst_handle = dst_storage.handle;
+        dst_offset = dst_storage.view_offset;
+    } else {
+        void * resolved_ptr = ggml_sycl_resolve_tensor_ptr(tensor, ctx->device);
+        if (!resolved_ptr || resolved_ptr == tensor->data) {
+            return false;
+        }
+        dst_handle = ggml_sycl_copy_handle_for_raw_ptr(resolved_ptr, GGML_LAYOUT_AOS, ctx->device);
+    }
+    ggml_sycl::mem_handle src_handle =
+        ggml_sycl::mem_handle::from_direct(tensor->data, GGML_LAYOUT_AOS, /*on_device=*/false,
+                                           ggml_sycl::mem_handle::HOST_DEVICE, 0 + ggml_nbytes(tensor));
+    (void) ggml_sycl::mem_copy_async(dst_handle, dst_offset, src_handle, 0, ggml_nbytes(tensor), q);
+    return true;
+}
+
 // When reusing an executable SYCL command graph, the usual per-op pointer refresh
 // paths are not executed. We must explicitly refresh dynamic input tensors (e.g. tokens)
 // on device before replaying the graph.
@@ -98135,42 +98292,7 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
 
     // Fast path: use pre-cached input tensor list; resolve pointers per replay.
     auto refresh_input_tensor = [&](ggml_tensor * tensor) -> bool {
-        if (!tensor || !tensor->data) {
-            return false;
-        }
-        // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
-        // comment on graph_input_staging in common.hpp. The name check
-        // stays as a cheap pre-filter (an unnamed leaf was never staged).
-        if (tensor->name && tensor->name[0] != '\0' &&
-            ctx->graph_input_refresh(tensor, tensor->data, ggml_nbytes(tensor), q)) {
-            return true;
-        }
-        ggml_sycl_tensor_storage_handle dst_storage{};
-        ggml_sycl::mem_handle           dst_handle{};
-        size_t                          dst_offset = 0;
-        if (ggml_sycl_find_tensor_storage_handle(tensor, ctx->device, &dst_storage) && dst_storage.handle.valid()) {
-            const auto resolved = dst_storage.handle.resolve(ctx->device);
-            if (!resolved.ptr) {
-                GGML_ABORT("[SYCL-GRAPH] input tensor %s smart storage handle could not resolve on device %d",
-                           tensor->name ? tensor->name : "?", ctx->device);
-            }
-            void * dst_ptr = static_cast<char *>(resolved.ptr) + dst_storage.view_offset;
-            if (dst_ptr == tensor->data) {
-                return false;
-            }
-            dst_handle = dst_storage.handle;
-            dst_offset = dst_storage.view_offset;
-        } else {
-            void * resolved_ptr = ggml_sycl_resolve_tensor_ptr(tensor, ctx->device);
-            if (!resolved_ptr || resolved_ptr == tensor->data) {
-                return false;
-            }
-            dst_handle = ggml_sycl_copy_handle_for_raw_ptr(resolved_ptr, GGML_LAYOUT_AOS, ctx->device);
-        }
-        ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
-            tensor->data, GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, 0 + ggml_nbytes(tensor));
-        (void) ggml_sycl::mem_copy_async(dst_handle, dst_offset, src_handle, 0, ggml_nbytes(tensor), q);
-        return true;
+        return graph_refresh_input_tensor(ctx, tensor, q);
     };
 
     if (ctx->input_tensors_cached && !ctx->cached_input_tensors.empty()) {

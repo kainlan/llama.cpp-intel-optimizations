@@ -20,6 +20,8 @@
 //     layout of the persistent per-device arena.
 //   - dense_exec_graph_first_off: do the ranges of a decode graph record and
 //     replay command graphs?
+//   - dense_exec_input_moved: on a plan-cache hit, does a graph input need
+//     copying to its device copy again?
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -32,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <memory>
 #include <utility>
@@ -883,6 +886,56 @@ inline const char * dense_exec_plan_violation(const dense_exec_graph & g, const 
         }
     }
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Input refresh on a plan-cache hit
+// ---------------------------------------------------------------------------
+
+// Replayed range graphs read each host input leaf from a stable device copy,
+// which the backend refreshes before the ranges run. On a plan-cache hit the
+// graph, its inputs and their device copies are the ones of the last graph, so
+// an input whose host bytes have not moved since they were last copied needs
+// no copy. The snapshot is what was last copied; inputs larger than the cap
+// are not snapshotted and always count as moved.
+constexpr size_t dense_exec_input_snapshot_max_bytes = 64 * 1024;
+
+struct dense_exec_input_snapshot {
+    bool                       valid = false;
+    std::vector<unsigned char> bytes;
+};
+
+// True when `src` must be copied again: never recorded, not snapshotted,
+// resized, or different in any byte.
+inline bool dense_exec_input_moved(const dense_exec_input_snapshot & s, const void * src, size_t bytes) {
+    if (!s.valid || src == nullptr || bytes != s.bytes.size()) {
+        return true;
+    }
+    return bytes != 0 && std::memcmp(s.bytes.data(), src, bytes) != 0;
+}
+
+// Records `src` as the bytes just copied.
+inline void dense_exec_input_record(dense_exec_input_snapshot & s, const void * src, size_t bytes) {
+    s.valid = src != nullptr && bytes <= dense_exec_input_snapshot_max_bytes;
+    if (!s.valid) {
+        s.bytes.clear();
+        return;
+    }
+    const unsigned char * p = static_cast<const unsigned char *>(src);
+    s.bytes.assign(p, p + bytes);
+}
+
+// Per root: true when a node of the graph writes it. A snapshot only proves
+// what the host last copied into the device copy; an input some node writes on
+// the device may no longer hold it, so the backend copies it on every graph.
+inline std::vector<bool> dense_exec_written_roots(const dense_exec_graph & g) {
+    std::vector<bool> written(g.roots.size(), false);
+    for (const dense_exec_node & node : g.nodes) {
+        if (!node.is_noop && node.dst_root >= 0 && static_cast<size_t>(node.dst_root) < written.size()) {
+            written[static_cast<size_t>(node.dst_root)] = true;
+        }
+    }
+    return written;
 }
 
 // A pool frees scratch that a recording used into its own retained list, not

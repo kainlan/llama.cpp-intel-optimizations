@@ -680,6 +680,60 @@ static void test_host_stage_layout() {
     }
 }
 
+// On a plan-cache hit an input is copied again only when its host bytes moved
+// since the last copy.
+static void test_input_moved() {
+    dense_exec_input_snapshot s;
+    unsigned char             pos[4] = { 7, 0, 0, 0 };
+    check(dense_exec_input_moved(s, pos, sizeof(pos)), "an input never recorded has moved");
+
+    dense_exec_input_record(s, pos, sizeof(pos));
+    check(!dense_exec_input_moved(s, pos, sizeof(pos)), "the bytes just copied have not moved");
+    unsigned char same[4] = { 7, 0, 0, 0 };
+    check(!dense_exec_input_moved(s, same, sizeof(same)), "equal bytes at another address have not moved");
+
+    pos[0] = 8;
+    check(dense_exec_input_moved(s, pos, sizeof(pos)), "a changed byte moves the input");
+    check(dense_exec_input_moved(s, same, 2), "a resized input has moved");
+    check(dense_exec_input_moved(s, nullptr, sizeof(pos)), "an input without host bytes always moves");
+
+    dense_exec_input_record(s, pos, sizeof(pos));
+    check(!dense_exec_input_moved(s, pos, sizeof(pos)), "recording again takes the new bytes");
+
+    std::vector<unsigned char> big(dense_exec_input_snapshot_max_bytes + 1, 0);
+    dense_exec_input_record(s, big.data(), big.size());
+    check(dense_exec_input_moved(s, big.data(), big.size()), "an input past the snapshot cap always moves");
+    check(s.bytes.empty(), "and keeps no snapshot");
+
+    std::vector<unsigned char> at_cap(dense_exec_input_snapshot_max_bytes, 3);
+    dense_exec_input_record(s, at_cap.data(), at_cap.size());
+    check(!dense_exec_input_moved(s, at_cap.data(), at_cap.size()), "an input at the cap is snapshotted");
+
+    dense_exec_input_snapshot empty;
+    dense_exec_input_record(empty, pos, 0);
+    check(!dense_exec_input_moved(empty, pos, 0), "an empty input recorded once has not moved");
+}
+
+// An input a node writes on the device is copied on every graph: the
+// snapshot only says what the host last copied there.
+static void test_written_roots() {
+    graph_builder           b       = make_split_graph();
+    const std::vector<bool> written = dense_exec_written_roots(b.g);
+    check(written.size() == b.g.roots.size(), "one entry per root");
+    for (const char * name : { "inp_tokens", "inp_pos", "kq_mask", "kv_idxs", "token_embd.weight" }) {
+        check(!written[static_cast<size_t>(b.root_index(name))], std::string(name) + " is only read");
+    }
+    check(written[static_cast<size_t>(b.root_index("cache_k-0"))], "SET_ROWS writes the KV cache");
+    check(written[static_cast<size_t>(b.root_index("l_out-0"))], "a node writes its own result");
+
+    b.write_into("mask_in_place", 0, b.root_index("kq_mask"), { b.root_index("kq_mask") });
+    check(dense_exec_written_roots(b.g)[static_cast<size_t>(b.root_index("kq_mask"))],
+          "an in-place write marks the input written");
+
+    b.g.nodes.back().is_noop = true;
+    check(!dense_exec_written_roots(b.g)[static_cast<size_t>(b.root_index("kq_mask"))], "a no-op writes nothing");
+}
+
 // A range graph takes the pool scratch freed while it recorded: only what the
 // pool gained since the recording began, in order, and nothing from before.
 static void test_take_since() {
@@ -808,6 +862,8 @@ int main() {
         { "graph-off-debug-envs",                       test_graph_off_debug_envs                            },
         { "host-stage-layout",                          test_host_stage_layout                               },
         { "take-since",                                 test_take_since                                      },
+        { "input-moved",                                test_input_moved                                     },
+        { "written-roots",                              test_written_roots                                   },
     };
 
     int failed = 0;
