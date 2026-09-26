@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14a. Author: impl-moua, 2026-09-26. The revisions answer fourteen reviews:
+Design, revision 7.14b. Author: impl-moua, 2026-09-26. The revisions answer fourteen reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -78,14 +78,16 @@ Design, revision 7.14a. Author: impl-moua, 2026-09-26. The revisions answer four
   crossed 7.14 (r13 I-F (5), m-f, zhcn r11's H4 (b) literal and route, §Z15), 23mk's table-only
   requests (23mk 4.7b `e81dc2327`, 4.7c `175dcd51b`), §M19, the lead's §M20 on the items first
   held for its fact-finder (row 134, `moe_control`, the RUNTIME figures in exact bytes), §V12
-  and 1oxa rev 10a's relay, recorded in §6.17. It is two commits: `def60ce6c` and this one.
+  and 1oxa rev 10a's relay, recorded in §6.17. It is two commits: `def60ce6c` and `9f68c61bd`.
+  Revision 7.14b is one commit on top of 7.14a (`9f68c61bd`): the lead's §M21 and §M22 on
+  7.14a's points, and the §M20 message that crossed 7.14a, recorded in §6.18.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
 §E.1, §E.2, §L0R, §M7, §REC, §T, §L6, §GA, §FM, §STRICT, §D15, §D16, §Z3, §Z42, §Z52, §D20
 (superseded), §D20.1, §M76, §M76a, §ZR5, §M8, §Z43, §Z5, §Z6, §M77, §M9, §M9a, §M10, §Z6x, §X7,
 §M11, §M11b, §Z8, §Z9, §Z9a, §M12, §Z10, §X9, §Z11, §M13, §M13a, §Z12, §Z13, §M14, §Z14, §M15,
-§V11, §M16, §M16a, §M16b, §M17, §M17a, §M18, §Z15, §M18.3a, §M19, §M20, §V12). §M11a is a relay line inside §Z8, not a section,
+§V11, §M16, §M16a, §M16b, §M17, §M17a, §M18, §Z15, §M18.3a, §M19, §M20, §V12, §M21, §M22). §M11a is a relay line inside §Z8, not a section,
 and is cited as §Z8 I-2 (r12 m-14). This document cites it as "rulings §X". **Where this
 document paraphrases a ruling and differs from the file, the file wins.**
 
@@ -1852,8 +1854,11 @@ L0, and a failed revalidation under L0 is a bug, not a race.
          placement-independent terms with a placement-dependent device set. Neither is class P
          (r13 I-F (5); rulings §Z15, §M19): `nonfa_shape` is charged by the pack in step 3, per
          device that hosts attention layers, and `onednn_graph_scratch` is a context-lifetime
-         (C) term of 23mk's, charged at the context transaction together with 1oxa's §V11.3
-         D512 term, so the load stage evaluates it as 0 (§2.4.5, "The C rule");
+         (C) term of 23mk's. **C terms leave the load stage entirely (rulings §M21.3):** the
+         graph-scratch term is charged at the context transaction, from that context's `REGION`
+         headroom like KV, together with 1oxa's §V11.3 D512 term; the load stage evaluates it
+         as 0 (§2.4.5, "The C rule"), and the load-stage ONEDNN ensure reads the stored,
+         no-floor getter (below);
       2. **ensure them** (`ensure_planned_arena_zones`) on every device `dev_layer` gives a
          layer, which the reordered early call (above) makes an input, at the early stage only,
          before the stage's device loop packs anything. No iteration reads a secondary device's
@@ -1909,8 +1914,11 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            consumers size from, so a term that step 1 or step 3 forgot, and that the plan still
            publishes, is caught here. r13 named the ONEDNN floor from the graph-scratch shape
            (`unified-cache.cpp:27581`); since §Z15 that term is class C, which the load-stage dry
-           run evaluates as 0, so the getter at `:2148-2160` stops adding the floor to the
-           load-stage ONEDNN zone, and the load-stage case is a forgotten `onednn_scratchpad`
+           run evaluates as 0. The load-stage ONEDNN sizing (`ensure_planned_arena_zones`,
+           `:4464`, and the plan's twin at `:27658`) reads the stored, no-floor getter
+           (`unified_cache_get_planned_onednn_scratchpad_bytes_stored`, `:2141`) in place of the
+           with-floor one (`:2148-2160`), whose floor branch goes with the term to 23mk's context
+           transaction (rulings §M21.3). The load-stage case is a forgotten `onednn_scratchpad`
            (H7ap). A C term's own check runs in the context transaction (23mk's). The enum is
            kept closed by a source-contract gate: every `unified_cache_set_planned_*` setter maps
            to one enum value, and an unmapped setter fails the gate.
@@ -1974,12 +1982,23 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       - `moe_control` adds 0 to both until the routing commit, then 24832 B and 49408 B.
       The displayed values 1617.9 / 12232.1 and 1672.0 / 12178.0 stand (§M20.1); master's
       late-stage 1618.0 / 12232.0 and 1672.3 / 12177.7 carry the whole control pool, tables
-      included, and are rejected. **One figure is flagged to the lead:** §M20 gives the 120B
-      weight slot as 564019200 B, which is the tensor's MXFP4 size, 2880 · 2880 · 128 · 17 / 32.
-      The sizing code rounds each expert's scale block to 256 B (`:445-446`; 259200 → 259328),
-      so the slot it computes is 564035584 B, 16384 B more. The two agree to one decimal, which
-      is why the display could not tell them apart. This design pre-registers the stepped value
-      and changes one line if the lead rules otherwise.
+      included, and are rejected. **The 120B weight slot is the code's 564035584 B (rulings
+      §M22.1),** not the tensor's MXFP4 size 564019200 B (2880 · 2880 · 128 · 17 / 32) that
+      §M20 first quoted: the sizing code rounds each expert's scale block to 256 B (`:445-446`;
+      259200 → 259328), 16384 B more in all, and the plan pre-registers what the code allocates
+      (P4). The two print alike to one decimal, which is why the logs could not separate them.
+      **The load-stage ONEDNN zone, stepped from `ensure_planned_arena_zones`
+      (`unified-cache.cpp:4459-4500` at `3d9414c8c`), with the C term gone (rulings §M21.3,
+      §M22.2):** the zone is `max(268435456, stored)`, where `stored` is the `onednn_scratchpad`
+      charge (34.5 MB on GPT-OSS 120B, `gptoss120b-b1.log:202`; 49.0 MB on Qwen,
+      `glkg-qwen35b-a3b-b1.log:228`), and the 0oxf budget clamp, `max(available / 4, stored)`,
+      is about 3.6 GB on a 14618 MiB arena and does not bind. So the zone is **268435456 B** on
+      both shapes. Master's with-floor sum (34.5 + 96.0 MB; 49.0 + 64.0 MB,
+      `glkg-qwen35b-a3b-b1.log:229`) is also under 268435456 B, so removing the floor frees
+      **0 B** there, and the weight zones above are the load-stage figures unchanged. The
+      weight zone absorbs the floor's bytes only on a shape whose with-floor sum exceeded the
+      minimum, and then exactly `with_floor − max(268435456, stored)`; H7ap's C-rule arm uses
+      such a fixture (the minimum precondition, §M22.2).
       So the early stage packs against the zones it admits, and B's ranges are recorded inside
       them. **The shared rule (rulings §Z8 I-3, §M13a): the sentence is this design's, the
       message is 23mk's, and each design mirrors both byte for byte.** The sentence: "an arena
@@ -2701,7 +2720,7 @@ prompt-processing performance, never correctness, and the yield WARN names them.
      PRIMARY planned copy is never a pick. A planned OPTIONAL copy (§2.4.2 (b), "The range
      bytes") is a pick like any buried tenant (§2.9, the cost-ordered ladder), and the yield path
      handles it in one critical section, under the TLSF's group mutex, per pick:
-     1. **retag**: its block's extent passes from `{MODEL, m}` / `WEIGHT` to this call's
+     1. **retag (rulings §M21.1)**: its block's extent passes from `{MODEL, m}` / `WEIGHT` to this call's
         `{CONTEXT, id}` / `REGION` pending room. The copy's draw consumed its part of the
         model's range (`consume = true`), so there is no `{MODEL, m}` range record over the
         block to move, and the retag is `record_pending({CONTEXT, id}, REGION, off, size)` over
@@ -2712,7 +2731,7 @@ prompt-processing performance, never correctness, and the yield WARN names them.
         flag), so dispatch selects the kernel from the resident primary layout, "the loaded
         layout is the answer", and the staging witnesses and the lazy path treat the copy as
         absent, never as missing;
-     3. **release the handle**: the plan's owning handle leaves the cache entry and joins the
+     3. **release the handle (rulings §M21.2)**: the plan's owning handle leaves the cache entry and joins the
         transaction's drop list, and it is destroyed in the yield's finish with no lock held,
         like every retired pick (a destroy under the group mutex would self-deadlock, since the
         free takes it). The destructor stays reason-free (P2): wherever the last reference drops,
@@ -4119,7 +4138,7 @@ value function; and 4.7c `175dcd51b`, whose §6.8 term table, L2986-3011, confir
 | `moe_compact_storage` | RUNTIME | D | 23mk | `moe_compact_storage_bytes`; `mmvq.cpp:16614`, `:16646` |
 | `bf16_materialize` | WEIGHT | D | 23mk | `bf16_materialize_bytes`; `ggml-sycl.cpp:14332` |
 | `fp16_slab` | WEIGHT, OPTIONAL | D | 23mk | `fp16_slab_bytes`; `ggml-sycl.cpp:1342` |
-| `onednn_graph_scratch` | ONEDNN | C | 23mk (rulings §Z15, §M19) | 23mk's; charged at the context transaction, with 1oxa's §V11.3 D512 term. Master publishes its shape at `unified-cache.cpp:27580-27583` and adds its floor at `:2148-2160`; the load-stage getter stops adding it |
+| `onednn_graph_scratch` | the context's `REGION` headroom (rulings §M21.3); not a load-stage zone | C | 23mk (rulings §Z15, §M19) | 23mk's; charged at the context transaction from that context's `REGION` headroom, like KV, with 1oxa's §V11.3 D512 term. Master publishes its shape at `unified-cache.cpp:27580-27583` and adds its floor to the ONEDNN zone at `:2148-2160`; the load stage no longer does |
 | `set_rows_stage` | RUNTIME of the owner device | C | 23mk | `set_rows_stage_bytes`; `set_rows.cpp:465` |
 | `onednn_pp_a` | RUNTIME | C | 23mk (A; 23mk's addition, for the same closure as `set_rows_stage`) | 23mk §4.5, `onednn_pp_a_bytes` |
 
@@ -5727,8 +5746,12 @@ L7 documents this limit, and pattern #2 remains the remedy.
       stage, so it moved; 23mk keeps its own `moe_ptr_table` mutant, and both stand. **The C
       rule** (§2.4.5): a mutant that keeps the graph-scratch floor in the load-stage getter
       (`unified-cache.cpp:2148-2160`) fires the same witness on the same fixture, naming ONEDNN
-      and the floor's bytes, since step 3 charges no C term. 7.14 pre-registered this mutant
-      with 96 MB on GPT-OSS's shape, where it cannot fire, for the reason above. The source-contract gate fails on a
+      and the floor's bytes, since step 3 charges no C term. On the correct tree the same
+      fixture's load-stage ONEDNN zone is exactly `max(268435456, stored)` B and its weight zone
+      is larger than master's by exactly `with_floor − max(268435456, stored)` B, both computed
+      from the fixture's stepped terms and scored in bytes (rulings §M21.3); on the merge-gate
+      shapes that difference is 0 B (§2.4.2 (b), "The end states"). 7.14 pre-registered this
+      mutant with 96 MB on GPT-OSS's shape, where it cannot fire, for the reason above. The source-contract gate fails on a
       `unified_cache_set_planned_*` setter with no enum value;
     - **a secondary device is charged its attention shape (r13 I-F (5), m-d; rulings §Z15):** a
       two-device plan whose `dev_layer` puts attention layers on device 1. Step 2 ensures device
@@ -7628,3 +7651,26 @@ relay (items 1-5), the amendment §M18.3a, 23mk's table-only requests (23mk 4.7b
   the weight zone relative to the arena it reads (arena − SCRATCH − ONEDNN − RUNTIME), so an
   arena that is not a whole MiB moves only the absolute figure.
 - Nothing was built for 7.14a; it is a document change only.
+
+### 6.18 Revision 7.14b: rulings §M21 and §M22, and the §M20 message
+
+The lead's §M20 message crossed 7.14a's first commit; 7.14a's second commit (`9f68c61bd`)
+had already folded it, and 7.14b checks each item against it. §M21 and §M22 rule on the points
+7.14a raised.
+
+| item | disposition |
+|------|-------------|
+| §M21.1: the OPTIONAL yield records the block's own extent | **Already so** in 7.14a (§2.4.2 step 5); step 5's item 1 now cites the ruling. |
+| §M21.2: the handle moves to the drop list, destroyed in the finish | **Already so** in 7.14a (§2.4.2 step 5), the same shape as §V12; item 3 now cites the ruling. |
+| §M21.3: C terms leave the load stage entirely | **Changed.** Step 1, the dry-run witness text and the enum row say so: `onednn_graph_scratch` is charged at the context transaction from that context's `REGION` headroom, like KV; the load-stage ONEDNN sizing (`unified-cache.cpp:4464`, and the plan's twin at `:27658`) reads the stored, no-floor getter (`:2141`). The load-stage ONEDNN and weight-zone figures are re-derived in bytes from `ensure_planned_arena_zones` (§2.4.2 (b), "The end states"): the zone is `max(268435456, stored)` = 268435456 B on both merge-gate shapes, with and without the floor, so the weight zone absorbs 0 B there. §M21.3's parenthetical "−96 MB on GPT-OSS" does not survive the code path, since 34.5 + 96.0 MB is under the 256 MiB minimum; §M22.2 already accepts that. H7ap's C-rule arm scores the absorbed bytes on a fixture above the minimum. |
+| §M22.1: the 120B weight slot is 564035584 B | **Adopted**; 7.14a's flag becomes the ruling's citation. |
+| §M22.2: every dry-run RED asserts that its term lifts its zone above the minimum | **Already so** in 7.14a's second commit (H7ap); 23mk's and 1oxa's REDs are theirs. |
+| §M20 figures: 1617.9 / 1672.0 stand, 1618.0 / 1672.3 rejected, exact bytes | **Already folded** (`9f68c61bd`), with the 120B slot as ruled in §M22.1. |
+| §M20: `expert_ptrs` is not a RUNTIME term | **Already folded** (§2.4.2 (b), §2.4.5). |
+| §M20: `moe_control` a step-3 charge, re-anchored to the row-134 routing commit (24832 B, 49408 B) | **Already folded.** |
+| §M20: `moe_ptr_table` (k + 1) × 1024 B / × 2048 B, then k | **Already folded** (§2.4.5, H7ap). |
+| §M20: row 134 is live, outside the arena, never freed; 23mk converts it | **Already folded**, cited at `unified-cache.cpp:22176`, `:22203`. |
+| §M20: remove the "held" note | **Already removed** in `9f68c61bd`. |
+| the three mirror items for 23mk 4.7d | **Sent** to impl-23mk-2 directly: the tenant-only A bullet, the A3 rewording, the §M18.3a A4 paragraph. |
+
+Nothing was built for 7.14b; it is a document change only.
