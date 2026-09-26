@@ -295,12 +295,17 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                     COMPUTE_KV_PTRS(kv_start, K_first, V_first);
                     k_prefetch = block_load<sycl::half, D>(K_first);
                     v_prefetch = block_load<sycl::half, D>(V_first);
+                    // The mask value rides the same one-ahead prefetch, so the
+                    // dead-cell test below reads a register instead of waiting
+                    // on a fresh load before every dot product.
+                    sycl::half mask_prefetch = mask_base ? mask_base[kv_start] : sycl::half(0.0f);
 
                     // Process this partition's KV positions with double-buffered K and V loading
                     for (int kv_pos = kv_start; kv_pos < kv_end; ++kv_pos) {
                         // Use prefetched K and V (already loaded from previous iteration)
-                        simd<float, D>      k_row   = convert<float>(k_prefetch);
-                        simd<sycl::half, D> v_row_h = v_prefetch;
+                        simd<float, D>      k_row    = convert<float>(k_prefetch);
+                        simd<sycl::half, D> v_row_h  = v_prefetch;
+                        const sycl::half    mask_val = mask_prefetch;
 
                         // Prefetch next K and V while we compute (if there is a next position)
                         if (kv_pos + 1 < kv_end) {
@@ -309,6 +314,9 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                             COMPUTE_KV_PTRS(kv_pos + 1, K_next, V_next);
                             k_prefetch = block_load<sycl::half, D>(K_next);
                             v_prefetch = block_load<sycl::half, D>(V_next);
+                            if (mask_base) {
+                                mask_prefetch = mask_base[kv_pos + 1];
+                            }
                         }
 
                         // A masked cell is skipped, never scored: its K and V
@@ -316,7 +324,7 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                         // online update below has no safe way to absorb a NaN
                         // score or a 0 * NaN V term. The causal and sequence-id
                         // predicates mask the same way the -inf mask does.
-                        if (mask_base && fattn_mask_is_dead(mask_base[kv_pos])) {
+                        if (mask_base && fattn_mask_is_dead(mask_val)) {
                             continue;
                         }
                         // Multi-token decode: each query attends only to KV
@@ -344,7 +352,7 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
 
                         // Apply mask if present (with ALiBi slope)
                         if (mask_base) {
-                            score += slope * static_cast<float>(mask_base[kv_pos]);
+                            score += slope * static_cast<float>(mask_val);
                         }
 
                         // Online softmax update - V was prefetched above
