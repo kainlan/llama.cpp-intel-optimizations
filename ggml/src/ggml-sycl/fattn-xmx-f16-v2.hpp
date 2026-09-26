@@ -709,6 +709,14 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                 k_val = reinterpret_cast<const sycl::half *>(K_row_base)[d];
                 v_val = reinterpret_cast<const sycl::half *>(V_row_base)[d];
             }
+            // S @ V multiplies whole tiles, so a dead cell's weight-0 column
+            // still meets its V row (0 * NaN is NaN). A cell masked for every
+            // query row of this work-group contributes nothing, so zeroing its
+            // non-finite V is exact; the mask is read only for such a value.
+            if (!sycl::isfinite(static_cast<float>(v_val)) &&
+                fattn_kv_dead_for_rows(maskh, ne30, sycl::min(ncols, ne01 - ic0), kv_pos)) {
+                v_val = sycl::half(0.0f);
+            }
             tile_K[k * D + d] = k_val;
             tile_V[k * D + d] = v_val;
         }
@@ -776,8 +784,7 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                 if (maskh) {
                     const int kv_abs = kv_start + kv_col + lane;
                     if (kv_abs < ne11) {
-                        const float mask_val = static_cast<float>(maskh[(sg_q_base + r) * ne30 + kv_abs]);
-                        lane_QK[r] += slope * mask_val;
+                        lane_QK[r] = fattn_apply_mask(lane_QK[r], slope, maskh[(sg_q_base + r) * ne30 + kv_abs]);
                     } else {
                         lane_QK[r] = -FLT_MAX;
                     }
@@ -958,9 +965,8 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
 
 #    pragma unroll
         for (int t = 0; t < D_TILES; ++t) {
-            const int   d   = t * TN + lane;
-            const float val = (float) VKQ[r][t] * inv_sum;
-            dst_row[d]      = sycl::isfinite(val) ? val : 0.0f;
+            const int d = t * TN + lane;
+            dst_row[d]  = (float) VKQ[r][t] * inv_sum;
         }
     }
 }
@@ -1202,7 +1208,7 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
                     score = logit_softcap * sycl::tanh(score);
                 }
                 if (maskh) {
-                    score += slope * static_cast<float>(maskh[kv_abs]);
+                    score = fattn_apply_mask(score, slope, maskh[kv_abs]);
                 }
             }
             lane_scores[i] = score;
@@ -1233,8 +1239,8 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
             const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
             if (lane < XMX_V2_DECODE_ACTIVE_LANES) {
                 const float p      = sycl::exp(lane_scores[i] - new_max);
-                tile_S_f[kv_local] = sycl::isfinite(p) ? p : 0.0f;
-                local_sum += tile_S_f[kv_local];
+                tile_S_f[kv_local] = p;
+                local_sum += p;
             }
         }
         const float tile_sum = sycl::reduce_over_group(sg, local_sum, sycl::plus<float>{});
@@ -1248,8 +1254,10 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
             float     acc = 0.0f;
 #    pragma unroll
             for (int k = 0; k < XMX_V2_DECODE_BATCH_KV; ++k) {
-                if (kv_start + k < ne11) {
-                    acc += tile_S_f[k] * static_cast<float>(tile_V[k * D + d]);
+                // Weight 0 is a dead cell whose V may be non-finite: skip it.
+                const float s = tile_S_f[k];
+                if (kv_start + k < ne11 && s != 0.0f) {
+                    acc += s * static_cast<float>(tile_V[k * D + d]);
                 }
             }
             VKQ[t] += acc;
@@ -1285,9 +1293,8 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
     float *     dst_row = dst + (int64_t) D * (head + ne02 * (q_abs + ne01 * sequence));
 #    pragma unroll
     for (int t = 0; t < D_TILES; ++t) {
-        const int   d   = t * XMX_V2_SG + lane;
-        const float val = VKQ[t] * inv_sum;
-        dst_row[d]      = sycl::isfinite(val) ? val : 0.0f;
+        const int d = t * XMX_V2_SG + lane;
+        dst_row[d]  = VKQ[t] * inv_sum;
     }
 }
 
@@ -1525,7 +1532,7 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
                     score = logit_softcap * sycl::tanh(score);
                 }
                 if (maskh) {
-                    score += slope * static_cast<float>(maskh[kv_abs]);
+                    score = fattn_apply_mask(score, slope, maskh[kv_abs]);
                 }
             }
             lane_scores[i] = score;
@@ -1556,8 +1563,8 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
             const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
             if (active && lane < XMX_V2_DECODE_ACTIVE_LANES) {
                 const float p                                       = sycl::exp(lane_scores[i] - new_max);
-                tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + kv_local] = sycl::isfinite(p) ? p : 0.0f;
-                local_sum += tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + kv_local];
+                tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + kv_local] = p;
+                local_sum += p;
             }
         }
         const float tile_sum = sycl::reduce_over_group(sg, local_sum, sycl::plus<float>{});
@@ -1572,8 +1579,10 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
                 float     acc = 0.0f;
 #    pragma unroll
                 for (int k = 0; k < XMX_V2_DECODE_BATCH_KV; ++k) {
-                    if (kv_start + k < ne11) {
-                        acc += tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + k] * static_cast<float>(tile_V[k * D + d]);
+                    // Weight 0 is a dead cell whose V may be non-finite: skip it.
+                    const float s = tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + k];
+                    if (kv_start + k < ne11 && s != 0.0f) {
+                        acc += s * static_cast<float>(tile_V[k * D + d]);
                     }
                 }
                 VKQ[t] += acc;
@@ -1611,9 +1620,8 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
         float *     dst_row = dst + (int64_t) D * (head + ne02 * (q_abs + ne01 * sequence));
 #    pragma unroll
         for (int t = 0; t < D_TILES; ++t) {
-            const int   d   = t * XMX_V2_SG + lane;
-            const float val = VKQ[t] * inv_sum;
-            dst_row[d]      = sycl::isfinite(val) ? val : 0.0f;
+            const int d = t * XMX_V2_SG + lane;
+            dst_row[d]  = VKQ[t] * inv_sum;
         }
     }
 }
@@ -1829,14 +1837,18 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
                 score = logit_softcap * sycl::tanh(score);
             }
             if (maskh) {
-                score += slope * static_cast<float>(maskh[kv_abs]);
+                score = fattn_apply_mask(score, slope, maskh[kv_abs]);
             }
         }
         lane_scores[i] = score;
         local_max      = sycl::fmax(local_max, score);
     }
 
-    KQ_max = sycl::reduce_over_group(sg, local_max, sycl::maximum<float>{});
+    // A partition whose visible cells are all masked has a -inf maximum; keep
+    // it finite (as every other kernel's initial maximum is) so that
+    // exp(score - KQ_max) stays 0 for dead cells instead of becoming NaN, and
+    // the merge weighs this partition by 0.
+    KQ_max = sycl::fmax(sycl::reduce_over_group(sg, local_max, sycl::maximum<float>{}), -FLT_MAX / 2.0f);
 
     float lane_probs[2 * XMX_V2_DECODE_SLOTS];
     float local_sum = 0.0f;
@@ -1847,8 +1859,7 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
         const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
         lane_probs[i]      = 0.0f;
         if (active && lane < XMX_V2_DECODE_ACTIVE_LANES) {
-            const float p = sycl::exp(lane_scores[i] - KQ_max);
-            lane_probs[i] = sycl::isfinite(p) ? p : 0.0f;
+            lane_probs[i] = sycl::exp(lane_scores[i] - KQ_max);
             if constexpr (!DIRECT_PV) {
                 tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + kv_local] = lane_probs[i];
             }
@@ -1876,16 +1887,22 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
                         const int kv_local =
                             half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + src_lane;
                         if (kv_start + kv_local < ne11) {
+                            // Uniform across the sub-group; weight 0 is a dead
+                            // cell whose V may be non-finite: skip it.
                             const float p = sycl::select_from_group(sg, lane_probs[i], src_lane);
-                            acc += p * static_cast<float>(tile_V[kv_local * D + d]);
+                            if (p != 0.0f) {
+                                acc += p * static_cast<float>(tile_V[kv_local * D + d]);
+                            }
                         }
                     }
                 }
             } else {
 #    pragma unroll
                 for (int k = 0; k < XMX_V2_DECODE_BATCH_KV; ++k) {
-                    if (kv_start + k < ne11) {
-                        acc += tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + k] * static_cast<float>(tile_V[k * D + d]);
+                    // Weight 0 is a dead cell whose V may be non-finite: skip it.
+                    const float s = tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + k];
+                    if (kv_start + k < ne11 && s != 0.0f) {
+                        acc += s * static_cast<float>(tile_V[k * D + d]);
                     }
                 }
             }
@@ -1976,9 +1993,8 @@ static void flash_attn_xmx_v2_decode_gqa_split_merge_kernel(const char * __restr
     }
 #    pragma unroll
     for (int t = 0; t < D_TILES; ++t) {
-        const int   d   = t * XMX_V2_SG + lane;
-        const float val = acc[t] * inv_sum;
-        dst_row[d]      = sycl::isfinite(val) ? val : 0.0f;
+        const int d = t * XMX_V2_SG + lane;
+        dst_row[d]  = acc[t] * inv_sum;
     }
 }
 

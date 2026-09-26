@@ -131,6 +131,13 @@ static void flash_attn_vec_f16_kernel(
         // Main KV loop — one KV position per iteration, lanes share Q dot work.
         // -----------------------------------------------------------------------
         for (int kv = 0; kv < ne11; ++kv) {
+            // A dead cell is skipped, never weighted by 0: its K and V may be
+            // non-finite (see fattn_mask_is_dead). The mask is per (query, kv),
+            // so the branch is uniform across the sub-group.
+            if (maskh && fattn_mask_is_dead(maskh[j * stride_mask + kv])) {
+                continue;
+            }
+
             const sycl::half * K_row = reinterpret_cast<const sycl::half*>(K_ptr + (int64_t)nb11 * kv);
 
             // Step 1: lane-local partial dot product Q · K[kv].
@@ -215,8 +222,7 @@ static void flash_attn_vec_f16_kernel(
 
         #pragma unroll
         for (int d = 0; d < D_PER_LANE; ++d) {
-            const float val = VKQ_partial[d] * inv_sum;
-            dst_row[d_base + d] = sycl::isfinite(val) ? val : 0.0f;
+            dst_row[d_base + d] = VKQ_partial[d] * inv_sum;
         }
     }
 }

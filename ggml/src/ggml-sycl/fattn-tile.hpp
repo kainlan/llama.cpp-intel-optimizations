@@ -573,10 +573,12 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             }
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
-                KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0] +=
-                    (ncols2 > 1 || mask) ? slope * sycl::vec<sycl::half, 1>(mask[j * stride_mask + k_VKQ_0 + i_KQ])
-                                                       .convert<float, sycl::rounding_mode::automatic>()[0] :
-                                           0.0f;
+                if (ncols2 > 1 || mask) {
+                    // Select, not add: a dead cell's K may be non-finite and
+                    // NaN + -inf is NaN (see fattn_mask_is_dead).
+                    KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0] = fattn_apply_mask(
+                        KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0], slope, mask[j * stride_mask + k_VKQ_0 + i_KQ]);
+                }
 
                 KQ_max_new[jc0] =
                     sycl::fmax((float) KQ_max_new[jc0],
@@ -697,6 +699,11 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
 #pragma unroll
                 for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                    // Weight 0 is a dead cell whose V may be non-finite; skip
+                    // it rather than add 0 * V. KQ_k is the same across the warp.
+                    if (KQ_k[jc_VKQ_0].x() == sycl::half(0.0f)) {
+                        continue;
+                    }
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x() +=
                         V_k[i0/warp_size].x()*KQ_k[jc_VKQ_0].x();
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].y() +=
@@ -727,6 +734,10 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
 #pragma unroll
                 for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                    // Weight 0 is a dead cell whose V may be non-finite; skip it.
+                    if (KQ_k[jc_VKQ_0] == 0.0f) {
+                        continue;
+                    }
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x() += V_k[i0/warp_size].x()*KQ_k[jc_VKQ_0];
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].y() += V_k[i0/warp_size].y()*KQ_k[jc_VKQ_0];
                 }
@@ -1094,7 +1105,9 @@ static void flash_attn_tile(const char *  Q,
             return;
         }
 
-        const float scale = item_ct1.get_group_range(1) == 1 ? 1.0f / KQ_sum[jc0] : 1.0f;
+        // A row with no visible cell (S == 0) is written as 0, like the CPU
+        // reference, instead of 0 * (1/0) = NaN.
+        const float scale = item_ct1.get_group_range(1) == 1 ? (KQ_sum[jc0] == 0.0f ? 0.0f : 1.0f / KQ_sum[jc0]) : 1.0f;
 
         const int j_dst_unrolled =
             ((sequence * int(ne01.z()) + col_Q_0 + j) * ne02 + head0 + c) * item_ct1.get_group_range(1) +

@@ -311,6 +311,28 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                             v_prefetch = block_load<sycl::half, D>(V_next);
                         }
 
+                        // A masked cell is skipped, never scored: its K and V
+                        // may be non-finite (see fattn_mask_is_dead), and the
+                        // online update below has no safe way to absorb a NaN
+                        // score or a 0 * NaN V term. The causal and sequence-id
+                        // predicates mask the same way the -inf mask does.
+                        if (mask_base && fattn_mask_is_dead(mask_base[kv_pos])) {
+                            continue;
+                        }
+                        // Multi-token decode: each query attends only to KV
+                        // positions <= its own position.
+                        if (kv_base_pos + kv_pos > q_pos) {
+                            continue;
+                        }
+                        // Continuous batching: a query attends only to KV of its
+                        // own sequence.
+                        if (q_seq >= 0 && kv_seq_ids) {
+                            const int32_t kv_seq = kv_seq_ids[kv_pos];
+                            if (kv_seq >= 0 && kv_seq != q_seq) {
+                                continue;
+                            }
+                        }
+
                         // Compute dot product
                         simd<float, D> prod  = query_row * k_row;
                         float          score = esimd::detail::sum<float, float, D>(prod);
@@ -323,21 +345,6 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                         // Apply mask if present (with ALiBi slope)
                         if (mask_base) {
                             score += slope * static_cast<float>(mask_base[kv_pos]);
-                        }
-
-                        // Multi-token decode: per-query position-based causal masking
-                        // Each query can only attend to KV positions <= its own position
-                        if (kv_base_pos + kv_pos > q_pos) {
-                            score = -FLT_MAX;
-                        }
-
-                        // Sequence ID masking: mask out KV positions from different sequences
-                        // Used in continuous batching to ensure queries only attend to KV from same sequence
-                        if (q_seq >= 0 && kv_seq_ids) {
-                            const int32_t kv_seq = kv_seq_ids[kv_pos];
-                            if (kv_seq >= 0 && kv_seq != q_seq) {
-                                score = -FLT_MAX;
-                            }
                         }
 
                         // Online softmax update - V was prefetched above
@@ -430,11 +437,14 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                         final_max                = new_max;
                     }
 
-                    // Final normalization and output
-                    if (final_sum > 0.0f) {
-                        simd<float, D> result = final_acc / final_sum;
-                        block_store(out_base, result);
+                    // Final normalization and output. A row with no visible
+                    // cell (S == 0) is written as 0, like the CPU reference;
+                    // leaving dst unwritten would return stale memory.
+                    simd<float, D> result = 0.0f;
+                    if (final_sum != 0.0f) {
+                        result = final_acc / final_sum;
                     }
+                    block_store(out_base, result);
                 }
 
 #    undef COMPUTE_KV_PTRS
@@ -1066,6 +1076,15 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                         if (q_idx >= ne01)
                             continue;
 
+                        // mask_base points to (sequence, head, ic0), so use j
+                        // (local query offset) not q_idx. A masked cell is
+                        // skipped for this query, never scored: its K and V
+                        // may be non-finite (see fattn_mask_is_dead).
+                        const sycl::half * mask_row = mask_base ? mask_base + j * stride_mask : nullptr;
+                        if (mask_row && fattn_mask_is_dead(mask_row[kv_pos])) {
+                            continue;
+                        }
+
                         // Compute Q @ K dot product
                         float score;
                         if constexpr (D == 128) {
@@ -1086,9 +1105,7 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                         }
 
                         // Apply mask if present
-                        // mask_base points to (sequence, head, ic0), so use j (local query offset) not q_idx
-                        if (mask_base) {
-                            const sycl::half * mask_row = mask_base + j * stride_mask;
+                        if (mask_row) {
                             score += static_cast<float>(mask_row[kv_pos]);
                         }
 
@@ -1255,22 +1272,30 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                         }
 #    endif
 
-                        if (final_sum > 0.0f) {
-                            if constexpr (D == 128) {
-                                simd<float, 64> result_h1 = final_acc_h1 / final_sum;
-                                simd<float, 64> result_h2 = final_acc_h2 / final_sum;
-                                block_store<float, 64>(out_ptr, result_h1);
-                                block_store<float, 64>(out_ptr + 64, result_h2);
-                            } else {
-                                // Native D-element store for D=64 and all other D
-                                simd<float, D> result = final_acc / final_sum;
-                                block_store(out_ptr, result);
-#    if ESIMD_BATCHED_DEBUG
-                                if (head == 0 && sequence == 0) {
-                                    sycl::ext::oneapi::experimental::printf("[STORE_DONE] q_idx=%d\n", q_idx);
-                                }
-#    endif
+                        // A row with no visible cell (S == 0) is written as 0,
+                        // like the CPU reference; leaving dst unwritten would
+                        // return stale memory.
+                        if constexpr (D == 128) {
+                            simd<float, 64> result_h1 = 0.0f;
+                            simd<float, 64> result_h2 = 0.0f;
+                            if (final_sum != 0.0f) {
+                                result_h1 = final_acc_h1 / final_sum;
+                                result_h2 = final_acc_h2 / final_sum;
                             }
+                            block_store<float, 64>(out_ptr, result_h1);
+                            block_store<float, 64>(out_ptr + 64, result_h2);
+                        } else {
+                            // Native D-element store for D=64 and all other D
+                            simd<float, D> result = 0.0f;
+                            if (final_sum != 0.0f) {
+                                result = final_acc / final_sum;
+                            }
+                            block_store(out_ptr, result);
+#    if ESIMD_BATCHED_DEBUG
+                            if (head == 0 && sequence == 0) {
+                                sycl::ext::oneapi::experimental::printf("[STORE_DONE] q_idx=%d\n", q_idx);
+                            }
+#    endif
                         }
                     }
                 }

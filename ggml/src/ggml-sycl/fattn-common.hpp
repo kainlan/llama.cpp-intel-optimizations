@@ -18,6 +18,37 @@
 // This reduces issues with numerical overflow but also causes larger values to be flushed to zero.
 #define FATTN_KQ_MAX_OFFSET   0.6931f  // log(2)
 
+// A -inf mask value marks a KV cell that does not exist for that query: a
+// freed cell, another sequence's cell, the pad past the used window. The CPU
+// reference never reads such a cell, so its K and V rows may hold anything,
+// NaN and Inf included. A kernel must therefore not ADD the mask to the score
+// (NaN + -inf is NaN) and must not multiply the cell's V row by weight 0
+// (0 * NaN is NaN).
+static inline bool fattn_mask_is_dead(sycl::half mask_val) {
+    return static_cast<float>(mask_val) == -INFINITY;
+}
+
+// The masked score: exactly -inf for a dead cell, whatever the QK^T value was.
+static inline float fattn_apply_mask(float score, float slope, sycl::half mask_val) {
+    return fattn_mask_is_dead(mask_val) ? -INFINITY : score + slope * static_cast<float>(mask_val);
+}
+
+// True when all n_rows query rows mask KV cell kv with -inf. Kernels that
+// multiply a whole V tile on the matrix engine cannot select per element;
+// such a cell has weight 0 for every row of the tile, so zeroing its V there
+// is exact.
+static inline bool fattn_kv_dead_for_rows(const sycl::half * mask, int64_t row_stride, int n_rows, int kv) {
+    if (mask == nullptr || n_rows <= 0) {
+        return false;
+    }
+    for (int j = 0; j < n_rows; ++j) {
+        if (!fattn_mask_is_dead(mask[j * row_stride + kv])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Default thread configuration for flash attention vector kernel
 #define FATTN_VEC_NTHREADS    128
 
