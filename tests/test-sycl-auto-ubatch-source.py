@@ -2045,17 +2045,20 @@ def test_planner_gate_check_else_branch_has_a_mutation_witness():
     """Mutation witness for the planner-gate check: a
     compute_multi_device_plan() call in the single-device else branch,
     AFTER the gate's block, must fail it too."""
-    raw = GGML_SYCL_CPP
-    fn = raw.find(_PLANNER_FN)
+    code = GGML_SYCL_CPP_CODE
+    fn = code.find(_PLANNER_FN)
     assert fn != -1, "mutation target not found -- update this witness to match the real source"
     target = "plan_candidate = ggml_sycl::compute_placement_plan("
-    at = raw.find(target, fn)
+    at = code.find(target, fn)
     assert at != -1, "mutation target not found -- update this witness to match the real source"
-    gate_at = raw.find("if (info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()) {", fn)
-    assert gate_at != -1 and gate_at < at, "the else-branch target must come after the gate"
-    mutated_raw = raw[:at] + "plan_candidate = ggml_sycl::compute_multi_device_plan(" + raw[at + len(target):]
+    gate_at = code.find(_PLANNER_GATE, fn)
+    assert gate_at != -1, "mutation target not found -- update this witness to match the real source"
+    gate_open = gate_at + len(_PLANNER_GATE) - 1
+    gate_end = gate_open + 1 + len(_brace_block(code, gate_open))
+    assert at > gate_end, "the else-branch target must come after the gate's block"
+    mutated = code[:at] + "plan_candidate = ggml_sycl::compute_multi_device_plan(" + code[at + len(target):]
     with pytest.raises(AssertionError, match="reachable only inside"):
-        _assert_planner_branches_on_the_gate(_normalize_ws(strip_comments(mutated_raw)))
+        _assert_planner_branches_on_the_gate(_normalize_ws(mutated))
 
 
 def test_hidden_gpu_gate_holds_for_a_dense_model():

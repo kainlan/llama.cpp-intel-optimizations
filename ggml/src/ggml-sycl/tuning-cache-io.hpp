@@ -102,7 +102,7 @@ inline long sycl_tuning_getpid() {
 // changed in place before release: first the "hidden:" marker and the
 // placement-knob suffix, then "|plan=multi" with a widened participating set.
 // v6 (llama.cpp-1oa3): relative to v4, the device_key is
-// "<name>@<driver>/pct=<p>/headroom=<bytes>" per participating device, in
+// "<sanitized name>@<driver>/pct=<p>/headroom=<bytes>" per participating device, in
 // order, joined by ','; under the planner's multi-device plan every physical
 // GPU the scheduler does not list participates too, prefixed "hidden:"; then
 // "|plan=multi" when that plan runs; then "|" plus the multi-GPU placement
