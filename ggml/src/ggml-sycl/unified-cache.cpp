@@ -7687,11 +7687,86 @@ size_t unified_cache::optional_layout_bytes() const {
     return bytes;
 }
 
-optional_layout_yield_result unified_cache::yield_optional_layouts(size_t bytes) {
+kv_zone_model unified_cache::kv_zone_snapshot(const std::vector<const void *> & ptrs,
+                                              std::vector<kv_zone_block> *      blocks) {
+    kv_zone_model model;
+    if (blocks) {
+        blocks->assign(ptrs.size(), kv_zone_block{});
+    }
+    if (!arena_base_) {
+        return model;
+    }
+    // zone_alloc(KV)'s allocators in its order: the KV zone's own (which
+    // WEIGHT shares in single-chunk mode), then each shared weight chunk.
+    // Copied under their group lock, so the model is one state of all of
+    // them; offsets are located the way zone_free() locates them.
+    const auto &                kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
+    std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(vram_zone_id::KV));
+    if (kv.allocator) {
+        model.push_back(*kv.allocator);
+        for (size_t i = 0; blocks && i < ptrs.size(); ++i) {
+            const size_t arena_offset = ptr_to_offset(ptrs[i]);
+            if (arena_offset != SIZE_MAX && arena_offset >= kv.start && arena_offset < kv.start + kv.size) {
+                (*blocks)[i] = { 0, arena_offset - kv.start };
+            }
+        }
+    }
+    for (const auto & wca : weight_chunk_allocators_) {
+        const size_t index = model.size();
+        model.push_back(*wca.allocator);
+        const auto &    chunk = arena_chunks_[static_cast<size_t>(wca.chunk_idx)];
+        const uintptr_t base  = reinterpret_cast<uintptr_t>(chunk.ptr);
+        for (size_t i = 0; blocks && i < ptrs.size(); ++i) {
+            const uintptr_t p = reinterpret_cast<uintptr_t>(ptrs[i]);
+            if ((*blocks)[i].allocator == SIZE_MAX && p >= base && p < base + chunk.size) {
+                (*blocks)[i] = { index, static_cast<size_t>(p - base) };
+            }
+        }
+    }
+    return model;
+}
+
+size_t unified_cache::kv_layers_allocatable(const std::vector<size_t> & layer_bytes) {
+    // Without an arena KV is not carved from a zone, so no zone limits it.
+    if (!arena_base_) {
+        return layer_bytes.size();
+    }
+    return ggml_sycl::kv_layers_allocatable(kv_zone_snapshot({}, nullptr), layer_bytes);
+}
+
+optional_layout_yield_result unified_cache::yield_optional_layouts(const std::vector<size_t> & layer_bytes) {
     optional_layout_yield_result result;
-    if (bytes == 0) {
+    if (layer_bytes.empty()) {
         return result;
     }
+    // Which copies to release is decided on a copy of the zone's allocators,
+    // not by bytes: KV is placed one allocation a layer, and a copy staged
+    // between two live weights frees into a hole that holds a layer only if
+    // the layer is no larger. Releasing a copy no layer can use would lose its
+    // layout and give the KV nothing.
+    std::vector<unified_cache_key> keys;
+    std::vector<const void *>      ptrs;
+    std::vector<size_t>            sizes;
+    {
+        std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
+        std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
+        std::lock(direct_lock, cache_lock);
+        for (const auto & pair : entries_) {
+            if (optional_layout_yieldable(pair.first, pair.second, direct_weight_entries_)) {
+                keys.push_back(pair.first);
+                ptrs.push_back(pair.second.device_ptr);
+                sizes.push_back(pair.second.size);
+            }
+        }
+    }
+    std::vector<kv_zone_block> blocks;
+    const kv_zone_model        zone  = kv_zone_snapshot(ptrs, &blocks);
+    const std::vector<size_t>  picks = select_optional_layout_yield(zone, blocks, layer_bytes);
+    if (picks.empty()) {
+        result.kv_layers = kv_layers_allocatable(layer_bytes);
+        return result;
+    }
+
     // A copy's readers take no lease: the oneDNN WOQ gemm reads the raw pointer
     // ggml_sycl_get_weight_layout_ptr() resolved, so neither in_use_count nor the
     // staging write event (which gates a direct-staged entry's deferred free)
@@ -7706,7 +7781,8 @@ optional_layout_yield_result unified_cache::yield_optional_layouts(size_t bytes)
     //
     // Otherwise the same withdrawal as retire_expert_entry_exact(): take the
     // cache's own mirror lease out and retire the entry under both locks, and
-    // destroy the mirror handles with neither held.
+    // destroy the mirror handles with neither held. A pick is retired only if
+    // it is still the same yieldable copy it was when the zone was modelled.
     std::vector<std::shared_ptr<mem_handle>> released_mirrors;
     std::vector<const void *>                retired_ptrs;
     std::vector<size_t>                      retired_sizes;
@@ -7716,25 +7792,30 @@ optional_layout_yield_result unified_cache::yield_optional_layouts(size_t bytes)
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
         std::lock(direct_lock, cache_lock);
 
-        std::vector<unified_cache_key> keys;
-        std::vector<size_t>            sizes;
-        for (const auto & pair : entries_) {
-            if (optional_layout_yieldable(pair.first, pair.second, direct_weight_entries_)) {
-                keys.push_back(pair.first);
-                sizes.push_back(pair.second.size);
+        std::vector<size_t> still;
+        for (size_t i : picks) {
+            const auto it = entries_.find(keys[i]);
+            if (it != entries_.end() && it->second.device_ptr == ptrs[i] &&
+                optional_layout_yieldable(it->first, it->second, direct_weight_entries_)) {
+                still.push_back(i);
             }
         }
-        const std::vector<size_t> picks = select_optional_layout_yield(sizes, bytes);
-        if (picks.empty()) {
+        bool gated = !still.empty();
+        if (gated) {
+            try {
+                readers_done = submit_barrier_all();
+            } catch (...) {
+                // No gate, no release: every copy stays resident and routable.
+                gated = false;
+            }
+        }
+        if (!gated) {
+            cache_lock.unlock();
+            direct_lock.unlock();
+            result.kv_layers = kv_layers_allocatable(layer_bytes);
             return result;
         }
-        try {
-            readers_done = submit_barrier_all();
-        } catch (...) {
-            // No gate, no release: every copy stays resident and routable.
-            return result;
-        }
-        for (size_t i : picks) {
+        for (size_t i : still) {
             const unified_cache_key & key    = keys[i];
             unified_cache_entry &     entry  = entries_.find(key)->second;
             auto                      mirror = direct_weight_entries_.find(key.id);
@@ -7793,6 +7874,8 @@ optional_layout_yield_result unified_cache::yield_optional_layouts(size_t bytes)
         result.pending_bytes += size;
     }
     result.pending_bytes -= result.freed_bytes;
+    // Read from the live zone, after the frees: what the KV can have now.
+    result.kv_layers = kv_layers_allocatable(layer_bytes);
     return result;
 }
 
@@ -21296,9 +21379,16 @@ size_t unified_cache_optional_layout_bytes(int device_id, bool multi_device) {
     return cache ? cache->optional_layout_bytes() : 0;
 }
 
-optional_layout_yield_result unified_cache_yield_optional_layouts(int device_id, bool multi_device, size_t bytes) {
+optional_layout_yield_result unified_cache_yield_optional_layouts(int                         device_id,
+                                                                  bool                        multi_device,
+                                                                  const std::vector<size_t> & layer_bytes) {
     auto * cache = optional_layout_cache_for_kv(device_id, multi_device);
-    return cache ? cache->yield_optional_layouts(bytes) : optional_layout_yield_result{};
+    if (!cache) {
+        optional_layout_yield_result none;
+        none.kv_layers = layer_bytes.size();  // no cache, no zone to hold the KV to
+        return none;
+    }
+    return cache->yield_optional_layouts(layer_bytes);
 }
 
 size_t unified_cache_kv_arena_used(int device_id) {

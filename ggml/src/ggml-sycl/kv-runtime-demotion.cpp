@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <numeric>
 
 namespace ggml_sycl {
 
@@ -138,6 +137,9 @@ kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in) {
         const size_t yield     = demand > available ? std::min(demand - available, yieldable) : 0;
         const size_t headroom  = available + std::min(yield, SIZE_MAX - available);
         fit.capacity           = headroom > slack ? headroom - slack : 0;
+        if (i < in.fit_capacity.size()) {
+            fit.capacity = std::min(fit.capacity, in.fit_capacity[i]);
+        }
         r.yield_bytes.push_back(yield);
 
         const kv_demotion_result demotion = plan_device_kv_fit(fit);
@@ -154,18 +156,77 @@ kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in) {
     return r;
 }
 
-std::vector<size_t> select_optional_layout_yield(const std::vector<size_t> & sizes, size_t bytes) {
-    std::vector<size_t> order(sizes.size());
-    std::iota(order.begin(), order.end(), size_t{ 0 });
-    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return sizes[a] > sizes[b]; });
-    std::vector<size_t> picked;
-    size_t              freed = 0;
-    for (size_t i : order) {
-        if (freed >= bytes) {
+size_t kv_layers_allocatable(kv_zone_model zone, const std::vector<size_t> & layer_bytes) {
+    size_t placed = 0;
+    for (size_t bytes : layer_bytes) {
+        bool fits = false;
+        for (tlsf_allocator & allocator : zone) {
+            if (allocator.allocate(bytes) != SIZE_MAX) {
+                fits = true;
+                break;
+            }
+        }
+        if (!fits) {
             break;
         }
-        picked.push_back(i);
-        freed += std::min(sizes[i], SIZE_MAX - freed);
+        ++placed;
+    }
+    return placed;
+}
+
+std::vector<size_t> select_optional_layout_yield(const kv_zone_model &              zone,
+                                                 const std::vector<kv_zone_block> & copies,
+                                                 const std::vector<size_t> &        layer_bytes) {
+    std::vector<size_t> order;
+    for (size_t i = 0; i < copies.size(); ++i) {
+        if (copies[i].allocator < zone.size()) {
+            order.push_back(i);
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return copies[a].allocator != copies[b].allocator ? copies[a].allocator > copies[b].allocator :
+                                                            copies[a].offset > copies[b].offset;
+    });
+    auto freed_model = [&](const std::vector<size_t> & picks) {
+        kv_zone_model model = zone;
+        for (size_t i : picks) {
+            model[copies[i].allocator].free(copies[i].offset);
+        }
+        return model;
+    };
+
+    std::vector<size_t> picked;
+    std::vector<size_t> pending;
+    size_t              placed = kv_layers_allocatable(zone, layer_bytes);
+    for (size_t i : order) {
+        if (placed >= layer_bytes.size()) {
+            break;
+        }
+        pending.push_back(i);
+        std::vector<size_t> trial = picked;
+        trial.insert(trial.end(), pending.begin(), pending.end());
+        const size_t trial_placed = kv_layers_allocatable(freed_model(trial), layer_bytes);
+        if (trial_placed <= placed) {
+            continue;
+        }
+        // Keep only the pending copies this gain needs: one that no longer
+        // coalesces into the block a layer took is dropped again.
+        for (size_t p = 0; p + 1 < pending.size();) {
+            std::vector<size_t> without = picked;
+            for (size_t q = 0; q < pending.size(); ++q) {
+                if (q != p) {
+                    without.push_back(pending[q]);
+                }
+            }
+            if (kv_layers_allocatable(freed_model(without), layer_bytes) >= trial_placed) {
+                pending.erase(pending.begin() + (std::ptrdiff_t) p);
+            } else {
+                ++p;
+            }
+        }
+        picked.insert(picked.end(), pending.begin(), pending.end());
+        pending.clear();
+        placed = trial_placed;
     }
     return picked;
 }

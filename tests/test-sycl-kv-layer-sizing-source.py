@@ -1694,7 +1694,7 @@ def test_mutation_dense_woq_knob_dropped_is_witnessed() -> None:
 # a copy under a reader that took no lease, and must not leave a recorded graph
 # baking a retired copy's pointer.
 GRAPH_COMPUTE_SIGNATURE = "static ggml_status ggml_backend_sycl_graph_compute_unchecked("
-YIELD_SIGNATURE = "optional_layout_yield_result unified_cache::yield_optional_layouts(size_t bytes) {"
+YIELD_SIGNATURE = "optional_layout_yield_result unified_cache::yield_optional_layouts(const std::vector<size_t> & layer_bytes) {"
 
 
 def optional_layout_release_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
@@ -1764,3 +1764,47 @@ def test_mutation_free_left_deferred_is_witnessed() -> None:
 def test_mutation_no_reader_wait_is_witnessed() -> None:
     _release_cache_mutation("        readers_done.wait_and_throw();\n", "", "storage is back in its zone",
                             "reader wait dropped")
+
+
+# A KV layer is one allocation, so the bytes a yield frees are KV headroom only
+# where a layer lands in them. The cache picks which copies to release on a
+# copy of the zone's allocators, and the re-fit is held to the layers the zone
+# can place: a device-planned layer it cannot place is not refused but lands in
+# raw device memory outside the arena (llama.cpp-moua).
+def kv_fit_hold_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
+    found: list[str] = []
+    txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
+    at = txn.find("unified_cache_yield_optional_layouts(in.devices[i], next_plan.multi_device, layer_bytes)")
+    hold = txn.find("in.fit_capacity[i] = placeable;")
+    refit = txn.find("residency = ggml_sycl::plan_runtime_kv_residency(in);", max(hold, 0))
+    if at < 0 or hold < at or refit < 0 or refit > txn.find("if (!residency.fits)"):
+        found.append("the re-fit is not held to the KV layers the zone can place")
+
+    body = strip_comments(function(cache_cpp, YIELD_SIGNATURE))
+    model = body.find("kv_zone_snapshot(ptrs, &blocks)")
+    pick = body.find("select_optional_layout_yield(zone, blocks, layer_bytes)")
+    if model < 0 or pick < model:
+        found.append("copies are picked without modelling where a KV layer lands")
+    return found
+
+
+def test_kv_fit_hold() -> None:
+    assert kv_fit_hold_violations(GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()) == []
+
+
+def _hold_sycl_mutation(old: str, new: str, expected: str, label: str) -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    _assert_witnessed(cpp, cpp.replace(old, new, 1), lambda c: kv_fit_hold_violations(c, cache), expected, label)
+
+
+def test_mutation_refit_not_held_is_witnessed() -> None:
+    _hold_sycl_mutation("                in.fit_capacity[i] = placeable;\n", "", "not held to the KV layers",
+                        "hold dropped")
+
+
+def test_mutation_yield_by_bytes_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    mutated = cache.replace("select_optional_layout_yield(zone, blocks, layer_bytes)",
+                            "std::vector<size_t>(keys.size(), 0)", 1)
+    _assert_witnessed(cache, mutated, lambda c: kv_fit_hold_violations(cpp, c), "without modelling",
+                      "zone model dropped")

@@ -17846,11 +17846,19 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         ggml_sycl::kv_residency_result residency = ggml_sycl::plan_runtime_kv_residency(in);
         // Optional layout copies (S1-PRELOAD's dense oneDNN WOQ second copies)
         // never outrank KV: the fit counted them as headroom, so release what
-        // it needs now, before the KV is allocated. A probe only counts. The
-        // fit is then redone against the live headroom with nothing left to
-        // count: copies are released whole, so more may come back than asked,
-        // and a copy whose free could not complete here comes back later, so
-        // less may.
+        // it needs now, before the KV is allocated. A probe only counts.
+        //
+        // Headroom in bytes is not what the KV gets, though: each layer is one
+        // allocation, and a copy staged between two live weights frees into a
+        // hole a layer fits only if it is no larger. So the cache releases only
+        // copies whose room lets another of this device's layers land, and
+        // reports how many of them its zone can place; the fit is then redone
+        // against the live headroom with nothing left to count, held to what
+        // lands. Without that hold a layer the zone cannot place is not
+        // refused -- it goes to raw device memory outside the arena
+        // (llama.cpp-moua). Layers are modelled in allocation order, which is
+        // the order the fit keeps them in for a model without SWA layers; with
+        // them the hold is approximate.
         //
         // A released copy leaves two stale records, both handled: an exec
         // graph another context recorded may bake its pointer, so every
@@ -17860,19 +17868,40 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         // ONEDNN_WOQ (the ggml_sycl_get_weight_layout_ptr() fast path and
         // ggml_sycl_can_use_layout_for_kernel() ask the cache).
         if (residency.fits && !probe_mode) {
-            bool yielded = false;
+            bool refit = false;
+            in.fit_capacity.assign(in.devices.size(), SIZE_MAX);
             for (size_t i = 0; i < in.devices.size(); ++i) {
-                const size_t want = residency.yield_bytes[i];
-                if (want == 0) {
+                if (residency.yield_bytes[i] == 0) {
                     continue;
                 }
+                refit = true;
+                std::vector<size_t> layer_bytes;
+                for (size_t l = 0; l < n_kv_layers; ++l) {
+                    if (in.load_kv_device[l] == in.devices[i] && in.layer_kv_bytes[l] > 0) {
+                        layer_bytes.push_back(ggml_sycl::kv_layer_alloc_bytes(in.layer_kv_bytes[l]));
+                    }
+                }
                 const ggml_sycl::optional_layout_yield_result released =
-                    ggml_sycl::unified_cache_yield_optional_layouts(in.devices[i], next_plan.multi_device, want);
+                    ggml_sycl::unified_cache_yield_optional_layouts(in.devices[i], next_plan.multi_device, layer_bytes);
+                size_t placeable = 0;
+                for (size_t l = 0, n = 0; l < n_kv_layers && n < released.kv_layers; ++l) {
+                    if (in.load_kv_device[l] == in.devices[i] && in.layer_kv_bytes[l] > 0) {
+                        placeable += in.layer_kv_bytes[l];
+                        ++n;
+                    }
+                }
+                in.fit_capacity[i] = placeable;
+                if (released.kv_layers < layer_bytes.size()) {
+                    GGML_LOG_WARN(
+                        "[SYCL-PLAN] KV admission on device %d for n_ctx=%u: its zone can place %zu of %zu KV layers "
+                        "(%.1f MB a layer) in its free blocks; the rest demote rather than leave the arena\n",
+                        in.devices[i], n_ctx, released.kv_layers, layer_bytes.size(),
+                        layer_bytes.empty() ? 0.0 : layer_bytes.back() / mb);
+                }
                 if (released.retired == 0) {
                     continue;
                 }
                 ggml_sycl_optional_layouts_retired();
-                yielded = true;
                 if (released.freed > 0) {
                     GGML_LOG_WARN(
                         "[SYCL-PLAN] KV admission released %zu optional oneDNN WOQ layout copies (%.1f MB) on device "
@@ -17887,7 +17916,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                         released.retired - released.freed, released.pending_bytes / mb, in.devices[i], n_ctx);
                 }
             }
-            if (yielded) {
+            if (refit) {
                 for (size_t i = 0; i < in.devices.size(); ++i) {
                     in.available[i] = ggml_sycl::unified_cache_kv_vram_available(in.devices[i], next_plan.multi_device);
                 }
@@ -38706,7 +38735,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     const size_t   kv_per_layer = kv_slice.bytes();
     const uint32_t n_kv_layers  = kv_slice.kv_layers();
 
-    const size_t aligned_per_layer = (kv_per_layer + 511) & ~size_t(511);
+    const size_t aligned_per_layer = ggml_sycl::kv_layer_alloc_bytes(kv_per_layer);
     GGML_LOG_INFO("[KV-ALLOC] kv_per_layer=%.1f MB (full=%.1f MB, swa=%.1f MB), n_kv_layers=%u/%u\n",
                   kv_per_layer / (1024.0 * 1024.0), planner_full_kv / (1024.0 * 1024.0),
                   planner_swa_kv / (1024.0 * 1024.0), n_kv_layers, n_layers);

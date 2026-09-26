@@ -2245,12 +2245,15 @@ enum class expert_retire_status : uint8_t {
 // What yield_optional_layouts() did. `retired` copies are hidden from routing
 // at once. `freed`/`freed_bytes` are the ones whose storage is back in its zone
 // when the call returns; the rest (`retired - freed`, `pending_bytes`) are
-// still held by a lease or an unfinished free and return later.
+// still held by a lease or an unfinished free and return later. `kv_layers` is
+// how many of the requested layers the zone can place as the call returns,
+// yield or not.
 struct optional_layout_yield_result {
     size_t retired       = 0;
     size_t freed         = 0;
     size_t freed_bytes   = 0;
     size_t pending_bytes = 0;
+    size_t kv_layers     = 0;
 };
 
 inline bool expert_retire_succeeded(expert_retire_status status) {
@@ -2918,14 +2921,19 @@ class unified_cache {
     // mark_optional_layout() tags a dense weight's staged copy in `layout`.
     // optional_layout_bytes() is what yield_optional_layouts() could release
     // now: device-resident, non-retired copies nobody but the cache's own
-    // direct-stage mirror leases. yield_optional_layouts() retires those,
-    // largest first, until they cover `bytes`, waits once for every queue the
-    // cache orders frees against (a copy's readers take no lease), and
-    // returns their storage to its zone before it returns. Primaries are never
-    // touched. A cold, context-admission-time call: not for a dispatch path.
+    // direct-stage mirror leases. yield_optional_layouts() retires the ones
+    // that let more of `layer_bytes` (KV layer allocations, in the order the
+    // tiered KV allocator makes them) land in the zone -- a copy whose hole no
+    // layer can use stays (select_optional_layout_yield()) -- waits once for
+    // every queue the cache orders frees against (a copy's readers take no
+    // lease), and returns their storage to its zone before it returns.
+    // Primaries are never touched. kv_layers_allocatable() is how many of
+    // `layer_bytes` the zone can place now. Cold, context-admission-time calls:
+    // not for a dispatch path.
     bool                         mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout);
     size_t                       optional_layout_bytes() const;
-    optional_layout_yield_result yield_optional_layouts(size_t bytes);
+    optional_layout_yield_result yield_optional_layouts(const std::vector<size_t> & layer_bytes);
+    size_t                       kv_layers_allocatable(const std::vector<size_t> & layer_bytes);
 
     // Fast O(1) lookup for inference-time weight resolution.
     // Returns nullptr if not staged.  No allocation, no state machine.
@@ -4512,6 +4520,9 @@ class unified_cache {
     std::mutex arena_destroy_mutex_;  // serializes retryable explicit destroy transactions
     static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
+    // A copy of the allocators KV is carved from (kv_zone_model), and where
+    // each of `ptrs` sits in it when `blocks` is given.
+    kv_zone_model kv_zone_snapshot(const std::vector<const void *> & ptrs, std::vector<kv_zone_block> * blocks);
     using zone_registry_commit_fn = bool (*)(void *, const arena_authority::allocation_record &, void *) noexcept;
     bool arena_register_exact(vram_zone_id zone, uint64_t allocation_id, size_t offset, size_t extent) noexcept;
     void arena_unregister_exact(vram_zone_id zone, size_t offset) noexcept;
@@ -6674,11 +6685,14 @@ bool   unified_cache_mode_is_global();
 // as well as a primary; the runtime-context transaction counts
 // unified_cache_optional_layout_bytes() as KV headroom and, before it demotes
 // any KV layer, releases what the KV needs with
-// unified_cache_yield_optional_layouts(). `multi_device` reads the device's
-// cache as unified_cache_kv_vram_available() does, so the two numbers come
-// from the same zone.
-size_t unified_cache_optional_layout_bytes(int device_id, bool multi_device);
-optional_layout_yield_result unified_cache_yield_optional_layouts(int device_id, bool multi_device, size_t bytes);
+// unified_cache_yield_optional_layouts(), which also says how many of the
+// device's KV layers its zone can place. `multi_device` reads the device's
+// cache as unified_cache_kv_vram_available() does, so the numbers come from
+// the same zone.
+size_t                       unified_cache_optional_layout_bytes(int device_id, bool multi_device);
+optional_layout_yield_result unified_cache_yield_optional_layouts(int                         device_id,
+                                                                  bool                        multi_device,
+                                                                  const std::vector<size_t> & layer_bytes);
 
 // Sum of zone_used(KV) + zone_used(ONEDNN) + zone_used(RUNTIME) + zone_used(SCRATCH).
 // Returns 0 when arena is inactive.
