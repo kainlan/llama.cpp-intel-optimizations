@@ -15977,7 +15977,12 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // holding KV-zone bytes is released here. A slot still claimed by an
     // in-flight dispatch refuses the release, never forced: the ring is kept,
     // KV admission still counts what it holds (read from its slots), and the
-    // next KV re-fit re-admits it.
+    // next KV re-fit re-admits it. The ring is per device, not per model, so
+    // this also releases a ring that another still-loaded model's live
+    // context admitted. That is not new: the planned sizes, n_ubatch and slot
+    // flags above were already overwritten for that model here. Its dispatch
+    // falls back when the planned scratch is unavailable, and its published
+    // charge for the ring becomes an over-count.
     const size_t stale_ring_kv_zone_bytes = ggml_sycl::unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(ctx->device);
     if (stale_ring_kv_zone_bytes > 0) {
         ggml_sycl::unified_cache * ring_cache = ggml_sycl::get_existing_unified_cache_for_device(ctx->device);
@@ -17645,11 +17650,11 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
                                        "compute-buffer reserve",
                                        admission.kv_zone_headroom_bytes / mb, admission.compute_reserve_bytes / mb);
         }
-        // The admission can pass a ring the allocator then cannot place; naming
-        // n_ubatch itself would name the size just refused.
+        // The size check can pass a ring the allocator then cannot place, on
+        // either route; naming n_ubatch itself would name the size just refused.
         if (fits >= n_ubatch && clause_len >= 0 && (size_t) clause_len < sizeof(fits_clause)) {
             std::snprintf(fits_clause + clause_len, sizeof(fits_clause) - clause_len,
-                          "; the zones have the room, but the allocator could not place the slots");
+                          "; the size fits, but the allocator could not place the slots");
         } else if (fits >= 32 && clause_len >= 0 && (size_t) clause_len < sizeof(fits_clause)) {
             std::snprintf(fits_clause + clause_len, sizeof(fits_clause) - clause_len,
                           "; the largest -ub that fits is about %u", fits);
