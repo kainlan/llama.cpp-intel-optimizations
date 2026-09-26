@@ -103,9 +103,9 @@ def pool_leg_violations(source: str) -> list[str]:
         found.append("pool_leg has no free() override")
     else:
         free_code = strip_comments(block(pool_leg, FREE_FN))
-        # Qualified or not, there is exactly one call, and it passes the live
-        # recording state.
-        call_count = len(re.findall(r"\bpool_legacy_release\s*\(", free_code))
+        # Qualified or not, with or without explicit template arguments, there
+        # is exactly one call, and it passes the live recording state.
+        call_count = len(re.findall(r"\bpool_legacy_release\b", free_code))
         calls = re.findall(r"\bpool_legacy_release\s*\(\s*ptr\s*,\s*([^,]+?)\s*,", free_code)
         if call_count != 1:
             found.append(f"free() calls pool_legacy_release {call_count} times, expected once")
@@ -129,12 +129,23 @@ def pool_leg_violations(source: str) -> list[str]:
         call_at = call.start() if call else -1
         lock_block_start = -1
         lock_block_end = -1
+        lock_blocks = []
         for m in re.finditer(r"\{\s*std::lock_guard<std::mutex>\s+lock\(arena_handles_mutex\);", free_code):
             end = matching_brace(free_code, m.start())
-            if m.start() < call_at < end:
+            lock_blocks.append((m.start(), end))
+            if lock_block_end < 0 and m.start() < call_at < end:
                 lock_block_start = m.start()
                 lock_block_end = end
-                break
+
+        # The declaration, the helper argument and the post-lock release are
+        # the only legitimate uses; any other (an alias, a second release) can
+        # release the owner somewhere this gate does not look.
+        dropped_uses = len(re.findall(r"\bdropped\b", free_code))
+        if dropped_uses != 3:
+            found.append(
+                f"free() names dropped {dropped_uses} times, expected 3 (declaration, helper argument, "
+                "post-lock release)"
+            )
         if lock_block_end < 0:
             found.append("free() does not call pool_legacy_release() inside a lock_guard block")
         else:
@@ -157,6 +168,11 @@ def pool_leg_violations(source: str) -> list[str]:
                 found.append(
                     "free() does not release dropped (`dropped = {};`) exactly once after the lock block closes -- "
                     "the unified-cache free would run under arena_handles_mutex"
+                )
+            elif any(start < releases[0] < end for start, end in lock_blocks):
+                found.append(
+                    "free() releases dropped inside an arena_handles_mutex lock_guard block -- "
+                    "the unified-cache free would run under the lock"
                 )
 
     if DTOR_FN not in pool_leg:
@@ -255,14 +271,62 @@ def test_release_by_scoped_move_under_lock_is_witnessed() -> None:
 
 def test_second_unqualified_call_is_witnessed() -> None:
     """A second call without the ggml_sycl:: qualifier, passing false. It
-    names no buffer_pool, so only the call count can catch it."""
+    names neither buffer_pool nor dropped, so only the call count can catch
+    it."""
     source = SOURCE.read_text()
     anchor = "        dropped = {};\n"
     assert source.count(anchor) == 1, "second-call anchor not found"
     mutated = source.replace(
         anchor,
         anchor + "        pool_legacy_release(ptr, false, (ggml_sycl_buffer *) nullptr, 0, active_handles,\n"
-        "                            graph_retained_handles, dropped, pool_size);\n",
+        "                            graph_retained_handles, pool_size);\n",
+        1,
+    )
+    violations = pool_leg_violations(mutated)
+    assert violations == ["free() calls pool_legacy_release 2 times, expected once"], (
+        f"mutation was not witnessed: {violations}"
+    )
+
+
+def test_reference_alias_release_under_lock_is_witnessed() -> None:
+    """Alias dropped by reference, then release through the alias inside the
+    lock: no use of the name dropped appears in the lock block."""
+    source = SOURCE.read_text()
+    decl = "        ggml_sycl::mem_handle                 dropped;\n"
+    assert source.count(decl) == 1, "alias mutation anchor not found"
+    mutated = source.replace(decl, decl + "        auto & d = dropped;\n", 1)
+    mutated = insert_after_locked_call(mutated, "            d = {};\n")
+    violations = pool_leg_violations(mutated)
+    assert any("names dropped 4 times, expected 3" in v for v in violations), (
+        f"mutation was not witnessed: {violations}"
+    )
+
+
+def test_release_in_a_second_lock_block_is_witnessed() -> None:
+    """Keep the release after the helper's lock block, but inside another."""
+    source = SOURCE.read_text()
+    release = "        dropped = {};\n"
+    assert source.count(release) == 1, "second-lock mutation anchor not found"
+    mutated = source.replace(
+        release, "        { std::lock_guard<std::mutex> lock(arena_handles_mutex); dropped = {}; }\n", 1
+    )
+    violations = pool_leg_violations(mutated)
+    assert violations == [
+        "free() releases dropped inside an arena_handles_mutex lock_guard block -- "
+        "the unified-cache free would run under the lock"
+    ], f"mutation was not witnessed: {violations}"
+
+
+def test_second_call_with_template_arguments_is_witnessed() -> None:
+    """A second call spelled with explicit template arguments, which a
+    name-then-paren count does not see."""
+    source = SOURCE.read_text()
+    anchor = "        dropped = {};\n"
+    assert source.count(anchor) == 1, "templated-call anchor not found"
+    mutated = source.replace(
+        anchor,
+        anchor + "        ggml_sycl::pool_legacy_release<ggml_sycl_buffer>(ptr, false, nullptr, 0, active_handles,\n"
+        "                                                          graph_retained_handles, pool_size);\n",
         1,
     )
     violations = pool_leg_violations(mutated)
