@@ -51,7 +51,9 @@ Design, revision 7.11. Author: impl-moua, 2026-09-26. The revisions answer eleve
 - design review r10 (design-moua-r10 on `85635feee..9d4d826b3`: 0 Critical, 6 Important,
   7 Minor), the lead's rulings on it (§M11), §M10, and design-1oxa-r7's I-3 (§X7, the load's
   room is admitted at the early stage), recorded in §6.13. Revision 7.11 is one commit on top
-  of 7.10 (`9d4d826b3`).
+  of 7.10 (`9d4d826b3`). Revision 7.11a is one commit on top of 7.11 (`c445f3c46`): §M11a (the
+  term filter on the clear and the fit), design-23mk-r6's H1 arm, and zhcn 5.7's and
+  f6218f3's relays, recorded in §6.13.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
@@ -783,7 +785,9 @@ written:
   - `CONTEXT`, id = the backend context's `execution_context_id` (`common.hpp:5667`, set at
     `ggml-sycl.cpp:14841` and `:14873`), from the context's transaction to its destruction.
     This design's transaction ranges ((0) and step 5) are `CONTEXT` ranges with term
-    `REGION`, and the commit re-fit's `own_ranges` are the ranges whose owner is this context;
+    `REGION`, and the commit re-fit's `own_ranges` are this context's ranges **of term
+    `REGION` only**: 23mk's persistent holds under the same `{CONTEXT, id}` are other terms,
+    so the re-fit treats them as allocated and never carves into them (rulings §M11a);
   - `DEVICE`, id = the device index, from the first load (by retag) to the last unload
     (23mk's).
 
@@ -794,7 +798,23 @@ written:
   `token.load` (it can run on another thread, rulings §M9 F2), and a dispatch or transaction
   site from its context's `execution_context_id`. An allocation whose caller fills nothing is
   not anyone's own, whatever thread it runs on. `pending_ranges()` returns each range with its
-  owner and term; a fit passes its own as `own_ranges` and treats every other as allocated.
+  owner and term; a fit passes as `own_ranges` only its owner's ranges of the terms it owns,
+  and treats every other range as allocated, a same-owner range of another term included.
+
+  **Every operation that selects ranges by owner also takes a term filter (rulings §M11a;
+  design-23mk-r6 I-2, §Z8 I-2).** The three, whose signatures both designs state identically:
+  - `retag_pending(owner, term_filter, new_owner)` (A4);
+  - `clear_pending(owner, term_filter)` (A2);
+  - the fit's query `pending_bytes(owner, term_filter)`: the free bytes of `owner`'s ranges
+    whose term is in `term_filter`, which is what a fit may count as its own room.
+
+  `term_filter` is a `pending_term_mask`; `PENDING_TERM_ALL` names every term, and only a
+  load's commit and rollback use it, since a load owns every term it records. Why the filter
+  is needed on the clear and the fit too: 23mk clears `{CONTEXT, id}` by RAII on every pre-carve
+  exit (a busy ring during the climb is one), and an unfiltered clear there would wipe the same
+  context's persistent holds; and a re-fit counting every `{CONTEXT, id}` range as its own
+  could carve into them. So every clear this design makes of a context's ranges passes
+  `REGION`, and every fit counts only `REGION`.
 - **A2, drawing inside one's own ranges.** `allocate_within(owner, term, size, align, tag,
   consume)` is a first fit over the free parts of the owner's ranges **of that term**, carved
   with `allocate_at` semantics, so remainders stay whole and coalesced (r5 m-c). The term keeps
@@ -810,8 +830,10 @@ written:
   - a miss inside the owner's own ranges is that owner's plan bug and never falls through to
     `allocate_excluding` outside them: `[KV-PLAN-BUG]` for a context's KV carve (§2.8), 23mk's
     `[ZONE-PLAN-BUG]` for its terms and for a load's weight draw (its WEIGHT-zone miss row);
-  - `clear_pending(owner)` is idempotent and clears **all** of that owner's ranges, of every
-    term, on every TLSF of the device.
+  - `clear_pending(owner, term_filter)` is idempotent and clears that owner's ranges whose term
+    is in `term_filter`, on every TLSF of the device; ranges of the owner's other terms stay
+    (rulings §M11a). This design's context clears pass `REGION`; a load's pass
+    `PENDING_TERM_ALL`.
 
   The commit's planned carves keep `allocate_at` at the offsets the re-fit chose (fit ==
   carve, above), which is `allocate_within` with the offset fixed, and trim the same way.
@@ -834,8 +856,10 @@ written:
   1. 23mk's `retag_pending({LOAD, txn}, MODEL_TERM, {MODEL, id})`;
   2. 23mk's `retag_pending({LOAD, txn}, DEVICE_TERM, {DEVICE, dev})` (row 118's DMA
      staging, §Z6x 4);
-  3. `clear_pending({LOAD, txn})`, which drops everything the load still holds: this design's
-     undrawn `WEIGHT` ranges and 23mk's `SCRATCH` hold.
+  3. `clear_pending({LOAD, txn}, PENDING_TERM_ALL)`, which drops everything the load still
+     holds: this design's undrawn `WEIGHT` ranges and 23mk's `SCRATCH` hold. After steps 1
+     and 2 only those two terms remain under `{LOAD, txn}`, so the filter could name them;
+     `PENDING_TERM_ALL` also covers a term a later design adds.
 
   A rollback runs only step 3. So after B's commit nothing of B's is `{LOAD, txn}`, and a
   later load C records and draws its own `SCRATCH` hold against a TLSF that holds only B's
@@ -845,10 +869,23 @@ written:
 Whichever design lands first implements them in the one primitive (L4 here); 23mk's §4
 depends on them. H1 adds `allocate_within` (both `consume` forms, reuse after a free inside an
 unconsumed range, a miss reported and not fallen through, and a `WEIGHT` draw that never lands
-in a `SCRATCH` range of the same owner), `clear_pending` idempotence, the term-filtered retag
-(only the named terms move) then the clear (every leftover goes), and `replace_within`'s refusal
-at `owner_use_count() != 1` and its restore on a failed carve, each with `check_invariants()`
-after.
+in a `SCRATCH` range of the same owner), `clear_pending` idempotence, and `replace_within`'s
+refusal at `owner_use_count() != 1` and its restore on a failed carve, each with
+`check_invariants()` after. Three arms carry the term filter (rulings §M11a):
+- **retag, then clear.** Load B records a `WEIGHT` range it draws partly, a second `WEIGHT`
+  range it never draws (the **undrawn** range), a `SCRATCH` range and a `MODEL_TERM` range.
+  After the commit's three steps the undrawn range, the undrawn remainder and the `SCRATCH`
+  range are gone (the TLSF's free bytes include them), the `MODEL_TERM` range survives whole
+  as `{MODEL, B}`, and nothing is left under `{LOAD, B}`. The undrawn range is what makes the
+  arm able to fail: under 7.10's move-every-range retag it moves to `{MODEL, B}` and survives
+  the clear, and the arm reports it;
+- **a filtered context clear.** `{CONTEXT, c}` holds a `REGION` range and a 23mk hold of
+  another term; `clear_pending({CONTEXT, c}, REGION)` drops the first and leaves the second
+  whole. Witness: an unfiltered clear, which drops both;
+- **the fit counts only its terms.** With the same two ranges, `pending_bytes({CONTEXT, c},
+  REGION)` counts only the `REGION` range, and a re-fit with `own_ranges` built from it places
+  nothing inside 23mk's hold. Witness: a fit that counts every range of the owner, which
+  carves into the hold.
 
 #### 2.3.4 Reset, settle, and the dead KV reclaim
 
@@ -936,7 +973,8 @@ kv_region_fit(const shared_zone_geometry & g, const kv_region_request & r) -> kv
   `frontier_walk` (L1's 044k contract, `9e0a708dc`), it runs **only under the group mutex**,
   inside the snapshot copy-out (addendum (d));
 - `pending_ranges`: other transactions' pending ranges, which the fit treats as allocated
-  (§2.3.1). At the commit re-fit, this call's own ranges are passed separately as `own_ranges`,
+  (§2.3.1). At the commit re-fit, this call's own ranges (term `REGION`) are passed separately
+  as `own_ranges`,
   and the re-fit may place **only inside them** (§2.4.2 step 6, r4 I8);
 - `self_extents`: the extents and slots this call carved earlier in the **same** transaction,
   on an earlier device of a multi-device commit (§2.4.2 step 6). A same-key republish never
@@ -1271,8 +1309,9 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     classified test-only class. The H9 arms that need a parked L0 holder park inside a real
     entry through a test park point instead;
   - the tenant-only path's llama-held scope, `ggml_backend_sycl_replan_scope`, which llama opens
-    before (s) on the growth path and closes before `sched_reserve` (§2.4.2 "The coverage
-    query"; rulings §M9a). The probe and (ii) that run inside it are nested holds;
+    before (s) on the growth path and closes before ALLOC's `graph_reserve` inside
+    `sched_reserve_impl` (§2.4.2 "The coverage query"; rulings §M9a). The probe and (ii) that
+    run inside it are nested holds;
   - the teardown release proc, and every other ring mutator outside graph compute.
 - **Orphaned publishers are deleted (rulings §M8 I-1; docs/plans/2026-04-22 A5).** A caller
   census over the whole tree at `3d9414c8c` (the command is in §6.11) finds no caller for three
@@ -1487,10 +1526,10 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       result.
     - **Lifetime.** Each range is trimmed as it is consumed. At `load_end`'s commit, under its
       L0 hold and after the preload, 23mk's two term-filtered retags run and then
-      `clear_pending({LOAD, txn})` drops what is left: B's undrawn `WEIGHT` ranges and 23mk's
-      `SCRATCH` hold (§2.3.3 A4). A load that aborts runs only the clear, on its unwind, in the
-      load transaction's rollback. A draw that misses inside B's own ranges is a
-      plan-versus-materialized-bytes mismatch in B's own plan, 23mk's WEIGHT-zone miss row
+      `clear_pending({LOAD, txn}, PENDING_TERM_ALL)` drops what is left: B's undrawn `WEIGHT`
+      ranges and 23mk's `SCRATCH` hold (§2.3.3 A4). A load that aborts runs only the clear, on
+      its unwind, in the load transaction's rollback. A draw that misses inside B's own ranges
+      is a plan-versus-materialized-bytes mismatch in B's own plan, 23mk's WEIGHT-zone miss row
       (`[ZONE-PLAN-BUG]`); no other transaction can cause it any more;
   - **(c) Identity.** The load's own identity is its bound candidate
     (`ggml_sycl_bound_load_candidate`, `:2681`; thread-local, `model-lifecycle.hpp:305`,
@@ -1883,12 +1922,13 @@ prompt-processing performance, never correctness, and the yield WARN names them.
        rows;
      - `lock.lock()`. A changed plan here (jehw's relock, master `3d9414c8c` `:18122`) is
        `[CONTEXT-PLAN-BUG]` under L0 (rulings §E.2), never `busy`; the guard's first phase then
-       clears the pending ranges.
+       clears this call's pending ranges, `clear_pending({CONTEXT, id}, REGION)`.
    - **A yielded copy is never lazily re-staged.** Dispatch reads the primary's materialized
      layout (P3, "the loaded layout is the answer"), and H7h gates it.
 6. **Commit the carve (r2 N-I7; r4 I8, m3).**
    - **Re-fit only inside this call's own pending ranges.** Re-snapshot, and re-run
-     `kv_region_fit` with `forced_host` and `own_ranges` = this call's ranges, as the only room
+     `kv_region_fit` with `forced_host` and `own_ranges` = this call's `REGION` ranges
+     (never 23mk's holds of the same context, rulings §M11a), as the only room
      it may place into. Nothing else can have entered them: weights exclude them, and every
      other transaction's fit treats them as allocated. So the only change the re-fit can see is
      a **shortfall**: a pick that was not retired (jehw's retire re-check, `:7804-7811`) or whose
@@ -2219,10 +2259,11 @@ contribution. It never re-fits KV and never yields.
   without L0: the covered path does not write it at all. zhcn 5.4 decides coverage through this
   same read-only query and names 5.3's key-record write as its RED (row 26), so the r8 m-1
   difference is closed (§6.11; r9 addendum m-12).
-- **The scope closes before `sched_reserve_impl`'s ALLOC (rulings §M9a, §M11 m-5; r9
-  addendum I-5(b)).** llama closes the replan scope once the guard's second phase has run, and
-  only then calls `sched_reserve` to rebuild the scheduler that (b) destroyed; in particular it
-  is closed before `sched_reserve_impl` reaches gallocr's ALLOC. That ALLOC (`graph_reserve`)
+- **The scope closes before ALLOC's `graph_reserve` (rulings §M9a, §M11 m-5; r9 addendum
+  I-5(b); zhcn 5.7).** The growth runs inside `sched_reserve_impl` (zhcn f6218f3): MEASURE,
+  the coverage growth, then the replan scope around steps 3-6, which llama closes once the
+  guard's second phase has run; only then does `sched_reserve_impl` reach gallocr's ALLOC,
+  whose `graph_reserve` rebuilds what (b) destroyed. That ALLOC (`graph_reserve`)
   allocates the SYCL compute buffers, and its failure path is a host-pinned retry
   (`ggml_backend_sycl_buffer_type_alloc_buffer`; `llama-context.cpp:1587-1589` at
   `3d9414c8c`). That growth is unplanned inference-time work on the decoding thread, where the
@@ -2829,7 +2870,7 @@ inventory. What differs, because it is not in the device geometry:
     stays gated. Its false positive while another model is in TG (the sticky phase reads TG
     during B's load) is **llama.cpp-dhpw**'s to fix; broadening the exemption is not the fix;
   - **`sched_reserve`'s host fallback is not exempt either.** llama's replan scope closes
-    before `sched_reserve` (§2.4.2 "The scope closes before `sched_reserve`"), so the
+    before ALLOC's `graph_reserve` (§2.4.2 "The scope closes"), so the
     host-pinned retry of `graph_reserve` (`llama-context.cpp:1587-1589`) runs with no
     `TRANSACTION` token and fires the gate as unplanned inference-time growth, with a debug
     assertion that it is so;
@@ -4244,15 +4285,17 @@ L7 documents this limit, and pattern #2 remains the remedy.
         growth, and its `site=` field names B's load weight fill (role `WEIGHT`), not a context
         carve; no abort is expected at gate 1. RED: 7.7a's held-any exemption, under which the
         WARN is silent;
-      - **negative (b), gallocr's ALLOC is not exempt (I-5(b); §M11 m-4, m-5):** the vehicle
-        is `sched_reserve_impl`'s ALLOC, which exists before and after zhcn lands, not the
-        resync, which zhcn deletes (zhcn :293). A modelled growth runs the path (scope,
-        wrapper, guard) and closes the scope; then `sched_reserve_impl` reaches ALLOC with the
-        RUNTIME, KV and SCRATCH zones filled so the compute buffer takes the host-pinned
-        fallback. At gate 2 the fallback asserts, since no `TRANSACTION` token is held, and the
-        arm checks `ggml_sycl_replan_token_held()` is false at ALLOC's entry. RED: a scope left
-        open across ALLOC, under which the fallback is exempt and silent, and which the
-        alloc-entry and fallback assertions (§2.4.2 "The scope closes") both catch;
+      - **negative (b), gallocr's ALLOC is not exempt (I-5(b); §M11 m-4, m-5):** the vehicle is
+        zhcn's H4h (zhcn f6218f3 §3.1, §3.3), adopted as is: `sched_reserve_impl`'s own growth
+        path, MEASURE → coverage GROWTH → scope → steps 3-6 → scope closed → ALLOC, not the
+        resync, which zhcn deletes (zhcn :293). It is reached from a ladder rung, from a
+        setter's next decode (`sched_reserve_nothrow`) and from `memory_update`; the arm runs it
+        from each. ALLOC runs with the RUNTIME, KV and SCRATCH zones filled so the compute
+        buffer takes `alloc_buffer`'s host-pinned fallback. At gate 2 the fallback asserts,
+        since no `TRANSACTION` token is held, and the arm checks `ggml_sycl_replan_token_held()`
+        is false at ALLOC's entry. RED: a scope left open across ALLOC, under which the fallback
+        is exempt and silent, and which the alloc-entry and fallback assertions (§2.4.2 "The
+        scope closes") both catch;
       - **the tree each runs on:** both arms run on the landing tree, moua L4-L6 over zhcn
         (the landing order in §4), where the resync is gone and zhcn's in-`sched_reserve`
         scope exists; arm (b) also runs zhcn's scope as the open-scope RED. Neither depends on
@@ -5801,7 +5844,7 @@ master `76c7f6548` at `db609bd15`, and every new line was checked with `git show
 | §Z42.3 (no per-record zone) | The zone line and the record's zone field are deleted (§2.4.3 "Zone"). |
 | §ZR5 I-1 (host sizing over every rung) | m-10 above. |
 | §ZR5 I-2 (one owner-first reservation per slot index, contiguous) | §2.4.3's HOLD is per-index reservations through the existing nsl3 contiguous path (revision 7.7a; 7.7 wrongly routed a large slot to `allocate_runtime` as an L4 gap); H4 and H7an. |
-| §ZR5 I-3 (identity compare and republish in one section) | §2.4.2 "The allowlist": the four sites call `ggml_sycl_republish_current_plan_into_empty(cache)` (revision 7.7a, lead ruling), which writes no device-global; H7ai and H9. |
+| §ZR5 I-3 (identity compare and republish in one section) | §2.4.2 "The allowlist": the four sites call `ggml_sycl_republish_current_plan_into_empty(cache, owner)` (revision 7.7a, lead ruling; the `owner` argument since 7.10, §Z6 I-C; three sites once `:60125`'s dead function is deleted), which writes no device-global; H7ai and H9. |
 
 **Revision 7.7a: the lead's allowlist ruling and zhcn 5.4's §3.8 rows (head `1547f42`).**
 
@@ -5811,7 +5854,7 @@ master `76c7f6548` at `db609bd15`, and every new line was checked with `git show
 | 22 | the C2t flush is `ggml_sycl_cpu_tg_flush_pending()` over four lists | **Adopted** (§2.4.2 (s)); cites checked at `3d9414c8c`. |
 | 26 | the §M76.1 monotone statement for the covered path | **Adopted** (§2.4.2 "Why COVERED is safe without L0"): the entry's only writers, and the ring as a max over live contributions. zhcn's two H9 arms are pointed to. |
 | 27 | H7ag gains the four scatter lists and `g_moe_down_shadow` | **Adopted** (§2.4.2 census, H7ag: nine named containers; the not-holders listed). One cite corrected: the shadow key's handle compare is `:21130-21131` (the `if (use_handle)` and its return), not `:21127-21129`. |
-| 30 | the allowlist calls `ggml_sycl_republish_current_plan_into_empty(cache)` | **Adopted** (lead ruling; §2.4.2 "The allowlist", H7ai, H9). The emptiness check outside the mutex is at `:5885-5886`. |
+| 30 | the allowlist calls `ggml_sycl_republish_current_plan_into_empty(cache, owner)` (the `owner` argument since 7.10) | **Adopted** (lead ruling; §2.4.2 "The allowlist", H7ai, H9). The emptiness check outside the mutex is at `:5885-5886`. |
 
 **The two cross-design items are closed (7.7a), and this is the agreed text.**
 - **The table opens at (c).** zhcn 5.4 §3.1 step 5(c): under `kv_region_mutex_`, on each
@@ -5974,7 +6017,7 @@ into this round.
 
 | id | finding | disposition |
 |----|---------|-------------|
-| I-A | 7.10's `retag_pending(from, to)` moves every term, so a later load's `SCRATCH` hold meets B's undrawn leftovers retagged as model terms | **Changed (rulings §M11 I-A).** Each pending range carries a term tag (`WEIGHT`, `SCRATCH`, `MODEL_TERM`, `DEVICE_TERM`, `ARENA`, `REGION`) beside its owner. `retag_pending(owner, term_filter, new_owner)` moves only the terms 23mk names (`MODEL_TERM` to `{MODEL, id}`, `DEVICE_TERM` to `{DEVICE, dev}`); `clear_pending(owner)` then drops the rest; a rollback runs only the clear. One primitive, the same in both designs (§2.3.3). H7ap arm: after commit B's leftovers are gone and C's `SCRATCH` hold is admitted; witness: an unfiltered retag. |
+| I-A | 7.10's `retag_pending(from, to)` moves every term, so a later load's `SCRATCH` hold meets B's undrawn leftovers retagged as model terms | **Changed (rulings §M11 I-A).** Each pending range carries a term tag (`WEIGHT`, `SCRATCH`, `MODEL_TERM`, `DEVICE_TERM`, `ARENA`, `REGION`) beside its owner. `retag_pending(owner, term_filter, new_owner)` moves only the terms 23mk names (`MODEL_TERM` to `{MODEL, id}`, `DEVICE_TERM` to `{DEVICE, dev}`); `clear_pending(owner)` then drops the rest; a rollback runs only the clear. One primitive, the same in both designs (§2.3.3). *7.11a (§M11a):* the clear and the fit query take the term filter too (below). H7ap arm: after commit B's leftovers are gone and C's `SCRATCH` hold is admitted; witness: an unfiltered retag. |
 | I-B | the compute-arena "own range" does not exist: on arena devices the arena is `SCRATCH` itself | **Changed (§M11 I-B).** On an arena device `reserve_compute_arena` points at `SCRATCH` and allocates nothing (`unified-cache.cpp:20707-20740`), so there is no range: the early stage checks `zone_capacity(SCRATCH) >= arena_bytes` and refuses by name, replacing the `GGML_ABORT` (`:12470`). On a non-arena device it is a real `COMPUTE` allocation (`:20757-20790`) and draws on no range. H7ap arm and witness. |
 | I-C | where the SYCL<n> weight buffer draws is unstated, and master's chain is RUNTIME first | **Changed (§M11 I-C).** With a load bound, `alloc_buffer` for a SYCL<n> weight buffer calls `allocate_within({LOAD, txn}, WEIGHT, ..., consume = true)` first; a miss is `[ZONE-PLAN-BUG]` and a null buffer (the load fails at `llama-model.cpp:2637`), never the RUNTIME-first chain (`:37642-37673`). This is a stated placement change from master. "Drawn once" rests on the disjoint tensor sets (the SYCL<n> buffers' tensors and `g_sycl_host_weight_extras`), not on the preload's early return. H7ap arms. |
 | I-D | deleting `load_end`'s site does not remove the `contexts.back()` binding: step 7 calls the same materializer | **Changed (§M11 I-D).** The materializer takes `ggml_backend_sycl_context &` from step 7 and binds by `(ctx.execution_context_id, owner_device)`; it never resolves a context itself. H7am arm: C1 re-plans after C2 exists and binds C1's queue; witness: the `get_backend_context_for_device` binding restored. |
@@ -6003,7 +6046,27 @@ into this round.
   `allocate_within(owner, term, size, align, tag, consume)`; `size_t retag_pending(pending_owner
   owner, pending_term_mask term_filter, pending_owner new_owner)`; the commit order (retag
   `MODEL_TERM`, retag `DEVICE_TERM`, then `clear_pending({LOAD, txn})`); a rollback runs only
-  the clear; `clear_pending` clears every term.
+  the clear; `clear_pending` clears every term. *Superseded by 7.11a (below):* the clear takes
+  a term filter, and the fit query `pending_bytes` joins them.
 - m-5 leaves two peer differences for the lead to reconcile, not this design: zhcn's kind count
   and its `into_empty` arity.
 - Nothing was built for 7.11; it is a document change only.
+
+**Revision 7.11a: §M11a, design-23mk-r6's H1 arm, zhcn 5.7 and f6218f3.** These arrived after
+7.11 was committed.
+
+| item | disposition |
+|------|-------------|
+| §M11a (design-23mk-r6 I-2; §Z8 I-2): the term filter on every by-owner operation | **Adopted** (§2.3.3 "The pending-range primitive"). The three signatures are stated exactly: `retag_pending(owner, term_filter, new_owner)`, `clear_pending(owner, term_filter)` and the fit query `pending_bytes(owner, term_filter)`. This design's context clears pass `REGION` (the guard's rollback at the relock, §2.4.2 step 5), its fits and the commit re-fit count only `REGION` ranges as `own_ranges` (step 6, (ii)), and a load's commit and rollback clear with `PENDING_TERM_ALL`. H1 arms: a filtered context clear leaves 23mk's hold of the same context, and a fit counting every owner range is the witness that carves into it. |
+| design-23mk-r6: H1's retag-then-clear arm is vacuous without an undrawn range | **Fixed.** The arm records an undrawn `WEIGHT` range and a `MODEL_TERM` range; after the commit the undrawn range is gone and the `MODEL_TERM` range survives whole as `{MODEL, B}`. Under 7.10's move-every-range retag the undrawn range survives, so the arm can fail. A4's step 3 now names its filter, so "the clear drops the undrawn ranges" holds as written. |
+| zhcn 5.7 (a): the scope closes before ALLOC's `graph_reserve`, not before `sched_reserve` | **Fixed** in §2.4.2's heading and text, the replan-scope bullet and §2.4.3's fallback bullet. The growth and its scope are inside `sched_reserve_impl`. |
+| zhcn 5.7 (b): two rows still say `into_empty(cache)` | **Fixed.** Both rows (§6.10's §ZR5 I-3 row and §6.11's row 30) now read `(cache, owner)`. |
+| zhcn f6218f3: an H4 (b) vehicle that survives zhcn | **Adopted.** H4 (b) uses zhcn's H4h (f6218f3 §3.1, §3.3), `sched_reserve_impl`'s own growth path with the compute buffer forced onto the host-pinned fallback. It runs from a ladder rung, a setter's next decode (`sched_reserve_nothrow`) and `memory_update`. |
+
+**Noted for the lead (7.11a).**
+- The fit query's ruled name, `pending_bytes`, is also the name of a field of the reap's result
+  (rulings §R, §2.4.2 (i)(d)). They are different things, a query on the pending-range
+  primitive and a result field, and never meet in one scope, so I kept the ruled name. If you
+  would rather rename one, the query is the easier rename.
+- I sent the three signatures to impl-23mk again, with the filter on the clear and the fit.
+- Nothing was built for 7.11a; it is a document change only.
