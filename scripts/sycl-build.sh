@@ -220,11 +220,32 @@ configure_args=(
     -DCMAKE_CXX_COMPILER=icpx
 )
 
+compiler_launcher=""
 if command -v ccache >/dev/null 2>&1; then
+    compiler_launcher="ccache"
+    # base_dir makes ccache rewrite absolute paths under this tree relative to
+    # the build directory, so a checkout at another path -- a worktree -- hits
+    # the entries this one stored instead of recompiling from cold. It also
+    # makes __FILE__ relative ("../ggml/src/..."); tests that locate the tree
+    # get the absolute LLAMA_CPP_SOURCE_ROOT, which ccache does not rewrite.
+    # `ccache KEY=VALUE compiler` needs ccache 4.8.
+    ccache_version="$(ccache --version 2>/dev/null | sed -n '1s/^ccache version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
+    if [[ -n "${ccache_version}" ]] && read -r ccache_major ccache_minor <<< "${ccache_version}" &&
+        (( ccache_major > 4 || (ccache_major == 4 && ccache_minor >= 8) )); then
+        compiler_launcher="ccache;base_dir=${ROOT_DIR}"
+    fi
     configure_args+=(
-        -DCMAKE_C_COMPILER_LAUNCHER=ccache
-        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        "-DCMAKE_C_COMPILER_LAUNCHER=${compiler_launcher}"
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=${compiler_launcher}"
     )
+fi
+
+if [[ -n "${compiler_launcher}" && -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
+    cached_launcher="$(sed -n 's/^CMAKE_CXX_COMPILER_LAUNCHER:[A-Z]*=//p' "${BUILD_DIR}/CMakeCache.txt" | tail -n 1)"
+    if [[ "${cached_launcher}" != "${compiler_launcher}" ]]; then
+        echo "[sycl-build] refreshing compiler launcher: ${cached_launcher:-<unset>} -> ${compiler_launcher}"
+        needs_configure=1
+    fi
 fi
 
 if (( needs_configure )); then

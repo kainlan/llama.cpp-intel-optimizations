@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # scripts/sycl-build.sh passes every named target to one build, expands --dev,
-# and runs the build in a private TMPDIR that is gone once the script exits,
-# whether the build passed or failed (llama.cpp-vuy0).
+# runs the build in a private TMPDIR that is gone once the script exits,
+# whether the build passed or failed, and configures ccache with base_dir set
+# to the tree so another checkout path reuses its entries (llama.cpp-vuy0).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,6 +19,7 @@ MOCK_BIN="${TMP}/bin"
 CCL_ROOT_FIXTURE="${TMP}/oneapi/ccl/2022.1"
 BUILD_DIR="${TMP}/build"
 CMAKE_LOG="${TMP}/cmake.log"
+CONFIGURE_LOG="${TMP}/configure.log"
 OUTER_TMP="${TMP}/outer-tmp"
 mkdir -p "${MOCK_BIN}" "${CCL_ROOT_FIXTURE}/include/oneapi" \
     "${CCL_ROOT_FIXTURE}/lib/cmake/oneCCL" "${BUILD_DIR}" "${OUTER_TMP}"
@@ -40,7 +42,14 @@ if [[ "$1" == "--build" ]]; then
     : > "${TMPDIR}/icpx-stranded.out"
     exit "${MOCK_BUILD_RC:-0}"
 fi
+printf '%s\n' --- "$@" >> "${CONFIGURE_LOG}"
 EOF
+cat > "${MOCK_BIN}/ccache" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "--version" ]] && echo "ccache version ${MOCK_CCACHE_VERSION:-4.12.3}"
+exit 0
+EOF
+chmod +x "${MOCK_BIN}/ccache"
 for tool in ninja icx icpx; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "${MOCK_BIN}/${tool}"
     chmod +x "${MOCK_BIN}/${tool}"
@@ -49,11 +58,13 @@ chmod +x "${MOCK_BIN}/cmake"
 
 run_script() {
     : > "${CMAKE_LOG}"
+    : > "${CONFIGURE_LOG}"
     env \
         ONEAPI_SETVARS="${TMP}/setvars.sh" \
         MOCK_BIN="${MOCK_BIN}" \
         TEST_CCL_ROOT="${CCL_ROOT_FIXTURE}" \
         CMAKE_LOG="${CMAKE_LOG}" \
+        CONFIGURE_LOG="${CONFIGURE_LOG}" \
         CMAKE_BUILD_PARALLEL_LEVEL=1 \
         TMPDIR="${OUTER_TMP}" \
         "${BUILD_SCRIPT}" -B "${BUILD_DIR}" "$@" > "${TMP}/out.log" 2>&1
@@ -100,5 +111,45 @@ rc=0
 MOCK_BUILD_RC=7 run_script llama-cli || rc=$?
 [[ ${rc} -eq 7 ]] || fail "failing build returned ${rc}, want 7"
 expect_private_tmp_removed
+
+# ccache runs with base_dir at the tree root, for both compilers.
+launcher="ccache;base_dir=${ROOT_DIR}"
+run_script
+for lang in C CXX; do
+    grep -Fxq -- "-DCMAKE_${lang}_COMPILER_LAUNCHER=${launcher}" "${CONFIGURE_LOG}" ||
+        fail "${lang} launcher is not '${launcher}': $(grep LAUNCHER "${CONFIGURE_LOG}")"
+done
+
+# An existing build configured with plain ccache is reconfigured onto base_dir;
+# one that already has it is left alone.
+write_cache() {
+    cat > "${BUILD_DIR}/CMakeCache.txt" <<EOF
+CMAKE_GENERATOR:INTERNAL=Ninja
+CMAKE_C_COMPILER:FILEPATH=${MOCK_BIN}/icx
+CMAKE_CXX_COMPILER:FILEPATH=${MOCK_BIN}/icpx
+CMAKE_C_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
+CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
+oneCCL_DIR:PATH=${CCL_ROOT_FIXTURE}/lib/cmake/oneCCL
+CMAKE_CXX_COMPILER_LAUNCHER:UNINITIALIZED=$1
+EOF
+    : > "${BUILD_DIR}/build.ninja"
+    touch -t 203701010000 "${BUILD_DIR}/build.ninja"
+}
+write_cache "${launcher}"
+run_script
+[[ ! -s "${CONFIGURE_LOG}" ]] || fail "reconfigured a build already on '${launcher}'"
+write_cache ccache
+run_script
+grep -Fxq -- "-DCMAKE_CXX_COMPILER_LAUNCHER=${launcher}" "${CONFIGURE_LOG}" ||
+    fail "a plain-ccache build was not reconfigured onto base_dir"
+grep -Fq 'refreshing compiler launcher: ccache ->' "${TMP}/out.log" ||
+    fail "no launcher refresh message: $(cat "${TMP}/out.log")"
+
+# ccache before 4.8 has no KEY=VALUE syntax and would take base_dir=... for the
+# compiler; it keeps the plain launcher.
+rm -f "${BUILD_DIR}/CMakeCache.txt" "${BUILD_DIR}/build.ninja"
+MOCK_CCACHE_VERSION=4.7.4 run_script
+grep -Fxq -- "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache" "${CONFIGURE_LOG}" ||
+    fail "ccache 4.7 got launcher: $(grep LAUNCHER "${CONFIGURE_LOG}")"
 
 echo "test-sycl-build-targets: PASS"

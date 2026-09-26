@@ -1024,6 +1024,15 @@ if (GGML_SYCL AND NOT WIN32 AND CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Inte
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
+    # Tests that read repo sources must find the tree without an absolute
+    # __FILE__, which ccache base_dir takes away (llama.cpp-vuy0).
+    add_test(NAME test-sycl-source-root-anchor
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-source-root-anchor.py ${CMAKE_BINARY_DIR})
+    set_tests_properties(test-sycl-source-root-anchor PROPERTIES
+        LABELS "sycl;build;hostonly;source-contract"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
 endif()
 
 if (NOT WIN32)
@@ -2844,6 +2853,11 @@ if(GGML_SYCL)
         ${PROJECT_SOURCE_DIR}/ggml/src)
     target_compile_definitions(test-sycl-fattn-onednn-gates PRIVATE
         $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    # Absolute repo root for the source-reading gates: under ccache base_dir
+    # (scripts/sycl-build.sh) __FILE__ is relative to the build directory, and
+    # this binary is install()ed and run from anywhere (llama.cpp-vuy0).
+    target_compile_definitions(test-sycl-fattn-onednn-gates PRIVATE
+        LLAMA_CPP_SOURCE_ROOT="${PROJECT_SOURCE_DIR}")
     target_compile_options(test-sycl-fattn-onednn-gates PRIVATE "-fsycl" "-Wno-narrowing")
     target_link_options(test-sycl-fattn-onednn-gates PRIVATE "-fsycl")
     install(TARGETS test-sycl-fattn-onednn-gates RUNTIME)

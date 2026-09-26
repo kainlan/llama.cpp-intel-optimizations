@@ -3217,6 +3217,19 @@ set(RESIDENCY_TEST_SYCL_OPTIONS
 # plus once in ggml-sycl-test.hpp (declaration) and is called by no production
 # path, so a green from them said nothing about the shipped backend. See the
 # commit message and docs/backend/sycl-test-inventory.md.
+# Tests that read repo sources at run time locate the tree through
+# LLAMA_CPP_SOURCE_ROOT (candidate_roots() in each). It is an absolute -D because
+# scripts/sycl-build.sh runs ccache with base_dir, which rewrites the source path
+# -- and so __FILE__ -- relative to the build directory; ccache leaves -D values
+# alone (llama.cpp-vuy0).
+get_filename_component(GGML_SYCL_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+set(GGML_SYCL_SOURCE_READING_TESTS
+    test-sycl-moe-fused-down-sum-policy
+    test-sycl-moe-direct-final-scratch-plan
+    test-sycl-moe-same-expert-grouping
+    test-sycl-moe-fusion-noactivation
+    test-sycl-moe-sequence-graphlet-policy
+)
 foreach(_residency_test
     test-sycl-mem-handle-lifetime
     test-sycl-residency-reservation
@@ -3250,6 +3263,10 @@ foreach(_residency_test
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
         GGML_SYCL_PRIVATE_TESTING=1
     )
+    if (_residency_test IN_LIST GGML_SYCL_SOURCE_READING_TESTS)
+        target_compile_definitions(${_residency_test} PRIVATE
+            LLAMA_CPP_SOURCE_ROOT="${GGML_SYCL_REPO_ROOT}")
+    endif()
     target_link_libraries(${_residency_test} PRIVATE ggml-sycl-private-fixtures)
     add_test(NAME ${_residency_test} COMMAND ${_residency_test})
     # LABELS drop the old "cache;residency;mem-handle" -- see rule 2 above
@@ -3564,6 +3581,7 @@ target_link_options(test-sycl-fattn-xmx-policy PRIVATE "-fsycl")
 target_compile_definitions(test-sycl-fattn-xmx-policy PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    LLAMA_CPP_SOURCE_ROOT="${GGML_SYCL_REPO_ROOT}"
 )
 target_link_libraries(test-sycl-fattn-xmx-policy PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
 if (IntelSYCL_FOUND)
