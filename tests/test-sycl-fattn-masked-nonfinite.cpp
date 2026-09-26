@@ -60,13 +60,38 @@
 // CPU output must itself be finite, or the case is void.
 //
 // KERNEL COVERAGE: the kernel is chosen by the dispatcher from the shape and
-// the environment, so this file cannot pin it. It sets
-// GGML_SYCL_FA_DISPATCH_DEBUG (unless already set), captures the dispatcher's
-// "[SYCL] fattn selected" line for every compute, prints it as kernel=<name>,
-// and fails a case that printed no dispatch line. Different arms reach
-// different kernels, e.g. GGML_SYCL_FA_ONEDNN=0 (native XMX for PP),
-// GGML_SYCL_FA_XMX_V1_PP=1 (XMX v1), GGML_SYCL_FA_ESIMD=0 (VEC decode,
-// tile_d512), GGML_SYCL_FA_FORCE_PATH=tile.
+// the environment. The test sets GGML_SYCL_FA_DISPATCH_DEBUG (unless already
+// set), captures the dispatcher's "[SYCL] fattn selected" line for every
+// compute, prints it as kernel=<name>, and fails a case that printed no
+// dispatch line. It also fails a case whose last dispatch line is a
+// "*_rejected" one: a rejected forced path falls back to a tile kernel
+// without printing a second line, so the name would claim coverage of a
+// kernel that never ran.
+//
+// ARMS. Each arm is an environment that reaches a different set of kernels.
+// GGML_SYCL_FATTN_TEST_EXPECT=<arm> makes the test verify the arm's
+// environment, run only the cases the arm covers, and FAIL any case whose
+// kernel differs from the arm's table (expected_kernels below), so a routing
+// change cannot silently drop coverage. Without it every case runs and the
+// kernel is printed, not asserted.
+//   default                    no FA overrides (oneDNN PP, ESIMD decode)
+//   noonednn                   GGML_SYCL_FA_ONEDNN=0 (native XMX v2 for PP)
+//   v1pp                       GGML_SYCL_FA_ONEDNN=0 GGML_SYCL_FA_XMX_V1_PP=1
+//   noesimd                    GGML_SYCL_FA_ESIMD=0 (VEC decode, tile_d512); skips
+//                              the cases oneDNN still routes
+//   force-v2-decode            GGML_SYCL_FA_FORCE_PATH=xmx-v2-decode (m1n64)
+//   force-v2-gqa               GGML_SYCL_FA_FORCE_PATH=xmx-v2-gqa
+//   force-v2-gqa-split-packed  GGML_SYCL_FA_FORCE_PATH=xmx-v2-gqa-split-packed
+//                              (split first pass plus the merge kernel)
+//   force-tile                 GGML_SYCL_FA_FORCE_PATH=tile (tile_f16_ncols8)
+// The XMX v2 decode kernels are reachable only through their force paths and
+// only at D=64 with one query row, which is the d64_sinks_decode shape.
+//
+// NOT COVERED, by construction: the FP8 K/V branches of XMX v1/v2 and ESIMD.
+// This tree has no FP8 ggml type (ggml_sycl_type_is_fp8_e4m3() returns false
+// for every type), so no FLASH_ATTN_EXT graph can reach them and the CPU
+// backend has no FP8 oracle. They are verified by code reading only. The paged
+// V loads belong to the opt-in paged v2 path and are out of scope here.
 //
 // Exit 77 when no SYCL device is present. GPU test: never run it in a loop.
 
@@ -483,7 +508,180 @@ static bool run_sycl(ggml_backend_t       sycl,
     return ok;
 }
 
-static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c, poison_kind poison) {
+// An arm's required environment; nullptr means the variable must be unset.
+struct expect_arm {
+    const char * name;
+    const char * fa_onednn;
+    const char * fa_xmx_v1_pp;
+    const char * fa_esimd;
+    const char * fa_force_path;
+    bool         inherit_default;  // cases absent from the arm's rows use the default arm's
+};
+
+static const expect_arm expect_arms[] = {
+    { "default",                   nullptr, nullptr, nullptr, nullptr,                   false },
+    { "noonednn",                  "0",     nullptr, nullptr, nullptr,                   true  },
+    { "v1pp",                      "0",     "1",     nullptr, nullptr,                   true  },
+    { "noesimd",                   nullptr, nullptr, "0",     nullptr,                   false },
+    { "force-v2-decode",           nullptr, nullptr, nullptr, "xmx-v2-decode",           false },
+    { "force-v2-gqa",              nullptr, nullptr, nullptr, "xmx-v2-gqa",              false },
+    { "force-v2-gqa-split-packed", nullptr, nullptr, nullptr, "xmx-v2-gqa-split-packed", false },
+    { "force-tile",                nullptr, nullptr, nullptr, "tile",                    false },
+};
+
+struct expect_kernel {
+    const char * arm;
+    const char * case_name;
+    const char * kernel;
+};
+
+// The kernel each arm must reach per case, as observed on the B50 and B70. A
+// case missing from an arm (after inheritance) is not run under that arm.
+static const expect_kernel expected_kernels[] = {
+    { "default",                   "d128_decode",                 "esimd_f16"                            },
+    { "default",                   "d128_pp72",                   "onednn"                               },
+    { "default",                   "d128_mq4",                    "tile_f16_ncols4"                      },
+    { "default",                   "d64_sinks_decode",            "esimd_f16"                            },
+    { "default",                   "d64_sinks_mq4",               "esimd_f16_batched"                    },
+    { "default",                   "d64_sinks_pp72",              "xmx_v2_f16_pp_ncols32"                },
+    { "default",                   "d256_pp16",                   "onednn"                               },
+    { "default",                   "d512_decode",                 "esimd_partitioned"                    },
+    { "default",                   "d512_mq4",                    "tile_d512"                            },
+    { "default",                   "d128_decode_all_masked",      "esimd_f16"                            },
+    { "default",                   "d64_sinks_decode_all_masked", "esimd_f16"                            },
+    { "default",                   "d512_decode_all_masked",      "esimd_partitioned"                    },
+    { "default",                   "d128_pp72_row1_masked",       "onednn"                               },
+    { "default",                   "d128_mq4_row1_masked",        "tile_f16_ncols4"                      },
+    { "default",                   "d64_sinks_mq4_row1_masked",   "esimd_f16_batched"                    },
+    { "default",                   "d64_sinks_pp72_row1_masked",  "xmx_v2_f16_pp_ncols32"                },
+
+    { "noonednn",                  "d128_pp72",                   "xmx_v2_f16_ncols16_large"             },
+    { "noonednn",                  "d128_pp72_row1_masked",       "xmx_v2_f16_ncols16_large"             },
+    { "noonednn",                  "d256_pp16",                   "xmx_v2_f16_ncols16"                   },
+
+    { "v1pp",                      "d128_pp72",                   "xmx_v1_f16_ncols8_large_kv"           },
+    { "v1pp",                      "d128_pp72_row1_masked",       "xmx_v1_f16_ncols8_large_kv"           },
+    { "v1pp",                      "d256_pp16",                   "xmx_v2_f16_ncols16"                   },
+
+    { "noesimd",                   "d128_decode",                 "vec_f16"                              },
+    { "noesimd",                   "d64_sinks_decode",            "vec_f16"                              },
+    { "noesimd",                   "d128_decode_all_masked",      "vec_f16"                              },
+    { "noesimd",                   "d64_sinks_decode_all_masked", "vec_f16"                              },
+    { "noesimd",                   "d512_decode",                 "tile_d512"                            },
+    { "noesimd",                   "d512_decode_all_masked",      "tile_d512"                            },
+    { "noesimd",                   "d64_sinks_mq4",               "xmx_v2_f16_ncols8"                    },
+    { "noesimd",                   "d64_sinks_mq4_row1_masked",   "xmx_v2_f16_ncols8"                    },
+    // oneDNN still routes the D=128 and D=256 prefill cases, which stay red
+    // until llama.cpp-t0f4; noonednn and v1pp cover their native kernels.
+    { "noesimd",                   "d128_mq4",                    "tile_f16_ncols4"                      },
+    { "noesimd",                   "d128_mq4_row1_masked",        "tile_f16_ncols4"                      },
+    { "noesimd",                   "d64_sinks_pp72",              "xmx_v2_f16_pp_ncols32"                },
+    { "noesimd",                   "d64_sinks_pp72_row1_masked",  "xmx_v2_f16_pp_ncols32"                },
+    { "noesimd",                   "d512_mq4",                    "tile_d512"                            },
+
+    { "force-v2-decode",           "d64_sinks_decode",            "force_xmx_v2_decode_m1n64"            },
+    { "force-v2-decode",           "d64_sinks_decode_all_masked", "force_xmx_v2_decode_m1n64"            },
+
+    { "force-v2-gqa",              "d64_sinks_decode",            "force_xmx_v2_decode_gqa"              },
+    { "force-v2-gqa",              "d64_sinks_decode_all_masked", "force_xmx_v2_decode_gqa"              },
+
+    { "force-v2-gqa-split-packed", "d64_sinks_decode",            "force_xmx_v2_decode_gqa_split_packed" },
+    { "force-v2-gqa-split-packed", "d64_sinks_decode_all_masked", "force_xmx_v2_decode_gqa_split_packed" },
+
+    // The forced tile path does not apply to the separate D=512 dispatcher.
+    { "force-tile",                "d128_decode",                 "force_tile_f16"                       },
+    { "force-tile",                "d128_pp72",                   "force_tile_f16"                       },
+    { "force-tile",                "d128_mq4",                    "force_tile_f16"                       },
+    { "force-tile",                "d64_sinks_decode",            "force_tile_f16"                       },
+    { "force-tile",                "d64_sinks_mq4",               "force_tile_f16"                       },
+    { "force-tile",                "d64_sinks_pp72",              "force_tile_f16"                       },
+    { "force-tile",                "d256_pp16",                   "force_tile_f16"                       },
+    { "force-tile",                "d128_decode_all_masked",      "force_tile_f16"                       },
+    { "force-tile",                "d64_sinks_decode_all_masked", "force_tile_f16"                       },
+    { "force-tile",                "d128_pp72_row1_masked",       "force_tile_f16"                       },
+    { "force-tile",                "d128_mq4_row1_masked",        "force_tile_f16"                       },
+    { "force-tile",                "d64_sinks_mq4_row1_masked",   "force_tile_f16"                       },
+    { "force-tile",                "d64_sinks_pp72_row1_masked",  "force_tile_f16"                       },
+};
+
+static const char * lookup_expected(const char * arm, const char * case_name) {
+    for (const expect_kernel & e : expected_kernels) {
+        if (std::strcmp(e.arm, arm) == 0 && std::strcmp(e.case_name, case_name) == 0) {
+            return e.kernel;
+        }
+    }
+    return nullptr;
+}
+
+// The selected arm (nullptr: routing is printed but not asserted).
+static const expect_arm * g_arm = nullptr;
+
+// The kernel case_name must reach under the selected arm, or nullptr when the
+// arm does not cover it. Only meaningful when g_arm is set.
+static const char * expected_kernel_for(const char * case_name) {
+    const char * k = lookup_expected(g_arm->name, case_name);
+    if (!k && g_arm->inherit_default) {
+        k = lookup_expected("default", case_name);
+    }
+    return k;
+}
+
+static bool env_matches(const char * name, const char * required) {
+    const char * val = std::getenv(name);
+    if (!required) {
+        return val == nullptr;
+    }
+    return val != nullptr && std::strcmp(val, required) == 0;
+}
+
+// Selects the arm named by GGML_SYCL_FATTN_TEST_EXPECT and checks that the
+// environment is the one the arm's table was observed under.
+static bool select_arm() {
+    const char * name = std::getenv("GGML_SYCL_FATTN_TEST_EXPECT");
+    if (!name) {
+        std::printf("expect: GGML_SYCL_FATTN_TEST_EXPECT unset, kernel routing is printed but not asserted\n");
+        return true;
+    }
+    for (const expect_arm & a : expect_arms) {
+        if (std::strcmp(a.name, name) != 0) {
+            continue;
+        }
+
+        struct {
+            const char * var;
+            const char * required;
+        } const checks[] = {
+            { "GGML_SYCL_FA_ONEDNN",     a.fa_onednn     },
+            { "GGML_SYCL_FA_XMX_V1_PP",  a.fa_xmx_v1_pp  },
+            { "GGML_SYCL_FA_ESIMD",      a.fa_esimd      },
+            { "GGML_SYCL_FA_FORCE_PATH", a.fa_force_path },
+        };
+
+        bool ok = true;
+        for (const auto & chk : checks) {
+            if (!env_matches(chk.var, chk.required)) {
+                std::printf("FAIL: arm %s requires %s=%s\n", a.name, chk.var, chk.required ? chk.required : "(unset)");
+                ok = false;
+            }
+        }
+        g_arm = &a;
+        std::printf("expect: arm %s\n", a.name);
+        return ok;
+    }
+    std::printf("FAIL: unknown GGML_SYCL_FATTN_TEST_EXPECT=%s\n", name);
+    return false;
+}
+
+static bool ends_with(const std::string & s, const char * suffix) {
+    const size_t n = std::strlen(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+static void run_case(ggml_backend_t  sycl,
+                     ggml_backend_t  cpu,
+                     const fa_case & c,
+                     poison_kind     poison,
+                     const char *    expected) {
     char label[160];
     std::snprintf(label, sizeof(label), "%s %s D=%d H_q=%d H_kv=%d ne01=%d n_kv=%d used=%d sinks=%d", c.name,
                   poison_name(poison), c.D, c.H_q, c.H_kv, c.ne01, c.n_kv, c.n_used, (int) c.sinks);
@@ -616,16 +814,30 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
         cpu_nf_rows > 0 && (cpu_nf_rows == n_rows || mse_ref > 0.0) && (c.ne01 == 1 || cpu_nf_rows < n_rows);
     const bool oracle_ok =
         rowwise ? rowwise_oracle : (cpu_nonfinite == 0 && (expect_all_zero ? mse_ref == 0.0 : mse_ref > 0.0));
-    const bool finite_ok = rowwise ? (hidden_rows == 0 && (spill_rows == 0 || spill_allowed)) : gpu_nonfinite == 0;
-    const bool ok        = oracle_ok && !kernel.empty() && finite_ok && zeroed_rows == 0 && stray_rows == 0 &&
-                    sentinel_rows == 0 && (!nmse_gated || nmse <= NMSE_MAX);
+    const bool finite_ok  = rowwise ? (hidden_rows == 0 && (spill_rows == 0 || spill_allowed)) : gpu_nonfinite == 0;
+    // A rejected forced path runs a fallback without naming it.
+    const bool rejected   = ends_with(kernel, "_rejected");
+    const bool routing_ok = !kernel.empty() && !rejected && (!expected || kernel == expected);
+    const bool ok = oracle_ok && routing_ok && finite_ok && zeroed_rows == 0 && stray_rows == 0 && sentinel_rows == 0 &&
+                    (!nmse_gated || nmse <= NMSE_MAX);
+    // A pass that relies on the documented XMX tile deviation says so.
+    const char * status = !ok ? "FAIL" : (spill_rows > 0 ? "OK-DEVIATION" : "OK");
 
     std::printf(
         "%s [%s] kernel=%s nmse=%.3e (max %.1e%s) max_diff=%.3e sycl_nonfinite=%zu zeroed_rows=%zu/%zu "
         "stray_rows=%zu sentinel_rows=%zu cpu_nonfinite=%zu\n",
-        ok ? "OK" : "FAIL", label, kernel.empty() ? "<none: no dispatch line captured>" : kernel.c_str(), nmse,
-        NMSE_MAX, nmse_gated ? "" : ", not gated", max_diff, gpu_nonfinite, zeroed_rows, n_rows, stray_rows,
-        sentinel_rows, cpu_nonfinite);
+        status, label, kernel.empty() ? "<none: no dispatch line captured>" : kernel.c_str(), nmse, NMSE_MAX,
+        nmse_gated ? "" : ", not gated", max_diff, gpu_nonfinite, zeroed_rows, n_rows, stray_rows, sentinel_rows,
+        cpu_nonfinite);
+    if (rejected) {
+        std::printf(
+            "  REJECTED [%s]: the dispatcher refused %s and fell back without naming the fallback, so this run "
+            "proves nothing about %s\n",
+            label, kernel.c_str(), kernel.c_str());
+    }
+    if (expected && !kernel.empty() && kernel != expected) {
+        std::printf("  ROUTING [%s]: arm %s expects kernel=%s\n", label, g_arm->name, expected);
+    }
     if (rowwise) {
         std::printf("  rows [%s]: cpu_nonfinite_rows=%zu hidden_rows=%zu spill_rows=%zu%s\n", label, cpu_nf_rows,
                     hidden_rows, spill_rows,
@@ -681,6 +893,12 @@ int main(int, char ** argv) {
         const char * val = std::getenv(name);
         std::printf("env %s=%s\n", name, val ? val : "(unset)");
     }
+    if (!select_arm()) {
+        ggml_backend_free(cpu);
+        ggml_backend_free(sycl);
+        return 1;
+    }
+    int n_run = 0;
 
     // name, D, H_q, H_kv, ne01, n_kv, n_used, sinks, q_f32, fully_masked_row
     const fa_case cases[] = {
@@ -704,13 +922,19 @@ int main(int, char ** argv) {
                                      POISON_K_PARTIAL, POISON_V_PARTIAL, POISON_V_UNDERFLOW };
 
     for (const fa_case & c : cases) {
+        const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
+        if (g_arm && !expected) {
+            std::printf("== %s == (not covered by arm %s)\n", c.name, g_arm->name);
+            continue;
+        }
         std::printf("== %s ==\n", c.name);
+        ++n_run;
         for (poison_kind p : variants) {
             // A single query row sees every cell or none: no partial mask.
             if (poison_is_partial(p) && c.ne01 == 1) {
                 continue;
             }
-            run_case(sycl, cpu, c, p);
+            run_case(sycl, cpu, c, p, expected);
         }
     }
 
@@ -720,20 +944,32 @@ int main(int, char ** argv) {
     // mistaken for a poison failure. Clean K/V only.
     std::printf("== fully masked rows ==\n");
     const fa_case fully_masked[] = {
-        { "d128_decode_all_masked",     128, 32, 8, 1,  256, 0,  false, false, false },
-        { "d512_decode_all_masked",     512, 8,  2, 1,  256, 0,  false, true,  false },
-        { "d128_pp72_row1_masked",      128, 32, 8, 72, 256, 72, false, false, true  },
-        { "d128_mq4_row1_masked",       128, 32, 8, 4,  256, 72, false, false, true  },
-        { "d64_sinks_mq4_row1_masked",  64,  64, 8, 4,  256, 72, true,  false, true  },
-        { "d64_sinks_pp72_row1_masked", 64,  64, 8, 72, 256, 72, true,  false, true  },
+        { "d128_decode_all_masked",      128, 32, 8, 1,  256, 0,  false, false, false },
+        // A sink supplies the whole denominator: 0 / S.
+        { "d64_sinks_decode_all_masked", 64,  64, 8, 1,  256, 0,  true,  false, false },
+        { "d512_decode_all_masked",      512, 8,  2, 1,  256, 0,  false, true,  false },
+        { "d128_pp72_row1_masked",       128, 32, 8, 72, 256, 72, false, false, true  },
+        { "d128_mq4_row1_masked",        128, 32, 8, 4,  256, 72, false, false, true  },
+        { "d64_sinks_mq4_row1_masked",   64,  64, 8, 4,  256, 72, true,  false, true  },
+        { "d64_sinks_pp72_row1_masked",  64,  64, 8, 72, 256, 72, true,  false, true  },
     };
     for (const fa_case & c : fully_masked) {
-        run_case(sycl, cpu, c, POISON_NONE);
+        const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
+        if (g_arm && !expected) {
+            std::printf("-- %s (not covered by arm %s)\n", c.name, g_arm->name);
+            continue;
+        }
+        ++n_run;
+        run_case(sycl, cpu, c, POISON_NONE, expected);
     }
 
     ggml_backend_free(cpu);
     ggml_backend_free(sycl);
 
+    if (n_run == 0) {
+        std::printf("FAIL: no case ran, so this run proves nothing\n");
+        return 1;
+    }
     if (g_failures) {
         std::printf("FAILED: %d case(s)\n", g_failures);
         return 1;
