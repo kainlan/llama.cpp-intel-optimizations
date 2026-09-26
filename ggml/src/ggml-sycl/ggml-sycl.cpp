@@ -63500,7 +63500,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 const int64_t dst_plane_elems  = M * N;
                 // May the SOA/AOS arms below take oneDNN PP? The candidate
                 // answers, as for every other arm; MXFP4_DIRECT moves only
-                // the batch floor (llama.cpp-je3b). COALESCED has no oneDNN
+                // the batch floor of admission (llama.cpp-je3b). COALESCED has no oneDNN
                 // arm, so it does not ask: asking can take the cache lock
                 // (executable_on_device) and spends trace budget.
                 const bool    onednn_pp_admitted = data_layout != ggml_sycl_unified::LayoutMode::COALESCED &&

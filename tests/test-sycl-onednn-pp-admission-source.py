@@ -57,11 +57,13 @@ PLACEMENT = Path(
 def in_number(text, i):
     """True when the ' at text[i] is a C++14 digit separator (1'000,
     0xFF'FF): it sits inside a token that starts with a digit. A char
-    literal's prefix (u8'a', L'a') starts with a letter, so it is not one."""
+    literal's prefix (u8'a', L'a') starts with a letter, so it is not one.
+    A number may also start with a dot (.5'0)."""
     j = i
     while j > 0 and (text[j - 1].isalnum() or text[j - 1] in "_.'"):
         j -= 1
-    return j < i and text[j].isdigit() and i + 1 < len(text) and text[i + 1].isalnum()
+    starts_number = text[j].isdigit() or (text[j] == "." and j + 1 < i and text[j + 1].isdigit())
+    return j < i and starts_number and i + 1 < len(text) and text[i + 1].isalnum()
 
 
 def strip_comments(text):
@@ -205,6 +207,29 @@ _CMP = r"(?:>=|<=|!=|==|>|<)"
 BATCH_COMPARISON = re.compile(_BATCH + r"(?:\s*\))*\s*" + _CMP + r"|" + _CMP + r"\s*" + _BATCH)
 
 
+def top_level_conjuncts(expr):
+    """Split `expr` on && outside any parentheses, after peeling parens
+    that wrap the whole expression. `!(a && b)` stays one conjunct."""
+    expr = expr.strip()
+    while expr.startswith("(") and matching(expr, 0, "(", ")") == len(expr) - 1:
+        expr = expr[1:-1].strip()
+    parts, depth, start, i = [], 0, 0, 0
+    while i < len(expr):
+        ch = expr[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0 and expr.startswith("&&", i):
+            parts.append(expr[start:i].strip())
+            start = i + 2
+            i += 2
+            continue
+        i += 1
+    parts.append(expr[start:].strip())
+    return parts
+
+
 def mxfp4_direct_span():
     """Body of the MXFP4 per-expert direct dispatch block in ggml_sycl_mul_mat."""
     matches = list(ws_pattern(MXFP4_GUARD).finditer(backend))
@@ -247,8 +272,9 @@ def test_every_mxfp4_direct_onednn_gemm_is_admitted_by_the_candidate():
     lo, hi = mxfp4_direct_span()
     region = backend[lo:hi]
     # The answer may be narrowed by conjuncts that are not about the batch
-    # (e.g. skipping the question for a layout with no oneDNN arm), but it
-    # must be the candidate's call, bound by &&, with no ||.
+    # (e.g. skipping the question for a layout with no oneDNN arm), but the
+    # candidate's call must be one whole top-level && conjunct: no ||, no ?:,
+    # nothing negating or comparing it.
     cands = list(re.finditer(r"const\s+bool\s+(\w+)\s*=([^;]*?)\bggml_sycl_onednn_pp_candidate\s*\(", region))
     assert len(cands) == 1, (
         f"expected the MXFP4 direct block to ask ggml_sycl_onednn_pp_candidate() exactly once into a const bool, "
@@ -258,8 +284,12 @@ def test_every_mxfp4_direct_onednn_gemm_is_admitted_by_the_candidate():
     call_open = lo + cands[0].end() - 1
     init = backend[lo + cands[0].start(2) : backend.index(";", call_open)]
     init_flat = " ".join(init.split())
-    assert "||" not in init_flat and not re.search(r"!\s*$", cands[0].group(2)), (
-        f"`{var}` is initialised as `{init_flat}`: the candidate's call must be a plain && conjunct"
+    call_start = backend.rindex("ggml_sycl_onednn_pp_candidate", 0, call_open + 1)
+    call_flat = " ".join(backend[call_start : matching(backend, call_open, "(", ")") + 1].split())
+    conjuncts = top_level_conjuncts(init_flat)
+    assert "?" not in init_flat and "||" not in init_flat and call_flat in conjuncts, (
+        f"`{var}` is initialised as `{init_flat}`: the candidate's call must be one whole && conjunct of it, "
+        "with no ||, no ?:, and nothing negating or comparing it"
     )
     assert not BATCH_COMPARISON.search(init), (
         f"`{var}` is initialised as `{init_flat}`, which compares the batch itself; the floor is the candidate's"
@@ -343,13 +373,16 @@ def test_pure_predicate_lives_once_in_the_header():
 def test_strip_comments_handles_digit_separators():
     # One separator (an odd count) used to open a char literal that ran to
     # the next quote, blanking the code after it.
-    src = "int x = 1'000; foo(); // gone\nchar c = u8'a'; long y = 0xFF'FF'FF; bar(); /* gone */\n"
+    src = (
+        "int x = 1'000; foo(); // gone\nchar c = u8'a'; long y = 0xFF'FF'FF; bar(); /* gone */\n"
+        "double d = .5'0; baz(); // gone\n"
+    )
     out = strip_comments(src)
     assert len(out) == len(src)
-    assert "foo();" in out and "bar();" in out, f"code after a digit separator was blanked: {out!r}"
+    assert "foo();" in out and "bar();" in out and "baz();" in out, f"code after a digit separator was blanked: {out!r}"
     assert "gone" not in out, f"a comment survived: {out!r}"
     assert "u8' '" in out, f"a char literal's content survived: {out!r}"
-    assert "1'000" in out and "0xFF'FF'FF" in out, f"a numeric literal was altered: {out!r}"
+    assert "1'000" in out and "0xFF'FF'FF" in out and ".5'0" in out, f"a numeric literal was altered: {out!r}"
 
 
 if __name__ == "__main__":
