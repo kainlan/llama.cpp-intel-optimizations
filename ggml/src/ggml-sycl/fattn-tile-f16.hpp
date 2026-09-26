@@ -316,9 +316,12 @@ static void flash_attn_tile_f16_kernel(
             for (int k = 0; k < kv_count; ++k) {
                 const float kq_val = KQ_shared[j * config::BATCH_KV + k];
                 // Skip a dead cell rather than weight it by 0: its V may be
-                // non-finite. Every thread reads the same kq_val, so the
-                // branch is uniform.
-                if (kq_val == -INFINITY) {
+                // non-finite. Dead is read from the mask (the same element the
+                // score step selected on), never inferred from kq_val: a
+                // visible cell whose QK^T is -inf still meets its V (see
+                // fattn_mark_dead). Every thread reads the same element, so
+                // the branch is uniform.
+                if (maskh && fattn_mask_is_dead(maskh[j * ne30 + kv_start + k])) {
                     continue;
                 }
                 const float w = sycl::exp(kq_val - KQ_max[j]);

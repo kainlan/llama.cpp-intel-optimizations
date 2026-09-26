@@ -539,6 +539,10 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
 
     float KQ_acc[nbatch_fa/(np*warp_size) * cpw] = {0.0f}; // Accumulators for KQ matrix multiplication.
 
+    // Per KQ_acc element: its cell's mask is -inf. Dead is decided where the
+    // mask is read, not from the score later (see fattn_mark_dead).
+    bool KQ_dead[nbatch_fa / (np * warp_size) * cpw] = {};
+
     // KQ = K @ Q matrix multiplication:
     constexpr int nbatch_K_last = DKQ % nbatch_K;
 #pragma unroll
@@ -576,8 +580,10 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
                 if (ncols2 > 1 || mask) {
                     // Select, not add: a dead cell's K may be non-finite and
                     // NaN + -inf is NaN (see fattn_mask_is_dead).
-                    KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0] = fattn_apply_mask(
-                        KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0], slope, mask[j * stride_mask + k_VKQ_0 + i_KQ]);
+                    const sycl::half mask_val = mask[j * stride_mask + k_VKQ_0 + i_KQ];
+                    const int        i_acc    = (i_KQ_0 / (np * warp_size)) * cpw + jc0;
+                    KQ_dead[i_acc]            = fattn_mask_is_dead(mask_val);
+                    KQ_acc[i_acc]             = fattn_apply_mask(KQ_acc[i_acc], slope, mask_val);
                 }
 
                 KQ_max_new[jc0] =
@@ -625,7 +631,8 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
                 const float val =
                     !oob_check || i0 + (item_ct1.get_local_id(1) % np) * warp_size + item_ct1.get_local_id(2) <
                                       static_cast<uint32_t>(k_VKQ_sup) ?
-                        fattn_mark_dead(KQ_val, sycl::native::exp(KQ_val - (float) KQ_max[jc])) :
+                        fattn_mark_dead(KQ_dead[(i0 / (np * warp_size)) * cpw + jc],
+                                        sycl::native::exp(KQ_val - (float) KQ_max[jc])) :
                         0.0f;
                 KQ_sum_add += fattn_weight_sum_term(val);
                 tmp[i0/(np*warp_size)][jc1] = val;

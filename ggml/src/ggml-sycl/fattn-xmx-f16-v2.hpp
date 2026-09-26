@@ -1194,6 +1194,9 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
             });
         }
 
+        // Dead is decided by the mask, never by the score: a visible cell whose
+        // QK^T is -inf still meets its V (see fattn_mark_dead).
+        bool  slot_dead[2 * XMX_V2_DECODE_SLOTS];
         float local_max = -FLT_MAX;
 #    pragma unroll
         for (int i = 0; i < 2 * XMX_V2_DECODE_SLOTS; ++i) {
@@ -1202,7 +1205,8 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
             const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
             const int kv_abs   = kv_start + kv_local;
 
-            float score = lane_scores[i];
+            float score  = lane_scores[i];
+            slot_dead[i] = false;
             if (lane >= XMX_V2_DECODE_ACTIVE_LANES || kv_abs >= ne11 || q_abs >= ne01) {
                 score = -FLT_MAX;
             } else {
@@ -1210,7 +1214,8 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
                     score = logit_softcap * sycl::tanh(score);
                 }
                 if (maskh) {
-                    score = fattn_apply_mask(score, slope, maskh[kv_abs]);
+                    slot_dead[i] = fattn_mask_is_dead(maskh[kv_abs]);
+                    score        = fattn_apply_mask(score, slope, maskh[kv_abs]);
                 }
             }
             lane_scores[i] = score;
@@ -1240,7 +1245,7 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
             const int slot     = i - half_id * XMX_V2_DECODE_SLOTS;
             const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
             if (lane < XMX_V2_DECODE_ACTIVE_LANES) {
-                const float p      = fattn_mark_dead(lane_scores[i], sycl::exp(lane_scores[i] - new_max));
+                const float p      = fattn_mark_dead(slot_dead[i], sycl::exp(lane_scores[i] - new_max));
                 tile_S_f[kv_local] = p;
                 local_sum += fattn_weight_sum_term(p);
             }
@@ -1518,6 +1523,9 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
             });
         }
 
+        // Dead is decided by the mask, never by the score: a visible cell whose
+        // QK^T is -inf still meets its V (see fattn_mark_dead).
+        bool  slot_dead[2 * XMX_V2_DECODE_SLOTS];
         float local_max = -FLT_MAX;
 #    pragma unroll
         for (int i = 0; i < 2 * XMX_V2_DECODE_SLOTS; ++i) {
@@ -1526,7 +1534,8 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
             const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
             const int kv_abs   = kv_start + kv_local;
 
-            float score = lane_scores[i];
+            float score  = lane_scores[i];
+            slot_dead[i] = false;
             if (!active || lane >= XMX_V2_DECODE_ACTIVE_LANES || kv_abs >= ne11) {
                 score = -FLT_MAX;
             } else {
@@ -1534,7 +1543,8 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
                     score = logit_softcap * sycl::tanh(score);
                 }
                 if (maskh) {
-                    score = fattn_apply_mask(score, slope, maskh[kv_abs]);
+                    slot_dead[i] = fattn_mask_is_dead(maskh[kv_abs]);
+                    score        = fattn_apply_mask(score, slope, maskh[kv_abs]);
                 }
             }
             lane_scores[i] = score;
@@ -1564,7 +1574,7 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
             const int slot     = i - half_id * XMX_V2_DECODE_SLOTS;
             const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
             if (active && lane < XMX_V2_DECODE_ACTIVE_LANES) {
-                const float p = fattn_mark_dead(lane_scores[i], sycl::exp(lane_scores[i] - new_max));
+                const float p = fattn_mark_dead(slot_dead[i], sycl::exp(lane_scores[i] - new_max));
                 tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + kv_local] = p;
                 local_sum += fattn_weight_sum_term(p);
             }
@@ -1823,6 +1833,9 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
         });
     }
 
+    // Dead is decided by the mask, never by the score: a visible cell whose
+    // QK^T is -inf still meets its V (see fattn_mark_dead).
+    bool  slot_dead[2 * XMX_V2_DECODE_SLOTS];
     float local_max = -FLT_MAX;
 #    pragma unroll
     for (int i = 0; i < 2 * XMX_V2_DECODE_SLOTS; ++i) {
@@ -1831,7 +1844,8 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
         const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
         const int kv_abs   = kv_start + kv_local;
 
-        float score = lane_scores[i];
+        float score  = lane_scores[i];
+        slot_dead[i] = false;
         if (!active || lane >= XMX_V2_DECODE_ACTIVE_LANES || kv_abs >= ne11) {
             score = -FLT_MAX;
         } else {
@@ -1839,7 +1853,8 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
                 score = logit_softcap * sycl::tanh(score);
             }
             if (maskh) {
-                score = fattn_apply_mask(score, slope, maskh[kv_abs]);
+                slot_dead[i] = fattn_mask_is_dead(maskh[kv_abs]);
+                score        = fattn_apply_mask(score, slope, maskh[kv_abs]);
             }
         }
         lane_scores[i] = score;
@@ -1861,7 +1876,7 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
         const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
         lane_probs[i]      = 0.0f;
         if (active && lane < XMX_V2_DECODE_ACTIVE_LANES) {
-            lane_probs[i] = fattn_mark_dead(lane_scores[i], sycl::exp(lane_scores[i] - KQ_max));
+            lane_probs[i] = fattn_mark_dead(slot_dead[i], sycl::exp(lane_scores[i] - KQ_max));
             if constexpr (!DIRECT_PV) {
                 tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + kv_local] = lane_probs[i];
             }

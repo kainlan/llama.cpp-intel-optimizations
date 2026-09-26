@@ -59,15 +59,17 @@ static inline bool fattn_kv_dead_for_rows(const sycl::half * mask, int64_t row_s
     return true;
 }
 
-// Softmax weight slots read back by a scalar P x V loop. A dead cell (score
-// exactly -inf) is stored as FATTN_DEAD_WEIGHT, which no exp() produces, so
-// the V loop skips exactly the dead cells. It must not skip on weight 0: a
-// VISIBLE cell whose weight underflowed to 0 still meets its V on the CPU
-// reference (0 * V is added), and 0 * NaN is NaN there.
+// Softmax weight slots read back by a scalar P x V loop. A dead cell is
+// stored as FATTN_DEAD_WEIGHT, which no exp() produces, so the V loop skips
+// exactly the dead cells. "Dead" means a -inf MASK (fattn_mask_is_dead), read
+// where the mask is applied. It must not be inferred from the weight or the
+// score: a VISIBLE cell whose weight underflowed to 0, or whose QK^T is itself
+// -inf (a -Inf K element), still meets its V on the CPU reference (0 * V is
+// added), and 0 * NaN is NaN there.
 static constexpr float FATTN_DEAD_WEIGHT = -1.0f;
 
-static inline float fattn_mark_dead(float score, float weight) {
-    return score == -INFINITY ? FATTN_DEAD_WEIGHT : weight;
+static inline float fattn_mark_dead(bool dead, float weight) {
+    return dead ? FATTN_DEAD_WEIGHT : weight;
 }
 
 // A NaN weight (a visible non-finite score) compares false, so it is never
