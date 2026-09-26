@@ -914,12 +914,14 @@ static void run_case(ggml_backend_t  sycl,
 }
 
 int main(int, char ** argv) {
+    // First statement: it may re-exec the process (see sycl-selector-fallback.hpp).
+    sycl_test_selector_fallback(argv, "level_zero:1");
+
     // The dispatcher writes to stderr while results go to stdout; when both
     // land in one file a block-buffered stdout is flushed mid-line and the
     // result lines are torn. Line buffering makes each result one write.
+    // Nothing has been written to stdout yet (the fallback reports on stderr).
     setvbuf(stdout, nullptr, _IOLBF, 1 << 16);
-
-    sycl_test_selector_fallback(argv, "level_zero:1");
 
     // The kernel line is the proof of which path ran; without it a pass is vacuous.
     if (!std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
