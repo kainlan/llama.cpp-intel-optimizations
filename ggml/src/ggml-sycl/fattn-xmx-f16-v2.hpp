@@ -1860,8 +1860,9 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
     // padding slots. The merge result is the same either way: such a partition
     // is weighted by 0 when another partition or a sink is live, and by
     // exp(0) = 1 when nothing is, where its partial sum and output of 0 add
-    // nothing (unless a visible cell scoring -inf carries a NaN V, which
-    // reaches the output as 0 * NaN, as on the CPU).
+    // nothing. Either way, a visible cell scoring -inf whose V is non-finite
+    // makes the partition's output NaN, which reaches the result as 0 * NaN,
+    // as on the CPU.
     KQ_max = sycl::fmax(sycl::reduce_over_group(sg, local_max, sycl::maximum<float>{}), -FLT_MAX / 2.0f);
 
     float lane_probs[2 * XMX_V2_DECODE_SLOTS];
