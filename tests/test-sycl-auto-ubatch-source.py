@@ -640,14 +640,7 @@ def test_publish_reserve_order_has_a_mutation_witness():
     reserve. Anchored on code lines only, so rewording a comment between
     the two cannot disarm it."""
     raw = LLAMA_CONTEXT_CPP
-    publish_block = (
-        "        try {\n"
-        "            sycl_resync_runtime_context_flash_attn();\n"
-        "        } catch (const std::exception &) {\n"
-        "            sched_matches_last_good = false;\n"
-        '            return "transaction refused";\n'
-        "        }\n"
-    )
+    publish_block = _CANDIDATE_PUBLISH_BLOCK
     reserve_end = '            return "compute buffers did not fit";\n        }\n'
     assert raw.count(publish_block) == 1, "mutation target not found -- update this witness to match the real source"
     assert raw.count(reserve_end) == 1, "mutation anchor not found -- update this witness to match the real source"
@@ -1275,6 +1268,13 @@ def test_all_nine_stop_reasons_are_present():
 # ---------------------------------------------------------------------------
 
 
+_CANDIDATE_PUBLISH_CATCH_RE = (
+    r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*"
+    r"&\s*\)\s*\{\s*sched_matches_last_good\s*=\s*false\s*;\s*publish_dirty\s*=\s*true\s*;\s*"
+    r'return\s*"transaction refused"\s*;\s*\}'
+)
+
+
 def test_candidate_publish_is_wrapped_in_try_catch():
     """The publish inside try_candidate() must be wrapped in
     try/catch(const std::exception&) -- sycl_resync_runtime_context_flash_
@@ -1290,39 +1290,47 @@ def test_candidate_publish_is_wrapped_in_try_catch():
     theoretically could be."""
     body_norm = _normalize_ws(_try_candidate_body())
     assert re.search(
-        r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*"
-        r'&\s*\)\s*\{\s*sched_matches_last_good\s*=\s*false\s*;\s*return\s*"transaction refused"\s*;\s*\}',
+        _CANDIDATE_PUBLISH_CATCH_RE,
         body_norm,
     ), (
         "the publish must be wrapped in try { ... } catch (const std::exception &) { sched_matches_last_good = "
-        'false; return "transaction refused"; }'
+        'false; publish_dirty = true; return "transaction refused"; } -- a publish that threw may have landed on '
+        "some devices, so the settle must republish"
     )
 
 
-def test_candidate_publish_try_catch_has_a_mutation_witness():
+_CANDIDATE_PUBLISH_BLOCK = (
+    "        try {\n"
+    "            sycl_resync_runtime_context_flash_attn();\n"
+    "        } catch (const std::exception &) {\n"
+    "            sched_matches_last_good = false;\n"
+    "            publish_dirty           = true;\n"
+    '            return "transaction refused";\n'
+    "        }\n"
+)
+
+
+@pytest.mark.parametrize("mutation", ["unwrapped", "dirty-flag-dropped"])
+def test_candidate_publish_try_catch_has_a_mutation_witness(mutation):
     """Mutation witness for the check above: proves it would actually
     catch the try/catch being deleted (leaving a bare, unprotected publish
     call that would let a refusal escape as an uncaught exception instead
-    of a clean "transaction refused" stop)."""
+    of a clean "transaction refused" stop), and the catch no longer
+    marking the publish dirty."""
     raw = LLAMA_CONTEXT_CPP
-    wrapped_block = (
-        "        try {\n"
-        "            sycl_resync_runtime_context_flash_attn();\n"
-        "        } catch (const std::exception &) {\n"
-        "            sched_matches_last_good = false;\n"
-        '            return "transaction refused";\n'
-        "        }\n"
-    )
-    assert wrapped_block in raw, "mutation target not found -- update this witness to match the real source"
-    mutated_raw = raw.replace(wrapped_block, "        sycl_resync_runtime_context_flash_attn();\n", 1)
+    assert _CANDIDATE_PUBLISH_BLOCK in raw, "mutation target not found -- update this witness to match the real source"
+    if mutation == "unwrapped":
+        replacement = "        sycl_resync_runtime_context_flash_attn();\n"
+    else:
+        replacement = _CANDIDATE_PUBLISH_BLOCK.replace("            publish_dirty           = true;\n", "")
+    mutated_raw = raw.replace(_CANDIDATE_PUBLISH_BLOCK, replacement, 1)
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
     assert not re.search(
-        r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*"
-        r'&\s*\)\s*\{\s*sched_matches_last_good\s*=\s*false\s*;\s*return\s*"transaction refused"\s*;\s*\}',
+        _CANDIDATE_PUBLISH_CATCH_RE,
         mutated_body_norm,
-    ), "mutation witness is broken: deleting the try/catch should make the wrapped-publish check fail"
+    ), "mutation witness is broken: the mutant should make the wrapped-publish check fail"
 
 
 def test_settle_publish_is_not_wrapped_in_try_catch():
@@ -1364,6 +1372,9 @@ def test_published_any_is_declared_false_and_set_true_after_the_publish_catch():
     assert re.search(r"bool\s+published_any\s*=\s*false\s*;", body_norm), (
         "published_any must be declared, initialized false"
     )
+    assert re.search(r"bool\s+publish_dirty\s*=\s*false\s*;", body_norm), (
+        "publish_dirty must be declared, initialized false"
+    )
 
     # llama.cpp-7n6n: the old anchor
     # (`"sched_matches_last_good = false; } if (candidate_lost) { break; }"`)
@@ -1398,7 +1409,8 @@ def _assert_settle_publish_call_is_inside_the_guard(settle_block: str, publish_g
 
 def test_settle_publish_is_gated_on_published_any_or_changed_value():
     """Q2b: the settle step's PUBLISH (not its reserve) must be gated on
-    `published_any || cparams.n_ubatch != fallback_ubatch` -- when nothing
+    llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty,
+    cparams.n_ubatch, fallback_ubatch) -- when nothing
     was ever published this trial and the resolved value is the same one
     already published by the constructor's own earlier publish, a settle
     republish would be a redundant runtime-context transaction with no
@@ -1412,7 +1424,8 @@ def test_settle_publish_is_gated_on_published_any_or_changed_value():
     settle_block = body_norm[settle_idx:]
 
     need_publish_idx = settle_block.find(
-        "const bool need_publish = published_any || cparams.n_ubatch != fallback_ubatch;"
+        "const bool need_publish = llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty, "
+        "cparams.n_ubatch, fallback_ubatch);"
     )
     assign_idx = settle_block.find("cparams.n_ubatch = last_good;")
     publish_guard_idx = settle_block.find("if (need_publish) {")
@@ -1439,7 +1452,9 @@ def test_settle_publish_gate_has_a_mutation_witness():
     raw = LLAMA_CONTEXT_CPP
     original_settle = (
         "    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {\n"
-        "        const bool need_publish = published_any || cparams.n_ubatch != fallback_ubatch;\n"
+        "        const bool need_publish =\n"
+        "            llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty, cparams.n_ubatch, "
+        "fallback_ubatch);\n"
         "        cparams.n_ubatch        = last_good;\n"
         "        if (need_publish) {\n"
         "            sycl_resync_runtime_context_flash_attn();\n"
@@ -1475,7 +1490,9 @@ def test_settle_publish_gate_has_a_mutation_witness():
     # re-implementation of it.
     emptied_guard_settle = (
         "    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {\n"
-        "        const bool need_publish = published_any || cparams.n_ubatch != fallback_ubatch;\n"
+        "        const bool need_publish =\n"
+        "            llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty, cparams.n_ubatch, "
+        "fallback_ubatch);\n"
         "        cparams.n_ubatch        = last_good;\n"
         "        if (need_publish) {\n"
         "        }\n"
@@ -1496,6 +1513,60 @@ def test_settle_publish_gate_has_a_mutation_witness():
 
     with pytest.raises(AssertionError, match="must be INSIDE the need_publish guard"):
         _assert_settle_publish_call_is_inside_the_guard(mutated_settle_block_2, mutated_publish_guard_idx_2)
+
+
+_SETTLE_NEEDS_PUBLISH_RE = (
+    r"inline\s+bool\s+llama_auto_ubatch_settle_needs_publish\s*\(\s*bool\s+published_any\s*,\s*"
+    r"bool\s+publish_dirty\s*,\s*uint32_t\s+n_ubatch\s*,\s*uint32_t\s+fallback_ubatch\s*\)\s*\{\s*"
+    r"return\s+published_any\s*\|\|\s*publish_dirty\s*\|\|\s*n_ubatch\s*!=\s*fallback_ubatch\s*;\s*\}"
+)
+
+
+def test_settle_needs_publish_reads_publish_dirty():
+    """llama.cpp-pyu4: a candidate publish that threw may have landed on
+    some devices before one refused, and it never sets published_any. The
+    settle's cparams.n_ubatch only records the LAST candidate, so a later
+    candidate at fallback_ubatch would erase the evidence of an earlier
+    partial publish above it (cached 1024 half-published, then rung 512's
+    publish also throws: need_publish would be false and a device would
+    keep the 1024 plan). llama_auto_ubatch_settle_needs_publish()
+    (src/llama-auto-ubatch.h) must therefore also return true for
+    publish_dirty; tests/test-auto-ubatch-ladder.cpp executes it on that
+    trace."""
+    assert re.search(_SETTLE_NEEDS_PUBLISH_RE, _normalize_ws(strip_comments(LLAMA_AUTO_UBATCH_H))), (
+        "llama_auto_ubatch_settle_needs_publish must return published_any || publish_dirty || "
+        "n_ubatch != fallback_ubatch"
+    )
+
+
+def test_settle_needs_publish_dirty_term_has_a_mutation_witness():
+    """Mutation witness for the check above: dropping the publish_dirty
+    term from the helper must make it fail."""
+    raw = LLAMA_AUTO_UBATCH_H
+    line = "    return published_any || publish_dirty || n_ubatch != fallback_ubatch;\n"
+    assert raw.count(line) == 1, f"mutation target not unique -- found {raw.count(line)}"
+    mutated_raw = raw.replace(line, "    return published_any || n_ubatch != fallback_ubatch;\n", 1)
+    assert not re.search(_SETTLE_NEEDS_PUBLISH_RE, _normalize_ws(strip_comments(mutated_raw))), (
+        "mutation witness is broken: dropping publish_dirty should make the helper check fail"
+    )
+
+
+def test_settle_need_publish_dirty_argument_has_a_mutation_witness():
+    """Mutation witness for test_settle_publish_is_gated_on_published_any_
+    or_changed_value: passing `false` instead of publish_dirty at the
+    settle must make it fail."""
+    raw = LLAMA_CONTEXT_CPP
+    call = "llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty, cparams.n_ubatch, fallback_ubatch)"
+    assert raw.count(call) == 1, f"mutation target not unique -- found {raw.count(call)}"
+    mutated_raw = raw.replace(
+        call, "llama_auto_ubatch_settle_needs_publish(published_any, false, cparams.n_ubatch, fallback_ubatch)", 1
+    )
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    settle_block = mutated_body_norm[mutated_body_norm.find("if (!sched_matches_last_good") :]
+    assert settle_block.find(
+        "const bool need_publish = llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty, "
+        "cparams.n_ubatch, fallback_ubatch);"
+    ) == -1, "mutation witness is broken: dropping publish_dirty from the settle call should make the check fail"
 
 
 def test_warn_and_settle_have_a_mutation_witness():

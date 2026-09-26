@@ -1,6 +1,7 @@
-// Host-only gate for llama_auto_ubatch_ladder_has_candidate() (src/llama-auto-ubatch.h),
-// the predicate behind the SYCL auto micro-batch trial's early exit before its
-// ladder loop. When it returns false the loop would skip every rung, leave the
+// Host-only gate for the pure helpers in src/llama-auto-ubatch.h.
+//
+// llama_auto_ubatch_ladder_has_candidate() is the predicate behind the SYCL
+// auto micro-batch trial's early exit before its ladder loop. When it returns false the loop would skip every rung, leave the
 // `tried` list empty, and still log the [SYCL-PLAN] auto n_ubatch= outcome and
 // persist a terminal tuning-cache entry for a ladder that never ran -- so the
 // trial must take the silent pre-trial path instead.
@@ -14,6 +15,12 @@
 // The three cases the narrower "floor above the ladder's largest rung" form
 // gets wrong also run that form and require it to DISAGREE, so each is known
 // to discriminate between the two.
+//
+// llama_auto_ubatch_settle_needs_publish() decides whether the trial's settle
+// step republishes last_good. A candidate publish that threw may have landed
+// on some devices, so it must force a republish even when the last candidate
+// tried was fallback_ubatch itself.
+//
 // No device, no model, no allocation.
 
 #include "../src/llama-auto-ubatch.h"
@@ -45,6 +52,21 @@ static void check_case(const char * name, uint32_t floor, uint32_t cap, bool exp
     std::printf("ok   %s: floor=%u cap=%u has_candidate=%d\n", name, floor, cap, got);
 }
 
+static void check_publish(const char * name,
+                          bool         published_any,
+                          bool         publish_dirty,
+                          uint32_t     n_ubatch,
+                          uint32_t     fallback_ubatch,
+                          bool         expect) {
+    const bool got = llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty, n_ubatch, fallback_ubatch);
+    if (got != expect) {
+        std::fprintf(stderr, "FAIL %s: needs_publish=%d, expected %d\n", name, got, expect);
+        g_failures++;
+        return;
+    }
+    std::printf("ok   %s: needs_publish=%d\n", name, got);
+}
+
 int main() {
     // Defaults: n_ctx=4096, n_batch=2048, n_ubatch=512 -> 512, 1024 and 2048 are candidates.
     check_case("default dense context", 512, 2048, true);
@@ -68,6 +90,18 @@ int main() {
     // trial's own `cap < ladder[0]` exit handles this before the cache
     // lookup; the predicate agrees.
     check_case("cap below the first rung", 256, 256, false, true);
+
+    // Settle publish gate. Nothing published or attempted and the value is
+    // the constructor's own: the constructor's publish still describes it.
+    check_publish("nothing attempted, value unchanged", false, false, 512, 512, false);
+    check_publish("a candidate's publish took effect", true, false, 512, 512, true);
+    check_publish("last candidate left a different value", false, false, 1024, 512, true);
+
+    // Two SYCL backends, fallback 512, cached 1024: the cached publish lands
+    // on dev0 and dev1 refuses; rung 512's publish then throws on dev0, so
+    // cparams.n_ubatch is 512 again and published_any is still false. dev0
+    // still holds the 1024 plan, so the settle must republish.
+    check_publish("earlier partial publish above fallback, last candidate at fallback", false, true, 512, 512, true);
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d case(s) failed\n", g_failures);

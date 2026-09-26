@@ -31,3 +31,16 @@ inline bool llama_auto_ubatch_ladder_has_candidate(const uint32_t * ladder,
     }
     return false;
 }
+
+// True iff the trial's settle step must republish last_good on every device.
+// A candidate publish that took effect (published_any), or that threw and so
+// may have landed on some devices before one refused (publish_dirty), leaves
+// device plans that need not describe last_good. Otherwise the constructor's
+// own publish of fallback_ubatch still stands, so only a candidate value left
+// in n_ubatch that differs from fallback_ubatch needs one.
+inline bool llama_auto_ubatch_settle_needs_publish(bool     published_any,
+                                                   bool     publish_dirty,
+                                                   uint32_t n_ubatch,
+                                                   uint32_t fallback_ubatch) {
+    return published_any || publish_dirty || n_ubatch != fallback_ubatch;
+}
