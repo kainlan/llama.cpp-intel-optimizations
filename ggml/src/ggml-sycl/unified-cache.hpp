@@ -1909,11 +1909,12 @@ uint32_t unified_cache_get_planned_pp_moe_onednn_ring_depth(int device_id);
 // placed there by the runtime-context transaction because the RUNTIME zone could
 // not also hold them. reserve_pp_moe_onednn_scratch() allocates each slot from
 // its zone on every call, and the RUNTIME zone requirement counts only the
-// slots that stay in RUNTIME. kv_zone_bytes is depth x the flagged slot bytes.
-void   unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(int device_id, bool activation, bool output);
-bool   unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(int device_id);
-bool   unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(int device_id);
-size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id);
+// slots that stay in RUNTIME. What the ring physically holds in the KV zone is
+// unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(), not these flags: a
+// model load resets them while a previous context's ring may still exist.
+void unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(int device_id, bool activation, bool output);
+bool unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(int device_id);
+bool unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(int device_id);
 
 // llama.cpp-ibj0: per-row bytes behind the two ubatch-scaled slots above,
 // carried from the loader (src/llama-model.cpp's ggml_sycl_tensor_inventory)
@@ -3791,6 +3792,9 @@ class unified_cache {
         mem_handle weight_owner;
         mem_handle activation_owner;
         mem_handle output_owner;
+        // Allocated from the arena's shared KV zone (the weight slot never is).
+        bool       activation_in_kv_zone = false;
+        bool       output_in_kv_zone     = false;
     };
 
     bool reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
@@ -3806,6 +3810,9 @@ class unified_cache {
     // (returns false, ring left untouched) if any slot -- claimed or retired
     // -- is still in use; see the .cpp definition for the full contract.
     bool release_pp_moe_onednn_scratch_ring();
+    // Bytes the physical ring -- current and retired slots -- holds in the
+    // shared KV zone, read from the slots themselves.
+    size_t pp_moe_onednn_kv_zone_bytes_held();
     bool claim_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
     void release_pp_moe_onednn_scratch_slot(uint32_t slot, uint64_t generation);
     bool get_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
@@ -6376,6 +6383,9 @@ bool                         unified_cache_reserve_pp_moe_onednn_scratch(int    
 // matching the reserve wrapper immediately above. False (no-op) when the
 // device has no cache yet, or the ring is still in use.
 bool                         unified_cache_release_pp_moe_onednn_scratch_ring(int device_id);
+// llama.cpp-u1bb: unified_cache::pp_moe_onednn_kv_zone_bytes_held() on the
+// device's existing cache (never creates one); 0 when there is none.
+size_t                       unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(int device_id);
 pp_moe_onednn_scratch_result unified_cache_get_pp_moe_onednn_scratch_slot(int device_id, uint32_t slot);
 
 // Get scratch buffers for oneDNN FP16 path. Returns pointers plus a logical

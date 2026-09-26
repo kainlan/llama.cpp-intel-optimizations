@@ -172,7 +172,8 @@ static bool pp_moe_onednn_admit_ring_at(const pp_moe_onednn_ring_admission_input
         return true;
     }
     return out->compute_reserve_bytes <= out->kv_zone_headroom_bytes &&
-           kv_zone_bytes <= out->kv_zone_headroom_bytes - out->compute_reserve_bytes;
+           kv_zone_bytes <= out->kv_zone_headroom_bytes - out->compute_reserve_bytes &&
+           kv_zone_bytes <= in.kv_zone_largest_block_bytes;
 }
 
 pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_admission_inputs & in) {

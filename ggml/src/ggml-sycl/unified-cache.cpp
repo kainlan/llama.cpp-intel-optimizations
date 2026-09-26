@@ -1545,6 +1545,8 @@ moe_control_requirement unified_cache_get_planned_moe_control_requirement(int de
     return requirement;
 }
 
+static size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id);
+
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out) {
     // Ring slots placed in the shared KV zone are not RUNTIME demand.
     const size_t ring_bytes    = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device_id);
@@ -2216,7 +2218,8 @@ bool unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(int device_id) {
     return g_planned_pp_moe_onednn_output_in_kv_zone[device_id].load(std::memory_order_acquire);
 }
 
-size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id) {
+// The KV-zone part of the planned ring: what the RUNTIME zone is not sized for.
+static size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id) {
     size_t slot = 0;
     if (unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(device_id)) {
         slot += unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device_id);
@@ -17903,6 +17906,9 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
         slot.output     = slot.activation ?
                               allocate_buffer(output_slot_bytes, "pp_moe_onednn_output", output_zone, slot.output_owner) :
                               nullptr;
+        // Only the arena has zones; off it the zone preference is not applied.
+        slot.activation_in_kv_zone = arena_active() && activation_zone == vram_zone_id::KV;
+        slot.output_in_kv_zone     = arena_active() && output_zone == vram_zone_id::KV;
         if (!slot.weight || !slot.activation || !slot.output) {
             new_slots.push_back(std::move(slot));
             ok = false;
@@ -18014,6 +18020,18 @@ bool unified_cache::release_pp_moe_onednn_scratch_ring() {
         saturating_sub_used(released_direct);
     }
     return true;
+}
+
+size_t unified_cache::pp_moe_onednn_kv_zone_bytes_held() {
+    std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
+    size_t                      held = 0;
+    for (const auto * slots : { &pp_moe_onednn_scratch_slots_, &pp_moe_onednn_retired_slots_ }) {
+        for (const auto & slot : *slots) {
+            held += (slot.activation_in_kv_zone && slot.activation ? slot.activation_size : 0) +
+                    (slot.output_in_kv_zone && slot.output ? slot.output_size : 0);
+        }
+    }
+    return held;
 }
 
 bool unified_cache::claim_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out) {
@@ -18174,6 +18192,11 @@ bool unified_cache_release_pp_moe_onednn_scratch_ring(int device_id) {
         return false;
     }
     return cache->release_pp_moe_onednn_scratch_ring();
+}
+
+size_t unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(int device_id) {
+    unified_cache * cache = get_existing_unified_cache_for_device(device_id);
+    return cache ? cache->pp_moe_onednn_kv_zone_bytes_held() : 0;
 }
 
 pp_moe_onednn_scratch_result unified_cache_get_pp_moe_onednn_scratch_slot(int device_id, uint32_t slot) {

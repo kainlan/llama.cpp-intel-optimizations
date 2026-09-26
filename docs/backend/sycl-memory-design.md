@@ -2281,9 +2281,31 @@ a flagged slot from the KV zone with `forbid_vram_zone_spill`, so a slot that
 does not fit fails instead of spilling past the arena. The RUNTIME zone
 requirement counts only the slots that live in RUNTIME. The transaction charges
 the KV-zone bytes to the plan's `vram_bytes`, which the weight stager reserves
-against. A refused re-plan restores the old placement with the old ring. A
-rollback of an accepted one restores a ring that fit before, so it is not
-re-admitted against the headroom.
+against. The ring is admitted against the live KV headroom, not against
+`vram_budget`, so the published `vram_bytes` may exceed `vram_budget`. A refused
+re-plan restores the old placement with the old ring. A rollback of an accepted
+one restores a ring that fit before, so it is not re-admitted against the
+headroom. A rollback to an unchanged `n_ubatch` keeps a re-admitted placement:
+it fits, but the published plan's charge is for the one before it until the next
+transaction.
+
+**What the ring holds is read from the ring.** The planned placement says where
+the next reserve puts each slot. What the ring holds in the KV zone now comes
+from its slots: each records the zone it was allocated from
+(`unified_cache_get_pp_moe_onednn_kv_zone_bytes_held()`). The KV capacity, the
+re-fit's forced re-admission and the `vram_bytes` charge all read that. The two
+facts differ across a model load. The arena and the physical ring outlive a
+model, and a load resets the planned placement to RUNTIME. So a load releases a
+ring that still holds KV-zone bytes, because the reserve's "already sufficient"
+path would otherwise keep it. A slot claimed by an in-flight dispatch refuses
+that release, and it is never forced. The ring is then kept, KV still counts
+what it holds, and the next re-fit re-admits it.
+
+**Contiguity.** Each KV-zone slot is one allocation. So the whole KV-zone part
+must also fit the zone's largest free block, read after the old ring is
+released. That is sufficient rather than necessary, so a `-ub` a refusal names
+can be placed. If the allocator still cannot place an admitted ring, the
+refusal says so rather than naming the size it just refused.
 
 **The compute-buffer reserve is a known gap, not a solved term.** Neither the
 compute buffers nor the flash-attention K/V conversion buffers are in the

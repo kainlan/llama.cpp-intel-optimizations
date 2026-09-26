@@ -19,7 +19,11 @@ and acts on the answer, which is what this file pins:
   * the MMID pools, placed in the RUNTIME zone after the ring, are materialized
     only for a route that can run them, and otherwise the ring leaves them room;
   * the cache allocates a flagged slot from the KV zone, never spilling past
-    the arena, and does not size the RUNTIME zone for it.
+    the arena, and does not size the RUNTIME zone for it;
+  * what the ring holds in the KV zone is read from its slots, not from the
+    planned placement, and a model load releases a ring that holds any;
+  * the KV-zone part must fit the zone's largest free block, and a refusal
+    never names the -ub it refuses.
 
 A source gate authored after the fix goes green on every tree that has it, so
 every check below is witnessed by a mutation that must turn it red.
@@ -40,7 +44,9 @@ KV_CAPACITY_SIGNATURE = "static size_t ggml_sycl_kv_capacity_live("
 KV_WITH_SLACK_SIGNATURE = "static size_t ggml_sycl_device_kv_bytes_with_slack("
 RESERVE_SIGNATURE = "bool unified_cache::reserve_pp_moe_onednn_scratch("
 RUNTIME_REQUIREMENT_SIGNATURE = "bool unified_cache_get_planned_runtime_zone_requirement("
-KV_ZONE_BYTES_SIGNATURE = "size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes("
+KV_ZONE_BYTES_SIGNATURE = "static size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id) {"
+HELD_SIGNATURE = "size_t unified_cache::pp_moe_onednn_kv_zone_bytes_held() {"
+HELD_FREE_SIGNATURE = "size_t unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(int device_id) {"
 
 
 def function(text: str, signature: str) -> str:
@@ -167,7 +173,7 @@ def transaction_violations(sycl_cpp: str) -> list[str]:
     if push is None or refit is None or push.start() > refit.start():
         found.append("the KV re-fit does not count this device's ring KV-zone slots as free")
     if not re.search(r"const\s+size_t\s+ring_kv_zone_bytes\s*=\s*ggml_sycl::"
-                     r"unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes\(\s*ctx->device\s*\)\s*;", txn):
+                     r"unified_cache_get_pp_moe_onednn_kv_zone_bytes_held\(\s*ctx->device\s*\)\s*;", txn):
         found.append("the KV re-fit does not read this device's ring KV-zone slots")
     readmit = re.search(r"ring_readmit\s*=\s*ring_kv_zone_bytes\s*>\s*0\s*;", txn)
     if readmit is None or refit is None or not push or not push.start() < readmit.start() < refit.start() or \
@@ -175,7 +181,7 @@ def transaction_violations(sycl_cpp: str) -> list[str]:
         found.append("a re-fit that freed the ring's KV-zone slots does not force the ring to be re-admitted")
 
     probe_at = txn.find("if (probe_mode) {", call_at)
-    charge = re.search(r"const\s+size_t\s+charge\s*=\s*ggml_sycl::unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes"
+    charge = re.search(r"const\s+size_t\s+charge\s*=\s*ggml_sycl::unified_cache_get_pp_moe_onednn_kv_zone_bytes_held"
                        r"\(\s*ring_devices\[i\]\s*\)\s*;\s*next_plan\.vram_bytes\s*\+=\s*charge\s*;", txn)
     refused = txn.find('return refuse("PP MoE oneDNN scratch ring does not fit");')
     if charge is None or not 0 <= refused < charge.start() < probe_at:
@@ -214,13 +220,18 @@ def replan_violations(sycl_cpp: str) -> list[str]:
                 (r"kv_zone_available_bytes\s*=\s*kv_zone\s*\?\s*kv_zone->kv_capacity_bytes\s*:\s*"
                  r"std::numeric_limits<size_t>::max\(\)\s*;", "the live KV capacity"),
                 (r"kv_admitted_bytes\s*=\s*kv_zone\s*\?\s*kv_zone->kv_bytes\s*:\s*0\s*;", "the plan's KV"),
+                (r"kv_zone_largest_block_bytes\s*=\s*kv_zone\s*\?\s*cache->zone_largest_free\(\s*ggml_sycl::"
+                 r"vram_zone_id::KV\s*\)\s*:\s*std::numeric_limits<size_t>::max\(\)\s*;",
+                 "the KV zone's largest free block"),
                 (r"compute_reserve_bytes_per_row\s*=\s*kv_zone\s*\?\s*k_pp_moe_ring_compute_reserve_bytes_per_row\s*:"
                  r"\s*0\s*;", "the compute-buffer reserve"),
-                (r"runtime_pending\s*=\s*kv_zone\s*\?\s*kv_zone->runtime_pending_bytes\s*:\s*0\s*;.*"
-                 r"runtime_available_bytes\s*=\s*capacity_bytes\s*>\s*runtime_pending\s*\?\s*capacity_bytes\s*-\s*"
-                 r"runtime_pending\s*:\s*0\s*;", "the RUNTIME zone less what follows the ring")):
+                (r"runtime_available_bytes\s*=\s*runtime_net_bytes\s*;", "the RUNTIME zone less what follows the ring")):
             if not re.search(pattern, inputs, re.S):
                 found.append(f"the admission is not given {what}")
+        if not re.search(r"runtime_pending\s*=\s*arena\s*&&\s*kv_zone\s*\?\s*kv_zone->runtime_pending_bytes\s*:\s*0\s*;"
+                         r"\s*const\s+size_t\s+runtime_net_bytes\s*=\s*capacity_bytes\s*>\s*runtime_pending\s*\?\s*"
+                         r"capacity_bytes\s*-\s*runtime_pending\s*:\s*0\s*;", body):
+            found.append("the admission is not given the RUNTIME zone less what follows the ring")
 
     guard = re.search(r"if\s*\(\s*arena\s*&&\s*!\s*admission\.admit\s*\)\s*\{\s*return\s+refuse_and_restore\(\)\s*;",
                       body)
@@ -232,6 +243,16 @@ def replan_violations(sycl_cpp: str) -> list[str]:
         found.append("the arena refusal is not the admission's answer")
     if publish is None or ceiling is None or guard is None or not guard.end() < publish.start() < ceiling.start():
         found.append("the slots' zones are not published after admission and before the ceiling")
+
+    release = body.find("cache->release_pp_moe_onednn_scratch_ring()")
+    if admit is not None and not 0 <= release < admit.start():
+        found.append("the admission reads the KV zone before the old ring is released")
+    if not re.search(r"if\s*\(\s*fits\s*>=\s*n_ubatch\s*&&[^{]*\{[^}]*\}\s*else\s+if\s*\(\s*fits\s*>=\s*32\s*&&[^{]*\{"
+                     r"[^}]*largest -ub that fits", body):
+        found.append("a refusal can name the -ub it refuses")
+    if not re.search(r"zone_name\s*,\s*runtime_net_bytes\s*/\s*mb\s*,\s*fits_clause\s*\)", body) or \
+            not re.search(r"runtime_net_bytes\s*=\s*capacity_bytes\s*>\s*runtime_pending\s*\?", body):
+        found.append("the refusal does not print the RUNTIME bytes the admission used")
 
     restore = re.search(r"auto\s+refuse_and_restore\s*=\s*\[&\]\(\)\s*->\s*ggml_sycl_ring_replan_result\s*\{\s*"
                         r"ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots\(\s*device\s*,\s*"
@@ -263,7 +284,7 @@ def capacity_violations(sycl_cpp: str) -> list[str]:
                      r"\s*\)\s*;", capacity):
         found.append("the KV capacity counts an admitted context's allocated KV as used")
     if not re.search(r"if\s*\(\s*device\s*==\s*ring_device\s*\)\s*\{\s*capacity\s*\+=\s*ggml_sycl::"
-                     r"unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes\(\s*device\s*\)\s*;", capacity):
+                     r"unified_cache_get_pp_moe_onednn_kv_zone_bytes_held\(\s*device\s*\)\s*;", capacity):
         found.append("the KV capacity does not count the ring's KV-zone slots as free")
 
     with_slack = code_of(sycl_cpp, KV_WITH_SLACK_SIGNATURE)
@@ -291,6 +312,20 @@ def cache_violations(cache_cpp: str) -> list[str]:
                      r"vram_zone_id::RUNTIME\s*,", reserve):
         found.append("the weight slot can leave the RUNTIME zone")
 
+    for kind in ("activation", "output"):
+        if not re.search(rf"slot\.{kind}_in_kv_zone\s*=\s*arena_active\(\)\s*&&\s*{kind}_zone\s*==\s*vram_zone_id::KV\s*;",
+                         reserve):
+            found.append(f"the {kind} slot does not record the zone it was allocated from")
+    held = code_of(cache_cpp, HELD_SIGNATURE)
+    if held is None or \
+            not re.search(r"\{\s*&pp_moe_onednn_scratch_slots_\s*,\s*&pp_moe_onednn_retired_slots_\s*\}", held) or \
+            not re.search(r"slot\.activation_in_kv_zone\s*&&\s*slot\.activation\s*\?\s*slot\.activation_size", held) or \
+            not re.search(r"slot\.output_in_kv_zone\s*&&\s*slot\.output\s*\?\s*slot\.output_size", held):
+        found.append("the ring's KV-zone bytes are not read from all of its slots")
+    held_free = code_of(cache_cpp, HELD_FREE_SIGNATURE)
+    if held_free is None or "get_existing_unified_cache_for_device(device_id)" not in held_free:
+        found.append("reading the ring's KV-zone bytes can create a cache")
+
     requirement = code_of(cache_cpp, RUNTIME_REQUIREMENT_SIGNATURE)
     kv_bytes = code_of(cache_cpp, KV_ZONE_BYTES_SIGNATURE)
     if requirement is None or kv_bytes is None or \
@@ -301,10 +336,15 @@ def cache_violations(cache_cpp: str) -> list[str]:
 
 def load_plan_violations(sycl_cpp: str) -> list[str]:
     code = strip_comments(sycl_cpp)
-    if not re.search(r"unified_cache_set_planned_pp_moe_onednn_scratch\(\s*ctx->device\s*,[^;]*;\s*"
+    load = re.search(r"unified_cache_set_planned_pp_moe_onednn_scratch\(\s*ctx->device\s*,[^;]*;(.*?)"
                      r"ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots\(\s*ctx->device\s*,\s*false"
-                     r"\s*,\s*false\s*\)\s*;", code):
+                     r"\s*,\s*false\s*\)\s*;", code, re.S)
+    if load is None:
         return ["a model load keeps a previous context's KV-zone placement"]
+    if not re.search(r"const\s+size_t\s+(\w+)\s*=\s*ggml_sycl::unified_cache_get_pp_moe_onednn_kv_zone_bytes_held\("
+                     r"\s*ctx->device\s*\)\s*;\s*if\s*\(\s*\1\s*>\s*0\s*\)\s*\{[^{}]*"
+                     r"->release_pp_moe_onednn_scratch_ring\(\)", load.group(1)):
+        return ["a model load keeps a previous context's ring in the KV zone"]
     return []
 
 
@@ -369,6 +409,16 @@ MUTATIONS = [
      "kv_zone ? kv_zone->kv_capacity_bytes : std::numeric_limits<size_t>::max();",
      "kv_zone ? cache->zone_available(ggml_sycl::vram_zone_id::KV) : std::numeric_limits<size_t>::max();",
      "the admission is not given the live KV capacity"),
+    ("no largest free block", "sycl",
+     "kv_zone ? cache->zone_largest_free(ggml_sycl::vram_zone_id::KV) : std::numeric_limits<size_t>::max();",
+     "std::numeric_limits<size_t>::max();",
+     "the admission is not given the KV zone's largest free block"),
+    ("names the refused -ub", "sycl",
+     "if (fits >= n_ubatch && clause_len >= 0", "if (false && clause_len >= 0",
+     "a refusal can name the -ub it refuses"),
+    ("gross RUNTIME in the refusal", "sycl",
+     "zone_name, runtime_net_bytes / mb, fits_clause", "zone_name, capacity_bytes / mb, fits_clause",
+     "the refusal does not print the RUNTIME bytes the admission used"),
     ("old RUNTIME-only guard", "sycl",
      "if (arena && !admission.admit) {", "if (arena && needed_total > capacity_bytes) {",
      "the arena refusal is not the admission's answer"),
@@ -392,6 +442,9 @@ MUTATIONS = [
     ("plan's KV without slack", "sycl",
      " + n_resident * ggml_sycl::kv_alloc_slack_per_layer;\n}", ";\n}",
      "the plan's KV does not count the allocator's per-layer slack"),
+    ("load keeps a KV-zone ring", "sycl",
+     "if (ring_cache && ring_cache->release_pp_moe_onednn_scratch_ring()) {", "if (false) {",
+     "a model load keeps a previous context's ring in the KV zone"),
     ("load keeps the placement", "sycl",
      "    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(ctx->device, false, false);\n", "",
      "a model load keeps a previous context's KV-zone placement"),
@@ -409,6 +462,17 @@ MUTATIONS = [
     ("weight slot follows the activation zone", "cache",
      '"pp_moe_onednn_weight", vram_zone_id::RUNTIME,', '"pp_moe_onednn_weight", activation_zone,',
      "the weight slot can leave the RUNTIME zone"),
+    ("activation zone not recorded", "cache",
+     "slot.activation_in_kv_zone = arena_active() && activation_zone == vram_zone_id::KV;",
+     "slot.activation_in_kv_zone = false;",
+     "the activation slot does not record the zone it was allocated from"),
+    ("held ignores retired slots", "cache",
+     "{ &pp_moe_onednn_scratch_slots_, &pp_moe_onednn_retired_slots_ }", "{ &pp_moe_onednn_scratch_slots_ }",
+     "the ring's KV-zone bytes are not read from all of its slots"),
+    ("held creates a cache", "cache",
+     "unified_cache * cache = get_existing_unified_cache_for_device(device_id);\n    return cache ? cache->pp_moe",
+     "unified_cache * cache = get_unified_cache_for_device(device_id);\n    return cache ? cache->pp_moe",
+     "reading the ring's KV-zone bytes can create a cache"),
     ("RUNTIME sized for KV-zone slots", "cache",
      "unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(device_id)", "0",
      "the RUNTIME zone is sized for ring slots that live in the KV zone"),
