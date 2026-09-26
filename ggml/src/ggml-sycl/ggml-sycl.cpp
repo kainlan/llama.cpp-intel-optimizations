@@ -17596,7 +17596,7 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int     
 enum class ggml_sycl_txn_result { ACCEPTED, REFUSED, BUSY };
 
 // Bumped whenever KV admission retires optional layout copies
-// (unified_cache_yield_optional_layouts()). A recorded exec graph bakes the raw
+// (unified_cache::yield_optional_layouts()). A recorded exec graph bakes the raw
 // pointers it resolved; for a WOQ copy it also holds the copy's lease for the
 // graph's life (the WOQ gemm's retain_handles_until_event() lands in the
 // graph's sink while recording), so a copy a live graph reads is never
@@ -17686,7 +17686,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         return busy("busy (could not acquire a live-update lease)");
     }
 
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::unique_lock<std::mutex> lock(g_tensor_inventory_mutex);
     if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
         return busy("busy (plan changed while acquiring the transaction lock)");
     }
@@ -17869,23 +17869,58 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         // may still name the copy's pointer, which no reader trusts for
         // ONEDNN_WOQ (the ggml_sycl_get_weight_layout_ptr() fast path and
         // ggml_sycl_can_use_layout_for_kernel() ask the cache).
+        //
+        // The yield waits for the retired copies' readers and drops the handles
+        // it withdrew, neither of which may happen under this inventory lock
+        // (canonical memory contract §12.5). So it is begun under the lock --
+        // copies picked and retired, their free gated -- and finished with the
+        // lock released. Taken again, the lock finds either the plan this
+        // admission began from or a newer one; a newer one makes it busy, and
+        // the retired copies' room is there for the retry.
         if (residency.fits && !probe_mode) {
-            bool refit = false;
+            bool refit       = false;
+            bool retired_any = false;
             in.fit_capacity.assign(in.devices.size(), SIZE_MAX);
+            std::vector<std::vector<size_t>>                device_layer_bytes(in.devices.size());
+            std::vector<ggml_sycl::optional_layout_release> releases(in.devices.size());
             for (size_t i = 0; i < in.devices.size(); ++i) {
                 if (residency.yield_bytes[i] == 0) {
                     continue;
                 }
                 refit = true;
-                std::vector<size_t> layer_bytes;
                 for (size_t l = 0; l < n_kv_layers; ++l) {
                     if (in.load_kv_device[l] == in.devices[i] && in.layer_kv_bytes[l] > 0) {
-                        layer_bytes.push_back(ggml_sycl::kv_layer_alloc_bytes(in.layer_kv_bytes[l]));
+                        device_layer_bytes[i].push_back(ggml_sycl::kv_layer_alloc_bytes(in.layer_kv_bytes[l]));
                     }
                 }
-                const ggml_sycl::optional_layout_yield_result released =
-                    ggml_sycl::unified_cache_yield_optional_layouts(in.devices[i], next_plan.multi_device, layer_bytes);
-                size_t placeable = 0;
+                releases[i] = ggml_sycl::unified_cache_yield_optional_layouts_begin(
+                    in.devices[i], next_plan.multi_device, device_layer_bytes[i]);
+                retired_any = retired_any || releases[i].result.retired > 0;
+            }
+            if (retired_any) {
+                ggml_sycl_optional_layouts_retired();
+                lock.unlock();
+            }
+            std::vector<ggml_sycl::optional_layout_yield_result> yields(in.devices.size());
+            for (size_t i = 0; i < in.devices.size(); ++i) {
+                if (residency.yield_bytes[i] != 0) {
+                    yields[i] =
+                        ggml_sycl::unified_cache_yield_optional_layouts_finish(releases[i], device_layer_bytes[i]);
+                }
+            }
+            if (retired_any) {
+                lock.lock();
+                if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
+                    return busy("busy (plan changed while optional layout copies were released)");
+                }
+            }
+            for (size_t i = 0; i < in.devices.size(); ++i) {
+                if (residency.yield_bytes[i] == 0) {
+                    continue;
+                }
+                const std::vector<size_t> &                   layer_bytes = device_layer_bytes[i];
+                const ggml_sycl::optional_layout_yield_result released    = yields[i];
+                size_t                                        placeable   = 0;
                 for (size_t l = 0, n = 0; l < n_kv_layers && n < released.kv_layers; ++l) {
                     if (in.load_kv_device[l] == in.devices[i] && in.layer_kv_bytes[l] > 0) {
                         placeable += in.layer_kv_bytes[l];
@@ -17900,10 +17935,6 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                         in.devices[i], n_ctx, released.kv_layers, layer_bytes.size(),
                         layer_bytes.empty() ? 0.0 : layer_bytes.back() / mb);
                 }
-                if (released.retired == 0) {
-                    continue;
-                }
-                ggml_sycl_optional_layouts_retired();
                 if (released.freed > 0) {
                     GGML_LOG_WARN(
                         "[SYCL-PLAN] KV admission released %zu optional oneDNN WOQ layout copies (%.1f MB) on device "
@@ -35512,7 +35543,7 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     //
     // extra->layout is the last layout resolved for the tensor, not a lease: a
     // ONEDNN_WOQ copy there may since have yielded to runtime KV
-    // (unified_cache_yield_optional_layouts) and its bytes be KV now, so WOQ
+    // (unified_cache::yield_optional_layouts) and its bytes be KV now, so WOQ
     // residency is always asked of the cache below.
     if (src_is_device && !request_prefer_host) {
         if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
@@ -35661,7 +35692,7 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
 // The cache's copy of `tensor` in exactly `layout`, as a leased handle rather
 // than a pointer: the reader keeps it until its queued work completes
 // (retain_handles_until_event), so a copy that can be released at runtime (an
-// optional ONEDNN_WOQ copy, unified_cache_yield_optional_layouts()) is never
+// optional ONEDNN_WOQ copy, unified_cache::yield_optional_layouts()) is never
 // freed under the read. Records the layout on extra->layout as
 // ggml_sycl_get_weight_layout_ptr() does. Empty on a miss.
 static ggml_sycl::mem_handle ggml_sycl_acquire_weight_layout(const ggml_tensor * tensor,
@@ -61771,7 +61802,7 @@ static bool ggml_sycl_layout_override_active(layout_mode & override_layout) {
 
 // Whether the unified cache holds `tensor` in `layout` on `device` right now.
 // For a layout that can be released at runtime (an optional ONEDNN_WOQ copy,
-// unified_cache_yield_optional_layouts) this, not extra->layout, is the fact.
+// unified_cache::yield_optional_layouts) this, not extra->layout, is the fact.
 static bool ggml_sycl_weight_layout_cached(const ggml_tensor * tensor, int device, layout_mode layout) {
     sycl::queue &              q     = ggml_sycl_get_device(device).default_queue();
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(q);

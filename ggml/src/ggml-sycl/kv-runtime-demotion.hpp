@@ -198,7 +198,7 @@ struct kv_residency_input {
     std::vector<size_t>  yieldable;
     // The most KV bytes devices[i] can hold whatever its headroom says: the
     // bytes of the leading layers its zone's free blocks can actually place
-    // (unified_cache_yield_optional_layouts()). Empty, or SIZE_MAX, is no cap.
+    // (unified_cache::yield_optional_layouts()). Empty, or SIZE_MAX, is no cap.
     std::vector<size_t>  fit_capacity;
     size_t               per_layer_slack = kv_alloc_slack_per_layer;
 };

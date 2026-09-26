@@ -802,6 +802,17 @@ reclaims one physical layout of a tensor, not the tensor:
 - **Who calls it.** Only `yield_optional_layouts()`, at a context's KV
   admission. `reclaim_weight_entries()` refuses the mode, because it neither
   withdraws the mirror lease nor gates a free on readers.
+- **Where it waits.** The KV admission transaction holds
+  `g_tensor_inventory_mutex` (L1), and §12.5 of the canonical contract allows
+  no wait and no destructor-running release under that lock. The yield is
+  therefore split in two (`optional_layout_release`):
+  - **Begin**, under the lock: pick the copies, retire them, and submit the
+    barrier that gates their frees. It waits on nothing and drops no handle.
+  - **Finish**, with the lock released: wait on the barrier, return the
+    storage to its zone, and drop the withdrawn mirror handles.
+  The transaction then takes the lock again. If a newer plan was published in
+  between, the transaction reports busy, and the retired copies' room is there
+  for the retry.
 
 ## Where a weight's provenance comes from
 

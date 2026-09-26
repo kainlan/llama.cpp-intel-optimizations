@@ -1305,7 +1305,7 @@ struct placement_plan {
 
     // VRAM the plan's dense extra copies take on `dev_id` (-1: every device).
     // Not part of weight_vram_bytes or vram_bytes: an extra copy is optional
-    // and yields to runtime KV (unified_cache_yield_optional_layouts()), so it
+    // and yields to runtime KV (unified_cache::yield_optional_layouts()), so it
     // is accounted for on its own rather than as weight the plan must keep.
     size_t optional_layout_vram_bytes(int dev_id) const {
         size_t bytes = 0;
@@ -2256,6 +2256,25 @@ struct optional_layout_yield_result {
     size_t kv_layers     = 0;
 };
 
+// A yield split at its one wait, so a caller can hold an L1 lock through the
+// decision and through none of the wait (canonical memory contract §12.5).
+// yield_optional_layouts_begin() picks and retires the copies and submits the
+// barrier that gates their frees; it waits on nothing and drops no handle --
+// the direct-stage mirror handles it withdraws move in here. Finishing waits
+// on the barrier, returns the copies' storage to their zone and drops those
+// handles, so it runs with no L1 lock held. A release dropped unfinished
+// drops the handles in its destructor and leaves the frees to a later
+// deferred-free pass. `result` holds `retired`, and `kv_layers` when nothing
+// was retired; the rest is filled by the finish.
+struct optional_layout_release {
+    unified_cache *                          cache = nullptr;
+    optional_layout_yield_result             result;
+    std::vector<std::shared_ptr<mem_handle>> mirrors;
+    std::vector<const void *>                ptrs;
+    std::vector<size_t>                      sizes;
+    sycl::event                              readers_done;
+};
+
 inline bool expert_retire_succeeded(expert_retire_status status) {
     return status == expert_retire_status::WITHDRAWN || status == expert_retire_status::DEFERRED ||
            status == expert_retire_status::NOT_FOUND;
@@ -2949,9 +2968,14 @@ class unified_cache {
     // picked; the wait is defence in depth. Primaries are never touched.
     // kv_layers_allocatable() is how many of `layer_bytes` the zone can place
     // now. Cold, context-admission-time calls: not for a dispatch path.
+    // yield_optional_layouts() is begin plus finish (optional_layout_release),
+    // for a caller holding no L1 lock.
     bool                         mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout);
     size_t                       optional_layout_bytes() const;
     optional_layout_yield_result yield_optional_layouts(const std::vector<size_t> & layer_bytes);
+    optional_layout_release      yield_optional_layouts_begin(const std::vector<size_t> & layer_bytes);
+    optional_layout_yield_result yield_optional_layouts_finish(optional_layout_release &   release,
+                                                               const std::vector<size_t> & layer_bytes);
     size_t                       kv_layers_allocatable(const std::vector<size_t> & layer_bytes);
 
     // Fast O(1) lookup for inference-time weight resolution.
@@ -6706,15 +6730,18 @@ bool   unified_cache_mode_is_global();
 // unified_cache_entry::optional_layout). S1-PRELOAD marks each copy it stages
 // as well as a primary; the runtime-context transaction counts
 // unified_cache_optional_layout_bytes() as KV headroom and, before it demotes
-// any KV layer, releases what the KV needs with
-// unified_cache_yield_optional_layouts(), which also says how many of the
-// device's KV layers its zone can place. `multi_device` reads the device's
-// cache as unified_cache_kv_vram_available() does, so the numbers come from
-// the same zone.
+// any KV layer, releases what the KV needs: it begins the yield under its
+// inventory lock and finishes it after releasing that lock
+// (optional_layout_release), and the finish says how many of the device's KV
+// layers its zone can place. `multi_device` reads the device's cache as
+// unified_cache_kv_vram_available() does, so the numbers come from the same
+// zone.
 size_t                       unified_cache_optional_layout_bytes(int device_id, bool multi_device);
-optional_layout_yield_result unified_cache_yield_optional_layouts(int                         device_id,
-                                                                  bool                        multi_device,
-                                                                  const std::vector<size_t> & layer_bytes);
+optional_layout_release      unified_cache_yield_optional_layouts_begin(int                         device_id,
+                                                                        bool                        multi_device,
+                                                                        const std::vector<size_t> & layer_bytes);
+optional_layout_yield_result unified_cache_yield_optional_layouts_finish(optional_layout_release &   release,
+                                                                         const std::vector<size_t> & layer_bytes);
 
 // Sum of zone_used(KV) + zone_used(ONEDNN) + zone_used(RUNTIME) + zone_used(SCRATCH).
 // Returns 0 when arena is inactive.

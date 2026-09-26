@@ -7735,9 +7735,16 @@ size_t unified_cache::kv_layers_allocatable(const std::vector<size_t> & layer_by
 }
 
 optional_layout_yield_result unified_cache::yield_optional_layouts(const std::vector<size_t> & layer_bytes) {
-    optional_layout_yield_result result;
+    optional_layout_release release = yield_optional_layouts_begin(layer_bytes);
+    return yield_optional_layouts_finish(release, layer_bytes);
+}
+
+optional_layout_release unified_cache::yield_optional_layouts_begin(const std::vector<size_t> & layer_bytes) {
+    optional_layout_release release;
+    release.cache                         = this;
+    optional_layout_yield_result & result = release.result;
     if (layer_bytes.empty()) {
-        return result;
+        return release;
     }
     // Which copies to release is decided on a copy of the zone's allocators,
     // not by bytes: KV is placed one allocation a layer, and a copy staged
@@ -7764,7 +7771,7 @@ optional_layout_yield_result unified_cache::yield_optional_layouts(const std::ve
     const std::vector<size_t>  picks = select_optional_layout_yield(zone, blocks, layer_bytes);
     if (picks.empty()) {
         result.kv_layers = kv_layers_allocatable(layer_bytes);
-        return result;
+        return release;
     }
 
     // A copy's reader holds its lease until the read completes
@@ -7780,10 +7787,15 @@ optional_layout_yield_result unified_cache::yield_optional_layouts(const std::ve
     // cache's own mirror lease out and retire the entry under both locks, and
     // destroy the mirror handles with neither held. A pick is retired only if
     // it is still the same yieldable copy it was when the zone was modelled.
-    std::vector<std::shared_ptr<mem_handle>> released_mirrors;
-    std::vector<const void *>                retired_ptrs;
-    std::vector<size_t>                      retired_sizes;
-    sycl::event                              readers_done;
+    //
+    // Nothing here waits or drops a handle: the withdrawn mirror handles move
+    // into the release, and finish -- which its caller runs with no L1 lock
+    // held (canonical memory contract §12.5) -- waits on the barrier and drops
+    // them.
+    std::vector<std::shared_ptr<mem_handle>> & released_mirrors = release.mirrors;
+    std::vector<const void *> &                retired_ptrs     = release.ptrs;
+    std::vector<size_t> &                      retired_sizes    = release.sizes;
+    sycl::event &                              readers_done     = release.readers_done;
     {
         std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
@@ -7810,7 +7822,7 @@ optional_layout_yield_result unified_cache::yield_optional_layouts(const std::ve
             cache_lock.unlock();
             direct_lock.unlock();
             result.kv_layers = kv_layers_allocatable(layer_bytes);
-            return result;
+            return release;
         }
         for (size_t i : still) {
             const unified_cache_key & key    = keys[i];
@@ -7829,15 +7841,28 @@ optional_layout_yield_result unified_cache::yield_optional_layouts(const std::ve
             retired_sizes.push_back(sizes[i]);
         }
     }
-    released_mirrors.clear();
     result.retired = retired_ptrs.size();
+    return release;
+}
+
+optional_layout_yield_result unified_cache::yield_optional_layouts_finish(optional_layout_release &   release,
+                                                                          const std::vector<size_t> & layer_bytes) {
+    optional_layout_yield_result result = release.result;
+    // The withdrawn mirrors go first, with no lock held: their release runs
+    // mem_handle destructors.
+    release.mirrors.clear();
+    if (release.ptrs.empty()) {
+        return result;
+    }
+    const std::vector<const void *> & retired_ptrs  = release.ptrs;
+    const std::vector<size_t> &       retired_sizes = release.sizes;
 
     // One host wait per context admission that needed room, never on a
     // dispatch path. If it fails, the frees stay queued behind the barrier and
     // return with the next deferred-free pass, and none is counted as freed.
     bool readers_finished = true;
     try {
-        readers_done.wait_and_throw();
+        release.readers_done.wait_and_throw();
     } catch (...) {
         readers_finished = false;
     }
@@ -21429,16 +21454,24 @@ size_t unified_cache_optional_layout_bytes(int device_id, bool multi_device) {
     return cache ? cache->optional_layout_bytes() : 0;
 }
 
-optional_layout_yield_result unified_cache_yield_optional_layouts(int                         device_id,
-                                                                  bool                        multi_device,
-                                                                  const std::vector<size_t> & layer_bytes) {
+optional_layout_release unified_cache_yield_optional_layouts_begin(int                         device_id,
+                                                                   bool                        multi_device,
+                                                                   const std::vector<size_t> & layer_bytes) {
     auto * cache = optional_layout_cache_for_kv(device_id, multi_device);
     if (!cache) {
-        optional_layout_yield_result none;
-        none.kv_layers = layer_bytes.size();  // no cache, no zone to hold the KV to
+        optional_layout_release none;
+        none.result.kv_layers = layer_bytes.size();  // no cache, no zone to hold the KV to
         return none;
     }
-    return cache->yield_optional_layouts(layer_bytes);
+    return cache->yield_optional_layouts_begin(layer_bytes);
+}
+
+optional_layout_yield_result unified_cache_yield_optional_layouts_finish(optional_layout_release &   release,
+                                                                         const std::vector<size_t> & layer_bytes) {
+    if (!release.cache) {
+        return release.result;
+    }
+    return release.cache->yield_optional_layouts_finish(release, layer_bytes);
 }
 
 size_t unified_cache_kv_arena_used(int device_id) {
