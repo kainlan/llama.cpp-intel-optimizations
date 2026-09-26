@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.8. Author: impl-moua, 2026-09-26. The revisions answer nine reviews:
+Design, revision 7.7a. Author: impl-moua, 2026-09-26. The revisions answer nine reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -36,8 +36,11 @@ Design, revision 7.8. Author: impl-moua, 2026-09-26. The revisions answer nine r
   lead's rulings on it (§M8), and the items queued for this round (§M76's conditions 1, 2 and
   5, §M76a, §Z42.3, §ZR5 I-1 to I-3, the llama.cpp-fsgi pointer), recorded in §6.11. Revision
   7.7 is one commit on top of `db609bd15`, the merge of master `76c7f6548` into `task/moua`.
-  Revision 7.8 is one commit on top of 7.7 (`307a4ddb1`): the lead's ruling on the allowlisted
-  republish and zhcn 5.4's §3.8 rows 19, 22, 26, 27 and 30, also recorded in §6.11.
+  Revision 7.7a is two commits on top of 7.7 (`307a4ddb1`): `85635feee` (committed as "7.8"
+  before the lead named the round 7.7a) and this one. It carries the lead's ruling on the
+  allowlisted republish, zhcn 5.4's §3.8 rows 19, 22, 26, 27 and 30, the two cross-design items
+  closed with zhcn, the whole-tree census for the three deleted setters, and the pool phase
+  gate's provenance rule, all recorded in §6.11.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
@@ -1856,12 +1859,11 @@ contribution. It never re-fits KV and never yields.
     - clear the tenant key and the entry's copy of this context's ring contribution (the
       coverage query's input); unlock.
 
-    The reap's owner list (d) is the batch's device handles, which nobody else can reach once
-    the table is taken. **zhcn 5.3 differs here (r8 m-2):** it takes the table pointers at (c)
-    but checks and opens the table at (e) (zhcn :47-48, :664-666). Revision 7.6 said the two
-    designs agreed; they do not. This design checks and opens at (c), so (d)'s owner list is
-    fixed before the reap and (e) checks only the moved-out handles. The alignment is an open
-    cross-design item (§6.11).
+    The reap's owner list (d) is the batch's device handles plus the ring's moved-out slots,
+    never a host reservation, which nobody else can reach once the table is taken; they are
+    destroyed at the end of (d). (e) checks only the moved-out handles and ring slots. **This is
+    the agreed text (zhcn 5.4 §3.1 step 5(c)):** zhcn 5.3 checked and opened the table at (e);
+    5.4 checks and opens it at (c), in the words above, so the r8 m-2 difference is closed.
   - **No step 8′ (rulings §B.2, superseding §B.1).** Revision 7.4 had a step (c′) here that
     erased this context's entries from four backend caches. It is deleted: every one of those
     caches only compares identity (`stable_identity_equal`, `common.hpp:6706` and `:7040` at
@@ -2264,10 +2266,33 @@ inventory. What differs, because it is not in the device geometry:
   allocation. The full path runs only at a context's first publish, and the tenant-only path
   allocates nothing on the host tier (below).
 - **The first publish reserves AND HOLDS the host-tier room (rulings §D15; r7 I-6; lead ruling
-  on the pool's phase gate).** `grow_into` WARNs, and at `GGML_SYCL_HOST_ALLOC_PHASE_GATE` ≥ 2
-  asserts, when the pool grows during a PP or TG phase (`pinned-pool.cpp:865-882`), so the one
-  host allocation happens at the **first** publish, at context creation, outside any inference
-  phase:
+  on the pool's phase gate).** The one host allocation happens at the **first** publish, at
+  context creation, and never at a republish. `grow_zone` and `grow_into` WARN, and at
+  `GGML_SYCL_HOST_ALLOC_PHASE_GATE` ≥ 2 assert, when the pool grows while
+  `offload_stats_phase()` reads PP or TG (`pinned-pool.cpp:613-640`, `:865-882` at
+  `3d9414c8c`). **That phase does not describe a context, so this design keys the gate on
+  provenance (checked for 7.7a at the lead's request):**
+  - the phase is one process-global atomic, `g_offload_phase` (`unified-cache.cpp:2545-2547`),
+    set to PP or TG at every graph-compute entry (`ggml-sycl.cpp:105145`) and reset only by the
+    load hooks (`:12450`, `:12754`, UNKNOWN; `:12415`, LOAD) and around the warmup pass
+    (`:106880-106882`), **never at graph exit**. Once any context in the process has computed a
+    graph, every later host growth reads as inference-time growth;
+  - so the gate fires on planned work: the first publish of any context created after another
+    has decoded (`llama-bench` builds a context per test; a server can build several), and the
+    MMID host carve's planned growth at a republish past `MOE_GPU_UBATCH_MAX` (§2.4.2 step 7).
+    At the default gate that is a false WARN; at ≥ 2 it asserts on work the plan sized;
+  - **the rule:** both gates skip when the calling thread holds `ggml_sycl_replan_token` (its
+    thread-local held flag, above), and fire as today otherwise. Every planned host growth runs
+    on a thread that holds the token: the first publish's reservations, taken before L1 inside
+    the full transaction, and the MMID carve's growth, under L0. Every unplanned growth runs
+    without it: an expert-cache host fill, host weight staging, and any allocation on a
+    decoding thread. The flag is thread-scoped and the gate runs on the allocating thread, so a
+    decode on another thread gets no exemption. The pool reads the flag through a unified-cache
+    accessor, since the token lives in `ggml-sycl.cpp`; this is L4's. Resetting
+    `g_offload_phase` around the transaction instead is rejected: the phase is process-global,
+    so the reset would also exempt a concurrent decode's fill.
+
+  The reservations themselves:
   - **Held carves, one per host slot index (rulings §D15, §ZR5 I-2).** The first publish
     allocates one owner-first reservation per host `(cohort, index)`, through the request above,
     and the registry entry holds them together, for the context's life, as the context's **host
@@ -2276,25 +2301,25 @@ inventory. What differs, because it is not in the device geometry:
     reserved nothing either (r7 I-6). Revision 7.6 took one carve and sub-carved the slots from
     it as offset views; §ZR5 I-2 replaces that, because the slots of one context need not be
     adjacent and an offset sub-carve across a pool region is exactly what the ruling forbids.
-  - **Each is contiguous, and the path exists (llama.cpp-nsl3; zhcn 5.4 row 19).** Host slot
-    `i` **is** reservation `i`: no offset views, no slices across reservations, no summed
-    envelope. The owner-first request (`unified_allocate_owner`, `unified-cache.cpp:16141` at
-    `3d9414c8c`) reaches one contiguous allocation with no new primitive: `select_zone`
-    (`:15361-15372`) maps `HOST_COMPUTE` to the WEIGHT zone, and `try_zone_alloc_contiguous`
-    (`:15394-15437`) calls `host_zone_alloc` → `pinned_chunk_pool::zone_alloc`
-    (`pinned-pool.cpp:500`, one chunk). On a miss it grows the zone through `host_zone_grow`
-    (`unified-cache.cpp:20399`) → `grow_zone` (`pinned-pool.cpp:613`) by one chunk of
-    `chunk_footprint_for` = `max(chunk_size_, align_up(need))` (`:798-803`), so a slot larger
-    than a zone chunk gets a chunk of its own. Before the zones are configured, the same request
-    takes `host_pool_alloc` (`unified-cache.cpp:20169-20174`) → `allocate_runtime`
-    (`pinned-pool.cpp:209-212`) → `allocate_from_chunks` (`:805-850`), with the same footprint.
-    `allocate_segmented`, `zone_alloc_segmented` and `host_zone_alloc_segmented`
-    (`unified-cache.cpp:20486-20502`) are never on this path. The limits are the pool budget
-    and Level Zero's per-allocation limit (about 11 GB); a failure there fails context creation.
-    Both `grow_zone`'s and `grow_into`'s phase gates (`pinned-pool.cpp:613-640`, `:865-882`)
-    stay silent, because the first publish runs at context creation, outside PP and TG.
-    Revision 7.7 routed a large slot to `allocate_runtime` and called routing it there an L4
-    gap; that was wrong, and the gap does not exist.
+  - **Each is contiguous, and the path exists (llama.cpp-nsl3; zhcn 5.4 row 19).** Host slot `i`
+    **is** reservation `i`: no offset views, no slices across reservations, no summed envelope.
+    The owner-first request (`unified_allocate_owner`, `unified-cache.cpp:16141` at `3d9414c8c`)
+    reaches one contiguous allocation with no new primitive: `select_zone` (`:15361-15372`) maps
+    `HOST_COMPUTE` to the WEIGHT zone, and `try_zone_alloc_contiguous` (`:15394-15437`) calls
+    `host_zone_alloc` → `pinned_chunk_pool::zone_alloc` (`pinned-pool.cpp:500`, one chunk). On a
+    miss it grows the zone through `host_zone_grow` (`unified-cache.cpp:20399`) → `grow_zone`
+    (`pinned-pool.cpp:613`) by one chunk of `chunk_footprint_for` = `max(chunk_size_,
+    align_up(need))` (`:798-803`), so a slot larger than a zone chunk gets a chunk of its own.
+    Before the zones are configured, the same request takes `host_pool_alloc`
+    (`unified-cache.cpp:20169-20174`) → `allocate_runtime` (`pinned-pool.cpp:209-212`) →
+    `allocate_from_chunks` (`:805-850`), with the same footprint. `allocate_segmented`,
+    `zone_alloc_segmented` and `host_zone_alloc_segmented` (`unified-cache.cpp:20486-20502`) are
+    never on this path. The limits are the pool budget and Level Zero's per-allocation limit
+    (about 11 GB); a failure there fails context creation. Both pool phase gates stay silent on
+    this growth because the thread holds the token (the provenance rule above), not because of
+    the phase, which can read PP or TG here. Revision 7.7 routed a large slot to
+    `allocate_runtime` and called routing it there an L4 gap; that was wrong, and the gap does
+    not exist.
   - **Each slot's size is the plan's maximum for that index (rulings §ZR5 I-1; r8 m-10):**
     `R_h[i]`, the largest `slot_bytes` at that `(cohort, index)` over **every** rung in the
     ladder's rung set, not the top rung's demand. The two are equal only if host demand is
@@ -3647,7 +3672,14 @@ L7 documents this limit, and pattern #2 remains the remedy.
       - a republish whose host need exceeds the reservation is refused at (0) as a candidate
         refusal naming the tenants, by arithmetic, whatever the pool's live free room (the arm
         runs it with the pool both full and empty, and the answer is the same); `grow_zone`
-        stays at 0. RED: the first draft's host path, which let every republish grow the pool.
+        stays at 0. RED: the first draft's host path, which let every republish grow the pool;
+      - **the phase gate keys on provenance (7.7a):** at `GGML_SYCL_HOST_ALLOC_PHASE_GATE=2`,
+        after a modelled graph has set the phase to TG, a second context's first publish grows
+        the pool for its reservations, and a republish past `MOE_GPU_UBATCH_MAX` grows the MMID
+        host carve under L0; neither asserts. A modelled expert-cache fill on another thread,
+        with no token, still asserts. REDs: today's phase-only gate, which asserts on the second
+        context's first publish, and a reset of `g_offload_phase` around the transaction, under
+        which the concurrent fill no longer asserts.
 - **H4b auto-ubatch ladder replay (r1 M9).** Replays `publish(ring_k) -> sched_reserve(overflow_k)`
   for the candidates, then the settle. It asserts:
   - the RETAINED run count stays at or below the number of candidates;
@@ -3902,9 +3934,11 @@ L7 documents this limit, and pattern #2 remains the remedy.
     reservation, sized at that index's maximum over every rung, and no tenant-only path reaches
     a host allocation; no host-slot path calls `allocate_segmented` or `zone_alloc_segmented`.
     The path is the one §2.4.3 cites (`try_zone_alloc_contiguous`, then `grow_zone` by one
-    chunk sized to the request). Mutation witnesses: 7.5's per-republish allocation with
-    `forbid_host_zone_growth = true`, 7.6's single carve with offset views, and a slot routed to
-    `zone_alloc_segmented`;
+    chunk sized to the request). Both pool phase gates read the token's held flag, and nothing
+    in the transaction writes `g_offload_phase`. Mutation witnesses: 7.5's per-republish
+    allocation with
+    `forbid_host_zone_growth = true`, 7.6's single carve with offset views, a slot routed to
+    `zone_alloc_segmented`, and a gate that ignores the token;
   - (ao) **per-model plan state (rulings §M76a).** On every L0-entry path (the transaction
     body, the probe, the FA recheck, activate, unload and the load entries), no read of
     `g_tensor_inventory_*`, `g_placement_kv_info` or `g_model_n_layer` exists outside the load
@@ -4276,7 +4310,9 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
   `stage_inventory_plan` to `load_end` (§M8 I-3; H7ap); the model's MMID entry, its first
   materialization inside the transaction and the planned growth of its carve (§M8 I-5; H7am);
   one fit computation with no MMID budget on arena devices (H7aq); the host tier's contiguous
-  per-index reservations, through the existing nsl3 path (§ZR5 I-2; H7an); the
+  per-index reservations, through the existing nsl3 path (§ZR5 I-2; H7an); the pool phase
+  gates' exemption for a thread holding the replan token, read through a unified-cache
+  accessor (7.7a; H4, H7an); the
   coverage query's backed-table rule and the entry's contribution copy (§M8 I-4); and the ring
   as per-kind contributions with a component-wise max (r8 m-8; H8).
 - **L6:** the transaction body taking the per-model snapshot (§M8 I-2); the token at the top of
@@ -5049,10 +5085,10 @@ master `76c7f6548` at `db609bd15`, and every new line was checked with `git show
 | llama.cpp-fsgi pointer | One line in §2.4.2: `get_cached_tensor_ptr` (`:19236`) is fsgi's, reuses the snapshot, lands after moua. |
 | §Z42.3 (no per-record zone) | The zone line and the record's zone field are deleted (§2.4.3 "Zone"). |
 | §ZR5 I-1 (host sizing over every rung) | m-10 above. |
-| §ZR5 I-2 (one owner-first reservation per slot index, contiguous) | §2.4.3's HOLD is per-index reservations through the existing nsl3 contiguous path (revision 7.8; 7.7 wrongly routed a large slot to `allocate_runtime` as an L4 gap); H4 and H7an. |
-| §ZR5 I-3 (identity compare and republish in one section) | §2.4.2 "The allowlist": the four sites call `ggml_sycl_republish_current_plan_into_empty(cache)` (revision 7.8, lead ruling), which writes no device-global; H7ai and H9. |
+| §ZR5 I-2 (one owner-first reservation per slot index, contiguous) | §2.4.3's HOLD is per-index reservations through the existing nsl3 contiguous path (revision 7.7a; 7.7 wrongly routed a large slot to `allocate_runtime` as an L4 gap); H4 and H7an. |
+| §ZR5 I-3 (identity compare and republish in one section) | §2.4.2 "The allowlist": the four sites call `ggml_sycl_republish_current_plan_into_empty(cache)` (revision 7.7a, lead ruling), which writes no device-global; H7ai and H9. |
 
-**Revision 7.8: the lead's allowlist ruling and zhcn 5.4's §3.8 rows (head `1547f42`).**
+**Revision 7.7a: the lead's allowlist ruling and zhcn 5.4's §3.8 rows (head `1547f42`).**
 
 | row | request | disposition |
 |-----|---------|-------------|
@@ -5062,21 +5098,75 @@ master `76c7f6548` at `db609bd15`, and every new line was checked with `git show
 | 27 | H7ag gains the four scatter lists and `g_moe_down_shadow` | **Adopted** (§2.4.2 census, H7ag: nine named containers; the not-holders listed). One cite corrected: the shadow key's compare is `:21131-21132`, not `:21127-21129`. |
 | 30 | the allowlist calls `ggml_sycl_republish_current_plan_into_empty(cache)` | **Adopted** (lead ruling; §2.4.2 "The allowlist", H7ai, H9). The emptiness check outside the mutex is at `:5885-5886`. |
 
-**Open cross-design items (zhcn).** These are not agreements until zhcn confirms:
-- the table: zhcn 5.3 checks and opens it at (e); this design at (c);
-- the I-4 rule (GROWTH on a cleared key or an empty ring record), sent to zhcn with the
-  wording above.
+**The two cross-design items are closed (7.7a), and this is the agreed text.**
+- **The table opens at (c).** zhcn 5.4 §3.1 step 5(c): under `kv_region_mutex_`, on each
+  device, read each slot's atomic claimed flag only (a still-claimed current tenant slot is
+  `[CONTEXT-PLAN-BUG]`, nothing taken); otherwise take every holder of the published table
+  (move the entry's `shared_ptr` into the batch, reset each backend context's cached pointer);
+  check `use_count() == 1`, else `[CONTEXT-PLAN-BUG]` naming the holder with nothing moved;
+  only then open it (covered device slots and every host reservation into the registry entry,
+  growing device slots and unused indexes into the batch; drop the emptied table); clear the
+  tenant key; unlock. The reap's owners are the batch's device handles plus the ring's moved-out
+  slots, never a host reservation, destroyed at the end of (d); (e) checks only those. §2.4.2
+  (c) says the same.
+- **The covered path's read (§M8 I-4).** zhcn adopts this design's wording as is: the coverage
+  query reads the registry entry's copy of the ring contribution under the `kv_region_mutex_`
+  leaf, releases it, then takes the ring record's lock alone, never nested; it answers GROWTH
+  if the tenant key is cleared, or if the context still contributes and the ring record is
+  empty, whatever the caps say. The §M76.1 statement holds with two sections, because the key
+  and the contribution are written only by the context's owner-thread transaction and its
+  release proc, and the ring never drops below a live contributor's contribution. zhcn carries
+  this design's refused-(ii) revert arm in its H2/H9. It lands in zhcn's round after
+  design-zhcn-r6, on the lead's hold, so it is agreed text not yet in zhcn's file.
 
-The covered path is no longer open: zhcn 5.4 uses the read-only query and names 5.3's
-key-record write as its RED (row 26).
+zhcn 5.4 also uses the read-only query on the covered path and names 5.3's key-record write as
+its RED (row 26).
+
+**The census for the three deleted setters (§M8 I-1; lead approval, conditional on the whole
+tree).** Command, run in the worktree against master `3d9414c8c`:
+
+```
+git grep -n -E 'set_runtime_n_ctx|set_model_loading|set_tensor_inventory' 3d9414c8c -- \
+    src ggml tools examples tests common include ggml/include
+```
+
+It finds no call of `ggml_backend_sycl_set_runtime_n_ctx`, `ggml_backend_sycl_set_model_loading`
+or `ggml_backend_sycl_set_tensor_inventory` outside their own definitions
+(`ggml-sycl.cpp:19086`, `:13273`, `:16745`). `src/`, `tools/`, `examples/`, `common/` and
+`include/` have no hit at all. The other hits are:
+- the declarations and their comments, `ggml/include/ggml-sycl.h:349`, `:356`, `:378`, `:418`,
+  `:596`, `:1430` and `:1434`, deleted with the definitions;
+- comments only: `ggml-sycl.cpp:2632`, `:14733`, `:15889`, `:25223`, `:35529`,
+  `layer-streaming.cpp:23`, `unified-cache.hpp:2432`,
+  `ggml-sycl/tests/test-unified-runtime-alloc.cpp:705`, `tests/test-tiered-dispatch.cpp:95`,
+  and `tests/test-sycl-model-lifecycle-hooks.cpp:26`, `:39`, `:207` and `:283` (the last a
+  diagnostic string);
+- `ggml_sycl_set_tensor_inventory_impl` (`:16491`), the private plan computation behind
+  `compute_placement_plan_early`, which **stays**; its callers are the deleted wrapper
+  (`:16748`) and the stage path (`:16826`), so only the exported wrapper at `:16745` goes;
+- source-contract tests: `test-sycl-lifecycle-source-contract.py:445` and
+  `test-sycl-tiered-verdict-contract.py:192` assert the call is **absent** and stay true;
+  `test-sycl-tiered-verdict-contract.py:237` is a text mutant and needs no symbol;
+  `test-sycl-nonfa-attn-scratch-guard-source.py:294`, `:344` and `:481` and
+  `test-sycl-host-zone-config-source-contract.py:12-14`, `:92`, `:109-113` and `:187` anchor on
+  the deleted text, and are re-anchored in L6 as §2.4.2 records (the host-zone check's
+  `setter_fn` window fails closed when empty, so it cannot pass vacuously).
+
+The rest of the tree has hits only in `docs/` (history and plans), which is not re-anchored.
 
 **Noted for the lead.**
-- The MMID host carve's planned growth (I-5(d)) can run outside a first publish only for a
-  context beyond the model's ladder maximum: an explicit `-ub` above `MOE_GPU_UBATCH_MAX`, or
-  the deprecated `llama_set_warmup`. That growth is a pinned-pool allocation at a republish.
-  Whether `GGML_SYCL_HOST_ALLOC_PHASE_GATE` ≥ 2 then asserts depends on the phase marker at
-  `sched_reserve` time, which this round did not check.
-- The merge `db609bd15` was not built; it changes no source file this design cites.
-- With row 19 the first publish's host growth is at context creation, outside PP and TG, so
-  neither pool phase gate fires there; the note above about the MMID carve's later growth is
-  unchanged.
+- **The phase gate (checked for 7.7a).** 7.7 left open whether the MMID host carve's growth
+  past `MOE_GPU_UBATCH_MAX` trips `GGML_SYCL_HOST_ALLOC_PHASE_GATE`. It does, and so would
+  7.7a's row-19 claim that a first publish is "outside PP and TG": `g_offload_phase` is
+  process-global and set at every graph-compute entry but never cleared at exit, so both
+  growths read as PP or TG once any graph has run. The design now keys both gates on the
+  replan token's held flag (§2.4.3; H4, H7an). This is a new mechanism in L4, and the lead
+  may prefer another shape.
+- **`db609bd15` was not built as a whole, and it is not doc-only.** It merges master `76c7f6548`
+  (61 files over `874fe5490`) into a branch whose own delta over master is this document plus
+  L1: `tlsf-allocator.hpp`, `shared-zone-tags.hpp`, `tests/test-tlsf-allocator.cpp` and
+  `tests/CMakeLists.txt`. The commits after it (7.7, 7.7a) are doc-only. The merge touches none
+  of L1's sources, only `tests/CMakeLists.txt`. After it, `sycl-build.sh test-tlsf-allocator`
+  reconfigured, found no work, and the host-only `test-tlsf-allocator` passed (25 PASSED lines,
+  rc 0) at `85635feee`. Nothing else was built; no source file this design cites differs from
+  `3d9414c8c`.
