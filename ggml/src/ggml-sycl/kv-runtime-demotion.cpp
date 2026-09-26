@@ -122,15 +122,25 @@ kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in) {
         fit.kv_device = r.kv_device;
 
         size_t n_resident = 0;
+        size_t kv_bytes   = 0;
         for (size_t l = 0; l < r.kv_device.size(); ++l) {
             if (r.kv_device[l] == fit.device && l < in.layer_kv_bytes.size() && in.layer_kv_bytes[l] > 0) {
                 ++n_resident;
+                kv_bytes += std::min(in.layer_kv_bytes[l], SIZE_MAX - kv_bytes);
             }
         }
         const bool   overflow  = in.per_layer_slack > 0 && n_resident > SIZE_MAX / in.per_layer_slack;
         const size_t slack     = overflow ? SIZE_MAX : n_resident * in.per_layer_slack;
+        const size_t demand    = kv_bytes + std::min(slack, SIZE_MAX - kv_bytes);
         const size_t available = i < in.available.size() ? in.available[i] : 0;
-        fit.capacity           = available > slack ? available - slack : 0;
+        const size_t yieldable = i < in.yieldable.size() ? in.yieldable[i] : 0;
+        const size_t yield     = demand > available ? std::min(demand - available, yieldable) : 0;
+        const size_t headroom  = available + std::min(yield, SIZE_MAX - available);
+        fit.capacity           = headroom > slack ? headroom - slack : 0;
+        if (i < in.fit_capacity.size()) {
+            fit.capacity = std::min(fit.capacity, in.fit_capacity[i]);
+        }
+        r.yield_bytes.push_back(yield);
 
         const kv_demotion_result demotion = plan_device_kv_fit(fit);
         for (int l : demotion.demoted_layers) {
@@ -144,6 +154,81 @@ kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in) {
         }
     }
     return r;
+}
+
+size_t kv_layers_allocatable(kv_zone_model zone, const std::vector<size_t> & layer_bytes) {
+    size_t placed = 0;
+    for (size_t bytes : layer_bytes) {
+        bool fits = false;
+        for (tlsf_allocator & allocator : zone) {
+            if (allocator.allocate(bytes) != SIZE_MAX) {
+                fits = true;
+                break;
+            }
+        }
+        if (!fits) {
+            break;
+        }
+        ++placed;
+    }
+    return placed;
+}
+
+std::vector<size_t> select_optional_layout_yield(const kv_zone_model &              zone,
+                                                 const std::vector<kv_zone_block> & copies,
+                                                 const std::vector<size_t> &        layer_bytes) {
+    std::vector<size_t> order;
+    for (size_t i = 0; i < copies.size(); ++i) {
+        if (copies[i].allocator < zone.size()) {
+            order.push_back(i);
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return copies[a].allocator != copies[b].allocator ? copies[a].allocator > copies[b].allocator :
+                                                            copies[a].offset > copies[b].offset;
+    });
+    auto freed_model = [&](const std::vector<size_t> & picks) {
+        kv_zone_model model = zone;
+        for (size_t i : picks) {
+            model[copies[i].allocator].free(copies[i].offset);
+        }
+        return model;
+    };
+
+    std::vector<size_t> picked;
+    std::vector<size_t> pending;
+    size_t              placed = kv_layers_allocatable(zone, layer_bytes);
+    for (size_t i : order) {
+        if (placed >= layer_bytes.size()) {
+            break;
+        }
+        pending.push_back(i);
+        std::vector<size_t> trial = picked;
+        trial.insert(trial.end(), pending.begin(), pending.end());
+        const size_t trial_placed = kv_layers_allocatable(freed_model(trial), layer_bytes);
+        if (trial_placed <= placed) {
+            continue;
+        }
+        // Keep only the pending copies this gain needs: one that no longer
+        // coalesces into the block a layer took is dropped again.
+        for (size_t p = 0; p + 1 < pending.size();) {
+            std::vector<size_t> without = picked;
+            for (size_t q = 0; q < pending.size(); ++q) {
+                if (q != p) {
+                    without.push_back(pending[q]);
+                }
+            }
+            if (kv_layers_allocatable(freed_model(without), layer_bytes) >= trial_placed) {
+                pending.erase(pending.begin() + (std::ptrdiff_t) p);
+            } else {
+                ++p;
+            }
+        }
+        picked.insert(picked.end(), pending.begin(), pending.end());
+        pending.clear();
+        placed = trial_placed;
+    }
+    return picked;
 }
 
 int layer_block_kv_device(const std::vector<int> &    kv_device,

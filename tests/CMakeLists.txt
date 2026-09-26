@@ -2675,6 +2675,29 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         TIMEOUT 300
     )
 
+    # test-sycl-optional-layout-yield: a yield of optional layout copies must
+    # hand their bytes back to the zone KV admission re-reads, pass over a
+    # leased copy, and never touch a primary -- on a real device cache, with no
+    # model loaded. Its memory cost has not been measured yet, so it carries
+    # `cache` and stays out of the throttled sweep until it is (see the label
+    # note on the gate above).
+    llama_build(test-sycl-optional-layout-yield.cpp)
+    target_include_directories(test-sycl-optional-layout-yield PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-optional-layout-yield PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-optional-layout-yield PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-optional-layout-yield PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-optional-layout-yield PRIVATE "-fsycl")
+        target_link_options(test-sycl-optional-layout-yield PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-optional-layout-yield LABEL "main")
+    set_tests_properties(test-sycl-optional-layout-yield PROPERTIES
+        LABELS "sycl;cache;lease"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        TIMEOUT 300
+    )
+
     # test-sycl-model-lifecycle-hooks: the weight-ownership hooks must actually
     # be INVOKED on a real llama_model load and teardown (llama.cpp-viga).
     #

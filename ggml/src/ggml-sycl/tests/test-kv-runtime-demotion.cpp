@@ -493,6 +493,194 @@ int main() {
         CHECK(kv_device_residency_changed(load, published, more, 0), "case 25: device 0 demoted one more layer");
         CHECK(kv_device_residency_changed(load, more, published, 0), "case 25: device 0 got a layer back");
     }
+    // 26. Optional layout copies yield before any KV layer demotes. The B50
+    // Mistral Q4_0 run at GGML_SYCL_VRAM_BUDGET_PCT=60, -c 2048: 32 layers of
+    // 8 MB, 84.4 MB of live headroom left beside 2869.8 MB of oneDNN WOQ
+    // copies. Without the copies counted it demotes 22 layers, as that run did.
+    {
+        const size_t       mb = 1024 * 1024;
+        kv_residency_input in;
+        in.load_kv_device.assign(32, 0);
+        in.swa_layer_mask.assign(32, 0);
+        in.layer_kv_bytes.assign(32, 8 * mb);
+        in.devices   = { 0 };
+        in.available = { 84 * mb + 4 * mb / 10 };
+
+        auto without = plan_runtime_kv_residency(in);
+        CHECK(without.fits, "case 26: fits without the copies, by demotion");
+        CHECK_EQ(without.per_device[0].demoted_layers.size(), 22, "case 26: 22 layers demoted without the copies");
+
+        in.yieldable = { 2869 * mb + 8 * mb / 10 };
+        auto r       = plan_runtime_kv_residency(in);
+        CHECK(r.fits, "case 26: fits");
+        CHECK(r.per_device[0].demoted_layers.empty(), "case 26: no KV layer demotes while copies can yield");
+        CHECK(r.kv_device == in.load_kv_device, "case 26: all 32 layers stay on the device");
+        CHECK_EQ(r.yield_bytes.size(), 1, "case 26: one yield per device");
+        CHECK_EQ(r.yield_bytes[0], 32 * 8 * mb + 32 * kv_alloc_slack_per_layer - in.available[0],
+                 "case 26: yields exactly the shortfall");
+    }
+    // 27. The same device at -c 32768 (128 MB a layer): by bytes every copy
+    // yields and only what is still over demotes -- 9 layers instead of all 32.
+    // Bytes are all this planner sees; whether those layers land is the zone's
+    // answer (cases 29-33), which the transaction passes back as fit_capacity.
+    {
+        const size_t       mb = 1024 * 1024;
+        kv_residency_input in;
+        in.load_kv_device.assign(32, 0);
+        in.swa_layer_mask.assign(32, 0);
+        in.layer_kv_bytes.assign(32, 128 * mb);
+        in.devices   = { 0 };
+        in.available = { 84 * mb + 4 * mb / 10 };
+
+        auto without = plan_runtime_kv_residency(in);
+        CHECK_EQ(without.per_device[0].demoted_layers.size(), 32, "case 27: every layer demoted without the copies");
+
+        in.yieldable = { 2869 * mb + 8 * mb / 10 };
+        auto r       = plan_runtime_kv_residency(in);
+        CHECK(r.fits, "case 27: fits");
+        CHECK_EQ(r.yield_bytes[0], in.yieldable[0], "case 27: every copy yields");
+        CHECK_EQ(r.per_device[0].demoted_layers.size(), 9, "case 27: only the rest demotes");
+    }
+    // 28. Nothing yields while the KV fits, and a device without a shortfall
+    // keeps its copies while another device yields.
+    {
+        const size_t       mb = 1024 * 1024;
+        kv_residency_input in;
+        in.load_kv_device = { 0, 0, 1, 1 };
+        in.swa_layer_mask.assign(4, 0);
+        in.layer_kv_bytes.assign(4, 8 * mb);
+        in.devices   = { 0, 1 };
+        in.available = { 100 * mb, 10 * mb };
+        in.yieldable = { 500 * mb, 500 * mb };
+        auto r       = plan_runtime_kv_residency(in);
+        CHECK(r.fits, "case 28: fits");
+        CHECK_EQ(r.yield_bytes[0], 0, "case 28: device 0 fits, nothing yields");
+        CHECK_EQ(r.yield_bytes[1], 16 * mb + 2 * kv_alloc_slack_per_layer - 10 * mb,
+                 "case 28: device 1 yields its shortfall");
+        CHECK(r.kv_device == in.load_kv_device, "case 28: no layer demotes");
+    }
+    // 29. What lands is decided by the allocator, not by bytes. The zone below
+    // is S1-PRELOAD's order -- each dense weight's primary (40 MB), then its
+    // WOQ copy (48 MB) -- sealed by one more primary, with 8 MB free on top.
+    // Freeing every copy frees 192 MB, but into four 48 MB holes between live
+    // primaries: not one 128 MB layer lands, so no copy is worth releasing.
+    // 8 MB layers do land in them, and only as many copies go as the layers
+    // need, from the top down.
+    {
+        using ggml_sycl::kv_zone_block;
+        using ggml_sycl::kv_zone_model;
+        using ggml_sycl::select_optional_layout_yield;
+        const size_t               mb = 1024 * 1024;
+        kv_zone_model              zone{ tlsf_allocator(400 * mb) };
+        std::vector<kv_zone_block> copies;
+        for (int k = 0; k < 4; ++k) {
+            (void) zone[0].allocate(40 * mb);
+            copies.push_back({ 0, zone[0].allocate(48 * mb) });
+        }
+        (void) zone[0].allocate(40 * mb);
+        CHECK_EQ(zone[0].largest_free_block(), 8 * mb, "case 29: 8 MB free on top");
+
+        const std::vector<size_t> big(2, 128 * mb);
+        CHECK_EQ(ggml_sycl::kv_layers_allocatable(zone, big), 0, "case 29: no 128 MB layer lands");
+        CHECK(select_optional_layout_yield(zone, copies, big).empty(),
+              "case 29: holes between primaries give a 128 MB layer nothing, so every copy stays");
+
+        const std::vector<size_t> small(13, 8 * mb);
+        CHECK_EQ(ggml_sycl::kv_layers_allocatable(zone, small), 1, "case 29: one 8 MB layer lands before a yield");
+        CHECK(select_optional_layout_yield(zone, copies, small) == std::vector<size_t>({ 3, 2 }),
+              "case 29: two holes of six layers each, the top two copies");
+        CHECK(select_optional_layout_yield(zone, copies, {}).empty(), "case 29: no layers asked, nothing yields");
+
+        // A copy the allocator does not model (allocator == SIZE_MAX) is never picked.
+        const std::vector<kv_zone_block> unmodelled = { kv_zone_block{} };
+        CHECK(select_optional_layout_yield(zone, unmodelled, small).empty(), "case 29: an unmodelled copy stays");
+    }
+    // 30. The same copies staged together, after every primary: they free into
+    // one extent with each other and the free space on top, so a 128 MB layer
+    // lands once the top three go -- and only those three, even with a second
+    // layer asked for that the fourth still would not make room for.
+    {
+        using ggml_sycl::kv_zone_block;
+        using ggml_sycl::kv_zone_model;
+        using ggml_sycl::select_optional_layout_yield;
+        const size_t               mb = 1024 * 1024;
+        kv_zone_model              zone{ tlsf_allocator(360 * mb) };
+        std::vector<kv_zone_block> copies;
+        for (int k = 0; k < 4; ++k) {
+            (void) zone[0].allocate(40 * mb);
+        }
+        for (int k = 0; k < 4; ++k) {
+            copies.push_back({ 0, zone[0].allocate(48 * mb) });
+        }
+        CHECK_EQ(zone[0].largest_free_block(), 8 * mb, "case 30: 8 MB free on top");
+        const std::vector<size_t> big(2, 128 * mb);
+        const std::vector<size_t> picks = select_optional_layout_yield(zone, copies, big);
+        CHECK(picks == std::vector<size_t>({ 3, 2, 1 }), "case 30: the top three copies, walked down from the top");
+        kv_zone_model freed = zone;
+        for (size_t i : picks) {
+            freed[0].free(copies[i].offset);
+        }
+        CHECK_EQ(ggml_sycl::kv_layers_allocatable(freed, big), 1, "case 30: and one 128 MB layer lands");
+    }
+    // 31. A copy the gain does not need is dropped again: the 4 MB copy on top
+    // joins the free space first, but only the isolated 48 MB hole below holds
+    // a 40 MB layer.
+    {
+        using ggml_sycl::kv_zone_block;
+        using ggml_sycl::kv_zone_model;
+        using ggml_sycl::select_optional_layout_yield;
+        const size_t               mb = 1024 * 1024;
+        kv_zone_model              zone{ tlsf_allocator(140 * mb) };
+        std::vector<kv_zone_block> copies;
+        (void) zone[0].allocate(40 * mb);
+        copies.push_back({ 0, zone[0].allocate(48 * mb) });
+        (void) zone[0].allocate(40 * mb);
+        copies.push_back({ 0, zone[0].allocate(4 * mb) });
+        CHECK_EQ(zone[0].largest_free_block(), 8 * mb, "case 31: 8 MB free on top");
+        CHECK(select_optional_layout_yield(zone, copies, { 40 * mb }) == std::vector<size_t>({ 0 }),
+              "case 31: only the hole that holds the layer");
+    }
+    // 32. Layers land in allocation order, each in the first allocator with
+    // room (zone_alloc(KV)'s order), and counting stops at the first that
+    // does not land even if a later, smaller one would.
+    {
+        using ggml_sycl::kv_zone_model;
+        const size_t  mb = 1024 * 1024;
+        kv_zone_model zone{ tlsf_allocator(16 * mb), tlsf_allocator(64 * mb) };
+        CHECK_EQ(ggml_sycl::kv_layers_allocatable(zone, { 16 * mb, 32 * mb, 32 * mb }), 3,
+                 "case 32: the first allocator, then the second");
+        CHECK_EQ(ggml_sycl::kv_layers_allocatable(zone, { 64 * mb, 128 * mb, 8 * mb }), 1,
+                 "case 32: stops at the first layer that does not land");
+        CHECK_EQ(zone[1].largest_free_block(), 64 * mb, "case 32: the model passed in is not changed");
+    }
+    // 33. fit_capacity holds a device's KV to what its zone can place,
+    // whatever its headroom: 2954 MB free, but only ten 128 MB layers land.
+    {
+        const size_t       mb = 1024 * 1024;
+        kv_residency_input in;
+        in.load_kv_device.assign(32, 0);
+        in.swa_layer_mask.assign(32, 0);
+        in.layer_kv_bytes.assign(32, 128 * mb);
+        in.devices   = { 0 };
+        in.available = { 2954 * mb };
+        CHECK_EQ(plan_runtime_kv_residency(in).per_device[0].demoted_layers.size(), 9,
+                 "case 33: by bytes, 23 layers stay");
+        in.fit_capacity = { 10 * 128 * mb };
+        auto r          = plan_runtime_kv_residency(in);
+        CHECK(r.fits, "case 33: fits");
+        CHECK_EQ(r.per_device[0].demoted_layers.size(), 22, "case 33: held to the ten that land");
+        for (int l = 0; l < 10; ++l) {
+            CHECK_EQ(r.kv_device[l], 0, "case 33: the leading layers are the ones kept");
+        }
+        in.fit_capacity = { SIZE_MAX };
+        CHECK_EQ(plan_runtime_kv_residency(in).per_device[0].demoted_layers.size(), 9, "case 33: SIZE_MAX is no cap");
+    }
+    // 34. kv_layer_alloc_bytes is the tiered allocator's 512-byte layer size.
+    {
+        CHECK_EQ(ggml_sycl::kv_layer_alloc_bytes(1), 512, "case 34: rounds up");
+        CHECK_EQ(ggml_sycl::kv_layer_alloc_bytes(512), 512, "case 34: exact stays");
+        CHECK_EQ(ggml_sycl::kv_layer_alloc_bytes(513), 1024, "case 34: next block");
+    }
     std::printf("test-kv-runtime-demotion: all ok\n");
     return 0;
 }

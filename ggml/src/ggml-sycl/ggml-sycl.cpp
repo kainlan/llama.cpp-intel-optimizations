@@ -17790,6 +17790,22 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
 // enum value without ever string-comparing `out->reason`.
 enum class ggml_sycl_txn_result { ACCEPTED, REFUSED, BUSY };
 
+// Bumped whenever KV admission retires optional layout copies
+// (unified_cache::yield_optional_layouts()). A recorded exec graph bakes the raw
+// pointers it resolved; for a WOQ copy it also holds the copy's lease for the
+// graph's life (the WOQ gemm's retain_handles_until_event() lands in the
+// graph's sink while recording), so a copy a live graph reads is never
+// yielded. This epoch is defence in depth behind that lease: each context
+// compares its optional_layout_epoch at the top of graph compute and drops
+// what it recorded before any replay; the next eligible call records afresh
+// against what is resident. Retiring copies is rare (a context whose KV needs
+// the room), so the one re-record costs nothing measurable.
+static std::atomic<uint64_t> g_ggml_sycl_optional_layout_epoch{ 0 };
+
+static void ggml_sycl_optional_layouts_retired() {
+    g_ggml_sycl_optional_layout_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
 // llama.cpp-3aos: kv_unified -- see placement_kv_info::kv_unified
 // / kv_layer_bytes_for_kind() (unified-cache.hpp) for the rationale.
 // Threaded the same way n_seq_max already is: onto next_kv_info and
@@ -17865,7 +17881,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         return busy("busy (could not acquire a live-update lease)");
     }
 
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::unique_lock<std::mutex> lock(g_tensor_inventory_mutex);
     if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
         return busy("busy (plan changed while acquiring the transaction lock)");
     }
@@ -18029,10 +18045,126 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         for (int device : in.devices) {
             // No admitted plan: KV still allocated counts as used (see above).
             in.available.push_back(ggml_sycl_kv_capacity_live(next_plan, device, nullptr, ctx->device));
+            in.yieldable.push_back(ggml_sycl::unified_cache_optional_layout_bytes(device, next_plan.multi_device));
         }
         ring_readmit = ring_kv_zone_bytes > 0;
 
-        const ggml_sycl::kv_residency_result residency = ggml_sycl::plan_runtime_kv_residency(in);
+        ggml_sycl::kv_residency_result residency = ggml_sycl::plan_runtime_kv_residency(in);
+        // Optional layout copies (S1-PRELOAD's dense oneDNN WOQ second copies)
+        // never outrank KV: the fit counted them as headroom, so release what
+        // it needs now, before the KV is allocated. A probe only counts.
+        //
+        // Headroom in bytes is not what the KV gets, though: each layer is one
+        // allocation, and a copy staged between two live weights frees into a
+        // hole a layer fits only if it is no larger. So the cache releases only
+        // copies whose room lets another of this device's layers land, and
+        // reports how many of them its zone can place; the fit is then redone
+        // against the live headroom with nothing left to count, held to what
+        // lands. Without that hold a layer the zone cannot place is not
+        // refused -- it goes to raw device memory outside the arena
+        // (llama.cpp-moua). Layers are modelled in allocation order, which is
+        // the order the fit keeps them in for a model without SWA layers; with
+        // them the hold is approximate. The PP MoE oneDNN ring's KV-zone slots,
+        // which the fit counts as free, are still held while the zone is
+        // modelled (the ring is released and re-admitted after KV, below), so
+        // on a device holding both the hold places fewer layers than the ring's
+        // room would take: more demotion, never a layer outside the arena.
+        //
+        // A released copy leaves two stale records, both handled: an exec
+        // graph another context recorded may bake its pointer, so every
+        // context drops its recorded graphs before its next replay
+        // (ggml_sycl_optional_layouts_retired()); and a tensor's extra->layout
+        // may still name the copy's pointer, which no reader trusts for
+        // ONEDNN_WOQ (the ggml_sycl_get_weight_layout_ptr() fast path and
+        // ggml_sycl_can_use_layout_for_kernel() ask the cache).
+        //
+        // The yield waits for the retired copies' readers and drops the handles
+        // it withdrew, neither of which may happen under this inventory lock
+        // (canonical memory contract §12.5). So it is begun under the lock --
+        // copies picked and retired, their free gated -- and finished with the
+        // lock released. Taken again, the lock finds either the plan this
+        // admission began from or a newer one; a newer one makes it busy, and
+        // the retired copies' room is there for the retry.
+        if (residency.fits && !probe_mode) {
+            bool refit       = false;
+            bool retired_any = false;
+            in.fit_capacity.assign(in.devices.size(), SIZE_MAX);
+            std::vector<std::vector<size_t>>                device_layer_bytes(in.devices.size());
+            std::vector<ggml_sycl::optional_layout_release> releases(in.devices.size());
+            for (size_t i = 0; i < in.devices.size(); ++i) {
+                if (residency.yield_bytes[i] == 0) {
+                    continue;
+                }
+                refit = true;
+                for (size_t l = 0; l < n_kv_layers; ++l) {
+                    if (in.load_kv_device[l] == in.devices[i] && in.layer_kv_bytes[l] > 0) {
+                        device_layer_bytes[i].push_back(ggml_sycl::kv_layer_alloc_bytes(in.layer_kv_bytes[l]));
+                    }
+                }
+                releases[i] = ggml_sycl::unified_cache_yield_optional_layouts_begin(
+                    in.devices[i], next_plan.multi_device, device_layer_bytes[i]);
+                retired_any = retired_any || releases[i].result.retired > 0;
+            }
+            if (retired_any) {
+                ggml_sycl_optional_layouts_retired();
+                lock.unlock();
+            }
+            std::vector<ggml_sycl::optional_layout_yield_result> yields(in.devices.size());
+            for (size_t i = 0; i < in.devices.size(); ++i) {
+                if (residency.yield_bytes[i] != 0) {
+                    yields[i] =
+                        ggml_sycl::unified_cache_yield_optional_layouts_finish(releases[i], device_layer_bytes[i]);
+                }
+            }
+            if (retired_any) {
+                lock.lock();
+                if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
+                    return busy("busy (plan changed while optional layout copies were released)");
+                }
+            }
+            for (size_t i = 0; i < in.devices.size(); ++i) {
+                if (residency.yield_bytes[i] == 0) {
+                    continue;
+                }
+                const std::vector<size_t> &                   layer_bytes = device_layer_bytes[i];
+                const ggml_sycl::optional_layout_yield_result released    = yields[i];
+                size_t                                        placeable   = 0;
+                for (size_t l = 0, n = 0; l < n_kv_layers && n < released.kv_layers; ++l) {
+                    if (in.load_kv_device[l] == in.devices[i] && in.layer_kv_bytes[l] > 0) {
+                        placeable += in.layer_kv_bytes[l];
+                        ++n;
+                    }
+                }
+                in.fit_capacity[i] = placeable;
+                if (released.kv_layers < layer_bytes.size()) {
+                    GGML_LOG_WARN(
+                        "[SYCL-PLAN] KV admission on device %d for n_ctx=%u: its zone can place %zu of %zu KV layers "
+                        "(%.1f MB a layer) in its free blocks; the rest demote rather than leave the arena\n",
+                        in.devices[i], n_ctx, released.kv_layers, layer_bytes.size(),
+                        layer_bytes.empty() ? 0.0 : layer_bytes.back() / mb);
+                }
+                if (released.freed > 0) {
+                    GGML_LOG_WARN(
+                        "[SYCL-PLAN] KV admission released %zu optional oneDNN WOQ layout copies (%.1f MB) on device "
+                        "%d for n_ctx=%u's KV; those tensors' prompt processing uses the resident primary layout\n",
+                        released.freed, released.freed_bytes / mb, in.devices[i], n_ctx);
+                }
+                if (released.freed < released.retired) {
+                    GGML_LOG_WARN(
+                        "[SYCL-PLAN] KV admission retired %zu more optional oneDNN WOQ layout copies (%.1f MB) on "
+                        "device %d for n_ctx=%u, but their free has not completed: they no longer serve any op, and "
+                        "their bytes return to the zone with a later deferred-free pass, not to this context's KV\n",
+                        released.retired - released.freed, released.pending_bytes / mb, in.devices[i], n_ctx);
+                }
+            }
+            if (refit) {
+                for (size_t i = 0; i < in.devices.size(); ++i) {
+                    in.available[i] = ggml_sycl_kv_capacity_live(next_plan, in.devices[i], nullptr, ctx->device);
+                }
+                in.yieldable.clear();
+                residency = ggml_sycl::plan_runtime_kv_residency(in);
+            }
+        }
         if (!residency.fits) {
             GGML_SYCL_RUNTIME_TXN_REFUSAL(
                 probe_mode,
@@ -27520,9 +27652,27 @@ static bool ggml_sycl_onednn_pp_skip_type(ggml_type type) {
 // 7732.2 MB staged on Mistral-7B Q4_0). One implementation now backs both the
 // plan's charge and the staging decision, so they cannot drift apart the way
 // two independent copies of this boolean eventually would.
+//
+// GGML_SYCL_DENSE_WOQ_ALTERNATES=0 turns the copies off at both sites at once,
+// so their PP benefit can be measured against the VRAM they duplicate: those
+// weights' prompt processing then takes the dequant-fp16 oneDNN path over the
+// primary, as a copy that did not fit already does.
+static bool ggml_sycl_dense_woq_alternates_enabled() {
+    static const bool enabled = []() {
+        const bool on = get_sycl_env("GGML_SYCL_DENSE_WOQ_ALTERNATES", 1) != 0;
+        if (!on) {
+            GGML_LOG_WARN(
+                "[SYCL] GGML_SYCL_DENSE_WOQ_ALTERNATES=0: no dense oneDNN WOQ second copies are planned or "
+                "staged\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
 static bool ggml_sycl_dense_woq_alternate_eligible_impl(ggml_type type, bool is_contiguous, bool placement_safe) {
-    return is_contiguous && ggml_sycl_onednn_pp_enabled() && !ggml_sycl_onednn_pp_skip_type(type) && placement_safe &&
-           ggml_sycl_onednn_woq_supported_type(type);
+    return ggml_sycl_dense_woq_alternates_enabled() && is_contiguous && ggml_sycl_onednn_pp_enabled() &&
+           !ggml_sycl_onednn_pp_skip_type(type) && placement_safe && ggml_sycl_onednn_woq_supported_type(type);
 }
 
 bool ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous) {
@@ -34784,6 +34934,9 @@ static void ggml_sycl_preload_model_weights() {
                                     device, cache_key, src_ptr, src_size, woq_size, GGML_LAYOUT_ONEDNN_WOQ,
                                     ggml_sycl_fill_onednn_woq, &woq_ctx, s1_preload_q, &woq_handle);
                                 if (woq_result.ok && woq_result.ptr) {
+                                    // A second copy of a weight whose primary is resident:
+                                    // it yields to runtime KV (unified_cache_entry::optional_layout).
+                                    (void) cache->mark_optional_layout(cache_key, GGML_LAYOUT_ONEDNN_WOQ);
                                     if (!woq_planned) {
                                         dense_woq_staged_unplanned++;
                                     }
@@ -35657,10 +35810,15 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     // (line ~33306's own guard), which is mutually exclusive with this
     // rule's src_is_device requirement, so the ordering does not change
     // which case reaches the host-placement branch versus this one.
+    //
+    // extra->layout is the last layout resolved for the tensor, not a lease: a
+    // ONEDNN_WOQ copy there may since have yielded to runtime KV
+    // (unified_cache::yield_optional_layouts) and its bytes be KV now, so WOQ
+    // residency is always asked of the cache below.
     if (src_is_device && !request_prefer_host) {
         if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
-            if (extra->layout.data_ptr != nullptr && extra->layout.mode == resolved &&
-                extra->layout.device_id == device && extra->layout.size >= dst_size) {
+            if (resolved != GGML_LAYOUT_ONEDNN_WOQ && extra->layout.data_ptr != nullptr &&
+                extra->layout.mode == resolved && extra->layout.device_id == device && extra->layout.size >= dst_size) {
                 ggml_sycl_update_layout_from_cache(extra, tensor, device, resolved, extra->layout.data_ptr,
                                                    extra->layout.size, xmx_info, onednn_pack_m);
                 return extra->layout.data_ptr;
@@ -35799,6 +35957,36 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     GGML_SYCL_DEBUG("[LOOKUP] weight %s layout=%d MISS — host-pinned fallback\n",
                     tensor->name ? tensor->name : "(null)", (int) resolved);
     return nullptr;
+}
+
+// The cache's copy of `tensor` in exactly `layout`, as a leased handle rather
+// than a pointer: the reader keeps it until its queued work completes
+// (retain_handles_until_event), so a copy that can be released at runtime (an
+// optional ONEDNN_WOQ copy, unified_cache::yield_optional_layouts()) is never
+// freed under the read. Records the layout on extra->layout as
+// ggml_sycl_get_weight_layout_ptr() does. Empty on a miss.
+static ggml_sycl::mem_handle ggml_sycl_acquire_weight_layout(const ggml_tensor * tensor,
+                                                             int                 device,
+                                                             layout_mode         layout) {
+    if (!tensor || !tensor->buffer) {
+        return {};
+    }
+    sycl::queue &              q     = ggml_sycl_get_device(device).default_queue();
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(q);
+    const ggml_sycl_cache_id   key   = ggml_backend_sycl_get_weight_cache_key(tensor, device);
+    if (!cache || !key.valid) {
+        return {};
+    }
+    ggml_sycl::mem_handle         handle = cache->acquire_layout_handle(key, layout, device);
+    const ggml_sycl::resolved_ptr view   = handle.resolve(device);
+    if (!view) {
+        return {};
+    }
+    if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
+        ggml_sycl_update_layout_from_cache(extra, tensor, device, layout, view.ptr, view.extent,
+                                           ggml_sycl::cache_layout_xmx_info{}, 0);
+    }
+    return handle;
 }
 
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
@@ -38880,7 +39068,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     const size_t   kv_per_layer = kv_slice.bytes();
     const uint32_t n_kv_layers  = kv_slice.kv_layers();
 
-    const size_t aligned_per_layer = (kv_per_layer + 511) & ~size_t(511);
+    const size_t aligned_per_layer = ggml_sycl::kv_layer_alloc_bytes(kv_per_layer);
     GGML_LOG_INFO("[KV-ALLOC] kv_per_layer=%.1f MB (full=%.1f MB, swa=%.1f MB), n_kv_layers=%u/%u\n",
                   kv_per_layer / (1024.0 * 1024.0), planner_full_kv / (1024.0 * 1024.0),
                   planner_swa_kv / (1024.0 * 1024.0), n_kv_layers, n_layers);
@@ -45313,7 +45501,10 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                                  static_cast<long long>(info.group_size));
                 }
                 if (info.total_bytes > 0) {
-                    void * woq_ptr = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_ONEDNN_WOQ);
+                    // The copy can yield to runtime KV, so its lease outlives the gemm.
+                    ggml_sycl::mem_handle woq_owner =
+                        ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_ONEDNN_WOQ);
+                    void * woq_ptr = woq_owner.resolve(ctx.device).ptr;
                     if (woq_trace) {
                         std::fprintf(stderr, "[ONEDNN][WOQ][TRACE] tensor=%s lookup_ptr=%p\n", src0->name, woq_ptr);
                     }
@@ -45333,6 +45524,12 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                                                                                    DnnlGemmWrapper::to_dt<sycl::half>(), weights_dev,
                                                                                    info.group_size, scales_dev, zp_dev, dst_dd_i,
                                                                                    DnnlGemmWrapper::to_dt<float>(), stream, ldc, 1);
+                            // Held until the gemm's reads complete, whether or not it
+                            // reports success. Recording lands the lease in the graph's
+                            // sink for the graph's life; the event is unused there.
+                            sycl::event read_done =
+                                g_ggml_sycl_graph_recording ? sycl::event{} : stream->ext_oneapi_submit_barrier();
+                            ggml_sycl::retain_handles_until_event({ std::move(woq_owner) }, std::move(read_done));
                             if (woq_trace) {
                                 std::fprintf(stderr, "[ONEDNN][WOQ][TRACE] tensor=%s cached_call_used=%d\n", src0->name,
                                              used_woq ? 1 : 0);
@@ -61873,6 +62070,16 @@ static bool ggml_sycl_layout_override_active(layout_mode & override_layout) {
     return false;
 }
 
+// Whether the unified cache holds `tensor` in `layout` on `device` right now.
+// For a layout that can be released at runtime (an optional ONEDNN_WOQ copy,
+// unified_cache::yield_optional_layouts) this, not extra->layout, is the fact.
+static bool ggml_sycl_weight_layout_cached(const ggml_tensor * tensor, int device, layout_mode layout) {
+    sycl::queue &              q     = ggml_sycl_get_device(device).default_queue();
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(q);
+    const ggml_sycl_cache_id   key   = ggml_backend_sycl_get_weight_cache_key(tensor, device);
+    return cache && key.valid && cache->is_cached(key, layout);
+}
+
 static bool ggml_sycl_can_use_layout_for_kernel(const ggml_tensor * tensor, layout_mode layout, int device) {
     if (!tensor) {
         return false;
@@ -61894,7 +62101,8 @@ static bool ggml_sycl_can_use_layout_for_kernel(const ggml_tensor * tensor, layo
     }
     const ggml_tensor_layout * info = ggml_sycl_get_layout_info(tensor);
     if (info && info->data_ptr != nullptr && (info->device_id < 0 || info->device_id == device) &&
-        info->mode == layout) {
+        info->mode == layout &&
+        (layout != GGML_LAYOUT_ONEDNN_WOQ || ggml_sycl_weight_layout_cached(tensor, device, layout))) {
         return true;
     }
     if (ggml_backend_sycl_weights_evictable() && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer)) {
@@ -105700,6 +105908,20 @@ normal_dispatch:
     }
 
 #ifdef GGML_SYCL_GRAPH
+    // Optional layout copies were retired since this context last looked: drop
+    // any graph it recorded, which may bake a retired copy's pointer (see
+    // g_ggml_sycl_optional_layout_epoch). Only when something was recorded --
+    // sycl_exec_graph_clear_active() is not side-effect free.
+    {
+        const uint64_t epoch = g_ggml_sycl_optional_layout_epoch.load(std::memory_order_acquire);
+        if (sycl_ctx->optional_layout_epoch != epoch) {
+            if (sycl_ctx->exec_graph || sycl_ctx->moe_segments_valid || !sycl_ctx->moe_block_graphs.empty()) {
+                sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");
+            }
+            sycl_ctx->optional_layout_epoch = epoch;
+        }
+    }
+
     // GPU subgraph replay for mixed CPU/GPU mode.
     // Instead of disabling graphs entirely when CPU layers exist, find the
     // contiguous GPU-only prefix and record/replay just that portion.
@@ -109887,11 +110109,11 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_ubatch_cache_path") == 0) {
         return (void *) ggml_backend_sycl_ubatch_cache_path;
     }
-    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_lookup") == 0) {
-        return (void *) ggml_backend_sycl_ubatch_cache_lookup;
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_lookup_layout1") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_lookup_layout1;
     }
-    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_store") == 0) {
-        return (void *) ggml_backend_sycl_ubatch_cache_store;
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_store_layout1") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_store_layout1;
     }
     if (strcmp(name, "ggml_backend_sycl_execution_context_create") == 0) {
         return (void *) ggml_backend_sycl_execution_context_create;

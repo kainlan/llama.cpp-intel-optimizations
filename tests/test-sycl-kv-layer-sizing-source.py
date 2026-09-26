@@ -1539,3 +1539,580 @@ def test_mutation_probe_skips_transaction_is_witnessed() -> None:
                           1)
     _assert_witnessed(cpp, mutated, _headroom_checker(cache), "the probe does not run the transaction body",
                       "the probe runs the publishing path")
+
+
+# ---------------------------------------------------------------------------
+# Optional layout copies yield to runtime KV.
+#
+# S1-PRELOAD stages dense oneDNN WOQ second copies into the room the load-time
+# KV sizing (n_ctx=512) leaves. A larger runtime context needs that room back:
+# the transaction counts the copies as KV headroom and, only when it is really
+# admitting (not probing) a context that fits with them, releases what the KV
+# needs before any layer is demoted, then redoes the fit against live headroom.
+# A released copy must not stay reachable through extra->layout or be
+# advertised as a route, a leased copy must never be picked, and a release must
+# not latch has_evictions_ (which disables graph replay and persistent TG).
+# ---------------------------------------------------------------------------
+
+PRELOAD_SIGNATURE = "static void ggml_sycl_preload_model_weights() {"
+WEIGHT_LAYOUT_PTR_SIGNATURE = ("void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, "
+                               "layout_mode target, bool prefer_host) {")
+CAN_USE_LAYOUT_SIGNATURE = ("static bool ggml_sycl_can_use_layout_for_kernel(const ggml_tensor * tensor, "
+                            "layout_mode layout, int device) {")
+FINALIZE_RETIRED_SIGNATURE = "size_t unified_cache::finalize_retired_entries_locked() {"
+YIELDABLE_SIGNATURE = "bool unified_cache::optional_layout_yieldable_locked("
+
+
+def optional_layout_yield_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
+    found: list[str] = []
+    txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
+    if "in.yieldable.push_back(ggml_sycl::unified_cache_optional_layout_bytes(device, next_plan.multi_device));" \
+            not in txn:
+        found.append("the fit does not count optional layouts as KV headroom")
+    yields = [m.start() for m in re.finditer(r"unified_cache_yield_optional_layouts_begin\(", txn)]
+    first_fit = txn.find("plan_runtime_kv_residency(in)")
+    demote = txn.find("if (!residency.fits)")
+    if len(yields) != 1 or first_fit < 0 or demote < 0:
+        found.append("the transaction does not release optional layouts exactly once")
+        return found
+    guard = txn.rfind("if (residency.fits && !probe_mode) {", first_fit, yields[0])
+    if guard < 0:
+        found.append("optional layouts are released outside a fitting, non-probe admission")
+    if yields[0] > demote:
+        found.append("optional layouts are released after KV demotion is decided")
+    refit = re.search(r"in\.available\[i\]\s*=\s*ggml_sycl_kv_capacity_live\(\s*next_plan\s*,\s*in\.devices\[i\]\s*,"
+                      r"\s*nullptr\s*,\s*ctx->device\s*\);.*?"
+                      r"in\.yieldable\.clear\(\);\s*residency\s*=\s*ggml_sycl::plan_runtime_kv_residency\(in\);",
+                      txn[yields[0]:demote], re.S)
+    if refit is None:
+        found.append("the fit is not redone against the live headroom after a yield")
+
+    preload = strip_comments(function(sycl_cpp, PRELOAD_SIGNATURE))
+    if "cache->mark_optional_layout(cache_key, GGML_LAYOUT_ONEDNN_WOQ);" not in preload:
+        found.append("S1-PRELOAD does not mark its WOQ copies optional")
+
+    ptr = strip_comments(function(sycl_cpp, WEIGHT_LAYOUT_PTR_SIGNATURE))
+    if not re.search(r"resolved\s*!=\s*GGML_LAYOUT_ONEDNN_WOQ\s*&&\s*extra->layout\.data_ptr\s*!=\s*nullptr", ptr):
+        found.append("the fast path trusts extra->layout for a yieldable WOQ copy")
+
+    can_use = strip_comments(function(sycl_cpp, CAN_USE_LAYOUT_SIGNATURE))
+    if not re.search(r"\(\s*layout\s*!=\s*GGML_LAYOUT_ONEDNN_WOQ\s*\|\|\s*"
+                     r"ggml_sycl_weight_layout_cached\(\s*tensor\s*,\s*device\s*,\s*layout\s*\)\s*\)", can_use):
+        found.append("a WOQ route is advertised without asking the cache")
+
+    finalize = strip_comments(function(cache_cpp, FINALIZE_RETIRED_SIGNATURE))
+    latch = re.search(r"if\s*\(([^{]*)\)\s*{\s*has_evictions_\.store\(true", finalize)
+    if latch is None or "!entry.optional_layout" not in latch.group(1):
+        found.append("an optional layout release latches has_evictions_")
+
+    yieldable = strip_comments(function(cache_cpp, YIELDABLE_SIGNATURE))
+    if not re.search(r"own_leases\s*=\s*mirrored\s*\?\s*1u\s*:\s*0u", yieldable):
+        found.append("an optional copy someone else leases can be picked to yield")
+    return found
+
+
+def test_optional_layout_yield_wiring() -> None:
+    assert optional_layout_yield_violations(GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()) == []
+
+
+def _yield_checker_sycl(cache_cpp: str):
+    return lambda sycl_cpp: optional_layout_yield_violations(sycl_cpp, cache_cpp)
+
+
+def _yield_checker_cache(sycl_cpp: str):
+    return lambda cache_cpp: optional_layout_yield_violations(sycl_cpp, cache_cpp)
+
+
+def _sycl_mutation(old: str, new: str, expected: str, label: str) -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    _assert_witnessed(cpp, cpp.replace(old, new, 1), _yield_checker_sycl(cache), expected, label)
+
+
+def _cache_mutation(old: str, new: str, expected: str, label: str) -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    _assert_witnessed(cache, cache.replace(old, new, 1), _yield_checker_cache(cpp), expected, label)
+
+
+def test_mutation_yieldable_not_counted_is_witnessed() -> None:
+    _sycl_mutation("in.yieldable.push_back(ggml_sycl::unified_cache_optional_layout_bytes(device, next_plan.multi_device));",
+                   "", "does not count optional layouts", "yieldable dropped")
+
+
+def test_mutation_probe_yields_is_witnessed() -> None:
+    _sycl_mutation("if (residency.fits && !probe_mode) {", "if (residency.fits) {", "outside a fitting, non-probe",
+                   "a probe releases copies")
+
+
+def test_mutation_yield_without_fit_is_witnessed() -> None:
+    _sycl_mutation("if (residency.fits && !probe_mode) {", "if (!probe_mode) {", "outside a fitting, non-probe",
+                   "a non-fitting admission releases copies")
+
+
+def test_mutation_no_refit_after_yield_is_witnessed() -> None:
+    _sycl_mutation("                in.yieldable.clear();\n                residency = ggml_sycl::plan_runtime_kv_residency(in);\n",
+                   "", "not redone against the live headroom", "refit dropped")
+
+
+def test_mutation_refit_ignores_ring_is_witnessed() -> None:
+    _sycl_mutation("in.available[i] = ggml_sycl_kv_capacity_live(next_plan, in.devices[i], nullptr, ctx->device);",
+                   "in.available[i] = ggml_sycl::unified_cache_kv_vram_available(in.devices[i], next_plan.multi_device);",
+                   "not redone against the live headroom", "refit reads a headroom that counts the ring as used")
+
+
+def test_mutation_preload_does_not_mark_is_witnessed() -> None:
+    _sycl_mutation("(void) cache->mark_optional_layout(cache_key, GGML_LAYOUT_ONEDNN_WOQ);", "",
+                   "does not mark its WOQ copies", "mark dropped")
+
+
+def test_mutation_fast_path_trusts_woq_is_witnessed() -> None:
+    _sycl_mutation("if (resolved != GGML_LAYOUT_ONEDNN_WOQ && extra->layout.data_ptr != nullptr &&",
+                   "if (extra->layout.data_ptr != nullptr &&", "trusts extra->layout", "fast path reverted")
+
+
+def test_mutation_woq_advertised_blind_is_witnessed() -> None:
+    _sycl_mutation("(layout != GGML_LAYOUT_ONEDNN_WOQ || ggml_sycl_weight_layout_cached(tensor, device, layout))",
+                   "true", "advertised without asking the cache", "route check dropped")
+
+
+def test_mutation_optional_release_latches_is_witnessed() -> None:
+    _cache_mutation("!entry.host_resident && !entry.optional_layout) {", "!entry.host_resident) {",
+                    "latches has_evictions_", "latch exemption dropped")
+
+
+def test_mutation_leased_copy_yieldable_is_witnessed() -> None:
+    _cache_mutation("own_leases   = mirrored ? 1u : 0u;", "own_leases   = UINT32_MAX;",
+                    "someone else leases", "lease check dropped")
+
+
+# GGML_SYCL_DENSE_WOQ_ALTERNATES=0 measures the copies' PP value. It must sit in
+# the one predicate both the planner and S1-PRELOAD read, or the disabled arm
+# would plan no copies and still stage them (or the reverse) and measure neither.
+WOQ_ELIGIBLE_IMPL_SIGNATURE = "static bool ggml_sycl_dense_woq_alternate_eligible_impl("
+
+
+def dense_woq_knob_violations(sycl_cpp: str) -> list[str]:
+    impl = strip_comments(function(sycl_cpp, WOQ_ELIGIBLE_IMPL_SIGNATURE))
+    if not re.search(r"return\s+ggml_sycl_dense_woq_alternates_enabled\(\)\s*&&", impl):
+        return ["the dense WOQ copies knob is not in the shared eligibility predicate"]
+    return []
+
+
+def test_dense_woq_knob_in_shared_predicate() -> None:
+    assert dense_woq_knob_violations(GGML_SYCL_CPP.read_text()) == []
+
+
+def test_mutation_dense_woq_knob_dropped_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("return ggml_sycl_dense_woq_alternates_enabled() && is_contiguous &&", "return is_contiguous &&", 1)
+    _assert_witnessed(cpp, mutated, dense_woq_knob_violations, "not in the shared eligibility predicate", "knob dropped")
+
+
+# A yield must hand the bytes back before the re-fit reads them, must not free
+# a copy under a reader that took no lease, and must not leave a recorded graph
+# baking a retired copy's pointer.
+GRAPH_COMPUTE_SIGNATURE = "static ggml_status ggml_backend_sycl_graph_compute_unchecked("
+YIELD_SIGNATURE = "optional_layout_release unified_cache::yield_optional_layouts_begin(const std::vector<size_t> & layer_bytes) {"
+YIELD_FINISH_SIGNATURE = "optional_layout_yield_result unified_cache::yield_optional_layouts_finish("
+
+
+def optional_layout_release_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
+    found: list[str] = []
+    txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
+    at = txn.find("unified_cache_yield_optional_layouts_begin(")
+    bump = txn.find("ggml_sycl_optional_layouts_retired();", max(at, 0))
+    if at < 0 or bump < 0 or bump > txn.find("if (!residency.fits)"):
+        found.append("a yield does not retire the recorded graphs")
+
+    compute = strip_comments(function(sycl_cpp, GRAPH_COMPUTE_SIGNATURE))
+    clear = compute.find('sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");')
+    replay = compute.find("ext_oneapi_graph(")
+    if clear < 0 or (replay >= 0 and replay < clear):
+        found.append("graph compute can replay before dropping graphs recorded before a yield")
+
+    body = strip_comments(function(cache_cpp, YIELD_SIGNATURE) + function(cache_cpp, YIELD_FINISH_SIGNATURE))
+    retire = body.find("transition_to_retired_locked(entry);")
+    gate = body.find("entry.last_write_event = readers_done;")
+    barrier = body.find("readers_done = submit_barrier_all();")
+    if min(retire, gate, barrier) < 0 or not barrier < gate < retire:
+        found.append("a retired copy's free is not gated on a barrier over every queue")
+    wait = body.find("release.readers_done.wait_and_throw();")
+    drain = body.find("it = deferred_frees_.erase(it);")
+    finalize = body.find("finalize_retired_entries_locked();")
+    if min(wait, drain, finalize) < 0 or not wait < finalize < drain:
+        found.append("a yield returns before the retired copies' storage is back in its zone")
+    return found
+
+
+def test_optional_layout_release() -> None:
+    assert optional_layout_release_violations(GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()) == []
+
+
+def _release_sycl_mutation(old: str, new: str, expected: str, label: str) -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    _assert_witnessed(cpp, cpp.replace(old, new, 1), lambda c: optional_layout_release_violations(c, cache), expected,
+                      label)
+
+
+def _release_cache_mutation(old: str, new: str, expected: str, label: str) -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    _assert_witnessed(cache, cache.replace(old, new, 1), lambda c: optional_layout_release_violations(cpp, c),
+                      expected, label)
+
+
+def test_mutation_yield_keeps_graphs_is_witnessed() -> None:
+    _release_sycl_mutation("                ggml_sycl_optional_layouts_retired();\n", "",
+                           "does not retire the recorded graphs", "epoch bump dropped")
+
+
+def test_mutation_graphs_not_dropped_is_witnessed() -> None:
+    _release_sycl_mutation('sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");', "(void) 0;",
+                           "replay before dropping graphs", "epoch check dropped")
+
+
+def test_mutation_free_gated_on_write_event_is_witnessed() -> None:
+    _release_cache_mutation("            entry.last_write_event = readers_done;\n", "",
+                            "not gated on a barrier", "barrier gate dropped")
+
+
+def test_mutation_free_left_deferred_is_witnessed() -> None:
+    _release_cache_mutation("                it = deferred_frees_.erase(it);\n", "                ++it;\n",
+                            "storage is back in its zone", "drain dropped")
+
+
+def test_mutation_no_reader_wait_is_witnessed() -> None:
+    _release_cache_mutation("        release.readers_done.wait_and_throw();\n", "", "storage is back in its zone",
+                            "reader wait dropped")
+
+
+# A KV layer is one allocation, so the bytes a yield frees are KV headroom only
+# where a layer lands in them. The cache picks which copies to release on a
+# copy of the zone's allocators, and the re-fit is held to the layers the zone
+# can place: a device-planned layer it cannot place is not refused but lands in
+# raw device memory outside the arena (llama.cpp-moua).
+def kv_fit_hold_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
+    found: list[str] = []
+    txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
+    begin = re.search(r"unified_cache_yield_optional_layouts_begin\(\s*in\.devices\[i\],\s*next_plan\.multi_device,"
+                      r"\s*device_layer_bytes\[i\]\)", txn)
+    at = begin.start() if begin else -1
+    hold = txn.find("in.fit_capacity[i] = placeable;")
+    refit = txn.find("residency = ggml_sycl::plan_runtime_kv_residency(in);", max(hold, 0))
+    if at < 0 or hold < at or refit < 0 or refit > txn.find("if (!residency.fits)"):
+        found.append("the re-fit is not held to the KV layers the zone can place")
+
+    body = strip_comments(function(cache_cpp, YIELD_SIGNATURE))
+    model = body.find("kv_zone_snapshot(ptrs, &blocks)")
+    pick = body.find("select_optional_layout_yield(zone, blocks, layer_bytes)")
+    if model < 0 or pick < model:
+        found.append("copies are picked without modelling where a KV layer lands")
+    return found
+
+
+def test_kv_fit_hold() -> None:
+    assert kv_fit_hold_violations(GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()) == []
+
+
+def _hold_sycl_mutation(old: str, new: str, expected: str, label: str) -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    _assert_witnessed(cpp, cpp.replace(old, new, 1), lambda c: kv_fit_hold_violations(c, cache), expected, label)
+
+
+def test_mutation_refit_not_held_is_witnessed() -> None:
+    _hold_sycl_mutation("                in.fit_capacity[i] = placeable;\n", "", "not held to the KV layers",
+                        "hold dropped")
+
+
+def test_mutation_yield_by_bytes_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    mutated = cache.replace("select_optional_layout_yield(zone, blocks, layer_bytes)",
+                            "std::vector<size_t>(keys.size(), 0)", 1)
+    _assert_witnessed(cache, mutated, lambda c: kv_fit_hold_violations(cpp, c), "without modelling",
+                      "zone model dropped")
+
+
+# Weight reclaim has one authority, weight_entry_reclaimable() (CLAUDE.md, SYCL
+# Memory Ownership). The yield releases optional layout copies through its
+# OPTIONAL_LAYOUT_YIELD mode: a copy is reclaimable while a live model or buffer
+# owns its tensor (they dispatch on the primary), never while anyone but the
+# cache's own mirror leases it, and a primary never is. The predicate is
+# compiled on its own and asked, so the check is of what it decides, not of how
+# it is spelled. A WOQ reader keeps its copy's lease until its work completes,
+# so the lease -- not the yield's barrier -- is what makes the free correct.
+PREDICATE_SIGNATURE = "static bool weight_entry_reclaimable("
+RECLAIM_LOOP_SIGNATURE = "size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t slot) {"
+OPTIONAL_BYTES_SIGNATURE = "size_t unified_cache::optional_layout_bytes() const {"
+ACQUIRE_LAYOUT_SIGNATURE = "static ggml_sycl::mem_handle ggml_sycl_acquire_weight_layout("
+
+PREDICATE_HARNESS = r"""
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+
+struct unified_cache_entry {
+    std::atomic<uint32_t> in_use_count{ 0 };
+    uint32_t              owner_mask      = 0;
+    bool                  owner_tagged    = false;
+    bool                  optional_layout = false;
+};
+
+@ENUM@
+
+@PREDICATE@
+
+static void ask(const char * name, weight_reclaim_mode mode, uint32_t leases, uint32_t owner_mask, bool optional,
+                uint32_t live_mask, bool buffer_owned, bool buffer_live, uint32_t own_leases) {
+    unified_cache_entry entry;
+    entry.in_use_count    = leases;
+    entry.owner_mask      = owner_mask;
+    entry.owner_tagged    = true;
+    entry.optional_layout = optional;
+    const bool reclaimable =
+        weight_entry_reclaimable(entry, mode, live_mask, buffer_owned, buffer_live, own_leases);
+    std::printf("%s=%d\n", name, reclaimable ? 1 : 0);
+}
+
+int main() {
+    const weight_reclaim_mode yield = weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD;
+    const weight_reclaim_mode load  = weight_reclaim_mode::LOAD_BOUNDARY;
+    ask("owned_copy_mirror_only", yield, 1, 1, true, 1, true, true, 1);
+    ask("copy_with_reader", yield, 2, 0, true, 0, false, false, 1);
+    ask("copy_lease_not_own", yield, 1, 0, true, 0, false, false, 0);
+    ask("primary_idle", yield, 0, 0, false, 0, false, false, 0);
+    ask("primary_mirror_only", yield, 1, 0, false, 0, false, false, 1);
+    ask("load_owned_copy", load, 0, 1, true, 1, false, false, 0);
+    ask("load_unowned", load, 0, 0, false, 0, false, false, 0);
+    ask("load_leased", load, 1, 0, false, 0, false, false, 0);
+    return 0;
+}
+"""
+
+PREDICATE_EXPECTED = {
+    "owned_copy_mirror_only": 1,
+    "copy_with_reader": 0,
+    "copy_lease_not_own": 0,
+    "primary_idle": 0,
+    "primary_mirror_only": 0,
+    # The whole-weight modes are unchanged: ownership and leases still veto.
+    "load_owned_copy": 0,
+    "load_unowned": 1,
+    "load_leased": 0,
+}
+
+
+def definition(text: str, signature: str) -> str | None:
+    """The DEFINITION of `signature`: a forward declaration ends in ';' first."""
+    at = text.find(signature)
+    while at >= 0:
+        brace = text.find("{", at)
+        semi = text.find(";", at)
+        if brace >= 0 and (semi < 0 or brace < semi):
+            return function(text[at:], signature)
+        at = text.find(signature, at + 1)
+    return None
+
+
+def predicate_decisions(hpp: str, cache_cpp: str) -> dict[str, int] | str:
+    import os
+    import subprocess
+    import tempfile
+
+    enum = re.search(r"enum class weight_reclaim_mode \{.*?\};", hpp, re.S)
+    predicate = definition(cache_cpp, PREDICATE_SIGNATURE)
+    if enum is None or predicate is None:
+        return "weight_reclaim_mode or weight_entry_reclaimable() is missing"
+    source = PREDICATE_HARNESS.replace("@ENUM@", enum.group(0)).replace("@PREDICATE@", predicate)
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "predicate.cpp"
+        exe = Path(tmp) / "predicate"
+        src.write_text(source)
+        compiler = os.environ.get("CXX", "c++")
+        built = subprocess.run([compiler, "-std=c++17", "-o", str(exe), str(src)], capture_output=True, text=True)
+        if built.returncode != 0:
+            first = next((line for line in built.stderr.splitlines() if "error" in line), built.stderr.strip())
+            return f"does not compile on its own: {first}"
+        ran = subprocess.run([str(exe)], capture_output=True, text=True, check=True)
+    return {name: int(value) for name, value in (line.split("=") for line in ran.stdout.split())}
+
+
+def optional_layout_reclaim_violations(hpp: str, cache_cpp: str, sycl_cpp: str) -> list[str]:
+    found: list[str] = []
+    decisions = predicate_decisions(hpp, cache_cpp)
+    if isinstance(decisions, str):
+        found.append(f"the reclaim predicate has no optional-layout mode: {decisions}")
+    else:
+        for name, want in PREDICATE_EXPECTED.items():
+            if decisions.get(name) != want:
+                found.append(f"the reclaim predicate decides {name}={decisions.get(name)}, want {want}")
+
+    yieldable = strip_comments(definition(cache_cpp, YIELDABLE_SIGNATURE) or "")
+    if not re.search(r"return\s+weight_entry_reclaimable\(\s*entry\s*,\s*weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD\s*,",
+                     yieldable) or re.search(r"entry\.(optional_layout|in_use_count)", yieldable):
+        found.append("the yield decides reclaim outside weight_entry_reclaimable()")
+    users = strip_comments(definition(cache_cpp, OPTIONAL_BYTES_SIGNATURE) or "") + \
+        strip_comments(definition(cache_cpp, YIELD_SIGNATURE) or "")
+    if users.count("optional_layout_yieldable_locked(") != 3:
+        found.append("a yield path picks copies without the reclaim predicate")
+
+    loop = strip_comments(definition(cache_cpp, RECLAIM_LOOP_SIGNATURE) or "")
+    if not re.search(r"if \(mode == weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD\) \{\s*GGML_ABORT\(", loop):
+        found.append("reclaim_weight_entries() accepts the optional-layout mode")
+
+    code = strip_comments(sycl_cpp)
+    if re.search(r"ggml_sycl_get_weight_layout_ptr\([^;]*GGML_LAYOUT_ONEDNN_WOQ\s*\)", code):
+        found.append("a WOQ reader resolves its copy to a bare pointer")
+    lease = code.find("ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_ONEDNN_WOQ)")
+    gemm = code.find("DnnlGemmWrapper::woq_gemm_q4_0(", max(lease, 0))
+    retain = code.find("ggml_sycl::retain_handles_until_event({ std::move(woq_owner) }", max(gemm, 0))
+    if lease < 0 or gemm < 0 or retain < 0:
+        found.append("the WOQ gemm does not hold its copy's lease until its work completes")
+    acquire = strip_comments(definition(sycl_cpp, ACQUIRE_LAYOUT_SIGNATURE) or "")
+    if "cache->acquire_layout_handle(key, layout, device)" not in acquire or "get_view(" in acquire:
+        found.append("the WOQ copy is resolved without a lease")
+    return found
+
+
+def test_optional_layout_reclaim() -> None:
+    assert optional_layout_reclaim_violations(UNIFIED_CACHE_HPP.read_text(), UNIFIED_CACHE_CPP.read_text(),
+                                              GGML_SYCL_CPP.read_text()) == []
+
+
+def _reclaim_mutation(path: Path, old: str, new: str, expected: str, label: str) -> None:
+    texts = {p: p.read_text() for p in (UNIFIED_CACHE_HPP, UNIFIED_CACHE_CPP, GGML_SYCL_CPP)}
+    original = texts[path]
+
+    def checker(mutated: str) -> list[str]:
+        t = dict(texts)
+        t[path] = mutated
+        return optional_layout_reclaim_violations(t[UNIFIED_CACHE_HPP], t[UNIFIED_CACHE_CPP], t[GGML_SYCL_CPP])
+
+    _assert_witnessed(original, original.replace(old, new, 1), checker, expected, label)
+
+
+def test_mutation_owner_vetoes_copy_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP, "    if (mode == weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD) {\n        return entry.optional_layout;\n    }\n",
+                      "", "owned_copy_mirror_only=0", "optional mode falls through to ownership")
+
+
+def test_mutation_primary_reclaimable_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP, "        return entry.optional_layout;\n", "        return true;\n",
+                      "primary_idle=1", "optional mode accepts a primary")
+
+
+def test_mutation_reader_lease_ignored_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP, "if (entry.in_use_count.load() > own_leases) {",
+                      "if (entry.in_use_count.load() > own_leases + 1) {", "copy_with_reader=1",
+                      "a reader's lease is not a veto")
+
+
+def test_mutation_mode_missing_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_HPP, "    OPTIONAL_LAYOUT_YIELD,\n", "", "has no optional-layout mode",
+                      "mode removed")
+
+
+def test_mutation_yield_bypasses_predicate_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP,
+                      "return weight_entry_reclaimable(entry, weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD,",
+                      "return entry.optional_layout && weight_entry_reclaimable(entry, weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD,",
+                      "outside weight_entry_reclaimable()", "yield reads the flag itself")
+
+
+def test_mutation_yield_path_unchecked_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP, "                optional_layout_yieldable_locked(it->first, it->second)) {",
+                      "                true) {", "without the reclaim predicate", "revalidation dropped")
+
+
+def test_mutation_reclaim_loop_accepts_mode_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP, "    if (mode == weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD) {\n        GGML_ABORT(",
+                      "    if (false) {\n        GGML_ABORT(", "accepts the optional-layout mode", "refusal dropped")
+
+
+def test_mutation_woq_reader_unleased_is_witnessed() -> None:
+    _reclaim_mutation(GGML_SYCL_CPP,
+                      "ggml_sycl::retain_handles_until_event({ std::move(woq_owner) }, std::move(read_done));",
+                      "(void) read_done;", "does not hold its copy's lease", "retention dropped")
+
+
+def test_mutation_woq_reader_bare_pointer_is_witnessed() -> None:
+    _reclaim_mutation(GGML_SYCL_CPP, "void * woq_ptr = woq_owner.resolve(ctx.device).ptr;",
+                      "void * woq_ptr = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_ONEDNN_WOQ);",
+                      "resolves its copy to a bare pointer", "pointer lookup restored")
+
+
+def test_mutation_woq_resolve_unleased_is_witnessed() -> None:
+    _reclaim_mutation(GGML_SYCL_CPP, "cache->acquire_layout_handle(key, layout, device)",
+                      "ggml_sycl::mem_handle::from_direct(cache->get_view(key, layout).ptr, layout, true, device, 0)",
+                      "resolved without a lease", "view instead of lease")
+
+
+# Canonical memory contract §12.5: no wait, and no release that can run a
+# destructor, under g_tensor_inventory_mutex (L1). The KV transaction holds it,
+# so the yield is split at its one wait: begin (picks, retires, submits the
+# barrier; waits on nothing, drops nothing) under the lock, finish (waits,
+# frees, drops the withdrawn mirror handles) with it released, and the lock is
+# taken again with the plan re-checked before the re-fit reads the zone.
+def yield_lock_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
+    found: list[str] = []
+    txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
+    if "std::unique_lock<std::mutex> lock(g_tensor_inventory_mutex);" not in txn:
+        found.append("the transaction cannot release its inventory lock")
+    begin = txn.find("unified_cache_yield_optional_layouts_begin(")
+    retired = re.search(r"retired_any\s*=\s*retired_any\s*\|\|\s*releases\[i\]\.result\.retired\s*>\s*0;", txn)
+    unlock = re.search(r"if \(retired_any\) \{\s*ggml_sycl_optional_layouts_retired\(\);\s*lock\.unlock\(\);\s*\}", txn)
+    finish = txn.find("unified_cache_yield_optional_layouts_finish(")
+    relock = re.search(r"if \(retired_any\) \{\s*lock\.lock\(\);\s*if \(ggml_sycl_global_plan_snapshot\(\)\.get\(\) != "
+                       r"current\.get\(\)\) \{\s*return busy\(", txn)
+    refit = txn.find("residency = ggml_sycl::plan_runtime_kv_residency(in);", max(finish, 0))
+    if begin < 0 or retired is None or unlock is None or finish < 0 or not begin < unlock.start() < finish:
+        found.append("the yield is finished under the inventory lock")
+    if relock is None or not finish < relock.start() < refit:
+        found.append("the re-fit runs without re-taking the lock and re-checking the plan")
+
+    started = strip_comments(function(cache_cpp, YIELD_SIGNATURE))
+    if re.search(r"\bwait(_and_throw)?\(|\.clear\(\)", started):
+        found.append("the yield's begin waits or drops handles")
+    finished = strip_comments(function(cache_cpp, YIELD_FINISH_SIGNATURE))
+    early = re.search(r"if \(release\.ptrs\.empty\(\)\) \{\s*return result;", finished)
+    wait = finished.find("wait_and_throw(")
+    if early is None or wait < 0 or early.start() > wait:
+        found.append("the yield's finish waits when nothing was retired")
+    return found
+
+
+def test_yield_lock_seam() -> None:
+    assert yield_lock_violations(GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()) == []
+
+
+def _lock_mutation(path: Path, old: str, new: str, expected: str, label: str) -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    if path == GGML_SYCL_CPP:
+        _assert_witnessed(cpp, cpp.replace(old, new, 1), lambda c: yield_lock_violations(c, cache), expected, label)
+    else:
+        _assert_witnessed(cache, cache.replace(old, new, 1), lambda c: yield_lock_violations(cpp, c), expected, label)
+
+
+def test_mutation_finish_under_lock_is_witnessed() -> None:
+    _lock_mutation(GGML_SYCL_CPP, "                ggml_sycl_optional_layouts_retired();\n                lock.unlock();\n",
+                   "                ggml_sycl_optional_layouts_retired();\n", "finished under the inventory lock",
+                   "unlock dropped")
+
+
+def test_mutation_no_plan_recheck_is_witnessed() -> None:
+    _lock_mutation(GGML_SYCL_CPP, 'return busy("busy (plan changed while optional layout copies were released)");',
+                   "(void) 0;", "re-checking the plan", "re-check dropped")
+
+
+def test_mutation_begin_waits_is_witnessed() -> None:
+    _lock_mutation(UNIFIED_CACHE_CPP, "    result.retired = retired_ptrs.size();\n    return release;\n",
+                   "    result.retired = retired_ptrs.size();\n    readers_done.wait_and_throw();\n    return release;\n",
+                   "begin waits or drops handles", "wait moved into begin")
+
+
+def test_mutation_begin_drops_mirrors_is_witnessed() -> None:
+    _lock_mutation(UNIFIED_CACHE_CPP, "    result.retired = retired_ptrs.size();\n    return release;\n",
+                   "    released_mirrors.clear();\n    result.retired = retired_ptrs.size();\n    return release;\n",
+                   "begin waits or drops handles", "mirror drop moved into begin")
+
+
+def test_mutation_finish_waits_unretired_is_witnessed() -> None:
+    _lock_mutation(UNIFIED_CACHE_CPP, "    if (release.ptrs.empty()) {\n        return result;\n    }\n", "",
+                   "waits when nothing was retired", "early return dropped")

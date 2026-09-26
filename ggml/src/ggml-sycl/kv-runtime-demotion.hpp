@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "tlsf-allocator.hpp"
+
 namespace ggml_sycl {
 
 // Input snapshot of the placement state relevant to runtime KV demotion.
@@ -91,12 +93,21 @@ inline bool kv_reads_device_arena(bool multi_device, bool global_cache_mode) {
 // Headroom runtime KV admission reserves per device-resident layer for the
 // tiered KV allocator placing them one allocation at a time, possibly across
 // two KV buffers: the arena allocator rounds every allocation up to its 256-byte
-// block and the tiered allocator aligns each layer to 512 bytes;
-// test-kv-runtime-demotion pins it against the allocator itself. Admission is a
-// byte count over zone_available(), so a fragmented or multi-chunk zone whose
-// largest free extent is smaller than a layer can still refuse, loudly, at
-// per-layer allocation.
+// block and the tiered allocator aligns each layer to 512 bytes
+// (kv_layer_alloc_bytes); test-kv-runtime-demotion pins it against the
+// allocator itself. Admission is a byte count over zone_available(); where free
+// bytes are not whole-layer extents -- the holes an optional-layout yield
+// leaves between live weights -- it is capped by what the zone can actually
+// place (kv_residency_input::fit_capacity), because a device-planned layer the
+// zone cannot place is not refused: it lands in raw device memory outside the
+// arena (llama.cpp-moua).
 constexpr size_t kv_alloc_slack_per_layer = 64 * 1024;
+
+// The bytes one layer of KV asks the zone for: the tiered KV allocator aligns
+// each layer's allocation to 512 bytes.
+inline size_t kv_layer_alloc_bytes(size_t kv_bytes) {
+    return (kv_bytes + 511) & ~size_t(511);
+}
 
 // The KV cache's shape as far as its size is concerned.
 struct kv_shape {
@@ -182,6 +193,13 @@ struct kv_residency_input {
     std::vector<uint8_t> swa_layer_mask;
     std::vector<int>     devices;         // devices to fit, in order
     std::vector<size_t>  available;       // live KV headroom of devices[i]
+    // Bytes of optional layout copies devices[i] can release for its KV
+    // (unified_cache_optional_layout_bytes()); empty means none.
+    std::vector<size_t>  yieldable;
+    // The most KV bytes devices[i] can hold whatever its headroom says: the
+    // bytes of the leading layers its zone's free blocks can actually place
+    // (unified_cache::yield_optional_layouts()). Empty, or SIZE_MAX, is no cap.
+    std::vector<size_t>  fit_capacity;
     size_t               per_layer_slack = kv_alloc_slack_per_layer;
 };
 
@@ -190,13 +208,46 @@ struct kv_residency_result {
     int                             refused_device = -1;  // the device that cannot fit even with KV demoted
     std::vector<int>                kv_device;            // the new residency
     std::vector<kv_demotion_result> per_device;           // same indexing as devices
+    std::vector<size_t>             yield_bytes;          // optional layout bytes devices[i] must release
 };
 
-// Starts from load_kv_device and demotes each device's latest full-attention
-// layers, then its latest SWA layers, to the host tier until its KV, plus
-// per_layer_slack per resident layer, fits that device's headroom. It refuses
-// only when even that cannot fit.
+// Starts from load_kv_device. A device whose KV, plus per_layer_slack per
+// resident layer, exceeds its headroom first counts up to its yieldable bytes
+// as headroom (yield_bytes, which the caller must release before the KV is
+// allocated): an optional layout copy never outranks KV for VRAM. Only what is
+// still over then demotes the device's latest full-attention layers, then its
+// latest SWA layers, to the host tier, with a device's KV also held to its
+// fit_capacity. It refuses only when even that cannot fit.
 kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in);
+
+// The allocators a device's KV is carved from, in the order zone_alloc(KV)
+// tries them, as copies of their live state. Allocating on a copy is the
+// allocator's own fit -- size-class rounding, coalescing on free -- which is
+// what decides whether a KV layer lands, not a byte count: free bytes split
+// into holes smaller than a layer are not KV headroom.
+using kv_zone_model = std::vector<tlsf_allocator>;
+
+// An allocation in a kv_zone_model: which allocator, and its offset there.
+// allocator == SIZE_MAX: not in the model (it lives where KV is not carved).
+struct kv_zone_block {
+    size_t allocator = SIZE_MAX;
+    size_t offset    = 0;
+};
+
+// How many of `layer_bytes`, allocated in order one allocation a layer (each
+// from the first allocator with room, as the tiered KV allocator does), land
+// before the first that does not. Works on its own copy of `zone`.
+size_t kv_layers_allocatable(kv_zone_model zone, const std::vector<size_t> & layer_bytes);
+
+// Which optional layout copies to release so more of `layer_bytes` land. Walks
+// the copies from the zone's high end down, since copies staged together sit
+// together and free into one extent with each other and with the free space
+// above them; a copy is kept for release only once the extent it joins lets
+// another layer land, and one that extent does not need is dropped again. A
+// copy no layer can use stays resident. Returns indices into `copies`.
+std::vector<size_t> select_optional_layout_yield(const kv_zone_model &              zone,
+                                                 const std::vector<kv_zone_block> & copies,
+                                                 const std::vector<size_t> &        layer_bytes);
 
 // One device's view of a (possibly multi-device) plan for the zone-fit pass.
 struct kv_device_fit_input {
