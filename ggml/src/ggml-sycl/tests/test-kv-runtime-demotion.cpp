@@ -424,13 +424,13 @@ int main() {
         CHECK_EQ(kv_vram_available(true, 512, 4096), 512, "case 21: the arena's KV zone");
         CHECK_EQ(kv_vram_available(false, 0, 4096), 4096, "case 21: no arena, the budget headroom");
     }
-    // 22. On a split, each device's backend publishes the same context, and
-    // each backend is not yet admitted, so each re-fits. All of them publish
-    // before llama_kv_cache allocates that KV, so every re-fit restarts from the
-    // load residency against the same headroom and gets the same answer: the
-    // second demotes no more than the first. Were one to run after the KV is
+    // 22. On a split, each device's backend publishes the same context and
+    // re-fits it. All of them publish before llama_kv_cache allocates that KV,
+    // so each re-fit restarts from the load residency against headroom that
+    // still includes it (plan_runtime_kv_residency is a pure function, so the
+    // same input gives the same answer). Were one to run after the KV is
     // allocated, the headroom would no longer include it and it would demote
-    // more; that ordering is pinned on the source
+    // more; the publish ordering is pinned on the source
     // (test-sycl-kv-layer-sizing-source.py).
     {
         kv_residency_input in;
@@ -439,15 +439,13 @@ int main() {
         in.swa_layer_mask = { 0, 0, 0, 0, 0, 0 };
         in.devices        = { 0, 1 };
         in.available      = { 128 + 3 * kv_alloc_slack_per_layer, 192 + 3 * kv_alloc_slack_per_layer };
-        auto first        = plan_runtime_kv_residency(in);
-        auto second       = plan_runtime_kv_residency(in);
-        CHECK(first.fits && second.fits, "case 22: both re-fits fit");
-        CHECK(first.kv_device == second.kv_device, "case 22: the second backend's re-fit keeps the first's residency");
-        CHECK_EQ(first.per_device[0].demoted_layers.size(), 1, "case 22: device 0 demotes one layer");
+        auto before       = plan_runtime_kv_residency(in);
+        CHECK(before.fits, "case 22: the re-fit before allocation fits");
+        CHECK_EQ(before.per_device[0].demoted_layers.size(), 1, "case 22: device 0 demotes one layer");
 
         in.available[0] -= 2 * 64;  // after allocation: the headroom no longer includes the two resident layers
         auto late = plan_runtime_kv_residency(in);
-        CHECK(late.per_device[0].demoted_layers.size() > first.per_device[0].demoted_layers.size(),
+        CHECK(late.per_device[0].demoted_layers.size() > before.per_device[0].demoted_layers.size(),
               "case 22: a re-fit after allocation would demote more");
     }
     // 23. GGML_SYCL_KV_HOT_LAYERS is read by value, as the tier manager reads
