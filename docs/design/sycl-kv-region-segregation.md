@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.12a. Author: impl-moua, 2026-09-26. The revisions answer twelve reviews:
+Design, revision 7.13. Author: impl-moua, 2026-09-26. The revisions answer thirteen reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -48,13 +48,13 @@ Design, revision 7.12a. Author: impl-moua, 2026-09-26. The revisions answer twel
   Revision 7.10 is one commit on top of 7.9 (`53908bce5`). It answers design-moua-r9's
   addendum on 7.7a (I-5 and m-12 to m-14, rulings §M9a), 23mk's four additions to the
   pending-range primitive (rev 4.4 §8.1) and zhcn 5.5's four relays, recorded in §6.12;
-- design review r10 (design-moua-r10 on `85635feee..9d4d826b3`: 0 Critical, 6 Important,
-  7 Minor), the lead's rulings on it (§M11), §M10, and design-1oxa-r7's I-3 (§X7, the load's
-  room is admitted at the early stage), recorded in §6.13. Revision 7.11 is one commit on top
-  of 7.10 (`9d4d826b3`). Revision 7.11a is one commit on top of 7.11 (`c445f3c46`): §M11a (the
-  term filter on the clear and the fit), design-23mk-r6's H1 arm, zhcn 5.7's and f6218f3's
-  relays, and the lead's decisions on m-6 and m-5, recorded in §6.13; it is two commits,
-  `0fc9f8c5e` and the decisions;
+- design review r10 (design-moua-r10 on `85635feee..9d4d826b3`: 0 Critical, 6 Important, 7
+  Minor), the lead's rulings on it (§M11), §M10, and design-1oxa-r7's I-3 (§X7, the load's room
+  is admitted at the early stage), recorded in §6.13. Revision 7.11 is one commit on top of 7.10
+  (`9d4d826b3`). Revision 7.11a is one commit on top of 7.11 (`c445f3c46`): §Z8 I-2 (relayed as
+  §M11a: the term filter on the clear and the fit), design-23mk-r6's H1 arm, zhcn 5.7's and
+  f6218f3's relays, and the lead's decisions on m-6 and m-5, recorded in §6.13; it is two
+  commits, `0fc9f8c5e` and the decisions;
 - design review r11 (design-moua-r11 on `9d4d826b3..c66848c26`: 1 Critical, 4 Important, 13
   Minor), the lead's rulings on it (§M12), and the post-r11 queue (§M11b, §M11b-amend, §Z9 I-3's
   always-compiled witnesses, §Z9a's H4 (b) limits), recorded in §6.14. Revision 7.12 is one
@@ -62,12 +62,17 @@ Design, revision 7.12a. Author: impl-moua, 2026-09-26. The revisions answer twel
   (`e64dac7db`): the lead's §M13 and §M13a, which fold 23mk rev 4.5's items, the `DEVICE_TERM`
   interim (§Z10.1), 1oxa r8's I-D (§X9), 23mk r7's I-A (§Z11), zhcn `8a58ad4`'s H4h hooks and
   ldvb's ownership of row 648, recorded in §6.14.
+- design review r12 (design-moua-r12 on `c66848c26..7f4808729`: 1 Critical, 3 Important, 15
+  Minor), the lead's rulings on it (§M14), §Z13.1, the late-stage string's term slot and zhcn
+  5.9's H4h vehicle (`4f8ff34`), recorded in §6.15. Revision 7.13 is one commit on top of 7.12a
+  (`7f4808729`).
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
 §E.1, §E.2, §L0R, §M7, §REC, §T, §L6, §GA, §FM, §STRICT, §D15, §D16, §Z3, §Z42, §Z52, §D20
 (superseded), §D20.1, §M76, §M76a, §ZR5, §M8, §Z43, §Z5, §Z6, §M77, §M9, §M9a, §M10, §Z6x, §X7,
-§M11, §M11a, §M11b, §Z8, §Z9, §Z9a, §M12, §Z10, §X9, §Z11, §M13, §M13a). This document cites it
+§M11, §M11b, §Z8, §Z9, §Z9a, §M12, §Z10, §X9, §Z11, §M13, §M13a, §Z12, §Z13, §M14). §M11a is a
+relay line inside §Z8, not a section, and is cited as §Z8 I-2 (r12 m-14). This document cites it
 as "rulings §X". **Where this document paraphrases a ruling and differs from the file, the file
 wins.**
 
@@ -828,8 +833,8 @@ written:
     design's transaction ranges ((0) and step 5) are `CONTEXT` ranges with term `REGION`, and
     the commit re-fit's `own_ranges` are this context's ranges **of term `REGION` only**. 23mk's
     two transient holds under the same `{CONTEXT, id}`, `ONEDNN_PP_A` and `SET_ROWS_STAGE`, are
-    other terms, so the re-fit treats them as allocated and never carves into them (rulings
-    §M11a). Since rev 4.5 23mk has no persistent `{CONTEXT, id}` hold: its row 73 is a `{MODEL,
+    other terms, so the re-fit treats them as allocated and never carves into them (rulings §Z8
+    I-2). Since rev 4.5 23mk has no persistent `{CONTEXT, id}` hold: its row 73 is a `{MODEL,
     id}` hold and its row 113 a carved slot;
   - `DEVICE`, id = the device index, from the first load (by retag) to the last unload
     (23mk's).
@@ -848,8 +853,8 @@ written:
   {CONTEXT, id}, REGION)`. The fit treats every other range as allocated, a same-owner range
   of another term included.
 
-  **Every operation that selects ranges by owner also takes a term filter (rulings §M11a,
-  §M12 I-4; design-23mk-r6 I-2, §Z8 I-2).** The operations, whose signatures both designs
+  **Every operation that selects ranges by owner also takes a term filter (rulings §Z8 I-2,
+  §M12 I-4; design-23mk-r6 I-2).** The operations, whose signatures both designs
   state identically:
   - `record_pending(owner, term, offset, size)` (23mk's name, adopted; rulings §M13): records
     one range at `offset`, on the TLSF that holds it, under that TLSF's group mutex. A load's
@@ -865,13 +870,17 @@ written:
     term is in `term_filter`, a scalar for accounting; a fit places by the ranges, not by
     this number;
   - the device-wide query `pending_bytes_excluding(device, zone, except_owner, except_term)`
-    (rulings §M13; 23mk r7 I-A, §Z11): the free bytes of **every** pending range on `device` in
-    `zone` (or in every zone), across all owners, except the ranges of `except_owner` whose term
-    is `except_term`. It is the one query for other owners' holds: the RUNTIME ring's replan,
-    which reads `zone_available(RUNTIME)` (`ggml-sycl.cpp:17603` at `3d9414c8c`) less the
-    transaction's MMID bytes (`runtime_pending`, `:17618`), subtracts every other hold through
-    it, naming its own `(owner, term)`, and no caller sums other owners' ranges by hand. Like
-    `pending_bytes`, it is accounting; a fit places by the ranges.
+    (rulings §M13, §Z13.4; 23mk r7 I-A): the free bytes of **every** pending range on `device`
+    in `zone` (or in every zone), across all owners, except the ranges whose owner is
+    `except_owner` **and** whose term is `except_term` (one term, not a mask). **Its consumer is
+    23mk's A fit (rulings §M14 I-3)**, which names its own `({CONTEXT, id}, ONEDNN_PP_A)` and so
+    counts every other hold as taken, this context's `REGION` ranges and the MMID device pool
+    among them; A's step sits between step 5's recording and the yield (§2.4.2 step 5). 7.12a
+    named the RUNTIME ring's replan (`ggml-sycl.cpp:17603`, `:17618`), which on an arena device
+    this design replaces with the fit (the ring is a head slot); until moua L4 lands, 23mk's
+    interim ring uses the same query with `({CONTEXT, id}, REGION)` (§Z13.4). No caller sums
+    other owners' ranges by hand. Like `pending_bytes`, it is accounting; a fit places by the
+    ranges.
 
   `term_filter` is a `pending_term_mask`; `PENDING_TERM_ALL` names every term, and only a load's
   commit and rollback use it, since a load owns every term it records. Why the filter is needed
@@ -903,7 +912,7 @@ written:
     self-deadlock on the non-recursive mutex, and a hand-rolled per-TLSF clear would lose the
     filter and wipe 23mk's same-context holds on that TLSF (r11 I-4). No site clears pending
     ranges any other way. Ranges of the owner's other terms stay
-    (rulings §M11a). This design's context clears pass `REGION`; a load's pass
+    (rulings §Z8 I-2). This design's context clears pass `REGION`; a load's pass
     `PENDING_TERM_ALL`.
 
   The commit's planned carves keep `allocate_at` at the offsets the re-fit chose (fit ==
@@ -951,8 +960,17 @@ written:
   **At B's unload the `{MODEL, B}` ranges go:** `ggml_sycl_teardown_owner_effects`
   (`ggml-sycl.cpp:12585`, called from `ggml_backend_sycl_model_unloaded_token` at `:12313`)
   calls `clear_pending({MODEL, owner.model}, WEIGHT)` beside 23mk's `MODEL_TERM` clear, each
-  naming only its own term (A1's rules), so no range outlives its model. The exact signatures go
-  to impl-23mk, so both designs name one primitive (§6.13).
+  naming only its own term (A1's rules), so no range outlives its model. **The clear is
+  teardown's first statement (r12 m-12)**, ahead of the publication block, the MoE discovery
+  release whose failure returns `false` (`:12615-12622`),
+  `ggml_sycl_release_model_slot_resources` (`:12656`) and 1oxa's chunk release, since no range
+  may outlive its chunk (the rollback's T13 rule). It is idempotent, so a teardown that returns
+  `false` and is retried by the reaper runs it again harmlessly. **An evicted planned weight
+  keeps its room (r12 m-11):** a draw trims the range (`consume = true`), so when the unified
+  cache evicts a planned device weight of a live model, the free re-records its block as
+  `{MODEL, id}` / `WEIGHT` with `record_pending`, and the re-stage draws it again; the room
+  stays the model's, as the plan admitted it (P4). 1oxa names the free and draw sites (relayed).
+  The exact signatures go to impl-23mk, so both designs name one primitive (§6.13).
 
 Whichever design lands first implements them in the one primitive (L4 here); 23mk's §4 depends
 on them. H1 adds `allocate_within` (both `consume` forms, reuse after a free inside an
@@ -960,7 +978,8 @@ unconsumed range, a miss reported and not fallen through, and a `WEIGHT` draw th
 in a `SCRATCH` range of the same owner), `clear_pending` idempotence, and `replace_within`'s
 `SHARED` status at `owner_use_count() != 1` with `old` returned unconsumed, a new range that
 never lands in the owner's ranges of another term, and its restore on a failed carve, each with
-`check_invariants()` after. These arms carry the term filter (rulings §M11a, §M11b, §M12, §M13):
+`check_invariants()` after. These arms carry the term filter (rulings §Z8 I-2, §M11b, §M12,
+§M13):
 - **retag, then clear.** Load B records a `WEIGHT` range it draws partly, a second `WEIGHT`
   range it never draws (the **undrawn** range), a `SCRATCH` range and a `MODEL_TERM` range.
   After the commit's four steps the `SCRATCH` range is gone (the TLSF's free bytes include it);
@@ -1001,7 +1020,12 @@ never lands in the owner's ranges of another term, and its restore on a failed c
   the free bytes of the other three RUNTIME ranges, and the every-zone form adds the `WEIGHT`
   range. Witnesses: an exclusion by owner alone, which also drops `{CONTEXT, c}` / `REGION`, and
   a sum of the caller's own owner's `pending_bytes`, which misses the other owners; each returns
-  a smaller sum.
+  a smaller sum;
+- **A's exact fit (rulings §M14 I-3).** One context: A's grow plus an MMID pool of X bytes,
+  recorded as this call's `REGION` range at step 5, with RUNTIME room for exactly both. A's fit
+  at its step (between the recording and the yield) is admitted. RED: the double count, A's fit
+  also subtracting `mmid_runtime_pending_bytes` = X, under which A is refused on a context whose
+  plan fits.
 
 #### 2.3.4 Reset, settle, and the dead KV reclaim
 
@@ -1018,11 +1042,11 @@ never lands in the owner's ranges of another term, and its restore on a failed c
     DEVICE-scope slots are covered by the registered-allocation rule above.
   - **The arena rebuild is refused the same way (rulings §M12 C-1; §Z8 I-3).**
     `ensure_planned_arena_zones`' rebuild (`arena_destroy()`, then `arena_reserve()`;
-    `unified-cache.cpp:4553-4625`) counts any pending range on the device as live and refuses
-    by name, as it already does for zone bytes, chunk leases and live scratch. Its failure is
-    the stage's named refusal, never the `GGML_ABORT` at `ggml-sycl.cpp:16215` (§2.4.2 (b)
-    "The zones come from the plan"). So the refused operations are: a settle, a TLSF reset,
-    `arena_destroy()` and the arena rebuild.
+    `unified-cache.cpp:4553-4625`) counts any pending range on the device as live and refuses by
+    name, as it already does for zone bytes, chunk leases and live scratch. Its failure is the
+    stage's named refusal, never the `GGML_ABORT` at `ggml-sycl.cpp:16215` (§2.4.2 (b) "The
+    zones come from the demands, before the pack"). So the refused operations are: a settle, a
+    TLSF reset, `arena_destroy()` and the arena rebuild.
 - **`zone_reclaim(KV)`.**
   - The bulk reclaim in `arena_reserve` (fe6c `unified-cache.cpp:22171`) is removed.
   - The second caller, master `ggml-sycl.cpp:37301`, sits in the
@@ -1329,9 +1353,13 @@ L0, and a failed revalidation under L0 is a bug, not a race.
   debug assertion. Each is `GGML_SYCL_WITNESS(cond, message)`, compiled in every build and
   independent of `NDEBUG`. It is evaluated in a `GGML_SYCL_PRIVATE_TESTING` build, where it is
   on unless the runtime switch `GGML_SYCL_WITNESS_CHECKS=0` turns it off for an arm that must
-  reach the unchecked path, and in any other build when `GGML_SYCL_WITNESS_CHECKS=1` is set.
-  A failure aborts with its own message, so a death arm scores by message, never by "it
-  aborted". There is no separate `-UNDEBUG` build. The checks and their messages:
+  reach the unchecked path, and in any other build when `GGML_SYCL_WITNESS_CHECKS=1` is set. A
+  failure aborts with its own message, so a death arm scores by message, never by "it aborted".
+  There is no separate `-UNDEBUG` build. **A disabled witness costs one branch (r12 m-10):** the
+  switch is read once, on first use, into a function-local static, and the macro tests that
+  static before it evaluates `cond`, so a disabled check costs one predictable branch, with no
+  `getenv` and no `thread_local` read. Graph compute's check, which runs on every decode, costs
+  that branch in a production build. The checks and their messages:
   - an illegal nesting (above): `[REPLAN-TOKEN] illegal nesting: <inner> under <outer>`;
   - the release proc entered holding L0 (§2.4.2 "The deadlock rule"): `[REPLAN-TOKEN] release
     proc entered with L0 held`;
@@ -1481,8 +1509,11 @@ L0, and a failed revalidation under L0 is a bug, not a race.
   Two more come off the publisher list (r9 m-2, m-3):
   - `ggml_backend_sycl_compute_placement_plan_early` (`:16473`; exported, `ggml-sycl.h:357`)
     runs populate and the plan computation and **publishes nothing**; 7.7 called it a publisher
-    and an L0 entry, which was wrong. Its only caller is the stage (`:16824`), so it becomes
-    `static`, the orphan rule's other outcome;
+    and an L0 entry, which was wrong. **Its public `void` entry stays, with its one declaration
+    at `ggml-sycl.h:357` (23mk's form; rulings §M14 m-13):** the body moves into a static `bool`
+    impl, which the stage (`:16824`) calls and whose `false` it maps to its refusal, and the
+    public entry logs and returns. 7.9 made the entry itself `static`, which conflicts with its
+    `GGML_BACKEND_API` declaration;
   - `ggml_sycl_reset_model_load_scratch_state` publishes `nullptr` (`:14773`) when
     `!preserve_placement_authority`. The forward declaration defaults that parameter to false
     (`:12404`), and every caller (`:12422`, `:12721`) passes true, so the branch is dead at
@@ -1493,15 +1524,15 @@ L0, and a failed revalidation under L0 is a bug, not a race.
   each public backend load entry, not across the whole load:
   - `ggml_backend_sycl_model_load_begin` (`:12728`);
   - `ggml_backend_sycl_stage_inventory_plan` (`:16775`), the inventory entry llama calls
-    (`llama-model.cpp`). Its early form (`early` true; llama calls it at
-    `llama-model.cpp:657`, before `create_tensor` picks each tensor's buffer type from the plan)
-    reaches `ggml_backend_sycl_compute_placement_plan_early` (`:16473`, made static above) at
-    `:16824`, which computes and publishes nothing; it is **the stage that admits B's room and
-    records the load pending ranges** ((b) below; rulings §X7 I-3). Its late form, llama's
-    `llama_model_sycl_set_late_inventory` (`llama-model.cpp:2408-2410`, reaching `:709`),
-    reaches `ggml_sycl_set_tensor_inventory_impl` (`:16491`, static) at `:16826`, consumes the
-    admitted plan by its identity, and provisions the host zones before the loader allocates
-    weight buffers;
+    (`llama-model.cpp`). Its early form (`early` true; llama calls it at `llama-model.cpp:657`,
+    before `create_tensor` picks each tensor's buffer type from the plan) reaches
+    `ggml_backend_sycl_compute_placement_plan_early` (`:16473`; the stage calls its static impl,
+    above) at `:16824`, which computes and publishes nothing; it is **the stage that admits B's
+    room and records the load pending ranges** ((b) below; rulings §X7 I-3). Its late form,
+    llama's `llama_model_sycl_set_late_inventory` (`llama-model.cpp:2408-2410`, reaching
+    `:709`), reaches `ggml_sycl_set_tensor_inventory_impl` (`:16491`, static) at `:16826`,
+    consumes the admitted plan by its identity, and provisions the host zones before the loader
+    allocates weight buffers;
   - `ggml_backend_sycl_model_load_end` (`:13096`, publish at `:13205`). The weight preload,
     `ggml_sycl_preload_model_weights` (`:33515`, static), runs inside it (`:13124` → `:12476`,
     and `:13267` → `:12933`), so its republish (`:33769`) is under `load_end`'s hold; it is not
@@ -1589,31 +1620,49 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     pending-range primitive (rulings §Z5 IMP-6; §2.3.3). All of it is on arena devices; a
     non-arena device has no zone TLSF and no pending range, and keeps master's placement
     (§2.11):
-    - **The zones come from the plan (rulings §M12 C-1).** On master,
-      `compute_and_store_plan_for_inventory` calls `unified_cache_ensure_planned_arena_zones`
-      **before** it computes the plan (`ggml-sycl.cpp:16213-16216`), and both stages reach it
-      (the early stage through `compute_placement_plan_early`, `:16488`; the late stage through
-      `ggml_sycl_set_tensor_inventory_impl`, `:16731`). But the zone inputs `moe_control` and
-      the non-FA shape are recorded **inside** the plan, by `populate_host_zone_sizing`
-      (`unified-cache.cpp:27082`, `:27430`, `:27617`). So the early stage sizes its zones
-      without its own plan's inputs, and the late stage's call is the first to see them; when
-      they grow the zones, `ensure_planned_arena_zones` rebuilds the arena with
-      `arena_destroy()` and `arena_reserve()` (`unified-cache.cpp:4553-4625`), whose live
-      check counts zone bytes, chunk leases and live scratch but no pending range. That is
-      master's normal MoE load path: `merge-gates/gptoss120b-b1.log` shows the early stage
-      rebuilding (`:184`, runtime 512.0 -> 1617.9 MB) and the late stage rebuilding again
-      (`:1544-1545`, runtime 1617.9 -> 1618.0 MB for `moe_control=0.1 MB`), and
-      `glkg-qwen35b-a3b-b1.log:2024-2025` shows the same. Under 7.11 that late rebuild would
-      destroy the `WEIGHT` ranges the early stage admitted, and every SYCL<n> draw would then
-      miss (r11 C-1). The order is one fact with two sources, and the fix is one source:
-      `compute_and_store_plan_for_inventory` computes the plan **first**, then ensures the
-      arena zones **from that plan** (its `moe_control`, non-FA shape and the rest of the
-      zone demands), in **both** stages. The early stage therefore sizes the zones correctly
-      before it records any range, and the late stage finds the same zones and rebuilds nothing.
-      **The shared rule (rulings §Z8 I-3, §M13a): the sentence is this design's, the message is
-      23mk's, and each design mirrors both byte for byte.** The sentence: "an arena rebuild that
-      meets live bytes or any pending range refuses by name; it never destroys them, and the
-      `GGML_ABORT` at `ggml-sycl.cpp:16215` becomes that named refusal."
+    - **The zones come from the demands, before the pack (rulings §M14 C-1, which corrects §M12
+      C-1's order).** The planner packs weights into the **live** zone capacities:
+      `compute_placement_plan` reads `zone_capacity` of SCRATCH, ONEDNN and RUNTIME and packs
+      into `unified_cache_kv_weight_capacity` ("Planned weights must fit the actual allocator
+      zone", `unified-cache.cpp:28085-28096`), and the single-device caller does the same
+      (`ggml-sycl.cpp:16318-16333`). So the zones must be ensured before the pack. 7.12's "plan
+      first, then ensure" packed against the pre-ensure zones (r12 C-1): on GPT-OSS 120B on the
+      B50 the early pack would read a 13338 MB weight zone, the ensure would then grow RUNTIME
+      from 512 to 1617.9 MB and leave a 12232.1 MB weight zone, and the early placement would
+      refuse a load master completes (`merge-gates/gptoss120b-b1.log:57`, `:184`, `:191`,
+      `:261`; `glkg-qwen35b-a3b-b1.log:73`, `:210`, `:217`, `:291` show the same growth, 512 to
+      1672 MB). Master gets the large term right: the `moe_onednn` slots are recorded before the
+      plan (`populate_inventory_globals` calls `unified_cache_set_planned_pp_moe_onednn_scratch`
+      at `:15967`, ahead of `compute_and_store_plan_for_inventory` in
+      `compute_placement_plan_early`, `:16484-16488`), so master's pre-plan ensure sizes RUNTIME
+      before the pack. Only the small terms, `moe_control` and the non-FA shape, are recorded
+      inside the plan (`populate_host_zone_sizing`, `unified-cache.cpp:27082`, `:27430`,
+      `:27617`), which is why master's late stage rebuilds again (`gptoss120b-b1.log:1544-1545`,
+      1617.9 to 1618.0 MB). **The one order, in `compute_and_store_plan_for_inventory` (one edit
+      to one function, shared with 23mk):**
+      1. **compute every non-weight zone demand** as a pure function of the inventory and the
+         context shape: the `moe_onednn` slots, `moe_control`, the non-FA shape and the rest of
+         the zone inputs. Each is a function of `n_experts`, `n_expert_used`,
+         `planner_n_head_all_max`, `n_ubatch` and `n_ctx` (`unified-cache.cpp:27425-27435`,
+         `:27615-27618`), not of the packing, so `populate_host_zone_sizing`'s in-plan terms
+         move into this one demand function, ahead of the pack. Each demand is a named term
+         (`moe_onednn`, `moe_control`, `nonfa_shape`, ...) in the zone that holds it;
+      2. **ensure the zones** from those demands (`ensure_planned_arena_zones`), at the early
+         stage only; the late stage compares instead (below);
+      3. **pack the weights once** against the ensured zones. There is no iterative re-plan: a
+         demand that depended on the packing would be a defect in step 1, and the witness names
+         it;
+      4. **witness, always compiled** (`GGML_SYCL_WITNESS`, message `[ZONE-PLAN-BUG] the plan
+         packed against zone capacities that differ from the ensured arena`): the zone
+         capacities the pack read (the `[PLACEMENT] Zone reservation` line) equal the arena's
+         zones after step 2, and the plan's device weight bytes are at most the `WEIGHT` zone.
+         It runs before any `record_pending`.
+
+      So the early stage packs against the zones it admits, and B's ranges are recorded inside
+      them. **The shared rule (rulings §Z8 I-3, §M13a): the sentence is this design's, the
+      message is 23mk's, and each design mirrors both byte for byte.** The sentence: "an arena
+      rebuild that meets live bytes or any pending range refuses by name; it never destroys
+      them, and the `GGML_ABORT` at `ggml-sycl.cpp:16215` becomes that named refusal."
       `ensure_planned_arena_zones` counts any pending range on the device as live, beside zone
       bytes, chunk leases and live scratch, and `compute_and_store_plan_for_inventory` returns
       `bool`. On the refusal it logs the message, `[SYCL-PLAN] model load refused: arena zones
@@ -1621,7 +1670,12 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       %.1f MB, chunk leases %zu, scratch %.1f MB, pending ranges %zu)`, stores no plan and
       returns false, and the stage passes that up as its refusal
       (`GGML_SYCL_LIFECYCLE_EFFECT_FAILED`, through the stage's rollback guard), never the
-      abort;
+      abort. **Its arguments (r12 m-7; relayed to 23mk, whose string it is):** the device index;
+      the zone bytes in MB as `double`; the chunk leases as `(size_t)` of the `uint32_t` count
+      (`unified-cache.cpp:4578`); the live scratch as the byte sum of the live scratch blocks in
+      MB, which replaces master's `has_live_scratch` bool (`:4585-4588`), so the check sums the
+      blocks it tests; and the pending range count as `size_t`. The late stage never calls the
+      ensure, so this refusal is reachable only at the early stage;
     - **The admitting stage is the early stage (rulings §X7 I-3).** llama calls
       `stage_inventory_plan` twice: early at `llama-model.cpp:657`, where `create_tensor` then
       picks each tensor's buffer type from the early plan, and late at `:709` (through
@@ -1633,12 +1687,25 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       bytes B's plan puts there and records them as load pending ranges with
       `record_pending({LOAD, B's LoadTxnId}, WEIGHT, offset, size)`. It stores the admitted
       plan, with its identity and its zone demands, in B's inventory record (§M76a). Placement
-      that does not fit is the early stage's refusal, by name, before any buffer type is chosen;
-    - **The recording is idempotent (§M12 m-9).** The stage loop calls
-      `compute_placement_plan_early` once per device (`:16816-16824`), and a multi-device plan
-      covers every device each time. The ranges are recorded once per `(txn, term, device)`,
-      with replace semantics: a second call for the same key replaces the first's range, so a
-      multi-device load holds its room once. 23mk's records use the same rule;
+      that does not fit is the early stage's refusal, by name, before any buffer type is chosen.
+      **One extent per `(txn, term, device)`, a declared limitation (r12 m-5):** B's `WEIGHT`
+      room on a device is one contiguous range, placed first fit. If no single free extent holds
+      it, which can happen only when another live model's blocks fragment the zone, the early
+      stage refuses by name (`[LOAD-PLAN] no contiguous WEIGHT extent of %.1f MB on device %d
+      (largest free %.1f MB)`) where master would have placed buffer by buffer. A range set per
+      key is the follow-up if that refusal is ever seen; it needs ggml-alloc's buffer split,
+      which the stage bounds but does not replay (below);
+    - **The recording runs once, after the device loop, from the admitted plan (r12 m-4; §M12
+      m-9).** The stage loop calls `compute_placement_plan_early` once per device
+      (`:16816-16824`). A multi-device plan covers every device each time, but without
+      `moe_multi_gpu_requested` each iteration plans its own device (`:16318-16338`) and
+      re-stages the candidate (`:16373`), so a range recorded inside the loop could come from a
+      plan that is not the admitted one, and would then be retagged to `{MODEL, id}` and held
+      for the model's life with no consumer. So the loop records nothing. After it, under the
+      same L0 hold, the stage records B's ranges once, from the one admitted plan (the candidate
+      the loop staged), for each device in that plan; a device absent from it records nothing.
+      Each `(txn, term, device)` key keeps replace semantics, so a re-staged candidate cannot
+      hold its room twice. 23mk's records use the same rule;
     - **The range bytes are the draws' own bytes (rulings §M12 I-2).** The inventory carries
       `ggml_nbytes` (`llama-model.cpp:604-611`), but a SYCL<n> draw is larger:
       `ggml_backend_sycl_buffer_type_get_alloc_size` adds a row of padding to every quantized
@@ -1659,32 +1726,62 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       `get_max_size` and the largest padded tensor; the early inventory's tensor order is not
       the order ggml-alloc walks, so the count is bounded, not replayed); plus, for the
       host-extra tensors staged to that device, by the preload or lazily after the commit, the
-      byte function their staging allocation calls for the tensor's materialized layout. The
-      draws are then at most the range. What is undrawn at the commit, the lazy tensors' room
-      plus at most the rounding bound, passes to `{MODEL, id}` with the `WEIGHT` retag (§2.3.3
-      A4 step 3; rulings §X9 I-D), where the lazy materializations draw it and the model's
-      unload clears it; with no lazy tensor, the leftover is at most the rounding bound. H7ap
-      asserts both, on a padded-`ne0` fixture;
-    - **The late stage consumes the admitted plan by its identity.** The
-      `ggml_sycl_set_tensor_inventory_impl` branch (`:16826`) no longer re-packs placement
-      against a live budget (it reads `compute_vram_budget_for_plan`'s free memory today). It
-      derives only what the late inventory adds (layer streaming, which needs
-      `g_sycl_host_weight_extras` from `create_tensor`, and the host-zone provisioning it
-      already runs "synchronous before the loader allocates weight buffers") against the
-      admitted placement. **The comparison is over the late inventory's subset (§M12 m-8):**
-      llama leaves every tensor whose buffer type is not SYCL-backed (the `CPU_REPACK` of a
-      host-tiered layer) out of the late inventory (`llama-model.cpp:2428-2432`), so only
-      the tensors in the late inventory are compared, and a tensor absent from it is
-      consistent if and only if the admitted plan put it on the host. If a present tensor's
-      device or tier differs, or an absent tensor was admitted to a device, the stage refuses
-      the load by name (`[LOAD-PLAN] the late inventory changes the placement admitted at
-      the early stage`, naming the first tensor and both placements). **The zones are
-      compared too (§M12 C-1):** if the late inventory's zone demands exceed the admitted
-      ones, the stage refuses by name (`[LOAD-PLAN] the late inventory changes the zones
-      admitted at the early stage`, naming the zone and both sizes), and never rebuilds; a
-      demand no larger than the admitted one rebuilds nothing. Neither is a silent re-plan. An
-      interleaved transaction plans around B's ranges (below), so it cannot cause either
-      refusal.
+      byte function their staging allocation calls for the tensor's materialized layout; **plus
+      every same-device extra copy in the plan's own copy list (rulings §M14 I-1)**: the MoE PP
+      `alternate_layouts` and the dense oneDNN WOQ `extra_layouts` (`add_dense_woq_alternates`,
+      `unified-cache.cpp:28369`, charged against the plan's `remaining`), each at the `dst_size`
+      its staging call uses (the expert alternates, `unified_cache_direct_stage_expert` at
+      `ggml-sycl.cpp:34570-34600`; the dense WOQ copies, `:33586-33595`). PLACE-4 already counts
+      them as device bytes (`:16390-16410`), and 1oxa charges them (1oxa `b0a7ffb` :1036-1037),
+      so the plan's copy list is the one source for all three. Their draws are
+      `allocate_within({LOAD, txn}, WEIGHT, ..., consume = true)` draws, under `{MODEL, id}`
+      after the commit. Every copy the plan counts on a device is admitted, the optional ones
+      included; the plan never counts a copy the admission does not hold. The draws are then at
+      most the range. What is undrawn at the commit, the lazy tensors' room plus at most the
+      rounding bound, passes to `{MODEL, id}` with the `WEIGHT` retag (§2.3.3 A4 step 3; rulings
+      §X9 I-D), where the lazy materializations draw it and the model's unload clears it; with
+      no lazy tensor, the leftover is at most the rounding bound. H7ap asserts both, on a
+      padded-`ne0` fixture;
+    - **The late stage consumes the admitted plan by its identity and compares; it never ensures
+      (rulings §M14 C-1, §Z13.1; r12 m-6).** The `ggml_sycl_set_tensor_inventory_impl` branch
+      (`:16826`) no longer re-packs placement against a live budget (it reads
+      `compute_vram_budget_for_plan`'s free memory today). It derives only what the late
+      inventory adds (layer streaming, which needs `g_sycl_host_weight_extras` from
+      `create_tensor`, and the host-zone provisioning it already runs "synchronous before the
+      loader allocates weight buffers") against the admitted placement. It recomputes the zone
+      demands with the early stage's demand function (step 1 above) and compares each term with
+      its admitted value, per device, **before and instead of any ensure**, so the arena rebuild
+      and its `[SYCL-PLAN]` refusal cannot run at the late stage. **Equality is the invariant,
+      and the rule is one for moua and 23mk (rulings §Z13.1):** a term **larger** late than
+      admitted refuses the load by name with this design's string, which 23mk mirrors byte for
+      byte: `[LOAD-PLAN] the late inventory changes the zones admitted at the early stage: term
+      %s in zone %s on device %d, early %zu B, late %zu B (refused)` (the term slot names which
+      of a zone's terms grew, since one zone holds several terms). A term **smaller** late is
+      admitted, never refused, with 23mk's WARN, mirrored byte for byte, `[ZONE-PLAN-BUG] the
+      late inventory shrinks term %s on device %d: early %zu B, late %zu B (admitted; the early
+      reservation stands)`, once per `(load, device, term)`, and 23mk's witness counter
+      `late_term_shrink_admitted` +1 (a `GGML_SYCL_PRIVATE_TESTING` dump); the zones and ranges
+      stay as admitted. **It re-packs only if the inventory changed:** when the late inventory's
+      tensors are the admitted plan's device tensors, it consumes the plan by identity and packs
+      nothing; otherwise it packs once against the admitted zones, and the comparison below
+      decides. **The comparison is over the late inventory's subset (§M12 m-8), and that subset
+      is the early one (rulings §M14 I-2):** llama leaves every tensor whose buffer type is not
+      SYCL-backed out of the late inventory (`llama-model.cpp:680-684`). The early inventory is
+      every weight (`ml.weights_map`, `:638-640`) under an envelope with no `-ngl` and no
+      overrides (`:235-242`), while `create_tensor` honours a `-ot` override ahead of the plan
+      and gives a partial-`-ngl` layer the CPU buffer list (`llama-model-loader.cpp:1316-1392`);
+      `--cpu-moe` and `-ncmoe` are internal `-ot` overrides. So each early inventory entry
+      carries a `forced_off_sycl` flag from **one** function that `create_tensor` also calls for
+      its choice, `llama_model_loader::weight_forced_off_sycl(name, layer)`: true when an
+      override matches the name with a non-SYCL buffer type, or the tensor's layer list does not
+      start on a SYCL device. The early plan puts a forced tensor on the host and records no
+      range for it; there is no late shrink, and the user's placement stands (P3). So a tensor
+      absent from the late inventory is consistent if and only if the admitted plan put it on
+      the host. If a present tensor's device or tier differs, or an absent tensor was admitted
+      to a device, the stage refuses the load by name (`[LOAD-PLAN] the late inventory changes
+      the placement admitted at the early stage`, naming the first tensor and both placements).
+      Neither refusal is a silent re-plan. An interleaved transaction plans around B's ranges
+      (below), so it cannot cause either.
     - **"B's own" is defined by identity (rulings §M9 I-4).** An allocation is B's own when
       its request carries the owner `{LOAD, B's LoadTxnId}` (§2.3.3 A1, 23mk's addition to the
       primitive), which the caller fills for B's planned draws only: on the loading thread from
@@ -1715,17 +1812,19 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       scheduler's compute buffers included, is allocated outside a bound load and keeps the
       chain. 7.10 said the buffers "draw from B's ranges" without saying where in that chain,
       which left three readings open (r10 I-C).
-    - **Each planned byte is drawn once, because the tensor sets are disjoint (rulings §M11
-      I-C).** A device weight tensor is in exactly one of two sets: the tensors `create_tensor`
+    - **Each planned `(tensor, layout)` is drawn once (rulings §M11 I-C, §M14 I-1).** A device
+      weight tensor's **primary** is in exactly one of two sets: the tensors `create_tensor`
       gave a SYCL<n> buffer type, which the SYCL<n> weight buffers back, and the host-extra
       tensors (`g_sycl_host_weight_extras`), which the preload stages to the device. A tensor
-      has one buffer, so the sets do not overlap, and the ranges hold the plan's per-device
-      count once. The preload's early return (`:33526-33528`) matters only when weights are
-      not evictable; in the default evictable mode (`ggml_backend_sycl_weights_evictable`,
-      `:13591`) the preload runs and iterates the host-extra set. 7.10 attributed the
-      disjointness to that early return, which is the wrong invariant. H7ap asserts, in both
-      weight modes, that the draws cover each planned tensor once, total at most the ranges
-      and leave at most the rounding bound (above), and that no tensor is drawn twice.
+      has one buffer, so the sets do not overlap. A planned extra copy (above) is a second draw
+      of the same tensor in another layout, and it too is drawn once. So the ranges hold the
+      plan's per-device `(tensor, layout)` count once. The preload's early return
+      (`:33526-33528`) matters only when weights are not evictable; in the default evictable
+      mode (`ggml_backend_sycl_weights_evictable`, `:13591`) the preload runs and iterates the
+      host-extra set. 7.10 attributed the disjointness to that early return, which is the wrong
+      invariant. H7ap asserts, in both weight modes, that the draws cover each planned `(tensor,
+      layout)` once, total at most the ranges and leave at most the rounding bound (above), and
+      that no `(tensor, layout)` is drawn twice.
     - **The compute arena: no range on an arena device (rulings §M11 I-B).** `load_end`'s
       load-exit effects reserve a compute arena per managed device (512 MB by default,
       `GGML_SYCL_COMPUTE_ARENA_MB`; `:12455-12474`) before the preload, and abort on failure
@@ -1736,37 +1835,52 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       SCRATCH zone is the hold**, and 7.10's "range of B's own" was a phantom that no draw would
       ever consume (r10 I-B). The early stage checks `zone_capacity(SCRATCH) >= arena_bytes`
       arithmetically, records no range, and refuses the load by name when it fails
-      (`[COMPUTE-ARENA] the model-load compute scratch (%zu MB) exceeds the SCRATCH zone
-      (%zu MB)`). On a non-arena device the reserve is the real `COMPUTE` allocation it is on
-      master (`:20757-20790`), drawn at `load_end` from no range, since non-arena devices have
-      none. **One accessor, and a channel for the refusal (§M12 m-10).** `arena_bytes` is read
-      today at `ggml-sycl.cpp:12455-12462` and `unified-cache.cpp:4353-4357`; both, and the
-      early check, call one accessor, `ggml_sycl_compute_arena_bytes()`. At `load_end` the
-      reserve's `GGML_ABORT` (`:12470`) becomes a named refusal, and
-      `ggml_sycl_model_loading_effects`, which is `void` today (`:12410`), returns `bool`. The
-      reserve runs before the preload inside it, so a refusal returns before the preload runs.
-      `load_end` treats a `false` return like `!ticket.commit`: it takes the not-committed
-      exit (`ggml_sycl_abort_owner_effects_noexcept(ticket.token,
-      "load_end/exit-effects-refused")`, then `finalize_end(ticket, false)`), so the rollback
-      clear below runs. On an arena device the early check makes that refusal unreachable
-      unless the zones changed, which C-1 forbids; on a non-arena device it is the real
-      allocation's failure.
+      (`[COMPUTE-ARENA] the model-load compute scratch (%zu MB) exceeds the SCRATCH zone (%zu
+      MB)`). On a non-arena device the reserve is the real `COMPUTE` allocation it is on master
+      (`:20757-20790`), drawn at `load_end` from no range, since non-arena devices have none.
+      **One accessor, and a channel for the refusal (§M12 m-10).** `arena_bytes` is read today
+      at `ggml-sycl.cpp:12455-12462` and `unified-cache.cpp:4353-4357`; both, and the early
+      check, call one accessor, `ggml_sycl_compute_arena_bytes()`. At `load_end` the reserve's
+      `GGML_ABORT` (`:12470`) becomes a named refusal, and `ggml_sycl_model_loading_effects`,
+      which is `void` today (`:12411`), returns `bool`. The reserve runs before the preload
+      inside it, so a refusal returns before the preload runs. On a `false` return `load_end`
+      calls `ggml_sycl_abort_owner_effects_noexcept(ticket.token,
+      "load_end/exit-effects-refused")` and then `finalize_end(ticket, false)`, so the rollback
+      clear below runs. It does **not** reuse the not-committed branch (r12 m-1):
+      `ticket.commit` is true on this path, and that branch's `finalize_end(ticket, cleanup_ok)`
+      computes `commit = ticket.commit && effects_ok` (`model-lifecycle.cpp:660`), so with
+      `cleanup_ok` true the model would go LIVE with no publication and no preload.
+      `finalize_end(ticket, false)` marks it `QUARANTINED` with `EFFECT_FAILED` (`:697`), and
+      the reaper re-runs the teardown. On an arena device the early check makes that refusal
+      unreachable unless the zones changed, which C-1 forbids; on a non-arena device it is the
+      real allocation's failure.
     - **Lifetime: the commit steps run only once the commit is irrevocable (rulings §M12 I-1).**
       Each range is trimmed as it is consumed. The retags and the clear (§2.3.3 A4) run in
       `load_end` **after `registry->finalize_end` returns `committed` and not
-      `cleanup_required`** (`:13206-13219`), still under `load_end`'s L0 hold. Placed any
-      earlier, a failed validation or a cleanup-required commit would leave B's `MODEL_TERM` and
-      `WEIGHT` ranges under `{MODEL, id}` for a model that never becomes LIVE and never unloads
-      (r11 I-1). **The rollback clear is one function,
-      `ggml_sycl_load_pending_rollback_noexcept(lifecycle::LoadTxnId txn)`**, this design's
-      name, which 23mk mirrors (rulings §M13a): `clear_pending({LOAD, txn}, PENDING_TERM_ALL)`
-      on every device, then 23mk's `onednn_w_rollback_pending`, idempotent and non-throwing.
-      `ggml_sycl_abort_owner_effects_noexcept` (`:12675`) calls it with `owner.load`, beside its
-      placement-plan abort, **before or together with 1oxa's T13 chunk destroy** (rulings §X9
-      I-D, §M13): a range's offsets name a place in a chunk, so no range may outlive its chunk.
-      Every non-commit exit reaches it (23mk's design states the same):
-      - not committed (`:13124-13135`, `"load_end/not-committed"`), which also carries the
-        exit-effects refusal above;
+      `cleanup_required`** (`:13206-13219`), still under `load_end`'s L0 hold, **as the first
+      statements of `if (result.committed)` (`:13219`), and `noexcept` (r12 m-2)**: a retag
+      changes the owner field of existing records in place under the group mutex and allocates
+      nothing, and a failure to take the mutex aborts with a named message, as the guard's does.
+      Placed after `moe_discovery_activate_retrying` or the export, or able to throw, it would
+      let an exception reach the `:13253` rollback, whose `PENDING_TERM_ALL` clear would drop
+      the un-retagged ranges of a model already LIVE. Placed any earlier, a failed validation or
+      a cleanup-required commit would leave B's `MODEL_TERM` and `WEIGHT` ranges under `{MODEL,
+      id}` for a model that never becomes LIVE and never unloads (r11 I-1). **The rollback clear
+      is one function, `ggml_sycl_load_pending_rollback_noexcept(lifecycle::LoadTxnId txn)`**,
+      this design's name, which 23mk mirrors (rulings §M13a): `clear_pending({LOAD, txn},
+      PENDING_TERM_ALL)` on every device, then 23mk's `onednn_w_rollback_pending`, idempotent
+      and non-throwing. It takes the `LoadTxnId` and resolves the model through the transaction
+      (rulings §M14 m-3): the Registry's `txns_` record (`model-lifecycle.hpp:434`) holds the
+      transaction's `ModelToken`, read by a new `noexcept` accessor,
+      `Registry::token_for_txn(txn)`, and 23mk's `onednn_w_rollback_pending` takes that token's
+      model (23mk adapts). So W's rollback has two idempotent call sites, the hook and the
+      validate-failed exit. `ggml_sycl_abort_owner_effects_noexcept` (`:12675`) calls it with
+      `owner.load`, beside its placement-plan abort, **before or together with 1oxa's T13 chunk
+      destroy** (rulings §X9 I-D, §M13): a range's offsets name a place in a chunk, so no range
+      may outlive its chunk. Every non-commit exit reaches it (23mk's design states the same):
+      - not committed (`:13124-13135`, `"load_end/not-committed"`);
+      - the exit-effects refusal above, through its own abort call and `finalize_end(ticket,
+        false)` (r12 m-1), not through the not-committed branch;
       - validation failed (`:13137-13148`). That exit calls the hook only when
         `pending.cleanup_required`; since a recorded range is an owner effect, the exit also
         calls `ggml_sycl_load_pending_rollback_noexcept(txn)` **unconditionally** (23mk mirrors
@@ -1839,7 +1953,10 @@ L0, and a failed revalidation under L0 is a bug, not a race.
   `ggml_sycl_materialize_moe_tensor_planned_layout` in the tree). Row 648 already cites
   `ggml-sycl.cpp:56194` while the function sits at `:60062` on master, so the row is stale-lined
   today and `--check` fails on master. Both belong to llama.cpp-ldvb, which owns the CSV
-  (rulings §M13), and the regeneration removes the row either way.
+  (rulings §M13). **So the regeneration clause is armed only when `--check` passes on this
+  design's base (r12 m-15)**, that is, after ldvb's fix lands, as zhcn arms its own (zhcn
+  `8a58ad4`); on a base where `--check` fails, this design leaves the CSV to ldvb, rewrites none
+  of its rows, and the witness is the absence assertion alone.
 
   The three live sites instead call
   **`ggml_sycl_republish_current_plan_into_empty(cache, owner)`**, never the full helper (zhcn
@@ -2018,14 +2135,16 @@ current tenant slots stay with their owners until step 8. So on any return other
 committed publish (a `refuse()`, a `[CONTEXT-PLAN-BUG]` return, or an exception, from any step;
 there is no `busy()` under L0), the destructor
 rolls back in two phases, and never has to re-acquire room:
-1. **Metadata, with one leaf-class lock at a time.** Clear this call's pending ranges on each
-   TLSF, under that TLSF's group mutex (L5, taken alone), with `clear_pending_locked(tlsf,
-   {CONTEXT, id}, REGION)` (§2.3.3). Retire this call's step-7 MMID entry, if any. Discard the
-   pending registry insert (local state). Then, under the ring record's lock (L5, taken alone,
-   never nested with the group mutex): remove this call's tentative contribution if step 8
-   recorded one, clear `RELEASING` if this call set it, and bump `ring_plan_gen` for either (r5
-   I-A(d)). This phase needs no L1: revision 5 re-took L1 only to restore the ring, and there is
-   no restore any more.
+1. **Metadata, with one leaf-class lock at a time.** Clear this call's pending ranges with
+   `clear_pending({CONTEXT, id}, REGION)` on each device it recorded on, which takes each TLSF's
+   group mutex itself, alone (L5; §2.3.3). This is the guard's one clear form (r12 m-8);
+   `clear_pending_locked` is only for a caller already inside a group-mutex section, which phase
+   1 is not. Retire this call's step-7 MMID entry, if any. Discard the pending registry insert
+   (local state). Then, under the ring record's lock (L5, taken alone, never nested with the
+   group mutex): remove this call's tentative contribution if step 8 recorded one, clear
+   `RELEASING` if this call set it, and bump `ring_plan_gen` for either (r5 I-A(d)). This phase
+   needs no L1: revision 5 re-took L1 only to restore the ring, and there is no restore any
+   more.
 2. **With no lock held.** Drop this call's new handles, the ring-handle copies, the unused
    pre-minted controls, and on a commit the superseded handles, so each `zone_free` runs
    lock-clean. Then take the ring record's lock alone and decrement `pinned[slot]` for each copy
@@ -2168,6 +2287,15 @@ prompt-processing performance, never correctness, and the yield WARN names them.
    - A WEIGHT request that fits **only** inside a pending range gets the zone miss it would get
      a moment later, once the range is carved. That is the post-commit state, so this adds no
      new behaviour class.
+   - **23mk's A step sits here, between the recording and the yield (rulings §M14 I-3).** Its
+     fit reads RUNTIME's free bytes less `pending_bytes_excluding(dev, RUNTIME, {CONTEXT, id},
+     ONEDNN_PP_A)`, so this call's `REGION` ranges, the MMID device pool among them, count as
+     taken, and A's capacity refusal is a pre-yield refusal (step 4's rule). On an arena device
+     the MMID RUNTIME bytes therefore have **one** source: this call's `REGION` range here, and
+     its carved block after step 6. `runtime_pending` and 23mk's `mmid_runtime_pending_bytes`
+     are zero there, and nothing subtracts them a second time. This holds from moua L4 until
+     beni makes A a head slot of step 2's fit (23mk "Under moua"), after which A has no fit of
+     its own.
    - Then the yield, as jehw HEAD runs it (jehw `:17873-17915`), with one change: the picks are
      the fit's strict prefix plus the buried tenants it chose, passed as an explicit pick list
      through **llama.cpp-uwlx** (owner impl-jehw, after jehw lands; proposed by impl-1oxa):
@@ -2190,7 +2318,7 @@ prompt-processing performance, never correctness, and the yield WARN names them.
 6. **Commit the carve (r2 N-I7; r4 I8, m3).**
    - **Re-fit only inside this call's own pending ranges.** Re-snapshot, and re-run
      `kv_region_fit` with `forced_host` and `own_ranges` = this call's `REGION` ranges
-     (never 23mk's holds of the same context, rulings §M11a), as the only room
+     (never 23mk's holds of the same context, rulings §Z8 I-2), as the only room
      it may place into. Nothing else can have entered them: weights exclude them, and every
      other transaction's fit treats them as allocated. So the only change the re-fit can see is
      a **shortfall**: a pick that was not retired (jehw's retire re-check, `:7804-7811`) or whose
@@ -4587,7 +4715,7 @@ L7 documents this limit, and pattern #2 remains the remedy.
         carve; no abort is expected at gate 1. RED: 7.7a's held-any exemption, under which the
         WARN is silent;
       - **negative (b), gallocr's ALLOC is not exempt (I-5(b); §M11 m-4, m-5; §M12 m-11;
-        §Z9a):** the vehicle is zhcn's H4h (zhcn f6218f3 §3.1, §3.3), adopted as is:
+        §Z9a):** the vehicle is zhcn's H4h (zhcn `4f8ff34`), adopted as is:
         `sched_reserve_impl`'s own growth path, MEASURE → coverage GROWTH → scope → steps 3-6 →
         scope closed → ALLOC, not the resync, which zhcn deletes (zhcn :293). The arm reaches it
         by two routes: a ladder rung, and a **growing** setter's next decode
@@ -4595,8 +4723,12 @@ L7 documents this limit, and pattern #2 remains the remedy.
         void. `memory_update` is not a route: it calls `graph_reserve` directly
         (`llama-context.cpp:2211`) and never opens a scope, so its post-update reserve is ALLOC
         only. The arm follows §Z9a's six points, through **zhcn's named
-        `GGML_SYCL_PRIVATE_TESTING` hooks, at zhcn head `8a58ad4`** (zhcn rev 5.8, H4h; rulings
-        §M13; this design defines no hooks of its own):
+        `GGML_SYCL_PRIVATE_TESTING` hooks, at zhcn head `4f8ff34`** (zhcn rev 5.9, H4h; the
+        names are `8a58ad4`'s, unchanged; this design defines no hooks of its own), **on zhcn's
+        vehicle target, `test-sycl-growth-fallback-vehicle`** (rulings §Z12 I-3): its link line
+        is exactly `llama-private-test-objects` + `ggml-sycl-private-fixtures`, so there is one
+        backend copy, and under `GGML_BACKEND_DL=ON` it is a disabled placeholder that exits 77,
+        which is a skip, never a pass:
         1. the fallback is reached through zhcn's forcing hook,
            `ggml_sycl_test_host_fallback_scope` (thread-local RAII). Its safe-max override,
            `ggml_sycl_test_override_safe_max_alloc_size(1 MiB)`, makes the real `alloc_buffer`
@@ -4617,15 +4749,20 @@ L7 documents this limit, and pattern #2 remains the remedy.
         6. the setup is a real `llama_context` on a SYCL backend on the CPU device, with a mock
            plan whose caps lie below the candidate, and the route is a ladder rung or a growing
            setter (embeddings on, or a backend-sampler chain added). zhcn's coverage-query
-           last-answer accessor must read GROWTH, or the run is void.
+           last-answer accessor must read GROWTH, or the run is void. **The phase is PP or TG at
+           the fallback (r12 m-9):** the phase gate fires only then (`pinned-pool.cpp:630-632`),
+           and a fresh load leaves it `UNKNOWN` (`ggml-sycl.cpp:12450`), so zhcn forces it to TG
+           with `offload_stats_set_phase` before ALLOC, and the probe reports the phase beside
+           `held` (relayed to zhcn); a phase other than PP or TG voids the run.
         Controls: positive, the correct tree, which dies with the phase message and probe 0;
         mutant, a scope left open across ALLOC, run with `GGML_SYCL_WITNESS_CHECKS=0` so the
         path reaches the fallback: the gate exempts it, nothing dies, the probe reads 1, and the
-        arm reports FAIL; void, a run where the coverage accessor did not read GROWTH or either
-        counter read 0, reported as void, never as a pass. A companion arm runs the same mutant
-        with the witness checks on and expects the alloc-entry check's own message
-        (`[REPLAN-TOKEN] TRANSACTION token held at alloc_buffer entry`), not the phase message,
-        so the two deaths are told apart by message;
+        arm reports FAIL; void, a run where the coverage accessor did not read GROWTH, either
+        counter read 0 or the phase was not PP or TG, reported as void, never as a pass. A
+        companion arm runs the same mutant with `GGML_SYCL_WITNESS_CHECKS=1` set explicitly and
+        expects the alloc-entry check's own message (`[REPLAN-TOKEN] TRANSACTION token held at
+        alloc_buffer entry`), not the phase message, so the two deaths are told apart by
+        message;
       - **the tree each runs on:** both arms run on the landing tree, moua L4-L6 over zhcn
         (the landing order in §4), where the resync is gone and zhcn's in-`sched_reserve`
         scope exists; arm (b) also runs zhcn's scope as the open-scope RED. Neither depends on
@@ -4864,8 +5001,9 @@ L7 documents this limit, and pattern #2 remains the remedy.
     `ggml_sycl_global_plan_snapshot()` read; **no exported entry reaches the transaction body
     except the wrapper, and the wrapper passes the snapshot it selected per model** (rulings §M9
     I-1); `ggml_backend_sycl_set_runtime_context` is not exported; the three orphaned publishers
-    are gone, `compute_placement_plan_early` is static, and the dead `nullptr` publish at
-    `:14773` is gone (r9 m-2, m-3); and no per-device re-plan mutex exists. Mutation witnesses:
+    are gone, `compute_placement_plan_early`'s body is a static impl behind its public entry,
+    and the dead `nullptr` publish at `:14773` is gone (r9 m-2, m-3); and no per-device re-plan
+    mutex exists. Mutation witnesses:
     **an unlisted exported entry that reaches the CAS** (a new exported function calling the
     transaction body, which the reachability walk must find although no list names it), a
     publisher call site without a token, `ggml_backend_sycl_set_runtime_context` restored as an
@@ -4999,35 +5137,52 @@ L7 documents this limit, and pattern #2 remains the remedy.
     - **a late placement change is refused:** a modelled late inventory that moves one tensor to
       another device or tier gets the named refusal ("the late inventory changes the placement
       admitted at the early stage"), and nothing is re-planned;
-    - **the late inventory is a subset (§M12 m-8):** a model with a host-tiered layer whose
-      tensors are `CPU_REPACK` and absent from the late inventory
-      (`llama-model.cpp:2428-2432`) loads with no refusal; the same absence for a tensor the
-      admitted plan put on a device is the named refusal. Witness: a comparison that reads an
-      absent tensor as a tier change, which refuses the host-tiered model;
-    - **the zones come from the plan (§M12 C-1):** an MoE fixture whose early plan records
-      `moe_control > 0` loads with no `Rebuilding unused early arena` line after B's ranges
-      exist, every SYCL<n> draw inside B's range, and zero `[ZONE-PLAN-BUG]`. A second fixture
-      replays master's real late-rebuild shape, GPT-OSS 120B's `moe_control` = 0.1 MB with
-      the runtime zone at 1617.9 MB after the early stage (`merge-gates/gptoss120b-b1.log:184`,
-      `:1544-1545`), and expects the early stage to size runtime to 1618.0 MB at once and the
-      late stage to rebuild nothing. Positive control: those master log lines, which show the
-      late rebuild. RED: master's order (zones before the plan), under which the late stage
-      rebuilds and B's ranges are gone;
-    - **a late zone change is refused, and a rebuild never meets a range (§M12 C-1; §Z8 I-3):**
-      a modelled late inventory whose zone demand exceeds the admitted one gets the named
-      refusal ("the late inventory changes the zones admitted at the early stage") and no
-      rebuild; and `ensure_planned_arena_zones` called with a pending range on the device
-      refuses with 23mk's `[SYCL-PLAN] model load refused` message (rulings §M13a) and leaves
-      the range whole, with zero aborts (the `:16215` abort is not reached). The same arm runs
-      23mk's sequence: a smaller load, its unload, then a larger load, with zero aborts.
-      Witnesses: the live check without pending ranges (the rebuild destroys the range), and the
-      `:16215` abort restored;
+    - **the late inventory is a subset, and user placement is in the early one (§M12 m-8;
+      rulings §M14 I-2):** a model with a host-tiered layer whose tensors are `CPU_REPACK` and
+      absent from the late inventory (`llama-model.cpp:680-684`) loads with no refusal; so do
+      three user-placement fixtures, `-ot <pat>=CPU`, `-ncmoe` and a partial `-ngl`, and in each
+      B's `WEIGHT` range excludes the forced tensors' bytes. The same absence for a tensor the
+      admitted plan put on a device is the named refusal. Witnesses: a comparison that reads an
+      absent tensor as a tier change (it refuses the host-tiered model), and 7.12a's early
+      inventory without `forced_off_sycl` (it refuses all three user-placement fixtures);
+    - **the zones come from the demands, before the pack (rulings §M14 C-1):** positive cases
+      from the merge-gate logs. GPT-OSS 120B on the B50 (initial runtime zone 512 MB, the
+      pre-plan `moe_onednn` demand 1617.9 MB, the in-plan `moe_control` 0.1 MB;
+      `merge-gates/gptoss120b-b1.log:57`, `:184`, `:191`, `:261`): the early stage ensures
+      RUNTIME to 1618.0 MB before it packs, the pack's zone reservation equals the ensured
+      weight zone (12232.1 MB in the log, less the 0.1 MB `moe_control` master added late), the
+      planned device bytes are at most it, B's ranges fit, and the late stage rebuilds nothing
+      and refuses nothing. Qwen3.5-35B-A3B on the B50 (`glkg-qwen35b-a3b-b1.log:73`, `:210`,
+      `:217`, `:291`; runtime 512 to 1672 MB, weight zone 12178.0 MB) gives the same result. The
+      packed-equals-ensured witness passes in both. Positive control: master's log lines, where
+      the pre-plan ensure precedes the pack. RED: pack before ensure (7.12a's order), which
+      packs at the 13338 MB zone; its early placement refuses the load, and the witness fires;
+    - **a late term change follows §Z13.1, and a rebuild never meets a range (§M12 C-1; §Z8 I-3;
+      rulings §Z13.1; r12 m-6):** a modelled late inventory whose `moe_control` term exceeds the
+      admitted one gets exactly one `[LOAD-PLAN] the late inventory changes the zones admitted
+      at the early stage: term %s in zone %s on device %d, early %zu B, late %zu B (refused)`
+      line naming `moe_control`, its zone and both sizes; no ensure is called and no
+      `[SYCL-PLAN] model load refused` line appears. One whose term is below the admitted one is
+      admitted, with exactly one `[ZONE-PLAN-BUG] the late inventory shrinks term %s on device
+      %d: early %zu B, late %zu B (admitted; the early reservation stands)` line,
+      `late_term_shrink_admitted` at 1 and the zones unchanged; an equal term logs nothing.
+      Separately, `ensure_planned_arena_zones` called with a pending range on the device refuses
+      with 23mk's `[SYCL-PLAN] model load refused` message (rulings §M13a) and leaves the range
+      whole, with zero aborts (the `:16215` abort is not reached). The same arm runs 23mk's
+      sequence: a smaller load, its unload, then a larger load, with zero aborts. Witnesses: the
+      live check without pending ranges (the rebuild destroys the range), the `:16215` abort
+      restored, a late stage that calls the ensure (the refusal comes out as `[SYCL-PLAN]`), and
+      a late stage that refuses a smaller term;
     - **the commit is irrevocable before the retag (§M12 I-1):** a failpoint at `validate_end`
       and one at `cleanup_required` after `finalize_end`, each after the preload. After each,
       nothing is left under `{LOAD, txn}`, there is no `{MODEL, B}` range, and the `{DEVICE}`
       range count is unchanged. The exit-effects refusal (m-10) and an exception take the same
-      path. RED: the retags placed before `validate_end` (the `{MODEL, B}` range survives a
-      model that never became LIVE);
+      path; after the exit-effects refusal the model is not LIVE and its code is `EFFECT_FAILED`
+      (r12 m-1), and a mutant that reuses the not-committed branch with `cleanup_ok` true,
+      making the model LIVE, is that case's RED. A failpoint that throws inside `if
+      (result.committed)` after the retags leaves B's `{MODEL, B}` ranges whole (r12 m-2). RED:
+      the retags placed before `validate_end` (the `{MODEL, B}` range survives a model that
+      never became LIVE);
     - **the range bytes are the draws' bytes (§M12 I-2):** a quantized fixture with `ne0` =
       2880 (GPT-OSS's `n_embd`; 2880 % 512 = 320, so each row carries padding) and a buffer
       split at `get_max_size`: every draw lands inside B's range, the draws total at most the
@@ -5038,9 +5193,23 @@ L7 documents this limit, and pattern #2 remains the remedy.
       buffer's offset lies inside a `{LOAD, txn}` `WEIGHT` range, and the RUNTIME zone's used
       bytes do not move; a buffer larger than B's remaining range gets the named
       `[ZONE-PLAN-BUG]` refusal and a null buffer, never a RUNTIME allocation;
-    - **each byte once:** in both weight modes the draws on B's ranges cover the plan's
-      per-device tensors once each, total at most the ranges, and leave at most the rounding
-      bound; the SYCL<n> buffer tensors and `g_sycl_host_weight_extras` are disjoint sets;
+    - **each `(tensor, layout)` once (rulings §M14 I-1):** in both weight modes the draws on B's
+      ranges cover the plan's per-device `(tensor, layout)` pairs once each, total at most the
+      ranges, and leave at most the rounding bound; the SYCL<n> buffer tensors and
+      `g_sycl_host_weight_extras` are disjoint sets. A WOQ and MoE-alternate fixture
+      (Qwen1.5-MoE Q4_0's shape, 169 WOQ copies) with a transaction interleaved between the
+      stages gives zero `dense_woq_planned_declined`, zero declined alternates and zero
+      `[ZONE-PLAN-BUG]`. RED: a range of the primaries alone, under which the copies miss or the
+      interleaved transaction takes their room;
+    - **one recording, from the admitted plan (r12 m-4):** on a two-device host without
+      `moe_multi_gpu_requested`, B's ranges are recorded once, after the stage's loop, and only
+      for the devices in the admitted plan. RED: recording inside the loop, which leaves device
+      0 a range from a plan that was not admitted, retagged to `{MODEL, B}` at the commit and
+      never drawn;
+    - **one extent per key (r12 m-5):** with a second live model fragmenting the zone so that no
+      free extent holds B's device total, though a per-buffer placement would fit, the early
+      stage refuses with `[LOAD-PLAN] no contiguous WEIGHT extent`, by name, before any buffer
+      type is chosen; the declared limitation is exercised, not silent;
     - **the compute arena has no range (I-B):** on an arena device B's pending ranges carry no
       arena term, and a modelled `SCRATCH` capacity below `arena_bytes` gets the stage's
       named refusal, with no `GGML_ABORT` reached; on a non-arena device the arena is the real
@@ -5066,7 +5235,9 @@ L7 documents this limit, and pattern #2 remains the remedy.
     twice against `SCRATCH`, and the `SCRATCH` cap arm admits a load it must refuse); an
     unfiltered retag that moves every term (C's hold is refused, since B's `SCRATCH` hold
     survives under `{MODEL, id}`); the commit without the `WEIGHT` retag (the lazy draw misses);
-    and the `in_load` bit left set through the preload (the T2 arm reads "in load");
+    the pack before the ensure (the GPT-OSS 120B shape refuses at the early stage, and the
+    packed-equals-ensured witness fires); and the `in_load` bit left set through the preload
+    (the T2 arm reads "in load");
   - (aq) **one fit computation (rulings §M8 I-5(c)).** On the arena path the MMID re-plan's
     `BUDGET_EXCEEDED` demotion is unreachable, and (0) and (ii) call the same sizing-then-fit
     function. Mutation witnesses: the demotion restored on the arena path, and a (0) that skips
@@ -5195,13 +5366,13 @@ L7 documents this limit, and pattern #2 remains the remedy.
     activate, unload with its failure republish, the quarantine reap through
     `ggml_backend_sycl_free`, shutdown, `load_begin`, `stage_inventory_plan` and `load_end`.
     Each blocks until L0 is released. (`set_runtime_context` is no longer exported,
-    `compute_placement_plan_early` publishes nothing and is static, and `test_hold_live_update`
-    is test-only with no L0.) RED, with its precondition stated (r9 m-10): **model B publishes
-    last**, so the publication names B; then 7.6's list, under which an exported
-    `set_runtime_context` called on a second thread for A's backend publishes inside A's yield
-    window, and A's relock reports `[CONTEXT-PLAN-BUG]`. Without that precondition the RED is
-    void: if the publication names A, the second thread's `acquire_live_update` (`:17879`)
-    meets A's outstanding ticket, returns `BUSY`, and never publishes.
+    `compute_placement_plan_early` publishes nothing (its body is a static impl), and
+    `test_hold_live_update` is test-only with no L0.) RED, with its precondition stated (r9
+    m-10): **model B publishes last**, so the publication names B; then 7.6's list, under which
+    an exported `set_runtime_context` called on a second thread for A's backend publishes inside
+    A's yield window, and A's relock reports `[CONTEXT-PLAN-BUG]`. Without that precondition the
+    RED is void: if the publication names A, the second thread's `acquire_live_update`
+    (`:17879`) meets A's outstanding ticket, returns `BUSY`, and never publishes.
   - **The allowlisted republish against a concurrent L0 committer (rulings §ZR5 I-3; zhcn 5.4
     row 30).** One thread loops `ggml_sycl_republish_current_plan_into_empty(cache, owner)` on
     an emptied cache while another commits legal L0 transactions that change the publication.
@@ -5453,7 +5624,8 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
   as per-kind contributions with a component-wise max (r8 m-8; H8).
 - **L6:** the transaction body taking the per-model snapshot (§M8 I-2); the token at the top of
   `shutdown`, `stage_inventory_plan` and the other entries of §2.4.2's list (revision 7.9 took
-  `set_runtime_context` out of the exported set, made `compute_placement_plan_early` static,
+  `set_runtime_context` out of the exported set, moved `compute_placement_plan_early`'s body
+  into a static impl (7.13),
   and left `test_hold_live_update` test-only with no L0; rulings §M9 I-1, m-2, m-4); the
   deletion of the three orphaned publishers and the re-anchoring of
   the gates that name them (§M8 I-1; H7ai); the three live decode sites switched to
@@ -5492,16 +5664,16 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
   counting pending ranges as live and refusing by name, with `arena_destroy` and the rebuild
   on §2.3.4's refusal list (C-1; H7ap); the MMID registry's non-accepting step-7 entry,
   flipped at the CAS (I-3; H7am); `recover(wait = false)` at context destruction (m-6).
-- **L6:** `compute_and_store_plan_for_inventory` computing the plan before it ensures the
-  zones, in both stages, the late zone comparison and the `:16215` abort made a named
-  refusal (C-1; H7ap); the retags only after an irrevocable commit, and the rollback clear in
-  `ggml_sycl_abort_owner_effects_noexcept` (I-1; H7ap); `ggml_sycl_weight_alloc_bytes`
-  shared by `get_alloc_size` and the stage, and the range bound (I-2; H7ap); the late
-  comparison over the late inventory's subset (m-8); one `ggml_sycl_compute_arena_bytes()`
-  accessor and `ggml_sycl_model_loading_effects` returning `bool` (m-10); the step-7 binding
-  through `g_execution_backend_bindings` (m-13; H7am); every witness check as
-  `GGML_SYCL_WITNESS` (§Z9 I-3); the `can_unload` arm's parked-unload handshake (m-5; H9);
-  H4 (b) on zhcn's H4h hooks (§Z9a, m-11); and `scripts/audit-sycl-static-storage.py
+- **L6:** `compute_and_store_plan_for_inventory` computing the plan before it ensures the zones
+  (7.12's order, which 7.13 reverses, below), in both stages, the late zone comparison and the
+  `:16215` abort made a named refusal (C-1; H7ap); the retags only after an irrevocable commit,
+  and the rollback clear in `ggml_sycl_abort_owner_effects_noexcept` (I-1; H7ap);
+  `ggml_sycl_weight_alloc_bytes` shared by `get_alloc_size` and the stage, and the range bound
+  (I-2; H7ap); the late comparison over the late inventory's subset (m-8); one
+  `ggml_sycl_compute_arena_bytes()` accessor and `ggml_sycl_model_loading_effects` returning
+  `bool` (m-10); the step-7 binding through `g_execution_backend_bindings` (m-13; H7am); every
+  witness check as `GGML_SYCL_WITNESS` (§Z9 I-3); the `can_unload` arm's parked-unload handshake
+  (m-5; H9); H4 (b) on zhcn's H4h hooks (§Z9a, m-11); and `scripts/audit-sycl-static-storage.py
   --check` with an absence assertion as the §M10 witness (m-7).
 
 **Revision 7.12a's additions to the rows (rulings §M13, §M13a).**
@@ -5515,6 +5687,22 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
   unconditionally by the validate-failed exit; 23mk's `[SYCL-PLAN] model load refused` message,
   with `compute_and_store_plan_for_inventory` returning `bool` (C-1; H7ap); and H4 (b) on zhcn
   `8a58ad4`'s hooks.
+
+**Revision 7.13's additions to the rows (r12; rulings §M14, §Z13.1).**
+- **L4:** `ensure_planned_arena_zones`' named refusal arguments (m-7); the guard's one clear
+  form (m-8); `retag_pending` as `noexcept` (m-2); and the eviction re-record of a planned
+  weight's block (m-11).
+- **L6:** the demand-ensure-pack order with the packed-equals-ensured witness, and the late
+  stage's per-term comparison under §Z13.1 with its two strings and counter (C-1; H7ap); the
+  extra copies in B's `WEIGHT` range (I-1; H7ap); `weight_forced_off_sycl`, shared by
+  `create_tensor` and the early inventory (I-2; H7ap); one MMID RUNTIME source on arena devices,
+  with 23mk's A step between step 5's recording and the yield (I-3; H1); the exit-effects
+  refusal through `finalize_end(ticket, false)` (m-1); the retags first in `if
+  (result.committed)` (m-2); `Registry::token_for_txn` for the rollback (m-3); the recording
+  after the device loop (m-4); the one-extent refusal (m-5); the unload clear first in teardown
+  (m-12); `compute_placement_plan_early`'s static `bool` impl behind the public entry (m-13);
+  the audit clause armed only on a passing base (m-15); and H4 (b) on zhcn `4f8ff34`'s vehicle
+  with its phase precondition (m-9).
 
 **Landing order (lead ruling; r4 I10).** jehw lands on master first (u1bb already has). Then:
 1. moua L1-L3 (pure, host-tested; L1 is done). zhcn and beni need L3's record type,
@@ -6585,3 +6773,52 @@ the r12 review covers `c66848c26` to this head.
 - A lazy materialization after the commit fills the owner `{MODEL, id}` from its model; 1oxa's
   design names the draw site, and this design states only the owner and the term.
 - Nothing was built for 7.12a; it is a document change only.
+
+### 6.15 Revision 7.13: design-moua-r12, the rulings (§M14), and the post-r12 queue
+
+design-moua-r12 reviewed `c66848c26..7f4808729` (7.12 and 7.12a) and gave NOT READY: 1 Critical,
+3 Important, 15 Minor. The lead ruled in §M14, queued §Z13.1 and zhcn 5.9's vehicle into this
+round, and then asked for a term slot in the late refusal.
+
+| id | finding | disposition |
+|----|---------|-------------|
+| C-1 | \"plan first, then ensure\" packs against the pre-ensure zones; GPT-OSS 120B and Qwen3.5-35B-A3B are refused at the early stage | **Changed (rulings §M14 C-1).** One order in `compute_and_store_plan_for_inventory`: compute every non-weight zone demand from the inventory and context shape, ensure the zones, pack once, and witness packed == ensured; no iterative re-plan. The late stage recomputes the demands and compares them per term under §Z13.1, never ensures, and re-packs only if the inventory changed. H7ap's arm uses both merge-gate shapes as positive cases, with pack-before-ensure as its RED. One function, shared with 23mk. |
+| I-1 | the `WEIGHT` range omits the plan's same-device extra copies | **Changed (§M14 I-1).** The range adds each MoE PP alternate and dense WOQ extra layout from the plan's copy list at its staging `dst_size`; the draws are `allocate_within` draws; each `(tensor, layout)` is drawn once. H7ap WOQ/alternate arm with an interleaved transaction. |
+| I-2 | m-8's absence rule refuses loads with user placement flags | **Changed (§M14 I-2).** The early inventory carries `forced_off_sycl` from `llama_model_loader::weight_forced_off_sycl`, the function `create_tensor` also calls; forced tensors are host-placed with no range. H7ap arm with `-ot`, `-ncmoe` and a partial `-ngl`. |
+| I-3 | `pending_bytes_excluding` names a removed consumer; the MMID RUNTIME bytes are counted twice | **Changed (§M14 I-3).** The consumer is 23mk's A fit, excluding `({CONTEXT, id}, ONEDNN_PP_A)`; A's step sits between step 5's recording and the yield; on arena devices the MMID bytes have one source, and `runtime_pending` / `mmid_runtime_pending_bytes` are zero there. H1 exact-fit arm. |
+| m-1 | the exit-effects refusal's wording could commit a failed load | **Fixed.** `finalize_end(ticket, false)`: `QUARANTINED`, `EFFECT_FAILED`; H7ap asserts not LIVE. |
+| m-2 | where the retags sit, and `noexcept` | **Fixed.** The first statements of `if (result.committed)` (`:13219`), `noexcept`; H7ap throw arm. |
+| m-3 | the rollback's signature | **Fixed as ruled.** It takes the `LoadTxnId` and resolves the model through `Registry::token_for_txn`; 23mk adapts; W's rollback has two idempotent call sites. |
+| m-4 | per-iteration recording on single-device plans | **Fixed.** Recorded once, after the loop, from the admitted plan; a device absent from it records nothing. H7ap arm. |
+| m-5 | one contiguous range per key | **Declared limitation**, refused by name (`[LOAD-PLAN] no contiguous WEIGHT extent`), with an H7ap arm; a range set is the follow-up. |
+| m-6 | the order of the two late zone refusals | **Fixed.** The late stage compares and never ensures, so only `[LOAD-PLAN]` is reachable there. |
+| m-7 | the C-1 message's arguments | **Fixed and relayed** to 23mk, whose string it is: each value and its cast are named; live scratch becomes a byte sum. |
+| m-8 | two forms of the guard's phase-1 clear | **Fixed.** `clear_pending({CONTEXT, id}, REGION)` per recorded device; `clear_pending_locked` is only for a caller already inside a group-mutex section. |
+| m-9 | H4 (b)'s positive control can be void (phase `UNKNOWN`) | **Fixed.** PP or TG is a precondition, forced by zhcn and probed; any other phase voids the run; `GGML_SYCL_WITNESS_CHECKS=1` is explicit; one zhcn head (`4f8ff34`). |
+| m-10 | witness cost on the hot path | **Fixed.** The switch is a static read once; a disabled witness is one branch. |
+| m-11 | re-materialization after an eviction | **Fixed.** The free re-records an evicted planned weight's block as `{MODEL, id}` / `WEIGHT`; relayed to 1oxa. |
+| m-12 | the unload clear's order | **Fixed.** Teardown's first statement; idempotent across the reaper's retry. |
+| m-13 | `compute_placement_plan_early`'s shape | **Fixed.** 23mk's form: the public `void` entry at `ggml-sycl.h:357` stays, and the body is a static `bool` impl. |
+| m-14 | citations | **Fixed.** §M11a is cited as §Z8 I-2; `:12411`. |
+| m-15 | the audit witness depends on ldvb | **Fixed.** The regeneration is armed only when `--check` passes on the base. |
+
+| item | disposition |
+|------|-------------|
+| §Z13.1 (the late-stage check) | **Adopted** (§2.4.2 (b)): larger late is refused by name, smaller late is admitted with 23mk's WARN and `late_term_shrink_admitted`. H7ap arm. |
+| the late refusal's term slot (lead, after §M14) | **Changed.** The string now names the term, its zone, the device and both sizes: `[LOAD-PLAN] the late inventory changes the zones admitted at the early stage: term %s in zone %s on device %d, early %zu B, late %zu B (refused)`. It is this design's string; 23mk mirrors it byte for byte (proposed to impl-23mk). The WARN is 23mk's `cc0e6e1d8` text, mirrored byte for byte. |
+| zhcn 5.9 (`4f8ff34`): the H4h vehicle | **Adopted** in H4 (b): `test-sycl-growth-fallback-vehicle`, one backend copy, exit 77 under `GGML_BACKEND_DL`, `GGML_SYCL_WITNESS_CHECKS=1` explicit. |
+| r12 seams | **Relayed**: to 23mk (C-1's order, the refusal string, m-3, m-7, I-3); 1oxa (I-1, m-11) and zhcn (m-9) through the lead. |
+
+**Noted for the lead (7.13).**
+- §Z13.4 has 23mk's ring subtract `pending_bytes_excluding` with `({CONTEXT, id}, REGION)`, and
+  §M14 I-3 names A's fit as the consumer. Both hold, in different windows: the ring's before
+  moua L4 lands (after it the ring is a head slot, and its replan is gone on arena devices), and
+  A's from L4 until beni makes A a head slot.
+- "Where A sits" is answered as between step 5's recording and the yield, so A's capacity
+  refusal stays pre-yield. 23mk has to place its fit there.
+- m-5 is declared, not fixed: a range set per key needs ggml-alloc's buffer split, which the
+  early stage bounds and does not replay.
+- m-11's re-record on eviction is new mechanism in the free path; 1oxa owns the site.
+- The widened refusal string was sent to impl-23mk before this commit, with no reply yet. If
+  23mk asks for a change, the string is fixed forward in one place, §2.4.2 (b), and H7ap's arm.
+- Nothing was built for 7.13; it is a document change only.
