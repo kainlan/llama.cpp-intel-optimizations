@@ -288,7 +288,9 @@ def writes_of(text, lo, hi, var):
     compound assignment. Leans towards counting: `x & var` or `x > var`
     count as writes, which fails closed. Known misses: a parenthesised
     declarator `bool (var){true}` (telling it from the guard
-    `if (var) {` needs a parser), and bindings outside `auto [...]`."""
+    `if (var) {` needs a parser), a trailing declarator with no initializer
+    (`bool x = false, var;` or `, *var;` -- that needs declarator-list
+    tracking), and bindings outside `auto [...]`."""
     sites = []
     for m in re.finditer(r"\b" + re.escape(var) + r"\b", text[lo:hi]):
         s = lo + m.start()
@@ -299,7 +301,7 @@ def writes_of(text, lo, hi, var):
             (word is not None and word.group(1) not in EXPRESSION_KEYWORDS)
             or re.search(r"(?:\w|>)\s*(?:(?<!&)&|\*|>)$", before) is not None
             or re.match(r"\s*[({]", after) is not None
-            or re.search(r"\bauto\s*&{0,2}\s*\[[\w\s,]*$", before + " ") is not None
+            or re.search(r"\bauto\b(?:\s*(?:const|volatile|&{1,2}))*\s*\[[\w\s,]*$", before) is not None
         )
         assigns = re.match(r"[\s)]*(?:(?:<<|>>|[-+*/%&|^])?=(?!=))", after) is not None
         if declares or assigns:
