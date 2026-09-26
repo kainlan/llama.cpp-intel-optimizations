@@ -112,4 +112,99 @@ const char * pp_moe_onednn_scratch_admission_reason_name(pp_moe_onednn_scratch_a
     return "unknown";
 }
 
+// Places and admits the ring at `n_ubatch` into *out. Every multiply and add is
+// checked, so an overflowing slot is refused rather than wrapped into a small
+// one that would be admitted.
+static bool pp_moe_onednn_admit_ring_at(const pp_moe_onednn_ring_admission_inputs & in,
+                                        uint32_t                                    n_ubatch,
+                                        pp_moe_onednn_ring_admission *              out) {
+    constexpr size_t kMax  = std::numeric_limits<size_t>::max();
+    const size_t     depth = in.ring_depth;
+    const size_t     rows  = n_ubatch;
+    out->compute_reserve_bytes =
+        in.compute_reserve_bytes_per_row > kMax / rows ? kMax : rows * in.compute_reserve_bytes_per_row;
+    if (in.activation_bytes_per_row > kMax / rows || in.output_bytes_per_row > kMax / rows) {
+        return false;
+    }
+    size_t act_slot = 0;
+    size_t out_slot = 0;
+    if (!pp_moe_onednn_checked_align_slot_bytes(rows * in.activation_bytes_per_row, &act_slot) ||
+        !pp_moe_onednn_checked_align_slot_bytes(rows * in.output_bytes_per_row, &out_slot)) {
+        return false;
+    }
+    out->activation_slot_bytes = act_slot;
+    out->output_slot_bytes     = out_slot;
+    if (in.weight_slot_bytes > kMax / depth || act_slot > kMax / depth || out_slot > kMax / depth) {
+        return false;
+    }
+    const size_t weight_total = in.weight_slot_bytes * depth;
+    const size_t act_total    = act_slot * depth;
+    const size_t out_total    = out_slot * depth;
+
+    if (weight_total > in.runtime_available_bytes) {
+        return false;
+    }
+
+    // Larger kind first: with two kinds this keeps the most bytes in the
+    // RUNTIME zone, so the least lands in the KV zone.
+    size_t       runtime_left = in.runtime_available_bytes - weight_total;
+    const bool   out_first    = out_total >= act_total;
+    const size_t first_total  = out_first ? out_total : act_total;
+    const size_t second_total = out_first ? act_total : out_total;
+    const bool   first_in_kv  = first_total > runtime_left;
+    if (!first_in_kv) {
+        runtime_left -= first_total;
+    }
+    const bool second_in_kv = second_total > runtime_left;
+
+    out->output_in_kv_zone     = out_first ? first_in_kv : second_in_kv;
+    out->activation_in_kv_zone = out_first ? second_in_kv : first_in_kv;
+
+    size_t kv_zone_bytes = first_in_kv ? first_total : 0;
+    if (second_in_kv) {
+        if (second_total > kMax - kv_zone_bytes) {
+            return false;
+        }
+        kv_zone_bytes += second_total;
+    }
+    out->kv_zone_bytes = kv_zone_bytes;
+    if (kv_zone_bytes == 0) {
+        return true;
+    }
+    return out->compute_reserve_bytes <= out->kv_zone_headroom_bytes &&
+           kv_zone_bytes <= out->kv_zone_headroom_bytes - out->compute_reserve_bytes;
+}
+
+pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_admission_inputs & in) {
+    pp_moe_onednn_ring_admission result;
+    result.kv_zone_headroom_bytes =
+        in.kv_zone_available_bytes > in.kv_admitted_bytes ? in.kv_zone_available_bytes - in.kv_admitted_bytes : 0;
+    if (in.ring_depth == 0 || in.n_ubatch == 0 || (in.activation_bytes_per_row == 0 && in.output_bytes_per_row == 0)) {
+        return result;
+    }
+    if (pp_moe_onednn_admit_ring_at(in, in.n_ubatch, &result)) {
+        result.admit                    = true;
+        result.largest_fitting_n_ubatch = in.n_ubatch;
+        return result;
+    }
+
+    // Binary search over multiples of 32 below n_ubatch. Admission is monotone
+    // in n_ubatch: every slot and the reserve only grow, so the placements that
+    // fit only shrink and the bytes left for the KV zone only grow.
+    uint32_t lo = 0;                           // count of 32-row steps known to fit (0: none)
+    uint32_t hi = (in.n_ubatch - 1) / 32 + 1;  // count known not to fit
+    while (hi - lo > 1) {
+        const uint32_t               mid = lo + (hi - lo) / 2;
+        pp_moe_onednn_ring_admission probe;
+        probe.kv_zone_headroom_bytes = result.kv_zone_headroom_bytes;
+        if (pp_moe_onednn_admit_ring_at(in, mid * 32, &probe)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    result.largest_fitting_n_ubatch = lo * 32;
+    return result;
+}
+
 }  // namespace ggml_sycl

@@ -5324,6 +5324,24 @@ set_tests_properties(sycl-moe-scratch-admission PROPERTIES
     TIMEOUT 30
 )
 
+# Runtime admission of the PP MoE oneDNN scratch ring (llama.cpp-u1bb): which
+# slots go to the RUNTIME zone and which to the KV zone's post-KV headroom.
+# Same dependency-free unit and registration as test-moe-scratch-admission.
+add_executable(test-pp-moe-ring-admission
+    tests/test-pp-moe-ring-admission.cpp
+    moe-scratch-admission.cpp
+)
+target_include_directories(test-pp-moe-ring-admission PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-pp-moe-ring-admission PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-pp-moe-ring-admission COMMAND test-pp-moe-ring-admission)
+set_tests_properties(sycl-pp-moe-ring-admission PROPERTIES
+    LABELS "sycl;moe;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
 # Dense two-card split decode policies (llama.cpp-m1or): which simple-consumer
 # sources the route must stage, and which gate stopped the block executor. Both
 # headers are dependency-free, so this target takes no -fsycl and links nothing.
