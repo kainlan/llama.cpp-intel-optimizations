@@ -1210,16 +1210,20 @@ contribution. It never re-fits KV and never yields.
   - **(d) The reap, with no L1-L5 lock held.** zhcn's new mem-handle call
     `release_retained_referencing(const retained_reap_request &)` (lead-approved, shared with
     llama.cpp-uwlx's yield), with the request `{owners, n_owners, precondition, reason}` built
-    from the batch's owner controls and `precondition = COMPLETE`: the caller asserts the
-    entries' events completed, which llama's `synchronize()` guaranteed. Under the retained-store
-    mutex only, it drops every queued retained entry that references those owners, and returns
-    `{entries_dropped, entries_pending, in_hand_yields}`. The drain worker publishes its in-hand
+    from the batch's owner controls and `precondition = EVENTS_COMPLETE_BY_CALLER`: the caller
+    asserts the entries' events completed, which llama's `synchronize()` guaranteed. Under the
+    retained-store mutex only, it moves out every queued retained entry that references those
+    owners, and destroys them after that mutex is released; it returns `{entries_dropped,
+    entries_pending, in_hand_yields}`. Whether it also scans the process-global
+    `graph_unwaitable` list is zhcn's to state; a stray entry there surfaces as (e)'s
+    `[CONTEXT-PLAN-BUG]`, never as a silent pass. The drain worker publishes its in-hand
     entry and phase under that mutex, so the reap yields for at most one completed-event return
     and one drop; it never waits on the device or on an unrelated event. Retained handles are
     otherwise released only by that background worker (`mem-handle.cpp:2039-2052`), which is
     why the step exists.
   - **(e) The use-count check.** Each moved-out tenant handle must now have `use_count() == 1`,
-    the batch's own reference; it is read on the local batch, with no lock. Anything else is
+    the batch's own reference. The check is the per-slot reference read (lead ruling), applied
+    to the moved-out batch: the batch is local, so it takes no lock. Anything else is
     `[CONTEXT-PLAN-BUG]`, aborting under `GGML_SYCL_STRICT_PLAN=1`: a holder that outlived
     `synchronize()` plus the graph clear. It is never `busy` and never a timeout.
   - **(f) Drop the batch**, with no lock held. The blocks are really free before (ii), so (ii)'s
@@ -1248,10 +1252,10 @@ contribution. It never re-fits KV and never yields.
   mark this call owns does not make its own step 2 return `busy`. They re-fit on the **live**
   TLSF, so a block whose release has not completed (after (e) only a ring slot pinned by
   another transaction's guard can be one) is TLSF-allocated and counts as allocated by
-  construction (the belt; zhcn's row 4a): the worst case is a refusal, never an overlap. If they fit,
-  step 5 records their pending ranges (no yield), step 6 carves them, and steps 7-8 run. If they do
-  not, the candidate is refused with the tenants-alone message, **with no demotion**, and the
-  ladder moves on; a setter or encode surfaces the refusal as a decode error naming the tenant
+  construction (the belt; zhcn's row 4a): the worst case is a refusal, never an overlap. If they
+  fit, step 5 records their pending ranges (no yield), step 6 carves them, and steps 7-8 run. If
+  they do not, the candidate is refused with the tenants-alone message, **with no demotion**, and
+  the ladder moves on; a setter or encode surfaces the refusal as a decode error naming the tenant
   bytes. Only a race between (0) and L1 can lose the released tenants; zhcn's ladder revert
   republishes the previous candidate.
 - The ladder's reservations therefore stay one KV region per `(c, d)`, which C3's trace counts.
@@ -2330,6 +2334,13 @@ L7 documents this limit, and pattern #2 remains the remedy.
     it only with no L1-L5 lock held. The exception retires with **llama.cpp-nrng** (reserve under
     the lock, allocate unlocked and owner-first, install and revalidate under the lock), which is
     pre-existing work and not moua's to implement.
+  - **L7 census row: the retained-store mutex (lead ruling "B").** `retained_handle_state::mutex`
+    (`mem-handle.cpp:53-64`, the lock of `g_retained_handles_state`) is not in §12.5's table.
+    L7 adds it as **L5, leaf**: nothing is acquired under it, nothing waits under it (the drain
+    worker waits on its event outside it, `mem-handle.cpp:125-176`), and no `mem_handle` is
+    destroyed under it (the worker clears its record after unlocking, and the tenant-only
+    path's reap destroys the entries it removes after unlocking). The reap takes it with no
+    L1-L5 lock held, and it is the only lock the reap takes.
   - The ring admit (step 8 (c)) allocates nothing any more: it installs slot handles (§2.7).
   - The guard's first phase takes only the group mutex, to clear ranges (§2.4.2).
 - **§12.6 event leases.** The KV clear's fill events retain the slices they write (§2.6), and a
@@ -3431,7 +3442,7 @@ graphs). §5 (m) records the cost and the alternative that was not chosen.
 | 3 | A2 recorded, gate in the H7e family | Done; the gate is H7y. |
 | 4 | (i) in rev 4's step-4 order | **Superseded by the lead's ruling "B"**: a synchronous targeted reap replaces both waits and both `busy`-on-timeout states (§2.4.2 (i) (a)-(f)); the ring's old slots go through the same reap and are exempt from the use-count check. Rev 7's wait text (`a402c15af`) is withdrawn. |
 | 5 | unreleased tenant blocks count as allocated | **Met by construction**: (ii) fits the live TLSF, where such a block is still allocated (§2.4.2 (ii)). |
-| 6 | a per-slot reference read | **Replaced** under ruling "B": the reap's control set is the moved-out batch, and the check reads `use_count()` on that local batch with no lock, so no registry read proc is needed. |
+| 6 | a per-slot reference read | **Kept as the step-(e) check** (lead ruling), applied to the moved-out batch after the reap; the batch is local, so it takes no lock. The reap's control set is the same batch (row 4b). |
 | 7 | M2 | Done; the host allocation now precedes (i), per r5 I-I(3) (zhcn to mirror: "after (0), before (i)"). |
 | 8 | the equal-key skip | Done; backend no-op, llama recreates the scheduler over the same slots (§2.4.2). |
 | 9 | the element superset | **Closed by zhcn rev 4.1 (`4bb0436`)**, which accepts this design's element with `int32_t device` (-1 = host) and the cohort table; the tenant key digests `(device, cohort, slot_index, slot_bytes)` (§2.4.4). |
@@ -3453,7 +3464,8 @@ table is the one source); the waits are replaced by the reap (ruling "B"); the b
 equal-key call is an OK no-op, and llama may rebuild its scheduler over the same slots without
 a republish (zhcn's to state).
 
-**Open: the `device` field's type.** This design says `int32_t device`, -1 for the host tier,
-which zhcn rev 4.1 accepted; revision 7's first commit (`99fd614da`) briefly used `uint32_t`
-with `UINT32_MAX`, and `a402c15af` reverted it. zhcn has asked the lead which is right; both
-docs will say whichever is ruled. zhcn has mirrored the host order ("after (0), before (i)").
+**The `device` field's type (lead ruling 2026-09-26):** `int32_t`, -1 for the host tier, as
+`a402c15af` and zhcn rev 4.1 have it; `99fd614da`'s `UINT32_MAX` is withdrawn. zhcn has
+mirrored the host order ("after (0), before (i)"). **FLAG B accepted:** the ring's depth counts
+a recorded holder's slot, and L4 checks whether the PP MoE oneDNN path is reached under
+recording (§2.7). **The reap's store mutex** is ranked in §2.10's census list (L5, leaf).
