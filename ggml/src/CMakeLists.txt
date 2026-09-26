@@ -218,6 +218,14 @@ set_target_properties(ggml-base PROPERTIES
     SOVERSION ${GGML_VERSION_MAJOR}
 )
 
+# GGML_COMMIT changes with every commit. Defined for the whole target it
+# changed every ggml-base compile command, so each commit recompiled all of
+# them; ggml.c, which defines ggml_version() and ggml_commit(), is the only
+# reader (tests/test-build-info-scope.py).
+set_property(SOURCE ggml.c APPEND PROPERTY COMPILE_DEFINITIONS
+    GGML_VERSION="${GGML_VERSION}"
+    GGML_COMMIT="${GGML_BUILD_COMMIT}")
+
 target_include_directories(ggml-base PRIVATE .)
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)

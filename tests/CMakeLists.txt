@@ -1034,6 +1034,17 @@ if (GGML_SYCL AND NOT WIN32 AND CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Inte
         TIMEOUT 60
     )
 endif()
+# A commit must recompile one file, not every file of the targets whose
+# definitions carry the commit id (llama.cpp-vuy0).
+if (CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Interpreter_FOUND)
+    add_test(NAME test-build-info-scope
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-build-info-scope.py ${CMAKE_BINARY_DIR})
+    set_tests_properties(test-build-info-scope PROPERTIES
+        LABELS "build;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+endif()
 
 if (NOT WIN32)
     llama_test_cmd(
