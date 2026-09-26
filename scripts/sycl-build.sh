@@ -76,8 +76,13 @@ while [[ $# -gt 0 ]]; do
             break
             ;;
         -*)
-            extra_build_args+=("$1")
-            shift
+            # Unknown options are refused rather than guessed at: passed through
+            # one at a time, a value-taking build-tool option such as "-k 0"
+            # would split into an option and a target.
+            echo "error: unknown option '$1'; pass build-tool arguments after --," \
+                "e.g. ./scripts/sycl-build.sh llama-cli -- -k 0" >&2
+            usage >&2
+            exit 2
             ;;
         *)
             targets+=("$1")
@@ -149,10 +154,26 @@ mkdir -p "${BUILD_DIR}"
 # exit. Only SIGKILL escapes this -- scripts/sycl-tmp-leak-report.sh lists
 # what is left behind.
 build_tmp="$(mktemp -d "${TMPDIR:-/tmp}/sycl-build.XXXXXX")"
+build_pid=""
+
+# bash runs a trap only once a foreground command returns, so a signal sent to
+# this script's pid alone would wait out the whole build. The build therefore
+# runs as a background job in its own process group, and a signal is passed on
+# to that group: ninja relays it to each job's process group and waits for
+# them, so their temporaries are gone before build_tmp is removed.
+on_signal() {
+    local status="$1" sig="$2"
+    if [[ -n "${build_pid}" ]]; then
+        kill "-${sig}" -- "-${build_pid}" 2>/dev/null || true
+        wait "${build_pid}" 2>/dev/null || true
+    fi
+    exit "${status}"
+}
+
 trap 'rm -rf "${build_tmp}"' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
+trap 'on_signal 130 INT' INT
+trap 'on_signal 143 TERM' TERM
+trap 'on_signal 129 HUP' HUP
 export TMPDIR="${build_tmp}"
 
 cmake_input_changed() {
@@ -286,4 +307,8 @@ if [[ ${#extra_build_args[@]} -gt 0 ]]; then
 fi
 
 echo "[sycl-build] building${targets[*]:+ targets ${targets[*]}} with Ninja in ${BUILD_DIR}"
-"${build_cmd[@]}"
+set -m
+"${build_cmd[@]}" &
+build_pid=$!
+set +m
+wait "${build_pid}"

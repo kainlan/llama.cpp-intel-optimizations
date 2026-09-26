@@ -1017,6 +1017,23 @@ if (NOT WIN32)
         TIMEOUT 30
     )
 endif()
+# Embedded in a parent project, the device-link routing must leave the
+# parent's own targets alone. Configures small fixtures with the host C
+# compiler; the routing module needs CMake 3.21, as in ggml-sycl.
+if (NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+    llama_test_cmd(
+        bash
+        NAME test-sycl-device-link-embedding
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-link-embedding.sh
+             "${CMAKE_COMMAND}" "${CMAKE_GENERATOR}" "${CMAKE_MAKE_PROGRAM}"
+    )
+    set_tests_properties(test-sycl-device-link-embedding PROPERTIES
+        LABELS "sycl;build;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+endif()
 if (GGML_SYCL AND NOT WIN32 AND CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-device-link-routing
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-link-routing.py ${CMAKE_BINARY_DIR})
@@ -1026,7 +1043,8 @@ if (GGML_SYCL AND NOT WIN32 AND CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Inte
         TIMEOUT 60
     )
     # Tests that read repo sources must find the tree without an absolute
-    # __FILE__, which ccache base_dir takes away (llama.cpp-vuy0).
+    # __FILE__, which ccache base_dir (opt-in, GGML_SYCL_CCACHE_BASE_DIR=1)
+    # takes away (llama.cpp-vuy0).
     add_test(NAME test-sycl-source-root-anchor
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-source-root-anchor.py ${CMAKE_BINARY_DIR})
     set_tests_properties(test-sycl-source-root-anchor PROPERTIES
@@ -1035,9 +1053,11 @@ if (GGML_SYCL AND NOT WIN32 AND CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Inte
         TIMEOUT 60
     )
 endif()
-# A commit must recompile one file, not every file of the targets whose
-# definitions carry the commit id (llama.cpp-vuy0).
-if (CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Interpreter_FOUND)
+# The commit id and build number must stay off every edge command that does not
+# need them, or each commit reruns those edges (llama.cpp-vuy0). The script
+# reads build.ninja, so single-config Ninja only, and it checks ggml-base's
+# compiles, which a LLAMA_USE_SYSTEM_GGML build does not have.
+if (CMAKE_GENERATOR STREQUAL "Ninja" AND NOT LLAMA_USE_SYSTEM_GGML AND Python3_Interpreter_FOUND)
     add_test(NAME test-build-info-scope
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-build-info-scope.py ${CMAKE_BINARY_DIR})
     set_tests_properties(test-build-info-scope PROPERTIES
@@ -2865,9 +2885,10 @@ if(GGML_SYCL)
         ${PROJECT_SOURCE_DIR}/ggml/src)
     target_compile_definitions(test-sycl-fattn-onednn-gates PRIVATE
         $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
-    # Absolute repo root for the source-reading gates: under ccache base_dir
-    # (scripts/sycl-build.sh) __FILE__ is relative to the build directory, and
-    # this binary is install()ed and run from anywhere (llama.cpp-vuy0).
+    # Absolute repo root for the source-reading gates: when scripts/sycl-build.sh
+    # runs ccache with base_dir (opt-in, GGML_SYCL_CCACHE_BASE_DIR=1) __FILE__ is
+    # relative to the build directory, and this binary is install()ed and run
+    # from anywhere (llama.cpp-vuy0).
     target_compile_definitions(test-sycl-fattn-onednn-gates PRIVATE
         LLAMA_CPP_SOURCE_ROOT="${PROJECT_SOURCE_DIR}")
     target_compile_options(test-sycl-fattn-onednn-gates PRIVATE "-fsycl" "-Wno-narrowing")

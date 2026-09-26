@@ -1176,9 +1176,10 @@ static bool test_materialization_descriptor_rejects_unsupported_layout() {
 // test-sycl-moe-fused-down-sum-policy.cpp, test-sycl-moe-fusion-noactivation.cpp
 // and test-sycl-moe-sequence-graphlet-policy.cpp): LLAMA_CPP_REPO_ROOT override
 // first, then the absolute LLAMA_CPP_SOURCE_ROOT the build defines, then the repo
-// root recovered from this TU's compile-time __FILE__, then cwd guesses last. The __FILE__ anchor is what makes the invocation directory
-// irrelevant, which matters because this target is install()ed and so gets run
-// from arbitrary cwds. All seven copies list the SAME six cwd guesses ("."
+// root recovered from this TU's compile-time __FILE__, then cwd guesses last. The
+// two build-time anchors are what make the invocation directory irrelevant,
+// which matters because this target is install()ed and so gets run from
+// arbitrary cwds. All seven copies list the SAME six cwd guesses ("."
 // through "../../../../.."); that depth is behavioural, not cosmetic, since the
 // guesses are what runs when the __FILE__ anchor fails, so a shallower copy stops
 // finding the file from a deeper cwd. Change all seven together. Duplicating

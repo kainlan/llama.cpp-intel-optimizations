@@ -282,6 +282,14 @@ launch env GGML_SYCL_OCLOC_CACHE_ROOT="${DBG_ROOT}" MOCK_RUN_OCLOC=1 MOCK_OCLOC_
     "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" || fail "warm run failed"
 [[ "$(paste -sd' ' "${ocloc_log}")" == "miss hit" ]] ||
     fail "positive control: warm cache did not hit: $(paste -sd' ' "${ocloc_log}")"
+# Two stale toolchain keys, so a prune (which keeps only the newest other key)
+# would visibly change the root if hygiene ran on the debug path.
+for d in ocloc-26.20.1_00000000000000aa ocloc-26.18.1_00000000000000bb; do
+    mkdir -p "${DBG_ROOT}/${d}"
+    echo key > "${DBG_ROOT}/${d}/KEY"
+done
+touch -d '1 day ago' "${DBG_ROOT}/ocloc-26.20.1_00000000000000aa"
+touch -d '2 days ago' "${DBG_ROOT}/ocloc-26.18.1_00000000000000bb"
 snapshot() { (cd "${DBG_ROOT}" && find . -type f -exec md5sum {} + | sort; find . | sort) | md5sum; }
 for debug_env in IGC_ShaderDumpEnable=1 NEOReadDebugKeys=1; do
     before="$(snapshot)"
@@ -298,6 +306,10 @@ for debug_env in IGC_ShaderDumpEnable=1 NEOReadDebugKeys=1; do
         fail "${debug_env}: want one warning naming it: $(cat "${LOG}/dbg-stderr")"
     assert_parent_tmp_empty "${debug_env}"
 done
+# ...nor create a root that was not there.
+launch env GGML_SYCL_OCLOC_CACHE_ROOT="${TMP}/dbg-absent" IGC_ShaderDumpEnable=1 \
+    "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" 2>/dev/null || fail "debug run on an absent root failed"
+[[ ! -e "${TMP}/dbg-absent" ]] || fail "a debug run created the persistent cache root"
 
 # 10. An ocloc call without -file (a query) is not an image: inventory mode
 #     records nothing for it, rather than a row with an empty input md5 and an
@@ -324,5 +336,17 @@ rc=0
 launch env GGML_SYCL_OCLOC_CACHE_ROOT="${STUCK_ROOT}" "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" || rc=$?
 chmod -R u+w "${STUCK_ROOT}"
 [[ ${rc} -eq 0 ]] || fail "an unremovable stale cache directory failed the link (rc ${rc})"
+
+# 12. KEY is informational: a cache directory that cannot take it (a concurrent
+#     prune in practice, a read-only directory here) does not fail the link.
+RO_ROOT="${TMP}/ro-cache"
+mkdir -p "${RO_ROOT}/$(key)"
+chmod 555 "${RO_ROOT}/$(key)"
+rc=0
+launch env GGML_SYCL_OCLOC_CACHE_ROOT="${RO_ROOT}" "${LAUNCHER}" --ocloc-cache -- "${MOCK_BIN}/mock-icpx" \
+    2> "${LOG}/ro-stderr" || rc=$?
+chmod -R u+w "${RO_ROOT}"
+[[ ${rc} -eq 0 ]] || fail "a cache directory that cannot take KEY failed the link (rc ${rc}): $(cat "${LOG}/ro-stderr")"
+[[ ! -s "${LOG}/ro-stderr" ]] || fail "a KEY write failure reached stderr: $(cat "${LOG}/ro-stderr")"
 
 echo "test-sycl-device-link-launcher: PASS" >&2

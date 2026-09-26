@@ -690,71 +690,12 @@ if (NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
         set_property(GLOBAL APPEND PROPERTY JOB_POOLS ggml_sycl_device_link=${GGML_SYCL_DEVICE_LINK_POOL})
     endif()
 
-    function(ggml_sycl_route_device_link target)
-        get_property(_launcher GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_LAUNCHER)
-        set_target_properties(${target} PROPERTIES CXX_LINKER_LAUNCHER "${_launcher}")
-        if (CMAKE_GENERATOR MATCHES "Ninja")
-            set_target_properties(${target} PROPERTIES JOB_POOL_LINK ggml_sycl_device_link)
-        endif()
-    endfunction()
-
-    # Consumers of ggml-sycl-private-fixtures inherit the backend objects and
-    # its link options through an INTERFACE target, which cannot carry these
-    # target properties, and they are declared in several directories. Route
-    # them once every directory has been processed. A target that does its own
-    # device link (-fsycl-targets in its link options, e.g. the
-    # GGML_SYCL_BUILD_XMX_TESTS executables) inherits neither, so it also gets
-    # the link options. tests/test-sycl-device-link-routing.py checks the result
-    # against build.ninja using the same -fsycl-targets criterion. Only this
-    # project's targets are touched: when it is embedded, the walk from the top
-    # directory also meets the parent project's own SYCL executables.
-    function(ggml_sycl_route_fixture_device_links dir)
-        get_property(root GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_ROUTE_ROOT)
-        if (NOT root)
-            message(FATAL_ERROR "ggml-sycl: no device-link route root")
-        endif()
-        get_property(_targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
-        foreach(_target IN LISTS _targets)
-            get_target_property(_type ${_target} TYPE)
-            if (NOT _type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
-                continue()
-            endif()
-            get_target_property(_source_dir ${_target} SOURCE_DIR)
-            string(FIND "${_source_dir}/" "${root}/" _pos)
-            if (NOT _pos EQUAL 0)
-                continue()
-            endif()
-            get_target_property(_routed ${_target} CXX_LINKER_LAUNCHER)
-            if (_routed)
-                continue()
-            endif()
-            get_target_property(_libs ${_target} LINK_LIBRARIES)
-            get_target_property(_link_options ${_target} LINK_OPTIONS)
-            if (_libs AND "ggml-sycl-private-fixtures" IN_LIST _libs)
-                ggml_sycl_route_device_link(${_target})
-            elseif (_link_options AND _link_options MATCHES "-fsycl-targets=")
-                get_property(_options GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_OPTIONS)
-                target_link_options(${_target} PRIVATE ${_options})
-                ggml_sycl_route_device_link(${_target})
-            endif()
-        endforeach()
-        get_property(_subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
-        foreach(_subdir IN LISTS _subdirs)
-            ggml_sycl_route_fixture_device_links("${_subdir}")
-        endforeach()
-    endfunction()
-
+    # Routing of the other device-linking targets lives in a module so that
+    # tests/test-sycl-device-link-embedding.sh can run it inside a small
+    # parent project.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/sycl-device-link-routing.cmake")
     ggml_sycl_route_device_link(ggml-sycl)
-    # llama.cpp when ggml is built inside it, otherwise ggml itself. A global
-    # property, because a deferred call expands its arguments where it runs
-    # (the top directory), not here.
-    if (DEFINED llama.cpp_SOURCE_DIR)
-        set_property(GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_ROUTE_ROOT "${llama.cpp_SOURCE_DIR}")
-    else()
-        set_property(GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_ROUTE_ROOT "${ggml_SOURCE_DIR}")
-    endif()
-    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
-        CALL ggml_sycl_route_fixture_device_links "${CMAKE_SOURCE_DIR}")
+    ggml_sycl_defer_device_link_routing()
 endif()
 target_link_options(ggml-sycl PRIVATE ${_ggml_sycl_device_link_options})
 
@@ -3260,9 +3201,10 @@ set(RESIDENCY_TEST_SYCL_OPTIONS
 # commit message and docs/backend/sycl-test-inventory.md.
 # Tests that read repo sources at run time locate the tree through
 # LLAMA_CPP_SOURCE_ROOT (candidate_roots() in each). It is an absolute -D because
-# scripts/sycl-build.sh runs ccache with base_dir, which rewrites the source path
-# -- and so __FILE__ -- relative to the build directory; ccache leaves -D values
-# alone (llama.cpp-vuy0).
+# when scripts/sycl-build.sh runs ccache with base_dir (opt-in,
+# GGML_SYCL_CCACHE_BASE_DIR=1), ccache rewrites the source path -- and so
+# __FILE__ -- relative to the build directory; it leaves -D values alone
+# (llama.cpp-vuy0).
 get_filename_component(GGML_SYCL_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
 set(GGML_SYCL_SOURCE_READING_TESTS
     test-sycl-moe-fused-down-sum-policy

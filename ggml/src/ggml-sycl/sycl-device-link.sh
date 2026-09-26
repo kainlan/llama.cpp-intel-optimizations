@@ -196,20 +196,24 @@ if (( ocloc_cache )); then
     cache_name="$(cache_key "$1")"
     cache_dir="${cache_root}/${cache_name}"
     min_free="${GGML_SYCL_OCLOC_CACHE_MIN_FREE:-4294967296}"
-    mkdir -p "${cache_root}"
-    prune_cache_keys "${cache_root}" "${cache_name}"
     debug_keys=()
     for name in $(compgen -e); do
         case "${name}" in
             IGC_*|NEOReadDebugKeys) debug_keys+=("${name}") ;;
         esac
     done
-    free_kb="$(df -Pk -- "${cache_root}" | awk 'NR == 2 { print $4 }')"
     bypass=""
     if (( ${#debug_keys[@]} )); then
+        # Decided before any hygiene: a debug run leaves the persistent cache
+        # exactly as it found it, including the stale keys a prune would drop.
         bypass="${debug_keys[*]} set"
-    elif (( ${free_kb:-0} * 1024 < min_free )); then
-        bypass="$(( free_kb / 1024 )) MB free under ${cache_root}, below GGML_SYCL_OCLOC_CACHE_MIN_FREE=${min_free}"
+    else
+        mkdir -p "${cache_root}"
+        prune_cache_keys "${cache_root}" "${cache_name}"
+        free_kb="$(df -Pk -- "${cache_root}" | awk 'NR == 2 { print $4 }')"
+        if (( ${free_kb:-0} * 1024 < min_free )); then
+            bypass="$(( free_kb / 1024 )) MB free under ${cache_root}, below GGML_SYCL_OCLOC_CACHE_MIN_FREE=${min_free}"
+        fi
     fi
     if [[ -n "${bypass}" ]]; then
         # The link still runs with a NEO cache so -allow_caching has somewhere
@@ -221,10 +225,13 @@ if (( ocloc_cache )); then
         mkdir -p "${cache_dir}"
     else
         mkdir -p "${cache_dir}"
-        touch "${cache_dir}"
+        # A concurrent link on another toolchain may prune this dir between the
+        # mkdir and here; KEY is informational and NEO fails soft on a missing
+        # dir, so neither step may fail the link.
+        touch "${cache_dir}" 2>/dev/null || true
         if [[ ! -f "${cache_dir}/KEY" ]]; then
             cache_key_description "$1" > "${link_tmp}/KEY"
-            mv -f "${link_tmp}/KEY" "${cache_dir}/KEY"
+            mv -f "${link_tmp}/KEY" "${cache_dir}/KEY" 2>/dev/null || true
         fi
     fi
     export NEO_CACHE_PERSISTENT=1

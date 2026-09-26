@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # scripts/sycl-build.sh passes every named target to one build, expands --dev,
 # runs the build in a private TMPDIR that is gone once the script exits,
-# whether the build passed or failed, exits 130/143/129 on INT/TERM/HUP, and
+# whether the build passed or failed, stops the build and exits 130/143/129 on
+# INT/TERM/HUP, refuses options it does not know, and
 # configures ccache with base_dir set to the tree -- so another checkout path
 # reuses its entries -- only when GGML_SYCL_CCACHE_BASE_DIR=1 (llama.cpp-vuy0).
 set -euo pipefail
@@ -40,6 +41,10 @@ if [[ "$1" == "--build" ]]; then
     printf 'TMPDIR=%s\n' "${TMPDIR}" >> "${CMAKE_LOG}"
     printf '%s\n' "$@" >> "${CMAKE_LOG}"
     [[ -d "${TMPDIR}" ]] || exit 90
+    if [[ -n "${MOCK_PID_FILE:-}" ]]; then
+        echo "$$" > "${MOCK_PID_FILE}"
+        exec sleep "${MOCK_BUILD_SLEEP:-0}"
+    fi
     sleep "${MOCK_BUILD_SLEEP:-0}"
     : > "${TMPDIR}/icpx-stranded.out"
     exit "${MOCK_BUILD_RC:-0}"
@@ -114,34 +119,56 @@ MOCK_BUILD_RC=7 run_script llama-cli || rc=$?
 [[ ${rc} -eq 7 ]] || fail "failing build returned ${rc}, want 7"
 expect_private_tmp_removed
 
-# A signal ends the script with the conventional status and still removes
-# its temporaries. The build is in flight when the signal lands.
+# A signal to the script's pid alone -- not its process group -- stops the
+# build in flight, ends the script with the conventional status and still
+# removes its temporaries.
 signal_case() {
-    local sig="$1" want_rc="$2" pid rc=0
+    local sig="$1" want_rc="$2" pid build_pid rc=0 start_ms elapsed_ms
     : > "${CMAKE_LOG}"
     : > "${CONFIGURE_LOG}"
+    rm -f "${TMP}/build.pid"
     # set -m: default dispositions, as from a terminal; a plain background job
     # would start with SIGINT ignored.
     set -m
     env ONEAPI_SETVARS="${TMP}/setvars.sh" MOCK_BIN="${MOCK_BIN}" TEST_CCL_ROOT="${CCL_ROOT_FIXTURE}" \
         CMAKE_LOG="${CMAKE_LOG}" CONFIGURE_LOG="${CONFIGURE_LOG}" CMAKE_BUILD_PARALLEL_LEVEL=1 \
-        TMPDIR="${OUTER_TMP}" MOCK_BUILD_SLEEP=1 \
+        TMPDIR="${OUTER_TMP}" MOCK_BUILD_SLEEP=30 MOCK_PID_FILE="${TMP}/build.pid" \
         "${BUILD_SCRIPT}" -B "${BUILD_DIR}" llama-cli > "${TMP}/out.log" 2>&1 &
     pid=$!
     set +m
     for _ in $(seq 100); do
-        [[ -n "$(build_tmpdir)" ]] && break
+        [[ -s "${TMP}/build.pid" ]] && break
         sleep 0.05
     done
-    [[ -n "$(build_tmpdir)" ]] || fail "SIG${sig}: the build never started"
+    [[ -s "${TMP}/build.pid" ]] || fail "SIG${sig}: the build never started"
+    build_pid="$(cat "${TMP}/build.pid")"
+    start_ms=$(( $(date +%s%N) / 1000000 ))
     kill "-${sig}" "${pid}"
     wait "${pid}" || rc=$?
+    elapsed_ms=$(( $(date +%s%N) / 1000000 - start_ms ))
     [[ ${rc} -eq ${want_rc} ]] || fail "SIG${sig}: script exited ${rc}, want ${want_rc}"
+    # The mock build sleeps 30 s; finishing near that means the signal waited
+    # for the build instead of stopping it.
+    (( elapsed_ms < 3000 )) || fail "SIG${sig}: the script took ${elapsed_ms} ms to stop the build"
+    if kill -0 "${build_pid}" 2>/dev/null; then
+        kill -KILL "${build_pid}" 2>/dev/null || true
+        fail "SIG${sig}: the build (pid ${build_pid}) outlived the script"
+    fi
     expect_private_tmp_removed
 }
 signal_case INT 130
 signal_case TERM 143
 signal_case HUP 129
+
+# An unknown option is refused before anything runs, pointing at "--": passed
+# through bare, a value-taking one such as "-k 0" would split into an option
+# and a target.
+rc=0
+run_script llama-cli -k 0 || rc=$?
+[[ ${rc} -eq 2 ]] || fail "unknown option: script exited ${rc}, want 2"
+[[ ! -s "${CMAKE_LOG}" && ! -s "${CONFIGURE_LOG}" ]] || fail "unknown option: cmake ran: $(cat "${CMAKE_LOG}")"
+grep -q -- "unknown option '-k'.*after --" "${TMP}/out.log" ||
+    fail "unknown option: no usage error pointing at --: $(cat "${TMP}/out.log")"
 
 write_cache() {
     cat > "${BUILD_DIR}/CMakeCache.txt" <<EOF
