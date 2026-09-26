@@ -1852,16 +1852,16 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
         local_max      = sycl::fmax(local_max, score);
     }
 
-    // local_max starts at -FLT_MAX, so KQ_max is finite even when no cell of
-    // this partition has a finite score. The floor at -FLT_MAX / 2 (the merge's
+    // local_max starts at -FLT_MAX, so KQ_max is finite even when every cell of
+    // this partition scores -inf. The floor at -FLT_MAX / 2 (the merge's
     // initial maximum) matters only then: it gives the partition's out-of-range
     // slots, which carry a score of -FLT_MAX, weight exp(-FLT_MAX / 2) = 0
     // rather than exp(0) = 1, so the partial sum is 0 instead of a count of
     // padding slots. The merge result is the same either way: such a partition
     // is weighted by 0 when another partition or a sink is live, and by
     // exp(0) = 1 when nothing is, where its partial sum and output of 0 add
-    // nothing. (A NaN V in a visible cell whose QK^T is -inf still reaches the
-    // output as 0 * NaN, as on the CPU.)
+    // nothing (unless a visible cell scoring -inf carries a NaN V, which
+    // reaches the output as 0 * NaN, as on the CPU).
     KQ_max = sycl::fmax(sycl::reduce_over_group(sg, local_max, sycl::maximum<float>{}), -FLT_MAX / 2.0f);
 
     float lane_probs[2 * XMX_V2_DECODE_SLOTS];
