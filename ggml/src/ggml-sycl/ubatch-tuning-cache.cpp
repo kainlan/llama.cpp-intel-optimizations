@@ -15,9 +15,9 @@
 //     GGML_SYCL_TUNING_CACHE_DIR), memoized the same way
 //     unified_cache_auto_ubatch_enabled() is (unified-cache.cpp);
 //   - composing the on-disk device_key (ubatch_device_set_key() over every
-//     participating device: the context's own SYCL devices plus any GPU the
-//     scheduler hides but the placement planner uses, each with its name,
-//     driver version and VRAM budget) from ggml_sycl_info() and each
+//     participating device: the context's own SYCL devices plus, under the
+//     multi-device placement plan, every other physical GPU, each with its
+//     name, driver version and VRAM budget) from ggml_sycl_info() and each
 //     device's budget authority -- callers pass only logical device indices,
 //     never the raw strings, so this composition happens in exactly one
 //     place;
@@ -35,6 +35,7 @@
 #include "tuning-cache-io.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -103,8 +104,10 @@ bool resolve_file_device_name(int device, std::string & out_device_name) {
 // GGML_SYCL_SPLIT_RATIO/TENSOR_SPLIT gives the context ONE SYCL backend
 // (device 0), while the placement planner still puts layers and KV on the
 // hidden device 1 whenever ggml_backend_sycl_moe_multi_gpu_requested() --
-// the same gate the multi-device plan uses. Each device's budget comes from
-// ggml_sycl_existing_device_budget_authority(), which reads the live cache's
+// the same gate the multi-device plan uses. That plan budgets every physical
+// GPU, so under it each one the context does not list is keyed as hidden,
+// and the key records that the plan ran. Each device's budget comes from
+// ggml_sycl_device_budget_authority_existing(), which reads the live cache's
 // resolved authority when there is one and never constructs a cache (see the
 // loop below). Returns false for an empty or out-of-range device list.
 bool resolve_device_set_key(const ggml_sycl_ubatch_cache_key & c_key,
@@ -123,9 +126,8 @@ bool resolve_device_set_key(const ggml_sycl_ubatch_cache_key & c_key,
         }
         topo.scheduler_devices.push_back(device);
     }
-    topo.scheduler_visible_count = info.device_count;
-    topo.total_gpu_count         = std::min(info.total_gpu_count, GGML_SYCL_MAX_DEVICES);
-    topo.hidden_gpus_participate = ggml_backend_sycl_moe_multi_gpu_requested();
+    topo.total_gpu_count   = std::min(info.total_gpu_count, GGML_SYCL_MAX_DEVICES);
+    topo.multi_device_plan = ggml_backend_sycl_moe_multi_gpu_requested();
 
     // How the work is divided across that set is as budget-relevant as the
     // set itself: the same two cards at a different split ratio put a
@@ -153,7 +155,7 @@ bool resolve_device_set_key(const ggml_sycl_ubatch_cache_key & c_key,
     // deterministic for a given configuration, which is all a key needs.
     for (int device : ubatch_participating_devices(topo)) {
         const auto &                           dev    = info.devices[device];
-        const ggml_sycl::vram_budget_authority budget = ggml_sycl::ggml_sycl_existing_device_budget_authority(
+        const ggml_sycl::vram_budget_authority budget = ggml_sycl::ggml_sycl_device_budget_authority_existing(
             device, dev.total_vram, dev.free_vram_at_init, /*default_pct=*/100);
         UbatchDeviceIdentity & id = identities[device];
         id.device_name            = dev.device_name;
@@ -225,10 +227,34 @@ bool ggml_backend_sycl_ubatch_cache_path(int device, char * buf, size_t buf_size
     return true;
 }
 
-bool ggml_backend_sycl_ubatch_cache_lookup_v5(const ggml_sycl_ubatch_cache_key * key,
-                                              uint32_t *                         n_ubatch,
-                                              char *                             reason_buf,
-                                              size_t                             reason_buf_size) {
+// The _layout1 suffix on the two entry points below names this exact layout
+// of ggml_sycl_ubatch_cache_key (see ggml-sycl.h). A change to it must bump
+// the suffix, so these pin it: 64-bit offsets, which is every platform the
+// SYCL backend builds for.
+static_assert(sizeof(void *) != 8 || sizeof(ggml_sycl_ubatch_cache_key) == 72,
+              "ggml_sycl_ubatch_cache_key layout changed: bump the _layoutN suffix");
+#define UBATCH_CACHE_KEY_FIELD_AT(field, offset)                                                  \
+    static_assert(sizeof(void *) != 8 || offsetof(ggml_sycl_ubatch_cache_key, field) == (offset), \
+                  "ggml_sycl_ubatch_cache_key layout changed: bump the _layoutN suffix")
+UBATCH_CACHE_KEY_FIELD_AT(devices, 0);
+UBATCH_CACHE_KEY_FIELD_AT(n_devices, 8);
+UBATCH_CACHE_KEY_FIELD_AT(model_name, 16);
+UBATCH_CACHE_KEY_FIELD_AT(model_size, 24);
+UBATCH_CACHE_KEY_FIELD_AT(model_hash, 32);
+UBATCH_CACHE_KEY_FIELD_AT(n_ctx, 40);
+UBATCH_CACHE_KEY_FIELD_AT(n_batch, 44);
+UBATCH_CACHE_KEY_FIELD_AT(flash_attn, 48);
+UBATCH_CACHE_KEY_FIELD_AT(n_seq_max, 52);
+UBATCH_CACHE_KEY_FIELD_AT(type_k, 56);
+UBATCH_CACHE_KEY_FIELD_AT(type_v, 60);
+UBATCH_CACHE_KEY_FIELD_AT(kv_unified, 64);
+UBATCH_CACHE_KEY_FIELD_AT(swa_full, 65);
+#undef UBATCH_CACHE_KEY_FIELD_AT
+
+bool ggml_backend_sycl_ubatch_cache_lookup_layout1(const ggml_sycl_ubatch_cache_key * key,
+                                                   uint32_t *                         n_ubatch,
+                                                   char *                             reason_buf,
+                                                   size_t                             reason_buf_size) {
     if (key == nullptr || n_ubatch == nullptr || !ubatch_tuning_cache_env_enabled()) {
         return false;
     }
@@ -255,9 +281,9 @@ bool ggml_backend_sycl_ubatch_cache_lookup_v5(const ggml_sycl_ubatch_cache_key *
     return false;
 }
 
-bool ggml_backend_sycl_ubatch_cache_store_v5(const ggml_sycl_ubatch_cache_key * key,
-                                             uint32_t                           n_ubatch,
-                                             const char *                       reason) {
+bool ggml_backend_sycl_ubatch_cache_store_layout1(const ggml_sycl_ubatch_cache_key * key,
+                                                  uint32_t                           n_ubatch,
+                                                  const char *                       reason) {
     if (key == nullptr || !ubatch_tuning_cache_env_enabled()) {
         return false;
     }

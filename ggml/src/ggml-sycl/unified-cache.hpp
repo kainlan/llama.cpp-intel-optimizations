@@ -7010,7 +7010,7 @@ vram_budget_authority ggml_sycl_device_budget_authority(int device, size_t total
 // did not register) gets the fresh computation. For callers that only need
 // to READ a device's budget identity, where creating a cache as a side
 // effect would be wrong.
-vram_budget_authority ggml_sycl_existing_device_budget_authority(int    device,
+vram_budget_authority ggml_sycl_device_budget_authority_existing(int    device,
                                                                  size_t total_mem,
                                                                  size_t free_mem,
                                                                  int    default_pct);

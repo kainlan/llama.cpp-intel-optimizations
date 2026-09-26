@@ -498,11 +498,14 @@ GGML_BACKEND_API bool ggml_backend_sycl_auto_ubatch_enabled(void);
 // only for the duration of the call, never retained.
 //
 // The struct carries no size or version field, so the two entry points that
-// take it are named for its layout (_v5, matching CACHE_VERSION in
-// tuning-cache-io.hpp). A libllama and a libggml-sycl built against different
-// layouts then fail to resolve the symbol -- a GGML_BACKEND_DL caller sees no
-// cache accessor and runs the ladder -- instead of misreading the struct.
-// Rename both again whenever this layout changes.
+// take it carry its LAYOUT version as a suffix (_layout1; the unsuffixed
+// names took the earlier single-device layout). A libllama and a
+// libggml-sycl built against different layouts then fail to resolve the
+// symbol -- a GGML_BACKEND_DL caller sees no cache accessor and runs the
+// ladder -- instead of misreading the struct. This is independent of the
+// on-disk CACHE_VERSION. The layout is pinned by static_asserts next to the
+// accessors in ggml/src/ggml-sycl/ubatch-tuning-cache.cpp: when one fires,
+// bump the suffix on both entry points and update the asserts.
 struct ggml_sycl_ubatch_cache_key {
     const int *  devices;
     uint32_t     n_devices;
@@ -548,10 +551,10 @@ GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_path(int device, char * buf
 // unreadable/corrupt/wrong-version file -- the caller's ladder trial
 // tolerates every one of those identically (a cold cache), so this never
 // throws and never distinguishes them.
-GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_lookup_v5(const struct ggml_sycl_ubatch_cache_key * key,
-                                                               uint32_t *                                n_ubatch,
-                                                               char *                                    reason_buf,
-                                                               size_t reason_buf_size);
+GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_lookup_layout1(const struct ggml_sycl_ubatch_cache_key * key,
+                                                                    uint32_t *                                n_ubatch,
+                                                                    char * reason_buf,
+                                                                    size_t reason_buf_size);
 
 // Persist the chosen n_ubatch for this exact key (atomic write; see
 // tuning-cache-io.hpp). `reason` is recorded verbatim -- llama.cpp-7n6n
@@ -565,9 +568,9 @@ GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_lookup_v5(const struct ggml
 // false (never throws) on a disabled cache, an empty or out-of-range device
 // list, or a write failure -- the caller logs one WARN and continues; a
 // failed store never blocks inference.
-GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_store_v5(const struct ggml_sycl_ubatch_cache_key * key,
-                                                              uint32_t                                  n_ubatch,
-                                                              const char *                              reason);
+GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_store_layout1(const struct ggml_sycl_ubatch_cache_key * key,
+                                                                   uint32_t                                  n_ubatch,
+                                                                   const char *                              reason);
 
 // Provide the actual layer membership for the next KV buffer allocation on a
 // SYCL device. llama_kv_cache may create multiple same-sized KV buffers for

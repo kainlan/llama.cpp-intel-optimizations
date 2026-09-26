@@ -1273,7 +1273,7 @@ vram_budget_authority ggml_sycl_device_budget_authority(int    device,
     return device_budget_authority_from(get_unified_cache_for_device(device), device, total_mem, free_mem, default_pct);
 }
 
-vram_budget_authority ggml_sycl_existing_device_budget_authority(int    device,
+vram_budget_authority ggml_sycl_device_budget_authority_existing(int    device,
                                                                  size_t total_mem,
                                                                  size_t free_mem,
                                                                  int    default_pct) {

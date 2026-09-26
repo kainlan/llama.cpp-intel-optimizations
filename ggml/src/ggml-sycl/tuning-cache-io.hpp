@@ -94,10 +94,11 @@ inline long sycl_tuning_getpid() {
 // for a swa_full=true raw-API context) although it was written before SWA
 // layers were sized by that flag at all.
 // v5 (llama.cpp-1oa3): UbatchCacheKey::device_key names every device whose
-// budget decides the fit -- including a GPU the scheduler hides but the
-// placement planner uses, marked "hidden:" -- with each one's budget
-// percentage and external headroom, plus the multi-GPU placement knobs that
-// are set, and device_set_hash (an index hash over the scheduler-visible
+// budget decides the fit -- including, under the planner's multi-device
+// plan, every GPU the scheduler does not list, marked "hidden:" -- with each
+// one's budget percentage and external headroom, whether that plan ran
+// ("|plan=multi"), and the multi-GPU placement knobs that are set, and
+// device_set_hash (an index hash over the scheduler-visible
 // backends only) is gone. A v4 entry's device_key names one card, so a v4
 // B70-alone entry would still be read back for a collapsed level_zero:0,1
 // split; bumping rejects every v4 file instead.
@@ -542,18 +543,17 @@ struct UbatchDeviceIdentity {
 // The device topology a context runs on, as indices into
 // ggml_sycl_info().devices[].
 struct UbatchDeviceTopology {
-    // Every SYCL backend the context has, in order.
+    // Every SYCL backend the context has, in order. A multi-GPU run without
+    // GGML_SYCL_SPLIT_RATIO/TENSOR_SPLIT exposes only device 0 to the
+    // scheduler, so the other physical GPUs are hidden from this list.
     std::vector<int> scheduler_devices;
-    // ggml_sycl_info().device_count and total_gpu_count. A multi-GPU run
-    // without GGML_SYCL_SPLIT_RATIO/TENSOR_SPLIT exposes only device 0 to the
-    // scheduler, so devices [scheduler_visible_count, total_gpu_count) are
-    // hidden from the context's backend list.
-    int              scheduler_visible_count = 0;
-    int              total_gpu_count         = 0;
-    // Whether the placement planner may put layers, KV or experts on those
-    // hidden GPUs (ggml_backend_sycl_moe_multi_gpu_requested(), the gate the
-    // multi-device plan itself uses).
-    bool             hidden_gpus_participate = false;
+    // ggml_sycl_info().total_gpu_count: the physical GPUs, hidden or not.
+    int              total_gpu_count   = 0;
+    // Whether the placement planner runs its multi-device plan
+    // (ggml_backend_sycl_moe_multi_gpu_requested(), the gate the plan itself
+    // uses). That plan budgets every physical GPU, the single-device plan
+    // only the scheduler's, so the two divide the same devices differently.
+    bool             multi_device_plan = false;
     // The multi-GPU placement knobs that are set (GGML_SYCL_MULTI_GPU_MODE,
     // GGML_SYCL_SPLIT_RATIO, GGML_SYCL_TENSOR_SPLIT), as "name=value" joined
     // by ';'; empty when none is. They change how work is divided across the
@@ -561,16 +561,23 @@ struct UbatchDeviceTopology {
     std::string      placement_config;
 };
 
+// Whether the topology runs the multi-device plan: its gate holds and there
+// is more than one GPU for it to divide work across.
+inline bool ubatch_multi_device_plan(const UbatchDeviceTopology & topo) {
+    return topo.multi_device_plan && topo.total_gpu_count >= 2;
+}
+
 // The devices whose budgets decide which n_ubatch fits: the scheduler devices
-// in order, then (when the planner may use them) each hidden physical GPU in
-// index order. Keying on the scheduler devices alone made a collapsed
-// level_zero:0,1 split and level_zero:0 alone the same set, [0].
+// in order, then (under the multi-device plan, which budgets every physical
+// GPU) each physical GPU the scheduler does not list, in index order.
+// Keying on the scheduler devices alone made a collapsed level_zero:0,1 split
+// and level_zero:0 alone the same set, [0].
 inline std::vector<int> ubatch_participating_devices(const UbatchDeviceTopology & topo) {
     std::vector<int> devices = topo.scheduler_devices;
-    if (!topo.hidden_gpus_participate) {
+    if (!ubatch_multi_device_plan(topo)) {
         return devices;
     }
-    for (int d = topo.scheduler_visible_count; d < topo.total_gpu_count; ++d) {
+    for (int d = 0; d < topo.total_gpu_count; ++d) {
         if (std::find(devices.begin(), devices.end(), d) == devices.end()) {
             devices.push_back(d);
         }
@@ -602,7 +609,10 @@ inline std::string ubatch_placement_config(const char * const * names, const cha
 // collapsed level_zero:0,1 split (scheduler [0], device 1 hidden) and a
 // SPLIT_RATIO/TENSOR_SPLIT split (scheduler [0,1]) have the same devices but
 // different demand, since only the latter puts compute buffers on device 1.
-// A non-empty placement_config is appended after '|'. `identities` is
+// "|plan=multi" follows when the multi-device plan runs: with every GPU
+// scheduler-visible nothing is hidden, yet that plan and the single-device
+// one still divide the devices differently. A non-empty placement_config is
+// appended after a further '|'. `identities` is
 // indexed by device index. Returns an empty string when a participating
 // index has no identity, which the caller treats as "no key" rather than
 // composing one that under-describes the set.
@@ -626,7 +636,13 @@ inline std::string ubatch_device_set_key(const UbatchDeviceTopology &           
         key += sanitize_device_name(id.device_name) + "@" + id.driver_version +
                "/pct=" + std::to_string(id.budget_pct) + "/headroom=" + std::to_string(id.external_headroom);
     }
-    if (!key.empty() && !topo.placement_config.empty()) {
+    if (key.empty()) {
+        return key;
+    }
+    if (ubatch_multi_device_plan(topo)) {
+        key += "|plan=multi";
+    }
+    if (!topo.placement_config.empty()) {
         key += "|" + topo.placement_config;
     }
     return key;

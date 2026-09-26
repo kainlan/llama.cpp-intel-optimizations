@@ -1636,19 +1636,45 @@ def test_header_declares_the_ubatch_cache_key_and_four_accessors():
     # quality round 1, Q2: lookup gained a reason_buf/reason_buf_size pair so
     # the caller can tell a TERMINAL cached outcome from a transient one.
     assert re.search(
-        r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_lookup_v5\s*\(\s*const\s+struct\s+"
+        r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_lookup_layout1\s*\(\s*const\s+struct\s+"
         r"ggml_sycl_ubatch_cache_key\s*\*\s*key\s*,\s*uint32_t\s*\*\s*n_ubatch\s*,\s*char\s*\*\s*reason_buf\s*,"
         r"\s*size_t\s+reason_buf_size\s*\)\s*;",
         GGML_SYCL_H_CODE,
     ), (
-        "ggml_backend_sycl_ubatch_cache_lookup_v5(const ggml_sycl_ubatch_cache_key*, uint32_t*, char*, size_t) must "
+        "ggml_backend_sycl_ubatch_cache_lookup_layout1(const ggml_sycl_ubatch_cache_key*, uint32_t*, char*, size_t) must "
         "be declared"
     )
     assert re.search(
-        r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_store_v5\s*\(\s*const\s+struct\s+"
+        r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_store_layout1\s*\(\s*const\s+struct\s+"
         r"ggml_sycl_ubatch_cache_key\s*\*\s*key\s*,\s*uint32_t\s+n_ubatch\s*,\s*const\s+char\s*\*\s*reason\s*\)\s*;",
         GGML_SYCL_H_CODE,
-    ), "ggml_backend_sycl_ubatch_cache_store_v5(const ggml_sycl_ubatch_cache_key*, uint32_t, const char*) must be declared"
+    ), (
+        "ggml_backend_sycl_ubatch_cache_store_layout1(const ggml_sycl_ubatch_cache_key*, uint32_t, const char*) must "
+        "be declared"
+    )
+
+
+def test_ubatch_cache_key_layout_is_pinned_next_to_the_accessors():
+    """The _layoutN suffix only protects a GGML_BACKEND_DL pair if a layout
+    change forces a rename, so the backend pins the struct's size and every
+    field's offset; ggml-sycl.h's comment points at that check."""
+    code = _normalize_ws(UBATCH_TUNING_CACHE_CPP_CODE)
+    assert re.search(r"static_assert\s*\([^;]*sizeof\s*\(\s*ggml_sycl_ubatch_cache_key\s*\)\s*==\s*72", code), (
+        "ubatch-tuning-cache.cpp must static_assert sizeof(ggml_sycl_ubatch_cache_key)"
+    )
+    for field in ("devices", "n_devices", "model_name", "model_size", "model_hash", "n_ctx", "n_batch",
+                  "flash_attn", "n_seq_max", "type_k", "type_v", "kv_unified", "swa_full"):
+        assert re.search(rf"UBATCH_CACHE_KEY_FIELD_AT\s*\(\s*{field}\s*,\s*\d+\s*\)\s*;", code), (
+            f"ubatch-tuning-cache.cpp must pin the offset of ggml_sycl_ubatch_cache_key::{field}"
+        )
+    assert re.search(
+        r"#define UBATCH_CACHE_KEY_FIELD_AT\s*\(\s*field\s*,\s*offset\s*\)\s*\\?\s*static_assert\s*\([^;]*"
+        r"offsetof\s*\(\s*ggml_sycl_ubatch_cache_key\s*,\s*field\s*\)\s*==\s*\(\s*offset\s*\)",
+        UBATCH_TUNING_CACHE_CPP,
+    ), "UBATCH_CACHE_KEY_FIELD_AT must static_assert offsetof(ggml_sycl_ubatch_cache_key, field) == offset"
+    assert "ubatch-tuning-cache.cpp" in GGML_SYCL_H and "static_assert" in GGML_SYCL_H, (
+        "ggml-sycl.h's comment must point at the layout check"
+    )
 
 
 def test_proc_address_registers_the_four_ubatch_cache_accessors():
@@ -1658,8 +1684,8 @@ def test_proc_address_registers_the_four_ubatch_cache_accessors():
     for symbol in (
         "ggml_backend_sycl_ubatch_cache_enabled",
         "ggml_backend_sycl_ubatch_cache_path",
-        "ggml_backend_sycl_ubatch_cache_lookup_v5",
-        "ggml_backend_sycl_ubatch_cache_store_v5",
+        "ggml_backend_sycl_ubatch_cache_lookup_layout1",
+        "ggml_backend_sycl_ubatch_cache_store_layout1",
     ):
         assert re.search(
             rf'strcmp\(\s*name\s*,\s*"{symbol}"\s*\)\s*==\s*0\s*\)\s*\{{\s*'
@@ -1722,13 +1748,13 @@ def test_ubatch_cache_disabled_by_env_var_zero():
         UBATCH_TUNING_CACHE_CPP_CODE,
     ), 'GGML_SYCL_TUNING_CACHE="0" must return false (disabled) from the memoized accessor'
     assert re.search(
-        r"ggml_backend_sycl_ubatch_cache_lookup_v5[\s\S]{0,400}?ubatch_tuning_cache_env_enabled\s*\(\s*\)",
+        r"ggml_backend_sycl_ubatch_cache_lookup_layout1[\s\S]{0,400}?ubatch_tuning_cache_env_enabled\s*\(\s*\)",
         UBATCH_TUNING_CACHE_CPP_CODE,
-    ), "ggml_backend_sycl_ubatch_cache_lookup_v5 must consult the enabled accessor before doing anything else"
+    ), "ggml_backend_sycl_ubatch_cache_lookup_layout1 must consult the enabled accessor before doing anything else"
     assert re.search(
-        r"ggml_backend_sycl_ubatch_cache_store_v5[\s\S]{0,400}?ubatch_tuning_cache_env_enabled\s*\(\s*\)",
+        r"ggml_backend_sycl_ubatch_cache_store_layout1[\s\S]{0,400}?ubatch_tuning_cache_env_enabled\s*\(\s*\)",
         UBATCH_TUNING_CACHE_CPP_CODE,
-    ), "ggml_backend_sycl_ubatch_cache_store_v5 must consult the enabled accessor before doing anything else"
+    ), "ggml_backend_sycl_ubatch_cache_store_layout1 must consult the enabled accessor before doing anything else"
 
 
 def test_ubatch_cache_lookup_and_store_have_mutation_witnesses():
@@ -1927,18 +1953,18 @@ def test_device_set_hash_is_gone():
 
 def test_backend_extends_the_device_set_with_hidden_planner_gpus():
     """ubatch-tuning-cache.cpp must compose the key over the PARTICIPATING
-    set: the context's devices plus the GPUs the scheduler hides, gated on
-    the same ggml_backend_sycl_moe_multi_gpu_requested() the multi-device
-    plan uses, with each device's budget from its budget authority."""
+    set: the context's devices plus, under the multi-device plan, every other
+    physical GPU, gated on the same ggml_backend_sycl_moe_multi_gpu_requested()
+    the multi-device plan uses, with each device's budget from its budget
+    authority."""
     code = _normalize_ws(UBATCH_TUNING_CACHE_CPP_CODE)
     for pattern, what in (
-        (r"topo\.scheduler_visible_count\s*=\s*info\.device_count\s*;", "the scheduler-visible count"),
         (r"topo\.total_gpu_count\s*=\s*std::min\s*\(\s*info\.total_gpu_count\s*,", "the physical GPU count"),
-        (r"topo\.hidden_gpus_participate\s*=\s*ggml_backend_sycl_moe_multi_gpu_requested\s*\(\s*\)\s*;",
+        (r"topo\.multi_device_plan\s*=\s*ggml_backend_sycl_moe_multi_gpu_requested\s*\(\s*\)\s*;",
          "the planner's own multi-GPU gate"),
         (r"for\s*\(\s*int\s+device\s*:\s*ubatch_participating_devices\s*\(\s*topo\s*\)\s*\)",
          "a walk over the participating devices"),
-        (r"ggml_sycl::ggml_sycl_existing_device_budget_authority\s*\(",
+        (r"ggml_sycl::ggml_sycl_device_budget_authority_existing\s*\(",
          "each device's budget authority, read without constructing a cache"),
         (r"id\.budget_pct\s*=\s*budget\.budget_pct\s*;", "the budget percentage"),
         (r"id\.external_headroom\s*=\s*budget\.external_headroom\s*;", "the external headroom"),
@@ -1977,7 +2003,7 @@ def test_hidden_gpu_gate_holds_for_a_dense_model():
     _assert_hidden_gpu_gate_model_independent(_normalize_ws(GGML_SYCL_CPP_CODE))
 
 
-def _assert_hidden_gpu_gate_model_independent(code: str) -> None:
+def _hidden_gpu_gate_body(code: str) -> str:
     start = code.find("bool ggml_backend_sycl_moe_multi_gpu_requested() {")
     assert start != -1, "could not find ggml_backend_sycl_moe_multi_gpu_requested()'s definition"
     open_idx = code.index("{", start)
@@ -1987,46 +2013,65 @@ def _assert_hidden_gpu_gate_model_independent(code: str) -> None:
         if depth == 0:
             end = i
             break
-    body = code[open_idx + 1:end]
-    assert re.search(r"return\s+ggml_sycl_info\s*\(\s*\)\.total_gpu_count\s*>=\s*2\s*;\s*$", body.strip()), (
-        "with no env set, the gate must be total_gpu_count >= 2 alone"
+    return code[open_idx + 1:end].strip()
+
+
+# The whole gate, whitespace-normalized: the GGML_SYCL_MOE_MULTI_GPU override,
+# then total_gpu_count >= 2 alone. An exact match rather than a forbid-list of
+# model terms, so ANY new input -- an expert count, g_model_n_layer, a global
+# nobody has named yet -- fails it.
+_HIDDEN_GPU_GATE_BODY = _normalize_ws(
+    'const char * env = std::getenv("GGML_SYCL_MOE_MULTI_GPU"); '
+    "if (env) { return std::atoi(env) != 0 && ggml_sycl_info().total_gpu_count >= 2; } "
+    "return ggml_sycl_info().total_gpu_count >= 2;"
+)
+
+
+def _assert_hidden_gpu_gate_model_independent(code: str) -> None:
+    body = _hidden_gpu_gate_body(code)
+    assert body == _HIDDEN_GPU_GATE_BODY, (
+        "the hidden-GPU gate must be exactly the env override plus total_gpu_count >= 2 -- it must not depend "
+        f"on the model; got: {body!r}"
     )
-    for model_term in ("n_expert", "is_moe", "g_moe_n_experts_total"):
-        assert model_term not in body, f"the hidden-GPU gate must not depend on the model ({model_term})"
 
 
-_HIDDEN_GPU_GATE_RETURN = "    return ggml_sycl_info().total_gpu_count >= 2;\n}\n\n// backend device"
+_HIDDEN_GPU_GATE_RETURN = "\n    return ggml_sycl_info().total_gpu_count >= 2;\n}"
 
 
-def _hidden_gpu_gate_mutant(replacement: str) -> str:
+def _hidden_gpu_gate_mutant(insert_before_return: str = "", replace_return: str = "") -> str:
+    """Mutate the gate's final return, located from the function's own
+    signature so the anchor does not depend on what follows it."""
     raw = GGML_SYCL_CPP
-    assert raw.count(_HIDDEN_GPU_GATE_RETURN) == 1, (
-        "mutation target not found -- update this witness to match the real source"
-    )
-    mutated_raw = raw.replace(_HIDDEN_GPU_GATE_RETURN, replacement, 1)
+    fn = raw.find("bool ggml_backend_sycl_moe_multi_gpu_requested() {")
+    assert fn != -1, "mutation target not found -- update this witness to match the real source"
+    ret = raw.find(_HIDDEN_GPU_GATE_RETURN, fn)
+    assert ret != -1, "mutation target not found -- update this witness to match the real source"
+    original = _HIDDEN_GPU_GATE_RETURN
+    replacement = insert_before_return + (replace_return or original)
+    mutated_raw = raw[:ret] + replacement + raw[ret + len(original):]
     assert mutated_raw != raw
     return _normalize_ws(strip_comments(mutated_raw))
 
 
 def test_hidden_gpu_gate_holds_for_a_dense_model_has_a_mutation_witness():
-    """Mutation witness for the model-term check above: an early return on
-    the expert count leaves the trailing `return ... >= 2;` intact, so only
-    the model-term loop can catch it -- the change that would make a dense
-    level_zero:0,1 split key as its first card alone."""
+    """Mutation witness for the check above: an early return on the expert
+    count leaves the trailing `return ... >= 2;` intact -- the change that
+    would make a dense level_zero:0,1 split key as its first card alone."""
     mutated = _hidden_gpu_gate_mutant(
-        "    if (g_moe_n_experts_total == 0) {\n        return false;\n    }\n" + _HIDDEN_GPU_GATE_RETURN
+        insert_before_return="\n    if (g_moe_n_experts_total == 0) {\n        return false;\n    }"
     )
     with pytest.raises(AssertionError, match="must not depend on the model"):
         _assert_hidden_gpu_gate_model_independent(mutated)
 
 
-def test_hidden_gpu_gate_return_shape_has_a_mutation_witness():
-    """Mutation witness for the return-shape check above: a model term
-    folded into the final return breaks the `total_gpu_count >= 2` shape."""
+def test_hidden_gpu_gate_unnamed_model_input_has_a_mutation_witness():
+    """Mutation witness that the exact-shape check is not a forbid-list: a
+    model input no list names (g_model_n_layer) folded into the return is
+    caught too."""
     mutated = _hidden_gpu_gate_mutant(
-        "    return ggml_sycl_info().total_gpu_count >= 2 && g_moe_n_experts_total > 0;\n}\n\n// backend device"
+        replace_return="\n    return ggml_sycl_info().total_gpu_count >= 2 && g_model_n_layer > 0;\n}"
     )
-    with pytest.raises(AssertionError, match="total_gpu_count >= 2 alone"):
+    with pytest.raises(AssertionError, match="must not depend on the model"):
         _assert_hidden_gpu_gate_model_independent(mutated)
 
 

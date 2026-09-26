@@ -1272,14 +1272,12 @@ static UbatchDeviceIdentity ubatch_test_identity(const char * name, int budget_p
 }
 
 static UbatchDeviceTopology ubatch_test_topology(std::vector<int> scheduler_devices,
-                                                 int              scheduler_visible_count,
                                                  int              total_gpu_count,
-                                                 bool             hidden_gpus_participate) {
+                                                 bool             multi_device_plan) {
     UbatchDeviceTopology topo;
-    topo.scheduler_devices       = std::move(scheduler_devices);
-    topo.scheduler_visible_count = scheduler_visible_count;
-    topo.total_gpu_count         = total_gpu_count;
-    topo.hidden_gpus_participate = hidden_gpus_participate;
+    topo.scheduler_devices = std::move(scheduler_devices);
+    topo.total_gpu_count   = total_gpu_count;
+    topo.multi_device_plan = multi_device_plan;
     return topo;
 }
 
@@ -1291,15 +1289,14 @@ static const char * const k_igpu = "Intel(R) Graphics";
 // device sets, at the same budget percentage. This is the dense case too:
 // the hidden-GPU gate (ggml_backend_sycl_moe_multi_gpu_requested()) is
 // total_gpu_count >= 2 whatever the model, so a dense Mistral
-// level_zero:0,1 run has hidden_gpus_participate=true and places a layer
+// level_zero:0,1 run has multi_device_plan=true and places a layer
 // block on the B50. test-sycl-auto-ubatch-source pins that gate's model
 // independence.
 TEST(ubatch_device_set_key_split_differs_from_first_card_alone) {
     const std::string alone =
-        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, 1, false), { ubatch_test_identity(k_b70, 100) });
-    const std::string split =
-        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, 2, true),
-                              { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_b50, 100) });
+        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, false), { ubatch_test_identity(k_b70, 100) });
+    const std::string split = ubatch_device_set_key(
+        ubatch_test_topology({ 0 }, 2, true), { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_b50, 100) });
     ASSERT(!alone.empty());
     ASSERT(split != alone);
     return true;
@@ -1308,7 +1305,7 @@ TEST(ubatch_device_set_key_split_differs_from_first_card_alone) {
 // Test: the same device set under a different VRAM budget percentage (or a
 // different external headroom) fits differently, so it is a different key.
 TEST(ubatch_device_set_key_includes_budget) {
-    const UbatchDeviceTopology alone_topo = ubatch_test_topology({ 0 }, 1, 1, false);
+    const UbatchDeviceTopology alone_topo = ubatch_test_topology({ 0 }, 1, false);
     const std::string          at_100     = ubatch_device_set_key(alone_topo, { ubatch_test_identity(k_b70, 100) });
     const std::string          at_22      = ubatch_device_set_key(alone_topo, { ubatch_test_identity(k_b70, 22) });
     ASSERT(at_100 != at_22);
@@ -1318,7 +1315,7 @@ TEST(ubatch_device_set_key_includes_budget) {
     ASSERT(ubatch_device_set_key(alone_topo, { other_headroom }) != at_100);
 
     // A budget change on the SECOND card alone must move the key too.
-    const UbatchDeviceTopology split_topo = ubatch_test_topology({ 0 }, 1, 2, true);
+    const UbatchDeviceTopology split_topo = ubatch_test_topology({ 0 }, 2, true);
     const std::string          both_22 =
         ubatch_device_set_key(split_topo, { ubatch_test_identity(k_b70, 22), ubatch_test_identity(k_b50, 22) });
     const std::string b50_at_30 =
@@ -1330,7 +1327,7 @@ TEST(ubatch_device_set_key_includes_budget) {
 // Test: every participating device's identity is keyed, not just its index --
 // [B70, B50] and [B70, iGPU] share indices [0, 1].
 TEST(ubatch_device_set_key_identifies_every_device) {
-    const UbatchDeviceTopology visible_pair = ubatch_test_topology({ 0, 1 }, 2, 2, true);
+    const UbatchDeviceTopology visible_pair = ubatch_test_topology({ 0, 1 }, 2, true);
     const std::string          with_b50 =
         ubatch_device_set_key(visible_pair, { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_b50, 100) });
     const std::string with_igpu =
@@ -1344,10 +1341,10 @@ TEST(ubatch_device_set_key_identifies_every_device) {
 TEST(ubatch_device_set_key_order_and_stability) {
     const std::vector<UbatchDeviceIdentity> ids = { ubatch_test_identity(k_b70, 100),
                                                     ubatch_test_identity(k_b50, 100) };
-    const std::string forward  = ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, 2, true), ids);
-    const std::string reversed = ubatch_device_set_key(ubatch_test_topology({ 1, 0 }, 2, 2, true), ids);
+    const std::string forward                   = ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, true), ids);
+    const std::string reversed                  = ubatch_device_set_key(ubatch_test_topology({ 1, 0 }, 2, true), ids);
     ASSERT(forward != reversed);
-    ASSERT(forward == ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, 2, true), ids));
+    ASSERT(forward == ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, true), ids));
     return true;
 }
 
@@ -1358,8 +1355,8 @@ TEST(ubatch_device_set_key_order_and_stability) {
 TEST(ubatch_device_set_key_collapsed_split_differs_from_visible_split) {
     const std::vector<UbatchDeviceIdentity> ids       = { ubatch_test_identity(k_b70, 100),
                                                           ubatch_test_identity(k_b50, 100) };
-    const UbatchDeviceTopology              collapsed = ubatch_test_topology({ 0 }, 1, 2, true);
-    const UbatchDeviceTopology              visible   = ubatch_test_topology({ 0, 1 }, 2, 2, true);
+    const UbatchDeviceTopology              collapsed = ubatch_test_topology({ 0 }, 2, true);
+    const UbatchDeviceTopology              visible   = ubatch_test_topology({ 0, 1 }, 2, true);
     ASSERT(ubatch_participating_devices(collapsed) == ubatch_participating_devices(visible));
     const std::string collapsed_key = ubatch_device_set_key(collapsed, ids);
     const std::string visible_key   = ubatch_device_set_key(visible, ids);
@@ -1371,19 +1368,22 @@ TEST(ubatch_device_set_key_collapsed_split_differs_from_visible_split) {
 }
 
 // Test: the multi-GPU placement knobs divide work across the same devices
-// differently, so each set value is keyed; an unset one adds nothing, which
-// keeps a single-device key free of them.
+// differently, so each set value is keyed; an unset one adds nothing, and a
+// single-device key carries no '|' suffix at all.
 TEST(ubatch_device_set_key_includes_placement_config) {
     const std::vector<UbatchDeviceIdentity> ids       = { ubatch_test_identity(k_b70, 100),
                                                           ubatch_test_identity(k_b50, 100) };
-    UbatchDeviceTopology                    layer     = ubatch_test_topology({ 0 }, 1, 2, true);
+    UbatchDeviceTopology                    layer     = ubatch_test_topology({ 0 }, 2, true);
     UbatchDeviceTopology                    hybrid    = layer;
     const std::string                       unset_key = ubatch_device_set_key(layer, ids);
     layer.placement_config                            = "mode=layer";
     hybrid.placement_config                           = "mode=hybrid";
     ASSERT(ubatch_device_set_key(layer, ids) != unset_key);
     ASSERT(ubatch_device_set_key(layer, ids) != ubatch_device_set_key(hybrid, ids));
-    ASSERT(unset_key.find('|') == std::string::npos);
+    ASSERT(unset_key.find("mode=") == std::string::npos);
+    const std::string alone =
+        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, false), { ubatch_test_identity(k_b70, 100) });
+    ASSERT(alone.find('|') == std::string::npos);
     return true;
 }
 
@@ -1408,21 +1408,51 @@ TEST(ubatch_placement_config_empty_value_is_unset) {
 // first-card-alone entry.
 TEST(ubatch_device_set_key_idle_hidden_gpu_is_not_keyed) {
     const std::string alone =
-        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, 1, false), { ubatch_test_identity(k_b70, 100) });
-    const std::string idle_split =
-        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, 2, false),
-                              { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_b50, 100) });
+        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, false), { ubatch_test_identity(k_b70, 100) });
+    const std::string idle_split = ubatch_device_set_key(
+        ubatch_test_topology({ 0 }, 2, false), { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_b50, 100) });
     ASSERT(idle_split == alone);
     return true;
 }
 
-// Test: the participating list is the scheduler devices in order, then each
-// hidden physical GPU in index order, without repeating one.
+// Test: with SPLIT_RATIO/TENSOR_SPLIT every GPU is scheduler-visible, so no
+// device is hidden -- yet the planner still runs the multi-device plan or the
+// single-device one depending on its gate. The key must record which.
+TEST(ubatch_device_set_key_visible_pair_keys_the_plan) {
+    const std::vector<UbatchDeviceIdentity> ids = { ubatch_test_identity(k_b70, 100),
+                                                    ubatch_test_identity(k_b50, 100) };
+    ASSERT(ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, true), ids) !=
+           ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, false), ids));
+    return true;
+}
+
+// Test: the multi-device plan budgets every physical GPU, so a scheduler list
+// that is a strict subset of the visible ones (e.g. only device 1) still keys
+// the others, marked hidden.
+TEST(ubatch_device_set_key_visible_subset_keys_every_planner_gpu) {
+    const std::vector<UbatchDeviceIdentity> ids = { ubatch_test_identity(k_b70, 100),
+                                                    ubatch_test_identity(k_b50, 100) };
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 1 }, 2, true)) == std::vector<int>{ 1, 0 }));
+    const std::string key = ubatch_device_set_key(ubatch_test_topology({ 1 }, 2, true), ids);
+    ASSERT(key.find("hidden:" + sanitize_device_name(k_b70)) != std::string::npos);
+    return true;
+}
+
+// Test: a participating device with no identity yields no key at all, never
+// one that under-describes the set.
+TEST(ubatch_device_set_key_missing_identity_is_no_key) {
+    ASSERT(ubatch_device_set_key(ubatch_test_topology({ 0 }, 2, true), { ubatch_test_identity(k_b70, 100) }).empty());
+    return true;
+}
+
+// Test: the participating list is the scheduler devices in order, then (under
+// the multi-device plan) each physical GPU the scheduler does not list, in
+// index order, without repeating one.
 TEST(ubatch_participating_devices_order) {
-    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 1, 2, true)) == std::vector<int>{ 0, 1 }));
-    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 1, 3, true)) == std::vector<int>{ 0, 1, 2 }));
-    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 1, 2, false)) == std::vector<int>{ 0 }));
-    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 1, 0 }, 2, 2, true)) == std::vector<int>{ 1, 0 }));
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 2, true)) == std::vector<int>{ 0, 1 }));
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 3, true)) == std::vector<int>{ 0, 1, 2 }));
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 2, false)) == std::vector<int>{ 0 }));
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 1, 0 }, 2, true)) == std::vector<int>{ 1, 0 }));
     return true;
 }
 
@@ -1498,6 +1528,9 @@ int main() {
     RUN_TEST(ubatch_device_set_key_includes_placement_config);
     RUN_TEST(ubatch_placement_config_empty_value_is_unset);
     RUN_TEST(ubatch_device_set_key_idle_hidden_gpu_is_not_keyed);
+    RUN_TEST(ubatch_device_set_key_visible_pair_keys_the_plan);
+    RUN_TEST(ubatch_device_set_key_visible_subset_keys_every_planner_gpu);
+    RUN_TEST(ubatch_device_set_key_missing_identity_is_no_key);
     RUN_TEST(ubatch_participating_devices_order);
 
     std::cout << "\n=== Summary ===\n";
