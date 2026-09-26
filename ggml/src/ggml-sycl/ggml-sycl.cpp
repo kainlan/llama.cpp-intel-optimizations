@@ -27096,7 +27096,12 @@ static bool ggml_sycl_onednn_pp_candidate(
     admission.contiguous_quantized_weight = ggml_is_quantized(src0->type) && ggml_is_contiguous(src0);
     const ggml_sycl::onednn_pp_refusal refusal = ggml_sycl::onednn_pp_admission_decide(admission);
     if (refusal != ggml_sycl::onednn_pp_refusal::NONE) {
-        trace_reject(ggml_sycl::onednn_pp_refusal_name(refusal));
+        // The MXFP4 direct block asks on every call, decode included, and
+        // decode is never oneDNN PP. Tracing those refusals would spend the
+        // shared budget above on lines that say nothing.
+        if (route != ggml_sycl::onednn_pp_route::MXFP4_DIRECT || admission.batch > 1) {
+            trace_reject(ggml_sycl::onednn_pp_refusal_name(refusal));
+        }
         return false;
     }
     ggml_sycl::onednn_pp_placement placement  = ggml_sycl::onednn_pp_placement::ALLOWED;
@@ -97657,7 +97662,14 @@ static void ggml_sycl_mmvq_soa_pre_allocate_buffers(ggml_backend_sycl_context & 
         }
 #    if GGML_SYCL_DNNL
         // Skip PP-sized MUL_MATs when oneDNN handles them — they use FP16 dequant,
-        // not Q8_1, so pre-allocating Q8_1 buffers wastes VRAM
+        // not Q8_1, so pre-allocating Q8_1 buffers wastes VRAM.
+        // This asks the dense route even for an MXFP4 op that the direct block
+        // in ggml_sycl_mul_mat will admit at M 2-15. That over-reserves, which
+        // is safe. Picking the MXFP4 route here from src0->type alone would err
+        // the unsafe way: an MXFP4 op that fails the direct block's runtime
+        // guard (planned-host weight, src0 pointer kind) goes to the dense
+        // dispatcher and its floor of 16, and would lose a buffer it may need
+        // during recording (llama.cpp-je3b).
         if (ggml_sycl_onednn_pp_candidate(src0, src1, node, ctx.device)) {
             continue;
         }

@@ -247,9 +247,17 @@ def test_every_mxfp4_direct_onednn_gemm_is_admitted_by_the_candidate():
     assert len(gemms) == 2, f"expected 2 oneDNN GEMMs (SOA and AOS arms) in the MXFP4 direct block, found {len(gemms)}"
     for g in gemms:
         conds = enclosing_if_conditions(backend, lo, hi, g)
-        assert any(re.search(r"\b" + re.escape(var) + r"\b", c) for c in conds), (
-            f"oneDNN GEMM at line {line_of(backend, g)} is not guarded by the candidate's answer `{var}`"
-        )
+        guards = [c for c in conds if re.search(r"\b" + re.escape(var) + r"\b", c)]
+        assert guards, f"oneDNN GEMM at line {line_of(backend, g)} is not guarded by the candidate's answer `{var}`"
+        # `var` must be a plain conjunct of its guard: `var || x` or `!var`
+        # names the answer without being bound by it.
+        for c in guards:
+            flat = " ".join(c.split())
+            conjuncts = [t.strip() for t in flat.split("&&")]
+            assert "||" not in flat and var in conjuncts, (
+                f"oneDNN GEMM at line {line_of(backend, g)} is guarded by `{flat}`; `{var}` must be a bare "
+                "conjunct of that guard, with no `||`"
+            )
         adhoc = [c for c in conds if re.search(r"\bM\s*>=?\s*\d", c)]
         assert not adhoc, (
             f"oneDNN GEMM at line {line_of(backend, g)} carries its own batch admission "
@@ -258,10 +266,11 @@ def test_every_mxfp4_direct_onednn_gemm_is_admitted_by_the_candidate():
 
 
 def test_mxfp4_direct_route_is_named_only_by_the_mxfp4_direct_block():
-    lo, hi = mxfp4_direct_span()
+    # The asker names the route; the candidate, which interprets it, may too.
+    spans = [mxfp4_direct_span(), function_span(backend, "ggml_sycl_onednn_pp_candidate")]
     uses = [m.start() for m in re.finditer(r"onednn_pp_route\s*::\s*MXFP4_DIRECT\b", backend)]
     assert uses, "onednn_pp_route::MXFP4_DIRECT is never used: the MXFP4 direct block does not ask the candidate"
-    stray = [line_of(backend, s) for s in uses if not (lo < s < hi)]
+    stray = [line_of(backend, s) for s in uses if not any(lo < s < hi for lo, hi in spans)]
     assert not stray, (
         f"onednn_pp_route::MXFP4_DIRECT used outside the MXFP4 direct block at line(s) {stray}: dense sites keep "
         "the dispatcher's floor"
