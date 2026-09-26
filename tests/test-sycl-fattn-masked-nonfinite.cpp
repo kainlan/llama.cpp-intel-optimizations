@@ -32,13 +32,22 @@
 //   Documented deviation: the XMX v1 and v2 tile kernels multiply a whole V
 // tile on the matrix engine, and "dead" is decided per work-group tile, so a
 // cell visible to any row of the tile keeps its V and 0 * NaN reaches the rows
-// of that tile that mask it. For those kernels, and for v_partial only, a
-// SYCL-non-finite row where the CPU row is finite is reported and allowed.
+// of that tile that mask it. For those kernels, and for the V variants only
+// (v_partial, and v_underflow below), a SYCL-non-finite row where the CPU row
+// is finite is reported and allowed.
 // This differs from the CPU there, and it is acceptable: the NaN is a genuine
 // non-finite visible input, so the batch already reports NaN for the rows that
 // see it; zeroing it instead would hide it from those rows as well. K needs no
 // such allowance, because the mask is a per-element select that runs before
 // the softmax.
+//
+// Every case except the fully masked set also runs v_underflow: NaN in the V
+// row of the same cell, which the rows that see it see through a finite mask
+// of -60000 instead of 0. Its softmax weight underflows to exactly 0, but the
+// cell is VISIBLE, so the CPU still adds 0 * V and reports NaN for those rows.
+// A kernel that skips a cell because its weight is 0, rather than because its
+// mask is -inf, hides that NaN (hidden_rows > 0). Only a -inf mask means the
+// cell does not exist. The XMX tile allowance above applies here too.
 //
 // The CPU backend runs with use_ref: its tiled multi-query path adds the mask to
 // the score and multiplies masked V by 0 exactly like the kernels under test, so
@@ -95,7 +104,12 @@ enum poison_kind {
     POISON_V,
     POISON_K_PARTIAL,
     POISON_V_PARTIAL,
+    POISON_V_UNDERFLOW,
 };
+
+// The finite mask value the v_underflow variant gives its visible cell: large
+// enough that exp(score - max) is exactly 0 in f32, still representable in f16.
+static constexpr float UNDERFLOW_MASK = -60000.0f;
 
 static const char * poison_name(poison_kind p) {
     switch (p) {
@@ -109,6 +123,8 @@ static const char * poison_name(poison_kind p) {
             return "k_partial";
         case POISON_V_PARTIAL:
             return "v_partial";
+        case POISON_V_UNDERFLOW:
+            return "v_underflow";
     }
     return "?";
 }
@@ -161,6 +177,11 @@ static int partial_cell(const fa_case & c) {
 
 static bool poison_is_partial(poison_kind p) {
     return p == POISON_K_PARTIAL || p == POISON_V_PARTIAL;
+}
+
+// Variants whose CPU output has NaN rows by design, scored row by row.
+static bool poison_is_rowwise(poison_kind p) {
+    return poison_is_partial(p) || p == POISON_V_UNDERFLOW;
 }
 
 static float poison_value(size_t i) {
@@ -238,11 +259,19 @@ static fa_inputs make_inputs(const fa_case & c, poison_kind poison) {
 
     if (poison != POISON_NONE) {
         const bool                 is_k    = poison == POISON_K || poison == POISON_K_PARTIAL;
-        const bool                 partial = poison_is_partial(poison);
+        const bool                 rowwise = poison_is_rowwise(poison);
         std::vector<ggml_fp16_t> & dst     = is_k ? in.k : in.v;
-        const std::vector<int> cells = partial ? std::vector<int>{ partial_cell(c) } : poison_cells(c.n_kv, c.n_used);
+        const std::vector<int> cells = rowwise ? std::vector<int>{ partial_cell(c) } : poison_cells(c.n_kv, c.n_used);
+        if (poison == POISON_V_UNDERFLOW) {
+            for (int r = 0; r < c.ne01; ++r) {
+                ggml_fp16_t & m = in.mask[(size_t) r * c.n_kv + cells[0]];
+                if (ggml_fp16_to_fp32(m) == 0.0f) {
+                    m = ggml_fp32_to_fp16(UNDERFLOW_MASK);
+                }
+            }
+        }
         for (size_t i = 0; i < cells.size(); ++i) {
-            const ggml_fp16_t val = ggml_fp32_to_fp16(partial ? NAN : poison_value(i));
+            const ggml_fp16_t val = ggml_fp32_to_fp16(rowwise ? NAN : poison_value(i));
             for (int h = 0; h < c.H_kv; ++h) {
                 for (int d = 0; d < c.D; ++d) {
                     dst[((size_t) h * c.n_kv + cells[i]) * c.D + d] = val;
@@ -481,7 +510,7 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
     }
 
     // dst is [D, H_q, ne01]: one row per (query, head).
-    const bool   partial       = poison_is_partial(poison);
+    const bool   rowwise       = poison_is_rowwise(poison);
     const size_t n_rows        = ref.size() / (size_t) c.D;
     size_t       cpu_nonfinite = 0;
     size_t       gpu_nonfinite = 0;
@@ -494,7 +523,7 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
     double       mse_diff      = 0.0;
     double       mse_ref       = 0.0;
     double       max_diff      = 0.0;
-    double       cmp_diff      = 0.0;  // partial variants: over rows finite on both sides
+    double       cmp_diff      = 0.0;  // row-wise variants: over rows finite on both sides
     double       cmp_ref       = 0.0;
     double       cmp_max_diff  = 0.0;
     for (size_t r = 0; r < n_rows; ++r) {
@@ -544,11 +573,11 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
         }
     }
     // A non-finite SYCL value has no finite distance to the reference, so it
-    // must never be summarised as a small error. The partial variants expect
+    // must never be summarised as a small error. The row-wise variants expect
     // non-finite rows, check them row by row above, and measure the error over
     // the rows both sides report finite.
     double nmse = 0.0;
-    if (partial) {
+    if (rowwise) {
         max_diff = cmp_max_diff;
         if (cmp_ref > 0.0) {
             nmse = cmp_diff / cmp_ref;
@@ -576,15 +605,18 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
     // tile that mask it.
     const bool xmx_tile = kernel.rfind("xmx_v1", 0) == 0 || kernel.rfind("xmx_v2_f16_ncols", 0) == 0 ||
                           kernel.rfind("xmx_v2_f16_pp_ncols", 0) == 0;
-    const bool spill_allowed = poison == POISON_V_PARTIAL && xmx_tile;
+    const bool spill_allowed = (poison == POISON_V_PARTIAL || poison == POISON_V_UNDERFLOW) && xmx_tile;
 
     // With no visible cell at all the CPU output is legitimately all zero. A
-    // partial variant needs both NaN rows (the cell is visible somewhere) and
-    // finite rows (it is masked somewhere), or it tests nothing.
+    // row-wise variant needs NaN rows (the cell is visible somewhere), and with
+    // several query rows also finite rows (it is masked somewhere), or it tests
+    // nothing.
     const bool expect_all_zero = c.n_used == 0;
-    const bool oracle_ok       = partial ? (cpu_nf_rows > 0 && cpu_nf_rows < n_rows && mse_ref > 0.0) :
-                                           (cpu_nonfinite == 0 && (expect_all_zero ? mse_ref == 0.0 : mse_ref > 0.0));
-    const bool finite_ok = partial ? (hidden_rows == 0 && (spill_rows == 0 || spill_allowed)) : gpu_nonfinite == 0;
+    const bool rowwise_oracle =
+        cpu_nf_rows > 0 && (cpu_nf_rows == n_rows || mse_ref > 0.0) && (c.ne01 == 1 || cpu_nf_rows < n_rows);
+    const bool oracle_ok =
+        rowwise ? rowwise_oracle : (cpu_nonfinite == 0 && (expect_all_zero ? mse_ref == 0.0 : mse_ref > 0.0));
+    const bool finite_ok = rowwise ? (hidden_rows == 0 && (spill_rows == 0 || spill_allowed)) : gpu_nonfinite == 0;
     const bool ok        = oracle_ok && !kernel.empty() && finite_ok && zeroed_rows == 0 && stray_rows == 0 &&
                     sentinel_rows == 0 && (!nmse_gated || nmse <= NMSE_MAX);
 
@@ -594,7 +626,7 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
         ok ? "OK" : "FAIL", label, kernel.empty() ? "<none: no dispatch line captured>" : kernel.c_str(), nmse,
         NMSE_MAX, nmse_gated ? "" : ", not gated", max_diff, gpu_nonfinite, zeroed_rows, n_rows, stray_rows,
         sentinel_rows, cpu_nonfinite);
-    if (partial) {
+    if (rowwise) {
         std::printf("  rows [%s]: cpu_nonfinite_rows=%zu hidden_rows=%zu spill_rows=%zu%s\n", label, cpu_nf_rows,
                     hidden_rows, spill_rows,
                     spill_rows == 0 ? "" : (spill_allowed ? " (allowed: XMX tile deviation)" : " (not allowed)"));
@@ -668,7 +700,8 @@ int main(int, char ** argv) {
         { "d512_decode",      512, 8,  2, 1,  256, 72, false, true,  false },
         { "d512_mq4",         512, 8,  2, 4,  256, 72, false, true,  false },
     };
-    const poison_kind variants[] = { POISON_NONE, POISON_K, POISON_V, POISON_K_PARTIAL, POISON_V_PARTIAL };
+    const poison_kind variants[] = { POISON_NONE,      POISON_K,         POISON_V,
+                                     POISON_K_PARTIAL, POISON_V_PARTIAL, POISON_V_UNDERFLOW };
 
     for (const fa_case & c : cases) {
         std::printf("== %s ==\n", c.name);
