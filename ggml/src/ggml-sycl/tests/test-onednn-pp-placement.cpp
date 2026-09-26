@@ -28,6 +28,7 @@ using ggml_sycl::onednn_pp_admission_decide;
 using ggml_sycl::onednn_pp_admission_inputs;
 using ggml_sycl::onednn_pp_executable;
 using ggml_sycl::onednn_pp_min_batch_for;
+using ggml_sycl::onednn_pp_mxfp4_direct_min_batch;
 using ggml_sycl::onednn_pp_placement;
 using ggml_sycl::onednn_pp_placement_decide;
 using ggml_sycl::onednn_pp_placement_inputs;
@@ -35,8 +36,9 @@ using ggml_sycl::onednn_pp_refusal;
 using ggml_sycl::onednn_pp_route;
 using ggml_sycl::onednn_pp_woq_alternates_allowed;
 
-// An op every route admits: oneDNN PP on, not a skipped type, F32 operands, a
-// contiguous quantized weight, and a batch at the dense floor.
+// An op with every admission input favourable (oneDNN PP on, not a skipped
+// type, F32 operands, a contiguous quantized weight). Whether `batch` clears
+// the route's floor is left to the caller.
 static onednn_pp_admission_inputs admitted_inputs(onednn_pp_route route, int64_t batch) {
     onednn_pp_admission_inputs in;
     in.enabled                     = true;
@@ -125,10 +127,14 @@ int main() {
     {
         CHECK(onednn_pp_min_batch_for(onednn_pp_route::DENSE_DISPATCH, 16) == 16, "case 6: dense floor is the env");
         CHECK(onednn_pp_min_batch_for(onednn_pp_route::DENSE_DISPATCH, 64) == 64, "case 6: dense floor follows env");
-        CHECK(onednn_pp_min_batch_for(onednn_pp_route::MXFP4_DIRECT, 16) == 2, "case 6: mxfp4 floor is 2");
-        CHECK(onednn_pp_min_batch_for(onednn_pp_route::MXFP4_DIRECT, 64) == 2, "case 6: env does not move mxfp4");
+        // Pinned on purpose: moving the MXFP4 direct floor needs a measurement.
+        CHECK(onednn_pp_mxfp4_direct_min_batch == 2, "case 6: mxfp4 floor is every non-decode batch");
+        CHECK(onednn_pp_min_batch_for(onednn_pp_route::MXFP4_DIRECT, 16) == onednn_pp_mxfp4_direct_min_batch,
+              "case 6: mxfp4 route takes its floor");
+        CHECK(onednn_pp_min_batch_for(onednn_pp_route::MXFP4_DIRECT, 64) == onednn_pp_mxfp4_direct_min_batch,
+              "case 6: env does not move mxfp4");
 
-        const int64_t small_batches[] = { 2, 8, 15 };
+        const int64_t small_batches[] = { onednn_pp_mxfp4_direct_min_batch, 8, 15 };
         for (int64_t m : small_batches) {
             CHECK(onednn_pp_admission_decide(admitted_inputs(onednn_pp_route::MXFP4_DIRECT, m)) ==
                       onednn_pp_refusal::NONE,
@@ -140,7 +146,8 @@ int main() {
         CHECK(
             onednn_pp_admission_decide(admitted_inputs(onednn_pp_route::DENSE_DISPATCH, 16)) == onednn_pp_refusal::NONE,
             "case 6: dense admits its floor");
-        CHECK(onednn_pp_admission_decide(admitted_inputs(onednn_pp_route::MXFP4_DIRECT, 1)) ==
+        CHECK(onednn_pp_admission_decide(
+                  admitted_inputs(onednn_pp_route::MXFP4_DIRECT, onednn_pp_mxfp4_direct_min_batch - 1)) ==
                   onednn_pp_refusal::BATCH_UNDER_THRESHOLD,
               "case 6: decode (M == 1) is never oneDNN PP");
     }
@@ -165,7 +172,7 @@ int main() {
 
         in              = admitted_inputs(route, 512);
         in.f32_operands = false;
-        CHECK(onednn_pp_admission_decide(in) == onednn_pp_refusal::TYPE, "case 7: non-F32 operands");
+        CHECK(onednn_pp_admission_decide(in) == onednn_pp_refusal::OPERAND_TYPE, "case 7: non-F32 operands");
 
         in                             = admitted_inputs(route, 512);
         in.contiguous_quantized_weight = false;

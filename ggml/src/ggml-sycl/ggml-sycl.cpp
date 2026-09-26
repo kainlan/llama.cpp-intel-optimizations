@@ -27057,7 +27057,8 @@ bool ggml_sycl_dense_woq_alternate_eligible_for_plan(ggml_type                  
 // arm asks it, so GGML_SYCL_ONEDNN_PP, GGML_SYCL_SKIP_ONEDNN_Q4_0 and the batch
 // floor bind everywhere (llama.cpp-je3b: the MXFP4 direct arms used to admit
 // themselves with `M >= 2 && executable_on_device`). `route` names the asking
-// arm; it moves only the batch floor (onednn_pp_min_batch_for).
+// arm. It changes two things: the batch floor (onednn_pp_min_batch_for), and,
+// on MXFP4_DIRECT, that refusals below that floor are not traced.
 static bool ggml_sycl_onednn_pp_candidate(
     const ggml_tensor *        src0,
     const ggml_tensor *        src1,
@@ -27097,9 +27098,9 @@ static bool ggml_sycl_onednn_pp_candidate(
     const ggml_sycl::onednn_pp_refusal refusal = ggml_sycl::onednn_pp_admission_decide(admission);
     if (refusal != ggml_sycl::onednn_pp_refusal::NONE) {
         // The MXFP4 direct block asks on every call, decode included, and
-        // decode is never oneDNN PP. Tracing those refusals would spend the
-        // shared budget above on lines that say nothing.
-        if (route != ggml_sycl::onednn_pp_route::MXFP4_DIRECT || admission.batch > 1) {
+        // nothing below its floor is ever oneDNN PP. Tracing those refusals
+        // would spend the shared budget above on lines that say nothing.
+        if (route != ggml_sycl::onednn_pp_route::MXFP4_DIRECT || admission.batch >= admission.min_batch) {
             trace_reject(ggml_sycl::onednn_pp_refusal_name(refusal));
         }
         return false;
@@ -63499,16 +63500,19 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 const int64_t dst_plane_elems  = M * N;
                 // May the SOA/AOS arms below take oneDNN PP? The candidate
                 // answers, as for every other arm; MXFP4_DIRECT moves only
-                // the batch floor (llama.cpp-je3b).
-                const bool    onednn_pp_admitted = ggml_sycl_onednn_pp_candidate(src0, src1, dst, ctx.device,
-                                                                                 ggml_sycl::onednn_pp_route::MXFP4_DIRECT);
+                // the batch floor (llama.cpp-je3b). COALESCED has no oneDNN
+                // arm, so it does not ask: asking can take the cache lock
+                // (executable_on_device) and spends trace budget.
+                const bool    onednn_pp_admitted = data_layout != ggml_sycl_unified::LayoutMode::COALESCED &&
+                                                ggml_sycl_onednn_pp_candidate(src0, src1, dst, ctx.device,
+                                                                              ggml_sycl::onednn_pp_route::MXFP4_DIRECT);
                 if (ggml_sycl_onednn_pp_trace_enabled()) {
                     static std::atomic<int> onednn_pp_direct_trace{ 0 };
                     const int               trace_idx = onednn_pp_direct_trace.fetch_add(1, std::memory_order_relaxed);
                     if (trace_idx < 240) {
                         fprintf(stderr,
                                 "[ONEDNN-PP-TRACE] direct tensor=%s type=%s layout=%d M=%lld K=%lld N=%lld "
-                                "ne02=%lld ne12=%lld ne13=%lld n_batch=%lld i02_divisor=%lld safe=%d\n",
+                                "ne02=%lld ne12=%lld ne13=%lld n_batch=%lld i02_divisor=%lld admitted=%d\n",
                                 src0->name ? src0->name : "?", ggml_type_name(src0->type), (int) data_layout,
                                 (long long) M, (long long) K, (long long) N, (long long) ne02, (long long) ne12,
                                 (long long) ne13, (long long) n_batch, (long long) i02_divisor,

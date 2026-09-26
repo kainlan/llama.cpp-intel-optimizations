@@ -22,9 +22,14 @@ What this file pins:
   2. The batch-floor, enabled and skip_type accessors are only read where
      the question is answered (the candidate; skip_type/enabled also by the
      dense WOQ second-copy predicate, which answers a different question).
+     This covers the accessors only: GGML_SYCL_ONEDNN_PP_MIN_BATCH is also
+     parsed by raw getenv in mmvq.cpp (MMVQ-MoE PP threshold) and in the
+     GGML_SYCL_PP_PIPELINE pre-scan, a partial admission copy tracked on
+     llama.cpp-gkus.
   3. Every oneDNN GEMM in the MXFP4 direct block is guarded by a boolean
-     taken from the candidate called with the MXFP4_DIRECT route, and no
-     guard carries the old ad-hoc `M >= 2` admission.
+     taken from the candidate called with the MXFP4_DIRECT route. Neither
+     that boolean nor any guard around a GEMM compares the batch (M or
+     src1->ne[1]) itself.
   4. The candidate delegates its checks to the pure
      onednn_pp_admission_decide() and asks for executability once.
   5. The pure predicate and the per-route floor are defined once, in the
@@ -47,6 +52,16 @@ BACKEND = Path(
 PLACEMENT = Path(
     os.environ.get("GGML_SYCL_ONEDNN_PP_PLACEMENT_SOURCE", str(ROOT / "ggml/src/ggml-sycl/onednn-pp-placement.hpp"))
 )
+
+
+def in_number(text, i):
+    """True when the ' at text[i] is a C++14 digit separator (1'000,
+    0xFF'FF): it sits inside a token that starts with a digit. A char
+    literal's prefix (u8'a', L'a') starts with a letter, so it is not one."""
+    j = i
+    while j > 0 and (text[j - 1].isalnum() or text[j - 1] in "_.'"):
+        j -= 1
+    return j < i and text[j].isdigit() and i + 1 < len(text) and text[i + 1].isalnum()
 
 
 def strip_comments(text):
@@ -73,7 +88,7 @@ def strip_comments(text):
                 continue
             if ch == '"':
                 state = "str"
-            elif ch == "'":
+            elif ch == "'" and not in_number(text, i):
                 state = "chr"
         elif state == "line":
             if ch == "\n":
@@ -181,6 +196,14 @@ def enclosing_if_conditions(text, lo, hi, pos):
 
 MXFP4_GUARD = "src0->type == GGML_TYPE_MXFP4 && !src0_planned_host"
 
+# Any comparison on the batch, from either side: M >= 2, M != 1, M > min_m,
+# src1->ne[1] >= 2, 2 <= M, static_cast<int>(M) >= 2. Closing parens may sit
+# between the batch and the operator; on the reversed side they may not, or
+# the `>` closing `static_cast<int>` in front of `(M)` would read as `> M`.
+_BATCH = r"(?:\bM\b|\bsrc1\s*->\s*ne\s*\[\s*1\s*\])"
+_CMP = r"(?:>=|<=|!=|==|>|<)"
+BATCH_COMPARISON = re.compile(_BATCH + r"(?:\s*\))*\s*" + _CMP + r"|" + _CMP + r"\s*" + _BATCH)
+
 
 def mxfp4_direct_span():
     """Body of the MXFP4 per-expert direct dispatch block in ggml_sycl_mul_mat."""
@@ -223,15 +246,24 @@ def test_admission_inputs_are_read_only_where_the_question_is_answered():
 def test_every_mxfp4_direct_onednn_gemm_is_admitted_by_the_candidate():
     lo, hi = mxfp4_direct_span()
     region = backend[lo:hi]
-    cands = list(
-        re.finditer(r"const\s+bool\s+(\w+)\s*=\s*ggml_sycl_onednn_pp_candidate\s*\(", region)
-    )
+    # The answer may be narrowed by conjuncts that are not about the batch
+    # (e.g. skipping the question for a layout with no oneDNN arm), but it
+    # must be the candidate's call, bound by &&, with no ||.
+    cands = list(re.finditer(r"const\s+bool\s+(\w+)\s*=([^;]*?)\bggml_sycl_onednn_pp_candidate\s*\(", region))
     assert len(cands) == 1, (
         f"expected the MXFP4 direct block to ask ggml_sycl_onednn_pp_candidate() exactly once into a const bool, "
         f"found {len(cands)}"
     )
     var = cands[0].group(1)
     call_open = lo + cands[0].end() - 1
+    init = backend[lo + cands[0].start(2) : backend.index(";", call_open)]
+    init_flat = " ".join(init.split())
+    assert "||" not in init_flat and not re.search(r"!\s*$", cands[0].group(2)), (
+        f"`{var}` is initialised as `{init_flat}`: the candidate's call must be a plain && conjunct"
+    )
+    assert not BATCH_COMPARISON.search(init), (
+        f"`{var}` is initialised as `{init_flat}`, which compares the batch itself; the floor is the candidate's"
+    )
     call_args = backend[call_open : matching(backend, call_open, "(", ")") + 1]
     assert re.search(r"onednn_pp_route\s*::\s*MXFP4_DIRECT\b", call_args), (
         "the MXFP4 direct block must ask the candidate with onednn_pp_route::MXFP4_DIRECT: its batch floor is "
@@ -258,7 +290,7 @@ def test_every_mxfp4_direct_onednn_gemm_is_admitted_by_the_candidate():
                 f"oneDNN GEMM at line {line_of(backend, g)} is guarded by `{flat}`; `{var}` must be a bare "
                 "conjunct of that guard, with no `||`"
             )
-        adhoc = [c for c in conds if re.search(r"\bM\s*>=?\s*\d", c)]
+        adhoc = [c for c in conds if BATCH_COMPARISON.search(c)]
         assert not adhoc, (
             f"oneDNN GEMM at line {line_of(backend, g)} carries its own batch admission "
             f"({' '.join(adhoc[0].split())}); the batch floor belongs to the candidate"
@@ -306,6 +338,18 @@ def test_pure_predicate_lives_once_in_the_header():
             f"{name} is (re)defined in ggml-sycl.cpp"
         )
     assert re.search(r"enum\s+class\s+onednn_pp_route\b", placement), "onednn_pp_route missing from the header"
+
+
+def test_strip_comments_handles_digit_separators():
+    # One separator (an odd count) used to open a char literal that ran to
+    # the next quote, blanking the code after it.
+    src = "int x = 1'000; foo(); // gone\nchar c = u8'a'; long y = 0xFF'FF'FF; bar(); /* gone */\n"
+    out = strip_comments(src)
+    assert len(out) == len(src)
+    assert "foo();" in out and "bar();" in out, f"code after a digit separator was blanked: {out!r}"
+    assert "gone" not in out, f"a comment survived: {out!r}"
+    assert "u8' '" in out, f"a char literal's content survived: {out!r}"
+    assert "1'000" in out and "0xFF'FF'FF" in out, f"a numeric literal was altered: {out!r}"
 
 
 if __name__ == "__main__":

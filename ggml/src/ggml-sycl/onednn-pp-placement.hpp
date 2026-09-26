@@ -89,12 +89,15 @@ enum class onednn_pp_route {
     MXFP4_DIRECT,
 };
 
+// The MXFP4_DIRECT floor: every batch that is not decode.
+constexpr int64_t onednn_pp_mxfp4_direct_min_batch = 2;
+
 inline int64_t onednn_pp_min_batch_for(onednn_pp_route route, int64_t dense_min_batch) {
     switch (route) {
         case onednn_pp_route::DENSE_DISPATCH:
             return dense_min_batch;
         case onednn_pp_route::MXFP4_DIRECT:
-            return 2;
+            return onednn_pp_mxfp4_direct_min_batch;
     }
     return dense_min_batch;
 }
@@ -105,7 +108,7 @@ enum class onednn_pp_refusal {
     NONE,
     DISABLED_OR_SKIP_TYPE,  // GGML_SYCL_ONEDNN_PP=0, or GGML_SYCL_SKIP_ONEDNN_Q4_0 for a Q4_0 weight
     BATCH_UNDER_THRESHOLD,  // batch below the route's floor
-    TYPE,                   // activations or destination not F32
+    OPERAND_TYPE,           // activations or destination not F32
     NOT_CONTIGUOUS_QUANT,   // weight not quantized, or not contiguous
 };
 
@@ -126,7 +129,7 @@ inline onednn_pp_refusal onednn_pp_admission_decide(const onednn_pp_admission_in
         return onednn_pp_refusal::BATCH_UNDER_THRESHOLD;
     }
     if (!in.f32_operands) {
-        return onednn_pp_refusal::TYPE;
+        return onednn_pp_refusal::OPERAND_TYPE;
     }
     if (!in.contiguous_quantized_weight) {
         return onednn_pp_refusal::NOT_CONTIGUOUS_QUANT;
@@ -142,7 +145,7 @@ inline const char * onednn_pp_refusal_name(onednn_pp_refusal r) {
             return "disabled-or-skip-type";
         case onednn_pp_refusal::BATCH_UNDER_THRESHOLD:
             return "batch-under-threshold";
-        case onednn_pp_refusal::TYPE:
+        case onednn_pp_refusal::OPERAND_TYPE:
             return "type";
         case onednn_pp_refusal::NOT_CONTIGUOUS_QUANT:
             return "not-contiguous-quant";
