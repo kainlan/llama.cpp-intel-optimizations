@@ -64,6 +64,17 @@ class tlsf_allocator {
     // is no_anchor.  The GAP below an anchor is the free block immediately
     // under it, if there is one.  All of them round like allocate() and
     // return SIZE_MAX, changing nothing, when the gap is missing or too small.
+    //
+    // Like every member of this class they are unsynchronized, and that
+    // includes the const reads: gap_below(), tag_at() and frontier_walk()
+    // walk blocks_, which a concurrent split_block() may reallocate.  A caller
+    // sharing the allocator must hold the same lock around them that it holds
+    // around allocate() and free() -- in the unified cache that is
+    // unified_cache::arena_allocator_group_mutex(zone) (llama.cpp-044k).
+    //
+    // gap_below() and frontier_walk() are EXACT: they read the physical block
+    // list.  largest_free_block() is not (it reports the head of the highest
+    // size class), so a fit decision should use these, not that.
     // ------------------------------------------------------------------
     static constexpr size_t no_anchor = SIZE_MAX;
 

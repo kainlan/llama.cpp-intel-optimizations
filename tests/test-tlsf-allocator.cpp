@@ -406,6 +406,12 @@ static void test_splitting() {
 // sit at the weight frontier. The tests below pin where each primitive places
 // a block, and that releasing yieldable tenants highest-first grows the gap
 // by exactly what frontier_walk() reported.
+//
+// These run single-threaded against a private allocator.  They do not test
+// locking: tlsf_allocator has none, and every call here, the const reads
+// included, must run under the owner's allocator lock in production
+// (unified_cache::arena_allocator_group_mutex, llama.cpp-044k).  That is a
+// property of the zone wrappers that call these, and belongs to their tests.
 // ---------------------------------------------------------------------------
 static constexpr uint8_t TAG_WEIGHT   = 1;
 static constexpr uint8_t TAG_OPTIONAL = 2;
