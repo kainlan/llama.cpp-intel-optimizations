@@ -217,10 +217,11 @@ def parse_top_n(raw: str) -> int:
 def aggregate_rows(rows: list[dict[str, Any]]) -> tuple[dict[str, Counter[str]], Counter[str]]:
     """Aggregate rows by kernel name and category.
 
-    Profiler artifacts are emitted at `(name, category, metadata)` granularity,
-    but this parser's `--require-kernel NAME` and counter output are intentionally
-    name-based so one kernel can be checked even when several metadata variants
-    appear in a single artifact.
+    Profiler artifacts are emitted at `(name, category, metadata, device)`
+    granularity, so a multi-GPU run carries one row per device for the same
+    label. This parser's `--require-kernel NAME` and counter output are
+    intentionally name-based: they sum the additive fields across metadata
+    variants and across devices, so one kernel can be checked as a whole.
     """
 
     kernel_totals: dict[str, Counter[str]] = {}

@@ -10,6 +10,8 @@
 #include "fattn-common.hpp"
 
 #include <cfloat>
+#include <cstdlib>
+#include <cstring>
 #include <sycl/sycl.hpp>
 
 // Check for joint_matrix support
@@ -19,6 +21,30 @@
 #else
 #    define SYCL_XMX_AVAILABLE 0
 #endif
+
+// XMX-v1 gives non-deterministic, intermittently wrong output on simple D=128
+// prompt processing (llama.cpp-b1ov), so it runs only behind two A/B opt-ins.
+// These are pure so host tests can pin the defaults.
+
+// Parse of GGML_SYCL_FA_XMX_V1, which forces v1 for every shape
+// can_use_xmx_v1_runtime() accepts: any value atoi() reads as nonzero enables
+// it; unset or zero keeps XMX-v2.
+inline bool ggml_sycl_fattn_xmx_v1_force_enabled(const char * env) {
+    return env != nullptr && std::atoi(env) != 0;
+}
+
+// Parse of GGML_SYCL_FA_XMX_V1_PP, the opt-in for simple D=128 prompt
+// processing: only exactly "1" requests v1; unset or any other value keeps
+// XMX-v2.
+inline bool ggml_sycl_fattn_xmx_v1_simple_pp_requested(const char * env) {
+    return env != nullptr && std::strcmp(env, "1") == 0;
+}
+
+// Whether simple D=128 prompt processing runs v1: only when it was requested
+// and can_use_xmx_v1_runtime() accepts the shape.
+inline bool ggml_sycl_fattn_xmx_v1_select_simple_pp(bool requested, bool xmx_v1_supported) {
+    return requested && xmx_v1_supported;
+}
 
 #if SYCL_XMX_AVAILABLE
 

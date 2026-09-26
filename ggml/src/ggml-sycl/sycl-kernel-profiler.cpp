@@ -20,6 +20,7 @@ struct profile_key {
     std::string name;
     std::string category;
     std::string metadata;
+    int         device = -1;
 
     bool operator<(const profile_key & other) const {
         if (name != other.name) {
@@ -28,15 +29,17 @@ struct profile_key {
         if (category != other.category) {
             return category < other.category;
         }
-        return metadata < other.metadata;
+        if (metadata != other.metadata) {
+            return metadata < other.metadata;
+        }
+        return device < other.device;
     }
 };
 
 struct profile_label_snapshot {
     profile_key key;
     std::string queue_kind;
-    int         device = -1;
-    size_t      bytes  = 0;
+    size_t      bytes = 0;
 };
 
 struct callsite_snapshot {
@@ -48,7 +51,6 @@ struct callsite_snapshot {
 struct profile_aggregate {
     profile_key key;
     std::string queue_kind = "unknown";
-    int         device     = -1;
 
     std::vector<uint64_t> durations_ns;
     uint64_t              total_ns          = 0;
@@ -86,7 +88,6 @@ struct raw_profile_event {
 struct profile_row {
     profile_key key;
     std::string queue_kind;
-    int         device            = -1;
     uint64_t    count             = 0;
     uint64_t    total_ns          = 0;
     uint64_t    mean_ns           = 0;
@@ -203,8 +204,8 @@ profile_label_snapshot snapshot_label(const ggml_sycl_profile_label & label) {
     snapshot.key.name     = string_from_cstr(label.name, "unknown");
     snapshot.key.category = string_from_cstr(label.category, "unknown");
     snapshot.key.metadata = string_from_cstr(label.metadata, "");
+    snapshot.key.device   = label.device;
     snapshot.queue_kind   = string_from_cstr(label.queue_kind, "unknown");
-    snapshot.device       = label.device;
     snapshot.bytes        = label.bytes;
     return snapshot;
 }
@@ -235,7 +236,6 @@ profile_aggregate & ensure_aggregate_locked(profiler_state & state, const profil
     if (inserted.second) {
         aggregate.key        = label.key;
         aggregate.queue_kind = label.queue_kind;
-        aggregate.device     = label.device;
     }
     return aggregate;
 }
@@ -271,7 +271,6 @@ std::vector<profile_row> collect_rows_locked(const profiler_state & state) {
         profile_row               row;
         row.key               = aggregate.key;
         row.queue_kind        = aggregate.queue_kind;
-        row.device            = aggregate.device;
         row.count             = static_cast<uint64_t>(aggregate.durations_ns.size());
         row.total_ns          = aggregate.total_ns;
         row.bytes             = aggregate.bytes;
@@ -295,13 +294,7 @@ std::vector<profile_row> collect_rows_locked(const profiler_state & state) {
         if (lhs.total_ns != rhs.total_ns) {
             return lhs.total_ns > rhs.total_ns;
         }
-        if (lhs.key.name != rhs.key.name) {
-            return lhs.key.name < rhs.key.name;
-        }
-        if (lhs.key.category != rhs.key.category) {
-            return lhs.key.category < rhs.key.category;
-        }
-        return lhs.key.metadata < rhs.key.metadata;
+        return lhs.key < rhs.key;
     });
 
     return rows;
@@ -366,7 +359,7 @@ std::string format_csv_rows(const std::vector<profile_row> & rows) {
            "timestamps,graph_recorded\n";
     for (const profile_row & row : rows) {
         out << csv_sanitize(row.key.name) << ',' << csv_sanitize(row.key.category) << ','
-            << csv_sanitize(row.key.metadata) << ',' << row.device << ',' << csv_sanitize(row.queue_kind) << ','
+            << csv_sanitize(row.key.metadata) << ',' << row.key.device << ',' << csv_sanitize(row.queue_kind) << ','
             << row.count << ',' << row.total_ns << ',' << row.mean_ns << ',' << row.min_ns << ',' << row.p50_ns << ','
             << row.p95_ns << ',' << row.max_ns << ',' << row.bytes << ',' << row.failed_timestamps << ','
             << (row.graph_recorded ? 1 : 0) << '\n';
@@ -386,7 +379,7 @@ std::string format_json_rows(const std::vector<profile_row> &       rows,
         out << '{' << "\"name\":\"" << json_escape(row.key.name) << "\","
             << "\"category\":\"" << json_escape(row.key.category) << "\","
             << "\"metadata\":\"" << json_escape(row.key.metadata) << "\","
-            << "\"device\":" << row.device << ',' << "\"queue_kind\":\"" << json_escape(row.queue_kind) << "\","
+            << "\"device\":" << row.key.device << ',' << "\"queue_kind\":\"" << json_escape(row.queue_kind) << "\","
             << "\"count\":" << row.count << ',' << "\"total_ns\":" << row.total_ns << ','
             << "\"mean_ns\":" << row.mean_ns << ',' << "\"min_ns\":" << row.min_ns << ',' << "\"p50_ns\":" << row.p50_ns
             << ',' << "\"p95_ns\":" << row.p95_ns << ',' << "\"max_ns\":" << row.max_ns << ','
@@ -406,7 +399,7 @@ std::string format_json_rows(const std::vector<profile_row> &       rows,
                 event.device_end_ns >= event.device_start_ns ? event.device_end_ns - event.device_start_ns : 0;
             out << '{' << "\"event_id\":" << event.event_id << ',' << "\"name\":\"" << json_escape(event.label.key.name)
                 << "\"," << "\"category\":\"" << json_escape(event.label.key.category) << "\"," << "\"metadata\":\""
-                << json_escape(event.label.key.metadata) << "\"," << "\"device\":" << event.label.device << ','
+                << json_escape(event.label.key.metadata) << "\"," << "\"device\":" << event.label.key.device << ','
                 << "\"queue_kind\":\"" << json_escape(event.label.queue_kind) << "\","
                 << "\"bytes\":" << event.label.bytes << ',' << "\"host_submit_begin_us\":" << event.host_submit_begin_us
                 << ',' << "\"host_submit_end_us\":" << event.host_submit_end_us << ','
@@ -435,14 +428,14 @@ std::string format_json_rows(const std::vector<profile_row> &       rows,
 std::string format_summary_rows(const std::vector<profile_row> & rows, int top_n) {
     const int          limit = top_n > 0 ? top_n : static_cast<int>(rows.size());
     std::ostringstream out;
-    out << "total_ns count mean_ns failed_timestamps name category metadata\n";
+    out << "total_ns count mean_ns failed_timestamps device name category metadata\n";
     int emitted = 0;
     for (const profile_row & row : rows) {
         if (emitted >= limit) {
             break;
         }
         out << row.total_ns << ' ' << row.count << ' ' << row.mean_ns << ' ' << row.failed_timestamps << ' '
-            << row.key.name << ' ' << row.key.category << ' ' << row.key.metadata << '\n';
+            << row.key.device << ' ' << row.key.name << ' ' << row.key.category << ' ' << row.key.metadata << '\n';
         emitted++;
     }
     return out.str();
@@ -479,7 +472,7 @@ std::string timeline_metadata_common(const profile_label_snapshot &             
                                      const ggml_sycl_kernel_profile_node_context & node_context = {}) {
     std::ostringstream out;
     out << "event_id=" << event_id << ";profile_category=" << label.key.category << ";queue_kind=" << label.queue_kind
-        << ";device=" << label.device << ";bytes=" << label.bytes;
+        << ";device=" << label.key.device << ";bytes=" << label.bytes;
     if (!label.key.metadata.empty()) {
         out << ";metadata=" << label.key.metadata;
     }
