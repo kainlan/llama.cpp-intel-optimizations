@@ -166,9 +166,10 @@ inline bool pp_moe_onednn_reserve_if_admitted(const pp_moe_onednn_scratch_shape 
 // can never be the reason KV leaves VRAM.
 //
 // The reserve stands in for runtime consumers of the KV zone that no plan
-// counts yet: compute buffers that miss the RUNTIME zone at graph_reserve,
-// which runs after the transaction, and the flash-attention K/V conversion
-// buffers. It applies only when some of the ring goes to the KV zone; a ring
+// counts yet: compute buffers that land there at graph_reserve, which runs
+// after the transaction (a RUNTIME miss tries raw device memory first, and
+// reaches the KV zone only when that is refused; llama.cpp-23mk), and the
+// flash-attention K/V conversion buffers. It applies only when some of the ring goes to the KV zone; a ring
 // that fits the RUNTIME zone competes with none of them.
 //
 // Each KV-zone slot is one allocation, so free space in pieces cannot hold it.
@@ -178,12 +179,17 @@ inline bool pp_moe_onednn_reserve_if_admitted(const pp_moe_onednn_scratch_shape 
 // can still miss. It covers the single-allocation case; for the rest, a failed
 // reserve refuses the ring, which the automatic -ub ladder treats as its
 // ceiling, keeping its last accepted size.
+//
+// The KV-zone part is charged to the plan's VRAM, so it must also fit what the
+// plan's VRAM budget leaves on the device once KV and the MMID pools are
+// charged. The RUNTIME slots are not charged there and need no budget room.
 struct pp_moe_onednn_ring_admission_inputs {
     size_t   kv_zone_available_bytes       = 0;  // KV bytes the device can still hold (live allocator figure)
     size_t   kv_admitted_bytes             = 0;  // KV the transaction admitted on this device
     size_t   compute_reserve_bytes_per_row = 0;  // KV-zone bytes held back per n_ubatch row
     size_t   runtime_available_bytes       = 0;  // RUNTIME zone free once the old ring is released
     size_t   kv_zone_largest_block_bytes   = std::numeric_limits<size_t>::max();  // largest free KV-zone block
+    size_t   vram_budget_room_bytes        = std::numeric_limits<size_t>::max();  // budget left after KV + MMID
     size_t   weight_slot_bytes             = 0;
     size_t   activation_bytes_per_row      = 0;
     size_t   output_bytes_per_row          = 0;

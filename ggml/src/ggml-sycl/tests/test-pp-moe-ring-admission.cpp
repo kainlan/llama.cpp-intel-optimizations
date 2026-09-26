@@ -243,6 +243,28 @@ void test_kv_zone_part_must_fit_the_largest_free_block() {
           "and the -ub it names (320) puts two activation slots in the KV zone that fit the block together");
 }
 
+void test_kv_zone_part_is_charged_to_the_vram_budget() {
+    printf("KV-zone part against the VRAM budget:\n");
+    pp_moe_onednn_ring_admission_inputs in = b50_inputs(1024, 16384ull * kMiB);
+    in.vram_budget_room_bytes              = act_slot(1024);
+    pp_moe_onednn_ring_admission r         = pp_moe_onednn_admit_ring(in);
+    check(r.admit && r.activation_in_kv_zone, "-ub 1024: budget room exactly the 180 MB activation slot admits it");
+    in.vram_budget_room_bytes -= 1;
+    r = pp_moe_onednn_admit_ring(in);
+    check(!r.admit, "one byte less: refused, though the KV zone has 16 GB free");
+    check(r.largest_fitting_n_ubatch == 992, "and the -ub it names (992) has an activation slot the budget holds");
+    in.vram_budget_room_bytes = 0;
+    r                         = pp_moe_onednn_admit_ring(in);
+    check(!r.admit && r.largest_fitting_n_ubatch == 672,
+          "no budget room: only a ring that fits the RUNTIME zone outright, 672");
+
+    // The RUNTIME slots are not charged to the plan's VRAM, so a ring that fits
+    // there needs no budget room.
+    pp_moe_onednn_ring_admission_inputs runtime_only = b50_inputs(512, 0);
+    runtime_only.vram_budget_room_bytes              = 0;
+    check(pp_moe_onednn_admit_ring(runtime_only).admit, "-ub 512 fits the RUNTIME zone: no budget room needed");
+}
+
 void test_degenerate_and_overflow() {
     printf("Degenerate inputs and overflow:\n");
     pp_moe_onednn_ring_admission_inputs dense = b50_inputs(512, 16384ull * kMiB);
@@ -282,6 +304,7 @@ int main() {
     test_runtime_zone_thresholds();
     test_ring_depth_multiplies_every_slot();
     test_kv_zone_part_must_fit_the_largest_free_block();
+    test_kv_zone_part_is_charged_to_the_vram_budget();
     test_degenerate_and_overflow();
 
     printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);

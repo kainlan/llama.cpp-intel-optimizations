@@ -17461,8 +17461,10 @@ enum class ggml_sycl_ring_replan_result { OK, RELEASE_REFUSED, DOES_NOT_FIT };
 
 // KV-zone bytes held back per micro-batch row when part of the ring goes to the
 // shared KV zone. It stands in for the compute buffers, which the transaction
-// cannot size: graph_reserve allocates them after it, and they try the RUNTIME
-// zone first, then the KV zone. GPT-OSS 20B's compute buffer is about 404 MiB
+// cannot size: graph_reserve allocates them after it. They try the RUNTIME zone
+// first; a miss there goes to raw device memory outside the arena when the VRAM
+// overcommit guard allows it, and to the KV zone only when it does not
+// (llama.cpp-23mk). GPT-OSS 20B's compute buffer is about 404 MiB
 // at n_ubatch=512 (0.79 MiB per row), rounded up here, and left linear in
 // n_ubatch like the buffer. An estimate, not a plan: neither the compute buffer
 // nor the flash-attention K/V conversion buffers are in the placement plan, so
@@ -17477,8 +17479,25 @@ struct ggml_sycl_ring_kv_zone_inputs {
     size_t kv_capacity_bytes     = 0;      // ggml_sycl_kv_capacity_live() on the device, the ring counted as free
     size_t kv_bytes              = 0;      // the plan's device KV there, with the allocator's per-layer slack
     size_t runtime_pending_bytes = 0;      // RUNTIME bytes the transaction places after the ring
+    size_t budget_room_bytes     = 0;      // ggml_sycl_device_vram_budget_room() before the ring is charged
     bool   readmit               = false;  // the KV re-fit counted the ring's KV-zone slots as free
 };
+
+// What the plan's VRAM budget leaves on `device` once the plan's VRAM (weights,
+// KV and the MMID pools) is charged. A multi-device plan's budget is the sum of
+// its per-device budgets, so the device's own budget bounds it.
+static size_t ggml_sycl_device_vram_budget_room(const ggml_sycl::placement_plan & plan, int device) {
+    if (!plan.multi_device) {
+        return plan.vram_budget > plan.vram_bytes ? plan.vram_budget - plan.vram_bytes : 0;
+    }
+    for (size_t i = 0; i < plan.devices.size(); ++i) {
+        if (plan.devices[i] == device && i < plan.per_device_vram.size() && i < plan.per_device_vram_budgets.size()) {
+            const size_t used = plan.per_device_vram[i];
+            return plan.per_device_vram_budgets[i] > used ? plan.per_device_vram_budgets[i] - used : 0;
+        }
+    }
+    return 0;
+}
 
 // The plan's device-resident KV on `device`, with the tiered allocator's
 // per-layer slack: what the KV zone must hold for it.
@@ -17594,7 +17613,8 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
     // the transaction still places there after the ring. A rollback restores a
     // ring that fit before, so its KV-zone part is not re-admitted. The
     // KV-zone slots are single allocations, so they must also fit the zone's
-    // largest free block, read now that the old ring is released.
+    // largest free block, read now that the old ring is released. They are
+    // charged to the plan's VRAM, so they must fit its budget room too.
     const size_t runtime_pending   = arena && kv_zone ? kv_zone->runtime_pending_bytes : 0;
     const size_t runtime_net_bytes = capacity_bytes > runtime_pending ? capacity_bytes - runtime_pending : 0;
 
@@ -17605,6 +17625,7 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
             kv_zone ? cache->zone_largest_free(ggml_sycl::vram_zone_id::KV) : std::numeric_limits<size_t>::max();
         admit_in.kv_zone_available_bytes = kv_zone ? kv_zone->kv_capacity_bytes : std::numeric_limits<size_t>::max();
         admit_in.kv_admitted_bytes       = kv_zone ? kv_zone->kv_bytes : 0;
+        admit_in.vram_budget_room_bytes  = kv_zone ? kv_zone->budget_room_bytes : std::numeric_limits<size_t>::max();
         admit_in.compute_reserve_bytes_per_row = kv_zone ? k_pp_moe_ring_compute_reserve_bytes_per_row : 0;
         admit_in.runtime_available_bytes       = runtime_net_bytes;
         admit_in.weight_slot_bytes             = weight_slot_bytes;
@@ -17647,8 +17668,9 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
         if (arena && kv_zone) {
             clause_len = std::snprintf(fits_clause, sizeof(fits_clause),
                                        "; the shared KV zone has %.1f MB free after KV, less a %.1f MB "
-                                       "compute-buffer reserve",
-                                       admission.kv_zone_headroom_bytes / mb, admission.compute_reserve_bytes / mb);
+                                       "compute-buffer reserve, and the VRAM budget has %.1f MB left",
+                                       admission.kv_zone_headroom_bytes / mb, admission.compute_reserve_bytes / mb,
+                                       kv_zone->budget_room_bytes / mb);
         }
         // The size check can pass a ring the allocator then cannot place, on
         // either route; naming n_ubatch itself would name the size just refused.
@@ -18334,6 +18356,10 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     ring_kv_zone.kv_capacity_bytes = ggml_sycl_kv_capacity_live(next_plan, ctx->device, admitted_kv, ctx->device);
     ring_kv_zone.kv_bytes          = ggml_sycl_device_kv_bytes_with_slack(next_plan, ctx->device);
     ring_kv_zone.readmit           = ring_readmit;
+    // Read after the MMID pools passed the budget check and before the charge
+    // below, so the ring's KV-zone part is admitted against the budget it is
+    // charged to.
+    ring_kv_zone.budget_room_bytes = ggml_sycl_device_vram_budget_room(next_plan, ctx->device);
     // The current plan's pools, still allocated, are already missing from the
     // RUNTIME zone's free space, so they are counted twice here: conservative,
     // and only in a build where the route is reachable.
@@ -18363,10 +18389,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     }
     // Ring slots in the shared KV zone take space the plan's vram_bytes
     // accounts for (weights + KV + MMID pool) and the weight stager reserves
-    // against, so they are charged there, on every device of the plan. The
-    // ring is admitted against the live KV headroom, not against vram_budget,
-    // so the published vram_bytes may exceed vram_budget; consumers that need
-    // the total rebuild it from its components.
+    // against, so they are charged there, on every device of the plan. Each
+    // device's KV-zone part was admitted against that device's budget room, so
+    // the charge keeps vram_bytes within vram_budget. A ring kept at an
+    // unchanged n_ubatch was admitted against the same KV and MMID charges: a
+    // KV shape change re-fits KV, which re-admits it.
     {
         const std::vector<int> ring_devices =
             next_plan.multi_device ? next_plan.devices : std::vector<int>{ next_plan.device_id };

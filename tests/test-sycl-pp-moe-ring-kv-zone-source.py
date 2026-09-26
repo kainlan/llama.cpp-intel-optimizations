@@ -15,7 +15,8 @@ and acts on the answer, which is what this file pins:
     free, and a re-fit forces the ring to be re-admitted after KV;
   * the arena refusal is the admission's answer, the placement is published
     before the ceiling and restored with it on a refusal;
-  * the KV-zone bytes are charged to the plan's vram_bytes;
+  * the KV-zone bytes are charged to the plan's vram_bytes, and admitted against
+    the budget room that charge draws on, read before it;
   * the MMID pools, placed in the RUNTIME zone after the ring, are materialized
     only for a route that can run them, and otherwise the ring leaves them room;
   * the cache allocates a flagged slot from the KV zone, never spilling past
@@ -42,6 +43,7 @@ REPLAN_SIGNATURE = "static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_
 LIVE_HINT_SIGNATURE = "static uint32_t ggml_sycl_largest_fitting_n_ctx_live"
 KV_CAPACITY_SIGNATURE = "static size_t ggml_sycl_kv_capacity_live("
 KV_WITH_SLACK_SIGNATURE = "static size_t ggml_sycl_device_kv_bytes_with_slack("
+BUDGET_ROOM_SIGNATURE = "static size_t ggml_sycl_device_vram_budget_room("
 RESERVE_SIGNATURE = "bool unified_cache::reserve_pp_moe_onednn_scratch("
 RUNTIME_REQUIREMENT_SIGNATURE = "bool unified_cache_get_planned_runtime_zone_requirement("
 KV_ZONE_BYTES_SIGNATURE = "static size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id) {"
@@ -166,6 +168,10 @@ def transaction_violations(sycl_cpp: str) -> list[str]:
                          r"\s*ctx->device\s*\)\s*;", txn)
     if kv_bytes is None or not 0 <= final_residency < kv_bytes.start() < call_at:
         found.append("the ring is not admitted against the final plan's KV")
+    budget_room = re.search(r"ring_kv_zone\.budget_room_bytes\s*=\s*ggml_sycl_device_vram_budget_room\(\s*next_plan\s*,"
+                            r"\s*ctx->device\s*\)\s*;", txn)
+    if budget_room is None or not 0 <= final_residency < budget_room.start() < call_at:
+        found.append("the ring is not admitted against the VRAM budget room its charge draws on")
 
     refit = re.search(r"plan_runtime_kv_residency\(in\)", txn)
     push = re.search(r"in\.available\.push_back\(\s*ggml_sycl_kv_capacity_live\(\s*next_plan\s*,\s*device\s*,"
@@ -225,6 +231,8 @@ def replan_violations(sycl_cpp: str) -> list[str]:
                  "the KV zone's largest free block"),
                 (r"compute_reserve_bytes_per_row\s*=\s*kv_zone\s*\?\s*k_pp_moe_ring_compute_reserve_bytes_per_row\s*:"
                  r"\s*0\s*;", "the compute-buffer reserve"),
+                (r"vram_budget_room_bytes\s*=\s*kv_zone\s*\?\s*kv_zone->budget_room_bytes\s*:\s*"
+                 r"std::numeric_limits<size_t>::max\(\)\s*;", "the VRAM budget room"),
                 (r"runtime_available_bytes\s*=\s*runtime_net_bytes\s*;", "the RUNTIME zone less what follows the ring")):
             if not re.search(pattern, inputs, re.S):
                 found.append(f"the admission is not given {what}")
@@ -291,6 +299,15 @@ def capacity_violations(sycl_cpp: str) -> list[str]:
     if with_slack is None or not re.search(r"return\s+plan\.device_kv_vram_bytes\(\s*device\s*\)\s*\+\s*n_resident"
                                            r"\s*\*\s*ggml_sycl::kv_alloc_slack_per_layer\s*;", with_slack):
         found.append("the plan's KV does not count the allocator's per-layer slack")
+
+    room = code_of(sycl_cpp, BUDGET_ROOM_SIGNATURE)
+    if room is None or \
+            not re.search(r"return\s+plan\.vram_budget\s*>\s*plan\.vram_bytes\s*\?\s*plan\.vram_budget\s*-\s*"
+                          r"plan\.vram_bytes\s*:\s*0\s*;", room) or \
+            not re.search(r"const\s+size_t\s+used\s*=\s*plan\.per_device_vram\[i\]\s*;\s*return\s+"
+                          r"plan\.per_device_vram_budgets\[i\]\s*>\s*used\s*\?\s*plan\.per_device_vram_budgets\[i\]"
+                          r"\s*-\s*used\s*:\s*0\s*;", room):
+        found.append("the budget room is not the budget less the plan's VRAM")
     return found
 
 
@@ -386,6 +403,28 @@ MUTATIONS = [
     ("no forced re-admission", "sycl",
      "        ring_readmit = ring_kv_zone_bytes > 0;\n", "",
      "a re-fit that freed the ring's KV-zone slots does not force the ring to be re-admitted"),
+    ("ring admitted without the budget", "sycl",
+     "    ring_kv_zone.budget_room_bytes = ggml_sycl_device_vram_budget_room(next_plan, ctx->device);\n", "",
+     "the ring is not admitted against the VRAM budget room its charge draws on"),
+    ("budget room read after the re-plan", "sycl",
+     ("    ring_kv_zone.budget_room_bytes = ggml_sycl_device_vram_budget_room(next_plan, ctx->device);\n",
+      "        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone);\n"),
+     ("",
+      "        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone);\n"
+      "    ring_kv_zone.budget_room_bytes = ggml_sycl_device_vram_budget_room(next_plan, ctx->device);\n"),
+     "the ring is not admitted against the VRAM budget room its charge draws on"),
+    ("admission not given the budget room", "sycl",
+     "kv_zone ? kv_zone->budget_room_bytes : std::numeric_limits<size_t>::max();",
+     "std::numeric_limits<size_t>::max();",
+     "the admission is not given the VRAM budget room"),
+    ("budget room ignores the plan's VRAM", "sycl",
+     "return plan.vram_budget > plan.vram_bytes ? plan.vram_budget - plan.vram_bytes : 0;",
+     "return plan.vram_budget;",
+     "the budget room is not the budget less the plan's VRAM"),
+    ("per-device budget room ignores the device's VRAM", "sycl",
+     "return plan.per_device_vram_budgets[i] > used ? plan.per_device_vram_budgets[i] - used : 0;",
+     "return plan.per_device_vram_budgets[i];",
+     "the budget room is not the budget less the plan's VRAM"),
     ("no vram_bytes charge", "sycl",
      "            next_plan.vram_bytes += charge;\n", "",
      "the ring's KV-zone bytes are not charged to the plan's vram_bytes"),
@@ -495,7 +534,11 @@ def test_mutation_is_witnessed(label: str, which: str, old: str, new: str, expec
     sycl_cpp = GGML_SYCL_CPP.read_text()
     cache_cpp = UNIFIED_CACHE_CPP.read_text()
     source = sycl_cpp if which == "sycl" else cache_cpp
-    assert old in source, f"{label}: mutation target not found -- update this witness to match the source"
-    mutated = source.replace(old, new, 1)
+    # A tuple is a sequence of replacements, for a mutation that moves code.
+    pairs = list(zip(old, new)) if isinstance(old, tuple) else [(old, new)]
+    mutated = source
+    for before, after in pairs:
+        assert before in mutated, f"{label}: mutation target not found -- update this witness to match the source"
+        mutated = mutated.replace(before, after, 1)
     violations = all_violations(mutated, cache_cpp) if which == "sycl" else all_violations(sycl_cpp, mutated)
     assert any(expected in v for v in violations), f"{label}: expected {expected!r}, got {violations!r}"

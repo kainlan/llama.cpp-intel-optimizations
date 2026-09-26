@@ -2281,8 +2281,10 @@ a flagged slot from the KV zone with `forbid_vram_zone_spill`, so a slot that
 does not fit fails instead of spilling past the arena. The RUNTIME zone
 requirement counts only the slots that live in RUNTIME. The transaction charges
 the KV-zone bytes to the plan's `vram_bytes`, which the weight stager reserves
-against. The ring is admitted against the live KV headroom, not against
-`vram_budget`, so the published `vram_bytes` may exceed `vram_budget`. A refused
+against. So the KV-zone part is admitted against the budget too: it must fit
+what `vram_budget` leaves on the device once KV and the MMID pools are charged.
+That room is read after the MMID budget check and before the charge, so the
+published `vram_bytes` stays within `vram_budget`. A refused
 re-plan restores the old placement with the old ring. A rollback of an accepted
 one restores a ring that fit before, so it is not re-admitted against the
 headroom. A rollback to an unchanged `n_ubatch` keeps a re-admitted placement:
@@ -2314,16 +2316,21 @@ accepted size; an explicit one fails context creation.
 
 **The compute-buffer reserve is a known gap, not a solved term.** Neither the
 compute buffers nor the flash-attention K/V conversion buffers are in the
-placement plan (`llama.cpp-zhcn`). Compute buffers that miss the RUNTIME zone
-fall back to the KV zone ("Arena RUNTIME zone
-full, runtime buffer ... allocated from KV zone"). When the ring fills RUNTIME,
-GPT-OSS's compute buffer does: about 404 MiB at `-ub 512`. `ggml-alloc` sizes
+placement plan (`llama.cpp-zhcn`). A compute buffer that misses the RUNTIME
+zone does not go straight to the KV zone. Its RUNTIME request does not forbid a
+spill, so it first falls through to raw device memory outside the arena, when
+the physical-VRAM overcommit guard allows that. It reaches the KV zone ("Arena
+RUNTIME zone full, runtime buffer ... allocated from KV zone") only when the
+guard refuses. The guard decides which, not the plan (`llama.cpp-23mk`). When
+the ring fills RUNTIME, GPT-OSS's compute buffer (about 404 MiB at `-ub 512`)
+misses it and goes down that chain. `ggml-alloc` sizes
 compute buffers from the graph at `graph_reserve`, which runs after the
 transaction, and they are not in the plan's `vram_bytes`. So the transaction
 cannot know their size. It holds back `k_pp_moe_ring_compute_reserve_bytes_per_row`
 = 1 MiB per micro-batch row: the GPT-OSS figure (0.79 MiB per row) rounded up,
-and scaled linearly with `n_ubatch` like the buffer. The reserve applies only
-when part of the ring goes to the KV zone. The admission line names it at WARN:
+and scaled linearly with `n_ubatch` like the buffer. It keeps KV-zone room for
+the case where the guard sends the buffer there. The reserve applies only when
+part of the ring goes to the KV zone. The admission line names it at WARN:
 
 ```
 [SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=1024 puts its activation slots (180.0 MB) in the shared
