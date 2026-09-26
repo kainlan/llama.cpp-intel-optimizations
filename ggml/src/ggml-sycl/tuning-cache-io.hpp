@@ -578,6 +578,24 @@ inline std::vector<int> ubatch_participating_devices(const UbatchDeviceTopology 
     return devices;
 }
 
+// Compose UbatchDeviceTopology::placement_config from the multi-GPU
+// placement knobs: "name=value" for each one that is set, joined by ';'.
+// values[i] is getenv(names[i]) (nullptr when unset). An empty value counts
+// as unset, as it does for the backend (ggml_sycl_env_is_set()).
+inline std::string ubatch_placement_config(const char * const * names, const char * const * values, size_t n) {
+    std::string config;
+    for (size_t i = 0; i < n; ++i) {
+        if (values[i] == nullptr || values[i][0] == '\0') {
+            continue;
+        }
+        if (!config.empty()) {
+            config += ';';
+        }
+        config += std::string(names[i]) + "=" + values[i];
+    }
+    return config;
+}
+
 // Compose the participating device set's key:
 // "<sanitized name>@<driver>/pct=<p>/headroom=<bytes>" per device, in order,
 // joined by ','. A device the scheduler hides is prefixed "hidden:": a

@@ -104,9 +104,9 @@ bool resolve_file_device_name(int device, std::string & out_device_name) {
 // (device 0), while the placement planner still puts layers and KV on the
 // hidden device 1 whenever ggml_backend_sycl_moe_multi_gpu_requested() --
 // the same gate the multi-device plan uses. Each device's budget comes from
-// ggml_sycl_device_budget_authority(), which reads the live cache's resolved
-// authority when there is one. Returns false for an empty or out-of-range
-// device list.
+// ggml_sycl_existing_device_budget_authority(), which reads the live cache's
+// resolved authority when there is one and never constructs a cache (see the
+// loop below). Returns false for an empty or out-of-range device list.
 bool resolve_device_set_key(const ggml_sycl_ubatch_cache_key & c_key,
                             std::string &                      out_device_name,
                             std::string &                      out_device_key) {
@@ -135,21 +135,17 @@ bool resolve_device_set_key(const ggml_sycl_ubatch_cache_key & c_key,
         "GGML_SYCL_SPLIT_RATIO",
         "GGML_SYCL_TENSOR_SPLIT",
     };
-    for (const char * name : placement_env) {
-        const char * value = std::getenv(name);
-        if (value == nullptr) {
-            continue;
-        }
-        if (!topo.placement_config.empty()) {
-            topo.placement_config += ';';
-        }
-        topo.placement_config += std::string(name) + "=" + value;
+    constexpr size_t n_placement_env = sizeof(placement_env) / sizeof(placement_env[0]);
+    const char *     placement_values[n_placement_env];
+    for (size_t i = 0; i < n_placement_env; ++i) {
+        placement_values[i] = std::getenv(placement_env[i]);
     }
+    topo.placement_config = ubatch_placement_config(placement_env, placement_values, n_placement_env);
 
     // ggml_sycl_info()'s init fills devices[] for every physical GPU, hidden
     // ones included, so a hidden participant's name and driver are real.
     std::vector<UbatchDeviceIdentity> identities(std::max(info.device_count, topo.total_gpu_count));
-    //
+
     // The budget read must not construct a cache: a lookup for a hidden GPU
     // the planner never registered would otherwise create one as a side
     // effect. Under GGML_SYCL_UNIFIED_CACHE_MODE=global every device shares

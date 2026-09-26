@@ -1387,6 +1387,22 @@ TEST(ubatch_device_set_key_includes_placement_config) {
     return true;
 }
 
+// Test: the backend treats an empty knob as unset (ggml_sycl_env_is_set()),
+// so an empty value must compose the same config as an absent one; keying
+// "NAME=" would make the same placement miss.
+TEST(ubatch_placement_config_empty_value_is_unset) {
+    const char * const names[]      = { "GGML_SYCL_MULTI_GPU_MODE", "GGML_SYCL_SPLIT_RATIO", "GGML_SYCL_TENSOR_SPLIT" };
+    const char * const unset[]      = { nullptr, nullptr, nullptr };
+    const char * const empty[]      = { nullptr, "", nullptr };
+    const char * const set_mode[]   = { "layer", nullptr, nullptr };
+    const char * const mode_empty[] = { "layer", "", "" };
+    ASSERT(ubatch_placement_config(names, empty, 3) == ubatch_placement_config(names, unset, 3));
+    ASSERT(ubatch_placement_config(names, unset, 3).empty());
+    ASSERT(ubatch_placement_config(names, mode_empty, 3) == ubatch_placement_config(names, set_mode, 3));
+    ASSERT(ubatch_placement_config(names, set_mode, 3) == "GGML_SYCL_MULTI_GPU_MODE=layer");
+    return true;
+}
+
 // Test: a hidden GPU that the placement planner does not use (multi-GPU
 // placement disabled) is not part of the set, so that run shares the
 // first-card-alone entry.
@@ -1480,6 +1496,7 @@ int main() {
     RUN_TEST(ubatch_device_set_key_order_and_stability);
     RUN_TEST(ubatch_device_set_key_collapsed_split_differs_from_visible_split);
     RUN_TEST(ubatch_device_set_key_includes_placement_config);
+    RUN_TEST(ubatch_placement_config_empty_value_is_unset);
     RUN_TEST(ubatch_device_set_key_idle_hidden_gpu_is_not_keyed);
     RUN_TEST(ubatch_participating_devices_order);
 

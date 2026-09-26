@@ -1953,7 +1953,9 @@ def test_backend_extends_the_device_set_with_hidden_planner_gpus():
     # The split itself is keyed: mode and ratio change each card's share.
     for env in ("GGML_SYCL_MULTI_GPU_MODE", "GGML_SYCL_SPLIT_RATIO", "GGML_SYCL_TENSOR_SPLIT"):
         assert f'"{env}"' in code, f"the placement config in the key must include {env}"
-    assert re.search(r"topo\.placement_config\s*\+=", code), "the placement config must be composed into topo"
+    assert re.search(
+        r"topo\.placement_config\s*=\s*ubatch_placement_config\s*\(\s*placement_env\s*,", code
+    ), "the placement config must be composed into topo by ubatch_placement_config()"
     # lookup and store both key through it; the path accessor needs only the file name.
     assert len(re.findall(r"resolve_device_set_key\s*\(\s*\*\s*key\s*,", code)) == 2, (
         "both lookup and store must resolve their key through resolve_device_set_key()"
@@ -1993,19 +1995,39 @@ def _assert_hidden_gpu_gate_model_independent(code: str) -> None:
         assert model_term not in body, f"the hidden-GPU gate must not depend on the model ({model_term})"
 
 
-def test_hidden_gpu_gate_holds_for_a_dense_model_has_a_mutation_witness():
-    """Mutation witness for the check above: proves it would actually catch
-    the gate starting to consult the model's expert count -- the change that
-    would make a dense level_zero:0,1 split key as its first card alone."""
+_HIDDEN_GPU_GATE_RETURN = "    return ggml_sycl_info().total_gpu_count >= 2;\n}\n\n// backend device"
+
+
+def _hidden_gpu_gate_mutant(replacement: str) -> str:
     raw = GGML_SYCL_CPP
-    target = "    return ggml_sycl_info().total_gpu_count >= 2;\n}\n\n// backend device"
-    assert raw.count(target) == 1, "mutation target not found -- update this witness to match the real source"
-    mutated_raw = raw.replace(
-        target, "    return ggml_sycl_info().total_gpu_count >= 2 && g_moe_n_experts_total > 0;\n}\n\n// backend device", 1
+    assert raw.count(_HIDDEN_GPU_GATE_RETURN) == 1, (
+        "mutation target not found -- update this witness to match the real source"
     )
+    mutated_raw = raw.replace(_HIDDEN_GPU_GATE_RETURN, replacement, 1)
     assert mutated_raw != raw
-    with pytest.raises(AssertionError):
-        _assert_hidden_gpu_gate_model_independent(_normalize_ws(strip_comments(mutated_raw)))
+    return _normalize_ws(strip_comments(mutated_raw))
+
+
+def test_hidden_gpu_gate_holds_for_a_dense_model_has_a_mutation_witness():
+    """Mutation witness for the model-term check above: an early return on
+    the expert count leaves the trailing `return ... >= 2;` intact, so only
+    the model-term loop can catch it -- the change that would make a dense
+    level_zero:0,1 split key as its first card alone."""
+    mutated = _hidden_gpu_gate_mutant(
+        "    if (g_moe_n_experts_total == 0) {\n        return false;\n    }\n" + _HIDDEN_GPU_GATE_RETURN
+    )
+    with pytest.raises(AssertionError, match="must not depend on the model"):
+        _assert_hidden_gpu_gate_model_independent(mutated)
+
+
+def test_hidden_gpu_gate_return_shape_has_a_mutation_witness():
+    """Mutation witness for the return-shape check above: a model term
+    folded into the final return breaks the `total_gpu_count >= 2` shape."""
+    mutated = _hidden_gpu_gate_mutant(
+        "    return ggml_sycl_info().total_gpu_count >= 2 && g_moe_n_experts_total > 0;\n}\n\n// backend device"
+    )
+    with pytest.raises(AssertionError, match="total_gpu_count >= 2 alone"):
+        _assert_hidden_gpu_gate_model_independent(mutated)
 
 
 def test_cache_hit_reads_the_stored_reason():
