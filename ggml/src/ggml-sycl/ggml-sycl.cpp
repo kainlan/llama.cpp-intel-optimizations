@@ -17595,6 +17595,20 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int     
 // enum value without ever string-comparing `out->reason`.
 enum class ggml_sycl_txn_result { ACCEPTED, REFUSED, BUSY };
 
+// Bumped whenever KV admission retires optional layout copies
+// (unified_cache_yield_optional_layouts()). A recorded exec graph bakes the raw
+// pointers it resolved and no weight lease: a WOQ copy's pointer baked by
+// another coexisting context would name memory that is now KV. So each
+// context compares its optional_layout_epoch at the top of graph compute and
+// drops what it recorded before any replay; the next eligible call records
+// afresh against what is resident. Retiring copies is rare (a context whose
+// KV needs the room), so the one re-record costs nothing measurable.
+static std::atomic<uint64_t> g_ggml_sycl_optional_layout_epoch{ 0 };
+
+static void ggml_sycl_optional_layouts_retired() {
+    g_ggml_sycl_optional_layout_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
 // llama.cpp-3aos: kv_unified -- see placement_kv_info::kv_unified
 // / kv_layer_bytes_for_kind() (unified-cache.hpp) for the rationale.
 // Threaded the same way n_seq_max already is: onto next_kv_info and
@@ -17835,8 +17849,16 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         // it needs now, before the KV is allocated. A probe only counts. The
         // fit is then redone against the live headroom with nothing left to
         // count: copies are released whole, so more may come back than asked,
-        // and a copy someone still leases is hidden from routing but not freed
-        // yet, so less may.
+        // and a copy whose free could not complete here comes back later, so
+        // less may.
+        //
+        // A released copy leaves two stale records, both handled: an exec
+        // graph another context recorded may bake its pointer, so every
+        // context drops its recorded graphs before its next replay
+        // (ggml_sycl_optional_layouts_retired()); and a tensor's extra->layout
+        // may still name the copy's pointer, which no reader trusts for
+        // ONEDNN_WOQ (the ggml_sycl_get_weight_layout_ptr() fast path and
+        // ggml_sycl_can_use_layout_for_kernel() ask the cache).
         if (residency.fits && !probe_mode) {
             bool yielded = false;
             for (size_t i = 0; i < in.devices.size(); ++i) {
@@ -17844,15 +17866,26 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                 if (want == 0) {
                     continue;
                 }
-                size_t       n_yielded = 0;
-                const size_t freed     = ggml_sycl::unified_cache_yield_optional_layouts(
-                    in.devices[i], next_plan.multi_device, want, &n_yielded);
-                GGML_LOG_WARN(
-                    "[SYCL-PLAN] KV admission released %zu optional oneDNN WOQ layout copies (%.1f MB) on device %d "
-                    "for n_ctx=%u so its KV stays in VRAM; those tensors' prompt processing uses the resident "
-                    "primary layout\n",
-                    n_yielded, freed / mb, in.devices[i], n_ctx);
+                const ggml_sycl::optional_layout_yield_result released =
+                    ggml_sycl::unified_cache_yield_optional_layouts(in.devices[i], next_plan.multi_device, want);
+                if (released.retired == 0) {
+                    continue;
+                }
+                ggml_sycl_optional_layouts_retired();
                 yielded = true;
+                if (released.freed > 0) {
+                    GGML_LOG_WARN(
+                        "[SYCL-PLAN] KV admission released %zu optional oneDNN WOQ layout copies (%.1f MB) on device "
+                        "%d for n_ctx=%u's KV; those tensors' prompt processing uses the resident primary layout\n",
+                        released.freed, released.freed_bytes / mb, in.devices[i], n_ctx);
+                }
+                if (released.freed < released.retired) {
+                    GGML_LOG_WARN(
+                        "[SYCL-PLAN] KV admission retired %zu more optional oneDNN WOQ layout copies (%.1f MB) on "
+                        "device %d for n_ctx=%u, but their free has not completed: they no longer serve any op, and "
+                        "their bytes return to the zone with a later deferred-free pass, not to this context's KV\n",
+                        released.retired - released.freed, released.pending_bytes / mb, in.devices[i], n_ctx);
+                }
             }
             if (yielded) {
                 for (size_t i = 0; i < in.devices.size(); ++i) {
@@ -105490,6 +105523,20 @@ normal_dispatch:
     }
 
 #ifdef GGML_SYCL_GRAPH
+    // Optional layout copies were retired since this context last looked: drop
+    // any graph it recorded, which may bake a retired copy's pointer (see
+    // g_ggml_sycl_optional_layout_epoch). Only when something was recorded --
+    // sycl_exec_graph_clear_active() is not side-effect free.
+    {
+        const uint64_t epoch = g_ggml_sycl_optional_layout_epoch.load(std::memory_order_acquire);
+        if (sycl_ctx->optional_layout_epoch != epoch) {
+            if (sycl_ctx->exec_graph || sycl_ctx->moe_segments_valid || !sycl_ctx->moe_block_graphs.empty()) {
+                sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");
+            }
+            sycl_ctx->optional_layout_epoch = epoch;
+        }
+    }
+
     // GPU subgraph replay for mixed CPU/GPU mode.
     // Instead of disabling graphs entirely when CPU layers exist, find the
     // contiguous GPU-only prefix and record/replay just that portion.

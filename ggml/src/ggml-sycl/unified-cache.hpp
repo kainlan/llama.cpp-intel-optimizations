@@ -2242,6 +2242,17 @@ enum class expert_retire_status : uint8_t {
     DEFERRED  = 3,
 };
 
+// What yield_optional_layouts() did. `retired` copies are hidden from routing
+// at once. `freed`/`freed_bytes` are the ones whose storage is back in its zone
+// when the call returns; the rest (`retired - freed`, `pending_bytes`) are
+// still held by a lease or an unfinished free and return later.
+struct optional_layout_yield_result {
+    size_t retired       = 0;
+    size_t freed         = 0;
+    size_t freed_bytes   = 0;
+    size_t pending_bytes = 0;
+};
+
 inline bool expert_retire_succeeded(expert_retire_status status) {
     return status == expert_retire_status::WITHDRAWN || status == expert_retire_status::DEFERRED ||
            status == expert_retire_status::NOT_FOUND;
@@ -2908,13 +2919,13 @@ class unified_cache {
     // optional_layout_bytes() is what yield_optional_layouts() could release
     // now: device-resident, non-retired copies nobody but the cache's own
     // direct-stage mirror leases. yield_optional_layouts() retires those,
-    // largest first, until at least `bytes` are freed, and returns the bytes
-    // it freed: a copy whose lease outlives the retirement is hidden from
-    // routing at once but freed only when that lease drops, so it is not
-    // counted. Primaries are never touched.
-    bool   mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout);
-    size_t optional_layout_bytes() const;
-    size_t yield_optional_layouts(size_t bytes, size_t * n_yielded = nullptr);
+    // largest first, until they cover `bytes`, waits once for every queue the
+    // cache orders frees against (a copy's readers take no lease), and
+    // returns their storage to its zone before it returns. Primaries are never
+    // touched. A cold, context-admission-time call: not for a dispatch path.
+    bool                         mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout);
+    size_t                       optional_layout_bytes() const;
+    optional_layout_yield_result yield_optional_layouts(size_t bytes);
 
     // Fast O(1) lookup for inference-time weight resolution.
     // Returns nullptr if not staged.  No allocation, no state machine.
@@ -6667,7 +6678,7 @@ bool   unified_cache_mode_is_global();
 // cache as unified_cache_kv_vram_available() does, so the two numbers come
 // from the same zone.
 size_t unified_cache_optional_layout_bytes(int device_id, bool multi_device);
-size_t unified_cache_yield_optional_layouts(int device_id, bool multi_device, size_t bytes, size_t * n_yielded);
+optional_layout_yield_result unified_cache_yield_optional_layouts(int device_id, bool multi_device, size_t bytes);
 
 // Sum of zone_used(KV) + zone_used(ONEDNN) + zone_used(RUNTIME) + zone_used(SCRATCH).
 // Returns 0 when arena is inactive.

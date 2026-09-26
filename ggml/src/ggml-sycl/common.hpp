@@ -6077,6 +6077,9 @@ struct ggml_backend_sycl_context {
     int      warmup_decode_n_nodes    = 0;      // Track which decode graph has been warmed up
     int      warmup_prompt_n_nodes    = 0;      // Track which prompt graph has been warmed up
     bool     graphs_disabled          = false;  // Set when graph recording fails; disables graphs for this context
+    // The optional-layout epoch this context's recorded graphs were checked
+    // against (ggml_sycl_optional_layouts_retired() in ggml-sycl.cpp).
+    uint64_t optional_layout_epoch          = 0;
     // llama.cpp-dkw0 (defect #4 closing fix): one exec_graph slot per context but
     // partial-offload graphs fragment a token's compute into many small,
     // differently-shaped splits that all cycle through that single slot. The

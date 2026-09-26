@@ -1688,3 +1688,79 @@ def test_mutation_dense_woq_knob_dropped_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
     mutated = cpp.replace("return ggml_sycl_dense_woq_alternates_enabled() && is_contiguous &&", "return is_contiguous &&", 1)
     _assert_witnessed(cpp, mutated, dense_woq_knob_violations, "not in the shared eligibility predicate", "knob dropped")
+
+
+# A yield must hand the bytes back before the re-fit reads them, must not free
+# a copy under a reader that took no lease, and must not leave a recorded graph
+# baking a retired copy's pointer.
+GRAPH_COMPUTE_SIGNATURE = "static ggml_status ggml_backend_sycl_graph_compute_unchecked("
+YIELD_SIGNATURE = "optional_layout_yield_result unified_cache::yield_optional_layouts(size_t bytes) {"
+
+
+def optional_layout_release_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
+    found: list[str] = []
+    txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
+    at = txn.find("unified_cache_yield_optional_layouts(")
+    bump = txn.find("ggml_sycl_optional_layouts_retired();", max(at, 0))
+    if at < 0 or bump < 0 or bump > txn.find("if (!residency.fits)"):
+        found.append("a yield does not retire the recorded graphs")
+
+    compute = strip_comments(function(sycl_cpp, GRAPH_COMPUTE_SIGNATURE))
+    clear = compute.find('sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");')
+    replay = compute.find("ext_oneapi_graph(")
+    if clear < 0 or (replay >= 0 and replay < clear):
+        found.append("graph compute can replay before dropping graphs recorded before a yield")
+
+    body = strip_comments(function(cache_cpp, YIELD_SIGNATURE))
+    retire = body.find("transition_to_retired_locked(entry);")
+    gate = body.find("entry.last_write_event = readers_done;")
+    barrier = body.find("readers_done = submit_barrier_all();")
+    if min(retire, gate, barrier) < 0 or not barrier < gate < retire:
+        found.append("a retired copy's free is not gated on a barrier over every queue")
+    wait = body.find("readers_done.wait_and_throw();")
+    drain = body.find("it = deferred_frees_.erase(it);")
+    finalize = body.find("finalize_retired_entries_locked();")
+    if min(wait, drain, finalize) < 0 or not wait < finalize < drain:
+        found.append("a yield returns before the retired copies' storage is back in its zone")
+    return found
+
+
+def test_optional_layout_release() -> None:
+    assert optional_layout_release_violations(GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()) == []
+
+
+def _release_sycl_mutation(old: str, new: str, expected: str, label: str) -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    _assert_witnessed(cpp, cpp.replace(old, new, 1), lambda c: optional_layout_release_violations(c, cache), expected,
+                      label)
+
+
+def _release_cache_mutation(old: str, new: str, expected: str, label: str) -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    _assert_witnessed(cache, cache.replace(old, new, 1), lambda c: optional_layout_release_violations(cpp, c),
+                      expected, label)
+
+
+def test_mutation_yield_keeps_graphs_is_witnessed() -> None:
+    _release_sycl_mutation("                ggml_sycl_optional_layouts_retired();\n", "",
+                           "does not retire the recorded graphs", "epoch bump dropped")
+
+
+def test_mutation_graphs_not_dropped_is_witnessed() -> None:
+    _release_sycl_mutation('sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");', "(void) 0;",
+                           "replay before dropping graphs", "epoch check dropped")
+
+
+def test_mutation_free_gated_on_write_event_is_witnessed() -> None:
+    _release_cache_mutation("            entry.last_write_event = readers_done;\n", "",
+                            "not gated on a barrier", "barrier gate dropped")
+
+
+def test_mutation_free_left_deferred_is_witnessed() -> None:
+    _release_cache_mutation("                it = deferred_frees_.erase(it);\n", "                ++it;\n",
+                            "storage is back in its zone", "drain dropped")
+
+
+def test_mutation_no_reader_wait_is_witnessed() -> None:
+    _release_cache_mutation("        readers_done.wait_and_throw();\n", "", "storage is back in its zone",
+                            "reader wait dropped")
