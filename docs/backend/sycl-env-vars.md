@@ -33,7 +33,7 @@ and `GGML_SYCL_DEVICE_LINK_POOL` (`docs/backend/SYCL.md`, notes 2 and 3).
 | `GGML_SYCL_OCLOC_KEY_PKGS` | `libigc2 intel-ocloc libze-intel-gpu1` | Packages whose dpkg version enters the toolchain key. |
 | `GGML_SYCL_DEVICE_LINK_INVENTORY=<file>` | unset | Append one row per ocloc invocation (device, SPIR-V md5, binary md5, size) to `<file>`; the byte-identity evidence `scripts/sycl-device-image-inventory.sh` compares. |
 | `IGC_*`, `NEOReadDebugKeys` | unset | Not ours, but read here: with any set, a link neither reads nor writes the persistent cache (they change or dump the ISA, and no cache key covers the environment) and warns once naming them. |
-| `GGML_SYCL_CCACHE_BASE_DIR=0` | unset (on) | `scripts/sycl-build.sh`: run plain ccache instead of ccache with `base_dir` at the tree, which lets another checkout path reuse its entries; see `docs/backend/SYCL.md`. `off`, `false` and `no` also opt out, `1`/`on`/`true`/`yes` keep the default, and any other value is an error. Switching either way recompiles every host translation unit once. `base_dir` is never used for a `GGML_SYCL_PROFILING_DEBUG` build or with ccache older than 4.8. |
+| `GGML_SYCL_CCACHE_BASE_DIR=0` | unset (on) | `scripts/sycl-build.sh`: run plain ccache instead of ccache with `base_dir` at the tree, which lets another checkout path reuse its entries; see `docs/backend/SYCL.md`. `off`, `false` and `no` also opt out, `1`/`on`/`true`/`yes` keep the default, and any other value is an error. Switching either way reruns every host compile once; those reruns hit wherever matching entries already exist. `base_dir` is never used for a `GGML_SYCL_PROFILING_DEBUG` build or with ccache older than 4.8. |
 
 ## Performance-critical (all default ON, opt-out)
 
