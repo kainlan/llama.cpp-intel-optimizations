@@ -82,21 +82,57 @@ static fattn_params decode_params(int h_q, int h_kv) {
 }
 
 // XMX-v1 gives non-deterministic, intermittently wrong output on simple D=128
-// prompt processing (llama.cpp-b1ov), so v2 is the default and only "1" opts
-// into v1, and then only for a shape can_use_xmx_v1_runtime() accepts.
-static bool check_simple_pp_select_xmx_v1() {
-    const char * const envs[] = { nullptr, "0", "", "2", "yes", "1 ", "1" };
-    bool               ok     = true;
-    for (const char * env : envs) {
-        for (const bool supported : { false, true }) {
-            const bool want = supported && env != nullptr && std::string(env) == "1";
-            const bool got  = ggml_sycl_fattn_simple_pp_select_xmx_v1(env, supported);
-            if (got != want) {
-                std::fprintf(stderr, "FAIL: GGML_SYCL_FA_XMX_V1_PP=%s%s%s xmx_v1_supported=%d selects %s, want %s\n",
-                             env ? "\"" : "", env ? env : "<unset>", env ? "\"" : "", (int) supported,
-                             got ? "v1" : "v2", want ? "v1" : "v2");
-                ok = false;
-            }
+// prompt processing (llama.cpp-b1ov), so v2 is the default: only exactly "1"
+// requests v1.
+static bool check_xmx_v1_simple_pp_requested() {
+    struct requested_case {
+        const char * env;
+        bool         want;
+    };
+
+    const requested_case cases[] = {
+        { nullptr, false },
+        { "0",     false },
+        { "",      false },
+        { "2",     false },
+        { "yes",   false },
+        { "1 ",    false },
+        { " 1",    false },
+        { "1",     true  },
+    };
+    bool ok = true;
+    for (const requested_case & c : cases) {
+        const bool got = ggml_sycl_fattn_xmx_v1_simple_pp_requested(c.env);
+        if (got != c.want) {
+            std::fprintf(stderr, "FAIL: GGML_SYCL_FA_XMX_V1_PP=%s%s%s requests v1=%d, want %d\n", c.env ? "\"" : "",
+                         c.env ? c.env : "<unset>", c.env ? "\"" : "", (int) got, (int) c.want);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+// A request selects v1 only for a shape can_use_xmx_v1_runtime() accepts.
+static bool check_xmx_v1_select_simple_pp() {
+    struct select_case {
+        bool requested;
+        bool supported;
+        bool want;
+    };
+
+    const select_case cases[] = {
+        { false, false, false },
+        { false, true,  false },
+        { true,  false, false },
+        { true,  true,  true  },
+    };
+    bool ok = true;
+    for (const select_case & c : cases) {
+        const bool got = ggml_sycl_fattn_xmx_v1_select_simple_pp(c.requested, c.supported);
+        if (got != c.want) {
+            std::fprintf(stderr, "FAIL: requested=%d xmx_v1_supported=%d selects %s, want %s\n", (int) c.requested,
+                         (int) c.supported, got ? "v1" : "v2", c.want ? "v1" : "v2");
+            ok = false;
         }
     }
     return ok;
@@ -104,7 +140,7 @@ static bool check_simple_pp_select_xmx_v1() {
 
 // GGML_SYCL_FA_XMX_V1 keeps its atoi() semantics: any nonzero integer forces
 // v1 for every shape can_use_xmx_v1_runtime() accepts; unset or zero does not.
-static bool check_force_xmx_v1_enabled() {
+static bool check_xmx_v1_force_enabled() {
     struct force_case {
         const char * env;
         bool         want;
@@ -124,7 +160,7 @@ static bool check_force_xmx_v1_enabled() {
     };
     bool ok = true;
     for (const force_case & c : cases) {
-        const bool got = ggml_sycl_fattn_force_xmx_v1_enabled(c.env);
+        const bool got = ggml_sycl_fattn_xmx_v1_force_enabled(c.env);
         if (got != c.want) {
             std::fprintf(stderr, "FAIL: GGML_SYCL_FA_XMX_V1=%s%s%s forces v1=%d, want %d\n", c.env ? "\"" : "",
                          c.env ? c.env : "<unset>", c.env ? "\"" : "", (int) got, (int) c.want);
@@ -134,7 +170,27 @@ static bool check_force_xmx_v1_enabled() {
     return ok;
 }
 
-static std::string find_repo_root() {
+// ---------------------------------------------------------------------------
+// Repo-root locator, duplicated verbatim across the seven source-reading tests in
+// this directory: test-sycl-fattn-onednn-gates.cpp, test-sycl-fattn-xmx-policy.cpp,
+// test-sycl-moe-direct-final-scratch-plan.cpp, test-sycl-moe-same-expert-grouping.cpp,
+// test-sycl-moe-fused-down-sum-policy.cpp, test-sycl-moe-fusion-noactivation.cpp and
+// test-sycl-moe-sequence-graphlet-policy.cpp. Duplicating rather than hoisting into a
+// shared header is the house style here.
+//
+// All seven copies list the SAME six cwd guesses ("." through "../../../../.."). That
+// depth is behavioural, not cosmetic: the guesses are what runs when the __FILE__
+// anchor fails, so a shallower copy stops finding the file from a deeper cwd. Change
+// all seven together.
+// ---------------------------------------------------------------------------
+static std::string join_path(const std::string & root, const char * rel) {
+    if (root.empty() || root == ".") {
+        return rel;
+    }
+    return root.back() == '/' ? root + rel : root + "/" + rel;
+}
+
+static std::vector<std::string> candidate_roots() {
     std::vector<std::string> roots;
     if (const char * env = std::getenv("LLAMA_CPP_REPO_ROOT")) {
         roots.emplace_back(env);
@@ -145,11 +201,20 @@ static std::string find_repo_root() {
     if (pos != std::string::npos) {
         roots.emplace_back(source_file.substr(0, pos));
     }
-    for (const char * rel : { ".", "..", "../..", "../../..", "../../../.." }) {
-        roots.emplace_back(rel);
-    }
-    for (const std::string & root : roots) {
-        if (std::filesystem::is_regular_file(root + "/ggml/src/ggml-sycl/fattn.cpp")) {
+    roots.emplace_back(".");
+    roots.emplace_back("..");
+    roots.emplace_back("../..");
+    roots.emplace_back("../../..");
+    roots.emplace_back("../../../..");
+    roots.emplace_back("../../../../..");
+    return roots;
+}
+
+// Unlike the siblings, which read one file, this scans the ggml-sycl tree, so it
+// needs the root itself rather than a file's contents.
+static std::string find_repo_root() {
+    for (const std::string & root : candidate_roots()) {
+        if (std::filesystem::is_regular_file(join_path(root, "ggml/src/ggml-sycl/fattn.cpp"))) {
             return root;
         }
     }
@@ -186,18 +251,20 @@ static int count_occurrences(const std::string & haystack, const std::string & n
     return count;
 }
 
-// fattn.cpp reads GGML_SYCL_FA_XMX_V1 and GGML_SYCL_FA_XMX_V1_PP once each,
-// both terms of use_xmx_v1_path are exactly the pinned helpers' results, and
-// use_xmx_v1_path guards the only default v1 launches, so the defaults pinned
+// fattn.cpp parses GGML_SYCL_FA_XMX_V1 and GGML_SYCL_FA_XMX_V1_PP once each
+// into a static const bool, so each opt-in's value is fixed for the process;
+// both terms of use_xmx_v1_path are exactly the pinned helpers' results; and
+// use_xmx_v1_path guards the only default v1 launches. So the defaults pinned
 // above are the defaults the dispatcher runs. Each line below is matched
-// verbatim: a reflow fails closed.
+// verbatim, including where clang-format wraps it: a reflow fails closed.
 static bool check_fattn_simple_pp_xmx_v1_wiring(const std::string & src) {
     const char * const chain[] = {
-        "static const bool force_xmx_v1 = ggml_sycl_fattn_force_xmx_v1_enabled(std::getenv(\"GGML_SYCL_FA_XMX_V1\"));",
-        "static const char * const simple_pp_xmx_v1_env = std::getenv(\"GGML_SYCL_FA_XMX_V1_PP\");",
-        "const bool simple_pp_xmx_v1 = ggml_sycl_fattn_simple_pp_select_xmx_v1(simple_pp_xmx_v1_env, "
-        "xmx_v1_supported);",
-        "const bool use_xmx_v1_path  = xmx_v1_supported && (force_xmx_v1 || simple_pp_xmx_v1);",
+        "static const bool force_xmx_v1 = ggml_sycl_fattn_xmx_v1_force_enabled(std::getenv(\"GGML_SYCL_FA_XMX_V1\"));",
+        "static const bool simple_pp_xmx_v1_requested =\n"
+        "            ggml_sycl_fattn_xmx_v1_simple_pp_requested(std::getenv(\"GGML_SYCL_FA_XMX_V1_PP\"));",
+        "const bool simple_pp_xmx_v1 =\n"
+        "            ggml_sycl_fattn_xmx_v1_select_simple_pp(simple_pp_xmx_v1_requested, xmx_v1_supported);",
+        "const bool use_xmx_v1_path = xmx_v1_supported && (force_xmx_v1 || simple_pp_xmx_v1);",
         "if (use_xmx_v1_path) {",
     };
     bool   ok   = true;
@@ -220,20 +287,23 @@ static bool check_fattn_simple_pp_xmx_v1_wiring(const std::string & src) {
     // rejection message), so nothing between the definition and the consumer
     // can substitute another value. launch_fattn_xmx_f16 counts the v1 launch
     // sites: FORCE_PATH=xmx-v1 plus the five under use_xmx_v1_path, so a new
-    // launch outside the chain fails here.
+    // launch outside the chain fails here. Three of those five (ncols 1, 2 and
+    // 4) are dead, because can_use_xmx_v1_runtime() requires ne01 >= 8;
+    // removing them is llama.cpp-n94g, which lowers this count to 3.
     struct identifier_uses {
         const char * name;
         int          want;
     };
 
     const identifier_uses uses[] = {
-        { "simple_pp_xmx_v1_env",                    2 },
-        { "simple_pp_xmx_v1",                        2 },
-        { "use_xmx_v1_path",                         2 },
-        { "ggml_sycl_fattn_simple_pp_select_xmx_v1", 1 },
-        { "force_xmx_v1",                            3 },
-        { "ggml_sycl_fattn_force_xmx_v1_enabled",    1 },
-        { "launch_fattn_xmx_f16",                    6 },
+        { "simple_pp_xmx_v1_requested",                 2 },
+        { "simple_pp_xmx_v1",                           2 },
+        { "use_xmx_v1_path",                            2 },
+        { "ggml_sycl_fattn_xmx_v1_simple_pp_requested", 1 },
+        { "ggml_sycl_fattn_xmx_v1_select_simple_pp",    1 },
+        { "force_xmx_v1",                               3 },
+        { "ggml_sycl_fattn_xmx_v1_force_enabled",       1 },
+        { "launch_fattn_xmx_f16",                       6 },
     };
     for (const identifier_uses & use : uses) {
         const int n = count_identifier(src, use.name);
@@ -290,8 +360,9 @@ static bool check_simple_pp_xmx_v1_source_contract() {
 int main() {
     bool ok = true;
 
-    ok &= check_simple_pp_select_xmx_v1();
-    ok &= check_force_xmx_v1_enabled();
+    ok &= check_xmx_v1_simple_pp_requested();
+    ok &= check_xmx_v1_select_simple_pp();
+    ok &= check_xmx_v1_force_enabled();
     ok &= check_simple_pp_xmx_v1_source_contract();
 
     ok &= expect_eq(ggml_sycl_fattn_xmx_v1_select_batch_kv(/*D=*/128, /*ncols=*/8, /*local_mem_size=*/96 * 1024), 48,

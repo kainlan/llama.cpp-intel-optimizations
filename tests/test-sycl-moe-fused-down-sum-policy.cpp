@@ -29,17 +29,17 @@ static std::string join_path(const std::string & root, const char * rel) {
 }
 
 // ---------------------------------------------------------------------------
-// Repo-root locator, duplicated verbatim across the six source-reading tests in
-// this directory: test-sycl-fattn-onednn-gates.cpp,
+// Repo-root locator, duplicated verbatim across the seven source-reading tests in
+// this directory: test-sycl-fattn-onednn-gates.cpp, test-sycl-fattn-xmx-policy.cpp,
 // test-sycl-moe-direct-final-scratch-plan.cpp, test-sycl-moe-same-expert-grouping.cpp,
 // test-sycl-moe-fused-down-sum-policy.cpp, test-sycl-moe-fusion-noactivation.cpp and
 // test-sycl-moe-sequence-graphlet-policy.cpp. Duplicating rather than hoisting into a
 // shared header is the house style here.
 //
-// All six copies list the SAME six cwd guesses ("." through "../../../../.."). That
+// All seven copies list the SAME six cwd guesses ("." through "../../../../.."). That
 // depth is behavioural, not cosmetic: the guesses are what runs when the __FILE__
 // anchor fails, so a shallower copy stops finding the file from a deeper cwd. Change
-// all six together.
+// all seven together.
 // ---------------------------------------------------------------------------
 static std::vector<std::string> candidate_roots() {
     std::vector<std::string> roots;

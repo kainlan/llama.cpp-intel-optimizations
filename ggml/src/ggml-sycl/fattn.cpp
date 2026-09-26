@@ -3194,12 +3194,13 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     //   GGML_SYCL_FA_XMX_V1=1     any shape can_use_xmx_v1_runtime() accepts
     //   GGML_SYCL_FA_XMX_V1_PP=1  simple D=128 PP
     if (use_xmx) {
-        static const bool force_xmx_v1 = ggml_sycl_fattn_force_xmx_v1_enabled(std::getenv("GGML_SYCL_FA_XMX_V1"));
-        static const char * const simple_pp_xmx_v1_env = std::getenv("GGML_SYCL_FA_XMX_V1_PP");
-
+        static const bool force_xmx_v1 = ggml_sycl_fattn_xmx_v1_force_enabled(std::getenv("GGML_SYCL_FA_XMX_V1"));
+        static const bool simple_pp_xmx_v1_requested =
+            ggml_sycl_fattn_xmx_v1_simple_pp_requested(std::getenv("GGML_SYCL_FA_XMX_V1_PP"));
         const bool xmx_v1_supported = can_use_xmx_v1_runtime();
-        const bool simple_pp_xmx_v1 = ggml_sycl_fattn_simple_pp_select_xmx_v1(simple_pp_xmx_v1_env, xmx_v1_supported);
-        const bool use_xmx_v1_path  = xmx_v1_supported && (force_xmx_v1 || simple_pp_xmx_v1);
+        const bool simple_pp_xmx_v1 =
+            ggml_sycl_fattn_xmx_v1_select_simple_pp(simple_pp_xmx_v1_requested, xmx_v1_supported);
+        const bool use_xmx_v1_path = xmx_v1_supported && (force_xmx_v1 || simple_pp_xmx_v1);
         if (force_xmx_v1 && !xmx_v1_supported && dispatch_debug_enabled) {
             fprintf(stderr,
                     "[SYCL] fattn: GGML_SYCL_FA_XMX_V1=1 rejected for D=%d ne01=%d sinks=%d softcap=%.6g fp8=%d; "
@@ -3210,8 +3211,12 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         if (use_xmx_v1_path) {
             // v1 kernel — A/B comparison only. It is faster than v2 on simple
             // D=128 PP but its output is not deterministic (llama.cpp-b1ov), so
-            // it is never the default. can_use_xmx_v1_runtime() keeps it off
-            // sink/softcap/FP8 and every decode shape.
+            // it is never the default. can_use_xmx_v1_runtime() admits only
+            // D=128 with ne01 >= 8 and a multiple of 8 (no ragged tail), and no
+            // sinks, softcap, FP8, paged or multi-seq layout, so no decode shape
+            // reaches v1. Under that gate the ncols 1/2/4 branches and the
+            // `ne01 % 8` test below are unreachable; removing them is
+            // llama.cpp-n94g.
             if (ne01 <= 1) {
                 GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=1 ne01=%d", D, ne01);
                 dispatch_debug_kernel("xmx_v1_f16_ncols1");
