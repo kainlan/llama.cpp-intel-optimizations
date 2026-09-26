@@ -1857,7 +1857,8 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
     // maximum) matters only then: it gives the partition's out-of-range slots,
     // which carry a score of -FLT_MAX, weight exp(-FLT_MAX / 2) = 0 rather than
     // exp(0) = 1, so the partial sum is 0 instead of a count of padding slots.
-    // The merge weighs such a partition by 0 either way.
+    // The merge result is the same either way: such a partition is weighted
+    // by 0 when another partition is live, and contributes 0 * 0 when none is.
     KQ_max = sycl::fmax(sycl::reduce_over_group(sg, local_max, sycl::maximum<float>{}), -FLT_MAX / 2.0f);
 
     float lane_probs[2 * XMX_V2_DECODE_SLOTS];
