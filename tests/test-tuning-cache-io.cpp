@@ -572,7 +572,8 @@ TEST(atomic_write) {
 // pre-existing matmul dispatch-tuning format alone, v2 for the pre-kv_unified
 // ubatch key shape, v3 (llama.cpp-3aos) for the pre-swa_full one, v4
 // (llama.cpp-uajm) for the single-device device_key, v5 for the device-set
-// key before it recorded the multi-device plan.
+// key whose shape changed in place ("hidden:", the placement-knob suffix,
+// "|plan=multi") before release.
 TEST(cache_version_is_6) {
     ASSERT(CACHE_VERSION == 6);
     return true;
