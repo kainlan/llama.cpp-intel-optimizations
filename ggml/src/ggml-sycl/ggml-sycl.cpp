@@ -17597,12 +17597,14 @@ enum class ggml_sycl_txn_result { ACCEPTED, REFUSED, BUSY };
 
 // Bumped whenever KV admission retires optional layout copies
 // (unified_cache_yield_optional_layouts()). A recorded exec graph bakes the raw
-// pointers it resolved and no weight lease: a WOQ copy's pointer baked by
-// another coexisting context would name memory that is now KV. So each
-// context compares its optional_layout_epoch at the top of graph compute and
-// drops what it recorded before any replay; the next eligible call records
-// afresh against what is resident. Retiring copies is rare (a context whose
-// KV needs the room), so the one re-record costs nothing measurable.
+// pointers it resolved; for a WOQ copy it also holds the copy's lease for the
+// graph's life (the WOQ gemm's retain_handles_until_event() lands in the
+// graph's sink while recording), so a copy a live graph reads is never
+// yielded. This epoch is defence in depth behind that lease: each context
+// compares its optional_layout_epoch at the top of graph compute and drops
+// what it recorded before any replay; the next eligible call records afresh
+// against what is resident. Retiring copies is rare (a context whose KV needs
+// the room), so the one re-record costs nothing measurable.
 static std::atomic<uint64_t> g_ggml_sycl_optional_layout_epoch{ 0 };
 
 static void ggml_sycl_optional_layouts_retired() {
@@ -35656,6 +35658,36 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     return nullptr;
 }
 
+// The cache's copy of `tensor` in exactly `layout`, as a leased handle rather
+// than a pointer: the reader keeps it until its queued work completes
+// (retain_handles_until_event), so a copy that can be released at runtime (an
+// optional ONEDNN_WOQ copy, unified_cache_yield_optional_layouts()) is never
+// freed under the read. Records the layout on extra->layout as
+// ggml_sycl_get_weight_layout_ptr() does. Empty on a miss.
+static ggml_sycl::mem_handle ggml_sycl_acquire_weight_layout(const ggml_tensor * tensor,
+                                                             int                 device,
+                                                             layout_mode         layout) {
+    if (!tensor || !tensor->buffer) {
+        return {};
+    }
+    sycl::queue &              q     = ggml_sycl_get_device(device).default_queue();
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(q);
+    const ggml_sycl_cache_id   key   = ggml_backend_sycl_get_weight_cache_key(tensor, device);
+    if (!cache || !key.valid) {
+        return {};
+    }
+    ggml_sycl::mem_handle         handle = cache->acquire_layout_handle(key, layout, device);
+    const ggml_sycl::resolved_ptr view   = handle.resolve(device);
+    if (!view) {
+        return {};
+    }
+    if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
+        ggml_sycl_update_layout_from_cache(extra, tensor, device, layout, view.ptr, view.extent,
+                                           ggml_sycl::cache_layout_xmx_info{}, 0);
+    }
+    return handle;
+}
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *         tensor,
                                                 const void *          data,
@@ -45168,7 +45200,10 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                                  static_cast<long long>(info.group_size));
                 }
                 if (info.total_bytes > 0) {
-                    void * woq_ptr = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_ONEDNN_WOQ);
+                    // The copy can yield to runtime KV, so its lease outlives the gemm.
+                    ggml_sycl::mem_handle woq_owner =
+                        ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_ONEDNN_WOQ);
+                    void * woq_ptr = woq_owner.resolve(ctx.device).ptr;
                     if (woq_trace) {
                         std::fprintf(stderr, "[ONEDNN][WOQ][TRACE] tensor=%s lookup_ptr=%p\n", src0->name, woq_ptr);
                     }
@@ -45188,6 +45223,12 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                                                                                    DnnlGemmWrapper::to_dt<sycl::half>(), weights_dev,
                                                                                    info.group_size, scales_dev, zp_dev, dst_dd_i,
                                                                                    DnnlGemmWrapper::to_dt<float>(), stream, ldc, 1);
+                            // Held until the gemm's reads complete, whether or not it
+                            // reports success. Recording lands the lease in the graph's
+                            // sink for the graph's life; the event is unused there.
+                            sycl::event read_done =
+                                g_ggml_sycl_graph_recording ? sycl::event{} : stream->ext_oneapi_submit_barrier();
+                            ggml_sycl::retain_handles_until_event({ std::move(woq_owner) }, std::move(read_done));
                             if (woq_trace) {
                                 std::fprintf(stderr, "[ONEDNN][WOQ][TRACE] tensor=%s cached_call_used=%d\n", src0->name,
                                              used_woq ? 1 : 0);

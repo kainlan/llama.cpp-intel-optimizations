@@ -1550,7 +1550,7 @@ WEIGHT_LAYOUT_PTR_SIGNATURE = ("void * ggml_sycl_get_weight_layout_ptr(const ggm
 CAN_USE_LAYOUT_SIGNATURE = ("static bool ggml_sycl_can_use_layout_for_kernel(const ggml_tensor * tensor, "
                             "layout_mode layout, int device) {")
 FINALIZE_RETIRED_SIGNATURE = "size_t unified_cache::finalize_retired_entries_locked() {"
-YIELDABLE_SIGNATURE = "static bool optional_layout_yieldable("
+YIELDABLE_SIGNATURE = "bool unified_cache::optional_layout_yieldable_locked("
 
 
 def optional_layout_yield_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
@@ -1595,7 +1595,7 @@ def optional_layout_yield_violations(sycl_cpp: str, cache_cpp: str) -> list[str]
         found.append("an optional layout release latches has_evictions_")
 
     yieldable = strip_comments(function(cache_cpp, YIELDABLE_SIGNATURE))
-    if not re.search(r"optional_layout_external_leases\(\s*key\s*,\s*entry\s*,\s*mirrors\s*\)\s*==\s*0", yieldable):
+    if not re.search(r"own_leases\s*=\s*mirrored\s*\?\s*1u\s*:\s*0u", yieldable):
         found.append("an optional copy someone else leases can be picked to yield")
     return found
 
@@ -1663,7 +1663,7 @@ def test_mutation_optional_release_latches_is_witnessed() -> None:
 
 
 def test_mutation_leased_copy_yieldable_is_witnessed() -> None:
-    _cache_mutation("optional_layout_external_leases(key, entry, mirrors) == 0;", "true;",
+    _cache_mutation("own_leases   = mirrored ? 1u : 0u;", "own_leases   = UINT32_MAX;",
                     "someone else leases", "lease check dropped")
 
 
@@ -1808,3 +1808,217 @@ def test_mutation_yield_by_bytes_is_witnessed() -> None:
                             "std::vector<size_t>(keys.size(), 0)", 1)
     _assert_witnessed(cache, mutated, lambda c: kv_fit_hold_violations(cpp, c), "without modelling",
                       "zone model dropped")
+
+
+# Weight reclaim has one authority, weight_entry_reclaimable() (CLAUDE.md, SYCL
+# Memory Ownership). The yield releases optional layout copies through its
+# OPTIONAL_LAYOUT_YIELD mode: a copy is reclaimable while a live model or buffer
+# owns its tensor (they dispatch on the primary), never while anyone but the
+# cache's own mirror leases it, and a primary never is. The predicate is
+# compiled on its own and asked, so the check is of what it decides, not of how
+# it is spelled. A WOQ reader keeps its copy's lease until its work completes,
+# so the lease -- not the yield's barrier -- is what makes the free correct.
+PREDICATE_SIGNATURE = "static bool weight_entry_reclaimable("
+RECLAIM_LOOP_SIGNATURE = "size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t slot) {"
+OPTIONAL_BYTES_SIGNATURE = "size_t unified_cache::optional_layout_bytes() const {"
+ACQUIRE_LAYOUT_SIGNATURE = "static ggml_sycl::mem_handle ggml_sycl_acquire_weight_layout("
+
+PREDICATE_HARNESS = r"""
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+
+struct unified_cache_entry {
+    std::atomic<uint32_t> in_use_count{ 0 };
+    uint32_t              owner_mask      = 0;
+    bool                  owner_tagged    = false;
+    bool                  optional_layout = false;
+};
+
+@ENUM@
+
+@PREDICATE@
+
+static void ask(const char * name, weight_reclaim_mode mode, uint32_t leases, uint32_t owner_mask, bool optional,
+                uint32_t live_mask, bool buffer_owned, bool buffer_live, uint32_t own_leases) {
+    unified_cache_entry entry;
+    entry.in_use_count    = leases;
+    entry.owner_mask      = owner_mask;
+    entry.owner_tagged    = true;
+    entry.optional_layout = optional;
+    const bool reclaimable =
+        weight_entry_reclaimable(entry, mode, live_mask, buffer_owned, buffer_live, own_leases);
+    std::printf("%s=%d\n", name, reclaimable ? 1 : 0);
+}
+
+int main() {
+    const weight_reclaim_mode yield = weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD;
+    const weight_reclaim_mode load  = weight_reclaim_mode::LOAD_BOUNDARY;
+    ask("owned_copy_mirror_only", yield, 1, 1, true, 1, true, true, 1);
+    ask("copy_with_reader", yield, 2, 0, true, 0, false, false, 1);
+    ask("copy_lease_not_own", yield, 1, 0, true, 0, false, false, 0);
+    ask("primary_idle", yield, 0, 0, false, 0, false, false, 0);
+    ask("primary_mirror_only", yield, 1, 0, false, 0, false, false, 1);
+    ask("load_owned_copy", load, 0, 1, true, 1, false, false, 0);
+    ask("load_unowned", load, 0, 0, false, 0, false, false, 0);
+    ask("load_leased", load, 1, 0, false, 0, false, false, 0);
+    return 0;
+}
+"""
+
+PREDICATE_EXPECTED = {
+    "owned_copy_mirror_only": 1,
+    "copy_with_reader": 0,
+    "copy_lease_not_own": 0,
+    "primary_idle": 0,
+    "primary_mirror_only": 0,
+    # The whole-weight modes are unchanged: ownership and leases still veto.
+    "load_owned_copy": 0,
+    "load_unowned": 1,
+    "load_leased": 0,
+}
+
+
+def definition(text: str, signature: str) -> str | None:
+    """The DEFINITION of `signature`: a forward declaration ends in ';' first."""
+    at = text.find(signature)
+    while at >= 0:
+        brace = text.find("{", at)
+        semi = text.find(";", at)
+        if brace >= 0 and (semi < 0 or brace < semi):
+            return function(text[at:], signature)
+        at = text.find(signature, at + 1)
+    return None
+
+
+def predicate_decisions(hpp: str, cache_cpp: str) -> dict[str, int] | str:
+    import os
+    import subprocess
+    import tempfile
+
+    enum = re.search(r"enum class weight_reclaim_mode \{.*?\};", hpp, re.S)
+    predicate = definition(cache_cpp, PREDICATE_SIGNATURE)
+    if enum is None or predicate is None:
+        return "weight_reclaim_mode or weight_entry_reclaimable() is missing"
+    source = PREDICATE_HARNESS.replace("@ENUM@", enum.group(0)).replace("@PREDICATE@", predicate)
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "predicate.cpp"
+        exe = Path(tmp) / "predicate"
+        src.write_text(source)
+        compiler = os.environ.get("CXX", "c++")
+        built = subprocess.run([compiler, "-std=c++17", "-o", str(exe), str(src)], capture_output=True, text=True)
+        if built.returncode != 0:
+            first = next((line for line in built.stderr.splitlines() if "error" in line), built.stderr.strip())
+            return f"does not compile on its own: {first}"
+        ran = subprocess.run([str(exe)], capture_output=True, text=True, check=True)
+    return {name: int(value) for name, value in (line.split("=") for line in ran.stdout.split())}
+
+
+def optional_layout_reclaim_violations(hpp: str, cache_cpp: str, sycl_cpp: str) -> list[str]:
+    found: list[str] = []
+    decisions = predicate_decisions(hpp, cache_cpp)
+    if isinstance(decisions, str):
+        found.append(f"the reclaim predicate has no optional-layout mode: {decisions}")
+    else:
+        for name, want in PREDICATE_EXPECTED.items():
+            if decisions.get(name) != want:
+                found.append(f"the reclaim predicate decides {name}={decisions.get(name)}, want {want}")
+
+    yieldable = strip_comments(definition(cache_cpp, YIELDABLE_SIGNATURE) or "")
+    if not re.search(r"return\s+weight_entry_reclaimable\(\s*entry\s*,\s*weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD\s*,",
+                     yieldable) or re.search(r"entry\.(optional_layout|in_use_count)", yieldable):
+        found.append("the yield decides reclaim outside weight_entry_reclaimable()")
+    users = strip_comments(definition(cache_cpp, OPTIONAL_BYTES_SIGNATURE) or "") + \
+        strip_comments(definition(cache_cpp, YIELD_SIGNATURE) or "")
+    if users.count("optional_layout_yieldable_locked(") != 3:
+        found.append("a yield path picks copies without the reclaim predicate")
+
+    loop = strip_comments(definition(cache_cpp, RECLAIM_LOOP_SIGNATURE) or "")
+    if not re.search(r"if \(mode == weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD\) \{\s*GGML_ABORT\(", loop):
+        found.append("reclaim_weight_entries() accepts the optional-layout mode")
+
+    code = strip_comments(sycl_cpp)
+    if re.search(r"ggml_sycl_get_weight_layout_ptr\([^;]*GGML_LAYOUT_ONEDNN_WOQ\s*\)", code):
+        found.append("a WOQ reader resolves its copy to a bare pointer")
+    lease = code.find("ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_ONEDNN_WOQ)")
+    gemm = code.find("DnnlGemmWrapper::woq_gemm_q4_0(", max(lease, 0))
+    retain = code.find("ggml_sycl::retain_handles_until_event({ std::move(woq_owner) }", max(gemm, 0))
+    if lease < 0 or gemm < 0 or retain < 0:
+        found.append("the WOQ gemm does not hold its copy's lease until its work completes")
+    acquire = strip_comments(definition(sycl_cpp, ACQUIRE_LAYOUT_SIGNATURE) or "")
+    if "cache->acquire_layout_handle(key, layout, device)" not in acquire or "get_view(" in acquire:
+        found.append("the WOQ copy is resolved without a lease")
+    return found
+
+
+def test_optional_layout_reclaim() -> None:
+    assert optional_layout_reclaim_violations(UNIFIED_CACHE_HPP.read_text(), UNIFIED_CACHE_CPP.read_text(),
+                                              GGML_SYCL_CPP.read_text()) == []
+
+
+def _reclaim_mutation(path: Path, old: str, new: str, expected: str, label: str) -> None:
+    texts = {p: p.read_text() for p in (UNIFIED_CACHE_HPP, UNIFIED_CACHE_CPP, GGML_SYCL_CPP)}
+    original = texts[path]
+
+    def checker(mutated: str) -> list[str]:
+        t = dict(texts)
+        t[path] = mutated
+        return optional_layout_reclaim_violations(t[UNIFIED_CACHE_HPP], t[UNIFIED_CACHE_CPP], t[GGML_SYCL_CPP])
+
+    _assert_witnessed(original, original.replace(old, new, 1), checker, expected, label)
+
+
+def test_mutation_owner_vetoes_copy_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP, "    if (mode == weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD) {\n        return entry.optional_layout;\n    }\n",
+                      "", "owned_copy_mirror_only=0", "optional mode falls through to ownership")
+
+
+def test_mutation_primary_reclaimable_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP, "        return entry.optional_layout;\n", "        return true;\n",
+                      "primary_idle=1", "optional mode accepts a primary")
+
+
+def test_mutation_reader_lease_ignored_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP, "if (entry.in_use_count.load() > own_leases) {",
+                      "if (entry.in_use_count.load() > own_leases + 1) {", "copy_with_reader=1",
+                      "a reader's lease is not a veto")
+
+
+def test_mutation_mode_missing_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_HPP, "    OPTIONAL_LAYOUT_YIELD,\n", "", "has no optional-layout mode",
+                      "mode removed")
+
+
+def test_mutation_yield_bypasses_predicate_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP,
+                      "return weight_entry_reclaimable(entry, weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD,",
+                      "return entry.optional_layout && weight_entry_reclaimable(entry, weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD,",
+                      "outside weight_entry_reclaimable()", "yield reads the flag itself")
+
+
+def test_mutation_yield_path_unchecked_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP, "                optional_layout_yieldable_locked(it->first, it->second)) {",
+                      "                true) {", "without the reclaim predicate", "revalidation dropped")
+
+
+def test_mutation_reclaim_loop_accepts_mode_is_witnessed() -> None:
+    _reclaim_mutation(UNIFIED_CACHE_CPP, "    if (mode == weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD) {\n        GGML_ABORT(",
+                      "    if (false) {\n        GGML_ABORT(", "accepts the optional-layout mode", "refusal dropped")
+
+
+def test_mutation_woq_reader_unleased_is_witnessed() -> None:
+    _reclaim_mutation(GGML_SYCL_CPP,
+                      "ggml_sycl::retain_handles_until_event({ std::move(woq_owner) }, std::move(read_done));",
+                      "(void) read_done;", "does not hold its copy's lease", "retention dropped")
+
+
+def test_mutation_woq_reader_bare_pointer_is_witnessed() -> None:
+    _reclaim_mutation(GGML_SYCL_CPP, "void * woq_ptr = woq_owner.resolve(ctx.device).ptr;",
+                      "void * woq_ptr = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_ONEDNN_WOQ);",
+                      "resolves its copy to a bare pointer", "pointer lookup restored")
+
+
+def test_mutation_woq_resolve_unleased_is_witnessed() -> None:
+    _reclaim_mutation(GGML_SYCL_CPP, "cache->acquire_layout_handle(key, layout, device)",
+                      "ggml_sycl::mem_handle::from_direct(cache->get_view(key, layout).ptr, layout, true, device, 0)",
+                      "resolved without a lease", "view instead of lease")

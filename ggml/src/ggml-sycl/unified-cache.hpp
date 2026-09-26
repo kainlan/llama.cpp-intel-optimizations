@@ -2411,6 +2411,14 @@ enum class weight_reclaim_mode {
     // ggml_backend_sycl_model_unloaded(): one model died.  Drop its ownership
     // bit and reclaim -- unpinning first -- every entry no live model owns.
     MODEL_TEARDOWN,
+    // unified_cache::yield_optional_layouts(): runtime KV wants the VRAM an
+    // optional layout copy holds.  Only a copy marked optional_layout is
+    // reclaimable, and it is even while a live model or buffer owns its
+    // tensor: that tensor's primary layout stays resident and its dispatch
+    // reads the primary once the copy is gone.  A primary never is, and no
+    // lease but the yield's own may be live.  Reclaimed only by the yield,
+    // never by reclaim_weight_entries().
+    OPTIONAL_LAYOUT_YIELD,
 };
 
 // An allocation detached from entries_ and freed after rw_mutex_ is dropped.
@@ -2503,7 +2511,8 @@ struct unified_cache_entry {
     uint64_t              pending_load_txn_id   = 0;
     // An optional layout copy, held as well as the tensor's primary (a dense
     // oneDNN WOQ copy): it serves no op the primary cannot, so a live model's
-    // ownership does not keep it resident against runtime KV. Only
+    // ownership does not keep it resident against runtime KV
+    // (weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD). Only
     // yield_optional_layouts() acts on it, and only while no one but the
     // cache's own direct-stage mirror holds a lease. Never set on a primary.
     bool                  optional_layout       = false;
@@ -2720,6 +2729,14 @@ class unified_cache {
     weight_ptr_lease_result acquire_weight_lease(const ggml_sycl_cache_id & key);
     weight_ptr_lease_result acquire_entry_lease(const unified_cache_key & key);
 
+    // A leased handle on a dense weight's staged copy in exactly `layout`, for
+    // a reader that holds it until its queued work completes
+    // (retain_handles_until_event) -- so a copy that can be released at
+    // runtime (an optional layout, yield_optional_layouts()) is never freed
+    // under a read. Resolves the same entry get_view() does; empty on a miss
+    // or while the copy's fill is still in flight.
+    mem_handle acquire_layout_handle(const ggml_sycl_cache_id & key, ggml_layout_mode layout, int device);
+
     // --- Decomposed cache operations (no queue ops during inference) ---
 
     // Allocate a VRAM slot for a cache entry. May evict LRU entries.
@@ -2920,16 +2937,18 @@ class unified_cache {
     // Optional layout copies (unified_cache_entry::optional_layout).
     // mark_optional_layout() tags a dense weight's staged copy in `layout`.
     // optional_layout_bytes() is what yield_optional_layouts() could release
-    // now: device-resident, non-retired copies nobody but the cache's own
-    // direct-stage mirror leases. yield_optional_layouts() retires the ones
+    // now: device-resident, non-retired copies weight_entry_reclaimable()
+    // accepts under OPTIONAL_LAYOUT_YIELD -- nobody but the cache's own
+    // direct-stage mirror leases them. yield_optional_layouts() retires the ones
     // that let more of `layer_bytes` (KV layer allocations, in the order the
     // tiered KV allocator makes them) land in the zone -- a copy whose hole no
     // layer can use stays (select_optional_layout_yield()) -- waits once for
-    // every queue the cache orders frees against (a copy's readers take no
-    // lease), and returns their storage to its zone before it returns.
-    // Primaries are never touched. kv_layers_allocatable() is how many of
-    // `layer_bytes` the zone can place now. Cold, context-admission-time calls:
-    // not for a dispatch path.
+    // every queue the cache orders frees against, and returns their storage to
+    // its zone before it returns. A reader holds its copy's lease until its
+    // work completes (acquire_layout_handle()), so a copy being read is never
+    // picked; the wait is defence in depth. Primaries are never touched.
+    // kv_layers_allocatable() is how many of `layer_bytes` the zone can place
+    // now. Cold, context-admission-time calls: not for a dispatch path.
     bool                         mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout);
     size_t                       optional_layout_bytes() const;
     optional_layout_yield_result yield_optional_layouts(const std::vector<size_t> & layer_bytes);
@@ -4523,6 +4542,9 @@ class unified_cache {
     // A copy of the allocators KV is carved from (kv_zone_model), and where
     // each of `ptrs` sits in it when `blocks` is given.
     kv_zone_model kv_zone_snapshot(const std::vector<const void *> & ptrs, std::vector<kv_zone_block> * blocks);
+    // May yield_optional_layouts() release this entry now? Caller holds
+    // direct_stage_mutex_ and rw_mutex_ (either mode).
+    bool optional_layout_yieldable_locked(const unified_cache_key & key, const unified_cache_entry & entry) const;
     using zone_registry_commit_fn = bool (*)(void *, const arena_authority::allocation_record &, void *) noexcept;
     bool arena_register_exact(vram_zone_id zone, uint64_t allocation_id, size_t offset, size_t extent) noexcept;
     void arena_unregister_exact(vram_zone_id zone, size_t offset) noexcept;

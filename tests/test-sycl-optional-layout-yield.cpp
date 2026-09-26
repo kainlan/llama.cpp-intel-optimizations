@@ -21,8 +21,10 @@
 //   - adjacent copies free into one extent, so a layer larger than any one
 //     copy lands once enough of them go.
 // And the ownership class's limits: a copy someone other than the cache's own
-// direct-stage mirror leases is not released until that lease drops, and a
-// primary (never marked optional) is never released.
+// direct-stage mirror leases -- including a reader whose work is still queued
+// -- is not released until that lease drops, a live model's ownership does not
+// keep a copy (its primary serves the model), and a primary (never marked
+// optional) is never released.
 //
 // No model is loaded: weights are staged directly into the device cache, as
 // S1-PRELOAD does, so the run costs a few tens of MB of device memory. The
@@ -41,10 +43,12 @@
 #include "sycl-selector-fallback.hpp"
 #include "test-skip.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <list>
 #include <sycl/sycl.hpp>
+#include <thread>
 #include <vector>
 
 #if !defined(GGML_USE_SYCL)
@@ -161,6 +165,74 @@ void test_leased_copy_is_not_yielded(unified_cache * cache, sycl::queue * queue)
     check(released.kv_layers == layers.size(), "and the extra layer lands");
 }
 
+// The WOQ gemm's lease: acquire_layout_handle() plus retain_handles_until_event()
+// on the gemm's completion. A reader whose work has not run yet keeps the copy,
+// so its free is gated by the read itself, not by the yield's barrier. The
+// "read" here is a host task on a queue of its own that finishes when the test
+// lets it -- a queue the yield's barrier does not cover, so only the lease can
+// hold the copy.
+void test_copy_being_read_is_not_yielded(unified_cache * cache, sycl::queue * queue) {
+    printf("a copy with a read in flight is not yielded until the read completes:\n");
+    staged copy;
+    if (!stage(cache, queue, GGML_LAYOUT_ONEDNN_WOQ, &copy)) {
+        check(false, "staged and marked a WOQ copy");
+        return;
+    }
+    ggml_sycl::mem_handle reader = cache->acquire_layout_handle(copy.key, GGML_LAYOUT_ONEDNN_WOQ, 0);
+    check(reader.valid() && reader.resolve(0).ptr == copy.ptr, "a reader leases the copy it resolves");
+
+    std::atomic<bool> done{ false };
+    sycl::queue       side(queue->get_context(), queue->get_device());
+    sycl::event       read = side.submit([&](sycl::handler & h) {
+        h.host_task([&done] {
+            while (!done.load()) {
+                std::this_thread::yield();
+            }
+        });
+    });
+    ggml_sycl::retain_handles_until_event({ std::move(reader) }, read);
+
+    size_t     placeable = 0;
+    const auto layers    = one_more_layer(cache, COPY_BYTES, &placeable);
+    const auto held      = cache->yield_optional_layouts(layers);
+    check(held.retired == 0 && held.freed_bytes == 0, "a yield passes over the copy being read");
+    check(cache->is_cached(copy.key, GGML_LAYOUT_ONEDNN_WOQ), "the copy still resolves");
+
+    done.store(true);
+    read.wait();
+    check(ggml_sycl::drain_retained_handles(true), "the read's lease is released once it completes");
+    const auto released = cache->yield_optional_layouts(layers);
+    check(released.freed == 1 && released.freed_bytes == COPY_BYTES, "then a yield frees it");
+    check(released.kv_layers == layers.size(), "and the extra layer lands");
+}
+
+// weight_entry_reclaimable(OPTIONAL_LAYOUT_YIELD): a live model's ownership
+// keeps a weight, not its optional second layout -- the model reads the primary.
+void test_owned_copy_is_yielded(unified_cache * cache, sycl::queue * queue) {
+    printf("a copy a live model owns is still yielded:\n");
+    staged copy;
+    if (!stage(cache, queue, GGML_LAYOUT_ONEDNN_WOQ, &copy)) {
+        check(false, "staged and marked a WOQ copy");
+        return;
+    }
+    constexpr uint32_t slot   = 7;
+    constexpr uint64_t txn    = 0x6a656877;
+    const uint32_t     before = cache->live_model_mask();
+    const size_t       tagged = cache->owner_tagged_entry_count();
+    const bool         marked = cache->test_mark_entry_touched_by_load(copy.key, GGML_LAYOUT_ONEDNN_WOQ, txn);
+    cache->note_model_load_end(slot, txn);
+    // Without the ownership taking hold, this case says nothing about it.
+    check(marked && (cache->live_model_mask() & (1u << slot)) != 0 && cache->owner_tagged_entry_count() > tagged,
+          "the copy is owned by a live model");
+
+    size_t     placeable = 0;
+    const auto layers    = one_more_layer(cache, COPY_BYTES, &placeable);
+    const auto result    = cache->yield_optional_layouts(layers);
+    check(result.freed == 1 && result.freed_bytes == COPY_BYTES, "a yield frees it");
+    check(result.kv_layers == layers.size(), "and the extra layer lands");
+    cache->set_live_model_mask(before);
+}
+
 // S1-PRELOAD's order: each copy beside its own primary. Three 4 MB copies free
 // 12 MB, more than an 8 MB layer, but as three holes between primaries.
 void test_holes_between_primaries_are_not_yielded(unified_cache *       cache,
@@ -268,6 +340,10 @@ int main(int, char ** argv) {
         std::vector<staged> primaries;
         test_yield_returns_bytes_to_zone(cache, queue);
         test_leased_copy_is_not_yielded(cache, queue);
+        // Before any case leaves a yieldable copy behind, so a yield in these
+        // two can only pick the copy under test.
+        test_copy_being_read_is_not_yielded(cache, queue);
+        test_owned_copy_is_yielded(cache, queue);
         test_holes_between_primaries_are_not_yielded(cache, queue, &primaries);
         test_adjacent_copies_are_yielded_together(cache, queue, &primaries);
 

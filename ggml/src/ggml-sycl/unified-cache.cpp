@@ -7649,29 +7649,29 @@ bool unified_cache::mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mod
     return true;
 }
 
-// The leases on an optional copy that are not the cache's own direct-stage
-// mirror: the mirror is the cache holding its own entry, which yielding
-// withdraws; any other lease is a user the copy must not be freed under.
-// Caller holds direct_stage_mutex_ and rw_mutex_ (either mode).
-template <typename mirror_map>
-static uint32_t optional_layout_external_leases(const unified_cache_key &   key,
-                                                const unified_cache_entry & entry,
-                                                const mirror_map &          mirrors) {
-    const uint32_t leases = entry.in_use_count.load();
-    const auto     mirror = mirrors.find(key.id);
-    const bool     held   = mirror != mirrors.end() && mirror->second.handle && mirror->second.layout == entry.layout &&
-                      mirror->second.ptr == entry.device_ptr;
-    return held && leases > 0 ? leases - 1 : leases;
-}
+static bool weight_entry_reclaimable(const unified_cache_entry & entry,
+                                     weight_reclaim_mode         mode,
+                                     uint32_t                    live_mask,
+                                     bool                        buffer_owned,
+                                     bool                        buffer_owner_live,
+                                     uint32_t                    own_leases = 0);
+static bool cache_id_is_buffer_owned(const ggml_sycl_cache_id & id) noexcept;
 
-template <typename mirror_map>
-static bool optional_layout_yieldable(const unified_cache_key &   key,
-                                      const unified_cache_entry & entry,
-                                      const mirror_map &          mirrors) {
-    return entry.optional_layout && !entry.retired && key.type == cache_entry_type::DENSE_WEIGHT &&
-           entry.location == cache_location::DEVICE && !entry.host_resident &&
-           entry.state == cache_entry_state::READY && entry.device_ptr != nullptr &&
-           optional_layout_external_leases(key, entry, mirrors) == 0;
+bool unified_cache::optional_layout_yieldable_locked(const unified_cache_key &   key,
+                                                     const unified_cache_entry & entry) const {
+    if (entry.retired || key.type != cache_entry_type::DENSE_WEIGHT || entry.location != cache_location::DEVICE ||
+        entry.host_resident || entry.state != cache_entry_state::READY || entry.device_ptr == nullptr) {
+        return false;
+    }
+    // The cache's own direct-stage mirror is the one lease the yield holds
+    // itself and withdraws; any other is a reader the copy is not freed under.
+    const auto mirror   = direct_weight_entries_.find(key.id);
+    const bool mirrored = mirror != direct_weight_entries_.end() && mirror->second.handle &&
+                          mirror->second.layout == entry.layout && mirror->second.ptr == entry.device_ptr;
+    const uint32_t own_leases   = mirrored ? 1u : 0u;
+    const bool     buffer_owned = cache_id_is_buffer_owned(key.id);
+    return weight_entry_reclaimable(entry, weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD, live_model_mask_, buffer_owned,
+                                    buffer_owned && live_buffer_owners_.count(key.id.model_id) != 0, own_leases);
 }
 
 size_t unified_cache::optional_layout_bytes() const {
@@ -7680,7 +7680,7 @@ size_t unified_cache::optional_layout_bytes() const {
     std::lock(direct_lock, cache_lock);
     size_t bytes = 0;
     for (const auto & pair : entries_) {
-        if (optional_layout_yieldable(pair.first, pair.second, direct_weight_entries_)) {
+        if (optional_layout_yieldable_locked(pair.first, pair.second)) {
             bytes += pair.second.size;
         }
     }
@@ -7752,7 +7752,7 @@ optional_layout_yield_result unified_cache::yield_optional_layouts(const std::ve
         std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
         std::lock(direct_lock, cache_lock);
         for (const auto & pair : entries_) {
-            if (optional_layout_yieldable(pair.first, pair.second, direct_weight_entries_)) {
+            if (optional_layout_yieldable_locked(pair.first, pair.second)) {
                 keys.push_back(pair.first);
                 ptrs.push_back(pair.second.device_ptr);
                 sizes.push_back(pair.second.size);
@@ -7767,17 +7767,14 @@ optional_layout_yield_result unified_cache::yield_optional_layouts(const std::ve
         return result;
     }
 
-    // A copy's readers take no lease: the oneDNN WOQ gemm reads the raw pointer
-    // ggml_sycl_get_weight_layout_ptr() resolved, so neither in_use_count nor the
-    // staging write event (which gates a direct-staged entry's deferred free)
-    // says when its last read has run. A barrier over every queue the cache
-    // orders frees against does -- every context on this device submits to
-    // queue_ -- so it replaces the write event as each retired copy's free gate.
-    // It is submitted in the same critical section that retires the copies:
-    // from there on no lookup resolves them. A read resolved earlier but not yet
-    // submitted would be another context computing during this admission,
-    // same-device concurrent inference, which is unsupported (canonical memory
-    // contract §5).
+    // A copy's reader holds its lease until the read completes
+    // (acquire_layout_handle() plus retain_handles_until_event(); a recorded
+    // graph holds it for the graph's life), so a copy being read is not
+    // yieldable and is never picked. The barrier below is defence in depth: a
+    // barrier over every queue the cache orders frees against -- every context
+    // on this device submits to queue_ -- replaces the staging write event as
+    // each retired copy's free gate. It is submitted in the same critical
+    // section that retires the copies: from there on no lookup resolves them.
     //
     // Otherwise the same withdrawal as retire_expert_entry_exact(): take the
     // cache's own mirror lease out and retire the entry under both locks, and
@@ -7796,7 +7793,7 @@ optional_layout_yield_result unified_cache::yield_optional_layouts(const std::ve
         for (size_t i : picks) {
             const auto it = entries_.find(keys[i]);
             if (it != entries_.end() && it->second.device_ptr == ptrs[i] &&
-                optional_layout_yieldable(it->first, it->second, direct_weight_entries_)) {
+                optional_layout_yieldable_locked(it->first, it->second)) {
                 still.push_back(i);
             }
         }
@@ -9667,6 +9664,39 @@ cache_ptr_view unified_cache::get_view(const ggml_sycl_cache_id & key_id, ggml_l
         view.ready_event     = entry.ready_event;
     }
     return view;
+}
+
+mem_handle unified_cache::acquire_layout_handle(const ggml_sycl_cache_id & key_id,
+                                                ggml_layout_mode           layout,
+                                                int                        device) {
+    if (!key_id.valid) {
+        return {};
+    }
+    // get_view()'s key: the direct-staged entry, else the id's canonical one.
+    unified_cache_key key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        if (entries_.find(key) == entries_.end()) {
+            const auto id_it = id_to_key_.find(key_id);
+            if (id_it == id_to_key_.end()) {
+                return {};
+            }
+            key = id_it->second;
+        }
+    }
+    weight_ptr_lease_result lease = acquire_entry_lease(key);
+    if (!lease) {
+        return {};
+    }
+    const bool filled = !lease.has_ready_event || event_complete(lease.ready_event);
+    mem_handle handle = mem_handle::from_weight_lease_snapshot(key, device, lease.ptr, lease.layout, lease.on_device,
+                                                               lease.entry, std::move(lease.storage_owner),
+                                                               lease.has_ready_event, lease.ready_event);
+    // The handle owns the lease now, so a refusal releases it.
+    if (!handle.valid() || lease.layout != layout || !filled) {
+        return {};
+    }
+    return handle;
 }
 
 // ---------------------------------------------------------------------------
@@ -12835,6 +12865,8 @@ static const char * weight_reclaim_mode_name(weight_reclaim_mode mode) {
             return "mid-load-replan";
         case weight_reclaim_mode::MODEL_TEARDOWN:
             return "model-teardown";
+        case weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD:
+            return "optional-layout-yield";
     }
     return "unknown";
 }
@@ -12878,13 +12910,24 @@ static bool strict_lease_checks_enabled() {
 // that buffer is still alive. A live buffer vetoes reclaim in every mode
 // (including the replan, which is why the test sits above that early return);
 // a dead buffer's entries are ordinary reclaimable state.
+//
+// OPTIONAL_LAYOUT_YIELD reclaims one physical layout of a tensor, not the
+// tensor: an optional copy's owners -- live model, live buffer -- dispatch on
+// the primary layout, which stays resident, so their ownership does not veto
+// it; only a lease does. `own_leases` is the lease the caller itself holds
+// and withdraws with the entry (the yield's direct-stage mirror); every other
+// is a reader. Nothing that is not an optional copy is reclaimable in it.
 static bool weight_entry_reclaimable(const unified_cache_entry & entry,
                                      weight_reclaim_mode         mode,
                                      uint32_t                    live_mask,
                                      bool                        buffer_owned,
-                                     bool                        buffer_owner_live) {
-    if (entry.in_use_count.load() != 0) {
+                                     bool                        buffer_owner_live,
+                                     uint32_t                    own_leases) {
+    if (entry.in_use_count.load() > own_leases) {
         return false;
+    }
+    if (mode == weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD) {
+        return entry.optional_layout;
     }
     if ((entry.owner_mask & live_mask) != 0) {
         return false;
@@ -13162,6 +13205,13 @@ void unified_cache::reset_model_weight_entries(weight_reclaim_mode mode) {
 }
 
 size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t slot) {
+    // This loop neither withdraws the direct-stage mirror lease nor gates a
+    // free on the copy's readers; yield_optional_layouts() does both and is
+    // that mode's only reclaim path.
+    if (mode == weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD) {
+        GGML_ABORT("weight reclaim mode %s reclaims only through yield_optional_layouts()",
+                   weight_reclaim_mode_name(mode));
+    }
     // perf-recovery track B (llama.cpp-1tjn): a MID_LOAD_REPLAN resets this
     // model's own weight materialization state (see the MID_LOAD_REPLAN
     // comment at the S1-PRELOAD call site in ggml-sycl.cpp) without going

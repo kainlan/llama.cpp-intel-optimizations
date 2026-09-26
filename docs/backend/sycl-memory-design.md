@@ -775,6 +775,34 @@ never moves — always returns its cached pointer), `ARENA_RUNTIME/SCRATCH/ONEDN
 its backing arena chunk, so the chunk can't be `sycl::free`'d while the pointer
 is in use).
 
+### Optional layout copies yield to runtime KV (llama.cpp-jehw)
+
+Weight reclaim has one authority, `weight_entry_reclaimable()`, and each
+reclaim path names its purpose as a `weight_reclaim_mode`. Three modes reclaim
+whole weights at model-load and teardown boundaries (`reset_model_weight_entries()`),
+and there a live model's ownership (`owner_mask`) or a live buffer vetoes
+reclaim even at `in_use_count == 0`. The fourth, `OPTIONAL_LAYOUT_YIELD`,
+reclaims one physical layout of a tensor, not the tensor:
+
+- **What it reclaims.** Only an entry marked `optional_layout`: a second
+  physical layout staged beside the tensor's primary (today, a dense oneDNN
+  WOQ copy). A primary is never reclaimable in this mode.
+- **Why ownership does not veto it.** The tensor's owners, a live model or a
+  live buffer, dispatch on the primary, which stays resident. Once the copy is
+  gone, the route asks the cache and no longer offers the WOQ path, so the
+  owner loses a faster PP route and keeps correctness. This holds for another
+  loaded model's copies too.
+- **What does veto it.** Any lease other than the cache's own direct-stage
+  mirror, which the yield withdraws with the entry. A reader leases its copy
+  through `unified_cache::acquire_layout_handle()` and keeps the lease until
+  its work completes: `retain_handles_until_event()`, or the recording graph's
+  sink for that graph's life. So a copy that is being read is not yieldable.
+  The yield's queue barrier and the recorded-graph epoch drop are defence in
+  depth behind that lease, not what makes the free correct.
+- **Who calls it.** Only `yield_optional_layouts()`, at a context's KV
+  admission. `reclaim_weight_entries()` refuses the mode, because it neither
+  withdraws the mirror lease nor gates a free on readers.
+
 ## Where a weight's provenance comes from
 
 A WEIGHT handle is keyed by `ggml_sycl_cache_id` — tensor identity, not pointer —
