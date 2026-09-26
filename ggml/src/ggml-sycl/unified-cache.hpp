@@ -1905,6 +1905,16 @@ size_t   unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(int device_id
 size_t   unified_cache_get_planned_pp_moe_onednn_scratch_bytes(int device_id);
 uint32_t unified_cache_get_planned_pp_moe_onednn_ring_depth(int device_id);
 
+// llama.cpp-u1bb: which ubatch-scaled ring slots live in the shared KV zone,
+// placed there by the runtime-context transaction because the RUNTIME zone could
+// not also hold them. reserve_pp_moe_onednn_scratch() allocates each slot from
+// its zone on every call, and the RUNTIME zone requirement counts only the
+// slots that stay in RUNTIME. kv_zone_bytes is depth x the flagged slot bytes.
+void   unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(int device_id, bool activation, bool output);
+bool   unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(int device_id);
+bool   unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(int device_id);
+size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id);
+
 // llama.cpp-ibj0: per-row bytes behind the two ubatch-scaled slots above,
 // carried from the loader (src/llama-model.cpp's ggml_sycl_tensor_inventory)
 // so the runtime-context transaction can re-plan the ring for the REAL

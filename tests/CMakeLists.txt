@@ -3260,6 +3260,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-u1bb: source gate for how the runtime transaction grows the PP MoE
+# oneDNN ring past the RUNTIME zone into the shared KV zone's post-KV headroom
+# (after KV, against the one live KV capacity, charged, never spilling). The
+# admission arithmetic itself is host-tested by test-pp-moe-ring-admission.
+# Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-pp-moe-ring-kv-zone-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-pp-moe-ring-kv-zone-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-tsfl: source gate for nphx Task 2 -- (A) the two compute-buffer
 # host-pinned fallback paths inside
 # ggml_backend_sycl_buffer_type_alloc_buffer() must be GGML_LOG_WARN (not

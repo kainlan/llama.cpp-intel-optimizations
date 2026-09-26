@@ -15965,6 +15965,10 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         ctx->device, g_tensor_inventory_pp_moe_onednn_weight_slot_bytes,
         g_tensor_inventory_pp_moe_onednn_activation_slot_bytes, g_tensor_inventory_pp_moe_onednn_output_slot_bytes,
         g_tensor_inventory_pp_moe_onednn_ring_depth);
+    // The load-time ring is sized for the RUNTIME zone, which the arena sizes
+    // from it, so every slot starts there. Only a runtime-context transaction
+    // places slots in the shared KV zone (ggml_sycl_replan_pp_moe_onednn_ring()).
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(ctx->device, false, false);
     // llama.cpp-ibj0: carry the per-row bytes behind the two slot sizes above
     // into the backend, so the runtime-context transaction can re-plan the
     // ring for the REAL runtime n_ubatch (ggml_sycl_replan_pp_moe_onednn_ring())
@@ -16907,18 +16911,39 @@ static uint32_t ggml_sycl_largest_fitting_n_ctx(const ggml_sycl::placement_plan 
     return static_cast<uint32_t>((cells / 256) * 256);
 }
 
-// Largest all-VRAM n_ctx against the live KV headroom runtime KV admission
-// uses (unified_cache_kv_vram_available), including kv_alloc_slack_per_layer
-// per resident layer, so every "-c" hint quotes the number admission applies.
-// Counts the load-time residency (what fits with no demotion). `device` limits
-// it to one device; -1 takes the smallest answer over the devices holding KV.
+// What `device`'s KV zone can hold for the KV a runtime-context transaction is
+// placing: the live KV headroom runtime KV admission uses
+// (unified_cache_kv_vram_available), read now, plus what that KV will replace.
 // `admitted` is the published plan of a context whose KV is already allocated
 // (its micro-batch trial): the live headroom excludes that KV, so it is added
-// back.
+// back. So are the PP MoE oneDNN ring's KV-zone slots when `ring_device` is this
+// device, the device whose transaction asks: KV wins over them, and that
+// transaction re-admits the ring after KV. The "-c" hints and the ring's
+// admission both read this one number.
+static size_t ggml_sycl_kv_capacity_live(const ggml_sycl::placement_plan & plan,
+                                         int                               device,
+                                         const ggml_sycl::placement_plan * admitted,
+                                         int                               ring_device) {
+    size_t capacity = ggml_sycl::unified_cache_kv_vram_available(device, plan.multi_device);
+    if (admitted) {
+        capacity += admitted->device_kv_vram_bytes(device);
+    }
+    if (device == ring_device) {
+        capacity += ggml_sycl::unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(device);
+    }
+    return capacity;
+}
+
+// Largest all-VRAM n_ctx against ggml_sycl_kv_capacity_live(), including
+// kv_alloc_slack_per_layer per resident layer, so every "-c" hint quotes the
+// number admission applies. Counts the load-time residency (what fits with no
+// demotion). `device` limits it to one device; -1 takes the smallest answer
+// over the devices holding KV.
 static uint32_t ggml_sycl_largest_fitting_n_ctx_live(const ggml_sycl::placement_plan &    plan,
                                                      const ggml_sycl::placement_kv_info & kv_info,
                                                      int                                  device,
-                                                     const ggml_sycl::placement_plan *    admitted) {
+                                                     const ggml_sycl::placement_plan *    admitted,
+                                                     int                                  ring_device) {
     const std::unordered_map<int, int> & all_vram = plan.load_kv_device_valid ? plan.load_kv_device : plan.kv_device;
     std::vector<int> devices = plan.multi_device ? plan.devices : std::vector<int>{ plan.device_id };
     if (device >= 0) {
@@ -16934,14 +16959,11 @@ static uint32_t ggml_sycl_largest_fitting_n_ctx_live(const ggml_sycl::placement_
         if (n_resident == 0) {
             continue;
         }
-        size_t capacity = ggml_sycl::unified_cache_kv_vram_available(d, plan.multi_device);
-        if (admitted) {
-            capacity += admitted->device_kv_vram_bytes(d);
-        }
-        const uint32_t fits = ggml_sycl_largest_fitting_n_ctx(plan, all_vram, kv_info, d, capacity,
-                                                              n_resident * ggml_sycl::kv_alloc_slack_per_layer);
-        best                = any ? std::min(best, fits) : fits;
-        any                 = true;
+        const size_t   capacity = ggml_sycl_kv_capacity_live(plan, d, admitted, ring_device);
+        const uint32_t fits     = ggml_sycl_largest_fitting_n_ctx(plan, all_vram, kv_info, d, capacity,
+                                                                  n_resident * ggml_sycl::kv_alloc_slack_per_layer);
+        best                    = any ? std::min(best, fits) : fits;
+        any                     = true;
     }
     return best;
 }
@@ -17361,9 +17383,17 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
 // requests reserve_pp_moe_onednn_scratch() makes set
 // forbid_vram_zone_spill (unified-cache.cpp), so the fallthrough itself now
 // fails the allocation instead of spilling; (2) this function separately
-// refuses BEFORE even attempting Step 3 when the new ring cannot fit
-// zone_available(RUNTIME) on the arena route, reproducing the exact same
-// refusal template without depending on the allocator-level behavior alone.
+// refuses BEFORE even attempting Step 3 when the admission does not admit the
+// new ring on the arena route, reproducing the exact same refusal template
+// without depending on the allocator-level behavior alone.
+//
+// Past the RUNTIME zone the ring may go only to the shared KV zone, and only
+// with the transaction's `kv_zone` inputs (llama.cpp-u1bb): the weight slots
+// stay in RUNTIME, and an ubatch-scaled slot kind RUNTIME cannot also hold is
+// placed in the KV zone when what KV leaves free there, less a compute-buffer
+// reserve, admits it (pp_moe_onednn_admit_ring()). The placement is published
+// with the ceiling, so every later reserve allocates each slot from the same
+// zone, and restored with it on a refusal.
 // llama.cpp-tsfl: `probe_mode` (default false, unchanged behaviour) is set
 // by the shared runtime-context transaction body when it is only evaluating
 // a candidate for ggml_backend_sycl_probe_runtime_context_for_model() -- it
@@ -17394,9 +17424,41 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
 // treats any other value as a failed rollback (ERROR, then a refusal).
 enum class ggml_sycl_ring_replan_result { OK, RELEASE_REFUSED, DOES_NOT_FIT };
 
-static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int      device,
-                                                                        uint32_t n_ubatch,
-                                                                        bool     probe_mode = false) {
+// KV-zone bytes held back per micro-batch row when part of the ring goes to the
+// shared KV zone. It stands in for the compute buffers, which the transaction
+// cannot size: graph_reserve allocates them after it, and they try the RUNTIME
+// zone first, then the KV zone. GPT-OSS 20B's compute buffer is about 404 MiB
+// at n_ubatch=512 (0.79 MiB per row), rounded up here, and left linear in
+// n_ubatch like the buffer. An estimate, not a plan: neither the compute buffer
+// nor the flash-attention K/V conversion buffers are in the placement plan, so
+// nothing here can subtract their real size. Once they are planned, the
+// admission subtracts that and this constant goes away.
+static constexpr size_t k_pp_moe_ring_compute_reserve_bytes_per_row = 1024 * 1024;
+
+// What the runtime-context transaction knows when it re-plans the ring, after
+// it has admitted KV. Without it (the rollbacks) the ring is restored to a
+// size that fit before, and its KV-zone part is not re-admitted.
+struct ggml_sycl_ring_kv_zone_inputs {
+    size_t kv_capacity_bytes = 0;      // ggml_sycl_kv_capacity_live() on the device, the ring counted as free
+    size_t kv_bytes          = 0;      // the plan's device KV there, with the allocator's per-layer slack
+    bool   readmit           = false;  // the KV re-fit counted the ring's KV-zone slots as free
+};
+
+// The plan's device-resident KV on `device`, with the tiered allocator's
+// per-layer slack: what the KV zone must hold for it.
+static size_t ggml_sycl_device_kv_bytes_with_slack(const ggml_sycl::placement_plan & plan, int device) {
+    size_t n_resident = 0;
+    for (const auto & [layer, owner] : plan.kv_device) {
+        n_resident += owner == device && layer >= 0 && plan.kv_size_for_layer(static_cast<uint32_t>(layer)) > 0;
+    }
+    return plan.device_kv_vram_bytes(device) + n_resident * ggml_sycl::kv_alloc_slack_per_layer;
+}
+
+static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
+    int                                   device,
+    uint32_t                              n_ubatch,
+    bool                                  probe_mode = false,
+    const ggml_sycl_ring_kv_zone_inputs * kv_zone    = nullptr) {
     const size_t weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
     if (weight_slot_bytes == 0) {
         return ggml_sycl_ring_replan_result::OK;  // dense model: no MoE PP ring was ever planned
@@ -17415,7 +17477,8 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int     
             device);
         return ggml_sycl_ring_replan_result::OK;
     }
-    if (n_ubatch == ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device)) {
+    if (n_ubatch == ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device) &&
+        !(kv_zone && kv_zone->readmit)) {
         return ggml_sycl_ring_replan_result::OK;  // already planned for this n_ubatch -- idempotent
     }
 
@@ -17447,6 +17510,9 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int     
         ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device);
     const size_t   old_output_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(device);
     const uint32_t old_n_ubatch          = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device);
+    const bool     old_activation_in_kv_zone =
+        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(device);
+    const bool     old_output_in_kv_zone = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(device);
     // llama.cpp-ibj0 quality round 1 Q5: declared once, used by both the
     // success WARN below and the failure-path ERROR further down, instead
     // of each repeating the literal (1024.0 * 1024.0).
@@ -17483,10 +17549,34 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int     
     const char * const zone_name = arena ? "RUNTIME" : "direct-device";
     const size_t       needed_total =
         static_cast<size_t>(ring_depth) * (weight_slot_bytes + new_activation_slot_bytes + new_output_slot_bytes);
-    const uint32_t fits = ggml_sycl::unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(
-        capacity_bytes, weight_slot_bytes,
-        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device),
-        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device), ring_depth);
+
+    // On the arena route, where each slot goes and whether the ring fits is
+    // pp_moe_onednn_admit_ring()'s answer: the weight slots stay in the RUNTIME
+    // zone, and an ubatch-scaled slot kind the RUNTIME zone cannot also hold
+    // goes to the shared KV zone, admitted against what KV leaves free there
+    // less the compute-buffer reserve. A rollback restores a ring that fit
+    // before, so its KV-zone part is not re-admitted.
+    ggml_sycl::pp_moe_onednn_ring_admission admission;
+    if (arena) {
+        ggml_sycl::pp_moe_onednn_ring_admission_inputs admit_in;
+        admit_in.kv_zone_available_bytes = kv_zone ? kv_zone->kv_capacity_bytes : std::numeric_limits<size_t>::max();
+        admit_in.kv_admitted_bytes       = kv_zone ? kv_zone->kv_bytes : 0;
+        admit_in.compute_reserve_bytes_per_row = kv_zone ? k_pp_moe_ring_compute_reserve_bytes_per_row : 0;
+        admit_in.runtime_available_bytes       = capacity_bytes;
+        admit_in.weight_slot_bytes             = weight_slot_bytes;
+        admit_in.activation_bytes_per_row =
+            ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device);
+        admit_in.output_bytes_per_row = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device);
+        admit_in.ring_depth           = ring_depth;
+        admit_in.n_ubatch             = n_ubatch;
+        admission                     = ggml_sycl::pp_moe_onednn_admit_ring(admit_in);
+    }
+    const uint32_t fits =
+        arena ? admission.largest_fitting_n_ubatch :
+                ggml_sycl::unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(
+                    capacity_bytes, weight_slot_bytes,
+                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device),
+                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device), ring_depth);
 
     // Shared refusal path: restore the OLD ring (re-reserve it -- see the
     // function comment for why this cannot plausibly fail, and what it
@@ -17494,6 +17584,8 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int     
     // both the F13 pre-check below (never attempted Step 3 at all) and the
     // post-Step-3-failure path (Step 3 was attempted and failed).
     auto refuse_and_restore = [&]() -> ggml_sycl_ring_replan_result {
+        ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, old_activation_in_kv_zone,
+                                                                         old_output_in_kv_zone);
         ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, weight_slot_bytes, old_activation_slot_bytes,
                                                                    old_output_slot_bytes, ring_depth);
         if (!cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, old_activation_slot_bytes, old_output_slot_bytes,
@@ -17506,9 +17598,17 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int     
         }
         ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, old_n_ubatch);
 
-        char fits_clause[64] = "";
-        if (fits >= 32) {
-            std::snprintf(fits_clause, sizeof(fits_clause), "; the largest -ub that fits is about %u", fits);
+        char fits_clause[192] = "";
+        int  clause_len       = 0;
+        if (arena && kv_zone) {
+            clause_len = std::snprintf(fits_clause, sizeof(fits_clause),
+                                       "; the shared KV zone has %.1f MB free after KV, less a %.1f MB "
+                                       "compute-buffer reserve",
+                                       admission.kv_zone_headroom_bytes / mb, admission.compute_reserve_bytes / mb);
+        }
+        if (fits >= 32 && clause_len >= 0 && (size_t) clause_len < sizeof(fits_clause)) {
+            std::snprintf(fits_clause + clause_len, sizeof(fits_clause) - clause_len,
+                          "; the largest -ub that fits is about %u", fits);
         }
         GGML_SYCL_RUNTIME_TXN_REFUSAL(
             probe_mode,
@@ -17532,9 +17632,14 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int     
     // fixed-size RUNTIME zone to overflow; it keeps its own existing
     // VRAM-overcommit guard (unified_alloc()'s DEVICE_VRAM tier check) as
     // its only budget check.
-    if (arena && needed_total > capacity_bytes) {
+    if (arena && !admission.admit) {
         return refuse_and_restore();
     }
+
+    // Where each slot goes, read by reserve_pp_moe_onednn_scratch() below and
+    // by every dispatch's re-reserve after it.
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, admission.activation_in_kv_zone,
+                                                                     admission.output_in_kv_zone);
 
     // Step 2: raise (or lower) the ceiling BEFORE reserving (see the
     // function comment for why this order is required).
@@ -17565,6 +17670,25 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int     
                 "%.1f MB, weights %.1f MB, depth %u\n",
                 n_ubatch, new_activation_slot_bytes / mb, new_output_slot_bytes / mb, weight_slot_bytes / mb,
                 ring_depth);
+        }
+        if (admission.kv_zone_bytes > 0) {
+            const char * slots = admission.activation_in_kv_zone && admission.output_in_kv_zone ? "activation+output" :
+                                 admission.activation_in_kv_zone                                ? "activation" :
+                                                                                                  "output";
+            if (probe_mode) {
+                GGML_LOG_INFO(
+                    "[SYCL-PLAN] probe: PP MoE oneDNN scratch ring for n_ubatch=%u puts its %s slots (%.1f MB) in "
+                    "the shared KV zone: %.1f MB free there after KV, %.1f MB compute-buffer reserve\n",
+                    n_ubatch, slots, admission.kv_zone_bytes / mb, admission.kv_zone_headroom_bytes / mb,
+                    admission.compute_reserve_bytes / mb);
+            } else {
+                GGML_LOG_WARN(
+                    "[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u puts its %s slots (%.1f MB) in the "
+                    "shared KV zone: %.1f MB free there after KV, %.1f MB compute-buffer reserve (an estimate of "
+                    "%.1f MB per micro-batch row; compute buffers are not in the plan)\n",
+                    n_ubatch, slots, admission.kv_zone_bytes / mb, admission.kv_zone_headroom_bytes / mb,
+                    admission.compute_reserve_bytes / mb, k_pp_moe_ring_compute_reserve_bytes_per_row / mb);
+            }
         }
         return ggml_sycl_ring_replan_result::OK;
     }
@@ -17800,6 +17924,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                 next_plan.devices.size());
         }
     }
+    // The PP MoE oneDNN ring's slots in the shared KV zone on this backend's
+    // device. A re-fit counts them as free, because KV wins over the ring: the
+    // ring is then released and re-admitted after KV, even at an unchanged
+    // n_ubatch (ring_readmit), and refused rather than kept if it no longer fits.
+    const size_t ring_kv_zone_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(ctx->device);
+    bool         ring_readmit       = false;
     if (ggml_sycl::kv_residency_needs_refit(published_shape, next_shape, ctx->runtime_kv_admitted)) {
         const bool shape_changed = ggml_sycl::kv_shape_changed(published_shape, next_shape);
         if (shape_changed && ctx->runtime_kv_admitted) {
@@ -17826,8 +17956,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         }
         in.devices = next_plan.multi_device ? next_plan.devices : std::vector<int>{ next_plan.device_id };
         for (int device : in.devices) {
-            in.available.push_back(ggml_sycl::unified_cache_kv_vram_available(device, next_plan.multi_device));
+            // No admitted plan: KV still allocated counts as used (see above).
+            in.available.push_back(ggml_sycl_kv_capacity_live(next_plan, device, nullptr, ctx->device));
         }
+        ring_readmit = ring_kv_zone_bytes > 0;
+
         const ggml_sycl::kv_residency_result residency = ggml_sycl::plan_runtime_kv_residency(in);
         if (!residency.fits) {
             GGML_SYCL_RUNTIME_TXN_REFUSAL(
@@ -17859,7 +17992,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             // What fits with NO demotion, read now: after the publish tail
             // (ring re-plan, MMID materialization) the headroom has moved.
             const uint32_t fits =
-                ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, in.devices[i], admitted_kv);
+                ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, in.devices[i], admitted_kv, ctx->device);
             kv_host_demotions.push_back({ in.devices[i], fit.demoted_layers, fit.host_kv_bytes_added, cause,
                                           ggml_sycl_all_vram_ctx_hint(fits) });
         }
@@ -17930,8 +18063,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                 current->plan->moe_mmid_device_pool_bytes, &demotion_result, &demote_reason, probe_mode)) {
             // Only a single-device plan reaches this path (see
             // ggml_sycl_try_demote_runtime_kv).
-            const uint32_t fits =
-                ggml_sycl_largest_fitting_n_ctx_live(demoted_plan, next_kv_info, demoted_plan.device_id, admitted_kv);
+            const uint32_t fits = ggml_sycl_largest_fitting_n_ctx_live(
+                demoted_plan, next_kv_info, demoted_plan.device_id, admitted_kv, ctx->device);
             kv_host_demotions.push_back(
                 { demoted_plan.device_id, demotion_result.demoted_layers, demotion_result.host_kv_bytes_added,
                   "the plan exceeded the device's VRAM budget", ggml_sycl_all_vram_ctx_hint(fits) });
@@ -18006,7 +18139,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             next_plan.kv_vram_bytes / mb, next_plan.vram_budget / mb,
             next_plan.vram_bytes > next_plan.vram_budget ? (next_plan.vram_bytes - next_plan.vram_budget) / mb : 0.0);
         if (plan_over_budget) {
-            const uint32_t fits = ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, -1, admitted_kv);
+            const uint32_t fits =
+                ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, -1, admitted_kv, ctx->device);
             if (fits >= 256) {
                 GGML_SYCL_RUNTIME_TXN_REFUSAL(
                     probe_mode,
@@ -18133,6 +18267,13 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // below to roll ITS OWN ring re-plan back before returning.
     const uint32_t pre_replan_pp_moe_ring_n_ubatch =
         ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(ctx->device);
+    // The ring is re-planned after KV is admitted, so the part of it the
+    // RUNTIME zone cannot hold is admitted against what KV leaves free in the
+    // shared KV zone, and never displaces KV.
+    ggml_sycl_ring_kv_zone_inputs ring_kv_zone;
+    ring_kv_zone.kv_capacity_bytes = ggml_sycl_kv_capacity_live(next_plan, ctx->device, admitted_kv, ctx->device);
+    ring_kv_zone.kv_bytes          = ggml_sycl_device_kv_bytes_with_slack(next_plan, ctx->device);
+    ring_kv_zone.readmit           = ring_readmit;
     // llama.cpp-jumy: RELEASE_REFUSED is a transient failure to release the
     // ring's OLD physical backing (still claimed by an in-flight dispatch)
     // -- nothing about the requested size was evaluated, so a caller may
@@ -18140,7 +18281,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // (DOES_NOT_FIT) is the deterministic "this size does not fit" answer
     // and stays a PLAN_REJECTED-mapped refusal, unchanged from before.
     const ggml_sycl_ring_replan_result ring_replan_result =
-        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode);
+        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone);
     if (ring_replan_result == ggml_sycl_ring_replan_result::RELEASE_REFUSED) {
         // refusal already logged (ERROR normally, INFO in probe mode)
         return busy("busy (PP MoE oneDNN scratch ring claimed by an in-flight dispatch)");
@@ -18149,6 +18290,20 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         // refusal already logged (ERROR normally, INFO in probe mode) with
         // the largest fitting -ub
         return refuse("PP MoE oneDNN scratch ring does not fit");
+    }
+    // Ring slots in the shared KV zone take space the plan's vram_bytes
+    // accounts for (weights + KV + MMID pool) and the weight stager reserves
+    // against, so they are charged there, on every device of the plan.
+    {
+        const std::vector<int> ring_devices =
+            next_plan.multi_device ? next_plan.devices : std::vector<int>{ next_plan.device_id };
+        for (size_t i = 0; i < ring_devices.size(); ++i) {
+            const size_t charge = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(ring_devices[i]);
+            next_plan.vram_bytes += charge;
+            if (next_plan.multi_device && i < next_plan.per_device_vram.size()) {
+                next_plan.per_device_vram[i] += charge;
+            }
+        }
     }
 
     if (probe_mode) {

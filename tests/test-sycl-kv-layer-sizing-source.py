@@ -807,7 +807,7 @@ def test_mutation_budget_path_refresh_dropped_is_witnessed() -> None:
 
 def test_mutation_budget_hint_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
-    mutated = cpp.replace("ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, -1, admitted_kv)",
+    mutated = cpp.replace("ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, -1, admitted_kv, ctx->device)",
                           "ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info, -1, 0, 0)", 1)
     _assert_witnessed(cpp, mutated, runtime_kv_admission_violations,
                       "a -c hint is not derived from the live KV headroom", "a hint bypasses the live headroom")
@@ -839,13 +839,16 @@ def test_mutation_host_zone_grown_before_refusal_is_witnessed() -> None:
 # kv_vram_available() itself, but its inputs are constants; what makes it the
 # admission number is that the transaction, the allocator and the -c hints all
 # reach it through unified_cache_kv_vram_available(), and that function keeps
-# the has-arena branch. Those call sites are pinned here.
+# the has-arena branch. Those call sites are pinned here. The transaction's
+# re-fit, the -c hints and the PP MoE ring's admission read it through one
+# helper, ggml_sycl_kv_capacity_live(), which adds back what the KV replaces.
 # ---------------------------------------------------------------------------
 
 KV_DEMOTION_HPP = ROOT / "ggml/src/ggml-sycl/kv-runtime-demotion.hpp"
 KV_HEADROOM_SIGNATURE = "size_t unified_cache_kv_vram_available("
 KV_WEIGHT_CAPACITY_SIGNATURE = "size_t unified_cache_kv_weight_capacity("
 LIVE_HINT_SIGNATURE = "static uint32_t ggml_sycl_largest_fitting_n_ctx_live"
+KV_CAPACITY_SIGNATURE = "static size_t ggml_sycl_kv_capacity_live"
 TRY_DEMOTE_SIGNATURE = "static bool ggml_sycl_try_demote_runtime_kv"
 CTX_HINT_SIGNATURE = "static std::string ggml_sycl_all_vram_ctx_hint"
 LLAMA_CONTEXT_CTOR_SIGNATURE = "llama_context::llama_context("
@@ -862,10 +865,14 @@ CHANGED_BRANCH = re.compile(r"if\s*\(\s*!probe_mode\s*&&\s*ggml_sycl::kv_device_
 def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
     found: list[str] = []
     txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
-    if not re.search(r"in\.available\.push_back\(\s*ggml_sycl::unified_cache_kv_vram_available\(", txn):
+    if not re.search(r"in\.available\.push_back\(\s*ggml_sycl_kv_capacity_live\(\s*next_plan\s*,\s*device\s*,", txn):
         found.append("the transaction's in.available is not the live KV headroom")
-    elif not re.search(r"unified_cache_kv_vram_available\(\s*device\s*,\s*next_plan\.multi_device\s*\)", txn):
-        found.append("the transaction's KV headroom is not asked for the plan's multi_device")
+
+    capacity = strip_comments(function(sycl_cpp, KV_CAPACITY_SIGNATURE))
+    if "ggml_sycl::unified_cache_kv_vram_available(" not in capacity:
+        found.append("the KV capacity helper does not read the live KV headroom")
+    elif not re.search(r"unified_cache_kv_vram_available\(\s*device\s*,\s*plan\.multi_device\s*\)", capacity):
+        found.append("the KV capacity helper's KV headroom is not asked for the plan's multi_device")
 
     alloc = strip_comments(function(sycl_cpp, TIERED_KV_ALLOC_SIGNATURE))
     caps = re.findall(r"\bkv_vram_cap\s*=(?!=)([^;]*);", alloc)
@@ -891,10 +898,8 @@ def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
         found.append("the allocator demotes device-planned KV itself")
 
     live = strip_comments(function(sycl_cpp, LIVE_HINT_SIGNATURE))
-    if "ggml_sycl::unified_cache_kv_vram_available(" not in live:
+    if not re.search(r"ggml_sycl_kv_capacity_live\(\s*plan\s*,\s*d\s*,\s*admitted\s*,\s*ring_device\s*\)", live):
         found.append("the -c hint does not read the live KV headroom")
-    elif not re.search(r"unified_cache_kv_vram_available\(\s*d\s*,\s*plan\.multi_device\s*\)", live):
-        found.append("the -c hint's KV headroom is not asked for the plan's multi_device")
 
     if not re.search(r"if\s*\(\s*next_plan\.multi_device\s*&&\s*next_plan\.devices\.size\(\)\s*>\s*1\s*&&\s*"
                      r"ggml_sycl::unified_cache_mode_is_global\(\)\s*\)\s*\{", txn) or \
@@ -1133,11 +1138,18 @@ def test_mutation_allocator_inline_cap_is_witnessed() -> None:
 
 def test_mutation_available_from_budgets_is_witnessed() -> None:
     cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
-    mutated = cpp.replace("in.available.push_back(ggml_sycl::unified_cache_kv_vram_available(device, "
-                          "next_plan.multi_device));",
+    mutated = cpp.replace("in.available.push_back(ggml_sycl_kv_capacity_live(next_plan, device, nullptr, ctx->device));",
                           "in.available.push_back(next_plan.per_device_vram_budgets[device]);", 1)
     _assert_witnessed(cpp, mutated, _headroom_checker(cache), "the transaction's in.available is not the live KV headroom",
                       "in.available pointed at per_device_vram_budgets")
+
+
+def test_mutation_hint_bypasses_capacity_helper_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    mutated = cpp.replace("ggml_sycl_kv_capacity_live(plan, d, admitted, ring_device)",
+                          "ggml_sycl::unified_cache_kv_vram_available(d, plan.multi_device)", 1)
+    _assert_witnessed(cpp, mutated, _headroom_checker(cache), "the -c hint does not read the live KV headroom",
+                      "the -c hint reads the zone directly, without what its KV replaces")
 
 
 def test_mutation_backstop_removed_is_witnessed() -> None:
@@ -1233,9 +1245,8 @@ def test_mutation_headroom_global_inverted_is_witnessed() -> None:
 
 def test_mutation_headroom_multi_device_dropped_is_witnessed() -> None:
     cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
-    for old, expected in (("unified_cache_kv_vram_available(device, next_plan.multi_device)", "the transaction's"),
+    for old, expected in (("unified_cache_kv_vram_available(device, plan.multi_device)", "the KV capacity helper's"),
                           ("unified_cache_kv_vram_available(device, kv_multi_device)", "the allocator's"),
-                          ("unified_cache_kv_vram_available(d, plan.multi_device)", "the -c hint's"),
                           ("lifecycle_owner && lifecycle_owner->plan && lifecycle_owner->plan->multi_device;",
                            "the allocator's")):
         new = re.sub(r"\((device|d), [^)]*\)$", r"(\1, false)", old) if old.endswith(")") else "false;"
@@ -1416,9 +1427,8 @@ def test_mutation_hint_ignores_its_fit_is_witnessed() -> None:
 
 def test_mutation_hint_fit_dropped_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
-    fit = ("            const uint32_t fits =\n"
-           "                ggml_sycl_largest_fitting_n_ctx_live(demoted_plan, next_kv_info, demoted_plan.device_id, "
-           "admitted_kv);\n")
+    fit = ("            const uint32_t fits = ggml_sycl_largest_fitting_n_ctx_live(\n"
+           "                demoted_plan, next_kv_info, demoted_plan.device_id, admitted_kv, ctx->device);\n")
     assert cpp.count(fit) == 1
     mutated = cpp.replace(fit, "            const uint32_t fits = 0;\n", 1)
     _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations,

@@ -759,6 +759,8 @@ static std::atomic<uint32_t> g_planned_pp_moe_onednn_ring_depth[GGML_SYCL_MAX_DE
 static std::atomic<size_t>   g_planned_pp_moe_onednn_activation_bytes_per_row[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_output_bytes_per_row[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_pp_moe_onednn_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<bool>     g_planned_pp_moe_onednn_activation_in_kv_zone[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<bool>     g_planned_pp_moe_onednn_output_in_kv_zone[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<bool>     g_atexit_registered{ false };  // Ensure atexit handler registered once
 static std::atomic<int>      g_cache_assert_enabled{ -1 };
 static std::atomic<int>      g_copy_trace_enabled{ -1 };
@@ -1544,8 +1546,11 @@ moe_control_requirement unified_cache_get_planned_moe_control_requirement(int de
 }
 
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out) {
+    // Ring slots placed in the shared KV zone are not RUNTIME demand.
+    const size_t ring_bytes    = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device_id);
+    const size_t ring_kv_bytes = unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(device_id);
     return moe_checked_runtime_zone_requirement(unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id),
-                                                unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device_id),
+                                                ring_bytes > ring_kv_bytes ? ring_bytes - ring_kv_bytes : 0,
                                                 unified_cache_get_planned_moe_control_requirement(device_id), out);
 }
 
@@ -2187,6 +2192,41 @@ uint32_t unified_cache_get_planned_pp_moe_onednn_ring_depth(int device_id) {
         return 0;
     }
     return g_planned_pp_moe_onednn_ring_depth[device_id].load(std::memory_order_acquire);
+}
+
+void unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(int device_id, bool activation, bool output) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_pp_moe_onednn_activation_in_kv_zone[device_id].store(activation, std::memory_order_release);
+    g_planned_pp_moe_onednn_output_in_kv_zone[device_id].store(output, std::memory_order_release);
+}
+
+bool unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    return g_planned_pp_moe_onednn_activation_in_kv_zone[device_id].load(std::memory_order_acquire);
+}
+
+bool unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    return g_planned_pp_moe_onednn_output_in_kv_zone[device_id].load(std::memory_order_acquire);
+}
+
+size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id) {
+    size_t slot = 0;
+    if (unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(device_id)) {
+        slot += unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device_id);
+    }
+    if (unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(device_id)) {
+        slot += unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(device_id);
+    }
+    const size_t depth = unified_cache_get_planned_pp_moe_onednn_ring_depth(device_id);
+    return depth != 0 && slot > std::numeric_limits<size_t>::max() / depth ? std::numeric_limits<size_t>::max() :
+                                                                             slot * depth;
 }
 
 void unified_cache_set_planned_pp_moe_onednn_row_bytes(int    device_id,
@@ -17808,7 +17848,16 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
         }
     };
 
-    auto allocate_buffer = [&](size_t size, const char * label, mem_handle & owner) -> void * {
+    // Each slot comes from the zone the runtime-context transaction planned for
+    // it: the weight slot always from RUNTIME, an ubatch-scaled slot from the
+    // shared KV zone when the RUNTIME zone could not also hold it.
+    const vram_zone_id activation_zone = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(device_id) ?
+                                             vram_zone_id::KV :
+                                             vram_zone_id::RUNTIME;
+    const vram_zone_id output_zone =
+        unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(device_id) ? vram_zone_id::KV : vram_zone_id::RUNTIME;
+
+    auto allocate_buffer = [&](size_t size, const char * label, vram_zone_id zone, mem_handle & owner) -> void * {
         alloc_request req{};
         req.queue                                     = &queue_;
         req.device                                    = ggml_sycl_get_device_id_from_queue(queue_);
@@ -17817,7 +17866,7 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
         req.intent.category                           = runtime_category::COMPUTE;
         req.intent.cohort_id                          = label;
         req.intent.constraints.must_device            = true;
-        req.intent.constraints.prefer_vram_zone       = vram_zone_id::RUNTIME;
+        req.intent.constraints.prefer_vram_zone       = zone;
         // llama.cpp-ibj0 spec round 5 F13: see the field's own comment in
         // unified-cache.hpp (alloc_constraints::forbid_vram_zone_spill) for why.
         req.intent.constraints.forbid_vram_zone_spill = true;
@@ -17846,12 +17895,14 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
         slot.weight_size     = weight_slot_bytes;
         slot.activation_size = activation_slot_bytes;
         slot.output_size     = output_slot_bytes;
-        slot.weight          = allocate_buffer(weight_slot_bytes, "pp_moe_onednn_weight", slot.weight_owner);
-        slot.activation =
-            slot.weight ? allocate_buffer(activation_slot_bytes, "pp_moe_onednn_activation", slot.activation_owner) :
-                          nullptr;
-        slot.output =
-            slot.activation ? allocate_buffer(output_slot_bytes, "pp_moe_onednn_output", slot.output_owner) : nullptr;
+        slot.weight =
+            allocate_buffer(weight_slot_bytes, "pp_moe_onednn_weight", vram_zone_id::RUNTIME, slot.weight_owner);
+        slot.activation = slot.weight ? allocate_buffer(activation_slot_bytes, "pp_moe_onednn_activation",
+                                                        activation_zone, slot.activation_owner) :
+                                        nullptr;
+        slot.output     = slot.activation ?
+                              allocate_buffer(output_slot_bytes, "pp_moe_onednn_output", output_zone, slot.output_owner) :
+                              nullptr;
         if (!slot.weight || !slot.activation || !slot.output) {
             new_slots.push_back(std::move(slot));
             ok = false;
@@ -17901,10 +17952,11 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
     }
     GGML_LOG_INFO(
         "[UNIFIED-CACHE] PP MoE oneDNN scratch ring reserved from %s: depth=%u total=%.1f MB "
-        "weight_slot=%.1f MB activation_slot=%.1f MB output_slot=%.1f MB\n",
+        "weight_slot=%.1f MB activation_slot=%.1f MB (%s) output_slot=%.1f MB (%s)\n",
         arena_active() ? "arena-runtime" : "direct-device", ring_depth, total / (1024.0 * 1024.0),
         weight_slot_bytes / (1024.0 * 1024.0), activation_slot_bytes / (1024.0 * 1024.0),
-        output_slot_bytes / (1024.0 * 1024.0));
+        activation_zone == vram_zone_id::KV ? "KV zone" : "RUNTIME", output_slot_bytes / (1024.0 * 1024.0),
+        output_zone == vram_zone_id::KV ? "KV zone" : "RUNTIME");
     return true;
 }
 
