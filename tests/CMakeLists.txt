@@ -967,6 +967,65 @@ if (NOT WIN32)
     )
 endif()
 
+# llama.cpp-vuy0: the SYCL device-link launcher (private TMPDIR removed on
+# exit or signal, toolchain-keyed ocloc cache, inventory recorder), exercised
+# against a mock compiler and ocloc; the list-only report of temporaries
+# earlier, unwrapped links stranded; sycl-build.sh's multi-target build and
+# private TMPDIR, against a mock cmake; the device-image inventory comparison;
+# and a check on the generated Ninja files
+# that every device-linking edge actually runs under that launcher and pool.
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME test-sycl-device-link-launcher
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-link-launcher.sh
+    )
+    set_tests_properties(test-sycl-device-link-launcher PROPERTIES
+        LABELS "sycl;build;hostonly"
+        TIMEOUT 60
+    )
+    llama_test_cmd(
+        bash
+        NAME test-sycl-tmp-leak-report
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-tmp-leak-report.sh
+    )
+    set_tests_properties(test-sycl-tmp-leak-report PROPERTIES
+        LABELS "sycl;build;hostonly"
+        TIMEOUT 60
+    )
+    llama_test_cmd(
+        bash
+        NAME test-sycl-build-targets
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-build-targets.sh
+    )
+    set_tests_properties(test-sycl-build-targets PROPERTIES
+        LABELS "sycl;build;hostonly"
+        TIMEOUT 30
+    )
+    llama_test_cmd(
+        bash
+        NAME test-sycl-device-image-inventory
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-image-inventory.sh
+    )
+    set_tests_properties(test-sycl-device-image-inventory PROPERTIES
+        LABELS "sycl;build;hostonly"
+        TIMEOUT 30
+    )
+endif()
+if (GGML_SYCL AND NOT WIN32 AND CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Interpreter_FOUND)
+    add_test(NAME test-sycl-device-link-routing
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-link-routing.py ${CMAKE_BINARY_DIR})
+    set_tests_properties(test-sycl-device-link-routing PROPERTIES
+        LABELS "sycl;build;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+endif()
+
 if (NOT WIN32)
     llama_test_cmd(
         bash

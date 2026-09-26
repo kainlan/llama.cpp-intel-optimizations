@@ -626,6 +626,97 @@ if (GGML_SYCL_CPU_DEVICE)
         "SHELL:-Xspirv-translator=spir64_x86_64 -spirv-ext=+SPV_INTEL_split_barrier")
 endif()
 
+# Device-link cost (llama.cpp-vuy0). The device link of libggml-sycl -- and of
+# every test executable that embeds the backend objects through
+# ggml-sycl-private-fixtures -- is ~97% ocloc: sycl-post-link splits the device
+# code into ~112 images per AOT target and llvm-foreach AOT-compiles them one at
+# a time (~715 s per BMG target, three fattn/mmvq images ~80% of it). None of
+# the three controls below changes a single device byte: the split images,
+# the options ocloc compiles them with and the embedded binaries are identical
+# (scripts/sycl-device-image-inventory.sh compares them); only scheduling and
+# reuse change. Two images -- the ESIMD fattn kernels and the MXFP4 MoE DPAS
+# kernels -- come out of IGC with different ISA from run to run on their own,
+# uncached and serial; a cache hit returns whichever variant was stored, so
+# rebuilds stop re-rolling them.
+#
+# 1. -fsycl-max-parallel-link-jobs: run the per-image llvm-spirv/ocloc steps N
+#    at a time. A cold link then costs about the largest image per target
+#    (~300 s) instead of the sum. ocloc peaks at ~1.4 GB per job.
+# 2. ocloc's persistent compiler cache: the split images are almost always
+#    byte-identical to the previous link's, and a hit returns the stored binary
+#    bit for bit. -allow_caching is needed on the ocloc command line AND
+#    NEO_CACHE_PERSISTENT=1 in its environment, which the launcher below sets
+#    together with a toolchain-keyed NEO_CACHE_DIR. Without that environment
+#    the flag caches nothing, so it is only added where the launcher runs.
+# 3. A Ninja pool bounding concurrent device links. A full build otherwise
+#    starts ~48 whole-backend links at once, which all miss the cache together.
+#    Memory, not cores, sets the depth: one link is N ocloc jobs x ~1.4 GB plus
+#    the whole-module llvm-link/sycl-post-link, ~12-13 GB at N=8, so the default
+#    depth of 2 bounds device linking at ~26 GB of this host's 246 GB.
+set(GGML_SYCL_DEVICE_LINK_JOBS "8" CACHE STRING
+    "Parallel llvm-spirv/ocloc jobs per SYCL device link (-fsycl-max-parallel-link-jobs)")
+option(GGML_SYCL_OCLOC_CACHE
+    "Reuse ocloc binaries for unchanged SYCL device images across links (toolchain-keyed persistent cache)" ON)
+set(GGML_SYCL_DEVICE_LINK_POOL "2" CACHE STRING
+    "Maximum concurrent SYCL device links under Ninja")
+
+if (GGML_SYCL_DEVICE_LINK_JOBS GREATER 1)
+    target_link_options(ggml-sycl PRIVATE "-fsycl-max-parallel-link-jobs=${GGML_SYCL_DEVICE_LINK_JOBS}")
+endif()
+
+# The launcher (sycl-device-link.sh) also gives each link a private TMPDIR that
+# it removes on exit or signal; killed links used to strand ~700 MB of icpx-*
+# temporaries and ocloc outputs each. <LANG>_LINKER_LAUNCHER needs CMake 3.21.
+if (NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+    set(_ggml_sycl_device_link_launcher "${CMAKE_CURRENT_SOURCE_DIR}/sycl-device-link.sh")
+    if (GGML_SYCL_OCLOC_CACHE AND GGML_SYCL_BMG_AOT_ENABLED)
+        list(APPEND _ggml_sycl_device_link_launcher --ocloc-cache)
+        target_link_options(ggml-sycl PRIVATE
+            "SHELL:-Xsycl-target-backend=intel_gpu_bmg_g21 -allow_caching"
+            "SHELL:-Xsycl-target-backend=intel_gpu_bmg_g31 -allow_caching")
+    endif()
+    list(APPEND _ggml_sycl_device_link_launcher --)
+    set_property(GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_LAUNCHER "${_ggml_sycl_device_link_launcher}")
+    if (CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(GLOBAL APPEND PROPERTY JOB_POOLS ggml_sycl_device_link=${GGML_SYCL_DEVICE_LINK_POOL})
+    endif()
+
+    function(ggml_sycl_route_device_link target)
+        get_property(_launcher GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_LAUNCHER)
+        set_target_properties(${target} PROPERTIES CXX_LINKER_LAUNCHER "${_launcher}")
+        if (CMAKE_GENERATOR MATCHES "Ninja")
+            set_target_properties(${target} PROPERTIES JOB_POOL_LINK ggml_sycl_device_link)
+        endif()
+    endfunction()
+
+    # Consumers of ggml-sycl-private-fixtures inherit the backend objects and
+    # its link options through an INTERFACE target, which cannot carry these
+    # target properties, and they are declared in several directories. Route
+    # them once every directory has been processed. tests/
+    # test-sycl-device-link-routing.py checks the result against build.ninja.
+    function(ggml_sycl_route_fixture_device_links dir)
+        get_property(_targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+        foreach(_target IN LISTS _targets)
+            get_target_property(_type ${_target} TYPE)
+            if (NOT _type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
+                continue()
+            endif()
+            get_target_property(_libs ${_target} LINK_LIBRARIES)
+            if (_libs AND "ggml-sycl-private-fixtures" IN_LIST _libs)
+                ggml_sycl_route_device_link(${_target})
+            endif()
+        endforeach()
+        get_property(_subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+        foreach(_subdir IN LISTS _subdirs)
+            ggml_sycl_route_fixture_device_links("${_subdir}")
+        endforeach()
+    endfunction()
+
+    ggml_sycl_route_device_link(ggml-sycl)
+    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
+        CALL ggml_sycl_route_fixture_device_links "${CMAKE_SOURCE_DIR}")
+endif()
+
 # Link against oneDNN (primary math backend for Intel targets)
 set(GGML_SYCL_DNNL 0)
 set(GGML_SYCL_MKL_FALLBACK_ENABLED 0)

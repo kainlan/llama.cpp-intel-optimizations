@@ -4,19 +4,29 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./scripts/sycl-build.sh [options] [target] [-- <extra build args>]
+Usage: ./scripts/sycl-build.sh [options] [target...] [-- <extra build args>]
 
 Configure and build the SYCL backend with Ninja in build/.
+
+With no target this builds everything, including every SYCL test executable;
+each of those embeds the backend objects and pays its own device link. Name
+the targets you will run, or use --dev, to skip them.
 
 Options:
   -r, --reconfigure       Force CMake reconfigure before building
   -c, --clean             Remove build/ and configure from scratch
   -B, --build-dir <dir>   Override build directory (default: build)
+      --dev               Add the everyday tools: llama-bench, llama-cli,
+                          llama-completion
   -h, --help              Show this help
+
+Compiler and device-link temporaries go to a private directory under
+${TMPDIR:-/tmp} that is removed when the script exits.
 
 Examples:
   ./scripts/sycl-build.sh
   ./scripts/sycl-build.sh llama-completion
+  ./scripts/sycl-build.sh --dev test-mem-ops
   ./scripts/sycl-build.sh -r llama-bench
   ./scripts/sycl-build.sh -c
   ./scripts/sycl-build.sh llama-completion -- -v
@@ -29,7 +39,7 @@ BUILD_DIR="${ROOT_DIR}/build"
 
 force_reconfigure=0
 clean_build=0
-target=""
+targets=()
 extra_build_args=()
 
 while [[ $# -gt 0 ]]; do
@@ -47,6 +57,10 @@ while [[ $# -gt 0 ]]; do
             BUILD_DIR="$2"
             shift 2
             ;;
+        --dev)
+            targets+=(llama-bench llama-cli llama-completion)
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -56,12 +70,12 @@ while [[ $# -gt 0 ]]; do
             extra_build_args=("$@")
             break
             ;;
+        -*)
+            extra_build_args+=("$1")
+            shift
+            ;;
         *)
-            if [[ -z "${target}" ]]; then
-                target="$1"
-            else
-                extra_build_args+=("$1")
-            fi
+            targets+=("$1")
             shift
             ;;
     esac
@@ -124,6 +138,16 @@ if (( clean_build )); then
 fi
 
 mkdir -p "${BUILD_DIR}"
+
+# icpx strands its temporaries (hundreds of MB per device link) in TMPDIR when
+# a build is interrupted; give this build its own directory and remove it on
+# exit. Only SIGKILL escapes this -- scripts/sycl-tmp-leak-report.sh lists
+# what is left behind.
+build_tmp="$(mktemp -d "${TMPDIR:-/tmp}/sycl-build.XXXXXX")"
+trap 'rm -rf "${build_tmp}"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+export TMPDIR="${build_tmp}"
 
 cmake_input_changed() {
     local stamp="${BUILD_DIR}/build.ninja"
@@ -215,13 +239,13 @@ fi
 
 build_cmd=(cmake --build "${BUILD_DIR}" --config Release -j "${jobs}")
 
-if [[ -n "${target}" ]]; then
-    build_cmd+=(--target "${target}")
+if [[ ${#targets[@]} -gt 0 ]]; then
+    build_cmd+=(--target "${targets[@]}")
 fi
 
 if [[ ${#extra_build_args[@]} -gt 0 ]]; then
     build_cmd+=(-- "${extra_build_args[@]}")
 fi
 
-echo "[sycl-build] building${target:+ target ${target}} with Ninja in ${BUILD_DIR}"
+echo "[sycl-build] building${targets[*]:+ targets ${targets[*]}} with Ninja in ${BUILD_DIR}"
 "${build_cmd[@]}"
