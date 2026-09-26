@@ -171,8 +171,9 @@ static bool check_xmx_v1_force_enabled() {
 }
 
 // ---------------------------------------------------------------------------
-// Repo-root locator, duplicated verbatim across the seven source-reading tests in
-// this directory: test-sycl-fattn-onednn-gates.cpp, test-sycl-fattn-xmx-policy.cpp,
+// Repo-root locator. candidate_roots() is duplicated verbatim across the seven
+// source-reading tests in this directory: test-sycl-fattn-onednn-gates.cpp,
+// test-sycl-fattn-xmx-policy.cpp,
 // test-sycl-moe-direct-final-scratch-plan.cpp, test-sycl-moe-same-expert-grouping.cpp,
 // test-sycl-moe-fused-down-sum-policy.cpp, test-sycl-moe-fusion-noactivation.cpp and
 // test-sycl-moe-sequence-graphlet-policy.cpp. Duplicating rather than hoisting into a
@@ -251,8 +252,10 @@ static int count_occurrences(const std::string & haystack, const std::string & n
     return count;
 }
 
-// fattn.cpp parses GGML_SYCL_FA_XMX_V1 and GGML_SYCL_FA_XMX_V1_PP once each
-// into a static const bool, so each opt-in's value is fixed for the process;
+// fattn.cpp parses GGML_SYCL_FA_XMX_V1 and GGML_SYCL_FA_XMX_V1_PP into a
+// static const bool each. Both live in the templated
+// ggml_sycl_flash_attn_ext_dispatch_ncols<D, Q_type>, so each is read once per
+// instantiation, at its first use, and never re-read after that;
 // both terms of use_xmx_v1_path are exactly the pinned helpers' results; and
 // use_xmx_v1_path guards the only default v1 launches. So the defaults pinned
 // above are the defaults the dispatcher runs. Each line below is matched

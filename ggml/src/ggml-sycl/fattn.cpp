@@ -3213,9 +3213,10 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             // D=128 PP but its output is not deterministic (llama.cpp-b1ov), so
             // it is never the default. can_use_xmx_v1_runtime() admits only
             // D=128 with ne01 >= 8 and a multiple of 8 (no ragged tail), and no
-            // sinks, softcap, FP8, paged or multi-seq layout, so no decode shape
-            // reaches v1. Under that gate the ncols 1/2/4 branches and the
-            // `ne01 % 8` test below are unreachable; removing them is
+            // sinks, softcap, FP8, paged or multi-seq layout, or multi-token
+            // decode, so no decode shape reaches v1. Under that gate the ncols
+            // 1/2/4 branches are unreachable and the `ne01 % 8` test below is
+            // always true (its ragged-tail arm is dead); removing them is
             // llama.cpp-n94g.
             if (ne01 <= 1) {
                 GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=1 ne01=%d", D, ne01);
@@ -3238,7 +3239,8 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 // blocks. Ragged query tails (for example nb=35 in
                 // test-backend-ops) can drift above the FA NMSE gate; keep the
                 // regular v1 path for those shapes until the large-KV tail path
-                // is fixed.
+                // is fixed (unreachable under the gate above; see
+                // llama.cpp-n94g).
                 if (batch_kv == XMX_BATCH_KV_LARGE && ne01 % 8 == 0) {
                     dispatch_debug_kernel("xmx_v1_f16_ncols8_large_kv");
                     DISPATCH_NCOLS_BATCH_KV(8, XMX_BATCH_KV_LARGE, launch_fattn_xmx_f16);
