@@ -30,7 +30,8 @@
 // A case fails on any of: SYCL non-finite values, an all-zero SYCL row where the
 // CPU row is non-zero (the sanitizer signature), a row left holding the dst
 // sentinel (an unwritten row), or NMSE above test-backend-ops' FLASH_ATTN_EXT
-// bound. The CPU output must itself be finite, or the case is void.
+// bound (reported but not gated for the nondeterministic XMX v1 kernel). The
+// CPU output must itself be finite, or the case is void.
 //
 // KERNEL COVERAGE: the kernel is chosen by the dispatcher from the shape and
 // the environment, so this file cannot pin it. It sets
@@ -465,10 +466,15 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
             ref_zero = ref_zero && a == 0.0f;
             got_zero = got_zero && b == 0.0f;
             sentinel = sentinel || b == DST_SENTINEL;
+            // The reference norm must not depend on the SYCL values: summing
+            // it only where both sides are finite made a fully non-finite
+            // SYCL result look like an all-zero oracle.
+            if (std::isfinite(a)) {
+                mse_ref += (double) a * (double) a;
+            }
             if (std::isfinite(a) && std::isfinite(b)) {
                 const double diff = (double) b - (double) a;
                 mse_diff += diff * diff;
-                mse_ref += (double) a * (double) a;
                 max_diff = std::max(max_diff, std::fabs(diff));
             }
         }
@@ -476,19 +482,37 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
         stray_rows += (ref_zero && !got_zero && !sentinel) ? 1 : 0;
         sentinel_rows += sentinel ? 1 : 0;
     }
-    const double nmse = mse_ref > 0.0 ? mse_diff / mse_ref : 0.0;
+    // A non-finite SYCL value has no finite distance to the reference, so it
+    // must never be summarised as a small error.
+    double nmse = 0.0;
+    if (gpu_nonfinite > 0) {
+        nmse     = INFINITY;
+        max_diff = INFINITY;
+    } else if (mse_ref > 0.0) {
+        nmse = mse_diff / mse_ref;
+    } else if (mse_diff > 0.0) {
+        nmse = INFINITY;
+    }
+
+    // XMX v1 is nondeterministic: bit-identical inputs give a different dst on
+    // every call, and its clean control lands at the NMSE bound on its own. Its
+    // error magnitude therefore cannot tell poison from noise, so for v1 only
+    // the structural signatures of this defect gate (non-finite values, zeroed
+    // rows, unwritten rows); the NMSE is still printed.
+    const bool nmse_gated = kernel.rfind("xmx_v1", 0) != 0;
 
     // With no visible cell at all the CPU output is legitimately all zero.
     const bool expect_all_zero = c.n_used == 0;
     const bool oracle_ok       = cpu_nonfinite == 0 && (expect_all_zero ? mse_ref == 0.0 : mse_ref > 0.0);
     const bool ok = oracle_ok && !kernel.empty() && gpu_nonfinite == 0 && zeroed_rows == 0 && stray_rows == 0 &&
-                    sentinel_rows == 0 && nmse <= NMSE_MAX;
+                    sentinel_rows == 0 && (!nmse_gated || nmse <= NMSE_MAX);
 
     std::printf(
-        "%s [%s] kernel=%s nmse=%.3e (max %.1e) max_diff=%.3e sycl_nonfinite=%zu zeroed_rows=%zu/%zu "
+        "%s [%s] kernel=%s nmse=%.3e (max %.1e%s) max_diff=%.3e sycl_nonfinite=%zu zeroed_rows=%zu/%zu "
         "stray_rows=%zu sentinel_rows=%zu cpu_nonfinite=%zu\n",
         ok ? "OK" : "FAIL", label, kernel.empty() ? "<none: no dispatch line captured>" : kernel.c_str(), nmse,
-        NMSE_MAX, max_diff, gpu_nonfinite, zeroed_rows, n_rows, stray_rows, sentinel_rows, cpu_nonfinite);
+        NMSE_MAX, nmse_gated ? "" : ", not gated", max_diff, gpu_nonfinite, zeroed_rows, n_rows, stray_rows,
+        sentinel_rows, cpu_nonfinite);
     if (!oracle_ok) {
         std::printf(
             "  VOID [%s]: the CPU reference is non-finite or has the wrong all-zero state, so this case proves "
@@ -501,6 +525,11 @@ static void run_case(ggml_backend_t sycl, ggml_backend_t cpu, const fa_case & c,
 }
 
 int main(int, char ** argv) {
+    // The dispatcher writes to stderr while results go to stdout; when both
+    // land in one file a block-buffered stdout is flushed mid-line and the
+    // result lines are torn. Line buffering makes each result one write.
+    setvbuf(stdout, nullptr, _IOLBF, 1 << 16);
+
     sycl_test_selector_fallback(argv, "level_zero:1");
 
     // The kernel line is the proof of which path ran; without it a pass is vacuous.
