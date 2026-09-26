@@ -976,6 +976,18 @@ def kv_overflow_announcement_violations(sycl_cpp: str) -> list[str]:
     if len(re.findall(hint, txn)) != 2 or len(re.findall(hint, refit.group(1))) != 1 or \
             len(re.findall(hint, budget)) != 1:
         found.append("a demotion record's -c hint is not taken where the record is made")
+    # ...from the live all-VRAM fit computed for that record, and never
+    # overwritten afterwards.
+    fit = r"const\s+uint32_t\s+fits\s*=\s*ggml_sycl_largest_fitting_n_ctx_live\("
+    for region in (refit.group(1), budget):
+        if len(re.findall(r"ggml_sycl_largest_fitting_n_ctx_live\(", region)) != 1 or not re.search(fit, region):
+            found.append("a demotion record's -c hint is not computed from the live fit in its region")
+            break
+        if not re.search(r"ggml_sycl_all_vram_ctx_hint\(\s*fits\s*\)", region):
+            found.append("a demotion record's -c hint is not the fit computed for it")
+            break
+    if re.search(r"\.ctx_hint\s*=(?!=)", txn):
+        found.append("a demotion record's -c hint is assigned outside its record")
 
     # Announced once per exit that accepts: at the probe's exit after its ring
     # rollback, and after a successful publish. Never before a refusal.
@@ -1319,15 +1331,50 @@ def test_mutation_hint_taken_after_cas_is_witnessed() -> None:
 
 def test_mutation_hint_filled_after_ring_replan_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
-    mutated = cpp.replace("fit.host_kv_bytes_added, cause,\n"
-                          "                                          ggml_sycl_all_vram_ctx_hint(fits) });",
-                          "fit.host_kv_bytes_added, cause, std::string() });", 1)
+    record = ("fit.host_kv_bytes_added, cause,\n"
+              "                                          ggml_sycl_all_vram_ctx_hint(fits) });")
+    assert cpp.count(record) == 1
+    mutated = cpp.replace(record, "fit.host_kv_bytes_added, cause, std::string() });", 1)
     probe_exit = "\n    if (probe_mode) {\n        // llama.cpp-tsfl: every candidate check"
     assert cpp.count(probe_exit) == 1
     mutated = mutated.replace(probe_exit, "\n    for (kv_host_demotion & rec : kv_host_demotions) {\n"
                               "        rec.ctx_hint = ggml_sycl_all_vram_ctx_hint(0);\n    }" + probe_exit, 1)
     _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations, "is not taken where the record is made",
                       "the re-fit hint filled by a loop after the ring re-plan")
+
+
+def test_mutation_hint_overwritten_before_probe_exit_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    probe_exit = "\n    if (probe_mode) {\n        // llama.cpp-tsfl: every candidate check"
+    assert cpp.count(probe_exit) == 1
+    mutated = cpp.replace(probe_exit, "\n    for (kv_host_demotion & rec : kv_host_demotions) {\n"
+                          "        rec.ctx_hint = \" Largest all-VRAM context is about -c \" + std::to_string(\n"
+                          "            ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, rec.device,\n"
+                          "                                                 admitted_kv)) + \".\";\n"
+                          "    }" + probe_exit, 1)
+    _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations,
+                      "is assigned outside its record", "every hint overwritten after the ring re-plan")
+
+
+def test_mutation_hint_ignores_its_fit_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    record = ("fit.host_kv_bytes_added, cause,\n"
+              "                                          ggml_sycl_all_vram_ctx_hint(fits) });")
+    assert cpp.count(record) == 1
+    mutated = cpp.replace(record, record.replace("_ctx_hint(fits)", "_ctx_hint(0)"), 1)
+    _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations, "is not the fit computed for it",
+                      "the re-fit hint quotes 0")
+
+
+def test_mutation_hint_fit_dropped_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    fit = ("            const uint32_t fits =\n"
+           "                ggml_sycl_largest_fitting_n_ctx_live(demoted_plan, next_kv_info, demoted_plan.device_id, "
+           "admitted_kv);\n")
+    assert cpp.count(fit) == 1
+    mutated = cpp.replace(fit, "            const uint32_t fits = 0;\n", 1)
+    _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations,
+                      "is not computed from the live fit in its region", "the budget-path hint's fit replaced by 0")
 
 
 def test_mutation_bare_refusal_after_announce_is_witnessed() -> None:
