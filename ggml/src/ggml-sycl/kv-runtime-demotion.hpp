@@ -74,10 +74,15 @@ inline size_t kv_vram_available(bool has_arena, size_t zone_available, size_t bu
     return has_arena ? zone_available : budget_available;
 }
 
-// Whether a device's KV capacity and headroom come from its own arena zones. A
-// multi-device plan in GLOBAL cache mode has one cache, and so one KV zone, for
-// every device: reading it per device would admit each device independently
-// against the same zone, so both KV questions use the budget path instead.
+// Whether a device's KV capacity and headroom may come from its own arena zones.
+// A multi-device plan in GLOBAL cache mode has one cache, and so one KV zone, for
+// every device, so neither KV question reads it per device. That makes
+// unified_cache_kv_weight_capacity() correct, because its budget fallback is the
+// plan's per-device vram_budget. It does NOT give unified_cache_kv_vram_available()
+// a per-device answer: its budget fallback resolves every device to cache 0 and
+// device 0's free VRAM, so each device is still admitted against one shared
+// number. GLOBAL mode with a multi-device plan has no per-device KV headroom and
+// is unsupported for runtime KV admission.
 inline bool kv_reads_device_arena(bool multi_device, bool global_cache_mode) {
     return !(multi_device && global_cache_mode);
 }

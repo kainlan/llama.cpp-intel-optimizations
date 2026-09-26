@@ -6613,7 +6613,9 @@ size_t unified_cache_kv_arena_used(int device_id);
 // runtime-context transaction, its non-publishing probe and the tiered KV
 // allocator all admit against this one number. `multi_device` is the same
 // flag: a multi-device plan in GLOBAL mode has no per-device zone to read
-// (kv_reads_device_arena()), so it gets the budget-based headroom.
+// (kv_reads_device_arena()), so it gets the budget-based headroom -- which in
+// GLOBAL mode is cache 0's for every device, so that combination has no
+// per-device KV headroom and is unsupported (see kv_reads_device_arena()).
 size_t unified_cache_kv_weight_capacity(int device_id, size_t vram_budget, bool multi_device);
 size_t unified_cache_kv_vram_available(int device_id, bool multi_device);
 

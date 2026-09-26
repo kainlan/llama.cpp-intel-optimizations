@@ -21099,7 +21099,9 @@ size_t unified_cache_kv_vram_available(int device_id, bool multi_device) {
     // shared KV+weight allocator's). A full zone reads 0 there, which is not
     // "no arena": it must not fall back to the budget-based headroom. Looks the
     // cache up without creating it: the runtime-context transaction calls this
-    // under g_tensor_inventory_mutex.
+    // under g_tensor_inventory_mutex. The budget fallback is not per-device in
+    // GLOBAL mode (every device resolves to cache 0), so a multi-device GLOBAL
+    // plan has no per-device KV headroom; see kv_reads_device_arena().
     auto *     cache     = vram_arena_enabled() &&
                            kv_reads_device_arena(multi_device, get_effective_mode() == unified_cache_mode::GLOBAL) ?
                                get_existing_cache_for_device(device_id) :
@@ -28920,8 +28922,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                 // materialization. The WEIGHT zone is the shared KV+weight
                 // allocator; packing against the larger VRAM budget can create
                 // planned entries that cannot be staged.
-                remaining[d]    = unified_cache_kv_weight_capacity(device_budgets[d].device_id,
-                                                                   device_budgets[d].vram_budget, /*multi_device=*/true);
+                remaining[d] =
+                    unified_cache_kv_weight_capacity(device_budgets[d].device_id, device_budgets[d].vram_budget,
+                                                     /*multi_device=*/true);
             }
         }
 
