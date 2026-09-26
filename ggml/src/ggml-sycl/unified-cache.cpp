@@ -21083,6 +21083,38 @@ size_t unified_cache_kv_arena_capacity(int device_id) {
     return cache->zone_available(vram_zone_id::KV);
 }
 
+size_t unified_cache_kv_weight_capacity(int device_id, size_t vram_budget, bool multi_device) {
+    if (!vram_arena_enabled()) {
+        return vram_budget;
+    }
+    auto *       cache       = kv_reads_device_arena(multi_device, get_effective_mode() == unified_cache_mode::GLOBAL) ?
+                                   get_existing_cache_for_device(device_id) :
+                                   nullptr;
+    const size_t shared_zone = cache && cache->arena_active() ? cache->zone_capacity(vram_zone_id::WEIGHT) : 0;
+    return kv_weight_capacity(vram_budget, shared_zone);
+}
+
+size_t unified_cache_kv_vram_available(int device_id, bool multi_device) {
+    // With an active arena, the KV zone's free space (in single-chunk mode, the
+    // shared KV+weight allocator's). A full zone reads 0 there, which is not
+    // "no arena": it must not fall back to the budget-based headroom. Looks the
+    // cache up without creating it: the runtime-context transaction calls this
+    // under g_tensor_inventory_mutex. The budget fallback is not per-device in
+    // GLOBAL mode (every device resolves to cache 0), so a multi-device GLOBAL
+    // plan has no per-device KV headroom; see kv_reads_device_arena().
+    auto *     cache     = vram_arena_enabled() &&
+                           kv_reads_device_arena(multi_device, get_effective_mode() == unified_cache_mode::GLOBAL) ?
+                               get_existing_cache_for_device(device_id) :
+                               nullptr;
+    const bool has_arena = cache && cache->arena_active();
+    return kv_vram_available(has_arena, has_arena ? cache->zone_available(vram_zone_id::KV) : 0,
+                             has_arena ? 0 : unified_cache_available_for_compute(device_id));
+}
+
+bool unified_cache_mode_is_global() {
+    return get_effective_mode() == unified_cache_mode::GLOBAL;
+}
+
 size_t unified_cache_kv_arena_used(int device_id) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (!cache || !cache->arena_active()) {
@@ -27600,7 +27632,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             // device headroom. Planned weights must fit the actual allocator
             // zone, not an idealized budget, or S1 can mark experts device-
             // planned that zone_alloc(WEIGHT) can never materialize.
-            remaining       = std::min(remaining, cache->zone_capacity(vram_zone_id::WEIGHT));
+            remaining       = unified_cache_kv_weight_capacity(device_id, vram_budget, /*multi_device=*/false);
             GGML_LOG_INFO(
                 "[PLACEMENT] Zone reservation: scratch=%.1f MB + oneDNN=%.1f MB + "
                 "runtime=%.1f MB (arena=%.1f MB, weight zone=%.1f MB)\n",
@@ -28215,8 +28247,6 @@ static void populate_multi_device_layer_blocks(placement_plan &                 
         block.dense_on_fastest_device =
             dense_device >= 0 && dense_device == plan.fastest_dense_device && plan.fastest_dense_score > 0.0;
 
-        bool kv_initialized = false;
-        int  kv_device      = -1;
         for (int layer = start; layer <= end; ++layer) {
             auto dense_it = layer_weight_bytes.find(layer);
             if (dense_it != layer_weight_bytes.end()) {
@@ -28227,17 +28257,7 @@ static void populate_multi_device_layer_blocks(placement_plan &                 
                 block.dense_vram_charge_bytes += charge_it->second;
             }
 
-            const int    layer_kv_device = plan.get_kv_device(layer);
-            const size_t kv_bytes        = plan.kv_size_for_layer(static_cast<uint32_t>(layer));
-            if (kv_bytes > 0) {
-                block.kv_bytes += kv_bytes;
-                if (!kv_initialized) {
-                    kv_device      = layer_kv_device;
-                    kv_initialized = true;
-                } else if (kv_device != layer_kv_device) {
-                    kv_device = -2;
-                }
-            }
+            block.kv_bytes += plan.kv_size_for_layer(static_cast<uint32_t>(layer));
 
             auto moe_dev_it = moe_device_bytes_by_layer.find(layer);
             if (moe_dev_it != moe_device_bytes_by_layer.end()) {
@@ -28250,7 +28270,7 @@ static void populate_multi_device_layer_blocks(placement_plan &                 
                 block.moe_host_weight_bytes += moe_host_it->second;
             }
         }
-        block.kv_device = kv_initialized ? kv_device : -1;
+        block.kv_device = plan.layer_range_kv_device(start, end);
 
         if (dense_device < 0) {
             block.dense_policy_reason = "host-or-unplanned";
@@ -28906,7 +28926,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                 // materialization. The WEIGHT zone is the shared KV+weight
                 // allocator; packing against the larger VRAM budget can create
                 // planned entries that cannot be staged.
-                remaining[d]    = std::min(remaining[d], cache->zone_capacity(vram_zone_id::WEIGHT));
+                remaining[d] =
+                    unified_cache_kv_weight_capacity(device_budgets[d].device_id, device_budgets[d].vram_budget,
+                                                     /*multi_device=*/true);
             }
         }
 

@@ -7,6 +7,7 @@
 // back on device 0 because the output norm and output weights live there.
 
 #include "block-exec-dense.hpp"
+#include "kv-runtime-demotion.hpp"
 
 #include <cstring>
 #include <iostream>
@@ -476,6 +477,44 @@ static void test_kv_not_on_executor_device() {
     check(p.failing_node == b.node("fattn-2"), "the refusal names the attention node");
 }
 
+// A block whose KV was partly re-placed to the host tier (llama.cpp-17ea)
+// reads as mixed (-2), and the precheck declines it like host KV.
+static void test_mixed_kv_block_is_declined() {
+    // Layers 21..29 of a device-0 block demoted; 30..31 on device 1.
+    std::vector<int>    owners(32, 0);
+    std::vector<size_t> bytes(32, 8u << 20);
+    for (int l = 21; l <= 29; ++l) {
+        owners[static_cast<size_t>(l)] = -1;
+    }
+    owners[30] = owners[31] = 1;
+    const int kv0           = ggml_sycl::layer_block_kv_device(owners, bytes, 0, 29);
+    const int kv1           = ggml_sycl::layer_block_kv_device(owners, bytes, 30, 31);
+    check(kv0 == -2, "a partly demoted block's KV owner is mixed");
+    check(kv1 == 1, "an untouched block keeps its KV owner");
+
+    dense_exec_precheck_inputs in{};
+    in.enabled   = true;
+    in.has_graph = true;
+    in.has_plan  = true;
+    in.blocks.push_back(dense_exec_block{ 0, 29, 0, kv0, false });
+    in.blocks.push_back(dense_exec_block{ 30, 31, 1, kv1, false });
+    check(dense_exec_first_failing_precheck(in) == DENSE_EXEC_GATE_KV_DEVICE, "mixed KV is refused");
+}
+
+// The builder answers from the graph's own KV operands, not the published
+// plan: blocks that still claim device KV (a stale or other context's plan)
+// do not route a host-resident cache to a device kernel.
+static void test_host_kv_operand_under_device_plan() {
+    split_options o{};
+    o.kv_mask_for_dev1 = 0;  // cache_k-2/-3 live in host memory
+    graph_builder b    = make_split_graph(o);
+    b.g.max_ranges     = 100;
+    dense_exec_plan p;
+    check(b.g.blocks[1].kv_device == 1, "the plan still claims device-1 KV");
+    check(dense_exec_build_plan(b.g, p) == DENSE_EXEC_GATE_OPERAND, "device-1 attention cannot read host KV");
+    check(p.failing_node == b.node("fattn-2"), "the refusal names the attention node");
+}
+
 // Placement decides the executor: a host-resident weight is never read over
 // PCIe by a GPU, so its node runs on the original device's per-op path.
 static void test_host_weight_runs_on_original_device() {
@@ -795,6 +834,8 @@ int main() {
         { "boundary-io",                                test_boundary_io                                     },
         { "noop-keeps-predecessor-device",              test_noop_keeps_predecessor_device                   },
         { "kv-not-on-executor-device",                  test_kv_not_on_executor_device                       },
+        { "mixed-kv-block-is-declined",                 test_mixed_kv_block_is_declined                      },
+        { "host-kv-operand-under-device-plan",          test_host_kv_operand_under_device_plan               },
         { "host-weight-runs-on-original-device",        test_host_weight_runs_on_original_device             },
         { "in-place-write-into-foreign-root",           test_in_place_write_into_foreign_root                },
         { "arena-layout",                               test_arena_layout                                    },
