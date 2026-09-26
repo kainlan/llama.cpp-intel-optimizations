@@ -12,6 +12,15 @@ the context's graph_input_staging_generation tells it. So:
   2. the executor takes the moved-only refresh only on a plan-cache hit that
      records nothing, and checks the generation and the input list first.
 
+Crossings (item C). The planner lays each crossing's slices out next to each
+other in the arena and hands out runs (block-exec-dense.hpp,
+dense_exec_coalesce), so:
+
+  3. the arena side of every crossing copies whole runs, never a slice at a
+     time;
+  4. leaving a range waits on its queue only when the crossing did not, and
+     the crossing reports that it waited only after it has.
+
 Runs under pytest and as a plain script. GGML_SYCL_2LXW_BACKEND_SOURCE and
 GGML_SYCL_2LXW_COMMON_SOURCE point it at other copies (to see it fail on a
 broken tree). No SYCL device or build is touched.
@@ -141,6 +150,42 @@ def test_moved_only_refresh_is_gated_on_a_recordless_plan_cache_hit():
     assert moved.find(GENERATION) < moved.find("mem_copy_async"), "check the generation before copying"
     assert "dense_exec_input_moved" in moved, "only moved inputs are copied"
     assert "in.written" in moved, "an input a node writes is copied every graph"
+
+
+def test_crossings_copy_whole_runs():
+    stage = strip_comments(member_body(backend, "bool stage_range("))
+    assert "io.stage_in_runs" in stage and "runs_[idx].stage_in" in stage, (
+        "stage_range must copy into the arena by the plan's stage-in runs"
+    )
+    assert "slices_[" not in stage, "stage_range must not copy into the arena one slice at a time"
+
+    leave = strip_comments(member_body(backend, "void leave_range("))
+    for runs in ("io.copy_out_src_runs", "io.copy_out_dst_runs", "runs.copy_out_src", "runs.copy_out_dst"):
+        assert runs in leave, f"leave_range must copy out by the plan's runs ({runs})"
+    assert "slices_[" not in leave, "leave_range must not copy out one slice at a time"
+
+
+def test_leaving_a_range_waits_once():
+    leave = strip_comments(member_body(backend, "void leave_range("))
+    def blocks(pattern):
+        spans = []
+        for m in re.finditer(pattern, leave):
+            open_idx = leave.index("{", m.end() - 1)
+            spans.append((open_idx, matching_brace(leave, open_idx)))
+        return spans
+
+    traced = blocks(r"if\s*\(\s*phase_trace_\s*\)\s*\{")
+    waits = [m.start() for m in re.finditer(r"q_exec->wait_and_throw\(\)", leave)]
+    untraced = [w for w in waits if not any(a < w < b for a, b in traced)]
+    assert len(untraced) == 1, f"leave_range must wait on its queue in exactly one untraced place ({len(untraced)})"
+    guarded = blocks(r"if\s*\(\s*!\s*cross\([^{]*\{")
+    assert any(a < untraced[0] < b for a, b in guarded), "leave_range must wait only when the crossing did not"
+
+    cross = strip_comments(member_body(backend, "bool cross("))
+    wait = cross.find("q_from->wait_and_throw()")
+    assert wait >= 0, "a crossing waits for its source queue"
+    assert "return true" in cross and cross.find("return true") > wait, "cross reports a wait only after it"
+    assert all(m.start() < wait for m in re.finditer(r"return false", cross)), "cross must not report false after waiting"
 
 
 if __name__ == "__main__":

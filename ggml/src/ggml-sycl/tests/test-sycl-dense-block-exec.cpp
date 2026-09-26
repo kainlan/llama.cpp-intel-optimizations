@@ -512,13 +512,31 @@ static void test_arena_layout() {
     }
     dense_exec_plan p;
     check(dense_exec_build_plan(b.g, p) == DENSE_EXEC_GATE_NONE, "plans");
-    size_t expect[2] = { 0, 0 };
-    for (const dense_exec_slice & s : p.slices) {
-        check(s.offset % dense_exec_slice_alignment == 0, "slices are 256-byte aligned");
-        check(s.offset == expect[s.device], "slices are packed in creation order");
-        expect[s.device] += 1024;
+    // Range 1's staged slices come first on device 1, in stage order; every
+    // other slice follows in creation order, with no gaps.
+    std::vector<int> order[2];
+    for (int s : p.io[1].stage_in) {
+        order[1].push_back(s);
     }
-    check(p.arena_bytes[0] == expect[0] && p.arena_bytes[1] == expect[1], "arena totals match the slices");
+    for (const dense_exec_copy & c : p.io[1].copy_out) {
+        order[1].push_back(c.from_slice);
+        order[0].push_back(c.to_slice);
+    }
+    for (size_t s = 0; s < p.slices.size(); ++s) {
+        if (!contains(order[p.slices[s].device], static_cast<int>(s))) {
+            order[p.slices[s].device].push_back(static_cast<int>(s));
+        }
+    }
+    for (int d = 0; d < 2; ++d) {
+        size_t expect = 0;
+        for (int s : order[d]) {
+            const dense_exec_slice & slice = p.slices[static_cast<size_t>(s)];
+            check(slice.offset % dense_exec_slice_alignment == 0, "slices are 256-byte aligned");
+            check(slice.offset == expect, "crossing slices first, then creation order, packed");
+            expect += 1024;
+        }
+        check(p.arena_bytes[static_cast<size_t>(d)] == expect, "arena totals match the slices");
+    }
     check(p.arena_bytes[0] == 1024, "device 0 holds only the copied-back norm");
 
     b.g.max_arena_bytes = p.arena_bytes[1] - 1;
@@ -734,6 +752,108 @@ static void test_written_roots() {
     check(!dense_exec_written_roots(b.g)[static_cast<size_t>(b.root_index("kq_mask"))], "a no-op writes nothing");
 }
 
+// Consecutive spans at the same distance apart in the arena and the host
+// buffer, separated only by alignment padding, are one copy.
+static void test_coalesce() {
+    const size_t A = dense_exec_slice_alignment;
+    check(dense_exec_coalesce({}).empty(), "no spans, no runs");
+
+    auto runs = dense_exec_coalesce({
+        { 0,    0,    1000 },
+        { 1024, 1024, 16   },
+        { 1280, 1280, A    },
+    });
+    check(runs.size() == 1, "packed spans are one run");
+    check(runs[0].arena_offset == 0 && runs[0].host_offset == 0 && runs[0].bytes == 1280 + A, "the run spans them all");
+
+    runs = dense_exec_coalesce({
+        { 4096, 0, 100 },
+        { 4352, A, 100 },
+    });
+    check(runs.size() == 1 && runs[0].arena_offset == 4096 && runs[0].bytes == A + 100,
+          "a common displacement between arena and host still merges");
+
+    runs = dense_exec_coalesce({
+        { 0,     0, 100 },
+        { 2 * A, A, 100 },
+    });
+    check(runs.size() == 2, "spans at different distances do not merge");
+
+    runs = dense_exec_coalesce({
+        { 0,     0,     100 },
+        { 2 * A, 2 * A, 100 },
+    });
+    check(runs.size() == 2, "a gap wider than padding does not merge");
+
+    runs = dense_exec_coalesce({
+        { A, A, 100 },
+        { 0, 0, 100 },
+    });
+    check(runs.size() == 2, "a span before its run does not merge");
+
+    runs = dense_exec_coalesce({
+        { 0,     0, 100 },
+        { A,     A, 0   },
+        { 2 * A, A, 100 },
+    });
+    check(runs.size() == 2 && runs[0].bytes == 100 && runs[1].arena_offset == 2 * A,
+          "an empty span is dropped, and the arena gap it leaves splits the run");
+}
+
+// The Mistral split crosses in one copy per side: range 1's staged slices,
+// and its copy out, are each one run.
+static void test_crossing_runs() {
+    graph_builder b = make_split_graph();
+    for (dense_exec_root & r : b.g.roots) {
+        r.bytes = 1000;
+    }
+    dense_exec_plan p;
+    check(dense_exec_build_plan(b.g, p) == DENSE_EXEC_GATE_NONE, "plans");
+    check(dense_exec_plan_violation(b.g, p) == nullptr, "a built plan is clean");
+
+    const dense_exec_range_io & io = p.io[1];
+    check(io.stage_in.size() > 1, "range 1 stages several slices");
+    check(io.stage_in_runs.size() == 1, "and stages them in one copy");
+    check(io.stage_in_runs[0].host_offset == 0 && io.stage_in_runs[0].bytes == io.stage_in_host.back() + 1000,
+          "the copy covers every staged span");
+    check(io.copy_out_src_runs.size() == 1 && io.copy_out_dst_runs.size() == 1, "the copy out is one copy each side");
+    for (size_t r = 0; r < p.io.size(); ++r) {
+        if (!p.ranges[r].executor) {
+            check(
+                p.io[r].stage_in_runs.empty() && p.io[r].copy_out_src_runs.empty() && p.io[r].copy_out_dst_runs.empty(),
+                "an original-device range crosses nothing");
+        }
+    }
+
+    {
+        dense_exec_plan bad = p;
+        bad.io[1].stage_in_runs.back().bytes -= 1;
+        expect_violation(b.g, bad, "a crossing's copies do not cover its slices");
+    }
+    {
+        dense_exec_plan bad = p;
+        bad.io[1].stage_in_runs[0].arena_offset += dense_exec_slice_alignment;
+        expect_violation(b.g, bad, "a crossing's copies do not cover its slices");
+    }
+    {
+        dense_exec_plan bad = p;
+        bad.io[1].copy_out_dst_runs.clear();
+        expect_violation(b.g, bad, "a crossing's copies do not cover its slices");
+    }
+    {
+        dense_exec_plan bad                  = p;
+        bad.io[1].copy_out_src_runs[0].bytes = bad.arena_bytes[1] + 1;
+        expect_violation(b.g, bad, "a crossing's copies do not cover its slices");
+    }
+
+    // A zero-byte staged root takes arena space but no host space, so the
+    // staged slices after it start a new copy.
+    b.g.roots[static_cast<size_t>(b.root_index("inp_pos"))].bytes = 0;
+    check(dense_exec_build_plan(b.g, p) == DENSE_EXEC_GATE_NONE, "plans");
+    check(dense_exec_plan_violation(b.g, p) == nullptr, "a built plan is clean");
+    check(p.io[1].stage_in_runs.size() == 2, "an empty staged slice splits the copy in two");
+}
+
 // A range graph takes the pool scratch freed while it recorded: only what the
 // pool gained since the recording began, in order, and nothing from before.
 static void test_take_since() {
@@ -863,6 +983,8 @@ int main() {
         { "host-stage-layout",                          test_host_stage_layout                               },
         { "take-since",                                 test_take_since                                      },
         { "input-moved",                                test_input_moved                                     },
+        { "coalesce",                                   test_coalesce                                        },
+        { "crossing-runs",                              test_crossing_runs                                   },
         { "written-roots",                              test_written_roots                                   },
     };
 
