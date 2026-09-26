@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.7. Author: impl-moua, 2026-09-26. The revisions answer nine reviews:
+Design, revision 7.8. Author: impl-moua, 2026-09-26. The revisions answer nine reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -36,6 +36,8 @@ Design, revision 7.7. Author: impl-moua, 2026-09-26. The revisions answer nine r
   lead's rulings on it (§M8), and the items queued for this round (§M76's conditions 1, 2 and
   5, §M76a, §Z42.3, §ZR5 I-1 to I-3, the llama.cpp-fsgi pointer), recorded in §6.11. Revision
   7.7 is one commit on top of `db609bd15`, the merge of master `76c7f6548` into `task/moua`.
+  Revision 7.8 is one commit on top of 7.7 (`307a4ddb1`): the lead's ruling on the allowlisted
+  republish and zhcn 5.4's §3.8 rows 19, 22, 26, 27 and 30, also recorded in §6.11.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
@@ -1173,23 +1175,36 @@ L0, and a failed revalidation under L0 is a bug, not a race.
   `g_tensor_inventory_index` at `:19246-19247`), is a separate ticket, **llama.cpp-fsgi** (P1).
   It reuses this snapshot mechanism and lands after moua; H7ao is scoped by path set so that
   fsgi extends it to dispatch.
-- **The allowlist: decode's identity-preserving republishes (rulings §L0R).** Four sites
-  republish the current snapshot from inside graph compute and do **not** take L0:
-  `ggml_sycl_republish_current_plan()` (`:2996`) at `:5887` and `:5908` (the MoE
-  secondary-queue setup, `:5852`), `:60125` (the lazy MoE layout materialization, `:60062`) and
-  `:74882` (`ggml_sycl_mul_mat_id`). They are allowed only because the plan identity cannot
-  change across them (rulings §ZR5 I-3). The helper reads the published snapshot, republishes
-  it, and compares the published identity with the one it read, all in **one**
-  `g_tensor_inventory_mutex` section, the section that already makes a publish atomic
-  (`:2996-2999`). Every L0 committer publishes under the same mutex (the transaction's CAS at
-  `:18646` runs under L1), so a concurrent commit lands wholly before or wholly after that
-  section, and the comparison cannot report a false change. The republish writes no
-  device-global: after §M76a (above), a publish writes only the publication and the per-cache
-  copies of the same pointer (`:15349-15354`), no longer `g_model_n_layer` or
-  `g_placement_kv_info`. A gate (H7ai) proves it: the helper takes no snapshot argument, and its
-  comparison sits inside the section. A change of identity there is `[CONTEXT-PLAN-BUG]`, and
-  H9 runs the republish against a concurrent L0 committer. The same helper's fifth caller,
-  `:33769`, is in the weight preload, under `load_end`'s L0 hold; it is not an allowlist site.
+- **The allowlist: decode's identity-preserving republishes (rulings §L0R, §ZR5 I-3; lead
+  ruling on zhcn 5.4 row 30).** Four sites republish the current snapshot from inside graph
+  compute and do **not** take L0: `:5887` and `:5908` (the MoE secondary-queue setup, `:5852`),
+  `:60125` (the lazy MoE layout materialization, `:60062`) and `:74882`
+  (`ggml_sycl_mul_mat_id`). Each republishes into one cache whose plan owner is empty. On master
+  they call `ggml_sycl_republish_current_plan()` (`:2996-2999`), which re-runs the full publish:
+  it writes `g_placement_publication` and every cache's snapshot, and the emptiness check runs
+  outside the mutex (`:5885-5886`). All four instead call
+  **`ggml_sycl_republish_current_plan_into_empty(cache)`**, never the full helper. In **one**
+  `g_tensor_inventory_mutex` section it:
+  1. reads the current publication (`g_placement_publication`);
+  2. re-checks that this cache's plan owner is still empty, and returns as a no-op otherwise;
+  3. computes this cache's participation the way `ggml_sycl_prepare_plan_publication_locked`
+     (`:15314`) does;
+  4. installs that snapshot, or `nullptr` for a non-participant, into **this cache only**;
+  5. compares the installed snapshot's identity (version, `model_id`, `load_txn_id`) with the
+     current publication's, in the same section.
+
+  It writes no device-global: not `g_model_n_layer`, not `g_placement_kv_info`, not
+  `g_placement_publication`, and no other cache's snapshot. Every L0 committer publishes under
+  the same mutex (the transaction's CAS at `:18646` runs under L1), so a concurrent commit lies
+  wholly before or wholly after the section. A mismatch is therefore a code defect,
+  `[CONTEXT-PLAN-BUG]` with a STRICT abort, never a race. It relies on §M76a retiring the
+  readers of the two inventory globals; the dispatch reader `get_cached_tensor_ptr` (`:19236`)
+  is llama.cpp-fsgi. The full helper has one caller left, `:33769` in the weight preload, which
+  is a load entry under `load_end`'s L0 hold with a debug assertion on the token's held flag; it
+  is not an allowlist site. The full helper is the second source for one fact that §M76a
+  removes, so this form is not an optimization. A gate (H7ai) proves it: the four sites call
+  only the narrow form, and it contains no write to the three globals or to another cache's
+  snapshot. H9 runs it against a concurrent L0 committer.
 - **Who never takes it (rulings §L0R; r7 m-7).** "Decode never takes L0" means **graph compute
   and dispatch never take it**. `llama_decode` can reach a re-plan legitimately through
   `sched_reserve` (the resync at `llama-context.cpp:1571`, and the FA recheck through
@@ -1657,16 +1672,20 @@ contribution. It never re-fits KV and never yields.
 
   **Why COVERED is safe without L0 (rulings §M76.1 condition (a)).** Everything a COVERED
   answer relies on is held by an owner, not read as free room, and nothing a concurrent L0
-  holder does can shrink it:
-  - the device tenant slots are reserved-slot handles in this context's registry entry, and no
-    L0 holder (an unload, a quarantine restore, a load, another context's transaction) may
-    free a live handle (the `mem_handle` rule; weight reclaim touches weights only; a release
-    proc touches only its own ContextId);
-  - the host slots are this context's own held reservations (§2.4.3);
-  - the ring: while this context is a contributor, only this context's own sole-contributor
-    move-out or the last contributor's release proc can release its storage, and a load no
-    longer touches it (llama.cpp-r7fz); an unload of another model removes only that model's
-    contributions, and the ring keeps its size;
+  holder does can shrink it while this context lives (zhcn 5.4 row 26 carries the same
+  statement):
+  - this context's CONTEXT slots, device and host (§2.4.3's reservations), are held by its own
+    registry entry. That entry's only writers are this context's growth transaction, on its
+    owner thread (the thread asking the query), and its teardown release proc, keyed by its
+    never-reused ContextId. Other contexts' transactions write their own entries; a load, an
+    unload, an activation and a quarantine restore write the publication and their own
+    entries; and no L0 holder may free a live handle (the `mem_handle` rule; weight reclaim
+    touches weights only);
+  - the ring is the max over live contributions. It never shrinks by carving, keeps its size
+    when a contributor leaves, and is released only with its last contributor (or by this
+    context's own sole-contributor move-out), so it never drops below this context's
+    contribution while the context lives. A load no longer touches it (llama.cpp-r7fz). A
+    growth of the ring contribution is GROWTH, never COVERED (r7 m-11);
   - the MMID workspaces are held by this model's MMID entry, released only at this model's
     unload, which cannot run while this context lives.
 
@@ -1674,7 +1693,9 @@ contribution. It never re-fits KV and never yields.
   cannot become unplanned use, and the caller need not re-check under a transaction. H9 runs a
   covered read against a parked L0 holder that unloads another model, restores a quarantined
   one and loads a third: the slot handles, the ring record's size and slots and the host
-  reservations are unchanged, and the answer is the same.
+  reservations are unchanged, and the answer is the same. zhcn's H9 has the two arms on its
+  side: another contributor unloads between COVERED and ALLOC, and another context commits a
+  growth; its RED is zhcn 5.3's key-record write.
 - **The coverage query, and L0 on the tenant-only path (rulings §E.2, §L0R, §M76.1; zhcn rev
   5.1; r7 I-2, m-1; r8 m-1).** llama asks first, through a read-only backend query,
   `ggml_backend_sycl_tenant_coverage(ctx, candidate)`, which answers EQUAL, COVERED or GROWTH.
@@ -1723,13 +1744,18 @@ contribution. It never re-fits KV and never yields.
   path, after L0; and it completes before (c)'s occupancy check and move-out and before any reap
   or release.
 
-  The list is zhcn's gate 30 (the queue census). The between-graph scatter lists,
-  `g_pending_secondary_scatter` and `g_pipeline_scatter`, hold compute slices, but zhcn flushes
-  them at every `graph_compute` exit and drains them in its step 3 (zhcn C2t), so neither needs
-  a queue wait of its own. A queue added later must join the list. If one is missed, (d)'s
-  backstop makes the miss a loud `[CONTEXT-PLAN-BUG]`, never a free under queued work. **Nothing
-  between (s) and (d) publishes a retention whose event postdates (s) (r6 m-2):** (a)'s
-  own-context clear submits no device work (its per-context input-staging reset,
+  The list is zhcn's gate 30 (the queue census). The between-graph scatter lists hold compute
+  slices, and none needs a queue wait of its own, because one flush drains all four (zhcn C2t;
+  zhcn 5.4 row 22): `ggml_sycl_cpu_tg_flush_pending()` (`:23911-23923`) covers
+  `g_pending_scatter` (`:21473`), `g_pending_cpu_pipeline` (`:23216`),
+  `g_pending_secondary_scatter` (`:23394`) and `g_pipeline_scatter` (`:23426`), not only the
+  secondary scatter. llama's `synchronize()` reaches it through `ggml_backend_sycl_synchronize`
+  (`:84304`) before (s)'s waits, and it also runs at every `graph_compute` exit that is not
+  recording (`:94869-94871`). A recording is exempt from the exit flush: its scatter state goes
+  into the recording sink, or the record is refused. A queue added later must join the list. If
+  one is missed, (d)'s backstop makes the miss a loud `[CONTEXT-PLAN-BUG]`, never a free under
+  queued work. **Nothing between (s) and (d) publishes a retention whose event postdates (s) (r6
+  m-2):** (a)'s own-context clear submits no device work (its per-context input-staging reset,
   `graph_input_staging_clear`, ignores its queue: `common.hpp:6457-6460` at `3d9414c8c`); A4's
   gallocr free takes the queue's last event and submits no barrier (§2.3.2); and the record-mode
   vacate's marker is a claim-state event that retains nothing (§2.3.2).
@@ -1847,7 +1873,7 @@ contribution. It never re-fits KV and never yields.
     follows (c) directly, and the three §B holder classes stand (e).
   - **The holder census beyond §B.2's list (rulings §M7 I-7; r7 I-7).** No step 8′ means the
     census carries the whole §B.2 load, so it must name every container that can own a tenant
-    slice between graphs. Four more do, at master `3d9414c8c`:
+    slice between graphs. Five more do, at master `3d9414c8c`:
     - **`graph_input_staging`** (`common.hpp:6338-6343`, used at `:6375-6428`): a per-context
       map keyed by a raw `ggml_tensor *`, whose entries own a `mem_handle` and persist across
       graphs; it is cleared only by `graph_input_staging_clear` (`:6457`), that is only inside
@@ -1880,13 +1906,26 @@ contribution. It never re-fits KV and never yields.
       instance.
 
     - **`g_moe_down_shadow`** (`:21153`, r8 m-3), a `thread_local` map whose key
-      (`moe_down_shadow_key`, `:21115-21123`) holds an owning `mem_handle` of the source tensor,
-      compared by `stable_identity_equal` and cleared only at graph start (`:21313`). It is
-      debug-gated (`GGML_SYCL_MOE_DOWN_SHADOW`, `:21169-21175`), so it is reachable only under
-      that variable, but it is a holder there, and it takes the same key-type fix.
+      (`moe_down_shadow_key`, `:21115-21123`) holds an owning `mem_handle` of the source tensor
+      but compares it only by `handle_identity` and `stable_identity_equal` (`:21131-21132`),
+      and is cleared only at graph start (`:21313`). It is debug-gated
+      (`GGML_SYCL_MOE_DOWN_SHADOW`, `:21169-21175`), so it is reachable only under that
+      variable, but it is a holder there, and it takes the same key-type fix: the key's handle
+      becomes a `mem_handle_identity`;
+    - **the four C2t scatter lists** (zhcn 5.4 row 27): `g_pending_scatter` (`:21473`),
+      `g_pending_cpu_pipeline` (`:23216`), `g_pending_secondary_scatter` (`:23394`) and
+      `g_pipeline_scatter` (`:23426`), all `thread_local`. Each scatter entry's `dst_handle`
+      owns the `MUL_MAT_ID` dst compute slice (`:21417`, `:23174`, `:23357`; the pipeline slot
+      wraps a `pending_secondary_scatter`, `:23419`). Their fix is the drain, not a key type:
+      `ggml_sycl_cpu_tg_flush_pending()` empties all four at every non-recording
+      `graph_compute` exit and in `synchronize`, and a recording keeps them in its sink or is
+      refused ((s) above).
 
     Each is either a non-owning identity key or holds no owning handle of a tenant slice past
-    `graph_compute` exit. H7ag names all five, each with a mutation witness.
+    `graph_compute` exit. H7ag names all nine, each with a mutation witness. Not holders (zhcn
+    5.4 row 27): `g_moe_down_sum_shadow_entries` (its own allocation), `g_mul_mat_exc_ctx` (raw
+    pointers), `local_extra` (scoped), `retained_ids` (a host copy) and the `CpuExpertPool`
+    tasks (a `weight_lease` only).
   - **(d) The reap, with no L1-L5 lock held (lead ruling "B"; r6 I-1, I-2, m-3, m-5; zhcn rev
     5).** zhcn's mem-handle call, shared with llama.cpp-uwlx's yield (jehw), is
     `retained_reap_result release_retained_referencing(const retained_reap_request &)`. The
@@ -2237,28 +2276,44 @@ inventory. What differs, because it is not in the device geometry:
     reserved nothing either (r7 I-6). Revision 7.6 took one carve and sub-carved the slots from
     it as offset views; §ZR5 I-2 replaces that, because the slots of one context need not be
     adjacent and an offset sub-carve across a pool region is exactly what the ruling forbids.
-  - **Each is contiguous.** A slot is one contiguous host allocation: the unified cache's
-    contiguous host-zone path (`unified_alloc`, `:15050-15092` at `11faace69`), and for a slot
-    larger than one zone chunk, the pinned pool's contiguous large-allocation path,
-    `pinned_chunk_pool::allocate_runtime` (`pinned-pool.hpp:137-141` at `3d9414c8c`: "suitable
-    for large contiguous allocations ... that don't fit within a single 256 MB zone chunk"),
-    never `allocate_segmented` or `zone_alloc_segmented`. If the owner-first request does not
-    route a large `must_host_pinned` slot to that path, routing it there is part of L4, a
-    support gap to close, not a named refusal.
-  - **Each slot's size is the plan's maximum for that index (rulings §ZR5 I-1; r8 m-10):** the
-    largest `slot_bytes` at that `(cohort, index)` over **every** rung the plan admits (each
-    ladder candidate up to the top), not the top rung's demand. The two are equal only if host
-    demand is monotone in `n_ubatch`, which nothing guarantees, so the first-publish MEASURE
-    measures every rung, and the ladder's rung set is fixed before the first publish: a rung is
-    a candidate only if it was in this computation. zhcn aligns its R_h to this form (rulings
-    §M8 minors). So every candidate the plan admits is covered on the host tier, a republish
-    never allocates host bytes, and no host slot is ever released and re-allocated within the
-    plan.
+  - **Each is contiguous, and the path exists (llama.cpp-nsl3; zhcn 5.4 row 19).** Host slot
+    `i` **is** reservation `i`: no offset views, no slices across reservations, no summed
+    envelope. The owner-first request (`unified_allocate_owner`, `unified-cache.cpp:16141` at
+    `3d9414c8c`) reaches one contiguous allocation with no new primitive: `select_zone`
+    (`:15361-15372`) maps `HOST_COMPUTE` to the WEIGHT zone, and `try_zone_alloc_contiguous`
+    (`:15394-15437`) calls `host_zone_alloc` → `pinned_chunk_pool::zone_alloc`
+    (`pinned-pool.cpp:500`, one chunk). On a miss it grows the zone through `host_zone_grow`
+    (`unified-cache.cpp:20399`) → `grow_zone` (`pinned-pool.cpp:613`) by one chunk of
+    `chunk_footprint_for` = `max(chunk_size_, align_up(need))` (`:798-803`), so a slot larger
+    than a zone chunk gets a chunk of its own. Before the zones are configured, the same request
+    takes `host_pool_alloc` (`unified-cache.cpp:20169-20174`) → `allocate_runtime`
+    (`pinned-pool.cpp:209-212`) → `allocate_from_chunks` (`:805-850`), with the same footprint.
+    `allocate_segmented`, `zone_alloc_segmented` and `host_zone_alloc_segmented`
+    (`unified-cache.cpp:20486-20502`) are never on this path. The limits are the pool budget
+    and Level Zero's per-allocation limit (about 11 GB); a failure there fails context creation.
+    Both `grow_zone`'s and `grow_into`'s phase gates (`pinned-pool.cpp:613-640`, `:865-882`)
+    stay silent, because the first publish runs at context creation, outside PP and TG.
+    Revision 7.7 routed a large slot to `allocate_runtime` and called routing it there an L4
+    gap; that was wrong, and the gap does not exist.
+  - **Each slot's size is the plan's maximum for that index (rulings §ZR5 I-1; r8 m-10):**
+    `R_h[i]`, the largest `slot_bytes` at that `(cohort, index)` over **every** rung in the
+    ladder's rung set, not the top rung's demand. The two are equal only if host demand is
+    monotone in `n_ubatch`, which nothing guarantees. The rung set is zhcn 5.4's
+    `llama_auto_ubatch_rung_set(ladder, n_ladder, fallback_ubatch, cap, cached_ubatch, out)` in
+    `src/llama-auto-ubatch.h`, new in zhcn's scope: the fallback, every ladder rung between the
+    fallback and the cap, and a valid cached value. It is computed before `create_memory`; the
+    fixpoint (zhcn's R*) measures each rung host-side before the first publish; and the ladder
+    iterates only that set, so a rung is a candidate only if it was measured (zhcn 5.4 row 19).
+    So every candidate the plan admits is covered on the host tier, a republish never allocates
+    host bytes, and no host slot is ever released and re-allocated within the plan.
   - **A request beyond it is refused by arithmetic, against that slot's reservation**, never
-    against live free room: a **candidate refusal** with the tenants-alone message at rulings §B
-    step 4 ((0) on the tenant-only path), before anything is released, never a growth under the
-    gate and never a transient. The setters and warmup are not ladder candidates, so they can
-    reach this refusal; it is deterministic in the plan.
+    against live free room, before anything is released, never a growth under the gate and
+    never a transient. Only a setter can reach it: the adapters, the sampler and
+    `llama_set_warmup` (rulings §D20.1), which are not ladder candidates. There it is a
+    **candidate refusal** with the tenants-alone message at rulings §B step 4 ((0) on the
+    tenant-only path; zhcn's E9), deterministic in the plan. At a ladder rung, a live host need
+    above `R_h[i]` contradicts the measured plan, so it is `[CONTEXT-PLAN-BUG]`, never a
+    refusal.
   - Expert-cache host fills and host weight staging take no L0 and allocate from the same pinned
     pool (zhcn T7). Between publishes they can take any free host room, but not the
     reservation, which is allocated. They are themselves planned capacity (P4; 1oxa r3 I5); host
@@ -3573,15 +3628,19 @@ L7 documents this limit, and pattern #2 remains the remedy.
       index, with growth allowed, each sized at that index's maximum over every rung. The
       fixture is not monotone: index 0 is largest at rung 256 and index 1 at rung 512, so each
       slot's size comes from a different rung, and the top rung alone under-sizes index 0. One
-      slot is larger than a zone chunk and must come from the contiguous large-allocation path
-      (one segment). REDs: 7.6's single carve with offset sub-carves (a slot spanning a
-      pool-region boundary), and sizing from the top rung's demand, under which the rung-256
-      republish is refused. Then, after a modelled decode:
+      slot is larger than a zone chunk: `R_h[0]` = the chunk size + 1 MiB, which must lie inside
+      one grown chunk (one segment), and the segmented form is detected. REDs: 7.6's single
+      carve with offset sub-carves (a slot spanning a pool-region boundary), sizing from the top
+      rung's demand, under which the rung-256 republish is refused, and a large slot served
+      segmented. Then, after a modelled decode:
       - **a concurrent host fill fails to take the room:** a modelled expert-cache host fill,
         taking no L0, asks the pinned pool for every free byte; it gets the room outside the
-        reservation and not one byte of the reservation. A republish at the plan's top rung
-        then succeeds, allocates nothing on the host tier, and an instrumented `grow_zone`
-        counter stays at 0. RED: revision 7.5's recorded-only reservation (host slots at the
+        reservation and not one byte of the reservation. A republish then **grows** slot `i`'s
+        need from its rung-512 value to the top rung's (still at most `R_h[i]`); the arm asserts
+        that growth before it scores, since a republish whose need does not grow passes under
+        the flag-only form too, and the arm would be vacuous (zhcn 5.4 row 19). The republish
+        succeeds, allocates nothing on the host tier, and an instrumented `grow_zone` counter
+        stays at 0. RED: revision 7.5's recorded-only reservation (host slots at the
         first candidate's size, later republishes allocating with `forbid_host_zone_growth =
         true`), where the fill takes the room and the top-rung republish refuses on live free
         room;
@@ -3767,15 +3826,18 @@ L7 documents this limit, and pattern #2 remains the remedy.
     q8 `cached_src_handle`, the `moe_ids_cache` keys, `runtime_tensor_extras`) if they still own
     one, and, by name (rulings §M7 I-7), `graph_input_staging` on the eager path and in record
     mode, `g_moe_ids_d2h_cache`, `g_moe_prompt_admission_cache`, `g_data_ptr_cache` and, under
-    `GGML_SYCL_MOE_DOWN_SHADOW`, `g_moe_down_shadow` (§2.4.2 "The holder census"; r8 m-3). The
+    `GGML_SYCL_MOE_DOWN_SHADOW`, `g_moe_down_shadow`, and the four C2t scatter lists
+    (`g_pending_scatter`, `g_pending_cpu_pipeline`, `g_pending_secondary_scatter`,
+    `g_pipeline_scatter`) (§2.4.2 "The holder census"; r8 m-3; zhcn 5.4 row 27). The
     identity type's no-recycling test and the `runtime_tensor_extras` publisher census are
     zhcn's gate 27 (rulings §B.2). Mutation witnesses: a beni-style owning park in a per-op
     cache, an owning `cached_src_handle` restored, a `ggml_backend_sycl_release_buffer_refs`
     step reintroduced, a `host_task` capture, and one per named container with an owning entry
     restored: an owning `graph_input_staging` handle with nothing recorded, an owning
     `moe_ids_cache_key::handle` in each of the two maps, an owning `g_data_ptr_cache` value with
-    zhcn's exit clear present (the key fix alone must catch it), and an owning
-    `moe_down_shadow_key::handle`;
+    zhcn's exit clear present (the key fix alone must catch it), an owning
+    `moe_down_shadow_key::handle`, and, for each of the four C2t scatter lists, an entry left
+    undrained past a non-recording `graph_compute` exit;
   - (ah) **step 2's ring-lock section precedes the snapshot (r6 I-5).** The copy of
     `ring_plan_gen` and of the ring's slots, with the `pinned[slot]` increments, is taken before
     the geometry snapshot, and the fit's ring input is that copy. Mutation witness: revision
@@ -3788,8 +3850,11 @@ L7 documents this limit, and pattern #2 remains the remedy.
     `ggml_sycl_publish_prepared_plan_locked`, `lifecycle_replace_placement_plan`,
     `Registry::prepare_live_update` and `Registry::acquire_live_update`. Each path must pass a
     `ggml_sycl_replan_token` taken at the top of its exported entry, or end in one of the four
-    allowlisted identity-preserving republishes (`:5887`, `:5908`, `:60125`, `:74882`, whose
-    helper takes no snapshot argument and compares identity inside its publish section), or
+    allowlisted identity-preserving republishes (`:5887`, `:5908`, `:60125`, `:74882`, each a
+    call of `ggml_sycl_republish_current_plan_into_empty(cache)`, whose one section re-checks
+    emptiness, installs into that cache only, compares identity, and writes none of
+    `g_model_n_layer`, `g_placement_kv_info`, `g_placement_publication` or another cache's
+    snapshot; a witness restores the full `ggml_sycl_republish_current_plan()` at one site), or
     start at a **classified test-only hook**. The test-only class is the exported `test_*`
     hooks that call `ggml_sycl_publish_test_plan` (`:9947`, `:10028`, `:10113`, `:10274`,
     `:19650`, `:19768`, `:19884` → the publish at `:2993`), `test_set_kv_placement_plan` and
@@ -3836,8 +3901,10 @@ L7 documents this limit, and pattern #2 remains the remedy.
     (rulings §D15, §ZR5 I-1, I-2; r7 I-6).** Each host slot is its own contiguous owner-first
     reservation, sized at that index's maximum over every rung, and no tenant-only path reaches
     a host allocation; no host-slot path calls `allocate_segmented` or `zone_alloc_segmented`.
-    Mutation witnesses: 7.5's per-republish allocation with `forbid_host_zone_growth = true`,
-    7.6's single carve with offset views, and a slot routed to `zone_alloc_segmented`;
+    The path is the one §2.4.3 cites (`try_zone_alloc_contiguous`, then `grow_zone` by one
+    chunk sized to the request). Mutation witnesses: 7.5's per-republish allocation with
+    `forbid_host_zone_growth = true`, 7.6's single carve with offset views, and a slot routed to
+    `zone_alloc_segmented`;
   - (ao) **per-model plan state (rulings §M76a).** On every L0-entry path (the transaction
     body, the probe, the FA recheck, activate, unload and the load entries), no read of
     `g_tensor_inventory_*`, `g_placement_kv_info` or `g_model_n_layer` exists outside the load
@@ -3966,13 +4033,15 @@ L7 documents this limit, and pattern #2 remains the remedy.
     `test_hold_live_update`. Each blocks until L0 is released. RED: 7.6's list, under which
     `set_runtime_context` called on a second thread publishes inside A's yield window and A's
     relock reports `[CONTEXT-PLAN-BUG]`.
-  - **The allowlisted republish against a concurrent L0 committer (rulings §ZR5 I-3).** The
-    four allowlisted republishes run, without blocking, while another thread holds L0 and
-    commits a transaction (its CAS under L1). Each republish leaves the plan identity unchanged
-    and reports no BUG, however the two interleave; a modelled republish that changes the
-    identity reports `[CONTEXT-PLAN-BUG]`. RED: a republish whose identity comparison runs
-    outside its publish section, which reports a false BUG when the commit lands between the
-    read and the comparison.
+  - **The allowlisted republish against a concurrent L0 committer (rulings §ZR5 I-3; zhcn 5.4
+    row 30).** One thread loops `ggml_sycl_republish_current_plan_into_empty(cache)` on an
+    emptied cache while another commits legal L0 transactions that change the publication.
+    Expected: 0 BUG lines, 0 STRICT aborts, and 0 writes to `g_model_n_layer`,
+    `g_placement_kv_info`, `g_placement_publication` or another cache's snapshot (write
+    counters). A modelled republish that changes the identity reports `[CONTEXT-PLAN-BUG]`.
+    RED: today's form, the full republish with the emptiness check outside the mutex and the
+    identity read before and after, which reports a false BUG when a commit lands between the
+    reads, and which writes the globals.
   - **A covered read against a parked L0 holder (rulings §M76.1).** Context A's candidate is
     covered. Another thread holds L0 and runs, in turn, an unload of model B, a quarantine
     restore of model C and a load of model D, parking inside each. A's coverage query runs at
@@ -4207,14 +4276,15 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
   `stage_inventory_plan` to `load_end` (§M8 I-3; H7ap); the model's MMID entry, its first
   materialization inside the transaction and the planned growth of its carve (§M8 I-5; H7am);
   one fit computation with no MMID budget on arena devices (H7aq); the host tier's contiguous
-  per-index reservations, with a large slot routed to `allocate_runtime` (§ZR5 I-2; H7an); the
+  per-index reservations, through the existing nsl3 path (§ZR5 I-2; H7an); the
   coverage query's backed-table rule and the entry's contribution copy (§M8 I-4); and the ring
   as per-kind contributions with a component-wise max (r8 m-8; H8).
 - **L6:** the transaction body taking the per-model snapshot (§M8 I-2); the token at the top of
   `set_runtime_context`, `shutdown`, `stage_inventory_plan`, `compute_placement_plan_early` and
   `test_hold_live_update`; the deletion of the three orphaned publishers and the re-anchoring of
-  the gates that name them (§M8 I-1; H7ai); the republish's same-section identity comparison
-  (§ZR5 I-3); and the deletion of the wrapper's post-transaction MMID materialization.
+  the gates that name them (§M8 I-1; H7ai); the four decode sites switched to
+  `ggml_sycl_republish_current_plan_into_empty(cache)` (§ZR5 I-3; zhcn 5.4 row 30); and the
+  deletion of the wrapper's post-transaction MMID materialization.
 
 **Landing order (lead ruling; r4 I10).** jehw lands on master first (u1bb already has). Then:
 1. moua L1-L3 (pure, host-tested; L1 is done). zhcn and beni need L3's record type,
@@ -4979,16 +5049,26 @@ master `76c7f6548` at `db609bd15`, and every new line was checked with `git show
 | llama.cpp-fsgi pointer | One line in §2.4.2: `get_cached_tensor_ptr` (`:19236`) is fsgi's, reuses the snapshot, lands after moua. |
 | §Z42.3 (no per-record zone) | The zone line and the record's zone field are deleted (§2.4.3 "Zone"). |
 | §ZR5 I-1 (host sizing over every rung) | m-10 above. |
-| §ZR5 I-2 (one owner-first reservation per slot index, contiguous) | §2.4.3's HOLD is per-index carves; a slot above a zone chunk goes to `allocate_runtime` (`pinned-pool.hpp:137-141`), and routing it there is L4's if the request does not reach it; H4 and H7an. |
-| §ZR5 I-3 (identity compare and republish in one section) | §2.4.2 "The allowlist"; the republish writes no device-global after §M76a; H9 arm with a concurrent L0 committer. |
+| §ZR5 I-2 (one owner-first reservation per slot index, contiguous) | §2.4.3's HOLD is per-index reservations through the existing nsl3 contiguous path (revision 7.8; 7.7 wrongly routed a large slot to `allocate_runtime` as an L4 gap); H4 and H7an. |
+| §ZR5 I-3 (identity compare and republish in one section) | §2.4.2 "The allowlist": the four sites call `ggml_sycl_republish_current_plan_into_empty(cache)` (revision 7.8, lead ruling), which writes no device-global; H7ai and H9. |
 
-**Open cross-design items (zhcn).** These are not agreements until zhcn's r5 round lands:
-- the covered path: zhcn 5.3 records the candidate key, takes L0 around a ring-shrink update,
-  and decides coverage inside its tenant-only publish; this design uses the read-only query
-  (rulings §M76.1) and writes nothing;
+**Revision 7.8: the lead's allowlist ruling and zhcn 5.4's §3.8 rows (head `1547f42`).**
+
+| row | request | disposition |
+|-----|---------|-------------|
+| 19 | host HOLD: one owner-first reservation per index, no offset views, `R_h` over the rung set | **Adopted** (§2.4.3). The contiguous path is nsl3's `try_zone_alloc_contiguous` → `grow_zone` by one request-sized chunk, cited at `3d9414c8c`; 7.7's `allocate_runtime` routing and its "L4 gap" are withdrawn. `llama_auto_ubatch_rung_set` is zhcn's new helper, not a `3d9414c8c` symbol. A need above `R_h[i]` is a setter-only refusal (zhcn's E9), and at a ladder rung a `[CONTEXT-PLAN-BUG]`. H4 asserts the slot's growth before scoring and adds the chunk + 1 MiB contiguity arm. |
+| 22 | the C2t flush is `ggml_sycl_cpu_tg_flush_pending()` over four lists | **Adopted** (§2.4.2 (s)); cites checked at `3d9414c8c`. |
+| 26 | the §M76.1 monotone statement for the covered path | **Adopted** (§2.4.2 "Why COVERED is safe without L0"): the entry's only writers, and the ring as a max over live contributions. zhcn's two H9 arms are pointed to. |
+| 27 | H7ag gains the four scatter lists and `g_moe_down_shadow` | **Adopted** (§2.4.2 census, H7ag: nine named containers; the not-holders listed). One cite corrected: the shadow key's compare is `:21131-21132`, not `:21127-21129`. |
+| 30 | the allowlist calls `ggml_sycl_republish_current_plan_into_empty(cache)` | **Adopted** (lead ruling; §2.4.2 "The allowlist", H7ai, H9). The emptiness check outside the mutex is at `:5885-5886`. |
+
+**Open cross-design items (zhcn).** These are not agreements until zhcn confirms:
 - the table: zhcn 5.3 checks and opens it at (e); this design at (c);
-- the I-4 rule (GROWTH on a cleared key or an empty ring record) and the m-10 sizing (the
-  per-index max over every rung), both sent to zhcn with the wording above.
+- the I-4 rule (GROWTH on a cleared key or an empty ring record), sent to zhcn with the
+  wording above.
+
+The covered path is no longer open: zhcn 5.4 uses the read-only query and names 5.3's
+key-record write as its RED (row 26).
 
 **Noted for the lead.**
 - The MMID host carve's planned growth (I-5(d)) can run outside a first publish only for a
@@ -4997,3 +5077,6 @@ master `76c7f6548` at `db609bd15`, and every new line was checked with `git show
   Whether `GGML_SYCL_HOST_ALLOC_PHASE_GATE` ≥ 2 then asserts depends on the phase marker at
   `sched_reserve` time, which this round did not check.
 - The merge `db609bd15` was not built; it changes no source file this design cites.
+- With row 19 the first publish's host growth is at context creation, outside PP and TG, so
+  neither pool phase gate fires there; the note above about the MMID carve's later growth is
+  unchanged.
