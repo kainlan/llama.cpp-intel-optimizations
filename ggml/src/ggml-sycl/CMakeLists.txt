@@ -3557,7 +3557,8 @@ endif()
 # One ctest per arm. Each arm pins its GGML_SYCL_FA_* environment and names
 # itself in GGML_SYCL_FATTN_TEST_EXPECT, so the test verifies that environment
 # and fails any case that does not reach the arm's expected kernel (see the
-# ARMS table in the test source).
+# ARMS table in the test source). RUN_SERIAL: every arm runs on the same B50,
+# so a parallel ctest must not start two of them (or another GPU test) at once.
 function(ggml_sycl_add_fattn_masked_arm arm)
     set(name test-sycl-fattn-masked-nonfinite-${arm})
     set(env
@@ -3571,6 +3572,7 @@ function(ggml_sycl_add_fattn_masked_arm arm)
         ENVIRONMENT "${env}"
         TIMEOUT 300
         SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
     )
 endfunction()
 
