@@ -31,6 +31,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace ggml_sycl {
 
@@ -152,5 +153,67 @@ inline bool pp_moe_onednn_reserve_if_admitted(const pp_moe_onednn_scratch_shape 
     }
     return on_admitted(aligned_required);
 }
+
+// Where the ring for a runtime n_ubatch goes, and whether it is admitted. The
+// runtime-context transaction decides this after it has admitted KV.
+//
+// The weight slot(s) stay in the RUNTIME zone. Each ubatch-scaled slot kind
+// (activation, output; ring_depth copies of each) stays in the RUNTIME zone if
+// it still fits there, larger kind first, and otherwise goes to the shared
+// KV/weight zone. The KV-zone part is admitted only against what the zone has
+// left once the admitted KV is placed, less a compute-buffer reserve. KV is
+// admitted before this runs and nothing here moves it, so a larger micro-batch
+// can never be the reason KV leaves VRAM.
+//
+// The reserve stands in for runtime consumers of the KV zone that no plan
+// counts yet: compute buffers that land there at graph_reserve, which runs
+// after the transaction (a RUNTIME miss tries raw device memory first, and
+// reaches the KV zone only when that is refused; llama.cpp-23mk), and the
+// flash-attention K/V conversion buffers. It applies only when some of the ring goes to the KV zone; a ring
+// that fits the RUNTIME zone competes with none of them.
+//
+// Each KV-zone slot is one allocation, so free space in pieces cannot hold it.
+// The whole KV-zone part must fit the zone's largest free block. That is an
+// estimate: the allocator reports the head of its largest size class, not a
+// scanned maximum, and with two or more KV-zone slots the later allocations
+// can still miss. It covers the single-allocation case; for the rest, a failed
+// reserve refuses the ring, which the automatic -ub ladder treats as its
+// ceiling, keeping its last accepted size.
+//
+// The KV-zone part is charged to the plan's VRAM, so it must also fit what the
+// plan's VRAM budget leaves on the device once KV and the MMID pools are
+// charged. The RUNTIME slots are not charged there and need no budget room.
+struct pp_moe_onednn_ring_admission_inputs {
+    size_t   kv_zone_available_bytes       = 0;  // KV bytes the device can still hold (live allocator figure)
+    size_t   kv_admitted_bytes             = 0;  // KV the transaction admitted on this device
+    size_t   compute_reserve_bytes_per_row = 0;  // KV-zone bytes held back per n_ubatch row
+    size_t   runtime_available_bytes       = 0;  // RUNTIME zone free once the old ring is released
+    size_t   kv_zone_largest_block_bytes   = std::numeric_limits<size_t>::max();  // largest free KV-zone block
+    size_t   vram_budget_room_bytes        = std::numeric_limits<size_t>::max();  // budget left after KV + MMID
+    size_t   weight_slot_bytes             = 0;
+    size_t   activation_bytes_per_row      = 0;
+    size_t   output_bytes_per_row          = 0;
+    uint32_t ring_depth                    = 0;
+    uint32_t n_ubatch                      = 0;
+};
+
+struct pp_moe_onednn_ring_admission {
+    bool     admit                    = false;
+    bool     activation_in_kv_zone    = false;
+    bool     output_in_kv_zone        = false;
+    size_t   activation_slot_bytes    = 0;  // align256(n_ubatch * activation_bytes_per_row)
+    size_t   output_slot_bytes        = 0;  // align256(n_ubatch * output_bytes_per_row)
+    size_t   kv_zone_bytes            = 0;  // ring bytes placed in the KV zone; 0 when it all fits RUNTIME
+    size_t   kv_zone_headroom_bytes   = 0;  // available - admitted, clamped at 0
+    size_t   compute_reserve_bytes    = 0;  // n_ubatch * compute_reserve_bytes_per_row, saturating
+    // n_ubatch when admitted; otherwise the largest multiple of 32 below it
+    // that would be, or 0 when none would (the weight slot alone does not fit
+    // the RUNTIME zone, or the inputs are degenerate).
+    uint32_t largest_fitting_n_ubatch = 0;
+};
+
+// Pure: every input is passed in. Not admitted on degenerate input (ring_depth
+// or n_ubatch 0, or both per-row terms 0) or when a slot size overflows size_t.
+pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_admission_inputs & in);
 
 }  // namespace ggml_sycl

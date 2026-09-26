@@ -130,7 +130,21 @@ static void flash_attn_vec_f16_kernel(
         // -----------------------------------------------------------------------
         // Main KV loop — one KV position per iteration, lanes share Q dot work.
         // -----------------------------------------------------------------------
+        // The mask value is loaded one position ahead, so the dead-cell test
+        // reads a register instead of waiting on a fresh load before every dot.
+        sycl::half mask_next = (maskh && ne11 > 0) ? maskh[j * stride_mask] : sycl::half(0.0f);
         for (int kv = 0; kv < ne11; ++kv) {
+            const sycl::half mask_cur = mask_next;
+            if (maskh && kv + 1 < ne11) {
+                mask_next = maskh[j * stride_mask + kv + 1];
+            }
+            // A dead cell is skipped, never weighted by 0: its K and V may be
+            // non-finite (see fattn_mask_is_dead). The mask is per (query, kv),
+            // so the branch is uniform across the sub-group.
+            if (maskh && fattn_mask_is_dead(mask_cur)) {
+                continue;
+            }
+
             const sycl::half * K_row = reinterpret_cast<const sycl::half*>(K_ptr + (int64_t)nb11 * kv);
 
             // Step 1: lane-local partial dot product Q · K[kv].
@@ -153,8 +167,7 @@ static void flash_attn_vec_f16_kernel(
             // Critical: use stride_mask (nb31/sizeof(half)) not ne30 — mask tensor may have
             // padding (GGML_KQ_MASK_PAD) so physical stride != logical column count.
             if (maskh) {
-                const float mask_val = static_cast<float>(maskh[j * stride_mask + kv]);
-                dot += slope * mask_val;
+                dot += slope * static_cast<float>(mask_cur);
             }
 
             // Step 5: online softmax update (all lanes see the same dot, so symmetric).
@@ -215,8 +228,7 @@ static void flash_attn_vec_f16_kernel(
 
         #pragma unroll
         for (int d = 0; d < D_PER_LANE; ++d) {
-            const float val = VKQ_partial[d] * inv_sum;
-            dst_row[d_base + d] = sycl::isfinite(val) ? val : 0.0f;
+            dst_row[d_base + d] = VKQ_partial[d] * inv_sum;
         }
     }
 }

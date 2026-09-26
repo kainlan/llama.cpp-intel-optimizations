@@ -32,6 +32,12 @@ inline float esimd_tanh(float x) {
     return (e2x - 1.0f) / (e2x + 1.0f);
 }
 
+// ESIMD-compatible fattn_exp_ftz: exp(diff), or 0 when the softmax
+// flush-to-zero applies. A NaN diff is never flushed (see fattn_ftz_flushes).
+inline float esimd_exp_ftz(float diff) {
+    return fattn_ftz_flushes(diff) ? 0.0f : esimd::exp(diff);
+}
+
 // ESIMD-compatible ALiBi slope computation
 // Uses exp(exph * log(base)) instead of dpct::pow which isn't supported in ESIMD
 inline float esimd_get_alibi_slope(const float    max_bias,
@@ -225,10 +231,14 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                     kv_len = pa_seq_lens[sequence];
                 }
 
-                // Compute this partition's KV range
+                // Compute this partition's KV range. Multi-token decode: a
+                // query attends only to KV positions <= its own, so the range
+                // ends there (q_pos is INT32_MAX otherwise); a partition past
+                // it is empty and the loop never prefetches beyond it.
                 const int kv_per_partition = (kv_len + ESIMD_PARTITIONS - 1) / ESIMD_PARTITIONS;
                 const int kv_start         = partition_id * kv_per_partition;
-                const int kv_end           = std::min(kv_start + kv_per_partition, kv_len);
+                const int kv_end           = (int) std::min<int64_t>(std::min(kv_start + kv_per_partition, kv_len),
+                                                                     (int64_t) q_pos - kv_base_pos + 1);
 
                 // Load query vector once and apply scale
                 // Native D-element vectors for all head dimensions (including D=64)
@@ -295,12 +305,17 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                     COMPUTE_KV_PTRS(kv_start, K_first, V_first);
                     k_prefetch = block_load<sycl::half, D>(K_first);
                     v_prefetch = block_load<sycl::half, D>(V_first);
+                    // The mask value rides the same one-ahead prefetch, so the
+                    // dead-cell test below reads a register instead of waiting
+                    // on a fresh load before every dot product.
+                    sycl::half mask_prefetch = mask_base ? mask_base[kv_start] : sycl::half(0.0f);
 
                     // Process this partition's KV positions with double-buffered K and V loading
                     for (int kv_pos = kv_start; kv_pos < kv_end; ++kv_pos) {
                         // Use prefetched K and V (already loaded from previous iteration)
-                        simd<float, D>      k_row   = convert<float>(k_prefetch);
-                        simd<sycl::half, D> v_row_h = v_prefetch;
+                        simd<float, D>      k_row    = convert<float>(k_prefetch);
+                        simd<sycl::half, D> v_row_h  = v_prefetch;
+                        const sycl::half    mask_val = mask_prefetch;
 
                         // Prefetch next K and V while we compute (if there is a next position)
                         if (kv_pos + 1 < kv_end) {
@@ -309,6 +324,27 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                             COMPUTE_KV_PTRS(kv_pos + 1, K_next, V_next);
                             k_prefetch = block_load<sycl::half, D>(K_next);
                             v_prefetch = block_load<sycl::half, D>(V_next);
+                            if (mask_base) {
+                                mask_prefetch = mask_base[kv_pos + 1];
+                            }
+                        }
+
+                        // A masked cell is skipped, never scored: its K and V
+                        // may be non-finite (see fattn_mask_is_dead), and the
+                        // online update below has no safe way to absorb a NaN
+                        // score or a 0 * NaN V term. The sequence-id predicate
+                        // below, and the causal bound on kv_end, mask the same
+                        // way the -inf mask does.
+                        if (mask_base && fattn_mask_is_dead(mask_val)) {
+                            continue;
+                        }
+                        // Continuous batching: a query attends only to KV of its
+                        // own sequence.
+                        if (q_seq >= 0 && kv_seq_ids) {
+                            const int32_t kv_seq = kv_seq_ids[kv_pos];
+                            if (kv_seq >= 0 && kv_seq != q_seq) {
+                                continue;
+                            }
                         }
 
                         // Compute dot product
@@ -322,37 +358,25 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
 
                         // Apply mask if present (with ALiBi slope)
                         if (mask_base) {
-                            score += slope * static_cast<float>(mask_base[kv_pos]);
-                        }
-
-                        // Multi-token decode: per-query position-based causal masking
-                        // Each query can only attend to KV positions <= its own position
-                        if (kv_base_pos + kv_pos > q_pos) {
-                            score = -FLT_MAX;
-                        }
-
-                        // Sequence ID masking: mask out KV positions from different sequences
-                        // Used in continuous batching to ensure queries only attend to KV from same sequence
-                        if (q_seq >= 0 && kv_seq_ids) {
-                            const int32_t kv_seq = kv_seq_ids[kv_pos];
-                            if (kv_seq >= 0 && kv_seq != q_seq) {
-                                score = -FLT_MAX;
-                            }
+                            score += slope * static_cast<float>(mask_val);
                         }
 
                         // Online softmax update - V was prefetched above
                         simd<float, D> v_row = convert<float>(v_row_h);
 
+                        // A NaN diff (a visible cell with a non-finite K) is
+                        // not flushed: it propagates as on the CPU (see
+                        // fattn_ftz_flushes).
                         if (score <= max_score) {
                             // Use FTZ threshold to avoid numerical issues
                             float diff      = score - max_score;
-                            float exp_score = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float exp_score = esimd_exp_ftz(diff);
                             acc_v           = acc_v + v_row * exp_score;
                             softmax_sum += exp_score;
                         } else {
                             // Use FTZ threshold to avoid numerical issues
                             float diff       = max_score - score;
-                            float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float exp_factor = esimd_exp_ftz(diff);
                             acc_v            = acc_v * exp_factor + v_row;
                             softmax_sum      = softmax_sum * exp_factor + 1.0f;
                             max_score        = score;
@@ -393,12 +417,12 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                         // Online softmax merge with FTZ threshold
                         if (p_max <= my_max) {
                             float diff       = p_max - my_max;
-                            float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float exp_factor = esimd_exp_ftz(diff);
                             my_acc           = my_acc + p_acc * exp_factor;
                             my_sum += p_sum * exp_factor;
                         } else {
                             float diff       = my_max - p_max;
-                            float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float exp_factor = esimd_exp_ftz(diff);
                             my_acc           = my_acc * exp_factor + p_acc;
                             my_sum           = my_sum * exp_factor + p_sum;
                             my_max           = p_max;
@@ -423,18 +447,21 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
                         const float sink         = sinks_ptr[head];
                         const float new_max      = std::max(sink, final_max);
                         float       diff         = final_max - new_max;
-                        float       max_scale    = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                        float       max_scale    = esimd_exp_ftz(diff);
                         float       sink_softmax = esimd::exp(sink - new_max);
                         final_acc                = final_acc * max_scale;
                         final_sum                = final_sum * max_scale + sink_softmax;
                         final_max                = new_max;
                     }
 
-                    // Final normalization and output
-                    if (final_sum > 0.0f) {
-                        simd<float, D> result = final_acc / final_sum;
-                        block_store(out_base, result);
+                    // Final normalization and output. A row with no visible
+                    // cell (S == 0) is written as 0, like the CPU reference;
+                    // leaving dst unwritten would return stale memory.
+                    simd<float, D> result = 0.0f;
+                    if (final_sum != 0.0f) {
+                        result = final_acc / final_sum;
                     }
+                    block_store(out_base, result);
                 }
 
 #    undef COMPUTE_KV_PTRS
@@ -683,7 +710,7 @@ void launch_fattn_esimd_f16(const fattn_params & params, sycl::queue & stream) {
 
                     // Rescale previous accumulator with FTZ threshold
                     float diff_val   = max_score - new_max;
-                    float exp_factor = diff_val >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff_val) : 0.0f;
+                    float exp_factor = esimd_exp_ftz(diff_val);
                     acc_v            = acc_v * exp_factor;
                     softmax_sum *= exp_factor;
                     max_score = new_max;
@@ -693,7 +720,7 @@ void launch_fattn_esimd_f16(const fattn_params & params, sycl::queue & stream) {
                     simd<float, ESIMD_GS> exp_scores;
 #    pragma unroll
                     for (int r = 0; r < ESIMD_GS; ++r) {
-                        exp_scores[r] = scores_diff[r] >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(scores_diff[r]) : 0.0f;
+                        exp_scores[r] = esimd_exp_ftz(scores_diff[r]);
                     }
 
 #    pragma unroll
@@ -783,12 +810,12 @@ void launch_fattn_esimd_f16(const fattn_params & params, sycl::queue & stream) {
 
                         if (score <= max_score) {
                             float diff      = score - max_score;
-                            float exp_score = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float exp_score = esimd_exp_ftz(diff);
                             acc_v           = acc_v + v_float * exp_score;
                             softmax_sum += exp_score;
                         } else {
                             float diff       = max_score - score;
-                            float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float exp_factor = esimd_exp_ftz(diff);
                             acc_v            = acc_v * exp_factor + v_float;
                             softmax_sum      = softmax_sum * exp_factor + 1.0f;
                             max_score        = score;
@@ -803,7 +830,7 @@ void launch_fattn_esimd_f16(const fattn_params & params, sycl::queue & stream) {
                     const float sink         = sinks_ptr[head];
                     const float new_max      = std::max(sink, max_score);
                     float       diff         = max_score - new_max;
-                    float       max_scale    = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                    float       max_scale    = esimd_exp_ftz(diff);
                     float       sink_softmax = esimd::exp(sink - new_max);
                     acc_v                    = acc_v * max_scale;
                     softmax_sum              = softmax_sum * max_scale + sink_softmax;
@@ -1066,6 +1093,15 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                         if (q_idx >= ne01)
                             continue;
 
+                        // mask_base points to (sequence, head, ic0), so use j
+                        // (local query offset) not q_idx. A masked cell is
+                        // skipped for this query, never scored: its K and V
+                        // may be non-finite (see fattn_mask_is_dead).
+                        const sycl::half * mask_row = mask_base ? mask_base + j * stride_mask : nullptr;
+                        if (mask_row && fattn_mask_is_dead(mask_row[kv_pos])) {
+                            continue;
+                        }
+
                         // Compute Q @ K dot product
                         float score;
                         if constexpr (D == 128) {
@@ -1086,23 +1122,23 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                         }
 
                         // Apply mask if present
-                        // mask_base points to (sequence, head, ic0), so use j (local query offset) not q_idx
-                        if (mask_base) {
-                            const sycl::half * mask_row = mask_base + j * stride_mask;
+                        if (mask_row) {
                             score += static_cast<float>(mask_row[kv_pos]);
                         }
 
-                        // Online softmax update
+                        // Online softmax update. A NaN diff (a visible cell
+                        // with a non-finite K) is not flushed: it propagates as
+                        // on the CPU (see fattn_ftz_flushes).
                         if constexpr (D == 128) {
                             if (score <= max_score[j]) {
                                 float diff      = score - max_score[j];
-                                float exp_score = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                float exp_score = esimd_exp_ftz(diff);
                                 acc_v_h1[j]     = acc_v_h1[j] + v_vec_h1 * exp_score;
                                 acc_v_h2[j]     = acc_v_h2[j] + v_vec_h2 * exp_score;
                                 softmax_sum[j] += exp_score;
                             } else {
                                 float diff       = max_score[j] - score;
-                                float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                float exp_factor = esimd_exp_ftz(diff);
                                 acc_v_h1[j]      = acc_v_h1[j] * exp_factor + v_vec_h1;
                                 acc_v_h2[j]      = acc_v_h2[j] * exp_factor + v_vec_h2;
                                 softmax_sum[j]   = softmax_sum[j] * exp_factor + 1.0f;
@@ -1111,12 +1147,12 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                         } else {
                             if (score <= max_score[j]) {
                                 float diff      = score - max_score[j];
-                                float exp_score = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                float exp_score = esimd_exp_ftz(diff);
                                 acc_v[j]        = acc_v[j] + v_vec * exp_score;
                                 softmax_sum[j] += exp_score;
                             } else {
                                 float diff       = max_score[j] - score;
-                                float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                float exp_factor = esimd_exp_ftz(diff);
                                 acc_v[j]         = acc_v[j] * exp_factor + v_vec;
                                 softmax_sum[j]   = softmax_sum[j] * exp_factor + 1.0f;
                                 max_score[j]     = score;
@@ -1195,13 +1231,13 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                             if constexpr (D == 128) {
                                 if (p_max <= final_max) {
                                     float diff       = p_max - final_max;
-                                    float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                    float exp_factor = esimd_exp_ftz(diff);
                                     final_acc_h1     = final_acc_h1 + p_acc_h1 * exp_factor;
                                     final_acc_h2     = final_acc_h2 + p_acc_h2 * exp_factor;
                                     final_sum += p_sum * exp_factor;
                                 } else {
                                     float diff       = final_max - p_max;
-                                    float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                    float exp_factor = esimd_exp_ftz(diff);
                                     final_acc_h1     = final_acc_h1 * exp_factor + p_acc_h1;
                                     final_acc_h2     = final_acc_h2 * exp_factor + p_acc_h2;
                                     final_sum        = final_sum * exp_factor + p_sum;
@@ -1211,12 +1247,12 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                                 // Native D-element merge for D=64 and all other D
                                 if (p_max <= final_max) {
                                     float diff       = p_max - final_max;
-                                    float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                    float exp_factor = esimd_exp_ftz(diff);
                                     final_acc        = final_acc + p_acc * exp_factor;
                                     final_sum += p_sum * exp_factor;
                                 } else {
                                     float diff       = final_max - p_max;
-                                    float exp_factor = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                                    float exp_factor = esimd_exp_ftz(diff);
                                     final_acc        = final_acc * exp_factor + p_acc;
                                     final_sum        = final_sum * exp_factor + p_sum;
                                     final_max        = p_max;
@@ -1229,7 +1265,7 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                             const float sink         = sinks_ptr[head];
                             const float new_max      = std::max(sink, final_max);
                             float       diff         = final_max - new_max;
-                            float       max_scale    = diff >= SOFTMAX_FTZ_THRESHOLD ? esimd::exp(diff) : 0.0f;
+                            float       max_scale    = esimd_exp_ftz(diff);
                             float       sink_softmax = esimd::exp(sink - new_max);
                             if constexpr (D == 128) {
                                 final_acc_h1 = final_acc_h1 * max_scale;
@@ -1255,22 +1291,30 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                         }
 #    endif
 
-                        if (final_sum > 0.0f) {
-                            if constexpr (D == 128) {
-                                simd<float, 64> result_h1 = final_acc_h1 / final_sum;
-                                simd<float, 64> result_h2 = final_acc_h2 / final_sum;
-                                block_store<float, 64>(out_ptr, result_h1);
-                                block_store<float, 64>(out_ptr + 64, result_h2);
-                            } else {
-                                // Native D-element store for D=64 and all other D
-                                simd<float, D> result = final_acc / final_sum;
-                                block_store(out_ptr, result);
-#    if ESIMD_BATCHED_DEBUG
-                                if (head == 0 && sequence == 0) {
-                                    sycl::ext::oneapi::experimental::printf("[STORE_DONE] q_idx=%d\n", q_idx);
-                                }
-#    endif
+                        // A row with no visible cell (S == 0) is written as 0,
+                        // like the CPU reference; leaving dst unwritten would
+                        // return stale memory.
+                        if constexpr (D == 128) {
+                            simd<float, 64> result_h1 = 0.0f;
+                            simd<float, 64> result_h2 = 0.0f;
+                            if (final_sum != 0.0f) {
+                                result_h1 = final_acc_h1 / final_sum;
+                                result_h2 = final_acc_h2 / final_sum;
                             }
+                            block_store<float, 64>(out_ptr, result_h1);
+                            block_store<float, 64>(out_ptr + 64, result_h2);
+                        } else {
+                            // Native D-element store for D=64 and all other D
+                            simd<float, D> result = 0.0f;
+                            if (final_sum != 0.0f) {
+                                result = final_acc / final_sum;
+                            }
+                            block_store(out_ptr, result);
+#    if ESIMD_BATCHED_DEBUG
+                            if (head == 0 && sequence == 0) {
+                                sycl::ext::oneapi::experimental::printf("[STORE_DONE] q_idx=%d\n", q_idx);
+                            }
+#    endif
                         }
                     }
                 }
