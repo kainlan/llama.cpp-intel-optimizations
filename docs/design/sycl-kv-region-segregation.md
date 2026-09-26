@@ -1249,7 +1249,10 @@ prompt-processing performance, never correctness, and the yield WARN names them.
 4. **Every predictable refusal, before any yield.** After this step, only a runtime shortfall
    or a lost race can change the outcome.
    - The non-FA scratch check (jehw `:18187-18246`) and the publication-ID check (jehw `:18351`)
-     move here.
+     move here. The non-FA check, with its shape recording and its SCRATCH raise, runs only for
+     a context whose tenants are not planned (`!tenants_planned`, a flag only zhcn's MEASURE
+     sets). Under a plan the KQ chunk and the `context-nonfa-stage` slots are already head slots
+     of step 2's fit, so the check would count them twice (zhcn §3.8 row 21, its gate 32).
    - The ring has no separate "does not fit" refusal (u1bb `:18388`) and no budget-room check
      (u1bb `:18362`, deleted, r4 I7): its slots are head slots of step 2's fit.
    - Nothing after the yield can fail for a runtime reason (rulings §M7 I-5, §E.2). The MMID
@@ -1459,13 +1462,16 @@ contribution. It never re-fits KV and never yields.
   coverage query are read-only and run before (s); (s) runs only on the growth path, after L0;
   and it completes before (c)'s occupancy check and move-out and before any reap or release.
 
-  A queue added later must join the list. If one is missed, (d)'s backstop makes the miss a loud
-  `[CONTEXT-PLAN-BUG]`, never a free under queued work. **Nothing between (s) and (d) publishes
-  a retention whose event postdates (s) (r6 m-2):** (a)'s own-context clear submits no device
-  work (its per-context input-staging reset, `graph_input_staging_clear`, ignores its queue:
-  `common.hpp:6457-6460` at `3d9414c8c`); A4's gallocr free takes the queue's last event and
-  submits no barrier (§2.3.2); and the record-mode vacate's marker is a claim-state event that
-  retains nothing (§2.3.2).
+  The list is zhcn's gate 30 (the queue census). The between-graph scatter lists,
+  `g_pending_secondary_scatter` and `g_pipeline_scatter`, hold compute slices, but zhcn flushes
+  them at every `graph_compute` exit and drains them in its step 3 (zhcn C2t), so neither needs
+  a queue wait of its own. A queue added later must join the list. If one is missed, (d)'s
+  backstop makes the miss a loud `[CONTEXT-PLAN-BUG]`, never a free under queued work. **Nothing
+  between (s) and (d) publishes a retention whose event postdates (s) (r6 m-2):** (a)'s
+  own-context clear submits no device work (its per-context input-staging reset,
+  `graph_input_staging_clear`, ignores its queue: `common.hpp:6457-6460` at `3d9414c8c`); A4's
+  gallocr free takes the queue's last event and submits no barrier (§2.3.2); and the record-mode
+  vacate's marker is a claim-state event that retains nothing (§2.3.2).
 - **(0) Probe, then hold its placements (rulings §M7 I-3(b), I-5(a)).** zhcn's measure pass has
   already sized the candidate's tenants. A fit places the candidate's head slots on the live
   geometry, with two kinds of room counted free **by arithmetic only**: the context's current
@@ -1659,6 +1665,10 @@ contribution. It never re-fits KV and never yields.
     `done_events[slot]` takes the same backstop (query; an incomplete event is waited, counted
     in the same BUG line and counter, never freed early), and then the retention is dropped.
     They are never held in the batch across (e).
+
+    **The request's owner vector dies at the end of (d)** (zhcn §3.8 row 20). Its `owners` are
+    `mem_handle`s, one reference each, so it is destroyed after the reap and the backstop and
+    before (e). If it lived longer, every (e) `use_count() == 1` check would read 2.
   - **(e) The use-count check (rulings §B step 10; r6 I-3; rulings §M7 I-3).** With no lock
     held, on the local batch (the table was checked and opened at (c)):
     - each moved-out CONTEXT tenant handle must have `use_count() == 1`, the batch's own
@@ -1855,8 +1865,11 @@ records; the only record moua produces is the recurrent state's.
 - **llama.cpp-zhcn:** the device compute chunks (per SYCL device buft, one slot per measured
   gallocr chunk, the K-shift and post-update graphs included) and the fattn K/V materialize
   slot, cohorts `context-compute` and `context-fattn-materialize`, CONTEXT scope, and the host
-  compute buffer, cohort `context-compute-host` (below). The sizes come from zhcn's pre-publish
-  measure pass and travel in the descriptor's tenant section (§2.4.4). zhcn also deletes u1bb's
+  compute buffer, cohort `context-compute-host` (below); and the `context-graph-stage` cohort
+  (zhcn §2.9, 1oxa's W7 staging tail, assigned to zhcn by the lead), a device head-slot index
+  set with eager and record-mode (rulings §REC) sets, which (ii) carves like the other tenants
+  (zhcn §3.8 row 28). The sizes come from zhcn's pre-publish measure pass and travel in the
+  descriptor's tenant section (§2.4.4). zhcn also deletes u1bb's
   `k_pp_moe_ring_compute_reserve_bytes_per_row` (lead ruling 3).
 - **llama.cpp-beni** (split from 23mk, lead ruling on 23mk's Q3; ticket comment c-khaj): the
   `graph_input_stage` per-context slab, the oneDNN activation scratch, `mmvq_q8_slab` (merging
@@ -2980,12 +2993,13 @@ L7 documents this limit, and pattern #2 remains the remedy.
     `unified-cache.cpp:14921`) is fail-open by default for every `must_device` role without
     `forbid_vram_zone_spill`. gxur flips that default after 23mk and moua L6 land.
 - **The non-FA outside-arena reserve (r3 I8 note).** The transaction's non-FA scratch check
-  compares against an EMPIRICAL 928 MiB constant, `unified_cache_nonfa_attn_outside_arena_reserve_bytes()`
-  (jehw `ggml-sycl.cpp:18187-18246`, the constant's comment at `:18198-18224`). It is an
-  estimate of consumers outside the arena, not a context-side demand, so it is not
-  `transient_reserve`'s successor and H7p does not cover it. It is pre-existing and belongs to
-  23mk/zhcn (and llama.cpp-k1ev for the unattributed part). moua only moves the check before the
-  yield (§2.4.2 step 4).
+  compares against an EMPIRICAL 928 MiB constant,
+  `unified_cache_nonfa_attn_outside_arena_reserve_bytes()` (jehw `ggml-sycl.cpp:18187-18246`,
+  the constant's comment at `:18198-18224`). It is an estimate of consumers outside the arena,
+  not a context-side demand, so it is not `transient_reserve`'s successor and H7p does not cover
+  it. It is pre-existing and belongs to 23mk/zhcn (and llama.cpp-k1ev for the unattributed
+  part). moua only moves the check before the yield (§2.4.2 step 4), where it runs only for an
+  unplanned context (`!tenants_planned`), so the constant serves only unplanned contexts.
 - The fattn-onednn.cpp:1011 `< 2^47` host-pointer heuristic is 1oxa's phase 1. moua's
   regions are USM device memory and are unaffected.
 
@@ -4472,3 +4486,15 @@ design-moua-r7 found 0 Critical, 7 Important and 11 Minor. The lead ruled in rul
   the whole load and needs a callback clause in the deadlock rule.
 - The MMID host pool is held by the model's MMID entry, not a context's reservation, because
   the workspaces are keyed by the model token.
+
+**zhcn rev 5.2 (`014abd5`) and 5.3 (`b171100`, `6afd110`) §3.8 rows, checked against 7.6.**
+
+| row | delta | disposition |
+|-----|-------|-------------|
+| 13 | §B.2 supersedes §B.1 | **Present** since 7.5. |
+| 19 | §D15 held host reservation | **Present** (§2.4.3): one carve, host slots are slices at the maximum caps, a larger need is refused by arithmetic. zhcn's D20.1 (warmup is an ordinary setter, no warmup term) matches "the setters and warmup are not ladder candidates". |
+| 20 | the (d) owner vector dies before (e) | **Adopted** (§2.4.2 (d)). |
+| 21 | the moved non-FA check runs only for `!tenants_planned` | **Adopted** (§2.4.2 step 4, §2.11). |
+| 22 | cite gate 30; the scatter lists need no wait (C2t) | **Adopted** (§2.4.2 (s)). |
+| 24, 25, 27 | §M7 I-3, I-5(a), I-7 | **Present** in 7.6. zhcn aligns to 7.6's covered path (no L0, no writes, the coverage query), the table opening at (c), and (0)'s pending ranges in its r5 round. |
+| 28 | the `context-graph-stage` cohort | **Adopted** (§2.4.3 producers): a device head-slot index set with eager and record sets, carved by (ii). |
