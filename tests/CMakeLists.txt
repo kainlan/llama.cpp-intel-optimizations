@@ -967,6 +967,106 @@ if (NOT WIN32)
     )
 endif()
 
+# llama.cpp-vuy0: the SYCL device-link launcher (private TMPDIR removed on
+# exit or signal, toolchain-keyed ocloc cache, inventory recorder), exercised
+# against a mock compiler and ocloc; the list-only report of temporaries
+# earlier, unwrapped links stranded; sycl-build.sh's multi-target build and
+# private TMPDIR, against a mock cmake; the device-image inventory comparison;
+# and a check on the generated Ninja files
+# that every device-linking edge actually runs under that launcher and pool.
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME test-sycl-device-link-launcher
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-link-launcher.sh
+    )
+    set_tests_properties(test-sycl-device-link-launcher PROPERTIES
+        LABELS "sycl;build;hostonly"
+        TIMEOUT 60
+    )
+    llama_test_cmd(
+        bash
+        NAME test-sycl-tmp-leak-report
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-tmp-leak-report.sh
+    )
+    # Scans all of /proc twice; 33 s measured at load 51.
+    set_tests_properties(test-sycl-tmp-leak-report PROPERTIES
+        LABELS "sycl;build;hostonly"
+        TIMEOUT 180
+    )
+    llama_test_cmd(
+        bash
+        NAME test-sycl-build-targets
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-build-targets.sh
+    )
+    set_tests_properties(test-sycl-build-targets PROPERTIES
+        LABELS "sycl;build;hostonly"
+        TIMEOUT 30
+    )
+    llama_test_cmd(
+        bash
+        NAME test-sycl-device-image-inventory
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-image-inventory.sh
+    )
+    set_tests_properties(test-sycl-device-image-inventory PROPERTIES
+        LABELS "sycl;build;hostonly"
+        TIMEOUT 30
+    )
+endif()
+# Embedded in a parent project, the device-link routing must leave the
+# parent's own targets alone. Configures small fixtures with the host C
+# compiler; the routing module needs CMake 3.21, as in ggml-sycl.
+if (NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+    llama_test_cmd(
+        bash
+        NAME test-sycl-device-link-embedding
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-link-embedding.sh
+             "${CMAKE_COMMAND}" "${CMAKE_GENERATOR}" "${CMAKE_MAKE_PROGRAM}"
+    )
+    set_tests_properties(test-sycl-device-link-embedding PROPERTIES
+        LABELS "sycl;build;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+endif()
+if (GGML_SYCL AND NOT WIN32 AND CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Interpreter_FOUND)
+    add_test(NAME test-sycl-device-link-routing
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-link-routing.py ${CMAKE_BINARY_DIR})
+    set_tests_properties(test-sycl-device-link-routing PROPERTIES
+        LABELS "sycl;build;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+    # Tests that read repo sources must find the tree without an absolute
+    # __FILE__, which ccache base_dir (opt-in, GGML_SYCL_CCACHE_BASE_DIR=1)
+    # takes away (llama.cpp-vuy0).
+    add_test(NAME test-sycl-source-root-anchor
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-source-root-anchor.py ${CMAKE_BINARY_DIR})
+    set_tests_properties(test-sycl-source-root-anchor PROPERTIES
+        LABELS "sycl;build;hostonly;source-contract"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+endif()
+# The commit id and build number must stay off every edge command that does not
+# need them, or each commit reruns those edges (llama.cpp-vuy0). The script
+# reads build.ninja, so single-config Ninja only, and it checks ggml-base's
+# compiles, which a LLAMA_USE_SYSTEM_GGML build does not have.
+if (CMAKE_GENERATOR STREQUAL "Ninja" AND NOT LLAMA_USE_SYSTEM_GGML AND Python3_Interpreter_FOUND)
+    add_test(NAME test-build-info-scope
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-build-info-scope.py ${CMAKE_BINARY_DIR})
+    set_tests_properties(test-build-info-scope PROPERTIES
+        LABELS "build;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+endif()
+
 if (NOT WIN32)
     llama_test_cmd(
         bash
@@ -2575,6 +2675,29 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         TIMEOUT 300
     )
 
+    # test-sycl-optional-layout-yield: a yield of optional layout copies must
+    # hand their bytes back to the zone KV admission re-reads, pass over a
+    # leased copy, and never touch a primary -- on a real device cache, with no
+    # model loaded. Its memory cost has not been measured yet, so it carries
+    # `cache` and stays out of the throttled sweep until it is (see the label
+    # note on the gate above).
+    llama_build(test-sycl-optional-layout-yield.cpp)
+    target_include_directories(test-sycl-optional-layout-yield PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-optional-layout-yield PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-optional-layout-yield PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-optional-layout-yield PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-optional-layout-yield PRIVATE "-fsycl")
+        target_link_options(test-sycl-optional-layout-yield PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-optional-layout-yield LABEL "main")
+    set_tests_properties(test-sycl-optional-layout-yield PROPERTIES
+        LABELS "sycl;cache;lease"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        TIMEOUT 300
+    )
+
     # test-sycl-model-lifecycle-hooks: the weight-ownership hooks must actually
     # be INVOKED on a real llama_model load and teardown (llama.cpp-viga).
     #
@@ -2785,6 +2908,12 @@ if(GGML_SYCL)
         ${PROJECT_SOURCE_DIR}/ggml/src)
     target_compile_definitions(test-sycl-fattn-onednn-gates PRIVATE
         $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    # Absolute repo root for the source-reading gates: when scripts/sycl-build.sh
+    # runs ccache with base_dir (opt-in, GGML_SYCL_CCACHE_BASE_DIR=1) __FILE__ is
+    # relative to the build directory, and this binary is install()ed and run
+    # from anywhere (llama.cpp-vuy0).
+    target_compile_definitions(test-sycl-fattn-onednn-gates PRIVATE
+        LLAMA_CPP_SOURCE_ROOT="${PROJECT_SOURCE_DIR}")
     target_compile_options(test-sycl-fattn-onednn-gates PRIVATE "-fsycl" "-Wno-narrowing")
     target_link_options(test-sycl-fattn-onednn-gates PRIVATE "-fsycl")
     install(TARGETS test-sycl-fattn-onednn-gates RUNTIME)
@@ -3161,6 +3290,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# llama.cpp-je3b: source gate -- "may oneDNN PP run here" has one source,
+# ggml_sycl_onednn_pp_candidate. The MXFP4 direct oneDNN arms ask it (with the
+# MXFP4_DIRECT route, which moves only the batch floor) instead of admitting
+# themselves with M >= 2 && executable_on_device. Host-only, reads the sources
+# as text. Same registration shape as test-sycl-onednn-woq-q8-source.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-onednn-pp-admission-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-onednn-pp-admission-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
 # llama.cpp-pktr: source gate -- the Q8_0 dense-weight coalesced/SOA
 # tile-alignment predicate must be defined exactly once
 # (q8-dense-layout-rule.hpp) and every chokepoint that resolves a dense Q8_0
@@ -3270,6 +3412,19 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-ubatch-ring-replan-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-ubatch-ring-replan-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-u1bb: source gate for how the runtime transaction grows the PP MoE
+# oneDNN ring past the RUNTIME zone into the shared KV zone's post-KV headroom
+# (after KV, against the one live KV capacity, charged, never spilling). The
+# admission arithmetic itself is host-tested by test-pp-moe-ring-admission.
+# Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-pp-moe-ring-kv-zone-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-pp-moe-ring-kv-zone-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()

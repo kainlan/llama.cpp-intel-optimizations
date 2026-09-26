@@ -385,16 +385,16 @@ static decltype(&ggml_backend_sycl_ubatch_cache_path) llama_context_sycl_ubatch_
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_path"));
 }
 
-static decltype(&ggml_backend_sycl_ubatch_cache_lookup) llama_context_sycl_ubatch_cache_lookup_proc(
+static decltype(&ggml_backend_sycl_ubatch_cache_lookup_layout1) llama_context_sycl_ubatch_cache_lookup_proc(
     ggml_backend_dev_t dev) {
-    return reinterpret_cast<decltype(&ggml_backend_sycl_ubatch_cache_lookup)>(
-        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_lookup"));
+    return reinterpret_cast<decltype(&ggml_backend_sycl_ubatch_cache_lookup_layout1)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_lookup_layout1"));
 }
 
-static decltype(&ggml_backend_sycl_ubatch_cache_store) llama_context_sycl_ubatch_cache_store_proc(
+static decltype(&ggml_backend_sycl_ubatch_cache_store_layout1) llama_context_sycl_ubatch_cache_store_proc(
     ggml_backend_dev_t dev) {
-    return reinterpret_cast<decltype(&ggml_backend_sycl_ubatch_cache_store)>(
-        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_store"));
+    return reinterpret_cast<decltype(&ggml_backend_sycl_ubatch_cache_store_layout1)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_store_layout1"));
 }
 #endif
 
@@ -1635,8 +1635,8 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
 #    ifdef GGML_USE_SYCL
     auto cache_enabled_fn = &ggml_backend_sycl_ubatch_cache_enabled;
     auto cache_path_fn    = &ggml_backend_sycl_ubatch_cache_path;
-    auto cache_lookup_fn  = &ggml_backend_sycl_ubatch_cache_lookup;
-    auto cache_store_fn   = &ggml_backend_sycl_ubatch_cache_store;
+    auto cache_lookup_fn  = &ggml_backend_sycl_ubatch_cache_lookup_layout1;
+    auto cache_store_fn   = &ggml_backend_sycl_ubatch_cache_store_layout1;
 #    else
     auto cache_enabled_fn = llama_context_sycl_ubatch_cache_enabled_proc(first_dev);
     auto cache_path_fn    = llama_context_sycl_ubatch_cache_path_proc(first_dev);
@@ -1645,39 +1645,37 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
 #    endif
     const bool have_cache_accessors = cache_enabled_fn && cache_path_fn && cache_lookup_fn && cache_store_fn;
 
-    // llama.cpp-7n6n: FNV-1a 32-bit hash over the
-    // ORDERED dev_index sequence of every SYCL backend this context has --
-    // see ggml_sycl_ubatch_cache_key::device_set_hash's own comment
-    // (ggml-sycl.h) for why `cache_key.device` (the FIRST device only) is
-    // not enough to tell a single-GPU run from a multi-GPU run that happens
-    // to start with the same device.
-    uint32_t device_set_hash = 0x811c9dc5u;  // FNV-1a 32-bit offset basis
+    // The ORDERED dev_index of every SYCL backend this context has. This is
+    // not the whole participating set: a collapsed multi-GPU run has one
+    // backend here while the planner also uses a hidden GPU, so the backend
+    // extends it (see ggml_sycl_ubatch_cache_key's comment, ggml-sycl.h).
+    std::vector<int> cache_devices;
+    cache_devices.reserve(sycl_backends.size());
     for (auto & sb : sycl_backends) {
-        device_set_hash ^= static_cast<uint32_t>(sb.dev_index);
-        device_set_hash *= 0x01000193u;  // FNV-1a 32-bit prime
+        cache_devices.push_back(sb.dev_index);
     }
 
     ggml_sycl_ubatch_cache_key cache_key{};
-    cache_key.device          = sycl_backends.front().dev_index;
-    cache_key.model_name      = model.name.c_str();
-    cache_key.model_size      = model.size();
-    cache_key.model_hash      = llama_context_sycl_model_tensor_hash(model);
-    cache_key.n_ctx           = cparams.n_ctx;
-    cache_key.n_batch         = cparams.n_batch;
-    cache_key.flash_attn      = cparams.flash_attn;
+    cache_key.devices    = cache_devices.data();
+    cache_key.n_devices  = static_cast<uint32_t>(cache_devices.size());
+    cache_key.model_name = model.name.c_str();
+    cache_key.model_size = model.size();
+    cache_key.model_hash = llama_context_sycl_model_tensor_hash(model);
+    cache_key.n_ctx      = cparams.n_ctx;
+    cache_key.n_batch    = cparams.n_batch;
+    cache_key.flash_attn = cparams.flash_attn;
     // llama.cpp-3aos: two contexts differing only in kv_unified need
     // different auto n_ubatch candidates once KV sizing depends on it
     // (kv_layer_bytes_for_kind(), unified-cache.hpp) -- must not share a
     // cache entry (CACHE_VERSION 3, ggml-sycl.h's struct comment).
-    cache_key.kv_unified      = cparams.kv_unified;
+    cache_key.kv_unified = cparams.kv_unified;
     // llama.cpp-uajm: swa_full changes every SWA layer's KV bytes (sized as
     // FULL when set), so a CLI run (false) and a raw-API context (true)
     // must not share one cache entry either (CACHE_VERSION 4).
-    cache_key.swa_full        = cparams.swa_full;
-    cache_key.n_seq_max       = cparams.n_seq_max;
-    cache_key.type_k          = static_cast<int32_t>(type_k);
-    cache_key.type_v          = static_cast<int32_t>(type_v);
-    cache_key.device_set_hash = device_set_hash;
+    cache_key.swa_full   = cparams.swa_full;
+    cache_key.n_seq_max  = cparams.n_seq_max;
+    cache_key.type_k     = static_cast<int32_t>(type_k);
+    cache_key.type_v     = static_cast<int32_t>(type_v);
 
     // llama.cpp-7n6n: the sentinel below is the ONLY
     // arm that can reach the tuning-cache WARN with an empty parenthetical
@@ -1689,7 +1687,7 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // cache_path_buf at its ORIGINAL sentinel value, not a partially-written
     // one, since the accessor itself never touches the buffer on failure.
     char cache_path_buf[512] = "(no cache accessor in this backend build)";
-    if (have_cache_accessors && !cache_path_fn(cache_key.device, cache_path_buf, sizeof(cache_path_buf))) {
+    if (have_cache_accessors && !cache_path_fn(cache_devices.front(), cache_path_buf, sizeof(cache_path_buf))) {
         std::strncpy(cache_path_buf, "(cache path unavailable)", sizeof(cache_path_buf) - 1);
         cache_path_buf[sizeof(cache_path_buf) - 1] = '\0';
     }

@@ -240,7 +240,7 @@ def test_replan_call_has_a_mutation_witness():
     raw = GGML_SYCL_CPP
     call_block = (
         "    const ggml_sycl_ring_replan_result ring_replan_result =\n"
-        "        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode);\n"
+        "        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone);\n"
         "    if (ring_replan_result == ggml_sycl_ring_replan_result::RELEASE_REFUSED) {\n"
         "        // refusal already logged (ERROR normally, INFO in probe mode)\n"
         '        return busy("busy (PP MoE oneDNN scratch ring claimed by an in-flight dispatch)");\n'
@@ -249,7 +249,7 @@ def test_replan_call_has_a_mutation_witness():
         "        // refusal already logged (ERROR normally, INFO in probe mode) with\n"
         "        // the largest fitting -ub\n"
         '        return refuse("PP MoE oneDNN scratch ring does not fit");\n'
-        "    }\n\n"
+        "    }\n"
     )
     assert call_block in raw, "mutation target block not found -- update this witness to match the real source"
     mutated_raw = raw.replace(call_block, "", 1)
@@ -471,15 +471,17 @@ def test_replan_is_idempotent_and_skips_dense_models():
     calling reserve -- the first because there is nothing to re-plan, the
     second so a transaction re-run at an unchanged n_ubatch (e.g. the narrow
     flash-attn re-check path) is a no-op rather than repeating the
-    ceiling-raise/reserve dance every time."""
+    ceiling-raise/reserve dance every time. The one exception is a KV re-fit
+    that counted the ring's KV-zone slots as free (kv_zone->readmit,
+    llama.cpp-u1bb): the ring must then be re-admitted after KV."""
     body_norm = _normalize_ws(_replan_ring_fn_body())
     ok_return = r"return\s+ggml_sycl_ring_replan_result::OK\s*;"
     assert re.search(
         r"if\s*\(\s*weight_slot_bytes\s*==\s*0\s*\)\s*\{\s*" + ok_return, body_norm
     ), "weight_slot_bytes == 0 (dense model) must return OK immediately, before any reserve attempt"
     assert re.search(
-        r"if\s*\(\s*n_ubatch\s*==\s*ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch\(device\)\s*\)\s*"
-        r"\{\s*" + ok_return,
+        r"if\s*\(\s*n_ubatch\s*==\s*ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch\(device\)\s*&&\s*"
+        r"!\(kv_zone\s*&&\s*kv_zone->readmit\)\s*\)\s*\{\s*" + ok_return,
         body_norm,
     ), (
         "n_ubatch already equal to the planned n_ubatch must return OK immediately (idempotent re-plan)"
@@ -648,7 +650,7 @@ def test_replan_guards_n_ubatch_zero():
     assert guard_match is not None, "the re-plan must explicitly guard n_ubatch == 0"
 
     idempotence_idx = body_norm.find(
-        "if (n_ubatch == ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device))", guard_match.start()
+        "if (n_ubatch == ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device)", guard_match.start()
     )
     assert idempotence_idx != -1 and idempotence_idx > guard_match.start(), (
         "could not bound the n_ubatch==0 guard's own if-block (looked for the idempotence check just after it)"
@@ -843,10 +845,14 @@ def test_replan_refuses_before_reserving_when_ring_exceeds_runtime_zone():
     acceptance)."""
     body_norm = _normalize_ws(_replan_ring_fn_body())
 
-    guard_match = re.search(r"if\s*\(\s*arena\s*&&\s*needed_total\s*>\s*capacity_bytes\s*\)\s*\{", body_norm)
+    # llama.cpp-u1bb: the arena guard is the ring admission's answer. The
+    # weight slots must fit the RUNTIME zone; an ubatch-scaled slot kind that
+    # does not goes to the shared KV zone only when its post-KV headroom
+    # admits it -- still never outside the arena.
+    guard_match = re.search(r"if\s*\(\s*arena\s*&&\s*!\s*admission\.admit\s*\)\s*\{", body_norm)
     assert guard_match is not None, (
-        "the re-plan must have a guard refusing when the new ring's needed_total exceeds capacity_bytes on "
-        "the arena route (`if (arena && needed_total > capacity_bytes)`)"
+        "the re-plan must have a guard refusing a ring the admission does not admit on the arena route "
+        "(`if (arena && !admission.admit)`)"
     )
 
     release_idx = body_norm.find("cache->release_pp_moe_onednn_scratch_ring()")
@@ -873,7 +879,7 @@ def test_replan_guard_has_a_mutation_witness():
     current, correct source."""
     raw = GGML_SYCL_CPP
     guard_block = (
-        "    if (arena && needed_total > capacity_bytes) {\n"
+        "    if (arena && !admission.admit) {\n"
         "        return refuse_and_restore();\n"
         "    }\n\n"
     )
@@ -882,7 +888,7 @@ def test_replan_guard_has_a_mutation_witness():
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _REPLAN_START, _RUNTIME_CONTEXT_START)
-    assert not re.search(r"if\s*\(\s*arena\s*&&\s*needed_total\s*>\s*capacity_bytes\s*\)", mutated_body_norm), (
+    assert not re.search(r"if\s*\(\s*arena\s*&&\s*!\s*admission\.admit\s*\)", mutated_body_norm), (
         "mutation witness is broken: deleting the guard left a reference to it behind"
     )
 
@@ -895,8 +901,9 @@ def test_reserve_pp_moe_onednn_scratch_forbids_vram_zone_spill():
     silently falling through to a raw sycl::malloc_device outside the
     arena."""
     body_norm = _normalize_ws(_bounded_body(CACHE_CPP_CODE, _RESERVE_PP_MOE_START, _RELEASE_RING_START))
-    assert "req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;" in body_norm, (
-        "expected the existing prefer_vram_zone = RUNTIME line -- update this test if that call site moved"
+    assert "req.intent.constraints.prefer_vram_zone = zone;" in body_norm, (
+        "expected the existing prefer_vram_zone = zone line (each slot's planned zone) -- update this test if "
+        "that call site moved"
     )
     assert "req.intent.constraints.forbid_vram_zone_spill = true;" in body_norm, (
         "reserve_pp_moe_onednn_scratch()'s own allocate_buffer lambda must set "

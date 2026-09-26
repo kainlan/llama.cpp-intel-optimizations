@@ -539,6 +539,10 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
 
     float KQ_acc[nbatch_fa/(np*warp_size) * cpw] = {0.0f}; // Accumulators for KQ matrix multiplication.
 
+    // Per KQ_acc element: its cell's mask is -inf. Dead is decided where the
+    // mask is read, not from the score later (see fattn_weight_mark_dead).
+    bool KQ_dead[nbatch_fa / (np * warp_size) * cpw] = {};
+
     // KQ = K @ Q matrix multiplication:
     constexpr int nbatch_K_last = DKQ % nbatch_K;
 #pragma unroll
@@ -573,10 +577,14 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             }
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
-                KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0] +=
-                    (ncols2 > 1 || mask) ? slope * sycl::vec<sycl::half, 1>(mask[j * stride_mask + k_VKQ_0 + i_KQ])
-                                                       .convert<float, sycl::rounding_mode::automatic>()[0] :
-                                           0.0f;
+                if (ncols2 > 1 || mask) {
+                    // Select, not add: a dead cell's K may be non-finite and
+                    // NaN + -inf is NaN (see fattn_mask_is_dead).
+                    const sycl::half mask_val = mask[j * stride_mask + k_VKQ_0 + i_KQ];
+                    const int        i_acc    = (i_KQ_0 / (np * warp_size)) * cpw + jc0;
+                    KQ_dead[i_acc]            = fattn_mask_is_dead(mask_val);
+                    KQ_acc[i_acc]             = fattn_mask_apply(KQ_acc[i_acc], slope, mask_val);
+                }
 
                 KQ_max_new[jc0] =
                     sycl::fmax((float) KQ_max_new[jc0],
@@ -619,12 +627,14 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             float KQ_sum_add = 0.0f;
 #pragma unroll
             for (int i0 = 0; i0 < nbatch_fa; i0 += np*warp_size) {
+                const float KQ_val = (float) KQ_acc[(i0 / (np * warp_size)) * cpw + jc];
                 const float val =
                     !oob_check || i0 + (item_ct1.get_local_id(1) % np) * warp_size + item_ct1.get_local_id(2) <
                                       static_cast<uint32_t>(k_VKQ_sup) ?
-                        sycl::native::exp((float) (KQ_acc[(i0 / (np * warp_size)) * cpw + jc] - KQ_max[jc])) :
+                        fattn_weight_mark_dead(KQ_dead[(i0 / (np * warp_size)) * cpw + jc],
+                                               sycl::native::exp(KQ_val - (float) KQ_max[jc])) :
                         0.0f;
-                KQ_sum_add += val;
+                KQ_sum_add += fattn_weight_sum_term(val);
                 tmp[i0/(np*warp_size)][jc1] = val;
             }
             KQ_sum[jc] = KQ_sum[jc]*KQ_max_scale + KQ_sum_add;
@@ -694,9 +704,15 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             }
 
 #pragma unroll
-            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+            for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                // A dead cell's V may be non-finite; skip it rather than add
+                // 0 * V (see fattn_weight_mark_dead). KQ_k is the same across
+                // the warp, and the test is made once per column.
+                if (fattn_weight_is_dead(static_cast<float>(KQ_k[jc_VKQ_0].x()))) {
+                    continue;
+                }
 #pragma unroll
-                for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                for (int i0 = 0; i0 < DVp / 2; i0 += warp_size) {
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x() +=
                         V_k[i0/warp_size].x()*KQ_k[jc_VKQ_0].x();
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].y() +=
@@ -724,9 +740,14 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             }
 
 #pragma unroll
-            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+            for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                // A dead cell's V may be non-finite; skip it, once per column
+                // (see fattn_weight_mark_dead).
+                if (fattn_weight_is_dead(KQ_k[jc_VKQ_0])) {
+                    continue;
+                }
 #pragma unroll
-                for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                for (int i0 = 0; i0 < DVp / 2; i0 += warp_size) {
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x() += V_k[i0/warp_size].x()*KQ_k[jc_VKQ_0];
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].y() += V_k[i0/warp_size].y()*KQ_k[jc_VKQ_0];
                 }
@@ -1094,7 +1115,9 @@ static void flash_attn_tile(const char *  Q,
             return;
         }
 
-        const float scale = item_ct1.get_group_range(1) == 1 ? 1.0f / KQ_sum[jc0] : 1.0f;
+        // A row with no visible cell (S == 0) is written as 0, like the CPU
+        // reference, instead of 0 * (1/0) = NaN.
+        const float scale = item_ct1.get_group_range(1) == 1 ? (KQ_sum[jc0] == 0.0f ? 0.0f : 1.0f / KQ_sum[jc0]) : 1.0f;
 
         const int j_dst_unrolled =
             ((sequence * int(ne01.z()) + col_Q_0 + j) * ne02 + head0 + c) * item_ct1.get_group_range(1) +

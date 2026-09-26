@@ -145,7 +145,18 @@ Reset does not override ownership. Weight reclaim is ownership- and mode-aware:
 `reset_model_weight_entries()` preserves entries with active `mem_handle` leases,
 entries owned by any live model even when `in_use_count == 0`, and unattributed
 entries when the current reclaim mode and live-model mask require it. It reclaims
-only entries for which `weight_entry_reclaimable()` returns true. Outside
+only entries for which `weight_entry_reclaimable()` returns true. That
+predicate is the only authority for weight reclaim. Its fourth mode,
+`OPTIONAL_LAYOUT_YIELD`, is used only by `yield_optional_layouts()` at KV
+admission. It reclaims an `optional_layout` copy, which is a second physical
+layout beside a resident primary, even when a live model or buffer owns the
+tensor, because those owners dispatch on the primary. A primary is never
+reclaimable in that mode, and neither is a copy with any lease other than the
+cache's own direct-stage mirror. Readers of such a copy hold its lease until
+their work completes (`acquire_layout_handle()` plus event or graph
+retention). `reclaim_weight_entries()` refuses the mode. Details are in
+`docs/backend/sycl-memory-design.md`, "Optional layout copies yield to runtime
+KV". Outside
 `MID_LOAD_REPLAN`, an attributed entry that remains leased with no live model
 owner is diagnosed separately as an ownerless lease and may abort when
 `GGML_SYCL_STRICT_LEASES=1`; that ownerless warning and strict abort are

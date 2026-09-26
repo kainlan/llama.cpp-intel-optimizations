@@ -687,14 +687,17 @@ static void flash_attn_xmx_f16_kernel(
                     const sycl::half   mh1 = mask_row[k + 1];
                     const sycl::half   mh2 = mask_row[k + 2];
                     const sycl::half   mh3 = mask_row[k + 3];
-                    const sycl::float4 mask_val(static_cast<float>(mh0), static_cast<float>(mh1),
-                                                static_cast<float>(mh2), static_cast<float>(mh3));
 
-                    qk += slope * mask_val;
+                    qk = sycl::float4(fattn_mask_apply(qk.x(), slope, mh0), fattn_mask_apply(qk.y(), slope, mh1),
+                                      fattn_mask_apply(qk.z(), slope, mh2), fattn_mask_apply(qk.w(), slope, mh3));
                 }
 
                 // Cross-sequence masking: set to -INF if KV belongs to different sequence
                 // Vectorized: load 4 seq_ids at once using int4
+                // These cells (and the causal ones below) get -FLT_MAX, not a
+                // dead mark, and fattn_v_zero_if_dead reads only the -inf mask.
+                // That is safe because llama.cpp's KQ mask already carries the
+                // same sequence separation and causality, so they are -inf there.
                 if (q_seq >= 0 && kv_seq_ids) {
                     const int  kv_idx_base = kv_start + k;
                     // Vectorized load of 4 int32 sequence IDs
@@ -743,9 +746,9 @@ static void flash_attn_xmx_f16_kernel(
                     qk_val = logit_softcap * sycl::tanh(qk_val);
                 }
                 if (mask_row) {
-                    qk_val += slope * static_cast<float>(mask_row[k]);
+                    qk_val = fattn_mask_apply(qk_val, slope, mask_row[k]);
                 }
-                // Cross-sequence masking for remainder elements
+                // Cross-sequence masking for remainder elements (-FLT_MAX: see above)
                 if (q_seq >= 0 && kv_seq_ids) {
                     const int32_t kv_seq = kv_seq_ids[kv_start + k];
                     if (kv_seq >= 0 && kv_seq != q_seq) {
@@ -763,7 +766,9 @@ static void flash_attn_xmx_f16_kernel(
             }
         }
 
-        // Load V tile for current batch (with stride padding for XMX)
+        // Load V tile for current batch (with stride padding for XMX). A
+        // dead cell's non-finite V is zeroed (see fattn_v_zero_if_dead).
+        const int v_dead_rows = sycl::min(ncols, ne01 - ic0);
         if constexpr (kv_is_fp8) {
             // FP8 E4M3: element-by-element dequantization (can't vectorize)
             for (int idx = tid; idx < kv_count * D; idx += XMX_NTHREADS) {
@@ -782,7 +787,8 @@ static void flash_attn_xmx_f16_kernel(
                     V_row_base = V_base + nb21 * kv_pos;
                 }
                 const uint8_t * V_row_fp8 = reinterpret_cast<const uint8_t *>(V_row_base);
-                tile_V[k * V_STRIDE + d]  = fp8_e4m3_to_half(V_row_fp8[d]);
+                tile_V[k * V_STRIDE + d] =
+                    fattn_v_zero_if_dead(fp8_e4m3_to_half(V_row_fp8[d]), maskh, stride_mask, v_dead_rows, kv_pos);
             }
         } else {
             // FP16: Vectorized V loading with half4 for better memory bandwidth
@@ -805,8 +811,9 @@ static void flash_attn_xmx_f16_kernel(
                 } else {
                     V_row = reinterpret_cast<const sycl::half *>(V_base + nb21 * kv_pos);
                 }
-                sycl::half4 v_vec = *reinterpret_cast<const sycl::half4 *>(&V_row[d]);
-                *reinterpret_cast<sycl::half4 *>(&tile_V[k * V_STRIDE + d]) = v_vec;
+                const sycl::half4 v_vec = *reinterpret_cast<const sycl::half4 *>(&V_row[d]);
+                *reinterpret_cast<sycl::half4 *>(&tile_V[k * V_STRIDE + d]) =
+                    fattn_v_zero_if_dead(v_vec, maskh, stride_mask, v_dead_rows, kv_pos);
             }
             // Handle remainder (if kv_count * D not divisible by 4)
             const int v_remainder_start = v_total_vecs * V_VEC_SIZE;
@@ -826,8 +833,14 @@ static void flash_attn_xmx_f16_kernel(
                 } else {
                     V_row = reinterpret_cast<const sycl::half *>(V_base + nb21 * kv_pos);
                 }
-                tile_V[k * V_STRIDE + d] = V_row[d];
+                tile_V[k * V_STRIDE + d] = fattn_v_zero_if_dead(V_row[d], maskh, stride_mask, v_dead_rows, kv_pos);
             }
+        }
+        // S @ V runs over the whole batch_kv tile. Rows past kv_count carry
+        // weight 0 but would otherwise hold a previous batch's V or, on the
+        // first batch, uninitialized SLM; 0 * NaN is NaN, so zero them.
+        for (int idx = tid; idx < (batch_kv - kv_count) * D; idx += XMX_NTHREADS) {
+            tile_V[(kv_count + idx / D) * V_STRIDE + idx % D] = sycl::half(0.0f);
         }
         // Zero-pad V stride padding (XMX_PAD is 0 now, but keep for safety)
         if (XMX_PAD > 0) {
@@ -1012,7 +1025,10 @@ static void flash_attn_xmx_f16_kernel(
                 for (int k = 0; k < kv_count; ++k) {
                     const float kq_val       = QK_acc[j * batch_kv + k];
                     const float diff         = kq_val - KQ_max[j];
-                    const float w            = diff >= SOFTMAX_FTZ_THRESHOLD ? sycl::exp(diff) : 0.0f;
+                    // A NaN score (a visible cell with a non-finite K) is not
+                    // flushed (see fattn_ftz_flushes). A dead cell is exactly
+                    // -inf here and still flushes to 0.
+                    const float w            = fattn_exp_ftz(diff);
                     tile_S[j * S_STRIDE + k] = sycl::half(w);
                     batch_sum += w;
                 }
@@ -1326,8 +1342,7 @@ static void flash_attn_xmx_f16_kernel(
         for (int i = 0; i < D_per_thread; ++i) {
             const int d_idx = tid + i * XMX_NTHREADS;
             if (d_idx < D) {
-                float val      = VKQ[j][i] * inv_sum;
-                dst_row[d_idx] = sycl::isfinite(val) ? val : 0.0f;
+                dst_row[d_idx] = VKQ[j][i] * inv_sum;
             }
         }
     }
