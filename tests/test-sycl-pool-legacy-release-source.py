@@ -67,6 +67,21 @@ def matching_brace(text: str, open_idx: int) -> int:
     raise AssertionError("unclosed brace")
 
 
+def matching_paren(text: str, open_idx: int) -> int:
+    """Paren match for an argument list; the arguments checked here hold no
+    string or character literals."""
+    assert text[open_idx] == "("
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    raise AssertionError("unclosed paren")
+
+
 def block(text: str, signature: str) -> str:
     start = text.index(signature)
     brace = text.index("{", start)
@@ -88,9 +103,14 @@ def pool_leg_violations(source: str) -> list[str]:
         found.append("pool_leg has no free() override")
     else:
         free_code = strip_comments(block(pool_leg, FREE_FN))
-        calls = re.findall(r"ggml_sycl::pool_legacy_release\(\s*ptr\s*,\s*([^,]+?)\s*,", free_code)
-        if len(calls) != 1:
-            found.append(f"free() calls ggml_sycl::pool_legacy_release {len(calls)} times, expected once")
+        # Qualified or not, there is exactly one call, and it passes the live
+        # recording state.
+        call_count = len(re.findall(r"\bpool_legacy_release\s*\(", free_code))
+        calls = re.findall(r"\bpool_legacy_release\s*\(\s*ptr\s*,\s*([^,]+?)\s*,", free_code)
+        if call_count != 1:
+            found.append(f"free() calls pool_legacy_release {call_count} times, expected once")
+        elif len(calls) != 1:
+            found.append("free() does not call pool_legacy_release(ptr, ...)")
         elif calls[0] != "ggml_sycl_graph_recording_active()":
             found.append(
                 f"free() passes `{calls[0]}` as graph_recording, not ggml_sycl_graph_recording_active() -- "
@@ -99,22 +119,39 @@ def pool_leg_violations(source: str) -> list[str]:
         # The one buffer_pool token allowed is the helper's slots argument;
         # any other (an index, a range-for) touches the free list directly.
         if len(re.findall(r"\bbuffer_pool\b", free_code)) != 1 or not re.search(
-            r"ggml_sycl::pool_legacy_release\(\s*ptr\s*,[^,]+,\s*buffer_pool\s*,", free_code
+            r"\bpool_legacy_release\s*\(\s*ptr\s*,[^,]+,\s*buffer_pool\s*,", free_code
         ):
             found.append("free() uses buffer_pool other than as pool_legacy_release()'s slots argument")
 
         # The dropped owner is released (a unified-cache free) after the lock
         # scope around the helper call closes, not inside it.
-        call_at = free_code.find("ggml_sycl::pool_legacy_release(")
+        call = re.search(r"\bpool_legacy_release\s*(\()", free_code)
+        call_at = call.start() if call else -1
+        lock_block_start = -1
         lock_block_end = -1
         for m in re.finditer(r"\{\s*std::lock_guard<std::mutex>\s+lock\(arena_handles_mutex\);", free_code):
             end = matching_brace(free_code, m.start())
             if m.start() < call_at < end:
+                lock_block_start = m.start()
                 lock_block_end = end
                 break
         if lock_block_end < 0:
             found.append("free() does not call pool_legacy_release() inside a lock_guard block")
         else:
+            # Inside the lock, dropped may appear only as the helper's
+            # argument: any other use (an assignment, a move into a local that
+            # dies in scope) can release the owner under the lock.
+            args_open = call.start(1)
+            args_close = matching_paren(free_code, args_open)
+            uses = [
+                m.start() for m in re.finditer(r"\bdropped\b", free_code[lock_block_start:lock_block_end + 1])
+            ]
+            if len(uses) != 1 or not args_open < lock_block_start + uses[0] < args_close:
+                found.append(
+                    "free() uses dropped inside the lock block other than as pool_legacy_release()'s argument -- "
+                    "the unified-cache free could run under arena_handles_mutex"
+                )
+
             releases = [m.start() for m in re.finditer(r"\bdropped\s*=\s*\{\s*\}\s*;", free_code)]
             if len(releases) != 1 or releases[0] < lock_block_end:
                 found.append(
@@ -192,3 +229,43 @@ def test_release_under_lock_mutation_is_witnessed() -> None:
     )
     violations = pool_leg_violations(mutated)
     assert any("after the lock block closes" in v for v in violations), f"mutation was not witnessed: {violations}"
+
+
+LOCKED_CALL_END = "active_handles, graph_retained_handles, dropped, pool_size);\n"
+
+
+def insert_after_locked_call(source: str, statement: str) -> str:
+    assert source.count(LOCKED_CALL_END) == 1, "locked-call anchor not found"
+    return source.replace(LOCKED_CALL_END, LOCKED_CALL_END + statement, 1)
+
+
+def test_release_by_constructor_assignment_under_lock_is_witnessed() -> None:
+    """A release spelled other than `dropped = {};`, inside the lock."""
+    mutated = insert_after_locked_call(SOURCE.read_text(), "            dropped = ggml_sycl::mem_handle();\n")
+    violations = pool_leg_violations(mutated)
+    assert any("inside the lock block" in v for v in violations), f"mutation was not witnessed: {violations}"
+
+
+def test_release_by_scoped_move_under_lock_is_witnessed() -> None:
+    """Move the owner into a local that dies inside the lock."""
+    mutated = insert_after_locked_call(SOURCE.read_text(), "            { auto tmp = std::move(dropped); }\n")
+    violations = pool_leg_violations(mutated)
+    assert any("inside the lock block" in v for v in violations), f"mutation was not witnessed: {violations}"
+
+
+def test_second_unqualified_call_is_witnessed() -> None:
+    """A second call without the ggml_sycl:: qualifier, passing false. It
+    names no buffer_pool, so only the call count can catch it."""
+    source = SOURCE.read_text()
+    anchor = "        dropped = {};\n"
+    assert source.count(anchor) == 1, "second-call anchor not found"
+    mutated = source.replace(
+        anchor,
+        anchor + "        pool_legacy_release(ptr, false, (ggml_sycl_buffer *) nullptr, 0, active_handles,\n"
+        "                            graph_retained_handles, dropped, pool_size);\n",
+        1,
+    )
+    violations = pool_leg_violations(mutated)
+    assert violations == ["free() calls pool_legacy_release 2 times, expected once"], (
+        f"mutation was not witnessed: {violations}"
+    )

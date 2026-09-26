@@ -42900,8 +42900,10 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                 ggml_sycl::pool_legacy_release(ptr, ggml_sycl_graph_recording_active(), buffer_pool, MAX_SYCL_BUFFERS,
                                                active_handles, graph_retained_handles, dropped, pool_size);
         }
-        // Released outside the lock, like the arena path's owner. Unlike the
-        // arena path, this release is immediate, not deferred to a marker event.
+        // Released outside the lock, like the arena path's owner, but at once
+        // rather than deferred to a marker event. That is unchanged from before
+        // this path honoured recording; whether an immediate release of a
+        // legacy COMPUTE owner is event-safe is open (llama.cpp-iclb c-64q3).
         dropped = {};
         if (released == ggml_sycl::pool_legacy_release_result::MISSING_OWNER) {
             GGML_ASSERT(false && "device pool free without unified allocation mem_handle");

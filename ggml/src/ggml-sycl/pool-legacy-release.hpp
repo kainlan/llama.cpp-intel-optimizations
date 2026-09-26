@@ -35,9 +35,10 @@ enum class pool_legacy_release_result {
 //
 // A DROPPED owner is moved into dropped rather than released here, so the
 // caller can release it (a unified-cache free) outside the lock that guards
-// graph_retained. dropped must be empty on entry. The free-list containers
-// (slots, active) are not guarded by that lock: pool_leg's arena-off alloc()
-// reads and writes them unlocked, relying on one thread driving each pool.
+// graph_retained. dropped must be empty on entry (checked in debug builds
+// only). The free-list state (slots, active, pool_size) is not guarded by that
+// lock: pool_leg's arena-off alloc() reads and writes it unlocked, relying on
+// one thread driving each pool.
 template <typename Slot, typename Owned, typename Handle>
 pool_legacy_release_result pool_legacy_release(void *                              ptr,
                                                bool                                graph_recording,
