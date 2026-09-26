@@ -63,18 +63,18 @@ Design, revision 7.13. Author: impl-moua, 2026-09-26. The revisions answer thirt
   interim (§Z10.1), 1oxa r8's I-D (§X9), 23mk r7's I-A (§Z11), zhcn `8a58ad4`'s H4h hooks and
   ldvb's ownership of row 648, recorded in §6.14.
 - design review r12 (design-moua-r12 on `c66848c26..7f4808729`: 1 Critical, 3 Important, 15
-  Minor), the lead's rulings on it (§M14), §Z13.1, the late-stage string's term slot and zhcn
-  5.9's H4h vehicle (`4f8ff34`), recorded in §6.15. Revision 7.13 is one commit on top of 7.12a
-  (`7f4808729`).
+  Minor), the lead's rulings on it (§M14, §M15), §Z13.1, the late-stage string's term slot zhcn
+  5.9's H4h vehicle (`4f8ff34`) and §Z14.2, recorded in §6.15. Revision 7.13 is two commits on
+  top of 7.12a (`7f4808729`): `79abac034`, and a second that folds §M15 and §Z14.2.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
 §E.1, §E.2, §L0R, §M7, §REC, §T, §L6, §GA, §FM, §STRICT, §D15, §D16, §Z3, §Z42, §Z52, §D20
 (superseded), §D20.1, §M76, §M76a, §ZR5, §M8, §Z43, §Z5, §Z6, §M77, §M9, §M9a, §M10, §Z6x, §X7,
-§M11, §M11b, §Z8, §Z9, §Z9a, §M12, §Z10, §X9, §Z11, §M13, §M13a, §Z12, §Z13, §M14). §M11a is a
-relay line inside §Z8, not a section, and is cited as §Z8 I-2 (r12 m-14). This document cites it
-as "rulings §X". **Where this document paraphrases a ruling and differs from the file, the file
-wins.**
+§M11, §M11b, §Z8, §Z9, §Z9a, §M12, §Z10, §X9, §Z11, §M13, §M13a, §Z12, §Z13, §M14, §Z14, §M15).
+§M11a is a relay line inside §Z8, not a section, and is cited as §Z8 I-2 (r12 m-14). This
+document cites it as "rulings §X". **Where this document paraphrases a ruling and differs from
+the file, the file wins.**
 
 Revisions cited:
 - **Current master is `3d9414c8c`, which contains jehw and u1bb** (jehw landed). Revision 7.6
@@ -1639,43 +1639,43 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       inside the plan (`populate_host_zone_sizing`, `unified-cache.cpp:27082`, `:27430`,
       `:27617`), which is why master's late stage rebuilds again (`gptoss120b-b1.log:1544-1545`,
       1617.9 to 1618.0 MB). **The one order, in `compute_and_store_plan_for_inventory` (one edit
-      to one function, shared with 23mk):**
-      1. **compute every non-weight zone demand** as a pure function of the inventory and the
-         context shape: the `moe_onednn` slots, `moe_control`, the non-FA shape and the rest of
-         the zone inputs. Each is a function of `n_experts`, `n_expert_used`,
-         `planner_n_head_all_max`, `n_ubatch` and `n_ctx` (`unified-cache.cpp:27425-27435`,
-         `:27615-27618`), not of the packing, so `populate_host_zone_sizing`'s in-plan terms
-         move into this one demand function, ahead of the pack. Each demand is a named term
-         (`moe_onednn`, `moe_control`, `nonfa_shape`, ...) in the zone that holds it;
-      2. **ensure the zones** from those demands (`ensure_planned_arena_zones`), at the early
-         stage only; the late stage compares instead (below);
-      3. **pack the weights once** against the ensured zones. There is no iterative re-plan: a
-         demand that depended on the packing would be a defect in step 1, and the witness names
-         it;
-      4. **witness, always compiled** (`GGML_SYCL_WITNESS`, message `[ZONE-PLAN-BUG] the plan
-         packed against zone capacities that differ from the ensured arena`): the zone
-         capacities the pack read (the `[PLACEMENT] Zone reservation` line) equal the arena's
-         zones after step 2, and the plan's device weight bytes are at most the `WEIGHT` zone.
-         It runs before any `record_pending`.
-
-      So the early stage packs against the zones it admits, and B's ranges are recorded inside
-      them. **The shared rule (rulings §Z8 I-3, §M13a): the sentence is this design's, the
-      message is 23mk's, and each design mirrors both byte for byte.** The sentence: "an arena
-      rebuild that meets live bytes or any pending range refuses by name; it never destroys
-      them, and the `GGML_ABORT` at `ggml-sycl.cpp:16215` becomes that named refusal."
-      `ensure_planned_arena_zones` counts any pending range on the device as live, beside zone
-      bytes, chunk leases and live scratch, and `compute_and_store_plan_for_inventory` returns
-      `bool`. On the refusal it logs the message, `[SYCL-PLAN] model load refused: arena zones
-      on device %d cannot be rebuilt while live allocations or pending ranges remain (zone bytes
-      %.1f MB, chunk leases %zu, scratch %.1f MB, pending ranges %zu)`, stores no plan and
-      returns false, and the stage passes that up as its refusal
-      (`GGML_SYCL_LIFECYCLE_EFFECT_FAILED`, through the stage's rollback guard), never the
-      abort. **Its arguments (r12 m-7; relayed to 23mk, whose string it is):** the device index;
-      the zone bytes in MB as `double`; the chunk leases as `(size_t)` of the `uint32_t` count
-      (`unified-cache.cpp:4578`); the live scratch as the byte sum of the live scratch blocks in
-      MB, which replaces master's `has_live_scratch` bool (`:4585-4588`), so the check sums the
-      blocks it tests; and the pending range count as `size_t`. The late stage never calls the
-      ensure, so this refusal is reachable only at the early stage;
+      to one function, shared with 23mk):** 1. **compute every non-weight zone demand** as a
+      pure function of the inventory and the context shape: the `moe_onednn` slots,
+      `moe_control`, the non-FA shape and the rest of the zone inputs. Each is a function of
+      `n_experts`, `n_expert_used`, `planner_n_head_all_max`, `n_ubatch` and `n_ctx`
+      (`unified-cache.cpp:27425-27435`, `:27615-27618`), not of the packing, so
+      `populate_host_zone_sizing`'s in-plan terms move into this one demand function, ahead of
+      the pack. Each demand is a named term (`moe_onednn`, `moe_control`, `nonfa_shape`, ...) in
+      the zone that holds it; 2. **ensure the zones** from those demands
+      (`ensure_planned_arena_zones`), at the early stage only; the late stage compares instead
+      (below); 3. **pack the weights once** against the ensured zones. There is no iterative
+      re-plan: a demand that depended on the packing would be a defect in step 1, and the
+      witness names it; 4. **witness, always compiled** (`GGML_SYCL_WITNESS`, message
+      `[ZONE-PLAN-BUG] the plan packed against zone capacities that differ from the ensured
+      arena`): the zone capacities the pack read (the `[PLACEMENT] Zone reservation` line) equal
+      the arena's zones after step 2, and the plan's device weight bytes are at most the
+      `WEIGHT` zone. It runs before any `record_pending`. So the early stage packs against the
+      zones it admits, and B's ranges are recorded inside them. **The shared rule (rulings §Z8
+      I-3, §M13a): the sentence is this design's, the message is 23mk's, and each design mirrors
+      both byte for byte.** The sentence: "an arena rebuild that meets live bytes or any pending
+      range refuses by name; it never destroys them, and the `GGML_ABORT` at
+      `ggml-sycl.cpp:16215` becomes that named refusal." `ensure_planned_arena_zones` counts any
+      pending range on the device as live, beside zone bytes, chunk leases and live scratch, and
+      `compute_and_store_plan_for_inventory` returns `bool`. On the refusal it logs the message,
+      `[SYCL-PLAN] model load refused: arena zones on device %d cannot be rebuilt while live
+      allocations or pending ranges remain (zone bytes %.1f MB, chunk leases %zu, scratch %.1f
+      MB, pending ranges %zu)`, stores no plan and returns false, and the stage passes that up
+      as its refusal (`GGML_SYCL_LIFECYCLE_EFFECT_FAILED`, through the stage's rollback guard),
+      never the abort. **Its arguments (r12 m-7; relayed to 23mk, whose string it is):** at
+      `unified-cache.cpp:4572-4588`, `%d` is the device; the zone bytes are `(double)
+      live_zone_bytes / MiB`; the chunk leases are `(size_t) chunk_leases`, since the count is a
+      `uint32_t` on master; the scratch is `(double) live_scratch_bytes / MiB`, a new `size_t`
+      summed beside master's `has_live_scratch` bool from each member's recorded size
+      (`compute_arena_used()`, the scratch pool, the two oneDNN scratches, the reorder temp
+      buffer, each persistent scratch and each PP MoE oneDNN slot); and the pending ranges are
+      the `size_t` count of pending ranges on the device's TLSFs (23mk §6.8, unchanged since
+      `437073a29`). The late stage never calls the ensure, so this refusal is reachable only at
+      the early stage;
     - **The admitting stage is the early stage (rulings §X7 I-3).** llama calls
       `stage_inventory_plan` twice: early at `llama-model.cpp:657`, where `create_tensor` then
       picks each tensor's buffer type from the early plan, and late at `:709` (through
@@ -1868,16 +1868,18 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       id}` for a model that never becomes LIVE and never unloads (r11 I-1). **The rollback clear
       is one function, `ggml_sycl_load_pending_rollback_noexcept(lifecycle::LoadTxnId txn)`**,
       this design's name, which 23mk mirrors (rulings §M13a): `clear_pending({LOAD, txn},
-      PENDING_TERM_ALL)` on every device, then 23mk's `onednn_w_rollback_pending`, idempotent
-      and non-throwing. It takes the `LoadTxnId` and resolves the model through the transaction
-      (rulings §M14 m-3): the Registry's `txns_` record (`model-lifecycle.hpp:434`) holds the
-      transaction's `ModelToken`, read by a new `noexcept` accessor,
-      `Registry::token_for_txn(txn)`, and 23mk's `onednn_w_rollback_pending` takes that token's
-      model (23mk adapts). So W's rollback has two idempotent call sites, the hook and the
-      validate-failed exit. `ggml_sycl_abort_owner_effects_noexcept` (`:12675`) calls it with
-      `owner.load`, beside its placement-plan abort, **before or together with 1oxa's T13 chunk
-      destroy** (rulings §X9 I-D, §M13): a range's offsets name a place in a chunk, so no range
-      may outlive its chunk. Every non-commit exit reaches it (23mk's design states the same):
+      PENDING_TERM_ALL)` on every device, then 23mk's `onednn_w_rollback_pending(txn)`,
+      idempotent and non-throwing. It passes the `LoadTxnId` on, with no model argument and no
+      registry lookup (rulings §M15, which keeps 23mk's form for §M14 m-3): 23mk records the
+      transaction on W's contribution (`onednn_w_contrib_` holds `{bytes, PENDING | COMMITTED,
+      txn}`), and `onednn_w_rollback_pending(txn)` erases the `PENDING` entry whose txn matches.
+      A lookup through the Registry's `txns_` record could miss at the validate-failed exit,
+      where that record may already be finalized; this form needs no registry state there. So
+      W's rollback has two idempotent call sites, the hook and the validate-failed exit.
+      `ggml_sycl_abort_owner_effects_noexcept` (`:12675`) calls it with `owner.load`, beside its
+      placement-plan abort, **before or together with 1oxa's T13 chunk destroy** (rulings §X9
+      I-D, §M13): a range's offsets name a place in a chunk, so no range may outlive its chunk.
+      Every non-commit exit reaches it (23mk's design states the same):
       - not committed (`:13124-13135`, `"load_end/not-committed"`);
       - the exit-effects refusal above, through its own abort call and `finalize_end(ticket,
         false)` (r12 m-1), not through the not-committed branch;
@@ -4728,7 +4730,9 @@ L7 documents this limit, and pattern #2 remains the remedy.
         vehicle target, `test-sycl-growth-fallback-vehicle`** (rulings §Z12 I-3): its link line
         is exactly `llama-private-test-objects` + `ggml-sycl-private-fixtures`, so there is one
         backend copy, and under `GGML_BACKEND_DL=ON` it is a disabled placeholder that exits 77,
-        which is a skip, never a pass:
+        which is a skip, never a pass. **It is lead-run (rulings §Z14.2):** on `level_zero:1`,
+        with the ctest label `cache|mem-handle` and the selector pinned by the registration's
+        `ENVIRONMENT` property, like zhcn's H4h; no CPU-device admission is added to ggml-sycl:
         1. the fallback is reached through zhcn's forcing hook,
            `ggml_sycl_test_host_fallback_scope` (thread-local RAII). Its safe-max override,
            `ggml_sycl_test_override_safe_max_alloc_size(1 MiB)`, makes the real `alloc_buffer`
@@ -4746,14 +4750,15 @@ L7 documents this limit, and pattern #2 remains the remedy.
         5. zhcn's `GGML_SYCL_PRIVATE_TESTING` probe prints `[H4h] fallback held(TRANSACTION)=N`
            to stderr at the fallback's entry, before the grow: N = 0 on the correct tree, 1 on
            the mutant;
-        6. the setup is a real `llama_context` on a SYCL backend on the CPU device, with a mock
-           plan whose caps lie below the candidate, and the route is a ladder rung or a growing
-           setter (embeddings on, or a backend-sampler chain added). zhcn's coverage-query
-           last-answer accessor must read GROWTH, or the run is void. **The phase is PP or TG at
-           the fallback (r12 m-9):** the phase gate fires only then (`pinned-pool.cpp:630-632`),
-           and a fresh load leaves it `UNKNOWN` (`ggml-sycl.cpp:12450`), so zhcn forces it to TG
-           with `offload_stats_set_phase` before ALLOC, and the probe reports the phase beside
-           `held` (relayed to zhcn); a phase other than PP or TG voids the run.
+        6. the setup is a real `llama_context` on the SYCL backend on `level_zero:1` (§Z14.2),
+           with a mock plan whose caps lie below the candidate, and the route is a ladder rung
+           or a growing setter (embeddings on, or a backend-sampler chain added). zhcn's
+           coverage-query last-answer accessor must read GROWTH, or the run is void. **The phase
+           is PP or TG at the fallback (r12 m-9):** the phase gate fires only then
+           (`pinned-pool.cpp:630-632`), and a fresh load leaves it `UNKNOWN`
+           (`ggml-sycl.cpp:12450`), so zhcn forces it to TG with `offload_stats_set_phase`
+           before ALLOC, and the probe reports the phase beside `held` (relayed to zhcn); a
+           phase other than PP or TG voids the run.
         Controls: positive, the correct tree, which dies with the phase message and probe 0;
         mutant, a scope left open across ALLOC, run with `GGML_SYCL_WITNESS_CHECKS=0` so the
         path reaches the fallback: the gate exempts it, nothing dies, the probe reads 1, and the
@@ -5698,11 +5703,12 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
   `create_tensor` and the early inventory (I-2; H7ap); one MMID RUNTIME source on arena devices,
   with 23mk's A step between step 5's recording and the yield (I-3; H1); the exit-effects
   refusal through `finalize_end(ticket, false)` (m-1); the retags first in `if
-  (result.committed)` (m-2); `Registry::token_for_txn` for the rollback (m-3); the recording
-  after the device loop (m-4); the one-extent refusal (m-5); the unload clear first in teardown
-  (m-12); `compute_placement_plan_early`'s static `bool` impl behind the public entry (m-13);
-  the audit clause armed only on a passing base (m-15); and H4 (b) on zhcn `4f8ff34`'s vehicle
-  with its phase precondition (m-9).
+  (result.committed)` (m-2); `onednn_w_rollback_pending(txn)` called with the transaction alone
+  (m-3; rulings §M15); the recording after the device loop (m-4); the one-extent refusal (m-5);
+  the unload clear first in teardown (m-12); `compute_placement_plan_early`'s static `bool` impl
+  behind the public entry (m-13); the audit clause armed only on a passing base (m-15); and H4
+  (b) on zhcn `4f8ff34`'s vehicle with its phase precondition (m-9), lead-run on `level_zero:1`
+  (§Z14.2).
 
 **Landing order (lead ruling; r4 I10).** jehw lands on master first (u1bb already has). Then:
 1. moua L1-L3 (pure, host-tested; L1 is done). zhcn and beni need L3's record type,
@@ -6788,11 +6794,11 @@ round, and then asked for a term slot in the late refusal.
 | I-3 | `pending_bytes_excluding` names a removed consumer; the MMID RUNTIME bytes are counted twice | **Changed (§M14 I-3).** The consumer is 23mk's A fit, excluding `({CONTEXT, id}, ONEDNN_PP_A)`; A's step sits between step 5's recording and the yield; on arena devices the MMID bytes have one source, and `runtime_pending` / `mmid_runtime_pending_bytes` are zero there. H1 exact-fit arm. |
 | m-1 | the exit-effects refusal's wording could commit a failed load | **Fixed.** `finalize_end(ticket, false)`: `QUARANTINED`, `EFFECT_FAILED`; H7ap asserts not LIVE. |
 | m-2 | where the retags sit, and `noexcept` | **Fixed.** The first statements of `if (result.committed)` (`:13219`), `noexcept`; H7ap throw arm. |
-| m-3 | the rollback's signature | **Fixed as ruled.** It takes the `LoadTxnId` and resolves the model through `Registry::token_for_txn`; 23mk adapts; W's rollback has two idempotent call sites. |
+| m-3 | the rollback's signature | **Fixed (rulings §M15).** The rollback passes the `LoadTxnId` to `onednn_w_rollback_pending(txn)`, which erases W's `PENDING` entry by the txn recorded on W's contribution; no model argument and no registry lookup, since `txns_` may already be finalized at the validate-failed exit. 7.13's first commit added `Registry::token_for_txn` for this; §M15 withdrew it. W's rollback has two idempotent call sites. |
 | m-4 | per-iteration recording on single-device plans | **Fixed.** Recorded once, after the loop, from the admitted plan; a device absent from it records nothing. H7ap arm. |
 | m-5 | one contiguous range per key | **Declared limitation**, refused by name (`[LOAD-PLAN] no contiguous WEIGHT extent`), with an H7ap arm; a range set is the follow-up. |
 | m-6 | the order of the two late zone refusals | **Fixed.** The late stage compares and never ensures, so only `[LOAD-PLAN]` is reachable there. |
-| m-7 | the C-1 message's arguments | **Fixed and relayed** to 23mk, whose string it is: each value and its cast are named; live scratch becomes a byte sum. |
+| m-7 | the C-1 message's arguments | **Fixed and relayed** to 23mk, whose string it is: each value and its cast are named from 23mk §6.8 (`unified-cache.cpp:4572-4588`); the scratch is a new byte sum beside the bool. |
 | m-8 | two forms of the guard's phase-1 clear | **Fixed.** `clear_pending({CONTEXT, id}, REGION)` per recorded device; `clear_pending_locked` is only for a caller already inside a group-mutex section. |
 | m-9 | H4 (b)'s positive control can be void (phase `UNKNOWN`) | **Fixed.** PP or TG is a precondition, forced by zhcn and probed; any other phase voids the run; `GGML_SYCL_WITNESS_CHECKS=1` is explicit; one zhcn head (`4f8ff34`). |
 | m-10 | witness cost on the hot path | **Fixed.** The switch is a static read once; a disabled witness is one branch. |
@@ -6805,7 +6811,9 @@ round, and then asked for a term slot in the late refusal.
 | item | disposition |
 |------|-------------|
 | §Z13.1 (the late-stage check) | **Adopted** (§2.4.2 (b)): larger late is refused by name, smaller late is admitted with 23mk's WARN and `late_term_shrink_admitted`. H7ap arm. |
-| the late refusal's term slot (lead, after §M14) | **Changed.** The string now names the term, its zone, the device and both sizes: `[LOAD-PLAN] the late inventory changes the zones admitted at the early stage: term %s in zone %s on device %d, early %zu B, late %zu B (refused)`. It is this design's string; 23mk mirrors it byte for byte (proposed to impl-23mk). The WARN is 23mk's `cc0e6e1d8` text, mirrored byte for byte. |
+| the late refusal's term slot (lead, after §M14) | **Changed.** The string now names the term, its zone, the device and both sizes: `[LOAD-PLAN] the late inventory changes the zones admitted at the early stage: term %s in zone %s on device %d, early %zu B, late %zu B (refused)`. It is this design's string; 23mk accepted it and mirrors it byte for byte once 7.13 lands (rulings §M15). The WARN is 23mk's `cc0e6e1d8` text, mirrored byte for byte. |
+| §M15 (W's rollback; the late string) | **Adopted.** W's rollback is 23mk's txn form (the m-3 row); the widened string stands as written. |
+| §Z14.2 (zhcn r10): who runs H4 (b) | **Adopted** in H4 (b): lead-run on `level_zero:1`, label `cache\|mem-handle`, selector pinned by the registration's `ENVIRONMENT`; no CPU-device admission in ggml-sycl. |
 | zhcn 5.9 (`4f8ff34`): the H4h vehicle | **Adopted** in H4 (b): `test-sycl-growth-fallback-vehicle`, one backend copy, exit 77 under `GGML_BACKEND_DL`, `GGML_SYCL_WITNESS_CHECKS=1` explicit. |
 | r12 seams | **Relayed**: to 23mk (C-1's order, the refusal string, m-3, m-7, I-3); 1oxa (I-1, m-11) and zhcn (m-9) through the lead. |
 
@@ -6819,6 +6827,6 @@ round, and then asked for a term slot in the late refusal.
 - m-5 is declared, not fixed: a range set per key needs ggml-alloc's buffer split, which the
   early stage bounds and does not replay.
 - m-11's re-record on eviction is new mechanism in the free path; 1oxa owns the site.
-- The widened refusal string was sent to impl-23mk before this commit, with no reply yet. If
-  23mk asks for a change, the string is fixed forward in one place, §2.4.2 (b), and H7ap's arm.
+- 23mk accepted the widened refusal string (rev 4.6c, `4ffb34aa3`) and adopted A's placement;
+  §M15 settles both. 23mk mirrors the string once 7.13 lands.
 - Nothing was built for 7.13; it is a document change only.
