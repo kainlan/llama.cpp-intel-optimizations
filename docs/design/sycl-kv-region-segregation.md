@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.5. Author: impl-moua, 2026-09-26. The revisions answer seven reviews:
+Design, revision 7.6. Author: impl-moua, 2026-09-26. The revisions answer eight reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -28,21 +28,29 @@ Design, revision 7.5. Author: impl-moua, 2026-09-26. The revisions answer seven 
   design-moua-r6's rewrite of its verdict (0 Critical, 7 Important, 11 Minor) and adopts the
   lead's rulings file, recorded in §6.9. Revision 7.4 makes L0 process-global (rulings §E.2),
   and revision 7.5 withdraws step 8′ (rulings §B.2) and adopts §D15 and §D16, all recorded in
-  §6.9.
+  §6.9;
+- design review r7 (design-moua-r7 on `5925f3fe1`: 0 Critical, 7 Important, 11 Minor) and the
+  lead's rulings on it (§L0R, §M7, the tightened §D15), recorded in §6.10. Revision 7.6 is one
+  commit on top of `5925f3fe1`.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
-one file, `lead-rulings-2026-09-26.md` (sections §B, §R, §RING, §E, §REC, §T, §L6, §GA, §FM,
-§STRICT). This document cites it as "rulings §X". **Where this document paraphrases a ruling
+one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
+§E.1, §E.2, §L0R, §M7, §REC, §T, §L6, §GA, §FM, §STRICT, §D15, §D16, §Z52). This document
+cites it as "rulings §X". **Where this document paraphrases a ruling
 and differs from the file, the file wins.**
 
 Revisions cited:
-- `master` = `401ff76cc`, the base of `task/moua`. Current master is `2c4f5e45d`, which
-  contains u1bb; the master lines cited below were read at `401ff76cc`.
+- **Current master is `3d9414c8c`, which contains jehw and u1bb** (jehw landed). Revision 7.6
+  re-pins to it the text that r7 checked: the header, §2.4.2's L0 block, step (s), step (a),
+  the §RING removal sites, and every line new in 7.6. Those cite `3d9414c8c` explicitly.
+- Older citations keep the revision they name. `master` without a sha means `401ff76cc`, the
+  base of `task/moua`.
 - `jehw` = `task/jehw` HEAD `c41fed119` (its parent `2ad2e0f0e` included). Revisions 3 and 4 cited
   `4d41db5c8`, which r3 found superseded (§6.5 C2). Where `4d41db5c8` is still meant, it is named.
 - `u1bb` = `task/u1bb` HEAD `ddee53ed5`. r3 read `f01b3e86c`; every u1bb line below was
   re-checked at `ddee53ed5`.
-- jehw is not in master. u1bb is: `ddee53ed5` is an ancestor of master `2c4f5e45d` (r4 m14).
+- jehw and u1bb are both in master `3d9414c8c`. A `c41fed119` (jehw) line is not a `3d9414c8c`
+  line: jehw merged master before landing, so its lines moved.
   `fe6c` = `fe6c9356d`, the revision the A2 logs were taken on.
 - Lines cited as `11faace69` (the record-mode park, `common.hpp`'s exec-graph slots,
   `llama-context.cpp`'s teardown paths) were read at current master `11faace69`.
@@ -401,8 +409,10 @@ Every read and write of `context_side`, of the pending ranges and of the TLSF ru
 - **Reservations are serialised by L0, not by L1.** Between the plan (step 2) and the commit
   (step 6), L1 is released for the yield window, but no other transaction or load can run in
   it, because the process-global re-plan mutex (L0, rulings §E.2; §2.4.2) is held for the whole
-  transaction. Runtime weight allocations (expert-cache fills), which take neither lock, can
-  still allocate at any point, window or not.
+  transaction. Runtime weight allocations (expert-cache fills, lazy MoE layout
+  materialization), which take neither lock, can still allocate at any point, window or not,
+  so every room a transaction plans to use is a pending range before any of them could see it
+  free (item 1 below, and the tenant-only path's (0), rulings §M7 I-5(a)).
 - **Three things keep A's plan valid across that window:**
   1. A's **pending ranges** are recorded under the group mutex **before** `lock.unlock()`
      (§2.4.2 step 5). They cover **every** extent and slot A's fit placed, not only the
@@ -410,9 +420,10 @@ Every read and write of `context_side`, of the pending ranges and of the TLSF ru
      (`allocate_excluding` whenever any pending range exists on the TLSF, §2.3.3) and every
      other transaction's geometry snapshot, whose fit sees them as allocated blocks. So B
      cannot plan into A's room, and a weight cannot take it.
-  2. The relock's plan check (jehw `:17911-17915`) turns any intervening commit into `busy`, and
-     A's guard rolls back (§2.4.2). Under L0 no other publish can intervene, so this return is
-     `[CONTEXT-PLAN-BUG]` (rulings §E.2), kept as a check.
+  2. The relock's plan check (jehw `:17911-17915`; master `3d9414c8c` `:18122`) returns `busy`
+     on master when a commit intervened. Under L0 no other publish can intervene anywhere in the
+     process, so here that return is `[CONTEXT-PLAN-BUG]` (rulings §E.2), kept as a check, and
+     A's guard rolls back (§2.4.2).
   3. The commit re-fits **only inside A's own pending ranges** and carves at exact offsets
      (§2.4.2 step 6, r4 I8), so nothing that runs between A's re-fit and A's carve can take
      what the re-fit chose.
@@ -986,67 +997,134 @@ changed", is gone, because nothing held before the transaction is released befor
 (r4 I5, I6).
 
 **The re-plan transaction mutex: no `busy` from any re-plan contention (rulings §E, §E.1,
-§E.2).** llama-server treats a `llama_decode` return of −2 as fatal, so no return code may mean
-"busy, retry" (rulings §E). The two `busy` returns that r5 I-A added, step 2's RELEASING and
-step 8 (a)'s generation mismatch, came from two re-plans contending on one device's shared ring.
-jehw's transaction adds five more, because every transaction revalidates against the published
-plan, which is one process-global atomic (`g_placement_publication`, read by
-`ggml_sycl_global_plan_snapshot`, jehw `c41fed119` `:2676`). All seven are replaced by
-serialization:
-- **What it is.** One process-global `std::mutex`, `g_replan_txn_mutex`, ranked **L0**: taken
-  before L1 and never under any L1-L5 lock (rulings §E.2, which supersedes §E.1's per-device
-  wording). A per-device mutex would not do: a publish or load on any device changes the
-  identity every transaction revalidates against, and "every device the plan covers" is not
-  closed under a publish that adds a device.
-- **Who holds it.** It is held for the whole of:
-  - a full-context transaction, from before step 1 to after the guard's second phase;
-  - a probe;
-  - a tenant-only transaction's growth path, from before (s) to after the guard's second phase
-    (the two fast paths take it only around a ring-contribution update, §2.4.2). Because llama
-    drives that sequence, the backend gives llama an RAII scope for it,
-    `ggml_backend_sycl_replan_scope`, declared before the transaction guard, so the guard's
-    phases run inside it;
-  - the teardown release proc;
-  - every other ring mutator outside the decode path;
-  - model load and jehw's optional-layout pass, on every backing (USM and VM).
+§E.2, §L0R).** llama-server treats a `llama_decode` return of −2 as fatal, so no return code
+may mean "busy, retry" (rulings §E). The published plan is one process-global atomic
+(`g_placement_publication`, master `3d9414c8c` `:2638`, read by
+`ggml_sycl_global_plan_snapshot` at `:2676`), and every re-plan revalidates against it. So
+every contention between re-plans, loads and unloads is replaced by serialization on one lock,
+L0, and a failed revalidation under L0 is a bug, not a race.
 
-  There is one mutex, so there is no device order. Loads never nest inside a transaction, and a
-  transaction never triggers a load.
-- **Who never takes it.** Decode and graph compute. The accepted cost is that re-plans and loads
-  on different devices serialize; they are rare (rulings §E.2).
-- **What changes.** Under L0 no other re-plan, release proc or load can run concurrently, so:
-  - another transaction's RELEASING cannot be observed at step 2, and step 8 (a)'s generation
-    check can fail only if a mutator skipped the mutex;
-  - jehw's five plan-identity returns (`c41fed119`) can fire only the same way: `:17672`
-    "stale identity" (`busy`), `:17686` the live-update lease (`busy`), `:17691` "plan changed
-    while acquiring the transaction lock" (`busy`), `:17914` the yield's relock (`busy`), and
-    `:18386` the lost publication CAS (`refuse`, PLAN_REJECTED, which the server treats as
-    fatal).
+- **What it is (rulings §E.2, §L0R).** One process-global `std::mutex`, `g_replan_txn_mutex`,
+  ranked **L0**: taken before L1 and never under any L1-L5 lock. It is taken only through one
+  RAII token type, `ggml_sycl_replan_token`, backed by a thread-local held flag:
+  - an acquire on a thread that already holds L0 is a **nested hold** and does not lock;
+  - an acquire on another thread blocks;
+  - the outermost token unlocks.
 
-  All seven are therefore `[CONTEXT-PLAN-BUG]` (an abort under `GGML_SYCL_STRICT_PLAN=1`), never
-  `busy` and never a retryable refusal. The ring's own `busy` at `:18274` ("scratch ring claimed
-  by an in-flight dispatch") is superseded too: after step (s)'s synchronize a claimed ring slot
-  is step 7's occupancy `[CONTEXT-PLAN-BUG]` (rulings §B step 7). RELEASING, `ring_plan_gen` and
-  the step-2 copies and pins stay (rulings §RING) as the checked invariants. Under L0 a pin
-  count P is always 0 at a move-out, and a nonzero P again means a mutator skipped it.
+  There is one mutex, so there is no device order. zhcn's gate 31 function-local token is this
+  same type.
+- **Where it is taken (rulings §L0R): at the top of every public entry point that can publish
+  the plan or prepare a live update,** before the module admission guard and before any ticket.
+  Located at master `3d9414c8c`, the publishers are the call sites of
+  `ggml_sycl_publish_plan_locked`, `ggml_sycl_publish_prepared_plan_locked`,
+  `lifecycle_replace_placement_plan` and `Registry::prepare_live_update`. Their public entry
+  points:
+  - `ggml_backend_sycl_set_runtime_context_for_model` (`:18840`), the wrapper around the
+    transaction: its live-update ticket (`:18867`) and its publish (`:18955`) are under L0, and
+    so is the inner transaction body (`:17852-18648`);
+  - the probe wrapper (`:18761`) and the FA recheck (`:19041`);
+  - `ggml_backend_sycl_activate_model_plan` (`:15228`, publish at `:15259`);
+  - model unload, `ggml_backend_sycl_model_unloaded_token` (`:12283`), with its failure and
+    exception republishes (`:12308`, `:12329` → `ggml_sycl_publish_restored_plan` `:12547`) and
+    its latest-live republish (`:12599`), and the quarantine reaper's retry of it;
+  - the model-load entry points (below);
+  - the tenant-only path's llama-held scope, `ggml_backend_sycl_replan_scope`, which llama opens
+    before (s) on the growth path. The probe and (ii) that run inside it are nested holds;
+  - the teardown release proc, and every other ring mutator outside graph compute.
+- **The load's span (m-9).** A load takes L0 at the top of each public backend load entry, not
+  across the whole load: `ggml_backend_sycl_model_load_begin` (`:12728`), the plan computation
+  (`ggml_backend_sycl_compute_placement_plan_early`, `:16473`, which runs
+  `populate_inventory_globals`), `ggml_sycl_set_tensor_inventory_impl` (`:16491`), the weight
+  preload (`ggml_sycl_preload_model_weights`, whose republish is `:33769`), and
+  `ggml_backend_sycl_model_load_end` (`:13096`, publish at `:13205`). llama's loader code and
+  the application's `progress_callback` therefore never run under L0, and the deadlock rule
+  below needs no clause for callbacks into application code. Between two load entries another
+  re-plan can run. That is safe because the load's own state is its bound candidate
+  (`ggml_sycl_bound_load_candidate`, `:2681`), not the published plan, and its publish at
+  `load_end` is under L0. Loads never nest inside a transaction, and a transaction never
+  triggers a load.
+- **The allowlist: decode's identity-preserving republishes (rulings §L0R).** Four sites
+  republish the current snapshot from inside graph compute and do **not** take L0:
+  `ggml_sycl_republish_current_plan()` (`:2996`) at `:5887` and `:5908` (the MoE
+  secondary-queue setup, `:5852`), `:60125` (the lazy MoE layout materialization, `:60062`) and
+  `:74882` (`ggml_sycl_mul_mat_id`). They are allowed only because they publish the
+  same pointer they read, under `g_tensor_inventory_mutex`, so the plan identity cannot change.
+  A gate (H7ai) proves it: the republish helper takes no snapshot argument, and a debug check
+  compares the identity before and after. A change of identity there is `[CONTEXT-PLAN-BUG]`.
+  The same helper's fifth caller, `:33769`, is in the weight preload, a load entry under L0.
+- **Who never takes it (rulings §L0R; r7 m-7).** "Decode never takes L0" means **graph compute
+  and dispatch never take it**. `llama_decode` can reach a re-plan legitimately through
+  `sched_reserve` (the resync at `llama-context.cpp:1571`, and the FA recheck through
+  `resolve_fused_ops` at `:1298`). That is a re-plan, and it takes L0 like any other. The
+  accepted cost is that re-plans, loads and unloads on different devices and models serialize;
+  they are rare (rulings §E.2).
+- **The probe and the FA recheck validate against their own model's plan (rulings §L0R).** On
+  master both compare the model token with the one global snapshot (`:18761-18767`,
+  `:19041-19056`). With two models loaded, B's load or re-plan publishes B's plan between two of
+  A's L0 holds, and A's probe then answers STALE_IDENTITY ("not the published model"), which
+  llama turns into a refusal or a throw (`llama-context.cpp:1531`, `:1195-1200`). L0 serializes;
+  it does not re-bind. So both read `lifecycle_select_placement_plan(model)`, the plan of the
+  model they are called for, and validate against that. The FA recheck has a second defect of
+  the same family: its headroom predicate reads **live** device free memory
+  (`ggml_backend_sycl_get_device_memory()`, the pvjr comment at `:19058-19075`), a reading taken
+  after this process's own destroys, which rulings §FM forbids for any sizing or gate. On an
+  arena device it is a second source of "fits" (P4; §2.2), so it reads the fit's ledger (the
+  registry's residency answer) instead. This was found while re-pinning the recheck and is
+  reported to the lead with its path.
+- **What changes.** Under L0 no other re-plan, release proc, load or unload runs concurrently,
+  so every return below can fire only if a mutator skipped L0. Each is `[CONTEXT-PLAN-BUG]`
+  (an abort under `GGML_SYCL_STRICT_PLAN=1`), never `busy` and never a retryable refusal:
+  - the two ring returns: another transaction's RELEASING at step 2, and step 8 (a)'s
+    generation mismatch;
+  - jehw's five in the transaction body, at master `3d9414c8c`: `:17867` "stale identity",
+    `:17881` the live-update lease, `:17886` "plan changed while acquiring the transaction
+    lock", `:18122` the yield's relock, and `:18646` the lost publication CAS (a `refuse`, which
+    is PLAN_REJECTED and fatal on the server);
+  - the wrapper's own `BUSY` returns: module admission (`:18848-18849`), the ticket
+    (`:18867-18870`), an open invocation or graph (`:18925-18929`), and `attach_root`
+    (`:18934-18935`).
+
+  The ring's own `busy` at `:18515` ("scratch ring claimed by an in-flight dispatch") is gone on
+  arena devices (r7 m-8): the full path no longer releases the ring, and on the tenant-only path
+  a claimed slot after (s) is step 7's occupancy `[CONTEXT-PLAN-BUG]` (rulings §B step 7). On a
+  device with no arena, u1bb's ring re-plan and that return stay as they are, outside this
+  design. llama's `BUSY` sleep-backoff loops (`llama-context.cpp:1154-1158`, `:1522-1526`) are
+  deleted (rulings §L0R); the deletion is in zhcn's scope, and this design depends on it.
+- **The pins.** RELEASING, `ring_plan_gen` and the step-2 copies and pins stay (rulings §RING)
+  as the checked invariants. Pins come only from a transaction guard's step 2 (rulings §M7
+  I-3). Under L0 no other guard is alive at a move-out, and (0) takes no pins, so the P
+  snapshotted at the move-out is 0 on every path. (e) still bounds by the snapshotted P, and
+  reports a nonzero P as `[CONTEXT-PLAN-BUG]` (r7 m-3).
 - **Held across waits.** It may be held across the transaction's own step (s) synchronize and
   its unlocked yield or driver window (1oxa's create/map). That is not a GPU wait on another
   party's work.
-- **The deadlock rule, and teardown's path.** A thread holding the mutex never waits on anything
-  that needs it.
-  - The mutex is scoped inside the backend's transaction entry points, the replan scope and the
-    load. None of them calls back into llama, and none destroys a context.
-  - Teardown takes it only in the release proc, which runs from `sycl_plan_guard`'s destructor
+- **The deadlock rule, and teardown's path.** A thread holding L0 never waits on anything that
+  needs L0 on another thread.
+  - Everything that runs under L0 is backend code, llama's re-plan sequence (`sched.reset()` and
+    the backend calls inside `ggml_backend_sycl_replan_scope`), or the release proc. None of it
+    runs application callbacks, destroys a context, or waits on another thread's llama call.
+    Graph compute, which other threads may be in, never takes L0, and queue waits are GPU
+    progress.
+  - Nested holds on one thread are legal and do not lock: the growth path's probe and (ii) run
+    inside llama's replan scope (r7 I-2).
+  - Teardown takes L0 only in the release proc, which runs from `sycl_plan_guard`'s destructor
     (§2.4.2 "Teardown"). That destructor runs in `~llama_context`, or in the constructor's
     unwind after the transaction's backend call has returned (the `create_memory` refusal at
-    `:869` throws after the transaction at `:810` has closed its scope).
-  - So the release proc is never reached on a thread that already holds L0. H9 asserts this
-    with a debug owner-thread check that aborts on a same-thread re-entry, since `std::mutex`
-    would otherwise hang.
-- **Gates.** H7ai checks that every holder above takes L0, before L1 and never under L1-L5, and
-  that decode and graph compute never take it. H9 runs two contexts re-planning concurrently,
-  on one device and on two devices, and a re-plan racing a load on the other device, and asserts
-  zero `busy` returns and zero lost CASes.
+    `:869` throws after the transaction at `:810` has closed its scope). So the release proc is
+    never reached on a thread that already holds L0. Its token is an **outermost-only** kind: a
+    debug check aborts if the thread's held flag is already set when it enters. That is
+    distinct from the transaction entries' legal nesting, and H9 has an arm for each.
+- **Gates.** H7ai checks every publish and `prepare_live_update` call site: each is under a
+  token taken at the top of its public entry point, or is one of the four allowlisted
+  identity-preserving republishes; graph compute and dispatch take no token; the token is
+  taken before L1 and never under L1-L5. H9 runs:
+  - two contexts re-planning concurrently, on one device and on two devices, a re-plan racing a
+    load on the other device, and a re-plan racing an unload;
+  - A in a transaction, then B loads, then A's probe and FA recheck, with zero STALE_IDENTITY;
+  - the growth path's nested holds (positive), and a release proc entered under a held token
+    (negative, the debug abort).
+
+  Each asserts zero `busy` returns and zero lost CASes.
 
 **The transaction guard: two phases (r2 N-I3; r3 I4; r4 I5, m14).** L6 declares a
 `kv_region_txn` guard **before** the transaction's L1 `std::unique_lock` (jehw `:17689`) and
@@ -1054,8 +1132,8 @@ before any pre-L1 work (the host-tier allocation, the tenant-only path's (s), (0
 Reverse destruction order therefore runs the guard's destructor after the lock is released,
 on every exit path. The guard owns everything this call has made and not yet published:
 - the owner-first controls it pre-minted before L1 (§2.10), used or not;
-- every extent handle and every new reserved-slot handle this call carved, and the host-tier
-  slots it allocated before L1 (§2.4.3);
+- every extent handle and every new reserved-slot handle this call carved, and the host
+  reservation it allocated before L1 at a first publish (§2.4.3);
 - **copies of the ring's current slot handles**, taken in step 2's ring-lock section before the
   snapshot, each counted in the ring record's `pinned[slot]` (r5 I-A; r6 I-4, I-5), so the blocks
   the plan reuses cannot be freed underneath it;
@@ -1063,12 +1141,13 @@ on every exit path. The guard owns everything this call has made and not yet pub
 - the pending registry insert, this call's tentative ring contribution (step 8), and a
   `RELEASING` mark this call set (the tenant-only path's step (i));
 - after a commit, **the superseded handles** (step 8; r5 m-a): device slots, the ring's old
-  slots, the context's old host slots, and any mirror handles 423j's retire withdrew (§2.9),
-  all dropped after L1 is released.
+  slots, and any mirror handles 423j's retire withdrew (§2.9), all dropped after L1 is
+  released. Host slots are never superseded within the plan (§2.4.3).
 
 It owns nothing that existed before the call. The ring's current slots and the context's
 current tenant slots stay with their owners until step 8. So on any return other than a
-committed publish (a `refuse()`, a `busy()`, or an exception, from any step), the destructor
+committed publish (a `refuse()`, a `[CONTEXT-PLAN-BUG]` return, or an exception, from any step;
+there is no `busy()` under L0), the destructor
 rolls back in two phases, and never has to re-acquire room:
 1. **Metadata, with one leaf-class lock at a time.** Clear this call's pending ranges on each
    TLSF, under that TLSF's group mutex (L5, taken alone). Discard the pending registry insert
@@ -1173,11 +1252,15 @@ prompt-processing performance, never correctness, and the yield WARN names them.
      move here.
    - The ring has no separate "does not fit" refusal (u1bb `:18388`) and no budget-room check
      (u1bb `:18362`, deleted, r4 I7): its slots are head slots of step 2's fit.
-   - What stays after the yield can fail only for a runtime reason: the MMID workspace
-     materialization allocates, and the CAS can lose a race.
+   - Nothing after the yield can fail for a runtime reason (rulings §M7 I-5, §E.2). The MMID
+     workspace is planned and carved at step 6, so step 7 allocates nothing, and under L0 the
+     CAS cannot lose. What is left is a shortfall, which step 6's re-fit demotes, and
+     `[CONTEXT-PLAN-BUG]`.
    - **Probe mode ends here.** A probe runs steps 1-4 with no side effects: no pending range, no
-     yield, no carve. On a matched key it runs the tenant-only path's fit only, with the
-     context's own tenant slots counted free by arithmetic (zhcn's step (0)).
+     yield, no carve, and no ring-lock copies or pins (rulings §M7 I-3). On a matched key it
+     runs the tenant-only path's fit only, with the context's own tenant slots, and a sole
+     contributor's old ring when its ring must grow, counted free by arithmetic (zhcn's step
+     (0); §2.4.2 "(0) Probe").
    - **Probes no longer see another transaction's pending ranges (r4 m13; rulings §E.2).** A
      probe holds L0, so no other transaction can be mid-yield anywhere while the probe runs. The
      spurious refusal that r4 m13 accepted is now unreachable.
@@ -1207,8 +1290,9 @@ prompt-processing performance, never correctness, and the yield WARN names them.
        (`ggml_sycl_optional_layouts_retired()`, jehw `:17610-17612`) and `lock.unlock()`;
      - finish with L1 released: wait on the barrier, drop the withdrawn mirrors and the freed
        rows;
-     - `lock.lock()`, and return `busy` if the plan changed (jehw `:17911-17915`). The guard's
-       first phase then clears the pending ranges.
+     - `lock.lock()`. A changed plan here (jehw's relock, master `3d9414c8c` `:18122`) is
+       `[CONTEXT-PLAN-BUG]` under L0 (rulings §E.2), never `busy`; the guard's first phase then
+       clears the pending ranges.
    - **A yielded copy is never lazily re-staged.** Dispatch reads the primary's materialized
      layout (P3, "the loaded layout is the answer"), and H7h gates it.
 6. **Commit the carve (r2 N-I7; r4 I8, m3).**
@@ -1246,8 +1330,27 @@ prompt-processing performance, never correctness, and the yield WARN names them.
    - The carve runs under L1, because the transaction body does. That is allocation work under
      a registry lock; §2.10 states the exact sequence and classifies it (lead ruling: a
      classified exception pending ratification; r4 m7).
-7. **The MMID workspace.** The MMID workspace materialization (jehw `:18360`) runs as today. A
-   refusal rolls back through the guard, which leaves the old ring and the old slots untouched.
+7. **The MMID workspace, from planned room only (rulings §M7 I-5(b)).** On master
+   (`3d9414c8c` `:18612-18620`) `ggml_sycl_materialize_published_mmid_workspaces` allocates the
+   new plan's MMID pools at runtime, after the yield. That makes step 7 a runtime refusal that
+   another context's RUNTIME or host allocation can cause, mapped to PLAN_REJECTED. Instead:
+   - step 2's fit places the new plan's MMID device pool (`moe_mmid_device_pool_bytes`) as a
+     head slot on the RUNTIME TLSF, the way it places the ring's RUNTIME half (§2.7), and step 6
+     carves it with the other head slots;
+   - its host pool (`moe_mmid_host_pool_bytes`) is a view of a held host carve. The MMID
+     workspaces belong to the model (`unified_cache_materialize_moe_mmid_workspaces` is keyed
+     by the model token), not to a context, so the carve is the model's: at the first
+     materialization, the wrapper's bind at context creation (`:18980`, where host growth is
+     still allowed), the MMID registry entry allocates and holds host room for the plan's
+     largest MMID host pool (the workspace at the plan's top `n_ubatch` rung), the same rule
+     §D15 sets for the tenants' host room (rulings §D15). Later workspace plans take views of
+     it, and a host pool beyond it is a candidate refusal by arithmetic at step 4, before
+     anything is released. The carve is released with the model's MMID entry, at unload;
+   - step 7 materializes into those two carves and allocates nothing. An allocation there, or a
+     carve too small, is `[CONTEXT-PLAN-BUG]`, never a refusal.
+
+   A stable MMID plan (`ggml_sycl_same_mmid_workspace_plan`) plans nothing new. Any refusal
+   still rolls back through the guard, which leaves the old ring and the old slots untouched.
 8. **Ring check, publish, then release what the new plan superseded (r4 I5; r5 I-A, m-a).**
    - **(a) The ring check, before the CAS (lead ruling).** Under the ring record's lock:
      `ring_plan_gen` must equal the value step 2 copied, and `RELEASING` must be clear or owned
@@ -1262,10 +1365,11 @@ prompt-processing performance, never correctness, and the yield WARN names them.
    - **(b) The publication CAS** (jehw `:18386`), as today. A lost CAS rolls back through the
      guard.
    - **(c) Commit, which has no refusing step** (nothing in it returns `busy` or a plan error):
-     - under `kv_region_mutex_`: insert the new entry, holding the extent handles and this
-       context's tenant-slot handles, the host slots included (a move of the pre-L1 handles);
-       on the tenant-only path, swap the new tenant and host handles into the existing entry
-       and move the old host handles into the guard (r5 I-I(3)); unlock;
+     - under `kv_region_mutex_`: insert the new entry, holding the extent handles, this
+       context's tenant-slot handles, the host reservation and its host-slot views (a move of
+       the pre-L1 handles); on the tenant-only path, install the new table in the existing
+       entry, with the device slots (c) kept and (ii) carved and the unchanged host-slot views
+       (rulings §D15); unlock;
      - under the ring record's lock: if the ring's slots changed (a growth), swap in the new slot
        handles, bump `ring_plan_gen`, clear `RELEASING` if this call set it, and move the
        superseded handles **into the guard**; unlock. The ring admit then installs the slot
@@ -1275,7 +1379,7 @@ prompt-processing performance, never correctness, and the yield WARN names them.
      - still under L1, if the fit reported a KV demotion that releasing lease-vetoed copies
        would have covered: log the WARN naming those copies, their bytes and the demoted
        layers, and, once llama.cpp-423j has landed, issue its retire request for them, once
-       (§2.9). This is the only site, so a `busy` retry never issues it.
+       (§2.9). This is the only site, and it runs once per committed transaction.
    - **(d) The superseded handles drop after L1 is released**, in the guard's second phase
      (r5 m-a). Revision 6's first draft dropped them "with no lock held" while the transaction
      still held L1, which contradicted P2 and H7t. A claim still retained by an in-flight event
@@ -1285,112 +1389,148 @@ prompt-processing performance, never correctness, and the yield WARN names them.
 same-key republish, which is how the auto-ubatch ladder, the setters, encode and a republish
 after `memory_update` arrive, re-plans only this context's head slots and its ring
 contribution. It never re-fits KV and never yields.
-- **A matched tenant key is an OK no-op (zhcn r3 I-5; r5 m-j; lead ruling).** If the
-  candidate's tenant section digest (§2.4.4) also equals the published tenant key, the backend
-  call returns OK with the published residency at once: no probe, no step (i), no registry
-  change, no L1. The server's per-request setters (a sampler set, a LoRA apply) change the
-  graph set but usually not one slot's bytes, and they must not pay a drain and a fit, or open
-  a refusal window, for nothing. On the llama side zhcn recreates the scheduler over the same
-  slots (zhcn §3.1 step 2), which reuses the same indexes through the event chain and touches
-  no backend state. The graph-set digest serves only zhcn's staleness seal.
-- **Reuse in place (r5 I-B; zhcn rev 5; lead ruling; r6 m-10 for the host tier).** If every
-  candidate tenant slot fits the published slot at the same `(cohort, index, device)`
-  (`slot_bytes ≤ cap`), host slots included, the published slots are reused in place: no step
-  (i), no fit, no allocation and no release. Under `kv_region_mutex_` the backend records the
-  new tenant key. The table, its caps and any published index the candidate no longer uses stay
-  as they are, as held planned room (like the ring's excess, §2.7), and claims keep reading the
-  same table. zhcn rev 5 states the rule for its tenants; this design applies the same rule to
-  the host tier (r6 m-10), so such a republish pays neither the old+new host peak nor a refusal
-  under the growth-forbidden host zone. Only a candidate with a slot that outgrows its published
-  cap, or with a new index, takes the path below.
-- **L0 on the two fast paths (rulings §E.2; zhcn rev 5.1).** The equal-key no-op takes no L0.
-  The covered path takes none either, unless its candidate changes this context's recorded ring
-  contribution (a smaller `n_ubatch` served by the existing ring): that update of the ring
-  record is a ring mutator outside decode, so it takes L0 around it. The growth path below
-  takes L0 before (s) and holds it to the guard's second phase.
+- **A matched tenant key is an OK no-op (zhcn r3 I-5; r5 m-j; lead ruling).** If the candidate's
+  tenant section digest (§2.4.4) also equals the published tenant key, the backend's coverage
+  query (below) answers EQUAL and llama keeps the published residency: no probe, no step (i), no
+  registry change, no L0 and no L1. The server's per-request setters (a sampler set, a LoRA
+  apply) change the graph set but usually not one slot's bytes, and they must not pay a drain
+  and a fit, or open a refusal window, for nothing. On the llama side zhcn recreates the
+  scheduler over the same slots (zhcn §3.1 step 2), which reuses the same indexes through the
+  event chain and touches no backend state. The graph-set digest serves only zhcn's staleness
+  seal.
+- **Reuse in place: the covered path (r5 I-B; zhcn rev 5; lead ruling; r6 m-10 for the host
+  tier; r7 m-11, m-1).** A candidate is **covered** when both of these hold:
+  - every candidate tenant slot fits the published slot at the same `(cohort, index, device)`
+    (`slot_bytes ≤ cap`), host slots included; and
+  - its ring contribution (§2.7) does not grow. The ring contribution is not part of the tenant
+    key (the digest covers the tenant section only, §2.4.4), so a candidate whose tenant slots
+    are all covered but whose ring contribution grows (a larger `n_ubatch`) is **not** covered:
+    it takes the growth path below (r7 m-11).
+
+  A covered candidate takes **no L0 and makes no registry change** (zhcn §3.1 step 3; r7 m-1):
+  no step (i), no fit, no allocation, no release, and no write to the ring record. The published
+  table, its caps, the published tenant key, any published index the candidate no longer uses,
+  and a ring contribution larger than the candidate needs all stay as they are, as held planned
+  room (like the ring's excess, §2.7). Claims keep reading the same table, and a claim's
+  `slot_bytes ≤ cap` is what makes the smaller need safe. Because the key is not re-recorded, a
+  repeat of the same candidate takes the covered check again, which is arithmetic over the
+  context's own table under the `kv_region_mutex_` leaf and nothing else. Only this context's
+  thread re-plans this context, and no other transaction writes its table, so the check needs no
+  L0. zhcn rev 5 states the rule for its tenants; this design applies it to the host tier too
+  (r6 m-10), so a covered republish neither allocates host bytes nor refuses. Only a candidate
+  with a slot that outgrows its published cap, a new index, or a growing ring contribution takes
+  the path below.
+- **The coverage query, and L0 on the tenant-only path (rulings §E.2, §L0R; zhcn rev 5.1; r7
+  I-2, m-1).** llama asks first, through a read-only backend query,
+  `ggml_backend_sycl_tenant_coverage(ctx, candidate)`, which answers EQUAL, COVERED or GROWTH
+  from the context's own table under the `kv_region_mutex_` leaf. It neither publishes nor
+  prepares a live update, so it is not an L0 entry point (§2.4.2 "The re-plan transaction
+  mutex"), and EQUAL and COVERED end there with no L0. On GROWTH, llama opens
+  `ggml_backend_sycl_replan_scope`, which takes L0 **before (s)**, and holds it to the guard's
+  second phase. The backend transaction wrapper it then calls takes the same token at its top as
+  a nested hold (rulings §L0R). No path writes the ring record without L0: the covered path does
+  not write it at all.
 - **The guard is declared before (s)**, so steps (s), (0), (i) and (ii) all run inside its
   lifetime (r5 I-A(d)). Its first phase is where RELEASING is cleared on any exit that did not
   publish.
 - **(s) Synchronize (rulings §B step 1; zhcn step 1; r6 I-1, m-2).** Before (0), zhcn's step 1
   synchronizes **every queue that can hold work on this context's slots**, and zhcn rev 5
-  carries the list (lines at master `11faace69`):
-  - each device's execution queue. `ggml_backend_sycl_synchronize` (`ggml-sycl.cpp:84085-84141`)
+  carries the list (lines re-pinned to master `3d9414c8c`; r7 m-4):
+  - each device's execution queue. `ggml_backend_sycl_synchronize` (`ggml-sycl.cpp:84293-84356`)
     waits `stream(device, 0)` only, and on the deferred-decode path only `last_graph_event`
-    (`:84096-84099`), so the step waits the queue itself;
+    (`:84306-84307`), so the step waits the queue itself;
   - the split queues: secondary, merge and coord (`g_split_secondary_queue_owner`,
-    `g_split_merge_queue_owner`, `g_split_coord_queue_owner`, `:62143-62145`);
+    `g_split_merge_queue_owner`, `g_split_coord_queue_owner`, `:62351-62353`);
   - the MoE shared-context queues (`ggml_sycl_ensure_moe_secondary_queues_for_plan`, `:5852`);
-  - the cache's queues (`cache->get_queue()` and `get_bcs_queue()`, waited at `:4805` and
-    `:4814-4815` today);
-  - the MMID exact queue needs no wait of its own: it is `ctx.stream()` (`:74943`), so the
-    execution-queue wait covers its submits and host tasks (`:75040-75060`);
+  - the cache's queues (`cache->get_queue()` and `get_bcs_queue()`, waited at `:4788-4790` and
+    `:4803-4805` today);
+  - the MMID exact queue needs no wait of its own: it is `ctx.stream()` (`:75151`), so the
+    execution-queue wait covers its submits and host tasks (`:75254-75264`);
   - the CPU-dispatch queue (`ggml_sycl_get_cpu_queue`, `cpu-dispatch.cpp:4771`, submitted
     through `cpu_submit_async`, `:252-266`);
   - each device's TP queue when TP is on (`ggml_sycl_get_tp_queue`, `common.cpp:194`), and the
-    TP device-1 worker's own queue (`:47946`);
+    TP device-1 worker's own queue (`:48143`);
   - each device's PP pipeline copy queue when `GGML_SYCL_PP_PIPELINE` is on
-    (`g_pipeline_copy_queue`, `:23299`).
+    (`g_pipeline_copy_queue`, `:23431`).
 
-  The last two are not in zhcn rev 5.1's list; zhcn is asked to add them (they submit on
-  queues the device wait does not cover).
+  zhcn rev 5.1's list lacks three of these: the cache's `get_bcs_queue()`, the TP worker's
+  queue, and the PP pipeline copy queue. zhcn is asked to add them (each submits on a queue the
+  device wait does not cover; r7 m-1). **The invariant (rulings §Z52 "Order"):** MEASURE and the
+  coverage query are read-only and run before (s); (s) runs only on the growth path, after L0;
+  and it completes before (c)'s occupancy check and move-out and before any reap or release.
 
-  A queue added later must join the list. If one is missed, (d)'s backstop makes the miss a
-  loud `[CONTEXT-PLAN-BUG]`, never a free under queued work. **Nothing between (s) and (d)
-  publishes a retention whose event postdates (s) (r6 m-2):** (a)'s own-context clear submits
-  no device work (its per-context input-staging reset, `graph_input_staging_clear`, ignores its
-  queue: `common.hpp:6454-6457`); A4's gallocr free takes the queue's last event and submits no
-  barrier (§2.3.2); and the record-mode vacate's marker is a claim-state event that retains
-  nothing (§2.3.2).
-- **(0) Probe.** zhcn's measure pass has already sized the candidate's tenants. A side-effect-free
-  fit places the candidate's head slots on the live geometry, with the context's current
-  tenant slots counted free by arithmetic only; their extents are copied out under the
-  `kv_region_mutex_` leaf, which is then released. **The probe checks the host tier too (r5
-  I-I(3)):** the candidate's new host-slot bytes (those not reused in place, below) against the
-  host zone's free room without growth (a republish never grows the pool, §2.4.3). A refusal
-  stops here with nothing released. zhcn's probe runs for every device before any (i), so a
-  predictable refusal is atomic across devices and the host tier.
-- **The new host slots are allocated after (0) and before (i)** (r5 I-I(3); lead ruling), with
-  no lock held, through §2.4.3's owner-first call, into the guard. **A host slot whose
-  published cap covers its new need is reused in place (rulings §B step 4; r6 m-10)**; only the
-  others are allocated new. A host shortfall is a refusal with nothing released yet. The
-  context's **old** host slots are not dropped by (i): (e) moves them from the table into the
-  registry entry, a reused one goes into the new table at the commit, and a superseded one moves
-  into the guard at the commit and drops after L1 (step 8 (c)-(d)).
+  A queue added later must join the list. If one is missed, (d)'s backstop makes the miss a loud
+  `[CONTEXT-PLAN-BUG]`, never a free under queued work. **Nothing between (s) and (d) publishes
+  a retention whose event postdates (s) (r6 m-2):** (a)'s own-context clear submits no device
+  work (its per-context input-staging reset, `graph_input_staging_clear`, ignores its queue:
+  `common.hpp:6457-6460` at `3d9414c8c`); A4's gallocr free takes the queue's last event and
+  submits no barrier (§2.3.2); and the record-mode vacate's marker is a claim-state event that
+  retains nothing (§2.3.2).
+- **(0) Probe, then hold its placements (rulings §M7 I-3(b), I-5(a)).** zhcn's measure pass has
+  already sized the candidate's tenants. A fit places the candidate's head slots on the live
+  geometry, with two kinds of room counted free **by arithmetic only**: the context's current
+  tenant slots, and, when this context is the ring's sole contributor and its ring must grow,
+  the ring's old slots (§2.7). Their extents are copied out under the `kv_region_mutex_` leaf,
+  and the ring's under the ring record's lock, each then released. (0) takes **no ring-lock
+  copies and no pins**: it is not step 2's ring-lock section, and "no side effects" (step 4,
+  "Probe mode") excludes both. So a growth that fits only in the old ring's room passes (0), and
+  nothing (0) did keeps the old ring allocated into (ii). **The probe checks the host tier by
+  arithmetic too (rulings §D15; r5 I-I(3)):** the candidate's host slots against the context's
+  held host reservation (§2.4.3). A refusal stops here with nothing released. zhcn's probe runs
+  for every device before any (i), so a predictable refusal is atomic across devices and the
+  host tier.
+
+  **If (0) fits, its placements become this call's pending ranges at once** (rulings §M7
+  I-5(a)), recorded under the group mutex on each TLSF before anything is released. They cover
+  the part of the freed room the candidate will use and any free room the fit used beside it.
+  From here until (ii) carves or the guard's first phase clears them, `allocate_excluding` keeps
+  every weight allocation, expert-cache fill and MoE layout materialization out of them
+  (§2.3.3), and none of those takes L0. A range that overlaps a still-allocated old slot is
+  harmless: the block is allocated anyway, and when (f) frees it the room is already excluded.
+  So the window between (f) and (ii), in which a fill that takes no lock could land in the freed
+  room, no longer exists.
+- **Host slots on this path (rulings §D15; r6 m-10; r7 I-6).** The context's host slots were
+  sub-carved at the plan's maximum caps from its held host reservation at the first publish
+  (§2.4.3), so every candidate the plan admits is covered on the host tier: its host slots are
+  reused in place, nothing is allocated, and nothing is released. A candidate whose host need
+  exceeds the reservation is refused **arithmetically** at (0), against the reservation and
+  never against live free room (rulings §B step 4). (c) moves the host slots from the table into
+  the registry entry, and they go into the new table at the commit.
 - **Device slots are reused per slot on this path too (rulings §B step 4).** A device slot at
-  the same `(cohort, index, device)` whose cap covers its new need is not released by (i): (e)
+  the same `(cohort, index, device)` whose cap covers its new need is not released by (i): (c)
   moves it into the registry entry, not the batch, and (ii)'s fit places that head slot on it
   (`reservations`, §2.4.1) and carves nothing for it. Only a slot that outgrows its cap, or an
   index the candidate no longer uses, is reaped and dropped. So a candidate that grows one
-  cohort frees and re-carves only that cohort's slots. The old+new host peak (at most 61.65 MiB
-  on GPT-OSS) is paid only by the slots that grow.
+  cohort frees and re-carves only that cohort's slots.
 - **(i) Before L1: release, by a synchronous targeted reap (zhcn r3 I-3; r5 I-G; lead ruling
   "B", 2026-09-26; r6).** The sequence is llama's, because it interleaves the scheduler's
   destruction; this design supplies the backend steps and the rules they keep. There is no
   poll, no sleep and no timeout anywhere in it. The only wait is (d)'s backstop, on an event
   that (s) should already have completed.
-  - **(a) This context clears its own executable graphs, and nothing else (zhcn r3 I-3; r6
-    I-2; lead ruling).** On its own thread, with no lock held, outside `graph_compute`, and only
-    if this context has a recorded graph, a new own-context clear runs per backend. It destroys
+  - **(a) This context clears its own executable graphs, and nothing else (zhcn r3 I-3; r6 I-2;
+    lead ruling).** On its own thread, with no lock held, outside `graph_compute`, and only if
+    this context has a recorded graph, a new own-context clear runs per backend. It destroys
     that backend's executable graphs and releases its `graph_retained_handles` and its pools'
     graph retentions, which in record mode releases the claims those graphs hold (§2.3.2 "Per
     execution mode"). Without it, after any recorded decode the old slot blocks stay alive
-    through `graph_retained_handles` (master `ggml-sycl.cpp:96856`), which the drain does not
-    wait on (`mem-handle.cpp:88-91`), and the probe's "free by arithmetic" would be false.
-    - It is **not** `sycl_exec_graph_clear_active` (master `11faace69`
-      `ggml-sycl.cpp:99102-99151`), which also does two process-global things:
-      - `release_graph_retained_handles()` (`:99072`; `mem-handle.cpp:2060-2070`) swaps out the
+    through `graph_retained_handles` (master `3d9414c8c` `ggml-sycl.cpp:97064`), which the drain
+    does not wait on (`mem-handle.cpp:88-91`), and the probe's "free by arithmetic" would be
+    false.
+    - It is **not** `sycl_exec_graph_clear_active` (master `3d9414c8c`
+      `ggml-sycl.cpp:99310-99359`), which also does two process-global things:
+      - `release_graph_retained_handles()` (`:99280`; `mem-handle.cpp:2060-2070`) swaps out the
         whole `graph_unwaitable` list, every context's entries included, and those can back
         another context's live executable graph (`mem-handle.cpp:92-103`);
-      - `ggml_sycl_cpu_staging_cache_clear()` (`:99147`) clears `g_leaf_staging_cache`
+      - `ggml_sycl_cpu_staging_cache_clear()` (`:99355`) clears `g_leaf_staging_cache`
         (`cpu-dispatch.cpp:2491-2496`), an unordered map with no mutex that another context's
         compute thread may be using while (a) runs.
-    - It also calls `graph_unpin_moe_experts` and `graph_unpin_weights` (`:99148-99149`). A
+    - It also calls `graph_unpin_moe_experts` and `graph_unpin_weights` (`:99356-99357`). A
       per-context re-plan never unpins MoE experts or weights (rulings §B step 5; oze0).
     - None of these is reachable from (i) (H7af). This context's own slices that reached
       `graph_unwaitable` are removed by (d)'s owner-filtered scan, so neither this design nor
       zhcn's depends on the global release.
     - The gate on a recorded graph keeps (a) off the other tenant-key changes: the dkw0 comment
-      (`:99093-99101`) records that the existing clear is not side-effect-free even when
+      (`:99301-99309`) records that the existing clear is not side-effect-free even when
       nothing is recorded.
     - This is not the cross-context graph clear the r4 addendum withdrew (§2.9): a context acts
       only on its own graphs, on the thread that drives it, at a point where it is not
@@ -1407,17 +1547,23 @@ contribution. It never re-fits KV and never yields.
     graphs, which vacated those claims on an eager event, so none is left at (c). The one state
     on master that looked
     like an in-flight occupier, u1bb's ring slot kept `busy` until its `done_event` completes, is
-    vacant-with-event under §2.7's conversion. Otherwise:
+    vacant-with-event under §2.7's conversion. Otherwise (rulings §B steps 7-8; zhcn §3.1 step
+    5(c); r7 m-1):
     - **take every holder of the published slot table (rulings §B step 8; r6 I-3):** move the
       registry entry's `shared_ptr` into the local batch, and reset each backend context's
       cached pointer (§2.3.2). This is legal because (c) runs on the context's own thread, which
       is not computing, and (b) released every claim; a claim that finds no table is
       `[CONTEXT-PLAN-BUG]` with an error status;
+    - **check the table, then open it:** its `use_count()` must be 1, the batch's own
+      reference, else `[CONTEXT-PLAN-BUG]` naming the table's holder (the holder scan, (e)).
+      Only then is it opened: each old **device** slot that the candidate reuses in place and
+      each old host slot move into the registry entry; each growing device slot and each index
+      the candidate no longer uses move into the batch; the emptied table is dropped;
     - clear the tenant key; unlock.
 
-    The table is not opened here; (e) checks it before anything is moved out of it. The reap's
-    owner list (d) is read from the table's handles, which nobody mutates once it is taken.
-    (c) is rulings §B steps 7 and 8.
+    The reap's owner list (d) is the batch's device handles, which nobody else can reach once
+    the table is taken. zhcn opens the table at the same point, so the two designs agree (r7
+    m-1).
   - **No step 8′ (rulings §B.2, superseding §B.1).** Revision 7.4 had a step (c′) here that
     erased this context's entries from four backend caches. It is deleted: every one of those
     caches only compares identity (`stable_identity_equal`, `common.hpp:6706` and `:7040` at
@@ -1427,12 +1573,45 @@ contribution. It never re-fits KV and never yields.
     tenant publish generation, and every `runtime_tensor_extras` publisher restores at scope
     exit; all of that is zhcn's scope, specified in rulings §B.2 and not restated here. So (d)
     follows (c) directly, and the three §B holder classes stand (e).
+  - **The holder census beyond §B.2's list (rulings §M7 I-7; r7 I-7).** No step 8′ means the
+    census carries the whole §B.2 load, so it must name every container that can own a tenant
+    slice between graphs. Three more do, at master `3d9414c8c`:
+    - **`graph_input_staging`** (`common.hpp:6338-6343`, used at `:6375-6428`): a per-context
+      map keyed by a raw `ggml_tensor *`, whose entries own a `mem_handle` and persist across
+      graphs; it is cleared only by `graph_input_staging_clear` (`:6457`), that is only inside
+      (a), which runs only when something is recorded. After beni converts
+      `graph_input_stage` to a CONTEXT tenant cohort (§2.4.3), every growth republish of a
+      context with nothing recorded would trip (c) or (e). The fix holds on the eager path as
+      well as in record mode: the map keeps only a non-owning `mem_handle_identity` and the
+      capacity, and the staging storage is claimed by index from the `graph_input_stage` slot
+      each graph, so its slice leaves graph compute through the claim and the retained store
+      like any other tenant slice. A recorded graph's claim lives in that graph's container
+      (class 3, rulings §REC). zhcn's §3.1.1 lists the map as "not a holder"; it is one until
+      this fix lands, and the two designs now classify it the same way (told to zhcn);
+    - **`g_moe_ids_d2h_cache`** (`ggml-sycl.cpp:19457`) and **`g_moe_prompt_admission_cache`**
+      (`:19513`): `thread_local` maps keyed by `moe_ids_cache_key`, whose `handle` field owns
+      the ids tensor's compute slice (`common.hpp:5713-5736`). They are cleared only at the next
+      graph start (`:19985`, `:19998`) or at model teardown (`:33767`), so between graphs they
+      hold that slice. §B.2's fix is on the **key type**, so it covers both maps and the context
+      member (`common.hpp:5750`) at once: the key's `handle` becomes a non-owning
+      `mem_handle_identity`. The entry values' own `device_handle` and `staging_handle` are the
+      cache's allocations, not tenant slices; if beni converts either to a tenant claim, it
+      falls under the same rule;
+    - **`g_data_ptr_cache`** (`:19339`), a `thread_local` map from `(tensor, device)` to an
+      owning `mem_handle`, cleared at graph start (`:19342`). §B.2 binds: it keys on identity
+      plus the tenant publish generation and holds no owning handle. zhcn's clear at
+      `graph_compute` exit is **in addition** to that key fix, never instead of it (rulings §M7
+      I-7): a clear on one thread's exit does not reach another thread's `thread_local`
+      instance.
+
+    Each is either a non-owning identity key or holds no owning handle of a tenant slice past
+    `graph_compute` exit. H7ag names all four, each with a mutation witness.
   - **(d) The reap, with no L1-L5 lock held (lead ruling "B"; r6 I-1, I-2, m-3, m-5; zhcn rev
     5).** zhcn's mem-handle call, shared with llama.cpp-uwlx's yield (jehw), is
     `retained_reap_result release_retained_referencing(const retained_reap_request &)`. The
     request is `{const mem_handle * owners; size_t n_owners; retained_reap_precondition pre;
-    const char * reason; bool * owner_pending}` (rulings §R). Its owners are the old slots the
-    candidate does not reuse, read from the taken table, plus the ring's moved-out slots; a
+    const char * reason; bool * owner_pending}` (rulings §R). Its owners are the batch's device
+    handles (the old slots the candidate does not reuse), plus the ring's moved-out slots; a
     reused slot is not an owner, because it is not freed. It is built with
     `pre = RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER` and `owner_pending = nullptr`. The other
     precondition, `RETAINED_REAP_QUERY_EVENT_STATUS`, is uwlx's: it keeps what is pending and
@@ -1450,8 +1629,8 @@ contribution. It never re-fits KV and never yields.
       live handles vector that the worker clears outside the mutex, and yields (a cv wait, which
       releases the mutex) until the worker clears it: at most one completed-event return and one
       drop or park. Today the worker pops, waits, clears and decrements in separate sections
-      (`mem-handle.cpp:126-177` at `11faace69`); the change lands with the reap's
-      implementation, zhcn's or jehw's, whichever lands first;
+      (`mem-handle.cpp:126-177`, the same at `11faace69` and `3d9414c8c`); the change lands with
+      the reap's implementation, zhcn's or jehw's, whichever lands first;
     - after the yield, the process-global `graph_unwaitable` list, per handle, by owner-control
       identity. So a copy the worker parked during the yield, through its `"command graph"`
       catch (`mem-handle.cpp:143-162`), is caught (lead ruling), and the reap does not depend on
@@ -1464,22 +1643,32 @@ contribution. It never re-fits KV and never yields.
     holding, costs no wait: the query blocks only on an incomplete event. An incomplete event
     means a queue that (s) did not cover. The record is then **waited, never freed early**, so
     there is no use-after-free, and the miss is `[CONTEXT-PLAN-BUG]`: a WARN by default, an
-    abort under `GGML_SYCL_STRICT_PLAN=1`. It is not re-queued and reported pending, because that
-    would turn a missed queue into a silent pending. A `graph_unwaitable` match carries no event;
-    it is dropped on the precondition that (s) and (a) destroyed every executable graph that
-    could use it (zhcn rev 5). Retained handles are otherwise released only by the background
-    worker (`mem-handle.cpp:2039-2052`), which is why the step exists.
-  - **(e) The use-count check (rulings §B step 10; r6 I-3).** With no lock held, on the local
-    batch, in this order:
-    - **the table first:** its `use_count()` must be 1, the batch's own reference, else
-      `[CONTEXT-PLAN-BUG]` naming the table's holder. Only then is it opened: each old
-      **device** slot that the candidate reuses in place (below) and each old host slot move
-      into the registry entry, under `kv_region_mutex_` briefly; every other device slot moves
-      into the batch; the table is dropped;
+    abort under `GGML_SYCL_STRICT_PLAN=1`. The BUG line carries the count of records the
+    backstop waited, and a `GGML_SYCL_PRIVATE_TESTING` counter accumulates it; §R's five-field
+    result is unchanged (rulings §D16; r7 m-6). It is not re-queued and reported pending,
+    because that would turn a missed queue into a silent pending. A `graph_unwaitable` match
+    carries no event; it is dropped on the precondition that (s) and (a) destroyed every
+    executable graph that could use it (zhcn rev 5). Retained handles are otherwise released
+    only by the background worker (`mem-handle.cpp:2039-2052`), which is why the step exists.
+
+    **The ring's moved-out retentions are dropped here too (rulings §M7 I-3(a)).** The
+    last-generation `retained_owners[slot]` that the ring's move-out took (below) are slices of
+    the old ring slots and share their controls (`mem-handle.hpp:70-72`, `:84`), so each would
+    count in that slot's `use_count()`. They are not in the retained store, so the reap does not
+    see them; (d) handles them itself, after the reap and before (e): each one's
+    `done_events[slot]` takes the same backstop (query; an incomplete event is waited, counted
+    in the same BUG line and counter, never freed early), and then the retention is dropped.
+    They are never held in the batch across (e).
+  - **(e) The use-count check (rulings §B step 10; r6 I-3; rulings §M7 I-3).** With no lock
+    held, on the local batch (the table was checked and opened at (c)):
     - each moved-out CONTEXT tenant handle must have `use_count() == 1`, the batch's own
       reference;
     - each old ring slot must have `use_count() ≤ 1 + P[slot]`, the guard pins snapshotted at
-      the ring's move-out ("The ring", below; r6 I-4).
+      the ring's move-out ("The ring", below). Pins come only from a transaction guard's step 2,
+      and under L0 no other guard is alive at the move-out while this call's (0) takes none, so
+      P is 0 on every path and the check is `use_count() == 1`. A nonzero snapshotted P is
+      itself `[CONTEXT-PLAN-BUG]` (a guard outlived its transaction, or a mutator skipped L0;
+      r7 m-3).
 
     Anything else is `[CONTEXT-PLAN-BUG]`, aborting under `GGML_SYCL_STRICT_PLAN=1`. The BUG
     line is followed by a holder scan over the census containers (zhcn rev 5 row 13), so it
@@ -1492,34 +1681,38 @@ contribution. It never re-fits KV and never yields.
     per-context graph container that (a) clears (rulings §B, §B.2; H7ag; r6 I-3). Two kinds of
     holder are design errors to fix in their producers, never to exempt:
     - a per-op cache that keeps an owning handle of a slice past submission, such as the oneDNN
-      Graph scratch park, or any park beni's conversions leave. A cache that only compares
+      Graph scratch park, the four containers the holder census names (above), or any park
+      beni's conversions leave. A cache that only compares
       identity holds a non-owning `mem_handle_identity` instead (rulings §B.2);
     - a `host_task` lambda that captures a tenant-slot handle instead of publishing its
       retention through the store (zhcn rev 5).
 
     It is never `busy` and never a timeout.
-  - **(f) Drop the batch**, with no lock held, after the backstop. The unpinned blocks are
-    really free before (ii), so (ii)'s live-TLSF fit never sees a graph- or event-held tenant
-    block; its live-TLSF reading stays as the belt (below).
-  - **The ring (rulings §RING; r4 I6; r5 I-A; r6 I-4).** If this context is the ring's **sole**
-    contributor and its ring must grow, then right after (c)'s unlock (never nested with the leaf
-    `kv_region_mutex_`), under the ring record's lock:
+  - **(f) Drop the batch**, with no lock held, after (e). The blocks are really free before
+    (ii), so (ii)'s live-TLSF fit never sees a graph- or event-held tenant block; its live-TLSF
+    reading stays as the belt (below). The room they free that the candidate uses has been this
+    call's pending range since (0) (rulings §M7 I-5(a)), so no allocation that takes no L0 can
+    land in it before (ii) carves.
+  - **The ring (rulings §RING, §M7 I-3; r4 I6; r5 I-A; r6 I-4).** If this context is the ring's
+    **sole** contributor and its ring must grow, then right after (c)'s unlock (never nested
+    with the leaf `kv_region_mutex_`), under the ring record's lock:
     - mark the record `RELEASING` with this context as its owner, and bump `ring_plan_gen`;
-    - move out into the batch the slot handles, **and each slot's slot-state retention of its
-      last generation** (`retained_owners[slot]` with `done_events[slot]`; master `11faace69`
-      `ggml-sycl.cpp:1526`, set at the record, `:1722`). That retention is not in the retained
-      store, so the reap cannot see it, and without the move it keeps every ring slot PP MoE
-      has used allocated until that index is next claimed;
+    - move out the slot handles into the batch, **and, separately, each slot's slot-state
+      retention of its last generation** (`retained_owners[slot]` with `done_events[slot]`;
+      master `3d9414c8c` `ggml-sycl.cpp:1526`, set at the record, `:1722`). That retention is
+      not in the retained store, so the reap cannot see it, and without the move it keeps every
+      ring slot PP MoE has used allocated until that index is next claimed. (d) drops it
+      through the backstop before (e); it never sits in the batch across (e);
     - snapshot `P[slot] = pinned[slot]`;
     - a claimed ring slot is `[CONTEXT-PLAN-BUG]`, as for any tenant.
 
-    The moved-out retentions take (d)'s backstop on their `done_events`, and the old slots go
-    through the same reap. The bound `use_count() ≤ 1 + P[slot]` is sound: once RELEASING is
-    set and the handles have left the record, no new pin can be taken (every other transaction
-    waits on L0, and the owner's own (ii) finds no handles to copy),
-    and pins only fall. Any excess is `[CONTEXT-PLAN-BUG]`; nothing is exempt. A pinned block
-    is freed when its guard drops the copy, after that transaction's step 8 (a) fails on the
-    generation; until then (ii)'s belt counts it as allocated.
+    The old slots go through the same reap as the tenant slots. The bound
+    `use_count() ≤ 1 + P[slot]` is sound: once RELEASING is set and the handles have left the
+    record, no new pin can be taken (every other transaction waits on L0, and the owner's own
+    (ii) finds no handles to copy), and pins only fall. P is 0 under L0, and a nonzero P is
+    `[CONTEXT-PLAN-BUG]` ((e)); any excess over the bound is `[CONTEXT-PLAN-BUG]` too, and
+    nothing is exempt. (0) made the growth possible without any of this: it counted the old
+    ring free by arithmetic and took no copy (rulings §M7 I-3(b)).
     - Revision 7.1 exempted the old ring slots from (e) outright. That hid the slot-state
       retention: the sole-contributor release freed nothing, (ii) refused the growth without
       demoting and without saying why, and a stray holder of an old ring slot went unreported
@@ -1542,17 +1735,19 @@ contribution. It never re-fits KV and never yields.
     and the ring. If the revert is refused too, the decode fails with that refusal, naming the
     tenant bytes.
 - **(ii) Under L1.** Steps 2-4 run for the head slots only, with the region fixed; a RELEASING
-  mark this call owns passes its own step 2. They re-fit on the **live** TLSF, so a block whose
-  release has not completed is TLSF-allocated and counts as allocated by construction (the belt;
-  zhcn's row 4a): the worst case is a refusal, never an overlap. Under the re-plan mutex no such
-  block exists after (e) (a ring slot pinned by another transaction's guard would need a second
-  transaction on the device), so the belt guards only against a bug. If they fit, step 5 records
-  their pending ranges (no yield), step 6 carves them, and steps 7-8 run. If they do not, the
-  candidate is refused with the tenants-alone message, **with no demotion**, and the ladder
-  moves on; a setter or encode surfaces the refusal as a decode error naming the tenant bytes.
-  Only a weight allocation between (0) and L1 can take the released tenants' room (another
-  re-plan cannot, under the re-plan mutex); zhcn's ladder revert republishes the previous
-  candidate.
+  mark this call owns passes its own step 2. The fit is restricted to this call's own pending
+  ranges, recorded at (0), exactly as step 6's re-fit is (`own_ranges`): nothing else can have
+  entered them, because every allocation on those TLSFs honours them and no other re-plan runs
+  under L0, and (f) freed what they overlapped. It reads the **live** TLSF, so a block whose
+  release has not completed counts as allocated by construction (the belt; zhcn's row 4a): the
+  worst case is a refusal, never an overlap. On a correct run (ii) therefore places exactly what
+  (0) placed, step 6 carves it, and steps 7-8 run; step 5 records nothing new and nothing
+  yields. If (ii) does not fit, some old block is still allocated, which means a holder that (e)
+  already reported as `[CONTEXT-PLAN-BUG]` (an abort under STRICT). Without STRICT the candidate
+  is then refused with the tenants-alone message, **with no demotion**, and the ladder moves on;
+  a setter or encode surfaces the refusal as a decode error naming the tenant bytes. It is not a
+  runtime race: no allocation that skips L0 can take the room (rulings §M7 I-5; r7 I-5), and
+  zhcn's ladder revert republishes the previous candidate.
 - The ladder's reservations therefore stay one KV region per `(c, d)`, which C3's trace counts.
 
 **Why "re-fit after `sched_reserve`" is ruled out (r3 I3).** A republish after `sched_reserve`
@@ -1704,60 +1899,62 @@ inventory. What differs, because it is not in the device geometry:
 - **It is not a head slot of `kv_region_fit`.** No VRAM TLSF holds it, so it neither competes
   with KV nor demotes anything; demoting a KV layer would add host bytes, not free them. A
   host-tier shortfall refuses the candidate with the tenants-alone message.
-- **It is allocated before L1, owner-first, never carved under L1 (zhcn M2; lead ruling; closes §5
-  (i)).** The host arena is a lazily grown `pinned_chunk_pool` (`unified-cache.cpp:4235` at
-  `2c4f5e45d`, `:4253` at `11faace69`; created with `committed=0.0 GB`), so a host-zone allocation
-  can need a new pinned chunk, which is a USM call, and a USM call must not run under L1. The
-  transaction therefore allocates the new host slots before L1 (after the probe and **before**
-  step (i) on the tenant-only path, so a host shortfall refuses with nothing released; after
-  step 1 and before step 2 on the full one) through the unified cache's owner-first surface,
-  **`unified_allocate_owner`** (`unified-cache.cpp:15815` at `11faace69`; `:15797` at
-  `2c4f5e45d`), never a bare USM call outside unified-cache code. The request (r5 I-I(1)):
-  `must_host_pinned` and `use_pinned_pool` set,
-  category `HOST_COMPUTE`, cohort `context-compute-host`, `require_host_usm_base` false, and
-  `forbid_host_zone_growth` false at the first publish and true afterwards (below); the pattern is
-  master `11faace69` `unified-cache.cpp:6515-6527`. `unified_allocate_owner_impl` classifies it as
-  `CACHE_SUBALLOCATION` and mints the control first (`:15729-15812`), and the result is handed to
-  the registry through `mem_handle::from_owned_alloc`. **Inside a claim scope**, the SYCL_Host
-  buft's `alloc_buffer` becomes a claim of these slots and no longer allocates through the
-  legacy `unified_alloc` → `from_legacy_owned_alloc` path (`ggml-sycl.cpp:42466-42475`).
-  **Outside a claim scope it keeps that path (r6 m-11):** llama's output buffer
-  (`11faace69` `src/llama-context.cpp:3492-3499`) and the LoRA and control-vector tensors also
-  allocate on the SYCL_Host buft, and zhcn keeps them out of every claim scope (zhcn T10, its
-  gate 20). The path is
-  `unified_allocate_owner_impl` (the control is minted first, `:15711`), `unified_alloc` (`:14699`),
-  the contiguous host-zone allocation (`:15050-15092`), and on a miss `host_zone_grow` →
-  `pinned_chunk_pool::grow_zone` → `grow_into`, under the pool's own lock (§2.10's census row). They
-  are real allocations from the start, so they need no pending range. The guard holds them; a failed
-  host allocation is a refusal before L1; a rollback drops them in the guard's second phase, with no
-  lock held; and **the commit only installs** the handles into the registry entry, a move, not an
-  allocation. On the tenant-only path a host slot whose published cap covers its new need is
-  reused in place and allocates nothing (r6 m-10; §2.4.2); a replaced one is superseded at that
-  install and dropped after L1 is released. On the full path there are none (it runs only at a
-  context's first publish).
-  Two transactions' pre-L1 host allocations cannot over-admit, because the allocation is the charge
-  and the pool serialises `host_zone_alloc`/`grow`; the worst case is a spurious refusal while a
-  doomed transaction still holds its host slots, accepted like r4 m13.
-- **The first publish reserves the host-tier headroom (lead ruling on the pool's phase gate).**
-  `grow_into` WARNs, and at `GGML_SYCL_HOST_ALLOC_PHASE_GATE` ≥ 2 asserts, when the pool grows
-  during a PP or TG phase (`pinned-pool.cpp:865-882`), and a setter republish after a decode
-  could reach it. So growth is allowed only at the **first** publish, at context creation,
-  outside any inference phase: it allocates the tenant set's host slots with
-  `forbid_host_zone_growth = false`, and records that capacity as the context's host-tier
-  reservation. Every later tenant-only republish allocates with `forbid_host_zone_growth =
-  true` against the reservation, so a post-decode republish never grows the pool.
-  - **The reservation covers the plan's maximum tenant demand (rulings §D15).** The first
-    publish reserves host-slot room for the top ladder candidate the plan admits, not only for
-    the first candidate, and holds it. So a republish within the plan, including its old+new
-    host peak, never competes with expert-cache host fills or host weight staging, neither of
-    which takes L0.
-  - A host need above the reservation is a genuine shortfall: a **candidate refusal** with the
-    tenants-alone message at rulings §B step 4, before anything is released, never a growth
-    under the gate and never a transient.
-  - Expert-cache host fills are themselves planned capacity (P4; 1oxa r3 I5); host growth the
-    plan does not account for is a plan bug, not a race to tolerate.
+- **It is allocated before L1, owner-first, never carved under L1 (zhcn M2; lead ruling; closes
+  §5 (i)).** The host arena is a lazily grown `pinned_chunk_pool` (`unified-cache.cpp:4235` at
+  `2c4f5e45d`, `:4253` at `11faace69`; created with `committed=0.0 GB`), so a host-zone
+  allocation can need a new pinned chunk, which is a USM call, and a USM call must not run under
+  L1. The transaction therefore allocates the context's host reservation (below) before L1,
+  after step 1 and before step 2 of the full transaction at the context's first publish, through
+  the unified cache's owner-first surface, **`unified_allocate_owner`**
+  (`unified-cache.cpp:15815` at `11faace69`; `:15797` at `2c4f5e45d`), never a bare USM call
+  outside unified-cache code. The request (r5 I-I(1)): `must_host_pinned` and `use_pinned_pool`
+  set, category `HOST_COMPUTE`, cohort `context-compute-host`, `require_host_usm_base` false,
+  and `forbid_host_zone_growth` false, since it runs only at the first publish (below); the
+  pattern is master `11faace69` `unified-cache.cpp:6515-6527`. `unified_allocate_owner_impl`
+  classifies it as `CACHE_SUBALLOCATION` and mints the control first (`:15729-15812`), and the
+  result is handed to the registry through `mem_handle::from_owned_alloc`. **Inside a claim
+  scope**, the SYCL_Host buft's `alloc_buffer` becomes a claim of these slots and no longer
+  allocates through the legacy `unified_alloc` → `from_legacy_owned_alloc` path
+  (`ggml-sycl.cpp:42466-42475`). **Outside a claim scope it keeps that path (r6 m-11):** llama's
+  output buffer (`11faace69` `src/llama-context.cpp:3492-3499`) and the LoRA and control-vector
+  tensors also allocate on the SYCL_Host buft, and zhcn keeps them out of every claim scope
+  (zhcn T10, its gate 20). The path is `unified_allocate_owner_impl` (the control is minted
+  first, `:15711`), `unified_alloc` (`:14699`), the contiguous host-zone allocation
+  (`:15050-15092`), and on a miss `host_zone_grow` → `pinned_chunk_pool::grow_zone` →
+  `grow_into`, under the pool's own lock (§2.10's census row). The reservation is a real
+  allocation from the start, so it needs no pending range. The guard holds it; a failed host
+  allocation is a refusal before L1; a rollback drops it in the guard's second phase, with no
+  lock held; and **the commit only installs** the handle into the registry entry, a move, not an
+  allocation. The full path runs only at a context's first publish, and the tenant-only path
+  allocates nothing on the host tier (below).
+- **The first publish reserves AND HOLDS the host-tier room (rulings §D15; r7 I-6; lead ruling
+  on the pool's phase gate).** `grow_into` WARNs, and at `GGML_SYCL_HOST_ALLOC_PHASE_GATE` ≥ 2
+  asserts, when the pool grows during a PP or TG phase (`pinned-pool.cpp:865-882`), so the one
+  host allocation happens at the **first** publish, at context creation, outside any inference
+  phase:
+  - **One held carve.** The first publish allocates a single owner-first carve, the context's
+    **host reservation**, through the request above, and holds it in the registry entry for the
+    context's life. "Reserves" means this carve holds the bytes: a flag such as
+    `forbid_host_zone_growth` reserves nothing, and revision 7.5's "records that capacity"
+    reserved nothing either (r7 I-6).
+  - **Its size is the plan's maximum tenant host demand:** for each host `(cohort, index)`, the
+    largest `slot_bytes` over every candidate the plan admits (each ladder rung up to the top),
+    summed. That envelope is at least any single candidate's total.
+  - **Host slots are sub-carved from it**, at those maximum caps, as offset views that share the
+    reservation's control (the slice form §2.3.2's claims use). So every candidate the plan
+    admits is covered on the host tier, a republish never allocates host bytes, and no host slot
+    is ever released and re-allocated within the plan.
+  - **A request beyond it is refused by arithmetic, against the reservation**, never against
+    live free room: a **candidate refusal** with the tenants-alone message at rulings §B step 4
+    ((0) on the tenant-only path), before anything is released, never a growth under the gate
+    and never a transient. The setters and warmup are not ladder candidates, so they can reach
+    this refusal; it is deterministic in the plan.
+  - Expert-cache host fills and host weight staging take no L0 and allocate from the same pinned
+    pool (zhcn T7). Between publishes they can take any free host room, but not the
+    reservation, which is allocated. They are themselves planned capacity (P4; 1oxa r3 I5); host
+    growth the plan does not account for is a plan bug, not a race to tolerate.
 
-  §3.1 H4 carries the cases.
+  §3.1 H4 carries the cases, including the RED where a concurrent host fill takes the room.
 
 **The record (r3 I2, I7; r4 I1, I4, m12).**
 ```
@@ -2208,6 +2405,36 @@ unchanged. The arena-device uses of `kv_admission_mismatch`, `kv_vram_cap` and
     the release proc once its drop is done (r5 I-A). This closes r4's race in which B, running
     in A's window, published a ring A had released, and r5's three further routes to the same
     absent-ring publish (§3.1 H9).
+  - **A model load never releases or re-sizes the ring (llama.cpp-r7fz; rulings §M7 I-4).** On
+    master, `populate_inventory_globals` (`3d9414c8c` `ggml-sycl.cpp:15891`, reached from
+    `ggml_backend_sycl_compute_placement_plan_early` at model load) overwrites the device's
+    planned ring sizes and depth (`unified_cache_set_planned_pp_moe_onednn_scratch`,
+    `:15967-15970`), releases the physical ring whenever it holds KV-zone bytes
+    (`release_pp_moe_onednn_scratch_ring()`, `:15983-16000`; its own comment says this "also
+    releases a ring that another still-loaded model's live context admitted"), clears the
+    KV-zone slot flags (`:16002`), and overwrites the per-row bytes and the planned `n_ubatch`
+    (`:16013-16015`). On an arena device the KV-zone half is always fit-placed, so that release
+    would fire on every load that follows a live PP MoE context: with model A live on device 0,
+    B's load (an L0 holder, so serialized) releases A's ring, and A's next PP MoE claim finds an
+    empty ring, which is `[CONTEXT-PLAN-BUG]` with an error status, a −2 that is fatal on the
+    server. On arena devices, therefore:
+    - a load neither releases the ring nor writes the ring record's sizes, depth, split flags,
+      per-row bytes or `n_ubatch`. The ring record changes only through contributions: a
+      context's contribution is computed from **its own model's** plan (its per-row bytes and
+      depth, carried in that model's `placement_plan`, not in device globals), recorded at its
+      commit, and removed by its release proc;
+    - storage is released only by the release proc's last-contributor drop and by the
+      sole-contributor move-out (above);
+    - a load only adds: its model's ring demand enters the device's plan when a context of that
+      model contributes.
+
+    A device with no arena keeps master's behaviour, outside this design. **Gate (H7z):**
+    `release_pp_moe_onednn_scratch_ring` and the planned-ring setters
+    (`unified_cache_set_planned_pp_moe_onednn_scratch`, `_kv_zone_slots`, `_row_bytes` and
+    `_n_ubatch`) are reachable, on the arena path, only from the release proc, the
+    sole-contributor move-out and the commit's install (§2.4.2 step 8); the mutation witness
+    restores the `populate_inventory_globals` release. **Test (H9):** "load B while A
+    contributes" (§3.1).
 - **The KV-zone half's size: one source (zhcn r3 item 9; r5 m-n; lead ruling).** The ring's
   context-side (KV-zone) half is `unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(device)`
   (`unified-cache.cpp:2222` at `2c4f5e45d`, `:2240` at `11faace69`): the activation and output
@@ -2278,19 +2505,24 @@ unchanged. The arena-device uses of `kv_admission_mismatch`, `kv_vram_cap` and
     supersession case.
   - **Every other removal of the retention hands off too (rulings §RING; r6 I-6).** With the
     refcount deleted, `retained_owners` is the only lifetime holder of a superseded ring slot.
-    Master drops it with no event, under the L5 slot-state mutex, at four more sites (`11faace69`
-    `ggml-sycl.cpp`):
+    Master drops it with no event, under the L5 slot-state mutex, at five more sites
+    (`ggml-sycl.cpp`, the same lines at `11faace69` and `3d9414c8c`):
     - `pp_moe_onednn_reset_slot_state_locked` (`:1551-1559`, `retained_owners.assign(ring_depth,
       {})`), reached from the claim, bind, record and release paths whenever the depth changes
       (`:1602-1604`, `:1693-1695`, `:1712-1714`, `:1733-1735`). The record-mode depth rule below
       makes a depth change reachable;
     - the generation-0 branch of the claim (`:1617-1621`);
-    - release-unused and rollback (`:1585-1588`, `:1738-1742`).
+    - release-unused and rollback (`:1585-1588`, `:1738-1742`);
+    - **the bind (r7 m-5):** `pp_moe_onednn_bind_scratch_slot_generation` clears
+      `retained_owners[slot]` (`:1698`). It is benign only while the claim before it has
+      already moved the previous generation out (above), so the slot is empty at the bind. It
+      gets the same hand-off, and a debug check that the vector it moves out is empty; the
+      witness plants a retention at the bind and requires it to be handed off, not dropped.
 
     Each of these would be a free under queued work, and each is a `mem_handle` destruction
     under a listed lock (H7t). Each site now moves the vector out and, after unlocking the
     slot-state mutex, hands it to `retain_handles_until_event(done_events[slot])`. A plain clear
-    remains only where the generation is 0 and nothing was recorded. H7z covers all five sites,
+    remains only where the generation is 0 and nothing was recorded. H7z covers all six sites,
     and H9's two-generation arm adds the depth change.
   - **Record mode (r5 I-C, for the ring).** A ring claim made while recording follows §2.3.2's
     record-mode rule: the recorded graph holds the slot for its life, and the slot vacates at
@@ -2325,8 +2557,10 @@ unchanged. The arena-device uses of `kv_admission_mismatch`, `kv_vram_cap` and
 - **Retained runs.** A superseded slot released at a publish may leave a RETAINED run when it is
   interior. H4b keeps revision 4's bound (at most one per ladder candidate) and adds that
   fit == carve after the settle.
-- **MMID pools** stay in RUNTIME, outside this interface; the fit reads them as allocated
-  blocks of the RUNTIME TLSF.
+- **MMID pools** stay in RUNTIME. The fit reads the live ones as allocated blocks of the RUNTIME
+  TLSF, and places a new plan's device pool as a head slot there, carved at step 6; the host
+  pool is a view of the model's held MMID host carve. So step 7 allocates nothing (§2.4.2 step
+  7; rulings §M7 I-5(b)).
 - **ONEDNN and SCRATCH tail zones:** no change.
 
 ### 2.8 The error path (decision (a), scoped per r1 I3)
@@ -2489,22 +2723,23 @@ depends on llama.cpp-uwlx, whose pick-list begin it extends with the retire requ
    the holder's next compute; a lease held only by an in-flight reader, with no graph, frees at the
    next pass on that device, whenever one runs. There is no bypass and no cross-thread clear, so P2
    holds as it is.
-3. **A narrow trigger.** The request is issued only when this transaction demoted a KV layer that
-   releasing the vetoed copies would have covered, and at most once per transaction: at step 8,
-   after the publish, so a `busy` retry never issues it. **"Vetoed" means lease-only (r5 I-J(3);
-   lead ruling):** a copy whose sole veto is a lease beyond the mirror. The predicate also rejects
-   non-READY or IN_PROGRESS copies, host-resident or non-DEVICE copies, copies already retired, and
-   copies vetoed by `weight_entry_reclaimable`'s live-owner terms; none of those is named, because
-   retiring an IN_PROGRESS staging copy is a different lifecycle. It names every lease-vetoed copy
-   the fit would have used, because the veto cannot tell a sink lease from an in-flight reader's; a
-   retired copy that an in-flight reader holds is still correct, since its free waits for that
-   lease. The narrowness matters, because the retire costs holders the layout at once while the room
-   comes back only after their next compute, and an idle holder never computes, so its retired copy
-   stays resident and unusable: strictly worse than today for that copy. **The accepted cost (r5
-   m-m):** a request naming a prefix held by several holders can cost the active holders their
-   layout while an idle holder's copy keeps the prefix fenced, so no room returns. It is not
-   restricted further, because "idle" is not observable at step 8; the WARN names each retired copy,
-   so a retire that returned no room is visible.
+3. **A narrow trigger.** The request is issued only when this transaction demoted a KV layer
+   that releasing the vetoed copies would have covered, and at most once per transaction: at
+   step 8, after the publish, so it runs once per committed transaction. **"Vetoed" means
+   lease-only (r5 I-J(3); lead ruling):** a copy whose sole veto is a lease beyond the mirror.
+   The predicate also rejects non-READY or IN_PROGRESS copies, host-resident or non-DEVICE
+   copies, copies already retired, and copies vetoed by `weight_entry_reclaimable`'s live-owner
+   terms; none of those is named, because retiring an IN_PROGRESS staging copy is a different
+   lifecycle. It names every lease-vetoed copy the fit would have used, because the veto cannot
+   tell a sink lease from an in-flight reader's; a retired copy that an in-flight reader holds
+   is still correct, since its free waits for that lease. The narrowness matters, because the
+   retire costs holders the layout at once while the room comes back only after their next
+   compute, and an idle holder never computes, so its retired copy stays resident and unusable:
+   strictly worse than today for that copy. **The accepted cost (r5 m-m):** a request naming a
+   prefix held by several holders can cost the active holders their layout while an idle
+   holder's copy keeps the prefix fenced, so no room returns. It is not restricted further,
+   because "idle" is not observable at step 8; the WARN names each retired copy, so a retire
+   that returned no room is visible.
 4. **A retired-but-leased block is allocated and not yieldable** until it is freed. The
    geometry is the live TLSF, so the fit already counts it that way, and the strict-prefix
    ladder truncates at it (H5).
@@ -2920,47 +3155,80 @@ L7 documents this limit, and pattern #2 remains the remedy.
       - **the backstop (r6 I-1).** A retention of slot k published on a second modelled queue
         that (s) does not cover, with its kernel still running: the reap waits the record, the
         modelled kernel's storage stays intact until the kernel completes, and the miss is
-        `[CONTEXT-PLAN-BUG]` (a WARN, and an abort under STRICT, run in a subprocess). RED: a
-        COMPLETE reap that drops without the backstop, which frees under the queued kernel;
-      - **the ring's bound (r6 I-4).** Ring slot k was used once, so its slot-state retention of
-        the last generation is present, and a sole-contributor growth fits only in the old
-        ring's room. The move-out takes the retention, (e) passes, the blocks are free, and
-        (ii) places the grown ring. RED: `f2e5606bc`, whose (ii) refuses with no demotion and no
-        reason. Variants: one guard pin (P = 1, `use_count` 2) passes, and the block frees when
-        that guard drops its copy; one guard pin plus one stray copy (`use_count` 3) reports
-        `[CONTEXT-PLAN-BUG]`.
-    - **Reuse in place (r5 I-B; zhcn rev 5; r6 m-10).** A candidate whose every slot fits its
-      published cap, host slots included, republishes with no step (i), no fit, no allocation
-      and no release, and the new tenant key is recorded. A candidate with one slot over its cap
-      takes step (i); its host slots that fit are reused, and only the other host slots are
-      allocated new. RED: `b30321a6f`, which re-allocates every host slot on any key change.
+        `[CONTEXT-PLAN-BUG]` (a WARN, and an abort under STRICT, run in a subprocess); the BUG
+        line carries the count 1 and the PRIVATE_TESTING backstop counter reads 1. On every
+        other GREEN arm of H4 the counter reads 0 (rulings §D16; r7 m-6). RED: a COMPLETE reap
+        that drops without the backstop, which frees under the queued kernel;
+      - **the ring's bound (r6 I-4; rulings §M7 I-3).** Ring slot k was used once by two claims,
+        so its slot-state retention of the last generation holds two slices that share the
+        slot's control, and a sole-contributor growth fits only in the old ring's room.
+        - **(0) on this case:** (0) passes, counting the old ring free by arithmetic; afterwards
+          `pinned[k]` is 0 and the guard holds no ring copy. RED: a (0) that runs step 2's
+          ring-lock section, whose copy keeps `use_count` at 2 into (ii), which refuses.
+        - **The move-out and (d):** the move-out takes the retention separately from the slot
+          handles; (d) backstops its `done_events[k]` and drops it before (e); (e) sees
+          `use_count() == 1` with P = 0; (f) frees the blocks; and (ii) places the grown ring.
+          REDs: `f2e5606bc`, whose (ii) refuses with no demotion and no reason; and 7.5's order,
+          which put the retention into the batch, so (e) sees `1 + 2` and reports
+          `[CONTEXT-PLAN-BUG]` on this healthy run.
+        - **A nonzero P is a bug (r7 m-3):** a test hook skips L0 for a second modelled
+          transaction, whose guard pins slot k; the move-out snapshots P = 1, and (e) reports
+          `[CONTEXT-PLAN-BUG]` even though `use_count() ≤ 1 + P` holds. A stray copy with P = 0
+          (`use_count` 2) reports it too;
+      - **the freed room is held (rulings §M7 I-5(a)).** A growth whose grown slot lands in its
+        old slot's room: between (f) and (ii) a modelled expert-cache fill and a modelled lazy
+        MoE layout materialization, each through `allocate_excluding` and taking no L0, try to
+        allocate exactly that room. Both are placed elsewhere or miss, and (ii) places exactly
+        what (0) placed. RED: 7.5's order, which recorded no pending range before (f), so the
+        fill takes the room and (ii) refuses a within-plan candidate;
+    - **The covered path (r5 I-B; zhcn rev 5; r6 m-10; r7 m-11, m-1).** A candidate whose every
+      slot fits its published cap, host slots included, and whose ring contribution does not
+      grow, gets COVERED from the coverage query: no L0 (the modelled L0 records no acquire), no
+      step (i), no fit, no allocation, no release, no registry or ring-record write, and the
+      published tenant key unchanged. A candidate whose tenant slots are covered but whose ring
+      contribution grows gets GROWTH and takes L0 and step (i). A candidate with one slot over
+      its cap takes step (i); its host slots are reused and nothing is allocated on the host
+      tier. REDs: `b30321a6f`, which re-allocates every host slot on any key change; and 7.5's
+      covered rule, which sends the ring-growth candidate down the covered path, so its next PP
+      MoE claim finds a ring too small.
     - **After a refused (ii) (r6 m-9).** A sole-contributor growth that (ii) refuses leaves the
       ring record empty and the context without slots. The next PP MoE claim reports
       `[CONTEXT-PLAN-BUG]` with an error status and the op is not skipped; the ladder revert,
       whose key no longer matches (it was cleared at (c)), re-carves the previous candidate's
       slots and ring. The positive control keeps the tenant key through (c), so the revert hits
       the equal-key no-op and returns OK with nothing carved.
-    - **Host-tier order (r5 I-I(3)).** A republish whose host need exceeds the free host room:
-      (0) refuses with every device tenant slot and every old host slot still held. A variant
-      where a concurrent host fill takes the room between (0) and the host allocation: the
-      allocation refuses, still before (i), with nothing released. On success, the old host
-      slots are present until the CAS and dropped after L1. RED: `c2613a688`'s order (host
-      allocation after (i)), which releases every device slot first.
+    - **Host-tier order (r5 I-I(3); rulings §D15).** A republish whose host need exceeds the
+      context's host reservation: (0) refuses by arithmetic, with every device tenant slot and
+      every host slot still held, and no host allocation is attempted. The concurrent-fill
+      variant of earlier revisions is deleted: within the plan there is no host allocation left
+      for a fill to race (the next arm). RED: `c2613a688`'s order (host allocation after (i)),
+      which releases every device slot first.
     - **The tenant-key no-op (r5 queue R8 (6); r5 m-j).** A sampler change that leaves every
-      slot's bytes equal republishes the same tenant key: the backend call returns OK with the
-      published residency, with no probe, no step (i), no registry change and no L1, and the
+      slot's bytes equal republishes the same tenant key: the coverage query answers EQUAL and
+      llama keeps the published residency, with no probe, no step (i), no registry change, no
+      L0 and no L1, and the
       count of tenant-only republishes is 0. In a split model, the second backend's run of one
       publish finds the first's entry and is the same no-op. RED: `c2613a688`, which sent every
       matched key to the tenant-only path.
     - **Claim-index order (zhcn A1).** Within one ALLOC per `(ContextId, buft)`, indexes 0, 1, 2
       pass; the orders 0, 2 and 1, 0, and an index at or above the measured chunk count, each
       report `[CONTEXT-PLAN-BUG]`, formatted and logged after the spin lock is released.
-    - **The host tier's phase gate (r5 queue R7b).** The first publish reserves host-tier
-      headroom, with growth allowed. After a modelled decode, a tenant-only republish whose host
-      need exceeds that reservation is refused as a candidate refusal naming the tenants, and an
-      instrumented `grow_zone` counter stays at 0. A republish within the reservation succeeds,
-      and the counter is still 0. RED: the first draft's host path, which let every republish
-      grow the pool.
+    - **The host reservation is held (r5 queue R7b; rulings §D15; r7 I-6).** The first publish
+      allocates one host carve sized to the plan's maximum tenant host demand, with growth
+      allowed, and sub-carves the host slots from it at the maximum caps. Then, after a modelled
+      decode:
+      - **a concurrent host fill fails to take the room:** a modelled expert-cache host fill,
+        taking no L0, asks the pinned pool for every free byte; it gets the room outside the
+        reservation and not one byte of the reservation. A republish at the plan's top rung
+        then succeeds, allocates nothing on the host tier, and an instrumented `grow_zone`
+        counter stays at 0. RED: revision 7.5's recorded-only reservation (host slots at the
+        first candidate's size, later republishes allocating with `forbid_host_zone_growth =
+        true`), where the fill takes the room and the top-rung republish refuses on live free
+        room;
+      - a republish whose host need exceeds the reservation is refused at (0) as a candidate
+        refusal naming the tenants, by arithmetic, whatever the pool's live free room (the arm
+        runs it with the pool both full and empty, and the answer is the same); `grow_zone`
+        stays at 0. RED: the first draft's host path, which let every republish grow the pool.
 - **H4b auto-ubatch ladder replay (r1 M9).** Replays `publish(ring_k) -> sched_reserve(overflow_k)`
   for the candidates, then the settle. It asserts:
   - the RETAINED run count stays at or below the number of candidates;
@@ -3013,7 +3281,7 @@ L7 documents this limit, and pattern #2 remains the remedy.
       truncates at it;
     - (c) after the holder's clear drops the last lease, the block is free, and a **new**
       context's fit uses it; the requesting context's demoted layer stays on the host;
-    - the request fires at most once per transaction, never on a `busy` retry, and never when
+    - the request fires at most once per transaction, never on a refused one, and never when
       the transaction demoted nothing the vetoed copies would have covered.
 - **H6 N-chunk.** Two weight TLSFs plus the tail KV TLSF, checking greedy packing across
   TLSFs and extents, fit == carve, and the TRANSIENT routing: WEIGHT-naming requests go to the
@@ -3116,9 +3384,9 @@ L7 documents this limit, and pattern #2 remains the remedy.
     `BUDGET_EXCEEDED` demotion (`:18118`) excludes in-arena head-slot bytes from its sum.
     Mutation witness: the head-slot term added back;
   - (ad) **the host tier is reached only through `unified_allocate_owner` (r5 queue R7a, R7b).**
-    `context-compute-host` slots are allocated only by `unified_allocate_owner`, and every
-    republish after the first passes `forbid_host_zone_growth = true`. Mutation witnesses: a
-    direct `pinned_chunk_pool` grow call, and a republish with growth allowed;
+    The `context-compute-host` reservation is allocated only by `unified_allocate_owner`, only
+    at the first publish, and no later republish reaches a host allocation (see (an)). Mutation
+    witnesses: a direct `pinned_chunk_pool` grow call, and a republish that allocates;
   - (ae) **the tenant-only release is a reap, not a wait (lead ruling "B").** The (i) sequence
     contains no sleep, poll loop or timeout; `release_retained_referencing` is called with the
     moved-out batch's owners before the batch is dropped and with no L1-L5 lock held; and the
@@ -3135,24 +3403,59 @@ L7 documents this limit, and pattern #2 remains the remedy.
     or by a per-context graph container that (a) clears. No `host_task` lambda captures a
     tenant-slot handle (zhcn rev 5). The gate runs over every converted claim site. **Any other
     park that owns a handle of a tenant slice fails** (rulings §B.2; r6 I-3): the oneDNN Graph
-    scratch park, any per-op cache beni converts, and the four former §B.1 members (the MMVQ and
-    MoE q8 `cached_src_handle`, the `moe_ids_cache` keys, `runtime_tensor_extras`) if they still
-    own one. The identity type's no-recycling test and the `runtime_tensor_extras` publisher
-    census are zhcn's gate 27 (rulings §B.2). Mutation witnesses: a beni-style owning park in a
-    per-op cache, an owning `cached_src_handle` restored, a
-    `ggml_backend_sycl_release_buffer_refs` step reintroduced, and a `host_task` capture;
+    scratch park, any per-op cache beni converts, the four former §B.1 members (the MMVQ and MoE
+    q8 `cached_src_handle`, the `moe_ids_cache` keys, `runtime_tensor_extras`) if they still own
+    one, and, by name (rulings §M7 I-7), `graph_input_staging` on the eager path and in record
+    mode, `g_moe_ids_d2h_cache`, `g_moe_prompt_admission_cache` and `g_data_ptr_cache` (§2.4.2
+    "The holder census"). The identity type's no-recycling test and the `runtime_tensor_extras`
+    publisher census are zhcn's gate 27 (rulings §B.2). Mutation witnesses: a beni-style owning
+    park in a per-op cache, an owning `cached_src_handle` restored, a
+    `ggml_backend_sycl_release_buffer_refs` step reintroduced, a `host_task` capture, and one
+    per named container with an owning entry restored: an owning `graph_input_staging` handle
+    with nothing recorded, an owning `moe_ids_cache_key::handle` in each of the two maps, and an
+    owning `g_data_ptr_cache` value with zhcn's exit clear present (the key fix alone must catch
+    it);
   - (ah) **step 2's ring-lock section precedes the snapshot (r6 I-5).** The copy of
     `ring_plan_gen` and of the ring's slots, with the `pinned[slot]` increments, is taken before
     the geometry snapshot, and the fit's ring input is that copy. Mutation witness: revision
     7.1's order (snapshot, fit, then the ring-lock section);
-  - (ai) **every L0 holder takes the one process-global re-plan mutex (rulings §E.1, §E.2).**
-    The full transaction, the tenant-only path (through `ggml_backend_sycl_replan_scope`), the
-    probe, the teardown release proc, every other writer of the ring record, its slots,
-    `ring_plan_gen`, RELEASING or `pinned[slot]` outside the decode path, model load, and the
-    optional-layout pass each hold `g_replan_txn_mutex`; it is taken before L1, and never under
-    an L1-L5 lock; the decode and graph-compute paths never take it; and no per-device re-plan
-    mutex exists. Mutation witnesses: a holder without it, the mutex taken under L1, a decode
-    path taking it, and a per-device mutex array.
+  - (ai) **every publish and live-update preparation is under L0 or allowlisted (rulings §E.1,
+    §E.2, §L0R; r7 I-1, I-2, m-7).** The census is by call site, not by operation name: every
+    call of `ggml_sycl_publish_plan_locked`, `ggml_sycl_publish_prepared_plan_locked`,
+    `lifecycle_replace_placement_plan` and `Registry::prepare_live_update` must be reachable
+    only under a `ggml_sycl_replan_token` taken at the top of its public entry point (§2.4.2
+    "The re-plan transaction mutex" lists them), or be one of the four allowlisted
+    identity-preserving republishes (`:5887`, `:5908`, `:60125`, `:74882`), whose helper takes
+    no snapshot argument and whose debug identity check stays in. Beside it: the token is the
+    only way to take `g_replan_txn_mutex`; it is taken before L1 and never under an L1-L5 lock;
+    graph compute and dispatch never take it (a `sched_reserve` re-plan does, legitimately); the
+    release proc's token is the outermost-only kind; no wrapper or transaction return maps to
+    `BUSY`; llama has no busy sleep loop; the probe and the FA recheck read
+    `lifecycle_select_placement_plan(model)`, not the global snapshot; and no per-device re-plan
+    mutex exists. Mutation witnesses: a publisher call site without a token, a fifth
+    identity-preserving republish that passes a new snapshot, the mutex taken under L1, a
+    graph-compute path taking it, a restored wrapper `BUSY` return, a restored llama sleep loop,
+    the probe reading the global snapshot, and a per-device mutex array;
+  - (aj) **a model load does not touch the ring (llama.cpp-r7fz; rulings §M7 I-4).** On the
+    arena path, `release_pp_moe_onednn_scratch_ring` and the planned-ring setters
+    (`unified_cache_set_planned_pp_moe_onednn_scratch`, `_kv_zone_slots`, `_row_bytes`,
+    `_n_ubatch`) are reachable only from the release proc, the sole-contributor move-out and the
+    commit's install. Mutation witness: the `populate_inventory_globals` release restored;
+  - (ak) **(0) takes no ring-lock copies or pins, and (d) drops the ring's retentions before (e)
+    (rulings §M7 I-3).** Mutation witnesses: (0) calling step 2's ring-lock section, and the
+    move-out putting `retained_owners` into the batch;
+  - (al) **the freed room is pending before (f) (rulings §M7 I-5(a)).** (0)'s placements are
+    recorded as pending ranges before any release, and (ii) re-fits only inside them. Mutation
+    witness: the recording moved after (f);
+  - (am) **step 7 allocates nothing (rulings §M7 I-5(b)).** The MMID materialization on the
+    transaction path takes its device pool from step 6's carve and its host pool from the
+    model's held carve; no `unified_alloc`, `unified_allocate_owner` or pool growth is reachable
+    from it. Mutation witness: master's `unified_cache_materialize_moe_mmid_workspaces`
+    allocation restored at `:18614`;
+  - (an) **the host tier allocates only at the first publish, from one held carve (rulings
+    §D15; r7 I-6).** The host slots are views of the reservation, sized at the plan's maximum
+    caps, and no tenant-only path reaches a host allocation. Mutation witness: 7.5's
+    per-republish allocation with `forbid_host_zone_growth = true`.
   RED: every check fires on the pre-change tree, and the count is recorded.
 - **H8 region scope under concurrency (r1 I6, third point).**
   - The registry and scope logic is factored into a SYCL-free header, `kv-region-registry.hpp`.
@@ -3189,7 +3492,8 @@ L7 documents this limit, and pattern #2 remains the remedy.
 - **H9 transaction guard (r2 N-I3; r3 I4, I6; r4 I5, I6, m9, m14; SYCL-free, in
   `kv-region-registry.hpp`).** A host model of the §2.4.2 steps, with a failpoint at every
   refusing step (the fit's head-slot refusal, the RELEASING `[CONTEXT-PLAN-BUG]`, the accounting
-  step, the non-FA check, the relock's cross-device `busy`, after the carve of device 0 of 2,
+  step, the non-FA check, the yield's relock (a `[CONTEXT-PLAN-BUG]` under L0, forced by the
+  skip-L0 hook below), after the carve of device 0 of 2,
   the MMID step, the ring check of step 8 (a), and the CAS). At each failpoint it asserts:
   - the registry and the ring record are unchanged;
   - no yield ran for a failpoint before step 5;
@@ -3213,8 +3517,31 @@ L7 documents this limit, and pattern #2 remains the remedy.
     the plan-identity checks and lose the CAS.
   - **Teardown's path.** The release proc runs from the guard member's destructor while another
     thread holds L0: it waits, then runs. A same-thread re-entry (a release proc
-    reached with this thread already holding L0) trips the debug owner-thread check and aborts,
-    instead of hanging.
+    reached with this thread already holding L0) trips the outermost-only token's debug check
+    and aborts, instead of hanging.
+  - **Legitimate nesting (rulings §L0R; r7 I-2), positive.** llama's `replan_scope` takes the
+    token; inside it the growth path's (0) probe, the transaction wrapper and (ii) each acquire
+    it again. The nested acquires do not lock (the instrumented mutex records one lock and one
+    unlock), the outermost token unlocks, and another thread's acquire blocks until then. RED: a
+    plain `std::mutex` in place of the token, which self-deadlocks (the model detects it with a
+    try-lock and reports it).
+  - **A in a transaction, then B loads, then A's probe and FA recheck (rulings §L0R; r7 I-1).**
+    Two modelled models. A opens a transaction and publishes; B's load entries run and publish
+    B's plan; A then runs its probe and its FA recheck. Both validate against A's own plan
+    (`lifecycle_select_placement_plan(A)`) and answer OK, with zero STALE_IDENTITY. RED:
+    master's probe and recheck, which compare A's token with the one global snapshot and answer
+    STALE_IDENTITY.
+  - **Load B while A contributes (llama.cpp-r7fz; rulings §M7 I-4).** Model A's context is a
+    ring contributor with a claimed-then-vacated ring on device 0; model B loads on device 0.
+    After B's load A's ring handles, sizes, depth, split flags and contribution are unchanged,
+    and A's next PP MoE claim succeeds. RED: master's `populate_inventory_globals`, which
+    releases the ring, so A's claim finds it empty and reports `[CONTEXT-PLAN-BUG]`.
+  - **Every publisher under L0 (rulings §L0R).** The model runs, against a parked L0 holder,
+    each public entry point §2.4.2 lists (the wrapper, activate, unload with its failure
+    republish, quarantine restore, each load entry): each blocks until L0 is released. The four
+    allowlisted republishes run against the parked holder without blocking, and each leaves the
+    plan identity unchanged; a modelled republish that changes it reports
+    `[CONTEXT-PLAN-BUG]`.
 
   **No absent ring (r4 I6), and the routes that used to answer `busy` (r5 I-A; r6 I-5).** Under
   L0 none of these interleavings can occur, so each is forced by a test hook that lets one
@@ -3253,10 +3580,10 @@ L7 documents this limit, and pattern #2 remains the remedy.
   dropped with the instrumented L1 released, including a retire's withdrawn mirrors (r5 I-J).
   RED: the first draft's drop inside step 8 under L1.
 
-  **RELEASING has an owner (r5 I-A, sharpened):** a sole-contributor tenant-only republish
-  that marked RELEASING passes its own (ii) step 2 and step 8 (a); a second transaction on the
-  device waits on L0 and then finds the mark cleared; the owner's guard clears the mark on a
-  refusal and on an injected exception. RED: `c2613a688`'s ownerless flag, on which the owner
+  **RELEASING has an owner (r5 I-A, sharpened):** a sole-contributor tenant-only republish that
+  marked RELEASING passes its own (ii) step 2 and step 8 (a); a second transaction, anywhere in
+  the process, waits on L0 and then finds the mark cleared; the owner's guard clears the mark on
+  a refusal and on an injected exception. RED: `c2613a688`'s ownerless flag, on which the owner
   answers `busy` to itself.
 
   **Two ring generations on one slot (r5 I-K; r6 I-6):** slot k is re-claimed while its previous
@@ -3430,7 +3757,7 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
 | L3 | pure `kv_region_fit` (multi-extent, self extents, `forced_host`, `own_ranges`-restricted commit re-fit, strict prefix, carve mirroring, indexed head slots placed first with reuse in place, the ring as max over contributions and its RUNTIME/KV-zone split, the recurrent slot, sidecar companion slots, the cost-ordered pack with the two-way optional classification, pending ranges as allocated, the stated demotion order, `free_after_full_kv` and demotion causes), the `context_side_demand` record (CONTEXT/DEVICE scopes, indexed slots) and its reconciliation, `kv_layer_cells` + `kv_layer_tensor_bytes` (the one byte function) and the RS-buffer size function, `kv-region-registry.hpp` (registry with tenant slots, scope, residency answer with the no-region fallback, the two-phase guard model, the ring record model with RELEASING, the release proc model); H2, H3, H6, H8, H9 | `kv-runtime-demotion.{hpp,cpp}`, `kv-region-registry.hpp`, `unified-cache.hpp` (`kv_layer_bytes_for_kind` delegates), their tests | xhigh | L1, jehw on master, the zhcn protocol (agreed, §6.6) | after jehw |
 | L4 | `context_side` (explicit `lifetime` field threaded into `zone_alloc`, LIVE/RETAINED states and the slot tag, the reserved-slot carve as owner-first handles, `claim_slot`/`release_claim` with event-chained reuse and per-slot claim state, atomic retained-run carve, settle refusals for pending ranges, the plan-violation ERROR with an error status, pending ranges on shared and RUNTIME TLSFs, `live_bytes()` beside an unchanged `zone_available`), `allocate_excluding` with range exclusion (used whenever a pending range exists), `allocate_at`, and a whole-TLSF block census (L1 follow-ups), retained-run registration hygiene and the `live_bytes` readers, the per-extent and per-slot owner-first carve inside `zone_alloc`'s locked section with controls pre-minted before L1 (`unified_allocate_owner` split into mint and bind halves), leaf `kv_region_mutex_` added to contract §12.5 (L3), locked geometry snapshot (cache locks then group mutex, with jehw's predicate), `reserve_kv_region`, strict-prefix `yield_optional_prefix`, `backend-buffer-kv-zone` passing its buffer's role, removal of the dead `KV_AUTO` reclaim and of the `arena_reserve` KV reclaim, N-chunk routing, and **1oxa's `GGML_SYCL_PRIVATE_TESTING` dump of `shared_zone_geometry` plus `kv_region_request` at each fit** (step 2 and the tenant-only path; lead-approved, for 1oxa's VM branch to test against); H4, H4b, H5 | `unified-cache.{hpp,cpp}`, `tlsf-allocator.hpp` (two primitives), `ggml-sycl.cpp` (the kv-zone fallback's role) | xhigh | L1, L3, **zhcn landed, beni's producers landed, llama.cpp-jzvq closed** (lead ruling, r4 I10), **llama.cpp-uwlx landed** (the pick-list yield, §2.4.2 step 5; r5 m-g) | after zhcn, beni producers, jzvq, uwlx |
 | L5 | the optional pass after all S1 staging (dense + expert/DPAS); `zone_alloc_optional` | `ggml-sycl.cpp` S1 block | medium | L4 | with L4/L6 |
-| L6 | llama side: `llama_kv_layer_shapes` and `llama_rs_layer_shapes` factored out and stored at the first publish, the `ggml_sycl_runtime_context_desc` descriptor (KV-shape with sidecar and `n_stream`, recurrent section; zhcn's tenant section filled by zhcn) and its publish entry point, the scope procs with an RAII guard, the one `ggml_backend_sycl_kv_region_release` call site in the `sycl_plan_guard` member's destructor (zhcn M1, with the ContextId captured at `create_exec`), and `llama_recurrent_sycl_kv_buft` returning the recurrent-state buft. Backend side: the transaction steps of §2.4.2 (two-phase guard without L1, idempotent key without `n_ubatch`, the tenant-only path with zhcn's step (i) (the own-context graph clear behind its recorded-graph gate, the slot-table take at (c), the reap call with its backstop, the use-count bound; r6), reuse in place for host slots, the ring record with contributions, `ring_plan_gen`, RELEASING and `pinned[slot]`, the ring-lock section before the snapshot, the slot-state retention moved out at a sole-contributor release and handed off after the unlock at all five removal sites (r6 I-4, I-5, I-6), the ring admit per the recorded split, plan / accounting / predictable refusals / pending ranges / yield / restricted re-fit and carve / MMID / ring check / CAS / commit with the ring admit / superseded drops after L1), the registry release proc, `g_execution_backend_binding_mutex` census entry, the residency hook answering from the registry, the tiered claim with `set_owner(mem_handle)` slice views and the KV-only size check, the sidecar companion claim, the recurrent-state buft, the per-extent clear with event-held slices, BLOCK_EXEC_CANDIDATE_KV ignored under an arena (the VMEM_KV refusal is 23mk core's, §2.6), the second sources deleted (§2.2, the budget-room check included), both ERROR sites plus `GGML_SYCL_STRICT_PLAN`, the dark B50 lever, `GGML_SYCL_KV_REGION_TRACE`; H7 with the unconverted-site list, the CPU-buft llama shape tests, G1. **Absorbs revision 1's L2.** | `ggml-sycl.cpp`, `ggml-sycl.h`, `unified-cache.cpp`, `fattn.cpp`, `common.hpp`, `src/llama-context.{h,cpp}`, `src/llama-model.cpp`, `src/llama-kv-cache.{h,cpp}`, `src/llama-memory-recurrent.cpp`, tests | xhigh | L3, L4, L5 | before beni's conversions |
+| L6 | llama side: `llama_kv_layer_shapes` and `llama_rs_layer_shapes` factored out and stored at the first publish, the `ggml_sycl_runtime_context_desc` descriptor (KV-shape with sidecar and `n_stream`, recurrent section; zhcn's tenant section filled by zhcn) and its publish entry point, the scope procs with an RAII guard, the one `ggml_backend_sycl_kv_region_release` call site in the `sycl_plan_guard` member's destructor (zhcn M1, with the ContextId captured at `create_exec`), and `llama_recurrent_sycl_kv_buft` returning the recurrent-state buft. Backend side: the transaction steps of §2.4.2 (two-phase guard without L1, idempotent key without `n_ubatch`, the tenant-only path with zhcn's step (i) (the own-context graph clear behind its recorded-graph gate, the slot-table take at (c), the reap call with its backstop, the use-count bound; r6), reuse in place for host slots, the ring record with contributions, `ring_plan_gen`, RELEASING and `pinned[slot]`, the ring-lock section before the snapshot, the slot-state retention moved out at a sole-contributor release and handed off after the unlock at all six removal sites (r6 I-4, I-5, I-6; r7 m-5), the model load's ring release and ring-record writes removed on arena devices (llama.cpp-r7fz), the ring admit per the recorded split, plan / accounting / predictable refusals / pending ranges / yield / restricted re-fit and carve / MMID / ring check / CAS / commit with the ring admit / superseded drops after L1), the registry release proc, `g_execution_backend_binding_mutex` census entry, the residency hook answering from the registry, the tiered claim with `set_owner(mem_handle)` slice views and the KV-only size check, the sidecar companion claim, the recurrent-state buft, the per-extent clear with event-held slices, BLOCK_EXEC_CANDIDATE_KV ignored under an arena (the VMEM_KV refusal is 23mk core's, §2.6), the second sources deleted (§2.2, the budget-room check included), both ERROR sites plus `GGML_SYCL_STRICT_PLAN`, the dark B50 lever, `GGML_SYCL_KV_REGION_TRACE`; H7 with the unconverted-site list, the CPU-buft llama shape tests, G1. **Absorbs revision 1's L2.** | `ggml-sycl.cpp`, `ggml-sycl.h`, `unified-cache.cpp`, `fattn.cpp`, `common.hpp`, `src/llama-context.{h,cpp}`, `src/llama-model.cpp`, `src/llama-kv-cache.{h,cpp}`, `src/llama-memory-recurrent.cpp`, tests | xhigh | L3, L4, L5 | before beni's conversions |
 | L7 | docs: memory-design section, contract §3/§5.2/§5.3/§12.5 (the binding-lock chain, the L5 group → `g_runtime_alloc_mutex` order, the step-6 carve exception), arena comment, limits (§2.9), lock order, the tenant protocol and the descriptor's layout rules, the owner-visible weight-hole line | docs, `unified-cache.hpp` comment | medium | L6 | with L6 |
 
 **Landing order (lead ruling; r4 I10).** jehw lands on master first (u1bb already has). Then:
@@ -4106,3 +4433,42 @@ device the plan covers" was not closed under a publish that adds a device. Chang
   lease), `:17886` (plan changed while acquiring L1), `:18122` (the relock), `:18646` (the lost
   CAS), and `:18515` is the superseded ring `busy`. The other jehw citations keep their
   `c41fed119` lines, named as such.
+
+### 6.10 Design review r7 (design-moua-r7 on `5925f3fe1`) and the lead's rulings §L0R, §M7, §D15
+
+design-moua-r7 found 0 Critical, 7 Important and 11 Minor. The lead ruled in rulings §L0R and
+§M7 and tightened §D15. Revision 7.6 answers every item; none is deferred.
+
+| item | finding | disposition |
+|------|---------|-------------|
+| I-1 | the L0 census names operations, not the publishers of the one fact L0 protects | **Changed (rulings §L0R).** §2.4.2 "The re-plan transaction mutex" lists every public entry point that reaches a publish or `prepare_live_update` call site at `3d9414c8c`, with lines: the wrapper (its ticket `:18867` and publish `:18955`), the probe and FA recheck, activate (`:15259`), unload and quarantine restore (`:12308`, `:12329` → `:12547`, `:12599`), and each load entry. Decode's four identity-preserving republishes are allowlisted behind a gate. H7ai checks every call site; H9 runs every entry against a parked holder. The probe and the recheck validate against `lifecycle_select_placement_plan(model)`, with an H9 arm (A in a transaction, B loads, A's probe and recheck). |
+| I-2 | the tenant-only path's L0 scope contradicts itself and zhcn | **Changed (rulings §L0R).** One RAII token type with a thread-local held flag; a nested acquire is a no-op hold, the release proc's token is outermost-only, and H9 has a positive nesting arm and a negative release-proc arm. Growth takes L0 before (s), in llama's `replan_scope`; the equal-key and covered paths take none, because they end at a new read-only coverage query that publishes nothing (§2.4.2 "The coverage query"). |
+| I-3 | §RING's bound fails on the sole-contributor growth, by two routes | **Changed (rulings §M7 I-3).** (a) The moved-out `retained_owners` are backstopped and dropped in (d), before (e), never held in the batch. (b) (0) counts the sole contributor's old ring free by arithmetic and takes no ring-lock copy or pin, so P = 0; (e) reports a nonzero P as `[CONTEXT-PLAN-BUG]`. H4's ring arm is GREEN-reachable, with (0), (d)-order and nonzero-P arms; H7ak gates both. |
+| I-4 | a model load releases a ring other contexts contribute to | **Changed (llama.cpp-r7fz, in this design's ring scope; rulings §M7 I-4).** On arena devices `populate_inventory_globals` neither releases nor writes the ring record; contributions carry their own model's per-row bytes and depth (§2.7). Gate H7aj; H9 "load B while A contributes", RED on master. |
+| I-5 | transient refusals remain on the re-plan path | **Changed (rulings §M7 I-5).** (a) (0)'s placements are this call's pending ranges before (f), and (ii) re-fits only inside them, so no allocation that skips L0 can take the freed room; H4 "the freed room is held", H7al. (b) Step 7 draws only from planned room: the MMID device pool is a RUNTIME head slot carved at step 6, and its host pool is a view of a carve the model's MMID entry holds at the plan's maximum (§2.4.2 step 7); H7am. No other transient was found on the re-plan path. The FA recheck's live free-memory read (below) is a §FM finding, not a transient refusal. |
+| I-6 | the §D15 reservation is recorded, not held | **Changed (rulings §D15).** The first publish allocates one owner-first host carve at the plan's maximum tenant host demand and holds it; host slots are views of it at the maximum caps; a need beyond it is an arithmetic refusal at (0). The old+new host peak text is deleted (§2.4.2, §2.4.3). H4's concurrent-fill arm is deleted; the new arm is RED on 7.5's recorded-only reservation. H7an. |
+| I-7 | the holder census misses parks, and zhcn deviates on `g_data_ptr_cache` | **Changed (rulings §M7 I-7).** §2.4.2 "The holder census" names `graph_input_staging` (eager and record mode), `g_moe_ids_d2h_cache`, `g_moe_prompt_admission_cache` (fixed at the key type) and `g_data_ptr_cache` (the §B.2 key fix, with zhcn's exit clear only in addition). H7ag names all four with mutation witnesses. The `graph_input_staging` class is aligned with zhcn. |
+| m-1 | zhcn agreement: bcs queue, covered path, table opening | **Changed.** The table is checked and opened at (c), as zhcn does; the covered path takes no L0 and writes nothing; zhcn is asked to add `get_bcs_queue()` with the TP worker and pipeline queues. |
+| m-2 | stale "busy" text | **Fixed** at step 5's relock, step 4's CAS, H9's failpoint list, the 423j WARN, §2.3.1 item 2, the guard's rollback sentence, and (ii). |
+| m-3 | a nonzero P accepted silently | **Changed:** reported as `[CONTEXT-PLAN-BUG]` ((e); H4). |
+| m-4 | header hygiene; five sites at `c41fed119`; (s) at `11faace69` | **Fixed.** The rulings list is complete; master is `3d9414c8c`; the five sites and (s) and (a) are re-pinned in the body. |
+| m-5 | the bind's `retained_owners` clear is a sixth removal site | **Changed:** listed in §2.7 with the hand-off, a debug empty-check and a witness; H7z and the L6 row say six. |
+| m-6 | §D16's counter missing from (d) and H4 | **Fixed:** (d)'s backstop text and H4's backstop arm (counter 1 there, 0 on every other GREEN arm). |
+| m-7 | "decode never takes L0" is too broad | **Fixed:** graph compute and dispatch never take it; a `sched_reserve` re-plan does. |
+| m-8 | ":18515 is superseded" holds only on arena devices | **Fixed:** scoped to arena devices; a device with no arena keeps u1bb's ring re-plan. |
+| m-9 | the load's L0 span | **Changed:** L0 at the top of each public load entry, not across the load, so neither llama's loader nor `progress_callback` runs under L0; the load's state is its bound candidate. |
+| m-10 | llama's BUSY sleep loops survive | **Changed:** deleted (rulings §L0R), in zhcn's scope; H7ai's witness restores one. |
+| m-11 | a covered candidate whose ring grows | **Changed:** covered requires a non-growing ring contribution; a ring growth takes the growth path (H4 arm, RED on 7.5's rule). |
+
+**Found while re-pinning, reported to the lead.**
+- The FA recheck (`:19041`) gates on a live device free-memory reading (`:19058-19075`), which
+  rulings §FM forbids; on arena devices it now reads the registry (§2.4.2 "The probe and the
+  FA recheck").
+- The wrapper's module-admission `BUSY` (`:18848-18849`) is reachable only when the module is
+  not ACTIVE (reactivation or shutdown). Under L0 it becomes `[CONTEXT-PLAN-BUG]` with the
+  wrapper's other returns; a legitimate shutdown race, if one exists, would need its own
+  answer.
+- The load's L0 span is a choice (per entry, not load_begin..load_end). The alternative covers
+  the whole load and needs a callback clause in the deadlock rule.
+- The MMID host pool is held by the model's MMID entry, not a context's reservation, because
+  the workspaces are keyed by the model token.
