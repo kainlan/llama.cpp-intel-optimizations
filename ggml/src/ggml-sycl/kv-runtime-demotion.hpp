@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <unordered_map>
 #include <vector>
 
 namespace ggml_sycl {
@@ -130,6 +131,16 @@ bool kv_shape_changed(const kv_shape & published, const kv_shape & next);
 // with interleaved publishes can reach it: that is same-device concurrent
 // contexts, which are unsupported (canonical memory contract §5).
 bool kv_residency_needs_refit(const kv_shape & published, const kv_shape & next, bool context_admitted);
+
+// True when `device`'s KV residency differs between the published plan and the
+// next one: over the layers the device holds at load (load_kv_device), whether
+// each is on the same device (or host tier, -1 or absent) in both. A runtime
+// KV demotion on a device is news only when this is true for that device, so
+// another device's change does not re-announce it.
+bool kv_device_residency_changed(const std::unordered_map<int, int> & load_kv_device,
+                                 const std::unordered_map<int, int> & published_kv_device,
+                                 const std::unordered_map<int, int> & next_kv_device,
+                                 int                                  device);
 
 // GGML_SYCL_KV_HOT_LAYERS by value: a count >= 0 overrides the tier layout;
 // unset or negative (-1) leaves it to the tier manager (kv-tier-manager.cpp).

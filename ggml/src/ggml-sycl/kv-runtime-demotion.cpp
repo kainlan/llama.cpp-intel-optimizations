@@ -94,6 +94,22 @@ bool kv_residency_needs_refit(const kv_shape & published, const kv_shape & next,
     return kv_shape_changed(published, next) || !context_admitted;
 }
 
+bool kv_device_residency_changed(const std::unordered_map<int, int> & load_kv_device,
+                                 const std::unordered_map<int, int> & published_kv_device,
+                                 const std::unordered_map<int, int> & next_kv_device,
+                                 int                                  device) {
+    auto owner = [](const std::unordered_map<int, int> & kv_device, int layer) {
+        const auto it = kv_device.find(layer);
+        return it == kv_device.end() ? -1 : it->second;
+    };
+    for (const auto & entry : load_kv_device) {
+        if (entry.second == device && owner(published_kv_device, entry.first) != owner(next_kv_device, entry.first)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in) {
     kv_residency_result r;
     r.kv_device = in.load_kv_device;

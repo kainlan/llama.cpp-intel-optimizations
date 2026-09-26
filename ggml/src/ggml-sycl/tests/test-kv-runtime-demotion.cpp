@@ -2,6 +2,7 @@
 #include "../tlsf-allocator.hpp"
 
 #include <cstdio>
+#include <unordered_map>
 #include <vector>
 
 // The build is -DNDEBUG (Release), so assert() would compile away and the
@@ -34,6 +35,7 @@ using ggml_sycl::kv_buffer_layer_owner;
 using ggml_sycl::kv_demotion_input;
 using ggml_sycl::kv_demotion_result;
 using ggml_sycl::kv_device_fit_input;
+using ggml_sycl::kv_device_residency_changed;
 using ggml_sycl::kv_hot_layers_override_active;
 using ggml_sycl::kv_reads_device_arena;
 using ggml_sycl::kv_residency_input;
@@ -68,6 +70,15 @@ static kv_demotion_input make_input(size_t budget, size_t vram, size_t kv_full, 
         in.layer_kv_bytes[l] = kv_swa;
     }
     return in;
+}
+
+// A dense residency (index = layer id) as a plan's kv_device map.
+static std::unordered_map<int, int> kv_device_map(const std::vector<int> & kv_device) {
+    std::unordered_map<int, int> map;
+    for (size_t l = 0; l < kv_device.size(); ++l) {
+        map[(int) l] = kv_device[l];
+    }
+    return map;
 }
 
 int main() {
@@ -463,6 +474,24 @@ int main() {
         CHECK(kv_reads_device_arena(true, false), "case 24: multi-device PER_DEVICE");
         CHECK(kv_reads_device_arena(false, true), "case 24: single-device GLOBAL");
         CHECK(kv_reads_device_arena(false, false), "case 24: single-device PER_DEVICE");
+    }
+    // 25. A device's KV residency changed only when one of the layers it holds
+    // at load moved between the published and the next plan. An absent layer
+    // is on the host tier, like -1.
+    {
+        const auto load      = kv_device_map({ 0, 0, 1, 1 });
+        const auto published = kv_device_map({ 0, -1, 1, 1 });
+        auto       absent    = published;
+        absent.erase(1);
+        CHECK(!kv_device_residency_changed(load, published, published, 0), "case 25: same residency");
+        CHECK(!kv_device_residency_changed(load, published, absent, 0),
+              "case 25: an absent layer is the host tier, like -1");
+        const auto other = kv_device_map({ 0, -1, 1, -1 });
+        CHECK(!kv_device_residency_changed(load, published, other, 0), "case 25: only device 1 changed");
+        CHECK(kv_device_residency_changed(load, published, other, 1), "case 25: device 1 demoted one more layer");
+        const auto more = kv_device_map({ -1, -1, 1, 1 });
+        CHECK(kv_device_residency_changed(load, published, more, 0), "case 25: device 0 demoted one more layer");
+        CHECK(kv_device_residency_changed(load, more, published, 0), "case 25: device 0 got a layer back");
     }
     std::printf("test-kv-runtime-demotion: all ok\n");
     return 0;

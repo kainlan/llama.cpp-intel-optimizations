@@ -21111,6 +21111,10 @@ size_t unified_cache_kv_vram_available(int device_id, bool multi_device) {
                              has_arena ? 0 : unified_cache_available_for_compute(device_id));
 }
 
+bool unified_cache_mode_is_global() {
+    return get_effective_mode() == unified_cache_mode::GLOBAL;
+}
+
 size_t unified_cache_kv_arena_used(int device_id) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (!cache || !cache->arena_active()) {

@@ -6618,6 +6618,9 @@ size_t unified_cache_kv_arena_used(int device_id);
 // per-device KV headroom and is unsupported (see kv_reads_device_arena()).
 size_t unified_cache_kv_weight_capacity(int device_id, size_t vram_budget, bool multi_device);
 size_t unified_cache_kv_vram_available(int device_id, bool multi_device);
+// Whether the effective cache mode (AUTO resolved) is GLOBAL, so the runtime-
+// context transaction can warn that a multi-device plan is unsupported there.
+bool   unified_cache_mode_is_global();
 
 // Sum of zone_used(KV) + zone_used(ONEDNN) + zone_used(RUNTIME) + zone_used(SCRATCH).
 // Returns 0 when arena is inactive.

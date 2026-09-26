@@ -851,6 +851,12 @@ CTX_HINT_SIGNATURE = "static std::string ggml_sycl_all_vram_ctx_hint"
 LLAMA_CONTEXT_CTOR_SIGNATURE = "llama_context::llama_context("
 RESYNC_SIGNATURE = "void llama_context::sycl_resync_runtime_context_flash_attn()"
 PLAN_OWNED_BLOCK = "if (kv_plan && kv_geometry.valid()) {"
+MODE_IS_GLOBAL_SIGNATURE = "bool unified_cache_mode_is_global()"
+ANNOUNCE_LAMBDA = "auto announce_kv_host_demotions = [&](const ggml_sycl::placement_plan & final_plan) {"
+OVERFLOW_WARN = re.compile(r'GGML_LOG_WARN\(\s*"\[SYCL-PLAN\] KV overflow')
+CHANGED_BRANCH = re.compile(r"if\s*\(\s*!probe_mode\s*&&\s*ggml_sycl::kv_device_residency_changed\(\s*"
+                            r"final_plan\.load_kv_device\s*,\s*current->plan->kv_device\s*,\s*"
+                            r"final_plan\.kv_device\s*,\s*rec\.device\s*\)\s*\)\s*\{")
 
 
 def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
@@ -890,6 +896,15 @@ def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
     elif not re.search(r"unified_cache_kv_vram_available\(\s*d\s*,\s*plan\.multi_device\s*\)", live):
         found.append("the -c hint's KV headroom is not asked for the plan's multi_device")
 
+    if not re.search(r"if\s*\(\s*next_plan\.multi_device\s*&&\s*next_plan\.devices\.size\(\)\s*>\s*1\s*&&\s*"
+                     r"ggml_sycl::unified_cache_mode_is_global\(\)\s*\)\s*\{", txn) or \
+            "uses device 0's free VRAM as every device's KV headroom" not in txn:
+        found.append("GLOBAL cache mode with a multi-device plan is not warned about")
+    is_global = function_or_none(cache_cpp, MODE_IS_GLOBAL_SIGNATURE)
+    if is_global is None or not re.search(r"return\s+get_effective_mode\(\)\s*==\s*unified_cache_mode::GLOBAL\s*;",
+                                          strip_comments(is_global)):
+        found.append("unified_cache_mode_is_global does not read the effective cache mode")
+
     probe_calls = re.findall(r"ggml_sycl_run_runtime_context_transaction\(([^;]*)\);", strip_comments(sycl_cpp))
     if not any(re.search(r",\s*true\s*,\s*out\s*$", c) for c in probe_calls):
         found.append("the probe does not run the transaction body")
@@ -914,7 +929,7 @@ def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
     return found
 
 
-def kv_refit_announcement_violations(sycl_cpp: str) -> list[str]:
+def kv_overflow_announcement_violations(sycl_cpp: str) -> list[str]:
     found: list[str] = []
     txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
     refit = re.search(r"plan_runtime_kv_residency\(in\)(.*?)rebuild_runtime_per_device_vram\(\)", txn, re.S)
@@ -923,22 +938,46 @@ def kv_refit_announcement_violations(sycl_cpp: str) -> list[str]:
     if not re.search(r"load_it\s*=\s*next_plan\.load_kv_device\.find\(", txn) or \
             "next_plan.kv_device = next_plan.load_kv_device;" not in refit.group(1):
         found.append("the re-fit does not restart from the load residency")
-    refused = refit.group(1).find("if (!residency.fits)")
-    recorded = refit.group(1).find("kv_host_demotions.push_back(")
-    if refused < 0 or recorded < 0 or recorded < refused:
-        found.append("a refused re-fit can log KV it re-placed")
-    # Both demotion paths only record; the one WARN reads the final residency,
-    # after the budget path and its refusal, and only when it changed.
-    announce = re.search(r"const\s+bool\s+announce\s*=\s*!probe_mode\s*&&\s*next_plan\.kv_device\s*!=\s*"
-                         r"current->plan->kv_device\s*;", txn)
-    records = [m.start() for m in re.finditer(r"kv_host_demotions\.push_back\(", txn)]
-    replan_refused = txn.find("if (!replan_ok) {")
-    if announce is None or len(records) != 2 or not max(records + [replan_refused]) < announce.start():
-        found.append("the demotion announcement does not read the final residency")
-    warns = [m.start() for m in re.finditer(r"GGML_LOG_WARN\(\s*\"\[SYCL-PLAN\] KV overflow", txn)]
-    gate = txn.find("if (!announce)")
-    if len(warns) != 1 or announce is None or gate < 0 or not announce.start() < gate < warns[0]:
-        found.append("a demotion WARN is not gated on a change to the published residency")
+    if len(re.findall(r"kv_host_demotions\.push_back\(", txn)) != 2:
+        found.append("the re-fit and the budget path do not both record their demotions")
+
+    # The one overflow WARN lives in the announcement, in the branch taken only
+    # when that device's residency changed; the other branch is INFO.
+    if ANNOUNCE_LAMBDA not in txn:
+        return found + ["the announcement is missing"]
+    lam_at = txn.index(ANNOUNCE_LAMBDA)
+    lam = function(txn, ANNOUNCE_LAMBDA)
+    warns = [m.start() for m in OVERFLOW_WARN.finditer(txn)]
+    if len(warns) != 1 or not lam_at < warns[0] < lam_at + len(lam):
+        found.append("a KV overflow WARN is logged outside the announcement")
+    branch = CHANGED_BRANCH.search(lam)
+    if branch is None:
+        found.append("the overflow WARN is not gated on that device's residency changing")
+    else:
+        changed = function(lam[branch.start():], branch.group(0))
+        rest = lam[branch.start() + len(changed):]
+        other = function(rest, "else") if re.match(r"\s*else\s*\{", rest) else ""
+        if len(OVERFLOW_WARN.findall(changed)) != 1 or len(OVERFLOW_WARN.findall(lam)) != 1 or \
+                "GGML_LOG_WARN(" in other or "GGML_LOG_INFO(" not in other:
+            found.append("the overflow WARN is not confined to the changed-residency branch")
+
+    # Announced once per exit that accepts: at the probe's exit after its ring
+    # rollback, and after a successful publish. Never before a refusal.
+    calls = list(re.finditer(r"\bannounce_kv_host_demotions\(([^;]*)\);", txn))
+    exits = [m.start() for m in re.finditer(r"\breturn\s+(?:refuse|busy)\(", txn)]
+    rollback = txn.find("if (!rollback_ok) {")
+    cas = txn.find("if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {")
+    published = txn.find("ggml_sycl_publish_prepared_plan_locked(prepared_publication);")
+    probe_accept = txn.find("return ggml_sycl_txn_result::ACCEPTED;")
+    probe = [m.start() for m in calls if m.group(1).strip() == "next_plan"]
+    publish = [m.start() for m in calls if m.group(1).strip() == "*immutable->plan"]
+    if min(rollback, cas, published, probe_accept) < 0:
+        found.append("an announcement anchor is missing (probe rollback, CAS, publication or probe acceptance)")
+    elif len(calls) != 2 or len(probe) != 1 or len(publish) != 1:
+        found.append("the demotions are not announced exactly once per accepting exit")
+    elif not rollback < probe[0] < probe_accept or any(probe[0] < e < probe_accept for e in exits) or \
+            not cas < published < publish[0] or any(e > publish[0] for e in exits):
+        found.append("the demotions can be announced before a refusal")
     return found
 
 
@@ -988,8 +1027,8 @@ def test_kv_headroom_wiring() -> None:
     assert kv_headroom_wiring_violations(GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()) == []
 
 
-def test_kv_refit_announcement() -> None:
-    assert kv_refit_announcement_violations(GGML_SYCL_CPP.read_text()) == []
+def test_kv_overflow_announcement() -> None:
+    assert kv_overflow_announcement_violations(GGML_SYCL_CPP.read_text()) == []
 
 
 def test_kv_publish_order() -> None:
@@ -1109,6 +1148,21 @@ def test_mutation_weight_capacity_ignores_global_mode_is_witnessed() -> None:
                       "the GLOBAL test inverted")
 
 
+def test_mutation_global_multi_device_warning_dropped_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    mutated = cpp.replace("next_plan.devices.size() > 1 && ggml_sycl::unified_cache_mode_is_global()",
+                          "next_plan.devices.size() > 1 && false", 1)
+    _assert_witnessed(cpp, mutated, _headroom_checker(cache), "is not warned about", "the GLOBAL warning disabled")
+
+
+def test_mutation_mode_is_global_inverted_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    body = function(cache, MODE_IS_GLOBAL_SIGNATURE)
+    new_body = body.replace("== unified_cache_mode::GLOBAL", "!= unified_cache_mode::GLOBAL", 1)
+    _assert_witnessed(cache, cache.replace(body, new_body, 1), _cache_checker(cpp),
+                      "does not read the effective cache mode", "the mode test inverted")
+
+
 def test_mutation_headroom_global_inverted_is_witnessed() -> None:
     cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
     body = function(cache, KV_HEADROOM_SIGNATURE)
@@ -1147,35 +1201,87 @@ def test_mutation_hot_overrides_or_plan_is_witnessed() -> None:
                       "license host layers under a plan", "!kv_plan && turned into ||")
 
 
-def test_mutation_refit_warn_ungated_is_witnessed() -> None:
+def test_mutation_announce_whole_plan_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
-    mutated = cpp.replace("const bool announce = !probe_mode && next_plan.kv_device != current->plan->kv_device;",
-                          "const bool announce = !probe_mode;", 1)
-    _assert_witnessed(cpp, mutated, kv_refit_announcement_violations,
-                      "a demotion WARN is not gated on a change to the published residency",
-                      "every demotion announced")
+    mutated = CHANGED_BRANCH.sub("if (!probe_mode && final_plan.kv_device != current->plan->kv_device) {", cpp, count=1)
+    _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations,
+                      "the overflow WARN is not gated on that device's residency changing",
+                      "every device announced when any device changed")
+
+
+def test_mutation_announce_warn_unconditional_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    lam = function(cpp, ANNOUNCE_LAMBDA)
+    w_at = lam.index("                // What fits with NO demotion.")
+    w_end = lam.index("ggml_sycl_all_vram_ctx_hint(fits_ctx).c_str());\n", w_at)
+    w_end += len("ggml_sycl_all_vram_ctx_hint(fits_ctx).c_str());\n")
+    warn = lam[w_at:w_end]
+    rest = lam[:w_at] + lam[w_end:]
+    loop_end = rest.rindex("        }\n    }")
+    new_lam = rest[:loop_end] + warn + rest[loop_end:]
+    _assert_witnessed(cpp, cpp.replace(lam, new_lam, 1), kv_overflow_announcement_violations,
+                      "the overflow WARN is not confined to the changed-residency branch",
+                      "the WARN hoisted out of the changed-residency branch")
+
+
+def test_mutation_announce_unchanged_branch_warns_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace('GGML_LOG_INFO(\n                    "[SYCL-PLAN] %sKV overflow %s on the host tier',
+                          'GGML_LOG_WARN(\n                    "[SYCL-PLAN] %sKV overflow %s on the host tier', 1)
+    _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations,
+                      "the overflow WARN is not confined to the changed-residency branch",
+                      "the unchanged branch raised to WARN")
+
+
+PUBLISH_ANNOUNCE = "    announce_kv_host_demotions(*immutable->plan);\n"
+REFUSAL_ANCHORS = (
+    "    if (!replan_ok && (replan_reason ==",
+    "    if (!ggml_sycl_check_nonfa_attn_scratch(",
+    "    if (ring_replan_result == ggml_sycl_ring_replan_result::RELEASE_REFUSED) {",
+    "    if (next->version == 0) {",
+    "    if (!stable_mmid && !ggml_sycl_materialize_published_mmid_workspaces(",
+    "    if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {",
+)
+
+
+def test_mutation_announce_before_each_refusal_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    body = function(cpp, TRANSACTION_SIGNATURE)
+    for anchor in REFUSAL_ANCHORS:
+        rest = body.replace(PUBLISH_ANNOUNCE, "", 1)
+        at = rest.index(anchor)
+        new_body = rest[:at] + PUBLISH_ANNOUNCE + rest[at:]
+        _assert_witnessed(cpp, cpp.replace(body, new_body, 1), kv_overflow_announcement_violations,
+                          "the demotions can be announced before a refusal", f"announced before {anchor.strip()}")
+        new_body = body[:body.index(anchor)] + PUBLISH_ANNOUNCE + body[body.index(anchor):]
+        _assert_witnessed(cpp, cpp.replace(body, new_body, 1), kv_overflow_announcement_violations,
+                          "announced exactly once per accepting exit", f"also announced before {anchor.strip()}")
+
+
+def test_mutation_probe_announces_before_rollback_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    body = function(cpp, TRANSACTION_SIGNATURE)
+    call = "        announce_kv_host_demotions(next_plan);\n"
+    rest = body.replace(call, "", 1)
+    at = rest.index("        if (!rollback_ok) {")
+    new_body = rest[:at] + call + rest[at:]
+    _assert_witnessed(cpp, cpp.replace(body, new_body, 1), kv_overflow_announcement_violations,
+                      "the demotions can be announced before a refusal", "probe announced before its rollback check")
+
+
+def test_mutation_announcement_anchor_missing_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("        if (!rollback_ok) {", "        if (rollback_ok == false) {", 1)
+    _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations, "an announcement anchor is missing",
+                      "the probe rollback anchor renamed")
 
 
 def test_mutation_refit_sticky_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
     mutated = cpp.replace("next_plan.kv_device = next_plan.load_kv_device;\n        for (size_t l = 0; l < n_kv_layers",
                           "for (size_t l = 0; l < n_kv_layers", 1)
-    _assert_witnessed(cpp, mutated, kv_refit_announcement_violations, "does not restart from the load residency",
+    _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations, "does not restart from the load residency",
                       "the re-fit starts from the published residency")
-
-
-def test_mutation_refit_logs_before_refusal_is_witnessed() -> None:
-    cpp = GGML_SYCL_CPP.read_text()
-    body = function(cpp, TRANSACTION_SIGNATURE)
-    refusal_at = body.index("        if (!residency.fits) {")
-    refusal_end = body.index("        }\n", body.index("return refuse(", refusal_at)) + len("        }\n")
-    refusal = body[refusal_at:refusal_end]
-    rest = body[:refusal_at] + body[refusal_end:]
-    record = rest.index("kv_host_demotions.push_back({ in.devices[i]")
-    loop_end = rest.index("\n        }\n", record) + len("\n        }\n")
-    new_body = rest[:loop_end] + refusal + rest[loop_end:]
-    _assert_witnessed(cpp, cpp.replace(body, new_body, 1), kv_refit_announcement_violations,
-                      "a refused re-fit can log KV it re-placed", "refusal checked after the re-fit records")
 
 
 def test_mutation_budget_demotion_warns_ungated_is_witnessed() -> None:
@@ -1184,21 +1290,8 @@ def test_mutation_budget_demotion_warns_ungated_is_witnessed() -> None:
     warn = ("            GGML_LOG_WARN(\"[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted\\n\",\n"
             "                          demotion_result.demoted_layers.size());\n")
     mutated = cpp.replace(anchor, anchor + warn, 1)
-    _assert_witnessed(cpp, mutated, kv_refit_announcement_violations,
-                      "a demotion WARN is not gated on a change to the published residency",
-                      "the budget path's own WARN restored")
-
-
-def test_mutation_announce_before_budget_path_is_witnessed() -> None:
-    cpp = GGML_SYCL_CPP.read_text()
-    body = function(cpp, TRANSACTION_SIGNATURE)
-    decl = "    const bool announce = !probe_mode && next_plan.kv_device != current->plan->kv_device;\n"
-    rest = body.replace(decl, "", 1)
-    at = rest.index("    if (!replan_ok && (replan_reason ==")
-    new_body = rest[:at] + decl + rest[at:]
-    _assert_witnessed(cpp, cpp.replace(body, new_body, 1), kv_refit_announcement_violations,
-                      "the demotion announcement does not read the final residency",
-                      "announce computed before the budget demotion")
+    _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations,
+                      "a KV overflow WARN is logged outside the announcement", "the budget path's own WARN restored")
 
 
 def test_mutation_publish_after_kv_allocation_is_witnessed() -> None:
@@ -1232,7 +1325,7 @@ def test_mutation_budget_path_swa_off_is_witnessed() -> None:
 
 def test_mutation_unguarded_hint_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
-    mutated = cpp.replace('"CPU.%s\\n",', '"CPU. Largest all-VRAM context is about -c %u\\n",', 1)
+    mutated = cpp.replace('the CPU.%s\\n",', 'the CPU. Largest all-VRAM context is about -c %u\\n",', 1)
     _assert_witnessed(cpp, mutated, kv_demotion_message_violations, "prints the -c hint unguarded",
                       "the old unguarded -c print")
 
