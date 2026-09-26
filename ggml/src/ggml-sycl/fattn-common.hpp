@@ -29,15 +29,13 @@ static inline bool fattn_mask_is_dead(sycl::half mask_val) {
 }
 
 // The masked score: exactly -inf for a dead cell, whatever the QK^T value was.
-static inline float fattn_apply_mask(float score, float slope, sycl::half mask_val) {
+static inline float fattn_mask_apply(float score, float slope, sycl::half mask_val) {
     return fattn_mask_is_dead(mask_val) ? -INFINITY : score + slope * static_cast<float>(mask_val);
 }
 
-// True when all n_rows query rows mask KV cell kv with -inf. Kernels that
-// multiply a whole V tile on the matrix engine cannot select per element;
-// such a cell has weight 0 for every row of the tile, so zeroing its V there
-// is exact. The rows are the ones the calling work-group covers, so "dead" is
-// decided per tile at run time, never globally.
+// True when all n_rows query rows mask KV cell kv with -inf. The rows are the
+// ones the calling work-group covers, so "dead" is decided per tile at run
+// time, never globally.
 //
 // A cell masked for only SOME rows of the tile (a causal mask in prefill) is
 // not dead, and its V is kept. If that V is non-finite, the rows that see it
@@ -47,7 +45,7 @@ static inline float fattn_apply_mask(float score, float slope, sycl::half mask_v
 // rows that see it a finite, wrong result and hide real garbage in the
 // cache. The spill keeps it visible, and it is confined to one tile of rows
 // that already contains a NaN answer.
-static inline bool fattn_kv_dead_for_rows(const sycl::half * mask, int64_t row_stride, int n_rows, int kv) {
+static inline bool fattn_mask_is_dead_for_rows(const sycl::half * mask, int64_t row_stride, int n_rows, int kv) {
     if (mask == nullptr || n_rows <= 0) {
         return false;
     }
@@ -59,6 +57,51 @@ static inline bool fattn_kv_dead_for_rows(const sycl::half * mask, int64_t row_s
     return true;
 }
 
+// V loads for kernels that multiply a whole V tile on the matrix engine
+// (S @ V). Such a kernel cannot select per element, so a dead cell's weight-0
+// column still meets its V row, and 0 * NaN is NaN. A cell masked for every
+// query row of the work-group (fattn_mask_is_dead_for_rows) contributes
+// nothing, so zeroing its non-finite V is exact. The mask is read only for a
+// non-finite value. A partially masked cell keeps its V; see
+// fattn_mask_is_dead_for_rows for why that NaN may spill within the tile.
+static inline sycl::half fattn_v_zero_if_dead(sycl::half         v,
+                                              const sycl::half * mask,
+                                              int64_t            row_stride,
+                                              int                n_rows,
+                                              int                kv) {
+    if (!sycl::isfinite(static_cast<float>(v)) && fattn_mask_is_dead_for_rows(mask, row_stride, n_rows, kv)) {
+        return sycl::half(0.0f);
+    }
+    return v;
+}
+
+static inline sycl::half4 fattn_v_zero_if_dead(sycl::half4        v,
+                                               const sycl::half * mask,
+                                               int64_t            row_stride,
+                                               int                n_rows,
+                                               int                kv) {
+    const bool finite = sycl::isfinite(static_cast<float>(v.x())) && sycl::isfinite(static_cast<float>(v.y())) &&
+                        sycl::isfinite(static_cast<float>(v.z())) && sycl::isfinite(static_cast<float>(v.w()));
+    if (!finite && fattn_mask_is_dead_for_rows(mask, row_stride, n_rows, kv)) {
+        return sycl::half4(0.0f);
+    }
+    return v;
+}
+
+// The softmax flush-to-zero test: true when exp(diff) is flushed to 0. It is
+// written `diff < T` so that a NaN diff (a visible cell with a non-finite
+// score) compares false and is NOT flushed: it propagates as on the CPU
+// reference. The complementary spelling `diff >= T ? exp : 0` flushes NaN to a
+// weight of 0 and hides it. Callers therefore test this predicate rather than
+// spell the comparison themselves.
+static inline bool fattn_ftz_flushes(float diff) {
+    return diff < SOFTMAX_FTZ_THRESHOLD;
+}
+
+static inline float fattn_exp_ftz(float diff) {
+    return fattn_ftz_flushes(diff) ? 0.0f : sycl::exp(diff);
+}
+
 // Softmax weight slots read back by a scalar P x V loop. A dead cell is
 // stored as FATTN_DEAD_WEIGHT, which no exp() produces, so the V loop skips
 // exactly the dead cells. "Dead" means a -inf MASK (fattn_mask_is_dead), read
@@ -68,7 +111,7 @@ static inline bool fattn_kv_dead_for_rows(const sycl::half * mask, int64_t row_s
 // added), and 0 * NaN is NaN there.
 static constexpr float FATTN_DEAD_WEIGHT = -1.0f;
 
-static inline float fattn_mark_dead(bool dead, float weight) {
+static inline float fattn_weight_mark_dead(bool dead, float weight) {
     return dead ? FATTN_DEAD_WEIGHT : weight;
 }
 

@@ -254,7 +254,7 @@ static void flash_attn_tile_f16_kernel(
                     // maskh indexing: maskh[query * ne30 + kv_pos] (ne30 is the KV dimension stride)
                     if (maskh) {
                         // Use ne30 (not ne11) for the KV stride in mask
-                        dot = fattn_apply_mask(dot, slope, maskh[q_idx * ne30 + kv_start + k_idx]);
+                        dot = fattn_mask_apply(dot, slope, maskh[q_idx * ne30 + kv_start + k_idx]);
                     }
 
                     KQ_shared[q_idx * config::BATCH_KV + k_idx] = dot;
@@ -319,7 +319,7 @@ static void flash_attn_tile_f16_kernel(
                 // non-finite. Dead is read from the mask (the same element the
                 // score step selected on), never inferred from kq_val: a
                 // visible cell whose QK^T is -inf still meets its V (see
-                // fattn_mark_dead). Every thread reads the same element, so
+                // fattn_weight_mark_dead). Every thread reads the same element, so
                 // the branch is uniform.
                 if (maskh && fattn_mask_is_dead(maskh[j * ne30 + kv_start + k])) {
                     continue;

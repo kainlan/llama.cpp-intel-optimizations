@@ -709,18 +709,9 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                 k_val = reinterpret_cast<const sycl::half *>(K_row_base)[d];
                 v_val = reinterpret_cast<const sycl::half *>(V_row_base)[d];
             }
-            // S @ V multiplies whole tiles, so a dead cell's weight-0 column
-            // still meets its V row (0 * NaN is NaN). A cell masked for every
-            // query row of this work-group contributes nothing, so zeroing its
-            // non-finite V is exact; the mask is read only for such a value.
-            // A partially masked cell keeps its V; see fattn_kv_dead_for_rows
-            // for why that NaN is allowed to spill within the tile.
-            if (!sycl::isfinite(static_cast<float>(v_val)) &&
-                fattn_kv_dead_for_rows(maskh, ne30, sycl::min(ncols, ne01 - ic0), kv_pos)) {
-                v_val = sycl::half(0.0f);
-            }
             tile_K[k * D + d] = k_val;
-            tile_V[k * D + d] = v_val;
+            // A dead cell's non-finite V is zeroed (see fattn_v_zero_if_dead).
+            tile_V[k * D + d] = fattn_v_zero_if_dead(v_val, maskh, ne30, sycl::min(ncols, ne01 - ic0), kv_pos);
         }
         // Zero-pad incomplete last batch so XMX never reads uninitialized SLM.
         for (int idx = tid; idx < (XMX_V2_BATCH_KV - kv_count) * D; idx += NTHREADS) {
@@ -786,7 +777,7 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                 if (maskh) {
                     const int kv_abs = kv_start + kv_col + lane;
                     if (kv_abs < ne11) {
-                        lane_QK[r] = fattn_apply_mask(lane_QK[r], slope, maskh[(sg_q_base + r) * ne30 + kv_abs]);
+                        lane_QK[r] = fattn_mask_apply(lane_QK[r], slope, maskh[(sg_q_base + r) * ne30 + kv_abs]);
                     } else {
                         lane_QK[r] = -FLT_MAX;
                     }
@@ -1195,7 +1186,7 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
         }
 
         // Dead is decided by the mask, never by the score: a visible cell whose
-        // QK^T is -inf still meets its V (see fattn_mark_dead).
+        // QK^T is -inf still meets its V (see fattn_weight_mark_dead).
         bool  slot_dead[2 * XMX_V2_DECODE_SLOTS];
         float local_max = -FLT_MAX;
 #    pragma unroll
@@ -1215,7 +1206,7 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
                 }
                 if (maskh) {
                     slot_dead[i] = fattn_mask_is_dead(maskh[kv_abs]);
-                    score        = fattn_apply_mask(score, slope, maskh[kv_abs]);
+                    score        = fattn_mask_apply(score, slope, maskh[kv_abs]);
                 }
             }
             lane_scores[i] = score;
@@ -1245,7 +1236,7 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
             const int slot     = i - half_id * XMX_V2_DECODE_SLOTS;
             const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
             if (lane < XMX_V2_DECODE_ACTIVE_LANES) {
-                const float p      = fattn_mark_dead(slot_dead[i], sycl::exp(lane_scores[i] - new_max));
+                const float p      = fattn_weight_mark_dead(slot_dead[i], sycl::exp(lane_scores[i] - new_max));
                 tile_S_f[kv_local] = p;
                 local_sum += fattn_weight_sum_term(p);
             }
@@ -1261,7 +1252,7 @@ static void flash_attn_xmx_v2_decode_m1n64_kernel(const char * __restrict__ Q_ba
             float     acc = 0.0f;
 #    pragma unroll
             for (int k = 0; k < XMX_V2_DECODE_BATCH_KV; ++k) {
-                // A dead cell's V may be non-finite: skip it (see fattn_mark_dead).
+                // A dead cell's V may be non-finite: skip it (see fattn_weight_mark_dead).
                 const float s = tile_S_f[k];
                 if (kv_start + k < ne11 && !fattn_weight_is_dead(s)) {
                     acc += s * static_cast<float>(tile_V[k * D + d]);
@@ -1524,7 +1515,7 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
         }
 
         // Dead is decided by the mask, never by the score: a visible cell whose
-        // QK^T is -inf still meets its V (see fattn_mark_dead).
+        // QK^T is -inf still meets its V (see fattn_weight_mark_dead).
         bool  slot_dead[2 * XMX_V2_DECODE_SLOTS];
         float local_max = -FLT_MAX;
 #    pragma unroll
@@ -1544,7 +1535,7 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
                 }
                 if (maskh) {
                     slot_dead[i] = fattn_mask_is_dead(maskh[kv_abs]);
-                    score        = fattn_apply_mask(score, slope, maskh[kv_abs]);
+                    score        = fattn_mask_apply(score, slope, maskh[kv_abs]);
                 }
             }
             lane_scores[i] = score;
@@ -1574,7 +1565,7 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
             const int slot     = i - half_id * XMX_V2_DECODE_SLOTS;
             const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
             if (active && lane < XMX_V2_DECODE_ACTIVE_LANES) {
-                const float p = fattn_mark_dead(slot_dead[i], sycl::exp(lane_scores[i] - new_max));
+                const float p = fattn_weight_mark_dead(slot_dead[i], sycl::exp(lane_scores[i] - new_max));
                 tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + kv_local] = p;
                 local_sum += fattn_weight_sum_term(p);
             }
@@ -1591,7 +1582,7 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
                 float     acc = 0.0f;
 #    pragma unroll
                 for (int k = 0; k < XMX_V2_DECODE_BATCH_KV; ++k) {
-                    // A dead cell's V may be non-finite: skip it (see fattn_mark_dead).
+                    // A dead cell's V may be non-finite: skip it (see fattn_weight_mark_dead).
                     const float s = tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + k];
                     if (kv_start + k < ne11 && !fattn_weight_is_dead(s)) {
                         acc += s * static_cast<float>(tile_V[k * D + d]);
@@ -1834,7 +1825,7 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
     }
 
     // Dead is decided by the mask, never by the score: a visible cell whose
-    // QK^T is -inf still meets its V (see fattn_mark_dead).
+    // QK^T is -inf still meets its V (see fattn_weight_mark_dead).
     bool  slot_dead[2 * XMX_V2_DECODE_SLOTS];
     float local_max = -FLT_MAX;
 #    pragma unroll
@@ -1854,17 +1845,19 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
             }
             if (maskh) {
                 slot_dead[i] = fattn_mask_is_dead(maskh[kv_abs]);
-                score        = fattn_apply_mask(score, slope, maskh[kv_abs]);
+                score        = fattn_mask_apply(score, slope, maskh[kv_abs]);
             }
         }
         lane_scores[i] = score;
         local_max      = sycl::fmax(local_max, score);
     }
 
-    // A partition whose visible cells are all masked has a -inf maximum; keep
-    // it finite (as every other kernel's initial maximum is) so that
-    // exp(score - KQ_max) stays 0 for dead cells instead of becoming NaN, and
-    // the merge weighs this partition by 0.
+    // local_max starts at -FLT_MAX, so KQ_max is finite even when every cell of
+    // this partition is dead. The floor at -FLT_MAX / 2 (the merge's initial
+    // maximum) matters only then: it gives the partition's out-of-range slots,
+    // which carry a score of -FLT_MAX, weight exp(-FLT_MAX / 2) = 0 rather than
+    // exp(0) = 1, so the partial sum is 0 instead of a count of padding slots.
+    // The merge weighs such a partition by 0 either way.
     KQ_max = sycl::fmax(sycl::reduce_over_group(sg, local_max, sycl::maximum<float>{}), -FLT_MAX / 2.0f);
 
     float lane_probs[2 * XMX_V2_DECODE_SLOTS];
@@ -1876,7 +1869,7 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
         const int kv_local = half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + lane;
         lane_probs[i]      = 0.0f;
         if (active && lane < XMX_V2_DECODE_ACTIVE_LANES) {
-            lane_probs[i] = fattn_mark_dead(slot_dead[i], sycl::exp(lane_scores[i] - KQ_max));
+            lane_probs[i] = fattn_weight_mark_dead(slot_dead[i], sycl::exp(lane_scores[i] - KQ_max));
             if constexpr (!DIRECT_PV) {
                 tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + kv_local] = lane_probs[i];
             }
@@ -1905,7 +1898,7 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
                             half_id * XMX_V2_DECODE_HALF_KV + slot * XMX_V2_DECODE_ACTIVE_LANES + src_lane;
                         if (kv_start + kv_local < ne11) {
                             // Uniform across the sub-group. A dead cell's V may
-                            // be non-finite: skip it (see fattn_mark_dead).
+                            // be non-finite: skip it (see fattn_weight_mark_dead).
                             const float p = sycl::select_from_group(sg, lane_probs[i], src_lane);
                             if (!fattn_weight_is_dead(p)) {
                                 acc += p * static_cast<float>(tile_V[kv_local * D + d]);
@@ -1916,7 +1909,7 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
             } else {
 #    pragma unroll
                 for (int k = 0; k < XMX_V2_DECODE_BATCH_KV; ++k) {
-                    // A dead cell's V may be non-finite: skip it (see fattn_mark_dead).
+                    // A dead cell's V may be non-finite: skip it (see fattn_weight_mark_dead).
                     const float s = tile_S_f[q_rel * XMX_V2_DECODE_BATCH_KV + k];
                     if (kv_start + k < ne11 && !fattn_weight_is_dead(s)) {
                         acc += s * static_cast<float>(tile_V[k * D + d]);

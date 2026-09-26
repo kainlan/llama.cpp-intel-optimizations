@@ -688,12 +688,16 @@ static void flash_attn_xmx_f16_kernel(
                     const sycl::half   mh2 = mask_row[k + 2];
                     const sycl::half   mh3 = mask_row[k + 3];
 
-                    qk = sycl::float4(fattn_apply_mask(qk.x(), slope, mh0), fattn_apply_mask(qk.y(), slope, mh1),
-                                      fattn_apply_mask(qk.z(), slope, mh2), fattn_apply_mask(qk.w(), slope, mh3));
+                    qk = sycl::float4(fattn_mask_apply(qk.x(), slope, mh0), fattn_mask_apply(qk.y(), slope, mh1),
+                                      fattn_mask_apply(qk.z(), slope, mh2), fattn_mask_apply(qk.w(), slope, mh3));
                 }
 
                 // Cross-sequence masking: set to -INF if KV belongs to different sequence
                 // Vectorized: load 4 seq_ids at once using int4
+                // These cells (and the causal ones below) get -FLT_MAX, not a
+                // dead mark, and fattn_v_zero_if_dead reads only the -inf mask.
+                // That is safe because llama.cpp's KQ mask already carries the
+                // same sequence separation and causality, so they are -inf there.
                 if (q_seq >= 0 && kv_seq_ids) {
                     const int  kv_idx_base = kv_start + k;
                     // Vectorized load of 4 int32 sequence IDs
@@ -742,9 +746,9 @@ static void flash_attn_xmx_f16_kernel(
                     qk_val = logit_softcap * sycl::tanh(qk_val);
                 }
                 if (mask_row) {
-                    qk_val = fattn_apply_mask(qk_val, slope, mask_row[k]);
+                    qk_val = fattn_mask_apply(qk_val, slope, mask_row[k]);
                 }
-                // Cross-sequence masking for remainder elements
+                // Cross-sequence masking for remainder elements (-FLT_MAX: see above)
                 if (q_seq >= 0 && kv_seq_ids) {
                     const int32_t kv_seq = kv_seq_ids[kv_start + k];
                     if (kv_seq >= 0 && kv_seq != q_seq) {
@@ -762,13 +766,8 @@ static void flash_attn_xmx_f16_kernel(
             }
         }
 
-        // Load V tile for current batch (with stride padding for XMX).
-        // S @ V multiplies whole tiles, so a dead cell's weight-0 column still
-        // meets its V row (0 * NaN is NaN). A cell masked for every query row
-        // of this work-group contributes nothing, so zeroing its non-finite V
-        // is exact; the mask is read only for such a value. A partially
-        // masked cell keeps its V; see fattn_kv_dead_for_rows for why that
-        // NaN is allowed to spill within the tile.
+        // Load V tile for current batch (with stride padding for XMX). A
+        // dead cell's non-finite V is zeroed (see fattn_v_zero_if_dead).
         const int v_dead_rows = sycl::min(ncols, ne01 - ic0);
         if constexpr (kv_is_fp8) {
             // FP8 E4M3: element-by-element dequantization (can't vectorize)
@@ -788,12 +787,8 @@ static void flash_attn_xmx_f16_kernel(
                     V_row_base = V_base + nb21 * kv_pos;
                 }
                 const uint8_t * V_row_fp8 = reinterpret_cast<const uint8_t *>(V_row_base);
-                sycl::half      v_val     = fp8_e4m3_to_half(V_row_fp8[d]);
-                if (!sycl::isfinite(static_cast<float>(v_val)) &&
-                    fattn_kv_dead_for_rows(maskh, stride_mask, v_dead_rows, kv_pos)) {
-                    v_val = sycl::half(0.0f);
-                }
-                tile_V[k * V_STRIDE + d] = v_val;
+                tile_V[k * V_STRIDE + d] =
+                    fattn_v_zero_if_dead(fp8_e4m3_to_half(V_row_fp8[d]), maskh, stride_mask, v_dead_rows, kv_pos);
             }
         } else {
             // FP16: Vectorized V loading with half4 for better memory bandwidth
@@ -816,13 +811,9 @@ static void flash_attn_xmx_f16_kernel(
                 } else {
                     V_row = reinterpret_cast<const sycl::half *>(V_base + nb21 * kv_pos);
                 }
-                sycl::half4 v_vec = *reinterpret_cast<const sycl::half4 *>(&V_row[d]);
-                if (!(sycl::isfinite(static_cast<float>(v_vec.x())) && sycl::isfinite(static_cast<float>(v_vec.y())) &&
-                      sycl::isfinite(static_cast<float>(v_vec.z())) && sycl::isfinite(static_cast<float>(v_vec.w()))) &&
-                    fattn_kv_dead_for_rows(maskh, stride_mask, v_dead_rows, kv_pos)) {
-                    v_vec = sycl::half4(0.0f);
-                }
-                *reinterpret_cast<sycl::half4 *>(&tile_V[k * V_STRIDE + d]) = v_vec;
+                const sycl::half4 v_vec = *reinterpret_cast<const sycl::half4 *>(&V_row[d]);
+                *reinterpret_cast<sycl::half4 *>(&tile_V[k * V_STRIDE + d]) =
+                    fattn_v_zero_if_dead(v_vec, maskh, stride_mask, v_dead_rows, kv_pos);
             }
             // Handle remainder (if kv_count * D not divisible by 4)
             const int v_remainder_start = v_total_vecs * V_VEC_SIZE;
@@ -842,12 +833,7 @@ static void flash_attn_xmx_f16_kernel(
                 } else {
                     V_row = reinterpret_cast<const sycl::half *>(V_base + nb21 * kv_pos);
                 }
-                sycl::half v_val = V_row[d];
-                if (!sycl::isfinite(static_cast<float>(v_val)) &&
-                    fattn_kv_dead_for_rows(maskh, stride_mask, v_dead_rows, kv_pos)) {
-                    v_val = sycl::half(0.0f);
-                }
-                tile_V[k * V_STRIDE + d] = v_val;
+                tile_V[k * V_STRIDE + d] = fattn_v_zero_if_dead(V_row[d], maskh, stride_mask, v_dead_rows, kv_pos);
             }
         }
         // S @ V runs over the whole batch_kv tile. Rows past kv_count carry
@@ -1039,11 +1025,10 @@ static void flash_attn_xmx_f16_kernel(
                 for (int k = 0; k < kv_count; ++k) {
                     const float kq_val       = QK_acc[j * batch_kv + k];
                     const float diff         = kq_val - KQ_max[j];
-                    // `diff < T ? 0 : exp` lets a NaN score (a visible cell
-                    // with a non-finite K) propagate like the CPU reference;
-                    // the `>=` form flushed it to weight 0 and hid it. A dead
-                    // cell is exactly -inf here and still flushes to 0.
-                    const float w            = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : sycl::exp(diff);
+                    // A NaN score (a visible cell with a non-finite K) is not
+                    // flushed (see fattn_ftz_flushes). A dead cell is exactly
+                    // -inf here and still flushes to 0.
+                    const float w            = fattn_exp_ftz(diff);
                     tile_S[j * S_STRIDE + k] = sycl::half(w);
                     batch_sum += w;
                 }

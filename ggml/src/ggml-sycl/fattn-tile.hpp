@@ -540,7 +540,7 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
     float KQ_acc[nbatch_fa/(np*warp_size) * cpw] = {0.0f}; // Accumulators for KQ matrix multiplication.
 
     // Per KQ_acc element: its cell's mask is -inf. Dead is decided where the
-    // mask is read, not from the score later (see fattn_mark_dead).
+    // mask is read, not from the score later (see fattn_weight_mark_dead).
     bool KQ_dead[nbatch_fa / (np * warp_size) * cpw] = {};
 
     // KQ = K @ Q matrix multiplication:
@@ -583,7 +583,7 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
                     const sycl::half mask_val = mask[j * stride_mask + k_VKQ_0 + i_KQ];
                     const int        i_acc    = (i_KQ_0 / (np * warp_size)) * cpw + jc0;
                     KQ_dead[i_acc]            = fattn_mask_is_dead(mask_val);
-                    KQ_acc[i_acc]             = fattn_apply_mask(KQ_acc[i_acc], slope, mask_val);
+                    KQ_acc[i_acc]             = fattn_mask_apply(KQ_acc[i_acc], slope, mask_val);
                 }
 
                 KQ_max_new[jc0] =
@@ -631,8 +631,8 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
                 const float val =
                     !oob_check || i0 + (item_ct1.get_local_id(1) % np) * warp_size + item_ct1.get_local_id(2) <
                                       static_cast<uint32_t>(k_VKQ_sup) ?
-                        fattn_mark_dead(KQ_dead[(i0 / (np * warp_size)) * cpw + jc],
-                                        sycl::native::exp(KQ_val - (float) KQ_max[jc])) :
+                        fattn_weight_mark_dead(KQ_dead[(i0 / (np * warp_size)) * cpw + jc],
+                                               sycl::native::exp(KQ_val - (float) KQ_max[jc])) :
                         0.0f;
                 KQ_sum_add += fattn_weight_sum_term(val);
                 tmp[i0/(np*warp_size)][jc1] = val;
@@ -704,15 +704,15 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             }
 
 #pragma unroll
-            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+            for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                // A dead cell's V may be non-finite; skip it rather than add
+                // 0 * V (see fattn_weight_mark_dead). KQ_k is the same across
+                // the warp, and the test is made once per column.
+                if (fattn_weight_is_dead(static_cast<float>(KQ_k[jc_VKQ_0].x()))) {
+                    continue;
+                }
 #pragma unroll
-                for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
-                    // A dead cell's V may be non-finite; skip it rather than
-                    // add 0 * V (see fattn_mark_dead). KQ_k is the same across
-                    // the warp.
-                    if (fattn_weight_is_dead(static_cast<float>(KQ_k[jc_VKQ_0].x()))) {
-                        continue;
-                    }
+                for (int i0 = 0; i0 < DVp / 2; i0 += warp_size) {
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x() +=
                         V_k[i0/warp_size].x()*KQ_k[jc_VKQ_0].x();
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].y() +=
@@ -740,13 +740,14 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             }
 
 #pragma unroll
-            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+            for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                // A dead cell's V may be non-finite; skip it, once per column
+                // (see fattn_weight_mark_dead).
+                if (fattn_weight_is_dead(KQ_k[jc_VKQ_0])) {
+                    continue;
+                }
 #pragma unroll
-                for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
-                    // A dead cell's V may be non-finite; skip it (see fattn_mark_dead).
-                    if (fattn_weight_is_dead(KQ_k[jc_VKQ_0])) {
-                        continue;
-                    }
+                for (int i0 = 0; i0 < DVp / 2; i0 += warp_size) {
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x() += V_k[i0/warp_size].x()*KQ_k[jc_VKQ_0];
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].y() += V_k[i0/warp_size].y()*KQ_k[jc_VKQ_0];
                 }
