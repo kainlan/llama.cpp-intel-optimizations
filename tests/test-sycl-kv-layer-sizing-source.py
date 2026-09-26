@@ -900,6 +900,9 @@ def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
                      r"ggml_sycl::unified_cache_mode_is_global\(\)\s*\)\s*\{", txn) or \
             "uses device 0's free VRAM as every device's KV headroom" not in txn:
         found.append("GLOBAL cache mode with a multi-device plan is not warned about")
+    elif not re.search(r"static\s+std::atomic<bool>\s+(\w+)\s*\{\s*false\s*\}\s*;\s*if\s*\(\s*!\1\.exchange\(\s*true\s*\)"
+                       r"\s*\)\s*\{\s*GGML_LOG_WARN\(\s*\"\[SYCL-PLAN\] GGML_SYCL_UNIFIED_CACHE_MODE=global", txn):
+        found.append("the GLOBAL multi-device warning is not one-shot across threads")
     is_global = function_or_none(cache_cpp, MODE_IS_GLOBAL_SIGNATURE)
     if is_global is None or not re.search(r"return\s+get_effective_mode\(\)\s*==\s*unified_cache_mode::GLOBAL\s*;",
                                           strip_comments(is_global)):
@@ -961,10 +964,21 @@ def kv_overflow_announcement_violations(sycl_cpp: str) -> list[str]:
                 "GGML_LOG_WARN(" in other or "GGML_LOG_INFO(" not in other:
             found.append("the overflow WARN is not confined to the changed-residency branch")
 
+    # The announcement only prints: the "-c" hint reads the headroom admission
+    # read, before the publish tail moves it, and nothing that allocates runs
+    # after ownership changes.
+    if re.search(r"ggml_sycl_largest_fitting_n_ctx_live\(|ggml_sycl_all_vram_ctx_hint\(", lam):
+        found.append("the announcement computes the -c hint after publication")
+    hints = [m.start() for m in re.finditer(r"ggml_sycl_all_vram_ctx_hint\(", txn)]
+    cas_at = txn.find("if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {")
+    if len(hints) != 2 or cas_at < 0 or any(h > cas_at for h in hints):
+        found.append("a demotion record's -c hint is not taken before the CAS")
+
     # Announced once per exit that accepts: at the probe's exit after its ring
     # rollback, and after a successful publish. Never before a refusal.
     calls = list(re.finditer(r"\bannounce_kv_host_demotions\(([^;]*)\);", txn))
-    exits = [m.start() for m in re.finditer(r"\breturn\s+(?:refuse|busy)\(", txn)]
+    exits = [m.start() for m in re.finditer(r"\breturn\s+(?:(?:refuse|busy)\(|ggml_sycl_txn_result::(?:REFUSED|BUSY)\b)",
+                                            txn)]
     rollback = txn.find("if (!rollback_ok) {")
     cas = txn.find("if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {")
     published = txn.find("ggml_sycl_publish_prepared_plan_locked(prepared_publication);")
@@ -1155,6 +1169,19 @@ def test_mutation_global_multi_device_warning_dropped_is_witnessed() -> None:
     _assert_witnessed(cpp, mutated, _headroom_checker(cache), "is not warned about", "the GLOBAL warning disabled")
 
 
+def test_mutation_global_warning_not_one_shot_is_witnessed() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    gate = "if (!global_multi_device_warned.exchange(true)) {"
+    decl = "static std::atomic<bool> global_multi_device_warned{ false };\n"
+    for label, mutated in (("every call warns", cpp.replace(gate, "if (true) {", 1)),
+                           ("a plain static bool", cpp.replace(
+                               decl + "        " + gate,
+                               "static bool global_multi_device_warned = false;\n"
+                               "        if (!global_multi_device_warned) {\n"
+                               "            global_multi_device_warned = true;", 1))):
+        _assert_witnessed(cpp, mutated, _headroom_checker(cache), "is not one-shot across threads", label)
+
+
 def test_mutation_mode_is_global_inverted_is_witnessed() -> None:
     cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
     body = function(cache, MODE_IS_GLOBAL_SIGNATURE)
@@ -1212,9 +1239,8 @@ def test_mutation_announce_whole_plan_is_witnessed() -> None:
 def test_mutation_announce_warn_unconditional_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
     lam = function(cpp, ANNOUNCE_LAMBDA)
-    w_at = lam.index("                // What fits with NO demotion.")
-    w_end = lam.index("ggml_sycl_all_vram_ctx_hint(fits_ctx).c_str());\n", w_at)
-    w_end += len("ggml_sycl_all_vram_ctx_hint(fits_ctx).c_str());\n")
+    w_at = lam.index("                GGML_LOG_WARN(")
+    w_end = lam.index("rec.ctx_hint.c_str());\n", w_at) + len("rec.ctx_hint.c_str());\n")
     warn = lam[w_at:w_end]
     rest = lam[:w_at] + lam[w_end:]
     loop_end = rest.rindex("        }\n    }")
@@ -1269,6 +1295,34 @@ def test_mutation_probe_announces_before_rollback_is_witnessed() -> None:
                       "the demotions can be announced before a refusal", "probe announced before its rollback check")
 
 
+def test_mutation_hint_computed_in_announcement_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = cpp.replace("                    rec.ctx_hint.c_str());",
+                          "                    ggml_sycl_all_vram_ctx_hint(ggml_sycl_largest_fitting_n_ctx_live(\n"
+                          "                        final_plan, next_kv_info, rec.device, admitted_kv)).c_str());", 1)
+    _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations,
+                      "the announcement computes the -c hint after publication", "the hint computed at announce time")
+
+
+def test_mutation_hint_taken_after_cas_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    body = function(cpp, TRANSACTION_SIGNATURE)
+    extra = "    (void) ggml_sycl_all_vram_ctx_hint(0);\n"
+    at = body.index(PUBLISH_ANNOUNCE)
+    new_body = body[:at] + extra + body[at:]
+    _assert_witnessed(cpp, cpp.replace(body, new_body, 1), kv_overflow_announcement_violations,
+                      "is not taken before the CAS", "a hint taken after the CAS")
+
+
+def test_mutation_bare_refusal_after_announce_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    for result in ("REFUSED", "BUSY"):
+        mutated = cpp.replace(PUBLISH_ANNOUNCE, PUBLISH_ANNOUNCE + "    if (!g_runtime_update_succeeded) {\n"
+                              f"        return ggml_sycl_txn_result::{result};\n    }}\n", 1)
+        _assert_witnessed(cpp, mutated, kv_overflow_announcement_violations,
+                          "the demotions can be announced before a refusal", f"a bare {result} after the announce")
+
+
 def test_mutation_announcement_anchor_missing_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
     mutated = cpp.replace("        if (!rollback_ok) {", "        if (rollback_ok == false) {", 1)
@@ -1286,7 +1340,7 @@ def test_mutation_refit_sticky_is_witnessed() -> None:
 
 def test_mutation_budget_demotion_warns_ungated_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
-    anchor = "                                          \"the plan exceeded the device's VRAM budget\" });\n"
+    anchor = "                  \"the plan exceeded the device's VRAM budget\", ggml_sycl_all_vram_ctx_hint(fits) });\n"
     warn = ("            GGML_LOG_WARN(\"[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted\\n\",\n"
             "                          demotion_result.demoted_layers.size());\n")
     mutated = cpp.replace(anchor, anchor + warn, 1)

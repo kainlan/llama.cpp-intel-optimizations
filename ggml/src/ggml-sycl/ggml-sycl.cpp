@@ -17701,7 +17701,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         int              device;
         std::vector<int> layers;
         size_t           host_bytes;
-        std::string      cause;  // what ran out
+        std::string      cause;     // what ran out
+        std::string      ctx_hint;  // the all-VRAM "-c" hint, from the headroom admission read
     };
 
     std::vector<kv_host_demotion> kv_host_demotions;
@@ -17828,7 +17829,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             kv_demoted_host_bytes += fit.host_kv_bytes_added;
             char cause[64];
             snprintf(cause, sizeof(cause), "the device has %.1f MB free for KV", in.available[i] / mb);
-            kv_host_demotions.push_back({ in.devices[i], fit.demoted_layers, fit.host_kv_bytes_added, cause });
+            // What fits with NO demotion, read now: after the publish tail
+            // (ring re-plan, MMID materialization) the headroom has moved.
+            const uint32_t fits =
+                ggml_sycl_largest_fitting_n_ctx_live(next_plan, next_kv_info, in.devices[i], admitted_kv);
+            kv_host_demotions.push_back({ in.devices[i], fit.demoted_layers, fit.host_kv_bytes_added, cause,
+                                          ggml_sycl_all_vram_ctx_hint(fits) });
         }
     }
 
@@ -17897,9 +17903,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                 current->plan->moe_mmid_device_pool_bytes, &demotion_result, &demote_reason, probe_mode)) {
             // Only a single-device plan reaches this path (see
             // ggml_sycl_try_demote_runtime_kv).
-            kv_host_demotions.push_back({ demoted_plan.device_id, demotion_result.demoted_layers,
-                                          demotion_result.host_kv_bytes_added,
-                                          "the plan exceeded the device's VRAM budget" });
+            const uint32_t fits =
+                ggml_sycl_largest_fitting_n_ctx_live(demoted_plan, next_kv_info, demoted_plan.device_id, admitted_kv);
+            kv_host_demotions.push_back(
+                { demoted_plan.device_id, demotion_result.demoted_layers, demotion_result.host_kv_bytes_added,
+                  "the plan exceeded the device's VRAM budget", ggml_sycl_all_vram_ctx_hint(fits) });
             kv_was_demoted = true;
             kv_demoted_host_bytes += demotion_result.host_kv_bytes_added;
             next_plan = std::move(demoted_plan);
@@ -17985,7 +17993,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 
     // Announces the recorded demotions, once, against the final plan. Called
     // only after the plan is published, or at the probe's exit, so a refused
-    // transaction announces nothing. A device's demotion is a WARN only when
+    // transaction announces nothing. It only prints: everything it reports,
+    // including the "-c" hint, was computed before ownership changed. A device's demotion is a WARN only when
     // its residency differs from the published plan's: on a split, the second
     // backend of a context reaches the residency the first published, re-fit
     // and budget demotion included, which is not news, and a demotion on one
@@ -18004,15 +18013,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             if (!probe_mode &&
                 ggml_sycl::kv_device_residency_changed(final_plan.load_kv_device, current->plan->kv_device,
                                                        final_plan.kv_device, rec.device)) {
-                // What fits with NO demotion.
-                const uint32_t fits_ctx =
-                    ggml_sycl_largest_fitting_n_ctx_live(final_plan, next_kv_info, rec.device, admitted_kv);
                 GGML_LOG_WARN(
                     "[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted, %zu SWA (%.1f MB host KV, "
                     "layers %d..%d) on device %d for n_ctx=%u; %s. Their KV lives in host memory and their attention "
                     "runs on the CPU.%s\n",
                     rec.layers.size(), swa, rec.host_bytes / mb, lo, hi, rec.device, n_ctx, rec.cause.c_str(),
-                    ggml_sycl_all_vram_ctx_hint(fits_ctx).c_str());
+                    rec.ctx_hint.c_str());
             } else {
                 GGML_LOG_INFO(
                     "[SYCL-PLAN] %sKV overflow %s on the host tier: %zu layer(s), %zu SWA (%.1f MB host KV, layers "
