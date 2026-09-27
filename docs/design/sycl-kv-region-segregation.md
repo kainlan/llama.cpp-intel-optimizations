@@ -158,12 +158,16 @@ Design, revision 7.14t, by impl-moua, 2026-09-27. The revisions answer twenty-ei
   `65300ce1a`, `7391f5e36` (the §M70 amendment, §M71 and §M72) and `b225d81e3` (the §6.35 rows
   in final form).
 - design review r27 (design-moua-r27 on `f2323f9e0..7391f5e36`: 0 Critical, 2 Important, 9
-  Minor, 5 nits), rulings §M73 (the load envelope c(P) is trimmed at the context transaction)
+  Minor, 5 nits), rulings §M73 (the load envelope c(P) is trimmed at the context transaction),
   the §M71 (a) amendment and §M74 (a vehicle-scored counter is always compiled and read from the
   `GGML_SYCL_COUNTER_DUMP=1` dump), recorded in §6.36. Revision 7.14t is four commits on top of
   `b225d81e3`: `f21309492`, `fb9d31041` (a follow-up for §M74 and 23mk `db61cb321`'s answers),
-  `9703897b2` (the §M74 census, §3.4) and a third follow-up (the dump re-pinned to §M74 (g)-(i),
+  `9703897b2` (the §M74 census, §3.4) and `e15f4095d` (the dump re-pinned to §M74 (g)-(i),
   23mk's format and names).
+- design review r28 (design-moua-r28 on `7391f5e36..e15f4095d`: 0 Critical, 0 Important, 4
+  Minor, 5 nits), rulings §M76 (decline and commit lines pair by transaction id) and the §M74
+  (i) (2) and (4) amendments, and 23mk `372bb5b16`'s answer on the pure interim decision,
+  recorded in §6.37. Revision 7.14u is one commit on top of `e15f4095d`.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -2570,16 +2574,18 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    on device %d outside the measured tail bound: re-measure G0 F3 at this
                    shape`, so an out-of-bound fault is never read as a lost publisher, and an
                    in-bound one keeps the message below. Every scored arm here runs inside the
-                   bound, and scores the WARN at 0. A publisher that finds the fault set does
-                   not publish, so every later waiter also reaches its cap, and
-                   `ggml_backend_sycl_synchronize` reads the fault word after its wait and
-                   aborts with `[W-ORDER] marker wait capped on device %d: W ordering lost`. A
-                   capped wait therefore never lets a run finish silently, since proceeding
-                   silently is the W race. A scope guard submits the publisher, so a throwing
-                   step still publishes after the last event it returned. **Cost:** K + 1
-                   single-work-item kernels per eager W use (the waiter chain and the
-                   publisher), one use per oneDNN PP `MUL_MAT`, and K + 1 per replay; C6's PP
-                   ABBA arms score it, with K as G0 printed it.
+                   bound, and scores the WARN at 0; G2's bound cell (§3.2) is that zero's
+                   positive control, and it separates the two abort messages (r28 m-4). A
+                   publisher that finds the fault set does not publish, so every later waiter
+                   also reaches its cap, and `ggml_backend_sycl_synchronize` reads the fault
+                   word after its wait and aborts with
+                   `[W-ORDER] marker wait capped on device %d: W ordering lost`. A capped wait
+                   therefore never lets a run finish silently, since proceeding silently is the
+                   W race. A scope guard submits the publisher, so a throwing step still
+                   publishes after the last event it returned. **Cost:** K + 1 single-work-item
+                   kernels per eager W use (the waiter chain and the publisher), one use per
+                   oneDNN PP `MUL_MAT`, and K + 1 per replay; C6's PP ABBA arms score it, with K
+                   as G0 printed it for that card.
                  - **Form E, an event section (the fallback).** The entry holds one slot,
                    `last_w_event`, and a **W-order mutex**. Under it the function reads
                    `last_w_event`, calls the steps (the first step's submit carries
@@ -3884,49 +3890,67 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         r27 m-1). From (b1) the pool is empty, since it holds only parked direct allocations and
         none is made, so it serves nothing: a zone miss still runs the try at `:11704`, which
         returns null, and then reaches the TERMINAL channel. **The decline reads a planned fact,
-        never a discovered miss (rulings §M70 (b), (b')):** in (b1) the per-call check at the
-        entry of `ggml_sycl_flash_attn_ext_onednn`, through 23mk's pure function
-        `ggml_sycl_onednn_graph_interim_decline`, compares the call's per-shape term with the
-        **planned** interim capacity, `interim_capped` (stored + G over the ONEDNN cap: 0 B
-        reserved for G, SDPA declined on that device) or `interim_capacity` (the term above the
-        zone's planned Graph room). That is an allowed interim form, and (b2) deletes it and
-        moves the decision to per-layer admission in the fit, `scratch_unplaced`. Dispatch then
-        reads the admitted decision. **The reader is 23mk (b2)'s route decline (r27 m-2):**
-        `onednn_graph_route_decline(ctx, kv_layer)` at the SDPA entry (`fattn-onednn.cpp:981`),
-        with `fattn_params::kv_layer` filled at dispatch (23mk `50b1f8f50` :4488, :4705-4706;
-        the field and its fill land in (b1) by §M71 (a) as amended). A declined layer returns
-        false there. Both routes enter through it: the D ≤ 256 route (`fattn.cpp:3123-3135`),
-        where a false return falls through to native FA (`:3132-3135`), and the D = 512 route
-        (`:3905-3927`). (b2) deletes the interim comparison, not this read: without the read, a
-        declined layer would reach the Graph draw as a draw beyond the admitted term, the
-        TERMINAL abort (§M72). The Qwen arms (Qwen3.6-35B-A3B, D = 256) drive declined layers
-        into dispatch by design and depend on it: C9's replay on the Qwen merge gate, pinned and
-        default, the four xqex baseline runs, and C10. llama.cpp-03nm's gap is D = 512 only
-        (`fattn.cpp:3905-3911` plans before any mask read; `:4080-4095` aborts when the tile
-        route is off or inadmissible), and it is outside moua's scope: no moua arm scores SDPA
-        on a D = 512 model. gemma4 E4B, the only D = 512 model here, appears in the merge-gate
-        script's g4 blocks as the lead's H7ap "must load" confirmation, with no SDPA field; an
-        arm that scored gemma4 SDPA counts would depend on 03nm. **Nothing reaches `:11708` for
-        want of zones (rulings §M70 (c) as amended, (c')):** on a VM device the Graph scratch
-        draws through 1oxa's `REGION` path, and on a device with no zones it takes §M33 I-B's
-        planned exact-owner form, an owner-first allocation through the unified cache (P1),
-        which stays. "SDPA is not admitted without zones" applies only where no exact-owner form
-        exists; there 23mk's (b1) rule sees an interim capacity of 0 and declines at the entry
-        check, before `:11708`. If a route can still reach `:11708` at the pin, its owner closes
-        it (1oxa for VM, 23mk for no-zone). **The decline lines and their witness (rulings §M70
-        (d), §M71; r26 I-2).** Both lines are 23mk's, printed at WARN, neither env-gated, so
-        §M66's arming rule does not apply; this design scores them and does not own them:
+        never a discovered miss (rulings §M70 (b), (b')):** in (b1) 23mk's counted seam
+        `ggml_sycl_onednn_graph_interim_gate` evaluates 23mk's pure decision, `constexpr
+        ggml_sycl_onednn_graph_interim_reason ggml_sycl_onednn_graph_interim_decline(bool tp,
+        bool capped, size_t capacity, size_t term) noexcept` (23mk `372bb5b16`, inline in
+        `fattn-onednn.hpp`; its reasons
+        `GGML_SYCL_ONEDNN_GRAPH_INTERIM_REASON_{NONE, TP, CAPPED, CAPACITY}`), on the call's
+        per-shape term and the **planned** interim capacity: `interim_tp`, `interim_capped`
+        (stored + G over the ONEDNN cap: 0 B reserved for G, SDPA declined on that device) or
+        `interim_capacity` (the term above the zone's planned Graph room). That is an allowed
+        interim form, and (b2) deletes it and moves the decision to per-layer admission in the
+        fit, `scratch_unplaced`, whose frozen mask the same read then consults. **The reader is
+        23mk's routing read, before the plan (23mk `a8cfbf901` rev 4.19a, §4.8 "Routing reads
+        the decline before the plan", at 23mk's head `bd560d3dd`; r28 m-1):** each of the three
+        dispatch arms, `fattn.cpp:2788` (FORCE_PATH), `:3123` (every non-D512 shape) and `:3907`
+        (D = 512) at `d8a67422d`, calls
+        `ggml_sycl_fattn_onednn_dispatch_routed(ctx, p, d_v, multi_seq, site)`, which reads
+        `ggml_sycl_onednn_graph_dispatch_declined(ctx, p)` (in (b1) the interim seam above, from
+        (b2) the frozen mask's `onednn_graph_route_decline(ctx, p.kv_layer)`) **before**
+        `ggml_sycl_flash_attn_ext_onednn_plan`, with `fattn_params::kv_layer` filled at dispatch
+        (the field and its fill land in (b1) by §M71 (a) as amended). A declined read adds one
+        to its site's key of `onednn_graph_mask_declined{force|default|d512}` and one to its
+        total (rulings §M74 (i) (2) as amended; a zero is scored on the total only, §3.4) and
+        returns false, so a declined D ≤ 256 layer never reaches the plan and falls through to
+        native FA on its own device (P3). The SDPA entry `ggml_sycl_flash_attn_ext_onednn`
+        (`fattn-onednn.cpp:981`) keeps only 23mk's uncounted backstop,
+        `ggml_sycl_onednn_graph_declined_quiet`, which adds to `onednn_graph_decline_at_entry`
+        when it declines; no dispatch call reaches it, so 23mk predicts that total 0 on every
+        gate. (b2) deletes the interim comparison, not the read: without the read, a declined
+        layer would reach the Graph draw as a draw beyond the admitted term, the TERMINAL abort
+        (§M72). The Qwen arms (Qwen3.6-35B-A3B, D = 256) drive declined layers into dispatch by
+        design and depend on it: C9's replay on the Qwen merge gate, pinned and default, the
+        four xqex baseline runs, and C10. llama.cpp-03nm's gap is a declined D = 512 call with
+        no tile route (23mk `bd560d3dd` §4.8 "Where a declined layer runs": when
+        `ggml_sycl_fattn_d512_tile_admissible` rejects the shape, the declined call reaches
+        `fattn.cpp:4080-4095`'s `GGML_ABORT`), and it is outside moua's scope: no moua arm
+        scores SDPA on a D = 512 model. gemma4 E4B, the only D = 512 model here, appears in the
+        merge-gate script's g4 blocks as the lead's H7ap "must load" confirmation, with no SDPA
+        field; an arm that scored gemma4 SDPA counts would depend on 03nm. **Nothing reaches
+        `:11708` for want of zones (rulings §M70 (c) as amended, (c')):** on a VM device the
+        Graph scratch draws through 1oxa's `REGION` path, and on a device with no zones it takes
+        §M33 I-B's planned exact-owner form, an owner-first allocation through the unified cache
+        (P1), which stays. "SDPA is not admitted without zones" applies only where no
+        exact-owner form exists; there 23mk's (b1) rule sees an interim capacity of 0 and
+        declines at the routing read, before the plan and `:11708`. If a route can still reach
+        `:11708` at the pin, its owner closes it (1oxa for VM, 23mk for no-zone). **The decline
+        lines and their witness (rulings §M70 (d), §M71; r26 I-2).** Both lines are 23mk's,
+        printed at WARN, neither env-gated, so §M66's arming rule does not apply; this design
+        scores them and does not own them:
         - from (b2), the fit's decline, one line per (context, device) per transaction, printed
-          only when N ≥ 1, N the routed device-KV layers left out and M the routed device-KV
-          candidates, with `onednn_graph_route_declined{scratch_unplaced}` raised by N:
+          only when N ≥ 1 and carrying `txn=%u` with the commit line of the same transaction
+          (rulings §M76, pending 23mk's txn field; §3.3's pairing), N the routed device-KV
+          layers left out and M the routed device-KV candidates, with
+          `onednn_graph_route_declined{scratch_unplaced}` raised by N:
           `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d declined=%u of %u layers
           needed=%zu room=%zu reason=scratch_unplaced`. 1oxa's step 6 reads the same line;
         - in (b1), the interim decline, one line per (context, device, layer) at that layer's
           first decline, its `declined` a running count, so the last line per (context, device)
           carries the aggregate: `[SYCL-PLAN] oneDNN SDPA declined: ctx=%u dev=%d il=%d
           declined=%u of %u layers term=%zu capacity=%zu
-          reason=<interim_tp|interim_capped|interim_capacity>`. (b2) deletes it with the entry
-          check. **The reason list has three members (rulings §M71 (a) as amended, 23mk
+          reason=<interim_tp|interim_capped|interim_capacity>`. (b2) deletes it with the interim
+          seam. **The reason list has three members (rulings §M71 (a) as amended, 23mk
           `db61cb321`):** `interim_tp` keys on the process-wide `ggml_sycl_get_tp_queue(dev) !=
           nullptr`, which is distinct from (b2)'s per-context `tp`. `fattn_params::kv_layer` and
           its fill move into (b1), since the line prints `il=`; a call whose layer is unknown is
@@ -3935,32 +3959,33 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         never ran prints no line either. So each tree carries a positive witness from the same
         run. From (b2) it is §M30's commit line, whose prefix stays byte-identical and which
         gains the suffix ` admitted=%u of %u layers` (§2.3.2's `ONEDNN_GRAPH_SCRATCH` term);
-        per (context, device) the decline line's `declined`, 0 when there is none, must equal M
-        − `admitted`, a run with no commit line is VOID, and M = 0 is VOID for any SDPA claim,
-        never a pass (§M71 (b)). At (b1) it is 23mk's counter dump (rulings §M74 (g)-(i); 23mk
-        `a8cfbf901` §5.1), read as §3.4 says: the run sets `GGML_SYCL_COUNTER_DUMP=1` in its
-        literal command, and the dump's `[SYCL-COUNTER] end devices=%d` line, with that many
-        devices listed, is its live check (§M66). N = 0 is valid only with `[SYCL-COUNTER]
-        dev=<d> name=onednn_sdpa_executed value=` ≥ 1 and the unlabelled total `[SYCL-COUNTER]
-        dev=<d> name=onednn_sdpa_fallback_after_admit value=0` on that device (§M74 (h), (i)
-        (4): the total, never a sum over the `{site}` lines); a run with no `end` line, or an
-        `end` count that differs from the devices listed, is VOID, an aborting run prints no
-        dump and is VOID, and N > 0 needs no witness (§M71 (c)). A reading taken before the SDPA
-        counters' producer lands prints 0 and is VOID (§M74 (i) (2)).
-        7.14s read a `GGML_SYCL_PRIVATE_TESTING` exit dump, which never prints in
-        `llama-completion`, `llama-cli` or `llama-server`, since the macro is defined only on
-        test targets (§M74), so every vehicle arm that scored it was VOID by construction. The
-        deletion of the direct path has one owner: 23mk `8547a22f0` (b2) item 8 deletes it with
-        its reuse pool, the pool try at `:11704` and its test hooks (rulings §M68 (b);
-        E-ONEDNN-GRAPH-DIRECT; `50b1f8f50` :4786), and 23mk's H3 "(b1)'s interim G" arm pins
-        that it has no caller from (b1) on. **The runtime miss's arm (r26 I-3; rulings §M72),
-        23mk's to carry and moua's to cite:** a fixture draw one byte above the planned
-        within-ubatch peak prints `[ZONE-PLAN-BUG]` once and aborts, with
-        `GGML_SYCL_STRICT_LEASES` unset, and allocates nothing. **It is 23mk H3's TERMINAL death
-        test (23mk `db61cb321`):** the channel is a `[[noreturn]]`
-        `ggml_sycl_onednn_graph_scratch_plan_miss`, run with STRICT unset inside a catch-all
-        wrapper. GREEN is SIGABRT and exactly one `[ZONE-PLAN-BUG]` line. Its REDs are a mutant
-        that returns nullptr, one that throws (which the wrapper, like
+        per (context, device) and transaction the decline line's `declined`, 0 when there is
+        none, must equal M − `admitted` of the commit line with the same `txn` (rulings §M76,
+        pending 23mk's txn field; §3.3's pairing), a run with no commit line is VOID, and M = 0
+        is VOID for any SDPA claim, never a pass (§M71 (b)). At (b1) it is 23mk's counter dump
+        (rulings §M74 (g)-(i); 23mk `a8cfbf901` §5.1), read as §3.4 says: the run sets
+        `GGML_SYCL_COUNTER_DUMP=1` in its literal command, and the dump's
+        `[SYCL-COUNTER] end devices=%d` line, with that many devices listed, is its live check
+        (§M66). N = 0 is valid only with
+        `[SYCL-COUNTER] dev=<d> name=onednn_sdpa_executed value=` ≥ 1 and the unlabelled total
+        `[SYCL-COUNTER] dev=<d> name=onednn_sdpa_fallback_after_admit value=0` on that device
+        (§M74 (h), (i) (4): the total, never a sum over the `{site}` lines); a run with no `end`
+        line, or an `end` count that differs from the devices listed, is VOID, an aborting run
+        prints no dump and is VOID, and N > 0 needs no witness (§M71 (c)). A reading taken
+        before the SDPA counters' producer lands prints 0 and is VOID (§M74 (i) (2)). 7.14s read
+        a `GGML_SYCL_PRIVATE_TESTING` exit dump, which never prints in `llama-completion`,
+        `llama-cli` or `llama-server`, since the macro is defined only on test targets (§M74),
+        so every vehicle arm that scored it was VOID by construction. The deletion of the direct
+        path has one owner: 23mk `8547a22f0` (b2) item 8 deletes it with its reuse pool, the
+        pool try at `:11704` and its test hooks (rulings §M68 (b); E-ONEDNN-GRAPH-DIRECT;
+        `50b1f8f50` :4786), and 23mk's H3 "(b1)'s interim G" arm pins that it has no caller from
+        (b1) on. **The runtime miss's arm (r26 I-3; rulings §M72), 23mk's to carry and moua's to
+        cite:** a fixture draw one byte above the planned within-ubatch peak prints
+        `[ZONE-PLAN-BUG]` once and aborts, with `GGML_SYCL_STRICT_LEASES` unset, and allocates
+        nothing. **It is 23mk H3's TERMINAL death test (23mk `db61cb321`):** the channel is a
+        `[[noreturn]]` `ggml_sycl_onednn_graph_scratch_plan_miss`, run with STRICT unset inside
+        a catch-all wrapper. GREEN is SIGABRT and exactly one `[ZONE-PLAN-BUG]` line. Its REDs
+        are a mutant that returns nullptr, one that throws (which the wrapper, like
         `fattn-onednn.cpp:1363-1366`, would catch), and one that aborts only under STRICT. No G
         arm scores a runtime miss; G1's `zone_plan_refusal` = 0 with 0 `[ZONE-PLAN-BUG]` lines
         is the gate-level zero. moua cites it and carries no arm of its own (§6.35's 23mk relay
@@ -4216,9 +4241,9 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       holds several terms). A term **smaller** late is admitted, never refused, with 23mk's
       WARN, mirrored byte for byte, `[ZONE-PLAN-BUG] the late inventory shrinks term %s on
       device %d: early %zu B, late %zu B (admitted; the early reservation stands)`, once per
-      `(load, device, term)`, and 23mk's witness counter `late_term_shrink_admitted` +1 (a
-      `GGML_SYCL_PRIVATE_TESTING` counter, read only by H7ap's host arms, in a test binary,
-      §3.1; no vehicle arm scores it, rulings §M74 (d); §3.4); the zones and ranges stay as
+      `(load, device, term)`, and 23mk's witness counter `late_term_shrink_admitted` +1 (23mk's
+      always-compiled counter, a §5.1 dump field, rulings §M74 (h); read here only by H7ap's
+      host arms, in a test binary, §3.1; §3.4); the zones and ranges stay as
       admitted. A forced-off tensor charges 0 at both stages, so `--no-host --cpu-moe` logs no
       shrink WARN and the counter stays a signal (r13 I-B (1)). Neither refusal is a silent
       re-plan. An interleaved transaction plans around B's ranges (below), so it causes neither.
@@ -9319,7 +9344,13 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
   - `ggml_sycl_test_w_order_uses(dev, term)`: a count the function raises once per ordered use
     (r25 m-10). A recorded graph's first execute and each replay are one ordered use each,
     through the graph wrapper; the capture itself, a declined use and a path that never calls
-    the function count nothing.
+    the function count nothing;
+  - `ggml_sycl_test_set_w_order_bound(dev, n_ubatch, graph_nodes)`, Form M only: replaces the
+    compiled tail bound (§2.4.2, G0 F3) for the device, so a fixture shape lies outside it (the
+    bound cell below; r28 m-4);
+  - `ggml_sycl_test_w_order_drop_next_publisher(dev)`, Form M only: the next W use on the
+    device submits no publisher, a planted lost publisher, so the waiter chain behind it reaches
+    its cap (the bound cell below).
 - **The gate (r23 m-8; r24 m-7).** Where the A-first, C-over-B and pool-term arms hold a use in
   flight, the gate is a `host_task` on the using context's **own** queue, ahead of the use,
   which returns only when the main thread opens it. llama.cpp-c6ah measured a `host_task` that
@@ -9479,6 +9510,24 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
   stderr. The negative control is the same child with a hook that allocates nothing: exit 0.
   RED: the function does not set its thread-local flag; the child then allocates and exits 0, as
   the negative control does.
+- **The bound cell (r28 m-4), when G0 picked Form M.** It is the positive control for §2.4.2's
+  out-of-bound WARN, whose zero every scored arm reads, and it separates the two abort messages.
+  Three children, each the test binary re-executed with the cell's selector, run X and Y's
+  marker uses at the fixture's `n_ubatch`:
+  - **(a) above the bound, no fault.** `ggml_sycl_test_set_w_order_bound` lowers the device's
+    bound below the fixture's `n_ubatch` and node count before the first use, and each context
+    runs two W uses. GREEN: exactly one `[W-ORDER] shape above the measured tail bound on device
+    0:` line per (context, device), so 2, zero `marker wait capped` lines, and exit 0;
+  - **(b) above the bound, a lost publisher.** As (a), then
+    `ggml_sycl_test_w_order_drop_next_publisher` before X's second use. GREEN: exit 134, exactly
+    one `[W-ORDER] marker wait capped on device 0 outside the measured tail bound: re-measure G0
+    F3 at this shape` line, and zero `W ordering lost` lines;
+  - **(c) inside the bound, a lost publisher.** The bound left as compiled, the same drop.
+    GREEN: exit 134, one `[W-ORDER] marker wait capped on device 0: W ordering lost` line, zero
+    `outside the measured tail bound` lines and zero `shape above` lines;
+  - **REDs.** The entry's flag never set. (a) still prints its WARNs, but (b) then aborts with
+    (c)'s message, so the two messages are told apart only by the flag. A second RED drops the
+    WARN's print: (a) reads 0 lines. Device 0 is the post-selector index of `level_zero:1`.
 - **Command.** Lead-run once, never in a subagent, with `Shmem` and `MemAvailable` sampled
   before the run and about 5 s after, and the kernel log checked after it (r24 m-7); any GT
   reset, `guc_id` or CAT error line in the window fails G2 and voids the run:
@@ -9547,8 +9596,13 @@ placement and demotion run. The rules for every such arm:
   - C5 and its sibling keep the registration's `-ub 32` (`tests/CMakeLists.txt:790` at
     `e2461d4fb`). The last `-ub` wins, so adding one would make the arm a different test from
     the registered one;
-  - C2b leaves `-ub` unpinned, because the ladder is its subject; its trial-live witness names
+    - C2b leaves `-ub` unpinned, because the ladder is its subject; its trial-live witness names
     the rungs the trial tried;
+  - C9's state-seq arm runs `test-save-load-state` as registered, with no `-ub`. Its ubatch is
+    fixed anyway: the test sets `n_batch = 100` (`tests/test-save-load-state.cpp:872` at
+    `e2461d4fb`), so `n_ubatch` is 100, and the trial takes its no-ladder exit, one reserve and
+    no WARN, since the cap 100 is below the ladder's first rung, 512
+    (`src/llama-context.cpp:1461-1464`). No figure of the arm depends on the ubatch (r28 n-3);
   - C3's default arm leaves `-ub` unpinned. Its single pre-registration source, zhcn GDC3 (zhcn
     `1c5e7ff`), runs `llama-cli` with no `-ub` and records `n_ubatch` 512, since the ladder does
     not climb on a MoE model (zhcn GU1n). The arm runs GDC3's command rather than changing
@@ -9657,37 +9711,54 @@ placement and demotion run. The rules for every such arm:
   make no SDPA claim and score neither field. The fields come with 23mk's (b2), which charges
   the Graph scratch in the fit, and this replay rule applies from (b2) (§2.4.3's transition
   rule). An arm run between (b1) and (b2) scores (b1)'s interim line instead, pre-registered by
-  (b1)'s own rule, never the fit's (r27 m-3). The replay evaluates 23mk's
-  `ggml_sycl_onednn_graph_interim_decline(capped, capacity, term)` (23mk `50b1f8f50` §4.8 (b1)),
-  **conditionally**: that a replay may call it as a pure function with these inputs is §6.36's
-  23mk relay (3), still unanswered, and until 23mk confirms it the (b1) pre-registration is not
-  final. It is evaluated for each SDPA-routed device-KV layer, over that device's planned
-  interim capacity (the ONEDNN zone's ensured bytes less its stored W, 0 on a device without the
-  zone) and the layer's per-shape term (`onednn_graph_scratch_term_bytes`), and gives the (b1) N
-  and each declined layer's reason, `interim_capped` or `interim_capacity`. The replay does not
-  model `interim_tp`, which keys on a process-wide TP queue (§M71 (a) as amended), since no arm
-  here sets up tensor parallelism; a run that prints it is VOID for the (b1) score, and the line
-  is recorded. The run's aggregate is the last interim line's `declined=%u of %u layers` per
-  (context, device), since the count runs; it must equal that N and M. N = 0 is read only with
-  23mk's counter dump (rulings §M74 (g)-(i)), read as §3.4 says: the run sets
-  `GGML_SYCL_COUNTER_DUMP=1` in its literal command, and its `[SYCL-COUNTER] end devices=%d`
-  line, with that many devices listed, is the live check (§M66). The dump must show
-  `name=onednn_sdpa_executed value=` ≥ 1 and the unlabelled total
-  `name=onednn_sdpa_fallback_after_admit value=0` on that device; no `end` line, or a
-  mismatched `end` count, is VOID, an aborting run prints no dump and is VOID, and a reading
-  taken before the counters' producer lands is VOID (§M71 (c), §M74 (i) (2)). So an arm run
-  between (b1) and (b2) adds `GGML_SYCL_COUNTER_DUMP=1` to its literal command. **Pairing when a
-  (context, device) prints several lines (r27 m-3).** From (b2), a GROWTH re-plan is a new
-  transaction: it prints the decline line again when N ≥ 1, and the commit line again when it
-  places or changes the range (23mk `50b1f8f50` §4.8, the commit line's rule). Neither line
-  carries a transaction id, so they pair by print order. In a transaction the fit, which prints
-  the decline, runs before the commit. So each decline line pairs with the first commit line
-  after it, and a commit line with no decline line since the previous commit line pairs with
-  `declined` = 0. The scored pair is the last one, the settled state, against the replay of the
-  context's last transaction; earlier pairs are recorded. A decline line with no commit line
-  after it (a last transaction that left the range unchanged) has no witness, so the arm is VOID
-  (§M71 (d)). The SDPA-scoring runs here, C9's Qwen merge-gate blocks and the xqex runs, pin
-  `-ub 512` and make one context each, so each is expected to print one pair per (context,
+  (b1)'s own rule, never the fit's (r27 m-3). The replay calls 23mk's
+  pure `ggml_sycl_onednn_graph_interim_decline(tp, capped, capacity, term)` (23mk `372bb5b16`
+  §4.8 (b1), L4514: it reads its four arguments and nothing else, and H3 pins it with four
+  `static_assert`s and a source pin; relay (3), answered), so the (b1) pre-registration is
+  final. It is evaluated for each SDPA-routed device-KV layer with `tp` = false, `capped` the
+  model's capped flag on the device, `capacity` that device's planned interim capacity (the
+  ONEDNN zone's ensured bytes less its stored W, 0 on a device without the zone), and `term`
+  from the pure `onednn_graph_scratch_term_bytes(n_head, ne01, ne11)`, and gives the (b1) N and
+  each declined layer's reason, `interim_capped` or `interim_capacity`. **Which shapes (r28
+  m-1).** The routing read runs before the plan, so every FA call on the route reaches the
+  check, decode calls included, even those the plan would reject `BELOW_MIN_NCOLS`
+  (`fattn-onednn.cpp:111-113` at `e2461d4fb`, `ne01` below 8). A layer is declined when any of
+  its calls is, so the replay evaluates every call shape the run issues: each prompt ubatch
+  (`ne01` its token count, `ne11` the KV length the graph gives FA at that ubatch) and each
+  decode step (`ne01` 1, `ne11` up to the run's final length). `capped` and `capacity` do not
+  change within the run, and the term grows with `ne01` and `ne11`, so a layer's verdict is the
+  decision at its largest-term call, and the smaller decode terms cannot decline a layer the
+  prompt's did not. The interim line prints the term of the layer's first declined call, which
+  need not be that maximum, so its `term` field is recorded, not scored. `tp` is false because
+  no arm here sets up tensor parallelism; `interim_tp` keys on a process-wide TP queue (§M71 (a)
+  as amended), and a run that prints it is VOID for the (b1) score, with the line recorded. The
+  run's aggregate is the last interim line's `declined=%u of %u layers` per (context, device),
+  since the count runs; it must equal that N and M. N = 0 is read only with 23mk's counter dump
+  (rulings §M74 (g)-(i)), read as §3.4 says: the run sets `GGML_SYCL_COUNTER_DUMP=1` in its
+  literal command, and its `[SYCL-COUNTER] end devices=%d` line, with that many devices listed,
+  is the live check (§M66). The dump must show `name=onednn_sdpa_executed value=` ≥ 1 and the
+  unlabelled total `name=onednn_sdpa_fallback_after_admit value=0` on that device; no `end`
+  line, or a mismatched `end` count, is VOID, an aborting run prints no dump and is VOID, and a
+  reading taken before the counters' producer lands is VOID (§M71 (c), §M74 (i) (2)). So an arm
+  run between (b1) and (b2) adds `GGML_SYCL_COUNTER_DUMP=1` to its literal command. **Pairing
+  when a (context, device) prints several lines (rulings §M76; r28 m-2), per §M76, pending
+  23mk's txn field.** From (b2), a GROWTH re-plan is a new transaction and prints its lines
+  again. Under §M76 the decline line and the commit line both carry `txn=%u`, the context
+  transaction's id, unique per (context, device), and any transaction that prints a decline line
+  also prints its commit line, even when the range is unchanged. A decline line pairs with the
+  commit line of the same `txn`; a decline line with no same-`txn` commit line is VOID; a commit
+  line with no same-`txn` decline line pairs with `declined` = 0. The scored pair is the last
+  `txn` per (context, device), the settled state, against the replay of the context's last
+  transaction; earlier pairs are recorded. 7.14t's print-order pairing is withdrawn: under
+  23mk's former rule, which printed the commit line only when the range or its admitted set
+  changed, the lines C0 (A = M − k), D1 (`declined` = k, from a transaction that changed
+  nothing) and C2 (A = M, from a later transaction with no decline) paired D1 with C2 and failed
+  a correct tree (r28 m-2). **Until the lead relays 23mk's commit** the lines carry no `txn`,
+  and a run is scored only when it prints exactly one decline line (or none) and exactly one
+  commit line per (context, device), which then pair directly; any more lines make the run VOID
+  for the pairing, with the lines recorded. When the field lands, the greps above capture `txn=`
+  at 23mk's position. The SDPA-scoring runs here, C9's Qwen merge-gate blocks and the xqex runs,
+  pin `-ub 512` and make one context each, so each is expected to print one pair per (context,
   device). Through `df9803cb8` the replay placed it as a head slot that could demote KV; 23mk's
   Qwen row cites the fixed replay (§6.34). Master prints it at WARN when a layer's residency
   changed (`ggml-sycl.cpp:18381-18386` at `e2461d4fb`, below `:40214`, so the same line at
@@ -9770,14 +9841,17 @@ placement and demotion run. The rules for every such arm:
   cat c2b.err | grep -oE 'auto n_ubatch=[0-9]+ .*\(tried [0-9,]+; [^)]*\)'  # exactly 1 line
   cat c2b.err | grep -oE '\(tried [0-9,]+;' | tr -cd ',' | wc -c  # >= 1 (two rungs), else VOID
   cat c2b.err | grep -c '\[KV-REGION\] reserve'           # 1: one (ctx, dev)
-  cat c2b.err | grep -cE 'llama_context: n_ctx +=  *32768$'  # 1, else VOID (§3.3)
+    cat c2b.err | grep -cE 'llama_context: n_ctx +=  *32768$'  # 1, else VOID (§3.3)
+  cat c2b.err | grep -c 'llama_context: n_ctx_seq'         # >= 1, the control's line
+  cat c2b.err | grep 'n_ctx_seq' | grep -cE 'llama_context: n_ctx +=  *32768$'  # 0
   ```
   - **The trial-live witness is the arm's precondition.** The trial's own WARN,
     `[SYCL-PLAN] auto n_ubatch=%u for n_ctx=%u n_batch=%u (tried %s; %s)`
     (`src/llama-context.cpp:1942` at `e2461d4fb`), prints once, its `tried` list names at least
     two rungs, and its reason is not `cached`; otherwise the arm is VOID, since a one-rung trial
     republishes nothing and a count of 1 then says nothing about republishes. The ladder stops
-    at its first losing rung (`:1329-1379`), so a second rung in `tried` means the first was
+    at its first losing rung (the loop at `src/llama-context.cpp:1809-1846`, its `break` at
+    `:1839-1840`, at `e2461d4fb`), so a second rung in `tried` means the first was
     accepted, published and reserved: the context has been published at least twice under its
     key, by the constructor and by the trial.
   - **Scored:** exactly 1 `[KV-REGION] reserve` line for the (context, device), in the format C1
@@ -10103,7 +10177,7 @@ placement and demotion run. The rules for every such arm:
     cat qx-<run>.err | grep -oE 'prompt eval time = *[0-9.]+ ms / *[0-9]+ tokens.*tokens per second'
     cat qx-<run>.err | grep -oE 'graph scratch range: ctx=[0-9]+ dev=0 .* admitted=[0-9]+ of [0-9]+ layers'
     cat qx-<run>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 declined=[0-9]+ of [0-9]+ layers'
-        cat qx-<run>.err | grep -cx '\[SYCL-COUNTER\] end devices=1'   # 1, else no dump: VOID (§M74 (g))
+    cat qx-<run>.err | grep -cx '\[SYCL-COUNTER\] end devices=1'   # 1, else no dump: VOID (§M74 (g))
     cat qx-<run>.err | grep -oxE '\[SYCL-COUNTER\] dev=0 name=onednn_sdpa_(executed|fallback_after_admit) value=[0-9]+'
     ```
     Recorded per run, on the ticket: PP tokens per second and the prompt's token count from the
@@ -10181,7 +10255,14 @@ placement and demotion run. The rules for every such arm:
       by the unified cache (P1). GREEN, pre-registered: both non-null, exactly **2**
       `[EXT-ALLOC]` lines, zero unplanned lines and zero notes. Then the child loads and unloads
       the Mistral fixture, whose RUNTIME is 0, and repeats: the same landing and the same 2
-      lines after the last unload.
+      lines after the last unload. **The raw-exit counter's positive control (r28 m-3):** in
+      each of the two halves the child prints `unified_cache_ext_alloc_count_for_testing(0)`
+      immediately before the 1 MiB buffer and after `ggml_opt_init` returns, and the difference
+      is exactly +2, equal to that half's `[EXT-ALLOC]` line count (rulings §M74 (e): the
+      counter counts at the print site). The argument is 0, the post-selector index of
+      `level_zero:1`, since the child sees only that device; the post-cut VM pass reads the same
+      accessor with the same argument, in the same binary, so its equal readings cannot come
+      from a wrong index or a counter that never moves.
     - **The VM vehicle (r23 I-1 (c)).** Both VM passes run on a real device, the B50
       (`ONEAPI_DEVICE_SELECTOR=level_zero:1`) with `GGML_SYCL_ARENA_BACKING=vm`, not on a mock:
       the post-cut pass loads and unloads the Mistral fixture, which a host mock cannot do. They
@@ -10295,19 +10376,20 @@ placement and demotion run. The rules for every such arm:
       scored instead by 23mk's always-compiled counter, the dump's `ext_alloc_count` field
       (rulings §M74 (h); it lands in 23mk step 0, `a8cfbf901` §5.1: incremented at every raw
       exit, whatever the trace says), read through its unconditional accessor
-      `unified_cache_ext_alloc_count_for_testing(dev)`, which each child prints before and after
-      its pass: the two are equal. **This pass is a test child, not a vehicle (rulings §M74
-      (d)), and the lead accepted its direct read:** each child is forked by C9's unit-arm
-      binary, `test-sycl-kv-region` (G1's target, §3.2, which defines
-      `GGML_SYCL_PRIVATE_TESTING`), never by `llama-cli`, `llama-completion`, `llama-server` or
-      `llama-bench`. It reads the counter directly because the pass scores a before-and-after
-      difference, which one exit value cannot give. Under §M74 (g) the dump would print in this
-      child too, since it runs at exit and needs no backend free, so 7.14t's earlier reason (no
-      backend free, no dump) is withdrawn. The counter counts at the `[EXT-ALLOC]` print site,
-      the raw device allocation (`unified_cache_raw_malloc_device` in §M74 (e);
-      `unified_cache_malloc_device_tracked` at `e2461d4fb`). A reading on a tree before step 0
-      lands is VOID (§M74 (i) (2)), and the ticket records it; the pass's positive signals, the
-      `[VM-WT]` line and the per-zone C11 lines, stand either way.
+      `unified_cache_ext_alloc_count_for_testing(0)`, with 0 the post-selector index of
+      `level_zero:1`, which each child prints before and after its pass: the two are equal. The
+      USM pass's +2 above is this reading's positive control (r28 m-3). **This pass is a test
+      child, not a vehicle (rulings §M74 (d)), and the lead accepted its direct read:** each
+      child is forked by C9's unit-arm binary, `test-sycl-kv-region` (G1's target, §3.2, which
+      defines `GGML_SYCL_PRIVATE_TESTING`), never by `llama-cli`, `llama-completion`,
+      `llama-server` or `llama-bench`. It reads the counter directly because the pass scores a
+      before-and-after difference, which one exit value cannot give. Under §M74 (g) the dump
+      would print in this child too, since it runs at exit and needs no backend free, so 7.14t's
+      earlier reason (no backend free, no dump) is withdrawn. The counter counts at the
+      `[EXT-ALLOC]` print site, the raw device allocation (`unified_cache_raw_malloc_device` in
+      §M74 (e); `unified_cache_malloc_device_tracked` at `e2461d4fb`). A reading on a tree
+      before step 0 lands is VOID (§M74 (i) (2)), and the ticket records it; the pass's positive
+      signals, the `[VM-WT]` line and the per-zone C11 lines, stand either way.
 
     REDs, one per pass, each re-derived on §M53's order (r24 I-1, m-12):
     - USM: 7.14l's `arena_active()` predicate, under which the early arena makes the device look
@@ -10486,9 +10568,15 @@ ordered list, zeros included, `[SYCL-COUNTER] dev=%d name=%s value=%llu`, then o
 - **Live check:** the `end` line, with its count equal to the devices listed. No `end` line, or
   a mismatched count, means no dump, and every reading from the run is VOID. `abort()` and
   `_Exit()` skip `atexit`, so an aborting or watchdog run is VOID by construction.
-- **Open-keyed counters:** the unlabelled total is a fixed field and always prints; the `{key}`
-  lines are a breakdown. A scorer reads the total, so an absent total is VOID, and never sums
-  the breakdown, since a sum over zero printed keys is vacuous (§M74 (i) (4)).
+- **Keyed counters:** every keyed counter, open- or closed-keyed, prints its unlabelled total as
+  a fixed field, which always prints, and its `{key}` lines as a breakdown (§M74 (i) (4) and its
+  second amendment). A zero is scored only on the total, so an absent total is VOID, and never
+  on a key line, where an absent key and a true zero look the same; a key line is scored only as
+  an expected nonzero (a missing line reads 0 and fails) or as a reach witness (a missing line
+  is VOID) (§M74 (i) (4), first amendment). A scorer never sums the breakdown, since a sum over
+  zero printed keys is vacuous. `onednn_graph_mask_declined` counts per routing read, keyed
+  `{force|default|d512}` by the reading site (§M74 (i) (2) as amended); and this design scores
+  none of that counter's keys, nor its total.
 - **Before the producer lands** a field prints 0, and a reading of it is VOID (§M74 (i) (2)).
 - **Names** are §M74 (h)'s, one per counter. This design reads `onednn_sdpa_executed`, the
   `onednn_sdpa_fallback_after_admit` total, and `ext_alloc_count` (the last through its
@@ -10504,7 +10592,7 @@ ordered list, zeros included, `[SYCL-COUNTER] dev=%d name=%s value=%llu`, then o
 | §2.4.2, W order | `w_order_wait_exhausted` | G0, G2 (§3.2) | test binary |
 | §2.4.2, the pack's capacity | `ggml_sycl_test_set_pack_capacity` | zhcn H5L (h) | test binary (seam) |
 | §2.4.2 (b1), and §3.3's replay rule | `onednn_sdpa_executed` ≥ 1 and the `onednn_sdpa_fallback_after_admit` total = 0 | the Qwen xqex baseline (`llama-completion`, §3.3 C9) and every arm run between (b1) and (b2) that scores N = 0 | **vehicle: moved** to the dump (the xqex command and the scratch script's Qwen block set `GGML_SYCL_COUNTER_DUMP=1` and read the `end` line) |
-| §2.4.2, the late stage | `late_term_shrink_admitted` | H7ap's host arms (§3.1): user placement, `--no-host` with the experts on the host, and the late term change | test binary; no vehicle arm scores it, and the g4 merge gates score only that the model loads |
+| §2.4.2, the late stage | `late_term_shrink_admitted` | H7ap's host arms (§3.1): user placement, `--no-host` with the experts on the host, and the late term change | 23mk's always-compiled counter, a §5.1 dump field (§M74 (h)); its only moua reader is a test binary, and the g4 merge gates score only that the model loads (r28 n-4) |
 | §2.4.2, the backstop | the H4 backstop counter | H4 (§3.1), in a subprocess | test binary |
 | §2.4.3 | `reserved_slot_claims` | G1 | test binary (accessor) |
 | §2.5 | the region scope hook | the `test-sycl-lifecycle-*` family and the kv-layer-sizing gates | test binary (hook) |
@@ -10516,7 +10604,7 @@ ordered list, zeros included, `[SYCL-COUNTER] dev=%d name=%s value=%llu`, then o
 | §3.2 G1 | the target; `unified_cache_test_graph_reclaim_available` | G1 | test binary |
 | §3.2 G2 | its seams, `ggml_sycl_test_w_order_uses` among them | G2 | test binary |
 | §3.3 C9, seam control (2) | the RUNTIME draw one byte over free room | its own test child, and the end of each process-level unit arm, all in `test-sycl-kv-region` | test binary (seam) |
-| §3.3 C9, the post-cut VM pass (r27 m-5) | `ext_alloc_count`, through its unconditional accessor `unified_cache_ext_alloc_count_for_testing(dev)` | children forked by `test-sycl-kv-region` (G1's target), which read it directly before and after the pass | test binary (§M74 (d)); the lead accepted the direct read. It scores a before-and-after difference, which the exit dump cannot give; the dump would print there too, since it runs at exit |
+| §3.3 C9, the post-cut VM pass (r27 m-5) | `ext_alloc_count`, through its unconditional accessor `unified_cache_ext_alloc_count_for_testing(dev)` | children forked by `test-sycl-kv-region` (G1's target), which read it directly before and after the pass, at argument 0; the USM no-model pass's +2 is its positive control (r28 m-3) | test binary (§M74 (d)); the lead accepted the direct read. It scores a before-and-after difference, which the exit dump cannot give; the dump would print there too, since it runs at exit |
 | §3.3 C9, the LoRA arm | `ggml_sycl_test_cap_shared_zone_free` | the refusal half, in `test-sycl-kv-region`; the GREEN half is `llama-completion` and scores no counter | test binary (dual arm; neither half scores a macro counter on a vehicle) |
 | §3.3 C5 | none | `test-thread-safety` and its sibling | no counter scored |
 | §4 L4 row | 1oxa's dump of `shared_zone_geometry` and `kv_region_request` | 1oxa's VM branch tests | test binary |
@@ -13397,14 +13485,14 @@ for source cites: `e2461d4fb`.
 | I-1 | §3.3's VOID guard ("scores exactly 1") failed the multi-context harnesses on a correct tree: C9's state-seq arm makes about ten contexts, and C5 with `-np 4` makes four per model | **Changed.** The guard has two named forms. The single-context form, for every CLI and merge-gate block: exactly one `llama_context: n_ctx` line, and it at N. The multi-context form, for C9's state-seq arm and C5 with its sibling: at least one such line, and every one at N (the count at N equals the any-value count). `nctx_void` in `run-merge-gates.sh` takes the form as its second argument; its offline self-test passes three lines at N in the multi form, fails them in the single form, fails a two-line sample with one line at another N in both, and still scores the `n_ctx_seq` and slot lines 0. A mutant dropping either form's count-equality check fails the self-test; `bash -n` is clean, and the replay on `gptoss120b-b1.log` gives `n_ctx=4096` in both forms and VOID at 131072. |
 | I-2 | C3's `-ub 1024` "ladder" count was vacuous: a pinned `-ub` switches the trial off, and a MoE ladder has one rung | **Changed.** New arm C2b: Mistral on the B70 with `-ub` unpinned and `GGML_SYCL_TUNING_CACHE=0`, so the trial runs the ladder; VOID unless the trial's own `[SYCL-PLAN] auto n_ubatch=... (tried %s; %s)` line names at least two rungs with a reason other than `cached`, and the `tuning cache disabled:` line prints. Scored: exactly 1 `[KV-REGION] reserve` for its (context, device); RED: L6's idempotent key removed, one line per publish. §2.3.2's "one KV region per `(c, d)`" rests on C2b. C3's `-ub 1024` run keeps the ring, and its count is only its trace-live check. |
 | m-1; §M68 | (b1) was said to remove the pool try at `:11704`, which 23mk deletes in (b2) item 8 | **Changed.** (b1) replaces only the `:11708` call. The pool try is 23mk `50b1f8f50` (b2) item 8's (:4786), cited beside the direct path's deletion. From (b1) the pool is empty, since it holds only parked direct allocations and none is made; a zone miss still runs the try, which returns null, then reaches the TERMINAL channel. The §6.35 I-3 row is marked amended. |
-| m-2 | the dispatch-side read of the admission decision had no site | **Changed.** It is 23mk (b2)'s route decline at the SDPA entry (`fattn-onednn.cpp:981`, `params.kv_layer`; `50b1f8f50` :4488, :4705-4706), which both the D ≤ 256 route (`fattn.cpp:3123-3135`, native FA on false at `:3132-3135`) and the D = 512 route (`:3905-3927`) enter. The Qwen arms (C9's Qwen replay, the xqex runs, C10) depend on it. llama.cpp-03nm is D = 512 only and outside moua's scope: gemma4 E4B, the one D = 512 model here, is a load-only confirmation with no SDPA field. |
-| m-3 | the (b1)-era scorer had no pre-registration, and multi-line pairing was unstated | **Changed.** The replay evaluates 23mk's `ggml_sycl_onednn_graph_interim_decline(capped, capacity, term)` per routed layer over the device's planned interim capacity and the per-shape term, giving (b1)'s N and reasons; the last interim line per (context, device) is scored against it, with §M71 (c)'s dump as the N = 0 witness. `interim_tp` is not replayed, and a run that prints it is VOID for the (b1) score. From (b2) the lines pair by print order: each decline line with the first commit line after it, a commit line with no decline since the previous one with `declined` = 0; the last pair is scored, and a trailing decline line with no commit line after it is VOID. |
+| m-2 | the dispatch-side read of the admission decision had no site | **Changed.** It is 23mk (b2)'s route decline at the SDPA entry (`fattn-onednn.cpp:981`, `params.kv_layer`; `50b1f8f50` :4488, :4705-4706), which both the D ≤ 256 route (`fattn.cpp:3123-3135`, native FA on false at `:3132-3135`) and the D = 512 route (`:3905-3927`) enter. The Qwen arms (C9's Qwen replay, the xqex runs, C10) depend on it. llama.cpp-03nm is D = 512 only and outside moua's scope: gemma4 E4B, the one D = 512 model here, is a load-only confirmation with no SDPA field. Amended in §6.37 (r28 m-1): the reader is 23mk's routing read before the plan, and the entry keeps only a backstop. |
+| m-3 | the (b1)-era scorer had no pre-registration, and multi-line pairing was unstated | **Changed.** The replay evaluates 23mk's `ggml_sycl_onednn_graph_interim_decline(capped, capacity, term)` per routed layer over the device's planned interim capacity and the per-shape term, giving (b1)'s N and reasons; the last interim line per (context, device) is scored against it, with §M71 (c)'s dump as the N = 0 witness. `interim_tp` is not replayed, and a run that prints it is VOID for the (b1) score. From (b2) the lines pair by print order: each decline line with the first commit line after it, a commit line with no decline since the previous one with `declined` = 0; the last pair is scored, and a trailing decline line with no commit line after it is VOID. Amended in §6.37 (r28 m-2 and the relay (3) answer): pairing is by `txn` per §M76, and the replay is final. |
 | m-4; §M66 | the unplanned-buffer and scoped-miss GREENs said zero `[EXT-ALLOC]` lines, against the arming rule's one seam line | **Changed.** Each unit arm prints `[MOUA-SEAM] seam draw` to stderr, flushed, immediately before the seam draw, and scores 0 `[EXT-ALLOC]` lines before it and exactly 1 after it, carrying `cohort=backend-buffer-runtime-zone`; no marker, or 0 after it, is VOID. Both GREENs and the no-model arm's reason for its own child say so. |
-| m-5; §M66 | the post-cut VM `[EXT-ALLOC]` zero was vacuous, since the printer runs only after a successful raw allocation | **Changed.** The post-cut pass scores no `[EXT-ALLOC]` line. Raw exits are scored by 23mk's always-compiled `unified_cache_ext_alloc_count_for_testing(dev)` (`50b1f8f50` §5.1), equal before and after the pass; on a tree without it the field is recorded as not scored. The §6.35 I-1 row's "found no other" is marked amended. (Follow-up, §M74: the pass is a test child and reads the counter directly under §M74 (d); see the §M74 row.) |
+| m-5; §M66 | the post-cut VM `[EXT-ALLOC]` zero was vacuous, since the printer runs only after a successful raw allocation | **Changed.** The post-cut pass scores no `[EXT-ALLOC]` line. Raw exits are scored by 23mk's always-compiled `unified_cache_ext_alloc_count_for_testing(dev)` (`50b1f8f50` §5.1), equal before and after the pass; on a tree without it the field is recorded as not scored. The §6.35 I-1 row's "found no other" is marked amended. (Follow-up, §M74: the pass is a test child and reads the counter directly under §M74 (d); see the §M74 row.) Amended in §6.37 (r28 m-3): the USM pass is the counter's positive control, at argument 0. |
 | m-6; §M60 (b) | the ubatch rule ("each command pins `-ub 512`") contradicted C3's ring run, C7's GA and C5's registration, and C3's pinned arm carried none | **Changed.** "Every command pins its `-ub`, 512 unless stated", with the exceptions listed with their reasons: C3's ring run and C7's GA at 1024, C5 and its sibling at the registration's `-ub 32` (the added `-ub 512` is removed), C2b and C3's default arm unpinned. C3's pinned arm gains `-ub 512`. C3's default arm checks `llama_context: n_ubatch += *512$` and the trial's `auto n_ubatch=512 for n_ctx=131072`, each 1, else VOID. |
 | m-7 | H7z's raw-call gate did not say how it treats comments, and the census counts were grep-false | **Changed.** The gate matches `ext_oneapi_graph\(` or `(\.\|->)finalize\(` on the source with `//` and `/* */` comments stripped and string literals kept. The census is thirty-four sites on thirty-five stripped lines (18 in `ggml-sycl.cpp`, where `:107431-107432` is one site, and 17 in `unified-kernel.cpp`); the raw grep's five further lines are the comments at `:99449`, `:99531`, `:106843`, `:106844` and `:106855`. The `->` form was missing: the dense range graph finalizes through `recording_->finalize()` (`:90525`). The ".finalize( at fo:868 is the only other" sentence now reads "on the stripped source". |
 | m-8; §M60 (b); §M73 | the llama-server rows carried `llama-completion`'s compute | **Changed.** The Qwen set's compute, 516947968 B, is labelled `llama-completion`'s (`n_outputs_max` 2048, 485.0 MiB of logits), which by §M73 is the load's envelope c(P) and right for the load's reservation (H7ap's pure fit). The server's `n_outputs_max` is 4 (`server.cpp:168-172`, `server-context.cpp:41-53`), about 3.8 MiB of logits, and its context returns c(P) − compute_ctx. C10's server row pre-registers no llama-server run until a named server-vehicle measure exists. The "`n_seq_max` 1 fixture" label is withdrawn. |
-| m-9 | Form M's tail bound held only on the gate shapes | **Changed.** G0's F3 prints the bound its cells cover (the largest `n_ubatch` and W-touching graph node count, C2b's 2048 rung included), compiled in with K. Outside it the use runs, and prints once per (context, device) `[W-ORDER] shape above the measured tail bound on device %d: ...`; a cap then aborts with its own message, so an out-of-bound fault is never read as a lost publisher. Every scored arm runs inside the bound. |
+| m-9 | Form M's tail bound held only on the gate shapes | **Changed.** G0's F3 prints the bound its cells cover (the largest `n_ubatch` and W-touching graph node count, C2b's 2048 rung included), compiled in with K. Outside it the use runs, and prints once per (context, device) `[W-ORDER] shape above the measured tail bound on device %d: ...`; a cap then aborts with its own message, so an out-of-bound fault is never read as a lost publisher. Every scored arm runs inside the bound. Amended in §6.37 (r28 m-4): G2's bound cell is the WARN's positive control. |
 | n-1 | stray indents in C1's block and the xqex block | **Changed.** C1's command and its `[KV-REGION]` count line are at 2 spaces, and the xqex commit-line grep at 4. |
 | n-2 | two §6.34 texts were unamended | **Changed.** The m-2 row's `print_info: n_ctx_train` and relay (7)'s "one WARN per (context, device)" are marked amended. |
 | n-3 | "the direct path's pointer-keyed map stays empty" was unobservable after an abort | **Changed.** Dropped. |
@@ -13422,13 +13510,13 @@ for source cites: `e2461d4fb`.
   try's deletion at `unified-cache.cpp:11704`, beside the direct path's, and says (b1) keeps
   the pool, empty. (2) moua cites your route decline at `fattn-onednn.cpp:981`
   (`params.kv_layer`) as the dispatch read of the admitted decision, and its Qwen arms depend
-  on it. (3) moua's (b1) scorer pre-registers N from your
-  `ggml_sycl_onednn_graph_interim_decline` over the interim capacity and each layer's
-  `onednn_graph_scratch_term_bytes`; please confirm that a (b1) replay may call it as a pure
-  function with those inputs. (4) moua's post-cut VM pass reads your
-  `unified_cache_ext_alloc_count_for_testing(dev)`; please name the commit that lands it. (5)
-  Follow-up: moua cites your `db61cb321` H3 TERMINAL death test as the runtime-miss arm, and
-  closes that relay. Under rulings §M74 moua's (b1) SDPA witness reads your step-0
+  on it (superseded by §6.37's relay (1): the read is your routing read before the plan). (3)
+  moua's (b1) scorer pre-registers N from your `ggml_sycl_onednn_graph_interim_decline` over the
+  interim capacity and each layer's `onednn_graph_scratch_term_bytes`; please confirm that a
+  (b1) replay may call it as a pure function with those inputs. (4) moua's post-cut VM pass
+  reads your `unified_cache_ext_alloc_count_for_testing(dev)`; please name the commit that lands
+  it. (5) Follow-up: moua cites your `db61cb321` H3 TERMINAL death test as the runtime-miss arm,
+  and closes that relay. Under rulings §M74 moua's (b1) SDPA witness reads your step-0
   `[SYCL-COUNTERS]` dump with `GGML_SYCL_COUNTER_DUMP=1`, and cites its fields as "23mk step 0
   dump field list" until the lead relays the names; please say which fields carry SDPA executed
   and fallback after admit. (6) Follow-up 2: until then moua writes them as
@@ -13443,3 +13531,33 @@ for source cites: `e2461d4fb`.
 - **zhcn:** moua cites GDC3 and GDC6 at `1c5e7ff`. C3's default arm now checks its `n_ubatch`
   on the run, both the constructor's line and the trial's result, rather than taking 512 from
   GDC3.
+
+### 6.37 Revision 7.14u: design-moua-r28, rulings §M76 and the §M74 (i) amendments, 23mk `372bb5b16`
+
+Revision 7.14u is one commit on top of `e15f4095d`. It answers design review r28
+(design-moua-r28 on `7391f5e36..e15f4095d`: 0 Critical, 0 Important, 4 Minor, 5 nits; every
+item a required fix; both r27 Importants verified closed) and folds rulings §M76 (decline and
+commit lines carry a transaction id), the §M74 (i) (2) and (4) amendments, and 23mk
+`372bb5b16`'s answer to §6.36's 23mk relay (3), queued during r28. 23mk's head for its routing
+read is `bd560d3dd`. The §6.36 rows it amends (m-2, m-3, m-5, m-9) are marked in place.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| m-1 | the dispatch read of the admitted decision was cited at the SDPA entry (`fattn-onednn.cpp:981`), which 23mk `a8cfbf901` moved to a routing read before the plan | **Changed.** §2.4.2 names 23mk's routing read: the three dispatch arms (`fattn.cpp:2788`, `:3123`, `:3907` at `d8a67422d`) call `ggml_sycl_fattn_onednn_dispatch_routed(..., site)`, which reads `ggml_sycl_onednn_graph_dispatch_declined` before `ggml_sycl_flash_attn_ext_onednn_plan`; a declined read counts `onednn_graph_mask_declined{force\|default\|d512}` and its total and falls through to native FA. The entry keeps only the uncounted backstop, `onednn_graph_decline_at_entry`, which 23mk predicts 0. (b1)'s location is the routing read's interim seam, and (b2) deletes the seam, not the read. The 03nm sentence now reads 23mk's scope, a declined D = 512 call with no tile route. §3.3's replay names its shapes: every prompt ubatch and decode step the run issues, since decode calls now reach the check, a layer's verdict taken at its largest-term call. §3.4 states the key-level rules for keyed counters. |
+| m-2; §M76 | print-order pairing failed a correct tree once a transaction reprinted its decline line without a commit line | **Changed.** Pairing is by `txn`, per §M76, pending 23mk's txn field: the decline line and the commit line of one transaction share a `txn`, a decline without a same-`txn` commit is VOID, and the last `txn` per (context, device) is scored. Print-order pairing is withdrawn, with r28's C0/D1/C2 counterexample recorded. Until the lead relays 23mk's commit, a run is scored only with at most one decline line and exactly one commit line per (context, device), and anything more is VOID with the lines recorded. §2.4.2's (b2) decline bullet and its witness sentence say the same. |
+| m-3 | the post-cut VM pass's equal readings had no positive witness, and the accessor's argument was unstated | **Changed.** The USM no-model pass prints `unified_cache_ext_alloc_count_for_testing(0)` before the 1 MiB buffer and after `ggml_opt_init`, in each half, and scores +2, equal to that half's `[EXT-ALLOC]` lines (§M74 (e)). The argument is 0, the post-selector index of `level_zero:1`, and the post-cut pass states the same argument. |
+| m-4 | the out-of-bound W-order WARN and its abort message had no test | **Changed.** G2 gains two Form M seams, `ggml_sycl_test_set_w_order_bound` and `ggml_sycl_test_w_order_drop_next_publisher`, and a bound cell of three children: above the bound with no fault (one WARN per (context, device), exit 0), above the bound with a lost publisher (the out-of-bound abort message only), and inside the bound with a lost publisher (the `W ordering lost` message only). REDs: the flag never set, and the WARN's print dropped. §2.4.2 cites the cell as the scored zero's positive control. |
+| n-1 | the xqex `end` grep sat at 8 spaces | **Changed.** At 4. |
+| n-2 | C2b cited the function's header comment for the ladder's stop, and lacked the `n_ctx_seq` negative control | **Changed.** The cite is the loop, `src/llama-context.cpp:1809-1846`, with its `break` at `:1839-1840`; the block carries C1's two negative-control greps. |
+| n-3 | the state-seq arm was missing from the `-ub` exception list | **Changed.** Listed: `test-save-load-state` sets `n_batch = 100` (`:872`), so `n_ubatch` is 100 and the trial takes its no-ladder exit (`src/llama-context.cpp:1461-1464`); no figure depends on it. |
+| n-4 | `late_term_shrink_admitted` was called a `GGML_SYCL_PRIVATE_TESTING` counter | **Changed.** §2.4.2 and §3.4 call it 23mk's always-compiled counter, a §5.1 dump field (§M74 (h)), read here only by H7ap's host arms. |
+| n-5 | a missing comma in the header's r27 bullet | **Changed.** |
+| 23mk `372bb5b16` (queued during r28) | relay (3): may a replay call the interim decision? | **Closed.** Yes: `constexpr ggml_sycl_onednn_graph_interim_reason ggml_sycl_onednn_graph_interim_decline(bool tp, bool capped, size_t capacity, size_t term) noexcept`, inline in `fattn-onednn.hpp` (L4514), reading only its arguments and pinned by H3's four `static_assert`s and a source pin; (b2) deletes it. The replay calls it with `tp` = false, and the (b1) pre-registration is final; §2.4.2 cites the four-argument form and its reasons. 23mk's seam and "sum over sites" wording at `372bb5b16` predate its §M74 (i) fold, so moua keeps reading the totals. |
+| §M74 (i) (2), (4) amendments | `onednn_graph_mask_declined` counts per routing read, keyed by site; zeros are scored on totals only, and every keyed counter prints a total | **Folded** in §3.4's keyed-counter rule and §2.4.2's routing read. moua scores none of the mask counter's keys. |
+
+**Relays.**
+- **23mk:** (1) moua cites your routing read (`a8cfbf901` rev 4.19a, §4.8, at `bd560d3dd`) as
+  the dispatch read of the decision, with the entry's backstop predicted 0, and the 03nm scope
+  as your "Where a declined layer runs". (2) moua's (b2) pairing waits for your `txn=%u` field
+  on both lines under §M76; please say where in each line it prints. (3) Closed: moua's replay
+  calls your four-argument pure decision with `tp` = false.
