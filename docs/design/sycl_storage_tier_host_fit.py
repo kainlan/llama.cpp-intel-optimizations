@@ -16,6 +16,8 @@ P3_MARGIN = 29.0            # 9g22 §4.5.2: MemAvailable_pre - expected_host - 5
 ENVELOPE = 2.5              # host_reserve 2 GiB + context envelope <= 0.5 (§4.3 step 3)
 GATE_CACHES = 4.0           # 9g22 P1: 2 GiB per table, index included, two tables
 DRAFT = 7.9                 # DSpark draft on the host (9g22 §10.3)
+DS_TABLE = 60.08 / 2        # one DeepSeek engram table, GiB
+DS_LAYER_EXPERTS = 4.58     # routed-expert bytes per DeepSeek layer, GiB
 KV_MIN = 64 * MIB           # min_kv_zone, ggml-sycl.cpp:5626
 N_CTX = 4096                # every gate pins -c
 
@@ -46,8 +48,8 @@ def zones(max_tensor, n_expert, ring, today):
     """Per-zone-set non-weight host terms, GiB.
 
     today=True: the sizing code as it is (uc:27685-27742, gs:5615-5653).
-    today=False: after lever (s): ring type-gated to MXFP4 (0 here) and the
-    VRAM-resident dma_staging_pool dropped from host SCRATCH and the RUNTIME pool.
+    today=False: after lever (s): ring type-gated to MXFP4 (0 here) and
+    dma_staging_pool removed entirely, with no device charge either (lead ruling D6 I-1).
     """
     mt = max_tensor
     routing_ids = n_expert * 4 * N_CTX / GIB
@@ -161,15 +163,25 @@ def main():
             print("    @%.1f predicted post-load MemAvailable %.1f to %.1f -> %s" %
                   (r, post[0], post[1], "passes" if post[0] >= 24 else "fails"))
         if not today:
-            # cross-check of 9g22 rev 5 §4.5.2's cold set (the doc links that figure, it does not restate it)
-            per_el = (2 * 1486356480 + 1946419200) / 384 / GIB
+            # Joint placement (lead ruling D6 I-5): a table goes HOST only if P3 holds with it
+            # HOST and the cold set EMPTY. Its 2 GiB gate cache is then not needed.
+            one = (p3[0] - 2 + DS_TABLE, p3[1] - 2 + DS_TABLE)
+            two = (one[0] - 2 + DS_TABLE, one[1] - 2 + DS_TABLE)
+            print("  engram table HOST under P3 with C empty: one table needs %.1f-%.1f, both %.1f-%.1f"
+                  " (MemTotal 246.9) -> STORAGE at every reading" % (one + two))
+            # Cross-check of 9g22 rev 6 §4.5.2's cold-set bands (the doc links them, it does
+            # not restate them). The search (D6 I-4) counts the slab 2 x (largest per-layer
+            # cold bytes): 2C/40 if spread evenly, 2 x 4.58 if whole layers are cold; the
+            # main pool's 0-2 GiB chunk rounding is carried as a band.
             for r in (READINGS[0], 189.6):
-                d = (p3[0] - r, p3[1] - r)
-                c = (max(0.0, d[0]) / 0.95, max(0.0, d[1]) / 0.95)   # slab 2C/40 counted
-                print("    cold set cross-check @%.1f: deficit %.1f-%.1f -> C %.1f-%.1f GiB (+2 main-pool rounding), %d-%d expert-layers of %.4f GiB, %.0f-%.0f%% of %.2f GiB"
-                      % (r, d[0], d[1], c[0], c[1], c[0] / per_el, c[1] / per_el, per_el,
-                         100 * c[0] / ds_experts, 100 * c[1] / ds_experts, ds_experts))
-
+                d = (max(0.0, p3[0] - r), max(0.0, p3[1] - r))
+                spread = (d[0] / 0.95, (d[1] + CHUNK) / 0.95)
+                conc = (d[0] + 2 * DS_LAYER_EXPERTS, d[1] + CHUNK + 2 * DS_LAYER_EXPERTS)
+                print("    cold set cross-check @%.1f: deficit %.1f-%.1f -> C spread %.1f-%.1f, concentrated %.1f-%.1f GiB"
+                      " (%.0f-%.0f%% / %.0f-%.0f%% of %.2f GiB)"
+                      % (r, d[0], d[1], spread[0], spread[1], conc[0], conc[1],
+                         100 * spread[0] / ds_experts, 100 * spread[1] / ds_experts,
+                         100 * conc[0] / ds_experts, 100 * conc[1] / ds_experts, ds_experts))
 
 if __name__ == "__main__":
     main()
