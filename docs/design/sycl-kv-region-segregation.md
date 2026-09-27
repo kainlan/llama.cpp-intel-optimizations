@@ -166,9 +166,10 @@ Design, revision 7.14t, by impl-moua, 2026-09-27. The revisions answer twenty-ei
   23mk's format and names).
 - design review r28 (design-moua-r28 on `7391f5e36..e15f4095d`: 0 Critical, 0 Important, 4
   Minor, 5 nits), rulings §M78 (decline and commit lines pair by transaction id) and the §M74
-  (i) (2) and (4) amendments, and 23mk `372bb5b16`'s answer on the pure interim decision,
-  recorded in §6.37. Revision 7.14u is two commits on top of `e15f4095d`, `2da8e3ed7` and a
-  follow-up that re-cites the pairing ruling as §M78.
+  (i) (2) and (4) amendments, and 23mk's answer on the pure interim decision (first at
+  `372bb5b16`, pinned at 23mk's head `bd560d3dd`, rev 4.19g), recorded in §6.37. Revision 7.14u
+  is three commits on top of `e15f4095d`: `2da8e3ed7`, `95ac344e4` (the pairing ruling re-cited
+  as §M78) and a follow-up re-pinning 23mk to its head.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -3894,8 +3895,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         never a discovered miss (rulings §M70 (b), (b')):** in (b1) 23mk's counted seam
         `ggml_sycl_onednn_graph_interim_gate` evaluates 23mk's pure decision, `constexpr
         ggml_sycl_onednn_graph_interim_reason ggml_sycl_onednn_graph_interim_decline(bool tp,
-        bool capped, size_t capacity, size_t term) noexcept` (23mk `372bb5b16`, inline in
-        `fattn-onednn.hpp`; its reasons
+        bool capped, size_t capacity, size_t term) noexcept` (23mk `bd560d3dd` §4.8 (b1), L4623,
+        first given at `372bb5b16`; inline in `fattn-onednn.hpp`; its reasons
         `GGML_SYCL_ONEDNN_GRAPH_INTERIM_REASON_{NONE, TP, CAPPED, CAPACITY}`), on the call's
         per-shape term and the **planned** interim capacity: `interim_tp`, `interim_capped`
         (stored + G over the ONEDNN cap: 0 B reserved for G, SDPA declined on that device) or
@@ -9713,57 +9714,58 @@ placement and demotion run. The rules for every such arm:
   the Graph scratch in the fit, and this replay rule applies from (b2) (§2.4.3's transition
   rule). An arm run between (b1) and (b2) scores (b1)'s interim line instead, pre-registered by
   (b1)'s own rule, never the fit's (r27 m-3). The replay calls 23mk's
-  pure `ggml_sycl_onednn_graph_interim_decline(tp, capped, capacity, term)` (23mk `372bb5b16`
-  §4.8 (b1), L4514: it reads its four arguments and nothing else, and H3 pins it with four
-  `static_assert`s and a source pin; relay (3), answered), so the (b1) pre-registration is
-  final. It is evaluated for each SDPA-routed device-KV layer with `tp` = false, `capped` the
-  model's capped flag on the device, `capacity` that device's planned interim capacity (the
-  ONEDNN zone's ensured bytes less its stored W, 0 on a device without the zone), and `term`
-  from the pure `onednn_graph_scratch_term_bytes(n_head, ne01, ne11)`, and gives the (b1) N and
-  each declined layer's reason, `interim_capped` or `interim_capacity`. **Which shapes (r28
-  m-1).** The routing read runs before the plan, so every FA call on the route reaches the
-  check, decode calls included, even those the plan would reject `BELOW_MIN_NCOLS`
-  (`fattn-onednn.cpp:111-113` at `e2461d4fb`, `ne01` below 8). A layer is declined when any of
-  its calls is, so the replay evaluates every call shape the run issues: each prompt ubatch
-  (`ne01` its token count, `ne11` the KV length the graph gives FA at that ubatch) and each
-  decode step (`ne01` 1, `ne11` up to the run's final length). `capped` and `capacity` do not
-  change within the run, and the term grows with `ne01` and `ne11`, so a layer's verdict is the
-  decision at its largest-term call, and the smaller decode terms cannot decline a layer the
-  prompt's did not. The interim line prints the term of the layer's first declined call, which
-  need not be that maximum, so its `term` field is recorded, not scored. `tp` is false because
-  no arm here sets up tensor parallelism; `interim_tp` keys on a process-wide TP queue (§M71 (a)
-  as amended), and a run that prints it is VOID for the (b1) score, with the line recorded. The
-  run's aggregate is the last interim line's `declined=%u of %u layers` per (context, device),
-  since the count runs; it must equal that N and M. N = 0 is read only with 23mk's counter dump
-  (rulings §M74 (g)-(i)), read as §3.4 says: the run sets `GGML_SYCL_COUNTER_DUMP=1` in its
-  literal command, and its `[SYCL-COUNTER] end devices=%d` line, with that many devices listed,
-  is the live check (§M66). The dump must show `name=onednn_sdpa_executed value=` ≥ 1 and the
-  unlabelled total `name=onednn_sdpa_fallback_after_admit value=0` on that device; no `end`
-  line, or a mismatched `end` count, is VOID, an aborting run prints no dump and is VOID, and a
-  reading taken before the counters' producer lands is VOID (§M71 (c), §M74 (i) (2)). So an arm
-  run between (b1) and (b2) adds `GGML_SYCL_COUNTER_DUMP=1` to its literal command. **Pairing
-  when a (context, device) prints several lines (rulings §M78; r28 m-2), per §M78, pending
-  23mk's txn field.** From (b2), a GROWTH re-plan is a new transaction and prints its lines
-  again. Under §M78 the decline line and the commit line both carry `txn=%u`, the context
-  transaction's id, unique per (context, device), and any transaction that prints a decline line
-  also prints its commit line, even when the range is unchanged. A decline line pairs with the
-  commit line of the same `txn`; a decline line with no same-`txn` commit line is VOID; a commit
-  line with no same-`txn` decline line pairs with `declined` = 0. The scored pair is the last
-  `txn` per (context, device), the settled state, against the replay of the context's last
-  transaction; earlier pairs are recorded. 7.14t's print-order pairing is withdrawn: under
-  23mk's former rule, which printed the commit line only when the range or its admitted set
-  changed, the lines C0 (A = M − k), D1 (`declined` = k, from a transaction that changed
-  nothing) and C2 (A = M, from a later transaction with no decline) paired D1 with C2 and failed
-  a correct tree (r28 m-2). **Until the lead relays 23mk's commit** the lines carry no `txn`,
-  and a run is scored only when it prints exactly one decline line (or none) and exactly one
-  commit line per (context, device), which then pair directly; any more lines make the run VOID
-  for the pairing, with the lines recorded. When the field lands, the greps above capture `txn=`
-  at 23mk's position. The SDPA-scoring runs here, C9's Qwen merge-gate blocks and the xqex runs,
-  pin `-ub 512` and make one context each, so each is expected to print one pair per (context,
-  device). Through `df9803cb8` the replay placed it as a head slot that could demote KV; 23mk's
-  Qwen row cites the fixed replay (§6.34). Master prints it at WARN when a layer's residency
-  changed (`ggml-sycl.cpp:18381-18386` at `e2461d4fb`, below `:40214`, so the same line at
-  `d19308be3`), in the form `[SYCL-PLAN] KV overflow re-placed to host tier:`, then
+  pure `ggml_sycl_onednn_graph_interim_decline(tp, capped, capacity, term)` (23mk `bd560d3dd`
+  §4.8 (b1), L4623, first given at `372bb5b16`: it reads its four arguments and nothing else,
+  and H3 pins it with four `static_assert`s and a source pin; relay (3), answered), so the (b1)
+  pre-registration is final. It is evaluated for each SDPA-routed device-KV layer with `tp` =
+  false, `capped` the model's capped flag on the device, `capacity` that device's planned
+  interim capacity (the ONEDNN zone's ensured bytes less its stored W, 0 on a device without the
+  zone), and `term` from the pure `onednn_graph_scratch_term_bytes(n_head, ne01, ne11)`, and
+  gives the (b1) N and each declined layer's reason, `interim_capped` or `interim_capacity`.
+  **Which shapes (r28 m-1).** The routing read runs before the plan, so every FA call on the
+  route reaches the check, decode calls included, even those the plan would reject
+  `BELOW_MIN_NCOLS` (`fattn-onednn.cpp:111-113` at `e2461d4fb`, `ne01` below 8). A layer is
+  declined when any of its calls is, so the replay evaluates every call shape the run issues:
+  each prompt ubatch (`ne01` its token count, `ne11` the KV length the graph gives FA at that
+  ubatch) and each decode step (`ne01` 1, `ne11` up to the run's final length). `capped` and
+  `capacity` do not change within the run, and the term grows with `ne01` and `ne11`, so a
+  layer's verdict is the decision at its largest-term call, and the smaller decode terms cannot
+  decline a layer the prompt's did not. The interim line prints the term of the layer's first
+  declined call, which need not be that maximum, so its `term` field is recorded, not scored.
+  `tp` is false because no arm here sets up tensor parallelism; `interim_tp` keys on a
+  process-wide TP queue (§M71 (a) as amended), and a run that prints it is VOID for the (b1)
+  score, with the line recorded. The run's aggregate is the last interim line's
+  `declined=%u of %u layers` per (context, device), since the count runs; it must equal that N
+  and M. N = 0 is read only with 23mk's counter dump (rulings §M74 (g)-(i)), read as §3.4 says:
+  the run sets `GGML_SYCL_COUNTER_DUMP=1` in its literal command, and its
+  `[SYCL-COUNTER] end devices=%d` line, with that many devices listed, is the live check (§M66).
+  The dump must show `name=onednn_sdpa_executed value=` ≥ 1 and the unlabelled total
+  `name=onednn_sdpa_fallback_after_admit value=0` on that device; no `end` line, or a mismatched
+  `end` count, is VOID, an aborting run prints no dump and is VOID, and a reading taken before
+  the counters' producer lands is VOID (§M71 (c), §M74 (i) (2)). So an arm run between (b1) and
+  (b2) adds `GGML_SYCL_COUNTER_DUMP=1` to its literal command. **Pairing when a (context,
+  device) prints several lines (rulings §M78; r28 m-2), per §M78, pending 23mk's txn field.**
+  From (b2), a GROWTH re-plan is a new transaction and prints its lines again. Under §M78 the
+  decline line and the commit line both carry `txn=%u`, the context transaction's id, unique per
+  (context, device), and any transaction that prints a decline line also prints its commit line,
+  even when the range is unchanged. A decline line pairs with the commit line of the same `txn`;
+  a decline line with no same-`txn` commit line is VOID; a commit line with no same-`txn`
+  decline line pairs with `declined` = 0. The scored pair is the last `txn` per (context,
+  device), the settled state, against the replay of the context's last transaction; earlier
+  pairs are recorded. 7.14t's print-order pairing is withdrawn: under 23mk's former rule, which
+  printed the commit line only when the range or its admitted set changed, the lines C0 (A = M −
+  k), D1 (`declined` = k, from a transaction that changed nothing) and C2 (A = M, from a later
+  transaction with no decline) paired D1 with C2 and failed a correct tree (r28 m-2). **Until
+  the lead relays 23mk's commit** the lines carry no `txn`, and a run is scored only when it
+  prints exactly one decline line (or none) and exactly one commit line per (context, device),
+  which then pair directly; any more lines make the run VOID for the pairing, with the lines
+  recorded. When the field lands, the greps above capture `txn=` at 23mk's position. The
+  SDPA-scoring runs here, C9's Qwen merge-gate blocks and the xqex runs, pin `-ub 512` and make
+  one context each, so each is expected to print one pair per (context, device). Through
+  `df9803cb8` the replay placed it as a head slot that could demote KV; 23mk's Qwen row cites
+  the fixed replay (§6.34). Master prints it at WARN when a layer's residency changed
+  (`ggml-sycl.cpp:18381-18386` at `e2461d4fb`, below `:40214`, so the same line at `d19308be3`),
+  in the form `[SYCL-PLAN] KV overflow re-placed to host tier:`, then
   `%zu layer(s) demoted, %zu SWA (%.1f MB host KV,`, then
   `layers %d..%d) on device %d for n_ctx=%u; %s`. The replay gives the layer count, the SWA
   count, the host MB, the layer range and the device (r25 n-2). **One verdict rule per arm
@@ -13535,8 +13537,9 @@ for source cites: `e2461d4fb`.
 
 ### 6.37 Revision 7.14u: design-moua-r28, rulings §M78 and the §M74 (i) amendments, 23mk `372bb5b16`
 
-Revision 7.14u is two commits on top of `e15f4095d`: `2da8e3ed7`, and a follow-up that
-renumbers the pairing ruling's cites to §M78 (the last row below). It answers design review r28
+Revision 7.14u is three commits on top of `e15f4095d`: `2da8e3ed7`; `95ac344e4`, which
+renumbers the pairing ruling's cites to §M78 (the "§M78 (numbering)" row); and a follow-up that
+re-pins 23mk to its head `bd560d3dd` (the "23mk re-pin" row). It answers design review r28
 (design-moua-r28 on `7391f5e36..e15f4095d`: 0 Critical, 0 Important, 4 Minor, 5 nits; every
 item a required fix; both r27 Importants verified closed) and folds rulings §M78 (decline and
 commit lines carry a transaction id), the §M74 (i) (2) and (4) amendments, and 23mk
@@ -13554,7 +13557,8 @@ read is `bd560d3dd`. The §6.36 rows it amends (m-2, m-3, m-5, m-9) are marked i
 | n-3 | the state-seq arm was missing from the `-ub` exception list | **Changed.** Listed: `test-save-load-state` sets `n_batch = 100` (`:872`), so `n_ubatch` is 100 and the trial takes its no-ladder exit (`src/llama-context.cpp:1461-1464`); no figure depends on it. |
 | n-4 | `late_term_shrink_admitted` was called a `GGML_SYCL_PRIVATE_TESTING` counter | **Changed.** §2.4.2 and §3.4 call it 23mk's always-compiled counter, a §5.1 dump field (§M74 (h)), read here only by H7ap's host arms. |
 | n-5 | a missing comma in the header's r27 bullet | **Changed.** |
-| §M78 (numbering) | the lead: the txn and co-print ruling is §M78, since §M76 (moua 7.6's rulings) and §M77 were taken | **Changed** in a follow-up commit: every cite of the pairing ruling reads §M78; the §M76 and §M76a cites to moua 7.6's rulings are unchanged. |
+| 23mk re-pin (the lead, before r29) | 7.14u pinned 23mk's interim decision at `372bb5b16` (rev 4.19c), an ancestor of 23mk's head `bd560d3dd` (rev 4.19g) | **Changed** in a follow-up commit: the interim decision is cited at `bd560d3dd` §4.8 (b1), L4623, its form unchanged since `372bb5b16`. The facts re-read from 4.19d-4.19g change no other moua text. §3.4 and §2.4.2 already state 4.19e's per-read `onednn_graph_mask_declined{force\|default\|d512}` with its total (a declined FORCE call gives `force` = 1, `default` = 1, total 2; moua scores none of it) and 4.19f's totals-only zeros. 4.19g's fix (a declined FORCE call no longer prints `unknown GGML_SYCL_FA_FORCE_PATH=onednn`) touches no moua arm or grep: the one `GGML_SYCL_FA_FORCE_PATH` in this design is the packed-K sidecar's `split-packed` opt-in (§2.8), which no arm scores. The dump facts moua reads also hold at `bd560d3dd` (§5.1: `ext_alloc_count` and the SDPA counters land in step 0, `late_term_shrink_admitted` in step 4, all always compiled). |
+| §M78 (numbering) | the lead: the txn and co-print ruling is §M78, since §M76 (moua 7.6's rulings) and §M77 were taken | **Changed** in `95ac344e4`: every cite of the pairing ruling reads §M78; the §M76 and §M76a cites to moua 7.6's rulings are unchanged. |
 | 23mk `372bb5b16` (queued during r28) | relay (3): may a replay call the interim decision? | **Closed.** Yes: `constexpr ggml_sycl_onednn_graph_interim_reason ggml_sycl_onednn_graph_interim_decline(bool tp, bool capped, size_t capacity, size_t term) noexcept`, inline in `fattn-onednn.hpp` (L4514), reading only its arguments and pinned by H3's four `static_assert`s and a source pin; (b2) deletes it. The replay calls it with `tp` = false, and the (b1) pre-registration is final; §2.4.2 cites the four-argument form and its reasons. 23mk's seam and "sum over sites" wording at `372bb5b16` predate its §M74 (i) fold, so moua keeps reading the totals. |
 | §M74 (i) (2), (4) amendments | `onednn_graph_mask_declined` counts per routing read, keyed by site; zeros are scored on totals only, and every keyed counter prints a total | **Folded** in §3.4's keyed-counter rule and §2.4.2's routing read. moua scores none of the mask counter's keys. |
 
