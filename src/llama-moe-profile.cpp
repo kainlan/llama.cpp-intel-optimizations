@@ -298,8 +298,8 @@ void llama_moe_profiler::init(const struct llama_hparams & hparams) {
         return;
     }
 
-    profile.init(hparams.n_layer(), hparams.n_expert, hparams.n_expert_used);
-    read_buffer.reserve(4096 * hparams.n_expert_used); // pre-allocate for typical batch
+    profile.init(hparams.n_layer(), hparams.n_expert, hparams.n_expert_used_max());
+    read_buffer.reserve(4096 * hparams.n_expert_used_max()); // pre-allocate for typical batch
 }
 
 void llama_moe_profiler::schedule_capture(uint32_t il, struct ggml_tensor * expert_ids,

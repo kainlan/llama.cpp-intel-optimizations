@@ -40214,7 +40214,8 @@ static ggml_backend_buffer_type_i ggml_backend_sycl_split_buffer_type_interface 
     /* .get_caps         = */ ggml_backend_sycl_split_buffer_type_get_caps,
 };
 
-ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * tensor_split) {
+ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type([[maybe_unused]] int main_device,
+                                                               const float *        tensor_split) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return nullptr;
     static std::mutex           mutex;
@@ -101355,7 +101356,7 @@ recipe_failed:
                             const ggml_tensor * kv_seq_ids       = node->src[6];
                             const ggml_tensor * block_table      = node->src[7];
                             const ggml_tensor * seq_lens         = node->src[8];
-                            const int32_t       use_paged_layout = ((int32_t *) node->op_params)[4];
+                            const int32_t       use_paged_layout = ((int32_t *) node->op_params)[5];
                             if (!Q_fa || !K_fa || !V_fa || sinks || q_seq_ids || kv_seq_ids || block_table ||
                                 seq_lens || use_paged_layout != 0) {
                                 fast_path_ok = false;
@@ -102896,7 +102897,7 @@ full_build:
                     const ggml_tensor * block_table = node->src[7];
                     const ggml_tensor * seq_lens    = node->src[8];
 
-                    const int32_t use_paged_layout = ((int32_t *) node->op_params)[4];
+                    const int32_t use_paged_layout = ((int32_t *) node->op_params)[5];
                     if (sinks || q_seq_ids || kv_seq_ids || block_table || seq_lens || use_paged_layout != 0) {
                         GGML_LOG_ERROR(
                             "[PERSISTENT-TG] FLASH_ATTN unsupported extras: sinks=%p q_seq=%p kv_seq=%p "
