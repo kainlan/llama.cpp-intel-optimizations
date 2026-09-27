@@ -1,7 +1,10 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 3g, not implemented. rev 3g is a new commit on rev 3f
-(`b3c08be71`). It folds design-5efe-r5 (`fb063e845..b3c08be71`,
+*Status: DESIGN rev 3h, not implemented. rev 3h is a new commit on rev 3g
+(`87181659f`). It folds r5's added I-3 (§M66), which moved design-5efe-r5 to
+0C/3I/10m/2n: each arm that scores a `[HOST-ZONE-ALLOC]` line sets the
+trace variable in its literal command and names its trace-live check. rev
+3g is a new commit on rev 3f (`b3c08be71`). It folds design-5efe-r5 (`fb063e845..b3c08be71`,
 0C/2I/10m/2n) with lead rulings §M63 (a), §M66, §M68 (a) and §M69 (a)-(d);
 Appendix B's "design-5efe-r5" table keys each item to r5's IDs. rev 3f is a
 new commit on rev 3e (`fb063e845`). It folds design-5efe-r4 as re-graded at
@@ -2732,8 +2735,12 @@ The lead's GPU runs share one protocol (r1 I-7):
   criterion, and the §M57 (a) RED. Every arm that scores it:
   - sets the variable **on its own command line**, not in an inherited
     environment;
-  - is **trace-live**: its stderr holds at least one `[HOST-ZONE-ALLOC]`
-    line of any cohort;
+  - is **trace-live**: its stderr holds at least one post-pre-size
+    `[HOST-ZONE-ALLOC]` line of any cohort. Each arm names the line it uses
+    (r5 I-3): C4 step 2, a `zone=SCRATCH cohort=backend_host_buffer` line
+    (at `-c 4096` there is no `zone=KV` line); step 3, the KV exact sum;
+    step 5 and its RED, the `kv_host_buffer` and `backend_host_buffer`
+    lines. C5 and C6 carry the same checks;
   - is otherwise **VOID**, and VOID counts as failed. For the RED, which
     scores the presence of a line, a non-live run is VOID, never a RED that
     did not fire.
@@ -3361,9 +3368,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
   1. `POSIX_FADV_DONTNEED` over shard 3, then `fincore` on it. Pre-registered:
      ≤ 1 MiB resident.
   2. **Qwen3.8 Q8_0 on `level_zero:0`, default load flags, `-c 4096`, the
-     baseline completion**: `llama-completion -m <Qwen3.8 Q8_0> -no-cnv -v
-     -c 4096 -p 'The capital of France is' -n 32 --seed 42 --temp 0`, the
-     run2 vehicle (r3 m2). `-v` is required: the zone, pre-size and demand
+     baseline completion**: `env GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1
+     ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion -m
+     <Qwen3.8 Q8_0> -no-cnv -v -c 4096 -p 'The capital of France is' -n 32
+     --seed 42 --temp 0 >step2.out 2>step2.err`, the run2 vehicle (r3 m2).
+     The trace variable is part of the command, not the environment the
+     lead happens to have (§M66; r5 I-3). `-v` is required: the zone, pre-size and demand
      criteria below read INFO lines, which `llama-completion` drops at its
      default threshold (§7 preamble).
 
@@ -3391,8 +3401,13 @@ I-5, §F2). It is the commit that changes every SYCL load.
        figures, and §4.4's table names what did not land from them;
      - §4.4's WEIGHT pre-registration: every post-pre-size `zone=WEIGHT`
        line is `cohort=routing_indices_cache` within 20480 bytes (r4 m-2).
-       The arm sets `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1` on its command line
-       and is trace-live (§7 preamble, §M66);
+       **Trace-live check** (§M66; r5 I-3): `step2.err` holds at least one
+       post-pre-size `[HOST-ZONE-ALLOC] ... zone=SCRATCH ...
+       cohort=backend_host_buffer` line, from the context's `SYCL_Host`
+       compute and output buffers that C4 routes to SCRATCH. At `-c 4096`
+       nothing demotes, so no `zone=KV` line can serve here. Without that
+       line the trace is dead, the WEIGHT criterion would pass on zero
+       lines, and the arm is **VOID**, which counts as failed;
      - `[ATTN-HOST] staging not planned (host dispatch off)` once, and no
        staging demand (§4.4 criteria, §M69 (a));
      - `DMA staging pool: 0.0 MB`;
@@ -3444,7 +3459,10 @@ I-5, §F2). It is the commit that changes every SYCL load.
      depend on the other shards' prior cache state.
   3. **The same `llama-completion` Qwen run with no `-c`** (the
      default-context arm), at `n_ctx = n_ctx_train = 262144`
-     (`run2.log:131`). The same precondition applies.
+     (`run2.log:131`): `env GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1
+     ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion -m
+     <Qwen3.8 Q8_0> -no-cnv -v -p 'The capital of France is' -n 32 --seed 42
+     --temp 0 >step3.out 2>step3.err`. The same precondition applies.
      - **The KV.** 12 of the 48 layers carry KV: qwen4exp marks layer `i`
        recurrent unless `(i + 1) % full_attention_interval == 0`
        (`src/models/qwen4exp.cpp:132-134`), and the interval is 4
@@ -3512,14 +3530,20 @@ I-5, §F2). It is the commit that changes every SYCL load.
          §M69 (a));
        - §4.4's WEIGHT pre-registration: every post-pre-size `zone=WEIGHT`
          trace line is `cohort=routing_indices_cache` within 20480 bytes
-         (r4 m-2), in the same trace-live run;
+         (r4 m-2). **Its trace-live check is the exact form above** (§M66;
+         r5 I-3): the `zone=KV cohort=kv_host_buffer` lines of the same
+         `step3.err` summing to 7247757312 bytes. A dead trace prints none,
+         so the WEIGHT criterion cannot pass vacuously: the arm is **VOID**,
+         which counts as failed;
        - `MemAvailable` stays above 25 GiB. The load pins 8 GiB of zone-1
          chunks on top of step 2's 6 GiB, and `MemAvailable` before the
          load was 155.0 GiB (`run2.mem`);
        - a `runtime KV update rejected` line is a FAIL.
 
      **3b. The same Qwen no-`-c` run with `GGML_SYCL_ATTN_HOST_DISPATCH=1`**
-     on its command line (§M69 (a)). It is VOID until th32 T6/T7 and C4 are
+     on its command line (§M69 (a)): step 3's command with
+     `GGML_SYCL_ATTN_HOST_DISPATCH=1` added after `env`, writing
+     `step3b.out` and `step3b.err`, and step 3's trace-live check. It is VOID until th32 T6/T7 and C4 are
      on the tree, like step 3. Every criterion of step 3 holds, except that
      the staging criteria are the dispatch-on ones (§4.4 criteria): a
      `planned staging` line, zero `exceeds the planned` refusals, no
@@ -3535,7 +3559,20 @@ I-5, §F2). It is the commit that changes every SYCL load.
      - **the canonical CLAUDE.md `llama-cli` command with `-c 4096`**, under
        `GGML_SYCL_STRICT_LEASES=1` (§M57 (b)): rc 0, and no `[HOST-ZONE]
        leaked` line and no ownerless-lease WARN when the context is freed;
-     - **the same with no `-c`**, at `n_ctx = 131072`.
+     - **the same with no `-c`**, at `n_ctx = 131072`, as a literal command:
+       `timeout 60 env GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1
+       ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli -m
+       /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -lv 4 -st --simple-io
+       --no-display-prompt --chat-template-kwargs
+       '{"reasoning_effort":"medium"}' --reasoning-format none
+       --reasoning-budget 0 -p 'Count from 1 to 5. Answer with only: 1, 2,
+       3, 4, 5' -n 48 --seed 42 --temp 0 >step5.out 2>step5.err` (§M66; r5
+       I-3).
+       - **Trace-live check:** `step5.err` holds the `[HOST-ZONE-ALLOC] ...
+         zone=KV ... cohort=kv_host_buffer` lines of the demoted host KV,
+         and at least one post-pre-size `zone=SCRATCH
+         cohort=backend_host_buffer` line. Without them the arm is **VOID**,
+         which counts as failed.
        - **The demotion line is zhcn's GDC3 row, cited and not copied**
          (§M56 (a)). GDC3 is the single source of N, the host-KV figure and
          the layer range. The arm scores against the GDC3 point its tree
@@ -3562,7 +3599,10 @@ I-5, §F2). It is the commit that changes every SYCL load.
          zone-3 miss, and no `[HOST-ZONE] leaked` line.
        - A refusal is a FAIL.
      - **5b. The same no-`-c` arm with `GGML_SYCL_ATTN_HOST_DISPATCH=1`** on
-       its command line (§M69 (a)), the cheapest demoting arm. Every
+       its command line (§M69 (a)), the cheapest demoting arm: step 5's
+       no-`-c` command with `GGML_SYCL_ATTN_HOST_DISPATCH=1` added after
+       `env`, writing `step5b.out` and `step5b.err`, and step 5's
+       trace-live check. Every
        criterion of the no-`-c` arm holds, except that the staging criteria
        are the dispatch-on ones (§4.4 criteria): a `planned staging` line,
        zero `exceeds the planned` refusals, no phase-gate WARN, and the
@@ -3585,10 +3625,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
        for `SYCL_KV_Host`), must FAIL the SCRATCH criterion: its host KV
        arrives in SCRATCH (`[HOST-ZONE-ALLOC] ... zone=SCRATCH ...
        cohort=backend_host_buffer`) with no demand line for it. On the second
-       commit it passes. The RED sets `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1` on
-       its command line and must be trace-live (§M66): with the trace off,
-       the line it looks for cannot print, so a non-live RED is **VOID**,
-       never a RED that silently failed to fire. GPT-OSS on the B50 is the RED's vehicle because it
+       commit it passes. The RED rides step 5's no-`-c` command, which sets
+       `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1`, and must be trace-live (§M66; r5
+       I-3): at least one post-pre-size `[HOST-ZONE-ALLOC]` line of any
+       cohort in the same `step5.err`. With the trace off, the line it looks
+       for cannot print, so a non-live RED is **VOID**, never a RED that
+       silently failed to fire. GPT-OSS on the B50 is the RED's vehicle because it
        demotes host KV at a fraction of Qwen's load.
 
      Every SYCL load now takes the mapped path.
@@ -3633,6 +3675,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
     GDC3's line at the point its tree selects (§M56 (a), §M61 (a)), the
     VOID guard, and the digit count on stdout.
   - The same precondition as C4 steps 2 and 3 applies to both Qwen arms.
+  - Each rerun uses its C4 step's **literal command**, with
+    `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1` in it, and carries that step's named
+    trace-live check: step 2's `backend_host_buffer` line, step 3's KV
+    exact sum, step 5's `kv_host_buffer` and `backend_host_buffer` lines. An
+    arm whose trace is not live is VOID, which counts as failed (§M66; r5
+    I-3).
 
 **C6. Retire unowned host registration** (§4.8).
 - RED `test-sycl-unregistered-host-refusal` (`sycl;cache;mem-handle`,
@@ -3646,6 +3694,9 @@ I-5, §F2). It is the commit that changes every SYCL load.
     preamble), and the no-`-c` arm scored on zhcn GDC3's line at the point
     its tree selects, with the VOID guard;
   - the C4 Qwen run in both arms.
+  - As in C5, every rerun of a C4 arm uses that step's literal command,
+    with `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1`, and its named trace-live
+    check; a non-live arm is VOID, which counts as failed (§M66; r5 I-3).
 
   The refusal must never fire on a real load.
 
@@ -3870,9 +3921,10 @@ Closed at `fb063e845`, per the verdict's section A (doc lines are
 | r3 m8 | fixed in 3e: own `MODEL` row | 1447 |
 | §M58 (c); §M56 (a) body; earlier-r4 m-R7, m-R10 | fixed in 3e (§M56 (a)'s Appendix B residue is m-5 above) | as the verdict cites |
 
-**design-5efe-r5** (`fb063e845..b3c08be71`, 0C/2I/10m/2n; every r4 item
-closed as claimed), with lead rulings §M63 (a), §M66, §M68 (a) and §M69
-(a)-(d), folded in rev 3g:
+**design-5efe-r5** (`fb063e845..b3c08be71`, 0C/3I/10m/2n; every r4 item
+closed as claimed; I-3 was added to the verdict after rev 3g), with lead
+rulings §M63 (a), §M66, §M68 (a) and §M69 (a)-(d), folded in rev 3g, and
+I-3 in rev 3h:
 
 | finding | disposition | where |
 |---|---|---|
@@ -3880,6 +3932,7 @@ closed as claimed), with lead rulings §M63 (a), §M66, §M68 (a) and §M69
 | I-2 (1) the refusal is discarded on the MoE segmented paths | Fixed per §M69 (b). C4 routes the four `ggml_sycl_compute_forward` calls at `gs:97234`, `:97285`, `:97551` and `:97595` through one fail-closed helper that prints the ordinary loop's unsupported-node line and asserts (`gs:94499-94506`). RED `test-sycl-seg-forward-return-source` fails at master naming the four sites, with a mutant per site and a positive-control fixture. A ticket is to be filed so the fix is tracked if C4 slips. | §4.4 staging plan, §7 C4 tests, tickets |
 | I-2 (2) the dsab release zeroes a live context's planned slots | Stated per §M69 (c): with dsab, the slots are released only when the last backend on the device is freed, by C4's per-device live-backend count, and dsab's fix adopts that count for the pools and the staging. Until dsab lands the premature release reaches the plan only as a fail-closed refusal; a dispatch-on arm that prints `planned 0 B` on a tree without dsab is VOID and reported as dsab's. | §4.4 Lifetimes, site table, §7 C4 step 5b |
 | I-2 (3) slots planned on the helper's device | Fixed per §M69 (d): the walk takes each node's device from the scheduler's assigned backend, the device whose `ctx.device` indexes the slots (`gs:82358`, `:82844`); demand and `req.device` are that device's. Test case with two devices, and a helper-device mutant. | §4.4 staging plan, §7 C4 tests |
+| I-3 (§M66) trace-scored arms neither set the variable nor check it is live | Fixed in rev 3h. `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1` is in the literal command of C4 steps 2, 3, 3b, 5's no-`-c` arm, 5b and the §M57 (a) RED, which rides step 5. Each names its trace-live check: step 2 a post-pre-size `zone=SCRATCH cohort=backend_host_buffer` line (at `-c 4096` nothing demotes); step 3 the KV exact sum of 7247757312 bytes, named as the validity check for its WEIGHT criterion; step 5 its `kv_host_buffer` and `backend_host_buffer` lines; the RED any post-pre-size `[HOST-ZONE-ALLOC]` line. A non-live arm is VOID, which counts as failed. C5 and C6 rerun the arms with the same commands and checks. | §7 preamble, C4 steps 2, 3, 3b, 5, 5b, RED; C5; C6 |
 | m-1 C1's Mistral default arm missing from the VOID-guard list | Fixed: C1's lead gate runs with `-v` and the guard, and is on the list; W1-W3 are named as not default-context arms, since each is killed before a `llama_context` exists. | §7 preamble, C1 |
 | m-2 GPT-OSS vehicle not fully named | Fixed: `llama-cli`, default `n_ubatch` 512, `n_outputs_max` 1 (`tools/server/server-context.cpp:1015`, `lc:2051`), for step 5 and 5b, C5 and C6. | §7 preamble |
 | m-3 the GDC3 row restates GDC3 figures | Fixed: the row names the GDC3 row and `9650b3e` only. | Appendix B |
@@ -3892,7 +3945,7 @@ closed as claimed), with lead rulings §M63 (a), §M66, §M68 (a) and §M69
 | m-10 the merge unit | Fixed: 5efe C1-C4 and th32 T6/T7 reach master in one merge; "VOID without T6/T7" is a branch state that master never holds. | §3.1 |
 | n-1 the IDLE branch still grows | Fixed: it takes the same refusal; its per-call buffer stays the `GRAPH` fallback; a gate mutant restores its grow. | §4.4 staging plan, §7 C4 source gate |
 | n-2 the recipe term closed by subtraction | Fixed: 0 because only `Q1_0`/`NVFP4` experts get a recipe workspace (`uc:27380-27399`) and Qwen's are `Q8_0` (`run2.log:81`). | §4.4 |
-| §M66 env-gated trace lines | Folded: the one such emitter here, `[HOST-ZONE-ALLOC]` (`GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1`), is scored at five points. Each sets the variable on its own command line and must be trace-live, meaning at least one `[HOST-ZONE-ALLOC]` line of any cohort in the same run, or it is VOID, which counts as failed. The §M57 (a) RED, which scores a line's presence, is VOID when not live. | §7 preamble, C4 steps 2, 3, 5, RED |
+| §M66 env-gated trace lines | Folded in rev 3g, made literal and per-arm in rev 3h (I-3 above): the one such emitter here, `[HOST-ZONE-ALLOC]` (`GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1`), is scored at five points. Each sets the variable on its own command line and must be trace-live, meaning at least one `[HOST-ZONE-ALLOC]` line of any cohort in the same run, or it is VOID, which counts as failed. The §M57 (a) RED, which scores a line's presence, is VOID when not live. | §7 preamble, C4 steps 2, 3, 5, RED |
 | §M68 (a) one owner per deletion | Folded (see m-5). | §4.4 notify, §7 C4 source gate |
 | §M69 (a)-(d) | (a) I-1; (b) I-2 (1); (c) I-2 (2); (d) I-2 (3). | as the rows above |
 | r5 H notes N1-N3 (tracker hygiene) | Not doc changes: llama.cpp-30r1's DEVICE wording, g2a7's env-var name, and dsab's cites and test switch are relayed to the lead. | - |
