@@ -1,7 +1,8 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 2 (folds design-5efe-r1 under lead rulings §F1 and §F2,
-and the th32 r15 m-4 mlock item), not implemented. Tracker: `llama.cpp-5efe`.
+*Status: DESIGN rev 3 (folds design-5efe-r1, including its addendum, under
+lead rulings §F1, §F2 and §F2a, plus the th32 r15 m-4 mlock item and the §M49
+note that the lazy-range record lands in C1), not implemented. Tracker: `llama.cpp-5efe`.
 Written 2026-09-27 against branch `task/5efe` at `69e70c715` (= master). Every
 cite without a revision prefix is to that tree. `gs` is
 `ggml/src/ggml-sycl/ggml-sycl.cpp`, `uc` is
@@ -15,9 +16,11 @@ Appendix A disposes of every r1 finding.*
 Sibling designs this one interfaces with, and does not restate:
 
 - `llama.cpp-th32`: STORAGE tier for lazy row tables,
-  `docs/design/sycl-storage-tier-lazy-tables.md`. Pinned at its latest
-  reviewed head, **rev 2q `1646da864`**, abbreviated **th32**. (Rev 2r,
-  `df6e83b3b`, folds r16 and was not yet reviewed when this was written.)
+  `docs/design/sycl-storage-tier-lazy-tables.md`, abbreviated **th32**.
+  Pinned at its latest reviewed head, **rev 2r `df6e83b3b`** (r17 found nits
+  only). Rev 2s, `f364952d3`, folds those nits and §F2a I-9: its inventory
+  reads byte ranges from this design's lazy-range record (§3.1). Section
+  numbers cited here are the same in both.
 - `llama.cpp-7v5c`: host-only plan dry-run.
 - `llama.cpp-rnh3`: exact host WEIGHT bytes.
 - `llama.cpp-sgc5`: one zone set per plan.
@@ -61,10 +64,12 @@ costs:
 
 This design therefore does four things:
 
-- **Commit 1 restores `mmap_support`**, as
-  `host_unified_memory` known and false (§3). By itself that moves one thing:
-  `-lzm auto` engages again, so the 50.66 GiB Qwen PLE table leaves the
-  pinned pool under default flags.
+- **Commit 1 restores `mmap_support`**, as `host_unified_memory` known and
+  false (§3). By itself that moves one thing: `-lzm auto` engages again, so
+  the 50.66 GiB Qwen PLE table leaves the pinned pool under default flags.
+  Commit 1 also lands the **per-file lazy-range record** (§3.1). It is the one
+  source of every `TENSOR_READ_LAZY` byte range, and lazy_read, th32's
+  inventory, the tier and llama_mmap all read it.
 - **A new allocation tier, `FILE_MAPPED`** (§4.1-§4.3).
   - It is a read-only file mapping that the unified cache creates inside one
     VA reservation, owns through one `alloc_owner`, and releases with one
@@ -234,6 +239,10 @@ executes it (`gs:76049-76067`). `ggml_sycl_host_data()` is `tensor->data`
   (`src/models/qwen4exp.cpp:189`). `lazy.add` accepts it under `on` at any
   size, and under `auto` only above 4 GiB (`lml:1240-1268`). `run2.log:370`
   shows `lazy read enabled` for 51880 MiB.
+- The byte range is kept in `lazy_read`'s private
+  `std::map<uint32_t, llama_mmap::ranges> ranges` (`llama-model-loader.h:118`,
+  filled at `lml:1258`). `llama_mmap` receives it through `lazy.for_file(idx)`
+  (`lml:1890-1891`). §3.1 replaces that copy with the record.
 - Its buffer type is the CPU default buft (§2.2), so the context is a lazy CPU
   context.
   - `init_mappings` maps every file whenever `lazy.any()`, even after
@@ -243,8 +252,15 @@ executes it (`gs:76049-76067`). `ggml_sycl_host_data()` is `tensor->data`
     excluded from `WILLNEED` and `MADV_HUGEPAGE`
     (`src/llama-mmap.cpp:503-545`). `MAP_POPULATE` is gone (`:479-481`).
 - `load_tensors` wraps it as `CPU_Mapped` (`is_lazy_mapped`, `lm:2745-2748`).
-  `load_all_data` points the tensor into the mapping without reading it, and
-  never mlocks it (`lml:2099-2128`).
+  `load_all_data` points the tensor into the mapping without reading it
+  (`lml:2099-2128`).
+- **It can still be mlocked** (r1 addendum I-10). Under `-lm mmap+mlock`,
+  `load_all_data` skips the growth call only for the lazy tensor itself
+  (`!lazy.has(cur)`, `lml:2120`). A non-lazy mapped tensor that comes after the
+  table in the same file calls `grow_to(weight->offs + n_size)` (`lml:2122`).
+  `llama_mlock::grow_to` locks `[addr + size, target)` contiguously from the
+  mapping's base (`src/llama-mmap.cpp:826-840`), so that call locks, and
+  therefore faults in, every lazy byte before the tensor. §4.6 fixes it.
 - It is not a SYCL inventory entry.
   - The late inventory filters out non-SYCL bufts, so the late plan's host
     total drops from 154263.6 to 102383.5 MB (`run2.log:308` vs `:2821`,
@@ -360,6 +376,58 @@ props->caps = {
 - **th32 drops its own flip** (lead ruling §T13, point 1). th32's T6 still
   resolves its lazy mode before the `auto` fallback; commit 1 does not depend
   on that.
+
+### 3.1 Also in commit 1: the per-file lazy-range record (§F2a I-9, §M49)
+
+**Why it exists.** Four consumers need the byte ranges of the
+`TENSOR_READ_LAZY` tensors:
+
+- `lazy_read`, for the CPU lazy path;
+- th32's inventory, after T6;
+- the tier's exclusion (§4.6);
+- `llama_mmap`'s prefetch, `MADV` and lock exclusion (§4.6; §T13c permits
+  feeding it from 5efe's code).
+
+Today the ranges live only in `lazy_read`'s private map (§2.5). th32 T6
+diverts SYCL tables *out* of `lazy_read`, so after T6 that map would hold no
+SYCL table. The tier would then receive an empty exclusion set, and the
+loader's mapping would `WILLNEED` the complement of that empty set, which is
+every byte of every shard, the 54.4 GB table included (r1 addendum I-9). One
+record, filled independently of who defers the read, removes that failure
+mode.
+
+**The record.** `llama_lazy_range_record`, one per loaded file, owned by 5efe
+and held by `llama_model_loader`:
+
+- **Rows.** One row per tensor created with `TENSOR_READ_LAZY`: (tensor name,
+  file index, offset, size, `deferral`).
+- **`deferral`** is `EAGER`, `LAZY_READ` or `STORAGE`.
+  - `EAGER`: the flag is set, but the tensor is read normally, for example
+    under `-lzm off`. It is an ordinary weight, and no consumer excludes it.
+  - `LAZY_READ`: upstream's CPU lazy path.
+  - `STORAGE`: th32's SYCL diversion, from T6.
+- **Where it is filled.** `create_tensor` fills the row at the one place the
+  flag is examined (`lml:1774-1777`), from the `llama_tensor_weight`, before
+  and independently of any consumer's decision. The decision only sets
+  `deferral`.
+- **Its API.** `deferred_for_file(idx)` returns the sorted, merged ranges of
+  every non-`EAGER` row of that file. `has(tensor)` and `deferral(tensor)` are
+  the per-tensor queries.
+
+**Consumers keep no copy.**
+- `lazy_read` keeps its `mode` and its decision (`add` without storage).
+  `any()`, `has()` and `for_file()` become queries on the record, filtered to
+  `LAZY_READ`, and its private `ranges` and `tensors` members are deleted.
+- `init_mappings` passes `record.deferred_for_file(idx)` to `llama_mmap`
+  (`lml:1890-1891`).
+- th32's inventory reads each table's (file, offset, size) from the record
+  (th32 rev 2s §4.1).
+- The tier hook's `lazy_ranges` argument (§4.3) is
+  `record.deferred_for_file(idx)`.
+
+**What it changes on its own.** Nothing observable in C1. The ranges and
+decisions are the ones `lazy_read` computes today, and the edge now held by
+th32 T6 on 5efe is a data edge on C1 alone (§M49).
 
 ---
 
@@ -524,7 +592,8 @@ because `supports_buft` keys on the name function (`gs:108779-108812`).
 
 **The hook.** The buffer is created by a new proc-address hook:
 `ggml_backend_sycl_mapped_buffer_from_file(dev, file_idx, dup_fd, file_size,
-tensor_ranges, lazy_ranges)`.
+tensor_ranges, lazy_ranges)`, whose `lazy_ranges` is the record's
+`deferred_for_file(file_idx)` (§3.1).
 - The loader calls it **instead of** `ggml_backend_alloc_ctx_tensors_from_buft`
   for each (`SYCL_Mapped`, file) pair.
 - It mirrors upstream's `buffer_from_host_ptr` shape (`lm:2748-2767`).
@@ -737,19 +806,25 @@ lifts it into `host_ledger_budget()`.
 ### 4.6 The mapping shape, prefetch, locking, and the lazy ranges (§T13a, §T13c, th32 r15 m-4)
 
 - **5efe owns the exclusion, because it owns the mapping.** th32 stays off
-  mmap entirely and does not register the table's range anywhere in the
-  loader (§T13c), so nothing upstream excludes it for the tier. The loader
-  passes every `TENSOR_READ_LAZY` range of the file to the tier through the
-  hook's `lazy_ranges` argument (§4.3). The ranges come from `lazy_read`'s
-  own set, which `lazy.add` fills (`lml:1776`).
+  mmap entirely (§T13c), and after T6 its tables leave `lazy_read`. The
+  exclusion set therefore comes from the **lazy-range record** (§3.1), never
+  from `lazy_read`'s set. Two exclusion sites read the record:
+  `deferred_for_file(idx)` goes to the tier through the hook's `lazy_ranges`
+  (§4.3), and to `llama_mmap` through `init_mappings`. A table diverted to
+  STORAGE is excluded exactly as a `LAZY_READ` one is.
 - **Three segment sets, one pure function** (r1 I-2, §F2).
   `file_mapping_segments(tensor_ranges, lazy_ranges, page)` returns:
 
   | set | rounding | purpose | bound on lazy bytes |
   |---|---|---|---|
-  | map segments | **outward** to pages | every non-lazy tensor byte is addressable (GGUF alignment is 32 B, so a lazy and a non-lazy tensor can share a page) | at most one page of lazy bytes mapped per lazy edge |
+  | map segments | **outward** to pages, including at a lazy boundary | every non-lazy tensor byte is addressable (GGUF alignment is 32 B, so a lazy and a non-lazy tensor can share a page) | at most one page of lazy bytes mapped per lazy edge |
   | `WILLNEED` segments | **inward** | host-executed ranges only; never a device-only range, never a page holding a lazy byte | 0 |
   | lock segments | **inward** | host-executed ranges, under `-lm mmap+mlock` only | 0 |
+  | `MADV_RANDOM` edge windows | **inward** from each lazy boundary into the map segment, plus the shared page | disables fault read-around next to a lazy range, on **both** sides of it | n/a (advice only) |
+
+  (§F2a I-2(a): only map segments round outward. Every advice and lock set
+  rounds inward, so no advice or lock ever reaches a lazy page other than the
+  shared page's `MADV_RANDOM`.)
 
   - Pages strictly between map segments stay the reservation's `PROT_NONE`
     anonymous memory. They are never faulted, and a tier read of one is a
@@ -758,15 +833,35 @@ lifts it into `host_ledger_budget()`.
     (`src/llama-mmap.cpp:444`), but that helper is file-static in libllama,
     which ggml-sycl cannot call. `file_mapping_segments` lives in the
     device-free `file-mapping.cpp`.
-- **Fault readahead** (r1 m-13).
-  - A fault near a map-segment edge can read ahead past the edge, because
-    readahead is per file, not per VMA. That covers CPU execution faults and
-    the staging bounce's `memcpy` faults alike.
-  - The tier sets `MADV_RANDOM` on the last `max(2 x read_ahead_kb, 2 MiB)`
-    of every map segment that borders a lazy range, and on the one shared page
-    itself. That splits the VMA and disables read-around there.
+- **Fault read-around** (r1 m-13, addendum m-19).
+  - Linux's synchronous mmap read-around is **centred on the fault**:
+    `start = pgoff - ra_pages/2`, `size = ra_pages`. It is per file, not per
+    VMA. So a fault near either edge can read into a neighbouring lazy range:
+    forward from a segment that ends at it, and **backward** from a segment
+    that starts after it. That covers CPU execution faults and the staging
+    bounce's `memcpy` faults alike.
+  - The tier sets `MADV_RANDOM` on a window of `W = max(2 x read_ahead_kb,
+    2 MiB)` at **both** edges of every lazy range: the last `W` of the map
+    segment before it, the first `W` of the map segment after it, and the
+    shared pages. That splits the VMAs and disables read-around there.
   - Device-only ranges are also staged through the mapping, so the same edge
     advice covers them.
+- **The second residual path: the loader's own whole-file mapping** (addendum
+  m-19).
+  - `llama_mmap` still maps whole files during the load. `load_all_data` reads
+    the tensors that are not in `SYCL_Mapped` through it: `CPU_REPACK` and
+    plain CPU sources, and lazy tables on the CPU path before th32.
+  - Today that mapping advises `MADV_RANDOM` only over the lazy range itself
+    (`src/llama-mmap.cpp:541-543`), and it sets `POSIX_FADV_SEQUENTIAL` on the
+    fd (`:475`), which enlarges the read-around window. A fault in the
+    neighbouring VMA can therefore read around into the lazy range.
+  - C4 applies the same both-edge window to `llama_mmap`: its lazy-range
+    advice covers `[lazy_begin - W, lazy_end + W)`, from the record, not the
+    lazy range alone.
+  - Bound: with both mappings advised, the lazy bytes either mapping can
+    fault in are the shared pages, at most one page per lazy edge per mapping,
+    plus whatever bcachefs reads at extent granularity (256 KiB, th32 §2.4).
+    The gate's 1 MiB guard band sits outside both.
   - The residency gate below measures what remains.
 - **No `MAP_POPULATE`, no `MADV_HUGEPAGE`** from the tier. Huge pages on a
   file mapping depend on the filesystem's large-folio support, which is not
@@ -775,26 +870,36 @@ lifts it into `host_ledger_budget()`.
 - **After staging**, device-only ranges get `POSIX_FADV_DONTNEED` through the
   owner's `dup` fd (§4.1). Their page cache goes back to the host experts'
   working set. A re-materialization after a VRAM eviction re-reads them.
-- **Locking** (th32 r15 m-4, carried by §F2).
-  - The tier's lock growth is **per range, never by prefix**: one `mlock` per
-    inward-rounded lock segment, in `unified_cache_raw_lock_file_segments`.
-  - It never calls `llama_mlock`, whose `grow_to` locks `[0, target)` of a
-    mapping (`src/llama-mmap.cpp:790-803`) and so would lock every lazy range
-    before a locked tensor in the same shard.
-  - The loader's `lmlock` growth is skipped for `SYCL_Mapped` tensors (§4.3).
+- **Locking** (th32 r15 m-4, addendum I-10, §F2a).
+  - **The tier.** It calls `mlock(2)` directly, once per inward-rounded,
+    host-executed lock segment, in `unified_cache_raw_lock_file_segments`.
+    Inward rounding matters because `mlock` rounds a mid-page start down to
+    the page. The tier never uses `llama_mlock`, whose `grow_to` locks
+    `[addr + size, target)` contiguously from the mapping base
+    (`src/llama-mmap.cpp:826-840`).
+  - **`mlock_bufs`.** `SYCL_Mapped` is excluded from the `mlock_bufs` block
+    (`lm:2782-2787`). Without that, `use_mlock && is_host` would `grow_to` the
+    whole buffer: every device-only source (about 25 GB on Qwen) and the
+    reservation's `PROT_NONE` holes.
+  - **The loader's prefix lock is fixed in 5efe**, because 5efe is what turns
+    mmap on for SYCL (§F2a I-10). `lml:2120-2123` stops calling
+    `grow_to(weight->offs + n_size)`. It calls a new
+    `llama_mlock::lock_range(offs, size)` instead, which locks the tensor's own
+    range: outward to pages, except inward at any end whose page holds a
+    record-deferred byte. `llama_mlock` records the ranges it has locked, and
+    `grow_to` remains only for whole-buffer locks (`mlock_bufs`).
   - Qwen is immune (its table is all of shard 3). DeepSeek's layouts are
-    exposed (Q3_K_M shard 2; Q2_K shards 1 and 4), which is why the RED below
-    puts a lazy range before a locked tensor.
+    exposed (Q3_K_M shard 2; Q2_K shards 1 and 4), which is why both lock REDs
+    put a lazy range before a locked range.
 - **Until th32 lands**, lazy tables keep today's path (§2.5): the loader's lazy
   mapping, `MADV_RANDOM`, no prefetch, no lock.
   - The tier changes none of it, and the loader's mapping gets prefetch 0 on
     SYCL (§4.2), which can only reduce what is prefetched.
   - The tier never double-maps a lazy range beyond the one-page edge bound
     above.
-  - Upstream's prefix-lock defect still applies to a plain `CPU_Mapped` tensor
-    after a lazy range under `-lm mlock` (for example with `--no-host`). After
-    C4 no tensor of a default SYCL load takes that path, and th32 r15 m-3
-    classifies the defect as upstream's.
+  - The upstream prefix lock that §2.5 describes is fixed in C3 (above), so a
+    plain `CPU_Mapped` tensor after a lazy range under `-lm mlock` no longer
+    locks the range either.
 - **The residency gate** (C3; r1 I-1, §F2). It measures the page-cache
   residency of the **file**, never `mincore` on the tier's hole.
   - **Fixture.** A 64 MiB file in the build directory: tensor A (16 MiB), a
@@ -824,6 +929,28 @@ lifts it into `host_ledger_budget()`.
   - **Arm 4 (synchronous positive control).** `pread` 1 MiB inside the hole's
     interior, then the probe over that MiB must read resident. There is no
     polling and no `WILLNEED` race.
+  - **Arms 5 and 6 (read-around, forward and backward; addendum m-20).**
+    - Arm 5 faults the last mapped page before the hole, arm 6 the first
+      mapped page after it. Both are the real faulting pages, not addresses
+      the tier does not map.
+    - With the edge `MADV_RANDOM` in place, the hole interior must read 0.
+    - Each has a **control twin** with no edge advice, which must read
+      resident pages inside the hole. This shows the arm could fail.
+    - Precondition: `read_ahead_kb` of the fixture's backing device (the bdi
+      of its `st_dev`) must be nonzero. Otherwise both arms exit 77, since
+      with no read-around they would pass vacuously.
+    - Measured through the probe above, as §F2 I-1 requires.
+- **The loader-side gates** (addendum I-9, I-10). The same fixture and probe
+  are driven through libllama, with no SYCL:
+  - **`llama_mmap` prefetch exclusion.** Construct `llama_mmap` with
+    `prefetch = -1`, the `init_mappings(true)` case, and lazy ranges from a
+    record. Wait 10 s, then the hole interior must read 0. The mutant is an
+    **empty** record (the T6 diversion with ranges taken from `lazy_read`); it
+    must read resident within the same 10 s, polled.
+  - **The loader's ranged lock.** Lock a tensor that sits after the lazy
+    range through `llama_mlock::lock_range`; the hole interior must read 0. The
+    mutant is `grow_to`, the whole-prefix lock, which must read resident. The
+    test exits 77 if `RLIMIT_MEMLOCK` is below the fixture size.
   - **On Qwen** the lead gate is `fincore` on shard 3, which holds only the
     table (§2.5), against the bound pre-registered in §7 C4.
 
@@ -915,11 +1042,12 @@ fallback" as an unowned path.
   `unified_cache_raw_lock_file_segments` (`file-mapping.cpp`, an allowlisted
   site, §4.1), at `SYCL_Mapped` buffer creation, and only when the load mode
   locks and the segment's entry is host-executed.
-- **The loader's locks.** The loader's `mlock_bufs` (`lm:2782-2787`) and its
-  `lmlock` growth in `load_all_data` (`lml:2120-2123`) skip `SYCL_Mapped`
-  buffers. Otherwise `mlock_bufs` would lock the whole buffer, device sources
-  included, because `is_host` is true (r1 m-6). They keep applying to
-  `SYCL_Host` under `-lm mlock`.
+- **The loader's locks.** `mlock_bufs` (`lm:2782-2787`) and the per-tensor
+  lock in `load_all_data` (`lml:2120-2123`) skip `SYCL_Mapped` buffers.
+  Otherwise `mlock_bufs` would lock the whole buffer, device sources included,
+  because `is_host` is true (r1 m-6). They keep applying to `SYCL_Host`, and
+  the per-tensor lock becomes the ranged `lock_range`, not the prefix
+  `grow_to` (§4.6).
 - **Lock time.** `mlock` without `MLOCK_ONFAULT` faults the whole segment in
   synchronously. On Qwen that is about 100 GiB from the USB members at
   0.29-1.78 GB/s (th32 §2.4), so a locked load takes one to six minutes. That
@@ -1083,6 +1211,27 @@ The lead's GPU runs share one protocol (r1 I-7):
   - Today it fails on the four-initializer list.
   - It also checks that `lm:2693-2696` is still present, since C1 must not
     remove it.
+- **The lazy-range record (§3.1)** lands in C1 too, with two host-only tests
+  (`host;lazy`, `tests/`, libllama only, no device):
+  - `test-llama-lazy-range-record`:
+    - builds `llama_tensor_weight`s from a test-written GGUF of four tensors
+      in two files, two of them flagged `TENSOR_READ_LAZY`, and feeds them
+      through the record's fill function, the same call `create_tensor` makes;
+    - checks that the record's rows equal the flagged tensors' (file, offset,
+      size) exactly, that `deferral` is `LAZY_READ` under `-lzm on` and
+      `EAGER` under `off`, and that `lazy_read`'s `any()`, `has()` and
+      `for_file()` and the ranges passed to `llama_mmap` agree with the record;
+    - its RED is a mutant, compiled into the test binary only (libllama has
+      no private-testing switch, so the test links a copy of the record and
+      `lazy_read` sources built with a test-local define), in which
+      `lazy_read::add` keeps its own copy and the record's fill is skipped
+      for one tensor. The agreement check must fail naming that tensor.
+  - `test-llama-lazy-range-record-source` (`host;lazy;source-contract`):
+    - no consumer holds its own range container: `lazy_read` has no `ranges`
+      or `tensors` member, and `init_mappings` passes the record, not
+      `lazy.for_file`;
+    - `create_tensor`'s `TENSOR_READ_LAZY` branch calls the fill;
+    - today it fails on `llama-model-loader.h:118-119`.
 - Lead witness (r1 I-7):
   - Run Qwen on the B70 with **no** `-lm`/`-lzm` flags.
   - Stop the process with `kill` as soon as the log shows both
@@ -1131,18 +1280,36 @@ The lead's GPU runs share one protocol (r1 I-7):
     0 before a lock segment.
   - Mutants: inward map rounding (fails the shared-page read), outward
     `WILLNEED` rounding (fails the zero-lazy bound).
-- RED `test-sycl-file-mapping-residency` (`sycl;host`), §4.6's four arms. The
-  fixture lives under `${CMAKE_BINARY_DIR}`, which is not tmpfs. The test
-  exits 77 if the eviction precondition fails, and arm 2 exits 77 if
-  `RLIMIT_MEMLOCK` is below the fixture size. Arm 3 is the must-fail mutant.
+- RED `test-sycl-file-mapping-residency` (`sycl;host`), §4.6's six arms and
+  their control twins.
+  - The fixture lives under `${CMAKE_BINARY_DIR}`, which is not tmpfs.
+  - The test exits 77 if the eviction precondition fails, arm 2 exits 77 if
+    `RLIMIT_MEMLOCK` is below the fixture size, and arms 5 and 6 exit 77 if
+    `read_ahead_kb` is 0.
+  - Arm 3 and the arm 5 and 6 control twins are the must-fail cases.
+  - Arms 5 and 6 need the both-edge window: a mutant that advises only the
+    segment tail fails arm 6.
+- The loader's ranged lock (§4.6) also lands here, in libllama, with RED
+  `test-llama-mlock-ranged` (`host;lazy`). It is §4.6's loader lock gate: a
+  lazy range before a locked range, the hole interior reading 0, and the
+  whole-prefix `grow_to` mutant reading resident.
 - Lead: none.
 
 **C4. One published fact, the planner split, `SYCL_Mapped` and the loader**
 (§4.3, §4.4, §5.3). This lands as **one commit**, because the fact and its only
 consumers must land together (r1 C-1, I-5, §F2). It is the commit that changes
 every SYCL load.
+- **Prefetch 0 on SYCL is an explicit C4 item** (addendum I-9, m-6).
+  `init_mappings` is called with prefetch 0 on a SYCL load (`lm:2702`), and
+  `llama_mmap` excludes the record's deferred ranges with the both-edge
+  window whatever the prefetch value.
 - Host-only REDs:
+  - `test-llama-mmap-lazy-exclusion` (`host;lazy`), §4.6's `llama_mmap`
+    prefetch gate. Under `prefetch = -1` there is no `WILLNEED` over a lazy
+    range and no read-around into one. The mutant is an empty record (lazy
+    ranges from a diverted `lazy_read`), which must read resident.
   - `test-sycl-mapped-loader-source` (`sycl;host;source-contract`):
+    - prefetch 0 at the SYCL `init_mappings` call;
     - every site of the §4.3 table;
     - the caps loops before `llama_model_sycl_compute_early_plan`;
     - no `use_mmap` read in `create_tensor`'s SYCL buft choice;
@@ -1251,7 +1418,7 @@ Tickets to file after review: `-lm none` double residency (§6), and
 
 ---
 
-## Appendix A. Disposition of design-5efe-r1 (69e70c715..1d896f4b9, 1C/8I/18m)
+## Appendix A. Disposition of design-5efe-r1 (69e70c715..de6d0d614 with addendum, 1C/10I/20m)
 
 | finding | disposition | where |
 |---|---|---|
@@ -1271,7 +1438,7 @@ Tickets to file after review: `-lm none` double residency (§6), and
 | m-5 fd lifetime and replacement gap | Fixed: `dup` of the loader's fd, kept by the owner for `FADV_DONTNEED`; no reopen by path. | §4.1, §4.6 |
 | m-6 loader sites under-enumerated | Fixed: the §4.3 site table (hooks, `weight_buft_supported`, `make_cpu_buft_list`, `mlock_bufs`, the `init_mappings` prefetch) and the loader `lmlock` skip. | §4.2, §4.3, §5.1 |
 | m-7 null path unverified; AOS branch | Fixed: `resolve_or_host` aborts naming the tensor, with the eight callers audited and pinned, and `binbcast.cpp:394/794` cited. Both layout-availability branches are excluded for `SYCL_Mapped`. | §5.3 |
-| m-8 stale th32 pin | Fixed per §F2: pinned at rev 2q `1646da864`, the latest reviewed head; 2r `df6e83b3b` noted as unreviewed. Rulings relabelled §T13/§T13a/§T13c. | header, §4.6 |
+| m-8 stale th32 pin | Fixed per §F2: pinned at the latest reviewed head, now rev 2r `df6e83b3b` (r17 nits only); 2s `f364952d3` is noted as the revision that reads the record. Rulings relabelled §T13/§T13a/§T13c. | header, §4.6 |
 | m-9 F1 fold and cold set | Fixed per §F2: the yl3v/7v5c interface is stated, the recommendation removed, and the terms yl3v must read are named so that DeepSeek's cold set is not implicitly empty. | §4.5, §8 |
 | m-10 enum value collision | Fixed per §F2: the next free value at landing; censuses key on names. | §4.1, §4.8 |
 | m-11 allowlist unenforced | Fixed: `test-sycl-raw-mmap-allowlist-source` with today's eight sites, shared with th32 T1. | §4.1, §7 C2 |
@@ -1282,4 +1449,10 @@ Tickets to file after review: `-lm none` double residency (§6), and
 | m-16 64 MiB claim too broad | Fixed: scoped to `mem_copy`; the reorder, WOQ and XMX fill paths are listed as unchanged and bounded per source tensor. | §5.4 |
 | m-17 host_unified fails open | Fixed: `host_unified_known` added, and `mmap_support` requires it. | §3 |
 | m-18 storage_owner type; PER_DEVICE teardown | Fixed: `storage_owner` wraps the reservation's `mem_handle`; every model unloads on every device before any cache tears down. | §4.2 |
+| addendum I-2(a) §4.6 text wrong for map segments | Fixed per §F2a: already corrected at `1ddbd9d56` (map segments outward); rev 3 states it at the table, adds the `MADV_RANDOM` edge windows as an inward set, and says that only map segments round outward. | §4.6 |
+| addendum I-9 lazy_ranges source disappears after th32 T6 | Fixed per §F2a and §M49: one per-file lazy-range record, filled at `create_tensor` from the flag, owned by 5efe, landing in C1. `lazy_read`, th32's inventory, the tier and `llama_mmap` consume it and keep no copy. Prefetch 0 on SYCL is an explicit C4 item, with RED `test-llama-mmap-lazy-exclusion` (its mutant is an empty record). | §3.1, §4.6, §7 C1, C4 |
+| addendum I-10 tier and loader inherit the prefix lock | Fixed per §F2a: the tier `mlock(2)`s inward-rounded host-executed segments directly; `SYCL_Mapped` is excluded from `mlock_bufs`; §2.5 is corrected; `lml:2122` becomes a ranged `lock_range` in 5efe (C3). Host-only RED `test-llama-mlock-ranged` with a lazy range before a locked range and a whole-prefix mutant; the tier's arm 2 covers the tier side. | §2.5, §4.6, §5.1, §7 C3 |
+| addendum m-19 one-sided edge advice; residual undercounted | Fixed per §F2a: `MADV_RANDOM` windows on both edges, because read-around is centred on the fault. The loader's whole-file `llama_mmap` read-around is named as a second residual path, given the same record-fed window (C4), and bounded at one shared page per edge per mapping, plus bcachefs extent granularity inside the guard band. | §4.6 |
+| addendum m-20 readahead case could pass vacuously | Fixed per §F2a: arms 5 (forward) and 6 (backward) fault real mapped pages, exit 77 when `read_ahead_kb` is 0, each has a no-advice control twin that must populate the hole, and both are measured with `cachestat` or a test-owned mapping. | §4.6, §7 C3 |
+| §M49 note: record in C1 | Done: the record and its two host-only tests are C1 deliverables, so th32 T6 depends on C1 alone. | §3.1, §7 C1 |
 | th32 r15 m-4 (relayed) mlock prefix | Fixed: the tier's own per-segment `mlock` (named, and where), no `llama_mlock` for `SYCL_Mapped`, a residency arm under mlock, and a RED with a lazy range before a locked tensor. | §4.6, §5.1, §7 C3 |
