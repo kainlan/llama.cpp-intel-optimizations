@@ -83,8 +83,9 @@ Design, revision 7.14c. Author: impl-moua, 2026-09-27. The revisions answer fift
   7.14a's points, and the §M20 message that crossed 7.14a, recorded in §6.18.
 - design review r14 (design-moua-r14 on `8e1c5c094..44b4b9d66`, judged at 7.14a `9f68c61bd`:
   0 Critical, 6 Important, 11 Minor), the lead's rulings on it (§M25), §M23 and §M24 (23mk
-  4.7d's byte mirror and zhcn 5.11's relay) and §V13 m-2, recorded in §6.19. Revision 7.14c is
-  one commit on top of 7.14b (`44b4b9d66`).
+  4.7d's byte mirror and zhcn 5.11's relay) and §V13 m-2, recorded in §6.19, with r14's
+  addendum on 7.14b (m-12 to m-16). Revision 7.14c is two commits on top of 7.14b
+  (`44b4b9d66`): `f05d67195` and this one, which folds the addendum.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
@@ -2087,18 +2088,38 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       §M20 first quoted: the sizing code rounds each expert's scale block to 256 B (`:445-446`;
       259200 → 259328), 16384 B more in all, and the plan pre-registers what the code allocates
       (P4). The two print alike to one decimal, which is why the logs could not separate them.
-      **The load-stage ONEDNN zone, stepped from `ensure_planned_arena_zones`
-      (`unified-cache.cpp:4459-4500` at `3d9414c8c`), with the C term gone (rulings §M21.3,
-      §M22.2):** the zone is `max(268435456, stored)`, where `stored` is the `onednn_scratchpad`
-      charge (34.5 MB on GPT-OSS 120B, `gptoss120b-b1.log:202`; 49.0 MB on Qwen,
-      `glkg-qwen35b-a3b-b1.log:228`), and the 0oxf budget clamp, `max(available / 4, stored)`,
-      is about 3.6 GB on a 14618 MiB arena and does not bind. So the zone is **268435456 B** on
-      both shapes. Master's with-floor sum (34.5 + 96.0 MB; 49.0 + 64.0 MB,
-      `glkg-qwen35b-a3b-b1.log:229`) is also under 268435456 B, so removing the floor frees
-      **0 B** there, and the weight zones above are the load-stage figures unchanged. The
-      weight zone absorbs the floor's bytes only on a shape whose with-floor sum exceeded the
-      minimum, and then exactly `with_floor − max(268435456, stored)`; H7ap's C-rule arm uses
-      such a fixture (the minimum precondition, §M22.2).
+      **The load-stage ONEDNN zone, with the C term gone (rulings §M21.3, §M22.2, §M25 I-1):**
+      by step 4's rule the zone is **`max(268435456, onednn_scratchpad + onednn_pp_w)`**, over
+      every ONEDNN term (r14 m-12). `onednn_scratchpad` is moua's per-device maximum, so it is
+      **at most** master's inventory-wide value, 34.5 MB on GPT-OSS 120B
+      (`gptoss120b-b1.log:202`) and 49.0 MB on Qwen (`glkg-qwen35b-a3b-b1.log:228`), an upper
+      bound, not the charge itself (r14 m-16); 23mk's `onednn_pp_w` is 23592960 B on the 120B
+      fixture and under the floor on Qwen's (23mk H3). Both sums are under 268435456 B, so the
+      zone is **268435456 B** on both shapes. Master's with-floor sum (34.5 + 96.0 MB; 49.0 +
+      64.0 MB, `glkg-qwen35b-a3b-b1.log:229`) is also under 268435456 B ("oneDNN
+      256.0->256.0", `gptoss120b-b1.log:184`, `glkg-qwen35b-a3b-b1.log:210`), so removing the
+      floor frees **0 B** there, and the weight zones above are the load-stage figures unchanged.
+      The weight zone absorbs the floor's bytes only on a shape whose with-floor sum exceeded
+      the minimum; H7ap's C-rule arm uses such a fixture (the minimum precondition, §M22.2).
+      **The 0oxf clamp is deleted with the floor (r14 m-13).** Master bounds the ONEDNN zone by
+      `max(available / 4, stored)` (`unified-cache.cpp:4476-4500`); its comment says it exists
+      to bound the Graph-scratch floor. Without the floor, `max(256 MiB, stored)` is at most
+      that cap whenever `available / 4 ≥ 256 MiB`, so it cannot bind there, and the sized
+      ensure takes the ledger's bytes, which the pack already charged against the capacity
+      that remained, so a clamp below them would break plan == reality (P4). The dry run's
+      `ensure_planned_arena_zones` loses the clamp in the same commit, so the two sides size
+      alike. **The gates and comments that name the with-floor getter's load-stage role move
+      in the same commit (r14 m-14):** `tests/test-sycl-onednn-graph-allocator-source.py`'s
+      `WITH_FLOOR_GETTER_BODY_CODE` extraction (`:475-481` at `c69d5774d`) and its "graph
+      scratch zone floor is additive" check (`:840-846`) re-anchor on the function that holds
+      the floor branch after the move, 23mk's context-transaction sizing, and a new check
+      asserts that `ensure_planned_arena_zones` and the plan's twin read the stored getter;
+      the "WITH-FLOOR getter, deliberately" comments at `unified-cache.cpp:4461-4463` and
+      `:27654-27656` and the two-getter note at `unified-cache.hpp:1644-1650` are rewritten to
+      say the load stage reads the stored getter; and the fixture assertion at
+      `ggml/src/ggml-sycl/tests/test-unified-runtime-alloc.cpp:996`, "inventory would exceed
+      the conservative ONEDNN tail bound", reads the stored getter, since it bounds the
+      load-stage tail.
       So the early stage packs against the zones it admits, and B's ranges are recorded inside
       them. **The shared rule (rulings §Z8 I-3, §M13a): the sentence is this design's, the
       message is 23mk's, and each design mirrors both byte for byte.** The sentence: "an arena
@@ -5899,18 +5920,25 @@ L7 documents this limit, and pattern #2 remains the remedy.
       fixture's scratchpad maximum, pre-registered by stepping the sizing at `:15946`). 7.14's
       mutant dropped `onednn_graph_scratch`, which is class C since §Z15 and is 0 at the load
       stage, so it moved; 23mk keeps its own `moe_ptr_table` mutant, and both stand. **The C
-      rule** (§2.4.5): a mutant that keeps the graph-scratch floor in the load-stage getter
-      (`unified-cache.cpp:2148-2160`) fires the same witness on the same fixture, naming ONEDNN
-      and the floor's bytes, since step 3 charges no C term. On the correct tree the same
-      fixture's load-stage ONEDNN zone is exactly `max(268435456, stored)` B and its weight zone
-      is larger than master's by exactly `with_floor − max(268435456, stored)` B, both computed
-      from the fixture's stepped terms and scored in bytes (rulings §M21.3); on the merge-gate
+      rule** (§2.4.5): the mutant reverts the load-stage reads at `unified-cache.cpp:4464` and
+      `:27658` to the with-floor getter (`:2148-2160`) (r14 m-15 (a)). Step 4 is sized from the
+      ledger, which charges no C term, so only the dry run reads the reverted getter; it fires
+      the same witness on the same fixture, naming ONEDNN and the floor's bytes. (Citing the
+      getter's body alone would mutate code the load path no longer executes, and the arm
+      would be void.) On the correct tree the same fixture's load-stage ONEDNN zone is exactly
+      `max(268435456, onednn_scratchpad + onednn_pp_w)` B, and its weight zone is larger than
+      master's by exactly master's ONEDNN zone minus that, where **master's zone is read from
+      master's own ensure on the same fixture**, clamp included (`min(with_floor,
+      max(available / 4, stored))`, `unified-cache.cpp:4476-4500`), never the unclamped
+      with-floor sum (r14 m-15 (b)); the arm also asserts master logged no clamp WARN
+      (`[VRAM-ARENA] planned ONEDNN zone ... clamping`) on the fixture, or it uses the clamped
+      figure. Both are scored in bytes (rulings §M21.3); on the merge-gate
       shapes that difference is 0 B (§2.4.2 (b), "The end states"). A context on the same
       fixture then places the graph scratch once, as a head slot inside its `REGION` ranges,
       and no zone grows after the load (rulings §M25 I-6; 23mk's transaction does the charge,
-      and this arm asserts only the room). 7.14 pre-registered this
-      mutant with 96 MB on GPT-OSS's shape, where it cannot fire, for the reason above. The source-contract gate fails on a
-      `unified_cache_set_planned_*` setter with no enum value;
+      and this arm asserts only the room). 7.14 pre-registered this mutant with 96 MB on
+      GPT-OSS's shape, where it cannot fire, for the reason above. The source-contract gate
+      fails on a `unified_cache_set_planned_*` setter with no enum value;
     - **a secondary device is charged its attention shape (r13 I-F (5), m-d; rulings §Z15):** a
       two-device plan whose `dev_layer` puts attention layers on device 1. Step 2 ensures device
       1 before the loop packs, the pack charges `nonfa_shape` to device 1 at the first attention
@@ -7922,6 +7950,19 @@ pins: 23mk `026b69b86` (rev 4.7d, second commit), zhcn `2c511f6` (rev 5.11), 1ox
 | §M24 (3) | the §6.11 streaming gate keys on `zone_backed()` | 23mk's §6.11 gate on 1oxa rev 10's predicate; this design has no streaming gate of its own to re-key, so no change here. |
 | §M24 (4) | zhcn 5.11: H4 (b) names only the growing setter; one probe literal | **Already so** since 7.14a (§6.17 relay 3); H4 (b) now cites zhcn 5.11 (`2c511f6`) and inherits its VOID positive control (zhcn r11 m-13). |
 | §V13 m-2 | planned copies can be OPTIONAL | **Already so** since 7.14a; §6.16's I-D row and its 7.14 note are marked superseded by §M18.3a. |
+
+**r14's addendum on 7.14b (second commit).** Its two checks hold: the load-stage ONEDNN zone is
+268435456 B on both merge-gate shapes, and the C-rule arm's fixture lifts ONEDNN above the
+minimum. Its I-6 residual (the other C rows name no context-time room) is closed by the first
+commit: every C row, `mmid_workspace` included, names the context's `REGION` headroom.
+
+| id | finding | disposition |
+|----|---------|-------------|
+| m-12 | the ONEDNN formula leaves out `onednn_pp_w` | **Fixed.** The load-stage zone is `max(268435456, onednn_scratchpad + onednn_pp_w)`, over every ONEDNN term; 268435456 B on both shapes, with 23mk's H3 value for W. |
+| m-13 | the 0oxf clamp can no longer bind at the load stage | **Deleted** with the floor, in `ensure_planned_arena_zones` too: its comment says it bounds the Graph-scratch floor, `max(256 MiB, stored)` stays under its cap whenever `available / 4 ≥ 256 MiB`, and a clamp below the ledger's charged bytes would break P4. |
+| m-14 | the with-floor getter's gates and comments are not named | **Named for the same commit:** the allocator source gate's `WITH_FLOOR_GETTER_BODY_CODE` extraction (`:475-481`) and additive-floor check (`:840-846`) re-anchor on 23mk's context-time sizing, with a new check that the two load-stage reads use the stored getter; the comments at `unified-cache.cpp:4461-4463`, `:27654-27656` and `unified-cache.hpp:1644-1650` are rewritten; `test-unified-runtime-alloc.cpp:996` reads the stored getter. |
+| m-15 | the C-rule mutant mutates code the load path no longer runs; the baseline ignores the clamp | **Fixed.** (a) The mutant reverts `unified-cache.cpp:4464` and `:27658` to the with-floor getter; with step 4 sized from the ledger (§M25 I-2), only the dry run reads it, and it fires. (b) The baseline is master's own ensure output on the fixture, clamp included, and the arm asserts master's clamp WARN absent or uses the clamped figure. |
+| m-16 | 34.5 / 49.0 MB are master's inventory-wide values | **Fixed:** "at most", named as upper bounds of moua's per-device maximum. |
 
 **Noted for the lead (7.14c).**
 - **`onednn_pp_a`'s room.** §M25 I-6 names `REGION` headroom for every C row, `onednn_pp_a`
