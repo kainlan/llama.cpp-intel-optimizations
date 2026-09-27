@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Host-fit calculator behind docs/design/sycl-storage-tier-lazy-tables.md §4.5
-# (llama.cpp-th32, rev 2y). Hand arithmetic only: llama.cpp-7v5c (T27's
+# (llama.cpp-th32, rev 2z). Hand arithmetic only: llama.cpp-7v5c (T27's
 # host-only plan dry-run) replaces every number here once it exists.
 #
 #   python3 docs/design/sycl_storage_tier_host_fit.py
