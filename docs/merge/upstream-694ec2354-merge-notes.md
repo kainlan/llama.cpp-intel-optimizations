@@ -200,9 +200,22 @@ CLI: the flag is `-lzm, --lazy-mode <on|auto|off>` in `common/arg.cpp` and
   the default devices. `test-recurrent-state-rollback-kimi-k3` is new, also
   `main`. Both depend on the `generate-models` fixture (`test-llama-archs -o`,
   which also builds every arch's model on the default devices). None of them
-  pins a selector, and the CLAUDE.md "form 2" full sweep
-  (`-LE 'residency|mem-handle|cache' -E '^test-backend-ops$'`) selects all of
-  them. Treat them like `test-llama-archs`: pinned, single run, lead only.
+  pins a selector, and before this merge the CLAUDE.md "form 2" full sweep
+  (`-LE 'residency|mem-handle|cache' -E '^test-backend-ops$'`) selected all of
+  them. It also selected four loaders that were there before the merge and
+  need a downloaded model: `test-thread-safety`,
+  `test-sycl-model-lifecycle-hooks`, `test-state-restore-fragmented` and
+  `test-eval-callback`. Treat them like `test-llama-archs`: pinned, single
+  run, lead only.
+- Fixed in the follow-up commit. `scripts/check-ctest-safety-net.sh` now
+  derives the loader set from the registration. A loader is any test with
+  `FIXTURES_REQUIRED`, or a fixture setup that runs a binary rather than
+  cmake. The guard fails naming each loader the documented sweep selects, and
+  also fails if CLAUDE.md stops carrying the sweep's exact `-E`. CLAUDE.md
+  form 2 and PR step 3 now exclude all ten loaders by name.
+  `tests/merge-guards/test-ctest-safety-net.sh` drives it with hermetic REDs
+  plus one real-build RED: drop `test-save-load-state` from the exclusion, and
+  the guard fails naming only that test.
 
 ## Host-only gates run on the merge
 

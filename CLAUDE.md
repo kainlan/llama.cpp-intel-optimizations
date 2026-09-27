@@ -80,8 +80,11 @@ ctest --test-dir build -R <name-or-regex> --output-on-failure
 
 # 2. Full suite. `-j 1` is NOT a typo and NOT negotiable -- see below.
 #    Check `uptime` first; never on a loaded machine.
+#    Run the guard first: it derives every model-loading ctest from the
+#    fixture registration and fails naming any that this command still selects.
+bash scripts/check-ctest-safety-net.sh --build-dir build
 ctest --test-dir build --output-on-failure -j 1 \
-      -LE 'residency|mem-handle|cache' -E '^test-backend-ops$'
+      -LE 'residency|mem-handle|cache' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
 
 # 3. The excluded family, serially, with monitoring. Manually only -- never in
 #    a subagent or background task. NOTE the label is 'cache|mem-handle', NOT
@@ -154,13 +157,46 @@ anything nobody remembered to tag, so it fails *open*:
 
 ```bash
 # Always confirm what a filtered sweep will actually run before running it.
-ctest --test-dir build -N -LE 'residency|mem-handle|cache' | grep backend-ops
-# ^ must print NOTHING once -E is added; if it prints a line, do not run the sweep.
+bash scripts/check-ctest-safety-net.sh --build-dir build
+# ^ must print "safety net intact"; if it names a test, do not run the sweep.
 ```
 
 Adding `LABELS "cache"` to that registration would also fix it, but it is
 upstream code that a rebase would silently revert, and the failure mode of
 losing the fix is an OOM. Excluding by name is the safer belt.
+
+⚠️ **Since the 694ec2354 upstream merge (llama.cpp-n77l), `test-backend-ops` and
+`test-llama-archs` are not ctests at all** — upstream registers both with
+`llama_build` only. So `ctest -R '^test-backend-ops$'` and
+`ctest -R '^test-llama-archs$'` select nothing and "pass" having run nothing, and
+`-E '^test-backend-ops$'` excludes nothing. (It stays in form 2's `-E` as a belt
+in case upstream registers the binary again.) Run both as binaries, pinned, one
+run at a time:
+
+```bash
+ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ./build/bin/test-llama-archs -a llama; echo "rc=$?"
+ONEAPI_DEVICE_SELECTOR=level_zero:0   ./build/bin/test-backend-ops
+```
+
+The same merge **added model loaders under the default `main` label**. Among them:
+
+- `test-generate-models`, the `generate-models` fixture setup, which runs
+  `test-llama-archs -o` to write every arch's model;
+- `test-save-load-state`, which loads every generated arch in one process;
+- the `test-recurrent-state-rollback*` family.
+
+None of them pins a selector, so on this host they run on the iGPU too. The
+older `-E '^test-backend-ops$'` form of the sweep selected all of them. It also
+selected four loaders that need a downloaded model: `test-thread-safety`,
+`test-sycl-model-lifecycle-hooks`, `test-state-restore-fragmented` and
+`test-eval-callback`.
+
+`scripts/check-ctest-safety-net.sh` now derives the loader set from the
+registration. A loader is any test with `FIXTURES_REQUIRED`, or a fixture setup
+that runs a binary rather than cmake. The guard fails naming each loader that
+form 2 still selects, and it fails if this file stops carrying form 2's exact
+`-E`. When it names a new test, add that test to the `-E` here and in the
+script's `SWEEP_E_DEFAULT`, together.
 
 ⚠️ **`test-backend-ops` is not the only unlabelled member of that family.**
 `test-llama-archs` also carries only `main`, and **looping it exhausts host
@@ -170,6 +206,9 @@ memory the same way**. Measured 2026-07-30: two separate global OOMs
 ```bash
 ctest --test-dir build -R '^test-llama-archs$' --output-on-failure   # ~36 s, fine ONCE
 ```
+
+(That was the registration then. The command now selects nothing; see the
+n77l note above, and run the binary instead.)
 
 Both show the TTM-shmem signature this file documents for `test-backend-ops`:
 `shmem:238266228` kB ≈ **227 GB** of 255 GB total, `inactive_anon` 227.8 GB (the
@@ -1363,12 +1402,16 @@ Common diagnostics: `GGML_SYCL_DEBUG=1` (verbose dispatch), `GGML_SYCL_NAN_CHECK
      form operates on the whole index and would reformat their files
    - **never** `clang-format-19 -i <file>` — ~180 lines of unrelated pre-existing drift
 2. Build: `./scripts/sycl-build.sh`
-3. Test: use a form from "Running Tests" above — **not** a bare
-   `ctest --test-dir build --output-on-failure`, which runs `test-backend-ops`
-   and so contradicts step 4. Prefer `-R <what your change gates>`; for a full
-   sweep use form 2 verbatim — `-j 1` **and** `-E '^test-backend-ops$'`. Do not
-   raise `-j` to save time; it is a memory multiplier and has OOM'd this host.
-4. For ggml changes: Run `test-backend-ops` on multiple backends — **manually only, never in a subagent/background task (memory-exhaustion hazard, see Hard-Won Rules)**
+3. Test: use a form from "Running Tests" above. Never use a bare
+   `ctest --test-dir build --output-on-failure`: it runs every model-loading test
+   on every device, the iGPU included. Prefer `-R <what your change gates>`. For
+   a full sweep, run `bash scripts/check-ctest-safety-net.sh --build-dir build`
+   first, then form 2 verbatim:
+   `-j 1 -LE 'residency|mem-handle|cache' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'`.
+   Do not raise `-j` to save time; it is a memory multiplier and has OOM'd this host.
+4. For ggml changes: run `test-backend-ops` on multiple backends. It is a binary, not
+   a ctest (`ctest -R test-backend-ops` selects nothing), so run
+   `ONEAPI_DEVICE_SELECTOR=level_zero:N ./build/bin/test-backend-ops` — **manually only, never in a subagent/background task (memory-exhaustion hazard, see Hard-Won Rules)**
 5. Verify correctness: run the canonical completion gate (Hard-Won Rules) — tokens must be right, not just fast
 6. Verify performance: `llama-bench` and `llama-perplexity` should not regress
 
