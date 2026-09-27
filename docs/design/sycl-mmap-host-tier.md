@@ -1,7 +1,10 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 3f, not implemented. rev 3f is a new commit on rev 3e
-(`fb063e845`). It folds design-5efe-r4 as re-graded at
+*Status: DESIGN rev 3g, not implemented. rev 3g is a new commit on rev 3f
+(`b3c08be71`). It folds design-5efe-r5 (`fb063e845..b3c08be71`,
+0C/2I/10m/2n) with lead rulings §M63 (a), §M66, §M68 (a) and §M69 (a)-(d);
+Appendix B's "design-5efe-r5" table keys each item to r5's IDs. rev 3f is a
+new commit on rev 3e (`fb063e845`). It folds design-5efe-r4 as re-graded at
 `3763bb164..fb063e845` (0C/3I/12m/1n), lead rulings addendum 11, §M60,
 §M61 (d) and §M62 (A)-(E), and 23mk rev 4.16's relay on
 `unified_cache_grow_host_scratch_zone`; Appendix B's "design-5efe-r4" table
@@ -91,7 +94,7 @@ The owner asked why SYCL disables mmap. There are **two** switches, not one:
 1. **The caps slip** (the known root cause). Upstream `153d324bc` added
    `ggml_backend_dev_caps::mmap_support`. The fork's
    `ggml_backend_sycl_device_get_props` lists four initializers
-   (`gs:108003-108008`), so the fifth is value-initialized to `false`, and
+   (`gs:108004-108009`), so the fifth is value-initialized to `false`, and
    `lm:2245-2265` then resolves `-lm auto` to `none` and `-lzm auto` to `off`
    on every SYCL load, discrete cards included.
 2. **The fork's own override.** `lm:2693-2696` sets `ml.use_mmap = false` for
@@ -151,6 +154,7 @@ This design therefore does four things:
 (`level_zero:0`) under default load flags, and every figure below was
 pre-registered before the run:
 
+- the answer on stdout contains `Paris` (§7 C4 step 2);
 - the WEIGHT zone is 64.0 MB, and it never grows after the pre-size;
 - the pre-size commits 3 chunks, 6144.0 MB, for a 3579.2 MB base working
   set and a 91.9 MB runtime need, scored on those printed figures (§4.4);
@@ -384,7 +388,7 @@ None of it refers to a `llama_mmap` page today:
 ## 3. Commit 1: the caps restore (item 2)
 
 ```cpp
-// gs:108003, ggml_backend_sycl_device_get_props
+// gs:108004, ggml_backend_sycl_device_get_props
 ggml_backend_sycl_device_context * ctx = (ggml_backend_sycl_device_context *) dev->context;
 const auto & info = ggml_sycl_info().devices[ctx->device];
 props->caps = {
@@ -768,6 +772,12 @@ The lead's ruling:
   (`task/th32` carries or merges `task/5efe`'s C1), and the merge to master
   happens once, after both are reviewed. The tracker blocks the merge of 5efe
   C1 on th32 T6.
+- **The merge unit** (r5 m-10; addendum 8 (b), addendum 11 (3)). 5efe C1-C4
+  and th32 T6 and T7 reach master in **one** merge. C4's Qwen arms are VOID
+  without T6 and T7 (§7 C4 step 2), and C4 depends on th32's scope because
+  it travels in that train. So "VOID without T6/T7" is a state of the
+  branch, never of master, and nothing here assumes C1 reaches master
+  alone.
 - The interim-`EAGER` alternative is refused: it breaks addendum 4's iff and
   creates a second source for `deferral`.
 - No lead-run gate of C1 reads the table (W1-W3 are killed first, and the
@@ -1273,10 +1283,18 @@ created") describes a path that does not run.
     `uch:6907`, named in the comment at `uc:27716`; its call is
     `gs:19145`). C4's notify does not call it: it is additive and resolves
     device 0 (`uc:21935-21940`), and §M57 (c) needs a high-water on the
-    host buft's device (below). So whichever of C4 and 23mk's step 7 lands
-    second deletes it with its declaration, C4 rewrites the `uc:27716`
-    comment to name `unified_cache_ensure_host_scratch_capacity`, and C4's
-    source gate fails if anything calls it once both have landed.
+    host buft's device (below).
+  - **C4 alone deletes it** (§M68 (a); r5 m-5). C4 removes its one call,
+    `gs:19145`, from `ggml_backend_sycl_notify_compute_buffer_sizes`,
+    deletes its definition (`uc:21935`) and declaration (`uch:6907`), and
+    rewrites the `uc:27716` comment to name
+    `unified_cache_ensure_host_scratch_capacity`. C4 does **not** delete
+    `ggml_backend_sycl_notify_compute_buffer_sizes`: that function is 23mk
+    step 7's, and step 7 cites C4. rev 3f's "whichever of C4 and 23mk's
+    step 7 lands second" is withdrawn. C4's source gate asserts zero
+    callers **and** zero definitions of the symbol, in both states of the
+    tree: with step 7 not yet landed, where the dead function is present
+    without the call, and with it landed, where the function is gone.
   - **C4 adds a host-only entry point:**
 
     ```c
@@ -1477,6 +1495,24 @@ created") describes a path that does not run.
         remain. Today the holders are released before that point, so the
         check passes on every run. It carries weight once dsab moves the
         release there.
+      - **The staging slots follow the same count** (§M69 (c); r5 I-2
+        (2)). Today every backend free zeroes every device's slots,
+        capacity included (`gs:84011` -> `gs:7583` -> `gs:82204` ->
+        `ggml_sycl_attn_host_staging_free_all`, `gs:82102-82108`). With
+        C4's plan that is no longer self-healing: a surviving context's
+        slots would be at capacity 0, and its next host dispatch refuses.
+        The rule: with dsab, the slots are released only when the **last**
+        backend on their device is freed, by the per-device live-backend
+        count C4 adds for the `DEVICE` check, and no backend free zeroes
+        another live backend's slots. dsab's fix adopts that count for the
+        pools and the staging together; the count is C4's, the release move
+        is dsab's.
+      - Until dsab lands, the premature release reaches C4's plan only as a
+        refusal, which now fails the graph (§M69 (b)), never as wrong
+        tokens. It needs the host dispatch on and a SYCL backend freed after
+        `sched_reserve`. A dispatch-on arm on a tree without dsab that
+        prints the refusal with `planned 0 B` is **VOID** and reported as
+        dsab's, not scored against C4.
   - **Each lifetime keeps a leak check at its owner's boundary.** A record
     still live at its owner's boundary prints `[HOST-ZONE] leaked
     <CONTEXT|MODEL|DEVICE> record: <cohort> <bytes> owner=<id>`. It is a
@@ -1493,11 +1529,11 @@ created") describes a path that does not run.
     first. That is outside the PP/TG phase gate (`pinned-pool.cpp:619-640`).
   - **`DEVICE` holders** register a demand keyed by (device, holder)
     through an internal call, `unified_cache_host_scratch_demand(owner,
-    bytes)`, before they allocate, on the same ledger as the context
-    demands. The two pools size their buffers at first `MUL_MAT_ID`
-    initialization (`gs:9024-9037`) from `max_dispatch_count` (top-K times
-    tokens, over the graph's `MUL_MAT_ID` nodes, `gs:8024-8030`), `max_K`
-    and `max_N` (`gs:8018-8023`):
+    bytes)`, on the same ledger as the context demands. The two pools size
+    their buffers at first `MUL_MAT_ID` initialization (`gs:9024-9037`)
+    from `max_dispatch_count` (top-K times tokens, over the graph's
+    `MUL_MAT_ID` nodes, `gs:8024-8030`), `max_K` and `max_N`
+    (`gs:8018-8023`):
     - `PinnedBufferPool`: D x (K + N) x 4 B (`pinned-buffer-pool.cpp:38-39`);
     - `CpuExpertPool`: 4 ring slots x D x (K + N) x 4 B
       (`cpu-expert-pool.cpp:56-59`, `RING_SLOTS = 4`, `cpu-expert-pool.hpp:89`).
@@ -1505,51 +1541,128 @@ created") describes a path that does not run.
     Each `DEVICE` registration prints `[HOST-ARENA] SCRATCH demand
     holder=<name> dev=%d bytes=%.1f MB total=%.1f MB grown=%.1f MB`, so the
     zone-3 criterion below sees it beside the context demands.
+    - **The pools' demand is planned in `sched_reserve`, not at first
+      use** (r5 m-7). `moe_hybrid_init_once` runs from `graph_compute`
+      (`gs:105477`) after it has set the offload phase (`gs:105352`), so a
+      demand registered there would ensure capacity inside PP, under the
+      phase gate (`pinned-pool.cpp:625-640`). C4 extracts the dimension
+      scan of `gs:7952-8030` (`max_dispatch_count`, `max_K`, `max_N`, with
+      its `ggml_sycl_host_data(src0)` filter) into one function that both
+      `moe_hybrid_init_once` and the plan walk below call, so the two
+      cannot disagree (P4). The plan walk runs it over each device's
+      `MUL_MAT_ID` nodes of the reserve graphs, whose `n_tokens` is
+      `n_ubatch`, and registers the two pools' demand from its result.
+    - At first use, `moe_hybrid_init_once` allocates from its own graph's
+      dimensions, which do not exceed the reserve graphs' at the same
+      top-K. A warmup graph's all-experts `ids` (`gs:8001-8004`) at 2
+      tokens stays under top-K x `n_ubatch` for both lead models (Qwen 2 x
+      512 = 1024 against 10 x 512 = 5120; GPT-OSS 2 x 32 = 64 against 4 x
+      512 = 2048). If an allocation does exceed its planned figure,
+      `moe_hybrid_init_once` prints `[HOST-ARENA] DEVICE holder %s dev=%d
+      allocation %.1f MB exceeds its planned %.1f MB` (WARN) before it
+      allocates, so the grow that follows is named, never silent.
   - **The attention host staging is planned from `n_ctx` at context
-    creation** (§M62 (E); r4 m-4). Today each slot of
+    creation, when the host dispatch is on** (§M62 (E), §M69 (a); r4 m-4,
+    r5 I-1). Today each slot of
     `g_attn_host_staging[dev][kind]` grows in 1 MiB steps whenever a
     request exceeds its capacity (`gs:82037-82065`), and the mask slot's
     request grows with `n_kv` during decode. Under ensure-capacity that no
     longer commits a chunk per step, but a request that crosses committed
     capacity during decode would commit a chunk of at least 2048 MB inside
     the PP/TG phase gate (`pinned-pool.cpp:619-640`).
-    - **The plan.** In `sched_reserve`, after the size-only reserves the
-      notify already runs, `llama_context` walks the pp and tg reserve
-      graphs. They are built on `memory->init_full()` (`lc:2027`), so
+    - **The plan follows the switch that runs the staging** (§M69 (a); r5
+      I-1). The staging's only user is the host attention dispatch
+      (`gs:82450-82455`, `:82645-82650`, `:82847-82849`), which is opt-in:
+      `ggml_sycl_attn_host_dispatch_enabled()` is false unless
+      `GGML_SYCL_ATTN_HOST_DISPATCH` is set (`gs:81901-81917`), and both
+      interceptions test it (`gs:83014-83016` for `FLASH_ATTN_EXT`,
+      `:83022-83024` for `SET_ROWS`). With it off, demoted-layer attention
+      runs on the scheduler's CPU split (`gs:81896-81900`), in the CPU
+      backend's compute buffer, which the notify covers. That default is
+      placement deciding the executor (P3): host KV, so the CPU runs the op.
+      So with the switch off the plan registers **no** staging demand, grows
+      no slot, and prints `[ATTN-HOST] staging not planned (host dispatch
+      off)` once per process, at WARN. Anything else would be an idle
+      reservation (P4).
+    - **The plan walk is SYCL-side** (r5 m-6, §M69 (d)). In `sched_reserve`,
+      right after each of the pp and tg reserves (`lc:2055`, `:2080`),
+      before the next `graph_reserve` resets the scheduler (`lc:3875`),
+      `llama_context` passes the scheduler and the graph to one exported
+      entry point, `bool
+      ggml_backend_sycl_plan_host_holders(ggml_backend_sched_t sched,
+      struct ggml_cgraph * graph)`. It is looked up by name like the notify,
+      and a `NULL` lookup WARNs and continues. Both arguments are ggml-base
+      handles, as with the existing `ggml_backend_sycl_set_sched_placement_plan(sched)`
+      (`lc:111-116`), and no llama type crosses. It was
+      `ggml_backend_sycl_plan_host_attn_staging(backend, five sizes)` in
+      rev 3f, and §M69 (a) names it so; it is renamed because it now also
+      plans the pools (m-7 above).
+    - The reserve graphs are built on `memory->init_full()` (`lc:2027`), so
       `n_kv` is the whole cache and `n_tokens` is `n_ubatch`: the largest
-      request any prefill or decode of this context can make. Per kind it
-      takes the largest `ggml_nbytes` of the operand the dispatch stages,
-      the same calls the dispatch makes: for each `FLASH_ATTN_EXT` node
-      whose K is in a host buffer (`ggml_backend_buffer_is_host`), Q
-      (`src[0]`), DST (the node) and MASK (`src[3]`)
-      (`gs:82389-82392`, `:82424-82426`); for each `SET_ROWS` node whose
-      destination is in a host buffer, VAL (`src[0]`) and IDS (`src[1]`)
+      request any prefill or decode of this context can make. For each node
+      the SYCL side reads the backend the scheduler assigned it
+      (`ggml_backend_sched_get_tensor_backend`), skips any that is not a
+      SYCL backend, and takes that backend's `device`: the device whose
+      `ctx.device` the dispatch indexes its slots by (`gs:82358`,
+      `:82844`). One fact, one source: the device that dispatches owns the
+      slot (§M69 (d)).
+    - It selects nodes with the dispatch's own predicate, not a second one
+      (r5 m-6): `FLASH_ATTN_EXT` where `ggml_sycl_tensor_is_in_kv_host_buft`
+      holds for K or V (`src[1]`, `src[2]`), and `SET_ROWS` where it holds
+      for the node, exactly the tests at `gs:83014-83016` and
+      `:83022-83024`. That predicate resolves `view_src` first
+      (`gs:108235-108241`). K is a view of the cache, and a view's `buffer`
+      is `NULL` at creation (`ggml.c:1817`), while the cache tensor it
+      views was allocated at context init. `ggml_backend_buffer_is_host`,
+      rev 3f's predicate, is also true of CPU and `SYCL_Host` buffers the
+      dispatch never stages (`-nkvo`, CPU-assigned layers).
+    - Per (device, kind) it takes the largest `ggml_nbytes` of the operand
+      the dispatch stages, the same calls the dispatch makes: Q (`src[0]`),
+      DST (the node) and MASK (`src[3]`) for attention (`gs:82389-82392`,
+      `:82424-82426`); VAL (`src[0]`) and IDS (`src[1]`) for `SET_ROWS`
       (`gs:82823-82824`, `:82839-82840`).
-    - It passes the five figures through a second scalar-only entry point,
-      exported by name like the notify: `bool
-      ggml_backend_sycl_plan_host_attn_staging(ggml_backend_t backend,
-      size_t q_bytes, size_t dst_bytes, size_t mask_bytes, size_t
-      val_bytes, size_t ids_bytes)`. A `NULL` proc lookup WARNs and
-      continues, as the notify's does.
-    - The SYCL side rounds each figure by the slot rule (`bytes + 64`, up to
-      1 MiB, `gs:82043`) and registers their sum as the staging's `DEVICE`
-      demand on the helper's device, a high-water over the live contexts.
-      It ensures SCRATCH capacity for it, then grows each slot to its
-      planned capacity through the existing grow code, with `req.device`
-      from the helper (today `-1`, `gs:82048`). All of that runs in
-      `sched_reserve`, before the first `graph_compute` and outside the
-      PP/TG phase, and prints `[ATTN-HOST] planned staging dev=%d q=%zu
-      dst=%zu mask=%zu val=%zu ids=%zu total=%.1f MB` at INFO.
+    - It rounds each figure by the slot rule (`bytes + 64`, up to 1 MiB,
+      `gs:82043`), keeps a per-slot high-water over the live contexts, and
+      registers the slots' sum as the staging's `DEVICE` demand **on the
+      dispatching device's cache**. It ensures SCRATCH capacity for it,
+      then grows each slot to its planned capacity through the existing
+      grow code, with `req.device` set to the dispatching device (today
+      `-1`, `gs:82048`). All of that runs in `sched_reserve`, before the
+      first `graph_compute` and outside the PP/TG phase, and prints
+      `[ATTN-HOST] planned staging dev=%d q=%zu dst=%zu mask=%zu val=%zu
+      ids=%zu total=%.1f MB` at INFO, once per device. A device with no
+      selected node plans nothing for it.
     - **At dispatch no slot grows.** On the persistent path, `bytes >
       slot.cap` is a request beyond the plan. C4 replaces the grow there
       with a named refusal, `[ATTN-HOST] staging request %zu B for kind %s
       exceeds the planned %zu B on device %d; declining host dispatch`
       (WARN), and returns `nullptr` to the existing declines
       (`gs:82458-82461`, `:82653-82656`, `:82851-82854`). A slot that was
-      never planned (capacity 0, as with a stale `libllama` that has no plan
-      call) refuses the same way, by name, rather than growing unplanned.
-    - So the staging's demand reaches the ledger once per context, from
-      `n_ctx` and `n_ubatch`, and decode-time regrowth never does.
+      never planned has capacity 0 and refuses the same way. The
+      `GGML_SYCL_ATTN_HOST_STAGING_IDLE` bisection branch (`gs:81989-82013`)
+      also grows its held slot today; C4 gives it the same refusal, so no
+      branch grows a slot at dispatch (r5 n-1). Its per-call buffer stays
+      the `GRAPH` fallback of the site table.
+    - **A refusal fails the graph on every path** (§M69 (b); r5 I-2 (1)).
+      The declines return `false` from the dispatch and then from
+      `ggml_sycl_compute_forward`. The ordinary node loop asserts on it
+      (`gs:94499-94506`), but the MoE segmented record/replay paths
+      discard it: `gs:97234` (a direct segment at first record),
+      `gs:97285` (recording), `gs:97551` (replay's direct segments) and
+      `gs:97595` (replay). Direct segments are where `FLASH_ATTN_EXT` nodes
+      go (`gs:97221-97234`), and the segmented path is the MoE default
+      (`gs:107142-107148`). So a refusal there would be a WARN and a
+      skipped op: wrong tokens, not a refusal. C4 routes all four calls
+      through one helper that, on `false`, prints the ordinary loop's
+      `[SYCL] graph compute unsupported node` line and asserts, as
+      `gs:94499-94506` does. This is a live master defect class, filed as
+      its own ticket so it is tracked if C4 slips.
+    - So the staging's demand reaches the ledger once per context and
+      device, from `n_ctx` and `n_ubatch`, and decode-time regrowth never
+      does.
+    - **A stale `libllama`** makes no plan call, so every slot stays at
+      capacity 0 and every host dispatch refuses, fail-closed. The pairing
+      stays unsupported (r4 n-1).
   - **`GRAPH` tenants** (the twelve `GRAPH` lines of the site table): each
     is bounded by a named plan term that the census gate records per row:
     `max_tensor_bytes` + `k_scratch_headroom` for the single-tensor staging
@@ -1614,7 +1727,7 @@ created") describes a path that does not run.
   | `uc:15652` | the caller's `offload_buffer_lease` | caller's | SCRATCH | caller's | caller's |
   | `cpu-expert-pool.cpp:77` | `g_cpu_expert_pools[dev]` (`gs:2605`), the ring | COMPUTE | SCRATCH | **DEVICE** | the last live backend on the device (§M62 (D)); released today at every `ggml_backend_sycl_free`, llama.cpp-dsab |
   | `pinned-buffer-pool.cpp:69` | `g_pinned_buffer_pools[dev]` (`gs:2604`) | COMPUTE | SCRATCH | **DEVICE** | the same |
-  | `gs:82001`, `:82050` | `g_attn_host_staging[dev]` (`gs:81953`), the slots, grown only by the plan (§M62 (E)) | COMPUTE | SCRATCH | **DEVICE** | the same; device-shared, see below |
+  | `gs:82001`, `:82050` | `g_attn_host_staging[dev]` (`gs:81953`), the slots, grown only by the plan, per dispatching device, and only with `GGML_SYCL_ATTN_HOST_DISPATCH` set (§M62 (E), §M69 (a), (d)) | COMPUTE | SCRATCH | **DEVICE** | the same; device-shared, see below; released at the last backend once dsab lands (§M69 (c)) |
   | `gs:82021`, `:82032` | the caller's per-call `fallback_holder`, taken only under `GGML_SYCL_ATTN_HOST_STAGING_IDLE=1` or a `GGML_SYCL_ATTN_HOST_STAGING` mask (`gs:81967-81973`, `:81985-81988`; r4 m-12) | COMPUTE | SCRATCH | GRAPH | - |
   | `common.cpp:443` | `g_runtime_staging_cache` (file scope) | STAGING | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | `ggml_backend_sycl_context`, after llama.cpp-30r1 |
   | `common.cpp:1970` | `g_tp_host_staging` | TP_TMP | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | same |
@@ -1645,11 +1758,15 @@ created") describes a path that does not run.
       moving the holders is not needed. The per-call fallbacks at
       `gs:82021` and `:82032` are not slot capacity: each is a buffer the
       caller holds for one dispatch, so they are `GRAPH` (r4 m-12). C4
-      needs this now because the pools are on Qwen's default path, and the
-      attention staging is on every no-`-c` arm's path: demoted layers run
-      their attention on the CPU through it (`gs:82450-82455`,
-      `:82645-82650`, `:82847-82849`). Left `GRAPH` in SCRATCH, each would
-      trip the boundary WARN at every `graph_compute`.
+      needs this now because the pools are on Qwen's default path. The
+      attention staging is **not** on a default arm's path: it serves only
+      the opt-in host dispatch (`gs:82450-82455`, `:82645-82650`,
+      `:82847-82849`; `GGML_SYCL_ATTN_HOST_DISPATCH`), and by default
+      demoted layers run their attention on the scheduler's CPU split
+      (§M69 (a); r5 I-1, which corrects rev 3f's "on every no-`-c` arm's
+      path"). Its `DEVICE` classification stands for the arms that turn it
+      on. Left `GRAPH` in SCRATCH, each would trip the boundary WARN at
+      every `graph_compute`.
     - **`CONTEXT`, pending llama.cpp-30r1:** the other 11 holders (12
       lines). Their handles live in file-scope statics or a `thread_local`,
       so no backend context holds them yet, and stamping them `CONTEXT`
@@ -1707,7 +1824,7 @@ created") describes a path that does not run.
     | `max_tensor_bytes` (`uch:820`) + `k_scratch_headroom` (32 MiB, `uc:27088`) | the host single-tensor staging copies, the `GRAPH` rows `common.cpp:551`, `gs:36787`, `gs:36906` | host pinned, role `STAGING` | **stays** |
     | `moe_cpu_expert_staging_bytes` + `moe_host_recipe_workspace_bytes` (`uch:831-832`) | the MoE PP CPU-island act/out staging | host pinned, role `EXPERT_STAGING` (`gs:78153-78166`) | **stays** |
     | `onednn_reorder_bytes` (`uch:826`) | the oneDNN weight reorder, the dequantized-f16 half of `onednn_scratchpad_bytes` (`uc:27543-27565`) | the device ONEDNN zone, sub-allocated by `reserve_onednn_scratch` (`uc:17514`) | **leaves** |
-    | `moe_q8_workspace_bytes` (`uch:828`) | nothing: this sum is its only reader. The MoE Q8_1 activation scratch is sized by its own demand (`uc:21793-21820`) | the device scratch pool: `unified_cache_reserve_moe_q8_1_scratch` (`uc:21823`), `reserve_scratch_pool` (`uc:20917`), the VRAM arena's WEIGHT zone (`uc:21011-21013`) | **leaves** |
+    | `moe_q8_workspace_bytes` (`uch:828`) | nothing: this sum is its only reader. The MoE Q8_1 activation scratch is sized by its own demand (`uc:21793-21820`) | the device scratch pool: `unified_cache_reserve_moe_q8_1_scratch` (`uc:21824`), `reserve_scratch_pool` (`uc:20917`), the VRAM arena's WEIGHT zone (`uc:21011-21013`) | **leaves** |
     | `moe_vram_runtime_bytes` (`uch:850`) | the MoE expert-pointer tables or CONTROL pool (`uc:27520`) | device RUNTIME | **leaves** |
     | `tp_vram_runtime_bytes` (`uch:889`) | TP FFN and attention compute buffers on secondary devices (`uc:27479-27491`, `:27511`); nothing else reads it | device VRAM | **leaves**; its host `TP_TMP` rows become `UNSIZED` (above) |
     | `dma_staging_pool_bytes` (`uch:856`) | the device double buffer for weight streaming | device RUNTIME | **leaves** (and is 0 in mmap mode, r2 m-2 below) |
@@ -1731,7 +1848,11 @@ created") describes a path that does not run.
     tensor at `:2753`). So SCRATCH = 7775.9 - 1700.0 - 4265.0 - 0.6 - 60.0
     - 18.3 = **1732.0 MB**. The surviving terms give the same: 850.0 + 32.0
     + 850.0 (`cpu_staging`, `run2.log:2750`) + a recipe term of 0.0. The
-    inputs print to 0.1 MB, so the figure is scored to ±0.2 MB.
+    recipe term is not printed; it is 0 because only `Q1_0` and `NVFP4`
+    expert tensors get a recipe workspace (`uc:27380-27399`), and Qwen's
+    are `Q8_0` (`run2.log:81`), so the two computations are independent
+    (r5 n-2). The inputs print to 0.1 MB, so the figure is scored to ±0.2
+    MB.
 - **The runtime pre-allocate stops carrying the same two terms** (r3 m3, the
   r2 m-2 pattern).
   - `ggml_sycl_configure_host_zones_for_plan` pre-allocates a second pinned
@@ -1774,9 +1895,22 @@ created") describes a path that does not run.
     GPT-OSS no-`-c` arms: no `[HOST-POOL] grow_zone(` WARN (the phase gate,
     `pinned-pool.cpp:633-635`, which warns at its default mode 1,
     `:625-628`, once `graph_compute` has set the phase, `gs:105352`), and
-    no `[ATTN-HOST] staging request ... exceeds the planned` WARN. The
-    positive control is the same run's `[ATTN-HOST] planned staging` line,
-    which a demoting arm must print; its absence there is a FAIL.
+    no `[HOST-ARENA] DEVICE holder ... exceeds its planned` WARN (m-7).
+  - **The staging criteria depend on the switch** (§M69 (a); r5 I-1).
+    - **Default arms** (no `GGML_SYCL_ATTN_HOST_DISPATCH`): the run prints
+      `[ATTN-HOST] staging not planned (host dispatch off)` exactly once,
+      prints no `[ATTN-HOST] planned staging` line, and registers zero
+      `DEVICE` staging demand (no `[HOST-ARENA] SCRATCH demand
+      holder=attn_host_staging` line).
+    - **Dispatch-on arms** (§7 C4 steps 3b and 5b, which set
+      `GGML_SYCL_ATTN_HOST_DISPATCH=1` on their own command line): an
+      `[ATTN-HOST] planned staging` line for each dispatching device, zero
+      `[ATTN-HOST] staging request ... exceeds the planned` WARNs, and no
+      phase-gate WARN. The positive control is C4's dispatch counter,
+      `[ATTN-HOST] host dispatches dev=%d fa=%zu set_rows=%zu refusals=%zu`
+      (WARN, printed at backend free whenever the switch is on), with
+      `fa` > 0. Without it, or with `fa` = 0, the arm is **VOID**: no host
+      attention ran, so the staging criteria were not exercised.
   - **KV (zone 1)** grows at context init, one chunk per host-KV buffer
     that does not fit, and the sum of its growth covers the printed host KV
     (§7 C4 step 3). On a run with no demotion it does not grow.
@@ -1795,7 +1929,7 @@ created") describes a path that does not run.
   them in the site table above. 23mk owns each site's conversion. Its class-H
   rows cite that table: the nine host landings this change moves, including
   `cpu-expert-pool.cpp:62`, `pinned-buffer-pool.cpp:88` and the
-  `ggml_sycl_attn_host_staging_get` rows (`gs:81788-81837`); row 56, beside
+  `ggml_sycl_attn_host_staging_get` rows (`gs:81975-82074`); row 56, beside
   `gs:39959`'s host-pinned fallback (and llama.cpp-nl0f for the zero-copy
   read); and row 118, the DMA staging pool (r2 m-2 below). Host SCRATCH reads
   neither the RUNTIME function nor any copy of its terms (addendum 11 (1)).
@@ -2511,7 +2645,7 @@ The lead's GPU runs share one protocol (r1 I-7):
   `llama-perplexity` (512) stay at their fixed contexts; a "no `-c`" bench
   arm is vacuous, so C4 step 6 has none. A **programmatic** arm (a harness on
   `llama_context_default_params`, whose `n_ctx` is 512,
-  `src/llama-context.cpp:5091`) must set `n_ctx = 0` explicitly (`:540`), and
+  `src/llama-context.cpp:5091`) must set `n_ctx = 0` explicitly (`:541`), and
   is **VOID** unless `llama_n_ctx(ctx) == n_ctx_train`. No 5efe test is such
   an arm today. The rule binds any that is added.
 - **Verbosity is part of the vehicle** (r3 C, m2). A criterion that reads a
@@ -2556,17 +2690,25 @@ The lead's GPU runs share one protocol (r1 I-7):
   - An arm that fails the guard is **VOID**, not FAIL. The line is INFO,
     so every such arm runs at a level that prints it: `-v` on
     `llama-completion`, `-lv 4` on `llama-cli`.
-  - **The arms it covers, all of them:** C4 step 3 (Qwen, N = 262144); C4
-    step 4 (the Mistral gate on both cards, N = 32768); C4 step 5's no-`-c`
-    arm (GPT-OSS, N = 131072); C5's Qwen and GPT-OSS no-`-c` arms; and C6's
-    Mistral gate, GPT-OSS no-`-c` arm and Qwen no-`-c` arm. No other 5efe
-    arm is a default-context arm.
+  - **The arms it covers, all of them:** C1's lead gate (the Mistral gate
+    on both cards, N = 32768, with `-v`; r5 m-1); C4 steps 3 and 3b (Qwen,
+    N = 262144); C4 step 4 (the Mistral gate on both cards, N = 32768); C4
+    step 5's no-`-c` arm and 5b (GPT-OSS, N = 131072); C5's Qwen and GPT-OSS
+    no-`-c` arms; and C6's Mistral gate, GPT-OSS no-`-c` arm and Qwen
+    no-`-c` arm.
+  - **Not default-context arms, named:** C1's witnesses W1-W3. They are
+    no-`-c` `llama-completion` runs, but each is killed before any
+    `llama_context` exists (§7 C1), so there is no context line to guard.
+    No other 5efe arm runs without `-c`.
 - **Every pre-registered number names its vehicle** (§M60 (b)). The device
   compute buffer depends on `n_outputs_max` (`src/llama-context.cpp:2051`),
   which is part of the vehicle. The Qwen figures are `llama-completion
   -no-cnv -v` at the default `n_ubatch` of 512, run2's vehicle. The GPT-OSS
-  figures are `llama-cli`'s, GDC3's vehicle. No figure measured on one is
-  scored on the other's arm. A `llama-completion` GPT-OSS no-`-c` arm
+  figures are GDC3's vehicle: `llama-cli` at its default `n_ubatch` of 512,
+  with `n_outputs_max` 1 (`tools/server/server-context.cpp:1015`,
+  `lc:2051`), for C4 step 5 and 5b, C5 and C6 (r5 m-2). A run with `-ub`,
+  or through another tool, is a different row. No figure measured on one
+  is scored on the other's arm. A `llama-completion` GPT-OSS no-`-c` arm
   would be a different row, and 5efe has none.
 - **A GDC3 citation names its point** (§M61 (a); r4 m-7). GDC3 carries two
   points, today's tree and the zhcn+moua fixpoint. A 5efe arm run on a tree
@@ -2576,6 +2718,28 @@ The lead's GPU runs share one protocol (r1 I-7):
   was. Each such arm also carries zhcn's plan == reality criterion (§M60
   (c)): the plan's compute charge equals the `sched_reserve` compute size
   the same run prints, as GDC3 states it.
+  - **The point is a replay of this run's inputs** (§M63 (a); r5 m-4). On a
+    zhcn tree, GDC3's point is its replay applied to this run's own printed
+    input lines, never a prior run's printed figure. So step 5's N, range
+    and host-KV figure `M`, and the zone-1 count `ceil(M / 2048)`, are
+    taken from that replay of the same run. A different N passes if and
+    only if the replay of that run's inputs yields it.
+- **An env-gated trace line is scored only when armed and live** (§M66).
+  5efe scores one such emitter, `[HOST-ZONE-ALLOC]`, printed only under
+  `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1` (`uc:3990`, `:4002-4008`). It is scored
+  at five points: §4.4's WEIGHT pre-registration, C4 step 2's WEIGHT
+  criterion, step 3's KV exact form and WEIGHT criterion, step 5's WEIGHT
+  criterion, and the §M57 (a) RED. Every arm that scores it:
+  - sets the variable **on its own command line**, not in an inherited
+    environment;
+  - is **trace-live**: its stderr holds at least one `[HOST-ZONE-ALLOC]`
+    line of any cohort;
+  - is otherwise **VOID**, and VOID counts as failed. For the RED, which
+    scores the presence of a line, a non-live run is VOID, never a RED that
+    did not fire.
+  The dispatch counter of the dispatch-on arms (§4.4 criteria) is a WARN,
+  printed whenever the switch is on, not a trace line. Its arms set the
+  switch on their own command line as well.
 - llama.cpp-uize part 3 has landed (`35ce2e65f`, `812c7d790`, `7259727e6`,
   `ae4204ba7`, all in this tree). So a KV cache that does not fit VRAM is
   re-placed to the host tier, and its layers' attention runs on the CPU. The
@@ -2801,8 +2965,9 @@ The lead's GPU runs share one protocol (r1 I-7):
     A `deferral=STORAGE` there is the process-level-selector defect (FAIL).
   - None of them is a load. None reaches the pre-size, and none reads the
     table, so none enters the C1-to-T6 window (§3.1, **Data edges**).
-- Lead gates: the Mistral gate on `:1` and `:0` (default context). Tokens are
-  unchanged, since Mistral has no lazy tensor.
+- Lead gates: the Mistral gate on `:1` and `:0` (default context), with `-v`
+  so its context line prints, and the VOID guard, N = 32768 (§7 preamble;
+  r5 m-1). Tokens are unchanged, since Mistral has no lazy tensor.
 - **Data edge:** th32 T6a lands no later than C1 (§3.1).
 
 **C2. The `FILE_MAPPED` tier, the raw wrappers and the census** (§4.1, §4.8).
@@ -2903,10 +3068,24 @@ I-5, §F2). It is the commit that changes every SYCL load.
       The `DEVICE` check follows `delete sycl_ctx` and is gated on the
       per-device live-backend count reaching 0; nothing in that function
       checks a record (§M62 (D)).
-    - The attention staging's persistent path allocates nothing: a request
-      above the slot's capacity takes the named refusal, and the slots grow
-      only under `ggml_backend_sycl_plan_host_attn_staging` (§M62 (E)).
-      The two per-call fallbacks are `GRAPH` (r4 m-12).
+    - The attention staging's persistent and IDLE paths allocate nothing
+      for a slot: a request above the slot's capacity takes the named
+      refusal, and the slots grow only under
+      `ggml_backend_sycl_plan_host_holders` (§M62 (E); r5 n-1). The two
+      per-call fallbacks are `GRAPH` (r4 m-12).
+    - The plan registers staging demand only after
+      `ggml_sycl_attn_host_dispatch_enabled()` returns true, and prints the
+      `staging not planned` line otherwise (§M69 (a)). It selects nodes
+      with `ggml_sycl_tensor_is_in_kv_host_buft`, the interception's own
+      predicate, and never calls `ggml_backend_buffer_is_host` (r5 m-6).
+      It takes each node's device from the scheduler's assigned backend,
+      never from the helper (§M69 (d)).
+    - The pools' dimension scan is one function, called by
+      `moe_hybrid_init_once` and by the plan; no other code computes
+      `max_dispatch_count` (r5 m-7).
+    - No `ggml_sycl_compute_forward(` call in the MoE segmented
+      record/replay functions discards its return: each goes through the
+      fail-closed helper (§M69 (b)).
     - Each of the 12 `UNOWNED` lines names a cohort (r4 m-2).
     - `select_zone` has no category clause for WEIGHT, and sends `UNOWNED`
       to WEIGHT.
@@ -2943,18 +3122,26 @@ I-5, §F2). It is the commit that changes every SYCL load.
       (r3 m3).
     - The inventory's `kv_idx_width` is declared after `kv_layer_count`,
       and both demotion sites read `kv_demand_for_layer` (r3 B).
-    - The new entry point takes an opaque backend handle plus scalars and
-      returns `bool`: no other pointer and no struct in its signature, in
-      either the header or the `llama_context` function pointer type (the
-      dlopen shape; r3 m5).
+    - The notify takes an opaque backend handle plus scalars and returns
+      `bool`: no other pointer and no struct in its signature, in either the
+      header or the `llama_context` function pointer type (the dlopen
+      shape; r3 m5). The plan entry point takes a `ggml_backend_sched_t` and
+      a `struct ggml_cgraph *`, both ggml-base handles, and no llama type.
     - The notify and `SYCL_Host`'s and `SYCL_KV_Host`'s `alloc_buffer` and
       `get_max_size` take the device from `ggml_sycl_host_buft_device` and
       nowhere else: no `ctx->device` and no `get_current_device_id()` on
       those paths, and no `resolve_effective_device(0)` on the notify's
       growth path. The growth is the ensure-capacity call, never
-      `grow_scratch_zone`'s additive form (§M57 (c); r4 I-D). Once 23mk's
-      step 7 is on the tree, nothing calls
-      `unified_cache_grow_host_scratch_zone` (23mk rev 4.16 relay).
+      `grow_scratch_zone`'s additive form (§M57 (c); r4 I-D). The staging
+      and pools plan is a different path: there the dispatching backend's
+      device is the right one (§M69 (d)).
+    - **`unified_cache_grow_host_scratch_zone` is absent** (§M68 (a); r5
+      m-5). The gate counts the token in `ggml/src/ggml-sycl/` and
+      `ggml/include/`, with comments stripped: zero call sites and zero
+      definitions or declarations. It runs in both states of the tree.
+      Before 23mk's step 7, `ggml_backend_sycl_notify_compute_buffer_sizes`
+      is present and must not contain the call. After step 7, that
+      function is absent, and the count is still zero.
     - The buffer-owned check runs in each host buft's `free_buffer`, and the
       backend-member check follows `delete sycl_ctx` in
       `ggml_backend_sycl_free` (§M57 (b)).
@@ -2988,9 +3175,30 @@ I-5, §F2). It is the commit that changes every SYCL load.
       - the notify growing `ctx->device`, the notifying backend's device,
         instead of the helper's (r4 I-D);
       - the dispatch-time slot grow restored in
-        `ggml_sycl_attn_host_staging_get` (§M62 (E));
+        `ggml_sycl_attn_host_staging_get` (§M62 (E)), and separately in its
+        IDLE branch (r5 n-1);
+      - the staging demand registered with the host dispatch off (§M69
+        (a));
+      - the plan's predicate replaced by `ggml_backend_buffer_is_host` of K
+        (r5 m-6);
+      - the staging slots planned on the helper's device, not the
+        dispatching backend's (§M69 (d));
+      - the return of one of the four segmented `ggml_sycl_compute_forward`
+        calls discarded again, once per site (§M69 (b));
+      - the pools' demand registered in `moe_hybrid_init_once` rather than
+        by the plan (r5 m-7);
+      - the call at `gs:19145` left in place; and separately, the definition
+        of `unified_cache_grow_host_scratch_zone` left with no caller, which
+        a callers-only check would pass (§M68 (a), r5 m-5);
       - the backend-member check moved into `~ggml_backend_sycl_context`
         (r3 I-3).
+  - RED `test-sycl-seg-forward-return-source` (Python, `sycl;host`; §M69
+    (b)). It scans the MoE segmented record/replay functions in
+    `ggml-sycl.cpp` and fails on any `ggml_sycl_compute_forward(` call whose
+    result is not consumed by the fail-closed helper. At master it fails
+    and names `gs:97234`, `:97285`, `:97551` and `:97595`; after C4 it
+    passes. Its mutants are the four discards, one at a time. A positive
+    control fixture holds one discarded call, and the gate must flag it.
   - `test-sycl-host-zone-select` (`sycl;host`). It is a pure test of the
     extracted `select_zone`, over role x category x `kv_spill_to_host`, and
     of the lifetime checks over a fake registry.
@@ -3050,10 +3258,14 @@ I-5, §F2). It is the commit that changes every SYCL load.
       today's additive `grow_scratch_zone` (the r3 I-1 (b) ratchet); the
       device-0 resolve (r3 I-1 (d)); the notifying backend's `ctx->device`,
       i.e. `model.devices[0]`'s, in place of `buft->device` (r4 I-D).
-  - `test-sycl-attn-host-staging-plan` (`sycl;host`; §M62 (E), r4 m-4). A
-    pure test of the slot admission extracted from
-    `ggml_sycl_attn_host_staging_get`, over a fake allocator that records
-    each allocation:
+  - `test-sycl-attn-host-staging-plan` (`sycl;host`; §M62 (E), §M69, r4
+    m-4, r5 I-1, I-2, m-6, m-7). A pure test of the slot admission extracted
+    from `ggml_sycl_attn_host_staging_get` and of the plan walk, over a fake
+    allocator that records each allocation and a fake scheduler that assigns
+    each node a backend and device:
+    - with the host dispatch off, the plan registers no staging demand,
+      grows no slot and prints the `staging not planned` line once (§M69
+      (a)); the pools' demand is still registered;
     - after a plan of (Q, DST, MASK, VAL, IDS), each slot's capacity is its
       figure rounded by the slot rule, and the `DEVICE` demand is their
       sum;
@@ -3065,11 +3277,25 @@ I-5, §F2). It is the commit that changes every SYCL load.
       to a slot never planned;
     - a second, larger plan grows each slot once; a smaller one grows
       nothing.
-    - A llama-side part walks a synthetic reserve graph with one
-      `FLASH_ATTN_EXT` node whose K is in a host buffer and one whose K is
-      not, and takes the figures from the first only.
-    - **Mutant:** the dispatch-time grow restored, which records an
-      allocation on the over-plan request instead of refusing it.
+    - The walk selects by the dispatch's predicate (r5 m-6). A synthetic
+      reserve graph holds four `FLASH_ATTN_EXT` nodes: one whose K is a
+      **view** (buffer `NULL`, `view_src` in a `SYCL_KV_Host` buffer), which
+      counts; one whose K is in a CPU buffer and one whose K is in a
+      `SYCL_Host` buffer (`-nkvo`), which do not; and one on a device
+      buffer, which does not.
+    - Per dispatching device (§M69 (d)): with the nodes of layers 0-1
+      assigned to a device-0 backend and layers 2-3 to a device-1 backend,
+      each device's slots get only its own nodes' figures, and a dispatch on
+      device 1 at or below them records no allocation.
+    - The pools' demand is the shared scan's result on the reserve graph's
+      `MUL_MAT_ID` nodes, registered at plan time; an allocation above it
+      prints the `exceeds its planned` line (r5 m-7).
+    - **Mutants:** the dispatch-time grow restored, which records an
+      allocation on the over-plan request instead of refusing it; the plan
+      ignoring the switch; `ggml_backend_buffer_is_host` as the predicate,
+      which counts the CPU and `SYCL_Host` K nodes and misses the view
+      (`NULL` buffer); the helper's device for every slot, which leaves
+      device 1's slots unplanned.
   - `test-sycl-kv-demand-idx` (`sycl;host`, r3 B). A pure test of
     `kv_demand_for_layer` on a 48-layer plan with Qwen's shape: 12 FULL
     layers of 512 MiB at 262144 cells, `kv_idx_width` 128. Each carries 576
@@ -3149,7 +3375,13 @@ I-5, §F2). It is the commit that changes every SYCL load.
      tree it was.
 
      Pre-registered pass criteria:
-     - the load completes and prints coherent text;
+     - **the answer** (r5 m-9): stdout and stderr go to separate files, and
+       `grep -c 'Paris' <stdout file>` ≥ 1. The lead also records the full
+       continuation on the parent commit with the same command. 5efe moves
+       where weight bytes are read from, not how they are computed, so the
+       two should agree; a difference with `Paris` present is reported to
+       the lead rather than failed, because two builds' device code can
+       differ;
      - `[HOST-ARENA] configured zones: WEIGHT=64.0 MB`;
      - `SCRATCH=1732.0 MB` (±0.2) in `configured zones`, `Pinned pool
        pre_allocate: grew 2 chunks for 3579.2 MB working set`,
@@ -3157,9 +3389,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
        MB)`, and `Committed 6144.0 MB in 3 chunk(s)` (§4.4; r2 I-1, r3 m3,
        addendum 11 (1), §M62 (A)). They are scored on the printed MB
        figures, and §4.4's table names what did not land from them;
-     - under `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1`, §4.4's WEIGHT
-       pre-registration: every post-pre-size `zone=WEIGHT` line is
-       `cohort=routing_indices_cache` within 20480 bytes (r4 m-2);
+     - §4.4's WEIGHT pre-registration: every post-pre-size `zone=WEIGHT`
+       line is `cohort=routing_indices_cache` within 20480 bytes (r4 m-2).
+       The arm sets `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1` on its command line
+       and is trace-live (§7 preamble, §M66);
+     - `[ATTN-HOST] staging not planned (host dispatch off)` once, and no
+       staging demand (§4.4 criteria, §M69 (a));
      - `DMA staging pool: 0.0 MB`;
      - **no `Pinned pool grow_zone: zone 0` line after the pre-size**, through
        the end of the completion (r2 I-2). This absence counts only because
@@ -3262,8 +3497,9 @@ I-5, §F2). It is the commit that changes every SYCL load.
          init, 8192.0 MB in all, which covers the printed 6912.0. Fewer lines,
          any zone-3 growth that is not a demand line, or a `SYCL_KV_Host`
          buffer outside zone 1 is a FAIL. The arm sets
-         `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1` (`uc:3990`), whose per-allocation
-         line names the zone;
+         `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1` (`uc:3990`) on its command line,
+         whose per-allocation line names the zone, and is trace-live (§7
+         preamble, §M66);
        - **the exact form** (§M57 (a)): the `[HOST-ZONE-ALLOC] ... zone=KV
          ... cohort=kv_host_buffer` trace lines (`uc:4002-4008`) sum to
          exactly the printed host-KV figure, 6912.0 MiB = 7247757312 bytes,
@@ -3271,15 +3507,24 @@ I-5, §F2). It is the commit that changes every SYCL load.
          `cohort=kv_host_buffer` line names another zone;
        - no `[HOST-ZONE] leaked` line at context free;
        - the VOID guard, N = 262144 (§7 preamble);
-       - no host zone grows during PP or TG, and the `[ATTN-HOST] planned
-         staging` line prints (§4.4 criteria, §M62 (E));
+       - no host zone grows during PP or TG, the `staging not planned` line
+         prints once, and no staging demand is registered (§4.4 criteria,
+         §M69 (a));
        - §4.4's WEIGHT pre-registration: every post-pre-size `zone=WEIGHT`
          trace line is `cohort=routing_indices_cache` within 20480 bytes
-         (r4 m-2);
+         (r4 m-2), in the same trace-live run;
        - `MemAvailable` stays above 25 GiB. The load pins 8 GiB of zone-1
          chunks on top of step 2's 6 GiB, and `MemAvailable` before the
          load was 155.0 GiB (`run2.mem`);
        - a `runtime KV update rejected` line is a FAIL.
+
+     **3b. The same Qwen no-`-c` run with `GGML_SYCL_ATTN_HOST_DISPATCH=1`**
+     on its command line (§M69 (a)). It is VOID until th32 T6/T7 and C4 are
+     on the tree, like step 3. Every criterion of step 3 holds, except that
+     the staging criteria are the dispatch-on ones (§4.4 criteria): a
+     `planned staging` line, zero `exceeds the planned` refusals, no
+     phase-gate WARN, and the dispatch counter with `fa` > 0 as the positive
+     control. The answer is scored as in step 2.
   4. The Mistral gate on `:1` and `:0` (default context), with `-v` added so
      the context line prints, and the VOID guard, N = 32768 (§7 preamble;
      r4 m-1).
@@ -3299,11 +3544,13 @@ I-5, §F2). It is the commit that changes every SYCL load.
          (c)). If GDC3 changes, this arm changes with it and nothing here is
          edited.
        - The VOID guard, N = 131072 (§7 preamble).
-       - No host zone grows during PP or TG, and the `[ATTN-HOST] planned
-         staging` line prints (§4.4 criteria, §M62 (E)).
-       - Under `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1`, every post-pre-size
-         `zone=WEIGHT` line is `cohort=routing_indices_cache` within 8192
-         bytes (r4 m-2).
+       - No host zone grows during PP or TG, the `staging not planned` line
+         prints once, and no staging demand is registered (§4.4 criteria,
+         §M69 (a)).
+       - With `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1` on the arm's command line
+         and the run trace-live (§M66), every post-pre-size `zone=WEIGHT`
+         line is `cohort=routing_indices_cache` within 8192 bytes (r4
+         m-2).
        - The line is WARN (`gs:18382`), so without `-lv` (or with `-lv` below
          2) `llama-cli` drops it and the arm cannot pass on a correct build
          (r3 C).
@@ -3314,6 +3561,14 @@ I-5, §F2). It is the commit that changes every SYCL load.
          host-KV figure `M` of the GDC3 point the arm scores against. No
          zone-3 miss, and no `[HOST-ZONE] leaked` line.
        - A refusal is a FAIL.
+     - **5b. The same no-`-c` arm with `GGML_SYCL_ATTN_HOST_DISPATCH=1`** on
+       its command line (§M69 (a)), the cheapest demoting arm. Every
+       criterion of the no-`-c` arm holds, except that the staging criteria
+       are the dispatch-on ones (§4.4 criteria): a `planned staging` line,
+       zero `exceeds the planned` refusals, no phase-gate WARN, and the
+       dispatch counter with `fa` > 0 as the positive control. A refusal
+       reading `planned 0 B` on a tree without dsab is VOID and reported as
+       dsab's (§M69 (c)).
      - **A model switch under `GGML_SYCL_STRICT_LEASES=1`** (§M57 (b)):
        `timeout 900 env GGML_SYCL_STRICT_LEASES=1
        ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench -m
@@ -3330,7 +3585,10 @@ I-5, §F2). It is the commit that changes every SYCL load.
        for `SYCL_KV_Host`), must FAIL the SCRATCH criterion: its host KV
        arrives in SCRATCH (`[HOST-ZONE-ALLOC] ... zone=SCRATCH ...
        cohort=backend_host_buffer`) with no demand line for it. On the second
-       commit it passes. GPT-OSS on the B50 is the RED's vehicle because it
+       commit it passes. The RED sets `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1` on
+       its command line and must be trace-live (§M66): with the trace off,
+       the line it looks for cannot print, so a non-live RED is **VOID**,
+       never a RED that silently failed to fire. GPT-OSS on the B50 is the RED's vehicle because it
        demotes host KV at a fraction of Qwen's load.
 
      Every SYCL load now takes the mapped path.
@@ -3392,7 +3650,10 @@ I-5, §F2). It is the commit that changes every SYCL load.
   The refusal must never fire on a real load.
 
 Tickets to file after review: `-lm none` double residency (§6), and
-`CPU_REPACK` outside the cache (§4.4).
+`CPU_REPACK` outside the cache (§4.4). To file now, per §M69 (b): the MoE
+segmented record/replay paths discard `ggml_sycl_compute_forward`'s return
+(`gs:97234`, `:97285`, `:97551`, `:97595`), which C4 fixes (§4.4), so the
+fix is tracked even if C4 slips.
 
 Out of scope and already ticketed: `SYCL_CpuOffloadCompute`'s
 `get_max_size`/`alloc_buffer` mismatch (**llama.cpp-g2a7**, §M62 (B)); the
@@ -3564,7 +3825,7 @@ says so:
 | m9 Appendix B I-3's `W`; `gs:39959` and nl0f | Done in rev 3d. | Appendix B, §4.4 |
 | n1 0edf outcome | Kept in rev 3e as rev 3d had it. **Relabelled in rev 3f** (§M61 (d)(3), r4 m-10): "a 5efe PASS plus a live 0edf defect", which keeps the two facts separate. | §7 C4 step 3 |
 | §M58 (c) | The source-gate clause and the per-model line were done in rev 3d. Now stated in §3.1 too: C1 lands the real attribute values, and T6 only reads them. | §3.1 |
-| zhcn GDC3 re-derived (N=5 at `9650b3e`) | Nothing here copied the old 7 / 1792.0 / 11..23 since rev 3d; the cite now names `9650b3e`. No arithmetic in this design takes the device compute buffer as an input: the Qwen room is shared zone minus device weights, and the step-5 zone-1 count, `ceil(M / 2048)`, reads `M` from the GDC3 point the arm scores against. **rev 3f** withdraws rev 3e's "the compute buffer shrinks when layers demote" (§M60 (a); r4 m-6), removes the copied figure (§M56 (a), §M61 (b); r4 m-5), and names the point (§M61 (a); r4 m-7). | header, §7 preamble, C4 step 5 |
+| zhcn GDC3 re-derived at `9650b3e` | Nothing here has copied a GDC3 figure since rev 3d; the cite names the row and `9650b3e` only (rev 3g removes the figures this row itself restated; r5 m-3). No arithmetic in this design takes the device compute buffer as an input: the Qwen room is shared zone minus device weights, and the step-5 zone-1 count, `ceil(M / 2048)`, reads `M` from the GDC3 point the arm scores against. **rev 3f** withdraws rev 3e's "the compute buffer shrinks when layers demote" (§M60 (a); r4 m-6), removes the copied figure (§M56 (a), §M61 (b); r4 m-5), and names the point (§M61 (a); r4 m-7). | header, §7 preamble, C4 step 5 |
 
 **design-5efe-r4** (re-graded at `3763bb164..fb063e845`, 0C/3I/12m/1n; it
 supersedes the draft written at `3e72abad5`), with addendum 11, §M60, §M61
@@ -3579,17 +3840,17 @@ supersedes the draft written at `3e72abad5`), with addendum 11, §M60, §M61
 | m-1 no VOID guard on default-context arms | Fixed per §M54, §M61 (c) and §M62 (C). The §7 preamble carries the guard, the padded regex `llama_context: n_ctx +=  *<N>$` (`lc:717`), not `^`-anchored, with the `n_ctx_seq` and `slot load_model` lines as the negative control, and names every arm it covers: C4 steps 3, 4 and 5's no-`-c`, C5's two arms, and C6's three. The Mistral gate adds `-v`. | §7 preamble, C4 steps 3-5, C5, C6 |
 | m-2 `UNOWNED` MoE holders on the lead arms' path | Fixed by pre-registration under `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1`. Only the `routing_indices_cache` cohort can reach WEIGHT after the pre-size, within `n_expert_used x n_ubatch x 4` bytes (Qwen 20480, GPT-OSS 8192). `fused_handle` is unreachable (`ensure_fused_buf`, `gs:21626`, has no caller); the retained scratch needs `GGML_SYCL_CPU_RETAINED` (`gs:93922-93927`); `runtime_staging_cache` only stages mmap'd weights to a device (`gs:47945-47957`, `:24288`); the TP and split holders are off. Each `UNOWNED` line names its cohort. | §4.4, §7 C4 steps 2, 3, 5 |
 | m-3 zone-3 "only through the notify" | Scoped to default flags: `SPLIT_MODE_TENSOR` reaches `SYCL_HostCompute`'s TP path (`lc:901-904`) and `GGML_SYCL_HOST_COMPUTE` the cpu-offload buft (`lc:928-931`); a run with either is VOID for the criterion. | §4.4 criteria |
-| m-4 attention staging regrows at decode | Fixed per §M62 (E). The staging is planned in `sched_reserve` from the reserve graphs (built on `init_full`, `lc:2027`) through the scalar entry point `ggml_backend_sycl_plan_host_attn_staging`, and its slots grow there, before the first `graph_compute`. At dispatch a request above the plan is the named refusal `[ATTN-HOST] staging request ... exceeds the planned ...`. Criteria: zero `[HOST-POOL] grow_zone(` phase-gate WARNs (`pinned-pool.cpp:633-635`) and zero refusal lines on the Qwen and GPT-OSS no-`-c` arms, beside the `[ATTN-HOST] planned staging` positive control. New test `test-sycl-attn-host-staging-plan`. | §4.4 staging plan, criteria, §7 C4 |
+| m-4 attention staging regrows at decode | Fixed per §M62 (E). The staging is planned in `sched_reserve` from the reserve graphs (built on `init_full`, `lc:2027`) through the scalar entry point `ggml_backend_sycl_plan_host_attn_staging`, and its slots grow there, before the first `graph_compute`. At dispatch a request above the plan is the named refusal `[ATTN-HOST] staging request ... exceeds the planned ...`. Criteria: zero `[HOST-POOL] grow_zone(` phase-gate WARNs (`pinned-pool.cpp:633-635`) and zero refusal lines on the Qwen and GPT-OSS no-`-c` arms, beside the `[ATTN-HOST] planned staging` positive control. New test `test-sycl-attn-host-staging-plan`. **Reworked in rev 3g** (§M69; r5 I-1, I-2, m-6): the plan follows `GGML_SYCL_ATTN_HOST_DISPATCH` and is not planned by default, its criteria move to the dispatch-on arms, the walk is SYCL-side through `ggml_backend_sycl_plan_host_holders(sched, graph)` with the dispatch's own predicate and per dispatching device, and a refusal fails the graph on the segmented paths. | §4.4 staging plan, criteria, §7 C4 |
 | m-5 Appendix B copies GDC3's figure | Fixed: the number is removed from the zhcn GDC3 row above. | Appendix B |
 | m-6 header restates the §M60 (a) premise | Fixed: the header states §M60's rule (compute size is a property of the vehicle's `n_outputs_max`, `lc:2051`), and the §7 preamble requires every pre-registered number to name its vehicle (§M60 (b)). | header, §7 preamble |
 | m-7 GDC3 citations do not name the point | Fixed per §M61 (a): today's-tree point, the zhcn+moua fixpoint, or VOID when only one of the two is on the tree; each such arm also carries zhcn's plan == reality criterion (§M60 (c)). | §7 preamble, C4 step 5, C5, C6 |
 | m-8 idle VRAM-RUNTIME read stays in host SCRATCH | Removed per addendum 11 (1) and §M61 (d)(2), and re-derived from run2's printed terms: SCRATCH 1732.0 MB, base 3579.2 MB (2 chunks), runtime need 91.9 MB (1 chunk), `Committed 6144.0 MB in 3 chunk(s)`, scored on the MB figures with a discriminator table. The setter-order pin is gone; the `runtime_bytes` drop stands on its own ground (both PP terms are VRAM allocations). | §0, §4.4, §7 C4 step 2 |
-| m-9 no per-term trace | Fixed per §M62 (A): a trace table, one row per host SCRATCH term. `onednn_reorder_bytes` sizes the ONEDNN device zone (`uc:27543-27565`); `moe_q8_workspace_bytes` has no reader, and the real Q8_1 scratch is a device pool (`uc:21823`); `tp_vram_runtime_bytes` sizes device buffers, so all three leave the sum, and the `TP_TMP` `GRAPH` rows become `UNSIZED`. | §4.4 term trace |
+| m-9 no per-term trace | Fixed per §M62 (A): a trace table, one row per host SCRATCH term. `onednn_reorder_bytes` sizes the ONEDNN device zone (`uc:27543-27565`); `moe_q8_workspace_bytes` has no reader, and the real Q8_1 scratch is a device pool (`uc:21824`); `tp_vram_runtime_bytes` sizes device buffers, so all three leave the sum, and the `TP_TMP` `GRAPH` rows become `UNSIZED`. | §4.4 term trace |
 | m-10 n1 label | Fixed per §M61 (d)(3): "a 5efe PASS plus a live 0edf defect", in C4 step 3 and the r3 n1 rows above. | §7 C4 step 3, Appendix B |
 | m-11 device-side `idx_` accounting uncited | Fixed: llama.cpp-ka9c (addendum 11 (5)) is cited there and in the tickets list. | §4.4, tickets |
 | m-12 the attention staging's per-call fallbacks listed as `DEVICE` | Fixed: `gs:82021` and `:82032` are env-only fallbacks (`gs:81967-81973`, `:81985-81988`), now their own `GRAPH` row, sized by the planned capacity of their kind. | §4.4 site table, `GRAPH` tenants |
 | n-1 stale-`libllama` padding claim | Fixed: the guarantee relied on is that every in-tree construction site value-initializes (`= {}`); the stale-`libllama` pairing is stated as unsupported, not as zeroed. | §4.4 |
-| 23mk rev 4.16 relay: `unified_cache_grow_host_scratch_zone` | One row, per the relay's two outcomes: **dead code, listed for deletion**. Its only caller is `ggml_backend_sycl_notify_compute_buffer_sizes` (`gs:19145`), which 23mk's step 7 deletes; C4's notify uses the ensure-capacity call instead. Whichever of C4 and step 7 lands second deletes it (`uc:21935`, `uch:6907`) and C4 rewrites the `uc:27716` comment; the source gate fails on any caller. | §4.4 notify, §7 C4 source gate |
+| 23mk rev 4.16 relay: `unified_cache_grow_host_scratch_zone` | One row, per the relay's two outcomes: **dead code, listed for deletion**. Its only caller is `ggml_backend_sycl_notify_compute_buffer_sizes` (`gs:19145`), which 23mk's step 7 deletes; C4's notify uses the ensure-capacity call instead. Whichever of C4 and step 7 lands second deletes it (`uc:21935`, `uch:6907`) and C4 rewrites the `uc:27716` comment; the source gate fails on any caller. **Superseded in rev 3g by §M68 (a)** (r5 m-5): C4 alone deletes it, removing the `gs:19145` call itself, and the gate asserts zero callers and zero definitions in both tree states. | §4.4 notify, §7 C4 source gate |
 | §M60 (a)-(d) | (a) premise withdrawn (m-6); (b) vehicles named (§7 preamble); (c) plan == reality on every GDC3 arm (m-7); (d) the device compute buffer routes to RUNTIME, and nothing here charges it to SCRATCH. | header, §7 preamble |
 | §M62 (A)-(E) | (A) the term trace (m-9); (B) llama.cpp-g2a7 cited (I-A); (C) the anchored guard (m-1); (D) the release point (I-B); (E) the staging plan (m-4). | as the rows above |
 
@@ -3608,3 +3869,30 @@ Closed at `fb063e845`, per the verdict's section A (doc lines are
 | r3 m5 | fixed in 3e: returns `bool`, `llama_context` WARNs | 1208-1236, 2661-2664 |
 | r3 m8 | fixed in 3e: own `MODEL` row | 1447 |
 | §M58 (c); §M56 (a) body; earlier-r4 m-R7, m-R10 | fixed in 3e (§M56 (a)'s Appendix B residue is m-5 above) | as the verdict cites |
+
+**design-5efe-r5** (`fb063e845..b3c08be71`, 0C/2I/10m/2n; every r4 item
+closed as claimed), with lead rulings §M63 (a), §M66, §M68 (a) and §M69
+(a)-(d), folded in rev 3g:
+
+| finding | disposition | where |
+|---|---|---|
+| I-1 the staging plan reserves for a dispatch that is off by default | Fixed per §M69 (a). The host dispatch is opt-in (`GGML_SYCL_ATTN_HOST_DISPATCH`, `gs:81901-81917`, tested at `gs:83014-83016`, `:83022-83024`), and by default demoted attention runs on the scheduler's CPU split (`gs:81896-81900`). With the switch off the plan registers no demand, grows no slot, and prints `[ATTN-HOST] staging not planned (host dispatch off)` once. The default arms (C4 steps 2, 3, 5) assert that line and zero staging demand. The staging criteria move to two dispatch-on arms, 5b (GPT-OSS B50 no-`-c`) and 3b (Qwen no-`-c`, VOID until th32 T6/T7 and C4 are on the tree), whose positive control is C4's new dispatch counter with `fa` > 0. The "on every no-`-c` arm's path" claim is corrected; the `DEVICE` classification stands. | §4.4 staging plan, addendum 10 (b) paragraph, criteria; §7 C4 steps 2, 3, 3b, 5, 5b |
+| I-2 (1) the refusal is discarded on the MoE segmented paths | Fixed per §M69 (b). C4 routes the four `ggml_sycl_compute_forward` calls at `gs:97234`, `:97285`, `:97551` and `:97595` through one fail-closed helper that prints the ordinary loop's unsupported-node line and asserts (`gs:94499-94506`). RED `test-sycl-seg-forward-return-source` fails at master naming the four sites, with a mutant per site and a positive-control fixture. A ticket is to be filed so the fix is tracked if C4 slips. | §4.4 staging plan, §7 C4 tests, tickets |
+| I-2 (2) the dsab release zeroes a live context's planned slots | Stated per §M69 (c): with dsab, the slots are released only when the last backend on the device is freed, by C4's per-device live-backend count, and dsab's fix adopts that count for the pools and the staging. Until dsab lands the premature release reaches the plan only as a fail-closed refusal; a dispatch-on arm that prints `planned 0 B` on a tree without dsab is VOID and reported as dsab's. | §4.4 Lifetimes, site table, §7 C4 step 5b |
+| I-2 (3) slots planned on the helper's device | Fixed per §M69 (d): the walk takes each node's device from the scheduler's assigned backend, the device whose `ctx.device` indexes the slots (`gs:82358`, `:82844`); demand and `req.device` are that device's. Test case with two devices, and a helper-device mutant. | §4.4 staging plan, §7 C4 tests |
+| m-1 C1's Mistral default arm missing from the VOID-guard list | Fixed: C1's lead gate runs with `-v` and the guard, and is on the list; W1-W3 are named as not default-context arms, since each is killed before a `llama_context` exists. | §7 preamble, C1 |
+| m-2 GPT-OSS vehicle not fully named | Fixed: `llama-cli`, default `n_ubatch` 512, `n_outputs_max` 1 (`tools/server/server-context.cpp:1015`, `lc:2051`), for step 5 and 5b, C5 and C6. | §7 preamble |
+| m-3 the GDC3 row restates GDC3 figures | Fixed: the row names the GDC3 row and `9650b3e` only. | Appendix B |
+| m-4 §M63 (a) not folded | Fixed: on a zhcn tree the GDC3 point is its replay applied to the run's own printed inputs; step 5's N, range, `M` and `ceil(M / 2048)` come from that replay of the same run. | §7 preamble, C4 step 5 |
+| m-5 the 23mk-relay gate is not mechanical | Fixed per §M68 (a): C4 alone deletes `unified_cache_grow_host_scratch_zone`, including the `gs:19145` call; `ggml_backend_sycl_notify_compute_buffer_sizes` stays 23mk step 7's. The gate counts zero call sites and zero definitions or declarations in both tree states (step 7 not landed, and landed), with a left-call mutant and a left-definition mutant. | §4.4 notify, §7 C4 source gate |
+| m-6 the plan predicate is a second source and reads a `NULL` buffer | Fixed: the walk uses `ggml_sycl_tensor_is_in_kv_host_buft` (`gs:108235-108241`), the interception's own predicate, which resolves `view_src` (a view's `buffer` is `NULL` at creation, `ggml.c:1817`). The test adds a view-K case that counts and CPU and `SYCL_Host` K cases that do not, with an `is_host` mutant. | §4.4 staging plan, §7 C4 tests |
+| m-7 the `DEVICE` pools' demand arrives inside PP | Fixed: the pools' dimension scan (`gs:7952-8030`) becomes one function shared by `moe_hybrid_init_once` and the `sched_reserve` plan walk, which registers the pools' demand before the phase is set (`gs:105352`). A warmup graph stays under the planned dispatch count for both lead models; an allocation above plan prints a named WARN, which the criteria count. | §4.4 Sizing, criteria, §7 C4 |
+| m-8 cite errors | Fixed: `ggml_sycl_attn_host_staging_get` is `gs:81975-82074`; `props->caps` is `gs:108004-108009`; `uc:21824`; `lc:541`. | §2, §4.4, §7 preamble, Appendix B |
+| m-9 the Qwen correctness criterion cannot fail | Fixed: stdout is captured on its own and scored `grep -c 'Paris'` ≥ 1; the lead records the parent commit's continuation, and a difference with `Paris` present is reported. | §7 C4 step 2 (and 3, 3b) |
+| m-10 the merge unit | Fixed: 5efe C1-C4 and th32 T6/T7 reach master in one merge; "VOID without T6/T7" is a branch state that master never holds. | §3.1 |
+| n-1 the IDLE branch still grows | Fixed: it takes the same refusal; its per-call buffer stays the `GRAPH` fallback; a gate mutant restores its grow. | §4.4 staging plan, §7 C4 source gate |
+| n-2 the recipe term closed by subtraction | Fixed: 0 because only `Q1_0`/`NVFP4` experts get a recipe workspace (`uc:27380-27399`) and Qwen's are `Q8_0` (`run2.log:81`). | §4.4 |
+| §M66 env-gated trace lines | Folded: the one such emitter here, `[HOST-ZONE-ALLOC]` (`GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1`), is scored at five points. Each sets the variable on its own command line and must be trace-live, meaning at least one `[HOST-ZONE-ALLOC]` line of any cohort in the same run, or it is VOID, which counts as failed. The §M57 (a) RED, which scores a line's presence, is VOID when not live. | §7 preamble, C4 steps 2, 3, 5, RED |
+| §M68 (a) one owner per deletion | Folded (see m-5). | §4.4 notify, §7 C4 source gate |
+| §M69 (a)-(d) | (a) I-1; (b) I-2 (1); (c) I-2 (2); (d) I-2 (3). | as the rows above |
+| r5 H notes N1-N3 (tracker hygiene) | Not doc changes: llama.cpp-30r1's DEVICE wording, g2a7's env-var name, and dsab's cites and test switch are relayed to the lead. | - |
