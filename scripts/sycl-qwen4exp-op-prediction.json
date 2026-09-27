@@ -2,10 +2,10 @@
   "_comment": "Static SYCL placement prediction for the qwen4exp (Qwen3.8-Flash-Next Q8_0) graph, derived at fefb92980. Read by scripts/parse-sycl-sched-census.py --prediction; the reasoning and the inventory live in docs/backend/sycl-qwen4exp-op-census.md. Rules are matched in order, first match wins: op is compared at the printer's %10.10s width, name and src0 are regexes over the %20.20s-truncated node and src[0] names. 'count' is the predicted node count per graph (n_tokens 1 and 512 alike) where it is exact. Line numbers are ggml/src/ggml-sycl/ggml-sycl.cpp unless a file is named.",
   "model": "qwen4exp / Qwen3.8-Flash-Next-Q8_0",
   "rules": [
-    {"id": "IN-TOK-EMBD", "op": "GET_ROWS", "src0": "^token_embd\\.weight$", "expect": "CPU", "verdict": "BY-DESIGN",
-     "cite": "input layer: tok_embd lives in the input-layer (host) buffer and GET_ROWS is never offloaded (get_op_batch_size returns 0 for GET_ROWS, :108846-108850)"},
-    {"id": "IN-PLE-GATHER", "op": "GET_ROWS", "src0": "^per_layer_token_embd", "expect": "CPU", "verdict": "BY-DESIGN",
-     "cite": "PLE n-gram gather over the 50.66 GiB per_layer_token_embd table, an input-layer tensor (src/llama-arch.cpp:915); CPU-executed by the STORAGE-tier design", "count": 1},
+    {"id": "IN-TOK-EMBD", "op": "GET_ROWS", "src0": "^token_embd\\.weight$", "expect": "SYCL", "verdict": "SUSPECT",
+     "cite": "input layer is the CPU device's buft list (src/llama-model.cpp:2338), whose first entry is the first GPU's host buffer type, ahead of the CPU buffer (make_cpu_buft_list, :1765-1777); the scheduler gives the gather the backend of that SYCL_Host buffer, so SYCL0 runs it -- measured on the B70 Mistral control (token_embd.weight [SYCL0]). Suspect under placement-decides-executor: a GPU gather over a host-pinned table"},
+    {"id": "IN-PLE-GATHER", "op": "GET_ROWS", "src0": "^per_layer_token_embd", "expect": "SYCL", "verdict": "SUSPECT", "count": 1,
+     "cite": "same input-layer buft list as IN-TOK-EMBD (per_layer_token_embd is LLM_TENSOR_LAYER_INPUT, src/llama-arch.cpp:915), so the 50.66 GiB PLE table would sit in a SYCL_Host pinned buffer and SYCL0 would gather from it; the storage-tier design (llama.cpp-th32) intends CPU/SSD. Predicted from the Mistral token gather, not measured"},
 
     {"id": "HC-PRE-FUSED", "op": "DSV4_HC_PRE", "expect": "CPU", "verdict": "UNSUPPORTED", "count": 96,
      "cite": "no GGML_OP_DSV4_HC_PRE case, falls to default:false (:108772); kept fused on CPU by the CPU-landing exemption in resolve_fused_ops (src/llama-context.cpp:1263) instead of reverting to the unfused SYCL chain"},

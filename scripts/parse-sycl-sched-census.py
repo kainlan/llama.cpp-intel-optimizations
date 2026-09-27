@@ -18,6 +18,18 @@ without -lv 5 (or -v) the log holds no dump at all.  That, and
 GGML_SCHED_DEBUG=1 (headers without node lines), are reported as VOID (exit 2)
 rather than as an empty census, because an empty census reads as "no gaps".
 
+Each line above is assembled from several GGML_LOG_DEBUG calls (the head, then
+one per source, then the newline), and common_log prefixes every call on its
+own: the tools turn prefix and timestamps on in common_init()
+(common/common.cpp), before argument parsing, so a default capture reads
+
+    node #  0 (  GET_ROWS): ... use=2,c=1:4.34.329.872 D     token_embd.weight (...
+
+with a "<M.ss.mmm.uuu> D " fragment prefix in the middle of the line.  Those
+prefixes are stripped here (the timestamped form anywhere, the bare "D " form
+where a fragment starts), so --no-log-prefix is a convenience, not a
+requirement.  A dump that still cannot be classified by n_tokens is VOID.
+
 What the dump cannot show, so neither can this census:
   * tensor types -- only op, name, size and backend are printed.  With
     --tensor-types, src[0] weight names are resolved to a GGUF type.
@@ -46,6 +58,17 @@ VERDICTS = ("SUPPORTED", "UNSUPPORTED", "SUSPECT", "BY-DESIGN", "PLACEMENT")
 OP_WIDTH = 10
 NAME_WIDTH = 20
 
+# common_log's per-call prefix (common/log.cpp): "<M>.<ss>.<mmm>.<uuu> <L> " with
+# timestamps, "<L> " without, optionally wrapped in colour escapes
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+TS_PREFIX_RE = re.compile(r"\d+\.\d{2}\.\d{3}\.\d{3} [DIWE] ")
+# without timestamps a fragment prefix is a bare level letter; stripped only on
+# lines that show that form (a node line opening with it, the source half of a
+# torn node line, or a split header whose ": " fragment carries it), where
+# fragments start after ':', ']', 's' ("inputs") or a space
+BARE_LINE_RE = re.compile(r"^[DIWE] node #|^[DIWE]  |^## SPLIT #\d+: \S+ # \d+ inputs[DIWE] ")
+BARE_FRAG_RE = re.compile(r"(?:^|(?<=[:\]s ]))[DIWE] (?=[ \[:n]|$)")
+
 SPLIT_RE = re.compile(r"## SPLIT #(\d+): (\S+) # (\d+) inputs")
 NODE_RE = re.compile(
     r"node #\s*(\d+) \(\s*([^)]*?)\): (.{%d}) \(\s*(\S*)\) \[\s*(\S*) ?.{0,8}\] use=(\d+),c=(\d+):" % NAME_WIDTH)
@@ -56,6 +79,13 @@ SIZE_RE = re.compile(r"^(\d+)([KM])$")
 # build_inp_embd() leaves it unnamed; some builders name it afterwards.
 INPUT_EMBED_NAMES = ("model.input_embed", "inp_embd")
 INPUT_EMBED_WEIGHT = "token_embd.weight"
+
+
+def strip_log_prefixes(line: str) -> str:
+    line = TS_PREFIX_RE.sub("", ANSI_RE.sub("", line))
+    if BARE_LINE_RE.search(line):
+        line = BARE_FRAG_RE.sub("", line)
+    return line
 
 
 def parse_size(s: str) -> int | None:
@@ -105,6 +135,7 @@ def parse_dumps(lines) -> list[Dump]:
     cur: Split | None = None
     pending_node: Node | None = None
     for line in lines:
+        line = strip_log_prefixes(line)
         m = SPLIT_RE.search(line)
         if m:
             idx = int(m.group(1))
@@ -356,6 +387,15 @@ def main(argv=None) -> int:
     by_class: dict = {}
     for d in dumps:
         by_class[d.n_tokens(args.n_embd)] = d
+    if None in by_class:
+        # one unclassifiable dump means the gather's src[0] was not read (a
+        # prefix this parser does not strip) or --n-embd is wrong; either way
+        # the other classes cannot be trusted to be complete
+        n_none = sum(1 for d in dumps if d.n_tokens(args.n_embd) is None)
+        print(f"VOID: {n_none} of {len(dumps)} dumps have no token-embedding GET_ROWS "
+              f"with src[0] {INPUT_EMBED_WEIGHT} and a readable size, so their n_tokens is unknown",
+              file=sys.stderr)
+        return 2
     wanted = args.n_tokens or [k for k in by_class]
     missing = [k for k in wanted if k not in by_class]
     if missing:

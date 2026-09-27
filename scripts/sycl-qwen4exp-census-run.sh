@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Lead-run capture for the qwen4exp SYCL op census
 # (docs/backend/sycl-qwen4exp-op-census.md). GPU work: run it from the lead
-# session only, one invocation at a time, never in a subagent or a loop.
+# session only, holding GPU.lock, one invocation at a time, never in a
+# subagent or a loop. This script does not take GPU.lock itself.
 #
 #   scripts/sycl-qwen4exp-census-run.sh <mode> <device> <outdir>
 #
@@ -9,89 +10,147 @@
 #                        (GGML_SYCL_FLASH_ATTN_EXT=0, fattn.cpp:2438) and -fa on:
 #                        a known split, 32 FLASH_ATTN_EXT nodes on CPU per graph.
 #           control-off  the same run without the decline: 32 on SYCL0.
-#           qwen4exp     the census itself.
+#           vehicle      the synthetic qwen4exp model (QWEN4EXP_VEHICLE, see the
+#                        census doc for how the lead generates it): 2 layers,
+#                        every qwen4exp op family, fits on either card.
+#           qwen4exp     the census on the real 177 GiB model. Needs 200 GiB
+#                        MemAvailable, which this host does not have under its
+#                        permanent load (the doc says what this waits on).
 #   device  0 = B70, 1 = B50 (level_zero index; the iGPU is never selected)
 #   outdir  receives run.err (the sched dump), run.out, mem.log, census.md
 #
 # One single-invocation llama-completion per call, wrapped by bench-guard
-# (Shmem ceiling, GPU-fault journal check, timeout -k). A watchdog samples
-# /proc/meminfo every 2 s and kills the run's process group if MemAvailable
+# (net-of-tmpfs Shmem ceiling, GPU-fault journal check, timeout -k, and a
+# VALID/SUSPECT verdict that this script enforces). A watchdog samples
+# /proc/meminfo every 2 s and kills the run's whole session if MemAvailable
 # drops under WATCHDOG_FLOOR_GB (default 20).
 #
 # The dump is GGML_LOG_DEBUG output: it needs GGML_SCHED_DEBUG=2 (1 prints
 # split headers only) AND -lv 5, because common_log drops DEBUG below
 # verbosity 5. It goes to stderr, captured apart from stdout so tokens cannot
-# tear its lines. Do not add --log-prefix/--log-timestamps: the dump is
-# assembled from several log calls per line and a prefix lands mid-line.
+# tear its lines. common_init() turns a per-call "<time> D " prefix on, which
+# lands mid-line in the dump; --no-log-prefix removes it (the parser strips it
+# too, so a capture taken without the flag is still readable).
 #
 # Exit: the parser's status (0 parsed, 2 VOID or control not met), or 3 when
-# the run itself was refused, killed or failed.
+# the run was refused, killed, failed, or stamped SUSPECT by bench-guard.
 
 # no `set -u`: setvars.sh reads unset variables and would kill this script
 set -o pipefail
 
 MODE="${1:-}" DEV="${2:-}" OUT="${3:-}"
-case "$MODE" in control-on|control-off|qwen4exp) ;; *) echo "usage: $0 control-on|control-off|qwen4exp 0|1 <outdir>" >&2; exit 1;; esac
+case "$MODE" in control-on|control-off|vehicle|qwen4exp) ;; *) echo "usage: $0 control-on|control-off|vehicle|qwen4exp 0|1 <outdir>" >&2; exit 1;; esac
 case "$DEV" in 0|1) ;; *) echo "device must be 0 (B70) or 1 (B50)" >&2; exit 1;; esac
 [ -n "$OUT" ] || { echo "no outdir" >&2; exit 1; }
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${LLAMA_COMPLETION:-$ROOT/build/bin/llama-completion}"
 QWEN_MODEL="${QWEN4EXP_MODEL:-/models/Qwen3.8-Flash-Next-GGUF/Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf}"
+VEHICLE_MODEL="${QWEN4EXP_VEHICLE:-}"
 MISTRAL_MODEL="${MISTRAL_MODEL:-/models/mistral-7b-v0.1.Q4_0.gguf}"
 FLOOR_GB="${WATCHDOG_FLOOR_GB:-20}"
+SETTLE_TIMEOUT_S="${SETTLE_TIMEOUT_S:-600}"
 mkdir -p "$OUT" || exit 1
-
-# the gates are blind to a CPU-only build (CLAUDE.md), so check the backend is in the binary
-grep -qE '^GGML_SYCL:BOOL=ON' "$ROOT/build/CMakeCache.txt" || { echo "GGML_SYCL is not ON in build/CMakeCache.txt" >&2; exit 3; }
-[ "$(ldd "$BIN" | grep -cE 'libggml-sycl|libsycl')" -ge 2 ] || { echo "$BIN does not link the SYCL backend" >&2; exit 3; }
 
 if [ -z "${ONEAPI_ROOT:-}" ]; then
     # shellcheck disable=SC1091
     source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 fi
 
+# the gates are blind to a CPU-only build (CLAUDE.md), so check the backend is
+# in the binary; after setvars, so the oneAPI libraries resolve, and counting
+# only resolved entries ("=> /path"), never "not found"
+grep -qE '^GGML_SYCL:BOOL=ON' "$ROOT/build/CMakeCache.txt" || { echo "GGML_SYCL is not ON in build/CMakeCache.txt" >&2; exit 3; }
+[ "$(ldd "$BIN" | grep -E 'libggml-sycl|libsycl' | grep -c '=> /')" -ge 2 ] || { echo "$BIN does not link a resolvable SYCL backend" >&2; exit 3; }
+
 meminfo_kb() { awk -v k="$1:" '$1 == k { print $2 }' /proc/meminfo; }
-stamp() { echo "$(date +%T) $1 Shmem=$(( $(meminfo_kb Shmem) / 1048576 ))G MemAvailable=$(( $(meminfo_kb MemAvailable) / 1048576 ))G" | tee -a "$OUT/mem.log"; }
+shmem_gb() { echo $(( $(meminfo_kb Shmem) / 1048576 )); }
+avail_gb() { echo $(( $(meminfo_kb MemAvailable) / 1048576 )); }
+stamp() { echo "$(date +%T) $1 Shmem=$(shmem_gb)G MemAvailable=$(avail_gb)G" | tee -a "$OUT/mem.log"; }
 
-# qwen4exp keeps ~120 GiB of experts and the 50.66 GiB PLE table in host
-# memory; refuse to start without room for them
-if [ "$MODE" = qwen4exp ]; then
-    NEED_GB=200 BUDGET=1800 MODEL="$QWEN_MODEL"
-    # structural controls: the dump must be the whole qwen4exp graph
-    REQUIRE=(--require GATED_DELTA_NET=ANY:36 --require MUL_MAT_ID=ANY:144)
-    EXTRA_ENV=() FA=(-fa auto)
-    PREDICTION=(--prediction "$ROOT/scripts/sycl-qwen4exp-op-prediction.json")
-    N_EMBD=2560
-else
-    NEED_GB=30 BUDGET=300 MODEL="$MISTRAL_MODEL" FA=(-fa on) PREDICTION=() N_EMBD=4096
-    if [ "$MODE" = control-on ]; then
+REQUIRE=() EXTRA_ENV=() PREDICTION=()
+case "$MODE" in
+    qwen4exp)
+        # ~120 GiB of experts and the 50.66 GiB PLE table are read into host
+        # memory: SYCL leaves mmap_support unset, so the loader turns mmap off
+        NEED_GB=200 BUDGET=1800 MODEL="$QWEN_MODEL" FA=(-fa auto) N_EMBD=2560
+        # structural controls: the dump must be the whole qwen4exp graph
+        REQUIRE=(--require GATED_DELTA_NET=ANY:36 --require MUL_MAT_ID=ANY:144 --require TOP_K=ANY:12)
+        PREDICTION=(--prediction "$ROOT/scripts/sycl-qwen4exp-op-prediction.json")
+        ;;
+    vehicle)
+        [ -n "$VEHICLE_MODEL" ] && [ -f "$VEHICLE_MODEL" ] || { echo "set QWEN4EXP_VEHICLE to the quantized synthetic qwen4exp GGUF" >&2; exit 1; }
+        NEED_GB=30 BUDGET=600 MODEL="$VEHICLE_MODEL" FA=(-fa auto) N_EMBD=256
+        # 2 layers: one GDN layer, one QSA layer, MoE on both -- 2 MUL_MAT_ID per
+        # layer if the fixture creates the merged ffn_gate_up_exps, else 3
+        REQUIRE=(--require GATED_DELTA_NET=ANY:1 --require MUL_MAT_ID=ANY:4 --require TOP_K=ANY:1)
+        PREDICTION=(--prediction "$ROOT/scripts/sycl-qwen4exp-op-prediction.json")
+        ;;
+    control-on)
+        NEED_GB=30 BUDGET=600 MODEL="$MISTRAL_MODEL" FA=(-fa on) N_EMBD=4096
         EXTRA_ENV=(GGML_SYCL_FLASH_ATTN_EXT=0) REQUIRE=(--require FLASH_ATTN_EXT=CPU:32)
-    else
-        EXTRA_ENV=() REQUIRE=(--require FLASH_ATTN_EXT=SYCL:32)
+        ;;
+    control-off)
+        NEED_GB=30 BUDGET=600 MODEL="$MISTRAL_MODEL" FA=(-fa on) N_EMBD=4096
+        REQUIRE=(--require FLASH_ATTN_EXT=SYCL:32)
+        ;;
+esac
+
+# CLAUDE.md's post-lock settle: TTM shmem release lags the previous run, so
+# wait for Shmem < 30 GB and MemAvailable > 150 GB (and the mode's own need)
+# before touching the device; give up after SETTLE_TIMEOUT_S and escalate
+[ "$NEED_GB" -gt 150 ] || NEED_GB=150
+waited=0
+until [ "$(shmem_gb)" -lt 30 ] && [ "$(avail_gb)" -ge "$NEED_GB" ]; do
+    if [ "$waited" -ge "$SETTLE_TIMEOUT_S" ]; then
+        stamp "refused: not settled after ${waited}s"
+        echo "host did not settle to Shmem < 30 GB and MemAvailable >= ${NEED_GB} GB in ${waited}s; release GPU.lock and escalate" >&2
+        exit 3
     fi
-fi
+    sleep 10; waited=$((waited + 10))
+done
+stamp "pre (settled after ${waited}s)"
 
-stamp "pre"
-[ "$(( $(meminfo_kb Shmem) / 1048576 ))" -lt 30 ] || { echo "Shmem >= 30 GB before the run; let the host settle" >&2; exit 3; }
-[ "$(( $(meminfo_kb MemAvailable) / 1048576 ))" -ge "$NEED_GB" ] || { echo "MemAvailable < ${NEED_GB} GB; refusing" >&2; exit 3; }
-
-# its own session, so the watchdog can kill the whole group by pid
-ONEAPI_DEVICE_SELECTOR="level_zero:$DEV" setsid "$ROOT/scripts/bench-guard.sh" --budget "$BUDGET" -- \
+# setsid does not fork here (a background, non-job-control shell), so RUN_PID
+# is the session id of bench-guard, timeout and llama-completion alike; that is
+# checked right after the launch. The kill must go by session, not process
+# group: timeout puts itself and the binary into a group of their own
+# (setpgid), which a group kill misses.
+ONEAPI_DEVICE_SELECTOR="level_zero:$DEV" setsid -w "$ROOT/scripts/bench-guard.sh" --budget "$BUDGET" -- \
     env GGML_SCHED_DEBUG=2 "${EXTRA_ENV[@]}" "$BIN" -m "$MODEL" -ngl 99 -c 4096 -b 512 -ub 512 "${FA[@]}" \
-        --no-warmup -no-cnv -lv 5 --seed 42 --temp 0 -p '1, 2, 3, 4, 5,' -n 2 \
+        --no-warmup -no-cnv -lv 5 --no-log-prefix --no-log-timestamps --seed 42 --temp 0 \
+        -p '1, 2, 3, 4, 5,' -n 2 \
     > "$OUT/run.out" 2> "$OUT/run.err" &
 RUN_PID=$!
 
+session_alive() { pgrep -s "$RUN_PID" >/dev/null 2>&1; }
+
+sleep 1
+if [ "$(ps -o sid= -p "$RUN_PID" | tr -d ' ')" != "$RUN_PID" ]; then
+    # setsid forked, so the session this script would watch and kill is not
+    # RUN_PID's; refuse rather than run with an inert watchdog
+    echo "setsid forked: pid $RUN_PID is not its own session leader; the watchdog could not kill the run" >&2
+    child="$(pgrep -P "$RUN_PID" | head -1)"
+    [ -n "$child" ] && pkill -TERM -s "$child" 2>/dev/null
+    kill -TERM "$RUN_PID" 2>/dev/null
+    exit 3
+fi
+
+# TERM the session, give it 5 s, KILL what is left, then block until the
+# session is empty so no stamp or exit happens while the load still allocates
+kill_session() {
+    pkill -TERM -s "$RUN_PID" 2>/dev/null
+    for _ in 1 2 3 4 5; do session_alive || return 0; sleep 1; done
+    pkill -KILL -s "$RUN_PID" 2>/dev/null
+}
+
 KILLED=0
 while kill -0 "$RUN_PID" 2>/dev/null; do
-    avail_gb=$(( $(meminfo_kb MemAvailable) / 1048576 ))
-    echo "$(date +%T) Shmem=$(( $(meminfo_kb Shmem) / 1048576 ))G MemAvailable=${avail_gb}G" >> "$OUT/mem.log"
-    if [ "$avail_gb" -lt "$FLOOR_GB" ]; then
-        echo "watchdog: MemAvailable ${avail_gb} GB < ${FLOOR_GB} GB, killing process group $RUN_PID" | tee -a "$OUT/mem.log" >&2
-        kill -TERM -- "-$RUN_PID" 2>/dev/null
-        sleep 10
-        kill -KILL -- "-$RUN_PID" 2>/dev/null
+    a=$(avail_gb)
+    echo "$(date +%T) Shmem=$(shmem_gb)G MemAvailable=${a}G" >> "$OUT/mem.log"
+    if [ "$a" -lt "$FLOOR_GB" ]; then
+        echo "watchdog: MemAvailable ${a} GB < ${FLOOR_GB} GB, killing session $RUN_PID" | tee -a "$OUT/mem.log" >&2
+        kill_session
         KILLED=1
         break
     fi
@@ -99,6 +158,18 @@ while kill -0 "$RUN_PID" 2>/dev/null; do
 done
 wait "$RUN_PID"
 RUN_RC=$?
+
+# bench-guard exiting does not prove its children did; wait for the session
+waited=0
+while session_alive; do
+    if [ "$waited" -ge 120 ]; then
+        stamp "session $RUN_PID still alive after ${waited}s"
+        echo "session $RUN_PID still has live processes after ${waited}s (D state?); do NOT start another GPU run -- check it by hand" >&2
+        exit 3
+    fi
+    [ "$waited" -eq 30 ] && kill_session
+    sleep 2; waited=$((waited + 2))
+done
 sleep 5
 stamp "post+5s rc=$RUN_RC"
 
@@ -107,8 +178,20 @@ if [ "$KILLED" = 1 ] || [ "$RUN_RC" -ne 0 ]; then
     exit 3
 fi
 
-python3 "$ROOT/scripts/parse-sycl-sched-census.py" "$OUT/run.err" --n-embd "$N_EMBD" \
+# bench-guard exits with the command's rc; its verdict lives only in its
+# stderr line, so a GPU fault during an rc=0 run is caught here or nowhere
+verdict="$(grep -E '^bench-guard: (VALID|SUSPECT)' "$OUT/run.err" | tail -1)"
+case "$verdict" in
+    "bench-guard: VALID"*) ;;
+    *)
+        echo "bench-guard did not stamp the run VALID (${verdict:-no verdict line}); the census is void." >&2
+        echo "check the GPU before the next run: journalctl -k --since '1 hour ago' --no-pager | grep -iE 'GT reset|guc_id|CAT error'" >&2
+        exit 3
+        ;;
+esac
+
+python3 "$ROOT/scripts/parse-sycl-sched-census.py" "$OUT/run.err" --n-embd "$N_EMBD" --n-tokens 1 --n-tokens 512 \
     "${PREDICTION[@]}" "${REQUIRE[@]}" > "$OUT/census.md"
 PARSE_RC=$?
-echo "parser rc=$PARSE_RC; census in $OUT/census.md"
+echo "$verdict; parser rc=$PARSE_RC; census in $OUT/census.md"
 exit "$PARSE_RC"

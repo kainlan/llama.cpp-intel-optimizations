@@ -3,16 +3,21 @@
 Tracker: `llama.cpp-k6jy`. Tree: master `fefb92980` (the upstream `694ec2354` merge, which brings in
 qwen4exp from upstream `6c84c7d5d`, #27742).
 
-**Status: static prediction done; measured columns are LEAD-RUN PENDING.** Nothing in this document
-comes from a device run. Every "measured" cell is empty until the lead runs the commands in
-[Lead-run census](#lead-run-census) and fills them from `census.md`.
+**Status: static prediction done; qwen4exp columns are LEAD-RUN PENDING.** The only device runs so
+far are the two Mistral controls on the B70 (see [Lead-run census](#lead-run-census)). Every qwen4exp
+"measured" cell is empty until the lead fills it from a `census.md`.
+
+**The real model cannot be censused on this host yet.** It needs about 175 GiB of host memory, because
+SYCL forces mmap off, and MemAvailable measures 151-159 GB under the host's permanent load. The census
+runs first on a synthetic qwen4exp vehicle; see [The census vehicle](#the-census-vehicle).
 
 Line numbers without a file name are `ggml/src/ggml-sycl/ggml-sycl.cpp` at `fefb92980`.
 
 ## Summary of the prediction
 
-On an all-offloaded run (`-ngl 99`), five op families are predicted to leave the SYCL backend.
-One of them is the PLE gather, which is CPU work by design. The other four are gaps.
+On an all-offloaded run (`-ngl 99`), four op families are predicted to leave the SYCL backend, and
+all four are capability gaps. The input gathers are predicted to stay on SYCL0, but that is itself
+suspect (last row).
 
 | family | op as printed | nodes per graph | why | class |
 |---|---|---:|---|---|
@@ -20,24 +25,42 @@ One of them is the PLE gather, which is CPU work by design. The other four are g
 | hyper-connection combine | `DSV4_HC_POST` | 96 | no SYCL case, `default: false` (:108772) | gap |
 | GDN gate softplus | `SOFTPLUS` | 36 | not in the UNARY switch (:108205-108240); no softplus kernel in `ggml-sycl/` | gap |
 | QSA indexer top-k | `TOP_K` | 12 | admitted only for `k <= 32` (:108684-108687); the indexer asks for up to 2051 | gap |
-| token + PLE gathers | `GET_ROWS` | 2 | input-layer tensors (the PLE table is 50.66 GiB) | by design |
+| token + PLE gathers | `GET_ROWS` | 2 | the input layer's first buffer type is SYCL_Host, so the scheduler runs the gather on SYCL0 over a pinned host table (measured for `token_embd` on the Mistral control) | suspect: placement |
 
-That is 242 CPU nodes per graph in 241 CPU splits, which comes to roughly 480 splits for each decode
-token (every island costs a CPU split plus the SYCL split that follows it). The HC islands dominate,
+That is 240 CPU nodes per graph in about 240 CPU splits, which comes to roughly 480 splits for each
+decode token (every island costs a CPU split plus the SYCL split that follows it). The HC islands dominate,
 and they exist only because of a fork-side rule; see
 [The HC ops stay fused on the CPU](#the-hc-ops-stay-fused-on-the-cpu).
 
-Two rows are **suspect** even though they are predicted to stay on SYCL:
+Four rows are **suspect** even though they are predicted to stay on SYCL:
 
 - `GATED_DELTA_NET` (36 nodes). It is admitted unconditionally (:108728-108729). The kernel aborts
   on unsupported shapes rather than declining them, and it has no chunked PP kernel. It is also in
   the same family as `llama.cpp-30h4` (Qwen3.6-27B produces garbage prefill on SYCL). qwen4exp has 36
   of these layers.
-- The BF16 indexer projections (24 `MUL_MAT`). They are admitted only through a one-time F32
-  materialization at dispatch (:108305-108325), which keeps its own cache outside the planner.
+- The BF16 indexer projections (24 `MUL_MAT`). They are admitted only through an F32 materialization
+  decided at dispatch (:108305-108325). Its cache holds `mem_handle`s (:14177), so ownership is
+  sanctioned. The layout decision is the problem: dispatch makes it, not the planner.
+- `FILL` (24). It is admitted unconditionally (:108753); the kernel asserts a contiguous F32/F16 dst.
+- The input gathers (`token_embd`, `per_layer_token_embd`). The input layer's buffer list is the CPU
+  device's, but its first entry is the first GPU's host buffer type (`src/llama-model.cpp:1765-1777`,
+  `:2338`). The scheduler hands a leaf the backend of its buffer, so SYCL0 gathers from a pinned host
+  table. The B70 Mistral control shows this for `token_embd`
+  (`node #0 (GET_ROWS) embd [SYCL0]`, `token_embd.weight [SYCL0]`). For qwen4exp that would put the
+  50.66 GiB PLE table in pinned host memory with a GPU reading it. The census has to show which
+  happens.
 
-A third row depends on placement: MoE `SWIGLU`. Layers whose experts the planner put on the host
-may run their GLU on the CPU (:109207). That follows placement and is not a capability gap.
+**CPU landings that are placement, not gaps.** `ggml_sycl_op_is_planned_on_host` (:109159) declines
+an op for any of these reasons. A CPU node the census shows for one of them follows placement and is
+not a ticket:
+- a `MUL_MAT` whose weight the planner executes on the host (:109185-109191);
+- a layer-plan op with a host-planned source (:109193-109199);
+- every op of a layer with `layer_device < 0` (:109225-109227);
+- MoE `SWIGLU`/`ADD_ID` for a layer whose experts are host-planned (`addid_glu_depends_host`, :109207).
+
+The KV-host residency check (:108067-108131) also declines `FLASH_ATTN_EXT` over demoted KV. On the
+full model, the experts are host-resident but `MUL_MAT_ID` is admitted residency-blind (:108134), so
+the host experts show as SYCL0 nodes running through the CpuExpertPool.
 
 ## Model facts (GGUF header only)
 
@@ -92,6 +115,13 @@ cross-check on the census:
 ```
 resolve_fused_ops: fused DeepSeek V4 HC pre executes on CPU for 96 layer(s) (e.g. layer 47) -- the executor follows data placement, not a capability gap
 ```
+
+Two corrections apply to that line:
+- **"96 layer(s)" counts fused nodes, not layers.** `n_cpu_landings` is incremented once per node
+  (`src/llama-context.cpp:1263`), and there are two HC pre-mixers per layer, so 96 is 48 layers x 2.
+  The vehicle prints 4 for its 2 layers.
+- **"not a capability gap" is false for HC.** The exemption cannot tell a capability decline from
+  placement, so it prints the placement wording for both (ticket P4).
 
 ## Op inventory and static SYCL verdict
 
@@ -208,7 +238,7 @@ unaffected, but no MMID kernel on this fork has been exercised at K = 640 or N =
 
 | op | src types -> dst | shape class | count | verdict | cite | B70 | B50 |
 |---|---|---|---:|---|---|---|---|
-| GET_ROWS `per_layer_token_embd` | q8_0 -> f32 | [160, 320001536] by i32 [16T] | 1 | BY-DESIGN (CPU) | input-layer tensor, `src/llama-arch.cpp:915` | | |
+| GET_ROWS `per_layer_token_embd` | q8_0 -> f32 | [160, 320001536] by i32 [16T] | 1 | **SUSPECT** (SYCL0 over SYCL_Host) | input-layer tensor (`src/llama-arch.cpp:915`) in the input buft list, whose first entry is SYCL_Host (`src/llama-model.cpp:1765-1777`) | | |
 | MUL_MAT `ple_key`, `ple_value` | q8_0 x f32 | [2560 -> 10240], [2560 -> 2560] | 1 each | SUPPORTED | :108271-108354 | | |
 | RMS_NORM + MUL (grouped) x3 | f32 | [2560,4,T] | 3 each | SUPPORTED | :108597-108607 | | |
 | MUL, SUM_ROWS, SCALE | f32 | [2560,4,T] -> [1,4,T] | 1 each | SUPPORTED | :108677-108680 | | |
@@ -222,7 +252,7 @@ unaffected, but no MMID kernel on this fork has been exercised at K = 640 or N =
 
 | op | src types -> dst | shape class | count | verdict | cite | B70 | B50 |
 |---|---|---|---:|---|---|---|---|
-| GET_ROWS `token_embd` | q8_0 -> f32 | [2560, 248320] by i32 [T] | 1 | BY-DESIGN (CPU) | input layer; `get_op_batch_size` returns 0 for GET_ROWS (:108846-108850) | | |
+| GET_ROWS `token_embd` | q8_0 -> f32 | [2560, 248320] by i32 [T] | 1 | **SUSPECT** (SYCL0 over SYCL_Host) | same buft list; measured SYCL0 for the Mistral control's gather | | |
 | GET_ROWS `out_ids` (last layer) | f32 | cur, inject, res_hc | 3 | SUPPORTED | :108356-108373 | | |
 | MUL_MAT `output` | q8_0 x f32 | [2560 -> 248320] | 1 | SUPPORTED | :108271-108354 | | |
 
@@ -237,6 +267,9 @@ The dump shows scheduler placement only. Read these gaps before calling a row cl
   - the KV-host flash-attention intercept.
 
   For qwen4exp this covers most of the 119.5 GiB of experts.
+- **Where a weight lives.** A leaf's backend label is the backend of its buffer. A SYCL_Host pinned
+  buffer therefore reads `[SYCL0]` exactly like device memory, and the dump cannot tell the two
+  apart. That is why the input-gather rows are SUSPECT, not measured facts.
 - **Wrong answers.** An op on SYCL0 can still be wrong. `GATED_DELTA_NET` needs its own correctness
   check (P5).
 - **Types.** The dump prints no tensor types. The types in the tables above come from the GGUF
@@ -247,169 +280,355 @@ The dump shows scheduler placement only. Read these gaps before calling a row cl
 
 ## Lead-run census
 
-GPU work, lead session only, one command at a time. `scripts/sycl-qwen4exp-census-run.sh` wraps
-each run. It checks that `GGML_SYCL` is ON and that the binary links the SYCL backend, samples
-`Shmem`/`MemAvailable` before the run and 5 s after it, and refuses to start if Shmem is at least
-30 GB or MemAvailable is under the floor (qwen4exp 200 GB, control 30 GB). It then runs through
-`bench-guard.sh`, which applies the timeout, the GPU-fault journal check and a VALID/SUSPECT
-stamp. A watchdog samples every 2 s into `mem.log` and kills the run's process group if
-MemAvailable drops under 20 GB. Finally it runs the parser.
+GPU work, lead session only, holding `GPU.lock`, one command at a time.
+`scripts/sycl-qwen4exp-census-run.sh` wraps each run and does not take the lock itself. In order, it:
+
+1. Sources oneAPI when needed, then checks that `GGML_SYCL` is ON and that `ldd` resolves at least
+   two SYCL libraries (it counts only lines with `=> /`, never "not found").
+2. Waits for CLAUDE.md's post-lock settle: Shmem < 30 GB and MemAvailable >= max(150 GB, the mode's
+   need). The qwen4exp need is 200 GB. After 600 s (`SETTLE_TIMEOUT_S`) it exits 3 with "release
+   GPU.lock and escalate".
+3. Launches the run in its own session through `bench-guard.sh`. bench-guard enforces the budget
+   (`timeout -k`), refuses to start if Shmem net of tmpfs exceeds its 10 GiB ceiling
+   (`bench-guard.sh:73,190`), checks the kernel journal for GPU faults, and stamps VALID or SUSPECT.
+   Its ceiling is the binding pre-run gate; the script's Shmem < 30 GB check is the looser one.
+4. Runs a watchdog that samples every 2 s into `mem.log`. If MemAvailable drops under 20 GB it kills
+   the **session**, TERM then KILL after 5 s. A process-group kill would miss the binary, because
+   `timeout` moves itself and its child into their own group.
+5. Blocks until the session is empty before it stamps the post sample or exits. If a process
+   survives 120 s it exits 3 with "do NOT start another GPU run".
+6. Fails the run (exit 3) unless `run.err` carries `bench-guard: VALID`. bench-guard exits with the
+   command's rc, so a GPU fault during an rc 0 run shows up only in that line.
+7. Runs the parser with `--n-tokens 1 --n-tokens 512`, so a dump class that is missing, or that
+   cannot be classified, is VOID (exit 2).
 
 What each run executes, for reference:
 
 ```bash
-ONEAPI_DEVICE_SELECTOR=level_zero:<0|1> scripts/bench-guard.sh --budget <300|1800> -- \
+ONEAPI_DEVICE_SELECTOR=level_zero:<0|1> setsid -w scripts/bench-guard.sh --budget <600|1800> -- \
   env GGML_SCHED_DEBUG=2 ./build/bin/llama-completion -m <model> -ngl 99 -c 4096 -b 512 -ub 512 \
-    -fa <on|auto> --no-warmup -no-cnv -lv 5 --seed 42 --temp 0 -p '1, 2, 3, 4, 5,' -n 2 \
-  > run.out 2> run.err
+    -fa <on|auto> --no-warmup -no-cnv -lv 5 --no-log-prefix --no-log-timestamps --seed 42 --temp 0 \
+    -p '1, 2, 3, 4, 5,' -n 2 > run.out 2> run.err
 ```
 
 Why each flag matters:
 
 - `GGML_SCHED_DEBUG=2`. At 1, the dump prints split headers only; at 2 it adds per-node backend
   lines (`ggml-backend.cpp:1734`). The parser returns VOID on a headers-only log.
-- `-lv 5` (or `-v`). The dump is `GGML_LOG_DEBUG`, and `common_log` drops DEBUG below verbosity 5
-  (`common/log.cpp:109`). Without it the log holds no dump at all, which the parser also
-  reports as VOID rather than "no splits".
+- `-lv 5`. The dump is `GGML_LOG_DEBUG`, and `common_log` drops DEBUG below verbosity 5
+  (`common/log.cpp:109`). Without it the log holds no dump at all, which the parser reports as VOID
+  rather than "no splits".
+- `--no-log-prefix --no-log-timestamps`. `llama-completion` calls `common_init()`
+  (`tools/completion/completion.cpp:92`) before it parses its arguments, and `common_init()` turns
+  on a prefix and timestamps (`common/common.cpp:391-392`). common_log prefixes **each** log call,
+  so a default capture has `<M.ss.mmm.uuu> D ` in the middle of every dump line, between the node
+  and its sources. The first version of this document said the opposite, and its parser lost
+  `src[0]` on every node of the lead's control runs: `n_tokens classes: [None]`. The parser now
+  strips both prefix forms, and `tests/golden/sched-census-mistral-b70-excerpt.err` (an excerpt of
+  that capture) gates it. The flags stay because they keep the log readable.
 - Stderr goes to a separate file. The dump goes to stderr. Merging stdout into it lets token output
   tear dump lines.
-- No `--log-prefix` or `--log-timestamps`. Each dump line is assembled from several log calls, and a
-  prefix would land mid-line.
 - `--no-warmup`. The MoE warmup graph activates all 512 experts, which changes the ARGSORT width
   and touches every host expert.
 - `-c 4096`. Without it, n_ctx_train is 262144 (see `llama.cpp-uize` for what a default context does
   on this fork).
 - Graph shapes. The reserve at `-ub 512` supplies the PP graph (T = 512), and the `-n 2` decode
-  supplies T = 1. The parser classifies each dump by the size of the token-embedding gather.
+  supplies T = 1. The parser classifies each dump by the size of the token-embedding gather, whose
+  `src[0]` is `token_embd.weight`. The gather node itself is unnamed or named `embd`, depending on
+  the model.
 
-Order and commands:
+### Measured so far: the controls (B70, `fefb92980` + `53eb4b700`)
+
+Both controls were run by the lead on 2026-09-27, one at a time. Shmem stayed flat at 1 G and the
+journal showed 0 GPU faults.
+
+| run | rc | bench-guard | FLASH_ATTN_EXT | wall |
+|---|---|---|---|---|
+| control-on (`GGML_SYCL_FLASH_ATTN_EXT=0`, `-fa on`) | 0 | VALID | CPU: 32 nodes in 32 CPU splits, per class | ~5 min (04:39:24 to 04:44:24): CPU FA at load 128 runs at 0.13 tok/s |
+| control-off | 0 | VALID | SYCL0: 32, 0 CPU splits | ~4 min (mem.log 04:44:24 to 04:48:34, load ~130) |
+
+With the fixed parser, both logs give the classes `[1, 16, 512]`, and `--n-tokens 1 --n-tokens 512`
+reports both. The placement control therefore discriminates both ways. The same logs showed
+`token_embd`'s gather on SYCL0 (see the input rows). The control budget is now 600 s, because
+both controls ran at 4-5 min against the old 300 s. MemAvailable at their start was 151 and 159 GB,
+which is where the 150 GB settle floor sits.
+
+### The census vehicle
+
+The real model does not fit the host today (next section), so the census runs first on a synthetic
+qwen4exp. `test-llama-archs -o` already writes one. Its qwen4exp fixture has:
+- n_embd 256 and 2 heads of 128;
+- 2 layers: layer 0 GDN (with PLE), layer 1 QSA (`full_attention_interval` 2, `qwen4exp.cpp:133`);
+- HC count 4, low rank 8;
+- compress ratio 4, indexer top_k 131072;
+- 2 experts, both used;
+- a "test" tokenizer.
+
+See `tests/test-llama-archs.cpp:250-299,418-459`.
+
+It must then be quantized. The fixture writes F32/F16 weights, and SYCL admits `MUL_MAT_ID` only for
+types in the MMID tables (:108150-108168). F32/F16 experts would put every `MUL_MAT_ID` on the CPU,
+which the Q8_0 model never does.
+
+```bash
+cd /Apps/llama.cpp && source /opt/intel/oneapi/setvars.sh --force
+O=/Apps/llama.cpp/census-k6jy; mkdir -p $O/vehicle
+# a. write the synthetic model: loads with an empty device list (test-llama-archs.cpp:597-599,953),
+#    but it is still a model load, so the lead runs it, pinned
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-llama-archs -a qwen4exp -o $O/vehicle   # -> qwen4exp-moe.gguf
+# b. Q8_0 like the real model, with the indexer projections BF16 like the real model
+./build/bin/llama-quantize --tensor-type 'indexer\.[qk]_proj=bf16' \
+    $O/vehicle/qwen4exp-moe.gguf $O/vehicle/qwen4exp-moe-q8_0.gguf Q8_0
+# c. the census, B70 then B50 (budget 600 s each)
+QWEN4EXP_VEHICLE=$O/vehicle/qwen4exp-moe-q8_0.gguf scripts/sycl-qwen4exp-census-run.sh vehicle 0 $O/vehicle-b70
+QWEN4EXP_VEHICLE=$O/vehicle/qwen4exp-moe-q8_0.gguf scripts/sycl-qwen4exp-census-run.sh vehicle 1 $O/vehicle-b50
+```
+
+Steps a and b are unmeasured. If `llama-quantize` refuses the arch or the `--tensor-type` pattern,
+that is a finding to report, not something to work around. Tensors whose rows are not a multiple of
+32 (the HC low rank 8) get quantize's fallback type.
+
+The structural controls for the vehicle are `GATED_DELTA_NET=ANY:1`, `MUL_MAT_ID=ANY:4` and
+`TOP_K=ANY:1`. The `MUL_MAT_ID` minimum is 4, not 6, because whether the fixture creates the merged
+`ffn_gate_up_exps` (`create_tensor_gate_up_exps`, `src/llama-model.cpp:4253`) decides whether a
+layer has 2 or 3 of them.
+
+What the vehicle exercises, per prediction rule:
+
+| rule(s) | exercised? | why |
+|---|---|---|
+| HC-PRE-FUSED, HC-POST-FUSED | yes, 4 + 4 nodes | HC count 4; the fused ops and the CPU-landing exemption are shape-independent |
+| GDN-SOFTPLUS, GDN-CORE, GDN-SSM-CONV, STATE-CONCAT | yes, 1 layer | S_v = 128 as in the real model, but H_k = H_v = 2. **The H_k 16 vs H_v 48 broadcast is not exercised.** |
+| QSA-TOPK | yes | k = min(n_kv, 131072 + 3) = n_kv >= 256 > 32, the same decline as the real k = 2051 |
+| QSA-FILL, QSA-SET-ROWS, ROPE | yes | same graph, smaller shapes |
+| QSA-FA | **different kernel shape** | head dim 128, not 256 |
+| IDX-PROJ-BF16 | only with step b's `--tensor-type` | the fixture writes F32 |
+| MOE-MMID, MOE-ARGSORT, MOE-SOFTMAX | yes, on Q8_0 | 2 experts, all used; K = 256/384, not 2560/640 |
+| MOE-GLU (PLACEMENT) | **no** | the vehicle's experts fit in VRAM: no host-planned layer, no CpuExpertPool |
+| IN-TOK-EMBD, IN-PLE-GATHER | yes | same input buft list; PLE on layer 0 |
+| every `count` | **no** | counts are for 48 layers; the vehicle has the per-layer multiples |
+| placement under memory pressure | **no** | nothing the 120 GiB of host experts does to the split graph shows up at 2 layers |
+
+So the vehicle can confirm or refute every capability verdict (the gaps and the suspect
+admissions). It cannot confirm the full-model counts, the placement rows, or the GDN head
+broadcast.
+
+### The real model: blocked on host memory
+
+The qwen4exp mode needs 200 GB MemAvailable. The lead measured 151-159 GB under the host's permanent
+load, so the script's settle step times out and exits 3. The cause is that SYCL leaves
+`caps.mmap_support` unset. The caps aggregate at :107798-107803 never names it, and
+`src/llama-model.cpp:2245-2265` then turns off both `use_mmap` and AUTO lazy mode. The whole 177 GiB
+is therefore read into host buffers.
+
+The full-model census waits on one of these:
+- the storage-tier lanes, which would place the 50.66 GiB PLE table on SSD (`llama.cpp-th32`,
+  `llama.cpp-9g22`);
+- a decision on SYCL mmap support. **`llama.cpp-5efe`** ("SYCL: mmap_support=0 makes lazy model
+  loading AUTO resolve to OFF", P3, open) is that ticket, but it covers lazy mode only.
+
+Proposed comment for the lead to add to 5efe:
+
+> Widen the scope. The same unset `mmap_support` also turns off `use_mmap` under
+> `LLAMA_LOAD_MODE_AUTO` (`src/llama-model.cpp:2245-2253`), not only AUTO lazy mode (`:2255-2265`).
+> Every SYCL load therefore reads the whole file into host buffers. For Qwen3.8-Flash-Next Q8_0
+> (177 GiB) that needs about 175 GiB resident, against 151-159 GB MemAvailable under this host's
+> permanent load, so the qwen4exp op census (`llama.cpp-k6jy`) cannot run on the real model. Raise
+> the priority from P3. Decide which of these holds:
+> - SYCL advertises mmap and the unified cache adopts mmap-backed host tiers;
+> - the storage tier (th32) owns those bytes instead;
+> - `-lzm on` is the documented requirement.
+>
+> Whichever it is, `llama.cpp-qptd` (`-ngl 0` loses mmap) is the same root.
+
+If the qwen4exp run does start (after mmap, or on a quieter host): Shmem may legitimately exceed
+CLAUDE.md's ~100 GB abort line when the host experts are USM-backed. The MemAvailable watchdog, which
+kills by session, stands in for that line on this run.
+
+### Order and commands
 
 ```bash
 cd /Apps/llama.cpp && source /opt/intel/oneapi/setvars.sh --force
 O=/Apps/llama.cpp/census-k6jy     # not /tmp: tmpfs does not survive a reboot
-
-# 1. positive control: FLASH_ATTN_EXT declined on SYCL (fattn.cpp:2438) -> 32 CPU nodes per graph
-scripts/sycl-qwen4exp-census-run.sh control-on  0 $O/control-on-b70    # parser: --require FLASH_ATTN_EXT=CPU:32
-# 2. negative control: same run, no decline -> 32 on SYCL0
-scripts/sycl-qwen4exp-census-run.sh control-off 0 $O/control-off-b70   # parser: --require FLASH_ATTN_EXT=SYCL:32
-# 3. the census, B70 then B50 -- detached: the first load of 177 GiB is unmeasured and can pass the 10-min tool ceiling
+# 0. controls: DONE on the B70 (above); repeat only after a parser or script change
+scripts/sycl-qwen4exp-census-run.sh control-on  0 $O/control-on-b70    # --require FLASH_ATTN_EXT=CPU:32
+scripts/sycl-qwen4exp-census-run.sh control-off 0 $O/control-off-b70   # --require FLASH_ATTN_EXT=SYCL:32
+# 1. the vehicle (steps a-c above), B70 then B50
+# 2. the real model, only once it fits -- detached, the first 177 GiB load can pass the 10-min tool ceiling
 setsid nohup scripts/sycl-qwen4exp-census-run.sh qwen4exp 0 $O/qwen-b70 > $O/qwen-b70.log 2>&1 &
-#    poll $O/qwen-b70.log for "parser rc="; wait for Shmem < 30 GB and MemAvailable > 200 GB, then
+#    poll $O/qwen-b70.log for "parser rc=" (or an exit-3 message); the next run settles by itself
 setsid nohup scripts/sycl-qwen4exp-census-run.sh qwen4exp 1 $O/qwen-b50 > $O/qwen-b50.log 2>&1 &
 ```
 
 Expected runtime:
-
-- Each control: about 1 min (a 3.9 GB load plus reserve).
-- Each qwen4exp run: the model load dominates and has never been measured on this host. The model
-  is 177 GiB on bcachefs over NVMe, SATA and a USB SSD, so expect 5-15 min cold. The budget is
-  1800 s.
-
-Memory: host residency is roughly 120 GiB of host experts, plus the PLE table if it is copied into
-a host buffer, plus 5 GiB of dense weights. That is why the floor is 200 GB and the watchdog is
-armed. If the preflight refuses, `--lazy-mode on` may keep the PLE table on disk. Lazy mode resolves OFF
-automatically on SYCL, and so does mmap itself: the SYCL caps initializer never sets
-`mmap_support` (:107798-107803), and `src/llama-model.cpp:2245-2265` turns off both `use_mmap` and
-AUTO lazy mode for such a device. The whole file is therefore read into host buffers. Forcing lazy
-mode on SYCL is untested.
+- The controls, about 4-5 min each under the host's load (control-on runs flash attention on the CPU).
+- The vehicle: unmeasured. Its graph is tiny, but the controls show that startup under this load costs minutes, so its budget is 600 s like theirs.
+- The real model: the load dominates and has never been measured here. 177 GiB on bcachefs over
+  NVMe, SATA and a USB SSD, so expect 5-15 min cold. The budget is 1800 s.
 
 How to score a run:
 
-1. Both controls must exit 0. If control-on exits 2, the parser or the log settings are broken.
-   Treat any qwen4exp census taken with that setup as void.
-2. qwen4exp exits 0 if its structural controls hold: `GATED_DELTA_NET` x36 and `MUL_MAT_ID` x144 in
-   every dump class. Exit 2 means the dump is missing or truncated, not "no gaps".
-3. `census.md` holds, for each T, the per-op backend table, the per-rule AGREE/DISAGREE/ABSENT
-   diff against `scripts/sycl-qwen4exp-op-prediction.json`, and every unpredicted CPU node. Copy
-   the backend and split counts into the B70/B50 columns above.
-4. Cross-check `run.err` for the HC WARN line quoted above. It is present at default verbosity too.
+1. **Exit 3 is void.** The run was refused, killed, failed, or bench-guard stamped it SUSPECT. For
+   SUSPECT, check the GPU (`journalctl -k --since "1 hour ago" --no-pager | grep -iE 'GT reset|guc_id|CAT error'`)
+   before starting any other run.
+2. Both controls must exit 0. If control-on exits 2, the parser or the log settings are broken, and
+   any census taken with that setup is void.
+3. A census exits 0 only if both T classes are present and classifiable, and its structural
+   controls hold. Exit 2 means the dump is missing, truncated or unclassifiable. It never means "no
+   gaps".
+4. `census.md` holds, for T = 1 and T = 512:
+   - the per-op backend table;
+   - the per-rule AGREE/DISAGREE/ABSENT diff against `scripts/sycl-qwen4exp-op-prediction.json`;
+   - every unpredicted CPU node.
+
+   Copy the backend and split counts into the B70/B50 columns above. For the vehicle, record them
+   with the vehicle table's caveats.
+5. Cross-check `run.err` for the HC WARN line quoted above. It is present at default verbosity, and
+   its count is fused nodes (vehicle 4, real model 96).
 
 The parser alone:
 
 ```bash
 python3 scripts/parse-sycl-sched-census.py run.err --prediction scripts/sycl-qwen4exp-op-prediction.json \
-    [--n-tokens 1 --n-tokens 512] [--tensor-types <"T name dims type" listing>] [--require OP=CPU|SYCL|ANY[:MIN]] [--strict]
+    --n-embd <2560|256|4096> --n-tokens 1 --n-tokens 512 [--tensor-types <"T name dims type" listing>] \
+    [--require OP=CPU|SYCL|ANY[:MIN]] [--strict]
 ```
 
-Its gate is `tests/test-sycl-sched-census.py` (ctest `test-sycl-sched-census`, pure Python). The
-gate plants CPU splits in a synthetic dump written with the printer's exact formats, including a
-torn line. It requires the counts to come out as planted, requires an empty or headers-only log to
-be VOID, and checks that every prediction rule names an op ggml prints.
+Its gate is `tests/test-sycl-sched-census.py` (ctest `test-sycl-sched-census`, pure Python). It works
+as follows:
+- It plants CPU splits in a synthetic dump. The dump is written one `GGML_LOG_DEBUG` call at a time
+  with the printer's exact formats, a torn line, and an unnamed token gather.
+- Every check runs once per prefix form: none, the default timestamped one, and bare `D `.
+- It requires the counts to come out as planted, and requires `src[0]` to survive on every node.
+- It requires an empty, headers-only or unclassifiable log to be VOID.
+- It parses the golden excerpt of the real control-on capture into the classes [512, 1].
+- It checks that every prediction rule names an op ggml prints.
+
+The parser at `53eb4b700` fails it with 27 assertions, among them
+"[timestamp] n_tokens classes: expected [512, 1], got [None, None]" and the same on the golden
+excerpt.
 
 ## Proposed closure tickets (not filed: the lead files them once the census confirms)
 
 **P1. sycl: GGML_UNARY_OP_SOFTPLUS kernel + supports_op case.**
 - Scope: an elementwise softplus in the unary family (f32, and f16 under `GGML_SYCL_F16`),
   admitted in the UNARY switch (:108205).
-- RED: `test-backend-ops -b SYCL0 -o SOFTPLUS` reports the cases "not supported" (lead-run,
-  pinned selector), and the census shows `GDN-SOFTPLUS` AGREE on CPU with 36 nodes.
-- GREEN: the cases pass against CPU, and the census rule flips to DISAGREE (0 CPU nodes).
-  Removes 36 islands, about 72 splits per token.
+- RED: `test-backend-ops -b SYCL0 -o SOFTPLUS` (pinned selector, lead-run) reports the `test_unary`
+  SOFTPLUS cases "not supported". SOFTPLUS is in `test_unary`'s op list (`test-backend-ops.cpp:2084`),
+  and the `test_unary_mul` SOFTPLUS cases (`:9552`) decline too. The census shows `GDN-SOFTPLUS` on
+  CPU (36 nodes, or 1 on the vehicle).
+- GREEN: the cases pass against CPU at the default NMSE <= 1e-7, and the census rule flips to
+  DISAGREE (0 CPU nodes). That removes 36 islands, about 72 splits per token.
 
-**P2. sycl: TOP_K for k > 32 (up to 2051 over n_kv up to the context size).**
+**P2. sycl: TOP_K for k > 32 (up to 2051, over n_kv up to the context size).**
 - Scope: a top-k whose shared memory does not scale with k, for example a radix select or a
   bitonic partial sort per row. Indices are unordered, matching the CPU semantics
   (`ggml.h`, "no particular order").
-- RED: `test-backend-ops -b SYCL0 -o TOP_K` with ne0 = 4096, k = 2051 is "not supported", and the
-  census shows `QSA-TOPK` on CPU with 12 nodes.
-- GREEN: that case passes, and QSA-TOPK moves to SYCL0.
+- RED: the existing cases with k in {100, 500, 1023, 9999} over ne0 = 2^i (+11)
+  (`test-backend-ops.cpp:11144-11151`) report "not supported" on SYCL0. The ticket adds the
+  qwen4exp shapes, which do not exist yet: `test_top_k(F32, {4096, 1, 1, 1}, 2051)` and
+  `{4096, 512, 1, 1}, 2051`. The census shows `QSA-TOPK` on CPU.
+- GREEN: all of those pass, and QSA-TOPK moves to SYCL0.
 
 **P3. sycl: DSV4_HC_PRE (gated and ungated), DSV4_HC_POST and DSV4_HC_COMB kernels.**
 - Scope: the three hyper-connection ops that upstream implements on CPU (`ggml-cpu.c:2100-2110`),
   shared with DeepSeek-V4.
-- RED: `test-backend-ops -b SYCL0 -o DSV4_HC_PRE` / `-o DSV4_HC_POST` are "not supported", and the
-  census shows 96 + 96 CPU nodes.
-- GREEN: these pass, and the HC WARN line reads "enabled" with no CPU landings. This is the
-  biggest item: 192 islands, about 384 splits per token.
+- RED: the existing cases decline on SYCL0 (`test-backend-ops.cpp:9586-9612`):
+  - `test_dsv4_hc_comb` x4 and a loop;
+  - `test_dsv4_hc_pre`, gated and ungated, n_embd up to 4096, n_hc {2..} loop;
+  - `test_dsv4_hc_post`, identity and not.
 
-**P4. llama-context: scope the fused-op CPU-landing exemption to placement.**
+  The ticket adds the qwen4exp shape, `test_dsv4_hc_pre(2560, 4, {1, 512}, gated = true)`. The
+  census shows 96 + 96 CPU nodes (vehicle 4 + 4).
+- GREEN: these pass, and the HC WARN line reads "enabled" with no CPU landings. This is the biggest
+  item: 192 islands, about 384 splits per token.
+
+**P4. llama-context + sycl: tell a capability decline from a placement decline, from one source.**
 - Problem: `resolve_fused_ops` (`src/llama-context.cpp:1242-1263`) treats every CPU landing as
-  placement. A landing caused by a backend declining the op is a capability gap, and upstream's
-  answer to one (disable the fusion and use the unfused chain) is the better fallback.
-- Proposed fix: before exempting, ask whether the layer's own device supports the node
-  (`ggml_backend_dev_supports_op(device_layer, node.tensor)`). If it does not, the landing is a
-  capability gap and the fusion is disabled.
-- RED: on qwen4exp, the WARN reports "executes on CPU for 96 layer(s)" for HC pre. On any build
-  without P3, the fix turns that into "not supported, set to disabled" and moves the unfused chain
-  onto SYCL0.
-- This touches an owner ruling (placement decides the executor), so it needs an owner decision.
-  P3 makes it moot for HC but not for the next fused op.
+  placement, and prints "not a capability gap" even for HC, where it is one. Asking
+  `ggml_backend_dev_supports_op(device_layer, node)` cannot fix this, because this fork's
+  supports_op also declines for placement:
+  - the KV-host residency check (:108067-108131), which declines FA over demoted KV unless
+    ATTN_HOST_DISPATCH is set;
+  - `ggml_sycl_op_is_planned_on_host` (:108185-108192).
+
+  For tiered-KV FA, that check would disable FA globally. That brings back `llama.cpp-7nzm` (the
+  17.3 GB compute buffer, `:1247-1252`) and overrides "placement decides the executor".
+- Scope: the backend is the only party that knows why it declined, so the reason comes from it:
+  - Split SYCL's supports_op into a capability predicate and a placement predicate. The public
+    supports_op stays their conjunction.
+  - Expose the capability half through the registry's `get_proc_address`, for example
+    `"ggml_backend_sycl_dev_supports_op_capability"`. No public ggml API change.
+  - `resolve_fused_ops` looks the function up on the layer's device. It exempts a CPU landing only
+    when the capability answer is yes (so the decline was placement). A capability no disables the
+    fusion, which is upstream's behaviour, and prints upstream's "not supported" wording.
+  - A backend that does not export the function keeps today's behaviour.
+- RED:
+  1. On the vehicle, the WARN reads "executes on CPU ... not a capability gap" for HC pre/post, and
+     the census shows `DSV4_HC_PR` on CPU.
+  2. With the fix, HC resolves "not supported, set to disabled", and the unfused chain appears on
+     SYCL0.
+  3. A tiered-KV run keeps FA enabled. Use the GPT-OSS n_ctx 131072 configuration from 7nzm and
+     measure the compute buffer: it must not regrow to 17.3 GB.
+- It touches the owner ruling on placement, so it needs an owner decision. P3 makes it moot for HC,
+  but not for the next fused op.
 
 **P5. sycl: GATED_DELTA_NET honesty, prefill correctness and PP throughput.**
-- (a) supports_op mirrors the kernel's real envelope: S_v in {16, 32, 64, 128}, contiguous g, beta
-  and state. RED: a `test-backend-ops` GDN case with S_v = 256 aborts instead of reporting "not
-  supported".
-- (b) Correctness at the qwen4exp shape: S_v 128, H_k 16, H_v 48, T in {1, 512}, K in {1, 2},
-  plus a `llama-perplexity` repeated-paragraph run as in 30h4. RED: whatever 30h4's localisation
-  shows for GDN. The `-o GATED_DELTA_NET` cases at that shape are the discriminator.
-- (c) A chunked PP kernel (`gated_delta_net.cpp:193`).
-- (b) blocks every GDN model on SYCL. File it against, or under, `llama.cpp-30h4`.
+- (a) supports_op mirrors the kernel's real envelope: S_v in {16, 32, 64, 128}, and contiguous g,
+  beta and state. RED: a GDN case with head_size 256 aborts in the kernel
+  (`gated_delta_net.cpp:251`) instead of reporting "not supported". The case is
+  `test_gated_delta_net(F32, 4, 256, 1, 1)` and does not exist yet.
+- (b) Correctness at the qwen4exp shape. The ticket adds
+  `test_gated_delta_net(F32, head_count=16, head_size=128, n_seq_tokens={1, 512}, n_seqs=1, v_repeat=3)`,
+  which gives H_k 16 and H_v 48. Tolerance is the test's default NMSE <= 1e-7
+  (`test-backend-ops.cpp:1217`). RED: the pre-registered prediction is that T=1 passes and T=512
+  fails. That follows from `llama.cpp-30h4`: Qwen3.6-27B is garbage in prefill only, PPL 473319. If
+  both pass, GDN is exonerated for this shape, and 30h4's cause lies elsewhere (host-tiered dense
+  weights).
+- (c) A chunked PP kernel (`gated_delta_net.cpp:193`). This is throughput only; RED/GREEN is PP512
+  tok/s on the vehicle and then the real model.
 
 **P6. sycl: FILL supports_op honesty.**
 - Scope: admit only a contiguous dst of type F32 or F16, matching `fill.cpp:17,48`.
-- RED: a `test-backend-ops` FILL case with a BF16 or non-contiguous dst aborts instead of
-  reporting "not supported".
+- RED: a `test_fill` with a BF16 or non-contiguous dst (the existing cases, `test-backend-ops.cpp:11326-11329`,
+  are all F32 contiguous) aborts instead of reporting "not supported".
 - Small, and not a qwen4exp blocker: its FILLs are contiguous F16/F32.
 
-**P7. sycl: BF16 weight materialization belongs to the planner.**
-- Problem: the 24 BF16 indexer projections run through a dispatch-time F32 materialization with its
-  own `g_sycl_bf16_materialize_cache` (:14177). The layout is decided at dispatch instead of
-  by the planner, which is the "one fact, two sources" shape. Whether its allocations go through the
-  unified cache also needs checking.
-- Scope: the planner materializes the F32 (or a native BF16 kernel reads it), and dispatch reads the
-  loaded layout.
-- RED: the census shows the indexer `MUL_MAT` on SYCL0 while the materialization cache is populated
-  at first dispatch. The observable is a trace of that cache, not the census.
+**P7. sycl: the BF16 weight layout is decided at dispatch, not by the planner.**
+- The ownership half is already right: `g_sycl_bf16_materialize_cache` holds
+  `ggml_sycl::mem_handle` values (:14177).
+- The defect is the one-fact-two-sources shape. Whether the indexer projections run as F32 is
+  decided at first dispatch (:108305-108325), not by the planner and unified cache that materialized
+  the operand. "The loaded layout is the answer" requires the planner to materialize the F32 layout
+  (or a BF16 kernel to consume BF16), and dispatch to read the loaded layout.
+- RED: on the vehicle (with step b's BF16 override) or the real model, the census shows the indexer
+  `MUL_MAT` on SYCL0 while the planner's layout record for those weights is BF16/AOS and a
+  materialization entry appears at first dispatch. The observable is a trace of that cache, not the
+  census.
 
-Not a ticket: MoE `SWIGLU` on the CPU for host-expert layers (:109207) is placement deciding the
-executor. If the census shows it, record the layer count, because it bounds the host-side work per
-token.
+**P8. question for the owner: the input-layer gathers run on SYCL0 over a SYCL_Host buffer.**
+- `make_cpu_buft_list` puts the first GPU's host buffer type ahead of the CPU buffer
+  (`src/llama-model.cpp:1765-1777`). The input layer (`:2338`) therefore lands `token_embd`, and on
+  qwen4exp the 50.66 GiB `per_layer_token_embd`, in pinned host memory, and SYCL0 runs the gathers.
+  Measured for `token_embd` on the Mistral control.
+- For a T-row gather the bandwidth is trivial. Still, it is a GPU reading host memory, and pinning
+  50 GiB of PLE collides with the storage-tier design (`th32`).
+- Decide: is a gather over the input layer a sanctioned exception to "placement decides the
+  executor", or should the input layer get a buffer list without the host type? The vehicle census
+  plus a `GGML_SYCL_DEBUG` trace of the PLE gather would show which path executes.
+
+Not a ticket: MoE `SWIGLU` on the CPU for host-expert layers (:109207), and the other
+`planned_on_host` declines listed in the summary, are placement deciding the executor. If the census
+shows them, record the layer count, because it bounds the host-side work per token.
 
 ## Principles check for the proposals
 
-- **P1-P3** add kernels for layouts the loaded operands already have. They add no allocator, no
-  zero-copy and no streaming: this is support-gap closure, not re-routing.
-- **P4** separates a capability decline from placement. It does not move data.
+- **P1-P3, P5 and P6** close support gaps, or make advertising honest, for layouts the loaded
+  operands already have. They add no allocator, no zero-copy, no weight streaming and no host wait.
+- **P4** gives "why did this backend decline" one source, the backend, and leaves placement
+  declines exempt. The first version asked supports_op, which would have overridden placement.
 - **P7** moves a layout decision from dispatch to the planner, so the layout has one source.
-- None of them adds a host wait. Today's CPU islands already cost a device-host round trip each,
-  which is the per-token synchronization P1-P3 remove.
+- **P8** asks whether an existing GPU read of host memory is sanctioned; it proposes nothing until
+  that is answered.
+- Today's CPU islands already cost a device-host round trip each. That is the per-token
+  synchronization P1-P3 remove.
