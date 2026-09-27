@@ -108,9 +108,10 @@ Design, revision 7.14j. Author: impl-moua, 2026-09-27. The revisions answer eigh
   Minor), the lead's rulings on it (§M41), §M39 on 7.14h's three notes, §M40 (the compute slot's
   ordering), §G1c (the hard uwlx edge), and the relays from 23mk 4.10, 1oxa rev 15 and zhcn
   5.16, recorded in §6.25. Revision 7.14i is two commits on top of 7.14h (`c345ddae5`):
-  `eaf159a29` and a follow-up for 23mk rev 4.11 (rulings §Z-23mk-411). Revision 7.14j is one
-  commit on top of 7.14i (`e9cc6609b`): the lead's rulings on 7.14i's three questions and the
-  frozen evidence logs (§M42), recorded in §6.26.
+  `eaf159a29` and a follow-up for 23mk rev 4.11 (rulings §Z-23mk-411). Revision 7.14j is two
+  commits on top of 7.14i (`e9cc6609b`): `da55df9b9`, the lead's rulings on 7.14i's three
+  questions and the frozen evidence logs (§M42), and a follow-up for zhcn r18's two relays
+  (rulings §Z23), both recorded in §6.26.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
@@ -120,7 +121,7 @@ one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2,
 §V11, §M16, §M16a, §M16b, §M17, §M17a, §M18, §Z15, §M18.3a, §M19, §M20, §V12, §M21, §M22, §M23,
 §M24, §M25, §V13, §M26, §M27, §M26a, §M28, §M29, §M29a, §V14, §M30, §M31, §M31a, §M32, §M33,
 §V15, §V15a, §V16, §V16a, §M34, §M35, §G1, §G1a, §V17, §M36, §M37, §Z20, §M38, §G1b, §M39, §G1c,
-§M40, §M41, §Z-23mk-411, §M42). §M11a is a
+§M40, §M41, §Z-23mk-411, §M42, §Z21, §Z23). §M11a is a
 relay line inside §Z8, not a section, and is cited as §Z8 I-2 (r12 m-14). This document cites it
 as "rulings §X".
 **Where this document paraphrases a ruling and differs from the file, the file wins.**
@@ -2254,24 +2255,33 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            allocation, registers no live context of the model, freezes nothing and is destroyed
            inside the load, at three call sites. Each call site names its input, and there is
            no second implementation:
-           1. **Ĉ, before the pack:** on the record-pass probe (item 2 above), each create-set
-              entry that is not forced off SYCL carrying a size-0 dummy buffer of its device's
-              buffer type, which is every such entry on its device. **The pack's capacity on a
-              device is the `WEIGHT` zone less the rest of the reservation's bound (above) and
-              Ĉ.**
+           1. **Ĉ, before the pack:** on the record-pass probe (item 2 above), every create-set
+              entry carrying a size-0 dummy buffer (zhcn §2.10 (a), with usage
+              `GGML_BACKEND_BUFFER_USAGE_WEIGHTS`, rulings §Z21 I-2): an entry not forced off
+              SYCL gets its device's buffer type, which is every such entry on its device, and
+              **a forced entry gets its forced buffer type (rulings §Z23).** No leaf keeps a
+              NULL buffer, which gallocr would allocate in the compute buffer; 7.14i gave
+              dummies only to the entries not forced off SYCL. **The pack's capacity on a device
+              is the `WEIGHT` zone less the rest of the reservation's bound (above) and Ĉ.**
            2. **c(P), after the pack, inside the same load transaction:** on the same probe,
               each entry carrying the dummy buffer of the buffer type the admitted plan gives
-              its site.
+              its site, from the one selector `create_tensor` uses (the plan-consulting suffix
+              after `resolve_create_site`), and a forced entry again its forced one.
               **The reservation records c(P)**, and Ĉ − c(P) goes back to the shared zone as
               free room, never held idle (P4). **c(P) > Ĉ refuses the load by name,**
               `[LOAD-PLAN] compute-slot-exceeds-probe-bound: device %d, placed %zu B > probe
               bound %zu B (refused)`, before any buffer type is chosen. The `FIRST_CONTEXT`
               range is recorded after this measure, so the compute part it holds is c(P) (zhcn
               5.16 relay (a)).
-           3. **The late check, at the late inventory (`llama-model.cpp:2410`):** on the real
-              model's tensors, with the buffer types `create_tensor` chose. It compares with
-              c(P) under the one late-check rule: larger refuses the load with the late string
-              (term `compute`), smaller is admitted with the shrink WARN.
+           3. **The late check, after the 30h4 `dev_layer` sync and before `init_mappings`
+              (between `llama-model.cpp:2556` and `:2564` at `c69d5774d`; rulings §Z21 I-2,
+              §Z23):** on the real model's tensors, with the buffer types `create_tensor` chose
+              and the synced `dev_layer`, which the measure reads (the flash-attention
+              executor's placement and the KV buffer type). The late weight inventory at `:2410`
+              runs before that sync (`:2446-2556`, its write at `:2525`), so a check there would
+              measure a stale `dev_layer`; 7.14i placed it there. It compares with c(P) under
+              the one late-check rule: larger refuses the load with the late string (term
+              `compute`), smaller is admitted with the shrink WARN.
            Each load prints, once per device, at WARN so a default run shows it,
            `[FIRST-CONTEXT] dev=%d compute_probe=%zu compute_placed=%zu splits_probe=%d
            splits_placed=%d`. **c(P) ≤ Ĉ is the unproved step:** a split's input copies land in
@@ -10100,3 +10110,11 @@ I-4 (a)'s and I-5's notes for the lead, m-2's baseline) are left as the record o
 I-4), but it compares the dry run with step 4's ledger, which first exists at L4+L6. Under the
 hard edge no tree has both until L4+L6, so this revision scores the arm on the L4+L6 tree. The
 issue was latent in 7.14h's 23mk-first order too; the hard edge makes it the only order.
+
+**The follow-up commit (zhcn r18's relays; rulings §Z23).**
+
+| item | relay | disposition |
+|---|---|---|
+| §Z23, §Z21 I-2 | the late compute check sat at `llama-model.cpp:2410`, before the 30h4 `dev_layer` sync | **Changed.** Step 3's third call site runs after the sync and before `init_mappings`, between `:2556` and `:2564` at `c69d5774d`, where zhcn 5.17 has it, so the measure reads the synced `dev_layer`. The late weight inventory stays at `:2410`. |
+| §Z23 | Ĉ's probe gave dummies only to entries not forced off SYCL | **Changed.** Every create-set entry carries a size-0 dummy (zhcn §2.10 (a), usage `GGML_BACKEND_BUFFER_USAGE_WEIGHTS`), a forced entry its forced buffer type, so no leaf keeps a NULL buffer for gallocr to allocate in the compute buffer. c(P)'s dummies name the one selector `create_tensor` uses. |
+| §Z23 m-4 | whose strings are canonical | **No change.** `[LOAD-PLAN] compute-slot-exceeds-probe-bound`, the `[FIRST-CONTEXT]` print line and the late term name `compute` are this design's and stay as written; zhcn and 1oxa cite them. |
