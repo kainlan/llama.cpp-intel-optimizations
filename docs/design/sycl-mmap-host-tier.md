@@ -1,7 +1,11 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 3i, not implemented. rev 3i is a new commit on rev 3h
-(`e1b6d2750`). It folds design-5efe-r6 (`b3c08be71..87181659f`,
+*Status: DESIGN rev 3j, not implemented. rev 3j is a new commit on rev 3i
+(`b29dd42d2`). It folds design-5efe-r7 (`87181659f..b29dd42d2`,
+0C/2I/7m/6n) under the lead's r7 rulings, the §M69 (b) second amendment
+(the six sites propagate `GGML_STATUS_FAILED`), §M73 and §M74; Appendix B's
+"design-5efe-r7" table keys each item to r7's IDs. rev 3i is a new commit
+on rev 3h (`e1b6d2750`). It folds design-5efe-r6 (`b3c08be71..87181659f`,
 0C/3I/5m/4n) under the lead's r6 rulings, including the §M69 (b)
 amendment to six sites (llama.cpp-573t); Appendix B's "design-5efe-r6"
 table keys each item to r6's IDs. rev 3h is a new commit on rev 3g
@@ -57,14 +61,18 @@ Sibling designs this one interfaces with, and does not restate:
 
 - `llama.cpp-th32`: STORAGE tier for lazy row tables,
   `docs/design/sycl-storage-tier-lazy-tables.md`, abbreviated **th32**.
-  Pinned at **rev 2x `90be8e260`** (it was 2w `3afc3b020` at rev 3c and 2u
-  `0bd69e251` at rev 3b; r2 m-15, r3 X7). th32's later commits `90cb98cab`
-  and `bde97cd15` only re-pin 5efe and move a tracker note. Its §4.1 consumes
+  Pinned at **rev 3d `c1903496f`**, its current reviewed head (r7 n-3; it
+  was 2x `90be8e260` at rev 3i, 2w `3afc3b020` at rev 3c and 2u
+  `0bd69e251` at rev 3b; r2 m-15, r3 X7). Every th32 section cited here
+  was re-read at 3d and keeps its number: §0 (16 PLE rows per token),
+  §2.3, §2.4, §3.1, §4.1, §4.2, §4.3, §4.5, §5.1, §9.1, and §10, which
+  holds the `[PLACEMENT] lazy per_layer_token_embd` expected line (rev 3i
+  cited it as §8, which was already wrong at 2x). Its §4.1 consumes
   this design's pre-fill (§3.1), the `lazy_eligible` bit, the taker and
   `deferral`, and its T6a owns the eligibility predicate that §3.1 calls. Its
   §9.1 names this design's declaration and attribute function. Its T6 fills
   the `STORAGE` branch of `create_tensor` that C1 lands (§3.1). Section
-  numbers cited here are 2x's.
+  numbers cited here are 3d's.
 - zhcn's design, cited by row id: its **GDC3** row is the single source of
   the GPT-OSS B50 default-context demotion figures (§M56 (a)), re-derived
   at zhcn `9650b3e`. This design carries no copy of them.
@@ -77,8 +85,10 @@ Sibling designs this one interfaces with, and does not restate:
     sentence is withdrawn (r4 m-6).
   - Every 5efe arm scored on GDC3 is a `llama-cli` arm (§7 C4 step 5, C5,
     C6). Each names the GDC3 point it scores against (§M61 (a), §7
-    preamble), and carries zhcn's plan == reality criterion (§M60 (c)),
-    cited, not restated.
+    preamble), and carries zhcn's compute criterion in its §M73 (b) form,
+    cited, not restated: GDC3's own statement of `compute_load +
+    compute_delta == sched_reserve` for that context, and its replay's
+    `compute_ctx` charge (§M73 (c)).
   - This design's own arithmetic takes no device compute-buffer size as an
     input. The Qwen room of §7 C4 step 3 is shared zone minus device
     weights, on the `llama-completion` vehicle, and is scored against that
@@ -1580,13 +1590,32 @@ created") describes a path that does not run.
       `n_tokens` is `n_ubatch`, with the dimension scan of `gs:7952-8030`
       (its `ggml_sycl_host_data(src0)` filter included) extracted into one
       function: `D = max_dispatch_count` (top-K x
-      `n_ubatch`), `K = max_K`, `N = max_N`. It records (D, K, N) for the
-      device and registers the pools' demand, `PinnedBufferPool` D x (K +
-      N) x 4 B and `CpuExpertPool` 4 x D x (K + N) x 4 B. It does so only
-      when one of that device's `MUL_MAT_ID` nodes has a host-resident
-      `src0` (`ggml_backend_buffer_is_host(src0->buffer)`; a weight is never
-      a view). Only then does the CPU expert path run, so an all-device
-      MoE model plans no pool (P3, P4).
+      `n_ubatch`), `K = max_K`, `N = max_N`. It records (D, K, N) in the
+      device's **pending** plan (below). The commit, never the walk,
+      registers the pools' demand, `PinnedBufferPool` D x (K + N) x 4 B and
+      `CpuExpertPool` 4 x D x (K + N) x 4 B (r7 I-1 (3)).
+    - **The gate is placement's executor fact, never the buffer** (r7 I-2;
+      P3, and P4's one fact, one source). A node counts only when the
+      planner put at least one expert of its `src0` on the host for that
+      device: `ggml_sycl_moe_plan_has_host_experts(src0, device, &known)`
+      (`gs:26003-26025`), which asks the placement plan's
+      `has_host_experts`. That is the fact the dispatch's CPU-island gate
+      routes on for expert weights (`gs:26031-26051`), whose own comment
+      says why the buffer cannot be: "the composite tensor's backing buffer
+      can be the host mmap source even when every expert is planned and
+      materialized in VRAM". Under C4 that is every expert, since
+      `SYCL_Mapped` is the source buffer of every SYCL weight on a mapped
+      load and is `is_host` (§4.3), so `ggml_backend_buffer_is_host` would
+      plan the pools for device-placed experts too, an idle reservation.
+      rev 3i gated on the buffer; that gate is withdrawn. If `known` comes
+      back false (no placement plan), the walk plans no pool demand and
+      prints `[HOST-ARENA] DEVICE pools dev=%d no placement plan for %s`
+      (WARN), a FAIL on any lead arm.
+    - **The walk's positive control** (r7 I-2 (3)). Every commit prints
+      `[HOST-ARENA] DEVICE pools dev=%d committed D=%d K=%lld N=%lld
+      host_expert_nodes=%d` (INFO), including `D=0 ... host_expert_nodes=0`
+      when no node counts. So the pools' zero case is scored beside a line
+      that proves the pool planning ran, never by absence alone.
     - `moe_hybrid_init_once` then initializes both pools from the device's
       committed (D, K, N), never from its own graph. Its own scan only
       checks that graph against them. If the graph needs more, it prints
@@ -1598,6 +1627,26 @@ created") describes a path that does not run.
       `n_expert` (Qwen 1024, GPT-OSS 64) is within the plan, so on the lead
       arms the check passes. Every dispatch then fits the pool, and the
       `[MoE-CPU] ... too small` cliff is retired.
+    - **More than one context: the pools are max-merged** (r7 m-5). The
+      device's committed (D, K, N) is the high-water, per field, over the
+      live contexts' committed plans, as the staging's slots are. Both
+      pools are init-once today (`pinned-buffer-pool.cpp:29-31`,
+      `cpu-expert-pool.cpp:42-45`), so C4 gives the commit a re-size: when
+      the device's high-water differs from what the pools hold, and the
+      pools are initialized, the commit shuts both down and initializes
+      them at the high-water, printing `[HOST-ARENA] DEVICE pools dev=%d
+      resized D=%d->%d` (INFO). That runs where the staging's re-allocation
+      runs, in `sched_reserve` after its `synchronize()` (`lc:2002`), with
+      same-device concurrent inference unsupported (canonical contract
+      §5), so no dispatch is using the pools. Before the pools' first
+      initialization the commit only records; `moe_hybrid_init_once` then
+      initializes at the high-water. A context's committed plan drops in
+      its backend context's destructor, and the next commit on the device
+      re-sizes down to the remaining high-water; the pools' release at the
+      last backend on the device is llama.cpp-dsab's per-device count
+      (§M69 (c)). The lead arms are single-context, so only the pure test
+      below exercises this; `llama-bench -ub a,b` on a MoE model is the
+      shipped path it covers.
     - **Pre-registered pool figures, from the reserve graph's `MUL_MAT_ID`
       dimensions** (plan == reality, scored on the same run's `holder=`
       lines against the `[MOE-POOL] Pinned buffer pool` and
@@ -1608,16 +1657,24 @@ created") describes a path that does not run.
         down tensors. `PinnedBufferPool` = 5120 x 5120 x 4 B = **100.0
         MiB**, printed `act=51200 KB, out=51200 KB, max_experts=5120`.
         `CpuExpertPool` = 4 x 100.0 = **400.0 MiB**, printed `4 ring slots,
-        102400.0 KB/slot`. The experts are in `SYCL_Mapped`, so both are
-        planned.
+        102400.0 KB/slot (act=51200.0 KB, out=51200.0 KB)`. Qwen's experts
+        are placed on the host (run2's `planner host placement: yes`), so
+        both are planned, and the pools line reads `committed D=5120
+        K=2560 N=2560` with `host_expert_nodes` > 0. These figures hold
+        only because the commit carries the pp walk's (D, K, N), not the
+        tg walk's D = 10 (r7 I-1).
       - **GPT-OSS** (`llama-cli`, `n_ubatch` 512; `n_embd` 2880,
         `expert_feed_forward_length` 2880, 32 experts, top-4, from the
-        GGUF header): D = 2048 and K = N = 2880. If the run's placement
-        puts every expert tensor on the device, **0**: no pool demand, and
-        the pools are not initialized. Otherwise **45.0 MiB** and **180.0
-        MiB** (`act=23040 KB, out=23040 KB, max_experts=2048`; `46080.0
-        KB/slot`). Which case applies is read from the same run's
-        placement report, and any other figure is a FAIL.
+        GGUF header): D = 2048 and K = N = 2880. If placement puts no
+        expert on the host, **0**: the pools line reads `committed D=0 ...
+        host_expert_nodes=0`, there is no `holder=` line for either pool,
+        and no `[MOE-POOL]` or `[CPU-EXPERT-POOL]` line. Otherwise **45.0
+        MiB** and **180.0 MiB** (`act=23040 KB, out=23040 KB,
+        max_experts=2048`; `46080.0 KB/slot`), with `host_expert_nodes` >
+        0. Which case applies is read from the pools line, which asks the
+        same placement fact the dispatch routes on (above), so the case and
+        the figures come from one source. Any other figure, or a zero case
+        with no pools line, is a FAIL.
   - **The attention host staging is planned from `n_ctx` at context
     creation, when the host dispatch is on** (§M62 (E), §M69 (a); r4 m-4,
     r5 I-1). Today each slot of
@@ -1676,31 +1733,98 @@ created") describes a path that does not run.
       `graph_reserve`. Every node of the graph is then in the live hash
       set, so the lookup inserts nothing. The `no_alloc` fit pass is
       skipped, as the notify skips it.
+    - **The size-only split is not the allocating split, and the claim is
+      bounded** (r7 m-4 (a)). `reserve_size`'s start reset (`gb:2682` into
+      `gb:2665-2675`) erases every pin set while the graph was built:
+      llama's `norm`/`l_last` pin when `n_tokens < 32` or under full
+      offload (`lc:3985-3997`), and the `!offload_kqv` pin of the KQ nodes
+      to the CPU (`src/llama-graph.cpp:2779`).
+      `ggml_backend_sched_reserve` keeps them, because it splits without
+      resetting first (`gb:2691-2698`). The walk's claim covers only its
+      three op kinds. `SET_ROWS` (its destination is a KV view) and
+      `MUL_MAT_ID` (its `src0` is a weight) are assigned in the split's
+      first pass by buffer (`gb:1639-1651`, `:1683-1696`), which no pin
+      affects. `FLASH_ATTN_EXT` is excluded from the weight rule
+      (`gb:1675`) and takes its backend by expansion. Under `-nkvo` its K
+      is in a `SYCL_Host` or CPU buffer, which the predicate excludes
+      anyway (below), and the `norm`/`l_last` pins move no attention node.
+      No other node's attribution is read.
+    - **The same fact for the notify's measure.** `host_compute_bytes` is
+      measured on the size-only split, so on the full-offload lead arms it
+      can differ from the allocating split's host compute buffer, in
+      either direction. The witness above catches only the under-estimate.
+      So at the commit `llama_context` re-notifies each context's demand
+      with the allocated size (`ggml_backend_sched_get_buffer_size` on the
+      CPU backend), which replaces the measured one, and the demand line
+      then prints both, `measured=%.1f allocated=%.1f`. The ledger then
+      holds the fact. Capacity an over-estimate already grew stays grown
+      (capacity is never returned, above); the SCRATCH criterion's chunk
+      rule (§7 C4 step 2) FAILs a chunk that no committed demand line
+      explains.
+    - **The lifecycle of a pending plan** (r7 I-1). A third proc-table
+      entry, `void ggml_backend_sycl_begin_host_holders(ggml_backend_sched_t
+      sched)`, runs at the **start** of every `sched_reserve`, right after
+      its `synchronize()` (`lc:2002`), and again before the
+      pipeline-parallel retry's re-measure (`lc:2059-2064`). It clears the
+      pending plan of every SYCL backend in `sched`, enumerated with
+      `ggml_backend_sched_get_n_backends` and `ggml_backend_sched_get_backend`
+      (`ggml-backend.h:362-363`, ggml-base). So no backend carries a
+      pending plan from an earlier reserve, and a failed candidate's walk
+      can never be promoted by a later commit.
+    - **The walks of one reserve merge as a maximum** (r7 I-1 (2)). The pp
+      walk and the tg walk of one `sched_reserve` merge into the pending
+      plan per (device, kind) for the staging, and per device and field
+      for the pools' (D, K, N). A walk never replaces what an earlier walk
+      of the same reserve recorded. The pp graph dominates: its `n_tokens`
+      is `min(n_ctx, n_ubatch)` (`lc:2007`) against the tg graph's 1
+      (`lc:2080`), and Q, DST, MASK and the pools' D all grow with
+      `n_tokens`, while VAL, IDS, K and N do not depend on it. The maximum
+      keeps that true without relying on the call order. A plan taken from
+      the tg walk alone would size Q, DST and MASK for one token, and give
+      Qwen's pools D = 10 instead of 5120.
     - **Witness** (P4). With the switch on, a walk that attributes no
       host-KV attention node to a SYCL backend prints `[ATTN-HOST] plan
       attributed 0 host-KV nodes to a SYCL backend (%d matched the
       predicate)` (WARN). A dispatch-on arm with host KV that prints it is
       a FAIL of C4.
-    - **Pending, then committed** (r6 I-1 (2), m-5). A walk records a
-      *pending* plan on each SYCL backend context it attributes nodes to,
-      keyed like the notify's demand, by that `ggml_backend_sycl_context`.
-      `llama_context` commits it through a second proc-table entry point,
-      `bool ggml_backend_sycl_commit_host_holders(ggml_backend_t
-      backend)`, once per SYCL backend, **only after the allocating
-      reserves succeed**. So an auto-`n_ubatch` candidate whose allocating
-      reserve throws (`lc:1607-1619`) leaves only a pending plan, which the
-      next walk replaces. The trial's settle step re-reserves the chosen
-      candidate whenever the scheduler does not already match it
-      (`lc:1931-1940`), so the last commit is always the chosen
-      candidate's.
+    - **Pending, then committed** (r6 I-1 (2), m-5; r7 I-1 (3), m-1). A
+      walk records into the *pending* plan of each SYCL backend context it
+      attributes nodes to, keyed like the notify's demand, by that
+      `ggml_backend_sycl_context`. `llama_context` commits it through a
+      second proc-table entry point, `bool
+      ggml_backend_sycl_commit_host_holders(ggml_backend_t backend)`, once
+      per SYCL backend. The commit consumes the pending plan, and it is the
+      only step that registers demand, for the staging and the pools
+      alike.
+    - **Where the commit runs** (r7 m-1). `sched_reserve` commits at its
+      end, after the allocating reserves succeed, for every caller except
+      the auto-`n_ubatch` trial. The trial's `try_candidate` commits
+      instead, and only after its host-fallback check passes
+      (`lc:1622-1629`). So a candidate whose allocating reserve throws
+      (`lc:1607-1619`) or whose compute buffer falls back to host commits
+      nothing: it grows no slot, re-sizes no pool and ensures no SCRATCH
+      for either, and the next `sched_reserve`'s begin clears its pending
+      plan. The trial's settle step re-reserves the chosen candidate
+      whenever the scheduler does not already match it (`lc:1931-1940`),
+      so the last commit is always the chosen candidate's. There is no
+      exception to this.
+    - **Outside the commit: the notify of a losing candidate.** The notify
+      must ensure SCRATCH before the allocating reserve it covers (above),
+      so a losing candidate's notify can grow SCRATCH for its own host
+      compute buffer before the candidate loses, and capacity is never
+      returned. On the MoE lead models the SYCL cap keeps the ladder at
+      512 (`lc:1409-1461`, `moe-control-plan.hpp:144`), a single candidate
+      that cannot lose to a larger one, so no lead arm reaches this path.
+      It is not claimed closed by m-1, and it is raised with the lead for
+      a ruling.
     - A commit **replaces** that context's committed plan, as a notify
       replaces its demand. The device's planned capacity per slot is the
       high-water over the live contexts' **committed** plans, not over
       every candidate tried (r6 m-5). A slot above it is re-allocated down
-      to it at the commit. That runs in `sched_reserve`, after the
-      allocating reserves' synchronize (`gb:2695`), and same-device concurrent
-      inference is unsupported (canonical contract §5), so no dispatch on
-      the device is using the slot. The entries drop in the backend
+      to it at the commit. That runs in `sched_reserve`, after its own
+      `synchronize()` (`lc:2002`) with no `graph_compute` since (r7 n-4),
+      and same-device concurrent inference is unsupported (canonical
+      contract §5), so no dispatch on the device is using the slot. The entries drop in the backend
       context's destructor (`gs:43877`), their owner boundary.
     - **On `false`** (r6 n-3). Either call returns false when the ledger
       could not ensure capacity. `llama_context` then prints `[HOST-ARENA]
@@ -1768,14 +1892,32 @@ created") describes a path that does not run.
       are where `FLASH_ATTN_EXT` nodes go (`gs:97221-97234`), and the
       segmented path is the MoE default (`gs:107142-107148`). So a refusal
       there would be a WARN and a skipped op: wrong tokens, not a refusal.
-    - C4 routes all six calls through one helper that, on `false`, prints
-      the device's dispatch counter line (below), then the ordinary loop's
-      `[SYCL] graph compute unsupported node` line, and asserts, as
-      `gs:94499-94506` does. No segmented site gets a legitimate `false`
-      for an op that then runs elsewhere, since the ordinary loop asserts
-      on the same `false` for the same node (`gs:94322-94327`). The defect
-      class is live on master and is tracked as **llama.cpp-573t**, so the
-      fix stays tracked if C4 slips.
+    - **The six sites propagate the failure; they do not assert** (§M69
+      (b) second amendment). C4 routes all six calls through one helper
+      that, on `false`, prints the device's dispatch counter line (below),
+      then the ordinary loop's `[SYCL] graph compute unsupported node`
+      line at ERROR, and sets a `ggml_status` out-parameter to
+      `GGML_STATUS_FAILED`. The helper never asserts or aborts: a refusal
+      is a capability refusal, not a terminal plan bug, and §M72's abort is
+      only for the latter.
+    - Both segmented functions gain that out-parameter and return at once
+      after a failed site. `ggml_backend_sycl_graph_compute` reads it right
+      after each call (`gs:107192`, `:107206`) and returns
+      `GGML_STATUS_FAILED` before any fallback. It must precede the
+      fallback: `moe_graph_record_segments`' `false` today means "recording
+      failed", which falls back to block graphlets and then to per-op
+      dispatch (`gs:107206-107229`), and that would re-dispatch nodes that
+      already ran and hide the refusal behind a second execution.
+    - llama then logs `ggml_backend_sched_graph_compute_async failed with
+      error` (`lc:3968-3970`), and `llama_decode` returns -3
+      (`lc:3290-3294`), its existing error path. No segmented site gets a
+      legitimate `false` for an op that then runs elsewhere, since the
+      ordinary loop asserts on the same `false` for the same node
+      (`gs:94322-94327`). The ordinary loop's assert (`gs:94499-94506`) is
+      upstream's and outside the six. The defect class is live on master
+      and is tracked as **llama.cpp-573t**, whose text
+      (`GGML_STATUS_FAILED`) is the authority, so the fix stays tracked if
+      C4 slips.
     - **The dispatch counter** (r6 I-2 (1), (2)). It is per device and
       module-global. `fa` counts **interceptions**, the entries into the
       host `FLASH_ATTN_EXT` dispatch, incremented before
@@ -1784,11 +1926,27 @@ created") describes a path that does not run.
       named staging refusals. They print as `[ATTN-HOST] host dispatches
       dev=%d fa=%zu set_rows=%zu refusals=%zu` (WARN) at every SYCL
       backend free for that device while the switch is on, and from the
-      fail-closed helper before it asserts, so the line survives the abort
-      path. The first interception per device also prints `[ATTN-HOST]
+      fail-closed helper before it returns the failure, so the line
+      survives a failed graph. The first interception per device also prints `[ATTN-HOST]
       first host dispatch dev=%d op=%s` (WARN), once. A score reads the
       **last** counter line per device. Load-time temporary backends print
       `fa=0` lines first, before any plan.
+    - **Always compiled** (§M74 (a), (f)). Every line C4 adds and a vehicle
+      arm scores is compiled in ggml-sycl itself, never behind
+      `GGML_SYCL_PRIVATE_TESTING`, which only test targets define: the
+      counter, `first host dispatch` and `plan attributed 0` lines;
+      `planned staging` and `staging not planned`; the `[HOST-ARENA]
+      SCRATCH demand` and `DEVICE pools` lines and the pools' `exceeds its
+      planned`, `unplanned` and `no placement plan` WARNs; `host holder
+      plan failed`; `host compute buffer ... exceeds notified`;
+      `[HOST-ZONE] leaked`; and `[FILE-MAPPED] counters`. Each is a
+      dedicated WARN or INFO line its owner prints in the shipped library,
+      which §M74 (f) accepts as a vehicle source, so none moves into
+      `[SYCL-COUNTERS]`. The `[ATTN-HOST]` dispatch lines are also gated by
+      `GGML_SYCL_ATTN_HOST_DISPATCH=1`, which 3b and 5b set in their
+      literal commands (§M66). Only test binaries keep PRIVATE_TESTING
+      seams: C2's `::free` and `sycl::free` branch counters and the
+      §4.6 arm-3 mutant (§M74 (d)).
     - So the staging's demand reaches the ledger once per context and
       device, from `n_ctx` and `n_ubatch`, and decode-time regrowth never
       does.
@@ -2037,13 +2195,30 @@ created") describes a path that does not run.
     `[CPU-EXPERT-POOL] Initialized` lines
     (`pinned-buffer-pool.cpp:110`, `cpu-expert-pool.cpp:106-109`) print
     the same D, K and N. A pool line with no `holder=` line, or the
-    reverse, is a FAIL.
+    reverse, is a FAIL. The same run's `[HOST-ARENA] DEVICE pools dev=%d
+    committed` line carries that D, K and N (r7 I-2).
+  - **The pools' zero case is scored beside its control** (r7 I-2 (3)). No
+    `holder=` line for either pool and no `[MOE-POOL]` or
+    `[CPU-EXPERT-POOL]` line counts only when the same run prints the
+    device's `DEVICE pools ... committed D=0 ... host_expert_nodes=0` line
+    (INFO). Without it the pool planning did not run, or INFO did not
+    reach the log, and the zero case is **VOID**, which counts as failed.
   - **The staging criteria depend on the switch** (§M69 (a); r5 I-1).
     - **Default arms** (no `GGML_SYCL_ATTN_HOST_DISPATCH`): the run prints
       `[ATTN-HOST] staging not planned (host dispatch off)` exactly once,
       prints no `[ATTN-HOST] planned staging` line, and registers zero
       `DEVICE` staging demand (no `[HOST-ARENA] SCRATCH demand
-      holder=attn_host_staging` line). That absence is scored only on a
+      holder=attn_host_staging` line).
+    - **That line is the default arms' witness, and it is required.** The
+      switch also gates every other `[ATTN-HOST]` line (`planned staging`,
+      `host dispatches`, `first host dispatch`, `plan attributed 0`), so
+      with the switch unset their absence is automatic and proves nothing
+      by itself. `staging not planned` is the one `[ATTN-HOST]` line that
+      prints with the switch **off**: the plan walk prints it on that
+      branch, at WARN, whether or not any host-KV node exists. So each
+      default arm REQUIRES it, exactly once. A run where it is absent is
+      **VOID**, which counts as failed, and every `[ATTN-HOST]` absence the
+      arm scores is scored only beside it. That absence is scored only on a
       run whose log carries the INFO positive control, a `[HOST-ARENA]
       SCRATCH demand ctx=` line from the same notify (r6 n-4); without it
       INFO did not reach the log, and the absence is **VOID**.
@@ -2055,26 +2230,56 @@ created") describes a path that does not run.
       `[ATTN-HOST] host dispatches dev=%d fa=%zu set_rows=%zu refusals=%zu`
       (§4.4 staging plan), read from its **last** line per device, where
       `fa` counts `FLASH_ATTN_EXT` interceptions, whatever followed them.
-    - **Precedence on a dispatch-on arm** (r6 I-2 (3)). The rules apply in
-      this order, and the first that matches decides:
-      1. **Any staging refusal or any abort is a FAIL of C4**, unless the
-         stderr shows, in this order, for the refusing device: an
-         `[ATTN-HOST] planned staging dev=<d> ... total=<X> MB` line with
-         X > 0; then a counter line for that device, which marks a SYCL
-         backend free after the commit; then the refusal. Only that
-         sequence is the dsab premature release (§4.4 Lifetimes, §M69
-         (c)), reported as dsab's and not scored against C4. A refusal
-         after `total=0.0 MB`, with no plan line, or with no free between
-         the plan and the refusal is an unplanned slot, and it is C4's.
-      2. A counter line that never printed is a FAIL: the switch was on,
-         so a backend free or the helper must print it.
-      3. `fa` = 0 with `set_rows` > 0 is a FAIL. Host KV writes were
-         intercepted while attention over that KV was not, so the two
-         predicates disagree.
-      4. `fa` = 0, `set_rows` = 0 and `refusals` = 0, with no abort, is
-         **VOID**: no host attention ran, so the staging criteria were not
-         exercised. This is the only VOID, and it cannot absorb a refusal
-         or an abort, which rule 1 has already decided.
+    - **Terms** (r7 m-2). A *refusal* is an `[ATTN-HOST] staging request
+      ... declining host dispatch` line; it names its kind. A *failed
+      graph* is llama's `ggml_backend_sched_graph_compute_async failed
+      with error` line (`lc:3968-3970`), which the six segmented sites now
+      produce (§M69 (b) second amendment). An *abort* is rc 134 with the
+      message the code prints: a `ggml_abort` line, `<file>.cpp:<line>:`,
+      or the ordinary loop's `GGML_ASSERT(ok) failed` (`gs:94499-94506`). A
+      *crash* is any other non-zero rc or signal: SIGSEGV (rc 139),
+      `timeout` (rc 124), the watchdog's `[SYCL-WATCHDOG]` `_Exit(1)`, or
+      a GPU-fault line. An abort or a crash is FAILED, never VOID.
+    - **Precedence on a dispatch-on arm** (r6 I-2 (3), r7 m-2, m-3). The
+      rules apply in this order, and the first that matches decides:
+      1. **Any refusal, failed graph, abort or crash is a FAIL of C4**,
+         with exactly two exceptions, both decided here and nowhere else:
+         - (a) **dsab.** A refusal is dsab's premature release (§4.4
+           Lifetimes, §M69 (c)) only when the stderr shows, in this order,
+           for the refusing device: an `[ATTN-HOST] planned staging
+           dev=<d>` line whose figure for the **refusing kind** (`q`,
+           `dst`, `mask`, `val` or `ids`, as the refusal names it) is > 0
+           (r7 n-2); then a counter line for that device, which marks a
+           SYCL backend free after the commit; then the refusal. It is
+           reported as dsab's and not scored against C4. A refusal after a
+           zero figure for its kind, with no plan line, or with no free
+           between the plan and the refusal is an unplanned slot, and it is
+           C4's.
+         - (b) **Pre-existing, 5b only** (r7 m-3). An abort or crash whose
+           abort line or GPU-fault line also prints on 5b's parent-tree
+           control (§7 C4 step 5b) is pre-existing, reported and not C4's.
+           A refusal or a failed graph is never pre-existing: the parent
+           cannot print a staging refusal, and its segmented sites discard
+           the return instead of failing the graph.
+      2. **No counter line for the device after its plan line** is a FAIL:
+         the switch was on, so a backend free or the helper must print
+         one.
+      3. **Flash attention must have resolved on** (r7 n-5). The arms do
+         not pass `-fa`, so llama resolves it and prints `Flash Attention
+         enabled` (INFO, `lc:1281`) or `Flash Attention not supported, set
+         to disabled` (WARN, `lc:1271`). With the latter there is no
+         `FLASH_ATTN_EXT` node, and the staging criteria are **VOID** for
+         the arm, whatever the counters read. With neither line, INFO did
+         not reach the log, and they are VOID too. With the former, `fa` =
+         0 while `set_rows` > 0 is a FAIL: host KV writes were intercepted
+         while attention over that KV was not, so the two predicates
+         disagree.
+      4. **The only VOID for "no host attention ran"**: `fa` = 0,
+         `set_rows` = 0 and `refusals` = 0, rc 0, and no `[ATTN-HOST] first
+         host dispatch dev=<d>` line (r7 m-2). It cannot absorb a refusal,
+         a failed graph, an abort or a crash, which rule 1 has already
+         decided, nor a run that dispatched and then lost its last counter
+         line.
       5. Otherwise (`fa` > 0), the staging criteria above are scored, and
          the first-dispatch line `[ATTN-HOST] first host dispatch dev=<d>`
          must precede the device's first counter line with a non-zero
@@ -2883,9 +3088,11 @@ The lead's GPU runs share one protocol (r1 I-7):
   with neither zhcn's nor moua's change scores against today's-tree point.
   On a tree with both, it scores against the fixpoint. On a tree with only
   one, it is VOID for the GDC3 criterion, and the lead is told which tree it
-  was. Each such arm also carries zhcn's plan == reality criterion (§M60
-  (c)): the plan's compute charge equals the `sched_reserve` compute size
-  the same run prints, as GDC3 states it.
+  was. Each such arm also carries zhcn's compute criterion in its §M73 (b)
+  form (r7 m-6), cited, not restated: the one GDC3 states for the context
+  the arm creates, never the load envelope `c(P)` scored against it. The
+  replay that yields the arm's point charges that context's `compute_ctx`
+  (§M73 (c)), a property of the vehicle (§M60 (b)).
   - **The point is a replay of this run's inputs** (§M63 (a); r5 m-4). On a
     zhcn tree, GDC3's point is its replay applied to this run's own printed
     input lines, never a prior run's printed figure. So step 5's N, range
@@ -3259,9 +3466,18 @@ I-5, §F2). It is the commit that changes every SYCL load.
     - **Where the walk runs** (r6 I-1). In `llama-context.cpp` each call
       through the `ggml_backend_sycl_plan_host_holders` pointer follows a
       `graph_reserve` whose `split_only` argument is `true`, with no
-      `graph_reserve` between them. The `ggml_backend_sycl_commit_host_holders`
-      calls follow the last allocating `graph_reserve` of `sched_reserve`
-      and run only on its success.
+      `graph_reserve` between them. `ggml_backend_sycl_begin_host_holders`
+      is called at the start of `sched_reserve`, after its `synchronize()`,
+      and before the pipeline-parallel retry's re-measure (r7 I-1). The
+      `ggml_backend_sycl_commit_host_holders` calls run at the end of
+      `sched_reserve` on its success, except under the auto-`n_ubatch`
+      trial, where `try_candidate` makes them after its host-fallback check
+      (r7 m-1).
+    - The pools' gate calls `ggml_sycl_moe_plan_has_host_experts`, and the
+      plan walk never calls `ggml_backend_buffer_is_host` (r7 I-2).
+    - No site in the two segmented functions asserts or aborts on a
+      refusal, and `ggml_backend_sycl_graph_compute` returns the helper's
+      status before the recording fallback (§M69 (b) second amendment).
     - No `ggml_sycl_compute_forward(` call in the MoE segmented
       record/replay functions discards its return: each of the six goes
       through the fail-closed helper (§M69 (b) as amended; r6 m-1).
@@ -3366,7 +3582,14 @@ I-5, §F2). It is the commit that changes every SYCL load.
         calls discarded again, once per site (§M69 (b); r6 m-1);
       - the plan walk moved after the allocating pp reserve (`lc:2055`),
         where `ggml_backend_sched_reserve` has reset the split (r6 I-1);
-      - the commit moved before the allocating reserves (r6 I-1 (2));
+      - the commit moved before the allocating reserves (r6 I-1 (2)), and
+        separately the trial's commit moved before its host-fallback check
+        (r7 m-1);
+      - the begin call removed (r7 I-1);
+      - the pools gated on `ggml_backend_buffer_is_host(src0->buffer)`
+        (r7 I-2);
+      - the helper asserting on a refusal, and separately the status read
+        after the recording fallback (§M69 (b) second amendment);
       - the pools' demand registered in `moe_hybrid_init_once` rather than
         by the plan (r5 m-7), and separately the pools initialized from
         `moe_hybrid_init_once`'s own scan (r6 I-3);
@@ -3381,9 +3604,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
     `ggml-sycl.cpp` and fails on any `ggml_sycl_compute_forward(` call
     whose result is not consumed by the fail-closed helper. At e2461d4fb it
     fails and names six sites: `gs:97234`, `:97240`, `:97285`, `:97315`,
-    `:97551` and `:97595` (at d8a67422d the two `moe_after` sites are
-    `:97250` and `:97325`; the gate names the line it finds, so the drift
-    does not matter). It reports each by its function and its role
+    `:97551` and `:97595`. At d8a67422d the same six are `gs:97244`,
+    `:97250`, `:97295`, `:97325`, `:97561` and `:97605` (r7 n-1). The gate
+    names the line it finds, so the drift does not matter. It also fails
+    if a site's helper call is followed by anything but an immediate
+    return on failure, and if the helper asserts or aborts (§M69 (b)
+    second amendment). It reports each by its function and its role
     (direct segment, `moe_after` after a direct segment, recording,
     `moe_after` after a recorded segment, replay direct, replay) as well
     as its line. After C4 it passes. Its mutants are the six discards, one
@@ -3450,13 +3676,26 @@ I-5, §F2). It is the commit that changes every SYCL load.
       today's additive `grow_scratch_zone` (the r3 I-1 (b) ratchet); the
       device-0 resolve (r3 I-1 (d)); the notifying backend's `ctx->device`,
       i.e. `model.devices[0]`'s, in place of `buft->device` (r4 I-D).
-  - RED `test-sycl-plan-walk-sched` (`sycl;host`; r6 I-1). Its vehicle
-    is the **real** ggml-base scheduler, not a fake: a
-    `ggml_backend_sched` over the CPU backend and a second CPU backend
-    instance, which stands in for the SYCL backend the walk attributes to,
-    with a graph of four nodes. It needs no GPU. It calls the walk's attribution function
-    (the part of `ggml_backend_sycl_plan_host_holders` that reads
-    `ggml_backend_sched_get_tensor_backend`) at three points:
+  - RED `test-sycl-plan-walk-sched` (`sycl;host`; r6 I-1, r7 m-4 (b)).
+    Its vehicle is the **real** ggml-base scheduler, not a fake: a
+    `ggml_backend_sched` over two CPU backend instances. The first, at
+    index 0 (the higher priority), stands in for the SYCL backend the walk
+    attributes to; the second is the scheduler's required last CPU
+    backend. It needs no GPU.
+    - **The injected target predicate.** The attribution function takes
+      `bool (*is_target)(ggml_backend_t)`. Production passes
+      `ggml_backend_is_sycl`; the test passes a predicate that matches the
+      stand-in by pointer. `ggml_backend_is_sycl` would reject a CPU
+      stand-in and attribute 0 at every point.
+    - **The nodes reach the stand-in through the split's first pass, never
+      a pin.** The graph's four nodes are `SET_ROWS` writing views of a
+      tensor pre-allocated in a CPU buffer, so the first pass assigns each
+      by its `view_src` buffer (`gb:1639-1651`) to the first backend that
+      supports that buffer, the stand-in at index 0. The fixture never
+      calls `ggml_backend_sched_set_tensor_backend`: `reserve_size`'s start
+      reset erases pins (`gb:2682`), so a pinned fixture would attribute 0
+      at C4's placement too, and the RED could never go green.
+    - It calls the attribution function at three points:
     - after `ggml_backend_sched_reserve_size`: it attributes all four
       nodes, since the split is live (`gb:2677-2689`);
     - after `ggml_backend_sched_reserve`: it attributes **zero**, since
@@ -3482,9 +3721,20 @@ I-5, §F2). It is the commit that changes every SYCL load.
       grows no slot and prints the `staging not planned` line once (§M69
       (a)); the pools' demand is still registered, for a host-resident
       `MUL_MAT_ID` `src0`;
-    - a walk alone changes nothing: the slots grow only at the commit
-      (r6 I-1 (2)), and a pending plan that is never committed (its
-      allocating reserve threw) is replaced by the next walk;
+    - a walk alone changes nothing: the slots grow, and demand is
+      registered, only at the commit (r6 I-1 (2), r7 I-1 (3));
+    - **one reserve's walks merge** (r7 I-1 (4)): a pp walk at `n_tokens`
+      512, then a tg walk at 1, then a commit leaves the pp figures for Q,
+      DST, MASK and the pools' D. **Mutant** "tg replaces pp": the RED
+      fails with `committed q=<1-token figure> expected <512-token
+      figure>`, and on the pools `committed D=10 expected D=5120`;
+    - **the begin clears every backend's pending plan** (r7 I-1 (1)): a
+      first reserve's walk attributes nodes to backends A and B and then
+      fails before its commit; a second reserve's begin runs, its walk
+      attributes only to A, and it commits. B then commits nothing.
+      **Mutant** "stale pending from a failed candidate is promoted": no
+      begin, so B commits the first reserve's plan, and the RED fails with
+      `backend B committed a plan its reserve never walked`;
     - after a plan of (Q, DST, MASK, VAL, IDS), each slot's capacity is its
       figure rounded by the slot rule, and the `DEVICE` demand is their
       sum;
@@ -3506,11 +3756,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
     - the dispatch counter (r6 I-2): a host `FLASH_ATTN_EXT` that is
       refused still counts in `fa`, and in `refusals`; the first
       interception prints the `first host dispatch` line once; the
-      fail-closed helper prints the counter line before it asserts, in a
-      death test scored on rc 134 plus the counter line before the
-      unsupported-node line. **Mutant:** `fa` incremented after
-      `ggml_sycl_attn_host_staging_get` succeeds, which reads `fa=0` on a
-      refused dispatch.
+      fail-closed helper prints the counter line, then the unsupported-node
+      line, and sets `GGML_STATUS_FAILED`, with the process still alive
+      and no abort (§M69 (b) second amendment). **Mutants:** `fa`
+      incremented after `ggml_sycl_attn_host_staging_get` succeeds, which
+      reads `fa=0` on a refused dispatch; the helper asserting, which
+      kills the test process.
     - The walk selects by the dispatch's predicate (r5 m-6). A synthetic
       reserve graph holds four `FLASH_ATTN_EXT` nodes: one whose K is a
       **view** (buffer `NULL`, `view_src` in a `SYCL_KV_Host` buffer), which
@@ -3522,21 +3773,30 @@ I-5, §F2). It is the commit that changes every SYCL load.
       each device's slots get only its own nodes' figures, and a dispatch on
       device 1 at or below them records no allocation.
     - **The pools are sized from the plan, and the over-plan check can
-      fire** (r6 I-3). A synthetic MoE graph with a host-resident
-      `MUL_MAT_ID` `src0` (a CPU buffer), top-2, is planned and committed
-      at `n_tokens` 8 (D = 16). `moe_hybrid_init_once` is then given the
+      fire** (r6 I-3). A synthetic MoE graph with a `MUL_MAT_ID` `src0`
+      whose experts the fixture placement plan puts on the host, top-2, is
+      planned and committed at `n_tokens` 8 (D = 16). `moe_hybrid_init_once` is then given the
       same graph at `n_tokens` 16 (D = 32): it initializes both pools at D
       = 16, the plan's figure, and prints the `exceeds its planned` line
       naming `graph needs D=32` and `planned D=16`. The same graph at
-      `n_tokens` 4 prints nothing. With the `src0` on a device buffer the
-      plan registers no pool demand and initializes nothing. With no
-      commit, the `unplanned; not initialized` line prints. The test
-      needs no GPU: the pools take host allocations through the fixture
-      cache.
+      `n_tokens` 4 prints nothing. With no commit, the `unplanned; not
+      initialized` line prints. The test needs no GPU: the pools take host
+      allocations through the fixture cache.
+    - **The gate is placement, not the buffer** (r7 I-2 (2)). The same
+      `src0` in a `SYCL_Mapped`-typed buffer, which is `is_host`, with
+      every expert placed on the device by the fixture plan, registers
+      **zero** pool demand, and the commit prints `committed D=0 ...
+      host_expert_nodes=0`. **Mutant:** the `ggml_backend_buffer_is_host`
+      gate, which fails with `pool demand 0.3 MiB for an all-device src0`.
+    - **Two contexts** (r7 m-5). Context A commits at `n_tokens` 8 (D =
+      16), then context B at 16 (D = 32): the pools re-size once to D = 32
+      and print `resized D=16->32`. B's backend context is destroyed and A
+      re-commits: the pools re-size to D = 16. **Mutant:** init-once kept,
+      which leaves the pools at D = 16 after B's commit and fails with
+      `pools hold D=16 below committed high-water D=32`.
     - **Mutants:** the init sized from its own graph (rev 3g), which
       initializes at D = 32 and prints no line; the check removed, which
-      prints nothing on the D = 32 graph; the host gate dropped, which
-      registers pool demand for the device `src0`.
+      prints nothing on the D = 32 graph.
     - **Mutants:** the dispatch-time grow restored, which records an
       allocation on the over-plan request instead of refusing it; the plan
       ignoring the switch; `ggml_backend_buffer_is_host` as the predicate,
@@ -3625,17 +3885,42 @@ I-5, §F2). It is the commit that changes every SYCL load.
      tree it was.
 
      Pre-registered pass criteria:
-     - **the answer** (r5 m-9, r6 m-3): stdout and stderr go to separate
-       files. `llama-completion` echoes the prompt, so the continuation's
-       first word is anchored:
-       `head -n 1 step2.out | grep -cE '^The capital of France is
-       Paris([^[:alnum:]]|$)'` = 1. **Non-degeneracy:** `grep -cE
-       '\b([[:alnum:]]+)\b([[:space:][:punct:]]+\1\b){3}' step2.out` = 0,
-       so no word repeats four times in a row. Its controls, run by the
-       lead before scoring: `echo 'Paris Paris Paris Paris' | grep -cE
-       '<same pattern>'` = 1, and `echo 'The capital of France is Paris.
-       It is' | grep -cE '<same pattern>'` = 0. Both must hold, or the
-       scorer is broken and the criterion is VOID;
+     - **the answer** (r5 m-9, r6 m-3, r7 m-7, n-6): stdout and stderr go
+       to separate files. `llama-completion` echoes the prompt, so the
+       continuation's first word is anchored on the first line. The
+       scorers, each on one line:
+
+       ```bash
+       head -n 1 step2.out | grep -cE '^The capital of France is Paris([^[:alnum:]]|$)'
+       tr -cs '[:alnum:]' '\n' < step2.out | awk '{r=($0==p)?r+1:1; if(r>m)m=r; p=$0} END{print m+0}'
+       tr -cs '[:alnum:]' '\n' < step2.out | awk 'NR>2{c[a" "b" "$0]++} {a=b; b=$0} END{m=0; for(k in c) if(c[k]>m) m=c[k]; print m}'
+       ```
+
+       The anchor must print 1, the word-run check at most 3 (no word
+       repeats four times in a row), and the trigram check at most 2 (no
+       three-word sequence occurs three times). The trigram check catches a
+       phrase loop such as `... is Paris. The capital of France is Paris.
+       ...`, which the word-level check passes. Its limit: a loop whose
+       period is longer than the 32 generated tokens can hold three times
+       is not caught.
+     - **The scorers' controls**, run by the lead before scoring; each is
+       fed the same way its scorer is:
+
+       ```bash
+       printf 'The capital of France is Paris.\n' | grep -cE '^The capital of France is Paris([^[:alnum:]]|$)'
+       printf 'The capital of France is Lyon.\n' | grep -cE '^The capital of France is Paris([^[:alnum:]]|$)'
+       printf 'The capital of France is\n' | grep -cE '^The capital of France is Paris([^[:alnum:]]|$)'
+       printf 'Paris Paris Paris Paris\n' | tr -cs '[:alnum:]' '\n' | awk '{r=($0==p)?r+1:1; if(r>m)m=r; p=$0} END{print m+0}'
+       printf 'The capital of France is Paris. It is\n' | tr -cs '[:alnum:]' '\n' | awk '{r=($0==p)?r+1:1; if(r>m)m=r; p=$0} END{print m+0}'
+       printf 'The capital of France is Paris. The capital of France is Paris. The capital of France is Paris.\n' | tr -cs '[:alnum:]' '\n' | awk 'NR>2{c[a" "b" "$0]++} {a=b; b=$0} END{m=0; for(k in c) if(c[k]>m) m=c[k]; print m}'
+       ```
+
+       They must print 1, 0, 0, 4, 1 and 3. The third line is the prompt
+       echo alone, the negative control the GPT-OSS gate's `grep -cx`
+       precedent asks for. Both repeat checks are `awk` over `tr`-split
+       words, because this host's `grep` is `ugrep`, which rejects the
+       back-reference a `grep -E` repeat pattern needs. Any other result means the scorer is broken
+       and the criterion is VOID;
      - **the reference is C4's own continuation.** The parent commit cannot
        load Qwen (rc 137 in run2), so no parent run can serve. The lead
        records step 2's full stdout as the reference, and C5 and C6 rerun
@@ -3697,7 +3982,7 @@ I-5, §F2). It is the commit that changes every SYCL load.
        reading, is < 30 GiB **plus the lazy table's own bytes**, read from
        th32's `[PLACEMENT] lazy per_layer_token_embd.weight` line: its
        `resident=` figure under `residency=HOST` (51880.0 MiB, locked, th32
-       §8's expected line), or its `cache=` figure under `residency=STORAGE`.
+       §10's expected line), or its `cache=` figure under `residency=STORAGE`.
        Those bytes are th32's, not 5efe's, and the term is taken from the
        line, never assumed. A missing line is a FAIL of the precondition.
        The criterion is skipped, and said to be skipped, if the control
@@ -3847,8 +4132,8 @@ I-5, §F2). It is the commit that changes every SYCL load.
          (§M56 (a)). GDC3 is the single source of N, the host-KV figure and
          the layer range. The arm scores against the GDC3 point its tree
          selects (§7 preamble, §M61 (a)), on GDC3's own vehicle,
-         `llama-cli`, and carries zhcn's plan == reality criterion (§M60
-         (c)). If GDC3 changes, this arm changes with it and nothing here is
+         `llama-cli`, and carries zhcn's compute criterion in its §M73 (b)
+         form, cited, not restated (r7 m-6). If GDC3 changes, this arm changes with it and nothing here is
          edited.
        - The VOID guard, N = 131072 (§7 preamble).
        - No host zone grows during PP or TG, the `staging not planned` line
@@ -3887,9 +4172,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
        - **Parent-tree control** (r6 m-4). GPT-OSS loads on master, so the
          lead runs 5b's literal command on the parent commit too. The
          parent has none of C4's lines, so only rc, the digit count, and
-         the abort and GPU-fault lines are compared. A defect that
-         reproduces on the parent is pre-existing and reported, not C4's;
-         one that does not is C4's. The host dispatch "cannot itself be
+         the abort and GPU-fault lines are compared. Its place in the
+         scoring is rule 1's exception (b) (§4.4 criteria; r7 m-3): only an
+         abort or crash whose abort or GPU-fault line also prints on the
+         parent is pre-existing, reported and not C4's. A staging refusal
+         or a failed graph is never pre-existing, since the parent can
+         print neither, and every other failure is C4's. The host dispatch "cannot itself be
          GPU-verified" by its own account (`gs:81855-81862`), which is why
          5b needs this control.
      - **A model switch under `GGML_SYCL_STRICT_LEASES=1`** (§M57 (b)):
@@ -4247,7 +4535,7 @@ amendment, folded in rev 3i:
 | finding | disposition | where |
 |---|---|---|
 | I-1 the plan walk runs after the scheduler has reset | Fixed per the ruling. `ggml_backend_sched_reserve` resets at its end (`gb:2703`), so after the allocating reserves `ggml_backend_sched_get_tensor_backend` returns `NULL` for every node (`gb:2665-2675`, `:2813-2820`). The walk now runs right after C4's size-only `reserve_size` calls, which leave the split live (`gb:2677-2689`), and records a pending plan; `ggml_backend_sycl_commit_host_holders` promotes it only after the allocating reserves succeed. The `no_alloc` pass is skipped. A walk that attributes zero host-KV nodes with the switch on WARNs, and a dispatch-on arm that prints it FAILs. New RED `test-sycl-plan-walk-sched` on the real ggml-base scheduler over CPU backends; source-gate placement and commit-order mutants. `ggml_backend_sycl_set_sched_placement_plan` is cited as a precedent for argument types only (direct call, no-op body, `gs:15847-15854`). | §4.4 staging plan, §7 C4 tests and source gate |
-| I-2 (1) `fa` undefined, counter can miss the abort | Fixed: `fa` counts interceptions, incremented before `ggml_sycl_attn_host_staging_get`; the first interception per device prints a `first host dispatch` WARN; the fail-closed helper prints the counter line before it asserts; a score reads the last line per device. | §4.4 staging plan, criteria, §7 C4 staging-plan test |
+| I-2 (1) `fa` undefined, counter can miss the abort | Fixed: `fa` counts interceptions, incremented before `ggml_sycl_attn_host_staging_get`; the first interception per device prints a `first host dispatch` WARN; the fail-closed helper prints the counter line before it asserts; a score reads the last line per device. | §4.4 staging plan, criteria, §7 C4 staging-plan test In rev 3j the helper propagates `GGML_STATUS_FAILED` instead of asserting (§M69 (b) second amendment), and prints the counter line before it returns. |
 | I-2 (2) the §M69 (c) VOID is an escape hatch | Fixed: `planned 0 B` alone no longer makes a refusal dsab's. Any refusal or abort is C4's FAIL unless stderr shows, in order, a plan line with a non-zero total, a counter line (a SYCL backend free) and the refusal. Lifetimes and 5b say so; single-context 3b and 5b cannot show that sequence. | §4.4 Lifetimes, criteria, §7 C4 steps 3b, 5b |
 | I-2 (3) no precedence between VOID and FAIL | Fixed: five ordered rules; the only VOID is `fa` = `set_rows` = `refusals` = 0 with no abort, and `fa` = 0 with `set_rows` > 0 is a FAIL. | §4.4 criteria |
 | I-3 the pools are sized from the warmup, not the plan | Fixed per the ruling (P4, one source): `moe_hybrid_init_once` initializes both pools from the device's committed (D, K, N), and its own scan only checks, with an `exceeds its planned` WARN and an `unplanned` WARN. Pool demand is planned only for a host-resident `MUL_MAT_ID` `src0`. rev 3g's claim that the two agree is deleted. Pre-registered: Qwen 100.0 + 400.0 MiB with the matching `[MOE-POOL]` and `[CPU-EXPERT-POOL]` lines; GPT-OSS 0, or 45.0 + 180.0 MiB, by the run's placement. A pure RED plans at 8 tokens and feeds 16, so the over-plan WARN fires. | §4.4 sizing, criteria, §7 C4 staging-plan test, source gate, step 2 |
@@ -4262,3 +4550,28 @@ amendment, folded in rev 3i:
 | n-4 the default arms' absence has no INFO control | Fixed: scored only beside a `[HOST-ARENA] SCRATCH demand ctx=` line of the same run, else VOID. | §4.4 criteria |
 | r6-prep: 573t | §M69 (b) is cited as llama.cpp-573t in §4.4, the tickets paragraph and the r5 I-2 (1) row; no ticket was created. | §4.4, §7 tickets, this appendix |
 | r6-prep: r5 N1-N3 | The r5 row now reads that the lead has done them. | this appendix |
+
+**design-5efe-r7** (`87181659f..b29dd42d2`, 0C/2I/7m/6n), with the lead's
+r7 rulings, the §M69 (b) second amendment, §M73 and §M74, folded in rev
+3j:
+
+| finding | disposition | where |
+|---|---|---|
+| I-1 the pending plan has no lifecycle | Fixed as the reviewer wrote it. A third proc-table entry, `ggml_backend_sycl_begin_host_holders(sched)`, clears every SYCL backend's pending plan at the start of each `sched_reserve` (after `lc:2002`) and before the pipeline-parallel re-measure, enumerating with `ggml_backend_sched_get_n_backends`/`get_backend` (`ggml-backend.h:362-363`). One reserve's pp and tg walks max-merge per (device, kind) and per device for (D, K, N); the pp graph dominates (`lc:2007` against `lc:2080`), so Qwen plans D = 5120, not 10. The commit consumes the pending plan and is the only step that registers demand. Tests: "tg replaces pp" and "stale pending from a failed candidate is promoted" mutants, each with its predicted message. | §4.4 sizing and staging plan, §7 C4 tests and source gate |
+| I-2 the pools gate on the buffer | Fixed as a P3 fix: the gate is placement's executor fact, `ggml_sycl_moe_plan_has_host_experts` (`gs:26003-26025`), the fact the dispatch's CPU-island gate routes on (`gs:26031-26051`), never `ggml_backend_buffer_is_host`, since under C4 `SYCL_Mapped` is `is_host` for device-placed experts too. A new INFO line, `DEVICE pools dev=%d committed D=... host_expert_nodes=%d`, is the positive control for the zero case, else VOID. Test: a `SYCL_Mapped` `src0` with every expert device-placed registers zero pool demand; mutant: the buffer gate. GPT-OSS's case is read from that line, one source. | §4.4 sizing, criteria, §7 C4 tests and source gate |
+| m-1 a losing candidate commits | Fixed: `try_candidate` commits only after its host-fallback check (`lc:1622-1629`); other callers commit at `sched_reserve`'s end. A losing candidate grows no slot, re-sizes no pool and ensures no SCRATCH for either. No exception is stated. The notify's own pre-allocation ensure for a losing candidate is a separate path, named in §4.4, unreachable on the lead arms (the MoE cap holds the ladder at 512), and raised with the lead. | §4.4 staging plan, §7 C4 source gate |
+| m-2 rule 4 can absorb a crash | Fixed: refusal, failed graph, abort (rc 134 plus the printed abort message) and crash (any other non-zero rc or signal: rc 139, rc 124, the watchdog's `_Exit(1)`, a GPU fault) are defined; an abort or crash is FAILED, never VOID. Rule 2 requires a counter line after the plan line; rule 4 also requires no `first host dispatch` line and rc 0. | §4.4 criteria |
+| m-3 5b's parent control has no place in the rules | Fixed: it is rule 1's exception (b), for an abort or crash whose abort or GPU-fault line also prints on the parent; a refusal or failed graph is never pre-existing. | §4.4 criteria, §7 C4 step 5b |
+| m-4 the size-only split is not the allocating split; the RED fixture | Fixed. (a) The start reset erases the `norm`/`l_last` pins (`lc:3985-3997`) and the `!offload_kqv` pin (`src/llama-graph.cpp:2779`), which `ggml_backend_sched_reserve` keeps (`gb:2691-2698`); the walk's three op kinds are assigned by buffer or expansion and unaffected, and the claim is bounded to them. The notify re-notifies at commit with the allocated size, so the ledger holds the fact, and the demand line prints both figures. (b) The RED takes an injected `is_target` predicate and reaches the stand-in through the first pass (`view_src` in a CPU buffer, stand-in at index 0), never `set_tensor_backend`. | §4.4 staging plan, §7 C4 tests |
+| m-5 no multi-context rule for the pools | Fixed: max-merged, the device high-water over live contexts' commits; the commit re-sizes initialized pools to it (`resized D=a->b`, INFO) in `sched_reserve`, which is quiescent; a context's plan drops at its backend destructor; release at the last backend is dsab's. Two-context test with an init-once mutant. | §4.4 sizing, §7 C4 tests |
+| m-6 §M73 not applied | Fixed: the three GDC3 places cite zhcn's compute criterion in its §M73 (b) form and the replay's `compute_ctx` charge (§M73 (c)), cited, not restated. | sibling designs (zhcn), §7 preamble, C4 step 5 |
+| m-7 the Paris anchor is fail-open | Fixed: the scorers are one-line commands in a fenced block, and the anchor has its own controls, Paris 1, Lyon 0 and the prompt echo alone 0. All six controls were run on this host and print the stated values. | §7 C4 step 2 |
+| n-1 sha mixing | Fixed: all six sites at both shas. | §7 C4 tests |
+| n-2 rule 1 keyed on the total | Fixed: keyed on the refusing kind's figure. | §4.4 criteria |
+| n-3 the th32 pin | Re-pinned at rev 3d `c1903496f`; every cited th32 section keeps its number at 3d, and the expected-line cite is corrected to §10 (it was already §10 at 2x). | sibling designs |
+| n-4 the synchronize cite | Fixed: `lc:2002`. | §4.4 staging plan |
+| n-5 rule 3 presumes FA on | Fixed: rule 3 reads `Flash Attention enabled` (`lc:1281`); with `set to disabled` (`lc:1271`), or neither line, the staging criteria are VOID. | §4.4 criteria |
+| n-6 word-level degeneracy only | Fixed: a trigram check (no three-word sequence three times) with a control, and its limit stated. The repeat checks use `awk`, because this host's `grep` (`ugrep`) rejects back-references. | §7 C4 step 2 |
+| §M69 (b) second amendment | Folded: the six sites propagate `GGML_STATUS_FAILED` through an out-parameter, and `graph_compute` returns it before the recording fallback, which would re-dispatch nodes (`gs:107206-107229`); llama's existing path logs `lc:3968-3970` and returns -3 (`lc:3290-3294`). No assert or abort; the test and the gate check it. | §4.4 staging plan, criteria, §7 C4 tests and source gate |
+| §M74 | Folded: every line C4 adds and a vehicle arm scores is always compiled in ggml-sycl; each is a dedicated line §M74 (f) accepts; the `[ATTN-HOST]` dispatch lines are also switch-gated, and 3b/5b set the switch. | §4.4 staging plan |
+| lead check: the default arms' witness | Folded: `staging not planned` is required exactly once on each default arm, absent is VOID, and every scored `[ATTN-HOST]` absence is scored only beside it. | §4.4 criteria |
