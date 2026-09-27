@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14r, by impl-moua, 2026-09-27. The revisions answer twenty-six reviews:
+Design, revision 7.14s, by impl-moua, 2026-09-27. The revisions answer twenty-seven reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -148,7 +148,12 @@ Design, revision 7.14r, by impl-moua, 2026-09-27. The revisions answer twenty-si
   or reads freed memory) and 23mk rev 4.16's Graph-scratch relay, recorded in §6.34, with the
   split-stream capture in the merge-gate script, and follow-ups for rulings §M64. Revision 7.14r
   is three commits on top of 7.14q (`f2323f9e0`): `df9803cb8`, `2489d9e85` (§M64 (b)) and a
-  second follow-up (§M64 (a), (c)).
+  second follow-up (§M64 (a), (c)), `038f698bd`.
+- design review r26 (design-moua-r26 on `f2323f9e0..038f698bd`: 0 Critical, 3 Important, 17
+  Minor, 4 nits) and the lead's rulings §M66 (armed trace lines), §M67 (the Graph scratch
+  after the pack and the KV; the load reserves none), §M68 (b) (one owner for the direct
+  path's deletion) and §M70 (what a runtime ONEDNN-zone miss does from (b1) on), recorded in
+  §6.35. Revision 7.14s is one commit on top of 7.14r (`038f698bd`).
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -161,9 +166,9 @@ one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2,
 §V15, §V15a, §V16, §V16a, §M34, §M35, §G1, §G1a, §V17, §M36, §M37, §Z20, §M38, §G1b, §M39, §G1c,
 §M40, §M41, §Z-23mk-411, §M42, §Z21, §Z23, §Z22, §M43, §M44, §Z24, §Z26, §M45, §M46, §M46b,
 §Z28, §M47, §M47a, §M48, §M49, §F3, §M50, §M51, §M52, §M53, §M56, §M59, §M60, §M61, §M62, §M63,
-§M64). §M11a is a relay line inside §Z8, not a section, and is cited as §Z8 I-2 (r12 m-14). This
-document cites it as "rulings §X". **Where this document paraphrases a ruling and differs from
-the file, the file wins.**
+§M64, §M66, §M67, §M68, §M70). §M11a is a relay line inside §Z8, not a section, and is cited as
+§Z8 I-2 (r12 m-14). This document cites it as "rulings §X". **Where this document paraphrases a
+ruling and differs from the file, the file wins.**
 
 Revisions cited:
 - **Current master is `3d9414c8c`, which contains jehw and u1bb** (jehw landed). Revision 7.6
@@ -256,7 +261,12 @@ Every file:line below names its revision.
   the shared zone, which the pack cannot fill and which the model's first context on the device
   draws from (§2.4.2 (b), step 3). **The reservation has one source:** it is the head-slot set
   that the context transaction's fit places, from the same function (`context_demand_records`,
-  §2.4.3), evaluated at the load envelope's shape, never a list kept beside it. The envelope
+  §2.4.3), evaluated at the load envelope's shape, never a list kept beside it. **The load
+  reserves no Graph scratch (rulings §M54, §M64 (b), §M67 (b)):** 23mk's `onednn_graph_scratch`
+  is not a head slot, so it is not in the set; each context's fit charges it after the KV
+  extents, in the `REGION` room the pack and the KV leave, and a layer it does not fit declines
+  oneDNN SDPA with `scratch_unplaced`. Reserving it at load would be an idle reservation (P4)
+  that puts it ahead of the pack. The envelope
   carries the caller's `n_ctx`, `n_seq_max`, flash-attention choice and KV types from
   llama.cpp-fkpg (a), so L4 does not land before fkpg (a) (§4), and every term is evaluated from
   the pack's inputs, never from a partial placement: a bound before the pack, the admitted value
@@ -486,7 +496,7 @@ into `zone_alloc`. `zone_alloc` has no role parameter today (master `unified-cac
 | `WEIGHT` | `alloc_role::WEIGHT`. That includes the runtime expert-cache fills, which are `alloc_role::WEIGHT` with `runtime_category::EXPERT_CACHE` (vram-pool.cpp:81, unified-cache.cpp:18484): on-demand expert rows, which are real weights. It also includes a `SYCL<n>` weight buffer that overflows RUNTIME into the shared zone (r2 m2, below). | weight | TLSF `allocate` (today's behaviour), tag `TAG_WEIGHT`; after the optional ladder exists, first a weight-side hole, then the gap front (§2.3.3) |
 | `OPTIONAL` | optional layout copies (jehw's `optional_layout`). Two kinds (rulings §M18.3a): an unplanned copy, outside every live model's admitted plan, which an arena device no longer stages (§2.4.2 (b), "The range bytes"); and a planned **OPTIONAL** copy, a duplicate layout whose primary layout is resident on the same device. A planned **PRIMARY** copy (every other planned copy) is `WEIGHT`, never optional, never an eviction or yield candidate, and freed only at unload. A planned OPTIONAL copy is never an eviction candidate either; it is yieldable only to a context's KV admission, through the yield path (§2.4.2 step 5) | unplanned: weight frontier; planned OPTIONAL: inside its model's `WEIGHT` range, where the fit sees it as a buried tenant (§2.9) | unplanned: `allocate_gap_front`, tag `TAG_OPTIONAL`; planned OPTIONAL: `allocate_within({LOAD, txn}, WEIGHT, ...)`, tag `TAG_OPTIONAL` |
 | `KV_REGION` | the per-(ContextId, device) KV region, including each layer's persistent packed-K sidecar as a companion slot when the sidecar is enabled (§2.4.1) | context | the extents chosen by `kv_region_fit` (§2.4) |
-| `CONTEXT` | the ring's activation and output slots, per (context, device) (§2.7; rulings §M32 I-1); zhcn's compute chunks and fattn slot; the recurrent state (§2.4.4, r4 I9); the context-lifetime cohorts beni routes here (the oneDNN activation half, `graph_input_stage`); the oneDNN Graph scratch, whose one producer is 23mk's function (rulings §M41 m-6) | context | a reserved slot, claimed by index (§2.3.2, §2.4.3) |
+| `CONTEXT` | the ring's activation and output slots, per (context, device) (§2.7; rulings §M32 I-1); zhcn's compute chunks and fattn slot; the recurrent state (§2.4.4, r4 I9); the context-lifetime cohorts beni routes here (the oneDNN activation half, `graph_input_stage`); the oneDNN Graph scratch, whose one producer is 23mk's function (rulings §M41 m-6) | context | a reserved slot, claimed by index (§2.3.2, §2.4.3); **except the oneDNN Graph scratch**, which is no reserved head slot: the context's fit charges it after the KV extents, per device-resident attention layer, and a layer it does not fit declines SDPA (rulings §M54, §M64 (b), §M67) |
 | `TRANSIENT` | every **non-WEIGHT role** that names `WEIGHT` or `KV`: COMPUTE/STAGING scratch (ggml-sycl.cpp:46120, :97965; mmvq.cpp:16863; common.hpp:6658), jzvq's MXFP4 MoE TG caches and fattn workspaces, persistent buffers (unified-kernel.cpp:4890, refused under an arena per 23mk Q5), and the forced-split fattn packed-K request (fattn.cpp:1640). `unified-cache.cpp:21455` and `scratch_pool` (`:20629`) are dead code that 23mk deletes | context | a reserved slot, claimed by index; the demand functions are beni's and jzvq's (§2.4.3) |
 
 **`backend-buffer-kv-zone` keeps its buffer's role (r2 m2).** Standard `SYCL<n>` buffers carry
@@ -995,11 +1005,14 @@ written:
     device-resident attention layers, each layer's term sized from its `n_kv`. Layers are
     admitted in ascending order of per-shape term; a layer whose term does not fit declines
     SDPA with `scratch_unplaced` (a counted WARN) and runs native FA, and no context is
-    refused. KV is placed first, so G never forces a demotion (follow-up llama.cpp-xqex), and
-    `FIRST_CONTEXT` calls the same fit. Step 5 records it under its own term, and step 6 **does
-    not carve it** (rulings §V17 I-1: the design that owns a C term says whether it is carved;
-    every head slot of this design, MMID's included, is carved at step 6, and this is the one
-    term left pending): 23mk's consumer draws inside it many times in one hold, through
+    refused. KV is placed first, so G never forces a demotion (follow-up llama.cpp-xqex).
+    `FIRST_CONTEXT` calls the same fit, and **the load reserves no G (rulings §M67 (b)):** its
+    reservation sums only the `HEAD_SLOT` records (§2.4.3), so G's bytes are never held before
+    a context exists, which would be an idle reservation (P4) ahead of the pack. Step 5 records
+    it under its own term, and step 6 **does not carve it** (rulings §V17 I-1: the design that
+    owns a C term says whether it is carved; every head slot of this design, MMID's included, is
+    carved at step 6, and this is the one term left pending): 23mk's consumer draws inside it
+    many times in one hold, through
     `allocate_within({CONTEXT, id}, ONEDNN_GRAPH_SCRATCH, size, align, tag, consume = false)`
     (A2), and 23mk's teardown clear names it. It lies in the shared zone like every range a
     transaction records (rulings §M32 I-2; 23mk 4.8a puts it on the RUNTIME TLSF, relayed,
@@ -1675,15 +1688,20 @@ The request `r`:
 
   Worked prediction (zhcn GA, B50 GPT-OSS 20B on **llama-cli** `-c 65536 -ub 1024`; r5 m-g: one
   number, from one function; rulings §M60, §M61(b)). **GA's demotion count is zhcn's, and this
-  doc carries no copy of it.** The single source is zhcn GA (`e4f424a`, llama-cli), whose
-  estimate is about 1 demoted layer. The room it starts from and the compute it charges are
-  zhcn's figures too, and this doc restates neither (rulings §M56(a), §M61(b)). What moua owns
-  in GA is the fit rule, its own KV and ring terms, and one delta:
+  doc carries no copy of it.** The single source is zhcn GA (`e4f424a`, llama-cli), and this
+  doc does not restate its count (r26 m-4). The room it starts from and the compute it charges
+  are zhcn's figures too, and this doc restates neither (rulings §M56(a), §M61(b)). What moua
+  owns in GA is the fit rule, its own KV and ring terms, and one delta:
   - **the RUNTIME-floor delta, +377.5 MiB of room on moua's tree** (L4+L6 landed and RUNTIME's
     floor released; r25 m-3, lead ruling 2026-09-27). The 512 MiB floor holds 377.5 MiB idle
     above GPT-OSS 20B's RUNTIME D terms, which are `moe_onednn`, 32 × 4406528 = 141008896 B
     (134.5 MiB), and `moe_ptr_table`'s k × 256 B (under 0.1 MiB); RUNTIME has no floor on an
-    arena device (§2.4.2 (b), the end states). zhcn cites moua for this delta alone. The model's
+    arena device (§2.4.2 (b), the end states). zhcn cites moua for this delta alone, and **only
+    as an input to the pre-registration** (r26 m-16; zhcn r30 m-3): the predicted shared zone on
+    moua's tree is GPT-OSS 20B's 13715.5 MiB, 13338.0 + 377.5 (§2.4.2 (b)'s pre-plan split). A
+    replay of a run on moua's tree reads that run's own shared-zone line, which already carries
+    the delta, and never adds 377.5 on top of it; adding it twice overstates the room by 377.5
+    MiB and under-counts the demoted layers. The model's
     `FIRST_CONTEXT` reservation is part of the room, since GA's context is the model's first and
     the fit counts the reservation as its own;
   - full-attention KV, from `kv_layer_bytes_for_kind` at `n_ubatch` = 1024 (f16 K and V, 8 KV
@@ -1695,10 +1713,11 @@ The request `r`:
     activation 1024 · 32 · 2880 · 2 = 188743680 B (180.0 MiB) and output 1024 · 32 · 2880 · 4 =
     377487360 B (360.0 MiB), with `local(t)` = 32, since the B50 holds every expert;
   - the fit: `free_after_full_kv` = R − 1566.0 − (c + 540.0 + H) MiB, where R is the room on
-    moua's tree (zhcn's room plus the 377.5 above), c is the llama-cli compute at `-ub 1024`
-    (zhcn GA's figure; the vehicle's `n_outputs_max` is 1), and H is the context's other head
-    slots, below. When it is negative, the fit demotes the ⌈−free / 128⌉ highest-indexed
-    full-attention layers, K and V together, and no SWA layer.
+    moua's tree: for the pre-registration, zhcn's room plus the 377.5 above; for a replay of a
+    run on moua's tree, that run's own shared-zone line, with nothing added (r26 m-16), c is the
+    llama-cli compute at `-ub 1024` (zhcn GA's figure; the vehicle's `n_outputs_max` is 1), and
+    H is the context's other head slots, below. When it is negative, the fit demotes the ⌈−free
+    / 128⌉ highest-indexed full-attention layers, K and V together, and no SWA layer.
 
   **Withdrawn (rulings §M60):** the −709.4 MiB and 6 layers that 7.14f through 7.14q printed
   here. They carried 808.0 MiB of compute, which is llama-completion's figure at `-ub 1024`
@@ -1718,18 +1737,20 @@ The request `r`:
   (`fattn-onednn.cpp:115-116`). RUNTIME's transitional terms are 0 on this shape (rulings §M38
   C-2), so the room is unchanged. Head-slot alignment rounding adds under 512 B per slot (sizes
   are 512 B multiples; rulings §GA). **These figures are hand arithmetic, and the score does not
-  use them (r6 I-7):** GA's pre-registered numbers are the output of H2's run of `kv_region_fit`
-  on this geometry, with every head slot and the llama-cli compute, recorded before the lead's
-  run. Weight-side holes smaller than one 128 MiB slot can add a demotion, in which case the
-  §2.9 sub-slot WARN names them. **The ring's 540.0 assumes a ring depth of 1 and no record-mode
-  per-op index sets (r6 m-6):** if L4 finds the PP MoE oneDNN path reached while recording, that
-  is `[ZONE-PLAN-BUG]` and the path claims no slot (rulings §M37 Q6, §2.7), so the depth stays
-  1; GA is re-scored with the index-set bytes G1 prints. zhcn's G2 and GA carry 270.0 and 540.0
-  for the rows (at `-ub 512` and `-ub 1024`). **After the ONEDNN floor goes (rulings §M37 Q3)**
-  the room grows by a further 244842496 B (233.5 MiB; GPT-OSS 20B's W is 23592960 B, like
-  120B's). The layer count at that state is H2's run at that state, pre-registered for that
-  commit, not hand arithmetic, and the Graph scratch stays where §M54 puts it: after the KV
-  extents, never a head slot.
+  use them (r6 I-7):** GA's pre-registered count is zhcn GA's alone (rulings §M56 (a), §M61
+  (b); r26 m-4). H2's run of `kv_region_fit` on this geometry, with every head slot and the
+  llama-cli compute, is this design's check of its fit rule against zhcn's number, recorded
+  before the lead's run; a disagreement is relayed to zhcn and settled in zhcn's row, and H2's
+  output is never a second source for GA's score. Weight-side holes smaller than one 128 MiB
+  slot can add a demotion, in which case the §2.9 sub-slot WARN names them. **The ring's 540.0
+  assumes a ring depth of 1 and no record-mode per-op index sets (r6 m-6):** if L4 finds the PP
+  MoE oneDNN path reached while recording, that is `[ZONE-PLAN-BUG]` and the path claims no slot
+  (rulings §M37 Q6, §2.7), so the depth stays 1; GA is re-scored with the index-set bytes G1
+  prints. zhcn's G2 and GA carry 270.0 and 540.0 for the rows (at `-ub 512` and `-ub 1024`).
+  **After the ONEDNN floor goes (rulings §M37 Q3)** the room grows by a further 244842496 B
+  (233.5 MiB; GPT-OSS 20B's W is 23592960 B, like 120B's). The layer count at that state is H2's
+  run at that state, pre-registered for that commit, not hand arithmetic, and the Graph scratch
+  stays where §M54 puts it: after the KV extents, never a head slot.
 - **The yield prefix is strict (r1 M7).**
   - jehw (since `4d41db5c8`, unchanged at `c41fed119`: `select_optional_layout_yield`, called at
     `unified-cache.cpp:7771`) already selects copies by address, from the top, but it *prunes*
@@ -2423,7 +2444,21 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                every block drawn under the old generation has already been freed, or else the
                last such block's free, which is after that block's event, as any `mem_handle`
                drop is. So a retired generation cannot leak its charge at a count of zero, and a
-               draw cannot take a reference on a generation after its release has run. So from
+               draw cannot take a reference on a generation after its release has run.
+               **The generation's storage (r26 m-9; P2).** The count's reaching zero releases
+               the generation's *charge*, the ledger bytes, never the record that holds the
+               count: otherwise a draw that loaded the pointer just before the release would
+               run its compare-and-swap on freed memory. Each generation is a small host record
+               (its id, its count and its charge) in the owning entry's generation list, whose
+               records have stable addresses and are never freed or reused while the entry
+               lives; a grow appends one. The entry owns the list, and the entry itself lives
+               until its last reference drops: the device-entry store holds one, and each
+               generation holds one more while its count is non-zero, taken with the
+               self-reference and dropped by the decrement that reaches zero. So every record a
+               draw can load is live for as long as any draw or block can reach it, and the
+               list is freed in the entry's destructor, after the last block's free. The list
+               grows by one record per grow, so it is bounded by the entry's grows, each a
+               context transaction. So from
                the commit until the old blocks drain, the ledger counts both charges, and no
                load can read the old blocks' bytes as free room. 7.14p left the old blocks
                uncounted for that window and argued that a short draw would wait on the pending
@@ -2491,16 +2526,31 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    through `unified_allocate_owner` and wrapped by
                    `mem_handle::from_owned_alloc` when the entry commits, held by the entry and
                    released with it (P1, P2). The same block holds a fault word. **The waiter is
-                   capped** at a poll count G0 sizes to one second on each card. At the cap it
-                   sets the fault word and returns. A publisher that finds the fault set does
-                   not publish, so every later waiter also reaches its cap, and
-                   `ggml_backend_sycl_synchronize` reads the fault word after its wait and
-                   aborts with `[W-ORDER] marker wait capped on device %d: W ordering lost`. A
-                   capped wait therefore never lets a run finish silently, since proceeding
-                   silently is the W race. A scope guard submits the publisher, so a throwing
-                   step still publishes after the last event it returned. **Cost:** two
-                   single-work-item kernels per eager W use, one per oneDNN PP `MUL_MAT`, and
-                   two per replay; C6's PP ABBA arms score it.
+                   capped, and the cap is derived from the worst case, not from a delay G0
+                   happened to use (r26 m-10).** Two bounds set it. A single kernel may not
+                   spin past the engine's xe `job_timeout_ms`, or the GT resets, so each waiter
+                   kernel's poll count is sized by G0 to half that timeout on each card, C. And
+                   the tail a correct predecessor can have is not one F2 delay: its use can sit
+                   behind a replayed graph and the `host_task` backlog on its queue. So the use
+                   submits a chain of K waiter kernels, each capped at C, and each returns at
+                   once when the marker has already reached n − 1, so a satisfied chain costs
+                   K − 1 near-empty launches. K = ⌈2 T / C⌉, where T is the worst predecessor
+                   tail G0 measures on the gate shapes (F3, §3.2: the longest replayed graph
+                   plus one ubatch's `host_task` backlog, per card), and G0 prints C, T and K.
+                   Only the last waiter of the chain faults: at its cap it sets the fault word
+                   and returns, and counts `w_order_wait_exhausted`
+                   (`GGML_SYCL_PRIVATE_TESTING`). A correct run then has twice its measured
+                   worst tail before the fault, so a fault means a lost publisher, not a slow
+                   one. A publisher that finds the fault set does not publish, so every later
+                   waiter also reaches its cap, and `ggml_backend_sycl_synchronize` reads the
+                   fault word after its wait and aborts with
+                   `[W-ORDER] marker wait capped on device %d: W ordering lost`. A capped wait
+                   therefore never lets a run finish silently, since proceeding silently is the
+                   W race. A scope guard submits the publisher, so a throwing step still
+                   publishes after the last event it returned. **Cost:** K + 1 single-work-item
+                   kernels per eager W use (the waiter chain and the publisher), one use per
+                   oneDNN PP `MUL_MAT`, and K + 1 per replay; C6's PP ABBA arms score it, with K
+                   as G0 printed it.
                  - **Form E, an event section (the fallback).** The entry holds one slot,
                    `last_w_event`, and a **W-order mutex**. Under it the function reads
                    `last_w_event`, calls the steps (the first step's submit carries
@@ -3787,16 +3837,60 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         overflow (rulings §M64 (a)),** `onednn_graph_scratch_alloc_direct_locked`
         (`unified-cache.cpp:11721`, reached from `:11708` at `c69d5774d` and `e2461d4fb`), which
         breaks P1, P2 and P4 on its own: a legacy `alloc_handle` outside the arena, a map keyed
-        by raw pointer, a host headroom poll with a 2 s drain, and an abort on exhaustion. When
-        the stored bytes plus G exceed the ONEDNN cap, (b1) declines oneDNN SDPA on that device
-        with a counted reason and one WARN per (context, device), which is §M54 (3) applied
-        early; the interim cost of the overflow is not accepted. Which commit deletes the direct
-        path is 23mk's to state (this design reads it as (b2)'s, below), or 23mk cites the
-        ticket that does. **Admission never admits a layer whose term exceeds the override
-        (rulings §M64 (c)):** it declines that layer's SDPA, since the plan never knowingly
-        schedules a miss (P4). **(b1) converts nothing (23mk §6.8's scoping
-        note, mirrored; rulings §M44b):** the commit that converts the Graph scratch is (b2),
-        and H7ap's C-rule arm targets the tree after (b2);
+        by raw pointer, a host headroom poll with a 2 s drain, and an abort on exhaustion.
+        **What a runtime ONEDNN-zone miss does from (b1) on (rulings §M70, matching 23mk
+        `8547a22f0` §4.8 (b1); r26 I-3):** (b1) replaces the call at `:11708` with the TERMINAL
+        `[ZONE-PLAN-BUG]` channel, which allocates nothing: it aborts under
+        `GGML_SYCL_STRICT_LEASES=1` (rulings §G1), and otherwise the draw gets no memory and the
+        SDPA call fails with the named error. Both misses it can see, a within-ubatch peak above
+        the plan and a draw beyond the admitted term, mean the plan is wrong, and the fix is the
+        plan, never a fallback allocation (P4). The DIRECT reuse pool's branch
+        (`onednn_graph_scratch_try_pool_locked`, `:11704`) goes with the call, so from (b1) on
+        `onednn_graph_scratch_alloc_direct_locked` has no caller. **The decline is decided at
+        planning or admission, per layer, never at dispatch (rulings §M70 (b)):** (b1)'s
+        `interim_capped` (stored + G over the ONEDNN cap: 0 B reserved for G and SDPA declined
+        on that device) and `interim_capacity` (a call's per-shape term above the zone's Graph
+        room), checked once at the SDPA entry through 23mk's pure function
+        `ggml_sycl_onednn_graph_interim_decline`, and from (b2) the fit's `scratch_unplaced`.
+        Dispatch reads the admitted decision; it never discovers a miss and declines on the
+        spot, which would give the admission fact a second source. **"Arena not active" never
+        reaches `:11708` (rulings §M70 (c)):** on a VM device the Graph scratch draws through
+        1oxa's `REGION` path, and with no zones at all oneDNN SDPA is not admitted; if either
+        route reaches `:11708` at the pin, its owner closes it (1oxa for VM, 23mk for no-zone).
+        **Every decline is a named WARN with a counter (rulings §M70 (d); r26 I-2),** in 23mk's
+        formats, which this design mirrors and does not own (23mk `8547a22f0` §4.8; unchanged at
+        `50b1f8f50`), none env-gated, so §M66's arming rule does not apply to them:
+        - `interim_capped`, once per device:
+          `[SYCL-PLAN] oneDNN Graph-scratch interim G %zu B exceeds the ONEDNN cap %zu B on
+          device %d; reserving 0 B, oneDNN SDPA declines on this device until the REGION
+          conversion` (one line in the source);
+        - `interim_capped` and `interim_capacity`, once per (backend context, device):
+          `[SYCL-PLAN] oneDNN SDPA declined: ctx=%u dev=%d term=%zu capacity=%zu reason=%s`;
+        - `scratch_unplaced`, once per (context, device), its `layers` field the per-layer
+          count: `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d layers=%u needed=%zu
+          room=%zu reason=scratch_unplaced`;
+        - each reason also counts `onednn_graph_route_declined{reason}` (PRIVATE_TESTING),
+          `scratch_unplaced` once per unadmitted layer.
+        The admitted count needs one line more, since the decline line prints only when a layer
+        is left out: this design asks 23mk, which owns the Graph charge in the fit, for one WARN
+        per (context, device) with at least one SDPA-routed device-KV candidate, printed whether
+        or not any layer declined (§6.35 relay (1)):
+        `[CONTEXT-PLAN] graph scratch admitted: ctx=%u dev=%d admitted=%u of %u layers cost=%zu
+        room=%zu`. `admitted` plus the decline line's `layers` equals the `of` field, which the
+        replay also gives. The deletion of the direct path has one owner: 23mk `8547a22f0` (b2)
+        item 8 deletes it with its reuse pool and test hooks (rulings §M68 (b);
+        E-ONEDNN-GRAPH-DIRECT), and 23mk's H3 "(b1)'s interim G" arm pins that it has no caller
+        from (b1) on. **The runtime miss's arm (r26 I-3), 23mk's to carry and moua's to cite:**
+        a fixture draw one byte above the planned within-ubatch peak prints `[ZONE-PLAN-BUG]`
+        once, allocates nothing (the direct path's pointer-keyed map stays empty, and no
+        `[EXT-ALLOC]` line prints with `GGML_SYCL_EXT_ALLOC_TRACE=1` set and the arm's closing
+        seam draw as its live check, rulings §M66), and exits 134 under
+        `GGML_SYCL_STRICT_LEASES=1`. Its RED is the pre-(b1) tree, where the same draw lands
+        through the direct path and returns memory. Relayed to 23mk (§6.35). **Admission never
+        admits a layer whose term exceeds the override (rulings §M64 (c)):** it declines that
+        layer's SDPA, since the plan never knowingly schedules a miss (P4). **(b1) converts
+        nothing (23mk §6.8's scoping note, mirrored; rulings §M44b):** the commit that converts
+        the Graph scratch is (b2), and H7ap's C-rule arm targets the tree after (b2);
       - **(b2), after moua L6:** the `REGION` conversion, an ordinary conversion under §2.4.3's
         transition rule: the charge at the context transaction, moua's fit charging it after the
         KV extents (never as a head slot; rulings §M54, §M64 (b)), the step-5 record under
@@ -3807,7 +3901,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         - the draw itself, moved out of the ONEDNN zone into the context's `REGION` range
           (`onednn_graph_scratch_alloc`, `unified-cache.cpp:11655`, draws from the ONEDNN zone
           at master), with the direct overflow (`onednn_graph_scratch_alloc_direct_locked`,
-          `:11721`) deleted, unless 23mk names another commit or ticket for it (§M64 (a));
+          `:11721`), uncalled since (b1), deleted by 23mk `8547a22f0` (b2) item 8 (rulings §M68
+          (b));
         - the load getter switch, `:4464` and `:27658` from the with-floor getter to the W
           getter, `unified_cache_get_planned_onednn_pp_w_bytes` (today `:2141`'s `_stored`
           getter), and the with-floor getter itself deleted (`:2148-2160`; no dead alias), and
@@ -3844,8 +3939,10 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       nothing exactly when the published W bytes are at most the ledger's ONEDNN terms, which is
       what it tests. The clamp cannot bind on the merge-gate shapes, so ONEDNN is 23592960 B on
       GPT-OSS 120B and 234881024 B on Qwen there. Where it binds, the Graph draw that no longer
-      fits is not sent to the direct overflow: (b1) declines oneDNN SDPA on that device,
-      counted, with one WARN per (context, device) (rulings §M64 (a)). The constant goes in
+      fits is not sent to the direct overflow: (b1) declines oneDNN SDPA on that device as
+      `interim_capped`, with 23mk's once-per-device line and one `oneDNN SDPA declined` WARN
+      per (context, device), and a runtime miss is the TERMINAL `[ZONE-PLAN-BUG]` channel
+      (rulings §M64 (a), §M70; "The Graph-scratch commit", above). The constant goes in
       L4+L6 (rulings §M37 Q3),
       since the zone's remaining consumers, W and the Graph scratch, are then each sized by its
       own function. Between (b1) and L4 the load stage is master's with (b1)'s G, 268435456 B on
@@ -5739,7 +5836,13 @@ producer once: zhcn's measure pass with beni's and jzvq's visitors, jzvq's deman
 `moe_control`'s value functions, the recurrent state's size function, the oneDNN scratchpad's
 load-time table and, where the route is reachable, the MMID workspace. A context
 transaction's step 2 reconciles its output at the context's own shape, and the load's
-`FIRST_CONTEXT` reservation sums it at the envelope's shape (§2.4.2 (b) step 3). No other code
+`FIRST_CONTEXT` reservation sums its head-slot records at the envelope's shape (§2.4.2 (b) step
+3). **Each record carries its placement kind, `HEAD_SLOT` or `AFTER_KV` (rulings §M54, §M64
+(b)):** the Graph scratch's record is `AFTER_KV`, which the fit charges after the KV extents and
+the reservation's sum skips by kind, so the load reserves none of it (rulings §M67 (b)); every
+other record is `HEAD_SLOT`. The skip reads the kind, never a name, so the source gate below
+still holds. RED: the kind dropped, so the reservation sums the Graph scratch (H7ap's
+first-context arm, the member RED). No other code
 enumerates the C terms: H7ap's first-context arm has a source gate that fails on a cohort or
 term named at the reservation site.
 
@@ -5759,7 +5862,6 @@ not a list any code reads: the reservation sums the function's output.
 |---|---|---|---|---:|---:|
 | the ring's activation and output rows | C term | moua | `ring` | 1132462080 | 1610612736 |
 | the compute slot | other head slot | zhcn | the compute chunks | 423624704 | 516947968 |
-
 | the recurrent state | other head slot | moua | `context-recurrent-state` | 0 | 65863680 |
 | the oneDNN PP activation half | C term | 23mk | `onednn_pp_a` | 4194304 | 4194304 |
 | the MoE control list and flag | C term | moua | `moe_control` | 16640 | 33024 |
@@ -6084,9 +6186,12 @@ class:
   The load-stage dry run (step 5's second witness) evaluates it as 0, no zone is sized for it,
   and its check runs in the context transaction, which is its owner's. The load's only charge
   for a C term is the model's first context's reservation (§2.4.2 (b) step 3; rulings §M32 C-1
-  (a)), which is not a zone term. **Its room is
-  that context's `REGION` headroom, like KV (rulings §M21.3, §M25 I-6):** the context
+  (a)), which is not a zone term, and which holds no Graph scratch (rulings §M67 (b)). **Its
+  room is that context's `REGION` headroom, like KV (rulings §M21.3, §M25 I-6):** the context
   transaction places it as a head slot of the context's fit, inside the ranges step 5 records.
+  **The one exception is 23mk's `onednn_graph_scratch` (rulings §M54, §M64 (b)):** the same fit
+  charges it after the KV extents, never as a head slot, and a layer it does not fit declines
+  oneDNN SDPA with `scratch_unplaced`.
   No C term waits for a zone to grow after load, since no zone may grow then (a rebuild that
   meets live bytes refuses, §2.4.2 (b)).
 
@@ -7011,7 +7116,17 @@ L7 documents this limit, and pattern #2 remains the remedy.
       record into the graph's meta, and every submit goes through
       `ggml_sycl_graph_submit(queue, exec, meta)`. A site whose recordings can never reach the
       oneDNN PP branch carries an empty meta and pays one empty check. So all seventeen sites
-      are wrapped and none is left to a gate of its own. The replay RED edits `:107235`
+      are wrapped and none is left to a gate of its own. **`unified-kernel.cpp` has seventeen
+      more (r26 m-8),** the same at `c69d5774d` and `e2461d4fb`: six finalizes (`:9365`,
+      `:9407`, `:9448`, `:9520` and `:9579` in `UnifiedKernel::benchmark_graph_overhead`, and
+      `:10876` in `record_micro_graph`) and eleven submits (`:9368`, `:9374`, `:9409`, `:9414`,
+      `:9450`, `:9455`, `:9522`, `:9527`, `:9581` and `:9586` in the benchmark, and `:10928` in
+      `launch_micro_graph_kernel`, the production MICRO-GRAPH). The micro-graph records the
+      unified kernel's fused ops, and the benchmark records `single_task` nodes on a scratch
+      buffer; neither reaches the oneDNN PP branch, so both would carry an empty meta. They are
+      wrapped all the same, so the rule has no file-scoped exception: the census is by grep over
+      the backend's sources, `ggml-sycl.cpp` and `unified-kernel.cpp` together, thirty-four
+      sites. The replay RED edits `:107235`
       (`:107236` at master `d19308be3`) back to a raw `ext_oneapi_graph` call.
 
     **H7z's source gate (rulings §M59(c); r24 n-6; r25 I-3).** Its scope is
@@ -7021,7 +7136,16 @@ L7 documents this limit, and pattern #2 remains the remedy.
     `stream_dnnl`, `engine_dnnl` or `get_scratchpad_mem`, the retention hand-off, and, under
     Form E, any lock other than `exec_mutex`. Inside a `GGML_SYCL_PRIVATE_TESTING` block only,
     it allows the W-order hook's call; a hook call outside one fails it. It also fails on a raw
-    `ext_oneapi_graph(` or a command graph's `.finalize(` outside the two wrappers. Its mutation
+    `ext_oneapi_graph(` or a command graph's `.finalize(` outside the two wrappers. **The scope
+    of that raw-call rule (r26 m-8)** is every source file under `ggml/src/ggml-sycl/`, not only
+    the files the W-order section reaches: it greps the directory, so `unified-kernel.cpp`'s
+    seventeen sites are in it, and a new file that records a graph is in it without an edit.
+    The two wrappers' own definitions are the only allowed raw calls. The directory's one
+    other `.finalize(` at `e2461d4fb`, `sdpa_graph.finalize()` in `fattn-onednn.cpp:868`, is
+    the oneDNN Graph API's `dnnl::graph::graph`, not a SYCL command graph, and the gate
+    allowlists it by file, line text and that reason, so a SYCL graph added beside it still
+    fails. So the `unified-kernel.cpp` count above, with `ggml-sycl.cpp`'s, is the whole
+    SYCL command-graph census. Its mutation
     witnesses, each of which must fail it: `ctx.stream_dnnl(q)` inside the production step
     callable; a `q->wait()` in a callee of that callable; the retention copy's
     `retain_handles_until_event` moved inside the use; and the replay RED's raw submit.
@@ -8054,8 +8178,9 @@ means that.
       merge-gate shapes. **Scored by the pure-fit run**, not by a load: H2's `kv_region_fit` on
       the geometry the load recorded (its `WEIGHT` ranges and its `FIRST_CONTEXT` reservation,
       from the host replay of the pack), for the model's first context at the gates' shape, `-c
-      4096 -ub 512` (`merge-gates/run-merge-gates.sh:85` for GPT-OSS 120B, `:94` for Qwen, as
-      the script reads at 7.14l; 7.14k cited `:72` and `:81`, before r19 m-9 and m-10 added the
+      4096 -ub 512` (`merge-gates/run-merge-gates.sh:115` for GPT-OSS 120B, `:125` for Qwen, as
+      the script reads at 7.14s; 7.14l cited `:85` and `:94`, before 7.14r's split capture and
+      7.14s's header reads; 7.14k cited `:72` and `:81`, before r19 m-9 and m-10 added the
       probe and self-test lines; 7.14j cited `:65` and `:72`, before r18 m-5's settle function
       moved them). Its precondition is fkpg (a): the envelope carries 4096, and a run whose load
       plan prints `n_ctx=512` is VOID, which fails (rulings §M38 I-5). **Pre-registered per
@@ -8080,10 +8205,19 @@ means that.
       second enumeration (rulings §M38 C-1):** the load reserving from 7.14g's hand list while
       the fixture's producers include the recurrent state; the per-term comparison finds that
       term's bytes missing from the reservation, and the source gate fails too, since the
-      reservation site names no cohort or term. **The 512 fallback:** a reservation evaluated at
-      `n_ctx` 512, caught by the load plan's `n_ctx=512` against the precondition's 4096 on
-      both trees, and at L4+L6 also by G left at 67108864 B, which the exact ONEDNN bytes catch.
-      From (b2) the Graph scratch no longer catches it, since it is not a member. **The Graph
+      reservation site names no cohort or term. **The 512 fallback is two mutants, and only one
+      is a RED (r26 m-15):** (a) **envelope-level**, fkpg (a) absent: the envelope carries 512,
+      the load plan prints `n_ctx=512`, and the arm is VOID by its precondition, which fails.
+      That is the precondition doing the work, not a RED. (b) **reservation-internal**: the
+      envelope carries 4096 and the plan prints it, but the reservation is evaluated at 512, so
+      the `n_ctx=` field cannot catch it. At L4+L6, before (b2), G left at 67108864 B catches
+      (b) through the exact ONEDNN bytes. From (b2) G is not a member, and every member left is
+      independent of `n_ctx` (the ring at `-ub 512`, the recurrent state, `onednn_pp_a` at 512 ×
+      `max_K`, `moe_control`, MMID) apart from the compute slot, which is a fixture constant
+      until zhcn's measure lands. So (b) has no byte consequence from (b2) until then, and no
+      RED is lost. Once the measure lands, the compute slot is (b)'s catcher: the arm then
+      pre-registers the compute slot's bytes at 512 against those at 4096, and states before
+      that that (b) is not scorable. **The Graph
       scratch admitted as a member (rulings §M41 I-1 (a), §M54):** Qwen's Graph-scratch record
       in the set; the reservation reads 2398978304 B against the expected 2197651712 B, and the
       per-term comparison fails naming `onednn_graph_scratch`. At L4+L6 it is also a double
@@ -8648,9 +8782,13 @@ means that.
     neither. GREEN: B's load is refused at its early stage with the named line, naming
     `moe_onednn`, zone RUNTIME, device 0, need 141008896 B, zone free 0 B and shared zone free
     67108864 B. B's `{LOAD, txn}` ranges are rolled back, A's entries and ranges are unchanged,
-    and the process has zero `[EXT-ALLOC]` lines with `GGML_SYCL_EXT_ALLOC_TRACE=1`. REDs: a
-    pack that admits B's load without the term, whose first PP MoE claim then finds no slot; and
-    a fall-through draw, which is caught by its `[EXT-ALLOC]` line. **(4) ONEDNN, a later load's
+    and the host model's out-of-range draw count is 0. **H9 is SYCL-free, so no
+    `[EXT-ALLOC]` emitter exists in its process (r26 I-1 (d); rulings §M66):** 7.14r scored
+    "zero `[EXT-ALLOC]` lines" here, which a SYCL-free binary prints whatever happens, so that
+    zero was vacuous. The model counts every draw that lands outside a placed range, and that
+    counter is the check. REDs: a pack that admits B's load without the term, whose first PP
+    MoE claim then finds no slot; and a fall-through draw, which the model's counter records as
+    1. **(4) ONEDNN, a later load's
     W above the laid-out zone (rulings §M41 I-4 (a)):** a fixture arena after the ONEDNN floor's
     removal. A = GPT-OSS 120B lays ONEDNN out at its W, 23592960 B; B = Mistral 7B Q4_0, whose W
     is 117440512 B. `onednn_pp_w` is the oneDNN pair's weights half, one object per device, so
@@ -8669,8 +8807,9 @@ means that.
     tag remains live. The loads refuse nothing. With the fixture's shared-zone free room set
     below 117440512 B, B is refused by name, naming `onednn_pp_w`, zone ONEDNN, need 117440512
     B, zone free 0 B and the fixture's shared free bytes; B's ranges are rolled back, the entry
-    is unchanged (backed by ONEDNN, A's owning charge), and the process prints zero
-    `[EXT-ALLOC]` lines. **The arms that need the backend are G2's (r23 I-4).** The A-first
+    is unchanged (backed by ONEDNN, A's owning charge), and the model's out-of-range
+    draw count is 0, (3)'s counter, not an `[EXT-ALLOC]` count, since H9 is SYCL-free (r26 I-1
+    (d)). **The arms that need the backend are G2's (r23 I-4).** The A-first
     order, C over B, the pool-term variant, record mode and the W-order arm drive the device
     entries on a real device, so they are in G2 `test-sycl-device-entry-lifetime` (§3.2), which
     lands with L4+L6. H9 keeps (4)'s ledger steps, above, and the REDs of the base order, below.
@@ -8880,12 +9019,18 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
   must return, or G0 is VOID.
 - **Form M's premise, and its cap.** Form M's waiter on one queue must see a publisher on
   another queue run. G0 first calibrates: a waiter alone on Q2, with a fixed poll count and
-  nothing to wait for, is timed, which gives the card's poll rate; Form M's cap is one second of
-  polls at that rate, and G0 prints it. Then two cells, each with that cap: **F1**, a waiter on
+  nothing to wait for, is timed, which gives the card's poll rate; Form M's per-kernel cap C is
+  half the engine's `job_timeout_ms` in polls at that rate, and G0 prints it (r26 m-10; §2.4.2's
+  derivation). Then three cells, each with that cap: **F1**, a waiter on
   Q2 and, after it, a publisher on Q1 with nothing ahead of it; **F2**, the same with the
   publisher behind a pending H1 that the watcher opens after 0.5 s, the production delay of a
-  previous use behind a `host_task`. "Progresses": the waiter ends without writing the fault
-  word. "Capped": it writes the fault word. G0 also prints the engine class's xe
+  previous use behind a `host_task`; and **F3**, the tail T that sets the chain length K: on
+  each gate shape, a W use's predecessor behind the longest graph replay the shape records and
+  one ubatch's `host_task` backlog, timed from the waiter's start to the publisher's store with
+  the device timestamps of the two kernels. "Progresses": the waiter ends without writing the
+  fault word. "Capped": it writes the fault word. F1 and F2 must progress within one C, and F3
+  gives T, from which K = ⌈2 T / C⌉; a cell that caps with K waiters on a correct run voids the
+  derivation. G0 also prints the engine class's xe
   `job_timeout_ms` for each card, and the cap must sit below it.
 - **Attribution (r25 m-5 (d)).** Each cell prints `[G0] cell=<H>/<M> start` before it runs and
   `[G0] cell=<H>/<M> submit_ms=%.1f verdict=returns|blocks` after (the controls and F1/F2 print
@@ -9254,22 +9399,32 @@ placement and demotion run. The rules for every such arm:
   it could pass on the wrong line. The regex is not anchored at `^`, since lines under `-v` and
   `-lv` carry a timestamp prefix. **Negative control, per arm:** the same regex scores 0 on the
   arm's `n_ctx_seq` line (`llama_context: n_ctx_seq = <N>`) and, on `llama-cli`, on its slot
-  line, each checked by running the regex over that line alone. Every arm below that says "the
-  check (<N>)" means this regex at that N. The line prints
+  line, each checked by running the regex over that line alone, after checking that the line is
+  present, since a zero from an absent line is vacuous (r26 m-3 (c)). Every arm below that says
+  "the check (<N>)" means this regex at that N. The line prints
   at INFO, which the default verbosity drops, so every such arm runs with `-lv 4`, or with `-v`,
   which raises the threshold further (`common/arg.cpp:3935-3940` at `d19308be3`) (rulings §M54's
-  VOID guard, as zhcn's GDC does). The fork has no fitter under SYCL today (`fit_params=false`),
+  VOID guard, as zhcn's GDC does). **Every arm names its ubatch (rulings §M60 (b); r26
+  m-11):** each command pins `-ub 512`. An absent `-ub` does not fix the ubatch: when the caller
+  does not pin it, the SYCL auto-ubatch trial replaces `sched_reserve` (`src/llama-context.cpp:
+  1011-1040` at `e2461d4fb`, gated on `n_ubatch_auto`), and on a dense model such as Mistral it
+  can climb the ladder. Pinning names the vehicle and switches the trial off. **The one arm that
+  does not pin it is C3's default arm,** whose single pre-registration source, zhcn GDC3 (zhcn
+  `5e0ffae`), runs `llama-cli` with no `-ub` and records `n_ubatch` 512, since the ladder does
+  not climb on a MoE model (zhcn GU1n); the arm runs GDC3's command, so it names 512 from GDC3
+  rather than changing GDC3's vehicle. The fork has no
+  fitter under SYCL today (`fit_params=false`),
   and `common_params.n_ctx` defaults to 0 (`common/common.h:451` at `e2461d4fb`), so every one
   of these arms should pass the check. The check is what makes that a measurement.
 - **Where the rule applies, arm by arm (r24 m-11; r25 m-2, m-4, m-11):**
   - C1 pins `-c 32768`, Mistral's `n_ctx_train`, so the pin is the default context. It adds
     `-lv 4` and the check, and needs no sibling;
   - C2 and C2a, the Mistral gate, pass no `-c`, so each is a default-context CLI arm. Each
-    carries `-lv 4` and the check (32768);
+    carries `-ub 512`, `-lv 4` and the check (32768);
   - C9's Mistral positive control (1) runs the Mistral gate command twice, with and without
     `GGML_SYCL_RUNTIME_ARENA_MB=0`, and passes no `-c`, so both runs are default-context CLI
-    arms (rulings §M61 (c)). Each carries `-lv 4` and the check (32768). Its score is still the
-    `[EXT-ALLOC]` count difference; a run that fails the check voids the control;
+    arms (rulings §M61 (c)). Each carries `-ub 512`, `-lv 4` and the check (32768). Its score is
+    still the `[EXT-ALLOC]` count difference; a run that fails the check voids the control;
   - C3's default arm (below) carries `-lv 4` and the check (131072);
   - C5's `test-thread-safety` is registered with `-c 256` (`tests/CMakeLists.txt:790` at
     `e2461d4fb`) on stories15M (`:662`), and gains a sibling that drops `-c` and carries the
@@ -9283,9 +9438,9 @@ placement and demotion run. The rules for every such arm:
   - C9's merge-gate default arms already print the line, since the script passes `--verbose`,
     and they add the check: 131072 for GPT-OSS 120B, and for Qwen the value its header gives;
   - C9's control-vector and LoRA arms run the Mistral gate command, which passes no `-c`, so
-    they are default-context CLI arms. Each carries `-lv 4` and the check (32768). The LoRA
-    arm's pre-registration, its KQ figure and its "compute peak does not move" argument are all
-    computed at 32768, which is Mistral 7B v0.1's real `n_ctx_train` (its GGUF
+    they are default-context CLI arms. Each carries `-ub 512`, `-lv 4` and the check (32768).
+    The LoRA arm's pre-registration, its KQ figure and its "compute peak does not move" argument
+    are all computed at 32768, which is Mistral 7B v0.1's real `n_ctx_train` (its GGUF
     `llama.context_length`), so the arithmetic is at the vehicle's default, not at a pin, and
     the check confirms it on the run (rulings §M61 (c)). Neither arm pins `-c`, so neither
     is a pinned arm in §M61 (c)'s sense;
@@ -9298,7 +9453,16 @@ placement and demotion run. The rules for every such arm:
     (`tests/test-save-load-state.cpp:395-398`, `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` at `:426` and
     `:437`) takes `n_ctx` from the common params, whose default is 0, so it is the on-device
     default-context case, and it carries the check. `test_seq_cp_scatter` with `on_device` true
-    pins 256 (`:462`, `:469`) and is exempt (below). 7.14q's claim that only
+    pins 256 (`:462`, `:469`), and 256 is the generated models' `n_ctx_train`: every model
+    `test-llama-archs` writes carries `context_length` 256 (`tests/test-llama-archs.cpp:247`,
+    written at `:309`). So its pin is the default context, as C1's is, and it is not exempt
+    (r26 m-7): it carries the check at N = 256, read from the model's header before the run
+    like every other N. In single-model mode `n_parallel` is 1, so the binary sets `kv_unified`
+    (`tests/test-save-load-state.cpp:907-909`), and the scatter case sets it itself (`:464`),
+    so its `n_ctx_seq` line also prints 256 and is the negative control as everywhere else. Its
+    interleaved layout (seq 0 in cells 0, 1 and 4, seq 1 in cells 2, 3 and 5) is unchanged by
+    the check, which only confirms that the 256 cells are the model's whole context. 7.14q's
+    claim that only
     `test_seq_rm_isolated` pins 256 held at `c69d5774d` and is false at the tip;
   - C10's default-context counts are pre-registered inside C9's default arm, and C11's
     default-context rows are below.
@@ -9311,16 +9475,11 @@ placement and demotion run. The rules for every such arm:
     the geometry of its contexts' KV against the leased copies' room. A default context would
     pick the case, not test placement at `n_ctx_train`;
   - G2 uses fixture term sets, with no GGUF and no context KV;
-  
   - C9's seam control (2), the unplanned-buffer arm with its clip and `ggml_opt_init` children,
     and the scoped-miss arm are unit arms whose subject is a fixed geometry chosen for the arm's
     arithmetic (one byte over RUNTIME's free room, a 1 MiB buffer on an arena whose RUNTIME is
     0, one byte over the compute head slot). A default-context sibling would change the
     arithmetic, not test KV placement;
-  - C9's state-seq scatter case, `test_seq_cp_scatter` with `on_device` true, is fixed-geometry
-    scatter arithmetic: an interleaved layout (seq 0 in cells 0, 1 and 4, seq 1 in cells 2, 3
-    and 5) in a 256-cell unified KV. Its allocation site, `llama_io_write_device`, is the one
-    `test_seq_cp_device` reaches at the default context;
   - C9's no-model arm loads no model, so there is no `n_ctx`;
   - the H tests are host models, with no device and no context.
 - **A refusal is a FAIL.** uize part 3 (`35ce2e65f`) has landed, so KV that does not fit is
@@ -9335,16 +9494,47 @@ placement and demotion run. The rules for every such arm:
   device-resident attention layers only, each from its `n_kv`, in ascending order of
   per-shape term. It is never a head slot, so no demoted layer's cause is the Graph scratch,
   and `head_slot` causes come from the head-slot set alone (§2.4.3's member table). The replay
-  pre-registers the number of layers admitted to oneDNN SDPA and the count of
-  `scratch_unplaced` WARNs, and the run must print the same. Through `df9803cb8` the replay
+  pre-registers, per (context, device), the number of SDPA-routed device-KV candidate layers
+  M, the number admitted to oneDNN SDPA A and the number declined `scratch_unplaced` M − A.
+  **They are scored from two fixed lines (rulings §M70 (d); r26 I-2),** both WARN, neither
+  env-gated, so §M66's arming rule does not apply: 23mk's decline line, `[CONTEXT-PLAN] graph
+  scratch declined: ctx=%u dev=%d layers=%u needed=%zu room=%zu reason=scratch_unplaced`, once
+  per (context, device) when M − A > 0, its `layers` field M − A; and the admitted line this
+  design asks 23mk for (§6.35 relay), `[CONTEXT-PLAN] graph scratch admitted: ctx=%u dev=%d
+  admitted=%u of %u layers cost=%zu room=%zu`, once per (context, device) whenever M > 0,
+  whether or not a layer declined. The admitted line is its own presence check: with M > 0
+  pre-registered, a run with no admitted line for that device is VOID. A zero from the
+  decline line needs a positive control, since an emitter that never prints also scores
+  none: the Qwen pinned arm on the B50 (the xqex baseline, C9), where the replay pre-registers
+  M − A > 0 (rulings §M67 (a)), must print it, or every zero it scores elsewhere in that
+  session is VOID (if no Qwen arm's replay gives M − A > 0, the control is instead a fit
+  fixture whose room is below the smallest candidate term, which must print it with `layers`
+  = M); 23mk's H3 "(b1)'s interim G" arm is the control for the two (b1) lines. The greps, on
+  the arm's stderr, for device 0:
+  ```
+  cat <arm>.err | grep -oE 'graph scratch admitted: ctx=[0-9]+ dev=0 admitted=[0-9]+ of [0-9]+ layers'  # A of M
+  cat <arm>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 layers=[0-9]+'                      # M − A, or no line when A = M
+  ```
+  A model whose attention has sinks, GPT-OSS, routes no layer to SDPA, so M = 0 and neither
+  line prints; its arms pre-register M = 0 and score both greps empty. Both lines come with
+  23mk's (b2), the commit that charges the Graph scratch in the fit, and this replay rule
+  applies from (b2) (§2.4.3's transition rule). If 23mk declines the admitted line, A is scored
+  as M minus the decline line's `layers`, with M from the replay, and the run carries no
+  independent witness that the fit saw M candidates; that gap is recorded on the ticket, never
+  scored as a pass. Through `df9803cb8` the replay
   placed it as a head slot that could demote KV; 23mk's Qwen row cites the fixed replay (§6.34).
   Master prints it at WARN when a layer's residency changed (`ggml-sycl.cpp:18381-18386` at
   `e2461d4fb`, below `:40214`, so the same line at `d19308be3`), in the form
   `[SYCL-PLAN] KV overflow re-placed to host tier:`, then
   `%zu layer(s) demoted, %zu SWA (%.1f MB host KV,`, then
   `layers %d..%d) on device %d for n_ctx=%u; %s`. The replay gives the layer count, the SWA
-  count, the host MB, the layer range and the device (r25 n-2). The run must print exactly those
-  numbers; a difference in either direction fails the arm, as plan != reality.
+  count, the host MB, the layer range and the device (r25 n-2). **One verdict rule per arm
+  (rulings §M63 (a); r26 m-6):** for an arm whose pre-registration is this replay, the run must
+  print exactly those numbers, and a difference in either direction fails the arm, as plan !=
+  reality. An arm with a rule of its own is scored by that rule alone, and this sentence does
+  not apply to it: C3's default arm is scored against GDC3's zhcn+moua fixpoint point, the
+  replay of that run's own input lines, and C7's GA and GH default arms by zhcn's GA-dc and GDC6
+  rows. So no arm has two rules.
 - **Scored besides:** the gate's tokens as its pinned arm scores them, zero aborts by the
   scratch runner's `ABRT` probe, and zero `KV-PLAN-BUG` and `CONTEXT-PLAN-BUG` lines. A wrong
   token here fails the arm even when the pinned arm passes: the default context puts KV on the
@@ -9356,18 +9546,29 @@ placement and demotion run. The rules for every such arm:
   `cohort=kv-tier-layer` count would be vacuous after L6, because that cohort is no longer
   emitted.
   ```
-  GGML_SYCL_EXT_ALLOC_TRACE=1 GGML_SYCL_VRAM_BUDGET_PCT=60 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-    ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -c 32768 \
+    GGML_SYCL_EXT_ALLOC_TRACE=1 GGML_SYCL_KV_REGION_TRACE=1 GGML_SYCL_VRAM_BUDGET_PCT=60 \
+    ONEAPI_DEVICE_SELECTOR=level_zero:1 \
+    ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -c 32768 -ub 512 -lv 4 \
     -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 < /dev/null > c1.out 2> c1.err
+  cat c1.err | grep -cE 'llama_context: n_ctx +=  *32768$'  # 1, else VOID (§3.3)
+  cat c1.err | grep -c 'llama_context: n_ctx_seq'         # >= 1, the control's line
+  cat c1.err | grep 'n_ctx_seq' | grep -cE 'llama_context: n_ctx +=  *32768$'  # 0
   cat c1.err | grep 'EXT-ALLOC' | grep -c 'role=2 '       # KV role: must be 0
   cat c1.err | grep 'EXT-ALLOC' | tail -1                 # total_external: compare with base
   cat c1.err | grep -c 'KV-PLAN-BUG'                      # must be 0
   cat c1.err | grep 'KV overflow re-placed'               # predicted: see below
-  cat c1.err | grep 'KV-REGION'                           # the head-slot sum H per TLSF
+    cat c1.err | grep -c '\[KV-REGION\] reserve'           # 1, else VOID: the trace is live
+  cat c1.err | grep '\[KV-REGION\] reserve'              # the head-slot sum H per TLSF
   ```
   - **Positive control.** The same command on the base (post-jehw/u1bb master) prints
     `role=2` EXT-ALLOC lines, or demotes all 32 layers under jehw. The fe6c run printed 23
-    such lines. That shows the trace is armed.
+    such lines. That shows the trace is armed. **Both traces are armed in the command and
+    each has its live check (rulings §M66; r26 I-1 (a)):** `GGML_SYCL_EXT_ALLOC_TRACE=1` by this
+    control, and `GGML_SYCL_KV_REGION_TRACE=1` by its own scored line, which must count exactly
+    1; a run with no `[KV-REGION]` line is VOID, which fails, since H is then unread. The
+    trace's format, L6's (§4), one WARN per region reservation per (context, device), read once
+    through an accessor and off by default: `[KV-REGION] reserve ctx=%u dev=%d H=%zu
+    region=%zu device_layers=%u host_layers=%u`.
   - **Non-KV EXT-ALLOC bytes** (total minus the KV role) must not exceed the base run's.
     That is the check for r1 C3(ii).
   - **Predicted, from a pinned head-slot sum (r3 m8; r4 m5):** `device = 23 − ⌈max(0, H_A2 −
@@ -9378,7 +9579,8 @@ placement and demotion run. The rules for every such arm:
     first). C1 passes only if the run's `GGML_SYCL_KV_REGION_TRACE=1` line prints `H == H_A2`
     **and** the device count matches the formula at `H_A2`. Revision 5 scored against the `H`
     the run printed, so an inflated `H` still passed.
-- **C2 Mistral gate:** B50 and B70, the CLAUDE.md command with `-lv 4` added, VOID unless
+- **C2 Mistral gate:** B50 and B70, `llama-completion`, the CLAUDE.md command with `-ub 512
+  -lv 4` added, VOID unless
   `llama_context: n_ctx +=  *32768$` scores 1 (§3.3's VOID guard; r25 m-2; rulings §M62 (C)).
 - **C2a B50 MMVQ/STAGING first submit (r2 N-I8), a named acceptance item.** The C2 B50 run,
   on `level_zero:1` at the **default** PCT (no `GGML_SYCL_VRAM_BUDGET_PCT`), is where the
@@ -9393,7 +9595,19 @@ placement and demotion run. The rules for every such arm:
   is also run once with u1bb's `-ub 1024` acceptance form, to cover the ring and the ladder.
   - With `GGML_SYCL_KV_REGION_TRACE=1`, a WARN line per reservation that is off by default,
     the ladder run must show exactly **one** reservation for the device, however many ladder
-    candidates republish (r2 N-I9).
+    candidates republish (r2 N-I9). The variable is set in the run's own command (rulings §M66
+    (1); r26 I-1 (b)), and the count of 1 is its own live check, since a dead trace counts 0:
+    ```
+    GGML_SYCL_KV_REGION_TRACE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 60 \
+      ./build/bin/llama-cli -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -c 4096 -ub 1024 \
+      -st --simple-io --no-display-prompt \
+      --chat-template-kwargs '{"reasoning_effort":"medium"}' \
+      --reasoning-format none --reasoning-budget 0 \
+      -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
+      -n 48 --seed 42 --temp 0 > c3l.out 2> c3l.err; echo "rc=$?"   # rc=0
+    cat c3l.err | grep -c '\[KV-REGION\] reserve'   # 1; 0 is VOID (a dead trace)
+    cat c3l.out | grep -cx '1, 2, 3, 4, 5'           # 1
+    ```
     - C3 is also the default-PCT half of C2a for STAGING.
   - **The default-context arm (r23 I-5).** The same command with no `-c`, so `n_ctx` is
     131072, GPT-OSS 20B's `n_ctx_train`. **Its pre-registration is zhcn GDC3's row, the single
@@ -9407,7 +9621,8 @@ placement and demotion run. The rules for every such arm:
     rows from `n_ubatch`), each checked against its own derivation, with the printed
     free-for-KV figure the thing checked, not the reference. It is scored on that point
     including whether this arm demotes layers and how many (r24 m-9). GDC3 is a `llama-cli`
-    point and so is this arm (rulings §M60(b)). **Its timeout is 300 s, not the 60 s hang guard
+    point and so is this arm, at `n_ubatch` 512 with no `-ub`, as GDC3 records (rulings §M60(b);
+    §3.3's ubatch rule). **Its timeout is 300 s, not the 60 s hang guard
     of the `-c 4096` shape,** since a default-context load allocates and clears host-tier KV for
     131072 cells before the first token:
     ```
@@ -9418,9 +9633,10 @@ placement and demotion run. The rules for every such arm:
       --reasoning-format none --reasoning-budget 0 \
       -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
       -n 48 --seed 42 --temp 0 > c3d.out 2> c3d.err; echo "rc=$?"   # rc=0
-        cat c3d.err | grep -cE 'llama_context: n_ctx +=  *131072$'  # 1, else VOID
-        cat c3d.err | grep -cE 'new slot, n_ctx += *131072'           # >= 1, the control's line
+    cat c3d.err | grep -cE 'llama_context: n_ctx +=  *131072$'  # 1, else VOID
+    cat c3d.err | grep -cE 'new slot, n_ctx += *131072'           # >= 1, the control's line
     cat c3d.err | grep 'new slot' | grep -cE 'llama_context: n_ctx +=  *131072$'  # 0
+    cat c3d.err | grep -c 'llama_context: n_ctx_seq'              # 1, the control's line
     cat c3d.err | grep 'n_ctx_seq' | grep -cE 'llama_context: n_ctx +=  *131072$'  # 0
     cat c3d.out | grep -cx '1, 2, 3, 4, 5'              # 1
     cat c3d.err | grep -c 'runtime KV update rejected'  # 0: a refusal is a FAIL
@@ -9431,12 +9647,12 @@ placement and demotion run. The rules for every such arm:
 - **C5 multi-context:** `test-thread-safety` with `ONEAPI_DEVICE_SELECTOR=level_zero:0,1`, ONE
   run, only if it is green on the base first. It is known-crashy (oze0), so compare against the
   base. H8 is the primary coverage, and C5 is corroboration. **Its default-context sibling (r24
-  m-11):** the registration's arguments with `-c 256` dropped and `-lv 4` added, run directly
-  with the fixture model the ctest fixture stages, once, VOID unless
+  m-11):** the registration's arguments with `-c 256` dropped and `-ub 512 -lv 4` added, run
+  directly with the fixture model the ctest fixture stages, once, VOID unless
   `llama_context: n_ctx +=  *<n_ctx_train>$` scores 1 at the model's `n_ctx_train`; the §3.3
   rules apply. **Unless stories15M's `llama.context_length` is 256 (r25 m-4):** the lead reads
   it from the staged model's header first, and if it is 256 the pinned run is already the
-  default-context arm, gains `-lv 4` and the check, and the sibling is not run.
+  default-context arm, gains `-ub 512`, `-lv 4` and the check, and the sibling is not run.
 - **C6 perf sanity:** B50 Mistral pp512/tg128 and GPT-OSS pp512, ABBA ×3 against the base.
   - It adds a **no-replay decode arm** (r2 m8; r4 I2): Mistral tg128 with
     `GGML_SYCL_DISABLE_GRAPH=1`. In that mode every per-op claim runs per dispatch: an atomic
@@ -9450,18 +9666,21 @@ placement and demotion run. The rules for every such arm:
     the weight side to the context side.
   - There is no fattn clause: the sidecar is opt-in only (§2.8, r2 m4).
 - **C7 zhcn's shared gates, scored against this design's plan fields.** zhcn's GA (B50 GPT-OSS
-  20B on llama-cli, `-c 65536 -ub 1024`: the count is zhcn GA's (`e4f424a`, about 1 demoted
-  layer), the highest-indexed full-attention layers first, scored against `free_after_full_kv`
-  and the demotion causes, §2.4.1) and GH (B50 Qwen3.8-Flash-Next
+  20B on llama-cli, `-c 65536 -ub 1024`: the count is zhcn GA's (`e4f424a`), not restated here
+  (r26 m-4), the highest-indexed full-attention layers first, scored against
+  `free_after_full_kv` and the demotion causes, §2.4.1) and GH (B50 Qwen3.8-Flash-Next
   under `GGML_SYCL_STRICT_LEASES=1` (§G1): no unplanned per-context SYCL buffer, the recurrent
   state claimed from its planned slot, §2.4.4). They are listed in zhcn's §5.3 and run once
   each, after L6. **GA's default-context arm is zhcn's (r23 I-5):** GA pins `-c 65536 -ub 1024`,
   and a sibling with no `-c` (`n_ctx` 131072) belongs in zhcn's §5.3 under the rules above. It
   is relayed to zhcn (§6.32); this design scores it against its plan fields as it scores GA.
+  **GH's default-context arm is zhcn GDC6 (r26 n-3):** `llama-completion` on the B50 with no
+  `-c`, so `n_ctx` is 262144, STRICT, scored on GH's criterion (zhcn `5e0ffae`, §5.3 row GDC6);
+  zhcn carries its VOID guard, and this design scores its plan fields as it scores GH.
 - **C8 a1_long, the OPTIONAL yield (rulings §M18.3a).** jehw's gate form, once, on the B50:
   ```
   GGML_SYCL_VRAM_BUDGET_PCT=60 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
-    ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -c 2048 \
+    ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -c 2048 -ub 512 \
     -p '1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,' -n 15 --seed 42 --temp 0 \
     < /dev/null > c8.out 2> c8.err
   cat c8.err | grep -c 'KV admission released 6 optional oneDNN WOQ layout copies (220.5 MB)'  # 1
@@ -9492,9 +9711,10 @@ placement and demotion run. The rules for every such arm:
     a1_long's prompt, so the yield and the demotion run together. The same host dry run of
     `kv_region_fit` over the a1_long fixture's admitted plan, at `n_ctx` 32768, pre-registers
     the release line's copy count and MB (or its absence), the KV device and host layer counts,
-    each demoted layer's cause, and uize part 3's line. It runs with `-lv 4` and is VOID unless
-    `llama_context: n_ctx +=  *32768$` scores 1 (r25 m-2; rulings §M62 (C)). Scored otherwise as
-    the rules above say, with the digits of C8's prompt continued as C8 scores them.
+    each demoted layer's cause, and uize part 3's line. It runs with `-ub 512 -lv 4` and is VOID
+    unless `llama_context: n_ctx +=  *32768$` scores 1 (r25 m-2; rulings §M62 (C)). Scored
+    otherwise as the rules above say, with the digits of C8's prompt continued as C8 scores
+    them.
 - **C9 zero `[EXT-ALLOC]` lines of any role on both merge gates (rulings §M38 C-2; P1).** The
   two merge-gate commands of `merge-gates/run-merge-gates.sh` (`gptoss120b-b1` at `:85` and the
   Qwen gate at `:94` at 7.14l, `-c 4096 -ub 512`, `level_zero:1`), each once, with
@@ -9527,7 +9747,8 @@ placement and demotion run. The rules for every such arm:
   fails and releases `GPU.lock`), now one `settle` function, since the block follows a 120B run
   with about 48 GB of host-resident experts and only sampled memory after it (m-5); (2) its
   abort probe, widened at 7.14l (rulings §M46 m-9), is the script's `ABRT`
-  (`run-merge-gates.sh:20`), three alternatives:
+  (the script's `ABRT=` line, cited by name since the script keeps moving; r26 n-2), three
+  alternatives:
   `ggml/src/[A-Za-z0-9_/.-]+\.(c|cpp|h|hpp):[0-9]+:`, `src/llama[A-Za-z0-9_-]*\.cpp:[0-9]+:` and
   `GGML_ASSERT`. It sees `GGML_ABORT` from any ggml source (`ggml-sycl/`, `ggml-sycl/dpct/`,
   `ggml.c`, `ggml-backend.cpp`) and from `src/llama-*.cpp`, as well as in `.hpp` sources and in
@@ -9576,13 +9797,25 @@ placement and demotion run. The rules for every such arm:
     `glkg-qwen35b-a3b-b1-2026-09-17.log:2024`), so the control laid out the baseline's arena,
     and any line it printed was the baseline's own (r17 m-1). Instead: (1) **the Mistral gate**
     on that master tip with the trace on, whose planned RUNTIME is 0, run with and without
-    `GGML_SYCL_RUNTIME_ARENA_MB=0`, each with `-lv 4` and §3.3's check (32768); the `=0` run
-    must print more `[EXT-ALLOC]` lines than the
+    `GGML_SYCL_RUNTIME_ARENA_MB=0`, each with `-ub 512 -lv 4` and §3.3's check (32768); the `=0`
+    run must print more `[EXT-ALLOC]` lines than the
     run without it, or C9 is VOID. (2) **On the scored tree**, where L4+L6 deletes the variable,
     a `GGML_SYCL_PRIVATE_TESTING` seam injects one RUNTIME draw one byte over RUNTIME's free
     room with `forbid_vram_zone_spill` cleared; it must print its `[EXT-ALLOC]` line, or C9 is
-    VOID. (1) shows that a draw left without room reaches the line, and (2) that the trace is
-    armed on the tree being scored.
+    VOID. It runs as its own test child, with `GGML_SYCL_EXT_ALLOC_TRACE=1` in that child's
+    command, on the build the other C9 arms run, in the same session. (1) shows that a draw left
+    without room reaches the line, and (2) that the trace is armed on the tree being scored.
+    **Arming and trace-live checks, arm by arm (rulings §M66; r26 I-1 (c)):** every C9 arm that
+    scores `[EXT-ALLOC]` lines, whether it counts zero or N, carries
+    `GGML_SYCL_EXT_ALLOC_TRACE=1` in its own literal command, and names its live check. A
+    process-level arm (the scoped-miss and unplanned-buffer unit arms) ends, after
+    its scored steps, with (2)'s seam draw in the same process, so the process's count is
+    exactly 1, that draw's line (`cohort=backend-buffer-runtime-zone`, `prefer_vram_zone=3`),
+    and 0 before it; a count of 0 means the trace is dead and the arm is VOID, which fails. A
+    CLI arm (the merge gates, the default-context arm, the control-vector and LoRA arms), which
+    cannot host a seam, names (2) as its live check: the arm is VOID unless (2) printed its
+    line on the same build in the same session. The state-seq arm is a CLI-shaped binary too,
+    and takes (2) the same way.
   - **Baseline:** the two gate commands on that master tip with the trace on. Every cohort they
     print is either converted by a commit that lands before L4+L6 (§4), a term's draw, or a
     named defect with a ticket, recorded on the ticket before L4+L6 lands. A cohort left out
@@ -9599,11 +9832,22 @@ placement and demotion run. The rules for every such arm:
     default in that mode, writes each `llama-completion` block's stdout to `<log>.out` and its
     stderr to `<log>.err`. Every existing check reads both (`cat <log>.out <log>.err`), a
     stdout-only score such as the Mistral digits reads `<log>.out` alone, and `SPLIT=0` keeps
-    the merged `.log`. **Each block scores the `n_ctx` VOID check (r25 m-2):** VOID unless
-    `llama_context: n_ctx +=  *<N>$` scores 1, where N is the `n_ctx_train` the same run prints
-    from the model header (`print_info: n_ctx_train`), which `--verbose` makes visible; that is
-    131072 for GPT-OSS 120B, and for Qwen the value its header gives, recorded on the ticket
-    before the run:
+    the merged `.log`. **Each block scores the `n_ctx` VOID check (r25 m-2; r26 m-3):** N is
+    read from the GGUF header BEFORE the run, never from the run's own print: before any GPU
+    work the script reads `<arch>.context_length` with `merge-gates/gguf-ctx.py` (a stdlib
+    header reader) for each model, 131072 for GPT-OSS 120B and 262144 for
+    `Qwen3.6-35B-A3B-UD-Q5_K_S.gguf`, prints both, and fails if either read is empty. A run
+    that resolves a smaller context then cannot certify itself by printing that value twice.
+    The block is VOID unless `llama_context: n_ctx +=  *<N>$` scores exactly 1 **and** its
+    negative control holds: the `llama_context: n_ctx_seq` line is present (`--verbose` makes
+    both visible) and the same regex scores 0 on it. The regex is not anchored at `^`, since
+    the verbose line carries a timestamp prefix. **Self-test:** at startup the script scores
+    the regex on the three lines rendered as `gptoss120b-b1.log:1968` prints them, at N =
+    131072: the context line counts 1, the `n_ctx_seq` line 0 and the server slot line 0,
+    while the bare `n_ctx = N` form counts 1 on the slot line, which is why the prefix is
+    required. A failed self-test fails the script. Offline, on the pinned logs: `nctx_void
+    131072` on `gptoss120b-b1.log` is VOID (its `n_ctx` is 4096), `nctx_void 4096` is not,
+    an empty N is VOID, and the same log with its `n_ctx_seq` lines deleted is VOID:
     ```
     DCTX=1 GGML_SYCL_EXT_ALLOC_TRACE=1 bash $S/merge-gates/run-merge-gates.sh <tip>
     D=$S/merge-gates
@@ -9619,9 +9863,43 @@ placement and demotion run. The rules for every such arm:
     master refusal or a non-zero rc at the default context is a master defect: it is recorded
     and ticketed, and it does not void this arm. The moua arm scores its own absolute counts
     against the rules above, with no comparison to a baseline.
+  - **The Qwen xqex baseline (rulings §M67 (a); r26 m-17).** §M67 (a) accepts that Qwen may
+    admit few or no layers to oneDNN SDPA at `-c 4096`, since G gets only the room the pack and
+    the KV leave, and makes llama.cpp-xqex (chunked SDPA scratch) the lever. So the Qwen gate
+    set records what xqex will be measured against: on **both cards** (`level_zero:1`, the B50;
+    `level_zero:0`, the B70), in the **pinned** (`-c 4096`) and **default-context** (no `-c`,
+    262144 from the header) arms, four runs in all, one at a time, each with
+    `-ub 512 -lv 4`, the §3.3 check at its N in the default arm, and a fixed prompt long enough
+    for PP to be measured. The merge gate's own prompt, `Count from 1 to 5:`, is a few tokens,
+    so its PP is noise; these runs use `-f $S/merge-gates/pp512.txt`, a fixed file kept beside
+    the script, its token count recorded on the ticket before the runs, and `-no-cnv -n 1`,
+    since they score no chat output and conversation mode would wrap the file in the template:
+    ```
+    for sel in 1 0; do for carg in '-c 4096' ''; do
+      ONEAPI_DEVICE_SELECTOR=level_zero:$sel timeout -k 15 1500 ./build/bin/llama-completion \
+        -m /Storage/GenAI/models/Qwen3.6-35B-A3B-UD-Q5_K_S.gguf $carg -b 2048 -ub 512 -lv 4 \
+        -f $S/merge-gates/pp512.txt -no-cnv -n 1 --seed 42 --temp 0 \
+        < /dev/null > qx-$sel${carg:+-c4096}.out 2> qx-$sel${carg:+-c4096}.err; echo "rc=$?"
+    done; done
+    cat qx-<run>.err | grep -oE 'prompt eval time = *[0-9.]+ ms / *[0-9]+ tokens.*tokens per second'
+    cat qx-<run>.err | grep -oE 'graph scratch admitted: ctx=[0-9]+ dev=0 admitted=[0-9]+ of [0-9]+ layers'
+    cat qx-<run>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 layers=[0-9]+'
+    ```
+    Recorded per run, on the ticket: PP tokens per second and the prompt's token count from the
+    `prompt eval time` line, A of M from the admitted line and M − A from the decline line
+    (§3.3's scorer), the demoted-layer count from uize part 3's line, rc, and the load
+    (`uptime`, `pgrep -af 'codescout|ninja|icpx|ffmpeg'`). A run whose token count differs from
+    the file's is VOID. The PP figures are a **record, not a gate**: they are single runs under
+    this host's permanent load, so xqex compares against them with interleaved pairs on its own
+    tree, never against the absolute numbers. A and M − A are scored as §3.3 says, against the
+    replay's per-card values, since the fit's room differs by card. The four runs are
+    lead-run, pinned, never overlapped, with `Shmem` and `MemAvailable` sampled before and about
+    5 s after each.
   - **The leg's other buffers (rulings §M41 I-5).** Neither gate allocates them, so each has a
-    run of its own, lead-run once, pinned to `level_zero:1`, with the trace on. **The control
-    vector:** the Mistral gate command with `-lv 4` and §3.3's `n_ctx` check (32768), plus
+    run of its own, lead-run once, pinned to `level_zero:1`, with `GGML_SYCL_EXT_ALLOC_TRACE=1`
+    in the run's command and seam control (2) as its trace-live check (rulings §M66). **The
+    control vector:** the Mistral gate command (`llama-completion`) with `-ub 512 -lv 4` and
+    §3.3's `n_ctx` check (32768), plus
     `--control-vector` with a fixture control vector of zeros (`n_embd` f32 per layer, so the
     tokens are the gate's), which reaches `llama_set_adapter_cvec`. **The state-seq buffers:**
     `test-save-load-state` in single-model mode, `-m <a generated llama-arch model> -lv 4`
@@ -9637,11 +9915,12 @@ placement and demotion run. The rules for every such arm:
     round-trip unchanged. RED: the L4+L6 tree with the leg as 7.14h left it (no `WEIGHT`
     routing, no `forbid_vram_zone_spill`, no context homes), where Mistral's RUNTIME is 0, so
     each run prints its buffer's `[EXT-ALLOC]` line.
-  - **The unplanned buffer (rulings §M41 I-5):** a unit arm, a SYCL test lead-run once,
-    allocates a 1 MiB buffer on a SYCL<n> buffer type outside every claim scope, on an L4+L6
-    arena whose RUNTIME is 0, after a model load, so the device is planned. GREEN: NULL, the
-    `unplanned SYCL%d buffer` line, the once-per-process `known unhomed consumers` note
-    once, zero
+  - **The unplanned buffer (rulings §M41 I-5):** a unit arm, a SYCL test lead-run once with
+    `GGML_SYCL_EXT_ALLOC_TRACE=1` in its command, ending with seam control (2)'s draw in the
+    same process as its trace-live check (rulings §M66), allocates a 1 MiB buffer on a SYCL<n>
+    buffer type outside every claim scope, on an L4+L6 arena whose RUNTIME is 0, after a model
+    load, so the device is planned. GREEN: NULL, the `unplanned SYCL%d buffer` line, the
+    once-per-process `known unhomed consumers` note once, zero
     `[EXT-ALLOC]` lines, and no zone's live bytes grown. REDs: the leg without the refusal,
     which prints `[EXT-ALLOC]`; and 7.14j's leg, `forbid_vram_zone_spill` set with the chain
     kept, where the null runs the KV-zone draw and the buffer lands in the KV zone with no line
@@ -9691,15 +9970,16 @@ placement and demotion run. The rules for every such arm:
       which is itself a non-creating lookup (§2's fact 2). **W2 is not gated by the cut (rulings
       §M59(a); r25 I-1).** W2 is an ownership rule, so it gives the same answer before and after
       the cut, and the cache answers this request with 1oxa's W2 identity refusal, as 1oxa's W2
-      row and its arm (5) have it (1oxa rev 31, `cbd2280`). The fact-(1) return (`:37852-37853`)
-      then ends `alloc_buffer` before master's host-pinned retry, as after the cut (below).
-      GREEN, pre-registered: the 1 MiB buffer is null after exactly one `[VM-WT]` line, with
-      zero `[EXT-ALLOC]` lines, zero C11 lines (the leg issues no zone request, since has-zones
-      is false), zero `[VM-ARENA] zoneless device allocation refused` lines, zero unplanned
-      lines and zero `retrying with host-pinned fallback` lines; and `ggml_opt_init`, in a
-      second child, exits 134 after one `[VM-WT]` line and the `llama.cpp-mogf` named abort.
-      7.14q's GREEN (both buffers non-null with two `[EXT-ALLOC]` lines) rested on a W2 gated by
-      the cut, which §M59(a) rules out; its field greps move to the RED below:
+      row and its arm (5) have it (1oxa rev 34 follow-up, `68c31f0`; r26 m-1). The fact-(1)
+      return (`:37852-37853`) then ends `alloc_buffer` before master's host-pinned retry, as
+      after the cut (below). GREEN, pre-registered: the 1 MiB buffer is null after exactly one
+      `[VM-WT]` line, with zero `[EXT-ALLOC]` lines, zero C11 lines (the leg issues no zone
+      request, since has-zones is false), zero `[VM-ARENA] zoneless device allocation refused`
+      lines, zero unplanned lines and zero `retrying with host-pinned fallback` lines; and
+      `ggml_opt_init`, in a second child, exits 134 after one `[VM-WT]` line and the
+      `llama.cpp-mogf` named abort. 7.14q's GREEN (both buffers non-null with two `[EXT-ALLOC]`
+      lines) rested on a W2 gated by the cut, which §M59(a) rules out; its field greps move to
+      the RED below:
       ```
       cat nm-vm-pre.err | grep -c 'WEIGHT request without model identity'   # 1
       cat nm-vm-pre.err | grep -c 'EXT-ALLOC'                               # 0
@@ -9718,16 +9998,17 @@ placement and demotion run. The rules for every such arm:
       the unload, so the RUNTIME, KV-zone and SCRATCH requests all miss and 1oxa's C11 refuses
       each by name. The KV-zone request (`:37682-37691`: COMPUTE role, cohort
       `backend-buffer-kv-zone`, `must_device`, `prefer_vram_zone` = KV, no forbid) prints one
-      C11 line too: a zone miss with no `zone_alloc` call, not the `[VM-PLAN-BUG]` E5 line (1oxa
-      C11 row, pending r30 fold). Then the
+      C11 line too: a zone miss with no `zone_alloc` call, not the `[VM-PLAN-BUG]` E5 line
+      (1oxa's C11 row, the single source for it, at `68c31f0`). Then the
       legacy request (`:37778-37788`), WEIGHT role with neither a load transaction nor a claim
       scope, reaches the cache, whose answer is 1oxa's W2 identity refusal,
       `[VM-WT] WEIGHT request without model identity on device D (site S, N bytes) -- refused`,
       not row C9's line (1oxa rows C4 and C13). **The refusal is terminal (rulings §M50, placed
       by §M53).** `alloc_buffer` reads fact (1) and returns nullptr at the main request's
       failure (`:37852-37853`), before master's host-pinned retry (`:37855-37869`); this is
-      1oxa's mechanism (ii) (rev 31, `cbd2280`; r25 n-4), and §M53 has 1oxa rev 31 reword its
-      "takes no step of master's arena chain" to mean the retry and safe-alloc tails only.
+      1oxa's W2 row at `68c31f0` (its rev 31 mechanism (ii); r25 n-4, r26 m-1), which, as §M53
+      asked, rewords "takes no step of master's arena chain" to mean the retry and safe-alloc
+      tails only.
       Without the early return the retry would run, since `allow_shared_fallback` defaults to
       true (`:37516`) and `must_host_pinned` is false; host-pinned memory is outside VM (1oxa
       W14), so the retry would land, and a device buffer type would hand out host memory that
@@ -9745,8 +10026,9 @@ placement and demotion run. The rules for every such arm:
       RED is 1oxa's arm. GREEN, pre-registered, with `GGML_SYCL_STRICT_LEASES` unset:
       - the 1 MiB buffer is null after exactly one `[VM-WT]` line;
       - **the C11 lines, scored per zone name, with no total (rulings §M59(b); r25 m-1):**
-        exactly one each for `runtime`, `kv` and `scratch`, in 1oxa's C11 format (1oxa C11 row,
-        pending r30 fold): `[VM-ARENA] zone <Z> miss would spill to a raw device allocation on
+        exactly one each for `runtime`, `kv` and `scratch`, in 1oxa's C11 format (1oxa's C11 row
+        at `68c31f0`, rev 34 follow-up; r26 m-1):
+        `[VM-ARENA] zone <Z> miss would spill to a raw device allocation on
         a VM device (tag <T>, <N> bytes) -- refused`, where Z is `arena_zone_name`, lowercase
         (`runtime`, `kv`, `scratch`, `onednn`, `weight`), T the request's cohort or `(none)`,
         and N = max(size, 1). The pattern, counted per captured Z, is `^\[VM-ARENA\] zone
@@ -9816,7 +10098,9 @@ placement and demotion run. The rules for every such arm:
       RED prints one unplanned line, `[ZONE-PLAN-BUG] unplanned SYCL%d buffer`, and returns
       null with zero `[VM-WT]` lines and zero C11 lines, where GREEN has one `[VM-WT]` line, one
       C11 line each for `runtime`, `kv` and `scratch`, and no unplanned line.
-  - **A scoped miss (rulings §M46 I-1 (a)):** a unit arm, lead-run once, on an L4+L6 arena,
+  - **A scoped miss (rulings §M46 I-1 (a)):** a unit arm, lead-run once with
+    `GGML_SYCL_EXT_ALLOC_TRACE=1` in its command, ending with seam control (2)'s draw in the
+    same process as its trace-live check (rulings §M66), on an L4+L6 arena,
     inside zhcn's compute scope, allocates a SYCL<n> buffer one byte larger than the compute
     head slot. GREEN: nullptr; the leg's
     `scoped SYCL%d buffer of %zu B missed its compute scope's range (refused)` line once; zero
@@ -9829,8 +10113,10 @@ placement and demotion run. The rules for every such arm:
     `must_device` returns a buffer, whether in VRAM outside any plan or host-pinned: **the RED's
     pre-registered outcome is a non-null buffer (r20 m-8)**, and the live-bytes and retry-line
     checks only say where it landed.
-  - **A LoRA adapter (rulings §M46 I-1 (b)):** the Mistral gate command with `-lv 4` and §3.3's
-    `n_ctx` check (32768), pinned to `level_zero:1`, with the trace on and `-fa on` pinned (r22
+  - **A LoRA adapter (rulings §M46 I-1 (b)):** the Mistral gate command (`llama-completion`)
+    with `-ub 512 -lv 4` and §3.3's
+    `n_ctx` check (32768), pinned to `level_zero:1`, with `GGML_SYCL_EXT_ALLOC_TRACE=1` in its
+    command, seam control (2) as its trace-live check (rulings §M66), and `-fa on` pinned (r22
     m-8), plus `--lora` naming a fixture adapter whose B matrices are zero on every attention
     projection, so the tokens are the gate's. GREEN: the gate's tokens, zero `[EXT-ALLOC]`
     lines, and the extension's plan line, printed at WARN at `extend_end`'s commit,
@@ -10075,7 +10361,8 @@ placement and demotion run. The rules for every such arm:
   ONEDNN sizing on both sides of the dry run until the Graph-scratch commit's (b2), less the
   constant from L4+L6 (rulings §M44 C-1).
 - **Not moua's:** the load getter switch, the with-floor getter's and the clamp's deletion, the
-  direct overflow's deletion, the draw's move and the m-14 test and comment updates are the
+  direct overflow's deletion (23mk `8547a22f0` (b2) item 8, rulings §M68 (b)), the draw's
+  move and the m-14 test and comment updates are the
   Graph-scratch commit's (23mk, in beni; rulings §M26a I-4), all in its (b2); its (b1) is the
   sinks-aware G input, before L4 (rulings §M44 C-1). 7.14b and 7.14c placed the switch in L6 and
   C-1.
@@ -12543,7 +12830,7 @@ and the matmul), the reading the lead confirmed after 7.14p.
 | n-6 | the W-order source gate would fail the `GGML_SYCL_PRIVATE_TESTING` hook call inside the section | **Changed.** H7z's gate allows the hook call inside a `GGML_SYCL_PRIVATE_TESTING` block only, and fails a hook call outside one. |
 | r24 addendum (follow-up), m-11 widened | apply the programmatic `n_ctx = 0` rule to G1, C5 and C9's fixture arms, or state per arm why none applies; C11 needs a default row | **Changed.** §3.3 now lists every arm the rule does not reach, each with its reason: G0 (no model), G1 (a synthetic fixture whose KV sizes are chosen for its cases), G2 (fixture term sets), C9's Mistral control, control-vector and LoRA arms (CLI vehicles with no `-c`, already at `n_ctx_train`), C9's seam control, unplanned-buffer and scoped-miss arms (fixed-geometry unit arms), C9's no-model arm (no `n_ctx`) and the H tests (host models). C5 has its sibling, C9's state-seq arm its VOID check, and C11 its default rows (first commit). (Amended, §6.34: C9's Mistral-command arms move to where the rule applies, and every C arm is listed, r25 m-2, m-11.) |
 | r24 addendum (follow-up), §M52 | §M52 does not bind moua | **Stated** in C9's VM post-cut pass: the leg returns before `:37769` on a planned device, so the safe_alloc forcing is unreachable there; the 1 MiB buffer never reaches it on the unplanned VM device; §M52's RED is 1oxa's. (Amended, §6.34: the reason is 1oxa's fact-(1) read, whatever the size, r25 n-7.) |
-| §M56 (a) (follow-up) | the GPT-OSS B50 default-context pre-registration has one source, zhcn GDC3 | **Changed.** C3's default-context arm cites zhcn GDC3 by row id and carries no copy of its numbers; the pre-moua `-c 56576` figure is dropped, so the arm has no second source. (Amended, §6.34: scored against GDC3's zhcn's-tree point, and GA's room cites GDC3's F, r25 m-3.) |
+| §M56 (a) (follow-up) | the GPT-OSS B50 default-context pre-registration has one source, zhcn GDC3 | **Changed.** C3's default-context arm cites zhcn GDC3 by row id and carries no copy of its numbers; the pre-moua `-c 56576` figure is dropped, so the arm has no second source. (Amended, §6.34 m-3, as corrected at §6.35 m-5: scored against GDC3's zhcn+moua fixpoint point, the replay of the run's own input lines (rulings §M61 (a), §M63 (a)), and GA cites zhcn GA, not GDC3's F (rulings §M61 (b)).) |
 
 **Relays.**
 - **1oxa** (amended, §6.34: request (1) is withdrawn under rulings §M59 (a), and (2) is answered
@@ -12596,12 +12883,12 @@ below is at `c69d5774d`; at master `d19308be3` each one above `:40214` is one hi
 | I-2; §M59 (d) | G2's replay witnesses could not reach a replay: record mode skipped master's direct warmup, and the W-order replay half ran X's graph compute while Y was inside its own, latching `g_sycl_graph_multithreaded` | **Changed, per §M59 (d).** Record mode pre-registers warmup (direct, `:106876-106903`), record (records +1, replays +0) and replay (replays +1), with the replay counted only at the main replay submit (`:107235`), never at the record paths' first execute (`:107092`, `:107123`); a capture that throws is VOID. New seam `ggml_sycl_test_context_graph_records(ctx)`. Record mode and each W-order sub-arm run in their own child process, so the latch (`:105112-105113`, `:105183-105185`) never reaches another arm. The replay half has X compute alone (warmup, ungated record, gated replay) and Y as a marker use that calls the function directly. |
 | I-3; §M59 (c) | the production matmul inside the "leaf" W-order section takes `exec_mutex(q)` and `dnnl_mutex`, may allocate, and host-waits under two diagnostic envs; H7z did not read the callback | **Changed, per §M59 (c).** Two forms, and G0 picks one (§2.4.2). Form M (preferred) narrows the order to one atomic `fetch_add` and a device-side waiter and publisher, so no lock is held across a submit. Form E keeps an event section with its rank stated once: `ctx.graph_mutex`, the W-order mutex, `exec_mutex(q)`. In both, the dnnl stream, engine, scratchpad memory and primitives are resolved before the use, and the matmul step calls a pre-resolved `gemm` variant, so `dnnl_mutex` is never taken and nothing allocates inside a use. `GGML_SYCL_PP_SPLIT_TIMING` and `GGML_SYCL_DEQUANT_BENCH` are declined by name, once per process, and run the unordered path. H7z reads the function, its step callables and their callees, and fails on waits, `host_task`, allocation entries, `stream_dnnl`/`engine_dnnl`/`get_scratchpad_mem`, the retention hand-off and, under Form E, any lock but `exec_mutex`; its witnesses include `ctx.stream_dnnl(q)` in the callable and a `q->wait()` in a callee. |
 | I-4; §M59 (d) | G0 never timed the replay's graph submit, yet its verdict landed the section for replays | **Changed, per §M59 (d).** G0 has three M kinds (kernel, oneDNN execute, and `ext_oneapi_graph(exec)` with a cross-queue `depends_on`) against two H states, six cells per card. The verdict matrix is Form M if F1 and F2 progress on both cards, else Form E if all six cells return on both cards, else the lead rules. |
-| m-1; §M59 (b); 1oxa's C11 answer | the post-cut C11 count fixed a total of 2, while the KV-zone request's line was unanswered | **Changed, per §M59 (b), with 1oxa's answer.** Exactly one C11 line each for `runtime`, `kv` and `scratch`, with no total, in 1oxa's format, `[VM-ARENA] zone <Z> miss would spill to a raw device allocation on a VM device (tag <T>, <N> bytes) -- refused`, Z being `arena_zone_name` in lowercase, T the cohort or `(none)`, N = max(size, 1); each is counted with the pattern at its Z. The KV-zone request (`:37682-37691`: COMPUTE role, cohort `backend-buffer-kv-zone`, `must_device`, `prefer_vram_zone` = KV, no forbid) prints its C11 line once, a zone miss with no `zone_alloc` call, not the `[VM-PLAN-BUG]` E5 line (1oxa C11 row, pending r30 fold). The planned-predicate RED's GREEN side reads the same three. Master's `RUNTIME+KV+scratch all full for runtime buffer` WARN (`:37737-37739`) is pre-registered once, as the witness that the chain reached the legacy request. |
+| m-1; §M59 (b); 1oxa's C11 answer | the post-cut C11 count fixed a total of 2, while the KV-zone request's line was unanswered | **Changed, per §M59 (b), with 1oxa's answer.** Exactly one C11 line each for `runtime`, `kv` and `scratch`, with no total, in 1oxa's format, `[VM-ARENA] zone <Z> miss would spill to a raw device allocation on a VM device (tag <T>, <N> bytes) -- refused`, Z being `arena_zone_name` in lowercase, T the cohort or `(none)`, N = max(size, 1); each is counted with the pattern at its Z. The KV-zone request (`:37682-37691`: COMPUTE role, cohort `backend-buffer-kv-zone`, `must_device`, `prefer_vram_zone` = KV, no forbid) prints its C11 line once, a zone miss with no `zone_alloc` call, not the `[VM-PLAN-BUG]` E5 line (1oxa C11 row, pending r30 fold). The planned-predicate RED's GREEN side reads the same three. Master's `RUNTIME+KV+scratch all full for runtime buffer` WARN (`:37737-37739`) is pre-registered once, as the witness that the chain reached the legacy request. (Amended, §6.35 m-1: the `kv` line is cited to 1oxa's C11 row at `68c31f0`, rev 34 follow-up, which carries it; "pending r30 fold" is withdrawn.) |
 | m-2; §M61 (c); §M62 (C) | the default-context CLI arms carried no `-lv 4` and no `n_ctx` check; the follow-up filed C9's Mistral-command arms under "does not apply"; the check matched on a bare `n_ctx =` | **Partly closed by `f2323f9e0`:** C5's programmatic sibling already carried `-lv 4` and the check, and the merge-gate arms already printed the line through `--verbose`. **Changed at 7.14r:** §3.3's VOID guard now covers every default-context arm, CLI and programmatic. C1 (a default-equivalent pin), C2 and C2a, C3's and C8's default arms, and C9's Mistral positive control (1) (both of its runs), control-vector and LoRA arms carry `-lv 4` and the check (131072 for GPT-OSS 20B and 120B, 32768 for Mistral, Qwen's header value), and C9's merge-gate default arms add it through the script's `DCTX=1` mode (`--verbose`). **The check is the padded regex `llama_context: n_ctx +=  *<N>$` everywhere (§M62 (C)),** unanchored at `^` since verbose lines carry a timestamp, with the `llama_context:` prefix load-bearing against the server's `new slot, n_ctx = <N>` line; its negative control is that line and the `n_ctx_seq` line, which must score 0 (C3's block carries both). The script's `nctx_void` uses the same regex, requires exactly one such line, and reads `print_info: n_ctx_train`. **The LoRA arm's arithmetic (§M61 (c)):** its KQ 2147483648 B is at 32768, which is Mistral 7B v0.1's real `n_ctx_train` (`llama.context_length`), so it is the vehicle's default, not a pin, and neither Mistral-command arm is a pinned arm. The exemption list names every arm it covers (C0, C4, C6, G0, G1, G2, C9's seam control, unplanned-buffer, clip and `ggml_opt_init` children, scoped-miss, state-seq scatter and no-model arms, and the H tests), and C9's Mistral control (1) has left it. |
 | m-3; §M56 (a); §M61 (a), (b); §M63 (a) | C3's arm did not name which GDC3 point it scores against; GA still stated F itself | **Closed by `f2323f9e0`:** C3 cites GDC3 by row id, holds none of its numbers, and has no `-c 56576`. **Changed at 7.14r:** (a) C3's default arm is scored against GDC3's **zhcn+moua fixpoint point** (§M61 (a)), not its today's-tree point, since the arm runs after L4+L6, and today's-tree F would fail a correct tree. That point is the replay of the run's own input lines, every charged slot checked against its own derivation, never a prior run's printed output (§M63 (a)). GDC3 is a `llama-cli` point, as the arm is (§M60 (b)). (b) Under §M61 (b), no GDC3 figure appears in this doc: moua owns only its +377.5 MiB RUNTIME-floor delta, and zhcn cites moua for that alone. GA's room, head-slot and spare figures, which rested on GDC3's F, are withdrawn (§2.4.1). §M60 (d): no text here routes the compute buffer anywhere but RUNTIME on master. |
 | m-4 | the C9 state-seq claim was stale at master; C5's sibling might equal the pinned run | **Changed.** Re-derived at `e2461d4fb`: the registration is `--models` over the generated models (`tests/CMakeLists.txt:369-374`), whose mode silences INFO, so the arm runs single-model `-m <generated model> -lv 4`; `test_seq_cp_device` (`:395-398`, `ON_DEVICE` at `:426`, `:437`) is the default-context case and carries the check; `test_seq_cp_scatter` with `on_device` true pins 256 (`:462`, `:469`) and is exempt as fixed-geometry scatter arithmetic at the same allocation site. C5: the lead stages stories15M (`tests/CMakeLists.txt:662`, `:790`) with the non-GPU `test-download-model` and reads `llama.context_length` first; if it is 256, the pinned arm is already default-context and the sibling is dropped. |
 | m-5 | G0 cited a self-test as production, lacked the not-started `host_task` state, warm-ups and per-kind controls, and had no attribution for a hang | **Changed.** The `:19948-19955` cite is withdrawn (a self-test, `:19858`). H1 is the executing async CPU-compute shape (`cpu-dispatch.cpp:4743`), H2 the not-started terminal shape (`:75262-75264`) behind a device-gated kernel. Each M kind gets an untimed warm-up and its own negative control; the positive control is per H shape. Each cell prints a start line and a verdict line, and an in-process 30 s watchdog prints `HUNG` and exits 3; rc 0, 1, 3, 77 and 124/137 are pre-registered, 77 through `sycl-test-skip.hpp`. |
-| m-6 | the fallback marker had no owner, no spin cap, no replay rule and no stated cost | **Changed.** Form M's marker is a 256 B block drawn owner-first (`unified_allocate_owner`, `mem_handle::from_owned_alloc`) at the entry's commit and held by the entry. The waiter is capped at one second of polls, sized by G0 per card below the xe job timeout; at the cap it sets a fault word, publishers stop, and `ggml_backend_sycl_synchronize` aborts with `[W-ORDER] marker wait capped`. Recordings bake no waiter or publisher; a replay gets eager ones with fresh numbers. Cost: two single-work-item kernels per eager W use and per replay, scored by C6's PP arms. |
+| m-6 | the fallback marker had no owner, no spin cap, no replay rule and no stated cost | **Changed.** Form M's marker is a 256 B block drawn owner-first (`unified_allocate_owner`, `mem_handle::from_owned_alloc`) at the entry's commit and held by the entry. The waiter is capped at one second of polls, sized by G0 per card below the xe job timeout; at the cap it sets a fault word, publishers stop, and `ggml_backend_sycl_synchronize` aborts with `[W-ORDER] marker wait capped`. Recordings bake no waiter or publisher; a replay gets eager ones with fresh numbers. Cost: two single-work-item kernels per eager W use and per replay, scored by C6's PP arms. (Amended, §6.35 m-10: the one-second cap is replaced by a chain of K waiters, each capped at half the xe job timeout, with K derived from G0's measured worst predecessor tail; the cost is K + 1 kernels.) |
 | m-7 | a retired generation could leak at count zero, and a draw could race retirement | **Changed.** A generation is created holding a self-reference while current; draws take references by increment-if-nonzero and reload on zero; the commit drops the self-reference after moving the charge to the retiring container, and the release runs on whichever decrement reaches zero. |
 | m-8 | the census missed `ctx.graph_mutex` | **Changed.** It is named (`lock_guard` at `:105182`, held for the whole `graph_compute`, the direct path included) and ranked above Form E's W-order mutex, with L2 above it where held. |
 | m-9 | RED 2 sat where the function could not see the first step; the replay RED named no line | **Changed.** `steps` is an ordered list of step callables that the function calls and anchors on the last event; RED 2 edits that anchor selection. Every executable-graph finalize (six sites) and submit (eleven sites) goes through `ggml_sycl_graph_finalize` and `ggml_sycl_graph_submit`, so which recordings bake W is decided at run time and no site is left unwrapped; H7z fails on a raw call. The replay RED edits `:107235` back to a raw submit. |
@@ -12610,18 +12897,18 @@ below is at `c69d5774d`; at master `d19308be3` each one above `:40214` is one hi
 | n-1 | the new `ggml-sycl.cpp` cites carried no revision | **Changed.** G2 and this section state `c69d5774d`, with the +1 offset above `:40214` at `d19308be3`. |
 | n-2 | the quoted uize line was stale | **Changed.** §3.3 quotes master's format (`:18381-18386` at `e2461d4fb`) with its SWA count, layer range and device, printed at WARN when residency changed. |
 | n-3 | stray indents in C3's default-context block | **Changed.** |
-| n-4 | re-pin 1oxa; answer its C14 reconciliation | **Changed.** 1oxa is cited at rev 31 (`cbd2280`; its C11 row as of `a71c71d`). **C14: 1oxa is right (design-1oxa-r31 m-2; cjko comment c-k083), re-derived at `e2461d4fb`.** The allocation is in the implicitly noexcept `~llama_io_write_device()` (`llama-context.cpp:4198`, alloc `:4262`; `:4103`, `:4167` at `c69d5774d`), unchecked, and it runs after `state_seq_get_data`'s catch region, since `io` is declared at `:4547`, outside the `try` at `:4554`. The allocator returns NULL without throwing, so a refused save is a deterministic abort at the first copy (`:4285`), in `GGML_ASSERT(buffer)` (`ggml-backend.cpp:706`; `:696` at `c69d5774d`), and a use-after-free when the checkpoint splits across buffers and a later range's refusal frees the earlier ones (`ggml-alloc.c:1136`). 7.14q's "throws, and the catch returns 0" is withdrawn. The refused branch is llama.cpp-cjko's: a named refusal through the save's failure return, zero `GGML_ASSERT` lines, and a split arm under ASan or poisoning; C9's state-seq arm scores the placed branch only (§2.4.2's census of the leg). |
+| n-4 | re-pin 1oxa; answer its C14 reconciliation | **Changed.** 1oxa is cited at rev 31 (`cbd2280`; its C11 row as of `a71c71d`). (Amended, §6.35 m-1: re-pinned to `68c31f0`, rev 34 follow-up.) **C14: 1oxa is right (design-1oxa-r31 m-2; cjko comment c-k083), re-derived at `e2461d4fb`.** The allocation is in the implicitly noexcept `~llama_io_write_device()` (`llama-context.cpp:4198`, alloc `:4262`; `:4103`, `:4167` at `c69d5774d`), unchecked, and it runs after `state_seq_get_data`'s catch region, since `io` is declared at `:4547`, outside the `try` at `:4554`. The allocator returns NULL without throwing, so a refused save is a deterministic abort at the first copy (`:4285`), in `GGML_ASSERT(buffer)` (`ggml-backend.cpp:706`; `:696` at `c69d5774d`), and a use-after-free when the checkpoint splits across buffers and a later range's refusal frees the earlier ones (`ggml-alloc.c:1136`). 7.14q's "throws, and the catch returns 0" is withdrawn. The refused branch is llama.cpp-cjko's: a named refusal through the save's failure return, zero `GGML_ASSERT` lines, and a split arm under ASan or poisoning; C9's state-seq arm scores the placed branch only (§2.4.2's census of the leg). |
 | n-5 | the TLSF granularity | **Changed.** max(alignment, 256 B) (`tlsf-allocator.hpp:366-367`). |
 | n-6 | G0 changes no backend code yet allocates through the cache | **Changed.** It is a `ggml-sycl/tests` target linked as `test-unified-runtime-alloc.cpp` is, using the exported `unified_allocate_owner()` (`unified-cache.hpp:6079`) and `mem_handle::from_owned_alloc()` (`mem-handle.hpp:394`). |
 | n-7 | the §M52 statement's range and reason | **Changed.** `:37797-37820` at `c69d5774d` (§M52's `:37799-37820` is at `3d9414c8c`), and the reason is 1oxa's fact-(1) read, which switches the forcing off on every VM device whatever the size; the oversize margin is the weaker reason. |
 | n-8 | the H-tests bullet was nested under C9's no-model arm | **Changed.** It is a sibling in the exemption list. |
 | n-9 | G1's exemption cited a sizing G1 does not state | **Changed.** The reason is the geometry-driven case split, with no "exactly". |
 | queued (lead, 2026-09-27) | zhcn GDC8 runs through `run-merge-gates.sh`, which merged each block's streams | **Changed.** The script gains `SPLIT=1` (each `llama-completion` block's stdout to `<log>.out`, stderr to `<log>.err`; existing checks read both, the Mistral digit score reads `.out` alone) and `DCTX=1`, the default-context mode C9 described (no `-c 4096` on the two merge-gate blocks, `-dctx` logs, the `n_ctx` VOID check), with `SPLIT=1` its default. The form before is kept as `run-merge-gates.sh.pre-m714q`. The helpers were checked offline against a stand-in binary in both modes; the script itself runs only as the lead's GPU run. |
-| §M60 (b); lead (GA's vehicle) | GA's −709.4 MiB carried 808.0 MiB of compute, `llama-completion`'s `-ub 1024` figure (`n_outputs_max` 2048), on an arm that runs `llama-cli` (`n_outputs_max` 1) | **Changed.** GA's count is marked unmeasured here and cited to zhcn GA (`e4f424a`, `llama-cli`, about 1 demoted layer), its single source. moua keeps the fit rule, its own terms at `-c 65536 -ub 1024` (full KV 1536.0, SWA 30.0, ring rows 180.0 + 360.0 MiB, all vehicle-independent) and the +377.5 MiB delta, with the fit written symbolically over zhcn's room and `llama-cli` compute. −709.4 and its 6 layers are withdrawn in §2.4.1, §5 (n), C7 and H2's fixture, which now takes its own synthetic room (−700.0 MiB, 6 layers, margins 60.0 and 68.0). Every GA number names its vehicle. |
+| §M60 (b); lead (GA's vehicle) | GA's −709.4 MiB carried 808.0 MiB of compute, `llama-completion`'s `-ub 1024` figure (`n_outputs_max` 2048), on an arm that runs `llama-cli` (`n_outputs_max` 1) | **Changed.** GA's count is marked unmeasured here and cited to zhcn GA (`e4f424a`, `llama-cli`), its single source. (Amended, §6.35 m-4: the count is no longer restated anywhere, and H2's run is a check of the fit rule, not a second source; the +377.5 MiB is an input to the pre-registration only, §6.35 m-16.) moua keeps the fit rule, its own terms at `-c 65536 -ub 1024` (full KV 1536.0, SWA 30.0, ring rows 180.0 + 360.0 MiB, all vehicle-independent) and the +377.5 MiB delta, with the fit written symbolically over zhcn's room and `llama-cli` compute. −709.4 and its 6 layers are withdrawn in §2.4.1, §5 (n), C7 and H2's fixture, which now takes its own synthetic room (−700.0 MiB, 6 layers, margins 60.0 and 68.0). Every GA number names its vehicle. |
 | 23mk rev 4.16 (`3499cbe90`); §M54 | the Graph (oneDNN SDPA) scratch is charged inside moua's fit after the KV extents, never as a head slot | **Changed.** §2.3.2's `ONEDNN_GRAPH_SCRATCH` term, GA's head-slot list, and the ONEDNN-floor state say so, as does H7ap's C-rule arm: G is charged after the KV extents, for device-resident attention layers only, each sized from its `n_kv`, admitted in ascending order of per-shape term; a layer that does not fit declines SDPA with `scratch_unplaced` and runs native FA, no context is refused, and G never forces a demotion (follow-up llama.cpp-xqex). `FIRST_CONTEXT` calls the same fit. The order is confirmed in the relay below. |
 | C14 correction (design-1oxa-r31 m-2; cjko c-k083) | a refused state-seq save is not a throw and not "returns 0" | **Changed**, with n-4 above: on master it is a deterministic `GGML_ASSERT(buffer)` abort at the first copy, and a use-after-free when the checkpoint splits across buffers. Every moua statement of the failure mode (§2.4.2's census of the leg, C9's state-seq arm, n-4) says so, cited at `e2461d4fb`; the refused arm, a named refusal with zero `GGML_ASSERT` lines and a split arm under ASan, is cjko's. |
-| §M64 (b); design-23mk-r20 I-2 (follow-up) | at `f2323f9e0` and `df9803cb8`, the §2.4.3 member table, the first-context arm and C9's replay still counted the Graph scratch in `FIRST_CONTEXT`'s head-slot set from (b2), so the replay could demote KV for it, against §M54 | **Changed in the follow-up.** The Graph scratch is not a member of the head-slot set at any landing order (§2.4.1's head-slot list, §2.4.2 (b)'s bound and C-term text, §2.4.3's member table and transition rule, the ledger row, H7ap's first-context arm, C10's orientation and §3.3's replay). The known sets are 1560297728 B and 2197651712 B on both sides of (b2), 2395242752 B for Qwen's server case. The replay charges G in the same fit after the KV extents, for the device-resident attention layers only, in ascending per-shape order, never names it as a demotion cause, and pre-registers the SDPA-admitted layer count and the `scratch_unplaced` count. The "Graph scratch admitted as a member" RED (2398978304 B against 2197651712 B) now applies on both trees. Consequence stated in C10: from (b2) the Qwen pack's capacity is 335.8 MiB below master's weight zone (was 527.8), and G takes only the room the pack and the KV leave, so few or no Qwen layers may keep SDPA; the replay pre-registers the count. 23mk's Qwen row cites this follow-up's hash. |
-| §M64 (a), (c); design-23mk-r20 I-3, m-3 (second follow-up) | (b1) could route a Graph draw that misses the ONEDNN cap to the direct overflow `onednn_graph_scratch_alloc_direct_locked` (`unified-cache.cpp:11721`), which breaks P1, P2 and P4; admission could admit a layer whose term exceeds the override; and (b2)'s text still named a context refusal | **Changed.** The Graph-scratch commit's (b1) bullet states that (b1) never uses the direct overflow: over the cap it declines oneDNN SDPA on that device, counted, with one WARN per (context, device), and the interim cost is not accepted. The step-4 interim sizing says the same where the clamp binds. Admission declines, never admits, a layer whose term exceeds the override (P4). (b2)'s charge is moua's fit after the KV extents, with `scratch_unplaced` for a layer that does not fit and no context refusal, and its deletion of the direct path stands unless 23mk names another commit or ticket (relayed). |
+| §M64 (b); design-23mk-r20 I-2 (follow-up) | at `f2323f9e0` and `df9803cb8`, the §2.4.3 member table, the first-context arm and C9's replay still counted the Graph scratch in `FIRST_CONTEXT`'s head-slot set from (b2), so the replay could demote KV for it, against §M54 | **Changed in the follow-up.** The Graph scratch is not a member of the head-slot set at any landing order (§2.4.1's head-slot list, §2.4.2 (b)'s bound and C-term text, §2.4.3's member table and transition rule, the ledger row, H7ap's first-context arm, C10's orientation and §3.3's replay). The known sets are 1560297728 B and 2197651712 B on both sides of (b2), 2395242752 B for Qwen's server case. The replay charges G in the same fit after the KV extents, for the device-resident attention layers only, in ascending per-shape order, never names it as a demotion cause, and pre-registers the SDPA-admitted layer count and the `scratch_unplaced` count. The "Graph scratch admitted as a member" RED (2398978304 B against 2197651712 B) now applies on both trees. Consequence stated in C10: from (b2) the Qwen pack's capacity is 335.8 MiB below master's weight zone (was 527.8), and G takes only the room the pack and the KV leave, so few or no Qwen layers may keep SDPA; the replay pre-registers the count. 23mk's Qwen row cites this follow-up's hash. (Amended, §6.35 m-13 (a): the zone-class table's `CONTEXT` row still listed the Graph scratch among the reserved slots; 7.14s removes it, and the claim above holds from 7.14s.) |
+| §M64 (a), (c); design-23mk-r20 I-3, m-3 (second follow-up) | (b1) could route a Graph draw that misses the ONEDNN cap to the direct overflow `onednn_graph_scratch_alloc_direct_locked` (`unified-cache.cpp:11721`), which breaks P1, P2 and P4; admission could admit a layer whose term exceeds the override; and (b2)'s text still named a context refusal | **Changed.** The Graph-scratch commit's (b1) bullet states that (b1) never uses the direct overflow: over the cap it declines oneDNN SDPA on that device, counted, with one WARN per (context, device), and the interim cost is not accepted. The step-4 interim sizing says the same where the clamp binds. Admission declines, never admits, a layer whose term exceeds the override (P4). (b2)'s charge is moua's fit after the KV extents, with `scratch_unplaced` for a layer that does not fit and no context refusal, and its deletion of the direct path stands unless 23mk names another commit or ticket (relayed). (Amended, §6.35 I-2, I-3 and m-12: the deletion has one owner, 23mk `8547a22f0` (b2) item 8, per §M68 (b); a runtime miss is the TERMINAL `[ZONE-PLAN-BUG]` channel from (b1), per §M70; and each decline is named, in 23mk's formats, with a scorer.) |
 
 **Relays.**
 - **1oxa:** (1) Under rulings §M59 (a), moua's pre-cut VM GREEN is null after one `[VM-WT]` line
@@ -12630,19 +12917,21 @@ below is at `c69d5774d`; at master `d19308be3` each one above `:40214` is one hi
   §M59 (b), moua scores the post-cut C11 lines per zone name, with no total: exactly one each
   for `runtime`, `kv` and `scratch`, in your format with Z lowercase, counted per captured Z
   with your pattern, as C9's post-cut VM pass quotes it. The `kv` line is cited as "1oxa C11 row
-  (pending r30 fold)" until that fold has a hash; please send the hash when it lands. (3) C14:
-  moua agrees with your row and design-1oxa-r31 m-2. Re-derived at `e2461d4fb`: the unchecked
-  allocation is in the implicitly noexcept `~llama_io_write_device()` (`llama-context.cpp:4198`,
-  alloc `:4262`), `io` is declared at `:4547`, outside the `try` at `:4554`, and the allocator
-  returns NULL without throwing, so a refused save aborts in `GGML_ASSERT(buffer)` at the first
-  copy (`:4285`; `ggml-backend.cpp:706`), or reads freed memory when the checkpoint splits
-  across buffers (`ggml-alloc.c:1136`). The c-k083 cites are `c69d5774d`'s numbers. moua
-  withdraws its "throws, and the catch returns 0", and the refused arm is cjko's. (4) moua cites
-  you at rev 31 (`cbd2280`), with your C11 row as of `a71c71d`, and the r30 fold for `kv`. (5)
-  Follow-up, rulings §M64 (b): the Graph scratch is no longer a member of the first-context set
-  at any landing order, so the C terms you place in your VM C-term extent from `FIRST_CONTEXT`
-  are 1136673024 B on GPT-OSS 120B and 1614840064 B on Qwen (the set 1560297728 B and 2197651712
-  B). G is charged by the context's fit after the KV extents.
+  (pending r30 fold)" until that fold has a hash; please send the hash when it lands. (Amended,
+  §6.35: cited at `68c31f0`.) (3) C14: moua agrees with your row and design-1oxa-r31 m-2.
+  Re-derived at `e2461d4fb`: the unchecked allocation is in the implicitly noexcept
+  `~llama_io_write_device()` (`llama-context.cpp:4198`, alloc `:4262`), `io` is declared at
+  `:4547`, outside the `try` at `:4554`, and the allocator returns NULL without throwing, so a
+  refused save aborts in `GGML_ASSERT(buffer)` at the first copy (`:4285`;
+  `ggml-backend.cpp:706`), or reads freed memory when the checkpoint splits across buffers
+  (`ggml-alloc.c:1136`). The c-k083 cites are `c69d5774d`'s numbers. moua withdraws its "throws,
+  and the catch returns 0", and the refused arm is cjko's. (4) moua cites you at rev 31
+  (`cbd2280`), with your C11 row as of `a71c71d`, and the r30 fold for `kv` (amended, §6.35 m-1:
+  now `68c31f0`, rev 34 follow-up). (5) Follow-up, rulings §M64 (b): the Graph scratch is no
+  longer a member of the first-context set at any landing order, so the C terms you place in
+  your VM C-term extent from `FIRST_CONTEXT` are 1136673024 B on GPT-OSS 120B and 1614840064 B
+  on Qwen (the set 1560297728 B and 2197651712 B). G is charged by the context's fit after the
+  KV extents.
 - **23mk:** the full W-order list (rulings §M59 (c)); it replaces §6.33's relay. (1)
   `ggml_sycl_device_entry_w_ordered(entry, queue, steps)` takes an ordered list of step
   callables, each returning its event or none, and anchors on the last event. On a `row_gemm`
@@ -12663,25 +12952,28 @@ below is at `c69d5774d`; at master `d19308be3` each one above `:40214` is one hi
   does not fit declines SDPA with `scratch_unplaced`. So KV extents come before G, G never
   forces a demotion, and no context is refused on G's account. The one difference from "KV
   extents, then G" is that the mandatory head slots are settled together with the KV extents,
-  ahead of G too. `FIRST_CONTEXT` calls the same fit. The per-layer SDPA fallback's follow-up is
-  tracked as llama.cpp-xqex. **Follow-up (rulings §M64 (b)):** `df9803cb8` still counted G in
-  the first-context head-slot set from (b2), so C9's replay could demote KV for it; the
-  follow-up removes it from the §2.4.3 member table, the bound, the first-context arm, C10 and
-  §3.3's replay, so the load's reservation holds no G at any landing order and G takes only the
-  `REGION` room the pack and the KV leave. If you read "`FIRST_CONTEXT` calls the same fit" as
-  the load reserving G's admitted bytes, please say so: that would put G ahead of the pack, and
-  the order would need a ruling. Your Qwen §9.3 row can cite `2489d9e85` for the fixed replay.
-  (7) §M64 (a): moua's text reads the deletion of `onednn_graph_scratch_alloc_direct_locked`
-  (`unified-cache.cpp:11721`) as (b2)'s; please state the commit that deletes it, or cite the
-  ticket that does, and moua will cite that. (b1) declines SDPA over the cap, counted, with one
-  WARN per (context, device), and admission declines a layer whose term exceeds the override
-  (§M64 (c)). On Qwen from (b2) the replay may admit few or no layers to SDPA, since master
-  already demotes 5 of 10 KV layers at `-c 4096`.
+  ahead of G too. `FIRST_CONTEXT` calls the same fit (amended, §6.35 m-13 (b): §M67 (b) rules
+  that the load reserves no G, and the question below is withdrawn). The per-layer SDPA
+  fallback's follow-up is tracked as llama.cpp-xqex. **Follow-up (rulings §M64 (b)):**
+  `df9803cb8` still counted G in the first-context head-slot set from (b2), so C9's replay could
+  demote KV for it; the follow-up removes it from the §2.4.3 member table, the bound, the
+  first-context arm, C10 and §3.3's replay, so the load's reservation holds no G at any landing
+  order and G takes only the `REGION` room the pack and the KV leave. If you read
+  "`FIRST_CONTEXT` calls the same fit" as the load reserving G's admitted bytes, please say so:
+  that would put G ahead of the pack, and the order would need a ruling. Your Qwen §9.3 row can
+  cite `2489d9e85` for the fixed replay. (7) §M64 (a): moua's text reads the deletion of
+  `onednn_graph_scratch_alloc_direct_locked` (`unified-cache.cpp:11721`) as (b2)'s; please state
+  the commit that deletes it, or cite the ticket that does, and moua will cite that (amended,
+  §6.35 m-12: answered by §M68 (b), 23mk `8547a22f0` (b2) item 8). (b1) declines SDPA over the
+  cap, counted, with one WARN per (context, device), and admission declines a layer whose term
+  exceeds the override (§M64 (c)). On Qwen from (b2) the replay may admit few or no layers to
+  SDPA, since master already demotes 5 of 10 KV layers at `-c 4096`.
 - **zhcn:** (1) GA (rulings §M60, §M61 (b)): moua marks GA's count unmeasured and cites your GA
-  (`e4f424a`, `llama-cli`, about 1 demoted layer) as its single source. moua states none of your
-  figures, neither GDC3's F nor the compute, and withdraws its −709.4 and 6 layers, which
-  carried `llama-completion`'s 808.0. You cite moua for the +377.5 MiB RUNTIME-floor delta alone
-  (512 MiB floor less GPT-OSS 20B's 134.5 MiB of RUNTIME D terms). moua's own GA terms, at
+  (`e4f424a`, `llama-cli`) as its single source (amended, §6.35 m-4: the count is not restated).
+  moua states none of your figures, neither GDC3's F nor the compute, and withdraws its −709.4
+  and 6 layers, which carried `llama-completion`'s 808.0. You cite moua for the +377.5 MiB
+  RUNTIME-floor delta alone (amended, §6.35 m-16: as an input to the pre-registration only) (512
+  MiB floor less GPT-OSS 20B's 134.5 MiB of RUNTIME D terms). moua's own GA terms, at
   `-c 65536 -ub 1024` and vehicle-independent, are full KV 1536.0, SWA 30.0 and ring rows 180.0
   + 360.0 MiB. (2) moua's C3 default arm is scored against GDC3's zhcn+moua fixpoint point, the
   replay of that run's own input lines (rulings §M61 (a), §M63 (a)). (3) The VOID guard moua
@@ -12691,3 +12983,66 @@ below is at `c69d5774d`; at master `d19308be3` each one above `:40214` is one hi
   mode: each `llama-completion` block's stdout goes to `<log>.out` and its stderr to
   `<log>.err`, the checks read both, and a stdout-only score reads `.out` alone, so GDC8 can
   score its stdout by itself.
+
+### 6.35 Revision 7.14s: design-moua-r26, rulings §M66 to §M68 and §M70
+
+Revision 7.14s is one commit on top of 7.14r (`038f698bd`). It answers design review r26
+(design-moua-r26 on `f2323f9e0..038f698bd`: 0 Critical, 3 Important, 17 Minor, 4 nits; every
+Minor a required fix) and folds rulings §M66 (armed trace lines), §M67 (the Graph scratch after
+the pack and the KV; the load reserves none), §M68 (b) (one owner for the direct path's
+deletion) and §M70 (what a runtime ONEDNN-zone miss does from (b1) on), all dated after
+`038f698bd`. The §6.33 and §6.34 rows and relays it amends are marked in place. Master pin for
+source cites: `e2461d4fb`.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| I-1; §M66 | arms scored env-gated trace lines without setting the variable in the command, or without a trace-live check | **Changed.** C1's command sets `GGML_SYCL_KV_REGION_TRACE=1` beside `GGML_SYCL_EXT_ALLOC_TRACE=1`, and its `[KV-REGION] reserve` line must count exactly 1 (0 is VOID), with the line's format stated (L6's trace). C3's `-ub 1024` ladder run has its own command block with the variable and the count of 1 as its live check. C9 states the arming rule arm by arm: every arm that scores `[EXT-ALLOC]` carries the variable in its literal command; the scoped-miss and unplanned-buffer unit arms end with seam control (2)'s draw in the same process, so their count is exactly that line; the CLI arms (merge gates, default-context, control-vector, state-seq, LoRA) name seam control (2), run as its own child with the variable on the same build in the same session, as their live check. H9 (3) and (4) scored "zero `[EXT-ALLOC]` lines" in a SYCL-free binary, where no emitter exists, so that zero was vacuous: they now score the host model's out-of-range draw counter. The audit found no other scored env-gated line: the `GGML_SYCL_WITNESS_CHECKS` and `GGML_SYCL_HOST_ALLOC_PHASE_GATE` arms set their variable and score a line that must fire, and the (b1)/(b2) decline lines are not env-gated. |
+| I-2; §M70 (d) | the SDPA decline and the replay's admitted and `scratch_unplaced` counts had no scorer | **Changed.** The (b1)/(b2) bullets quote 23mk's three decline formats (`8547a22f0` §4.8, unchanged at `50b1f8f50`), their units and counter, and state that none is env-gated. §3.3's replay names the lines it scores, with greps: 23mk's `[CONTEXT-PLAN] graph scratch declined: ... layers=%u ... reason=scratch_unplaced` (M − A) and an admitted line asked of 23mk, `[CONTEXT-PLAN] graph scratch admitted: ctx=%u dev=%d admitted=%u of %u layers cost=%zu room=%zu` (A of M), printed per (context, device) whenever M > 0 and so its own presence check. The decline line's zero has a positive control, the Qwen pinned B50 arm or, failing that, a fit fixture with room below the smallest term. GPT-OSS pre-registers M = 0. |
+| I-3; §M70 (a)-(c) | the direct overflow stayed reachable from (b1) through a runtime zone miss | **Changed, per §M70.** (b1) replaces the `:11708` call, and the DIRECT pool branch at `:11704` with it, by the TERMINAL `[ZONE-PLAN-BUG]` channel, which allocates nothing; both runtime misses mean the plan is wrong. The decline is decided at planning or admission (`interim_capped`, `interim_capacity`, `scratch_unplaced`), and dispatch reads the admitted decision, never discovering a miss. "Arena not active" never reaches `:11708`: VM draws through 1oxa's `REGION` path, and no zones means no SDPA admission; each route's owner closes it if it can reach `:11708` at the pin. The runtime-miss arm (one byte over the planned peak: one `[ZONE-PLAN-BUG]`, nothing allocated, 134 under STRICT; RED the pre-(b1) tree) is 23mk's, cited and relayed. |
+| m-1 | the 1oxa pin was stale | **Changed.** 1oxa is cited at `68c31f0` (rev 34 follow-up), whose C11 row carries the `kv` line and keeps the W2 row and arm (5). §6.34's "pending r30 fold" row, its n-4 row and relays (2) and (4) are marked amended. |
+| m-2 | C1's block lacked `-lv 4` and the check | **Changed.** C1's command has `-ub 512 -lv 4`, the check at 32768, and the `n_ctx_seq` negative control with its presence check. |
+| m-3 | the VOID check's N came from the run being judged | **Changed**, in the doc and the script together. N is `<arch>.context_length` read from the GGUF header before any GPU work (`merge-gates/gguf-ctx.py`, a stdlib reader: 131072 for GPT-OSS 120B, 262144 for the Qwen gate model, 32768 for Mistral), and an empty read fails the script. `nctx_void N` is VOID unless the padded regex counts exactly 1 at N, the `n_ctx_seq` line is present and the regex counts 0 on it. A startup self-test scores the regex on the three lines as `gptoss120b-b1.log:1968` renders them. Offline: VOID at 131072 on the pinned log (its `n_ctx` is 4096), pass at 4096, VOID for an empty N, VOID with the `n_ctx_seq` lines removed. The script's form before is kept as `run-merge-gates.sh.pre-m714s`. |
+| m-4 | GA's count was restated, and H2's run was a second source | **Changed.** "About 1 demoted layer" is gone from §2.4.1, C7 and the §6.34 row and relay (marked amended); GA's count is zhcn GA's alone. H2's run of `kv_region_fit` is this design's check of its fit rule against zhcn's number, relayed on disagreement, never a second source. |
+| m-5 | §6.33's amendment contradicted C3 and §6.34 m-3 (b) | **Changed.** It now reads: scored against GDC3's zhcn+moua fixpoint point, the replay of the run's own input lines, and GA cites zhcn GA, not GDC3's F. |
+| m-6; §M63 (a) | §3.3's "must print exactly those numbers" was a second verdict rule beside C3's | **Changed.** The rule applies only to arms whose pre-registration is §3.3's replay; C3's default arm (GDC3's fixpoint replay) and C7's GA and GH default arms (zhcn's rows) are scored by their own rule alone. |
+| m-7; §M61 (c) | the state-seq scatter pin of 256 was filed as an exemption | **Changed.** 256 is the generated models' `n_ctx_train` (`tests/test-llama-archs.cpp:247`, written at `:309`), and single-model mode sets `kv_unified` (`tests/test-save-load-state.cpp:907-909`; the case sets it too, `:464`), so the scatter case is default-context and carries the check at N = 256. The exemption entry is removed. |
+| m-8 | the graph-site census covered `ggml-sycl.cpp` only | **Changed.** `unified-kernel.cpp`'s six finalizes and eleven submits are named (the benchmark's ten and five, `record_micro_graph`'s `:10876` and the production MICRO-GRAPH submit at `:10928`), identical at `c69d5774d` and `e2461d4fb`, and all are wrapped. H7z's raw-call rule scopes every file under `ggml/src/ggml-sycl/`, with one allowlisted site, `fattn-onednn.cpp:868`'s oneDNN Graph API finalize. |
+| m-9 | the generation object's storage lifetime was unstated | **Changed.** A zero count releases the generation's charge, never its record. Records live in the owning entry's list, with stable addresses, never freed or reused while the entry lives; the entry is held by the store and by each generation with a non-zero count, so any record a draw can load is live. |
+| m-10 | Form M's one-second cap would abort correct slow work | **Changed.** Each waiter kernel is capped at C, half the engine's xe `job_timeout_ms` (the one hard bound, since a longer spin resets the GT), and the use submits a chain of K = ⌈2 T / C⌉ waiters, T the worst predecessor tail G0's new F3 cell measures on the gate shapes (the longest replayed graph plus one ubatch's `host_task` backlog). Only the chain's last waiter faults, counting `w_order_wait_exhausted`. The cost is K + 1 single-work-item kernels per use. |
+| m-11; §M60 (b) | arms did not name the ubatch | **Changed.** §3.3 states the rule: every arm pins `-ub 512`, since the SYCL auto-ubatch trial runs only when `-ub` is unpinned (`src/llama-context.cpp:1011-1040` at `e2461d4fb`). C1, C2, C2a, C5, C8, the Mistral controls, the control-vector and LoRA arms carry it. The one exception is C3's default arm, which runs GDC3's `llama-cli` command with no `-ub` and names `n_ubatch` 512 from GDC3. |
+| m-12; §M68 (b) | the deletion of the direct path was hedged in three places | **Changed.** One citation: 23mk `8547a22f0` (b2) item 8 deletes it with its reuse pool and test hooks. The (b1), (b2) and "not moua's" bullets say so, and §6.34's relay (7) is marked answered. |
+| m-13; §M67 (b) | the zone-class table's `CONTEXT` row still listed the Graph scratch among the reserved slots; the relay still asked 23mk how to read "`FIRST_CONTEXT` calls the same fit" | **Changed.** The `CONTEXT` row now names the Graph scratch as its one exception: not a reserved head slot, but charged by the context's fit after the KV extents, per device-resident attention layer. A1 and the first-context reservation cite §M67 (b): the load reserves no G, and the reservation's sum skips the `AFTER_KV` record by kind. §6.34's relay (6) is marked amended, and the question is withdrawn. |
+| m-14 | a blank line split the §2.4.3 member table | **Changed.** Deleted; the recurrent-state row and the three sum rows render in the table again. |
+| m-15 | the 512-fallback note conflated two mutants | **Changed.** (a) the envelope-level fallback is the precondition's VOID, not a RED; (b) the reservation-internal fallback is caught by G's exact ONEDNN bytes before (b2), has no byte consequence from (b2) until zhcn's compute measure lands, and is then caught by the compute slot's bytes at 512 against 4096, which the arm pre-registers once the measure exists. |
+| m-16 | the +377.5 MiB delta was stated without restriction | **Changed.** In GA and in the zhcn relay: +377.5 is an input to the pre-registration only (predicted zone 13715.5 MiB = 13338.0 + 377.5). A replay of a run on moua's tree reads that run's own shared-zone line and never adds 377.5 to it. |
+| m-17; §M67 (a) | the Qwen gate set had no PP and no SDPA counts | **Changed.** C9 gains the Qwen xqex baseline: both cards, pinned (`-c 4096`) and default-context arms, four serial runs with `-ub 512 -lv 4`, a fixed 512-token prompt file, `-no-cnv -n 1`. Each records PP tokens per second, the prompt's token count, A of M, M − A, the demotion count, rc and the host load. PP is a record for xqex's interleaved pairs, not a gate; A and M − A are scored against the replay per card. |
+| n-1 | stray indents in C3's block | **Changed.** C3's command and control lines, and C8's command, are at the block's indent. |
+| n-2 | the ABRT cite was stale | **Changed.** Cited by name, the script's `ABRT=` line. The merge-gate block cites move to `:115` and `:125` at 7.14s. |
+| n-3 | C7 named only GA's default arm | **Changed.** GH's default arm is zhcn GDC6 (`5e0ffae`): `llama-completion` on the B50, no `-c`, `n_ctx` 262144, STRICT. |
+| n-4 | a blank bullet in the exemption list | **Changed.** Deleted, with a second one the same edit exposed. |
+
+**Relays.**
+- **23mk:** (1) Please add one WARN per (context, device) with at least one SDPA-routed
+  device-KV candidate, printed whether or not any layer declined, at the fit's commit, beside
+  your decline line: `[CONTEXT-PLAN] graph scratch admitted: ctx=%u dev=%d admitted=%u of %u
+  layers cost=%zu room=%zu`. Your decline line prints only when a layer is left out, so without
+  it the admitted count A has no scorer (rulings §M70 (d)); moua's §3.3 replay and your Qwen
+  §9.3 row score both. If you decline, moua scores A as M minus your `layers` and records the
+  missing witness on the ticket. (2) moua cites your `8547a22f0` (b2) item 8 as the one owner of
+  the direct path's deletion (rulings §M68 (b)) and quotes your three decline formats as they
+  stand at `50b1f8f50`. (3) The runtime-miss arm (rulings §M70 (a)): a draw one byte over the
+  planned within-ubatch peak prints `[ZONE-PLAN-BUG]` once, allocates nothing, and exits 134
+  under STRICT, with the pre-(b1) tree as its RED. moua reads it as part of your H3 "(b1)'s
+  interim G" arm; please confirm or name the arm that carries it. (4) Your Qwen row can cite
+  7.14s for the scorer lines; the replay itself is unchanged since `2489d9e85`.
+- **1oxa:** (1) moua cites you at `68c31f0` (rev 34 follow-up), whose C11 row is the single
+  source for the `kv` line, with your W2 row and arm (5). (2) Rulings §M70 (c): on a VM device
+  the Graph scratch draws through your `REGION` path, so a VM Graph draw never reaches
+  `unified-cache.cpp:11708`; if your route can reach it at the pin, closing it is yours.
+- **zhcn:** (1) Rulings §M70 (d) and moua's §3.3: the admitted and `scratch_unplaced` lines are
+  23mk's; nothing changes for your rows. (2) The +377.5 MiB delta you cite from moua is an
+  input to the pre-registration only (the predicted zone, 13715.5 MiB). A replay of a run on
+  moua's tree reads that run's own shared-zone line, which already carries it, and adds
+  nothing (r26 m-16; your r30 m-3). (3) The VOID guard's N is now read from the GGUF header
+  before the run, and `run-merge-gates.sh` does so (`merge-gates/gguf-ctx.py`); GDC8 inherits
+  it.
