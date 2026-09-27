@@ -73,9 +73,9 @@ void llama_moe_profile::reset() {
     total_tokens_profiled = 0;
 }
 
-void llama_moe_profile::update(uint32_t il, const int32_t * expert_ids, int n_tokens) {
+void llama_moe_profile::update(uint32_t il, const int32_t * expert_ids, int n_tokens, int n_expert_used_il) {
     if (il < layer_stats.size()) {
-        layer_stats[il].update(expert_ids, n_tokens, n_expert_used);
+        layer_stats[il].update(expert_ids, n_tokens, n_expert_used_il);
         // only count tokens once (use layer 0 as reference)
         if (il == 0) {
             total_tokens_profiled += n_tokens;
@@ -298,8 +298,8 @@ void llama_moe_profiler::init(const struct llama_hparams & hparams) {
         return;
     }
 
-    profile.init(hparams.n_layer(), hparams.n_expert, hparams.n_expert_used);
-    read_buffer.reserve(4096 * hparams.n_expert_used); // pre-allocate for typical batch
+    profile.init(hparams.n_layer(), hparams.n_expert, hparams.n_expert_used_max());
+    read_buffer.reserve(4096 * hparams.n_expert_used_max()); // pre-allocate for typical batch
 }
 
 void llama_moe_profiler::schedule_capture(uint32_t il, struct ggml_tensor * expert_ids,
@@ -307,6 +307,10 @@ void llama_moe_profiler::schedule_capture(uint32_t il, struct ggml_tensor * expe
     if (!enabled || expert_ids == nullptr) {
         return;
     }
+    // flush() reads the ids as packed rows of ne[0]; a strided view (such as
+    // the one ggml_argsort_top_k returns) has rows nb[1] apart and more bytes
+    // than elements, so it would be misread and overflow the read buffer
+    GGML_ASSERT(ggml_is_contiguous(expert_ids));
 
     pending_reads.push_back({il, expert_ids, n_tokens, n_expert_used});
 }
@@ -319,8 +323,9 @@ void llama_moe_profiler::flush(struct ggml_backend * backend) {
     }
 
     for (const auto & read : pending_reads) {
-        // The tensor has shape [n_expert_used, n_tokens] from ggml_argsort_top_k
-        // Total elements = tensor->ne[0] * tensor->ne[1]
+        // The tensor has shape [n_expert_used, n_tokens] and is contiguous
+        // (schedule_capture() refuses anything else), so its bytes are its
+        // elements and each row is ne[0] ids
         const size_t n_elements = ggml_nelements(read.tensor);
         const size_t tensor_size = ggml_nbytes(read.tensor);
 
@@ -331,13 +336,12 @@ void llama_moe_profiler::flush(struct ggml_backend * backend) {
         // synchronous read from device
         ggml_backend_tensor_get(read.tensor, read_buffer.data(), 0, tensor_size);
 
-        // update profile - tensor layout is [n_expert_used, n_tokens]
-        // so we need to read n_tokens * n_expert_used elements
+        // update profile - the row width is this layer's own expert count:
+        // n_expert_used is per layer, so the profile-wide value is only the
+        // maximum
         const int n_tokens = read.tensor->ne[1];
         const int n_expert_used = read.tensor->ne[0];
-        profile.update(read.il, read_buffer.data(), n_tokens);
-
-        GGML_UNUSED(n_expert_used); // used for documentation
+        profile.update(read.il, read_buffer.data(), n_tokens, n_expert_used);
     }
 
     pending_reads.clear();

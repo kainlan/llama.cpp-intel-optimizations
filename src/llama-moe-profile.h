@@ -45,8 +45,9 @@ struct llama_moe_profile {
     // reset all statistics
     void reset();
 
-    // update statistics with expert selection from a layer
-    void update(uint32_t il, const int32_t * expert_ids, int n_tokens);
+    // update statistics with expert selection from a layer; expert_ids holds
+    // n_tokens rows of that layer's own n_expert_used_il ids
+    void update(uint32_t il, const int32_t * expert_ids, int n_tokens, int n_expert_used_il);
 
     // analyze usage and determine placement
     // gpu_fraction: 0.0-1.0, fraction of experts to keep on GPU per layer

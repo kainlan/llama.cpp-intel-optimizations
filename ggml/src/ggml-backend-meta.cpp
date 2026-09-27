@@ -1169,7 +1169,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
-    GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
 }
@@ -1201,11 +1200,6 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     for (size_t j = 0; j < n_simple_bufs; j++) {
         ggml_context          * simple_ctx = stc.ctxs[j].get();
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
-
-        if ((simple_buf != nullptr) && ggml_backend_buffer_is_multi_buffer(simple_buf)) {
-            // see https://github.com/ggml-org/llama.cpp/issues/22197
-            GGML_ABORT("multi buffers are not supported by the meta backend");
-        }
 
         if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
             // TODO: the following assert fails for llama-parallel even though the results are correct:
@@ -1254,13 +1248,31 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 }
             }
         }
+        // TODO: revisit once the graph allocator has been refactored, see https://github.com/ggml-org/llama.cpp/pull/25051#issuecomment-4842873396
+        ggml_backend_buffer_t init_buf = simple_buf;
         if (t_ij->view_src != nullptr) {
             t_ij->data = (char *) t_ij->view_src->data + t_ij->view_offs;
+            // views inherit the source slice's concrete sub-buffer (issue 22197)
+            if (tensor->view_src != nullptr && ggml_backend_buffer_is_meta(tensor->view_src->buffer)
+                    && t_ij->view_src->buffer != nullptr) {
+                t_ij->buffer = t_ij->view_src->buffer;
+                init_buf     = t_ij->view_src->buffer;
+            }
         } else if (simple_buf != nullptr) {
+            if (ggml_backend_buffer_is_multi_buffer(simple_buf)) {
+                GGML_ABORT("multi buffers are not supported by the meta backend");
+            }
             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
                 + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer));
         }
-        t_ij->extra = tensor->extra;
+
+        if (init_buf) {
+            // the backend that owns the buffer will set .extra
+            ggml_backend_buffer_init_tensor(init_buf, t_ij);
+        } else {
+            t_ij->extra = tensor->extra;
+        }
+
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             t_ij->src[i] = tensor->src[i];
             if (tensor->src[i] == tensor) {
@@ -1668,6 +1680,16 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
 
 bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
+}
+
+void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
+    GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
+    for (size_t i = 0; i < buf_ctx->bufs.size(); i++) {
+        if (buf_ctx->bufs[i]) {
+            ggml_backend_buffer_set_usage(buf_ctx->bufs[i].get(), usage);
+        }
+    }
 }
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
