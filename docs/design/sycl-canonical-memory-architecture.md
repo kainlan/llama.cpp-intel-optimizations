@@ -1868,13 +1868,22 @@ python3 scripts/audit-sycl-static-storage.py
 python3 scripts/audit-sycl-static-storage.py --check
 ```
 
-The staleness gate is `python3 scripts/audit-sycl-static-storage.py --check`
-(rc 0 current, rc 1 stale, rc 2 fail-closed recovery-coverage rejection). The
-registered ctest `test-sycl-static-storage-audit` runs that comparison against
-the committed `docs/backend/sycl-static-storage-inventory.csv` and fails on any
-drift (llama.cpp-ldvb), so a change that moves any census input must regenerate
-the CSV in the same change. The gate parses the working tree, so an uncommitted
-edit to a census input in a shared checkout turns it red.
+The staleness gate is
+`python3 scripts/audit-sycl-static-storage.py --check-classification` (rc 0
+same objects and classification, rc 1 drift, rc 2 fail-closed
+recovery-coverage rejection). The registered ctest
+`test-sycl-static-storage-audit` runs it against the committed
+`docs/backend/sycl-static-storage-inventory.csv` (llama.cpp-6upb). What it
+protects is the multiset of rows projected to `file`, `scope`, `symbol`,
+`type`, `mutability`, `synchronization`, `owner_identity` and the category of
+`reset_teardown_disposition`: the set of static-storage objects and how each is
+classified. An added, removed or reclassified object fails it and is named in
+the output, so such a change must regenerate the CSV in the same change. Line
+positions and lexical evidence are not protected; a line-only drift passes
+with a note. The byte-exact `--check` (rc 1 stale) is the regen verifier used
+by the audit sequence above. The gate parses the working tree, so an
+uncommitted edit that adds, removes or reclassifies a static in a shared
+checkout turns it red.
 
 Closed prerequisite `hcyp` owns only the already-merged self-test line-drift
 repair. After `otry` and `hcyp`, `jwy4` owns the final script and fixture

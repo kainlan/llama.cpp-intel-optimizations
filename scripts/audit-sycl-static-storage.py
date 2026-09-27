@@ -5,11 +5,22 @@ Pinned parser dependencies:
   tree-sitter==0.25.2
   tree-sitter-language-pack==1.8.1 (C++ grammar ABI 15)
 
-Exit codes: 0 = census/self-test succeeded (--check: inventory matches HEAD);
-1 = --check found the inventory stale (regenerate without --check); 2 = the
-fail-closed recovery-coverage census rejected the parse (a declaration the
-parser cannot prove safe -- read the printed file:line:reason and either fix
-the declaration or extend the recognized recovery patterns).
+Two verification modes, neither of which writes:
+  --check-classification  the ctest gate. Compares the multiset of rows
+      projected to CLASSIFICATION_COLUMNS: which static objects exist and how
+      each is classified. The line column, the evidence columns and the
+      reset-candidate excerpts in the disposition are informational, so a
+      line-only drift passes with a note.
+  --check  the regen verifier. Requires the rendered CSV byte-for-byte.
+
+Exit codes: 0 = census/self-test succeeded (--check: inventory matches HEAD
+byte-for-byte; --check-classification: same objects, same classification);
+1 = the inventory is stale (--check) or classification drift was found
+(--check-classification; the added/removed rows are printed) -- regenerate
+without either flag; 2 = the fail-closed recovery-coverage census rejected the
+parse (a declaration the parser cannot prove safe -- read the printed
+file:line:reason and either fix the declaration or extend the recognized
+recovery patterns).
 
 Do NOT pipe --check into `tail`/`head`/etc: `$?` after a pipe reports the
 LAST command's exit status, not this script's, so `--check | tail` silently
@@ -43,6 +54,13 @@ COLUMNS = (
     "file", "line", "symbol", "type", "scope", "mutability", "synchronization",
     "writer_evidence", "reader_evidence", "owner_identity", "reset_teardown_disposition",
 )
+# The identity and classification of a row: what --check-classification
+# compares. Everything else in COLUMNS moves when an unrelated line does.
+CLASSIFICATION_COLUMNS = (
+    "file", "scope", "symbol", "type", "mutability", "synchronization",
+    "owner_identity", "reset_teardown_disposition",
+)
+RESET_CANDIDATE_MARKER = "unscoped lexical reset candidate"
 DECL_KINDS = {"declaration", "field_declaration"}
 DECLARATOR_KINDS = {
     "identifier", "field_identifier", "init_declarator", "pointer_declarator",
@@ -889,6 +907,33 @@ def classify(row, reset_candidates):
     return "immutable binding" if immutable else "mutable", synchronization, owner, disposition
 
 
+def classification_key(row):
+    """Project a rendered row to CLASSIFICATION_COLUMNS. The disposition keeps
+    its category but not the `L<n>:` reset-candidate excerpts after it, which
+    are unscoped lexical evidence like the writer/reader columns."""
+    disposition = row["reset_teardown_disposition"]
+    category, marker, _ = disposition.partition(RESET_CANDIDATE_MARKER)
+    projected = dict(row, reset_teardown_disposition=category + marker if marker else disposition)
+    return tuple(projected[column] for column in CLASSIFICATION_COLUMNS)
+
+
+def classification_drift(committed_rows, current_rows):
+    """Return (added, removed) Counters of projected rows. A multiset, not a
+    set: one scope can hold several same-named, same-typed statics."""
+    committed = Counter(map(classification_key, committed_rows))
+    current = Counter(map(classification_key, current_rows))
+    return current - committed, committed - current
+
+
+def format_classification_drift(added, removed):
+    lines = []
+    for label, rows in (("added", added), ("removed", removed)):
+        for key, count in sorted(rows.items()):
+            fields = " ".join(f"{column}={value}" for column, value in zip(CLASSIFICATION_COLUMNS, key))
+            lines.append(f"  {label} x{count}: {fields}")
+    return "\n".join(lines)
+
+
 def get_parser_checked():
     found_pack, found_ts = version("tree-sitter-language-pack"), version("tree-sitter")
     if (found_pack, found_ts) != (PARSER_PACK_VERSION, TREE_SITTER_VERSION):
@@ -1228,8 +1273,9 @@ def main():
     ap = argparse.ArgumentParser(
         description=(
             "Generate/verify the parser-grade SYCL static-storage census. "
-            "Exit codes: 0 success, 1 --check found stale inventory, 2 fail-closed "
-            "recovery-coverage rejection. Do not pipe --check into tail/head -- "
+            "Exit codes: 0 success, 1 --check found stale inventory or "
+            "--check-classification found classification drift, 2 fail-closed "
+            "recovery-coverage rejection. Do not pipe either check into tail/head -- "
             "`$?` after a pipe reports the pipeline's LAST command, not this "
             "script's; capture `--check; echo rc=$?` or read ${PIPESTATUS[0]} instead."
         )
@@ -1244,9 +1290,20 @@ def main():
             "`$?` after a pipe is the last pipeline command's status, not this one's."
         ),
     )
+    ap.add_argument(
+        "--check-classification", action="store_true",
+        help=(
+            "Verify the checked-in inventory lists the same static objects with the same "
+            "classification as a fresh parse (line and evidence columns ignored); do not "
+            "write. rc=0 same (a line-only drift prints a note), rc=1 drift (rows named), "
+            "rc=2 fail-closed rejection."
+        ),
+    )
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     args = ap.parse_args()
+    if args.check and args.check_classification:
+        ap.error("--check and --check-classification are separate gates; pass one")
     if args.self_test:
         self_test(parser)
         return 0
@@ -1292,6 +1349,24 @@ def main():
         if not output.exists() or output.read_text(encoding="utf-8") != rendered:
             print(f"ERROR: {args.output} is stale; regenerate without --check", file=sys.stderr)
             return 1
+    elif args.check_classification:
+        committed = output.read_text(encoding="utf-8") if output.exists() else ""
+        committed_reader = csv.DictReader(StringIO(committed))
+        if tuple(committed_reader.fieldnames or ()) != COLUMNS:
+            print(f"ERROR: {args.output} is missing or its header is not {','.join(COLUMNS)}; "
+                  "regenerate without --check-classification", file=sys.stderr)
+            return 1
+        added, removed = classification_drift(committed_reader, csv.DictReader(StringIO(rendered)))
+        if added or removed:
+            print(f"ERROR: {args.output} classification drift: {sum(added.values())} row(s) added, "
+                  f"{sum(removed.values())} removed (line and evidence columns ignored); regenerate "
+                  "without --check-classification and review these rows:", file=sys.stderr)
+            print(format_classification_drift(added, removed), file=sys.stderr)
+            return 1
+        if committed != rendered:
+            print(f"NOTE: {args.output} line/evidence columns differ from the current sources; "
+                  "informational only (objects and classification match). Regenerate without "
+                  "--check-classification to refresh them.")
     else:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(rendered, encoding="utf-8")

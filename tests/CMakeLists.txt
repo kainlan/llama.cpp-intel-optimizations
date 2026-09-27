@@ -1357,16 +1357,22 @@ if (NOT WIN32)
         set(LLAMA_PYTHON3 python3)
     endif()
 
-    # Parser census gate: runs `scripts/audit-sycl-static-storage.py --check`
-    # against the COMMITTED inventory and fails on any drift, with a planted
-    # stale row as its positive control. It also establishes a freshly
-    # generated matching inventory, proves --check accepts it, then line-shifts
-    # an input and proves --check rejects drift without rewriting the snapshot.
-    # The plain unittest script exits 77 when g++ or pinned parser packages are
-    # unavailable, so dependency absence is visible as Skipped rather than a
-    # vacuous pass. Each census parse costs about a CPU-minute and the test runs
-    # five, so TIMEOUT allows for this host's permanent load (one parse took
-    # 6 min wall at load average ~125).
+    # Parser census gate: runs `scripts/audit-sycl-static-storage.py
+    # --check-classification` against the COMMITTED inventory. It fails when a
+    # static object is added, removed or reclassified, and passes a line-only
+    # drift with a note (llama.cpp-6upb): line and evidence columns move with
+    # every unrelated SYCL edit. Its positive control is a planted
+    # reclassified row; a planted line shift is the control that it passes.
+    # It also generates a matching inventory in a temp tree and proves, on
+    # copies of it, that a blank line near the top of an input passes
+    # --check-classification while the byte-exact --check (the regen verifier)
+    # still rejects it, and that an added namespace-scope static fails
+    # --check-classification by name. The plain unittest script exits 77 when
+    # g++ or pinned parser packages are unavailable, so dependency absence is
+    # visible as Skipped rather than a vacuous pass. Each census parse costs
+    # about a CPU-minute; the test runs nine in three concurrent waves, so
+    # TIMEOUT allows for this host's permanent load (one parse took 6 min wall
+    # at load average ~125).
     llama_test_cmd(
         ${LLAMA_PYTHON3}
         NAME test-sycl-static-storage-audit
