@@ -55,11 +55,14 @@ never reads the repository census inputs or the checked-in inventory, so it is
 independent of source-tree and line-number drift (including running at a newer
 integration HEAD). Generation is the refresh operation, and `--check` is the
 staleness gate: it parses the current inputs and requires their rendered census
-to match the checked-in CSV byte-for-byte. Under the pinned audited-commit
-policy, a newer source commit is therefore allowed to pass `--self-test` while
-`--check` reports that the audited snapshot needs an explicitly reviewed
-refresh. Do not treat a green self-test as evidence that the inventory is
-current, and do not suppress `--check` drift by weakening its comparison.
+to match the checked-in CSV byte-for-byte. The registered ctest
+`test-sycl-static-storage-audit` runs that `--check` comparison against the
+committed CSV and fails on any drift (llama.cpp-ldvb; before that it only
+checked a freshly generated temp copy, so the committed CSV drifted 2,785 lines
+unnoticed). A change that moves any of the five inputs must therefore
+regenerate the CSV in the same change. Do not treat a green self-test as
+evidence that the inventory is current, and do not suppress `--check` drift by
+weakening its comparison.
 
 The generator pins and checks the C++ grammar ABI 15 through
 `tree_sitter_language_pack` 1.8.1 and `tree-sitter` 0.25.2; it fails on a
@@ -354,11 +357,12 @@ separate positive controls) are canonical §12.9. Multiple LIVE
 models and sequential A→B→A are separate gates; neither proves overlapping
 execution, which must serialize/reject through per-device aggregate roots.
 
-**Census status now:** the checked-in inventory remains the historical
-`5793f2ca1089eaf27203ee171c0d73d60a3e4c83` snapshot described above. On this
-worktree, `python3 scripts/audit-sycl-static-storage.py --check` reports it stale.
-That is expected before implementation and is an explicit open gate, not a pass.
-`jwy4` must run, at final source HEAD:
+**Census status (historical, pre-`jwy4`):** the checked-in inventory was then
+the `5793f2ca1089eaf27203ee171c0d73d60a3e4c83` snapshot, and
+`python3 scripts/audit-sycl-static-storage.py --check` reported it stale. `jwy4`
+has since regenerated it; the current audited commit and counts are in the
+census section above, and `test-sycl-static-storage-audit` now fails ctest
+whenever `--check` does. `jwy4` ran, at final source HEAD:
 
 ```sh
 python3 scripts/audit-sycl-static-storage.py --self-test

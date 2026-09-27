@@ -1868,6 +1868,13 @@ python3 scripts/audit-sycl-static-storage.py
 python3 scripts/audit-sycl-static-storage.py --check
 ```
 
+The staleness gate is `python3 scripts/audit-sycl-static-storage.py --check`
+(rc 0 current, rc 1 stale). The registered ctest `test-sycl-static-storage-audit`
+runs that comparison against the committed
+`docs/backend/sycl-static-storage-inventory.csv` and fails on any drift
+(llama.cpp-ldvb), so a change that moves any census input must regenerate the
+CSV in the same change.
+
 Closed prerequisite `hcyp` owns only the already-merged self-test line-drift
 repair. After `otry` and `hcyp`, `jwy4` owns the final script and fixture
 adjustments plus generated CSV and this audit's commit/hash/count prose as one
