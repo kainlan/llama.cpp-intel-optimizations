@@ -124,7 +124,8 @@ Design, revision 7.14m. Author: impl-moua, 2026-09-27. The revisions answer twen
   (§M46b), zhcn r20 (§Z28) and zhcn 5.20.
 - design review r20 (design-moua-r20 on `bc80a697f..916ee34d5`: 0 Critical, 4 Important, 14
   Minor), the lead's rulings on it (§M47) and the lead's addendum on m-13 and m-14, recorded in
-  §6.29. Revision 7.14m is one commit on top of 7.14l's follow-up (`916ee34d5`).
+  §6.29. Revision 7.14m is two commits on top of 7.14l's follow-up (`916ee34d5`):
+  `263bf7ad9` and a follow-up for the lead's §M47a, which scopes §M47 I-1.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -136,7 +137,7 @@ one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2,
 §M24, §M25, §V13, §M26, §M27, §M26a, §M28, §M29, §M29a, §V14, §M30, §M31, §M31a, §M32, §M33,
 §V15, §V15a, §V16, §V16a, §M34, §M35, §G1, §G1a, §V17, §M36, §M37, §Z20, §M38, §G1b, §M39, §G1c,
 §M40, §M41, §Z-23mk-411, §M42, §Z21, §Z23, §Z22, §M43, §M44, §Z24, §Z26, §M45, §M46, §M46b,
-§Z28, §M47). §M11a is a
+§Z28, §M47, §M47a). §M11a is a
 relay line inside §Z8, not a section, and is cited as §Z8 I-2 (r12 m-14). This document cites it
 as "rulings §X".
 **Where this document paraphrases a ruling and differs from the file, the file wins.**
@@ -2832,8 +2833,20 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         `ensure_planned_arena_zones`, `:4338`, into `arena_reserve`, `:4624`), the cache is
         built lazily at first touch (`:14706-14719`), which the leg itself makes
         (`ggml-sycl.cpp:37638`), and `gptoss120b-b1-2026-09-17.log:57-58` prints "Active on
-        device 0" before any plan exists (r20 I-1). So L4+L6, on a planned device (rulings
-        §M44 I-1, §M47 I-1; r18 I-1):
+        device 0" before any plan exists (r20 I-1). **Two predicates, one fact each (rulings
+        §M47a).** The planned predicate, above, decides one thing: whether the leg refuses or
+        serves a SYCL<n> device buffer, that is, the scope dispatch, the deleted
+        `should_use_runtime` block, the unplanned line and C9's no-model control. The device's
+        backing classification is a different fact and keeps the arena predicate,
+        `arena_active()`: whether the device's arena is VM- or USM-backed, and zhcn's
+        `ggml_sycl_arena_chunk_cap`, which zhcn's (a)/(b)/(c)/freeze branch reads. That fact
+        must hold before any plan exists: at stage (a) of a process's first model, at the first
+        context's freeze, and on zhcn's mock VM devices. Keyed on the ledger, it would put stage
+        (a) on the USM `min(2 GiB, A)` cap and fire the refusal that cap guards on a correct
+        tree. 7.14m moved only the leg's rules to the planned predicate; this document's other
+        "arena device" rules (the zone layout, RUNTIME's floor, the ring's deletions, the
+        charging sites) keep the arena predicate. So L4+L6, on a planned device (rulings §M44
+        I-1, §M47 I-1; r18 I-1):
         - **makes the claim scope the leg's only discriminator.** The buffer's role cannot be
           one: `alloc_role` (`:37618-37620`) is `WEIGHT` for every SYCL<n> buffer whose buffer
           type is not a `_Compute` one, which covers the scheduler's compute buffers, the
@@ -8929,7 +8942,8 @@ zhcn 5.16).**
   returning on every path before `:37769`, with the scoped-miss line, so the tail at
   `:37778-37873` is unreachable for a SYCL<n> device buffer on a planned device (rulings §M46
   I-1 (a)), a device being planned while the ledger holds a record on it, never by
-  `arena_active()` (rulings §M47 I-1); context-owned homes for the control vector and the
+  `arena_active()` (rulings §M47 I-1), while the backing classification keeps the arena
+  predicate (rulings §M47a); context-owned homes for the control vector and the
   on-device state-seq buffers; the LoRA extension transaction, the exported
   `ggml_backend_sycl_model_extend_begin` / `_end` pair with its `lora` scope, the fourth
   measure while no context of the model exists, the `[CONTEXT-PLAN]` compute refusal on an
@@ -10987,9 +11001,11 @@ r20 (design-moua-r20 on `bc80a697f..916ee34d5`: 0 Critical, 4 Important, 14 Mino
 - **zhcn:** a fourth call site of the one measure: the LoRA extension, with the adapters
   attached, while no context of the model exists on the device. The `[CONTEXT-PLAN] compute ...
   (refused)` line on an adapter's re-reserve goes through the context transaction. The leg's
-  planned-device predicate is the ledger, not `arena_active()`. zhcn's compute scope is keyed
-  the same way. The pack-capacity seam gains `ggml_sycl_test_clear_pack_capacity(dev)`, and 0
-  is a valid capacity.
+  planned-device predicate is the ledger, not `arena_active()`, for the leg's refuse-or-serve
+  decision only. The backing classification and `ggml_sycl_arena_chunk_cap`, which zhcn's
+  (a)/(b)/(c)/freeze branch reads, keep the arena predicate (rulings §M47a, which corrects
+  this relay's first form in `263bf7ad9`: "zhcn's compute scope is keyed the same way"). The
+  pack-capacity seam gains `ggml_sycl_test_clear_pack_capacity(dev)`, and 0 is a valid capacity.
 - **23mk:**
   - device entries are charged once at their size;
   - a swap retires the consumer's copy at the commit, and the old backing counts as retiring
@@ -11002,3 +11018,14 @@ r20 (design-moua-r20 on `bc80a697f..916ee34d5`: 0 Critical, 4 Important, 14 Mino
 - **Tickets llama.cpp-6qou and llama.cpp-mogf:** L4+L6 adds the clip throw and the ggml-opt
   named abort. Each ticket's landing removes its own guard.
 - **fkpg:** the `n_ctx=512` RED row is what fkpg (a) → L4 prevents.
+
+**The follow-up commit (rulings §M47a, raised by zhcn).** It scopes §M47 I-1: the ledger's
+planned predicate replaces `arena_active()` only in the leg's refuse-or-serve decision for
+SYCL<n> device buffers.
+
+| item | ruling | disposition |
+|---|---|---|
+| §M47a | the device's backing classification (VM or USM, zhcn's `ggml_sycl_arena_chunk_cap`) stays a property of the device's arena, true before any plan: at stage (a) of a process's first model, at the first context's freeze and on mock VM devices; keying it on the ledger would put (a) on the USM `min(2 GiB, A)` cap and fire a refusal on a correct tree | **Changed.** The leg passage names both predicates and their readers. The planned predicate (the ledger) is read by the scope dispatch, the deleted `should_use_runtime` block, the unplanned line and C9's no-model control. The arena predicate (`arena_active()`) is read by the backing classification, the chunk cap and zhcn's (a)/(b)/(c)/freeze branch. The document's other "arena device" rules keep the arena predicate. The §4 leg bullet says the same. The zhcn relay above is corrected; its first form said zhcn's compute scope was keyed on the ledger. |
+
+**Relay.** zhcn: the backing classification, the chunk cap and the (a)/(b)/(c)/freeze branch
+stay on the arena predicate; only the leg's refuse-or-serve decision moves to the ledger.
