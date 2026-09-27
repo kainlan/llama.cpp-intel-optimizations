@@ -1,8 +1,9 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 3 (folds design-5efe-r1, including its addendum, under
-lead rulings §F1, §F2 and §F2a, plus the th32 r15 m-4 mlock item and the §M49
-note that the lazy-range record lands in C1), not implemented. Tracker: `llama.cpp-5efe`.
+*Status: DESIGN rev 3a (folds design-5efe-r1, including its addendum, under
+lead rulings §F1, §F2 and §F2a with §F2a I-9 addendum 2, plus the th32 r15 m-4
+mlock item and the §M49 note that the lazy-range record lands in C1), not
+implemented. Tracker: `llama.cpp-5efe`.
 Written 2026-09-27 against branch `task/5efe` at `69e70c715` (= master). Every
 cite without a revision prefix is to that tree. `gs` is
 `ggml/src/ggml-sycl/ggml-sycl.cpp`, `uc` is
@@ -17,10 +18,11 @@ Sibling designs this one interfaces with, and does not restate:
 
 - `llama.cpp-th32`: STORAGE tier for lazy row tables,
   `docs/design/sycl-storage-tier-lazy-tables.md`, abbreviated **th32**.
-  Pinned at its latest reviewed head, **rev 2r `df6e83b3b`** (r17 found nits
-  only). Rev 2s, `f364952d3`, folds those nits and §F2a I-9: its inventory
-  reads byte ranges from this design's lazy-range record (§3.1). Section
-  numbers cited here are the same in both.
+  Pinned, per the lead, at **rev 2q `1646da864`**. Rev 2s, `f364952d3`, is
+  under review as r18. It folds §F2a I-9, and its §4.1 inventory reads each
+  table's (file, offset, size) from this design's lazy-range record (§3.1).
+  §3.1's interface is written to match what 2s consumes. Section numbers cited
+  here are the same in 2q and 2s.
 - `llama.cpp-7v5c`: host-only plan dry-run.
 - `llama.cpp-rnh3`: exact host WEIGHT bytes.
 - `llama.cpp-sgc5`: one zone set per plan.
@@ -284,8 +286,10 @@ The lead asked whether `Host staging zone ... per_inflight=103762.3 MB`
 - Both configure lines carry `STAGING=1719.2 MB` (`run2.log:2893`, `:2899`).
 
 So it is a plan-time figure that was never committed. th32 §4.1 already
-requires lazy tables to be excluded from `max_tensor`, and its T3 fixture
-should cover the early plan too.
+requires lazy tables to be excluded from `max_tensor`. The early plan cannot
+see the table without the record, so C1's pre-fill is what makes that
+exclusion reach it (§3.1), and th32's T3 fixture should cover the early plan
+too.
 
 ### 2.7 The legacy "mmap" vocabulary
 
@@ -406,13 +410,56 @@ and held by `llama_model_loader`:
     under `-lzm off`. It is an ordinary weight, and no consumer excludes it.
   - `LAZY_READ`: upstream's CPU lazy path.
   - `STORAGE`: th32's SYCL diversion, from T6.
-- **Where it is filled.** `create_tensor` fills the row at the one place the
-  flag is examined (`lml:1774-1777`), from the `llama_tensor_weight`, before
-  and independently of any consumer's decision. The decision only sets
-  `deferral`.
-- **Its API.** `deferred_for_file(idx)` returns the sorted, merged ranges of
-  every non-`EAGER` row of that file. `has(tensor)` and `deferral(tensor)` are
-  the per-tensor queries.
+- **Where it is filled: before the early plan, not at `create_tensor`**
+  (§F2a I-9 addendum 2).
+  - **Why `create_tensor` is too late.** The SYCL early plan runs before
+    `create_tensor` (`lm:2228-2231`) and builds its inventory from
+    `ml.weights_map` (`lm:639-641`), so it cannot see a row filled there. It
+    would place and stage the lazy table as an ordinary weight: run2's early
+    plan counted the PLE in `max_tensor` (§2.6) and in the host total
+    (154263.6 MB, `run2.log:308`).
+  - **When the flag is knowable.** `TENSOR_READ_LAZY` is first knowable only
+    at `create_tensor`: it is an argument at each arch's call site
+    (`src/models/qwen4exp.cpp:189`, `src/models/gemma4.cpp:58`), and no table
+    records it.
+  - **The fix: a static declaration.** C1 adds a per-arch lazy-tensor
+    declaration, `llama_model_lazy_tensor_names(arch, hparams)`. It lists the
+    GGUF names the arch creates with `TENSOR_READ_LAZY`, for example
+    `per_layer_token_embd.weight` for qwen4exp and gemma4, and
+    `blk.%d.engram_embd.weight` for the layers deepseek41's hparams name.
+    th32 T6's per-arch facts (`rows_per_token`, `consumer_layer`, th32 §4.1
+    and §9.1) attach to the same entries rather than to a second list.
+  - **The pre-fill.** C1 moves the lazy-mode resolution (`lm:2256-2265`, with
+    the caps loop above it that it depends on, `lm:2245-2254`) before the early
+    plan; they depend only on `devices` and `params`. The loader then fills one
+    row per declared name found in `weights_map`: (name, file index, offset,
+    size) from the `llama_tensor_weight`, and `deferral` from `lazy_read`'s
+    decision, which needs only the mode and `ggml_nbytes` of the weight's
+    metadata tensor. This happens before `llama_model_sycl_compute_early_plan`.
+  - **One source, checked at `create_tensor`.** `create_tensor` does not fill
+    the record; it checks it. A `TENSOR_READ_LAZY` call for a name with no row,
+    or a non-lazy call for a name with a non-`EAGER` row, aborts naming the
+    tensor and the arch. The upstream flag and the declaration therefore
+    cannot drift silently.
+  - **The early plan reads it.** Its loop over `weights_map` (`lm:639-641`)
+    skips every row whose `deferral` is not `EAGER`. That keeps the table out
+    of placement, out of `max_tensor` and the staging maxima, and out of the
+    host total, which is th32 §4.1's requirement applied to the early plan too.
+    The late inventory already excludes it (§2.5).
+- **Its API.**
+  - `deferred_for_file(idx)` returns the sorted, merged ranges of every
+    non-`EAGER` row of that file.
+  - `has(name)` and `deferral(name)` are the per-tensor queries.
+  - `value(name)` returns a `llama_lazy_range_value {file_idx, offs, size}` **by
+    value**. th32's backend `lazy_table` takes its (file, offset, size) from
+    this once, at plan publish, through the inventory. It is a hand-off of the
+    record's value, not a second source (§F2a I-9 addendum 2, M-1). What is
+    forbidden is deriving those numbers independently, for example from
+    `w->offs`.
+- **Immutability.** Rows are immutable once the pre-fill completes, and
+  `deferral` is set once. A later write aborts. So a by-value copy taken at plan
+  publish stays equal to the record for the model's lifetime, and is safe for
+  tickets that outlive the model.
 
 **Consumers keep no copy.**
 - `lazy_read` keeps its `mode` and its decision (`add` without storage).
@@ -425,9 +472,21 @@ and held by `llama_model_loader`:
 - The tier hook's `lazy_ranges` argument (§4.3) is
   `record.deferred_for_file(idx)`.
 
-**What it changes on its own.** Nothing observable in C1. The ranges and
-decisions are the ones `lazy_read` computes today, and the edge now held by
-th32 T6 on 5efe is a data edge on C1 alone (§M49).
+**What it changes on its own.** The ranges and decisions are the ones
+`lazy_read` computes today. The one observable change is that the early plan
+stops counting deferred tables. On Qwen with lazy enabled:
+- the early `[SYCL-PLAN] Host staging zone` reads `per_inflight` about
+  1702 MB, like the late plan, instead of 103762.3 MB (`run2.log:243`);
+- the early `[PLACEMENT] Totals` host figure reads 102383.5 MB instead of
+  154263.6 MB (`run2.log:308`).
+
+The arithmetic is exact. The early inventory's largest tensor is
+`per_layer_token_embd.weight` at 51880.1 MB (`run2.log:235`), and
+154263.6 - 51880.1 = 102383.5, the late host total (`:2821`). The early
+`per_inflight` is 2 x 51880.1 + 2.1; the late one is 2 x 850.0 + 2.0, with
+the 850.0 MB `ffn_*_exps` tensors next in line (`:235`, `:2756`).
+
+The edge th32 T6 holds on 5efe is a data edge on C1 alone (§M49).
 
 ---
 
@@ -565,8 +624,10 @@ reservations over one page cache; sharing them is not needed.
 ### 4.3 One published fact, the buffer type, and the loader change
 
 **The fact, resolved before the early plan** (r1 I-5, §F2).
-- C4 moves the two caps loops (`lm:2245-2265`) above the early plan
-  (`lm:2228-2231`). They depend only on `devices` and `params`.
+- C1 already moves the two caps loops (`lm:2245-2265`) above the early plan
+  (`lm:2228-2231`), because the record's pre-fill needs the resolved lazy mode
+  (§3.1). They depend only on `devices` and `params`. C4 adds the publication
+  below.
 - The resolved answer is published once, on the SYCL load transaction:
   `load_maps_files = ml.use_mmap after resolution`. It is false under
   `-lm none`, and false when an iGPU in the device set forced `none`.
@@ -705,6 +766,15 @@ contract lists them. `[PLACEMENT] Totals` prints all four terms.
 - Falsifier: a WEIGHT zone above 128 MB must equal 1.2 x the reordered-expert
   bytes, and the placement report must print that sum. Otherwise the split
   missed an accumulation site.
+- **Re-checked against the early-plan fix** (§F2a I-9 addendum 2). The
+  configured zones come from the late plan: `configured zones` (`:2893`)
+  follows the late `Totals` (`:2821`) and equals 1.2 x 102383.5 + 64. The late
+  plan already excluded the table. So the WEIGHT, pre-size and total figures
+  above are unchanged. What the record changes is the early plan (§3.1): the
+  early STAGING `per_inflight` falls to about 1702 MB, and the early host
+  total to 102383.5 MB before the split. After C4's split, the early and late
+  `[PLACEMENT] Totals` both print charged host 0 and mapped 102383.5 MB. These
+  witness lines are added to C4's run.
 
 ### 4.5 The budget, the ledger, the working set, and the host-fit gate
 
@@ -1216,7 +1286,7 @@ The lead's GPU runs share one protocol (r1 I-7):
   - `test-llama-lazy-range-record`:
     - builds `llama_tensor_weight`s from a test-written GGUF of four tensors
       in two files, two of them flagged `TENSOR_READ_LAZY`, and feeds them
-      through the record's fill function, the same call `create_tensor` makes;
+      through the record's fill function, the same call the pre-fill makes;
     - checks that the record's rows equal the flagged tensors' (file, offset,
       size) exactly, that `deferral` is `LAZY_READ` under `-lzm on` and
       `EAGER` under `off`, and that `lazy_read`'s `any()`, `has()` and
@@ -1230,14 +1300,37 @@ The lead's GPU runs share one protocol (r1 I-7):
     - no consumer holds its own range container: `lazy_read` has no `ranges`
       or `tensors` member, and `init_mappings` passes the record, not
       `lazy.for_file`;
-    - `create_tensor`'s `TENSOR_READ_LAZY` branch calls the fill;
+    - `create_tensor`'s `TENSOR_READ_LAZY` branch checks the record and
+      does not fill it;
     - today it fails on `llama-model-loader.h:118-119`.
+- The record's pre-fill and the early plan's exclusion (§3.1) are covered by
+  more host-only tests:
+  - `test-llama-lazy-range-prefill` (`host;lazy`) feeds a declared lazy name,
+    an undeclared flagged name and a declared-but-unflagged name through the
+    pre-fill and the `create_tensor` check.
+    - The first gives one row, filled before any `create_tensor` call.
+    - The other two abort naming the tensor, each in its own process, scored
+      on rc 134 plus the name.
+    - `value(name)` equals the weight's (file, offset, size), and a write after
+      the pre-fill aborts.
+    - RED mutant: the row filled at `create_tensor` instead, under which the
+      "before any `create_tensor` call" check fails.
+  - `test-llama-lazy-range-record-source` also asserts that the caps and
+    lazy-mode loops precede `llama_model_sycl_compute_early_plan`, and that
+    the early plan's `weights_map` loop consults the record.
 - Lead witness (r1 I-7):
   - Run Qwen on the B70 with **no** `-lm`/`-lzm` flags.
-  - Stop the process with `kill` as soon as the log shows both
-    `load_mode = mmap` and `per_layer_token_embd ... lazy read enabled`. In
-    run2 both appeared by t = 3.9 s (`run2.log:314`, `:370`), about 53 s
-    before the pinned pre-size began (`:2893`).
+  - Stop the process with `kill` as soon as the log shows all of:
+    - `per_layer_token_embd ... lazy read enabled`, now printed at the
+      pre-fill;
+    - the early `[SYCL-PLAN] Host staging zone` line;
+    - the early `[PLACEMENT] Totals` line;
+    - `load_mode = mmap`.
+
+    In run2 all four were printed by t = 3.9 s (`run2.log:243`, `:308`, `:314`,
+    `:370`), about 53 s before the pinned pre-size began (`:2893`).
+  - Pre-registered: early `per_inflight` ≤ 1800 MB, and early host total =
+    102383.5 MB ± 0.1 MB.
   - This run is a witness, not a load; it never reaches the pre-size.
 - Lead gates: the Mistral gate on `:1` and `:0`. Tokens are unchanged, since
   Mistral has no lazy tensor.
@@ -1311,7 +1404,6 @@ every SYCL load.
   - `test-sycl-mapped-loader-source` (`sycl;host;source-contract`):
     - prefetch 0 at the SYCL `init_mappings` call;
     - every site of the §4.3 table;
-    - the caps loops before `llama_model_sycl_compute_early_plan`;
     - no `use_mmap` read in `create_tensor`'s SYCL buft choice;
     - `lm:2693` gone;
     - the eight `weight_host_bytes` accumulation sites test `host_backing`;
@@ -1349,6 +1441,9 @@ every SYCL load.
      - the load completes and prints coherent text;
      - `[HOST-ARENA] configured zones: WEIGHT=` is 64.0-128.0 MB, and the
        pre-size commits ≤ 12288 MB (§4.4);
+     - the early and late `[PLACEMENT] Totals` both print charged host 0 and
+       mapped 102383.5 MB, and the early `Host staging zone` has
+       `per_inflight` ≤ 1800 MB;
      - `SYCL_Mapped` model buffer lines sum to 127615 MiB ± 1%;
      - `SYCL_Host` model buffer lines hold 0 weight bytes;
      - peak `AnonPages` minus the pre-load reading is < 30 GiB;
@@ -1438,7 +1533,7 @@ Tickets to file after review: `-lm none` double residency (§6), and
 | m-5 fd lifetime and replacement gap | Fixed: `dup` of the loader's fd, kept by the owner for `FADV_DONTNEED`; no reopen by path. | §4.1, §4.6 |
 | m-6 loader sites under-enumerated | Fixed: the §4.3 site table (hooks, `weight_buft_supported`, `make_cpu_buft_list`, `mlock_bufs`, the `init_mappings` prefetch) and the loader `lmlock` skip. | §4.2, §4.3, §5.1 |
 | m-7 null path unverified; AOS branch | Fixed: `resolve_or_host` aborts naming the tensor, with the eight callers audited and pinned, and `binbcast.cpp:394/794` cited. Both layout-availability branches are excluded for `SYCL_Mapped`. | §5.3 |
-| m-8 stale th32 pin | Fixed per §F2: pinned at the latest reviewed head, now rev 2r `df6e83b3b` (r17 nits only); 2s `f364952d3` is noted as the revision that reads the record. Rulings relabelled §T13/§T13a/§T13c. | header, §4.6 |
+| m-8 stale th32 pin | Fixed per §F2: pinned at the latest reviewed head, rev 2q `1646da864` (see the lead-check row below); 2s `f364952d3` is noted as the revision that reads the record. Rulings relabelled §T13/§T13a/§T13c. | header, §4.6 |
 | m-9 F1 fold and cold set | Fixed per §F2: the yl3v/7v5c interface is stated, the recommendation removed, and the terms yl3v must read are named so that DeepSeek's cold set is not implicitly empty. | §4.5, §8 |
 | m-10 enum value collision | Fixed per §F2: the next free value at landing; censuses key on names. | §4.1, §4.8 |
 | m-11 allowlist unenforced | Fixed: `test-sycl-raw-mmap-allowlist-source` with today's eight sites, shared with th32 T1. | §4.1, §7 C2 |
@@ -1450,9 +1545,12 @@ Tickets to file after review: `-lm none` double residency (§6), and
 | m-17 host_unified fails open | Fixed: `host_unified_known` added, and `mmap_support` requires it. | §3 |
 | m-18 storage_owner type; PER_DEVICE teardown | Fixed: `storage_owner` wraps the reservation's `mem_handle`; every model unloads on every device before any cache tears down. | §4.2 |
 | addendum I-2(a) §4.6 text wrong for map segments | Fixed per §F2a: already corrected at `1ddbd9d56` (map segments outward); rev 3 states it at the table, adds the `MADV_RANDOM` edge windows as an inward set, and says that only map segments round outward. | §4.6 |
-| addendum I-9 lazy_ranges source disappears after th32 T6 | Fixed per §F2a and §M49: one per-file lazy-range record, filled at `create_tensor` from the flag, owned by 5efe, landing in C1. `lazy_read`, th32's inventory, the tier and `llama_mmap` consume it and keep no copy. Prefetch 0 on SYCL is an explicit C4 item, with RED `test-llama-mmap-lazy-exclusion` (its mutant is an empty record). | §3.1, §4.6, §7 C1, C4 |
+| addendum I-9 lazy_ranges source disappears after th32 T6 | Fixed per §F2a and §M49: one per-file lazy-range record, owned by 5efe (filled before the early plan from the arch declaration, per addendum 2 below), landing in C1. `lazy_read`, th32's inventory, the tier and `llama_mmap` consume it and keep no copy. Prefetch 0 on SYCL is an explicit C4 item, with RED `test-llama-mmap-lazy-exclusion` (its mutant is an empty record). | §3.1, §4.6, §7 C1, C4 |
 | addendum I-10 tier and loader inherit the prefix lock | Fixed per §F2a: the tier `mlock(2)`s inward-rounded host-executed segments directly; `SYCL_Mapped` is excluded from `mlock_bufs`; §2.5 is corrected; `lml:2122` becomes a ranged `lock_range` in 5efe (C3). Host-only RED `test-llama-mlock-ranged` with a lazy range before a locked range and a whole-prefix mutant; the tier's arm 2 covers the tier side. | §2.5, §4.6, §5.1, §7 C3 |
 | addendum m-19 one-sided edge advice; residual undercounted | Fixed per §F2a: `MADV_RANDOM` windows on both edges, because read-around is centred on the fault. The loader's whole-file `llama_mmap` read-around is named as a second residual path, given the same record-fed window (C4), and bounded at one shared page per edge per mapping, plus bcachefs extent granularity inside the guard band. | §4.6 |
 | addendum m-20 readahead case could pass vacuously | Fixed per §F2a: arms 5 (forward) and 6 (backward) fault real mapped pages, exit 77 when `read_ahead_kb` is 0, each has a no-advice control twin that must populate the hole, and both are measured with `cachestat` or a test-owned mapping. | §4.6, §7 C3 |
+| §F2a I-9 addendum 2: early plan cannot see the record | Fixed: the flag is first knowable only at `create_tensor`, so C1 adds a per-arch lazy-tensor declaration and pre-fills the record from it plus `weights_map`, after the caps and lazy-mode loops move above the early plan. The early plan skips deferred rows; `create_tensor` checks the record rather than filling it, and aborts on disagreement. C-1's numbers are re-checked and unchanged, because the zones come from the late plan. Early-plan witness lines are pre-registered in C1 and C4. | §3.1, §2.6, §4.3, §4.4, §7 C1, C4 |
+| §F2a I-9 addendum 2 (M-1): by-value hand-off | Done: `value(name)` returns `{file_idx, offs, size}` by value, rows are immutable after the pre-fill, and deriving the numbers independently (from `w->offs`) is named as forbidden. | §3.1 |
+| lead check: th32 pin | Pinned at rev 2q `1646da864` per the lead; 2s `f364952d3` is named as the record's consumer, and §3.1's row fields match its §4.1. | header |
 | §M49 note: record in C1 | Done: the record and its two host-only tests are C1 deliverables, so th32 T6 depends on C1 alone. | §3.1, §7 C1 |
 | th32 r15 m-4 (relayed) mlock prefix | Fixed: the tier's own per-segment `mlock` (named, and where), no `llama_mlock` for `SYCL_Mapped`, a residency arm under mlock, and a RED with a lazy range before a locked tensor. | §4.6, §5.1, §7 C3 |
