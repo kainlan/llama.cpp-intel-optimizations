@@ -133,14 +133,26 @@ kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in) {
         const size_t slack     = overflow ? SIZE_MAX : n_resident * in.per_layer_slack;
         const size_t demand    = kv_bytes + std::min(slack, SIZE_MAX - kv_bytes);
         const size_t available = i < in.available.size() ? in.available[i] : 0;
-        const size_t yieldable = i < in.yieldable.size() ? in.yieldable[i] : 0;
-        const size_t yield     = demand > available ? std::min(demand - available, yieldable) : 0;
-        const size_t headroom  = available + std::min(yield, SIZE_MAX - available);
-        fit.capacity           = headroom > slack ? headroom - slack : 0;
+        size_t       yieldable = 0;
+        if (i < in.optional_layouts.size()) {
+            for (size_t bytes : in.optional_layouts[i].bytes) {
+                yieldable += std::min(bytes, SIZE_MAX - yieldable);
+            }
+        }
+        const size_t yield    = demand > available ? std::min(demand - available, yieldable) : 0;
+        const size_t headroom = available + std::min(yield, SIZE_MAX - available);
+        fit.capacity          = headroom > slack ? headroom - slack : 0;
         if (i < in.fit_capacity.size()) {
             fit.capacity = std::min(fit.capacity, in.fit_capacity[i]);
         }
+        kv_optional_layout_yield picks;
+        if (yield > 0) {
+            // The copies' bytes are headroom only where a layer lands in them.
+            picks = plan_optional_layout_yield(in.optional_layouts[i], kv_device_layer_alloc_bytes(in, fit.device));
+            fit.capacity = std::min(fit.capacity, kv_device_leading_layer_bytes(in, fit.device, picks.kv_layers));
+        }
         r.yield_bytes.push_back(yield);
+        r.yields.push_back(std::move(picks));
 
         const kv_demotion_result demotion = plan_device_kv_fit(fit);
         for (int l : demotion.demoted_layers) {
@@ -174,39 +186,46 @@ size_t kv_layers_allocatable(kv_zone_model zone, const std::vector<size_t> & lay
     return placed;
 }
 
-std::vector<size_t> select_optional_layout_yield(const kv_zone_model &              zone,
-                                                 const std::vector<kv_zone_block> & copies,
-                                                 const std::vector<size_t> &        layer_bytes) {
+kv_optional_layout_yield plan_optional_layout_yield(const kv_optional_layouts & copies,
+                                                    const std::vector<size_t> & layer_bytes) {
+    const kv_zone_model & zone = copies.zone;
+    if (zone.empty()) {
+        kv_optional_layout_yield none;
+        none.kv_layers = layer_bytes.size();
+        return none;
+    }
     std::vector<size_t> order;
-    for (size_t i = 0; i < copies.size(); ++i) {
-        if (copies[i].allocator < zone.size()) {
+    for (size_t i = 0; i < copies.copies.size(); ++i) {
+        if (copies.copies[i].allocator < zone.size()) {
             order.push_back(i);
         }
     }
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return copies[a].allocator != copies[b].allocator ? copies[a].allocator > copies[b].allocator :
-                                                            copies[a].offset > copies[b].offset;
+        const kv_zone_block & x = copies.copies[a];
+        const kv_zone_block & y = copies.copies[b];
+        return x.allocator != y.allocator ? x.allocator > y.allocator : x.offset > y.offset;
     });
     auto freed_model = [&](const std::vector<size_t> & picks) {
         kv_zone_model model = zone;
         for (size_t i : picks) {
-            model[copies[i].allocator].free(copies[i].offset);
+            model[copies.copies[i].allocator].free(copies.copies[i].offset);
         }
         return model;
     };
 
-    std::vector<size_t> picked;
-    std::vector<size_t> pending;
-    size_t              placed = kv_layers_allocatable(zone, layer_bytes);
+    kv_optional_layout_yield r;
+    std::vector<size_t>      picked;
+    std::vector<size_t>      pending;
+    r.kv_layers = kv_layers_allocatable(zone, layer_bytes);
     for (size_t i : order) {
-        if (placed >= layer_bytes.size()) {
+        if (r.kv_layers >= layer_bytes.size()) {
             break;
         }
         pending.push_back(i);
         std::vector<size_t> trial = picked;
         trial.insert(trial.end(), pending.begin(), pending.end());
         const size_t trial_placed = kv_layers_allocatable(freed_model(trial), layer_bytes);
-        if (trial_placed <= placed) {
+        if (trial_placed <= r.kv_layers) {
             continue;
         }
         // Keep only the pending copies this gain needs: one that no longer
@@ -225,10 +244,32 @@ std::vector<size_t> select_optional_layout_yield(const kv_zone_model &          
             }
         }
         picked.insert(picked.end(), pending.begin(), pending.end());
+        r.groups.push_back(pending);
         pending.clear();
-        placed = trial_placed;
+        r.kv_layers = trial_placed;
     }
-    return picked;
+    return r;
+}
+
+std::vector<size_t> kv_device_layer_alloc_bytes(const kv_residency_input & in, int device) {
+    std::vector<size_t> bytes;
+    for (size_t l = 0; l < in.load_kv_device.size() && l < in.layer_kv_bytes.size(); ++l) {
+        if (in.load_kv_device[l] == device && in.layer_kv_bytes[l] > 0) {
+            bytes.push_back(kv_layer_alloc_bytes(in.layer_kv_bytes[l]));
+        }
+    }
+    return bytes;
+}
+
+size_t kv_device_leading_layer_bytes(const kv_residency_input & in, int device, size_t n_layers) {
+    size_t bytes = 0;
+    for (size_t l = 0, n = 0; l < in.load_kv_device.size() && l < in.layer_kv_bytes.size() && n < n_layers; ++l) {
+        if (in.load_kv_device[l] == device && in.layer_kv_bytes[l] > 0) {
+            bytes += std::min(in.layer_kv_bytes[l], SIZE_MAX - bytes);
+            ++n;
+        }
+    }
+    return bytes;
 }
 
 int layer_block_kv_device(const std::vector<int> &    kv_device,

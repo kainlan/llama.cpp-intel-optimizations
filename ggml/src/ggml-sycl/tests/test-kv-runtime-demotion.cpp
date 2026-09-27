@@ -37,15 +37,19 @@ using ggml_sycl::kv_demotion_result;
 using ggml_sycl::kv_device_fit_input;
 using ggml_sycl::kv_device_residency_changed;
 using ggml_sycl::kv_hot_layers_override_active;
+using ggml_sycl::kv_optional_layout_yield;
+using ggml_sycl::kv_optional_layouts;
 using ggml_sycl::kv_reads_device_arena;
 using ggml_sycl::kv_residency_input;
 using ggml_sycl::kv_residency_needs_refit;
+using ggml_sycl::kv_residency_result;
 using ggml_sycl::kv_shape;
 using ggml_sycl::kv_shape_changed;
 using ggml_sycl::kv_vram_available;
 using ggml_sycl::kv_weight_capacity;
 using ggml_sycl::layer_block_kv_device;
 using ggml_sycl::plan_device_kv_fit;
+using ggml_sycl::plan_optional_layout_yield;
 using ggml_sycl::plan_runtime_kv_demotion;
 using ggml_sycl::plan_runtime_kv_residency;
 using ggml_sycl::tlsf_allocator;
@@ -73,6 +77,31 @@ static kv_demotion_input make_input(size_t budget, size_t vram, size_t kv_full, 
 }
 
 // A dense residency (index = layer id) as a plan's kv_device map.
+// One optional layout copy of copy_bytes with free_bytes free beside it, in a
+// zone of its own: releasing it frees one extent of both.
+static kv_optional_layouts one_copy_beside_free(size_t free_bytes, size_t copy_bytes) {
+    kv_optional_layouts copies;
+    copies.zone.emplace_back(free_bytes + copy_bytes);
+    copies.copies.push_back({ 0, copies.zone[0].allocate(copy_bytes) });
+    copies.bytes.push_back(copy_bytes);
+    return copies;
+}
+
+// Case 29's zone: four primaries (40 MB) each followed by its copy (48 MB),
+// sealed by one more primary, with 8 MB free on top.
+static kv_optional_layouts interleaved_copies() {
+    const size_t        mb = 1024 * 1024;
+    kv_optional_layouts copies;
+    copies.zone.emplace_back(400 * mb);
+    for (int k = 0; k < 4; ++k) {
+        (void) copies.zone[0].allocate(40 * mb);
+        copies.copies.push_back({ 0, copies.zone[0].allocate(48 * mb) });
+        copies.bytes.push_back(48 * mb);
+    }
+    (void) copies.zone[0].allocate(40 * mb);
+    return copies;
+}
+
 static std::unordered_map<int, int> kv_device_map(const std::vector<int> & kv_device) {
     std::unordered_map<int, int> map;
     for (size_t l = 0; l < kv_device.size(); ++l) {
@@ -510,19 +539,21 @@ int main() {
         CHECK(without.fits, "case 26: fits without the copies, by demotion");
         CHECK_EQ(without.per_device[0].demoted_layers.size(), 22, "case 26: 22 layers demoted without the copies");
 
-        in.yieldable = { 2869 * mb + 8 * mb / 10 };
-        auto r       = plan_runtime_kv_residency(in);
+        in.optional_layouts = { one_copy_beside_free(in.available[0], 2869 * mb + 8 * mb / 10) };
+        auto r              = plan_runtime_kv_residency(in);
         CHECK(r.fits, "case 26: fits");
         CHECK(r.per_device[0].demoted_layers.empty(), "case 26: no KV layer demotes while copies can yield");
         CHECK(r.kv_device == in.load_kv_device, "case 26: all 32 layers stay on the device");
         CHECK_EQ(r.yield_bytes.size(), 1, "case 26: one yield per device");
         CHECK_EQ(r.yield_bytes[0], 32 * 8 * mb + 32 * kv_alloc_slack_per_layer - in.available[0],
                  "case 26: yields exactly the shortfall");
+        CHECK(r.yields[0].groups == std::vector<std::vector<size_t>>({ { 0 } }), "case 26: the copy is the pick");
+        CHECK_EQ(r.yields[0].kv_layers, 32, "case 26: every layer lands once it goes");
     }
     // 27. The same device at -c 32768 (128 MB a layer): by bytes every copy
     // yields and only what is still over demotes -- 9 layers instead of all 32.
-    // Bytes are all this planner sees; whether those layers land is the zone's
-    // answer (cases 29-33), which the transaction passes back as fit_capacity.
+    // The copy and the free space beside it are one extent, so the 23 layers
+    // the bytes admit also land.
     {
         const size_t       mb = 1024 * 1024;
         kv_residency_input in;
@@ -535,10 +566,11 @@ int main() {
         auto without = plan_runtime_kv_residency(in);
         CHECK_EQ(without.per_device[0].demoted_layers.size(), 32, "case 27: every layer demoted without the copies");
 
-        in.yieldable = { 2869 * mb + 8 * mb / 10 };
-        auto r       = plan_runtime_kv_residency(in);
+        in.optional_layouts = { one_copy_beside_free(in.available[0], 2869 * mb + 8 * mb / 10) };
+        auto r              = plan_runtime_kv_residency(in);
         CHECK(r.fits, "case 27: fits");
-        CHECK_EQ(r.yield_bytes[0], in.yieldable[0], "case 27: every copy yields");
+        CHECK_EQ(r.yield_bytes[0], in.optional_layouts[0].bytes[0], "case 27: every copy yields");
+        CHECK_EQ(r.yields[0].kv_layers, 23, "case 27: 23 layers land once it goes");
         CHECK_EQ(r.per_device[0].demoted_layers.size(), 9, "case 27: only the rest demotes");
     }
     // 28. Nothing yields while the KV fits, and a device without a shortfall
@@ -549,12 +581,14 @@ int main() {
         in.load_kv_device = { 0, 0, 1, 1 };
         in.swa_layer_mask.assign(4, 0);
         in.layer_kv_bytes.assign(4, 8 * mb);
-        in.devices   = { 0, 1 };
-        in.available = { 100 * mb, 10 * mb };
-        in.yieldable = { 500 * mb, 500 * mb };
-        auto r       = plan_runtime_kv_residency(in);
+        in.devices          = { 0, 1 };
+        in.available        = { 100 * mb, 10 * mb };
+        in.optional_layouts = { one_copy_beside_free(100 * mb, 500 * mb), one_copy_beside_free(10 * mb, 500 * mb) };
+        auto r              = plan_runtime_kv_residency(in);
         CHECK(r.fits, "case 28: fits");
         CHECK_EQ(r.yield_bytes[0], 0, "case 28: device 0 fits, nothing yields");
+        CHECK(r.yields[0].groups.empty(), "case 28: and device 0 picks nothing");
+        CHECK(r.yields[1].groups == std::vector<std::vector<size_t>>({ { 0 } }), "case 28: device 1 picks its copy");
         CHECK_EQ(r.yield_bytes[1], 16 * mb + 2 * kv_alloc_slack_per_layer - 10 * mb,
                  "case 28: device 1 yields its shortfall");
         CHECK(r.kv_device == in.load_kv_device, "case 28: no layer demotes");
@@ -565,79 +599,88 @@ int main() {
     // Freeing every copy frees 192 MB, but into four 48 MB holes between live
     // primaries: not one 128 MB layer lands, so no copy is worth releasing.
     // 8 MB layers do land in them, and only as many copies go as the layers
-    // need, from the top down.
+    // need, from the top down -- each its own group, since each hole holds
+    // layers without the other.
     {
         using ggml_sycl::kv_zone_block;
-        using ggml_sycl::kv_zone_model;
-        using ggml_sycl::select_optional_layout_yield;
-        const size_t               mb = 1024 * 1024;
-        kv_zone_model              zone{ tlsf_allocator(400 * mb) };
-        std::vector<kv_zone_block> copies;
-        for (int k = 0; k < 4; ++k) {
-            (void) zone[0].allocate(40 * mb);
-            copies.push_back({ 0, zone[0].allocate(48 * mb) });
-        }
-        (void) zone[0].allocate(40 * mb);
-        CHECK_EQ(zone[0].largest_free_block(), 8 * mb, "case 29: 8 MB free on top");
+        const size_t              mb     = 1024 * 1024;
+        const kv_optional_layouts copies = interleaved_copies();
+        CHECK_EQ(copies.zone[0].largest_free_block(), 8 * mb, "case 29: 8 MB free on top");
 
         const std::vector<size_t> big(2, 128 * mb);
-        CHECK_EQ(ggml_sycl::kv_layers_allocatable(zone, big), 0, "case 29: no 128 MB layer lands");
-        CHECK(select_optional_layout_yield(zone, copies, big).empty(),
-              "case 29: holes between primaries give a 128 MB layer nothing, so every copy stays");
+        CHECK_EQ(ggml_sycl::kv_layers_allocatable(copies.zone, big), 0, "case 29: no 128 MB layer lands");
+        kv_optional_layout_yield y = plan_optional_layout_yield(copies, big);
+        CHECK(y.groups.empty(), "case 29: holes between primaries give a 128 MB layer nothing, so every copy stays");
+        CHECK_EQ(y.kv_layers, 0, "case 29: and no 128 MB layer lands");
 
         const std::vector<size_t> small(13, 8 * mb);
-        CHECK_EQ(ggml_sycl::kv_layers_allocatable(zone, small), 1, "case 29: one 8 MB layer lands before a yield");
-        CHECK(select_optional_layout_yield(zone, copies, small) == std::vector<size_t>({ 3, 2 }),
-              "case 29: two holes of six layers each, the top two copies");
-        CHECK(select_optional_layout_yield(zone, copies, {}).empty(), "case 29: no layers asked, nothing yields");
+        CHECK_EQ(ggml_sycl::kv_layers_allocatable(copies.zone, small), 1,
+                 "case 29: one 8 MB layer lands before a yield");
+        y = plan_optional_layout_yield(copies, small);
+        CHECK(y.groups == std::vector<std::vector<size_t>>({ { 3 }, { 2 } }),
+              "case 29: two holes of six layers each, the top two copies, one group each");
+        CHECK_EQ(y.kv_layers, 13, "case 29: all thirteen land once both go");
+        y = plan_optional_layout_yield(copies, {});
+        CHECK(y.groups.empty() && y.kv_layers == 0, "case 29: no layers asked, nothing yields");
 
         // A copy the allocator does not model (allocator == SIZE_MAX) is never picked.
-        const std::vector<kv_zone_block> unmodelled = { kv_zone_block{} };
-        CHECK(select_optional_layout_yield(zone, unmodelled, small).empty(), "case 29: an unmodelled copy stays");
+        kv_optional_layouts unmodelled = copies;
+        unmodelled.copies              = { kv_zone_block{} };
+        unmodelled.bytes               = { 48 * mb };
+        CHECK(plan_optional_layout_yield(unmodelled, small).groups.empty(), "case 29: an unmodelled copy stays");
+
+        // No zone (no arena): KV is not carved from a zone, so none limits it.
+        kv_optional_layouts no_zone;
+        no_zone.copies = { kv_zone_block{} };
+        no_zone.bytes  = { 48 * mb };
+        y              = plan_optional_layout_yield(no_zone, small);
+        CHECK(y.groups.empty(), "case 29: without a zone nothing is picked");
+        CHECK_EQ(y.kv_layers, small.size(), "case 29: and no zone holds the layers back");
     }
     // 30. The same copies staged together, after every primary: they free into
     // one extent with each other and the free space on top, so a 128 MB layer
     // lands once the top three go -- and only those three, even with a second
-    // layer asked for that the fourth still would not make room for.
+    // layer asked for that the fourth still would not make room for. They are
+    // one group: any two of them free an extent the layer does not fit.
     {
-        using ggml_sycl::kv_zone_block;
-        using ggml_sycl::kv_zone_model;
-        using ggml_sycl::select_optional_layout_yield;
-        const size_t               mb = 1024 * 1024;
-        kv_zone_model              zone{ tlsf_allocator(360 * mb) };
-        std::vector<kv_zone_block> copies;
+        const size_t        mb = 1024 * 1024;
+        kv_optional_layouts copies;
+        copies.zone.emplace_back(360 * mb);
         for (int k = 0; k < 4; ++k) {
-            (void) zone[0].allocate(40 * mb);
+            (void) copies.zone[0].allocate(40 * mb);
         }
         for (int k = 0; k < 4; ++k) {
-            copies.push_back({ 0, zone[0].allocate(48 * mb) });
+            copies.copies.push_back({ 0, copies.zone[0].allocate(48 * mb) });
+            copies.bytes.push_back(48 * mb);
         }
-        CHECK_EQ(zone[0].largest_free_block(), 8 * mb, "case 30: 8 MB free on top");
-        const std::vector<size_t> big(2, 128 * mb);
-        const std::vector<size_t> picks = select_optional_layout_yield(zone, copies, big);
-        CHECK(picks == std::vector<size_t>({ 3, 2, 1 }), "case 30: the top three copies, walked down from the top");
-        kv_zone_model freed = zone;
-        for (size_t i : picks) {
-            freed[0].free(copies[i].offset);
+        CHECK_EQ(copies.zone[0].largest_free_block(), 8 * mb, "case 30: 8 MB free on top");
+        const std::vector<size_t>      big       = std::vector<size_t>(2, 128 * mb);
+        const kv_optional_layout_yield y         = plan_optional_layout_yield(copies, big);
+        const std::vector<size_t>      top_three = { 3, 2, 1 };
+        CHECK(y.groups.size() == 1 && y.groups[0] == top_three,
+              "case 30: the top three copies, walked down from the top, as one group");
+        CHECK_EQ(y.kv_layers, 1, "case 30: and one 128 MB layer lands");
+        ggml_sycl::kv_zone_model freed = copies.zone;
+        for (size_t i : y.groups[0]) {
+            freed[0].free(copies.copies[i].offset);
         }
-        CHECK_EQ(ggml_sycl::kv_layers_allocatable(freed, big), 1, "case 30: and one 128 MB layer lands");
+        CHECK_EQ(ggml_sycl::kv_layers_allocatable(freed, big), (long long) y.kv_layers,
+                 "case 30: kv_layers is what the zone places once the groups go");
     }
     // 31. A copy the gain does not need is dropped again: the 4 MB copy on top
     // joins the free space first, but only the isolated 48 MB hole below holds
     // a 40 MB layer.
     {
-        using ggml_sycl::kv_zone_block;
-        using ggml_sycl::kv_zone_model;
-        using ggml_sycl::select_optional_layout_yield;
-        const size_t               mb = 1024 * 1024;
-        kv_zone_model              zone{ tlsf_allocator(140 * mb) };
-        std::vector<kv_zone_block> copies;
-        (void) zone[0].allocate(40 * mb);
-        copies.push_back({ 0, zone[0].allocate(48 * mb) });
-        (void) zone[0].allocate(40 * mb);
-        copies.push_back({ 0, zone[0].allocate(4 * mb) });
-        CHECK_EQ(zone[0].largest_free_block(), 8 * mb, "case 31: 8 MB free on top");
-        CHECK(select_optional_layout_yield(zone, copies, { 40 * mb }) == std::vector<size_t>({ 0 }),
+        const size_t        mb = 1024 * 1024;
+        kv_optional_layouts copies;
+        copies.zone.emplace_back(140 * mb);
+        (void) copies.zone[0].allocate(40 * mb);
+        copies.copies.push_back({ 0, copies.zone[0].allocate(48 * mb) });
+        (void) copies.zone[0].allocate(40 * mb);
+        copies.copies.push_back({ 0, copies.zone[0].allocate(4 * mb) });
+        copies.bytes = { 48 * mb, 4 * mb };
+        CHECK_EQ(copies.zone[0].largest_free_block(), 8 * mb, "case 31: 8 MB free on top");
+        CHECK(plan_optional_layout_yield(copies, { 40 * mb }).groups == std::vector<std::vector<size_t>>({ { 0 } }),
               "case 31: only the hole that holds the layer");
     }
     // 32. Layers land in allocation order, each in the first allocator with
@@ -680,6 +723,63 @@ int main() {
         CHECK_EQ(ggml_sycl::kv_layer_alloc_bytes(1), 512, "case 34: rounds up");
         CHECK_EQ(ggml_sycl::kv_layer_alloc_bytes(512), 512, "case 34: exact stays");
         CHECK_EQ(ggml_sycl::kv_layer_alloc_bytes(513), 1024, "case 34: next block");
+    }
+    // 35. The fit counts a device's copies as headroom only where its layers
+    // land in them: it hands back the groups worth releasing as the pick list,
+    // and holds the device's KV to the leading layers its zone places once they
+    // go. Case 29's zone, with 8 MB of live headroom beside it.
+    {
+        const size_t       mb = 1024 * 1024;
+        kv_residency_input in;
+        in.devices          = { 0 };
+        in.available        = { 8 * mb };
+        in.optional_layouts = { interleaved_copies() };
+
+        // Two 128 MB layers: 200 MB of headroom admits one by bytes, but no
+        // layer lands, so nothing is picked and both demote.
+        in.load_kv_device.assign(2, 0);
+        in.swa_layer_mask.assign(2, 0);
+        in.layer_kv_bytes.assign(2, 128 * mb);
+        kv_residency_result r = plan_runtime_kv_residency(in);
+        CHECK(r.fits, "case 35: fits");
+        CHECK(r.yield_bytes[0] > 0, "case 35: by bytes the copies are headroom");
+        CHECK(r.yields[0].groups.empty(), "case 35: no copy lets a 128 MB layer land");
+        CHECK_EQ(r.per_device[0].demoted_layers.size(), 2, "case 35: held to the zone, both layers demote");
+
+        // Thirteen 8 MB layers: the top two copies, one group each, and none demote.
+        in.load_kv_device.assign(13, 0);
+        in.swa_layer_mask.assign(13, 0);
+        in.layer_kv_bytes.assign(13, 8 * mb);
+        r = plan_runtime_kv_residency(in);
+        CHECK(r.fits, "case 35: fits");
+        CHECK(r.yields[0].groups == std::vector<std::vector<size_t>>({ { 3 }, { 2 } }),
+              "case 35: the fit's pick list is the zone model's groups");
+        CHECK_EQ(r.yields[0].kv_layers, 13, "case 35: all land");
+        CHECK(r.per_device[0].demoted_layers.empty(), "case 35: nothing demotes");
+
+        // Twenty-six, with headroom enough by bytes: all four copies make
+        // room for only 25, so the zone, not the bytes, demotes one.
+        in.available = { 40 * mb };
+        in.load_kv_device.assign(26, 0);
+        in.swa_layer_mask.assign(26, 0);
+        in.layer_kv_bytes.assign(26, 8 * mb);
+        r = plan_runtime_kv_residency(in);
+        CHECK_EQ(r.yields[0].groups.size(), 4, "case 35: every copy is its own group");
+        CHECK_EQ(r.yields[0].kv_layers, 25, "case 35: 25 of 26 land");
+        CHECK(r.per_device[0].demoted_layers == std::vector<int>({ 25 }), "case 35: the last layer demotes");
+    }
+    // 36. A device's layers in allocation order, and the bytes of its leading
+    // ones: another device's layers and KV-less layers are not its.
+    {
+        kv_residency_input in;
+        in.load_kv_device = { 0, 1, 0, 0, -1, 0 };
+        in.layer_kv_bytes = { 1000, 2000, 0, 3000, 4000, 513 };
+        CHECK(ggml_sycl::kv_device_layer_alloc_bytes(in, 0) == std::vector<size_t>({ 1024, 3072, 1024 }),
+              "case 36: device 0's layers, at their allocation size");
+        CHECK(ggml_sycl::kv_device_layer_alloc_bytes(in, 1) == std::vector<size_t>({ 2048 }), "case 36: device 1");
+        CHECK_EQ(ggml_sycl::kv_device_leading_layer_bytes(in, 0, 0), 0, "case 36: no layers");
+        CHECK_EQ(ggml_sycl::kv_device_leading_layer_bytes(in, 0, 2), 4000, "case 36: the first two, at KV bytes");
+        CHECK_EQ(ggml_sycl::kv_device_leading_layer_bytes(in, 0, 99), 4513, "case 36: clamped to the device's");
     }
     std::printf("test-kv-runtime-demotion: all ok\n");
     return 0;

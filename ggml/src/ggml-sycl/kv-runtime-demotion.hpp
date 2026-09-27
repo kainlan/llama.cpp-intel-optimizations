@@ -183,43 +183,6 @@ inline int kv_buffer_layer_owner(bool have_plan, int plan_owner, bool layout_on_
     return layout_on_device ? device : -1;
 }
 
-// Runtime KV residency for a new KV shape.
-struct kv_residency_input {
-    // The planner's residency before any runtime demotion, so a smaller context
-    // gets back the device residency a larger one gave up. Same conventions as
-    // kv_demotion_input::kv_device.
-    std::vector<int>     load_kv_device;
-    std::vector<size_t>  layer_kv_bytes;  // at the new shape
-    std::vector<uint8_t> swa_layer_mask;
-    std::vector<int>     devices;         // devices to fit, in order
-    std::vector<size_t>  available;       // live KV headroom of devices[i]
-    // Bytes of optional layout copies devices[i] can release for its KV
-    // (unified_cache_optional_layout_bytes()); empty means none.
-    std::vector<size_t>  yieldable;
-    // The most KV bytes devices[i] can hold whatever its headroom says: the
-    // bytes of the leading layers its zone's free blocks can actually place
-    // (unified_cache::yield_optional_layouts()). Empty, or SIZE_MAX, is no cap.
-    std::vector<size_t>  fit_capacity;
-    size_t               per_layer_slack = kv_alloc_slack_per_layer;
-};
-
-struct kv_residency_result {
-    bool                            fits           = true;
-    int                             refused_device = -1;  // the device that cannot fit even with KV demoted
-    std::vector<int>                kv_device;            // the new residency
-    std::vector<kv_demotion_result> per_device;           // same indexing as devices
-    std::vector<size_t>             yield_bytes;          // optional layout bytes devices[i] must release
-};
-
-// Starts from load_kv_device. A device whose KV, plus per_layer_slack per
-// resident layer, exceeds its headroom first counts up to its yieldable bytes
-// as headroom (yield_bytes, which the caller must release before the KV is
-// allocated): an optional layout copy never outranks KV for VRAM. Only what is
-// still over then demotes the device's latest full-attention layers, then its
-// latest SWA layers, to the host tier, with a device's KV also held to its
-// fit_capacity. It refuses only when even that cannot fit.
-kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in);
-
 // The allocators a device's KV is carved from, in the order zone_alloc(KV)
 // tries them, as copies of their live state. Allocating on a copy is the
 // allocator's own fit -- size-class rounding, coalescing on free -- which is
@@ -239,15 +202,85 @@ struct kv_zone_block {
 // before the first that does not. Works on its own copy of `zone`.
 size_t kv_layers_allocatable(kv_zone_model zone, const std::vector<size_t> & layer_bytes);
 
-// Which optional layout copies to release so more of `layer_bytes` land. Walks
-// the copies from the zone's high end down, since copies staged together sit
-// together and free into one extent with each other and with the free space
-// above them; a copy is kept for release only once the extent it joins lets
-// another layer land, and one that extent does not need is dropped again. A
-// copy no layer can use stays resident. Returns indices into `copies`.
-std::vector<size_t> select_optional_layout_yield(const kv_zone_model &              zone,
-                                                 const std::vector<kv_zone_block> & copies,
-                                                 const std::vector<size_t> &        layer_bytes);
+// The optional layout copies a device could release for its KV (an optional
+// copy yields to runtime KV, unified_cache_entry::optional_layout), as its fit
+// reads them: one copy of the device's KV zone and where each copy sits in it.
+// This one snapshot is where the fit's yieldable bytes, the copies it picks and
+// the layers it expects to land all come from. An empty zone is no zone:
+// without an arena KV is not carved from one, so none limits it.
+struct kv_optional_layouts {
+    kv_zone_model              zone;
+    std::vector<kv_zone_block> copies;
+    std::vector<size_t>        bytes;  // same indexing as copies
+};
+
+// Which copies to release so more of `layer_bytes` land, as groups: a group is
+// released whole or not at all, since part of one frees an extent no layer the
+// group made room for fits. Walks the copies from the zone's high end down,
+// since copies staged together sit together and free into one extent with each
+// other and with the free space above them; a copy joins a group only once
+// the extent it joins lets another layer land, and one that extent does not
+// need is dropped again. A copy no layer can use stays resident.
+struct kv_optional_layout_yield {
+    std::vector<std::vector<size_t>> groups;         // indices into kv_optional_layouts::copies
+    size_t                           kv_layers = 0;  // of layer_bytes, how many land once every group is released
+};
+
+kv_optional_layout_yield plan_optional_layout_yield(const kv_optional_layouts & copies,
+                                                    const std::vector<size_t> & layer_bytes);
+
+// Runtime KV residency for a new KV shape.
+struct kv_residency_input {
+    // The planner's residency before any runtime demotion, so a smaller context
+    // gets back the device residency a larger one gave up. Same conventions as
+    // kv_demotion_input::kv_device.
+    std::vector<int>     load_kv_device;
+    std::vector<size_t>  layer_kv_bytes;  // at the new shape
+    std::vector<uint8_t> swa_layer_mask;
+    std::vector<int>     devices;         // devices to fit, in order
+    std::vector<size_t>  available;       // live KV headroom of devices[i]
+    // The optional layout copies devices[i] can release for its KV
+    // (unified_cache_optional_layouts_snapshot()); empty means none.
+    std::vector<kv_optional_layouts> optional_layouts;
+    // The most KV bytes devices[i] can hold whatever its headroom says: the
+    // bytes of the leading layers its zone's free blocks can actually place
+    // (unified_cache::yield_optional_layouts_finish()). Empty, or SIZE_MAX, is
+    // no cap.
+    std::vector<size_t>  fit_capacity;
+    size_t               per_layer_slack = kv_alloc_slack_per_layer;
+};
+
+struct kv_residency_result {
+    bool                            fits           = true;
+    int                             refused_device = -1;  // the device that cannot fit even with KV demoted
+    std::vector<int>                kv_device;            // the new residency
+    std::vector<kv_demotion_result> per_device;           // same indexing as devices
+    std::vector<size_t>             yield_bytes;  // optional layout bytes the fit counted as devices[i]'s headroom
+    // The copies devices[i] must release before its KV is allocated (empty
+    // when yield_bytes[i] is 0), which the caller hands to the yield as its
+    // pick list.
+    std::vector<kv_optional_layout_yield> yields;
+};
+
+// Starts from load_kv_device. A device whose KV, plus per_layer_slack per
+// resident layer, exceeds its headroom first counts up to its optional layout
+// copies' bytes as headroom (yield_bytes): an optional layout copy never
+// outranks KV for VRAM. Those bytes are headroom only where a layer lands in
+// them, so the device's copies are then modelled on its zone
+// (plan_optional_layout_yield()): the ones worth releasing become its pick list
+// (yields), and its KV is held to the leading layers the zone places once they
+// go. Only what is still over then demotes the device's latest full-attention
+// layers, then its latest SWA layers, to the host tier, with a device's KV
+// also held to its fit_capacity. It refuses only when even that cannot fit.
+kv_residency_result plan_runtime_kv_residency(const kv_residency_input & in);
+
+// devices' KV layers in allocation order (load_kv_device order), as the bytes
+// each asks its zone for (kv_layer_alloc_bytes).
+std::vector<size_t> kv_device_layer_alloc_bytes(const kv_residency_input & in, int device);
+
+// The KV bytes of device's first n_layers layers in allocation order: what a
+// device holds when n_layers of them land.
+size_t kv_device_leading_layer_bytes(const kv_residency_input & in, int device, size_t n_layers);
 
 // One device's view of a (possibly multi-device) plan for the zone-fit pass.
 struct kv_device_fit_input {

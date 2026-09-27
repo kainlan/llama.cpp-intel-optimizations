@@ -799,24 +799,45 @@ reclaims one physical layout of a tensor, not the tensor:
   sink for that graph's life. So a copy that is being read is not yieldable.
   The yield's queue barrier and the recorded-graph epoch drop are defence in
   depth behind that lease, not what makes the free correct.
-- **Who calls it.** Only `yield_optional_layouts()`, at a context's KV
+- **Who calls it.** Only the optional-layout yield, at a context's KV
   admission. `reclaim_weight_entries()` refuses the mode, because it neither
   withdraws the mirror lease nor gates a free on readers.
+- **Who picks.** The KV fit, not the cache. The transaction snapshots each
+  device's copies with a copy of its KV zone
+  (`unified_cache_optional_layouts_snapshot()`); the fit
+  (`plan_runtime_kv_residency()`) models on it which copies let more of the
+  device's layers land and hands them back as groups
+  (`kv_optional_layout_yield`), each naming its copies by key and entry
+  generation, never by pointer. A group frees one extent a layer needs whole,
+  so the yield releases it whole or not at all: if any copy in it is no longer
+  the yieldable copy the snapshot read, the group stays resident and the
+  re-fit holds the KV to what the zone places without it.
 - **Where it waits.** The KV admission transaction holds
   `g_tensor_inventory_mutex` (L1), and §12.5 of the canonical contract allows
   no wait and no destructor-running release under that lock. The yield is
   therefore split in two (`optional_layout_release`):
-  - **Begin**, under the lock: pick the copies, retire them, and submit the
-    barrier that gates their frees. It waits on nothing and drops no handle.
-  - **Finish**, with the lock released: wait on the barrier, return the
-    storage to its zone, and drop the withdrawn mirror handles.
+  - **Begin**, under the lock: check each group the fit picked against the
+    live cache, retire the groups that are still whole, and submit the barrier
+    that gates their frees. It picks nothing, waits on nothing and drops no
+    handle. If the barrier cannot be submitted, no group is released and the
+    transaction says so in its own WARN, apart from groups that were no longer
+    yieldable.
+  - **Finish**, with the lock released: wait on the barrier, reap the
+    retained handles that still reference the copies' allocation owners
+    (`release_retained_referencing()`, QUERY mode: a copy's fill retains its
+    destination until the drain worker sees the fill complete, which can be
+    long after it did), return the storage to its zone, and drop the
+    withdrawn mirror handles. A copy counts as freed only when the yield's own
+    reference to its owner turns out to be the last one and releasing it
+    returns the bytes; one still referenced after the reap is a
+    `[CONTEXT-PLAN-BUG]` (abort under `GGML_SYCL_STRICT_LEASES=1`).
   The transaction then takes the lock again. If a newer plan was published in
   between, the transaction reports busy, and the retired copies' room is there
   for the retry.
 - **Beside the PP MoE oneDNN ring.** The KV fit reads
   `ggml_sycl_kv_capacity_live()`, which counts the ring's KV-zone slots as
   free: the ring is released and re-admitted after KV (llama.cpp-u1bb). The
-  yield models the zone before that release, so it sees those slots as used.
+  fit models the zone before that release, so it sees those slots as used.
   On a device holding both copies and ring slots, the fit therefore holds KV
   to fewer layers than the ring's room would take. The error is toward
   demotion, never toward a layer outside the arena. Only a MoE model whose
