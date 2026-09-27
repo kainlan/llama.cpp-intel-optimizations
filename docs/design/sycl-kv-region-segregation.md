@@ -160,8 +160,9 @@ Design, revision 7.14t, by impl-moua, 2026-09-27. The revisions answer twenty-ei
 - design review r27 (design-moua-r27 on `f2323f9e0..7391f5e36`: 0 Critical, 2 Important, 9
   Minor, 5 nits), rulings §M73 (the load envelope c(P) is trimmed at the context transaction)
   the §M71 (a) amendment and §M74 (a vehicle-scored counter is always compiled and read from the
-  `GGML_SYCL_COUNTER_DUMP=1` dump), recorded in §6.36. Revision 7.14t is two commits on top of
-  `b225d81e3`: `f21309492` and a follow-up for §M74 and 23mk `db61cb321`'s answers.
+  `GGML_SYCL_COUNTER_DUMP=1` dump), recorded in §6.36. Revision 7.14t is three commits on top of
+  `b225d81e3`: `f21309492`, `fb9d31041` (a follow-up for §M74 and 23mk `db61cb321`'s answers)
+  and a second follow-up (the §M74 census, §3.4, with the dump fields as placeholders).
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -3938,24 +3939,27 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         never a pass (§M71 (b)). At (b1) it is the always-compiled counter dump (rulings §M74):
         the run sets `GGML_SYCL_COUNTER_DUMP=1` in its literal command, and the dump's WARN line
         `[SYCL-COUNTERS] dev=%d <name>=<value> ...`, printed at the last SYCL backend free on
-        the device, is its trace-live check (§M66). N = 0 is valid only with the SDPA-executed
-        field ≥ 1 and the fallback-after-admit field = 0 on that device, a run with no
-        `[SYCL-COUNTERS]` line is VOID, an aborting run is VOID for it, and N > 0 needs no
-        witness (§M71 (c)). The field names are 23mk's (23mk step 0 dump field list; §M71 (c)
-        calls them `onednn_sdpa_executed` and `fallback_after_admit`). 7.14s read a
-        `GGML_SYCL_PRIVATE_TESTING` exit dump, which never prints in `llama-completion`,
-        `llama-cli` or `llama-server`, since the macro is defined only on test targets (§M74),
-        so every vehicle arm that scored it was VOID by construction. The deletion of the direct
-        path has one owner: 23mk `8547a22f0` (b2) item 8 deletes it with its reuse pool, the
-        pool try at `:11704` and its test hooks (rulings §M68 (b); E-ONEDNN-GRAPH-DIRECT;
-        `50b1f8f50` :4786), and 23mk's H3 "(b1)'s interim G" arm pins that it has no caller from
-        (b1) on. **The runtime miss's arm (r26 I-3; rulings §M72), 23mk's to carry and moua's to
-        cite:** a fixture draw one byte above the planned within-ubatch peak prints
-        `[ZONE-PLAN-BUG]` once and aborts, with `GGML_SYCL_STRICT_LEASES` unset, and allocates
-        nothing. **It is 23mk H3's TERMINAL death test (23mk `db61cb321`):** the channel is a
-        `[[noreturn]]` `ggml_sycl_onednn_graph_scratch_plan_miss`, run with STRICT unset inside
-        a catch-all wrapper. GREEN is SIGABRT and exactly one `[ZONE-PLAN-BUG]` line. Its REDs
-        are a mutant that returns nullptr, one that throws (which the wrapper, like
+        the device, is its trace-live check (§M66). N = 0 is valid only with
+        `<23mk:sdpa_executed>` ≥ 1 and `<23mk:fallback_after_admit>` = 0 on that device, a run
+        with no `[SYCL-COUNTERS]` line is VOID, an aborting run is VOID for it, and N > 0 needs
+        no witness (§M71 (c)). The two names in angle brackets are placeholders for 23mk's (23mk
+        step 0 dump field list; §M71 (c) calls them `onednn_sdpa_executed` and
+        `fallback_after_admit`), and the criterion is **VOID until 23mk names relayed**: no run
+        is scored on it before the lead relays the names and this design folds them (§3.4).
+        7.14s read a `GGML_SYCL_PRIVATE_TESTING` exit dump, which never prints in
+        `llama-completion`, `llama-cli` or `llama-server`, since the macro is defined only on
+        test targets (§M74), so every vehicle arm that scored it was VOID by construction. The
+        deletion of the direct path has one owner: 23mk `8547a22f0` (b2) item 8 deletes it with
+        its reuse pool, the pool try at `:11704` and its test hooks (rulings §M68 (b);
+        E-ONEDNN-GRAPH-DIRECT; `50b1f8f50` :4786), and 23mk's H3 "(b1)'s interim G" arm pins
+        that it has no caller from (b1) on. **The runtime miss's arm (r26 I-3; rulings §M72),
+        23mk's to carry and moua's to cite:** a fixture draw one byte above the planned
+        within-ubatch peak prints `[ZONE-PLAN-BUG]` once and aborts, with
+        `GGML_SYCL_STRICT_LEASES` unset, and allocates nothing. **It is 23mk H3's TERMINAL death
+        test (23mk `db61cb321`):** the channel is a `[[noreturn]]`
+        `ggml_sycl_onednn_graph_scratch_plan_miss`, run with STRICT unset inside a catch-all
+        wrapper. GREEN is SIGABRT and exactly one `[ZONE-PLAN-BUG]` line. Its REDs are a mutant
+        that returns nullptr, one that throws (which the wrapper, like
         `fattn-onednn.cpp:1363-1366`, would catch), and one that aborts only under STRICT. No G
         arm scores a runtime miss; G1's `zone_plan_refusal` = 0 with 0 `[ZONE-PLAN-BUG]` lines
         is the gate-level zero. moua cites it and carries no arm of its own (§6.35's 23mk relay
@@ -4212,10 +4216,11 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       WARN, mirrored byte for byte, `[ZONE-PLAN-BUG] the late inventory shrinks term %s on
       device %d: early %zu B, late %zu B (admitted; the early reservation stands)`, once per
       `(load, device, term)`, and 23mk's witness counter `late_term_shrink_admitted` +1 (a
-      `GGML_SYCL_PRIVATE_TESTING` dump); the zones and ranges stay as admitted. A forced-off
-      tensor charges 0 at both stages, so `--no-host --cpu-moe` logs no shrink WARN and the
-      counter stays a signal (r13 I-B (1)). Neither refusal is a silent re-plan. An interleaved
-      transaction plans around B's ranges (below), so it cannot cause either.
+      `GGML_SYCL_PRIVATE_TESTING` counter, read only by H7ap's host arms, in a test binary,
+      §3.1; no vehicle arm scores it, rulings §M74 (d); §3.4); the zones and ranges stay as
+      admitted. A forced-off tensor charges 0 at both stages, so `--no-host --cpu-moe` logs no
+      shrink WARN and the counter stays a signal (r13 I-B (1)). Neither refusal is a silent
+      re-plan. An interleaved transaction plans around B's ranges (below), so it causes neither.
     - **"B's own" is defined by identity (rulings §M9 I-4).** An allocation is B's own when
       its request carries the owner `{LOAD, B's LoadTxnId}` (§2.3.3 A1, 23mk's addition to the
       primitive), which the caller fills for B's planned draws only: on the loading thread from
@@ -8132,20 +8137,21 @@ means that.
     - **user placement is a fixed input (§M12 m-8; rulings §M14 I-2, §M18.2; r13 I-B):** a model
       with a host-tiered layer whose tensors are `CPU_REPACK` and absent from the late inventory
       (`llama-model.cpp:680-684`) loads with no refusal; so do the user-placement fixtures `-ot
-      <pat>=CPU`, `-ncmoe` and a partial `-ngl`, each once under `--no-host` (pinned, since the
-      partial `-ngl` case is forced only there) and once in default mode (where the forced
-      tensors are SYCL_Host tensors in the late inventory). In each, B's `WEIGHT` range excludes
-      the forced tensors' bytes, the late stage packs nothing and moves no forced tensor, and
-      under `--no-host --cpu-moe` on a MoE fixture the charged `moe_onednn` is 0 on every
-      device, no shrink WARN is logged and `late_term_shrink_admitted` stays 0. The same absence
-      for a tensor the admitted plan put on a device is the named refusal. The source-contract
-      gate finds the override match once, in `resolve_create_site`. Witnesses: a comparison that
-      reads an absent tensor as a tier change (it refuses the host-tiered model); 7.12a's early
-      inventory without the forced flag (it refuses the user-placement fixtures); 7.13's
-      inventory-wide `moe_onednn` (early 564035584 B, the weight slot, late 0: one shrink
-      WARN, the counter at 1; 1617.9 MB before 7.14e moved the ring's rows to `ring`);
-      and a late re-pack in default mode, which puts a forced expert on the device and gets the
-      placement refusal;
+      <pat>=CPU`, `-ncmoe` and a partial `-ngl` (the host fixture sets the `llama_model_params`
+      those flags set; it is a test binary, not a CLI run, rulings §M74 (d)), each once under
+      `--no-host` (pinned, since the partial `-ngl` case is forced only there) and once in
+      default mode (where the forced tensors are SYCL_Host tensors in the late inventory). In
+      each, B's `WEIGHT` range excludes the forced tensors' bytes, the late stage packs nothing
+      and moves no forced tensor, and under `--no-host --cpu-moe` on a MoE fixture the charged
+      `moe_onednn` is 0 on every device, no shrink WARN is logged and
+      `late_term_shrink_admitted` stays 0. The same absence for a tensor the admitted plan put
+      on a device is the named refusal. The source-contract gate finds the override match once,
+      in `resolve_create_site`. Witnesses: a comparison that reads an absent tensor as a tier
+      change (it refuses the host-tiered model); 7.12a's early inventory without the forced flag
+      (it refuses the user-placement fixtures); 7.13's inventory-wide `moe_onednn` (early
+      564035584 B, the weight slot, late 0: one shrink WARN, the counter at 1; 1617.9 MB before
+      7.14e moved the ring's rows to `ring`); and a late re-pack in default mode, which puts a
+      forced expert on the device and gets the placement refusal;
     - **the zones come from the demands, in five steps (rulings §M14 C-1, §M17, §M17a, §M20; r13
       I-F, m-b, m-c):** positive cases from the merge-gate logs, with the terms re-derived by
       stepping the sizing code and **scored in exact bytes, never one-decimal MiB** (§M20.1; the
@@ -9663,8 +9669,9 @@ placement and demotion run. The rules for every such arm:
   the always-compiled counter dump (rulings §M74): the run sets `GGML_SYCL_COUNTER_DUMP=1` in
   its literal command, and the dump's WARN line `[SYCL-COUNTERS] dev=%d <name>=<value> ...`,
   printed at the last SYCL backend free on the device, is its trace-live check (§M66). The line
-  must show the SDPA-executed field ≥ 1 and the fallback-after-admit field = 0 on that device
-  (23mk step 0 dump field list); no `[SYCL-COUNTERS]` line is VOID, and an aborting run is VOID
+  must show `<23mk:sdpa_executed>` ≥ 1 and `<23mk:fallback_after_admit>` = 0 on that device
+  (placeholders for 23mk step 0 dump field list; this criterion is **VOID until 23mk names
+  relayed**, §3.4); no `[SYCL-COUNTERS]` line is VOID, and an aborting run is VOID
   for this witness (§M71 (c), §M74). So an arm run between (b1) and (b2) adds
   `GGML_SYCL_COUNTER_DUMP=1` to its literal command. **Pairing when a (context, device) prints
   several lines (r27 m-3).** From (b2), a GROWTH re-plan is a new transaction: it prints the
@@ -10043,7 +10050,8 @@ placement and demotion run. The rules for every such arm:
     that resolves a smaller context then cannot certify itself by printing that value twice.
     The Qwen block's command sets `GGML_SYCL_COUNTER_DUMP=1` and records its `[SYCL-COUNTERS]`
     line count, which scores the (b1) witness between (b1) and (b2) (rulings §M74; §3.3's replay
-    rule). The block is VOID unless §3.3's single-context form holds,
+    rule; the field criterion is VOID until 23mk names relayed, and the line count is the
+    block's live check either way). The block is VOID unless §3.3's single-context form holds,
     `llama_context: n_ctx +=  *<N>$` scoring exactly 1 and the any-value count 1 too (r27 I-1),
     **and** its negative control holds: the `llama_context: n_ctx_seq` line is present
     (`--verbose` makes both visible) and the same regex scores 0 on it. The regex is not
@@ -10096,7 +10104,8 @@ placement and demotion run. The rules for every such arm:
     Recorded per run, on the ticket: PP tokens per second and the prompt's token count from the
     `prompt eval time` line, A of M from the commit line's `admitted` field and M − A from the
     decline line's `declined` (§3.3's scorer, rulings §M71; no commit line is VOID), on a tree
-    between (b1) and (b2) the `[SYCL-COUNTERS]` line's SDPA fields as §3.3's (b1) witness
+    between (b1) and (b2) the `[SYCL-COUNTERS]` line whole, and its `<23mk:sdpa_executed>` and
+    `<23mk:fallback_after_admit>` fields as §3.3's (b1) witness (VOID until 23mk names relayed)
     (rulings §M74: the command sets `GGML_SYCL_COUNTER_DUMP=1`, and a run with no such line, or
     one that aborted, is VOID for it), the demoted-layer count from uize part 3's line, rc, and
     the load (`uptime`, `pgrep -af 'codescout|ninja|icpx|ffmpeg'`). A run whose token count
@@ -10369,8 +10378,11 @@ placement and demotion run. The rules for every such arm:
     persistent until `ggml_sycl_test_clear_shared_zone_free_cap(dev)`) capping the shared zone's
     ledger free room below the adapter's bytes, `llama_adapter_lora_init` returns nullptr after
     printing the `[LOAD-PLAN] LoRA adapter on device %d does not fit` line once, `model.loras`
-    stays empty, and no zone's live bytes grow. RED: L4+L6 without the extension transaction,
-    which refuses the adapter with the unplanned line.
+    stays empty, and no zone's live bytes grow. The refusal half runs in a test binary whose
+    target defines `GGML_SYCL_PRIVATE_TESTING`, since the seam is absent from the library that
+    `llama-completion` loads; the GREEN half above is the only vehicle half, and it scores no
+    `GGML_SYCL_PRIVATE_TESTING` counter (rulings §M74 (d); §3.4). RED: L4+L6 without the
+    extension transaction, which refuses the adapter with the unplanned line.
 - **C10 the merge gates' placement, plan == reality (rulings §M39 (2)).** The first-context
   reservation takes room that master's pack spent on experts, so fewer experts sit on the
   device, and the CPU runs the rest (placement decides the executor). That is the plan being
@@ -10436,6 +10448,51 @@ placement and demotion run. The rules for every such arm:
   - **Scored:** a run without the line is VOID, which fails. A run that refuses, or that
     prints `compute_placed` > `compute_probe`, fails C11. Its fix is a split-copy bound term in
     Ĉ, with the run repeated, never a looser compare.
+
+### 3.4 Which binary reads each counter (rulings §M74 census)
+
+`GGML_SYCL_PRIVATE_TESTING` is defined only by a test target's own `target_compile_definitions`
+(`ggml/src/ggml-sycl/CMakeLists.txt:160ff`, `:2089ff` at `e2461d4fb`), never on the `ggml-sycl`
+library. So a counter, seam or dump gated by it never runs in `llama-cli`, `llama-completion`,
+`llama-server` or `llama-bench`, nor in a test that links the shipped library without the
+definition (`test-thread-safety`, C5). This census lists every body site that names the macro,
+found with `cat docs/design/sycl-kv-region-segregation.md | grep -n PRIVATE_TESTING`, and says
+which binary scores it. **Test binary** is §M74 (d), fine as written, and holds only for a
+target that defines the macro in its registration (G1 and G2 say so in their headings, and each
+H arm's target does the same). **Vehicle** means a CLI vehicle arm or a dual-arm test scores it,
+so it moves to the always-compiled `[SYCL-COUNTERS]` dump (§M74 (a), (b)): the arm's literal
+command sets `GGML_SYCL_COUNTER_DUMP=1`, the dump line is its live check (no line, or an
+aborting run, is VOID), and the counter counts at the print site it witnesses (§M74 (e)).
+**(f)** is an always-compiled WARN line its owner already prints. The dump's field names are
+23mk's (§M74 (c)); until the lead relays them, this design writes them as `<23mk:name>`
+placeholders, and each criterion that reads one is **VOID until 23mk names relayed**.
+
+| site | counter, seam or hook | scored by | class |
+|---|---|---|---|
+| §2.3.3, superseded controls | controls created and freed, `superseded_released` | the H arms' teardown balance; G1 (§3.2) | test binary |
+| §2.3.3, case E | the drain worker's `in_hand` handshake | the host arm for case E (§3.1) | test binary (seam) |
+| §2.4.2, witness checks | `GGML_SYCL_WITNESS` evaluation | on in test builds; off elsewhere unless `GGML_SYCL_WITNESS_CHECKS=1` | not a counter; a failure aborts with its message, and no vehicle arm counts witnesses |
+| §2.4.2, W order | `w_order_wait_exhausted` | G0, G2 (§3.2) | test binary |
+| §2.4.2, the pack's capacity | `ggml_sycl_test_set_pack_capacity` | zhcn H5L (h) | test binary (seam) |
+| §2.4.2 (b1), and §3.3's replay rule | `<23mk:sdpa_executed>`, `<23mk:fallback_after_admit>` | the Qwen xqex baseline (`llama-completion`, §3.3 C9) and every arm run between (b1) and (b2) that scores N = 0 | **vehicle: moved** to the dump (the xqex command and the scratch script's Qwen block set `GGML_SYCL_COUNTER_DUMP=1`); VOID until 23mk names relayed |
+| §2.4.2, the late stage | `late_term_shrink_admitted` | H7ap's host arms (§3.1): user placement, `--no-host` with the experts on the host, and the late term change | test binary; no vehicle arm scores it, and the g4 merge gates score only that the model loads |
+| §2.4.2, the backstop | the H4 backstop counter | H4 (§3.1), in a subprocess | test binary |
+| §2.4.3 | `reserved_slot_claims` | G1 | test binary (accessor) |
+| §2.5 | the region scope hook | the `test-sycl-lifecycle-*` family and the kv-layer-sizing gates | test binary (hook) |
+| §2.10 | the W-order hook inside a guarded block | H7z's source gate | source gate |
+| §3.1 H4h | zhcn's hooks and its probe literal | H4h | test binary |
+| §3.1 H7, the compute-slot bound | the seam that adds bytes to c(P) | H7ap's first-context arm | test binary (seam) |
+| §3.1 H7, the ring's GPU arm | `[PP-MOE-RING] ctx=%u dev=%d batched_admitted=%zu refused=%zu` | two `llama-completion` runs (§3.3) | **(f)**: printed at WARN in every build since 7.14h (r16 I-5); no dump needed |
+| §3.1 H9 | the `-DNDEBUG` test build; `ggml_backend_sycl_test_wait_unload_parked` | H9 | test binary |
+| §3.2 G1 | the target; `unified_cache_test_graph_reclaim_available` | G1 | test binary |
+| §3.2 G2 | its seams, `ggml_sycl_test_w_order_uses` among them | G2 | test binary |
+| §3.3 C9, seam control (2) | the RUNTIME draw one byte over free room | its own test child, and the end of each process-level unit arm | test binary (seam) |
+| §3.3 C9, the post-cut VM pass (r27 m-5) | `unified_cache_ext_alloc_count_for_testing(dev)`, always compiled, not the macro | the buffer test child, directly before and after | test binary (§M74 (d)); the dump prints only at the last backend free and this child frees none, so it would be VOID on a correct run. The lead's §M74 message listed this counter; the reason is kept here for the lead to overrule |
+| §3.3 C9, the LoRA arm | `ggml_sycl_test_cap_shared_zone_free` | the refusal half, in a test binary; the GREEN half is `llama-completion` and scores no counter | test binary (dual arm; neither half scores a macro counter on a vehicle) |
+| §3.3 C5 | none | `test-thread-safety` and its sibling | no counter scored |
+| §4 L4 row | 1oxa's dump of `shared_zone_geometry` and `kv_region_request` | 1oxa's VM branch tests | test binary |
+| §4, the later-load bullet of L4+L6 (G2 lands with its seams) | G2's seams | G2 | test binary |
+| header, §6 rows | named as history | nothing | not scored |
 
 ## 4. Decomposition, effort, landing order
 
@@ -13293,8 +13350,9 @@ Master pin for source cites: `e2461d4fb`.
 
 ### 6.36 Revision 7.14t: design-moua-r27, rulings §M73, §M74 and the §M71 (a) amendment
 
-Revision 7.14t is two commits on top of `b225d81e3`: `f21309492`, and a follow-up for ruling
-§M74 and 23mk `db61cb321`'s answers to §6.35's relays (the last two rows below). It answers
+Revision 7.14t is three commits on top of `b225d81e3`: `f21309492`; `fb9d31041`, a follow-up
+for ruling §M74 and 23mk `db61cb321`'s answers to §6.35's relays (the rows marked "follow-up");
+and a second follow-up, the §M74 census (the row marked "follow-up 2"). It answers
 design review r27 (design-moua-r27 on `f2323f9e0..7391f5e36`: 0 Critical, 2 Important, 9 Minor,
 5 nits; every item a required fix) and folds rulings §M73 (the load envelope c(P) is trimmed at
 the context transaction) and the §M71 (a) amendment (23mk `db61cb321`: the `interim_tp` reason,
@@ -13325,6 +13383,7 @@ for source cites: `e2461d4fb`.
 | §M73 | the load envelope c(P) is trimmed at the context transaction | **Folded** in m-8: the Qwen server rows cite §M73 (a)-(c). C3's default arm was already scored against GDC3's replay of its own input lines (rulings §M63 (a)), which charges that run's own compute. |
 | §M74 (follow-up) | a counter scored on a vehicle arm must be in the shipped library; `GGML_SYCL_PRIVATE_TESTING` is defined only on test targets | **Changed.** The (b1) SDPA witness (§2.4.2 and §3.3's replay) is the always-compiled `[SYCL-COUNTERS]` exit dump: the arm sets `GGML_SYCL_COUNTER_DUMP=1` in its literal command, the line is its live check, no line or an aborting run is VOID for it, and the fields are cited by "23mk step 0 dump field list". The xqex command and the scratch script's Qwen block set the variable; the script records the line count. The post-cut VM pass keeps its direct counter read, since it is a test child (§M74 (d)) whose buffer child frees no backend, so the dump would never print there. The other `GGML_SYCL_PRIVATE_TESTING` counters this design scores (`late_term_shrink_admitted`, the H4 backstop counter, `w_order_wait_exhausted`, the H4h probe) are read in fixtures and test binaries, and the `[PP-MOE-RING]` teardown line is already an always-compiled WARN (§M74 (f)). |
 | 23mk `db61cb321` (follow-up) | 23mk's answers to §6.35's 23mk relays (1) and (3) | **Closed.** (1) The admitted witness is the §M71 (b) suffix, with no separate line, as moua already scores it. (3) The runtime-miss arm is 23mk H3's TERMINAL death test: `[[noreturn]]` `ggml_sycl_onednn_graph_scratch_plan_miss`, STRICT unset, a catch-all wrapper; GREEN SIGABRT with exactly one `[ZONE-PLAN-BUG]` line; REDs nullptr, throw and a STRICT-only abort. §2.4.2 cites it, and 7.14s's pre-(b1)-tree RED is withdrawn in its favour. No G arm scores a runtime miss; G1's `zone_plan_refusal` = 0 with 0 `[ZONE-PLAN-BUG]` lines is the gate-level zero. |
+| §M74 (follow-up 2) | the lead on `f21309492`: census every site that names `GGML_SYCL_PRIVATE_TESTING`, move each vehicle-scored counter to the `[SYCL-COUNTERS]` dump, and write the dump fields as placeholders until 23mk's names are relayed | **Changed.** New §3.4 is the census, one row per body site, each classed test binary (§M74 (d)), vehicle (moved to the dump) or (f) WARN. The only vehicle-scored macro counter is the (b1) SDPA witness, which `fb9d31041` moved; `late_term_shrink_admitted` is read only by H7ap's host arms (§3.1), so §2.4.2's "(a `GGML_SYCL_PRIVATE_TESTING` dump)" now says so, and the user-placement arm says its flags are the host fixture's model params; `[PP-MOE-RING]` is (f). The (b1) fields are now `<23mk:sdpa_executed>` and `<23mk:fallback_after_admit>` in §2.4.2, §3.3's replay rule and the xqex block, each criterion marked **VOID until 23mk names relayed**; the xqex block's line count stays its live check. The LoRA arm says its refusal half runs in a test binary. The post-cut VM pass keeps its direct read (§3.4 gives the reason), for the lead to overrule. |
 | §M71 (a), amended | the (b1) reason list and `kv_layer` | **Folded.** The (b1) format reads `reason=<interim_tp\|interim_capped\|interim_capacity>`; `interim_tp` keys on the process-wide TP queue, and `kv_layer` with its fill lands in (b1), a layer-unknown call keyed `il=-1`. |
 
 **Relays.**
@@ -13341,7 +13400,9 @@ for source cites: `e2461d4fb`.
   closes that relay. Under rulings §M74 moua's (b1) SDPA witness reads your step-0
   `[SYCL-COUNTERS]` dump with `GGML_SYCL_COUNTER_DUMP=1`, and cites its fields as "23mk step 0
   dump field list" until the lead relays the names; please say which fields carry SDPA executed
-  and fallback after admit.
+  and fallback after admit. (6) Follow-up 2: until then moua writes them as
+  `<23mk:sdpa_executed>` and `<23mk:fallback_after_admit>`, and marks each criterion VOID until
+  your names are relayed (§3.4).
 - **1oxa:** moua cites you at `6ee1ff1` (the lead's pin) for the C11 and W2 rows.
 - **zhcn:** moua cites GDC3 and GDC6 at `1c5e7ff`. C3's default arm now checks its `n_ubatch`
   on the run, both the constructor's line and the trial's result, rather than taking 512 from
