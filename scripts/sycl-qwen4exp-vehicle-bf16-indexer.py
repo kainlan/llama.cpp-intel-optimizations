@@ -18,33 +18,115 @@ numpy cannot load (libmkl_intel_lp64.so.2 missing).
     scripts/sycl-qwen4exp-vehicle-bf16-indexer.py <in.gguf> <out.gguf>
     scripts/sycl-qwen4exp-vehicle-bf16-indexer.py --verify <file.gguf>
 
---verify exits 0 only if the file has indexer projections and all of them are
-BF16; sycl-qwen4exp-census-run.sh runs it so an F32 indexer cannot pass as BF16.
+Both check every tensor type before any data is read: the input must be the
+step-b Q8_0 vehicle (Q8_0 experts, F32 indexer projections), and --verify's file
+the step-b2 result (Q8_0 experts, BF16 indexer projections). --verify exits 0
+only then; sycl-qwen4exp-census-run.sh runs it so a wrongly typed vehicle cannot
+score its rows as agreeing.
 """
 
+import os
 import re
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gguf-py"))
 import gguf  # noqa: E402
 
 INDEXER_PROJ = re.compile(r"^blk\.\d+\.indexer\.[qk]_proj\.weight$")
+EXPERTS      = re.compile(r"^blk\.\d+\.ffn_(gate|up|down|gate_up)_exps\.weight$")
+
+Q8_0 = gguf.GGMLQuantizationType.Q8_0
+BF16 = gguf.GGMLQuantizationType.BF16
+F32  = gguf.GGMLQuantizationType.F32
 
 
 def pad(n: int, align: int) -> int:
     return (align - n % align) % align
 
 
+def type_problems(reader: gguf.GGUFReader, indexer_type: gguf.GGMLQuantizationType) -> list[str]:
+    # MOE-MMID and IDX-PROJ-BF16 score these types, and the sched dump prints none
+    problems = []
+    for pattern, want, what in ((INDEXER_PROJ, indexer_type, "indexer.{q,k}_proj"),
+                                (EXPERTS,      Q8_0,         "ffn_*_exps")):
+        found = [t for t in reader.tensors if pattern.match(t.name)]
+        if not found:
+            problems.append(f"no {what} tensors")
+        problems += [f"{t.name} is {t.tensor_type.name}, expected {want.name}"
+                     for t in found if t.tensor_type != want]
+    return problems
+
+
+def refuse(path: str, problems: list[str]) -> int:
+    print(f"{path}: refusing: " + "; ".join(problems), file=sys.stderr)
+    return 1
+
+
 def verify(path: str) -> int:
-    reader = gguf.GGUFReader(path)
-    found = [(t.name, t.tensor_type) for t in reader.tensors if INDEXER_PROJ.match(t.name)]
-    bad = [f"{n} is {q.name}" for n, q in found if q != gguf.GGMLQuantizationType.BF16]
-    if not found or bad:
-        print(f"{path}: indexer projections are not all BF16 ({'; '.join(bad) or 'none found'}); "
-              "run this script's rewrite on it first", file=sys.stderr)
+    problems = type_problems(gguf.GGUFReader(path), BF16)
+    return refuse(path, problems) if problems else 0
+
+
+def rewrite(src: str, dst: str) -> int:
+    # a same-file rewrite would destroy the step-b input on any failure mid-write
+    if os.path.realpath(src) == os.path.realpath(dst) or (
+            os.path.exists(dst) and os.path.samefile(src, dst)):
+        print(f"{dst} is the input {src}; refusing to overwrite it", file=sys.stderr)
         return 1
+
+    reader = gguf.GGUFReader(src)
+    if reader.endianess != gguf.GGUFEndian.LITTLE:
+        print("only little-endian files are handled", file=sys.stderr)
+        return 1
+    problems = type_problems(reader, F32)
+    if problems:
+        return refuse(src, problems)
+    align = reader.alignment
+
+    kv = [f for f in reader.fields.values() if not f.name.startswith("GGUF.")]
+    kv_bytes = b"".join(p.tobytes() for f in kv for p in f.parts)
+
+    # tensor infos first, from types and shapes alone; the data is streamed below
+    infos = bytearray()
+    offset = 0
+    for t in reader.tensors:
+        convert = INDEXER_PROJ.match(t.name) is not None
+        qtype   = BF16 if convert else t.tensor_type
+        n_bytes = t.n_elements * 2 if convert else t.n_bytes
+        name = t.name.encode("utf-8")
+        ne = [int(d) for d in t.shape]
+        infos += struct.pack("<Q", len(name)) + name
+        infos += struct.pack("<I", len(ne)) + struct.pack(f"<{len(ne)}Q", *ne)
+        infos += struct.pack("<IQ", int(qtype), offset)
+        offset += n_bytes + pad(n_bytes, align)
+
+    version = int(reader.fields["GGUF.version"].parts[-1][0])
+    head = struct.pack("<IIQQ", gguf.GGUF_MAGIC, version, len(reader.tensors), len(kv))
+
+    # write beside dst and rename, so dst is either the old file or a complete new one
+    fd, tmp = tempfile.mkstemp(prefix=".bf16-indexer-", dir=os.path.dirname(os.path.abspath(dst)))
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(head + kv_bytes + infos)
+            out.write(b"\0" * pad(out.tell(), align))
+            for t in reader.tensors:
+                data = t.data
+                if INDEXER_PROJ.match(t.name):
+                    data = gguf.quants.quantize(data, BF16)
+                blob = data.tobytes()
+                out.write(blob)
+                out.write(b"\0" * pad(len(blob), align))
+        os.replace(tmp, dst)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+    for t in reader.tensors:
+        if INDEXER_PROJ.match(t.name):
+            print(f"BF16: {t.name}")
     return 0
 
 
@@ -54,56 +136,7 @@ def main() -> int:
     if len(sys.argv) != 3:
         print(__doc__.split("\n\n")[-2].strip(), file=sys.stderr)
         return 1
-    src, dst = sys.argv[1], sys.argv[2]
-
-    reader = gguf.GGUFReader(src)
-    if reader.endianess != gguf.GGUFEndian.LITTLE:
-        print("only little-endian files are handled", file=sys.stderr)
-        return 1
-    align = reader.alignment
-
-    kv = [f for f in reader.fields.values() if not f.name.startswith("GGUF.")]
-    kv_bytes = b"".join(p.tobytes() for f in kv for p in f.parts)
-
-    converted = []
-    infos = bytearray()
-    blobs = []
-    offset = 0
-    for t in reader.tensors:
-        data, qtype = t.data, t.tensor_type
-        if INDEXER_PROJ.match(t.name):
-            if qtype != gguf.GGMLQuantizationType.F32:
-                print(f"{t.name} is {qtype.name}, expected F32; refusing", file=sys.stderr)
-                return 1
-            data = gguf.quants.quantize(data, gguf.GGMLQuantizationType.BF16)
-            qtype = gguf.GGMLQuantizationType.BF16
-            converted.append(t.name)
-        blob = data.tobytes()
-        name = t.name.encode("utf-8")
-        ne = [int(d) for d in t.shape]
-        infos += struct.pack("<Q", len(name)) + name
-        infos += struct.pack("<I", len(ne)) + struct.pack(f"<{len(ne)}Q", *ne)
-        infos += struct.pack("<IQ", int(qtype), offset)
-        blobs.append(blob)
-        offset += len(blob) + pad(len(blob), align)
-
-    if not converted:
-        # a vehicle without an indexer would silently lose IDX-PROJ-BF16 coverage
-        print("no indexer.{q,k}_proj tensors found; refusing", file=sys.stderr)
-        return 1
-
-    version = int(reader.fields["GGUF.version"].parts[-1][0])
-    head = struct.pack("<IIQQ", gguf.GGUF_MAGIC, version, len(reader.tensors), len(kv))
-    with open(dst, "wb") as out:
-        out.write(head + kv_bytes + infos)
-        out.write(b"\0" * pad(out.tell(), align))
-        for blob in blobs:
-            out.write(blob)
-            out.write(b"\0" * pad(len(blob), align))
-
-    for name in converted:
-        print(f"BF16: {name}")
-    return 0
+    return rewrite(sys.argv[1], sys.argv[2])
 
 
 if __name__ == "__main__":

@@ -69,11 +69,13 @@ fi
 grep -qE '^GGML_SYCL:BOOL=ON' "$ROOT/build/CMakeCache.txt" || { echo "GGML_SYCL is not ON in build/CMakeCache.txt" >&2; exit 3; }
 [ "$(ldd "$BIN" | grep -E 'libggml-sycl|libsycl' | grep -c '=> /')" -ge 2 ] || { echo "$BIN does not link a resolvable SYCL backend" >&2; exit 3; }
 
-# bytes, and whole decimal GB (10^9 bytes) for display; /proc/meminfo's "kB" is KiB
+# every comparison is in bytes; display is decimal GB (10^9 bytes) to two places,
+# so a refusal at the floor and a pass just above it never print the same figure.
+# /proc/meminfo's "kB" is KiB
 meminfo_b() { echo $(( $(awk -v k="$1:" '$1 == k { print $2 }' /proc/meminfo) * 1024 )); }
-shmem_gb() { echo $(( $(meminfo_b Shmem) / 1000000000 )); }
-avail_gb() { echo $(( $(meminfo_b MemAvailable) / 1000000000 )); }
-stamp() { echo "$(date +%T) $1 Shmem=$(shmem_gb)GB MemAvailable=$(avail_gb)GB" | tee -a "$OUT/mem.log"; }
+gb() { awk -v b="$1" 'BEGIN { printf "%.2f", b / 1e9 }'; }
+mem_line() { echo "Shmem=$(gb "$(meminfo_b Shmem)")GB MemAvailable=$(gb "$(meminfo_b MemAvailable)")GB"; }
+stamp() { echo "$(date +%T) $1 $(mem_line)" | tee -a "$OUT/mem.log"; }
 
 REQUIRE=() EXTRA_ENV=() EXTRA_ARGS=() PREDICTION=()
 case "$MODE" in
@@ -84,7 +86,7 @@ case "$MODE" in
         SHMEM_ABORT_GB=
         # structural controls: the dump must be the whole qwen4exp graph. TOP_K
         # counts QSA only because the MoE router uses ggml_argsort_top_k (an
-        # ARGSORT, llama-graph.cpp:2118); see the census doc's vehicle section
+        # ARGSORT, llama-graph.cpp:2121); see the census doc's vehicle section
         REQUIRE=(--require GATED_DELTA_NET=ANY:36 --require MUL_MAT_ID=ANY:144 --require TOP_K=ANY:12)
         PREDICTION=(--prediction "$ROOT/scripts/sycl-qwen4exp-op-prediction.json")
         ;;
@@ -130,20 +132,25 @@ waited=0
 until settled; do
     if [ "$waited" -ge "$SETTLE_TIMEOUT_S" ]; then
         stamp "refused: not settled after ${waited}s"
-        echo "host did not settle to Shmem < 30 GB and MemAvailable > ${NEED_GB} GB in ${waited}s; release GPU.lock and escalate" >&2
+        echo "host did not settle to Shmem < 30 GB and MemAvailable > ${NEED_GB} GB in ${waited}s" \
+             "(Shmem $(meminfo_b Shmem) B, MemAvailable $(meminfo_b MemAvailable) B); release GPU.lock and escalate" >&2
         exit 3
     fi
     sleep 10; waited=$((waited + 10))
 done
 stamp "pre (settled after ${waited}s)"
 
+# LLAMA_ARG_BACKEND_SAMPLING is dropped from the environment: set_env
+# (common/arg.cpp:2326) would enable backend sampling without the flag, and its
+# ggml_top_k (llama-sampler.cpp:1603) would satisfy the TOP_K control with no QSA.
+#
 # setsid does not fork here (a background, non-job-control shell), so RUN_PID
 # is the session id of bench-guard, timeout and llama-completion alike; that is
 # checked right after the launch. The kill must go by session, not process
 # group: timeout puts itself and the binary into a group of their own
 # (setpgid), which a group kill misses.
 ONEAPI_DEVICE_SELECTOR="level_zero:$DEV" setsid -w "$ROOT/scripts/bench-guard.sh" --budget "$BUDGET" -- \
-    env GGML_SCHED_DEBUG=2 "${EXTRA_ENV[@]}" "$BIN" -m "$MODEL" -ngl 99 -c 4096 -b 512 -ub 512 "${FA[@]}" \
+    env -u LLAMA_ARG_BACKEND_SAMPLING GGML_SCHED_DEBUG=2 "${EXTRA_ENV[@]}" "$BIN" -m "$MODEL" -ngl 99 -c 4096 -b 512 -ub 512 "${FA[@]}" \
         --no-warmup -no-cnv -lv 5 --no-log-prefix --no-log-timestamps --seed 42 --temp 0 \
         -p '1, 2, 3, 4, 5,' -n 2 "${EXTRA_ARGS[@]}" \
     > "$OUT/run.out" 2> "$OUT/run.err" &
@@ -204,13 +211,13 @@ fi
 
 KILLED=0
 while kill -0 "$RUN_PID" 2>/dev/null; do
-    a=$(avail_gb) sh=$(shmem_gb)
-    echo "$(date +%T) Shmem=${sh}GB MemAvailable=${a}GB" >> "$OUT/mem.log"
+    a=$(meminfo_b MemAvailable) sh=$(meminfo_b Shmem)
+    echo "$(date +%T) Shmem=$(gb "$sh")GB MemAvailable=$(gb "$a")GB" >> "$OUT/mem.log"
     why=
-    if [ "$a" -lt "$FLOOR_GB" ]; then
-        why="MemAvailable ${a} GB < ${FLOOR_GB} GB"
-    elif [ -n "$SHMEM_ABORT_GB" ] && [ "$sh" -gt "$SHMEM_ABORT_GB" ]; then
-        why="Shmem ${sh} GB > ${SHMEM_ABORT_GB} GB"
+    if [ "$a" -lt $((FLOOR_GB * 1000000000)) ]; then
+        why="MemAvailable $(gb "$a") GB ($a B) < ${FLOOR_GB} GB"
+    elif [ -n "$SHMEM_ABORT_GB" ] && [ "$sh" -gt $((SHMEM_ABORT_GB * 1000000000)) ]; then
+        why="Shmem $(gb "$sh") GB ($sh B) > ${SHMEM_ABORT_GB} GB"
     fi
     if [ -n "$why" ]; then
         echo "watchdog: $why, killing session $SID" | tee -a "$OUT/mem.log" >&2

@@ -290,10 +290,11 @@ GPU work, lead session only, holding `GPU.lock`, one command at a time.
 2. Waits for CLAUDE.md's post-lock settle: Shmem < 30 GB and MemAvailable > max(150 GB, the mode's
    need). The qwen4exp need is 215 GB (200 GiB). After 600 s (`SETTLE_TIMEOUT_S`) it exits 3 with
    "release GPU.lock and escalate". Every memory figure the script compares or prints is decimal GB
-   (10^9 bytes), CLAUDE.md's unit; it compares in bytes, so the floor is exactly 150e9 bytes. Under
-   the host's permanent load MemAvailable can sit near or below that floor, and then an exit 3 "not
-   settled" is the rule working as intended, not a defect to work around: the lead retries later or
-   escalates, and never lowers the floor.
+   (10^9 bytes), CLAUDE.md's unit; it compares in bytes, so the floor is exactly 150e9 bytes, and
+   prints two decimals, with the bytes on a refusal, so a refusal at the floor never reads like a
+   pass. Under the host's permanent load MemAvailable can sit near or below that floor, and then an
+   exit 3 "not settled" is the rule working as intended, not a defect to work around: the lead
+   retries later or escalates, and never lowers the floor.
 3. Launches the run in its own session through `bench-guard.sh`. bench-guard enforces the budget
    (`timeout -k`), refuses to start if Shmem net of tmpfs exceeds its 10 GiB ceiling
    (`bench-guard.sh:73,190`), checks the kernel journal for GPU faults, and stamps VALID or SUSPECT.
@@ -320,7 +321,8 @@ What each run executes, for reference:
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:<0|1> setsid -w scripts/bench-guard.sh --budget <600|1800> -- \
-  env GGML_SCHED_DEBUG=2 ./build/bin/llama-completion -m <model> -ngl 99 -c 4096 -b 512 -ub 512 \
+  env -u LLAMA_ARG_BACKEND_SAMPLING GGML_SCHED_DEBUG=2 \
+    ./build/bin/llama-completion -m <model> -ngl 99 -c 4096 -b 512 -ub 512 \
     -fa <on|auto> --no-warmup -no-cnv -lv 5 --no-log-prefix --no-log-timestamps --seed 42 --temp 0 \
     -p '1, 2, 3, 4, 5,' -n 2 [--ignore-eos] > run.out 2> run.err
 ```
@@ -415,18 +417,25 @@ the Q8_0 file is 11464096 B with 98 tensors (36 Q8_0, 6 F16, 56 F32). Tensors wh
 multiple of 32 (the HC low rank 8) get quantize's fallback type.
 
 Step b2 exists because quantize cannot make the indexer BF16. `src/llama-quant.cpp:327-329` exempts
-`indexer.k_proj.weight` and `indexer.q_proj.weight` from quantization before any type is chosen, so a
-`--tensor-type 'indexer\.[qk]_proj=bf16'` override (this document's first version of step b) matches
-the names and changes nothing: the lead's run left both F32, with no BF16 conversion in the log.
-The script copies the file byte for byte except those two tensors, which it converts F32 -> BF16.
-Run on the lead's Q8_0 file it gave 7204256 B: the two projections BF16 with unchanged shapes and a
-relative error of at most 3.9e-3 (bf16 rounding), the other 96 tensors and all 162 metadata fields
-byte-identical. It copies the metadata as raw bytes because the fixture has empty arrays
+`indexer.k_proj.weight` and `indexer.q_proj.weight` from quantization before any type is chosen, so
+a `--tensor-type 'indexer\.[qk]_proj=bf16'` override (this document's first version of step b)
+matches the names and changes nothing: the lead's run left both F32, with no BF16 conversion in the
+log. The script copies the file byte for byte except those two tensors, which it converts F32 ->
+BF16. Run on the lead's Q8_0 file it gave 7204256 B: the two projections BF16 with unchanged shapes
+and a relative error of at most 3.9e-3 (bf16 rounding), the other 96 tensors and all 162 metadata
+fields byte-identical. It copies the metadata as raw bytes because the fixture has empty arrays
 (`tokenizer.ggml.merges`, `classifier.output_labels`) that gguf-py's writer refuses. Whether the
-loader accepts the rewritten file is measured only by step c. Step c cannot be pointed at the plain Q8_0 file
-by mistake: vehicle mode runs the script's `--verify` first and exits 1, before any device work,
-unless every indexer projection is BF16. The sched dump prints no types, so without that check an F32
-indexer `MUL_MAT` on SYCL0 would score as agreeing with IDX-PROJ-BF16.
+loader accepts the rewritten file is measured only by step c. The script checks every tensor type
+before it reads any data: the input must have F32 indexer projections and Q8_0
+`blk.*.ffn_*_exps.weight`, so step a's all-F32 file is refused, and so is a real shard (BF16
+indexer) before a byte of it is copied. It refuses an output that is its input, by path or through a
+symlink, and writes through a temp file beside the output plus a rename, so a failure mid-write
+leaves any existing output intact. Step c cannot be pointed at the wrong file by mistake: vehicle
+mode runs the script's `--verify` first and exits 1, before any device work, unless every indexer
+projection is BF16 and every expert weight is Q8_0. The sched dump prints no types, so without that
+check an F32 indexer `MUL_MAT` on SYCL0 would score as agreeing with IDX-PROJ-BF16, and F32 experts
+with MOE-MMID's "on Q8_0". The script's gate is `tests/test-sycl-qwen4exp-vehicle-bf16-indexer.py`
+(see the gates at the end of the lead-run section).
 
 The fixture's `qwen4exp.attention.indexer.types = 0` does not mean "no indexer". qwen4exp never
 reads that key (`src/models/qwen4exp.cpp:56-61` reads head count, key length and top_k); only the
@@ -443,14 +452,15 @@ ratio is 4. qwen4exp sets no SWA, so the model gets `llama_memory_hybrid_idx`, n
 That is conditional, not unconditional: without the indexer cache or with a zero ratio, layer 1 runs
 dense attention and emits no TOP_K. The control discriminates only because nothing else in the graph
 emits `GGML_OP_TOP_K`. `qwen4exp.cpp:684` is the model's only `ggml_top_k`, and the MoE router
-selects experts with `ggml_argsort_top_k` (`src/llama-graph.cpp:2118`), which is an `ARGSORT` plus a
+selects experts with `ggml_argsort_top_k` (`src/llama-graph.cpp:2121`), which is an `ARGSORT` plus a
 view (`ggml.c:5500-5511`), not a TOP_K node. The same holds for the qwen4exp mode's `TOP_K=ANY:12`.
 If the router ever switches to `ggml_top_k`, both controls pass with no QSA at all. Backend sampling
-would do the same through `llama-sampler.cpp:1603`; it is off by default (`common/common.h:297`),
-and the script never passes the flag that enables it (`common/arg.cpp:2324`). The `MUL_MAT_ID`
-minimum is 4, not 6, because whether the fixture creates the merged `ffn_gate_up_exps`
-(`create_tensor_gate_up_exps`, `src/llama-model.cpp:4253`) decides whether a layer has 2 or 3 of
-them.
+would do the same through `llama-sampler.cpp:1603`. It is off by default (`common/common.h:297`) and
+the script does not pass `--backend-sampling`, but the option also reads
+`LLAMA_ARG_BACKEND_SAMPLING` from the environment (`set_env`, `common/arg.cpp:2326`), so the script
+launches with `env -u LLAMA_ARG_BACKEND_SAMPLING`. The `MUL_MAT_ID` minimum is 4, not 6, because
+whether the fixture creates the merged `ffn_gate_up_exps` (`create_tensor_gate_up_exps`,
+`src/llama-model.cpp:4253`) decides whether a layer has 2 or 3 of them.
 
 What the vehicle exercises, per prediction rule:
 
@@ -484,21 +494,19 @@ The full-model census waits on one of these:
 - the storage-tier lanes, which would place the 50.66 GiB PLE table on SSD (`llama.cpp-th32`,
   `llama.cpp-9g22`);
 - a decision on SYCL mmap support. **`llama.cpp-5efe`** ("SYCL: mmap_support=0 makes lazy model
-  loading AUTO resolve to OFF", P3, open) is that ticket, but it covers lazy mode only.
+  loading AUTO resolve to OFF", open, now P2) is that ticket; as filed it covered lazy mode only.
 
-The lead added this comment to 5efe on 2026-09-27:
-
-> Widen the scope. The same unset `mmap_support` also turns off `use_mmap` under
-> `LLAMA_LOAD_MODE_AUTO` (`src/llama-model.cpp:2245-2253`), not only AUTO lazy mode (`:2255-2265`).
-> Every SYCL load therefore reads the whole file into host buffers. For Qwen3.8-Flash-Next Q8_0
-> (177 GiB) that needs about 175 GiB resident, against 151-159 GiB MemAvailable under this host's
-> permanent load, so the qwen4exp op census (`llama.cpp-k6jy`) cannot run on the real model. Raise
-> the priority from P3. Decide which of these holds:
-> - SYCL advertises mmap and the unified cache adopts mmap-backed host tiers;
-> - the storage tier (th32) owns those bytes instead;
-> - `-lzm on` is the documented requirement.
->
-> Whichever it is, `llama.cpp-qptd` (`-ngl 0` loses mmap) is the same root.
+The lead commented on 5efe on 2026-09-27 (tracker comment `c-yuc0`; read it there, this is a summary,
+not a quote):
+- The scope widens: the same unset `mmap_support` also turns off `use_mmap` under
+  `LLAMA_LOAD_MODE_AUTO` (`src/llama-model.cpp:2245-2253`), not only AUTO lazy mode (`:2255-2265`),
+  so every SYCL load reads the whole file into host buffers. Qwen3.8-Flash-Next Q8_0 (177 GiB) needs
+  about 175 GiB resident against 151-159 GiB (162-171 GB) MemAvailable, so this census cannot run
+  on the real model. (The comment's figures were first posted as "GB" and corrected to GiB.)
+- The ticket moves toward P2 (it is P2 now). The decision is one of: SYCL advertises mmap and the
+  unified cache adopts mmap-backed host tiers; the storage tier (`llama.cpp-th32`) owns those bytes;
+  or `-lzm on` becomes the documented requirement. Whichever holds, the unified cache must own the
+  bytes (P1), and `llama.cpp-qptd` (`-ngl 0` loses mmap) has the same root.
 
 If the qwen4exp run does start (after mmap, or on a quieter host): Shmem may legitimately exceed
 CLAUDE.md's ~100 GB abort line when the host experts are USM-backed. The MemAvailable watchdog, which
@@ -567,6 +575,23 @@ The parser at `53eb4b700` fails it with 25 assertions (re-run 2026-09-27: 1 in t
 mode, 10 each in the timestamp and bare-prefix modes, 4 on the golden excerpt), among them
 "[timestamp] n_tokens classes: expected [512, 1], got [None, None]" and the same on the golden
 excerpt.
+
+The step-b2 script's gate is `tests/test-sycl-qwen4exp-vehicle-bf16-indexer.py` (ctest
+`test-sycl-qwen4exp-vehicle-bf16-indexer`). It is standard-library Python that plants tiny GGUFs and
+runs the script through its `/usr/bin/python3` shebang; it exits 77 (skip) when that interpreter has
+no numpy. It requires:
+- a rewrite whose projections are bit-exact to ggml's round-to-nearest-even (ties both ways, NaN,
+  inf, -0, a subnormal, max finite) and whose every other byte is unchanged, accepted by `--verify`;
+- rc 1, no output and an untouched input for an output that is the input (same path or symlink),
+  step a's all-F32 file, an already-BF16 indexer, and no indexer;
+- `--verify` to refuse F32 indexers and F32 experts;
+- an existing output to survive a write that fails partway (a file-size limit, as ENOSPC would);
+- a wrongly typed file to be refused before its data is read: with a 256 MiB sparse tensor ahead of
+  the indexer, the script's peak RSS stays under half of it.
+
+The script at `f6f0746b9` fails it with 9 assertions: the same-path and symlink overwrites (2 each),
+the all-F32 file accepted (2), F32 experts accepted by `--verify`, the existing output destroyed
+mid-write, and the early refusal (peak RSS 558484 KiB against 34680 KiB after the fix).
 
 ## Proposed closure tickets (not filed: the lead files them once the census confirms)
 
