@@ -1602,6 +1602,41 @@ if (NOT WIN32)
         TIMEOUT 120
     )
 
+    # Gate for parse-sycl-sched-census.py, which reads the qwen4exp op census
+    # (docs/backend/sycl-qwen4exp-op-census.md) out of a GGML_SCHED_DEBUG=2 log.
+    # An empty census reads as "no gaps", so the gate plants CPU splits in a
+    # synthetic dump and requires them counted, and requires a log with no dump
+    # to come back VOID. It also checks that every rule in the checked-in
+    # prediction names an op ggml actually prints. Same plain-script rationale
+    # as its siblings above.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-sched-census
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-sched-census.py
+    )
+    set_tests_properties(test-sycl-sched-census PROPERTIES
+        LABELS "sycl;profiling;tdd"
+        TIMEOUT 120
+    )
+
+    # Gate for sycl-qwen4exp-vehicle-rewrite.py, which writes the census vehicle
+    # whose tensor types and layouts the census cannot see. Standard-library Python
+    # that runs the script through its /usr/bin/python3 shebang (this host's
+    # ctest interpreter cannot load numpy), so it skips (77) where that
+    # interpreter is missing or cannot import gguf-py (numpy and yaml).
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-qwen4exp-vehicle-rewrite
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-qwen4exp-vehicle-rewrite.py
+    )
+    set_tests_properties(test-sycl-qwen4exp-vehicle-rewrite PROPERTIES
+        LABELS "sycl;profiling;tdd"
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+    )
+
     # ---------------------------------------------------------------------
     # RESTORED COVERAGE, batch 1/N (llama.cpp-0igs): 37 pytest-style gates for
     # the scripts/ profiling toolchain that were in-tree and UNREGISTERED.
