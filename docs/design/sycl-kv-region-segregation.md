@@ -165,9 +165,10 @@ Design, revision 7.14t, by impl-moua, 2026-09-27. The revisions answer twenty-ei
   `9703897b2` (the §M74 census, §3.4) and `e15f4095d` (the dump re-pinned to §M74 (g)-(i),
   23mk's format and names).
 - design review r28 (design-moua-r28 on `7391f5e36..e15f4095d`: 0 Critical, 0 Important, 4
-  Minor, 5 nits), rulings §M76 (decline and commit lines pair by transaction id) and the §M74
+  Minor, 5 nits), rulings §M78 (decline and commit lines pair by transaction id) and the §M74
   (i) (2) and (4) amendments, and 23mk `372bb5b16`'s answer on the pure interim decision,
-  recorded in §6.37. Revision 7.14u is one commit on top of `e15f4095d`.
+  recorded in §6.37. Revision 7.14u is two commits on top of `e15f4095d`, `2da8e3ed7` and a
+  follow-up that re-cites the pairing ruling as §M78.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -180,9 +181,9 @@ one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2,
 §V15, §V15a, §V16, §V16a, §M34, §M35, §G1, §G1a, §V17, §M36, §M37, §Z20, §M38, §G1b, §M39, §G1c,
 §M40, §M41, §Z-23mk-411, §M42, §Z21, §Z23, §Z22, §M43, §M44, §Z24, §Z26, §M45, §M46, §M46b,
 §Z28, §M47, §M47a, §M48, §M49, §F3, §M50, §M51, §M52, §M53, §M56, §M59, §M60, §M61, §M62, §M63,
-§M64, §M66, §M67, §M68, §M70, §M71, §M72, §M73, §M74). §M11a is a relay line inside §Z8, not a
-section, and is cited as §Z8 I-2 (r12 m-14). This document cites it as "rulings §X". **Where
-this document paraphrases a ruling and differs from the file, the file wins.**
+§M64, §M66, §M67, §M68, §M70, §M71, §M72, §M73, §M74, §M78). §M11a is a relay line inside §Z8,
+not a section, and is cited as §Z8 I-2 (r12 m-14). This document cites it as "rulings §X".
+**Where this document paraphrases a ruling and differs from the file, the file wins.**
 
 Revisions cited:
 - **Current master is `3d9414c8c`, which contains jehw and u1bb** (jehw landed). Revision 7.6
@@ -3940,7 +3941,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         scores them and does not own them:
         - from (b2), the fit's decline, one line per (context, device) per transaction, printed
           only when N ≥ 1 and carrying `txn=%u` with the commit line of the same transaction
-          (rulings §M76, pending 23mk's txn field; §3.3's pairing), N the routed device-KV
+          (rulings §M78, pending 23mk's txn field; §3.3's pairing), N the routed device-KV
           layers left out and M the routed device-KV candidates, with
           `onednn_graph_route_declined{scratch_unplaced}` raised by N:
           `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d declined=%u of %u layers
@@ -3960,7 +3961,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         run. From (b2) it is §M30's commit line, whose prefix stays byte-identical and which
         gains the suffix ` admitted=%u of %u layers` (§2.3.2's `ONEDNN_GRAPH_SCRATCH` term);
         per (context, device) and transaction the decline line's `declined`, 0 when there is
-        none, must equal M − `admitted` of the commit line with the same `txn` (rulings §M76,
+        none, must equal M − `admitted` of the commit line with the same `txn` (rulings §M78,
         pending 23mk's txn field; §3.3's pairing), a run with no commit line is VOID, and M = 0
         is VOID for any SDPA claim, never a pass (§M71 (b)). At (b1) it is 23mk's counter dump
         (rulings §M74 (g)-(i); 23mk `a8cfbf901` §5.1), read as §3.4 says: the run sets
@@ -9741,9 +9742,9 @@ placement and demotion run. The rules for every such arm:
   line, or a mismatched `end` count, is VOID, an aborting run prints no dump and is VOID, and a
   reading taken before the counters' producer lands is VOID (§M71 (c), §M74 (i) (2)). So an arm
   run between (b1) and (b2) adds `GGML_SYCL_COUNTER_DUMP=1` to its literal command. **Pairing
-  when a (context, device) prints several lines (rulings §M76; r28 m-2), per §M76, pending
+  when a (context, device) prints several lines (rulings §M78; r28 m-2), per §M78, pending
   23mk's txn field.** From (b2), a GROWTH re-plan is a new transaction and prints its lines
-  again. Under §M76 the decline line and the commit line both carry `txn=%u`, the context
+  again. Under §M78 the decline line and the commit line both carry `txn=%u`, the context
   transaction's id, unique per (context, device), and any transaction that prints a decline line
   also prints its commit line, even when the range is unchanged. A decline line pairs with the
   commit line of the same `txn`; a decline line with no same-`txn` commit line is VOID; a commit
@@ -13486,7 +13487,7 @@ for source cites: `e2461d4fb`.
 | I-2 | C3's `-ub 1024` "ladder" count was vacuous: a pinned `-ub` switches the trial off, and a MoE ladder has one rung | **Changed.** New arm C2b: Mistral on the B70 with `-ub` unpinned and `GGML_SYCL_TUNING_CACHE=0`, so the trial runs the ladder; VOID unless the trial's own `[SYCL-PLAN] auto n_ubatch=... (tried %s; %s)` line names at least two rungs with a reason other than `cached`, and the `tuning cache disabled:` line prints. Scored: exactly 1 `[KV-REGION] reserve` for its (context, device); RED: L6's idempotent key removed, one line per publish. §2.3.2's "one KV region per `(c, d)`" rests on C2b. C3's `-ub 1024` run keeps the ring, and its count is only its trace-live check. |
 | m-1; §M68 | (b1) was said to remove the pool try at `:11704`, which 23mk deletes in (b2) item 8 | **Changed.** (b1) replaces only the `:11708` call. The pool try is 23mk `50b1f8f50` (b2) item 8's (:4786), cited beside the direct path's deletion. From (b1) the pool is empty, since it holds only parked direct allocations and none is made; a zone miss still runs the try, which returns null, then reaches the TERMINAL channel. The §6.35 I-3 row is marked amended. |
 | m-2 | the dispatch-side read of the admission decision had no site | **Changed.** It is 23mk (b2)'s route decline at the SDPA entry (`fattn-onednn.cpp:981`, `params.kv_layer`; `50b1f8f50` :4488, :4705-4706), which both the D ≤ 256 route (`fattn.cpp:3123-3135`, native FA on false at `:3132-3135`) and the D = 512 route (`:3905-3927`) enter. The Qwen arms (C9's Qwen replay, the xqex runs, C10) depend on it. llama.cpp-03nm is D = 512 only and outside moua's scope: gemma4 E4B, the one D = 512 model here, is a load-only confirmation with no SDPA field. Amended in §6.37 (r28 m-1): the reader is 23mk's routing read before the plan, and the entry keeps only a backstop. |
-| m-3 | the (b1)-era scorer had no pre-registration, and multi-line pairing was unstated | **Changed.** The replay evaluates 23mk's `ggml_sycl_onednn_graph_interim_decline(capped, capacity, term)` per routed layer over the device's planned interim capacity and the per-shape term, giving (b1)'s N and reasons; the last interim line per (context, device) is scored against it, with §M71 (c)'s dump as the N = 0 witness. `interim_tp` is not replayed, and a run that prints it is VOID for the (b1) score. From (b2) the lines pair by print order: each decline line with the first commit line after it, a commit line with no decline since the previous one with `declined` = 0; the last pair is scored, and a trailing decline line with no commit line after it is VOID. Amended in §6.37 (r28 m-2 and the relay (3) answer): pairing is by `txn` per §M76, and the replay is final. |
+| m-3 | the (b1)-era scorer had no pre-registration, and multi-line pairing was unstated | **Changed.** The replay evaluates 23mk's `ggml_sycl_onednn_graph_interim_decline(capped, capacity, term)` per routed layer over the device's planned interim capacity and the per-shape term, giving (b1)'s N and reasons; the last interim line per (context, device) is scored against it, with §M71 (c)'s dump as the N = 0 witness. `interim_tp` is not replayed, and a run that prints it is VOID for the (b1) score. From (b2) the lines pair by print order: each decline line with the first commit line after it, a commit line with no decline since the previous one with `declined` = 0; the last pair is scored, and a trailing decline line with no commit line after it is VOID. Amended in §6.37 (r28 m-2 and the relay (3) answer): pairing is by `txn` per §M78, and the replay is final. |
 | m-4; §M66 | the unplanned-buffer and scoped-miss GREENs said zero `[EXT-ALLOC]` lines, against the arming rule's one seam line | **Changed.** Each unit arm prints `[MOUA-SEAM] seam draw` to stderr, flushed, immediately before the seam draw, and scores 0 `[EXT-ALLOC]` lines before it and exactly 1 after it, carrying `cohort=backend-buffer-runtime-zone`; no marker, or 0 after it, is VOID. Both GREENs and the no-model arm's reason for its own child say so. |
 | m-5; §M66 | the post-cut VM `[EXT-ALLOC]` zero was vacuous, since the printer runs only after a successful raw allocation | **Changed.** The post-cut pass scores no `[EXT-ALLOC]` line. Raw exits are scored by 23mk's always-compiled `unified_cache_ext_alloc_count_for_testing(dev)` (`50b1f8f50` §5.1), equal before and after the pass; on a tree without it the field is recorded as not scored. The §6.35 I-1 row's "found no other" is marked amended. (Follow-up, §M74: the pass is a test child and reads the counter directly under §M74 (d); see the §M74 row.) Amended in §6.37 (r28 m-3): the USM pass is the counter's positive control, at argument 0. |
 | m-6; §M60 (b) | the ubatch rule ("each command pins `-ub 512`") contradicted C3's ring run, C7's GA and C5's registration, and C3's pinned arm carried none | **Changed.** "Every command pins its `-ub`, 512 unless stated", with the exceptions listed with their reasons: C3's ring run and C7's GA at 1024, C5 and its sibling at the registration's `-ub 32` (the added `-ub 512` is removed), C2b and C3's default arm unpinned. C3's pinned arm gains `-ub 512`. C3's default arm checks `llama_context: n_ubatch += *512$` and the trial's `auto n_ubatch=512 for n_ctx=131072`, each 1, else VOID. |
@@ -13532,11 +13533,12 @@ for source cites: `e2461d4fb`.
   on the run, both the constructor's line and the trial's result, rather than taking 512 from
   GDC3.
 
-### 6.37 Revision 7.14u: design-moua-r28, rulings §M76 and the §M74 (i) amendments, 23mk `372bb5b16`
+### 6.37 Revision 7.14u: design-moua-r28, rulings §M78 and the §M74 (i) amendments, 23mk `372bb5b16`
 
-Revision 7.14u is one commit on top of `e15f4095d`. It answers design review r28
+Revision 7.14u is two commits on top of `e15f4095d`: `2da8e3ed7`, and a follow-up that
+renumbers the pairing ruling's cites to §M78 (the last row below). It answers design review r28
 (design-moua-r28 on `7391f5e36..e15f4095d`: 0 Critical, 0 Important, 4 Minor, 5 nits; every
-item a required fix; both r27 Importants verified closed) and folds rulings §M76 (decline and
+item a required fix; both r27 Importants verified closed) and folds rulings §M78 (decline and
 commit lines carry a transaction id), the §M74 (i) (2) and (4) amendments, and 23mk
 `372bb5b16`'s answer to §6.36's 23mk relay (3), queued during r28. 23mk's head for its routing
 read is `bd560d3dd`. The §6.36 rows it amends (m-2, m-3, m-5, m-9) are marked in place.
@@ -13544,7 +13546,7 @@ read is `bd560d3dd`. The §6.36 rows it amends (m-2, m-3, m-5, m-9) are marked i
 | item | finding / ruling | disposition |
 |---|---|---|
 | m-1 | the dispatch read of the admitted decision was cited at the SDPA entry (`fattn-onednn.cpp:981`), which 23mk `a8cfbf901` moved to a routing read before the plan | **Changed.** §2.4.2 names 23mk's routing read: the three dispatch arms (`fattn.cpp:2788`, `:3123`, `:3907` at `d8a67422d`) call `ggml_sycl_fattn_onednn_dispatch_routed(..., site)`, which reads `ggml_sycl_onednn_graph_dispatch_declined` before `ggml_sycl_flash_attn_ext_onednn_plan`; a declined read counts `onednn_graph_mask_declined{force\|default\|d512}` and its total and falls through to native FA. The entry keeps only the uncounted backstop, `onednn_graph_decline_at_entry`, which 23mk predicts 0. (b1)'s location is the routing read's interim seam, and (b2) deletes the seam, not the read. The 03nm sentence now reads 23mk's scope, a declined D = 512 call with no tile route. §3.3's replay names its shapes: every prompt ubatch and decode step the run issues, since decode calls now reach the check, a layer's verdict taken at its largest-term call. §3.4 states the key-level rules for keyed counters. |
-| m-2; §M76 | print-order pairing failed a correct tree once a transaction reprinted its decline line without a commit line | **Changed.** Pairing is by `txn`, per §M76, pending 23mk's txn field: the decline line and the commit line of one transaction share a `txn`, a decline without a same-`txn` commit is VOID, and the last `txn` per (context, device) is scored. Print-order pairing is withdrawn, with r28's C0/D1/C2 counterexample recorded. Until the lead relays 23mk's commit, a run is scored only with at most one decline line and exactly one commit line per (context, device), and anything more is VOID with the lines recorded. §2.4.2's (b2) decline bullet and its witness sentence say the same. |
+| m-2; §M78 | print-order pairing failed a correct tree once a transaction reprinted its decline line without a commit line | **Changed.** Pairing is by `txn`, per §M78, pending 23mk's txn field: the decline line and the commit line of one transaction share a `txn`, a decline without a same-`txn` commit is VOID, and the last `txn` per (context, device) is scored. Print-order pairing is withdrawn, with r28's C0/D1/C2 counterexample recorded. Until the lead relays 23mk's commit, a run is scored only with at most one decline line and exactly one commit line per (context, device), and anything more is VOID with the lines recorded. §2.4.2's (b2) decline bullet and its witness sentence say the same. |
 | m-3 | the post-cut VM pass's equal readings had no positive witness, and the accessor's argument was unstated | **Changed.** The USM no-model pass prints `unified_cache_ext_alloc_count_for_testing(0)` before the 1 MiB buffer and after `ggml_opt_init`, in each half, and scores +2, equal to that half's `[EXT-ALLOC]` lines (§M74 (e)). The argument is 0, the post-selector index of `level_zero:1`, and the post-cut pass states the same argument. |
 | m-4 | the out-of-bound W-order WARN and its abort message had no test | **Changed.** G2 gains two Form M seams, `ggml_sycl_test_set_w_order_bound` and `ggml_sycl_test_w_order_drop_next_publisher`, and a bound cell of three children: above the bound with no fault (one WARN per (context, device), exit 0), above the bound with a lost publisher (the out-of-bound abort message only), and inside the bound with a lost publisher (the `W ordering lost` message only). REDs: the flag never set, and the WARN's print dropped. §2.4.2 cites the cell as the scored zero's positive control. |
 | n-1 | the xqex `end` grep sat at 8 spaces | **Changed.** At 4. |
@@ -13552,6 +13554,7 @@ read is `bd560d3dd`. The §6.36 rows it amends (m-2, m-3, m-5, m-9) are marked i
 | n-3 | the state-seq arm was missing from the `-ub` exception list | **Changed.** Listed: `test-save-load-state` sets `n_batch = 100` (`:872`), so `n_ubatch` is 100 and the trial takes its no-ladder exit (`src/llama-context.cpp:1461-1464`); no figure depends on it. |
 | n-4 | `late_term_shrink_admitted` was called a `GGML_SYCL_PRIVATE_TESTING` counter | **Changed.** §2.4.2 and §3.4 call it 23mk's always-compiled counter, a §5.1 dump field (§M74 (h)), read here only by H7ap's host arms. |
 | n-5 | a missing comma in the header's r27 bullet | **Changed.** |
+| §M78 (numbering) | the lead: the txn and co-print ruling is §M78, since §M76 (moua 7.6's rulings) and §M77 were taken | **Changed** in a follow-up commit: every cite of the pairing ruling reads §M78; the §M76 and §M76a cites to moua 7.6's rulings are unchanged. |
 | 23mk `372bb5b16` (queued during r28) | relay (3): may a replay call the interim decision? | **Closed.** Yes: `constexpr ggml_sycl_onednn_graph_interim_reason ggml_sycl_onednn_graph_interim_decline(bool tp, bool capped, size_t capacity, size_t term) noexcept`, inline in `fattn-onednn.hpp` (L4514), reading only its arguments and pinned by H3's four `static_assert`s and a source pin; (b2) deletes it. The replay calls it with `tp` = false, and the (b1) pre-registration is final; §2.4.2 cites the four-argument form and its reasons. 23mk's seam and "sum over sites" wording at `372bb5b16` predate its §M74 (i) fold, so moua keeps reading the totals. |
 | §M74 (i) (2), (4) amendments | `onednn_graph_mask_declined` counts per routing read, keyed by site; zeros are scored on totals only, and every keyed counter prints a total | **Folded** in §3.4's keyed-counter rule and §2.4.2's routing read. moua scores none of the mask counter's keys. |
 
@@ -13559,5 +13562,5 @@ read is `bd560d3dd`. The §6.36 rows it amends (m-2, m-3, m-5, m-9) are marked i
 - **23mk:** (1) moua cites your routing read (`a8cfbf901` rev 4.19a, §4.8, at `bd560d3dd`) as
   the dispatch read of the decision, with the entry's backstop predicted 0, and the 03nm scope
   as your "Where a declined layer runs". (2) moua's (b2) pairing waits for your `txn=%u` field
-  on both lines under §M76; please say where in each line it prints. (3) Closed: moua's replay
+  on both lines under §M78; please say where in each line it prints. (3) Closed: moua's replay
   calls your four-argument pure decision with `tp` = false.
