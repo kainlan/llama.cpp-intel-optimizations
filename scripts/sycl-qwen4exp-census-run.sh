@@ -92,10 +92,10 @@ case "$MODE" in
         ;;
     vehicle)
         [ -n "$VEHICLE_MODEL" ] && [ -f "$VEHICLE_MODEL" ] || { echo "set QWEN4EXP_VEHICLE to the quantized synthetic qwen4exp GGUF" >&2; exit 1; }
-        # the dump prints no types or layouts, so an F32 indexer would score
-        # IDX-PROJ-BF16 as agreeing and a fused gate_up would score MOE-MMID on a
-        # path the real model never takes; refuse any file the rewrite (census
-        # doc, step b2) has not made
+        # the dump prints no types, and nothing marks a tensor that should not be
+        # there, so a vehicle whose tensors differ from the real model's would
+        # score paths the real model never takes; refuse any file whose tensor set
+        # differs from scripts/sycl-qwen4exp-real-tensors.json (census doc, step b2)
         "$ROOT/scripts/sycl-qwen4exp-vehicle-rewrite.py" --verify "$VEHICLE_MODEL" || exit 1
         NEED_GB=30 BUDGET=600 MODEL="$VEHICLE_MODEL" FA=(-fa auto) N_EMBD=256
         # 2 layers: one GDN layer, one QSA layer, MoE on both -- 3 MUL_MAT_ID per
