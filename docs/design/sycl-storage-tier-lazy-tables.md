@@ -1845,10 +1845,16 @@ failure path waits for IO.
   - **copy not enqueued**: cancel plus marker, with the host stores first.
     These epochs are the **cancel set**; each needs a cancellation marker, or
     its entry never frees;
-  - **copy enqueued, stage 2 unsignalled**: the drain, which is the
-    force-signal and the stage re-post (the request's `drain` flag). The copy
-    already `depends_on` the event, its own marker frees the entry, and its
-    output is discarded: the graph failed, and nothing reads that tensor;
+  - **copy enqueued, stage 2 unsignalled**: the drain. The step sets the
+    request's `drain` flag and re-posts the stage, and enqueues nothing: the
+    flag is what turns the re-post into the force-signal, because the
+    re-posted stage reads it, skips its dequant if it has not begun it, and
+    signals its event at once without waiting for its reads (below). The copy
+    already `depends_on` that event, so it then runs, moving output-slot rows
+    that nothing reads, since the graph failed, and its own copy marker writes
+    `e` and frees the entry. The flag and the re-post are the whole of the
+    drain; no cancellation marker is enqueued for this case, and it is
+    counted in `epochs_drained`, not `epochs_cancelled`;
   - **copy enqueued, stage 2 signalled**: no action. The epoch completes
     normally: its marker `e` was already enqueued with the copy, which writes
     it on completion.
@@ -3570,7 +3576,7 @@ Each ticket names the RED that must fail before its code exists (*lead ruling
   *lead ruling §T7* 1 asked for is **withdrawn** for th32 (*§T8* I-1).
 
 **Relays to `9g22`** (through the lead, *lead rulings §T8, §T10, §D12, §T12,
-§D12e, §D12f*). th32 pins it at rev 14 (`35e063206`), which pins th32 at rev
+§D12e, §D12f*). th32 pins it at rev 14a (`3e4d19473`), which pins th32 at rev
 2i and already has, checked there: the device-written cancellation marker, the
 backend cancel step before the flush with the failed-graph mark and at a
 throwing `synchronize()`, `D_cold` = (`in_flight_depth` + 1) x 40 (*§D12a*),
@@ -3582,43 +3588,34 @@ input guard's sync in its list of non-graph watchdog scopes,
 `llama.cpp-uwlx` as the accessor's sole definer (*§G1b*, *§G1c*), *§D12d*'s
 mark with its scope and three consumers, and every shared item of *§D12f*:
 the three-case partition by `copy_enqueued`, with throw-free host stores
-(flags, slot, recorded re-post) before the marker enqueue (I-1, *§D12e*); the
+(flags and a re-post that cannot throw) before the marker enqueue, and the
+drain as the flag and the re-post with nothing enqueued (I-1, *§D12e*); the
 mark arms with reads held, the backstop off by a hook with
 `epochs_cancelled{backstop}` = 0 as its engagement check, the site labels
 `catch`, `sync`, `entry`, `teardown` and `backstop`, and
 `cold_mark_consumed{catch, sync, entry}` (I-2); the witness once per ubatch
-per family with its own snapshot (m-2); SYCL backend device 0 as the host
-buffer's device (m-3); the queue seam with kinds TP and FOREIGN (m-5); both
-strict forms with `cold-input-unguarded` (m-6); the watchdog scope engaged
-only for a lazy or cold context, with a Mistral regression arm and a
-cold-plan positive control (m-7); the fault fact per device only for device
-loss, with a queue-refused marker submission as a poison source (m-8). Its r9
-m10 relays (a) and (b) are in th32: the cold first reader in T7's boundary set
-(§7.4) and T5's test-only FIFO override (§5.2.1); its (c), the cold arm, is
-yl3v's acceptance, on th32's fixture (*§D12f* m-10). Open for it from rev 2j:
-- re-pin th32 at rev 2j (th32 pins it at rev 10, `054069548`, by anchor, and
-  its rev-14 checks against 2i, the -8.9 to -6.0 quote, the T2 phases and the
-  §5.2.1 FIFO override, are unchanged in 2j);
-- **a join re-keys only within a context** (§5.2.1, r7 m-7): across contexts
-  it adds the joiner's own queue entry, since two contexts' epochs do not
-  compare; within an equal key, reads go in enqueue order (r7 m-6);
-- HT-1..HT-6; HT-6, the long hold, matters more to its cold path, which
-  parks the device longer, and its report now records the loaded xe module
-  (§7.2, r6 m-9);
-- **the watchdog rule** (§5.3, *§T10* I-6 (a)), now stated with its limits:
-  only class-0 reads heartbeat, the heartbeat is process-global like every
-  other (r6 m-6), and every wait outside `graph_compute` runs in a non-graph
-  scope (*§D12a* m16);
-- **a join inherits the more urgent key** (§5.2.1, *§T12* I-C). Its cold
-  slices, which two contexts routing the same expert share routinely, take
-  the rule, and T5's shared-block RED covers them;
-- **if HT-6 resets, continuation submission** (§7.2, *§T12* I-D), shared: the
-  IO completion submits the copy and the rest of the graph, and no host waits;
-- its site row 2 (a HOST output in the `SYCL_Host` buffer) is rev 2a's form;
-- th32's backend RED throws after the first reader, not between the hand-off
-  and the first reader, because th32 enqueues no copy before its first reader
-  (T7 (4)); the cold path, whose flush can enqueue a cold copy, keeps its
-  placement.
+per family with its own snapshot, and its full-bypass RED with the engagement
+check (m-1, m-2); SYCL backend device 0 as the host buffer's device (m-3);
+the queue seam with kinds TP and FOREIGN (m-5); both strict forms with
+`cold-input-unguarded` (m-6); the watchdog scope engaged only for a lazy or
+cold context, with a Mistral regression arm and a cold-plan positive control
+(m-7); the fault fact per device only for device loss, with a queue-refused
+marker submission as a poison source (m-8). Rev 14a also closes th32's
+earlier relays: a failed host buffer sync poisons through th32's fault fact
+(r7 m-9 (b)); a join re-keys only within a context, and a join from another
+context adds its own entry at its own key (r7 m-7, *§T12* I-C); its IO
+ordering and heartbeat are th32's, with no rule of its own (*§T10* I-6 (a));
+HT-1..HT-6 are th32's lead-run HTs, which it cites; its site row 2 has the
+HOST output in the `SYCL_Host` buffer; its backend RED keeps the throw
+between the hand-off and the first reader, with a sub-arm after the first
+reader. Its r9 m10 relays (a) and (b) are in th32: the cold first reader in
+T7's boundary set (§7.4) and T5's test-only FIFO override (§5.2.1); its (c),
+the cold arm, is yl3v's acceptance, on th32's fixture (*§D12f* m-10). The one
+item open for it from rev 2j is to re-pin th32 at rev 2j (th32 pins it at rev
+10, `054069548`, by anchor); the three th32 facts it checks against 2i, the
+-8.9 to -6.0 quote, the T2 phases and the §5.2.1 FIFO override, are unchanged
+in 2j. th32 counts the drain in `epochs_drained` where `9g22` counts it in
+`epochs_cancelled`; each design's arms pre-register their own counter.
 
 **Relay to `zhcn`:** split `ggml_sycl_node_is_host_dispatched()` into "sources
 not staged" and "intercepted by the funnel" before T7 (§7.2, r4 m-12).
