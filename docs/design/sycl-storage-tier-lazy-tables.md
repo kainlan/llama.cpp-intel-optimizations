@@ -118,7 +118,7 @@ the declaration is keyed by arch and GGUF name with no hparams, its attributes
 come from one per-arch function at the pre-fill, and `lazy_read::add()` reads
 the bit on the non-taker path. Rev 2x folds review `design-th32-r22` (1
 Important, 2 Minor, 3 nits) under *§F2a* I-9 addenda 6, 8 and 9, and re-pins
-`llama.cpp-5efe` at rev 3c (`111292728`): T6 serves a lazy table on the executor
+`llama.cpp-5efe` at rev 3c (`fef860772`): T6 serves a lazy table on the executor
 the plan assigns to its consumer layer, a CPU-executed consumer getting a
 host-tier descriptor and the CPU gather, with no device descriptor; a source
 clause pins the pre-fill's mmap-support input; T6 (k) runs on the gemma4 shape
@@ -973,7 +973,7 @@ by (arch, GGUF name) (*§F2a* I-9 addendum 5; r21 M-2),
 std::vector<std::string> &` of the GGUF names the arch creates with
 `TENSOR_READ_LAZY`, each an exact name or one with a single `%d` for the block
 index, and takes no hparams, and from each matched name's `weights_map` entry,
-its (file index, offset, size) (5efe rev 3c, `111292728`; *§F2a* I-9 addendum
+its (file index, offset, size) (5efe rev 3c, `fef860772`; *§F2a* I-9 addendum
 8). The arch key is load-bearing: gemma3n creates the same
 `per_layer_token_embd.weight` **without** the flag (`fefb92980
 src/models/gemma3n.cpp:39`), so a name-only key would give every gemma3n load an
@@ -4111,7 +4111,7 @@ consumes this contract and links here for it; this section is the one source.
 1. **Mark and declare at load.** Create the table with `TENSOR_READ_LAZY`, and
    add an entry for it to the lazy-tensor declaration, keyed by (arch, GGUF name
    or name pattern), `llama_model_lazy_tensor_names(arch)` (`llama.cpp-5efe`'s
-   C1, rev 3c `111292728`), whose entries today are
+   C1, rev 3c `fef860772`), whose entries today are
    `per_layer_token_embd.weight` for qwen4exp and for gemma4. The name list
    takes no hparams; the arch key is required, because another arch may create
    the same name without the flag (gemma3n's `per_layer_token_embd.weight`,
