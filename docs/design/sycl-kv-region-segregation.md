@@ -152,8 +152,10 @@ Design, revision 7.14s, by impl-moua, 2026-09-27. The revisions answer twenty-se
 - design review r26 (design-moua-r26 on `f2323f9e0..038f698bd`: 0 Critical, 3 Important, 17
   Minor, 4 nits) and the lead's rulings §M66 (armed trace lines), §M67 (the Graph scratch
   after the pack and the KV; the load reserves none), §M68 (b) (one owner for the direct
-  path's deletion) and §M70 (what a runtime ONEDNN-zone miss does from (b1) on), recorded in
-  §6.35. Revision 7.14s is one commit on top of 7.14r (`038f698bd`).
+  path's deletion), §M70 with its amendment (what a runtime ONEDNN-zone miss does from (b1)
+  on), §M71 (the decline lines and their admission witness) and §M72 (the TERMINAL channel
+  aborts), recorded in §6.35. Revision 7.14s is two commits on top of 7.14r (`038f698bd`):
+  `65300ce1a` and a follow-up for the §M70 amendment, §M71 and §M72.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -166,9 +168,9 @@ one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2,
 §V15, §V15a, §V16, §V16a, §M34, §M35, §G1, §G1a, §V17, §M36, §M37, §Z20, §M38, §G1b, §M39, §G1c,
 §M40, §M41, §Z-23mk-411, §M42, §Z21, §Z23, §Z22, §M43, §M44, §Z24, §Z26, §M45, §M46, §M46b,
 §Z28, §M47, §M47a, §M48, §M49, §F3, §M50, §M51, §M52, §M53, §M56, §M59, §M60, §M61, §M62, §M63,
-§M64, §M66, §M67, §M68, §M70). §M11a is a relay line inside §Z8, not a section, and is cited as
-§Z8 I-2 (r12 m-14). This document cites it as "rulings §X". **Where this document paraphrases a
-ruling and differs from the file, the file wins.**
+§M64, §M66, §M67, §M68, §M70, §M71, §M72). §M11a is a relay line inside §Z8, not a section, and
+is cited as §Z8 I-2 (r12 m-14). This document cites it as "rulings §X". **Where this document
+paraphrases a ruling and differs from the file, the file wins.**
 
 Revisions cited:
 - **Current master is `3d9414c8c`, which contains jehw and u1bb** (jehw landed). Revision 7.6
@@ -1018,7 +1020,9 @@ written:
     transaction records (rulings §M32 I-2; 23mk 4.8a puts it on the RUNTIME TLSF, relayed,
     §6.22). Its commit line is §M30's
     `[CONTEXT-PLAN] graph scratch range: ctx=%u dev=%d term=ONEDNN_GRAPH_SCRATCH backing=%s
-    offset=%zu bytes=%zu`;
+    offset=%zu bytes=%zu admitted=%u of %u layers`, whose suffix, added from (b2) with the
+    prefix byte-identical, is the admission witness the SDPA counts are scored against
+    (rulings §M71 (b));
   - `FIRST_CONTEXT`: this design's (rulings §M32 C-1, §M38 C-1). The room a load reserves on a
     device for its model's first context's head-slot set (§2.4.2 (b), step 3), recorded under
     `{LOAD, txn}` with the load's `WEIGHT` ranges and retagged to `{MODEL, id}` at the commit
@@ -3838,55 +3842,66 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         (`unified-cache.cpp:11721`, reached from `:11708` at `c69d5774d` and `e2461d4fb`), which
         breaks P1, P2 and P4 on its own: a legacy `alloc_handle` outside the arena, a map keyed
         by raw pointer, a host headroom poll with a 2 s drain, and an abort on exhaustion.
-        **What a runtime ONEDNN-zone miss does from (b1) on (rulings §M70, matching 23mk
-        `8547a22f0` §4.8 (b1); r26 I-3):** (b1) replaces the call at `:11708` with the TERMINAL
-        `[ZONE-PLAN-BUG]` channel, which allocates nothing: it aborts under
-        `GGML_SYCL_STRICT_LEASES=1` (rulings §G1), and otherwise the draw gets no memory and the
-        SDPA call fails with the named error. Both misses it can see, a within-ubatch peak above
-        the plan and a draw beyond the admitted term, mean the plan is wrong, and the fix is the
-        plan, never a fallback allocation (P4). The DIRECT reuse pool's branch
-        (`onednn_graph_scratch_try_pool_locked`, `:11704`) goes with the call, so from (b1) on
-        `onednn_graph_scratch_alloc_direct_locked` has no caller. **The decline is decided at
-        planning or admission, per layer, never at dispatch (rulings §M70 (b)):** (b1)'s
-        `interim_capped` (stored + G over the ONEDNN cap: 0 B reserved for G and SDPA declined
-        on that device) and `interim_capacity` (a call's per-shape term above the zone's Graph
-        room), checked once at the SDPA entry through 23mk's pure function
-        `ggml_sycl_onednn_graph_interim_decline`, and from (b2) the fit's `scratch_unplaced`.
-        Dispatch reads the admitted decision; it never discovers a miss and declines on the
-        spot, which would give the admission fact a second source. **"Arena not active" never
-        reaches `:11708` (rulings §M70 (c)):** on a VM device the Graph scratch draws through
-        1oxa's `REGION` path, and with no zones at all oneDNN SDPA is not admitted; if either
-        route reaches `:11708` at the pin, its owner closes it (1oxa for VM, 23mk for no-zone).
-        **Every decline is a named WARN with a counter (rulings §M70 (d); r26 I-2),** in 23mk's
-        formats, which this design mirrors and does not own (23mk `8547a22f0` §4.8; unchanged at
-        `50b1f8f50`), none env-gated, so §M66's arming rule does not apply to them:
-        - `interim_capped`, once per device:
-          `[SYCL-PLAN] oneDNN Graph-scratch interim G %zu B exceeds the ONEDNN cap %zu B on
-          device %d; reserving 0 B, oneDNN SDPA declines on this device until the REGION
-          conversion` (one line in the source);
-        - `interim_capped` and `interim_capacity`, once per (backend context, device):
-          `[SYCL-PLAN] oneDNN SDPA declined: ctx=%u dev=%d term=%zu capacity=%zu reason=%s`;
-        - `scratch_unplaced`, once per (context, device), its `layers` field the per-layer
-          count: `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d layers=%u needed=%zu
-          room=%zu reason=scratch_unplaced`;
-        - each reason also counts `onednn_graph_route_declined{reason}` (PRIVATE_TESTING),
-          `scratch_unplaced` once per unadmitted layer.
-        The admitted count needs one line more, since the decline line prints only when a layer
-        is left out: this design asks 23mk, which owns the Graph charge in the fit, for one WARN
-        per (context, device) with at least one SDPA-routed device-KV candidate, printed whether
-        or not any layer declined (§6.35 relay (1)):
-        `[CONTEXT-PLAN] graph scratch admitted: ctx=%u dev=%d admitted=%u of %u layers cost=%zu
-        room=%zu`. `admitted` plus the decline line's `layers` equals the `of` field, which the
-        replay also gives. The deletion of the direct path has one owner: 23mk `8547a22f0` (b2)
-        item 8 deletes it with its reuse pool and test hooks (rulings §M68 (b);
-        E-ONEDNN-GRAPH-DIRECT), and 23mk's H3 "(b1)'s interim G" arm pins that it has no caller
-        from (b1) on. **The runtime miss's arm (r26 I-3), 23mk's to carry and moua's to cite:**
-        a fixture draw one byte above the planned within-ubatch peak prints `[ZONE-PLAN-BUG]`
-        once, allocates nothing (the direct path's pointer-keyed map stays empty, and no
-        `[EXT-ALLOC]` line prints with `GGML_SYCL_EXT_ALLOC_TRACE=1` set and the arm's closing
-        seam draw as its live check, rulings §M66), and exits 134 under
-        `GGML_SYCL_STRICT_LEASES=1`. Its RED is the pre-(b1) tree, where the same draw lands
-        through the direct path and returns memory. Relayed to 23mk (§6.35). **Admission never
+        **What a runtime ONEDNN-zone miss does from (b1) on (rulings §M70 with its amendment,
+        §M72; matching 23mk `8547a22f0` §4.8 (b1); r26 I-3):** (b1) replaces the call at
+        `:11708` with the TERMINAL `[ZONE-PLAN-BUG]` channel, which never allocates. It **aborts
+        unconditionally** with its scorable `[ZONE-PLAN-BUG]` message, whatever
+        `GGML_SYCL_STRICT_LEASES` and STRICT say (rulings §M72): returning null would fault the
+        GPU, since the oneDNN Graph callback has no failure return, and throwing would be caught
+        (`fattn-onednn.cpp:1363-1366`) and fall back to native FA silently (`fattn.cpp:3911`,
+        `:3924`), a skipped decision dressed as a fallback. Both misses it can see, a
+        within-ubatch peak above the plan and a draw beyond the admitted term, mean the plan is
+        wrong, and the fix is the plan, never a fallback allocation (P4). The DIRECT reuse
+        pool's branch (`onednn_graph_scratch_try_pool_locked`, `:11704`) goes with the call, so
+        from (b1) on `onednn_graph_scratch_alloc_direct_locked` has no caller. **The decline
+        reads a planned fact, never a discovered miss (rulings §M70 (b), (b')):** in (b1) the
+        per-call check at the entry of `ggml_sycl_flash_attn_ext_onednn`, through 23mk's pure
+        function `ggml_sycl_onednn_graph_interim_decline`, compares the call's per-shape term
+        with the **planned** interim capacity, `interim_capped` (stored + G over the ONEDNN cap:
+        0 B reserved for G, SDPA declined on that device) or `interim_capacity` (the term above
+        the zone's planned Graph room). That is an allowed interim form, and (b2) deletes it and
+        moves the decision to per-layer admission in the fit, `scratch_unplaced`. Dispatch then
+        reads the admitted decision. **Nothing reaches `:11708` for want of zones (rulings §M70
+        (c) as amended, (c')):** on a VM device the Graph scratch draws through 1oxa's `REGION`
+        path, and on a device with no zones it takes §M33 I-B's planned exact-owner form, an
+        owner-first allocation through the unified cache (P1), which stays. "SDPA is not
+        admitted without zones" applies only where no exact-owner form exists; there 23mk's
+        (b1) rule sees an interim capacity of 0 and declines at the entry check, before
+        `:11708`. If a route can still reach `:11708` at the pin, its owner closes it (1oxa for
+        VM, 23mk for no-zone).
+        **The decline lines and their witness (rulings §M70 (d), §M71; r26 I-2).** Both lines
+        are 23mk's, printed at WARN, neither env-gated, so §M66's arming rule does not apply;
+        this design scores them and does not own them:
+        - from (b2), the fit's decline, one line per (context, device) per transaction, printed
+          only when N ≥ 1, N the routed device-KV layers left out and M the routed device-KV
+          candidates, with `onednn_graph_route_declined{scratch_unplaced}` raised by N:
+          `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d declined=%u of %u layers
+          needed=%zu room=%zu reason=scratch_unplaced`. 1oxa's step 6 reads the same line;
+        - in (b1), the interim decline, one line per (context, device, layer) at that layer's
+          first decline, its `declined` a running count, so the last line per (context, device)
+          carries the aggregate: `[SYCL-PLAN] oneDNN SDPA declined: ctx=%u dev=%d il=%d
+          declined=%u of %u layers term=%zu capacity=%zu
+          reason=<interim_capped|interim_capacity>`. (b2) deletes it with the entry check.
+        **"No decline line" is never read as N = 0 by itself (rulings §M71 (d)):** a path that
+        never ran prints no line either. So each tree carries a positive witness from the same
+        run. From (b2) it is §M30's commit line, whose prefix stays byte-identical and which
+        gains the suffix ` admitted=%u of %u layers` (§2.3.2's `ONEDNN_GRAPH_SCRATCH` term);
+        per (context, device) the decline line's `declined`, 0 when there is none, must equal M
+        − `admitted`, a run with no commit line is VOID, and M = 0 is VOID for any SDPA claim,
+        never a pass (§M71 (b)). At (b1) it is the `GGML_SYCL_PRIVATE_TESTING` exit dump: N = 0
+        is valid only with `onednn_sdpa_executed` ≥ 1 and `fallback_after_admit` = 0 on that
+        device, a run with no dump is VOID, and N > 0 needs no witness (§M71 (c)). The deletion
+        of the direct path has one owner: 23mk `8547a22f0` (b2) item 8 deletes it with its
+        reuse pool and test hooks (rulings §M68 (b); E-ONEDNN-GRAPH-DIRECT), and 23mk's H3
+        "(b1)'s interim G" arm pins that it has no caller from (b1) on. **The runtime miss's arm
+        (r26 I-3; rulings §M72), 23mk's to carry and moua's to cite:** a fixture draw one byte
+        above the planned within-ubatch peak prints `[ZONE-PLAN-BUG]` once and aborts, with
+        `GGML_SYCL_STRICT_LEASES` unset, and allocates nothing (the direct path's pointer-keyed
+        map stays empty). The RED proves the abort is reached and that no catch intercepts it:
+        a mutant that throws instead is caught at `fattn-onednn.cpp:1363-1366`, the child
+        exits 0 with native FA's output, and the arm fails it. A second RED is the pre-(b1)
+        tree, where the same draw lands through the direct path and returns memory. Relayed to
+        23mk (§6.35). **Admission never
         admits a layer whose term exceeds the override (rulings §M64 (c)):** it declines that
         layer's SDPA, since the plan never knowingly schedules a miss (P4). **(b1) converts
         nothing (23mk §6.8's scoping note, mirrored; rulings §M44b):** the commit that converts
@@ -3940,10 +3955,10 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       what it tests. The clamp cannot bind on the merge-gate shapes, so ONEDNN is 23592960 B on
       GPT-OSS 120B and 234881024 B on Qwen there. Where it binds, the Graph draw that no longer
       fits is not sent to the direct overflow: (b1) declines oneDNN SDPA on that device as
-      `interim_capped`, with 23mk's once-per-device line and one `oneDNN SDPA declined` WARN
-      per (context, device), and a runtime miss is the TERMINAL `[ZONE-PLAN-BUG]` channel
-      (rulings §M64 (a), §M70; "The Graph-scratch commit", above). The constant goes in
-      L4+L6 (rulings §M37 Q3),
+      `interim_capped`, with one `oneDNN SDPA declined` WARN per (context, device, layer)
+      carrying the running count (rulings §M71 (a)), and a runtime miss is the TERMINAL
+      `[ZONE-PLAN-BUG]` channel, which aborts (rulings §M64 (a), §M70, §M72; "The Graph-scratch
+      commit", above). The constant goes in L4+L6 (rulings §M37 Q3),
       since the zone's remaining consumers, W and the Graph scratch, are then each sized by its
       own function. Between (b1) and L4 the load stage is master's with (b1)'s G, 268435456 B on
       both gate shapes. **The final sizing is not 268435456 B (rulings §M37 Q3; 23mk 4.10
@@ -9496,36 +9511,34 @@ placement and demotion run. The rules for every such arm:
   and `head_slot` causes come from the head-slot set alone (§2.4.3's member table). The replay
   pre-registers, per (context, device), the number of SDPA-routed device-KV candidate layers
   M, the number admitted to oneDNN SDPA A and the number declined `scratch_unplaced` M − A.
-  **They are scored from two fixed lines (rulings §M70 (d); r26 I-2),** both WARN, neither
-  env-gated, so §M66's arming rule does not apply: 23mk's decline line, `[CONTEXT-PLAN] graph
-  scratch declined: ctx=%u dev=%d layers=%u needed=%zu room=%zu reason=scratch_unplaced`, once
-  per (context, device) when M − A > 0, its `layers` field M − A; and the admitted line this
-  design asks 23mk for (§6.35 relay), `[CONTEXT-PLAN] graph scratch admitted: ctx=%u dev=%d
-  admitted=%u of %u layers cost=%zu room=%zu`, once per (context, device) whenever M > 0,
-  whether or not a layer declined. The admitted line is its own presence check: with M > 0
-  pre-registered, a run with no admitted line for that device is VOID. A zero from the
-  decline line needs a positive control, since an emitter that never prints also scores
-  none: the Qwen pinned arm on the B50 (the xqex baseline, C9), where the replay pre-registers
-  M − A > 0 (rulings §M67 (a)), must print it, or every zero it scores elsewhere in that
-  session is VOID (if no Qwen arm's replay gives M − A > 0, the control is instead a fit
-  fixture whose room is below the smallest candidate term, which must print it with `layers`
-  = M); 23mk's H3 "(b1)'s interim G" arm is the control for the two (b1) lines. The greps, on
-  the arm's stderr, for device 0:
+  **They are scored from two fixed fields, with a witness (rulings §M70 (d), §M71; r26
+  I-2).** Both lines are 23mk's, at WARN and not env-gated, so §M66's arming rule does not
+  apply (§2.4.2's Graph-scratch commit quotes them): from (b2), the fit's decline line
+  `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d declined=%u of %u layers needed=%zu
+  room=%zu reason=scratch_unplaced`, once per (context, device) per transaction, only when
+  M − A ≥ 1; and the witness, §M30's commit line with its suffix, `[CONTEXT-PLAN] graph scratch
+  range: ... bytes=%zu admitted=%u of %u layers`, once per (context, device) whose Graph
+  scratch is committed. Per (context, device): A is the commit line's `admitted`, M its `of`
+  field, and M − A the decline line's `declined`, 0 when it prints none; the two must agree
+  (`declined` = M − `admitted`), and both must equal the replay's. **A zero is never read from
+  an absent line (rulings §M71 (d)):** a run with no commit line for a device where the replay
+  gives M > 0 is VOID, and M = 0 is VOID for any SDPA claim, never a pass (§M71 (b)). The
+  greps, on the arm's stderr, for device 0:
   ```
-  cat <arm>.err | grep -oE 'graph scratch admitted: ctx=[0-9]+ dev=0 admitted=[0-9]+ of [0-9]+ layers'  # A of M
-  cat <arm>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 layers=[0-9]+'                      # M − A, or no line when A = M
+  cat <arm>.err | grep -oE 'graph scratch range: ctx=[0-9]+ dev=0 .* admitted=[0-9]+ of [0-9]+ layers'  # A of M; none is VOID
+  cat <arm>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 declined=[0-9]+ of [0-9]+ layers'  # M − A, or none when A = M
   ```
-  A model whose attention has sinks, GPT-OSS, routes no layer to SDPA, so M = 0 and neither
-  line prints; its arms pre-register M = 0 and score both greps empty. Both lines come with
-  23mk's (b2), the commit that charges the Graph scratch in the fit, and this replay rule
-  applies from (b2) (§2.4.3's transition rule). If 23mk declines the admitted line, A is scored
-  as M minus the decline line's `layers`, with M from the replay, and the run carries no
-  independent witness that the fit saw M candidates; that gap is recorded on the ticket, never
-  scored as a pass. Through `df9803cb8` the replay
-  placed it as a head slot that could demote KV; 23mk's Qwen row cites the fixed replay (§6.34).
-  Master prints it at WARN when a layer's residency changed (`ggml-sycl.cpp:18381-18386` at
-  `e2461d4fb`, below `:40214`, so the same line at `d19308be3`), in the form
-  `[SYCL-PLAN] KV overflow re-placed to host tier:`, then
+  A model whose attention has sinks, GPT-OSS, routes no layer to SDPA, so M = 0: its arms
+  make no SDPA claim and score neither field. The fields come with 23mk's (b2), which charges
+  the Graph scratch in the fit, and this replay rule applies from (b2) (§2.4.3's transition
+  rule). An arm run between (b1) and (b2) scores (b1)'s interim line instead, its aggregate the
+  last `declined=%u of %u layers` per (context, device), and reads N = 0 only with the
+  `GGML_SYCL_PRIVATE_TESTING` exit dump showing `onednn_sdpa_executed` ≥ 1 and
+  `fallback_after_admit` = 0 on that device; no dump is VOID (§M71 (c)). Through `df9803cb8` the
+  replay placed it as a head slot that could demote KV; 23mk's Qwen row cites the fixed replay
+  (§6.34). Master prints it at WARN when a layer's residency changed
+  (`ggml-sycl.cpp:18381-18386` at `e2461d4fb`, below `:40214`, so the same line at `d19308be3`),
+  in the form `[SYCL-PLAN] KV overflow re-placed to host tier:`, then
   `%zu layer(s) demoted, %zu SWA (%.1f MB host KV,`, then
   `layers %d..%d) on device %d for n_ctx=%u; %s`. The replay gives the layer count, the SWA
   count, the host MB, the layer range and the device (r25 n-2). **One verdict rule per arm
@@ -9882,19 +9895,19 @@ placement and demotion run. The rules for every such arm:
         < /dev/null > qx-$sel${carg:+-c4096}.out 2> qx-$sel${carg:+-c4096}.err; echo "rc=$?"
     done; done
     cat qx-<run>.err | grep -oE 'prompt eval time = *[0-9.]+ ms / *[0-9]+ tokens.*tokens per second'
-    cat qx-<run>.err | grep -oE 'graph scratch admitted: ctx=[0-9]+ dev=0 admitted=[0-9]+ of [0-9]+ layers'
-    cat qx-<run>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 layers=[0-9]+'
+        cat qx-<run>.err | grep -oE 'graph scratch range: ctx=[0-9]+ dev=0 .* admitted=[0-9]+ of [0-9]+ layers'
+    cat qx-<run>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 declined=[0-9]+ of [0-9]+ layers'
     ```
     Recorded per run, on the ticket: PP tokens per second and the prompt's token count from the
-    `prompt eval time` line, A of M from the admitted line and M − A from the decline line
-    (§3.3's scorer), the demoted-layer count from uize part 3's line, rc, and the load
-    (`uptime`, `pgrep -af 'codescout|ninja|icpx|ffmpeg'`). A run whose token count differs from
-    the file's is VOID. The PP figures are a **record, not a gate**: they are single runs under
-    this host's permanent load, so xqex compares against them with interleaved pairs on its own
-    tree, never against the absolute numbers. A and M − A are scored as §3.3 says, against the
-    replay's per-card values, since the fit's room differs by card. The four runs are
-    lead-run, pinned, never overlapped, with `Shmem` and `MemAvailable` sampled before and about
-    5 s after each.
+    `prompt eval time` line, A of M from the commit line's `admitted` field and M − A from the
+    decline line's `declined` (§3.3's scorer, rulings §M71; no commit line is VOID), the
+    demoted-layer count from uize part 3's line, rc, and the load (`uptime`,
+    `pgrep -af 'codescout|ninja|icpx|ffmpeg'`). A run whose token count differs from the file's
+    is VOID. The PP figures are a **record, not a gate**: they are single runs under this host's
+    permanent load, so xqex compares against them with interleaved pairs on its own tree, never
+    against the absolute numbers. A and M − A are scored as §3.3 says, against the replay's
+    per-card values, since the fit's room differs by card. The four runs are lead-run, pinned,
+    never overlapped, with `Shmem` and `MemAvailable` sampled before and about 5 s after each.
   - **The leg's other buffers (rulings §M41 I-5).** Neither gate allocates them, so each has a
     run of its own, lead-run once, pinned to `level_zero:1`, with `GGML_SYCL_EXT_ALLOC_TRACE=1`
     in the run's command and seam control (2) as its trace-live check (rulings §M66). **The
@@ -12984,21 +12997,22 @@ below is at `c69d5774d`; at master `d19308be3` each one above `:40214` is one hi
   `<log>.err`, the checks read both, and a stdout-only score reads `.out` alone, so GDC8 can
   score its stdout by itself.
 
-### 6.35 Revision 7.14s: design-moua-r26, rulings §M66 to §M68 and §M70
+### 6.35 Revision 7.14s: design-moua-r26, rulings §M66 to §M68 and §M70 to §M72
 
-Revision 7.14s is one commit on top of 7.14r (`038f698bd`). It answers design review r26
-(design-moua-r26 on `f2323f9e0..038f698bd`: 0 Critical, 3 Important, 17 Minor, 4 nits; every
-Minor a required fix) and folds rulings §M66 (armed trace lines), §M67 (the Graph scratch after
-the pack and the KV; the load reserves none), §M68 (b) (one owner for the direct path's
-deletion) and §M70 (what a runtime ONEDNN-zone miss does from (b1) on), all dated after
-`038f698bd`. The §6.33 and §6.34 rows and relays it amends are marked in place. Master pin for
-source cites: `e2461d4fb`.
+Revision 7.14s is two commits on top of 7.14r (`038f698bd`): `65300ce1a` and a follow-up for the
+§M70 amendment and rulings §M71 and §M72, which arrived after `65300ce1a` was committed (the
+last three rows below). It answers design review r26 (design-moua-r26 on `f2323f9e0..038f698bd`:
+0 Critical, 3 Important, 17 Minor, 4 nits; every Minor a required fix) and folds rulings §M66
+(armed trace lines), §M67 (the Graph scratch after the pack and the KV; the load reserves none),
+§M68 (b) (one owner for the direct path's deletion) and §M70 (what a runtime ONEDNN-zone miss
+does from (b1) on), all dated after `038f698bd`. The §6.33 and §6.34 rows and relays it amends
+are marked in place. Master pin for source cites: `e2461d4fb`.
 
 | item | finding / ruling | disposition |
 |---|---|---|
 | I-1; §M66 | arms scored env-gated trace lines without setting the variable in the command, or without a trace-live check | **Changed.** C1's command sets `GGML_SYCL_KV_REGION_TRACE=1` beside `GGML_SYCL_EXT_ALLOC_TRACE=1`, and its `[KV-REGION] reserve` line must count exactly 1 (0 is VOID), with the line's format stated (L6's trace). C3's `-ub 1024` ladder run has its own command block with the variable and the count of 1 as its live check. C9 states the arming rule arm by arm: every arm that scores `[EXT-ALLOC]` carries the variable in its literal command; the scoped-miss and unplanned-buffer unit arms end with seam control (2)'s draw in the same process, so their count is exactly that line; the CLI arms (merge gates, default-context, control-vector, state-seq, LoRA) name seam control (2), run as its own child with the variable on the same build in the same session, as their live check. H9 (3) and (4) scored "zero `[EXT-ALLOC]` lines" in a SYCL-free binary, where no emitter exists, so that zero was vacuous: they now score the host model's out-of-range draw counter. The audit found no other scored env-gated line: the `GGML_SYCL_WITNESS_CHECKS` and `GGML_SYCL_HOST_ALLOC_PHASE_GATE` arms set their variable and score a line that must fire, and the (b1)/(b2) decline lines are not env-gated. |
-| I-2; §M70 (d) | the SDPA decline and the replay's admitted and `scratch_unplaced` counts had no scorer | **Changed.** The (b1)/(b2) bullets quote 23mk's three decline formats (`8547a22f0` §4.8, unchanged at `50b1f8f50`), their units and counter, and state that none is env-gated. §3.3's replay names the lines it scores, with greps: 23mk's `[CONTEXT-PLAN] graph scratch declined: ... layers=%u ... reason=scratch_unplaced` (M − A) and an admitted line asked of 23mk, `[CONTEXT-PLAN] graph scratch admitted: ctx=%u dev=%d admitted=%u of %u layers cost=%zu room=%zu` (A of M), printed per (context, device) whenever M > 0 and so its own presence check. The decline line's zero has a positive control, the Qwen pinned B50 arm or, failing that, a fit fixture with room below the smallest term. GPT-OSS pre-registers M = 0. |
-| I-3; §M70 (a)-(c) | the direct overflow stayed reachable from (b1) through a runtime zone miss | **Changed, per §M70.** (b1) replaces the `:11708` call, and the DIRECT pool branch at `:11704` with it, by the TERMINAL `[ZONE-PLAN-BUG]` channel, which allocates nothing; both runtime misses mean the plan is wrong. The decline is decided at planning or admission (`interim_capped`, `interim_capacity`, `scratch_unplaced`), and dispatch reads the admitted decision, never discovering a miss. "Arena not active" never reaches `:11708`: VM draws through 1oxa's `REGION` path, and no zones means no SDPA admission; each route's owner closes it if it can reach `:11708` at the pin. The runtime-miss arm (one byte over the planned peak: one `[ZONE-PLAN-BUG]`, nothing allocated, 134 under STRICT; RED the pre-(b1) tree) is 23mk's, cited and relayed. |
+| I-2; §M70 (d) | the SDPA decline and the replay's admitted and `scratch_unplaced` counts had no scorer | **Changed.** The (b1)/(b2) bullets quote 23mk's three decline formats (`8547a22f0` §4.8, unchanged at `50b1f8f50`), their units and counter, and state that none is env-gated. §3.3's replay names the lines it scores, with greps: 23mk's `[CONTEXT-PLAN] graph scratch declined: ... layers=%u ... reason=scratch_unplaced` (M − A) and an admitted line asked of 23mk, `[CONTEXT-PLAN] graph scratch admitted: ctx=%u dev=%d admitted=%u of %u layers cost=%zu room=%zu` (A of M), printed per (context, device) whenever M > 0 and so its own presence check. The decline line's zero has a positive control, the Qwen pinned B50 arm or, failing that, a fit fixture with room below the smallest term. GPT-OSS pre-registers M = 0. (Amended in the follow-up, rulings §M71: the formats are §M71 (a)'s, and the admitted line asked of 23mk is withdrawn in favour of §M71 (b)'s commit-line suffix and (c)'s exit dump; see the §M71 row.) |
+| I-3; §M70 (a)-(c) | the direct overflow stayed reachable from (b1) through a runtime zone miss | **Changed, per §M70.** (b1) replaces the `:11708` call, and the DIRECT pool branch at `:11704` with it, by the TERMINAL `[ZONE-PLAN-BUG]` channel, which allocates nothing; both runtime misses mean the plan is wrong. The decline is decided at planning or admission (`interim_capped`, `interim_capacity`, `scratch_unplaced`), and dispatch reads the admitted decision, never discovering a miss. "Arena not active" never reaches `:11708`: VM draws through 1oxa's `REGION` path, and no zones means no SDPA admission; each route's owner closes it if it can reach `:11708` at the pin. The runtime-miss arm (one byte over the planned peak: one `[ZONE-PLAN-BUG]`, nothing allocated, 134 under STRICT; RED the pre-(b1) tree) is 23mk's, cited and relayed. (Amended in the follow-up: the channel aborts unconditionally, §M72; the no-zone case keeps §M33 I-B's exact-owner form, §M70 (c'); the entry check is the allowed interim form, §M70 (b').) |
 | m-1 | the 1oxa pin was stale | **Changed.** 1oxa is cited at `68c31f0` (rev 34 follow-up), whose C11 row carries the `kv` line and keeps the W2 row and arm (5). §6.34's "pending r30 fold" row, its n-4 row and relays (2) and (4) are marked amended. |
 | m-2 | C1's block lacked `-lv 4` and the check | **Changed.** C1's command has `-ub 512 -lv 4`, the check at 32768, and the `n_ctx_seq` negative control with its presence check. |
 | m-3 | the VOID check's N came from the run being judged | **Changed**, in the doc and the script together. N is `<arch>.context_length` read from the GGUF header before any GPU work (`merge-gates/gguf-ctx.py`, a stdlib reader: 131072 for GPT-OSS 120B, 262144 for the Qwen gate model, 32768 for Mistral), and an empty read fails the script. `nctx_void N` is VOID unless the padded regex counts exactly 1 at N, the `n_ctx_seq` line is present and the regex counts 0 on it. A startup self-test scores the regex on the three lines as `gptoss120b-b1.log:1968` renders them. Offline: VOID at 131072 on the pinned log (its `n_ctx` is 4096), pass at 4096, VOID for an empty N, VOID with the `n_ctx_seq` lines removed. The script's form before is kept as `run-merge-gates.sh.pre-m714s`. |
@@ -13020,25 +13034,36 @@ source cites: `e2461d4fb`.
 | n-2 | the ABRT cite was stale | **Changed.** Cited by name, the script's `ABRT=` line. The merge-gate block cites move to `:115` and `:125` at 7.14s. |
 | n-3 | C7 named only GA's default arm | **Changed.** GH's default arm is zhcn GDC6 (`5e0ffae`): `llama-completion` on the B50, no `-c`, `n_ctx` 262144, STRICT. |
 | n-4 | a blank bullet in the exemption list | **Changed.** Deleted, with a second one the same edit exposed. |
+| §M70 amendment (b'), (c') (follow-up) | the entry check read as a dispatch-time decision; "SDPA not admitted without zones" was too broad | **Changed.** (b1)'s per-call check at the entry of `ggml_sycl_flash_attn_ext_onednn` compares against the **planned** interim capacity, so it reads a planned fact and is an allowed interim form; (b2) deletes it and moves the decision to per-layer admission. A device with no zones keeps §M33 I-B's planned exact-owner form (owner-first through the unified cache); "not admitted" applies only where no such form exists, where 23mk's (b1) rule declines at interim capacity 0, before `:11708`. |
+| §M71 (follow-up) | the decline lines' format and their admission witness | **Changed.** The (b1)/(b2) bullets and §3.3's scorer use §M71 (a)'s two formats: the (b2) fit line `... declined=%u of %u layers needed=%zu room=%zu reason=scratch_unplaced` per (ctx, dev), and the (b1) interim line per (ctx, dev, layer) with `il` and a running count. The witness from (b2) is §M30's commit line with the suffix ` admitted=%u of %u layers` (A1 quotes it); `declined` = M − `admitted`, no commit line is VOID, M = 0 is VOID for any SDPA claim. At (b1) the witness is the `GGML_SYCL_PRIVATE_TESTING` exit dump (`onednn_sdpa_executed` ≥ 1, `fallback_after_admit` = 0), no dump VOID. The Qwen xqex greps read these fields. The admitted line `65300ce1a` asked of 23mk and its positive-control fallback are withdrawn. |
+| §M72 (follow-up) | the TERMINAL channel's failure mode | **Changed.** It aborts unconditionally with its `[ZONE-PLAN-BUG]` message, independent of STRICT; returning null (a GPU fault, no failure return in the Graph callback) and throwing (caught at `fattn-onednn.cpp:1363-1366`, silent native FA at `fattn.cpp:3911`, `:3924`) are both named as forbidden. The runtime-miss arm aborts with `GGML_SYCL_STRICT_LEASES` unset, and its RED is a throwing mutant that the catch would hide. |
 
 **Relays.**
-- **23mk:** (1) Please add one WARN per (context, device) with at least one SDPA-routed
-  device-KV candidate, printed whether or not any layer declined, at the fit's commit, beside
-  your decline line: `[CONTEXT-PLAN] graph scratch admitted: ctx=%u dev=%d admitted=%u of %u
-  layers cost=%zu room=%zu`. Your decline line prints only when a layer is left out, so without
-  it the admitted count A has no scorer (rulings §M70 (d)); moua's §3.3 replay and your Qwen
-  §9.3 row score both. If you decline, moua scores A as M minus your `layers` and records the
+- **23mk:** (1) (Withdrawn in the follow-up: §M71 (b) rules the witness is your §M30 commit line
+  with the suffix ` admitted=%u of %u layers`, and this design scores that.) Please add one WARN
+  per (context, device) with at least one SDPA-routed device-KV candidate, printed whether or
+  not any layer declined, at the fit's commit, beside your decline line:
+  `[CONTEXT-PLAN] graph scratch admitted: ctx=%u dev=%d admitted=%u of %u layers cost=%zu
+  room=%zu`. Your decline line prints only when a layer is left out, so without it the admitted
+  count A has no scorer (rulings §M70 (d)); moua's §3.3 replay and your Qwen §9.3 row score
+  both. If you decline, moua scores A as M minus your `layers` and records the
   missing witness on the ticket. (2) moua cites your `8547a22f0` (b2) item 8 as the one owner of
   the direct path's deletion (rulings §M68 (b)) and quotes your three decline formats as they
-  stand at `50b1f8f50`. (3) The runtime-miss arm (rulings §M70 (a)): a draw one byte over the
+  stand at `50b1f8f50` (amended in the follow-up: now §M71 (a)'s two formats). (3) The runtime-miss arm (rulings §M70 (a)): a draw one byte over the
   planned within-ubatch peak prints `[ZONE-PLAN-BUG]` once, allocates nothing, and exits 134
   under STRICT, with the pre-(b1) tree as its RED. moua reads it as part of your H3 "(b1)'s
-  interim G" arm; please confirm or name the arm that carries it. (4) Your Qwen row can cite
-  7.14s for the scorer lines; the replay itself is unchanged since `2489d9e85`.
+  interim G" arm; please confirm or name the arm that carries it. (Amended in the follow-up,
+  §M72: the abort is unconditional, and the RED is a throwing mutant that
+  `fattn-onednn.cpp:1363-1366` would catch.) (4) Your Qwen row can cite 7.14s for the scorer
+  lines; the replay itself is unchanged since `2489d9e85`.
 - **1oxa:** (1) moua cites you at `68c31f0` (rev 34 follow-up), whose C11 row is the single
   source for the `kv` line, with your W2 row and arm (5). (2) Rulings §M70 (c): on a VM device
   the Graph scratch draws through your `REGION` path, so a VM Graph draw never reaches
-  `unified-cache.cpp:11708`; if your route can reach it at the pin, closing it is yours.
+  `unified-cache.cpp:11708`; if your route can reach it at the pin, closing it is yours. (3)
+  Follow-up, rulings §M71: moua scores 23mk's (b2) fit line in §M71 (a)'s form,
+  `declined=%u of %u layers`, per (context, device), the same line your step 6 reads, with
+  §M30's `admitted=%u of %u layers` suffix as the witness. `FIRST_CONTEXT` carries no G record
+  (§M67 (b)); the zone-class table's `CONTEXT` row names G as the exception.
 - **zhcn:** (1) Rulings §M70 (d) and moua's §3.3: the admitted and `scratch_unplaced` lines are
   23mk's; nothing changes for your rows. (2) The +377.5 MiB delta you cite from moua is an
   input to the pre-registration only (the predicted zone, 13715.5 MiB). A replay of a run on
