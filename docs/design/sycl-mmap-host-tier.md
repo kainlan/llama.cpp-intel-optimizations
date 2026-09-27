@@ -1,7 +1,11 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 3m, not implemented. rev 3m is a new commit on rev 3l
-(`a68508606`). It folds design-5efe-r9 (`8b798c0e6..a68508606`,
+*Status: DESIGN rev 3n, not implemented. rev 3n is a new commit on rev 3m
+(`6b674097e`). It folds design-5efe-r10 (`a68508606..6b674097e`,
+0C/1I/5m/8n) under the lead's r10 rulings, including the §M69 (b)
+fourth amendment (submitted executables outlive the throw); Appendix B's
+"design-5efe-r10" table keys each item to r10's IDs. rev 3m is a new
+commit on rev 3l (`a68508606`). It folds design-5efe-r9 (`8b798c0e6..a68508606`,
 0C/0I/5m/8n) under the lead's r9 rulings, corrects the tracker-edge
 sentence of the C1/T6 merge ruling, and re-pins th32 at rev 3f;
 Appendix B's "design-5efe-r9" table keys each item to r9's IDs. rev 3l
@@ -1868,7 +1872,9 @@ created") describes a path that does not run.
       it (r9 m-3, P4):
       - withdrawal is the **one** decrement site of the zone's capacity:
         it subtracts the chunk's usable size from `zones_[zi].size`, which
-        `zone_capacity` returns (`pp:583-589`). The release never changes
+        `zone_capacity` returns (`pp:583-589`), **only on the flag's
+        false-to-true transition** (r10 m-4), so a second withdrawal of
+        one chunk changes nothing. The release never changes
         `zones_[zi].size` again;
       - `zone_alloc` (`pp:510-521`) and `zone_alloc_segmented` skip a
         withdrawn allocator;
@@ -1891,9 +1897,10 @@ created") describes a path that does not run.
       settle's publish (`lc:1936`) runs before the settle's begin. Neither
       can land an allocation in a marked chunk, and neither can drop the
       mark.
-    - **When the return runs.** Marked chunks are released later, not at
-      `RETURN`. At that instant the losing candidate's scheduler still
-      holds its host compute buffers in them, and releasing memory that a
+    - **When the return runs.** A returned chunk that is already empty is
+      released by the return itself (below). One that is not is released
+      later: at `RETURN` the losing candidate's scheduler still holds its
+      host compute buffers in it, and releasing memory that a
       live handle still owns is forbidden (r9 n-8). Every loss clears
       `sched_matches_last_good` (`lc:1619`, `:1627`), so a `sched_reserve`
       always follows, for the next candidate or for the settle
@@ -1904,29 +1911,65 @@ created") describes a path that does not run.
       withdrawn chunk is never counted, so no later ensure sees it either
       way.
     - **Every withdrawn chunk has an owner and a bounded release** (r9
-      m-5, P4). Each marked-set entry records the SYCL backend whose
-      transaction returned it, the context's. It is released at whichever
-      comes first:
-      - the next begin on its device, if its allocators are empty then;
-      - its owner's end. `ggml_backend_sycl_free` (`gs:83943`) releases
-        each of its owner's entries whose allocators are already empty and
-        marks the rest **orphaned**. The free that empties an orphaned
-        chunk's allocators releases it: the zone free reports the empty
-        orphaned chunk, and the cache releases it after the pool's lock is
-        dropped. This runs only at teardown, never on a dispatch path.
+      m-5, r10 m-3, P4). Each marked-set entry records the SYCL backend
+      whose transaction returned it, the context's. A returned chunk is
+      released at whichever comes first:
+      - **the return itself, if the chunk's allocators are already
+        empty**: `RETURN` and `RETURN_TO_MARK` apply the begin's rule at
+        once, so only a chunk that still holds a scheduler's buffers stays
+        withdrawn;
+      - the owning context's next begin, if its allocators are empty then;
+      - its owner's end. `ggml_backend_sycl_free` (`gs:83943`) runs the
+        owner-end step before `delete sycl_ctx` (`gs:84119`): it releases
+        each of its owner's entries whose allocators are empty and sets
+        `orphaned` on the rest. The free that empties an orphaned chunk
+        releases it.
 
-      The second path is needed because the owner's end comes before its
-      scheduler's. `llama_context` declares `sched` before `backends`
-      (`src/llama-context.h:398`, `:403`), so its members are destroyed
-      backends first, and `~llama_context` (`lc:1066-1105`) does not reset
-      `sched` earlier. A constructor that throws (`lc:2068`, `lc:2082`,
-      reached from the constructor's `sched_reserve` at `lc:1042` or the
-      trial at `lc:1040`) runs the same member destruction and no
-      `sched_reserve` follows it. So when the backend is freed the
-      scheduler's compute buffers can still sit in the chunk; they leave
-      it when `sched` is destroyed right after, and that free releases
-      it. No chunk stays withdrawn until the pool's destructor, and none
-      is released while a live handle owns memory in it.
+      **Where the two flags live** (r10 n-2). `withdrawn` and `orphaned`
+      are the only per-chunk states, and both live on the chunk's
+      `zone_chunk_state` in the pinned pool, their one home. The device
+      cache's marked set holds only each chunk's owner, which no free
+      reads. `zone_free` already finds the chunk's `zone_chunk_state`
+      before it frees (`pp:536-541`); after the free it tests `orphaned`
+      and the allocator's emptiness on that same entry, a flag test with
+      no cache lookup, and returns the chunk's index to its caller, which
+      releases it after the pool's lock is dropped. A free into a chunk
+      that is not orphaned tests one flag and does nothing more, so
+      dispatch-path frees gain no lookup.
+
+      **A begin and a live owner** (r10 m-3). A begin releases every empty
+      chunk in the device's marked set, whatever its owner. It leaves a
+      non-empty chunk whose owner is another live context, and prints
+      nothing: that chunk holds the other context's scheduler's buffers,
+      as after a runtime throw (below). `SCRATCH return refused` prints
+      only at the **owning** context's own begin, after its scheduler
+      creation has freed its buffers, when the chunk is still not empty.
+
+      **Why the owner's end needs the free path.** The owner's end comes
+      before its scheduler's. `llama_context` declares `sched` before
+      `backends` (`src/llama-context.h:398`, `:403`), so its members are
+      destroyed backends first, and `~llama_context` (`lc:1066-1107`)
+      does not reset `sched` earlier. A constructor that throws
+      (`lc:2068`, `lc:2082`, reached from the constructor's
+      `sched_reserve` at `lc:1042` or the trial at `lc:1040`) runs the
+      same member destruction, and no `sched_reserve` follows it. So when
+      the backend is freed the scheduler's compute buffers can still sit
+      in the chunk; they leave it when `sched` is destroyed right after,
+      and that free releases it.
+
+      **The runtime throw** (r10 m-3). `sched_reserve` also runs from
+      `decode` (`lc:3178`) and `encode` (`lc:2891`), and clears
+      `sched_need_reserve` (`lc:1998`) before it can throw (`lc:2068`,
+      `:2082`). `llama_decode` has no catch (`lc:5733-5742`), but a caller
+      that catches, such as the server, keeps the context, and nothing
+      flags another reserve. The own transaction's `RETURN` then releases
+      every empty chunk at once. A chunk that holds the failed scheduler's
+      buffers stays withdrawn while they live: it is in use, not idle, and
+      is released at that context's next begin or at its end. Another
+      context's begin meanwhile leaves it silently.
+
+      No chunk stays withdrawn until the pool's destructor, and none is
+      released while a live handle owns memory in it.
     - **The pipeline-parallel retry is the same shape, and gets the same
       return** (r8 n-6). When the pp reserve fails with pipeline
       parallelism on, `sched_reserve` replaces the scheduler and measures
@@ -1936,8 +1979,13 @@ created") describes a path that does not run.
       - `MARK`, before the measure, opens `sched_reserve`'s own
         transaction when no trial transaction is open, and records the
         open transaction's chunk count;
-      - `RETURN_TO_MARK`, before the retry, withdraws and marks the chunks
-        grown since that mark, and leaves the transaction open.
+      - `RETURN_TO_MARK`, before the retry, **truncates the transaction to
+        the mark** (r10 m-4): the chunks grown since it leave the
+        transaction's set and are withdrawn and marked, or released at
+        once if empty, and the transaction stays open. A later `RETURN`
+        never sees them, so it cannot withdraw one twice, and a later
+        `KEEP` makes only the chunks still in the set ordinary capacity; it
+        never clears a `withdrawn` flag.
 
       So the retry's measure and reserve run inside a transaction in both
       cases: `sched_reserve`'s own, which it `KEEP`s on success (the
@@ -1982,7 +2030,13 @@ created") describes a path that does not run.
         not exist;
       - the header's "Chunks are only released when the pool is
         destroyed" (`pinned-pool.hpp:112`) is rewritten to name this
-        release.
+        release;
+      - **`configure_zones` never meets a withdrawn chunk** (r10 n-3). It
+        gives every zone fresh allocators (`pp:389-417`), so it already
+        presumes no live zone allocation. Its caller first releases every
+        chunk in the device's marked set. Each is empty there by that
+        presumption, and one that is not is the same refusal by name as at
+        a begin. So neither flag has to survive the rebuild.
     - **A return that finds a live allocation refuses by name.** If a
       marked chunk still holds an allocation or a lease, the release
       prints `[HOST-ARENA] SCRATCH return refused dev=%d chunk=%zu: %zu B
@@ -1990,17 +2044,19 @@ created") describes a path that does not run.
       transaction's figure stays charged. It never forces the release. A
       lead arm that prints it is a FAIL: something outside the losing
       candidate took SCRATCH during the trial.
-    - **The witness.** `KEEP` and `RETURN` print `[HOST-ARENA] SCRATCH
-      trial dev=%d n_ubatch=%u kept|returned %.1f MB (%zu chunk(s))`
-      (INFO), and the release prints `[HOST-ARENA] SCRATCH released %.1f
-      MB (%zu chunk(s)); capacity %.1f MB` (INFO) with the capacity after
-      it. A `returned` line with no `released` line before the next
-      `SCRATCH demand ctx=` line is a FAIL. **At zero chunks nothing
-      prints** (r9 m-4): `KEEP`, `RETURN` and `RETURN_TO_MARK` (which
-      prints the `returned` form) print only when they move at least one
-      chunk, and `released` prints only when a release frees at least one.
-      `sched_reserve`'s own transaction `KEEP`s on every successful
-      reserve, so a `kept` line means that reserve grew SCRATCH.
+    - **The witness.** `KEEP`, `RETURN` and `RETURN_TO_MARK` print
+      `[HOST-ARENA] SCRATCH <txn> dev=%d n_ubatch=%u kept|returned %.1f MB
+      (%zu chunk(s))` (INFO). `<txn>` is `trial` only for `try_candidate`'s
+      transaction, `reserve` for `sched_reserve`'s own, and `retry` for
+      `RETURN_TO_MARK` (r10 n-7). The release prints `[HOST-ARENA] SCRATCH
+      released %.1f MB (%zu chunk(s)); capacity %.1f MB` (INFO) with the
+      capacity after it. On a lead arm, a `returned` line of any form with
+      no `released` line before the next `SCRATCH demand ctx=` line is a
+      FAIL. **At zero chunks nothing prints** (r9 m-4): the three ops
+      print only when they move at least one chunk, and `released` prints
+      only when a release frees at least one. `sched_reserve`'s own
+      transaction `KEEP`s on every successful reserve, so a `reserve ...
+      kept` line means that reserve grew SCRATCH.
     - A commit **replaces** that context's committed plan, as a notify
       replaces its demand. The device's planned capacity per slot is the
       high-water over the live contexts' **committed** plans, not over
@@ -2129,8 +2185,42 @@ created") describes a path that does not run.
       before the catch waits on the queue. A non-catch exit would skip
       that step and leave the parked copy to `process_ubatch`'s failure
       path, which runs later; th32 moved its cancel out of that path for
-      exactly this reason.
-    - **The catch's lease unpin must not be a no-op** (r9 m-1 (c)). The
+      exactly this reason. Qwen 3b, with the host dispatch on and a lazy
+      PLE table, is the arm where both are live.
+    - **Submitted executables outlive the throw** (§M69 (b) fourth
+      amendment; r10 I-1). `moe_graph_record_segments` keeps the
+      executables it records in two locals, `recorded_segments` and
+      `recorded_moe_graphs` (`gs:97159-97160`), and moves them into the
+      context only on success (`gs:97355-97356`). A throw from any of its
+      four sites would destroy them in the unwind: the direct sites
+      (`gs:97234`, `:97240`) after earlier segments were submitted, the
+      recording site (`gs:97285`), and the moe_after site (`gs:97315`),
+      whose segment was submitted just before (`gs:97311`). Destroying an
+      executable while its submission is outstanding is the tree's own
+      recorded heap corruption: `sycl_exec_graph_clear_active`'s comment
+      (`gs:99522-99538`, llama.cpp-dkw0 defect #4) records a glibc
+      "corrupted size vs. prev_size" abort with an `exec_graph_impl`
+      destructor frame, and every other destruction site drains first
+      (`gs:99542-99545`; the MoE retirement, `gs:96549-96553`). This
+      replaces rev 3m's "unverified". So:
+      - C4 wraps the record loop, after the two locals' declaration, in
+        `try { ... } catch (...) { ...; throw; }`. The handler moves both
+        locals into `sycl_ctx->moe_segments` and `moe_dispatch_graphs`,
+        with `moe_segments_valid` false, and rethrows. Both context
+        vectors are empty there, since `graph_compute` invalidated them
+        before recording (`gs:107202`), and a vector move does not throw,
+        so the unwind that follows destroys two empty locals. The handler
+        sees every exception type from all four sites, including the inner
+        catch's rethrow (`gs:97347-97349`);
+      - no wait at the throw site: it would precede th32's cancel step;
+      - `graph_compute`'s catch destroys them in its cleanup step (next
+        bullet), after th32's cancel step and after its own waits.
+
+      The inner catch's two `return false` exits (`gs:97333`, `:97350`)
+      destroy submitted locals the same way, before `graph_compute`'s
+      fallback runs. That is a pre-existing defect, reported to the lead
+      for its own ticket, and not part of this design.
+    - **The catch's cleanup step** (r9 m-1 (c); r10 I-1, m-1). The
       transient leases are the backend context's `graph_weight_leases`
       and `graph_moe_expert_leases` (`common.hpp:7222-7223`). The unpin
       the catch calls (`gs:107768`) returns without releasing them while
@@ -2138,31 +2228,52 @@ created") describes a path that does not run.
       (`gs:61136-61138`). Nothing in the catch clears either before it:
       the quarantine (`gs:15570-15586`) aborts the registry invocation
       only, and the execution release, which runs after the unpin
-      (`gs:107769`), resets only the execution epoch fields
-      (`gs:15392-15400`). Nothing on the segmented path guarantees them
-      clear either. So C4 amends the catch: after its two queue waits
-      (`gs:107753-107764`) and before the unpin, if either is live, it
-      calls `sycl_exec_graph_clear_active(ctx, "fallback-error")`
-      (`gs:99517-99550`), which resets both and releases the pool's
-      retained handles. That function's own queue wait (`gs:99541`) finds
-      the queue already drained. A whole graph cached for another phase is
-      dropped and re-recorded at its next use; after a failed graph that
-      state is not trusted anyway. th32's cancel step still runs first.
-    - **A known ordering item, shared with today's `return false` path**
-      (r9, ungraded). A throw at a direct site unwinds the local
-      `recorded_segments` vector (`gs:97159`), whose executable graphs
-      belong to segments already submitted, before the catch and its
-      cancel step run. The oneAPI headers show the executable graph as a
-      handle over a `shared_ptr` to the runtime's `exec_graph_impl`
-      (`sycl/ext/oneapi/experimental/graph/executable_graph.hpp:82`), so
-      destroying the handle drops a reference. Whether the runtime's
-      destructor then waits for in-flight executions is **unverified**:
-      that code is in the runtime library, not the headers. If it waits,
-      the wait precedes th32's cancel step. The existing `return false`
-      path unwinds the same vector the same way, so the throw adds no new
-      ordering. C4's implementer checks the runtime before C4 lands and
-      reports the answer to the lead. Qwen 3b, with the host dispatch on and a lazy PLE table, is
-      the arm where both are live.
+      (`gs:107769`; `gs:15608-15637`), resets only the execution epoch
+      fields, through `ggml_sycl_execution_clear_graph_tracking`
+      (`gs:15632`). Nothing on the segmented path guarantees them clear
+      either. So C4 inserts one step **immediately after the MMID
+      recovery (`gs:107767`) and before the unpin (`gs:107768`)**: after
+      th32's cancel step, both queue waits (`gs:107753-107764`), the
+      scatter wait (`:107765`) and `ggml_sycl_cpu_staging_drain`
+      (`:107766`, which waits the CPU chain and the staging events,
+      `cpu-dispatch.cpp:3093-3107`). It is wrapped `try { ... } catch
+      (...) {}` like each of its siblings, because an exception thrown
+      inside a handler is not caught by the same try's other handlers and
+      would cross the backend boundary the third amendment forbids:
+      - if `exec_graph` is non-null or `active_exec_graph.valid` is set,
+        it calls `sycl_exec_graph_clear_active(ctx, "fallback-error")`
+        (`gs:99517-99567`);
+      - otherwise it calls `ctx->invalidate_moe_segments()`
+        (`common.hpp:6234-6244`), which the clear also calls, so the
+        executables the record function moved are destroyed in either
+        branch.
+
+      What the clear does, in order: it waits the stream only when
+      `exec_graph` is set (`gs:99542-99544`; the wait is `:99543`, on a
+      queue already drained); destroys `exec_graph` (`:99545`) before it
+      releases any lease, the right order for leases the cached
+      executable bakes in; releases the pool's retained handles
+      (`:99546`); resets the replay state and the input caches
+      (`:99547-99555`); clears the input staging (`:99560`) and the leaf
+      staging cache (`:99562`, `cpu-dispatch.cpp:2494-2496`); unpins the
+      MoE and weight leases itself (`:99563-99564`), so the catch's unpin
+      at `:107768` then runs on empty vectors; and invalidates the MoE
+      segments and block graphs (`:99565-99566`). That invalidation
+      retires the MoE graph epoch first, waiting the streams of every
+      device with a retention terminal (`gs:96549-96553`). If retirement
+      fails it keeps the vectors and sets the disabled flag rather than
+      destroy an executable whose submission may be outstanding
+      (`common.hpp:6234-6238`). All of these waits run after th32's cancel
+      step, and the leases and leaf staging are released only after the
+      CPU drains (P2). A whole graph cached for another phase is dropped
+      and re-recorded at its next use.
+    - **Scope of the cleanup step** (r10 n-8). The step is in the catch
+      that every `ggml_sycl_fallback_error` reaches, so it applies to all
+      38 existing throw sites (37 in `ggml-sycl.cpp` and one at
+      `getrows.cpp:291`, at `e2461d4fb`), not only the six. That is
+      intended: each of them ends the graph FAILED, after which the cached
+      whole-graph and segment state is not trusted, and dropping it after
+      the drains costs one re-record at its next use and nothing else.
     - llama then logs `ggml_backend_sched_graph_compute_async failed with
       error` (`lc:3968-3970`), and `llama_decode` returns -3
       (`lc:3290-3294`), its existing error path (through `gb:2515-2516`
@@ -2197,7 +2308,9 @@ created") describes a path that does not run.
       plan failed`; `host compute buffer ... exceeds notified`;
       `[HOST-ZONE] leaked`; `[FILE-MAPPED] counters`; and §M75's `SCRATCH
       trial ... kept|returned`, `SCRATCH released`, `SCRATCH return
-      refused` and `DEVICE pools ... resized` lines (r8 n-7). Each is a
+      refused` and `DEVICE pools ... resized` lines (r8 n-7), the
+      first now as `SCRATCH trial|reserve|retry ... kept|returned` (r10
+      n-7). Each is a
       dedicated WARN or INFO line its owner prints in the shipped library,
       which §M74 (f) accepts as a vehicle source, so none moves into the
       §M74 (g)/(i) counter dump (`[SYCL-COUNTER] dev=%d name=%s
@@ -3744,14 +3857,19 @@ I-5, §F2). It is the commit that changes every SYCL load.
       and `RETURN` on both loss paths. The begin entry follows each
       scheduler creation. The pinned pool frees a chunk only in its
       destructor and in `release_zone_chunk`, and `release_zone_chunk` is
-      reached only from the begin entry and the owner's end
-      (`ggml_backend_sycl_free` and an orphaned chunk's emptying free; r9
-      m-5). `RETURN` withdraws the marked chunks and files them in the
+      reached only from the begin entry, the returns (for an empty chunk;
+      r10 m-3) and the owner's end (`ggml_backend_sycl_free` and an
+      orphaned chunk's emptying free; r9 m-5). The gate also pins the
+      wiring positively (r10 m-5): `ggml_backend_sycl_free` calls the
+      owner-end step before `delete sycl_ctx` (`gs:84119`), and
+      `sched_reserve` calls `RETURN` on its own transaction's throw path
+      and `KEEP` on its success path. `RETURN` withdraws the marked chunks and files them in the
       device cache's marked set, and nothing in `OPEN` touches that set
       (r8 m-1). Withdrawal is the only writer that lowers
       `zones_[zi].size`, and `release_zone_chunk` does not write it (r9
-      m-3). `sched_reserve` calls `MARK` before its measure and
-      `RETURN_TO_MARK` before the pipeline-parallel retry (r9 n-6).
+      m-3), and only on the flag's false-to-true transition (r10 m-4).
+      `sched_reserve` calls `MARK` before its measure and `RETURN_TO_MARK`
+      before the pipeline-parallel retry (r9 n-6).
     - The pools' gate calls `ggml_sycl_moe_plan_has_host_experts`, and the
       plan walk never calls `ggml_backend_buffer_is_host` (r7 I-2).
     - The helper **throws `ggml_sycl_fallback_error`** at each of the six
@@ -3759,8 +3877,14 @@ I-5, §F2). It is the commit that changes every SYCL load.
       third amendment). Its argument is a string literal (r9 n-3). The
       recording catch's rethrow of that type (`gs:97347-97349`) is
       present, and `graph_compute`'s `ggml_sycl_fallback_error` catch
-      calls `sycl_exec_graph_clear_active` before its lease unpin and
-      returns `GGML_STATUS_FAILED` (r9 m-1 (c)).
+      returns `GGML_STATUS_FAILED`. Its cleanup step sits immediately
+      after the MMID recovery (`gs:107767`) and before the lease unpin
+      (`gs:107768`), inside its own `try { ... } catch (...) {}`, and
+      calls `sycl_exec_graph_clear_active` or `invalidate_moe_segments`
+      (r9 m-1 (c); r10 m-1). `moe_graph_record_segments` wraps its record
+      loop in a `catch (...)` that moves `recorded_segments` and
+      `recorded_moe_graphs` into the context before it rethrows (§M69 (b)
+      fourth amendment).
     - No `ggml_sycl_compute_forward(` call in the MoE segmented
       record/replay functions discards its return: each of the six goes
       through the fail-closed helper (§M69 (b) as amended; r6 m-1).
@@ -4120,8 +4244,11 @@ I-5, §F2). It is the commit that changes every SYCL load.
       live filler per chunk, leaving every existing chunk's largest free
       block below 58 MiB. Candidate 512 then grows one 64 MiB chunk (target
       140 MiB, deficit 12) and wins; candidate 1024 grows one 64 MiB chunk
-      (target 250 MiB, deficit 58), holds a **58 MiB** stand-in, which fits
-      only that chunk, and loses. The ladder ends at 192 MiB, the capacity
+      (target 250 MiB, deficit 58), holds a **58 MiB** stand-in, and
+      loses. Before 1024's notify the fixture also fills candidate 512's
+      kept chunk, which is empty once 1024's scheduler replaces 512's and
+      which `zone_alloc` would visit first (`pp:510-521`), so the stand-in
+      fits only the new chunk (r10 n-5). The ladder ends at 192 MiB, the capacity
       that 100 MiB plus the winner's 40 MiB needs, chunk-rounded, with
       `chunk_count` at the pre-ladder count plus 1, and not at 256 MiB;
     - a fixture allocation left live in the loser's chunk makes the return
@@ -4139,15 +4266,28 @@ I-5, §F2). It is the commit that changes every SYCL load.
       chunk, `chunk_count` is the pre-ladder count plus 1 (the new chunk),
       `allocated()` is the pre-ladder figure plus that chunk's backing
       size, and capacity is 128.0 MiB;
-    - **the owner's end** (r9 m-5): outside any trial, `sched_reserve`'s
-      own transaction grows one chunk, a stand-in is allocated in it, and
-      the reserve throws, so `RETURN` runs and no `sched_reserve` follows.
-      The fixture frees the backend with the stand-in still live (the
-      chunk is orphaned, and nothing is released), then frees the
-      stand-in, as `sched`'s destruction does after the backends'. That
-      free releases the chunk: the `released` line prints, and
-      `chunk_count` and `allocated()` are back to their pre-reserve values
-      before the pool is destroyed.
+    - **the empty return** (r10 m-3): outside any trial, `sched_reserve`'s
+      own transaction grows one chunk, and the reserve throws before any
+      host buffer lands in it, as when the device buffer fails first.
+      `RETURN` releases it at once: right after the `RETURN`, with no
+      begin, `chunk_count` and `allocated()` are back to their
+      pre-reserve values and the `released` line has printed;
+    - **the runtime throw with the context kept** (r10 m-3): the same
+      throw with a stand-in live in the chunk. The context is kept and no
+      reserve follows. A second context's begin on the device then leaves
+      the chunk and prints no `SCRATCH return refused` line; the chunk is
+      still withdrawn, and capacity still excludes it;
+    - **the retry's truncation** (r10 m-4): `MARK`, one chunk grown (A)
+      with a stand-in live in it, `RETURN_TO_MARK`, then one more chunk
+      grown (B). Two endings:
+      - `RETURN`: A and B are each withdrawn once; after the stand-in is
+        freed and the next begin runs, capacity, `chunk_count` and
+        `allocated()` are back to their pre-`MARK` values;
+      - `KEEP`: B becomes ordinary capacity, A stays withdrawn, and the
+        next begin, after the stand-in is freed, releases A: `chunk_count`
+        is the pre-`MARK` count plus 1.
+      The same two endings run once more inside a trial transaction, with
+      `try_candidate`'s `RETURN` or `KEEP`.
 
     Every expected figure is computed as a sum of `chunk_footprint_for`
     terms, never as a difference, and every case also asserts that
@@ -4165,17 +4305,19 @@ I-5, §F2). It is the commit that changes every SYCL load.
       The test computes `<C>` from `chunk_footprint_for` rather than
       hard-coding it, and asserts that the mutant's message quotes it. In
       the second-context case the same mutant reads 256 MiB against 192.
-    - A second mutant releases at `RETURN` instead of at the begin. The
-      80 MiB stand-in is live at `RETURN`, so the release refuses by name
-      and keeps the chunk, and the test fails on the `SCRATCH return
-      refused` line (r8 m-2).
+    - A second mutant tries to release every returned chunk at `RETURN`,
+      empty or not. The 80 MiB stand-in is live at `RETURN`, so the
+      release refuses by name and keeps the chunk, and the test fails on
+      the `SCRATCH return refused` line (r8 m-2).
     - Two mutants for the window (r9 m-2):
-      - **no withdrawal**: the counted capacity is 150 MiB with 6 MiB free
-        in the marked chunk, so the ensure grows nothing and the 1 MiB
-        lands in the marked chunk, the only one with room. The begin then
-        refuses, and the test fails on `SCRATCH return refused dev=0
-        chunk=<idx>`; the right-after-`RETURN` check has already failed
-        with `SCRATCH capacity 150.x MiB after RETURN, expected 64.0 MiB`;
+      - **no withdrawal**: it fails **first** on the right-after-`RETURN`
+        check, with `SCRATCH capacity <C> MiB after RETURN, expected 64.0
+        MiB`, and the test asserts that the mutant's message quotes that
+        text, `<C>` computed as above (r10 n-4). For the record, run on,
+        the counted capacity is `<C>` with 6 MiB free in the marked chunk,
+        so the ensure grows nothing, the 1 MiB lands in the marked chunk,
+        the only one with room, and the begin refuses with `SCRATCH
+        return refused dev=0 chunk=<idx>`;
       - **marks kept per transaction**, which candidate 512's `OPEN`
         resets: the chunk stays withdrawn but unmarked, so no begin
         releases it and capacity still reads 128.0 MiB. The test fails on
@@ -4184,9 +4326,43 @@ I-5, §F2). It is the commit that changes every SYCL load.
     - **Double decrement** (r9 m-3): `release_zone_chunk` also lowers
       `zones_[zi].size`. The main case fails with `SCRATCH capacity
       <wrapped> MiB exceeds the pool's allocated() <x> MiB`.
-    - **No owner-end release** (r9 m-5): the owner's-end case fails with
-      `chunk_count <n+1> after context free, expected <n>: withdrawn chunk
-      <idx> idle until pool destruction`.
+    - **Release only at a begin** (r10 m-3): the empty-return case fails
+      with `chunk_count <n+1> right after RETURN, expected <n>: empty
+      returned chunk <idx> not released`.
+    - **A begin refuses any owner's chunk** (r10 m-3): the runtime-throw
+      case fails on the second context's `SCRATCH return refused dev=0
+      chunk=<idx>` line.
+    - **`RETURN_TO_MARK` leaves its chunks in the set** (r10 m-4): the
+      `RETURN` ending withdraws A twice under a transition-blind
+      decrement, or double-counts it otherwise; it fails with `SCRATCH
+      capacity <wrapped> MiB exceeds the pool's allocated() <x> MiB`. The
+      `KEEP` ending un-withdraws A, which no begin then releases, and
+      fails with `chunk_count <n+2> after the begin, expected <n+1>`.
+  - RED `test-sycl-scratch-owner-end` (r9 m-5, r10 m-5; device,
+    `sycl;cache;mem-handle`, `level_zero:1`, lead-run, loads no model). It
+    creates a real backend with `ggml_backend_sycl_init`, drives its
+    transaction through the `ggml_backend_sycl_host_scratch_trial`
+    proc-table entry, and frees it with `ggml_backend_free`, which
+    reaches `ggml_backend_sycl_free` and the owner-end step, never a
+    fixture call. The stand-in is a SCRATCH allocation made through the
+    same host-buffer path the scheduler's host compute buffer takes, freed
+    with `ggml_backend_buffer_free` after the backend, in `llama_context`'s
+    member order. Two cases, each starting with `sched_reserve`'s own
+    transaction growing one chunk with the stand-in live, then `RETURN`
+    on a throw, with no begin after it:
+    - **orphaned**: `ggml_backend_free` with the stand-in live releases
+      nothing and orphans the chunk; freeing the stand-in releases it, the
+      `released` line prints, and `chunk_count` and `allocated()` are back
+      to their pre-reserve values before the pool is destroyed;
+    - **empty at free**: the stand-in is freed first, and then
+      `ggml_backend_free` releases the chunk itself.
+
+    Mutants, each with its message: the owner-end call removed from
+    `ggml_backend_sycl_free`, which fails both cases; the orphaned-free
+    branch removed, `chunk_count <n+1> after the stand-in's free, expected
+    <n>`; and the empty-at-free branch removed, `chunk_count <n+1> after
+    the context is freed, expected <n>: withdrawn chunk <idx> idle until
+    pool destruction`.
   - `test-sycl-kv-demand-idx` (`sycl;host`, r3 B). A pure test of
     `kv_demand_for_layer` on a 48-layer plan with Qwen's shape: 12 FULL
     layers of 512 MiB at 262144 cells, `kv_idx_width` 128. Each carries 576
@@ -4259,11 +4435,32 @@ I-5, §F2). It is the commit that changes every SYCL load.
          failed decode leaks no lease (P2);
       5. a second `graph_compute` on the same context, with the seam off,
          succeeds.
-    - A third case sets a cached `exec_graph` live through the seam before
-      the call, and asserts 4: the catch's clear is what makes the unpin
-      run. Mutant: that clear removed. It fails with `lease vectors
-      <w>+<m> non-empty after a FAILED return; exec_graph live`, where
-      `<w>` and `<m>` are the seam's snapshot.
+    - A third case sets `active_exec_graph.valid` alone through the seam
+      before the call, with `exec_graph` left null (r10 m-2). That state
+      avoids both earlier clears, the key-miss clear (`gs:106993`, inside
+      the branch that needs `exec_graph`, `gs:106944`) and the fa-pointer
+      drift clear (`gs:107112-107117`), and the preload and pre-allocation
+      skips that a non-null `exec_graph` causes (`gs:107026-107051`).
+      **Precondition:** the seam's snapshot shows `active_exec_graph.valid`
+      set at the refusal; if an earlier path cleared it, the case is
+      VOID. The case asserts 4: the catch's cleanup step is what makes
+      the unpin run. Mutant: that step removed. It fails with `lease
+      vectors <w>+<m> non-empty after a FAILED return; active_exec_graph
+      live`, where `<w>` and `<m>` are the seam's snapshot.
+    - A fourth case refuses at the **moe_after site** (`gs:97315`), whose
+      segment was submitted just before (`gs:97311`) (§M69 (b) fourth
+      amendment; r10 I-1). The seam records the number of recorded
+      executables at the throw, which must be at least 1 (precondition),
+      the size of `moe_segments` at the catch's entry, and the order of
+      the catch's steps. It asserts 1-5 and also:
+      - at the catch's entry `moe_segments` holds every executable the
+        throw had recorded: none was destroyed in the unwind;
+      - the cleanup step destroys them after th32's cancel step and after
+        both queue waits, and `moe_segments` is empty after it.
+
+      Mutant: the local unwind restored (no move). It fails with
+      `executables destroyed in the unwind: moe_segments 0 at catch
+      entry, <n> recorded at the throw`.
 
     **RED: the immediate-return mutant** (rev 3j's exit). It never reaches
     `gs:107778`, so both cases fail **first** on assertion 1, with `no
@@ -4550,11 +4747,15 @@ I-5, §F2). It is the commit that changes every SYCL load.
      The command carries `GGML_SYCL_TUNING_CACHE=0`, so a cached terminal
      hit (`lc:1755-1760`) cannot skip the ladder and the run writes no
      tuning cache (r8 m-3). Criteria:
-     - **scored always:** no `SCRATCH return refused` line prints, and the
-       last `SCRATCH demand ctx=` line's figure fits the final capacity
-       with no chunk beyond it;
+     - **scored always:** the last `SCRATCH demand ctx=` line's figure
+       fits the final capacity with no chunk beyond it. The absence of a
+       `SCRATCH return refused` line is informative only beside a
+       counted `returned` line (next item), since no release is attempted
+       without one; otherwise the run reports it as not exercised (r10
+       n-6);
      - **the §M75 sub-criterion counts only with at least one `SCRATCH
-       trial ... returned` line whose chunk count is at least 1** (r9 m-4;
+       trial ... returned` line whose chunk count is at least 1**; the
+       `reserve` and `retry` forms do not count (r10 n-7) (r9 m-4;
        a zero-chunk return prints nothing, §4.4, and the scorer checks the
        count anyway): every such line is followed by its `released` line.
        With none, the sub-criterion is **VOID**, neither PASS nor FAIL,
@@ -5078,6 +5279,27 @@ re-pin, folded in rev 3m:
 | n-6 the pipeline-parallel retry | Fixed: `MARK` before the measure and `RETURN_TO_MARK` before the retry, so the retry runs inside a transaction (its own, `KEEP`t on success, or the trial's) and the discarded first measure's growth is returned in both cases. | §4.4 staging plan, §7 C4 source gate |
 | n-7 the second-context stand-in | Fixed: sized per case, a 58 MiB stand-in in a 64 MiB chunk with the other chunks filled below it; the ladder ends at 192 MiB, and the keep mutant reads 256. | §7 C4 tests |
 | n-8 prose | Fixed. | §4.4 staging plan |
-| ungraded: the executable-graph destructor | Recorded as a known ordering item shared with today's `return false` path: the headers show a `shared_ptr` handle (`executable_graph.hpp:82`); whether the runtime's destructor waits is unverified, and C4's implementer checks it before landing. | §4.4 staging plan |
+| ungraded: the executable-graph destructor | Recorded as a known ordering item shared with today's `return false` path: the headers show a `shared_ptr` handle (`executable_graph.hpp:82`); whether the runtime's destructor waits is unverified, and C4's implementer checks it before landing. **Superseded in rev 3n**: the tree answers it (`gs:99522-99538`), and the §M69 (b) fourth amendment moves the executables out of the unwind (design-5efe-r10 table, I-1). | §4.4 staging plan |
 | queued: the tracker-edge sentence | Fixed: no tracker edge blocks C1's merge on T6 (it would close a cycle); the one-merge constraint is comments `c-q50c` and `c-0elm`, as th32's T6 row states. The two Appendix B rows that repeated the claim are corrected in place. | the lead's C1/T6 ruling, this appendix |
 | merge unit: th32 pin | Re-pinned at rev 3f `d0ad45bb7`; 3f changes no heading from 3e, §5.3's cancel step and the §10 expected line are unchanged. | sibling designs |
+
+**design-5efe-r10** (`a68508606..6b674097e`, 0C/1I/5m/8n, P2 and P4
+FAIL), with the lead's r10 rulings and the §M69 (b) fourth amendment,
+folded in rev 3n:
+
+| finding | disposition | where |
+|---|---|---|
+| I-1 the unwind destroys submitted executables (§M69 (b) fourth amendment) | Fixed: `moe_graph_record_segments` wraps its record loop in a `catch (...)` that moves `recorded_segments` and `recorded_moe_graphs` (`gs:97159-97160`) into the context before rethrowing, from all four sites (direct `gs:97234`, `:97240`; recording `gs:97285`; moe_after `gs:97315`). The catch's cleanup step destroys them after th32's cancel step and its own waits. No wait at the throw site. The evidence is `gs:99522-99538` (dkw0 #4), which replaces "unverified". New fourth seg-refusal case at the moe_after site, with the local-unwind mutant. The inner catch's `return false` exits (`gs:97333`, `:97350`) have the same shape and were reported to the lead for their own ticket. | §4.4 staging plan, §7 C4 tests and source gate |
+| m-1 the clear's position, wrapping and body | Fixed: one step immediately after `gs:107767` and before `:107768`, wrapped `try/catch (...)`; it calls the clear when whole-graph state is live, else `invalidate_moe_segments`. The clear's real body (`gs:99517-99567`) is described: its own unpin (`:99563-99564`), the input and leaf staging clears (`:99560`, `:99562`), and the MoE retirement waits (`gs:96549-96553`), all after th32's cancel step. | §4.4 staging plan, §7 C4 source gate |
+| m-2 the third case can pass vacuously | Fixed: the seam sets `active_exec_graph.valid` alone, and the snapshot showing it set at the refusal is a precondition, else VOID; the miss-path and fa-drift clears need `exec_graph` and so cannot run first. | §7 C4 tests |
+| m-3 a runtime throw leaves an empty chunk idle | Fixed: `RETURN` and `RETURN_TO_MARK` release every empty returned chunk at once; a non-empty one stays withdrawn until its owner's next begin or end. A begin leaves another live owner's non-empty chunk silently; `return refused` prints only at the owner's own begin. The runtime throw (`lc:3178`, `:2891`, with `lc:1998` and `lc:5733-5742`) is stated. New host cases: the empty return and the runtime throw with the context kept, each with a mutant. | §4.4 staging plan, §7 C4 tests |
+| m-4 `RETURN_TO_MARK` can withdraw twice | Fixed: it truncates the transaction to the mark, and withdrawal lowers `zones_[zi].size` only on the flag's false-to-true transition; `KEEP` never clears the flag. New host case with `RETURN` and `KEEP` endings, in and out of a trial; mutant: the chunks left in the set. | §4.4 staging plan, §7 C4 tests and source gate |
+| m-5 the owner-end wiring is not pinned | Fixed: the gate pins the owner-end call in `ggml_backend_sycl_free` before `delete sycl_ctx` (`gs:84119`), and `sched_reserve`'s `RETURN` on a throw and `KEEP` on success. The owner-end cases move to a device RED, `test-sycl-scratch-owner-end`, which frees through `ggml_backend_free`, with the orphaned and empty-at-free cases and three mutants. | §7 C4 tests and source gate |
+| n-1 cites | Fixed: the clear's wait `gs:99543`, its body `gs:99517-99567`, `~llama_context` `lc:1066-1107`, and the execution release `gs:15608-15637` calling the tracking helper at `:15632`. | §4.4 staging plan |
+| n-2 where `orphaned` lives | Fixed: `withdrawn` and `orphaned` both live on the chunk's `zone_chunk_state`; the marked set holds only the owner; `zone_free` tests the flag on the entry it already found (`pp:536-541`), with no cache lookup. | §4.4 staging plan |
+| n-3 `configure_zones` drops the flag | Fixed: its caller releases every marked chunk first, since the rebuild (`pp:389-417`) already presumes no live zone allocation; a non-empty one refuses by name. | §4.4 staging plan |
+| n-4 the window mutant's first failure | Fixed: the right-after-`RETURN` capacity check fails first, and the test asserts that the message quotes it. | §7 C4 tests |
+| n-5 "fits only that chunk" | Fixed: candidate 512's kept chunk is filled too. | §7 C4 tests |
+| n-6 step 4's zero without liveness | Fixed: the `return refused` absence is informative only beside a counted `returned` line, otherwise reported as not exercised. | §7 C4 step 4 |
+| n-7 `trial` on non-trial lines | Fixed: the line names its transaction, `trial`, `reserve` or `retry`; step 4 counts only `trial` lines. | §4.4 staging plan, §7 C4 step 4 |
+| n-8 the cleanup step's scope | Fixed: it applies to all 38 throw sites (37 in `ggml-sycl.cpp`, one at `getrows.cpp:291`), and that is intended. | §4.4 staging plan |
