@@ -1,7 +1,10 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 3j, not implemented. rev 3j is a new commit on rev 3i
-(`b29dd42d2`). It folds design-5efe-r7 (`87181659f..b29dd42d2`,
+*Status: DESIGN rev 3k, not implemented. rev 3k is a new commit on rev 3j
+(`df0bddfed`). It folds lead ruling §M75: a losing auto-`n_ubatch`
+candidate's SCRATCH growth is returned, through a zone-chunk release the
+pinned pool does not have today (§4.4 staging plan, §7 C4 tests). rev 3j
+is a new commit on rev 3i (`b29dd42d2`). It folds design-5efe-r7 (`87181659f..b29dd42d2`,
 0C/2I/7m/6n) under the lead's r7 rulings, the §M69 (b) second amendment
 (the six sites propagate `GGML_STATUS_FAILED`), §M73 and §M74; Appendix B's
 "design-5efe-r7" table keys each item to r7's IDs. rev 3i is a new commit
@@ -1424,7 +1427,9 @@ created") describes a path that does not run.
       sizes replace the same demand and grow nothing, and a larger demand
       grows only by the rise. Today's `grow_scratch_zone(additional_bytes)`
       is additive and never shrinks (`uc:20442-20449`), which is why the
-      notify does not call it. Capacity is never returned, so a later
+      notify does not call it. Outside an auto-`n_ubatch` trial, whose
+      losing candidates return their growth (§M75, below), capacity is
+      never returned, so a later
       context reuses what an earlier one grew, and one `llama_context` never
       grows the zone once per SYCL backend.
     - The growth is one `grow_zone(SCRATCH, deficit + n x
@@ -1764,8 +1769,12 @@ created") describes a path that does not run.
     - **The lifecycle of a pending plan** (r7 I-1). A third proc-table
       entry, `void ggml_backend_sycl_begin_host_holders(ggml_backend_sched_t
       sched)`, runs at the **start** of every `sched_reserve`, right after
-      its `synchronize()` (`lc:2002`), and again before the
-      pipeline-parallel retry's re-measure (`lc:2059-2064`). It clears the
+      the scheduler is created (`lc:2019-2022`) and before the measure, and
+      again right after the pipeline-parallel retry creates its scheduler
+      (`lc:2061-2064`). It sits after the creation, not at the
+      `synchronize()` (`lc:2002`), because the creation destroys the
+      previous scheduler and its compute buffers, which §M75's return
+      needs (below). It clears the
       pending plan of every SYCL backend in `sched`, enumerated with
       `ggml_backend_sched_get_n_backends` and `ggml_backend_sched_get_backend`
       (`ggml-backend.h:362-363`, ggml-base). So no backend carries a
@@ -1808,15 +1817,69 @@ created") describes a path that does not run.
       whenever the scheduler does not already match it (`lc:1931-1940`),
       so the last commit is always the chosen candidate's. There is no
       exception to this.
-    - **Outside the commit: the notify of a losing candidate.** The notify
-      must ensure SCRATCH before the allocating reserve it covers (above),
-      so a losing candidate's notify can grow SCRATCH for its own host
-      compute buffer before the candidate loses, and capacity is never
-      returned. On the MoE lead models the SYCL cap keeps the ladder at
-      512 (`lc:1409-1461`, `moe-control-plan.hpp:144`), a single candidate
-      that cannot lose to a larger one, so no lead arm reaches this path.
-      It is not claimed closed by m-1, and it is raised with the lead for
-      a ruling.
+    - **A losing candidate's SCRATCH growth is returned** (§M75). The
+      notify must ensure SCRATCH before the allocating reserve it covers
+      (above), so a trial candidate's notify can grow SCRATCH for its own
+      host compute buffer before the candidate is known to win. That
+      growth follows the pending plan's lifecycle: it is charged to the
+      candidate, kept only if the candidate wins (its `sched_reserve`
+      succeeds **and** its host-fallback check passes, `lc:1622-1629`),
+      and returned if it loses. After the ladder, SCRATCH capacity is the
+      winner's need plus the other live contexts' demand, chunk-rounded as
+      every SCRATCH figure is, and never the losers' high-water (P4).
+      "Capacity is never returned" (above) holds for every other caller,
+      and no longer for a trial candidate.
+    - **The transaction.** A fourth proc-table entry, `bool
+      ggml_backend_sycl_host_scratch_trial(ggml_backend_t backend, int
+      op)`, with `op` one of `OPEN`, `KEEP` and `RETURN` (plain `int`
+      constants, since no enum crosses the dlopen boundary), called on the
+      backend the notify is made through. `try_candidate` calls `OPEN`
+      right before its `sched_reserve` (`lc:1607`). While it is open, every
+      chunk that zone 3 grows for that context is recorded in the
+      transaction, by the notify's ensure and by the miss path alike. On a
+      win, `try_candidate` calls `KEEP` together with the commit, after the
+      host-fallback check; the chunks become ordinary SCRATCH capacity. On
+      each loss path, the allocating reserve's throw (`lc:1609-1619`) and
+      the host fallback (`lc:1624-1628`), it calls `RETURN`.
+    - **When the return runs.** `RETURN` drops the context's demand and
+      marks the transaction's chunks for return. It cannot release them at
+      that instant, because the losing candidate's scheduler still holds
+      its host compute buffers in them, and releasing memory that a live
+      handle still owns is forbidden. Every loss clears
+      `sched_matches_last_good` (`lc:1619`, `:1627`), so a `sched_reserve`
+      always follows, for the next candidate or for the settle
+      (`lc:1931-1940`). Its scheduler creation (`lc:2019`) destroys the
+      losing scheduler and frees those buffers, and the begin entry, which
+      runs right after it, releases the marked chunks before the measure
+      and the notify. So no later ensure ever sees the loser's chunks.
+    - **The support gap it closes.** The pinned pool cannot shrink a zone
+      today. `grow_zone` appends a chunk to `chunks_`, a span to
+      `flat_spans_` and a TLSF allocator to the zone's
+      `zone_allocators_` (`pinned-pool.cpp:613-712`), and chunks are freed
+      only in the pool's destructor (`:141-162`). C4 adds
+      `pinned_chunk_pool::release_zone_chunk(host_zone_id zone, size_t
+      chunk_idx)`. It requires the chunk's zone allocator to be wholly
+      free and its lease count 0. It removes the chunk's span and zone
+      allocator, subtracts the chunk from the zone's capacity and from
+      `total_allocated_`, and releases the chunk through
+      `free_chunk_owner` (`:778-791`), whose `mem_handle` release is the
+      only release point (P2). The `chunks_` entry stays as a tombstone
+      (base null, size 0), so no other chunk's index moves: the indices in
+      `flat_spans_` and in every `zone_chunk_state` stay valid. `contains`,
+      `allocated` and `chunk_count` skip tombstones.
+    - **A return that finds a live allocation refuses by name.** If a
+      marked chunk still holds an allocation or a lease, the release
+      prints `[HOST-ARENA] SCRATCH return refused dev=%d chunk=%zu: %zu B
+      still allocated (cohort %s)` (WARN), keeps the chunk, and the
+      transaction's figure stays charged. It never forces the release. A
+      lead arm that prints it is a FAIL: something outside the losing
+      candidate took SCRATCH during the trial.
+    - **The witness.** `KEEP` and `RETURN` print `[HOST-ARENA] SCRATCH
+      trial dev=%d n_ubatch=%u kept|returned %.1f MB (%zu chunk(s))`
+      (INFO), and the release prints `[HOST-ARENA] SCRATCH released %.1f
+      MB (%zu chunk(s)); capacity %.1f MB` (INFO) with the capacity after
+      it. A `returned` line with no `released` line before the next
+      `SCRATCH demand ctx=` line is a FAIL.
     - A commit **replaces** that context's committed plan, as a notify
       replaces its demand. The device's planned capacity per slot is the
       high-water over the live contexts' **committed** plans, not over
@@ -3473,6 +3536,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
       `sched_reserve` on its success, except under the auto-`n_ubatch`
       trial, where `try_candidate` makes them after its host-fallback check
       (r7 m-1).
+    - **§M75.** `try_candidate` calls `ggml_backend_sycl_host_scratch_trial`
+      with `OPEN` before its `sched_reserve`, `KEEP` beside the commit,
+      and `RETURN` on both loss paths. The begin entry follows each
+      scheduler creation. The pinned pool frees a chunk only in its
+      destructor and in `release_zone_chunk`, and `release_zone_chunk` is
+      reached only from the begin entry's return.
     - The pools' gate calls `ggml_sycl_moe_plan_has_host_experts`, and the
       plan walk never calls `ggml_backend_buffer_is_host` (r7 I-2).
     - No site in the two segmented functions asserts or aborts on a
@@ -3586,6 +3655,9 @@ I-5, §F2). It is the commit that changes every SYCL load.
         separately the trial's commit moved before its host-fallback check
         (r7 m-1);
       - the begin call removed (r7 I-1);
+      - `RETURN` removed from the host-fallback loss path (§M75), and
+        separately the begin moved before the scheduler creation, where
+        the losing scheduler's buffers are still live;
       - the pools gated on `ggml_backend_buffer_is_host(src0->buffer)`
         (r7 I-2);
       - the helper asserting on a refusal, and separately the status read
@@ -3803,6 +3875,37 @@ I-5, §F2). It is the commit that changes every SYCL load.
       which counts the CPU and `SYCL_Host` K nodes and misses the view
       (`NULL` buffer); the helper's device for every slot, which leaves
       device 1's slots unplanned.
+  - RED `test-sycl-scratch-trial-return` (`sycl;host`; §M75). A host
+    fixture: the fixture cache's pinned pool with its chunk size set to 64
+    MiB (`GGML_SYCL_PINNED_CHUNK_MB=64`, read by `resolve_chunk_size`,
+    `pinned-pool.cpp:49-63`), SCRATCH configured at 64 MiB, and a plan
+    term `host_zone_scratch_bytes` of 0, so the ensure target is the sum
+    of the live demands. It is driven through the notify and the trial
+    entry points as a **non-MoE** ladder would drive them:
+    - candidate 512 needs 40 MiB of host compute: it fits the base, and no
+      chunk grows;
+    - candidate 1024 needs 150 MiB: its notify's deficit is 150 - 64 = 86
+      MiB, which grows one chunk, and it then loses at the host-fallback
+      check, so `RETURN` runs;
+    - the settle re-reserves 512: after its begin, SCRATCH capacity is
+      **64.0 MiB**, the winner's need chunk-rounded, the `released` line
+      prints the returned chunk, and the pool's `chunk_count` is back to
+      its pre-ladder value;
+    - with a second live context holding a 100 MiB demand, the same ladder
+      ends at the capacity that 100 MiB plus the winner's 40 MiB needs,
+      chunk-rounded (192 MiB with 64 MiB chunks), and not at the loser's;
+    - a fixture allocation left live in the loser's chunk makes the return
+      refuse by name and keeps the chunk; nothing is released under it.
+    - **RED: the keep-the-high-water mutant**, `RETURN` as a no-op. It
+      fails with `SCRATCH capacity <C> MiB after the ladder, expected
+      64.0 MiB (winner's need)`, where `<C>` is 64 plus the one chunk the
+      loser grew, `chunk_footprint_for` of its 86 MiB deficit plus the
+      alignment terms (about 150 MiB). The test computes `<C>` from
+      `chunk_footprint_for` rather than hard-coding it, and asserts that
+      the mutant's message quotes it.
+    - A second mutant releases at `RETURN` instead of at the begin: the
+      losing scheduler's buffers are still live then, and the test fails
+      on the return-refused line.
   - `test-sycl-kv-demand-idx` (`sycl;host`, r3 B). A pure test of
     `kv_demand_for_layer` on a 48-layer plan with Qwen's shape: 12 FULL
     layers of 512 MiB at 262144 cells, `kv_idx_width` 128. Each carries 576
@@ -4106,7 +4209,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
        5b's result beside it.
   4. The Mistral gate on `:1` and `:0` (default context), with `-v` added so
      the context line prints, and the VOID guard, N = 32768 (§7 preamble;
-     r4 m-1).
+     r4 m-1). Mistral's `n_ubatch` ladder is not capped (it is not MoE),
+     so this is the lead arm on which a trial candidate can lose (§M75):
+     every `SCRATCH trial ... returned` line is followed by its `released`
+     line, no `SCRATCH return refused` line prints, and the last `SCRATCH
+     demand ctx=` line's figure fits the final capacity with no chunk
+     beyond it.
   5. The GPT-OSS gate on `:1`, in two arms, each under `timeout 60`, **with
      `-lv 4` added** to the canonical command (r3 C; §7 preamble), stdout and
      stderr captured to separate files, and scored with `grep -cx '1, 2, 3,
@@ -4557,9 +4665,9 @@ r7 rulings, the §M69 (b) second amendment, §M73 and §M74, folded in rev
 
 | finding | disposition | where |
 |---|---|---|
-| I-1 the pending plan has no lifecycle | Fixed as the reviewer wrote it. A third proc-table entry, `ggml_backend_sycl_begin_host_holders(sched)`, clears every SYCL backend's pending plan at the start of each `sched_reserve` (after `lc:2002`) and before the pipeline-parallel re-measure, enumerating with `ggml_backend_sched_get_n_backends`/`get_backend` (`ggml-backend.h:362-363`). One reserve's pp and tg walks max-merge per (device, kind) and per device for (D, K, N); the pp graph dominates (`lc:2007` against `lc:2080`), so Qwen plans D = 5120, not 10. The commit consumes the pending plan and is the only step that registers demand. Tests: "tg replaces pp" and "stale pending from a failed candidate is promoted" mutants, each with its predicted message. | §4.4 sizing and staging plan, §7 C4 tests and source gate |
+| I-1 the pending plan has no lifecycle | Fixed as the reviewer wrote it. A third proc-table entry, `ggml_backend_sycl_begin_host_holders(sched)`, clears every SYCL backend's pending plan at the start of each `sched_reserve` (after `lc:2002`) and before the pipeline-parallel re-measure, enumerating with `ggml_backend_sched_get_n_backends`/`get_backend` (`ggml-backend.h:362-363`). The begin runs right after each scheduler creation (`lc:2019-2022`, and the retry's `lc:2061-2064`; moved there from `lc:2002` in rev 3k for §M75). One reserve's pp and tg walks max-merge per (device, kind) and per device for (D, K, N); the pp graph dominates (`lc:2007` against `lc:2080`), so Qwen plans D = 5120, not 10. The commit consumes the pending plan and is the only step that registers demand. Tests: "tg replaces pp" and "stale pending from a failed candidate is promoted" mutants, each with its predicted message. | §4.4 sizing and staging plan, §7 C4 tests and source gate |
 | I-2 the pools gate on the buffer | Fixed as a P3 fix: the gate is placement's executor fact, `ggml_sycl_moe_plan_has_host_experts` (`gs:26003-26025`), the fact the dispatch's CPU-island gate routes on (`gs:26031-26051`), never `ggml_backend_buffer_is_host`, since under C4 `SYCL_Mapped` is `is_host` for device-placed experts too. A new INFO line, `DEVICE pools dev=%d committed D=... host_expert_nodes=%d`, is the positive control for the zero case, else VOID. Test: a `SYCL_Mapped` `src0` with every expert device-placed registers zero pool demand; mutant: the buffer gate. GPT-OSS's case is read from that line, one source. | §4.4 sizing, criteria, §7 C4 tests and source gate |
-| m-1 a losing candidate commits | Fixed: `try_candidate` commits only after its host-fallback check (`lc:1622-1629`); other callers commit at `sched_reserve`'s end. A losing candidate grows no slot, re-sizes no pool and ensures no SCRATCH for either. No exception is stated. The notify's own pre-allocation ensure for a losing candidate is a separate path, named in §4.4, unreachable on the lead arms (the MoE cap holds the ladder at 512), and raised with the lead. | §4.4 staging plan, §7 C4 source gate |
+| m-1 a losing candidate commits | Fixed: `try_candidate` commits only after its host-fallback check (`lc:1622-1629`); other callers commit at `sched_reserve`'s end. A losing candidate grows no slot, re-sizes no pool and ensures no SCRATCH for either. No exception is stated. The notify's own pre-allocation ensure for a losing candidate was raised with the lead and is ruled by §M75 (row below). | §4.4 staging plan, §7 C4 source gate |
 | m-2 rule 4 can absorb a crash | Fixed: refusal, failed graph, abort (rc 134 plus the printed abort message) and crash (any other non-zero rc or signal: rc 139, rc 124, the watchdog's `_Exit(1)`, a GPU fault) are defined; an abort or crash is FAILED, never VOID. Rule 2 requires a counter line after the plan line; rule 4 also requires no `first host dispatch` line and rc 0. | §4.4 criteria |
 | m-3 5b's parent control has no place in the rules | Fixed: it is rule 1's exception (b), for an abort or crash whose abort or GPU-fault line also prints on the parent; a refusal or failed graph is never pre-existing. | §4.4 criteria, §7 C4 step 5b |
 | m-4 the size-only split is not the allocating split; the RED fixture | Fixed. (a) The start reset erases the `norm`/`l_last` pins (`lc:3985-3997`) and the `!offload_kqv` pin (`src/llama-graph.cpp:2779`), which `ggml_backend_sched_reserve` keeps (`gb:2691-2698`); the walk's three op kinds are assigned by buffer or expansion and unaffected, and the claim is bounded to them. The notify re-notifies at commit with the allocated size, so the ledger holds the fact, and the demand line prints both figures. (b) The RED takes an injected `is_target` predicate and reaches the stand-in through the first pass (`view_src` in a CPU buffer, stand-in at index 0), never `set_tensor_backend`. | §4.4 staging plan, §7 C4 tests |
@@ -4575,3 +4683,4 @@ r7 rulings, the §M69 (b) second amendment, §M73 and §M74, folded in rev
 | §M69 (b) second amendment | Folded: the six sites propagate `GGML_STATUS_FAILED` through an out-parameter, and `graph_compute` returns it before the recording fallback, which would re-dispatch nodes (`gs:107206-107229`); llama's existing path logs `lc:3968-3970` and returns -3 (`lc:3290-3294`). No assert or abort; the test and the gate check it. | §4.4 staging plan, criteria, §7 C4 tests and source gate |
 | §M74 | Folded: every line C4 adds and a vehicle arm scores is always compiled in ggml-sycl; each is a dedicated line §M74 (f) accepts; the `[ATTN-HOST]` dispatch lines are also switch-gated, and 3b/5b set the switch. | §4.4 staging plan |
 | lead check: the default arms' witness | Folded: `staging not planned` is required exactly once on each default arm, absent is VOID, and every scored `[ATTN-HOST]` absence is scored only beside it. | §4.4 criteria |
+| §M75 a losing candidate's SCRATCH growth | Folded in rev 3k. The growth is charged to the candidate through `ggml_backend_sycl_host_scratch_trial` (`OPEN`, `KEEP`, `RETURN`), kept only on a win (`sched_reserve` and the host-fallback check), and returned on a loss. The release runs in the begin entry, after the next scheduler creation frees the loser's buffers, and before the next notify. The zone could not shrink: C4 adds `pinned_chunk_pool::release_zone_chunk` with a tombstone so no chunk index moves, releasing through the chunk's `mem_handle`, and refusing by name over a live allocation. RED `test-sycl-scratch-trial-return` on a non-MoE ladder, with the keep-the-high-water mutant and its predicted message; Mistral's step 4 carries the lead-arm criterion. | §4.4 staging plan, §7 C4 tests, source gate, step 4 |
