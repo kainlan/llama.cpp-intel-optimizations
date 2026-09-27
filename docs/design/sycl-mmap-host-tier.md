@@ -279,7 +279,7 @@ props->caps = {
 - **An unpinned selector** that includes the iGPU makes the iGPU a model device
   and both fallbacks fire exactly as today. That is the intended behaviour, and
   it is never run on this host (CLAUDE.md, llama.cpp-403s).
-- **th32 drops its own flip** (lead ruling §T10, point 1). th32's T6 still
+- **th32 drops its own flip** (lead ruling §T13, point 1). th32's T6 still
   resolves its lazy mode before the `auto` fallback; commit 1 does not depend
   on that.
 
@@ -481,16 +481,31 @@ the baseline hit becomes a fit instead of a refusal (§4.7), so no gate is
 needed to protect the first Qwen run, but the gate remains the protection for
 `-lm none` and for models whose charged bytes still overflow.
 
-### 4.6 Prefetch, and the lazy ranges (lead ruling §T10a)
+### 4.6 Prefetch, and the lazy ranges (lead rulings §T13a, §T13c)
 
+- **5efe owns the exclusion, because it owns the mapping.** th32 stays off
+  mmap entirely and does not register the table's range anywhere in the
+  loader (§T13c), so nothing upstream excludes it for the tier. The loader
+  passes every `TENSOR_READ_LAZY` range of the file to the tier through the
+  hook's `lazy_ranges` argument (§4.3), taken from `lazy_read`'s own set,
+  which `lazy.add` fills (`lml:1776`).
 - **The tier maps only non-lazy tensor ranges.** `[first, last)` of a
   `SYCL_Mapped` buffer is computed over that buffer's tensors, and lazy
   tensors are never in it (they have their own CPU or th32 buffer). Where a
   lazy range still falls inside `[first, last)` (tensors from different
-  buffers interleave in a file), the tier maps the complement segments
-  (`ranges_complement`, the helper `src/llama-mmap.cpp` already uses) as
+  buffers interleave in a file), the tier maps the complement segments as
   separate mappings under one owner, so a lazy byte is never mapped by the
-  tier at all.
+  tier at all. The complement is the same computation as
+  `ranges_complement` (`src/llama-mmap.cpp:444`), but that helper is a
+  file-static in libllama and ggml-sycl cannot call it. So the tier has its
+  own pure function, `file_mapping_segments`, which also rounds each segment
+  *inward* at a lazy boundary, so no mapped page straddles a lazy byte. C3
+  tests it.
+- **Kernel readahead is the one residual path.** A fault near a segment edge
+  can read ahead past the edge, because readahead is per file, not per
+  mapping. The tier sets `MADV_RANDOM` on the last `read_ahead_kb` of each
+  segment that borders a lazy range, which disables readahead there. The
+  residency gate below measures what is left.
 - **`WILLNEED`** is issued only over host-executed ranges (the `FILE_MAPPED`
   entries of §4.4), right after mapping, never over lazy ranges and never
   over device-only ranges (the staging copy reads those once).
@@ -504,19 +519,24 @@ needed to protect the first Qwen run, but the gate remains the protection for
 - **Until th32 lands**, lazy tables keep today's path (§2.5): the loader's
   lazy mapping, `MADV_RANDOM`, no prefetch, no lock. The tier changes none of
   it, and the loader's mapping gets prefetch 0 on SYCL (§4.2), which can only
-  reduce what is prefetched.
+  reduce what is prefetched. That loader mapping is upstream's, not the
+  tier's. The tier never double-maps a lazy range, because it maps no lazy
+  byte at all.
 - **Gate** (commit 3, and §7's lead gate): after a load, no page of a lazy
   range is resident. Host-only form: a fixture file on a non-tmpfs directory,
   evicted with `POSIX_FADV_DONTNEED`, mapped through the tier with a lazy hole,
   then `mincore` over the hole must report 0 resident pages while the
   host-executed range reports resident after `WILLNEED` (the positive
   control). The test returns 77 if the directory is tmpfs, whose pages are
-  always resident.
+  always resident. A second case faults the byte just before the hole and
+  expects the hole to stay non-resident; that is the readahead case. On Qwen
+  the lead gate is simpler, because shard 3 holds only the table (§2.5):
+  `fincore` on shard 3 after the load must still read about 0.
 
 ### 4.7 th32 interface, and the figures that move
 
 - **Separate tiers, separate readers.** STORAGE reads through th32's own
-  `O_DIRECT` fd and never maps (lead ruling §T10a); `HOST_CPU` is anonymous.
+  `O_DIRECT` fd and never maps (lead rulings §T13a, §T13c); `HOST_CPU` is anonymous.
   `FILE_MAPPED` never holds a lazy table. th32 §5.1's argument that "a HOST
   residency backed by mmap is not HOST at all" is consistent with this
   design: `FILE_MAPPED` is not charged as resident, and the plan says so.
@@ -711,7 +731,7 @@ with a 25 GB `MemAvailable` watchdog, and runs once.
   ranges, page size)` → map segments and `WILLNEED` segments, including an
   interleaved lazy range and page-boundary rounding that must never reach
   into a lazy page. Then the `mincore` fixture of §4.6, with its positive
-  control; 77 on tmpfs.
+  control and its readahead case; 77 on tmpfs.
 - Lead: none.
 
 **C4. `SYCL_Mapped` and the loader** (§4.3, §4.4, §5.3). This is the commit
