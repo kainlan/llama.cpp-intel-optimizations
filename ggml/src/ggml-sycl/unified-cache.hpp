@@ -1305,7 +1305,7 @@ struct placement_plan {
 
     // VRAM the plan's dense extra copies take on `dev_id` (-1: every device).
     // Not part of weight_vram_bytes or vram_bytes: an extra copy is optional
-    // and yields to runtime KV (unified_cache::yield_optional_layouts()), so it
+    // and yields to runtime KV (unified_cache::yield_optional_layouts_begin()), so it
     // is accounted for on its own rather than as weight the plan must keep.
     size_t optional_layout_vram_bytes(int dev_id) const {
         size_t bytes = 0;
@@ -2253,7 +2253,7 @@ enum class expert_retire_status : uint8_t {
     DEFERRED  = 3,
 };
 
-// What yield_optional_layouts() did. `retired` copies are hidden from routing
+// What yield_optional_layouts_finish() did. `retired` copies are hidden from routing
 // at once. `freed`/`freed_bytes` are the ones whose storage is back in its zone
 // when the call returns; the rest (`retired - freed`, `pending_bytes`) are
 // still held by a lease or an unfinished free and return later.
@@ -2479,7 +2479,7 @@ enum class weight_reclaim_mode {
     // ggml_backend_sycl_model_unloaded(): one model died.  Drop its ownership
     // bit and reclaim -- unpinning first -- every entry no live model owns.
     MODEL_TEARDOWN,
-    // unified_cache::yield_optional_layouts(): runtime KV wants the VRAM an
+    // unified_cache::yield_optional_layouts_begin(): runtime KV wants the VRAM an
     // optional layout copy holds.  Only a copy marked optional_layout is
     // reclaimable, and it is even while a live model or buffer owns its
     // tensor: that tensor's primary layout stays resident and its dispatch
@@ -2581,7 +2581,7 @@ struct unified_cache_entry {
     // oneDNN WOQ copy): it serves no op the primary cannot, so a live model's
     // ownership does not keep it resident against runtime KV
     // (weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD). Only
-    // yield_optional_layouts() acts on it, and only while no one but the
+    // yield_optional_layouts_begin() acts on it, and only while no one but the
     // cache's own direct-stage mirror holds a lease. Never set on a primary.
     bool                  optional_layout       = false;
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
@@ -2800,7 +2800,7 @@ class unified_cache {
     // A leased handle on a dense weight's staged copy in exactly `layout`, for
     // a reader that holds it until its queued work completes
     // (retain_handles_until_event) -- so a copy that can be released at
-    // runtime (an optional layout, yield_optional_layouts()) is never freed
+    // runtime (an optional layout, yield_optional_layouts_begin()) is never freed
     // under a read. Resolves the same entry get_view() does; empty on a miss
     // or while the copy's fill is still in flight.
     mem_handle acquire_layout_handle(const ggml_sycl_cache_id & key, ggml_layout_mode layout, int device);
@@ -3021,12 +3021,9 @@ class unified_cache {
     // copy being read is never yieldable; the wait is defence in depth.
     // Primaries are never touched. kv_layers_allocatable() is how many of
     // `layer_bytes` the zone can place now. Cold, context-admission-time
-    // calls: not for a dispatch path. yield_optional_layouts() is snapshot,
-    // plan_optional_layout_yield(), begin and finish in one, for a caller
-    // holding no L1 lock.
+    // calls: not for a dispatch path.
     bool                         mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout);
     optional_layout_snapshot     optional_layouts_snapshot();
-    optional_layout_yield_result yield_optional_layouts(const std::vector<size_t> & layer_bytes);
     optional_layout_release      yield_optional_layouts_begin(const std::vector<optional_layout_pick_group> & groups);
     optional_layout_yield_result yield_optional_layouts_finish(optional_layout_release &   release,
                                                                const std::vector<size_t> & layer_bytes);

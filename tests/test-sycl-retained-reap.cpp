@@ -10,8 +10,8 @@
 // opens; the drain worker is paused at its test points to put a record in its
 // hands, and a reap on another thread is known to be waiting on it when
 // retained_reap_test_yielding() says so -- no case orders threads by sleeping.
-// Every owner release checks that its thread does not hold the retained-store
-// mutex. Nothing here touches a GPU (the registration pins the selector to
+// Every owner release, and every log line, checks that its thread does not
+// hold the retained-store mutex. Nothing here touches a GPU (the registration pins the selector to
 // the OpenCL CPU device).
 //
 // Usage:
@@ -19,6 +19,7 @@
 //   ./build/bin/test-sycl-retained-reap strict-child             # STRICT backstop child
 //   ./build/bin/test-sycl-retained-reap strict-ownerless-child   # STRICT ownerless child
 
+#include "ggml.h"
 #include "mem-handle.hpp"
 #include "unified-cache.hpp"
 
@@ -59,6 +60,19 @@ int g_failures = 0;
 std::atomic<uint64_t> g_next_id{ 1000 };
 std::atomic<int>      g_released{ 0 };
 std::atomic<int>      g_released_under_store_mutex{ 0 };
+
+std::atomic<int> g_logged_under_store_mutex{ 0 };
+
+// The log callback runs on the logging thread, so a line logged inside the
+// retained-store critical section calls out to arbitrary code under the last
+// lock in the §12.5 order. The text still reaches stderr, where the STRICT
+// children's parents look for it.
+void count_log(ggml_log_level, const char * text, void *) {
+    if (retained_store_mutex_held()) {
+        g_logged_under_store_mutex.fetch_add(1);
+    }
+    std::fputs(text, stderr);
+}
 
 release_attempt count_release(const alloc_metadata &, void *) noexcept {
     g_released.fetch_add(1);
@@ -655,6 +669,7 @@ int main(int argc, char ** argv) {
     if (argc > 1 && std::strcmp(argv[1], "strict-ownerless-child") == 0) {
         return strict_ownerless_child();
     }
+    ggml_log_set(count_log, nullptr);
     test_queued_query(q);
     test_shared_and_non_owner();
     test_in_hand_yield();
@@ -676,6 +691,9 @@ int main(int argc, char ** argv) {
     // Every owner released above, by the worker, a reap or the test, was
     // released with the retained-store mutex not held by its thread.
     CHECK_EQ(g_released_under_store_mutex.load(), 0, "no owner is released under the retained-store mutex");
+    // Nor is anything logged under it: the failed-wait parks above
+    // (test_query_throw_is_incomplete, test_wait_failure_parks) each log.
+    CHECK_EQ(g_logged_under_store_mutex.load(), 0, "nothing is logged under the retained-store mutex");
     if (g_failures != 0) {
         std::fprintf(stderr, "test-sycl-retained-reap: %d failure(s)\n", g_failures);
         return 1;

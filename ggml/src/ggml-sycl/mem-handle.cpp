@@ -259,20 +259,28 @@ void retained_handle_drain_loop() {
             // freed early. What the exception says is not read: the record
             // was retained as event-bound, and a failed wait parks it
             // whatever the reason.
-            auto &              state = *g_retained_handles_state;
-            retained_store_lock lock(state);
-            state.graph_unwaitable.insert(state.graph_unwaitable.end(), std::make_move_iterator(record.handles.begin()),
-                                          std::make_move_iterator(record.handles.end()));
-            state.graph_unwaitable_ids.insert(state.graph_unwaitable_ids.end(), record.ids.begin(), record.ids.end());
-            record.handles.clear();
-            // Parked and no longer in hand, in one critical section: a
-            // reaper that sees in_hand_valid clear finds them here.
-            state.in_hand_valid = false;
-            std::swap(done_event, state.in_hand_event);
+            size_t parked = 0;
+            {
+                auto &              state = *g_retained_handles_state;
+                retained_store_lock lock(state);
+                state.graph_unwaitable.insert(state.graph_unwaitable.end(),
+                                              std::make_move_iterator(record.handles.begin()),
+                                              std::make_move_iterator(record.handles.end()));
+                state.graph_unwaitable_ids.insert(state.graph_unwaitable_ids.end(), record.ids.begin(),
+                                                  record.ids.end());
+                record.handles.clear();
+                // Parked and no longer in hand, in one critical section: a
+                // reaper that sees in_hand_valid clear finds them here.
+                state.in_hand_valid = false;
+                std::swap(done_event, state.in_hand_event);
+                parked = state.graph_unwaitable.size();
+            }
+            // Logged after unlock: the log callback is arbitrary code, and the
+            // store mutex is the last lock in the §12.5 order.
             GGML_LOG_WARN(
                 "[MEM-HANDLE] event-bound lease wait failed (%s); its %zu leases are kept for graph lifetime "
                 "(%zu parked) rather than freed early\n",
-                failure, record.ids.size(), state.graph_unwaitable.size());
+                failure, record.ids.size(), parked);
         }
         record.handles.clear();
 #if defined(GGML_SYCL_PRIVATE_TESTING)

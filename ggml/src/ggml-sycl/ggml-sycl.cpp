@@ -17791,7 +17791,7 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
 enum class ggml_sycl_txn_result { ACCEPTED, REFUSED, BUSY };
 
 // Bumped whenever KV admission retires optional layout copies
-// (unified_cache::yield_optional_layouts()). A recorded exec graph bakes the raw
+// (unified_cache::yield_optional_layouts_begin()). A recorded exec graph bakes the raw
 // pointers it resolved; for a WOQ copy it also holds the copy's lease for the
 // graph's life (the WOQ gemm's retain_handles_until_event() lands in the
 // graph's sink while recording), so a copy a live graph reads is never
@@ -35823,7 +35823,7 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     //
     // extra->layout is the last layout resolved for the tensor, not a lease: a
     // ONEDNN_WOQ copy there may since have yielded to runtime KV
-    // (unified_cache::yield_optional_layouts) and its bytes be KV now, so WOQ
+    // (unified_cache::yield_optional_layouts_begin) and its bytes be KV now, so WOQ
     // residency is always asked of the cache below.
     if (src_is_device && !request_prefer_host) {
         if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
@@ -35972,7 +35972,7 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
 // The cache's copy of `tensor` in exactly `layout`, as a leased handle rather
 // than a pointer: the reader keeps it until its queued work completes
 // (retain_handles_until_event), so a copy that can be released at runtime (an
-// optional ONEDNN_WOQ copy, unified_cache::yield_optional_layouts()) is never
+// optional ONEDNN_WOQ copy, unified_cache::yield_optional_layouts_begin()) is never
 // freed under the read. Records the layout on extra->layout as
 // ggml_sycl_get_weight_layout_ptr() does. Empty on a miss.
 static ggml_sycl::mem_handle ggml_sycl_acquire_weight_layout(const ggml_tensor * tensor,
@@ -62082,7 +62082,7 @@ static bool ggml_sycl_layout_override_active(layout_mode & override_layout) {
 
 // Whether the unified cache holds `tensor` in `layout` on `device` right now.
 // For a layout that can be released at runtime (an optional ONEDNN_WOQ copy,
-// unified_cache::yield_optional_layouts) this, not extra->layout, is the fact.
+// unified_cache::yield_optional_layouts_begin) this, not extra->layout, is the fact.
 static bool ggml_sycl_weight_layout_cached(const ggml_tensor * tensor, int device, layout_mode layout) {
     sycl::queue &              q     = ggml_sycl_get_device(device).default_queue();
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(q);

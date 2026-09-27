@@ -1,4 +1,4 @@
-// Gate for unified_cache::yield_optional_layouts() on a real device cache.
+// Gate for the unified cache's optional layout yield on a real device cache.
 //
 // A dense weight's optional layout copy (S1-PRELOAD's oneDNN WOQ second copy,
 // unified_cache_entry::optional_layout) yields to runtime KV: the runtime-
@@ -125,6 +125,17 @@ bool stage(unified_cache *         cache,
     return layout != GGML_LAYOUT_ONEDNN_WOQ || cache->mark_optional_layout(out->key, GGML_LAYOUT_ONEDNN_WOQ);
 }
 
+// The yield as the runtime-context transaction runs it for one device: the
+// fit's picks on a snapshot of the zone (plan_runtime_kv_residency() calls
+// plan_optional_layout_yield() on the same snapshot), then begin and finish.
+ggml_sycl::optional_layout_yield_result yield_optional_layouts(unified_cache *             cache,
+                                                               const std::vector<size_t> & layers) {
+    const ggml_sycl::optional_layout_snapshot snapshot = cache->optional_layouts_snapshot();
+    const ggml_sycl::kv_optional_layout_yield picks    = ggml_sycl::plan_optional_layout_yield(snapshot.fit, layers);
+    ggml_sycl::optional_layout_release release = cache->yield_optional_layouts_begin(snapshot.pick_groups(picks));
+    return cache->yield_optional_layouts_finish(release, layers);
+}
+
 // One more KV layer of `layer_bytes` than the zone can place now, and how many
 // it can: the request no copy's release can help unless its room is usable.
 std::vector<size_t> one_more_layer(unified_cache * cache, size_t layer_bytes, size_t * placeable) {
@@ -148,7 +159,7 @@ void test_yield_returns_bytes_to_zone(unified_cache * cache, sycl::queue * queue
     const auto   layers    = one_more_layer(cache, COPY_BYTES, &placeable);
     const size_t staged    = cache->zone_available(vram_zone_id::WEIGHT);
 
-    const auto   result = cache->yield_optional_layouts(layers);
+    const auto   result = yield_optional_layouts(cache, layers);
     const size_t after  = cache->zone_available(vram_zone_id::WEIGHT);
     printf(
         "  placeable before=%zu; yield: retired=%zu freed=%zu freed_bytes=%zu pending_bytes=%zu kv_layers=%zu; "
@@ -173,13 +184,13 @@ void test_leased_copy_is_not_yielded(unified_cache * cache, sycl::queue * queue)
     size_t     placeable = 0;
     const auto layers    = one_more_layer(cache, COPY_BYTES, &placeable);
 
-    const auto held = cache->yield_optional_layouts(layers);
+    const auto held = yield_optional_layouts(cache, layers);
     check(held.retired == 0 && held.freed_bytes == 0, "a yield passes over the leased copy");
     check(held.kv_layers == placeable, "and says the extra layer still does not land");
     check(cache->is_cached(copy.key, GGML_LAYOUT_ONEDNN_WOQ), "the leased copy still resolves");
 
     lease               = {};
-    const auto released = cache->yield_optional_layouts(layers);
+    const auto released = yield_optional_layouts(cache, layers);
     check(released.freed == 1 && released.freed_bytes == COPY_BYTES, "once the lease drops, a yield frees it");
     check(released.kv_layers == layers.size(), "and the extra layer lands");
 }
@@ -213,14 +224,14 @@ void test_copy_being_read_is_not_yielded(unified_cache * cache, sycl::queue * qu
 
     size_t     placeable = 0;
     const auto layers    = one_more_layer(cache, COPY_BYTES, &placeable);
-    const auto held      = cache->yield_optional_layouts(layers);
+    const auto held      = yield_optional_layouts(cache, layers);
     check(held.retired == 0 && held.freed_bytes == 0, "a yield passes over the copy being read");
     check(cache->is_cached(copy.key, GGML_LAYOUT_ONEDNN_WOQ), "the copy still resolves");
 
     done.store(true);
     read.wait();
     check(ggml_sycl::drain_retained_handles(true), "the read's lease is released once it completes");
-    const auto released = cache->yield_optional_layouts(layers);
+    const auto released = yield_optional_layouts(cache, layers);
     check(released.freed == 1 && released.freed_bytes == COPY_BYTES, "then a yield frees it");
     check(released.kv_layers == layers.size(), "and the extra layer lands");
 }
@@ -246,7 +257,7 @@ void test_owned_copy_is_yielded(unified_cache * cache, sycl::queue * queue) {
 
     size_t     placeable = 0;
     const auto layers    = one_more_layer(cache, COPY_BYTES, &placeable);
-    const auto result    = cache->yield_optional_layouts(layers);
+    const auto result    = yield_optional_layouts(cache, layers);
     printf("  placeable before=%zu; yield: retired=%zu freed=%zu freed_bytes=%zu pending_bytes=%zu kv_layers=%zu\n",
            placeable, result.retired, result.freed, result.freed_bytes, result.pending_bytes, result.kv_layers);
     check(result.freed == 1 && result.freed_bytes == COPY_BYTES, "a yield frees it");
@@ -289,7 +300,7 @@ void test_holes_between_primaries_are_not_yielded(unified_cache *       cache,
     check(optional >= 3 * COPY_BYTES && optional >= layers.back(),
           "by bytes, releasing the copies makes room for the extra layer");
 
-    const auto result = cache->yield_optional_layouts(layers);
+    const auto result = yield_optional_layouts(cache, layers);
     printf("  placeable before=%zu optional=%zu; yield: retired=%zu kv_layers=%zu\n", placeable, optional,
            result.retired, result.kv_layers);
     check(result.retired == 0, "no copy is released: none of their holes holds the layer");
@@ -321,7 +332,7 @@ void test_adjacent_copies_are_yielded_together(unified_cache *       cache,
 
     size_t     placeable = 0;
     const auto layers    = one_more_layer(cache, 2 * COPY_BYTES, &placeable);
-    const auto result    = cache->yield_optional_layouts(layers);
+    const auto result    = yield_optional_layouts(cache, layers);
     printf("  placeable before=%zu; yield: retired=%zu freed_bytes=%zu kv_layers=%zu\n", placeable, result.retired,
            result.freed_bytes, result.kv_layers);
     check(result.retired == 2 && result.freed_bytes == 2 * COPY_BYTES, "both adjacent copies are released");
@@ -383,7 +394,7 @@ void test_queued_fill_reference_is_reaped(unified_cache * cache, sycl::queue * q
     size_t       placeable = 0;
     const auto   layers    = one_more_layer(cache, COPY_BYTES, &placeable);
     const size_t staged    = cache->zone_available(vram_zone_id::WEIGHT);
-    const auto   result    = cache->yield_optional_layouts(layers);
+    const auto   result    = yield_optional_layouts(cache, layers);
     const size_t after     = cache->zone_available(vram_zone_id::WEIGHT);
     printf(
         "  yield: retired=%zu freed=%zu freed_bytes=%zu pending_bytes=%zu kv_layers=%zu; zone_available %zu -> %zu\n",
@@ -420,7 +431,7 @@ void test_unplanned_reference_is_reported(unified_cache * cache, sycl::queue * q
         g_log.clear();
     }
     ggml_log_set(capture_log, nullptr);
-    const auto result = cache->yield_optional_layouts(layers);
+    const auto result = yield_optional_layouts(cache, layers);
     ggml_log_set(nullptr, nullptr);
     const size_t after = cache->zone_available(vram_zone_id::WEIGHT);
     printf("  yield: retired=%zu freed=%zu pending_bytes=%zu kv_layers=%zu; zone_available %zu -> %zu\n",

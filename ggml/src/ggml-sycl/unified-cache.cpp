@@ -7814,13 +7814,6 @@ size_t unified_cache::kv_layers_allocatable(const std::vector<size_t> & layer_by
     return ggml_sycl::kv_layers_allocatable(kv_zone_snapshot({}, nullptr), layer_bytes);
 }
 
-optional_layout_yield_result unified_cache::yield_optional_layouts(const std::vector<size_t> & layer_bytes) {
-    const optional_layout_snapshot snapshot = optional_layouts_snapshot();
-    const kv_optional_layout_yield picks    = plan_optional_layout_yield(snapshot.fit, layer_bytes);
-    optional_layout_release        release  = yield_optional_layouts_begin(snapshot.pick_groups(picks));
-    return yield_optional_layouts_finish(release, layer_bytes);
-}
-
 optional_layout_release unified_cache::yield_optional_layouts_begin(
     const std::vector<optional_layout_pick_group> & groups) {
     optional_layout_release release;
@@ -12668,7 +12661,7 @@ size_t unified_cache::finalize_retired_entries_locked() {
         }
 
         release_entry_allocation_locked(entry);
-        // An optional layout copy is released only by yield_optional_layouts(),
+        // An optional layout copy is released only by yield_optional_layouts_begin(),
         // from a context's KV admission, and that transaction also bumps the
         // optional-layout epoch (ggml-sycl.cpp): every coexisting context
         // drops the exec graphs it recorded, which may bake the copy's
@@ -13352,10 +13345,10 @@ void unified_cache::reset_model_weight_entries(weight_reclaim_mode mode) {
 
 size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t slot) {
     // This loop neither withdraws the direct-stage mirror lease nor gates a
-    // free on the copy's readers; yield_optional_layouts() does both and is
+    // free on the copy's readers; yield_optional_layouts_begin() does both and is
     // that mode's only reclaim path.
     if (mode == weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD) {
-        GGML_ABORT("weight reclaim mode %s reclaims only through yield_optional_layouts()",
+        GGML_ABORT("weight reclaim mode %s reclaims only through yield_optional_layouts_begin()",
                    weight_reclaim_mode_name(mode));
     }
     // perf-recovery track B (llama.cpp-1tjn): a MID_LOAD_REPLAN resets this
