@@ -1,6 +1,6 @@
 # SYCL STORAGE tier for lazy row tables (PLE / n-gram / engram embeddings)
 
-*Status: DESIGN rev 2e, not implemented. Tracker: `llama.cpp-th32`.
+*Status: DESIGN rev 2f, not implemented. Tracker: `llama.cpp-th32`.
 Implementation tickets are filed after review (proposed split in §11). Written
 2026-09-26 against fork `76c7f6548` and upstream `ggml-org/master` `694ec2354`;
 the host-fit terms are re-read at fork `c69d5774d`, whose `unified-cache.cpp`
@@ -16,7 +16,10 @@ cold-expert order source. Rev 2d folds review `design-th32-r3` (3 Important,
 14 Minor) under the lead's §T6, and §D7 I-B's consumer-copy criterion. Rev 2e
 folds review `design-th32-r4` (7 Important, 13 Minor) under the lead's §T8,
 which makes D6-M(b) the one refill mechanism for every model and depth, with
-the relays of §T7, §D9 and §D10.*
+the relays of §T7, §D9 and §D10. Rev 2f folds review `design-th32-r5` (7
+Important, 15 Minor) under the lead's §T10, with §T9 and §T9a, which settle
+the epoch ring's bound (DQ-E): its depth derives from the context's in-flight
+ubatch depth, and exhaustion is a plan bug.*
 
 Citations: fork code as `76c7f6548 <file>:<line>`, upstream code as
 `694ec2354 <file>:<line>` (read with `git show ggml-org/master:<file>`; the fork
@@ -37,7 +40,7 @@ Appendix A and the probe sources are described in Appendix B.
 (`lead-rulings-2026-09-26.md`, or relayed by the lead as an owner answer), and
 the owner's decisions are cited as **owner §D1**, **owner §D2** and **owner
 §D4** after their sections there. A decision the lead made is marked *lead
-ruling* with its section (§T1-§T8, §D5-§D10). Everything else in this
+ruling* with its section (§T1-§T10, §D5-§D10). Everything else in this
 document is this design's **proposal**. This document's own decisions are
 numbered D1-D9 in §13; the one that was also called D4 (`--lazy-mode`) is
 **DLM** from rev 2b on, so that "§D4" always means the owner's decision, and
@@ -92,8 +95,9 @@ environment variable:
   **hot-row cache** (CLOCK), a **yieldable** tenant sized from the host budget
   left above the P3 floor (fixed at 2 GiB per table in a cold-set plan), plus a small per-context **staging** area. Missing rows are read with
   `O_DIRECT` preads that are issued as soon as the row indices exist (after
-  `set_input`), in priority order: the current ubatch before lookahead, the
-  earlier consumer layer first, contexts served fairly. STORAGE is a residency
+  `set_input`), in priority order: prefetched ubatches before lookahead, the
+  older epoch first and within it the earlier consumer layer, contexts served
+  fairly. STORAGE is a residency
   state, not an allocation tier: no byte is ever allocated "in" it (§3.1).
 
 In both residencies **the CPU executes the gather**, and the table never
@@ -114,9 +118,12 @@ gather sits in the graph is the **provider's** decision, not the model's
   F32 activation into the device compute buffer just before the consumer, with
   an event edge on that event. **No SYCL kernel reads `SYCL_Host` memory**
   on this path, and a RED fails if one does (§7.3).
-- There is no scheduler split and no host wait on the GPU path, which removes
-  `llama.cpp-x1xd` and `llama.cpp-jhxq` from this path (§5.3). Under
-  command-graph replay the gather is a **stated segment boundary** (§7.4).
+- There is no scheduler split, and this design adds no host wait: it removes
+  `llama.cpp-x1xd` and `llama.cpp-jhxq`'s split-input copy from this path
+  (§5.3). The ring's depth derives from the context's in-flight ubatch depth,
+  which the existing input drain sets, and exhausting it is a plan bug
+  (*lead rulings §T9a, §T10*). Under command-graph replay the gather is a
+  **stated segment boundary**, dense graphs included (§7.4).
 
 Rev 2a put the HOST gather in the leading CPU split, as a CPU op next to
 `inp_embd` (*lead ruling §T1*, C2), and let the first SYCL op read its output
@@ -710,13 +717,20 @@ lazy_table
 | HOST body | model | `HOST_CPU` / `WEIGHT` | `table_bytes` (Qwen 50.66 GiB) |
 | row cache slab | model | `HOST_CPU` / new `alloc_role::LAZY_ROW_CACHE` | `slots x row_size`, in chunks of 256 MiB so that it can yield (§6.4) |
 | row cache index | model | `HOST_CPU` / `LAZY_ROW_CACHE` | `slots x 13.3 B` (§6.3): 7.8% of the slab on 170 B rows, 12.1% on 110 B, 15.9% on 84 B |
-| landing slab | context, per table | `HOST_CPU` / new `alloc_role::LAZY_STAGING` | `depth x n_ubatch x rows_per_token x row_size`: Qwen 2 x 512 x 16 x 170 B = 2.66 MiB; DeepSeek Q2_K 2 x 512 x 24 x 84 B = **1.97 MiB per table** |
-| epoch ring: ids captures | context, per table, both residencies | `HOST_CPU` / `LAZY_STAGING` | `D x n_ubatch x rows_per_token x 4 B`, with `D = 2 x ceil(n_batch / n_ubatch) + 2` (§5.3): at `n_batch` 2048, `D` = 10, so Qwen 10 x 32 KiB = **320 KiB**; DeepSeek 10 x 48 KiB = **480 KiB per table** |
-| block ring | the IO pool (process), shared by every context and table | `HOST_CPU` / `LAZY_STAGING` | `QD x 2 x io_block` = 64 x 8 KiB = **512 KiB**, once (4 KiB-aligned, for `O_DIRECT`); each in-flight read holds a reference on its slot (§5.3) |
-| output slot | context, per table, both residencies | `HOST_PINNED` / new `alloc_role::LAZY_OUTPUT` | `depth x n_ubatch x rows_per_token x ne[0] x 4 B`: Qwen 2 x 512 x 16 x 160 x 4 B = **10 MiB**; DeepSeek 2 x 512 x 24 x 256 x 4 B = **24 MiB per table** |
-| epoch ring: marker words | context, per table, both residencies | `HOST_PINNED` / `LAZY_OUTPUT`, its own allocation | `D` words of 4 B, one per ring entry (§7.2): the only host bytes a device kernel writes on this path |
-| epoch ring: interop events | context, per table | driver objects, not cache bytes (P1) | `D` host-signalled Level Zero events from a host-visible pool, created at context init, wrapped with `ownership::keep`, destroyed by the `lazy_gather_ctx` destructor, which runs at the last reference (§5.3) |
+| landing slab | context (class C), per table | `HOST_CPU` / new `alloc_role::LAZY_STAGING` | `depth x n_ubatch x rows_per_token x row_size`: Qwen 2 x 512 x 16 x 170 B = 2.66 MiB; DeepSeek Q2_K 2 x 512 x 24 x 84 B = **1.97 MiB per table** |
+| epoch ring: ids captures | context (class C), per table, both residencies | `HOST_CPU` / `LAZY_STAGING` | `D x n_ubatch x rows_per_token x 4 B`, with `D = in_flight_depth + 2` (§5.3; *lead ruling §T9a*): today `in_flight_depth` is 1, so `D` = 3, and Qwen 3 x 32 KiB = **96 KiB**; DeepSeek 3 x 48 KiB = **144 KiB per table** |
+| block ring | the IO pool (process), shared by every context and table | `HOST_CPU` / `LAZY_STAGING` | `QD x span_max`, where `span_max` is the largest row read of any lazy table (§5.2): 64 x 8 KiB = **512 KiB** for rows of at most 4 KiB, 64 x 16 KiB = 1 MiB if gemma4 E4B's 11424 B PLE rows are STORAGE; once, 4 KiB-aligned for `O_DIRECT`; each in-flight read holds a reference on its slot (§5.3) |
+| output slot | context (class C), per table, both residencies | `HOST_PINNED` / new `alloc_role::LAZY_OUTPUT` | `depth x n_ubatch x rows_per_token x ne[0] x 4 B`: Qwen 2 x 512 x 16 x 160 x 4 B = **10 MiB**; DeepSeek 2 x 512 x 24 x 256 x 4 B = **24 MiB per table** |
+| epoch ring: marker words | context (class C), per table, both residencies | `HOST_PINNED` / `LAZY_OUTPUT`, its own allocation | `D` words of 4 B, one per ring entry (§7.2): the only host bytes a device kernel writes on this path |
+| epoch ring: interop events | context (class C), per table | driver objects, not cache bytes (P1) | `D` host-signalled Level Zero events and their host-visible pool, created at context init, owned by a refcounted `lazy_event_pool` that every enqueued copy's wait also holds, and destroyed at its last reference, which the marker watcher drops after that copy's marker (§5.3, *§T10* I-7). The SYCL wrapper (`make_event`, `ownership::keep`) is made per copy, never kept (§7.2). The `zeEventPoolCreate`/`zeEventCreate` site is a new native Level Zero object site in the backend, so T1 gives it an allowlist line in the canonical contract, next to the `HOST_CPU` wrapper (r5 m-15) |
 
+- **Class C, charged at the context transaction** (*lead rulings §T9, §T10*
+  I-1, r5 m-13). Every row whose scope is "context" scales with that
+  context's own `n_ubatch` and its in-flight depth, so it is class C: sized at
+  the context's transaction from the context's own values, never from the
+  plan's `n_ubatch`, and never carried in a model-scope plan field (§4.1).
+  The context records its `in_flight_depth`, its `D` and the guard input that
+  sets the depth (§5.3) in the same transaction.
 - **STORAGE** uses the cache slab and index, the landing slab, the epoch ring, a
   share of the pool's block ring and the output slot. Those are the **entire**
   resident footprint of a STORAGE table, and the planner charges exactly those
@@ -862,7 +876,8 @@ struct placement_lazy_table {
     size_t         host_resident_bytes; // HOST: table_bytes; STORAGE: cache slab + index
     size_t         cache_slots;     // STORAGE only
     size_t         cache_floor_slots;
-    size_t         staging_bytes_per_context; // §3.3's per-context rows
+    // no per-context bytes here: §3.3's context rows are class C, charged at
+    // the context's own transaction (§3.3; lead ruling §T10, I-1)
 };
 ```
 
@@ -1143,8 +1158,8 @@ and 0.83 GiB for Qwen, both `blk.0.ffn_down_exps`):
 | **non-weight host, one zone set, as committed** | | **15.4** | **5.5** | **31.0** | **9.5** |
 | main-pool chunk rounding | the main pool commits 2 GiB chunks | up to 2 | up to 2 | up to 2 | up to 2 |
 | **step 2, one zone set** (main-pool rounding excluded) | | **114.8-118.2** | **101.3-104.7** | **195.9-199.3** | **167.1-170.5** |
-| `host_reserve` + context envelope | 2 GiB + <= 0.5 GiB (the per-context rows of §3.3: output slots Qwen 10 MiB, DeepSeek 48 MiB; landing slabs Qwen 2.66 MiB when STORAGE, DeepSeek 3.9 MiB; epoch rings Qwen 0.3 MiB, DeepSeek 0.9 MiB; plus the pool's block ring 0.5 MiB once, and the `SYCL_Host` compute buffer) | 2.5 | 2.5 | 2.5 | 2.5 |
-| DSpark draft: its own host bytes only | `9g22` §10.3; its cold-set effect, which also counts the device experts it displaces, is `9g22` §4.5.2's (rev 9), linked, not modelled here | - | - | +7.9 | +7.9 |
+| `host_reserve` + context envelope | 2 GiB + <= 0.5 GiB (the class-C context rows of §3.3, charged at the context transaction: output slots Qwen 10 MiB, DeepSeek 48 MiB; landing slabs Qwen 2.66 MiB when STORAGE, DeepSeek 3.9 MiB; epoch rings at `D` = 3, Qwen 0.1 MiB, DeepSeek 0.3 MiB; plus the pool's block ring 0.5 MiB once, and the `SYCL_Host` compute buffer) | 2.5 | 2.5 | 2.5 | 2.5 |
+| DSpark draft: its host effect on phase 1 | its ≈ 7.9 GiB of weights are **device** demand; with its ring they move ≈ 10.0 GiB of experts to the host (`9g22` rev 9 §4.5.2, its l.1601-1603). What that does to the cold set is `9g22`'s figure, linked, not modelled here | - | - | +10.0 | +10.0 |
 | cold set: credit and landing slab | `-C` from the host experts, plus `2 x` the largest per-layer cold bytes (*lead ruling §D6*, I-4): `2C/40` if the cold set is spread evenly, 9.16 GiB if whole layers are cold | - | - | - | `-C` + slab |
 
 The oneDNN reorder and `moe_q8` figures are `9g22`'s estimates for DeepSeek,
@@ -1181,7 +1196,7 @@ after (s)):
 |---|---:|---:|---|---|---|---|
 | A: phase 1 (B70 alone), no draft, floor caches (cannot occur in a cold-set plan, whose caches are fixed) | 206.4-209.8 | **177.6-181.0** | refused | fits (0.8-4.2 left) | fits (2.7-6.1 left) | fits (9.4-12.8 left) |
 | B: A + the fixed caches (2 GiB per table, index included) | 210.4-213.8 | 181.6-185.0 | refused | low corner only (0.2 left) | low corner only (2.1 left) | fits (5.4-8.8 left) |
-| C: A + the DSpark draft's own host bytes | 214.3-217.7 | 185.5-188.9 | refused | refused | refused | fits (1.5-4.9 left) |
+| C: A + the experts the DSpark draft displaces | 216.4-219.8 | 187.6-191.0 | refused | refused | refused | low corner only (2.8 left) |
 | D: two cards after sgc5 and `9g22` T25, non-weight zones counted once (a lower bound only: after sgc5 each card keeps its own STAGING, SCRATCH and RUNTIME, which is E) | - | 165.6-173.0 | low corner only (5.8 left) | fits (8.8-16.2 left) | fits (10.7-18.1 left) | fits (17.4-24.8 left) |
 | E: D + the non-weight zones a second time | - | 175.1-182.5 | refused | low corner only (6.7 left) | fits (1.2-8.6 left) | fits (7.9-15.3 left) |
 | F: two cards, code as it is today (a whole second zone set, WEIGHT included) | 393.1-407.9 | - | refused (T2) or OOM without T2 | | | |
@@ -1191,8 +1206,10 @@ recovers ≈ 28.9 GiB of what the load needs: the ring three times (twice on the
 host, 15.7, and once as displaced experts, 7.4) and the DMA pool twice (7.3),
 less 1.5 GiB that the RUNTIME pool's 2 GiB chunk rounding gives back (it
 commits 2 GiB for 0.09 after (s), against 12 for 11.58 today). Case C counts
-only the draft's own host bytes; what the draft does to the cold set is
-`9g22`'s figure, linked, not restated (rev 9,
+the draft's host effect as `9g22` states it: the draft's weights are device
+demand, so its host bytes are the ≈ 10.0 GiB of experts it displaces (rev
+2e carried the 7.9 GiB of weights here as host bytes, r5 m-12). What the
+draft does to the cold set is `9g22`'s figure, linked, not restated (rev 9,
 [its §4.5.2](deepseek41-runtime.md#452-the-host-fit-r2-c-a-r3-c-1-c-2-owner-d4)).
 
 <a id="th32-p3"></a>
@@ -1322,7 +1339,11 @@ The rules both engines follow:
 
 - Every miss becomes one 4 KiB-aligned read of the block(s) that contain the
   row: 4 KiB, or 8 KiB for the rows that straddle a block (4.1% of 170 B rows,
-  2.7% of 110 B rows, 1.9-2.2% of 84 B rows).
+  2.7% of 110 B rows, 1.9-2.2% of 84 B rows). In general the read is
+  `ceil((offset mod 4 KiB + row_size) / 4 KiB)` blocks, sized from the
+  table's `row_size`, and the block ring's slot from the largest such span
+  (§3.3): gemma4 E4B's PLE row (10752 x Q8_0 = 11424 B) is 3 or 4 blocks
+  (r5 m-10).
 - `O_DIRECT` alignment comes from `statx(STATX_DIOALIGN)`. If the filesystem
   refuses `O_DIRECT` (for example tmpfs or some FUSE mounts), the fallback is
   buffered `pread` followed by `posix_fadvise(DONTNEED)` on the range. It logs a
@@ -1342,14 +1363,24 @@ waiting prefill reads (11.2 ms with nothing else queued; the remainder is the
 prefill's reads already on the 64 workers). The prefill lost ~100 ms. So the
 engine's queue is:
 
-- **Class 0, the current ubatch**, served before class 1. Every class-0 read
-  carries a **deadline**, the layer whose execution needs it: a lazy table's
-  `consumer_layer`, or, for a cold-expert slice (`llama.cpp-yl3v`), the
-  expert's layer. Within a context, class 0 is served **earliest deadline
-  first**. At an equal layer, lazy-table rows go before expert slices,
-  because the engram consumer runs at the head of its layer and the expert
-  FFN runs at its end. So DeepSeek's `blk.1` rows go before layer 2's cold
-  slices, and `blk.14`'s rows go after the cold slices of layers 2-13.
+- **Class 0, the prefetched ubatches**, served before class 1. Every class-0
+  read carries a key **(epoch, deadline)**. The epoch is the ubatch's epoch
+  (§5.3); for a cold-expert slice (`llama.cpp-yl3v`) it is the ubatch that
+  routed it. The deadline is the layer whose execution needs the read: a lazy
+  table's `consumer_layer`, or the expert's layer. Within a context, class 0
+  is ordered by that key **lexicographically** (*lead ruling §T10*, I-4):
+  every read of epoch `e` before any of epoch `e+1`, and **earliest deadline
+  first** within an epoch. At an equal layer, lazy-table rows go before expert
+  slices, because the engram consumer runs at the head of its layer and the
+  expert FFN runs at its end. So DeepSeek's `blk.1` rows go before layer 2's
+  cold slices, and `blk.14`'s rows go after the cold slices of layers 2-13.
+- **Why the epoch comes first** (r5 I-4 (a)). The submitter may post up to
+  `D` epochs before the device finishes the oldest (§5.3), so "the current
+  ubatch" alone is not defined. Keyed by layer only, epoch `e+1`'s `blk.1`
+  rows would be served ahead of epoch `e`'s `blk.14` rows and its layer 2-13
+  slices while the device is stalled on epoch `e`: no deadlock, since IO
+  never waits on the device, but a priority inversion of up to several cold
+  PP ubatches.
 - **Why earliest deadline, and not "cold reads lowest"** (the rule
   `9g22` rev 8 stated, retired by *§D10* I-3). The device reaches layer 2
   before layer 14, and a layer's cold experts run on the CPU inside that
@@ -1366,7 +1397,7 @@ engine's queue is:
   promotes it to class 0.
 - **Chunks.** A slice is read in chunks of at most 512 KiB, and a row block
   is 4 or 8 KiB. Nothing preempts a chunk a worker has already started, so a
-  newly queued earlier-deadline read waits at most for one worker to finish
+  newly queued read with an earlier key waits at most for one worker to finish
   its current chunk.
 - **In-flight dedup.** An in-flight table keyed by `(file, block offset)`
   records each pending read and its **waiters** (ticket, epoch, landing
@@ -1376,30 +1407,44 @@ engine's queue is:
   row cold at the same moment. Two rows that share a 4 KiB block are one read.
   A join takes references to the read's ring slot (§5.3).
 - **The interface** is `lazy_io_submit(fd, offset, length, destination handle,
-  ticket, class, deadline)`: the same call for a 4 KiB row block and a
+  ticket, class, epoch, deadline)`: the same call for a 4 KiB row block and a
   512 KiB slice chunk, callable from any thread (§9.2).
 
-**The ordering witnesses**, both T5 REDs on a file fixture with the mock or
-the pread engine, CPU-only:
+**The ordering witnesses**, all T5 REDs on a file fixture with the mock or
+the pread engine, CPU-only. The engine records a **dispatch log**: a
+sequence number taken when a worker picks a read up. The order the rule sets
+is the dispatch order, not the completion order, since 64 reads in flight
+complete in whatever order the device returns them (r5 I-4 (b)); so the
+separating REDs are pre-registered on the dispatch log.
 1. **Head-of-line, the backlog shape** (`batch_probe3 hol`, P = 12000). One
    context queues a 12000-read class-0 backlog, more than the 64 workers can
    hold, and a second context then queues a 48-read decode ticket. That
-   ticket must complete within **2 x** its no-backlog latency. Under FIFO it
-   takes 1359 ms against 11.2 ms. A single held read on a 64-worker pool
-   cannot fail this check, so the backlog is the shape (*§D10* I-3).
+   ticket must complete within its no-backlog latency **plus the p99 of one
+   read at QD64**, both measured by the fixture in the same run, because at
+   worst it waits for one worker to finish a read already started (r5 m-5).
+   On this host that is 11.2 + 33.2 ms (the same session's QD64 control p99,
+   A.2) = 44.4 ms, against 21.7 ms measured under this rule and 1359 ms under
+   FIFO. A single held read on a 64-worker pool cannot fail this check, so the
+   backlog is the shape (*§D10* I-3).
 2. **The separating RED** (*lead ruling §T8*, I-6). One context queues cold
-   slice chunks for layers 2-13, more than 64 of them, so that every worker is
-   busy and a backlog waits. Then it queues cold chunks for layer 20 and a
-   `blk.14` engram ticket, in that order. Under this rule the pre-registered
-   result is:
-   - the `blk.14` ticket completes after every queued layer-2-13 chunk;
-   - it completes before any layer-20 chunk that was not already on a
-     worker.
+   slice chunks for layers 2-13 of one epoch, more than 64 of them, so that
+   every worker is busy and a backlog waits. Then it queues cold chunks for
+   layer 20 and a `blk.14` engram ticket, in that order. Under this rule the
+   pre-registered dispatch log shows:
+   - every `blk.14` read dispatched after every queued layer-2-13 chunk;
+   - and before every layer-20 chunk that was still queued when the ticket
+     arrived.
 
-   Under "cold reads lowest" it completes before the layer-2-13 backlog, so
-   the RED fails there. A `blk.1` ticket queued at the same point completes
-   ahead of the backlog under both rules, so it separates nothing and is
-   recorded only as a sanity arm.
+   Under "cold reads lowest" the `blk.14` reads dispatch before the layer-2-13
+   backlog, so the RED fails there. A `blk.1` ticket queued at the same point
+   dispatches ahead of the backlog under both rules, so it separates nothing
+   and is recorded only as a sanity arm.
+3. **The epoch RED** (*lead ruling §T10*, I-4). One context queues two epochs,
+   `e` and `e+1`, each with a `blk.1` and a `blk.14` ticket, behind its own
+   epoch `e-1` backlog that keeps every worker busy. The pre-registered dispatch
+   log shows every read of epoch `e`'s `blk.14` ticket dispatched before any
+   read of epoch `e+1`'s `blk.1` ticket. Keyed by deadline alone, `e+1`'s
+   `blk.1` reads dispatch first, so the RED fails there.
 
 ### 5.3 Epochs, the gather worker, and every wait on the path
 
@@ -1408,7 +1453,9 @@ the one mechanism for every lazy-table refill in v1: every model, dense ones
 included, and every depth, lookahead included. It is the same mechanism as
 `llama.cpp-9g22`'s cold-expert path (*lead ruling §D6a*). Nothing in it
 depends on how far the submitting thread runs ahead of the device, so rev 2d's
-invariant L is no longer a precondition anywhere.
+invariant L is no longer a precondition anywhere. The ring's depth is the one
+place where that distance enters, and it is a planned fact this design reads,
+not one it sets (below).
 
 Each ubatch a table is gathered for is an **epoch** `e` of that table in that
 context. Its resources split by the thread that writes them:
@@ -1416,52 +1463,103 @@ context. Its resources split by the thread that writes them:
 - **Submitter side, the epoch ring**, depth `D` (§3.3). Entry `e mod D` holds
   the ubatch's **ids capture** (its row indices), one **host-signalled Level
   Zero event**, and one **marker word**.
+- **Per epoch, the gather request**, never reused. It carries the epoch's
+  **cancel flag** (and teardown's `drain` flag) and, for STORAGE, its ticket.
+  The flag lives here, off the ring entry, so the `prefetch` that takes an entry
+  over can never observe a half-cancelled one, and HOST, which has no ticket,
+  has the same flag (*lead ruling §T10*, I-2).
 - **Worker side, the depth-2 slots**, indexed `e mod 2`: the landing slot
   (STORAGE) and the output slot (both residencies).
 
 ```
-epoch entry  { uint32 epoch; ids capture; ze event; marker word;
-               std::atomic<state> state; }  // FREE, PREFETCHED,
-                                              // COPY_ENQUEUED, CANCELLED
-ticket       { lazy_gather_ctx ref; epoch; std::atomic<int> outstanding;
-               std::atomic<bool> cancelled }
-landing slot { uint32 epoch; leaf lock }
+epoch entry    { uint32 epoch; ids capture; ze event; marker word;
+                 request ref; bool copy_enqueued; }  // submitter-private
+gather request { lazy_gather_ctx ref; epoch; ticket (STORAGE only);
+                 std::atomic<bool> cancelled, drain; }  // one per epoch
+ticket         { request ref; std::atomic<int> outstanding; }
+landing slot   { uint32 epoch; leaf lock; }
 ```
+
+**The ring's depth** (*lead ruling §T9a* and its follow-up). The caller's
+run-ahead is bounded today by the RAW guard on graph inputs. Each ubatch's
+`set_inputs` writes its device-resident inputs through the SYCL buffer's
+`set_tensor`, whose default GLOBAL drain waits for the device queues before
+the write (`c69d5774d ggml-sycl.cpp:36084`, `queues_wait_and_throw`,
+commented "RAW race on device memory"; `GGML_SYCL_SET_TENSOR_STREAM_FENCE=1`
+selects a stream wait, which still waits, and no variable reaches no wait).
+`llama.cpp-jhxq` keeps that drain for start-of-graph input uploads (its
+comment `c-sy4h`, site (4)). So the context's **in-flight ubatch depth** `n`
+is one planned quantity, owned by whatever enforces that guard, not by th32:
+today the drain, which gives `n` = 1. Depth `n` means that at `prefetch(k)`
+every copy up to epoch `k-n` has completed.
+- **`D = in_flight_depth + 2`, with margin 0.** The entries live at
+  `prefetch(k)` are epochs `k-n+1..k`, whose copies may be outstanding, and two
+  more: the oldest of those may not have run stage 2 yet, and stage 2 reads
+  the marker of the copy two epochs back (the output slot's depth). So `n + 2`
+  entries, and today `D` = 3. With plan == reality a margin would only hide a
+  wrong depth fact; the exhaustion assertion below is the safety net.
+- `D` is read at the context's transaction (§3.3). Any change that replaces
+  the input drain with an event-ordered guard must publish the in-flight depth
+  as a planned quantity for `D` to read: a constraint on `jhxq`'s successor
+  (§11).
+- **The plan-time guard check.** The drain bounds run-ahead only for a ubatch
+  with at least one input in a DEVICE buffer, and the lazy rows input is
+  `SYCL_Host`, which takes no `set_tensor`. So at context creation, once the
+  reserve graph is scheduled, the lazy-table plan names a device-resident
+  per-ubatch input that carries the guard (`KQ_mask` or `inp_pos`, whichever
+  the check finds first) and records it with `n` and `D`. If there is none,
+  the context is refused at creation with `[LAZY-PLAN-BUG]` naming the missing
+  guard. It is never discovered mid-run.
+- **Initial state** (r5 m-3). Epochs start at `D`. Context init seeds entry
+  `i` (`0 <= i < D`) with marker `i`, and both slots as released, so the
+  first epochs' checks read epochs `0..D-1` as completed, never uninitialised
+  memory. Epochs compare modulo 2^31; the marker's top bit is `CANCELLED`.
 
 **The flow.**
 
 - **`prefetch(e)`, on the submitting thread, never waits.** It reads entry
   `e mod D`'s marker word, a plain load. The entry is free when that word
-  holds epoch `e-D` (its copy completed) or `e-D` marked cancelled. It then
-  resets the entry's event (`zeEventHostReset`: no command can still wait on
-  it, because copy `e-D` has completed or never existed), copies the rows
-  input into the ids capture (at most 48 KiB), sets the entry `PREFETCHED`,
-  and posts a gather request `{table, context, e}` to the IO engine. That is
-  its whole cost. When the entry is not free, see **exhaustion** below.
+  holds epoch `e-D` (its copy completed) or `e-D | CANCELLED` (the strand
+  retired it, below). Only the device's marker kernel and the retiring strand
+  write the word. It then resets the entry's event (`zeEventHostReset`: no
+  command can still wait on it and no thread can still signal it, because
+  copy `e-D` has completed, or epoch `e-D` was retired without a signal),
+  copies the rows input into the ids capture (at most 48 KiB), creates the
+  gather request, and posts it `{table, context, e}` to the IO engine. That
+  is its whole cost. When the entry is not free, see **exhaustion** below.
 - **The gather worker.** The IO engine runs each `(table, context)` as a
-  **strand**: its epochs in order, in two stages. The engine starts a stage
-  when its condition holds, and no thread blocks on the condition:
+  **strand**: its epochs in order, in two stages, on the engine's **stage
+  executor**, two threads of its own that are not the pread workers (r5
+  m-9). A stage never blocks: it is a classification, hit copies, or one
+  dequant (at most 12 MiB, ~2 ms at PP512; ~4 us per decode token). So a HOST
+  dequant or a hit copy never queues behind a blocking `pread`, and T8 counts
+  the time a ready stage waits for a thread as `stage_queue_ns`. The engine
+  starts a stage when its condition holds, and no thread blocks on the
+  condition:
   - **Stage 1, refill,** once epoch `e-2`'s dequant has released landing slot
     `e mod 2` (a worker-side fact). It takes the slot under its lock and sets
     the slot's epoch to `e`. Then it classifies each id (§6.3): a **hit** is
     copied from the row cache into its landing position at once, under the
-    shard lock; a **miss** joins a pending read or queues a class-0 read with
-    deadline `consumer_layer` (§5.2.1), and registers a waiter. HOST has
-    nothing to classify.
+    shard lock; a **miss** joins a pending read or queues a class-0 read keyed
+    `(e, consumer_layer)` (§5.2.1), and registers a waiter. HOST has nothing
+    to classify.
   - **Stage 2, dequant,** once the ticket's `outstanding` is 0 (STORAGE; at
     once for HOST) **and** copy `e-2`, the last reader of output slot
-    `e mod 2`, has completed. It dequantizes into the output slot: STORAGE from
-    the landing slot, HOST from the resident body through the ids capture.
-    Then it releases the landing slot and signals the entry's event
-    (`zeEventHostSignal`).
+    `e mod 2`, has completed (its marker holds `e-2`, or `e-2 | CANCELLED`).
+    It dequantizes into the output slot: STORAGE from the landing slot, HOST
+    from the resident body through the ids capture. Then it releases the
+    landing slot and signals the entry's event (`zeEventHostSignal`).
 - **The copy** (§7.2 step 3). The submitter enqueues the output slot's H2D
-  copy with `depends_on` the entry's event (wrapped with `sycl::make_event`),
-  then a marker kernel that writes `e` into the entry's marker word, and sets
-  the entry `COPY_ENQUEUED`.
-- **The marker watcher.** One thread per process watches the marker words
-  that parked stage-2 requests need and those of enqueued copies, with
-  back-off, and resumes the stage whose marker is set. It is the only thread
-  that waits on device progress. That wait is on its own thread, which
+  copy with `depends_on` the entry's event, through a `sycl::make_event`
+  wrapper made for this copy (§7.2), then a marker kernel that writes `e`
+  into the entry's marker word. It takes a reference on the context's
+  `lazy_event_pool` for that wait, registers the copy with the marker
+  watcher, and sets `copy_enqueued`.
+- **The marker watcher.** One thread per process watches the marker words that
+  parked stage-2 requests need and those of enqueued copies, with back-off, and
+  resumes the stage whose marker is set. When it sees an enqueued copy's marker,
+  it drops that copy's references, the event pool's included. It is the only
+  thread that waits on device progress. That wait is on its own thread, which
   *lead ruling §T8* sanctions, and it is never the submitter's.
 
 **No cycle.** Copy `e` waits on event `e`. Event `e` is signalled by stage 2
@@ -1470,73 +1568,121 @@ same in-order queue and waits only on event `e-2`. Every wait points at IO or
 at a strictly earlier epoch, so the chain ends at the first epoch, and the
 submitting thread is in none of it.
 
-**Exhaustion (the one bound).** If entry `e mod D` is not free at
-`prefetch(e)`, the submitter is more than `D` epochs ahead of the device's
-copies. With `D = 2 x ceil(n_batch / n_ubatch) + 2` (§3.3), that takes more than
-two full batches enqueued without reading an output while the device is still
-behind. Nothing waits and nothing aborts. `prefetch` refuses the ubatch by
-name (`lazy-epoch-ring-exhausted`, a WARN that names the table, the context,
-`e` and the entry's epoch) and counts `epoch_ring_exhausted`.
-`process_ubatch` then returns `GGML_STATUS_FAILED` through the cancellation
-path below, which `llama_decode` reports as its recoverable error. A retry
-proceeds once the device has caught up. A refusal is the only form that
-bounds finite submitter-side state without a wait. This is a proposal, sent
-to the lead with rev 2e (DQ-E, §13).
+**Exhaustion is a plan bug** (*lead rulings §T9a*, *§T10* I-1). If entry
+`e mod D` is not free at `prefetch(e)`, the submitter is further ahead of the
+device than the planned in-flight depth, which the input guard excludes.
+`llama_decode`'s contract has no recoverable return for it
+(`c69d5774d include/llama.h:976-990`: 1 means no KV slot, and a
+`GGML_STATUS_FAILED` surfaces as -3, which is fatal), so rev 2e's recoverable
+`lazy-epoch-ring-exhausted` is withdrawn. Nothing waits: `prefetch` logs
+`[LAZY-PLAN-BUG] epoch ring exhausted` at ERROR, naming the table, the
+context, `e`, the entry's marker, `in_flight_depth`, `D` and the guard input,
+and counts `epoch_ring_exhausted`. Under `GGML_SYCL_STRICT_LEASES=1`, the
+fork's one strict switch, it aborts (this design's choice of switch; T7
+widens that variable's row in `sycl-env-vars.md`). Otherwise it is that
+line plus a fatal -3: `process_ubatch` returns `GGML_STATUS_FAILED` through
+the cancellation path below. T7's public-API fixture (§11, T7 (5)) is the
+RED/GREEN that shows it unreachable on today's code, including through
+llama-server's long-prompt path: the server synchronizes only after an
+output-carrying batch (`tools/server/server-context.cpp:3565-3569`), but
+that does not remove the per-ubatch drain.
 
-**Cancellation** (*lead ruling §T8*, I-2). An epoch whose copy was never
-enqueued is **cancelled**, not waited for, and the process never aborts on a
-recoverable ubatch failure. `process_ubatch`'s failure path (a non-SUCCESS
-`graph_compute`, or any failure between `prefetch` and the copy's enqueue)
-calls `lazy_cancel_unenqueued()` (T6). For each `PREFETCHED` entry that call:
-- sets the ticket `cancelled`;
-- writes the entry's marker word as `e | CANCELLED` from the host (no copy
-  exists to write it);
-- marks the entry `CANCELLED`.
+**The one case the guard does not reach** (found folding r5 I-2; sent to the
+lead as DQ-F, §13). A cancelled epoch has no device work, so the guard does
+not retire it; the strand does. At the cancel of epoch `e`, the guard has
+already drained copy `e-1`, so `e`'s pending stages depend on no IO and no
+device work, only on the stage executor. `prefetch(e+D)` can find `e`
+unretired only if all `D-1` epochs after it were cancelled too, each a whole
+failed `llama_decode`, before the executor ran `e`'s stage once. The executor
+runs a cancelled epoch's stage ahead of other ready stages, which bounds the
+window to one pickup. If it is ever reached, it is the same
+`[LAZY-PLAN-BUG]`.
 
-The strand's next stage for that epoch sees the flag. It skips the dequant,
-releases the landing slot and signals the event. In-flight reads still
-complete and feed the row cache, and the reaper's slot copy skips them under
-the slot lock. The strand runs a table's epochs in order, so no later epoch
-touches a slot while the cancelled epoch's stage is still in it. A copy that
-was enqueued before its graph failed is not cancelled: its strand completes
-and the device copy runs into a result the caller discards.
-T5's RED: epoch A's reads are held and
-cancelled, then epoch B takes landing slot 0 with different rows. A's
-completions are released, then B's. Slot 0 must hold B's rows exactly, and
-A's rows must appear only in the cache.
+**Cancellation** (*lead rulings §T8* I-2, *§T10* I-2). An epoch whose copy
+was never enqueued is **cancelled**, not waited for, and the process never
+aborts on a recoverable ubatch failure. `process_ubatch`'s failure path (a
+non-SUCCESS `graph_compute`, or any failure between `prefetch` and the copy's
+enqueue) calls `lazy_cancel_unenqueued()` (T6). For each entry whose
+`copy_enqueued` is false, that call sets its request's `cancelled` flag and
+nothing else: it writes no marker and touches no event.
+
+The strand's next stage for that epoch sees the flag. It skips the dequant
+and releases the landing slot. It does **not** signal the event. Nothing waits
+on the event of a copy that was never enqueued, so a signal could only land
+late, on the event of the epoch that takes the entry over, and let that
+epoch's copy run before its output slot is written (r5 I-2). Then the strand
+**retires** the epoch: after all its own work on the entry and the slots, it
+writes `e | CANCELLED` into the marker word. Only then can `prefetch(e+D)`
+take the entry over. In-flight reads still complete and feed the row cache,
+and the reaper's slot copy skips them under the slot lock. The strand runs a
+table's epochs in order, so no later epoch touches a slot while the cancelled
+epoch's stage is still in it. A copy that was enqueued before its graph
+failed is not cancelled: its strand completes and signals, and the device
+copy runs into a result the caller discards.
+
+T5's RED (r5 I-3): epoch A's reads are held and cancelled, then epoch B takes
+landing slot 0 with different rows. **B's completions are released first,
+then A's stale ones.** Pre-registered: the check-and-copy build holds B's
+rows in slot 0 exactly, and A's rows appear only in the cache. The positive
+control is a pre-registered mutant without the reaper's epoch and cancel
+check, in which A's late completions overwrite B's positions, so slot 0 shows
+A's rows. Releasing A first could not fail: B's completions would overwrite
+the same positions, and the mutant would pass.
 
 **The reaper** is the worker whose read completed (or the `io_uring` CQ
 reader). It removes the entry from the in-flight table, then handles each
 waiter:
 1. It takes the waiter's landing-slot lock and copies the row **only if** the
-   slot's epoch still equals the waiter's epoch and its ticket is not
-   cancelled. The check and the copy happen under one lock, and the slot's
-   epoch changes only under it, so a stale row can never land in a
+   slot's epoch still equals the waiter's epoch and its request is neither
+   cancelled nor draining. The check and the copy happen under one lock, and the
+   slot's epoch changes only under it, so a stale row can never land in a
    reassigned slot.
 2. It inserts the row into the row cache either way, because file bytes are
    always valid cache content.
 3. It decrements `outstanding`. The last decrement resumes stage 2.
 
-**References, and teardown never waits** (*lead ruling §T8*, I-7, P2).
+**References, and teardown never waits on IO** (*lead rulings §T8* I-7,
+*§T10* I-7, P2).
 - Every in-flight read holds a reference on its block-ring slot. The ring is
   owned by the IO pool, not a context (§3.3), so a read that another
   context's ticket joined writes into memory that neither context owns.
 - Every waiter holds its ticket and a handle to the landing slot it fills.
 - Every gather request holds, by value, the handles of its ids capture,
-  landing slot, output slot, marker word and event wrapper.
-- The marker watcher holds an enqueued copy's output-slot and marker handles
-  until it sees that copy's marker.
+  landing slot, output slot and marker word.
+- **Every enqueued wait holds the event and its pool.** The `sycl::event` from
+  `make_event` uses `ownership::keep`, so it does not keep the Level Zero
+  event alive. So a copy's enqueue takes a reference on the context's
+  `lazy_event_pool`, which owns the pool and its `D` events. The marker watcher
+  drops that reference only after it has seen the copy's marker, which the
+  device writes after the copy, and so after its wait on the event.
+  `zeEventDestroy` and `zeEventPoolDestroy` run at the pool's last reference,
+  never while a command can still wait on the event.
+- The marker watcher holds an enqueued copy's output-slot and marker handles,
+  and its event-pool reference, until it sees that copy's marker.
 - A ticket also holds its `lazy_table` (I11).
 
-Context teardown cancels every epoch not yet `COPY_ENQUEUED`, and also every
-enqueued one whose stage 2 has not signalled: stage 2 then signals at once,
-without waiting for IO, so the device drains. Teardown then drops the
-context's own references and returns. The `lazy_gather_ctx` destructor, the
-sole release point, runs at the last release, and the memory is freed then.
-T5's RED: free context A with a read in flight that context B has joined. B's
-rows must arrive, there must be no use-after-free (ASAN, or the mock engine's
-poisoned slabs), and the release must be observed only after the read
-completes.
+**Teardown order.** `llama_context::~llama_context` begins with
+`synchronize()` (`c69d5774d src/llama-context.cpp:1067`), which waits on the
+queue, copies parked on IO events included. So T6 runs the lazy teardown
+**before** that `synchronize()`, as the destructor's first statement. It
+cancels every epoch not yet enqueued (`cancelled`: retired, never
+signalled), and sets `drain` on every enqueued epoch whose stage 2 has not
+signalled. A draining stage 2 skips its dequant, waits for no IO, and
+signals as soon as copy `e-2`'s marker is set, so the enqueued copies run in
+queue order and the device drains. The two flags differ because only an
+enqueued copy has a waiter to release. The `synchronize()` then
+waits only for device work already enqueued, which no longer depends on IO:
+that is the one teardown wait left. Teardown then drops the context's own
+references and returns. The `lazy_gather_ctx` destructor, the sole release
+point, runs at the last release, and the memory is freed then. T5's REDs:
+- free context A with a read in flight that context B has joined. B's rows
+  must arrive, there must be no use-after-free (ASAN, or the mock engine's
+  poisoned slabs), and the release must be observed only after the read
+  completes;
+- **the event arm** (r5 I-7): free the context between an epoch's signal and
+  its copy's execution. The event and its pool must be destroyed only after
+  that copy's marker is observed (a destroy-order counter on the mock's
+  event pool).
 
 **Lock order** (M11). The pool's per-context queues, the in-flight table, the
 cache shards, the landing-slot locks and the strand queues are all **leaf**
@@ -1559,8 +1705,11 @@ IO wait or a callback. T5 adds them to canonical contract §12.5 as L5 leaves.
    WARN per table per context and counts `slot_marker_stale`: the
    bounded-age witness of *lead ruling §T8*. It never aborts and never waits.
 4. **Device side, an event edge, not a host wait:** the output copy waits on
-   the epoch's event. If the IO is late, the *device* waits there; the host
-   thread has already moved on.
+   the epoch's event. If the IO is late, the *device* waits there. The
+   submitting thread does not wait at the copy; on today's MoE models and on
+   the record paths it can still wait later, at one of the existing waits of
+   item 8. How long a device may stay parked on a host-signalled event is
+   HT-6's question (§7.2).
 5. **Removed from this path by *lead ruling §T1* D6(c):**
    - `llama.cpp-x1xd`, the scheduler's host sync before a zero-input split
      after a backend change (`ggml-backend.cpp:2326-2334`). There is no CPU
@@ -1586,14 +1735,42 @@ IO wait or a callback. T5 adds them to canonical contract §12.5 as L5 leaves.
    the gather node dispatches nothing, and `prefetch` copied the ids on the
    host at `set_input` (§7.5). The gather's **output** reaches the device
    only by the explicit copy of item 4, in both residencies (*lead ruling
-   §T2*, DQ). Wait sites (2)-(4) of the `llama.cpp-jhxq` census are not
-   reached by anything this design adds; `jhxq` stays open for the copies
-   other paths make.
+   §T2*, DQ). Wait sites (2)-(3) of the `llama.cpp-jhxq` census are not
+   reached by anything this design adds. Site (4), the start-of-graph input
+   uploads, is not added to either, but it is the guard that bounds the ring
+   (above), so this design depends on it staying, or on a replacement that
+   publishes its depth. `jhxq` stays open for the copies other paths make.
 7. **No SYCL host-task thread is held** (*lead ruling §T8*). This path has no
    `host_task`, so rev 2d's HT-3 question about the size of the runtime's
    host-task pool no longer applies. Its analogue, a slow read that holds
    back another context's gather, is the IO engine's head-of-line rule
    (§5.2.1), and T5 tests it.
+8. **Existing waits that now span IO** (r5 m-4). This design adds none of
+   them, but each can now include `T_ticket`, because the device work it
+   waits for can sit behind an epoch's copy (`c69d5774d ggml-sycl.cpp`):
+   - the input guard's `set_tensor` GLOBAL drain (`:36084`), the one that
+     bounds the ring (above);
+   - the MMID ids admission (`:72160-72162`);
+   - the synchronous router ids copy (`:74069` -> `:57241`);
+   - `graph_prestage_leaf_tensors`' INPUT staging, run before record,
+     segmented and block execution (`:98768-98780`, `graph_input_stage`);
+   - sampling's `llama_synchronize`.
+
+   `llama.cpp-jhxq` and `llama.cpp-54sf0` own them.
+
+**The watchdog counts IO progress** (*lead ruling §T10*, I-6 (a)). The fork's
+watchdog `_Exit(1)`s after `GGML_SYCL_OP_TIMEOUT_MS` (default 30 s) without
+a heartbeat while a `graph_compute` is in flight (`c69d5774d
+ggml-sycl/common.cpp:655-677`; the in-flight count is an RAII guard around
+`graph_compute`, `ggml-sycl.cpp:105097-105111`). Under today's MoE lockstep a
+submitter sits inside `graph_compute` while the device waits on IO, and
+`9g22` §4.5.3 predicts 28-145 s per DeepSeek PP512 ubatch. So the rule is:
+**a stall is no device progress AND no IO-engine progress for the timeout.**
+The reaper calls `ggml_sycl_watchdog_heartbeat()` for every read that
+completes bytes. The queued reads are finite, so a hung device is still
+caught, one timeout after the IO in front of it has drained, and an engine
+that completes nothing is caught as before. The lead relays the rule to
+`9g22`, whose cold path has the same exposure at a larger size (§11).
 
 <a id="th32-windows"></a>
 ### 5.4 The prefetch window
@@ -1635,7 +1812,7 @@ IO wait or a callback. T5 adds them to canonical contract §12.5 as L5 leaves.
   tail)` hook. The generic path skips lookahead when a model does not implement
   it. For DeepSeek on this host the tables are always on STORAGE and a cold
   ubatch costs ~2.5-3.5 s of IO, so lookahead is what makes long prompts
-  tolerable; D9 proposes it for v1.
+  tolerable; D9 puts it in v1 (*lead ruling §T2*).
 
 ---
 
@@ -1961,15 +2138,18 @@ Before the **first node (or fused group) that reads the gather's `dst`**, the
 backend enqueues, on the **main in-order queue**:
 
 3. `memcpy(dst_device, output_slot, bytes)` with `depends_on` the epoch's
-   host-signalled event (wrapped with `sycl::make_event`), then a marker
-   kernel that writes the epoch into the ring entry's marker word (§3.3). This
-   is the explicit, event-ordered H2D copy of *lead ruling §T2* DQ, the same
-   for both residencies. Because the main queue is in-order, the copy runs
-   after every earlier main-queue command, including the previous graph's
-   readers of the same compute-buffer region: that is the write-after-read
-   guard, with no barrier of its own. The consumer follows the copy in queue
-   order: that is the read-after-write edge. The host thread waits for
-   neither.
+   host-signalled event, then a marker kernel that writes the epoch into the
+   ring entry's marker word (§3.3). **The wrapper form, pinned** (r5 m-2): the
+   native event is the context's, created at context init (§3.3); each copy
+   wraps it with a fresh `sycl::make_event` (`ownership::keep`) and drops the
+   wrapper with its request, so no runtime-cached status can outlive a reset.
+   HT-4 and HT-5 use exactly this form. This is the explicit, event-ordered H2D
+   copy of *lead ruling §T2* DQ, the same for both residencies. Because the main
+   queue is in-order, the copy runs after every earlier main-queue command,
+   including the previous graph's readers of the same compute-buffer region:
+   that is the write-after-read guard, with no barrier of its own. The consumer
+   follows the copy in queue order: that is the read-after-write edge. The host
+   thread waits for neither.
 
 Rules around it:
 
@@ -1978,16 +2158,18 @@ Rules around it:
   retires r4's m-4 and m-5). Slot reuse is now the worker's business (§5.3,
   stage 2), and the submitter needs only a free ring entry, which it checks
   with one plain load.
-- **The event reset rule.** An event is reset only by the `prefetch` that
-  takes over its ring entry, and only after it has read that entry's marker
-  word showing the previous epoch's copy completed (or cancelled). No command
-  can wait on the event then, so no copy can ever find its event still
-  signalled from an earlier epoch. A reset by a worker *after* it sees the
-  marker, with the event reused at depth 2, would race the device: copy
-  `e+2` can start the moment copy `e` completes, before any host thread has
-  reset the event, and it would then read the output slot before stage 2 of
-  `e+2` has written it. HT-5 probes this hazard, with a negative arm, and the
-  lead relays the rule to `9g22` (§11).
+- **The event reset rule.** An event is reset only by the `prefetch` that takes
+  over its ring entry, and only after it has read that entry's marker word
+  showing the previous epoch's copy completed, or the epoch retired as cancelled
+  by its strand. A cancelled epoch that never enqueued its copy is never
+  signalled (§5.3, *lead ruling §T10* I-2). So no command can wait on the event
+  then and no thread can still signal it, and no copy can ever find its event
+  still signalled from an earlier epoch. A reset by a worker *after* it sees the
+  marker, with the event reused at depth 2, would race the device: copy `e+2`
+  can start the moment copy `e` completes, before any host thread has reset the
+  event, and it would then read the output slot before stage 2 of `e+2` has
+  written it. HT-5 probes this hazard, with a negative arm, and the lead relays
+  the rule to `9g22` (§11).
 - **What today's code does, which nothing here depends on** (r4 m-3). On
   today's code the submitter rarely runs far ahead of the device:
   - decode: the sampling step's `llama_synchronize` bounds it before the next
@@ -2039,28 +2221,47 @@ Rules around it:
   Nothing reads `rows` after `prefetch` has copied it into the ring entry
   (§7.5).
 - **Counters.** `slot_wait_device_ns` and `stall_ns_total` (§5.3 items 2-3),
-  `slot_marker_stale`, `epoch_ring_exhausted` and `epochs_cancelled` (§10).
+  `slot_marker_stale`, `epoch_ring_exhausted`, `epochs_cancelled` and
+  `stage_queue_ns` (§10).
 
 **The interop the mechanism rests on, and how T7 retires it first.** The fork
-has no precedent for a SYCL command depending on a host-signalled Level Zero
-event. So T7's first deliverable is five lead-run probes. Each is a small
-standalone SYCL program with no model, a few seconds long, run on
-`level_zero:0` and then `level_zero:1`, with `Shmem` sampled before and after.
-`E` below is a host-signalled event from a host-visible pool, wrapped with
-`sycl::make_event`:
+has one precedent, in a test (r5 m-1):
+`c69d5774d ggml/src/ggml-sycl/tests/test-fattn-packed-k-lifecycle.cpp:262-342`
+(`level_zero_host_gate`) creates a `HOST_VISIBLE` pool and an event whose
+signal and wait scopes are `ZE_EVENT_SCOPE_FLAG_HOST`, wraps it with
+`make_event(ownership::keep)`, and gates a kernel on it with `depends_on`
+(`submit_half_payload`, `:345-350`); `submit_retry_after_accepted_signal`
+(`:407-429`) requires a dependent submit to be accepted before the gate is
+released. It never resets or reuses its event and never holds the device
+long, so it does not settle this design's questions. T7's first deliverable
+is six lead-run probes built on that gate class, with its pool flags and
+event scopes. Production uses the same scopes: the host signals after it has
+written host memory, and the device only DMA-reads that memory. Each probe is
+a small standalone SYCL program with no model, run on `level_zero:0` and then
+`level_zero:1` with the selector pinned, and `Shmem` sampled before and ~5 s
+after. `E` below is such an event. Each copy wraps it with a fresh
+`make_event`, as production does, and a probe that needs its status reads
+`zeEventQueryStatus` on the native handle, never through the SYCL wrapper:
 
 | probe | construction | pass |
 |---|---|---|
 | HT-1 | main queue: kernel K1 (~1 ms), copy `depends_on(E)`, a kernel K1b also `depends_on(E)`, then kernels K2..K50; a host thread signals `E` after 200 ms. **Must-fire control:** `c6ah`'s exact shape, a `host_task` whose `depends_on` names another queue's in-flight ~200 ms spin kernel | every `submit` in the main arm, the copy's and K1b's included, returns in < 1 ms; K1 completes at ~1 ms, not ~200 ms; K2 starts after `E` is signalled. The control's submit takes ~200 ms, which proves the timer sees a blocking submit |
 | HT-2 | HT-1 with a recorded command graph replayed on the main queue after the copy | the replay's submit returns in < 1 ms, and its kernels run after the copy |
-| HT-3 | two contexts' main queues, each with a copy `depends_on` its own event; `E_A` is signalled after 2 s, `E_B` after 10 ms | B's copy completes at ~10 ms: one context's late event does not hold back another's |
+| HT-3 | the production execution queue, one per device and shared by every context on it (`ggml_sycl_execution_queue_for_device`, `common.hpp:5808-5822`), on `level_zero:0` and `level_zero:1` in one process, each with a copy `depends_on` its own event; `E_A` (card 0) is signalled after 2 s, `E_B` (card 1) after 10 ms | B's copy completes at ~10 ms: one device's late event does not hold back another device's. The claim is two devices only (r5 m-14): on one device a late event holds every later command of every context, so §5.2.1's per-context round-robin is an IO-only property, and same-device multi-context is unsupported anyway (canonical contract §5) |
 | HT-4 | HT-1 repeated 10000 times, reusing one event under the reset rule | no crash, no Level Zero error, no event-handle anomaly (the `:32755` failure), `Shmem` flat |
 | HT-5 | reset before reuse: copy `c1` `depends_on(E)`, then a marker kernel; `E` is signalled and `c1` completes; the host reads the marker, resets `E`, and enqueues copy `c2` `depends_on(E)`; `E` is signalled again 200 ms later. **Negative arm:** skip the reset | `c2` starts ~200 ms after its enqueue in the main arm, and at once in the negative arm, so the probe can tell a stale signal from a fresh one |
+| HT-6 | **the long hold** (*lead ruling §T10*, I-6 (b)): HT-1's main arm with `E` signalled after **60 s**, then a second run after **300 s**; lead-run, selector pinned. The probe runs no `graph_compute`, so the fork's watchdog is not armed | no `GT reset`, `guc_id`, CAT error or job-timeout line in `journalctl -k` over the run's window; the copy completes, and correctly, after the signal; `Shmem` flat. The fork's own watchdog comment says xe resets the GT engine after ~10 s of job inactivity (`ggml-sycl/common.cpp`, its watchdog block at `:655-677`), so the outcome is not assumed |
 
-- If all five pass, T7 builds the mechanism above.
-- If any fails, there is no in-design fallback. `host_task` (rev 2d's D6-M(a))
-  is superseded by *lead ruling §T8*, and D6-M(c) is rejected. The failure
-  goes to the lead as a new question before anything else is built (§13).
+- If HT-1..HT-5 pass, T7 builds the mechanism above.
+- HT-6's result goes to the lead whatever it is. If xe resets or times out
+  the parked job, the device must not be parked on IO: the dependent copy is
+  then submitted only once the IO has completed, still event-ordered and with
+  no submitter wait. Which form ships is the lead's decision on HT-6's result
+  (*§T10* I-6).
+- If any of HT-1..HT-5 fails, there is no in-design fallback. `host_task`
+  (rev 2d's D6-M(a)) is superseded by *lead ruling §T8*, and D6-M(c) is
+  rejected. The failure goes to the lead as a new question before anything
+  else is built (§13).
 
 ### 7.3 Data movement, and P1 at both ends (M7)
 
@@ -2153,9 +2354,36 @@ segment boundary.**
   T7 widens that collector to a **boundary set** = the MoE dispatch indices
   plus, for each lazy gather of either residency, the first node that reads
   its `dst`. At that boundary the backend submits §7.2 step 3; the gather node
-  itself is a no-op
-  in both modes (its work was posted at prefetch), and the segments
-  between boundaries replay as today.
+  itself is a no-op in both modes (its work was posted at prefetch), and the
+  segments between boundaries replay as today.
+- **Dense graphs enter the same path** (*lead ruling §T10*, I-5). Today the
+  segmented path runs only when `moe_graph_rerecord` is set (`use_segmented`,
+  `:106941`), and only MoE graphs set it (`:106161-106165`,
+  `:106354-106363`; the setters at `:94128` and `:106265` are MoE paths
+  too), while `moe_graph_record_segments` returns "No MoE ops found" on an
+  empty dispatch set (`:96912-96918`). So a dense graph with a lazy gather
+  would take the full-graph record path, which would record the step-3 copy
+  with its record-time event, a stale edge on every replay, or drop silently
+  to direct dispatch. T7 widens the trigger from "has `MUL_MAT_ID`" to **"has
+  `MUL_MAT_ID` or lazy consumers"**, the second from T7's recognition of the
+  graph's lazy gathers, the same fact the boundary set is built from:
+  - at the flash-attention non-engage site (`:106161`), a graph with lazy
+    consumers sets the flag instead of turning graphs off;
+  - at the topology site (`:106354`), `stats.moe_ops > 0` becomes "MoE ops or
+    lazy consumers";
+  - `moe_graph_record_segments`' early return tests the whole boundary set;
+  - `moe_decode_segmented_graph_profitable` (`:97240`) already returns true
+    with no MoE ops, so a dense graph with one or two lazy boundaries (two or
+    three segments) is admitted, under the cap below;
+  - the full-graph record path refuses a graph with a lazy gather by name
+    (`[SYCL-GRAPH] lazy gather needs segmented replay`) and counts
+    `lazy_graph_direct`, so it can never record a copy's event edge.
+
+  It is feasible: each site is in `graph_compute`'s policy block, where T7's
+  recognition is available. If T7 finds a site where it is not, a dense
+  lazy-bearing graph runs direct in record mode, named by that line and
+  counted by `lazy_graph_direct`, and the case goes to the lead. There is no
+  silent third form. gemma4 is the dense witness (T7 (6)).
 - **What it costs.** One extra segment per consumer: two per graph on
   DeepSeek, one on Qwen. On DeepSeek each consumer boundary falls inside a
   segment that already ends at the previous layer's `MUL_MAT_ID`. The
@@ -2174,21 +2402,21 @@ segment boundary.**
   - `full_replay` and `seg_replay` are not both zero on a decode run;
   - zero `[SYCL-GRAPH] replay futility` WARN lines;
   - T8's `lazy_boundary_dispatches` counter equals `tables x graphs`;
-  - **the consumer copy does not block its submitter** (*lead rulings §D7*
-    I-B, *§T8* I-5, the same criterion for both models), **scored per table**
-    (r4 m-13). For every §7.2 step-3 copy, T8 records two things: host chrono
-    around its submit, including its `depends_on`; and whether the epoch's
-    event was still unsignalled at that moment (`copy_submit_io_pending`), so
-    the claim about pending copies is measured, not assumed. The criterion:
-    submit < 1 ms on at least 99% of each table's copies, and on at least 99%
-    of those with `copy_submit_io_pending` set. The old ordering witness
-    ("block 15 submitted before block 13 completes") is withdrawn everywhere.
-    The synchronous router ids copy lives in the general
+  - **the consumer copy does not block its submitter** (*lead rulings §D7* I-B,
+    *§T8* I-5, the same criterion for both models), **scored per table** (r4
+    m-13). For every §7.2 step-3 copy, T8 records two things: host chrono around
+    its submit, including its `depends_on`; and whether the epoch's event was
+    still unsignalled at that moment (`copy_submit_io_pending`, read with
+    `zeEventQueryStatus` on the native handle, never through the SYCL wrapper,
+    r5 m-2), so the claim about pending copies is measured, not assumed. The
+    criterion: submit < 1 ms on at least 99% of each table's copies, and on at
+    least 99% of those with `copy_submit_io_pending` set. The old ordering
+    witness ("block 15 submitted before block 13 completes") is withdrawn
+    everywhere. The synchronous router ids copy lives in the general
     `ggml_sycl_mul_mat_id` (`ggml-sycl.cpp:74069` ->
-    `ggml_sycl_safe_memcpy_sync`, `:57241`; *lead ruling §D8* moves the
-    earlier `:57239` cite to this synchronous branch), and it keeps every MoE
-    graph's submitter in lockstep with the device, so that ordering could not
-    fail.
+    `ggml_sycl_safe_memcpy_sync`, `:57241`; *lead ruling §D8* moves the earlier
+    `:57239` cite to this synchronous branch), and it keeps every MoE graph's
+    submitter in lockstep with the device, so that ordering could not fail.
 
   **The engram controls**, defined here and nowhere else (*lead rulings §D9*
   2, *§T7* 3, *§T8* I-5; `9g22` cites them). T7 owns them. They are
@@ -2200,17 +2428,18 @@ segment boundary.**
 
   | variable | values | effect |
   |---|---|---|
-  | `GGML_SYCL_LAZY_CONTROL` | `off` (default), `hold`, `hold_blocking` | `hold`: the IO engine completes each read of one table late (below). `hold_blocking`: the same hold, and the submitter also waits on the epoch's event before it enqueues that table's step-3 copy. That is the blocking build, selectable in release, and it must show the hold in its submit time |
-  | `GGML_SYCL_LAZY_CONTROL_TABLE` | a lazy tensor's name (default: the table with the highest `consumer_layer`, `blk.14.engram_embd.weight` on DeepSeek) | the one table `hold` applies to, so `blk.14` is reachable |
-  | `GGML_SYCL_LAZY_CONTROL_HOLD_MS` | a positive integer, default 50 | the extra hold. Each read of the table is completed `T_window(t) + HOLD_MS` after its issue, where `T_window(t)` is the table's window as the engine measured it over the first 8 ubatches before the hold engages (§8.1) |
+  | `GGML_SYCL_LAZY_CONTROL` | `off` (default), `hold`, `hold_blocking` | `hold`: the IO engine completes each read of one STORAGE table late (below); a HOST table has no reads, so for it the same timer holds its stage-2 signal instead, and the control is never a no-op (r5 m-8). `hold_blocking`: the same hold, and the submitter also waits on the epoch's event before it enqueues that table's step-3 copy. That is the blocking build, selectable in release, and it must show the hold in its submit time |
+  | `GGML_SYCL_LAZY_CONTROL_TABLE` | a lazy tensor's name (default: the table with the highest `consumer_layer`, `blk.14.engram_embd.weight` on DeepSeek) | the one table `hold` applies to, so `blk.14` is reachable. A name that is not a lazy tensor of the model is a WARN, and the control is `off` |
+  | `GGML_SYCL_LAZY_CONTROL_HOLD_MS` | a positive integer, default 50; `<= 0` or non-numeric is a WARN, and the control is `off` | the extra hold. Each read of the table completes (for HOST, each stage-2 signal is made) `T_window(t) + HOLD_MS` after its gather request is posted. `T_window(t)` is engine-observable (r5 m-8): the p99, over the 8 warm ubatches before the hold engages, of the time from the table's request post to its copy's submit, two instants the backend records. (§8.1's `T_window` comes from the lead's op timing, which the engine does not have) |
 
-  The hold delays the reaper's completion on a timer. It does not sleep an IO
-  worker, and there is no SYCL host-task thread to hold, so it depends on
-  neither the pool size nor HT-3's outcome (*§T8* I-5). One table is held at a
-  time, and the hold outlasts the table's own window. So under the lockstep of
-  today's decode, the held table's copies are still pending when they are
-  submitted. That makes the rev 2d uniform hold's blind spot (r4 I-5 (b):
-  `blk.14`'s host task finished before its copy was submitted) impossible.
+  The hold delays the reaper's completion (HOST: the stage's signal) on a timer.
+  It does not sleep an IO worker, and there is no SYCL host-task thread to hold,
+  so it depends on neither the pool size nor HT-3's outcome (*§T8* I-5). One
+  table is held at a time, and the hold outlasts the table's own window. So
+  under the lockstep of today's decode, the held table's copies are still
+  pending when they are submitted. That makes the rev 2d uniform hold's blind
+  spot (r4 I-5 (b): `blk.14`'s host task finished before its copy was submitted)
+  impossible.
   - **Positive control, `hold`:** the held table's copies must show
     `copy_submit_io_pending` on at least 90% of them, submit < 1 ms, and
     `T_ticket` up by at least `HOLD_MS`.
@@ -2512,7 +2741,9 @@ tables read 24 rows per token each at blocks 1 and 14.
 
 - **Any row table.** Type, `ne[0]` and `row_size = ggml_row_size(type, ne[0])`
   come from the tensor. Quantized rows are whole blocks by construction.
-  Dequant goes through the type traits.
+  Dequant goes through the type traits. The read span and the block ring's
+  slot are sized from `row_size` (§5.2, §3.3), so a row wider than 4 KiB,
+  such as gemma4 E4B's 11424 B PLE row, is read as 3-4 blocks (r5 m-10).
 - **Consumers.** Every consumer of a lazy tensor goes through
   `build_lazy_get_rows`. That covers an indexed `get_rows` (qwen4exp's hashed
   rows; DeepSeek's engram rows; gemma4's `inp->tokens`,
@@ -2586,7 +2817,7 @@ The SYCL side of the same interface:
 | block ring | the IO pool's, shared by every context | a `mem_handle`; each in-flight read holds a reference on its slot |
 | `prefetch(gather_ctx, rows, n, class) -> ticket` | called by `lazy_prefetch()` after `set_inputs()` (§7.5); it copies the ids into the epoch ring after one non-blocking marker load and posts the gather request; it never waits (§5.3) | |
 | the gather | both residencies: the IO engine's worker (D6-M(b)) + an H2D copy ordered on its host-signalled event (§5.3, §7.2, §7.3) | th32 owns it (*lead ruling §T1*, D6(c); *§T2*, DQ) |
-| `lazy_io_submit(fd, offset, length, dst handle, ticket, class, deadline)` | the one IO entry point, shared with `llama.cpp-yl3v`'s cold-expert slice reads (§5.2, §9.2) | th32 (T5) |
+| `lazy_io_submit(fd, offset, length, dst handle, ticket, class, epoch, deadline)` | the one IO entry point, shared with `llama.cpp-yl3v`'s cold-expert slice reads (§5.2, §9.2) | th32 (T5) |
 
 ### 9.2 Cold routed experts on STORAGE (phase 1, owner §D4; the path is `llama.cpp-yl3v`'s)
 
@@ -2610,7 +2841,7 @@ the CPU expert pool, not the gather worker. This design provides the rest:
 | th32 provides | used by yl3v as |
 |---|---|
 | the `STORAGE` residency state (§3.1) | the reported state of a cold expert-layer |
-| `lazy_io_submit(fd, offset, length, dst handle, ticket, class, deadline)` and its pool (§5.2); callable from any thread, including one that is not the graph's submitter | the slice reads, class 0, deadline = the expert's layer, in chunks of at most 512 KiB. Because they are known only once the router has run, the edge from the router's device event to the read must not be a `host_task` that `depends_on` that in-flight event, which blocks the submitter (`llama.cpp-c6ah`); it is D6-M(b)'s host-signalled event or a non-submitting thread (§13; *lead ruling §T6*, relay). The ordering rule is §5.2.1, the single source (*§D10* I-3) |
+| `lazy_io_submit(fd, offset, length, dst handle, ticket, class, epoch, deadline)` and its pool (§5.2); callable from any thread, including one that is not the graph's submitter | the slice reads, class 0, epoch = the routing ubatch's, deadline = the expert's layer, in chunks of at most 512 KiB. Because they are known only once the router has run, the edge from the router's device event to the read must not be a `host_task` that `depends_on` that in-flight event, which blocks the submitter (`llama.cpp-c6ah`); it is D6-M(b)'s host-signalled event or a non-submitting thread (§13; *lead ruling §T6*, relay). The ordering rule is §5.2.1, the single source (*§D10* I-3) |
 | the ticket and epoch machinery (§5.3) | completion and cancellation of a slice load |
 | the host ledger and `host_planned_bytes` (§4.2) | the charge for the landing slab (`2 x` the largest per-layer cold bytes, *lead ruling §D6* I-4) and the credit of `C` |
 | the order of §4.3, with the cold set found in step 5 by 7v5c's search (*lead rulings §D5, §D6*) | the size `C` that its profile order fills |
@@ -2702,10 +2933,13 @@ own targets from this measurement when DSpark lands.
   device part of rev 2d's `slot_wait_ns`; its IO part is `stall_ns_total`,
   §5.3), `slot_marker_stale`, `epoch_ring_exhausted`, `epochs_cancelled`,
   `copy_submit_ns` and `copy_submit_io_pending` (§7.4, per copy, per table),
-  `lazy_output_copies`, `lazy_zero_copy_reads` (§7.3). Per pool:
+  `lazy_output_copies`, `lazy_zero_copy_reads` (§7.3), `stage_queue_ns`
+  (§5.3). Per context: `lazy_graph_direct` (§7.4). Per pool:
   `class0_reads`, `class1_reads`, `inflight_joins`, and the reads and bytes
   submitted by other clients (yl3v's slices), so the shared-device record of
-  §8.1 comes from the same place.
+  §8.1 comes from the same place; for tests, the dispatch log of §5.2.1. Per
+  process: `set_tensor_global_drains`, the input guard's GLOBAL drains, which
+  T7 (5)'s GREEN counts per ubatch (§5.3).
 - **Definitions** (M5), chosen so that runtime counts match the simulation's
   per-reference counting:
   - Every row reference in `rows` is one of: a **hit** (the row is in the
@@ -2732,14 +2966,14 @@ Each ticket names the RED that must fail before its code exists (*lead ruling
 
 | # | ticket | depends on | RED (fails first) | notes |
 |---|---|---|---|---|
-| T1 | `alloc_tier::HOST_CPU`: raw wrapper (`mmap` + `MADV_HUGEPAGE` + `mlock`), `must_host_cpu`, `device_mappable()`, the 36-site tier census (§3.1); `lazy_residency`; `cache_location`/`expert_resolve_tier` gain reported `STORAGE`; roles `LAZY_ROW_CACHE`/`LAZY_STAGING`/`LAZY_OUTPUT`; canonical contract §3/§4/§12.5 edits | - | a host test that requests `HOST_CPU` under `RLIMIT_MEMLOCK` = 1 page and expects the typed refusal `host-cpu-lock-failed` naming `errno` and the bytes; a census test that a `HOST_CPU` allocation appears in the registry and the shutdown census | header change first: every other ticket includes it |
+| T1 | `alloc_tier::HOST_CPU`: raw wrapper (`mmap` + `MADV_HUGEPAGE` + `mlock`), `must_host_cpu`, `device_mappable()`, the 36-site tier census (§3.1); `lazy_residency`; `cache_location`/`expert_resolve_tier` gain reported `STORAGE`; roles `LAZY_ROW_CACHE`/`LAZY_STAGING`/`LAZY_OUTPUT`; canonical contract §3/§4/§12.5 edits, including the allowlist line for T7's native Level Zero event-pool site, next to the `HOST_CPU` wrapper (§3.3, r5 m-15) | - | a host test that requests `HOST_CPU` under `RLIMIT_MEMLOCK` = 1 page and expects the typed refusal `host-cpu-lock-failed` naming `errno` and the bytes; a census test that a `HOST_CPU` allocation appears in the registry and the shutdown census | header change first: every other ticket includes it |
 | T2 | the process-global host ledger: one budget function, pools capped by their sum, `NO_PINNED` and `RESERVE_MB` semantics, `host_planned_bytes` per §4.2, the plan's host fields, `host-budget-exceeded`, `[HOST-PLAN-BUG]` | phase (a): T1 and **`llama.cpp-rnh3`**, computed through the functions `llama.cpp-7v5c` runs; **not** sgc5, moua or zhcn (*lead ruling §D6*, I-3). Phase (b) adds **`llama.cpp-sgc5`** (one zone set per plan), `llama.cpp-moua` (the shared publish struct and lifetime order), `llama.cpp-zhcn` (the `SYCL_Host` compute buffer as a planned tenant) and `llama.cpp-s4ip` (lever (s), for the regression gates' expected bytes) | **phase (a), WARN-only** (*lead ruling §T6*, m-2): a planner fixture whose host weights exceed the budget expects the load to proceed and one would-refuse WARN line carrying each term and the plan's number, and no refusal; a Q2_K-shaped fixture expects `host_planned_bytes`' zone terms to equal what `populate_host_zone_sizing` and the `configure_host_zones` sizing return for the same inventory, the expected bytes **derived from those functions, never a literal** (*lead ruling §D5*): with the ring, `dma_staging_pool` and the RUNTIME pool included, `cpu_quant_buffer_bytes` excluded, and `pp_moe_onednn_scratch_bytes == 0` and `dma_staging_pool` absent from host SCRATCH, the RUNTIME pool and the device once `s4ip` lands; and, because that equality can only fail by a term's absence (m-3), a **plan-against-committed mutant**: a fixture that commits one pool chunk the plan does not count must give `[HOST-PLAN-BUG]` naming both numbers (§10's ledger check). **Phase (b), enforcing:** the same over-budget fixture expects `host-budget-exceeded` with each term, not the WARN; a `PER_DEVICE` fixture with two caches expects their pools capped by the **sum**; a fixture whose pre-allocation runs short expects the refusal, not the WARN (§4.2) | **changes behaviour for every model.** Lands in two phases (*lead ruling §D6*, I-3): (a) WARN-only, the single ledger logging what it would refuse, now (*lead ruling §T3*, (c)), and all `9g22`'s phase-1 gates (its T13) need; (b) enforcing, with the sum cap, only after the regression gates pass: GPT-OSS 120B (host experts, `level_zero:0`), Qwen3.5-35B-A3B on the B50, the `glkg` 1% VRAM fixture, and the Mistral gate, all still admitted (GPU) |
-| T3 | `placement_lazy_table_info` inventory class, excluded from `max_tensor` and every inventory maximum; the residency decision (§4.3); the plan lines (§10) | T2, **`llama.cpp-7v5c`** (the joint placement is its computation, §4.3 step 5) and, for step 5's cold set, **`llama.cpp-yl3v`** | a Q2_K-shaped inventory fixture with its two tables asserts STAGING and SCRATCH equal to `populate_host_zone_sizing()`'s result for the same inventory without the tables (derived, not a literal; a counted table adds at least twice its bytes, §4.1). The residency decision is driven by a synthetic `MemAvailable_pre`, not a budget, and must take **both branches** (*lead ruling §T6*, m-5): the DeepSeek fixture at the lowest §4.5 reading gives both tables STORAGE, and at a synthetic `MemAvailable_pre` above the one-table threshold (§4.5, ~232 GiB) gives `blk.1` HOST (the tie-break of §4.3 step 4: ascending `consumer_layer`) and `blk.14` STORAGE; a Qwen flip pair at `MemAvailable_pre` = the fixture's own P3 threshold (`expected_host + 5 + 24`, computed by the fixture from its inventory, never taken from §4.5's hand band) minus and plus 1 GiB gives STORAGE and HOST. A stub that never returns HOST fails the second and third (r4 m-8) | |
+| T3 | `placement_lazy_table_info` inventory class, excluded from `max_tensor` and every inventory maximum; the residency decision (§4.3); the plan lines (§10) | T2, **`llama.cpp-7v5c`** (the joint placement is its computation, §4.3 step 5) and, for step 5's cold set, **`llama.cpp-yl3v`** | a Q2_K-shaped inventory fixture with its two tables asserts STAGING and SCRATCH equal to `populate_host_zone_sizing()`'s result for the same inventory without the tables (derived, not a literal; a counted table adds at least twice its bytes, §4.1). The residency decision is driven by a synthetic `MemAvailable_pre`, not a budget, and must take **both branches** (*lead ruling §T6*, m-5): the DeepSeek fixture at the lowest §4.5 reading gives both tables STORAGE, and at a synthetic `MemAvailable_pre` 1 GiB above the fixture's own one-table threshold (`expected_host - 2 + one table + 29`, computed from its inventory as the Qwen pair is, never §4.5's hand figure; r5 m-11), which the fixture first asserts lies below its own both-tables threshold (otherwise both tables go HOST), gives `blk.1` HOST (the tie-break of §4.3 step 4: ascending `consumer_layer`) and `blk.14` STORAGE; a Qwen flip pair at `MemAvailable_pre` = the fixture's own P3 threshold (`expected_host + 5 + 24`, computed by the fixture from its inventory, never taken from §4.5's hand band) minus and plus 1 GiB gives STORAGE and HOST. A stub that never returns HOST fails the second and third (r4 m-8) | |
 | T4 | the `lazy_table` object: refcount, descriptor buffer type, HOST body load (eager, locked, D1), STORAGE fd, row cache (CLOCK, sharded, 13.3 B/slot index, 256 MiB yieldable chunks), the activation check | T1, T3 | an activation-check mismatch fixture (one extra chunk) must refuse naming both numbers; a yield fixture must free a chunk with no wait while rows remain gatherable | |
-| T5 | the IO engine: pread pool, the ordering of §5.2.1 (classes, earliest deadline, per-context round-robin, chunking, promotion), in-flight dedup, tickets with epochs, landing slabs, the pool's block ring, the per-`(table, context)` strands and the marker watcher (§5.3), references on every read, join and request | T4 | the cancelled-epoch fixture of §5.3 (slot 0 must hold epoch B's rows exactly); the two ordering witnesses of §5.2.1: the head-of-line backlog shape (P = 12000; the decode ticket within 2x its unloaded latency) and the **separating RED** (the `blk.14` ticket after every queued layer-2-13 chunk, before the layer-20 chunks; it fails under "cold reads lowest", *lead ruling §T8* I-6); the teardown fixture of §5.3 (context A freed with a read in flight that B joined: B's rows arrive, no use-after-free under ASAN or the mock's poisoned slabs, release observed after the read, *§T8* I-7) | CPU-only |
-| T6 | llama side: loader SYCL branch for `TENSOR_READ_LAZY` (independent of `mmap_support`, resolved before upstream's `AUTO`->`OFF`), SYCL device reports `mmap_support = true`, `lazy_table_info` declaration, `build_lazy_get_rows` + arm C's CPU custom op + `lazy_expand_for_layer` + `lazy_prefetch()` + `lazy_cancel_unenqueued()` on `process_ubatch`'s failure path (§5.3) + the post-build consumer scan, gemma4's const-row input class; qwen4exp and gemma4 declarations | T4, T5, `llama.cpp-n77l` | (a) with `AUTO` and a device reporting `mmap_support = false`, the dual-card config still prints `[PLACEMENT] lazy ... residency=`; (b) a graph with a `ggml_view_1d` of a lazy tensor fails the build naming it | `deepseek41` follows the §9.1 contract in `llama.cpp-9g22`'s own tickets |
+| T5 | the IO engine: pread pool, the ordering of §5.2.1 (classes, the `(epoch, deadline)` key, per-context round-robin, chunking, promotion) and its dispatch log, in-flight dedup, tickets with epochs, gather requests with their cancel flags, landing slabs, the pool's block ring sized from `row_size`, the per-`(table, context)` strands on their own stage executor, the strand's retire of a cancelled epoch, and the marker watcher with its event-pool references (§5.3), references on every read, join and request, the watchdog heartbeat on read completions | T4 | the cancelled-epoch fixture of §5.3 (r5 I-3): **B's completions released first, then A's**, slot 0 holds B's rows exactly and A's appear only in the cache; positive control, the pre-registered mutant without the reaper's epoch and cancel check, shows A's rows in slot 0. The three ordering witnesses of §5.2.1, scored on the dispatch log: the head-of-line backlog shape (P = 12000; the decode ticket within its no-backlog latency plus one QD64 read's p99, both measured in the run, r5 m-5), the **separating RED** (every `blk.14` read dispatched after every queued layer-2-13 chunk and before the still-queued layer-20 chunks; it fails under "cold reads lowest", *lead ruling §T8* I-6), and the **epoch RED** (epoch `e`'s `blk.14` reads dispatched before epoch `e+1`'s `blk.1` reads; it fails under a deadline-only key, *§T10* I-4). The teardown fixtures of §5.3: context A freed with a read in flight that B joined (B's rows arrive, no use-after-free under ASAN or the mock's poisoned slabs, release observed after the read, *§T8* I-7), and the event arm (the context freed between a signal and its copy's execution; the event pool destroyed only after the copy's marker is observed, *§T10* I-7) | CPU-only |
+| T6 | llama side: loader SYCL branch for `TENSOR_READ_LAZY` (independent of `mmap_support`, resolved before upstream's `AUTO`->`OFF`), SYCL device reports `mmap_support = true`, `lazy_table_info` declaration, `build_lazy_get_rows` + arm C's CPU custom op + `lazy_expand_for_layer` + `lazy_prefetch()` + `lazy_cancel_unenqueued()` on `process_ubatch`'s failure path (§5.3) + the lazy teardown as `~llama_context`'s first statement, before its `synchronize()` (§5.3, *lead ruling §T10* I-7) + the post-build consumer scan, gemma4's const-row input class; qwen4exp and gemma4 declarations | T4, T5, `llama.cpp-n77l` | (a) with `AUTO` and a device reporting `mmap_support = false`, the dual-card config still prints `[PLACEMENT] lazy ... residency=`; (b) a graph with a `ggml_view_1d` of a lazy tensor fails the build naming it | `deepseek41` follows the §9.1 contract in `llama.cpp-9g22`'s own tickets |
 | T6b | llama handling of the descriptor buffer: memory breakdown and model size report resident bytes, `load_all_data` skips the tensor in its mapping branch, including the mlock growth there (`694ec2354 src/llama-model-loader.cpp:1640-1662`, whose `lazy.has(cur)` tests the mmap lazy set this design no longer fills) | T6 | a load of a lazy-table fixture reports model size equal to the resident bytes, and `load_all_data` reads zero bytes of the table | |
-| T7 | the SYCL-owned gather for **both residencies** under D6-M(b) (*lead ruling §T8*): lazy `GET_ROWS` recognition, the epoch ring (ids captures, marker words, host-signalled events and their reset rule), the worker's dequant and signal, the explicit H2D copy on the event, the cancellation and exhaustion paths (§5.3), the "sources not staged" predicate split agreed with zhcn (§7.2), fusion exclusion, the record-mode segment boundary (§7.4), the engram controls `GGML_SYCL_LAZY_CONTROL*` (§7.4; listed in `sycl-env-vars.md`), the `lazy_output_copies`, `lazy_zero_copy_reads` (resolved-pointer, and arm C's own range), `copy_submit_*`, `slot_*`, `epoch_*` counters | T5, T6; `llama.cpp-zhcn` for the predicate split and the host-memory check | **first the five probes HT-1..HT-5 (§7.2), lead-run, GPU**; then: (1) the §7.3 zero-copy fixture (fails first with `lazy_output_copies == 0`; positive control: the pre-registered aliasing mutant, `lazy_zero_copy_reads >= 1` per graph; arm C's own mutant likewise); (2) **the dense held-copy fixture** (*§T8* I-1): a dense graph, gemma4-shaped with `-lzm on`, of >= 3 ubatches in one decode, with one lazy gather, `GGML_SYCL_DISABLE_GRAPH=1`, and copy 0 held behind a test-controlled event. Its RED is rev 2d's L-dependent form, which aborts at `prefetch(2)`. GREEN completes with rows equal to CPU `get_rows` for every ubatch and no abort. Pre-registered 60 s timeout, so an implementation that waits fails instead of hanging; (3) **the ids-capture race fixture** (*§T8* I-4): a dense 2-ubatch fixture whose test hook holds the worker's gather for ubatch 0 until `set_input(1)` has returned. The pre-registered result: an in-place mutant, reading the rows input instead of the ring entry, gathers ubatch 1's rows for ubatch 0 (a mismatch against CPU `get_rows`), and the ring build matches. Two ubatches touch no slot reuse, and a dense graph has no lockstep for the hold to deadlock against; (4) **the recoverable-failure fixture** (*§T8* I-2): a test hook throws `ggml_sycl_fallback_error` in block 0 of ubatch `k`, after its prefetch. `llama_decode` returns its recoverable error with no abort; the next three ubatches complete with correct rows; `epochs_cancelled == 1`; and no slot is written while the cancelled epoch's stage is in it (the strand order, checked by a slot-owner assertion in the mock); (5) the exhaustion fixture: the copies held, `D + 1` prefetches, and the last one refused as `lazy-epoch-ring-exhausted` with a recoverable status, within a 60 s timeout; (6) a record-mode fixture: a graph with a lazy gather must replay with `seg_replay > 0`, zero futility WARNs, and `lazy_boundary_dispatches == graphs` per table; (7) the §7.4 consumer-copy submit check, per table, with its `hold` and `hold_blocking` controls on a two-table fixture | if a probe fails there is no in-design fallback: it goes to the lead before anything else is built (§7.2) |
+| T7 | the SYCL-owned gather for **both residencies** under D6-M(b) (*lead ruling §T8*): lazy `GET_ROWS` recognition; the epoch ring (ids captures, marker words and their initial seeding, host-signalled events in the refcounted `lazy_event_pool`, the per-copy wrapper, the reset rule); `D = in_flight_depth + 2`, read at the context transaction, and the plan-time guard check (§5.3, *lead ruling §T9a*); the worker's dequant and signal; the explicit H2D copy on the event; the cancellation path (never signalled, retired by the strand) and the `[LAZY-PLAN-BUG]` exhaustion (§5.3); the "sources not staged" predicate split agreed with zhcn (§7.2); fusion exclusion; the record-mode segment boundary and the widened segmented-replay trigger (§7.4); the engram controls `GGML_SYCL_LAZY_CONTROL*` (§7.4; listed in `sycl-env-vars.md`, where `GGML_SYCL_STRICT_LEASES`' row is widened to `[LAZY-PLAN-BUG]`); the `lazy_output_copies`, `lazy_zero_copy_reads` (resolved-pointer, and arm C's own range), `copy_submit_*`, `slot_*`, `epoch_*`, `lazy_graph_direct` and `set_tensor_global_drains` counters, and the test hook that removes the input drain | T5, T6; `llama.cpp-zhcn` for the predicate split and the host-memory check | **first the six probes HT-1..HT-6 (§7.2), lead-run, GPU**, built on `test-fattn-packed-k-lifecycle.cpp:262-342`'s gate class, HT-3 on the production execution queue per device (r5 m-1, m-14). Then the fixtures below. **Every one** runs under a pre-registered 60 s timeout with `GGML_SYCL_OP_TIMEOUT_MS=120000`, so the watchdog cannot fire first and an `rc=1` stays unambiguous, and with `GGML_SYCL_DISABLE_GRAPH=1` unless it is about record mode (r5 m-6): (1) the §7.3 zero-copy fixture (fails first with `lazy_output_copies == 0`; positive control: the pre-registered aliasing mutant, `lazy_zero_copy_reads >= 1` per graph; arm C's own mutant likewise); (2) **the dense held-copy fixture** (*§T8* I-1, r5 m-7): a dense graph, gemma4-shaped with `-lzm on`, of exactly `D` = 3 ubatches in one decode, with one lazy gather, and copy 0 held behind a test-controlled event. It uses the drain-removal hook, since the drain would otherwise hold `set_inputs(1)` until copy 0 completes. The pre-registered RED is a mutant in rev 2d's form, whose `prefetch` treats an unset marker two epochs back as overrun: it aborts at `prefetch(2)`. GREEN completes with rows equal to CPU `get_rows` for every ubatch, with no abort and no exhaustion. Positive control: a mutant whose stage 2 skips the "copy `e-2` completed" guard overwrites output slot 0 while copy 0 is held, so ubatch 0's rows mismatch; (3) **the ids-capture race fixture** (*§T8* I-4): a dense 2-ubatch fixture, with the drain-removal hook for the same reason, whose test hook holds the worker's gather for ubatch 0 until `set_input(1)` has returned. The pre-registered result: an in-place mutant, reading the rows input instead of the ring entry, gathers ubatch 1's rows for ubatch 0 (a mismatch against CPU `get_rows`), and the ring build matches; (4) **the recoverable-failure fixture** (*§T8* I-2, r5 m-6): a test hook throws `ggml_sycl_fallback_error` in ubatch `k` after its prefetch and **before the first reader of the gather's `dst`**, so before its step-3 copy is enqueued (gemma4 reads the PLE before layer 0, `694ec2354 src/models/gemma4.cpp:176-181`, so "in block 0" would be too late). `llama_decode` returns its failure status with no abort; the next three ubatches complete with correct rows; `epochs_cancelled == 1`; no slot is written while the cancelled epoch's stage is in it (a slot-owner assertion in the mock). **The enqueued arm** throws after the copy is enqueued: `epochs_cancelled == 0`, and the next ubatches are correct. **The retire arm** (r5 I-2): with the drain-removal hook, wait until copies up to `e-1` have completed, cancel `e`, hold the strand's stage for `e` and stage 2 of `e+D`, and drive `D` more epochs. The build must report `[LAZY-PLAN-BUG]` at `prefetch(e+D)` (STRICT off: -3, `epoch_ring_exhausted == 1`) and enqueue no copy `e+D`. The pre-registered mutant, which writes `e | CANCELLED` from the host and signals the event on cancel, lets copy `e+D` complete while stage 2 of `e+D` is still held, so its rows mismatch; (5) **the public-API exhaustion fixture** (*§T9a*, *§T10* I-1): `llama_decode` through the public API with no output read between calls, `GGML_SYCL_LAZY_CONTROL=hold` with `HOLD_MS=5000` engaged after 8 warm ubatches, `n_ubatch` 16 and `n_batch` 32. Two shapes: at least `2 x D` single-batch decodes, and **the llama-server shape**, one 80-token prompt (more than `2 x n_batch`) split into `n_batch` decodes with logits only on the last token of the last one. GREEN, on today's code: no exhaustion over every ubatch, and `set_tensor_global_drains` rises by at least one per ubatch. RED: the same runs with the test hook that removes the drain (no variable reaches no drain) report `[LAZY-PLAN-BUG] epoch ring exhausted` at the (`D`+1)-th ubatch after the hold engages, with -3 and `epoch_ring_exhausted == 1` (STRICT off). **The plan-time RED**: a fixture graph whose per-ubatch inputs are all host-resident is refused at context creation with `[LAZY-PLAN-BUG]` naming the missing guard; (6) **the record-mode fixture** (*§T10* I-5), two arms, a MoE graph and the dense gemma4 shape, each with a lazy gather and `GGML_SYCL_GRAPH_DIAG=1`: `seg_replay > 0`, zero futility WARNs, `lazy_boundary_dispatches == graphs` per table, and `lazy_graph_direct == 0`; (7) the §7.4 consumer-copy submit check, per table, with its `hold` and `hold_blocking` controls on a two-table fixture, after at least 8 warm ubatches (r5 m-8) | if one of HT-1..HT-5 fails there is no in-design fallback: it goes to the lead before anything else is built. HT-6's result goes to the lead whatever it is (§7.2) |
 | T8 | counters (unconditional), their definitions (§10), and CPU-only unit tests, with both hash harnesses of Appendix B as fixtures | T5, T6 | a counter test where a repeated row in one ubatch counts as a join and a hit, and a same-block different row counts as a miss with no extra read | |
 | T9q | Qwen acceptance against §8.2-8.3: H, S-cold, S-warm, S-hot, the correctness gate, the positive and negative controls, the engine ratio (GPU) | T7, T8 | an `--lazy-mode off` run must fail the engagement check (the negative control proves the check can fail) | |
 | T10 | `peek_rows` lookahead (class 1, into the row cache only; §5.4, §7.2) | T9q | a lookahead fixture where rows missed by ubatch `k` and `k+1` are read once; and, with every ring entry's copy held, lookahead for `k+1` still issues its class-1 reads and writes no slot, no ring entry and no marker (*lead ruling §T8*, I-3) | required for DeepSeek (D9) |
@@ -2767,15 +3001,26 @@ Each ticket names the RED that must fail before its code exists (*lead ruling
 - `llama.cpp-zhcn`: the `SYCL_Host` compute buffer as a planned host tenant;
   T2 phase (b).
 - `llama.cpp-n77l`: the upstream merge that brings `TENSOR_READ_LAZY`; T6.
-- `llama.cpp-x1xd` and `llama.cpp-jhxq`: not on this design's path (§5.3); they
-  stay open for the paths that do reach them.
+- `llama.cpp-x1xd`: not on this design's path (§5.3); it stays open for the
+  paths that do reach it.
+- `llama.cpp-jhxq`: its split-input copy sites are not on this design's path
+  either, but its site (4), the start-of-graph input drain, is the guard that
+  bounds the epoch ring (§5.3; the relay above).
 - `llama.cpp-54sf0`: owns the MoE path's existing submitter waits (§7.2).
   Nothing in this design relies on them any more, so the dependency edge that
   *lead ruling §T7* 1 asked for is **withdrawn** for th32 (*§T8* I-1).
 
-**Relays to `9g22`** (for its rev 10, through the lead, *lead ruling §T8*):
-- re-pin th32 at rev 2e;
-- HT-1..HT-5;
+**Relays to `9g22`** (through the lead, *lead rulings §T8, §T10*):
+- re-pin th32 at rev 2f;
+- HT-1..HT-6; HT-6, the long hold, matters more to its cold path, which
+  parks the device longer;
+- **the watchdog rule** (§5.3, *§T10* I-6 (a)): a stall is no device progress
+  and no IO-engine progress for the timeout. Its cold path has the same
+  exposure at a larger size;
+- a cancelled, never-enqueued epoch is never signalled, and its strand, not
+  the submitter, retires the ring entry (§5.3, *§T10* I-2);
+- class 0 is keyed `(epoch, deadline)`, and a cold slice takes the epoch of
+  the ubatch that routed it (§5.2.1, *§T10* I-4);
 - the refill uses "the marker word", not "the marker event";
 - its site row 2 (a HOST output in the `SYCL_Host` buffer) is rev 2a's form;
 - adopt the shared D6-M(b) refill, and re-evaluate its own
@@ -2785,6 +3030,12 @@ Each ticket names the RED that must fail before its code exists (*lead ruling
 
 **Relay to `zhcn`:** split `ggml_sycl_node_is_host_dispatched()` into "sources
 not staged" and "intercepted by the funnel" before T7 (§7.2, r4 m-12).
+
+**Relay to `jhxq`'s successor** (*lead ruling §T9a*): any event-ordered
+replacement of the start-of-graph input drain must publish the context's
+in-flight ubatch depth as a planned quantity, which th32's `D` reads (§5.3).
+
+**Alongside, outside the table:**
 - `llama.cpp-yl3v`: cold routed experts on STORAGE, executed by the CPU,
   brought forward to Q2_K phase 1 by owner §D4 (§9.2). It uses T5's engine
   and T2's ledger through the interface of §9.2; T9d waits for it.
@@ -2889,8 +3140,8 @@ its mechanism is D6-M. th32 owns the op; `llama.cpp-9g22` consumes it through
 **D6-M. The mechanism under D6(c). Ruled (b)** (*lead ruling §T8*, amending
 *§T2*'s "(a), with (b) as the fallback"; *§D6a* makes (b) mandatory for
 `9g22`'s cold path, and §T8 makes it the one mechanism for every lazy-table
-refill, every model and every depth). §7.2 pre-registers five probes
-(HT-1..HT-5) of the interop it needs.
+refill, every model and every depth). §7.2 pre-registers six probes
+(HT-1..HT-6) of the interop it needs; HT-6's result goes to the lead.
 - a) **Superseded** (*§T8*): `host_task`. Under rev 2d it needed invariant L,
   which dense graphs, recoverable failures and lookahead each break (r4 I-1,
   I-2, I-3).
@@ -2955,7 +3206,7 @@ lead's separate ticket.
   body into the output slot, and the step-3 copy moves it. The copy's source
   is guarded on the worker's own thread (§5.3, stage 2), so nothing waits on
   the submitting thread. It is what §T2's "one code path for both tiers"
-  reads as, and HOST depends on HT-1..HT-5 like STORAGE.
+  reads as, and HOST depends on HT-1..HT-6 like STORAGE.
 - b) Keep C2's form: the CPU op in the leading split, and the SYCL backend
   copies its output from the `SYCL_Host` compute buffer before the consumer.
   Nothing orders ubatch `k+1`'s CPU op after ubatch `k`'s copy in a
@@ -2964,21 +3215,40 @@ lead's separate ticket.
   offer as a baseline. Arm C (§8.4) runs exactly this form, as a comparison
   arm.
 
-**DQ-E. What bounds the epoch ring? Proposed, for the lead** (rev 2e). Any
-finite submitter-side state has to be bounded somehow, and the submitter may
-not wait on the device. So one of three things must give: a wait, unbounded
-memory, or a refusal. This design proposes:
-- **(a, proposed)** Plan `D = 2 x ceil(n_batch / n_ubatch) + 2` entries, a
-  few hundred KiB per table. Refuse the ubatch by name, recoverably,
-  on the rare exhaustion (`lazy-epoch-ring-exhausted`, §5.3). That takes a
-  caller more than two full batches ahead of the device with no output read.
-- b) A larger `D` shrinks that case further, but does not remove it.
-- c) A wait on the submitter is the host wait §T6 I-2 forbids.
+**DQ-E. What bounds the epoch ring? Ruled** (*lead rulings §T9, §T9a* and
+its follow-up, *§T10* I-1). The caller's run-ahead is bounded by the RAW
+guard on graph inputs, today the `set_tensor` GLOBAL drain, which gives an
+in-flight depth of 1. That depth is one planned quantity owned by whatever
+enforces the guard; th32 reads it. `D = in_flight_depth + 2` with margin 0
+(`D` = 3 today), because with plan == reality a margin would only hide a wrong
+depth fact. Exhaustion is `[LAZY-PLAN-BUG]`: a STRICT abort, otherwise a WARN
+and a fatal -3. Rev 2e's recoverable `lazy-epoch-ring-exhausted` is rejected,
+because `llama_decode`'s contract has no recoverable return for it. The
+plan-time check names the device-resident input that carries the guard, and
+the public-API fixture, llama-server's shape included, shows exhaustion
+unreachable on today's code (§5.3, T7 (5)). A replacement of the drain must
+publish its depth (§11). No host wait is added.
+
+**DQ-F. The cancelled-epoch window. Proposed, for the lead** (rev 2f; found
+folding r5 I-2). The guard bounds device work, and a cancelled epoch has none,
+so its ring entry is freed by the strand's retire, not by the guard (§5.3).
+The window is one stage-executor pickup, and reaching exhaustion through it
+needs the `D-1` epochs after it cancelled too, each a whole failed
+`llama_decode`, inside that pickup.
+- **(a, rec)** The stage executor runs a cancelled epoch's stage ahead of
+  other ready stages, and the window stays `[LAZY-PLAN-BUG]` like any other
+  exhaustion. T7 (4)'s retire arm shows the entry is not taken over early.
+- b) Count cancelled-but-unretired epochs into the depth and plan `D` for
+  them. There is no planned bound on consecutive failures to count, so this
+  only moves the question.
+- c) The submitter retires the epoch itself. That reopens r5 I-2's race and
+  contradicts *§T10* I-2.
 
 **D9. Lookahead in v1 for STORAGE-bound models? Ruled (a)** (*lead ruling
 §T2*).
 - a) **(ruled)** Yes for DeepSeek: T10 lands before T9d. Its tables are always
-  on STORAGE here, and a cold PP512 ubatch is ~3.5-4.4 s of IO that, without
+  on STORAGE here, and a cold PP512 ubatch is ~2.5-3.5 s of IO at the
+  measured rates (§0; §8.4's S-cold bound allows up to 4.4 s) that, without
   lookahead, only `blk.14`'s window can partly hide.
 - b) Keep lookahead as phase 2 for every model.
 

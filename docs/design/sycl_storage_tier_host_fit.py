@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Host-fit calculator behind docs/design/sycl-storage-tier-lazy-tables.md §4.5
-# (llama.cpp-th32, rev 2e). Hand arithmetic only: llama.cpp-7v5c (T27's
+# (llama.cpp-th32, rev 2f). Hand arithmetic only: llama.cpp-7v5c (T27's
 # host-only plan dry-run) replaces every number here once it exists.
 #
 #   python3 docs/design/sycl_storage_tier_host_fit.py
@@ -15,9 +15,10 @@ OS_RESERVE = 8.0            # max(8 GiB, MemTotal/32), unified-cache.cpp:4216
 P3_MARGIN = 29.0            # 9g22 §4.5.2: MemAvailable_pre - expected_host - 5 >= 24
 ENVELOPE = 2.5              # host_reserve 2 GiB + context envelope <= 0.5 (§4.3 step 3)
 GATE_CACHES = 4.0           # 2 GiB per table, index included, two tables (9g22 P1, lead ruling T5)
-DRAFT = 7.9                 # the DSpark draft's own HOST bytes only (9g22 §10.3). Its cold-set
-                            # effect (it also displaces device experts) is 9g22 rev 7 §4.5.2's
-                            # figure, which the doc links and this calculator does not model.
+DRAFT = 10.0                # the DSpark draft's host effect on phase 1: its ~7.9 GiB of weights are
+                            # DEVICE demand, and with its ring (+2.1 over the RUNTIME floor) they
+                            # move ~10.0 GiB of experts to the host (9g22 rev 9 §4.5.2, its
+                            # l.1601-1603). What that does to the cold set is 9g22's figure.
 RUNTIME_FLOOR = 0.5         # the VRAM RUNTIME zone's 512 MiB floor (9g22 rev 7 r4 m4)
 DS_TABLE = 60.08 / 2        # one DeepSeek engram table, GiB
 DS_LAYER_EXPERTS = 4.58     # routed-expert bytes per DeepSeek layer, GiB
@@ -164,7 +165,7 @@ def main():
         A = (s[0] + ENVELOPE, s[1] + ENVELOPE)
         show("A phase 1, no draft, floor caches", A)
         show("B A + gate caches (2 x 2 GiB)", (A[0] + GATE_CACHES, A[1] + GATE_CACHES))
-        show("C A + DSpark draft", (A[0] + DRAFT, A[1] + DRAFT))
+        show("C A + DSpark draft (displaced experts)", (A[0] + DRAFT, A[1] + DRAFT))
         if not today:
             s2 = step2(two_s, z, 0.0)
             D = (s2[0] + ENVELOPE, s2[1] + ENVELOPE)
