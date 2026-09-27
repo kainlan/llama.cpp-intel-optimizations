@@ -115,7 +115,8 @@ Design, revision 7.14k. Author: impl-moua, 2026-09-27. The revisions answer nine
 - design review r18 (design-moua-r18 on `c345ddae5..e1b904771`: 1 Critical, 2 Important, 9
   Minor), the lead's rulings on it (§M44, which supersedes §M42 (3) and §M43's scoring tree),
   §M43 (the C-rule arm on 7.14j), and zhcn 5.18's relays (§Z24.3, with §Z22's amendment),
-  recorded in §6.27. Revision 7.14k is one commit on top of 7.14j (`e1b904771`).
+  recorded in §6.27. Revision 7.14k is two commits on top of 7.14j (`e1b904771`): `bc80a697f`
+  and a follow-up for the r18 addendum and §M44b.
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
@@ -3057,7 +3058,9 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         `fattn-onednn.cpp:115-116`, so a model whose attention has sinks gets G = 0. It charges
         only in master's floor path and needs none of L4-L7. At `-c 4096` it takes GPT-OSS
         120B's G from 805306368 B to 0 B, and Qwen's stays 201326592 B. It is interim, and it
-        goes with the floor function in (b2);
+        goes with the floor function in (b2). **(b1) converts nothing (23mk §6.8's scoping
+        note, mirrored; rulings §M44b):** the commit that converts the Graph scratch is (b2),
+        and H7ap's C-rule arm targets the tree after (b2);
       - **(b2), after moua L6:** the `REGION` conversion, an ordinary conversion under §2.4.3's
         transition rule: the charge at the context transaction, moua's fit placing the slot, the
         step-5 record under `ONEDNN_GRAPH_SCRATCH`, the draw through `allocate_within`, and the
@@ -3090,7 +3093,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           `ggml/src/ggml-sycl/tests/test-unified-runtime-alloc.cpp:996`, "inventory would exceed
           the conservative ONEDNN tail bound", reads the W getter, since it bounds the
           load-stage tail.
-      **The order is (b1) → moua L4 and moua L6 → (b2) (rulings §M44 C-1),** so no landing
+      **The order is (b1) → L4 → L6 → (b2) (rulings §M44 C-1, §M44b; L4 and L6 are one commit,
+      §4),** so no landing
       leaves a gap (the floor gone, the charge not yet landed) or a double charge. **Between
       L4+L6 and (b2)** step 4 sizes ONEDNN as master does, less the constant, over the ledger:
       `min(charged_ONEDNN + G, max(available / 4, charged_ONEDNN))`, where G is (b1)'s
@@ -7111,7 +7115,20 @@ means that.
       `n_head_ctx_max` 64 with no sinks input, so G is 805306368 B, ONEDNN 828899328 B and the
       weight zone 13398278144 − k × 1024 B; the exact ONEDNN bytes catch it, and the arm's
       message names G. 7.14j's order check for the hard edge is withdrawn with the edge (rulings
-      §M44 C-1); (b2) cannot land before L6, whose steps it calls.
+      §M44 C-1); (b2) cannot land before L6, whose steps it calls. **Per step (rulings §M44b
+      (4); 23mk's relay), ONEDNN on the two gates, each figure exact:**
+
+      | step | GPT-OSS 120B ONEDNN | moved | Qwen ONEDNN | moved |
+      |---|---|---|---|---|
+      | master, and after (b1) | 268435456 B | — | 268435456 B | — |
+      | L4+L6 (W + G) | 23592960 B (G = 0) | −244842496 B | 234881024 B | −33554432 B |
+      | (b2) (W) | 23592960 B | 0 B | 33554432 B | −201326592 B |
+
+      So all of GPT-OSS 120B's 244842496 B gain lands at L6, and (b2) moves it by 0; Qwen gains
+      33554432 B at L6 and 201326592 B at (b2). The weight zone moves by the same bytes each
+      step, and the end states do not change. (b1) moves neither gate's ONEDNN: master's load
+      stage ensures 268435456 B on both before and after it (the Graph-scratch commit, above);
+      the L6 row is this arm's, the (b2) row the (b2) arm's.
       **SCRATCH**, from the commit
       that converts the last untermed census row (the end states): after step 4 SCRATCH is
       exactly the ledger's SCRATCH terms, and `ggml_sycl_compute_arena_bytes()` returns that
@@ -7247,31 +7264,41 @@ means that.
       and G > 0, with the Graph allocator on and the fixture's attention shape published. Since
       (b1) makes G sinks-aware, the fixture's attention is a non-sinks shape the SDPA route
       accepts, as Qwen's is, so G > 0; a sinks shape gives G = 0 and the arm is VOID (rulings
-      §M44 addendum). The arm pre-registers its witness values on that shape. 7.14e's arm
-      deleted W's source, so the W getter read 0 and the mutant fired only if G exceeded W,
-      which the fixture did not assert. With both held it fires the same witness on the same
-      fixture, naming ONEDNN and G's bytes. (Citing the getter's body alone would mutate code
-      the load path no longer executes, and the arm would be void.) On the correct tree the same
-      fixture's load-stage ONEDNN zone is exactly `onednn_pp_w` B, which the fixture's W ≥ 256
-      MiB makes equal to the `max(268435456, onednn_pp_w)` form (rulings §M29a, §M44 C-1), and
-      its weight zone is larger than master's by exactly master's ONEDNN zone minus that, where
+      §M44 addendum). **Its witness values, pre-registered on that shape (rulings §M44
+      addendum):** the fixture publishes the Qwen gate's attention shape at `-c 4096 -ub 512`,
+      for which 23mk's function gives G = 201326592 B (the positive control of rulings §M44b
+      (2)), beside the eligible weight with K = 8192 and N = 18432, so W = 8192 · 18432 · 2 =
+      301989888 B. Step 4 ensures ONEDNN at 301989888 B from the ledger; the mutant's dry run
+      sizes it at 301989888 + 201326592 = 503316480 B, so its one outcome, with
+      `GGML_SYCL_WITNESS_CHECKS=1`, is the witness naming ONEDNN and 201326592 B of growth. On a
+      sinks shape (GPT-OSS's) G is 0, the dry run equals step 4, and the arm is VOID, never a
+      pass. 7.14e's arm deleted W's source, so the W getter read 0 and the mutant fired only if
+      G exceeded W, which the fixture did not assert. With both held it fires the same witness
+      on the same fixture, naming ONEDNN and G's bytes. (Citing the getter's body alone would
+      mutate code the load path no longer executes, and the arm would be void.) On the correct
+      tree the same fixture's load-stage ONEDNN zone is exactly `onednn_pp_w` B, which the
+      fixture's W ≥ 256 MiB makes equal to the `max(268435456, onednn_pp_w)` form (rulings
+      §M29a, §M44 C-1), and its weight zone is larger than master's by exactly master's ONEDNN
+      zone minus that, where
       **master's zone is read from master's own ensure on the same fixture**, clamp included
       (`min(with_floor, max(available / 4, stored))`, `unified-cache.cpp:4476-4500`), never the
       unclamped with-floor sum (r14 m-15 (b)); the arm also asserts master logged no clamp WARN
       (`[VRAM-ARENA] planned ONEDNN zone ... clamping`) on the fixture, or it uses the clamped
-      figure. Both are scored in bytes (rulings §M21.3); on the merge-gate shapes that
-      difference is the floor's 244842496 B on GPT-OSS 120B and 234881024 B on Qwen (§2.4.2 (b),
-      "The end states"). A context on the same fixture then places the graph scratch once, as a
-      head slot inside its `REGION` ranges, and no zone grows after the load (rulings §M25 I-6;
-      23mk's transaction does the charge, and this arm asserts only the room). **The placement
-      witness is 23mk's commit line (rulings §M30, §V16a):** `[CONTEXT-PLAN] graph scratch
-      range: ctx=%u dev=%d term=ONEDNN_GRAPH_SCRATCH backing=%s offset=%zu bytes=%zu`, printed
-      by 23mk at its context-transaction commit, whose offset lies inside the context's `REGION`
-      ranges and whose bytes equal 23mk's value function; a missing line makes the arm VOID,
-      never a pass. The range is recorded at step 5 under its own `ONEDNN_GRAPH_SCRATCH` pending
-      term, not carved at step 6 (§2.4.2). 7.14 pre-registered this mutant with 96 MB on
-      GPT-OSS's shape, where it cannot fire, for the reason above. The source-contract gate
-      fails on a `unified_cache_set_planned_*` setter with no enum value;
+      figure. Both are scored in bytes (rulings §M21.3). On the fixture, where master's ensure
+      logs no clamp WARN, master's zone is W + G = 503316480 B, so the correct tree's weight
+      zone is larger by 201326592 B; on the merge-gate shapes that difference is the floor's
+      244842496 B on GPT-OSS 120B and 234881024 B on Qwen (§2.4.2 (b), "The end states"). A
+      context on the same fixture then places the graph scratch once, as a head slot inside its
+      `REGION` ranges, and no zone grows after the load (rulings §M25 I-6; 23mk's transaction
+      does the charge, and this arm asserts only the room). **The placement witness is 23mk's
+      commit line (rulings §M30, §V16a):** `[CONTEXT-PLAN] graph scratch range: ctx=%u dev=%d
+      term=ONEDNN_GRAPH_SCRATCH backing=%s offset=%zu bytes=%zu`, printed by 23mk at its
+      context-transaction commit, whose offset lies inside the context's `REGION` ranges and
+      whose bytes equal 23mk's value function; a missing line makes the arm VOID, never a pass.
+      The range is recorded at step 5 under its own `ONEDNN_GRAPH_SCRATCH` pending term, not
+      carved at step 6 (§2.4.2). 7.14 pre-registered this mutant with 96 MB on GPT-OSS's shape,
+      where it cannot fire, for the reason above. The source-contract gate fails on a
+      `unified_cache_set_planned_*` setter with no enum value;
     - **a secondary device is charged its attention shape (r13 I-F (5), m-d; rulings §Z15):** a
       two-device plan whose `dev_layer` puts attention layers on device 1. Step 2 ensures device
       1 before the loop packs, the pack charges `nonfa_shape` to device 1 at the first attention
@@ -8443,7 +8470,9 @@ zhcn 5.16).**
   edge, the whole commit before L4+L6, was cyclic, since the conversion needs L4's pending
   ranges and claims and L6's transaction steps (r18 C-1). The tracker edges are added when the
   implementation tickets are filed, and 23mk's "whichever of moua L4+L6 and the Graph-scratch
-  commit lands later" (23mk 4.11 L3421) is relayed as the split and its two edges.
+  commit lands later" (23mk 4.11 L3421) is relayed as the split and its two edges. The order
+  is fixed as (b1) → L4 → L6 → (b2) (rulings §M44b), and 23mk §6.8's scoping note is mirrored:
+  the converting commit is (b2), and H7ap's C-rule arm targets the tree after it.
 
 **Landing order (lead ruling; r4 I10).** jehw lands on master first (u1bb already has). Then:
 1. moua L1-L3 (pure, host-tested; L1 is done). zhcn and beni need L3's record type,
@@ -8472,7 +8501,7 @@ edge for the strict accessor: every moua commit that calls `ggml_sycl_strict_ena
 after uwlx's merge (rulings §G1c). And fkpg (a) → moua L4 (rulings §M38 C-1; the transport
 carries `n_ctx`, `n_seq_max`, the flash-attention choice and the KV types, rulings §M41 I-3),
 jzvq's host test → moua L4 (rulings §M39 (3)), and 23mk's §11 step 3 → moua L4+L6 (the DECLINE;
-rulings §M36 I-3), and 23mk's (b1) → moua L4 and moua L6 → 23mk's (b2) (rulings §M44 C-1).
+rulings §M36 I-3), and 23mk's (b1) → moua L4 → moua L6 → 23mk's (b2) (rulings §M44 C-1, §M44b).
 
 - L3 through L7 form one series in one worktree, so there is one first build and the
   follow-ups reuse it. L3 lands first on its own; L4-L7 follow, rebased on zhcn and beni's
@@ -10341,6 +10370,14 @@ its RED and its edge; the For-the-lead paragraph) are left as the record of 7.14
 | §Z24.3 | `demoted=%d` on `[FIRST-CONTEXT]` | **Changed.** The line ends `splits_placed=%d demoted=%d`: the entries the probe placement puts on the device and the admitted plan does not. C11 pre-registers 0 on the all-device shapes and records it on the merge gates; zhcn's m-2 VOID check reads it. The canonical string changes once, here. |
 | §Z24.3 | the scope closes before the probe is destroyed | **Changed.** zhcn's measure scope is opened inside the probe guard's scope, so it unwinds first on commit and on every rollback path. |
 | §Z24.3 | the remaining `:2410` | **Confirmed.** Every live `llama-model.cpp:2410` cite (§2.4.2 (b)'s late inventory, `:2408-2410`; the admitting stage; the late check's note that the late inventory runs before the sync) is the late WEIGHT inventory, `llama_model_sycl_set_late_inventory`. The compute check is at `:2556`-`:2557` only. §6.25's zhcn 5.16 row keeps 7.14i's `:2410` as history. |
+
+**The follow-up commit (the r18 addendum; rulings §M44b).**
+
+| item | relay | disposition |
+|---|---|---|
+| r18 addendum; §M44 addendum | re-pre-register the C-rule arm's witness values on a non-sinks shape | **Changed.** The fixture publishes the Qwen gate's attention shape at `-c 4096 -ub 512` (G = 201326592 B) beside W = 301989888 B (K 8192, N 18432). Step 4 ensures ONEDNN at 301989888 B; the mutant's dry run sizes 503316480 B and the witness names ONEDNN and 201326592 B. Master's zone on the fixture, with no clamp WARN, is 503316480 B, so the weight zone difference is 201326592 B. A sinks shape gives G = 0 and VOID. |
+| §M44b (4); 23mk relay | the order and the per-step values | **Changed.** The order reads (b1) → L4 → L6 → (b2) everywhere it is stated (L4 and L6 one commit). The floors arm pre-registers ONEDNN per step: GPT-OSS 120B 268435456 → 23592960 B at L6 (all 244842496 B), 0 at (b2); Qwen 268435456 → 234881024 B at L6 (33554432 B), → 33554432 B at (b2) (201326592 B). End states unchanged. |
+| §M44b; 23mk §6.8 | the scoping note | **Mirrored.** (b1) converts nothing; the converting commit is (b2), and H7ap's C-rule arm targets the tree after it (the Graph-scratch commit's (b1) bullet and §4). |
 
 **Relays.**
 - **23mk:** L3421's "whichever lands later" becomes the (b1)/(b2) split with the two edges, (b1)
