@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14s, by impl-moua, 2026-09-27. The revisions answer twenty-seven reviews:
+Design, revision 7.14t, by impl-moua, 2026-09-27. The revisions answer twenty-eight reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -155,8 +155,12 @@ Design, revision 7.14s, by impl-moua, 2026-09-27. The revisions answer twenty-se
   path's deletion), §M70 with its amendment (what a runtime ONEDNN-zone miss does from (b1)
   on), §M71 (the decline lines and their admission witness) and §M72 (the TERMINAL channel
   aborts), recorded in §6.35. Revision 7.14s is three commits on top of 7.14r (`038f698bd`):
-  `65300ce1a`, `7391f5e36` (the §M70 amendment, §M71 and §M72) and a second follow-up (the
-  §6.35 rows in final form).
+  `65300ce1a`, `7391f5e36` (the §M70 amendment, §M71 and §M72) and `b225d81e3` (the §6.35 rows
+  in final form).
+- design review r27 (design-moua-r27 on `f2323f9e0..7391f5e36`: 0 Critical, 2 Important, 9
+  Minor, 5 nits), rulings §M73 (the load envelope c(P) is trimmed at the context transaction)
+  and the §M71 (a) amendment, recorded in §6.36. Revision 7.14t is one commit on top of
+  `b225d81e3`.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -169,9 +173,9 @@ one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2,
 §V15, §V15a, §V16, §V16a, §M34, §M35, §G1, §G1a, §V17, §M36, §M37, §Z20, §M38, §G1b, §M39, §G1c,
 §M40, §M41, §Z-23mk-411, §M42, §Z21, §Z23, §Z22, §M43, §M44, §Z24, §Z26, §M45, §M46, §M46b,
 §Z28, §M47, §M47a, §M48, §M49, §F3, §M50, §M51, §M52, §M53, §M56, §M59, §M60, §M61, §M62, §M63,
-§M64, §M66, §M67, §M68, §M70, §M71, §M72). §M11a is a relay line inside §Z8, not a section, and
-is cited as §Z8 I-2 (r12 m-14). This document cites it as "rulings §X". **Where this document
-paraphrases a ruling and differs from the file, the file wins.**
+§M64, §M66, §M67, §M68, §M70, §M71, §M72, §M73). §M11a is a relay line inside §Z8, not a
+section, and is cited as §Z8 I-2 (r12 m-14). This document cites it as "rulings §X". **Where
+this document paraphrases a ruling and differs from the file, the file wins.**
 
 Revisions cited:
 - **Current master is `3d9414c8c`, which contains jehw and u1bb** (jehw landed). Revision 7.6
@@ -2546,16 +2550,33 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    and returns, and counts `w_order_wait_exhausted`
                    (`GGML_SYCL_PRIVATE_TESTING`). A correct run then has twice its measured
                    worst tail before the fault, so a fault means a lost publisher, not a slow
-                   one. A publisher that finds the fault set does not publish, so every later
-                   waiter also reaches its cap, and `ggml_backend_sycl_synchronize` reads the
-                   fault word after its wait and aborts with
-                   `[W-ORDER] marker wait capped on device %d: W ordering lost`. A capped wait
-                   therefore never lets a run finish silently, since proceeding silently is the
-                   W race. A scope guard submits the publisher, so a throwing step still
-                   publishes after the last event it returned. **Cost:** K + 1 single-work-item
-                   kernels per eager W use (the waiter chain and the publisher), one use per
-                   oneDNN PP `MUL_MAT`, and K + 1 per replay; C6's PP ABBA arms score it, with K
-                   as G0 printed it.
+                   one. **That holds inside the measured shapes only, and the bound is stated
+                   and guarded (r27 m-9).** G0's F3 prints, with T and K, the bound its cells
+                   cover per card: the largest `n_ubatch` and the largest W-touching recorded
+                   graph (its node count) among the gate shapes, which include C2b's ladder,
+                   whose top rung is 2048 at the default `n_batch`; the W-order commit compiles
+                   both in with K. A larger shape (a longer replayed graph, a larger ubatch or
+                   model) can have a longer tail than 2T. Outside the bound the use still runs,
+                   since refusing would fail correct runs that never come near 2T, but it is
+                   named: the first W use of a context at an `n_ubatch` above the bound, or
+                   through a recording above the node bound (the finalize wrapper sees the node
+                   count and the meta's W entry), prints once per (context, device)
+                   `[W-ORDER] shape above the measured tail bound on device %d: n_ubatch=%u
+                   graph_nodes=%zu bound=%u/%zu` at WARN and sets a flag on the entry. A cap
+                   with the flag set aborts with its own message, `[W-ORDER] marker wait capped
+                   on device %d outside the measured tail bound: re-measure G0 F3 at this
+                   shape`, so an out-of-bound fault is never read as a lost publisher, and an
+                   in-bound one keeps the message below. Every scored arm here runs inside the
+                   bound, and scores the WARN at 0. A publisher that finds the fault set does
+                   not publish, so every later waiter also reaches its cap, and
+                   `ggml_backend_sycl_synchronize` reads the fault word after its wait and
+                   aborts with `[W-ORDER] marker wait capped on device %d: W ordering lost`. A
+                   capped wait therefore never lets a run finish silently, since proceeding
+                   silently is the W race. A scope guard submits the publisher, so a throwing
+                   step still publishes after the last event it returned. **Cost:** K + 1
+                   single-work-item kernels per eager W use (the waiter chain and the
+                   publisher), one use per oneDNN PP `MUL_MAT`, and K + 1 per replay; C6's PP
+                   ABBA arms score it, with K as G0 printed it.
                  - **Form E, an event section (the fallback).** The entry holds one slot,
                    `last_w_event`, and a **W-order mutex**. Under it the function reads
                    `last_w_event`, calls the steps (the first step's submit carries
@@ -3852,27 +3873,46 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         (`fattn-onednn.cpp:1363-1366`) and fall back to native FA silently (`fattn.cpp:3911`,
         `:3924`), a skipped decision dressed as a fallback. Both misses it can see, a
         within-ubatch peak above the plan and a draw beyond the admitted term, mean the plan is
-        wrong, and the fix is the plan, never a fallback allocation (P4). The DIRECT reuse
-        pool's branch (`onednn_graph_scratch_try_pool_locked`, `:11704`) goes with the call, so
-        from (b1) on `onednn_graph_scratch_alloc_direct_locked` has no caller. **The decline
-        reads a planned fact, never a discovered miss (rulings §M70 (b), (b')):** in (b1) the
-        per-call check at the entry of `ggml_sycl_flash_attn_ext_onednn`, through 23mk's pure
-        function `ggml_sycl_onednn_graph_interim_decline`, compares the call's per-shape term
-        with the **planned** interim capacity, `interim_capped` (stored + G over the ONEDNN cap:
-        0 B reserved for G, SDPA declined on that device) or `interim_capacity` (the term above
-        the zone's planned Graph room). That is an allowed interim form, and (b2) deletes it and
+        wrong, and the fix is the plan, never a fallback allocation (P4). From (b1) on
+        `onednn_graph_scratch_alloc_direct_locked` has no caller. (b1) does not delete the
+        DIRECT reuse pool's try (`onednn_graph_scratch_try_pool_locked`, `:11704`): 23mk keeps
+        the pool through (b1) (`50b1f8f50` §4.8 (b1)), and its (b2) item 8 deletes the try with
+        the direct path (`50b1f8f50` :4786), so that deletion has one owner too (rulings §M68;
+        r27 m-1). From (b1) the pool is empty, since it holds only parked direct allocations and
+        none is made, so it serves nothing: a zone miss still runs the try at `:11704`, which
+        returns null, and then reaches the TERMINAL channel. **The decline reads a planned fact,
+        never a discovered miss (rulings §M70 (b), (b')):** in (b1) the per-call check at the
+        entry of `ggml_sycl_flash_attn_ext_onednn`, through 23mk's pure function
+        `ggml_sycl_onednn_graph_interim_decline`, compares the call's per-shape term with the
+        **planned** interim capacity, `interim_capped` (stored + G over the ONEDNN cap: 0 B
+        reserved for G, SDPA declined on that device) or `interim_capacity` (the term above the
+        zone's planned Graph room). That is an allowed interim form, and (b2) deletes it and
         moves the decision to per-layer admission in the fit, `scratch_unplaced`. Dispatch then
-        reads the admitted decision. **Nothing reaches `:11708` for want of zones (rulings §M70
-        (c) as amended, (c')):** on a VM device the Graph scratch draws through 1oxa's `REGION`
-        path, and on a device with no zones it takes §M33 I-B's planned exact-owner form, an
-        owner-first allocation through the unified cache (P1), which stays. "SDPA is not
-        admitted without zones" applies only where no exact-owner form exists; there 23mk's
-        (b1) rule sees an interim capacity of 0 and declines at the entry check, before
-        `:11708`. If a route can still reach `:11708` at the pin, its owner closes it (1oxa for
-        VM, 23mk for no-zone).
-        **The decline lines and their witness (rulings §M70 (d), §M71; r26 I-2).** Both lines
-        are 23mk's, printed at WARN, neither env-gated, so §M66's arming rule does not apply;
-        this design scores them and does not own them:
+        reads the admitted decision. **The reader is 23mk (b2)'s route decline (r27 m-2):**
+        `onednn_graph_route_decline(ctx, kv_layer)` at the SDPA entry (`fattn-onednn.cpp:981`),
+        with `fattn_params::kv_layer` filled at dispatch (23mk `50b1f8f50` :4488, :4705-4706;
+        the field and its fill land in (b1) by §M71 (a) as amended). A declined layer returns
+        false there. Both routes enter through it: the D ≤ 256 route (`fattn.cpp:3123-3135`),
+        where a false return falls through to native FA (`:3132-3135`), and the D = 512 route
+        (`:3905-3927`). (b2) deletes the interim comparison, not this read: without the read, a
+        declined layer would reach the Graph draw as a draw beyond the admitted term, the
+        TERMINAL abort (§M72). The Qwen arms (Qwen3.6-35B-A3B, D = 256) drive declined layers
+        into dispatch by design and depend on it: C9's replay on the Qwen merge gate, pinned and
+        default, the four xqex baseline runs, and C10. llama.cpp-03nm's gap is D = 512 only
+        (`fattn.cpp:3905-3911` plans before any mask read; `:4080-4095` aborts when the tile
+        route is off or inadmissible), and it is outside moua's scope: no moua arm scores SDPA
+        on a D = 512 model. gemma4 E4B, the only D = 512 model here, appears in the merge-gate
+        script's g4 blocks as the lead's H7ap "must load" confirmation, with no SDPA field; an
+        arm that scored gemma4 SDPA counts would depend on 03nm. **Nothing reaches `:11708` for
+        want of zones (rulings §M70 (c) as amended, (c')):** on a VM device the Graph scratch
+        draws through 1oxa's `REGION` path, and on a device with no zones it takes §M33 I-B's
+        planned exact-owner form, an owner-first allocation through the unified cache (P1),
+        which stays. "SDPA is not admitted without zones" applies only where no exact-owner form
+        exists; there 23mk's (b1) rule sees an interim capacity of 0 and declines at the entry
+        check, before `:11708`. If a route can still reach `:11708` at the pin, its owner closes
+        it (1oxa for VM, 23mk for no-zone). **The decline lines and their witness (rulings §M70
+        (d), §M71; r26 I-2).** Both lines are 23mk's, printed at WARN, neither env-gated, so
+        §M66's arming rule does not apply; this design scores them and does not own them:
         - from (b2), the fit's decline, one line per (context, device) per transaction, printed
           only when N ≥ 1, N the routed device-KV layers left out and M the routed device-KV
           candidates, with `onednn_graph_route_declined{scratch_unplaced}` raised by N:
@@ -3882,7 +3922,12 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           first decline, its `declined` a running count, so the last line per (context, device)
           carries the aggregate: `[SYCL-PLAN] oneDNN SDPA declined: ctx=%u dev=%d il=%d
           declined=%u of %u layers term=%zu capacity=%zu
-          reason=<interim_capped|interim_capacity>`. (b2) deletes it with the entry check.
+          reason=<interim_tp|interim_capped|interim_capacity>`. (b2) deletes it with the entry
+          check. **The reason list has three members (rulings §M71 (a) as amended, 23mk
+          `db61cb321`):** `interim_tp` keys on the process-wide `ggml_sycl_get_tp_queue(dev) !=
+          nullptr`, which is distinct from (b2)'s per-context `tp`. `fattn_params::kv_layer` and
+          its fill move into (b1), since the line prints `il=`; a call whose layer is unknown is
+          keyed `il=-1` and counts as one layer.
         **"No decline line" is never read as N = 0 by itself (rulings §M71 (d)):** a path that
         never ran prints no line either. So each tree carries a positive witness from the same
         run. From (b2) it is §M30's commit line, whose prefix stays byte-identical and which
@@ -3892,21 +3937,21 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         never a pass (§M71 (b)). At (b1) it is the `GGML_SYCL_PRIVATE_TESTING` exit dump: N = 0
         is valid only with `onednn_sdpa_executed` ≥ 1 and `fallback_after_admit` = 0 on that
         device, a run with no dump is VOID, and N > 0 needs no witness (§M71 (c)). The deletion
-        of the direct path has one owner: 23mk `8547a22f0` (b2) item 8 deletes it with its
-        reuse pool and test hooks (rulings §M68 (b); E-ONEDNN-GRAPH-DIRECT), and 23mk's H3
-        "(b1)'s interim G" arm pins that it has no caller from (b1) on. **The runtime miss's arm
-        (r26 I-3; rulings §M72), 23mk's to carry and moua's to cite:** a fixture draw one byte
-        above the planned within-ubatch peak prints `[ZONE-PLAN-BUG]` once and aborts, with
-        `GGML_SYCL_STRICT_LEASES` unset, and allocates nothing (the direct path's pointer-keyed
-        map stays empty). The RED proves the abort is reached and that no catch intercepts it:
-        a mutant that throws instead is caught at `fattn-onednn.cpp:1363-1366`, the child
-        exits 0 with native FA's output, and the arm fails it. A second RED is the pre-(b1)
-        tree, where the same draw lands through the direct path and returns memory. Relayed to
-        23mk (§6.35). **Admission never
-        admits a layer whose term exceeds the override (rulings §M64 (c)):** it declines that
-        layer's SDPA, since the plan never knowingly schedules a miss (P4). **(b1) converts
-        nothing (23mk §6.8's scoping note, mirrored; rulings §M44b):** the commit that converts
-        the Graph scratch is (b2), and H7ap's C-rule arm targets the tree after (b2);
+        of the direct path has one owner: 23mk `8547a22f0` (b2) item 8 deletes it with its reuse
+        pool, the pool try at `:11704` and its test hooks (rulings §M68 (b);
+        E-ONEDNN-GRAPH-DIRECT; `50b1f8f50` :4786), and 23mk's H3 "(b1)'s interim G" arm pins
+        that it has no caller from (b1) on. **The runtime miss's arm (r26 I-3; rulings §M72),
+        23mk's to carry and moua's to cite:** a fixture draw one byte above the planned
+        within-ubatch peak prints `[ZONE-PLAN-BUG]` once and aborts, with
+        `GGML_SYCL_STRICT_LEASES` unset, and allocates nothing. The RED proves the abort is
+        reached and that no catch intercepts it: a mutant that throws instead is caught at
+        `fattn-onednn.cpp:1363-1366`, the child exits 0 with native FA's output, and the arm
+        fails it. A second RED is the pre-(b1) tree, where the same draw lands through the
+        direct path and returns memory. Relayed to 23mk (§6.35). **Admission never admits a
+        layer whose term exceeds the override (rulings §M64 (c)):** it declines that layer's
+        SDPA, since the plan never knowingly schedules a miss (P4). **(b1) converts nothing
+        (23mk §6.8's scoping note, mirrored; rulings §M44b):** the commit that converts the
+        Graph scratch is (b2), and H7ap's C-rule arm targets the tree after (b2);
       - **(b2), after moua L6:** the `REGION` conversion, an ordinary conversion under §2.4.3's
         transition rule: the charge at the context transaction, moua's fit charging it after the
         KV extents (never as a head slot; rulings §M54, §M64 (b)), the step-5 record under
@@ -5500,7 +5545,8 @@ them. It never re-fits KV and never yields.
     and nothing has been released when it is made;
   - **A's carve runs after the publish.**
   23mk mirrors this bullet; the tenant-only path's other steps are unchanged.
-- The ladder's reservations therefore stay one KV region per `(c, d)`, which C3's trace counts.
+- The ladder's reservations therefore stay one KV region per `(c, d)`, which C2b's trace counts
+  on a run whose trial is shown to climb (§3.3; r27 I-2).
 
 **Why "re-fit after `sched_reserve`" is ruled out (r3 I3).** A republish after `sched_reserve`
 that re-fits would change the region after the KV is allocated and would break the idempotent
@@ -5927,8 +5973,23 @@ not a list any code reads: the reservation sums the function's output.
 - **llama-server's default launch (rulings §M41 I-3)** runs at `n_seq_max` 4, which fkpg (a)
   carries: the recurrent state is 4 × 65863680 = 263454720 B (251.3 MiB), 197591040 B above the
   table, so the known Qwen set is 2395242752 B (2284.3 MiB) at every landing order. GPT-OSS's
-  set does not move. The compute slot at `n_seq_max` 4 is the table's `n_seq_max` 1 fixture
-  until zhcn's measure lands, and is labelled so.
+  set does not move. **That set is the load's reservation, and its compute member is the load
+  envelope (rulings §M73, §M60 (b); r27 m-8).** The table's compute slot, 516947968 B, is
+  `glkg-qwen35b-a3b-b1`'s `llama-completion` figure, at `n_outputs_max` 2048: 485.0 MiB of it is
+  logits, 512 × 248320 × 4 B, with `n_vocab` 248320 read from the GGUF header. By §M73 that is
+  the load's c(P), measured at `llama-completion`'s shape because the load does not know the
+  vehicle, so it is an envelope and right for the load's reservation. It is not the server
+  context's compute. llama-server at its default launch has `n_outputs_max` 4
+  (`tools/server/server.cpp:168-172` at `e2461d4fb`: auto `n_parallel` becomes 4 with
+  `kv_unified`; `server-context.cpp:41-53`: `n_outputs_max` is the output limit's total,
+  `n_parallel` 4 without speculative decoding), so its reserve graph carries min(512, 4) output
+  rows, about 3.8 MiB of logits, and its context transaction returns c(P) − compute_ctx, about
+  481 MiB, to the pool (§M73 (a)). A replay of the server context's KV placement charges
+  compute_ctx (§M73 (c)), which no named measure gives yet. So the server figures here are the
+  load's, and they pre-register no llama-server context until a named server-vehicle measure
+  exists (§M64 (b)'s own pre-registration for the llama-server row). 7.14s called the compute
+  "the table's `n_seq_max` 1 fixture"; the difference is the vehicle, not `n_seq_max`, and that
+  label is withdrawn.
 - **`onednn_pp_a`** is 23mk's 512 × `max_K` × 2, with `max_K` 4096 on both models (GPT-OSS's
   `attn_output` Q8_0 4096 × 2880; on Qwen a 4096-wide plane-W tensor), by 23mk's `gguf_w2.py`
   rule over each gate's model file.
@@ -7141,8 +7202,13 @@ L7 documents this limit, and pattern #2 remains the remedy.
       unified kernel's fused ops, and the benchmark records `single_task` nodes on a scratch
       buffer; neither reaches the oneDNN PP branch, so both would carry an empty meta. They are
       wrapped all the same, so the rule has no file-scoped exception: the census is by grep over
-      the backend's sources, `ggml-sycl.cpp` and `unified-kernel.cpp` together, thirty-four
-      sites. The replay RED edits `:107235`
+      the backend's sources with comments stripped (the gate's rule, below), `ggml-sycl.cpp` and
+      `unified-kernel.cpp` together: thirty-four sites on thirty-five lines, 18 and 17, since
+      `:107431-107432` at `e2461d4fb` (`:107224-107225` at `c69d5774d`) is one site whose
+      ternary puts its two calls on two lines (r27 m-7). A grep of the raw source finds five
+      more lines in `ggml-sycl.cpp`, all comments: two in prose (`:99449` and `:99531` at
+      `e2461d4fb`, the `:99242` and `:99324` above) and three of commented-out code (`:106843`,
+      `:106844` and `:106855`, `model_sycl_graph.finalize(`). The replay RED edits `:107235`
       (`:107236` at master `d19308be3`) back to a raw `ext_oneapi_graph` call.
 
     **H7z's source gate (rulings §M59(c); r24 n-6; r25 I-3).** Its scope is
@@ -7152,18 +7218,23 @@ L7 documents this limit, and pattern #2 remains the remedy.
     `stream_dnnl`, `engine_dnnl` or `get_scratchpad_mem`, the retention hand-off, and, under
     Form E, any lock other than `exec_mutex`. Inside a `GGML_SYCL_PRIVATE_TESTING` block only,
     it allows the W-order hook's call; a hook call outside one fails it. It also fails on a raw
-    `ext_oneapi_graph(` or a command graph's `.finalize(` outside the two wrappers. **The scope
-    of that raw-call rule (r26 m-8)** is every source file under `ggml/src/ggml-sycl/`, not only
-    the files the W-order section reaches: it greps the directory, so `unified-kernel.cpp`'s
-    seventeen sites are in it, and a new file that records a graph is in it without an edit.
-    The two wrappers' own definitions are the only allowed raw calls. The directory's one
-    other `.finalize(` at `e2461d4fb`, `sdpa_graph.finalize()` in `fattn-onednn.cpp:868`, is
-    the oneDNN Graph API's `dnnl::graph::graph`, not a SYCL command graph, and the gate
-    allowlists it by file, line text and that reason, so a SYCL graph added beside it still
-    fails. So the `unified-kernel.cpp` count above, with `ggml-sycl.cpp`'s, is the whole
-    SYCL command-graph census. Its mutation
-    witnesses, each of which must fail it: `ctx.stream_dnnl(q)` inside the production step
-    callable; a `q->wait()` in a callee of that callable; the retention copy's
+    `ext_oneapi_graph(` or a command graph's `finalize(`, reached by `.` or `->` (the dense
+    range graph's is `recording_->finalize()`, `ggml-sycl.cpp:90525` at `e2461d4fb`), outside
+    the two wrappers. **It matches on the source with `//` and `/* */` comments stripped and
+    string literals kept (r27 m-7),** so the five comment lines above never match, and a literal
+    grep of the raw tree, which they would fail, is not the gate. Its pattern is
+    `ext_oneapi_graph\(` or `(\.|->)finalize\(`; `finalize_end(` and the other registry calls do
+    not match, since `_` follows `finalize`. **The scope of that raw-call rule (r26 m-8)** is
+    every source file under `ggml/src/ggml-sycl/`, not only the files the W-order section
+    reaches: it greps the directory, so `unified-kernel.cpp`'s seventeen sites are in it, and a
+    new file that records a graph is in it without an edit. The two wrappers' own definitions
+    are the only allowed raw calls. On the stripped source the directory's one other match at
+    `e2461d4fb`, `sdpa_graph.finalize()` in `fattn-onednn.cpp:868`, is the oneDNN Graph API's
+    `dnnl::graph::graph`, not a SYCL command graph, and the gate allowlists it by file, line
+    text and that reason, so a SYCL graph added beside it still fails. So the
+    `unified-kernel.cpp` count above, with `ggml-sycl.cpp`'s, is the whole SYCL command-graph
+    census. Its mutation witnesses, each of which must fail it: `ctx.stream_dnnl(q)` inside the
+    production step callable; a `q->wait()` in a callee of that callable; the retention copy's
     `retain_handles_until_event` moved inside the use; and the replay RED's raw submit.
   - The commit's install of the ring rows (step 8 (c)) allocates nothing: it installs slot
     handles (§2.7). No `mem_handle` is destroyed under the L5 slot-state mutex: every removal of
@@ -8211,29 +8282,35 @@ means that.
       arm scores both trees at the same sums. **llama-server's default launch (rulings §M41
       I-3):** a second pure-fit case on Qwen at `n_seq_max` 4, the shape fkpg (a) carries from
       the server's default `n_parallel`. The recurrent state is 263454720 B and the known set
-      2395242752 B on both sides of (b2). GREEN as below: the context is sized and
-      placed, not refused, and the larger reservation's demoted experts are C10's server row
-      (§3.3). No refusal is pre-registered for it. GREEN: the load's reservation equals the
-      first context's head-slot set term by term, and the fit places every head slot in the
-      reservation plus the free `REGION` room, demotes KV only, and does not refuse. REDs: the
-      7.14e pack, whose capacity is the whole `WEIGHT` zone with no reservation; its weights
-      fill the zone, and the fit refuses the context, naming the ring head slot (r15 C-1). **A
-      second enumeration (rulings §M38 C-1):** the load reserving from 7.14g's hand list while
-      the fixture's producers include the recurrent state; the per-term comparison finds that
-      term's bytes missing from the reservation, and the source gate fails too, since the
-      reservation site names no cohort or term. **The 512 fallback is two mutants, and only one
-      is a RED (r26 m-15):** (a) **envelope-level**, fkpg (a) absent: the envelope carries 512,
-      the load plan prints `n_ctx=512`, and the arm is VOID by its precondition, which fails.
-      That is the precondition doing the work, not a RED. (b) **reservation-internal**: the
-      envelope carries 4096 and the plan prints it, but the reservation is evaluated at 512, so
-      the `n_ctx=` field cannot catch it. At L4+L6, before (b2), G left at 67108864 B catches
-      (b) through the exact ONEDNN bytes. From (b2) G is not a member, and every member left is
-      independent of `n_ctx` (the ring at `-ub 512`, the recurrent state, `onednn_pp_a` at 512 ×
-      `max_K`, `moe_control`, MMID) apart from the compute slot, which is a fixture constant
-      until zhcn's measure lands. So (b) has no byte consequence from (b2) until then, and no
-      RED is lost. Once the measure lands, the compute slot is (b)'s catcher: the arm then
-      pre-registers the compute slot's bytes at 512 against those at 4096, and states before
-      that that (b) is not scorable. **The Graph
+      2395242752 B on both sides of (b2). Its compute member is the load envelope c(P),
+      `llama-completion`'s figure (rulings §M73; r27 m-8), which is right here, since this is a
+      pure fit of the load's reservation; it says nothing about the server context's own compute
+      (§2.4.3's server bullet). GREEN as below: the context is sized and placed, not refused,
+      and the larger reservation's demoted experts are C10's server row (§3.3). No refusal is
+      pre-registered for it. GREEN: the load's reservation equals the first context's head-slot
+      set term by term, and the fit places every head slot in the reservation plus the free
+      `REGION` room, demotes KV only, and does not refuse. REDs: the 7.14e pack, whose capacity
+      is the whole `WEIGHT` zone with no reservation; its weights fill the zone, and the fit
+      refuses the context, naming the ring head slot (r15 C-1). **A second enumeration (rulings
+      §M38 C-1):** the load reserving from 7.14g's hand list while the fixture's producers
+      include the recurrent state; the per-term comparison finds that term's bytes missing from
+      the reservation, and the source gate fails too, since the reservation site names no cohort
+      or term. **The 512 fallback is two mutants, and only one is a RED (r26 m-15):** (a)
+      **envelope-level**, fkpg (a) absent: the envelope carries 512, the load plan prints
+      `n_ctx=512`, and the arm is VOID by its precondition, which fails. That is the
+      precondition doing the work, not a RED. (b) **reservation-internal**: the envelope carries
+      4096 and the plan prints it, but the reservation is evaluated at 512, so the `n_ctx=`
+      field cannot catch it. **(b) is not scorable at any landing order until zhcn's measure
+      lands (r27 n-4).** G is not a reservation member before (b2) or after it, and its interim
+      sizing reads the envelope's `n_ctx` through the floor function, not through the
+      reservation, so a mutant that evaluates only the reservation at 512 leaves G's ONEDNN
+      bytes as they were; 7.14s's "G left at 67108864 B catches (b)" is withdrawn. Every member
+      is independent of `n_ctx` (the ring at `-ub 512`, the recurrent state, `onednn_pp_a` at
+      512 × `max_K`, `moe_control`, MMID) apart from the compute slot, which is a fixture
+      constant until zhcn's measure lands. So (b) has no byte consequence until then; the ticket
+      records it as not scorable, and it is not counted as a RED. Once the measure lands, the
+      compute slot is (b)'s catcher: the arm then pre-registers the compute slot's bytes at 512
+      against those at 4096, and states before that that (b) is not scorable. **The Graph
       scratch admitted as a member (rulings §M41 I-1 (a), §M54):** Qwen's Graph-scratch record
       in the set; the reservation reads 2398978304 B against the expected 2197651712 B, and the
       per-term comparison fails naming `onednn_graph_scratch`. At L4+L6 it is also a double
@@ -9041,12 +9118,14 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
   Q2 and, after it, a publisher on Q1 with nothing ahead of it; **F2**, the same with the
   publisher behind a pending H1 that the watcher opens after 0.5 s, the production delay of a
   previous use behind a `host_task`; and **F3**, the tail T that sets the chain length K: on
-  each gate shape, a W use's predecessor behind the longest graph replay the shape records and
-  one ubatch's `host_task` backlog, timed from the waiter's start to the publisher's store with
-  the device timestamps of the two kernels. "Progresses": the waiter ends without writing the
-  fault word. "Capped": it writes the fault word. F1 and F2 must progress within one C, and F3
-  gives T, from which K = ⌈2 T / C⌉; a cell that caps with K waiters on a correct run voids the
-  derivation. G0 also prints the engine class's xe
+  each gate shape (C2b's top rung, `n_ubatch` 2048 on Mistral, included), a W use's predecessor
+  behind the longest graph replay the shape records and one ubatch's `host_task` backlog, timed
+  from the waiter's start to the publisher's store with the device timestamps of the two
+  kernels. "Progresses": the waiter ends without writing the fault word. "Capped": it writes the
+  fault word. F1 and F2 must progress within one C, and F3 gives T, from which K = ⌈2 T / C⌉; a
+  cell that caps with K waiters on a correct run voids the derivation. F3 also prints the bound
+  its cells cover, the largest `n_ubatch` and W-touching graph node count, which §2.4.2's
+  out-of-bound WARN compares against (r27 m-9). G0 also prints the engine class's xe
   `job_timeout_ms` for each card, and the cap must sit below it.
 - **Attribution (r25 m-5 (d)).** Each cell prints `[G0] cell=<H>/<M> start` before it runs and
   `[G0] cell=<H>/<M> submit_ms=%.1f verdict=returns|blocks` after (the controls and F1/F2 print
@@ -9409,29 +9488,54 @@ placement and demotion run. The rules for every such arm:
   and programmatic alike (r25 m-2).** The arm reads `n_ctx` from its
   context line, with `n_ctx_train` read before the run from the model header's GGUF key
   `<arch>.context_length`, and it is VOID unless the padded regex
-  `llama_context: n_ctx +=  *<n_ctx_train>$` (`grep -cE`) scores exactly 1 (rulings §M61 (c),
-  §M62 (C)). **The `llama_context:` prefix is load-bearing:** on `llama-cli` a bare
-  `n_ctx = <N>` also matches the server's `slot load_model: ... new slot, n_ctx = <N>` line, so
-  it could pass on the wrong line. The regex is not anchored at `^`, since lines under `-v` and
-  `-lv` carry a timestamp prefix. **Negative control, per arm:** the same regex scores 0 on the
-  arm's `n_ctx_seq` line (`llama_context: n_ctx_seq = <N>`) and, on `llama-cli`, on its slot
-  line, each checked by running the regex over that line alone, after checking that the line is
+  `llama_context: n_ctx +=  *<n_ctx_train>$` (`grep -cE`) passes the arm's named form (rulings
+  §M61 (c), §M62 (C); r27 I-1). **The single-context form**, for a block that makes one context
+  (every `llama-completion`, `llama-cli` and merge-gate block here): the regex scores exactly 1,
+  and so does the any-value regex below, so the block's one context line is at N (the blocks
+  below show the count at N; the any-value count is part of the form). **The multi-context
+  form**, for a harness that makes several contexts in one process: the any-value regex
+  `llama_context: n_ctx +=  *[0-9]+$` scores at least 1, and the regex at N scores the same
+  count, so every context line is at N. Two arms use the multi-context form: C9's state-seq arm,
+  where `test-save-load-state` in single-model mode makes one context per sub-test, about ten
+  (`tests/test-save-load-state.cpp:820-854`), and C5 with its sibling, where `-np 4` makes four
+  contexts per model (`tests/test-thread-safety.cpp:102`, `:208-224`). Every other arm uses the
+  single-context form. The scratch runner's `nctx_void` takes the form as its second argument,
+  and its offline self-test covers both: three context lines at N pass the multi-context form
+  and fail the single-context form, and a sample with two context lines, one at N and one at
+  another value, is VOID under both. A mutant that drops either form's count-equality check
+  fails the self-test. The `n_ctx_seq` line never matches either regex, since `_seq` follows
+  `n_ctx`. **The `llama_context:` prefix is load-bearing:** on `llama-cli` a bare `n_ctx = <N>`
+  also matches the server's `slot load_model: ... new slot, n_ctx = <N>` line, so it could pass
+  on the wrong line. The regex is not anchored at `^`, since lines under `-v` and `-lv` carry a
+  timestamp prefix. **Negative control, per arm:** the same regex scores 0 on the arm's
+  `n_ctx_seq` line (`llama_context: n_ctx_seq = <N>`) and, on `llama-cli`, on its slot line,
+  each checked by running the regex over that line alone, after checking that the line is
   present, since a zero from an absent line is vacuous (r26 m-3 (c)). Every arm below that says
-  "the check (<N>)" means this regex at that N. The line prints
-  at INFO, which the default verbosity drops, so every such arm runs with `-lv 4`, or with `-v`,
-  which raises the threshold further (`common/arg.cpp:3935-3940` at `d19308be3`) (rulings §M54's
-  VOID guard, as zhcn's GDC does). **Every arm names its ubatch (rulings §M60 (b); r26
-  m-11):** each command pins `-ub 512`. An absent `-ub` does not fix the ubatch: when the caller
-  does not pin it, the SYCL auto-ubatch trial replaces `sched_reserve` (`src/llama-context.cpp:
-  1011-1040` at `e2461d4fb`, gated on `n_ubatch_auto`), and on a dense model such as Mistral it
-  can climb the ladder. Pinning names the vehicle and switches the trial off. **The one arm that
-  does not pin it is C3's default arm,** whose single pre-registration source, zhcn GDC3 (zhcn
-  `5e0ffae`), runs `llama-cli` with no `-ub` and records `n_ubatch` 512, since the ladder does
-  not climb on a MoE model (zhcn GU1n); the arm runs GDC3's command, so it names 512 from GDC3
-  rather than changing GDC3's vehicle. The fork has no
-  fitter under SYCL today (`fit_params=false`),
-  and `common_params.n_ctx` defaults to 0 (`common/common.h:451` at `e2461d4fb`), so every one
-  of these arms should pass the check. The check is what makes that a measurement.
+  "the check (<N>)" means this regex at that N. The line prints at INFO, which the default
+  verbosity drops, so every such arm runs with `-lv 4`, or with `-v`, which raises the threshold
+  further (`common/arg.cpp:3935-3940` at `d19308be3`) (rulings §M54's VOID guard, as zhcn's GDC
+  does). The fork has no fitter under SYCL today (`fit_params=false`), and `common_params.n_ctx`
+  defaults to 0 (`common/common.h:451` at `e2461d4fb`), so every one of these arms should pass
+  the check. The check is what makes that a measurement.
+- **Every arm names its ubatch (rulings §M60 (b); r26 m-11; r27 m-6).** Every command pins its
+  `-ub`, 512 unless stated. An absent `-ub` does not fix the ubatch: when the caller does not
+  pin it, the SYCL auto-ubatch trial replaces `sched_reserve` (`src/llama-context.cpp:1011-1040`
+  at `e2461d4fb`, gated on `n_ubatch_auto`), and on a dense model such as Mistral it can climb
+  the ladder. Pinning names the vehicle and switches the trial off. Every arm pins `-ub 512`
+  except these, each listed with its value and reason:
+  - C3's ring run pins `-ub 1024`, u1bb's acceptance form, which is what it covers;
+  - C7's GA pins `-ub 1024`, zhcn GA's own command (`e4f424a`);
+  - C5 and its sibling keep the registration's `-ub 32` (`tests/CMakeLists.txt:790` at
+    `e2461d4fb`). The last `-ub` wins, so adding one would make the arm a different test from
+    the registered one;
+  - C2b leaves `-ub` unpinned, because the ladder is its subject; its trial-live witness names
+    the rungs the trial tried;
+  - C3's default arm leaves `-ub` unpinned. Its single pre-registration source, zhcn GDC3 (zhcn
+    `1c5e7ff`), runs `llama-cli` with no `-ub` and records `n_ubatch` 512, since the ladder does
+    not climb on a MoE model (zhcn GU1n). The arm runs GDC3's command rather than changing
+    GDC3's vehicle, and checks the ubatch on the run (§M60 (b)): the constructor's line
+    `llama_context: n_ubatch += *512$` (`src/llama-context.cpp:720`) scores 1, and so does the
+    trial's result, `auto n_ubatch=512 for n_ctx=131072` (`:1942`); otherwise the arm is VOID.
 - **Where the rule applies, arm by arm (r24 m-11; r25 m-2, m-4, m-11):**
   - C1 pins `-c 32768`, Mistral's `n_ctx_train`, so the pin is the default context. It adds
     `-lv 4` and the check, and needs no sibling;
@@ -9442,13 +9546,13 @@ placement and demotion run. The rules for every such arm:
     arms (rulings §M61 (c)). Each carries `-ub 512`, `-lv 4` and the check (32768). Its score is
     still the `[EXT-ALLOC]` count difference; a run that fails the check voids the control;
   - C3's default arm (below) carries `-lv 4` and the check (131072);
-  - C5's `test-thread-safety` is registered with `-c 256` (`tests/CMakeLists.txt:790` at
-    `e2461d4fb`) on stories15M (`:662`), and gains a sibling that drops `-c` and carries the
-    check, unless stories15M's own `context_length` is 256. It is not staged here, so the lead
-    stages it with the non-GPU `ctest --test-dir build -R '^test-download-model$'`, reads
-    `llama.context_length` from its header before the run, and records the value on the ticket.
-    If it is 256, the pinned arm is already default-context: it gains the check, and the sibling
-    is dropped as a duplicate;
+  - C5's `test-thread-safety` is registered with `-c 256 -ub 32 -np 4`
+    (`tests/CMakeLists.txt:790` at `e2461d4fb`) on stories15M (`:662`), and gains a sibling that
+    drops `-c` and carries the check in the multi-context form, unless stories15M's own
+    `context_length` is 256. It is not staged here, so the lead stages it with the non-GPU
+    `ctest --test-dir build -R '^test-download-model$'`, reads `llama.context_length` from its
+    header before the run, and records the value on the ticket. If it is 256, the pinned arm is
+    already default-context: it gains the check, and the sibling is dropped as a duplicate;
   - C7's GA default arm is zhcn's GA-dc, and zhcn carries its check;
   - C8's default arm (below) carries `-lv 4` and the check (32768);
   - C9's merge-gate default arms already print the line, since the script passes `--verbose`,
@@ -9472,14 +9576,15 @@ placement and demotion run. The rules for every such arm:
     pins 256 (`:462`, `:469`), and 256 is the generated models' `n_ctx_train`: every model
     `test-llama-archs` writes carries `context_length` 256 (`tests/test-llama-archs.cpp:247`,
     written at `:309`). So its pin is the default context, as C1's is, and it is not exempt
-    (r26 m-7): it carries the check at N = 256, read from the model's header before the run
-    like every other N. In single-model mode `n_parallel` is 1, so the binary sets `kv_unified`
-    (`tests/test-save-load-state.cpp:907-909`), and the scatter case sets it itself (`:464`),
-    so its `n_ctx_seq` line also prints 256 and is the negative control as everywhere else. Its
+    (r26 m-7): it carries the check at N = 256, read from the model's header before the run like
+    every other N. The process makes one context per sub-test, all at 256, so the arm uses
+    §3.3's multi-context form: at least one `llama_context: n_ctx` line, and every one at 256
+    (r27 I-1). In single-model mode `n_parallel` is 1, so the binary sets `kv_unified`
+    (`tests/test-save-load-state.cpp:907-909`), and the scatter case sets it itself (`:464`), so
+    its `n_ctx_seq` line also prints 256 and is the negative control as everywhere else. Its
     interleaved layout (seq 0 in cells 0, 1 and 4, seq 1 in cells 2, 3 and 5) is unchanged by
     the check, which only confirms that the 256 cells are the model's whole context. 7.14q's
-    claim that only
-    `test_seq_rm_isolated` pins 256 held at `c69d5774d` and is false at the tip;
+    claim that only `test_seq_rm_isolated` pins 256 held at `c69d5774d` and is false at the tip;
   - C10's default-context counts are pre-registered inside C9's default arm, and C11's
     default-context rows are below.
 - **The fixture, unit and no-model exemptions (r24 m-11 and its addendum; r25 m-11).** Every C
@@ -9532,14 +9637,34 @@ placement and demotion run. The rules for every such arm:
   A model whose attention has sinks, GPT-OSS, routes no layer to SDPA, so M = 0: its arms
   make no SDPA claim and score neither field. The fields come with 23mk's (b2), which charges
   the Graph scratch in the fit, and this replay rule applies from (b2) (§2.4.3's transition
-  rule). An arm run between (b1) and (b2) scores (b1)'s interim line instead, its aggregate the
-  last `declined=%u of %u layers` per (context, device), and reads N = 0 only with the
-  `GGML_SYCL_PRIVATE_TESTING` exit dump showing `onednn_sdpa_executed` ≥ 1 and
-  `fallback_after_admit` = 0 on that device; no dump is VOID (§M71 (c)). Through `df9803cb8` the
-  replay placed it as a head slot that could demote KV; 23mk's Qwen row cites the fixed replay
-  (§6.34). Master prints it at WARN when a layer's residency changed
-  (`ggml-sycl.cpp:18381-18386` at `e2461d4fb`, below `:40214`, so the same line at `d19308be3`),
-  in the form `[SYCL-PLAN] KV overflow re-placed to host tier:`, then
+  rule). An arm run between (b1) and (b2) scores (b1)'s interim line instead, pre-registered by
+  (b1)'s own rule, never the fit's (r27 m-3). The replay evaluates 23mk's pure
+  `ggml_sycl_onednn_graph_interim_decline(capped, capacity, term)` (23mk `50b1f8f50` §4.8 (b1))
+  for each SDPA-routed device-KV layer, over that device's planned interim capacity (the ONEDNN
+  zone's ensured bytes less its stored W, 0 on a device without the zone) and the layer's
+  per-shape term (`onednn_graph_scratch_term_bytes`), and gives the (b1) N and each declined
+  layer's reason, `interim_capped` or `interim_capacity`. The replay does not model
+  `interim_tp`, which keys on a process-wide TP queue (§M71 (a) as amended), since no arm here
+  sets up tensor parallelism; a run that prints it is VOID for the (b1) score, and the line is
+  recorded. The run's aggregate is the last interim line's `declined=%u of %u layers` per
+  (context, device), since the count runs; it must equal that N and M. N = 0 is read only with
+  the `GGML_SYCL_PRIVATE_TESTING` exit dump showing `onednn_sdpa_executed` ≥ 1 and
+  `fallback_after_admit` = 0 on that device; no dump is VOID (§M71 (c)). **Pairing when a
+  (context, device) prints several lines (r27 m-3).** From (b2), a GROWTH re-plan is a new
+  transaction: it prints the decline line again when N ≥ 1, and the commit line again when it
+  places or changes the range (23mk `50b1f8f50` §4.8, the commit line's rule). Neither line
+  carries a transaction id, so they pair by print order. In a transaction the fit, which prints
+  the decline, runs before the commit. So each decline line pairs with the first commit line
+  after it, and a commit line with no decline line since the previous commit line pairs with
+  `declined` = 0. The scored pair is the last one, the settled state, against the replay of the
+  context's last transaction; earlier pairs are recorded. A decline line with no commit line
+  after it (a last transaction that left the range unchanged) has no witness, so the arm is VOID
+  (§M71 (d)). The SDPA-scoring runs here, C9's Qwen merge-gate blocks and the xqex runs, pin
+  `-ub 512` and make one context each, so each is expected to print one pair per (context,
+  device). Through `df9803cb8` the replay placed it as a head slot that could demote KV; 23mk's
+  Qwen row cites the fixed replay (§6.34). Master prints it at WARN when a layer's residency
+  changed (`ggml-sycl.cpp:18381-18386` at `e2461d4fb`, below `:40214`, so the same line at
+  `d19308be3`), in the form `[SYCL-PLAN] KV overflow re-placed to host tier:`, then
   `%zu layer(s) demoted, %zu SWA (%.1f MB host KV,`, then
   `layers %d..%d) on device %d for n_ctx=%u; %s`. The replay gives the layer count, the SWA
   count, the host MB, the layer range and the device (r25 n-2). **One verdict rule per arm
@@ -9560,7 +9685,7 @@ placement and demotion run. The rules for every such arm:
   `cohort=kv-tier-layer` count would be vacuous after L6, because that cohort is no longer
   emitted.
   ```
-    GGML_SYCL_EXT_ALLOC_TRACE=1 GGML_SYCL_KV_REGION_TRACE=1 GGML_SYCL_VRAM_BUDGET_PCT=60 \
+  GGML_SYCL_EXT_ALLOC_TRACE=1 GGML_SYCL_KV_REGION_TRACE=1 GGML_SYCL_VRAM_BUDGET_PCT=60 \
     ONEAPI_DEVICE_SELECTOR=level_zero:1 \
     ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -c 32768 -ub 512 -lv 4 \
     -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 < /dev/null > c1.out 2> c1.err
@@ -9571,7 +9696,7 @@ placement and demotion run. The rules for every such arm:
   cat c1.err | grep 'EXT-ALLOC' | tail -1                 # total_external: compare with base
   cat c1.err | grep -c 'KV-PLAN-BUG'                      # must be 0
   cat c1.err | grep 'KV overflow re-placed'               # predicted: see below
-    cat c1.err | grep -c '\[KV-REGION\] reserve'           # 1, else VOID: the trace is live
+  cat c1.err | grep -c '\[KV-REGION\] reserve'           # 1, else VOID: the trace is live
   cat c1.err | grep '\[KV-REGION\] reserve'              # the head-slot sum H per TLSF
   ```
   - **Positive control.** The same command on the base (post-jehw/u1bb master) prints
@@ -9603,14 +9728,45 @@ placement and demotion run. The rules for every such arm:
   - Pass: rc=0, the digit output, zero aborts, and no `UR_RESULT_ERROR` in stderr.
   - Its **baseline** is the base tree, where those pages are untouched (r3 m5: a baseline
     run, not a positive control, since nothing in it is known to fail). On a failure, rerun
-    with `GGML_SYCL_B50_SCRATCH_WEIGHT_SIDE=1` (§2.1's lever). A pass there makes the lever
-    the default for the two B50 sites.
-- **C3 GPT-OSS B50 gate:** `llama-cli ... -c 4096`, scored `grep -cx '1, 2, 3, 4, 5'` = 1. It
-  is also run once with u1bb's `-ub 1024` acceptance form, to cover the ring and the ladder.
-  - With `GGML_SYCL_KV_REGION_TRACE=1`, a WARN line per reservation that is off by default,
-    the ladder run must show exactly **one** reservation for the device, however many ladder
-    candidates republish (r2 N-I9). The variable is set in the run's own command (rulings §M66
-    (1); r26 I-1 (b)), and the count of 1 is its own live check, since a dead trace counts 0:
+    with `GGML_SYCL_B50_SCRATCH_WEIGHT_SIDE=1` (§2.1's lever). A pass there makes the lever the
+    default for the two B50 sites.
+- **C2b the ladder keeps one reservation (r2 N-I9; r27 I-2), the arm §2.3.2's republish argument
+  rests on.** A dense model with `-ub` unpinned, so the auto-ubatch trial runs and republishes
+  the context under the same key at each rung it accepts (§2.3.2). The persisted tuning cache is
+  off (`GGML_SYCL_TUNING_CACHE=0`), since a stored hit skips the ladder and reports `cached`. It
+  runs on the B70, where Mistral has room to climb:
+  ```
+  GGML_SYCL_KV_REGION_TRACE=1 GGML_SYCL_TUNING_CACHE=0 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
+    ./build/bin/llama-completion -m /models/mistral-7b-v0.1.Q4_0.gguf -lv 4 \
+    -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 < /dev/null > c2b.out 2> c2b.err
+  cat c2b.err | grep -c 'tuning cache disabled:'           # 1, else VOID: the cache is off
+  cat c2b.err | grep -oE 'auto n_ubatch=[0-9]+ .*\(tried [0-9,]+; [^)]*\)'  # exactly 1 line
+  cat c2b.err | grep -oE '\(tried [0-9,]+;' | tr -cd ',' | wc -c  # >= 1 (two rungs), else VOID
+  cat c2b.err | grep -c '\[KV-REGION\] reserve'           # 1: one (ctx, dev)
+  cat c2b.err | grep -cE 'llama_context: n_ctx +=  *32768$'  # 1, else VOID (§3.3)
+  ```
+  - **The trial-live witness is the arm's precondition.** The trial's own WARN,
+    `[SYCL-PLAN] auto n_ubatch=%u for n_ctx=%u n_batch=%u (tried %s; %s)`
+    (`src/llama-context.cpp:1942` at `e2461d4fb`), prints once, its `tried` list names at least
+    two rungs, and its reason is not `cached`; otherwise the arm is VOID, since a one-rung trial
+    republishes nothing and a count of 1 then says nothing about republishes. The ladder stops
+    at its first losing rung (`:1329-1379`), so a second rung in `tried` means the first was
+    accepted, published and reserved: the context has been published at least twice under its
+    key, by the constructor and by the trial.
+  - **Scored:** exactly 1 `[KV-REGION] reserve` line for the (context, device), in the format C1
+    quotes; the Mistral gate's digits; and §3.3's VOID guard at 32768 in the single-context
+    form, since with no `-c` this is a default-context CLI arm.
+  - **RED:** the tree with L6's idempotent key removed, so that every same-key republish
+    re-reserves (§2.4.2 step 1), prints one line per publish: at least 2 on a run whose witness
+    passes.
+- **C3 GPT-OSS B50 gate:** `llama-cli ... -c 4096 -ub 512` (r27 m-6), scored
+  `grep -cx '1, 2, 3, 4, 5'` = 1. It is also run once with u1bb's `-ub 1024` acceptance form, to
+  cover the ring. This run cannot see a ladder (r27 I-2): a pinned `-ub` switches the trial off,
+  and a MoE model's auto ladder has one rung, 512 (§2.4.2, r15 m-1). The ladder claim is C2b's.
+  - With `GGML_SYCL_KV_REGION_TRACE=1`, a WARN line per reservation that is off by default, the
+    ring run shows exactly **one** reservation for the device. The variable is set in the run's
+    own command (rulings §M66 (1); r26 I-1 (b)), and the count of 1 is its live check, since a
+    dead trace counts 0. It says nothing about republishes, which C2b scores:
     ```
     GGML_SYCL_KV_REGION_TRACE=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 60 \
       ./build/bin/llama-cli -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -c 4096 -ub 1024 \
@@ -9635,10 +9791,10 @@ placement and demotion run. The rules for every such arm:
     rows from `n_ubatch`), each checked against its own derivation, with the printed
     free-for-KV figure the thing checked, not the reference. It is scored on that point
     including whether this arm demotes layers and how many (r24 m-9). GDC3 is a `llama-cli`
-    point and so is this arm, at `n_ubatch` 512 with no `-ub`, as GDC3 records (rulings §M60(b);
-    §3.3's ubatch rule). **Its timeout is 300 s, not the 60 s hang guard
-    of the `-c 4096` shape,** since a default-context load allocates and clears host-tier KV for
-    131072 cells before the first token:
+    point and so is this arm, at `n_ubatch` 512 with no `-ub`, as GDC3 records, and the run
+    checks it (rulings §M60(b); §3.3's ubatch rule; r27 m-6). **Its timeout is 300 s, not the 60
+    s hang guard of the `-c 4096` shape,** since a default-context load allocates and clears
+    host-tier KV for 131072 cells before the first token:
     ```
     ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout -k 15 300 ./build/bin/llama-cli \
       -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -lv 4 \
@@ -9648,6 +9804,8 @@ placement and demotion run. The rules for every such arm:
       -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
       -n 48 --seed 42 --temp 0 > c3d.out 2> c3d.err; echo "rc=$?"   # rc=0
     cat c3d.err | grep -cE 'llama_context: n_ctx +=  *131072$'  # 1, else VOID
+    cat c3d.err | grep -cE 'llama_context: n_ubatch += *512$'    # 1, else VOID (r27 m-6)
+    cat c3d.err | grep -c 'auto n_ubatch=512 for n_ctx=131072'  # 1, else VOID
     cat c3d.err | grep -cE 'new slot, n_ctx += *131072'           # >= 1, the control's line
     cat c3d.err | grep 'new slot' | grep -cE 'llama_context: n_ctx +=  *131072$'  # 0
     cat c3d.err | grep -c 'llama_context: n_ctx_seq'              # 1, the control's line
@@ -9661,12 +9819,15 @@ placement and demotion run. The rules for every such arm:
 - **C5 multi-context:** `test-thread-safety` with `ONEAPI_DEVICE_SELECTOR=level_zero:0,1`, ONE
   run, only if it is green on the base first. It is known-crashy (oze0), so compare against the
   base. H8 is the primary coverage, and C5 is corroboration. **Its default-context sibling (r24
-  m-11):** the registration's arguments with `-c 256` dropped and `-ub 512 -lv 4` added, run
-  directly with the fixture model the ctest fixture stages, once, VOID unless
-  `llama_context: n_ctx +=  *<n_ctx_train>$` scores 1 at the model's `n_ctx_train`; the §3.3
-  rules apply. **Unless stories15M's `llama.context_length` is 256 (r25 m-4):** the lead reads
-  it from the staged model's header first, and if it is 256 the pinned run is already the
-  default-context arm, gains `-ub 512`, `-lv 4` and the check, and the sibling is not run.
+  m-11):** the registration's arguments with `-c 256` dropped and `-lv 4` added, run directly
+  with the fixture model the ctest fixture stages, once. The registration's `-ub 32` stays,
+  since it already names the ubatch (r27 m-6 (b)). It is VOID unless §3.3's multi-context form
+  holds at the model's `n_ctx_train`: `-np 4` makes four contexts per model, so at least one
+  `llama_context: n_ctx` line prints and every one is at N (r27 I-1). The other §3.3 rules
+  apply. **Unless stories15M's `llama.context_length` is 256 (r25 m-4):** the lead reads it from
+  the staged model's header first, and if it is 256 the pinned run is already the
+  default-context arm, gains `-lv 4` and the check in the multi-context form, and the sibling is
+  not run.
 - **C6 perf sanity:** B50 Mistral pp512/tg128 and GPT-OSS pp512, ABBA ×3 against the base.
   - It adds a **no-replay decode arm** (r2 m8; r4 I2): Mistral tg128 with
     `GGML_SYCL_DISABLE_GRAPH=1`. In that mode every per-op claim runs per dispatch: an atomic
@@ -9689,8 +9850,8 @@ placement and demotion run. The rules for every such arm:
   and a sibling with no `-c` (`n_ctx` 131072) belongs in zhcn's §5.3 under the rules above. It
   is relayed to zhcn (§6.32); this design scores it against its plan fields as it scores GA.
   **GH's default-context arm is zhcn GDC6 (r26 n-3):** `llama-completion` on the B50 with no
-  `-c`, so `n_ctx` is 262144, STRICT, scored on GH's criterion (zhcn `5e0ffae`, §5.3 row GDC6);
-  zhcn carries its VOID guard, and this design scores its plan fields as it scores GH.
+  `-c`, so `n_ctx` is 262144, STRICT, scored on GH's criterion (zhcn `1c5e7ff`, §5.3 row GDC6;
+  r27 n-5); zhcn carries its VOID guard, and this design scores its plan fields as it scores GH.
 - **C8 a1_long, the OPTIONAL yield (rulings §M18.3a).** jehw's gate form, once, on the B50:
   ```
   GGML_SYCL_VRAM_BUDGET_PCT=60 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
@@ -9822,14 +9983,25 @@ placement and demotion run. The rules for every such arm:
     **Arming and trace-live checks, arm by arm (rulings §M66; r26 I-1 (c)):** every C9 arm that
     scores `[EXT-ALLOC]` lines, whether it counts zero or N, carries
     `GGML_SYCL_EXT_ALLOC_TRACE=1` in its own literal command, and names its live check. A
-    process-level arm (the scoped-miss and unplanned-buffer unit arms) ends, after
-    its scored steps, with (2)'s seam draw in the same process, so the process's count is
-    exactly 1, that draw's line (`cohort=backend-buffer-runtime-zone`, `prefer_vram_zone=3`),
-    and 0 before it; a count of 0 means the trace is dead and the arm is VOID, which fails. A
-    CLI arm (the merge gates, the default-context arm, the control-vector and LoRA arms), which
-    cannot host a seam, names (2) as its live check: the arm is VOID unless (2) printed its
-    line on the same build in the same session. The state-seq arm is a CLI-shaped binary too,
-    and takes (2) the same way.
+    process-level arm (the scoped-miss and unplanned-buffer unit arms) ends, after its scored
+    steps, with (2)'s seam draw in the same process. **A marker delimits it (r27 m-4):**
+    immediately before the seam draw the test prints the fixed line `[MOUA-SEAM] seam draw` to
+    stderr with `fprintf` and flushes it, so it orders with the `[EXT-ALLOC]` line, which the
+    printer writes to stderr the same way (`unified-cache.cpp:15308-15318` at `e2461d4fb`). The
+    arm scores 0 `[EXT-ALLOC]` lines before the marker and exactly 1 after it, that draw's line
+    (`cohort=backend-buffer-runtime-zone`, `prefer_vram_zone=3`); a missing marker, or 0 lines
+    after it, means the seam did not run or the trace is dead, and the arm is VOID, which fails:
+    ```
+    cat <arm>.err | grep -c '^\[MOUA-SEAM\] seam draw$'   # 1, else VOID
+    cat <arm>.err | sed '/^\[MOUA-SEAM\] seam draw$/q' | grep -c 'EXT-ALLOC'   # 0 before it
+    cat <arm>.err | sed -n '/^\[MOUA-SEAM\] seam draw$/,$p' | grep 'EXT-ALLOC' \
+      | grep -c 'cohort=backend-buffer-runtime-zone '   # 1: the seam's line
+    cat <arm>.err | sed -n '/^\[MOUA-SEAM\] seam draw$/,$p' | grep -c 'EXT-ALLOC'   # 1: only it
+    ```
+    A CLI arm (the merge gates, the default-context arm, the control-vector and LoRA arms),
+    which cannot host a seam, names (2) as its live check: the arm is VOID unless (2) printed
+    its line on the same build in the same session. The state-seq arm is a CLI-shaped binary
+    too, and takes (2) the same way.
   - **Baseline:** the two gate commands on that master tip with the trace on. Every cohort they
     print is either converted by a commit that lands before L4+L6 (§4), a term's draw, or a
     named defect with a ticket, recorded on the ticket before L4+L6 lands. A cohort left out
@@ -9896,7 +10068,7 @@ placement and demotion run. The rules for every such arm:
         < /dev/null > qx-$sel${carg:+-c4096}.out 2> qx-$sel${carg:+-c4096}.err; echo "rc=$?"
     done; done
     cat qx-<run>.err | grep -oE 'prompt eval time = *[0-9.]+ ms / *[0-9]+ tokens.*tokens per second'
-        cat qx-<run>.err | grep -oE 'graph scratch range: ctx=[0-9]+ dev=0 .* admitted=[0-9]+ of [0-9]+ layers'
+    cat qx-<run>.err | grep -oE 'graph scratch range: ctx=[0-9]+ dev=0 .* admitted=[0-9]+ of [0-9]+ layers'
     cat qx-<run>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 declined=[0-9]+ of [0-9]+ layers'
     ```
     Recorded per run, on the ticket: PP tokens per second and the prompt's token count from the
@@ -9934,30 +10106,31 @@ placement and demotion run. The rules for every such arm:
     same process as its trace-live check (rulings §M66), allocates a 1 MiB buffer on a SYCL<n>
     buffer type outside every claim scope, on an L4+L6 arena whose RUNTIME is 0, after a model
     load, so the device is planned. GREEN: NULL, the `unplanned SYCL%d buffer` line, the
-    once-per-process `known unhomed consumers` note once, zero
-    `[EXT-ALLOC]` lines, and no zone's live bytes grown. REDs: the leg without the refusal,
-    which prints `[EXT-ALLOC]`; and 7.14j's leg, `forbid_vram_zone_spill` set with the chain
-    kept, where the null runs the KV-zone draw and the buffer lands in the KV zone with no line
-    at all, which the live-bytes check catches (r18 I-1). The arm counts the leg bullet's
-    whole line, `(refused)` included. **The two unhomed consumers, scored at the caller
-    (rulings §M46 I-1 (b); r20 m-2):** after a model load on the same arena, `clip_init` on a
-    fixture projector returns null (so `mtmd_init_from_file` does) after the unplanned line
-    and the clip's `llama.cpp-6qou` message, run in a child process that exits 0, and no
-    zone's live bytes grow; and `ggml_opt_init` on the SYCL backend, run in a child process,
-    exits 134 after the unplanned line and the `llama.cpp-mogf` abort message, each once. RED
-    for the clip: L4+L6 without the throw, where the child aborts in `GGML_ASSERT(buffer)`
-    (`ggml-backend.cpp:673`) and exits 134. Both sub-arms run in children, so a RED never
-    takes down the test binary (r21 m-2).
-  - **No model (rulings §M47 I-1, §M47a):** in its own child process, since the unplanned
-    arm counts zero `[EXT-ALLOC]` lines (r21 m-1), with `GGML_SYCL_EXT_ALLOC_TRACE=1` and no
-    model loaded, the arm allocates a 1 MiB SYCL<n> buffer and calls `ggml_opt_init`. **The
-    count is pre-registered (r22 m-9).** The arm's opt params use static graphs (`ctx_compute`,
-    `inputs` and `outputs` set) and `GGML_OPT_BUILD_TYPE_FORWARD`, so `ggml_opt_build` allocates
-    exactly one SYCL<n> buffer, `buf_static` on the scheduler's first backend at
-    `ggml-opt.cpp:453`, and returns before the CPU buffer at `:546`; `:497` and `:541` are the
-    GRAD and OPT arms, which it does not reach. So each pass makes **two** SYCL<n> buffers. The
-    device is not planned, so the leg keeps master's path, and where that path lands depends on
-    the backing (rulings §M49 I-1; r22 I-1). It runs on both, one pass per child process:
+    once-per-process `known unhomed consumers` note once, zero `[EXT-ALLOC]` lines before the
+    seam marker and the seam draw's one line after it (the arming rule above; r27 m-4), and no
+    zone's live bytes grown. REDs: the leg without the refusal, which prints `[EXT-ALLOC]`; and
+    7.14j's leg, `forbid_vram_zone_spill` set with the chain kept, where the null runs the
+    KV-zone draw and the buffer lands in the KV zone with no line at all, which the live-bytes
+    check catches (r18 I-1). The arm counts the leg bullet's whole line, `(refused)` included.
+    **The two unhomed consumers, scored at the caller (rulings §M46 I-1 (b); r20 m-2):** after a
+    model load on the same arena, `clip_init` on a fixture projector returns null (so
+    `mtmd_init_from_file` does) after the unplanned line and the clip's `llama.cpp-6qou`
+    message, run in a child process that exits 0, and no zone's live bytes grow; and
+    `ggml_opt_init` on the SYCL backend, run in a child process, exits 134 after the unplanned
+    line and the `llama.cpp-mogf` abort message, each once. RED for the clip: L4+L6 without the
+    throw, where the child aborts in `GGML_ASSERT(buffer)` (`ggml-backend.cpp:673`) and exits
+    134. Both sub-arms run in children, so a RED never takes down the test binary (r21 m-2).
+  - **No model (rulings §M47 I-1, §M47a):** in its own child process, so that the lines it
+    prints, which it scores, never fall in the unplanned arm's window before its seam marker
+    (r21 m-1; r27 m-4), with `GGML_SYCL_EXT_ALLOC_TRACE=1` and no model loaded, the arm
+    allocates a 1 MiB SYCL<n> buffer and calls `ggml_opt_init`. **The count is pre-registered
+    (r22 m-9).** The arm's opt params use static graphs (`ctx_compute`, `inputs` and `outputs`
+    set) and `GGML_OPT_BUILD_TYPE_FORWARD`, so `ggml_opt_build` allocates exactly one SYCL<n>
+    buffer, `buf_static` on the scheduler's first backend at `ggml-opt.cpp:453`, and returns
+    before the CPU buffer at `:546`; `:497` and `:541` are the GRAD and OPT arms, which it does
+    not reach. So each pass makes **two** SYCL<n> buffers. The device is not planned, so the leg
+    keeps master's path, and where that path lands depends on the backing (rulings §M49 I-1; r22
+    I-1). It runs on both, one pass per child process:
     - **USM** (the B50, `level_zero:1`, at the default backing; the B70 is the same kind, and no
       mock is needed or used): the device has zones from the constructor's early arena, so both
       buffers take the leg's arena branch. That is not master's landing on an L4+L6 tree: L4+L6
@@ -9984,7 +10157,7 @@ placement and demotion run. The rules for every such arm:
       which is itself a non-creating lookup (§2's fact 2). **W2 is not gated by the cut (rulings
       §M59(a); r25 I-1).** W2 is an ownership rule, so it gives the same answer before and after
       the cut, and the cache answers this request with 1oxa's W2 identity refusal, as 1oxa's W2
-      row and its arm (5) have it (1oxa rev 34 follow-up, `68c31f0`; r26 m-1). The fact-(1)
+      row and its arm (5) have it (1oxa `6ee1ff1`; r26 m-1; r27 n-5). The fact-(1)
       return (`:37852-37853`) then ends `alloc_buffer` before master's host-pinned retry, as
       after the cut (below). GREEN, pre-registered: the 1 MiB buffer is null after exactly one
       `[VM-WT]` line, with zero `[EXT-ALLOC]` lines, zero C11 lines (the leg issues no zone
@@ -10013,16 +10186,16 @@ placement and demotion run. The rules for every such arm:
       each by name. The KV-zone request (`:37682-37691`: COMPUTE role, cohort
       `backend-buffer-kv-zone`, `must_device`, `prefer_vram_zone` = KV, no forbid) prints one
       C11 line too: a zone miss with no `zone_alloc` call, not the `[VM-PLAN-BUG]` E5 line
-      (1oxa's C11 row, the single source for it, at `68c31f0`). Then the
+      (1oxa's C11 row, the single source for it, at `6ee1ff1`). Then the
       legacy request (`:37778-37788`), WEIGHT role with neither a load transaction nor a claim
       scope, reaches the cache, whose answer is 1oxa's W2 identity refusal,
       `[VM-WT] WEIGHT request without model identity on device D (site S, N bytes) -- refused`,
       not row C9's line (1oxa rows C4 and C13). **The refusal is terminal (rulings §M50, placed
       by §M53).** `alloc_buffer` reads fact (1) and returns nullptr at the main request's
       failure (`:37852-37853`), before master's host-pinned retry (`:37855-37869`); this is
-      1oxa's W2 row at `68c31f0` (its rev 31 mechanism (ii); r25 n-4, r26 m-1), which, as §M53
-      asked, rewords "takes no step of master's arena chain" to mean the retry and safe-alloc
-      tails only.
+      1oxa's W2 row at `6ee1ff1` (its rev 31 mechanism (ii); r25 n-4, r26 m-1, r27 n-5), which,
+      as §M53 asked, rewords "takes no step of master's arena chain" to mean the retry and
+      safe-alloc tails only.
       Without the early return the retry would run, since `allow_shared_fallback` defaults to
       true (`:37516`) and `must_host_pinned` is false; host-pinned memory is outside VM (1oxa
       W14), so the retry would land, and a device buffer type would hand out host memory that
@@ -10041,10 +10214,11 @@ placement and demotion run. The rules for every such arm:
       - the 1 MiB buffer is null after exactly one `[VM-WT]` line;
       - **the C11 lines, scored per zone name, with no total (rulings §M59(b); r25 m-1):**
         exactly one each for `runtime`, `kv` and `scratch`, in 1oxa's C11 format (1oxa's C11 row
-        at `68c31f0`, rev 34 follow-up; r26 m-1):
-        `[VM-ARENA] zone <Z> miss would spill to a raw device allocation on
-        a VM device (tag <T>, <N> bytes) -- refused`, where Z is `arena_zone_name`, lowercase
-        (`runtime`, `kv`, `scratch`, `onednn`, `weight`), T the request's cohort or `(none)`,
+        at `6ee1ff1`, byte-identical to rev 34's `68c31f0` apart from stating its WARN level;
+        r26 m-1, r27 n-5):
+        `[VM-ARENA] zone <Z> miss would spill to a raw device allocation on a VM device (tag
+        <T>, <N> bytes) -- refused`, where Z is `arena_zone_name`, lowercase (`runtime`, `kv`,
+        `scratch`, `onednn`, `weight`), T the request's cohort or `(none)`,
         and N = max(size, 1). The pattern, counted per captured Z, is `^\[VM-ARENA\] zone
         (runtime|kv|scratch|onednn|weight) miss would spill to a raw device allocation on a VM
         device \(tag [^,]+, [0-9]+ bytes\) --
@@ -10055,9 +10229,9 @@ placement and demotion run. The rules for every such arm:
         `[SYCL] RUNTIME+KV+scratch all full for runtime buffer %zu MB, unified_alloc fallback`
         WARN (`ggml-sycl.cpp:37737-37739` at `c69d5774d`) exactly once, the witness that the
         chain ended in misses and reached the legacy request;
-      - zero `retrying with host-pinned fallback` lines, zero `[EXT-ALLOC]` lines, zero
-        unplanned lines (the device is not planned, so moua's refusal does not run), and
-        `ggml_backend_sycl_compute_buffer_host_fallbacks(dev)` unchanged;
+      - zero `retrying with host-pinned fallback` lines, no raw exit by the counter below (r27
+        m-5), zero unplanned lines (the device is not planned, so moua's refusal does not run),
+        and `ggml_backend_sycl_compute_buffer_host_fallbacks(dev)` unchanged;
       - `ggml_opt_init`, in a second child, exits 134 after one `[VM-WT]` line and the
         `llama.cpp-mogf` named abort, with the same retry and C11 counts. That abort is L4+L6's
         named abort, which fires on any null `buf_static`, whoever refused it; C9's
@@ -10071,8 +10245,17 @@ placement and demotion run. The rules for every such arm:
       cat nm-vm-post.err | grep -cE "^\[VM-ARENA\] zone scratch $C11"                    # 1
       cat nm-vm-post.err | grep -c 'RUNTIME+KV+scratch all full for runtime buffer'         # 1
       cat nm-vm-post.err | grep -c 'retrying with host-pinned fallback'                     # 0
-      cat nm-vm-post.err | grep -c 'EXT-ALLOC'                                              # 0
       ```
+      The post-cut pass scores no `[EXT-ALLOC]` line (r27 m-5). The printer runs only after a
+      raw allocation that succeeds (`if (ptr && ext_alloc_trace_enabled())`,
+      `unified-cache.cpp:15308-15318` at `e2461d4fb`), and after the cut 1oxa's row C9 refuses
+      the raw exit on VM, so the line can never print there, and its zero would be vacuous; 23mk
+      withdrew G1's line check for the same reason (`50b1f8f50` §9, G1). The raw exits are
+      scored instead by 23mk's always-compiled `unified_cache_ext_alloc_count_for_testing(dev)`
+      (`50b1f8f50` §5.1: incremented at every raw exit, whatever the trace says), which each
+      child prints before and after its pass: the two are equal. On a tree without that counter
+      the field is not scored, and the ticket records it; the pass's positive signals, the
+      `[VM-WT]` line and the per-zone C11 lines, stand either way.
 
     REDs, one per pass, each re-derived on §M53's order (r24 I-1, m-12):
     - USM: 7.14l's `arena_active()` predicate, under which the early arena makes the device look
@@ -10122,11 +10305,12 @@ placement and demotion run. The rules for every such arm:
     line carries a size, so the format string itself never matches) and zero
     `exceeds safe alloc` lines; `ggml_backend_sycl_compute_buffer_host_fallbacks(dev)`
     (`ggml-sycl.cpp:17025`; the counter is `:17023`) unchanged; the unified cache's host-zone
-    live bytes unchanged, so no host-pinned buffer was created; and zero `[EXT-ALLOC]` lines.
-    RED: the dispatch without its return, which falls to `:37846`, where `unified_alloc` without
-    `must_device` returns a buffer, whether in VRAM outside any plan or host-pinned: **the RED's
-    pre-registered outcome is a non-null buffer (r20 m-8)**, and the live-bytes and retry-line
-    checks only say where it landed.
+    live bytes unchanged, so no host-pinned buffer was created; and zero `[EXT-ALLOC]` lines
+    before the seam marker, with the seam draw's one line after it (the arming rule above; r27
+    m-4). RED: the dispatch without its return, which falls to `:37846`, where `unified_alloc`
+    without `must_device` returns a buffer, whether in VRAM outside any plan or host-pinned:
+    **the RED's pre-registered outcome is a non-null buffer (r20 m-8)**, and the live-bytes and
+    retry-line checks only say where it landed.
   - **A LoRA adapter (rulings §M46 I-1 (b)):** the Mistral gate command (`llama-completion`)
     with `-ub 512 -lv 4` and §3.3's
     `n_ctx` check (32768), pinned to `level_zero:1`, with `GGML_SYCL_EXT_ALLOC_TRACE=1` in its
@@ -10184,9 +10368,14 @@ placement and demotion run. The rules for every such arm:
     or no Qwen layers to SDPA from (b2); that is §M54's order, and the replay pre-registers the
     count (§3.3). jzvq's terms reduce both a little more.
   - **llama-server's default launch (rulings §M41 I-3):** a replay row, not a GPU run. The
-    replay also packs Qwen at `n_seq_max` 4 and pre-registers its `device_groups`, `host_groups`
-    and KV layer counts the same way; the recurrent state's 197591040 B (188.4 MiB) more is
-    about 91 more groups on the host. GPT-OSS's counts do not move.
+    replay also packs Qwen at `n_seq_max` 4 and computes its `device_groups`, `host_groups` and
+    KV layer counts the same way; the recurrent state's 197591040 B (188.4 MiB) more is about 91
+    more groups on the host. GPT-OSS's counts do not move. **These are the `llama-completion`
+    vehicle's counts (rulings §M73, §M60 (b); r27 m-8).** The replay's compute member is the
+    load envelope c(P), `llama-completion`'s 516947968 B at `n_outputs_max` 2048, not the
+    server's, whose `n_outputs_max` is 4 (§2.4.3's server bullet), and by §M73 a context scores
+    its own `sched_reserve`, never another vehicle's c(P). So the row pre-registers no
+    llama-server run until a named server-vehicle measure exists (§M64 (b)).
   - **Scored:** the run prints exactly the replay's `device_groups`, `host_groups` and KV
     layer counts, and a difference in either direction fails C10 as plan != reality. The
     gates' correctness checks are unaffected and score as before. Throughput against master is
@@ -12898,7 +13087,7 @@ below is at `c69d5774d`; at master `d19308be3` each one above `:40214` is one hi
 | I-3; §M59 (c) | the production matmul inside the "leaf" W-order section takes `exec_mutex(q)` and `dnnl_mutex`, may allocate, and host-waits under two diagnostic envs; H7z did not read the callback | **Changed, per §M59 (c).** Two forms, and G0 picks one (§2.4.2). Form M (preferred) narrows the order to one atomic `fetch_add` and a device-side waiter and publisher, so no lock is held across a submit. Form E keeps an event section with its rank stated once: `ctx.graph_mutex`, the W-order mutex, `exec_mutex(q)`. In both, the dnnl stream, engine, scratchpad memory and primitives are resolved before the use, and the matmul step calls a pre-resolved `gemm` variant, so `dnnl_mutex` is never taken and nothing allocates inside a use. `GGML_SYCL_PP_SPLIT_TIMING` and `GGML_SYCL_DEQUANT_BENCH` are declined by name, once per process, and run the unordered path. H7z reads the function, its step callables and their callees, and fails on waits, `host_task`, allocation entries, `stream_dnnl`/`engine_dnnl`/`get_scratchpad_mem`, the retention hand-off and, under Form E, any lock but `exec_mutex`; its witnesses include `ctx.stream_dnnl(q)` in the callable and a `q->wait()` in a callee. |
 | I-4; §M59 (d) | G0 never timed the replay's graph submit, yet its verdict landed the section for replays | **Changed, per §M59 (d).** G0 has three M kinds (kernel, oneDNN execute, and `ext_oneapi_graph(exec)` with a cross-queue `depends_on`) against two H states, six cells per card. The verdict matrix is Form M if F1 and F2 progress on both cards, else Form E if all six cells return on both cards, else the lead rules. |
 | m-1; §M59 (b); 1oxa's C11 answer | the post-cut C11 count fixed a total of 2, while the KV-zone request's line was unanswered | **Changed, per §M59 (b), with 1oxa's answer.** Exactly one C11 line each for `runtime`, `kv` and `scratch`, with no total, in 1oxa's format, `[VM-ARENA] zone <Z> miss would spill to a raw device allocation on a VM device (tag <T>, <N> bytes) -- refused`, Z being `arena_zone_name` in lowercase, T the cohort or `(none)`, N = max(size, 1); each is counted with the pattern at its Z. The KV-zone request (`:37682-37691`: COMPUTE role, cohort `backend-buffer-kv-zone`, `must_device`, `prefer_vram_zone` = KV, no forbid) prints its C11 line once, a zone miss with no `zone_alloc` call, not the `[VM-PLAN-BUG]` E5 line (1oxa C11 row, pending r30 fold). The planned-predicate RED's GREEN side reads the same three. Master's `RUNTIME+KV+scratch all full for runtime buffer` WARN (`:37737-37739`) is pre-registered once, as the witness that the chain reached the legacy request. (Amended, §6.35 m-1: the `kv` line is cited to 1oxa's C11 row at `68c31f0`, rev 34 follow-up, which carries it; "pending r30 fold" is withdrawn.) |
-| m-2; §M61 (c); §M62 (C) | the default-context CLI arms carried no `-lv 4` and no `n_ctx` check; the follow-up filed C9's Mistral-command arms under "does not apply"; the check matched on a bare `n_ctx =` | **Partly closed by `f2323f9e0`:** C5's programmatic sibling already carried `-lv 4` and the check, and the merge-gate arms already printed the line through `--verbose`. **Changed at 7.14r:** §3.3's VOID guard now covers every default-context arm, CLI and programmatic. C1 (a default-equivalent pin), C2 and C2a, C3's and C8's default arms, and C9's Mistral positive control (1) (both of its runs), control-vector and LoRA arms carry `-lv 4` and the check (131072 for GPT-OSS 20B and 120B, 32768 for Mistral, Qwen's header value), and C9's merge-gate default arms add it through the script's `DCTX=1` mode (`--verbose`). **The check is the padded regex `llama_context: n_ctx +=  *<N>$` everywhere (§M62 (C)),** unanchored at `^` since verbose lines carry a timestamp, with the `llama_context:` prefix load-bearing against the server's `new slot, n_ctx = <N>` line; its negative control is that line and the `n_ctx_seq` line, which must score 0 (C3's block carries both). The script's `nctx_void` uses the same regex, requires exactly one such line, and reads `print_info: n_ctx_train`. **The LoRA arm's arithmetic (§M61 (c)):** its KQ 2147483648 B is at 32768, which is Mistral 7B v0.1's real `n_ctx_train` (`llama.context_length`), so it is the vehicle's default, not a pin, and neither Mistral-command arm is a pinned arm. The exemption list names every arm it covers (C0, C4, C6, G0, G1, G2, C9's seam control, unplanned-buffer, clip and `ggml_opt_init` children, scoped-miss, state-seq scatter and no-model arms, and the H tests), and C9's Mistral control (1) has left it. |
+| m-2; §M61 (c); §M62 (C) | the default-context CLI arms carried no `-lv 4` and no `n_ctx` check; the follow-up filed C9's Mistral-command arms under "does not apply"; the check matched on a bare `n_ctx =` | **Partly closed by `f2323f9e0`:** C5's programmatic sibling already carried `-lv 4` and the check, and the merge-gate arms already printed the line through `--verbose`. **Changed at 7.14r:** §3.3's VOID guard now covers every default-context arm, CLI and programmatic. C1 (a default-equivalent pin), C2 and C2a, C3's and C8's default arms, and C9's Mistral positive control (1) (both of its runs), control-vector and LoRA arms carry `-lv 4` and the check (131072 for GPT-OSS 20B and 120B, 32768 for Mistral, Qwen's header value), and C9's merge-gate default arms add it through the script's `DCTX=1` mode (`--verbose`). **The check is the padded regex `llama_context: n_ctx +=  *<N>$` everywhere (§M62 (C)),** unanchored at `^` since verbose lines carry a timestamp, with the `llama_context:` prefix load-bearing against the server's `new slot, n_ctx = <N>` line; its negative control is that line and the `n_ctx_seq` line, which must score 0 (C3's block carries both). The script's `nctx_void` uses the same regex, requires exactly one such line, and reads `print_info: n_ctx_train` (amended, §6.35 m-3 and §6.36 I-1: N comes from the model header's GGUF key before the run, and the rule has a single-context and a multi-context form). **The LoRA arm's arithmetic (§M61 (c)):** its KQ 2147483648 B is at 32768, which is Mistral 7B v0.1's real `n_ctx_train` (`llama.context_length`), so it is the vehicle's default, not a pin, and neither Mistral-command arm is a pinned arm. The exemption list names every arm it covers (C0, C4, C6, G0, G1, G2, C9's seam control, unplanned-buffer, clip and `ggml_opt_init` children, scoped-miss, state-seq scatter and no-model arms, and the H tests), and C9's Mistral control (1) has left it. |
 | m-3; §M56 (a); §M61 (a), (b); §M63 (a) | C3's arm did not name which GDC3 point it scores against; GA still stated F itself | **Closed by `f2323f9e0`:** C3 cites GDC3 by row id, holds none of its numbers, and has no `-c 56576`. **Changed at 7.14r:** (a) C3's default arm is scored against GDC3's **zhcn+moua fixpoint point** (§M61 (a)), not its today's-tree point, since the arm runs after L4+L6, and today's-tree F would fail a correct tree. That point is the replay of the run's own input lines, every charged slot checked against its own derivation, never a prior run's printed output (§M63 (a)). GDC3 is a `llama-cli` point, as the arm is (§M60 (b)). (b) Under §M61 (b), no GDC3 figure appears in this doc: moua owns only its +377.5 MiB RUNTIME-floor delta, and zhcn cites moua for that alone. GA's room, head-slot and spare figures, which rested on GDC3's F, are withdrawn (§2.4.1). §M60 (d): no text here routes the compute buffer anywhere but RUNTIME on master. |
 | m-4 | the C9 state-seq claim was stale at master; C5's sibling might equal the pinned run | **Changed.** Re-derived at `e2461d4fb`: the registration is `--models` over the generated models (`tests/CMakeLists.txt:369-374`), whose mode silences INFO, so the arm runs single-model `-m <generated model> -lv 4`; `test_seq_cp_device` (`:395-398`, `ON_DEVICE` at `:426`, `:437`) is the default-context case and carries the check; `test_seq_cp_scatter` with `on_device` true pins 256 (`:462`, `:469`) and is exempt as fixed-geometry scatter arithmetic at the same allocation site. C5: the lead stages stories15M (`tests/CMakeLists.txt:662`, `:790`) with the non-GPU `test-download-model` and reads `llama.context_length` first; if it is 256, the pinned arm is already default-context and the sibling is dropped. |
 | m-5 | G0 cited a self-test as production, lacked the not-started `host_task` state, warm-ups and per-kind controls, and had no attribution for a hang | **Changed.** The `:19948-19955` cite is withdrawn (a self-test, `:19858`). H1 is the executing async CPU-compute shape (`cpu-dispatch.cpp:4743`), H2 the not-started terminal shape (`:75262-75264`) behind a device-gated kernel. Each M kind gets an untimed warm-up and its own negative control; the positive control is per H shape. Each cell prints a start line and a verdict line, and an in-process 30 s watchdog prints `HUNG` and exits 3; rc 0, 1, 3, 77 and 124/137 are pre-registered, 77 through `sycl-test-skip.hpp`. |
@@ -12979,9 +13168,10 @@ below is at `c69d5774d`; at master `d19308be3` each one above `:40214` is one hi
   `onednn_graph_scratch_alloc_direct_locked` (`unified-cache.cpp:11721`) as (b2)'s; please state
   the commit that deletes it, or cite the ticket that does, and moua will cite that (amended,
   §6.35 m-12: answered by §M68 (b), 23mk `8547a22f0` (b2) item 8). (b1) declines SDPA over the
-  cap, counted, with one WARN per (context, device), and admission declines a layer whose term
-  exceeds the override (§M64 (c)). On Qwen from (b2) the replay may admit few or no layers to
-  SDPA, since master already demotes 5 of 10 KV layers at `-c 4096`.
+  cap, counted, with one WARN per (context, device) (amended, §6.36 n-2: one WARN per (context,
+  device, layer) with a running count, rulings §M71 (a)), and admission declines a layer whose
+  term exceeds the override (§M64 (c)). On Qwen from (b2) the replay may admit few or no layers
+  to SDPA, since master already demotes 5 of 10 KV layers at `-c 4096`.
 - **zhcn:** (1) GA (rulings §M60, §M61 (b)): moua marks GA's count unmeasured and cites your GA
   (`e4f424a`, `llama-cli`) as its single source (amended, §6.35 m-4: the count is not restated).
   moua states none of your figures, neither GDC3's F nor the compute, and withdraws its −709.4
@@ -13013,9 +13203,9 @@ Master pin for source cites: `e2461d4fb`.
 
 | item | finding / ruling | disposition |
 |---|---|---|
-| I-1; §M66 | arms scored env-gated trace lines without setting the variable in the command, or without a trace-live check | **Changed.** C1's command sets `GGML_SYCL_KV_REGION_TRACE=1` beside `GGML_SYCL_EXT_ALLOC_TRACE=1`, and its `[KV-REGION] reserve` line must count exactly 1 (0 is VOID), with the line's format stated (L6's trace). C3's `-ub 1024` ladder run has its own command block with the variable and the count of 1 as its live check. C9 states the arming rule arm by arm: every arm that scores `[EXT-ALLOC]` carries the variable in its literal command; the scoped-miss and unplanned-buffer unit arms end with seam control (2)'s draw in the same process, so their count is exactly that line; the CLI arms (merge gates, default-context, control-vector, state-seq, LoRA) name seam control (2), run as its own child with the variable on the same build in the same session, as their live check. H9 (3) and (4) scored "zero `[EXT-ALLOC]` lines" in a SYCL-free binary, where no emitter exists, so that zero was vacuous: they now score the host model's out-of-range draw counter. The audit found no other scored env-gated line: the `GGML_SYCL_WITNESS_CHECKS` and `GGML_SYCL_HOST_ALLOC_PHASE_GATE` arms set their variable and score a line that must fire, and the (b1)/(b2) decline lines are not env-gated. |
+| I-1; §M66 | arms scored env-gated trace lines without setting the variable in the command, or without a trace-live check | **Changed.** C1's command sets `GGML_SYCL_KV_REGION_TRACE=1` beside `GGML_SYCL_EXT_ALLOC_TRACE=1`, and its `[KV-REGION] reserve` line must count exactly 1 (0 is VOID), with the line's format stated (L6's trace). C3's `-ub 1024` ladder run has its own command block with the variable and the count of 1 as its live check. C9 states the arming rule arm by arm: every arm that scores `[EXT-ALLOC]` carries the variable in its literal command; the scoped-miss and unplanned-buffer unit arms end with seam control (2)'s draw in the same process, so their count is exactly that line; the CLI arms (merge gates, default-context, control-vector, state-seq, LoRA) name seam control (2), run as its own child with the variable on the same build in the same session, as their live check. H9 (3) and (4) scored "zero `[EXT-ALLOC]` lines" in a SYCL-free binary, where no emitter exists, so that zero was vacuous: they now score the host model's out-of-range draw counter. The audit found no other scored env-gated line: the `GGML_SYCL_WITNESS_CHECKS` and `GGML_SYCL_HOST_ALLOC_PHASE_GATE` arms set their variable and score a line that must fire, and the (b1)/(b2) decline lines are not env-gated. (Amended, §6.36 I-2 and m-5: the `-ub 1024` run is the ring run and its count is only its live check, and C2b carries the ladder claim; the audit missed the post-cut VM `[EXT-ALLOC]` zero, which is now scored by 23mk's raw-exit counter.) |
 | I-2; §M70 (d); §M71 | the SDPA decline and the replay's admitted and `scratch_unplaced` counts had no scorer | **Changed, per §M71.** The (b1)/(b2) bullets quote 23mk's two decline lines as §M71 (a) rules them, at WARN and not env-gated: from (b2) the fit line `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d declined=%u of %u layers needed=%zu room=%zu reason=scratch_unplaced`, once per (ctx, dev) when N ≥ 1, with `onednn_graph_route_declined{scratch_unplaced}` raised by N; in (b1) the interim line `[SYCL-PLAN] oneDNN SDPA declined: ctx=%u dev=%d il=%d declined=%u of %u layers term=%zu capacity=%zu reason=<interim_capped\|interim_capacity>`, once per (ctx, dev, layer) with a running count. There is no separate admitted line: the witness from (b2) is §M30's commit line with the suffix ` admitted=%u of %u layers`, its prefix byte-identical (A1 quotes it). Per (ctx, dev), `declined` (0 when there is no decline line) must equal M − `admitted`; no commit line is VOID, and M = 0 is VOID for any SDPA claim. At (b1) the witness is the `GGML_SYCL_PRIVATE_TESTING` exit dump: N = 0 needs `onednn_sdpa_executed` ≥ 1 and `fallback_after_admit` = 0 on that device, and no dump is VOID. §3.3's replay and the Qwen xqex baseline score these fields with greps. GPT-OSS has M = 0 and makes no SDPA claim. (`65300ce1a` asked 23mk for a separate admitted line; the follow-up withdrew it under §M71.) |
-| I-3; §M70 (a)-(c) with its amendment; §M72 | the direct overflow stayed reachable from (b1) through a runtime zone miss | **Changed, per §M70 and §M72.** (b1) replaces the `:11708` call, and the DIRECT pool branch at `:11704` with it, by the TERMINAL `[ZONE-PLAN-BUG]` channel, which never allocates and **aborts** unconditionally with its scorable message, independent of `GGML_SYCL_STRICT_LEASES` and STRICT. Returning null is forbidden (the oneDNN Graph callback has no failure return, so a null faults the GPU), and so is throwing (`fattn-onednn.cpp:1363-1366` catches it and `fattn.cpp:3911`, `:3924` fall back to native FA silently). Both runtime misses mean the plan is wrong. The decline reads a planned fact: in (b1) the entry check compares against the planned interim capacity, the allowed interim form (§M70 (b')), and (b2) moves it to per-layer admission; dispatch reads the admitted decision. Nothing reaches `:11708` for want of zones: VM draws through 1oxa's `REGION` path, and a no-zone device keeps §M33 I-B's planned exact-owner form (§M70 (c')); "not admitted" applies only where no such form exists. The runtime-miss arm (one byte over the planned peak: one `[ZONE-PLAN-BUG]`, nothing allocated, an abort with STRICT unset; REDs a throwing mutant the catch would hide, and the pre-(b1) tree) is 23mk's, cited and relayed. |
+| I-3; §M70 (a)-(c) with its amendment; §M72 | the direct overflow stayed reachable from (b1) through a runtime zone miss | **Changed, per §M70 and §M72.** (b1) replaces the `:11708` call, and the DIRECT pool branch at `:11704` with it, by the TERMINAL `[ZONE-PLAN-BUG]` channel, which never allocates and **aborts** unconditionally with its scorable message, independent of `GGML_SYCL_STRICT_LEASES` and STRICT. Returning null is forbidden (the oneDNN Graph callback has no failure return, so a null faults the GPU), and so is throwing (`fattn-onednn.cpp:1363-1366` catches it and `fattn.cpp:3911`, `:3924` fall back to native FA silently). Both runtime misses mean the plan is wrong. The decline reads a planned fact: in (b1) the entry check compares against the planned interim capacity, the allowed interim form (§M70 (b')), and (b2) moves it to per-layer admission; dispatch reads the admitted decision. Nothing reaches `:11708` for want of zones: VM draws through 1oxa's `REGION` path, and a no-zone device keeps §M33 I-B's planned exact-owner form (§M70 (c')); "not admitted" applies only where no such form exists. The runtime-miss arm (one byte over the planned peak: one `[ZONE-PLAN-BUG]`, nothing allocated, an abort with STRICT unset; REDs a throwing mutant the catch would hide, and the pre-(b1) tree) is 23mk's, cited and relayed. (Amended, §6.36 m-1: (b1) replaces only the `:11708` call; the pool try at `:11704` is 23mk (b2) item 8's to delete, and from (b1) the pool is empty.) |
 | m-1 | the 1oxa pin was stale | **Changed.** 1oxa is cited at `68c31f0` (rev 34 follow-up), whose C11 row carries the `kv` line and keeps the W2 row and arm (5). §6.34's "pending r30 fold" row, its n-4 row and relays (2) and (4) are marked amended. |
 | m-2 | C1's block lacked `-lv 4` and the check | **Changed.** C1's command has `-ub 512 -lv 4`, the check at 32768, and the `n_ctx_seq` negative control with its presence check. |
 | m-3 | the VOID check's N came from the run being judged | **Changed**, in the doc and the script together. N is `<arch>.context_length` read from the GGUF header before any GPU work (`merge-gates/gguf-ctx.py`, a stdlib reader: 131072 for GPT-OSS 120B, 262144 for the Qwen gate model, 32768 for Mistral), and an empty read fails the script. `nctx_void N` is VOID unless the padded regex counts exactly 1 at N, the `n_ctx_seq` line is present and the regex counts 0 on it. A startup self-test scores the regex on the three lines as `gptoss120b-b1.log:1968` renders them. Offline: VOID at 131072 on the pinned log (its `n_ctx` is 4096), pass at 4096, VOID for an empty N, VOID with the `n_ctx_seq` lines removed. The script's form before is kept as `run-merge-gates.sh.pre-m714s`. |
@@ -13026,7 +13216,7 @@ Master pin for source cites: `e2461d4fb`.
 | m-8 | the graph-site census covered `ggml-sycl.cpp` only | **Changed.** `unified-kernel.cpp`'s six finalizes and eleven submits are named (the benchmark's ten and five, `record_micro_graph`'s `:10876` and the production MICRO-GRAPH submit at `:10928`), identical at `c69d5774d` and `e2461d4fb`, and all are wrapped. H7z's raw-call rule scopes every file under `ggml/src/ggml-sycl/`, with one allowlisted site, `fattn-onednn.cpp:868`'s oneDNN Graph API finalize. |
 | m-9 | the generation object's storage lifetime was unstated | **Changed.** A zero count releases the generation's charge, never its record. Records live in the owning entry's list, with stable addresses, never freed or reused while the entry lives; the entry is held by the store and by each generation with a non-zero count, so any record a draw can load is live. |
 | m-10 | Form M's one-second cap would abort correct slow work | **Changed.** Each waiter kernel is capped at C, half the engine's xe `job_timeout_ms` (the one hard bound, since a longer spin resets the GT), and the use submits a chain of K = ⌈2 T / C⌉ waiters, T the worst predecessor tail G0's new F3 cell measures on the gate shapes (the longest replayed graph plus one ubatch's `host_task` backlog). Only the chain's last waiter faults, counting `w_order_wait_exhausted`. The cost is K + 1 single-work-item kernels per use. |
-| m-11; §M60 (b) | arms did not name the ubatch | **Changed.** §3.3 states the rule: every arm pins `-ub 512`, since the SYCL auto-ubatch trial runs only when `-ub` is unpinned (`src/llama-context.cpp:1011-1040` at `e2461d4fb`). C1, C2, C2a, C5, C8, the Mistral controls, the control-vector and LoRA arms carry it. The one exception is C3's default arm, which runs GDC3's `llama-cli` command with no `-ub` and names `n_ubatch` 512 from GDC3. |
+| m-11; §M60 (b) | arms did not name the ubatch | **Changed.** §3.3 states the rule: every arm pins `-ub 512`, since the SYCL auto-ubatch trial runs only when `-ub` is unpinned (`src/llama-context.cpp:1011-1040` at `e2461d4fb`). C1, C2, C2a, C5, C8, the Mistral controls, the control-vector and LoRA arms carry it. The one exception is C3's default arm, which runs GDC3's `llama-cli` command with no `-ub` and names `n_ubatch` 512 from GDC3. (Amended, §6.36 m-6 and I-2: every command pins its `-ub`, 512 unless stated, and the exceptions are listed with their reasons; C5 keeps the registration's `-ub 32`, and C2b leaves `-ub` unpinned.) |
 | m-12; §M68 (b) | the deletion of the direct path was hedged in three places | **Changed.** One citation: 23mk `8547a22f0` (b2) item 8 deletes it with its reuse pool and test hooks. The (b1), (b2) and "not moua's" bullets say so, and §6.34's relay (7) is marked answered. |
 | m-13; §M67 (b) | the zone-class table's `CONTEXT` row still listed the Graph scratch among the reserved slots; the relay still asked 23mk how to read "`FIRST_CONTEXT` calls the same fit" | **Changed.** The `CONTEXT` row now names the Graph scratch as its one exception: not a reserved head slot, but charged by the context's fit after the KV extents, per device-resident attention layer. A1 and the first-context reservation cite §M67 (b): the load reserves no G, and the reservation's sum skips the `AFTER_KV` record by kind. §6.34's relay (6) is marked amended, and the question is withdrawn. |
 | m-14 | a blank line split the §2.4.3 member table | **Changed.** Deleted; the recurrent-state row and the three sum rows render in the table again. |
@@ -13068,3 +13258,51 @@ Master pin for source cites: `e2461d4fb`.
   nothing (r26 m-16; your r30 m-3). (3) The VOID guard's N is now read from the GGUF header
   before the run, and `run-merge-gates.sh` does so (`merge-gates/gguf-ctx.py`); GDC8 inherits
   it.
+
+### 6.36 Revision 7.14t: design-moua-r27, rulings §M73 and the §M71 (a) amendment
+
+Revision 7.14t is one commit on top of `b225d81e3`. It answers design review r27
+(design-moua-r27 on `f2323f9e0..7391f5e36`: 0 Critical, 2 Important, 9 Minor, 5 nits; every
+item a required fix) and folds rulings §M73 (the load envelope c(P) is trimmed at the context
+transaction) and the §M71 (a) amendment (23mk `db61cb321`: the `interim_tp` reason, and
+`kv_layer` in (b1)). r27 did not read `b225d81e3`, which put the §6.35 I-2 and I-3 rows
+(`b225d81e3` lines 13017-13018) and the 23mk relay (line 13045) in final form. None of r27's
+items is closed there: m-1 names the I-3 row's pool-branch clause, which `b225d81e3` kept, and
+this revision amends it. The §6.34 and §6.35 rows it supersedes are marked in place. Master pin
+for source cites: `e2461d4fb`.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| I-1 | §3.3's VOID guard ("scores exactly 1") failed the multi-context harnesses on a correct tree: C9's state-seq arm makes about ten contexts, and C5 with `-np 4` makes four per model | **Changed.** The guard has two named forms. The single-context form, for every CLI and merge-gate block: exactly one `llama_context: n_ctx` line, and it at N. The multi-context form, for C9's state-seq arm and C5 with its sibling: at least one such line, and every one at N (the count at N equals the any-value count). `nctx_void` in `run-merge-gates.sh` takes the form as its second argument; its offline self-test passes three lines at N in the multi form, fails them in the single form, fails a two-line sample with one line at another N in both, and still scores the `n_ctx_seq` and slot lines 0. A mutant dropping either form's count-equality check fails the self-test; `bash -n` is clean, and the replay on `gptoss120b-b1.log` gives `n_ctx=4096` in both forms and VOID at 131072. |
+| I-2 | C3's `-ub 1024` "ladder" count was vacuous: a pinned `-ub` switches the trial off, and a MoE ladder has one rung | **Changed.** New arm C2b: Mistral on the B70 with `-ub` unpinned and `GGML_SYCL_TUNING_CACHE=0`, so the trial runs the ladder; VOID unless the trial's own `[SYCL-PLAN] auto n_ubatch=... (tried %s; %s)` line names at least two rungs with a reason other than `cached`, and the `tuning cache disabled:` line prints. Scored: exactly 1 `[KV-REGION] reserve` for its (context, device); RED: L6's idempotent key removed, one line per publish. §2.3.2's "one KV region per `(c, d)`" rests on C2b. C3's `-ub 1024` run keeps the ring, and its count is only its trace-live check. |
+| m-1; §M68 | (b1) was said to remove the pool try at `:11704`, which 23mk deletes in (b2) item 8 | **Changed.** (b1) replaces only the `:11708` call. The pool try is 23mk `50b1f8f50` (b2) item 8's (:4786), cited beside the direct path's deletion. From (b1) the pool is empty, since it holds only parked direct allocations and none is made; a zone miss still runs the try, which returns null, then reaches the TERMINAL channel. The §6.35 I-3 row is marked amended. |
+| m-2 | the dispatch-side read of the admission decision had no site | **Changed.** It is 23mk (b2)'s route decline at the SDPA entry (`fattn-onednn.cpp:981`, `params.kv_layer`; `50b1f8f50` :4488, :4705-4706), which both the D ≤ 256 route (`fattn.cpp:3123-3135`, native FA on false at `:3132-3135`) and the D = 512 route (`:3905-3927`) enter. The Qwen arms (C9's Qwen replay, the xqex runs, C10) depend on it. llama.cpp-03nm is D = 512 only and outside moua's scope: gemma4 E4B, the one D = 512 model here, is a load-only confirmation with no SDPA field. |
+| m-3 | the (b1)-era scorer had no pre-registration, and multi-line pairing was unstated | **Changed.** The replay evaluates 23mk's `ggml_sycl_onednn_graph_interim_decline(capped, capacity, term)` per routed layer over the device's planned interim capacity and the per-shape term, giving (b1)'s N and reasons; the last interim line per (context, device) is scored against it, with §M71 (c)'s dump as the N = 0 witness. `interim_tp` is not replayed, and a run that prints it is VOID for the (b1) score. From (b2) the lines pair by print order: each decline line with the first commit line after it, a commit line with no decline since the previous one with `declined` = 0; the last pair is scored, and a trailing decline line with no commit line after it is VOID. |
+| m-4; §M66 | the unplanned-buffer and scoped-miss GREENs said zero `[EXT-ALLOC]` lines, against the arming rule's one seam line | **Changed.** Each unit arm prints `[MOUA-SEAM] seam draw` to stderr, flushed, immediately before the seam draw, and scores 0 `[EXT-ALLOC]` lines before it and exactly 1 after it, carrying `cohort=backend-buffer-runtime-zone`; no marker, or 0 after it, is VOID. Both GREENs and the no-model arm's reason for its own child say so. |
+| m-5; §M66 | the post-cut VM `[EXT-ALLOC]` zero was vacuous, since the printer runs only after a successful raw allocation | **Changed.** The post-cut pass scores no `[EXT-ALLOC]` line. Raw exits are scored by 23mk's always-compiled `unified_cache_ext_alloc_count_for_testing(dev)` (`50b1f8f50` §5.1), equal before and after the pass; on a tree without it the field is recorded as not scored. The §6.35 I-1 row's "found no other" is marked amended. |
+| m-6; §M60 (b) | the ubatch rule ("each command pins `-ub 512`") contradicted C3's ring run, C7's GA and C5's registration, and C3's pinned arm carried none | **Changed.** "Every command pins its `-ub`, 512 unless stated", with the exceptions listed with their reasons: C3's ring run and C7's GA at 1024, C5 and its sibling at the registration's `-ub 32` (the added `-ub 512` is removed), C2b and C3's default arm unpinned. C3's pinned arm gains `-ub 512`. C3's default arm checks `llama_context: n_ubatch += *512$` and the trial's `auto n_ubatch=512 for n_ctx=131072`, each 1, else VOID. |
+| m-7 | H7z's raw-call gate did not say how it treats comments, and the census counts were grep-false | **Changed.** The gate matches `ext_oneapi_graph\(` or `(\.\|->)finalize\(` on the source with `//` and `/* */` comments stripped and string literals kept. The census is thirty-four sites on thirty-five stripped lines (18 in `ggml-sycl.cpp`, where `:107431-107432` is one site, and 17 in `unified-kernel.cpp`); the raw grep's five further lines are the comments at `:99449`, `:99531`, `:106843`, `:106844` and `:106855`. The `->` form was missing: the dense range graph finalizes through `recording_->finalize()` (`:90525`). The ".finalize( at fo:868 is the only other" sentence now reads "on the stripped source". |
+| m-8; §M60 (b); §M73 | the llama-server rows carried `llama-completion`'s compute | **Changed.** The Qwen set's compute, 516947968 B, is labelled `llama-completion`'s (`n_outputs_max` 2048, 485.0 MiB of logits), which by §M73 is the load's envelope c(P) and right for the load's reservation (H7ap's pure fit). The server's `n_outputs_max` is 4 (`server.cpp:168-172`, `server-context.cpp:41-53`), about 3.8 MiB of logits, and its context returns c(P) − compute_ctx. C10's server row pre-registers no llama-server run until a named server-vehicle measure exists. The "`n_seq_max` 1 fixture" label is withdrawn. |
+| m-9 | Form M's tail bound held only on the gate shapes | **Changed.** G0's F3 prints the bound its cells cover (the largest `n_ubatch` and W-touching graph node count, C2b's 2048 rung included), compiled in with K. Outside it the use runs, and prints once per (context, device) `[W-ORDER] shape above the measured tail bound on device %d: ...`; a cap then aborts with its own message, so an out-of-bound fault is never read as a lost publisher. Every scored arm runs inside the bound. |
+| n-1 | stray indents in C1's block and the xqex block | **Changed.** C1's command and its `[KV-REGION]` count line are at 2 spaces, and the xqex commit-line grep at 4. |
+| n-2 | two §6.34 texts were unamended | **Changed.** The m-2 row's `print_info: n_ctx_train` and relay (7)'s "one WARN per (context, device)" are marked amended. |
+| n-3 | "the direct path's pointer-keyed map stays empty" was unobservable after an abort | **Changed.** Dropped. |
+| n-4 | m-15's "G left at 67108864 B catches (b)" needed a shared helper | **Changed.** No such helper exists in the design: G is not a reservation member, and its sizing does not read the reservation. (b) is stated as not scorable at any landing order until zhcn's measure lands. |
+| n-5 | the zhcn and 1oxa pins | **Changed.** zhcn is cited at `1c5e7ff` (GDC3, GDC6), and 1oxa at `6ee1ff1` in the body (the C11 and W2 rows). History rows keep the pins they were written at. |
+| §M73 | the load envelope c(P) is trimmed at the context transaction | **Folded** in m-8: the Qwen server rows cite §M73 (a)-(c). C3's default arm was already scored against GDC3's replay of its own input lines (rulings §M63 (a)), which charges that run's own compute. |
+| §M71 (a), amended | the (b1) reason list and `kv_layer` | **Folded.** The (b1) format reads `reason=<interim_tp\|interim_capped\|interim_capacity>`; `interim_tp` keys on the process-wide TP queue, and `kv_layer` with its fill lands in (b1), a layer-unknown call keyed `il=-1`. |
+
+**Relays.**
+- **23mk:** (1) moua now cites your (b2) item 8 (`50b1f8f50` :4786) as the owner of the pool
+  try's deletion at `unified-cache.cpp:11704`, beside the direct path's, and says (b1) keeps
+  the pool, empty. (2) moua cites your route decline at `fattn-onednn.cpp:981`
+  (`params.kv_layer`) as the dispatch read of the admitted decision, and its Qwen arms depend
+  on it. (3) moua's (b1) scorer pre-registers N from your
+  `ggml_sycl_onednn_graph_interim_decline` over the interim capacity and each layer's
+  `onednn_graph_scratch_term_bytes`; please confirm that a (b1) replay may call it as a pure
+  function with those inputs. (4) moua's post-cut VM pass reads your
+  `unified_cache_ext_alloc_count_for_testing(dev)`; please name the commit that lands it.
+- **1oxa:** moua cites you at `6ee1ff1` (the lead's pin) for the C11 and W2 rows.
+- **zhcn:** moua cites GDC3 and GDC6 at `1c5e7ff`. C3's default arm now checks its `n_ubatch`
+  on the run, both the constructor's line and the trial's result, rather than taking 512 from
+  GDC3.
