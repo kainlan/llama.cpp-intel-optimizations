@@ -146,8 +146,9 @@ Design, revision 7.14r, by impl-moua, 2026-09-27. The revisions answer twenty-si
   Minor, 9 nits), the lead's rulings on it (§M59, §M61, §M62 (C), §M63 (a)), rulings §M60 on
   GA's vehicle, 1oxa's C11 KV-zone answer, the C14 correction (the refused state-seq read aborts
   or reads freed memory) and 23mk rev 4.16's Graph-scratch relay, recorded in §6.34, with the
-  split-stream capture in the merge-gate script, and a follow-up for rulings §M64 (b). Revision
-  7.14r is two commits on top of 7.14q (`f2323f9e0`): `df9803cb8` and the follow-up.
+  split-stream capture in the merge-gate script, and follow-ups for rulings §M64. Revision 7.14r
+  is three commits on top of 7.14q (`f2323f9e0`): `df9803cb8`, `2489d9e85` (§M64 (b)) and a
+  second follow-up (§M64 (a), (c)).
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -3782,17 +3783,31 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         `fattn-onednn.cpp:115-116`, so a model whose attention has sinks gets G = 0. It charges
         only in master's floor path and needs none of L4-L7. At `-c 4096` it takes GPT-OSS
         120B's G from 805306368 B to 0 B, and Qwen's stays 201326592 B. It is interim, and it
-        goes with the floor function in (b2). **(b1) converts nothing (23mk §6.8's scoping
+        goes with the floor function in (b2). **(b1) never routes a Graph draw to the direct
+        overflow (rulings §M64 (a)),** `onednn_graph_scratch_alloc_direct_locked`
+        (`unified-cache.cpp:11721`, reached from `:11708` at `c69d5774d` and `e2461d4fb`), which
+        breaks P1, P2 and P4 on its own: a legacy `alloc_handle` outside the arena, a map keyed
+        by raw pointer, a host headroom poll with a 2 s drain, and an abort on exhaustion. When
+        the stored bytes plus G exceed the ONEDNN cap, (b1) declines oneDNN SDPA on that device
+        with a counted reason and one WARN per (context, device), which is §M54 (3) applied
+        early; the interim cost of the overflow is not accepted. Which commit deletes the direct
+        path is 23mk's to state (this design reads it as (b2)'s, below), or 23mk cites the
+        ticket that does. **Admission never admits a layer whose term exceeds the override
+        (rulings §M64 (c)):** it declines that layer's SDPA, since the plan never knowingly
+        schedules a miss (P4). **(b1) converts nothing (23mk §6.8's scoping
         note, mirrored; rulings §M44b):** the commit that converts the Graph scratch is (b2),
         and H7ap's C-rule arm targets the tree after (b2);
       - **(b2), after moua L6:** the `REGION` conversion, an ordinary conversion under §2.4.3's
-        transition rule: the charge at the context transaction, moua's fit placing the slot, the
-        step-5 record under `ONEDNN_GRAPH_SCRATCH`, the draw through `allocate_within`, and the
-        refusal on moua's context-refusal channel. Its parts:
+        transition rule: the charge at the context transaction, moua's fit charging it after the
+        KV extents (never as a head slot; rulings §M54, §M64 (b)), the step-5 record under
+        `ONEDNN_GRAPH_SCRATCH`, the draw through `allocate_within`, and, for a layer whose term
+        does not fit or exceeds the override, SDPA declined with the counted `scratch_unplaced`
+        WARN, never a refusal of the context (§M54 (3), §M64 (c)). Its parts:
         - 23mk's `REGION` charge at the context transaction, under 23mk's value function;
         - the draw itself, moved out of the ONEDNN zone into the context's `REGION` range
           (`onednn_graph_scratch_alloc`, `unified-cache.cpp:11655`, draws from the ONEDNN zone
-          at master), with the direct overflow deleted;
+          at master), with the direct overflow (`onednn_graph_scratch_alloc_direct_locked`,
+          `:11721`) deleted, unless 23mk names another commit or ticket for it (§M64 (a));
         - the load getter switch, `:4464` and `:27658` from the with-floor getter to the W
           getter, `unified_cache_get_planned_onednn_pp_w_bytes` (today `:2141`'s `_stored`
           getter), and the with-floor getter itself deleted (`:2148-2160`; no dead alias), and
@@ -3828,7 +3843,10 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       reads that sizing. The dry run computes the same expression from the getters, so it grows
       nothing exactly when the published W bytes are at most the ledger's ONEDNN terms, which is
       what it tests. The clamp cannot bind on the merge-gate shapes, so ONEDNN is 23592960 B on
-      GPT-OSS 120B and 234881024 B on Qwen there. The constant goes in L4+L6 (rulings §M37 Q3),
+      GPT-OSS 120B and 234881024 B on Qwen there. Where it binds, the Graph draw that no longer
+      fits is not sent to the direct overflow: (b1) declines oneDNN SDPA on that device,
+      counted, with one WARN per (context, device) (rulings §M64 (a)). The constant goes in
+      L4+L6 (rulings §M37 Q3),
       since the zone's remaining consumers, W and the Graph scratch, are then each sized by its
       own function. Between (b1) and L4 the load stage is master's with (b1)'s G, 268435456 B on
       both gate shapes. **The final sizing is not 268435456 B (rulings §M37 Q3; 23mk 4.10
@@ -12559,9 +12577,10 @@ and the matmul), the reading the lead confirmed after 7.14p.
 
 ### 6.34 Revision 7.14r: design-moua-r25, rulings §M59 to §M63
 
-Revision 7.14r is two commits on top of 7.14q (`f2323f9e0`): `df9803cb8`, and a follow-up for
+Revision 7.14r is three commits on top of 7.14q (`f2323f9e0`): `df9803cb8`; `2489d9e85`, for
 rulings §M64 (b), design-23mk-r20 I-2's finding that the Graph scratch was still a head-slot
-member of the first-context set and of C9's replay. It answers design review r25
+member of the first-context set and of C9's replay; and a second follow-up for §M64 (a) and (c),
+(b1)'s direct overflow and the override. It answers design review r25
 (design-moua-r25 on `f69884157..f2323f9e0`: 0 Critical, 4 Important, 11 Minor, 9 nits) as ruled
 in §M59 and §M61 (a) to (c), and folds the items the lead queued during that review:
 split-stream capture in the merge-gate script; GA's tree stated (its room, first cited to zhcn
@@ -12602,6 +12621,7 @@ below is at `c69d5774d`; at master `d19308be3` each one above `:40214` is one hi
 | 23mk rev 4.16 (`3499cbe90`); §M54 | the Graph (oneDNN SDPA) scratch is charged inside moua's fit after the KV extents, never as a head slot | **Changed.** §2.3.2's `ONEDNN_GRAPH_SCRATCH` term, GA's head-slot list, and the ONEDNN-floor state say so, as does H7ap's C-rule arm: G is charged after the KV extents, for device-resident attention layers only, each sized from its `n_kv`, admitted in ascending order of per-shape term; a layer that does not fit declines SDPA with `scratch_unplaced` and runs native FA, no context is refused, and G never forces a demotion (follow-up llama.cpp-xqex). `FIRST_CONTEXT` calls the same fit. The order is confirmed in the relay below. |
 | C14 correction (design-1oxa-r31 m-2; cjko c-k083) | a refused state-seq save is not a throw and not "returns 0" | **Changed**, with n-4 above: on master it is a deterministic `GGML_ASSERT(buffer)` abort at the first copy, and a use-after-free when the checkpoint splits across buffers. Every moua statement of the failure mode (§2.4.2's census of the leg, C9's state-seq arm, n-4) says so, cited at `e2461d4fb`; the refused arm, a named refusal with zero `GGML_ASSERT` lines and a split arm under ASan, is cjko's. |
 | §M64 (b); design-23mk-r20 I-2 (follow-up) | at `f2323f9e0` and `df9803cb8`, the §2.4.3 member table, the first-context arm and C9's replay still counted the Graph scratch in `FIRST_CONTEXT`'s head-slot set from (b2), so the replay could demote KV for it, against §M54 | **Changed in the follow-up.** The Graph scratch is not a member of the head-slot set at any landing order (§2.4.1's head-slot list, §2.4.2 (b)'s bound and C-term text, §2.4.3's member table and transition rule, the ledger row, H7ap's first-context arm, C10's orientation and §3.3's replay). The known sets are 1560297728 B and 2197651712 B on both sides of (b2), 2395242752 B for Qwen's server case. The replay charges G in the same fit after the KV extents, for the device-resident attention layers only, in ascending per-shape order, never names it as a demotion cause, and pre-registers the SDPA-admitted layer count and the `scratch_unplaced` count. The "Graph scratch admitted as a member" RED (2398978304 B against 2197651712 B) now applies on both trees. Consequence stated in C10: from (b2) the Qwen pack's capacity is 335.8 MiB below master's weight zone (was 527.8), and G takes only the room the pack and the KV leave, so few or no Qwen layers may keep SDPA; the replay pre-registers the count. 23mk's Qwen row cites this follow-up's hash. |
+| §M64 (a), (c); design-23mk-r20 I-3, m-3 (second follow-up) | (b1) could route a Graph draw that misses the ONEDNN cap to the direct overflow `onednn_graph_scratch_alloc_direct_locked` (`unified-cache.cpp:11721`), which breaks P1, P2 and P4; admission could admit a layer whose term exceeds the override; and (b2)'s text still named a context refusal | **Changed.** The Graph-scratch commit's (b1) bullet states that (b1) never uses the direct overflow: over the cap it declines oneDNN SDPA on that device, counted, with one WARN per (context, device), and the interim cost is not accepted. The step-4 interim sizing says the same where the clamp binds. Admission declines, never admits, a layer whose term exceeds the override (P4). (b2)'s charge is moua's fit after the KV extents, with `scratch_unplaced` for a layer that does not fit and no context refusal, and its deletion of the direct path stands unless 23mk names another commit or ticket (relayed). |
 
 **Relays.**
 - **1oxa:** (1) Under rulings §M59 (a), moua's pre-cut VM GREEN is null after one `[VM-WT]` line
@@ -12650,9 +12670,13 @@ below is at `c69d5774d`; at master `d19308be3` each one above `:40214` is one hi
   §3.3's replay, so the load's reservation holds no G at any landing order and G takes only the
   `REGION` room the pack and the KV leave. If you read "`FIRST_CONTEXT` calls the same fit" as
   the load reserving G's admitted bytes, please say so: that would put G ahead of the pack, and
-  the order would need a ruling. Your Qwen §9.3 row can cite the follow-up's hash for the fixed
-  replay. On Qwen from (b2) the replay may admit few or no layers to SDPA, since master already
-  demotes 5 of 10 KV layers at `-c 4096`.
+  the order would need a ruling. Your Qwen §9.3 row can cite `2489d9e85` for the fixed replay.
+  (7) §M64 (a): moua's text reads the deletion of `onednn_graph_scratch_alloc_direct_locked`
+  (`unified-cache.cpp:11721`) as (b2)'s; please state the commit that deletes it, or cite the
+  ticket that does, and moua will cite that. (b1) declines SDPA over the cap, counted, with one
+  WARN per (context, device), and admission declines a layer whose term exceeds the override
+  (§M64 (c)). On Qwen from (b2) the replay may admit few or no layers to SDPA, since master
+  already demotes 5 of 10 KV layers at `-c 4096`.
 - **zhcn:** (1) GA (rulings §M60, §M61 (b)): moua marks GA's count unmeasured and cites your GA
   (`e4f424a`, `llama-cli`, about 1 demoted layer) as its single source. moua states none of your
   figures, neither GDC3's F nor the compute, and withdraws its −709.4 and 6 layers, which
