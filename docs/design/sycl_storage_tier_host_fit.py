@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Host-fit calculator behind docs/design/sycl-storage-tier-lazy-tables.md §4.5
-# (llama.cpp-th32, rev 2c). Hand arithmetic only: llama.cpp-7v5c (T27's
+# (llama.cpp-th32, rev 2d). Hand arithmetic only: llama.cpp-7v5c (T27's
 # host-only plan dry-run) replaces every number here once it exists.
 #
 #   python3 docs/design/sycl_storage_tier_host_fit.py
@@ -15,7 +15,10 @@ OS_RESERVE = 8.0            # max(8 GiB, MemTotal/32), unified-cache.cpp:4216
 P3_MARGIN = 29.0            # 9g22 §4.5.2: MemAvailable_pre - expected_host - 5 >= 24
 ENVELOPE = 2.5              # host_reserve 2 GiB + context envelope <= 0.5 (§4.3 step 3)
 GATE_CACHES = 4.0           # 2 GiB per table, index included, two tables (9g22 P1, lead ruling T5)
-DRAFT = 7.9                 # DSpark draft on the host (9g22 §10.3)
+DRAFT = 7.9                 # the DSpark draft's own HOST bytes only (9g22 §10.3). Its cold-set
+                            # effect (it also displaces device experts) is 9g22 rev 7 §4.5.2's
+                            # figure, which the doc links and this calculator does not model.
+RUNTIME_FLOOR = 0.5         # the VRAM RUNTIME zone's 512 MiB floor (9g22 rev 7 r4 m4)
 DS_TABLE = 60.08 / 2        # one DeepSeek engram table, GiB
 DS_LAYER_EXPERTS = 4.58     # routed-expert bytes per DeepSeek layer, GiB
 KV_MIN = 64 * MIB           # min_kv_zone, ggml-sycl.cpp:5626
@@ -37,6 +40,12 @@ def ring_gib(n_expert, n_embd, n_ff, n_ubatch=512):
     act = align256(rows * max(n_embd, n_ff) * 2)
     out = align256(rows * max(n_embd, n_ff) * 4)
     return weight / GIB, act / GIB, out / GIB, (weight + act + out) / GIB
+
+
+def displaced(ring):
+    # Today the ring sets each card's VRAM RUNTIME zone; after (s) that zone is at its floor.
+    # So the expert room the ring takes is the ring less the floor (9g22 rev 7 §4.5.2, ~7.4 on DS).
+    return max(0.0, ring - RUNTIME_FLOOR)
 
 
 def runtime_commit(x):
@@ -110,9 +119,9 @@ def main():
     q_ex_s = (95.0, 98.0)                       # host experts after (s), B70 holds 21.5-24.5
     q_other = 0.629                             # token_embd on the host
     q_rnh3 = (0.1, 0.5)
-    print("\nQwen3.8, B70 alone. Needed MemAvailable = before-table + table + 8")
+    print("\nQwen3.8, B70 alone. Planner: needed MemAvailable = before-table + table + 8")
     for today in (True, False):
-        disp = q_ring[3] if today else 0.0      # the ring sets the VRAM RUNTIME floor today
+        disp = displaced(q_ring[3]) if today else 0.0
         z = qw[today]
         before = tuple(q_ex_s[i] + disp + q_other + q_rnh3[i] + z["nonweight_committed"] + ENVELOPE for i in (0, 1))
         need = (before[0] + q_table + OS_RESERVE, before[1] + q_table + OS_RESERVE)
@@ -125,6 +134,17 @@ def main():
         if today:
             nd = (need[0] - disp, need[1] - disp)
             print("    without the device displacement: needs %.1f-%.1f" % nd)
+        # P3 binds every load (lead ruling T6 m-14): HOST only if post-load MemAvailable >= 24 with
+        # the table HOST, i.e. MemAvailable_pre >= expected_host + 29, where expected_host is step 2
+        # (before the envelope and reserve) plus the table.
+        s2 = (before[0] - ENVELOPE, before[1] - ENVELOPE)
+        eh = (s2[0] + q_table, s2[1] + q_table)
+        p3 = (eh[0] + P3_MARGIN, eh[1] + P3_MARGIN)
+        print("    P3 with the table HOST: expected_host %.1f-%.1f, needs MemAvailable_pre %.1f-%.1f" % (eh + p3))
+        for r in READINGS:
+            post = (r - eh[1] - 5, r - eh[0] - 5)
+            res = "HOST" if post[0] >= 24 else ("HOST at the low corner only" if post[1] >= 24 else "STORAGE")
+            print("      @%.1f post-load %.1f to %.1f -> %s" % (r, post[0], post[1], res))
 
     # ---- DeepSeek Q2_K
     ds_experts = 196765286400 / GIB             # 183.25 GiB routed experts
@@ -138,7 +158,7 @@ def main():
     print("\nDeepSeek Q2_K. Planner fit: needed MemAvailable = requirement + 8 (main-pool rounding, 0-2 GiB, excluded)")
     for today in (True, False):
         z = ds[today]
-        disp = ds_ring[3] if today else 0.0
+        disp = displaced(ds_ring[3]) if today else 0.0
         s = step2(p1_s, z, disp)
         print(" %s: step 2 (as committed) %.1f-%.1f" % ("today's code" if today else "after (s)", s[0], s[1]))
         A = (s[0] + ENVELOPE, s[1] + ENVELOPE)
