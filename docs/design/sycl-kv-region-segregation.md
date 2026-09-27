@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14v, by impl-moua, 2026-09-27. The revisions answer thirty reviews:
+Design, revision 7.14w, by impl-moua, 2026-09-27. The revisions answer thirty-one reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -174,6 +174,10 @@ Design, revision 7.14v, by impl-moua, 2026-09-27. The revisions answer thirty re
   Minor, 4 nits; the interim pairing rule ruled sound), recorded in §6.38. Revision 7.14v is one
   commit on top of `8aeb2253d`: the W-order bound check reads one use descriptor, and the bound
   cell's order and synchronize are pinned.
+- design review r30 (design-moua-r30 on `8aeb2253d..df4dcf937`: 0 Critical, 0 Important, 4
+  Minor, 3 nits), recorded in §6.39. Revision 7.14w is one commit on top of `df4dcf937`: the
+  recorded use's descriptor is carried in meta and built at submit, the bound cell binds its
+  contexts and gains a production child, and H7 (as) gains positive and source clauses.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -1051,7 +1055,17 @@ written:
     FIRST_CONTEXT)`. On any exit that does not publish, the guard's first phase re-records the
     saved ranges in the section that clears the transaction's own (§2.4.2 "The transaction
     guard"), so a refused first context leaves the reservation whole for the next. The
-    model's unload clears it if no context took it (A4 names it beside `WEIGHT`);
+    model's unload clears it if no context took it (A4 names it beside `WEIGHT`). **zhcn reads
+    it (zhcn 5.35 `1d32420`, H5L (n)):** its `GGML_SYCL_PRIVATE_TESTING` accessor
+    `llama_sycl_first_context_reservation_bytes_for_testing(dev)` is the one accessor for this
+    figure, and moua defines no other. It reads no copy. It returns the byte sum of
+    `pending_ranges(c, dev, owner, FIRST_CONTEXT)` on the device's shared-zone TLSFs, with
+    `owner` = `{LOAD, txn}` before the load commits and `{MODEL, id}` after the retag. The
+    scalar `pending_bytes(owner, term_filter)` takes no device, so it cannot serve. The sum is
+    non-zero only from the load's recording (§2.4.2 (b) step 3, after the c(P) measure) until
+    the first context's step 5 clear, the unload or the rollback. It holds c(P), not Ĉ, and
+    only `HEAD_SLOT` records. With two live models on a device it sums both unless the
+    accessor filters by owner. It lands with L4, and before L4 it reads 0;
   - `VM_TAIL_SURPLUS`: 1oxa's (rev 11 `f6d3015`; rulings §V13 I-4, §V14 I-E, §V17 m-10). At the
     mark of a rolled-back load **that leaves a live model** on a VM device, under the tail's
     group mutex, 1oxa records the tail's **surplus
@@ -2513,37 +2527,70 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                  production function (r24 I-3)**,
                  `ggml_sycl_device_entry_w_ordered(entry, queue, use, steps)`. The oneDNN PP
                  path calls it, and G2 calls it too. **`use` is the one source of the use's
-                 shape and context (r29 m-1):** a `ggml_sycl_w_use_desc { uint32_t ctx_id;
-                 uint32_t n_ubatch; size_t graph_nodes; }`, where `ctx_id` is the backend
-                 context's `ContextId`, the id the `ctx=%u` plan lines print. The oneDNN PP
-                 branch fills it from its own backend context and `src1->ne[1]`, with
-                 `graph_nodes` 0 for a direct use; the graph wrapper fills it for a recorded
-                 use from the recording's context, the `n_ubatch` its meta's W entry recorded
-                 at capture and the recording's node count; a marker use passes it
-                 explicitly. **`steps` is an ordered list of the use's
-                 W-touching step callables (r25 m-9).** Each step submits on `queue` and returns
-                 its event, or returns none when it throws or declines, and the function calls
-                 the steps itself, so it sees every one. It anchors the use on the **last** step
-                 that returned an event. On the production path that is the matmul that reads W,
-                 not the reorder that writes it: an anchor on the reorder would let the next
-                 use's reorder overwrite W under this matmul. When `row_gemm` throws
-                 (`ggml-sycl.cpp:65729-65733` at `c69d5774d`), the path falls back to the
-                 unified kernel, which reads `src0` and not W, so the anchor is the reorder's
-                 event (r25 m-10). **Before the use** the caller resolves its view, its
-                 retention copy and every allocation the steps need: the activation views; the
-                 scratchpad memory, through `ctx.get_scratchpad_mem`, which takes
-                 `ctx.dnnl_mutex` and can allocate (`common.hpp:5948`, `:5961`); the dnnl stream
-                 and engine, through `ctx.stream_dnnl(q)` and `ctx.engine_dnnl(q)`, which take
-                 `dnnl_mutex` (`common.hpp:5932`, `:5927`); **and its oneDNN primitives**,
-                 created or fetched with their JIT and oneDNN's primitive-cache lock (r24 m-3).
-                 The matmul step calls a pre-resolved variant of `DnnlGemmWrapper::gemm` that
-                 takes all of these as arguments (relay to 23mk, §6.34), so nothing inside the
-                 use allocates, compiles or takes `dnnl_mutex` (r25 I-3). After the use the
-                 caller hands its retention copy to `retain_handles_until_event`. A thread-local
-                 flag spans the use, from the ordering decision to the last step's return, and
-                 under `GGML_SYCL_STRICT_LEASES=1` every unified-cache allocation entry aborts
-                 by name while it is set. **The order has two forms, and G0 picks one before
-                 this code lands (rulings §M59(c); r25 I-3, I-4, m-6):**
+                 shape and context (r29 m-1):** a `ggml_sycl_w_use_desc { uint64_t ctx_id;
+                 uint32_t n_ubatch; size_t graph_nodes; }`. `ctx_id` is the backend context's
+                 `execution_context_id` (`uint64_t`, `common.hpp:5667` at `d8a67422d`), the
+                 value of the `ContextId` (`execution-lifecycle.hpp:20`) that
+                 `ggml_backend_sycl_execution_context_bind_backend` binds
+                 (`ggml-sycl.cpp:14810`, written at `:14841` and `:14873`) (r30 n-1). **0 means
+                 unbound (r30 m-2):** the registry issues ids from 1 (`next_context_id_ = 1`,
+                 `execution-lifecycle.hpp:480`), and the reset zeroes the field
+                 (`ggml-sycl.cpp:11877`). A llama context binds its backends, so its uses carry
+                 its own non-zero id. An unbound backend context (`test-backend-ops`, or any
+                 non-llama caller of the oneDNN PP branch) passes 0, and every unbound context
+                 on a device shares that one dedup key, so they get one WARN between them. The
+                 WARN is a diagnostic and the out-of-bound flag is per entry, so the shared key
+                 loses only the WARN's per-context count, never the flag. The descriptor has
+                 three fills, and each is named (r30 m-1):
+                 - **The oneDNN PP branch, for a direct use:** `ctx_id` =
+                   `ctx.execution_context_id`, read under `ctx.execution_state_mutex` (the lock
+                   that the field's writers hold, and that the callers of
+                   `ggml_sycl_execution_snapshot_locked`, `ggml-sycl.cpp:11850`, hold) before
+                   the use and released before the ordering decision; `n_ubatch` =
+                   `src1->ne[1]`; and `graph_nodes` = 0.
+                 - **A recorded use, in three steps.**
+                   - **Capture.** While a graph records, the PP branch fills `use` as above and
+                     calls the function. The function compares nothing, since a capture is not a
+                     use. It adds {entry, `use.ctx_id`, `use.n_ubatch`} to the thread-local
+                     baked-W record, keeping the largest `n_ubatch` when an entry recurs.
+                   - **Finalize.** `ggml_sycl_graph_finalize(graph, props, meta)` moves that
+                     record into meta, and adds the recording's node count as
+                     `graph.get_nodes().size()` on the modifiable `command_graph` before it
+                     finalizes. That is the SYCL command-graph node count, the one unit every
+                     finalize site can read, since the `unified-kernel.cpp` sites have no ggml
+                     cgraph. G0 F3 prints its bound in the same unit, read by the same call
+                     through the same wrapper (§3.2).
+                   - **Submit.** For each entry meta names, `ggml_sycl_graph_submit(queue,
+                     exec, meta)` builds `use` = {the record's `ctx_id`, the record's
+                     `n_ubatch`, meta's node count} and calls the function. So the check runs
+                     at submit, once for each first execute and replay, which are the W uses
+                     `ggml_sycl_test_w_order_uses` counts.
+                 - **A marker use** passes `use` explicitly (G2).
+
+                 **`steps` is an ordered list of the use's W-touching step callables (r25
+                 m-9).** Each step submits on `queue` and returns its event, or returns none
+                 when it throws or declines, and the function calls the steps itself, so it sees
+                 every one. It anchors the use on the **last** step that returned an event. On
+                 the production path that is the matmul that reads W, not the reorder that
+                 writes it: an anchor on the reorder would let the next use's reorder overwrite
+                 W under this matmul. When `row_gemm` throws (`ggml-sycl.cpp:65729-65733` at
+                 `c69d5774d`), the path falls back to the unified kernel, which reads `src0` and
+                 not W, so the anchor is the reorder's event (r25 m-10). **Before the use** the
+                 caller resolves its view, its retention copy and every allocation the steps
+                 need: the activation views; the scratchpad memory, through
+                 `ctx.get_scratchpad_mem`, which takes `ctx.dnnl_mutex` and can allocate
+                 (`common.hpp:5948`, `:5961`); the dnnl stream and engine, through
+                 `ctx.stream_dnnl(q)` and `ctx.engine_dnnl(q)`, which take `dnnl_mutex`
+                 (`common.hpp:5932`, `:5927`); **and its oneDNN primitives**, created or fetched
+                 with their JIT and oneDNN's primitive-cache lock (r24 m-3). The matmul step
+                 calls a pre-resolved variant of `DnnlGemmWrapper::gemm` that takes all of these
+                 as arguments (relay to 23mk, §6.34), so nothing inside the use allocates,
+                 compiles or takes `dnnl_mutex` (r25 I-3). After the use the caller hands its
+                 retention copy to `retain_handles_until_event`. A thread-local flag spans the
+                 use, from the ordering decision to the last step's return, and under
+                 `GGML_SYCL_STRICT_LEASES=1` every unified-cache allocation entry aborts by name
+                 while it is set. **The order has two forms, and G0 picks one before this code
+                 lands (rulings §M59(c); r25 I-3, I-4, m-6):**
                  - **Form M, a device-side completion marker (preferred, §M59(c)'s narrowed
                    form).** The ordering decision is one atomic `fetch_add` on the entry's
                    sequence counter, which gives the use its number n. No mutex is held for it,
@@ -2574,16 +2621,34 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    one. **That holds inside the measured shapes only, and the bound is stated
                    and guarded (r27 m-9).** G0's F3 prints, with T and K, the bound its cells
                    cover per card: the largest `n_ubatch` and the largest W-touching recorded
-                   graph (its node count) among the gate shapes, which include C2b's ladder,
-                   whose top rung is 2048 at the default `n_batch`; the W-order commit compiles
-                   both in with K. A larger shape (a longer replayed graph, a larger ubatch or
-                   model) can have a longer tail than 2T. Outside the bound the use still runs,
-                   since refusing would fail correct runs that never come near 2T, but it is
-                   named: the first W use whose `use.n_ubatch` is above the bound, or whose
-                   `use.graph_nodes` is above the node bound, prints once per (`use.ctx_id`,
-                   device), deduped by a per-entry set of `ctx_id`s,
+                   graph (its command-graph node count, the unit meta carries) among the gate
+                   shapes, which include C2b's ladder, whose top rung is 2048 at the default
+                   `n_batch`; the W-order commit compiles both in with K, as
+                   `GGML_SYCL_W_ORDER_BOUND_N_UBATCH` and `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES`
+                   (r30 m-4). A larger shape (a longer replayed graph, a larger ubatch or model)
+                   can have a longer tail than 2T. Outside the bound the use still runs, since
+                   refusing would fail correct runs that never come near 2T, but it is named.
+                   **The names (r30 m-4).** The function reads the device's bound as
+                   `ggml_sycl_w_order_bound_for(device)`, a
+                   `ggml_sycl_w_order_bound { uint32_t n_ubatch; size_t graph_nodes; }` that
+                   holds the two compiled constants unless `ggml_sycl_test_set_w_order_bound`
+                   overrode them. At the start of a
+                   use (a capture compares nothing, above), before the ordering decision, it
+                   tests `use.n_ubatch > bound.n_ubatch || use.graph_nodes > bound.graph_nodes`.
+                   An in-bound use takes no lock. An out-of-bound use takes the entry's
+                   `w_order_warn_mutex` and inserts `use.ctx_id` into the entry's
+                   `w_order_warned_ctx` set. If the insert is new, it prints
                    `[W-ORDER] shape above the measured tail bound on device %d: n_ubatch=%u
-                   graph_nodes=%zu bound=%u/%zu` at WARN and sets a flag on the entry. A cap
+                   graph_nodes=%zu bound=%u/%zu` at WARN, once per (`use.ctx_id`, device). On
+                   every out-of-bound use it sets the entry's `std::atomic<bool>
+                   w_order_out_of_bound` flag with a release store.
+                   **`w_order_warn_mutex` is a leaf (r30 n-3).** Two threads' first uses can
+                   reach the insert together, since Form M holds no mutex for the ordering
+                   decision. The mutex is held only for the insert, the print and the flag
+                   store, never across a submit, and nothing is taken under it. It is taken
+                   before the ordering decision, so it never nests with Form E's W-order mutex.
+                   The set's host allocation happens before the use's thread-local flag is set,
+                   so it is outside the strict-mode span. §2.10's L7 row lists it. A cap
                    with the flag set aborts with its own message, `[W-ORDER] marker wait capped
                    on device %d outside the measured tail bound: re-measure G0 F3 at this
                    shape`, so an out-of-bound fault is never read as a lost publisher, and an
@@ -2591,17 +2656,18 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    bound, and scores the WARN at 0; G2's bound cell (§3.2) is that zero's
                    positive control, and it separates the two abort messages (r28 m-4). The
                    comparison and the dedup are inside `ggml_sycl_device_entry_w_ordered` and
-                   read only `use`'s fields, never a caller's shape, and H7 (as) gates that (r29
-                   m-1). A publisher that finds the fault set does not publish, so every later
-                   waiter also reaches its cap, and `ggml_backend_sycl_synchronize` reads the
-                   fault word after its wait and aborts with
-                   `[W-ORDER] marker wait capped on device %d: W ordering lost`. A capped wait
-                   therefore never lets a run finish silently, since proceeding silently is the
-                   W race. A scope guard submits the publisher, so a throwing step still
-                   publishes after the last event it returned. **Cost:** K + 1 single-work-item
-                   kernels per eager W use (the waiter chain and the publisher), one use per
-                   oneDNN PP `MUL_MAT`, and K + 1 per replay; C6's PP ABBA arms score it, with K
-                   as G0 printed it for that card.
+                   read only `use`'s fields, never a caller's shape. Each of the three fills
+                   takes its fields from its own named source (above). H7 (as) gates both, with
+                   positive clauses (r29 m-1; r30 m-3, m-4). A publisher that finds the fault
+                   set does not publish, so every later waiter also reaches its cap, and
+                   `ggml_backend_sycl_synchronize` reads the fault word after its wait and
+                   aborts with `[W-ORDER] marker wait capped on device %d: W ordering lost`. A
+                   capped wait therefore never lets a run finish silently, since proceeding
+                   silently is the W race. A scope guard submits the publisher, so a throwing
+                   step still publishes after the last event it returned. **Cost:** K + 1
+                   single-work-item kernels per eager W use (the waiter chain and the
+                   publisher), one use per oneDNN PP `MUL_MAT`, and K + 1 per replay; C6's PP
+                   ABBA arms score it, with K as G0 printed it for that card.
                  - **Form E, an event section (the fallback).** The entry holds one slot,
                    `last_w_event`, and a **W-order mutex**. Under it the function reads
                    `last_w_event`, calls the steps (the first step's submit carries
@@ -2642,14 +2708,17 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    `ext_oneapi_graph` submit goes through
                    `ggml_sycl_graph_submit(queue, exec, meta)`. While a graph records, the
                    W-ordered function submits nothing for the order (Form M bakes no waiter and
-                   no publisher; Form E reads and writes no slot) and sets a thread-local record
-                   of the entries whose W the recording touches. Each recording site copies that
-                   record into its executable graph's meta at `end_recording`. A replay whose
-                   meta names an entry is one W use on it. Form M submits an eager waiter before
-                   the `ext_oneapi_graph` submit and an eager publisher after it, with fresh
-                   numbers as kernel arguments, so no replay waits on a number baked at record
-                   time. Form E runs the submit as the use's single step and stores the replay's
-                   event. §2.10's census lists the sites and H7z's gate.
+                   no publisher; Form E reads and writes no slot) and adds {entry, `use.ctx_id`,
+                   `use.n_ubatch`} to a thread-local record of the entries whose W the
+                   recording touches. Every finalize goes through `ggml_sycl_graph_finalize`,
+                   which moves that record into the executable graph's meta and adds the
+                   recording's command-graph node count (the descriptor's fills, above; r30
+                   m-1). A first execute or replay whose meta names an entry is one W use on
+                   it, and the submit wrapper builds its `use` from meta. Form M submits an
+                   eager waiter before the `ext_oneapi_graph` submit and an eager publisher
+                   after it, with fresh numbers as kernel arguments, so no replay waits on a
+                   number baked at record time. Form E runs the submit as the use's single step
+                   and stores the replay's event. §2.10's census lists the sites and H7z's gate.
                  - **The A half needs no such order:** each context's `onednn_pp_a` is its own.
              - **The pair's activations half is not the entry's (rulings §M48 I-2).** It is
                `onednn_pp_a`, a C term placed as a head slot in its context's `REGION` (§2.4.5),
@@ -2889,17 +2958,18 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            `-c 4096 -ub 512`. **The reservation is not a zone term:** no zone grows for it, the
            dry run does not see it (the C rule, §2.4.5), and its bytes are a `FIRST_CONTEXT`
            pending range in the device's shared zone, recorded with the load's `WEIGHT` ranges
-           (the recording, below). The pack's capacity on a device is the `WEIGHT` zone less the
-           device's reservation, so the pack cannot spend the bytes the first context needs, and
-           the model's first context on the device takes them over at its transaction (§2.4.2
-           step 5). **zhcn's compute slot at load: one measure, three call sites (rulings §M37
-           Q1, §Z20, §M40).** The compute slot depends on the placement, since tiering a layer
-           to the host adds scheduler splits, and the pack's capacity must leave room for it
-           before the placement exists. So zhcn's one measure function runs, at n₀ and the
-           envelope's `n_ctx`, through a transient measure-only context that owns no buffer,
-           makes no unified-cache allocation, registers no live context of the model, freezes
-           nothing and is destroyed inside the load, at three call sites. Each call site names
-           its input, and there is no second implementation:
+           (the recording, below). zhcn's test accessor reads that range and nothing else
+           (§2.3.3's `FIRST_CONTEXT` bullet). The pack's capacity on a device is the `WEIGHT`
+           zone less the device's reservation, so the pack cannot spend the bytes the first
+           context needs, and the model's first context on the device takes them over at its
+           transaction (§2.4.2 step 5). **zhcn's compute slot at load: one measure, three call
+           sites (rulings §M37 Q1, §Z20, §M40).** The compute slot depends on the placement,
+           since tiering a layer to the host adds scheduler splits, and the pack's capacity must
+           leave room for it before the placement exists. So zhcn's one measure function runs,
+           at n₀ and the envelope's `n_ctx`, through a transient measure-only context that owns
+           no buffer, makes no unified-cache allocation, registers no live context of the model,
+           freezes nothing and is destroyed inside the load, at three call sites. Each call site
+           names its input, and there is no second implementation:
            1. **Ĉ, before the pack:** on the record-pass probe (item 2 above), every create-set
               entry carrying a size-0 dummy buffer (zhcn §2.10 (a), with usage
               `GGML_BACKEND_BUFFER_USAGE_WEIGHTS`, rulings §Z21 I-2): an entry not forced off
@@ -7205,7 +7275,14 @@ L7 documents this limit, and pattern #2 remains the remedy.
     oneDNN pair's weights half W (§2.4.2), kept only inside `ggml_sycl_device_entry_w_ordered`.
     G0 picks the form (§3.2), and this row states both:
     - **Form M has no W-order mutex.** The ordering decision is an atomic `fetch_add` on the
-      entry's sequence counter, and no lock is held across a submit, so it adds no lock here.
+      entry's sequence counter, and no lock is held across a submit. It adds one leaf lock,
+      the entry's `w_order_warn_mutex` (r30 n-3). Only an out-of-bound use takes it, before
+      the ordering decision, and holds it for the `w_order_warned_ctx` insert, the WARN's
+      print and the `w_order_out_of_bound` store. Nothing is taken under it, it is never held
+      across a submit or a wait, and it never nests with Form E's W-order mutex. Callers may
+      hold `ctx.graph_mutex` and L2 when they take it, since it is a leaf. The oneDNN PP
+      fill's read of `execution_context_id` takes `ctx.execution_state_mutex` for that read
+      alone, before the use, and releases it before either W lock is taken (§2.4.2).
     - **Form E's W-order mutex is not a leaf, and its rank is stated here once.** It guards
       `last_w_event` and is held across one W use's steps, and the matmul step takes
       `exec_mutex(q)` (`gemm.hpp:338`) under it. The order is `g_sycl_graph_compute_mutex` (L2),
@@ -7249,26 +7326,29 @@ L7 documents this limit, and pattern #2 remains the remedy.
       execute; and `:107235`, the main replay). `:99242` and `:99324` are comments. Whether a
       recording bakes W is decided at run time, not per site: every finalize goes through
       `ggml_sycl_graph_finalize(graph, props, meta)`, which moves the thread-local baked-W
-      record into the graph's meta, and every submit goes through
-      `ggml_sycl_graph_submit(queue, exec, meta)`. A site whose recordings can never reach the
-      oneDNN PP branch carries an empty meta and pays one empty check. So all seventeen sites
-      are wrapped and none is left to a gate of its own. **`unified-kernel.cpp` has seventeen
-      more (r26 m-8),** the same at `c69d5774d` and `e2461d4fb`: six finalizes (`:9365`,
-      `:9407`, `:9448`, `:9520` and `:9579` in `UnifiedKernel::benchmark_graph_overhead`, and
-      `:10876` in `record_micro_graph`) and eleven submits (`:9368`, `:9374`, `:9409`, `:9414`,
-      `:9450`, `:9455`, `:9522`, `:9527`, `:9581` and `:9586` in the benchmark, and `:10928` in
-      `launch_micro_graph_kernel`, the production MICRO-GRAPH). The micro-graph records the
-      unified kernel's fused ops, and the benchmark records `single_task` nodes on a scratch
-      buffer; neither reaches the oneDNN PP branch, so both would carry an empty meta. They are
-      wrapped all the same, so the rule has no file-scoped exception: the census is by grep over
-      the backend's sources with comments stripped (the gate's rule, below), `ggml-sycl.cpp` and
-      `unified-kernel.cpp` together: thirty-four sites on thirty-five lines, 18 and 17, since
-      `:107431-107432` at `e2461d4fb` (`:107224-107225` at `c69d5774d`) is one site whose
-      ternary puts its two calls on two lines (r27 m-7). A grep of the raw source finds five
-      more lines in `ggml-sycl.cpp`, all comments: two in prose (`:99449` and `:99531` at
-      `e2461d4fb`, the `:99242` and `:99324` above) and three of commented-out code (`:106843`,
-      `:106844` and `:106855`, `model_sycl_graph.finalize(`). The replay RED edits `:107235`
-      (`:107236` at master `d19308be3`) back to a raw `ext_oneapi_graph` call.
+      record, each entry with its `ctx_id` and `n_ubatch`, into the graph's meta and adds the
+      modifiable graph's `get_nodes().size()` as its node count; every submit goes through
+      `ggml_sycl_graph_submit(queue, exec, meta)`, which builds each entry's
+      `ggml_sycl_w_use_desc` from meta (§2.4.2; r30 m-1). A site whose recordings can never
+      reach the oneDNN PP branch carries an empty meta and pays one empty check. So all
+      seventeen sites are wrapped and none is left to a gate of its own. **`unified-kernel.cpp`
+      has seventeen more (r26 m-8),** the same at `c69d5774d` and `e2461d4fb`: six finalizes
+      (`:9365`, `:9407`, `:9448`, `:9520` and `:9579` in
+      `UnifiedKernel::benchmark_graph_overhead`, and `:10876` in `record_micro_graph`) and
+      eleven submits (`:9368`, `:9374`, `:9409`, `:9414`, `:9450`, `:9455`, `:9522`, `:9527`,
+      `:9581` and `:9586` in the benchmark, and `:10928` in `launch_micro_graph_kernel`, the
+      production MICRO-GRAPH). The micro-graph records the unified kernel's fused ops, and the
+      benchmark records `single_task` nodes on a scratch buffer; neither reaches the oneDNN PP
+      branch, so both would carry an empty meta. They are wrapped all the same, so the rule has
+      no file-scoped exception: the census is by grep over the backend's sources with comments
+      stripped (the gate's rule, below), `ggml-sycl.cpp` and `unified-kernel.cpp` together:
+      thirty-four sites on thirty-five lines, 18 and 17, since `:107431-107432` at `e2461d4fb`
+      (`:107224-107225` at `c69d5774d`) is one site whose ternary puts its two calls on two
+      lines (r27 m-7). A grep of the raw source finds five more lines in `ggml-sycl.cpp`, all
+      comments: two in prose (`:99449` and `:99531` at `e2461d4fb`, the `:99242` and `:99324`
+      above) and three of commented-out code (`:106843`, `:106844` and `:106855`,
+      `model_sycl_graph.finalize(`). The replay RED edits `:107235` (`:107236` at master
+      `d19308be3`) back to a raw `ext_oneapi_graph` call.
 
     **H7z's source gate (rulings §M59(c); r24 n-6; r25 I-3).** Its scope is
     `ggml_sycl_device_entry_w_ordered`, the bodies of the step callables passed to it, and their
@@ -8793,14 +8873,36 @@ means that.
     check. A host arm drives the admission with the recording flag set and expects that line
     and no weight-slot claim. Mutation witness: the check removed, under which the arm sees a
     weight-slot claim and no `[ZONE-PLAN-BUG]` line;
-  - (as) **the W-order bound check has one source, the use descriptor (r29 m-1).** On the
-    comment-stripped source, the bound comparison (the compiled bound's two fields, or the
-    test seam's override) and the per-entry `ctx_id` dedup occur only inside
-    `ggml_sycl_device_entry_w_ordered`, and read only its `use` parameter's `ctx_id`, `n_ubatch`
-    and `graph_nodes`; no caller of the function names the bound, and every caller passes a
-    `ggml_sycl_w_use_desc`. Mutation witnesses: the comparison moved into the oneDNN PP caller
-    on `src1->ne[1]` (under which the G2 bound cell's marker uses print 0 WARNs), and a dedup
-    keyed by the queue instead of `ctx_id`.
+  - (as) **the W-order bound check has one source, the use descriptor (r29 m-1; r30 m-3,
+    m-4).** It runs on the comment-stripped source.
+    - **Positive clauses (r30 m-4).** They fail on the pre-change tree, which has no such
+      function, and on a tree with the comparison or the dedup deleted, and they are the
+      positive witness for the restriction clauses' zero. Each must match at least once inside
+      the body of `ggml_sycl_device_entry_w_ordered`:
+      - a comparison of `use.n_ubatch` against the `n_ubatch` field of
+        `ggml_sycl_w_order_bound_for(...)`'s result;
+      - a comparison of `use.graph_nodes` against its `graph_nodes` field;
+      - an insert into `w_order_warned_ctx` keyed on `use.ctx_id`.
+    - **Restriction clauses.** `ggml_sycl_w_order_bound_for`,
+      `GGML_SYCL_W_ORDER_BOUND_N_UBATCH`, `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` and
+      `w_order_warned_ctx` occur nowhere else, except in their definitions and in
+      `ggml_sycl_test_set_w_order_bound`'s body. So no caller names the bound. Every caller
+      passes a `ggml_sycl_w_use_desc`.
+    - **Source clauses on the fills (r30 m-3).**
+      - In the oneDNN PP branch, the descriptor's initializer takes `n_ubatch` from
+        `src1->ne[1]` and `ctx_id` from `ctx.execution_context_id`.
+      - In the function's capture path, the record's two fields are read from `use.ctx_id`
+        and `use.n_ubatch`, and from nothing else.
+      - In `ggml_sycl_graph_finalize`, meta's node count is `get_nodes().size()`.
+      - In `ggml_sycl_graph_submit`, all three of the descriptor's fields are read from meta's
+        record and meta's node count, and from nothing else.
+    - **Mutation witnesses.**
+      - The comparison moved into the oneDNN PP caller on `src1->ne[1]`: the positive and
+        restriction clauses fail, and the G2 bound cell's (a) prints 0 WARNs.
+      - A dedup keyed by the queue instead of `ctx_id`: the third positive clause fails.
+      - The PP fill's `n_ubatch` set to 0 or a constant: its source clause fails, and the bound
+        cell's (d) prints 0 WARNs.
+      - The submit's `graph_nodes` set to 0: its source clause fails.
   RED: every check fires on the pre-change tree, and the count is recorded.
 - **H8 region scope under concurrency (r1 I6, third point).**
   - The registry and scope logic is factored into a SYCL-free header, `kv-region-registry.hpp`.
@@ -9193,8 +9295,11 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
   fault word. F1 and F2 must progress within one C, and F3 gives T, from which K = ⌈2 T / C⌉; a
   cell that caps with K waiters on a correct run voids the derivation. F3 also prints the bound
   its cells cover, the largest `n_ubatch` and W-touching graph node count, which §2.4.2's
-  out-of-bound WARN compares against (r27 m-9). G0 also prints the engine class's xe
-  `job_timeout_ms` for each card, and the cap must sit below it.
+  out-of-bound WARN compares against (r27 m-9). The node count is the SYCL command-graph node
+  count, `get_nodes().size()`, which `ggml_sycl_graph_finalize` stores in meta, and F3 reads it
+  from the meta of the graphs it replays. That is the unit the submit wrapper passes as
+  `use.graph_nodes`, so the two sides are never in different units (r30 m-1). G0 also prints the
+  engine class's xe `job_timeout_ms` for each card, and the cap must sit below it.
 - **Attribution (r25 m-5 (d)).** Each cell prints `[G0] cell=<H>/<M> start` before it runs and
   `[G0] cell=<H>/<M> submit_ms=%.1f verdict=returns|blocks` after (the controls and F1/F2 print
   the same two lines under their own names). An in-process watchdog thread arms at each start
@@ -9298,8 +9403,8 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
   - a **marker use**: the use resolves the pair's view through `acquire_onednn_pp_scratch`
     (`ggml-sycl.cpp:1483`) and then calls the production
     `ggml_sycl_device_entry_w_ordered(entry, queue, use, steps)` (§2.4.2), with `use` = {the
-    context's `ContextId`, 32, 0}, the production use's column count and no recording, unless
-    an arm states another, and two steps, each a
+    context's `execution_context_id`, 32, 0}, the production use's column count and no
+    recording, unless an arm states another, and two steps, each a
     kernel on the context's own in-order queue: a **W writer**, which writes the use's id into
     the view's first word, then a **W reader**, which reads that word and appends the use's id
     and the word it read to the log. The writer stands for the reorder and the reader for the
@@ -9369,8 +9474,8 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
     `GGML_SYCL_PRIVATE_TESTING` build only;
   - `ggml_sycl_test_w_order_uses(dev, term)`: a count the function raises once per ordered use
     (r25 m-10). A recorded graph's first execute and each replay are one ordered use each,
-    through the graph wrapper; the capture itself, a declined use and a path that never calls
-    the function count nothing;
+    through the submit wrapper `ggml_sycl_graph_submit`; the capture itself, a declined use and
+    a path that never calls the function count nothing;
   - `ggml_sycl_test_set_w_order_bound(dev, n_ubatch, graph_nodes)`, Form M only: replaces the
     compiled tail bound (§2.4.2, G0 F3) for the device, so a fixture shape lies outside it (the
     bound cell below; r28 m-4);
@@ -9538,17 +9643,25 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
   the negative control does.
 - **The bound cell (r28 m-4), when G0 picked Form M.** It is the positive control for §2.4.2's
   out-of-bound WARN, whose zero every scored arm reads, and it separates the two abort messages.
-  Three children, each the test binary re-executed with the cell's selector, run X's and Y's
-  marker uses in the pinned order X1, Y1, X2, Y2, each passing `use` = {its context's
-  `ContextId`, 32, 0}: X and Y are two fixture contexts, so two distinct `ctx_id`s, and 32 is
-  the `n_ubatch` the check reads (r29 m-1). **Each child ends with
+  Four children, each the test binary re-executed with the cell's selector. **Binding (r30
+  m-2).** Before X1, each child creates two execution contexts with
+  `ggml_backend_sycl_execution_context_create` (`ggml-sycl.cpp:14788` at `d8a67422d`) and binds
+  X's backend to one and Y's to the other with
+  `ggml_backend_sycl_execution_context_bind_backend` (`:14810`). The child is VOID unless both
+  calls return OK and the two backends' `execution_context_id`s then read non-zero and
+  distinct, printed as `[G2] bound ctx x=%llu y=%llu`. An unbound fixture context reads 0, so X
+  and Y would share one dedup key and (a) would print 1. Children (a) to (c) run X's and Y's
+  marker uses in the pinned order X1, Y1, X2, Y2. Each passes `use` = {its context's
+  `execution_context_id`, 32, 0}, so the two `ctx_id`s are distinct, and 32 is the `n_ubatch`
+  the check reads (r29 m-1). **Each child ends with
   `ggml_backend_sycl_synchronize` on both contexts' backends**, the call that reads the fault
   word after its wait (§2.4.2), and the harness's log read, "after every queue has completed",
   comes after that synchronize (r29 m-2):
-  - **(a) above the bound, no fault.** `ggml_sycl_test_set_w_order_bound(0, 16, <the compiled
-    node bound>)` lowers the device's `n_ubatch` bound to 16, below the uses' 32, before X1.
-    GREEN: exactly one `[W-ORDER] shape above the measured tail bound on device 0:` line per
-    (`ctx_id`, device), at X1 and Y1, so 2, zero `marker wait capped` lines, and exit 0;
+  - **(a) above the bound, no fault.** `ggml_sycl_test_set_w_order_bound(0, 16, SIZE_MAX)`
+    lowers the device's `n_ubatch` bound to 16, below the uses' 32, before X1. The node bound is
+    `SIZE_MAX`, and any value would serve, since every marker use passes `graph_nodes` 0 (r30
+    n-2). GREEN: exactly one `[W-ORDER] shape above the measured tail bound on device 0:` line
+    per (`ctx_id`, device), at X1 and Y1, so 2, zero `marker wait capped` lines, and exit 0;
   - **(b) above the bound, a lost publisher.** As (a), with
     `ggml_sycl_test_w_order_drop_next_publisher(0)` called before X2, so X2 submits no
     publisher and Y2's waiter chain, which waits on X2's number, reaches its cap; the
@@ -9559,9 +9672,19 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
     bound is at least 2048, G0 F3), the same order and the same drop before X2.
     GREEN: exit 134, one `[W-ORDER] marker wait capped on device 0: W ordering lost` line, zero
     `outside the measured tail bound` lines and zero `shape above` lines;
+  - **(d) a production use above the bound (r30 m-3).** It is bound as above. It calls
+    `ggml_sycl_test_set_w_order_bound(0, 16, SIZE_MAX)` and then runs X's production use once:
+    the fixture `MUL_MAT` with `src1` of 32 columns through the oneDNN PP branch, with its VOID
+    guards (the resolver and `ggml_sycl_test_w_order_uses` + 1). GREEN: exactly one
+    `[W-ORDER] shape above the measured tail bound on device 0:` line, reading `n_ubatch=32
+    graph_nodes=0`, zero `marker wait capped` lines, and exit 0. This is the witness that the
+    PP branch fills `n_ubatch` from `src1->ne[1]`. A fill of 0 or of a constant at or below 16
+    prints nothing, and any other constant prints a different `n_ubatch`;
   - **REDs.** The entry's flag never set. (a) still prints its WARNs, but (b) then aborts with
     (c)'s message, so the two messages are told apart only by the flag. A second RED drops the
-    WARN's print: (a) reads 0 lines. Device 0 is the post-selector index of `level_zero:1`.
+    WARN's print: (a) and (d) read 0 lines. A third sets the PP fill's `n_ubatch` to 0: (d)
+    reads 0 lines while (a) still reads 2. Device 0 is the post-selector index of the
+    selector's `level_zero:1`.
 - **Command.** Lead-run once, never in a subagent, with `Shmem` and `MemAvailable` sampled
   before the run and about 5 s after, and the kernel log checked after it (r24 m-7); any GT
   reset, `guc_id` or CAT error line in the window fails G2 and voids the run:
@@ -13616,7 +13739,7 @@ queued during r29: the §6.35 amendment marker and design-23mk-r22's peer-cite n
 
 | item | finding / ruling | disposition |
 |---|---|---|
-| m-1 | the W-order bound check compared "n_ubatch" and "graph_nodes" and deduped per (context, device), but the function's signature carried no shape or context, so each caller could feed a different figure and the bound cell's "fixture n_ubatch" had no source | **Changed.** `ggml_sycl_device_entry_w_ordered(entry, queue, use, steps)` takes a use descriptor `ggml_sycl_w_use_desc { uint32_t ctx_id; uint32_t n_ubatch; size_t graph_nodes; }` (§2.4.2). The oneDNN PP branch fills it from its backend context's `ContextId` and `src1->ne[1]`, with `graph_nodes` 0; the finalize wrapper fills it from the recording's context, the `n_ubatch` its meta's W entry recorded, and the node count; a marker use passes it explicitly. The bound comparison and the per-(`ctx_id`, device) WARN dedup sit inside the function and read only `use`. New H7 (as) is a source gate on that, with two mutation witnesses: the comparison moved into the PP caller on `src1->ne[1]`, and a dedup keyed by queue. The G2 marker use and the bound cell pass `use` = {the context's `ContextId`, 32, 0}, and (a)'s two WARNs are defined from it. |
+| m-1 | the W-order bound check compared "n_ubatch" and "graph_nodes" and deduped per (context, device), but the function's signature carried no shape or context, so each caller could feed a different figure and the bound cell's "fixture n_ubatch" had no source | **Changed.** `ggml_sycl_device_entry_w_ordered(entry, queue, use, steps)` takes a use descriptor `ggml_sycl_w_use_desc { uint32_t ctx_id; uint32_t n_ubatch; size_t graph_nodes; }` (§2.4.2). The oneDNN PP branch fills it from its backend context's `ContextId` and `src1->ne[1]`, with `graph_nodes` 0; the finalize wrapper fills it from the recording's context, the `n_ubatch` its meta's W entry recorded, and the node count; a marker use passes it explicitly. The bound comparison and the per-(`ctx_id`, device) WARN dedup sit inside the function and read only `use`. New H7 (as) is a source gate on that, with two mutation witnesses: the comparison moved into the PP caller on `src1->ne[1]`, and a dedup keyed by queue. The G2 marker use and the bound cell pass `use` = {the context's `ContextId`, 32, 0}, and (a)'s two WARNs are defined from it. Amended in §6.39 (r30 m-1, m-2, n-1): `ctx_id` is `uint64_t`, the recorded use's descriptor is built at submit (`ggml_sycl_graph_submit`) from the meta that capture and finalize fill, and the cell binds its contexts. |
 | m-2 | the bound cell's children could not reach their abort messages in a stated order, and the harness read the log with no completion point | **Changed.** Each child runs X1, Y1, X2, Y2 in that order; (b) and (c) drop X2's publisher (`ggml_sycl_test_w_order_drop_next_publisher(0)` before X2), so Y2's chain caps. Each child ends with `ggml_backend_sycl_synchronize` on both backends, which is where the flag is read, and the harness's "after every queue has completed" log read comes after that synchronize. |
 | n-1 | stray indents in the `-ub` exception list | **Changed.** The C2b bullet is un-nested to 2 spaces, and C2b's `n_ctx +=` grep line sits at 2 spaces. |
 | n-2 | "decode calls included" overstated the routing read's reach, and "23mk's former rule" called commit-on-change former, though it is in force at `bd560d3dd` :5024 | **Changed.** §3.3 says every decode call that reaches the routing read (the `:3123` arm reads after its `!safe_decode` term, `fattn.cpp:3121` at `d8a67422d`). The pairing text says 23mk's rule until §M78 lands, which prints the commit line only when the range or its admitted set changes (`bd560d3dd` :5024). |
@@ -13624,3 +13747,22 @@ queued during r29: the §6.35 amendment marker and design-23mk-r22's peer-cite n
 | n-4 | the header named revision 7.14t and twenty-eight reviews above an r28 bullet | **Changed.** It named 7.14u and twenty-nine reviews at the fold; with this revision it names 7.14v and thirty, and gains an r29 bullet. |
 | §6.35 marker (queued during r29) | the §6.35 "§M70 amendment (b'), (c') (follow-up)" row still placed (b1)'s per-call check at the SDPA entry, unmarked | **Changed.** The row ends "Amended in §6.37 (r28 m-1)", naming 23mk's routing read before the plan and the entry's uncounted backstop. |
 | design-23mk-r22 peer-cite nit (queued during r29) | moua cited a three-argument `interim_decline` and said the decline is read "at the entry" | **Closed, no body change.** Both cites are `e15f4095d` line numbers, fixed in the body by `2da8e3ed7`: §3.3 cites the four-argument form at 23mk `bd560d3dd` L4623, and §2.4.2 places the decline at the routing read. The remaining three-argument text is the §6.36 m-3 row, history marked amended in §6.37. |
+
+### 6.39 Revision 7.14w: design-moua-r30
+
+Revision 7.14w is one commit on top of `df4dcf937`. It answers design review r30
+(design-moua-r30 on `8aeb2253d..df4dcf937`: 0 Critical, 0 Important, 4 Minor, 3 nits; P1-P3
+pass, and P4 passes on condition that m-1 and m-3 close). It found r29 m-2 and every r29 nit
+closed. It also folds zhcn's FIRST_CONTEXT accessor, queued during r30. 23mk's §M79 (b) re-pin
+waits for the lead's relay of 23mk's commit, and is not in this revision.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| m-1 | the recorded use's descriptor had no named carrier, caller or unit; §2.4.2 said "the graph wrapper" and §6.38 said "the finalize wrapper" | **Changed.** §2.4.2 names the three fills. For a recorded use: at capture the function adds {entry, `use.ctx_id`, `use.n_ubatch`} to the thread-local record and compares nothing. `ggml_sycl_graph_finalize` moves the record into meta and adds the node count as `get_nodes().size()` on the modifiable `command_graph`. `ggml_sycl_graph_submit` builds the descriptor from meta and calls the function, so the check runs at submit. The unit is the SYCL command-graph node count, the only unit every finalize site can read, and G0 F3 prints its bound in that unit from the same meta. The recording bullet, the §2.10 census's finalize and submit sentence, and the `ggml_sycl_test_w_order_uses` seam now say "submit", and the §6.38 m-1 row is marked amended. |
+| m-2 | the cell's two distinct `ctx_id`s rested on a binding G2 never made; an unbound context reads 0 | **Changed.** Each child creates two execution contexts, `ggml_backend_sycl_execution_context_create` (`ggml-sycl.cpp:14788`), and binds X and Y with `..._bind_backend` (`:14810`). It is VOID unless both ids read non-zero and distinct (printed as `[G2] bound ctx`). §2.4.2 states that 0 means unbound: the registry issues ids from 1 (`execution-lifecycle.hpp:480`), and all unbound contexts on a device share one dedup key, so they get one WARN between them. The flag is per entry, so only the WARN's per-context count is lost. |
+| m-3 | the WARN's scored zero had a positive control only on the marker fill | **Changed, both options.** H7 (as) gains source clauses on each fill: the PP initializer's `n_ubatch` is `src1->ne[1]` and its `ctx_id` is `ctx.execution_context_id`; the capture record reads `use`; finalize's count is `get_nodes().size()`; and the submit's fields are read from meta. Each clause has a mutation witness. The bound cell gains (d), X's production `MUL_MAT` with `src1` of 32 columns under a bound of 16. GREEN is exactly one WARN reading `n_ubatch=32 graph_nodes=0`, and a third RED (the fill's `n_ubatch` set to 0) reads 0. |
+| m-4 | H7 (as) had only restriction clauses, so it held on the pre-change tree | **Changed.** Positive clauses, each at least once inside the function: `use.n_ubatch` and `use.graph_nodes` compared against `ggml_sycl_w_order_bound_for(...)`'s fields, and an insert into `w_order_warned_ctx` keyed on `use.ctx_id`. The names are fixed: `ggml_sycl_w_order_bound_for`, `ggml_sycl_w_order_bound`, `GGML_SYCL_W_ORDER_BOUND_N_UBATCH`, `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES`, `w_order_warned_ctx`, `w_order_warn_mutex` and `w_order_out_of_bound`. The restriction clauses match those names outside the function. |
+| n-1 | `uint32_t ctx_id` narrowed the id | **Changed.** `uint64_t`, the type of `execution_context_id` (`common.hpp:5667`) and of `ContextId::value`. |
+| n-2 | (a)'s node-bound argument was unnamed | **Changed.** (a) and (d) pass `SIZE_MAX`, and the text says any value would serve, since every marker use passes `graph_nodes` 0. |
+| n-3 | the dedup set's synchronization was unstated | **Changed.** `w_order_warn_mutex` is a per-entry leaf. It is taken only by an out-of-bound use, before the ordering decision, and held for the insert, the print and the flag store. It is never held across a submit or a wait, and never nests with Form E's W-order mutex. The set's host allocation happens outside the strict-mode span. §2.10's L7 row lists it, and also lists the PP fill's brief `execution_state_mutex` read. |
+| zhcn 5.35 `1d32420` (queued during r30) | zhcn's `llama_sycl_first_context_reservation_bytes_for_testing(dev)` reads moua's FIRST_CONTEXT reservation; one source | **Changed.** §2.3.3's `FIRST_CONTEXT` bullet names it as the one accessor. It returns the byte sum of `pending_ranges(c, dev, owner, FIRST_CONTEXT)`, with owner `{LOAD, txn}` and then `{MODEL, id}`, and never a copy. It is non-zero from the step 3 recording to the first context's step 5 clear. It holds c(P) and `HEAD_SLOT` records only, and sums two live models unless filtered. It lands with L4. §2.4.2 (b) step 3 points to it. |
