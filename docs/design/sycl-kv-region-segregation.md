@@ -107,7 +107,8 @@ Design, revision 7.14i. Author: impl-moua, 2026-09-27. The revisions answer eigh
 - design review r17 (design-moua-r17 on `ee484eb5b..c345ddae5`: 0 Critical, 5 Important, 10
   Minor), the lead's rulings on it (§M41), §M39 on 7.14h's three notes, §M40 (the compute
   slot's ordering), §G1c (the hard uwlx edge), and the relays from 23mk 4.10, 1oxa rev 15 and
-  zhcn 5.16, recorded in §6.25. Revision 7.14i is one commit on top of 7.14h (`c345ddae5`).
+  zhcn 5.16, recorded in §6.25. Revision 7.14i is two commits on top of 7.14h (`c345ddae5`):
+  `eaf159a29` and a follow-up for 23mk rev 4.11 (rulings §Z-23mk-411).
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
@@ -2713,24 +2714,27 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           MiB). From that commit the pre-plan layout puts ONEDNN at 0 as well, the split is
           **14791213056 B** (14106.0 MiB), and step 4 grows ONEDNN to W;
         - **SCRATCH.** Its floor is load-bearing today, and the consumers that need it are named
-          here as defects: every SCRATCH draw in 23mk 4.10's allocation census that no enum term
-          covers. The core rows are covered (`load_reorder_temp`: rows 18, 43 and 48;
-          `onednn_pp_pool` and `lm_head_f16`: row 61's model-shaped part; `mmq_work_counter`:
-          row 100). The others draw the floor with no term: beni's context-shaped rows 17, 21,
-          31, 33, 34, 61 (the pool's peak), 81 and 90; zhcn's row 51 (the compute-buffer chain's
-          SCRATCH leg); pqmm's rows 59 and 60; and 6lfq's row 9 (census at `003bce159`, master
-          `2c4f5e45d`). Each becomes its owner's term or head slot. The two named exemptions,
-          rows 101 and 138, also draw SCRATCH with no term and need one, or another source,
-          first. Rows 102, 111 and 127 have no production caller and are deleted, and rows 129
-          and 137 are unreachable under an arena. The floor goes in the commit that converts the
-          last of them, and `ggml_sycl_compute_arena_bytes()` then returns the planned SCRATCH
-          sum instead of `GGML_SYCL_COMPUTE_ARENA_MB`, so the compute arena spans exactly the
-          terms. The freed bytes on GPT-OSS 120B are 536870912 B less the SCRATCH terms:
-          `nonfa_shape` (100663296 B at the load shape), `mxfp4_direct_f16_w` (16588800 B),
-          `mmq_work_counter` (4 B) and 23mk's `load_reorder_temp`, `woq_packed`,
-          `onednn_pp_pool` and `lm_head_f16`. On 23mk's H3 fixture, whose load temporary is 64
-          MiB and whose other 23mk terms are 0, that is **352509948 B** (336.2 MiB). The arm
-          reads the live value from the ledger, never this fixture figure;
+          here as defects: every SCRATCH draw in 23mk's allocation census that no enum term
+          covers. **The list is the one 23mk's appendix derives (23mk rev 4.11, `93050c979`;
+          rulings §Z-23mk-411), and this design keeps no second hand list of it.** For reading
+          only, at `93050c979` it has 22 rows: beni's 17, 21, 31, 33, 34, 61 (the pool's peak,
+          which covers row 62), 68, 69, 74, 81, 90 and 106; pqmm's 59, 60, 66, 67 and 91; zhcn's
+          51 (the compute-buffer chain's SCRATCH leg); 6lfq's 9 and 103; and the two named
+          exemptions, 101 and 138, which also draw SCRATCH with no term and need one, or another
+          source, first. 7.14h named 14 of them from 23mk 4.10 (`003bce159`) and missed 66, 67,
+          68, 69, 74, 91, 103 and 106 (23mk r12 I-3). Each becomes its owner's term or head
+          slot. The appendix excludes the core-planned rows (18, 32, 43, 47, 48, 70 and 100),
+          the D rows 102, 111 and 127, which have no production caller and are deleted, row 137
+          (a REF row) and row 129, which is unreachable under an arena. The floor goes in the
+          commit that converts the last row of that list, and `ggml_sycl_compute_arena_bytes()`
+          then returns the planned SCRATCH sum instead of `GGML_SYCL_COMPUTE_ARENA_MB`, so the
+          compute arena spans exactly the terms. The freed bytes on GPT-OSS 120B are 536870912 B
+          less the SCRATCH terms: `nonfa_shape` (100663296 B at the load shape),
+          `mxfp4_direct_f16_w` (16588800 B), `mmq_work_counter` (4 B) and 23mk's
+          `load_reorder_temp`, `woq_packed`, `onednn_pp_pool` and `lm_head_f16`. On 23mk's H3
+          fixture, whose load temporary is 64 MiB and whose other 23mk terms are 0, that is
+          **352509948 B** (336.2 MiB). The arm reads the live value from the ledger, never this
+          fixture figure;
       The displayed values are 537.9 / 13312.1 on GPT-OSS 120B (k-independent part) and 136.0 /
       13714.0 on Qwen (§M20.1; RUNTIME with no floor, rulings §M32 I-2); master's early 1617.9 /
       12232.1 and 1672.0 / 12178.0 carry the ring's 512 rows, and its late-stage 1618.0 /
@@ -9875,7 +9879,8 @@ which this revision does not read), 1oxa at `47206cb` (rev 13), zhcn at `edd507b
   - the H3 GREENs' "SCRATCH and ONEDNN are unchanged at their floors" (L5728) gain the
     ONEDNN-floor state: 23592960 B and weight zone 14203584512 − k × 1024 B on 120B,
     33554432 B and 14615052288 − k × 2048 B on the Qwen gate;
-  - the SCRATCH floor's untermed census rows are the ones listed in the end states;
+  - the SCRATCH floor's untermed census rows are the ones listed in the end states (7.14i's
+    follow-up defers to 23mk's appendix at `93050c979` instead; rulings §Z-23mk-411);
   - the Graph-scratch commit removes the ONEDNN floor if it lands after moua's L4+L6;
   - §G1a applies to 23mk's DECLINE class too (§M36 I-3 aborts it under the §G1 switch).
 - **1oxa** (`47206cb`):
@@ -10052,3 +10057,10 @@ unchanged; the new ones are below.
   lands.
 - **beni:** the Graph scratch's producer is 23mk's function; beni's commit carries it and adds
   no visitor for it.
+
+**The follow-up commit (23mk rev 4.11, `93050c979`; rulings §Z-23mk-411).**
+
+| item | relay | disposition |
+|---|---|---|
+| 23mk r12 I-3 | the SCRATCH floor's row list is 22 rows, and 7.14h named 14 | **Changed.** The SCRATCH end state defers to the list 23mk's appendix derives at `93050c979`, adds rows 66, 67, 68, 69, 74, 91, 103 and 106 to the reading copy, and keeps no second hand list. Row 62 is covered by row 61's peak; the appendix's exclusions (core-planned 18, 32, 43, 47, 48, 70, 100; the deleted D rows 102, 111, 127; 137 REF; 129) are named as its. |
+| §M41 I-1 (b), confirmed | GPT-OSS 120B's Graph-scratch term at `-c 4096` | **No change.** 805306368 B before 23mk's Graph-scratch commit (master's function, no sinks input, `n_head_ctx_max` 64) and 0 B after it (the reject predicate); Qwen 201326592 B at both instants. 7.14i's L4+L6-first arm already reads 805306368 B, and 23mk's H3 pins both instants. |
