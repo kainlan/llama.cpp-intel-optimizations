@@ -2160,7 +2160,7 @@ bool ggml_sycl_fa_onednn_d512_enabled() {
 // Shared "declined outright, not planned" screen for paged/multi-seq
 // sources and the paged-layout flag (spec review rev-dtpk-qual, F3): both
 // D=512 admissibility helpers below (this one and the tile route's, later
-// in this file) exclude the identical src[5..8]/op_params[4] set for the
+// in this file) exclude the identical src[5..8]/op_params[5] set for the
 // identical reason (see the comment on ggml_sycl_fattn_d512_onednn_
 // admissible below for why src[5..8] presence is an exact graph-structural
 // fact rather than an approximation of a moving target) -- previously
@@ -2175,7 +2175,7 @@ static bool ggml_sycl_fattn_d512_has_paged_or_multiseq_sources(const ggml_tensor
     if (q_seq_ids || kv_seq_ids || block_table || seq_lens_tensor) {
         return true;
     }
-    const int32_t use_paged_layout_i32 = ((const int32_t *) dst->op_params)[4];
+    const int32_t use_paged_layout_i32 = ((const int32_t *) dst->op_params)[5];
     return use_paged_layout_i32 != 0;
 }
 
@@ -3458,9 +3458,10 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    // Read use_paged_layout from op_params[4] (set by ggml_flash_attn_ext_set_paged_layout)
-    // op_params layout: [0-2]=float scale/max_bias/logit_softcap, [3]=prec, [4]=use_paged_layout
-    const int32_t use_paged_layout_i32 = ((const int32_t *) dst->op_params)[4];
+    // Read use_paged_layout from op_params[5] (set by ggml_flash_attn_ext_set_paged_layout)
+    // op_params layout: [0-2]=float scale/max_bias/logit_softcap, [3]=prec, [4]=n_kv_max
+    // (sparse hint; ignored here, the mask alone is exact), [5]=use_paged_layout
+    const int32_t use_paged_layout_i32 = ((const int32_t *) dst->op_params)[5];
     const bool    use_paged_layout     = (use_paged_layout_i32 != 0);
 
     // If using logit_softcap, adjust scale
@@ -3775,7 +3776,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         params.seq_lens           = nullptr;
     }
 
-    // Set paged layout flag (read from op_params[4], set via ggml_flash_attn_ext_set_paged_layout)
+    // Set paged layout flag (read from op_params[5], set via ggml_flash_attn_ext_set_paged_layout)
     params.use_paged_layout = use_paged_layout;
 
     if (ggml_sycl_graph_recording_this_thread() && ctx.fa_graph_ptrs_recording) {

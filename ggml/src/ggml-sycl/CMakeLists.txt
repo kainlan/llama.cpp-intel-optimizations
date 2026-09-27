@@ -626,6 +626,79 @@ if (GGML_SYCL_CPU_DEVICE)
         "SHELL:-Xspirv-translator=spir64_x86_64 -spirv-ext=+SPV_INTEL_split_barrier")
 endif()
 
+# Device-link cost (llama.cpp-vuy0). The device link of libggml-sycl -- and of
+# every test executable that embeds the backend objects through
+# ggml-sycl-private-fixtures -- is ~97% ocloc: sycl-post-link splits the device
+# code into ~112 images per AOT target and llvm-foreach AOT-compiles them one at
+# a time (~715 s per BMG target, three fattn/mmvq images ~80% of it). None of
+# the three controls below changes a single device byte: the split images,
+# the options ocloc compiles them with and the embedded binaries are identical
+# (scripts/sycl-device-image-inventory.sh compares them); only scheduling and
+# reuse change. Two images -- the ESIMD fattn kernels and the MXFP4 MoE DPAS
+# kernels -- come out of IGC with different ISA from run to run on their own,
+# uncached and serial; a cache hit returns whichever variant was stored, so
+# rebuilds stop re-rolling them.
+#
+# 1. -fsycl-max-parallel-link-jobs: run the per-image llvm-spirv/ocloc steps N
+#    at a time. A cold link then costs about the largest image per target
+#    (~300 s) instead of the sum. ocloc peaks at ~1.4 GB per job.
+# 2. ocloc's persistent compiler cache: the split images are almost always
+#    byte-identical to the previous link's, and a hit returns the stored binary
+#    bit for bit. -allow_caching is needed on the ocloc command line AND
+#    NEO_CACHE_PERSISTENT=1 in its environment, which the launcher below sets
+#    together with a toolchain-keyed NEO_CACHE_DIR. Without that environment
+#    the flag caches nothing, so it is only added where the launcher runs.
+# 3. A Ninja pool bounding concurrent device links. A full build has ~49 of
+#    them, and without the pool only ninja -j (nproc by default) caps how many
+#    run at once; with it the pool depth does. Links started together also
+#    miss the cache together.
+#    Memory, not cores, sets the depth: one link is N ocloc jobs x ~1.4 GB plus
+#    the whole-module llvm-link/sycl-post-link, ~12-13 GB at N=8, so the default
+#    depth of 2 bounds device linking at ~26 GB of this host's 246 GB.
+set(GGML_SYCL_DEVICE_LINK_JOBS "8" CACHE STRING
+    "Parallel llvm-spirv/ocloc jobs per SYCL device link (-fsycl-max-parallel-link-jobs)")
+option(GGML_SYCL_OCLOC_CACHE
+    "Reuse ocloc binaries for unchanged SYCL device images across links (toolchain-keyed persistent cache)" ON)
+set(GGML_SYCL_DEVICE_LINK_POOL "2" CACHE STRING
+    "Maximum concurrent SYCL device links under Ninja")
+foreach(_var GGML_SYCL_DEVICE_LINK_JOBS GGML_SYCL_DEVICE_LINK_POOL)
+    if (NOT "${${_var}}" MATCHES "^[1-9][0-9]*$")
+        message(FATAL_ERROR "${_var} must be a positive integer, got '${${_var}}'")
+    endif()
+endforeach()
+
+set(_ggml_sycl_device_link_options)
+if (GGML_SYCL_DEVICE_LINK_JOBS GREATER 1)
+    list(APPEND _ggml_sycl_device_link_options "-fsycl-max-parallel-link-jobs=${GGML_SYCL_DEVICE_LINK_JOBS}")
+endif()
+
+# The launcher (sycl-device-link.sh) also gives each link a private TMPDIR that
+# it removes on exit or signal; killed links used to strand ~700 MB of icpx-*
+# temporaries and ocloc outputs each. <LANG>_LINKER_LAUNCHER needs CMake 3.21.
+if (NOT WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+    set(_ggml_sycl_device_link_launcher "${CMAKE_CURRENT_SOURCE_DIR}/sycl-device-link.sh")
+    if (GGML_SYCL_OCLOC_CACHE AND GGML_SYCL_BMG_AOT_ENABLED)
+        list(APPEND _ggml_sycl_device_link_launcher --ocloc-cache)
+        list(APPEND _ggml_sycl_device_link_options
+            "SHELL:-Xsycl-target-backend=intel_gpu_bmg_g21 -allow_caching"
+            "SHELL:-Xsycl-target-backend=intel_gpu_bmg_g31 -allow_caching")
+    endif()
+    list(APPEND _ggml_sycl_device_link_launcher --)
+    set_property(GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_LAUNCHER "${_ggml_sycl_device_link_launcher}")
+    set_property(GLOBAL PROPERTY GGML_SYCL_DEVICE_LINK_OPTIONS "${_ggml_sycl_device_link_options}")
+    if (CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(GLOBAL APPEND PROPERTY JOB_POOLS ggml_sycl_device_link=${GGML_SYCL_DEVICE_LINK_POOL})
+    endif()
+
+    # Routing of the other device-linking targets lives in a module so that
+    # tests/test-sycl-device-link-embedding.sh can run it inside a small
+    # parent project.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/sycl-device-link-routing.cmake")
+    ggml_sycl_route_device_link(ggml-sycl)
+    ggml_sycl_defer_device_link_routing()
+endif()
+target_link_options(ggml-sycl PRIVATE ${_ggml_sycl_device_link_options})
+
 # Link against oneDNN (primary math backend for Intel targets)
 set(GGML_SYCL_DNNL 0)
 set(GGML_SYCL_MKL_FALLBACK_ENABLED 0)
@@ -3159,6 +3232,20 @@ set(RESIDENCY_TEST_SYCL_OPTIONS
 # plus once in ggml-sycl-test.hpp (declaration) and is called by no production
 # path, so a green from them said nothing about the shipped backend. See the
 # commit message and docs/backend/sycl-test-inventory.md.
+# Tests that read repo sources at run time locate the tree through
+# LLAMA_CPP_SOURCE_ROOT (candidate_roots() in each). It is an absolute -D because
+# when scripts/sycl-build.sh runs ccache with base_dir (the default; off with
+# GGML_SYCL_CCACHE_BASE_DIR=0), ccache rewrites the source path -- and so
+# __FILE__ -- relative to the build directory; it leaves -D values alone
+# (llama.cpp-vuy0).
+get_filename_component(GGML_SYCL_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+set(GGML_SYCL_SOURCE_READING_TESTS
+    test-sycl-moe-fused-down-sum-policy
+    test-sycl-moe-direct-final-scratch-plan
+    test-sycl-moe-same-expert-grouping
+    test-sycl-moe-fusion-noactivation
+    test-sycl-moe-sequence-graphlet-policy
+)
 foreach(_residency_test
     test-sycl-mem-handle-lifetime
     test-sycl-residency-reservation
@@ -3192,6 +3279,10 @@ foreach(_residency_test
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
         GGML_SYCL_PRIVATE_TESTING=1
     )
+    if (_residency_test IN_LIST GGML_SYCL_SOURCE_READING_TESTS)
+        target_compile_definitions(${_residency_test} PRIVATE
+            LLAMA_CPP_SOURCE_ROOT="${GGML_SYCL_REPO_ROOT}")
+    endif()
     target_link_libraries(${_residency_test} PRIVATE ggml-sycl-private-fixtures)
     add_test(NAME ${_residency_test} COMMAND ${_residency_test})
     # LABELS drop the old "cache;residency;mem-handle" -- see rule 2 above
@@ -3506,6 +3597,7 @@ target_link_options(test-sycl-fattn-xmx-policy PRIVATE "-fsycl")
 target_compile_definitions(test-sycl-fattn-xmx-policy PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    LLAMA_CPP_SOURCE_ROOT="${GGML_SYCL_REPO_ROOT}"
 )
 target_link_libraries(test-sycl-fattn-xmx-policy PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
 if (IntelSYCL_FOUND)

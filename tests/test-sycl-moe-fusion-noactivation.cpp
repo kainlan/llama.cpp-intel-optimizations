@@ -56,6 +56,11 @@ static std::vector<std::string> candidate_roots() {
     if (const char * env = std::getenv("LLAMA_CPP_REPO_ROOT")) {
         roots.emplace_back(env);
     }
+#ifdef LLAMA_CPP_SOURCE_ROOT
+    // Absolute root from the build. Under ccache base_dir (scripts/sycl-build.sh)
+    // __FILE__ is relative to the build directory, so it no longer pins the root.
+    roots.emplace_back(LLAMA_CPP_SOURCE_ROOT);
+#endif
     const std::string source_file = __FILE__;
     const std::string suffix      = "/tests/test-sycl-moe-fusion-noactivation.cpp";
     const size_t      pos         = source_file.rfind(suffix);

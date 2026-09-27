@@ -147,7 +147,10 @@ _CALL_SITE_END = "if (!cparams.flash_attn) {"
 # updated here since every other check in this file depends on this exact
 # string via _trial_body().
 _TRIAL_START = "void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) {"
-_TRIAL_END = "void llama_context::sched_reserve() {"
+# The trial is followed by upstream's llama_graph_n_input_tensors() helper,
+# not by sched_reserve() itself; ending at sched_reserve() would pull that
+# helper's LLAMA_LOG_WARN into the trial body.
+_TRIAL_END = "static int llama_graph_n_input_tensors(ggml_cgraph * gf) {"
 # llama.cpp-7n6n: the shared per-candidate validator --
 # probe with busy backoff, publish in a try/catch, reserve, host-fallback
 # check -- extracted into one lambda used by BOTH the cache-hit revalidation
@@ -847,8 +850,15 @@ def test_settle_reserve_unguarded_check_has_a_mutation_witness():
     in try/catch must make it fail."""
     raw = LLAMA_CONTEXT_CPP
     settle_reserve = "        sched_need_reserve = true;\n        sched_reserve();\n    }\n"
-    assert raw.count(settle_reserve) == 1, "mutation target not found -- update this witness to match the real source"
-    mutated_raw = raw.replace(
+    # opt_init() carries the same three lines, so count and mutate only
+    # inside the trial.
+    start = raw.find(_TRIAL_START)
+    end = raw.find(_TRIAL_END, start + 1)
+    assert start != -1 and end != -1, "could not bound the trial -- update this witness to match the real source"
+    assert raw.count(settle_reserve, start, end) == 1, (
+        "mutation target not found -- update this witness to match the real source"
+    )
+    mutated_raw = raw[:start] + raw[start:end].replace(
         settle_reserve,
         "        sched_need_reserve = true;\n"
         "        try {\n"
@@ -857,7 +867,7 @@ def test_settle_reserve_unguarded_check_has_a_mutation_witness():
         "        }\n"
         "    }\n",
         1,
-    )
+    ) + raw[end:]
     assert mutated_raw != raw
     assert not _settle_reserve_is_unguarded(_body_of(mutated_raw, _TRIAL_START, _TRIAL_END)), (
         "mutation witness is broken: wrapping the settle reserve should make the unguarded check fail"

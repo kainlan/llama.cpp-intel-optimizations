@@ -48,7 +48,7 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int de
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_kv_buffer_type(int device);
 
 // split tensor buffer that splits matrices by rows across multiple devices
-GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * tensor_split);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(int main_device, const float * tensor_split);
 
 // tensor parallel buffer type (Megatron-style column/row parallel with all-reduce)
 // Initializes TP system on first call. Pass device_ids=NULL for auto-detection.
@@ -647,7 +647,7 @@ GGML_BACKEND_API struct ggml_sycl_cache_id ggml_backend_sycl_get_tensor_cache_ke
 GGML_BACKEND_API void ggml_backend_sycl_print_sycl_devices(void);
 GGML_BACKEND_API void ggml_backend_sycl_get_gpu_list(int * id_list, int max_len);
 GGML_BACKEND_API void ggml_backend_sycl_get_device_description(int device, char * description, size_t description_size);
-GGML_BACKEND_API int  ggml_backend_sycl_get_device_count();
+GGML_BACKEND_API int  ggml_backend_sycl_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_sycl_get_device_memory(int device, size_t * free, size_t * total);
 
 // Check if MoE multi-GPU mode is requested via GGML_SYCL_MOE_MULTI_GPU=1.

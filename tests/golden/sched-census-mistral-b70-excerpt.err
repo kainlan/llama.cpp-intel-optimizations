@@ -1,0 +1,42 @@
+4.34.390.844 D llama_graph_n_input_tensors: input tensor '                      inp_tokens' [i32, ne = {   512,     1,     1,     1 }] is used by node 'embd' (GET_ROWS)
+4.34.391.630 D 
+## SPLIT #0: SYCL0 # 0 inputs4.34.391.630 D 
+4.34.391.631 D node #  0 (  GET_ROWS):                 embd (   8M) [SYCL0         ] use=2,c=1:4.34.391.632 D     token_embd.weight (  70M) [SYCL0         ]4.34.391.632 D            inp_tokens (   2K) [  CPU         ]4.34.391.632 D 
+4.34.391.633 D node #  1 (  RMS_NORM):               norm-0 (   8M) [SYCL0         ] use=1,c=1:4.34.391.633 D                  embd (   8M) [SYCL0         ]4.34.391.633 D 
+4.34.391.633 D node #  2 (       MUL):          attn_norm-0 (   8M) [SYCL0         ] use=3,c=1:4.34.391.633 D                norm-0 (   8M) [SYCL0         ]4.34.391.634 D  blk.0.attn_norm.weig (  16K) [SYCL0         ]4.34.391.634 D 
+4.34.391.634 D node #  3 (   MUL_MAT):               Qcur-0 (   8M) [SYCL0         ] use=1,c=1:4.34.391.635 D   blk.0.attn_q.weight (   9M) [SYCL0         ]4.34.391.635 D           attn_norm-0 (   8M) [SYCL0         ]4.34.391.635 D 
+4.34.391.635 D node #  5 (      ROPE):               Qcur-0 (   8M) [SYCL0         ] use=1,c=1:4.34.391.635 D                Qcur-0 (   8M) [SYCL0         ]4.34.391.635 D               inp_pos (   2K) [  CPU         ]4.34.391.635 D 
+4.34.391.636 D node #  6 (   MUL_MAT):               Vcur-0 (   2M) [SYCL0         ] use=1,c=1:4.34.391.636 D   blk.0.attn_v.weight (   2M) [SYCL0         ]4.34.391.636 D           attn_norm-0 (   8M) [SYCL0         ]4.34.391.636 D 
+4.34.391.637 D node #  8 (   MUL_MAT):               Kcur-0 (   2M) [SYCL0         ] use=1,c=1:4.34.391.637 D   blk.0.attn_k.weight (   2M) [SYCL0         ]4.34.391.637 D           attn_norm-0 (   8M) [SYCL0         ]4.34.391.637 D 
+4.34.391.637 D node # 10 (      ROPE):               Kcur-0 (   2M) [SYCL0         ] use=1,c=1:4.34.391.638 D                Kcur-0 (   2M) [SYCL0         ]4.34.391.638 D               inp_pos (   2K) [  CPU         ]4.34.391.638 D 
+4.34.391.638 D node # 12 (  SET_ROWS):    cache_k_l0 (view) (   8M) [SYCL0         ] use=0,c=1:4.34.391.638 D         Kcur-0 (view) (   2M) [SYCL0         ]4.34.391.638 D       attn_inp_k_idxs (   4K) [  CPU         ]4.34.391.639 D            cache_k_l0 (   8M) [SYCL0         ]4.34.391.639 D 
+4.34.391.639 D node # 14 (  SET_ROWS):    cache_v_l0 (view) (   8M) [SYCL0         ] use=0,c=1:4.34.391.639 D         Vcur-0 (view) (   2M) [SYCL0         ]4.34.391.639 D       attn_inp_v_idxs (   4K) [  CPU         ]4.34.391.640 D            cache_v_l0 (   8M) [SYCL0         ]4.34.391.640 D 
+4.34.391.640 D node # 17 (       CPY): Qcur-0 (view) (permu (   4M) [SYCL0         ] use=2,c=1:4.34.391.640 D  Qcur-0 (view) (permu (   8M) [SYCL0         ]4.34.391.640 D  Qcur-0 (view) (permu (   4M) [SYCL0         ]4.34.391.640 D 
+4.34.391.640 D 
+## SPLIT #1: CPU # 3 inputs4.34.391.641 D : 4.34.391.641 D [Qcur-0 (view) (permuted) (copy) (   4M)] 4.34.391.641 D [cache_k_l0 (view) (permuted) (   8M)] 4.34.391.641 D [cache_v_l0 (view) (permuted) (   8M)] 4.34.391.641 D 
+4.34.391.641 D node # 22 (FLASH_ATTN):              node_22 (   8M) [  CPU         ] use=1,c=1:4.34.391.642 D  CPU#Qcur-0 (view) (p (   4M) [ NULL         ]4.34.391.642 D  CPU#cache_k_l0 (view (   8M) [ NULL         ]4.34.391.642 D  CPU#cache_v_l0 (view (   8M) [ NULL         ]4.34.391.642 D      attn_inp_kq_mask (   4M) [  CPU         ]4.34.391.642 D 
+4.34.391.642 D 
+## SPLIT #2: SYCL0 # 0 inputs4.34.391.642 D 
+4.34.391.643 D node # 24 (   MUL_MAT):           attn_out-0 (   8M) [SYCL0         ] use=1,c=1:4.34.391.643 D  blk.0.attn_output.we (   9M) [SYCL0         ]4.34.391.643 D             kqv_out-0 (   8M) [  CPU         ]4.34.391.643 D 
+4.34.391.644 D node # 25 (       ADD):            ffn_inp-0 (   8M) [SYCL0         ] use=2,c=1:4.34.391.644 D            attn_out-0 (   8M) [SYCL0         ]4.34.391.644 D                  embd (   8M) [SYCL0         ]4.34.391.644 D 
+4.41.908.167 D n_remain: 1
+4.41.909.291 D 
+## SPLIT #0: SYCL0 # 0 inputs4.41.909.292 D 
+4.41.909.295 D node #  0 (  GET_ROWS):                 embd (  16K) [SYCL0         ] use=2,c=1:4.41.909.296 D     token_embd.weight (  70M) [SYCL0         ]4.41.909.296 D            inp_tokens (   0K) [  CPU         ]4.41.909.297 D 
+4.41.909.297 D node #  1 (  RMS_NORM):               norm-0 (  16K) [SYCL0         ] use=1,c=1:4.41.909.298 D                  embd (  16K) [SYCL0         ]4.41.909.298 D 
+4.41.909.298 D node #  2 (       MUL):          attn_norm-0 (  16K) [SYCL0         ] use=3,c=1:4.41.909.299 D                norm-0 (  16K) [SYCL0         ]4.41.909.299 D  blk.0.attn_norm.weig (  16K) [SYCL0         ]4.41.909.299 D 
+4.41.909.300 D node #  3 (   MUL_MAT):               Qcur-0 (  16K) [SYCL0         ] use=1,c=1:4.41.909.300 D   blk.0.attn_q.weight (   9M) [SYCL0         ]4.41.909.300 D           attn_norm-0 (  16K) [SYCL0         ]4.41.909.300 D 
+4.41.909.301 D node #  5 (      ROPE):               Qcur-0 (  16K) [SYCL0         ] use=1,c=1:4.41.909.301 D                Qcur-0 (  16K) [SYCL0         ]4.41.909.301 D               inp_pos (   0K) [  CPU         ]4.41.909.301 D 
+4.41.909.301 D node #  6 (   MUL_MAT):               Vcur-0 (   4K) [SYCL0         ] use=1,c=1:4.41.909.302 D   blk.0.attn_v.weight (   2M) [SYCL0         ]4.41.909.302 D           attn_norm-0 (  16K) [SYCL0         ]4.41.909.302 D 
+4.41.909.302 D node #  8 (   MUL_MAT):               Kcur-0 (   4K) [SYCL0         ] use=1,c=1:4.41.909.302 D   blk.0.attn_k.weight (   2M) [SYCL0         ]4.41.909.302 D           attn_norm-0 (  16K) [SYCL0         ]4.41.909.303 D 
+4.41.909.303 D node # 10 (      ROPE):               Kcur-0 (   4K) [SYCL0         ] use=1,c=1:4.41.909.303 D                Kcur-0 (   4K) [SYCL0         ]4.41.909.303 D               inp_pos (   0K) [  CPU         ]4.41.909.303 D 
+4.41.909.304 D node # 12 (  SET_ROWS):    cache_k_l0 (view) (   8M) [SYCL0         ] use=0,c=1:4.41.909.304 D         Kcur-0 (view) (   4K) [SYCL0         ]4.41.909.304 D       attn_inp_k_idxs (   0K) [  CPU         ]4.41.909.304 D            cache_k_l0 (   8M) [SYCL0         ]4.41.909.304 D 
+4.41.909.305 D node # 14 (  SET_ROWS):    cache_v_l0 (view) (   8M) [SYCL0         ] use=0,c=1:4.41.909.305 D         Vcur-0 (view) (   4K) [SYCL0         ]4.41.909.305 D       attn_inp_v_idxs (   0K) [  CPU         ]4.41.909.305 D            cache_v_l0 (   8M) [SYCL0         ]4.41.909.305 D 
+4.41.909.306 D node # 17 (       CPY): Qcur-0 (view) (permu (   8K) [SYCL0         ] use=2,c=1:4.41.909.306 D  Qcur-0 (view) (permu (  16K) [SYCL0         ]4.41.909.306 D  Qcur-0 (view) (permu (   8K) [SYCL0         ]4.41.909.306 D 
+4.41.909.307 D 
+## SPLIT #1: CPU # 3 inputs4.41.909.307 D : 4.41.909.307 D [Qcur-0 (view) (permuted) (copy) (   8K)] 4.41.909.307 D [cache_k_l0 (view) (permuted) ( 512K)] 4.41.909.307 D [cache_v_l0 (view) (permuted) ( 512K)] 4.41.909.307 D 
+4.41.909.308 D node # 22 (FLASH_ATTN):              node_22 (  16K) [  CPU         ] use=1,c=1:4.41.909.308 D  CPU#Qcur-0 (view) (p (   8K) [ NULL         ]4.41.909.308 D  CPU#cache_k_l0 (view ( 512K) [ NULL         ]4.41.909.309 D  CPU#cache_v_l0 (view ( 512K) [ NULL         ]4.41.909.309 D      attn_inp_kq_mask (   0K) [  CPU         ]4.41.909.309 D 
+4.41.909.309 D 
+## SPLIT #2: SYCL0 # 0 inputs4.41.909.309 D 
+4.41.909.310 D node # 24 (   MUL_MAT):           attn_out-0 (  16K) [SYCL0         ] use=1,c=1:4.41.909.310 D  blk.0.attn_output.we (   9M) [SYCL0         ]4.41.909.310 D             kqv_out-0 (  16K) [  CPU         ]4.41.909.310 D 
+4.41.909.310 D node # 25 (       ADD):            ffn_inp-0 (  16K) [SYCL0         ] use=2,c=1:4.41.909.311 D            attn_out-0 (  16K) [SYCL0         ]4.41.909.311 D                  embd (  16K) [SYCL0         ]4.41.909.311 D 

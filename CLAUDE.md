@@ -80,8 +80,12 @@ ctest --test-dir build -R <name-or-regex> --output-on-failure
 
 # 2. Full suite. `-j 1` is NOT a typo and NOT negotiable -- see below.
 #    Check `uptime` first; never on a loaded machine.
+#    Run the guard first: it derives the model loaders from the registration
+#    (fixture users, fixture generators, tests labelled `model`) and fails
+#    naming any that this command still selects.
+bash scripts/check-ctest-safety-net.sh --build-dir build
 ctest --test-dir build --output-on-failure -j 1 \
-      -LE 'residency|mem-handle|cache' -E '^test-backend-ops$'
+      -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
 
 # 3. The excluded family, serially, with monitoring. Manually only -- never in
 #    a subagent or background task. NOTE the label is 'cache|mem-handle', NOT
@@ -154,13 +158,61 @@ anything nobody remembered to tag, so it fails *open*:
 
 ```bash
 # Always confirm what a filtered sweep will actually run before running it.
-ctest --test-dir build -N -LE 'residency|mem-handle|cache' | grep backend-ops
-# ^ must print NOTHING once -E is added; if it prints a line, do not run the sweep.
+bash scripts/check-ctest-safety-net.sh --build-dir build
+# ^ must print "safety net intact"; if it names a test, do not run the sweep.
 ```
 
 Adding `LABELS "cache"` to that registration would also fix it, but it is
 upstream code that a rebase would silently revert, and the failure mode of
 losing the fix is an OOM. Excluding by name is the safer belt.
+
+⚠️ **Since the 694ec2354 upstream merge (llama.cpp-n77l), `test-backend-ops` and
+`test-llama-archs` are not ctests at all** — upstream registers both with
+`llama_build` only. So `ctest -R '^test-backend-ops$'` and
+`ctest -R '^test-llama-archs$'` select nothing and "pass" having run nothing, and
+`-E '^test-backend-ops$'` excludes nothing. (It stays in form 2's `-E` as a belt
+in case upstream registers the binary again.) Run both as binaries, pinned, one
+run at a time:
+
+```bash
+ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ./build/bin/test-llama-archs -a llama; echo "rc=$?"
+ONEAPI_DEVICE_SELECTOR=level_zero:0   ./build/bin/test-backend-ops
+```
+
+The same merge **added model loaders under the default `main` label**. Among them:
+
+- `test-generate-models`, the `generate-models` fixture setup, which runs
+  `test-llama-archs -o` to write every arch's model;
+- `test-save-load-state`, which loads every generated arch in one process;
+- the `test-recurrent-state-rollback*` family.
+
+None of them pins a selector, so on this host they run on the iGPU too. The
+older `-E '^test-backend-ops$'` form of the sweep selected all of them. It also
+selected four loaders that need a downloaded model: `test-thread-safety`,
+`test-sycl-model-lifecycle-hooks`, `test-state-restore-fragmented` and
+`test-eval-callback`.
+
+`scripts/check-ctest-safety-net.sh` now derives the loader set from the
+registration. A loader is any of these:
+
+- a test with `FIXTURES_REQUIRED`;
+- a fixture setup that runs a binary rather than cmake;
+- a test labelled `model`. That is upstream's label for tests that load
+  `LLAMACPP_TEST_MODELFILE` (`test-model-load-cancel`, `test-autorelease`,
+  `test-backend-sampler` and others). The fork also puts it on
+  `sycl-lifecycle-gpu-sequential`, which loads the models its G1 fixture
+  names. Form 2 leaves them out through `-LE '...|^model$'`.
+
+The guard fails naming each loader that form 2 still selects. It also fails if
+this file stops carrying form 2's exact `-LE ... -E ...`.
+
+When the guard names a new test, change this file and the script together:
+either label the test `model`, or add it to the `-E` here and to the script's
+`SWEEP_E_DEFAULT`.
+
+The guard cannot see a test that loads a model but has no fixture and no
+`model` label. Give such a test a label that form 2 excludes (`model`, `cache`
+or `mem-handle`); do not trust the guard to find it.
 
 ⚠️ **`test-backend-ops` is not the only unlabelled member of that family.**
 `test-llama-archs` also carries only `main`, and **looping it exhausts host
@@ -170,6 +222,9 @@ memory the same way**. Measured 2026-07-30: two separate global OOMs
 ```bash
 ctest --test-dir build -R '^test-llama-archs$' --output-on-failure   # ~36 s, fine ONCE
 ```
+
+(That was the registration then. The command now selects nothing; see the
+n77l note above, and run the binary instead.)
 
 Both show the TTM-shmem signature this file documents for `test-backend-ops`:
 `shmem:238266228` kB ≈ **227 GB** of 255 GB total, `inactive_anon` 227.8 GB (the
@@ -540,8 +595,8 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
 - **The user reads Discord, not the terminal.** CLI output is invisible to them. Any question, confirmation, decision prompt, or status update intended for the user MUST go through the Discord reply tool (the harness supplies the channel id each session). Terminal text is logging only — never "await a reply" there.
 - **Work on the active feature branch** (`git branch --show-current` — do not trust a branch name written down here). When reviewing diffs, bound by BASE_SHA/HEAD_SHA, not "everything on the branch."
 - **Worktrees are allowed and are the right tool for build-heavy parallel work** (owner decision, 2026-08-01). This entry previously said *"skip git worktrees — a worktree forces a fresh `build/` and loses the ~10-min ccache-warm hit rate."* The cost is real but was overstated: **ccache is global (`~/.ccache`), not per-tree**, so a worktree build still gets its hits; only the `build/` object tree and CMake cache are fresh.
-  ⚠️ **But "still gets its hits" is only half true, and the missing half is the expensive one.** ccache keys on the compiler command line, and a **new worktree path misses on every TU whose command line embeds absolute paths** — which here includes `ggml-sycl.cpp`, the 60k-line one. Measured 2026-08-01: a first build in a fresh worktree spent **~50 minutes on that single translation unit**, against a lifetime ccache hit rate of 82.8 %. So **a first build at a NEW path is close to a cold build regardless of ccache**; only *subsequent* builds in that same worktree are cheap.
-  Consequence for fan-out: size a wave by the number of **first** builds it triggers, not by the number of tasks. Reusing an existing worktree for a follow-up task is dramatically cheaper than creating one, and three concurrent first-builds on this 20-core box is already past the point where adding agents slows everything down (measured: load 96, ~1 wave/hour).
+  ⚠️ **Since llama.cpp-7mqd, a first build at a new path hits the cache for host compiles.** `scripts/sycl-build.sh` runs ccache with `base_dir` at the tree (opt out with `GGML_SYCL_CCACHE_BASE_DIR=0`), so ccache rewrites the absolute paths it receives to paths relative to `build/` before hashing. Measured 2026-09-26 on `ggml-sycl` plus seven tests: 206 of the 213 cacheable compiles hit in a fresh worktree, and `ggml-sycl.cpp` took 0.4 s against 292 s cold. Before that change, a new path missed on every TU whose command line embedded absolute paths; on 2026-08-01 one first build spent ~50 min on `ggml-sycl.cpp` alone. **What still misses at a new path:** the 12 icpx `-march=native` `ggml-cpu` compiles (never cached by ccache), the `LLAMA_CPP_SOURCE_ROOT` test TUs, and `ggml.c` when the commit changes. The device links still run, but they hit the ocloc cache wherever a link on this toolchain already stored the same SPIR-V, because that cache is keyed by toolchain and SPIR-V rather than by path (`libggml-sycl` linked in 27 s in a fresh worktree against 643 s uncached; a toolchain upgrade or changed SPIR-V misses in every tree). **Changing the launcher (the first build after the switch, or any toggle of the variable) reruns every host compile once**, because the launcher is on every compile command. Those reruns hit wherever a matching entry already exists (a plain rebuild of a tree that built plain before hit 106 of 107 cacheable compiles), and are cold only where none does. A hit build is bound by device links and host load (99-219 s measured).
+  Consequence for fan-out: size a wave by the number of concurrent **builds** it triggers, since each still pays its device links and the uncached `ggml-cpu` compiles. Reusing an existing worktree for a follow-up task remains cheaper than creating one, and three concurrent cold builds on this 20-core box is already past the point where adding agents slows everything down (measured 2026-08-01: load 96, ~1 wave/hour).
   Measured 2026-08-01: with one shared `build/`, four agents serialised on a ~14-min build cycle and one track was starved **~2 hours**. Two worktree builds completed fine in the same session. Path-scoped commits prevent *file* conflicts; they do nothing about *build* contention, and that is what actually costs time.
   Use a worktree when a track will build repeatedly. Stay in the shared checkout when the work is small, or when it must operate on the checked-out branch itself (git refuses to check out one branch in two trees — so a **merge into** the active branch must happen in the main checkout, though only the build needs isolating).
   ⚠️ **Lock scope follows the build directory, not the act of building.** Shared checkout → take `/Apps/llama.cpp/BUILD.lock`. Own worktree → take nothing; nothing contends. `GPU.lock` is always global, from any tree, because the *devices* are shared.
@@ -1363,12 +1418,16 @@ Common diagnostics: `GGML_SYCL_DEBUG=1` (verbose dispatch), `GGML_SYCL_NAN_CHECK
      form operates on the whole index and would reformat their files
    - **never** `clang-format-19 -i <file>` — ~180 lines of unrelated pre-existing drift
 2. Build: `./scripts/sycl-build.sh`
-3. Test: use a form from "Running Tests" above — **not** a bare
-   `ctest --test-dir build --output-on-failure`, which runs `test-backend-ops`
-   and so contradicts step 4. Prefer `-R <what your change gates>`; for a full
-   sweep use form 2 verbatim — `-j 1` **and** `-E '^test-backend-ops$'`. Do not
-   raise `-j` to save time; it is a memory multiplier and has OOM'd this host.
-4. For ggml changes: Run `test-backend-ops` on multiple backends — **manually only, never in a subagent/background task (memory-exhaustion hazard, see Hard-Won Rules)**
+3. Test: use a form from "Running Tests" above. Never use a bare
+   `ctest --test-dir build --output-on-failure`: it runs every model-loading test
+   on every device, the iGPU included. Prefer `-R <what your change gates>`. For
+   a full sweep, run `bash scripts/check-ctest-safety-net.sh --build-dir build`
+   first, then form 2 verbatim:
+   `-j 1 -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'`.
+   Do not raise `-j` to save time; it is a memory multiplier and has OOM'd this host.
+4. For ggml changes: run `test-backend-ops` on multiple backends. It is a binary, not
+   a ctest (`ctest -R test-backend-ops` selects nothing), so run
+   `ONEAPI_DEVICE_SELECTOR=level_zero:N ./build/bin/test-backend-ops` — **manually only, never in a subagent/background task (memory-exhaustion hazard, see Hard-Won Rules)**
 5. Verify correctness: run the canonical completion gate (Hard-Won Rules) — tokens must be right, not just fast
 6. Verify performance: `llama-bench` and `llama-perplexity` should not regress
 
