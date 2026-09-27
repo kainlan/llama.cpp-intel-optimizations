@@ -1370,9 +1370,9 @@ if (NOT WIN32)
     # --check-classification by name. The plain unittest script exits 77 when
     # g++ or pinned parser packages are unavailable, so dependency absence is
     # visible as Skipped rather than a vacuous pass. Each census parse costs
-    # about a CPU-minute; the test runs nine in three concurrent waves, so
-    # TIMEOUT allows for this host's permanent load (one parse took 6 min wall
-    # at load average ~125).
+    # about a CPU-minute; the test runs nine in three waves (3 concurrent, then
+    # 1 generate, then 5 concurrent), so TIMEOUT allows for this host's
+    # permanent load (one parse took 6 min wall at load average ~125).
     llama_test_cmd(
         ${LLAMA_PYTHON3}
         NAME test-sycl-static-storage-audit

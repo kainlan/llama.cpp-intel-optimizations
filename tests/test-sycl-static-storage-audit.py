@@ -4,7 +4,8 @@ must classify the same static objects as the current sources, and both
 --check-classification and the byte-exact --check must detect what they gate.
 
 Pass --check to run only the committed-inventory drift gate
-(CommittedInventoryDriftTest); with no flag every test runs, which is what the
+(CommittedInventoryDriftTest), which runs the script's --check-classification,
+not its byte-exact --check; with no flag every test runs, which is what the
 registered ctest target does.
 """
 
@@ -97,6 +98,17 @@ class ClassificationProjectionTest(unittest.TestCase):
     def drift(self, current: list[dict[str, str]]):
         return self.audit.classification_drift(self.committed, current)
 
+    def test_classification_columns_are_every_column_but_the_informational_ones(self) -> None:
+        self.assertEqual(
+            self.audit.CLASSIFICATION_COLUMNS,
+            ("file", "symbol", "type", "scope", "mutability", "synchronization",
+             "owner_identity", "reset_teardown_disposition"),
+        )
+        self.assertEqual(self.audit.CLASSIFICATION_COLUMNS, self.audit.classification_columns(self.audit.COLUMNS))
+        # A column added to COLUMNS later is gated unless it is deliberately
+        # declared informational.
+        self.assertIn("new_column", self.audit.classification_columns((*self.audit.COLUMNS, "new_column")))
+
     def test_committed_inventory_has_no_drift_against_itself(self) -> None:
         self.assertEqual(self.drift([dict(row) for row in self.committed]), ({}, {}))
 
@@ -128,7 +140,10 @@ class ClassificationProjectionTest(unittest.TestCase):
         self.assertIn(PLANTED_STATIC, self.audit.format_classification_drift(added, removed))
 
     def test_changed_classification_column_is_drift(self) -> None:
-        for column in ("reset_teardown_disposition", "owner_identity", "mutability", "synchronization", "type", "scope"):
+        # Spelled out rather than read from the key, so dropping a column from
+        # the key fails here instead of silently skipping its subtest.
+        for column in ("file", "symbol", "type", "scope", "mutability", "synchronization",
+                       "owner_identity", "reset_teardown_disposition"):
             with self.subTest(column=column):
                 current = [dict(row) for row in self.committed]
                 current[0][column] = "planted"

@@ -54,12 +54,18 @@ COLUMNS = (
     "file", "line", "symbol", "type", "scope", "mutability", "synchronization",
     "writer_evidence", "reader_evidence", "owner_identity", "reset_teardown_disposition",
 )
-# The identity and classification of a row: what --check-classification
-# compares. Everything else in COLUMNS moves when an unrelated line does.
-CLASSIFICATION_COLUMNS = (
-    "file", "scope", "symbol", "type", "mutability", "synchronization",
-    "owner_identity", "reset_teardown_disposition",
-)
+# Columns that move when an unrelated line does. Every other column is the
+# identity and classification of a row, which --check-classification compares;
+# it is derived by exclusion so that a column added to COLUMNS is gated unless
+# it is deliberately listed here.
+INFORMATIONAL_COLUMNS = ("line", "writer_evidence", "reader_evidence")
+
+
+def classification_columns(columns):
+    return tuple(column for column in columns if column not in INFORMATIONAL_COLUMNS)
+
+
+CLASSIFICATION_COLUMNS = classification_columns(COLUMNS)
 RESET_CANDIDATE_MARKER = "unscoped lexical reset candidate"
 DECL_KINDS = {"declaration", "field_declaration"}
 DECLARATOR_KINDS = {
@@ -901,7 +907,7 @@ def classify(row, reset_candidates):
     if immutable:
         disposition = "not applicable: immutable binding"
     elif reset_candidates:
-        disposition = "lifecycle not inferred; unscoped lexical reset candidate: " + " | ".join(reset_candidates)
+        disposition = f"lifecycle not inferred; {RESET_CANDIDATE_MARKER}: " + " | ".join(reset_candidates)
     else:
         disposition = "lifecycle not inferred; no binding-resolved reset analysis"
     return "immutable binding" if immutable else "mutable", synchronization, owner, disposition

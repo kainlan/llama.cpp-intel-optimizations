@@ -83,9 +83,9 @@ ctest only checked a freshly generated temp copy, so the committed CSV drifted
 2,785 lines unnoticed.)
 
 One residue of lexical evidence stays inside the classification: whether a row
-has **any** reset candidate selects the disposition category, so a new
-same-named `clear()`/`reset()`/`store(false)` elsewhere in the same input can
-reclassify a row without touching its declaration. Review such a row and
+has **any** reset candidate selects the disposition category, so adding or
+removing a same-named `clear()`/`reset()`/`store(false)` elsewhere in the same
+input can reclassify a row without touching its declaration. Review such a row and
 regenerate; it is the unscoped scan being honest about what it saw.
 
 A change that adds, removes or reclassifies a static in any of the five inputs
