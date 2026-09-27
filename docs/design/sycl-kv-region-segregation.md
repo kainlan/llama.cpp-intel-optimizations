@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14t, by impl-moua, 2026-09-27. The revisions answer twenty-eight reviews:
+Design, revision 7.14v, by impl-moua, 2026-09-27. The revisions answer thirty reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -169,7 +169,11 @@ Design, revision 7.14t, by impl-moua, 2026-09-27. The revisions answer twenty-ei
   (i) (2) and (4) amendments, and 23mk's answer on the pure interim decision (first at
   `372bb5b16`, pinned at 23mk's head `bd560d3dd`, rev 4.19g), recorded in §6.37. Revision 7.14u
   is three commits on top of `e15f4095d`: `2da8e3ed7`, `95ac344e4` (the pairing ruling re-cited
-  as §M78) and a follow-up re-pinning 23mk to its head.
+  as §M78) and `8aeb2253d` (23mk re-pinned to its head).
+- design review r29 (design-moua-r29 on `e15f4095d..8aeb2253d`: 0 Critical, 0 Important, 2
+  Minor, 4 nits; the interim pairing rule ruled sound), recorded in §6.38. Revision 7.14v is one
+  commit on top of `8aeb2253d`: the W-order bound check reads one use descriptor, and the bound
+  cell's order and synchronize are pinned.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -2507,8 +2511,16 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                  the lifetime half of what it did. The ordering half becomes a device-side chain
                  (rulings §M50, as amended: one W use's submits; r23 I-2), owned by **one
                  production function (r24 I-3)**,
-                 `ggml_sycl_device_entry_w_ordered(entry, queue, steps)`. The oneDNN PP path
-                 calls it, and G2 calls it too. **`steps` is an ordered list of the use's
+                 `ggml_sycl_device_entry_w_ordered(entry, queue, use, steps)`. The oneDNN PP
+                 path calls it, and G2 calls it too. **`use` is the one source of the use's
+                 shape and context (r29 m-1):** a `ggml_sycl_w_use_desc { uint32_t ctx_id;
+                 uint32_t n_ubatch; size_t graph_nodes; }`, where `ctx_id` is the backend
+                 context's `ContextId`, the id the `ctx=%u` plan lines print. The oneDNN PP
+                 branch fills it from its own backend context and `src1->ne[1]`, with
+                 `graph_nodes` 0 for a direct use; the graph wrapper fills it for a recorded
+                 use from the recording's context, the `n_ubatch` its meta's W entry recorded
+                 at capture and the recording's node count; a marker use passes it
+                 explicitly. **`steps` is an ordered list of the use's
                  W-touching step callables (r25 m-9).** Each step submits on `queue` and returns
                  its event, or returns none when it throws or declines, and the function calls
                  the steps itself, so it sees every one. It anchors the use on the **last** step
@@ -2567,9 +2579,9 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    both in with K. A larger shape (a longer replayed graph, a larger ubatch or
                    model) can have a longer tail than 2T. Outside the bound the use still runs,
                    since refusing would fail correct runs that never come near 2T, but it is
-                   named: the first W use of a context at an `n_ubatch` above the bound, or
-                   through a recording above the node bound (the finalize wrapper sees the node
-                   count and the meta's W entry), prints once per (context, device)
+                   named: the first W use whose `use.n_ubatch` is above the bound, or whose
+                   `use.graph_nodes` is above the node bound, prints once per (`use.ctx_id`,
+                   device), deduped by a per-entry set of `ctx_id`s,
                    `[W-ORDER] shape above the measured tail bound on device %d: n_ubatch=%u
                    graph_nodes=%zu bound=%u/%zu` at WARN and sets a flag on the entry. A cap
                    with the flag set aborts with its own message, `[W-ORDER] marker wait capped
@@ -2577,10 +2589,12 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    shape`, so an out-of-bound fault is never read as a lost publisher, and an
                    in-bound one keeps the message below. Every scored arm here runs inside the
                    bound, and scores the WARN at 0; G2's bound cell (§3.2) is that zero's
-                   positive control, and it separates the two abort messages (r28 m-4). A
-                   publisher that finds the fault set does not publish, so every later waiter
-                   also reaches its cap, and `ggml_backend_sycl_synchronize` reads the fault
-                   word after its wait and aborts with
+                   positive control, and it separates the two abort messages (r28 m-4). The
+                   comparison and the dedup are inside `ggml_sycl_device_entry_w_ordered` and
+                   read only `use`'s fields, never a caller's shape, and H7 (as) gates that (r29
+                   m-1). A publisher that finds the fault set does not publish, so every later
+                   waiter also reaches its cap, and `ggml_backend_sycl_synchronize` reads the
+                   fault word after its wait and aborts with
                    `[W-ORDER] marker wait capped on device %d: W ordering lost`. A capped wait
                    therefore never lets a run finish silently, since proceeding silently is the
                    W race. A scope guard submits the publisher, so a throwing step still
@@ -8777,8 +8791,16 @@ means that.
     batched entry checks `ggml_sycl_graph_recording_active()` before it claims the weight slot,
     and the `[ZONE-PLAN-BUG] PP MoE oneDNN path reached while recording` line exists at that
     check. A host arm drives the admission with the recording flag set and expects that line
-    and no weight-slot claim. Mutation witness: the check removed, under which the arm sees the
-    claim and no line.
+    and no weight-slot claim. Mutation witness: the check removed, under which the arm sees a
+    weight-slot claim and no `[ZONE-PLAN-BUG]` line;
+  - (as) **the W-order bound check has one source, the use descriptor (r29 m-1).** On the
+    comment-stripped source, the bound comparison (the compiled bound's two fields, or the
+    test seam's override) and the per-entry `ctx_id` dedup occur only inside
+    `ggml_sycl_device_entry_w_ordered`, and read only its `use` parameter's `ctx_id`, `n_ubatch`
+    and `graph_nodes`; no caller of the function names the bound, and every caller passes a
+    `ggml_sycl_w_use_desc`. Mutation witnesses: the comparison moved into the oneDNN PP caller
+    on `src1->ne[1]` (under which the G2 bound cell's marker uses print 0 WARNs), and a dedup
+    keyed by the queue instead of `ctx_id`.
   RED: every check fires on the pre-change tree, and the count is recorded.
 - **H8 region scope under concurrency (r1 I6, third point).**
   - The registry and scope logic is factored into a SYCL-free header, `kv-region-registry.hpp`.
@@ -9275,7 +9297,9 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
   the arm executes (r24 I-3).** A use takes one of two forms:
   - a **marker use**: the use resolves the pair's view through `acquire_onednn_pp_scratch`
     (`ggml-sycl.cpp:1483`) and then calls the production
-    `ggml_sycl_device_entry_w_ordered(entry, queue, steps)` (§2.4.2) with two steps, each a
+    `ggml_sycl_device_entry_w_ordered(entry, queue, use, steps)` (§2.4.2), with `use` = {the
+    context's `ContextId`, 32, 0}, the production use's column count and no recording, unless
+    an arm states another, and two steps, each a
     kernel on the context's own in-order queue: a **W writer**, which writes the use's id into
     the view's first word, then a **W reader**, which reads that word and appends the use's id
     and the word it read to the log. The writer stands for the reorder and the reader for the
@@ -9514,17 +9538,25 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
   the negative control does.
 - **The bound cell (r28 m-4), when G0 picked Form M.** It is the positive control for §2.4.2's
   out-of-bound WARN, whose zero every scored arm reads, and it separates the two abort messages.
-  Three children, each the test binary re-executed with the cell's selector, run X and Y's
-  marker uses at the fixture's `n_ubatch`:
-  - **(a) above the bound, no fault.** `ggml_sycl_test_set_w_order_bound` lowers the device's
-    bound below the fixture's `n_ubatch` and node count before the first use, and each context
-    runs two W uses. GREEN: exactly one `[W-ORDER] shape above the measured tail bound on device
-    0:` line per (context, device), so 2, zero `marker wait capped` lines, and exit 0;
-  - **(b) above the bound, a lost publisher.** As (a), then
-    `ggml_sycl_test_w_order_drop_next_publisher` before X's second use. GREEN: exit 134, exactly
+  Three children, each the test binary re-executed with the cell's selector, run X's and Y's
+  marker uses in the pinned order X1, Y1, X2, Y2, each passing `use` = {its context's
+  `ContextId`, 32, 0}: X and Y are two fixture contexts, so two distinct `ctx_id`s, and 32 is
+  the `n_ubatch` the check reads (r29 m-1). **Each child ends with
+  `ggml_backend_sycl_synchronize` on both contexts' backends**, the call that reads the fault
+  word after its wait (§2.4.2), and the harness's log read, "after every queue has completed",
+  comes after that synchronize (r29 m-2):
+  - **(a) above the bound, no fault.** `ggml_sycl_test_set_w_order_bound(0, 16, <the compiled
+    node bound>)` lowers the device's `n_ubatch` bound to 16, below the uses' 32, before X1.
+    GREEN: exactly one `[W-ORDER] shape above the measured tail bound on device 0:` line per
+    (`ctx_id`, device), at X1 and Y1, so 2, zero `marker wait capped` lines, and exit 0;
+  - **(b) above the bound, a lost publisher.** As (a), with
+    `ggml_sycl_test_w_order_drop_next_publisher(0)` called before X2, so X2 submits no
+    publisher and Y2's waiter chain, which waits on X2's number, reaches its cap; the
+    synchronize then reads the fault word. GREEN: exit 134, exactly
     one `[W-ORDER] marker wait capped on device 0 outside the measured tail bound: re-measure G0
     F3 at this shape` line, and zero `W ordering lost` lines;
-  - **(c) inside the bound, a lost publisher.** The bound left as compiled, the same drop.
+  - **(c) inside the bound, a lost publisher.** The bound left as compiled (its `n_ubatch`
+    bound is at least 2048, G0 F3), the same order and the same drop before X2.
     GREEN: exit 134, one `[W-ORDER] marker wait capped on device 0: W ordering lost` line, zero
     `outside the measured tail bound` lines and zero `shape above` lines;
   - **REDs.** The entry's flag never set. (a) still prints its WARNs, but (b) then aborts with
@@ -9598,7 +9630,7 @@ placement and demotion run. The rules for every such arm:
   - C5 and its sibling keep the registration's `-ub 32` (`tests/CMakeLists.txt:790` at
     `e2461d4fb`). The last `-ub` wins, so adding one would make the arm a different test from
     the registered one;
-    - C2b leaves `-ub` unpinned, because the ladder is its subject; its trial-live witness names
+  - C2b leaves `-ub` unpinned, because the ladder is its subject; its trial-live witness names
     the rungs the trial tried;
   - C9's state-seq arm runs `test-save-load-state` as registered, with no `-ub`. Its ubatch is
     fixed anyway: the test sets `n_batch = 100` (`tests/test-save-load-state.cpp:872` at
@@ -9722,8 +9754,11 @@ placement and demotion run. The rules for every such arm:
   interim capacity (the ONEDNN zone's ensured bytes less its stored W, 0 on a device without the
   zone), and `term` from the pure `onednn_graph_scratch_term_bytes(n_head, ne01, ne11)`, and
   gives the (b1) N and each declined layer's reason, `interim_capped` or `interim_capacity`.
-  **Which shapes (r28 m-1).** The routing read runs before the plan, so every FA call on the
-  route reaches the check, decode calls included, even those the plan would reject
+  **Which shapes (r28 m-1).** The routing read runs before the plan, so every FA call that
+  reaches the routing read is checked. That includes every decode call that reaches the routing
+  read, which is one that passes its arm's first terms (the `:3123` arm reads after its
+  `!safe_decode` term, `fattn.cpp:3121` at `d8a67422d`, so a decode call that `safe_decode`
+  sends elsewhere is never checked; r29 n-2), even one the plan would reject
   `BELOW_MIN_NCOLS` (`fattn-onednn.cpp:111-113` at `e2461d4fb`, `ne01` below 8). A layer is
   declined when any of its calls is, so the replay evaluates every call shape the run issues:
   each prompt ubatch (`ne01` its token count, `ne11` the KV length the graph gives FA at that
@@ -9752,8 +9787,9 @@ placement and demotion run. The rules for every such arm:
   a decline line with no same-`txn` commit line is VOID; a commit line with no same-`txn`
   decline line pairs with `declined` = 0. The scored pair is the last `txn` per (context,
   device), the settled state, against the replay of the context's last transaction; earlier
-  pairs are recorded. 7.14t's print-order pairing is withdrawn: under 23mk's former rule, which
-  printed the commit line only when the range or its admitted set changed, the lines C0 (A = M −
+  pairs are recorded. 7.14t's print-order pairing is withdrawn: under 23mk's rule until §M78
+  lands, which prints the commit line only when the range or its admitted set changes (23mk
+  `bd560d3dd` :5024), the lines C0 (A = M −
   k), D1 (`declined` = k, from a transaction that changed nothing) and C2 (A = M, from a later
   transaction with no decline) paired D1 with C2 and failed a correct tree (r28 m-2). **Until
   the lead relays 23mk's commit** the lines carry no `txn`, and a run is scored only when it
@@ -9844,7 +9880,7 @@ placement and demotion run. The rules for every such arm:
   cat c2b.err | grep -oE 'auto n_ubatch=[0-9]+ .*\(tried [0-9,]+; [^)]*\)'  # exactly 1 line
   cat c2b.err | grep -oE '\(tried [0-9,]+;' | tr -cd ',' | wc -c  # >= 1 (two rungs), else VOID
   cat c2b.err | grep -c '\[KV-REGION\] reserve'           # 1: one (ctx, dev)
-    cat c2b.err | grep -cE 'llama_context: n_ctx +=  *32768$'  # 1, else VOID (§3.3)
+  cat c2b.err | grep -cE 'llama_context: n_ctx +=  *32768$'  # 1, else VOID (§3.3)
   cat c2b.err | grep -c 'llama_context: n_ctx_seq'         # >= 1, the control's line
   cat c2b.err | grep 'n_ctx_seq' | grep -cE 'llama_context: n_ctx +=  *32768$'  # 0
   ```
@@ -9853,7 +9889,7 @@ placement and demotion run. The rules for every such arm:
     (`src/llama-context.cpp:1942` at `e2461d4fb`), prints once, its `tried` list names at least
     two rungs, and its reason is not `cached`; otherwise the arm is VOID, since a one-rung trial
     republishes nothing and a count of 1 then says nothing about republishes. The ladder stops
-    at its first losing rung (the loop at `src/llama-context.cpp:1809-1846`, its `break` at
+    at its first losing rung (the loop at `src/llama-context.cpp:1809-1843`, its `break` at
     `:1839-1840`, at `e2461d4fb`), so a second rung in `tried` means the first was
     accepted, published and reserved: the context has been published at least twice under its
     key, by the constructor and by the trial.
@@ -13435,7 +13471,7 @@ Master pin for source cites: `e2461d4fb`.
 | n-2 | the ABRT cite was stale | **Changed.** Cited by name, the script's `ABRT=` line. The merge-gate block cites move to `:115` and `:125` at 7.14s. |
 | n-3 | C7 named only GA's default arm | **Changed.** GH's default arm is zhcn GDC6 (`5e0ffae`): `llama-completion` on the B50, no `-c`, `n_ctx` 262144, STRICT. |
 | n-4 | a blank bullet in the exemption list | **Changed.** Deleted, with a second one the same edit exposed. |
-| §M70 amendment (b'), (c') (follow-up) | the entry check read as a dispatch-time decision; "SDPA not admitted without zones" was too broad | **Changed.** (b1)'s per-call check at the entry of `ggml_sycl_flash_attn_ext_onednn` compares against the **planned** interim capacity, so it reads a planned fact and is an allowed interim form; (b2) deletes it and moves the decision to per-layer admission. A device with no zones keeps §M33 I-B's planned exact-owner form (owner-first through the unified cache); "not admitted" applies only where no such form exists, where 23mk's (b1) rule declines at interim capacity 0, before `:11708`. |
+| §M70 amendment (b'), (c') (follow-up) | the entry check read as a dispatch-time decision; "SDPA not admitted without zones" was too broad | **Changed.** (b1)'s per-call check at the entry of `ggml_sycl_flash_attn_ext_onednn` compares against the **planned** interim capacity, so it reads a planned fact and is an allowed interim form; (b2) deletes it and moves the decision to per-layer admission. A device with no zones keeps §M33 I-B's planned exact-owner form (owner-first through the unified cache); "not admitted" applies only where no such form exists, where 23mk's (b1) rule declines at interim capacity 0, before `:11708`. Amended in §6.37 (r28 m-1): the (b1) decline is read in 23mk's routing read before the plan, and the entry keeps only an uncounted backstop. |
 | §M71 (follow-up) | the decline lines' format and their admission witness | **Changed.** The (b1)/(b2) bullets and §3.3's scorer use §M71 (a)'s two formats: the (b2) fit line `... declined=%u of %u layers needed=%zu room=%zu reason=scratch_unplaced` per (ctx, dev), and the (b1) interim line per (ctx, dev, layer) with `il` and a running count. The witness from (b2) is §M30's commit line with the suffix ` admitted=%u of %u layers` (A1 quotes it); `declined` = M − `admitted`, no commit line is VOID, M = 0 is VOID for any SDPA claim. At (b1) the witness is the `GGML_SYCL_PRIVATE_TESTING` exit dump (`onednn_sdpa_executed` ≥ 1, `fallback_after_admit` = 0), no dump VOID. The Qwen xqex greps read these fields. The admitted line `65300ce1a` asked of 23mk and its positive-control fallback are withdrawn. |
 | §M72 (follow-up) | the TERMINAL channel's failure mode | **Changed.** It aborts unconditionally with its `[ZONE-PLAN-BUG]` message, independent of STRICT; returning null (a GPU fault, no failure return in the Graph callback) and throwing (caught at `fattn-onednn.cpp:1363-1366`, silent native FA at `fattn.cpp:3911`, `:3924`) are both named as forbidden. The runtime-miss arm aborts with `GGML_SYCL_STRICT_LEASES` unset, and its RED is a throwing mutant that the catch would hide. |
 
@@ -13568,3 +13604,23 @@ read is `bd560d3dd`. The §6.36 rows it amends (m-2, m-3, m-5, m-9) are marked i
   as your "Where a declined layer runs". (2) moua's (b2) pairing waits for your `txn=%u` field
   on both lines under §M78; please say where in each line it prints. (3) Closed: moua's replay
   calls your four-argument pure decision with `tp` = false.
+
+### 6.38 Revision 7.14v: design-moua-r29
+
+Revision 7.14v is one commit on top of `8aeb2253d`. It answers design review r29
+(design-moua-r29 on `e15f4095d..8aeb2253d`: 0 Critical, 0 Important, 2 Minor, 4 nits; P1-P4
+all pass; every r28 item verified closed). The reviewer ruled the interim pairing rule of §6.37
+m-2 (at most one decline line and exactly one commit line per (context, device), otherwise VOID)
+sound, so it stands unchanged until §M78's `txn` field lands. The revision also folds two notes
+queued during r29: the §6.35 amendment marker and design-23mk-r22's peer-cite nit.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| m-1 | the W-order bound check compared "n_ubatch" and "graph_nodes" and deduped per (context, device), but the function's signature carried no shape or context, so each caller could feed a different figure and the bound cell's "fixture n_ubatch" had no source | **Changed.** `ggml_sycl_device_entry_w_ordered(entry, queue, use, steps)` takes a use descriptor `ggml_sycl_w_use_desc { uint32_t ctx_id; uint32_t n_ubatch; size_t graph_nodes; }` (§2.4.2). The oneDNN PP branch fills it from its backend context's `ContextId` and `src1->ne[1]`, with `graph_nodes` 0; the finalize wrapper fills it from the recording's context, the `n_ubatch` its meta's W entry recorded, and the node count; a marker use passes it explicitly. The bound comparison and the per-(`ctx_id`, device) WARN dedup sit inside the function and read only `use`. New H7 (as) is a source gate on that, with two mutation witnesses: the comparison moved into the PP caller on `src1->ne[1]`, and a dedup keyed by queue. The G2 marker use and the bound cell pass `use` = {the context's `ContextId`, 32, 0}, and (a)'s two WARNs are defined from it. |
+| m-2 | the bound cell's children could not reach their abort messages in a stated order, and the harness read the log with no completion point | **Changed.** Each child runs X1, Y1, X2, Y2 in that order; (b) and (c) drop X2's publisher (`ggml_sycl_test_w_order_drop_next_publisher(0)` before X2), so Y2's chain caps. Each child ends with `ggml_backend_sycl_synchronize` on both backends, which is where the flag is read, and the harness's "after every queue has completed" log read comes after that synchronize. |
+| n-1 | stray indents in the `-ub` exception list | **Changed.** The C2b bullet is un-nested to 2 spaces, and C2b's `n_ctx +=` grep line sits at 2 spaces. |
+| n-2 | "decode calls included" overstated the routing read's reach, and "23mk's former rule" called commit-on-change former, though it is in force at `bd560d3dd` :5024 | **Changed.** §3.3 says every decode call that reaches the routing read (the `:3123` arm reads after its `!safe_decode` term, `fattn.cpp:3121` at `d8a67422d`). The pairing text says 23mk's rule until §M78 lands, which prints the commit line only when the range or its admitted set changes (`bd560d3dd` :5024). |
+| n-3 | C2b cited the ladder loop at `:1809-1846` | **Changed.** The loop is `src/llama-context.cpp:1809-1843`. |
+| n-4 | the header named revision 7.14t and twenty-eight reviews above an r28 bullet | **Changed.** It named 7.14u and twenty-nine reviews at the fold; with this revision it names 7.14v and thirty, and gains an r29 bullet. |
+| §6.35 marker (queued during r29) | the §6.35 "§M70 amendment (b'), (c') (follow-up)" row still placed (b1)'s per-call check at the SDPA entry, unmarked | **Changed.** The row ends "Amended in §6.37 (r28 m-1)", naming 23mk's routing read before the plan and the entry's uncounted backstop. |
+| design-23mk-r22 peer-cite nit (queued during r29) | moua cited a three-argument `interim_decline` and said the decline is read "at the entry" | **Closed, no body change.** Both cites are `e15f4095d` line numbers, fixed in the body by `2da8e3ed7`: §3.3 cites the four-argument form at 23mk `bd560d3dd` L4623, and §2.4.2 places the decline at the routing read. The remaining three-argument text is the §6.36 m-3 row, history marked amended in §6.37. |
