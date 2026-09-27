@@ -128,7 +128,8 @@ Design, revision 7.14n. Author: impl-moua, 2026-09-27. The revisions answer twen
   `263bf7ad9` and a follow-up for the lead's §M47a, which scopes §M47 I-1, `508601e79`.
 - design review r21 (design-moua-r21 on `916ee34d5..263bf7ad9`: 0 Critical, 5 Important, 9
   Minor), the lead's rulings on it (§M48), and the name zhcn 5.22 gives the arena predicate,
-  recorded in §6.30. Revision 7.14n is one commit on top of 7.14m's follow-up (`508601e79`).
+  recorded in §6.30. Revision 7.14n is two commits on top of 7.14m's follow-up (`508601e79`):
+  `c24d3a482` and r21's m-10 from its re-score.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -368,7 +369,10 @@ different questions of a device, and each has one named predicate:
   enters at `:37637-37639`). It is a property of the device's arena, true from the
   `unified_cache` constructor's early arena (`unified-cache.cpp:4093-4099`), so it holds with no
   model loaded, at stage (a) of a process's first model, at the first context's freeze and on
-  zhcn's mock VM devices. Its readers are the VM/USM decisions (zhcn's chunk cap in the device
+  zhcn's mock VM devices. It does not by itself say VM or USM: `arena_active()` is
+  `arena_base_ != nullptr`, true on both backings. The split is the arena predicate and, under
+  it, the arena's backing kind (1oxa's `g.backing == VM`, behind §2.11's `arena_backing`
+  interface; r21 m-10). Its readers are the VM/USM decisions (zhcn's chunk cap in the device
   buft's `get_max_size`, the per-context freeze, and the (a), (b) and (c) caps of zhcn's
   load-time measure), `reserve_onednn_scratch`'s arena path and `onednn_scratch_from_arena`
   (`unified-cache.hpp:3697-3701`), 23mk's vmem-kv refusal (§2.6), the ring-setter cut in
@@ -2899,15 +2903,18 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         above, decides one thing: whether the leg refuses or serves a SYCL<n> device buffer,
         that is, the scope dispatch, the deleted `should_use_runtime` block, the unplanned line
         and C9's no-model control. The device's backing classification is a different fact and
-        keeps the arena predicate, `ggml_sycl_device_arena_backed(dev)` (§2): whether the
-        device's arena is VM- or USM-backed, and zhcn's `ggml_sycl_arena_chunk_cap`, which
-        zhcn's (a)/(b)/(c)/freeze branch reads. That fact must hold before any plan exists: at
-        stage (a) of a process's first model, at the first context's freeze, and on zhcn's mock
-        VM devices. Keyed on the ledger, it would put stage (a) on the USM `min(2 GiB, A)` cap
-        and fire the refusal that cap guards on a correct tree. 7.14m moved only the leg's rules
-        to the planned predicate; this document's other "arena device" rules (the zone layout,
-        RUNTIME's floor, the ring's deletions, the charging sites) keep the arena predicate. So
-        L4+L6, on a planned device (rulings §M44 I-1, §M47 I-1; r18 I-1):
+        keeps the arena predicate, `ggml_sycl_device_arena_backed(dev)` (§2), and, under it,
+        the arena's backing kind (1oxa's `g.backing == VM`, §2.11's `arena_backing`): together
+        they decide whether the device is VM- or USM-backed, and zhcn's
+        `ggml_sycl_arena_chunk_cap`, which zhcn's (a)/(b)/(c)/freeze branch reads. 7.14m said
+        `arena_active()` decides VM versus USM, but it is true on both backings (r21 m-10). That
+        fact must hold before any plan exists: at stage (a) of a process's first model, at the
+        first context's freeze, and on zhcn's mock VM devices. Keyed on the ledger, it would put
+        stage (a) on the USM `min(2 GiB, A)` cap and fire the refusal that cap guards on a
+        correct tree. 7.14m moved only the leg's rules to the planned predicate; this document's
+        other "arena device" rules (the zone layout, RUNTIME's floor, the ring's deletions, the
+        charging sites) keep the arena predicate. So L4+L6, on a planned device (rulings §M44
+        I-1, §M47 I-1; r18 I-1):
         - **makes the claim scope the leg's only discriminator.** The buffer's role cannot be
           one: `alloc_role` (`:37618-37620`) is `WEIGHT` for every SYCL<n> buffer whose buffer
           type is not a `_Compute` one, which covers the scheduler's compute buffers, the
@@ -11140,17 +11147,19 @@ SYCL<n> device buffers.
 
 | item | ruling | disposition |
 |---|---|---|
-| §M47a | the device's backing classification (VM or USM, zhcn's `ggml_sycl_arena_chunk_cap`) stays a property of the device's arena, true before any plan: at stage (a) of a process's first model, at the first context's freeze and on mock VM devices; keying it on the ledger would put (a) on the USM `min(2 GiB, A)` cap and fire a refusal on a correct tree | **Changed.** The leg passage names both predicates and their readers. The planned predicate (the ledger) is read by the scope dispatch, the deleted `should_use_runtime` block, the unplanned line and C9's no-model control. The arena predicate (`arena_active()`) is read by the backing classification, the chunk cap and zhcn's (a)/(b)/(c)/freeze branch. The document's other "arena device" rules keep the arena predicate. The §4 leg bullet says the same. The zhcn relay above is corrected; its first form said zhcn's compute scope was keyed on the ledger. |
+| §M47a | the device's backing classification (VM or USM, zhcn's `ggml_sycl_arena_chunk_cap`) stays a property of the device's arena, true before any plan: at stage (a) of a process's first model, at the first context's freeze and on mock VM devices; keying it on the ledger would put (a) on the USM `min(2 GiB, A)` cap and fire a refusal on a correct tree | **Changed.** The leg passage names both predicates and their readers. The planned predicate (the ledger) is read by the scope dispatch, the deleted `should_use_runtime` block, the unplanned line and C9's no-model control. The arena predicate (`arena_active()`) is read by the backing classification, the chunk cap and zhcn's (a)/(b)/(c)/freeze branch. The document's other "arena device" rules keep the arena predicate. The §4 leg bullet says the same. The zhcn relay above is corrected; its first form said zhcn's compute scope was keyed on the ledger. (Amended in place, §6.30 m-10: the VM/USM split is the arena predicate and, under it, the arena's backing kind; `arena_active()` is true on both.) |
 
 **Relay.** zhcn: the backing classification, the chunk cap and the (a)/(b)/(c)/freeze branch
 stay on the arena predicate; only the leg's refuse-or-serve decision moves to the ledger.
 
 ### 6.30 Revision 7.14n: design-moua-r21, rulings §M48
 
-Revision 7.14n is one commit on top of 7.14m's follow-up (`508601e79`). It answers design review
-r21 (design-moua-r21 on `916ee34d5..263bf7ad9`: 0 Critical, 5 Important, 9 Minor) as ruled in
-§M48. r21 read 263bf7ad9, so its I-1 was partly closed by `508601e79` (§6.29's follow-up); this
-revision closes the rest. The §6.28 and §6.29 rows it supersedes are marked in place.
+Revision 7.14n is two commits on top of 7.14m's follow-up (`508601e79`). It answers design
+review r21 (design-moua-r21 on `916ee34d5..263bf7ad9`: 0 Critical, 5 Important, 9 Minor) as
+ruled in §M48. r21 read 263bf7ad9; re-scored at `508601e79`, its I-1 is closed by §6.29's
+follow-up, and it adds m-10. 7.14n's first commit (`c24d3a482`) still carries the I-1 work below
+(§2's two predicates, the uses checked), which the re-score does not require; this commit adds
+m-10. The §6.28 and §6.29 rows it supersedes are marked in place.
 
 | item | finding / ruling | disposition |
 |---|---|---|
@@ -11171,16 +11180,18 @@ revision closes the rest. The §6.28 and §6.29 rows it supersedes are marked in
 | m-7 | superseded §6.28 rows unmarked | **Changed.** The r19 I-4 and addendum m-12 rows carry the 7.14m figures, and the r18 I-1 and r19 I-1 rows the predicate change, in place. |
 | m-8 | the extension keyed on `model_id` alone | **Changed.** It takes the whole `llama_sycl_model_token` (`llama-model.h:742`, `:755`), so a stale token is refused by its generation. |
 | m-9 | ":85 and :94 stand" read as the ABRT gates | **Changed.** Those are the `< /dev/null` command lines; the `$ABRT` gates are `:87` and `:96`. |
+| m-10 (r21 re-score at `508601e79`) | the leg passage said `arena_active()` decides VM versus USM, but `arena_base_ != nullptr` is true on both backings | **Changed.** §2's definition, the leg passage and the zhcn relay say the split is the arena predicate, `ggml_sycl_device_arena_backed(dev)`, and, under it, the arena's backing kind (1oxa's `g.backing == VM`, §2.11's `arena_backing`). §6.29's §M47a row is amended in place. |
 
 **Relays.**
 - **zhcn:** the arena predicate is `ggml_sycl_device_arena_backed(dev)`, your 5.22 name, and
-  every VM/USM decision stays on it. Your stage (a) measures before the pack, and a load's
-  device becomes planned only when the early stage stages its pending plan after the pack. So
-  on the ledger predicate a process's first model is unplanned at (a), and (a) would take the
-  USM `min(2 GiB, A)` cap. That is why the backing must not move to the ledger. moua's
-  fourth measure is withdrawn, and your three call sites stand. An adapter's compute delta
-  reaches you only as the setter's decode-time re-reserve, your existing runtime-transaction
-  site, with your GC2/GC2r arms.
+  every VM/USM decision stays on it and, under it, on the arena's backing kind (1oxa's
+  `g.backing == VM`), never on `arena_active()` alone (r21 m-10). Your stage (a) measures before
+  the pack, and a load's device becomes planned only when the early stage stages its pending
+  plan after the pack. So on the ledger predicate a process's first model is unplanned at (a),
+  and (a) would take the USM `min(2 GiB, A)` cap. That is why the backing must not move to the
+  ledger. moua's fourth measure is withdrawn, and your three call sites stand. An adapter's
+  compute delta reaches you only as the setter's decode-time re-reserve, your existing
+  runtime-transaction site, with your GC2/GC2r arms.
 - **23mk:** the device entry owns only `onednn_pp_w`'s handle. `onednn_pp_a` stays the
   context's `REGION` head slot. Uses retain the handle to their own queue's event. The old
   backing is released by its destructor, never by `defer_published_zone_release`. Every
