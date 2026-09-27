@@ -1001,6 +1001,28 @@ inline const char * dense_exec_plan_violation(const dense_exec_graph & g, const 
         }
         return true;
     };
+    // And a run writes no slice of its device but those its spans carry:
+    // the bytes between them are padding, never another root's storage.
+    auto runs_confined = [&](const std::vector<dense_exec_run> & runs, int device,
+                             const std::vector<std::pair<int, size_t>> & spans) {
+        for (size_t s = 0; s < p.slices.size(); ++s) {
+            const dense_exec_slice & slice = p.slices[s];
+            if (slice.device != device || slice.bytes == 0) {
+                continue;
+            }
+            bool carried = false;
+            for (const auto & span : spans) {
+                carried = carried || static_cast<size_t>(span.first) == s;
+            }
+            for (const dense_exec_run & run : runs) {
+                if (!carried && slice.offset < run.arena_offset + run.bytes &&
+                    run.arena_offset < slice.offset + slice.bytes) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
     for (size_t r = 0; r < p.ranges.size(); ++r) {
         const dense_exec_range_io &         io = p.io[r];
         std::vector<std::pair<int, size_t>> in, src, dst;
@@ -1015,6 +1037,11 @@ inline const char * dense_exec_plan_violation(const dense_exec_graph & g, const 
             !runs_cover(io.copy_out_src_runs, p.ranges[r].device, src) ||
             !runs_cover(io.copy_out_dst_runs, g.original_device, dst)) {
             return "a crossing's copies do not cover its slices";
+        }
+        if (!runs_confined(io.stage_in_runs, p.ranges[r].device, in) ||
+            !runs_confined(io.copy_out_src_runs, p.ranges[r].device, src) ||
+            !runs_confined(io.copy_out_dst_runs, g.original_device, dst)) {
+            return "a crossing's copy overwrites a slice it does not carry";
         }
     }
     return nullptr;

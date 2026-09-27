@@ -13,7 +13,11 @@ the context's graph_input_staging_generation tells it. So:
   2. the executor takes the moved-only refresh only on a plan-cache hit that
      records nothing, checks the generation and the input list first, and
      skips exactly the inputs whose bytes did not move and that no node
-     writes.
+     writes. Every other input is copied from its host bytes into its
+     staging copy, or, without one, refreshed in full;
+  2a. the executor's memo of that refresh holds no staging handle: a copy
+     looks the entry up when it runs, so nothing keeps an allocation alive
+     after the staging map has dropped it.
 
 What makes the skip sound is (1): no node writes a staging copy. Kernels
 only read them, through graph_input_stage_lookup, and a node that writes a
@@ -33,7 +37,9 @@ dense_exec_coalesce), so:
   3. the arena side of every crossing copies whole runs, never a slice at a
      time;
   4. leaving a range waits on its queue only when the crossing did not, and
-     the crossing reports that it waited only after it has.
+     the crossing reports that it waited only after it has;
+  4a. a plan-cache hit shares the prepared plan, slices and run views with
+     the cache entry instead of copying their handles.
 
 Publications (item A-lite). Every storage publish and restore starts a new
 data-pointer cache, and a split token publishes and restores dozens of
@@ -199,7 +205,7 @@ def test_no_other_code_touches_the_staging_map():
 # add it here only if it reads, or make it bump the generation.
 LOOKUP_HANDLE_TAKERS = {
     ("getrows.cpp", "&out_handle"),  # pre-staged get_rows indices, read by the kernel
-    ("ggml-sycl.cpp", "&in.dst"),  # the executor's memo
+    ("ggml-sycl.cpp", "&dst"),  # the executor's moved-only copy, held for that copy only
 }
 
 
@@ -260,19 +266,83 @@ def test_moved_only_refresh_is_gated_on_a_recordless_plan_cache_hit():
     assert moved.count("refresh_skipped_++") == 1 and moved.count("continue") == 2, (
         "the unmoved skip and the full refresh are the only ways past the copy"
     )
+    full = re.findall(
+        r"if\s*\(\s*!\s*in\.staged\s*\|\|\s*t\s*==\s*nullptr\s*\|\|\s*t->data\s*==\s*nullptr\s*\|\|"
+        r"\s*ggml_nbytes\(t\)\s*!=\s*in\.bytes\s*\)\s*\{\s*in\.snapshot\s*=\s*ggml_sycl::dense_exec_input_snapshot\{\}\s*;"
+        r"\s*refresh_full_\s*\+=\s*graph_refresh_input_tensor\(&ctx_,\s*t,\s*q\)\s*\?\s*1\s*:\s*0\s*;\s*continue\s*;\s*\}",
+        moved,
+    )
+    assert len(full) == 1, "an input without a staging copy is refreshed in full"
+    # Past the skip, the input is copied: its entry looked up (a missing one
+    # refuses the whole moved-only refresh), then host to device, then
+    # recorded. Nothing may condition or reorder the copy.
+    copy = re.findall(
+        r"refresh_skipped_\+\+\s*;\s*continue\s*;\s*\}\s*"
+        r"ggml_sycl::mem_handle\s+dst\s*;\s*void\s*\*\s*dst_ptr\s*=\s*nullptr\s*;\s*"
+        r"if\s*\(\s*!\s*ctx_\.graph_input_stage_lookup\(\s*t\s*,\s*in\.bytes\s*,\s*original_device_\s*,\s*&dst\s*,"
+        r"\s*&dst_ptr\s*\)\s*\)\s*\{\s*return\s+false\s*;\s*\}\s*"
+        r"const\s+ggml_sycl::mem_handle\s+src\s*=\s*ggml_sycl::mem_handle::from_direct\(\s*t->data\s*,[^;]*,\s*in\.bytes\s*\)\s*;\s*"
+        r"\(void\)\s*ggml_sycl::mem_copy_async\(\s*dst\s*,\s*src\s*,\s*in\.bytes\s*,\s*q\s*\)\s*;\s*"
+        r"ggml_sycl::dense_exec_input_record\(\s*in\.snapshot\s*,\s*t->data\s*,\s*in\.bytes\s*\)\s*;\s*"
+        r"refresh_copied_\+\+\s*;\s*\}",
+        moved,
+    )
+    assert len(copy) == 1, "every input past the skip is copied from its host bytes into its staging copy, then recorded"
+    assert moved.count("mem_copy_async") == 1, "the moved-only refresh copies in exactly one place"
+
+
+def test_the_refresh_memo_holds_no_staging_handle():
+    memo = strip_comments(struct_body(backend, "refresh_input"))
+    assert "mem_handle" not in memo, "the refresh memo must not hold a staging copy's handle"
+    remember = strip_comments(member_body(backend, "void remember_refresh("))
+    lookups = re.findall(r"graph_input_stage_lookup\(([^;]*)\)", remember)
+    assert len(lookups) == 1 and lookups[0].split(",")[3].strip() == "nullptr", (
+        "remembering a refresh asks only whether an input has a staging copy, not for its handle"
+    )
 
 
 def test_crossings_copy_whole_runs():
     stage = strip_comments(member_body(backend, "bool stage_range("))
-    assert "io.stage_in_runs" in stage and "runs_[idx].stage_in" in stage, (
+    assert "io.stage_in_runs" in stage and "built_->runs[idx].stage_in" in stage, (
         "stage_range must copy into the arena by the plan's stage-in runs"
     )
-    assert "slices_[" not in stage, "stage_range must not copy into the arena one slice at a time"
+    assert "built_->slices[" not in stage, "stage_range must not copy into the arena one slice at a time"
 
     leave = strip_comments(member_body(backend, "void leave_range("))
     for runs in ("io.copy_out_src_runs", "io.copy_out_dst_runs", "runs.copy_out_src", "runs.copy_out_dst"):
         assert runs in leave, f"leave_range must copy out by the plan's runs ({runs})"
-    assert "slices_[" not in leave, "leave_range must not copy out one slice at a time"
+    assert "built_->slices[" not in leave, "leave_range must not copy out one slice at a time"
+
+    # Each run's view is on the device whose arena that side of the crossing
+    # copies: the range's device for the stage in and the copy out's source,
+    # the backend's device for the copy out's destination.
+    allocate = strip_comments(
+        member_body(backend, "bool allocate(const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner,")
+    )
+    for device, runs, views in (
+        ("d", "io.stage_in_runs", "build.runs[r].stage_in"),
+        ("d", "io.copy_out_src_runs", "build.runs[r].copy_out_src"),
+        ("original_device_", "io.copy_out_dst_runs", "build.runs[r].copy_out_dst"),
+    ):
+        call = r"views\(\s*" + device + r"\s*,\s*" + re.escape(runs) + r"\s*,\s*" + re.escape(views) + r"\s*\)"
+        assert len(re.findall(call, allocate)) == 1, f"{views} must be views of device {device}'s arena"
+    assert re.search(r"const\s+int\s+d\s*=\s*build\.plan\.ranges\[r\]\.device\s*;", allocate), (
+        "d must be the range's device"
+    )
+
+
+def test_a_plan_cache_hit_shares_the_prepared_plan():
+    prepared = strip_comments(struct_body(backend, "prepared_plan"))
+    assert re.search(r"std::shared_ptr<const\s+ggml_sycl_block_exec_dense_prepared>\s+built\s*;", prepared), (
+        "the cache entry must hold the prepared plan by a shared, immutable reference"
+    )
+    for copied in ("dense_exec_plan", "mem_handle", "range_runs"):
+        assert copied not in prepared, f"the cache entry holds its own {copied} rather than sharing the prepared one"
+    reuse = strip_comments(member_body(backend, "bool reuse_prepared("))
+    tail = reuse[reuse.rfind("return false") :]
+    assert re.search(r"return\s+false\s*;(?:\s*\})+\s*built_\s*=\s*p\.built\s*;\s*return\s+true\s*;\s*\}\s*$", tail), (
+        "a plan-cache hit must take the entry's prepared plan by reference, copying nothing"
+    )
 
 
 def test_leaving_a_range_waits_once():

@@ -845,6 +845,18 @@ static void test_crossing_runs() {
         bad.io[1].copy_out_src_runs[0].bytes = bad.arena_bytes[1] + 1;
         expect_violation(b.g, bad, "a crossing's copies do not cover its slices");
     }
+    {
+        // Still inside both buffers and still covering its own spans, but
+        // grown over the slice that follows it in the arena (the source of
+        // the range's copy out), which the stage in would overwrite.
+        dense_exec_plan  bad = p;
+        dense_exec_run & run = bad.io[1].stage_in_runs[0];
+        run.bytes += dense_exec_slice_alignment;
+        bad.host_stage_bytes          = std::max(bad.host_stage_bytes, run.host_offset + run.bytes);
+        const dense_exec_slice & next = bad.slices[static_cast<size_t>(bad.io[1].copy_out[0].from_slice)];
+        check(next.device == 1 && next.offset < run.arena_offset + run.bytes, "the grown run reaches the next slice");
+        expect_violation(b.g, bad, "a crossing's copy overwrites a slice it does not carry");
+    }
 
     // A zero-byte staged root takes arena space but no host space, so the
     // staged slices after it start a new copy.
