@@ -1,13 +1,15 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 3b, not implemented. It folds:
+*Status: DESIGN rev 3c, not implemented. rev 3c adds §F2a I-9 addenda 4 to
+6 and rulings addenda 7 and 8 to rev 3b (`3b447ee70`). It folds:
 - design-5efe-r1 and its addendum, under lead rulings §F1, §F2 and §F2a with
-  §F2a I-9 addenda 2 and 3;
+  §F2a I-9 addenda 2 to 6, and rulings addenda 7 and 8;
 - design-5efe-r2 (0C/6I/19m), with the lead's rulings on its I-2 and I-5;
 - the th32 r15 m-4 mlock item, and the §M49 note that the lazy-range record
   lands in C1;
 - the owner's default-context ruling: every model gate set carries a no-`-c`
-  arm, scored. Tracker: `llama.cpp-5efe`.
+  arm, scored, with the vehicle clarification (a CLI with no `-c`, or a
+  programmatic `n_ctx = 0`). Tracker: `llama.cpp-5efe`.
 Written 2026-09-27 against branch `task/5efe` at `69e70c715` (= master). Every
 cite without a revision prefix is to that tree. `gs` is
 `ggml/src/ggml-sycl/ggml-sycl.cpp`, `uc` is
@@ -16,16 +18,18 @@ is `src/llama-model-loader.cpp` and `lm` is `src/llama-model.cpp`. Load-phase
 evidence is the lead's Qwen3.8 baseline `qwen-base/run2.log` and `run2.mem`
 (session scratchpad, `fefb92980`, B70 alone, `-lm mmap -lzm on -c 4096 -v`),
 whose load-path code is byte-identical to this tree in every region cited here.
-Appendix A disposes of every r1 finding.*
+Appendix A disposes of every r1 finding, and Appendix B of every r2 finding
+and later ruling.*
 
 Sibling designs this one interfaces with, and does not restate:
 
 - `llama.cpp-th32`: STORAGE tier for lazy row tables,
   `docs/design/sycl-storage-tier-lazy-tables.md`, abbreviated **th32**.
-  Pinned at **rev 2u `0bd69e251`** (r2 m-15). Its §4.1 consumes this
-  design's pre-fill (§3.1) and addendum 3's `lazy_eligible` bit, and its T6a
-  owns the eligibility predicate that §3.1 calls. Section numbers cited here
-  are 2u's.
+  Pinned at **rev 2w `3afc3b020`** (it was 2u `0bd69e251` at rev 3b, per r2
+  m-15). Its §4.1 consumes this design's pre-fill (§3.1), the `lazy_eligible`
+  bit, the taker and `deferral`, and its T6a owns the eligibility predicate
+  that §3.1 calls. Its §9.1 names this design's declaration and attribute
+  function. Section numbers cited here are 2w's.
 - `llama.cpp-7v5c`: host-only plan dry-run.
 - `llama.cpp-rnh3`: exact host WEIGHT bytes.
 - `llama.cpp-sgc5`: one zone set per plan.
@@ -387,9 +391,10 @@ props->caps = {
 - **An unpinned selector** that includes the iGPU makes the iGPU a model
   device, and both fallbacks fire exactly as today. That is the intended
   behaviour, and it is never run on this host (CLAUDE.md, llama.cpp-403s).
-- **th32 drops its own flip** (lead ruling §T13, point 1). th32's T6 still
-  resolves its lazy mode before the `auto` fallback; commit 1 does not depend
-  on that.
+- **th32 drops its own flip** (lead ruling §T13, point 1). The pre-fallback
+  mode capture that th32's T6 used to own is now commit 1's (§F2a I-9
+  addendum 4). Commit 1 captures it, with the taker, at the §3.1 pre-fill,
+  before its moved fallback block.
 
 ### 3.1 Also in commit 1: the per-file lazy-range record (§F2a I-9, §M49)
 
@@ -413,42 +418,56 @@ mode.
 **The record.** `llama_lazy_range_record`, one per loaded file, owned by 5efe
 and held by `llama_model_loader`.
 
-- **Membership is flag-based** (§F2a I-9 addendum 3). There is one row per
-  `TENSOR_READ_LAZY` tensor, whatever any consumer decides about it. A row
-  holds (tensor name, file index, offset, size, `lazy_eligible`, `deferral`).
+- **Membership is by declaration** (§F2a I-9 addenda 3 and 5). There is one row
+  per declared name found in `weights_map`, whatever any consumer decides about
+  it. A row holds (tensor name, file index, offset, size, `lazy_eligible`,
+  `deferral`, and the attributes `rows_per_token` and `consumer_layer`).
+- **Two per-model facts are captured once, at the pre-fill** (addenda 4 and 5):
+  - **`mode_pre`**, the lazy mode as requested (`ml.lazy.mode`), captured
+    **before** C1's moved `AUTO`-to-`OFF` fallback block (`lm:2256-2265`
+    today). This capture is a 5efe C1 deliverable, no longer a th32 T6 one.
+  - **`taker`** = `sycl_model_loading_guard.active` (`lm:2228-2230`). It is
+    true when the model's weights are SYCL-owned (`n_gpu_layers() > 0` with a
+    SYCL model device, or a SYCL buffer-type override, `lm:2214-2227`) and the
+    hooks resolve. It is the fact the early plan is already gated on
+    (`lm:2229`). It is **not** `llama_model_sycl_hooks_enabled()`, which is
+    process-level: a `-ngl 0` load in a SYCL build registers the hooks
+    without taking, and must not get `STORAGE`. In a build with neither
+    `GGML_USE_SYCL` nor `GGML_BACKEND_DL` (`lm:2213`), `taker` is false.
+  - **`mode_post`** is `ml.lazy.mode` after the fallback block. It is not
+    captured separately: it is what `lazy_read` holds.
 - **`lazy_eligible`** is one bit, computed once at the pre-fill by **th32's
-  T6a predicate**, the DLM (a) rule (th32 rev 2u §4.1 and its T6a row):
-  - its inputs are the lazy mode resolved **before** upstream's `AUTO` to
-    `OFF` fallback, and the row's size;
-  - `OFF` is never eligible, `AUTO` only above 4 GiB, and `ON` always.
-
-  5efe calls that function and does not restate it. It is the same function
-  th32's SYCL branch uses at `create_tensor`.
-- **`deferral`** is `EAGER`, `LAZY_READ` or `STORAGE`, defined once at the
-  pre-fill as a function of the bit (r2 I-6):
+  T6a predicate**, the DLM (a) rule (th32 rev 2w `3afc3b020` §4.1 and its T6a
+  row), called and not restated:
 
   ```
-  deferral = !lazy_eligible                         ? EAGER
-           : sycl_branch                            ? STORAGE
-           : mode_post != OFF && llama_mmap::SUPPORTED ? LAZY_READ
-           :                                          EAGER
+  lazy_eligible = T6a(taker ? mode_pre : mode_post,
+                      size,
+                      taker ? true : llama_mmap::SUPPORTED)
   ```
 
-  - **`sycl_branch`** is `llama_model_sycl_hooks_enabled() &&
-    resolved_sycl_weight_owner`, which is known before the early plan
-    (`lm:2213-2227`). It is th32 T6's branch condition.
-  - **Which mode feeds which branch.** `STORAGE` is decided on the
-    **pre-fallback** mode, through the bit, because th32's SYCL branch is
-    independent of `mmap_support`. `LAZY_READ` also requires the
-    **post-fallback** mode (`mode_post`, after `lm:2256-2265`), because
-    upstream's CPU lazy path needs a mapping.
-  - **Non-`EAGER` implies eligible**, and on the SYCL branch non-`EAGER` is
-    exactly "eligible". The one eligible-but-`EAGER` case is off the SYCL
-    branch: an iGPU forced the mode to `OFF`, or mmap is unsupported. There
-    the loader reads the table eagerly, so it is the ordinary weight the
-    ruling says an ineligible entry is.
-  - Consumers read `deferral` or the bit, and none re-evaluates the mode or
-    the size.
+  - `OFF` is never eligible, `AUTO` only above 4 GiB, and `ON` always, each
+    only when the third input is true.
+  - **Why the mode differs by path** (addendum 4). The taker reads through
+    its own `O_DIRECT` fd and never through a mapping, so the fallback, which
+    exists because the CPU lazy path needs a mapping, must not disengage it,
+    and a no-mmap platform does not either (addendum 6 (1)). Off the taker,
+    `lazy_read` really does read with `mode_post`, so feeding it `mode_pre`
+    would mark a table that is read eagerly as lazy, and the prefetch
+    exclusion would then leave a table cold that is about to be read in full.
+- **`deferral`** carries only the consumer kind (addendum 5):
+  - `STORAGE` iff `lazy_eligible && taker`;
+  - `LAZY_READ` iff `lazy_eligible && !taker`;
+  - `EAGER` otherwise.
+
+  So **`deferral != EAGER` iff `lazy_eligible`**: one fact, one source. rev
+  3b's (`3b447ee70`) eligible-but-`EAGER` case is gone, because off the taker the bit
+  already reads `mode_post` and `SUPPORTED`. `STORAGE` is written here at the
+  pre-fill, like every other field, since rows are immutable afterwards; th32
+  T6 never writes it. T6 takes a table iff `deferral == STORAGE`, in place of
+  its `hooks_enabled` gate.
+- Consumers read `deferral` or the bit. None re-evaluates the mode, the floor
+  or `SUPPORTED`.
 - **Where it is filled: before the early plan, not at `create_tensor`**
   (§F2a I-9 addendum 2).
   - **Why `create_tensor` is too late.** The SYCL early plan runs before
@@ -461,99 +480,147 @@ and held by `llama_model_loader`.
     at `create_tensor`. It is an argument at each arch's call site
     (`src/models/qwen4exp.cpp:189`, `src/models/gemma4.cpp:58`), and no table
     records it (`llm_tensor_info` is `{layer, op}`, `llama-arch.h:782-785`).
-  - **The declaration (r2 I-5; lead ruling: 5efe's, since the record is
-    5efe's; th32 consumes it).**
+  - **The declaration** (r2 I-5; lead ruling: 5efe's, since the record is
+    5efe's; th32 consumes it; keyed by arch per addendum 5; names only per
+    addendum 7 (a), whose naming addendum 8 (a) amends back to this):
 
     ```cpp
     // src/llama-model.h, C1
-    struct llama_lazy_tensor_decl {
-        const char * name;            // exact GGUF name, or one "%d" standing for the block index
-        uint32_t     rows_per_token;  // th32 T6's field; 0 until T6 fills it
-        int32_t      consumer_layer;  // th32 T6's field; -1 = the block index "%d" matched
+    // The GGUF names, or name patterns with one "%d" standing for the block
+    // index, that `arch` creates with TENSOR_READ_LAZY. Static and immutable:
+    // names only, no hparams-valued field.
+    const std::vector<std::string> & llama_model_lazy_tensor_names(llm_arch arch);
+
+    struct llama_lazy_tensor_attrs {
+        uint32_t rows_per_token;  // 0 = not known for this arch
+        int32_t  consumer_layer;  // -1 = not known for this arch
     };
-    const std::vector<llama_lazy_tensor_decl> & llama_model_lazy_tensor_decls(llm_arch arch);
+    // One per-arch function, next to the declaration, reading the loaded hparams.
+    llama_lazy_tensor_attrs llama_model_lazy_tensor_attrs(llm_arch arch, const llama_hparams & hparams,
+                                                          const std::string & name);
     ```
 
-    - It is keyed by GGUF name or pattern, matched against `weights_map`.
-      There is no `hparams` parameter. Presence in the GGUF already bounds it,
+    - **Keyed by (arch, GGUF name or pattern)** (addendum 5, amending r2 I-5's
+      "keyed by GGUF name"). The arch key is load-bearing: `gemma3n` creates
+      the same `per_layer_token_embd.weight` **without** the flag
+      (`src/models/gemma3n.cpp:39`). With a name-only key, every gemma3n load
+      would get a row, and the drift check below would abort it.
+    - **The declaration holds names only** (addendum 7 (a); names per
+      addendum 8 (a), and th32 keeps them). rev 3b put `rows_per_token` and
+      `consumer_layer` in a struct for T6 to fill in. A static table that T6
+      writes is mutable global state shared by every loaded model, so two
+      loaded models with different hparams would overwrite each other's
+      values (P4).
+    - The name list takes no hparams. Presence in the GGUF already bounds it,
       so the call sites' hparams conditions (`qwen4exp.cpp:171`
       `ple_n_heads > 0`, `gemma4.cpp:57` `n_embd_per_layer > 0`) are not
-      stated a third time, and `blk.%d.engram_embd.weight` needs no layer
-      list.
-    - Today's entries are `per_layer_token_embd.weight` for `qwen4exp` and
-      for `gemma4`. deepseek41's `blk.%d.engram_embd.weight` is added with
-      its call site.
-    - **Not an `LLM_TENSOR_INFOS` column.** That table is keyed by tensor
-      kind across every arch (`llama-arch.cpp:721`), and
-      `LLM_TENSOR_PER_LAYER_TOKEN_EMBD` is created **without** the flag by
-      `gemma3n` (`src/models/gemma3n.cpp:39`). A kind-level column would
-      declare gemma3n's table lazy.
-    - th32 T6's per-arch facts attach to these entries, not to a second list
-      (th32 2u §4.1, §9.1).
-  - **The pre-fill.**
-    - C1 moves the caps loop (`lm:2245-2254`) and the lazy-mode loop
-      (`lm:2256-2265`) above the early plan. They read `devices`,
-      `params.load_mode`, `ml.use_mmap` and `ml.lazy.mode`, and nothing the
-      early plan writes (r2 verified).
-    - The loader captures the requested lazy mode before that loop runs, for
-      the bit.
-    - It then fills one row per declared name found in `weights_map`: (name,
-      file index, offset, size) from the `llama_tensor_weight`, the bit from
-      T6a, and `deferral` as above. This runs after `resolved_sycl_weight_owner`
-      is known and before `llama_model_sycl_compute_early_plan` (`lm:2230`).
-    - It runs the same way under `no_alloc` (r2 m-9), so the fit pass plans
-      what the real load plans. See `lazy_read` below for why that maps
-      nothing in the fit pass.
+      stated a third time.
+    - **The attributes live on the per-model record entry.** C1's pre-fill
+      calls `llama_model_lazy_tensor_attrs` once per matched name, with the
+      loaded hparams, and stores the result on that model's record entry.
+      th32 T6 reads it from there through `record.attrs(name)`, and never
+      from a static.
+      - The function is 5efe's, and C1 lands it with th32 §4.1's values:
+        `qwen4exp` returns {`hparams.ple_n_heads`, 1} (`qwen4exp.cpp:95`), and
+        `gemma4` returns {1, 0}.
+      - The **missing-attribute refusal** is T6's (addendum 5). It applies
+        only to `deferral == STORAGE` rows, and runs before the early plan
+        reads the row. A non-taker row is never refused for missing
+        attributes.
+    - Today's entries are `per_layer_token_embd.weight` for `qwen4exp` and for
+      `gemma4`. deepseek41 is **not** declared: that arch does not exist in
+      the tree, and llama.cpp-9g22 (paused) adds its own entry when it lands
+      (addendum 4).
+    - **Not an `LLM_TENSOR_INFOS` column.** That table is keyed by tensor kind
+      across every arch (`llama-arch.cpp:721`). A kind-level column would
+      declare gemma3n's table lazy, for the same gemma3n reason.
+  - **The pre-fill.** In `load_tensors` (`lm:2212-2232`), C1 reorders the
+    code to:
+    1. `resolved_sycl_weight_owner` and the guard, unchanged (`lm:2214-2228`);
+    2. capture `mode_pre` and `taker`;
+    3. the caps loop (`lm:2245-2254`) and the lazy-mode fallback
+       (`lm:2256-2265`), moved up. They read `devices`, `params.load_mode`,
+       `ml.use_mmap` and `ml.lazy.mode`, and nothing the early plan writes
+       (r2 verified);
+    4. fill one row per declared name found in `weights_map`: (name, file
+       index, offset, size) from the `llama_tensor_weight`, the bit, the
+       deferral, and the attributes. Each row prints one INFO line,
+       `lazy-range record: <name> (<size> MiB) eligible=<0|1>
+       deferral=<EAGER|LAZY_READ|STORAGE> taker=<0|1> mode=<the mode the bit
+       read>`. It replaces `add()`'s "lazy read enabled" line as the witness
+       §7 C1's lead runs read;
+    5. `llama_model_sycl_compute_early_plan`, if `taker` (`lm:2229-2231`).
+
+    It runs the same way under `no_alloc` (r2 m-9), so the fit pass plans what
+    the real load plans. See `lazy_read` below for why that maps nothing in
+    the fit pass.
   - **One source, checked twice.**
     - **Statically:** `test-llama-lazy-declaration-source` (C1) maps every
-      `TENSOR_READ_LAZY` `create_tensor` call in `src/models/*.cpp` to a
-      declaration entry, and every entry back to a call site. An upstream
-      merge that adds a flagged call, or a new upstream arch that arrives with
-      one, fails it at build time, on every backend's tree, before any load.
-    - **At runtime (the second belt):** `create_tensor` compares the flag with
-      **row membership, whatever the `deferral`** (r2 I-5(3)). A flagged call
-      with no row, or an unflagged call with a row, aborts naming the tensor
-      and the arch. So declaration drift is caught under `-lzm off` too.
+      `TENSOR_READ_LAZY` `create_tensor` call in `src/models/*.cpp`, with its
+      arch, to a declaration entry, and every entry back to a call site. An
+      upstream merge that adds a flagged call, or a new upstream arch that
+      arrives with one, fails it at build time, on every backend's tree,
+      before any load.
+    - **At runtime, mode-independent** (addendum 4; r2 I-5(3)).
+      `create_tensor` aborts, naming the tensor and the arch, on a
+      `TENSOR_READ_LAZY` call to a tensor with **no** row, and on a non-lazy
+      call to a tensor that **has** one, whatever the row's eligibility,
+      `deferral` and the mode. So drift is caught under `-lzm off`, and under
+      `AUTO` at or below 4 GiB, too. rev 3a checked only non-`EAGER` rows,
+      which let exactly those cases through.
   - **The early plan reads it.** Its loop over `weights_map` (`lm:639-641`)
-    skips every row whose `deferral` is not `EAGER`. That keeps an eligible
-    table out of placement, out of `max_tensor` and the staging maxima, and
-    out of the host total, which is th32 §4.1's requirement applied to the
-    early plan too. An ineligible row (`OFF`, or `AUTO` at or below 4 GiB) is
-    placed as the ordinary weight it is (th32 r19 M-1; the witness is in §7
-    C1). The late inventory already excludes deferred tables (§2.5).
+    skips every row whose `deferral` is `STORAGE`, the only kind it can see,
+    since the early plan runs only when `taker` is true. That keeps an
+    eligible table out of placement, out of `max_tensor` and the staging
+    maxima, and out of the host total, which is th32 §4.1's requirement
+    applied to the early plan too. An ineligible row (`OFF`, or `AUTO` at or
+    below 4 GiB) is placed as the ordinary weight it is (th32 r19 M-1; the
+    witness is in §7 C1). The late inventory already excludes deferred tables
+    (§2.5).
 - **Its API.**
   - `deferred_for_file(idx)` returns the sorted, merged ranges of every
     non-`EAGER` row of that file.
-  - `has(name)`, `eligible(name)` and `deferral(name)` are the per-tensor
-    queries.
+  - `has(name)`, `eligible(name)`, `deferral(name)` and `attrs(name)` are the
+    per-tensor queries.
   - `value(name)` returns a `llama_lazy_range_value {file_idx, offs, size}` **by
     value**. th32's backend `lazy_table` takes its (file, offset, size) from
     this once, at plan publish, through the inventory. It is a hand-off of the
     record's value, not a second source (§F2a I-9 addendum 2, M-1). What is
     forbidden is deriving those numbers independently, for example from
     `w->offs`.
-- **Immutability.** Rows, the bit and `deferral` are set once, by the
-  pre-fill, and a later write aborts. So a by-value copy taken at plan publish
-  stays equal to the record for the model's lifetime, and is safe for tickets
-  that outlive the model.
+- **Immutability.** Rows, the bit, `deferral` and the attributes are set
+  once, by the pre-fill, and a later write aborts. So a by-value copy taken at
+  plan publish stays equal to the record for the model's lifetime, and is
+  safe for tickets that outlive the model.
 
 **Consumers keep no copy of the ranges.**
 - **`lazy_read`** keeps its `mode` and a **membership** set of names, as th32
-  2u §4.1 requires (its r18 N-4).
-  - `add(name, w)` no longer decides anything. It accepts iff `w != nullptr`
-    and `record.deferral(name) == LAZY_READ`.
+  §4.1 requires (its r18 N-4).
+  - **`add(name, t, w)` reads `deferral` and decides nothing** (addendum 5;
+    addendum 6 (2): a C1 deliverable). It accepts iff `w != nullptr` and
+    `record.deferral(name) == LAZY_READ`. Its own mode test, the 4 GiB floor
+    and the `llama_mmap::SUPPORTED` test (`lml:1241-1256`) are deleted.
+    - That is a fork change to upstream code, so
+      `test-llama-lazy-range-record-source` pins it (§7 C1). A rebase that
+      restores `add()`'s own gates fails loudly.
+    - Landing it in C1, where `deferral` is filled, leaves no window in which
+      `add()` and the bit disagree.
+    - `add()`'s "mmap is not available, so tensor %s ... is loaded into RAM in
+      full" WARN (`lml:1252-1253`) moves to the pre-fill. It prints for a
+      declared row whose bit is clear because `SUPPORTED` is false off the
+      taker.
   - `any()` and `has()` answer from that membership. `for_file(idx)` returns
     the record's ranges for its members only.
   - Its private `ranges` map is deleted.
-  - So on the SYCL branch, where eligible rows are `STORAGE`, `any()` stays
-    false, and `init_mappings` does not map every shard with `use_mmap`
-    cleared (`lml:1871`, the hazard r2 I-6 names).
+  - So under `taker`, where eligible rows are `STORAGE`, `any()` stays false,
+    and `init_mappings` does not map every shard with `use_mmap` cleared
+    (`lml:1871`, the hazard r2 I-6 names).
   - Under `no_alloc`, `create_tensor` passes `nullptr` (`lml:1776`), the
     membership stays empty, and the fit pass maps nothing, as today (r2 m-9).
 - `init_mappings` passes `record.deferred_for_file(idx)` to `llama_mmap`
   (`lml:1890-1891`).
 - th32's inventory reads each table's (file, offset, size) from the record
-  through `value(name)` (th32 2u §4.1).
+  through `value(name)` (th32 §4.1).
 - The tier hook's `lazy_ranges` argument (§4.3) is
   `record.deferred_for_file(idx)`.
 
@@ -572,9 +639,32 @@ The arithmetic is exact. The early inventory's largest tensor is
 `per_inflight` is 2 x 51880.1 + 2.1; the late one is 2 x 850.0 + 2.0, with
 the 850.0 MB `ffn_*_exps` tensors next in line (`:235`, `:2756`).
 
-**Data edges.** th32 T6 depends on C1 alone (§M49). C1 depends on th32's T6a,
-whose predicate the pre-fill calls, so T6a lands no later than C1 (§F2a I-9
-addendum 3).
+**Data edges.** th32 T6 depends on C1 alone (§M49): C1 lands the record, the
+two captures, the declaration, the attribute function and `add()`'s reading
+of `deferral`. C1 depends on th32's T6a, whose predicate (mode, size,
+`SUPPORTED`) the pre-fill calls, so T6a lands no later than C1 (§F2a I-9
+addenda 3 and 6).
+
+**The C1-to-T6 window (addendum 8 (b)).** C1 writes `STORAGE` for an eligible
+row when `taker` is true, and th32 T6 is the only consumer of `STORAGE`. On a
+tree holding C1 without T6, a taker load of Qwen under default flags would
+therefore:
+- exclude the table from the early plan, since its row is `STORAGE`;
+- keep it out of `lazy_read`, since `add()` accepts only `LAZY_READ`;
+- and then load it eagerly as an ordinary 51880 MiB pinned weight that the
+  early plan's staging maxima never counted.
+
+The lead's ruling:
+- **C1 and T6 reach master in one merge.** T6 is built on top of C1
+  (`task/th32` carries or merges `task/5efe`'s C1), and the merge to master
+  happens once, after both are reviewed. The tracker blocks the merge of 5efe
+  C1 on th32 T6.
+- The interim-`EAGER` alternative is refused: it breaks addendum 4's iff and
+  creates a second source for `deferral`.
+- No lead-run gate of C1 reads the table (W1-W3 are killed first, and the
+  Mistral gate has no lazy tensor), so C1 needs no Qwen load of its own.
+- C4's Qwen arms are VOID without T6 and T7 (§7 C4), and that precondition
+  was accepted.
 
 ---
 
@@ -911,79 +1001,188 @@ created") describes a path that does not run.
   (`in_model_load`). The `|| weights_evictable` term goes. A post-load
   `SYCL_Host` buffer (compute, output, inputs) takes role `COMPUTE`, and so
   SCRATCH.
-- **The sizing path exists.**
-  - C4 gives `ggml_backend_sycl_notify_compute_buffer_sizes` its caller:
-    `llama_context`, after the scheduler reserve, through the registry's proc
-    address (a direct call does not link under `GGML_BACKEND_DL`).
-  - It passes the host-buft compute-buffer size, plus the output buffer's
-    size as **its own named term**: `n_outputs_max x (n_vocab + n_embd) x 4 B`,
-    which `llama_context` computes for the allocation anyway.
-  - SCRATCH grows by the sum, and prints `[HOST-ARENA] SCRATCH zone grown by
-    %.1f MB for compute buffers` (`uc:20442-20449`).
+- **The sizing path exists** (addendum 7: "watch the dlopen boundary").
+  - **The existing entry point is not wired as it stands.**
+    `ggml_backend_sycl_notify_compute_buffer_sizes` does two things
+    (`gs:19140-19145`):
+    - it reserves the **VRAM** compute arena, and aborts if the reserve is
+      short (`unified_cache_reserve_compute_arena`);
+    - it grows host SCRATCH by the sum over **every** backend's compute
+      buffer, device buffers included.
+
+    The first is VRAM arena sizing, not 5efe's. The second over-reserves
+    host memory by the device compute buffers. The function stays uncalled
+    by 5efe. Whether its VRAM half should get a caller is **reported to the
+    lead**, not decided here.
+  - **C4 adds a host-only entry point:**
+
+    ```c
+    // ggml/include/ggml-sycl.h, C4. Grows the host pinned SCRATCH zone only.
+    GGML_BACKEND_API void ggml_backend_sycl_notify_host_buffer_sizes(ggml_backend_t backend,
+                                                                     size_t         host_compute_bytes,
+                                                                     size_t         host_output_bytes);
+    ```
+
+    - `ggml_backend_sycl_reg_get_proc_address` (`gs:109834`) exports it by
+      name.
+    - `llama_context` calls it through that proc address after the scheduler
+      reserve. A direct call does not link under `GGML_BACKEND_DL`.
+  - **The ABI shape is deliberate.** It takes scalars, so no struct crosses
+    the dlopen boundary and no stride can drift between a fresh `libllama`
+    and a stale `libggml-sycl` (memory:
+    extending-a-struct-that-crosses-the-backend-dlopen-boundary).
+    - It is a new name, not a new signature under the old name. So a stale
+      backend returns `NULL` from the proc lookup, and never runs with
+      misread arguments.
+    - On `NULL`, `llama_context` WARNs `SYCL backend has no
+      ggml_backend_sycl_notify_host_buffer_sizes; host SCRATCH is not
+      grown`, and continues. The zone-0 criterion below is then the witness.
+    - The commit message states that both libraries rebuild together.
+  - `host_compute_bytes` is the scheduler's buffer size for the host buft
+    (`ggml_backend_sched_get_buffer_size` on the CPU backend, whose buft is
+    `SYCL_Host`, `src/llama-context.cpp:889-895`). `host_output_bytes` is the
+    output buffer as **its own named term**: `n_outputs_max x (n_vocab +
+    n_embd) x 4 B`, which `llama_context` computes for the allocation anyway
+    (`src/llama-context.cpp:3562-3564`).
+  - SCRATCH grows by the sum, through `unified_cache_grow_host_scratch_zone`,
+    and prints `[HOST-ARENA] SCRATCH zone grown by %.1f MB for compute
+    buffers` (`uc:20442-20449`).
   - The "runtime term at the runtime KV update" of rev 3a is withdrawn,
     since it had no path into the zone (host zones are configured once, at
     load, `gs:5623`).
-- **Lifetimes: why SCRATCH needs one more fact.**
+- **Lifetimes** (addendum 7 (b): **confirmed over a fifth zone**).
   - SCRATCH's graph-boundary check runs at every `graph_compute`
     (`gs:92459`), and WARNs on any live SCRATCH record ("refusing SCRATCH
     host_zone_boundary_check with N live registered allocations",
     `uc:20290-20298`). That is exactly why the `CpuExpertPool` ring was
     routed to WEIGHT (llama.cpp-cg8j).
-  - Context- and process-lifetime tenants in SCRATCH would trip the check
-    at every graph, and the leak signal it exists for would be lost.
-  - So C4 adds `alloc_intent::lifetime` (`GRAPH`, the default; `CONTEXT`;
-    `PROCESS`). The census below assigns it to every rerouted site, and the
-    boundary check counts only `GRAPH` records.
-  - This keeps the ruling's zone. It is flagged to the lead, because the
-    alternative is a fifth host zone, a one-line change in `select_zone`.
-- **The census** (C4 source contract, `test-sycl-host-role-routing-source`).
-  - It is generated from the tree, not written by hand. Every `alloc_request`
-    construction or `alloc_intent` aggregate in `ggml/src/ggml-sycl/` whose
-    category is `HOST_COMPUTE` or `EXPERT_CACHE` and which can land on the
-    host is listed with its role, its zone before and after, and its
-    lifetime.
-  - A first lexical cut finds 72 such lines across 8 files. By role:
-    - 23 `EXPERT_STAGING`: already SCRATCH, unchanged;
-    - 14 `STAGING`, 7 `TP_TMP`, 10 `COMPUTE` and 1 `GRAPH_TMP`: WEIGHT to
-      SCRATCH;
-    - 3 choose their role at the site: `SYCL_Host` itself (`gs:42647`),
-      `uc:15652` and `uc:16728`;
+  - C4 adds `alloc_intent::lifetime` with three values. There is **no
+    `PROCESS`**: a process-lifetime allocation has no releasing owner (P2).
+    - **`GRAPH`**, the default. The graph-boundary check counts only these
+      records.
+    - **`CONTEXT`**. The record also carries its owner, the backend
+      context's id (`ggml_backend_sycl_context`, whose destructor is
+      `gs:43872`, run from `ggml_backend_sycl_free`, `gs:83938`, at
+      `llama_context` free).
+    - **`MODEL`**. The record carries the model's `ModelId`
+      (`model-lifecycle.hpp`), whose release is the model-free point.
+  - **Each lifetime keeps a leak check at its owner's boundary.** A
+    `CONTEXT` record still live when its backend context is destroyed, or a
+    `MODEL` record still live when its model is freed, prints `[HOST-ZONE]
+    leaked <CONTEXT|MODEL> record: <cohort> <bytes> owner=<id>`. It is a
+    WARN that aborts under `GGML_SYCL_STRICT_LEASES=1`, through the existing
+    accessor (`strict_lease_checks_enabled`, `uc:12962-12968`).
+  - Every non-`GRAPH` row of the census cites its owner.
+- **The site table** (addendum 7 (c)). 5efe owns each host site's role, zone,
+  lifetime and sizing, and publishes them here. 23mk owns each site's
+  conversion, and its class-H rows (56, 118 and the others) cite this table.
+  C4's source gate (`test-sycl-host-role-routing-source`) regenerates the
+  table from the tree and fails on any difference.
+  - A first lexical cut finds 72 host-capable lines with category
+    `HOST_COMPUTE` or `EXPERT_CACHE`, across 8 files. By role:
+    - 23 `EXPERT_STAGING`: already SCRATCH, `GRAPH`, unchanged;
     - 14 role `WEIGHT`: 10 are device-tier cache entries that never reach
-      `select_zone`'s host branch, and 4 stay WEIGHT. One of those four is a
-      real weight, the direct-stage last resort (`uc:6522`).
-  - The other three are non-weight bytes carrying role `WEIGHT`:
-    - `cpu-dispatch.cpp:315`, the CPU-offload host weight copy;
-    - `gs:39954`, a device buffer's host-pinned fallback on low free VRAM;
-    - `gs:63226`, the tensor-split weight cache.
+      `select_zone`'s host branch, and 4 stay WEIGHT. One of the four is a
+      real weight, the direct-stage last resort (`uc:6522`). The other three
+      are non-weight bytes carrying role `WEIGHT`: `cpu-dispatch.cpp:315`
+      (the CPU-offload host weight copy), `gs:39954` (a device buffer's
+      host-pinned fallback on low free VRAM) and `gs:63226` (the
+      tensor-split weight cache). These are the "role-WEIGHT, unplanned"
+      rows. None is reached on Qwen's default path, and if one is, the
+      zone-0 criterion catches it;
+    - 35 that change zone, or choose it at the site, tabulated below.
+  - Two of the 35 are not tenants: `pinned-pool.cpp:93` is the pool's own
+    chunk backing (`require_host_usm_base`, never zone-selected), and
+    `uc:16728` is `category_to_intent`, a mapping, not a request.
+    `uc:15652` (`acquire_offload_buffer`) takes the lifetime its caller
+    passes, so the gate follows its callers.
 
-    These are named "role-WEIGHT, unplanned" rows. None is reached on Qwen's
-    default path. If one is reached, the zone-0 criterion below catches it.
-  - The mutant: the category clause restored in `select_zone`, under which
-    the gate's `CpuExpertPool` row resolves to WEIGHT.
+  | site | holder of the handle | role | zone after C4 | lifetime | owner |
+  |---|---|---|---|---|---|
+  | `common.cpp:551` | local `host_handle`, released in-function | STAGING | SCRATCH | GRAPH | - |
+  | `common.cpp:1414` | local `host_handle` | TP_TMP | SCRATCH | GRAPH | - |
+  | `gs:8549`, `gs:8711` | local `d2h_staging` in `moe_hybrid_init_once` | STAGING | SCRATCH | GRAPH | - |
+  | `gs:36782` | local `fallback_handle` (`buffer_get_tensor`) | STAGING | SCRATCH | GRAPH | - |
+  | `gs:36901` | local `host_stage_handle` | STAGING | SCRATCH | GRAPH | - |
+  | `gs:44289` | graph-local `host_copies`, cleared at exit | GRAPH_TMP | SCRATCH | GRAPH | - |
+  | `gs:48239` | `g_tp_*` job slot, consumed and cleared by the TP sync (`gs:48396`) | TP_TMP | SCRATCH | GRAPH | - |
+  | `gs:48977` | `g_tp_async_ffn_jobs[layer]` slot, consumed within the graph | TP_TMP | SCRATCH | GRAPH | - |
+  | `gs:82678` | local `vh`, waited in-function (`gs:82683`) | COMPUTE | SCRATCH | GRAPH | - |
+  | `gs:42647` | a post-load `SYCL_Host` buffer (compute, output, inputs) | COMPUTE (WEIGHT only in `in_model_load`) | SCRATCH | CONTEXT | the `llama_context` that allocated the buffer |
+  | `gs:42832` | the `SYCL_HostCompute` buffer | COMPUTE | SCRATCH | CONTEXT | the scheduler of its `llama_context` |
+  | `gs:44097` | `ggml_backend_sycl_context::readback_staging_handle` | STAGING | SCRATCH | CONTEXT | its backend context (`gs:43872`) |
+  | `gs:57647` | `ctx.moe_ids_cache[key]`, or a call-local entry | STAGING | SCRATCH | CONTEXT, or GRAPH for the call-local entry | its backend context |
+  | `uc:15652` | the caller's `offload_buffer_lease` | caller's | SCRATCH | caller's | caller's |
+  | `common.cpp:443` | `g_runtime_staging_cache` (file scope) | STAGING | SCRATCH | **none** | **UNOWNED** |
+  | `common.cpp:1970` | `g_tp_host_staging` | TP_TMP | SCRATCH | **none** | **UNOWNED** |
+  | `common.cpp:2083` | `g_tp_quant_comm_bufs` | TP_TMP | SCRATCH | **none** | **UNOWNED** |
+  | `common.cpp:2279` | `g_tp_shared_reduce_handle` | TP_TMP | SCRATCH | **none** | **UNOWNED** |
+  | `common.cpp:2328` | `g_tp_host_buf0/1_handle` | TP_TMP | SCRATCH | **none** | **UNOWNED** |
+  | `cpu-dispatch.cpp:2160` | `g_retained_scratch_lease` | COMPUTE | SCRATCH | **none** | **UNOWNED** |
+  | `cpu-expert-pool.cpp:77` | `g_cpu_expert_pools[dev]` (`gs:2605`), the ring | COMPUTE | SCRATCH | **none** | **UNOWNED** |
+  | `pinned-buffer-pool.cpp:69` | `g_pinned_buffer_pools[dev]` (`gs:2604`) | COMPUTE | SCRATCH | **none** | **UNOWNED** |
+  | `gs:10882` | `g_routing_indices_cache` | STAGING | SCRATCH | **none** | **UNOWNED** |
+  | `gs:21522` | `g_moe_fusions[layer].fused_handle` (`thread_local`, `gs:21664`) | COMPUTE | SCRATCH | **none** | **UNOWNED** |
+  | `gs:62927`, `gs:62942` | `g_split_staging[dev]` (`gs:62915`) | STAGING | SCRATCH | **none** | **UNOWNED** |
+  | `gs:63145` | `g_split_weight_staging` (`gs:63132`) | STAGING | SCRATCH | **none** | **UNOWNED** |
+  | `gs:63548` | `s_second_out_ring_alloc` / `s_cpu_out_ring_alloc` (`gs:62645`) | STAGING | SCRATCH | **none** | **UNOWNED** |
+  | `gs:81996`, `:82016`, `:82027`, `:82045` | `g_attn_host_staging[dev]` (`gs:81948`) | COMPUTE | SCRATCH | **none** | **UNOWNED** |
+
+  - **14 holders (18 lines) are UNOWNED, and are brought to the lead**
+    (addendum 7 (b)). Each keeps its handle in a file-scope static or a
+    `thread_local`, so it has no context owner and no model owner.
+    - They cannot take `GRAPH`, because they outlive the graph and would trip
+      the boundary check at every `graph_compute`.
+    - They have no `CONTEXT` or `MODEL` owner to cite.
+    - Two of them are on Qwen's default path: the `CpuExpertPool` ring and
+      `PinnedBufferPool`, both per-device process globals.
+    - The design assigns them no lifetime. The ruling is the lead's. The
+      likely owner is `ggml_backend_sycl_context` (`CONTEXT`), which would
+      move each global into the backend context. That is a refactor of 14
+      holders, which this design does not size.
+    - Until the ruling, C4's census gate lists them as `UNOWNED`, and fails
+      on any **new** `UNOWNED` row.
+- **Host SCRATCH reads RUNTIME through 23mk's function, not a copy**
+  (addendum 7 (c)).
+  - The fold at `uc:27727-27730` today reads plan fields:
+    `moe_vram_runtime_bytes` (`= max(expert_ptrs, control_pool)`,
+    `uc:27520`, the llama.cpp-s4ip defect), `pp_pipeline_scratch_bytes`
+    and `pp_moe_onednn_scratch_bytes`.
+  - C4 replaces those three terms with one read of
+    `unified_cache_get_planned_runtime_zone_requirement(dev, &out)`
+    (`uc:1568-1575`), the function the VRAM RUNTIME zone is sized through
+    (`uc:4520`) and that 23mk routes through. That function already sums
+    the PP pipeline scratch, the PP MoE oneDNN ring net of its KV-zone part,
+    and the MoE control requirement. Keeping the two PP terms beside it would
+    count them twice.
+  - `tp_vram_runtime_bytes` is not in that function and stays. It is 0 on
+    Qwen. `dma_staging_pool_bytes` is 0 in mmap mode (m-2).
+  - **Order.** The function reads published values, so C4's source gate
+    pins that the setters for `pp_pipeline`, `pp_moe_onednn` and
+    `moe_control` run before the host SCRATCH sizing. Run2 prints the RUNTIME
+    requirement at `run2.log:219`, before the host staging line at `:243`.
+    If the getter returns false, sizing takes the existing reject path
+    (`host_scratch_valid = false`).
+  - **Qwen's figure.** Run2's RUNTIME requirement is 4265.6 MB (pipeline 0.0,
+    moe_onednn 4265.0, moe_control 0.6; `run2.log:2732`), against the 0.0 +
+    4265.0 + `moe_vram_runtime_bytes` those terms contributed before. So host
+    SCRATCH changes by 0.6 MB minus `moe_vram_runtime_bytes`, which is at
+    most +0.6 MB. The base pre-size stays at or below 7923.7 MB, which is
+    still 4 chunks.
 - **The criterion** (C4 lead run). No `Pinned pool grow_zone: zone 0` line
   appears after the pre-size, through the end of the completion. Zone 0 is
   WEIGHT (`pinned-pool.hpp:62-67`). SCRATCH (zone 3) may grow only by the
   notified sum.
 - **The boundary with llama.cpp-23mk** (`docs/design/sycl-alloc-zone-routing.md`,
-  in 23mk's worktree). 23mk routes **device**-scope requests, 139 rows. Its 74
-  host-only declarations, and its class-H rows ("host tier reached through a
-  copy or aggregate ... no change"), are outside its routing. 5efe changes
-  only `select_zone`'s **host** branch and the `SYCL_Host` role, and no
-  request construction. Possible overlaps are reported to the lead, not
-  resolved here:
-  - 23mk's nine class-H rows are exactly host landings this change moves
-    from WEIGHT to SCRATCH. They include `cpu-expert-pool.cpp:62`,
-    `pinned-buffer-pool.cpp:88` and the `ggml_sycl_attn_host_staging_get`
-    rows (`gs:81783-81832`).
-  - `gs:39954`'s host-pinned fallback on low free VRAM is next to 23mk's row
-    56 (`gs:39761`, the split-buffer branch it refuses).
-  - The DMA staging pool (m-2 below) is 23mk's row 118, which it refuses
-    under an arena.
-  - Host SCRATCH folds three VRAM RUNTIME terms
-    (`moe_vram_runtime_bytes`, `tp_vram_runtime_bytes`,
-    `dma_staging_pool_bytes`, `uc:27727-27730`, "conservative zone
-    budgeting"). That is a host reservation sized for device allocations,
-    and 23mk owns those device terms.
+  23mk's worktree; addendum 7 (c)). 23mk routes **device**-scope requests.
+  For host sites, 5efe owns role, zone, lifetime and sizing, and publishes
+  them in the site table above. 23mk owns each site's conversion. Its class-H
+  rows cite that table: the nine host landings this change moves, including
+  `cpu-expert-pool.cpp:62`, `pinned-buffer-pool.cpp:88` and the
+  `ggml_sycl_attn_host_staging_get` rows (`gs:81783-81832`); row 56, beside
+  `gs:39954`'s host-pinned fallback; and row 118, the DMA staging pool
+  (m-2 below). Host SCRATCH reads the RUNTIME function above, and does not
+  copy it.
 
 **The DMA staging pool in mmap mode** (r2 m-2).
 - It is 1700 MB: 2 x `dma_streamed` (`run2.log:2752`), where `dma_streamed`
@@ -1664,6 +1863,15 @@ The lead's GPU runs share one protocol (r1 I-7):
   its own default-context arm (n_ctx_train 32768).
 - Every **Qwen** and **GPT-OSS** gate below that pins `-c 4096` has a no-`-c`
   twin.
+- **The vehicle** (lead's clarification, 2026-09-27). A default-context arm
+  is `llama-cli`, `llama-completion` or `llama-server` with no `-c`, whose
+  context defaults to `n_ctx_train`. `llama-bench` (`n_ctx = p + n + d`) and
+  `llama-perplexity` (512) stay at their fixed contexts; a "no `-c`" bench
+  arm is vacuous, so C4 step 6 has none. A **programmatic** arm (a harness on
+  `llama_context_default_params`, whose `n_ctx` is 512,
+  `src/llama-context.cpp:5091`) must set `n_ctx = 0` explicitly (`:540`), and
+  is **VOID** unless `llama_n_ctx(ctx) == n_ctx_train`. No 5efe test is such
+  an arm today. The rule binds any that is added.
 - llama.cpp-uize part 3 has landed (`35ce2e65f`, `812c7d790`, `7259727e6`,
   `ae4204ba7`, all in this tree). So a KV cache that does not fit VRAM is
   re-placed to the host tier, and its layers' attention runs on the CPU. The
@@ -1686,86 +1894,150 @@ The lead's GPU runs share one protocol (r1 I-7):
     remove it. **C4 amends that clause** to the narrowed form of §4.3
     (r2 m-8).
 - **The record** lands in C1, with these host-only tests (`host;lazy`,
-  `tests/`, libllama only, no device):
+  `tests/`, libllama only, no device). C1 factors three pure functions out of
+  `load_tensors` so that a host test can drive them without a device:
+  - `llama_lazy_mode_resolve(mode, caps)`: the moved fallback block, over a
+    list of device caps;
+  - the pre-fill: (declaration, `weights_map`, `hparams`, `mode_pre`,
+    `mode_post`, `taker`, `SUPPORTED`) to a record;
+  - the early plan's inventory filter.
+
+  The loader calls the same functions.
   - `test-llama-lazy-range-record`:
-    - It builds `llama_tensor_weight`s from a test-written GGUF of four
-      tensors in two files, two of them flagged `TENSOR_READ_LAZY`, one of
-      those at 4 GiB + 1 byte of logical size and one at 4 GiB. It feeds them
-      through the record's fill function, the same call the pre-fill makes.
-    - Rows equal the flagged tensors' (file, offset, size) exactly, whatever
-      the mode (membership is flag-based).
-    - `lazy_eligible` comes from T6a's function, called and not restated. It
-      is set for both rows under `ON`, for the 4 GiB + 1 row only under
-      `AUTO`, and for neither under `OFF`.
-    - `deferral` follows §3.1's definition in all four branches:
-      - an ineligible row is `EAGER`;
-      - an eligible row on the SYCL branch is `STORAGE`;
-      - off it, `LAZY_READ`;
-      - off it, with a post-fallback `OFF`, `EAGER`.
+    - It builds `llama_tensor_weight`s from a test-written GGUF of five
+      tensors in two files. Three of them are declared lazy for the test's
+      arch: one at 4 GiB + 1 byte of logical size, one at 4 GiB, and one
+      **sparse table above 4 GiB**, its data region an `ftruncate` hole, so
+      the fixture costs no disk. The GGUF also holds one tensor of the same
+      name under a second arch that does not declare it (the gemma3n shape).
+    - Rows equal the declared tensors' (file, offset, size) exactly, whatever
+      the mode. The second arch's same-named tensor gets **no** row (the
+      (arch, name) key; addendum 5).
+    - **The eligibility matrix** (addenda 4 to 6), over `taker` x `mode_pre`
+      x `mode_post` x `SUPPORTED`:
+      - `lazy_eligible` comes from T6a's function, called and not restated,
+        with `(mode_pre, true)` when `taker` and `(mode_post, SUPPORTED)`
+        otherwise;
+      - `deferral` is `STORAGE` iff eligible and `taker`, `LAZY_READ` iff
+        eligible and not `taker`, and `EAGER` otherwise;
+      - `deferral != EAGER` iff `lazy_eligible`, asserted on every row of
+        every cell.
+    - **The required witness** (addendum 4). With `AUTO`, a caps list holding
+      one device with `mmap_support = false`, and `taker`, the sparse row's
+      bit is set, its `deferral` is `STORAGE`, and the early plan's filter
+      excludes it. `llama_lazy_mode_resolve` does turn `mode_post` to `OFF`,
+      which is what makes this cell discriminate. **RED mutant:** the fill
+      reads `mode_post` for the taker (a post-fallback fill). The bit is then
+      clear and the filter includes the table.
+    - **The `-ngl 0` witness** (addendum 5). A SYCL-registered load whose
+      weights are not SYCL-owned has `taker` false. Every row's `deferral` is
+      then `LAZY_READ` or `EAGER`, and never `STORAGE`, across the whole
+      matrix. How `taker` is derived is pinned by the source test below and
+      by lead witness W3.
+    - **`!SUPPORTED`, off the taker.** The bit is clear under every mode, and
+      the pre-fill prints the "mmap is not available ... loaded into RAM in
+      full" WARN once per declared row.
+    - **The attributes are per model** (addendum 7 (a)). Two records are
+      filled from two `qwen4exp` hparams sets with different `ple_n_heads`,
+      and each record's `attrs(name)` returns its own value, whichever was
+      filled last. **RED mutant:** the attributes cached in a static beside
+      the declaration, under which the first record reads the second's
+      value.
     - `deferred_for_file` holds exactly the non-`EAGER` rows.
     - `lazy_read`'s `any()`, `has()` and `for_file()`, and the ranges passed
-      to `llama_mmap`, agree with the record. `any()` is false on the SYCL
-      branch, and under `no_alloc`.
+      to `llama_mmap`, agree with the record. `any()` is false when `taker`,
+      and under `no_alloc`. `add()` accepts exactly the `LAZY_READ` rows,
+      under every mode value `lazy_read` holds.
     - **RED** is a mutant, compiled into the test binary only. libllama has
       no private-testing switch, so the test links a copy of the record and
       `lazy_read` sources built with a test-local define. In it
-      `lazy_read::add` keeps its own range copy, and the record's fill is
-      skipped for one tensor. The agreement check must fail naming that
-      tensor.
+      `lazy_read::add` keeps its own range copy and its upstream mode and
+      floor tests, and the record's fill is skipped for one tensor. The
+      agreement check must fail naming that tensor, and the `add()` check
+      must fail on the 4 GiB row under `ON` with `taker`, which is `STORAGE`
+      and which upstream's `add()` would accept.
   - `test-llama-lazy-range-prefill`:
     - It feeds three names through the pre-fill and the `create_tensor`
       check: a declared lazy name, an undeclared flagged name, and a
       declared-but-unflagged name.
-    - The first gives one row, filled before any `create_tensor` call.
+    - The first gives one row, filled before any `create_tensor` call, with
+      the attributes `llama_model_lazy_tensor_attrs` returns for it.
     - The other two abort naming the tensor and the arch, each in its own
-      process, scored on rc 134 plus the name. The unflagged case aborts under
-      `-lzm off` too, where the row is `EAGER` (r2 I-5(3)).
-    - `value(name)` equals the weight's (file, offset, size), and a write after
-      the pre-fill aborts.
+      process, scored on rc 134 plus the name.
+    - **Mode-independent** (addendum 4). The unflagged case aborts under
+      `-lzm off` and under `AUTO` at 4 GiB, both of which leave the row
+      ineligible and `EAGER`. **RED mutant:** rev 3a's check, which compares
+      the flag only against non-`EAGER` rows, lets both through.
+    - `value(name)` equals the weight's (file, offset, size), and a write
+      after the pre-fill aborts.
     - **The ineligible early-plan witness** (th32 r19 M-1, assigned to 5efe).
-      The early plan's inventory filter includes an ineligible row, for
+      With `taker`, the early plan's filter includes an ineligible row, for
       `AUTO` at 4 GiB and for `OFF`, as an ordinary weight, and excludes the
       eligible one.
     - **RED mutant:** the row filled at `create_tensor` instead, under which
       the "before any `create_tensor` call" check fails.
   - `test-llama-lazy-declaration-source` (`host;lazy;source-contract`, r2
-    I-5):
+    I-5, addendum 5):
     - It extracts every `create_tensor` call in `src/models/*.cpp` that
       passes `TENSOR_READ_LAZY`.
     - It maps the file's model class to its `LLM_ARCH` through the
       registration in `llama-model.cpp`, and each `tn(LLM_TENSOR_*, suffix
       [, bid])` to its GGUF name through `LLM_TENSOR_NAMES`
       (`llama-arch.cpp:561`), with a bid argument becoming `blk.%d.`.
-    - It requires a `llama_model_lazy_tensor_decls` entry for each, and a call
-      site for each entry.
+    - It requires a `llama_model_lazy_tensor_names` entry **under that arch**
+      for each call, and a flagged call site in that arch's file for each
+      entry.
+    - It also requires `llama_model_lazy_tensor_attrs` to have a case for
+      every arch that has names, and no case for any other arch.
+    - The declaration returns names only (addenda 7 (a) and 8 (a)). No
+      static beside it stores an hparams-valued field, and
+      `llama_model_lazy_tensor_attrs` writes nothing but its return value.
+      Mutant: a function-local `static llama_lazy_tensor_attrs` cache in
+      `llama_model_lazy_tensor_attrs`.
     - Today it passes on the two call sites once the declaration exists, and
       it fails before C1, which has no declaration.
-    - **Mutants:** a flagged call added in a copy of `gemma4.cpp` with no
-      entry; an entry with no call site.
+    - **Mutants:**
+      - a flagged call added in a copy of `gemma4.cpp` with no entry;
+      - an entry with no call site;
+      - the `qwen4exp` entry moved under `gemma3n`, whose same-named call is
+        unflagged;
+      - an attribute case deleted.
   - `test-llama-lazy-range-record-source` (`host;lazy;source-contract`):
     - no consumer holds its own **range** container: `lazy_read` has no
       `ranges` member (its membership set of names stays, §3.1), and
       `init_mappings` passes the record, not `lazy.for_file`;
+    - **`lazy_read::add()` reads `deferral`** (addendum 5; addendum 6 (2)).
+      Its body names `LAZY_READ` and the record, and contains no
+      `LLAMA_LAZY_MODE_`, no `llama_mmap::SUPPORTED` and no 4 GiB floor.
+      Mutant: upstream's `add()` restored (`lml:1240-1258`), as a rebase
+      would restore it;
+    - **`taker`** is assigned from `sycl_model_loading_guard.active`, and no
+      pre-fill input names `llama_model_sycl_hooks_enabled`. Mutant: the
+      process-level selector (addendum 5's RED);
+    - `mode_pre` is captured before the call to `llama_lazy_mode_resolve`, and
+      the pre-fill runs after the guard and before
+      `llama_model_sycl_compute_early_plan`;
     - `create_tensor`'s `TENSOR_READ_LAZY` branch checks the record and does
       not fill it, and compares the flag with membership, not with
       `deferral`;
-    - the caps and lazy-mode loops precede `llama_model_sycl_compute_early_plan`,
-      and the early plan's `weights_map` loop consults the record;
+    - the early plan's `weights_map` loop consults the record;
     - today it fails on `llama-model-loader.h:118`.
-- **Lead witnesses** (r1 I-7, r2 m-1). Two short runs, each killed before the
-  pinned pre-size.
+- **Lead witnesses** (r1 I-7, r2 m-1; addendum 5). Three short
+  `llama-completion` runs, each with `-v` (§3.1's pre-fill line is INFO, which
+  default verbosity drops), each killed at its witness lines, before the
+  pinned pre-size and before any tensor data is read.
   - **The margin.** In run2 the witness lines were all printed by t = 3.9 s
     (`run2.log:243`, `:308`, `:314`, `:370`). Chunk 1 of the pinned pre-size
     was allocated at t = 8.12 s (`:2827`). So the margin is about **4.2 s**,
     not the 53 s rev 3a claimed. `:2893` is the summary after the pre-size.
   - **The belt.** C1 does not split the ledger, so its load still sizes
-    WEIGHT at 122.9 GB. Both runs set `GGML_SYCL_HOST_RESERVE_MB=16384`, the
+    WEIGHT at 122.9 GB. All three runs set `GGML_SYCL_HOST_RESERVE_MB=16384`, the
     budget override (`uc:4172-4184`), so a late kill cannot commit more than
     16 GiB.
-  - **W1, lazy enabled.** Qwen on the B70 with **no** `-lm`/`-lzm` flags. Kill
-    it as soon as the log shows all of:
-    - `per_layer_token_embd ... lazy read enabled`, now printed at the
-      pre-fill;
+  - **W1, lazy enabled, the taker.** Qwen on the B70 with **no** `-lm`/`-lzm`
+    flags. Kill it as soon as the log shows all of:
+    - the pre-fill line `lazy-range record: per_layer_token_embd.weight
+      (51880 MiB) eligible=1 deferral=STORAGE taker=1 mode=auto`;
     - the early `[SYCL-PLAN] Host staging zone` line;
     - the early `[PLACEMENT] Totals` line;
     - `load_mode = mmap`.
@@ -1773,10 +2045,23 @@ The lead's GPU runs share one protocol (r1 I-7):
     Pre-registered: early `per_inflight` ≤ 1800 MB, and early host total =
     102383.5 MB ± 0.1 MB.
   - **W2, the ineligible case** (th32 r19 M-1). The same with `-lzm off`, so
-    the row is ineligible. The early plan must place the table as the
-    ordinary weight it is: early `per_inflight` = 103762.3 MB and early host
-    total = 154263.6 MB, both ± 0.1 MB, the run2 figures (`:243`, `:308`).
-  - Neither is a load. Neither reaches the pre-size.
+    the row is ineligible. The pre-fill line reads `eligible=0 deferral=EAGER
+    taker=1 mode=off`. The early plan must place the table as the ordinary
+    weight it is: early `per_inflight` = 103762.3 MB and early host total =
+    154263.6 MB, both ± 0.1 MB, the run2 figures (`:243`, `:308`).
+  - **W3, `-ngl 0` in a SYCL build** (addendum 5). Qwen with `-ngl 0` under
+    `ONEAPI_DEVICE_SELECTOR=level_zero:1`, so the SYCL backend and its hooks
+    are registered but the weights are CPU-owned. Kill it at the pre-fill line
+    plus `load_mode = mmap`. Pre-registered:
+    - the pre-fill line reads `eligible=1 deferral=LAZY_READ taker=0
+      mode=auto`, because C1's `mmap_support` keeps `mode_post` at `auto` on a
+      discrete card;
+    - **no** `[SYCL-PLAN] Host staging zone` line and **no** early
+      `[PLACEMENT] Totals` line: the early plan does not run.
+
+    A `deferral=STORAGE` there is the process-level-selector defect (FAIL).
+  - None of them is a load. None reaches the pre-size, and none reads the
+    table, so none enters the C1-to-T6 window (§3.1, **Data edges**).
 - Lead gates: the Mistral gate on `:1` and `:0` (default context). Tokens are
   unchanged, since Mistral has no lazy tensor.
 - **Data edge:** th32 T6a lands no later than C1 (§3.1).
@@ -1864,20 +2149,50 @@ I-5, §F2). It is the commit that changes every SYCL load.
       at 0. The mutant, with the window left `HUGEPAGE`, must read it
       resident, or the arm exits 77 naming why.
   - `test-sycl-host-role-routing-source` (`sycl;host;source-contract`, r2
-    I-2):
-    - It generates §4.4's census from the tree, and pins it: each row's role,
-      zone before and after, and lifetime.
+    I-2, addendum 7):
+    - It regenerates §4.4's **site table** from the tree, and fails on any
+      difference: each row's holder, role, zone after C4, lifetime and owner.
+      23mk's class-H rows cite that table, so the gate is its one source.
+    - Every non-`GRAPH` row names an owner. An `UNOWNED` row not in the
+      table's 18 lines fails, as a ratchet, pending the lead's ruling on
+      them.
     - `select_zone` has no category clause for WEIGHT.
     - `SYCL_Host` takes role `WEIGHT` only under `in_model_load`.
-    - `notify_compute_buffer_sizes` has a caller in `src/`.
+    - `llama_context` calls `ggml_backend_sycl_notify_host_buffer_sizes`
+      through the registry's proc address, and nothing in `src/` calls
+      `ggml_backend_sycl_notify_compute_buffer_sizes` (its VRAM half is not
+      5efe's).
+    - The new entry point's parameters are scalars: no pointer and no struct
+      in its signature, in either the header or the `llama_context` function
+      pointer type (the dlopen shape).
+    - Host SCRATCH's fold at `uc:27727-27730` calls
+      `unified_cache_get_planned_runtime_zone_requirement`. It reads none of
+      `moe_vram_runtime_bytes`, `pp_pipeline_scratch_bytes` and
+      `pp_moe_onednn_scratch_bytes`, and runs after their setters.
     - The SCRATCH boundary check counts only `GRAPH` records.
-    - **Mutant:** the category clause restored, which moves the
-      `CpuExpertPool` row to WEIGHT.
+    - **Mutants:**
+      - the category clause restored, which moves the `CpuExpertPool` row to
+        WEIGHT;
+      - `moe_vram_runtime_bytes` added back beside the function (a copied
+        term);
+      - a new file-scope static holder added at a `HOST_COMPUTE` site (a new
+        `UNOWNED` row).
   - `test-sycl-host-zone-select` (`sycl;host`). It is a pure test of the
-    extracted `select_zone`, over role x category x `kv_spill_to_host`. It
-    covers every row of §4.4's routing, and the boundary check's lifetime
-    filter over a fake registry: a `CONTEXT` record passes the check, a
-    `GRAPH` record trips it.
+    extracted `select_zone`, over role x category x `kv_spill_to_host`, and
+    of the lifetime checks over a fake registry.
+    - It covers every row of §4.4's routing.
+    - The graph-boundary check: a `CONTEXT` record and a `MODEL` record pass
+      it, and a `GRAPH` record trips it.
+    - **The owner-boundary checks** (addendum 7 (b)):
+      - a `CONTEXT` record live at its context's destruction prints the
+        `[HOST-ZONE] leaked CONTEXT record` WARN, naming the cohort, the
+        bytes and the owner. Under `GGML_SYCL_STRICT_LEASES=1` it aborts, in
+        its own process, scored on rc 134 plus that text;
+      - a `MODEL` record live at its model's free does the same;
+      - a record owned by a **different** context or model does not fire,
+        which is the multi-model case.
+    - Mutant: the owner check keyed by lifetime alone, which fires on
+      another context's live record.
   - `test-sycl-getrows-refusal-terminal` (`sycl;host`, a fake `stream_dma`,
     r2 m-5). One refusal gives one call, one counted refusal, no
     `[GET_ROWS] DMA retry` line, and the CPU fallback.
@@ -1933,8 +2248,17 @@ I-5, §F2). It is the commit that changes every SYCL load.
   1. `POSIX_FADV_DONTNEED` over shard 3, then `fincore` on it. Pre-registered:
      ≤ 1 MiB resident.
   2. **Qwen3.8 Q8_0 on `level_zero:0`, default load flags, `-c 4096`, the
-     baseline completion** (`-p 'The capital of France is' -n 32 --seed 42
-     --temp 0`). Pre-registered pass criteria:
+     baseline completion** (`llama-completion -p 'The capital of France is'
+     -n 32 --seed 42 --temp 0`).
+
+     **Precondition** (§3.1, the C1-to-T6 window; accepted in addendum 8 (b)). th32
+     T6 and T7 are on the tree, so the PLE table is taken by T6 and gathered
+     by T7. Without T6, a taker load reads the table eagerly and the early
+     plan never counted it. With T6 but not T7, nothing gathers it. Either
+     tree makes steps 2 and 3 VOID, not FAIL, and the lead is told which
+     tree it was.
+
+     Pre-registered pass criteria:
      - the load completes and prints coherent text;
      - `[HOST-ARENA] configured zones: WEIGHT=64.0 MB`;
      - `Pinned pool pre_allocate: grew 4 chunks`,
@@ -1951,8 +2275,14 @@ I-5, §F2). It is the commit that changes every SYCL load.
      - `SYCL_Mapped` model buffer lines sum to 127615 MiB ± 1%;
      - `SYCL_Host` model buffer lines hold 0 weight bytes;
      - peak growth of the counter the control named, over the pre-load
-       reading, is < 30 GiB. It is skipped, and said to be skipped, if the
-       control exited 77;
+       reading, is < 30 GiB **plus the lazy table's own bytes**, read from
+       th32's `[PLACEMENT] lazy per_layer_token_embd.weight` line: its
+       `resident=` figure under `residency=HOST` (51880.0 MiB, locked, th32
+       §8's expected line), or its `cache=` figure under `residency=STORAGE`.
+       Those bytes are th32's, not 5efe's, and the term is taken from the
+       line, never assumed. A missing line is a FAIL of the precondition.
+       The criterion is skipped, and said to be skipped, if the control
+       exited 77;
      - `MemAvailable` never falls under 25 GiB (the watchdog unit);
      - `Shmem` stays under 5 GiB;
      - `fincore` on shard 3 after the run is ≤ 256 MiB. The bound: the prompt
@@ -1965,8 +2295,9 @@ I-5, §F2). It is the commit that changes every SYCL load.
 
      There is deliberately no page-cache-growth criterion, because it would
      depend on the other shards' prior cache state.
-  3. **The same Qwen run with no `-c`** (the default-context arm), at
-     `n_ctx = n_ctx_train = 262144` (`run2.log:131`).
+  3. **The same `llama-completion` Qwen run with no `-c`** (the
+     default-context arm), at `n_ctx = n_ctx_train = 262144`
+     (`run2.log:131`). The same precondition applies.
      - **The KV.** 12 of the 48 layers carry KV: qwen4exp marks layer `i`
        recurrent unless `(i + 1) % full_attention_interval == 0`
        (`src/models/qwen4exp.cpp:132-134`), and the interval is 4
@@ -2137,11 +2468,11 @@ Rows marked "superseded in part" did not hold as written at rev 3a (design-5efe-
 | finding | disposition | where |
 |---|---|---|
 | I-1 pre-size omits the runtime pre-allocate | Fixed: the criterion is split, and both numbers are pre-registered from the configure path. The base is 4 chunks and the runtime is 3 chunks, so the pre-registered line is `Committed 14336.0 MB in 7 chunk(s)`. Without m-2's zeroed DMA pool the same arithmetic gives 8 chunks, 16384.0 MB, and that is stated as the discriminator. | §0, §4.4, §7 C4 |
-| I-2 WEIGHT has non-weight tenants; the runtime term has no path | Fixed per the lead ruling. 5efe routes host-side non-weight requests by role, and HOST_COMPUTE and EXPERT_CACHE go to SCRATCH. §4.4 censuses the 72 host-intent lines in 8 files, and the rev 3a "runtime term" is withdrawn. The criterion is **no `Pinned pool grow_zone: zone 0` line after the pre-size**. The gs:19145 split is resolved by a finding: `ggml_backend_sycl_notify_compute_buffer_sizes` (gs:19103-19146) has no caller, so C4 wires it from `llama_context` through a proc address. SCRATCH's per-graph boundary check (gs:92459, uc:20293) is why cg8j put the `CpuExpertPool` ring in WEIGHT. So C4 adds `alloc_intent::lifetime` {`GRAPH`, `CONTEXT`, `PROCESS`}, and the check counts `GRAPH` records only. **Flagged to the lead:** the lifetime field versus a fifth zone. The boundary with 23mk is stated: 23mk routes device zones. The host-role overlaps with it are **reported to the lead, not resolved**: 23mk's class-H rows; gs:39954 beside its row 56; the DMA pool, which is its row 118; and host SCRATCH folding the VRAM RUNTIME terms (uc:27727-27730). | §4.4, §7 C4 |
+| I-2 WEIGHT has non-weight tenants; the runtime term has no path | Fixed per the lead's rulings on I-2 and addendum 7 (b)/(c). 5efe routes host-side non-weight requests by role: HOST_COMPUTE and EXPERT_CACHE go to SCRATCH. The rev 3a "runtime term" is withdrawn. The criterion is **no `Pinned pool grow_zone: zone 0` line after the pre-size**. **Sizing:** `ggml_backend_sycl_notify_compute_buffer_sizes` (gs:19103-19146) has no caller, and it also reserves the VRAM arena and sums device buffers into host SCRATCH. So it stays uncalled, and C4 adds the host-only, scalar-ABI `ggml_backend_sycl_notify_host_buffer_sizes(backend, host_compute_bytes, host_output_bytes)`, reached through the proc address; a stale backend yields NULL and a WARN. Whether the old function's VRAM half should get a caller is reported to the lead. **Lifetime** (confirmed over a fifth zone): `alloc_intent::lifetime` {`GRAPH`, `CONTEXT`, `MODEL`}, with no `PROCESS`. The graph-boundary check counts `GRAPH` only. `CONTEXT` is leak-checked at backend-context destruction and `MODEL` at model free, each a WARN that aborts under STRICT_LEASES. **The site table** (35 lines) is published in §4.4, with a holder, role, zone, lifetime and owner per row: 10 `GRAPH`, 4 `CONTEXT`, 1 caller-chosen, 2 non-tenants, and **14 holders (18 lines) UNOWNED**. The UNOWNED rows are file-scope statics and `thread_local`s, including the `CpuExpertPool` and `PinnedBufferPool` rings on Qwen's default path, and are brought to the lead. **23mk:** 5efe owns role, zone, lifetime and sizing, and 23mk owns conversion and cites the table. Host SCRATCH reads `unified_cache_get_planned_runtime_zone_requirement` in place of three copied terms. | §4.4, §7 C4 |
 | I-3 arms 5 and 6 cannot reach the hole interior | Fixed: read-around is centred on the fault, with reach `ra_pages/2`, doubled under `FADV_SEQUENTIAL`, where `ra_pages` comes from the bdi's `read_ahead_kb`. Arms 5 and 6 measure the **edge band** `W = max(2 x read_ahead_kb, 2 MiB)`. The interior is measured by arms 1 and 2 only. Each arm exits 77 if the computed reach does not extend two pages past the shared page. | §4.6, §7 C3 |
 | I-4 `MADV_HUGEPAGE` defeats the edge windows | Fixed: `do_sync_mmap_readahead` tests `VM_HUGEPAGE` before `VM_RAND_READ`. So C4 applies `MADV_NOHUGEPAGE` to the `MADV_RANDOM` windows widened to 2 MiB, inside `llama_mmap`'s `HUGEPAGE` advice (`src/llama-mmap.cpp:517-532`). The one-page bound is restated per mapping. A faulting arm with lazy boundaries at 2 MiB + 1 MiB offsets gets a `HUGEPAGE` control mutant. | §4.6, §7 C4 |
-| I-5 the declaration needs a static cross-check | Fixed per the lead ruling. The declaration is 5efe's, and th32 consumes it. It is keyed by exact GGUF name or a single `%d` pattern, and carries no hparams. The final signature is `const std::vector<llama_lazy_tensor_decl> & llama_model_lazy_tensor_decls(llm_arch)`, with `{const char * name; uint32_t rows_per_token; int32_t consumer_layer;}`. An `LLM_TENSOR_INFOS` column was considered and rejected: `gemma3n.cpp:39` creates the same `LLM_TENSOR_PER_LAYER_TOKEN_EMBD` without the flag, so a per-tensor-kind column would be wrong for one arch. `test-llama-lazy-declaration-source` maps call site to entry and back, with both mutants. The runtime abort is kept, and it fires under `-lzm off` too. | §3.1, §7 C1 |
-| I-6 no writer for `STORAGE`; eligibility superseded by addendum 3 | Fixed by folding addendum 3. The pre-fill writes `lazy_eligible` once, from th32 T6a's predicate on the pre-fallback mode. `deferral` is a function of `lazy_eligible` and the SYCL branch: `EAGER` if ineligible, `STORAGE` on the SYCL branch (`llama_model_sycl_hooks_enabled() && resolved_sycl_weight_owner`, lm:2213-2227), otherwise `LAZY_READ` or `EAGER` from the post-fallback mode. §3.1 names which mode feeds each branch. The early plan counts ineligible rows as ordinary weights: a host witness plus C1's lead witness W2. th32 is re-pinned at rev 2u `0bd69e251`. | header, §3.1, §7 C1 |
+| I-5 the declaration needs a static cross-check | Fixed per the lead ruling, as amended by addenda 5, 7 (a) and 8 (a). The declaration is 5efe's, and th32 consumes it. The final signatures (addendum 8 (a): rev 3c's stand, and th32 does not rename) are `const std::vector<std::string> & llama_model_lazy_tensor_names(llm_arch)`, keyed by (arch, exact name or one `%d`), names only; `struct llama_lazy_tensor_attrs { uint32_t rows_per_token; int32_t consumer_layer; }`; and `llama_model_lazy_tensor_attrs(arch, hparams, name)`, 5efe's. C1's pre-fill stores the attributes on the per-model record entry, and T6 reads `record.attrs(name)`. There is no static table: one that T6 filled would be shared across models (P4). An `LLM_TENSOR_INFOS` column was rejected, and the arch key is required, because `gemma3n.cpp:39` creates the same tensor unflagged. `test-llama-lazy-declaration-source` maps (arch, call site) to entry and back, with four mutants plus a static-attribute-cache mutant. The record test has a two-hparams P4 witness. The runtime abort is kept and is mode-independent. | §3.1, §7 C1 |
+| I-6 no writer for `STORAGE`; eligibility superseded by addendum 3 | Fixed by folding addenda 3 to 6. The pre-fill writes every field once. `lazy_eligible = T6a(taker ? mode_pre : mode_post, size, taker ? true : SUPPORTED)`. `deferral` is `STORAGE` iff eligible and taker, `LAZY_READ` iff eligible and not taker, and `EAGER` otherwise, so `deferral != EAGER` iff eligible. `taker` is `sycl_model_loading_guard.active` (`lm:2228-2230`), not `hooks_enabled()` (rev 3b's `sycl_branch` is withdrawn). The ineligible early-plan witness is a host test plus lead witness W2. th32 is pinned at rev 2w `3afc3b020`. | header, §3.1, §7 C1 |
 | m-1 witness margin | Fixed: the lines are all printed by t = 3.9 s, and chunk 1 is at t = 8.12 s (`run2.log:2827`), a margin of about 4.2 s. `GGML_SYCL_HOST_RESERVE_MB=16384` is added as a belt. | §7 C1 |
 | m-2 idle DMA pool | Fixed: the DMA staging pool is sized 0 when no host weight is `PINNED`-backed, and the `DMA staging pool: 0.0 MB` line is a C4 criterion. | §4.4, §7 C4 |
 | m-3 readers not censused | Fixed: a readers table for `weight_host_bytes`, with each reader's assigned meaning, pinned by the loader source test. | §4.4, §7 C4 |
@@ -2156,7 +2487,7 @@ Rows marked "superseded in part" did not hold as written at rev 3a (design-5efe-
 | m-12 allowlist tokenizer | Fixed: comments and strings are stripped, `mmap (` is matched with a fixture, and a non-listed-file mutant is added. | §4.1, §7 C2 |
 | m-13 AnonPages has no positive control | Fixed: `test-sycl-pinned-meminfo-control` (lead-run) names the counter that pinned host USM lands in. The C4 criterion keys on that counter. If none moves, the test exits 77 and the criterion rests on `Committed` plus `MemAvailable`. | §7 C4 |
 | m-14 residency-test hygiene | Fixed: a non-tmpfs fixture, eviction per arm, `cachestat` through `syscall(__NR_cachestat)`, the `RLIMIT_MEMLOCK` skip, and arm 4 last on a fresh fixture. | §4.6, §7 C3 |
-| m-15 th32 pin | Fixed: re-pinned at rev 2u `0bd69e251`. | header |
+| m-15 th32 pin | Fixed: re-pinned at rev 2u `0bd69e251` in rev 3b, then at rev 2w `3afc3b020` in rev 3c. | header |
 | m-16 map segments | Fixed: exact definitions. Map segments are the union of the buffer's tensor ranges rounded outward, never a complement. `WILLNEED` and lock segments round inward. The pure-function test has a complement mutant. | §4.6, §7 C3 |
 | m-17 counter chokepoints | Fixed: `mem_copy`, `mem_copy_async` and `mem_copy_ptr_async` (`mem-ops.hpp:13-62`), `copy_to_device_async` (uc:10799), and `stream_dma` (uc:13959). | §5.3, §7 C4 |
 | m-18 counter log line | Fixed: `[FILE-MAPPED] counters: stream_dma_refusals=N device_copies_outside_materialization=M`, printed at WARN at load end and at unload. | §5.3, §7 C4 |
@@ -2165,3 +2496,13 @@ Rows marked "superseded in part" did not hold as written at rev 3a (design-5efe-
 | owner ruling: default-context arms | Folded: every Qwen and GPT-OSS gate set has a no-`-c` arm, HARD and scored. The Mistral gate is already default-context. | §0, §7 C4, C6 |
 | correction: uize part 3 landed | Folded: `35ce2e65f`, `812c7d790`, `7259727e6` and `ae4204ba7` are in the base, so a no-`-c` arm expects the `KV overflow re-placed to host tier` line (gs:18382) with a pre-registered N and range. Any refusal line is a FAIL, and so are garbage tokens, an abort, or `Shmem` growth. Qwen: 12 layers, 6144.0 MB, layers 3..47 (real sizing), or 48 layers, 24576.0 MB, layers 0..47 (the over-claim). GPT-OSS on the B50: 7 layers, 1792.0 MB, layers 11..23. | §7 C4 |
 | llama.cpp-0edf: the x4 hybrid KV over-count | Cited, and kept out of 5efe's scope. The Qwen no-`-c` arm's two pre-registered lines discriminate it, but do not fix it. | §7 C4 |
+
+| addendum 4 (§F2a I-9): which mode feeds the bit | Folded in rev 3c. The pre-fallback capture `mode_pre` is C1's, taken before the moved fallback block. The bit reads `mode_pre` for the taker and `mode_post` otherwise. `deferral` carries only the kind, and `STORAGE` is written at the pre-fill. The drift check is mode-independent, with a RED mutant of rev 3a's form. The required witness is a host arm with `AUTO`, an `mmap_support = false` device and a sparse table above 4 GiB (bit set, early plan excludes it; RED: a post-fallback fill). deepseek41 is dropped from the declaration. The stale "commit 1 does not depend on that" bullet (end of §3) is corrected. | §3, §3.1, §7 C1 |
+| addendum 5 (§F2a I-9): the taker is per-model; (arch, name) key; `add()` reads the bit | Folded in rev 3c. `taker = sycl_model_loading_guard.active`, captured once at the pre-fill. The declaration is keyed by (arch, name), and the attributes come from one per-arch function. `lazy_read::add()` accepts iff `deferral == LAZY_READ`, and its mode, floor and `SUPPORTED` tests are deleted and pinned by a source gate (mutant: upstream's `add()`). The `-ngl 0` witness: the host matrix never yields `STORAGE` without `taker`, the source gate has a process-level-selector mutant, and lead witness W3 expects `deferral=LAZY_READ taker=0` with no early plan. The missing-attribute refusal is T6's, for `STORAGE` rows only. | §3.1, §7 C1 |
+| addendum 6: th32 rev 2w interpretations | Folded in rev 3c. T6a's `SUPPORTED` input is `llama_mmap::SUPPORTED` off the taker and `true` on it. `add()`'s switch and its source gate are C1's. The attribute function's name is `llama_model_lazy_tensor_attrs(arch, hparams, name)`. | §3.1, §7 C1 |
+| vehicle clarification and the programmatic `n_ctx = 0` rule | Folded in rev 3c. The no-`-c` arms are `llama-completion` (Qwen, Mistral) and `llama-cli` (GPT-OSS). `llama-bench` and `llama-perplexity` stay fixed. A programmatic arm sets `n_ctx = 0` (`src/llama-context.cpp:5091`, `:540`) and is VOID unless `llama_n_ctx == n_ctx_train`. | §7 |
+| found in rev 3c: the C1-to-T6 window | Ruled in addendum 8 (b). C1 and T6 reach master in one merge, with T6 built on C1, and the tracker blocks C1's merge on T6. Interim `EAGER` is refused. C4's Qwen arms are VOID without T6 and T7, and their host-growth bound adds th32's printed table bytes; both were accepted. | §3.1, §7 C4 |
+
+| addendum 7 (a), (b), (c) | Folded in rev 3c. (a): no mutable static table, and attributes stored on the per-model record entry; the naming follows addendum 8 (a) (see I-5). (b): lifetime {GRAPH, CONTEXT, MODEL}, owner-boundary leak checks, owners cited, UNOWNED rows brought to the lead (see I-2). (c): the published site table, 23mk citing it, and host SCRATCH reading the RUNTIME function, not copying it. The pre-size stays 4 + 3 chunks, since the base moves by at most +0.6 MB. dlopen: the new entry point is scalar-only, under a new name. | §3.1, §4.4, §7 C1, C4 |
+
+| addendum 8 (a), (b) | Folded in rev 3c. (a): rev 3c's `_names`/`_attrs` signatures stand. (b): the C1-to-T6 window is closed by one merge. | §3.1, §7 C4 |
