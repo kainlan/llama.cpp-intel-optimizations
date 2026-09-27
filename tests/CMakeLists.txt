@@ -1609,18 +1609,18 @@ if (NOT WIN32)
         TIMEOUT 120
     )
 
-    # Gate for sycl-qwen4exp-vehicle-bf16-indexer.py, which writes the census
-    # vehicle whose tensor types the census cannot see. Standard-library Python
+    # Gate for sycl-qwen4exp-vehicle-rewrite.py, which writes the census vehicle
+    # whose tensor types and layouts the census cannot see. Standard-library Python
     # that runs the script through its /usr/bin/python3 shebang (this host's
     # ctest interpreter cannot load numpy), so it skips (77) where that
     # interpreter has no numpy.
     llama_test_cmd(
         ${LLAMA_PYTHON3}
-        NAME test-sycl-qwen4exp-vehicle-bf16-indexer
+        NAME test-sycl-qwen4exp-vehicle-rewrite
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-qwen4exp-vehicle-bf16-indexer.py
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-qwen4exp-vehicle-rewrite.py
     )
-    set_tests_properties(test-sycl-qwen4exp-vehicle-bf16-indexer PROPERTIES
+    set_tests_properties(test-sycl-qwen4exp-vehicle-rewrite PROPERTIES
         LABELS "sycl;profiling;tdd"
         TIMEOUT 120
         SKIP_RETURN_CODE 77

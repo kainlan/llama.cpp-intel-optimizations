@@ -92,14 +92,17 @@ case "$MODE" in
         ;;
     vehicle)
         [ -n "$VEHICLE_MODEL" ] && [ -f "$VEHICLE_MODEL" ] || { echo "set QWEN4EXP_VEHICLE to the quantized synthetic qwen4exp GGUF" >&2; exit 1; }
-        # the dump prints no types, so an F32 indexer would score IDX-PROJ-BF16 as
-        # agreeing; refuse any file that the BF16 rewrite (census doc, step b2) has not made
-        "$ROOT/scripts/sycl-qwen4exp-vehicle-bf16-indexer.py" --verify "$VEHICLE_MODEL" || exit 1
+        # the dump prints no types or layouts, so an F32 indexer would score
+        # IDX-PROJ-BF16 as agreeing and a fused gate_up would score MOE-MMID on a
+        # path the real model never takes; refuse any file the rewrite (census
+        # doc, step b2) has not made
+        "$ROOT/scripts/sycl-qwen4exp-vehicle-rewrite.py" --verify "$VEHICLE_MODEL" || exit 1
         NEED_GB=30 BUDGET=600 MODEL="$VEHICLE_MODEL" FA=(-fa auto) N_EMBD=256
-        # 2 layers: one GDN layer, one QSA layer, MoE on both -- 2 MUL_MAT_ID per
-        # layer if the fixture creates the merged ffn_gate_up_exps, else 3. TOP_K
-        # is QSA's alone for the reason given in the qwen4exp mode above
-        REQUIRE=(--require GATED_DELTA_NET=ANY:1 --require MUL_MAT_ID=ANY:4 --require TOP_K=ANY:1)
+        # 2 layers: one GDN layer, one QSA layer, MoE on both -- 3 MUL_MAT_ID per
+        # layer (gate, up, down), as the real model's 144 = 48 x 3; a fused
+        # gate_up would give 2. TOP_K is QSA's alone for the reason given in the
+        # qwen4exp mode above
+        REQUIRE=(--require GATED_DELTA_NET=ANY:1 --require MUL_MAT_ID=ANY:6 --require TOP_K=ANY:1)
         # a no-op on today's vehicle: its "test" tokenizer has no EOS
         # (llama-vocab.cpp:2095), so common.cpp:1321-1323 drops the flag with a
         # WARN and nothing can end the run early. It matters only for a vehicle

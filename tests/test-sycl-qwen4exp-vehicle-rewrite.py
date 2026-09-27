@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Gate for scripts/sycl-qwen4exp-vehicle-bf16-indexer.py (census doc, step b2).
+"""Gate for scripts/sycl-qwen4exp-vehicle-rewrite.py (census doc, step b2).
 
 The rewrite feeds the qwen4exp census vehicle, and the census cannot see tensor
-types: a vehicle with F32 where BF16 or Q8_0 belongs scores its rows as agreeing.
-So this plants tiny GGUFs and requires:
+types or layouts: a vehicle with F32 where BF16 or Q8_0 belongs, or a fused
+gate_up where the real model has separate gate and up, scores its rows as
+agreeing. So this plants tiny GGUFs and requires:
 - the rewrite converts exactly the indexer projections, bit-exact to ggml's
-  round-to-nearest-even, and leaves every other byte alone;
+  round-to-nearest-even; splits the fused ffn_gate_up_exps into ffn_gate_exps
+  (rows [0, n_ff) of each expert) and ffn_up_exps (rows [n_ff, 2 n_ff)), in
+  its place, and drops it; and leaves every other byte alone;
 - it refuses (rc 1, no output, input untouched) an input that is its own output
-  (the same path or a symlink), an all-F32 step-a file, an already-BF16 indexer
-  and a file with no indexer;
-- --verify accepts the result and refuses F32 indexers or F32 experts;
+  (the same path or a symlink), an all-F32 step-a file, an already-BF16 indexer,
+  a file with no indexer, an already-split file and one with no gate/up at all;
+- --verify accepts the result and refuses F32 indexers, F32 experts, and the
+  fused gate_up of the previous BF16-only rewrite;
 - a failure mid-write leaves an existing output untouched and no temp file.
 
 Standard library only: the script runs through its own /usr/bin/python3 shebang,
@@ -28,7 +32,7 @@ import tempfile
 from pathlib import Path
 
 ROOT   = Path(__file__).resolve().parent.parent
-SCRIPT = ROOT / "scripts" / "sycl-qwen4exp-vehicle-bf16-indexer.py"
+SCRIPT = ROOT / "scripts" / "sycl-qwen4exp-vehicle-rewrite.py"
 PY     = "/usr/bin/python3"
 
 F32, Q8_0, BF16 = 0, 8, 30
@@ -126,14 +130,31 @@ def bf16_ref(u):
 Q_BITS = [0x3f808000, 0x3f818000, 0x3f808001, 0x3f807fff, 0x7f800001, 0xff800001,
           0x7f800000, 0x80000000, 0x007fffff, 0x7f7fffff] + [0x3f800000 + 977 * i for i in range(22)]
 K_BITS = [0x40490fdb + 131 * i for i in range(8)]
-EXPERT_Q8 = bytes(range(68))                 # 2 Q8_0 blocks; content is never read
-EXPERT_F32 = f32_bits([0x3f800000] * 64)
+N_FF, N_EXP = 2, 2
+Q8_ROW = 34                                  # one Q8_0 block: 32 weights along ne0
+# every row distinct, so a split taking the wrong rows cannot match by accident
+GATE_UP_Q8 = bytes(i % 251 for i in range(2 * N_FF * N_EXP * Q8_ROW))
 
 
-def vehicle(indexer_type=F32, expert_type=Q8_0, with_indexer=True):
-    t = [("blk.0.ffn_down_exps.weight", expert_type, [32, 2],
-          EXPERT_Q8 if expert_type == Q8_0 else EXPERT_F32),
-         ("blk.0.ffn_down_exps.scale", F32, [2], f32_bits([0x3f800000] * 2))]
+def rows(raw, first, n):
+    return raw[first * Q8_ROW:(first + n) * Q8_ROW]
+
+
+def expert_tensor(name, qtype, n_rows):
+    ne = [32, n_rows, N_EXP]
+    if qtype == Q8_0:
+        return (name, qtype, ne, GATE_UP_Q8[:n_rows * N_EXP * Q8_ROW])
+    return (name, qtype, ne, f32_bits([0x3f800000] * (32 * n_rows * N_EXP)))
+
+
+def vehicle(indexer_type=F32, expert_type=Q8_0, with_indexer=True, experts="fused"):
+    t = [expert_tensor("blk.0.ffn_down_exps.weight", expert_type, N_FF),
+         ("blk.0.ffn_down_exps.scale", F32, [N_EXP], f32_bits([0x3f800000] * N_EXP))]
+    if experts == "fused":
+        t += [expert_tensor("blk.0.ffn_gate_up_exps.weight", expert_type, 2 * N_FF)]
+    elif experts == "split":
+        t += [expert_tensor("blk.0.ffn_gate_exps.weight", expert_type, N_FF),
+              expert_tensor("blk.0.ffn_up_exps.weight", expert_type, N_FF)]
     if with_indexer:
         def idx(bits):
             if indexer_type == F32:
@@ -154,7 +175,7 @@ def sha(p):
 
 
 def temps(d):
-    return [p for p in os.listdir(d) if p.startswith(".bf16-indexer-")]
+    return [p for p in os.listdir(d) if p.startswith(".vehicle-rewrite-")]
 
 
 def refused(tag, r, src, before, dst=None):
@@ -181,8 +202,20 @@ def main():
         check(r.returncode == 0, f"rewrite: rc {r.returncode} ({r.stderr.strip()[-300:]})")
         check(sha(src) == before, "rewrite: input was modified")
         a, b = read_gguf(src), read_gguf(out)
-        check(list(a) == list(b), "rewrite: tensor order or names changed")
+        fused = "blk.0.ffn_gate_up_exps.weight"
+        split = ["blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight"]
+        want_names = [n for m in a for n in (split if m == fused else [m])]
+        check(list(b) == want_names, f"rewrite: tensors {list(b)}, expected {want_names}")
+        _, _, fraw = a[fused]
+        for i, name in enumerate(split):
+            # per expert e, gate is rows [0, n_ff) and up rows [n_ff, 2 n_ff) of e's 2 n_ff rows
+            want = b"".join(rows(fraw, e * 2 * N_FF + i * N_FF, N_FF) for e in range(N_EXP))
+            bq, bne, braw = b.get(name, (None, None, None))
+            check(bq == Q8_0 and bne == [32, N_FF, N_EXP], f"{name}: type {bq} shape {bne}")
+            check(braw == want, f"{name}: not the {('gate', 'up')[i]} half of each expert's fused rows")
         for name, (qt, ne, raw) in a.items():
+            if name == fused:
+                continue
             bq, bne, braw = b[name]
             check(bne == ne, f"{name}: shape changed")
             if name.endswith(("q_proj.weight", "k_proj.weight")):
@@ -213,18 +246,28 @@ def main():
         refused("dst symlinks to src", run(p, link), p, h, link)
 
         # RED: wrongly typed inputs, each refused before any output exists
-        for tag, kw in (("all-F32 step-a file", dict(expert_type=F32)),
-                        ("already-BF16 indexer", dict(indexer_type=BF16)),
-                        ("no indexer", dict(with_indexer=False))):
+        for tag, kw, why in (("all-F32 step-a file", dict(expert_type=F32), "is F32, expected Q8_0"),
+                             ("already-BF16 indexer", dict(indexer_type=BF16), "is BF16, expected F32"),
+                             ("no indexer", dict(with_indexer=False), "no indexer"),
+                             ("already split", dict(experts="split"), "expected the fused"),
+                             ("no gate or up", dict(experts="none"), "expected the fused")):
             p, h, o = case(tag, **kw)
-            refused(tag, run(p, o), p, h, o)
+            r = run(p, o)
+            refused(tag, r, p, h, o)
+            check(why in r.stderr, f"{tag}: refused for another reason ({r.stderr.strip()[-200:]})")
 
-        # RED: --verify on the step-b file and on BF16 indexers over F32 experts
-        p, _, _ = case("verify step-b file")
-        check(run("--verify", p).returncode == 1, "--verify accepted F32 indexers")
-        p, _, _ = case("verify f32 experts", indexer_type=BF16, expert_type=F32)
+        # RED: --verify on the step-b file, on BF16 indexers over F32 experts,
+        # and on the fused gate_up the previous BF16-only rewrite left in place
+        for tag, kw, why in (("verify step-b file", dict(experts="split"), "q_proj.weight is F32"),
+                             ("verify f32 experts", dict(indexer_type=BF16, expert_type=F32, experts="split"),
+                              "ffn_down_exps.weight is F32"),
+                             ("verify fused gate_up", dict(indexer_type=BF16), "no fused ffn_gate_up_exps")):
+            p, _, _ = case(tag, **kw)
+            r = run("--verify", p)
+            check(r.returncode == 1 and why in r.stderr, f"{tag}: rc {r.returncode} ({r.stderr.strip()[-200:]})")
+        p, _, _ = case("verify real shape", indexer_type=BF16, experts="split")
         r = run("--verify", p)
-        check(r.returncode == 1 and "ffn_down_exps" in r.stderr, "--verify accepted F32 experts")
+        check(r.returncode == 0, f"verify real shape: rc {r.returncode} ({r.stderr.strip()[-200:]})")
 
         # a failure mid-write (a file-size limit makes write() fail with EFBIG
         # partway through, as ENOSPC would) keeps an existing output, no temp file
@@ -250,7 +293,7 @@ def main():
         p = os.path.join(cd, "in.gguf")
         big = 256 << 20
         write_gguf(p, [("blk.0.ffn_down_exps.weight", Q8_0, [32, big // 34], big // 34 * 34)]
-                   + vehicle(indexer_type=BF16)[2:])
+                   + [t for t in vehicle(indexer_type=BF16) if t[0] != "blk.0.ffn_down_exps.weight"])
         code = ("import resource, subprocess, sys\n"
                 "r = subprocess.run(sys.argv[1:], capture_output=True)\n"
                 "print(r.returncode, resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)\n")
@@ -263,7 +306,7 @@ def main():
     if failures:
         print(f"{len(failures)} failure(s)")
         return 1
-    print("PASS: qwen4exp vehicle BF16 indexer rewrite")
+    print("PASS: qwen4exp vehicle rewrite")
     return 0
 
 

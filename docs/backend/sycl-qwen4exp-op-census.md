@@ -402,47 +402,79 @@ O=/Apps/llama.cpp/census-k6jy; mkdir -p $O/vehicle
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-llama-archs -a qwen4exp -o $O/vehicle   # -> qwen4exp-moe.gguf
 # b. Q8_0 like the real model
 ./build/bin/llama-quantize $O/vehicle/qwen4exp-moe.gguf $O/vehicle/qwen4exp-moe-q8_0.gguf Q8_0
-# b2. the indexer projections BF16 like the real model (host-only file rewrite, no device).
-#     The script's shebang is /usr/bin/python3: `python3` on this host is miniconda, whose numpy
-#     cannot load (libmkl_intel_lp64.so.2 missing, even after setvars)
-scripts/sycl-qwen4exp-vehicle-bf16-indexer.py \
-    $O/vehicle/qwen4exp-moe-q8_0.gguf $O/vehicle/qwen4exp-moe-q8_0-bf16idx.gguf
+# b2. the real model's shapes: indexer projections BF16, separate expert gate and up (host-only
+#     file rewrite, no device). The script's shebang is /usr/bin/python3: `python3` on this host
+#     is miniconda, whose numpy cannot load (libmkl_intel_lp64.so.2 missing, even after setvars)
+scripts/sycl-qwen4exp-vehicle-rewrite.py \
+    $O/vehicle/qwen4exp-moe-q8_0.gguf $O/vehicle/qwen4exp-moe-q8_0-realshape.gguf
 # c. the census, B70 then B50 (budget 600 s each)
-QWEN4EXP_VEHICLE=$O/vehicle/qwen4exp-moe-q8_0-bf16idx.gguf scripts/sycl-qwen4exp-census-run.sh vehicle 0 $O/vehicle-b70
-QWEN4EXP_VEHICLE=$O/vehicle/qwen4exp-moe-q8_0-bf16idx.gguf scripts/sycl-qwen4exp-census-run.sh vehicle 1 $O/vehicle-b50
+QWEN4EXP_VEHICLE=$O/vehicle/qwen4exp-moe-q8_0-realshape.gguf scripts/sycl-qwen4exp-census-run.sh vehicle 0 $O/vehicle-b70
+QWEN4EXP_VEHICLE=$O/vehicle/qwen4exp-moe-q8_0-realshape.gguf scripts/sycl-qwen4exp-census-run.sh vehicle 1 $O/vehicle-b50
 ```
 
 Steps a and b were run by the lead on 2026-09-27, both rc 0: `qwen4exp-moe.gguf` is 19242592 B, and
 the Q8_0 file is 11464096 B with 98 tensors (36 Q8_0, 6 F16, 56 F32). Tensors whose rows are not a
 multiple of 32 (the HC low rank 8) get quantize's fallback type.
 
-Step b2 exists because quantize cannot make the indexer BF16. `src/llama-quant.cpp:327-329` exempts
-`indexer.k_proj.weight` and `indexer.q_proj.weight` from quantization before any type is chosen, so
-a `--tensor-type 'indexer\.[qk]_proj=bf16'` override (this document's first version of step b)
+Step b2 exists because two things still differ from the real model after step b, and quantize can
+fix neither.
+
+The indexer. `src/llama-quant.cpp:327-329` exempts `indexer.k_proj.weight` and
+`indexer.q_proj.weight` from quantization before any type is chosen, so a
+`--tensor-type 'indexer\.[qk]_proj=bf16'` override (this document's first version of step b)
 matches the names and changes nothing: the lead's run left both F32, with no BF16 conversion in the
-log. The script copies the file byte for byte except those two tensors, which it converts F32 ->
-BF16. Run on the lead's Q8_0 file it gave 7204256 B: the two projections BF16 with unchanged shapes
-and a relative error of at most 3.9e-3 (bf16 rounding), the other 96 tensors and all 162 metadata
-fields byte-identical. It copies the metadata as raw bytes because the fixture has empty arrays
-(`tokenizer.ggml.merges`, `classifier.output_labels`) that gguf-py's writer refuses. Whether the
-loader accepts the rewritten file is measured only by step c. The script checks every tensor type
-before it reads any data: the input must have F32 indexer projections and Q8_0
-`blk.*.ffn_*_exps.weight`, so step a's all-F32 file is refused, and so is a real shard (BF16
-indexer) before a byte of it is copied. It refuses an output that is its input, by path or through a
-symlink, and writes through a temp file beside the output plus a rename, so a failure mid-write
-leaves any existing output intact. Step c cannot be pointed at the wrong file by mistake: vehicle
-mode runs the script's `--verify` first and exits 1, before any device work, unless every indexer
-projection is BF16 and every expert weight is Q8_0. The sched dump prints no types, so without that
-check an F32 indexer `MUL_MAT` on SYCL0 would score as agreeing with IDX-PROJ-BF16, and F32 experts
-with MOE-MMID's "on Q8_0". The script's gate is `tests/test-sycl-qwen4exp-vehicle-bf16-indexer.py`
-(see the gates at the end of the lead-run section).
+log. The script converts both F32 -> BF16.
+
+The expert layout. The fixture writes a fused `blk.*.ffn_gate_up_exps.weight` [256, 768, 2]; the
+real model has separate `ffn_gate_exps` and `ffn_up_exps` (the lead's gguf-py read of shards 4-6,
+2026-09-27). The two reach different `MUL_MAT_ID` paths. The first vehicle runs (2026-09-27, on a
+step-b2 file that converted only the indexer) were refused on both cards at the first prompt, with
+the same lines on each:
+
+```
+[MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_up_exps.weight occurrence=0 expert=0 reason=recipe_missing source_reason=0 recipe_reason=local-layout-unsupported
+graph_compute: ggml_backend_sched_graph_compute_async failed with error -1
+```
+
+Both exited rc 3 and scored nothing about the real model. The fused path's gap is llama.cpp-zfbl and
+is out of this census's scope, because qwen4exp as shipped never takes it. The script splits each
+fused tensor, in its place, into `ffn_gate_exps` and `ffn_up_exps`, [256, 384, 2] Q8_0. The order is
+the one `build_moe_ffn` views the fused result in (`src/llama-graph.cpp:2195-2198`): gate is the
+view at offset 0 and up the view at `n_ff * nb[0]`, so of each expert's 2 n_ff weight rows,
+[0, n_ff) are gate and [n_ff, 2 n_ff) are up. Q8_0 blocks run along ne0, so each half is whole rows,
+copied unchanged. qwen4exp loads the separate form: `src/models/qwen4exp.cpp:252` calls
+`create_tensor_gate_up_exps`, which creates the fused tensor `TENSOR_NOT_REQUIRED` and, when it is
+absent, both separate tensors as required (`src/llama-model.cpp:4262-4266`). The fused tensor has no
+scale and the separate scales are optional (`llama-model.cpp:2413-2421`), so the split has none
+either. Whether the separate form clears the prompt `MUL_MAT_ID` is measured only by step c.
+
+The script copies everything else byte for byte. Run on the lead's Q8_0 file it gave 7204416 B with
+100 tensors (38 Q8_0, 54 F32, 6 F16, 2 BF16): the two projections BF16 with unchanged shapes and a
+relative error of at most 3.9e-3 (bf16 rounding); on both layers, gate and up byte-equal to the two
+halves of each expert's fused rows; the other 94 tensors and all 162 metadata fields byte-identical.
+It copies the metadata as raw bytes because the fixture has empty arrays (`tokenizer.ggml.merges`,
+`classifier.output_labels`) that gguf-py's writer refuses. Whether the loader accepts the rewritten
+file is measured only by step c. The script checks every tensor type and the expert layout before it
+reads any data: the input must have F32 indexer projections, Q8_0 `blk.*.ffn_*_exps.weight` and a
+fused gate_up on every MoE layer, so step a's all-F32 file is refused, and so is a real shard (BF16
+indexer, separate gate and up) before a byte of it is copied. It refuses an output that is its
+input, by path or through a symlink, and writes through a temp file beside the output plus a rename,
+so a failure mid-write leaves any existing output intact. Step c cannot be pointed at the wrong file
+by mistake: vehicle mode runs the script's `--verify` first and exits 1, before any device work,
+unless every indexer projection is BF16, every expert weight is Q8_0, and every MoE layer has
+separate gate and up and no fused tensor. The sched dump prints no types or layouts, so without that
+check an F32 indexer `MUL_MAT` on SYCL0 would score as agreeing with IDX-PROJ-BF16, F32 experts with
+MOE-MMID's "on Q8_0", and a fused gate_up would score MOE-MMID on a path the real model never takes.
+`--verify` refuses the first runs' indexer-only file (`qwen4exp-moe-q8_0-bf16idx.gguf`) with rc 1,
+naming both layers. The script's gate is `tests/test-sycl-qwen4exp-vehicle-rewrite.py` (see the gates
+at the end of the lead-run section).
 
 The fixture's `qwen4exp.attention.indexer.types = 0` does not mean "no indexer". qwen4exp never
 reads that key (`src/models/qwen4exp.cpp:56-61` reads head count, key length and top_k); only the
 DOTS3NOTE and HY_V4 fixtures set it (`tests/test-llama-archs.cpp:381,485`). The indexer tensors are
 created on every non-recurrent layer (`qwen4exp.cpp:225-228`), and `blk.1.indexer.*` is in the file.
 
-The structural controls for the vehicle are `GATED_DELTA_NET=ANY:1`, `MUL_MAT_ID=ANY:4` and
+The structural controls for the vehicle are `GATED_DELTA_NET=ANY:1`, `MUL_MAT_ID=ANY:6` and
 `TOP_K=ANY:1`. Layer 1 emits one TOP_K per graph: QSA runs when the indexer cache exists and the
 layer's compress ratio is nonzero (`qwen4exp.cpp:786-788`); the cache exists because
 `indexer_head_size` is 128, which sets the index-cache filter for non-recurrent layers
@@ -458,9 +490,9 @@ If the router ever switches to `ggml_top_k`, both controls pass with no QSA at a
 would do the same through `llama-sampler.cpp:1603`. It is off by default (`common/common.h:297`) and
 the script does not pass `--backend-sampling`, but the option also reads
 `LLAMA_ARG_BACKEND_SAMPLING` from the environment (`set_env`, `common/arg.cpp:2326`), so the script
-launches with `env -u LLAMA_ARG_BACKEND_SAMPLING`. The `MUL_MAT_ID` minimum is 4, not 6, because
-whether the fixture creates the merged `ffn_gate_up_exps` (`create_tensor_gate_up_exps`,
-`src/llama-model.cpp:4253`) decides whether a layer has 2 or 3 of them.
+launches with `env -u LLAMA_ARG_BACKEND_SAMPLING`. The `MUL_MAT_ID` minimum is 6: gate, up and
+down on each of the two MoE layers, as the real model's 144 is 48 x 3. A fused gate_up would give 4,
+so the control refuses that layout independently of `--verify`.
 
 What the vehicle exercises, per prediction rule:
 
@@ -472,7 +504,7 @@ What the vehicle exercises, per prediction rule:
 | QSA-FILL, QSA-SET-ROWS, ROPE | yes | same graph, smaller shapes |
 | QSA-FA | **different kernel shape** | head dim 128, not 256 |
 | IDX-PROJ-BF16 | yes, 2 nodes, on the step b2 file | quantize leaves the indexer F32 (`llama-quant.cpp:327-329`); b2 rewrites it to BF16. On the plain Q8_0 file the two `MUL_MAT`s are F32 and say nothing about BF16 |
-| MOE-MMID, MOE-ARGSORT, MOE-SOFTMAX | yes, on Q8_0 | 2 experts, all used; K = 256/384, not 2560/640 |
+| MOE-MMID, MOE-ARGSORT, MOE-SOFTMAX | yes, on Q8_0, separate gate and up (step b2) | 2 experts, all used; K = 256/384, not 2560/640. On the fixture's fused gate_up, `MUL_MAT_ID` takes a path the real model never does, and SYCL refuses it at the first prompt (llama.cpp-zfbl, out of scope) |
 | MOE-GLU (PLACEMENT) | **no** | the vehicle's experts fit in VRAM: no host-planned layer, no CpuExpertPool |
 | IN-TOK-EMBD, IN-PLE-GATHER | yes | same input buft list; PLE on layer 0 |
 | every `count` | **no** | counts are for 48 layers; the vehicle has the per-layer multiples |
@@ -576,15 +608,20 @@ mode, 10 each in the timestamp and bare-prefix modes, 4 on the golden excerpt), 
 "[timestamp] n_tokens classes: expected [512, 1], got [None, None]" and the same on the golden
 excerpt.
 
-The step-b2 script's gate is `tests/test-sycl-qwen4exp-vehicle-bf16-indexer.py` (ctest
-`test-sycl-qwen4exp-vehicle-bf16-indexer`). It is standard-library Python that plants tiny GGUFs and
+The step-b2 script's gate is `tests/test-sycl-qwen4exp-vehicle-rewrite.py` (ctest
+`test-sycl-qwen4exp-vehicle-rewrite`). It is standard-library Python that plants tiny GGUFs and
 runs the script through its `/usr/bin/python3` shebang; it exits 77 (skip) when that interpreter has
 no numpy. It requires:
 - a rewrite whose projections are bit-exact to ggml's round-to-nearest-even (ties both ways, NaN,
-  inf, -0, a subnormal, max finite) and whose every other byte is unchanged, accepted by `--verify`;
+  inf, -0, a subnormal, max finite); whose `ffn_gate_exps` and `ffn_up_exps` are, byte for byte, rows
+  [0, n_ff) and [n_ff, 2 n_ff) of each expert's fused rows (every row distinct), in the fused
+  tensor's place, with the fused tensor gone; and whose every other byte is unchanged, accepted by
+  `--verify`;
 - rc 1, no output and an untouched input for an output that is the input (same path or symlink),
-  step a's all-F32 file, an already-BF16 indexer, and no indexer;
-- `--verify` to refuse F32 indexers and F32 experts;
+  step a's all-F32 file, an already-BF16 indexer, no indexer, an already-split file, and a file with
+  neither form, each refused for its own reason;
+- `--verify` to refuse F32 indexers, F32 experts and a fused gate_up (the indexer-only rewrite's
+  output), and to accept the real shape;
 - an existing output to survive a write that fails partway (a file-size limit, as ENOSPC would);
 - a wrongly typed file to be refused before its data is read: with a 256 MiB sparse tensor ahead of
   the indexer, the script's peak RSS stays under half of it.
@@ -592,6 +629,12 @@ no numpy. It requires:
 The script at `f6f0746b9` fails it with 9 assertions: the same-path and symlink overwrites (2 each),
 the all-F32 file accepted (2), F32 experts accepted by `--verify`, the existing output destroyed
 mid-write, and the early refusal (peak RSS 558484 KiB against 34680 KiB after the fix).
+
+The script at `9bec100c4` (indexer only) fails the updated gate with 12 assertions: no split (the
+tensor list, and the type/shape and bytes of each half), the already-split file and the file with
+neither form accepted (3 each: rc, output written, reason), and `--verify` accepting the fused
+gate_up. Three mutants of the split each fail it: gate and up swapped at the call, the halves swapped
+inside an expert, and a wrong expert stride.
 
 ## Proposed closure tickets (not filed: the lead files them once the census confirms)
 
