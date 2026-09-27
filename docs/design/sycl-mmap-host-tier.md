@@ -1,7 +1,11 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 3c, not implemented. rev 3c adds §F2a I-9 addenda 4 to
-6 and rulings addenda 7 and 8 to rev 3b (`3b447ee70`). It folds:
+*Status: DESIGN rev 3d, not implemented. rev 3d is a new commit on rev 3c
+(`fef860772`), which is not amended (addendum 10 (a)). It folds
+design-5efe-r3 (0C/5I/7m/1n, and its contradictions X1-X7), addendum 10 (b)
+and (c), §M56 (a), and th32 rev 2x's two C1 requirements; Appendix B's r3
+rows say where each landed. rev 3c added §F2a I-9 addenda 4 to 6 and rulings
+addenda 7 and 8 to rev 3b (`3b447ee70`). It folds:
 - design-5efe-r1 and its addendum, under lead rulings §F1, §F2 and §F2a with
   §F2a I-9 addenda 2 to 6, and rulings addenda 7 and 8;
 - design-5efe-r2 (0C/6I/19m), with the lead's rulings on its I-2 and I-5;
@@ -25,11 +29,17 @@ Sibling designs this one interfaces with, and does not restate:
 
 - `llama.cpp-th32`: STORAGE tier for lazy row tables,
   `docs/design/sycl-storage-tier-lazy-tables.md`, abbreviated **th32**.
-  Pinned at **rev 2w `3afc3b020`** (it was 2u `0bd69e251` at rev 3b, per r2
-  m-15). Its §4.1 consumes this design's pre-fill (§3.1), the `lazy_eligible`
-  bit, the taker and `deferral`, and its T6a owns the eligibility predicate
-  that §3.1 calls. Its §9.1 names this design's declaration and attribute
-  function. Section numbers cited here are 2w's.
+  Pinned at **rev 2x `90be8e260`** (it was 2w `3afc3b020` at rev 3c and 2u
+  `0bd69e251` at rev 3b; r2 m-15, r3 X7). th32's later commits `90cb98cab`
+  and `bde97cd15` only re-pin 5efe and move a tracker note. Its §4.1 consumes
+  this design's pre-fill (§3.1), the `lazy_eligible` bit, the taker and
+  `deferral`, and its T6a owns the eligibility predicate that §3.1 calls. Its
+  §9.1 names this design's declaration and attribute function. Its T6 row
+  owns the context allocation scope that §4.4 reads for host-buffer owners.
+  Section numbers cited here are 2x's.
+- zhcn's design, cited by row id: its **GDC3** row is the single source of
+  the GPT-OSS B50 default-context demotion figures (§M56 (a)). This design
+  carries no copy of them.
 - `llama.cpp-7v5c`: host-only plan dry-run.
 - `llama.cpp-rnh3`: exact host WEIGHT bytes.
 - `llama.cpp-sgc5`: one zone set per plan.
@@ -110,7 +120,7 @@ This design therefore does four things:
 pre-registered before the run:
 
 - the WEIGHT zone is 64.0 MB, and it never grows after the pre-size;
-- the pre-size commits 7 chunks, 14336.0 MB (§4.4);
+- the pre-size commits 5 chunks, 10240.0 MB (§4.4);
 - `MemAvailable` never falls under 25 GiB;
 - `SYCL_Mapped` holds about 127615 MiB;
 - shard 3, the PLE table, stays under 256 MiB resident;
@@ -542,14 +552,26 @@ and held by `llama_model_loader`.
        (`lm:2256-2265`), moved up. They read `devices`, `params.load_mode`,
        `ml.use_mmap` and `ml.lazy.mode`, and nothing the early plan writes
        (r2 verified);
-    4. fill one row per declared name found in `weights_map`: (name, file
+    4. print **one per-model INFO line** (th32 rev 2x's requirement, its
+       §4.1 and T6 row (k)), `lazy-range record: mode_pre=<mode>
+       mode_post=<mode> taker=<0|1>`, with `mode_post` read after the
+       moved fallback. It prints for every model, whether or not any name is
+       declared, so a harness can read both modes and the taker without a
+       lazy table. It is INFO, like the row lines below. A test that installs
+       a callback through `llama_log_set` receives every level, since
+       `llama_log_internal_v` hands each line to the callback unfiltered
+       (`src/llama-impl.cpp:40-55`); only `common_log`'s default callback
+       drops INFO, at `verbosity <= common_log_verbosity_thold`
+       (`common/log.cpp:542-546`, with INFO mapped to TRACE at `:532`). A
+       CLI reads it with `-v` or `-lv 4`;
+    5. fill one row per declared name found in `weights_map`: (name, file
        index, offset, size) from the `llama_tensor_weight`, the bit, the
        deferral, and the attributes. Each row prints one INFO line,
        `lazy-range record: <name> (<size> MiB) eligible=<0|1>
        deferral=<EAGER|LAZY_READ|STORAGE> taker=<0|1> mode=<the mode the bit
        read>`. It replaces `add()`'s "lazy read enabled" line as the witness
        §7 C1's lead runs read;
-    5. `llama_model_sycl_compute_early_plan`, if `taker` (`lm:2229-2231`).
+    6. `llama_model_sycl_compute_early_plan`, if `taker` (`lm:2229-2231`).
 
     It runs the same way under `no_alloc` (r2 m-9), so the fit pass plans what
     the real load plans. See `lazy_read` below for why that maps nothing in
@@ -597,9 +619,24 @@ and held by `llama_model_loader`.
 - **`lazy_read`** keeps its `mode` and a **membership** set of names, as th32
   §4.1 requires (its r18 N-4).
   - **`add(name, t, w)` reads `deferral` and decides nothing** (addendum 5;
-    addendum 6 (2): a C1 deliverable). It accepts iff `w != nullptr` and
-    `record.deferral(name) == LAZY_READ`. Its own mode test, the 4 GiB floor
-    and the `llama_mmap::SUPPORTED` test (`lml:1241-1256`) are deleted.
+    addendum 6 (2): a C1 deliverable). **Its return value is
+    `record.deferral(name) == LAZY_READ`, and nothing else** (r3 m1). Its
+    own mode test, the 4 GiB floor and the `llama_mmap::SUPPORTED` test
+    (`lml:1241-1256`) are deleted.
+    - **Membership is a separate axis from the decision.** `add()` inserts
+      the name into the membership set only when `w != nullptr`, that is,
+      only when the real load will map the file. Under `no_alloc`,
+      `create_tensor` passes `nullptr` (`lml:1776`), so `add()` still returns
+      true for a `LAZY_READ` row and `is_lazy` is set, while membership stays
+      empty and nothing is mapped. Upstream's comment at `lml:1775` requires
+      exactly that: the decision "must not depend on the load mode, or the
+      memory-fit pass (no_alloc, no mmap)" would size a lazy table as
+      resident. rev 3c's `w != nullptr` term in the decision made `is_lazy`
+      false in the fit pass, so the fit pass sized the 51880 MiB table that
+      the real load leaves unread.
+    - For a `STORAGE` row `add()` returns false, since `lazy_read` is not its
+      consumer. Whether `create_tensor` treats that tensor as lazy is th32
+      T6's SYCL branch, which keys on `deferral == STORAGE` (th32 2x T6 row).
     - That is a fork change to upstream code, so
       `test-llama-lazy-range-record-source` pins it (§7 C1). A rebase that
       restores `add()`'s own gates fails loudly.
@@ -615,8 +652,9 @@ and held by `llama_model_loader`.
   - So under `taker`, where eligible rows are `STORAGE`, `any()` stays false,
     and `init_mappings` does not map every shard with `use_mmap` cleared
     (`lml:1871`, the hazard r2 I-6 names).
-  - Under `no_alloc`, `create_tensor` passes `nullptr` (`lml:1776`), the
-    membership stays empty, and the fit pass maps nothing, as today (r2 m-9).
+  - Under `no_alloc`, membership stays empty and the fit pass maps nothing,
+    while a `LAZY_READ` table still reads as lazy to the fit pass (r2 m-9,
+    r3 m1; the membership bullet above).
 - `init_mappings` passes `record.deferred_for_file(idx)` to `llama_mmap`
   (`lml:1890-1891`).
 - th32's inventory reads each table's (file, offset, size) from the record
@@ -993,40 +1031,134 @@ created") describes a path that does not run.
   - Role `KV`, or `kv_spill_to_host`, goes to KV, as today.
   - Role `WEIGHT` goes to WEIGHT.
   - Role `EXPERT_STAGING` goes to SCRATCH, as today.
+  - A request whose lifetime is the interim `UNOWNED` goes to WEIGHT, where
+    it lands today. Only the 12 lines that addendum 10 (b) leaves to
+    llama.cpp-30r1 carry it (the site table below).
   - Every other role whose category is `HOST_COMPUTE` or `EXPERT_CACHE` goes
     to **SCRATCH**, per the lead's ruling.
   - Anything else goes to STAGING, as today.
-  - Category no longer selects WEIGHT. No call site changes its request.
+  - Category no longer selects WEIGHT. No call site changes its role,
+    except the three host buffer types below; the `DEVICE` and `UNOWNED`
+    sites change only their lifetime.
 - **`SYCL_Host` takes role `WEIGHT` only inside a model load**
   (`in_model_load`). The `|| weights_evictable` term goes. A post-load
   `SYCL_Host` buffer (compute, output, inputs) takes role `COMPUTE`, and so
   SCRATCH.
-- **The sizing path exists** (addendum 7: "watch the dlopen boundary").
-  - **The existing entry point is not wired as it stands.**
-    `ggml_backend_sycl_notify_compute_buffer_sizes` does two things
-    (`gs:19140-19145`):
-    - it reserves the **VRAM** compute arena, and aborts if the reserve is
-      short (`unified_cache_reserve_compute_arena`);
-    - it grows host SCRATCH by the sum over **every** backend's compute
-      buffer, device buffers included.
-
-    The first is VRAM arena sizing, not 5efe's. The second over-reserves
-    host memory by the device compute buffers. The function stays uncalled
-    by 5efe. Whether its VRAM half should get a caller is **reported to the
-    lead**, not decided here.
+- **`SYCL_KV_Host` gets its own `alloc_buffer`, with role `KV`** (r3 B; lead
+  ruling on r3 B).
+  - Today `ggml_backend_sycl_kv_host_buffer_type()` copies the `SYCL_Host`
+    buft and overrides only `get_name` (`gs:42750-42758`). So uize-demoted
+    host KV goes through `SYCL_Host`'s `alloc_buffer` (`gs:42627-42707`),
+    with role `WEIGHT` or `STAGING` (`gs:42645-42646`), cohort
+    `backend_host_buffer`, and lands in WEIGHT. Nothing sets
+    `kv_spill_to_host` on that path; only the device-KV fallback does
+    (`uc:15285-15303`). After the routing above alone, it would take role
+    `COMPUTE`, zone SCRATCH and lifetime `GRAPH`: every `graph_compute`
+    would trip the SCRATCH boundary WARN (`gs:92459`, `uc:20290-20298`), 6
+    GiB would arrive in SCRATCH unannounced, and the KV zone would receive
+    nothing.
+  - C4 factors the body of `SYCL_Host`'s `alloc_buffer` into one helper that
+    takes the intent, and gives `SYCL_KV_Host` its own `alloc_buffer` over
+    that helper, with role `KV`, category `HOST_COMPUTE`, cohort
+    `kv_host_buffer` and lifetime `CONTEXT`. `select_zone` sends role `KV` to
+    the KV zone (zone 1) by its first rule. The buft keeps its own
+    `get_name` (the residency decline keys on it,
+    `ggml_sycl_tensor_is_in_kv_host_buft`), and every other iface slot stays
+    shared.
+  - **The qwen4exp indexer cache takes the same path.** `llama_memory_hybrid_idx`
+    builds a second `llama_kv_cache`, prefix `idx_`, K only (the MLA trick,
+    one head of `indexer_head_size`), over the layers `filter_idx` admits
+    (`src/llama-memory-hybrid-idx.cpp:45-67`). qwen4exp's `filter_idx` is
+    `!is_recr(il)` (`lm:3580-3585`), the same 12 layers that carry
+    attention KV. The per-layer buft choice is the same hook call
+    (`src/llama-kv-cache.cpp:290-306`), so a demoted layer's indexer keys go
+    to `SYCL_KV_Host` too. At Qwen's default context that is 12 x 262144 x
+    128 x 2 B = 768 MiB, which the printed host-KV figure must include (next
+    item).
+  - The recurrent state is **not** host KV: `llama_memory_recurrent`
+    allocates it in the plain device buft (`src/llama-memory-recurrent.cpp:97-103`,
+    `llama_recurrent_sycl_kv_buft`). rev 3c's "plus a small recurrent state"
+    beside the host-KV figure is withdrawn.
+- **The demotion counts the indexer** (lead ruling on r3 B: the indexer is
+  in the printed figure).
+  - Today the demotion's per-layer bytes come from
+    `placement_plan::kv_size_for_layer(l)` (`uch:1033`), at both the demotion
+    input (`gs:17089-17092`) and the residency re-fit (`gs:18037-18042`).
+    Its per-layer truth comes from `llama_model_sycl_build_kv_layer_arrays`
+    (`lm:350-365`) through the inventory's `kv_k_width_per_layer`,
+    `kv_v_width_per_layer` and `kv_layer_kind` (`ggml-sycl.h:323-326`). No
+    field carries the indexer, so the printed `X MB host KV` omits 768 MiB
+    that the load then pins.
+  - C4 adds **`uint32_t kv_idx_width`** to `ggml_sycl_tensor_inventory`,
+    filled from `hparams.indexer_head_size` when the model's memory is
+    `llama_memory_hybrid_idx` and 0 otherwise. Measured with a standalone
+    compile against this tree's header: the struct is 176 bytes, 8-aligned,
+    with `kv_layer_count` at offset 168, so a `uint32_t` after it lands at
+    offset 172, in the tail padding, and `sizeof` stays 176. A stale
+    libllama leaves the byte zero, which is today's behaviour (no indexer
+    term), and never shifts another field (memory:
+    extending-a-struct-that-crosses-the-backend-dlopen-boundary). Every
+    in-tree construction is value-initialized (`lm:653`, `:705`,
+    `tests/test-tiered-dispatch.cpp:35`,
+    `tests/test-sycl-lifecycle-runtime-wrapper.cpp:1388`, `:1426`).
+  - One accessor, `placement_plan::kv_demand_for_layer(l)` =
+    `kv_size_for_layer(l)` + `kv_idx_width` x the layer's cells x the K
+    element size, for every layer the plan counts as carrying KV. Both
+    demotion sites read it, and so does `rec.host_bytes`, the printed
+    figure. `kv_size_for_layer` itself, which sizes the device per-layer
+    slabs, is unchanged: on the device the `idx_` tensors are not remapped
+    into a layer slab (`[KV-REMAP]` matches only `cache_k_l`/`cache_v_l`,
+    `gs:38570-38578`). How the device accounts for them is outside 5efe.
+  - So the Qwen no-`-c` line prints 12 x (512 + 64) = **6912.0 MB** of host
+    KV (§7 C4 step 3).
+- **Every host buffer type's `get_max_size` asks `select_zone`** (found
+  while folding r3 B; P4, one fact with one source).
+  - ggml-alloc splits a host buffer into chunks of at most `get_max_size`,
+    and `SYCL_Host`'s `get_max_size` answers from a zone it names itself:
+    WEIGHT, hard-coded (`gs:42477`), and the `SYCL_HostCompute` buft's
+    answers from STAGING (`gs:42977`). The glkg fix made the first one
+    agree with `select_zone` as it stands today, and
+    `tests/test-sycl-host-zone-config-source-contract.py` pins that
+    agreement.
+  - After C4's routing, both are wrong: a post-load `SYCL_Host` buffer goes
+    to SCRATCH, a `SYCL_KV_Host` buffer to KV, and a `SYCL_HostCompute`
+    buffer (role `COMPUTE`, `gs:42832`) to SCRATCH. Chunking against the
+    wrong zone's largest free block is the llama.cpp-glkg defect again.
+  - C4 gives each of the three bufts one intent builder, used by its
+    `alloc_buffer` and by its `get_max_size`, which calls the extracted
+    `select_zone` on that intent. The source contract is amended from
+    "names WEIGHT" to "calls `select_zone` on the `alloc_buffer`'s intent".
+    Mutant: the hard-coded WEIGHT restored.
+  - The chunk cap (2 GiB, `GGML_SYCL_HOST_BUFFER_CHUNK_MB`, `gs:42421-42438`)
+    is unchanged. So Qwen's 6144 MiB of demoted main KV reaches the KV zone
+    as three 2048 MiB buffers (24 tensors of 256 MiB, 8 per buffer), and the
+    768 MiB indexer cache as one buffer.
+- **The notify path, before allocation** (r3 A; addendum 10 (c) accepts the
+  entry point).
+  - **The existing entry point stays uncalled.**
+    `ggml_backend_sycl_notify_compute_buffer_sizes` (`gs:19103-19146`) has
+    no caller. It reserves the **VRAM** compute arena and aborts if the
+    reserve is short (`unified_cache_reserve_compute_arena`, `:19140-19142`),
+    and then grows host SCRATCH by the sum over **every** backend's buffer,
+    device buffers included (`:19145`). The lead sends its VRAM half to
+    23mk's dead-code census (addendum 10 (c)).
   - **C4 adds a host-only entry point:**
 
     ```c
-    // ggml/include/ggml-sycl.h, C4. Grows the host pinned SCRATCH zone only.
+    // ggml/include/ggml-sycl.h, C4. Records one llama_context's host buffer
+    // demand and grows the host pinned SCRATCH zone to cover it.
     GGML_BACKEND_API void ggml_backend_sycl_notify_host_buffer_sizes(ggml_backend_t backend,
                                                                      size_t         host_compute_bytes,
                                                                      size_t         host_output_bytes);
     ```
 
     - `ggml_backend_sycl_reg_get_proc_address` (`gs:109834`) exports it by
-      name.
-    - `llama_context` calls it through that proc address after the scheduler
-      reserve. A direct call does not link under `GGML_BACKEND_DL`.
+      name. A direct call does not link under `GGML_BACKEND_DL`.
+    - **`backend` is checked, not cast blindly** (r3 A.4). The function
+      returns with a WARN unless `ggml_backend_is_sycl(backend)`
+      (`gs:107651`). `llama_context` passes exactly one backend: the SYCL
+      backend of `model.devices[0]`, the device whose host buft its CPU
+      backend uses (`src/llama-context.cpp:889-895`).
   - **The ABI shape is deliberate.** It takes scalars, so no struct crosses
     the dlopen boundary and no stride can drift between a fresh `libllama`
     and a stale `libggml-sycl` (memory:
@@ -1036,43 +1168,157 @@ created") describes a path that does not run.
       misread arguments.
     - On `NULL`, `llama_context` WARNs `SYCL backend has no
       ggml_backend_sycl_notify_host_buffer_sizes; host SCRATCH is not
-      grown`, and continues. The zone-0 criterion below is then the witness.
+      grown`, and continues. The zone criteria below are then the witness.
     - The commit message states that both libraries rebuild together.
-  - `host_compute_bytes` is the scheduler's buffer size for the host buft
-    (`ggml_backend_sched_get_buffer_size` on the CPU backend, whose buft is
-    `SYCL_Host`, `src/llama-context.cpp:889-895`). `host_output_bytes` is the
-    output buffer as **its own named term**: `n_outputs_max x (n_vocab +
-    n_embd) x 4 B`, which `llama_context` computes for the allocation anyway
-    (`src/llama-context.cpp:3562-3564`).
-  - SCRATCH grows by the sum, through `unified_cache_grow_host_scratch_zone`,
-    and prints `[HOST-ARENA] SCRATCH zone grown by %.1f MB for compute
-    buffers` (`uc:20442-20449`).
-  - The "runtime term at the runtime KV update" of rev 3a is withdrawn,
-    since it had no path into the zone (host zones are configured once, at
-    load, `gs:5623`).
-- **Lifetimes** (addendum 7 (b): **confirmed over a fifth zone**).
+  - **When it is called: before each allocation it covers** (r3 A.2). An
+    allocation made first fits or grows zone 3 through the miss path
+    (`uc:15418-15437`); a notify after it would grow SCRATCH again for the
+    same bytes, an idle reservation (P4).
+    - `llama_context` keeps its two current terms, `host_compute_bytes` and
+      `host_output_bytes`, and every call passes both.
+    - **Output buffer.** `output_reserve` computes `new_size`
+      (`src/llama-context.cpp:3535-3537`) and frees the old buffer (`:3550`)
+      before it allocates (`:3566`). When the chosen buft is the SYCL host
+      buft (`:3559-3565`), it notifies with the new
+      `host_output_bytes` between those two steps. That covers the first
+      reserve in the constructor (`:850`) and every regrowth (`:2896`,
+      `:3231`, `:4974`). The term is `new_size`, the bytes the allocation
+      asks for.
+    - **Compute buffers.** In `sched_reserve`, after the scheduler is created
+      (`:2019`) and before the first allocating `graph_reserve` (`:2055`),
+      C4 runs the pp graph and the tg graph through `graph_reserve(...,
+      /*split_only=*/true, sizes)`, which calls
+      `ggml_backend_sched_reserve_size` (`:3908-3910`) and allocates nothing.
+      `host_compute_bytes` is the larger of the two sizes at the index of
+      the CPU backend, whose buft is the SYCL host buft (`:889-895`). It
+      notifies, then runs the allocating reserves as today. The
+      pipeline-parallel retry makes a new scheduler (`:2059-2064`) and
+      repeats the measure and the notify. The `no_alloc` fit pass already
+      takes the size-only path (`:2055-2056`) and does not notify.
+    - **The witness.** After the allocating reserves, `llama_context` compares
+      `ggml_backend_sched_get_buffer_size` on the CPU backend with the
+      notified figure and WARNs `[HOST-ARENA] host compute buffer %.1f MB
+      exceeds notified %.1f MB` if it is larger. Plan != reality is then
+      printed, not inferred.
+  - **What the SYCL side does with it** (r3 A.3, A.5).
+    - One demand per `llama_context`, keyed by the notifying backend's
+      `ggml_backend_sycl_context`. A new call **replaces** that context's
+      demand; it does not add to it. The entry is dropped in that backend
+      context's destructor (`gs:43872`, reached through
+      `ggml_backend_sycl_free`, `gs:83938`), its owner boundary.
+    - The zone is global: `unified_cache_grow_host_scratch_zone` resolves
+      device 0 (`uc:21935`), and host zones are configured once, at load
+      (`gs:5623`). So SCRATCH's target is the plan's `host_zone_scratch_bytes`
+      plus the **sum of the live demands**, and it grows by
+      `max(0, sum - grown_for_demands)`, where `grown_for_demands` is the
+      most the demands have already grown it. Capacity is never returned, so
+      a later context reuses what an earlier one grew. One call per context,
+      and one `llama_context` never grows the zone once per SYCL backend.
+    - The growth is one `grow_zone(SCRATCH, deficit + n x
+      DEFAULT_ALIGNMENT)` call, where `n` is the number of buffers the demand
+      splits into at the chunk cap, the same slack rule as the miss path
+      (`uc:15432`). `grow_zone` commits **one chunk of
+      `max(2048 MB, align_up(request))`** (`pinned-pool.cpp:613-712`). So
+      the zone grows by at least the deficit, **rounded up to one chunk**,
+      and the criteria score it that way.
+    - It prints `[HOST-ARENA] SCRATCH demand ctx=%llu compute=%.1f MB
+      output=%.1f MB total=%.1f MB grown=%.1f MB` on every call, and the
+      existing `[HOST-ARENA] SCRATCH zone grown by %.1f MB for compute
+      buffers` (`uc:20447-20448`) when it grows.
+  - The "runtime term at the runtime KV update" of rev 3a stays withdrawn,
+    since it had no path into the zone.
+- **Lifetimes** (addendum 7 (b), addendum 10 (b)).
   - SCRATCH's graph-boundary check runs at every `graph_compute`
     (`gs:92459`), and WARNs on any live SCRATCH record ("refusing SCRATCH
     host_zone_boundary_check with N live registered allocations",
     `uc:20290-20298`). That is exactly why the `CpuExpertPool` ring was
     routed to WEIGHT (llama.cpp-cg8j).
-  - C4 adds `alloc_intent::lifetime` with three values. There is **no
-    `PROCESS`**: a process-lifetime allocation has no releasing owner (P2).
+  - C4 adds `alloc_intent::lifetime` with four values, plus the interim
+    marker `UNOWNED` described under the site table, which llama.cpp-30r1
+    deletes. There is **no `PROCESS`**: a process-lifetime allocation has no
+    releasing owner (P2).
     - **`GRAPH`**, the default. The graph-boundary check counts only these
       records.
-    - **`CONTEXT`**. The record also carries its owner, the backend
-      context's id (`ggml_backend_sycl_context`, whose destructor is
-      `gs:43872`, run from `ggml_backend_sycl_free`, `gs:83938`, at
-      `llama_context` free).
+    - **`CONTEXT`**. The record carries its owner, and the owner's
+      boundary is where it is checked:
+      - a record held by a backend context (`readback_staging_handle`,
+        `moe_ids_cache`) carries that `ggml_backend_sycl_context`'s id and
+        is checked in its destructor (`gs:43872`, run from
+        `ggml_backend_sycl_free`, `gs:83938`, at `llama_context` free);
+      - a **host buffer** allocated through a buft (`SYCL_Host` after the
+        load, `SYCL_KV_Host`, `SYCL_HostCompute`) carries the context serial
+        of the `llama_context` that allocated it. The buft call has no
+        context argument, so the serial comes from th32 T6's **context
+        allocation scope**, `thread_local` and RAII-nested, which stamps every
+        host compute buffer the context allocates with (context serial,
+        allocation serial) (th32 2x T6 row, its §5.3 and *§D12h* I-3). T6
+        opens it in `graph_reserve()` and at the scheduler's
+        `alloc_graph` sites; **C4 opens the same scope around
+        `output_reserve`'s allocation and around the memory module's
+        construction** (`src/llama-context.cpp:870`), so the output buffer
+        and the host KV carry the serial too. A post-load host-buffer
+        allocation with no open scope WARNs `[HOST-ZONE] host buffer
+        outside a context scope: <cohort> <bytes>` and aborts under
+        `GGML_SYCL_STRICT_LEASES=1`. These records are checked at the
+        device cache's teardown, not at the context's: the buffers are
+        members of `llama_context` whose destruction order against its
+        backends is not a boundary the backend can see. The WARN names the
+        context serial.
     - **`MODEL`**. The record carries the model's `ModelId`
       (`model-lifecycle.hpp`), whose release is the model-free point.
-  - **Each lifetime keeps a leak check at its owner's boundary.** A
-    `CONTEXT` record still live when its backend context is destroyed, or a
-    `MODEL` record still live when its model is freed, prints `[HOST-ZONE]
-    leaked <CONTEXT|MODEL> record: <cohort> <bytes> owner=<id>`. It is a
+    - **`DEVICE`** (addendum 10 (b)). The owner is that device's
+      `unified_cache` instance, and the check runs at that cache's teardown.
+      It is not the refused `PROCESS`: it has a named owner and a release
+      point, and it is allowed only for a holder whose contents are
+      device-scoped and shared by every context on the device. The module
+      teardown releases every `DEVICE` holder first, through
+      `ggml_sycl_shutdown_global_runtime_pinned_owners` (`gs:7575-7590`,
+      asserted at `gs:84006`), which shuts down `g_cpu_expert_pools[d]`,
+      `g_attn_host_pools[d]` and `g_pinned_buffer_pools[d]` and frees the
+      attention host staging (`ggml_sycl_attn_host_cpu_backend_free`,
+      `gs:82177`, which calls `ggml_sycl_attn_host_staging_free_all`,
+      `gs:82097`), all while the cache is still alive.
+  - **Each lifetime keeps a leak check at its owner's boundary.** A record
+    still live at its owner's boundary prints `[HOST-ZONE] leaked
+    <CONTEXT|MODEL|DEVICE> record: <cohort> <bytes> owner=<id>`. It is a
     WARN that aborts under `GGML_SYCL_STRICT_LEASES=1`, through the existing
     accessor (`strict_lease_checks_enabled`, `uc:12962-12968`).
   - Every non-`GRAPH` row of the census cites its owner.
+- **Sizing: every SCRATCH tenant has a term** (r3 m4). The rerouted
+  tenants used to fit only inside the VRAM-RUNTIME terms folded into host
+  SCRATCH, which were never sized for them.
+  - **Context host buffers** (compute, output): the notified demand above.
+  - **Host KV** (`SYCL_KV_Host`): not SCRATCH at all. The KV zone grows at
+    context init through the miss path (`uc:15418-15437`), one chunk per
+    host-KV buffer that does not fit, and the demotion line prints the bytes
+    first. That is outside the PP/TG phase gate (`pinned-pool.cpp:619-640`).
+  - **`DEVICE` holders** register a demand keyed by (device, holder)
+    through an internal call, `unified_cache_host_scratch_demand(owner,
+    bytes)`, before they allocate, on the same ledger as the context
+    demands. The two pools size their buffers at first `MUL_MAT_ID`
+    initialization (`gs:9024-9037`) from `max_dispatch_count` (top-K times
+    tokens, over the graph's `MUL_MAT_ID` nodes, `gs:8024-8030`), `max_K`
+    and `max_N` (`gs:8018-8023`):
+    - `PinnedBufferPool`: D x (K + N) x 4 B (`pinned-buffer-pool.cpp:38-39`);
+    - `CpuExpertPool`: 4 ring slots x D x (K + N) x 4 B
+      (`cpu-expert-pool.cpp:56-59`, `RING_SLOTS = 4`, `cpu-expert-pool.hpp:89`).
+
+    The attention host staging registers the sum of its slot capacities
+    before each grow, since it grows with `n_kv` (`gs:81970-82060`). So the
+    demand is exact, and its value is printed, not pre-registered.
+  - **`GRAPH` tenants** (the ten `GRAPH` rows of the site table): each is
+    bounded by a named plan term that the census gate records per row:
+    `max_tensor_bytes` + `k_scratch_headroom` for the single-tensor staging
+    copies, `moe_cpu_expert_staging_bytes` + `moe_host_recipe_workspace_bytes`
+    for the MoE staging, and `tp_vram_runtime_bytes` for `TP_TMP`. A `GRAPH`
+    row the gate cannot map to a term is listed **`UNSIZED`** and ratcheted
+    like `UNOWNED`.
+  - **The VRAM-RUNTIME read that stays in host SCRATCH** (addendum 7 (c))
+    then sizes no host tenant: the PP pipeline scratch and the PP MoE oneDNN
+    ring are VRAM allocations (the ring's slots come from the VRAM RUNTIME
+    and KV zones, `uc:18197-18199`). With the terms above it is an idle
+    host reservation (P4). Removing it would amend addendum 7 (c), so it is
+    **brought to the lead**, not changed here.
 - **The site table** (addendum 7 (c)). 5efe owns each host site's role, zone,
   lifetime and sizing, and publishes them here. 23mk owns each site's
   conversion, and its class-H rows (56, 118 and the others) cite this table.
@@ -1089,8 +1335,12 @@ created") describes a path that does not run.
       host-pinned fallback on low free VRAM) and `gs:63226` (the
       tensor-split weight cache). These are the "role-WEIGHT, unplanned"
       rows. None is reached on Qwen's default path, and if one is, the
-      zone-0 criterion catches it;
-    - 35 that change zone, or choose it at the site, tabulated below.
+      zone-0 criterion catches it. **`gs:39954` is also a P3 violation**: a
+      device buffer's bytes in host-pinned memory are read by the GPU in
+      place (zero-copy). That is llama.cpp-nl0f's, beside 23mk's row 56
+      (r3 m6);
+    - 35 that change zone, or choose it at the site, tabulated below, plus
+      the new `SYCL_KV_Host` `alloc_buffer`.
   - Two of the 35 are not tenants: `pinned-pool.cpp:93` is the pool's own
     chunk backing (`require_host_usm_base`, never zone-selected), and
     `uc:16728` is `category_to_intent`, a mapping, not a request.
@@ -1108,40 +1358,58 @@ created") describes a path that does not run.
   | `gs:48239` | `g_tp_*` job slot, consumed and cleared by the TP sync (`gs:48396`) | TP_TMP | SCRATCH | GRAPH | - |
   | `gs:48977` | `g_tp_async_ffn_jobs[layer]` slot, consumed within the graph | TP_TMP | SCRATCH | GRAPH | - |
   | `gs:82678` | local `vh`, waited in-function (`gs:82683`) | COMPUTE | SCRATCH | GRAPH | - |
-  | `gs:42647` | a post-load `SYCL_Host` buffer (compute, output, inputs) | COMPUTE (WEIGHT only in `in_model_load`) | SCRATCH | CONTEXT | the `llama_context` that allocated the buffer |
-  | `gs:42832` | the `SYCL_HostCompute` buffer | COMPUTE | SCRATCH | CONTEXT | the scheduler of its `llama_context` |
+  | `gs:42647` | a post-load `SYCL_Host` buffer (compute, output, inputs) | COMPUTE (WEIGHT only in `in_model_load`) | SCRATCH | CONTEXT | the allocating `llama_context`, by the context allocation scope's serial |
+  | new, `SYCL_KV_Host`'s `alloc_buffer` (C4) | a demoted layer's host KV, and its `idx_` keys | KV | KV | CONTEXT | the allocating `llama_context`, by the context allocation scope's serial |
+  | `gs:42832` | the `SYCL_HostCompute` buffer | COMPUTE | SCRATCH | CONTEXT | the allocating `llama_context`, by the context allocation scope's serial |
   | `gs:44097` | `ggml_backend_sycl_context::readback_staging_handle` | STAGING | SCRATCH | CONTEXT | its backend context (`gs:43872`) |
   | `gs:57647` | `ctx.moe_ids_cache[key]`, or a call-local entry | STAGING | SCRATCH | CONTEXT, or GRAPH for the call-local entry | its backend context |
   | `uc:15652` | the caller's `offload_buffer_lease` | caller's | SCRATCH | caller's | caller's |
-  | `common.cpp:443` | `g_runtime_staging_cache` (file scope) | STAGING | SCRATCH | **none** | **UNOWNED** |
-  | `common.cpp:1970` | `g_tp_host_staging` | TP_TMP | SCRATCH | **none** | **UNOWNED** |
-  | `common.cpp:2083` | `g_tp_quant_comm_bufs` | TP_TMP | SCRATCH | **none** | **UNOWNED** |
-  | `common.cpp:2279` | `g_tp_shared_reduce_handle` | TP_TMP | SCRATCH | **none** | **UNOWNED** |
-  | `common.cpp:2328` | `g_tp_host_buf0/1_handle` | TP_TMP | SCRATCH | **none** | **UNOWNED** |
-  | `cpu-dispatch.cpp:2160` | `g_retained_scratch_lease` | COMPUTE | SCRATCH | **none** | **UNOWNED** |
-  | `cpu-expert-pool.cpp:77` | `g_cpu_expert_pools[dev]` (`gs:2605`), the ring | COMPUTE | SCRATCH | **none** | **UNOWNED** |
-  | `pinned-buffer-pool.cpp:69` | `g_pinned_buffer_pools[dev]` (`gs:2604`) | COMPUTE | SCRATCH | **none** | **UNOWNED** |
-  | `gs:10882` | `g_routing_indices_cache` | STAGING | SCRATCH | **none** | **UNOWNED** |
-  | `gs:21522` | `g_moe_fusions[layer].fused_handle` (`thread_local`, `gs:21664`) | COMPUTE | SCRATCH | **none** | **UNOWNED** |
-  | `gs:62927`, `gs:62942` | `g_split_staging[dev]` (`gs:62915`) | STAGING | SCRATCH | **none** | **UNOWNED** |
-  | `gs:63145` | `g_split_weight_staging` (`gs:63132`) | STAGING | SCRATCH | **none** | **UNOWNED** |
-  | `gs:63548` | `s_second_out_ring_alloc` / `s_cpu_out_ring_alloc` (`gs:62645`) | STAGING | SCRATCH | **none** | **UNOWNED** |
-  | `gs:81996`, `:82016`, `:82027`, `:82045` | `g_attn_host_staging[dev]` (`gs:81948`) | COMPUTE | SCRATCH | **none** | **UNOWNED** |
+  | `cpu-expert-pool.cpp:77` | `g_cpu_expert_pools[dev]` (`gs:2605`), the ring | COMPUTE | SCRATCH | **DEVICE** | that device's `unified_cache` (addendum 10 (b)) |
+  | `pinned-buffer-pool.cpp:69` | `g_pinned_buffer_pools[dev]` (`gs:2604`) | COMPUTE | SCRATCH | **DEVICE** | that device's `unified_cache` (addendum 10 (b)) |
+  | `gs:81996`, `:82016`, `:82027`, `:82045` | `g_attn_host_staging[dev]` (`gs:81948`) | COMPUTE | SCRATCH | **DEVICE** | that device's `unified_cache`; device-shared, see below |
+  | `common.cpp:443` | `g_runtime_staging_cache` (file scope) | STAGING | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | `ggml_backend_sycl_context`, after llama.cpp-30r1 |
+  | `common.cpp:1970` | `g_tp_host_staging` | TP_TMP | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | same |
+  | `common.cpp:2083` | `g_tp_quant_comm_bufs` | TP_TMP | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | same |
+  | `common.cpp:2279` | `g_tp_shared_reduce_handle` | TP_TMP | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | same |
+  | `common.cpp:2328` | `g_tp_host_buf0/1_handle` | TP_TMP | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | same |
+  | `cpu-dispatch.cpp:2160` | `g_retained_scratch_lease` | COMPUTE | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | same |
+  | `gs:10882` | `g_routing_indices_cache` | STAGING | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | same |
+  | `gs:21522` | `g_moe_fusions[layer].fused_handle` (`thread_local`, `gs:21664`) | COMPUTE | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | same |
+  | `gs:62927`, `gs:62942` | `g_split_staging[dev]` (`gs:62915`) | STAGING | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | same |
+  | `gs:63145` | `g_split_weight_staging` (`gs:63132`) | STAGING | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | same |
+  | `gs:63548` | `s_second_out_ring_alloc` / `s_cpu_out_ring_alloc` (`gs:62645`) | STAGING | WEIGHT until llama.cpp-30r1 | **UNOWNED**, target CONTEXT | same |
 
-  - **14 holders (18 lines) are UNOWNED, and are brought to the lead**
-    (addendum 7 (b)). Each keeps its handle in a file-scope static or a
-    `thread_local`, so it has no context owner and no model owner.
-    - They cannot take `GRAPH`, because they outlive the graph and would trip
-      the boundary check at every `graph_compute`.
-    - They have no `CONTEXT` or `MODEL` owner to cite.
-    - Two of them are on Qwen's default path: the `CpuExpertPool` ring and
-      `PinnedBufferPool`, both per-device process globals.
-    - The design assigns them no lifetime. The ruling is the lead's. The
-      likely owner is `ggml_backend_sycl_context` (`CONTEXT`), which would
-      move each global into the backend context. That is a refactor of 14
-      holders, which this design does not size.
-    - Until the ruling, C4's census gate lists them as `UNOWNED`, and fails
-      on any **new** `UNOWNED` row.
+  - **Addendum 10 (b) rules the 14 holders (18 lines) that rev 3c brought to
+    the lead.** Each gets an owner; the refactor that moves them is
+    **llama.cpp-30r1**, not 5efe's.
+    - **`DEVICE`, landed in C4:** the `CpuExpertPool` ring and
+      `PinnedBufferPool`, per the ruling, and the attention host staging,
+      under the ruling's own clause ("if one of them turns out to be
+      device-shared, it becomes DEVICE, with the reason stated"). The
+      reason: `g_attn_host_staging[dev][kind]` is indexed by device, its
+      slots keep a grow-only capacity that every context's host attention
+      on that device reuses (`gs:81970-82060`), and it is released only by
+      the module teardown above. All three already have their owner (the
+      device's cache) and their release point, so C4 sets `lifetime =
+      DEVICE` on their requests, and moving the holders is not needed. C4
+      needs this now because the pools are on Qwen's default path, and the
+      attention staging is on every no-`-c` arm's path: demoted layers run
+      their attention on the CPU through it (`gs:82445-82450`,
+      `:82640-82645`, `:82842-82844`). Left `GRAPH` in SCRATCH, each would
+      trip the boundary WARN at every `graph_compute`.
+    - **`CONTEXT`, pending llama.cpp-30r1:** the other 11 holders (12
+      lines). Their handles live in file-scope statics or a `thread_local`,
+      so no backend context holds them yet, and stamping them `CONTEXT`
+      before 30r1 moves them would make the owner check fire on every
+      context free. So until 30r1 lands they carry the interim value
+      **`UNOWNED`**, which `select_zone` sends to WEIGHT, where each lands
+      today, and which no boundary check counts. That is today's behaviour
+      made explicit, not a new lifetime: 30r1 deletes the value. None of
+      them is on a C4 lead arm's path, and if one is, the zone-0 criterion
+      catches it.
+    - **The ratchet** (accepted in addendum 10 (b)): C4's census gate fails
+      on any request site carrying `UNOWNED` that is not one of these 12
+      lines, and it cites llama.cpp-30r1 in the failure message.
 - **Host SCRATCH reads RUNTIME through 23mk's function, not a copy**
   (addendum 7 (c)).
   - The fold at `uc:27727-27730` today reads plan fields:
@@ -1169,10 +1437,41 @@ created") describes a path that does not run.
     SCRATCH changes by 0.6 MB minus `moe_vram_runtime_bytes`, which is at
     most +0.6 MB. The base pre-size stays at or below 7923.7 MB, which is
     still 4 chunks.
-- **The criterion** (C4 lead run). No `Pinned pool grow_zone: zone 0` line
-  appears after the pre-size, through the end of the completion. Zone 0 is
-  WEIGHT (`pinned-pool.hpp:62-67`). SCRATCH (zone 3) may grow only by the
-  notified sum.
+- **The runtime pre-allocate stops carrying the same two terms** (r3 m3, the
+  m-2 pattern).
+  - `ggml_sycl_configure_host_zones_for_plan` pre-allocates a second pinned
+    pool of `onednn_scratchpad_bytes + dma_staging_pool_bytes +
+    pp_pipeline_scratch_bytes + pp_moe_onednn_scratch_bytes`
+    (`gs:5649-5653`). The PP pipeline scratch and the PP MoE oneDNN ring
+    are therefore charged twice on the host: in host SCRATCH through the
+    RUNTIME function, and here. 3c's replacement of the SCRATCH terms did
+    not touch this site, so the double charge was still there.
+  - **One owner: host SCRATCH**, because addendum 7 (c) put the RUNTIME
+    read there. The runtime pool is not where either term is used: once host
+    zones are configured, `host_pool_alloc` (the runtime chunks,
+    `pinned-pool.cpp:209-212`) serves only the KV-zone miss fallback
+    (`uc:15483-15495`); the other callers take it only when zones are not
+    configured (`uc:15440`, `:15492`, `:10565`, `:20614`,
+    `common.hpp:2982`). And both terms are VRAM allocations (above).
+  - C4 drops them from `runtime_bytes`, which becomes
+    `onednn_scratchpad_bytes + dma_staging_pool_bytes`.
+    `reserve_pp_moe_onednn_scratch` (`gs:5654-5681`) is a VRAM reserve and
+    is unchanged.
+- **The criteria** (C4 lead run).
+  - No `Pinned pool grow_zone: zone 0` line appears after the pre-size,
+    through the end of the completion. Zone 0 is WEIGHT
+    (`pinned-pool.hpp:62-67`). Its positive control is the
+    `Pinned pool pre_allocate: grew` line of the same run: both are INFO,
+    so the absence counts only in a run that printed the control (r3 m2).
+  - **SCRATCH (zone 3)** grows only through the notify path: every zone-3
+    `grow_zone` line follows a `[HOST-ARENA] SCRATCH demand` line with
+    `grown` > 0, and is one chunk of `max(2048 MB, align_up(deficit + n x
+    alignment))`. A zone-3 grow from a miss is a FAIL, and names the
+    unplanned tenant by its cohort.
+  - **KV (zone 1)** grows at context init, one chunk per host-KV buffer
+    that does not fit, and the sum of its growth covers the printed host KV
+    (§7 C4 step 3). On a run with no demotion it does not grow.
+  - No `host compute buffer ... exceeds notified` WARN.
 - **The boundary with llama.cpp-23mk** (`docs/design/sycl-alloc-zone-routing.md`,
   23mk's worktree; addendum 7 (c)). 23mk routes **device**-scope requests.
   For host sites, 5efe owns role, zone, lifetime and sizing, and publishes
@@ -1180,9 +1479,9 @@ created") describes a path that does not run.
   rows cite that table: the nine host landings this change moves, including
   `cpu-expert-pool.cpp:62`, `pinned-buffer-pool.cpp:88` and the
   `ggml_sycl_attn_host_staging_get` rows (`gs:81783-81832`); row 56, beside
-  `gs:39954`'s host-pinned fallback; and row 118, the DMA staging pool
-  (m-2 below). Host SCRATCH reads the RUNTIME function above, and does not
-  copy it.
+  `gs:39954`'s host-pinned fallback (and llama.cpp-nl0f for the zero-copy
+  read); and row 118, the DMA staging pool (m-2 below). Host SCRATCH reads
+  the RUNTIME function above, and does not copy it.
 
 **The DMA staging pool in mmap mode** (r2 m-2).
 - It is 1700 MB: 2 x `dma_streamed` (`run2.log:2752`), where `dma_streamed`
@@ -1213,14 +1512,23 @@ created") describes a path that does not run.
     SCRATCH. SCRATCH loses the 1700 MB DMA pool (m-2): 7775.9 - 1700.0 =
     6075.9. The base is 64.0 + 64.0 + 1719.2 + 6075.9 = 7923.1 MB, which is
     **4 chunks**, and the log reads `pre_allocate: grew 4 chunks`.
-  - **Runtime** (`pre_allocate_runtime_chunks`, `gs:5648-5652`): oneDNN
-    scratchpad + DMA pool + PP pipeline + PP MoE oneDNN. Run2's need was
-    6056.9 MB (`:2897`), and without the DMA pool it is 4356.9 MB, which is
-    **3 chunks**: `pre_allocate_runtime: grew 3 chunks`.
-  - So `[HOST-ARENA] Committed` reads **14336.0 MB in 7 chunk(s)**, against
-    139264.0 MB in 68 (`run2.log:2900`).
-  - Without m-2 it would be 5 + 3 = 8 chunks, 16384.0 MB. So a reading of 8
-    means the DMA-pool change did not land.
+  - **Runtime** (`pre_allocate_runtime_chunks`, `gs:5649-5653`): today
+    oneDNN scratchpad + DMA pool + PP pipeline + PP MoE oneDNN. Run2's need
+    was 6056.9 MB (`:2897`): 1700.0 of DMA pool, 0.0 + 4265.0 of the two PP
+    terms (`run2.log:2732`), so 91.9 MB of oneDNN scratchpad. C4 drops the
+    DMA pool (m-2) and the two PP terms (r3 m3), so the need is **91.9 MB,
+    1 chunk**: `pre_allocate_runtime: grew 1 chunks`.
+  - So `[HOST-ARENA] Committed` reads **10240.0 MB in 5 chunk(s)**, against
+    139264.0 MB in 68 (`run2.log:2900`). rev 3c's 7 chunks, 14336.0 MB, kept
+    the double charge.
+  - **The reading names what did not land:**
+
+    | lands | base | runtime | Committed |
+    |---|---|---|---|
+    | m-2 and m3 (C4 as specified) | 4 (7923.1) | 1 (91.9) | 5 chunks, 10240.0 MB |
+    | m-2 only | 4 (7923.1) | 3 (4356.9) | 7 chunks, 14336.0 MB |
+    | m3 only | 5 (9623.1) | 1 (1791.9) | 6 chunks, 12288.0 MB |
+    | neither | 5 (9623.1) | 3 (6056.9) | 8 chunks, 16384.0 MB |
 - **Falsifiers.**
   - A WEIGHT zone above 64.0 MB must equal 64 MiB + 1.2 x the reordered-expert
     bytes, and the placement report must print that sum. Otherwise the split
@@ -1773,7 +2081,11 @@ false for null (`binbcast.cpp:394`), and then uses null as the kernel source.
 - **Where the lead reads both counters** (r2 m-18). One line,
   `[FILE-MAPPED] counters: stream_dma_refusals=%llu
   device_copies_outside_materialization=%llu`, printed through
-  `GGML_LOG_WARN`, so it survives default verbosity:
+  `GGML_LOG_WARN`. WARN maps to `LOG_LEVEL_WARN` (2) (`common/log.cpp:533`),
+  so it survives `llama-completion`'s default threshold, `LOG_LEVEL_INFO`
+  (3, `common/log.cpp:30`). It does **not** survive `llama-cli`'s, which is
+  `LOG_LEVEL_ERROR` (1, `tools/cli/cli.cpp:36`), so every `llama-cli` arm
+  that reads it passes `-lv 4` (§7, r3 C). It prints:
   - once at the end of `ggml_backend_sycl_model_load_end`, after the
     preload, so a killed run still has one;
   - once at model unload.
@@ -1872,6 +2184,29 @@ The lead's GPU runs share one protocol (r1 I-7):
   `src/llama-context.cpp:5091`) must set `n_ctx = 0` explicitly (`:540`), and
   is **VOID** unless `llama_n_ctx(ctx) == n_ctx_train`. No 5efe test is such
   an arm today. The rule binds any that is added.
+- **Verbosity is part of the vehicle** (r3 C, m2). A criterion that reads a
+  log line is void if the vehicle drops that line's level, and an absence
+  criterion then passes vacuously.
+  - `common_log`'s default callback prints a line only at `verbosity <=
+    common_log_verbosity_thold` (`common/log.cpp:542-546`). GGML INFO maps
+    to 4 and WARN to 2 (`:532-533`).
+  - `llama-completion` keeps the default threshold, 3 (`common/log.cpp:30`,
+    `LOG_DEFAULT_LLAMA`), so it prints WARN and drops INFO. The Qwen arms
+    read INFO lines (`pre_allocate`, `configured zones`, the `SCRATCH
+    demand` line), so they pass **`-v`**, as run2 did.
+  - `llama-cli` sets `params.verbosity = LOG_LEVEL_ERROR` (1) before it
+    parses (`tools/cli/cli.cpp:36`), so it drops WARN too, the demotion line
+    (`gs:18382`) and `[FILE-MAPPED] counters` included. `-lv N` overrides it:
+    `common_params_parse_ex` first sets the threshold from that default
+    (`common/arg.cpp:769`), and the `-lv` handler, which runs while the
+    arguments are parsed afterwards, sets both `params.verbosity` and the
+    threshold (`:3950-3962`). So **every `llama-cli` arm passes `-lv 4`**,
+    which admits WARN and INFO.
+  - `-lv 4` does not move the digit scoring. The answer is console output
+    on stdout (`common/console.cpp:75`, `:1145-1149`), and every log line
+    goes to stderr (`common/log.cpp:113-116`). The arm captures the two
+    streams to **separate files** and scores `grep -cx '1, 2, 3, 4, 5'` on
+    the stdout file only, since a merged capture can tear the answer line.
 - llama.cpp-uize part 3 has landed (`35ce2e65f`, `812c7d790`, `7259727e6`,
   `ae4204ba7`, all in this tree). So a KV cache that does not fit VRAM is
   re-placed to the host tier, and its layers' attention runs on the CPU. The
@@ -1948,6 +2283,16 @@ The lead's GPU runs share one protocol (r1 I-7):
       to `llama_mmap`, agree with the record. `any()` is false when `taker`,
       and under `no_alloc`. `add()` accepts exactly the `LAZY_READ` rows,
       under every mode value `lazy_read` holds.
+    - **The fit-pass invariant** (r3 m1; `lml:1775`). With `w = nullptr`
+      (the `no_alloc` call), `add()` returns true for a `LAZY_READ` row and
+      leaves membership empty; with a weight it returns true and inserts the
+      name. **RED mutant:** rev 3c's `w != nullptr` term in the decision,
+      under which the `no_alloc` call returns false for the `LAZY_READ` row.
+    - **The per-model line** (th32 2x). The pre-fill prints exactly one
+      `lazy-range record: mode_pre=<m> mode_post=<m> taker=<0|1>` line per
+      model, read through a callback installed with `llama_log_set`, and it
+      prints even for a model with no declared name. In the addendum-4
+      witness cell it reads `mode_pre=auto mode_post=off taker=1`.
     - **RED** is a mutant, compiled into the test binary only. libllama has
       no private-testing switch, so the test links a copy of the record and
       `lazy_read` sources built with a test-local define. In it
@@ -2014,6 +2359,15 @@ The lead's GPU runs share one protocol (r1 I-7):
     - **`taker`** is assigned from `sycl_model_loading_guard.active`, and no
       pre-fill input names `llama_model_sycl_hooks_enabled`. Mutant: the
       process-level selector (addendum 5's RED);
+    - **T6a's third argument is exactly `taker ? true :
+      llama_mmap::SUPPORTED`** (th32 2x, its §4.1 and T6a row). Two mutants
+      must each fail the clause: the argument always `llama_mmap::SUPPORTED`
+      (the taker loses its no-mmap eligibility, addendum 6 (1)), and always
+      `true` (the non-taker marks a table lazy that `lazy_read` cannot map).
+      A source clause is the only discriminator: `llama_mmap::SUPPORTED` is
+      a constant `true` wherever `_POSIX_MEMLOCK_RANGE` or `_WIN32` is
+      defined (`src/llama-mmap.cpp:711-715`), so on Linux and Windows no
+      runtime test can tell either mutant from GREEN;
     - `mode_pre` is captured before the call to `llama_lazy_mode_resolve`, and
       the pre-fill runs after the guard and before
       `llama_model_sycl_compute_early_plan`;
@@ -2036,6 +2390,9 @@ The lead's GPU runs share one protocol (r1 I-7):
     16 GiB.
   - **W1, lazy enabled, the taker.** Qwen on the B70 with **no** `-lm`/`-lzm`
     flags. Kill it as soon as the log shows all of:
+    - the per-model line `lazy-range record: mode_pre=auto mode_post=auto
+      taker=1` (C1's `mmap_support` keeps `mode_post` at `auto` on a discrete
+      card);
     - the pre-fill line `lazy-range record: per_layer_token_embd.weight
       (51880 MiB) eligible=1 deferral=STORAGE taker=1 mode=auto`;
     - the early `[SYCL-PLAN] Host staging zone` line;
@@ -2045,7 +2402,8 @@ The lead's GPU runs share one protocol (r1 I-7):
     Pre-registered: early `per_inflight` ≤ 1800 MB, and early host total =
     102383.5 MB ± 0.1 MB.
   - **W2, the ineligible case** (th32 r19 M-1). The same with `-lzm off`, so
-    the row is ineligible. The pre-fill line reads `eligible=0 deferral=EAGER
+    the row is ineligible. The per-model line reads `mode_pre=off
+    mode_post=off taker=1`, and the pre-fill line `eligible=0 deferral=EAGER
     taker=1 mode=off`. The early plan must place the table as the ordinary
     weight it is: early `per_inflight` = 103762.3 MB and early host total =
     154263.6 MB, both ± 0.1 MB, the run2 figures (`:243`, `:308`).
@@ -2053,7 +2411,8 @@ The lead's GPU runs share one protocol (r1 I-7):
     `ONEAPI_DEVICE_SELECTOR=level_zero:1`, so the SYCL backend and its hooks
     are registered but the weights are CPU-owned. Kill it at the pre-fill line
     plus `load_mode = mmap`. Pre-registered:
-    - the pre-fill line reads `eligible=1 deferral=LAZY_READ taker=0
+    - the per-model line reads `mode_pre=auto mode_post=auto taker=0`, and
+      the pre-fill line `eligible=1 deferral=LAZY_READ taker=0
       mode=auto`, because C1's `mmap_support` keeps `mode_post` at `auto` on a
       discrete card;
     - **no** `[SYCL-PLAN] Host staging zone` line and **no** early
@@ -2153,15 +2512,42 @@ I-5, §F2). It is the commit that changes every SYCL load.
     - It regenerates §4.4's **site table** from the tree, and fails on any
       difference: each row's holder, role, zone after C4, lifetime and owner.
       23mk's class-H rows cite that table, so the gate is its one source.
-    - Every non-`GRAPH` row names an owner. An `UNOWNED` row not in the
-      table's 18 lines fails, as a ratchet, pending the lead's ruling on
-      them.
-    - `select_zone` has no category clause for WEIGHT.
+    - Every non-`GRAPH` row names an owner. A request site carrying
+      `UNOWNED` that is not one of the table's 12 lines fails, as a ratchet,
+      and the message cites llama.cpp-30r1 (addendum 10 (b)). A `GRAPH` row
+      with no plan term is listed `UNSIZED` and ratcheted the same way (r3
+      m4).
+    - The three `DEVICE` holders' requests set `lifetime = DEVICE`, and
+      `ggml_sycl_shutdown_global_runtime_pinned_owners` still releases each
+      of them (`gs:7575-7590`).
+    - `select_zone` has no category clause for WEIGHT, and sends `UNOWNED`
+      to WEIGHT.
     - `SYCL_Host` takes role `WEIGHT` only under `in_model_load`.
+      `SYCL_KV_Host` has its own `alloc_buffer`, with role `KV`, and keeps
+      its own `get_name` (r3 B).
+    - Each of `SYCL_Host`, `SYCL_KV_Host` and `SYCL_HostCompute` builds its
+      intent in one function that its `alloc_buffer` and its `get_max_size`
+      both call, and `get_max_size` passes that intent to `select_zone`; no
+      `get_max_size` names a zone. This amends
+      `tests/test-sycl-host-zone-config-source-contract.py`.
     - `llama_context` calls `ggml_backend_sycl_notify_host_buffer_sizes`
       through the registry's proc address, and nothing in `src/` calls
       `ggml_backend_sycl_notify_compute_buffer_sizes` (its VRAM half is not
       5efe's).
+    - **The notify is ordered before the allocation it covers** (r3 A.2):
+      in `output_reserve`, between the free of the old buffer and
+      `ggml_backend_buft_alloc_buffer`; in `sched_reserve`, after the
+      size-only `graph_reserve(..., true, sizes)` calls and before the first
+      allocating one. It is called with one backend, `model.devices[0]`'s,
+      not in a loop over backends (r3 A.5).
+    - `ggml_backend_sycl_notify_host_buffer_sizes` tests
+      `ggml_backend_is_sycl(backend)` before it reads `backend->context`
+      (r3 A.4).
+    - `runtime_bytes` in `ggml_sycl_configure_host_zones_for_plan` names
+      neither `pp_pipeline_scratch_bytes` nor `pp_moe_onednn_scratch_bytes`
+      (r3 m3).
+    - The inventory's `kv_idx_width` is declared after `kv_layer_count`,
+      and both demotion sites read `kv_demand_for_layer` (r3 B).
     - The new entry point's parameters are scalars: no pointer and no struct
       in its signature, in either the header or the `llama_context` function
       pointer type (the dlopen shape).
@@ -2176,23 +2562,55 @@ I-5, §F2). It is the commit that changes every SYCL load.
       - `moe_vram_runtime_bytes` added back beside the function (a copied
         term);
       - a new file-scope static holder added at a `HOST_COMPUTE` site (a new
-        `UNOWNED` row).
+        `UNOWNED` row);
+      - the notify moved after `ggml_backend_buft_alloc_buffer` in
+        `output_reserve` (r3 A.2);
+      - `SYCL_Host`'s `get_max_size` with WEIGHT hard-coded again;
+      - `pp_moe_onednn_scratch_bytes` restored in `runtime_bytes` (r3 m3).
   - `test-sycl-host-zone-select` (`sycl;host`). It is a pure test of the
     extracted `select_zone`, over role x category x `kv_spill_to_host`, and
     of the lifetime checks over a fake registry.
     - It covers every row of §4.4's routing.
-    - The graph-boundary check: a `CONTEXT` record and a `MODEL` record pass
-      it, and a `GRAPH` record trips it.
+    - The graph-boundary check: a `CONTEXT`, a `MODEL`, a `DEVICE` and an
+      `UNOWNED` record pass it, and a `GRAPH` record trips it.
+    - Role `KV` from the `SYCL_KV_Host` intent selects zone 1, and the
+      post-load `SYCL_Host` intent selects zone 3.
     - **The owner-boundary checks** (addendum 7 (b)):
       - a `CONTEXT` record live at its context's destruction prints the
         `[HOST-ZONE] leaked CONTEXT record` WARN, naming the cohort, the
         bytes and the owner. Under `GGML_SYCL_STRICT_LEASES=1` it aborts, in
         its own process, scored on rc 134 plus that text;
       - a `MODEL` record live at its model's free does the same;
+      - a `DEVICE` record live at its cache's teardown does the same
+        (addendum 10 (b));
+      - a host-buffer `CONTEXT` record stamped with a context serial that is
+        still live at the device cache's teardown does the same, naming the
+        serial;
       - a record owned by a **different** context or model does not fire,
         which is the multi-model case.
     - Mutant: the owner check keyed by lifetime alone, which fires on
       another context's live record.
+  - `test-sycl-host-scratch-demand` (`sycl;host`, r3 A). A pure test of the
+    demand ledger behind `ggml_backend_sycl_notify_host_buffer_sizes`, over a
+    fake zone that records `grow_zone` calls:
+    - a context's second notify replaces its first: (100, 10) then (300, 10)
+      grows for 310 in total, not 410;
+    - two contexts sum, and one `grow_zone` call is made per notify whose
+      sum exceeds `grown_for_demands`; a context's demand dropped at its
+      destructor does not shrink the zone, and a later context of the same
+      size grows nothing;
+    - the request is the deficit plus one `DEFAULT_ALIGNMENT` per buffer at
+      the chunk cap, and a `DEVICE` holder's demand is on the same ledger;
+    - a non-SYCL backend is refused with the WARN and records nothing.
+    - **Mutants:** accumulate instead of replace (the r3 A.2 double
+      growth); one grow per SYCL backend (the r3 A.5 N-times growth).
+  - `test-sycl-kv-demand-idx` (`sycl;host`, r3 B). A pure test of
+    `kv_demand_for_layer` on a 48-layer plan with Qwen's shape: 12 FULL
+    layers of 512 MiB at 262144 cells, `kv_idx_width` 128. Each carries 576
+    MiB, and a 0 width gives 512. Fed to `plan_runtime_kv_demotion` with 287.8
+    MB of room, it demotes 12 layers, 3..47, with 6912.0 MB of host KV.
+    Mutant: the demotion input reading `kv_size_for_layer`, which prints
+    6144.0.
   - `test-sycl-getrows-refusal-terminal` (`sycl;host`, a fake `stream_dma`,
     r2 m-5). One refusal gives one call, one counted refusal, no
     `[GET_ROWS] DMA retry` line, and the CPU fallback.
@@ -2211,7 +2629,8 @@ I-5, §F2). It is the commit that changes every SYCL load.
     B70 budget):
     - with `load_maps_files` true: host experts are `FILE_MAPPED`,
       `weight_host_bytes` = 0, `host_mapped_bytes` = 102383.5 MB, the WEIGHT
-      zone is 64 MiB, the DMA pool is 0, and base + runtime = 4 + 3 chunks;
+      zone is 64 MiB, the DMA pool is 0, the runtime pre-allocate is 91.9
+      MB, and base + runtime = 4 + 1 chunks (r3 m3);
     - with it false: today's 122924.2 MB zone and 1700 MB DMA pool;
     - with mlock: the mapped bytes are charged.
 
@@ -2248,8 +2667,11 @@ I-5, §F2). It is the commit that changes every SYCL load.
   1. `POSIX_FADV_DONTNEED` over shard 3, then `fincore` on it. Pre-registered:
      ≤ 1 MiB resident.
   2. **Qwen3.8 Q8_0 on `level_zero:0`, default load flags, `-c 4096`, the
-     baseline completion** (`llama-completion -p 'The capital of France is'
-     -n 32 --seed 42 --temp 0`).
+     baseline completion**: `llama-completion -m <Qwen3.8 Q8_0> -no-cnv -v
+     -c 4096 -p 'The capital of France is' -n 32 --seed 42 --temp 0`, the
+     run2 vehicle (r3 m2). `-v` is required: the zone, pre-size and demand
+     criteria below read INFO lines, which `llama-completion` drops at its
+     default threshold (§7 preamble).
 
      **Precondition** (§3.1, the C1-to-T6 window; accepted in addendum 8 (b)). th32
      T6 and T7 are on the tree, so the PLE table is taken by T6 and gathered
@@ -2262,12 +2684,25 @@ I-5, §F2). It is the commit that changes every SYCL load.
      - the load completes and prints coherent text;
      - `[HOST-ARENA] configured zones: WEIGHT=64.0 MB`;
      - `Pinned pool pre_allocate: grew 4 chunks`,
-       `pre_allocate_runtime: grew 3 chunks`, and `Committed 14336.0 MB in 7
-       chunk(s)` (§4.4; r2 I-1);
+       `pre_allocate_runtime: grew 1 chunks`, and `Committed 10240.0 MB in 5
+       chunk(s)` (§4.4; r2 I-1, r3 m3). A reading of 6, 7 or 8 chunks names
+       what did not land, by §4.4's table;
      - `DMA staging pool: 0.0 MB`;
      - **no `Pinned pool grow_zone: zone 0` line after the pre-size**, through
-       the end of the completion. `[HOST-ARENA] SCRATCH zone grown by` equals
-       the notified compute-buffer sum (r2 I-2);
+       the end of the completion (r2 I-2). This absence counts only because
+       the same run printed the `Pinned pool pre_allocate: grew` line above,
+       its positive control at the same INFO level (r3 m2);
+     - **SCRATCH is scored by chunks** (r3 A.3). Every `Pinned pool
+       grow_zone: zone 3` line follows a `[HOST-ARENA] SCRATCH demand` line
+       whose `grown` is positive, and reads `max(2048.0, align_up(deficit +
+       n x alignment))` MB for that line's deficit. A zone-3 grow with no
+       demand line before it is a miss, and FAILs naming the tenant's
+       cohort. The demand lines print the compute and output figures; they
+       are read from the run, not pre-registered, since run2 was killed
+       before its scheduler reserve;
+     - no `host compute buffer ... exceeds notified` WARN (r3 A.2);
+     - **no zone-1 growth**: at `-c 4096` nothing is demoted, so `Pinned pool
+       grow_zone: zone 1` is absent (with the same positive control);
      - the early and late `[PLACEMENT] Totals` both print charged host 0 and
        mapped 102383.5 MB. The early `Host staging zone` has `per_inflight`
        ≤ 1800 MB;
@@ -2303,7 +2738,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
        (`src/models/qwen4exp.cpp:132-134`), and the interval is 4
        (`run2.log:37`). So layers 3, 7, ..., 47 carry it. Each holds
        262144 x (512 + 512) x 2 B = 512 MiB (`run2.log:146-147`). That is
-       **6144 MiB** in all, plus a small recurrent state.
+       **6144 MiB** of main KV.
+     - **The indexer** (r3 B). The `idx_` cache covers the same 12 layers
+       (`lm:3580-3585`), K only, `indexer_head_size` 128: 262144 x 128 x 2 B
+       = 64 MiB per layer, **768 MiB** in all. After C4 it is in the demand
+       (§4.4), so each KV layer is 576 MiB, and **6912 MiB** in all. The
+       recurrent state is device-resident and not in the figure (§4.4).
      - The SYCL planner's KV sizing counts all 48 layers (`run2.log:217`,
        `:307`). At 262144 that would claim 24576 MiB. That over-count is
        **llama.cpp-0edf**, outside 5efe.
@@ -2311,47 +2751,67 @@ I-5, §F2). It is the commit that changes every SYCL load.
        (`kv_weight_capacity`, `kv-runtime-demotion.cpp:58`). In run2 the shared
        zone was 25519.0 MB (`run2.log:227`) and device weights 25231.2 MB
        (`:308`), with optional layouts 0.0. So the room is at most 287.8 MB,
-       less than one 512 MiB layer, and no layer that carries KV stays on the
+       less than one 576 MiB layer, and no layer that carries KV stays on the
        device.
      - Demotion walks layers latest first, and skips layers with 0 recorded
        bytes (`kv-runtime-demotion.cpp:19-45`).
      - **Two pre-registered outcomes, and which one prints is 0edf's
        discriminator:**
-       - real hybrid sizing: `12 layer(s) demoted, 0 SWA (6144.0 MB host KV,
-         layers 3..47)`;
-       - 0edf's over-claim: `48 layer(s) demoted, 0 SWA (24576.0 MB host KV,
-         layers 0..47)`.
+       - real hybrid sizing: `12 layer(s) demoted, 0 SWA (6912.0 MB host KV,
+         layers 3..47)`. **PASS.**
+       - 0edf's over-claim: `48 layer(s) demoted, 0 SWA (27648.0 MB host KV,
+         layers 0..47)`, 48 x 576. The indexer term follows the planner's
+         KV-layer set, so it scales with the over-claim. **This is a FAIL**
+         (r3 n1): the plan then prints 27648 MiB of host KV while the load
+         pins 6912, which is plan != reality (P4). It is attributed to
+         llama.cpp-0edf and is not a 5efe regression; whether it blocks the
+         merge is the lead's call.
+       - Without C4's indexer term, the two lines would read 6144.0 and
+         24576.0. Either figure is a FAIL of the r3 B change.
 
        The MB figures are MiB, the unit the existing demotion lines print (29
        Mistral layers at 32768 print 3712.0).
      - **General rule, if the printed `F` differs.** With `K = floor(F /
-       512)`, real sizing gives `N = 12 - K`, layers `3 + 4K..47`; the
-       over-claim gives `N = 48 - K`, layers `K..47`. Any other N or range is
-       a FAIL.
+       576)`, real sizing gives `N = 12 - K`, layers `3 + 4K..47`, and
+       `N x 576` MB; the over-claim gives `N = 48 - K`, layers `K..47`. Any
+       other N, range or figure is a FAIL.
      - **The criteria:**
        - every criterion of step 2 that does not depend on `n_ctx` holds;
-       - the KV zone (zone 1) grows by at most the printed host KV;
-       - `MemAvailable` stays above 25 GiB. With 0edf's figure that is 24 GiB
-         more pinned host KV, which fits: step 2's pinned total is 14 GiB,
-         and `MemAvailable` before the load was 155.0 GiB (`run2.mem`);
+       - **the KV zone (zone 1) must grow, scored by chunks** (r3 B). The
+         main KV reaches `SYCL_KV_Host` as three 2048 MiB buffers and the
+         indexer as one 768 MiB buffer (§4.4, the chunk cap), and none fits
+         the 64 MiB base. So the run prints **four** `Pinned pool grow_zone:
+         zone 1 grown by 2048.0 MB (1 new chunks, ...)` lines at context
+         init, 8192.0 MB in all, which covers the printed 6912.0. Fewer lines,
+         any zone-3 growth that is not a demand line, or a `SYCL_KV_Host`
+         buffer outside zone 1 is a FAIL. The arm sets
+         `GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1` (`uc:3990`), whose per-allocation
+         line names the zone;
+       - no `[HOST-ZONE] leaked` line at context free;
+       - `MemAvailable` stays above 25 GiB. The load pins 8 GiB of zone-1
+         chunks on top of step 2's 10 GiB, and `MemAvailable` before the
+         load was 155.0 GiB (`run2.mem`);
        - a `runtime KV update rejected` line is a FAIL.
   4. The Mistral gate on `:1` and `:0` (default context).
-  5. The GPT-OSS gate on `:1`, in two arms, each under `timeout 60` and
-     scored with `grep -cx '1, 2, 3, 4, 5'` = 1:
+  5. The GPT-OSS gate on `:1`, in two arms, each under `timeout 60`, **with
+     `-lv 4` added** to the canonical command (r3 C; §7 preamble), stdout and
+     stderr captured to separate files, and scored with `grep -cx '1, 2, 3,
+     4, 5'` = 1 on the stdout file:
      - **the canonical CLAUDE.md `llama-cli` command with `-c 4096`**;
      - **the same with no `-c`**, at `n_ctx = 131072`.
-       - GPT-OSS 20B has 24 layers, with SWA on even layers and full
-         attention on odd ones (`load_swa_pattern(ml, 2)`,
-         `src/models/openai-moe.cpp:9`, whose `dense_first` defaults to false, `llama-model.h:851`; `llama-hparams.cpp:13-16`). Each full
-         layer holds 131072 x 1024 x 2 B = 256 MiB.
-       - uize's recorded refusal on the B50 reads `vram=16569.0 MB (weights
-         13363.7 + kv 3090.0) budget=14828.0` (CLAUDE.md). That leaves
-         14828.0 - 13479.0 = 1349.0 MiB for KV, of which the 12 SWA layers
-         take 18.0.
-       - So 5 full layers stay on the device, and the pre-registered line is
-         `7 layer(s) demoted, 0 SWA (1792.0 MB host KV, layers 11..23)`.
-       - If the printed `F` differs, the rule is `N = 12 - floor((F - 18.0) /
-         256)`, layers `23 - 2(N - 1)..23`.
+       - **The demotion line is zhcn's GDC3 row, cited and not copied**
+         (§M56 (a)). GDC3 is the single source of N, the host-KV figure and
+         the layer range, and of the replay point that scores them. If GDC3
+         changes, this arm changes with it and nothing here is edited.
+       - The line is WARN (`gs:18382`), so without `-lv` (or with `-lv` below
+         2) `llama-cli` drops it and the arm cannot pass on a correct build
+         (r3 C).
+       - **Zone 1 grows**, one `Pinned pool grow_zone: zone 1 grown by
+         2048.0 MB` line per host-KV buffer: GPT-OSS's full-attention K and
+         V tensors are 128 MiB each at 131072 cells, so they pack the 2 GiB
+         chunk cap exactly, and the count is `ceil(M / 2048)` for GDC3's
+         host-KV figure `M`. No zone-3 miss, and no `[HOST-ZONE] leaked`
+         line.
        - A refusal is a FAIL.
 
      Every SYCL load now takes the mapped path.
@@ -2381,9 +2841,20 @@ I-5, §F2). It is the commit that changes every SYCL load.
     available, 20 GiB mapped) it does not WARN, where the P3 constant would.
 - It depends on th32 T2 for `host_ledger_budget()` if T2 has landed.
   Otherwise it edits `uc:4165-4231`, and T2 lifts the result.
-- Lead: the C4 Qwen `-c 4096` run once more, reading `[PLACEMENT] Totals`
-  (the four terms) and the working-set line against the `/proc/meminfo`
-  samples.
+- Lead (r3 E). C5 changes the host budget that uize-demoted host KV is
+  charged against, so it can move KV placement, and every arm that places
+  KV runs at the default context too:
+  - the C4 Qwen `-c 4096` run once more (C4 step 2's command, `-v`),
+    reading `[PLACEMENT] Totals` (the four terms) and the working-set line
+    against the `/proc/meminfo` samples;
+  - **the C4 step-3 Qwen no-`-c` arm**, with its pre-registered line (12
+    layers, 6912.0 MB, layers 3..47) and its zone-1 criterion. A different
+    N under C5's budget is a FAIL of C5, unless the arm prints the budget
+    change that explains it and the general rule of step 3 predicts the
+    printed N from it;
+  - **the C4 step-5 GPT-OSS no-`-c` arm**, with `-lv 4`, scored on zhcn
+    GDC3's line (§M56 (a)) and the digit count on stdout.
+  - The same precondition as C4 steps 2 and 3 applies to both Qwen arms.
 
 **C6. Retire unowned host registration** (§4.8).
 - RED `test-sycl-unregistered-host-refusal` (`sycl;cache;mem-handle`,
@@ -2393,7 +2864,8 @@ I-5, §F2). It is the commit that changes every SYCL load.
 - Lead:
   - the Mistral gate (default context);
   - the GPT-OSS gate in both arms, `-c 4096` and no `-c`, under
-    `timeout 60`, with C4's pre-registered no-`-c` line;
+    `timeout 60`, with `-lv 4` and the stdout-only digit scoring (§7
+    preamble), and the no-`-c` arm scored on zhcn GDC3's line;
   - the C4 Qwen run in both arms.
 
   The refusal must never fire on a real load.
@@ -2467,12 +2939,12 @@ Rows marked "superseded in part" did not hold as written at rev 3a (design-5efe-
 
 | finding | disposition | where |
 |---|---|---|
-| I-1 pre-size omits the runtime pre-allocate | Fixed: the criterion is split, and both numbers are pre-registered from the configure path. The base is 4 chunks and the runtime is 3 chunks, so the pre-registered line is `Committed 14336.0 MB in 7 chunk(s)`. Without m-2's zeroed DMA pool the same arithmetic gives 8 chunks, 16384.0 MB, and that is stated as the discriminator. | §0, §4.4, §7 C4 |
+| I-1 pre-size omits the runtime pre-allocate | Fixed: the criterion is split, and both numbers are pre-registered from the configure path. The base is 4 chunks and the runtime is 3 chunks, so the pre-registered line was `Committed 14336.0 MB in 7 chunk(s)`. **Superseded in rev 3d by r3 m3:** the runtime pool drops the two PP terms, so it is 1 chunk and the line is `Committed 10240.0 MB in 5 chunk(s)`; §4.4's table maps 6, 7 and 8 chunks to what did not land. | §0, §4.4, §7 C4 |
 | I-2 WEIGHT has non-weight tenants; the runtime term has no path | Fixed per the lead's rulings on I-2 and addendum 7 (b)/(c). 5efe routes host-side non-weight requests by role: HOST_COMPUTE and EXPERT_CACHE go to SCRATCH. The rev 3a "runtime term" is withdrawn. The criterion is **no `Pinned pool grow_zone: zone 0` line after the pre-size**. **Sizing:** `ggml_backend_sycl_notify_compute_buffer_sizes` (gs:19103-19146) has no caller, and it also reserves the VRAM arena and sums device buffers into host SCRATCH. So it stays uncalled, and C4 adds the host-only, scalar-ABI `ggml_backend_sycl_notify_host_buffer_sizes(backend, host_compute_bytes, host_output_bytes)`, reached through the proc address; a stale backend yields NULL and a WARN. Whether the old function's VRAM half should get a caller is reported to the lead. **Lifetime** (confirmed over a fifth zone): `alloc_intent::lifetime` {`GRAPH`, `CONTEXT`, `MODEL`}, with no `PROCESS`. The graph-boundary check counts `GRAPH` only. `CONTEXT` is leak-checked at backend-context destruction and `MODEL` at model free, each a WARN that aborts under STRICT_LEASES. **The site table** (35 lines) is published in §4.4, with a holder, role, zone, lifetime and owner per row: 10 `GRAPH`, 4 `CONTEXT`, 1 caller-chosen, 2 non-tenants, and **14 holders (18 lines) UNOWNED**. The UNOWNED rows are file-scope statics and `thread_local`s, including the `CpuExpertPool` and `PinnedBufferPool` rings on Qwen's default path, and are brought to the lead. **23mk:** 5efe owns role, zone, lifetime and sizing, and 23mk owns conversion and cites the table. Host SCRATCH reads `unified_cache_get_planned_runtime_zone_requirement` in place of three copied terms. | §4.4, §7 C4 |
-| I-3 arms 5 and 6 cannot reach the hole interior | Fixed: read-around is centred on the fault, with reach `ra_pages/2`, doubled under `FADV_SEQUENTIAL`, where `ra_pages` comes from the bdi's `read_ahead_kb`. Arms 5 and 6 measure the **edge band** `W = max(2 x read_ahead_kb, 2 MiB)`. The interior is measured by arms 1 and 2 only. Each arm exits 77 if the computed reach does not extend two pages past the shared page. | §4.6, §7 C3 |
+| I-3 arms 5 and 6 cannot reach the hole interior | Fixed: read-around is centred on the fault, with reach `ra_pages/2`, doubled under `FADV_SEQUENTIAL`, where `ra_pages` comes from the bdi's `read_ahead_kb`. Arms 5 and 6 measure the **edge band** `[shared page + 1 page, edge + reach)` at each lazy edge (§4.6). `W = max(2 x read_ahead_kb, 2 MiB)` is a different quantity, the width of the `MADV_RANDOM` window C4 applies at both edges; rev 3c's row gave that name to the band (r3 m5). The interior is measured by arms 1 and 2 only. Each arm exits 77 if the computed reach does not extend two pages past the shared page. | §4.6, §7 C3 |
 | I-4 `MADV_HUGEPAGE` defeats the edge windows | Fixed: `do_sync_mmap_readahead` tests `VM_HUGEPAGE` before `VM_RAND_READ`. So C4 applies `MADV_NOHUGEPAGE` to the `MADV_RANDOM` windows widened to 2 MiB, inside `llama_mmap`'s `HUGEPAGE` advice (`src/llama-mmap.cpp:517-532`). The one-page bound is restated per mapping. A faulting arm with lazy boundaries at 2 MiB + 1 MiB offsets gets a `HUGEPAGE` control mutant. | §4.6, §7 C4 |
 | I-5 the declaration needs a static cross-check | Fixed per the lead ruling, as amended by addenda 5, 7 (a) and 8 (a). The declaration is 5efe's, and th32 consumes it. The final signatures (addendum 8 (a): rev 3c's stand, and th32 does not rename) are `const std::vector<std::string> & llama_model_lazy_tensor_names(llm_arch)`, keyed by (arch, exact name or one `%d`), names only; `struct llama_lazy_tensor_attrs { uint32_t rows_per_token; int32_t consumer_layer; }`; and `llama_model_lazy_tensor_attrs(arch, hparams, name)`, 5efe's. C1's pre-fill stores the attributes on the per-model record entry, and T6 reads `record.attrs(name)`. There is no static table: one that T6 filled would be shared across models (P4). An `LLM_TENSOR_INFOS` column was rejected, and the arch key is required, because `gemma3n.cpp:39` creates the same tensor unflagged. `test-llama-lazy-declaration-source` maps (arch, call site) to entry and back, with four mutants plus a static-attribute-cache mutant. The record test has a two-hparams P4 witness. The runtime abort is kept and is mode-independent. | §3.1, §7 C1 |
-| I-6 no writer for `STORAGE`; eligibility superseded by addendum 3 | Fixed by folding addenda 3 to 6. The pre-fill writes every field once. `lazy_eligible = T6a(taker ? mode_pre : mode_post, size, taker ? true : SUPPORTED)`. `deferral` is `STORAGE` iff eligible and taker, `LAZY_READ` iff eligible and not taker, and `EAGER` otherwise, so `deferral != EAGER` iff eligible. `taker` is `sycl_model_loading_guard.active` (`lm:2228-2230`), not `hooks_enabled()` (rev 3b's `sycl_branch` is withdrawn). The ineligible early-plan witness is a host test plus lead witness W2. th32 is pinned at rev 2w `3afc3b020`. | header, §3.1, §7 C1 |
+| I-6 no writer for `STORAGE`; eligibility superseded by addendum 3 | Fixed by folding addenda 3 to 6. The pre-fill writes every field once. `lazy_eligible = T6a(taker ? mode_pre : mode_post, size, taker ? true : SUPPORTED)`. `deferral` is `STORAGE` iff eligible and taker, `LAZY_READ` iff eligible and not taker, and `EAGER` otherwise, so `deferral != EAGER` iff eligible. `taker` is `sycl_model_loading_guard.active` (`lm:2228-2230`), not `hooks_enabled()` (rev 3b's `sycl_branch` is withdrawn). The ineligible early-plan witness is a host test plus lead witness W2. th32 was pinned at rev 2w `3afc3b020`, and is pinned at rev 2x `90be8e260` since rev 3d. | header, §3.1, §7 C1 |
 | m-1 witness margin | Fixed: the lines are all printed by t = 3.9 s, and chunk 1 is at t = 8.12 s (`run2.log:2827`), a margin of about 4.2 s. `GGML_SYCL_HOST_RESERVE_MB=16384` is added as a belt. | §7 C1 |
 | m-2 idle DMA pool | Fixed: the DMA staging pool is sized 0 when no host weight is `PINNED`-backed, and the `DMA staging pool: 0.0 MB` line is a C4 criterion. | §4.4, §7 C4 |
 | m-3 readers not censused | Fixed: a readers table for `weight_host_bytes`, with each reader's assigned meaning, pinned by the loader source test. | §4.4, §7 C4 |
@@ -2487,14 +2959,14 @@ Rows marked "superseded in part" did not hold as written at rev 3a (design-5efe-
 | m-12 allowlist tokenizer | Fixed: comments and strings are stripped, `mmap (` is matched with a fixture, and a non-listed-file mutant is added. | §4.1, §7 C2 |
 | m-13 AnonPages has no positive control | Fixed: `test-sycl-pinned-meminfo-control` (lead-run) names the counter that pinned host USM lands in. The C4 criterion keys on that counter. If none moves, the test exits 77 and the criterion rests on `Committed` plus `MemAvailable`. | §7 C4 |
 | m-14 residency-test hygiene | Fixed: a non-tmpfs fixture, eviction per arm, `cachestat` through `syscall(__NR_cachestat)`, the `RLIMIT_MEMLOCK` skip, and arm 4 last on a fresh fixture. | §4.6, §7 C3 |
-| m-15 th32 pin | Fixed: re-pinned at rev 2u `0bd69e251` in rev 3b, then at rev 2w `3afc3b020` in rev 3c. | header |
+| m-15 th32 pin | Fixed: re-pinned at rev 2u `0bd69e251` in rev 3b, at rev 2w `3afc3b020` in rev 3c, and at rev 2x `90be8e260` in rev 3d (r3 X7). | header |
 | m-16 map segments | Fixed: exact definitions. Map segments are the union of the buffer's tensor ranges rounded outward, never a complement. `WILLNEED` and lock segments round inward. The pure-function test has a complement mutant. | §4.6, §7 C3 |
 | m-17 counter chokepoints | Fixed: `mem_copy`, `mem_copy_async` and `mem_copy_ptr_async` (`mem-ops.hpp:13-62`), `copy_to_device_async` (uc:10799), and `stream_dma` (uc:13959). | §5.3, §7 C4 |
 | m-18 counter log line | Fixed: `[FILE-MAPPED] counters: stream_dma_refusals=N device_copies_outside_materialization=M`, printed at WARN at load end and at unload. | §5.3, §7 C4 |
 | m-19 non-POSIX builds | Fixed: `load_maps_files` requires the tier to exist in the build (POSIX only). On Windows SYCL it is false, and the no-tier caps path of `lm:2693` applies. | §4.3 |
 | addendum 3 (§F2a I-9): `lazy_eligible` bit | Folded: one bit per row, filled once at the C1 pre-fill by calling T6a's predicate (a): OFF never, AUTO above 4 GiB, ON always, on the pre-fallback mode. Consumers read the bit, and an ineligible row is an ordinary weight. Membership stays flag-based. Data edge: T6a lands no later than C1. | §3.1, §7 C1 |
 | owner ruling: default-context arms | Folded: every Qwen and GPT-OSS gate set has a no-`-c` arm, HARD and scored. The Mistral gate is already default-context. | §0, §7 C4, C6 |
-| correction: uize part 3 landed | Folded: `35ce2e65f`, `812c7d790`, `7259727e6` and `ae4204ba7` are in the base, so a no-`-c` arm expects the `KV overflow re-placed to host tier` line (gs:18382) with a pre-registered N and range. Any refusal line is a FAIL, and so are garbage tokens, an abort, or `Shmem` growth. Qwen: 12 layers, 6144.0 MB, layers 3..47 (real sizing), or 48 layers, 24576.0 MB, layers 0..47 (the over-claim). GPT-OSS on the B50: 7 layers, 1792.0 MB, layers 11..23. | §7 C4 |
+| correction: uize part 3 landed | Folded: `35ce2e65f`, `812c7d790`, `7259727e6` and `ae4204ba7` are in the base, so a no-`-c` arm expects the `KV overflow re-placed to host tier` line (gs:18382) with a pre-registered N and range. Any refusal line is a FAIL, and so are garbage tokens, an abort, or `Shmem` growth. Qwen: 12 layers, layers 3..47 (real sizing), or 48 layers, 0..47 (the over-claim); the figures became 6912.0 and 27648.0 MB in rev 3d with the indexer term (r3 B), and the over-claim outcome is a FAIL attributed to 0edf (r3 n1). GPT-OSS on the B50: rev 3d cites zhcn's GDC3 row and carries no copy of its figures (§M56 (a)). | §7 C4 |
 | llama.cpp-0edf: the x4 hybrid KV over-count | Cited, and kept out of 5efe's scope. The Qwen no-`-c` arm's two pre-registered lines discriminate it, but do not fix it. | §7 C4 |
 
 | addendum 4 (§F2a I-9): which mode feeds the bit | Folded in rev 3c. The pre-fallback capture `mode_pre` is C1's, taken before the moved fallback block. The bit reads `mode_pre` for the taker and `mode_post` otherwise. `deferral` carries only the kind, and `STORAGE` is written at the pre-fill. The drift check is mode-independent, with a RED mutant of rev 3a's form. The required witness is a host arm with `AUTO`, an `mmap_support = false` device and a sparse table above 4 GiB (bit set, early plan excludes it; RED: a post-fallback fill). deepseek41 is dropped from the declaration. The stale "commit 1 does not depend on that" bullet (end of §3) is corrected. | §3, §3.1, §7 C1 |
@@ -2506,3 +2978,36 @@ Rows marked "superseded in part" did not hold as written at rev 3a (design-5efe-
 | addendum 7 (a), (b), (c) | Folded in rev 3c. (a): no mutable static table, and attributes stored on the per-model record entry; the naming follows addendum 8 (a) (see I-5). (b): lifetime {GRAPH, CONTEXT, MODEL}, owner-boundary leak checks, owners cited, UNOWNED rows brought to the lead (see I-2). (c): the published site table, 23mk citing it, and host SCRATCH reading the RUNTIME function, not copying it. The pre-size stays 4 + 3 chunks, since the base moves by at most +0.6 MB. dlopen: the new entry point is scalar-only, under a new name. | §3.1, §4.4, §7 C1, C4 |
 
 | addendum 8 (a), (b) | Folded in rev 3c. (a): rev 3c's `_names`/`_attrs` signatures stand. (b): the C1-to-T6 window is closed by one merge. | §3.1, §7 C4 |
+
+**design-5efe-r3** (reviewed 3763bb164..3b447ee70, with spot-checks of rev 3c;
+0C/5I/7m/1n and contradictions X1-X7), folded in rev 3d:
+
+| finding | disposition | where |
+|---|---|---|
+| r3 A notify unsound: VRAM half, ordering, chunk rounding, unchecked cast, N-times growth | A.1 and A.4 were fixed in rev 3c (the host-only, scalar-ABI entry point under a new proc name); rev 3d adds the `ggml_backend_is_sycl` test before `backend->context` is read (`gs:107651`). **A.2:** the notify now precedes each allocation it covers: in `output_reserve` between the old buffer's free (`src/llama-context.cpp:3550`) and the allocation (`:3566`), and in `sched_reserve` after size-only `graph_reserve(..., true, sizes)` calls (`ggml_backend_sched_reserve_size`, `:3908-3910`) and before the first allocating reserve (`:2055`); a WARN compares the allocated size with the notified one. **A.3:** SCRATCH is scored by chunks, one `grow_zone` of `max(2048 MB, align_up(deficit + n x alignment))` (`pinned-pool.cpp:613-712`, `:798-803`). **A.5:** one demand per `llama_context`, keyed by one backend context, replaced on re-notify and dropped at that context's destructor; the global zone grows by `sum - grown_for_demands`. `test-sycl-host-scratch-demand` has the accumulate and per-backend mutants. | §4.4, §7 C4 |
+| r3 B demoted host KV routed to SCRATCH; zone-1 criterion vacuous; the indexer omitted | Fixed per the lead's ruling. `SYCL_KV_Host` gets its own `alloc_buffer` with role `KV`, zone 1, lifetime `CONTEXT` (it copied `SYCL_Host`'s iface, `gs:42750-42758`). The qwen4exp `idx_` cache (`src/llama-memory-hybrid-idx.cpp:45-67`, `lm:3580-3585`) takes the same path, and the demotion counts it through `kv_idx_width`, a `uint32_t` in the inventory's tail padding (measured: `sizeof` stays 176), and `kv_demand_for_layer`. Qwen's no-`-c` line is 12 layers, 6912.0 MB, 3..47. Zone 1 must grow, scored by chunks: four 2048.0 MB `grow_zone: zone 1` lines. "Plus a small recurrent state" is withdrawn: the recurrent state is device-resident (`src/llama-memory-recurrent.cpp:97-103`). | §4.4, §7 C4 |
+| r3 C `llama-cli` drops WARN | Fixed. `tools/cli/cli.cpp:36` sets `LOG_LEVEL_ERROR` before parsing; `-lv N` overrides it, since the parser sets the threshold from the default first (`common/arg.cpp:769`) and the `-lv` handler sets it again (`:3950-3962`). Every `llama-cli` arm passes `-lv 4`. The digit scoring is unaffected because the answer is stdout (`common/console.cpp:75`) and logs are stderr (`common/log.cpp:113-116`); the arms capture them separately. The `[FILE-MAPPED] counters` claim is scoped to `llama-completion`. | §4.6 counters, §7 preamble, C4 step 5, C5, C6 |
+| r3 D the C1-to-T6 window | Closed in rev 3c by addendum 8 (b), and the verdict's 3c spot-check confirms it: C1 and T6 merge together, the tracker blocks C1's merge on T6, and W1 kills on `deferral=STORAGE taker=1`. | §3.1, §7 C1 |
+| r3 E C5 has no no-`-c` arm | Fixed: C5's lead runs add the C4 step-3 Qwen arm and the step-5 GPT-OSS arm with `-lv 4`. | §7 C5 |
+| r3 m1 `add()`'s `w != nullptr` breaks the fit pass | Fixed: `add()` returns `deferral == LAZY_READ` alone, and inserts into membership only when `w` is non-null, so the `no_alloc` fit pass still reads the table as lazy (`lml:1775-1776`). The "as today" wording is gone. A RED mutant restores the rev 3c term. | §3.1, §7 C1 |
+| r3 m2 Qwen arms' vehicle and `-v` | Fixed: `llama-completion -no-cnv -v`, and the zone-0 absence counts only beside its `pre_allocate` positive control. | §7 preamble, C4 step 2 |
+| r3 m3 double charge of the PP terms | Confirmed still present in rev 3c: the runtime pre-allocate (`gs:5649-5653`) kept `pp_pipeline + pp_moe_onednn`. One owner, host SCRATCH (addendum 7 (c)); the runtime pool, which after zone configuration serves only the KV-zone miss fallback (`uc:15483-15495`), drops them. Re-derived: base 4 chunks + runtime 1 chunk (91.9 MB) = **5 chunks, 10240.0 MB**; 6, 7 and 8 chunks name what did not land. Both PP terms are VRAM allocations (`uc:18197-18199`), so the RUNTIME read left in host SCRATCH sizes no host tenant; removing it would amend addendum 7 (c) and is brought to the lead. | §0, §4.4, §7 C4 |
+| r3 m4 rerouted SCRATCH tenants have no sizing term | Fixed: context buffers are the notified demand; `DEVICE` holders register a demand before allocating (the pool formulas from `gs:8018-8030`, `pinned-buffer-pool.cpp:38-39`, `cpu-expert-pool.cpp:56-59`); host KV sizes zone 1 through the miss path at context init; each `GRAPH` row maps to a named plan term or is ratcheted `UNSIZED`. | §4.4, §7 C4 |
+| r3 m5 I-3 row misnames the band | Fixed in the I-3 row above: the band is `[shared page + 1 page, edge + reach)`, and `W` is the `MADV_RANDOM` window. | Appendix B |
+| r3 m6 `gs:39954` is a P3 zero-copy pattern | Fixed: the site table cites llama.cpp-nl0f beside 23mk's row 56. | §4.4 |
+| r3 m7 proc-address name | Fixed in rev 3c; the r3 spot-check confirms it. | §4.4 |
+| r3 n1 0edf outcome | Changed per the lead: the 48-layer line (27648.0 MB with the indexer) is a **FAIL**, plan != reality, attributed to llama.cpp-0edf and not a 5efe regression. | §7 C4 step 3 |
+| r3 X1 PROCESS lifetime | Closed in rev 3c: `{GRAPH, CONTEXT, MODEL}`, no `PROCESS` (addendum 7 (b)); rev 3d adds `DEVICE` (addendum 10 (b)). | §4.4 Lifetimes |
+| r3 X2 attributes in the declaration struct | Closed in rev 3c: names only in `llama_model_lazy_tensor_names`, attributes from `llama_model_lazy_tensor_attrs(arch, hparams, name)` stored per model (addenda 7 (a), 8 (a)). | §3.1 |
+| r3 X3 `sycl_branch` from `hooks_enabled()` | Closed in rev 3c: `taker = sycl_model_loading_guard.active` (`lm:2228-2230`). | §3.1 |
+| r3 X4 the bit always reads `mode_pre` | Closed in rev 3c: `T6a(taker ? mode_pre : mode_post, size, taker ? true : SUPPORTED)`; rev 3d pins the third argument in source (th32 2x). | §3.1, §7 C1 |
+| r3 X5 eligible-but-`EAGER` | Closed in rev 3c: `deferral != EAGER` iff `lazy_eligible`. | §3.1 |
+| r3 X6 23mk overlaps unresolved | Closed in rev 3c: the published site table, which 23mk's class-H rows cite. | §4.4 |
+| r3 X7 th32 pin stale | Fixed: re-pinned at rev 2x `90be8e260`. | header |
+| found in rev 3d: host bufts' `get_max_size` names its own zone | `SYCL_Host`'s answers from WEIGHT (`gs:42477`) and `SYCL_HostCompute`'s from STAGING (`gs:42977`); after C4's routing both would chunk against the wrong zone (the llama.cpp-glkg shape). Each buft now builds one intent for `alloc_buffer` and `get_max_size`, which calls `select_zone`; `tests/test-sycl-host-zone-config-source-contract.py` is amended. | §4.4, §7 C4 |
+| addendum 10 (a) never amend a reported commit | Followed: rev 3d is a new commit on `fef860772`. | header |
+| addendum 10 (b) the 14 UNOWNED holders | Folded. `DEVICE` (owner: the device's `unified_cache`, checked at its teardown) for the two pools, and for `g_attn_host_staging` under the ruling's device-shared clause, with the reason stated; all three are released by `ggml_sycl_shutdown_global_runtime_pinned_owners` (`gs:7575-7590`) before the cache goes. The other 11 holders (12 lines) are `CONTEXT` targets pending **llama.cpp-30r1**, and carry the interim `UNOWNED` marker, routed to WEIGHT as today, until it lands. The ratchet fails on any new `UNOWNED` site and cites llama.cpp-30r1. | §4.4, §7 C4 |
+| addendum 10 (c) notify | Folded: the scalar entry point stands; the old function stays uncalled and its VRAM half is 23mk's dead-code census's. | §4.4 |
+| §M56 (a) GPT-OSS figures have one source | Folded: C4 step 5, C5 and C6 cite zhcn's GDC3 row and carry no copy of its N, figure or range. | header, §7 C4, C5, C6 |
+| th32 2x C1 requirement 1: the third argument in source | Folded: `test-llama-lazy-range-record-source` pins `taker ? true : llama_mmap::SUPPORTED`, with the always-`SUPPORTED` and always-`true` mutants; the reason is that `SUPPORTED` is a constant `true` on Linux and Windows (`src/llama-mmap.cpp:711-715`). | §7 C1 |
+| th32 2x C1 requirement 2: one per-model line | Folded: `lazy-range record: mode_pre=<m> mode_post=<m> taker=<0|1>` at INFO, once per model; a `llama_log_set` callback receives every level (`src/llama-impl.cpp:40-55`), and only `common_log` drops INFO (`common/log.cpp:542-546`). W1-W3 read it. | §3.1, §7 C1 |
