@@ -7,16 +7,23 @@
 // The kernel reports the advice per VMA in /proc/self/smaps ("hg" in VmFlags),
 // so this maps a small file with one unaligned lazy range and checks each
 // region: before and after the range carry "hg", and the range itself,
-// including the pages holding its unaligned ends, does not. Exits 77 when the
-// non-lazy region's VmFlags were read and carry no "hg" either (THP
-// unavailable), since then the check cannot tell anything apart. A VmFlags
-// line that cannot be found is a failure, not a skip: "no flags" also reads as
-// "no hg", so skipping on it would pass every probe vacuously.
+// including the pages holding its unaligned ends, does not.
+//
+// Whether THP is available is decided by a positive control that does not go
+// through llama_mmap: the test maps the file itself and advises it
+// MADV_HUGEPAGE. Exits 77 only when that madvise fails or its VMA still lacks
+// "hg". Once the control shows the kernel honours the advice, a llama_mmap
+// region without "hg" is a failure, not a skip: deciding the skip from
+// llama_mmap's own mapping would turn a regression that stops advising the
+// non-lazy ranges into a skip. A VmFlags line that cannot be found is a failure
+// too, since "no flags" also reads as "no hg".
 
 #include "../src/llama-mmap.h"
 
+#include <sys/mman.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -60,6 +67,39 @@ int main() {
         fprintf(stderr, "FAIL: could not create an 8 MiB temp file\n");
         return 1;
     }
+
+    // positive control: can this kernel mark a file mapping VM_HUGEPAGE at all?
+    {
+        void * ctl = mmap(nullptr, 8 * MiB, PROT_READ, MAP_SHARED, fd, 0);
+        if (ctl == MAP_FAILED) {
+            fprintf(stderr, "FAIL: could not map the temp file for the THP control\n");
+            close(fd);
+            unlink(path);
+            return 1;
+        }
+        if (madvise(ctl, 8 * MiB, MADV_HUGEPAGE) != 0) {
+            printf("SKIP: madvise(MADV_HUGEPAGE) failed on the control mapping (THP unavailable): %s\n",
+                   strerror(errno));
+            munmap(ctl, 8 * MiB);
+            close(fd);
+            unlink(path);
+            return 77;
+        }
+        const std::string ctl_flags = vm_flags_at(ctl);
+        munmap(ctl, 8 * MiB);
+        if (ctl_flags.empty()) {
+            fprintf(stderr, "FAIL: no VmFlags line for the control mapping in /proc/self/smaps\n");
+            close(fd);
+            unlink(path);
+            return 1;
+        }
+        if (!has_hugepage(ctl_flags)) {
+            printf("SKIP: the advised control mapping carries no hg flag (THP unavailable): '%s'\n", ctl_flags.c_str());
+            close(fd);
+            unlink(path);
+            return 77;
+        }
+    }
     close(fd);
 
     const size_t lazy_beg = 2 * MiB + 100;
@@ -74,18 +114,6 @@ int main() {
         llama_file   f(path, "rb");
         llama_mmap   m(&f, /*prefetch =*/0, /*numa =*/false, lazy_ranges);
         const char * base = (const char *) m.addr();
-
-        const std::string base_flags = vm_flags_at(base);
-        if (base_flags.empty()) {
-            fprintf(stderr, "FAIL: no VmFlags line for the mapping in /proc/self/smaps\n");
-            unlink(path);
-            return 1;
-        }
-        if (!has_hugepage(base_flags)) {
-            printf("SKIP: the non-lazy region carries no hg flag (THP unavailable): '%s'\n", base_flags.c_str());
-            unlink(path);
-            return 77;
-        }
 
         struct probe {
             const char * what;

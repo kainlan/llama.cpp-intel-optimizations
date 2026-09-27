@@ -31,9 +31,13 @@
 static int n_failures = 0;
 
 static jmp_buf abort_jmp;
+static bool    abort_was_contiguity;
 
+// leaves ggml_abort before its abort(); records whether it was the contiguity
+// assert, so that some other abort in schedule_capture() cannot pass for it
 static void abort_jump(const char * message) {
-    printf("refused as expected: %s\n", message);
+    abort_was_contiguity = strstr(message, "ggml_is_contiguous") != nullptr;
+    printf("aborted: %s\n", message);
     longjmp(abort_jmp, 1);
 }
 
@@ -105,6 +109,7 @@ int main() {
     }
     ggml_set_abort_callback(prev_abort);
     check_eq("non-contiguous view refused", refused, 1);
+    check_eq("refused by the ggml_is_contiguous assert", refused && abort_was_contiguity, 1);
     check_eq("pending reads after the view", profiler.pending_reads.size(), n_pending_before);
 
     ggml_backend_buffer_free(buf);
