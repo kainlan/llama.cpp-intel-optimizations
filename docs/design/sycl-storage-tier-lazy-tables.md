@@ -1,10 +1,14 @@
 # SYCL STORAGE tier for lazy row tables (PLE / n-gram / engram embeddings)
 
-*Status: DESIGN rev 2, not implemented. Tracker: `llama.cpp-th32`.
+*Status: DESIGN rev 2b, not implemented. Tracker: `llama.cpp-th32`.
 Implementation tickets are filed after review (proposed split in §11). Written
-2026-09-26 against fork `76c7f6548` and upstream `ggml-org/master` `694ec2354`.
-Rev 2 folds review `design-th32-r1` (2 Critical, 11 Important, 13 Minor) under
-the lead's rulings §T1 (`lead-rulings-2026-09-26.md`, §D3/§T1).*
+2026-09-26 against fork `76c7f6548` and upstream `ggml-org/master` `694ec2354`;
+the host-fit terms are re-read at fork `c69d5774d`, whose `unified-cache.cpp`
+and `ggml-sycl.cpp` are byte-identical to `76c7f6548`. Rev 2 folded review
+`design-th32-r1` under the lead's rulings §T1. Rev 2b folds review
+`design-th32-r2` (1 Critical, 5 Important, 12 Minor) under the lead's rulings
+§T2, §T3, §T4 and §D5, and the owner's decision §D4
+(`lead-rulings-2026-09-26.md`).*
 
 Citations: fork code as `76c7f6548 <file>:<line>`, upstream code as
 `694ec2354 <file>:<line>` (read with `git show ggml-org/master:<file>`; the fork
@@ -15,15 +19,22 @@ PR #28696, and its runtime design is `llama.cpp-9g22`
 interface in §9.1. This document owns the storage-tier contract and the
 numbers it rests on; `llama.cpp-9g22` links to them by the anchors below
 (`th32-contract`, `th32-host-fit`, `th32-windows`, `th32-ds-targets`,
-`th32-cold-expert-facts`, `th32-dspark`). Every number in this document was
+`th32-cold-expert-facts`, `th32-dspark`, and from rev 2b `th32-p3` and
+`th32-d4-fit`). Every number in this document was
 measured on this host on 2026-09-26 under its permanent ambient load (load
 average 31-57, ~90 for the first DeepSeek probes); the raw logs are in
 Appendix A and the probe sources are described in Appendix B.
 
 **Attribution.** A decision is called the owner's only where the owner made it
-(`lead-rulings-2026-09-26.md`, or relayed by the lead as an owner answer). A
-decision the lead made is marked *lead ruling §T1*. Everything else in this
-document is this design's **proposal**.
+(`lead-rulings-2026-09-26.md`, or relayed by the lead as an owner answer), and
+the owner's decisions are cited as **owner §D1**, **owner §D2** and **owner
+§D4** after their sections there. A decision the lead made is marked *lead
+ruling* with its section (§T1-§T4, §D5). Everything else in this document is
+this design's **proposal**. This document's own decisions are numbered D1-D9
+in §13; the one that was also called D4 (`--lazy-mode`) is **DLM** from rev 2b
+on, so that "§D4" always means the owner's decision. A bare D-number is this
+document's; the rulings file's sections always carry "§" and their author
+("owner §D2", "*lead ruling §D5*").
 
 ---
 
@@ -42,8 +53,8 @@ few rows per token and are far too large for their value on a GPU:
 | raw bytes per token | 2720 B | 4032 B Q2_K (5280 B Q3_K) |
 | row indices known host-side before compute | yes: hash in `set_input` | yes: `token_map` + hash in `set_input` |
 | consumed at | block 1 | block 1 (table 1) and block 14 (table 14) |
-| residency the planner picks on this host | **HOST** at every `MemAvailable` reading today (§4.5) | **STORAGE**, both tables (§4.5) |
-| who executes the gather | the CPU, in the leading CPU split (upstream's order) | the CPU, as a SYCL-backend-owned `host_task` with event edges; no scheduler split |
+| residency the planner picks on this host | **HOST** at every `MemAvailable` reading once lever (s) lands; on today's code **STORAGE** at the lowest reading, 171.4 GiB (§4.5) | **STORAGE**, both tables; phase 1 also puts a cold routed-expert set on STORAGE (owner §D4, §4.5) |
+| who executes the gather | the CPU, as a SYCL-backend-owned `host_task`; an event-ordered H2D copy takes the output to the device | the same, after the rows' IO ticket completes |
 
 Each row read from storage is one random 4 KiB read. DeepSeek needs **3x** the
 rows per token and **3x** the unique rows per PP512 ubatch, and on this host it
@@ -76,22 +87,31 @@ environment variable:
 In both residencies **the CPU executes the gather**, and the table never
 reaches the GPU: there is no zero-copy and no weight streaming. Where the
 gather sits in the graph is the **provider's** decision, not the model's
-(*lead ruling §T1*, C2 and D6(c)):
+(*lead ruling §T1*, C2 and D6(c)). Both residencies take **one path**
+(*lead ruling §T2*, DQ, and §T4 I-3):
 
-- **HOST** tables are gathered by a CPU op in the **leading CPU split**, next to
-  `inp_embd`, which is upstream's order. The gather takes microseconds, adds no
-  split, and the first SYCL op reads its output where it lies, exactly as it
-  reads `inp_embd` today (§7.3).
-- **STORAGE** tables are gathered by the **SYCL backend**, which owns the node
-  and runs it as a CPU `host_task`, submitted at prefetch with no device
-  dependency (a cross-queue dependency would block the submitting thread,
-  `llama.cpp-c6ah`): it waits for its IO ticket on a runtime thread, and
-  dequantizes into a planned pinned slot; the copy of that F32
-  activation to the device is enqueued just before the consumer, with an event
-  edge on the host task. There is no scheduler split and no host wait on
-  the GPU path, which removes `llama.cpp-x1xd` and `llama.cpp-jhxq` from this
-  path (§5.3). Under command-graph replay the gather is a **stated segment
-  boundary** (§7.4).
+- The **SYCL backend** owns the gather node and runs the gather as a CPU
+  `host_task`, submitted at prefetch with no device dependency (a cross-queue
+  dependency would block the submitting thread, `llama.cpp-c6ah`). A **HOST**
+  table's host task dequantizes straight from the resident body, in
+  microseconds. A **STORAGE** table's host task first waits for its IO ticket
+  on the runtime thread. Either way it dequantizes into a planned pinned
+  output slot.
+- An **explicit, event-ordered H2D copy** on the main in-order queue moves that
+  F32 activation into the device compute buffer just before the consumer, with
+  an event edge on the host task. **No SYCL kernel reads `SYCL_Host` memory**
+  on this path, and a RED fails if one does (§7.3).
+- There is no scheduler split and no host wait on the GPU path, which removes
+  `llama.cpp-x1xd` and `llama.cpp-jhxq` from this path (§5.3). Under
+  command-graph replay the gather is a **stated segment boundary** (§7.4).
+
+Rev 2a put the HOST gather in the leading CPU split, as a CPU op next to
+`inp_embd` (*lead ruling §T1*, C2), and let the first SYCL op read its output
+in place. DQ forbids that read. The copy that replaces it cannot be made
+wait-free from the leading split, because the next ubatch's CPU op would
+overwrite the copy's source on the submitting thread (§7.1). Rev 2b therefore
+routes HOST through the STORAGE path. That changes a *lead ruling §T1*
+placement, so it is put to the lead as **DQ-C2** (§13).
 
 The consumer contract that a model implements is §9.1.
 
@@ -118,32 +138,43 @@ The consumer contract that a model implements is §9.1.
 **What the planner will choose on this host** (§4.5). The host weights are
 counted at their **exact** bytes (`llama.cpp-rnh3`), not at the 1.2x ratio the
 fork charges today, and the host zones at the bytes the sizing code actually
-commits (§2.3), `dma_staging_pool` and the RUNTIME pool included. The host
-budget follows `MemAvailable`, which read 171.4-190.4 GiB today, so
-`host_budget` = **163.4-182.4 GiB**. Under the default EXPERT mode the B50
-holds no routed expert, so these are B70-alone numbers (`llama.cpp-9g22`
-phase 1, `level_zero:0`).
+commits (§2.3): `dma_staging_pool`, the RUNTIME pool and the **PP MoE oneDNN
+ring** included. The ring has no type gate, so every MoE model carries it
+today: 7.87 GiB on DeepSeek Q2_K and 4.17 GiB on Qwen, charged twice on the
+host and once in VRAM. Every fit is therefore stated twice: on **today's
+code**, and **after lever (s)** (`llama.cpp-sgc5`, `llama.cpp-s4ip` and the
+ring type-gate, which the owner chose in §D4). The host budget follows
+`MemAvailable`, which read 171.4-190.4 GiB today, so `host_budget` =
+**163.4-182.4 GiB**. Under the default EXPERT mode the B50 holds no routed
+expert, so these are B70-alone numbers (`llama.cpp-9g22` phase 1,
+`level_zero:0`). The numbers are reproduced by
+`docs/design/sycl_storage_tier_host_fit.py` (§4.5); `llama.cpp-7v5c`'s
+dry-run replaces them.
 
-- **Qwen:** host experts, one set of host zones (≈ 6.9 GiB) and the context
-  envelope need 105.2-108.6 GiB; the 50.66 GiB table fits at every reading,
-  with 4.2-26.6 GiB left over. The table is **HOST**. It flips to STORAGE
-  only below a `MemAvailable` of ~164-167 GiB.
-- **DeepSeek Q2_K (the owner's primary rung):** host experts (157.3-160.3 GiB,
-  exact) plus one set of host zones (≈ 14.8 GiB) need 172.4-175.8 GiB before
-  any table. **Stated plainly: DeepSeek Q2_K's phase 1 does not fit this host
-  at three of today's four readings.** With no draft and floor-sized row
-  caches it needs a `MemAvailable` of 182.9-186.3 GiB: refused at 171.4 and
-  181.8, at 183.7 only
-  at the low corner, and it fits at 190.4 with 4.1-7.5 GiB to spare. With the
-  gate protocol's 2 GiB row caches it fits only at 190.4; with the DSpark
-  draft it fits at none. Rev 2 said it fitted at every reading, because it
-  left out ~7.4 GiB of zone terms and put experts on the B50. This goes back
-  to the owner as a D8 re-check (§13). T2 also depends on `llama.cpp-sgc5`:
-  today a two-card run commits a second full zone set, WEIGHT included.
+- **Qwen:** one zone set's non-weight host terms are 15.4 GiB as committed on
+  today's code and 5.6 GiB after (s). The 50.66 GiB table needs a
+  `MemAvailable` of 176.4-179.8 GiB on today's code, so it is **STORAGE at
+  171.4** and HOST at the other three readings. After (s) it needs
+  162.4-165.8 GiB and is **HOST at every reading**.
+- **DeepSeek Q2_K (the owner's primary rung):** one zone set's non-weight
+  terms are 31.0 GiB as committed today and 9.5 GiB after (s). On today's code
+  phase 1 is refused at every reading, even with floor caches and no draft.
+  After (s) the planner's fit (`MemAvailable - 8`) admits it at three
+  readings, but 9g22's gate precondition P3 (predicted post-load
+  `MemAvailable >= 24 GiB`) fails at all four. **The owner's §D4 closes that
+  gap**: the coldest Q2_K experts go to STORAGE and the CPU executes them. The
+  cold set `C` is computed at load from that load's reading (*lead ruling
+  §D5*); its size at each reading is `llama.cpp-9g22`'s number
+  ([its §4.5.2](deepseek41-runtime.md#452-the-host-fit-r2-c-a-r3-c-1-c-2-owner-d4)),
+  not restated here. If even every expert on STORAGE cannot clear P3, the
+  load refuses by name (D8, §13).
 
 STORAGE speed on this box is dominated by the filesystem's 60x amplification.
 Plain NVMe is not an option here (D3), so for DeepSeek that filesystem is the
-operating point, and §8 scores against it.
+operating point, and §8 scores against it. On that filesystem DeepSeek's
+"decent speed" is bounded by the cold experts' reads on the same devices, not
+by the engram rows: a PP512 ubatch reads the whole cold set once (§8.4,
+`9g22` §4.5.3).
 
 ---
 
@@ -169,21 +200,32 @@ The owner's decisions on the ticket (2026-09-26):
   prefetch and a hot-row cache.
 - The CPU executes the gather, so only the gathered rows move.
 - "Decent speed" in either tier.
-- DeepSeek-V4.1-Flash runs the **Q2_K** rung (D8, revised 2026-09-26).
+- DeepSeek-V4.1-Flash runs the **Q2_K** rung (owner §D2).
+- The Q2_K fit (owner §D4): fix the zone waste with lever (s) (`sgc5`, `s4ip`
+  and the ring type-gate), and put the coldest Q2_K routed experts on STORAGE,
+  executed by the CPU. That sanctions STORAGE→CPU for experts. The cold set
+  is profiled, with the `exp_probs_b` bias as the fallback (owner §D2).
 
-The lead's rulings on this design (`lead-rulings-2026-09-26.md` §D3/§T1):
-host weights are charged at exact bytes (`llama.cpp-rnh3`, which T2 depends
-on); the provider decides where the gather sits; STORAGE gathers are
-SYCL-owned CPU `host_task`s with event edges (D6(c)); one host budget function
+The lead's rulings on this design (`lead-rulings-2026-09-26.md` §D3/§T1-§T4,
+§D5): host weights are charged at exact bytes (`llama.cpp-rnh3`, which T2
+depends on); the provider decides where the gather sits; the gather is a
+SYCL-owned CPU `host_task` with event edges (D6(c)); one host budget function
 that every consumer reads; STORAGE is a residency state; planned HOST
 residency is locked or refused by name; the row cache is yieldable; plain NVMe
-is not an option (D3).
+is not an option (D3); the gather's output reaches the device by an explicit
+event-ordered H2D copy, never zero-copy (§T2 DQ); the cold set is sized at load
+by one computation (§D5); row caches are fixed before the cold set is sized
+(§T4 I-4).
 
 Out of scope: the `qwen4exp` port itself (`llama.cpp-n77l`) and the `deepseek41`
 runtime (`llama.cpp-9g22`); the GPU kernels that consume the gathered rows
 (PLE's `ple_key`/`ple_value`/norms/conv, engram's `engram_q`/`engram_k`/
-`engram_wkv`, all ordinary dense weights); the MTP head; and cold routed
-experts on STORAGE, a later ticket (`llama.cpp-yl3v`, §9.2).
+`engram_wkv`, all ordinary dense weights); and the MTP head. **The cold-expert
+path itself** is in scope only at its interface. Owner §D4 brings
+`llama.cpp-yl3v` forward to Q2_K, and yl3v owns the selection, the
+`CpuExpertPool` execution, its landing slab and the prefetch from routing.
+This design provides the residency state, the shared IO engine and the host
+ledger that yl3v uses, and the fit that sizes the cold set (§4.3, §9.2).
 
 ---
 
@@ -341,35 +383,60 @@ shard 2 (tensors); Appendix A.1:
   replaces it with exact bytes plus named terms; T2 depends on it (§4.2).
 - **The STAGING and SCRATCH zones, and a separate RUNTIME pool, scale with the
   largest tensor.** All three are host-pinned, from the same pool budget.
-  - STAGING is `s1_in_flight x (2 x max_tensor + 2 MiB)`, with
-    `s1_in_flight = 1` (`unified-cache.hpp:5539`), plus 16 MiB, the expert
-    bias, `moe_routing_ids` (`384 x 4 x n_ctx`) and the MMID host pool
-    (`unified-cache.cpp:27676-27707`).
+  - STAGING is `s1_in_flight x (max(2 x max_tensor, max_staging_pair_bytes)
+    + 2 MiB)`, with `s1_in_flight = 1` (`unified-cache.hpp:5539`), plus
+    16 MiB, the expert bias, `moe_routing_ids` (`n_expert x 4 x n_ctx`),
+    `tp_staging_buffer_bytes` and the MMID host pool
+    (`unified-cache.cpp:27685-27699`). For DeepSeek's and Qwen's expert types
+    the SOA staging pair equals `2 x max_tensor`, and the TP staging buffer is
+    0 on one card.
   - SCRATCH is the sum of `max_tensor`, 32 MiB, `onednn_reorder`,
     `moe_q8_workspace`, `moe_cpu_expert_staging` (the largest MoE tensor) plus
     `moe_host_recipe_workspace`, `moe_vram_runtime`, `tp_vram_runtime`,
-    **`dma_staging_pool`**, `pp_pipeline_scratch` and `pp_moe_onednn_scratch`
-    (`:27716-27742`). `ggml_sycl_configure_host_zones_for_plan()` raises it
-    to at least the oneDNN scratch sizes plus `max_tensor + 32 MiB`
+    **`dma_staging_pool`**, `pp_pipeline_scratch` and
+    **`pp_moe_onednn_scratch`** (`:27716-27742`, the ring at `:27730`).
+    `ggml_sycl_configure_host_zones_for_plan()` raises it to at least the
+    cache's live oneDNN scratch sizes plus `max_tensor + 32 MiB`
     (`ggml-sycl.cpp:5634-5636`).
+  - `pp_moe_onednn_scratch` is the **PP MoE oneDNN ring**. The loader sizes it
+    for every MoE expert weight **with no type gate**
+    (`c69d5774d src/llama-model.cpp:430-507`): `n_expert` MXFP4 WOQ weight
+    slots, plus activation and output slots of `512 x n_expert x
+    max(n_embd, n_ff)` rows at 2 and 4 B. `ggml-sycl.cpp:15962-15970`
+    publishes it unconditionally. It serves only the MXFP4 WOQ executor, which
+    Q2_K, Q3_K and Q8_0 experts never reach. It is **7.87 GiB** on DeepSeek
+    Q2_K (2.24 + 1.88 + 3.75) and **4.17 GiB** on Qwen (0.42 + 1.25 + 2.50).
+    It is charged in host SCRATCH, again in the RUNTIME pool below, and it sets
+    the floor of each card's VRAM RUNTIME zone (`unified-cache.cpp:1567-1574`,
+    `:4512-4530`), so on today's code it also takes that many bytes of expert
+    room from the card.
   - `dma_staging_pool` is `2 x` the largest DMA-streamed tensor. It is sized
     **unconditionally**, whether or not weight streaming can engage; the code's
     own note says so and points at `llama.cpp-iaqm` (`:27522-27541`).
   - The **RUNTIME pool** is a separate pinned pool:
     `pre_allocate_runtime_chunks(onednn_scratchpad + dma_staging_pool +
     pp_pipeline_scratch + pp_moe_onednn_scratch)` on the cache's host arena
-    (`ggml-sycl.cpp:5649-5653`, `unified-cache.cpp:20479-20483`). So the DMA
-    staging pool is charged twice, once in SCRATCH and once here.
-    `llama.cpp-s4ip` (comment `c-rbwa`) covers removing both copies where no
-    host reader exists.
+    (`ggml-sycl.cpp:5649-5653`, `unified-cache.cpp:20479-20483`,
+    `pinned-pool.cpp:272-305`: a separate `runtime_chunks_` list charged to the
+    same budget). So the DMA staging pool and the ring are each charged twice
+    on the host, once in SCRATCH and once here. **Lever (s)** removes both
+    where no host reader exists and type-gates the ring to MXFP4 experts
+    (`llama.cpp-s4ip`, comments `c-rbwa` and `c-td91`, widened to the `:5649`
+    site); it is part of the owner's §D4.
   - `cpu_quant_buffer_bytes` is **not** a host term. The code states it is
     diagnostic-only: no allocation is sized from it (`:27436-27446`).
 
-  On DeepSeek Q2_K (`max_tensor` 1.81 GiB) one zone set is STAGING 3.64 +
-  SCRATCH >= 7.39 + RUNTIME >= 3.72 (committed as 4.0) + KV 0.06 ≈ **14.8
-  GiB** of non-weight host memory (§4.5). A 30 GiB engram table counted as
-  `max_tensor` would make STAGING alone ~60 GiB and move SCRATCH and RUNTIME
-  by as much again, so the lazy tables must stay out of that inventory (§4.1).
+  One zone set's non-weight host memory (§4.5, KV zone included, the RUNTIME
+  pool as committed in 2 GiB chunks):
+
+  | | today's code | after lever (s) |
+  |---|---:|---:|
+  | DeepSeek Q2_K (`max_tensor` 1.81 GiB) | STAGING 3.65 + SCRATCH 15.26 + RUNTIME 11.58 (commits 12) + KV 0.06 = **31.0 GiB** | 3.65 + 3.77 + 0.09 (commits 2) + 0.06 = **9.5 GiB** |
+  | Qwen3.8 (`max_tensor` 0.83 GiB) | 1.69 + 7.63 + 5.92 (commits 6) + 0.06 = **15.4 GiB** | 1.69 + 1.80 + 0.09 (commits 2) + 0.06 = **5.6 GiB** |
+
+  A 30 GiB engram table counted as `max_tensor` would make STAGING alone
+  ~60 GiB and move SCRATCH and RUNTIME by as much again, so the lazy tables
+  must stay out of that inventory (§4.1).
 - **Every participating cache builds its own zone set, WEIGHT included**
   (`llama.cpp-sgc5`). A two-card run gives every cache the same plan snapshot
   (`ggml-sycl.cpp:15325-15352`), and the S1 preload calls
@@ -548,8 +615,9 @@ byte is ever allocated "in" it, and an allocatable enum value would be a latent
 path to request it. A `lazy_table` instead carries `lazy_residency { HOST,
 STORAGE }`, the planner's decision. The reporting enums `cache_location`
 (`unified-cache.hpp:2167`) and `expert_resolve_tier` (`:2313`) gain `STORAGE`
-as a *reported* state only; nothing allocates against them. (The later
-cold-expert ticket, §9.2, uses the same residency value.)
+as a *reported* state only; nothing allocates against them. The cold
+routed-expert set of owner §D4 (`llama.cpp-yl3v`, §9.2) reports the same
+`STORAGE` value.
 
 ### 3.2 The `lazy_table` object
 
@@ -592,7 +660,7 @@ lazy_table
   - The scheduler assigns an op whose source sits in a `WEIGHTS` buffer to the
     highest-priority backend that supports that buffer type and the op
     (`ggml-backend.cpp:1594-1612`, rule `1.wgt` at `:1684`). That is how the
-    SYCL backend claims the STORAGE gather deterministically (§7.2).
+    SYCL backend claims the gather of either residency deterministically (§7.2).
   - `llama` sees an ordinary buffer, so model size, memory breakdown, the
     loader's mlock loop and `load_all_data` need only a narrow change (T6b):
     skip the tensor, and report the buffer's *resident* bytes, not its
@@ -607,18 +675,22 @@ lazy_table
 | row cache index | model | `HOST_CPU` / `LAZY_ROW_CACHE` | `slots x 13.3 B` (§6.3): 7.8% of the slab on 170 B rows, 12.1% on 110 B, 15.9% on 84 B |
 | landing slab | context, per table | `HOST_CPU` / new `alloc_role::LAZY_STAGING` | `depth x n_ubatch x rows_per_token x row_size`: Qwen 2 x 512 x 16 x 170 B = 2.66 MiB; DeepSeek Q2_K 2 x 512 x 24 x 84 B = **1.97 MiB per table** |
 | block ring | context, shared by its tables | `HOST_CPU` / `LAZY_STAGING` | `QD x 2 x io_block` = 64 x 8 KiB = **512 KiB** (4 KiB-aligned, for `O_DIRECT`) |
-| output slot | context, per SYCL-gathered table | `HOST_PINNED` / new `alloc_role::LAZY_OUTPUT` | `depth x n_ubatch x rows_per_token x ne[0] x 4 B`: DeepSeek 2 x 512 x 24 x 256 x 4 B = **24 MiB per table** |
+| output slot | context, per table, both residencies | `HOST_PINNED` / new `alloc_role::LAZY_OUTPUT` | `depth x n_ubatch x rows_per_token x ne[0] x 4 B`: Qwen 2 x 512 x 16 x 160 x 4 B = **10 MiB**; DeepSeek 2 x 512 x 24 x 256 x 4 B = **24 MiB per table** |
 
 - **STORAGE** uses the cache slab and index, the landing slab, the block ring
-  and, because its gather is SYCL-owned (§7.2), the output slot. Those are the
-  **entire** resident footprint of a STORAGE table, and the planner charges
-  exactly those bytes (P4).
-- **HOST** uses only the body. Its gather dequantizes straight from the body
-  inside the CPU op (§7.1), which is what the 4.2 us/token measurement did, so
-  it needs no landing slab, no ticket and no output slot. Its output lives in
-  the CPU backend's compute buffer, which `llama.cpp-zhcn` plans (M7, §7.3).
+  and the output slot. Those are the **entire** resident footprint of a
+  STORAGE table, and the planner charges exactly those bytes (P4).
+- **HOST** uses the body and the output slot. Its host task dequantizes
+  straight from the body (§7.2), which is what the 4.2 us/token measurement
+  did, so it needs no landing slab and no ticket.
 - **The output slot is pinned** because the device's copy engine reads it. It
-  is the host end of the activation copy (§7.3).
+  is the host end of the explicit H2D copy (§7.2 step 3, §7.3), which is DMA
+  staging, the one GPU use `HOST_PINNED` allows (§3.1). No kernel reads it.
+- **Not a th32 allocation: the cold-expert landing slab.** The owner's §D4
+  cold set is read by `llama.cpp-yl3v` into its own planned, cache-owned
+  `O_DIRECT` slab. Lead ruling §D5 charges it as `2C/40` (double-buffered, one
+  layer's cold bytes) inside the cold-set computation; §4.2 lists it as a term
+  so that `host_planned_bytes` carries it.
 
 ### 3.4 Pointer discipline
 
@@ -642,7 +714,12 @@ never placement entries for a device: P3 forbids a device tier for them, so the
 planner cannot offer one. They are also **excluded from `max_tensor_bytes`**
 and every other inventory maximum: with a 30 GiB engram table counted as
 `max_tensor`, the host STAGING zone alone would be ~60 GiB (§2.3). T3's RED
-fixture plans a Q2_K-shaped inventory and asserts a STAGING zone of 3.64 GiB.
+fixture plans a Q2_K-shaped inventory with its two tables and asserts that the
+STAGING and SCRATCH zones equal what `populate_host_zone_sizing()` returns for
+the same inventory **without** the tables. The expected bytes come from the
+sizing function, never from a literal (*lead ruling §D5*): today that is about
+3.65 GiB of STAGING, and it moves when `s4ip` lands. Counting a table would
+add at least twice the table's bytes, so the check cannot pass by accident.
 `rows_per_token` and `consumer_layer` are arch facts that `llama` supplies
 (§9.1):
 
@@ -732,7 +809,8 @@ struct placement_lazy_table {
 ```
 
 <a id="th32-host-fit"></a>
-**T2's definition** (it depends on `llama.cpp-rnh3` and `llama.cpp-sgc5`):
+**T2's definition** (it depends on `llama.cpp-rnh3`; its enforcing phase also
+depends on `llama.cpp-sgc5`):
 
 `host_planned_bytes` is what the sizing code will commit, not a second
 estimate of it. Its zone terms are the bytes `populate_host_zone_sizing()`
@@ -745,14 +823,21 @@ and `ggml_sycl_configure_host_zones_for_plan()` produce, term for term (§2.3):
   logits and the server's prompt-checkpoint reads, and a TLSF fragmentation
   bound derived from the block count)
 + the KV zone: the host KV, at least 64 MiB
-+ the STAGING zone, as sized at `unified-cache.cpp:27676-27707`
++ the STAGING zone, as sized at `unified-cache.cpp:27685-27699`:
+  `max(2 x max_tensor, max_staging_pair_bytes) + 2 MiB`, plus the 16 MiB
+  headroom, the expert bias, `moe_routing_ids`, `tp_staging_buffer_bytes` and
+  the MMID host pool
 + the SCRATCH zone, as sized at `:27716-27742` and raised at
-  `ggml-sycl.cpp:5634-5636`: every term §2.3 lists, `dma_staging_pool`
-  included
+  `ggml-sycl.cpp:5634-5636`: every term §2.3 lists, `dma_staging_pool` and the
+  PP MoE oneDNN ring included on today's code
 + the RUNTIME pool that `pre_allocate_runtime_chunks` commits
-  (`ggml-sycl.cpp:5649-5653`)
+  (`ggml-sycl.cpp:5649-5653`), the ring and the DMA pool included on today's
+  code
 + each pool's rounding up to its commit chunk (2 GiB for the pinned pools),
   because the ledger charges committed chunks
++ the cold-expert landing slab, `2C/40` for a cold set of `C` bytes, and
+  **minus** those `C` bytes from the host experts (owner §D4, *lead ruling
+  §D5*; `C` is 0 for a model with no cold set)
 + the **context envelope**: per context, the host tenants a context adds (the
   CPU backend's `SYCL_Host` compute buffer, which `llama.cpp-zhcn` plans; host
   KV growth; the lazy tables' landing slabs, block ring and output slots),
@@ -763,35 +848,65 @@ Two terms are deliberately absent. `cpu_quant_buffer_bytes` is
 diagnostic-only (`:27436-27446`), and `moe_cpu_expert_staging` is counted once,
 inside SCRATCH.
 
+Three details make "term for term" hold:
+
+- **The SCRATCH raise reads live cache state.** `ggml-sycl.cpp:5634-5636`
+  takes the max with `cache->onednn_weights_scratch_size() +
+  onednn_activations_scratch_size()`, and a host-only dry-run has no cache. T2
+  and `llama.cpp-7v5c` substitute the plan-time value of the same scratch, from
+  the value function its owner defines (*lead ruling §M19*: `llama.cpp-moua`'s
+  `onednn_scratchpad`). The raise is a max: it binds only when those two sizes
+  exceed SCRATCH's terms other than `max_tensor + 32 MiB`, which after (s) are
+  0.94 GiB on Qwen and 1.92 GiB on DeepSeek. Whether they do on these models
+  is for 7v5c to print; §4.5 assumes they do not.
+- **The ledger charges backing bytes.** Chunk growth charges
+  `footprint.backing`, not `footprint.usable` (`pinned-pool.cpp:889-895`), so
+  T2 does too.
+- **A short pre-allocation becomes a refusal.** Today
+  `pinned_chunk_pool::pre_allocate` logs a WARN and carries on when the budget
+  runs out (`pinned-pool.cpp:241-246`), so a zone set can be committed in part
+  without anyone noticing. Under T2's enforcing phase that shortfall is the
+  typed refusal `host-budget-exceeded`. In the WARN-only phase it is logged
+  with the plan's number next to it.
+
 **One zone set per plan (`llama.cpp-sgc5`).** Today every participating cache
 builds a full zone set, WEIGHT included, from the one plan (§2.3). T2 does not
 sum that. It counts the WEIGHT zone once, in the cache whose `CpuExpertPool`
 leases the host experts, and STAGING, SCRATCH and RUNTIME once per cache that
 sgc5's fix still gives them (from that device's own maxima). Until sgc5 lands,
 the ledger's sum cap turns the duplicate WEIGHT zone from an OOM into a
-refusal that no lever can clear. So T2's enforcing phase waits for sgc5.
+refusal that no lever can clear. So T2's enforcing phase (b) waits for sgc5;
+its WARN-only phase (a) does not, and proceeds now (*lead ruling §T3*, (c)).
 Phase 1 of `llama.cpp-9g22` runs on the B70 alone (`level_zero:0`), which has
 one cache and one zone set whether or not sgc5 has landed.
 
-**One source for the number** (proposed). `llama.cpp-9g22` proposes T27, a
-host-only plan dry-run: `compute_multi_device_plan`,
+**One source for the number** (*lead rulings §T3, §D5*). `llama.cpp-7v5c`
+(9g22's T27) is the host-only plan dry-run: `compute_multi_device_plan`,
 `populate_host_zone_sizing` and the `configure_host_zones` sizing, run over the
-GGUF header inventory and recorded device budgets, with no GPU. This design
-proposes that T2 compute `host_planned_bytes` through the same functions T27
-runs, so that T2's number, T27's printout and `9g22`'s `expected_host` are one
-computation. Hand arithmetic, including §4.5's, is an estimate that T27
-replaces. It has already missed terms twice: the r1 text charged the
-diagnostic-only `cpu_quant_buffer_bytes`, and the r2 text left out the DMA
-staging pool and the RUNTIME pool.
+GGUF header inventory and recorded device budgets, with no GPU. It also
+computes the cold set `C` for the launch's reading (§4.3). T2's
+`host_planned_bytes`, 7v5c's printout and `9g22`'s `expected_host` are one
+computation through the same functions. Hand arithmetic, including §4.5's, is
+an estimate that 7v5c replaces. It has already missed terms three times: the
+r1 text charged the diagnostic-only `cpu_quant_buffer_bytes`, the r2 text left
+out the DMA staging pool and the RUNTIME pool, and rev 2a left out the ring.
+
+**The readings are samples, not a shared fact.** This document took four
+`MemAvailable` readings (171.4, 181.8, 183.7 and 190.4 GiB); `9g22` rev 5 cites
+171.4 and 189.6. Both are hand samples of a quantity that moves with the other
+tenants. The number that decides a load is the one 7v5c takes at that load, so
+neither document's table is a gate.
 
 ### 4.3 The decision, in order
 
 1. VRAM is placed exactly as today: dense first, then experts.
 2. Host weights (exact), `rnh3`'s named terms, host KV and every carved host
-   zone are charged against `host_budget`. If they exceed it, the plan refuses
-   with a typed reason (`host-budget-exceeded`, carrying each term). Today it
-   silently overcommits (§2.3). (Moving cold routed experts to STORAGE instead
-   of refusing is the later ticket, `llama.cpp-yl3v`, §9.2.)
+   zone are charged against `host_budget`. For a model with no cold-expert
+   class, a plan that exceeds the budget refuses with a typed reason
+   (`host-budget-exceeded`, carrying each term); today it silently
+   overcommits (§2.3). For a model that has one (DeepSeek phase 1, owner §D4),
+   the host experts are **not** refused here: step 5 moves the coldest of them
+   to STORAGE.
 3. The **context envelope** for the planned contexts is charged next, and
    `host_reserve = max(2 GiB, 1% of the budget)` is set aside. Context-lifetime
    tenants therefore come before any lazy-table byte (*lead ruling §T1*, I8;
@@ -801,28 +916,54 @@ staging pool and the RUNTIME pool.
    **STORAGE**, with a cache floor of `2 x n_ubatch x rows_per_token` slots (one
    double-buffered ubatch working set) plus its index. If `leftover` cannot
    hold the floors, the plan refuses (`lazy-table-cache-below-floor`) rather
-   than run with a cache that cannot hold one ubatch.
-5. The STORAGE caches then take what is left, as a **yieldable** tenant (§6.4),
-   split between tables in proportion to `table_bytes x rows_per_token`, a
-   proxy for miss traffic.
+   than run with a cache that cannot hold one ubatch. With a cold-expert class,
+   "leftover" here is measured with the cold set at `C_selected` (step 5): a
+   table may be HOST only if that does not make step 5 demote more experts, so
+   a table never pushes an expert to STORAGE (§4.4). In a plan with a cold
+   set, each STORAGE cache is also **fixed** in this step at its target size,
+   index included: the gate size, 2 GiB per table, which this design proposes
+   as the default for DeepSeek (never below the floor) (*lead ruling §T4*,
+   I-4).
+5. **With a cold-expert class: the cold set** (owner §D4; *lead ruling §D5*).
+   `llama.cpp-7v5c` computes `C = max(C_selected, C_P3)` from this load's
+   `MemAvailable` reading. `C_selected` is what the owner's §D1/§D2 selection
+   already demotes (the usage profile, then the `exp_probs_b` bias). `C_P3` is
+   the smallest cold set that leaves a predicted post-load `MemAvailable` of at
+   least 24 GiB (9g22's P3), counting the landing slab (`2C/40`) and the main
+   pool's chunk rounding. The experts themselves are chosen by the §D1
+   selection; this step only sizes `C`. Everything charged in steps 2-4, the
+   fixed caches included, is charged **before** `C` is sized, and `C` absorbs
+   the remainder: row caches and the cold set never trade bytes at run time
+   (*lead ruling §T4*, I-4). If even `C` = every routed expert cannot clear
+   P3, the load **refuses** as `cold-set-cannot-clear-p3`, naming the reading,
+   the P3 threshold and the shortfall; it never loads below P3. The step is
+   `llama.cpp-yl3v`'s, through 7v5c's computation; th32 consumes its `C` and
+   slab bytes in `host_planned_bytes` (§4.2).
+   **Without one** (Qwen): the STORAGE caches take what is left as a
+   **yieldable** tenant (§6.4), split between tables in proportion to
+   `table_bytes x rows_per_token`, a proxy for miss traffic.
 
 Nothing in this sequence reads an environment variable except the ledger's
 budget override (§4.2). `--lazy-mode` keeps its upstream meaning of
 **eligibility**: `OFF` means the tensor is an ordinary weight and never a lazy
 table, and `AUTO`/`ON` pick the eligible set. The residency is always the
-planner's (D4).
+planner's (DLM, *lead ruling §T2*).
 
 ### 4.4 Interaction with host experts and later tenants
 
 - **Memory.** Host experts are charged before lazy tables (step 2 before step
-  4), which is the owner's ticket ruling ("after VRAM and experts"). A table on
-  STORAGE never displaces an expert.
-- **Execution.** A HOST gather runs in the leading CPU split, in microseconds.
-  A STORAGE gather runs on a SYCL runtime `host_task` thread, which mostly
-  sleeps on its ticket. Its CPU cost is the dequant of the rows (~2-3 ms per
-  PP512 ubatch per table, §2.4 and A.2), which does not compete with
-  `CpuExpertPool`'s compute workers in any measurable way. The pread workers
-  sleep in the kernel.
+  4), which is the owner's ticket ruling ("after VRAM and experts"). What
+  moves an expert to STORAGE is the host budget at P3 (step 5, owner §D4),
+  never a lazy table: a table becomes HOST only out of what is left once the
+  warm experts, the zones, the envelope and the fixed caches are charged, at
+  `C_selected`.
+- **Execution.** Both residencies' gathers run on a SYCL runtime `host_task`
+  thread. A HOST one takes microseconds; a STORAGE one mostly sleeps on its
+  ticket. The CPU cost is the dequant of the rows (~2-3 ms per PP512 ubatch per
+  table, §2.4 and A.2), which does not compete with `CpuExpertPool`'s compute
+  workers in any measurable way. The pread workers sleep in the kernel.
+- **IO.** The cold experts and the engram tables live on the same bcachefs USB
+  members, and share the one IO engine (§5.2). How much that costs is in §8.4.
 - **Later tenants.** A table's residency is immutable after the plan is
   published: a live HOST table is never demoted. Its **row cache** is
   different, because it holds only clean copies of file bytes: no lease, no
@@ -837,12 +978,26 @@ planner's (D4).
 <a id="th32-host-fit-numbers"></a>
 ### 4.5 What the planner will choose on this host (through T2's definition)
 
+**How to reproduce these numbers.** From the repository root, run
+`python3 docs/design/sycl_storage_tier_host_fit.py`. It needs no packages, and
+it prints every figure in this section: the ring, the per-set terms in both
+columns, the Qwen rows, DeepSeek cases A-F, the P3 check, and a cross-check of
+`9g22`'s cold set. It is hand arithmetic over the terms of §4.2, and
+`llama.cpp-7v5c`'s dry-run replaces it.
+
 **The budget.** `MemTotal` is 246.9 GiB, so `total x 90%` = 222.2 GiB and the OS
 reserve is 8 GiB. `MemAvailable` read **171.4, 181.8, 183.7 and 190.4 GiB** at
 four points today, moved by the other tenants (the qemu VM, Emby, Frigate), so
-`host_budget` = **163.4-182.4 GiB**. The table below states each case's
+`host_budget` = **163.4-182.4 GiB**. The tables below state each case's
 requirement as the `MemAvailable` it needs at load (requirement + 8 GiB), so
-that it can be checked against any reading.
+that it can be checked against any reading (§4.2: these readings are samples,
+not a gate).
+
+**Two columns.** *Today's code* is the sizing code at `c69d5774d`. *After (s)*
+is lever (s) of the owner's §D4: the ring type-gated to MXFP4 experts (so 0 on
+both models here), and the VRAM-resident `dma_staging_pool` and ring removed
+from host SCRATCH and from the RUNTIME pool (`llama.cpp-s4ip`), with one zone
+set per plan (`llama.cpp-sgc5`).
 
 **The exact weights** (GGUF tensor headers, `ds_q2k_census.py` and
 `qwen_census.py`, Appendix A.1):
@@ -859,88 +1014,129 @@ places no routed expert on the B50 at all. The static secondary route returns
 secondary-route equivalence gate), and the secondary executor exists only for
 MXFP4, Q4_0 and Q6_K (`:24943-24958`). So `llama.cpp-9g22`'s phase 1 pins
 `level_zero:0`, the B70 alone (its §4.5.1), and the same holds for Qwen's
-Q8_0 experts. With a placement budget of ~29.9 GiB, and after dense weights
-(DeepSeek ~2.8 GiB), attention state and device zones of 1.5-4 GiB, the B70
-holds **23-26 GiB** of DeepSeek experts and, with Qwen's 1.46 GiB more dense
-weight, **21.5-24.5 GiB** of Qwen's. A two-card run is `9g22`'s T25, after
-sgc5; there the cards hold ~31-38 GiB of DeepSeek experts.
+Q8_0 experts.
+
+- **After (s).** With a placement budget of ~29.9 GiB, and after dense weights
+  (DeepSeek ~2.8 GiB), attention state and device zones of 1.5-4 GiB, the B70
+  holds **23-26 GiB** of DeepSeek experts and, with Qwen's 1.46 GiB more dense
+  weight, **21.5-24.5 GiB** of Qwen's. A two-card run is `9g22`'s T25, after
+  sgc5; there the cards hold ~31-38 GiB of DeepSeek experts.
+- **Today's code.** The ring sets the floor of each card's VRAM RUNTIME zone
+  (§2.3), so the device zones are not 1.5-4 GiB but at least 7.87 GiB
+  (DeepSeek) or 4.17 GiB (Qwen). The B70 then holds up to that many bytes
+  fewer experts, and they become host experts. The today's-code rows below
+  charge the whole ring as displaced.
+- **Two VRAM terms are inputs, not estimates here.** They are the C-class terms
+  charged at the context transaction: `llama.cpp-1oxa`'s D512 no-tile ONEDNN
+  term (*lead ruling §V11.3*; DeepSeek's head_dim is 512) and
+  `onednn_graph_scratch` (*lead ruling §M19*, owned by `llama.cpp-23mk`). A
+  context that does not fit is refused (§V11.3), and planned expert copies are
+  never yielded to it (§M18.3, §M18.3a). So both terms displace host experts
+  1:1, and the plan must carry them before it places experts. 7v5c prints
+  them; this section carries no number for them.
 
 **The terms, per T2's definition** (GiB; `max_tensor` is 1.81 GiB for DeepSeek
 and 0.83 GiB for Qwen, both `blk.0.ffn_down_exps`):
 
-| term | source | Qwen | DeepSeek Q2_K |
-|---|---|---:|---:|
-| host experts, exact | total minus B70 experts | 95.0-98.0 | 157.3-160.3 |
-| other host weights (`token_embd`, CPU `get_rows`) | header | 0.63 | 0.20 |
-| `rnh3` named terms | WEIGHT reserve 64 MiB (`unified-cache.cpp:27103`) + `HOST_COMPUTE`; the TLSF bound is not yet defined | 0.1-0.5 | 0.1-0.5 |
-| host KV | Qwen: attention on the card at the gate contexts; DeepSeek: the dsv41 module is non-demotable (`9g22` §2.4) | 0 | 0 |
-| STAGING zone | `2 x max_tensor + 2 MiB + 16 MiB` + routing ids (6 MiB at `-c 4096`) + MMID pool (§2.3) | 1.68 | 3.64 |
-| SCRATCH zone | `2 x max_tensor + 32 MiB` (`max_tensor` + `moe_cpu_expert_staging`) + `dma_staging_pool` (`2 x max_tensor`) + oneDNN reorder ≈ 0.08 + `moe_q8` ≈ 0.03, + `moe_vram_runtime` and PP terms (not yet known) | 3.46+ | 7.39+ |
-| RUNTIME pool | oneDNN scratchpad ≈ 0.09 + `dma_staging_pool` a second time, + PP terms | 1.75+ | 3.72+ |
-| KV zone minimum | `:27673` | 0.06 | 0.06 |
-| **non-weight host, one zone set** | | **≈ 6.9** | **≈ 14.8** |
-| chunk rounding | pinned pools commit 2 GiB chunks (RUNTIME: 1.75 → 2.0, 3.72 → 4.0) | up to ~2.3 | up to ~2.3 |
-| **step 2, one zone set** (before rounding) | | **102.7-106.1** | **172.4-175.8** |
-| `host_reserve` + context envelope | 2 GiB + <= 0.5 GiB (DeepSeek: output slots 48 MiB, landing slabs 3.9 MiB, ring 0.5 MiB, `SYCL_Host` compute buffer) | 2.5 | 2.5 |
-| DSpark draft, host | `9g22` §10.3 | - | +7.9 |
+| term | source | Qwen today | Qwen after (s) | DeepSeek today | DeepSeek after (s) |
+|---|---|---:|---:|---:|---:|
+| host experts, exact | total minus B70 experts; today also the ring's VRAM displacement | 99.2-102.2 | 95.0-98.0 | 165.2-168.2 | 157.3-160.3 |
+| other host weights (`token_embd`, CPU `get_rows`) | header | 0.63 | 0.63 | 0.20 | 0.20 |
+| `rnh3` named terms | WEIGHT reserve 64 MiB (`unified-cache.cpp:27103`) + `HOST_COMPUTE`; the TLSF bound is not yet defined | 0.1-0.5 | 0.1-0.5 | 0.1-0.5 | 0.1-0.5 |
+| host KV | Qwen: attention on the card at the gate contexts; DeepSeek: the dsv41 module is non-demotable (`9g22` §2.4) | 0 | 0 | 0 | 0 |
+| STAGING zone | `2 x max_tensor + 2 MiB + 16 MiB` + routing ids at `-c 4096` (§2.3; expert bias and MMID pool not yet known) | 1.69 | 1.69 | 3.65 | 3.65 |
+| SCRATCH zone | `2 x max_tensor + 32 MiB` + oneDNN reorder ≈ 0.08 + `moe_q8` ≈ 0.03; today also `dma_staging_pool` (`2 x max_tensor`) and **the ring**; `moe_vram_runtime` and `pp_pipeline` not yet known | 7.63 | 1.80 | 15.26 | 3.77 |
+| ... of which the ring | `llama-model.cpp:430-507` | 4.17 | 0 | 7.87 | 0 |
+| RUNTIME pool, as committed | oneDNN scratchpad + `pp_pipeline` ≈ 0.09; today also the DMA pool and the ring again; 2 GiB chunks | 5.92 → 6 | 0.09 → 2 | 11.58 → 12 | 0.09 → 2 |
+| KV zone minimum | `ggml-sycl.cpp:5626` | 0.06 | 0.06 | 0.06 | 0.06 |
+| **non-weight host, one zone set, as committed** | | **15.4** | **5.6** | **31.0** | **9.5** |
+| main-pool chunk rounding | the main pool commits 2 GiB chunks | up to 2 | up to 2 | up to 2 | up to 2 |
+| **step 2, one zone set** (main-pool rounding excluded) | | **115.3-118.7** | **101.3-104.7** | **196.4-199.8** | **167.1-170.5** |
+| `host_reserve` + context envelope | 2 GiB + <= 0.5 GiB (output slots: Qwen 10 MiB, DeepSeek 48 MiB; DeepSeek landing slabs 3.9 MiB and ring 0.5 MiB; the `SYCL_Host` compute buffer) | 2.5 | 2.5 | 2.5 | 2.5 |
+| DSpark draft, host | `9g22` §10.3 | - | - | +7.9 | +7.9 |
 
-The DeepSeek non-weight terms agree with `9g22` rev 4 §4.5.2, and the step-2
-figure plus 4 GiB of row caches is its `expected_host` of 176.4-179.8 GiB. The
-MoE oneDNN and Q8 figures are `9g22`'s estimates for DeepSeek, reused for Qwen
-for want of better. T27's dry-run replaces all of them. The rows below exclude
-chunk rounding, so each requirement can be up to ~2.3 GiB higher.
+The oneDNN reorder and `moe_q8` figures are `9g22`'s estimates for DeepSeek,
+reused for Qwen for want of better. Every row below excludes the main pool's
+chunk rounding, so each requirement can be up to 2 GiB higher.
 
-**Qwen: HOST at every reading on one card.**
+**Qwen (B70 alone, one zone set).**
 
-| case | needed before the table | + table (HOST) | `MemAvailable` needed | leftover at 171.4 / 190.4 |
-|---|---:|---:|---:|---|
-| B70 alone, one zone set | 105.2-108.6 | 155.8-159.2 | **163.8-167.2** | 4.2-7.6 / 23.2-26.6 |
-| two caches, non-weight zones twice (after sgc5) | 112.1-115.5 | 162.8-166.2 | **170.8-174.2** | -2.8 to 0.6 / 16.2-19.6 |
+| code | needed before the table | + table (HOST) | `MemAvailable` needed | 171.4 | 181.8 | 183.7 | 190.4 |
+|---|---:|---:|---:|---|---|---|---|
+| today | 117.8-121.2 | 168.5-171.9 | **176.4-179.8** | **STORAGE** (42.2-45.6 left for the table) | HOST (1.9-5.3 spare) | HOST | HOST |
+| after (s) | 103.8-107.2 | 154.5-157.9 | **162.4-165.8** | HOST (5.5-8.9 spare) | HOST | HOST | HOST |
 
-On one card the table flips to STORAGE only when `MemAvailable` at load drops
-below ~164-167 GiB, which the lowest reading clears by 4.2-7.6 GiB. The leftover
-becomes other tenants' headroom; Qwen has no row cache while its table is
-HOST. If a two-card run keeps a second set of non-weight zones, the table
-flips at the lowest reading.
+- On today's code the table flips to STORAGE at the lowest reading, and 181.8
+  is marginal once main-pool rounding is counted. The flip does not depend on
+  the ring's device displacement: without it, today's code still needs
+  172.3-175.7.
+- After (s) the table is **HOST at every reading**. The spare becomes other
+  tenants' headroom; Qwen has no row cache while its table is HOST.
+- A second zone set (two cards before sgc5) adds another 5.6-15.4 GiB and
+  moves the flip up by as much.
 
-**DeepSeek Q2_K: both tables are STORAGE, and phase 1 does not fit at today's
-readings.**
+**DeepSeek Q2_K, the planner's fit** (`MemAvailable - 8`; the verdicts are
+after (s)):
 
-| case | requirement | `MemAvailable` needed | 171.4 | 181.8 | 183.7 | 190.4 |
+| case | today's code: `MemAvailable` needed | after (s): needed | 171.4 | 181.8 | 183.7 | 190.4 |
 |---|---:|---:|---|---|---|---|
-| A: phase 1 (B70 alone), no draft, floor caches | 174.9-178.3 | **182.9-186.3** | refused | refused | low corner only (0.8 left) | fits (4.1-7.5 left) |
-| B: A + gate-protocol caches (2 GiB per table, index included) | 178.9-182.3 | 186.9-190.3 | refused | refused | refused | fits (0.1-3.5 left) |
-| C: A + DSpark draft | 182.8-186.2 | 190.8-194.2 | refused | refused | refused | refused |
-| D: two cards after sgc5 and `9g22` T25, one zone set | 162.9-170.3 | 170.9-178.3 | low corner only (0.5 left) | fits (3.5-10.9 left) | fits (5.4-12.8 left) | fits (12.1-19.5 left) |
-| E: two cards, non-weight zones twice, WEIGHT once | 177.7-185.1 | 185.7-193.1 | refused | refused | refused | low corner only (4.7 left) |
-| F: two cards, code as it is today (WEIGHT twice) | ≈ 323-338 | ≈ 331-346 | refused (T2) or OOM without T2 | | | |
+| A: phase 1 (B70 alone), no draft, floor caches | 206.9-210.3 | **177.6-181.0** | refused | fits (0.8-4.2 left) | fits (2.7-6.1 left) | fits (9.4-12.8 left) |
+| B: A + gate caches (2 GiB per table, index included) | 210.9-214.3 | 181.6-185.0 | refused | low corner only (0.2 left) | low corner only (2.1 left) | fits (5.4-8.8 left) |
+| C: A + DSpark draft | 214.8-218.2 | 185.5-188.9 | refused | refused | refused | fits (1.5-4.9 left) |
+| D: two cards after sgc5 and `9g22` T25, one zone set | - | 165.6-173.0 | low corner only (5.8 left) | fits (8.8-16.2 left) | fits (10.7-18.1 left) | fits (17.4-24.8 left) |
+| E: D + the non-weight zones a second time | - | 175.1-182.5 | refused | low corner only (6.7 left) | fits (1.2-8.6 left) | fits (7.9-15.3 left) |
+| F: two cards, code as it is today (a whole second zone set, WEIGHT included) | 395.1-409.9 | - | refused (T2) or OOM without T2 | | | |
 
-("Leftover" is what step 5 would give the two row caches together.)
+On today's code every phase-1 case is refused at every reading. Lever (s)
+recovers ≈ 29.3 GiB of what case A needs: the ring three times (twice on the
+host, once as displaced experts) and the DMA pool twice.
 
-**Stated plainly** (C1): with the code's own terms, DeepSeek Q2_K's phase 1
-does not fit the planner at three of today's four readings. It fits at the
-highest reading (190.4 GiB) with 4.1-7.5 GiB to spare, and at 183.7 only at
-the low corner. Rev 2 of this document said case A fitted at every reading;
-that figure left out ~7.4 GiB of zone terms (the DMA staging pool twice, and
-the small SCRATCH terms) and assumed the B50 held experts. Every other phase-1
-case is refused at every reading but the highest, and the draft is refused at
-all four. The fit is decided by the other tenants' memory at load time, not by
-this model. Per *lead ruling §T1* (C1), this goes back to the owner as a **D8
-re-check** (§13). `9g22` rev 4 §4.5.2 reaches the same verdict through its P3
-envelope and lists the levers (its lever (b), `llama.cpp-s4ip`, recovers
-~12.6 GiB per zone set, ~7.25 of it the two DMA staging copies).
+<a id="th32-p3"></a>
+**DeepSeek Q2_K, 9g22's P3: the binding check** (*lead ruling §T4*, I-2).
+The gate protocol launches only at a predicted post-load `MemAvailable` of at
+least 24 GiB: `MemAvailable_pre - expected_host - 5 >= 24`, where
+`expected_host` is step 2 as committed plus the gate caches (2 x 2 GiB), with
+no draft, before any cold set, and without the main pool's chunk rounding
+(0-2 GiB), as 9g22 §4.5.2 defines it. Its margin (29 GiB over
+`expected_host`) is wider than the planner's (8 GiB, plus the 2.5 GiB reserve
+and envelope), so **a plan that passes P3 also passes the planner**.
 
-Where the row caches land on the hit-rate curves (§6.2.2), when the model does
-fit:
+| code | `expected_host` | `MemAvailable_pre` needed | predicted post-load `MemAvailable` at 171.4 / 181.8 / 183.7 / 190.4 |
+|---|---:|---:|---|
+| today | 200.4-203.8 | 229.4-232.8 | -37.4 to -34.0 / -27.0 to -23.6 / -25.1 to -21.7 / -18.4 to -15.0 |
+| after (s) | **171.1-174.5** | **200.1-203.5** | -8.1 to -4.7 / 2.3 to 5.7 / 4.2 to 7.6 / 10.9 to 14.3 |
 
-- **At the floor** (case A), the caches hold a few ubatches' rows:
-  effectively the cold rows of §6.2.2.
-- **At the 2 GiB gate cap** (case B), each table has ~1.7 GiB of 84 B slots
-  after its index (44 M slots together). In the simulation's units (110 B
-  slots) that is ~4.5 GiB, between the 2 GiB and 8 GiB columns.
-- **At 190.4 GiB** (case A), the caches get 4.1-7.5 GiB together, around the
-  2 GiB-per-table column. Case D at the same reading gives 12.1-19.5 GiB,
-  past the 8 GiB column's knee on every corpus.
+P3 fails at every reading in both columns, so without a cold set the gates
+cannot launch at all. After (s), `expected_host` agrees with `9g22` rev 5
+§4.5.2's 171.0-174.4 GiB to rounding. Rev 5's today's-code row (188.0-195.4)
+is 8.4-12.4 GiB lower than the one above, which charges the ring's full VRAM
+displacement and the 4 GiB of gate caches. That row decides nothing (today's
+code fails P3 either way) and is not reconciled by hand here; 7v5c's printout
+is the one list of terms both documents cite (§4.2).
+
+<a id="th32-d4-fit"></a>
+**DeepSeek Q2_K with the owner's §D4 applied** (D8, *lead rulings §T3,
+§D5*). The fit is case A after (s), minus the bytes of the cold set `C` that
+moves to STORAGE, plus its landing slab (`2C/40`). `C` is not a th32 choice:
+7v5c computes `C = max(C_selected, C_P3)` at load from that load's reading
+(§4.3 step 5), with the gate caches fixed before it (§T4, I-4). The size it
+reaches at 171.4 GiB and at 189.6 GiB is `9g22`'s figure, in
+[its §4.5.2](deepseek41-runtime.md#452-the-host-fit-r2-c-a-r3-c-1-c-2-owner-d4)
+(the cold-set table); this document does not restate it. The calculator's
+cross-check, run from the P3 row above, lands in the same range. Because P3
+binds, a load whose `C` clears P3 also fits the planner. With the DSpark draft
+(production, after gates 1-4) `C` grows by about the draft's bytes. The load
+refuses (`cold-set-cannot-clear-p3`) only if moving every routed expert to
+STORAGE would still fail P3. At the lowest reading that is far away: P3's
+deficit there (the P3 table above) is under a fifth of the 183.25 GiB of
+experts.
+
+Where the row caches land on the hit-rate curves (§6.2.2): in a plan with a
+cold set they are **fixed** at the gate size, 2 GiB per table with the index
+included (§4.3 step 4, §T4 I-4). That leaves each table ~1.7 GiB of 84 B slots
+after its index, 44 M slots together, which is ~4.5 GiB in the simulation's
+110 B units, between its 2 GiB and 8 GiB columns. That is the DeepSeek
+operating point at every reading; the reading changes `C`, not the caches.
 
 ---
 
@@ -1021,6 +1217,20 @@ workers). The prefill lost ~100 ms. So the engine's queue is:
   row in ubatch `k` and in `k+1`'s lookahead, or two contexts reading the same
   hot row cold at the same moment. Two rows that share a 4 KiB block are one
   read.
+- **Cold-expert slice reads share the pool** (owner §D4, *lead ruling §T4*
+  I-4). The cold experts and the engram tables live on the same two USB
+  bcachefs members, so a second engine would only hide the contention, not
+  remove it. `llama.cpp-yl3v` therefore submits its expert-slice reads through
+  this pool, as class 0 of the context that routed them, with the deadline set
+  to the expert's layer, in chunks of at most 512 KiB (§9.2.2). One ordering
+  then serves both kinds of read. An engram `blk.1` row (deadline 1) goes ahead
+  of any expert read for a later layer, and nothing preempts a chunk a worker
+  has already started, so an engram read waits at most for one worker to
+  finish its current chunk. The interface is `lazy_io_submit(fd, offset,
+  length, destination handle, ticket, class, deadline)`, the same call for a
+  4 KiB row block and a 512 KiB slice chunk (§9.2.1). The cost of the sharing
+  is not known until it is measured; §8.4 states targets for the shared
+  device.
 
 The rules both engines follow:
 
@@ -1049,8 +1259,9 @@ landing slot { uint32 epoch; ticket * owner; }   // depth 2 per table per contex
   row, 84-170 B. That removes any window in which another context could evict
   it. A **miss** registers a waiter in the in-flight table, joining a pending
   read or queuing a new one. `outstanding` is the number of waiters this ticket
-  registered. For a STORAGE table `prefetch` then submits the gather's host
-  task (§7.2, step 1), with no device dependency.
+  registered. `prefetch` then submits the gather's host task (§7.2, step 1),
+  with no device dependency. A HOST table skips the classification and the
+  ticket: its `prefetch` only submits the host task.
 - **The reaper**, the worker whose read completed (or the io_uring CQ reader),
   removes the entry from the in-flight table, then handles each waiter: if the
   waiter's epoch still equals its slot's epoch and its ticket is not
@@ -1082,7 +1293,9 @@ landing slot { uint32 epoch; ticket * owner; }   // depth 2 per table per contex
 
 **Every wait on the path, named:**
 
-1. **HOST residency: none.** The CPU op dequantizes from the resident body.
+1. **HOST residency: none for rows.** The host task dequantizes from the
+   resident body and has no ticket to wait for. It shares item 7 with
+   STORAGE.
 2. **STORAGE: the gather's `host_task` waits for `outstanding == 0`** on a
    SYCL runtime thread. A CPU thread waits for *storage* IO, never for the GPU,
    and the host thread that submits the graph never waits at all. The wait is
@@ -1105,17 +1318,19 @@ landing slot { uint32 epoch; ticket * owner; }   // depth 2 per table per contex
      `set_tensor`.
    - The replay fragmentation of C2: the gather adds no `graph_compute` call,
      so the context's exec-graph slot sees the same graph every token (§7.4).
-5. **Nothing added at the graph's start.** The rows input and a HOST gather's
-   output both live in the CPU backend's compute buffer, which on this fork is
-   the SYCL host buffer type (`76c7f6548 src/llama-context.cpp:888-895`), and
-   the SYCL device reports that type as supported
-   (`ggml-sycl.cpp:108809-108811`). The scheduler therefore creates no split
-   input and no copy for either (`ggml-backend.cpp:2116`, the
-   `!ggml_backend_sched_buffer_supported` condition; the per-copy input
-   duplicates of `:2092-2112` need `n_copies > 1`, and pipeline parallelism is
-   off whenever a SYCL placement plan is active, `llama-context.cpp:970-971`):
-   the consuming SYCL op reads the activation where it is, exactly as the
-   first SYCL split reads `inp_embd` today (DQ, §13). Wait sites (2)-(4) of the `llama.cpp-jhxq` census are not
+5. **Nothing added at the graph's start, and nothing read in place.** The rows
+   input lives in the CPU backend's compute buffer, which on this fork is the
+   SYCL host buffer type (`76c7f6548 src/llama-context.cpp:888-895`), and the
+   SYCL device reports that type as supported (`ggml-sycl.cpp:108809-108811`).
+   The scheduler therefore creates no split input and no copy for it
+   (`ggml-backend.cpp:2116`, the `!ggml_backend_sched_buffer_supported`
+   condition; the per-copy input duplicates of `:2092-2112` need
+   `n_copies > 1`, and pipeline parallelism is off whenever a SYCL placement
+   plan is active, `llama-context.cpp:970-971`). No device reads it either:
+   the gather node dispatches nothing, and `lazy_prefetch()` read the ids on
+   the host at `set_input` (§7.2). The gather's **output** reaches the device
+   only by the explicit copy of item 3, in both residencies (*lead ruling
+   §T2*, DQ). Wait sites (2)-(4) of the `llama.cpp-jhxq` census are not
    reached by anything this design adds; `jhxq` stays open for the copies
    other paths make.
 6. **A risk to verify, not a wait by design:** SYCL `host_task`s run on the
@@ -1126,9 +1341,9 @@ landing slot { uint32 epoch; ticket * owner; }   // depth 2 per table per contex
    place. §7.2 pre-registers four probes (HT-1 to HT-4) that T7 runs first,
    through the lead; HT-3 is this case. If any fails, the completion signal
    moves to the reaper and a host-signalled Level Zero event (D6-M, §13).
-7. **The output slot's reuse check** (§7.2): the host task's thread, never the
-   submitting thread, waits for the device, and only when the device runs two
-   ubatches behind the host.
+7. **The output slot's reuse check** (§7.2), in both residencies: the host
+   task's thread, never the submitting thread, waits for the device, and only
+   when the device runs two ubatches behind the host.
 8. **The landing slot's reuse check** (§7.2): `prefetch(k+2)` waits on the
    submitting thread for ubatch `k`'s host task to consume its slot, which
    happens only when ubatch `k`'s storage IO is still outstanding two ubatches
@@ -1148,7 +1363,7 @@ landing slot { uint32 epoch; ticket * owner; }   // depth 2 per table per contex
 
   | table | residency here | issued | needed before | window |
   |---|---|---|---|---|
-  | Qwen `per_layer_token_embd` | HOST | nothing to issue | block 1 | n/a: the gather is ~4 us per token and sits in the leading CPU split |
+  | Qwen `per_layer_token_embd` | HOST | `lazy_prefetch()` submits the host task; no IO | block 1 | graph launch + block 0, against a ~4 us gather |
   | DeepSeek `blk.1.engram_embd` | STORAGE | `lazy_prefetch()`, class 0, deadline 1 | block 1 (B70) | graph launch + block 0 |
   | DeepSeek `blk.14.engram_embd` | STORAGE | `lazy_prefetch()`, class 0, deadline 14, behind `blk.1` | block 14 (B70) | graph launch + blocks 0-13 |
 
@@ -1327,15 +1542,13 @@ Why DeepSeek is harder, beyond having 3x the rows:
   prose ~16 k against ~4.3 k, code ~3.0 k against ~0.7 k.
 
 Prose keeps gaining up to 8 GiB (wiki train: 34% at 512 MiB, 46% at 8 GiB),
-and the distinct-row sets are 0.9-11.5 GiB. What Q2_K gets on this host depends
-on the tenants' memory at load (§4.5): from the floor (effectively the cold
-rows above) in case A at the lowest reading, through ~4.5 GiB in simulation
-units under the gate protocol's 2 GiB-per-table cap, to 4.1-7.5 GiB at the
-highest reading on one card (case A). Only a two-card run after
-`llama.cpp-sgc5` (case D, 12.1-19.5 GiB at the highest reading) gets past
-every corpus's knee. So on phase 1 the cache size matters: it sits at or below
-the 2 GiB-per-table column, and the hit rates of that column are the
-operating point.
+and the distinct-row sets are 0.9-11.5 GiB. On this host Q2_K's phase 1 has a
+cold-expert set, so its caches are **fixed** at the gate size, 2 GiB per table
+with the index included (§4.3 step 4, *lead ruling §T4* I-4). That is ~4.5 GiB
+in simulation units, between the 2 GiB and 8 GiB columns, at every reading:
+the reading moves the cold set, not the caches (§4.5). The hit rates of those
+two columns bracket the operating point. A larger cache would cost the same
+number of GiB of warm experts, one for one.
 
 **Which corpora a target may quote** (M4). The code and docs corpora are this
 fork's own sources, and the decode and perplexity vehicles in §8 would run on
@@ -1382,9 +1595,15 @@ Code and docs stay in the tables as the upper bound.
   Q2_K table. The floor is charged in step 4 (§4.3), before any leftover, and is
   never yielded. If even the floor does not fit, the load is refused as
   `lazy-table-cache-below-floor`.
-- **The leftover, yieldable** (*lead ruling §T1*, I8). Step 5 gives the rest of
-  the host budget to the row caches, split as that step states (evenly for
-  DeepSeek's two equal tables), in
+- **Fixed, when the plan has a cold set** (*lead ruling §T4*, I-4). Then each
+  cache is charged at its target in step 4, before the cold set is sized, and
+  it does not trade bytes with the cold set at run time in either direction
+  (§4.3). For DeepSeek this design proposes the gate size, 2 GiB per table
+  including the index, as the target. It is still built from yieldable
+  256 MiB chunks, so a context tenant can take bytes back (below).
+- **The leftover, yieldable, when it has none** (*lead ruling §T1*, I8). Step 5
+  gives the rest of the host budget to the row caches, split as that step
+  states, in
   **256 MiB chunks**. Each chunk is its own `HOST_CPU` allocation (role
   `LAZY_ROW_CACHE`) and is charged in the ledger as **yieldable**. When a later
   tenant needs host bytes (a new context's envelope, a KV growth, a later
@@ -1414,7 +1633,7 @@ Code and docs stay in the tables as the upper bound.
 ## 7. The executor (item 5)
 
 <a id="th32-executors"></a>
-### 7.1 The residency decides the executor, and the provider decides the position
+### 7.1 One gather path, and the provider decides the position
 
 Every consumer of a lazy tensor (Qwen's `build_inp_ple`, DeepSeek's engram block
 input, and the rest of §9) calls one graph helper:
@@ -1425,31 +1644,39 @@ ggml_tensor * llm_graph_context::build_lazy_get_rows(ggml_tensor * lazy, ggml_te
 
 - **Without SYCL hooks**, it returns `ggml_get_rows(lazy, rows)`: the upstream
   path, with the mmap and page faults, unchanged.
-- **HOST residency: a CPU op in the leading split** (*lead ruling §T1*, C2). It
-  returns
-  `ggml_custom_4d(ctx, GGML_TYPE_F32, ne0 = row elements, ne1 = n_rows_requested, 1, 1, {rows}, 1, lazy_get_rows_cpu, GGML_N_TASKS_MAX, gather_ctx)`.
-  Its only source is `rows`, never the lazy tensor, so no scheduler rule can
-  pull it toward the table's buffer. SYCL declines `GGML_OP_CUSTOM` (§2.3), and
-  `rows` is an input, which the scheduler assigns to the CPU (`ggml-backend.cpp`
-  rule `1.inp`, `:1651-1653`), so the node runs on the CPU. The helper expands
-  it right after `inp_embd`, in the **leading** CPU split, which is where
-  upstream puts PLE on purpose ("make sure ple_emb and build_inp_embd are in
-  the same graph split", `694ec2354 src/models/qwen4exp.cpp:381-386`). Each
-  of the `nth` threads dequantizes its share of rows **straight from the
-  resident body** through the type's `to_float` trait. There is no ticket and
-  no landing slab (§3.3). The result has the shape `ggml_get_rows` produces,
-  so each model's reshape and everything downstream are untouched.
-- **STORAGE residency: `GGML_OP_GET_ROWS(lazy, rows)`, claimed by SYCL.** The
-  lazy tensor sits in the SYCL descriptor buffer of its consumer device
-  (§3.2), a `WEIGHTS` buffer, so the scheduler assigns the node to that SYCL
-  backend (rule `1.wgt`, `ggml-backend.cpp:1594-1612`, `:1684`); the CPU
-  backend cannot claim it, because the buffer is not a host buffer. The SYCL
-  backend recognizes a `GET_ROWS` whose `src[0]` is in a lazy buffer and runs
-  the gather of §7.2. There is no CPU split in the middle of the graph.
+- **Both residencies: `GGML_OP_GET_ROWS(lazy, rows)`, claimed by SYCL**
+  (*lead ruling §T2*, DQ: one code path for both tiers). The lazy tensor sits
+  in the SYCL descriptor buffer of its consumer device (§3.2), a `WEIGHTS`
+  buffer, so the scheduler assigns the node to that SYCL backend (rule
+  `1.wgt`, `ggml-backend.cpp:1594-1612`, `:1684`); the CPU backend cannot claim
+  it, because the buffer is not a host buffer. The SYCL backend recognizes a
+  `GET_ROWS` whose `src[0]` is in a lazy buffer and runs the gather of §7.2.
+  The residency changes only what the host task does before it dequantizes:
+  a HOST table's host task reads the resident body at once, a STORAGE table's
+  first waits for its ticket. There is no CPU split in the middle of the graph,
+  and the result has the shape `ggml_get_rows` produces, so each model's
+  reshape and everything downstream are untouched.
+- **Why HOST no longer sits in the leading CPU split** (rev 2a's form, *lead
+  ruling §T1* C2; put to the lead as DQ-C2, §13). Rev 2a made the HOST gather
+  a CPU custom op in the leading split and let the first SYCL op read its
+  output from the `SYCL_Host` compute buffer in place. §T2's DQ forbids that
+  read, and an explicit copy from the leading split cannot be made wait-free.
+  The CPU op runs on the submitting thread and writes the same compute-buffer
+  bytes for every ubatch, because `gallocr` gives a graph of the same topology
+  the same addresses. In a multi-ubatch prefill nothing orders ubatch `k+1`'s
+  CPU op after the device's copy of ubatch `k`'s output: the ubatch loop does
+  not synchronize between ubatches unless pipeline parallelism is on
+  (`c69d5774d src/llama-context.cpp:2724-2729`), and the SYCL split takes no
+  split-input copy for a supported host buffer (§5.3 item 5). Guarding that
+  source would take a wait on the submitting thread for the device, which is
+  the host wait this design exists to avoid. The host task of §7.2 puts the
+  same guard on a runtime thread (§7.2, the output-slot rule). So HOST takes
+  the STORAGE path, and the CPU custom op survives only as arm C's executor
+  (§8.4).
 - **Position.** The helper expands the node at the **head of the consumer
   device's first split**: immediately before the first node of the first layer
   that runs on the table's consumer device. On one device that is right after
-  `inp_embd`, as for HOST. With `-sm layer` and a consumer layer on the second
+  `inp_embd`. With `-sm layer` and a consumer layer on the second
   card, a node placed at the very start of the graph would instead form a
   one-node split on that card ahead of the first card's split, and the
   first card's split would then pay the zero-input sync (`llama.cpp-x1xd`)
@@ -1461,18 +1688,20 @@ ggml_tensor * llm_graph_context::build_lazy_get_rows(ggml_tensor * lazy, ggml_te
   device waits only at the copy before the consumer, so the node's position
   changes nothing that runs; it only has to keep the split structure intact.
 
-### 7.2 The SYCL-owned STORAGE gather (*lead ruling §T1*, D6(c))
+### 7.2 The SYCL-owned gather, both residencies (*lead rulings §T1* D6(c), *§T2* DQ)
 
 1. **At prefetch time, a `host_task` on a per-context, per-device
    out-of-order host queue** (same SYCL context as the main queue), with
    **no** `depends_on`. `prefetch` (§5.3) submits it right after it has
-   queued the table's reads, from `lazy_prefetch()`, before the graph is
-   submitted (§7.5). Its inputs are host data that is complete at `set_input`,
-   so it has nothing on the device to depend on. It waits for its ticket, then
-   dequantizes the landing slab's rows into the context's pinned `LAZY_OUTPUT`
-   slot (§3.3) through the type's `to_float` trait. Nothing else runs on that
-   queue. A `host_task` whose `depends_on` names an in-flight event from
-   another queue blocks the *submitting* thread until that event completes
+   queued the table's reads (STORAGE) or at once (HOST), from
+   `lazy_prefetch()`, before the graph is submitted (§7.5). Its inputs are
+   host data that is complete at `set_input`, so it has nothing on the device
+   to depend on. A STORAGE host task waits for its ticket, then dequantizes
+   the landing slab's rows; a HOST host task dequantizes the rows straight from
+   the resident body. Both write the context's pinned `LAZY_OUTPUT` slot (§3.3)
+   through the type's `to_float` trait. Nothing else runs on that queue. A
+   `host_task` whose `depends_on` names an in-flight event from another queue
+   blocks the *submitting* thread until that event completes
    (measured on both cards for `llama.cpp-c6ah`, 2026-09-09, 6/6 reps). Had
    `blk.14`'s host task depended on device work, submitting it would have held
    the host until blocks 0-13 finished, and blocks 14-39 would have been
@@ -1484,7 +1713,9 @@ ggml_tensor * llm_graph_context::build_lazy_get_rows(ggml_tensor * lazy, ggml_te
 Before the **first node (or fused group) that reads the gather's `dst`**, the
 backend enqueues, on the **main in-order queue**:
 
-3. `memcpy(dst_device, output_slot, bytes)` with `depends_on(host_task event)`.
+3. `memcpy(dst_device, output_slot, bytes)` with `depends_on(host_task event)`:
+   the explicit, event-ordered H2D copy of *lead ruling §T2* DQ, the same for
+   both residencies.
    Because the main queue is in-order, the copy runs after every earlier
    main-queue command, including the previous graph's readers of the same
    compute-buffer region: that is the write-after-read guard, with no barrier
@@ -1505,7 +1736,8 @@ Rules around it:
   device runs two ubatches behind the host; then the host task's thread, never
   the submitting thread, waits for it. That is the CPU executor waiting on its
   own output slot, a named wait (§5.3, item 7).
-- **The landing slot is reused only after its host task consumed it.** Slot
+- **The landing slot is reused only after its host task consumed it**
+  (STORAGE only; a HOST table has no landing slab). Slot
   `k mod 2` of the landing slab is reassigned by `prefetch(k+2)`, which copies
   that ubatch's hits into it at once (§5.3). The host task of ubatch `k` sets
   the slot's `consumed_epoch` (a host atomic) when its dequant is done, and
@@ -1566,30 +1798,40 @@ program with no model, a few seconds long, on `level_zero:0` and then
 
 ### 7.3 Data movement, and P1 at both ends (M7)
 
-- **HOST.** The custom op's F32 output is an activation in the CPU backend's
-  compute buffer, the SYCL host buffer type (§7.2). The consuming SYCL op
-  reads it from there, exactly as the first SYCL split reads `inp_embd` today:
-  10 KiB per token (Qwen), 5 MiB per PP512 ubatch. That buffer is allocated by
-  `ggml_backend_sycl_host_buffer_type`, whose memory comes from the unified
-  cache as `HOST_COMPUTE`, and `llama.cpp-zhcn` puts it in the plan. This
-  design adds bytes to it (the gather's output) and changes nothing about how
-  it is owned.
-  **One thing this makes visible**: the consuming SYCL kernel reads that
-  activation from pinned host memory over PCIe, with no copy, because the
-  scheduler makes no copy for a buffer type the device supports (§5.3, item
-  5). That is how every CPU-split output reaches SYCL in this fork today,
-  `inp_embd` included, and it is 10 KiB per decode token here. P3 as written
-  forbids GPU zero-copy of host memory in the context of weights; whether it
-  also covers this activation path is a question for the lead (DQ, §13), not
-  something this design changes either way.
-- **STORAGE.** The copy in §7.2 step 3 is an **activation** too: 24 KiB per
-  token per DeepSeek table, 12 MiB per PP512 ubatch per table, ~1 ms of PCIe
-  against ~1.4 s of cold IO for that table's rows. Its source is the
+- **Both residencies** (*lead ruling §T2*, DQ). The copy in §7.2 step 3 is an
+  **activation**: 10 KiB per token for Qwen and 24 KiB per token per DeepSeek
+  table, 5 MiB and 12 MiB per PP512 ubatch, ~1 ms of PCIe at most, against
+  ~1.4 s of cold IO for a DeepSeek table's rows. Its source is the
   `LAZY_OUTPUT` slot, a `HOST_PINNED` allocation from `unified_allocate_owner`
-  (§3.3); its destination is the gather's `dst` in the device compute buffer,
-  planned by `gallocr` and allocated from the unified cache. Both ends are
-  unified-cache memory (P1) held by `mem_handle`s that outlive the queued copy
-  (P2).
+  (§3.3), which only the copy engine reads. Its destination is a planned
+  device slot: the gather's `dst` in the device compute buffer, planned by
+  `gallocr` and allocated from the unified cache. Both ends are unified-cache
+  memory (P1) held by `mem_handle`s that outlive the queued copy (P2). It
+  never goes through `set_tensor` (`llama.cpp-jhxq`) and never needs the
+  scheduler's zero-input sync (`llama.cpp-x1xd`), because the backend enqueues
+  it itself on its in-order queue behind an event (§5.3).
+- **No GPU read of `SYCL_Host` memory on this path.** Neither the gather's
+  output nor its rows input is read by a device kernel: the output goes
+  through the copy, and the rows are read only on the host (§5.3 item 5). This
+  is the same P3 rule as `llama.cpp-zhcn`'s eager-path fix, which found and
+  removed a zero-copy read of the same shape. The general census of CPU-split
+  outputs that SYCL still reads zero-copy, `inp_embd` first, is a separate
+  ticket the lead files (§T2 DQ); this design does not solve it and does not
+  add a member to it.
+  **T7's RED.** A lead-run graph fixture on `level_zero:0` with one HOST and
+  one STORAGE lazy gather feeding a SYCL consumer. For every node it
+  dispatches, the SYCL backend checks whether a source that is a lazy gather's
+  `dst` resolves to a host buffer (`ggml_backend_buffer_is_host`), and counts
+  it in an unconditional counter, `lazy_zero_copy_reads` (§10). It counts the
+  step-3 copies in `lazy_output_copies`. The fixture requires
+  `lazy_zero_copy_reads == 0` and `lazy_output_copies == tables x graphs`, and
+  compares the consumer's input with a CPU `get_rows` of the same rows.
+  - It fails first: T7 lands the recognition and the counters before the copy,
+    so `lazy_output_copies` is 0 and the consumer reads an unwritten `dst`.
+  - The zero-copy probe has a positive control, so its zero means something:
+    the same check pointed at `inp_embd`'s first SYCL consumer, which reads the
+    `SYCL_Host` compute buffer in place today (the census ticket's case), must
+    count at least one read per graph.
 - **Placement consistency (P3).** The table never crosses PCIe; the device
   receives the *result* of a CPU op. No weight byte is staged to the device
   (no streaming), and no device kernel reads a table. The table is consumed
@@ -1623,13 +1865,15 @@ segment boundary.**
   replays with directly dispatched nodes (`ggml-sycl.cpp:97186-97270`, the
   `MUL_MAT_ID` boundaries collected by `moe_graph_collect_dispatch_indices`).
   T7 widens that collector to a **boundary set** = the MoE dispatch indices
-  plus, for each STORAGE gather, the first node that reads its `dst`. At that
-  boundary the backend submits §7.2 step 3; the gather node itself is a no-op
+  plus, for each lazy gather of either residency, the first node that reads
+  its `dst`. At that boundary the backend submits §7.2 step 3; the gather node
+  itself is a no-op
   in both modes (its host task was submitted at prefetch), and the segments
   between boundaries replay as today.
-- **What it costs.** On DeepSeek, one extra segment per consumer (two per
-  graph): each consumer boundary falls inside a segment that already ends at
-  the previous layer's `MUL_MAT_ID`. The replay-count cap
+- **What it costs.** One extra segment per consumer: two per graph on
+  DeepSeek, one on Qwen. On DeepSeek each consumer boundary falls inside a
+  segment that already ends at the previous layer's `MUL_MAT_ID`. The
+  replay-count cap
   (`MAX_PROFITABLE_SEGMENT_GRAPHS = 8`, `:97249`) applies to the total, and T7
   must show the DeepSeek decode graph stays under it or raise the cap with a
   measurement.
@@ -1659,10 +1903,11 @@ segment boundary.**
 `llm_graph_result` records every `build_lazy_get_rows` call as
 `{gather_ctx, rows_input_tensor, consumer_layer, residency}`. After
 `llm_graph_result::set_inputs()` has run every input's `set_input`,
-`llama_context` calls `res->lazy_prefetch()`. For each STORAGE record, in
-ascending `consumer_layer`, it reads the row indices from the rows input,
-whose buffer is the CPU backend's host compute buffer (§7.2), and calls
-`prefetch` with class 0 (§5.2). HOST records need no prefetch. Lookahead (§5.4)
+`llama_context` calls `res->lazy_prefetch()`. For each record, in ascending
+`consumer_layer`, it reads the row indices from the rows input, whose buffer
+is the CPU backend's host compute buffer (§7.2), and calls `prefetch`: with
+class 0 for a STORAGE table (§5.2), and for a HOST table only to submit its
+host task (§5.3). Lookahead (§5.4)
 is the one per-model hook. Model code is untouched apart from
 `build_lazy_get_rows` and the layer loop's `lazy_expand_for_layer`.
 
@@ -1685,16 +1930,20 @@ every binary, so every arm runs the **same** build. There is no test-only
 override and no `GGML_SYCL_PRIVATE_TESTING` arm (that define is per test target
 and never reaches `llama-bench` or `llama-perplexity`).
 
-- **H**: HOST residency. Qwen's natural choice here, no override. DeepSeek has
-  no H arm on this host (§4.5).
+- **H**: HOST residency. Qwen's natural choice here once lever (s) lands, no
+  override; on today's code Qwen is STORAGE at the lowest reading (§4.5), so an
+  H run records its `MemAvailable` at load. DeepSeek has no H arm on this host
+  (§4.5).
 - **S**: STORAGE residency, by setting the budget below the table:
   `RESERVE_MB = (step-3 requirement + floors + cache target) / 1 MiB`, the
   requirement taken from that run's own plan line in a load-only run first.
-  For Qwen that is ~105 GiB with a 4 GiB cache target. For DeepSeek S is the
-  natural choice, and the same lever **caps its caches**: `llama.cpp-9g22`'s
-  gate protocol wants <= 2 GiB per table (its §5.2 P1), which is
-  `RESERVE_MB = case-A requirement + 2 x (2 GiB + index)`. No separate cache-size
-  variable exists or is needed.
+  For Qwen the step-3 requirement is ~118-121 GiB on today's code and ~104-107
+  GiB after (s) (§4.5), plus a 4 GiB cache target. For DeepSeek S is the
+  natural choice and its caches are fixed at the gate size, 2 GiB per table
+  **with the index included**, which is also 9g22's P1 cap (§4.3 step 4). An
+  S arm that wants a different cache sets `RESERVE_MB` = the case-A
+  requirement + 2 x the per-table cache size, index included. No separate
+  cache-size variable exists or is needed.
   - **S-cold**: a fresh load, empty cache.
   - **S-warm**: steady state after at least 25% of a same-domain stream.
   - **S-hot**: the same text replayed with a cache at least as large as its
@@ -1709,9 +1958,9 @@ engagement is shown, because an absence of work looks exactly like success:
 
 | arm | required in that run's own log | void if |
 |---|---|---|
-| H | `[PLACEMENT] lazy <name> residency=HOST` **and** `rows_requested > 0` **and** `blocks_read == 0` | the line is missing, or `rows_requested == 0` (the design silently disengaged, e.g. `AUTO` fell to `OFF`) |
+| H | `[PLACEMENT] lazy <name> residency=HOST` **and** `rows_requested > 0` **and** `blocks_read == 0` **and** `lazy_output_copies > 0` | the line is missing, or `rows_requested == 0` (the design silently disengaged, e.g. `AUTO` fell to `OFF`) |
 | S | `residency=STORAGE`, `rows_miss > 0`, `blocks_read > 0` | any is zero |
-| any SYCL-gather arm | the §7.4 record-mode witness | any witness fails |
+| any SYCL-gather arm | the §7.4 record-mode witness, and `lazy_zero_copy_reads == 0` (§7.3) | any witness fails |
 | negative control, once | a `--lazy-mode off` run shows **no** `[PLACEMENT] lazy` line and no lazy counters | the check fires anyway (then it proves nothing) |
 
 **Correctness gate, every arm.** Greedy decode (`--temp 0 --seed 42`, 64
@@ -1723,8 +1972,8 @@ oracle gate.
 
 **Instruments.**
 
-- `T_gather`: HOST, time inside the CPU op per ubatch; STORAGE, the host task's
-  run time.
+- `T_gather`: the host task's run time, per ubatch. For STORAGE it includes
+  the ticket wait; `T_ticket` separates it out.
 - `T_ticket(t)`: the part of table `t`'s gather spent waiting on its ticket,
   measured from the host task's start (≈ graph launch). It bounds the IO
   latency the device can see.
@@ -1747,6 +1996,11 @@ oracle gate.
   its duration, so that fresh (NVMe-foreground) and settled (backing-device)
   placement are told apart: during the `blk.1` probes the NVMe wrote 7.5 GB in
   15 s at 4657 IOPS, and 0.4-0.5 GB at 7070-7242 two minutes later.
+- **Concurrent expert IO** (*lead ruling §T4*, I-4). On DeepSeek, every arm
+  also records the cold-expert reads that shared the device in the same
+  window: `llama.cpp-yl3v`'s read and byte counters, per ubatch and per decode
+  token, next to the engram counters. Without that record, an engram latency
+  measured on the shared device cannot be told apart from contention.
 - **Scaling rule for latency targets.** The latency targets below were measured
   with the control at 4657-7242 IOPS. When an arm's bracketing control reads
   below 4657, each latency bound is multiplied by `4657 / control`.
@@ -1755,7 +2009,7 @@ oracle gate.
 
 | arm | target | derived from |
 |---|---|---|
-| H | `T_gather` <= **20 us/token**; tg128 within **1%** of `--lazy-mode off` (scored on that arm's second run, its table pages resident) | measured 4.2 us for 16 rows including dequant |
+| H | `T_gather` <= **20 us/token** (the host task's run time); tg128 within **1%** of `--lazy-mode off` (scored on that arm's second run, its table pages resident) | measured 4.2 us for 16 rows including dequant |
 | S-cold | `T_ticket` mean <= **4.3 ms/token**, p99 <= **15 ms** | batch of 16: mean 3.75 ms, p99 13.0 ms (A.2), + 15% |
 | S-warm | mean `T_ticket` <= **(1 - P0) x 4.3 ms**, where P0 is the steady-state zero-miss share at the *planned* `cache_slots` (§8.5): prose 32-43%, mixed 63-68%. This is a ceiling, not a discriminator (M13); the runtime-versus-simulation match of §8.5 is the discriminator | §6.2.1 |
 | S-hot | `T_ticket == 0` on **>= 99%** of tokens | every row hits |
@@ -1779,12 +2033,37 @@ Expressed as throughput: `pp_S >= 512 / (512/pp_H + T_stall)`.
 ### 8.4 DeepSeek Q2_K (the harder case)
 
 **Where it runs.** Inside `llama.cpp-9g22`'s real-model gate protocol, P0-P7 of
-its §5.2 (`3604061db`, rev 4), after gates 1-4 pass: phase 1 on
-`level_zero:0` (the B70 alone), caches capped at 2 GiB per table by the §8.1
-lever, no DSpark draft, P3's launch precondition honoured. §4.5 states when
-the model fits at all. Two gathers per ubatch; `T(a..b)` is the
-measured time of blocks `a..b` for the same ubatch; `U` is the unique miss rows
-of the ubatch, both tables together.
+its §5.2 (rev 5, `8997c6405`), after gates 1-4 pass: phase 1 on
+`level_zero:0` (the B70 alone), caches fixed at 2 GiB per table with the index
+included (§4.3 step 4), no DSpark draft, **in the owner's §D4 configuration**:
+lever (s) landed, and the cold set `C` that 7v5c computed for that launch's
+`MemAvailable` reading resident on STORAGE (§4.5, "with the owner's §D4
+applied"). P3 is claimed only as §4.5 evaluates it: on today's code, or after
+(s) with no cold set, P3 fails at every reading taken today, so §8.4 is
+unrunnable until (s) and `llama.cpp-yl3v` have landed. Two gathers per ubatch;
+`T(a..b)` is the measured time of blocks `a..b` for the same ubatch; `U` is
+the unique miss rows of the ubatch, both tables together.
+
+**The device is shared** (*lead ruling §T4*, I-4). The cold experts and the
+engram tables are read from the same USB bcachefs members through the one
+pool (§5.2). The engram bounds below were measured with no competing IO. They
+are scored only on the tokens and ubatches whose concurrent expert IO the arm
+recorded (§8.1), and they are reported split by that IO: none, or some. The
+expert-IO terms themselves are **measured-later targets, not promises**. Their
+estimates are `9g22`'s (§4.5.3), from this document's facts (§9.2.2):
+
+- **PP512.** A ubatch touches 99.97% of a layer's experts, so it reads the
+  whole cold set once. At the 0.29-1.2 GB/s measured for expert slices that is
+  ~25-110 s per ubatch at the lowest reading's cold set (*lead ruling §T4*),
+  far more than the engram tables' ~2.5-3.5 s. PP on DeepSeek phase 1 is
+  bounded by the cold experts, not by the engram IO.
+- **Decode.** A token reads `240 x c x (1 - r) x 12.8 MB` of cold experts
+  (§9.2.2), where `c` is the cold set's touch share, which the usage profile
+  decides. The engram rows of a token are ~4 KiB reads that the deadline order
+  puts ahead of any expert read for a later layer (§5.2); the bound that holds
+  for them on a shared device is measured, not assumed.
+- So "decent speed" for DeepSeek on this host is set by the cold-expert IO,
+  and `9g22` §4.5.3 owns that number.
 
 **Decode, S-cold** (48 rows per token). Re-derived from the probe that issues
 both tables' reads together through one pool, which is what the engine does (I7;
@@ -1830,7 +2109,7 @@ position; these arms test that decision rather than assume it:
 | arm | STORAGE gather | host waits on the path | predicted |
 |---|---|---|---|
 | **A** (the design) | SYCL-owned gather (§7.2): host task at prefetch, event-edged copy before the consumer | none on the GPU path (§5.3) | best or tied |
-| C | upstream order: the gather as the CPU op in the leading split, the HOST executor applied to STORAGE | the submitting thread waits for the IO before layer 0 is submitted | loses the whole window: ~7-11 ms per cold token; wins nothing on a fully hot cache |
+| C | upstream order: the gather as a CPU custom op in the leading split (rev 2a's HOST form); its output reaches the device through the same step-3 copy, and the op guards that copy's source by waiting for the previous graph's copy event | the submitting thread waits for the IO before layer 0 is submitted, and for the previous copy when the device runs a graph behind | loses the whole window: ~7-11 ms per cold token; wins nothing on a fully hot cache |
 
 - **No arm B.** r1's B ("expand right before the consumer") is identical to A
   now: the host task is submitted at prefetch whatever the node's position,
@@ -1848,8 +2127,9 @@ position; these arms test that decision rather than assume it:
   over the 10 pairs beats A's by >= 2%**. Anything less is a tie, and a tie
   goes to the arm with fewer host waits, which is A.
 
-**DSpark** (I9). The draft adds +7.9 GiB of host memory (`9g22` §10.3), which
-is §4.5's case C: on one card it is refused at every reading taken today.
+**DSpark** (I9). The draft adds +7.9 GiB of host memory (`9g22` §10.3). Under
+owner §D4 that is paid in cold set: 7v5c's `C` grows by about the draft's
+bytes (§4.5).
 Verify steps carry up to 6 tokens, so up to 288 rows per step: 74 ms mean, 131
 ms p99 cold on the Q3_K_M extent (§9.2.3). The DSpark arm gets its own targets
 from a Q2_K re-measurement when `9g22`'s gates 1-4 have passed; this document
@@ -1908,9 +2188,9 @@ tables read 24 rows per token each at blocks 1 and 14.
   constant one-row index, supplied by a new input class
   `llm_graph_input_const_rows` whose `set_input` writes the constant ids and
   whose `can_reuse` returns true when the ids are unchanged (M9).
-- **The consumer check is a scan, not an assert at the call** (M9). A HOST
-  gather's custom op has no edge to the lazy tensor, so nothing at the call
-  site can see a stray consumer. After graph build, `llm_graph_context` scans
+- **The consumer check is a scan, not an assert at the call** (M9). Nothing at
+  the call site can see a stray consumer (and arm C's custom op has no edge to
+  the lazy tensor at all). After graph build, `llm_graph_context` scans
   every node's `src[]` and follows each `view_src` chain to its root; any node
   other than a lazy `GET_ROWS` whose chain reaches a lazy tensor fails the
   build with `GGML_ABORT` naming the node and the tensor. Under SYCL the lazy
@@ -1953,9 +2233,9 @@ consumes this contract and links here for it; this section is the one source.
    not offered.
 5. **Position and executor: the provider decides** (*lead ruling §T1*, C2). The
    model does **not** choose where the gather sits or what runs it. The
-   helper places a HOST gather in the leading split as a CPU op, and a STORAGE
-   gather at the head of the consumer device's first split as a SYCL-owned op
-   (§7.1), and §8.4's arms test that choice. A consumer must not hard-code "before
+   helper places the gather of either residency at the head of the consumer
+   device's first split as a SYCL-owned op (§7.1; DQ-C2 in §13 for the HOST
+   case), and §8.4's arms test that choice. A consumer must not hard-code "before
    block N": that is the r1 contract, withdrawn.
 6. **Optional lookahead.** `peek_rows(next_ubatch, tail)` returns the next
    ubatch's rows from the model's sequence state, so the IO of ubatch `k+1`
@@ -1968,21 +2248,41 @@ The SYCL side of the same interface:
 |---|---|---|
 | `lazy_table` | model-scoped unified-cache object, keyed by the weight's `ggml_sycl_cache_id`; refcounted by the descriptor buffer and every outstanding ticket; llama holds only the descriptor buffer, never a row pointer | the unified cache (§3.2) |
 | descriptor buffer | `ggml_backend_sycl_lazy_buffer_type(consumer device)`: sentinel base, nominal size, `WEIGHTS` usage | the model, like any weight buffer (§3.2) |
-| `lazy_gather_ctx` | per context, per table: the landing slab, the output slot (STORAGE), the host queue, the current ticket | its `mem_handle`s, released in its destructor |
+| `lazy_gather_ctx` | per context, per table: the output slot, the host queue; for STORAGE also the landing slab and the current ticket | its `mem_handle`s, released in its destructor |
 | block ring | per context, shared by its tables | a `mem_handle` |
-| `prefetch(gather_ctx, rows, n, class) -> ticket` | called by `lazy_prefetch()` after `set_inputs()` (§7.5); for STORAGE it also submits the gather's host task, with no device dependency (§7.2) | |
-| the gather | HOST: CPU custom op (§7.1). STORAGE: SYCL host task + event-edged copy (§7.2) | th32 owns it (*lead ruling §T1*, D6(c)) |
+| `prefetch(gather_ctx, rows, n, class) -> ticket` | called by `lazy_prefetch()` after `set_inputs()` (§7.5); it submits the gather's host task, with no device dependency, and for STORAGE first queues the reads (§7.2) | |
+| the gather | both residencies: SYCL host task + explicit event-ordered H2D copy (§7.2, §7.3) | th32 owns it (*lead ruling §T1*, D6(c); *§T2*, DQ) |
+| `lazy_io_submit(fd, offset, length, dst handle, ticket, class, deadline)` | the one IO entry point, shared with `llama.cpp-yl3v`'s cold-expert slice reads (§5.2, §9.2) | th32 (T5) |
 
-### 9.2 Hosting cold routed experts later (not phase 1)
+### 9.2 Cold routed experts on STORAGE (phase 1, owner §D4; the path is `llama.cpp-yl3v`'s)
 
-**Status.** On 2026-09-26 the owner first ruled that DeepSeek-V4.1-Flash runs
-Q3_K_M with its coldest routed experts on STORAGE, then revised it the same
-day: the **primary is Q2_K**, whose routed experts fit VRAM plus host, so only
-the engram tables use STORAGE (§4.5). Cold routed experts on STORAGE feeding
-the CPU executor (for Q3_K_M) become a **later ticket that `llama.cpp-9g22`
-files**. This document does not design or gate that path. It does two things
-for it: it keeps the tier's interface generic enough to host it, and it
-records the measurements already taken, so the later ticket starts from facts.
+**Status.** On 2026-09-26 the owner first ruled Q3_K_M with its coldest routed
+experts on STORAGE (owner §D1), then made Q2_K the primary and moved the cold
+experts to a later ticket (owner §D2). The Q2_K fit then fell short of this
+host, and the owner chose **"Zones + SSD cold experts"** (owner §D4): lever (s)
+plus the coldest Q2_K experts on STORAGE, executed by the CPU. That sanctions
+STORAGE→CPU for experts and brings `llama.cpp-yl3v` forward to Q2_K phase 1.
+So cold experts **are** on STORAGE in phase 1.
+
+**Who owns what** (the owner's either/or in §D4: this design names the
+interface). `llama.cpp-yl3v` owns the cold-expert path: choosing the experts
+(the usage profile, then the `exp_probs_b` bias), executing them on
+`CpuExpertPool`, its landing slab, and prefetching from routing. The expert
+read path differs from the row path in exactly those places: its unit is an
+expert-layer's three slices (~12.8 MB on Q2_K), not a row; its reads are known
+only once the layer's router has run, not at `set_input`; and its executor is
+the CPU expert pool, not the gather host task. This design provides the rest:
+
+| th32 provides | used by yl3v as |
+|---|---|
+| the `STORAGE` residency state (§3.1) | the reported state of a cold expert-layer |
+| `lazy_io_submit(fd, offset, length, dst handle, ticket, class, deadline)` and its pool (§5.2) | the slice reads, class 0, deadline = the expert's layer, in chunks of at most 512 KiB |
+| the ticket and epoch machinery (§5.3) | completion and cancellation of a slice load |
+| the host ledger and `host_planned_bytes` (§4.2) | the charge for the landing slab (`2C/40`) and the credit of `C` |
+| the order of §4.3, with the cold set sized in step 5 by 7v5c (*lead ruling §D5*) | the size `C` its selection fills |
+
+The cold-set **size** is not a th32 number either: 7v5c computes it at load
+(§4.3 step 5), and `9g22` §4.5.2 records what it reaches on this host (§4.5).
 
 #### 9.2.1 What the interface keeps open
 
@@ -1990,14 +2290,13 @@ records the measurements already taken, so the later ticket starts from facts.
   reads into `mem_handle`-owned `HOST_CPU` memory whose size the planner charges
   (§3.3). Its read unit is an (fd, offset, length, destination, ticket)
   request, not a row: a 4 KiB row block and a 512 KiB slice chunk are the same
-  call. The later path adds a new slab role and a slot-granular cache, not a
-  new engine.
+  call. yl3v adds its slab role, not a new engine.
 - **A hotness ranking by expected reads per step.** The planner's inputs are
   per-object sizes plus an expected-reads-per-step score. For a lazy table it
   is `rows_per_token` (§4.1). For an expert-layer it would be its expected uses
-  per step, from routing counts. §4.3's ordering, "charge the score-weighted
-  cost, place the coldest last", then covers both. Phase 1 implements only the
-  table case.
+  per step, from the usage profile. §4.3's ordering, "charge the warm set,
+  place the coldest last", then covers both; for experts the §D1 selection
+  supplies the order and §D5 the size.
 - **The CPU executor already takes a lease.** `cpu_expert_task` carries a
   `weight_lease` `mem_handle` (`76c7f6548 ggml/src/ggml-sycl/cpu-dispatch.hpp:127`)
   and the host AOS executor consumes file-layout blocks
@@ -2006,10 +2305,11 @@ records the measurements already taken, so the later ticket starts from facts.
   and only the expert's output reaches the GPU.
 
 <a id="th32-cold-expert-facts"></a>
-#### 9.2.2 Facts recorded for the later ticket
+#### 9.2.2 Facts recorded for the cold-expert path
 
 | fact | value |
 |---|---|
+| one expert of one layer, Q2_K (phase 1) | **12.8 MB**: gate and up Q2_K 3870720 B each, down Q3_K 5068800 B (4.58 GiB per layer / 384) |
 | one expert of one layer, Q3_K_M | **16.77 MB**: gate and up Q3_K 5068800 B each, down Q4_K 6635520 B; **18.25 MB** at layers 0-1 (down Q5_K 8110080 B) |
 | where its bytes are | three contiguous slices, one in each `ffn_{gate,up,down}_exps`, ~2 GB apart in one shard; expert `x` starts at `data_offset + x * slice`; slices are not 4 KiB-aligned (5068800 = 1237.5 x 4096) |
 | one expert-layer, 16 x 512 KiB chunks in flight, fresh DeepSeek shards | **14.1 ms mean, 29.1 ms p99, 1.2 GB/s**; about 70% of the bytes came from the NVMe, because the shards were minutes old |
@@ -2017,8 +2317,8 @@ records the measurements already taken, so the later ticket starts from facts.
 | the same shapes on a settled Qwen split (mostly on the T7) | **0.29 GB/s** (1 load) to **0.47 GB/s** (6 loads); the T7's 5 Gb/s link is the cap |
 | reading promotes | `promote_target=nvme` wrote 2.7 GB to the NVMe during a 12 s settled read, so repeatedly read extents become NVMe-cached |
 | PP coverage | a PP512 ubatch uses 99.97% of a layer's 384 experts (1 - (1 - 6/384)^512), so PP reads the whole cold set once per ubatch |
-| static prior | none available: `exp_probs_b` is DeepSeek-V3-style load balancing, which equalises expert load in training; `hash_layer_count = 0` |
-| decode cost model | `240 x c x (1 - r) x 16.8 MB / BW` per token, where `c` is the cold share of expert uses and `r` the share a RAM cache serves |
+| static prior | the owner's fallback is the `exp_probs_b` bias (owner §D1, §D2). **A risk to it**: `exp_probs_b` is DeepSeek-V3-style load balancing, which equalises expert load in training, so the prior may carry little signal about which experts are cold (`hash_layer_count = 0`). The usage profile is therefore the primary input, and whether it must be mandatory is `llama.cpp-9g22`'s call |
+| decode cost model | `240 x c x (1 - r) x S / BW` per token, where `c` is the cold share of expert uses, `r` the share a RAM cache serves, and `S` an expert-layer's bytes: **12.8 MB on Q2_K** (phase 1), 16.8 MB on Q3_K_M |
 
 Raw logs are in Appendix A.2 (`expert_probe`).
 
@@ -2044,10 +2344,10 @@ own targets from this measurement when DSpark lands.
   "`llama-bench` traps"):
 
   ```
-  [PLACEMENT] lazy per_layer_token_embd.weight residency=HOST table=51880.0 MiB resident=51880.0 MiB locked=yes host_budget=... host_planned=... leftover=...
+  [PLACEMENT] lazy per_layer_token_embd.weight residency=HOST table=51880.0 MiB resident=51880.0 MiB locked=yes output_slot=10.0 MiB/ctx host_budget=... host_planned=... leftover=...
   [PLACEMENT] lazy blk.1.engram_embd.weight residency=STORAGE table=30762.6 MiB cache=... MiB (N slots, index ... MiB) floor=... yieldable=... MiB output_slot=24.0 MiB/ctx consumer_layer=1 device=... rows_per_token=24 file=<split> off=5785327904
   [PLACEMENT] lazy blk.14.engram_embd.weight residency=STORAGE table=30763.4 MiB cache=... consumer_layer=14 ... off=4032
-  [HOST-PLAN] budget=... (source: computed|GGML_SYCL_HOST_RESERVE_MB) planned=... weights=... named_terms=... kv=... zones=... (caches carving: 1|2) envelope=... lazy_resident=... reserve=...
+  [HOST-PLAN] budget=... (source: computed|GGML_SYCL_HOST_RESERVE_MB) planned=... weights=... named_terms=... kv=... zones=... (caches carving: 1|2) envelope=... lazy_resident=... reserve=... cold_set=... (expert-layers ..., slab ...) p3_post_load=...
   ```
 
   (The `host_budget` figures are elided because they depend on the tenants'
@@ -2064,8 +2364,11 @@ own targets from this measurement when DSpark lands.
   `rows_requested`, `rows_hit`, `rows_miss`, `rows_joined`, `blocks_read`,
   `bytes_read`, `stall_ns_total` (`T_ticket`), `stall_ns_max`,
   `gather_ns_total` (`T_gather`), `ubatches`, `tickets_cancelled`,
-  `chunks_yielded`, `lazy_boundary_dispatches`, `slot_wait_ns`. Per pool: `class0_reads`,
-  `class1_reads`, `inflight_joins`.
+  `chunks_yielded`, `lazy_boundary_dispatches`, `slot_wait_ns`,
+  `lazy_output_copies`, `lazy_zero_copy_reads` (§7.3). Per pool:
+  `class0_reads`, `class1_reads`, `inflight_joins`, and the reads and bytes
+  submitted by other clients (yl3v's slices), so the shared-device record of
+  §8.1 comes from the same place.
 - **Definitions** (M5), chosen so that runtime counts match the simulation's
   per-reference counting:
   - Every row reference in `rows` is one of: a **hit** (the row is in the
@@ -2093,38 +2396,46 @@ Each ticket names the RED that must fail before its code exists (*lead ruling
 | # | ticket | depends on | RED (fails first) | notes |
 |---|---|---|---|---|
 | T1 | `alloc_tier::HOST_CPU`: raw wrapper (`mmap` + `MADV_HUGEPAGE` + `mlock`), `must_host_cpu`, `device_mappable()`, the 36-site tier census (§3.1); `lazy_residency`; `cache_location`/`expert_resolve_tier` gain reported `STORAGE`; roles `LAZY_ROW_CACHE`/`LAZY_STAGING`/`LAZY_OUTPUT`; canonical contract §3/§4/§12.5 edits | - | a host test that requests `HOST_CPU` under `RLIMIT_MEMLOCK` = 1 page and expects the typed refusal `host-cpu-lock-failed` naming `errno` and the bytes; a census test that a `HOST_CPU` allocation appears in the registry and the shutdown census | header change first: every other ticket includes it |
-| T2 | the process-global host ledger: one budget function, pools capped by their sum, `NO_PINNED` and `RESERVE_MB` semantics, `host_planned_bytes` per §4.2, the plan's host fields, `host-budget-exceeded`, `[HOST-PLAN-BUG]` | T1, **`llama.cpp-rnh3`**, `llama.cpp-moua` (the shared publish struct and lifetime order), `llama.cpp-zhcn` (the `SYCL_Host` compute buffer as a planned tenant), **`llama.cpp-sgc5`** (one zone set per plan); computed through the functions `9g22`'s T27 runs (proposed) | a planner fixture whose host weights exceed the budget expects `host-budget-exceeded` with each term; a Q2_K-shaped fixture expects `host_planned_bytes`' zone terms to equal what `populate_host_zone_sizing` and the `configure_host_zones` sizing produce (≈ 14.8 GiB before chunk rounding, `dma_staging_pool` and the RUNTIME pool included, `cpu_quant_buffer_bytes` excluded); a `PER_DEVICE` fixture with two caches expects their pools capped by the **sum** | **changes behaviour for every model.** Lands in two phases: (a) WARN-only, logging what it would refuse; (b) enforcing, only after the regression gates pass: GPT-OSS 120B (host experts, `level_zero:0`), Qwen3.5-35B-A3B on the B50, the `glkg` 1% VRAM fixture, and the Mistral gate, all still admitted (GPU) |
-| T3 | `placement_lazy_table_info` inventory class, excluded from `max_tensor` and every inventory maximum; the residency decision (§4.3); the plan lines (§10) | T2 | a Q2_K-shaped inventory fixture asserts a STAGING zone of **3.64 GiB** (it is ~60 GiB if a table counts as `max_tensor`) and the residencies of §4.5 at a fixed budget | |
+| T2 | the process-global host ledger: one budget function, pools capped by their sum, `NO_PINNED` and `RESERVE_MB` semantics, `host_planned_bytes` per §4.2, the plan's host fields, `host-budget-exceeded`, `[HOST-PLAN-BUG]` | phase (a): T1, **`llama.cpp-rnh3`**, `llama.cpp-moua` (the shared publish struct and lifetime order), `llama.cpp-zhcn` (the `SYCL_Host` compute buffer as a planned tenant); computed through the functions `llama.cpp-7v5c` runs. Phase (b) adds **`llama.cpp-sgc5`** (one zone set per plan) and `llama.cpp-s4ip` (lever (s), for the regression gates' expected bytes) | a planner fixture whose host weights exceed the budget expects `host-budget-exceeded` with each term; a Q2_K-shaped fixture expects `host_planned_bytes`' zone terms to equal what `populate_host_zone_sizing` and the `configure_host_zones` sizing return for the same inventory, the expected bytes **derived from those functions, never a literal** (*lead ruling §D5*): with the ring, `dma_staging_pool` and the RUNTIME pool included, `cpu_quant_buffer_bytes` excluded, and `pp_moe_onednn_scratch_bytes == 0` once `s4ip`'s type gate lands; a `PER_DEVICE` fixture with two caches expects their pools capped by the **sum**; a fixture whose pre-allocation runs short expects the refusal, not the WARN (§4.2) | **changes behaviour for every model.** Lands in two phases: (a) WARN-only, logging what it would refuse, now (*lead ruling §T3*, (c)); (b) enforcing, only after the regression gates pass: GPT-OSS 120B (host experts, `level_zero:0`), Qwen3.5-35B-A3B on the B50, the `glkg` 1% VRAM fixture, and the Mistral gate, all still admitted (GPU) |
+| T3 | `placement_lazy_table_info` inventory class, excluded from `max_tensor` and every inventory maximum; the residency decision (§4.3); the plan lines (§10) | T2 | a Q2_K-shaped inventory fixture with its two tables asserts STAGING and SCRATCH equal to `populate_host_zone_sizing()`'s result for the same inventory without the tables (derived, not a literal; a counted table adds at least twice its bytes, §4.1), and the residencies of §4.5 at a fixed budget | |
 | T4 | the `lazy_table` object: refcount, descriptor buffer type, HOST body load (eager, locked, D1), STORAGE fd, row cache (CLOCK, sharded, 13.3 B/slot index, 256 MiB yieldable chunks), the activation check | T1, T3 | an activation-check mismatch fixture (one extra chunk) must refuse naming both numbers; a yield fixture must free a chunk with no wait while rows remain gatherable | |
 | T5 | the IO engine: pread pool, priority classes, per-context fairness, in-flight dedup, tickets with epochs, landing slabs, block ring | T4 | the abort-mid-ubatch fixture of §5.3 (slot 0 must hold ticket B's rows exactly); a head-of-line fixture (the `batch_probe3 hol` shape against a file fixture) where class-0 completion must not wait for class-0 reads of another context queued earlier | CPU-only |
-| T6 | llama side: loader SYCL branch for `TENSOR_READ_LAZY` (independent of `mmap_support`, resolved before upstream's `AUTO`->`OFF`), SYCL device reports `mmap_support = true`, `lazy_table_info` declaration, `build_lazy_get_rows` + HOST custom op + `lazy_expand_for_layer` + `lazy_prefetch()` + the post-build consumer scan, gemma4's const-row input class; qwen4exp and gemma4 declarations | T4, T5, `llama.cpp-n77l` | (a) with `AUTO` and a device reporting `mmap_support = false`, the dual-card config still prints `[PLACEMENT] lazy ... residency=`; (b) a graph with a `ggml_view_1d` of a lazy tensor fails the build naming it | `deepseek41` follows the §9.1 contract in `llama.cpp-9g22`'s own tickets |
+| T6 | llama side: loader SYCL branch for `TENSOR_READ_LAZY` (independent of `mmap_support`, resolved before upstream's `AUTO`->`OFF`), SYCL device reports `mmap_support = true`, `lazy_table_info` declaration, `build_lazy_get_rows` + arm C's CPU custom op + `lazy_expand_for_layer` + `lazy_prefetch()` + the post-build consumer scan, gemma4's const-row input class; qwen4exp and gemma4 declarations | T4, T5, `llama.cpp-n77l` | (a) with `AUTO` and a device reporting `mmap_support = false`, the dual-card config still prints `[PLACEMENT] lazy ... residency=`; (b) a graph with a `ggml_view_1d` of a lazy tensor fails the build naming it | `deepseek41` follows the §9.1 contract in `llama.cpp-9g22`'s own tickets |
 | T6b | llama handling of the descriptor buffer: memory breakdown and model size report resident bytes, `load_all_data` skips the tensor in its mapping branch, including the mlock growth there (`694ec2354 src/llama-model-loader.cpp:1640-1662`, whose `lazy.has(cur)` tests the mmap lazy set this design no longer fills) | T6 | a load of a lazy-table fixture reports model size equal to the resident bytes, and `load_all_data` reads zero bytes of the table | |
-| T7 | the SYCL-owned STORAGE gather: lazy `GET_ROWS` recognition, the side-queue host task, the event-edged copy, the output-slot reuse marker, fusion exclusion, the record-mode segment boundary (§7.4) | T5, T6 | **first the four probes HT-1..HT-4 (§7.2), lead-run, GPU**; then a record-mode fixture: a graph with a lazy gather must replay with `seg_replay > 0`, zero futility WARNs, and `lazy_boundary_dispatches == graphs` per table; and the §7.4 submission-runs-ahead check on a two-table fixture | if a probe fails, D6-M (b) replaces the host task before anything else is built |
+| T7 | the SYCL-owned gather for **both residencies**: lazy `GET_ROWS` recognition, the side-queue host task (body or ticket), the explicit event-ordered H2D copy, the output-slot reuse marker, fusion exclusion, the record-mode segment boundary (§7.4), the `lazy_output_copies` and `lazy_zero_copy_reads` counters | T5, T6 | **first the four probes HT-1..HT-4 (§7.2), lead-run, GPU**; then the §7.3 zero-copy fixture (fails first with `lazy_output_copies == 0`; its probe's positive control is `inp_embd`'s consumer); then a record-mode fixture: a graph with a lazy gather must replay with `seg_replay > 0`, zero futility WARNs, and `lazy_boundary_dispatches == graphs` per table; and the §7.4 submission-runs-ahead check on a two-table fixture | if a probe fails, D6-M (b) replaces the host task before anything else is built |
 | T8 | counters (unconditional), their definitions (§10), and CPU-only unit tests, with both hash harnesses of Appendix B as fixtures | T5, T6 | a counter test where a repeated row in one ubatch counts as a join and a hit, and a same-block different row counts as a miss with no extra read | |
 | T9q | Qwen acceptance against §8.2-8.3: H, S-cold, S-warm, S-hot, the correctness gate, the positive and negative controls, the engine ratio (GPU) | T7, T8 | an `--lazy-mode off` run must fail the engagement check (the negative control proves the check can fail) | |
 | T10 | `peek_rows` lookahead (class 1, depth 2) | T9q | a lookahead fixture where rows missed by ubatch `k` and `k+1` are read once | required for DeepSeek (D9) |
-| T9d | DeepSeek acceptance against §8.4: S arms, executor arms A/C, the submission-runs-ahead check, bucketed decode, the runtime-vs-simulation match, inside `9g22`'s P0-P7 (GPU) | T10, the `deepseek41` runtime (`9g22` T6, T11), `9g22` gates 1-4 | the §8.4 witness must fail on an arm run with `GGML_SYCL_DISABLE_GRAPH=1` (record mode off: `seg_replay == 0`) | only if §4.5 lets the model load (D8) |
+| T9d | DeepSeek acceptance against §8.4: S arms, executor arms A/C, the submission-runs-ahead check, bucketed decode, the runtime-vs-simulation match, inside `9g22`'s P0-P7 (GPU) | T10, the `deepseek41` runtime (`9g22` T6, T11), `9g22` gates 1-4, **`llama.cpp-s4ip`** (lever (s), the ring and RUNTIME scope included), **`llama.cpp-yl3v`** (the cold set on STORAGE) and **`llama.cpp-7v5c`** (its size at launch) | the §8.4 witness must fail on an arm run with `GGML_SYCL_DISABLE_GRAPH=1` (record mode off: `seg_replay == 0`) | its S arms run with the §D4 cold set resident on STORAGE, and record the concurrent expert IO (§8.1) |
 | T11 | optional: `io_uring` engine | T9q | engine ratio on the ext4 NVMe reference must exceed the pool's | |
 
 **Existing tickets this design depends on or leaves open:**
 
 - `llama.cpp-rnh3`: exact host weights plus named terms; T2 depends on it.
 - `llama.cpp-sgc5`: every participating cache builds a full host zone set,
-  WEIGHT included, from one plan (§2.3). T2 depends on it (§4.2): without it,
-  the sum cap refuses a two-card host-expert load that no lever can clear.
-- `llama.cpp-s4ip` (comment `c-rbwa`): the host SCRATCH and RUNTIME pool terms
-  with no host reader, `dma_staging_pool` twice among them. Not on T2's path;
-  T2 counts whatever the sizing code commits, before or after it.
-- `llama.cpp-9g22` T27 (proposed there): the host-only plan dry-run that this
-  design proposes as the one computation behind `host_planned_bytes` (§4.2).
+  WEIGHT included, from one plan (§2.3). T2's enforcing phase depends on it
+  (§4.2): without it, the sum cap refuses a two-card host-expert load that no
+  lever can clear. Part of lever (s) (owner §D4).
+- `llama.cpp-s4ip` (comments `c-rbwa`, `c-td91`): lever (s)'s host side, the
+  SCRATCH and RUNTIME pool terms with no host reader (`dma_staging_pool` and
+  the ring, each twice) and the ring's MXFP4 type gate, which also frees the
+  ring's VRAM. T2 counts whatever the sizing code commits, before or after it;
+  T2's enforcing phase and T9d wait for it.
+- `llama.cpp-7v5c` (9g22's T27): the host-only plan dry-run, the one
+  computation behind `host_planned_bytes`, `expected_host` and the cold set
+  `C` (§4.2, §4.3 step 5; *lead rulings §T3, §D5*).
 - `llama.cpp-moua`: lifetime segregation and the shared publish struct; T2.
 - `llama.cpp-zhcn`: the `SYCL_Host` compute buffer as a planned host tenant,
   which holds the HOST gather's output (§7.3); T2.
 - `llama.cpp-n77l`: the upstream merge that brings `TENSOR_READ_LAZY`; T6.
 - `llama.cpp-x1xd` and `llama.cpp-jhxq`: not on this design's path (§5.3); they
   stay open for the paths that do reach them.
-- `llama.cpp-yl3v`: cold routed experts on STORAGE for Q3_K_M (§9.2), after
-  T5; filed by `llama.cpp-9g22`, not part of this design.
+- `llama.cpp-yl3v`: cold routed experts on STORAGE, executed by the CPU,
+  brought forward to Q2_K phase 1 by owner §D4 (§9.2). It uses T5's engine
+  and T2's ledger through the interface of §9.2; T9d waits for it.
+- The census of CPU-split outputs that SYCL reads zero-copy (`inp_embd`
+  first), which the lead files under §T2 DQ. This design adds no member to it
+  (§7.3).
 
 **Missing tickets from r1, now in the table:** `mmap_support` independence (T6
 RED a), the `mlock` policy (T1), llama handling of the descriptor buffer (T6b),
@@ -2151,9 +2462,9 @@ between them, so that nothing depends on a later ticket.
 - **A scheduler event edge for the zero-input split sync** (`llama.cpp-x1xd`).
   This design no longer reaches that sync (§5.3), so it is not a dependency;
   the ticket stays open for the paths that do.
-- **Cold routed experts on STORAGE.** A later ticket (`llama.cpp-yl3v`, §9.2),
-  filed by `llama.cpp-9g22`; this design keeps the interface open and records
-  the measurements.
+- **The cold-expert path itself.** It is in phase 1 (owner §D4), but it is
+  `llama.cpp-yl3v`'s; this design names its interface (§9.2) and records the
+  measurements it starts from.
 
 ---
 
@@ -2161,11 +2472,12 @@ between them, so that nothing depends on a later ticket.
 
 Each open decision offers options, and the recommended one is marked
 **(rec)**. Recommendations are this design's proposals. A decision that is
-already made says by whom: *lead ruling §T1* for the lead's rulings in
-`lead-rulings-2026-09-26.md`, "the owner" only for D8.
+already made says by whom: *lead ruling* with its section for the lead's
+rulings in `lead-rulings-2026-09-26.md`, and "owner §D1/§D2/§D4" for the
+owner's.
 
-**D1. How is the HOST residency populated?** (proposed; lead-level)
-- a) **(rec)** Eager: at load, a sequential `O_DIRECT` read of the whole table
+**D1. How is the HOST residency populated? Ruled (a)** (*lead ruling §T2*).
+- a) **(ruled)** Eager: at load, a sequential `O_DIRECT` read of the whole table
   into the locked body, blocking model load. It is simplest, H is H from the
   first token, and a failure (lock or read) surfaces at load. r1 quoted
   "~31 s" for it; that read was NVMe-cached (A.2: 19.7 of 27.6 GB from the
@@ -2178,8 +2490,10 @@ already made says by whom: *lead ruling §T1* for the lead's rulings in
   for a one-time saving.
 - c) On-demand only. A HOST table would never become the H arm.
 
-**D2. IO engine?** (proposed; lead-level)
-- a) **(rec)** A portable `pread` worker pool first, with priority classes,
+**D2. IO engine? Ruled (a)** (*lead ruling §T2*). Owner §D4 adds a second
+client, `llama.cpp-yl3v`'s cold-expert slice reads, through the same pool
+(§5.2).
+- a) **(ruled)** A portable `pread` worker pool first, with priority classes,
   per-context fairness and in-flight dedup (§5.2). It measured at the device
   ceiling (ratio 0.99) and adds no dependency.
 - b) `io_uring` through raw syscalls only.
@@ -2195,8 +2509,9 @@ on bcachefs as it is; every S target in §8 is that filesystem's. The one
 filesystem lever left, per-file bcachefs targets on the engram shards, is the
 owner's filesystem policy, and this design does not propose it for v1.
 
-**D4. `--lazy-mode` under SYCL?** (proposed; lead-level)
-- a) **(rec)** Keep upstream's meaning as *eligibility* (`OFF` = ordinary
+**DLM. `--lazy-mode` under SYCL? Ruled (a)** (*lead ruling §T2*, where it is
+called D4; renamed here so that "§D4" means only the owner's decision).
+- a) **(ruled)** Keep upstream's meaning as *eligibility* (`OFF` = ordinary
   weight, `AUTO` = marked and larger than 4 GiB, `ON` = all marked). The
   planner alone picks HOST or STORAGE for eligible tensors, and the SYCL branch
   does not inherit upstream's `AUTO`->`OFF` fallback on `mmap_support` (§4.1).
@@ -2204,10 +2519,11 @@ owner's filesystem policy, and this design does not propose it for v1.
 - c) Ignore the flag under SYCL.
 
 **D5. Where is each gather placed? Ruled** (*lead ruling §T1*, C2): the
-provider decides, by residency. HOST gathers stay in the leading `inp_embd`
-split as a CPU op; STORAGE gathers head the consumer device's first split as a
-SYCL-owned op (§7.1). §8.4's arms A and C test the STORAGE executor with a fixed
-decision rule. r1's "expand before each consumer block" is withdrawn.
+provider decides, by residency. As ruled, HOST gathers stay in the leading
+`inp_embd` split as a CPU op, and STORAGE gathers head the consumer device's
+first split as a SYCL-owned op (§7.1). Rev 2b proposes changing the HOST half
+under DQ (DQ-C2, below). §8.4's arms A and C test the STORAGE executor with a
+fixed decision rule. r1's "expand before each consumer block" is withdrawn.
 
 **D6. Who executes the STORAGE gather? Ruled** (*lead ruling §T1*, D6(c)): the
 SYCL backend, as a CPU `host_task` with event edges, no scheduler split, no
@@ -2215,55 +2531,80 @@ host wait. th32 owns the op; `llama.cpp-9g22` consumes it through §9.1. The
 record-mode question the ruling left to this design is answered in §7.4: a
 stated segment boundary, not a recorded host-task node.
 
-**D6-M. The mechanism under D6(c), if the host-task probes fail** (proposed;
-lead-level). §7.2 pre-registers four probes (HT-1..HT-4) against the fork's
-own warning about `host_task` (`ggml-sycl.cpp:32755`) and the measured
-cross-queue submit block (`llama.cpp-c6ah`).
-- a) **(rec)** `host_task` as ruled, **if** HT-1..HT-4 all pass.
-- b) If any fails: the IO reaper dequantizes and signals a host-signalled Level
+**D6-M. The mechanism under D6(c). Ruled** (*lead ruling §T2*): (a), with
+(b) as the fallback; (c) is rejected. §7.2 pre-registers four probes
+(HT-1..HT-4) against the fork's own warning about `host_task`
+(`ggml-sycl.cpp:32755`) and the measured cross-queue submit block
+(`llama.cpp-c6ah`).
+- a) **(ruled)** `host_task`, **if** HT-1..HT-4 all pass.
+- b) **(ruled fallback)** If any fails: the IO reaper dequantizes (for a HOST
+  table, a pool thread does, from the body) and signals a host-signalled Level
   Zero event wrapped with `sycl::make_event`; the output copy depends on it.
   Still backend-owned, event-edged, split-free and wait-free; it needs Level
   Zero interop the fork has not used before.
-- c) If (b) also fails: the submitting thread waits for the ticket at the
-  consumer boundary and submits the copy itself. That is a host wait on
-  **storage IO** (not on the GPU), and it would come back to the lead as a
-  ruling change, not be adopted silently.
+- c) **Rejected** (*lead ruling §T2*): the submitting thread waiting for the
+  ticket at the consumer boundary is a host wait. If (b) also fails, that goes
+  back to the lead as a new question; this design does not offer (c).
 
-**D7. Size of the STORAGE row cache. Ruled** (*lead ruling §T1*, I8): sized
-after the context envelope, from what is left, and **yieldable**, since it holds
-no leases. What remains proposed (§6.4): 256 MiB chunks; yielded chunks come
-back only at the next plan publish.
+**D7. Size of the STORAGE row cache. Ruled** (*lead rulings §T1* I8, *§T2*,
+*§T4* I-4): sized after the context envelope and **yieldable**, since it holds
+no leases; in 256 MiB chunks; yielded chunks come back only at the next plan
+publish (§T2: no regrow until then). In a plan with a cold set the cache is
+**fixed** at its target and charged before the cold set is sized (§T4 I-4);
+without one it takes what is left (§4.3, §6.4). The target this design
+proposes for DeepSeek is the gate size, 2 GiB per table with the index.
 
-**D8. DeepSeek-V4.1-Flash rung. Decided by the owner** (2026-09-26): Q2_K is
-the primary; its experts fit VRAM plus host, and only the engram tables use
-STORAGE. **Re-check required** (*lead ruling §T1*, C1). Through T2's
-accounting, with the zone terms taken from the sizing code (§2.3, §4.2) and
-phase 1 on the B70 alone, Q2_K without the draft and with floor caches needs a
-`MemAvailable` of 182.9-186.3 GiB at load (§4.5, case A). That is refused at
-171.4 and 181.8 GiB, fits only at the low corner at 183.7, and fits at 190.4
-with 4.1-7.5 GiB to spare. The gate protocol's 2 GiB caches fit only at 190.4,
-and the DSpark draft (+7.9 GiB) fits at no reading. Rev 2's "fits at every
-reading, 0.5 GiB spare" is withdrawn: it left out ~7.4 GiB of zone terms and
-put ~11 GiB of experts on the B50, which holds none under EXPERT mode.
-`9g22` rev 4 §4.5.2 reaches the same verdict through its P3 envelope and lists
-the levers; `llama.cpp-s4ip` (its lever (b)) recovers ~12.6 GiB per zone set.
-Whether the model fits is decided by the other tenants' memory at load time.
-The lead takes this back to the owner.
+**D8. DeepSeek-V4.1-Flash: the rung and its fit. Decided by the owner**
+(owner §D2: Q2_K primary; owner §D4: "Zones + SSD cold experts"). The lead
+ruled that §D4 answers the fit and is not re-asked (*lead ruling §T3*). With
+§D4 applied:
+- **The fit** is case A after lever (s) (§4.5), minus the bytes of the cold
+  set `C` on STORAGE, plus its landing slab. 9g22's P3 is the binding check:
+  after (s) and before any cold set, `expected_host` is 171.1-174.5 GiB and P3
+  fails at every reading taken today (§4.5).
+- **The cold-set size** that clears P3 is computed at load by
+  `llama.cpp-7v5c` as `C = max(C_selected, C_P3)` (*lead ruling §D5*; §4.3 step
+  5). Its value at the lowest reading, 171.4 GiB, and at 189.6 GiB is
+  `9g22`'s, in
+  [its §4.5.2](deepseek41-runtime.md#452-the-host-fit-r2-c-a-r3-c-1-c-2-owner-d4);
+  this document does not restate it. It is an input to 9g22's cold-set
+  selection (owner §D1), not a th32 choice.
+- **If even `C` = every routed expert cannot clear P3**, the load refuses as
+  `cold-set-cannot-clear-p3`, naming the reading and the shortfall (§D5).
+- **Today's code** refuses phase 1 at every reading even for the planner, so
+  the gates wait for (s) and yl3v (T9d, §11).
 
-**DQ. The HOST gather's output is read by the GPU in place** (a question for
-the lead, §7.3). The consuming SYCL op reads the F32 activation from the CPU
-backend's pinned compute buffer over PCIe, as every CPU-split output in this
-fork is read today.
-- a) **(rec)** Accept it as the existing activation path. It is 10 KiB per
-  decode token and 5 MiB per PP512 ubatch, read once.
-- b) Treat it as zero-copy that P3 forbids. The fix is then general, not
-  PLE's: every CPU-split output, `inp_embd` first, would need an explicit
-  event-edged copy into device memory, and that belongs in its own ticket.
-  Routing HOST gathers through the SYCL-owned path of §7.2 instead would
-  contradict *lead ruling §T1* C2.
+Rev 2a's "goes back to the owner as a re-check" is withdrawn: the owner had
+already decided (§T3).
 
-**D9. Lookahead in v1 for STORAGE-bound models?** (proposed; lead-level)
-- a) **(rec)** Yes for DeepSeek: T10 lands before T9d. Its tables are always
+**DQ. The gather's output reaches the device by an explicit copy. Ruled**
+(*lead ruling §T2*): the HOST-tier gather output reaches the device by an
+explicit event-ordered H2D copy on the main in-order queue, the same path as
+STORAGE; the GPU does not read `SYCL_Host` memory zero-copy. The design is
+§7.2 step 3 and §7.3, with a RED that fails on a zero-copy read (§7.3, T7).
+The general census of CPU-split outputs that SYCL reads zero-copy is the
+lead's separate ticket.
+
+**DQ-C2. Where the HOST gather runs under DQ** (proposed; lead-level; it
+changes the HOST half of *lead ruling §T1* C2).
+- a) **(rec)** The one path for both residencies (§7.1, §7.2): the SYCL backend
+  owns the HOST gather too; its host task dequantizes from the resident body
+  into the output slot at prefetch, and the step-3 copy moves it. The copy's
+  source is guarded on the host task's thread (the output-slot rule of §7.2),
+  so nothing waits on the submitting thread. It is what §T2's "one code path
+  for both tiers" reads as, and HOST then also depends on HT-1..HT-4 (or
+  D6-M(b)).
+- b) Keep C2's form: the CPU op in the leading split, and the SYCL backend
+  copies its output from the `SYCL_Host` compute buffer before the consumer.
+  Nothing orders ubatch `k+1`'s CPU op after ubatch `k`'s copy in a
+  multi-ubatch prefill (§7.1), so the CPU op would have to wait for that copy
+  on the submitting thread: a host wait on the GPU, which this design does not
+  offer as a baseline. Arm C (§8.4) runs exactly this form, as a comparison
+  arm.
+
+**D9. Lookahead in v1 for STORAGE-bound models? Ruled (a)** (*lead ruling
+§T2*).
+- a) **(ruled)** Yes for DeepSeek: T10 lands before T9d. Its tables are always
   on STORAGE here, and a cold PP512 ubatch is ~3.5-4.4 s of IO that, without
   lookahead, only `blk.14`'s window can partly hide.
 - b) Keep lookahead as phase 2 for every model.
@@ -2656,7 +2997,7 @@ mixed cache= 8192MiB hit=70.2% (2g 86.8%, 3g 67.7%, 4g 56.1%) decode(steady): mi
 finished
 ```
 
-## Appendix B. Probe sources (scratch, not committed)
+## Appendix B. Probe sources (scratch, not committed; the fit calculator is committed)
 
 - `io_probe.sh`: fio randread driver plus bcachefs `io_done` snapshots.
 - `mmap_probe.cpp`: N threads touch random rows through `mmap`.
@@ -2689,6 +3030,14 @@ finished
   Run with `/usr/bin/python3` (gguf-py needs its numpy).
 - `io_probe2.sh` takes `FOFF`/`SIZE` for the extent; rev 2's same-session
   controls use it at `blk.1`'s offset.
+- **`docs/design/sycl_storage_tier_host_fit.py` (rev 2b, committed with this
+  document)**: the §4.5 host-fit calculator, grown from the scratch
+  `c2_fit.py` by adding the PP MoE oneDNN ring, the today / after-(s) columns,
+  the RUNTIME pool's chunk commit and 9g22's P3 check. Run it from the
+  repository root with `python3 docs/design/sycl_storage_tier_host_fit.py`; it
+  has no dependencies. Its constants are the GGUF header facts of A.1 and the
+  sizing-code terms of §2.3. It is committed, unlike the probes, because
+  §4.5's numbers must stay reproducible until `llama.cpp-7v5c` replaces it.
 
 T8 should lift `upstream_set_input_body.inc`, `ds_sim.cpp`'s `ds_rows()` and
 both Python transcriptions into CPU-only unit tests, so that a change to either
