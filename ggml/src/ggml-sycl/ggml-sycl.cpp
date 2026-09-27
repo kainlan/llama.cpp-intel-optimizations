@@ -88911,9 +88911,11 @@ struct ggml_sycl_block_exec_dense_range_runs {
 
 // What a prepare builds and a plan-cache hit reuses: the plan, its roots, the
 // arena slices and the views of each crossing's runs. Immutable once built,
-// and shared: a hit takes a reference instead of copying the handles, and the
-// executor's reference keeps them alive for the graph's queued work even if
-// the cache entry is dropped meanwhile.
+// and shared: a hit takes a reference instead of copying the handles. The
+// executor's reference keeps them for its own lifetime even if the cache
+// entry is dropped mid-graph; work still queued after it returns holds its
+// own references (each copy retains its handles until its event completes, a
+// recorded graph retains the slices it baked, and the state owns the arena).
 struct ggml_sycl_block_exec_dense_prepared {
     ggml_sycl::dense_exec_plan                         plan;
     std::vector<ggml_tensor *>                         roots;
@@ -89657,9 +89659,8 @@ class ggml_sycl_block_exec_dense_run {
             in.tensor  = t;
             in.bytes   = t != nullptr ? ggml_nbytes(t) : 0;
             in.written = std::find(p.written_inputs.begin(), p.written_inputs.end(), root) != p.written_inputs.end();
-            void * dst_ptr = nullptr;
-            in.staged      = t != nullptr && t->data != nullptr && t->name[0] != '\0' &&
-                        ctx_.graph_input_stage_lookup(t, in.bytes, original_device_, nullptr, &dst_ptr);
+            in.staged  = t != nullptr && t->data != nullptr && t->name[0] != '\0' &&
+                        ctx_.graph_input_stage_lookup(t, in.bytes, original_device_, nullptr, nullptr);
             p.refresh.push_back(std::move(in));
         }
     }
@@ -89701,15 +89702,16 @@ class ggml_sycl_block_exec_dense_run {
                 continue;
             }
             // The generation held, so the entry is the one remembered; its
-            // handle is taken for this copy only.
-            ggml_sycl::mem_handle dst;
-            void *                dst_ptr = nullptr;
-            if (!ctx_.graph_input_stage_lookup(t, in.bytes, original_device_, &dst, &dst_ptr)) {
+            // handle is taken for this copy only. Without it the caller
+            // refreshes every input in full, and the trace says so.
+            ggml_sycl::mem_handle moved_dst;
+            if (!ctx_.graph_input_stage_lookup(t, in.bytes, original_device_, &moved_dst, nullptr)) {
+                refresh_copied_ = -1;
                 return false;
             }
             const ggml_sycl::mem_handle src = ggml_sycl::mem_handle::from_direct(
                 t->data, GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, in.bytes);
-            (void) ggml_sycl::mem_copy_async(dst, src, in.bytes, q);
+            (void) ggml_sycl::mem_copy_async(moved_dst, src, in.bytes, q);
             ggml_sycl::dense_exec_input_record(in.snapshot, t->data, in.bytes);
             refresh_copied_++;
         }

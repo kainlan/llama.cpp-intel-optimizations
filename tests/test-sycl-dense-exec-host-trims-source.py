@@ -28,7 +28,8 @@ it sets for written graph-input (CONTROL) roots, is an extra margin on top
 of that and not what the skip relies on, which is why it does not have to
 cover every input, such as an INPUT-flagged view of a non-input root.
 Lookups hand a caller the copy's handle, so every caller that takes the
-handle, rather than only the pointer, is listed here and must be a reader.
+handle, rather than only the pointer, is listed here, once per call: each is
+a reader, except the executor's own copy.
 
 Crossings (item C). The planner lays each crossing's slices out next to each
 other in the arena and hands out runs (block-exec-dense.hpp,
@@ -57,6 +58,7 @@ device or build is touched.
 
 import os
 import re
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,18 +201,20 @@ def test_no_other_code_touches_the_staging_map():
         )
 
 
-# Lookups that take the staging copy's handle, not only its pointer. Each is
-# a reader, except the executor's memo, which writes through its handle and
-# records what it wrote. A new one is a writer until someone shows otherwise:
-# add it here only if it reads, or make it bump the generation.
-LOOKUP_HANDLE_TAKERS = {
-    ("getrows.cpp", "&out_handle"),  # pre-staged get_rows indices, read by the kernel
-    ("ggml-sycl.cpp", "&dst"),  # the executor's moved-only copy, held for that copy only
-}
+# Lookups that take the staging copy's handle, not only its pointer, and how
+# many of each. Each is a reader, except the executor's moved-only copy, which
+# writes through the handle for that one copy and records what it wrote (its
+# memo holds no handle). A new one is a writer until someone shows otherwise:
+# add it here only if it reads, or make it bump the generation. The count
+# matters: a second taker with a listed name is still a new taker.
+LOOKUP_HANDLE_TAKERS = Counter({
+    ("getrows.cpp", "&out_handle"): 1,  # pre-staged get_rows indices, read by the kernel
+    ("ggml-sycl.cpp", "&moved_dst"): 1,  # the executor's moved-only copy
+})
 
 
 def test_every_lookup_that_takes_the_handle_is_known():
-    found = set()
+    found = Counter()
     for path, text in sycl_sources().items():
         code = strip_comments(text)
         if path == "common.hpp":
@@ -235,10 +239,11 @@ def test_every_lookup_that_takes_the_handle_is_known():
             args.append(arg.strip())
             assert len(args) == 5, f"{path}: unexpected graph_input_stage_lookup call {args}"
             if args[3] != "nullptr":
-                found.add((path, args[3]))
+                found[(path, args[3])] += 1
     unknown = found - LOOKUP_HANDLE_TAKERS
-    assert not unknown, f"a lookup takes a staging copy's handle and may write through it: {sorted(unknown)}"
-    assert found == LOOKUP_HANDLE_TAKERS, f"a listed handle taker is gone; update the list: {sorted(LOOKUP_HANDLE_TAKERS - found)}"
+    assert not unknown, f"a lookup takes a staging copy's handle and may write through it: {sorted(unknown.items())}"
+    gone = LOOKUP_HANDLE_TAKERS - found
+    assert not gone, f"a listed handle taker is gone; update the list: {sorted(gone.items())}"
 
 
 def test_moved_only_refresh_is_gated_on_a_recordless_plan_cache_hit():
@@ -274,15 +279,16 @@ def test_moved_only_refresh_is_gated_on_a_recordless_plan_cache_hit():
     )
     assert len(full) == 1, "an input without a staging copy is refreshed in full"
     # Past the skip, the input is copied: its entry looked up (a missing one
-    # refuses the whole moved-only refresh), then host to device, then
-    # recorded. Nothing may condition or reorder the copy.
+    # refuses the whole moved-only refresh, and the trace reports a full
+    # refresh), then host to device, then recorded. Nothing may condition or
+    # reorder the copy.
     copy = re.findall(
         r"refresh_skipped_\+\+\s*;\s*continue\s*;\s*\}\s*"
-        r"ggml_sycl::mem_handle\s+dst\s*;\s*void\s*\*\s*dst_ptr\s*=\s*nullptr\s*;\s*"
-        r"if\s*\(\s*!\s*ctx_\.graph_input_stage_lookup\(\s*t\s*,\s*in\.bytes\s*,\s*original_device_\s*,\s*&dst\s*,"
-        r"\s*&dst_ptr\s*\)\s*\)\s*\{\s*return\s+false\s*;\s*\}\s*"
+        r"ggml_sycl::mem_handle\s+moved_dst\s*;\s*"
+        r"if\s*\(\s*!\s*ctx_\.graph_input_stage_lookup\(\s*t\s*,\s*in\.bytes\s*,\s*original_device_\s*,\s*&moved_dst\s*,"
+        r"\s*nullptr\s*\)\s*\)\s*\{\s*refresh_copied_\s*=\s*-1\s*;\s*return\s+false\s*;\s*\}\s*"
         r"const\s+ggml_sycl::mem_handle\s+src\s*=\s*ggml_sycl::mem_handle::from_direct\(\s*t->data\s*,[^;]*,\s*in\.bytes\s*\)\s*;\s*"
-        r"\(void\)\s*ggml_sycl::mem_copy_async\(\s*dst\s*,\s*src\s*,\s*in\.bytes\s*,\s*q\s*\)\s*;\s*"
+        r"\(void\)\s*ggml_sycl::mem_copy_async\(\s*moved_dst\s*,\s*src\s*,\s*in\.bytes\s*,\s*q\s*\)\s*;\s*"
         r"ggml_sycl::dense_exec_input_record\(\s*in\.snapshot\s*,\s*t->data\s*,\s*in\.bytes\s*\)\s*;\s*"
         r"refresh_copied_\+\+\s*;\s*\}",
         moved,
@@ -296,8 +302,8 @@ def test_the_refresh_memo_holds_no_staging_handle():
     assert "mem_handle" not in memo, "the refresh memo must not hold a staging copy's handle"
     remember = strip_comments(member_body(backend, "void remember_refresh("))
     lookups = re.findall(r"graph_input_stage_lookup\(([^;]*)\)", remember)
-    assert len(lookups) == 1 and lookups[0].split(",")[3].strip() == "nullptr", (
-        "remembering a refresh asks only whether an input has a staging copy, not for its handle"
+    assert len(lookups) == 1 and [a.strip() for a in lookups[0].split(",")[3:]] == ["nullptr", "nullptr"], (
+        "remembering a refresh asks only whether an input has a staging copy, not for its handle or pointer"
     )
 
 

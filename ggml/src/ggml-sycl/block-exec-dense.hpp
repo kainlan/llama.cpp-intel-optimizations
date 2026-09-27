@@ -1014,9 +1014,11 @@ inline const char * dense_exec_plan_violation(const dense_exec_graph & g, const 
             for (const auto & span : spans) {
                 carried = carried || static_cast<size_t>(span.first) == s;
             }
+            if (carried) {
+                continue;
+            }
             for (const dense_exec_run & run : runs) {
-                if (!carried && slice.offset < run.arena_offset + run.bytes &&
-                    run.arena_offset < slice.offset + slice.bytes) {
+                if (slice.offset < run.arena_offset + run.bytes && run.arena_offset < slice.offset + slice.bytes) {
                     return false;
                 }
             }

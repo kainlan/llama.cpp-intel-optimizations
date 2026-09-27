@@ -6335,9 +6335,10 @@ struct ggml_backend_sycl_context {
 
     std::unordered_map<const ggml_tensor *, graph_input_staging_entry> graph_input_staging;
     // Bumped whenever an entry is created, replaced, dropped or written
-    // through the functions below, so a caller that holds an entry's handle
-    // and copies into it itself can tell the entry is still the input's
-    // device copy and still holds what that caller last copied.
+    // through the functions below, so a caller that remembers what it last
+    // copied into an input's entry, and looks the entry up again to copy
+    // into it itself, can tell it is still the same entry and still holds
+    // those bytes.
     uint64_t                                                           graph_input_staging_generation = 0;
 
     bool graph_input_stage_lookup(const ggml_tensor *     owner,

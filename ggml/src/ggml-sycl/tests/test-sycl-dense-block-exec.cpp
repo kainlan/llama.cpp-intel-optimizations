@@ -866,6 +866,89 @@ static void test_crossing_runs() {
     check(p.io[1].stage_in_runs.size() == 2, "an empty staged slice splits the copy in two");
 }
 
+// Grows `run` just far enough to reach the nearest non-empty slice above it on
+// `device` that `carried` does not list, and widens the host buffer to match,
+// so only the run's reach can be wrong. False when there is no such slice.
+static bool grow_run_over_next_slice(dense_exec_plan &        p,
+                                     dense_exec_run &         run,
+                                     int                      device,
+                                     const std::vector<int> & carried) {
+    const dense_exec_slice * next = nullptr;
+    for (size_t s = 0; s < p.slices.size(); ++s) {
+        const dense_exec_slice & slice = p.slices[s];
+        if (slice.device != device || slice.bytes == 0 || contains(carried, static_cast<int>(s)) ||
+            slice.offset < run.arena_offset + run.bytes) {
+            continue;
+        }
+        if (next == nullptr || slice.offset < next->offset) {
+            next = &slice;
+        }
+    }
+    if (next == nullptr) {
+        return false;
+    }
+    run.bytes          = next->offset + 1 - run.arena_offset;
+    p.host_stage_bytes = std::max(p.host_stage_bytes, run.host_offset + run.bytes);
+    return true;
+}
+
+// Both sides of a copy out are confined to the slices they carry: two
+// executor ranges on device 1 each copy a result back to device 0, so the
+// first copy's source run is followed by the second range's staged slice on
+// device 1, and its destination run by the second copy's destination on
+// device 0.
+static void test_copy_out_runs_are_confined() {
+    graph_builder b;
+    b.g.original_device = 0;
+    b.g.blocks          = {
+        { 0, 0, 0, 0, false },
+        { 1, 1, 1, 1, false },
+        { 2, 2, 0, 0, false },
+        { 3, 3, 1, 1, false },
+        { 4, 4, 0, 0, false },
+    };
+    const int w0 = b.root("w0", DENSE_EXEC_ROOT_WEIGHT, DEV0);
+    const int w1 = b.root("w1", DENSE_EXEC_ROOT_WEIGHT, DEV1);
+    const int in = b.root("inp", DENSE_EXEC_ROOT_CONTROL);
+    const int a0 = b.op("a-0", 0, { in, w0 });
+    const int a1 = b.op("a-1", 1, { a0, w1 });
+    const int a2 = b.op("a-2", 2, { a1, w0 });
+    const int a3 = b.op("a-3", 3, { a2, w1 });
+    const int a4 = b.op("a-4", 4, { a3, w0 });
+    (void) a4;
+    for (dense_exec_root & r : b.g.roots) {
+        r.bytes = 1000;
+    }
+    dense_exec_plan p;
+    check(dense_exec_build_plan(b.g, p) == DENSE_EXEC_GATE_NONE, "plans");
+    check(dense_exec_plan_violation(b.g, p) == nullptr, "a built plan is clean");
+    check(p.ranges.size() == 5 && p.io[1].copy_out.size() == 1 && p.io[3].copy_out.size() == 1,
+          "two executor ranges each copy one result back");
+
+    std::vector<int> from, to;
+    for (const dense_exec_copy & c : p.io[1].copy_out) {
+        from.push_back(c.from_slice);
+        to.push_back(c.to_slice);
+    }
+    {
+        dense_exec_plan bad = p;
+        check(bad.io[1].copy_out_src_runs.size() == 1 &&
+                  grow_run_over_next_slice(bad, bad.io[1].copy_out_src_runs[0], 1, from),
+              "the copy out's source run can reach the next slice on device 1");
+        expect_violation(b.g, bad, "a crossing's copy overwrites a slice it does not carry");
+    }
+    {
+        dense_exec_plan bad = p;
+        check(bad.io[1].copy_out_dst_runs.size() == 1 &&
+                  grow_run_over_next_slice(bad, bad.io[1].copy_out_dst_runs[0], 0, to),
+              "the copy out's destination run can reach the next slice on device 0");
+        check(bad.slices[static_cast<size_t>(bad.io[3].copy_out[0].to_slice)].offset <
+                  bad.io[1].copy_out_dst_runs[0].arena_offset + bad.io[1].copy_out_dst_runs[0].bytes,
+              "and that slice is the second copy's destination");
+        expect_violation(b.g, bad, "a crossing's copy overwrites a slice it does not carry");
+    }
+}
+
 // A range graph takes the pool scratch freed while it recorded: only what the
 // pool gained since the recording began, in order, and nothing from before.
 static void test_take_since() {
@@ -997,6 +1080,7 @@ int main() {
         { "input-moved",                                test_input_moved                                     },
         { "coalesce",                                   test_coalesce                                        },
         { "crossing-runs",                              test_crossing_runs                                   },
+        { "copy-out-runs-are-confined",                 test_copy_out_runs_are_confined                      },
         { "written-roots",                              test_written_roots                                   },
     };
 
