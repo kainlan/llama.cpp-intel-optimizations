@@ -10,6 +10,7 @@
 #include "device-pool.hpp"
 #include "dpct/helper.hpp"
 #include "ggml-sycl.h"
+#include "kv-runtime-demotion.hpp"
 #include "mem-handle.hpp"
 #include "moe-control-plan.hpp"
 #include "moe-mmid-workspace.hpp"
@@ -961,6 +962,13 @@ struct placement_plan {
     // KV cache for a layer lives on the same device as its dense weights.
     std::unordered_map<int, int> kv_device;
 
+    // kv_device as the load-time planner left it, captured by the first
+    // runtime-context transaction. Every KV-shape change re-decides residency
+    // from here, so a context that demoted KV at a large n_ctx does not leave
+    // a later, smaller context on the host tier.
+    std::unordered_map<int, int> load_kv_device;
+    bool                         load_kv_device_valid = false;
+
     // layer_device[layer_id] = device_id (-1 = host/CPU) for the dense
     // execution unit of the layer. This is the authoritative placement for the
     // layer's shared dense weights; MoE experts remain separately placeable.
@@ -974,6 +982,43 @@ struct placement_plan {
     int get_layer_device(int layer_id) const {
         auto it = layer_device.find(layer_id);
         return it == layer_device.end() ? -1 : it->second;
+    }
+
+    // The KV owner of layers [start_layer, end_layer] (-2 = mixed, -1 =
+    // none), from the same per-layer KV bytes every other consumer sizes from.
+    int layer_range_kv_device(int start_layer, int end_layer) const {
+        const size_t        n_layers = end_layer >= 0 ? static_cast<size_t>(end_layer) + 1 : 0;
+        std::vector<int>    owners(n_layers, -1);
+        std::vector<size_t> bytes(n_layers, 0);  // 0: layers before start_layer do not vote
+        for (size_t l = static_cast<size_t>(std::max(start_layer, 0)); l < n_layers; ++l) {
+            owners[l] = get_kv_device(static_cast<int>(l));
+            bytes[l]  = kv_size_for_layer(static_cast<uint32_t>(l));
+        }
+        return layer_block_kv_device(owners, bytes, start_layer, end_layer);
+    }
+
+    // Sum of KV bytes placed on `device` -- the KV the runtime-context
+    // transaction admitted there. Pairs with unified_cache_kv_vram_available().
+    size_t device_kv_vram_bytes(int device) const {
+        size_t total = 0;
+        for (const auto & [layer, owner] : kv_device) {
+            if (owner == device && layer >= 0) {
+                total += kv_size_for_layer(static_cast<uint32_t>(layer));
+            }
+        }
+        return total;
+    }
+
+    // Re-derive every block's KV owner after kv_device changed, so a block
+    // whose KV was partly demoted reads as mixed and the block executor,
+    // which requires kv_device == execution_device, declines it.
+    void refresh_layer_block_kv_devices() {
+        for (layer_block & block : layer_blocks) {
+            block.kv_device = layer_range_kv_device(block.start_layer, block.end_layer);
+        }
+        for (layer_block & block : candidate_layer_blocks) {
+            block.kv_device = layer_range_kv_device(block.start_layer, block.end_layer);
+        }
     }
 
     // True when kv_size_for_layer(layer_id) answers from the per-layer truth
@@ -1256,6 +1301,23 @@ struct placement_plan {
             }
         }
         return false;
+    }
+
+    // VRAM the plan's dense extra copies take on `dev_id` (-1: every device).
+    // Not part of weight_vram_bytes or vram_bytes: an extra copy is optional
+    // and yields to runtime KV (unified_cache::yield_optional_layouts()), so it
+    // is accounted for on its own rather than as weight the plan must keep.
+    size_t optional_layout_vram_bytes(int dev_id) const {
+        size_t bytes = 0;
+        for (const placement_entry & e : entries) {
+            if (e.expert_id >= 0 || !e.on_device || (dev_id >= 0 && e.target_device != dev_id)) {
+                continue;
+            }
+            for (const placement_alternate_layout & extra : e.extra_layouts) {
+                bytes += extra.vram_charge_size;
+            }
+        }
+        return bytes;
     }
 
     // Did the plan promise a dense extra (same-device, additional) copy in `layout`?
@@ -1860,6 +1922,17 @@ size_t   unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(int device_id
 size_t   unified_cache_get_planned_pp_moe_onednn_scratch_bytes(int device_id);
 uint32_t unified_cache_get_planned_pp_moe_onednn_ring_depth(int device_id);
 
+// llama.cpp-u1bb: which ubatch-scaled ring slots live in the shared KV zone,
+// placed there by the runtime-context transaction because the RUNTIME zone could
+// not also hold them. reserve_pp_moe_onednn_scratch() allocates each slot from
+// its zone on every call, and the RUNTIME zone requirement counts only the
+// slots that stay in RUNTIME. What the ring physically holds in the KV zone is
+// unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(), not these flags: a
+// model load resets them while a previous context's ring may still exist.
+void unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(int device_id, bool activation, bool output);
+bool unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(int device_id);
+bool unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(int device_id);
+
 // llama.cpp-ibj0: per-row bytes behind the two ubatch-scaled slots above,
 // carried from the loader (src/llama-model.cpp's ggml_sycl_tensor_inventory)
 // so the runtime-context transaction can re-plan the ring for the REAL
@@ -2180,6 +2253,39 @@ enum class expert_retire_status : uint8_t {
     DEFERRED  = 3,
 };
 
+// What yield_optional_layouts() did. `retired` copies are hidden from routing
+// at once. `freed`/`freed_bytes` are the ones whose storage is back in its zone
+// when the call returns; the rest (`retired - freed`, `pending_bytes`) are
+// still held by a lease or an unfinished free and return later. `kv_layers` is
+// how many of the requested layers the zone can place as the call returns,
+// yield or not.
+struct optional_layout_yield_result {
+    size_t retired       = 0;
+    size_t freed         = 0;
+    size_t freed_bytes   = 0;
+    size_t pending_bytes = 0;
+    size_t kv_layers     = 0;
+};
+
+// A yield split at its one wait, so a caller can hold an L1 lock through the
+// decision and through none of the wait (canonical memory contract §12.5).
+// yield_optional_layouts_begin() picks and retires the copies and submits the
+// barrier that gates their frees; it waits on nothing and drops no handle --
+// the direct-stage mirror handles it withdraws move in here. Finishing waits
+// on the barrier, returns the copies' storage to their zone and drops those
+// handles, so it runs with no L1 lock held. A release dropped unfinished
+// drops the handles in its destructor and leaves the frees to a later
+// deferred-free pass. `result` holds `retired`, and `kv_layers` when nothing
+// was retired; the rest is filled by the finish.
+struct optional_layout_release {
+    unified_cache *                          cache = nullptr;
+    optional_layout_yield_result             result;
+    std::vector<std::shared_ptr<mem_handle>> mirrors;
+    std::vector<const void *>                ptrs;
+    std::vector<size_t>                      sizes;
+    sycl::event                              readers_done;
+};
+
 inline bool expert_retire_succeeded(expert_retire_status status) {
     return status == expert_retire_status::WITHDRAWN || status == expert_retire_status::DEFERRED ||
            status == expert_retire_status::NOT_FOUND;
@@ -2335,6 +2441,14 @@ enum class weight_reclaim_mode {
     // ggml_backend_sycl_model_unloaded(): one model died.  Drop its ownership
     // bit and reclaim -- unpinning first -- every entry no live model owns.
     MODEL_TEARDOWN,
+    // unified_cache::yield_optional_layouts(): runtime KV wants the VRAM an
+    // optional layout copy holds.  Only a copy marked optional_layout is
+    // reclaimable, and it is even while a live model or buffer owns its
+    // tensor: that tensor's primary layout stays resident and its dispatch
+    // reads the primary once the copy is gone.  A primary never is, and no
+    // lease but the yield's own may be live.  Reclaimed only by the yield,
+    // never by reclaim_weight_entries().
+    OPTIONAL_LAYOUT_YIELD,
 };
 
 // An allocation detached from entries_ and freed after rw_mutex_ is dropped.
@@ -2425,6 +2539,13 @@ struct unified_cache_entry {
     uint32_t              owner_mask            = 0;
     bool                  owner_tagged          = false;
     uint64_t              pending_load_txn_id   = 0;
+    // An optional layout copy, held as well as the tensor's primary (a dense
+    // oneDNN WOQ copy): it serves no op the primary cannot, so a live model's
+    // ownership does not keep it resident against runtime KV
+    // (weight_reclaim_mode::OPTIONAL_LAYOUT_YIELD). Only
+    // yield_optional_layouts() acts on it, and only while no one but the
+    // cache's own direct-stage mirror holds a lease. Never set on a primary.
+    bool                  optional_layout       = false;
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
     // entry -- a distinct string literal stamped at each of the ~16 sites that
     // bump in_use_count, whether directly or through acquire_entry_lease().
@@ -2638,6 +2759,14 @@ class unified_cache {
     weight_ptr_lease_result acquire_weight_lease(const ggml_sycl_cache_id & key);
     weight_ptr_lease_result acquire_entry_lease(const unified_cache_key & key);
 
+    // A leased handle on a dense weight's staged copy in exactly `layout`, for
+    // a reader that holds it until its queued work completes
+    // (retain_handles_until_event) -- so a copy that can be released at
+    // runtime (an optional layout, yield_optional_layouts()) is never freed
+    // under a read. Resolves the same entry get_view() does; empty on a miss
+    // or while the copy's fill is still in flight.
+    mem_handle acquire_layout_handle(const ggml_sycl_cache_id & key, ggml_layout_mode layout, int device);
+
     // --- Decomposed cache operations (no queue ops during inference) ---
 
     // Allocate a VRAM slot for a cache entry. May evict LRU entries.
@@ -2834,6 +2963,31 @@ class unified_cache {
     expert_retire_status retire_expert_entry_exact(ggml_sycl_cache_id key,
                                                    ggml_layout_mode   layout,
                                                    const char *       reason = nullptr);
+
+    // Optional layout copies (unified_cache_entry::optional_layout).
+    // mark_optional_layout() tags a dense weight's staged copy in `layout`.
+    // optional_layout_bytes() is what yield_optional_layouts() could release
+    // now: device-resident, non-retired copies weight_entry_reclaimable()
+    // accepts under OPTIONAL_LAYOUT_YIELD -- nobody but the cache's own
+    // direct-stage mirror leases them. yield_optional_layouts() retires the ones
+    // that let more of `layer_bytes` (KV layer allocations, in the order the
+    // tiered KV allocator makes them) land in the zone -- a copy whose hole no
+    // layer can use stays (select_optional_layout_yield()) -- waits once for
+    // every queue the cache orders frees against, and returns their storage to
+    // its zone before it returns. A reader holds its copy's lease until its
+    // work completes (acquire_layout_handle()), so a copy being read is never
+    // picked; the wait is defence in depth. Primaries are never touched.
+    // kv_layers_allocatable() is how many of `layer_bytes` the zone can place
+    // now. Cold, context-admission-time calls: not for a dispatch path.
+    // yield_optional_layouts() is begin plus finish (optional_layout_release),
+    // for a caller holding no L1 lock.
+    bool                         mark_optional_layout(ggml_sycl_cache_id key, ggml_layout_mode layout);
+    size_t                       optional_layout_bytes() const;
+    optional_layout_yield_result yield_optional_layouts(const std::vector<size_t> & layer_bytes);
+    optional_layout_release      yield_optional_layouts_begin(const std::vector<size_t> & layer_bytes);
+    optional_layout_yield_result yield_optional_layouts_finish(optional_layout_release &   release,
+                                                               const std::vector<size_t> & layer_bytes);
+    size_t                       kv_layers_allocatable(const std::vector<size_t> & layer_bytes);
 
     // Fast O(1) lookup for inference-time weight resolution.
     // Returns nullptr if not staged.  No allocation, no state machine.
@@ -3736,6 +3890,9 @@ class unified_cache {
         mem_handle weight_owner;
         mem_handle activation_owner;
         mem_handle output_owner;
+        // Allocated from the arena's shared KV zone (the weight slot never is).
+        bool       activation_in_kv_zone = false;
+        bool       output_in_kv_zone     = false;
     };
 
     bool reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
@@ -3751,6 +3908,9 @@ class unified_cache {
     // (returns false, ring left untouched) if any slot -- claimed or retired
     // -- is still in use; see the .cpp definition for the full contract.
     bool release_pp_moe_onednn_scratch_ring();
+    // Bytes the physical ring -- current and retired slots -- holds in the
+    // shared KV zone, read from the slots themselves.
+    size_t pp_moe_onednn_kv_zone_bytes_held();
     bool claim_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
     void release_pp_moe_onednn_scratch_slot(uint32_t slot, uint64_t generation);
     bool get_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
@@ -4420,6 +4580,12 @@ class unified_cache {
     std::mutex arena_destroy_mutex_;  // serializes retryable explicit destroy transactions
     static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
+    // A copy of the allocators KV is carved from (kv_zone_model), and where
+    // each of `ptrs` sits in it when `blocks` is given.
+    kv_zone_model kv_zone_snapshot(const std::vector<const void *> & ptrs, std::vector<kv_zone_block> * blocks);
+    // May yield_optional_layouts() release this entry now? Caller holds
+    // direct_stage_mutex_ and rw_mutex_ (either mode).
+    bool optional_layout_yieldable_locked(const unified_cache_key & key, const unified_cache_entry & entry) const;
     using zone_registry_commit_fn = bool (*)(void *, const arena_authority::allocation_record &, void *) noexcept;
     bool arena_register_exact(vram_zone_id zone, uint64_t allocation_id, size_t offset, size_t extent) noexcept;
     void arena_unregister_exact(vram_zone_id zone, size_t offset) noexcept;
@@ -6321,6 +6487,9 @@ bool                         unified_cache_reserve_pp_moe_onednn_scratch(int    
 // matching the reserve wrapper immediately above. False (no-op) when the
 // device has no cache yet, or the ring is still in use.
 bool                         unified_cache_release_pp_moe_onednn_scratch_ring(int device_id);
+// llama.cpp-u1bb: unified_cache::pp_moe_onednn_kv_zone_bytes_held() on the
+// device's existing cache (never creates one); 0 when there is none.
+size_t                       unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(int device_id);
 pp_moe_onednn_scratch_result unified_cache_get_pp_moe_onednn_scratch_slot(int device_id, uint32_t slot);
 
 // Get scratch buffers for oneDNN FP16 path. Returns pointers plus a logical
@@ -6551,6 +6720,48 @@ size_t unified_cache_compute_arena_used(int device_id);
 // Query KV arena zone capacity and usage.
 size_t unified_cache_kv_arena_capacity(int device_id);
 size_t unified_cache_kv_arena_used(int device_id);
+
+// Two different questions about the shared KV+weight zone, answered by two
+// functions on purpose:
+//
+// unified_cache_kv_weight_capacity(): how many bytes of weights plus KV the
+// device CAN hold -- kv_weight_capacity() of its budget and the zone. It is a
+// before-materialization question, so the planners pack weights against it.
+// `multi_device` mirrors the multi-device planner, which does not read a
+// per-device zone out of the single GLOBAL cache.
+//
+// unified_cache_kv_vram_available(): how many bytes of KV fit on the device
+// NOW -- the zone's live free space after every weight actually materialized
+// and every zone grew. The planned weight bytes under-count that
+// (llama.cpp-jehw), so KV is never admitted against the capacity above: the
+// runtime-context transaction, its non-publishing probe and the tiered KV
+// allocator all admit against this one number. `multi_device` is the same
+// flag: a multi-device plan in GLOBAL mode has no per-device zone to read
+// (kv_reads_device_arena()), so it gets the budget-based headroom -- which in
+// GLOBAL mode is cache 0's for every device, so that combination has no
+// per-device KV headroom and is unsupported (see kv_reads_device_arena()).
+size_t unified_cache_kv_weight_capacity(int device_id, size_t vram_budget, bool multi_device);
+size_t unified_cache_kv_vram_available(int device_id, bool multi_device);
+// Whether the effective cache mode (AUTO resolved) is GLOBAL, so the runtime-
+// context transaction can warn that a multi-device plan is unsupported there.
+bool   unified_cache_mode_is_global();
+
+// Optional layout copies yield to runtime KV (see
+// unified_cache_entry::optional_layout). S1-PRELOAD marks each copy it stages
+// as well as a primary; the runtime-context transaction counts
+// unified_cache_optional_layout_bytes() as KV headroom and, before it demotes
+// any KV layer, releases what the KV needs: it begins the yield under its
+// inventory lock and finishes it after releasing that lock
+// (optional_layout_release), and the finish says how many of the device's KV
+// layers its zone can place. `multi_device` reads the device's cache as
+// unified_cache_kv_vram_available() does, so the numbers come from the same
+// zone.
+size_t                       unified_cache_optional_layout_bytes(int device_id, bool multi_device);
+optional_layout_release      unified_cache_yield_optional_layouts_begin(int                         device_id,
+                                                                        bool                        multi_device,
+                                                                        const std::vector<size_t> & layer_bytes);
+optional_layout_yield_result unified_cache_yield_optional_layouts_finish(optional_layout_release &   release,
+                                                                         const std::vector<size_t> & layer_bytes);
 
 // Sum of zone_used(KV) + zone_used(ONEDNN) + zone_used(RUNTIME) + zone_used(SCRATCH).
 // Returns 0 when arena is inactive.
@@ -6934,6 +7145,16 @@ struct vram_budget_authority {
 // site) log it themselves before calling this.
 vram_budget_authority ggml_sycl_device_budget_authority(int device, size_t total_mem, size_t free_mem,
                                                          int default_pct);
+
+// The same answer as ggml_sycl_device_budget_authority() above, but never
+// constructs a cache: a device with none yet (e.g. a hidden GPU the planner
+// did not register) gets the fresh computation. For callers that only need
+// to READ a device's budget identity, where creating a cache as a side
+// effect would be wrong.
+vram_budget_authority ggml_sycl_device_budget_authority_existing(int    device,
+                                                                 size_t total_mem,
+                                                                 size_t free_mem,
+                                                                 int    default_pct);
 
 vram_budget_authority compute_vram_budget_authority(bool   host_unified,
                                                     size_t total_mem_in,

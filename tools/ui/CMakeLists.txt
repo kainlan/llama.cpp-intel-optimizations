@@ -36,57 +36,6 @@ endif()
 set(UI_CPP "${CMAKE_CURRENT_BINARY_DIR}/ui.cpp")
 set(UI_H   "${CMAKE_CURRENT_BINARY_DIR}/ui.h")
 
-if(CMAKE_CROSSCOMPILING)
-    find_program(HOST_CXX_COMPILER NAMES g++ clang++ NO_CMAKE_FIND_ROOT_PATH)
-    if(NOT HOST_CXX_COMPILER)
-        message(FATAL_ERROR "UI: no host C++ compiler (g++/clang++) found to build llama-ui-embed; set -DHOST_CXX_COMPILER=<path>")
-    endif()
-    message(STATUS "UI: building llama-ui-embed with host compiler ${HOST_CXX_COMPILER}")
-
-    if(CMAKE_HOST_WIN32)
-        set(LLAMA_UI_EMBED_EXE "${CMAKE_CURRENT_BINARY_DIR}/llama-ui-embed-host.exe")
-    else()
-        set(LLAMA_UI_EMBED_EXE "${CMAKE_CURRENT_BINARY_DIR}/llama-ui-embed-host")
-    endif()
-
-    add_custom_command(
-        OUTPUT  "${LLAMA_UI_EMBED_EXE}"
-        COMMAND "${HOST_CXX_COMPILER}" -O2 -std=c++17
-                -o "${LLAMA_UI_EMBED_EXE}" "${CMAKE_CURRENT_SOURCE_DIR}/embed.cpp"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/embed.cpp"
-        COMMENT "Building llama-ui-embed (host)"
-        VERBATIM
-    )
-
-    # phony target to tie it into the dependency graph
-    add_custom_target(llama-ui-embed DEPENDS "${LLAMA_UI_EMBED_EXE}")
-else()
-    # exclude llama-ui-embed from sanitizer flags,
-    # it's a build-time-only tool, no need to instrument it
-    # this is to fix TSan "memory layout is incompatible" error on CI
-    get_directory_property(_llama_ui_dir_co COMPILE_OPTIONS)
-    get_directory_property(_llama_ui_dir_ll LINK_LIBRARIES)
-    set(_llama_ui_embed_co ${_llama_ui_dir_co})
-    set(_llama_ui_embed_ll ${_llama_ui_dir_ll})
-    list(FILTER _llama_ui_embed_co EXCLUDE REGEX ".*-fsanitize=.*")
-    list(FILTER _llama_ui_embed_ll EXCLUDE REGEX ".*-fsanitize=.*")
-    set_directory_properties(PROPERTIES
-        COMPILE_OPTIONS "${_llama_ui_embed_co}"
-        LINK_LIBRARIES  "${_llama_ui_embed_ll}")
-
-    add_executable(llama-ui-embed embed.cpp)
-    target_compile_features(llama-ui-embed PRIVATE cxx_std_17)
-    set_target_properties(llama-ui-embed PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-    )
-    set(LLAMA_UI_EMBED_EXE "$<TARGET_FILE:llama-ui-embed>")
-
-    # restore so the llama-ui library below keeps sanitizer instrumentation
-    set_directory_properties(PROPERTIES
-        COMPILE_OPTIONS "${_llama_ui_dir_co}"
-        LINK_LIBRARIES  "${_llama_ui_dir_ll}")
-endif()
-
 # Inputs that make the provisioning script's answer change.
 #
 # The bulk of this comes from sources.cmake -- the same list the script itself
@@ -123,18 +72,20 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist")
         CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/dist")
 endif()
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist/index.html")
-    # EVERY file under dist/ is an input, not just index.html: embed.cpp
-    # "recursively embeds every regular file under <asset_dir>", so a changed
-    # hashed bundle at dist/_app/immutable/bundle.HASH.js is embedded verbatim.
+    # EVERY file under dist/ is an input, not just index.html: emit_files() in
+    # scripts/ui-assets.cmake GLOB_RECURSEs and embeds every regular file under
+    # the asset dir, so a changed hashed bundle at
+    # dist/_app/immutable/bundle.HASH.js is embedded verbatim.
     # Depending on index.html alone let every other asset go stale silently --
     # the same defect this block was added to close, one file across.
     file(GLOB_RECURSE UI_DIST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/dist/*")
 
-    # dist/_gzip is OUTPUT, not input. ui-assets.cmake REMOVE_RECURSEs and
-    # regenerates it INSIDE dist/ on every provisioning run, so declaring its
-    # files would leave the stamp's own inputs newer than the stamp after each
-    # run -- provisioning on every build, precisely the always-dirty defect this
-    # file exists to remove.
+    # dist/_gzip is OUTPUT, not input. ui-assets.cmake used to REMOVE_RECURSE
+    # and regenerate it INSIDE dist/ on every provisioning run; it now stages
+    # the gzip tree under the build dir and deletes a leftover dist/_gzip, and
+    # emit_files() skips ^_gzip/ when embedding. Declaring those files would
+    # leave the stamp's inputs newer than the stamp -- provisioning on every
+    # build, precisely the always-dirty defect this file exists to remove.
     #
     # ONE pattern, used at BOTH exclusion sites below, and it must stay one:
     # they were two patterns in two syntaxes and drifted, because `MATCHES` is
@@ -213,7 +164,7 @@ endif()
 #                         static-site dist/) are declared, not skipped
 #           mechanism     file(GLOB_RECURSE) does match leading-dot names --
 #                         checked because the opposite is widely assumed and
-#                         would be this bug's exact shape: an asset embed.cpp
+#                         would be this bug's exact shape: an asset emit_files()
 #                         embeds but nothing declares
 #           test          cmake -P over a scratch dist/ containing .nojekyll
 #                         and sub/.hidden -> both listed
@@ -221,14 +172,17 @@ endif()
 #   CLOSED  symlinks      a symlinked directory under dist/ is not a source of
 #                         embedded-but-undeclared assets
 #           mechanism     agreement, not coverage: file(GLOB_RECURSE) does not
-#                         descend into a symlinked directory, and neither does
-#                         embed.cpp -- std::filesystem::recursive_directory_
-#                         iterator without follow_directory_symlink. What is
+#                         descend into a symlinked directory, and the embedder
+#                         is the same primitive -- emit_files() in
+#                         scripts/ui-assets.cmake GLOB_RECURSEs without
+#                         FOLLOW_SYMLINKS (it replaced the C++ llama-ui-embed
+#                         helper in the upstream 694ec2354 merge). What is
 #                         embedded and what is declared match, which is the
 #                         property that matters; both descending or neither is
 #                         fine, one of each is not
 #           test          cmake -P scratch tree with a dir symlink (not
-#                         descended) + embed.cpp:160 read for its iterator flags
+#                         descended), run against the C++ helper before it
+#                         was replaced; emit_files() uses the same glob
 #
 #   OPEN    npm cold start   a first-ever `node_modules` install could create a
 #                            top-level entry under tools/ui and fire one extra
@@ -283,18 +237,17 @@ add_custom_command(
         "-DHF_VERSION=${HF_UI_VERSION}"
         "-DHF_ENABLED=${LLAMA_USE_PREBUILT_UI}"
         "-DBUILD_UI=${LLAMA_BUILD_UI}"
-        "-DLLAMA_UI_EMBED=${LLAMA_UI_EMBED_EXE}"
         "-DLLAMA_UI_GZIP=${LLAMA_UI_GZIP}"
         -P "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake"
     COMMAND ${CMAKE_COMMAND} -E touch "${UI_ASSETS_STAMP}"
-    DEPENDS ${UI_ASSET_DEPENDS} "${LLAMA_UI_EMBED_EXE}"
+    DEPENDS ${UI_ASSET_DEPENDS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/ui.h.in"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ui.cpp.in"
     COMMENT "Provisioning UI assets"
     VERBATIM
 )
 
 add_custom_target(llama-ui-assets ALL DEPENDS "${UI_ASSETS_STAMP}")
-
-add_dependencies(llama-ui-assets llama-ui-embed)
 
 set_source_files_properties(${UI_CPP} ${UI_H} PROPERTIES GENERATED TRUE)
 

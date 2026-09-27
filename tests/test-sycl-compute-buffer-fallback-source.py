@@ -970,8 +970,9 @@ def test_refusal_macro_used_at_the_kv_budget_and_ring_and_nonfa_sites():
     )
 
     # And every one of those three functions must actually receive a
-    # probe_mode parameter for the macro call above to even compile.
-    assert re.search(r"ggml_sycl_replan_pp_moe_onednn_ring\([^)]*bool\s+probe_mode\s*=\s*false\s*\)",
+    # probe_mode parameter for the macro call above to even compile. The ring
+    # re-plan takes its KV-zone inputs after it (llama.cpp-u1bb).
+    assert re.search(r"ggml_sycl_replan_pp_moe_onednn_ring\([^)]*bool\s+probe_mode\s*=\s*false\s*[,)]",
                      GGML_SYCL_CPP_CODE), "ggml_sycl_replan_pp_moe_onednn_ring() must take a probe_mode parameter"
     assert re.search(r"ggml_sycl_check_nonfa_attn_scratch\([^)]*bool\s+probe_mode\s*=\s*false\s*\)",
                      GGML_SYCL_CPP_CODE), "ggml_sycl_check_nonfa_attn_scratch() must take a probe_mode parameter"

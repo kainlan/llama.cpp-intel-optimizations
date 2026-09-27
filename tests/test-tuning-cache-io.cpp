@@ -566,12 +566,16 @@ TEST(atomic_write) {
 // ever running against the real cache directory unsandboxed.
 // =============================================================================
 
-// Test: CACHE_VERSION was bumped to 4 (llama.cpp-uajm, UbatchCacheKey::
-// swa_full) -- v1 stays reserved for the pre-existing matmul
-// dispatch-tuning format alone, v2 for the pre-kv_unified ubatch key shape,
-// v3 (llama.cpp-3aos) for the pre-swa_full one.
-TEST(cache_version_is_4) {
-    ASSERT(CACHE_VERSION == 4);
+// Test: CACHE_VERSION was bumped to 6 (llama.cpp-1oa3, a device_key that
+// names every participating device and its budget, whether the multi-device
+// plan ran, and the placement knobs) -- v1 stays reserved for the
+// pre-existing matmul dispatch-tuning format alone, v2 for the pre-kv_unified
+// ubatch key shape, v3 (llama.cpp-3aos) for the pre-swa_full one, v4
+// (llama.cpp-uajm) for the single-device device_key, v5 for the device-set
+// key whose shape changed in place ("hidden:", the placement-knob suffix,
+// "|plan=multi") before release.
+TEST(cache_version_is_6) {
+    ASSERT(CACHE_VERSION == 6);
     return true;
 }
 
@@ -613,13 +617,12 @@ TEST(ubatch_key_equality) {
     b.flash_attn = !a.flash_attn;
     ASSERT(a != b);
 
-    // llama.cpp-7n6n: the four fields added to UbatchCacheKey must each
+    // llama.cpp-7n6n: the fields added to UbatchCacheKey must each
     // independently affect equality too.
-    a.n_seq_max       = 1;
-    a.type_k          = 1;  // GGML_TYPE_F16
-    a.type_v          = 1;
-    a.device_set_hash = 0xdeadbeefu;
-    b                 = a;
+    a.n_seq_max = 1;
+    a.type_k    = 1;  // GGML_TYPE_F16
+    a.type_v    = 1;
+    b           = a;
     ASSERT(a == b);
 
     b.n_seq_max = a.n_seq_max + 1;
@@ -629,9 +632,6 @@ TEST(ubatch_key_equality) {
     ASSERT(a != b);
     b        = a;
     b.type_v = a.type_v + 1;
-    ASSERT(a != b);
-    b                 = a;
-    b.device_set_hash = a.device_set_hash ^ 1u;
     ASSERT(a != b);
 
     // llama.cpp-3aos: kv_unified must independently affect equality too --
@@ -661,7 +661,7 @@ TEST(ubatch_kv_mode_json_roundtrip) {
         "{\"device_key\":\"Dev@1.0\",\"model_name\":\"mode-regression\","
         "\"model_size\":4096,\"model_hash\":17,\"n_ctx\":4096,\"n_batch\":2048,"
         "\"flash_attn\":true,\"n_seq_max\":4,\"type_k\":1,\"type_v\":1,"
-        "\"device_set_hash\":23,\"swa_full\":false,\"kv_unified\":";
+        "\"swa_full\":false,\"kv_unified\":";
     const UbatchCacheKey separate = ubatch_key_from_json(prefix + "false}");
     const UbatchCacheKey unified  = ubatch_key_from_json(prefix + "true}");
     // Positive parse controls must pass before the mode distinction is tested.
@@ -691,7 +691,7 @@ TEST(ubatch_swa_full_json_roundtrip) {
         "{\"device_key\":\"Dev@1.0\",\"model_name\":\"swa-full-regression\","
         "\"model_size\":4096,\"model_hash\":17,\"n_ctx\":4096,\"n_batch\":2048,"
         "\"flash_attn\":true,\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,"
-        "\"device_set_hash\":23,\"kv_unified\":false,\"swa_full\":";
+        "\"kv_unified\":false,\"swa_full\":";
     const UbatchCacheKey windowed = ubatch_key_from_json(prefix + "false}");
     const UbatchCacheKey full     = ubatch_key_from_json(prefix + "true}");
     ASSERT(windowed.model_name == "swa-full-regression");
@@ -894,6 +894,86 @@ TEST(ubatch_cache_v3_file_rejected) {
     bool                          result = load_ubatch_cache(cache_dir, device_name, loaded);
     ASSERT(result == false);
     ASSERT(loaded.empty());
+
+    std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// Test: a v4 ubatch cache file (the pre-llama.cpp-1oa3 shape: a device_key
+// naming one card, plus an index-only device_set_hash) is rejected now that
+// CACHE_VERSION is 5. Without the bump, the entry a level_zero:0 run stored
+// would still be read back for a collapsed level_zero:0,1 split: both runs
+// file under the first card, and v4 keyed them identically.
+TEST(ubatch_cache_v4_file_rejected) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_v4_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchV4Device_" + std::to_string(getpid());
+
+    create_dir_recursive(cache_dir);
+    std::string   path = get_ubatch_cache_file(cache_dir, device_name);
+    std::ofstream f(path);
+    f << "{\n";
+    f << "  \"version\": 4,\n";
+    f << "  \"device\": \"" << device_name << "\",\n";
+    f << "  \"entries\": [{\"key\":{\"device_key\":\"Dev@1.0\",\"model_name\":\"m\",\"model_size\":0,"
+      << "\"model_hash\":0,\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":false,\"n_seq_max\":1,"
+      << "\"type_k\":0,\"type_v\":0,\"device_set_hash\":84696351,\"kv_unified\":false,\"swa_full\":false},"
+      << "\"n_ubatch\":2048,\"reason\":\"ladder exhausted\",\"created\":\"2026-09-25T00:00:00Z\"}]\n";
+    f << "}\n";
+    f.close();
+
+    std::vector<UbatchCacheEntry> loaded;
+    bool                          result = load_ubatch_cache(cache_dir, device_name, loaded);
+    ASSERT(result == false);
+    ASSERT(loaded.empty());
+
+    std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// Test: a v5 ubatch cache file is rejected, and the next store replaces it
+// with a current-version file. v5's device_key did not record whether the
+// multi-device plan ran, so a v5 "B70,B50" entry written under that plan
+// (GGML_SYCL_MOE_MULTI_GPU unset) spells exactly what a current key spells
+// for the single-device plan (GGML_SYCL_MOE_MULTI_GPU=0) over the same two
+// scheduler-visible cards -- a terminal entry from one would be trusted by
+// the other.
+TEST(ubatch_cache_v5_file_rejected_then_replaced) {
+    std::string       cache_dir   = "/tmp/llama_test_ubatch_cache_v5_" + std::to_string(getpid());
+    std::string       device_name = "TestUbatchV5Device_" + std::to_string(getpid());
+    const std::string device_key =
+        "IntelR_ArcTM_Pro_B70_Graphics@1.17.39395+13/pct=100/headroom=2147483648,"
+        "IntelR_ArcTM_Pro_B50_Graphics@1.17.39395+13/pct=100/headroom=2147483648";
+
+    create_dir_recursive(cache_dir);
+    std::string   path = get_ubatch_cache_file(cache_dir, device_name);
+    std::ofstream f(path);
+    f << "{\n";
+    f << "  \"version\": 5,\n";
+    f << "  \"device\": \"" << device_name << "\",\n";
+    f << "  \"entries\": [{\"key\":{\"device_key\":\"" << device_key << "\",\"model_name\":\"m\",\"model_size\":0,"
+      << "\"model_hash\":0,\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":false,\"n_seq_max\":1,"
+      << "\"type_k\":0,\"type_v\":0,\"kv_unified\":false,\"swa_full\":false},"
+      << "\"n_ubatch\":2048,\"reason\":\"ladder exhausted\",\"created\":\"2026-09-26T00:00:00Z\"}]\n";
+    f << "}\n";
+    f.close();
+
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded) == false);
+    ASSERT(loaded.empty());
+
+    UbatchCacheEntry fresh;
+    fresh.key.device_key = device_key;
+    fresh.key.model_name = "m";
+    fresh.key.n_ctx      = 4096;
+    fresh.key.n_batch    = 2048;
+    fresh.key.n_seq_max  = 1;
+    fresh.n_ubatch       = 1024;
+    fresh.reason         = "ladder exhausted";
+    ASSERT(save_ubatch_cache(cache_dir, device_name, { fresh }));
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 1 && loaded[0].n_ubatch == 1024);
 
     std::remove(path.c_str());
     rmdir(cache_dir.c_str());
@@ -1128,7 +1208,7 @@ TEST(ubatch_cache_oversized_digit_no_ub) {
              "  \"entries\": [\n"
              "    {\"device_key\":\"Dev@1.0\",\"model_name\":\"m\",\"model_size\":0,\"model_hash\":0,"
              "\"n_ctx\":123456789012345678901234567890,\"n_batch\":2048,\"flash_attn\":false,"
-             "\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,\"device_set_hash\":0,"
+             "\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,"
              "\"n_ubatch\":512,\"reason\":\"ladder exhausted\",\"created\":\"2026-09-12T00:00:00Z\"}\n"
              "  ]\n"
              "}\n";
@@ -1228,6 +1308,205 @@ TEST(ubatch_cache_u64_hash_boundary_roundtrip) {
     return true;
 }
 
+// The participating-device-set half of the key. The identities below mirror
+// this host: logical 0 = B70, logical 1 = B50 (logical 1 is the iGPU in the
+// "different second card" case). A level_zero:0,1 run without
+// GGML_SYCL_SPLIT_RATIO/TENSOR_SPLIT exposes only device 0 to the scheduler,
+// while the placement planner still puts layers and KV on device 1.
+static UbatchDeviceIdentity ubatch_test_identity(const char * name, int budget_pct) {
+    UbatchDeviceIdentity id;
+    id.device_name       = name;
+    id.driver_version    = "1.17.39395+13";
+    id.budget_pct        = budget_pct;
+    id.external_headroom = 2048ull << 20;
+    return id;
+}
+
+static UbatchDeviceTopology ubatch_test_topology(std::vector<int> scheduler_devices,
+                                                 int              total_gpu_count,
+                                                 bool             multi_device_plan) {
+    UbatchDeviceTopology topo;
+    topo.scheduler_devices = std::move(scheduler_devices);
+    topo.total_gpu_count   = total_gpu_count;
+    topo.multi_device_plan = multi_device_plan;
+    return topo;
+}
+
+static const char * const k_b70  = "Intel(R) Arc(TM) Pro B70 Graphics";
+static const char * const k_b50  = "Intel(R) Arc(TM) Pro B50 Graphics";
+static const char * const k_igpu = "Intel(R) Graphics";
+
+// Test: a collapsed two-card split and the first card alone are different
+// device sets, at the same budget percentage. This is the dense case too:
+// the hidden-GPU gate (ggml_backend_sycl_moe_multi_gpu_requested()) is
+// total_gpu_count >= 2 whatever the model, so a dense Mistral
+// level_zero:0,1 run has multi_device_plan=true and places a layer
+// block on the B50. test-sycl-auto-ubatch-source pins that gate's model
+// independence.
+TEST(ubatch_device_set_key_split_differs_from_first_card_alone) {
+    const std::string alone =
+        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, false), { ubatch_test_identity(k_b70, 100) });
+    const std::string split = ubatch_device_set_key(
+        ubatch_test_topology({ 0 }, 2, true), { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_b50, 100) });
+    ASSERT(!alone.empty());
+    ASSERT(split != alone);
+    return true;
+}
+
+// Test: the same device set under a different VRAM budget percentage (or a
+// different external headroom) fits differently, so it is a different key.
+TEST(ubatch_device_set_key_includes_budget) {
+    const UbatchDeviceTopology alone_topo = ubatch_test_topology({ 0 }, 1, false);
+    const std::string          at_100     = ubatch_device_set_key(alone_topo, { ubatch_test_identity(k_b70, 100) });
+    const std::string          at_22      = ubatch_device_set_key(alone_topo, { ubatch_test_identity(k_b70, 22) });
+    ASSERT(at_100 != at_22);
+
+    UbatchDeviceIdentity other_headroom = ubatch_test_identity(k_b70, 100);
+    other_headroom.external_headroom += 1ull << 20;
+    ASSERT(ubatch_device_set_key(alone_topo, { other_headroom }) != at_100);
+
+    // A budget change on the SECOND card alone must move the key too.
+    const UbatchDeviceTopology split_topo = ubatch_test_topology({ 0 }, 2, true);
+    const std::string          both_22 =
+        ubatch_device_set_key(split_topo, { ubatch_test_identity(k_b70, 22), ubatch_test_identity(k_b50, 22) });
+    const std::string b50_at_30 =
+        ubatch_device_set_key(split_topo, { ubatch_test_identity(k_b70, 22), ubatch_test_identity(k_b50, 30) });
+    ASSERT(both_22 != b50_at_30);
+    return true;
+}
+
+// Test: every participating device's identity is keyed, not just its index --
+// [B70, B50] and [B70, iGPU] share indices [0, 1].
+TEST(ubatch_device_set_key_identifies_every_device) {
+    const UbatchDeviceTopology visible_pair = ubatch_test_topology({ 0, 1 }, 2, true);
+    const std::string          with_b50 =
+        ubatch_device_set_key(visible_pair, { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_b50, 100) });
+    const std::string with_igpu =
+        ubatch_device_set_key(visible_pair, { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_igpu, 100) });
+    ASSERT(with_b50 != with_igpu);
+    return true;
+}
+
+// Test: order is part of the set's identity, and identical inputs give an
+// identical key (the property a cache hit depends on).
+TEST(ubatch_device_set_key_order_and_stability) {
+    const std::vector<UbatchDeviceIdentity> ids = { ubatch_test_identity(k_b70, 100),
+                                                    ubatch_test_identity(k_b50, 100) };
+    const std::string forward                   = ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, true), ids);
+    const std::string reversed                  = ubatch_device_set_key(ubatch_test_topology({ 1, 0 }, 2, true), ids);
+    ASSERT(forward != reversed);
+    ASSERT(forward == ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, true), ids));
+    return true;
+}
+
+// Test: a collapsed split (scheduler [0], device 1 hidden) and a
+// SPLIT_RATIO/TENSOR_SPLIT split (scheduler [0, 1]) involve the same devices
+// but not the same demand -- only the latter puts compute buffers on device
+// 1 -- so they must not share a key.
+TEST(ubatch_device_set_key_collapsed_split_differs_from_visible_split) {
+    const std::vector<UbatchDeviceIdentity> ids       = { ubatch_test_identity(k_b70, 100),
+                                                          ubatch_test_identity(k_b50, 100) };
+    const UbatchDeviceTopology              collapsed = ubatch_test_topology({ 0 }, 2, true);
+    const UbatchDeviceTopology              visible   = ubatch_test_topology({ 0, 1 }, 2, true);
+    ASSERT(ubatch_participating_devices(collapsed) == ubatch_participating_devices(visible));
+    const std::string collapsed_key = ubatch_device_set_key(collapsed, ids);
+    const std::string visible_key   = ubatch_device_set_key(visible, ids);
+    ASSERT(!collapsed_key.empty());
+    ASSERT(collapsed_key != visible_key);
+    ASSERT(collapsed_key.find("hidden:") != std::string::npos);
+    ASSERT(visible_key.find("hidden:") == std::string::npos);
+    return true;
+}
+
+// Test: the multi-GPU placement knobs divide work across the same devices
+// differently, so each set value is keyed; an unset one adds nothing, and a
+// single-device key carries no '|' suffix at all.
+TEST(ubatch_device_set_key_includes_placement_config) {
+    const std::vector<UbatchDeviceIdentity> ids       = { ubatch_test_identity(k_b70, 100),
+                                                          ubatch_test_identity(k_b50, 100) };
+    UbatchDeviceTopology                    layer     = ubatch_test_topology({ 0 }, 2, true);
+    UbatchDeviceTopology                    hybrid    = layer;
+    const std::string                       unset_key = ubatch_device_set_key(layer, ids);
+    layer.placement_config                            = "mode=layer";
+    hybrid.placement_config                           = "mode=hybrid";
+    ASSERT(ubatch_device_set_key(layer, ids) != unset_key);
+    ASSERT(ubatch_device_set_key(layer, ids) != ubatch_device_set_key(hybrid, ids));
+    ASSERT(unset_key.find("mode=") == std::string::npos);
+    const std::string alone =
+        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, false), { ubatch_test_identity(k_b70, 100) });
+    ASSERT(alone.find('|') == std::string::npos);
+    return true;
+}
+
+// Test: the backend treats an empty knob as unset (ggml_sycl_env_is_set()),
+// so an empty value must compose the same config as an absent one; keying
+// "NAME=" would make the same placement miss.
+TEST(ubatch_placement_config_empty_value_is_unset) {
+    const char * const names[]      = { "GGML_SYCL_MULTI_GPU_MODE", "GGML_SYCL_SPLIT_RATIO", "GGML_SYCL_TENSOR_SPLIT" };
+    const char * const unset[]      = { nullptr, nullptr, nullptr };
+    const char * const empty[]      = { nullptr, "", nullptr };
+    const char * const set_mode[]   = { "layer", nullptr, nullptr };
+    const char * const mode_empty[] = { "layer", "", "" };
+    ASSERT(ubatch_placement_config(names, empty, 3) == ubatch_placement_config(names, unset, 3));
+    ASSERT(ubatch_placement_config(names, unset, 3).empty());
+    ASSERT(ubatch_placement_config(names, mode_empty, 3) == ubatch_placement_config(names, set_mode, 3));
+    ASSERT(ubatch_placement_config(names, set_mode, 3) == "GGML_SYCL_MULTI_GPU_MODE=layer");
+    return true;
+}
+
+// Test: a hidden GPU that the placement planner does not use (multi-GPU
+// placement disabled) is not part of the set, so that run shares the
+// first-card-alone entry.
+TEST(ubatch_device_set_key_idle_hidden_gpu_is_not_keyed) {
+    const std::string alone =
+        ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, false), { ubatch_test_identity(k_b70, 100) });
+    const std::string idle_split = ubatch_device_set_key(
+        ubatch_test_topology({ 0 }, 2, false), { ubatch_test_identity(k_b70, 100), ubatch_test_identity(k_b50, 100) });
+    ASSERT(idle_split == alone);
+    return true;
+}
+
+// Test: with SPLIT_RATIO/TENSOR_SPLIT every GPU is scheduler-visible, so no
+// device is hidden -- yet the planner still runs the multi-device plan or the
+// single-device one depending on its gate. The key must record which.
+TEST(ubatch_device_set_key_visible_pair_keys_the_plan) {
+    const std::vector<UbatchDeviceIdentity> ids = { ubatch_test_identity(k_b70, 100),
+                                                    ubatch_test_identity(k_b50, 100) };
+    ASSERT(ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, true), ids) !=
+           ubatch_device_set_key(ubatch_test_topology({ 0, 1 }, 2, false), ids));
+    return true;
+}
+
+// Test: the multi-device plan budgets every physical GPU, so a scheduler list
+// that is a strict subset of the visible ones (e.g. only device 1) still keys
+// the others, marked hidden.
+TEST(ubatch_device_set_key_visible_subset_keys_every_planner_gpu) {
+    const std::vector<UbatchDeviceIdentity> ids = { ubatch_test_identity(k_b70, 100),
+                                                    ubatch_test_identity(k_b50, 100) };
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 1 }, 2, true)) == std::vector<int>{ 1, 0 }));
+    const std::string key = ubatch_device_set_key(ubatch_test_topology({ 1 }, 2, true), ids);
+    ASSERT(key.find("hidden:" + sanitize_device_name(k_b70)) != std::string::npos);
+    return true;
+}
+
+// Test: a participating device with no identity yields no key at all, never
+// one that under-describes the set.
+TEST(ubatch_device_set_key_missing_identity_is_no_key) {
+    ASSERT(ubatch_device_set_key(ubatch_test_topology({ 0 }, 2, true), { ubatch_test_identity(k_b70, 100) }).empty());
+    return true;
+}
+
+// Test: the participating list is the scheduler devices in order, then (under
+// the multi-device plan) each physical GPU the scheduler does not list, in
+// index order, without repeating one.
+TEST(ubatch_participating_devices_order) {
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 2, true)) == std::vector<int>{ 0, 1 }));
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 3, true)) == std::vector<int>{ 0, 1, 2 }));
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 0 }, 2, false)) == std::vector<int>{ 0 }));
+    ASSERT((ubatch_participating_devices(ubatch_test_topology({ 1, 0 }, 2, true)) == std::vector<int>{ 1, 0 }));
+    return true;
+}
+
 // =============================================================================
 // Main test runner
 // =============================================================================
@@ -1273,7 +1552,7 @@ int main() {
     RUN_TEST(parse_string_edge_cases);
     RUN_TEST(atomic_write);
 
-    RUN_TEST(cache_version_is_4);
+    RUN_TEST(cache_version_is_6);
     RUN_TEST(ubatch_key_equality);
     RUN_TEST(ubatch_kv_mode_json_roundtrip);
     RUN_TEST(ubatch_swa_full_json_roundtrip);
@@ -1282,6 +1561,8 @@ int main() {
     RUN_TEST(ubatch_cache_v1_file_rejected);
     RUN_TEST(ubatch_cache_v2_file_rejected);
     RUN_TEST(ubatch_cache_v3_file_rejected);
+    RUN_TEST(ubatch_cache_v4_file_rejected);
+    RUN_TEST(ubatch_cache_v5_file_rejected_then_replaced);
     RUN_TEST(ubatch_cache_unwritable_dir);
     RUN_TEST(ubatch_cache_load_missing_file);
     RUN_TEST(ubatch_cache_string_escaping_roundtrip);
@@ -1291,6 +1572,18 @@ int main() {
     RUN_TEST(ubatch_cache_oversized_digit_no_ub);
     RUN_TEST(parse_u64_rejects_overflow);
     RUN_TEST(ubatch_cache_u64_hash_boundary_roundtrip);
+    RUN_TEST(ubatch_device_set_key_split_differs_from_first_card_alone);
+    RUN_TEST(ubatch_device_set_key_includes_budget);
+    RUN_TEST(ubatch_device_set_key_identifies_every_device);
+    RUN_TEST(ubatch_device_set_key_order_and_stability);
+    RUN_TEST(ubatch_device_set_key_collapsed_split_differs_from_visible_split);
+    RUN_TEST(ubatch_device_set_key_includes_placement_config);
+    RUN_TEST(ubatch_placement_config_empty_value_is_unset);
+    RUN_TEST(ubatch_device_set_key_idle_hidden_gpu_is_not_keyed);
+    RUN_TEST(ubatch_device_set_key_visible_pair_keys_the_plan);
+    RUN_TEST(ubatch_device_set_key_visible_subset_keys_every_planner_gpu);
+    RUN_TEST(ubatch_device_set_key_missing_identity_is_no_key);
+    RUN_TEST(ubatch_participating_devices_order);
 
     std::cout << "\n=== Summary ===\n";
     std::cout << "Passed: " << g_passed << ", Failed: " << g_failed << "\n";

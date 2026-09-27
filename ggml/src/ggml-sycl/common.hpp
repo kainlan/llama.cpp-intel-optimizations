@@ -5676,6 +5676,10 @@ struct ggml_backend_sycl_context {
     uint64_t                             execution_root_load_txn_id = 0;
     uint32_t                             execution_root_slot = GGML_SYCL_MODEL_SLOT_NONE;
     uint64_t                             execution_root_slot_generation = 0;
+    // Set once this context's runtime-context transaction published: its KV
+    // was admitted (and is then allocated), so a later same-shape republish
+    // keeps the published residency (kv_residency_needs_refit).
+    bool                                 runtime_kv_admitted = false;
     // Device capability: does this device support SoA weight layout optimization?
     // This is NOT tensor state - it's a static capability of the GPU.
     // Tensor state is tracked per-tensor in ggml_tensor_extra_gpu::optimized_feature
@@ -6073,6 +6077,9 @@ struct ggml_backend_sycl_context {
     int      warmup_decode_n_nodes    = 0;      // Track which decode graph has been warmed up
     int      warmup_prompt_n_nodes    = 0;      // Track which prompt graph has been warmed up
     bool     graphs_disabled          = false;  // Set when graph recording fails; disables graphs for this context
+    // The optional-layout epoch this context's recorded graphs were checked
+    // against (ggml_sycl_optional_layouts_retired() in ggml-sycl.cpp).
+    uint64_t optional_layout_epoch          = 0;
     // llama.cpp-dkw0 (defect #4 closing fix): one exec_graph slot per context but
     // partial-offload graphs fragment a token's compute into many small,
     // differently-shaped splits that all cycle through that single slot. The
