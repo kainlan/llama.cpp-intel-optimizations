@@ -419,8 +419,8 @@ def main(argv=None) -> int:
             if got < mn:
                 print(f"VOID: control {op}={backend}:{mn} not met at n_tokens={k} (found {got})", file=sys.stderr)
                 void = True
-        if d is not None and (any(r.status == "DISAGREE" for r in d.rules) or
-                              any(is_cpu(u.backend) for u in d.unpredicted)):
+        if d is not None and (any(r.status == "DISAGREE" for r in d.rules)
+                              or any(is_cpu(u.backend) for u in d.unpredicted)):
             strict_fail = True
     if void:
         return 2

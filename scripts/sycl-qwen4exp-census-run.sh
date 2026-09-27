@@ -13,7 +13,7 @@
 #           vehicle      the synthetic qwen4exp model (QWEN4EXP_VEHICLE, see the
 #                        census doc for how the lead generates it): 2 layers,
 #                        every qwen4exp op family, fits on either card.
-#           qwen4exp     the census on the real 177 GiB model. Needs 200 GiB
+#           qwen4exp     the census on the real 177 GiB model. Needs 215 GB (200 GiB)
 #                        MemAvailable, which this host does not have under its
 #                        permanent load (the doc says what this waits on).
 #   device  0 = B70, 1 = B50 (level_zero index; the iGPU is never selected)
@@ -24,8 +24,11 @@
 # VALID/SUSPECT verdict that this script enforces). A watchdog samples
 # /proc/meminfo every 2 s and kills the run's whole session if MemAvailable
 # drops under WATCHDOG_FLOOR_GB (default 20) or, in the control and vehicle
-# modes, if Shmem climbs past WATCHDOG_SHMEM_GB (default 100): those runs
-# measure ~2 GB pinned, so 100 GB means a runaway, not a large load.
+# modes, if Shmem climbs past WATCHDOG_SHMEM_GB (default 100): the controls
+# measured ~1-2 GB, so 100 GB means a runaway, not a large load.
+#
+# Every memory figure here is decimal GB (10^9 bytes), the unit of CLAUDE.md's
+# settle rule; /proc/meminfo's kB are KiB and are converted, never relabelled.
 #
 # The dump is GGML_LOG_DEBUG output: it needs GGML_SCHED_DEBUG=2 (1 prints
 # split headers only) AND -lv 5, because common_log drops DEBUG below
@@ -66,17 +69,18 @@ fi
 grep -qE '^GGML_SYCL:BOOL=ON' "$ROOT/build/CMakeCache.txt" || { echo "GGML_SYCL is not ON in build/CMakeCache.txt" >&2; exit 3; }
 [ "$(ldd "$BIN" | grep -E 'libggml-sycl|libsycl' | grep -c '=> /')" -ge 2 ] || { echo "$BIN does not link a resolvable SYCL backend" >&2; exit 3; }
 
-meminfo_kb() { awk -v k="$1:" '$1 == k { print $2 }' /proc/meminfo; }
-shmem_gb() { echo $(( $(meminfo_kb Shmem) / 1048576 )); }
-avail_gb() { echo $(( $(meminfo_kb MemAvailable) / 1048576 )); }
-stamp() { echo "$(date +%T) $1 Shmem=$(shmem_gb)G MemAvailable=$(avail_gb)G" | tee -a "$OUT/mem.log"; }
+# bytes, and whole decimal GB (10^9 bytes) for display; /proc/meminfo's "kB" is KiB
+meminfo_b() { echo $(( $(awk -v k="$1:" '$1 == k { print $2 }' /proc/meminfo) * 1024 )); }
+shmem_gb() { echo $(( $(meminfo_b Shmem) / 1000000000 )); }
+avail_gb() { echo $(( $(meminfo_b MemAvailable) / 1000000000 )); }
+stamp() { echo "$(date +%T) $1 Shmem=$(shmem_gb)GB MemAvailable=$(avail_gb)GB" | tee -a "$OUT/mem.log"; }
 
 REQUIRE=() EXTRA_ENV=() EXTRA_ARGS=() PREDICTION=()
 case "$MODE" in
     qwen4exp)
         # ~120 GiB of experts and the 50.66 GiB PLE table are read into host
         # memory: SYCL leaves mmap_support unset, so the loader turns mmap off
-        NEED_GB=200 BUDGET=1800 MODEL="$QWEN_MODEL" FA=(-fa auto) N_EMBD=2560
+        NEED_GB=215 BUDGET=1800 MODEL="$QWEN_MODEL" FA=(-fa auto) N_EMBD=2560
         SHMEM_ABORT_GB=
         # structural controls: the dump must be the whole qwen4exp graph
         REQUIRE=(--require GATED_DELTA_NET=ANY:36 --require MUL_MAT_ID=ANY:144 --require TOP_K=ANY:12)
@@ -84,12 +88,18 @@ case "$MODE" in
         ;;
     vehicle)
         [ -n "$VEHICLE_MODEL" ] && [ -f "$VEHICLE_MODEL" ] || { echo "set QWEN4EXP_VEHICLE to the quantized synthetic qwen4exp GGUF" >&2; exit 1; }
+        # the dump prints no types, so an F32 indexer would score IDX-PROJ-BF16 as
+        # agreeing; refuse any file that the BF16 rewrite (census doc, step b2) has not made
+        "$ROOT/scripts/sycl-qwen4exp-vehicle-bf16-indexer.py" --verify "$VEHICLE_MODEL" || exit 1
         NEED_GB=30 BUDGET=600 MODEL="$VEHICLE_MODEL" FA=(-fa auto) N_EMBD=256
         # 2 layers: one GDN layer, one QSA layer, MoE on both -- 2 MUL_MAT_ID per
         # layer if the fixture creates the merged ffn_gate_up_exps, else 3
         REQUIRE=(--require GATED_DELTA_NET=ANY:1 --require MUL_MAT_ID=ANY:4 --require TOP_K=ANY:1)
-        # random weights can sample EOS first, which ends the run before the
-        # T=1 decode graph is built; the census needs both token classes
+        # a no-op on today's vehicle: its "test" tokenizer has no EOS
+        # (llama-vocab.cpp:2095), so common.cpp:1321-1323 drops the flag with a
+        # WARN and nothing can end the run early. It matters only for a vehicle
+        # whose tokenizer has an EOS, which a random-weight model could sample
+        # before the T=1 decode graph is built
         EXTRA_ARGS=(--ignore-eos)
         PREDICTION=(--prediction "$ROOT/scripts/sycl-qwen4exp-op-prediction.json")
         ;;
@@ -105,13 +115,19 @@ esac
 
 # CLAUDE.md's post-lock settle: TTM shmem release lags the previous run, so
 # wait for Shmem < 30 GB and MemAvailable > 150 GB (and the mode's own need)
-# before touching the device; give up after SETTLE_TIMEOUT_S and escalate
+# before touching the device; give up after SETTLE_TIMEOUT_S and escalate.
+# Compared in bytes against the rule's decimal GB, so the floor is exactly the
+# rule's 150e9, neither the 161 GB a GiB floor would be nor anything lower.
 [ "$NEED_GB" -gt 150 ] || NEED_GB=150
+settled() {
+    [ "$(meminfo_b Shmem)" -lt $((30 * 1000000000)) ] &&
+        [ "$(meminfo_b MemAvailable)" -gt $((NEED_GB * 1000000000)) ]
+}
 waited=0
-until [ "$(shmem_gb)" -lt 30 ] && [ "$(avail_gb)" -ge "$NEED_GB" ]; do
+until settled; do
     if [ "$waited" -ge "$SETTLE_TIMEOUT_S" ]; then
         stamp "refused: not settled after ${waited}s"
-        echo "host did not settle to Shmem < 30 GB and MemAvailable >= ${NEED_GB} GB in ${waited}s; release GPU.lock and escalate" >&2
+        echo "host did not settle to Shmem < 30 GB and MemAvailable > ${NEED_GB} GB in ${waited}s; release GPU.lock and escalate" >&2
         exit 3
     fi
     sleep 10; waited=$((waited + 10))
@@ -168,7 +184,14 @@ elif [ "$(ps -o sid= -p "$RUN_PID" | tr -d ' ')" != "$RUN_PID" ]; then
     child="$(pgrep -P "$RUN_PID" | head -1)"
     if [ -n "$child" ]; then
         SID="$(ps -o sid= -p "$child" | tr -d ' ')"
-        [ -n "$SID" ] && { kill_session; wait_session_empty; }
+        # a child that has not reached setsid() yet still has this script's
+        # session, and killing that would kill the caller: TERM it by pid
+        if [ -n "$SID" ] && [ "$SID" != "$(ps -o sid= -p $$ | tr -d ' ')" ]; then
+            kill_session
+            wait_session_empty
+        else
+            kill -TERM "$child" 2>/dev/null
+        fi
     fi
     kill -TERM "$RUN_PID" 2>/dev/null
     wait "$RUN_PID"
@@ -179,7 +202,7 @@ fi
 KILLED=0
 while kill -0 "$RUN_PID" 2>/dev/null; do
     a=$(avail_gb) sh=$(shmem_gb)
-    echo "$(date +%T) Shmem=${sh}G MemAvailable=${a}G" >> "$OUT/mem.log"
+    echo "$(date +%T) Shmem=${sh}GB MemAvailable=${a}GB" >> "$OUT/mem.log"
     why=
     if [ "$a" -lt "$FLOOR_GB" ]; then
         why="MemAvailable ${a} GB < ${FLOOR_GB} GB"

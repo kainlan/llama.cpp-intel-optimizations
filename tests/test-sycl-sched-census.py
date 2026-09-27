@@ -265,8 +265,8 @@ def check_mode(tmp: Path, mode: str) -> None:
                   f"{tag}: SOFTPLUS must sit in 2 CPU splits, got {c.cpu_splits_by_op.get('SOFTPLUS', 0)}")
             check(c.cpu_splits_by_op.get("TOP_K", 0) == 1,
                   f"{tag}: TOP_K must sit in 1 CPU split, got {c.cpu_splits_by_op.get('TOP_K', 0)}")
-            check(c.nodes_by_op_backend.get(("MUL_MAT", "SYCL0"), 0) == 4 and
-                  c.nodes_by_op_backend.get(("MUL_MAT", "CPU"), 0) == 1,
+            check(c.nodes_by_op_backend.get(("MUL_MAT", "SYCL0"), 0) == 4
+                  and c.nodes_by_op_backend.get(("MUL_MAT", "CPU"), 0) == 1,
                   f"{tag}: MUL_MAT per backend wrong: {dict(c.nodes_by_op_backend)}")
             # the fixed-width op field truncates GATED_DELTA_NET; the torn
             # line in the decode dump must still yield this node
