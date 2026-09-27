@@ -9,8 +9,8 @@ and `ggml-sycl.cpp` are byte-identical to `76c7f6548`. Rev 2 folded review
 `design-th32-r2` (1 Critical, 5 Important, 12 Minor) under the lead's rulings
 §T2, §T3, §T4, §D5 and §D6 (§D6 amends §D5 after `9g22`'s r4 review), and
 the owner's decision §D4 (`lead-rulings-2026-09-26.md`). It takes `9g22`'s
-figures from that design's rev 9 (`c0d472a68`), which moves no figure of
-rev 7's. Rev 2c folds the lead's
+figures from that design's rev 10 (`054069548`), which moves one figure of
+rev 9's that this document quotes (§4.5, `th32-p3`). Rev 2c folds the lead's
 §T5, which rules on rev 2b's open items: DQ-C2, the row-cache size and the
 cold-expert order source. Rev 2d folds review `design-th32-r3` (3 Important,
 14 Minor) under the lead's §T6, and §D7 I-B's consumer-copy criterion. Rev 2e
@@ -19,7 +19,8 @@ which makes D6-M(b) the one refill mechanism for every model and depth, with
 the relays of §T7, §D9 and §D10. Rev 2f folds review `design-th32-r5` (7
 Important, 15 Minor) under the lead's §T10, with §T9 and §T9a, which settle
 the epoch ring's bound (DQ-E): its depth derives from the context's in-flight
-ubatch depth, and exhaustion is a plan bug.*
+ubatch depth, and exhaustion is a plan bug. It re-pins `9g22` at rev 10 and
+takes that design's device-written cancellation marker.*
 
 Citations: fork code as `76c7f6548 <file>:<line>`, upstream code as
 `694ec2354 <file>:<line>` (read with `git show ggml-org/master:<file>`; the fork
@@ -1129,7 +1130,7 @@ Q8_0 experts.
 - **Today's code.** The ring sets the floor of each card's VRAM RUNTIME zone
   (§2.3). The expert room it takes is the ring less that zone's own 512 MiB
   floor: about 7.4 GiB on DeepSeek and 3.7 GiB on Qwen, which become host
-  experts. The figure and its rule are `9g22`'s (rev 9, r4 m4:
+  experts. The figure and its rule are `9g22`'s (rev 10, r4 m4:
   [its §4.5.2](deepseek41-runtime.md#452-the-host-fit-r2-c-a-r3-c-1-c-2-owner-d4)); the
   today's-code rows below use that rule, one source (*lead ruling §T6*, m-9).
 - **Two VRAM terms are inputs, not estimates here.** They are the C-class terms
@@ -1159,7 +1160,7 @@ and 0.83 GiB for Qwen, both `blk.0.ffn_down_exps`):
 | main-pool chunk rounding | the main pool commits 2 GiB chunks | up to 2 | up to 2 | up to 2 | up to 2 |
 | **step 2, one zone set** (main-pool rounding excluded) | | **114.8-118.2** | **101.3-104.7** | **195.9-199.3** | **167.1-170.5** |
 | `host_reserve` + context envelope | 2 GiB + <= 0.5 GiB (the class-C context rows of §3.3, charged at the context transaction: output slots Qwen 10 MiB, DeepSeek 48 MiB; landing slabs Qwen 2.66 MiB when STORAGE, DeepSeek 3.9 MiB; epoch rings at `D` = 3, Qwen 0.1 MiB, DeepSeek 0.3 MiB; plus the pool's block ring 0.5 MiB once, and the `SYCL_Host` compute buffer) | 2.5 | 2.5 | 2.5 | 2.5 |
-| DSpark draft: its host effect on phase 1 | its ≈ 7.9 GiB of weights are **device** demand; with its ring they move ≈ 10.0 GiB of experts to the host (`9g22` rev 9 §4.5.2, its l.1601-1603). What that does to the cold set is `9g22`'s figure, linked, not modelled here | - | - | +10.0 | +10.0 |
+| DSpark draft: its host effect on phase 1 | its ≈ 7.9 GiB of weights are **device** demand; with its ring they move ≈ 10.0 GiB of experts to the host (`9g22` rev 10 §4.5.2, its l.1842-1844). What that does to the cold set is `9g22`'s figure, linked, not modelled here | - | - | +10.0 | +10.0 |
 | cold set: credit and landing slab | `-C` from the host experts, plus `2 x` the largest per-layer cold bytes (*lead ruling §D6*, I-4): `2C/40` if the cold set is spread evenly, 9.16 GiB if whole layers are cold | - | - | - | `-C` + slab |
 
 The oneDNN reorder and `moe_q8` figures are `9g22`'s estimates for DeepSeek,
@@ -1209,7 +1210,7 @@ commits 2 GiB for 0.09 after (s), against 12 for 11.58 today). Case C counts
 the draft's host effect as `9g22` states it: the draft's weights are device
 demand, so its host bytes are the ≈ 10.0 GiB of experts it displaces (rev
 2e carried the 7.9 GiB of weights here as host bytes, r5 m-12). What the
-draft does to the cold set is `9g22`'s figure, linked, not restated (rev 9,
+draft does to the cold set is `9g22`'s figure, linked, not restated (rev 10,
 [its §4.5.2](deepseek41-runtime.md#452-the-host-fit-r2-c-a-r3-c-1-c-2-owner-d4)).
 
 <a id="th32-p3"></a>
@@ -1228,18 +1229,18 @@ and envelope), so **a plan that passes P3 also passes the planner**.
 | after (s) | **171.1-174.5** | **200.1-203.5** | -8.1 to -4.7 / 2.3 to 5.7 / 4.2 to 7.6 / 10.9 to 14.3 |
 
 P3 fails at every reading in both columns, so without a cold set the gates
-cannot launch at all. `9g22` rev 9 §4.5.2 (`c0d472a68`, no figure moved
-since rev 7) agrees with both
+cannot launch at all. `9g22` rev 10 §4.5.2 (`054069548`) agrees with both
 rows:
 - **Today's code:** its "B70 alone, today's code + rnh3" row (its r4 m1)
   gives `E₀` = **201.1-204.0 GiB**, against 199.9-203.3 above; both now take
   the ring's displacement less the 512 MiB floor. That closes the 8.4-12.4
   GiB gap rev 2b recorded against rev 5, whose 188.0-195.4 was two-card room
   misread as one card (*lead ruling §T5*).
-- **After (s):** it predicts -8.7 to -5.8 GiB post-load at 171.4, 0.6-1.1 GiB
-  below the row above. 9g22 adds the RUNTIME zone's 512 MiB floor to the
-  device side (its r4 m4) and the 0.06 WEIGHT reserve (its m11); the rest is
-  hand rounding.
+- **After (s):** it predicts -8.9 to -6.0 GiB post-load at 171.4 (two cards
+  -10.7 to -3.3), 0.8-1.3 GiB below the row above (rev 9 said -8.7 to -5.8).
+  9g22 adds the RUNTIME zone's 512 MiB floor to the device side (its r4 m4),
+  the 0.06 WEIGHT reserve (its m11) and, from rev 10, its class-C cold slots;
+  the rest is hand rounding.
 
 7v5c's printout is the one list of terms both documents cite (§4.2).
 
@@ -1520,10 +1521,12 @@ every copy up to epoch `k-n` has completed.
 - **`prefetch(e)`, on the submitting thread, never waits.** It reads entry
   `e mod D`'s marker word, a plain load. The entry is free when that word
   holds epoch `e-D` (its copy completed) or `e-D | CANCELLED` (the strand
-  retired it, below). Only the device's marker kernel and the retiring strand
-  write the word. It then resets the entry's event (`zeEventHostReset`: no
-  command can still wait on it and no thread can still signal it, because
-  copy `e-D` has completed, or epoch `e-D` was retired without a signal),
+  retired it, below). Only device marker kernels write the word after
+  context init: the copy's, or a cancellation marker. It then resets the
+  entry's event (`zeEventHostReset`: no command can still wait on it and no
+  thread can still signal it, because the one command that waited on it, copy
+  `e-D` or its cancellation marker, has completed, and that command ran only
+  after the strand's signal),
   copies the rows input into the ids capture (at most 48 KiB), creates the
   gather request, and posts it `{table, context, e}` to the IO engine. That
   is its whole cost. When the entry is not free, see **exhaustion** below.
@@ -1587,16 +1590,13 @@ llama-server's long-prompt path: the server synchronizes only after an
 output-carrying batch (`tools/server/server-context.cpp:3565-3569`), but
 that does not remove the per-ubatch drain.
 
-**The one case the guard does not reach** (found folding r5 I-2; sent to the
-lead as DQ-F, §13). A cancelled epoch has no device work, so the guard does
-not retire it; the strand does. At the cancel of epoch `e`, the guard has
-already drained copy `e-1`, so `e`'s pending stages depend on no IO and no
-device work, only on the stage executor. `prefetch(e+D)` can find `e`
-unretired only if all `D-1` epochs after it were cancelled too, each a whole
-failed `llama_decode`, before the executor ran `e`'s stage once. The executor
-runs a cancelled epoch's stage ahead of other ready stages, which bounds the
-window to one pickup. If it is ever reached, it is the same
-`[LAZY-PLAN-BUG]`.
+**Cancelled epochs are inside the guard too.** A cancelled epoch still puts
+one command on the queue, its cancellation marker (below), so the next
+ubatch's input drain waits for it exactly as it waits for a copy. The depth
+fact therefore covers cancelled epochs with no separate bound. (Rev 2f's
+first draft had the strand write the marker from the host, which left a
+cancelled epoch outside the guard; the device-written marker closes that,
+and DQ-F is withdrawn, §13.)
 
 **Cancellation** (*lead rulings §T8* I-2, *§T10* I-2). An epoch whose copy
 was never enqueued is **cancelled**, not waited for, and the process never
@@ -1604,21 +1604,25 @@ aborts on a recoverable ubatch failure. `process_ubatch`'s failure path (a
 non-SUCCESS `graph_compute`, or any failure between `prefetch` and the copy's
 enqueue) calls `lazy_cancel_unenqueued()` (T6). For each entry whose
 `copy_enqueued` is false, that call sets its request's `cancelled` flag and
-nothing else: it writes no marker and touches no event.
+enqueues **the marker kernel alone**, `depends_on` the entry's event, writing
+`e | CANCELLED`. It does not write the marker from the host and does not
+signal the event. This is the cancellation form of `9g22`'s cold path (its
+rev 10, the cold strand's cancellation), chosen so the two designs cancel
+the same way (*lead ruling §T10* I-2 admits either form).
 
-The strand's next stage for that epoch sees the flag. It skips the dequant
-and releases the landing slot. It does **not** signal the event. Nothing waits
-on the event of a copy that was never enqueued, so a signal could only land
-late, on the event of the epoch that takes the entry over, and let that
-epoch's copy run before its output slot is written (r5 I-2). Then the strand
-**retires** the epoch: after all its own work on the entry and the slots, it
-writes `e | CANCELLED` into the marker word. Only then can `prefetch(e+D)`
-take the entry over. In-flight reads still complete and feed the row cache,
-and the reaper's slot copy skips them under the slot lock. The strand runs a
-table's epochs in order, so no later epoch touches a slot while the cancelled
-epoch's stage is still in it. A copy that was enqueued before its graph
-failed is not cancelled: its strand completes and signals, and the device
-copy runs into a result the caller discards.
+The strand's next stage for that epoch sees the flag. It skips the dequant,
+releases the landing slot and, as its last touch of the entry, signals the
+event, which releases the cancellation marker. So the device writes
+`e | CANCELLED` only after the strand is done with the entry, and only then can
+`prefetch(e+D)` take it over. The signal cannot land late on a later occupant's
+event, which was r5 I-2's race: the takeover needs the marker, and the marker
+needs the signal. The flag still lives off the ring entry, on the request, so a
+takeover never sees a half-cancelled entry. In-flight reads still complete and
+feed the row cache, and the reaper's slot copy skips them under the slot lock.
+The strand runs a table's epochs in order, so no later epoch touches a slot
+while the cancelled epoch's stage is still in it. A copy that was enqueued
+before its graph failed is not cancelled: its strand completes and signals, and
+the device copy runs into a result the caller discards.
 
 T5's RED (r5 I-3): epoch A's reads are held and cancelled, then epoch B takes
 landing slot 0 with different rows. **B's completions are released first,
@@ -1665,12 +1669,13 @@ waiter:
 `synchronize()` (`c69d5774d src/llama-context.cpp:1067`), which waits on the
 queue, copies parked on IO events included. So T6 runs the lazy teardown
 **before** that `synchronize()`, as the destructor's first statement. It
-cancels every epoch not yet enqueued (`cancelled`: retired, never
-signalled), and sets `drain` on every enqueued epoch whose stage 2 has not
+cancels every epoch not yet enqueued (`cancelled`, with no marker: no
+`prefetch` follows, so nothing needs the entry back, as in `9g22`'s cold
+path), and sets `drain` on every enqueued epoch whose stage 2 has not
 signalled. A draining stage 2 skips its dequant, waits for no IO, and
 signals as soon as copy `e-2`'s marker is set, so the enqueued copies run in
 queue order and the device drains. The two flags differ because only an
-enqueued copy has a waiter to release. The `synchronize()` then
+enqueued copy has a waiter to release at teardown. The `synchronize()` then
 waits only for device work already enqueued, which no longer depends on IO:
 that is the one teardown wait left. Teardown then drops the context's own
 references and returns. The `lazy_gather_ctx` destructor, the sole release
@@ -2160,16 +2165,16 @@ Rules around it:
   with one plain load.
 - **The event reset rule.** An event is reset only by the `prefetch` that takes
   over its ring entry, and only after it has read that entry's marker word
-  showing the previous epoch's copy completed, or the epoch retired as cancelled
-  by its strand. A cancelled epoch that never enqueued its copy is never
-  signalled (§5.3, *lead ruling §T10* I-2). So no command can wait on the event
-  then and no thread can still signal it, and no copy can ever find its event
-  still signalled from an earlier epoch. A reset by a worker *after* it sees the
-  marker, with the event reused at depth 2, would race the device: copy `e+2`
-  can start the moment copy `e` completes, before any host thread has reset the
-  event, and it would then read the output slot before stage 2 of `e+2` has
-  written it. HT-5 probes this hazard, with a negative arm, and the lead relays
-  the rule to `9g22` (§11).
+  showing the previous epoch's copy, or its cancellation marker, completed.
+  Either command runs only after the strand's signal, and the strand signals a
+  cancelled epoch only as its last touch of the entry (§5.3, *lead ruling §T10*
+  I-2). So no command can wait on the event then and no thread can still signal
+  it, and no copy can ever find its event still signalled from an earlier epoch.
+  A reset by a worker *after* it sees the marker, with the event reused at depth
+  2, would race the device: copy `e+2` can start the moment copy `e` completes,
+  before any host thread has reset the event, and it would then read the output
+  slot before stage 2 of `e+2` has written it. HT-5 probes this hazard, with a
+  negative arm, and the lead relays the rule to `9g22` (§11).
 - **What today's code does, which nothing here depends on** (r4 m-3). On
   today's code the submitter rarely runs far ahead of the device:
   - decode: the sampling step's `llama_synchronize` bounds it before the next
@@ -2591,7 +2596,7 @@ Expressed as throughput: `pp_S >= 512 / (512/pp_H + T_stall)`.
 ### 8.4 DeepSeek Q2_K (the harder case)
 
 **Where it runs.** Inside `llama.cpp-9g22`'s real-model gate protocol, P0-P7 of
-its §5.2 (rev 9, `c0d472a68`), after gates 1-4 pass: phase 1 on
+its §5.2 (rev 10, `054069548`), after gates 1-4 pass: phase 1 on
 `level_zero:0` (the B70 alone), caches fixed at 2 GiB per table with the index
 included (§4.3 step 4), no DSpark draft, **in the owner's §D4 configuration**:
 lever (s) landed, and the cold set `C` that 7v5c computed for that launch's
@@ -2612,10 +2617,10 @@ estimates are `9g22`'s (§4.5.3), from this document's facts (§9.2.2):
 
 - **PP512.** A ubatch touches 99.97% of a layer's experts, so it reads the whole
   cold set once, at the 0.29-1.2 GB/s measured for expert slices (§9.2.2). The
-  per-ubatch time that gives at each reading's cold set is `9g22`'s (rev 9, [its
-  §4.5.3](deepseek41-runtime.md#453-speed-estimates-not-targets); *lead ruling
-  §T6*, m-10), and it is far more than the engram tables' ~2.5-3.5 s. PP on
-  DeepSeek phase 1 is bounded by the cold experts, not by the engram IO.
+  per-ubatch time that gives at each reading's cold set is `9g22`'s (rev 10,
+  [its §4.5.3](deepseek41-runtime.md#453-speed-estimates-not-targets); *lead
+  ruling §T6*, m-10), and it is far more than the engram tables' ~2.5-3.5 s. PP
+  on DeepSeek phase 1 is bounded by the cold experts, not by the engram IO.
 - **Decode.** A token reads `240 x c x (1 - r) x 12.8 MB` of cold experts
   (§9.2.2), where `c` is the cold set's touch share, which the usage profile
   decides. The engram rows of a token are ~4 KiB reads that the deadline order
@@ -2691,7 +2696,7 @@ position; these arms test that decision rather than assume it:
 case C). Under owner §D4 its whole effect is paid in cold set, and that
 effect, VRAM displaced as well as host bytes, is `9g22`'s figure
 ([its §4.5.2](deepseek41-runtime.md#452-the-host-fit-r2-c-a-r3-c-1-c-2-owner-d4),
-rev 9); this document does not restate it.
+rev 10); this document does not restate it.
 Verify steps carry up to 6 tokens, so up to 288 rows per step: 74 ms mean, 131
 ms p99 cold on the Q3_K_M extent (§9.2.3). The DSpark arm gets its own targets
 from a Q2_K re-measurement when `9g22`'s gates 1-4 have passed; this document
@@ -2973,7 +2978,7 @@ Each ticket names the RED that must fail before its code exists (*lead ruling
 | T5 | the IO engine: pread pool, the ordering of §5.2.1 (classes, the `(epoch, deadline)` key, per-context round-robin, chunking, promotion) and its dispatch log, in-flight dedup, tickets with epochs, gather requests with their cancel flags, landing slabs, the pool's block ring sized from `row_size`, the per-`(table, context)` strands on their own stage executor, the strand's retire of a cancelled epoch, and the marker watcher with its event-pool references (§5.3), references on every read, join and request, the watchdog heartbeat on read completions | T4 | the cancelled-epoch fixture of §5.3 (r5 I-3): **B's completions released first, then A's**, slot 0 holds B's rows exactly and A's appear only in the cache; positive control, the pre-registered mutant without the reaper's epoch and cancel check, shows A's rows in slot 0. The three ordering witnesses of §5.2.1, scored on the dispatch log: the head-of-line backlog shape (P = 12000; the decode ticket within its no-backlog latency plus one QD64 read's p99, both measured in the run, r5 m-5), the **separating RED** (every `blk.14` read dispatched after every queued layer-2-13 chunk and before the still-queued layer-20 chunks; it fails under "cold reads lowest", *lead ruling §T8* I-6), and the **epoch RED** (epoch `e`'s `blk.14` reads dispatched before epoch `e+1`'s `blk.1` reads; it fails under a deadline-only key, *§T10* I-4). The teardown fixtures of §5.3: context A freed with a read in flight that B joined (B's rows arrive, no use-after-free under ASAN or the mock's poisoned slabs, release observed after the read, *§T8* I-7), and the event arm (the context freed between a signal and its copy's execution; the event pool destroyed only after the copy's marker is observed, *§T10* I-7) | CPU-only |
 | T6 | llama side: loader SYCL branch for `TENSOR_READ_LAZY` (independent of `mmap_support`, resolved before upstream's `AUTO`->`OFF`), SYCL device reports `mmap_support = true`, `lazy_table_info` declaration, `build_lazy_get_rows` + arm C's CPU custom op + `lazy_expand_for_layer` + `lazy_prefetch()` + `lazy_cancel_unenqueued()` on `process_ubatch`'s failure path (§5.3) + the lazy teardown as `~llama_context`'s first statement, before its `synchronize()` (§5.3, *lead ruling §T10* I-7) + the post-build consumer scan, gemma4's const-row input class; qwen4exp and gemma4 declarations | T4, T5, `llama.cpp-n77l` | (a) with `AUTO` and a device reporting `mmap_support = false`, the dual-card config still prints `[PLACEMENT] lazy ... residency=`; (b) a graph with a `ggml_view_1d` of a lazy tensor fails the build naming it | `deepseek41` follows the §9.1 contract in `llama.cpp-9g22`'s own tickets |
 | T6b | llama handling of the descriptor buffer: memory breakdown and model size report resident bytes, `load_all_data` skips the tensor in its mapping branch, including the mlock growth there (`694ec2354 src/llama-model-loader.cpp:1640-1662`, whose `lazy.has(cur)` tests the mmap lazy set this design no longer fills) | T6 | a load of a lazy-table fixture reports model size equal to the resident bytes, and `load_all_data` reads zero bytes of the table | |
-| T7 | the SYCL-owned gather for **both residencies** under D6-M(b) (*lead ruling §T8*): lazy `GET_ROWS` recognition; the epoch ring (ids captures, marker words and their initial seeding, host-signalled events in the refcounted `lazy_event_pool`, the per-copy wrapper, the reset rule); `D = in_flight_depth + 2`, read at the context transaction, and the plan-time guard check (§5.3, *lead ruling §T9a*); the worker's dequant and signal; the explicit H2D copy on the event; the cancellation path (never signalled, retired by the strand) and the `[LAZY-PLAN-BUG]` exhaustion (§5.3); the "sources not staged" predicate split agreed with zhcn (§7.2); fusion exclusion; the record-mode segment boundary and the widened segmented-replay trigger (§7.4); the engram controls `GGML_SYCL_LAZY_CONTROL*` (§7.4; listed in `sycl-env-vars.md`, where `GGML_SYCL_STRICT_LEASES`' row is widened to `[LAZY-PLAN-BUG]`); the `lazy_output_copies`, `lazy_zero_copy_reads` (resolved-pointer, and arm C's own range), `copy_submit_*`, `slot_*`, `epoch_*`, `lazy_graph_direct` and `set_tensor_global_drains` counters, and the test hook that removes the input drain | T5, T6; `llama.cpp-zhcn` for the predicate split and the host-memory check | **first the six probes HT-1..HT-6 (§7.2), lead-run, GPU**, built on `test-fattn-packed-k-lifecycle.cpp:262-342`'s gate class, HT-3 on the production execution queue per device (r5 m-1, m-14). Then the fixtures below. **Every one** runs under a pre-registered 60 s timeout with `GGML_SYCL_OP_TIMEOUT_MS=120000`, so the watchdog cannot fire first and an `rc=1` stays unambiguous, and with `GGML_SYCL_DISABLE_GRAPH=1` unless it is about record mode (r5 m-6): (1) the §7.3 zero-copy fixture (fails first with `lazy_output_copies == 0`; positive control: the pre-registered aliasing mutant, `lazy_zero_copy_reads >= 1` per graph; arm C's own mutant likewise); (2) **the dense held-copy fixture** (*§T8* I-1, r5 m-7): a dense graph, gemma4-shaped with `-lzm on`, of exactly `D` = 3 ubatches in one decode, with one lazy gather, and copy 0 held behind a test-controlled event. It uses the drain-removal hook, since the drain would otherwise hold `set_inputs(1)` until copy 0 completes. The pre-registered RED is a mutant in rev 2d's form, whose `prefetch` treats an unset marker two epochs back as overrun: it aborts at `prefetch(2)`. GREEN completes with rows equal to CPU `get_rows` for every ubatch, with no abort and no exhaustion. Positive control: a mutant whose stage 2 skips the "copy `e-2` completed" guard overwrites output slot 0 while copy 0 is held, so ubatch 0's rows mismatch; (3) **the ids-capture race fixture** (*§T8* I-4): a dense 2-ubatch fixture, with the drain-removal hook for the same reason, whose test hook holds the worker's gather for ubatch 0 until `set_input(1)` has returned. The pre-registered result: an in-place mutant, reading the rows input instead of the ring entry, gathers ubatch 1's rows for ubatch 0 (a mismatch against CPU `get_rows`), and the ring build matches; (4) **the recoverable-failure fixture** (*§T8* I-2, r5 m-6): a test hook throws `ggml_sycl_fallback_error` in ubatch `k` after its prefetch and **before the first reader of the gather's `dst`**, so before its step-3 copy is enqueued (gemma4 reads the PLE before layer 0, `694ec2354 src/models/gemma4.cpp:176-181`, so "in block 0" would be too late). `llama_decode` returns its failure status with no abort; the next three ubatches complete with correct rows; `epochs_cancelled == 1`; no slot is written while the cancelled epoch's stage is in it (a slot-owner assertion in the mock). **The enqueued arm** throws after the copy is enqueued: `epochs_cancelled == 0`, and the next ubatches are correct. **The retire arm** (r5 I-2): with the drain-removal hook, wait until copies up to `e-1` have completed, cancel `e`, hold the strand's stage for `e` and stage 2 of `e+D`, and drive `D` more epochs. The build must report `[LAZY-PLAN-BUG]` at `prefetch(e+D)` (STRICT off: -3, `epoch_ring_exhausted == 1`) and enqueue no copy `e+D`. The pre-registered mutant, which writes `e | CANCELLED` from the host and signals the event on cancel, lets copy `e+D` complete while stage 2 of `e+D` is still held, so its rows mismatch; (5) **the public-API exhaustion fixture** (*§T9a*, *§T10* I-1): `llama_decode` through the public API with no output read between calls, `GGML_SYCL_LAZY_CONTROL=hold` with `HOLD_MS=5000` engaged after 8 warm ubatches, `n_ubatch` 16 and `n_batch` 32. Two shapes: at least `2 x D` single-batch decodes, and **the llama-server shape**, one 80-token prompt (more than `2 x n_batch`) split into `n_batch` decodes with logits only on the last token of the last one. GREEN, on today's code: no exhaustion over every ubatch, and `set_tensor_global_drains` rises by at least one per ubatch. RED: the same runs with the test hook that removes the drain (no variable reaches no drain) report `[LAZY-PLAN-BUG] epoch ring exhausted` at the (`D`+1)-th ubatch after the hold engages, with -3 and `epoch_ring_exhausted == 1` (STRICT off). **The plan-time RED**: a fixture graph whose per-ubatch inputs are all host-resident is refused at context creation with `[LAZY-PLAN-BUG]` naming the missing guard; (6) **the record-mode fixture** (*§T10* I-5), two arms, a MoE graph and the dense gemma4 shape, each with a lazy gather and `GGML_SYCL_GRAPH_DIAG=1`: `seg_replay > 0`, zero futility WARNs, `lazy_boundary_dispatches == graphs` per table, and `lazy_graph_direct == 0`; (7) the §7.4 consumer-copy submit check, per table, with its `hold` and `hold_blocking` controls on a two-table fixture, after at least 8 warm ubatches (r5 m-8) | if one of HT-1..HT-5 fails there is no in-design fallback: it goes to the lead before anything else is built. HT-6's result goes to the lead whatever it is (§7.2) |
+| T7 | the SYCL-owned gather for **both residencies** under D6-M(b) (*lead ruling §T8*): lazy `GET_ROWS` recognition; the epoch ring (ids captures, marker words and their initial seeding, host-signalled events in the refcounted `lazy_event_pool`, the per-copy wrapper, the reset rule); `D = in_flight_depth + 2`, read at the context transaction, and the plan-time guard check (§5.3, *lead ruling §T9a*); the worker's dequant and signal; the explicit H2D copy on the event; the cancellation path (a device-written marker behind the strand's signal, as `9g22`'s cold path) and the `[LAZY-PLAN-BUG]` exhaustion (§5.3); the "sources not staged" predicate split agreed with zhcn (§7.2); fusion exclusion; the record-mode segment boundary and the widened segmented-replay trigger (§7.4); the engram controls `GGML_SYCL_LAZY_CONTROL*` (§7.4; listed in `sycl-env-vars.md`, where `GGML_SYCL_STRICT_LEASES`' row is widened to `[LAZY-PLAN-BUG]`); the `lazy_output_copies`, `lazy_zero_copy_reads` (resolved-pointer, and arm C's own range), `copy_submit_*`, `slot_*`, `epoch_*`, `lazy_graph_direct` and `set_tensor_global_drains` counters, and the test hook that removes the input drain | T5, T6; `llama.cpp-zhcn` for the predicate split and the host-memory check | **first the six probes HT-1..HT-6 (§7.2), lead-run, GPU**, built on `test-fattn-packed-k-lifecycle.cpp:262-342`'s gate class, HT-3 on the production execution queue per device (r5 m-1, m-14). Then the fixtures below. **Every one** runs under a pre-registered 60 s timeout with `GGML_SYCL_OP_TIMEOUT_MS=120000`, so the watchdog cannot fire first and an `rc=1` stays unambiguous, and with `GGML_SYCL_DISABLE_GRAPH=1` unless it is about record mode (r5 m-6): (1) the §7.3 zero-copy fixture (fails first with `lazy_output_copies == 0`; positive control: the pre-registered aliasing mutant, `lazy_zero_copy_reads >= 1` per graph; arm C's own mutant likewise); (2) **the dense held-copy fixture** (*§T8* I-1, r5 m-7): a dense graph, gemma4-shaped with `-lzm on`, of exactly `D` = 3 ubatches in one decode, with one lazy gather, and copy 0 held behind a test-controlled event. It uses the drain-removal hook, since the drain would otherwise hold `set_inputs(1)` until copy 0 completes. The pre-registered RED is a mutant in rev 2d's form, whose `prefetch` treats an unset marker two epochs back as overrun: it aborts at `prefetch(2)`. GREEN completes with rows equal to CPU `get_rows` for every ubatch, with no abort and no exhaustion. Positive control: a mutant whose stage 2 skips the "copy `e-2` completed" guard overwrites output slot 0 while copy 0 is held, so ubatch 0's rows mismatch; (3) **the ids-capture race fixture** (*§T8* I-4): a dense 2-ubatch fixture, with the drain-removal hook for the same reason, whose test hook holds the worker's gather for ubatch 0 until `set_input(1)` has returned. The pre-registered result: an in-place mutant, reading the rows input instead of the ring entry, gathers ubatch 1's rows for ubatch 0 (a mismatch against CPU `get_rows`), and the ring build matches; (4) **the recoverable-failure fixture** (*§T8* I-2, r5 m-6): a test hook throws `ggml_sycl_fallback_error` in ubatch `k` after its prefetch and **before the first reader of the gather's `dst`**, so before its step-3 copy is enqueued (gemma4 reads the PLE before layer 0, `694ec2354 src/models/gemma4.cpp:176-181`, so "in block 0" would be too late). `llama_decode` returns its failure status with no abort; the next three ubatches complete with correct rows; `epochs_cancelled == 1`; no slot is written while the cancelled epoch's stage is in it (a slot-owner assertion in the mock). **The enqueued arm** throws after the copy is enqueued: `epochs_cancelled == 0`, and the next ubatches are correct. **The retire arm** (r5 I-2): with the drain-removal hook, wait until copies up to `e-1` have completed, cancel `e`, hold the strand's stage for `e` and stage 2 of `e+D`, and drive `D` more epochs. The build must report `[LAZY-PLAN-BUG]` at `prefetch(e+D)` (STRICT off: -3, `epoch_ring_exhausted == 1`) and enqueue no copy `e+D`, because the cancellation marker waits on the held stage's signal. The pre-registered mutant, rev 2e's form, which writes `e | CANCELLED` from the host at cancel and signals on the strand's later stage, lets copy `e+D` complete while stage 2 of `e+D` is still held, so its rows mismatch. **The guard arm**, without the hook and without holds: after the cancel, the next ubatch's input drain completes only after `e`'s cancellation marker is set (`e | CANCELLED` observed before `prefetch(e+1)` returns); (5) **the public-API exhaustion fixture** (*§T9a*, *§T10* I-1): `llama_decode` through the public API with no output read between calls, `GGML_SYCL_LAZY_CONTROL=hold` with `HOLD_MS=5000` engaged after 8 warm ubatches, `n_ubatch` 16 and `n_batch` 32. Two shapes: at least `2 x D` single-batch decodes, and **the llama-server shape**, one 80-token prompt (more than `2 x n_batch`) split into `n_batch` decodes with logits only on the last token of the last one. GREEN, on today's code: no exhaustion over every ubatch, and `set_tensor_global_drains` rises by at least one per ubatch. RED: the same runs with the test hook that removes the drain (no variable reaches no drain) report `[LAZY-PLAN-BUG] epoch ring exhausted` at the (`D`+1)-th ubatch after the hold engages, with -3 and `epoch_ring_exhausted == 1` (STRICT off). **The plan-time RED**: a fixture graph whose per-ubatch inputs are all host-resident is refused at context creation with `[LAZY-PLAN-BUG]` naming the missing guard; (6) **the record-mode fixture** (*§T10* I-5), two arms, a MoE graph and the dense gemma4 shape, each with a lazy gather and `GGML_SYCL_GRAPH_DIAG=1`: `seg_replay > 0`, zero futility WARNs, `lazy_boundary_dispatches == graphs` per table, and `lazy_graph_direct == 0`; (7) the §7.4 consumer-copy submit check, per table, with its `hold` and `hold_blocking` controls on a two-table fixture, after at least 8 warm ubatches (r5 m-8) | if one of HT-1..HT-5 fails there is no in-design fallback: it goes to the lead before anything else is built. HT-6's result goes to the lead whatever it is (§7.2) |
 | T8 | counters (unconditional), their definitions (§10), and CPU-only unit tests, with both hash harnesses of Appendix B as fixtures | T5, T6 | a counter test where a repeated row in one ubatch counts as a join and a hit, and a same-block different row counts as a miss with no extra read | |
 | T9q | Qwen acceptance against §8.2-8.3: H, S-cold, S-warm, S-hot, the correctness gate, the positive and negative controls, the engine ratio (GPU) | T7, T8 | an `--lazy-mode off` run must fail the engagement check (the negative control proves the check can fail) | |
 | T10 | `peek_rows` lookahead (class 1, into the row cache only; §5.4, §7.2) | T9q | a lookahead fixture where rows missed by ubatch `k` and `k+1` are read once; and, with every ring entry's copy held, lookahead for `k+1` still issues its class-1 reads and writes no slot, no ring entry and no marker (*lead ruling §T8*, I-3) | required for DeepSeek (D9) |
@@ -3011,14 +3016,21 @@ Each ticket names the RED that must fail before its code exists (*lead ruling
   *lead ruling §T7* 1 asked for is **withdrawn** for th32 (*§T8* I-1).
 
 **Relays to `9g22`** (through the lead, *lead rulings §T8, §T10*):
-- re-pin th32 at rev 2f;
+- re-pin th32 at rev 2f (th32 pins it at rev 10, `054069548`);
 - HT-1..HT-6; HT-6, the long hold, matters more to its cold path, which
   parks the device longer;
 - **the watchdog rule** (§5.3, *§T10* I-6 (a)): a stall is no device progress
   and no IO-engine progress for the timeout. Its cold path has the same
   exposure at a larger size;
-- a cancelled, never-enqueued epoch is never signalled, and its strand, not
-  the submitter, retires the ring entry (§5.3, *§T10* I-2);
+- th32 now cancels as the cold path does (§5.3, *§T10* I-2): a marker kernel
+  alone, `depends_on` the entry's event, writes `e | CANCELLED`, and the
+  strand signals as its last touch of the entry. Its rev 10 text "th32 writes
+  a cancelled marker from the host" is out of date;
+- its ring depth `D_cold` still uses rev 2e's `2 x ceil(n_batch / n_ubatch)
+  + 2`, and its exhaustion a named refusal (`cold-epoch-ring-exhausted`).
+  Under *§T9a* th32's `D` is `in_flight_depth + 2` and exhaustion is
+  `[LAZY-PLAN-BUG]` (§5.3), which the cold strand takes by rev 10's own
+  wording ("whatever lead ruling §T9 settles");
 - class 0 is keyed `(epoch, deadline)`, and a cold slice takes the epoch of
   the ubatch that routed it (§5.2.1, *§T10* I-4);
 - the refill uses "the marker word", not "the marker event";
@@ -3229,20 +3241,12 @@ the public-API fixture, llama-server's shape included, shows exhaustion
 unreachable on today's code (§5.3, T7 (5)). A replacement of the drain must
 publish its depth (§11). No host wait is added.
 
-**DQ-F. The cancelled-epoch window. Proposed, for the lead** (rev 2f; found
-folding r5 I-2). The guard bounds device work, and a cancelled epoch has none,
-so its ring entry is freed by the strand's retire, not by the guard (§5.3).
-The window is one stage-executor pickup, and reaching exhaustion through it
-needs the `D-1` epochs after it cancelled too, each a whole failed
-`llama_decode`, inside that pickup.
-- **(a, rec)** The stage executor runs a cancelled epoch's stage ahead of
-  other ready stages, and the window stays `[LAZY-PLAN-BUG]` like any other
-  exhaustion. T7 (4)'s retire arm shows the entry is not taken over early.
-- b) Count cancelled-but-unretired epochs into the depth and plan `D` for
-  them. There is no planned bound on consecutive failures to count, so this
-  only moves the question.
-- c) The submitter retires the epoch itself. That reopens r5 I-2's race and
-  contradicts *§T10* I-2.
+**DQ-F. The cancelled-epoch window. Withdrawn** (rev 2f). A host-written
+cancellation marker would leave a cancelled epoch outside the input guard,
+since it would have no device work. Adopting `9g22`'s device-written
+cancellation marker (relayed by the lead) gives every cancelled epoch one
+command on the queue, which the guard drains like a copy, so the window
+does not exist (§5.3).
 
 **D9. Lookahead in v1 for STORAGE-bound models? Ruled (a)** (*lead ruling
 §T2*).

@@ -17,8 +17,8 @@ ENVELOPE = 2.5              # host_reserve 2 GiB + context envelope <= 0.5 (§4.
 GATE_CACHES = 4.0           # 2 GiB per table, index included, two tables (9g22 P1, lead ruling T5)
 DRAFT = 10.0                # the DSpark draft's host effect on phase 1: its ~7.9 GiB of weights are
                             # DEVICE demand, and with its ring (+2.1 over the RUNTIME floor) they
-                            # move ~10.0 GiB of experts to the host (9g22 rev 9 §4.5.2, its
-                            # l.1601-1603). What that does to the cold set is 9g22's figure.
+                            # move ~10.0 GiB of experts to the host (9g22 rev 10 §4.5.2, its
+                            # l.1842-1844). What that does to the cold set is 9g22's figure.
 RUNTIME_FLOOR = 0.5         # the VRAM RUNTIME zone's 512 MiB floor (9g22 rev 7 r4 m4)
 DS_TABLE = 60.08 / 2        # one DeepSeek engram table, GiB
 DS_LAYER_EXPERTS = 4.58     # routed-expert bytes per DeepSeek layer, GiB
