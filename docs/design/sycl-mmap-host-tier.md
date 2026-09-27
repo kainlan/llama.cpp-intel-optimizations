@@ -1,9 +1,13 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 3a (folds design-5efe-r1, including its addendum, under
-lead rulings §F1, §F2 and §F2a with §F2a I-9 addendum 2, plus the th32 r15 m-4
-mlock item and the §M49 note that the lazy-range record lands in C1), not
-implemented. Tracker: `llama.cpp-5efe`.
+*Status: DESIGN rev 3b, not implemented. It folds:
+- design-5efe-r1 and its addendum, under lead rulings §F1, §F2 and §F2a with
+  §F2a I-9 addenda 2 and 3;
+- design-5efe-r2 (0C/6I/19m), with the lead's rulings on its I-2 and I-5;
+- the th32 r15 m-4 mlock item, and the §M49 note that the lazy-range record
+  lands in C1;
+- the owner's default-context ruling: every model gate set carries a no-`-c`
+  arm, scored. Tracker: `llama.cpp-5efe`.
 Written 2026-09-27 against branch `task/5efe` at `69e70c715` (= master). Every
 cite without a revision prefix is to that tree. `gs` is
 `ggml/src/ggml-sycl/ggml-sycl.cpp`, `uc` is
@@ -18,11 +22,10 @@ Sibling designs this one interfaces with, and does not restate:
 
 - `llama.cpp-th32`: STORAGE tier for lazy row tables,
   `docs/design/sycl-storage-tier-lazy-tables.md`, abbreviated **th32**.
-  Pinned, per the lead, at **rev 2q `1646da864`**. Rev 2s, `f364952d3`, is
-  under review as r18. It folds §F2a I-9, and its §4.1 inventory reads each
-  table's (file, offset, size) from this design's lazy-range record (§3.1).
-  §3.1's interface is written to match what 2s consumes. Section numbers cited
-  here are the same in 2q and 2s.
+  Pinned at **rev 2u `0bd69e251`** (r2 m-15). Its §4.1 consumes this
+  design's pre-fill (§3.1) and addendum 3's `lazy_eligible` bit, and its T6a
+  owns the eligibility predicate that §3.1 calls. Section numbers cited here
+  are 2u's.
 - `llama.cpp-7v5c`: host-only plan dry-run.
 - `llama.cpp-rnh3`: exact host WEIGHT bytes.
 - `llama.cpp-sgc5`: one zone set per plan.
@@ -102,11 +105,13 @@ This design therefore does four things:
 (`level_zero:0`) under default load flags, and every figure below was
 pre-registered before the run:
 
-- the WEIGHT zone is 64.0 MB;
-- `AnonPages` grows by less than 30 GiB;
+- the WEIGHT zone is 64.0 MB, and it never grows after the pre-size;
+- the pre-size commits 7 chunks, 14336.0 MB (§4.4);
 - `MemAvailable` never falls under 25 GiB;
 - `SYCL_Mapped` holds about 127615 MiB;
-- shard 3, the PLE table, stays under 256 MiB resident.
+- shard 3, the PLE table, stays under 256 MiB resident;
+- a no-`-c` arm at the default context passes too, with the KV overflow
+  re-placed to the host tier (§7 C4).
 
 ---
 
@@ -309,6 +314,11 @@ None of it refers to a `llama_mmap` page today:
   - the tiered KV buffer's synthetic, non-USM base (`gs:39631-39639`);
   - "regular malloc (pinned cap overflow)", which `unified_free_record` frees
     with `::free` (`uc:14922-14929`).
+- `memory_tier::MMAP` (`tensor-types.hpp:36-40`, "File-backed mmap (slowest,
+  fallback)") is the fourth name (r2 m-11). Its six uses (`gs:14317`,
+  `:19256`, `:19279`, `:34766`, `:35665`, `:98734`) are the initial value and
+  the "not found" result of `get_cached_tensor_ptr`, which always returns
+  `nullptr` (§2.3). So it means "unresolved", not a mapping.
 
 ### 2.8 The host budget today
 
@@ -401,15 +411,44 @@ record, filled independently of who defers the read, removes that failure
 mode.
 
 **The record.** `llama_lazy_range_record`, one per loaded file, owned by 5efe
-and held by `llama_model_loader`:
+and held by `llama_model_loader`.
 
-- **Rows.** One row per tensor created with `TENSOR_READ_LAZY`: (tensor name,
-  file index, offset, size, `deferral`).
-- **`deferral`** is `EAGER`, `LAZY_READ` or `STORAGE`.
-  - `EAGER`: the flag is set, but the tensor is read normally, for example
-    under `-lzm off`. It is an ordinary weight, and no consumer excludes it.
-  - `LAZY_READ`: upstream's CPU lazy path.
-  - `STORAGE`: th32's SYCL diversion, from T6.
+- **Membership is flag-based** (§F2a I-9 addendum 3). There is one row per
+  `TENSOR_READ_LAZY` tensor, whatever any consumer decides about it. A row
+  holds (tensor name, file index, offset, size, `lazy_eligible`, `deferral`).
+- **`lazy_eligible`** is one bit, computed once at the pre-fill by **th32's
+  T6a predicate**, the DLM (a) rule (th32 rev 2u §4.1 and its T6a row):
+  - its inputs are the lazy mode resolved **before** upstream's `AUTO` to
+    `OFF` fallback, and the row's size;
+  - `OFF` is never eligible, `AUTO` only above 4 GiB, and `ON` always.
+
+  5efe calls that function and does not restate it. It is the same function
+  th32's SYCL branch uses at `create_tensor`.
+- **`deferral`** is `EAGER`, `LAZY_READ` or `STORAGE`, defined once at the
+  pre-fill as a function of the bit (r2 I-6):
+
+  ```
+  deferral = !lazy_eligible                         ? EAGER
+           : sycl_branch                            ? STORAGE
+           : mode_post != OFF && llama_mmap::SUPPORTED ? LAZY_READ
+           :                                          EAGER
+  ```
+
+  - **`sycl_branch`** is `llama_model_sycl_hooks_enabled() &&
+    resolved_sycl_weight_owner`, which is known before the early plan
+    (`lm:2213-2227`). It is th32 T6's branch condition.
+  - **Which mode feeds which branch.** `STORAGE` is decided on the
+    **pre-fallback** mode, through the bit, because th32's SYCL branch is
+    independent of `mmap_support`. `LAZY_READ` also requires the
+    **post-fallback** mode (`mode_post`, after `lm:2256-2265`), because
+    upstream's CPU lazy path needs a mapping.
+  - **Non-`EAGER` implies eligible**, and on the SYCL branch non-`EAGER` is
+    exactly "eligible". The one eligible-but-`EAGER` case is off the SYCL
+    branch: an iGPU forced the mode to `OFF`, or mmap is unsupported. There
+    the loader reads the table eagerly, so it is the ordinary weight the
+    ruling says an ineligible entry is.
+  - Consumers read `deferral` or the bit, and none re-evaluates the mode or
+    the size.
 - **Where it is filled: before the early plan, not at `create_tensor`**
   (§F2a I-9 addendum 2).
   - **Why `create_tensor` is too late.** The SYCL early plan runs before
@@ -419,62 +458,109 @@ and held by `llama_model_loader`:
     plan counted the PLE in `max_tensor` (§2.6) and in the host total
     (154263.6 MB, `run2.log:308`).
   - **When the flag is knowable.** `TENSOR_READ_LAZY` is first knowable only
-    at `create_tensor`: it is an argument at each arch's call site
+    at `create_tensor`. It is an argument at each arch's call site
     (`src/models/qwen4exp.cpp:189`, `src/models/gemma4.cpp:58`), and no table
-    records it.
-  - **The fix: a static declaration.** C1 adds a per-arch lazy-tensor
-    declaration, `llama_model_lazy_tensor_names(arch, hparams)`. It lists the
-    GGUF names the arch creates with `TENSOR_READ_LAZY`, for example
-    `per_layer_token_embd.weight` for qwen4exp and gemma4, and
-    `blk.%d.engram_embd.weight` for the layers deepseek41's hparams name.
-    th32 T6's per-arch facts (`rows_per_token`, `consumer_layer`, th32 §4.1
-    and §9.1) attach to the same entries rather than to a second list.
-  - **The pre-fill.** C1 moves the lazy-mode resolution (`lm:2256-2265`, with
-    the caps loop above it that it depends on, `lm:2245-2254`) before the early
-    plan; they depend only on `devices` and `params`. The loader then fills one
-    row per declared name found in `weights_map`: (name, file index, offset,
-    size) from the `llama_tensor_weight`, and `deferral` from `lazy_read`'s
-    decision, which needs only the mode and `ggml_nbytes` of the weight's
-    metadata tensor. This happens before `llama_model_sycl_compute_early_plan`.
-  - **One source, checked at `create_tensor`.** `create_tensor` does not fill
-    the record; it checks it. A `TENSOR_READ_LAZY` call for a name with no row,
-    or a non-lazy call for a name with a non-`EAGER` row, aborts naming the
-    tensor and the arch. The upstream flag and the declaration therefore
-    cannot drift silently.
+    records it (`llm_tensor_info` is `{layer, op}`, `llama-arch.h:782-785`).
+  - **The declaration (r2 I-5; lead ruling: 5efe's, since the record is
+    5efe's; th32 consumes it).**
+
+    ```cpp
+    // src/llama-model.h, C1
+    struct llama_lazy_tensor_decl {
+        const char * name;            // exact GGUF name, or one "%d" standing for the block index
+        uint32_t     rows_per_token;  // th32 T6's field; 0 until T6 fills it
+        int32_t      consumer_layer;  // th32 T6's field; -1 = the block index "%d" matched
+    };
+    const std::vector<llama_lazy_tensor_decl> & llama_model_lazy_tensor_decls(llm_arch arch);
+    ```
+
+    - It is keyed by GGUF name or pattern, matched against `weights_map`.
+      There is no `hparams` parameter. Presence in the GGUF already bounds it,
+      so the call sites' hparams conditions (`qwen4exp.cpp:171`
+      `ple_n_heads > 0`, `gemma4.cpp:57` `n_embd_per_layer > 0`) are not
+      stated a third time, and `blk.%d.engram_embd.weight` needs no layer
+      list.
+    - Today's entries are `per_layer_token_embd.weight` for `qwen4exp` and
+      for `gemma4`. deepseek41's `blk.%d.engram_embd.weight` is added with
+      its call site.
+    - **Not an `LLM_TENSOR_INFOS` column.** That table is keyed by tensor
+      kind across every arch (`llama-arch.cpp:721`), and
+      `LLM_TENSOR_PER_LAYER_TOKEN_EMBD` is created **without** the flag by
+      `gemma3n` (`src/models/gemma3n.cpp:39`). A kind-level column would
+      declare gemma3n's table lazy.
+    - th32 T6's per-arch facts attach to these entries, not to a second list
+      (th32 2u §4.1, §9.1).
+  - **The pre-fill.**
+    - C1 moves the caps loop (`lm:2245-2254`) and the lazy-mode loop
+      (`lm:2256-2265`) above the early plan. They read `devices`,
+      `params.load_mode`, `ml.use_mmap` and `ml.lazy.mode`, and nothing the
+      early plan writes (r2 verified).
+    - The loader captures the requested lazy mode before that loop runs, for
+      the bit.
+    - It then fills one row per declared name found in `weights_map`: (name,
+      file index, offset, size) from the `llama_tensor_weight`, the bit from
+      T6a, and `deferral` as above. This runs after `resolved_sycl_weight_owner`
+      is known and before `llama_model_sycl_compute_early_plan` (`lm:2230`).
+    - It runs the same way under `no_alloc` (r2 m-9), so the fit pass plans
+      what the real load plans. See `lazy_read` below for why that maps
+      nothing in the fit pass.
+  - **One source, checked twice.**
+    - **Statically:** `test-llama-lazy-declaration-source` (C1) maps every
+      `TENSOR_READ_LAZY` `create_tensor` call in `src/models/*.cpp` to a
+      declaration entry, and every entry back to a call site. An upstream
+      merge that adds a flagged call, or a new upstream arch that arrives with
+      one, fails it at build time, on every backend's tree, before any load.
+    - **At runtime (the second belt):** `create_tensor` compares the flag with
+      **row membership, whatever the `deferral`** (r2 I-5(3)). A flagged call
+      with no row, or an unflagged call with a row, aborts naming the tensor
+      and the arch. So declaration drift is caught under `-lzm off` too.
   - **The early plan reads it.** Its loop over `weights_map` (`lm:639-641`)
-    skips every row whose `deferral` is not `EAGER`. That keeps the table out
-    of placement, out of `max_tensor` and the staging maxima, and out of the
-    host total, which is th32 §4.1's requirement applied to the early plan too.
-    The late inventory already excludes it (§2.5).
+    skips every row whose `deferral` is not `EAGER`. That keeps an eligible
+    table out of placement, out of `max_tensor` and the staging maxima, and
+    out of the host total, which is th32 §4.1's requirement applied to the
+    early plan too. An ineligible row (`OFF`, or `AUTO` at or below 4 GiB) is
+    placed as the ordinary weight it is (th32 r19 M-1; the witness is in §7
+    C1). The late inventory already excludes deferred tables (§2.5).
 - **Its API.**
   - `deferred_for_file(idx)` returns the sorted, merged ranges of every
     non-`EAGER` row of that file.
-  - `has(name)` and `deferral(name)` are the per-tensor queries.
+  - `has(name)`, `eligible(name)` and `deferral(name)` are the per-tensor
+    queries.
   - `value(name)` returns a `llama_lazy_range_value {file_idx, offs, size}` **by
     value**. th32's backend `lazy_table` takes its (file, offset, size) from
     this once, at plan publish, through the inventory. It is a hand-off of the
     record's value, not a second source (§F2a I-9 addendum 2, M-1). What is
     forbidden is deriving those numbers independently, for example from
     `w->offs`.
-- **Immutability.** Rows are immutable once the pre-fill completes, and
-  `deferral` is set once. A later write aborts. So a by-value copy taken at plan
-  publish stays equal to the record for the model's lifetime, and is safe for
-  tickets that outlive the model.
+- **Immutability.** Rows, the bit and `deferral` are set once, by the
+  pre-fill, and a later write aborts. So a by-value copy taken at plan publish
+  stays equal to the record for the model's lifetime, and is safe for tickets
+  that outlive the model.
 
-**Consumers keep no copy.**
-- `lazy_read` keeps its `mode` and its decision (`add` without storage).
-  `any()`, `has()` and `for_file()` become queries on the record, filtered to
-  `LAZY_READ`, and its private `ranges` and `tensors` members are deleted.
+**Consumers keep no copy of the ranges.**
+- **`lazy_read`** keeps its `mode` and a **membership** set of names, as th32
+  2u §4.1 requires (its r18 N-4).
+  - `add(name, w)` no longer decides anything. It accepts iff `w != nullptr`
+    and `record.deferral(name) == LAZY_READ`.
+  - `any()` and `has()` answer from that membership. `for_file(idx)` returns
+    the record's ranges for its members only.
+  - Its private `ranges` map is deleted.
+  - So on the SYCL branch, where eligible rows are `STORAGE`, `any()` stays
+    false, and `init_mappings` does not map every shard with `use_mmap`
+    cleared (`lml:1871`, the hazard r2 I-6 names).
+  - Under `no_alloc`, `create_tensor` passes `nullptr` (`lml:1776`), the
+    membership stays empty, and the fit pass maps nothing, as today (r2 m-9).
 - `init_mappings` passes `record.deferred_for_file(idx)` to `llama_mmap`
   (`lml:1890-1891`).
 - th32's inventory reads each table's (file, offset, size) from the record
-  (th32 rev 2s §4.1).
+  through `value(name)` (th32 2u §4.1).
 - The tier hook's `lazy_ranges` argument (§4.3) is
   `record.deferred_for_file(idx)`.
 
 **What it changes on its own.** The ranges and decisions are the ones
-`lazy_read` computes today. The one observable change is that the early plan
-stops counting deferred tables. On Qwen with lazy enabled:
+`lazy_read` computes today, on today's `AUTO`-to-`OFF` fallback. The one
+observable change is that the early plan stops counting deferred tables. On
+Qwen with lazy enabled:
 - the early `[SYCL-PLAN] Host staging zone` reads `per_inflight` about
   1702 MB, like the late plan, instead of 103762.3 MB (`run2.log:243`);
 - the early `[PLACEMENT] Totals` host figure reads 102383.5 MB instead of
@@ -486,7 +572,9 @@ The arithmetic is exact. The early inventory's largest tensor is
 `per_inflight` is 2 x 51880.1 + 2.1; the late one is 2 x 850.0 + 2.0, with
 the 850.0 MB `ffn_*_exps` tensors next in line (`:235`, `:2756`).
 
-The edge th32 T6 holds on 5efe is a data edge on C1 alone (§M49).
+**Data edges.** th32 T6 depends on C1 alone (§M49). C1 depends on th32's T6a,
+whose predicate the pre-fill calls, so T6a lands no later than C1 (§F2a I-9
+addendum 3).
 
 ---
 
@@ -533,8 +621,15 @@ tests link it alone (§7).
   `unified_cache_raw_malloc_host` and th32's `HOST_CPU` wrapper.
 - A new source gate, `test-sycl-raw-mmap-allowlist-source`, makes that
   enforceable, which the allowlist entry alone is not (r1 m-11). It fails on
-  any `mmap(`, `munmap(`, `mlock(` or `madvise(` call in `ggml/src/ggml-sycl/`
+  any `mmap`, `munmap`, `mlock` or `madvise` call in `ggml/src/ggml-sycl/`
   outside a listed site.
+  - **It tokenizes first** (r2 m-12). It strips comments, string and
+    character literals, then matches `\b(mmap|munmap|mlock|madvise)\s*\(`.
+    Comments such as `uc:21652` "host/mmap (conservative)" and
+    `tensor-types.hpp:40` "mmap (slowest" would otherwise be flagged by the
+    `\s*` form, and a literal `mmap(` would miss a real `mmap (` call.
+  - A fixture of those comment and string forms, plus one real `mmap (` call,
+    is part of its test.
   - Its list is today's sites (`uch:2066`, `:2071`, `:2107`; `gs:11195`,
     `:11200`, `:11261`; `dpct/helper.hpp:1362`, `:1389`), the new TU, and
     th32 T1's `HOST_CPU` wrapper when it lands.
@@ -553,10 +648,21 @@ tests link it alone (§7).
 **The registry type.**
 - `alloc_type` gains `FILE_MAPPED`. `unified_free_record` handles
   `alloc_tier::FILE_MAPPED` in its own branch, which calls the unmap wrapper.
-- That branch sits before both the `MMAP_TRACKED`/`UNREGISTERED` no-free case
-  (`uc:14812`) and the `alloc_type::MMAP` `::free` branch (`uc:14922-14929`),
-  so a `FILE_MAPPED` record can never reach `::free` (r1 m-4).
-- C2's test proves the ordering with a private `::free`-branch counter.
+- That branch sits before the `MMAP_TRACKED`/`UNREGISTERED` no-free case
+  (`uc:14812`), the `::free` branch (`uc:14922-14929`, `HOST_MALLOC` after
+  §4.8), the `zone_managed` branch and the `sycl::free` fallthrough
+  (`uc:14930-14940`). So a `FILE_MAPPED` record can never reach `::free` or
+  `sycl::free` (r1 m-4).
+- The `::free` branch keys on the **registry type**, which a `FILE_MAPPED`
+  record never carries, so moving the `FILE_MAPPED` branch after it would
+  change nothing (r2 m-6). C2's test therefore uses mutants that change
+  behaviour:
+  - the record registered as `HOST_MALLOC`, which reaches `::free`;
+  - the branch moved after the `zone_managed` branch, into the `sycl::free`
+    fallthrough.
+
+  Private counters on the `::free` and `sycl::free` branches must both read 0
+  at a correct release.
 
 **`memory_location::device_mappable()`** (th32 §3.1 adds it) is false for
 `FILE_MAPPED`. `host_accessible()` stays true, because the CPU reads it.
@@ -629,8 +735,14 @@ reservations over one page cache; sharing them is not needed.
   (§3.1). They depend only on `devices` and `params`. C4 adds the publication
   below.
 - The resolved answer is published once, on the SYCL load transaction:
-  `load_maps_files = ml.use_mmap after resolution`. It is false under
-  `-lm none`, and false when an iGPU in the device set forced `none`.
+  `load_maps_files = ml.use_mmap after resolution && the file-mapping tier
+  exists in this build`. It is false under `-lm none`, and false when an iGPU
+  in the device set forced `none`.
+- **Builds without the tier** (r2 m-19). `file-mapping.cpp` needs
+  `PROT_NONE` reservations and `MAP_FIXED`, so it is compiled for POSIX only.
+  On a non-POSIX build (Windows SYCL) the hook reports the tier absent, and
+  `load_maps_files` is false. Those loads keep `SYCL_Host`, and C1's cap never
+  routes them to a missing hook.
 - The planner reads it to give every inventory entry a `host_backing` (§4.4).
 - The loader reads the planner's answer through a new hook,
   `planned_host_backing(name)`. Non-name-indexed tensors such as MoE experts
@@ -648,6 +760,11 @@ because `supports_buft` keys on the name function (`gs:108779-108812`).
   resolve the cache's VRAM copy by identity, as they do today.
 - `set_tensor`, `memset_tensor` and `clear` abort, naming the tensor. The
   mapping is read-only, and weights are never written after load.
+- `alloc_buffer` (r2 m-10). The `no_alloc` path calls
+  `ggml_backend_buft_alloc_buffer(buft, 0)` for every buft (`lm:2770-2772`),
+  so size 0 returns a dummy buffer with no storage. Any other size aborts,
+  naming the caller, because a `SYCL_Mapped` buffer is made only by the hook
+  below.
 - `init_tensor` registers the host weight the way `SYCL_Host` weights are
   registered today (`lml:1542-1561`).
 
@@ -685,7 +802,8 @@ the host experts (r1 I-8b).
 | `make_cpu_buft_list` `lm:1765-1779` | on a SYCL load that maps files, the front host buft is the device's `SYCL_Mapped`, so `token_embd` lands there |
 | `allow_host_buft_with_mmap` `lml:1503-1518` | unchanged for `SYCL_Host`; `SYCL_Mapped` is never demoted |
 | buffer creation `lm:2740-2791` | the `SYCL_Mapped` branch calls the hook; the `mlock_bufs` block (`lm:2782-2787`) skips `SYCL_Mapped` buffers, which lock through the tier (§5.1) |
-| `lm:2693-2696` | deleted |
+| `lm:2693-2696` | narrowed: it clears `use_mmap` for a SYCL load only when `load_maps_files` is false while `use_mmap` is true, which happens only on a build without the tier (m-19). There the loader keeps today's behaviour instead of copying from a mapping into `SYCL_Host`. C4 amends C1's caps source test, which asserts the line is present (r2 m-8) |
+| preload's host-planned copy, `gs:34696-34730` (r2 m-7) | today it copies a weight that the late plan tiers to host, after `create_tensor` put it in a SYCL buffer (the `dev_layer` sync case, `lm:2680-2689`), into a pinned WEIGHT allocation (role `WEIGHT`, category `OTHER`, `memcpy` from `tensor->data`). For a `SYCL_Mapped` source it is served in place when the CPU executes the file layout (host backing `FILE_MAPPED`, registered as a mapped slice). When a reorder is needed, the copy is planned: host backing `PINNED`, or `HOST_CPU` after th32 T1, charged in `weight_host_bytes`. It never copies mapped bytes into memory the plan does not charge |
 | `init_mappings` call `lm:2702` | prefetch 0 on a SYCL load |
 | `load_all_data` mapping branch `lml:2099-2129` | addresses `SYCL_Mapped` tensors from the buffer base; no `lmlock` growth for them |
 
@@ -736,45 +854,189 @@ Every accumulation site of `weight_host_bytes` in the planner
 `:29798`) tests the entry's `host_backing` before adding. The C4 source
 contract lists them. `[PLACEMENT] Totals` prints all four terms.
 
-**Non-weight `SYCL_Host` buffers.**
-- Every `SYCL_Host` buffer, including the context's input and output buffers
-  created after the load, allocates with role `WEIGHT` while
-  `weights_evictable` holds (`gs:42645-42646`). Its `HOST_COMPUTE` category
-  routes it to the WEIGHT zone (`uc:15361-15372`).
-- Today those buffers fit in the 20% headroom over 100 GB of pinned experts.
-  After the split they must fit in the named reserve term,
-  `k_host_runtime_reserve_bytes` = 64 MiB (`uc:27103`).
-- For Qwen at `-c 4096` with one sequence that holds. The output buffer is
-  `n_vocab x 4 B` per output: 248320 x 4 B = 0.95 MiB (`run2.log:174`).
-- It does not hold for an all-logits run (`n_outputs = n_ubatch = 512` gives
-  485 MiB). So C4 sizes this term explicitly at the runtime KV update, which
-  knows `n_ctx` and `n_ubatch`, as `n_ubatch x (n_vocab + n_embd) x 4 B` plus
-  the input tensors. If rnh3 (exact host WEIGHT terms) has landed, the term
-  goes through rnh3.
+**Who reads `weight_host_bytes`** (r2 m-3). The C4 contract lists the writers
+above, and these readers too. Each is assigned one meaning, "charged" or
+"placed on host":
 
-**Pre-registered Qwen WEIGHT zone after C4** (r1 C-1):
+| reader | meaning after C4 | why |
+|---|---|---|
+| `planned_host_bytes` / `actual_host_bytes` on the plan snapshot (`uc:171`, `:228-229`) | **placed**: `weight_host_bytes + host_cpu_owned_bytes + host_mapped_bytes` | it feeds the verdict below |
+| `ggml_sycl_current_model_planner_host_placement()` (`gs:2702`), which drives `ggml_backend_sycl_is_tiered_enabled` (`gs:19168`) and the "planner host placement: yes" log (`gs:16737`, `run2.log:2826`) | **placed** | otherwise Qwen would report "no" while 100 GB of host experts execute on the CPU |
+| the lifecycle LIVE publication (`gs:13197`, `model-lifecycle.cpp:668`) | both: `ModelState` gains `charged_host_bytes` beside the placed figure | multi-model accounting needs the charge; the tiering verdict needs placement |
+| the load summary (`gs:1135-1230`, `:12498`) | prints both, labelled | one number would be read as the other |
+
+**Host-side non-weight requests: routed by role** (r2 I-2; lead ruling: 5efe
+owns role-based routing of **host** non-weight requests).
+
+*Today.*
+- `select_zone` sends every host request with category `HOST_COMPUTE` or
+  `EXPERT_CACHE` to the WEIGHT zone, whatever its role (`uc:15368-15370`).
+- `SYCL_Host` buffers allocate with role `WEIGHT` whenever
+  `weights_evictable` holds, even after the load (`gs:42645-42646`).
+- Those tenants fitted, unseen, in the ~20 GB of 1.2x headroom over 100 GB of
+  pinned experts. After the split the WEIGHT zone is 64 MiB. So they would
+  grow zone 0 one ≥ 2048 MB chunk per miss (`uc:15418-15437`), which is what
+  zone 0 did in run2 (`run2.log:2965`, `:2968`).
+- The known tenants are:
+  - llama-context's CPU-backend compute buffer, which uses the first
+    device's host buft, i.e. `SYCL_Host` (`src/llama-context.cpp:889-895`);
+  - the output buffer (`src/llama-context.cpp:3562-3564`);
+  - `CpuExpertPool`'s process-lifetime ring, "role=COMPUTE +
+    category=EXPERT_CACHE instead routes to the WEIGHT host zone"
+    (`cpu-expert-pool.cpp:66-77`), and `PinnedBufferPool`'s ring
+    (`pinned-buffer-pool.cpp:69`);
+  - the other `HOST_COMPUTE` sites whose role is `STAGING`, `TP_TMP`,
+    `COMPUTE`, `GRAPH_TMP` or `OTHER`.
+
+*The sizing fact the reviewer relied on does not hold.*
+`ggml_backend_sycl_notify_compute_buffer_sizes` (`gs:19103-19146`), which
+would grow SCRATCH by the scheduler's compute-buffer sizes (`:19145`), **has no
+caller in the tree**: `git grep notify_compute_buffer_sizes` finds only its
+declaration (`ggml-sycl.h:629`) and definition. So the host compute buffer is
+not "sized in SCRATCH, allocated in WEIGHT". It is sized nowhere, and
+allocated in WEIGHT. The comment at `uc:27716` ("fed back via
+`unified_cache_grow_host_scratch_zone()` after the ggml scheduler is
+created") describes a path that does not run.
+
+*C4's change.*
+- **Route by role, in `select_zone`, the one place.**
+  - Role `KV`, or `kv_spill_to_host`, goes to KV, as today.
+  - Role `WEIGHT` goes to WEIGHT.
+  - Role `EXPERT_STAGING` goes to SCRATCH, as today.
+  - Every other role whose category is `HOST_COMPUTE` or `EXPERT_CACHE` goes
+    to **SCRATCH**, per the lead's ruling.
+  - Anything else goes to STAGING, as today.
+  - Category no longer selects WEIGHT. No call site changes its request.
+- **`SYCL_Host` takes role `WEIGHT` only inside a model load**
+  (`in_model_load`). The `|| weights_evictable` term goes. A post-load
+  `SYCL_Host` buffer (compute, output, inputs) takes role `COMPUTE`, and so
+  SCRATCH.
+- **The sizing path exists.**
+  - C4 gives `ggml_backend_sycl_notify_compute_buffer_sizes` its caller:
+    `llama_context`, after the scheduler reserve, through the registry's proc
+    address (a direct call does not link under `GGML_BACKEND_DL`).
+  - It passes the host-buft compute-buffer size, plus the output buffer's
+    size as **its own named term**: `n_outputs_max x (n_vocab + n_embd) x 4 B`,
+    which `llama_context` computes for the allocation anyway.
+  - SCRATCH grows by the sum, and prints `[HOST-ARENA] SCRATCH zone grown by
+    %.1f MB for compute buffers` (`uc:20442-20449`).
+  - The "runtime term at the runtime KV update" of rev 3a is withdrawn,
+    since it had no path into the zone (host zones are configured once, at
+    load, `gs:5623`).
+- **Lifetimes: why SCRATCH needs one more fact.**
+  - SCRATCH's graph-boundary check runs at every `graph_compute`
+    (`gs:92459`), and WARNs on any live SCRATCH record ("refusing SCRATCH
+    host_zone_boundary_check with N live registered allocations",
+    `uc:20290-20298`). That is exactly why the `CpuExpertPool` ring was
+    routed to WEIGHT (llama.cpp-cg8j).
+  - Context- and process-lifetime tenants in SCRATCH would trip the check
+    at every graph, and the leak signal it exists for would be lost.
+  - So C4 adds `alloc_intent::lifetime` (`GRAPH`, the default; `CONTEXT`;
+    `PROCESS`). The census below assigns it to every rerouted site, and the
+    boundary check counts only `GRAPH` records.
+  - This keeps the ruling's zone. It is flagged to the lead, because the
+    alternative is a fifth host zone, a one-line change in `select_zone`.
+- **The census** (C4 source contract, `test-sycl-host-role-routing-source`).
+  - It is generated from the tree, not written by hand. Every `alloc_request`
+    construction or `alloc_intent` aggregate in `ggml/src/ggml-sycl/` whose
+    category is `HOST_COMPUTE` or `EXPERT_CACHE` and which can land on the
+    host is listed with its role, its zone before and after, and its
+    lifetime.
+  - A first lexical cut finds 72 such lines across 8 files. By role:
+    - 23 `EXPERT_STAGING`: already SCRATCH, unchanged;
+    - 14 `STAGING`, 7 `TP_TMP`, 10 `COMPUTE` and 1 `GRAPH_TMP`: WEIGHT to
+      SCRATCH;
+    - 3 choose their role at the site: `SYCL_Host` itself (`gs:42647`),
+      `uc:15652` and `uc:16728`;
+    - 14 role `WEIGHT`: 10 are device-tier cache entries that never reach
+      `select_zone`'s host branch, and 4 stay WEIGHT. One of those four is a
+      real weight, the direct-stage last resort (`uc:6522`).
+  - The other three are non-weight bytes carrying role `WEIGHT`:
+    - `cpu-dispatch.cpp:315`, the CPU-offload host weight copy;
+    - `gs:39954`, a device buffer's host-pinned fallback on low free VRAM;
+    - `gs:63226`, the tensor-split weight cache.
+
+    These are named "role-WEIGHT, unplanned" rows. None is reached on Qwen's
+    default path. If one is reached, the zone-0 criterion below catches it.
+  - The mutant: the category clause restored in `select_zone`, under which
+    the gate's `CpuExpertPool` row resolves to WEIGHT.
+- **The criterion** (C4 lead run). No `Pinned pool grow_zone: zone 0` line
+  appears after the pre-size, through the end of the completion. Zone 0 is
+  WEIGHT (`pinned-pool.hpp:62-67`). SCRATCH (zone 3) may grow only by the
+  notified sum.
+- **The boundary with llama.cpp-23mk** (`docs/design/sycl-alloc-zone-routing.md`,
+  in 23mk's worktree). 23mk routes **device**-scope requests, 139 rows. Its 74
+  host-only declarations, and its class-H rows ("host tier reached through a
+  copy or aggregate ... no change"), are outside its routing. 5efe changes
+  only `select_zone`'s **host** branch and the `SYCL_Host` role, and no
+  request construction. Possible overlaps are reported to the lead, not
+  resolved here:
+  - 23mk's nine class-H rows are exactly host landings this change moves
+    from WEIGHT to SCRATCH. They include `cpu-expert-pool.cpp:62`,
+    `pinned-buffer-pool.cpp:88` and the `ggml_sycl_attn_host_staging_get`
+    rows (`gs:81783-81832`).
+  - `gs:39954`'s host-pinned fallback on low free VRAM is next to 23mk's row
+    56 (`gs:39761`, the split-buffer branch it refuses).
+  - The DMA staging pool (m-2 below) is 23mk's row 118, which it refuses
+    under an arena.
+  - Host SCRATCH folds three VRAM RUNTIME terms
+    (`moe_vram_runtime_bytes`, `tp_vram_runtime_bytes`,
+    `dma_staging_pool_bytes`, `uc:27727-27730`, "conservative zone
+    budgeting"). That is a host reservation sized for device allocations,
+    and 23mk owns those device terms.
+
+**The DMA staging pool in mmap mode** (r2 m-2).
+- It is 1700 MB: 2 x `dma_streamed` (`run2.log:2752`), where `dma_streamed`
+  is "largest tensor the host->device weight stream can carry"
+  (`zone-sizing.hpp:80`, `uc:27537`).
+- It is charged twice: in SCRATCH (`uc:27727-27730`) and in the runtime
+  pre-allocate (`gs:5648-5651`).
+- It exists for streaming, and §5.3 refuses streaming for every
+  `FILE_MAPPED` source. So in mmap mode it is an idle reservation, which P4
+  forbids.
+- C4 sets `dma_streamed = 0` when no host weight is `PINNED`-backed. Both
+  charges then vanish, and the log prints `DMA staging pool: 0.0 MB (no
+  pinned host weights)`.
+- `-lm none` keeps it, pending 23mk's row 118.
+
+**Pre-registered Qwen zones and pre-size after C4** (r1 C-1, r2 I-1).
 - Host experts are all AOS, registered in place (`gs:33437-33457`), so
   `weight_host_bytes` = 0 and `host_cpu_owned_bytes` = 0. The host total is
   experts only: 61671 host tensors = 20557 groups x 3 (`run2.log:2824`).
-- `host_zone_weight_bytes = 0 x 1.2 + 64 MiB + runtime term`, with a runtime
-  term of at most 64 MiB at `-c 4096`. So `[HOST-ARENA] configured zones:
-  WEIGHT=` reads **64.0-128.0 MB**, against 122924.2 MB in the baseline
+- `host_zone_weight_bytes = 0 x 1.2 + k_host_runtime_reserve_bytes (64 MiB,
+  uc:27103)`, and nothing else reaches WEIGHT. So `[HOST-ARENA] configured
+  zones: WEIGHT=` reads **64.0 MB**, against 122924.2 MB in the baseline
   (`run2.log:2893`).
-- The zone total is then about 64 + 64 + 1719.2 + 7775.9 = 9623.1 MB (KV,
-  STAGING and SCRATCH are unchanged), and the pre-size commits **at most
-  6 chunks, 12288 MB**, against 68 chunks, 139264 MB (`run2.log:2900`).
-- Falsifier: a WEIGHT zone above 128 MB must equal 1.2 x the reordered-expert
-  bytes, and the placement report must print that sum. Otherwise the split
-  missed an accumulation site.
-- **Re-checked against the early-plan fix** (§F2a I-9 addendum 2). The
-  configured zones come from the late plan: `configured zones` (`:2893`)
-  follows the late `Totals` (`:2821`) and equals 1.2 x 102383.5 + 64. The late
-  plan already excluded the table. So the WEIGHT, pre-size and total figures
-  above are unchanged. What the record changes is the early plan (§3.1): the
-  early STAGING `per_inflight` falls to about 1702 MB, and the early host
-  total to 102383.5 MB before the split. After C4's split, the early and late
-  `[PLACEMENT] Totals` both print charged host 0 and mapped 102383.5 MB. These
-  witness lines are added to C4's run.
+- **The pre-size is two pools, and the "Committed" line counts both**
+  (`gs:5615-5688`). Run2's 68 chunks were 65 + 3 (`run2.log:2892`, `:2897`,
+  `:2900`).
+  - **Base** (`pre_allocate_host_pool`, `gs:5643`): WEIGHT + KV + STAGING +
+    SCRATCH. SCRATCH loses the 1700 MB DMA pool (m-2): 7775.9 - 1700.0 =
+    6075.9. The base is 64.0 + 64.0 + 1719.2 + 6075.9 = 7923.1 MB, which is
+    **4 chunks**, and the log reads `pre_allocate: grew 4 chunks`.
+  - **Runtime** (`pre_allocate_runtime_chunks`, `gs:5648-5652`): oneDNN
+    scratchpad + DMA pool + PP pipeline + PP MoE oneDNN. Run2's need was
+    6056.9 MB (`:2897`), and without the DMA pool it is 4356.9 MB, which is
+    **3 chunks**: `pre_allocate_runtime: grew 3 chunks`.
+  - So `[HOST-ARENA] Committed` reads **14336.0 MB in 7 chunk(s)**, against
+    139264.0 MB in 68 (`run2.log:2900`).
+  - Without m-2 it would be 5 + 3 = 8 chunks, 16384.0 MB. So a reading of 8
+    means the DMA-pool change did not land.
+- **Falsifiers.**
+  - A WEIGHT zone above 64.0 MB must equal 64 MiB + 1.2 x the reordered-expert
+    bytes, and the placement report must print that sum. Otherwise the split
+    missed an accumulation site.
+  - A base above 4 chunks names the zone that grew.
+- **Re-checked against the early-plan fix** (§F2a I-9 addendum 2).
+  - The configured zones come from the late plan: `configured zones`
+    (`:2893`) follows the late `Totals` (`:2821`) and equals
+    1.2 x 102383.5 + 64. The late plan already excluded the table.
+  - What the record changes is the early plan (§3.1): the early STAGING
+    `per_inflight` falls to about 1702 MB, and the early host total to
+    102383.5 MB before the split.
+  - After C4's split, the early and late `[PLACEMENT] Totals` both print
+    charged host 0 and mapped 102383.5 MB. These witness lines are added to
+    C4's run.
 
 ### 4.5 The budget, the ledger, the working set, and the host-fit gate
 
@@ -798,14 +1060,17 @@ counts them as available. So:
 - The plan computes:
 
   ```
-  resident_room = MemAvailable_pre - expected_host - k_host_p3_floor
+  resident_room = MemAvailable_pre - expected_host - host_headroom(MemTotal)
   mapped_ws     = host_mapped_bytes            (host-executed ranges only)
   ```
 
 - If `mapped_ws > resident_room`, the load logs one WARN,
   `[HOST-PLAN] mapped host weights exceed the page cache that can stay
   resident: mapped_ws=... resident_room=... (MemAvailable_pre=...
-  expected_host=... floor=...)`, and proceeds.
+  expected_host=... headroom=...)`, and proceeds.
+- It uses `host_headroom(total)` below, not the P3 constant (r2 m-4). On a
+  62 or 32 GiB host a 29 GiB floor would make the WARN fire on almost every
+  load, against a headroom of 15.5 or 8 GiB.
 - The plan report (7v5c's dry-run and `[PLACEMENT] Totals`) carries the same
   three figures.
 - A mapped overflow costs refaults, not an OOM (§5.2). Refusal stays for
@@ -847,11 +1112,19 @@ host_ledger_budget() = min(total x pct, MemAvailable - host_headroom)   when Mem
   bind every load) requires `MemAvailable_pre - expected_host - 5 >= 24` on
   this host. A ledger that leaves only 8 GiB admits plans P3 refuses, which
   th32 §4.5 has to argue around.
-  - With one named constant, the ledger and P3 read the same number.
-  - th32 §4.3 is asked to cite `k_host_p3_floor` rather than the literal
+  - The ledger and P3 read the same number **only where `total/4 >= 29 GiB`,
+    that is `MemTotal >= 116 GiB`** (r2 m-4). On smaller hosts the headroom
+    is `total/4` or `total/32`, and P3's measured floor does not describe
+    them.
+  - th32 §4.3 is asked to cite `host_headroom(total)` rather than the literal
     `24 + 5`.
   - The `min(..., total/4)` cap keeps this host's policy from becoming a
     universal allocation cap on smaller hosts.
+- **`GGML_SYCL_HOST_RESERVE_MB` composes; it does not bypass** (r2 m-4).
+  Today a valid value replaces the whole budget (`uc:4171-4181`). After C5 it
+  is a cap: `budget = min(override, host_ledger_budget())`. It can lower the
+  budget, and it can never take it past `MemAvailable - host_headroom`. The
+  refusal still names the headroom when the override is the smaller term.
 
 | host | `MemTotal` | headroom | `MemAvailable` | budget (new) | budget (old) |
 |---|---:|---:|---:|---:|---:|
@@ -878,61 +1151,104 @@ lifts it into `host_ledger_budget()`.
 - **5efe owns the exclusion, because it owns the mapping.** th32 stays off
   mmap entirely (§T13c), and after T6 its tables leave `lazy_read`. The
   exclusion set therefore comes from the **lazy-range record** (§3.1), never
-  from `lazy_read`'s set. Two exclusion sites read the record:
-  `deferred_for_file(idx)` goes to the tier through the hook's `lazy_ranges`
-  (§4.3), and to `llama_mmap` through `init_mappings`. A table diverted to
-  STORAGE is excluded exactly as a `LAZY_READ` one is.
-- **Three segment sets, one pure function** (r1 I-2, §F2).
-  `file_mapping_segments(tensor_ranges, lazy_ranges, page)` returns:
+  from `lazy_read`'s set. Two exclusion sites read the record, both through
+  `deferred_for_file(idx)`, which holds only non-`EAGER`, and so only
+  eligible, rows (§3.1, §F2a I-9 addendum 3):
+  - the tier, through the hook's `lazy_ranges` (§4.3);
+  - `llama_mmap`, through `init_mappings`.
 
-  | set | rounding | purpose | bound on lazy bytes |
+  A table diverted to STORAGE is excluded exactly as a `LAZY_READ` one is. An
+  ineligible table is not in the set, and is mapped and prefetched as the
+  ordinary weight it is.
+- **Three segment sets, one pure function** (r1 I-2, §F2; defined exactly per
+  r2 m-16). `file_mapping_segments(tensor_ranges, lazy_ranges, page)`, where
+  `tensor_ranges` is the byte ranges of the tensors in this `SYCL_Mapped`
+  buffer and `lazy_ranges` is `deferred_for_file(idx)`, returns:
+
+  | set | definition | rounding | bound on lazy bytes |
   |---|---|---|---|
-  | map segments | **outward** to pages, including at a lazy boundary | every non-lazy tensor byte is addressable (GGUF alignment is 32 B, so a lazy and a non-lazy tensor can share a page) | at most one page of lazy bytes mapped per lazy edge |
-  | `WILLNEED` segments | **inward** | host-executed ranges only; never a device-only range, never a page holding a lazy byte | 0 |
-  | lock segments | **inward** | host-executed ranges, under `-lm mmap+mlock` only | 0 |
-  | `MADV_RANDOM` edge windows | **inward** from each lazy boundary into the map segment, plus the shared page | disables fault read-around next to a lazy range, on **both** sides of it | n/a (advice only) |
+  | map segments | the union of `tensor_ranges`, each range rounded **outward** to pages, then merged. It is **not** a complement: bytes that belong to no tensor of this buffer are never mapped | outward, including at a lazy boundary (GGUF alignment is 32 B, so a lazy and a non-lazy tensor can share a page) | at most one page of lazy bytes mapped per lazy edge (the shared page) |
+  | `WILLNEED` segments | the host-executed subset of `tensor_ranges`, each rounded **inward**, minus every page that holds a lazy byte | inward | 0 |
+  | lock segments | as `WILLNEED`, under `-lm mmap+mlock` only | inward | 0 |
+  | `MADV_RANDOM` edge windows | for each lazy range, `[lazy_begin - W, lazy_begin)` and `[lazy_end, lazy_end + W)` intersected with the map segments, plus the shared pages | inward from each lazy boundary | n/a (advice only) |
 
   (§F2a I-2(a): only map segments round outward. Every advice and lock set
   rounds inward, so no advice or lock ever reaches a lazy page other than the
   shared page's `MADV_RANDOM`.)
 
+  - Lazy ranges are never in `tensor_ranges`, because deferred tables are not
+    `SYCL_Mapped` tensors (§4.4). A lazy byte is mapped only through a shared
+    page.
   - Pages strictly between map segments stay the reservation's `PROT_NONE`
     anonymous memory. They are never faulted, and a tier read of one is a
     `SIGSEGV`: a loud bug, not a silent read.
-  - The complement is the same computation as `ranges_complement`
-    (`src/llama-mmap.cpp:444`), but that helper is file-static in libllama,
-    which ggml-sycl cannot call. `file_mapping_segments` lives in the
-    device-free `file-mapping.cpp`.
-- **Fault read-around** (r1 m-13, addendum m-19).
+  - `file_mapping_segments` lives in the device-free `file-mapping.cpp`.
+    libllama's `ranges_complement` (`src/llama-mmap.cpp:444`) is a different
+    set and is not reused.
+- **Fault read-around** (r1 m-13, addendum m-19, r2 I-3).
   - Linux's synchronous mmap read-around is **centred on the fault**:
     `start = pgoff - ra_pages/2`, `size = ra_pages`. It is per file, not per
     VMA. So a fault near either edge can read into a neighbouring lazy range:
     forward from a segment that ends at it, and **backward** from a segment
     that starts after it. That covers CPU execution faults and the staging
     bounce's `memcpy` faults alike.
-  - The tier sets `MADV_RANDOM` on a window of `W = max(2 x read_ahead_kb,
-    2 MiB)` at **both** edges of every lazy range: the last `W` of the map
-    segment before it, the first `W` of the map segment after it, and the
-    shared pages. That splits the VMAs and disables read-around there.
+  - **Its reach** on each side is `ra_pages/2`. `ra_pages` is the backing
+    device's `read_ahead_kb`, doubled when the open file description carries
+    `POSIX_FADV_SEQUENTIAL`. The tier's `dup` fd shares the loader's
+    description, and `llama_mmap` sets that advice on it
+    (`src/llama-mmap.cpp:475`). Every bdi on this host reads
+    `read_ahead_kb = 128`, so the reach here is 64 KiB, or 128 KiB with the
+    advice.
+  - The tier sets `MADV_RANDOM` on a window of
+    `W = max(2 x read_ahead_kb, 2 MiB)` at **both** edges of every lazy range,
+    which is at least twice the reach. That splits the VMAs and disables
+    read-around there.
   - Device-only ranges are also staged through the mapping, so the same edge
     advice covers them.
 - **The second residual path: the loader's own whole-file mapping** (addendum
-  m-19).
+  m-19, r2 I-4).
   - `llama_mmap` still maps whole files during the load. `load_all_data` reads
     the tensors that are not in `SYCL_Mapped` through it: `CPU_REPACK` and
     plain CPU sources, and lazy tables on the CPU path before th32.
   - Today that mapping advises `MADV_RANDOM` only over the lazy range itself
     (`src/llama-mmap.cpp:541-543`), and it sets `POSIX_FADV_SEQUENTIAL` on the
-    fd (`:475`), which enlarges the read-around window. A fault in the
-    neighbouring VMA can therefore read around into the lazy range.
-  - C4 applies the same both-edge window to `llama_mmap`: its lazy-range
-    advice covers `[lazy_begin - W, lazy_end + W)`, from the record, not the
-    lazy range alone.
-  - Bound: with both mappings advised, the lazy bytes either mapping can
-    fault in are the shared pages, at most one page per lazy edge per mapping,
-    plus whatever bcachefs reads at extent granularity (256 KiB, th32 §2.4).
-    The gate's 1 MiB guard band sits outside both.
-  - The residency gate below measures what remains.
+    fd (`:475`), which doubles the read-around. A fault in the neighbouring
+    VMA can therefore read into the lazy range.
+  - **Worse, it advises `MADV_HUGEPAGE` over every non-lazy range** shrunk to
+    pages (`src/llama-mmap.cpp:517-532`), and that includes the page runs
+    next to each lazy range. Its own comment names the effect: "a fault in a
+    VM_HUGEPAGE area reads a whole 2 MiB folio before POSIX_MADV_RANDOM is
+    honoured" (`:518-522`).
+    - In `do_sync_mmap_readahead` the `VM_HUGEPAGE` branch comes before the
+      `VM_RAND_READ` return. It aligns the index down to 2 MiB and reads
+      2 MiB, or 4 MiB without `VM_RAND_READ`.
+    - THP is `[madvise]` on this host.
+    - So a `MADV_RANDOM` window inside a `VM_HUGEPAGE` VMA does nothing. A
+      fault in the page before a lazy range reads up to the next 2 MiB
+      boundary into it. A fault after it reads back to the previous
+      boundary.
+  - **C4's `llama_mmap` change, both halves.**
+    - The lazy-range advice covers `[lazy_begin - W, lazy_end + W)`, from the
+      record, not the lazy range alone.
+    - The same window, **widened outward to 2 MiB alignment**, is excluded
+      from `MADV_HUGEPAGE`, and advised `MADV_NOHUGEPAGE`. The explicit
+      `NOHUGEPAGE` also covers THP `[always]`, where a VMA is huge unless
+      told otherwise.
+  - The tier's own mapping never advises `MADV_HUGEPAGE` (below), so it needs
+    only the `MADV_RANDOM` windows.
+- **The bound, stated per mapping** (r2 I-4). This counts lazy bytes that a
+  non-lazy fault can bring into the page cache:
+  - **The tier's mapping:** the shared page at each lazy edge, and nothing
+    else. There is no `HUGEPAGE`, and the `MADV_RANDOM` windows are at least
+    twice the reach.
+  - **`llama_mmap`'s mapping:** the same, once C4's window is both
+    `MADV_RANDOM` and `NOHUGEPAGE`.
+  - **Either mapping:** plus whatever bcachefs reads at extent granularity
+    (256 KiB, th32 §2.4) around a page it does read.
+
+  The gates below measure what remains. The C3 gate measures the band that
+  read-around would reach. The C4 gate measures the band a 2 MiB folio would
+  reach.
 - **No `MAP_POPULATE`, no `MADV_HUGEPAGE`** from the tier. Huge pages on a
   file mapping depend on the filesystem's large-folio support, which is not
   established for bcachefs here. th32 §2.4 measured that bcachefs reads whole
@@ -970,55 +1286,87 @@ lifts it into `host_ledger_budget()`.
   - The upstream prefix lock that §2.5 describes is fixed in C3 (above), so a
     plain `CPU_Mapped` tensor after a lazy range under `-lm mlock` no longer
     locks the range either.
-- **The residency gate** (C3; r1 I-1, §F2). It measures the page-cache
-  residency of the **file**, never `mincore` on the tier's hole.
+- **The residency gate** (C3; r1 I-1, §F2; hygiene per r2 m-14). It measures
+  the page-cache residency of the **file**, never `mincore` on the tier's
+  hole.
   - **Fixture.** A 64 MiB file in the build directory: tensor A (16 MiB), a
-    lazy range (24 MiB), then tensor B (16 MiB), with 32 B-aligned, deliberately
-    non-page-aligned boundaries. The lazy range is larger than any readahead
-    window.
-  - **Precondition.** `POSIX_FADV_DONTNEED` over the whole file, then the probe
-    must read about 0 resident. If it does not, the test exits 77: the
-    directory cannot be evicted (tmpfs, or a filesystem that ignores the
-    advice).
-  - **Probe.** `cachestat(2)` on the file's fd (Linux 6.5+; this host runs
-    7.1). The fallback is `mincore` over a **test-owned**, separate
-    `PROT_READ` mapping of the file, which reports the page cache of those
-    file pages whichever mapping faulted them.
+    lazy range (24 MiB), then tensor B (16 MiB), with 32 B-aligned,
+    deliberately non-page-aligned boundaries. The test sets
+    `POSIX_FADV_SEQUENTIAL` on its fd, as the loader does, so the reach
+    matches production.
+  - **Eviction, per arm.** Before **each** arm, every mapping of the fixture
+    is unmapped (`FADV_DONTNEED` skips mapped pages), then
+    `POSIX_FADV_DONTNEED` runs over the whole file, and the probe must read
+    about 0 resident. If it does not, that arm exits 77: the directory
+    cannot be evicted (tmpfs, or a filesystem that ignores the advice).
+  - **Probe.** `cachestat(2)`, called as `syscall(__NR_cachestat, ...)`
+    because glibc has no wrapper here (Linux 6.5+; this host runs 7.1). On
+    `ENOSYS`, or where `__NR_cachestat` is undefined, the fallback is
+    `mincore` over a **test-owned**, separate `PROT_READ` mapping of the
+    file. That reports the page cache of those file pages whichever mapping
+    faulted them. `mincore` reports every page resident for a file the
+    caller neither owns nor can write, which does not apply to a fixture the
+    test creates.
+  - **The two bands.**
+    - The **interior** is the hole minus a 1 MiB guard band in from each
+      edge. The `WILLNEED`, lock and `pread` arms measure it.
+    - The **edge band** at each lazy edge is `[shared page + 1 page,
+      edge + reach)` inward from the edge, where the reach is computed from
+      the fixture's bdi `read_ahead_kb` (the bdi of its `st_dev`), x2 for
+      the fd's `FADV_SEQUENTIAL`, /2. The read-around arms measure it (r2
+      I-3). If the reach does not extend at least 2 pages past the shared
+      page, those arms exit 77, since an empty band passes vacuously.
   - **Arm 1 (the property).** Map through the tier with the lazy hole, apply
     the `WILLNEED` segments, and read every byte of A and B, including the
     bytes that share a page with the hole. That reads outward-rounded bytes
-    without a `SIGSEGV`, which also tests I-2(a). Then the probe over the
-    hole's interior, a 1 MiB guard band in from each edge, must read **0
-    resident pages**.
+    without a `SIGSEGV`, which also tests I-2(a). Then the interior must read
+    **0 resident pages**.
   - **Arm 2 (the mlock case).** Arm 1 under the lock path, with the lazy range
     placed *before* a locked tensor. Same bound. It exits 77 if
     `RLIMIT_MEMLOCK` is below the fixture size.
+    - **It cannot fail by construction** (r2 m-14): the hole is `PROT_NONE`,
+      not file-mapped, and edge read-around stays inside the guard band. So
+      it gets its own mutant, which maps the hole and locks the prefix
+      `[0, B_end)`. The mutant must read the interior resident.
   - **Arm 3 (negative control).** A `GGML_SYCL_PRIVATE_TESTING` mutant that
-    passes the hole as non-lazy must read resident pages in the interior. This
-    shows the gate can fail.
-  - **Arm 4 (synchronous positive control).** `pread` 1 MiB inside the hole's
-    interior, then the probe over that MiB must read resident. There is no
-    polling and no `WILLNEED` race.
-  - **Arms 5 and 6 (read-around, forward and backward; addendum m-20).**
-    - Arm 5 faults the last mapped page before the hole, arm 6 the first
-      mapped page after it. Both are the real faulting pages, not addresses
-      the tier does not map.
-    - With the edge `MADV_RANDOM` in place, the hole interior must read 0.
+    passes the hole **as a tensor range**, that is, adds it to
+    `tensor_ranges` and leaves it out of `lazy_ranges` (the one reading
+    m-16's definition allows). It maps and `WILLNEED`s the hole, and must
+    read resident pages in the interior. This shows the gate can fail.
+  - **Arms 5 and 6 (read-around, forward and backward; addendum m-20, r2
+    I-3).**
+    - Arm 5 faults the mapped page adjacent to the hole's start, and arm 6
+      the one adjacent to its end. Both are real faulting pages, not
+      addresses the tier does not map.
+    - With the edge `MADV_RANDOM` in place, the **edge band** must read 0.
     - Each has a **control twin** with no edge advice, which must read
-      resident pages inside the hole. This shows the arm could fail.
-    - Precondition: `read_ahead_kb` of the fixture's backing device (the bdi
-      of its `st_dev`) must be nonzero. Otherwise both arms exit 77, since
-      with no read-around they would pass vacuously.
-    - Measured through the probe above, as §F2 I-1 requires.
-- **The loader-side gates** (addendum I-9, I-10). The same fixture and probe
-  are driven through libllama, with no SYCL:
+      resident pages in the edge band. This shows the arm could fail.
+    - A mutant that advises only the segment tail fails arm 6.
+  - **Arm 4 (synchronous positive control) runs last**, on its own freshly
+    evicted fixture. `pread` 1 MiB inside the interior, then the probe over
+    that MiB must read resident. There is no polling and no `WILLNEED` race.
+    It runs last because its `pread` populates the hole, plus readahead past
+    the MiB.
+- **The loader-side gates** (addendum I-9, I-10, r2 I-4). The same fixture and
+  probe are driven through libllama, with no SYCL:
   - **`llama_mmap` prefetch exclusion.** Construct `llama_mmap` with
     `prefetch = -1`, the `init_mappings(true)` case, and lazy ranges from a
-    record. Wait 10 s, then the hole interior must read 0. The mutant is an
+    record. Wait 10 s, then the interior must read 0. The mutant is an
     **empty** record (the T6 diversion with ranges taken from `lazy_read`); it
     must read resident within the same 10 s, polled.
+  - **The `HUGEPAGE` arm** (r2 I-4).
+    - A second fixture places the lazy boundaries at 2 MiB + 1 MiB offsets,
+      not 2 MiB-aligned.
+    - The arm faults the page adjacent to each lazy edge through
+      `llama_mmap`'s mapping.
+    - The **folio band** is the lazy bytes from the shared page + 1 page up
+      to the edge's 2 MiB boundary, 1 MiB here. It must read 0.
+    - The mutant leaves the window `MADV_HUGEPAGE`, and must read the folio
+      band resident. If the mutant does not populate it (THP `[never]`, or
+      a kernel whose file THP path ignores the advice), the arm exits 77
+      naming that, rather than passing on a control that cannot fail.
   - **The loader's ranged lock.** Lock a tensor that sits after the lazy
-    range through `llama_mlock::lock_range`; the hole interior must read 0. The
+    range through `llama_mlock::lock_range`; the interior must read 0. The
     mutant is `grow_to`, the whole-prefix lock, which must read resident. The
     test exits 77 if `RLIMIT_MEMLOCK` is below the fixture size.
   - **On Qwen** the lead gate is `fincore` on shard 3, which holds only the
@@ -1042,8 +1390,8 @@ lifts it into `host_ledger_budget()`.
     Under `-lm mmap+mlock` it stays.
   - "Other host weights (`token_embd`)" moves the same way.
   - The WEIGHT zone term shrinks to 1.2 x the reordered experts, plus rnh3's
-    named terms, plus the runtime term of §4.4. For Qwen that is about 64 MB
-    (§4.4).
+    named terms, plus the 64 MiB reserve. Non-weight host requests move to
+    SCRATCH (§4.4). For Qwen the WEIGHT zone is 64.0 MB (§4.4).
   - Every "`MemAvailable_pre` needed" row drops by the moved bytes.
     - For Qwen after (s), a HOST table would need about
       180.9 - 99.3 = 81.6 GiB of `MemAvailable_pre` for step 2 plus the table,
@@ -1075,24 +1423,33 @@ lifts it into `host_ledger_budget()`.
 | `gs:81263-81269` `ggml_sycl_alloc_tier_name` | 3 cases | one case per tier |
 | `gs:5731` (`expert_resolve_tier` name switch) | `HOST_MMAP` | `HOST_MMAP` now means "served from a `FILE_MAPPED` owner" |
 | `tests/test-cpu-gpu-soa-interaction.cpp:178`, `:180`, `:182` | `alloc_tier::MMAP_TRACKED` x3 | `alloc_tier::UNREGISTERED` (r1 m-3; the rename breaks this build otherwise) |
+| `tensor-types.hpp:36-40` `memory_tier::MMAP`, used at `gs:14317`, `:19256`, `:19279`, `:34766`, `:35665`, `:98734` (r2 m-11) | "File-backed mmap (slowest, fallback)"; in fact the initial value and "not found" result of the dead `get_cached_tensor_ptr` (§2.7) | `memory_tier::UNRESOLVED`, so no name in the tree says "mmap" without meaning a `FILE_MAPPED` owner |
 
-The registry's `alloc_type::MMAP` (r1 m-4) is renamed **`HOST_NON_USM`**,
-which names what the pointer is (registered host memory that is not USM)
-rather than a GGUF mapping it never was. `alloc_type::FILE_MAPPED` is new. The
-ten `MMAP` consumers, all in C2:
+The registry's `alloc_type::MMAP` (r1 m-4) is split and **named for its
+release semantics** (r2 m-6), because "host memory that is not USM" would
+also describe a file mapping, and invite registering one under it.
+- **`HOST_MALLOC`**: registered host memory that `unified_free_record`
+  releases with `::free`, the pinned-cap overflow (`uc:14922-14929`).
+- **`HOST_OWNED_ELSEWHERE`**: registered only so the registry can identify
+  it; `unified_free_record` never frees it. This is the tiered KV's synthetic
+  base, a `std::vector` that its own context clears (`gs:39615-39619`,
+  `:39636-39637`, released at `:38403-38410`).
+- `alloc_type::FILE_MAPPED` is new.
+
+The ten `MMAP` consumers, all in C2:
 
 | consumer | meaning today | after |
 |---|---|---|
-| `alloc-registry.hpp:26`, `:143`, `:223` | enum, host-accessible set, commented usm mapping | `HOST_NON_USM`; `FILE_MAPPED` added to the host-accessible set |
-| `common.hpp:2863` | maps to `usm::alloc::unknown` | both map to `unknown` |
-| `dpct/helper.hpp:1327` | pointer-attribute classification | both |
-| `gs:38730`, `:38755` | tiered-KV memcpy for the synthetic base | `HOST_NON_USM` only |
-| `gs:39638` | registers the KV synthetic base | `HOST_NON_USM` |
-| `gs:87745` | (classification) | both |
-| `mem-ops.cpp:151` | non-USM host classification | both (a `FILE_MAPPED` source takes the bounce) |
-| `set_rows.cpp:321` | non-USM host classification | both |
-| `uc:14927` | malloc-overflow `::free` | `HOST_NON_USM` only; a `FILE_MAPPED` record never reaches it (§4.1) |
-| `uc:21635` | `query_registered_location` | both, to their own tiers |
+| `alloc-registry.hpp:26`, `:143`, `:223` | enum, host-accessible set, commented usm mapping | `HOST_MALLOC` and `HOST_OWNED_ELSEWHERE`; `FILE_MAPPED` added to the host-accessible set |
+| `common.hpp:2863` | maps to `usm::alloc::unknown` | all three map to `unknown` |
+| `dpct/helper.hpp:1327` | pointer-attribute classification | all three |
+| `gs:38730`, `:38755` | tiered-KV memcpy for the synthetic base | `HOST_OWNED_ELSEWHERE` only |
+| `gs:39638` | registers the KV synthetic base | `HOST_OWNED_ELSEWHERE` |
+| `gs:87745` | (classification) | all three |
+| `mem-ops.cpp:151` | non-USM host classification | all three (a `FILE_MAPPED` source takes the bounce) |
+| `set_rows.cpp:321` | non-USM host classification | all three |
+| `uc:14927` | malloc-overflow `::free` | `HOST_MALLOC` only; a `FILE_MAPPED` or `HOST_OWNED_ELSEWHERE` record never reaches it (§4.1) |
+| `uc:21635` | `query_registered_location` | all three, each to its own tier |
 
 `cache_location::HOST_MMAP` (39 sites) keeps its name. Its derivation changes
 in one place each (`uc:8068-8081`, `:8235-8248`, `:6504-6545`): it is
@@ -1170,6 +1527,7 @@ ways a weight's host pointer can reach a device today, and what each becomes:
 | `direct_stage_weight`'s plain copy (`uc:6167-6175`) | `mem_copy` from a copy handle | unchanged: `mem_copy` bounces a non-USM source through a 64 MiB pinned window (`mem-ops.cpp:700-729`); this is load or materialization, not streaming |
 | reorder `fill_fn`s (`gs:34835-34840`) | read `src_ptr` on the CPU | unchanged (CPU reads are allowed); see §5.4 for their staging |
 | direct-stage last resort (`uc:6504-6545`) | registers an unrecognized source in place as `HOST_MMAP` | registers the `FILE_MAPPED` slice with its owner; an `UNREGISTERED` source is refused (C6) |
+| preload's host-planned copy (`gs:34696-34730`, r2 m-7) | `memcpy`s a late-plan host weight into an uncharged pinned WEIGHT allocation | served in place from the mapping, or a planned, charged copy (§4.3 site table); a CPU copy, never a device read |
 
 **The `stream_dma` refusal.**
 - The check runs at entry, before the `copy_fn` test, so custom-copy callers
@@ -1178,7 +1536,17 @@ ways a weight's host pointer can reach a device today, and what each becomes:
   `stream_dma_file_mapped_refusals` counter increments.
 - Callers route a refusal like `mmap_direct_failed` today: to the CPU executor
   (`ggml_sycl_cpu_fallback_graph`, `mmq.cpp:7653-7658`), because a host-tier
-  weight executes on the CPU.
+  weight executes on the CPU. C4 routes `refused_file_mapped` **explicitly**
+  in all four callers (`mmq.cpp`, `mmvq.cpp`, `dmmv.cpp`, `getrows.cpp`),
+  not by relying on `mmap_direct_failed`.
+- **The refusal is terminal in `getrows`' retry loop** (r2 m-5). That loop
+  halves the slice on any non-ok result (`getrows.cpp:2762-2795`), so a
+  deterministic refusal would repeat `log2(slice/min)` times, each counted
+  and each logging `[GET_ROWS] DMA retry`, and its fallback keys on
+  `mmap_direct_failed` (`:2806`). C4 breaks out of the loop on
+  `refused_file_mapped` before the retry test, and routes it to the CPU
+  fallback. A host test over a fake `stream_dma` that refuses asserts one
+  call, one count and no retry line.
 - Streaming mapped weights is forbidden by P3.
 
 **The `resolve_or_host` abort.** Returning null would not be safe:
@@ -1192,9 +1560,26 @@ false for null (`binbcast.cpp:394`), and then uses null as the kernel source.
 
 **Gates.**
 - The device-bound copy counter `file_mapped_device_copies_outside_materialization`
-  counts **any** device-bound copy of `FILE_MAPPED` bytes, bounced or direct,
+  counts a device-bound copy of `FILE_MAPPED` bytes, bounced or direct,
   outside a load transaction or a cache materialization
-  (`direct_stage_weight` or a fill). The lead's load gate reads it as 0.
+  (`direct_stage_weight` or a fill), **at the instrumented chokepoints** (r2
+  m-17):
+  - `mem_copy`, `mem_copy_async` and `mem_copy_ptr_async` (`mem-ops.hpp:13-62`);
+  - `unified_cache::copy_to_device_async` (`uc:10799`);
+  - `stream_dma` (`uc:13959`).
+
+  A copy through any other path is not counted. The standing
+  `llama.cpp-v4jk` audit covers those. The lead's load gate reads the counter
+  as 0.
+- **Where the lead reads both counters** (r2 m-18). One line,
+  `[FILE-MAPPED] counters: stream_dma_refusals=%llu
+  device_copies_outside_materialization=%llu`, printed through
+  `GGML_LOG_WARN`, so it survives default verbosity:
+  - once at the end of `ggml_backend_sycl_model_load_end`, after the
+    preload, so a killed run still has one;
+  - once at model unload.
+
+  A missing line is a failed criterion, not a zero.
 - `stream_dma_file_mapped_refusals` must also read 0 on a correct build: a
   refusal means dispatch routed a host-tier weight to a device kernel.
 - The standing `llama.cpp-v4jk` audit (no route stages a host operand to a
@@ -1266,74 +1651,135 @@ what the lead runs. Test rules (r1 I-6, §F2):
 
 The lead's GPU runs share one protocol (r1 I-7):
 - the selector is pinned;
-- `grep -E '^(MemAvailable|Shmem|AnonPages|Cached|Mlocked):' /proc/meminfo`
-  is sampled **every 1 s**;
+- `grep -E '^(MemAvailable|Shmem|AnonPages|Cached|Mlocked|Unevictable):'
+  /proc/meminfo` is sampled **every 1 s**;
 - the watchdog floor is `MemAvailable < 25 GiB` = 26214400 kB, the same unit
   and value as the criteria;
 - each run is done once;
 - `journalctl -k` is checked for `GT reset|guc_id|CAT error` after it.
 
-**C1. Restore `mmap_support`** (§3).
+**Every model gate set carries a default-context arm** (owner ruling
+2026-09-27), and every such arm is scored:
+- The **Mistral** gate already runs `llama-completion` with no `-c`, so it is
+  its own default-context arm (n_ctx_train 32768).
+- Every **Qwen** and **GPT-OSS** gate below that pins `-c 4096` has a no-`-c`
+  twin.
+- llama.cpp-uize part 3 has landed (`35ce2e65f`, `812c7d790`, `7259727e6`,
+  `ae4204ba7`, all in this tree). So a KV cache that does not fit VRAM is
+  re-placed to the host tier, and its layers' attention runs on the CPU. The
+  runtime prints `[SYCL-PLAN] KV overflow re-placed to host tier: N layer(s)
+  demoted, S SWA (X MB host KV, layers A..B) on device D for n_ctx=C; the
+  device has F MB free for KV. ...` (`gs:18382`).
+- **PASS** needs correct tokens, and that line with the pre-registered N and
+  range. **Any** `runtime KV update rejected` line is a FAIL: the refusal is
+  now only the fallback for when the host tiers cannot hold the KV either, so
+  no attribution to uize remains. Garbage tokens, an abort, or `Shmem`
+  growth are also 5efe FAILs.
+
+**C1. Restore `mmap_support`, and the lazy-range record** (§3, §3.1).
 - RED `test-sycl-mmap-support-caps-source` (Python, `tests/`, `sycl;host;source-contract`).
   - It checks that the initializer in `ggml_backend_sycl_device_get_props`
     names `.mmap_support`, binds it to `host_unified_known &&
     !host_unified_memory`, and is neither a literal `true` nor absent.
   - Today it fails on the four-initializer list.
   - It also checks that `lm:2693-2696` is still present, since C1 must not
-    remove it.
-- **The lazy-range record (§3.1)** lands in C1 too, with two host-only tests
-  (`host;lazy`, `tests/`, libllama only, no device):
+    remove it. **C4 amends that clause** to the narrowed form of §4.3
+    (r2 m-8).
+- **The record** lands in C1, with these host-only tests (`host;lazy`,
+  `tests/`, libllama only, no device):
   - `test-llama-lazy-range-record`:
-    - builds `llama_tensor_weight`s from a test-written GGUF of four tensors
-      in two files, two of them flagged `TENSOR_READ_LAZY`, and feeds them
-      through the record's fill function, the same call the pre-fill makes;
-    - checks that the record's rows equal the flagged tensors' (file, offset,
-      size) exactly, that `deferral` is `LAZY_READ` under `-lzm on` and
-      `EAGER` under `off`, and that `lazy_read`'s `any()`, `has()` and
-      `for_file()` and the ranges passed to `llama_mmap` agree with the record;
-    - its RED is a mutant, compiled into the test binary only (libllama has
+    - It builds `llama_tensor_weight`s from a test-written GGUF of four
+      tensors in two files, two of them flagged `TENSOR_READ_LAZY`, one of
+      those at 4 GiB + 1 byte of logical size and one at 4 GiB. It feeds them
+      through the record's fill function, the same call the pre-fill makes.
+    - Rows equal the flagged tensors' (file, offset, size) exactly, whatever
+      the mode (membership is flag-based).
+    - `lazy_eligible` comes from T6a's function, called and not restated. It
+      is set for both rows under `ON`, for the 4 GiB + 1 row only under
+      `AUTO`, and for neither under `OFF`.
+    - `deferral` follows §3.1's definition in all four branches:
+      - an ineligible row is `EAGER`;
+      - an eligible row on the SYCL branch is `STORAGE`;
+      - off it, `LAZY_READ`;
+      - off it, with a post-fallback `OFF`, `EAGER`.
+    - `deferred_for_file` holds exactly the non-`EAGER` rows.
+    - `lazy_read`'s `any()`, `has()` and `for_file()`, and the ranges passed
+      to `llama_mmap`, agree with the record. `any()` is false on the SYCL
+      branch, and under `no_alloc`.
+    - **RED** is a mutant, compiled into the test binary only. libllama has
       no private-testing switch, so the test links a copy of the record and
-      `lazy_read` sources built with a test-local define), in which
-      `lazy_read::add` keeps its own copy and the record's fill is skipped
-      for one tensor. The agreement check must fail naming that tensor.
-  - `test-llama-lazy-range-record-source` (`host;lazy;source-contract`):
-    - no consumer holds its own range container: `lazy_read` has no `ranges`
-      or `tensors` member, and `init_mappings` passes the record, not
-      `lazy.for_file`;
-    - `create_tensor`'s `TENSOR_READ_LAZY` branch checks the record and
-      does not fill it;
-    - today it fails on `llama-model-loader.h:118-119`.
-- The record's pre-fill and the early plan's exclusion (§3.1) are covered by
-  more host-only tests:
-  - `test-llama-lazy-range-prefill` (`host;lazy`) feeds a declared lazy name,
-    an undeclared flagged name and a declared-but-unflagged name through the
-    pre-fill and the `create_tensor` check.
+      `lazy_read` sources built with a test-local define. In it
+      `lazy_read::add` keeps its own range copy, and the record's fill is
+      skipped for one tensor. The agreement check must fail naming that
+      tensor.
+  - `test-llama-lazy-range-prefill`:
+    - It feeds three names through the pre-fill and the `create_tensor`
+      check: a declared lazy name, an undeclared flagged name, and a
+      declared-but-unflagged name.
     - The first gives one row, filled before any `create_tensor` call.
-    - The other two abort naming the tensor, each in its own process, scored
-      on rc 134 plus the name.
+    - The other two abort naming the tensor and the arch, each in its own
+      process, scored on rc 134 plus the name. The unflagged case aborts under
+      `-lzm off` too, where the row is `EAGER` (r2 I-5(3)).
     - `value(name)` equals the weight's (file, offset, size), and a write after
       the pre-fill aborts.
-    - RED mutant: the row filled at `create_tensor` instead, under which the
-      "before any `create_tensor` call" check fails.
-  - `test-llama-lazy-range-record-source` also asserts that the caps and
-    lazy-mode loops precede `llama_model_sycl_compute_early_plan`, and that
-    the early plan's `weights_map` loop consults the record.
-- Lead witness (r1 I-7):
-  - Run Qwen on the B70 with **no** `-lm`/`-lzm` flags.
-  - Stop the process with `kill` as soon as the log shows all of:
+    - **The ineligible early-plan witness** (th32 r19 M-1, assigned to 5efe).
+      The early plan's inventory filter includes an ineligible row, for
+      `AUTO` at 4 GiB and for `OFF`, as an ordinary weight, and excludes the
+      eligible one.
+    - **RED mutant:** the row filled at `create_tensor` instead, under which
+      the "before any `create_tensor` call" check fails.
+  - `test-llama-lazy-declaration-source` (`host;lazy;source-contract`, r2
+    I-5):
+    - It extracts every `create_tensor` call in `src/models/*.cpp` that
+      passes `TENSOR_READ_LAZY`.
+    - It maps the file's model class to its `LLM_ARCH` through the
+      registration in `llama-model.cpp`, and each `tn(LLM_TENSOR_*, suffix
+      [, bid])` to its GGUF name through `LLM_TENSOR_NAMES`
+      (`llama-arch.cpp:561`), with a bid argument becoming `blk.%d.`.
+    - It requires a `llama_model_lazy_tensor_decls` entry for each, and a call
+      site for each entry.
+    - Today it passes on the two call sites once the declaration exists, and
+      it fails before C1, which has no declaration.
+    - **Mutants:** a flagged call added in a copy of `gemma4.cpp` with no
+      entry; an entry with no call site.
+  - `test-llama-lazy-range-record-source` (`host;lazy;source-contract`):
+    - no consumer holds its own **range** container: `lazy_read` has no
+      `ranges` member (its membership set of names stays, §3.1), and
+      `init_mappings` passes the record, not `lazy.for_file`;
+    - `create_tensor`'s `TENSOR_READ_LAZY` branch checks the record and does
+      not fill it, and compares the flag with membership, not with
+      `deferral`;
+    - the caps and lazy-mode loops precede `llama_model_sycl_compute_early_plan`,
+      and the early plan's `weights_map` loop consults the record;
+    - today it fails on `llama-model-loader.h:118`.
+- **Lead witnesses** (r1 I-7, r2 m-1). Two short runs, each killed before the
+  pinned pre-size.
+  - **The margin.** In run2 the witness lines were all printed by t = 3.9 s
+    (`run2.log:243`, `:308`, `:314`, `:370`). Chunk 1 of the pinned pre-size
+    was allocated at t = 8.12 s (`:2827`). So the margin is about **4.2 s**,
+    not the 53 s rev 3a claimed. `:2893` is the summary after the pre-size.
+  - **The belt.** C1 does not split the ledger, so its load still sizes
+    WEIGHT at 122.9 GB. Both runs set `GGML_SYCL_HOST_RESERVE_MB=16384`, the
+    budget override (`uc:4172-4184`), so a late kill cannot commit more than
+    16 GiB.
+  - **W1, lazy enabled.** Qwen on the B70 with **no** `-lm`/`-lzm` flags. Kill
+    it as soon as the log shows all of:
     - `per_layer_token_embd ... lazy read enabled`, now printed at the
       pre-fill;
     - the early `[SYCL-PLAN] Host staging zone` line;
     - the early `[PLACEMENT] Totals` line;
     - `load_mode = mmap`.
 
-    In run2 all four were printed by t = 3.9 s (`run2.log:243`, `:308`, `:314`,
-    `:370`), about 53 s before the pinned pre-size began (`:2893`).
-  - Pre-registered: early `per_inflight` ≤ 1800 MB, and early host total =
+    Pre-registered: early `per_inflight` ≤ 1800 MB, and early host total =
     102383.5 MB ± 0.1 MB.
-  - This run is a witness, not a load; it never reaches the pre-size.
-- Lead gates: the Mistral gate on `:1` and `:0`. Tokens are unchanged, since
-  Mistral has no lazy tensor.
+  - **W2, the ineligible case** (th32 r19 M-1). The same with `-lzm off`, so
+    the row is ineligible. The early plan must place the table as the
+    ordinary weight it is: early `per_inflight` = 103762.3 MB and early host
+    total = 154263.6 MB, both ± 0.1 MB, the run2 figures (`:243`, `:308`).
+  - Neither is a load. Neither reaches the pre-size.
+- Lead gates: the Mistral gate on `:1` and `:0` (default context). Tokens are
+  unchanged, since Mistral has no lazy tensor.
+- **Data edge:** th32 T6a lands no later than C1 (§3.1).
 
 **C2. The `FILE_MAPPED` tier, the raw wrappers and the census** (§4.1, §4.8).
 - RED `test-sycl-file-mapping-host` (C++, links `file-mapping.cpp` only,
@@ -1352,69 +1798,107 @@ The lead's GPU runs share one protocol (r1 I-7):
   - `query_location` returns `FILE_MAPPED`;
   - `device_mappable()` is false, and `resolve(device)` is empty;
   - the registry has one record for the reservation;
-  - the `::free`-branch counter stays 0 at release.
+  - the private `::free` and `sycl::free` branch counters both stay 0 at
+    release.
 
-  Mutant: the `FILE_MAPPED` branch placed after the `alloc_type` `::free`
-  branch.
+  Mutants (r2 m-6; the rev 3a mutant was equivalent): the record registered
+  as `HOST_MALLOC`; the `FILE_MAPPED` branch moved after the `zone_managed`
+  branch into the `sycl::free` fallthrough.
 - RED `test-sycl-raw-mmap-allowlist-source` (`sycl;host;source-contract`),
-  §4.1. Mutant: an `mmap(` call added to a non-listed file.
+  §4.1. It uses the tokenizer, with the comment, string and `mmap (` fixture
+  (r2 m-12). Mutant: an `mmap (` call added to a non-listed file.
 - RED `test-sycl-alloc-tier-census-source` (`sycl;host;source-contract`). No
-  `MMAP_TRACKED` and no `alloc_type::MMAP` remain anywhere in the tree,
-  `tests/` included. Today it fails on the 12 + 3 + 10 sites of §4.8.
+  `MMAP_TRACKED`, no `alloc_type::MMAP`, no `HOST_NON_USM` and no
+  `memory_tier::MMAP` remain anywhere in the tree, `tests/` included. Today
+  it fails on the 12 + 3 + 10 + 7 sites of §4.8 (r2 m-11).
 - Also: the canonical contract §3 allowlist gains the three wrappers, and the
   static-storage census and the allowlist gates are re-run.
 
 **C3. The segment plan and the residency gate** (§4.6).
 - RED `test-sycl-file-mapping-segments` (`sycl;host`), a pure-function test.
-  - Map segments round outward, and `WILLNEED` and lock segments round inward.
+  - Map segments are the union of the tensor ranges rounded outward, and never
+    a complement (r2 m-16). `WILLNEED` and lock segments round inward.
   - At most one lazy page is mapped per edge.
   - Cases: an interleaved lazy range, a lazy range sharing a page with a
-    tensor at each end, back-to-back lazy ranges, and a lazy range at offset
-    0 before a lock segment.
+    tensor at each end, back-to-back lazy ranges, a lazy range at offset 0
+    before a lock segment, and bytes that belong to no tensor of the buffer
+    (never mapped).
   - Mutants: inward map rounding (fails the shared-page read), outward
-    `WILLNEED` rounding (fails the zero-lazy bound).
-- RED `test-sycl-file-mapping-residency` (`sycl;host`), §4.6's six arms and
-  their control twins.
+    `WILLNEED` rounding (fails the zero-lazy bound), the complement reading
+    of map segments (maps the no-tensor bytes).
+- RED `test-sycl-file-mapping-residency` (`sycl;host`), §4.6's arms.
   - The fixture lives under `${CMAKE_BINARY_DIR}`, which is not tmpfs.
-  - The test exits 77 if the eviction precondition fails, arm 2 exits 77 if
-    `RLIMIT_MEMLOCK` is below the fixture size, and arms 5 and 6 exit 77 if
-    `read_ahead_kb` is 0.
-  - Arm 3 and the arm 5 and 6 control twins are the must-fail cases.
-  - Arms 5 and 6 need the both-edge window: a mutant that advises only the
-    segment tail fails arm 6.
+  - Each arm has its own eviction precondition, and exits 77 if it fails.
+  - Arm 2 exits 77 if `RLIMIT_MEMLOCK` is below the fixture size.
+  - Arms 5 and 6 exit 77 if the computed reach does not extend 2 pages past
+    the shared page (r2 I-3).
+  - Arms 1-2 are measured over the interior. Arms 5-6 and their twins are
+    measured over the edge band.
+  - Arm 4 runs last, on a fresh fixture (r2 m-14).
+  - The must-fail cases: arm 2's prefix-lock mutant, arm 3, and the arm 5
+    and 6 control twins.
+  - A mutant that advises only the segment tail fails arm 6.
 - The loader's ranged lock (§4.6) also lands here, in libllama, with RED
   `test-llama-mlock-ranged` (`host;lazy`). It is §4.6's loader lock gate: a
-  lazy range before a locked range, the hole interior reading 0, and the
+  lazy range before a locked range, the interior reading 0, and the
   whole-prefix `grow_to` mutant reading resident.
 - Lead: none.
 
-**C4. One published fact, the planner split, `SYCL_Mapped` and the loader**
-(§4.3, §4.4, §5.3). This lands as **one commit**, because the fact and its only
-consumers must land together (r1 C-1, I-5, §F2). It is the commit that changes
-every SYCL load.
+**C4. One published fact, the planner split, host role routing,
+`SYCL_Mapped` and the loader** (§4.3, §4.4, §5.3). This lands as **one
+commit**, because the fact and its only consumers must land together (r1 C-1,
+I-5, §F2). It is the commit that changes every SYCL load.
 - **Prefetch 0 on SYCL is an explicit C4 item** (addendum I-9, m-6).
   `init_mappings` is called with prefetch 0 on a SYCL load (`lm:2702`), and
   `llama_mmap` excludes the record's deferred ranges with the both-edge
-  window whatever the prefetch value.
+  `MADV_RANDOM` window and the 2 MiB-widened `NOHUGEPAGE` window, whatever
+  the prefetch value (r2 I-4).
 - Host-only REDs:
   - `test-llama-mmap-lazy-exclusion` (`host;lazy`), §4.6's `llama_mmap`
-    prefetch gate. Under `prefetch = -1` there is no `WILLNEED` over a lazy
-    range and no read-around into one. The mutant is an empty record (lazy
-    ranges from a diverted `lazy_read`), which must read resident.
+    gates:
+    - **The prefetch arm.** Under `prefetch = -1` there is no `WILLNEED` over
+      a lazy range and no read-around into one. The mutant is an empty record
+      (lazy ranges from a diverted `lazy_read`), which must read resident.
+    - **The `HUGEPAGE` arm** (r2 I-4). Lazy boundaries sit at 2 MiB + 1 MiB
+      offsets. Faulting the page adjacent to each edge leaves the folio band
+      at 0. The mutant, with the window left `HUGEPAGE`, must read it
+      resident, or the arm exits 77 naming why.
+  - `test-sycl-host-role-routing-source` (`sycl;host;source-contract`, r2
+    I-2):
+    - It generates §4.4's census from the tree, and pins it: each row's role,
+      zone before and after, and lifetime.
+    - `select_zone` has no category clause for WEIGHT.
+    - `SYCL_Host` takes role `WEIGHT` only under `in_model_load`.
+    - `notify_compute_buffer_sizes` has a caller in `src/`.
+    - The SCRATCH boundary check counts only `GRAPH` records.
+    - **Mutant:** the category clause restored, which moves the
+      `CpuExpertPool` row to WEIGHT.
+  - `test-sycl-host-zone-select` (`sycl;host`). It is a pure test of the
+    extracted `select_zone`, over role x category x `kv_spill_to_host`. It
+    covers every row of §4.4's routing, and the boundary check's lifetime
+    filter over a fake registry: a `CONTEXT` record passes the check, a
+    `GRAPH` record trips it.
+  - `test-sycl-getrows-refusal-terminal` (`sycl;host`, a fake `stream_dma`,
+    r2 m-5). One refusal gives one call, one counted refusal, no
+    `[GET_ROWS] DMA retry` line, and the CPU fallback.
   - `test-sycl-mapped-loader-source` (`sycl;host;source-contract`):
     - prefetch 0 at the SYCL `init_mappings` call;
-    - every site of the §4.3 table;
+    - every site of the §4.3 table, including the preload copy (m-7) and
+      `alloc_buffer` (m-10);
     - no `use_mmap` read in `create_tensor`'s SYCL buft choice;
-    - `lm:2693` gone;
-    - the eight `weight_host_bytes` accumulation sites test `host_backing`;
-    - the eight `resolve_or_host` callers are the pinned list (§5.3).
+    - `lm:2693` narrowed to the no-tier case;
+    - the eight `weight_host_bytes` accumulation sites test `host_backing`,
+      and the readers of §4.4 read their assigned meaning (m-3);
+    - `dma_streamed` is 0 without `PINNED` host weights (m-2);
+    - the eight `resolve_or_host` callers are the pinned list (§5.3);
+    - the four `stream_dma` callers route `refused_file_mapped` explicitly.
   - `test-sycl-host-backing-plan`, a Qwen-shaped inventory (1223 tensors,
     B70 budget):
-    - with `load_maps_files` true, host experts are `FILE_MAPPED`,
-      `weight_host_bytes` = 0, `host_mapped_bytes` = 102383.5 MB, and the
-      WEIGHT zone is 64 MiB plus the runtime term;
-    - with it false, today's 122924.2 MB zone;
-    - with mlock, the mapped bytes are charged.
+    - with `load_maps_files` true: host experts are `FILE_MAPPED`,
+      `weight_host_bytes` = 0, `host_mapped_bytes` = 102383.5 MB, the WEIGHT
+      zone is 64 MiB, the DMA pool is 0, and base + runtime = 4 + 3 chunks;
+    - with it false: today's 122924.2 MB zone and 1700 MB DMA pool;
+    - with mlock: the mapped bytes are charged.
 
     It is host-only through 7v5c's dry-run entry if 7v5c has landed.
     Otherwise it is registered `sycl;cache;mem-handle`, `level_zero:1`, and is
@@ -1424,14 +1908,27 @@ every SYCL load.
     view refuses, with and without a `copy_fn`, and the counter counts.
     Mutant: the check placed after the `copy_fn` test.
   - `test-sycl-file-mapped-bounce`: `mem_copy` of a mapped source takes the
-    bounce (`host_ptr_is_usm_accessible` false), and the outside-materialization
-    counter stays 0 inside a materialization and counts outside one.
+    bounce (`host_ptr_is_usm_accessible` false). The outside-materialization
+    counter stays 0 inside a materialization, and counts outside one at each
+    named chokepoint (m-17).
   - `test-sycl-file-mapped-expert-owner`: `register_host_expert` over a mapped
     slice stores the owner, and the mapping outlives the buffer while an entry
     holds it.
   - `test-sycl-file-mapped-resolve-abort`, a death test in its own process:
     `resolve_or_host` on a mapped weight aborts naming the tensor. It is
     scored on rc 134 plus the tensor name.
+  - **`test-sycl-pinned-meminfo-control`** (r2 m-13; the lead runs it before
+    step 2 below):
+    - It allocates 4 GiB through `unified_allocate` with `must_host_pinned`,
+      touches every page, samples `/proc/meminfo` before and after, and frees
+      it.
+    - It prints each counter's delta: `AnonPages`, `Shmem`, `Mlocked`,
+      `Unevictable`, `Cached`.
+    - Pre-registered: at least one counter moves by ≥ 3.5 GiB, and that
+      counter is the one pinned host USM lands in. run2's `Shmem` stayed at
+      1.8 G while 140 GB was pinned, so it is not `Shmem`.
+    - If no counter moves, the test exits 77, and the host-growth criterion
+      below rests on the `Committed` line plus `MemAvailable` alone.
 - Lead, in this order (r1 I-8, m-14, m-15):
   1. `POSIX_FADV_DONTNEED` over shard 3, then `fincore` on it. Pre-registered:
      ≤ 1 MiB resident.
@@ -1439,30 +1936,95 @@ every SYCL load.
      baseline completion** (`-p 'The capital of France is' -n 32 --seed 42
      --temp 0`). Pre-registered pass criteria:
      - the load completes and prints coherent text;
-     - `[HOST-ARENA] configured zones: WEIGHT=` is 64.0-128.0 MB, and the
-       pre-size commits ≤ 12288 MB (§4.4);
+     - `[HOST-ARENA] configured zones: WEIGHT=64.0 MB`;
+     - `Pinned pool pre_allocate: grew 4 chunks`,
+       `pre_allocate_runtime: grew 3 chunks`, and `Committed 14336.0 MB in 7
+       chunk(s)` (§4.4; r2 I-1);
+     - `DMA staging pool: 0.0 MB`;
+     - **no `Pinned pool grow_zone: zone 0` line after the pre-size**, through
+       the end of the completion. `[HOST-ARENA] SCRATCH zone grown by` equals
+       the notified compute-buffer sum (r2 I-2);
      - the early and late `[PLACEMENT] Totals` both print charged host 0 and
-       mapped 102383.5 MB, and the early `Host staging zone` has
-       `per_inflight` ≤ 1800 MB;
+       mapped 102383.5 MB. The early `Host staging zone` has `per_inflight`
+       ≤ 1800 MB;
+     - "planner host placement: yes" (m-3);
      - `SYCL_Mapped` model buffer lines sum to 127615 MiB ± 1%;
      - `SYCL_Host` model buffer lines hold 0 weight bytes;
-     - peak `AnonPages` minus the pre-load reading is < 30 GiB;
+     - peak growth of the counter the control named, over the pre-load
+       reading, is < 30 GiB. It is skipped, and said to be skipped, if the
+       control exited 77;
      - `MemAvailable` never falls under 25 GiB (the watchdog unit);
      - `Shmem` stays under 5 GiB;
      - `fincore` on shard 3 after the run is ≤ 256 MiB. The bound: the prompt
-       plus 32 tokens is under 40 tokens, x 16 PLE rows per token (th32 §0 table),
-       x a 256 KiB bcachefs extent per row fault = 160 MiB, rounded up;
-     - `stream_dma_file_mapped_refusals` = 0, and
-       `file_mapped_device_copies_outside_materialization` = 0;
+       plus 32 tokens is under 40 tokens, x 16 PLE rows per token (th32 §0
+       table), x a 256 KiB bcachefs extent per row fault = 160 MiB, rounded
+       up;
+     - the `[FILE-MAPPED] counters:` line prints `stream_dma_refusals=0
+       device_copies_outside_materialization=0` (m-18);
      - no GPU fault lines.
 
      There is deliberately no page-cache-growth criterion, because it would
      depend on the other shards' prior cache state.
-  3. The Mistral gate on `:1` and `:0`. The GPT-OSS gate on `:1` is **the
-     canonical CLAUDE.md `llama-cli` command, including `-c 4096`, under
-     `timeout 60`**, scored with `grep -cx '1, 2, 3, 4, 5'` = 1. Every SYCL
-     load now takes the mapped path.
-  4. `llama-bench` Mistral Q4_0 and GPT-OSS 20B on both cards, interleaved
+  3. **The same Qwen run with no `-c`** (the default-context arm), at
+     `n_ctx = n_ctx_train = 262144` (`run2.log:131`).
+     - **The KV.** 12 of the 48 layers carry KV: qwen4exp marks layer `i`
+       recurrent unless `(i + 1) % full_attention_interval == 0`
+       (`src/models/qwen4exp.cpp:132-134`), and the interval is 4
+       (`run2.log:37`). So layers 3, 7, ..., 47 carry it. Each holds
+       262144 x (512 + 512) x 2 B = 512 MiB (`run2.log:146-147`). That is
+       **6144 MiB** in all, plus a small recurrent state.
+     - The SYCL planner's KV sizing counts all 48 layers (`run2.log:217`,
+       `:307`). At 262144 that would claim 24576 MiB. That over-count is
+       **llama.cpp-0edf**, outside 5efe.
+     - **The room.** The demotion's capacity is `min(budget, shared zone)`
+       (`kv_weight_capacity`, `kv-runtime-demotion.cpp:58`). In run2 the shared
+       zone was 25519.0 MB (`run2.log:227`) and device weights 25231.2 MB
+       (`:308`), with optional layouts 0.0. So the room is at most 287.8 MB,
+       less than one 512 MiB layer, and no layer that carries KV stays on the
+       device.
+     - Demotion walks layers latest first, and skips layers with 0 recorded
+       bytes (`kv-runtime-demotion.cpp:19-45`).
+     - **Two pre-registered outcomes, and which one prints is 0edf's
+       discriminator:**
+       - real hybrid sizing: `12 layer(s) demoted, 0 SWA (6144.0 MB host KV,
+         layers 3..47)`;
+       - 0edf's over-claim: `48 layer(s) demoted, 0 SWA (24576.0 MB host KV,
+         layers 0..47)`.
+
+       The MB figures are MiB, the unit the existing demotion lines print (29
+       Mistral layers at 32768 print 3712.0).
+     - **General rule, if the printed `F` differs.** With `K = floor(F /
+       512)`, real sizing gives `N = 12 - K`, layers `3 + 4K..47`; the
+       over-claim gives `N = 48 - K`, layers `K..47`. Any other N or range is
+       a FAIL.
+     - **The criteria:**
+       - every criterion of step 2 that does not depend on `n_ctx` holds;
+       - the KV zone (zone 1) grows by at most the printed host KV;
+       - `MemAvailable` stays above 25 GiB. With 0edf's figure that is 24 GiB
+         more pinned host KV, which fits: step 2's pinned total is 14 GiB,
+         and `MemAvailable` before the load was 155.0 GiB (`run2.mem`);
+       - a `runtime KV update rejected` line is a FAIL.
+  4. The Mistral gate on `:1` and `:0` (default context).
+  5. The GPT-OSS gate on `:1`, in two arms, each under `timeout 60` and
+     scored with `grep -cx '1, 2, 3, 4, 5'` = 1:
+     - **the canonical CLAUDE.md `llama-cli` command with `-c 4096`**;
+     - **the same with no `-c`**, at `n_ctx = 131072`.
+       - GPT-OSS 20B has 24 layers, with SWA on even layers and full
+         attention on odd ones (`load_swa_pattern(ml, 2)`,
+         `src/models/openai-moe.cpp:9`, whose `dense_first` defaults to false, `llama-model.h:851`; `llama-hparams.cpp:13-16`). Each full
+         layer holds 131072 x 1024 x 2 B = 256 MiB.
+       - uize's recorded refusal on the B50 reads `vram=16569.0 MB (weights
+         13363.7 + kv 3090.0) budget=14828.0` (CLAUDE.md). That leaves
+         14828.0 - 13479.0 = 1349.0 MiB for KV, of which the 12 SWA layers
+         take 18.0.
+       - So 5 full layers stay on the device, and the pre-registered line is
+         `7 layer(s) demoted, 0 SWA (1792.0 MB host KV, layers 11..23)`.
+       - If the printed `F` differs, the rule is `N = 12 - floor((F - 18.0) /
+         256)`, layers `23 - 2(N - 1)..23`.
+       - A refusal is a FAIL.
+
+     Every SYCL load now takes the mapped path.
+  6. `llama-bench` Mistral Q4_0 and GPT-OSS 20B on both cards, interleaved
      against the parent commit, gated on `docs/backend/sycl-perf-baselines.md`.
      Load time is also reported, since device weights now read from page cache
      through the bounce.
@@ -1474,23 +2036,36 @@ every SYCL load.
     34.5, 12.0 and a refusal.
   - It sweeps `MemAvailable` from 0 to `MemTotal` in 64 MiB steps for 32, 62
     and 246.9 GiB, and asserts the budget never decreases.
-  - Today's formula fails both: the (246.9, 28.9) row gives 20.9, and the
-    sweep drops at the `available/2` cliff.
-- RED `test-sycl-host-working-set-warn` (`sycl;host`). The WARN is printed
-  with its three figures at `resident_room < mapped_ws`, not above it, and
-  the plan-report line carries the same figures.
+  - **The override composes** (r2 m-4). With `GGML_SYCL_HOST_RESERVE_MB` above
+    the formula's value, the budget is the formula's. Below it, the budget is
+    the override. At zero headroom-free memory it is the named refusal
+    either way.
+  - Today's formula fails all three: the (246.9, 28.9) row gives 20.9, the
+    sweep drops at the `available/2` cliff, and the override replaces the
+    budget outright.
+- RED `test-sycl-host-working-set-warn` (`sycl;host`).
+  - The WARN is printed with its figures at `resident_room < mapped_ws`, not
+    above it, and the plan-report line carries the same figures.
+  - `resident_room` uses `host_headroom(total)`. At (62 GiB, 50 GiB
+    available, 20 GiB mapped) it does not WARN, where the P3 constant would.
 - It depends on th32 T2 for `host_ledger_budget()` if T2 has landed.
-  Otherwise it edits `uc:4200-4231`, and T2 lifts the result.
-- Lead: the C4 Qwen run once more, reading `[PLACEMENT] Totals` (the four
-  terms) and the working-set line against the `/proc/meminfo` samples.
+  Otherwise it edits `uc:4165-4231`, and T2 lifts the result.
+- Lead: the C4 Qwen `-c 4096` run once more, reading `[PLACEMENT] Totals`
+  (the four terms) and the working-set line against the `/proc/meminfo`
+  samples.
 
 **C6. Retire unowned host registration** (§4.8).
 - RED `test-sycl-unregistered-host-refusal` (`sycl;cache;mem-handle`,
   `level_zero:1`, lead-run). `register_host_expert` and `register_host_weight`
   with a `malloc`ed (`UNREGISTERED`) pointer are refused. Today they succeed as
   `HOST_MMAP`, `non_owning_external_host`.
-- Lead: the Mistral and GPT-OSS gates (GPT-OSS under `timeout 60`), and the C4
-  Qwen run. The refusal must never fire on a real load.
+- Lead:
+  - the Mistral gate (default context);
+  - the GPT-OSS gate in both arms, `-c 4096` and no `-c`, under
+    `timeout 60`, with C4's pre-registered no-`-c` line;
+  - the C4 Qwen run in both arms.
+
+  The refusal must never fire on a real load.
 
 Tickets to file after review: `-lm none` double residency (§6), and
 `CPU_REPACK` outside the cache (§4.4).
@@ -1515,29 +2090,31 @@ Tickets to file after review: `-lm none` double residency (§6), and
 
 ## Appendix A. Disposition of design-5efe-r1 (69e70c715..de6d0d614 with addendum, 1C/10I/20m)
 
+Rows marked "superseded in part" did not hold as written at rev 3a (design-5efe-r2); Appendix B re-disposes them.
+
 | finding | disposition | where |
 |---|---|---|
-| C-1 C4 acceptance ordered before the ledger split | Fixed per §F2: the split and the WEIGHT-zone sizing that reads it move into C4, one commit with the loader and no C4-only exclusion. Qwen's WEIGHT zone is pre-registered at 64.0-128.0 MB, the pre-size at ≤ 12288 MB, with a falsifier. The non-weight `SYCL_Host` runtime term is named. | §4.4, §7 C4 |
-| I-1 mincore gate cannot measure the property | Fixed per §F2: `cachestat(2)` on the fd, or `mincore` on a test-owned mapping; never the tier's hole. Synchronous `pread` positive control, must-fail mutant arm, 24 MiB hole with a 1 MiB guard band, and an mlock arm. | §4.6, §7 C3 |
+| C-1 C4 acceptance ordered before the ledger split | **Superseded in part by r2 I-1 (pre-size figure) and I-2 (runtime term withdrawn); see Appendix B.** Fixed per §F2: the split and the WEIGHT-zone sizing that reads it move into C4, one commit with the loader and no C4-only exclusion. Qwen's WEIGHT zone is pre-registered at 64.0-128.0 MB, the pre-size at ≤ 12288 MB, with a falsifier. The non-weight `SYCL_Host` runtime term is named. | §4.4, §7 C4 |
+| I-1 mincore gate cannot measure the property | **Superseded in part by r2 I-3 (read-around arms re-scoped to the edge band); see Appendix B.** Fixed per §F2: `cachestat(2)` on the fd, or `mincore` on a test-owned mapping; never the tier's hole. Synchronous `pread` positive control, must-fail mutant arm, 24 MiB hole with a 1 MiB guard band, and an mlock arm. | §4.6, §7 C3 |
 | I-2 multi-segment shape under-specified | Fixed per §F2: one `PROT_NONE` reservation with `MAP_FIXED` segments, one owner, one record, one `munmap`. Map segments round outward; `WILLNEED` and lock segments round inward. Bound: at most one lazy page mapped per edge. | §4.1, §4.3, §4.6 |
 | I-3 stream_dma disposition legitimized streaming | Fixed per §F2: a typed, counted refusal checked before `copy_fn`, routed to the CPU executor. The counter counts any device-bound copy of mapped bytes outside a materialization. The RED asserts the refusal. | §5.3, §7 C4 |
 | I-4 headroom cap universal and discontinuous | Fixed per §F2: `max(total/32, min(29 GiB, total/4))`, one named P3 constant cited as this host's measurement, the `available/2` cliff removed in favour of a named refusal, and 32 and 62 GiB cases plus a monotonicity sweep. | §4.5, §7 C5 |
 | I-5 plan and loader derive "mapped" separately, and in the wrong order | Fixed per §F2: the caps are resolved before the early plan, and one `load_maps_files` fact is published. The planner's `host_backing` is read by the loader through a hook; `create_tensor` never reads `use_mmap` for SYCL weights. | §2.1, §4.3, §4.4 |
 | I-6 host-only REDs need a device; no labels | Fixed per §F2: every test is named with its registration and label. Device tests are `sycl;cache;mem-handle`, `level_zero:1`, lead-run. Host tests link a device-free TU and never touch `stream_dma` or a device `mem_copy`. | §4.1, §7 |
-| I-7 C1 witness re-runs the near-OOM | Fixed per §F2: the witness is killed on the two log lines (t ≈ 3.9 s, before the pre-size). Sampling every 1 s; floor and criteria both 25 GiB = 26214400 kB. | §7 |
+| I-7 C1 witness re-runs the near-OOM | **Superseded in part by r2 m-1 (margin is 4.2 s, not 53 s); see Appendix B.** Fixed per §F2: the witness is killed on the two log lines (t ≈ 3.9 s, before the pre-size). Sampling every 1 s; floor and criteria both 25 GiB = 26214400 kB. | §7 |
 | I-8 two C4 criteria fail on a correct build | Fixed per §F2: the page-cache growth criterion is dropped. Shard 3 gets a pre-registered bound (≤ 1 MiB before, ≤ 256 MiB after). `SYCL_Mapped` is expected at 127615 MiB ± 1%, all SYCL host-sourced weights. | §4.3, §7 C4 |
 | m-1 "pinned 110 GB" | Fixed: 139264 MB committed, 140.0 GB reached, `MemAvailable` fell 141 GiB. | §0 |
 | m-2 expert figures | Fixed: 512 experts, 10 used, about 1.7 MB per matrix, about 2.4 GB per cold token, 1-6 ms per matrix. | §5.2 |
 | m-3 census misses tests | Fixed: `tests/test-cpu-gpu-soa-interaction.cpp:178/180/182` added, and the census gate covers `tests/`. | §4.8, §7 C2 |
-| m-4 `alloc_type::MMAP` understated | Fixed: ten consumers listed, the `::free` meaning recorded, renamed `HOST_NON_USM`, and a `FILE_MAPPED` branch ordered before `::free` with a counter test. | §2.7, §4.1, §4.8 |
+| m-4 `alloc_type::MMAP` understated | **Superseded in part by r2 m-11 (`HOST_NON_USM` replaced by `HOST_MALLOC` and `HOST_OWNED_ELSEWHERE`); see Appendix B.** Fixed: ten consumers listed, the `::free` meaning recorded, renamed `HOST_NON_USM`, and a `FILE_MAPPED` branch ordered before `::free` with a counter test. | §2.7, §4.1, §4.8 |
 | m-5 fd lifetime and replacement gap | Fixed: `dup` of the loader's fd, kept by the owner for `FADV_DONTNEED`; no reopen by path. | §4.1, §4.6 |
-| m-6 loader sites under-enumerated | Fixed: the §4.3 site table (hooks, `weight_buft_supported`, `make_cpu_buft_list`, `mlock_bufs`, the `init_mappings` prefetch) and the loader `lmlock` skip. | §4.2, §4.3, §5.1 |
+| m-6 loader sites under-enumerated | **Superseded in part by r2 m-8 (C4 amends the C1 caps test); see Appendix B.** Fixed: the §4.3 site table (hooks, `weight_buft_supported`, `make_cpu_buft_list`, `mlock_bufs`, the `init_mappings` prefetch) and the loader `lmlock` skip. | §4.2, §4.3, §5.1 |
 | m-7 null path unverified; AOS branch | Fixed: `resolve_or_host` aborts naming the tensor, with the eight callers audited and pinned, and `binbcast.cpp:394/794` cited. Both layout-availability branches are excluded for `SYCL_Mapped`. | §5.3 |
-| m-8 stale th32 pin | Fixed per §F2: pinned at the latest reviewed head, rev 2q `1646da864` (see the lead-check row below); 2s `f364952d3` is noted as the revision that reads the record. Rulings relabelled §T13/§T13a/§T13c. | header, §4.6 |
+| m-8 stale th32 pin | **Superseded in part by r2 m-15 (re-pinned at rev 2u `0bd69e251`); see Appendix B.** Fixed per §F2: pinned at the latest reviewed head, rev 2q `1646da864` (see the lead-check row below); 2s `f364952d3` is noted as the revision that reads the record. Rulings relabelled §T13/§T13a/§T13c. | header, §4.6 |
 | m-9 F1 fold and cold set | Fixed per §F2: the yl3v/7v5c interface is stated, the recommendation removed, and the terms yl3v must read are named so that DeepSeek's cold set is not implicitly empty. | §4.5, §8 |
 | m-10 enum value collision | Fixed per §F2: the next free value at landing; censuses key on names. | §4.1, §4.8 |
-| m-11 allowlist unenforced | Fixed: `test-sycl-raw-mmap-allowlist-source` with today's eight sites, shared with th32 T1. | §4.1, §7 C2 |
-| m-12 C2 RED weak | Fixed: named mutants plus a private `munmap` counter and a registry query; no `mincore`-ENOMEM check. | §7 C2 |
+| m-11 allowlist unenforced | **Superseded in part by r2 m-12 (the gate tokenizes); see Appendix B.** Fixed: `test-sycl-raw-mmap-allowlist-source` with today's eight sites, shared with th32 T1. | §4.1, §7 C2 |
+| m-12 C2 RED weak | **Superseded in part by r2 m-6 (the rev 3a mutant was equivalent); see Appendix B.** Fixed: named mutants plus a private `munmap` counter and a registry query; no `mincore`-ENOMEM check. | §7 C2 |
 | m-13 staging faults can populate lazy pages | Fixed: `MADV_RANDOM` on segment edges bordering lazy ranges covers execution and bounce faults; the gate reads every byte of A and B, edges included. | §4.6 |
 | m-14 GPT-OSS gate lacks `timeout 60` | Fixed per §F2: the canonical command with `-c 4096` under `timeout 60`, scored with `grep -cx`. | §7 C4, C6 |
 | m-15 shard-3 "~0" not pre-registered | Fixed: ≤ 1 MiB before, ≤ 256 MiB after, with the arithmetic. | §7 C4 |
@@ -1549,8 +2126,42 @@ Tickets to file after review: `-lm none` double residency (§6), and
 | addendum I-10 tier and loader inherit the prefix lock | Fixed per §F2a: the tier `mlock(2)`s inward-rounded host-executed segments directly; `SYCL_Mapped` is excluded from `mlock_bufs`; §2.5 is corrected; `lml:2122` becomes a ranged `lock_range` in 5efe (C3). Host-only RED `test-llama-mlock-ranged` with a lazy range before a locked range and a whole-prefix mutant; the tier's arm 2 covers the tier side. | §2.5, §4.6, §5.1, §7 C3 |
 | addendum m-19 one-sided edge advice; residual undercounted | Fixed per §F2a: `MADV_RANDOM` windows on both edges, because read-around is centred on the fault. The loader's whole-file `llama_mmap` read-around is named as a second residual path, given the same record-fed window (C4), and bounded at one shared page per edge per mapping, plus bcachefs extent granularity inside the guard band. | §4.6 |
 | addendum m-20 readahead case could pass vacuously | Fixed per §F2a: arms 5 (forward) and 6 (backward) fault real mapped pages, exit 77 when `read_ahead_kb` is 0, each has a no-advice control twin that must populate the hole, and both are measured with `cachestat` or a test-owned mapping. | §4.6, §7 C3 |
-| §F2a I-9 addendum 2: early plan cannot see the record | Fixed: the flag is first knowable only at `create_tensor`, so C1 adds a per-arch lazy-tensor declaration and pre-fills the record from it plus `weights_map`, after the caps and lazy-mode loops move above the early plan. The early plan skips deferred rows; `create_tensor` checks the record rather than filling it, and aborts on disagreement. C-1's numbers are re-checked and unchanged, because the zones come from the late plan. Early-plan witness lines are pre-registered in C1 and C4. | §3.1, §2.6, §4.3, §4.4, §7 C1, C4 |
+| §F2a I-9 addendum 2: early plan cannot see the record | **Superseded in part by r2 I-5 (declaration keyed by GGUF name, no hparams; static gate) and I-6 (STORAGE writer); see Appendix B.** Fixed: the flag is first knowable only at `create_tensor`, so C1 adds a per-arch lazy-tensor declaration and pre-fills the record from it plus `weights_map`, after the caps and lazy-mode loops move above the early plan. The early plan skips deferred rows; `create_tensor` checks the record rather than filling it, and aborts on disagreement. C-1's numbers are re-checked and unchanged, because the zones come from the late plan. Early-plan witness lines are pre-registered in C1 and C4. | §3.1, §2.6, §4.3, §4.4, §7 C1, C4 |
 | §F2a I-9 addendum 2 (M-1): by-value hand-off | Done: `value(name)` returns `{file_idx, offs, size}` by value, rows are immutable after the pre-fill, and deriving the numbers independently (from `w->offs`) is named as forbidden. | §3.1 |
-| lead check: th32 pin | Pinned at rev 2q `1646da864` per the lead; 2s `f364952d3` is named as the record's consumer, and §3.1's row fields match its §4.1. | header |
+| lead check: th32 pin | **Superseded in part by r2 m-15 (re-pinned at rev 2u `0bd69e251`); see Appendix B.** Pinned at rev 2q `1646da864` per the lead; 2s `f364952d3` is named as the record's consumer, and §3.1's row fields match its §4.1. | header |
 | §M49 note: record in C1 | Done: the record and its two host-only tests are C1 deliverables, so th32 T6 depends on C1 alone. | §3.1, §7 C1 |
 | th32 r15 m-4 (relayed) mlock prefix | Fixed: the tier's own per-segment `mlock` (named, and where), no `llama_mlock` for `SYCL_Mapped`, a residency arm under mlock, and a RED with a lazy range before a locked tensor. | §4.6, §5.1, §7 C3 |
+
+## Appendix B. Disposition of design-5efe-r2 (rev 3a `3763bb164`, 0C/6I/19m), with held rulings
+
+| finding | disposition | where |
+|---|---|---|
+| I-1 pre-size omits the runtime pre-allocate | Fixed: the criterion is split, and both numbers are pre-registered from the configure path. The base is 4 chunks and the runtime is 3 chunks, so the pre-registered line is `Committed 14336.0 MB in 7 chunk(s)`. Without m-2's zeroed DMA pool the same arithmetic gives 8 chunks, 16384.0 MB, and that is stated as the discriminator. | §0, §4.4, §7 C4 |
+| I-2 WEIGHT has non-weight tenants; the runtime term has no path | Fixed per the lead ruling. 5efe routes host-side non-weight requests by role, and HOST_COMPUTE and EXPERT_CACHE go to SCRATCH. §4.4 censuses the 72 host-intent lines in 8 files, and the rev 3a "runtime term" is withdrawn. The criterion is **no `Pinned pool grow_zone: zone 0` line after the pre-size**. The gs:19145 split is resolved by a finding: `ggml_backend_sycl_notify_compute_buffer_sizes` (gs:19103-19146) has no caller, so C4 wires it from `llama_context` through a proc address. SCRATCH's per-graph boundary check (gs:92459, uc:20293) is why cg8j put the `CpuExpertPool` ring in WEIGHT. So C4 adds `alloc_intent::lifetime` {`GRAPH`, `CONTEXT`, `PROCESS`}, and the check counts `GRAPH` records only. **Flagged to the lead:** the lifetime field versus a fifth zone. The boundary with 23mk is stated: 23mk routes device zones. The host-role overlaps with it are **reported to the lead, not resolved**: 23mk's class-H rows; gs:39954 beside its row 56; the DMA pool, which is its row 118; and host SCRATCH folding the VRAM RUNTIME terms (uc:27727-27730). | §4.4, §7 C4 |
+| I-3 arms 5 and 6 cannot reach the hole interior | Fixed: read-around is centred on the fault, with reach `ra_pages/2`, doubled under `FADV_SEQUENTIAL`, where `ra_pages` comes from the bdi's `read_ahead_kb`. Arms 5 and 6 measure the **edge band** `W = max(2 x read_ahead_kb, 2 MiB)`. The interior is measured by arms 1 and 2 only. Each arm exits 77 if the computed reach does not extend two pages past the shared page. | §4.6, §7 C3 |
+| I-4 `MADV_HUGEPAGE` defeats the edge windows | Fixed: `do_sync_mmap_readahead` tests `VM_HUGEPAGE` before `VM_RAND_READ`. So C4 applies `MADV_NOHUGEPAGE` to the `MADV_RANDOM` windows widened to 2 MiB, inside `llama_mmap`'s `HUGEPAGE` advice (`src/llama-mmap.cpp:517-532`). The one-page bound is restated per mapping. A faulting arm with lazy boundaries at 2 MiB + 1 MiB offsets gets a `HUGEPAGE` control mutant. | §4.6, §7 C4 |
+| I-5 the declaration needs a static cross-check | Fixed per the lead ruling. The declaration is 5efe's, and th32 consumes it. It is keyed by exact GGUF name or a single `%d` pattern, and carries no hparams. The final signature is `const std::vector<llama_lazy_tensor_decl> & llama_model_lazy_tensor_decls(llm_arch)`, with `{const char * name; uint32_t rows_per_token; int32_t consumer_layer;}`. An `LLM_TENSOR_INFOS` column was considered and rejected: `gemma3n.cpp:39` creates the same `LLM_TENSOR_PER_LAYER_TOKEN_EMBD` without the flag, so a per-tensor-kind column would be wrong for one arch. `test-llama-lazy-declaration-source` maps call site to entry and back, with both mutants. The runtime abort is kept, and it fires under `-lzm off` too. | §3.1, §7 C1 |
+| I-6 no writer for `STORAGE`; eligibility superseded by addendum 3 | Fixed by folding addendum 3. The pre-fill writes `lazy_eligible` once, from th32 T6a's predicate on the pre-fallback mode. `deferral` is a function of `lazy_eligible` and the SYCL branch: `EAGER` if ineligible, `STORAGE` on the SYCL branch (`llama_model_sycl_hooks_enabled() && resolved_sycl_weight_owner`, lm:2213-2227), otherwise `LAZY_READ` or `EAGER` from the post-fallback mode. §3.1 names which mode feeds each branch. The early plan counts ineligible rows as ordinary weights: a host witness plus C1's lead witness W2. th32 is re-pinned at rev 2u `0bd69e251`. | header, §3.1, §7 C1 |
+| m-1 witness margin | Fixed: the lines are all printed by t = 3.9 s, and chunk 1 is at t = 8.12 s (`run2.log:2827`), a margin of about 4.2 s. `GGML_SYCL_HOST_RESERVE_MB=16384` is added as a belt. | §7 C1 |
+| m-2 idle DMA pool | Fixed: the DMA staging pool is sized 0 when no host weight is `PINNED`-backed, and the `DMA staging pool: 0.0 MB` line is a C4 criterion. | §4.4, §7 C4 |
+| m-3 readers not censused | Fixed: a readers table for `weight_host_bytes`, with each reader's assigned meaning, pinned by the loader source test. | §4.4, §7 C4 |
+| m-4 two headroom expressions; override bypass | Fixed: `resident_room` uses `host_headroom(MemTotal)`, and the "one number" claim is scoped to MemTotal ≥ 116 GiB. `HOST_RESERVE_MB` becomes `min(override, host_ledger_budget())`, so it can lower the budget but never exceed the headroom. `test-sycl-host-budget` covers it. | §4.5, §7 C5 |
+| m-5 getrows retries a refusal | Fixed: `refused_file_mapped` is terminal in the getrows slice loop, so there is one call, one counted refusal, no retry line, and the CPU fallback. `test-sycl-getrows-refusal-terminal` covers it. | §5.3, §7 C4 |
+| m-6 equivalent tier mutant | Fixed: the mutants are the record registered as `HOST_MALLOC`, and the `FILE_MAPPED` branch moved after `zone_managed` into the `sycl::free` fallthrough. | §7 C2 |
+| m-7 preload site | Fixed: `gs:34696-34730` is added to the §4.3 site table and §5.3, and the loader source test pins it. | §4.3, §5.3 |
+| m-8 C1 test vs C4 deletion | Fixed: C4 narrows `lm:2693` to the no-tier case and amends the C1 caps test. | §4.3, §7 C1, C4 |
+| m-9 pre-fill `no_alloc` | Fixed: under `no_alloc` the pre-fill still runs (rows are metadata), `lazy_read.any()` is false, and no range reaches `llama_mmap`. | §3.1, §7 C1 |
+| m-10 `SYCL_Mapped` `alloc_buffer` | Fixed: size 0 returns a dummy buffer, and any other size aborts naming the buft. | §4.3 |
+| m-11 `memory_tier::MMAP` | Fixed: listed in §2.7 and renamed `UNRESOLVED` in §4.8. The census gate covers all four legacy names. `alloc_type::MMAP` is split into `HOST_MALLOC` (`::free`) and `HOST_OWNED_ELSEWHERE` (the KV synthetic base, gs:39615-39619, :39636-39637, released at :38403-38410). | §2.7, §4.8, §7 C2 |
+| m-12 allowlist tokenizer | Fixed: comments and strings are stripped, `mmap (` is matched with a fixture, and a non-listed-file mutant is added. | §4.1, §7 C2 |
+| m-13 AnonPages has no positive control | Fixed: `test-sycl-pinned-meminfo-control` (lead-run) names the counter that pinned host USM lands in. The C4 criterion keys on that counter. If none moves, the test exits 77 and the criterion rests on `Committed` plus `MemAvailable`. | §7 C4 |
+| m-14 residency-test hygiene | Fixed: a non-tmpfs fixture, eviction per arm, `cachestat` through `syscall(__NR_cachestat)`, the `RLIMIT_MEMLOCK` skip, and arm 4 last on a fresh fixture. | §4.6, §7 C3 |
+| m-15 th32 pin | Fixed: re-pinned at rev 2u `0bd69e251`. | header |
+| m-16 map segments | Fixed: exact definitions. Map segments are the union of the buffer's tensor ranges rounded outward, never a complement. `WILLNEED` and lock segments round inward. The pure-function test has a complement mutant. | §4.6, §7 C3 |
+| m-17 counter chokepoints | Fixed: `mem_copy`, `mem_copy_async` and `mem_copy_ptr_async` (`mem-ops.hpp:13-62`), `copy_to_device_async` (uc:10799), and `stream_dma` (uc:13959). | §5.3, §7 C4 |
+| m-18 counter log line | Fixed: `[FILE-MAPPED] counters: stream_dma_refusals=N device_copies_outside_materialization=M`, printed at WARN at load end and at unload. | §5.3, §7 C4 |
+| m-19 non-POSIX builds | Fixed: `load_maps_files` requires the tier to exist in the build (POSIX only). On Windows SYCL it is false, and the no-tier caps path of `lm:2693` applies. | §4.3 |
+| addendum 3 (§F2a I-9): `lazy_eligible` bit | Folded: one bit per row, filled once at the C1 pre-fill by calling T6a's predicate (a): OFF never, AUTO above 4 GiB, ON always, on the pre-fallback mode. Consumers read the bit, and an ineligible row is an ordinary weight. Membership stays flag-based. Data edge: T6a lands no later than C1. | §3.1, §7 C1 |
+| owner ruling: default-context arms | Folded: every Qwen and GPT-OSS gate set has a no-`-c` arm, HARD and scored. The Mistral gate is already default-context. | §0, §7 C4, C6 |
+| correction: uize part 3 landed | Folded: `35ce2e65f`, `812c7d790`, `7259727e6` and `ae4204ba7` are in the base, so a no-`-c` arm expects the `KV overflow re-placed to host tier` line (gs:18382) with a pre-registered N and range. Any refusal line is a FAIL, and so are garbage tokens, an abort, or `Shmem` growth. Qwen: 12 layers, 6144.0 MB, layers 3..47 (real sizing), or 48 layers, 24576.0 MB, layers 0..47 (the over-claim). GPT-OSS on the B50: 7 layers, 1792.0 MB, layers 11..23. | §7 C4 |
+| llama.cpp-0edf: the x4 hybrid KV over-count | Cited, and kept out of 5efe's scope. The Qwen no-`-c` arm's two pre-registered lines discriminate it, but do not fix it. | §7 C4 |
