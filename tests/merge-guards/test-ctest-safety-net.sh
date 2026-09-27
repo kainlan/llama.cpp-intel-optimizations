@@ -126,19 +126,27 @@ entry() {
     printf '{"name":"%s","command":["%s"],"properties":[{"name":"FIXTURES_REQUIRED","value":%s},{"name":"FIXTURES_SETUP","value":%s}]}' \
         "$1" "$2" "$3" "$4"
 }
+# Same, with no fixtures and one LABELS list: name, command, labels array.
+labelled() {
+    printf '{"name":"%s","command":["%s"],"properties":[{"name":"LABELS","value":%s}]}' "$1" "$2" "$3"
+}
 tests_json() { local IFS=,; printf '{"kind":"ctestInfo","tests":[%s]}\n' "$*"; }
 
 PLAIN=$(entry test-something-else /b/test-something-else '[]' '[]')
 LOADER=$(entry test-model-user /b/test-model-user '["gen-weights"]' '[]')
 GENERATOR=$(entry test-make-weights /b/test-llama-archs '[]' '["gen-weights"]')
 DOWNLOAD=$(entry test-fetch-weights /usr/bin/cmake '[]' '["fetch-weights"]')
-tests_json "$PLAIN" "$LOADER" "$GENERATOR" "$DOWNLOAD" > "$TMP/registry.json"
+ENVMODEL=$(labelled test-env-model /b/test-env-model '["model"]')
+tests_json "$PLAIN" "$LOADER" "$GENERATOR" "$DOWNLOAD" "$ENVMODEL" > "$TMP/registry.json"
 
-# The documented exclusion must appear in CLAUDE.md; the mocks do not exercise
-# that, so they get a doc that carries it for whatever the guard's default is.
+# The documented exclusions must appear in CLAUDE.md; the mocks do not exercise
+# that, so they get a doc that carries them for whatever the guard's defaults are.
+sweep_le=$(sed -n "s/^SWEEP_LE_DEFAULT='\(.*\)'$/\1/p" "$G")
 sweep_e=$(sed -n "s/^SWEEP_E_DEFAULT='\(.*\)'$/\1/p" "$G")
+[ -n "$sweep_le" ] || { echo "FAIL: could not read SWEEP_LE_DEFAULT from $G"; exit 1; }
 [ -n "$sweep_e" ] || { echo "FAIL: could not read SWEEP_E_DEFAULT from $G"; exit 1; }
-printf "form 2: -E '%s'\nPR step 3: -E '%s'\n" "$sweep_e" "$sweep_e" > "$TMP/doc-ok.md"
+printf "form 2: -LE '%s' -E '%s'\nPR step 3: -LE '%s' -E '%s'\n" "$sweep_le" "$sweep_e" "$sweep_le" "$sweep_e" \
+    > "$TMP/doc-ok.md"
 
 # GREEN-mock: hermetic positive control for the --ctest-cmd seam. The sweep
 # keeps the plain test and the cmake download setup, which is not a loader,
@@ -193,6 +201,35 @@ rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-clean" --claude-md "$TMP/doc-stale
 [ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc for a stale CLAUDE.md, want 1: $out"; exit 1; }
 grep -qF "DOC DRIFT" <<<"$out" || { echo "FAIL: RED-11 did not name the cause: $out"; exit 1; }
 echo "RED-11 ok (CLAUDE.md drift caught)"
+
+# RED-12: the sweep keeps a test labelled `model` (it loads a model named by
+# the environment). It has no fixture, so only the label makes it a loader.
+tests_json "$PLAIN" "$ENVMODEL" > "$TMP/sweep-envmodel.json"
+mock_json ctest-envmodel registry.json sweep-envmodel.json
+rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-envmodel" --claude-md "$TMP/doc-ok.md" 2>&1) || rc=$?
+[ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc for a swept model-labelled test, want 1: $out"; exit 1; }
+grep -qF "SWEEP RUNS MODEL LOADER: test-env-model (carries label model)" <<<"$out" \
+    || { echo "FAIL: RED-12 did not name the test: $out"; exit 1; }
+echo "RED-12 ok (swept model-labelled test named)"
+
+# RED-13: the SWEEP JSON listing is not JSON. RED-10 covers the registry
+# listing only.
+mock_json ctest-sweep-garbage registry.json garbage.json
+rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-sweep-garbage" --claude-md "$TMP/doc-ok.md" 2>&1) || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: rc=$rc for an unreadable sweep listing, want 2: $out"; exit 1; }
+grep -qF "SWEEP LISTING UNREADABLE" <<<"$out" || { echo "FAIL: RED-13 did not name the cause: $out"; exit 1; }
+echo "RED-13 ok (unreadable sweep listing refused)"
+
+# RED-real-label: against the real build/, drop `model` from the label
+# exclusion. The guard must name the environment-model tests and the G1
+# lifecycle test, none of which has a fixture.
+rc=0; out=$(bash "$G" --build-dir build --sweep-label-exclude 'residency|mem-handle|cache' 2>&1) || rc=$?
+[ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc with label model dropped, want 1: $out"; exit 1; }
+for t in test-model-load-cancel test-autorelease test-backend-sampler sycl-lifecycle-gpu-sequential; do
+    grep -qF "SWEEP RUNS MODEL LOADER: $t (carries label model)" <<<"$out" \
+        || { echo "FAIL: RED-real-label did not name $t: $out"; exit 1; }
+done
+echo "RED-real-label ok (label model dropped: env-model and G1 tests named against build/)"
 
 # RED-real: against the real build/, drop test-save-load-state from the
 # exclusion. The guard must fail and name exactly that test. Read-only -N

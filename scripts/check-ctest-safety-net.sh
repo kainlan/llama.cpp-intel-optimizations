@@ -19,28 +19,37 @@
 # (style: check-merge-source-coverage.sh:30-31).
 #
 # Half 3 (model loaders) derives the set of model-loading tests from the
-# registration, not from a hand list: every test that REQUIRES a fixture (all
-# of this tree's fixtures provide a generated or downloaded model), plus every
-# fixture SETUP test that runs a binary rather than cmake (the generator,
-# test-llama-archs -o, loads each arch it writes). It then fails naming each one
-# the documented sweep still selects. The fixture names are never consulted, so
-# a new upstream fixture or a renamed one is covered without editing this file.
+# registration, not from a hand list. A loader is:
+#   - any test that REQUIRES a fixture (all of this tree's fixtures provide a
+#     generated or downloaded model);
+#   - any fixture SETUP test that runs a binary rather than cmake (the
+#     generator, test-llama-archs -o, loads each arch it writes);
+#   - any test labelled `model`, upstream's label for tests that load a model
+#     named by the environment (LLAMACPP_TEST_MODELFILE), which the fork also
+#     puts on sycl-lifecycle-gpu-sequential (models named by its G1 fixture).
+# It then fails naming each one the documented sweep still selects. Fixture
+# names are never consulted, so a new or renamed upstream fixture is covered
+# without editing this file. A GPU test with no fixture and no `model` label is
+# invisible to this half; label it rather than widen the guess.
 #
-# SWEEP_E_DEFAULT is the exclusion CLAUDE.md documents. The guard also checks
-# that CLAUDE.md carries it in both places the sweep is written out (Running
-# Tests form 2 and Before Submitting PRs step 3), so the checked sweep and the
-# documented one cannot drift apart. --sweep-exclude overrides it for a RED
-# run, which skips the doc check.
+# SWEEP_LE_DEFAULT and SWEEP_E_DEFAULT are the exclusions CLAUDE.md documents.
+# The guard also checks that CLAUDE.md carries both, together, in the two
+# places the sweep is written out (Running Tests form 2 and Before Submitting
+# PRs step 3), so the checked sweep and the documented one cannot drift apart.
+# --sweep-label-exclude and --sweep-exclude override them for a RED run, which
+# skips the doc check.
 set -euo pipefail
-SWEEP_LE='residency|mem-handle|cache'
+SWEEP_LE_DEFAULT='residency|mem-handle|cache|model'
 SWEEP_E_DEFAULT='^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
-BUILD="build" CTEST="ctest" SWEEP_E="$SWEEP_E_DEFAULT"
+BUILD="build" CTEST="ctest" SWEEP_LE="$SWEEP_LE_DEFAULT" SWEEP_E="$SWEEP_E_DEFAULT"
 CLAUDE_MD="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/CLAUDE.md"
 while [ $# -gt 0 ]; do case "$1" in
     --build-dir) [ $# -ge 2 ] || { echo "check-ctest-safety-net: --build-dir needs a value" >&2; exit 2; }
                  BUILD="$2"; shift 2;;
     --ctest-cmd) [ $# -ge 2 ] || { echo "check-ctest-safety-net: --ctest-cmd needs a value" >&2; exit 2; }
                  CTEST="$2"; shift 2;;
+    --sweep-label-exclude) [ $# -ge 2 ] || { echo "check-ctest-safety-net: --sweep-label-exclude needs a value" >&2; exit 2; }
+                 SWEEP_LE="$2"; shift 2;;
     --sweep-exclude) [ $# -ge 2 ] || { echo "check-ctest-safety-net: --sweep-exclude needs a value" >&2; exit 2; }
                  SWEEP_E="$2"; shift 2;;
     --claude-md) [ $# -ge 2 ] || { echo "check-ctest-safety-net: --claude-md needs a value" >&2; exit 2; }
@@ -96,13 +105,16 @@ def loader_reason(t):
     cmd = t.get("command") or [""]
     if p.get("FIXTURES_SETUP") and os.path.basename(cmd[0]) != "cmake":
         return "sets up fixture " + ",".join(p["FIXTURES_SETUP"]) + " by running " + os.path.basename(cmd[0])
+    if "model" in (p.get("LABELS") or []):
+        return "carries label model"
     return None
 
 registry = tests(3, "REGISTRY")
 sweep    = tests(4, "SWEEP")
 loaders  = {t["name"]: loader_reason(t) for t in registry if loader_reason(t)}
 if not loaders:
-    print("MODEL-LOADER SET EMPTY: no registered test requires or generates a fixture -- refusing to pass vacuously",
+    print("MODEL-LOADER SET EMPTY: no registered test requires or generates a fixture or carries label model"
+          " -- refusing to pass vacuously",
           file=sys.stderr)
     sys.exit(2)
 if not sweep:
@@ -117,11 +129,12 @@ if hits:
 print(len(loaders))
 ' 3<<<"$registry_json" 4<<<"$sweep_json") || { rc=$?; [ -n "$loaders" ] && printf '%s\n' "$loaders"; exit "$rc"; }
 
-if [ "$SWEEP_E" = "$SWEEP_E_DEFAULT" ]; then
+if [ "$SWEEP_LE" = "$SWEEP_LE_DEFAULT" ] && [ "$SWEEP_E" = "$SWEEP_E_DEFAULT" ]; then
     [ -f "$CLAUDE_MD" ] || { echo "MISSING CLAUDE.md: $CLAUDE_MD -- refusing to pass vacuously" >&2; exit 2; }
-    documented=$(grep -cF -- "-E '$SWEEP_E'" "$CLAUDE_MD" || true)
+    sweep_args="-LE '$SWEEP_LE' -E '$SWEEP_E'"
+    documented=$(grep -cF -- "$sweep_args" "$CLAUDE_MD" || true)
     if [ "$documented" -lt 2 ]; then
-        echo "DOC DRIFT: $CLAUDE_MD carries -E '$SWEEP_E' $documented time(s); want it in form 2 and PR step 3"
+        echo "DOC DRIFT: $CLAUDE_MD carries $sweep_args $documented time(s); want it in form 2 and PR step 3"
         exit 1
     fi
 fi

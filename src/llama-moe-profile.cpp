@@ -73,9 +73,9 @@ void llama_moe_profile::reset() {
     total_tokens_profiled = 0;
 }
 
-void llama_moe_profile::update(uint32_t il, const int32_t * expert_ids, int n_tokens) {
+void llama_moe_profile::update(uint32_t il, const int32_t * expert_ids, int n_tokens, int n_expert_used_il) {
     if (il < layer_stats.size()) {
-        layer_stats[il].update(expert_ids, n_tokens, n_expert_used);
+        layer_stats[il].update(expert_ids, n_tokens, n_expert_used_il);
         // only count tokens once (use layer 0 as reference)
         if (il == 0) {
             total_tokens_profiled += n_tokens;
@@ -331,13 +331,12 @@ void llama_moe_profiler::flush(struct ggml_backend * backend) {
         // synchronous read from device
         ggml_backend_tensor_get(read.tensor, read_buffer.data(), 0, tensor_size);
 
-        // update profile - tensor layout is [n_expert_used, n_tokens]
-        // so we need to read n_tokens * n_expert_used elements
+        // update profile - tensor layout is [n_expert_used, n_tokens], and the
+        // row width is this layer's own expert count: n_expert_used is per
+        // layer, so the profile-wide value is only the maximum
         const int n_tokens = read.tensor->ne[1];
         const int n_expert_used = read.tensor->ne[0];
-        profile.update(read.il, read_buffer.data(), n_tokens);
-
-        GGML_UNUSED(n_expert_used); // used for documentation
+        profile.update(read.il, read_buffer.data(), n_tokens, n_expert_used);
     }
 
     pending_reads.clear();

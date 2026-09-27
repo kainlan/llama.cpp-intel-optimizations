@@ -80,11 +80,12 @@ ctest --test-dir build -R <name-or-regex> --output-on-failure
 
 # 2. Full suite. `-j 1` is NOT a typo and NOT negotiable -- see below.
 #    Check `uptime` first; never on a loaded machine.
-#    Run the guard first: it derives every model-loading ctest from the
-#    fixture registration and fails naming any that this command still selects.
+#    Run the guard first: it derives the model loaders from the registration
+#    (fixture users, fixture generators, tests labelled `model`) and fails
+#    naming any that this command still selects.
 bash scripts/check-ctest-safety-net.sh --build-dir build
 ctest --test-dir build --output-on-failure -j 1 \
-      -LE 'residency|mem-handle|cache' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
+      -LE 'residency|mem-handle|cache|model' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
 
 # 3. The excluded family, serially, with monitoring. Manually only -- never in
 #    a subagent or background task. NOTE the label is 'cache|mem-handle', NOT
@@ -192,11 +193,26 @@ selected four loaders that need a downloaded model: `test-thread-safety`,
 `test-eval-callback`.
 
 `scripts/check-ctest-safety-net.sh` now derives the loader set from the
-registration. A loader is any test with `FIXTURES_REQUIRED`, or a fixture setup
-that runs a binary rather than cmake. The guard fails naming each loader that
-form 2 still selects, and it fails if this file stops carrying form 2's exact
-`-E`. When it names a new test, add that test to the `-E` here and in the
-script's `SWEEP_E_DEFAULT`, together.
+registration. A loader is any of these:
+
+- a test with `FIXTURES_REQUIRED`;
+- a fixture setup that runs a binary rather than cmake;
+- a test labelled `model`. That is upstream's label for tests that load
+  `LLAMACPP_TEST_MODELFILE` (`test-model-load-cancel`, `test-autorelease`,
+  `test-backend-sampler` and others). The fork also puts it on
+  `sycl-lifecycle-gpu-sequential`, which loads the models its G1 fixture
+  names. Form 2 leaves them out through `-LE '...|model'`.
+
+The guard fails naming each loader that form 2 still selects. It also fails if
+this file stops carrying form 2's exact `-LE ... -E ...`.
+
+When the guard names a new test, change this file and the script together:
+either label the test `model`, or add it to the `-E` here and to the script's
+`SWEEP_E_DEFAULT`.
+
+The guard cannot see a GPU test that has no fixture and no `model` label.
+Give such a test a label that form 2 excludes (`model`, `cache` or
+`mem-handle`); do not trust the guard to find it.
 
 ⚠️ **`test-backend-ops` is not the only unlabelled member of that family.**
 `test-llama-archs` also carries only `main`, and **looping it exhausts host
@@ -1407,7 +1423,7 @@ Common diagnostics: `GGML_SYCL_DEBUG=1` (verbose dispatch), `GGML_SYCL_NAN_CHECK
    on every device, the iGPU included. Prefer `-R <what your change gates>`. For
    a full sweep, run `bash scripts/check-ctest-safety-net.sh --build-dir build`
    first, then form 2 verbatim:
-   `-j 1 -LE 'residency|mem-handle|cache' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'`.
+   `-j 1 -LE 'residency|mem-handle|cache|model' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'`.
    Do not raise `-j` to save time; it is a memory multiplier and has OOM'd this host.
 4. For ggml changes: run `test-backend-ops` on multiple backends. It is a binary, not
    a ctest (`ctest -R test-backend-ops` selects nothing), so run

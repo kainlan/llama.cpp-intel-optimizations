@@ -780,7 +780,10 @@ if (GGML_SYCL)
             RUN_SERIAL TRUE
             RESOURCE_LOCK sycl-lifecycle-device
             TIMEOUT 950
-            LABELS "sycl;lifecycle;g1;hash-pinned")
+            # `model`: it loads the models its G1 fixture names, so the documented
+            # sweep (-LE '...|model') leaves it out and scripts/check-ctest-safety-net.sh
+            # counts it as a loader.
+            LABELS "sycl;lifecycle;g1;hash-pinned;model")
     endif()
 endif()
 
@@ -3147,6 +3150,26 @@ target_include_directories(test-tensor-class PRIVATE ${PROJECT_SOURCE_DIR}/src)
 set_tests_properties(test-tensor-class      PROPERTIES LABELS "main;tensor")
 set_property(TEST test-tensor-class PROPERTY
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
+
+# The MoE profiler must stride each captured layer by its own expert count,
+# which upstream made per layer (llama.cpp-n77l). Host-only: the tensors sit in
+# a CPU buffer over a static array, with no registry, device or model.
+llama_build_and_test(test-moe-profile-stride.cpp)
+target_include_directories(test-moe-profile-stride PRIVATE ${PROJECT_SOURCE_DIR}/src)
+set_tests_properties(test-moe-profile-stride PROPERTIES LABELS "main;moe")
+set_property(TEST test-moe-profile-stride PROPERTY
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
+
+# llama_mmap keeps MADV_HUGEPAGE off the lazily read ranges (llama.cpp-n77l),
+# checked through the VmFlags in /proc/self/smaps. Linux-only; exits 77 when
+# THP is unavailable.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    llama_build_and_test(test-mmap-lazy-hugepage.cpp)
+    target_include_directories(test-mmap-lazy-hugepage PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    set_tests_properties(test-mmap-lazy-hugepage PROPERTIES LABELS "main;mmap" SKIP_RETURN_CODE 77)
+    set_property(TEST test-mmap-lazy-hugepage PROPERTY
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
+endif()
 
 # 178 assertions over the paged-KV block manager, block table, defragmentation
 # planner and prefix cache. Two things had to be true before this could be

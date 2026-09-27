@@ -516,10 +516,19 @@ struct llama_mmap::impl {
         // With 2MB pages, a 3.9GB model needs ~2000 pages (fits in L2 TLB) vs ~1M 4KB pages.
         // Requires THP in "madvise" or "always" mode. Returns EINVAL when THP is "never".
         // Skip for NUMA: THP can merge pages across NUMA boundaries, defeating locality.
+        // Not over the lazy ranges either: a fault in a VM_HUGEPAGE area reads a whole
+        // 2 MiB folio before POSIX_MADV_RANDOM is honoured, so each on-demand row read
+        // would pull 2 MiB. Each range is shrunk to whole pages so that no page holding
+        // lazy bytes is advised.
         if (!numa) {
-            if (madvise(addr, file->size(), MADV_HUGEPAGE)) {
-                LLAMA_LOG_WARN("warning: madvise(MADV_HUGEPAGE) failed: %s\n",
-                        strerror(errno));
+            const size_t page_size = sysconf(_SC_PAGESIZE);
+            for (const auto & range : ranges_complement(lazy_ranges, file->size())) {
+                const size_t beg = (range.first + page_size - 1) & ~(page_size - 1);
+                const size_t end = range.second == file->size() ? range.second : range.second & ~(page_size - 1);
+                if (beg < end && madvise((char *) addr + beg, end - beg, MADV_HUGEPAGE)) {
+                    LLAMA_LOG_WARN("warning: madvise(MADV_HUGEPAGE) failed: %s\n", strerror(errno));
+                    break;
+                }
             }
         }
 #endif

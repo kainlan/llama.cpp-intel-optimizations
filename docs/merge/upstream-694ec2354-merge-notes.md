@@ -236,3 +236,36 @@ The merge was built in full (`sycl-build.sh`, 266/266 steps) before these runs.
 - **`test-sycl-static-storage-audit`:** passed, 1 test OK in 689 s at load
   average ~80. Under ctest it times out, because its registered TIMEOUT is
   300 s. The script was therefore run directly.
+
+## Review follow-ups (review-n77l-merge, 0 Critical / 0 Important / 5 Minor)
+
+Three minors are fixed in the follow-up commit. The other two are filed:
+M2 (the split buft ignores `main_device`) as llama.cpp-oajm, and M5 (the
+`prec_set_src` F32-src1 route) as llama.cpp-pj53. The SYCL `mmap_support = 0`
+question is llama.cpp-5efe.
+
+- **M1, `src/llama-moe-profile.cpp`.** `flush()` read each captured
+  expert-id tensor at the profile-wide `n_expert_used`, which is now the
+  maximum over layers. A narrower layer was read past its own ids, and at the
+  wrong offset from its second token onward. `llama_moe_profile::update()`
+  now takes the row width, and `flush()` passes the tensor's `ne[0]`.
+  `test-moe-profile-stride` is host-only; its tensors sit in a CPU buffer over
+  a static array. It captures a full-width layer, then a half-width one, and
+  failed before the fix with layer 1's selections at 8 instead of 4, four of
+  them layer 0's stale expert 7.
+- **M3, `src/llama-mmap.cpp`.** `MADV_HUGEPAGE` now covers only
+  `ranges_complement(lazy_ranges)`, with each range shrunk to whole pages.
+  Before, a THP fault in a lazy range read a whole 2 MiB folio, despite
+  `POSIX_MADV_RANDOM`. `test-mmap-lazy-hugepage` reads the per-VMA flags from
+  `/proc/self/smaps`. It failed before the fix with `hg` on the lazy VMA
+  (`rd mr me ms rr sd hg`), including the pages holding the range's
+  unaligned ends.
+- **M4, safety net.** The guard now also counts a test labelled `model` as a
+  loader. That covers `test-model-load-cancel`, `test-autorelease` and
+  `test-backend-sampler`, which load `LLAMACPP_TEST_MODELFILE`.
+  `sycl-lifecycle-gpu-sequential` now carries `model` too. The documented
+  sweep's label exclusion is `-LE 'residency|mem-handle|cache|model'`, and the
+  guard ties the whole `-LE ... -E ...` string to CLAUDE.md. The driver adds
+  a mock RED for a model-labelled test and a mock RED for an unreadable sweep
+  listing, plus a real-build RED: drop `model` from the `-LE`, and the guard
+  names all four tests.
