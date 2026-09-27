@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14h. Author: impl-moua, 2026-09-27. The revisions answer seventeen reviews:
+Design, revision 7.14i. Author: impl-moua, 2026-09-27. The revisions answer eighteen reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -104,6 +104,10 @@ Design, revision 7.14h. Author: impl-moua, 2026-09-27. The revisions answer seve
   Minor), the lead's rulings on it (§M38), §G1b, §Z20 where it binds this design, and the note
   that two of the thirteen scratchpad sites are dead, recorded in §6.24. Revision 7.14h is one
   commit on top of 7.14g (`3d782e264`).
+- design review r17 (design-moua-r17 on `ee484eb5b..c345ddae5`: 0 Critical, 5 Important, 10
+  Minor), the lead's rulings on it (§M41), §M39 on 7.14h's three notes, §M40 (the compute
+  slot's ordering), §G1c (the hard uwlx edge), and the relays from 23mk 4.10, 1oxa rev 15 and
+  zhcn 5.16, recorded in §6.25. Revision 7.14i is one commit on top of 7.14h (`c345ddae5`).
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
 one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2, §R, §RING, §E,
@@ -112,7 +116,8 @@ one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2,
 §M11, §M11b, §Z8, §Z9, §Z9a, §M12, §Z10, §X9, §Z11, §M13, §M13a, §Z12, §Z13, §M14, §Z14, §M15,
 §V11, §M16, §M16a, §M16b, §M17, §M17a, §M18, §Z15, §M18.3a, §M19, §M20, §V12, §M21, §M22, §M23,
 §M24, §M25, §V13, §M26, §M27, §M26a, §M28, §M29, §M29a, §V14, §M30, §M31, §M31a, §M32, §M33,
-§V15, §V15a, §V16, §V16a, §M34, §M35, §G1, §G1a, §V17, §M36, §M37, §Z20, §M38, §G1b). §M11a is a
+§V15, §V15a, §V16, §V16a, §M34, §M35, §G1, §G1a, §V17, §M36, §M37, §Z20, §M38, §G1b, §M39, §G1c,
+§M40, §M41). §M11a is a
 relay line inside §Z8, not a section, and is cited as §Z8 I-2 (r12 m-14). This document cites it
 as "rulings §X".
 **Where this document paraphrases a ruling and differs from the file, the file wins.**
@@ -203,15 +208,20 @@ Every file:line below names its revision.
   (regions are multi-extent). Only holes smaller than one slot are a limit (§2.9).
 - **The load plans its first context's room (rulings §M32 C-1, §M38 C-1).** The pack charges
   each expert it admits to a device its weight bytes plus its share of the ring's rows, sized by
-  the experts resident on that device (the batched executor refuses a non-local expert), and
-  the load reserves the rest of the first context's head slots as a `FIRST_CONTEXT` pending
-  range in the shared zone, which the pack cannot fill and which the model's first context on
-  the device draws from (§2.4.2 (b), step 3). **The reservation has one source:** it is the
-  head-slot set that the context transaction's fit places, from the same function
-  (`context_demand_records`, §2.4.3), evaluated at the load envelope's shape, never a list
-  kept beside it. The envelope carries the caller's `n_ctx` from llama.cpp-fkpg (a), so L4 does
-  not land before fkpg (a) (§4). RUNTIME has no floor on an arena device: its capacity is the
-  planned sum of its named consumers (rulings §M32 I-2, §M38 C-2).
+  the experts resident on that device (the batched executor refuses a non-local expert), and the
+  load reserves the rest of the first context's head slots as a `FIRST_CONTEXT` pending range in
+  the shared zone, which the pack cannot fill and which the model's first context on the device
+  draws from (§2.4.2 (b), step 3). **The reservation has one source:** it is the head-slot set
+  that the context transaction's fit places, from the same function (`context_demand_records`,
+  §2.4.3), evaluated at the load envelope's shape, never a list kept beside it. The envelope
+  carries the caller's `n_ctx`, `n_seq_max`, flash-attention choice and KV types from
+  llama.cpp-fkpg (a), so L4 does not land before fkpg (a) (§4), and every term is evaluated from
+  the pack's inputs, never from a partial placement: a bound before the pack, the admitted value
+  after it (rulings §M41 I-2, I-3). zhcn's compute slot is measured by one function twice: Ĉ on
+  the record-pass probe bounds the pack, and c(P) at the admitted placement is what the
+  reservation records, so c(P) > Ĉ refuses the load by name (rulings §M40). RUNTIME has no floor
+  on an arena device: its capacity is the planned sum of its named consumers (rulings §M32 I-2,
+  §M38 C-2).
 - **Optional copies held by recorded graphs.** On jehw HEAD a recorded graph leases the WOQ
   copies it reads for the graph's life, so jehw's predicate calls them not yieldable, and KV
   demotes while they hold VRAM. The fit plans with exactly that, and a WARN names the leased
@@ -358,7 +368,7 @@ into `zone_alloc`. `zone_alloc` has no role parameter today (master `unified-cac
 | `WEIGHT` | `alloc_role::WEIGHT`. That includes the runtime expert-cache fills, which are `alloc_role::WEIGHT` with `runtime_category::EXPERT_CACHE` (vram-pool.cpp:81, unified-cache.cpp:18484): on-demand expert rows, which are real weights. It also includes a `SYCL<n>` weight buffer that overflows RUNTIME into the shared zone (r2 m2, below). | weight | TLSF `allocate` (today's behaviour), tag `TAG_WEIGHT`; after the optional ladder exists, first a weight-side hole, then the gap front (§2.3.3) |
 | `OPTIONAL` | optional layout copies (jehw's `optional_layout`). Two kinds (rulings §M18.3a): an unplanned copy, outside every live model's admitted plan, which an arena device no longer stages (§2.4.2 (b), "The range bytes"); and a planned **OPTIONAL** copy, a duplicate layout whose primary layout is resident on the same device. A planned **PRIMARY** copy (every other planned copy) is `WEIGHT`, never optional, never an eviction or yield candidate, and freed only at unload. A planned OPTIONAL copy is never an eviction candidate either; it is yieldable only to a context's KV admission, through the yield path (§2.4.2 step 5) | unplanned: weight frontier; planned OPTIONAL: inside its model's `WEIGHT` range, where the fit sees it as a buried tenant (§2.9) | unplanned: `allocate_gap_front`, tag `TAG_OPTIONAL`; planned OPTIONAL: `allocate_within({LOAD, txn}, WEIGHT, ...)`, tag `TAG_OPTIONAL` |
 | `KV_REGION` | the per-(ContextId, device) KV region, including each layer's persistent packed-K sidecar as a companion slot when the sidecar is enabled (§2.4.1) | context | the extents chosen by `kv_region_fit` (§2.4) |
-| `CONTEXT` | the ring's activation and output slots, per (context, device) (§2.7; rulings §M32 I-1); zhcn's compute chunks and fattn slot; the recurrent state (§2.4.4, r4 I9); the context-lifetime cohorts beni routes here (the oneDNN activation half, `graph_input_stage`, the oneDNN Graph scratch) | context | a reserved slot, claimed by index (§2.3.2, §2.4.3) |
+| `CONTEXT` | the ring's activation and output slots, per (context, device) (§2.7; rulings §M32 I-1); zhcn's compute chunks and fattn slot; the recurrent state (§2.4.4, r4 I9); the context-lifetime cohorts beni routes here (the oneDNN activation half, `graph_input_stage`); the oneDNN Graph scratch, whose one producer is 23mk's function (rulings §M41 m-6) | context | a reserved slot, claimed by index (§2.3.2, §2.4.3) |
 | `TRANSIENT` | every **non-WEIGHT role** that names `WEIGHT` or `KV`: COMPUTE/STAGING scratch (ggml-sycl.cpp:46120, :97965; mmvq.cpp:16863; common.hpp:6658), jzvq's MXFP4 MoE TG caches and fattn workspaces, persistent buffers (unified-kernel.cpp:4890, refused under an arena per 23mk Q5), and the forced-split fattn packed-K request (fattn.cpp:1640). `unified-cache.cpp:21455` and `scratch_pool` (`:20629`) are dead code that 23mk deletes | context | a reserved slot, claimed by index; the demand functions are beni's and jzvq's (§2.4.3) |
 
 **`backend-buffer-kv-zone` keeps its buffer's role (r2 m2).** Standard `SYCL<n>` buffers carry
@@ -894,7 +904,7 @@ written:
     draws a pending range, which is the fence. It is cleared at exactly four points, each
     under the tail's group mutex: an admit whose plan covers part of it, the short admit that
     takes the surplus (it clears the range and trims the extent), the last model's unload, and
-    a rollback that leaves no live model (1oxa rev 13 `47206cb` L59-61; §V17 m-10).
+    a rollback that leaves no live model (1oxa rev 15 `dd678c3` L122-124; §V17 m-10).
     1oxa rev 11 recorded the whole trailing extent under `{LOAD, txn}`; §V14 I-E replaces that.
     **Four rules (r15 m-3; §V17 m-10 adopts (a) and withdraws (d)):** (a) the record
     **replaces** per `(term, device, TLSF)`, like a `{LOAD, txn}` record (the replace rule
@@ -1970,8 +1980,14 @@ L0, and a failed revalidation under L0 is a bug, not a race.
          required tensor throws the same way), resolves the request's site with
          `resolve_create_site` (item 3), appends `{name, flags, site}` to the loader's create
          record and returns the loader's own meta tensor. It takes no context, creates nothing,
-         registers nothing and leaves `n_created` and `size_data` alone. The probe is destroyed
-         after the pass, and the meta pointers it stored go with it. Upstream's
+         registers nothing and leaves `n_created` and `size_data` alone. **The probe outlives
+         the pack (rulings §M40; zhcn 5.16 relay):** zhcn's measure reads it twice, for Ĉ
+         before the pack and for c(P) at the admitted placement (step 3), so it lives until
+         c(P) is measured and is destroyed inside the load's transaction, on the commit path
+         and on every rollback path, by a scope guard. The meta pointers it stored go with it.
+         7.14h destroyed it after the record pass. zhcn gives a tied or `TENSOR_DUPLICATED`
+         name a per-site meta clone of its own and restores every dummy `buffer` to null behind
+         its own scope guard, so the record above is unchanged. Upstream's
          `llama_params_fit` makes the same kind of pass with `no_alloc` (the fork disables it
          under SYCL); a record pass builds no context at all. The record is in `create_tensor`'s
          order, which is each context's tensor order.
@@ -2095,30 +2111,57 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            (`:430-452`) by `n_expert` (`:465-467`), which is never less. Static layer-first
            packing places whole layers (`unified-cache.cpp:24300-24320`), so on both merge-gate
            models the densest tensor has `local(t)` = `n_expert` and the two agree; H7ap asserts
-           that, with a non-uniform fixture and a partial layer as the RED. **It has its own
-           load-time setter (rulings §M32 I-3), and its store is keyed by (model, device)
-           (rulings §M38 I-2):**
-           `unified_cache_set_planned_pp_moe_onednn_weight_slot_bytes(model, dev, bytes)` writes
-           the entry for that model on that device, and the getter and the executor read the
-           dispatching context's model's entry. The source-contract gate maps the setter to
-           `MOE_ONEDNN`. It is not one of the device-global ring setters, which no arena path
-           reaches (H7z (aj), §2.7), and it is the term's one load-time publication; the
+           that, with a non-uniform fixture and a partial layer as the RED. **It is a record of
+           the load's own transaction, keyed by (model, device), and it has no setter (rulings
+           §M38 I-2; zhcn 5.16 relay):** step 3 writes the model's entry for the device into
+           the weight-slot store, `g_moe_onednn_weight_slots[(model, dev)]`, as a pending entry
+           of the load's transaction, beside the slot's `{LOAD, txn}` range. The commit (§2.3.3
+           A4) makes it the model's, the load's rollback erases it, and the model's unload
+           erases it after the slot's release (§2.7). Those four are the store's only writers.
+           The RUNTIME getter and the executor read the dispatching context's model's entry;
+           the dry run (step 5) reads the committed entries plus this load's pending one. No
+           `unified_cache_set_planned_*` function exists for the term, so no path outside a
+           load's transaction, and no other model's load, can write an entry. H7z (aj)'s writer
+           gate fails on a fifth writer site. The slot is not one of the device-global ring
+           setters, which no arena path reaches (H7z (aj), §2.7), and the
            `unified_cache_set_planned_pp_moe_onednn_scratch` call at `:15961-15967` is deleted
-           on arena devices. 7.14f and 7.14g gave the setter a `(dev, bytes)` signature over a
-           per-device store, so a second model's load overwrote the first model's entry, the
-           last writer winning, for a fact that is per (model, device) (r16 I-2). The slot
-           itself is one per (model, device), planned and drawn inside that model's own load
-           before `finalize_end` under `{MODEL, id}`, and released at the model's unload (§2.7).
-           **Where a later load's D terms go (rulings §M38 I-2):** the load that lays out the
-           arena on a device sizes RUNTIME to its own D terms (step 4). A later load on that
-           device cannot grow RUNTIME, because a rebuild that meets live bytes refuses (below).
-           So its pack charges each of its D terms against RUNTIME's free room where the term
-           fits there, and otherwise against the shared zone's capacity, beside its `WEIGHT`
-           ranges, and records the term's range under `{LOAD, txn}` either way, retagged
-           `{MODEL, id}` at the commit (§2.3.3 A4) and drawn inside the load. Another model's
-           entries and ranges are untouched. So RUNTIME plus the later loads' shared-zone D
-           ranges hold exactly the sum, over the live models, of their D terms, and H9's
-           second-load arm scores it with last-writer-wins as its RED (§3.1);
+           on arena devices. 7.14f and 7.14g gave it a setter with a `(dev, bytes)` signature
+           over a per-device store, so a second model's load overwrote the first model's entry,
+           the last writer winning, for a fact that is per (model, device) (r16 I-2). 7.14h
+           keyed the setter by (model, dev), which still left a setter any path could call
+           (zhcn 5.16 relay); 7.14i deletes it. The slot itself is one per (model, device),
+           planned and drawn inside that model's own load before `finalize_end` under `{MODEL,
+           id}`, and released at the model's unload (§2.7).
+           **Where a later load's zone terms go (rulings §M38 I-2, §M39 (1), §M41 I-4 (a)):**
+           the load that lays out the arena on a device sizes each zone to its own terms (step
+           4): RUNTIME to its D terms, and, once §M37 Q3 has removed their floors, ONEDNN and
+           SCRATCH to theirs. A later load on that device cannot grow any zone, because a
+           rebuild that meets live bytes refuses (below). So its pack charges each of its P and
+           D terms, in every zone, against that zone's free room where the term fits there, and
+           otherwise against the shared zone's capacity, beside its `WEIGHT` ranges. Either way
+           the term is a MODEL-owned range, recorded under `{LOAD, txn}`, retagged `{MODEL, id}`
+           at the commit (§2.3.3 A4) and drawn inside the load, and the term's consumer draws
+           from that range. Another model's entries and ranges are untouched. So each zone plus
+           the later loads' shared-zone ranges for its terms hold exactly the sum, over the live
+           models, of their terms in that zone. **The case that widened the rule (r17 I-4
+           (a)):** once the ONEDNN floor is gone, GPT-OSS 120B lays ONEDNN out at its W,
+           23592960 B. Mistral 7B then loads on the same device, with W = 14336 · 4096 · 2 =
+           117440512 B, master's 112.0 MB reorder half. At master the 256 MiB floor served both.
+           7.14h's rule covered RUNTIME only, so Mistral's step 4 tried to grow ONEDNN over
+           GPT-OSS's live bytes and the load was refused with "cannot be rebuilt" (below), a
+           refusal of a load that fits. Now ONEDNN has no free room, since GPT-OSS's W fills it,
+           and Mistral's W is a 117440512 B `{MODEL, Mistral}` range in the shared zone. The
+           same holds for SCRATCH's terms, 23mk's P and D terms and `moe_ptr_table` (rulings
+           §M39 (1)). Rulings §M41 I-4 (a) names RUNTIME's free room; for an ONEDNN or SCRATCH
+           term this design reads that as the term's own zone's free room, the room its consumer
+           draws from, and flags the reading to the lead (§6.25).
+           **A term that fits in neither refuses the load by name,** before any buffer type is
+           chosen, like any placement that does not fit (the admitting stage, below):
+           `[LOAD-PLAN] term %s of zone %s on device %d does not fit: need %zu B, zone free %zu
+           B, shared zone free %zu B (refused)`. It never falls through to a draw outside the
+           arena: the executor's presence check (§2.7) finds no slot for a model whose load was
+           refused, since that model does not exist. H9's second-load arms score both the
+           placement and the refusal, for RUNTIME, ONEDNN and SCRATCH (§3.1);
          - **the ring's rows for the model's first context (rulings §M32 C-1 (a), (b)).** As the
            pack admits an expert of tensor t to a device that executes t through oneDNN PP,
            `local(t)` rises by one. The ring's activation slot is align256(align64(n₀) · max
@@ -2131,16 +2174,46 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            point. On the merge gates the totals are **1132462080 B** on GPT-OSS 120B (377487360
            + 754974720) and **1610612736 B** on Qwen3.5-35B-A3B (536870912 + 1073741824),
            reached with the first whole layer each device packs;
-         - **the rest of the model's first context's head slots (rulings §M32 C-1 (a), §M38
-           C-1).** At the first placement that makes a device need them, the pack charges the
-           device's reservation **the head-slot set of the model's first context on that device,
-           from the one function the context transaction's fit uses**:
+         - **the rest of the model's first context's head slots (rulings §M32 C-1 (a), §M38 C-1,
+           §M41 I-2).** The device's reservation holds **the head-slot set of the model's first
+           context on that device, from the one function the context transaction's fit uses**:
            `context_demand_records(model, dev, shape)`, the producer set that every context
-           transaction's step 2 reconciles (§2.4.3), evaluated at the load envelope's shape,
-           which is its `n_ctx`, n₀ for `n_ubatch`, and the flash-attention rule, KV types and
-           `n_seq_max` of `llama_context_default_params()` (rulings §Z20 Q1). The reservation is
-           the byte sum of that set's slots on the device, less the ring rows, which the set
-           holds at the same `local(t)` and which the pack charges as it admits experts (above).
+           transaction's step 2 reconciles (§2.4.3), evaluated at the load envelope's shape.
+           **The envelope is the caller's (rulings §M41 I-3):** its `n_ctx`, `n_seq_max`,
+           flash-attention choice and KV types, all carried by llama.cpp-fkpg (a)'s transport,
+           and n₀ for `n_ubatch`. 7.14h took `n_seq_max`, the flash-attention rule and the KV
+           types from `llama_context_default_params()` (rulings §Z20 Q1), whose `n_seq_max` is
+           1, while llama-server's default launch runs four sequences (`n_parallel` 4,
+           `merge-gates/server-g4-default-parallel-b0.log:23`; `n_seq_max = 4` at `:1801`). The
+           recurrent state scales with `n_seq_max`, so on Qwen it is 4 × 65863680 = 263454720 B
+           there, and 7.14h's reservation was 197591040 B short on a default server launch,
+           whose pack fills the zone, so the first context was refused (r17 I-3). The server's
+           context is now sized, not refused: the larger reservation demotes more experts to the
+           host, which rulings §M41 I-3 accepts as §M39 (2) does, and C10 pre-registers the
+           count (§3.3). A context that later asks for more than the transported shape follows
+           §M39 (1): its own transaction draws context-owned ranges, or it is refused by name.
+           **The set is evaluated from the pack's inputs, never from a partial placement
+           (rulings §M41 I-2):** the inventory, `dev_layer`, the forced flags, the model's
+           hparams and the envelope. Each producer declares that it reads only those, and the
+           set is evaluated twice, as the compute slot is (below). **The bound, before the
+           pack:** each term at its largest over what the inputs allow on the device, so
+           `moe_control` wherever `dev_layer` gives the device a MoE layer, `onednn_pp_a`'s
+           `max_K` over every eligible weight of the device's layers, and the Graph scratch and
+           the recurrent state over the device's layers. The pack's capacity on the device is
+           the zone less that bound. **The admitted value, after the pack, inside the same load
+           transaction:** the same function at the admitted placement, which the reservation
+           records, and the bound less the admitted value goes back to the shared zone as free
+           room, never held idle (P4). Every term but the compute slot is a maximum or a sum
+           over the device's resident subset of what the bound ranges over, so the admitted
+           value is at most the bound by construction, and the step-5 witness checks it. The
+           attention-shaped terms and the recurrent state read `dev_layer`, which the pack does
+           not move, so for them the two evaluations agree; `moe_control` is 0 on a device the
+           pack left with no GPU expert. 7.14h charged the set "at the first placement that
+           makes a device need them", inside the one-pass pack, which places dense weights
+           first, so `moe_control` read 0 there and the reservation was short by 16640 B on
+           GPT-OSS 120B and 33024 B on Qwen (r17 I-2). The reservation is the byte sum of that
+           set's slots on the device, less the ring rows, which the set holds at the same
+           `local(t)` and which the pack charges as it admits experts (above).
            **The load names no term.** 7.14f and 7.14g kept a hand list here (`mmid_workspace`,
            `moe_control`, `onednn_pp_a`, `set_rows_stage`, `onednn_graph_scratch`,
            `onednn_scratchpad` and zhcn's compute slot) that omitted the recurrent state and
@@ -2169,13 +2242,41 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            capacity on a device is the `WEIGHT` zone less the device's reservation, so the pack
            cannot spend the bytes the first context needs, and the model's first context on the
            device takes them over at its transaction (§2.4.2 step 5). **zhcn's compute slot at
-           load (rulings §M37 Q1, §Z20):** zhcn runs its measure pass once at the load envelope,
-           at n₀ and the envelope's `n_ctx`, through a transient measure-only context that owns
-           no buffer, makes no unified-cache allocation, registers no live context of the model,
-           freezes nothing and is destroyed inside the load before the commit, and that value
-           sizes the reservation's compute slot. Until zhcn lands it, H7ap's first-context arm
-           injects master's context-time value at the gate shape as a fixture constant, and the
-           arm's output labels it as one, never as a measured load value (§3.1);
+           load: one measure, three call sites (rulings §M37 Q1, §Z20, §M40).** The compute
+           slot depends on the placement, since tiering a layer to the host adds scheduler
+           splits, and the pack's capacity must leave room for it before the placement exists.
+           So zhcn's one measure function runs, at n₀ and the envelope's `n_ctx`, through a
+           transient measure-only context that owns no buffer, makes no unified-cache
+           allocation, registers no live context of the model, freezes nothing and is destroyed
+           inside the load, at three call sites. Each call site names its input, and there is
+           no second implementation:
+           1. **Ĉ, before the pack:** on the record-pass probe (item 2 above), each create-set
+              entry that is not forced off SYCL carrying a size-0 dummy buffer of its device's
+              buffer type, which is every such entry on its device. **The pack's capacity on a
+              device is the `WEIGHT` zone less the rest of the reservation's bound (above) and
+              Ĉ.**
+           2. **c(P), after the pack, inside the same load transaction:** on the same probe,
+              each entry carrying the dummy buffer of the buffer type the admitted plan gives
+              its site.
+              **The reservation records c(P)**, and Ĉ − c(P) goes back to the shared zone as
+              free room, never held idle (P4). **c(P) > Ĉ refuses the load by name,**
+              `[LOAD-PLAN] compute-slot-exceeds-probe-bound: device %d, placed %zu B > probe
+              bound %zu B (refused)`, before any buffer type is chosen. The `FIRST_CONTEXT`
+              range is recorded after this measure, so the compute part it holds is c(P) (zhcn
+              5.16 relay (a)).
+           3. **The late check, at the late inventory (`llama-model.cpp:2410`):** on the real
+              model's tensors, with the buffer types `create_tensor` chose. It compares with
+              c(P) under the one late-check rule: larger refuses the load with the late string
+              (term `compute`), smaller is admitted with the shrink WARN.
+           Each load prints, once per device, at WARN so a default run shows it,
+           `[FIRST-CONTEXT] dev=%d compute_probe=%zu compute_placed=%zu splits_probe=%d
+           splits_placed=%d`. **c(P) ≤ Ĉ is the unproved step:** a split's input copies land in
+           the device's compute buffer, so a tiered placement can in principle measure larger
+           than the all-device probe. It is pre-registered on every gate model (§3.3 C11). If a
+           gate refuses, Ĉ gains a split-copy bound term, and the refusal is never loosened.
+           Until zhcn lands the measure, H7ap's first-context arm injects master's context-time
+           value at the gate shape as a fixture constant for both Ĉ and c(P), and the arm's
+           output labels it as one, never as a measured load value (§3.1);
          - not `onednn_scratchpad`: **it is class C (rulings §M29a, amending §M29 and §M19),**
            the oneDNN primitives' own user scratchpad, consumer (b), charged at the context
            transaction as a head slot in the context's `REGION` headroom, and the load stage
@@ -2189,7 +2290,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            `REGION`), so master counts W twice. **The site is not deleted (rulings §M32 I-4,
            §M33 I-G):** 23mk's §4 commit re-points it to `onednn_pp_w`'s value function and
            renames the store for W (`unified_cache_set_planned_onednn_pp_w_bytes`; 23mk §4.3 at
-           `e4f08213a`), and moua adopts the names. 7.14e said the value was deleted from both
+           `003bce159`), and moua adopts the names. 7.14e said the value was deleted from both
            sites, which left the W getter 0 and one fact with two sources (r15 I-4);
          - `pp_pipeline` (RUNTIME), **one term, whose value function is 23mk's (rulings §Z15;
            23mk 4.7b `e81dc2327`)**: the allocation site's own bytes, `pp_pipeline_weight_bytes`
@@ -2217,7 +2318,18 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            `c69d5774d`) at the envelope's shape, and 0 unless both `GGML_SYCL_XMX_MOE_SORTED`
            and `GGML_SYCL_XMX_MOE_PREALLOC` are set (`ggml-sycl.cpp:67008-67018`). Its setter
            maps to that enum value like any other, and a larger request at a later context takes
-           the site's existing declared fallback with a WARN that names the term;
+           the site's existing declared fallback with a WARN that names the term. **The object
+           is per backend context, the term per (model, device) (rulings §M41 m-9):**
+           `ctx.xmx_moe_buffers` (`common.hpp:7012`; ensured at `ggml-sycl.cpp:66852`) is a
+           member of each backend context, so a second context's equal-sized draw finds the
+           term's bytes held by the first context's buffers. L4+L6 sets `forbid_vram_zone_spill`
+           on both draws (`common.hpp:6855`, `:6887`; neither sets it at `c69d5774d`, so today a
+           miss would go raw), so that draw returns false,
+           `ggml_sycl_xmx_moe_ensure_runtime_buffers` takes its existing false return with its
+           WARN (`:66862-66864`), and the sorted wrapper, which ignores that return
+           (`:67016-67018`), runs the second context without the prealloc, the path it takes
+           when `GGML_SYCL_XMX_MOE_PREALLOC` is unset. The term is not sized per context, since
+           beni's conversion makes the buffers per-context head slots and deletes it;
          - and 23mk's placement-dependent terms (§2.4.5), `moe_ptr_table` (the **only** term
            for the MoE pointer tables) among them.
          A forced-off tensor contributes 0 to each. There is no re-pack: the pack charges what
@@ -2237,7 +2349,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
          charged_RUNTIME`, the planned sum of RUNTIME's named consumers, which are its D terms
          and, until each converts, the transitional terms of the draws not yet converted (step
          3; the end states' census, below). The L4+L6 commit deletes master's 512 MiB default
-         and its `GGML_SYCL_RUNTIME_ARENA_MB` read (`unified-cache.cpp:4505-4508` at
+         and its `GGML_SYCL_RUNTIME_ARENA_MB` read (`unified-cache.cpp:4507-4510` at
          `c69d5774d`) from `ensure_planned_arena_zones`, which is the dry run's input (step 5),
          so the dry run and step 4 size RUNTIME from the same terms. 7.14f and 7.14g cited the
          default at `:4486-4489` and kept it "for a device with no arena", but RUNTIME exists
@@ -2254,15 +2366,22 @@ L0, and a failed revalidation under L0 is a bug, not a race.
          the rebuild refusal below is reachable only at the early stage;
       5. **two witnesses, always compiled, before any `record_pending`** (`GGML_SYCL_WITNESS`):
          - `[ZONE-PLAN-BUG] the plan packed against zone capacities that differ from the ensured
-           arena`: per device in `plan.devices` and per zone, **`ensured_Z == max(floor_Z,
-           demand_Z + charged_Z)`** from the ledger (RUNTIME with no floor on an arena device),
-           the packed weights plus the charged terms are at most the ensured zones, and
-           `plan.weight_vram_bytes` plus the device's first-context reservation is at most the
-           `WEIGHT` zone (rulings §M25 I-1, §M32 C-1). It checks step 4 against the ledger. It
-           names
-           `weight_vram_bytes`, not `vram_bytes`, which at master includes the MMID workspace
-           charges: 12343.8 MB against master's 12232.1 MB weight zone on the canonical gate
-           would be a false fire (r13 m-b);
+           arena`: per device in `plan.devices` and per zone, **keyed per (model, device), not
+           per load (rulings §M41 I-4 (b)).** For the load that lays out the arena, **`ensured_Z
+           == max(floor_Z, demand_Z + charged_Z)`** from the ledger (RUNTIME with no floor on an
+           arena device). For every load, that one included, the load's ledger equals what it
+           placed, term by term, in a zone's free room or as shared-zone ranges, and each zone's
+           capacity is at least the sum, over the live models, of their terms placed in that
+           zone, and equal to it while one model is live. 7.14h compared a later load's own
+           ledger with a zone another model laid out, so on H9's fixture (1), where B's slot
+           goes to the shared zone and RUNTIME stays at A's 141008896 + k × 256 B, it fired on a
+           correct tree (r17 I-4 (b)). Per device, the packed weights plus the charged terms are
+           at most the ensured zones, each first-context term's admitted value is at most its
+           bound (step 3; rulings §M41 I-2), and `plan.weight_vram_bytes` plus the device's
+           first-context reservation is at most the `WEIGHT` zone (rulings §M25 I-1, §M32 C-1).
+           It checks step 4 against the ledger. It names `weight_vram_bytes`, not `vram_bytes`,
+           which at master includes the MMID workspace charges: 12343.8 MB against master's
+           12232.1 MB weight zone on the canonical gate would be a false fire (r13 m-b);
          - `[ZONE-PLAN-BUG] an ensure after the pack would still grow zone %s on device %d by
            %zu B`: per device in `plan.devices`, a **dry run** of `ensure_planned_arena_zones`,
            which sizes each zone from the `planned_*` globals the plan published, is compared
@@ -2285,20 +2404,20 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            so the witness compares like with like. **This dry run is the one definition both
            designs use (rulings §M26a m13):** the pack's charge ledger compared with the
            published getters; 23mk mirrors it. **The RUNTIME getter it reads
-           (`unified-cache.cpp:1566-1575`) sums the D setters' stores and the transitional
-           terms' stores** on an arena device (r15 I-3, m-8; rulings §M38 C-2): `moe_onednn`'s
-           own setter (`unified_cache_set_planned_pp_moe_onednn_weight_slot_bytes`, the entries
-           of the load that laid out the arena), `pp_pipeline`'s, 23mk's
+           (`unified-cache.cpp:1566-1575`) sums the D terms' stores and the transitional terms'
+           stores** on an arena device (r15 I-3, m-8; rulings §M38 C-2): `moe_onednn`'s
+           weight-slot store (the entries of the load that laid out the arena, and during a load
+           that load's pending entry; step 3), `pp_pipeline`'s, 23mk's
            `unified_cache_set_planned_moe_ptr_table_bytes(dev, k × stride)` (23mk 4.8a L50,
            L5489), and `XMX_MOE_BUFFERS`'s until beni converts rows 13 and 14. At master it sums
            `pp_pipeline`, the ring less its KV-zone part and `moe_control` (`:1569-1574`); the
            L4+L6 commit rewrites it to those stores, `moe_control` leaving as class C and the
            KV-zone split with the device ring (rulings §M32 I-1). The load-stage case is a
            forgotten `moe_onednn` (H7ap); every C term, `ring` and `onednn_scratchpad` among
-           them, is published as 0 at the load, and none has a setter. A C term's own check runs
-           in the context transaction (23mk's). The enum is kept closed by a source-contract
-           gate: every `unified_cache_set_planned_*` setter maps to one enum value, and an
-           unmapped setter fails the gate.
+           them, is published as 0 at the load, and none has a setter or a store entry. A C
+           term's own check runs in the context transaction (23mk's). The enum is kept closed by
+           a source-contract gate: every `unified_cache_set_planned_*` setter maps to one enum
+           value, and an unmapped setter fails the gate.
 
       **`moe_control` is a C term: one slot per context and device, in `REGION` (rulings §M27
       (2), (2a); §M26 I-3).** Every byte that scales with `n_ubatch` is context-scoped, so the
@@ -2411,7 +2530,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         (`unified-cache.cpp:15231-15320`), which is P1's violation. **The census:** every draw
         that names RUNTIME at `c69d5774d`, by an anchored search of the tracked tree for
         `vram_zone_id::RUNTIME` and every `prefer_vram_zone` assignment through a variable
-        (tests excluded), with 23mk 4.9's rows (census at `e4f08213a`, master `2c4f5e45d`), its
+        (tests excluded), with 23mk 4.10's rows (census at `003bce159`, master `2c4f5e45d`), its
         owner, and where it lands relative to L4+L6:
         | site at `c69d5774d` | 23mk row | what it is | owner | its RUNTIME term after L4+L6 |
         |---|---|---|---|---|
@@ -2419,12 +2538,45 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         | `unified-cache.cpp:18246` | 125 | the ring's weight slot | moua L4+L6 | `moe_onednn`, a D term |
         | `unified-cache.cpp:18203-18216` | 125 | the ring's activation and output rows | moua L4+L6 | none: per-context `REGION` head slots, converted by L4+L6 itself |
         | `unified-cache.cpp:16222` | 122 | the MMID device pools | moua L4+L6 | none: `mmid_workspace`, a `REGION` head slot, converted by L4+L6 |
-        | `ggml-sycl.cpp:37657` | 49 | the compute buffer's RUNTIME leg | zhcn, before L4 | none: zhcn's compute head slot |
+        | `ggml-sycl.cpp:37657`, the scheduler compute buffers | 49 | the SYCL<n> buffer type's RUNTIME leg | zhcn, before L4 | none: zhcn's compute head slot |
+        | `ggml-sycl.cpp:37657`, SYCL<n> weight buffers (`--no-host` paths; any weight buffer outside the pack's ranges) | 49 | the same leg, role WEIGHT | moua L4+L6 | none: the `WEIGHT` zone, never RUNTIME |
+        | `ggml-sycl.cpp:37657`, the control vector (`llama-adapter.cpp:67`, `model.select_buft(il)`) | 49 | the same leg: one f32 row of `n_embd` per layer on the device | moua L4+L6 | none: a context-owned range in the context's `REGION` headroom at `llama_set_adapter_cvec` (below) |
+        | `ggml-sycl.cpp:37657`, the on-device state-seq buffers (`llama-context.cpp:4167`, `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`) | 49 | the same leg, per sequence | moua L4+L6 | none: a context-owned range in the context's `REGION` headroom at the save call (below) |
+        | `ggml-sycl.cpp:37657`, any other SYCL<n> buffer outside every claim scope | 49 | the same leg | moua L4+L6 | none: refused by name (below) |
         | `fattn-onednn.cpp:457`, `:537` | 25, 26 | the oneDNN FA Q and K/V materializations (`:537` is role KV) | zhcn's carve, before L4+L6 (rulings §M38 C-2) | none |
         | `fattn.cpp:755`, `:1808` | 28, 30 | the fattn device workspaces and the XMX v2 split workspace | jzvq, closed before L4 | none: jzvq's per-context demands |
         | `unified-cache.cpp:18472` | 126 | the MoE reorder temporary | 23mk, before L4+L6 (rulings §M38 C-2) | none: 23mk's term |
         | `common.hpp:6855`, `:6887` | 13, 14 | the XMX MoE graph buffers (`xmx_moe_buffers_t`) | beni, after moua L4-L7 | `XMX_MOE_BUFFERS`, transitional (step 3) |
-        | `dense-scheduler.cpp:29` | 20 | `dense_scheduler_alloc_slot`, whose class has no users | deleted in L4+L6 | none |
+        | `dense-scheduler.cpp:29` | 20 | `dense_scheduler_alloc_slot`, whose class has no users | deleted in L4+L6, with its dependents (§4) | none |
+
+        **`ggml-sycl.cpp:37657` is the whole buffer type's leg, not the compute buffer's
+        (rulings §M41 I-5).** Its predicate, `should_use_runtime = !is_kv_buft && DEVICE`
+        (`:37623-37660`), takes every non-KV buffer on a SYCL<n> buffer type, and its own
+        comment says those carry "both model-weight backing buffers and scheduler compute
+        buffers". 7.14h's row named only the compute buffer, and `runtime_req` sets no
+        `forbid_vram_zone_spill` (`:37646-37657`), so after L4+L6 a RUNTIME miss inside
+        `unified_alloc` fell to `unified_cache_malloc_device_tracked` and `[EXT-ALLOC]`
+        (`unified-cache.cpp:15250-15254`, `:15307-15318`) for every other buffer on the leg, and
+        on Mistral, whose RUNTIME is 0, every one would (r17 I-5). The gs fallback chain
+        (`:37675-37737`) runs only if that raw malloc is itself refused. So L4+L6:
+        - routes a WEIGHT-role buffer on the leg to the `WEIGHT` zone;
+        - sets `runtime_req.forbid_vram_zone_spill`, so a buffer the leg meets outside every
+          claim scope and every row above is refused by name, never drawn raw: `[ZONE-PLAN-BUG]
+          unplanned SYCL%d buffer of %zu B outside any claim scope (refused)`, at WARN through
+          core's emitter, and the allocation returns NULL, which its callers already check;
+        - gives the control vector and the on-device state-seq buffers a home. Both are
+          context-owned: `llama_context` owns the control vector (`llama-context.h:330`, created
+          at `llama-context.cpp:495`, applied at `:2700`), and the state-seq buffers live in the
+          context's `mem_storage[seq_id]` (`:4367`). Both are allocated lazily, at a later API
+          call, so each follows §M39 (1)'s rule for a later ask: a context-owned range drawn in
+          the context's `REGION` headroom by a transaction of the context's own at that call,
+          and refused by name where the room does not exist, `[CONTEXT-PLAN] %s on device %d
+          does not fit: need %zu B, REGION free %zu B (refused)`, through the call's existing
+          failure return (`llama_set_adapter_cvec` returns non-zero; the state-seq save throws,
+          and `state_seq_get_data`'s catch returns 0). Rulings §M41 I-5 names a MODEL term for
+          the control vector; the code shows a context-lifetime object whose size is known only
+          at the call, so this design places it in the context and flags the deviation to the
+          lead (§6.25). The arms are C9's (§3.3).
 
         **No site lacks a size function,** so no defect ticket is needed today; a site found
         later with none is named as a defect with a ticket, per the ruling. The census's own
@@ -2457,8 +2609,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         the bytes with experts, which left the first context no room for them (r15 C-1). Both
         are withdrawn: the pack charges the first context's rows to the device's reservation
         (step 3), which that context takes over at its transaction (§2.4.2 step 5). The load
-        publishes the rows as 0 (the C rule, §2.4.5); `moe_onednn`'s own setter carries the
-        weight slot (step 3; rulings §M32 I-3);
+        publishes the rows as 0 (the C rule, §2.4.5); `moe_onednn`'s store entry, a record of
+        the load's transaction, carries the weight slot (step 3; rulings §M32 I-3, §M38 I-2);
       - **`moe_control` adds nothing to either, in any commit** (rulings §M27 (2a)): it is class
         C, placed in each context's `REGION` headroom (its first context's slot in the
         reservation). The figures above are re-derived without the 24832 B / 49408 B that 7.14c
@@ -2534,14 +2686,24 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           Graph-scratch commit (§M26a I-4). After the later of L4+L6 and that commit, W is the
           zone's only consumer and `ensured_ONEDNN = onednn_pp_w`; the floor and the
           `max(268435456, …)` form go in that commit. **Neither order is assumed (confirmed by
-          the lead, 7.14h):** each of the two commits' arms checks whether the other has
-          landed. The earlier one keeps the zone's capacity for the consumers that still draw
-          it, as named planned terms each sized by its own function, not as the 268435456 B
-          constant: the Graph scratch's `onednn_graph_scratch_zone_floor_bytes` at the
-          envelope's shape when L4+L6 is first, and `onednn_pp_a` and the scratchpad's value
-          function when 23mk's commit is first. The later one deletes the last of them, and its
-          RED is a tree that still lays out the floor's bytes, which the exact ONEDNN bytes
-          catch. On GPT-OSS 120B ONEDNN is then
+          the lead, 7.14h):** each of the two commits' arms checks whether the other has landed.
+          The earlier one keeps the zone's capacity for the consumers that still draw it, as
+          named planned terms each sized by its own function, not as the 268435456 B constant:
+          the Graph scratch's `onednn_graph_scratch_zone_floor_bytes` at the envelope's shape
+          when L4+L6 is first, and `onednn_pp_a` and the scratchpad's value function when 23mk's
+          commit is first. **With L4+L6 first, the Graph scratch's value is master's function's
+          (rulings §M41 I-1 (b)),** which takes no sinks input: at `-c 4096` ONEDNN is 23592960
+          + 805306368 = **828899328 B** (790.5 MiB) on GPT-OSS 120B, so its weight zone is
+          **13398278144 − k × 1024 B** (12777.6 MiB), 560463872 B (534.5 MiB) below the
+          with-floor figure, and 33554432 + 201326592 = **234881024 B** on Qwen, below the
+          floor, so its weight zone is **14413725696 − k × 2048 B** (13746.0 MiB). On GPT-OSS
+          those 768 MiB are held for a route that sinks forbid, until 23mk's Graph-scratch
+          commit; landing that commit before L4+L6 avoids the interim, and the choice is taken
+          to the lead (§6.25). fkpg (a) alone lifts master's floor the same way on every GPT-OSS
+          load, to 768 MiB at `-c 4096` and toward the 25 % clamp at llama-cli's default 131072
+          (relayed to fkpg and 23mk). The later one deletes the last of them, and its RED is a
+          tree that still lays out the floor's bytes, which the exact ONEDNN bytes catch. On
+          GPT-OSS 120B ONEDNN is then
           **23592960 B**, and the weight zone gains **244842496 B** (233.5 MiB) to become
           **14203584512 − k × 1024 B** (13545.6 MiB before `moe_ptr_table`). On the Qwen gate W
           is **33554432 B** (32.0 MiB, `blk.*.attn_qkv` Q8_0 2048 × 8192, by 23mk's
@@ -2551,12 +2713,12 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           MiB). From that commit the pre-plan layout puts ONEDNN at 0 as well, the split is
           **14791213056 B** (14106.0 MiB), and step 4 grows ONEDNN to W;
         - **SCRATCH.** Its floor is load-bearing today, and the consumers that need it are named
-          here as defects: every SCRATCH draw in 23mk 4.9's allocation census that no enum term
+          here as defects: every SCRATCH draw in 23mk 4.10's allocation census that no enum term
           covers. The core rows are covered (`load_reorder_temp`: rows 18, 43 and 48;
           `onednn_pp_pool` and `lm_head_f16`: row 61's model-shaped part; `mmq_work_counter`:
           row 100). The others draw the floor with no term: beni's context-shaped rows 17, 21,
           31, 33, 34, 61 (the pool's peak), 81 and 90; zhcn's row 51 (the compute-buffer chain's
-          SCRATCH leg); pqmm's rows 59 and 60; and 6lfq's row 9 (census at `e4f08213a`, master
+          SCRATCH leg); pqmm's rows 59 and 60; and 6lfq's row 9 (census at `003bce159`, master
           `2c4f5e45d`). Each becomes its owner's term or head slot. The two named exemptions,
           rows 101 and 138, also draw SCRATCH with no term and need one, or another source,
           first. Rows 102, 111 and 127 have no production caller and are deleted, and rows 129
@@ -2588,9 +2750,13 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       Qwen, `glkg-qwen35b-a3b-b1.log:228`) is not an input to either. Master's with-floor sum
       (34.5 + 96.0 MB; 49.0 + 64.0 MB, `glkg-qwen35b-a3b-b1.log:229`) is under 268435456 B
       ("oneDNN 256.0->256.0", `gptoss120b-b1.log:184`, `glkg-qwen35b-a3b-b1.log:210`), so on the
-      merge-gate shapes removing the floor frees **0 B**. The weight zone absorbs the floor's
-      bytes only on a shape whose with-floor sum exceeded the minimum; H7ap's C-rule arm uses
-      such a fixture (the minimum precondition, §M22.2).
+      merge-gate shapes removing the Graph-scratch floor G frees **0 B** while the 268435456 B
+      constant stands. The weight zone absorbs G's bytes only on a shape whose with-floor sum
+      exceeded the minimum; H7ap's C-rule arm uses such a fixture (the minimum precondition,
+      §M22.2). **Deleting the constant is a separate step, and it does free bytes on the gates
+      (rulings §M37 Q3):** in the commit that lands later of this one and L4+L6 (the end states,
+      above), ONEDNN becomes `onednn_pp_w` exactly, 23592960 B on GPT-OSS 120B and 33554432 B on
+      Qwen, and the weight zone gains 244842496 B and 234881024 B.
       **The ONEDNN zone's scratchpad: what the code and the oneDNN API say, the value
       function, and the probe (rulings §M29, §M29a).** Though it is named for the zone it drew
       from at master, `onednn_scratchpad` is a C term from 7.14e, and nothing of it is in the
@@ -2614,18 +2780,39 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         measured bound, and a process-global one (P4). **One buffer per (context, queue), at the
         planned maximum (rulings §M29a):** it is allocated once, at the context transaction, as
         a head slot in the context's `REGION` headroom (the first context's in the load's
-        reservation, step 3), and never grown. A request above it is the named
-        `[ZONE-PLAN-BUG]`: a STRICT (§G1) abort, otherwise the existing non-oneDNN decline with
-        a WARN. That line is the plan == reality witness. Host RED: two growth steps on one
-        queue, which today's retention serves by keeping both buffers, against the planned
-        maximum, under which the pool holds one buffer and the second step is served inside it.
-        **The pre-record call sizes nothing (rulings §V16 I-A; 1oxa rev 13 `47206cb` L3297-3306,
+        reservation, step 3), and never grown. **A request above it is a DECLINE (rulings §M36
+        I-3; 23mk 4.10 §4.8, `003bce159`).** DECLINE is the fourth miss class, and it is outside
+        23mk's chokepoint, since the check is a size compare in `get_scratchpad_mem`, not a
+        forbid refusal. Above the planned max of this (context, queue), `get_scratchpad_mem`:
+        1. emits `[ZONE-PLAN-BUG] decline dev=%d site=%s bytes=%zu planned_max=%zu next=%s` at
+           WARN, once per (context, site), through core's emitter;
+        2. counts `onednn_scratchpad_over_plan_declined` on every decline;
+        3. bumps no refusal epoch, because the op still produces its output on its declared
+           path;
+        4. aborts with the same text when `ggml_sycl_strict_enabled()` (§G1);
+        5. otherwise returns `std::nullopt`, and the consumer takes its declared next path from
+           23mk's table of the 11 live sites. At three of them (the two dense arms and
+           `out_prod`) a DNNL build has no other arm, so the path is the named op failure, never
+           `std::exit(1)`.
+        **Who lands what:** 23mk's §11 step 3 lands the `std::optional<dnnl::memory>` contract,
+        the 11 declared next paths and the deletion of the dead wrappers. This design's
+        value-function commit (L4+L6) lands the over-max compare, the line, the counter and the
+        abort, and it lands after 23mk's step 3, because a decline with no declared path would
+        reach today's throw. That line is the plan == reality witness. Host RED: two growth
+        steps on one queue, which today's retention serves by keeping both buffers, against the
+        planned maximum, under which the pool holds one buffer and the second step is served
+        inside it.
+        **The pre-record call sizes nothing (rulings §V16 I-A; 1oxa rev 15 `dd678c3` L3600-3618,
         adopted by name):** the TG record path's
         `pre_allocate_scratchpad(get_max_scratchpad_size())` becomes
         `assert_scratchpad_planned(stream)`, which has no size argument, reads no global and
         allocates nothing. It asserts that the (context, queue) buffer from the transaction
         exists at its planned size; for a planned 0, which has no buffer, it checks only that
-        the planned value is 0. `get_scratchpad_mem`'s growth and `!valid()` branches are
+        the planned value is 0. When the assert fails it prints 1oxa's line, `[ZONE-PLAN-BUG]
+        oneDNN primitive scratchpad not planned for queue Q in context C on device D at graph
+        record`, a STRICT (§G1) abort. Without STRICT the recording fails, the context's graphs
+        are disabled for its life and it computes eagerly, where the request meets the DECLINE
+        above; nothing allocates. `get_scratchpad_mem`'s growth and `!valid()` branches are
         deleted, and its `get_size() == 0` early return stays (below). A missing buffer is
         `[ZONE-PLAN-BUG] oneDNN primitive scratchpad buffer missing for queue Q in context C on
         device D`, never a second draw into an occupied range. **A ladder climb re-draws the
@@ -2785,8 +2972,13 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       reads that sizing. The dry run computes the same expression from the getters, so it
       grows nothing exactly when the published W bytes are at most the ledger's ONEDNN
       terms, which is what it tests, and it does not false-fire where the with-floor sum
-      exceeds the floor. On both merge-gate shapes the interim and the final sizing are both
-      268435456 B. H7ap's C-rule arm is an arm of the Graph-scratch commit.
+      exceeds the floor. On both merge-gate shapes the interim sizing is 268435456 B, and so is
+      the sizing after this commit while the 268435456 B constant stands. **The final sizing is
+      not 268435456 B (rulings §M37 Q3; 23mk 4.10 relay):** the later of this commit and L4+L6
+      deletes the constant, and ONEDNN is then `onednn_pp_w` exactly, 23592960 B on GPT-OSS 120B
+      and 33554432 B on Qwen (the end states, above). 7.14f to 7.14h said "the interim and the
+      final sizing are both 268435456 B", which predates §M37 Q3. H7ap's C-rule arm is an arm of
+      the Graph-scratch commit.
       So the early stage packs against the zones it admits, and B's ranges are recorded inside
       them. **The shared rule (rulings §Z8 I-3, §M13a): the sentence is this design's, the
       message is 23mk's, and each design mirrors both byte for byte.** The sentence: "an arena
@@ -4430,11 +4622,14 @@ records; the only record moua produces is the recurrent state's.
   `graph_input_stage` per-context slab, the oneDNN activation scratch, `mmvq_q8_slab` (merging
   the per-op mint at master `ggml-sycl.cpp:46128`, the SOA prealloc at `:97906` and the q8
   activation cache at `common.hpp:6648`), the MoE Q8_1 prealloc (`mmvq.cpp:16856`), the
-  forced-split packed-K slot (`fattn.cpp:1636`, TRANSIENT, max over layers), and **the oneDNN
-  Graph scratch** (`unified_cache::onednn_graph_scratch_alloc`, reached through
-  `make_engine_with_allocator`, shaped by `n_kv` and `n_q`; r4 I10(d)). Every beni demand is
-  computed by a visitor in zhcn's measure walker, before KV admission, and travels in zhcn's
-  tenant section. The llama.cpp-cxgg sidecar fix is folded into beni.
+  forced-split packed-K slot (`fattn.cpp:1636`, TRANSIENT, max over layers). **The oneDNN Graph
+  scratch** (`unified_cache::onednn_graph_scratch_alloc`, reached through
+  `make_engine_with_allocator`, shaped by `n_kv` and `n_q`; r4 I10(d)) lands in beni as 23mk's
+  Graph-scratch commit (rulings §M26a I-4), and its one producer is 23mk's function, which beni
+  cites and does not duplicate as a visitor; 7.14h listed it under beni's visitor and 23mk's
+  function at once (r17 m-6; rulings §M41 m-6). Every beni demand is computed by a visitor in
+  zhcn's measure walker, before KV admission, and travels in zhcn's tenant section. The
+  llama.cpp-cxgg sidecar fix is folded into beni.
 - **llama.cpp-jzvq:** the fattn thread-local device workspaces (`fattn.cpp:747` and its callers,
   the `:1800` XMX split workspace) and the **MXFP4 MoE token-generation caches**
   (`g_mxfp4_moe_tg_reuse`, `mmvq.cpp:1744`, and `g_mxfp4_stored_gemm_ksplit_scratch`,
@@ -4665,6 +4860,78 @@ transaction's step 2 reconciles its output at the context's own shape, and the l
 enumerates the C terms: H7ap's first-context arm has a source gate that fails on a cohort or
 term named at the reservation site.
 
+**The members of the merge gates' first-context set (1oxa rev 15 relay, `dd678c3`).** 1oxa
+sizes its VM `reserved` from `FIRST_CONTEXT`, so it needs each member, not only the total. The
+set is `context_demand_records` at the gates' shape, `-c 4096 -ub 512`, `n_seq_max` 1, flash
+attention on, on the one device. **Class** separates the C zone terms (§2.4.5), which 1oxa
+places in its C-term extent, from the other head slots, which have no zone term. Bytes are the
+value functions' outputs before the fit's alignment. The table is what the functions return on
+these two shapes, pre-registered for H7ap's first-context arm (§3.1). It is not a list any code
+reads: the reservation sums the function's output.
+
+| member | class | owner | record / term | `gptoss120b-b1` B | `glkg-qwen35b-a3b-b1` B |
+|---|---|---|---|---:|---:|
+| the ring's activation and output rows | C term | moua | `ring` | 1132462080 | 1610612736 |
+| the compute slot | other head slot | zhcn | the compute chunks | 423624704 | 516947968 |
+| the oneDNN Graph scratch | C term | 23mk | `onednn_graph_scratch` | 0 | 201326592 |
+| the recurrent state | other head slot | moua | `context-recurrent-state` | 0 | 65863680 |
+| the oneDNN PP activation half | C term | 23mk | `onednn_pp_a` | 4194304 | 4194304 |
+| the MoE control list and flag | C term | moua | `moe_control` | 16640 | 33024 |
+| the set_rows stage | C term | 23mk | `set_rows_stage` | 0 | 0 |
+| the primitives' scratchpad | C term | moua | `onednn_scratchpad` | 0 | 0 |
+| the MMID workspace | C term | moua | `mmid_workspace` | 0 | 0 |
+| the fattn workspaces | other head slot | jzvq | jzvq's records | jzvq | jzvq |
+| the MXFP4 MoE TG caches | other head slot | jzvq | jzvq's records | jzvq | 0 |
+| **C terms** | | | | **1136673024** | **1816166656** |
+| **other head slots** (known) | | | | **423624704** | **582811648** |
+| **the set** (known) | | | | **1560297728** | **2398978304** |
+
+- **The ring rows** are §2.7's at `-ub 512` and do not depend on `n_ctx`. The pack charges them
+  to the reservation as it admits each expert (§2.4.2 (b) step 3). So they are part of
+  `FIRST_CONTEXT`'s bytes, but the reservation site's sum leaves them out, since the pack has
+  already charged them.
+- **The compute slot** is c(P), zhcn's measure at the admitted placement, bounded by the
+  probe's Ĉ (rulings §M40; §2.4.2 (b) step 3). The figures are master's SYCL0 compute buffer
+  at this shape (404.00 MiB, `gptoss120b-b1.log:2171`; 493.00 MiB,
+  `glkg-qwen35b-a3b-b1.log:2889`), labelled fixture constants until zhcn's load-time measure
+  lands.
+- **The Graph scratch** is 0 on GPT-OSS because its attention has sinks, which the oneDNN SDPA
+  route rejects (`fattn-onednn.cpp:115-116`), so the term is 0 under its dispatch's gate. On
+  Qwen it is 1.5 · 16 · 512 · 4096 · 4 (`n_head_ctx_max` 16, `glkg-qwen35b-a3b-b1.log:229`); at
+  the planner's 512 it would be 24 MiB, clamped to the 64 MiB minimum the log prints. **The
+  function takes every input it depends on (rulings §M41 I-1 (b)):** 23mk's function reads the
+  sinks and `n_head_ctx_max`, and its count of SDPA-routed layers calls
+  `ggml_sycl_flash_attn_ext_onednn_plan`'s reject predicate, not a hand list (relayed to 23mk).
+  The 0 is that function's. Master's `onednn_graph_scratch_zone_floor_bytes` takes no sinks
+  input and counts GPT-OSS 120B at `n_head_ctx_max` 64 (`gptoss120b-b1.log:203`), so at `-c
+  4096` it returns max(1.5 · 64 · 512 · 4096 · 4, 1.5 · 64 · 512 · 640 · 4) = 805306368 B. **The
+  column depends on the landing order (rulings §M41 I-1 (a)):** with 23mk's Graph-scratch commit
+  in the tree the member is that function's 0 / 201326592 B as tabled; with L4+L6 first and that
+  commit not yet in, the Graph scratch is an ONEDNN term, valued by master's function, and not a
+  member (§2.4.3's transition rule), so the known set is 1560297728 B on GPT-OSS 120B and
+  2197651712 B (2095.8 MiB) on Qwen.
+- **The recurrent state** on Qwen is 30 recurrent layers × 4 B × (3 · (4096 + 2 · 16 · 128) +
+  128 · 4096) at `n_seq_max` 1 (`glkg-qwen35b-a3b-b1.log:154-158`, printed as 62.81 MiB at
+  `:2858`), times max(1, `n_seq_max`). GPT-OSS has no recurrent layer.
+- **llama-server's default launch (rulings §M41 I-3)** runs at `n_seq_max` 4, which fkpg (a)
+  carries: the recurrent state is 4 × 65863680 = 263454720 B (251.3 MiB), 197591040 B above the
+  table, so the known Qwen set is 2596569344 B (2476.3 MiB), or 2395242752 B with L4+L6 first.
+  GPT-OSS's set does not move. The compute slot at `n_seq_max` 4 is the table's `n_seq_max` 1
+  fixture until zhcn's measure lands, and is labelled so.
+- **`onednn_pp_a`** is 23mk's 512 × `max_K` × 2, with `max_K` 4096 on both models (GPT-OSS's
+  `attn_output` Q8_0 4096 × 2880; on Qwen a 4096-wide plane-W tensor), by 23mk's `gguf_w2.py`
+  rule over each gate's model file.
+- **The zeros:** `set_rows_stage` is 0 on one device, `onednn_scratchpad` is 0 by §M31a's probe,
+  and `mmid_workspace` is 0 because the MMID route is unreachable in an ordinary build
+  (§2.4.2 (b) step 7).
+- **jzvq's two rows** come from jzvq's exact demand functions. The TG caches are 0 on Qwen,
+  which has no MXFP4 experts. For scale, master's baseline on GPT-OSS 20B at `-c 4096` draws
+  3240, 184320, 23040 and 12960 B (llama.cpp-jzvq comment c-jv0r). The gates' values come from
+  jzvq's host test, and until it supplies them the first-context arm is VOID, which fails, so
+  L4 cannot land before it (rulings §M39 (3)).
+- **KV is not a member.** The fit places the context's KV in the `REGION` room beside the
+  reservation and demotes it when that room is short; the reservation holds head slots only.
+
 **Timing (r3 I3; r4 I10(d)).** Every record exists before the transaction that consumes it.
 zhcn's measure pass runs before each publish, for each ladder candidate, and computes its own,
 beni's and (where they are graph-shaped) jzvq's demands with its visitors. The ring rows' and
@@ -4704,6 +4971,17 @@ L4-L7. So when L4 lands, most TRANSIENT sites still allocate as today. The rule:
   beni's or jzvq's). Until then it keeps its current placement: the zone and
   `forbid_vram_zone_spill` that 23mk core gave it. It is not a context-side request, it is
   never classified as a plan violation, and STRICT (§G1) does not abort on it;
+- **its producer's record stays out of `context_demand_records` until that commit (rulings §M41
+  I-1 (a)).** One byte has one charge. While a site draws its zone, the zone's term holds its
+  bytes, and the producer's record joins the context's set, and so the load's `FIRST_CONTEXT`
+  reservation, only in the commit that converts the site. So at each landing order exactly one
+  side holds the bytes: the Graph scratch is an ONEDNN term while L4+L6 is in the tree without
+  23mk's Graph-scratch commit, and a `REGION` head slot from that commit on. 7.14h let a
+  producer that lands before L4 contribute a record for a site still drawing its zone, so on
+  Qwen with L4+L6 first the 201326592 B Graph scratch was charged in ONEDNN and again in the
+  reservation, 192 MiB of `REGION` reserved that no claim takes (r17 I-1 (a)). The filter is
+  this list: `context_demand_records` skips a producer whose site is on it. RED, H7ap's
+  first-context arm: with L4+L6 first, the record present while the draw is unconverted;
 - H7p carries an explicit **unconverted-site list**, each entry naming its site and its
   converting ticket. At L4, H7p passes when every site is either converted (claims, with a
   producer) or on the list. The list may only shrink, and a mutation that adds a site fails
@@ -4936,12 +5214,12 @@ value function; and 4.7c `175dcd51b`, whose §6.8 term table, L2986-3011, confir
 | `ring` | the context's `REGION` headroom, as its own CONTEXT head slots, one activation and one output row per (context, device) (§2.7; rulings §M32 I-1); not a load-stage zone | C (rulings §M28 (1); P before 7.14e) | moua | the rows at the context's own `n_ubatch`, sized by the experts resident on the device (rulings §M32 C-1 (b)): align256(align64(`n_ubatch`) × max over t of (min(`local(t)`, `n_ubatch` × `n_expert_used`) × K_t) × 2) and the same with N_t × 4, times the depth (1); t runs over the expert tensors the device executes through oneDNN PP, `local(t)` is t's resident expert count, K_t and N_t per `src/llama-model.cpp:490-493`. The PP MoE dispatch does not chunk (§2.4.2 (b)). No device-wide record: 7.14e's max over contributions is withdrawn |
 | `nonfa_shape` | SCRATCH | D: per device that hosts attention layers (r13 I-F (5)) | moua | `unified-cache.cpp:27615-27618`, sized at `:4401` |
 | `onednn_scratchpad` | the context's `REGION` headroom, one buffer per (context, queue) over the context's enumerated queue set, at the context transaction; not a load-stage zone | C (rulings §M29a) | moua (rulings §M19, §M29, §M29a, §M32 I-5) | consumer (b) alone, the oneDNN primitives' own user scratchpad (`common.hpp:5878`, `:5945-5980`): the maximum of `scratchpad_desc().get_size()` over the `primitive_desc` objects of **every user-scratchpad family the context's dispatch can reach, each under its dispatch's gate** (the eleven live `get_scratchpad_mem` sites, matmul, WOQ, eltwise, softmax and binary; the reduction and `DnnlBinaryWrapper::binary` are dead and deleted, rulings §M36 I-3, §M38; §2.4.2 (b), "The ONEDNN zone's scratchpad"), for the shapes the context runs, over the M set up to its `n_ubatch`, read from the load's descriptor table (rulings §M31), never a measured bound; allocated once and never grown, a request above it the named `[ZONE-PLAN-BUG]`. It has **no load-stage setter**. Master's `onednn_reorder + onednn_eligible` (`ggml-sycl.cpp:15947`, `unified-cache.cpp:27565`) is withdrawn: it sized 23mk's W and A pair, and 23mk re-points that site to W (`onednn_pp_w`, below) |
-| `moe_onednn` | RUNTIME | D | moua | the ring's weight slot alone (rulings §M28 (1)), one per (model, device), drawn at load under `{MODEL, id}`: the maximum over the device's oneDNN-PP expert tensors t of t's per-expert slot (`src/llama-model.cpp:441-447`) times `local(t)`, t's experts resident on the device (rulings §M32 C-1 (b)); master multiplies the inventory maximum by `n_expert` (`:465-467`). Published by its own setter, `unified_cache_set_planned_pp_moe_onednn_weight_slot_bytes(model, dev, bytes)`, into a store keyed by (model, device) (rulings §M32 I-3, §M38 I-2); a later load on a laid-out arena places it in RUNTIME's free room or the shared zone (§2.4.2 (b) step 3); master's `unified_cache_set_planned_pp_moe_onednn_scratch` call with the 512-row slots (`ggml-sycl.cpp:15961-15967`) is deleted on arena devices |
+| `moe_onednn` | RUNTIME | D | moua | the ring's weight slot alone (rulings §M28 (1)), one per (model, device), drawn at load under `{MODEL, id}`: the maximum over the device's oneDNN-PP expert tensors t of t's per-expert slot (`src/llama-model.cpp:441-447`) times `local(t)`, t's experts resident on the device (rulings §M32 C-1 (b)); master multiplies the inventory maximum by `n_expert` (`:465-467`). Recorded by the load's own transaction into the weight-slot store keyed by (model, device), with no setter (rulings §M32 I-3, §M38 I-2; zhcn 5.16 relay); a later load on a laid-out arena places it in RUNTIME's free room or the shared zone, and refuses the load by name if it fits in neither (§2.4.2 (b) step 3; rulings §M39 (1)); master's `unified_cache_set_planned_pp_moe_onednn_scratch` call with the 512-row slots (`ggml-sycl.cpp:15961-15967`) is deleted on arena devices |
 | `moe_control` | the context's `REGION` headroom: one slot per (context, device) on each device that executes a GPU expert of the context's model, at the context transaction (rulings §M27 (2a)) | C | moua | the ungated layout's compact list and missing flag at the context's own `n_ubatch` (`moe-control-plan.cpp:478-497`; `mmvq.cpp:16589`, `:16649`): `total_bytes − compact_offset`, 16640 B / 33024 B at `-ub 512` on GPT-OSS 120B / Qwen3.5-35B-A3B; never `moe_control_requirement_from_layout`. The ids staging is row 75's (beni; rulings §M26 I-3), the pointer tables `moe_ptr_table`'s (rulings §Z15); the load charges nothing. 7.14a to 7.14c's RUNTIME D charge (24832 B / 49408 B from the routing commit, at r14 m-6's plan `n_ubatch` of 512) is withdrawn |
 | `xmx_moe_buffers` | RUNTIME | D, transitional (rulings §M38 C-2) | beni, whose conversion of rows 13 and 14 deletes it | the `xmx_moe_buffers_t` byte functions (`common.hpp:6804-6834` at `c69d5774d`) at the envelope's shape, under the dispatch's gate: 0 unless `GGML_SYCL_XMX_MOE_SORTED` and `GGML_SYCL_XMX_MOE_PREALLOC` are both set (`ggml-sycl.cpp:67008-67018`) |
 | `pp_pipeline` | RUNTIME | D | 23mk (rulings §Z15) | 23mk's `pp_pipeline_weight_bytes`, the allocation site's own bytes (`ggml-sycl.cpp:92998-93031` at `3d9414c8c`); moua's pack calls it, and master's `:15955-15958` fields become its output |
 | `moe_ptr_table` | RUNTIME | D | 23mk (row 73) | 23mk's `moe_ptr_table_bytes`; the **only** term for the MoE pointer tables, whichever path holds them (rulings §Z15): k tables at the 256-aligned stride (1024 B on GPT-OSS 120B, 2048 B on Qwen), k from the term's first commit, which also deletes row 73's fallback (rulings §M23 (2)). No `expert_ptrs` term exists; `expert_ptrs` feeds only the host sum (s4ip) |
-| `onednn_pp_w` | ONEDNN | D | 23mk (W) | `onednn_pp_w_bytes`; `unified-cache.cpp:17316`. The ONEDNN D store survives under 23mk's five I-G names: `g_tensor_inventory_onednn_pp_w_bytes`, the setter `unified_cache_set_planned_onednn_pp_w_bytes`, the store `g_planned_onednn_pp_w_bytes[dev]`, the getter `unified_cache_get_planned_onednn_pp_w_bytes` and `plan.onednn_pp_w_bytes` (today `onednn_scratchpad_bytes` in each, the getter with a `_stored` suffix; 23mk §4.3 at `e4f08213a` L1137-1165; rulings §M32 I-4, §M33 I-G). 23mk re-points master's `:15947` site to this value function. H7ap's C-rule fixture asserts the getter returns > 0 |
+| `onednn_pp_w` | ONEDNN | D | 23mk (W) | `onednn_pp_w_bytes`; `unified-cache.cpp:17316`. The ONEDNN D store survives under 23mk's five I-G names: `g_tensor_inventory_onednn_pp_w_bytes`, the setter `unified_cache_set_planned_onednn_pp_w_bytes`, the store `g_planned_onednn_pp_w_bytes[dev]`, the getter `unified_cache_get_planned_onednn_pp_w_bytes` and `plan.onednn_pp_w_bytes` (today `onednn_scratchpad_bytes` in each, the getter with a `_stored` suffix; 23mk §4.3 at `003bce159` L1201-1215; rulings §M32 I-4, §M33 I-G). 23mk re-points master's `:15947` site to this value function. H7ap's C-rule fixture asserts the getter returns > 0 |
 | `onednn_pp_pool` | SCRATCH | D | 23mk (POOL) | `onednn_pp_pool_w_bytes`; pool `:43324` via `:45640-45651`, `:65339-65355` |
 | `load_reorder_temp` | SCRATCH | D, needs the layout | 23mk (the LOAD term) | `load_reorder_temp_bytes` |
 | `woq_packed` | SCRATCH | D, reads the chosen layout | 23mk | `woq_packed_bytes`; `gemm.hpp:860` |
@@ -4972,8 +5250,10 @@ device in `plan.devices`, what the published getters would size with what step 4
 ledger, over every value, a C value as 0 on both sides. The late check compares by enum value,
 per device, over the P and D values. And a source-contract gate maps every
 `unified_cache_set_planned_*` setter to exactly one value, so a new demand that publishes a
-planned global without a term fails the build's gate, not a load. The gate's map carries
-`unified_cache_set_planned_pp_moe_onednn_weight_slot_bytes` → `MOE_ONEDNN` (rulings §M32 I-3),
+planned global without a term fails the build's gate, not a load. `MOE_ONEDNN` has no setter:
+its store is written only by the load's transaction (§2.4.2 (b) step 3), and H7z (aj)'s writer
+gate covers it, so the map carries no entry for it and fails on any setter named for it (rulings
+§M38 I-2). The gate's map carries
 `unified_cache_set_planned_onednn_pp_w_bytes` → `ONEDNN_PP_W` (23mk's rename; rulings §M32 I-4,
 §M33 I-G) and 23mk's `unified_cache_set_planned_moe_ptr_table_bytes` → `MOE_PTR_TABLE`, and each
 transitional term's setter to its value (`XMX_MOE_BUFFERS`, rulings §M38 C-2); no setter maps to
@@ -5161,10 +5441,11 @@ withdrawn. The ring is split by lifetime into two objects with one owner each:
   model's first context on a device takes over the rows the load reserved for it (§2.4.2
   (b) step 3, step 5; rulings §M32 C-1 (a)).
 - **The weight slot is a per-(model, device) D term.** `moe_onednn` (§2.4.5) is one slot per
-  model and device, sized by the resident-expert count, published by its own setter
-  (`unified_cache_set_planned_pp_moe_onednn_weight_slot_bytes`; rulings §M32 I-3), drawn from
-  RUNTIME inside the load before `finalize_end` under `{MODEL, id}`, and released at the
-  model's unload. No context transaction sizes, places or releases it.
+  model and device, sized by the resident-expert count, recorded by the load's own
+  transaction in the weight-slot store keyed by (model, device), with no setter (rulings §M32
+  I-3, §M38 I-2), drawn from RUNTIME's free room or the shared zone inside the load before
+  `finalize_end` under `{MODEL, id}`, and released at the model's unload. No context
+  transaction sizes, places or releases it, and no context transaction writes its store.
 - **The executor is re-keyed (rulings §M32 I-1).** Today the batched executor reads the
   planned shape per device (`ggml-sycl.cpp:78760-78767`, the four
   `unified_cache_get_planned_pp_moe_onednn_*` getters keyed by `ctx.device`), reserves the
@@ -5186,27 +5467,26 @@ withdrawn. The ring is split by lifetime into two objects with one owner each:
   contradicted this section's deletion of the `*_in_kv_zone` flags, the executor's reading no
   device global, and the setter gate's "no setter maps to a C term" (r16 I-1). They and
   `release_pp_moe_onednn_scratch_ring` stay only for a device with no arena, outside this
-  design, and the L4+L6 commit deletes their arena-path calls. The weight-slot setter is not
-  one of them: it is the load's one publication of a D term, keyed by (model, device).
+  design, and the L4+L6 commit deletes their arena-path calls. The weight slot has no setter
+  at all (above).
 - **A model load never releases or re-sizes another model's ring (llama.cpp-r7fz; rulings §M7
   I-4).** On master, `populate_inventory_globals` (`3d9414c8c` `ggml-sycl.cpp:15891`, reached
   from `ggml_backend_sycl_compute_placement_plan_early` at model load) overwrites the device's
   planned ring sizes and depth (`unified_cache_set_planned_pp_moe_onednn_scratch`,
   `:15967-15970`), releases the physical ring whenever it holds KV-zone bytes
   (`release_pp_moe_onednn_scratch_ring()`, `:15983-16000`; its own comment says this "also
-  releases a ring that another still-loaded model's live context admitted"), clears the
-  KV-zone slot flags (`:16002`), and overwrites the per-row bytes and the planned `n_ubatch`
+  releases a ring that another still-loaded model's live context admitted"), clears the KV-zone
+  slot flags (`:16002`), and overwrites the per-row bytes and the planned `n_ubatch`
   (`:16013-16015`). With model A's context live on device 0, B's load would release A's rows,
   and A's next PP MoE claim would find none: `[CONTEXT-PLAN-BUG]` with an error status, a −2
-  that is fatal on the server. On arena devices a load writes only its own weight slot's
-  setter; it releases nothing and writes no row size, depth, split flag, per-row bytes or
-  `n_ubatch`. Since the rows are in each context's table, there is no device record left for
-  a load to overwrite. **The load-time reserve goes too:** master's
-  `ggml_sycl_configure_host_zones_for_plan` reserves the whole device ring at the load's
-  sizes (`ggml-sycl.cpp:5657-5680` at `c69d5774d`, `reserve_pp_moe_onednn_scratch`); on an
-  arena device the load draws only the weight slot. **Test (H9):** "load B while A's context
-  holds its rows" (§3.1). A device with no arena keeps master's behaviour, outside this
-  design.
+  that is fatal on the server. On arena devices a load records only its own (model, device)
+  weight-slot entry (§2.4.2 (b) step 3); it releases nothing and writes no row size, depth,
+  split flag, per-row bytes or `n_ubatch`. Since the rows are in each context's table, there is
+  no device record left for a load to overwrite. **The load-time reserve goes too:** master's
+  `ggml_sycl_configure_host_zones_for_plan` reserves the whole device ring at the load's sizes
+  (`ggml-sycl.cpp:5657-5680` at `c69d5774d`, `reserve_pp_moe_onednn_scratch`); on an arena
+  device the load draws only the weight slot. **Test (H9):** "load B while A's context holds its
+  rows" (§3.1). A device with no arena keeps master's behaviour, outside this design.
 - **The host runtime pre-size is re-derived from the terms (rulings §M34 (4)).** The same
   function, `ggml_sycl_configure_host_zones_for_plan` (a load-time function, not a context
   init), pre-sizes the host arena's runtime pool with `plan.onednn_pp_w_bytes` (today
@@ -5356,10 +5636,14 @@ the TU-static reader, and every call site in this design is that accessor. uwlx'
 §G1a's three doc edits: it adds the `GGML_SYCL_STRICT_LEASES` row to
 `docs/backend/sycl-env-vars.md`, turns that file's :590 ("only on weight:leaked_lease") into the
 family list, and gives the canonical contract's :178-179 ("entries_leaked — the sole counter")
-the per-family tags. **The fallback:** if moua's L4+L6 commit lands before uwlx, it carries the
-export and the three edits (§4), and uwlx converts to the accessor before it merges. No
-design adds a second `GGML_SYCL_STRICT_*` switch or a second `getenv` of this one, and H7 (e)
-gates both. `GGML_SYCL_HANDLE_STRICT` only reports and never aborts, so it is outside §G1.
+the per-family tags. **The edge is hard (rulings §G1c):** uwlx is the accessor's sole definer,
+and every moua commit that calls it lands after uwlx's merge (§4). No moua commit carries the
+export or the three edits; 7.14h's fallback, under which L4+L6 carried them if it landed first,
+is withdrawn, since a conditional edge cannot be encoded in the tracker and would allow two
+definers of one symbol. No design adds a second `GGML_SYCL_STRICT_*` switch or a second `getenv`
+of this one, and H7 (e) gates both. `GGML_SYCL_HANDLE_STRICT` only reports and never aborts, so
+it is outside §G1: §G1b's exception list gains it as a named non-member, allowlisted by name in
+H7 (e) and zhcn's gate 22 with that reason (rulings §M41 m-4; relayed to zhcn by the lead).
 **Withdrawn (7.14g):** up to 7.14f this section named a second variable, `GGML_SYCL_STRICT_PLAN`
 (lead ruling 4, D3), and forbade an alias, `GGML_SYCL_STRICT_KV_PLAN`. §G1 retires both;
 uwlx's branch reads the first and converts it before it merges (rulings §G1b). Outside this
@@ -6109,8 +6393,8 @@ means that.
         `memory_update` is not a route: it calls `graph_reserve` directly
         (`llama-context.cpp:2211`) and never opens a scope, so its post-update reserve is ALLOC
         only. The arm follows §Z9a's six points, through **zhcn's named
-        `GGML_SYCL_PRIVATE_TESTING` hooks, at zhcn head `2c511f6`** (zhcn rev 5.11, H4h; the
-        names are `8a58ad4`'s, unchanged through 5.10 `c75ce4d` and 5.11; this design defines
+        `GGML_SYCL_PRIVATE_TESTING` hooks, at zhcn head `ea3056c`** (zhcn rev 5.16, H4h; the
+        names are `8a58ad4`'s, unchanged through 5.16; this design defines
         no hooks of its own), **on zhcn's
         vehicle target, `test-sycl-growth-fallback-vehicle`** (rulings §Z12 I-3): its link line
         is exactly `llama-private-test-objects` + `ggml-sycl-private-fixtures`, so there is one
@@ -6261,13 +6545,20 @@ means that.
     site, and each aborts under `GGML_SYCL_STRICT_LEASES=1` through `ggml_sycl_strict_enabled()`
     (rulings §G1, §G1a). Across the tree, the gate forbids any `GGML_SYCL_STRICT_[A-Z_]*` name
     other than `GGML_SYCL_STRICT_LEASES`, and any `getenv` of the switch outside its one reader.
-    It also forbids the suffix form, a `GGML_SYCL_[A-Z_]*_STRICT` switch name, except the one
-    exception that zhcn's gate 22 allowlists with its ticket until that switch's own lane
-    retires it (rulings §G1b). This is gate 22's rule (r4 I3; §G1 follow-up, §G1b), and the gate
-    reuses gate 22's allowlist rather than keeping a second one. It skips historical documents.
-    `GGML_SYCL_HANDLE_STRICT` only reports and never aborts, and is outside §G1. The mutation
-    witnesses are a planted `getenv("GGML_SYCL_STRICT_PLAN")` and a planted second
-    `getenv("GGML_SYCL_STRICT_LEASES")` in `ggml-sycl.cpp`, and each must fail the gate;
+    It also forbids the suffix form, a `GGML_SYCL_[A-Z_]*_STRICT` switch name, except the names
+    zhcn's gate 22 allowlists: the §G1b exception, with its ticket, until that switch's own lane
+    retires it, and **`GGML_SYCL_HANDLE_STRICT`, by name (rulings §M41 m-4),** with its reason:
+    it is a diagnostic REPORT switch, which widens logging (`common.hpp:4056`, `:4232`;
+    `ggml-sycl.cpp:25753`) and never aborts, so it is not a §G1 abort switch. Without that entry
+    the rule is red on master, which carries it at `ggml-sycl.cpp:25619`,
+    `tests/test-sycl-env-report.cpp` and `docs/backend/sycl-env-vars.md` (r17 m-4); renaming it
+    is out of scope. This is gate 22's rule (r4 I3; §G1 follow-up, §G1b), and the gate reuses
+    gate 22's allowlist rather than keeping a second one. It skips historical documents
+    (`MEMORY_STRICT` and `LAYOUT_CACHE_STRICT` appear only in `docs/plans`). The mutation
+    witnesses are a planted `getenv("GGML_SYCL_STRICT_PLAN")`, a planted second
+    `getenv("GGML_SYCL_STRICT_LEASES")` and a planted `getenv("GGML_SYCL_FOO_STRICT")` in
+    `ggml-sycl.cpp`, and each must fail the gate; the positive control is master's tree, which
+    passes only with the `HANDLE_STRICT` entry;
   - (f) no raw pointer is stored as region state;
   - (g) `reserve_kv_region` does not hold the group mutex across the yield call (C2); the
     pending ranges are recorded before the yield window's `lock.unlock()` (r3 C2(a)) and cover
@@ -6456,14 +6747,22 @@ means that.
     `_row_bytes`, `_n_ubatch`; `unified-cache.cpp:2164`, `:2217`, `:2253`, `:2278`) have no
     caller: the gate walks the call graph from the load's stages, the context transaction (its
     install included), the release proc and the batched executor, and fails on any path that
-    reaches one of the five. The context's rows are written to its slot-table entry directly
-    (§2.7). The weight-slot setter,
-    `unified_cache_set_planned_pp_moe_onednn_weight_slot_bytes(model, dev, bytes)`, is not on
-    the list; it is reachable only from the load's step 3 (rulings §M32 I-3). Mutation
+    reaches one of the five. **The cut (rulings §M41 m-10):** the setters stay for a device with
+    no arena (§2.7), reached through the same load functions, so the no-arena calls are isolated
+    in one named function, `ggml_sycl_ring_setters_no_arena`, called from a single `if
+    (!arena_active)` branch in `populate_inventory_globals`; the walk treats that function as
+    its one excluded node and every other path from its roots as an arena path. Mutation
+    witness: a setter call moved out of that function into `populate_inventory_globals`'s common
+    path, which must fail the gate. The context's rows are written to its slot-table entry
+    directly (§2.7). **The weight-slot store's writers (rulings §M38 I-2; zhcn 5.16 relay):**
+    the gate also finds every write to `g_moe_onednn_weight_slots` and fails unless the writer
+    set is exactly the load's step 3 record, the load's commit, its rollback and the model's
+    unload, and unless no `unified_cache_set_planned_*` function names the term. Mutation
     witnesses: the `populate_inventory_globals` release restored; a call to
-    `unified_cache_set_planned_pp_moe_onednn_row_bytes` planted in the commit's install (the
-    r16 I-1 case, which 7.14g's text allowed); and the weight-slot setter called from a context
-    transaction. Each must fail the gate;
+    `unified_cache_set_planned_pp_moe_onednn_row_bytes` planted in the commit's install (the r16
+    I-1 case, which 7.14g's text allowed); a write to the weight-slot store planted in a context
+    transaction; and 7.14h's `unified_cache_set_planned_pp_moe_onednn_weight_slot_bytes`
+    restored. Each must fail the gate;
   - (ak) **(0) takes no copies of the rows, and (d) drops the rows' retentions before (e)
     (rulings §M7 I-3).** Mutation witnesses: (0) copying the context's rows, and the move-out
     putting `retained_owners` into the batch;
@@ -6657,13 +6956,16 @@ means that.
       and RUNTIME laid out at 0), and after step 4 ONEDNN is exactly W, 23592960 B on
       GPT-OSS 120B and 33554432 B on Qwen, with weight zones **14203584512 − k × 1024 B** and
       **14615052288 − k × 2048 B**. RED: a tree that keeps the floor ensures 244842496 B /
-      234881024 B of ONEDNN that no term charged, and the exact ONEDNN bytes catch it; a
-      scorer that reads 256.0 MB there is the arm's own RED. **The arm reads the order first
-      (7.14h):** it asserts whether the other commit is in the tree and scores that state.
-      In the earlier commit ONEDNN is W plus the named terms of the consumers still drawing it,
-      never 268435456 B: with L4+L6 first, W plus the Graph scratch at the envelope's `-c
-      4096`, 23592960 + 0 B on GPT-OSS 120B (sinks) and 33554432 + 201326592 B on Qwen; with
-      23mk's commit first, W plus the terms 23mk's arm names. Its RED is the constant kept.
+      234881024 B of ONEDNN that no term charged, and the exact ONEDNN bytes catch it; a scorer
+      that reads 256.0 MB there is the arm's own RED. **The arm reads the order first (7.14h):**
+      it asserts whether the other commit is in the tree and scores that state. In the earlier
+      commit ONEDNN is W plus the named terms of the consumers still drawing it, never 268435456
+      B: with L4+L6 first, W plus master's Graph-scratch function at the envelope's `-c 4096`,
+      23592960 + 805306368 = 828899328 B on GPT-OSS 120B (the function takes no sinks input;
+      rulings §M41 I-1 (b); 7.14h pre-registered 23592960 + 0 B, which needs 23mk's route-aware
+      count) and 33554432 + 201326592 = 234881024 B on Qwen, with weight zones 13398278144 − k ×
+      1024 B and 14413725696 − k × 2048 B; with 23mk's commit first, W plus the terms 23mk's arm
+      names. Its RED is the constant kept.
       **SCRATCH**, from the commit
       that converts the last untermed census row (the end states): after step 4 SCRATCH is
       exactly the ledger's SCRATCH terms, and `ggml_sycl_compute_arena_bytes()` returns that
@@ -6673,49 +6975,44 @@ means that.
       nothing;
     - **the model's first context places its C head slots (rulings §M32 C-1; pre-registered
       before the lead's run):** vehicles `gptoss120b-b1` and `glkg-qwen35b-a3b-b1`, the B50
-      merge-gate shapes. **Scored by the pure-fit run**, not by a load: H2's `kv_region_fit`
-      on the geometry the load recorded (its `WEIGHT` ranges and its `FIRST_CONTEXT`
-      reservation, from the host replay of the pack), for the model's first context at the
-      gates' shape, `-c 4096 -ub 512` (`merge-gates/run-merge-gates.sh:65`). Its precondition
-      is fkpg (a): the envelope carries 4096, and a run whose load plan prints `n_ctx=512` is
-      VOID, which fails (rulings §M38 I-5). **Pre-registered per term (rulings §M38 C-1), in
-      bytes, `gptoss120b-b1` / `glkg-qwen35b-a3b-b1`:**
-      - the ring rows: 1132462080 / 1610612736 (§2.7 at `-ub 512`; independent of `n_ctx`);
-      - zhcn's compute slot: 423624704 / 516947968, master's SYCL0 compute buffers at this shape
-        (404.00 MiB, `gptoss120b-b1.log:2171`; 493.00 MiB, `glkg-qwen35b-a3b-b1.log:2889`),
-        labelled fixture constants until zhcn's load-time measure lands (below);
-      - the oneDNN Graph scratch: 0 / 201326592. GPT-OSS's attention has sinks, which the oneDNN
-        SDPA route rejects (`fattn-onednn.cpp:115-116`), so its term is 0 under its dispatch's
-        gate; on Qwen it is 1.5 · 16 · 512 · 4096 · 4 (`n_head_ctx_max` 16,
-        `glkg-qwen35b-a3b-b1.log:229`, where at the planner's 512 it is 24 MiB, clamped to the
-        64 MiB minimum the log prints);
-      - the recurrent state: 0 / 65863680, 30 recurrent layers × 4 B × (3 · (4096 + 2 · 16 ·
-        128) + 128 · 4096) at `n_seq_max` 1 (`glkg-qwen35b-a3b-b1.log:154-158`; printed as
-        62.81 MiB at `:2858`);
-      - `onednn_pp_a`: 4194304 / 4194304, 23mk's 512 × `max_K` × 2 with `max_K` 4096 on both
-        (GPT-OSS's `attn_output` Q8_0 4096 × 2880; on Qwen a 4096-wide plane-W tensor; 23mk's
-        `gguf_w2.py` rule over each gate's model file);
-      - `moe_control`: 16640 / 33024;
-      - `set_rows_stage`, `onednn_scratchpad` and `mmid_workspace`: 0 each (one device; §M31a;
-        the MMID route is unreachable in an ordinary build, step 7);
-      - jzvq's fattn workspaces and MXFP4 MoE TG caches, from jzvq's exact demand functions
-        (llama.cpp-jzvq closes before L4, §2.4.3). The TG caches are 0 on Qwen, which has no
-        MXFP4 experts. On GPT-OSS 20B at `-c 4096` master's baseline draws 3240, 184320, 23040
-        and 12960 B (llama.cpp-jzvq comment c-jv0r). The arm takes jzvq's values at this shape
-        from jzvq's host test before the lead's run, and without them it is VOID, which fails.
-
-      The known terms sum to 1560297728 B (1488.0 MiB) / 2398978304 B (2287.8 MiB), plus jzvq's.
-      GREEN: the load's reservation equals the first context's head-slot set term by term, and
-      the fit places every head slot in the reservation plus the free `REGION` room, demotes KV
-      only, and does not refuse. REDs: the 7.14e pack, whose capacity is the whole `WEIGHT` zone
-      with no reservation; its weights fill the zone, and the fit refuses the context, naming
-      the ring head slot (r15 C-1). **A second enumeration (rulings §M38 C-1):** the load
-      reserving from 7.14g's hand list while the fixture's producers include the recurrent
-      state; the per-term comparison finds that term's bytes missing from the reservation, and
-      the source gate fails too, since the reservation site names no cohort or term. **The 512
-      fallback:** a reservation evaluated at `n_ctx` 512, which on Qwen is short by 201326592 −
-      67108864 B of Graph scratch and is caught by that term. Handover and rollback, on the same
-      fixture:
+      merge-gate shapes. **Scored by the pure-fit run**, not by a load: H2's `kv_region_fit` on
+      the geometry the load recorded (its `WEIGHT` ranges and its `FIRST_CONTEXT` reservation,
+      from the host replay of the pack), for the model's first context at the gates' shape, `-c
+      4096 -ub 512` (`merge-gates/run-merge-gates.sh:65` for GPT-OSS 120B, `:72` for Qwen). Its
+      precondition is fkpg (a): the envelope carries 4096, and a run whose load plan prints
+      `n_ctx=512` is VOID, which fails (rulings §M38 I-5). **Pre-registered per member (rulings
+      §M38 C-1; 1oxa rev 15):** each member's class and bytes are §2.4.3's member table, the
+      known members summing to 1560297728 B (1488.0 MiB) on `gptoss120b-b1` and 2398978304 B
+      (2287.8 MiB) on `glkg-qwen35b-a3b-b1`, plus jzvq's two rows. The arm takes jzvq's values
+      at this shape from jzvq's host test before the lead's run, and without them it is VOID,
+      which fails (rulings §M39 (3)). The compute slot's figures are labelled fixture constants
+      until zhcn's load-time measure lands (below). **The arm reads the order first (rulings
+      §M41 I-1 (a)),** as the floors arm does: with 23mk's Graph-scratch commit in the tree the
+      sums above stand; with L4+L6 first the Graph scratch is an ONEDNN term and not a member,
+      and the known sums are 1560297728 B and 2197651712 B. **llama-server's default launch
+      (rulings §M41 I-3):** a second pure-fit case on Qwen at `n_seq_max` 4, the shape fkpg (a)
+      carries from the server's default `n_parallel`. The recurrent state is 263454720 B and the
+      known set 2596569344 B (2395242752 B with L4+L6 first). GREEN as below: the context is
+      sized and placed, not refused, and the larger reservation's demoted experts are C10's
+      server row (§3.3). No refusal is pre-registered for it. GREEN: the load's reservation
+      equals the first context's head-slot set term by term, and the fit places every head slot
+      in the reservation plus the free `REGION` room, demotes KV only, and does not refuse.
+      REDs: the 7.14e pack, whose capacity is the whole `WEIGHT` zone with no reservation; its
+      weights fill the zone, and the fit refuses the context, naming the ring head slot (r15
+      C-1). **A second enumeration (rulings §M38 C-1):** the load reserving from 7.14g's hand
+      list while the fixture's producers include the recurrent state; the per-term comparison
+      finds that term's bytes missing from the reservation, and the source gate fails too, since
+      the reservation site names no cohort or term. **The 512 fallback:** a reservation
+      evaluated at `n_ctx` 512, which on Qwen is short by 201326592 − 67108864 B of Graph
+      scratch and is caught by that term. **The double charge (rulings §M41 I-1 (a)):** with
+      L4+L6 first, the Graph-scratch record admitted while its draw is unconverted; the
+      reservation reads 2398978304 B against the expected 2197651712 B while ONEDNN holds the
+      same 201326592 B, and the per-term comparison fails naming `onednn_graph_scratch`. **The
+      partial placement (rulings §M41 I-2):** the set evaluated at the first dense placement
+      inside the pack, as 7.14h's text said; `moe_control` reads 0, and the per-term comparison
+      fails 16640 B short on GPT-OSS 120B and 33024 B short on Qwen. **The default-params
+      envelope (rulings §M41 I-3):** the server case sized at `n_seq_max` 1, short by 197591040
+      B of recurrent state and caught by that term. Handover and rollback, on the same fixture:
       - the context's step 5 records its placements and clears the `FIRST_CONTEXT` range in one
         group-mutex section; a failpoint just before and just after that section finds the
         reservation whole or fully taken over, never both nor neither;
@@ -6727,10 +7024,17 @@ means that.
       - the model's unload clears `WEIGHT | FIRST_CONTEXT`, and no `FIRST_CONTEXT` range
         survives it.
 
-      **zhcn's compute slot at load (rulings §M37 Q1, §Z20).** zhcn runs its measure pass once
-      at the load envelope, at n₀ and the envelope's `n_ctx`, and that value sizes the
-      reservation's compute slot. Until that lands, the arm injects the figures above as fixture
-      constants,
+      **zhcn's compute slot at load (rulings §M37 Q1, §Z20, §M40).** zhcn's one measure runs
+      for Ĉ before the pack and for c(P) after it (§2.4.2 (b) step 3), and c(P) sizes the
+      reservation's compute slot. **The bound's refusal:** a `GGML_SYCL_PRIVATE_TESTING` seam
+      adds a fixed byte count to c(P) before the compare. With c(P) + 1 MiB > Ĉ the load is
+      refused with `compute-slot-exceeds-probe-bound`, printing both values, and no
+      `FIRST_CONTEXT` or `WEIGHT` range survives the rollback. With the seam at 0 the same
+      fixture loads. A run in which the seam did not engage, so the refusal is absent and the
+      printed c(P) equals the unseamed value, is VOID, which fails. **The return:** on a fixture
+      whose c(P) < Ĉ, the shared zone's free room after the load exceeds the fixture's by Ĉ −
+      c(P). RED: a reservation that records Ĉ. Until the measure lands, the arm injects the
+      figures above as fixture constants,
       labelled as a fixture constant in the arm's output, and the plan line says whether the
       reservation carried a measured compute slot. Without one, the reservation is short by that
       slot, and where the pack filled the zone (both merge gates) no KV demotion frees room for
@@ -6751,12 +7055,11 @@ means that.
       RUNTIME is 0 on both sides (no MoE, the pipeline off, every transitional term 0), grows
       nothing; on Qwen the dry run's RUNTIME equals step 4's, 142606336 + k × 2048 B. RED:
       master's 512 MiB default left in `ensure_planned_arena_zones`
-      (`unified-cache.cpp:4505-4508`), under which the dry run reports RUNTIME growing by
+      (`unified-cache.cpp:4507-4510`), under which the dry run reports RUNTIME growing by
       536870912 B on Mistral and by 536870912 − 142606336 − k × 2048 B on Qwen, both correct
-      trees. **Mutant, against the term's own setter (rulings §M32 I-3):**
-      step 3 drops `moe_onednn` from the ledger while the load still publishes it through
-      `unified_cache_set_planned_pp_moe_onednn_weight_slot_bytes`, which the RUNTIME getter sums
-      (§2.4.2 (b) step 5). 7.14e named master's
+      trees. **Mutant, against the term's own store (rulings §M32 I-3, §M38 I-2):** step 3 drops
+      `moe_onednn` from the ledger while the load still records the slot's entry in the
+      weight-slot store, which the RUNTIME getter sums (§2.4.2 (b) step 5). 7.14e named master's
       `unified_cache_set_planned_pp_moe_onednn_scratch` call, which H7z keeps off the load path,
       so under H7z no load-time getter carried the slot and the mutant could not fire (r15 I-3).
       The ledger lacks the term, so step 4 sizes RUNTIME at the table bytes and the
@@ -6911,19 +7214,34 @@ means that.
         never into the `ggml-sycl` library that `llama-completion` loads, so the arm was VOID on
         every run, a correct one included (r16 I-5). The arm requires `batched_admitted` ≥ 1 per
         context. Two contexts of GPT-OSS 20B on the B50 at `-ub 512` and `-ub 1024`, pinned to
-        `level_zero:1`, each run one prompt; each line prints `batched_admitted` ≥ 1 and
-        `refused=0`, each plan line prints that context's own row bytes, and the refusal WARN
-        count is 0. **Positive control:** the `-ub 512` context alone must print ≥ 1, or the
-        arm is VOID. **Negative control:** a Mistral 7B context prints the line with
-        `batched_admitted=0`, so the line's presence is not the engagement;
+        `level_zero:1`, each run one prompt. **The vehicle (rulings §M41 m-7):** two
+        `llama-completion` runs, `-m /models/gpt-oss-20b-mxfp4.gguf -c 4096 -b 2048 -ub 512` and
+        the same with `-ub 1024`, each `-f` a committed fixture prompt of at least 1100 tokens,
+        `-n 1 --seed 42 --temp 0`, under `timeout 60`. The length is the point: the batched PP
+        executor (`ggml-sycl.cpp:79496`) is reached only by a prompt micro-batch (its precheck
+        refuses `ids->ne[1] <= 1`, `:78483-78485`), and 1100 tokens fill a whole micro-batch at
+        both sizes, so a short prompt cannot make the positive control VOID on a correct tree
+        (r17 m-7); each line prints `batched_admitted` ≥ 1 and `refused=0`, each plan line
+        prints that context's own row bytes, and the refusal WARN count is 0. **Positive
+        control:** the `-ub 512` context alone must print ≥ 1, or the arm is VOID. **Negative
+        control:** a Mistral 7B context prints the line with `batched_admitted=0`, so the line's
+        presence is not the engagement;
     - **`onednn_scratchpad` is one buffer per (context, queue), at its planned maximum (rulings
       §M29a, §M31, §M32 I-5, §V16 I-A).** Host arms over the pool with a stub descriptor table
       (the sizes are injected, since a `primitive_desc` needs the device's engine):
       - **one buffer, never grown:** two growth steps on one queue, both under the planned
         maximum, are served inside the one buffer. RED: today's retention, which keeps both
         buffers;
-      - **a request above the plan:** the named `[ZONE-PLAN-BUG]`, a STRICT (§G1) abort,
-        otherwise the non-oneDNN decline with a WARN and the op still runs. RED: a silent grow;
+      - **a request above the plan is a DECLINE (rulings §M36 I-3; 23mk 4.10):** the stub's
+        descriptor asks for planned max + 64 B at a site with a declared next path. GREEN:
+        `get_scratchpad_mem` returns `std::nullopt`, and the consumer takes the next path. One
+        `[ZONE-PLAN-BUG] decline dev=… site=… bytes=… planned_max=… next=…` line is emitted for
+        the (context, site) across two requests, while
+        `onednn_scratchpad_over_plan_declined` counts 2. The refusal epoch does not move, and
+        under `GGML_SYCL_STRICT_LEASES=1` the same request aborts with the line's text. REDs: a
+        silent grow (the pool's buffer changes); the compare routed through the chokepoint (the
+        epoch moves); and a second line for the same (context, site). This is 23mk's H7 DECLINE
+        arm, run against this design's compare;
       - **two contexts at different `n_ubatch` (§V16 I-A):** each holds its own buffer at its
         own planned size, and `assert_scratchpad_planned(stream)`, which replaces
         `pre_allocate_scratchpad` and has no size argument, only asserts the buffer exists at
@@ -7197,20 +7515,44 @@ means that.
     loads on device 0. After B's load, A's rows (handles, sizes, depth) and A's model's weight
     slot are unchanged, B's load drew only B's weight slot, and A's next PP MoE claim succeeds.
     **The mechanism (§2.4.2 (b) step 3):** the weight-slot store is keyed by (model, device), so
-    B's setter writes B's entry and A's executor reads A's; A's load laid out RUNTIME at A's D
-    terms, so B's pack places B's slot in RUNTIME's free room where it fits and otherwise as a
-    `{LOAD, txn}` range in the shared zone, retagged `{MODEL, B}` at the commit and drawn inside
-    B's load. **Pre-registered, on two fixtures:** (1) A = GPT-OSS 20B (weight slot 32 ×
-    4406528 = 141008896 B) and B = a GPT-OSS-20B-shaped fixture with one partial expert layer
-    on the device, whose slot is smaller, so `get(A, 0)` = 141008896 B and `get(B, 0)` is B's
-    value, both after B's load; B's slot is a shared-zone range, since RUNTIME has no free
-    room, and RUNTIME's capacity is unchanged; (2) A = Mistral 7B (no MoE: RUNTIME laid out at
-    0) and B = GPT-OSS 20B: B's 141008896 B slot and its k × 256 B tables are `{MODEL, B}`
-    ranges in the shared zone, and the load refuses nothing. REDs: master's
-    `populate_inventory_globals`, which releases the ring, so A's claim finds none and reports
-    `[CONTEXT-PLAN-BUG]`; and **last-writer-wins**, 7.14g's `(dev, bytes)` store, under which
-    `get(0)` after B's load returns B's value on fixture (1), so A's next claim admits against
-    B's slot size and the exact bytes catch it.
+    B's load transaction records B's entry and A's executor reads A's; A's load laid out RUNTIME
+    at A's D terms, so B's pack places B's slot in RUNTIME's free room where it fits and
+    otherwise as a `{LOAD, txn}` range in the shared zone, retagged `{MODEL, B}` at the commit
+    and drawn inside B's load. **Pre-registered, on two fixtures:** (1) A = GPT-OSS 20B (weight
+    slot 32 × 4406528 = 141008896 B) and B = a GPT-OSS-20B-shaped fixture with one partial
+    expert layer on the device, whose slot is smaller, so `get(A, 0)` = 141008896 B and `get(B,
+    0)` is B's value, both after B's load; B's slot is a shared-zone range, since RUNTIME has no
+    free room, and RUNTIME's capacity is unchanged. The step-5 witness, keyed per (model,
+    device), passes: B's ledger equals B's placed ranges, and RUNTIME holds A's 141008896 + k ×
+    256 B (rulings §M41 I-4 (b)). RED: 7.14h's per-load equality, which fires here on a correct
+    tree; (2) A = Mistral 7B (no MoE: RUNTIME laid out at 0) and B = GPT-OSS 20B: B's 141008896
+    B slot and its k × 256 B tables are `{MODEL, B}` ranges in the shared zone, and the load
+    refuses nothing. REDs: master's `populate_inventory_globals`, which releases the ring, so
+    A's claim finds none and reports `[CONTEXT-PLAN-BUG]`; and **last-writer-wins**, 7.14g's
+    `(dev, bytes)` store, under which `get(0)` after B's load returns B's value on fixture (1),
+    so A's next claim admits against B's slot size and the exact bytes catch it. **(3) B's D
+    terms fit nowhere (rulings §M39 (1)):** A = GPT-OSS 20B on a fixture arena whose RUNTIME
+    holds exactly A's D terms and whose shared zone A's weights and first-context reservation
+    leave with 64 MiB free. B = a second GPT-OSS 20B, whose 141008896 B weight slot fits in
+    neither. GREEN: B's load is refused at its early stage with the named line, naming
+    `moe_onednn`, zone RUNTIME, device 0, need 141008896 B, zone free 0 B and shared zone free
+    67108864 B. B's `{LOAD, txn}` ranges are rolled back, A's entries and ranges are unchanged,
+    and the process has zero `[EXT-ALLOC]` lines with `GGML_SYCL_EXT_ALLOC_TRACE=1`. REDs: a
+    pack that admits B's load without the term, whose first PP MoE claim then finds no slot; and
+    a fall-through draw, which is caught by its `[EXT-ALLOC]` line. **(4) ONEDNN, a later load's
+    W above the laid-out zone (rulings §M41 I-4 (a)):** a fixture arena after the ONEDNN floor's
+    removal. A = GPT-OSS 120B lays ONEDNN out at its W, 23592960 B; B = Mistral 7B Q4_0, whose W
+    is 117440512 B. GREEN: B's W is a 117440512 B `{MODEL, B}` range in the shared zone
+    (ONEDNN's free room is 0), ONEDNN stays at 23592960 B, B's oneDNN PP reorder draws inside
+    B's range, and the load refuses nothing. With the fixture's shared-zone free room set below
+    117440512 B, B is refused by name, naming `onednn_pp_w`, zone ONEDNN, need 117440512 B, zone
+    free 0 B and the fixture's shared free bytes; B's ranges are rolled back and the process
+    prints zero `[EXT-ALLOC]` lines. RED: 7.14h's RUNTIME-only rule, under which B's step 4
+    tries to grow ONEDNN over A's live bytes and B is refused with "cannot be rebuilt". **(5)
+    SCRATCH, the same shape:** a fixture arena after the SCRATCH floor's removal, whose SCRATCH
+    A lays out at A's terms, 67108864 B, and B's SCRATCH terms are 100663296 B. GREEN: B's terms
+    are a 100663296 B `{MODEL, B}` shared-zone range and SCRATCH stays at 67108864 B; the
+    fit-nowhere variant and the RED as in (4).
   - **Every publisher under L0 (rulings §L0R, §M8 I-1, §M9 F5).** The model runs, against a
     parked L0 holder, each exported entry §2.4.2 lists: the wrapper, the probe, the FA recheck,
     activate, unload with its failure republish, the quarantine reap through
@@ -7465,26 +7807,112 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
     either way. A run that logs no release line and
   demotes KV layers instead is §M18.3's regression, which §M18.3a withdraws, and fails C8.
 - **C9 zero `[EXT-ALLOC]` lines of any role on both merge gates (rulings §M38 C-2; P1).** The
-  two merge-gate commands of `merge-gates/run-merge-gates.sh` (`gptoss120b-b1` and
-  `glkg-qwen35b-a3b-b1`, `-c 4096 -ub 512`, `level_zero:1`), each once, with
+  two merge-gate commands of `merge-gates/run-merge-gates.sh` (`gptoss120b-b1` at `:65` and the
+  Qwen gate at `:72`, `-c 4096 -ub 512`, `level_zero:1`), each once, with
   `GGML_SYCL_EXT_ALLOC_TRACE=1` added. The line prints only under that variable
   (`unified-cache.cpp:3960-3968`, `:15309`), and the gate logs in hand were taken without it and
   hold none, so a zero from them would be vacuous:
   ```
   cat <gate>.err | grep -c 'EXT-ALLOC'      # 0, every role, on both gates
   ```
-  - **Positive control, before the scored runs:** the two commands on `c69d5774d` with
-    `GGML_SYCL_RUNTIME_ARENA_MB=0`, which takes RUNTIME's floor away from the unconverted draws
-    of §2.4.2 (b)'s census (the precedent is the 423624704 B `backend-buffer-runtime-zone` line
-    that 23mk's census records going raw on a GPT-OSS B50 run, its CR-2 control). At least one
-    `[EXT-ALLOC]` line must print, or C9 is VOID. That shows the trace is armed and that a draw
-    left without room reaches the line.
+  7.14h cited the script for both gates, but it carried only GPT-OSS 120B, and the Qwen model is
+  not under `/models` (r17 m-2). The Qwen command, added to the script at `:72` (rulings §M41
+  m-2), is the shape of `glkg-qwen35b-a3b-b1.log:2667-2673` (`n_ctx` 4096, `n_batch` 2048,
+  `n_ubatch` 512, `n_seq_max` 1):
+  ```
+  timeout -k 15 1500 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
+    -m /Storage/GenAI/models/Qwen3.6-35B-A3B-UD-Q5_K_S.gguf -c 4096 -b 2048 -ub 512 --jinja \
+    -p 'Count from 1 to 5:' -n 8 --seed 42 --temp 0 --verbose
+  ```
+  It writes `qwen35b-a3b-b1.log`, so it never overwrites the 2026-09-17 log this design cites.
+  That log, and `gptoss120b-b1.log`, end in aborts (`pinned-buffer-pool.cpp:122` at
+  `glkg-qwen35b-a3b-b1.log:4847`; `ggml-sycl.cpp:29064` at `gptoss120b-b1.log:2722`, rc=134 in
+  `results.txt`), so neither is a baseline: C9's baseline is re-taken on `c69d5774d`, and a
+  baseline run that does not reach rc=0 is VOID, which fails.
+  - **Positive controls, on knobs that move (rulings §M41 m-1).** 7.14h set
+    `GGML_SYCL_RUNTIME_ARENA_MB=0` on the two gates, but the variable lowers only the default
+    (`unified-cache.cpp:4507-4510`), and the planned requirement raises RUNTIME back to 1617.9 /
+    1672.3 MB (`:4519-4535`; `gptoss120b-b1.log:1544`, `glkg-qwen35b-a3b-b1.log:2024`), so the
+    control laid out the baseline's arena, and any line it printed was the baseline's own (r17
+    m-1). Instead: (1) **the Mistral gate** on `c69d5774d` with the trace on, whose planned
+    RUNTIME is 0, run with and without `GGML_SYCL_RUNTIME_ARENA_MB=0`; the `=0` run must print
+    more `[EXT-ALLOC]` lines than the run without it, or C9 is VOID. (2) **On the scored tree**,
+    where L4+L6 deletes the variable, a `GGML_SYCL_PRIVATE_TESTING` seam injects one RUNTIME
+    draw one byte over RUNTIME's free room with `forbid_vram_zone_spill` cleared; it must print
+    its `[EXT-ALLOC]` line, or C9 is VOID. (1) shows that a draw left without room reaches the
+    line, and (2) that the trace is armed on the tree being scored.
   - **Baseline:** the two gate commands on `c69d5774d` with the trace on. Every cohort they
     print is either converted by a commit that lands before L4+L6 (§4), a term's draw, or a
     named defect with a ticket, recorded on the ticket before L4+L6 lands. A cohort left out
     of all three fails C9's precondition, and L4+L6 does not land over it.
   - **Scored at the L4+L6 tree:** 0 lines of any role on both gates, rc=0, and the gates'
     own checks green. C1 keeps its KV-role count, which this generalises to every role.
+  - **The leg's other buffers (rulings §M41 I-5).** Neither gate allocates them, so each has a
+    run of its own, lead-run once, pinned to `level_zero:1`, with the trace on. **The control
+    vector:** the Mistral gate command plus `--control-vector` with a fixture control vector of
+    zeros (`n_embd` f32 per layer, so the tokens are the gate's), which reaches
+    `llama_set_adapter_cvec`. **The state-seq buffers:** `test-save-load-state` with
+    `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` (`tests/test-save-load-state.cpp:315`). GREEN: zero
+    `[EXT-ALLOC]` lines, the context's plan line naming the control-vector or state-seq range
+    (or the run is VOID, since a run that never allocated the buffer also prints no line), and
+    the gate's tokens or the state round-trip unchanged. RED: the L4+L6 tree with the leg as
+    7.14h left it (no `WEIGHT` routing, no `forbid_vram_zone_spill`, no context homes), where
+    Mistral's RUNTIME is 0, so each run prints its buffer's `[EXT-ALLOC]` line.
+  - **The unplanned buffer (rulings §M41 I-5):** a unit arm, a SYCL test lead-run once,
+    allocates a 1 MiB buffer on a SYCL<n> buffer type outside every claim scope, on an L4+L6
+    arena whose RUNTIME is 0. GREEN: NULL, the `unplanned SYCL%d buffer` line, and zero
+    `[EXT-ALLOC]` lines. RED: the leg without `forbid_vram_zone_spill`, which prints one.
+- **C10 the merge gates' placement, plan == reality (rulings §M39 (2)).** The first-context
+  reservation takes room that master's pack spent on experts, so fewer experts sit on the
+  device, and the CPU runs the rest (placement decides the executor). That is the plan being
+  honest: master placed those experts only because the context's own memory was unplanned,
+  which is §M32 C-1's defect. C10 pre-registers the counts and scores the run against them.
+  - **Pre-registered from the host replay of the pack at the L4+L6 tree, before the lead's
+    run:** for each gate, `device_groups` and `host_groups` from the `[PLACEMENT-MOE] triplet
+    packing` line, and the KV device and host layer counts from the `[LOAD-SUMMARY]` line. The
+    replay is H7ap's, on the gate's model header and the B50's arena, so these numbers are the
+    plan's. This design does not pin them as literals, because they move with jzvq's terms
+    and with which of L4+L6 and the Graph-scratch commit lands first (the ONEDNN floor).
+  - **Master, for the label** (`merge-gates/*.log` at the gate baseline): GPT-OSS 120B
+    `device_groups=781 host_groups=3827`, KV 18 device / 0 host layers
+    (`gptoss120b-b1.log:196`, `:2026`); Qwen `device_groups=4646 host_groups=5594`, KV 5
+    device / 5 host layers (`glkg-qwen35b-a3b-b1.log:222`, `:2730`).
+  - **Orientation, not a gate.** The pack's capacity is this design's weight zone less the
+    reservation, which on Qwen is 751.8 MiB below master's weight zone: 12178.0 − (13714.0 −
+    2287.8) = 751.8 MiB, about 364 fewer groups at 2.0625 MiB per group (9582.4 MiB / 4646), or
+    about 256 fewer once the ONEDNN floor's 224.0 MiB returns. On GPT-OSS 120B it is 408.0 MiB,
+    about 32 fewer groups at 12.61 MiB, or about 14 fewer after the floor's 233.5 MiB. jzvq's
+    terms reduce both a little more. With L4+L6 first, GPT-OSS 120B's ONEDNN holds master's
+    Graph-scratch value (rulings §M41 I-1 (b)), 534.5 MiB above the floor, so about 42 more
+    groups go to the host until 23mk's Graph-scratch commit; on Qwen the interim ONEDNN is 32.0
+    MiB below the floor.
+  - **llama-server's default launch (rulings §M41 I-3):** a replay row, not a GPU run. The
+    replay also packs Qwen at `n_seq_max` 4 and pre-registers its `device_groups`, `host_groups`
+    and KV layer counts the same way; the recurrent state's 197591040 B (188.4 MiB) more is
+    about 91 more groups on the host. GPT-OSS's counts do not move.
+  - **Scored:** the run prints exactly the replay's `device_groups`, `host_groups` and KV
+    layer counts, and a difference in either direction fails C10 as plan != reality. The
+    gates' correctness checks are unaffected and score as before. Throughput against master is
+    recorded, labelled "placement: N fewer device expert groups than master (rulings §M39
+    (2))". It is a known regression in placement, not a throughput gate, and C6's
+    expected-zero delta does not apply to the MoE gates. The room comes back through the
+    planned-memory work that shrinks the reservation (jzvq's exact caches, zhcn's carve), not
+    by shrinking the reservation below the plan.
+
+- **C11 the compute-slot bound, c(P) ≤ Ĉ (rulings §M40).** Once on each gate model: Mistral
+  7B Q4_0 on the B70 and on the B50 (C2's command), GPT-OSS on the B50 (C3's 20B command and
+  the `gptoss120b-b1` merge gate), and the Qwen merge gate. Each run prints, per device,
+  `[FIRST-CONTEXT] dev=… compute_probe=… compute_placed=… splits_probe=… splits_placed=…`.
+  - **Pre-registered:** `compute_placed` ≤ `compute_probe` on every run, and no
+    `compute-slot-exceeds-probe-bound` line. On the all-device shapes (both Mistral runs and
+    GPT-OSS 20B) the placement is the probe's, so the two values and the two split counts are
+    equal. On the two MoE merge gates the pack tiers experts to the host, which the CPU runs
+    inside the backend op without a graph split, so the split counts are also pre-registered
+    equal. If a merge gate tiers whole layers, `splits_placed` exceeds `splits_probe`, and the
+    printed values decide.
+  - **Scored:** a run without the line is VOID, which fails. A run that refuses, or that
+    prints `compute_placed` > `compute_probe`, fails C11. Its fix is a split-copy bound term in
+    Ĉ, with the run repeated, never a looser compare.
 
 ## 4. Decomposition, effort, landing order
 
@@ -7494,7 +7922,7 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
 | L3 | pure `kv_region_fit` (multi-extent, self extents, `forced_host`, `own_ranges`-restricted commit re-fit, strict prefix, carve mirroring, indexed head slots placed first with reuse in place, the context's ring rows as its own head slots (7.14f; rulings §M32 I-1), the recurrent slot, sidecar companion slots, the cost-ordered pack with the two-way optional classification, pending ranges as allocated, the stated demotion order, `free_after_full_kv` and demotion causes), the `context_side_demand` record (MODEL/CONTEXT scopes, indexed slots) and its reconciliation, `kv_layer_cells` + `kv_layer_tensor_bytes` (the one byte function) and the RS-buffer size function, `kv-region-registry.hpp` (registry with tenant slots, scope, residency answer with the no-region fallback, the two-phase guard model, the release proc model); H2, H3, H6, H8, H9 | `kv-runtime-demotion.{hpp,cpp}`, `kv-region-registry.hpp`, `unified-cache.hpp` (`kv_layer_bytes_for_kind` delegates), their tests | xhigh | L1, jehw on master, the zhcn protocol (agreed, §6.6) | after jehw |
 | L4 | `context_side` (explicit `lifetime` field threaded into `zone_alloc`, LIVE/RETAINED states and the slot tag, the reserved-slot carve as owner-first handles, `claim_slot`/`release_claim` with event-chained reuse and per-slot claim state, atomic retained-run carve, settle refusals for pending ranges, the plan-violation ERROR with an error status, pending ranges on the shared zone's TLSFs (the context's head slots and KV, `WEIGHT`, `FIRST_CONTEXT`, and a later load's D terms that RUNTIME cannot hold) and on RUNTIME for the D terms of the load that laid it out (rulings §M38 m-2, I-2; §2.3.3 A1), `live_bytes()` beside an unchanged `zone_available`), `allocate_excluding` with range exclusion (used whenever a pending range exists), `allocate_at`, and a whole-TLSF block census (L1 follow-ups), retained-run registration hygiene and the `live_bytes` readers, the per-extent and per-slot owner-first carve inside `zone_alloc`'s locked section with controls pre-minted before L1 (`unified_allocate_owner` split into mint and bind halves), leaf `kv_region_mutex_` added to contract §12.5 (L3), locked geometry snapshot (cache locks then group mutex, with jehw's predicate), `reserve_kv_region`, strict-prefix `yield_optional_prefix`, `backend-buffer-kv-zone` passing its buffer's role, removal of the dead `KV_AUTO` reclaim and of the `arena_reserve` KV reclaim, N-chunk routing, and **1oxa's `GGML_SYCL_PRIVATE_TESTING` dump of `shared_zone_geometry` plus `kv_region_request` at each fit** (step 2 and the tenant-only path; lead-approved, for 1oxa's VM branch to test against); H4, H4b, H5 | `unified-cache.{hpp,cpp}`, `tlsf-allocator.hpp` (two primitives), `ggml-sycl.cpp` (the kv-zone fallback's role) | xhigh | L1, L3, **zhcn landed, beni's producers landed, llama.cpp-jzvq closed** (lead ruling, r4 I10), **llama.cpp-uwlx landed** (the pick-list yield, §2.4.2 step 5; r5 m-g), **llama.cpp-fkpg (a) landed** (the envelope's `n_ctx`, which sizes `FIRST_CONTEXT`; rulings §M38 C-1), **zhcn's `fattn-onednn` carve and 23mk's reorder temporary landed** (rulings §M38 C-2) | after zhcn, beni producers, jzvq, uwlx, fkpg (a) |
 | L5 | the optional pass after all S1 staging (dense + expert/DPAS); `zone_alloc_optional` | `ggml-sycl.cpp` S1 block | medium | L4 | with L4/L6 |
-| L6 | llama side: `llama_kv_layer_shapes` and `llama_rs_layer_shapes` factored out and stored at the first publish, the `ggml_sycl_runtime_context_desc` descriptor (KV-shape with sidecar and `n_stream`, recurrent section; zhcn's tenant section filled by zhcn) and its publish entry point, the scope procs with an RAII guard, the one `ggml_backend_sycl_kv_region_release` call site in the `sycl_plan_guard` member's destructor (zhcn M1, with the ContextId captured at `create_exec`), and `llama_recurrent_sycl_kv_buft` returning the recurrent-state buft. Backend side: the transaction steps of §2.4.2 (two-phase guard without L1, idempotent key without `n_ubatch`, the tenant-only path with zhcn's step (i) (the own-context graph clear behind its recorded-graph gate, the slot-table take at (c), the reap call with its backstop, the use-count bound; r6), reuse in place for host slots, the ring rows in the context's slot table with the executor re-keyed to them (7.14f; rulings §M32 I-1), the slot-state retention moved out at a row growth and at teardown and handed off after the unlock at every removal site (r6 I-4, I-6; r7 m-5), the model load's ring release and ring writes removed on arena devices (llama.cpp-r7fz), plan / accounting / predictable refusals / pending ranges / yield / restricted re-fit and carve / MMID / CAS / commit installing the slot table / superseded drops after L1), the registry release proc, `g_execution_backend_binding_mutex` census entry, the residency hook answering from the registry, the tiered claim with `set_owner(mem_handle)` slice views and the KV-only size check, the sidecar companion claim, the recurrent-state buft, the per-extent clear with event-held slices, BLOCK_EXEC_CANDIDATE_KV ignored under an arena (the VMEM_KV refusal is 23mk core's, §2.6), the second sources deleted (§2.2, the budget-room check included), both ERROR sites and their §G1 abort through `ggml_sycl_strict_enabled()` (uwlx exports the accessor and makes §G1a's three doc edits, rulings §G1b; only if this commit lands before uwlx does it carry both, §2.8), the dark B50 lever, `GGML_SYCL_KV_REGION_TRACE`; H7 with the unconverted-site list, the CPU-buft llama shape tests, G1. **Absorbs revision 1's L2.** | `ggml-sycl.cpp`, `ggml-sycl.h`, `unified-cache.cpp`, `fattn.cpp`, `common.hpp`, `src/llama-context.{h,cpp}`, `src/llama-model.cpp`, `src/llama-kv-cache.{h,cpp}`, `src/llama-memory-recurrent.cpp`, tests | xhigh | L3, L4, L5 | before beni's conversions |
+| L6 | llama side: `llama_kv_layer_shapes` and `llama_rs_layer_shapes` factored out and stored at the first publish, the `ggml_sycl_runtime_context_desc` descriptor (KV-shape with sidecar and `n_stream`, recurrent section; zhcn's tenant section filled by zhcn) and its publish entry point, the scope procs with an RAII guard, the one `ggml_backend_sycl_kv_region_release` call site in the `sycl_plan_guard` member's destructor (zhcn M1, with the ContextId captured at `create_exec`), and `llama_recurrent_sycl_kv_buft` returning the recurrent-state buft. Backend side: the transaction steps of §2.4.2 (two-phase guard without L1, idempotent key without `n_ubatch`, the tenant-only path with zhcn's step (i) (the own-context graph clear behind its recorded-graph gate, the slot-table take at (c), the reap call with its backstop, the use-count bound; r6), reuse in place for host slots, the ring rows in the context's slot table with the executor re-keyed to them (7.14f; rulings §M32 I-1), the slot-state retention moved out at a row growth and at teardown and handed off after the unlock at every removal site (r6 I-4, I-6; r7 m-5), the model load's ring release and ring writes removed on arena devices (llama.cpp-r7fz), plan / accounting / predictable refusals / pending ranges / yield / restricted re-fit and carve / MMID / CAS / commit installing the slot table / superseded drops after L1), the registry release proc, `g_execution_backend_binding_mutex` census entry, the residency hook answering from the registry, the tiered claim with `set_owner(mem_handle)` slice views and the KV-only size check, the sidecar companion claim, the recurrent-state buft, the per-extent clear with event-held slices, BLOCK_EXEC_CANDIDATE_KV ignored under an arena (the VMEM_KV refusal is 23mk core's, §2.6), the second sources deleted (§2.2, the budget-room check included), both ERROR sites and their §G1 abort through `ggml_sycl_strict_enabled()` (uwlx, the accessor's sole definer, exports it and makes §G1a's three doc edits, and this commit lands after uwlx's merge, rulings §G1b, §G1c, §2.8), the dark B50 lever, `GGML_SYCL_KV_REGION_TRACE`; H7 with the unconverted-site list, the CPU-buft llama shape tests, G1. **Absorbs revision 1's L2.** | `ggml-sycl.cpp`, `ggml-sycl.h`, `unified-cache.cpp`, `fattn.cpp`, `common.hpp`, `src/llama-context.{h,cpp}`, `src/llama-model.cpp`, `src/llama-kv-cache.{h,cpp}`, `src/llama-memory-recurrent.cpp`, tests | xhigh | L3, L4, L5 | before beni's conversions |
 | L7 | docs: memory-design section, contract §3/§5.2/§5.3/§12.5 (the binding-lock chain, the L5 group → `g_runtime_alloc_mutex` order, the step-6 carve exception), arena comment, limits (§2.9), lock order, the tenant protocol and the descriptor's layout rules, the owner-visible weight-hole line | docs, `unified-cache.hpp` comment | medium | L6 | with L6 |
 
 **Revision 7.7's additions to the rows (r8; rulings §M8, §M76a, §ZR5).**
@@ -7671,16 +8099,16 @@ I-A, §V16a).**
   with r15 C-1 the first context on either gate was refused from L4 on. The rows' `REGION`
   placement and the load's removal of them are now one commit, so no tree between them exists.
   The commit carries both rows' lists below and above; L5 stays with it as before.
-- **L4+L6, the ring (rulings §M32 C-1, I-1, I-3):** the per-context rows as CONTEXT head
-  slots in the context's slot table, sized by the resident-expert value function; the
-  executor re-keyed to them (`ggml-sycl.cpp:78760-78767`, `:78817`, `:78823`), its lazy
-  reserve made a presence check; the per-(model, device) weight slot drawn at load under
-  `{MODEL, id}`, published by `unified_cache_set_planned_pp_moe_onednn_weight_slot_bytes` and
-  mapped to `MOE_ONEDNN` by the setter gate, and the `:15961-15967` call deleted on arena
-  devices; the device ring record, its generation, RELEASING, pins and contributions deleted,
-  with the KV-zone split and `unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes`; the
-  load-time reserve at `ggml-sycl.cpp:5657-5680` deleted on arena devices; the RUNTIME getter
-  rewritten to the three D stores (§2.4.2 (b) step 5).
+- **L4+L6, the ring (rulings §M32 C-1, I-1, I-3):** the per-context rows as CONTEXT head slots
+  in the context's slot table, sized by the resident-expert value function; the executor
+  re-keyed to them (`ggml-sycl.cpp:78760-78767`, `:78817`, `:78823`), its lazy reserve made a
+  presence check; the per-(model, device) weight slot drawn at load under `{MODEL, id}`,
+  recorded in the (model, device) weight-slot store by the load's transaction (7.14f's setter is
+  withdrawn at 7.14i; rulings §M38 I-2), and the `:15961-15967` call deleted on arena devices;
+  the device ring record, its generation, RELEASING, pins and contributions deleted, with the
+  KV-zone split and `unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes`; the load-time
+  reserve at `ggml-sycl.cpp:5657-5680` deleted on arena devices; the RUNTIME getter rewritten to
+  the three D stores (§2.4.2 (b) step 5).
 - **L4+L6, the first context (rulings §M32 C-1 (a), §M38 C-1):** the pack's per-expert
   ring-row increments and the rest of the first context's head-slot set, from
   `context_demand_records` at the envelope's shape, charged to the device reservation, with no
@@ -7700,7 +8128,8 @@ I-A, §V16a).**
   descriptor table over every family under its gate; the per-context queue set, frozen at the
   transaction; `assert_scratchpad_planned(stream)` in place of `pre_allocate_scratchpad`'s
   size argument and global read; the climb as a C-term re-place swapped into
-  `scratchpad_map[q]` at the publish; the `get_scratchpad_mem` site gate.
+  `scratchpad_map[q]` at the publish; the `get_scratchpad_mem` site gate; and the DECLINE
+  (7.14i, below).
 - **L4 replaces zhcn's H2 (1)/(1b) interim arm with zhcn 5.13's arm (1h), in the same
   commit** (zhcn ships the interim arm because it lands before A becomes a head slot). (1h)
   checks three things: the head-slot extents are disjoint in `{CONTEXT, id} ∩ REGION`, A
@@ -7724,9 +8153,10 @@ I-A, §V16a).**
 - **L4+L6's prerequisites on RUNTIME (rulings §M38 C-2):** zhcn's carve of the oneDNN FA
   materializations and 23mk's reorder temporary land before it, jzvq before L4 as before, and
   beni's rows 13 and 14 keep the transitional `xmx_moe_buffers` term until beni converts them.
-  L4+L6 deletes `dense-scheduler.cpp:29`'s caller-less draw and master's 512 MiB RUNTIME
-  default at `unified-cache.cpp:4505-4508` (I-3), and adds C9, zero `[EXT-ALLOC]` lines on both
-  merge gates (§3.3).
+  L4+L6 deletes `dense-scheduler.cpp:29`'s caller-less draw (its dependents: the 7.14i rows
+  below) and master's 512 MiB RUNTIME default at `unified-cache.cpp:4507-4510` (I-3; decl
+  `:4507`, `getenv` `:4508`, assignment `:4509`; 7.14h cited `:4505-4508`, which starts at the
+  `#endif`, r17 m-3), and adds C9, zero `[EXT-ALLOC]` lines on both merge gates (§3.3).
 - **L4+L6, the ring's setters (rulings §M38 I-1):** the arena-path calls of the four
   device-global setters are deleted, and H7z (aj) gates their reachability.
 - **L4+L6, the weight slot (rulings §M38 I-2):** the store is keyed by (model, device), and a
@@ -7735,7 +8165,66 @@ I-A, §V16a).**
 - **L4+L6, the ring's engagement line (rulings §M38 I-5):** the per-context
   `[PP-MOE-RING]` WARN line, in every build.
 - **The strict switch (rulings §G1b):** uwlx exports `ggml_sycl_strict_enabled()` and makes
-  §G1a's three doc edits; L4+L6 carries them only if it lands before uwlx.
+  §G1a's three doc edits. (7.14h's clause letting L4+L6 carry them if it landed first is
+  withdrawn by rulings §G1c at 7.14i.)
+
+**Revision 7.14i's changes to the rows (rulings §M39, §M40, §M41, §G1c; 23mk 4.10, 1oxa rev 15,
+zhcn 5.16).**
+- **L4+L6, the weight slot (rulings §M38 I-2; zhcn 5.16 relay):** no setter. The load's
+  transaction records the (model, device) entry, its commit and rollback settle it, and the
+  unload erases it. H7z (aj)'s writer gate is added. A later load's D term that fits in neither
+  RUNTIME's free room nor the shared zone refuses the load by name (rulings §M39 (1)), with
+  H9's third fixture.
+- **L4+L6, the oneDNN scratchpad's DECLINE (rulings §M36 I-3; 23mk 4.10):** the over-max
+  compare in `get_scratchpad_mem`, the `[ZONE-PLAN-BUG] decline` line through core's emitter,
+  the `onednn_scratchpad_over_plan_declined` counter and the strict abort. **It lands after
+  23mk's §11 step 3**, which lands the `std::optional` contract and the 11 declared next paths.
+- **C10 (rulings §M39 (2)):** the merge gates' placement counts, pre-registered from the pack's
+  host replay and scored as plan == reality, with the comparison to master labelled as a
+  placement regression.
+- **L4+L6, the first context's evaluation (rulings §M41 I-2, I-3):** the reservation evaluated
+  from the pack's inputs, as a bound before the pack and the admitted value after it, with the
+  difference returned and the bound witness; the envelope's `n_seq_max`, flash-attention choice
+  and KV types from fkpg (a)'s transport, which the fkpg (a) edge now covers; H7ap's
+  partial-placement, default-params and server cases; C10's server row.
+- **L4+L6, one charge per byte (rulings §M41 I-1):** `context_demand_records` skips a producer
+  whose site is on H7p's unconverted list; the first-context and floors arms read the order,
+  with the interim at master's Graph-scratch value (828899328 B of ONEDNN on GPT-OSS 120B,
+  234881024 B on Qwen) and the double-charge RED.
+- **L4+L6, the later load (rulings §M41 I-4):** every zone's P and D terms of a later load go to
+  that zone's free room or the shared zone, else the renamed `[LOAD-PLAN] term %s of zone %s`
+  refusal; the step-5 witness keyed per (model, device); H9's fixture (1) scored against it, and
+  fixtures (4) and (5).
+- **L4+L6, the `ggml-sycl.cpp:37657` leg (rulings §M41 I-5):** WEIGHT-role buffers to the
+  `WEIGHT` zone, `runtime_req.forbid_vram_zone_spill` with the `unplanned SYCL%d buffer`
+  refusal, and context-owned homes for the control vector and the on-device state-seq buffers;
+  `forbid_vram_zone_spill` on the two XMX MoE draws (`common.hpp:6855`, `:6887`; rulings §M41
+  m-9); C9's control-vector, state-seq and unplanned-buffer arms, and its Mistral and seam
+  controls (rulings §M41 m-1).
+- **L4+L6, the dense scheduler's dependents (rulings §M41 m-5; §M36 I-4's rule):** the class
+  goes whole, `dense-scheduler.cpp` and `dense-scheduler.hpp` (the ggml-sycl source globs at
+  `ggml/src/ggml-sycl/CMakeLists.txt:45`, `:83` drop them, so no CMake edit), and in the same
+  commit its dependents: `tests/test-dense-scheduler.cpp`, which includes the header and is
+  neither registered nor built (deleted); the checker's dense-scheduler rule, the loop at
+  `scripts/check-sycl-alloc-usage.sh:1249-1270` with its pattern at `:113` (deleted, since the
+  file it names is gone); and `tests/test-sycl-alloc-policy.sh:247-250`'s expectation with its
+  fixture directory `tests/sycl-alloc-policy-fixtures/bad-dense-scheduler-slot-legacy-owner/`
+  (both deleted). The gate: `test-sycl-alloc-policy` passes after the commit, and a tree search
+  for `dense_layer_scheduler` or `dense-scheduler` outside `docs/` and the historical
+  `artifacts/7f2e/` returns nothing.
+- **H7 (e) and H7z (aj) (rulings §M41 m-4, m-10):** `GGML_SYCL_HANDLE_STRICT` allowlisted by
+  name, with the `FOO_STRICT` witness and master as the positive control; the no-arena setter
+  calls isolated in `ggml_sycl_ring_setters_no_arena`, with the moved-call mutant.
+- **L4 and jzvq (rulings §M39 (3)):** L4 does not land before jzvq's host test supplies its
+  two rows of the member table at the gates' shape (§2.4.3).
+- **L4+L6, the compute slot's bound (rulings §M40):** the probe kept alive until c(P), under
+  a scope guard on commit and rollback; the pack's capacity less Ĉ; the reservation recorded
+  at c(P), with Ĉ − c(P) returned; the `compute-slot-exceeds-probe-bound` refusal and its
+  test seam; the late check against c(P); the `[FIRST-CONTEXT]` WARN line; H7ap's arms and
+  C11. zhcn lands the measure function and its three call sites' inputs.
+- **The strict accessor's edge is hard (rulings §G1c):** every moua commit that calls
+  `ggml_sycl_strict_enabled()` lands after uwlx's merge. No moua commit carries the export or
+  §G1a's doc edits, and 7.14h's fallback clause is withdrawn.
 
 **Landing order (lead ruling; r4 I10).** jehw lands on master first (u1bb already has). Then:
 1. moua L1-L3 (pure, host-tested; L1 is done). zhcn and beni need L3's record type,
@@ -7743,7 +8232,8 @@ I-A, §V16a).**
 2. llama.cpp-zhcn: the measure pass, its tenants, the descriptor's tenant section, the deletion
    of the per-row constant.
 3. llama.cpp-beni's **producers**: the demand functions and zhcn-walker visitors for its
-   cohorts, including the oneDNN Graph scratch.
+   cohorts. The oneDNN Graph scratch's producer is 23mk's function, carried by 23mk's
+   Graph-scratch commit in beni (rulings §M41 m-6).
 4. moua L4-L7. L4 needs every producer that exists at its landing to be real, because a
    converted site with no producer fails H7p; sites not yet converted are on H7p's list
    (§2.4.3's transition rule), so L4 does not wait for beni's conversions.
@@ -7756,8 +8246,12 @@ decode path and would otherwise be unplanned at L4 (r4 I10(c)). llama.cpp-uwlx (
 `yield_optional_layouts_begin`, owner impl-jehw) depends on jehw and lands before L4, which is
 its consumer. llama.cpp-423j (retire on request, §2.9) depends on uwlx and moua L1-L3 and can
 land at any point after them; until it does, leased copies are not yieldable, and the WARN is
-the owner-visible record. So: jehw → uwlx → 423j, and uwlx → moua L4. And fkpg (a) → moua
-L4 (rulings §M38 C-1).
+the owner-visible record. So: jehw → uwlx → 423j, and uwlx → moua L4, which is also the hard
+edge for the strict accessor: every moua commit that calls `ggml_sycl_strict_enabled()` lands
+after uwlx's merge (rulings §G1c). And fkpg (a) → moua L4 (rulings §M38 C-1; the transport
+carries `n_ctx`, `n_seq_max`, the flash-attention choice and the KV types, rulings §M41 I-3),
+jzvq's host test → moua L4 (rulings §M39 (3)), and 23mk's §11 step 3 → moua L4+L6 (the DECLINE;
+rulings §M36 I-3).
 
 - L3 through L7 form one series in one worktree, so there is one first build and the
   follow-ups reuse it. L3 lands first on its own; L4-L7 follow, rebased on zhcn and beni's
@@ -7774,9 +8268,10 @@ L4 (rulings §M38 C-1).
     §2.4.2 step 5). The seam for leased copies is jehw's retire-on-request, **llama.cpp-423j**,
     on §2.9's terms, and it depends on uwlx; no transaction drops another context's graphs.
   - **u1bb (in master):** the ring's rows become per-(context, device) CONTEXT head slots in
-    the context's slot table and its weight slot a per-(model, device) D term with its own
-    setter (7.14f; rulings §M32 I-1, I-3; 7.14e's DEVICE-scope record with contributions is
-    withdrawn); the executor reads and claims the context's rows;
+    the context's slot table and its weight slot a per-(model, device) D term recorded by the
+    load's transaction, with no setter (7.14f, 7.14i; rulings §M32 I-1, I-3, §M38 I-2; 7.14e's
+    DEVICE-scope record with contributions is withdrawn); the executor reads and claims the
+    context's rows;
     `release_pp_moe_onednn_scratch_ring` is no longer called by the full transaction; the
     `zone_largest_free(KV)`, `ggml_sycl_kv_capacity_live`, `ggml_sycl_device_kv_bytes_with_slack`
     and budget-room reads are deleted for arena devices; its "does not fit" refusal becomes the
@@ -7821,10 +8316,10 @@ L4 (rulings §M38 C-1).
   - Context-side tenants publish indexed slot lists with a scope; the fit places them as head
     slots, and the commit holds them as reserved slots owned by handles (§2.4.3, §2.3.2).
   - **Producers (lead rulings, r3 and r4):** zhcn the compute chunks and fattn slot; beni every
-    other context-shaped cohort, the oneDNN Graph scratch included; jzvq the fattn workspaces and
-    the MXFP4 MoE TG caches; moua the recurrent state and u1bb's ring rows, which are
-    per-context CONTEXT slots (7.14f; rulings §M32 I-1; 7.14e's one DEVICE-scope record is
-    withdrawn). moua L3 consumes the rest.
+    other context-shaped cohort, citing 23mk's Graph-scratch function rather than producing it
+    (rulings §M41 m-6); jzvq the fattn workspaces and the MXFP4 MoE TG caches; moua the
+    recurrent state and u1bb's ring rows, which are per-context CONTEXT slots (7.14f; rulings
+    §M32 I-1; 7.14e's one DEVICE-scope record is withdrawn). moua L3 consumes the rest.
   - Landing: jehw → moua L1-L3 → zhcn → beni producers → moua L4-L7 → beni conversions; 23mk
     core after jehw; jzvq before L4 (§4).
 - **(f) The runtime context crosses the ABI once (r2 N-C1; lead ruling 4, D4).** One versioned,
@@ -9415,10 +9910,10 @@ of 7.14g. Nothing was built or run on a GPU for it; the code facts are read at `
 | C-2 | the RUNTIME floor's removal rested on a two-consumer census | **Changed.** The end states carry the full census of RUNTIME draws at `c69d5774d` (an anchored search of the tracked tree, with 23mk's rows): each with its owner and landing point. zhcn's carve and 23mk's reorder temporary land before L4+L6; beni's rows 13 and 14 keep a transitional term, `xmx_moe_buffers`, sized by their own byte functions and 0 unless two opt-ins are set; `dense-scheduler.cpp:29` has no user and is deleted. No site lacks a size function. RUNTIME's capacity is the planned sum of its named consumers. New arm C9: zero `[EXT-ALLOC]` lines of any role on both gates, with the trace armed and a positive control (§3.3). |
 | I-1 | the four device-global ring setters stayed reachable from the commit's install | **Changed.** No arena path reaches them (§2.7); H7z (aj) walks the call graph from the load, the transaction, the release proc and the executor, and its new witness plants `_row_bytes` in the install. |
 | I-2 | the weight slot's store was per device, last writer wins | **Changed.** Keyed by (model, device) (§2.4.2 (b) step 3, §2.4.5). A later load on a laid-out arena places its D terms in RUNTIME's free room or the shared zone, inside its own load. H9's second-load arm pre-registers both fixtures, and last-writer-wins is its RED. |
-| I-3 | the dry run kept master's 512 MiB RUNTIME default | **Changed.** L4+L6 deletes it from `ensure_planned_arena_zones` (`unified-cache.cpp:4505-4508`); a Mistral positive control grows nothing, RED 536870912 B (H7ap). |
+| I-3 | the dry run kept master's 512 MiB RUNTIME default | **Changed.** L4+L6 deletes it from `ensure_planned_arena_zones` (`unified-cache.cpp:4505-4508`; re-pinned to `:4507-4510` at 7.14i, r17 m-3); a Mistral positive control grows nothing, RED 536870912 B (H7ap). |
 | I-4 | §M37 not yet folded | **Already in 7.14g** (`3d782e264`, §6.23), which r16 did not see. 7.14h amends Q2 for `FIRST_CONTEXT` (C-1). |
 | I-5 | the ring GPU arm's witness was compiled out in production | **Changed.** A per-context `[PP-MOE-RING]` line at WARN, in every build, with a positive and a negative control. §3 opens with the rule that a VOID arm fails. |
-| m-1 | stale cite of the RUNTIME default | **Fixed:** `:4505-4508`. |
+| m-1 | stale cite of the RUNTIME default | **Fixed:** `:4505-4508`, itself two lines early; 7.14i re-pins it to `:4507-4510` (r17 m-3). |
 | m-2 | the L4 row's "pending ranges on shared and RUNTIME TLSFs" | **Fixed:** the row names which terms sit on the shared zone's TLSFs and which on RUNTIME. |
 | m-3 | GA's hand arithmetic left out the other C slots | **Fixed:** every head slot on GA's shape is listed (§2.4.1); the known ones sum to 8.2 MiB, and the count stays 6 while jzvq's fattn workspaces stay under 50.4 MiB. |
 | dead code | 2 of the 13 `get_scratchpad_mem` sites are dead (§M36 I-3) | **Changed.** The value function and the gate cover the eleven live sites; `binary` and `reduce_last_dim` are listed as deleted, and a call site restored in either fails the gate. `binary_broadcast_row` (`:338`) stays as family B. |
@@ -9435,11 +9930,12 @@ of 7.14g. Nothing was built or run on a GPU for it; the code facts are read at `
   first model unloads, RUNTIME's freed bytes stay laid out until the arena is re-laid; that idle
   room is bounded by the first model's D terms, and re-laying a quiescent arena is out of scope.
   23mk's `moe_ptr_table` `MODEL_TERM` meets the same case (relayed).
-- **The reservation moves weights to the host.** On the Qwen gate the reservation is about
-  2.29 GB, so the pack's capacity is about 11426 MiB (13714.0 less the reservation) against
-  master's 12136.5 MB of device weights (`glkg-qwen35b-a3b-b1.log:2730`): fewer experts on the
-  device, run by the CPU (placement decides the executor). That is the plan's answer, not a
-  regression to tune away, but the perf arms should expect it.
+- **The reservation moves weights to the host.** On the Qwen gate the reservation is 2398978304
+  B (2287.8 MiB; 7.14i, rulings §M41 m-8, replaces 7.14h's "about 2.29 GB"), so the pack's
+  capacity is about 11426 MiB (13714.0 less the reservation) against master's 12136.5 MB of
+  device weights (`glkg-qwen35b-a3b-b1.log:2730`): fewer experts on the device, run by the CPU
+  (placement decides the executor). That is the plan's answer, not a regression to tune away,
+  but the perf arms should expect it.
 - **jzvq's values are the one hole in the pre-registration.** The first-context arm needs
   jzvq's fattn workspaces and TG caches at both gates' shape from jzvq's host test before the
   lead's run, and it fails as VOID without them.
@@ -9449,7 +9945,7 @@ of 7.14g. Nothing was built or run on a GPU for it; the code facts are read at `
   `ssm_d_conv` 4, `ssm_d_inner` 4096, `ssm_d_state` 128, `ssm_n_group` 16) and equals r16's
   65863680 B.
 - **`dense-scheduler.cpp:29`'s deletion** is assigned to L4+L6, since its class has no user
-  (23mk row 20); 23mk may prefer to take it.
+  (23mk row 20); 23mk may prefer to take it. 7.14i names its dependents (§4).
 - **C9's baseline** is a lead run on `c69d5774d` with the trace armed, and its cohorts must be
   dispositioned before L4+L6 lands.
 - **The `[PP-MOE-RING]` line** prints once per context in every run, including non-MoE ones.
@@ -9468,3 +9964,91 @@ of 7.14g. Nothing was built or run on a GPU for it; the code facts are read at `
   deletes the term.
 - **uwlx:** the export and §G1a's three doc edits are uwlx's (rulings §G1b).
 - **fkpg:** L4 depends on (a).
+
+### 6.25 Revision 7.14i: design-moua-r17, rulings §M39, §M40, §M41, §G1c, 23mk 4.10, 1oxa rev 15, zhcn 5.16
+
+Revision 7.14i is one commit on top of 7.14h (`c345ddae5`). It folds the lead's §M39, which
+answers 7.14h's three notes, §M40 (the compute-slot ordering) and §G1c (the hard uwlx edge), and
+the relays from 23mk rev 4.10 (`003bce159`), 1oxa rev 15 (`dd678c3`) and zhcn 5.16 (`ea3056c`),
+and re-pins those three peers. It also answers design review r17 (design-moua-r17 on
+`ee484eb5b..c345ddae5`: 0 Critical, 5 Important, 10 Minor) under the lead's §M41, which accepts
+all five Important findings and asks for all ten Minor fixes. The figures r17 recomputed are
+unchanged; the new ones are below.
+
+| item | finding or relay | disposition |
+|---|---|---|
+| §M39 (1) | a later load's D terms: accepted as MODEL-owned ranges; a term that fits nowhere refuses by name | **Changed.** §2.4.2 (b) step 3 states the refusal and its line, `[LOAD-PLAN] D term %s on device %d does not fit: …` (renamed below, §M41 I-4 (a)), before any buffer type is chosen and never through to a draw outside the arena. The rule covers 23mk's `moe_ptr_table`. H9's fixture (3) pre-registers the refusal (need 141008896 B, RUNTIME free 0 B, shared zone free 67108864 B), with two REDs: an admit without the term and a fall-through draw. |
+| §M39 (2) | the reservation moves experts to the host: plan == reality | **Changed.** New arm C10 (§3.3): `device_groups`, `host_groups` and the KV layer counts are pre-registered from the pack's host replay and scored exactly. Master's counts (781 / 3827 on 120B, 4646 / 5594 on Qwen) are the label, the throughput comparison is a labelled placement regression, and C6's zero delta does not apply to the MoE gates. |
+| §M39 (3) | jzvq's values are a dependency | **Changed.** In §4's landing order, jzvq's host test → moua L4. The member table (§2.4.3) marks jzvq's two rows. |
+| 23mk 4.10 (1) | the DECLINE class is new work in moua's value-function commit | **Changed.** §2.4.2's scratchpad text states the over-max compare, the line, the counter, the absent epoch bump, the strict abort, and `std::nullopt` into 23mk's declared next paths. H7ap's arm is rewritten with three REDs. In §4 the DECLINE lands after 23mk's §11 step 3. |
+| 23mk 4.10 (2) | the floors | **No change.** They stand as 7.14h has them: the ONEDNN floor by landing order, and SCRATCH until its last named row converts. |
+| 23mk 4.10 (3) | §6.8's C-1 text still called 268435456 B the final ONEDNN sizing | **Fixed.** The Graph-scratch commit's paragraph now says that the interim sizing, and the sizing after that commit while the constant stands, are 268435456 B. The final sizing is `onednn_pp_w` exactly: 23592960 B and 33554432 B. The load-stage ONEDNN paragraph separates G's 0 B from the constant's 244842496 B / 234881024 B. |
+| 1oxa rev 15 | FIRST_CONTEXT's members, each with class and bytes | **Changed.** §2.4.3 gains the member table at `-c 4096 -ub 512` for both gates: C terms 1136673024 / 1816166656 B and other head slots 423624704 / 582811648 B (known), plus jzvq. H7ap's first-context arm pre-registers from it. |
+| zhcn 5.16 (a); §M40 | FIRST_CONTEXT recorded after zhcn's measure; the circularity with the early pack | **Changed (rulings §M40, option (1)).** In §2.4.2 (b) step 3, one measure function has three call sites: Ĉ on the record-pass probe before the pack, which bounds the pack's capacity; c(P) at the admitted placement, which the reservation records, with Ĉ − c(P) returned to the shared zone; and the late check at `:2410` under the one late-check rule. c(P) > Ĉ refuses the load with `compute-slot-exceeds-probe-bound`, printing both values. `FIRST_CONTEXT` is recorded after c(P). The `[FIRST-CONTEXT]` WARN line prints Ĉ, c(P) and both split counts. H7ap adds the refusal through a seam that inflates c(P) (VOID if the seam does not engage) and the return (RED: recording Ĉ). New arm C11 pre-registers c(P) ≤ Ĉ on Mistral B70/B50, GPT-OSS B50 (20B and 120B) and the Qwen gate; a refusal's fix is a split-copy term in Ĉ. |
+| zhcn relay (§M40) | the record-pass probe must outlive the pack | **Changed.** The probe lives until c(P) is measured and is destroyed inside the load's transaction on commit and rollback, by a scope guard (§2.4.2 (b) item 2). zhcn's per-site meta clones and its dummy-buffer guard leave the record unchanged. |
+| §G1c | the uwlx export edge is hard | **Changed.** §2.8, the L6 row and the landing order: every moua commit that calls `ggml_sycl_strict_enabled()` lands after uwlx's merge. 7.14h's fallback clause (L4+L6 carrying the export and the doc edits) is withdrawn. |
+| zhcn 5.16 (b) | the weight slot still published through a setter | **Changed.** The setter is deleted. The (model, device) entry is a record of the load's transaction, with four writers (step 3's record, the commit, the rollback, the unload), and H7z (aj) has a writer gate. The enum gate carries no `MOE_ONEDNN` setter, and the H7ap mutant targets the store. |
+| re-pins | 23mk `003bce159`, 1oxa `dd678c3`, zhcn `ea3056c` | **Done** where the cited content survives. 23mk's census rows and §4.3's I-G table (L1201-1215); 1oxa's fourth clear point (L122-124) and its pre-record check (L3600-3618), whose failure line moua now mirrors; zhcn's H4h hooks. |
+| r17 I-1 (a); §M41 | one draw charged twice on Qwen with L4+L6 first: ONEDNN held the Graph scratch, and the reservation held it again | **Changed.** §2.4.3's transition rule: an unconverted site's producer record stays out of `context_demand_records` until the converting commit, so one byte has one charge at every landing order. The first-context arm reads the order: with L4+L6 first the known Qwen set is 2197651712 B. RED: the record present while the draw is unconverted (2398978304 B read against 2197651712 B). |
+| r17 I-1 (b); §M41 | the GPT-OSS interim was pre-registered at 0, which master's function cannot return | **Changed.** The Graph-scratch function takes the sinks and `n_head_ctx_max` (§2.4.3). With L4+L6 first ONEDNN is master's function's value: 23592960 + 805306368 = 828899328 B on GPT-OSS 120B (weight zone 13398278144 − k × 1024 B), 234881024 B on Qwen (14413725696 − k × 2048 B). The floors arm is corrected, and C10 orients the ~42 extra host groups. **For the lead:** the interim holds 768 MiB of ONEDNN on GPT-OSS for a route that sinks forbid; landing 23mk's Graph-scratch commit before L4+L6 avoids it. |
+| r17 I-2; §M41 | the reservation was evaluated at a partial placement | **Changed.** Step 3: every term is evaluated from the pack's inputs (inventory, `dev_layer`, forced flags, hparams, envelope), as a bound before the pack and the admitted value after it; the reservation records the admitted value and returns the difference, like §M40's Ĉ and c(P). Admitted ≤ bound holds by construction for every term but the compute slot, and the step-5 witness checks it. RED: `moe_control` at the first dense placement, 16640 / 33024 B short. |
+| r17 I-3; §M41 | the envelope's `n_seq_max` was the default params' 1 | **Changed.** fkpg (a)'s transport carries `n_seq_max`, the flash-attention choice and the KV types with `n_ctx` (step 3, §4). llama-server's default (`n_parallel` 4) is sized, not refused: the Qwen recurrent state is 263454720 B (+197591040 B), the known set 2596569344 B (2395242752 B with L4+L6 first), and C10's replay pre-registers the server's counts (about 91 more host groups). No refusal is pre-registered. |
+| r17 I-4 (a); §M41 | the later-load rule covered RUNTIME only | **Changed.** Every zone's P and D terms of a later load go to that zone's free room or the shared zone, as model-owned ranges, else the renamed refusal. H9 gains fixture (4), GPT-OSS 120B then Mistral (W 23592960 then 117440512 B), and (5), SCRATCH. **For the lead:** §M41 I-4 (a) says "RUNTIME free room"; for an ONEDNN or SCRATCH term this design reads it as the term's own zone's free room. |
+| r17 I-4 (b); §M41 | the step-5 witness was per load | **Changed.** It is keyed per (model, device): each load's ledger equals what it placed, and each zone's capacity is at least the live models' placed terms in it. H9 fixture (1) scores the witness passing, with 7.14h's per-load equality as its RED. |
+| r17 I-5; §M41 | the `ggml-sycl.cpp:37657` leg serves the whole buffer type | **Changed.** The census row is split by buffer class: compute buffers (zhcn), SYCL<n> weight buffers to the `WEIGHT` zone, the control vector and the on-device state-seq buffers as context-owned `REGION` ranges at their API calls, and anything else refused by name through `runtime_req.forbid_vram_zone_spill`. C9 gains the control-vector, state-seq and unplanned-buffer arms. **Deviation, for the lead:** §M41 I-5 names a MODEL term for the control vector, but `llama_context` owns it (`llama-context.h:330`, `llama-context.cpp:495`), and its buffer is allocated lazily at `llama_set_adapter_cvec`, so this design places it in the context. |
+| r17 m-1; §M41 | C9's positive control moved no knob | **Changed.** The Mistral gate with and without `GGML_SYCL_RUNTIME_ARENA_MB=0`, and a test-injected over-capacity RUNTIME draw on the scored tree. |
+| r17 m-2; §M41 | no Qwen command in the merge-gate script | **Changed.** `merge-gates/run-merge-gates.sh:72` runs the Qwen gate from `/Storage/GenAI/models/`, written out in C9. It writes `qwen35b-a3b-b1.log`, so it cannot overwrite the cited log. Both cited gate logs (2026-09-17) end in aborts, so C9's baseline is re-taken on `c69d5774d`, and a baseline that does not reach rc=0 is VOID. |
+| r17 m-3; §M41 | the RUNTIME default's cite was two lines early | **Fixed:** `unified-cache.cpp:4507-4510` (decl `:4507`, `getenv` `:4508`, assignment `:4509`) everywhere, the r16 closure rows annotated. |
+| r17 m-4; §M41 | H7 (e)'s suffix rule is red on master | **Changed.** `GGML_SYCL_HANDLE_STRICT` is allowlisted by name as a diagnostic REPORT switch (`common.hpp:4056`, `:4232`; `ggml-sycl.cpp:25753`; it never aborts), in H7 (e) and gate 22, and §2.8's §G1b text names it as a non-member. Master is the positive control. |
+| r17 m-5; §M41 | the dense scheduler's deletion named no dependents | **Changed.** §4: `tests/test-dense-scheduler.cpp`, the checker loop at `scripts/check-sycl-alloc-usage.sh:1249-1270` (pattern `:113`), and `tests/test-sycl-alloc-policy.sh:247-250` with its fixture directory, all deleted in the same commit. |
+| r17 m-6; §M41 | two producers for the Graph scratch | **Fixed.** 23mk's function is the one producer; beni's list, the CONTEXT row and the landing order cite it. |
+| r17 m-7; §M41 | the ring GPU arm named no vehicle | **Changed.** Two `llama-completion` runs, `-ub 512` and `-ub 1024`, on a committed prompt of at least 1100 tokens, so the batched executor is reached. |
+| r17 m-8; §M41 | "about 2.29 GB" | **Fixed:** 2398978304 B (2287.8 MiB). |
+| r17 m-9; §M41 | `XMX_MOE_BUFFERS` is per backend context | **Changed.** A second context's draw takes the declared fallback: L4+L6 sets `forbid_vram_zone_spill` on both draws, so the ensure's existing false return runs the wrapper without the prealloc. |
+| r17 m-10; §M41 | H7z (aj)'s walk named no cut | **Changed.** The no-arena calls are isolated in `ggml_sycl_ring_setters_no_arena` under one `!arena_active` branch, with the moved-call mutant. |
+
+**Mirror relays.**
+- **23mk** (`003bce159`):
+  - L3074's "The `268435456` below is 7.14f's figure, mirrored until then" can now mirror
+    7.14i's final sizing: `onednn_pp_w` exactly after the later of L4+L6 and the Graph-scratch
+    commit.
+  - The row-10 DECLINE text matches 7.14i's. moua's value-function commit lands after 23mk's §11
+    step 3, and the edge is in moua's §4.
+  - §M39 (1) applies to `moe_ptr_table`'s `MODEL_TERM`: a later load's tables that fit neither
+    RUNTIME's free room nor the shared zone refuse that load with moua's line, byte for byte,
+    which 7.14i renames `[LOAD-PLAN] term %s of zone %s on device %d does not fit: need %zu B,
+    zone free %zu B, shared zone free %zu B (refused)` because it now covers every zone (§M41
+    I-4 (a)).
+- **1oxa** (`dd678c3`):
+  - The member table is in §2.4.3, with each row's class. The C terms go to the C-term extent
+    and the other head slots do not.
+  - **Lead-ruled (one fact, one line):** 23mk's DECLINE line, with its WARN, counter and strict
+    abort, is the only emitter for a oneDNN scratchpad request above the planned max. 1oxa's
+    `[ZONE-PLAN-BUG] oneDNN primitive scratchpad request N bytes above the planned max M bytes
+    for context C on device D` (L3632-3633) is deleted, and 1oxa cites 23mk's DECLINE instead.
+    The lead relays this to 1oxa for rev 17.
+  - The caller list (L3637-3650) drops `dnnl-ops.hpp:284` and `:433`, the two dead wrappers that
+    23mk deletes, leaving the 11 live sites (lead-ruled with the line above).
+  - The weight slot has no setter.
+- **zhcn** (`ea3056c`):
+  - (b) is done.
+  - (a): §M40 is folded as above. zhcn's §2.10 names the three call sites; moua keeps the probe
+    alive until c(P).
+- **23mk** (r17 relays, rulings §M41):
+  - I-1 (b): the Graph-scratch function takes the sinks and `n_head_ctx_max`, and its
+    "SDPA-routed" count calls `ggml_sycl_flash_attn_ext_onednn_plan`'s reject predicate, not a
+    hand list.
+  - I-4 (a): a later load's W, P and D terms above a laid-out zone follow §M39 (1): a
+    model-owned range in that zone's free room or the shared zone, else the renamed `[LOAD-PLAN]
+    term %s of zone %s …` refusal.
+  - m-6: the Graph scratch has one producer, 23mk's function; beni cites it.
+  - fkpg (a) alone lifts master's Graph-scratch floor to 768 MiB on every GPT-OSS load at `-c
+    4096` (sinks forbid the route).
+- **fkpg:** (a)'s transport carries `n_seq_max`, the flash-attention choice and the KV types
+  alongside `n_ctx` (rulings §M41 I-3), and L4 depends on all of it. The GPT-OSS floor hazard
+  above applies to (a) alone.
+- **zhcn:** the lead relays m-4 (`GGML_SYCL_HANDLE_STRICT` allowlisted by name in gate 22, with
+  its reason). The compute slot at the server's `n_seq_max` 4 is a fixture until the measure
+  lands.
+- **beni:** the Graph scratch's producer is 23mk's function; beni's commit carries it and adds
+  no visitor for it.
