@@ -407,8 +407,8 @@ def main():
                  "blk.1.indexer.k_proj.weight is F32, the real model's is BF16"),
                 ("verify F16 outside the allowlist", retype("blk.0.attn_qkv.weight", F16),
                  "blk.0.attn_qkv.weight is F16, the real model's is Q8_0"),
-                ("verify F16 where Q8_0 fits", [(n, t, [32] + ne[1:] if n == "blk.0.hc_attn_up.weight" else ne)
-                                                 for n, t, ne, _ in real_shape],
+                ("verify F16 where Q8_0 fits",
+                 [(n, t, [32] + ne[1:] if n == "blk.0.hc_attn_up.weight" else ne) for n, t, ne, _ in real_shape],
                  "blk.0.hc_attn_up.weight is F16, the real model's is Q8_0"),
                 ("verify F32 token_embd", retype("token_embd.weight", F32),
                  "token_embd.weight is F32, the real model's is Q8_0"),
