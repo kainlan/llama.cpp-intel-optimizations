@@ -73,6 +73,9 @@ class CommittedInventoryDriftTest(unittest.TestCase):
             )
             # The gate and its positive control parse the same sources and differ
             # only in the one planted row, so run the two parses concurrently.
+            # That attribution relies on the census being deterministic: two
+            # parses of the same bytes must render the same CSV, otherwise the
+            # control's rc 1 could come from parse variance, not the planted row.
             # An absolute --output replaces the repo-relative default.
             gate = subprocess.Popen(
                 audit_command("--check"), cwd=REPO, text=True,

@@ -60,7 +60,10 @@ to match the checked-in CSV byte-for-byte. The registered ctest
 committed CSV and fails on any drift (llama.cpp-ldvb; before that it only
 checked a freshly generated temp copy, so the committed CSV drifted 2,785 lines
 unnoticed). A change that moves any of the five inputs must therefore
-regenerate the CSV in the same change. Do not treat a green self-test as
+regenerate the CSV in the same change. The gate parses the **working tree**,
+not a commit, so in a shared checkout any uncommitted edit to a census input
+(anyone's) turns it red until that edit is committed together with a
+regenerated CSV. Do not treat a green self-test as
 evidence that the inventory is current, and do not suppress `--check` drift by
 weakening its comparison.
 
@@ -118,8 +121,9 @@ census: their artifact, source SHA, and extraction method were not supplied,
 so a row-for-row comparison would be invented. Structurally, they expand in
 both directions: multi-object declarations produce multiple object rows,
 while static functions/prototypes are not storage objects; the parser also
-adds the 58 implicit non-local objects, 869 local statics, and 4 class statics
-that a column-zero lexical pass does not cover. No comparison is made to the
+adds the objects a column-zero lexical pass does not cover (at the audited
+commit above: 87 implicit non-local objects, 841 function-local
+static/thread-local objects, and 7 class statics). No comparison is made to the
 historical 329 figure because it likewise lacks a source SHA and method.
 
 ### Parse coverage and fail-closed behavior
