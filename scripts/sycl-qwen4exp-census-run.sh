@@ -82,7 +82,9 @@ case "$MODE" in
         # memory: SYCL leaves mmap_support unset, so the loader turns mmap off
         NEED_GB=215 BUDGET=1800 MODEL="$QWEN_MODEL" FA=(-fa auto) N_EMBD=2560
         SHMEM_ABORT_GB=
-        # structural controls: the dump must be the whole qwen4exp graph
+        # structural controls: the dump must be the whole qwen4exp graph. TOP_K
+        # counts QSA only because the MoE router uses ggml_argsort_top_k (an
+        # ARGSORT, llama-graph.cpp:2118); see the census doc's vehicle section
         REQUIRE=(--require GATED_DELTA_NET=ANY:36 --require MUL_MAT_ID=ANY:144 --require TOP_K=ANY:12)
         PREDICTION=(--prediction "$ROOT/scripts/sycl-qwen4exp-op-prediction.json")
         ;;
@@ -93,7 +95,8 @@ case "$MODE" in
         "$ROOT/scripts/sycl-qwen4exp-vehicle-bf16-indexer.py" --verify "$VEHICLE_MODEL" || exit 1
         NEED_GB=30 BUDGET=600 MODEL="$VEHICLE_MODEL" FA=(-fa auto) N_EMBD=256
         # 2 layers: one GDN layer, one QSA layer, MoE on both -- 2 MUL_MAT_ID per
-        # layer if the fixture creates the merged ffn_gate_up_exps, else 3
+        # layer if the fixture creates the merged ffn_gate_up_exps, else 3. TOP_K
+        # is QSA's alone for the reason given in the qwen4exp mode above
         REQUIRE=(--require GATED_DELTA_NET=ANY:1 --require MUL_MAT_ID=ANY:4 --require TOP_K=ANY:1)
         # a no-op on today's vehicle: its "test" tokenizer has no EOS
         # (llama-vocab.cpp:2095), so common.cpp:1321-1323 drops the flag with a

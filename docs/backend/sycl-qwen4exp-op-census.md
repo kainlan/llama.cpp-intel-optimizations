@@ -440,9 +440,17 @@ layer's compress ratio is nonzero (`qwen4exp.cpp:786-788`); the cache exists bec
 (`src/llama-model.cpp:3581-3586`); layer 1 is not recurrent (`recurrent_layers [1, 0]`) and its
 ratio is 4. qwen4exp sets no SWA, so the model gets `llama_memory_hybrid_idx`, not the iswa variant
 (`llama-model.cpp:3589,3609`). `ggml_top_k` builds a `GGML_OP_TOP_K` node (`ggml/src/ggml.c:5526`).
-The `MUL_MAT_ID` minimum is 4, not 6, because whether the fixture creates the merged
-`ffn_gate_up_exps` (`create_tensor_gate_up_exps`, `src/llama-model.cpp:4253`) decides whether a
-layer has 2 or 3 of them.
+That is conditional, not unconditional: without the indexer cache or with a zero ratio, layer 1 runs
+dense attention and emits no TOP_K. The control discriminates only because nothing else in the graph
+emits `GGML_OP_TOP_K`. `qwen4exp.cpp:684` is the model's only `ggml_top_k`, and the MoE router
+selects experts with `ggml_argsort_top_k` (`src/llama-graph.cpp:2118`), which is an `ARGSORT` plus a
+view (`ggml.c:5500-5511`), not a TOP_K node. The same holds for the qwen4exp mode's `TOP_K=ANY:12`.
+If the router ever switches to `ggml_top_k`, both controls pass with no QSA at all. Backend sampling
+would do the same through `llama-sampler.cpp:1603`; it is off by default (`common/common.h:297`),
+and the script never passes the flag that enables it (`common/arg.cpp:2324`). The `MUL_MAT_ID`
+minimum is 4, not 6, because whether the fixture creates the merged `ffn_gate_up_exps`
+(`create_tensor_gate_up_exps`, `src/llama-model.cpp:4253`) decides whether a layer has 2 or 3 of
+them.
 
 What the vehicle exercises, per prediction rule:
 
