@@ -176,8 +176,10 @@ records or force reclamation.
 the leaked-lease one above, and `GGML_SYCL_STRICT_LEASES=1` cannot abort on
 it — by construction, not by observation** (`llama.cpp-zjz6`, adjudicating the
 Phase-0 `weight:unattributed` cohort at `weight-reclaim/model-teardown`,
-1536 entries on GPT-OSS). `entries_leaked` — the sole counter
-`GGML_SYCL_STRICT_LEASES=1` aborts on — increments only inside the
+1536 entries on GPT-OSS). `entries_leaked` — the sole weight-reclaim counter
+`GGML_SYCL_STRICT_LEASES=1` aborts on; the same one switch arms the other
+families, each under its own tag (`[CONTEXT-PLAN-BUG]` and the other
+`*-PLAN-BUG` families) — increments only inside the
 `in_use_count.load() != 0` branch of `reclaim_weight_entries()`
 (`unified-cache.cpp`); the `weight:unattributed` cohort is exactly the entries
 with `in_use_count == 0`, so the two are mutually exclusive at the type level,

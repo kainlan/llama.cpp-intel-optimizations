@@ -2210,14 +2210,6 @@ void release_graph_retained_handles() {
     GGML_SYCL_DEBUG("[MEM-HANDLE] released %zu command-graph retained leases\n", n);
 }
 
-bool strict_plan_checks_enabled() {
-    static const bool enabled = [] {
-        const char * env = std::getenv("GGML_SYCL_STRICT_PLAN");
-        return env != nullptr && std::atoi(env) != 0;
-    }();
-    return enabled;
-}
-
 namespace {
 
 // Whether an event-bound record's event is known complete, without waiting
@@ -2249,10 +2241,10 @@ void report_retained_reap_backstop(const char * reason, const char * entry) {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     g_retained_reap_backstop_incomplete.fetch_add(1, std::memory_order_relaxed);
 #endif
-    if (strict_plan_checks_enabled()) {
+    if (ggml_sycl_strict_enabled()) {
         GGML_ABORT(
             "[CONTEXT-PLAN-BUG] retained-reap backstop: %s %s event incomplete after the caller's "
-            "synchronize (GGML_SYCL_STRICT_PLAN=1)",
+            "synchronize (GGML_SYCL_STRICT_LEASES=1)",
             reason, entry);
     }
     GGML_LOG_WARN(
@@ -2266,10 +2258,10 @@ void report_retained_reap_backstop(const char * reason, const char * entry) {
 // handle): nothing the store holds of it can be matched, so the reap cannot
 // say it is clean.
 void report_retained_reap_ownerless(const char * reason, size_t owner) {
-    if (strict_plan_checks_enabled()) {
+    if (ggml_sycl_strict_enabled()) {
         GGML_ABORT(
             "[CONTEXT-PLAN-BUG] retained-reap %s: owner %zu has no owner control, so what the retained store holds "
-            "of it cannot be found (GGML_SYCL_STRICT_PLAN=1)",
+            "of it cannot be found (GGML_SYCL_STRICT_LEASES=1)",
             reason, owner);
     }
     GGML_LOG_WARN(

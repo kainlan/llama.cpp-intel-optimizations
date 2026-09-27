@@ -613,7 +613,7 @@ void test_backstop(sycl::queue & q) {
     CHECK(only_reference(blocker), "backstop: blocker drained");
 }
 
-// Under GGML_SYCL_STRICT_PLAN=1 the same backstop aborts.
+// Under GGML_SYCL_STRICT_LEASES=1 the same backstop aborts.
 int strict_child(sycl::queue & q) {
     mem_handle blocker = hold_worker();
     mem_handle a       = make_owner(800);
@@ -631,7 +631,7 @@ int strict_child(sycl::queue & q) {
     return 0;
 }
 
-// Under GGML_SYCL_STRICT_PLAN=1 an owner with no owner control aborts.
+// Under GGML_SYCL_STRICT_LEASES=1 an owner with no owner control aborts.
 int strict_ownerless_child() {
     (void) reap({ make_ownerless() }, RETAINED_REAP_QUERY_EVENT_STATUS);
     std::printf("strict-child: returned without aborting\n");
@@ -639,7 +639,7 @@ int strict_ownerless_child() {
 }
 
 void test_strict_aborts(const char * self, const char * child, const char * line) {
-    const std::string cmd = std::string("GGML_SYCL_STRICT_PLAN=1 ") + self + " " + child + " 2>&1";
+    const std::string cmd = std::string("GGML_SYCL_STRICT_LEASES=1 ") + self + " " + child + " 2>&1";
     FILE *            p   = popen(cmd.c_str(), "r");
     CHECK(p != nullptr, "strict: child started");
     if (!p) {

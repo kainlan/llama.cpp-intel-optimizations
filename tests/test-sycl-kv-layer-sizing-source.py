@@ -57,6 +57,7 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIFIED_CACHE_HPP = ROOT / "ggml/src/ggml-sycl/unified-cache.hpp"
 UNIFIED_CACHE_CPP = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
 GGML_SYCL_CPP = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
+MEM_HANDLE_CPP = ROOT / "ggml/src/ggml-sycl/mem-handle.cpp"
 LLAMA_MODEL_CPP = ROOT / "src/llama-model.cpp"
 LLAMA_CONTEXT_CPP = ROOT / "src/llama-context.cpp"
 
@@ -1755,7 +1756,7 @@ def optional_layout_release_violations(sycl_cpp: str, cache_cpp: str) -> list[st
                         r"result\.freed\+\+;", body)
     if counted is None or counted.start() < drain:
         found.append("a yield counts a copy freed that did not reach its zone")
-    if not re.search(r"if \(readers_finished && still_held > 0\) \{\s*if \(strict_plan_checks_enabled\(\)\) \{\s*"
+    if not re.search(r"if \(readers_finished && still_held > 0\) \{\s*if \(ggml_sycl_strict_enabled\(\)\) \{\s*"
                      r"GGML_ABORT\(\s*\"\[CONTEXT-PLAN-BUG\] optional-layout yield", body):
         found.append("a copy still referenced after the reap is not reported as a plan bug")
     return found
@@ -2213,3 +2214,85 @@ def test_mutation_finish_waits_unretired_is_witnessed() -> None:
     _lock_mutation(UNIFIED_CACHE_CPP, "    if (!release.owners.empty()) {\n        finish_optional_layout_release(release, result);\n    }\n",
                    "    finish_optional_layout_release(release, result);\n",
                    "waits when nothing was retired", "guard dropped")
+
+
+# One abort switch for ownership, lifetime and plan defects:
+# GGML_SYCL_STRICT_LEASES=1, read once in unified-cache.cpp and read everywhere
+# else through ggml_sycl_strict_enabled(). The [CONTEXT-PLAN-BUG] sites keep
+# their own tag; a second variable for them would be a second source for one
+# fact.
+STRICT_SWITCH_SOURCES = sorted((ROOT / "ggml/src/ggml-sycl").rglob("*.[ch]pp"))
+# Both assembled, so a grep of the tree finds the one real getenv and no
+# mention of the retired switch.
+STRICT_LEASES_GETENV = 'std::getenv("GGML_SYCL_STRICT_' + 'LEASES")'
+RETIRED_STRICT_SWITCH = "GGML_SYCL_STRICT_" + "PLAN"
+
+
+def strict_switch_violations(sources: dict[str, str]) -> list[str]:
+    found: list[str] = []
+    for name, text in sources.items():
+        if RETIRED_STRICT_SWITCH in text:
+            found.append(f"{name} names {RETIRED_STRICT_SWITCH}, a second strict switch")
+    readers = [name for name, text in sources.items() for _ in range(text.count(STRICT_LEASES_GETENV))]
+    if readers != ["unified-cache.cpp"]:
+        found.append(f"GGML_SYCL_STRICT_LEASES is not read exactly once, in unified-cache.cpp: {readers}")
+    cache = strip_comments(sources.get("unified-cache.cpp", ""))
+    if not re.search(r"bool ggml_sycl_strict_enabled\(\) \{\s*return strict_lease_checks_enabled\(\);\s*\}", cache):
+        found.append("ggml_sycl_strict_enabled() does not return the one STRICT_LEASES reading")
+    # Every site asks the accessor itself: a function that forwards it is a
+    # second name for the one fact.
+    for name, text in sources.items():
+        if re.search(r"\breturn\s+ggml_sycl_strict_enabled\(\)\s*;", strip_comments(text)):
+            found.append(f"{name} wraps ggml_sycl_strict_enabled() in a second name")
+    mem = sources.get("mem-handle.cpp", "")
+    for report in ("void report_retained_reap_backstop(", "void report_retained_reap_ownerless("):
+        body = function_or_none(mem, report)
+        if body is None or not re.search(r"if \(ggml_sycl_strict_enabled\(\)\) \{\s*GGML_ABORT\(\s*"
+                                         r"\"\[CONTEXT-PLAN-BUG\]", strip_comments(body)):
+            found.append(f"{report}...) does not abort under ggml_sycl_strict_enabled()")
+    return found
+
+
+def _strict_sources() -> dict[str, str]:
+    return {str(p.relative_to(ROOT / "ggml/src/ggml-sycl")): p.read_text() for p in STRICT_SWITCH_SOURCES}
+
+
+def test_one_strict_switch() -> None:
+    assert strict_switch_violations(_strict_sources()) == []
+
+
+def _strict_mutation(name: str, old: str, new: str, expected: str, label: str) -> None:
+    sources = _strict_sources()
+    mutated = dict(sources)
+    assert old in sources[name], f"{label}: anchor missing"
+    mutated[name] = sources[name].replace(old, new, 1)
+    _assert_witnessed(sources[name], mutated[name], lambda text: strict_switch_violations({**sources, name: text}),
+                      expected, label)
+
+
+def test_mutation_strict_plan_getenv_readded_is_witnessed() -> None:
+    _strict_mutation("mem-handle.cpp", "namespace {\n\n// Whether an event-bound record's event is known complete",
+                     f"static bool strict_plan() {{ return std::getenv(\"{RETIRED_STRICT_SWITCH}\") != nullptr; }}\n\n"
+                     "namespace {\n\n// Whether an event-bound record's event is known complete",
+                     f"names {RETIRED_STRICT_SWITCH}", "retired switch's getenv re-added")
+
+
+def test_mutation_second_strict_leases_getenv_is_witnessed() -> None:
+    _strict_mutation("mem-handle.cpp", "namespace {\n\n// Whether an event-bound record's event is known complete",
+                     "static bool strict() { return std::getenv(\"GGML_SYCL_STRICT_LEASES\") != nullptr; }\n\n"
+                     "namespace {\n\n// Whether an event-bound record's event is known complete",
+                     "not read exactly once", "second STRICT_LEASES getenv")
+
+
+def test_mutation_strict_wrapper_reintroduced_is_witnessed() -> None:
+    _strict_mutation("mem-handle.cpp", "namespace {\n\n// Whether an event-bound record's event is known complete",
+                     "bool strict_plan_checks_enabled() {\n    return ggml_sycl_strict_enabled();\n}\n\n"
+                     "namespace {\n\n// Whether an event-bound record's event is known complete",
+                     "wraps ggml_sycl_strict_enabled()", "wrapper reintroduced")
+
+
+def test_mutation_report_ungated_is_witnessed() -> None:
+    _strict_mutation("mem-handle.cpp", "    if (ggml_sycl_strict_enabled()) {\n        GGML_ABORT(\n"
+                     "            \"[CONTEXT-PLAN-BUG] retained-reap backstop",
+                     "    if (false) {\n        GGML_ABORT(\n            \"[CONTEXT-PLAN-BUG] retained-reap backstop",
+                     "report_retained_reap_backstop", "backstop abort ungated")

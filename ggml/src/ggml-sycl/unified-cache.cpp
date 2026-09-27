@@ -7988,10 +7988,10 @@ void unified_cache::finish_optional_layout_release(optional_layout_release &    
     // copies, so a reference left after the reap is state the plan does not
     // account for, not a free still on its way.
     if (readers_finished && still_held > 0) {
-        if (strict_plan_checks_enabled()) {
+        if (ggml_sycl_strict_enabled()) {
             GGML_ABORT(
                 "[CONTEXT-PLAN-BUG] optional-layout yield: %zu retired copies (%.1f MB) still referenced "
-                "after the reap (%zu retained entries pending) (GGML_SYCL_STRICT_PLAN=1)",
+                "after the reap (%zu retained entries pending) (GGML_SYCL_STRICT_LEASES=1)",
                 still_held, result.pending_bytes / (1024.0 * 1024.0), reaped.entries_pending);
         }
         GGML_LOG_WARN(
@@ -13004,6 +13004,10 @@ static bool strict_lease_checks_enabled() {
         return env != nullptr && std::atoi(env) != 0;
     }();
     return enabled;
+}
+
+bool ggml_sycl_strict_enabled() {
+    return strict_lease_checks_enabled();
 }
 
 // Decide whether ONE weight entry may be reclaimed.  Three lifetimes are in

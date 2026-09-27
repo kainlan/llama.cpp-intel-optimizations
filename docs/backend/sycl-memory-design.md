@@ -830,7 +830,7 @@ reclaims one physical layout of a tensor, not the tensor:
     withdrawn mirror handles. A copy counts as freed only when the yield's own
     reference to its owner turns out to be the last one and releasing it
     returns the bytes; one still referenced after the reap is a
-    `[CONTEXT-PLAN-BUG]` (abort under `GGML_SYCL_STRICT_PLAN=1`).
+    `[CONTEXT-PLAN-BUG]` (abort under `GGML_SYCL_STRICT_LEASES=1`).
   The transaction then takes the lock again. If a newer plan was published in
   between, the transaction reports busy, and the retired copies' room is there
   for the retry.

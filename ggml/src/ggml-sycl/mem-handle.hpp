@@ -861,7 +861,7 @@ void release_graph_retained_handles();
 // an owner match it too. An owner with no owner control (id 0: an arena,
 // WEIGHT or ownerless DIRECT handle) cannot be matched, so it is never
 // reported clean: it is a [CONTEXT-PLAN-BUG] -- marked pending, its size in
-// pending_bytes, with a WARN, or an abort under GGML_SYCL_STRICT_PLAN=1.
+// pending_bytes, with a WARN, or an abort under GGML_SYCL_STRICT_LEASES=1.
 //
 // The retained-store mutex is the only listed lock it takes, last in L5
 // (canonical memory contract §12.5); call it with no L1-L5 lock held. Moving a
@@ -876,9 +876,9 @@ void release_graph_retained_handles();
 // graph_lifetime_retention_active(), or parked by the drain worker when a
 // record's wait failed -- and they are never queried or waited on. A status
 // query that throws on an event-bound record means only "not known complete".
-// GGML_SYCL_STRICT_PLAN=1: a [CONTEXT-PLAN-BUG] -- state the context plan
-// says cannot exist -- aborts instead of logging a WARN. Read once.
-bool strict_plan_checks_enabled();
+// A [CONTEXT-PLAN-BUG] -- state the context plan says cannot exist -- aborts
+// instead of logging a WARN under GGML_SYCL_STRICT_LEASES=1
+// (ggml_sycl_strict_enabled()).
 
 enum retained_reap_precondition {
     // The caller has synchronized every queue that can reach the owners, and
@@ -889,7 +889,7 @@ enum retained_reap_precondition {
     // (release_graph_retained_handles() is never called). An event-bound
     // event not known complete is a missed queue: it is waited on, never
     // freed early, counted, and reported as a [CONTEXT-PLAN-BUG] -- a WARN,
-    // or an abort under GGML_SYCL_STRICT_PLAN=1.
+    // or an abort under GGML_SYCL_STRICT_LEASES=1.
     RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER,
     // The caller vouches for nothing. Only a matching record whose event is
     // queried complete is dropped (a complete in-hand record by yielding to

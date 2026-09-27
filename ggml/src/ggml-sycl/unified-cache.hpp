@@ -7253,6 +7253,11 @@ void rollback_unified_cache_module_use() noexcept;
 // Used by ExpertCache/ExpertPrefetcher to skip sycl::free() during static destruction.
 bool ggml_sycl_is_shutting_down();
 
+// GGML_SYCL_STRICT_LEASES=1, read once: the one switch that turns an
+// ownership, lifetime or plan defect -- a leaked lease, a [CONTEXT-PLAN-BUG]
+// -- into an abort instead of a WARN. Each family keeps its own log tag.
+bool ggml_sycl_strict_enabled();
+
 // (ExpertPlacementTable removed — the cache IS the placement.
 //  Use is_expert_resident() / get_expert_device_ptr() for residency,
 //  get_expert_popularity_rank() for eviction scoring.)
