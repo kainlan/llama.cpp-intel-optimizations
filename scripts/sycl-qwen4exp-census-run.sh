@@ -23,7 +23,9 @@
 # (net-of-tmpfs Shmem ceiling, GPU-fault journal check, timeout -k, and a
 # VALID/SUSPECT verdict that this script enforces). A watchdog samples
 # /proc/meminfo every 2 s and kills the run's whole session if MemAvailable
-# drops under WATCHDOG_FLOOR_GB (default 20).
+# drops under WATCHDOG_FLOOR_GB (default 20) or, in the control and vehicle
+# modes, if Shmem climbs past WATCHDOG_SHMEM_GB (default 100): those runs
+# measure ~2 GB pinned, so 100 GB means a runaway, not a large load.
 #
 # The dump is GGML_LOG_DEBUG output: it needs GGML_SCHED_DEBUG=2 (1 prints
 # split headers only) AND -lv 5, because common_log drops DEBUG below
@@ -49,6 +51,7 @@ QWEN_MODEL="${QWEN4EXP_MODEL:-/models/Qwen3.8-Flash-Next-GGUF/Q8_0/Qwen3.8-Flash
 VEHICLE_MODEL="${QWEN4EXP_VEHICLE:-}"
 MISTRAL_MODEL="${MISTRAL_MODEL:-/models/mistral-7b-v0.1.Q4_0.gguf}"
 FLOOR_GB="${WATCHDOG_FLOOR_GB:-20}"
+SHMEM_ABORT_GB="${WATCHDOG_SHMEM_GB:-100}"
 SETTLE_TIMEOUT_S="${SETTLE_TIMEOUT_S:-600}"
 mkdir -p "$OUT" || exit 1
 
@@ -68,12 +71,13 @@ shmem_gb() { echo $(( $(meminfo_kb Shmem) / 1048576 )); }
 avail_gb() { echo $(( $(meminfo_kb MemAvailable) / 1048576 )); }
 stamp() { echo "$(date +%T) $1 Shmem=$(shmem_gb)G MemAvailable=$(avail_gb)G" | tee -a "$OUT/mem.log"; }
 
-REQUIRE=() EXTRA_ENV=() PREDICTION=()
+REQUIRE=() EXTRA_ENV=() EXTRA_ARGS=() PREDICTION=()
 case "$MODE" in
     qwen4exp)
         # ~120 GiB of experts and the 50.66 GiB PLE table are read into host
         # memory: SYCL leaves mmap_support unset, so the loader turns mmap off
         NEED_GB=200 BUDGET=1800 MODEL="$QWEN_MODEL" FA=(-fa auto) N_EMBD=2560
+        SHMEM_ABORT_GB=
         # structural controls: the dump must be the whole qwen4exp graph
         REQUIRE=(--require GATED_DELTA_NET=ANY:36 --require MUL_MAT_ID=ANY:144 --require TOP_K=ANY:12)
         PREDICTION=(--prediction "$ROOT/scripts/sycl-qwen4exp-op-prediction.json")
@@ -84,6 +88,9 @@ case "$MODE" in
         # 2 layers: one GDN layer, one QSA layer, MoE on both -- 2 MUL_MAT_ID per
         # layer if the fixture creates the merged ffn_gate_up_exps, else 3
         REQUIRE=(--require GATED_DELTA_NET=ANY:1 --require MUL_MAT_ID=ANY:4 --require TOP_K=ANY:1)
+        # random weights can sample EOS first, which ends the run before the
+        # T=1 decode graph is built; the census needs both token classes
+        EXTRA_ARGS=(--ignore-eos)
         PREDICTION=(--prediction "$ROOT/scripts/sycl-qwen4exp-op-prediction.json")
         ;;
     control-on)
@@ -119,37 +126,68 @@ stamp "pre (settled after ${waited}s)"
 ONEAPI_DEVICE_SELECTOR="level_zero:$DEV" setsid -w "$ROOT/scripts/bench-guard.sh" --budget "$BUDGET" -- \
     env GGML_SCHED_DEBUG=2 "${EXTRA_ENV[@]}" "$BIN" -m "$MODEL" -ngl 99 -c 4096 -b 512 -ub 512 "${FA[@]}" \
         --no-warmup -no-cnv -lv 5 --no-log-prefix --no-log-timestamps --seed 42 --temp 0 \
-        -p '1, 2, 3, 4, 5,' -n 2 \
+        -p '1, 2, 3, 4, 5,' -n 2 "${EXTRA_ARGS[@]}" \
     > "$OUT/run.out" 2> "$OUT/run.err" &
 RUN_PID=$!
 
-session_alive() { pgrep -s "$RUN_PID" >/dev/null 2>&1; }
+session_alive() { pgrep -s "$SID" >/dev/null 2>&1; }
 
+# TERM the session, give it 5 s, KILL what is left
+kill_session() {
+    pkill -TERM -s "$SID" 2>/dev/null
+    for _ in 1 2 3 4 5; do session_alive || return 0; sleep 1; done
+    pkill -KILL -s "$SID" 2>/dev/null
+}
+
+# block until the session is empty, so no stamp or exit happens while the
+# load still allocates; re-kill at 30 s, give up (exit 3) at 120 s
+wait_session_empty() {
+    local waited=0
+    while session_alive; do
+        if [ "$waited" -ge 120 ]; then
+            stamp "session $SID still alive after ${waited}s"
+            echo "session $SID still has live processes after ${waited}s (D state?); do NOT start another GPU run -- check it by hand" >&2
+            exit 3
+        fi
+        [ "$waited" -eq 30 ] && kill_session
+        sleep 2; waited=$((waited + 2))
+    done
+}
+
+SID="$RUN_PID"
 sleep 1
-if [ "$(ps -o sid= -p "$RUN_PID" | tr -d ' ')" != "$RUN_PID" ]; then
-    # setsid forked, so the session this script would watch and kill is not
-    # RUN_PID's; refuse rather than run with an inert watchdog
+if ! kill -0 "$RUN_PID" 2>/dev/null; then
+    # gone within a second: bench-guard refused or failed at once. Not a
+    # setsid fork -- let the normal wait/rc path report its status
+    echo "bench-guard exited within 1 s of launch; its status follows" >&2
+elif [ "$(ps -o sid= -p "$RUN_PID" | tr -d ' ')" != "$RUN_PID" ]; then
+    # setsid forked, so the run lives in the child's session, not RUN_PID's;
+    # refuse rather than run with an inert watchdog, and do not exit until
+    # that session is empty
     echo "setsid forked: pid $RUN_PID is not its own session leader; the watchdog could not kill the run" >&2
     child="$(pgrep -P "$RUN_PID" | head -1)"
-    [ -n "$child" ] && pkill -TERM -s "$child" 2>/dev/null
+    if [ -n "$child" ]; then
+        SID="$(ps -o sid= -p "$child" | tr -d ' ')"
+        [ -n "$SID" ] && { kill_session; wait_session_empty; }
+    fi
     kill -TERM "$RUN_PID" 2>/dev/null
+    wait "$RUN_PID"
+    stamp "refused: setsid forked"
     exit 3
 fi
 
-# TERM the session, give it 5 s, KILL what is left, then block until the
-# session is empty so no stamp or exit happens while the load still allocates
-kill_session() {
-    pkill -TERM -s "$RUN_PID" 2>/dev/null
-    for _ in 1 2 3 4 5; do session_alive || return 0; sleep 1; done
-    pkill -KILL -s "$RUN_PID" 2>/dev/null
-}
-
 KILLED=0
 while kill -0 "$RUN_PID" 2>/dev/null; do
-    a=$(avail_gb)
-    echo "$(date +%T) Shmem=$(shmem_gb)G MemAvailable=${a}G" >> "$OUT/mem.log"
+    a=$(avail_gb) sh=$(shmem_gb)
+    echo "$(date +%T) Shmem=${sh}G MemAvailable=${a}G" >> "$OUT/mem.log"
+    why=
     if [ "$a" -lt "$FLOOR_GB" ]; then
-        echo "watchdog: MemAvailable ${a} GB < ${FLOOR_GB} GB, killing session $RUN_PID" | tee -a "$OUT/mem.log" >&2
+        why="MemAvailable ${a} GB < ${FLOOR_GB} GB"
+    elif [ -n "$SHMEM_ABORT_GB" ] && [ "$sh" -gt "$SHMEM_ABORT_GB" ]; then
+        why="Shmem ${sh} GB > ${SHMEM_ABORT_GB} GB"
+    fi
+    if [ -n "$why" ]; then
+        echo "watchdog: $why, killing session $SID" | tee -a "$OUT/mem.log" >&2
         kill_session
         KILLED=1
         break
@@ -160,16 +198,7 @@ wait "$RUN_PID"
 RUN_RC=$?
 
 # bench-guard exiting does not prove its children did; wait for the session
-waited=0
-while session_alive; do
-    if [ "$waited" -ge 120 ]; then
-        stamp "session $RUN_PID still alive after ${waited}s"
-        echo "session $RUN_PID still has live processes after ${waited}s (D state?); do NOT start another GPU run -- check it by hand" >&2
-        exit 3
-    fi
-    [ "$waited" -eq 30 ] && kill_session
-    sleep 2; waited=$((waited + 2))
-done
+wait_session_empty
 sleep 5
 stamp "post+5s rc=$RUN_RC"
 

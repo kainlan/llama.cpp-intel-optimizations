@@ -3,9 +3,9 @@
   "model": "qwen4exp / Qwen3.8-Flash-Next-Q8_0",
   "rules": [
     {"id": "IN-TOK-EMBD", "op": "GET_ROWS", "src0": "^token_embd\\.weight$", "expect": "SYCL", "verdict": "SUSPECT",
-     "cite": "input layer is the CPU device's buft list (src/llama-model.cpp:2338), whose first entry is the first GPU's host buffer type, ahead of the CPU buffer (make_cpu_buft_list, :1765-1777); the scheduler gives the gather the backend of that SYCL_Host buffer, so SYCL0 runs it -- measured on the B70 Mistral control (token_embd.weight [SYCL0]). Suspect under placement-decides-executor: a GPU gather over a host-pinned table"},
+     "cite": "input layer is the CPU device's buft list (src/llama-model.cpp:2338), whose first entry is the first GPU's host buffer type, ahead of the CPU buffer (make_cpu_buft_list, :1765-1777); the scheduler gives the gather the backend of that SYCL_Host buffer, so SYCL0 runs it -- measured on the B70 Mistral control (token_embd.weight [SYCL0]). A GPU gather over a host-pinned table is zero-copy and not sanctioned (ruling 2026-09-27, doc P8, llama.cpp-lah5); after the fix this rule expects CPU"},
     {"id": "IN-PLE-GATHER", "op": "GET_ROWS", "src0": "^per_layer_token_embd", "expect": "SYCL", "verdict": "SUSPECT", "count": 1,
-     "cite": "same input-layer buft list as IN-TOK-EMBD (per_layer_token_embd is LLM_TENSOR_LAYER_INPUT, src/llama-arch.cpp:915), so the 50.66 GiB PLE table would sit in a SYCL_Host pinned buffer and SYCL0 would gather from it; the storage-tier design (llama.cpp-th32) intends CPU/SSD. Predicted from the Mistral token gather, not measured"},
+     "cite": "same input-layer buft list as IN-TOK-EMBD (per_layer_token_embd is LLM_TENSOR_LAYER_INPUT, src/llama-arch.cpp:915), so the 50.66 GiB PLE table would sit in a SYCL_Host pinned buffer and SYCL0 would gather from it; the storage-tier design (llama.cpp-th32) intends CPU/SSD. Predicted from the Mistral token gather, not measured; zero-copy, not sanctioned (doc P8, llama.cpp-lah5)"},
 
     {"id": "HC-PRE-FUSED", "op": "DSV4_HC_PRE", "expect": "CPU", "verdict": "UNSUPPORTED", "count": 96,
      "cite": "no GGML_OP_DSV4_HC_PRE case, falls to default:false (:108772); kept fused on CPU by the CPU-landing exemption in resolve_fused_ops (src/llama-context.cpp:1263) instead of reverting to the unfused SYCL chain"},

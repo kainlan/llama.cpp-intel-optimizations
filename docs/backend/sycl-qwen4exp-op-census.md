@@ -25,7 +25,7 @@ suspect (last row).
 | hyper-connection combine | `DSV4_HC_POST` | 96 | no SYCL case, `default: false` (:108772) | gap |
 | GDN gate softplus | `SOFTPLUS` | 36 | not in the UNARY switch (:108205-108240); no softplus kernel in `ggml-sycl/` | gap |
 | QSA indexer top-k | `TOP_K` | 12 | admitted only for `k <= 32` (:108684-108687); the indexer asks for up to 2051 | gap |
-| token + PLE gathers | `GET_ROWS` | 2 | the input layer's first buffer type is SYCL_Host, so the scheduler runs the gather on SYCL0 over a pinned host table (measured for `token_embd` on the Mistral control) | suspect: placement |
+| token + PLE gathers | `GET_ROWS` | 2 | the input layer's first buffer type is SYCL_Host, so the scheduler runs the gather on SYCL0 over a pinned host table (measured for `token_embd` on the Mistral control) | gap: zero-copy, not sanctioned (P8, `llama.cpp-lah5`) |
 
 That is 240 CPU nodes per graph in about 240 CPU splits, which comes to roughly 480 splits for each
 decode token (every island costs a CPU split plus the SYCL split that follows it). The HC islands dominate,
@@ -47,8 +47,8 @@ Four rows are **suspect** even though they are predicted to stay on SYCL:
   `:2338`). The scheduler hands a leaf the backend of its buffer, so SYCL0 gathers from a pinned host
   table. The B70 Mistral control shows this for `token_embd`
   (`node #0 (GET_ROWS) embd [SYCL0]`, `token_embd.weight [SYCL0]`). For qwen4exp that would put the
-  50.66 GiB PLE table in pinned host memory with a GPU reading it. The census has to show which
-  happens.
+  50.66 GiB PLE table in pinned host memory with a GPU reading it. Ruled 2026-09-27 (P8): that is a
+  zero-copy read of host memory and is not sanctioned; the gathers belong on ggml-cpu (`llama.cpp-lah5`).
 
 **CPU landings that are placement, not gaps.** `ggml_sycl_op_is_planned_on_host` (:109159) declines
 an op for any of these reasons. A CPU node the census shows for one of them follows placement and is
@@ -292,9 +292,16 @@ GPU work, lead session only, holding `GPU.lock`, one command at a time.
    (`timeout -k`), refuses to start if Shmem net of tmpfs exceeds its 10 GiB ceiling
    (`bench-guard.sh:73,190`), checks the kernel journal for GPU faults, and stamps VALID or SUSPECT.
    Its ceiling is the binding pre-run gate; the script's Shmem < 30 GB check is the looser one.
-4. Runs a watchdog that samples every 2 s into `mem.log`. If MemAvailable drops under 20 GB it kills
-   the **session**, TERM then KILL after 5 s. A process-group kill would miss the binary, because
-   `timeout` moves itself and its child into their own group.
+   One second after the launch it checks the session. If bench-guard has already exited, which is
+   what a refusal looks like, it says so and takes the normal rc path (steps 5 and 6). If
+   `setsid` forked instead, so the run is not in the session the watchdog would kill, it kills the
+   forked session, waits for it to empty, and exits 3.
+4. Runs a watchdog that samples every 2 s into `mem.log`. It kills the **session**, TERM then KILL
+   after 5 s, if MemAvailable drops under 20 GB (`WATCHDOG_FLOOR_GB`), or, in the control and
+   vehicle modes, if Shmem exceeds 100 GB (`WATCHDOG_SHMEM_GB`). Those runs measure about 2 GB, so
+   100 GB means a runaway. The qwen4exp mode has no Shmem abort (see "The real model: blocked on
+   host memory"). A process-group kill would miss the binary, because `timeout` moves itself and
+   its child into their own group.
 5. Blocks until the session is empty before it stamps the post sample or exits. If a process
    survives 120 s it exits 3 with "do NOT start another GPU run".
 6. Fails the run (exit 3) unless `run.err` carries `bench-guard: VALID`. bench-guard exits with the
@@ -308,7 +315,7 @@ What each run executes, for reference:
 ONEAPI_DEVICE_SELECTOR=level_zero:<0|1> setsid -w scripts/bench-guard.sh --budget <600|1800> -- \
   env GGML_SCHED_DEBUG=2 ./build/bin/llama-completion -m <model> -ngl 99 -c 4096 -b 512 -ub 512 \
     -fa <on|auto> --no-warmup -no-cnv -lv 5 --no-log-prefix --no-log-timestamps --seed 42 --temp 0 \
-    -p '1, 2, 3, 4, 5,' -n 2 > run.out 2> run.err
+    -p '1, 2, 3, 4, 5,' -n 2 [--ignore-eos] > run.out 2> run.err
 ```
 
 Why each flag matters:
@@ -332,6 +339,10 @@ Why each flag matters:
   and touches every host expert.
 - `-c 4096`. Without it, n_ctx_train is 262144 (see `llama.cpp-uize` for what a default context does
   on this fork).
+- `--ignore-eos`, vehicle mode only. The vehicle's weights are random, so it can sample EOS as its
+  first token, which ends the run before the T = 1 decode graph exists. The Mistral controls
+  continue the digit sequence, and their measured dumps carry the T = 1 class. The real
+  model runs without it; if it did stop at EOS, the missing T = 1 class makes the parser return VOID.
 - Graph shapes. The reserve at `-ub 512` supplies the PP graph (T = 512), and the `-n 2` decode
   supplies T = 1. The parser classifies each dump by the size of the token-embedding gather, whose
   `src[0]` is `token_embd.weight`. The gather node itself is unnamed or named `embd`, depending on
@@ -427,7 +438,7 @@ The full-model census waits on one of these:
 - a decision on SYCL mmap support. **`llama.cpp-5efe`** ("SYCL: mmap_support=0 makes lazy model
   loading AUTO resolve to OFF", P3, open) is that ticket, but it covers lazy mode only.
 
-Proposed comment for the lead to add to 5efe:
+The lead added this comment to 5efe on 2026-09-27:
 
 > Widen the scope. The same unset `mmap_support` also turns off `use_mmap` under
 > `LLAMA_LOAD_MODE_AUTO` (`src/llama-model.cpp:2245-2253`), not only AUTO lazy mode (`:2255-2265`).
@@ -504,7 +515,8 @@ as follows:
 - It parses the golden excerpt of the real control-on capture into the classes [512, 1].
 - It checks that every prediction rule names an op ggml prints.
 
-The parser at `53eb4b700` fails it with 27 assertions, among them
+The parser at `53eb4b700` fails it with 25 assertions (re-run 2026-09-27: 1 in the unprefixed
+mode, 10 each in the timestamp and bare-prefix modes, 4 on the golden excerpt), among them
 "[timestamp] n_tokens classes: expected [512, 1], got [None, None]" and the same on the golden
 excerpt.
 
@@ -570,8 +582,7 @@ excerpt.
      SYCL0.
   3. A tiered-KV run keeps FA enabled. Use the GPT-OSS n_ctx 131072 configuration from 7nzm and
      measure the compute buffer: it must not regrow to 17.3 GB.
-- It touches the owner ruling on placement, so it needs an owner decision. P3 makes it moot for HC,
-  but not for the next fused op.
+- **Accepted** (lead ruling, 2026-09-27). P3 makes it moot for HC, but not for the next fused op.
 
 **P5. sycl: GATED_DELTA_NET honesty, prefill correctness and PP throughput.**
 - (a) supports_op mirrors the kernel's real envelope: S_v in {16, 32, 64, 128}, and contiguous g,
@@ -606,16 +617,21 @@ excerpt.
   materialization entry appears at first dispatch. The observable is a trace of that cache, not the
   census.
 
-**P8. question for the owner: the input-layer gathers run on SYCL0 over a SYCL_Host buffer.**
+**P8. The input-layer gathers run on SYCL0 over a SYCL_Host buffer. Ruled: not sanctioned.**
 - `make_cpu_buft_list` puts the first GPU's host buffer type ahead of the CPU buffer
   (`src/llama-model.cpp:1765-1777`). The input layer (`:2338`) therefore lands `token_embd`, and on
   qwen4exp the 50.66 GiB `per_layer_token_embd`, in pinned host memory, and SYCL0 runs the gathers.
   Measured for `token_embd` on the Mistral control.
-- For a T-row gather the bandwidth is trivial. Still, it is a GPU reading host memory, and pinning
-  50 GiB of PLE collides with the storage-tier design (`th32`).
-- Decide: is a gather over the input layer a sanctioned exception to "placement decides the
-  executor", or should the input layer get a buffer list without the host type? The vehicle census
-  plus a `GGML_SYCL_DEBUG` trace of the PLE gather would show which path executes.
+- **Ruling (2026-09-27): the existing owner rule applies, with no exception.** Placement decides the
+  executor, and a GPU gather over SYCL_Host-pinned `token_embd` or PLE is a zero-copy read of host
+  memory. A small T-row gather gets no carve-out for moving few bytes.
+- `llama.cpp-lah5` first verifies which executor actually runs the gathers, then moves them to
+  ggml-cpu. The vehicle census plus a `GGML_SYCL_DEBUG` trace of the PLE gather give the evidence;
+  after the fix, IN-TOK-EMBD and IN-PLE-GATHER expect CPU.
+- The gathered rows, T x n_embd per layer, then cross to the device as an ordinary activation copy
+  at the split boundary. That is not weight streaming: no weight moves, only the op's output.
+- Where the PLE table's bytes live, RAM or SSD, is not part of this ticket. That stays the storage
+  planner's decision (`llama.cpp-th32`); lah5 only moves the executor to where the bytes already are.
 
 Not a ticket: MoE `SWIGLU` on the CPU for host-expert layers (:109207), and the other
 `planned_on_host` declines listed in the summary, are placement deciding the executor. If the census
@@ -628,7 +644,7 @@ shows them, record the layer count, because it bounds the host-side work per tok
 - **P4** gives "why did this backend decline" one source, the backend, and leaves placement
   declines exempt. The first version asked supports_op, which would have overridden placement.
 - **P7** moves a layout decision from dispatch to the planner, so the layout has one source.
-- **P8** asks whether an existing GPU read of host memory is sanctioned; it proposes nothing until
-  that is answered.
+- **P8** removes an existing GPU zero-copy read of host memory: placement decides the executor, and
+  the input gathers go to ggml-cpu.
 - Today's CPU islands already cost a device-host round trip each. That is the per-token
   synchronization P1-P3 remove.
