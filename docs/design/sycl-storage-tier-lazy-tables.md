@@ -1,6 +1,6 @@
 # SYCL STORAGE tier for lazy row tables (PLE / n-gram / engram embeddings)
 
-*Status: DESIGN rev 2b, not implemented. Tracker: `llama.cpp-th32`.
+*Status: DESIGN rev 2c, not implemented. Tracker: `llama.cpp-th32`.
 Implementation tickets are filed after review (proposed split in §11). Written
 2026-09-26 against fork `76c7f6548` and upstream `ggml-org/master` `694ec2354`;
 the host-fit terms are re-read at fork `c69d5774d`, whose `unified-cache.cpp`
@@ -9,7 +9,9 @@ and `ggml-sycl.cpp` are byte-identical to `76c7f6548`. Rev 2 folded review
 `design-th32-r2` (1 Critical, 5 Important, 12 Minor) under the lead's rulings
 §T2, §T3, §T4, §D5 and §D6 (§D6 amends §D5 after `9g22`'s r4 review), and
 the owner's decision §D4 (`lead-rulings-2026-09-26.md`). It takes `9g22`'s
-figures from that design's rev 6 (`8cc84d46a`).*
+figures from that design's rev 6 (`8cc84d46a`). Rev 2c folds the lead's
+§T5, which rules on rev 2b's open items: DQ-C2, the row-cache size and the
+cold-expert order source.*
 
 Citations: fork code as `76c7f6548 <file>:<line>`, upstream code as
 `694ec2354 <file>:<line>` (read with `git show ggml-org/master:<file>`; the fork
@@ -30,7 +32,7 @@ Appendix A and the probe sources are described in Appendix B.
 (`lead-rulings-2026-09-26.md`, or relayed by the lead as an owner answer), and
 the owner's decisions are cited as **owner §D1**, **owner §D2** and **owner
 §D4** after their sections there. A decision the lead made is marked *lead
-ruling* with its section (§T1-§T4, §D5, §D6). Everything else in this
+ruling* with its section (§T1-§T5, §D5, §D6). Everything else in this
 document is this design's **proposal**. This document's own decisions are
 numbered D1-D9 in §13; the one that was also called D4 (`--lazy-mode`) is
 **DLM** from rev 2b on, so that "§D4" always means the owner's decision, and
@@ -112,9 +114,10 @@ Rev 2a put the HOST gather in the leading CPU split, as a CPU op next to
 `inp_embd` (*lead ruling §T1*, C2), and let the first SYCL op read its output
 in place. DQ forbids that read. The copy that replaces it cannot be made
 wait-free from the leading split, because the next ubatch's CPU op would
-overwrite the copy's source on the submitting thread (§7.1). Rev 2b therefore
-routes HOST through the STORAGE path. That changes a *lead ruling §T1*
-placement, so it is put to the lead as **DQ-C2** (§13).
+overwrite the copy's source on the submitting thread (§7.1). So HOST takes
+the STORAGE path: **one host_task path, no host wait**. The lead ruled this
+(*lead ruling §T5*, DQ-C2 option (a)), and it supersedes *§T1* C2's placement
+of HOST in the leading CPU split.
 
 The consumer contract that a model implements is §9.1.
 
@@ -211,9 +214,14 @@ The owner's decisions on the ticket (2026-09-26):
 - The Q2_K fit (owner §D4): fix the zone waste with lever (s) (`sgc5`, `s4ip`
   and the ring type-gate), and put the coldest Q2_K routed experts on STORAGE,
   executed by the CPU. That sanctions STORAGE→CPU for experts. The cold set
-  is profiled, with the `exp_probs_b` bias as the fallback (owner §D2).
+  is profiled, with the `exp_probs_b` bias as the fallback (owner §D2). The
+  profile is not mandatory (*lead ruling §T5*): the order comes from a
+  measured profile, then the `exp_probs_b` prior, then a deterministic
+  fallback with a WARN naming it. P3 holds either way; only speed depends on
+  the profile. `llama.cpp-9g22` states the order once, in
+  [its §7 D1](deepseek41-runtime.md#7-owner-decisions).
 
-The lead's rulings on this design (`lead-rulings-2026-09-26.md` §D3/§T1-§T4,
+The lead's rulings on this design (`lead-rulings-2026-09-26.md` §D3/§T1-§T5,
 §D5, §D6): host weights are charged at exact bytes (`llama.cpp-rnh3`, which T2
 depends on); the provider decides where the gather sits; the gather is a
 SYCL-owned CPU `host_task` with event edges (D6(c)); one host budget function
@@ -226,7 +234,10 @@ of `2 x` the largest per-layer cold bytes (§D6 I-4); one P3 budget is placed
 jointly, routed experts before engram tables (§D6 I-5); row caches are fixed
 before the cold set is sized (§T4 I-4); lever (s) removes `dma_staging_pool`
 entirely (§D6 I-1); T2 is split into a WARN-only phase (a) and an enforcing
-phase (b) (§D6 I-3).
+phase (b) (§D6 I-3); HOST gathers take the STORAGE host_task path, which
+supersedes §T1 C2's HOST placement (§T5 DQ-C2); the row caches are fixed at
+2 GiB per table, index included, in the P3 budget before the cold-set search
+(§T5); the cold-expert order has a deterministic last resort (§T5).
 
 Out of scope: the `qwen4exp` port itself (`llama.cpp-n77l`) and the `deepseek41`
 runtime (`llama.cpp-9g22`); the GPU kernels that consume the gathered rows
@@ -951,30 +962,32 @@ neither document's table is a gate.
    the residual that step 5 sizes `C` to leave. P3 binds production loads and
    gate loads alike. On DeepSeek phase 1 one HOST table needs a
    `MemAvailable_pre` of about 228-232 GiB (§4.5), so both tables are STORAGE
-   at every reading so far. Each STORAGE cache is then **fixed** at its
-   target size, index included: the gate size, 2 GiB per table, which this
-   design proposes as the default for DeepSeek (never below the floor)
-   (*lead ruling §T4*, I-4).
+   at every reading so far. Each STORAGE cache is then **fixed** at 2 GiB
+   per table, index included (never below the floor), and charged in the
+   one P3 budget before step 5's search (*lead rulings §T4* I-4, *§T5*);
+   7v5c prints it.
 5. **With a cold-expert class: the cold set** (owner §D4; *lead ruling §D5*,
    amended by *§D6*, I-4). `llama.cpp-7v5c` finds `C` from this load's
    `MemAvailable` reading by a **search** down the §D1 profile order, coldest
-   first (the usage profile, then the `exp_probs_b` bias). Each step moves the
-   next expert-layer to STORAGE and recomputes the warm WEIGHT bytes, the
-   main pool's exact chunk rounding and the landing slab (`2 x` the largest
-   per-layer cold bytes). The search stops at the first `C` whose predicted
-   post-load `MemAvailable` is at least 24 GiB (9g22's P3). The profile
-   orders the experts; it does not size the set, so there is no separate
-   selected size (§D6 withdraws `C_selected`). Everything charged in steps
-   2-4, the fixed caches included, is charged **before** `C` is sized, and `C`
+   first. The order comes from a measured profile, then the `exp_probs_b` prior,
+   then a deterministic fallback with a WARN naming it (*lead ruling §T5*;
+   stated once in `9g22`'s [§7 D1](deepseek41-runtime.md#7-owner-decisions)).
+   Each step moves the next expert-layer to STORAGE and recomputes the warm
+   WEIGHT bytes, the main pool's exact chunk rounding and the landing slab
+   (`2 x` the largest per-layer cold bytes). The search stops at the first `C`
+   whose predicted post-load `MemAvailable` is at least 24 GiB (9g22's P3). The
+   profile orders the experts; it does not size the set, so there is no separate
+   selected size (§D6 withdraws `C_selected`). Everything charged in steps 2-4,
+   the fixed caches included, is charged **before** `C` is sized, and `C`
    absorbs the remainder: row caches and the cold set never trade bytes at run
    time (*lead ruling §T4*, I-4). If even every host expert cold cannot clear
    P3, the load **refuses** as `cold-set-cannot-clear-p3`, naming the reading,
    the P3 threshold and the shortfall; it never loads below P3. The step is
    `llama.cpp-yl3v`'s, through 7v5c's computation; th32 consumes its `C` and
-   slab bytes in `host_planned_bytes` (§4.2).
-   **Without one** (Qwen): the STORAGE caches take what is left as a
-   **yieldable** tenant (§6.4), split between tables in proportion to
-   `table_bytes x rows_per_token`, a proxy for miss traffic.
+   slab bytes in `host_planned_bytes` (§4.2). **Without one** (Qwen): the
+   STORAGE caches take what is left as a **yieldable** tenant (§6.4), split
+   between tables in proportion to `table_bytes x rows_per_token`, a proxy for
+   miss traffic.
 
 Nothing in this sequence reads an environment variable except the ledger's
 budget override (§4.2). `--lazy-mode` keeps its upstream meaning of
@@ -1143,12 +1156,17 @@ and envelope), so **a plan that passes P3 also passes the planner**.
 | after (s) | **171.1-174.5** | **200.1-203.5** | -8.1 to -4.7 / 2.3 to 5.7 / 4.2 to 7.6 / 10.9 to 14.3 |
 
 P3 fails at every reading in both columns, so without a cold set the gates
-cannot launch at all. `9g22` rev 6 §4.5.2 (`8cc84d46a`) predicts -8.7 to
--5.8 GiB post-load at 171.4 after (s), 0.6-1.1 GiB below the row above, and
--37.6 to -34.7 on today's code, within 0.7 GiB of it. Rev 6 adds the RUNTIME
-zone's 512 MiB floor (its r4 m4); the rest is hand rounding. Rev 5's
-today's-code row, 8.4-12.4 GiB lower than this one, is superseded. 7v5c's
-printout is the one list of terms both documents cite (§4.2).
+cannot launch at all. `9g22` rev 6 §4.5.2 (`8cc84d46a`) agrees with both
+rows:
+- **Today's code:** its "B70 alone, today's code + rnh3" row (its r4 m1)
+  gives `E₀` = **201.1-204.0 GiB**, against 200.4-203.8 above. That closes
+  the 8.4-12.4 GiB gap rev 2b recorded against rev 5, whose 188.0-195.4 was
+  two-card room misread as one card (*lead ruling §T5*).
+- **After (s):** it predicts -8.7 to -5.8 GiB post-load at 171.4, 0.6-1.1 GiB
+  below the row above. Rev 6 adds the RUNTIME zone's 512 MiB floor (its r4
+  m4), and the rest is hand rounding.
+
+7v5c's printout is the one list of terms both documents cite (§4.2).
 
 **An engram table HOST under P3** (§4.3 step 4, *lead ruling §D6*, I-5).
 With the cold set empty and one table HOST, its 2 GiB gate cache is no longer
@@ -1177,8 +1195,9 @@ if every host expert cold still fails P3; `9g22` §4.5.2 puts that far below
 any reading taken.
 
 Where the row caches land on the hit-rate curves (§6.2.2): in a plan with a
-cold set they are **fixed** at the gate size, 2 GiB per table with the index
-included (§4.3 step 4, §T4 I-4). That leaves each table ~1.7 GiB of 84 B slots
+cold set they are **fixed** at 2 GiB per table with the index included,
+charged in the P3 budget before the cold-set search (§4.3 step 4; *lead
+rulings §T4* I-4, *§T5*). That leaves each table ~1.7 GiB of 84 B slots
 after its index, 44 M slots together, which is ~4.5 GiB in the simulation's
 110 B units, between its 2 GiB and 8 GiB columns. That is the DeepSeek
 operating point at every reading; the reading changes `C`, not the caches.
@@ -1643,8 +1662,9 @@ Code and docs stay in the tables as the upper bound.
 - **Fixed, when the plan has a cold set** (*lead ruling §T4*, I-4). Then each
   cache is charged at its target in step 4, before the cold set is sized, and
   it does not trade bytes with the cold set at run time in either direction
-  (§4.3). For DeepSeek this design proposes the gate size, 2 GiB per table
-  including the index, as the target. It is still built from yieldable
+  (§4.3). For DeepSeek the target is 2 GiB per table including the index,
+  charged in the P3 budget before the cold-set search (*lead ruling §T5*).
+  It is still built from yieldable
   256 MiB chunks, so a context tenant can take bytes back (below).
 - **The leftover, yieldable, when it has none** (*lead ruling §T1*, I8). Step 5
   gives the rest of the host budget to the row caches, split as that step
@@ -1702,9 +1722,9 @@ ggml_tensor * llm_graph_context::build_lazy_get_rows(ggml_tensor * lazy, ggml_te
   and the result has the shape `ggml_get_rows` produces, so each model's
   reshape and everything downstream are untouched.
 - **Why HOST no longer sits in the leading CPU split** (rev 2a's form, *lead
-  ruling §T1* C2; put to the lead as DQ-C2, §13). Rev 2a made the HOST gather
-  a CPU custom op in the leading split and let the first SYCL op read its
-  output from the `SYCL_Host` compute buffer in place. §T2's DQ forbids that
+  ruling §T1* C2, superseded by *§T5* DQ-C2 (a); §13). Rev 2a made the HOST
+  gather a CPU custom op in the leading split and let the first SYCL op read
+  its output from the `SYCL_Host` compute buffer in place. §T2's DQ forbids that
   read, and an explicit copy from the leading split cannot be made wait-free.
   The CPU op runs on the submitting thread and writes the same compute-buffer
   bytes for every ubatch, because `gallocr` gives a graph of the same topology
@@ -2279,9 +2299,9 @@ consumes this contract and links here for it; this section is the one source.
 5. **Position and executor: the provider decides** (*lead ruling §T1*, C2). The
    model does **not** choose where the gather sits or what runs it. The
    helper places the gather of either residency at the head of the consumer
-   device's first split as a SYCL-owned op (§7.1; DQ-C2 in §13 for the HOST
-   case), and §8.4's arms test that choice. A consumer must not hard-code "before
-   block N": that is the r1 contract, withdrawn.
+   device's first split as a SYCL-owned op (§7.1; DQ-C2 in §13, *lead ruling
+   §T5*), and §8.4's arms test that choice. A consumer must not hard-code
+   "before block N": that is the r1 contract, withdrawn.
 6. **Optional lookahead.** `peek_rows(next_ubatch, tail)` returns the next
    ubatch's rows from the model's sequence state, so the IO of ubatch `k+1`
    overlaps the compute of ubatch `k` (§5.4). The provider bounds lookahead to
@@ -2311,7 +2331,8 @@ So cold experts **are** on STORAGE in phase 1.
 
 **Who owns what** (the owner's either/or in §D4: this design names the
 interface). `llama.cpp-yl3v` owns the cold-expert path: choosing the experts
-(the usage profile, then the `exp_probs_b` bias), executing them on
+(a measured profile, then the `exp_probs_b` prior, then a deterministic
+fallback with a WARN; *lead ruling §T5*), executing them on
 `CpuExpertPool`, its landing slab, and prefetching from routing. The expert
 read path differs from the row path in exactly those places: its unit is an
 expert-layer's three slices (~12.8 MB on Q2_K), not a row; its reads are known
@@ -2362,7 +2383,7 @@ The cold-set **size** is not a th32 number either: 7v5c computes it at load
 | the same shapes on a settled Qwen split (mostly on the T7) | **0.29 GB/s** (1 load) to **0.47 GB/s** (6 loads); the T7's 5 Gb/s link is the cap |
 | reading promotes | `promote_target=nvme` wrote 2.7 GB to the NVMe during a 12 s settled read, so repeatedly read extents become NVMe-cached |
 | PP coverage | a PP512 ubatch uses 99.97% of a layer's 384 experts (1 - (1 - 6/384)^512), so PP reads the whole cold set once per ubatch |
-| static prior | the owner's fallback is the `exp_probs_b` bias (owner §D1, §D2). **A risk to it**: `exp_probs_b` is DeepSeek-V3-style load balancing, which equalises expert load in training, so the prior may carry little signal about which experts are cold (`hash_layer_count = 0`). The usage profile is therefore the primary input, and whether it must be mandatory is `llama.cpp-9g22`'s call |
+| static prior | the owner's fallback is the `exp_probs_b` bias (owner §D1, §D2). **A risk to it**: `exp_probs_b` is DeepSeek-V3-style load balancing, which equalises expert load in training, so the prior may carry little signal about which experts are cold (`hash_layer_count = 0`). The profile is **not** mandatory (*lead ruling §T5*): a measured profile first, then this prior, then a deterministic fallback with a WARN naming it. P3 holds with any of them; a weak prior costs speed, not fit. `9g22` [its §7 D1](deepseek41-runtime.md#7-owner-decisions) states the order |
 | decode cost model | `240 x c x (1 - r) x S / BW` per token, where `c` is the cold share of expert uses, `r` the share a RAM cache serves, and `S` an expert-layer's bytes: **12.8 MB on Q2_K** (phase 1), 16.8 MB on Q3_K_M |
 
 Raw logs are in Appendix A.2 (`expert_probe`).
@@ -2565,12 +2586,12 @@ called D4; renamed here so that "§D4" means only the owner's decision).
 - b) Also let `OFF` force HOST and refuse STORAGE.
 - c) Ignore the flag under SYCL.
 
-**D5. Where is each gather placed? Ruled** (*lead ruling §T1*, C2): the
-provider decides, by residency. As ruled, HOST gathers stay in the leading
-`inp_embd` split as a CPU op, and STORAGE gathers head the consumer device's
-first split as a SYCL-owned op (§7.1). Rev 2b proposes changing the HOST half
-under DQ (DQ-C2, below). §8.4's arms A and C test the STORAGE executor with a
-fixed decision rule. r1's "expand before each consumer block" is withdrawn.
+**D5. Where is each gather placed? Ruled** (*lead rulings §T1* C2, *§T5*
+DQ-C2): the provider decides. §T1 C2 put HOST gathers in the leading
+`inp_embd` split as a CPU op; §T5 supersedes that half, so both residencies
+head the consumer device's first split as a SYCL-owned op (§7.1). §8.4's
+arms A and C test the STORAGE executor with a fixed decision rule. r1's
+"expand before each consumer block" is withdrawn.
 
 **D6. Who executes the STORAGE gather? Ruled** (*lead ruling §T1*, D6(c)): the
 SYCL backend, as a CPU `host_task` with event edges, no scheduler split, no
@@ -2598,8 +2619,9 @@ stated segment boundary, not a recorded host-task node.
 no leases; in 256 MiB chunks; yielded chunks come back only at the next plan
 publish (§T2: no regrow until then). In a plan with a cold set the cache is
 **fixed** at its target and charged before the cold set is sized (§T4 I-4);
-without one it takes what is left (§4.3, §6.4). The target this design
-proposes for DeepSeek is the gate size, 2 GiB per table with the index.
+without one it takes what is left (§4.3, §6.4). For DeepSeek the target is
+2 GiB per table with the index, charged in the P3 budget before the cold-set
+search and printed by 7v5c (*lead ruling §T5*).
 
 **D8. DeepSeek-V4.1-Flash: the rung and its fit. Decided by the owner**
 (owner §D2: Q2_K primary; owner §D4: "Zones + SSD cold experts"). The lead
@@ -2636,14 +2658,14 @@ STORAGE; the GPU does not read `SYCL_Host` memory zero-copy. The design is
 The general census of CPU-split outputs that SYCL reads zero-copy is the
 lead's separate ticket.
 
-**DQ-C2. Where the HOST gather runs under DQ** (proposed; lead-level; it
-changes the HOST half of *lead ruling §T1* C2).
-- a) **(rec)** The one path for both residencies (§7.1, §7.2): the SYCL backend
-  owns the HOST gather too; its host task dequantizes from the resident body
-  into the output slot at prefetch, and the step-3 copy moves it. The copy's
-  source is guarded on the host task's thread (the output-slot rule of §7.2),
-  so nothing waits on the submitting thread. It is what §T2's "one code path
-  for both tiers" reads as, and HOST then also depends on HT-1..HT-4 (or
+**DQ-C2. Where the HOST gather runs under DQ. Ruled (a)** (*lead ruling
+§T5*; it supersedes *§T1* C2's placement of HOST in the leading CPU split).
+- a) **(ruled)** The one path for both residencies (§7.1, §7.2): the SYCL
+  backend owns the HOST gather too; its host task dequantizes from the resident
+  body into the output slot at prefetch, and the step-3 copy moves it. The
+  copy's source is guarded on the host task's thread (the output-slot rule of
+  §7.2), so nothing waits on the submitting thread. It is what §T2's "one code
+  path for both tiers" reads as, and HOST then also depends on HT-1..HT-4 (or
   D6-M(b)).
 - b) Keep C2's form: the CPU op in the leading split, and the SYCL backend
   copies its output from the `SYCL_Host` compute buffer before the consumer.
@@ -3081,7 +3103,7 @@ finished
   Run with `/usr/bin/python3` (gguf-py needs its numpy).
 - `io_probe2.sh` takes `FOFF`/`SIZE` for the extent; rev 2's same-session
   controls use it at `blk.1`'s offset.
-- **`docs/design/sycl_storage_tier_host_fit.py` (rev 2b, committed with this
+- **`docs/design/sycl_storage_tier_host_fit.py` (rev 2b-2c, committed with this
   document)**: the §4.5 host-fit calculator, grown from the scratch
   `c2_fit.py` by adding the PP MoE oneDNN ring, the today / after-(s) columns,
   the RUNTIME pool's chunk commit, 9g22's P3 check, the engram tables' joint

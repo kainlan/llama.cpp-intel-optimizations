@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Host-fit calculator behind docs/design/sycl-storage-tier-lazy-tables.md §4.5
-# (llama.cpp-th32, rev 2b). Hand arithmetic only: llama.cpp-7v5c (T27's
+# (llama.cpp-th32, rev 2c). Hand arithmetic only: llama.cpp-7v5c (T27's
 # host-only plan dry-run) replaces every number here once it exists.
 #
 #   python3 docs/design/sycl_storage_tier_host_fit.py
@@ -14,7 +14,7 @@ READINGS = [171.4, 181.8, 183.7, 190.4]   # MemAvailable at load, GiB, 2026-09-2
 OS_RESERVE = 8.0            # max(8 GiB, MemTotal/32), unified-cache.cpp:4216
 P3_MARGIN = 29.0            # 9g22 §4.5.2: MemAvailable_pre - expected_host - 5 >= 24
 ENVELOPE = 2.5              # host_reserve 2 GiB + context envelope <= 0.5 (§4.3 step 3)
-GATE_CACHES = 4.0           # 9g22 P1: 2 GiB per table, index included, two tables
+GATE_CACHES = 4.0           # 2 GiB per table, index included, two tables (9g22 P1, lead ruling T5)
 DRAFT = 7.9                 # DSpark draft on the host (9g22 §10.3)
 DS_TABLE = 60.08 / 2        # one DeepSeek engram table, GiB
 DS_LAYER_EXPERTS = 4.58     # routed-expert bytes per DeepSeek layer, GiB
