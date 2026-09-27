@@ -1613,7 +1613,7 @@ if (NOT WIN32)
     # whose tensor types and layouts the census cannot see. Standard-library Python
     # that runs the script through its /usr/bin/python3 shebang (this host's
     # ctest interpreter cannot load numpy), so it skips (77) where that
-    # interpreter has no numpy.
+    # interpreter is missing or cannot import gguf-py (numpy and yaml).
     llama_test_cmd(
         ${LLAMA_PYTHON3}
         NAME test-sycl-qwen4exp-vehicle-rewrite

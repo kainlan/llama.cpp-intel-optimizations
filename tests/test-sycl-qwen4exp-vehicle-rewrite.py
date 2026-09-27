@@ -6,7 +6,8 @@ types or which tensors exist: a vehicle whose tensors differ from the real
 model's scores its rows as agreeing on paths the real model never takes. So this
 plants tiny GGUFs -- a two-shard "real model", a step-a file (all F32) and a
 step-b file (quantized, reordered) -- and requires:
-- --derive to read the real shards into the expected map;
+- --derive to read the real shards into the expected map, and to refuse a
+  class with two types;
 - the rewrite to give, in step b's order and with the metadata unchanged, each
   tensor's real type from the step that has it: step b's bytes, step a's F32
   bytes where quantize changed an F32 tensor, BF16 bit-exact to ggml's
@@ -20,8 +21,9 @@ step-b file (quantized, reordered) -- and requires:
   require;
 - --verify to accept the result and refuse, each for its own reason, the step-b
   file, type flips (Q8_0 or F16 where the real model has F32, F32 experts, F32
-  indexer, F16 outside the allowlist), an extra tensor, the fused gate_up (in
-  both layers, and in the second layer only), and a missing global tensor;
+  indexer, F32 token_embd, F16 outside the allowlist, and F16 in the allowlist
+  where ne0 = 32 lets Q8_0 hold it), an extra tensor, the fused gate_up (in both
+  layers, and in the second layer only), and a missing global tensor;
 - a failure mid-write to leave an existing output and no temp file, and a
   wrongly shaped input to be refused before its data is read.
 
@@ -271,6 +273,15 @@ def main():
                     "layers": sorted(sorted(s) for s in layers.values())}
         check(json.loads(r.stdout or "{}") == want_map, f"--derive: map {r.stdout[:300]}")
 
+        # RED: a class with two types has no single real type, so --derive refuses it
+        two = [os.path.join(d, "two-types-1.gguf"), os.path.join(d, "two-types-2.gguf")]
+        write_gguf(two[0], [(n, t, ne, None) for n, t, ne in real if not n.startswith("blk.1.")])
+        write_gguf(two[1], [(n, F16 if n == "blk.1.hc_attn_up.weight" else t, ne, None)
+                            for n, t, ne in real if n.startswith("blk.1.")])
+        r = run("--derive", *two)
+        check(r.returncode != 0 and "blk.1.hc_attn_up.weight is F16" in r.stderr,
+              f"--derive with two types in one class: rc {r.returncode} ({r.stderr.strip()[-200:]})")
+
         def rewrite(*args, **kw):
             return run("--map", tmap, *args, **kw)
 
@@ -396,6 +407,11 @@ def main():
                  "blk.1.indexer.k_proj.weight is F32, the real model's is BF16"),
                 ("verify F16 outside the allowlist", retype("blk.0.attn_qkv.weight", F16),
                  "blk.0.attn_qkv.weight is F16, the real model's is Q8_0"),
+                ("verify F16 where Q8_0 fits", [(n, t, [32] + ne[1:] if n == "blk.0.hc_attn_up.weight" else ne)
+                                                 for n, t, ne, _ in real_shape],
+                 "blk.0.hc_attn_up.weight is F16, the real model's is Q8_0"),
+                ("verify F32 token_embd", retype("token_embd.weight", F32),
+                 "token_embd.weight is F32, the real model's is Q8_0"),
                 ("verify extra scale", [t[:3] for t in real_shape] + [("blk.0.ffn_down_exps.scale", F32, [N_EXP])],
                  "blk.0.ffn_down_exps.scale is not in the real model"),
                 ("verify fused gate_up", fused("blk.0", "blk.1"), "blk.0.ffn_gate_up_exps.weight is not in the real"),

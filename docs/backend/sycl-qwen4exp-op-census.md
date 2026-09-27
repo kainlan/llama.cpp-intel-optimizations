@@ -437,8 +437,9 @@ the first two, and the vehicle carried the other two into a census run.
    [256, 768, 2]; the real model has separate `ffn_gate_exps` and `ffn_up_exps`. The two reach
    different `MUL_MAT_ID` paths (detail below).
 3. **Types quantize changed that the real model keeps.** `ple_norm_{key,query,conv}` became Q8_0
-   (lines 38-40 of the lead's quantize log) and `ple_conv1d` became F16, where the real model has
-   F32. The fused run's sched dump shows the grouped PLE norm's `MUL` on SYCL0 with src1
+   (the lead's quantize log, entries [38/98]-[40/98] at lines 214-216) and `ple_conv1d` became F16
+   (entry [36/98] at line 212, after the "ncols 4 not divisible by 32" fallback warning at
+   line 174), where the real model has F32. The fused run's sched dump shows the grouped PLE norm's `MUL` on SYCL0 with src1
    `blk.0.ple_norm_key.w`. So the "RMS_NORM + MUL (grouped) x3 | f32" row would have scored a
    Q8_0-weight path the real model never takes. The reviewer's inferred out-of-bounds read on that
    path is llama.cpp-1z69, not this census's. The script copies step a's F32 tensors unchanged.
@@ -458,7 +459,10 @@ the first two, and the vehicle carried the other two into a census run.
 One delta cannot be closed, and it is the only entry in the script's allowlist: `hc_attn_up`,
 `hc_ffn_up` and `output_hc_up` are Q8_0 in the real model and F16 in the vehicle. Their ne0 is the
 HC low rank, 320 in the real model and 8 in the fixture, and Q8_0 needs ne0 % 32 == 0, so quantize
-falls back to F16.
+falls back to F16. The allowance is bound to that reason: both the rewrite and `--verify` grant F16
+only while the real type's block size (from gguf-py's quant table) does not divide the tensor's
+ne0, so an F16 `hc_attn_up` with ne0 = 32 is refused. What this delta costs the census is in the
+table under "What the vehicle exercises".
 
 The expert layout in detail. The real model's separate gate and up are from the lead's gguf-py read
 of shards 4-6 (2026-09-27), confirmed by the derived map. The first vehicle runs (2026-09-27, on a
@@ -558,14 +562,15 @@ What the vehicle exercises, per prediction rule:
 | QSA-FA | **different kernel shape** | head dim 128, not 256 |
 | IDX-PROJ-BF16 | yes, 2 nodes, on the step b2 file | quantize leaves the indexer F32 (`llama-quant.cpp:327-329`); b2 rewrites it to BF16. On the plain Q8_0 file the two `MUL_MAT`s are F32 and say nothing about BF16 |
 | MOE-MMID, MOE-ARGSORT, MOE-SOFTMAX | yes, on Q8_0, separate gate and up (step b2) | 2 experts, all used; K = 256/384, not 2560/640. On the fixture's fused gate_up, `MUL_MAT_ID` takes a path the real model never does, and SYCL refuses it at the first prompt (llama.cpp-zfbl, out of scope) |
+| MUL-MAT on `hc_*_up` (the `MUL_MAT hc_*_up` row, and the rule's "K=320 hc_up") | **no, different type and K** | the one allowlisted delta: the vehicle's `hc_attn_up`, `hc_ffn_up` and `output_hc_up` are F16 [8, 1024], so their `MUL_MAT` is f16 x f32 with K = 8. It says nothing about q8_0 x f32 at K = 320 |
 | MOE-GLU (PLACEMENT) | **no** | the vehicle's experts fit in VRAM: no host-planned layer, no CpuExpertPool |
 | IN-TOK-EMBD, IN-PLE-GATHER | yes | same input buft list; PLE on layer 0 |
 | every `count` | **no** | counts are for 48 layers; the vehicle has the per-layer multiples |
 | placement under memory pressure | **no** | nothing the 120 GiB of host experts does to the split graph shows up at 2 layers |
 
 So the vehicle can confirm or refute every capability verdict (the gaps and the suspect
-admissions). It cannot confirm the full-model counts, the placement rows, or the GDN head
-broadcast.
+admissions) except the `hc_*_up` `MUL_MAT`'s, which it runs at F16 and K = 8 rather than Q8_0 and
+K = 320. It cannot confirm the full-model counts, the placement rows, or the GDN head broadcast.
 
 ### The real model: blocked on host memory
 
@@ -669,7 +674,7 @@ gguf-py, which needs numpy and yaml.
 It plants tiny GGUFs: a two-shard "real model", a step-a file (all F32) and a step-b file (quantized
 and reordered). Expert rows are 64 wide, two Q8_0 blocks, so a one-block row size fails. The test
 derives its own map through `--derive` and requires:
-- **`--derive`** to give the expected map.
+- **`--derive`** to give the expected map, and to refuse a class with two types.
 - **The rewrite** to give, in step b's order and with the metadata unchanged, each tensor's real type
   from the step that has it:
   - step b's bytes;
@@ -693,7 +698,9 @@ derives its own map through `--derive` and requires:
   - Q8_0 or F16 where the real model has F32;
   - F32 experts;
   - an F32 indexer;
+  - an F32 global tensor (`token_embd`);
   - F16 outside the allowlist;
+  - F16 in the allowlist where ne0 = 32 lets Q8_0 hold it;
   - an extra `.scale`;
   - the fused gate_up in both layers, and in the second layer only;
   - a missing global tensor.
@@ -715,7 +722,7 @@ Earlier versions of this gate:
   first steps.
 
 This version is shown to discriminate by mutants of the current script, each run in a git-archive
-extract. Every one fails it:
+extract. Every one fails it (the last three were survivors of the previous version):
 - gate and up swapped at the call;
 - a contiguous gate-then-up layout with no expert stride;
 - a wrong expert stride;
@@ -727,7 +734,10 @@ extract. Every one fails it:
 - no chmod;
 - dropping any tensor;
 - BF16 by truncation;
-- no layer-set check.
+- no layer-set check;
+- no type check on global tensors;
+- `--derive` letting the first type seen win;
+- the F16 allowance granted whatever ne0 is.
 
 ## Proposed closure tickets (not filed: the lead files them once the census confirms)
 

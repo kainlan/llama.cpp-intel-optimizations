@@ -9,26 +9,28 @@ the real shards' headers into scripts/sycl-qwen4exp-real-tensors.json (a type
 per name class, the per-layer tensor sets, the global tensors), and the rewrite
 and --verify both diff against that file.
 
-Step a (test-llama-archs -o) and step b (llama-quantize Q8_0) differ from the
-real model in four ways, and the rewrite fixes each:
+Step b (llama-quantize Q8_0 of test-llama-archs -o's step a) differs from the
+real model in four ways, which the rewrite fixes, plus one it cannot:
 
-- types quantize cannot produce: the indexer projections are BF16 in the real
-  model, and quantize never converts them (src/llama-quant.cpp:327-329), so they
-  are converted from step a's F32. Where step b quantized what the real model
-  keeps F32 (ple_norm_*) or made F16 (ple_conv1d), step a's F32 tensor is
-  copied unchanged;
-- the fused blk.*.ffn_gate_up_exps.weight: the real model has separate
-  ffn_gate_exps and ffn_up_exps, and the two reach different MUL_MAT_ID paths.
-  Split along ne1 in the order build_moe_ffn views the fused result
-  (src/llama-graph.cpp:2195-2198): rows [0, n_ff) are gate, rows [n_ff, 2 n_ff)
-  are up, per expert. Rows are whole Q8_0 blocks. qwen4exp loads the separate
-  form whenever the fused tensor is absent (src/llama-model.cpp:4262-4266);
-- tensors the real model lacks: every .scale and .input_scale, which the loader
-  creates TENSOR_NOT_REQUIRED in its generic pass (src/llama-model.cpp:
-  2366-2499), and attn_{q,k,v}.bias, TENSOR_NOT_REQUIRED in create_tensor_qkv
-  (src/llama-model.cpp:4302-4304). They are dropped; any other tensor the real
-  model lacks is refused;
-- what cannot be fixed is listed in ALLOWED with its reason.
+1. a type quantize cannot produce: the indexer projections are BF16 in the
+   real model, and quantize never converts them (src/llama-quant.cpp:327-329),
+   so they are converted from step a's F32;
+2. the fused blk.*.ffn_gate_up_exps.weight: the real model has separate
+   ffn_gate_exps and ffn_up_exps, and the two reach different MUL_MAT_ID paths.
+   Split along ne1 in the order build_moe_ffn views the fused result
+   (src/llama-graph.cpp:2195-2198): rows [0, n_ff) are gate, rows [n_ff, 2 n_ff)
+   are up, per expert. Rows are whole Q8_0 blocks. qwen4exp loads the separate
+   form whenever the fused tensor is absent (src/llama-model.cpp:4262-4266);
+3. types quantize changed that the real model keeps F32: ple_norm_* (Q8_0) and
+   ple_conv1d (F16). Step a's F32 tensor is copied unchanged;
+4. tensors the real model lacks: every .scale and .input_scale, which the loader
+   creates TENSOR_NOT_REQUIRED in its generic pass (src/llama-model.cpp:
+   2366-2499), and attn_{q,k,v}.bias, TENSOR_NOT_REQUIRED in create_tensor_qkv
+   (src/llama-model.cpp:4302-4304). They are dropped; any other tensor the real
+   model lacks is refused.
+
+The one it cannot fix is in ALLOWED: a type the vehicle may have only where the
+real model's type cannot hold the vehicle's shape.
 
 Everything else, and the metadata, is copied byte for byte from step b, the
 metadata as raw bytes: the fixture carries empty arrays (tokenizer.ggml.merges,
@@ -72,17 +74,23 @@ DROPPABLE = re.compile(r"\.(scale|input_scale)$|^blk\.\d+\.attn_[qkv]\.bias$")
 BF16 = gguf.GGMLQuantizationType.BF16
 F32  = gguf.GGMLQuantizationType.F32
 
-# name class -> (the vehicle's type, why it cannot be the real model's)
-ALLOWED = {
-    c: ("F16", "ne0 is the HC low rank, 320 in the real model and 8 in the fixture; "
-               "Q8_0 needs ne0 % 32 == 0, so quantize falls back to F16")
-    for c in ("blk.#.hc_attn_up.weight", "blk.#.hc_ffn_up.weight", "output_hc_up.weight")
-}
+# name class -> the type the vehicle may have instead of the real model's, which
+# allowed() grants only while the real type's block does not divide ne0. The HC
+# up projections' ne0 is the HC low rank, 320 in the real model and 8 in the
+# fixture; Q8_0 blocks are 32 wide, so quantize falls back to F16 ("ncols 8 not
+# divisible by 32")
+ALLOWED = {c: "F16" for c in ("blk.#.hc_attn_up.weight", "blk.#.hc_ffn_up.weight", "output_hc_up.weight")}
 
 
 def name_class(name: str) -> str:
     m = LAYER.match(name)
     return f"blk.#.{m.group(2)}" if m else name
+
+
+def allowed(c: str, real: str, ne: list[int]) -> list[str]:
+    """[the allowlisted type], when the real type cannot hold a tensor of shape ne"""
+    block = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType[real]][0]
+    return [ALLOWED[c]] if c in ALLOWED and ne[0] % block else []
 
 
 def pad(n: int, align: int) -> int:
@@ -105,18 +113,18 @@ def derive(shards: list[str]) -> dict:
             "layers": sorted(sorted(s) for s in {frozenset(s) for s in layers.values()})}
 
 
-def diff(tensors: list[tuple[str, str]], tmap: dict) -> list[str]:
-    """what separates [(name, type name)] from the real model's tensor set"""
+def diff(tensors: list[tuple[str, str, list[int]]], tmap: dict) -> list[str]:
+    """what separates [(name, type name, ne)] from the real model's tensor set"""
     problems = []
     types = tmap["types"]
     by_layer = collections.defaultdict(set)
     found_globals = set()
-    for name, qtype in tensors:
+    for name, qtype, ne in tensors:
         c = name_class(name)
         if c not in types:
             problems.append(f"{name} is not in the real model")
             continue
-        if qtype != types[c] and qtype != ALLOWED.get(c, (None,))[0]:
+        if qtype != types[c] and qtype not in allowed(c, types[c], ne):
             problems.append(f"{name} is {qtype}, the real model's is {types[c]}")
         m = LAYER.match(name)
         if m:
@@ -142,7 +150,8 @@ def refuse(path: str, problems: list[str]) -> int:
 
 
 def verify(path: str, tmap: dict) -> int:
-    problems = diff([(t.name, t.tensor_type.name) for t in gguf.GGUFReader(path).tensors], tmap)
+    problems = diff([(t.name, t.tensor_type.name, [int(d) for d in t.shape])
+                     for t in gguf.GGUFReader(path).tensors], tmap)
     return refuse(path, problems) if problems else 0
 
 
@@ -200,7 +209,7 @@ def plan(ra: gguf.GGUFReader, rb: gguf.GGUFReader, tmap: dict):
             else:
                 problems.append(f"{tb.name} is not in the real model, and the loader may require it")
             continue
-        src = pick(ta, tb, [tmap["types"][c]] + ([ALLOWED[c][0]] if c in ALLOWED else []))
+        src = pick(ta, tb, [tmap["types"][c]] + allowed(c, tmap["types"][c], ne))
         if src is None:
             problems.append(f"{tb.name}: the real model's is {tmap['types'][c]}, step b has "
                             f"{tb.tensor_type.name} and step a {ta.tensor_type.name}")
@@ -211,7 +220,7 @@ def plan(ra: gguf.GGUFReader, rb: gguf.GGUFReader, tmap: dict):
                         lambda t=t: gguf.quants.quantize(t.data, BF16).tobytes()))
         else:
             out.append((t.name, t.tensor_type, ne, t.n_bytes, lambda t=t: t.data.tobytes()))
-    problems += diff([(name, qtype.name) for name, qtype, _, _, _ in out], tmap)
+    problems += diff([(name, qtype.name, ne) for name, qtype, ne, _, _ in out], tmap)
     return out, dropped, problems
 
 
