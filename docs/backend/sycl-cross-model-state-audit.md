@@ -55,11 +55,17 @@ never reads the repository census inputs or the checked-in inventory, so it is
 independent of source-tree and line-number drift (including running at a newer
 integration HEAD). Generation is the refresh operation, and `--check` is the
 staleness gate: it parses the current inputs and requires their rendered census
-to match the checked-in CSV byte-for-byte. Under the pinned audited-commit
-policy, a newer source commit is therefore allowed to pass `--self-test` while
-`--check` reports that the audited snapshot needs an explicitly reviewed
-refresh. Do not treat a green self-test as evidence that the inventory is
-current, and do not suppress `--check` drift by weakening its comparison.
+to match the checked-in CSV byte-for-byte. The registered ctest
+`test-sycl-static-storage-audit` runs that `--check` comparison against the
+committed CSV and fails on any drift (llama.cpp-ldvb; before that it only
+checked a freshly generated temp copy, so the committed CSV drifted 2,785 lines
+unnoticed). A change that moves any of the five inputs must therefore
+regenerate the CSV in the same change. The gate parses the **working tree**,
+not a commit, so in a shared checkout any uncommitted edit to a census input
+(anyone's) turns it red until that edit is committed together with a
+regenerated CSV. Do not treat a green self-test as
+evidence that the inventory is current, and do not suppress `--check` drift by
+weakening its comparison.
 
 The generator pins and checks the C++ grammar ABI 15 through
 `tree_sitter_language_pack` 1.8.1 and `tree-sitter` 0.25.2; it fails on a
@@ -96,11 +102,11 @@ explicitly labeled **unscoped lexical candidates**: they do not resolve C++
 bindings and therefore never establish lifecycle reset/teardown. An empty
 candidate search is likewise not proof of no access.
 
-At audited source commit `1d3c4c6ef65d8a627d0b1683a86c31d50f16b967`, the
-census emits **1,386 object rows**: 436 explicitly-static non-local objects,
-66 non-local objects with implicit static storage duration, 878 function-local
-static/thread-local objects, and 6 class static declarations. Per-file rows are 1,169
-(`ggml-sycl.cpp`), 163 (`unified-cache.cpp`), 10 (`unified-cache.hpp`), 42
+At audited source commit `fefb929808417c662a1e976f018bfb783c0b6281`, the
+census emits **1,451 object rows**: 516 explicitly-static non-local objects,
+87 non-local objects with implicit static storage duration, 841 function-local
+static/thread-local objects, and 7 class static declarations. Per-file rows are 1,160
+(`ggml-sycl.cpp`), 231 (`unified-cache.cpp`), 11 (`unified-cache.hpp`), 47
 (`fattn.cpp`), and 2 (`layer-streaming.cpp`). The script prints SHA-256 for
 every input so this result can be tied to exact source bytes.
 
@@ -115,24 +121,26 @@ census: their artifact, source SHA, and extraction method were not supplied,
 so a row-for-row comparison would be invented. Structurally, they expand in
 both directions: multi-object declarations produce multiple object rows,
 while static functions/prototypes are not storage objects; the parser also
-adds the 58 implicit non-local objects, 869 local statics, and 4 class statics
-that a column-zero lexical pass does not cover. No comparison is made to the
+adds the objects a column-zero lexical pass does not cover (at the audited
+commit above: 87 implicit non-local objects, 841 function-local
+static/thread-local objects, and 7 class statics). No comparison is made to the
 historical 329 figure because it likewise lacks a source SHA and method.
 
 ### Parse coverage and fail-closed behavior
 
-Tree-sitter reports 43 raw recovery/missing nodes in `ggml-sycl.cpp`, 10 in
-`fattn.cpp`, and 2 in `unified-cache.hpp`; the remaining two inputs parse
-without recovery. The `ggml-sycl.cpp` sites are
+Tree-sitter reports 50 raw recovery/missing nodes in `ggml-sycl.cpp`, 10 in
+`fattn.cpp`, 3 in `unified-cache.hpp`, and 2 in `unified-cache.cpp` (one
+function signature, one function body); `layer-streaming.cpp` parses without
+recovery. The `ggml-sycl.cpp` sites are
 from nested preprocessor alternatives, declaration-prefix macros
 (`GGML_API`, `__dpct_inline__`), conditional `else` arms, and formatting-macro
 tokens such as `PRId64`; the `fattn.cpp` ones are dispatch macro invocations and a label
-next to a conditional compilation boundary; the `unified-cache.hpp` pair are
+next to a conditional compilation boundary; the three `unified-cache.hpp` sites are
 defaulted const-reference parameters, which grammar ABI 15 misparses.
 These are **explicit raw-parser recovery sites**, not silently discarded
-regions. Each of the 55 nodes must receive a structural proof category. In the
-current inputs, 19 are confined to parsed function signature/storage spans,
-31 are in parsed or unambiguously recovered function bodies, and 2 are the
+regions. Each of the 65 nodes must receive a structural proof category. In the
+current inputs, 24 are confined to parsed function signature/storage spans,
+35 are in parsed or unambiguously recovered function bodies, and 3 are the
 defaulted const-reference parameter shape, which is proved by an anchored
 spelling match and fails closed on every near miss. Recovered function
 regions end at the lexically balanced closing brace (with comments and literals
@@ -353,11 +361,12 @@ separate positive controls) are canonical §12.9. Multiple LIVE
 models and sequential A→B→A are separate gates; neither proves overlapping
 execution, which must serialize/reject through per-device aggregate roots.
 
-**Census status now:** the checked-in inventory remains the historical
-`5793f2ca1089eaf27203ee171c0d73d60a3e4c83` snapshot described above. On this
-worktree, `python3 scripts/audit-sycl-static-storage.py --check` reports it stale.
-That is expected before implementation and is an explicit open gate, not a pass.
-`jwy4` must run, at final source HEAD:
+**Census status (historical, pre-`jwy4`):** the checked-in inventory was then
+the `5793f2ca1089eaf27203ee171c0d73d60a3e4c83` snapshot, and
+`python3 scripts/audit-sycl-static-storage.py --check` reported it stale. `jwy4`
+has since regenerated it; the current audited commit and counts are in the
+census section above, and `test-sycl-static-storage-audit` now fails ctest
+whenever `--check` does. `jwy4` ran, at final source HEAD:
 
 ```sh
 python3 scripts/audit-sycl-static-storage.py --self-test

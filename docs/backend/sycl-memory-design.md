@@ -1717,7 +1717,11 @@ projection, not the exact live edge list. Exact direct `otry` dependencies are
 foundation/organizational edges are transitive. Exact tail edges are `{otry,
 hcyp (closed)} → jwy4` and `{jwy4, awcp (closed)} → k7b0`; final `k7b0` closure
 is blocked by `jwy4`. `{1q72, .15.13} → .15.12 → o6jx` is preserved. `jwy4`, not `hcyp`, owns the final script/fixtures/CSV/prose
-census refresh. The fixed teardown order, H1-H14/G1-G7, fixtures, split
+census refresh. The census staleness gate is
+`python3 scripts/audit-sycl-static-storage.py --check`, which the registered
+ctest `test-sycl-static-storage-audit` runs against the committed
+`docs/backend/sycl-static-storage-inventory.csv`; it parses the working tree, so
+an uncommitted edit to a census input turns it red. The fixed teardown order, H1-H14/G1-G7, fixtures, split
 mutations, and lock controls remain canonical.
 
 ## The VRAM budget authority (llama.cpp-o3h1)

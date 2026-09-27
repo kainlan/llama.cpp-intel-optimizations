@@ -1357,11 +1357,16 @@ if (NOT WIN32)
         set(LLAMA_PYTHON3 python3)
     endif()
 
-    # Parser census regression: establishes a freshly generated matching
-    # inventory, proves --check accepts it, then line-shifts an input and proves
-    # --check rejects drift without rewriting the snapshot. The plain unittest
-    # script exits 77 when g++ or pinned parser packages are unavailable, so
-    # dependency absence is visible as Skipped rather than a vacuous pass.
+    # Parser census gate: runs `scripts/audit-sycl-static-storage.py --check`
+    # against the COMMITTED inventory and fails on any drift, with a planted
+    # stale row as its positive control. It also establishes a freshly
+    # generated matching inventory, proves --check accepts it, then line-shifts
+    # an input and proves --check rejects drift without rewriting the snapshot.
+    # The plain unittest script exits 77 when g++ or pinned parser packages are
+    # unavailable, so dependency absence is visible as Skipped rather than a
+    # vacuous pass. Each census parse costs about a CPU-minute and the test runs
+    # five, so TIMEOUT allows for this host's permanent load (one parse took
+    # 6 min wall at load average ~125).
     llama_test_cmd(
         ${LLAMA_PYTHON3}
         NAME test-sycl-static-storage-audit
@@ -1371,7 +1376,7 @@ if (NOT WIN32)
     set_tests_properties(test-sycl-static-storage-audit PROPERTIES
         LABELS "sycl;policy;audit"
         SKIP_RETURN_CODE 77
-        TIMEOUT 300
+        TIMEOUT 3600
     )
 
     # Wiring gate for the Phase 0 zone-reset escape audit (llama.cpp-iiff). The
