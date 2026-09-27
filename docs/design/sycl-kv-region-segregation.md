@@ -139,8 +139,9 @@ Design, revision 7.14q, by impl-moua, 2026-09-27. The revisions answer twenty-fi
   rules and rulings §M51. Revision 7.14p is two commits on top of 7.14o (`c9f3ea2b8`):
   `89efc2f74` and the follow-up, `f69884157`.
 - design review r24 (design-moua-r24 on `c9f3ea2b8..f69884157`: 0 Critical, 3 Important, 12
-  Minor, 6 nits) and the lead's rulings on it (§M53), recorded in §6.33. Revision 7.14q is one
-  commit on top of 7.14p (`f69884157`).
+  Minor, 6 nits) and the lead's rulings on it (§M53), recorded in §6.33, with a follow-up for
+  r24's addendum and rulings §M56 (a). Revision 7.14q is two commits on top of 7.14p
+  (`f69884157`): `5685e4898` and the follow-up.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -152,7 +153,7 @@ one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2,
 §M24, §M25, §V13, §M26, §M27, §M26a, §M28, §M29, §M29a, §V14, §M30, §M31, §M31a, §M32, §M33,
 §V15, §V15a, §V16, §V16a, §M34, §M35, §G1, §G1a, §V17, §M36, §M37, §Z20, §M38, §G1b, §M39, §G1c,
 §M40, §M41, §Z-23mk-411, §M42, §Z21, §Z23, §Z22, §M43, §M44, §Z24, §Z26, §M45, §M46, §M46b,
-§Z28, §M47, §M47a, §M48, §M49, §F3, §M50, §M51, §M53). §M11a is a
+§Z28, §M47, §M47a, §M48, §M49, §F3, §M50, §M51, §M52, §M53, §M56). §M11a is a
 relay line inside §Z8, not a section, and is cited as §Z8 I-2 (r12 m-14). This document cites it
 as "rulings §X".
 **Where this document paraphrases a ruling and differs from the file, the file wins.**
@@ -9030,11 +9031,24 @@ placement and demotion run. The rules for every such arm:
   that arm needs no fork change, only the VOID check. Each such arm reads `n_ctx` from its
   `llama_context: n_ctx = <n_ctx_train>` line, with `n_ctx_train` from the GGUF key
   `<arch>.context_length`. The line prints at INFO, which the default verbosity drops, so the
-  arm runs with `-lv 4` (rulings §M54's VOID guard, as zhcn's GDC does). **Exempt, with the
-  reason:** G0, G1, G2, the unplanned-buffer and scoped-miss unit arms and the H tests. Their
-  subject is a fixed geometry chosen for the arm's arithmetic, not a model's context, and a
-  default-context sibling would change the arithmetic, not test KV placement. The control-vector
-  and LoRA arms already run their CLI vehicles with no `-c` at all.
+  arm runs with `-lv 4` (rulings §M54's VOID guard, as zhcn's GDC does). **Every other arm, and
+  why the rule does not apply to it (r24 m-11 and its addendum):**
+  - G0: no model and no context, only queues and kernels;
+  - G1: a synthetic fixture on a real device cache. Its contexts' KV sizes are chosen so that
+    context 2 needs exactly the room the leased copies hold, and a default context would move
+    the arm to another of its cases (a) to (c) rather than test placement at `n_ctx_train`;
+  - G2: fixture term sets, with no GGUF and no context KV;
+  - C9's merge gates: their default-context arm is below; C9's Mistral positive control (1), the
+    control-vector arm and the LoRA arm run the Mistral gate command, which passes no `-c`, so,
+    as CLI vehicles, they already run at `n_ctx_train` (32768); the state-seq arm is above;
+  - C9's seam control (2), the unplanned-buffer arm with its clip and `ggml_opt_init` children,
+    and the scoped-miss arm: unit arms whose subject is a fixed geometry chosen for the arm's
+    arithmetic (one byte over RUNTIME's free room, a 1 MiB buffer on an arena whose RUNTIME is
+    0, one byte over the compute head slot), where a default-context sibling would change the
+    arithmetic, not test KV placement;
+  - C9's no-model arm: no model is loaded, so there is no `n_ctx`;
+    - the H tests: host models, with no device and no context;
+  - C11: its default-context rows are below.
 - **A refusal is a FAIL.** uize part 3 (`35ce2e65f`) has landed, so KV that does not fit is
   re-placed to the host tier, never refused. Any `runtime KV update rejected` line, any
   `[LOAD-PLAN] ... (refused)` line and any non-zero rc fails the arm.
@@ -9096,11 +9110,13 @@ placement and demotion run. The rules for every such arm:
     candidates republish (r2 N-I9).
     - C3 is also the default-PCT half of C2a for STAGING.
   - **The default-context arm (r23 I-5).** The same command with no `-c`, so `n_ctx` is
-    131072, GPT-OSS 20B's `n_ctx_train`. llama.cpp-uize measured the largest context that fit
-    the B50 all-VRAM at about `-c 56576` before moua, so the replay (above) pre-registers
-    whether this arm demotes layers and how many, their causes and the host MB (r24 m-9). **Its
-    timeout is 300 s, not the 60 s hang guard of the `-c 4096` shape,** since a default-context
-    load allocates and clears host-tier KV for 131072 cells before the first token:
+    131072, GPT-OSS 20B's `n_ctx_train`. **Its pre-registration is zhcn GDC3's row, the single
+    source for this model on the B50 (rulings §M56 (a)).** The replay (above) cites GDC3 by row
+    id and carries no copy of its numbers, so a change to GDC3 needs no edit here; the run is
+    scored against that row, including whether this arm demotes layers and how many (r24 m-9).
+    **Its timeout is 300 s, not the 60 s hang guard of the `-c 4096` shape,** since a
+    default-context load allocates and clears host-tier KV for 131072 cells before the first
+    token:
     ```
         ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout -k 15 300 ./build/bin/llama-cli \
       -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
@@ -9383,7 +9399,11 @@ placement and demotion run. The rules for every such arm:
       kernels read zero-copy (P3). The general compute-buffer host-pinned fallback is
       `llama.cpp-nl0f`, outside moua. **This supersedes §M50's "no C11 line" for this pass:**
       §M50 read the early return as sitting ahead of the chain, and §M53 places it at the
-      cache's answer, so on an unplanned device the chain's misses print first. GREEN,
+      cache's answer, so on an unplanned device the chain's misses print first. **§M52 does not
+      bind moua (the §M53 clarification):** its safe_alloc no-force (`:37797-37820`) is on
+      master's tail, which a planned device never reaches, since the leg returns before
+      `:37769`; on this unplanned VM device the 1 MiB buffer is far below the oversize
+      threshold, so the forcing does not arise, and §M52's RED is 1oxa's arm. GREEN,
       pre-registered, with `GGML_SYCL_STRICT_LEASES` unset:
       - the 1 MiB buffer is null after exactly one `[VM-WT]` line;
       - exactly two C11 lines, the RUNTIME and SCRATCH misses, fixed substring `miss would spill
@@ -12120,12 +12140,13 @@ place, with the item that changes them.
 
 ### 6.33 Revision 7.14q: design-moua-r24, rulings §M53
 
-Revision 7.14q is one commit on top of 7.14p (`f69884157`). It answers design review r24
-(design-moua-r24 on `c9f3ea2b8..f69884157`: 0 Critical, 3 Important, 12 Minor, 6 nits) as ruled
-in §M53, which places 1oxa's VM refusal inside moua's leg and accepts r24 I-2 as a phase-0 lead
-measurement. The §6.31 and §6.32 rows it supersedes or amends are marked in place, with the item
-that changes them. §M50's "one asynchronous submit" is recorded as amended, one W use's submits
-(the reorder and the matmul), the reading the lead confirmed after 7.14p.
+Revision 7.14q is two commits on top of 7.14p (`f69884157`): `5685e4898` and a follow-up for
+r24's addendum and rulings §M56 (a). It answers design review r24 (design-moua-r24 on
+`c9f3ea2b8..f69884157`: 0 Critical, 3 Important, 12 Minor, 6 nits) as ruled in §M53, which
+places 1oxa's VM refusal inside moua's leg and accepts r24 I-2 as a phase-0 lead measurement.
+The §6.31 and §6.32 rows it supersedes or amends are marked in place, with the item that changes
+them. §M50's "one asynchronous submit" is recorded as amended, one W use's submits (the reorder
+and the matmul), the reading the lead confirmed after 7.14p.
 
 | item | finding / ruling | disposition |
 |---|---|---|
@@ -12150,6 +12171,9 @@ that changes them. §M50's "one asynchronous submit" is recorded as amended, one
 | n-4 | the W-order gate sentence misattributed c6ah | **Changed** with I-2. |
 | n-5 | whether Z's term set includes `mxfp4_direct_f16_w` | **Stated.** No: Z is a dense fixture with neither `mxfp4_direct_f16_w` nor `onednn_pp_w`, so A's load is each entry's first placement. |
 | n-6 | the W-order source gate would fail the `GGML_SYCL_PRIVATE_TESTING` hook call inside the section | **Changed.** H7z's gate allows the hook call inside a `GGML_SYCL_PRIVATE_TESTING` block only, and fails a hook call outside one. |
+| r24 addendum (follow-up), m-11 widened | apply the programmatic `n_ctx = 0` rule to G1, C5 and C9's fixture arms, or state per arm why none applies; C11 needs a default row | **Changed.** §3.3 now lists every arm the rule does not reach, each with its reason: G0 (no model), G1 (a synthetic fixture whose KV sizes are chosen for its cases), G2 (fixture term sets), C9's Mistral control, control-vector and LoRA arms (CLI vehicles with no `-c`, already at `n_ctx_train`), C9's seam control, unplanned-buffer and scoped-miss arms (fixed-geometry unit arms), C9's no-model arm (no `n_ctx`) and the H tests (host models). C5 has its sibling, C9's state-seq arm its VOID check, and C11 its default rows (first commit). |
+| r24 addendum (follow-up), §M52 | §M52 does not bind moua | **Stated** in C9's VM post-cut pass: the leg returns before `:37769` on a planned device, so the safe_alloc forcing is unreachable there; the 1 MiB buffer never reaches it on the unplanned VM device; §M52's RED is 1oxa's. |
+| §M56 (a) (follow-up) | the GPT-OSS B50 default-context pre-registration has one source, zhcn GDC3 | **Changed.** C3's default-context arm cites zhcn GDC3 by row id and carries no copy of its numbers; the pre-moua `-c 56576` figure is dropped, so the arm has no second source. |
 
 **Relays.**
 - **1oxa:** (1) moua's C9 VM passes now run on §M53's order: has-zones entry, scope dispatch,
@@ -12172,4 +12196,8 @@ that changes them. §M50's "one asynchronous submit" is recorded as amended, one
   oneDNN primitive creation and fetch move ahead of the section, so
   `DnnlGemmWrapper::row_gemm`'s fetch is split from its execute.
 - **zhcn:** no change to your interfaces. The default-context VOID guard moua uses is §M54's,
-  `-lv 4` and the `llama_context: n_ctx =` line, as your GDC does.
+  `-lv 4` and the `llama_context: n_ctx =` line, as your GDC does. moua's C3 default-context arm
+  cites your GDC3 by row id and holds no copy of its numbers (rulings §M56 (a)).
+  `run-merge-gates.sh` merges each block's streams (`> $out 2>&1`, `:85`, `:94`); it can gain a
+  split-capture mode that writes each block's stdout and stderr to separate files and runs its
+  checks over both, so GDC8 can score its stdout alone if you choose that.
