@@ -135,8 +135,9 @@ Design, revision 7.14p, by impl-moua, 2026-09-27. The revisions answer twenty-fo
   top of 7.14n (`05c555ca4`).
 - design review r23 (design-moua-r23 on `05c555ca4..c9f3ea2b8`: 0 Critical, 5 Important, 10
   Minor, 4 nits), the lead's rulings on it (§M50), 1oxa rev 29's relay and the owner's
-  2026-09-27 default-context ruling, recorded in §6.32. Revision 7.14p is one commit on top of
-  7.14o, `c9f3ea2b8`, and touches only this document.
+  2026-09-27 default-context ruling, recorded in §6.32, with a follow-up for the lead's vehicle
+  rules and rulings §M51. Revision 7.14p is two commits on top of 7.14o (`c9f3ea2b8`):
+  `89efc2f74` and the follow-up.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -148,7 +149,7 @@ one file, `lead-rulings-2026-09-26.md` (sections §B, §B.1 (superseded), §B.2,
 §M24, §M25, §V13, §M26, §M27, §M26a, §M28, §M29, §M29a, §V14, §M30, §M31, §M31a, §M32, §M33,
 §V15, §V15a, §V16, §V16a, §M34, §M35, §G1, §G1a, §V17, §M36, §M37, §Z20, §M38, §G1b, §M39, §G1c,
 §M40, §M41, §Z-23mk-411, §M42, §Z21, §Z23, §Z22, §M43, §M44, §Z24, §Z26, §M45, §M46, §M46b,
-§Z28, §M47, §M47a, §M48, §M49, §F3, §M50). §M11a is a
+§Z28, §M47, §M47a, §M48, §M49, §F3, §M50, §M51). §M11a is a
 relay line inside §Z8, not a section, and is cited as §Z8 I-2 (r12 m-14). This document cites it
 as "rulings §X".
 **Where this document paraphrases a ruling and differs from the file, the file wins.**
@@ -8809,10 +8810,13 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
 gate set here that pins `-c` also runs once with no `-c`, beside the pinned arm, not instead of
 it. A `-c` pin that makes a gate pass marks a known gap, and the default context is where KV
 placement and demotion run. The rules for every such arm:
-- **The vehicle** is `llama-cli` or `llama-completion` with no `-c`, so `n_ctx` is the model's
-  `n_ctx_train`, running the gate's own correctness check (the lead's vehicle clarification of
-  2026-09-27). `llama-bench` (`n_ctx` = p + n + d) and `llama-perplexity` keep their fixed
-  contexts, since a "no `-c`" arm of either is vacuous.
+- **The vehicle.** A CLI vehicle is `llama-cli`, `llama-completion` or `llama-server` with no
+  `-c`, so `n_ctx` is the model's `n_ctx_train`, running the gate's own correctness check (the
+  lead's vehicle clarification of 2026-09-27). **A programmatic harness sets `n_ctx = 0`
+  explicitly,** since `llama_context_default_params()` gives 512, and the arm is VOID unless
+  `llama_n_ctx(ctx) == n_ctx_train` for the loaded model. `llama-bench` (`n_ctx` = p + n + d)
+  and `llama-perplexity` keep their fixed contexts, since a "no `-c`" arm of either is vacuous
+  and scores nothing about KV placement.
 - **A refusal is a FAIL.** uize part 3 (`35ce2e65f`) has landed, so KV that does not fit is
   re-placed to the host tier, never refused. Any `runtime KV update rejected` line, any
   `[LOAD-PLAN] ... (refused)` line and any non-zero rc fails the arm.
@@ -9267,7 +9271,7 @@ placement and demotion run. The rules for every such arm:
 |----|------|-------|--------|------------|-------|
 | L1 | TLSF placement primitives, tags, frontier walk; H1 | `tlsf-allocator.hpp`, `shared-zone-tags.hpp`, `tests/test-tlsf-allocator.cpp`, CMake | high | none | **done, approved:** `eab1ebeb6`, `9e0a708dc`, `97315421b`, `456650c01` |
 | L3 | pure `kv_region_fit` (multi-extent, self extents, `forced_host`, `own_ranges`-restricted commit re-fit, strict prefix, carve mirroring, indexed head slots placed first with reuse in place, the context's ring rows as its own head slots (7.14f; rulings §M32 I-1), the recurrent slot, sidecar companion slots, the cost-ordered pack with the two-way optional classification, pending ranges as allocated, the stated demotion order, `free_after_full_kv` and demotion causes), the `context_side_demand` record (MODEL/CONTEXT scopes, indexed slots) and its reconciliation, `kv_layer_cells` + `kv_layer_tensor_bytes` (the one byte function) and the RS-buffer size function, `kv-region-registry.hpp` (registry with tenant slots, scope, residency answer with the no-region fallback, the two-phase guard model, the release proc model); H2, H3, H6, H8, H9 | `kv-runtime-demotion.{hpp,cpp}`, `kv-region-registry.hpp`, `unified-cache.hpp` (`kv_layer_bytes_for_kind` delegates), their tests | xhigh | L1, jehw on master, the zhcn protocol (agreed, §6.6) | after jehw |
-| L4 | `context_side` (explicit `lifetime` field threaded into `zone_alloc`, LIVE/RETAINED states and the slot tag, the reserved-slot carve as owner-first handles, `claim_slot`/`release_claim` with event-chained reuse and per-slot claim state, atomic retained-run carve, settle refusals for pending ranges, the plan-violation ERROR with an error status, pending ranges on the shared zone's TLSFs (the context's head slots and KV, `WEIGHT`, `FIRST_CONTEXT`, and a later load's D terms that RUNTIME cannot hold) and on RUNTIME for the D terms of the load that laid it out (rulings §M38 m-2, I-2; §2.3.3 A1), `live_bytes()` beside an unchanged `zone_available`), `allocate_excluding` with range exclusion (used whenever a pending range exists), `allocate_at`, and a whole-TLSF block census (L1 follow-ups), retained-run registration hygiene and the `live_bytes` readers, the per-extent and per-slot owner-first carve inside `zone_alloc`'s locked section with controls pre-minted before L1 (`unified_allocate_owner` split into mint and bind halves), leaf `kv_region_mutex_` added to contract §12.5 (L3), locked geometry snapshot (cache locks then group mutex, with jehw's predicate), `reserve_kv_region`, strict-prefix `yield_optional_prefix`, `backend-buffer-kv-zone` passing its buffer's role, removal of the dead `KV_AUTO` reclaim and of the `arena_reserve` KV reclaim, N-chunk routing, and **1oxa's `GGML_SYCL_PRIVATE_TESTING` dump of `shared_zone_geometry` plus `kv_region_request` at each fit** (step 2 and the tenant-only path; lead-approved, for 1oxa's VM branch to test against); H4, H4b, H5 | `unified-cache.{hpp,cpp}`, `tlsf-allocator.hpp` (two primitives), `ggml-sycl.cpp` (the kv-zone fallback's role) | xhigh | L1, L3, **zhcn landed, beni's producers landed, llama.cpp-jzvq closed** (lead ruling, r4 I10), **llama.cpp-uwlx landed** (the pick-list yield, §2.4.2 step 5; r5 m-g), **llama.cpp-fkpg (a) landed** (the envelope's `n_ctx`, which sizes `FIRST_CONTEXT`; rulings §M38 C-1), **zhcn's `fattn-onednn` carve and 23mk's reorder temporary landed** (rulings §M38 C-2), **23mk's (b1), the sinks-aware G, landed** (rulings §M44 C-1) | after zhcn, beni producers, jzvq, uwlx, fkpg (a), 23mk's (b1) |
+| L4 | `context_side` (explicit `lifetime` field threaded into `zone_alloc`, LIVE/RETAINED states and the slot tag, the reserved-slot carve as owner-first handles, `claim_slot`/`release_claim` with event-chained reuse and per-slot claim state, atomic retained-run carve, settle refusals for pending ranges, the plan-violation ERROR with an error status, pending ranges on the shared zone's TLSFs (the context's head slots and KV, `WEIGHT`, `FIRST_CONTEXT`, and a later load's D terms that RUNTIME cannot hold) and on RUNTIME for the D terms of the load that laid it out (rulings §M38 m-2, I-2; §2.3.3 A1), `live_bytes()` beside an unchanged `zone_available`), `allocate_excluding` with range exclusion (used whenever a pending range exists), `allocate_at`, and a whole-TLSF block census (L1 follow-ups), retained-run registration hygiene and the `live_bytes` readers, the per-extent and per-slot owner-first carve inside `zone_alloc`'s locked section with controls pre-minted before L1 (`unified_allocate_owner` split into mint and bind halves), leaf `kv_region_mutex_` added to contract §12.5 (L3), locked geometry snapshot (cache locks then group mutex, with jehw's predicate), `reserve_kv_region`, strict-prefix `yield_optional_prefix`, `backend-buffer-kv-zone` passing its buffer's role, removal of the dead `KV_AUTO` reclaim and of the `arena_reserve` KV reclaim, N-chunk routing, and **1oxa's `GGML_SYCL_PRIVATE_TESTING` dump of `shared_zone_geometry` plus `kv_region_request` at each fit** (step 2 and the tenant-only path; lead-approved, for 1oxa's VM branch to test against); H4, H4b, H5 | `unified-cache.{hpp,cpp}`, `tlsf-allocator.hpp` (two primitives), `ggml-sycl.cpp` (the kv-zone fallback's role) | xhigh | L1, L3, **zhcn landed, beni's producers landed, llama.cpp-jzvq closed** (lead ruling, r4 I10), **llama.cpp-uwlx landed** (the pick-list yield, §2.4.2 step 5; r5 m-g), **llama.cpp-fkpg (a) landed** (the envelope's `n_ctx`, which sizes `FIRST_CONTEXT`; rulings §M38 C-1), **zhcn's `fattn-onednn` carve and 23mk's reorder temporary landed** (rulings §M38 C-2), **23mk's (b1), the sinks-aware G, landed** (rulings §M44 C-1), **1oxa's P0-accessors commit landed** (`ggml_sycl_device_has_zones` and `ggml_sycl_arena_backing`, ahead of 1oxa phase 1; rulings §M51) | after zhcn, beni producers, jzvq, uwlx, fkpg (a), 23mk's (b1) |
 | L5 | the optional pass after all S1 staging (dense + expert/DPAS); `zone_alloc_optional` | `ggml-sycl.cpp` S1 block | medium | L4 | with L4/L6 |
 | L6 | llama side: `llama_kv_layer_shapes` and `llama_rs_layer_shapes` factored out and stored at the first publish, the `ggml_sycl_runtime_context_desc` descriptor (KV-shape with sidecar and `n_stream`, recurrent section; zhcn's tenant section filled by zhcn) and its publish entry point, the scope procs with an RAII guard, the one `ggml_backend_sycl_kv_region_release` call site in the `sycl_plan_guard` member's destructor (zhcn M1, with the ContextId captured at `create_exec`), and `llama_recurrent_sycl_kv_buft` returning the recurrent-state buft. Backend side: the transaction steps of §2.4.2 (two-phase guard without L1, idempotent key without `n_ubatch`, the tenant-only path with zhcn's step (i) (the own-context graph clear behind its recorded-graph gate, the slot-table take at (c), the reap call with its backstop, the use-count bound; r6), reuse in place for host slots, the ring rows in the context's slot table with the executor re-keyed to them (7.14f; rulings §M32 I-1), the slot-state retention moved out at a row growth and at teardown and handed off after the unlock at every removal site (r6 I-4, I-6; r7 m-5), the model load's ring release and ring writes removed on arena devices (llama.cpp-r7fz), plan / accounting / predictable refusals / pending ranges / yield / restricted re-fit and carve / MMID / CAS / commit installing the slot table / superseded drops after L1), the registry release proc, `g_execution_backend_binding_mutex` census entry, the residency hook answering from the registry, the tiered claim with `set_owner(mem_handle)` slice views and the KV-only size check, the sidecar companion claim, the recurrent-state buft, the per-extent clear with event-held slices, BLOCK_EXEC_CANDIDATE_KV ignored under an arena (the VMEM_KV refusal is 23mk core's, §2.6), the second sources deleted (§2.2, the budget-room check included), both ERROR sites and their §G1 abort through `ggml_sycl_strict_enabled()` (uwlx, the accessor's sole definer, exports it and makes §G1a's three doc edits, and this commit lands after uwlx's merge, rulings §G1b, §G1c, §2.8), the dark B50 lever, `GGML_SYCL_KV_REGION_TRACE`; H7 with the unconverted-site list, the CPU-buft llama shape tests, G1. **Absorbs revision 1's L2.** | `ggml-sycl.cpp`, `ggml-sycl.h`, `unified-cache.cpp`, `fattn.cpp`, `common.hpp`, `src/llama-context.{h,cpp}`, `src/llama-model.cpp`, `src/llama-kv-cache.{h,cpp}`, `src/llama-memory-recurrent.cpp`, tests | xhigh | L3, L4, L5 | before beni's conversions |
 | L7 | docs: memory-design section, contract §3/§5.2/§5.3/§12.5 (the binding-lock chain, the L5 group → `g_runtime_alloc_mutex` order, the step-6 carve exception), arena comment, limits (§2.9), lock order, the tenant protocol and the descriptor's layout rules, the owner-visible weight-hole line | docs, `unified-cache.hpp` comment | medium | L6 | with L6 |
@@ -9582,15 +9586,19 @@ zhcn 5.16).**
   I-1 (a)), a device being planned while the ledger holds a record on it, never by
   `arena_active()` (rulings §M47 I-1), the leg's entry test reading
   `ggml_sycl_device_has_zones(dev)` and nothing here reading the backing kind (rulings §M49 I-1,
-  I-2); context-owned homes for the control vector and the on-device state-seq buffers; the LoRA
-  extension transaction, the exported `ggml_backend_sycl_model_extend_begin` / `_end` /
-  `_release` entries taking the whole `llama_sycl_model_token`, its `lora` scope, the retag to
-  `{MODEL, base}` at the commit, and the adapter's `sycl_extension` member declared before
-  `bufs`, which rolls back or releases after the adapter's buffers are freed (rulings §M47 I-3,
-  §M48 I-5), with the adapter's compute delta left to zhcn's existing decode-time re-reserve (no
-  fourth measure); the unplanned line and its once-per-process `known unhomed consumers` note
-  naming llama.cpp-6qou and llama.cpp-mogf (rulings §M46 I-1 (b), §M47 m-3), with the clip throw
-  in `tools/mtmd/clip.cpp` and the ggml-opt named abort in `ggml/src/ggml-opt.cpp` (rulings §M47
+  I-2), the accessor coming from 1oxa's early **P0-accessors** commit, which lands ahead of 1oxa
+  phase 1 with the enum, both declarations, the constructor-fixed backing member (`USM` or
+  `NONE` until phase 2 adds `VM`) and has-zones as a non-creating lookup over `zone_backed()`
+  (rulings §M51), so L4+L6 depends on P0-accessors, not on phase 1 or phase 2; context-owned
+  homes for the control vector and the on-device state-seq buffers; the LoRA extension
+  transaction, the exported `ggml_backend_sycl_model_extend_begin` / `_end` / `_release` entries
+  taking the whole `llama_sycl_model_token`, its `lora` scope, the retag to `{MODEL, base}` at
+  the commit, and the adapter's `sycl_extension` member declared before `bufs`, which rolls back
+  or releases after the adapter's buffers are freed (rulings §M47 I-3, §M48 I-5), with the
+  adapter's compute delta left to zhcn's existing decode-time re-reserve (no fourth measure);
+  the unplanned line and its once-per-process `known unhomed consumers` note naming
+  llama.cpp-6qou and llama.cpp-mogf (rulings §M46 I-1 (b), §M47 m-3), with the clip throw in
+  `tools/mtmd/clip.cpp` and the ggml-opt named abort in `ggml/src/ggml-opt.cpp` (rulings §M47
   m-2); `forbid_vram_zone_spill` on the two XMX MoE draws (`common.hpp:6855`, `:6887`; rulings
   §M41 m-9); C9's control-vector, state-seq, unplanned-buffer (with the clip and ggml-opt
   allocations), scoped-miss and LoRA arms, and its Mistral, no-model and seam controls (rulings
@@ -11775,7 +11783,8 @@ r21 m-10's premise, which was that `arena_active()` is true on both backings. Th
 
 ### 6.32 Revision 7.14p: design-moua-r23, rulings §M50
 
-Revision 7.14p is one commit on top of 7.14o (`c9f3ea2b8`). It answers design review r23
+Revision 7.14p is two commits on top of 7.14o (`c9f3ea2b8`): `89efc2f74` and a follow-up for
+the lead's default-context vehicle rules and rulings §M51. It answers design review r23
 (design-moua-r23 on `05c555ca4..c9f3ea2b8`: 0 Critical, 5 Important, 10 Minor, 4 nits) as ruled
 in §M50. It also folds 1oxa rev 29's relay, held until r23, and the owner's 2026-09-27
 default-context ruling (rulings §F3). The §6.31 rows it supersedes or amends are marked in
@@ -11808,6 +11817,8 @@ place, with the item that changes them.
 | 1oxa rev 29 (2) | the enum's spelling | **Changed.** §2's fact (1) spells `GGML_SYCL_ARENA_BACKING_TYPE_{NONE,USM,VM}`. |
 | 1oxa rev 29 (3) | rev 29 keeps the VM post-cut landing | **Changed.** The "if 1oxa moves it to row C9" hedge is dropped from the arm and from §6.31's relay. |
 | owner, 2026-09-27 | every model gate set carries a default-context arm; a refusal is a FAIL | **Adopted** as I-5 above. |
+| lead, default-context vehicles (follow-up) | CLI vehicles are `llama-cli`, `llama-completion` or `llama-server` with no `-c`; a programmatic harness gets `n_ctx` 512 from `llama_context_default_params()` | **Changed.** §3.3's rules name `llama-server`, and a programmatic harness sets `n_ctx = 0` explicitly, VOID unless `llama_n_ctx(ctx) == n_ctx_train`. `llama-bench` and `llama-perplexity` keep their fixed contexts; any refusal is a FAIL. |
+| §M51 (follow-up) | 1oxa's accessors land early, in a P0-accessors commit ahead of 1oxa phase 1 | **Changed.** L4's dependency cell and §4's leg bullet name P0-accessors as the source of `ggml_sycl_device_has_zones`, so L4+L6 depends on it and not on phase 1 or phase 2. The C9 VM passes still wait for phase 2, which introduces `VM`. |
 
 **Relays.**
 - **zhcn:** GA pins `-c 65536 -ub 1024`. Under the owner's 2026-09-27 ruling it needs a
