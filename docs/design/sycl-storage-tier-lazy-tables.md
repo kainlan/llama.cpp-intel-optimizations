@@ -1239,18 +1239,18 @@ lazy_table
     is undefined behaviour (byte 92 of the object read as `managed_meta.tier`,
     layout `:25855-25874`, where a zero reads as `DEVICE_VRAM`,
     `alloc_tier::DEVICE_VRAM == 0` at `unified-cache.hpp:5590-5594`), into
-    `false` for `SYCL_Host`, `SYCL_KV_Host`, the split buffer
-    (`:40169`), TP (`:40914`), tiered KV (`:39377`, `:39711`) and 5efe's
-    `SYCL_Mapped`, and at `:26065` and `:81495` `false` means a host-resident
-    weight, so a split or TP weight reaching them would change route with no
-    th32 arm to see it. That pre-existing undefined read is the lead's, not
-    th32's. One consumer of it moves on the merge unit whichever guard is used:
-    `moe_hybrid_init_once`, always on (`:105464-105477`), counts host experts
-    through this function (`:8101`) and prints them with its `host_src_ptr`
-    count (`[MOE-HYBRID]`, `:8158-8165`); under 5efe's `SYCL_Mapped`, which
-    holds the late inventory, that count carries no residency information, and
-    no th32 or 5efe arm scores it. Its buffer-based residency is a second source
-    beside the plan (P4), which the lead tickets and th32 does not fix.
+    `false` for `SYCL_Host`, `SYCL_KV_Host`, the split buffer (`:40169`), TP
+    (`:40914`), tiered KV (`:39377`, `:39711`) and 5efe's `SYCL_Mapped`, and at
+    `:26065` and `:81495` `false` means a host-resident weight, so a split or TP
+    weight reaching them would change route with no th32 arm to see it. That
+    pre-existing undefined read is the lead's, not th32's. One consumer of it
+    moves on the merge unit whichever guard is used: `moe_hybrid_init_once`,
+    always on (`:105464-105477`), counts host experts through this function
+    (`:8101`) and prints them with its `host_src_ptr` count (`[MOE-HYBRID]`,
+    `:8158-8165`); under 5efe's `SYCL_Mapped`, which holds the late inventory,
+    that count carries no residency information, and no th32 or 5efe arm scores
+    it. Its buffer-based residency is a second source beside the plan (P4),
+    ticketed as `llama.cpp-0qe1`, which th32 does not fix.
   - The default-on dense-split executor (`:89612-89614`) classifies the lazy
     tensor as a `WEIGHT` root whose `resident_mask` is 0, because
     `ggml_sycl_tensor_metadata_owner` finds no `extra` and no SYCL buffer
