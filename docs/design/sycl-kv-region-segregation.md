@@ -2394,14 +2394,43 @@ L0, and a failed revalidation under L0 is a bug, not a race.
               names the probe placement's plan (rulings §Z22, §Z24.1):** before the measure,
               moua emits an unpublished plan for the probe placement, every entry not forced off
               SYCL on its device and every forced entry on its forced buffer type, and zhcn's
-              measure scope names it as the override. The emission is owned by the probe and
-              goes with it; no reader outside the measure sees it, and it is never the published
-              plan. An override of "none" would measure a different executor assignment
-              (pipeline parallelism, and `offload_op` moving forced-CPU ops), so Ĉ would not be
-              the probe placement's value (P3, P4). Call sites 2 and 3 name the load's candidate
-              plan.
+              measure scope names it as the override. **The plan fills the per-layer maps as
+              well as the entries (zhcn r20 m-12; rulings §Z28):** `layer_device` and
+              `kv_device` (`unified-cache.hpp:975-985` at `c69d5774d`) hold, for every layer,
+              the device the probe placement gives the layer's dense entries, `dev_layer`'s, or
+              −1 for a layer whose entries are forced off SYCL, and the same device for its KV,
+              since the probe demotes none. Both maps are read by the executor, not the entries:
+              the per-layer KV buffer type at `ggml-sycl.cpp:107844` (`get_kv_device`) and the
+              host-executor predicate at `:109223-109224` (`get_layer_device`), and a missing
+              key reads −1, so an entries-only plan would put every layer on the host. The
+              emission asserts, per layer in `[0, n_layer)`, that both maps hold the layer,
+              always compiled under `GGML_SYCL_WITNESS`: `[ZONE-PLAN-BUG] probe plan for device
+              %d has no %s entry for layer %d`, naming the map; H7ap's first-context arm carries
+              the entries-only mutant as its RED. **The hand-off (zhcn 5.20 (1), `0f60f88`):**
+              moua's early `stage_inventory_plan` (`ggml-sycl.cpp:16775`, called through
+              `llama_model_sycl_compute_early_plan`'s apply, `llama-model.cpp:657`) builds the
+              plan from the staged inventory, whose entries carry each site and forced buffer
+              type, under the load's bound candidate (the load's transaction,
+              `acquire_load_effect`, `:16786`), before the pack. It stores the plan in the
+              load's per-model state (§M76a), keyed by the load's transaction, and zhcn's
+              `ggml_backend_sycl_measure_plan_override_install(load_txn, stage)` with stage (a)
+              finds it there and wraps it. The emission is owned by the probe and goes with it:
+              the load's commit or rollback drops it; no reader outside the measure sees it, and
+              it is never the published plan. An override of "none" would measure a different
+              executor assignment (pipeline parallelism, and `offload_op` moving forced-CPU
+              ops), so Ĉ would not be the probe placement's value (P3, P4). Call sites 2 and 3
+              name the load's candidate plan.
               **The pack's capacity on a device is the `WEIGHT` zone less the rest of the
-              reservation's bound (above) and Ĉ.**
+              reservation's bound (above) and Ĉ.** **A test seam sets it directly (zhcn 5.20
+              (2), `0f60f88`, for its H5L (h)):** under `GGML_SYCL_PRIVATE_TESTING`,
+              `ggml_sycl_test_set_pack_capacity(dev, bytes)` makes the next load's pack on
+              device `dev` use exactly `bytes` in place of that difference, and
+              `ggml_sycl_test_get_pack_capacity(dev)` reads back the capacity the last pack on
+              `dev` used, so a test asserts the seam bound before it scores. It is per device,
+              cleared by `ggml_sycl_test_set_pack_capacity(dev, 0)`, and absent from a
+              production build. zhcn's pre-registered numbers assume capacity = S + L + 1 page
+              on its pinned fixture (n_vocab 16384, n_embd 256, n_ff 384, n_layer 2); the terms
+              and the numbers are zhcn's.
            2. **c(P), after the pack, inside the same load transaction:** on the same probe,
               each entry carrying the dummy buffer of the buffer type the admitted plan gives
               its site, from the one selector `create_tensor` uses (the plan-consulting suffix
@@ -2938,14 +2967,15 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           own function,** so the 268435456 B constant and the `max(268435456, …)` form go in
           L4+L6, and step 4 sizes ONEDNN at W + G, G being master's floor function over the
           envelope's shape with (b1)'s sinks input. From (b2) W is the zone's only consumer and
-          `ensured_ONEDNN = onednn_pp_w`. **(b1) lands before L4, so G is 0 B on GPT-OSS 120B
-          (rulings §M44 C-1):** without it master's function counts GPT-OSS 120B at
-          `n_head_ctx_max` 64 with no sinks input and holds 805306368 B (768 MiB at `-c 4096`)
-          in ONEDNN for a route that sinks forbid, an idle reservation (P4; rulings §M32 I-2).
-          The floors arm pre-registers the 0 B, with L4+L6 with (b1)'s sinks input reverted as
-          its RED (§3.3; rulings §M46 m-4). fkpg (a) alone lifts master's floor the same way on
-          every GPT-OSS load until (b1), to 768 MiB at `-c 4096` and toward the 25 % clamp at
-          llama-cli's default 131072 (relayed to fkpg and 23mk). The RED for the constant's
+          `ensured_ONEDNN = onednn_pp_w`. **(b1) lands before fkpg (a) and L4, so G is 0 B on
+          GPT-OSS 120B (rulings §M44 C-1, §M46b I-4):** without it master's function counts
+          GPT-OSS 120B at `n_head_ctx_max` 64 with no sinks input and holds 805306368 B (768 MiB
+          at `-c 4096`) in ONEDNN for a route that sinks forbid, an idle reservation (P4;
+          rulings §M32 I-2). The floors arm pre-registers the 0 B, with L4+L6 with (b1)'s sinks
+          input reverted as its RED (§3.3; rulings §M46 m-4). fkpg (a) alone would lift master's
+          floor the same way on every GPT-OSS load until (b1), to 768 MiB at `-c 4096` and
+          toward the 25 % clamp at llama-cli's default 131072 (relayed to fkpg and 23mk), so
+          (b1) → fkpg (a) is an edge (§4; the floors arm's RED row). The RED for the constant's
           removal is a tree that still lays out the floor's bytes, which the exact ONEDNN bytes
           catch. On GPT-OSS 120B ONEDNN is then
           **23592960 B** from L4+L6 on, and the weight zone gains **244842496 B** (233.5 MiB)
@@ -3250,11 +3280,11 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           `ggml/src/ggml-sycl/tests/test-unified-runtime-alloc.cpp:996`, "inventory would exceed
           the conservative ONEDNN tail bound", reads the W getter, since it bounds the
           load-stage tail.
-      **The order is (b1) → L4 → L6 → (b2) (rulings §M44 C-1, §M44b; L4 and L6 are one commit,
-      §4),** so no landing
-      leaves a gap (the floor gone, the charge not yet landed) or a double charge. **Between
-      L4+L6 and (b2)** step 4 sizes ONEDNN as master does, less the constant, over the ledger:
-      `min(charged_ONEDNN + G, max(available / 4, charged_ONEDNN))`, where G is (b1)'s
+      **The order is (b1) → fkpg (a) → L4 → L6 → (b2) (rulings §M44 C-1, §M44b, §M46b I-4; L4,
+      L5, L6 and L7 are one commit with no merge point between them, §4, rulings §M46 m-5),** so
+      no landing leaves a gap (the floor gone, the charge not yet landed) or a double charge.
+      **Between L4+L6 and (b2)** step 4 sizes ONEDNN as master does, less the constant, over the
+      ledger: `min(charged_ONEDNN + G, max(available / 4, charged_ONEDNN))`, where G is (b1)'s
       sinks-aware floor over the published shape (`onednn_graph_scratch_zone_floor_bytes_swa`,
       `:2148-2160`; 0 with the allocator off). G is capacity for the interim, like a floor
       (§2.4.5, "A floor is not a term"), never a ledger entry, and witness 1's ONEDNN check
@@ -3520,24 +3550,22 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       (`:20757-20790`), drawn at `load_end` from no range, since non-arena devices have none.
       **One accessor, and a channel for the refusal (§M12 m-10).** `arena_bytes` is read today
       at `ggml-sycl.cpp:12455-12462` and `unified-cache.cpp:4353-4357`; both, and the early
-      check, call one accessor, `ggml_sycl_compute_arena_bytes()`, which is `floor_SCRATCH` in
-      step 4's composition rule and not a zone term (rulings §M25 I-1), until the floor retires;
-      from then it is `demand_SCRATCH(dev)`, SCRATCH's pack-independent demand (the end states;
-      rulings §Z26.1, §M45). At `load_end` the
-      reserve's
-      `GGML_ABORT` (`:12470`) becomes a named refusal, and `ggml_sycl_model_loading_effects`,
-      which is `void` today (`:12411`), returns `bool`. The reserve runs before the preload
-      inside it, so a refusal returns before the preload runs. On a `false` return `load_end`
-      calls `ggml_sycl_abort_owner_effects_noexcept(ticket.token,
-      "load_end/exit-effects-refused")` and then `finalize_end(ticket, false)`, so the rollback
-      clear below runs. It does **not** reuse the not-committed branch (r12 m-1):
-      `ticket.commit` is true on this path, and that branch's `finalize_end(ticket, cleanup_ok)`
-      computes `commit = ticket.commit && effects_ok` (`model-lifecycle.cpp:660`), so with
-      `cleanup_ok` true the model would go LIVE with no publication and no preload.
-      `finalize_end(ticket, false)` marks it `QUARANTINED` with `EFFECT_FAILED` (`:697`), and
-      the reaper re-runs the teardown. On an arena device the early check makes that refusal
-      unreachable unless the zones changed, which C-1 forbids; on a non-arena device it is the
-      real allocation's failure.
+      check, call one accessor, `ggml_sycl_compute_arena_bytes(dev)`, which is `floor_SCRATCH`
+      in step 4's composition rule and not a zone term (rulings §M25 I-1), until the floor
+      retires; from then it is `demand_SCRATCH(dev)`, SCRATCH's pack-independent demand (the end
+      states; rulings §Z26.1, §M45). At `load_end` the reserve's `GGML_ABORT` (`:12470`) becomes
+      a named refusal, and `ggml_sycl_model_loading_effects`, which is `void` today (`:12411`),
+      returns `bool`. The reserve runs before the preload inside it, so a refusal returns before
+      the preload runs. On a `false` return `load_end` calls
+      `ggml_sycl_abort_owner_effects_noexcept(ticket.token, "load_end/exit-effects-refused")`
+      and then `finalize_end(ticket, false)`, so the rollback clear below runs. It does **not**
+      reuse the not-committed branch (r12 m-1): `ticket.commit` is true on this path, and that
+      branch's `finalize_end(ticket, cleanup_ok)` computes `commit = ticket.commit &&
+      effects_ok` (`model-lifecycle.cpp:660`), so with `cleanup_ok` true the model would go LIVE
+      with no publication and no preload. `finalize_end(ticket, false)` marks it `QUARANTINED`
+      with `EFFECT_FAILED` (`:697`), and the reaper re-runs the teardown. On an arena device the
+      early check makes that refusal unreachable unless the zones changed, which C-1 forbids; on
+      a non-arena device it is the real allocation's failure.
     - **Lifetime: the commit steps run only once the commit is irrevocable (rulings §M12 I-1).**
       Each range is trimmed as it is consumed. The retags and the clear (§2.3.3 A4) run in
       `load_end` **after `registry->finalize_end` returns `committed` and not
@@ -7295,27 +7323,42 @@ means that.
 
       | step | GPT-OSS 120B ONEDNN | moved | Qwen ONEDNN | moved |
       |---|---|---|---|---|
-      | master, and after (b1) | 268435456 B | — | 268435456 B | — |
+      | master (`n_ctx=512`, no fkpg (a)) | 268435456 B | — | 268435456 B | — |
+      | (b1), then fkpg (a) (`n_ctx=4096`) | 268435456 B (W + E = 36175872 B, G = 0) | 0 B | 268435456 B (W + E + G = 252706816 B) | 0 B |
       | L4+L6 (W + G) | 23592960 B (G = 0) | −244842496 B | 234881024 B | −33554432 B |
       | (b2) (W) | 23592960 B | 0 B | 33554432 B | −201326592 B |
+      | RED: fkpg (a) without (b1) | 841482240 B (36175872 + 805306368) | +573046784 B | 268435456 B (252706816 B, below the constant) | 0 B |
 
       So all of GPT-OSS 120B's 244842496 B gain lands at L6, and (b2) moves it by 0; Qwen gains
       33554432 B at L6 and 201326592 B at (b2). The weight zone moves by the same bytes each
       step, and the end states do not change. (b1) moves neither gate's ONEDNN: master's load
       stage ensures 268435456 B on both before and after it (the Graph-scratch commit, above);
-      the L6 row is this arm's, the (b2) row the (b2) arm's.
+      the L6 row is this arm's, the (b2) row the (b2) arm's. **The master row holds only on a
+      tree without fkpg (a) (rulings §M46b I-4):** master publishes `n_ctx=512` at load
+      (`gptoss120b-b1-2026-09-17.log:181`, "n_ctx=512 (conservative)"), so G is 100663296 B on
+      GPT-OSS 120B and 67108864 B on Qwen, under the constant; 805306368 B needs fkpg (a)'s
+      4096. Master's stored value is W + E, E being `onednn_eligible`, the largest eligible
+      weight as stored (`zone-sizing.cpp:168`; summed at `unified-cache.cpp:27565`): 34.5 =
+      22.5 + 12.0 MB on GPT-OSS 120B (`gptoss120b-b1-2026-09-17.log:202`) and 49.0 = 32.0 +
+      17.0 MB on Qwen (`glkg-qwen35b-a3b-b1-2026-09-17.log:228`), so E is 12582912 B and
+      17825792 B. Master's zone is `max(268435456, W + E + G)`. **fkpg (a) landing before (b1)
+      is the RED row:** GPT-OSS 120B's ONEDNN becomes 36175872 + 805306368 = 841482240 B, the
+      idle reservation for a route that sinks forbid that rulings §M42 and §M44 refused (P4);
+      Qwen's 252706816 B stays under the constant. The edge (b1) → fkpg (a) forbids that
+      order; they stay separate landings (§4).
       **SCRATCH**, from the commit that converts the last untermed census row (the end states):
       after step 4 SCRATCH is exactly the ledger's SCRATCH terms, and
       `ggml_sycl_compute_arena_bytes(dev)` returns `demand_SCRATCH(dev)`, the class-P part,
-      `mmq_work_counter`'s fixed bytes, on both gates (rulings §Z26.1). The arm asserts, per
-      device, that the accessor's value read before the pack is at most step 4's SCRATCH. RED:
-      an accessor that counts D terms before the pack, at their pre-pack bound (every term at
-      its largest, as the first context's bound is). On a fixture whose pack tiers the output
-      head to the host, (a) reads `lm_head_f16`'s bytes into `cap_min`, step 4 sizes SCRATCH
-      without them, and zhcn's witness fires naming the admitted cap below `cap_min`. Its
-      precondition, asserted first or the arm is VOID: the census gate finds no SCRATCH draw
-      without a term. RED: the floor kept, which ensures 536870912 B less the terms that no term
-      charged. Both arms also run the dry-run witness, which must grow nothing;
+      `mmq_work_counter`'s fixed bytes, on both gates (rulings §Z26.1). It sizes nothing: the
+      compute arena is still `reserve_compute_arena` over the whole zone (zhcn r20 m-8). The arm
+      asserts, per device, that the accessor's value read before the pack is at most step 4's
+      SCRATCH. RED: an accessor that counts D terms before the pack, at their pre-pack bound
+      (every term at its largest, as the first context's bound is). On a fixture whose pack
+      tiers the output head to the host, (a) reads `lm_head_f16`'s bytes into `cap_min`, step 4
+      sizes SCRATCH without them, and zhcn's witness fires naming the admitted cap below
+      `cap_min`. Its precondition, asserted first or the arm is VOID: the census gate finds no
+      SCRATCH draw without a term. RED: the floor kept, which ensures 536870912 B less the terms
+      that no term charged. Both arms also run the dry-run witness, which must grow nothing;
     - **the model's first context places its C head slots (rulings §M32 C-1; pre-registered
       before the lead's run):** vehicles `gptoss120b-b1` and `glkg-qwen35b-a3b-b1`, the B50
       merge-gate shapes. **Scored by the pure-fit run**, not by a load: H2's `kv_region_fit` on
@@ -7448,26 +7491,34 @@ means that.
       §M44 addendum). **Its witness values, pre-registered on that shape (rulings §M44
       addendum):** the fixture publishes the Qwen gate's attention shape at `-c 4096 -ub 512`,
       for which 23mk's function gives G = 201326592 B (the positive control of rulings §M44b
-      (2)), beside the eligible weight with K = 8192 and N = 18432, so W = 8192 · 18432 · 2 =
-      301989888 B. Step 4 ensures ONEDNN at 301989888 B from the ledger; the mutant's dry run
-      sizes it at 301989888 + 201326592 = 503316480 B, so its one outcome, with
-      `GGML_SYCL_WITNESS_CHECKS=1`, is the witness naming ONEDNN and 201326592 B of growth. On a
-      sinks shape (GPT-OSS's) G is 0, the dry run equals step 4, and the arm is VOID, never a
-      pass. 7.14e's arm deleted W's source, so the W getter read 0 and the mutant fired only if
-      G exceeded W, which the fixture did not assert. With both held it fires the same witness
-      on the same fixture, naming ONEDNN and G's bytes. (Citing the getter's body alone would
-      mutate code the load path no longer executes, and the arm would be void.) On the correct
-      tree the same fixture's load-stage ONEDNN zone is exactly `onednn_pp_w` B, which the
-      fixture's W ≥ 256 MiB makes equal to the `max(268435456, onednn_pp_w)` form (rulings
-      §M29a, §M44 C-1), and its weight zone is larger than master's by exactly master's ONEDNN
-      zone minus that, where
+      (2)), beside the eligible weight with K = 8192 and N = 18432, stored as Q4_0, so W = 8192
+      · 18432 · 2 = 301989888 B and **E, master's `onednn_eligible`, is its stored size, 8192 ·
+      18432 / 32 · 18 = 84934656 B** (81.0 MiB; `zone-sizing.cpp:168`; Q4_0's reorder · 9 =
+      stored · 32, which `test-zone-sizing.cpp:212` pins; rulings §M46b m-12). Step 4 ensures
+      ONEDNN at 301989888 B from the ledger; the mutant's dry run sizes it at 301989888 +
+      201326592 = 503316480 B, so its one outcome, with `GGML_SYCL_WITNESS_CHECKS=1`, is the
+      witness naming ONEDNN and 201326592 B of growth. On a sinks shape (GPT-OSS's) G is 0, the
+      dry run equals step 4, and the arm is VOID, never a pass. 7.14e's arm deleted W's source,
+      so the W getter read 0 and the mutant fired only if G exceeded W, which the fixture did
+      not assert. With both held it fires the same witness on the same fixture, naming ONEDNN
+      and G's bytes. (Citing the getter's body alone would mutate code the load path no longer
+      executes, and the arm would be void.) On the correct tree the same fixture's load-stage
+      ONEDNN zone is exactly `onednn_pp_w` B, which the fixture's W ≥ 256 MiB makes equal to the
+      `max(268435456, onednn_pp_w)` form (rulings §M29a, §M44 C-1), and its weight zone is
+      larger than master's by exactly master's ONEDNN zone minus that, where
       **master's zone is read from master's own ensure on the same fixture**, clamp included
       (`min(with_floor, max(available / 4, stored))`, `unified-cache.cpp:4476-4500`), never the
       unclamped with-floor sum (r14 m-15 (b)); the arm also asserts master logged no clamp WARN
       (`[VRAM-ARENA] planned ONEDNN zone ... clamping`) on the fixture, or it uses the clamped
       figure. Both are scored in bytes (rulings §M21.3). On the fixture, where master's ensure
-      logs no clamp WARN, master's zone is W + G = 503316480 B, so the correct tree's weight
-      zone is larger by 201326592 B; on the merge-gate shapes that difference is the floor's
+      logs no clamp WARN, master's zone is W + E + G = 301989888 + 84934656 + 201326592 =
+      588251136 B, since master's stored value is reorder plus eligible
+      (`unified-cache.cpp:27565`), so the correct tree's weight zone is larger by G + E =
+      286261248 B. 7.14k's W + G = 503316480 B dropped E (r19 addendum m-12). E is cross-checked
+      before scoring, or the arm is VOID: master's run on the fixture prints `[SYCL-PLAN] oneDNN
+      scratchpad: 369.0 MB (onednn_reorder 288.0 MB + onednn_eligible 81.0 MB` (`:27566-27570`).
+      The mutant's 503316480 B is the post-(b2) dry run's W + G, which carries no E, and is
+      unchanged; on the merge-gate shapes that difference is the floor's
       244842496 B on GPT-OSS 120B and 234881024 B on Qwen (§2.4.2 (b), "The end states"). A
       context on the same fixture then places the graph scratch once, as a head slot inside its
       `REGION` ranges, and no zone grows after the load (rulings §M25 I-6; 23mk's transaction
@@ -8468,7 +8519,7 @@ Pre-check: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` and
   and the rollback clear in `ggml_sycl_abort_owner_effects_noexcept` (I-1; H7ap);
   `ggml_sycl_weight_alloc_bytes` shared by `get_alloc_size` and the stage, and the range bound
   (I-2; H7ap); the late comparison over the late inventory's subset (m-8); one
-  `ggml_sycl_compute_arena_bytes()` accessor and `ggml_sycl_model_loading_effects` returning
+  `ggml_sycl_compute_arena_bytes(dev)` accessor and `ggml_sycl_model_loading_effects` returning
   `bool` (m-10); the step-7 binding through `g_execution_backend_bindings` (m-13; H7am); every
   witness check as `GGML_SYCL_WITNESS` (§Z9 I-3); the `can_unload` arm's parked-unload handshake
   (m-5; H9); H4 (b) on zhcn's H4h hooks (§Z9a, m-11); and `scripts/audit-sycl-static-storage.py
@@ -8743,7 +8794,8 @@ zhcn 5.16).**
   ranges and claims and L6's transaction steps (r18 C-1). The tracker edges are added when the
   implementation tickets are filed, and 23mk's "whichever of moua L4+L6 and the Graph-scratch
   commit lands later" (23mk 4.11 L3421) is relayed as the split and its two edges. The order
-  is fixed as (b1) → L4 → L6 → (b2) (rulings §M44b), and 23mk §6.8's scoping note is mirrored:
+  is fixed as (b1) → fkpg (a) → L4 → L6 → (b2) (rulings §M44b, §M46b I-4), and 23mk §6.8's
+  scoping note is mirrored:
   the converting commit is (b2), and H7ap's C-rule arm targets the tree after it.
 
 **Landing order (lead ruling; r4 I10).** jehw lands on master first (u1bb already has). Then:
@@ -8753,8 +8805,8 @@ zhcn 5.16).**
    of the per-row constant.
 3. llama.cpp-beni's **producers**: the demand functions and zhcn-walker visitors for its
    cohorts. 23mk's (b1), the sinks-aware G input to master's floor function, lands here, before
-   L4 (rulings §M44 C-1). The oneDNN Graph scratch's producer is 23mk's function, carried by
-   23mk's (b2) in step 5 (rulings §M41 m-6).
+   fkpg (a) and L4 (rulings §M44 C-1, §M46b I-4). The oneDNN Graph scratch's producer is 23mk's
+   function, carried by 23mk's (b2) in step 5 (rulings §M41 m-6).
 4. moua L4-L7. L4 needs every producer that exists at its landing to be real, because a
    converted site with no producer fails H7p; sites not yet converted are on H7p's list
    (§2.4.3's transition rule), so L4 does not wait for beni's conversions.
@@ -8773,7 +8825,10 @@ edge for the strict accessor: every moua commit that calls `ggml_sycl_strict_ena
 after uwlx's merge (rulings §G1c). And fkpg (a) → moua L4 (rulings §M38 C-1; the transport
 carries `n_ctx`, `n_seq_max`, the flash-attention choice and the KV types, rulings §M41 I-3),
 jzvq's host test → moua L4 (rulings §M39 (3)), and 23mk's §11 step 3 → moua L4+L6 (the DECLINE;
-rulings §M36 I-3), and 23mk's (b1) → moua L4 → moua L6 → 23mk's (b2) (rulings §M44 C-1, §M44b).
+rulings §M36 I-3), and 23mk's (b1) → moua L4 → moua L6 → 23mk's (b2) (rulings §M44 C-1, §M44b),
+and 23mk's (b1) → fkpg (a) (rulings §M46b I-4): fkpg (a) before (b1) publishes `n_ctx=4096` to
+master's sinks-blind floor function, so GPT-OSS 120B's ONEDNN is 841482240 B, an idle
+reservation (the floors arm's RED row). The two stay separate landings.
 
 - L3 through L7 form one series in one worktree, so there is one first build and the
   follow-ups reuse it. L3 lands first on its own; L4-L7 follow, rebased on zhcn and beni's
@@ -10699,3 +10754,21 @@ the "pre-(b1) tree" wording) are left as the record of 7.14k.
   consumers; `onednn_pp_w`, `onednn_pp_pool`, `lm_head_f16`, `mxfp4_direct_f16_w` and
   `mmq_work_counter` read device-scoped entries, not the per-model store; `woq_packed` keeps the
   per-model store. The counter's handle leaves `mmq.cpp`'s process-static pointer.
+
+**The follow-up commit (the r19 addendum, rulings §M46b; zhcn r20, rulings §Z28; zhcn 5.20).**
+The addendum covers `c345ddae5..761a84374` (0 Critical, 4 Important, 12 Minor with it). It
+reconciles the three GPT-OSS ONEDNN figures: master publishes `n_ctx=512` at load, so G is
+100663296 B and the zone stays at 268435456 B, and 805306368 B needs fkpg (a)'s `n_ctx=4096`.
+
+| item | finding / relay | disposition |
+|---|---|---|
+| r19 I-4; §M46b | nothing ordered fkpg (a) against (b1); fkpg (a) first makes GPT-OSS 120B's ONEDNN 36175872 + 805306368 = 841482240 B (P4) | **Changed.** The edge (b1) → fkpg (a) is in the landing order, the edge list and the order statements, which read (b1) → fkpg (a) → L4 → L6 → (b2); the two stay separate landings. The floors arm's per-step table labels the master row `n_ctx=512`, adds the (b1)-then-fkpg (a) row (268435456 B on both gates) and the RED row "fkpg (a) without (b1)": 841482240 B on GPT-OSS 120B, 252706816 B → 268435456 B on Qwen. |
+| r19 addendum m-12; §M46b | H7ap's master comparison dropped `onednn_eligible` | **Changed.** Master's zone on the fixture is W + E + G = 588251136 B, and the weight-zone difference is G + E = 286261248 B. E is pre-registered from the formula, the fixture weight stored as Q4_0: 84934656 B, cross-checked against master's `[SYCL-PLAN] oneDNN scratchpad` line (81.0 MB) or VOID. The mutant's 503316480 B is unchanged. On the gates E is 12582912 B (GPT-OSS 120B) and 17825792 B (Qwen), from the frozen logs. |
+| r19 m-5 (the addendum) | `761a84374`'s order statement said "L4 and L6 are one commit" beside §4's separate rows | **Changed.** It reads "L4, L5, L6 and L7 are one commit with no merge point between them", as the §4 note does. |
+| zhcn r20 m-8; §Z28 | two sites said the accessor returns the planned SCRATCH sum and sizes the arena | **Already changed in 7.14l**, where both sentences became `demand_SCRATCH(dev)`, the pre-pack class-P lower bound; this commit adds that the arena is still `reserve_compute_arena` over the whole zone to the floors arm, and passes `dev` at the two remaining cites. |
+| zhcn r20 m-12; §Z28 | the (a) plan must fill `layer_device` and `kv_device` | **Changed.** Every layer gets the probe placement's device in both maps (−1 where its entries are forced off SYCL), with a per-layer witness naming the map and H7ap's entries-only RED. |
+| zhcn 5.20 (1) | who hands the (a) plan to the backend | **Changed.** moua's early `stage_inventory_plan` builds it under the load's bound candidate, before the pack, and stores it in the load's per-model state keyed by the load's transaction, where zhcn's `ggml_backend_sycl_measure_plan_override_install(load_txn, stage)` wraps it. |
+| zhcn 5.20 (2) | a pack-capacity seam for H5L (h) | **Changed.** `ggml_sycl_test_set_pack_capacity(dev, bytes)` and `ggml_sycl_test_get_pack_capacity(dev)` under `GGML_SYCL_PRIVATE_TESTING`, per device, with read-back; zhcn's fixture and numbers are cited as zhcn's. |
+
+**Relays.** fkpg and 23mk: the edge (b1) → fkpg (a). zhcn: the hand-off's location, the
+witness string for the per-layer maps, and the seam's two names.
