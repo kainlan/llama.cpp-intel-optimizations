@@ -13748,7 +13748,7 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
             "[UNIFIED-CACHE] %zu weight entr%s still leased with NO live model owning them -- this is a leaked "
             "mem_handle, not concurrent model use (set GGML_SYCL_STRICT_LEASES=1 to abort here)\n",
             entries_leaked, entries_leaked == 1 ? "y is" : "ies are");
-        if (strict_lease_checks_enabled()) {
+        if (ggml_sycl_strict_enabled()) {
             GGML_ABORT("[UNIFIED-CACHE] leaked model-weight mem_handle lease (GGML_SYCL_STRICT_LEASES=1)");
         }
     }

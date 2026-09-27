@@ -2220,31 +2220,52 @@ def test_mutation_finish_waits_unretired_is_witnessed() -> None:
 # GGML_SYCL_STRICT_LEASES=1, read once in unified-cache.cpp and read everywhere
 # else through ggml_sycl_strict_enabled(). The [CONTEXT-PLAN-BUG] sites keep
 # their own tag; a second variable for them would be a second source for one
-# fact.
-STRICT_SWITCH_SOURCES = sorted((ROOT / "ggml/src/ggml-sycl").rglob("*.[ch]pp"))
-# Both assembled, so a grep of the tree finds the one real getenv and no
-# mention of the retired switch.
-STRICT_LEASES_GETENV = 'std::getenv("GGML_SYCL_STRICT_' + 'LEASES")'
+# fact, and so would a second reader of this one or a second name for the
+# accessor.
+STRICT_SWITCH_DIRS = ("ggml/src/ggml-sycl", "src", "common", "tools")
+STRICT_SWITCH_SUFFIXES = {".c", ".cpp", ".h", ".hpp"}
+# Assembled, so a grep of the tree finds the one real reader and no mention of
+# the retired switch. The quoted name, closing quote included, appears only
+# where the variable is read: every message that names it says "=1".
+STRICT_LEASES_LITERAL = '"GGML_SYCL_STRICT_' + 'LEASES"'
 RETIRED_STRICT_SWITCH = "GGML_SYCL_STRICT_" + "PLAN"
+STRICT_ACCESSOR = "ggml_sycl_strict_enabled"
+STRICT_ACCESSOR_USE = re.compile(r"(?:::)?(?:ggml_sycl::)?\bggml_sycl_strict_enabled\s*\(\s*\)")
+STRICT_CACHE_CPP = "ggml/src/ggml-sycl/unified-cache.cpp"
+STRICT_MEM_HANDLE_CPP = "ggml/src/ggml-sycl/mem-handle.cpp"
 
 
 def strict_switch_violations(sources: dict[str, str]) -> list[str]:
     found: list[str] = []
+    readers: list[str] = []
     for name, text in sources.items():
         if RETIRED_STRICT_SWITCH in text:
             found.append(f"{name} names {RETIRED_STRICT_SWITCH}, a second strict switch")
-    readers = [name for name, text in sources.items() for _ in range(text.count(STRICT_LEASES_GETENV))]
-    if readers != ["unified-cache.cpp"]:
+        if STRICT_LEASES_LITERAL not in text and STRICT_ACCESSOR not in text:
+            continue
+        code = strip_comments(text)
+        readers += [name] * code.count(STRICT_LEASES_LITERAL)
+        # Every site asks the accessor itself, as an if condition: a function
+        # that forwards it, or a value cached from it, is a second name for the
+        # one fact. Only its declaration and definition name it otherwise.
+        if re.search(r"\breturn\s+" + STRICT_ACCESSOR_USE.pattern + r"\s*;", code):
+            found.append(f"{name} wraps ggml_sycl_strict_enabled() in a second name")
+        for use in STRICT_ACCESSOR_USE.finditer(code):
+            before = code[max(0, use.start() - 16):use.start()]
+            after = code[use.end():use.end() + 3]
+            declared = re.search(r"\bbool\s+$", before) is not None
+            condition = re.search(r"\bif\s*\(\s*$", before) is not None and after.startswith(")")
+            if not declared and not condition:
+                found.append(f"{name} uses ggml_sycl_strict_enabled() other than as an if condition")
+                break
+    if readers != [STRICT_CACHE_CPP]:
         found.append(f"GGML_SYCL_STRICT_LEASES is not read exactly once, in unified-cache.cpp: {readers}")
-    cache = strip_comments(sources.get("unified-cache.cpp", ""))
+    cache = strip_comments(sources.get(STRICT_CACHE_CPP, ""))
     if not re.search(r"bool ggml_sycl_strict_enabled\(\) \{\s*return strict_lease_checks_enabled\(\);\s*\}", cache):
         found.append("ggml_sycl_strict_enabled() does not return the one STRICT_LEASES reading")
-    # Every site asks the accessor itself: a function that forwards it is a
-    # second name for the one fact.
-    for name, text in sources.items():
-        if re.search(r"\breturn\s+ggml_sycl_strict_enabled\(\)\s*;", strip_comments(text)):
-            found.append(f"{name} wraps ggml_sycl_strict_enabled() in a second name")
-    mem = sources.get("mem-handle.cpp", "")
+    if cache.count("strict_lease_checks_enabled()") != 2:
+        found.append("strict_lease_checks_enabled() is called other than by ggml_sycl_strict_enabled()")
+    mem = sources.get(STRICT_MEM_HANDLE_CPP, "")
     for report in ("void report_retained_reap_backstop(", "void report_retained_reap_ownerless("):
         body = function_or_none(mem, report)
         if body is None or not re.search(r"if \(ggml_sycl_strict_enabled\(\)\) \{\s*GGML_ABORT\(\s*"
@@ -2254,7 +2275,12 @@ def strict_switch_violations(sources: dict[str, str]) -> list[str]:
 
 
 def _strict_sources() -> dict[str, str]:
-    return {str(p.relative_to(ROOT / "ggml/src/ggml-sycl")): p.read_text() for p in STRICT_SWITCH_SOURCES}
+    sources: dict[str, str] = {}
+    for d in STRICT_SWITCH_DIRS:
+        for path in sorted((ROOT / d).rglob("*")):
+            if path.suffix in STRICT_SWITCH_SUFFIXES and "node_modules" not in path.parts and path.is_file():
+                sources[str(path.relative_to(ROOT))] = path.read_text(errors="replace")
+    return sources
 
 
 def test_one_strict_switch() -> None:
@@ -2263,36 +2289,62 @@ def test_one_strict_switch() -> None:
 
 def _strict_mutation(name: str, old: str, new: str, expected: str, label: str) -> None:
     sources = _strict_sources()
-    mutated = dict(sources)
     assert old in sources[name], f"{label}: anchor missing"
-    mutated[name] = sources[name].replace(old, new, 1)
-    _assert_witnessed(sources[name], mutated[name], lambda text: strict_switch_violations({**sources, name: text}),
+    mutated = sources[name].replace(old, new, 1)
+    _assert_witnessed(sources[name], mutated, lambda text: strict_switch_violations({**sources, name: text}),
                       expected, label)
 
 
+STRICT_ANCHOR = "namespace {\n\n// Whether an event-bound record's event is known complete"
+
+
+def _strict_insert(code: str, expected: str, label: str) -> None:
+    _strict_mutation(STRICT_MEM_HANDLE_CPP, STRICT_ANCHOR, code + "\n\n" + STRICT_ANCHOR, expected, label)
+
+
 def test_mutation_strict_plan_getenv_readded_is_witnessed() -> None:
-    _strict_mutation("mem-handle.cpp", "namespace {\n\n// Whether an event-bound record's event is known complete",
-                     f"static bool strict_plan() {{ return std::getenv(\"{RETIRED_STRICT_SWITCH}\") != nullptr; }}\n\n"
-                     "namespace {\n\n// Whether an event-bound record's event is known complete",
-                     f"names {RETIRED_STRICT_SWITCH}", "retired switch's getenv re-added")
+    _strict_insert(f'static bool strict_plan() {{ return std::getenv("{RETIRED_STRICT_SWITCH}") != nullptr; }}',
+                   f"names {RETIRED_STRICT_SWITCH}", "retired switch's getenv re-added")
 
 
 def test_mutation_second_strict_leases_getenv_is_witnessed() -> None:
-    _strict_mutation("mem-handle.cpp", "namespace {\n\n// Whether an event-bound record's event is known complete",
-                     "static bool strict() { return std::getenv(\"GGML_SYCL_STRICT_LEASES\") != nullptr; }\n\n"
-                     "namespace {\n\n// Whether an event-bound record's event is known complete",
-                     "not read exactly once", "second STRICT_LEASES getenv")
+    _strict_insert(f"static bool strict() {{ return std::getenv({STRICT_LEASES_LITERAL}) != nullptr; }}",
+                   "not read exactly once", "second STRICT_LEASES getenv")
+
+
+def test_mutation_bare_strict_leases_getenv_is_witnessed() -> None:
+    _strict_insert(f"static bool strict() {{ return getenv( {STRICT_LEASES_LITERAL} ) != nullptr; }}",
+                   "not read exactly once", "bare, spaced STRICT_LEASES getenv")
+
+
+def test_mutation_strict_leases_reader_outside_backend_is_witnessed() -> None:
+    _strict_mutation("src/llama.cpp", "#include", f"static const char * strict_env = getenv({STRICT_LEASES_LITERAL});\n#include",
+                     "not read exactly once", "STRICT_LEASES reader in src/")
 
 
 def test_mutation_strict_wrapper_reintroduced_is_witnessed() -> None:
-    _strict_mutation("mem-handle.cpp", "namespace {\n\n// Whether an event-bound record's event is known complete",
-                     "bool strict_plan_checks_enabled() {\n    return ggml_sycl_strict_enabled();\n}\n\n"
-                     "namespace {\n\n// Whether an event-bound record's event is known complete",
-                     "wraps ggml_sycl_strict_enabled()", "wrapper reintroduced")
+    _strict_insert("bool strict_plan_checks_enabled() {\n    return ggml_sycl_strict_enabled();\n}",
+                   "wraps ggml_sycl_strict_enabled()", "wrapper reintroduced")
+
+
+def test_mutation_qualified_strict_wrapper_is_witnessed() -> None:
+    _strict_insert("static bool strict_plan() { return ggml_sycl::ggml_sycl_strict_enabled(); }",
+                   "wraps ggml_sycl_strict_enabled()", "namespace-qualified wrapper")
+
+
+def test_mutation_cached_strict_wrapper_is_witnessed() -> None:
+    _strict_insert("static bool strict_plan() {\n    static const bool cached = ggml_sycl_strict_enabled();\n"
+                   "    return cached;\n}", "other than as an if condition", "cached wrapper")
+
+
+def test_mutation_leaked_lease_abort_bypasses_accessor_is_witnessed() -> None:
+    _strict_mutation(STRICT_CACHE_CPP, "        if (ggml_sycl_strict_enabled()) {\n            GGML_ABORT(\"[UNIFIED-CACHE] leaked",
+                     "        if (strict_lease_checks_enabled()) {\n            GGML_ABORT(\"[UNIFIED-CACHE] leaked",
+                     "called other than by ggml_sycl_strict_enabled()", "leaked-lease abort reads the TU static")
 
 
 def test_mutation_report_ungated_is_witnessed() -> None:
-    _strict_mutation("mem-handle.cpp", "    if (ggml_sycl_strict_enabled()) {\n        GGML_ABORT(\n"
+    _strict_mutation(STRICT_MEM_HANDLE_CPP, "    if (ggml_sycl_strict_enabled()) {\n        GGML_ABORT(\n"
                      "            \"[CONTEXT-PLAN-BUG] retained-reap backstop",
                      "    if (false) {\n        GGML_ABORT(\n            \"[CONTEXT-PLAN-BUG] retained-reap backstop",
                      "report_retained_reap_backstop", "backstop abort ungated")
