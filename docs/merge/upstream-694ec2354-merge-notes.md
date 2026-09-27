@@ -269,3 +269,38 @@ question is llama.cpp-5efe.
   a mock RED for a model-labelled test and a mock RED for an unreadable sweep
   listing, plus a real-build RED: drop `model` from the `-LE`, and the guard
   names all four tests.
+
+## Review follow-ups, round 2 (review-n77l-fix-r1, 0 Critical / 0 Important / 4 Minor)
+
+- **m1, `src/llama-moe-profile.cpp`.** `flush()` reads the ids as packed rows
+  of `ne[0]`. That holds only for a contiguous tensor, and
+  `ggml_argsort_top_k` returns a strided view: its rows are `n_expert` apart,
+  and `ggml_nbytes` exceeds the element count, which would overflow the read
+  buffer. `schedule_capture()` now asserts `ggml_is_contiguous`, and the
+  comment no longer names the view as the producer. `test-moe-profile-stride`
+  captures a top-k style view and observes the refusal via an abort callback
+  that `longjmp`s out. Before the assert, the view was queued ("refused = 0,
+  want 1").
+- **m2, `tests/test-mmap-lazy-hugepage.cpp`.** The test skipped (77) whenever
+  the mapping lacked `hg`, including when no VmFlags line was read at all, so
+  a parse failure passed vacuously. It now fails when no VmFlags line is
+  found, and skips only when one was read without `hg`. RED: with the parser
+  mutated to look for `VmFlagz:`, the old test printed "SKIP ... ''" and
+  exited 77; the new one fails with "no VmFlags line".
+- **m3, label anchoring.** `ctest -LE` searches each label with the regex, so
+  a bare `model` also dropped the seven `cross-model` tests and
+  `test-layout-cache` (`model-load`) from form 2. None of them loads a model;
+  `test-layout-cache` drives the model-load lifecycle hooks on a pinned
+  device and belongs in the -j 1 sweep, as its registration says. The
+  exclusion is now `^model$` in the guard's `MODEL_LABEL_RE` (from which
+  `SWEEP_LE_DEFAULT` is built) and in both CLAUDE.md copies. The guard
+  matches labels with the same per-label regex search. It also gains an
+  over-exclusion check: every test ctest's own `-LE`-only listing drops must
+  be a loader or in the `cache|mem-handle` label net. The opt-in
+  `sycl-canonical-gates` (`gpu;model-loading`, two model loads, no fixture)
+  was excluded only by the unanchored match, so it now carries `model` too.
+  REDs: a mock where the label exclusion drops a plain test, and the real
+  build with the unanchored `model`, which names all eight tests.
+- **m4, CLAUDE.md.** The limit now reads "a test that loads a model but has
+  no fixture and no `model` label", not "a GPU test", which would have told
+  readers to strip the pinned GPU unit tests from form 2.

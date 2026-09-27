@@ -98,11 +98,13 @@ rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-sweep-empty" 2>&1) || rc=$?
 grep -qF "SWEEP LISTING EMPTY" <<<"$out" || { echo "FAIL: RED-6 did not name the cause: $out"; exit 1; }
 echo "RED-6 ok (empty sweep listing refused, not vacuously passed)"
 
-# The model-loader half reads `ctest -N --show-only=json-v1` twice: once
-# unfiltered (the registry the loader set is derived from) and once through the
-# documented sweep filters. mock_json writes a mock that answers the text
-# listings like the mocks above and the two JSON listings from files: a call
-# carrying -LE is the sweep, one without it is the registry.
+# The model-loader half reads `ctest -N --show-only=json-v1` three times:
+# unfiltered (the registry the loader set is derived from), through the
+# documented sweep filters, and through the -LE alone (what the label exclusion
+# keeps). mock_json writes a mock that answers the text listings like the mocks
+# above and the JSON listings from files: a call carrying -LE gets the sweep
+# file, so the mock's label exclusion keeps exactly its sweep, and a call
+# without it gets the registry.
 mock_json() {  # name registry.json sweep.json
     cat > "$TMP/$1" <<EOF
 #!/usr/bin/env bash
@@ -141,7 +143,7 @@ tests_json "$PLAIN" "$LOADER" "$GENERATOR" "$DOWNLOAD" "$ENVMODEL" > "$TMP/regis
 
 # The documented exclusions must appear in CLAUDE.md; the mocks do not exercise
 # that, so they get a doc that carries them for whatever the guard's defaults are.
-sweep_le=$(sed -n "s/^SWEEP_LE_DEFAULT='\(.*\)'$/\1/p" "$G")
+sweep_le=$(eval "$(grep -E '^(MODEL_LABEL_RE|SWEEP_LE_DEFAULT)=' "$G")"; printf '%s' "$SWEEP_LE_DEFAULT")
 sweep_e=$(sed -n "s/^SWEEP_E_DEFAULT='\(.*\)'$/\1/p" "$G")
 [ -n "$sweep_le" ] || { echo "FAIL: could not read SWEEP_LE_DEFAULT from $G"; exit 1; }
 [ -n "$sweep_e" ] || { echo "FAIL: could not read SWEEP_E_DEFAULT from $G"; exit 1; }
@@ -219,6 +221,27 @@ rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-sweep-garbage" --claude-md "$TMP/d
 [ "$rc" -eq 2 ] || { echo "FAIL: rc=$rc for an unreadable sweep listing, want 2: $out"; exit 1; }
 grep -qF "SWEEP LISTING UNREADABLE" <<<"$out" || { echo "FAIL: RED-13 did not name the cause: $out"; exit 1; }
 echo "RED-13 ok (unreadable sweep listing refused)"
+
+# RED-14: the label exclusion drops a test that is neither a model loader nor
+# in the label net, so the sweep silently loses it.
+tests_json "$DOWNLOAD" > "$TMP/sweep-overdrop.json"
+mock_json ctest-overdrop registry.json sweep-overdrop.json
+rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-overdrop" --claude-md "$TMP/doc-ok.md" 2>&1) || rc=$?
+[ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc for an over-dropping label exclusion, want 1: $out"; exit 1; }
+grep -qF "SWEEP DROPS NON-LOADER: test-something-else" <<<"$out" || { echo "FAIL: RED-14 did not name the test: $out"; exit 1; }
+echo "RED-14 ok (label exclusion dropping a non-loader named)"
+
+# RED-real-unanchored: against the real build/, an unanchored `model` in the
+# label exclusion (ctest -LE is a regex search per label) also drops the
+# `cross-model` tests and test-layout-cache (`model-load`), none of which loads
+# a model. The guard must name them.
+rc=0; out=$(bash "$G" --build-dir build --sweep-label-exclude 'residency|mem-handle|cache|model' 2>&1) || rc=$?
+[ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc with label model unanchored, want 1: $out"; exit 1; }
+for t in test-layout-cache cross-model-weight-usage; do
+    grep -qF "SWEEP DROPS NON-LOADER: $t " <<<"$out" \
+        || { echo "FAIL: RED-real-unanchored did not name $t: $out"; exit 1; }
+done
+echo "RED-real-unanchored ok (unanchored model drops test-layout-cache and the cross-model tests)"
 
 # RED-real-label: against the real build/, drop `model` from the label
 # exclusion. The guard must name the environment-model tests and the G1

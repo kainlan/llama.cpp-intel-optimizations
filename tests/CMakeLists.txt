@@ -781,7 +781,7 @@ if (GGML_SYCL)
             RESOURCE_LOCK sycl-lifecycle-device
             TIMEOUT 950
             # `model`: it loads the models its G1 fixture names, so the documented
-            # sweep (-LE '...|model') leaves it out and scripts/check-ctest-safety-net.sh
+            # sweep (-LE '...|^model$') leaves it out and scripts/check-ctest-safety-net.sh
             # counts it as a loader.
             LABELS "sycl;lifecycle;g1;hash-pinned;model")
     endif()
@@ -1311,7 +1311,10 @@ if (NOT WIN32 AND LLAMA_SYCL_CANONICAL_GATES)
         RESOURCE_LOCK gpu-ttm-memory
         ENVIRONMENT ONEAPI_DEVICE_SELECTOR=level_zero:1
         TIMEOUT 1800
-        LABELS "gpu;model-loading"
+        # `model` (exact): the documented sweep excludes -LE '^model$', which
+        # "model-loading" does not match, so an opted-in build would otherwise
+        # sweep these two model loads.
+        LABELS "gpu;model-loading;model"
     )
 endif()
 
@@ -3162,7 +3165,7 @@ set_property(TEST test-moe-profile-stride PROPERTY
 
 # llama_mmap keeps MADV_HUGEPAGE off the lazily read ranges (llama.cpp-n77l),
 # checked through the VmFlags in /proc/self/smaps. Linux-only; exits 77 when
-# THP is unavailable.
+# THP is unavailable, and fails when no VmFlags line can be read.
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     llama_build_and_test(test-mmap-lazy-hugepage.cpp)
     target_include_directories(test-mmap-lazy-hugepage PRIVATE ${PROJECT_SOURCE_DIR}/src)

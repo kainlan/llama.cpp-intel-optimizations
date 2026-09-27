@@ -11,6 +11,11 @@
 // read of layer 1 picks up layer 0's stale 7s, and expert 7 shows up in a
 // layer that never selected it.
 //
+// The row width is ne[0] only for a contiguous tensor, so schedule_capture()
+// must refuse a strided view (ggml_argsort_top_k returns one, with rows
+// n_expert apart). The refusal is a GGML_ASSERT; an abort callback longjmps
+// out of it before abort() so the test can observe it in-process.
+//
 // Host-only: the tensors live in a CPU buffer wrapped around a static array,
 // so no backend registry, device or model is involved.
 
@@ -18,11 +23,19 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <csetjmp>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 
 static int n_failures = 0;
+
+static jmp_buf abort_jmp;
+
+static void abort_jump(const char * message) {
+    printf("refused as expected: %s\n", message);
+    longjmp(abort_jmp, 1);
+}
 
 static void check_eq(const char * what, uint64_t got, uint64_t want) {
     if (got != want) {
@@ -77,6 +90,22 @@ int main() {
         check_eq(what, l1.expert_counts[e], 1);
     }
     check_eq("layer 1 expert 7 (layer 0's stale ids)", l1.expert_counts[7], 0);
+
+    // a top-k style view: the first n_used_small ids of each wide row, so rows
+    // stay n_used_max apart and ne[0] is not the stride
+    ggml_tensor * view = ggml_view_2d(ctx, wide, n_used_small, n_tokens, wide->nb[1], 0);
+
+    const size_t          n_pending_before = profiler.pending_reads.size();
+    ggml_abort_callback_t prev_abort       = ggml_set_abort_callback(abort_jump);
+    bool                  refused          = false;
+    if (setjmp(abort_jmp) == 0) {
+        profiler.schedule_capture(0, view, n_tokens, n_used_small);
+    } else {
+        refused = true;
+    }
+    ggml_set_abort_callback(prev_abort);
+    check_eq("non-contiguous view refused", refused, 1);
+    check_eq("pending reads after the view", profiler.pending_reads.size(), n_pending_before);
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);

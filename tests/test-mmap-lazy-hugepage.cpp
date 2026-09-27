@@ -8,8 +8,10 @@
 // so this maps a small file with one unaligned lazy range and checks each
 // region: before and after the range carry "hg", and the range itself,
 // including the pages holding its unaligned ends, does not. Exits 77 when the
-// non-lazy region carries no "hg" either (THP unavailable), since then the
-// check cannot tell anything apart.
+// non-lazy region's VmFlags were read and carry no "hg" either (THP
+// unavailable), since then the check cannot tell anything apart. A VmFlags
+// line that cannot be found is a failure, not a skip: "no flags" also reads as
+// "no hg", so skipping on it would pass every probe vacuously.
 
 #include "../src/llama-mmap.h"
 
@@ -27,7 +29,8 @@
 
 static const size_t MiB = 1024 * 1024;
 
-// VmFlags of the VMA that contains `p`, or "" when no VMA does
+// VmFlags of the VMA that contains `p`, or "" when no VMA or no VmFlags line
+// for it was found
 static std::string vm_flags_at(const void * p) {
     const uintptr_t target = (uintptr_t) p;
     std::ifstream   smaps("/proc/self/smaps");
@@ -46,8 +49,8 @@ static std::string vm_flags_at(const void * p) {
     return "";
 }
 
-static bool has_hugepage(const void * p) {
-    return vm_flags_at(p).find(" hg ") != std::string::npos;
+static bool has_hugepage(const std::string & flags) {
+    return flags.find(" hg ") != std::string::npos;
 }
 
 int main() {
@@ -72,8 +75,14 @@ int main() {
         llama_mmap   m(&f, /*prefetch =*/0, /*numa =*/false, lazy_ranges);
         const char * base = (const char *) m.addr();
 
-        if (!has_hugepage(base)) {
-            printf("SKIP: the non-lazy region carries no hg flag (THP unavailable): '%s'\n", vm_flags_at(base).c_str());
+        const std::string base_flags = vm_flags_at(base);
+        if (base_flags.empty()) {
+            fprintf(stderr, "FAIL: no VmFlags line for the mapping in /proc/self/smaps\n");
+            unlink(path);
+            return 1;
+        }
+        if (!has_hugepage(base_flags)) {
+            printf("SKIP: the non-lazy region carries no hg flag (THP unavailable): '%s'\n", base_flags.c_str());
             unlink(path);
             return 77;
         }
@@ -92,11 +101,16 @@ int main() {
             { "after the lazy range",         6 * MiB,      true  },
         };
         for (const probe & pr : probes) {
-            const bool got = has_hugepage(base + pr.off);
+            const std::string flags = vm_flags_at(base + pr.off);
+            if (flags.empty()) {
+                fprintf(stderr, "FAIL: %s (offset %zu): no VmFlags line\n", pr.what, pr.off);
+                n_failures++;
+                continue;
+            }
+            const bool got = has_hugepage(flags);
             if (got != pr.want_hg) {
                 fprintf(stderr, "FAIL: %s (offset %zu): hg %s, want %s; VmFlags '%s'\n", pr.what, pr.off,
-                        got ? "present" : "absent", pr.want_hg ? "present" : "absent",
-                        vm_flags_at(base + pr.off).c_str());
+                        got ? "present" : "absent", pr.want_hg ? "present" : "absent", flags.c_str());
                 n_failures++;
             }
         }
