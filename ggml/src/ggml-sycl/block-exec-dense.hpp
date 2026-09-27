@@ -16,10 +16,13 @@
 //     Split into the context gates and the block gates, whose verdict
 //     dense_exec_block_memo keeps per placement plan. The composed form is
 //     the reference ordering; the backend runs the two halves separately.
-//   - dense_exec_build_plan: node devices, ranges, per-range copies and the
-//     layout of the persistent per-device arena.
+//   - dense_exec_build_plan: node devices, ranges, per-range copies, the
+//     layout of the persistent per-device arena, and the runs that move each
+//     crossing in as few copies as the layout allows.
 //   - dense_exec_graph_first_off: do the ranges of a decode graph record and
 //     replay command graphs?
+//   - dense_exec_input_moved: on a plan-cache hit, does a graph input need
+//     copying to its device copy again?
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -32,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <memory>
 #include <utility>
@@ -417,6 +421,16 @@ struct dense_exec_copy {
     int to_slice   = -1;
 };
 
+// One copy between a device arena and a host staging buffer. A run covers one
+// or more consecutive spans that sit at the same distance apart in both, so one
+// copy moves them all; the bytes between two spans are alignment padding that
+// belongs to no slice.
+struct dense_exec_run {
+    size_t arena_offset = 0;
+    size_t host_offset  = 0;
+    size_t bytes        = 0;
+};
+
 struct dense_exec_range_io {
     // Executor ranges only. Slices filled before the range runs, each copied
     // from the root's storage on the original device: for a NODE root, where
@@ -436,6 +450,14 @@ struct dense_exec_range_io {
     // together and waited on once.
     std::vector<size_t>          stage_in_host;
     std::vector<size_t>          copy_out_host;
+    // The copies that move a crossing, each one run: host buffer to the
+    // range's device (stage in), the range's device to host buffer (copy
+    // out, source side), host buffer to the original device (copy out,
+    // destination side). The source side of a stage in is one copy per slice:
+    // its sources are not in an arena.
+    std::vector<dense_exec_run>  stage_in_runs;
+    std::vector<dense_exec_run>  copy_out_src_runs;
+    std::vector<dense_exec_run>  copy_out_dst_runs;
 };
 
 struct dense_exec_plan {
@@ -450,6 +472,31 @@ struct dense_exec_plan {
 
 inline size_t dense_exec_align(size_t bytes) {
     return (bytes + dense_exec_slice_alignment - 1) / dense_exec_slice_alignment * dense_exec_slice_alignment;
+}
+
+// Merges spans, in order, into runs: a span joins the run before it when it
+// starts in the padding after that run and sits at the same distance from it
+// in the arena as in the host buffer. Empty spans move nothing and are
+// dropped.
+inline std::vector<dense_exec_run> dense_exec_coalesce(const std::vector<dense_exec_run> & spans) {
+    std::vector<dense_exec_run> runs;
+    for (const dense_exec_run & span : spans) {
+        if (span.bytes == 0) {
+            continue;
+        }
+        if (!runs.empty()) {
+            dense_exec_run & run = runs.back();
+            const size_t     end = run.host_offset + run.bytes;
+            if (span.host_offset >= end && span.host_offset - end < dense_exec_slice_alignment &&
+                span.arena_offset >= run.arena_offset &&
+                span.arena_offset - run.arena_offset == span.host_offset - run.host_offset) {
+                run.bytes = span.host_offset + span.bytes - run.host_offset;
+                continue;
+            }
+        }
+        runs.push_back(span);
+    }
+    return runs;
 }
 
 inline int dense_exec_block_device(const std::vector<dense_exec_block> & blocks, int layer) {
@@ -732,11 +779,36 @@ inline dense_exec_gate dense_exec_build_plan(const dense_exec_graph & g, dense_e
         }
     }
 
+    // A crossing's slices sit next to each other in the arena, in the order
+    // the crossing packs them in the host buffer, so one copy moves them:
+    // each executor range's staged slices, then the sources and the
+    // destinations of its copies out. Every other slice follows, in creation
+    // order.
     out.arena_bytes.assign(dense_exec_max_devices, 0);
-    for (dense_exec_slice & slice : out.slices) {
-        size_t & total = out.arena_bytes[static_cast<size_t>(slice.device)];
-        slice.offset   = total;
+    std::vector<bool> placed(out.slices.size(), false);
+    auto              place = [&](int s) {
+        if (placed[static_cast<size_t>(s)]) {
+            return;
+        }
+        placed[static_cast<size_t>(s)] = true;
+        dense_exec_slice & slice       = out.slices[static_cast<size_t>(s)];
+        size_t &           total       = out.arena_bytes[static_cast<size_t>(slice.device)];
+        slice.offset                   = total;
         total += dense_exec_align(slice.bytes != 0 ? slice.bytes : 1);
+    };
+    for (const dense_exec_range_io & io : out.io) {
+        for (int s : io.stage_in) {
+            place(s);
+        }
+        for (const dense_exec_copy & c : io.copy_out) {
+            place(c.from_slice);
+        }
+        for (const dense_exec_copy & c : io.copy_out) {
+            place(c.to_slice);
+        }
+    }
+    for (size_t s = 0; s < out.slices.size(); ++s) {
+        place(static_cast<int>(s));
     }
     out.host_stage_bytes = 0;
     for (dense_exec_range_io & io : out.io) {
@@ -751,6 +823,21 @@ inline dense_exec_gate dense_exec_build_plan(const dense_exec_graph & g, dense_e
             out_bytes += dense_exec_align(out.slices[static_cast<size_t>(c.from_slice)].bytes);
         }
         out.host_stage_bytes = std::max(out.host_stage_bytes, std::max(in_bytes, out_bytes));
+
+        std::vector<dense_exec_run> in_spans, src_spans, dst_spans;
+        for (size_t k = 0; k < io.stage_in.size(); ++k) {
+            const dense_exec_slice & slice = out.slices[static_cast<size_t>(io.stage_in[k])];
+            in_spans.push_back(dense_exec_run{ slice.offset, io.stage_in_host[k], slice.bytes });
+        }
+        for (size_t k = 0; k < io.copy_out.size(); ++k) {
+            const dense_exec_slice & from = out.slices[static_cast<size_t>(io.copy_out[k].from_slice)];
+            const dense_exec_slice & to   = out.slices[static_cast<size_t>(io.copy_out[k].to_slice)];
+            src_spans.push_back(dense_exec_run{ from.offset, io.copy_out_host[k], from.bytes });
+            dst_spans.push_back(dense_exec_run{ to.offset, io.copy_out_host[k], to.bytes });
+        }
+        io.stage_in_runs     = dense_exec_coalesce(in_spans);
+        io.copy_out_src_runs = dense_exec_coalesce(src_spans);
+        io.copy_out_dst_runs = dense_exec_coalesce(dst_spans);
     }
     if (g.max_arena_bytes != 0) {
         for (size_t total : out.arena_bytes) {
@@ -882,7 +969,134 @@ inline const char * dense_exec_plan_violation(const dense_exec_graph & g, const 
             return "host staging spans overlap or leave the buffer";
         }
     }
+
+    // Each crossing's runs stay inside the host buffer and their arena, and
+    // every non-empty span lies inside one run at the run's own distance
+    // between arena and host, so the run writes it where the slice is.
+    auto runs_cover = [&](const std::vector<dense_exec_run> & runs, int device,
+                          const std::vector<std::pair<int, size_t>> & spans) {  // (slice, host offset)
+        if (device < 0 || static_cast<size_t>(device) >= p.arena_bytes.size()) {
+            return false;
+        }
+        for (const dense_exec_run & run : runs) {
+            if (run.bytes == 0 || run.host_offset + run.bytes > p.host_stage_bytes ||
+                run.arena_offset + run.bytes > p.arena_bytes[static_cast<size_t>(device)]) {
+                return false;
+            }
+        }
+        for (const auto & span : spans) {
+            const dense_exec_slice & slice = p.slices[static_cast<size_t>(span.first)];
+            if (slice.bytes == 0) {
+                continue;
+            }
+            bool covered = false;
+            for (const dense_exec_run & run : runs) {
+                covered = covered || (slice.device == device && span.second >= run.host_offset &&
+                                      span.second + slice.bytes <= run.host_offset + run.bytes &&
+                                      slice.offset + run.host_offset == span.second + run.arena_offset);
+            }
+            if (!covered) {
+                return false;
+            }
+        }
+        return true;
+    };
+    // And a run writes no slice of its device but those its spans carry:
+    // the bytes between them are padding, never another root's storage.
+    auto runs_confined = [&](const std::vector<dense_exec_run> & runs, int device,
+                             const std::vector<std::pair<int, size_t>> & spans) {
+        for (size_t s = 0; s < p.slices.size(); ++s) {
+            const dense_exec_slice & slice = p.slices[s];
+            if (slice.device != device || slice.bytes == 0) {
+                continue;
+            }
+            bool carried = false;
+            for (const auto & span : spans) {
+                carried = carried || static_cast<size_t>(span.first) == s;
+            }
+            if (carried) {
+                continue;
+            }
+            for (const dense_exec_run & run : runs) {
+                if (slice.offset < run.arena_offset + run.bytes && run.arena_offset < slice.offset + slice.bytes) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    for (size_t r = 0; r < p.ranges.size(); ++r) {
+        const dense_exec_range_io &         io = p.io[r];
+        std::vector<std::pair<int, size_t>> in, src, dst;
+        for (size_t k = 0; k < io.stage_in.size(); ++k) {
+            in.emplace_back(io.stage_in[k], io.stage_in_host[k]);
+        }
+        for (size_t k = 0; k < io.copy_out.size(); ++k) {
+            src.emplace_back(io.copy_out[k].from_slice, io.copy_out_host[k]);
+            dst.emplace_back(io.copy_out[k].to_slice, io.copy_out_host[k]);
+        }
+        if (!runs_cover(io.stage_in_runs, p.ranges[r].device, in) ||
+            !runs_cover(io.copy_out_src_runs, p.ranges[r].device, src) ||
+            !runs_cover(io.copy_out_dst_runs, g.original_device, dst)) {
+            return "a crossing's copies do not cover its slices";
+        }
+        if (!runs_confined(io.stage_in_runs, p.ranges[r].device, in) ||
+            !runs_confined(io.copy_out_src_runs, p.ranges[r].device, src) ||
+            !runs_confined(io.copy_out_dst_runs, g.original_device, dst)) {
+            return "a crossing's copy overwrites a slice it does not carry";
+        }
+    }
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Input refresh on a plan-cache hit
+// ---------------------------------------------------------------------------
+
+// Replayed range graphs read each host input leaf from a stable device copy,
+// which the backend refreshes before the ranges run. On a plan-cache hit the
+// graph, its inputs and their device copies are the ones of the last graph, so
+// an input whose host bytes have not moved since they were last copied needs
+// no copy. The snapshot is what was last copied; inputs larger than the cap
+// are not snapshotted and always count as moved.
+constexpr size_t dense_exec_input_snapshot_max_bytes = 64 * 1024;
+
+struct dense_exec_input_snapshot {
+    bool                       valid = false;
+    std::vector<unsigned char> bytes;
+};
+
+// True when `src` must be copied again: never recorded, not snapshotted,
+// resized, or different in any byte.
+inline bool dense_exec_input_moved(const dense_exec_input_snapshot & s, const void * src, size_t bytes) {
+    if (!s.valid || src == nullptr || bytes != s.bytes.size()) {
+        return true;
+    }
+    return bytes != 0 && std::memcmp(s.bytes.data(), src, bytes) != 0;
+}
+
+// Records `src` as the bytes just copied.
+inline void dense_exec_input_record(dense_exec_input_snapshot & s, const void * src, size_t bytes) {
+    s.valid = src != nullptr && bytes <= dense_exec_input_snapshot_max_bytes;
+    if (!s.valid) {
+        s.bytes.clear();
+        return;
+    }
+    const unsigned char * p = static_cast<const unsigned char *>(src);
+    s.bytes.assign(p, p + bytes);
+}
+
+// Per root: true when a node of the graph writes it. A snapshot only proves
+// what the host last copied into the device copy; an input some node writes on
+// the device may no longer hold it, so the backend copies it on every graph.
+inline std::vector<bool> dense_exec_written_roots(const dense_exec_graph & g) {
+    std::vector<bool> written(g.roots.size(), false);
+    for (const dense_exec_node & node : g.nodes) {
+        if (!node.is_noop && node.dst_root >= 0 && static_cast<size_t>(node.dst_root) < written.size()) {
+            written[static_cast<size_t>(node.dst_root)] = true;
+        }
+    }
+    return written;
 }
 
 // A pool frees scratch that a recording used into its own retained list, not

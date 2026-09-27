@@ -19338,8 +19338,13 @@ static thread_local std::
     unordered_map<ggml_sycl_data_ptr_cache_key, ggml_sycl::mem_handle, ggml_sycl_data_ptr_cache_key_hash>
         g_data_ptr_cache;
 
+// Called on every storage publish and restore, often with the map already
+// empty. clear() still walks the whole bucket array, which never shrinks, so
+// an empty map is left alone.
 void ggml_sycl_data_ptr_cache_new_graph() {
-    g_data_ptr_cache.clear();
+    if (!g_data_ptr_cache.empty()) {
+        g_data_ptr_cache.clear();
+    }
 }
 
 struct ggml_sycl_tensor_storage_handle {
@@ -89625,13 +89630,35 @@ static sycl::queue * ggml_sycl_block_exec_dense_queue(ggml_backend_sycl_context 
     return ctx.stream(device, 0);
 }
 
-// One copy of a crossing between devices: source, destination, offset in the
-// host staging buffers, bytes.
-struct ggml_sycl_block_exec_dense_crossing_span {
-    ggml_sycl::mem_handle src;
-    ggml_sycl::mem_handle dst;
+// One copy of a crossing between a device and the host staging buffers: the
+// device side (the source going out, the destination coming in), the offset in
+// the host staging buffers, bytes.
+struct ggml_sycl_block_exec_dense_crossing_copy {
+    ggml_sycl::mem_handle device;
     size_t                host_offset = 0;
     size_t                bytes       = 0;
+};
+
+// The arena views each run of a range's crossings copies to or from, parallel
+// to that range's dense_exec_range_io runs.
+struct ggml_sycl_block_exec_dense_range_runs {
+    std::vector<ggml_sycl::mem_handle> stage_in;
+    std::vector<ggml_sycl::mem_handle> copy_out_src;
+    std::vector<ggml_sycl::mem_handle> copy_out_dst;
+};
+
+// What a prepare builds and a plan-cache hit reuses: the plan, its roots, the
+// arena slices and the views of each crossing's runs. Immutable once built,
+// and shared: a hit takes a reference instead of copying the handles. The
+// executor's reference keeps them for its own lifetime even if the cache
+// entry is dropped mid-graph; work still queued after it returns holds its
+// own references (each copy retains its handles until its event completes, a
+// recorded graph retains the slices it baked, and the state owns the arena).
+struct ggml_sycl_block_exec_dense_prepared {
+    ggml_sycl::dense_exec_plan                         plan;
+    std::vector<ggml_tensor *>                         roots;
+    std::vector<ggml_sycl::mem_handle>                 slices;
+    std::vector<ggml_sycl_block_exec_dense_range_runs> runs;  // per range
 };
 
 // Per backend context: one device arena per device the executor stages into.
@@ -89656,9 +89683,30 @@ struct ggml_sycl_block_exec_dense_state {
         size_t                                         arena_identity[GGML_SYCL_MAX_DEVICES] = {};
         size_t                                         arena_bytes[GGML_SYCL_MAX_DEVICES]    = {};
         std::vector<const ggml_tensor *>               tensors;  // per node: node, view_src, src[0..GGML_MAX_SRC)
-        ggml_sycl::dense_exec_plan                     plan;
-        std::vector<ggml_tensor *>                     roots;
-        std::vector<ggml_sycl::mem_handle>             slices;
+
+        // Shared with each executor that ran from this entry.
+        std::shared_ptr<const ggml_sycl_block_exec_dense_prepared> built;
+
+        // Graph input (CONTROL) roots some node of the graph writes.
+        std::vector<const ggml_tensor *> written_inputs;
+
+        // What the last input refresh copied, so a later graph with this
+        // plan copies only the inputs that moved. Built from the context's
+        // input list and staging generation, and valid while both hold. It
+        // holds no staging handle: a copy looks its entry up when it runs,
+        // so nothing here keeps an allocation the staging map has dropped.
+        struct refresh_input {
+            ggml_tensor *                        tensor  = nullptr;
+            size_t                               bytes   = 0;
+            bool                                 staged  = false;  // has a device copy; else refreshed in full
+            bool                                 written = false;  // its root is written: copied every graph
+            ggml_sycl::dense_exec_input_snapshot snapshot;
+        };
+
+        bool                       refresh_valid      = false;
+        uint64_t                   refresh_generation = 0;
+        std::vector<ggml_tensor *> refresh_list;
+        std::vector<refresh_input> refresh;
     };
 
     std::optional<prepared_plan> prepared;
@@ -89667,16 +89715,19 @@ struct ggml_sycl_block_exec_dense_state {
     // crossing packs its copies into the source device's buffer and waits
     // once, moves them on the host to the destination device's buffer, and
     // copies them in from there without waiting: the destination's in-order
-    // queue orders them before the kernels that read them. host_stage_read
-    // is the last of those copies per buffer; the host waits on it before it
-    // writes the buffer again.
+    // queue orders them before the kernels that read them. Each side copies
+    // whole runs of the plan, so a crossing whose slices sit together in an
+    // arena is one copy on that side. host_stage_read is the last of the
+    // copies in per buffer; the host waits on it before it writes the buffer
+    // again.
     ggml_sycl::mem_handle host_stage[GGML_SYCL_MAX_DEVICES];
     size_t                host_stage_bytes[GGML_SYCL_MAX_DEVICES] = {};
     sycl::event           host_stage_read[GGML_SYCL_MAX_DEVICES];
 
-    // The spans of the crossing being built. Reused so a token allocates
-    // nothing for them; emptied after each crossing, never shrunk.
-    std::vector<ggml_sycl_block_exec_dense_crossing_span> crossing_spans;
+    // The copies of the crossing being built, each side. Reused so a token
+    // allocates nothing for them; emptied after each crossing, never shrunk.
+    std::vector<ggml_sycl_block_exec_dense_crossing_copy> crossing_out;
+    std::vector<ggml_sycl_block_exec_dense_crossing_copy> crossing_in;
 
 #ifdef GGML_SYCL_GRAPH
     // One recorded command graph per range of a decode graph, replayed on the
@@ -89847,6 +89898,7 @@ static bool ggml_sycl_graph_is_decode(const ggml_cgraph * cgraph) {
 static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph);
 static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph);
 static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph);
+static bool graph_refresh_input_tensor(ggml_backend_sycl_context * ctx, ggml_tensor * tensor, sycl::queue & q);
 
 // GGML_SYCL_BLOCK_EXEC_DENSE_GRAPH=0 keeps every range on direct dispatch.
 static bool ggml_sycl_block_exec_dense_graph_enabled() {
@@ -90007,7 +90059,7 @@ class ggml_sycl_block_exec_dense_run {
         g_ggml_sycl_block_exec_dense_active       = false;
         executed_ranges_++;
 
-        const ggml_sycl::dense_exec_range_io & io     = plan_.io[static_cast<size_t>(idx)];
+        const ggml_sycl::dense_exec_range_io & io     = built_->plan.io[static_cast<size_t>(idx)];
         sycl::queue *                          q_orig = ggml_sycl_block_exec_dense_queue(ctx_, original_device_);
         sycl::queue *                          q_exec = ggml_sycl_block_exec_dense_queue(ctx_, range.device);
         if (!q_orig || !q_exec) {
@@ -90021,22 +90073,22 @@ class ggml_sycl_block_exec_dense_run {
                 phases_[static_cast<size_t>(idx)].drain_out_us = elapsed_us(t_copy);
                 t_copy                                         = std::chrono::steady_clock::now();
             }
-            crossing_spans_scope         scope(state().crossing_spans);
-            std::vector<crossing_span> & spans = scope.spans;
-            for (size_t k = 0; k < io.copy_out.size(); ++k) {
-                const ggml_sycl::dense_exec_copy &  copy = io.copy_out[k];
-                const ggml_sycl::dense_exec_slice & from = plan_.slices[static_cast<size_t>(copy.from_slice)];
-                if (from.bytes == 0) {
-                    continue;
-                }
-                spans.push_back(crossing_span{ slices_[static_cast<size_t>(copy.from_slice)],
-                                               slices_[static_cast<size_t>(copy.to_slice)], io.copy_out_host[k],
-                                               from.bytes });
+            crossing_scope                                scope(state());
+            const ggml_sycl_block_exec_dense_range_runs & runs = built_->runs[static_cast<size_t>(idx)];
+            for (size_t k = 0; k < io.copy_out_src_runs.size(); ++k) {
+                const ggml_sycl::dense_exec_run & run = io.copy_out_src_runs[k];
+                scope.out.push_back(crossing_copy{ runs.copy_out_src[k], run.host_offset, run.bytes });
             }
-            cross(range.device, original_device_, spans);
+            for (size_t k = 0; k < io.copy_out_dst_runs.size(); ++k) {
+                const ggml_sycl::dense_exec_run & run = io.copy_out_dst_runs[k];
+                scope.in.push_back(crossing_copy{ runs.copy_out_dst[k], run.host_offset, run.bytes });
+            }
             // The range's own work is done before the next graph can reuse
-            // its arena slices, whether or not anything crossed back.
-            q_exec->wait_and_throw();
+            // its arena slices, whether or not anything crossed back. A
+            // crossing that copied out already waited for the queue.
+            if (!cross(range.device, original_device_, scope.out, scope.in)) {
+                q_exec->wait_and_throw();
+            }
             if (phase_trace_) {
                 phases_[static_cast<size_t>(idx)].copy_out_us = elapsed_us(t_copy);
             }
@@ -90051,10 +90103,10 @@ class ggml_sycl_block_exec_dense_run {
         // The copies are the storage of their roots on the backend's device
         // for the rest of the graph.
         for (const ggml_sycl::dense_exec_copy & copy : io.copy_out) {
-            const ggml_sycl::dense_exec_slice & to = plan_.slices[static_cast<size_t>(copy.to_slice)];
+            const ggml_sycl::dense_exec_slice & to = built_->plan.slices[static_cast<size_t>(copy.to_slice)];
             if (!publish(to, static_cast<size_t>(copy.to_slice), graph_publications_)) {
                 GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] publishing %s on device %d after range %d failed",
-                           roots_[static_cast<size_t>(to.root)]->name, to.device, idx);
+                           built_->roots[static_cast<size_t>(to.root)]->name, to.device, idx);
             }
         }
     }
@@ -90158,10 +90210,11 @@ class ggml_sycl_block_exec_dense_run {
     ggml_cgraph *                                    cgraph_          = nullptr;
     int                                              original_device_ = -1;
     ggml_sycl::dense_exec_gate                       gate_            = ggml_sycl::DENSE_EXEC_GATE_DISABLED;
-    ggml_sycl::dense_exec_plan                       plan_;
-    std::vector<ggml_sycl::dense_exec_range>         ranges_;
-    std::vector<ggml_tensor *>                       roots_;
-    std::vector<ggml_sycl::mem_handle>               slices_;
+
+    // What the plan-cache entry holds, shared; set once the gate passes.
+    std::shared_ptr<const ggml_sycl_block_exec_dense_prepared> built_;
+
+    std::vector<ggml_sycl::dense_exec_range> ranges_;
     enum class plan_cache_result { NONE, HIT, MISS };
     plan_cache_result                                plan_cache_ = plan_cache_result::NONE;
     ggml_cgraph                                      view_{};
@@ -90187,6 +90240,12 @@ class ggml_sycl_block_exec_dense_run {
     bool                       graphs_on_  = false;
     ggml_sycl::dense_graph_off graphs_off_ = ggml_sycl::DENSE_GRAPH_OFF_NONE;
 
+    // Inputs the last refresh copied, found unmoved, and refreshed in full;
+    // refresh_copied_ < 0 when every input was refreshed in full.
+    int refresh_copied_  = -1;
+    int refresh_skipped_ = 0;
+    int refresh_full_    = 0;
+
     std::vector<range_graph_mode>                                           range_modes_;
     uint64_t                                                                recording_signature_ = 0;
     std::optional<sycl_ex::command_graph<sycl_ex::graph_state::modifiable>> recording_;
@@ -90211,7 +90270,7 @@ class ggml_sycl_block_exec_dense_run {
             mix(static_cast<uint64_t>(r.device));
             mix(r.executor ? 1 : 0);
         }
-        for (const ggml_sycl::dense_exec_slice & s : plan_.slices) {
+        for (const ggml_sycl::dense_exec_slice & s : built_->plan.slices) {
             mix(static_cast<uint64_t>(s.root));
             mix(static_cast<uint64_t>(s.device));
             mix(static_cast<uint64_t>(s.offset));
@@ -90305,10 +90364,96 @@ class ggml_sycl_block_exec_dense_run {
             graph_prestage_leaf_tensors(&ctx_, cgraph_);
         }
         split_lap(split_.key_us);
-        graph_refresh_input_tensors(&ctx_, cgraph_);
+        // On a plan-cache hit that records nothing, copy only the inputs
+        // that moved; otherwise refresh them all and remember what went.
+        if (plan_cache_ != plan_cache_result::HIT || any_missing || !refresh_moved_inputs()) {
+            graph_refresh_input_tensors(&ctx_, cgraph_);
+            remember_refresh();
+        }
         split_lap(split_.refresh_us);
         range_modes_.assign(ranges_.size(), range_graph_mode::DIRECT);
         graphs_on_ = true;
+    }
+
+    // The inputs a full refresh just went through, each marked when it has a
+    // stable device copy. No bytes are recorded here: the first
+    // refresh from this list copies every input and records what it copied,
+    // so a snapshot only ever describes a copy this path made.
+    void remember_refresh() {
+        ggml_sycl_block_exec_dense_state & st = state();
+        if (!st.prepared) {
+            return;
+        }
+        auto & p             = *st.prepared;
+        p.refresh_valid      = ctx_.input_tensors_cached;
+        p.refresh_generation = ctx_.graph_input_staging_generation;
+        p.refresh_list       = ctx_.cached_input_tensors;
+        p.refresh.clear();
+        p.refresh.reserve(p.refresh_list.size());
+        for (ggml_tensor * t : p.refresh_list) {
+            size_t              offs = 0;
+            const ggml_tensor * root = t != nullptr ? ggml_sycl_view_root_and_offset(t, offs) : nullptr;
+            ggml_sycl_block_exec_dense_state::prepared_plan::refresh_input in{};
+            in.tensor  = t;
+            in.bytes   = t != nullptr ? ggml_nbytes(t) : 0;
+            in.written = std::find(p.written_inputs.begin(), p.written_inputs.end(), root) != p.written_inputs.end();
+            in.staged  = t != nullptr && t->data != nullptr && t->name[0] != '\0' &&
+                        ctx_.graph_input_stage_lookup(t, in.bytes, original_device_, nullptr, nullptr);
+            p.refresh.push_back(std::move(in));
+        }
+    }
+
+    // False when the remembered refresh no longer describes the context's
+    // inputs; the caller then refreshes them all.
+    //
+    // Skipping an input whose bytes did not move is sound because nothing
+    // but the staging members (which bump the generation) and this copy
+    // writes a staging copy: kernels only read them through lookups, and a
+    // node that writes a graph input writes the tensor's own storage. The
+    // `written` flag is a margin on top of that, not the guarantee, so it
+    // need not cover every input (an INPUT-flagged view of a non-input root
+    // is not marked).
+    bool refresh_moved_inputs() {
+        ggml_sycl_block_exec_dense_state & st = state();
+        if (!st.prepared) {
+            return false;
+        }
+        auto & p = *st.prepared;
+        if (!p.refresh_valid || !ctx_.input_tensors_cached ||
+            p.refresh_generation != ctx_.graph_input_staging_generation ||
+            p.refresh_list != ctx_.cached_input_tensors) {
+            return false;
+        }
+        sycl::queue & q  = *ctx_.stream();
+        refresh_copied_  = 0;
+        refresh_skipped_ = 0;
+        refresh_full_    = 0;
+        for (auto & in : p.refresh) {
+            ggml_tensor * t = in.tensor;
+            if (!in.staged || t == nullptr || t->data == nullptr || ggml_nbytes(t) != in.bytes) {
+                in.snapshot = ggml_sycl::dense_exec_input_snapshot{};
+                refresh_full_ += graph_refresh_input_tensor(&ctx_, t, q) ? 1 : 0;
+                continue;
+            }
+            if (!in.written && !ggml_sycl::dense_exec_input_moved(in.snapshot, t->data, in.bytes)) {
+                refresh_skipped_++;
+                continue;
+            }
+            // The generation held, so the entry is the one remembered; its
+            // handle is taken for this copy only. Without it the caller
+            // refreshes every input in full, and the trace says so.
+            ggml_sycl::mem_handle moved_dst;
+            if (!ctx_.graph_input_stage_lookup(t, in.bytes, original_device_, &moved_dst, nullptr)) {
+                refresh_copied_ = -1;
+                return false;
+            }
+            const ggml_sycl::mem_handle src = ggml_sycl::mem_handle::from_direct(
+                t->data, GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, in.bytes);
+            (void) ggml_sycl::mem_copy_async(moved_dst, src, in.bytes, q);
+            ggml_sycl::dense_exec_input_record(in.snapshot, t->data, in.bytes);
+            refresh_copied_++;
+        }
+        return true;
     }
 
     // After the range's inputs are staged and published and its device is
@@ -90394,7 +90539,7 @@ class ggml_sycl_block_exec_dense_run {
                 g.retained.push_back(st.arena[d]);
             }
         }
-        g.retained.insert(g.retained.end(), slices_.begin(), slices_.end());
+        g.retained.insert(g.retained.end(), built_->slices.begin(), built_->slices.end());
         const ggml_sycl::mem_handle q8 = ctx_.mmvq_q8_activation_cache.handle(range.device);
         if (q8.valid()) {
             g.retained.push_back(q8);
@@ -90521,6 +90666,13 @@ class ggml_sycl_block_exec_dense_run {
                      (unsigned long long) st.graphs[r].replays);
             line += buf;
         }
+        if (refresh_copied_ < 0) {
+            line += " refresh=all";
+        } else {
+            snprintf(buf, sizeof(buf), " refresh(copied=%d unmoved=%d full=%d)", refresh_copied_, refresh_skipped_,
+                     refresh_full_);
+            line += buf;
+        }
         fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE-GRAPH] on%s\n", line.c_str());
         fflush(stderr);
     }
@@ -90533,10 +90685,10 @@ class ggml_sycl_block_exec_dense_run {
     // the llama.cpp-49lj layer 4/5 defect, so it aborts instead.
     void restore(publications & pubs) {
         for (auto it = pubs.rbegin(); it != pubs.rend(); ++it) {
-            const ggml_sycl::dense_exec_slice & slice = plan_.slices[it->slice];
-            const ggml_tensor *                 root  = roots_[static_cast<size_t>(slice.root)];
+            const ggml_sycl::dense_exec_slice & slice = built_->plan.slices[it->slice];
+            const ggml_tensor *                 root  = built_->roots[static_cast<size_t>(slice.root)];
             const auto *                        extra = static_cast<const ggml_tensor_extra_gpu *>(root->extra);
-            const void *                        ours  = slices_[it->slice].resolve(slice.device).ptr;
+            const void *                        ours  = built_->slices[it->slice].resolve(slice.device).ptr;
             if (extra == nullptr || extra->data_device[slice.device] != ours ||
                 extra->data_handle[slice.device].resolve(slice.device).ptr != ours) {
                 GGML_ABORT(
@@ -90551,7 +90703,8 @@ class ggml_sycl_block_exec_dense_run {
 
     bool publish(const ggml_sycl::dense_exec_slice & slice, size_t slice_idx, publications & pubs) {
         auto scoped = std::make_unique<block_exec_scoped_tensor_storage_publication>();
-        if (!scoped->publish(roots_[static_cast<size_t>(slice.root)], slice.device, slices_[slice_idx], &ctx_)) {
+        if (!scoped->publish(built_->roots[static_cast<size_t>(slice.root)], slice.device, built_->slices[slice_idx],
+                             &ctx_)) {
             return false;
         }
         pubs.push_back(dense_publication{ std::move(scoped), slice_idx });
@@ -90594,22 +90747,35 @@ class ggml_sycl_block_exec_dense_run {
         return make_data_ptr_handle(t, original_device_, ptr);
     }
 
-    // One crossing from `from` to `to`: every span is copied into from's host
-    // buffer, waited on once, moved to to's host buffer, and copied out of it
-    // on to's queue without a wait.
-    using crossing_span = ggml_sycl_block_exec_dense_crossing_span;
+    using crossing_copy = ggml_sycl_block_exec_dense_crossing_copy;
 
-    // Empties the context's reused span list on entry, and again on exit,
-    // which releases the spans' handles.
-    struct crossing_spans_scope {
-        std::vector<crossing_span> & spans;
+    // Empties the context's reused copy lists on entry, and again on exit,
+    // which releases the copies' handles.
+    struct crossing_scope {
+        std::vector<crossing_copy> & out;
+        std::vector<crossing_copy> & in;
 
-        explicit crossing_spans_scope(std::vector<crossing_span> & v) : spans(v) { spans.clear(); }
+        explicit crossing_scope(ggml_sycl_block_exec_dense_state & st) : out(st.crossing_out), in(st.crossing_in) {
+            out.clear();
+            in.clear();
+        }
 
-        ~crossing_spans_scope() { spans.clear(); }
+        ~crossing_scope() {
+            out.clear();
+            in.clear();
+        }
     };
 
-    void cross(int from, int to, const std::vector<crossing_span> & spans, dense_phase * laps = nullptr) {
+    // One crossing from `from` to `to`: every copy out lands in from's host
+    // buffer and is waited on once, the buffer moves to to's host buffer, and
+    // every copy in leaves it on to's queue without a wait. True when the
+    // crossing waited for from's queue, which it does whenever anything
+    // crossed.
+    bool cross(int                                from,
+               int                                to,
+               const std::vector<crossing_copy> & out,
+               const std::vector<crossing_copy> & in,
+               dense_phase *                      laps = nullptr) {
         auto t   = laps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         auto lap = [&](double & bucket) {
             if (laps) {
@@ -90624,12 +90790,12 @@ class ggml_sycl_block_exec_dense_run {
             throw std::runtime_error("no queue or host stage for the crossing");
         }
         size_t packed = 0;
-        for (const crossing_span & span : spans) {
-            ggml_sycl::mem_copy_async(st.host_stage[from], span.host_offset, span.src, 0, span.bytes, *q_from);
-            packed = std::max(packed, span.host_offset + span.bytes);
+        for (const crossing_copy & c : out) {
+            ggml_sycl::mem_copy_async(st.host_stage[from], c.host_offset, c.device, 0, c.bytes, *q_from);
+            packed = std::max(packed, c.host_offset + c.bytes);
         }
         if (packed == 0) {
-            return;
+            return false;
         }
         double unused = 0.0;
         lap(laps ? laps->stage_d2h_us : unused);
@@ -90638,34 +90804,37 @@ class ggml_sycl_block_exec_dense_run {
         lap(laps ? laps->stage_wait_us : unused);
         ggml_sycl::mem_copy(st.host_stage[to], 0, st.host_stage[from], 0, packed, *q_to);
         lap(laps ? laps->stage_host_us : unused);
-        for (const crossing_span & span : spans) {
+        for (const crossing_copy & c : in) {
             st.host_stage_read[to] =
-                ggml_sycl::mem_copy_async(span.dst, 0, st.host_stage[to], span.host_offset, span.bytes, *q_to);
+                ggml_sycl::mem_copy_async(c.device, 0, st.host_stage[to], c.host_offset, c.bytes, *q_to);
         }
         lap(laps ? laps->stage_h2d_us : unused);
+        return true;
     }
 
     bool stage_range(size_t idx) {
         const ggml_sycl::dense_exec_range &    range = ranges_[idx];
-        const ggml_sycl::dense_exec_range_io & io    = plan_.io[idx];
-        crossing_spans_scope                   scope(state().crossing_spans);
-        std::vector<crossing_span> &           spans = scope.spans;
+        const ggml_sycl::dense_exec_range_io & io    = built_->plan.io[idx];
+        crossing_scope                         scope(state());
+        // The sources are not in an arena: one copy out per slice.
         for (size_t k = 0; k < io.stage_in.size(); ++k) {
-            const int                           s     = io.stage_in[k];
-            const ggml_sycl::dense_exec_slice & slice = plan_.slices[static_cast<size_t>(s)];
+            const ggml_sycl::dense_exec_slice & slice = built_->plan.slices[static_cast<size_t>(io.stage_in[k])];
             if (slice.bytes == 0) {
                 continue;
             }
-            ggml_sycl::mem_handle src = root_source(roots_[static_cast<size_t>(slice.root)]);
+            ggml_sycl::mem_handle src = root_source(built_->roots[static_cast<size_t>(slice.root)]);
             if (!src.valid()) {
                 return false;
             }
-            spans.push_back(
-                crossing_span{ std::move(src), slices_[static_cast<size_t>(s)], io.stage_in_host[k], slice.bytes });
+            scope.out.push_back(crossing_copy{ std::move(src), io.stage_in_host[k], slice.bytes });
+        }
+        for (size_t k = 0; k < io.stage_in_runs.size(); ++k) {
+            const ggml_sycl::dense_exec_run & run = io.stage_in_runs[k];
+            scope.in.push_back(crossing_copy{ built_->runs[idx].stage_in[k], run.host_offset, run.bytes });
         }
         dense_phase * laps = phase_trace_ ? &phases_[idx] : nullptr;
         try {
-            cross(original_device_, range.device, spans, laps);
+            (void) cross(original_device_, range.device, scope.out, scope.in, laps);
         } catch (const std::exception & e) {
             GGML_LOG_WARN("[SYCL-BLOCK-EXEC-DENSE] staging into range %zu (device %d) failed: %s\n", idx, range.device,
                           e.what());
@@ -90673,7 +90842,7 @@ class ggml_sycl_block_exec_dense_run {
         }
         const auto t_publish = laps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         for (int s : io.publish) {
-            if (!publish(plan_.slices[static_cast<size_t>(s)], static_cast<size_t>(s), range_publications_)) {
+            if (!publish(built_->plan.slices[static_cast<size_t>(s)], static_cast<size_t>(s), range_publications_)) {
                 return false;
             }
         }
@@ -90734,10 +90903,10 @@ class ggml_sycl_block_exec_dense_run {
             plan_cache_ = plan_cache_result::HIT;
             split_lap(split_.cache_us);
             check_queue_order(original_device_);
-            for (const ggml_sycl::dense_exec_range & range : plan_.ranges) {
+            for (const ggml_sycl::dense_exec_range & range : built_->plan.ranges) {
                 check_queue_order(range.device);
             }
-            ranges_ = plan_.ranges;
+            ranges_ = built_->plan.ranges;
             split_lap(split_.queue_order_us);
             trace_prepare();
             split_lap(split_.trace_us);
@@ -90745,13 +90914,14 @@ class ggml_sycl_block_exec_dense_run {
         }
         plan_cache_ = plan_cache_result::MISS;
         st.prepared.reset();
+        auto build = std::make_shared<ggml_sycl_block_exec_dense_prepared>();
 
         // The node loop's MoE direct-dispatch state indexes the whole graph;
         // a range view would corrupt it. Dense means no MUL_MAT_ID at all.
         for (int i = 0; i < cgraph_->n_nodes; ++i) {
             if (cgraph_->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
-                plan_.failing_node = i;
-                trace_reject(ggml_sycl::DENSE_EXEC_GATE_NOT_DENSE);
+                build->plan.failing_node = i;
+                trace_reject(ggml_sycl::DENSE_EXEC_GATE_NOT_DENSE, build->plan);
                 return ggml_sycl::DENSE_EXEC_GATE_NOT_DENSE;
             }
         }
@@ -90760,26 +90930,34 @@ class ggml_sycl_block_exec_dense_run {
         g.blocks          = judged.blocks;
         g.original_device = original_device_;
         g.max_arena_bytes = ggml_sycl_block_exec_dense_max_arena_bytes();
-        gather_facts(g);
+        gather_facts(g, build->roots);
 
-        gate = ggml_sycl::dense_exec_build_plan(g, plan_);
+        gate = ggml_sycl::dense_exec_build_plan(g, build->plan);
         if (gate != ggml_sycl::DENSE_EXEC_GATE_NONE) {
-            trace_reject(gate);
+            trace_reject(gate, build->plan);
             return gate;
         }
-        if (const char * violation = ggml_sycl::dense_exec_plan_violation(g, plan_)) {
+        if (const char * violation = ggml_sycl::dense_exec_plan_violation(g, build->plan)) {
             GGML_ABORT("[SYCL-BLOCK-EXEC-DENSE] plan breaks an ownership invariant: %s", violation);
         }
+        std::vector<const ggml_tensor *> written_inputs;
+        const std::vector<bool>          written = ggml_sycl::dense_exec_written_roots(g);
+        for (size_t r = 0; r < g.roots.size(); ++r) {
+            if (written[r] && g.roots[r].kind == ggml_sycl::DENSE_EXEC_ROOT_CONTROL) {
+                written_inputs.push_back(build->roots[r]);
+            }
+        }
         check_queue_order(original_device_);
-        for (const ggml_sycl::dense_exec_range & range : plan_.ranges) {
+        for (const ggml_sycl::dense_exec_range & range : build->plan.ranges) {
             check_queue_order(range.device);
         }
-        if (!allocate(plan_owner)) {
-            trace_reject(ggml_sycl::DENSE_EXEC_GATE_PREPARE_FAILED);
+        if (!allocate(plan_owner, *build)) {
+            trace_reject(ggml_sycl::DENSE_EXEC_GATE_PREPARE_FAILED, build->plan);
             return ggml_sycl::DENSE_EXEC_GATE_PREPARE_FAILED;
         }
-        ranges_ = plan_.ranges;
-        store_prepared(st, plan_owner, signature);
+        built_  = std::move(build);
+        ranges_ = built_->plan.ranges;
+        store_prepared(st, plan_owner, signature, std::move(written_inputs));
         split_lap(split_.cache_us);
         trace_prepare();
         split_lap(split_.trace_us);
@@ -90787,7 +90965,7 @@ class ggml_sycl_block_exec_dense_run {
     }
 
     // True when the cache entry was prepared for this graph, placement plan
-    // and arenas; plan_, roots_ and slices_ are then taken from it.
+    // and arenas; the executor then shares what it built.
     bool reuse_prepared(const ggml_sycl_block_exec_dense_state &                 state,
                         const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner,
                         uint64_t                                                 signature) {
@@ -90821,15 +90999,14 @@ class ggml_sycl_block_exec_dense_run {
                 }
             }
         }
-        plan_   = p.plan;
-        roots_  = p.roots;
-        slices_ = p.slices;
+        built_ = p.built;
         return true;
     }
 
     void store_prepared(ggml_sycl_block_exec_dense_state &                       state,
                         const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner,
-                        uint64_t                                                 signature) const {
+                        uint64_t                                                 signature,
+                        std::vector<const ggml_tensor *>                         written_inputs) const {
         ggml_sycl_block_exec_dense_state::prepared_plan p{};
         p.owner     = plan_owner;
         p.signature = signature;
@@ -90846,24 +91023,23 @@ class ggml_sycl_block_exec_dense_run {
                 p.tensors.push_back(node->src[s]);
             }
         }
-        p.plan         = plan_;
-        p.roots        = roots_;
-        p.slices       = slices_;
-        state.prepared = std::move(p);
+        p.built          = built_;
+        p.written_inputs = std::move(written_inputs);
+        state.prepared   = std::move(p);
     }
 
     void trace_prepare() const {
         if (ggml_sycl_block_exec_plan_trace_enabled()) {
             size_t n_stage = 0, n_publish = 0, n_copy_out = 0;
-            for (const auto & io : plan_.io) {
+            for (const auto & io : built_->plan.io) {
                 n_stage += io.stage_in.size();
                 n_publish += io.publish.size();
                 n_copy_out += io.copy_out.size();
             }
             std::string arenas;
-            for (size_t d = 0; d < plan_.arena_bytes.size(); ++d) {
-                if (plan_.arena_bytes[d] != 0) {
-                    arenas += " arena_dev" + std::to_string(d) + "=" + std::to_string(plan_.arena_bytes[d]);
+            for (size_t d = 0; d < built_->plan.arena_bytes.size(); ++d) {
+                if (built_->plan.arena_bytes[d] != 0) {
+                    arenas += " arena_dev" + std::to_string(d) + "=" + std::to_string(built_->plan.arena_bytes[d]);
                 }
             }
             fprintf(stderr,
@@ -90874,23 +91050,23 @@ class ggml_sycl_block_exec_dense_run {
                         range.end, range.device, range.executor ? 1 : 0, cgraph_->nodes[range.begin]->name);
             }
             // What each crossing moves, once per prepared plan.
-            for (size_t r = 0; plan_cache_ != plan_cache_result::HIT && r < plan_.io.size(); ++r) {
-                for (int s : plan_.io[r].stage_in) {
-                    const ggml_sycl::dense_exec_slice & slice = plan_.slices[static_cast<size_t>(s)];
+            for (size_t r = 0; plan_cache_ != plan_cache_result::HIT && r < built_->plan.io.size(); ++r) {
+                for (int s : built_->plan.io[r].stage_in) {
+                    const ggml_sycl::dense_exec_slice & slice = built_->plan.slices[static_cast<size_t>(s)];
                     fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE]   r%zu stage_in %s bytes=%zu\n", r,
-                            roots_[static_cast<size_t>(slice.root)]->name, slice.bytes);
+                            built_->roots[static_cast<size_t>(slice.root)]->name, slice.bytes);
                 }
-                for (const ggml_sycl::dense_exec_copy & c : plan_.io[r].copy_out) {
-                    const ggml_sycl::dense_exec_slice & slice = plan_.slices[static_cast<size_t>(c.from_slice)];
+                for (const ggml_sycl::dense_exec_copy & c : built_->plan.io[r].copy_out) {
+                    const ggml_sycl::dense_exec_slice & slice = built_->plan.slices[static_cast<size_t>(c.from_slice)];
                     fprintf(stderr, "[SYCL-BLOCK-EXEC-DENSE]   r%zu copy_out %s bytes=%zu\n", r,
-                            roots_[static_cast<size_t>(slice.root)]->name, slice.bytes);
+                            built_->roots[static_cast<size_t>(slice.root)]->name, slice.bytes);
                 }
             }
             fflush(stderr);
         }
     }
 
-    void gather_facts(ggml_sycl::dense_exec_graph & g) {
+    void gather_facts(ggml_sycl::dense_exec_graph & g, std::vector<ggml_tensor *> & roots) {
         const int n_devices = std::min(ggml_sycl_routable_device_count(), ggml_sycl::dense_exec_max_devices);
 
         std::unordered_map<const ggml_tensor *, int> producer;
@@ -90929,7 +91105,7 @@ class ggml_sycl_block_exec_dense_run {
                 }
                 it = root_index.emplace(root, static_cast<int>(g.roots.size())).first;
                 g.roots.push_back(r);
-                roots_.push_back(const_cast<ggml_tensor *>(root));
+                roots.push_back(const_cast<ggml_tensor *>(root));
             }
             if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
                 g.roots[static_cast<size_t>(it->second)].is_output = true;
@@ -90956,11 +91132,13 @@ class ggml_sycl_block_exec_dense_run {
         }
     }
 
-    bool allocate(const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner) {
+    bool allocate(const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner,
+                  ggml_sycl_block_exec_dense_prepared &                    build) {
         ggml_sycl_block_exec_dense_state & state = ggml_sycl_block_exec_dense_state_for(ctx_);
         const bool plan_changed = state.plan.owner_before(plan_owner) || plan_owner.owner_before(state.plan);
         for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
-            const size_t need = d < ggml_sycl::dense_exec_max_devices ? plan_.arena_bytes[static_cast<size_t>(d)] : 0;
+            const size_t need =
+                d < ggml_sycl::dense_exec_max_devices ? build.plan.arena_bytes[static_cast<size_t>(d)] : 0;
             if (plan_changed || (need > state.arena_bytes[d] && state.arena[d].valid())) {
                 state.drop_arena(ctx_, d);
             }
@@ -90981,19 +91159,20 @@ class ggml_sycl_block_exec_dense_run {
         }
         for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
             const bool crosses = d == original_device_ || [&] {
-                for (const ggml_sycl::dense_exec_range & range : plan_.ranges) {
+                for (const ggml_sycl::dense_exec_range & range : build.plan.ranges) {
                     if (range.executor && range.device == d) {
                         return true;
                     }
                 }
                 return false;
             }();
-            if (!crosses || plan_.host_stage_bytes == 0 || state.host_stage_bytes[d] >= plan_.host_stage_bytes) {
+            if (!crosses || build.plan.host_stage_bytes == 0 ||
+                state.host_stage_bytes[d] >= build.plan.host_stage_bytes) {
                 continue;
             }
             state.drop_host_stage(ctx_, d);
             const size_t          granule = size_t{ 64 } << 10;
-            const size_t          bytes   = (plan_.host_stage_bytes + granule - 1) / granule * granule;
+            const size_t          bytes   = (build.plan.host_stage_bytes + granule - 1) / granule * granule;
             ggml_sycl::mem_handle stage;
             if (!ggml_sycl::alloc_pinned_stage_handle_terminal(bytes, *ggml_sycl_block_exec_dense_queue(ctx_, d), d,
                                                                "block-exec-dense-host-stage",
@@ -91006,29 +91185,52 @@ class ggml_sycl_block_exec_dense_run {
         }
         state.plan = plan_owner;
 
-        slices_.clear();
-        slices_.reserve(plan_.slices.size());
-        for (const ggml_sycl::dense_exec_slice & slice : plan_.slices) {
+        build.slices.clear();
+        build.slices.reserve(build.plan.slices.size());
+        for (const ggml_sycl::dense_exec_slice & slice : build.plan.slices) {
             ggml_sycl::mem_handle h =
                 state.arena[slice.device].slice(slice.offset, slice.bytes != 0 ? slice.bytes : size_t{ 1 });
             if (!h.valid()) {
                 return false;
             }
-            slices_.push_back(std::move(h));
+            build.slices.push_back(std::move(h));
+        }
+
+        // A view of the arena for each run of each crossing.
+        auto views = [&](int device, const std::vector<ggml_sycl::dense_exec_run> & runs,
+                         std::vector<ggml_sycl::mem_handle> & out) {
+            for (const ggml_sycl::dense_exec_run & run : runs) {
+                ggml_sycl::mem_handle h = state.arena[device].slice(run.arena_offset, run.bytes);
+                if (!h.valid()) {
+                    return false;
+                }
+                out.push_back(std::move(h));
+            }
+            return true;
+        };
+        build.runs.assign(build.plan.io.size(), ggml_sycl_block_exec_dense_range_runs{});
+        for (size_t r = 0; r < build.plan.io.size(); ++r) {
+            const ggml_sycl::dense_exec_range_io & io = build.plan.io[r];
+            const int                              d  = build.plan.ranges[r].device;
+            if (!views(d, io.stage_in_runs, build.runs[r].stage_in) ||
+                !views(d, io.copy_out_src_runs, build.runs[r].copy_out_src) ||
+                !views(original_device_, io.copy_out_dst_runs, build.runs[r].copy_out_dst)) {
+                return false;
+            }
         }
         return true;
     }
 
-    void trace_reject(ggml_sycl::dense_exec_gate gate) const {
+    void trace_reject(ggml_sycl::dense_exec_gate gate, const ggml_sycl::dense_exec_plan & plan) const {
         if (!ggml_sycl_block_exec_plan_trace_enabled()) {
             return;
         }
-        const int           i    = plan_.failing_node;
+        const int           i    = plan.failing_node;
         const ggml_tensor * node = i >= 0 && i < cgraph_->n_nodes ? cgraph_->nodes[i] : nullptr;
         fprintf(
             stderr, "[SYCL-BLOCK-EXEC-DENSE] reject gate=%s node=%d op=%s name=%s device=%d\n",
             ggml_sycl::dense_exec_gate_name(gate), i, node ? ggml_op_name(node->op) : "-", node ? node->name : "-",
-            node && static_cast<size_t>(i) < plan_.node_device.size() ? plan_.node_device[static_cast<size_t>(i)] : -1);
+            node && static_cast<size_t>(i) < plan.node_device.size() ? plan.node_device[static_cast<size_t>(i)] : -1);
         fflush(stderr);
     }
 
@@ -98855,6 +99057,49 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         skipped_control);
 }
 
+// Refreshes one input tensor's device copy from its host bytes on `q`. True
+// when a copy was submitted; false when the tensor reads its host storage in
+// place or has nothing to copy.
+static bool graph_refresh_input_tensor(ggml_backend_sycl_context * ctx, ggml_tensor * tensor, sycl::queue & q) {
+    if (!tensor || !tensor->data) {
+        return false;
+    }
+    // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
+    // comment on graph_input_staging in common.hpp. The name check
+    // stays as a cheap pre-filter (an unnamed leaf was never staged).
+    if (tensor->name && tensor->name[0] != '\0' &&
+        ctx->graph_input_refresh(tensor, tensor->data, ggml_nbytes(tensor), q)) {
+        return true;
+    }
+    ggml_sycl_tensor_storage_handle dst_storage{};
+    ggml_sycl::mem_handle           dst_handle{};
+    size_t                          dst_offset = 0;
+    if (ggml_sycl_find_tensor_storage_handle(tensor, ctx->device, &dst_storage) && dst_storage.handle.valid()) {
+        const auto resolved = dst_storage.handle.resolve(ctx->device);
+        if (!resolved.ptr) {
+            GGML_ABORT("[SYCL-GRAPH] input tensor %s smart storage handle could not resolve on device %d",
+                       tensor->name ? tensor->name : "?", ctx->device);
+        }
+        void * dst_ptr = static_cast<char *>(resolved.ptr) + dst_storage.view_offset;
+        if (dst_ptr == tensor->data) {
+            return false;
+        }
+        dst_handle = dst_storage.handle;
+        dst_offset = dst_storage.view_offset;
+    } else {
+        void * resolved_ptr = ggml_sycl_resolve_tensor_ptr(tensor, ctx->device);
+        if (!resolved_ptr || resolved_ptr == tensor->data) {
+            return false;
+        }
+        dst_handle = ggml_sycl_copy_handle_for_raw_ptr(resolved_ptr, GGML_LAYOUT_AOS, ctx->device);
+    }
+    ggml_sycl::mem_handle src_handle =
+        ggml_sycl::mem_handle::from_direct(tensor->data, GGML_LAYOUT_AOS, /*on_device=*/false,
+                                           ggml_sycl::mem_handle::HOST_DEVICE, 0 + ggml_nbytes(tensor));
+    (void) ggml_sycl::mem_copy_async(dst_handle, dst_offset, src_handle, 0, ggml_nbytes(tensor), q);
+    return true;
+}
+
 // When reusing an executable SYCL command graph, the usual per-op pointer refresh
 // paths are not executed. We must explicitly refresh dynamic input tensors (e.g. tokens)
 // on device before replaying the graph.
@@ -98879,51 +99124,12 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
     sycl::queue & q = *ctx->stream();
 
     // Fast path: use pre-cached input tensor list; resolve pointers per replay.
-    auto refresh_input_tensor = [&](ggml_tensor * tensor) -> bool {
-        if (!tensor || !tensor->data) {
-            return false;
-        }
-        // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
-        // comment on graph_input_staging in common.hpp. The name check
-        // stays as a cheap pre-filter (an unnamed leaf was never staged).
-        if (tensor->name && tensor->name[0] != '\0' &&
-            ctx->graph_input_refresh(tensor, tensor->data, ggml_nbytes(tensor), q)) {
-            return true;
-        }
-        ggml_sycl_tensor_storage_handle dst_storage{};
-        ggml_sycl::mem_handle           dst_handle{};
-        size_t                          dst_offset = 0;
-        if (ggml_sycl_find_tensor_storage_handle(tensor, ctx->device, &dst_storage) && dst_storage.handle.valid()) {
-            const auto resolved = dst_storage.handle.resolve(ctx->device);
-            if (!resolved.ptr) {
-                GGML_ABORT("[SYCL-GRAPH] input tensor %s smart storage handle could not resolve on device %d",
-                           tensor->name ? tensor->name : "?", ctx->device);
-            }
-            void * dst_ptr = static_cast<char *>(resolved.ptr) + dst_storage.view_offset;
-            if (dst_ptr == tensor->data) {
-                return false;
-            }
-            dst_handle = dst_storage.handle;
-            dst_offset = dst_storage.view_offset;
-        } else {
-            void * resolved_ptr = ggml_sycl_resolve_tensor_ptr(tensor, ctx->device);
-            if (!resolved_ptr || resolved_ptr == tensor->data) {
-                return false;
-            }
-            dst_handle = ggml_sycl_copy_handle_for_raw_ptr(resolved_ptr, GGML_LAYOUT_AOS, ctx->device);
-        }
-        ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
-            tensor->data, GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, 0 + ggml_nbytes(tensor));
-        (void) ggml_sycl::mem_copy_async(dst_handle, dst_offset, src_handle, 0, ggml_nbytes(tensor), q);
-        return true;
-    };
-
     if (ctx->input_tensors_cached && !ctx->cached_input_tensors.empty()) {
         const size_t n          = ctx->cached_input_tensors.size();
         int          copy_count = 0;
         int          skip_count = 0;
         for (size_t idx = 0; idx < n; idx++) {
-            if (refresh_input_tensor(ctx->cached_input_tensors[idx])) {
+            if (graph_refresh_input_tensor(ctx, ctx->cached_input_tensors[idx], q)) {
                 copy_count++;
             } else {
                 skip_count++;
@@ -98997,8 +99203,8 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
 
     // llama.cpp-dyi3: the fast (already-cached) path below prints a
     // "refreshed N input tensors" summary every call; this first-call
-    // discovery path refreshes each tensor too (via refresh_input_tensor
-    // inline below) but previously had no matching summary, so a run whose
+    // discovery path refreshes each tensor too (via graph_refresh_input_tensor
+    // below) but previously had no matching summary, so a run whose
     // first replay-eligible call happened to take THIS path (e.g. right
     // after a re-record) looked like it never refreshed at all in the log.
     int  discover_copy_count = 0;
@@ -99028,7 +99234,7 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
 
         void * resolved_ptr = ggml_sycl_resolve_tensor_ptr(tensor, ctx->device);
         ctx->cached_input_tensors.push_back(tensor);
-        if (resolved_ptr && refresh_input_tensor(tensor)) {
+        if (resolved_ptr && graph_refresh_input_tensor(ctx, tensor, q)) {
             resolved_ptr = ggml_sycl_resolve_tensor_ptr(tensor, ctx->device);
             discover_copy_count++;
         } else {
