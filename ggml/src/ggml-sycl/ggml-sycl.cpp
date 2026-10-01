@@ -83697,6 +83697,24 @@ static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, 
     return ggml_sycl_dispatch_host_flash_attn_sync(ctx, dst);
 }
 
+// True exactly for the nodes the funnel intercepts and runs on the host: a
+// FLASH_ATTN_EXT whose K or V lives in the KV-host buft, and a SET_ROWS into a
+// KV-host dst, with GGML_SYCL_ATTN_HOST_DISPATCH on.  The funnel and supports_op call
+// it and neither re-derives it; a host-dispatched node's sources are read on the host,
+// so they are not staged for a device.
+static bool ggml_sycl_node_is_host_dispatched(const ggml_tensor * node) {
+    if (!node || !ggml_sycl_attn_host_dispatch_enabled()) {
+        return false;
+    }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        return ggml_sycl_tensor_is_in_kv_host_buft(node->src[1]) || ggml_sycl_tensor_is_in_kv_host_buft(node->src[2]);
+    }
+    if (node->op == GGML_OP_SET_ROWS) {
+        return ggml_sycl_tensor_is_in_kv_host_buft(node);
+    }
+    return false;
+}
+
 // True while the dense layer-block executor runs a node range on that range's
 // own device (llama.cpp-tf8m). Every operand of such a range was placed on, or
 // copied to, that device before the range started, so the per-op routes in
@@ -83724,16 +83742,14 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
     // persistent-TG, MoE-precomputed) calls ggml_sycl_compute_forward, so
     // intercepting here — rather than at each of its ~7 call sites — covers
     // all of them uniformly.
-    if (dst && dst->op == GGML_OP_FLASH_ATTN_EXT && ggml_sycl_attn_host_dispatch_enabled() &&
-        (ggml_sycl_tensor_is_in_kv_host_buft(dst->src[1]) || ggml_sycl_tensor_is_in_kv_host_buft(dst->src[2]))) {
+    if (dst && dst->op == GGML_OP_FLASH_ATTN_EXT && ggml_sycl_node_is_host_dispatched(dst)) {
         return ggml_sycl_dispatch_host_flash_attn(ctx, dst);
     }
 
     // TKV-13 step 5: the KV append for a demoted layer, kept inside the
     // SYCL graph by the matching supports_op acceptance and executed
     // host-side (see ggml_sycl_dispatch_host_set_rows_sync).
-    if (dst && dst->op == GGML_OP_SET_ROWS && ggml_sycl_attn_host_dispatch_enabled() &&
-        ggml_sycl_tensor_is_in_kv_host_buft(dst)) {
+    if (dst && dst->op == GGML_OP_SET_ROWS && ggml_sycl_node_is_host_dispatched(dst)) {
         return ggml_sycl_dispatch_host_set_rows_sync(ctx, dst);
     }
 
@@ -109402,7 +109418,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         // ggml_sycl_dispatch_host_set_rows_sync (host-side, in-place).
         // Every other dst-resident op kind keeps declining exactly as
         // before.
-        if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_attn_host_dispatch_enabled())) {
+        if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_node_is_host_dispatched(op))) {
             if (g_ggml_sycl_debug) {
                 g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
                 GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (dst): op=%s\n", ggml_op_name(op->op));
@@ -109440,9 +109456,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             // the dst, so a src-only match would be admitted to SYCL,
             // decline the intercept, and run the normal GPU kernel over
             // host KV -- the forbidden zero-copy, via predicate asymmetry.
-            if ((op->op == GGML_OP_FLASH_ATTN_EXT ||
-                 (op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
-                ggml_sycl_attn_host_dispatch_enabled()) {
+            if (ggml_sycl_node_is_host_dispatched(op)) {
                 if (g_ggml_sycl_debug) {
                     g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);
                     GGML_SYCL_DEBUG(
