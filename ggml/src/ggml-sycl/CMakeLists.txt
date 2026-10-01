@@ -1861,6 +1861,25 @@ set_tests_properties(sycl-kv-geometry-census PROPERTIES
     TIMEOUT 60
 )
 
+# Host-weight create-set record (llama.cpp-moua L4 1c; th32pre test 1r):
+# host-create-record.hpp is the one wire converter, the thread-local pending slot
+# and the stage-scoped holder. Header-only; it includes ggml-sycl.h for the wire
+# struct and nothing else, so the test needs no -fsycl and links nothing but
+# threads (the slot is per thread, and one arm checks that on a second thread).
+add_executable(test-host-create-record
+    tests/test-host-create-record.cpp
+)
+target_include_directories(test-host-create-record PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-host-create-record PRIVATE Threads::Threads)
+add_test(NAME sycl-host-create-record COMMAND test-host-create-record)
+set_tests_properties(sycl-host-create-record PROPERTIES
+    LABELS "sycl;memory;planner;tdd;hostonly"
+    TIMEOUT 60
+)
+
 # oneDNN PP placement answers (llama.cpp-1d0n): which devices may run oneDNN PP
 # on a multi-device plan, and whether the plan may add WOQ second copies; and
 # the admission predicate plus per-route batch floor (llama.cpp-je3b).

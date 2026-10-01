@@ -340,6 +340,21 @@ struct ggml_sycl_placement_envelope {
     int32_t  flash_attn_type;  // -1 = AUTO, 0 = DISABLED, 1 = ENABLED
 };
 
+// The host-resident weight create set (llama.cpp-moua L4, th32pre D-R8): per
+// tensor, the SYCL ordinal of the host buffer type it was created in and the
+// allocation size on that buffer type, in create order.  It is its own
+// size-prefixed struct, passed by pointer and never in an array, so a later
+// field is a new trailing member and a short or absent struct reads as ABSENT
+// rather than as stack garbage.  Zero-init means absent.  The two arrays are
+// parallel so a later field is a new array and never a changed stride.
+typedef struct ggml_sycl_host_create_record {
+    uint32_t         struct_size;  // sizeof(*this); FIRST.  Below the v1 size reads as ABSENT; above is read to v1
+    uint32_t         present;      // 1: published for this inventory (count may be 0); 0: absent
+    uint64_t         count;        // entries in both arrays
+    const int32_t *  device;       // [count] SYCL ordinal of the host buft each tensor was created in, create order
+    const uint64_t * alloc_bytes;  // [count] the tensor's allocation size on that buft, same order
+} ggml_sycl_host_create_record;
+
 // Set tensor inventory for tiered memory placement.
 // Must be called after model metadata parsing, before tensor allocation.
 // This enables automatic VRAM/host placement based on tensor priority.
