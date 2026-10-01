@@ -108209,30 +108209,58 @@ bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32
 
 // llama.cpp-38af: whether the CPU will execute any part of this model's graph,
 // read from the PUBLISHED placement plan -- the same authority supports_op
-// consults when it declines an op because its data is host-planned. Each clause
-// below is one of those declines: a dense layer planned on the host
-// (layer_device < 0, ggml_sycl_op_is_planned_on_host), a layer whose KV is
-// planned on the host (ggml_sycl_tensor_is_in_kv_host_buft), and an expert
-// tensor with NO expert on a device (ggml_sycl_moe_tensor_all_experts_on_host).
-// A partially-host expert tensor deliberately does not count: those experts run
-// in-backend through the CPU expert pool, never as a CPU split.
+// consults when it declines an op because its data is host-planned. The result
+// names the clause that fired (nullptr = none), and each clause is one of those
+// declines:
+//   "layer"   a dense layer planned on the host (layer_device < 0;
+//             ggml_sycl_op_is_planned_on_host's "layer_device<0").
+//   "kv"      a layer whose KV is planned on the host, using the plan's own
+//             host-KV accounting (kv_size_for_layer > 0 && no device owner, as
+//             refresh_kv_byte_totals counts it); a layer with no KV bytes (a
+//             recurrent or KV-less layer) owes nothing here
+//             (ggml_sycl_tensor_is_in_kv_host_buft).
+//   "dense"   a dense weight whose residency is host by supports_op's exact rule,
+//             ggml_sycl_get_planned_weight_residency (common.hpp): when the plan
+//             has a layer_device row for the weight's layer that row decides and
+//             the layer clause above has already covered it (so a stray
+//             off-device entry inside a device-planned layer is NOT CPU work);
+//             otherwise -- including every weight outside any layer, such as
+//             token_embd, output, output_norm, rope_freqs or gemma's
+//             per_layer_token_embd -- the entry decides: !on_device on one
+//             device, target_device < 0 on several.
+//   "experts" an expert tensor with NO expert on a device
+//             (ggml_sycl_moe_tensor_all_experts_on_host). A partially-host
+//             expert tensor deliberately does not count: those experts run
+//             in-backend through the CPU expert pool, never as a CPU split.
+//
+// The expert clause asks "any device" (expert_on_device with device -1), where
+// ggml_sycl_moe_tensor_all_experts_on_host asks one device at a time. They differ
+// only under GGML_SYCL_MOE_MULTI_GPU (opt-in), for a tensor whose experts all
+// sit on ANOTHER GPU: that device's supports_op declines, but the work goes to
+// the other GPU, not to the CPU, so this predicate -- which asks whether anything
+// is left for the CPU -- correctly stays false. A second asymmetry is
+// deliberate and the opposite way round: the plan only carries entries, so an
+// expert tensor with no entry at all is invisible here, whereas
+// all_experts_on_host reads "no entry" as "host" (expert_on_device is false for a
+// missing entry) once a plan exists. The plan builder emits an entry for every
+// expert of every tensor it places, so the case is not expected.
 //
 // llama-context uses this to decide whether the CPU backend's compute buffer
 // needs the dedicated activation buft (ggml_backend_sycl_cpu_activation_buffer_type):
 // with no CPU work every input is read out of SYCL_Host in place, and giving
 // that run split-copy names would only trip the replay-futility detector.
-static bool ggml_sycl_plan_has_cpu_work(const ggml_sycl::placement_plan & plan) {
+static const char * ggml_sycl_plan_cpu_work_reason(const ggml_sycl::placement_plan & plan) {
     for (const auto & [layer_id, layer_dev] : plan.layer_device) {
         GGML_UNUSED(layer_id);
         if (layer_dev < 0) {
-            return true;
+            return "layer";
         }
     }
 
     const size_t n_kv_layers = plan.kv_layer_count();
     for (uint32_t l = 0; l < n_kv_layers; ++l) {
         if (plan.kv_size_for_layer(l) > 0 && plan.get_kv_device(static_cast<int>(l)) < 0) {
-            return true;
+            return "kv";
         }
     }
 
@@ -108240,8 +108268,11 @@ static bool ggml_sycl_plan_has_cpu_work(const ggml_sycl::placement_plan & plan) 
     std::unordered_map<std::string, bool> expert_tensor_has_device_expert;
     for (const auto & e : plan.entries) {
         if (e.expert_id < 0) {
-            if (e.layer_id >= 0 && !e.on_device) {
-                return true;  // a dense block weight planned on the host
+            if (e.layer_id >= 0 && plan.layer_device.count(e.layer_id) != 0) {
+                continue;  // layer_device decides this layer's dense weights
+            }
+            if (plan.multi_device ? e.target_device < 0 : !e.on_device) {
+                return "dense";
             }
             continue;
         }
@@ -108251,13 +108282,21 @@ static bool ggml_sycl_plan_has_cpu_work(const ggml_sycl::placement_plan & plan) 
     for (const auto & [name, any_on_device] : expert_tensor_has_device_expert) {
         GGML_UNUSED(name);
         if (!any_on_device) {
-            return true;
+            return "experts";
         }
     }
 
-    return false;
+    return nullptr;
 }
 
+static bool ggml_sycl_plan_has_cpu_work(const ggml_sycl::placement_plan & plan) {
+    return ggml_sycl_plan_cpu_work_reason(plan) != nullptr;
+}
+
+// Same process-global limitation as ggml_backend_sycl_kv_layer_on_device_from_dev:
+// the plan is not per device, so a LATER model's publish is what an EARLIER
+// context's re-reserve reads. llama-context re-asks right before each scheduler
+// it builds; a context whose scheduler already exists keeps the answer it had.
 bool ggml_backend_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) {
@@ -108266,9 +108305,12 @@ bool ggml_backend_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);  // the placement plan is process-global, not per-device
     const auto snapshot = ggml_sycl_global_plan_snapshot();
     if (!snapshot || !snapshot->plan) {
+        GGML_LOG_INFO("[SYCL-CPU-ACT] plan CPU work: none (no active plan)\n");
         return false;
     }
-    return ggml_sycl_plan_has_cpu_work(*snapshot->plan);
+    const char * reason = ggml_sycl_plan_cpu_work_reason(*snapshot->plan);
+    GGML_LOG_INFO("[SYCL-CPU-ACT] plan CPU work: %s\n", reason ? reason : "none");
+    return reason != nullptr;
 }
 
 namespace ggml_sycl {

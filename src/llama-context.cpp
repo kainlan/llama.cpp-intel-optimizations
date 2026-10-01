@@ -459,11 +459,16 @@ static ggml_backend_buffer_type_t llama_context_cpu_compute_buft(const llama_mod
     if (auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev)) {
         buft = host_buft;
     }
-    if (llama_context_sycl_plan_has_cpu_work(dev.dev) || model.n_gpu_layers() <= model.hparams.n_layer_all) {
+    const bool plan_cpu_work   = llama_context_sycl_plan_has_cpu_work(dev.dev);
+    const bool partial_offload = model.n_gpu_layers() <= model.hparams.n_layer_all;
+    if (plan_cpu_work || partial_offload) {
         if (auto * activation_buft = llama_context_sycl_cpu_activation_buft(dev.dev)) {
             buft = activation_buft;
         }
     }
+    // One line per selection; the backend logs which plan clause fired just above it.
+    LLAMA_LOG_DEBUG("[SYCL-CPU-ACT] CPU compute buft '%s': plan_cpu_work=%d partial_offload=%d\n",
+                    ggml_backend_buft_name(buft), plan_cpu_work, partial_offload);
     return buft;
 }
 

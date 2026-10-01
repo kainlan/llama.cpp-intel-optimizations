@@ -50,7 +50,6 @@ BUFT_FN = "ggml_backend_sycl_cpu_activation_buffer_type"
 NAME_FN = BUFT_FN + "_name"
 PRED_FN = "ggml_backend_sycl_plan_has_cpu_work"
 PLAN_HELPER = "ggml_sycl_plan_cpu_work_reason"
-PLAN_BOOL = "ggml_sycl_plan_has_cpu_work"
 CTX_PRED = "llama_context_sycl_plan_has_cpu_work"
 CTX_SELECT = "llama_context_cpu_compute_buft"
 NEW_CALL = "ggml_backend_sched_new(backend_ptrs"
@@ -220,7 +219,7 @@ def check_vi_predicate_reads_the_plan(t):
     helper = t["plan_helper"]
     return (bool(wrapper) and bool(helper)
             and "ggml_sycl_global_plan_snapshot()" in wrapper
-            and PLAN_BOOL + "(" in wrapper
+            and PLAN_HELPER + "(" in wrapper
             and "[SYCL-CPU-ACT]" in wrapper     # which clause fired, for the -v log
             and "layer_device" in helper        # host-planned dense layer
             and "get_kv_device(" in helper      # host-planned KV
