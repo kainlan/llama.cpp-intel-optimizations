@@ -1,13 +1,20 @@
 #pragma once
 
-// The measured-tenant section of a context's published plan: the tenant
-// element, the cohort ids and their one static table, and the visitor contract
-// that fills the section while the measure pass walks a graph.
+// The measured-tenant section of a context's published plan: the cohort table
+// and the visitor contract that fill the section while the measure pass walks a
+// graph. The element and the cohort ids are in context-tenant-desc.h, a header
+// C can include, so the extern "C" backend header can name the element without
+// a second definition.
 //
-// The header includes only ggml.h, so a host test builds it without a device
-// and the llama side can read the element layout across the backend dlopen
-// boundary.
+// The tier, scope and lifetime of a cohort come from the table below; the zone
+// is added with the allocator's zone vocabulary, not here.
+//
+// This header names only ggml types, so a host test builds it without a device.
+// Its two functions are C++ and are not part of the backend's proc-address
+// surface; libggml-sycl exports them only because nothing hides symbols, and a
+// caller across the dlopen boundary needs a proc-address export first.
 
+#include "context-tenant-desc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 
@@ -15,29 +22,6 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-
-// One slot of the tenant section. Zone, lifetime, scope and tier are not
-// fields: the cohort table below is their only source, so each fact has one.
-// Fields are only appended, and a reader gates each element on struct_size.
-struct ggml_sycl_context_tenant_desc {
-    uint32_t struct_size;  // element stride gate, as for every section
-    uint32_t cohort;       // the cohort id; zone, lifetime, scope and tier are fixed per cohort
-    uint32_t slot_index;   // the claim index
-    int32_t  device;       // SYCL device index; -1 for the host-pinned tier
-    uint64_t slot_bytes;   // the slot's cap
-};
-
-// The cohorts this header registers. The value is the id carried in the
-// element, so it is append-only; the cohort's name (the `cohort=` text of an
-// allocation line) is in the table. Each further producer adds its rows here.
-enum ggml_sycl_context_cohort : uint32_t {
-    GGML_SYCL_CONTEXT_COHORT_COMPUTE           = 0,  // device compute chunk slots, index = chunk index
-    GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST      = 1,  // SYCL_Host compute chunk slots, device = -1
-    GGML_SYCL_CONTEXT_COHORT_FATTN_MATERIALIZE = 2,  // the fattn materialization slot, index 0
-    GGML_SYCL_CONTEXT_COHORT_NONFA_STAGE       = 3,  // batched-f16 src1 staging slots
-    GGML_SYCL_CONTEXT_COHORT_GRAPH_STAGE       = 4,  // staged graph sources, index = k-th staged source
-    GGML_SYCL_CONTEXT_COHORT_COUNT
-};
 
 enum ggml_sycl_context_cohort_tier {
     GGML_SYCL_CONTEXT_COHORT_TIER_DEVICE,       // a slot on the element's device

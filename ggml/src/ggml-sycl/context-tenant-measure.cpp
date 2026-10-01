@@ -43,10 +43,21 @@ void context_demand_accum::demand(const context_measure_view & view,
                                   uint32_t                     cohort,
                                   uint32_t                     slot_index,
                                   uint64_t                     bytes) {
-    if (ggml_sycl_context_cohort_lookup(cohort) == nullptr) {
+    const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(cohort);
+    if (info == nullptr) {
         char what[96];
         std::snprintf(what, sizeof(what), "demand for unknown cohort id %u", (unsigned) cohort);
         fail(what);
+        return;
+    }
+    // A device-tier slot on device -1 would read as a host-tier slot.
+    if (info->tier == GGML_SYCL_CONTEXT_COHORT_TIER_DEVICE && view.device < 0) {
+        fail(std::string("device-tier cohort ") + info->name + " demanded with a negative device");
+        return;
+    }
+    // A zero-byte demand (the fattn slot is 0 by default) records no element:
+    // an element is a slot to carve and to claim, and there is nothing to claim.
+    if (bytes == 0) {
         return;
     }
     const int32_t device = ggml_sycl_context_cohort_element_device(cohort, view.device);

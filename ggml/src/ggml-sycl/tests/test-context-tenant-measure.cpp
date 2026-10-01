@@ -63,6 +63,33 @@ int main() {
         CHECK(names.insert(info->name).second, "cohort names are unique");
         CHECK(info->scope == GGML_SYCL_CONTEXT_COHORT_SCOPE_CONTEXT, "every registered cohort is CONTEXT scope");
     }
+    // The table's content, literally: the ids are append-only ABI carried in
+    // published elements, and the names are the `cohort=` text the scorers grep.
+    {
+        struct expected_row {
+            uint32_t                      id;
+            const char *                  name;
+            ggml_sycl_context_cohort_tier tier;
+        };
+
+        const expected_row want[] = {
+            { 0, "context-compute",           GGML_SYCL_CONTEXT_COHORT_TIER_DEVICE      },
+            { 1, "context-compute-host",      GGML_SYCL_CONTEXT_COHORT_TIER_HOST_PINNED },
+            { 2, "context-fattn-materialize", GGML_SYCL_CONTEXT_COHORT_TIER_DEVICE      },
+            { 3, "context-nonfa-stage",       GGML_SYCL_CONTEXT_COHORT_TIER_DEVICE      },
+            { 4, "context-graph-stage",       GGML_SYCL_CONTEXT_COHORT_TIER_DEVICE      },
+        };
+        CHECK(sizeof(want) / sizeof(want[0]) == GGML_SYCL_CONTEXT_COHORT_COUNT, "the literal pin covers every cohort");
+        CHECK(GGML_SYCL_CONTEXT_COHORT_COMPUTE == 0 && GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST == 1 &&
+                  GGML_SYCL_CONTEXT_COHORT_FATTN_MATERIALIZE == 2 && GGML_SYCL_CONTEXT_COHORT_NONFA_STAGE == 3 &&
+                  GGML_SYCL_CONTEXT_COHORT_GRAPH_STAGE == 4,
+              "the numeric cohort ids are published ABI and must not move");
+        for (const expected_row & w : want) {
+            const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(w.id);
+            CHECK(info != nullptr && std::strcmp(info->name, w.name) == 0, "a cohort's name changed");
+            CHECK(info->tier == w.tier, "a cohort's tier changed");
+        }
+    }
     CHECK(ggml_sycl_context_cohort_lookup(GGML_SYCL_CONTEXT_COHORT_COUNT) == nullptr, "an unknown id has no row");
     CHECK(ggml_sycl_context_cohort_lookup(0xffffffffu) == nullptr, "a wild id has no row");
     CHECK(std::strcmp(ggml_sycl_context_cohort_lookup(GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST)->name,
@@ -108,6 +135,59 @@ int main() {
         }
     }
 
+    // Two device-tier cohorts at one (device, index) are two slots: the fattn
+    // slot 0 and compute chunk 0 of the same device must not merge, and they
+    // order by cohort id.
+    {
+        context_demand_accum acc;
+        context_measure_view view;
+        view.device = 1;
+        acc.demand(view, GGML_SYCL_CONTEXT_COHORT_FATTN_MATERIALIZE, 0, 11);
+        acc.demand(view, GGML_SYCL_CONTEXT_COHORT_COMPUTE, 0, 50);
+        const auto t = acc.tenants();
+        CHECK(acc.ok() && t.size() == 2, "two cohorts at one (device, index) are two elements");
+        CHECK(t[0].cohort == GGML_SYCL_CONTEXT_COHORT_COMPUTE && t[0].slot_bytes == 50,
+              "the lower cohort id sorts first and keeps its own bytes");
+        CHECK(t[1].cohort == GGML_SYCL_CONTEXT_COHORT_FATTN_MATERIALIZE && t[1].slot_bytes == 11,
+              "the higher cohort id sorts second and keeps its own bytes");
+    }
+
+    // A zero-byte demand records no element, whether or not the slot has one.
+    {
+        context_demand_accum acc;
+        context_measure_view view;
+        view.device = 0;
+        acc.demand(view, GGML_SYCL_CONTEXT_COHORT_FATTN_MATERIALIZE, 0, 0);
+        CHECK(acc.ok() && acc.tenants().empty(), "a zero-byte demand records no element");
+        acc.demand(view, GGML_SYCL_CONTEXT_COHORT_COMPUTE, 0, 8);
+        acc.demand(view, GGML_SYCL_CONTEXT_COHORT_COMPUTE, 0, 0);
+        const auto t = acc.tenants();
+        CHECK(t.size() == 1 && t[0].slot_bytes == 8, "a zero after a demand leaves the slot's maximum");
+    }
+
+    // A fresh accumulator is ok and empty.
+    {
+        context_demand_accum acc;
+        CHECK(acc.ok() && acc.error().empty() && acc.tenants().empty(), "a fresh accumulator is ok and empty");
+    }
+
+    // A device-tier cohort on a negative device would read as the host tier.
+    {
+        context_demand_accum acc;
+        context_measure_view view;
+        view.device = -1;
+        acc.demand(view, GGML_SYCL_CONTEXT_COHORT_COMPUTE, 0, 1);
+        CHECK(!acc.ok() && acc.error().find("negative device") != std::string::npos,
+              "a device-tier demand on a negative device is a named error");
+        CHECK(acc.tenants().empty(), "and carries no tenants");
+
+        // The host tier does not depend on the view's device.
+        context_demand_accum host;
+        host.demand(view, GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST, 0, 1);
+        CHECK(host.ok() && host.tenants().size() == 1 && host.tenants()[0].device == -1,
+              "a host-tier demand is device -1 whatever the view's device");
+    }
+
     // An error is named, the first one wins, and the section is empty.
     {
         context_demand_accum acc;
@@ -140,6 +220,11 @@ int main() {
         CHECK(g_visits == 2, "both visitors before the terminator ran, and none after it");
         CHECK(!acc.ok() && acc.error() == "leaf has no backend assignment",
               "a null backend assignment is a named error");
+
+        // A null table is a table with no visitors.
+        context_demand_accum none;
+        ggml_sycl::context_measure_visit(nullptr, &node, view, none);
+        CHECK(none.ok() && g_visits == 2, "a null visitor table runs nothing");
 
         // The registered table is terminated.
         const context_measure_visitor * t = ggml_sycl::context_measure_visitors();
