@@ -1644,6 +1644,14 @@ size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
 // unified_cache_get_planned_runtime_zone_requirement(). False on overflow (nothing published).
 bool   unified_cache_set_planned_mmq_src1_scratch(int device_id, size_t bytes_per_token, uint32_t n_ubatch);
 size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id);
+// llama.cpp-479i (A5): plan the per-context dense f16 dequant buffers (src0 copy + src1 copy) from
+// the inventory maxima (zone_scoped_maxima().dequant_f16_weight_bytes / _src1_bytes_per_token) at
+// n_ubatch. Folded into unified_cache_get_planned_runtime_zone_requirement(). False on overflow.
+bool   unified_cache_set_planned_dequant_f16_scratch(int      device_id,
+                                                     size_t   max_weight_bytes,
+                                                     size_t   src1_bytes_per_token,
+                                                     uint32_t n_ubatch);
+size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id);
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno

@@ -81,6 +81,13 @@ struct zone_tensor_desc {
     // ne[2] > 1: that is the expert predicate and it misclassifies dense 3-D
     // operands such as the MLA wk_b / wv_b (llama.cpp-8xbt).
     size_t mmq_src1_bytes_per_token = 0;
+
+    // dense f16 dequant scratch (llama.cpp-479i, A5): f16 bytes of the WHOLE dequantized weight a
+    // dense MUL_MAT's oneDNN arm materializes (zone_dequant_f16_weight_bytes(ne[0], ne[1])), and the
+    // f16 activation bytes per token it converts alongside (zone_dequant_f16_src1_bytes_per_token).
+    // Supplied by the adapter, which knows the type and the expert role; zero means "not a candidate".
+    size_t dequant_f16_weight_bytes         = 0;
+    size_t dequant_f16_src1_bytes_per_token = 0;
 };
 
 struct path_scoped_maxima {
@@ -113,6 +120,11 @@ struct path_scoped_maxima {
     // per-layer-family maximum: a singleton such as the LM head is a MUL_MAT src0
     // and counts. See zone_tensor_desc::mmq_src1_bytes_per_token.
     size_t mmq_src1_bytes_per_token = 0;
+
+    // Largest f16 dequant weight and widest f16 activation row over the adapter's marked
+    // candidates. Both are plain maxima over marked tensors, like mmq_src1_bytes_per_token.
+    size_t dequant_f16_weight_bytes         = 0;
+    size_t dequant_f16_src1_bytes_per_token = 0;
 };
 
 // A (type, ne) group must have at least this many members to be a per-layer
@@ -203,6 +215,33 @@ bool zone_mmq_src1_bytes_per_token(int64_t ne0, int64_t ne2, int64_t ne3, size_t
 // The plan figure: n_ubatch tokens of `bytes_per_token`, plus the overflow pad,
 // aligned up to 256. Zero when bytes_per_token is zero (no dense quantized operand).
 bool zone_mmq_src1_scratch_bytes(size_t bytes_per_token, uint32_t n_ubatch, size_t * out);
+
+// ---------------------------------------------------------------------------
+// dense f16 dequant scratch (llama.cpp-479i, A5)
+// ---------------------------------------------------------------------------
+//
+// ggml_sycl_op_mul_mat_sycl's f16 arm converts the WHOLE src0 weight and the src1 activations to f16
+// before the oneDNN GEMM, each into its own planned buffer. These mirror the dispatch's own arithmetic; the
+// backend static_asserts the element size against sizeof(sycl::half). Pure: no state, no log.
+constexpr size_t k_zone_dequant_f16_elem_bytes = 2;    // sizeof(sycl::half)
+constexpr size_t k_zone_dequant_f16_align      = 256;  // buffer and plan figures are 256-aligned
+
+// f16 bytes of a dequantized 2-D weight slice of ne0 x ne1. False on a non-positive extent or overflow.
+bool zone_dequant_f16_weight_bytes(int64_t ne0, int64_t ne1, size_t * out);
+
+// f16 activation bytes per token for a weight whose K is `ne0`, times ne2 * ne3 for a batched operand.
+bool zone_dequant_f16_src1_bytes_per_token(int64_t ne0, int64_t ne2, int64_t ne3, size_t * out);
+
+// Bytes of one buffer holding `elems` f16 elements (the src0 copy or the src1 copy of one op), rounded up
+// to the region alignment. `elems` is 0 for an operand that needs no copy. False on a negative count or overflow.
+bool zone_dequant_f16_region_bytes(int64_t elems, size_t * out);
+
+// The plan figure: the largest weight copy plus n_ubatch activation rows at the widest K, each buffer
+// aligned to 256 (the two buffers are planned together). Zero when there is no candidate.
+bool zone_dequant_f16_scratch_bytes(size_t   max_weight_bytes,
+                                    size_t   src1_bytes_per_token,
+                                    uint32_t n_ubatch,
+                                    size_t * out);
 
 // ---------------------------------------------------------------------------
 // Mispredict accounting

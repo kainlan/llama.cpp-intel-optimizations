@@ -139,7 +139,8 @@ assert CACHE.count("from_legacy_owned_alloc(") == 12
 assert CACHE.count("unified_allocate_owner(") == 10
 assert COMMON.count("unified_alloc(") == 4
 assert COMMON.count("from_legacy_owned_alloc(") == 4
-assert COMMON.count("unified_allocate_owner(") == 3
+# 3 -> 4: the dense f16 dequant scratch ensure_buffer (llama.cpp-479i, A5) is a second owner-first site.
+assert COMMON.count("unified_allocate_owner(") == 4
 assert COMMON_IMPL.count("unified_alloc(") == 8
 assert COMMON_IMPL.count("from_legacy_owned_alloc(") == 8
 assert COMMON_IMPL.count("unified_allocate_owner(") == 4

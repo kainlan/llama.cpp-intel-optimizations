@@ -182,6 +182,9 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
         // Not gated on a per-layer family or on the expert predicate: the adapter
         // already said whether this is a dense MUL_MAT operand (non-zero).
         maxima.mmq_src1_bytes_per_token = std::max(maxima.mmq_src1_bytes_per_token, tensor.mmq_src1_bytes_per_token);
+        maxima.dequant_f16_weight_bytes = std::max(maxima.dequant_f16_weight_bytes, tensor.dequant_f16_weight_bytes);
+        maxima.dequant_f16_src1_bytes_per_token =
+            std::max(maxima.dequant_f16_src1_bytes_per_token, tensor.dequant_f16_src1_bytes_per_token);
     }
     return maxima;
 }
@@ -242,6 +245,74 @@ bool zone_mmq_src1_scratch_bytes(size_t bytes_per_token, uint32_t n_ubatch, size
     }
     const size_t raw = bytes_per_token * n_ubatch + k_zone_mmq_src1_overflow_pad;
     *out             = (raw + k_zone_mmq_src1_align - 1) / k_zone_mmq_src1_align * k_zone_mmq_src1_align;
+    return true;
+}
+
+bool zone_dequant_f16_weight_bytes(int64_t ne0, int64_t ne1, size_t * out) {
+    if (!out || ne0 <= 0 || ne1 <= 0) {
+        return false;
+    }
+    const size_t cols = static_cast<size_t>(ne0);
+    const size_t rows = static_cast<size_t>(ne1);
+    if (cols > SIZE_MAX / rows || cols * rows > SIZE_MAX / k_zone_dequant_f16_elem_bytes) {
+        return false;
+    }
+    *out = cols * rows * k_zone_dequant_f16_elem_bytes;
+    return true;
+}
+
+bool zone_dequant_f16_src1_bytes_per_token(int64_t ne0, int64_t ne2, int64_t ne3, size_t * out) {
+    if (!out || ne0 <= 0 || ne2 <= 0 || ne3 <= 0) {
+        return false;
+    }
+    const size_t row   = static_cast<size_t>(ne0);
+    const size_t batch = static_cast<size_t>(ne2);
+    if (row > SIZE_MAX / batch || row * batch > SIZE_MAX / static_cast<size_t>(ne3) ||
+        row * batch * static_cast<size_t>(ne3) > SIZE_MAX / k_zone_dequant_f16_elem_bytes) {
+        return false;
+    }
+    *out = row * batch * static_cast<size_t>(ne3) * k_zone_dequant_f16_elem_bytes;
+    return true;
+}
+
+bool zone_dequant_f16_region_bytes(int64_t elems, size_t * out) {
+    if (!out || elems < 0) {
+        return false;
+    }
+    const size_t n = static_cast<size_t>(elems);
+    if (n > (SIZE_MAX - (k_zone_dequant_f16_align - 1)) / k_zone_dequant_f16_elem_bytes) {
+        return false;
+    }
+    const size_t raw = n * k_zone_dequant_f16_elem_bytes;
+    *out             = (raw + k_zone_dequant_f16_align - 1) / k_zone_dequant_f16_align * k_zone_dequant_f16_align;
+    return true;
+}
+
+bool zone_dequant_f16_scratch_bytes(size_t   max_weight_bytes,
+                                    size_t   src1_bytes_per_token,
+                                    uint32_t n_ubatch,
+                                    size_t * out) {
+    if (!out) {
+        return false;
+    }
+    if (max_weight_bytes == 0 && src1_bytes_per_token == 0) {
+        *out = 0;
+        return true;
+    }
+    const size_t align = k_zone_dequant_f16_align;
+    if (src1_bytes_per_token != 0 && n_ubatch != 0 && src1_bytes_per_token > (SIZE_MAX - (align - 1)) / n_ubatch) {
+        return false;
+    }
+    if (max_weight_bytes > SIZE_MAX - (align - 1)) {
+        return false;
+    }
+    const size_t weights  = (max_weight_bytes + align - 1) / align * align;
+    const size_t acts_raw = src1_bytes_per_token * n_ubatch;
+    const size_t acts     = (acts_raw + align - 1) / align * align;
+    if (weights > SIZE_MAX - acts) {
+        return false;
+    }
+    *out = weights + acts;
     return true;
 }
 
