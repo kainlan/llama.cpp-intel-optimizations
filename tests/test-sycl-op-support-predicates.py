@@ -52,9 +52,25 @@ def _evaluate_rope_predicate(expression: str, out_of_place: bool, contiguous: bo
     return bool(eval(python_expression, {"__builtins__": {}}, {}))
 
 
+# b10630 ggml_rope_set_offset: the kernels predate n_offs (op_params[15]), so the ROPE case opens with
+# a fail-closed refusal. It is an early `return false;`, so reading the case's FIRST return (as this gate
+# used to) yields the literal `false` rather than the view_src/contiguity predicate that follows it
+# (llama.cpp-6e08: ROPE support had not become false; the extractor latched onto the wrong statement).
+ROPE_N_OFFS_GUARD = re.compile(
+    r"if\s*\(\s*\(\(const\s+int32_t\s*\*\)\s*op->op_params\)\[15\]\s*!=\s*0\s*\)\s*\{\s*return\s+false\s*;\s*\}"
+)
+
+
+def _rope_case_without_n_offs_guard(case: str) -> str:
+    code = re.sub(r"//[^\n]*", "", case)
+    assert ROPE_N_OFFS_GUARD.search(code), "ROPE case lost its n_offs fail-closed guard"
+    # The remainder is a single `return <predicate>;`, which is what the rest of this contract evaluates.
+    return ROPE_N_OFFS_GUARD.sub("", code, count=1)
+
+
 def _assert_rope_contract(full_source: str) -> None:
     source = _supports_source(full_source)
-    rope_expression = _normalized_return(_case(source, "ROPE", "IM2COL"))
+    rope_expression = _normalized_return(_rope_case_without_n_offs_guard(_case(source, "ROPE", "IM2COL")))
     for out_of_place in (False, True):
         for contiguous in (False, True):
             actual = _evaluate_rope_predicate(rope_expression, out_of_place, contiguous)
@@ -81,6 +97,7 @@ def _assert_rope_inventory_contract(inventory: str) -> None:
     parsed_views = []
     parsed_offset_views = []
     skipped_non_inplace = 0
+    skipped_real_model = 0
     for row in discovered_rows:
         # original inplace rows: (..., ff, <v>, true, true)
         match = re.search(r"ff,\s*([-+]?\d+)\s*,\s*true\s*,\s*true\s*$", row)
@@ -99,8 +116,14 @@ def _assert_rope_inventory_contract(inventory: str) -> None:
         if re.search(r",\s*(?:fw|false|true)\s*,\s*false\s*,\s*\d+\s*$", row):
             skipped_non_inplace += 1
             continue
+        # Upstream real-model RoPE rows (hexagon #28628, merged 2026-09-09): literal bool ff, then
+        # (v, forward) and no inplace argument, so they default to out-of-place like the offset rows.
+        if re.search(r",\s*(?:false|true)\s*,\s*\d+\s*,\s*true\s*$", row):
+            skipped_real_model += 1
+            continue
         raise AssertionError(f"unparsed inplace ROPE inventory row: {row!r}")
-    assert len(parsed_views) + len(parsed_offset_views) + skipped_non_inplace == len(discovered_rows)
+    assert (len(parsed_views) + len(parsed_offset_views) + skipped_non_inplace + skipped_real_model ==
+            len(discovered_rows))
 
     assert types == ["GGML_TYPE_F32", "GGML_TYPE_F16"]
     assert modes == [
@@ -116,6 +139,8 @@ def _assert_rope_inventory_contract(inventory: str) -> None:
     # plus one inplace-with-offset row (view 0), all inside the same window.
     assert parsed_offset_views == [0]
     assert skipped_non_inplace == 4
+    # qwen3.5 0.8B/4B and gemma4 E2B/E4B shapes: out-of-place, outside this inplace contract.
+    assert skipped_real_model == 4
 
     multiplicity = len(types) * len(modes) * len(factors)
     decisions = [view == 0 for view in parsed_views for _ in range(multiplicity)]
@@ -407,11 +432,11 @@ def test_review_mutations_are_detected() -> None:
     rope_start = full_support.index("case GGML_OP_ROPE:", support_start)
     rope_end = full_support.index("case GGML_OP_IM2COL:", rope_start)
     rope_case = full_support[rope_start:rope_end]
-    for old, new in ((" == nullptr", " != nullptr"), (" || ", " && ")):
+    for old, new in ((" == nullptr", " != nullptr"), (" || ", " && "), ("[15] != 0", "[15] == 0")):
         assert old in rope_case
         mutated_case = rope_case.replace(old, new, 1)
         mutated_source = full_support[:rope_start] + mutated_case + full_support[rope_end:]
-        assert _contract_rejects(_assert_rope_contract, mutated_source)
+        assert _contract_rejects(_assert_rope_contract, mutated_source), old
 
     inventory = BACKEND_OPS_SOURCE.read_text(encoding="utf-8")
     inventory_start = inventory.index("// single inplace test per type/mode/ff")
