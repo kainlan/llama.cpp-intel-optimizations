@@ -64123,6 +64123,18 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // Determine the data layout: use forced_layout from mul_mat_id if provided,
         // else check src0->extra->layout.mode, else default to AOS.
         ggml_sycl_unified::LayoutMode data_layout = ggml_sycl_unified::LayoutMode::AOS;
+        if (forced_layout && !moe_mmvq_mxfp4_direct_reads_layout(*forced_layout)) {
+            // The switch below would map this layout onto AOS (its default arm) and the
+            // reconcile guard further down compares stored against ADVERTISED, so a
+            // tensor stored in this layout passes it -- and is then decoded as AOS:
+            // deterministic garbage (llama.cpp-4hg7, xmx_tiled hybrid expert). The
+            // kernels here do not decode it, so refuse. A crash is strictly better
+            // than wrong tokens; the fix for a missing kernel is the kernel.
+            GGML_ABORT(
+                "[MXFP4-DIRECT] %s: no decode for advertised layout=%s on this path -- refusing instead of "
+                "reading it as AOS (support gap; llama.cpp-4hg7)",
+                src0->name ? src0->name : "(null)", ggml_sycl_layout_mode_name(*forced_layout));
+        }
         if (forced_layout) {
             switch (*forced_layout) {
                 case GGML_LAYOUT_AOS:

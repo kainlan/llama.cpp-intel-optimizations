@@ -102,6 +102,29 @@ inline bool moe_mmvq_pair_glu_dispatch_supports_layout(enum ggml_type type, enum
     return layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_XMX_TILED_BUNDLE4;
 }
 
+// Whether the grouped MXFP4 XMX_TILED executor in mmvq_moe_batched_dispatch() can take a
+// route whose device entries cover n_gpu_entries slots.
+//
+// It always could for FULL cover. It must also for PARTIAL cover: a hybrid decode
+// (some experts device-resident, the rest on the host) routes the device slots here
+// and the host slots to the CPU arm, whose scatter writes them afterwards. The kernel is
+// driven by the per-slot route arrays (expert id, token, slot), so it needs no
+// all-slots cover -- only that those arrays exist when cover is partial. Refusing
+// partial cover sent the op to a per-expert fallback that did not read this layout
+// at all (llama.cpp-4hg7): a support gap closed here rather than routed around.
+inline bool moe_mmvq_xmx_tiled_grouped_accepts_cover(bool full_cover, int n_gpu_entries, bool route_arrays_present) {
+    return n_gpu_entries > 0 && (full_cover || route_arrays_present);
+}
+
+// Layouts the per-expert MXFP4 "direct" dispatch in ggml_sycl_mul_mat can read from the
+// bytes it is handed. Its kernels decode exactly these three; every other layout
+// (XMX_TILED, XMX_TILED_BUNDLE4, MXFP4_I8, MXFP4_DPAS, ...) is a different byte format and
+// reading it as one of these is garbage from the first element out. A caller handed any
+// other layout must refuse, never map it onto AOS (llama.cpp-4hg7).
+inline bool moe_mmvq_mxfp4_direct_reads_layout(enum ggml_layout_mode layout) {
+    return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED;
+}
+
 inline bool moe_mmvq_any_dispatch_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     return moe_mmvq_batched_dispatch_supports_layout(type, layout) ||
            moe_mmvq_pair_glu_dispatch_supports_layout(type, layout);

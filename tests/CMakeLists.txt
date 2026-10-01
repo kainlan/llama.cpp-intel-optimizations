@@ -710,6 +710,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-activation-row-source.py --self-test)
     set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+    # A hybrid MXFP4 xmx_tiled expert must be decoded by a kernel that reads
+    # xmx_tiled: the grouped executor accepts partial cover, and the per-expert
+    # direct path refuses layouts it cannot decode (llama.cpp-4hg7). WITH --self-test.
+    add_test(NAME test-sycl-xmx-tiled-partial-cover-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-xmx-tiled-partial-cover-source.py --self-test)
+    set_tests_properties(test-sycl-xmx-tiled-partial-cover-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
     # A MoE host-expert dispatch must bridge a storage-handle miss, not kill the
     # graph (llama.cpp-srti). Also runs WITH --self-test: the per-site checks are
     # anchored on refusal-message text, so a renamed site would silently stop
