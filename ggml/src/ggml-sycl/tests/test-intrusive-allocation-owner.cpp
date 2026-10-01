@@ -492,6 +492,124 @@ void failure_accounting_and_metadata_nonownership() {
 } // namespace
 
 static_assert(std::is_copy_constructible_v<alloc_metadata>);
+// H12 (design 4.5a): mem_handle::owner_use_count() is an exact, non-destructive snapshot of the references that share one
+// handle's intrusive owner. A copy, a copy-assignment and a slice each count; a moved-from handle reports 0, and so does a
+// handle with no intrusive owner. Reading it releases nothing.
+void owner_use_count_has_no_owner_zero() {
+    mem_handle empty{};
+    check(empty.owner_use_count() == 0, "a default mem_handle reported a nonzero owner count");
+    char storage[256];
+    mem_handle direct = mem_handle::from_direct(storage, GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE, sizeof(storage));
+    check(direct.valid() && !direct.owns_allocation(), "bounded from_direct fixture is not ownerless");
+    check(direct.owner_use_count() == 0, "an ownerless bounded from_direct handle reported a nonzero owner count");
+    std::cout << "PASS owner-use-count-no-owner-is-zero\n";
+}
+
+void owner_use_count_counts_every_reference_exactly() {
+    fake_release_backend backend;
+    auto fixture = make_owner(backend, 30);
+    mem_handle root = mem_handle::from_owned_alloc(std::move(fixture.result.owner));
+    auto stable = [&](const mem_handle & h, uint32_t want, const char * what) {
+        for (int i = 0; i < 1000; ++i) {
+            if (h.owner_use_count() != want) fail(what);
+        }
+        check(backend.attempts == 0, "reading owner_use_count released the allocation");
+    };
+    stable(root, 1, "root from_owned_alloc is not 1");
+    mem_handle copy(root);
+    stable(root, 2, "a copy did not raise the root to 2");
+    stable(copy, 2, "a copy did not report 2");
+    mem_handle assigned;
+    assigned = root;
+    stable(root, 3, "a copy-assignment did not raise the root to 3");
+    mem_handle slice = copy.slice(32, 64);
+    check(slice.valid(), "slice fixture is invalid");
+    stable(root, 4, "a slice is a counted reference, not a free view");
+    stable(slice, 4, "a slice did not report the shared count");
+    mem_handle moved(std::move(slice));
+    stable(root, 4, "a move-construct changed the count");
+    stable(moved, 4, "a move-construct target did not report 4");
+    check(slice.owner_use_count() == 0, "a moved-from handle did not report 0");
+    root = mem_handle{};
+    stable(copy, 3, "resetting the root did not drop the count to 3");
+    check(root.owner_use_count() == 0, "a reset handle did not report 0");
+    moved = mem_handle{};
+    assigned = mem_handle{};
+    stable(copy, 1, "dropping to the last reference did not leave 1");
+    check(backend.attempts == 0, "dropping to one reference released early");
+    copy = mem_handle{};
+    check(backend.attempts == 1 && backend.releases == 1, "the last drop was not the one release");
+    std::cout << "PASS owner-use-count-counts-copies-slices-moves\n"
+                 "PASS owner-use-count-read-is-non-destructive\n"
+                 "PASS owner-use-count-last-drop-is-the-only-release\n";
+}
+
+void owner_use_count_acquire_orders_a_dropped_copy() {
+    fake_release_backend backend;
+    auto fixture = make_owner(backend, 31);
+    mem_handle root = mem_handle::from_owned_alloc(std::move(fixture.result.owner));
+    int plain = 0;
+    std::atomic<bool> go{false};
+    std::thread worker([copy = root, &plain, &go]() mutable {
+        while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+        plain = 42;
+        copy = mem_handle{};
+    });
+    while (root.owner_use_count() != 2) std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    while (root.owner_use_count() != 1) std::this_thread::yield();
+    check(plain == 42, "a reader that saw the count drop did not see the dropped copy's writes");
+    worker.join();
+    root = mem_handle{};
+    check(backend.attempts == 1 && backend.releases == 1, "ordering fixture released other than exactly once");
+    std::cout << "PASS owner-use-count-acquire-ordering\n";
+}
+
+void owner_use_count_concurrent_readers_and_copiers() {
+    fake_release_backend backend;
+    auto fixture = make_owner(backend, 32);
+    mem_handle root = mem_handle::from_owned_alloc(std::move(fixture.result.owner));
+    constexpr int thread_count = 16;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<bool> bad{false};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < thread_count; ++i) {
+        threads.emplace_back([own = root, &ready, &go, &bad]() mutable {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int k = 0; k < 2000; ++k) {
+                mem_handle again(own);
+                if (own.owner_use_count() < 1 || again.owner_use_count() < 1) bad.store(true);
+            }
+        });
+    }
+    mem_handle shared_object;
+    std::atomic<bool> stop{false};
+    std::thread assigner([&] {
+        while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+        for (int k = 0; k < 2000; ++k) {
+            mem_handle fresh(root);
+            shared_object = fresh;
+        }
+        stop.store(true, std::memory_order_release);
+    });
+    while (ready.load(std::memory_order_acquire) != thread_count) std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    while (!stop.load(std::memory_order_acquire)) {
+        // root + 16 workers' copies + 16 transient copies + the assigner's fresh + the shared object is the most that can be live
+        if (shared_object.owner_use_count() > 1 + 2 * thread_count + 2) bad.store(true);
+    }
+    assigner.join();
+    for (auto & t : threads) t.join();
+    check(!bad.load(), "a reader that holds a reference saw a count below 1");
+    shared_object = mem_handle{};
+    check(root.owner_use_count() == 1 && backend.attempts == 0, "concurrent copiers left the count off 1 or released early");
+    root = mem_handle{};
+    check(backend.attempts == 1 && backend.releases == 1, "concurrent copiers broke exactly-once release");
+    std::cout << "PASS owner-use-count-concurrent-readers-and-copiers\n";
+}
+
 static_assert(std::is_trivially_destructible_v<alloc_metadata>);
 static_assert(!std::is_constructible_v<alloc_owner, alloc_metadata>);
 static_assert(!std::is_constructible_v<shared_alloc_owner, alloc_metadata>);
@@ -515,6 +633,10 @@ int main() {
     in_flight_promotion_cleanup_pending_survives_rollback();
     promotion_cleanup_retry_visits_all_snapshot_rows();
     invalid_request_has_zero_coordinator_census();
+    owner_use_count_has_no_owner_zero();
+    owner_use_count_counts_every_reference_exactly();
+    owner_use_count_acquire_orders_a_dropped_copy();
+    owner_use_count_concurrent_readers_and_copiers();
     std::cout << "intrusive allocation owner deterministic runtime tests: PASS\n";
     return 0;
 }
