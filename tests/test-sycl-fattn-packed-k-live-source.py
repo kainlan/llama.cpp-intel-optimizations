@@ -35,9 +35,9 @@ GUARD = 'if (GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT GGML_BACKEND_DL)'
 def production_contract(
         fattn: str, xmx: str, fattn_hpp: str = FATTN_HPP, mem_ops: str = MEM_OPS) -> bool:
     fattn_needles = (
-        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-before-initial-fill")',
-        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
-        'ggml_sycl_fattn_xmx_test_failpoint("materializer-zero-to-pack")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-before-initial-fill")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-zero-to-update")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("materializer-zero-to-pack")',
         "zero_deps.push_back(previous_use)",
         "out->ready_event = zero_event",
         "out->ready_event = pack_event",
@@ -45,8 +45,8 @@ def production_contract(
         "            });\n    });\n    // Publish accepted work",
         "            });\n        });\n        const uint64_t host_submit_end_us",
         "*accepted_event = event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("sidecar-update")',
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("materializer-pack")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("sidecar-update")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("materializer-pack")',
         "host_submit_begin_us",
         "host_submit_end_us",
         "ggml_sycl_kernel_profile_record_event(",
@@ -65,15 +65,15 @@ def production_contract(
         "const int64_t packed_batch_stride = static_cast<int64_t>(head_count) * packed_head_stride",
     )
     xmx_needles = (
-        'ggml_sycl_fattn_xmx_test_failpoint("packed-first-to-merge")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("packed-first-to-merge")',
         "cgh.depends_on(packed_ready_event)",
         "sycl::event first_event = stream->submit",
         "*packed_k_ready_event = first_event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-first")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("packed-first")',
         "cgh.depends_on(first_event)",
         "sycl::event merge_event = stream->submit",
         "*packed_k_ready_event = merge_event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-merge")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("packed-merge")',
         "static bool launch_fattn_xmx_v2_decode_gqa_split_packed_impl",
         "packed_k == nullptr || packed_k->device != ctx.device",
         "const ggml_sycl::resolved_ptr resolved = packed_k->handle.resolve(ctx.device)",
@@ -124,7 +124,7 @@ def mem_fill_attribution_contract(mem_ops: str) -> bool:
     try:
         return (
             direct.index("sycl::event event = queue.submit") <
-            direct.index("mem_fill_test_profile_error_after_submit();") <
+            direct.index("GGML_SYCL_MEM_FILL_TEST_CHECK();") <
             direct.index("return event;") and
             submit.index("mem_fill_direct_submit") <
             submit.index("retain_handles_until_event({ h }, event, std::move(publish_ticket))") <
@@ -418,7 +418,10 @@ def overlap_v_write_contract(source: str) -> bool:
 
 def live_contract(source: str) -> bool:
     required = (
-        "SKIP_UNSUPPORTED = 77",
+        # fbcb86b94 (llama.cpp-g290) replaced the file-local `SKIP_UNSUPPORTED = 77` with the single shared
+        # definition; score the include and the use. The 77 itself is pinned by the CMake SKIP_RETURN_CODE check.
+        '#include "../../../../tests/test-skip.h"',
+        "return LLAMA_TEST_EXIT_SKIP;",
         "sycl::device::get_devices(sycl::info::device_type::gpu)",
         "dev.get_backend() != sycl::backend::ext_oneapi_level_zero",
         "dev.has(sycl::aspect::fp16)",
@@ -531,17 +534,25 @@ def cmake_contract(source: str) -> bool:
     block = guarded_cmake_block(source)
     if block is None:
         return False
+    # Whitespace-normalised: the link line is wrapped across lines now, and a literal needle for it is a
+    # formatting hostage. It links the private-fixtures target (dd880f9ee, "isolate core mutable test
+    # seams") rather than ggml-base/ggml/ggml-sycl directly, plus the Level Zero loader the test needs.
+    block = " ".join(block.split())
     required = (
         "add_executable(test-fattn-packed-k-lifecycle",
         "tests/test-fattn-packed-k-lifecycle.cpp",
-        "target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE ggml-base ggml ggml-sycl ${LEVEL_ZERO_LOADER})",
+        "target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE ggml-sycl-private-fixtures ${LEVEL_ZERO_LOADER})",
         "foreach(_packed_k_checkpoint IN ITEMS",
         "COMMAND test-fattn-packed-k-lifecycle --checkpoint ${_packed_k_checkpoint}",
         "ONEAPI_DEVICE_SELECTOR=level_zero:1",
         "SKIP_RETURN_CODE 77",
     )
+    # The guard must close right after the registration loop. Without this, deleting that `endif()` leaves
+    # the guard open and guarded_cmake_block() runs on to whichever later `endif()` balances the count, so
+    # every needle above is still found in an over-long block and the mutation survives.
     return (all(needle in block for needle in required) and
             all(cp in block for cp in CHECKPOINTS) and
+            block.endswith("endforeach() endif()") and
             source.count("find_library(LEVEL_ZERO_LOADER") == 1)
 
 
@@ -619,8 +630,8 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         "            });\n    });\n    // Publish accepted work",
         "            });\n        });\n        const uint64_t host_submit_end_us",
         "*accepted_event = event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("sidecar-update")',
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("materializer-pack")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("sidecar-update")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("materializer-pack")',
         "const int n_partitions = ggml_sycl_fattn_xmx_packed_k_n_blocks(params.ne11);\n"
         "                            const int selected_tk",
         "host_submit_begin_us",
@@ -693,11 +704,11 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         "cgh.depends_on(packed_ready_event)",
         "sycl::event first_event = stream->submit",
         "*packed_k_ready_event = first_event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-first")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("packed-first")',
         "cgh.depends_on(first_event)",
         "sycl::event merge_event = stream->submit",
         "*packed_k_ready_event = merge_event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-merge")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("packed-merge")',
         "packed_k->ready_event = merge_event",
         "first_submit_begin_us",
         "first_submit_end_us",
