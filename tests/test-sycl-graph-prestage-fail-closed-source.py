@@ -255,6 +255,8 @@ if args.self_test:
     ref_sig = r"static void graph_refresh_input_tensors\([^)]*\)\s*\{"
     dec_sig = r"static bool graph_prestage_or_decline\([^)]*\)\s*\{"
     cmp_sig = r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{"
+    # the first full-graph recording site (the debug line just above it is the anchor)
+    full_sig = r"Pre-staging leaf tensors before recording[^;]*;"
     mem_ = memo_hdr
     mutants = [
         ("flag-only INPUT test in pre-stage", "pre-stage has no flag-only INPUT test left",
@@ -288,10 +290,10 @@ if args.self_test:
          (mutate_in_func(backend, dec_sig, "prestage_decline_memo.forget(graph_hash)", "(void) graph_hash"),
           common, mem_)),
         ("recording site loses its decline", "every full-graph recording is preceded by a pre-stage that can decline it",
-         (mutate_in_func(backend, cmp_sig, "graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)",
+         (mutate_in_func(backend, full_sig, "graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)",
                          "graph_prestage_leaf_tensors(sycl_ctx, cgraph)"), common, mem_)),
         ("decline does not leave", "every full-graph recording is preceded by a pre-stage that can decline it",
-         (mutate_in_func(backend, cmp_sig, "graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)",
+         (mutate_in_func(backend, full_sig, "graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)",
                          "graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash) || true"), common, mem_)),
         ("block graphlets pre-stage as a statement",
          "no code pre-stages as a statement: graph_prestage_or_decline is the only caller of the pre-stage",

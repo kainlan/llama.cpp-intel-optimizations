@@ -419,9 +419,10 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-concat-no-host-wait-source.py
             --self-test)
     set_tests_properties(sycl-concat-no-host-wait-source PROPERTIES LABELS "sycl;graph;host;source-contract")
-    # llama.cpp-qhfp review fold: the graph input pre-stage fails closed (a pre-stage failure declines the
-    # recording before it starts) and treats a view of an INPUT as that input. --self-test: the flag-only and
-    # swallowed-failure checks are absence-based.
+    # llama.cpp-qhfp: a recorded graph must not read a host-resident input, so every recorder (full graph, dense
+    # split, MoE block graphlets, MoE segments) declines to record or replay when the input pre-stage fails, and a
+    # view of an INPUT counts as that input. --self-test: the flag-only, swallowed-failure and statement-form
+    # pre-stage checks are absence-based.
     add_test(NAME sycl-graph-prestage-fail-closed-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-prestage-fail-closed-source.py
             --self-test)
@@ -5351,6 +5352,18 @@ add_executable(test-graph-safe-memcpy-width
 target_include_directories(test-graph-safe-memcpy-width PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME graph-safe-memcpy-width COMMAND test-graph-safe-memcpy-width)
 set_tests_properties(graph-safe-memcpy-width PROPERTIES
+    LABELS "sycl;graph;host;tdd"
+    TIMEOUT 60
+)
+
+# Test: per-context memo of declined graph signatures (llama.cpp-qhfp). Host-only, same arrangement as
+# test-graph-safe-memcpy-width above: graph-prestage-decline-memo.hpp is pure C++.
+add_executable(test-graph-prestage-decline-memo
+    tests/test-graph-prestage-decline-memo.cpp
+)
+target_include_directories(test-graph-prestage-decline-memo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME graph-prestage-decline-memo COMMAND test-graph-prestage-decline-memo)
+set_tests_properties(graph-prestage-decline-memo PROPERTIES
     LABELS "sycl;graph;host;tdd"
     TIMEOUT 60
 )
