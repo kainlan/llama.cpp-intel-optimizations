@@ -2802,6 +2802,37 @@ set_tests_properties(test-sycl-retained-reap PROPERTIES
     TIMEOUT 120
 )
 
+# Test: the host pool's inference-phase gate (grow_zone, grow_into) skips only
+# for a TRANSACTION-kind L0 token, and its warning names the calling site. A real
+# pinned_chunk_pool on the OpenCL CPU device with 1 MB chunks, so the selector is
+# pinned to it: no GPU. The assert-mode arms re-exec the binary.
+add_executable(test-sycl-pool-phase-gate
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pool-phase-gate.cpp
+)
+target_include_directories(test-sycl-pool-phase-gate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-pool-phase-gate PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-pool-phase-gate PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-pool-phase-gate PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-pool-phase-gate PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-pool-phase-gate PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-pool-phase-gate COMMAND test-sycl-pool-phase-gate)
+set_tests_properties(test-sycl-pool-phase-gate PROPERTIES
+    LABELS "sycl;handle;hostonly;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 # Test: L0, the re-plan transaction mutex, and the always-compiled witness
 # (ggml_sycl_replan_token, ggml_sycl_replan_token_held, GGML_SYCL_WITNESS).
 # The real objects of unified-cache.cpp in the private carrier: nesting, kinds,
