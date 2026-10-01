@@ -16,7 +16,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-#include "get-rows-q4-k.hpp"
+#include "get-rows-kquant.hpp"
 #include "get-rows-support.hpp"
 #include "ggml.h"
 
@@ -99,9 +99,9 @@ int main() {
         }
         uint8_t d = 0;
         uint8_t m = 0;
-        ggml_sycl_get_rows_q4_k_scale_min(1, scales, d, m);
+        ggml_sycl_kquant_scale_min_k4(1, scales, d, m);
         CHECK(d == (scales[1] & 63) && m == (scales[5] & 63), "scale/min for j < 4");
-        ggml_sycl_get_rows_q4_k_scale_min(6, scales, d, m);
+        ggml_sycl_kquant_scale_min_k4(6, scales, d, m);
         CHECK(d == ((scales[10] & 0xF) | ((scales[2] >> 6) << 4)) && m == ((scales[10] >> 4) | ((scales[6] >> 6) << 4)),
               "scale/min for j >= 4");
     }
@@ -111,6 +111,14 @@ int main() {
     CHECK(ggml_sycl_get_rows_type_supported(GGML_TYPE_Q4_0), "Q4_0 stays admitted");
     CHECK(ggml_sycl_get_rows_type_supported(GGML_TYPE_Q6_K), "Q6_K stays admitted");
     CHECK(ggml_sycl_get_rows_type_supported(GGML_TYPE_F16), "F16 stays admitted");
+    // (type, layout): the Q4_K kernel reads AoS blocks only, so the pair for any other layout is declined.
+    CHECK(ggml_sycl_get_rows_layout_supported(GGML_TYPE_Q4_K, GGML_LAYOUT_AOS), "Q4_K AoS is a supported pair");
+    CHECK(!ggml_sycl_get_rows_layout_supported(GGML_TYPE_Q4_K, GGML_LAYOUT_SOA), "Q4_K SoA is declined");
+    CHECK(!ggml_sycl_get_rows_layout_supported(GGML_TYPE_Q4_K, GGML_LAYOUT_COALESCED), "Q4_K coalesced is declined");
+    CHECK(ggml_sycl_get_rows_layout_supported(GGML_TYPE_Q6_K, GGML_LAYOUT_SOA), "Q6_K keeps its SoA kernel");
+    CHECK(ggml_sycl_get_rows_layout_supported(GGML_TYPE_Q4_0, GGML_LAYOUT_COALESCED),
+          "Q4_0 keeps its coalesced kernel");
+
     CHECK(!ggml_sycl_get_rows_type_supported(GGML_TYPE_Q3_K), "Q3_K has no kernel and is not admitted");
     CHECK(!ggml_sycl_get_rows_type_supported(GGML_TYPE_IQ4_NL), "IQ4_NL has no kernel and is not admitted");
 

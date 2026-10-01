@@ -18,12 +18,16 @@ a Q4_K arm in ggml_sycl_op_get_rows. Embedding tables are materialised AoS (the 
 EMBEDDING rule), and the arm refuses any other layout instead of reading it as AoS.
 
 Pinned here:
-  * supports_op asks the shared predicate (get-rows-support.hpp) and keeps no private type list;
+  * supports_op asks the shared predicates (get-rows-support.hpp) and keeps no private type list;
   * the predicate admits Q4_K, and every type it admits has an arm in ggml_sycl_op_get_rows
     (admitting a type nothing computes is the worse failure);
-  * the Q4_K arm refuses a non-AoS layout before it launches, and the streamed-slice dispatcher
-    has the arm too;
-  * the kernel decodes through the shared element function the host test checks against ggml.
+  * (type, layout) pairs: Q4_K is admitted for the AoS layout only, and supports_op asks it with the
+    layout the placement plan actually materialises the weight in, so a pair no kernel covers is
+    declined before placement routes it. The dispatch arm asks the same predicate; its abort is a
+    backstop for a pair supports_op already refused, never the way a pair is declined;
+  * the streamed-slice dispatcher has the arm too;
+  * the kernel decodes through the K-quant element function the host test checks against ggml, which
+    unpacks scales through the one shared scale/min helper (Q5_K reuses it).
 
 Run with --self-test to prove every check fires against a mutant of the thing it forbids; a check
 that cannot fail is decoration.
@@ -40,6 +44,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--getrows", default=str(sycl / "getrows.cpp"))
 parser.add_argument("--support", default=str(sycl / "get-rows-support.hpp"))
+parser.add_argument("--kquant", default=str(sycl / "get-rows-kquant.hpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -116,13 +121,16 @@ def case_arm(body, type_name):
 
 
 SUPPORT_SIG = r"inline bool ggml_sycl_get_rows_type_supported\([^)]*\)\s*\{"
+LAYOUT_SIG = r"inline bool ggml_sycl_get_rows_layout_supported\([^)]*\)\s*\{"
+SCALE_SIG = r"inline void ggml_sycl_kquant_scale_min_k4\([^)]*\)\s*\{"
+ELEM_SIG = r"inline float ggml_sycl_get_rows_q4_k_elem\([^)]*\)\s*\{"
 SUPPORTS_OP_SIG = r"static bool ggml_backend_sycl_device_supports_op\([^)]*\)\s*\{"
 OP_SIG = r"void ggml_sycl_op_get_rows\([^)]*\)\s*\{"
 SLICE_SIG = r"static void ggml_sycl_get_rows_dispatch_slice\([^)]*\)\s*\{"
 KERNEL_SIG = r"static void k_get_rows_q4_k_aos\([^)]*\)\s*\{"
 
 
-def evaluate(backend, getrows, support):
+def evaluate(backend, getrows, support, kquant):
     results = {}
 
     pred = function_body(support, SUPPORT_SIG)
@@ -130,16 +138,20 @@ def evaluate(backend, getrows, support):
     op = function_body(getrows, OP_SIG)
     slice_ = function_body(getrows, SLICE_SIG)
     results["anchor: the shared support predicate exists"] = pred is not None
+    layout_pred = function_body(support, LAYOUT_SIG)
+    results["anchor: the (type, layout) predicate exists"] = layout_pred is not None
     results["anchor: supports_op exists"] = supports_op is not None
     results["anchor: ggml_sycl_op_get_rows exists"] = op is not None
     results["anchor: the streamed-slice dispatcher exists"] = slice_ is not None
-    if None in (pred, supports_op, op, slice_):
+    if None in (pred, layout_pred, supports_op, op, slice_):
         return results
 
     # --- supports_op has one source for the GET_ROWS type list ----------------
     m = re.search(r"case\s+GGML_OP_GET_ROWS\s*:", supports_op)
-    arm = supports_op[m.start():m.start() + 400] if m else ""
+    arm = supports_op[m.start():m.start() + 1200] if m else ""
     results["supports_op GET_ROWS asks the shared predicate"] = "ggml_sycl_get_rows_type_supported(" in arm
+    results["supports_op GET_ROWS asks the (type, layout) predicate with the planned layout"] = \
+        "ggml_sycl_get_rows_layout_supported(" in arm and "ggml_sycl_get_planned_weight_layout(" in arm
     results["supports_op keeps no private GET_ROWS type list"] = \
         m is not None and re.search(r"GGML_TYPE_Q4_0", arm) is None
 
@@ -149,14 +161,20 @@ def evaluate(backend, getrows, support):
     missing = [t for t in admitted if case_arm(op, t) is None]
     results["every admitted type has an arm in ggml_sycl_op_get_rows"] = bool(admitted) and not missing
 
-    # --- the Q4_K arm fails closed on a layout the kernel cannot read ----------
+    # --- (type, layout): Q4_K is admitted for AoS only -------------------------
+    q4k_layout = case_arm(layout_pred, "Q4_K")
+    results["the layout predicate admits Q4_K for AoS only"] = \
+        q4k_layout is not None and "GGML_LAYOUT_AOS" in q4k_layout and \
+        re.search(r"GGML_LAYOUT_(SOA|COALESCED)", q4k_layout) is None
+
+    # --- the Q4_K arm uses the predicate as a backstop --------------------------
     q4k = case_arm(op, "Q4_K")
     results["op: a Q4_K arm exists"] = q4k is not None
     if q4k is not None:
-        refuse = re.search(r"layout\s*!=\s*GGML_LAYOUT_AOS", q4k)
+        refuse = re.search(r"ggml_sycl_get_rows_layout_supported\(", q4k)
         launch = re.search(r"get_rows_q4_k_aos_sycl\(", q4k)
         abort = re.search(r"GGML_ABORT", q4k)
-        results["op: the Q4_K arm refuses a non-AoS layout before it launches"] = \
+        results["op: the Q4_K arm asks the layout predicate before it launches"] = \
             bool(refuse and launch and abort) and refuse.start() < launch.start()
     sq4k = case_arm(slice_, "Q4_K")
     results["slice: the streamed-slice dispatcher has a Q4_K arm"] = \
@@ -168,6 +186,12 @@ def evaluate(backend, getrows, support):
     if kernel is not None:
         results["the Q4_K kernel decodes through the shared element function"] = \
             "ggml_sycl_get_rows_q4_k_elem(" in kernel
+
+    scale = function_body(kquant, SCALE_SIG)
+    elem = function_body(kquant, ELEM_SIG)
+    results["the K-quant header has the shared scale/min helper"] = scale is not None
+    results["the Q4_K element decode unpacks scales through the shared helper"] = \
+        elem is not None and "ggml_sycl_kquant_scale_min_k4(" in elem
     return results
 
 
@@ -183,11 +207,10 @@ def run(label, sources, expect_fail=None):
     return [] if fired else [label]
 
 
-backend, getrows, support = read(args.backend), read(args.getrows), read(args.support)
-failed = run("tree", (backend, getrows, support))
+backend, getrows, support, kquant = read(args.backend), read(args.getrows), read(args.support), read(args.kquant)
+failed = run("tree", (backend, getrows, support, kquant))
 
 if args.self_test:
-    failed_before = len(failed)
 
     def mutate(src, sig_regex, old, new):
         m = re.search(sig_regex, src)
@@ -198,24 +221,39 @@ if args.self_test:
         k = src.find(old, m.end())
         return src[:k] + new + src[k + len(old):]
 
+    def with_(**kw):
+        return (kw.get("backend", backend), kw.get("getrows", getrows), kw.get("support", support),
+                kw.get("kquant", kquant))
+
     mutants = [
         ("Q4_K dropped from the predicate", "the predicate admits Q4_K",
-         (backend, getrows, mutate(support, SUPPORT_SIG, "case GGML_TYPE_Q4_K:", "case GGML_TYPE_Q3_K:"))),
+         with_(support=mutate(support, SUPPORT_SIG, "case GGML_TYPE_Q4_K:", "case GGML_TYPE_Q3_K:"))),
         ("private type list in supports_op", "supports_op keeps no private GET_ROWS type list",
-         (mutate(backend, SUPPORTS_OP_SIG, "case GGML_OP_GET_ROWS:", "case GGML_OP_GET_ROWS: if (op->src[0]->type == GGML_TYPE_Q4_0) { return true; }"),
-          getrows, support)),
+         with_(backend=mutate(backend, SUPPORTS_OP_SIG, "case GGML_OP_GET_ROWS:",
+                              "case GGML_OP_GET_ROWS: if (op->src[0]->type == GGML_TYPE_Q4_0) { return true; }"))),
         ("supports_op ignores the predicate", "supports_op GET_ROWS asks the shared predicate",
-         (mutate(backend, SUPPORTS_OP_SIG, "ggml_sycl_get_rows_type_supported(", "ggml_sycl_get_rows_type_supportedX("),
-          getrows, support)),
+         with_(backend=mutate(backend, SUPPORTS_OP_SIG, "ggml_sycl_get_rows_type_supported(",
+                              "ggml_sycl_get_rows_type_supportedX("))),
+        ("supports_op ignores the planned layout",
+         "supports_op GET_ROWS asks the (type, layout) predicate with the planned layout",
+         with_(backend=mutate(backend, SUPPORTS_OP_SIG, "ggml_sycl_get_planned_weight_layout(",
+                              "ggml_sycl_get_planned_weight_layoutX("))),
         ("admitted type without an arm", "every admitted type has an arm in ggml_sycl_op_get_rows",
-         (backend, mutate(getrows, OP_SIG, "case GGML_TYPE_Q5_1:", "case GGML_TYPE_IQ4_NL:"), support)),
-        ("layout refusal dropped", "op: the Q4_K arm refuses a non-AoS layout before it launches",
-         (backend, mutate(getrows, OP_SIG, "layout != GGML_LAYOUT_AOS", "false"), support)),
+         with_(getrows=mutate(getrows, OP_SIG, "case GGML_TYPE_Q5_1:", "case GGML_TYPE_IQ4_NL:"))),
+        ("Q4_K admitted for SoA", "the layout predicate admits Q4_K for AoS only",
+         with_(support=mutate(support, LAYOUT_SIG, "GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA"))),
+        ("op arm skips the layout predicate", "op: the Q4_K arm asks the layout predicate before it launches",
+         with_(getrows=mutate(getrows, OP_SIG, "ggml_sycl_get_rows_layout_supported(",
+                              "ggml_sycl_get_rows_layout_supportedX("))),
         ("streamed arm dropped", "slice: the streamed-slice dispatcher has a Q4_K arm",
-         (backend, mutate(getrows, SLICE_SIG, "case GGML_TYPE_Q4_K:", "case GGML_TYPE_IQ4_NL:"), support)),
+         with_(getrows=mutate(getrows, SLICE_SIG, "case GGML_TYPE_Q4_K:", "case GGML_TYPE_IQ4_NL:"))),
         ("kernel stops using the shared decode", "the Q4_K kernel decodes through the shared element function",
-         (backend, mutate(getrows, KERNEL_SIG, "ggml_sycl_get_rows_q4_k_elem(", "ggml_sycl_get_rows_q4_k_elemX("),
-          support)),
+         with_(getrows=mutate(getrows, KERNEL_SIG, "ggml_sycl_get_rows_q4_k_elem(",
+                              "ggml_sycl_get_rows_q4_k_elemX("))),
+        ("Q4_K decode keeps a private scale unpack",
+         "the Q4_K element decode unpacks scales through the shared helper",
+         with_(kquant=mutate(kquant, ELEM_SIG, "ggml_sycl_kquant_scale_min_k4(",
+                             "ggml_sycl_private_scale_min("))),
     ]
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)
