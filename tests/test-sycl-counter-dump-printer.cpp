@@ -37,6 +37,12 @@ using namespace ggml_sycl;
 
 int g_failures = 0;
 
+std::atomic<int> g_log_calls{ 0 };
+
+void count_and_drop_log(ggml_log_level, const char *, void *) {
+    g_log_calls.fetch_add(1);
+}
+
 void check(bool ok, const char * what) {
     if (!ok) {
         std::fprintf(stderr, "FAIL: %s\n", what);
@@ -452,6 +458,29 @@ int main(int argc, char ** argv) {
         const auto r1 = split_lines(capture_stderr([] { unified_cache_dump_report("landing dev=0 size=1"); }));
         check(r1.size() == 1 && r1[0] == "[SYCL-REPORT] landing dev=0 size=1",
               "a report prints as [SYCL-REPORT] <text>");
+
+        // Default verbosity drops GGML_LOG_INFO in every tool (common_log maps it above the threshold), so
+        // a report that went through the log would vanish from a plain llama-completion run and leave G0
+        // vacuous. Install a log sink that swallows everything: the report and the dump must still reach
+        // fd 2, and must not have touched the log at all.
+        {
+            g_log_calls = 0;
+            ggml_log_set(count_and_drop_log, nullptr);
+            // Positive control: the sink does see a log line, so a zero below means something.
+            GGML_LOG_WARN("[SYCL-REPORT-TEST] sink control\n");
+            const bool sink_live = g_log_calls == 1;
+            g_log_calls          = 0;
+            const auto bypass_report =
+                split_lines(capture_stderr([] { unified_cache_dump_report("landing dev=0 log=bypass"); }));
+            const auto bypass_dump = split_lines(capture_stderr([] { unified_cache_test_counter_dump(); }));
+            ggml_log_set(nullptr, nullptr);
+            check(bypass_report.size() == 1 && bypass_report[0] == "[SYCL-REPORT] landing dev=0 log=bypass",
+                  "a report reaches stderr with every log level swallowed");
+            check(!bypass_dump.empty() && bypass_dump.back().rfind("[SYCL-COUNTER] end devices=", 0) == 0,
+                  "the counter dump reaches stderr with every log level swallowed");
+            check(sink_live, "the log sink counts a line that does go through the log");
+            check(g_log_calls == 0, "neither the report nor the dump goes through the ggml log");
+        }
         const auto o1 = split_lines(
             capture_stderr([] { (void) unified_cache_dump_report_once("arm_a:0:Q6_K:512", "arm_a_kernel ne11=512"); }));
         const auto o2 = split_lines(
