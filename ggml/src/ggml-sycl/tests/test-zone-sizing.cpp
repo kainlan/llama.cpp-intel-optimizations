@@ -704,6 +704,106 @@ int main() {
               "an empty inventory plans no dequant scratch");
     }
 
+    // ---- Case 14: the planned dense scratch is ONE reservation that follows the runtime n_ubatch (llama.cpp-kpjw) --
+    // B70, full card, Qwen3.6-27B perplexity (-c 512 gives n_ctx 2048 with 4 sequences, n_batch 2048): the plan was
+    // sized at the load-time n_ubatch (512, 10027264 B), auto-ubatch then chose 2048 (40108288 B), and the compute
+    // buffers of the 2048 rung had already filled the RUNTIME zone ("zone has 0.3 MB free"), so the planned buffer
+    // was never allocated and the first graph was refused.
+    {
+        // The plan is a function of n_ubatch: the same figure the three buffers' own helpers give, summed.
+        size_t q8 = 0, src0 = 0, src1 = 0, total = 0;
+        CHECK(ggml_sycl::zone_dense_scratch_total_bytes(19584, 0, 0, 512, &total) && total == 10027264,
+              "the incident's load-time plan: 512 rows of K=17408");
+        CHECK(ggml_sycl::zone_dense_scratch_total_bytes(19584, 0, 0, 2048, &total) && total == 40108288,
+              "the runtime rung the incident chose plans 4x the load-time figure");
+        CHECK(ggml_sycl::zone_mmq_src1_scratch_bytes(19584, 2048, &q8) &&
+                  ggml_sycl::zone_dequant_f16_plan_bytes(104857600, 20480, 2048, &src0, &src1) &&
+                  ggml_sycl::zone_dense_scratch_total_bytes(19584, 104857600, 20480, 2048, &total) &&
+                  total == q8 + src0 + src1,
+              "the total is exactly the three buffers' own plan figures");
+        CHECK(ggml_sycl::zone_dense_scratch_total_bytes(0, 0, 0, 2048, &total) && total == 0,
+              "a model with no dense candidate plans nothing at any n_ubatch");
+        CHECK(!ggml_sycl::zone_dense_scratch_total_bytes(SIZE_MAX / 2, 0, 0, 2048, &total),
+              "an overflowing total is refused, not wrapped into a small size");
+        CHECK(!ggml_sycl::zone_dense_scratch_total_bytes(19584, 0, 0, 512, nullptr), "a null out is refused");
+
+        // The runtime-context transaction refuses a rung the zone cannot hold, and names the largest that fits.
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 0, 512 * MiB, 4096) == 4096,
+              "a 512 MiB RUNTIME zone holds every rung the ladder can try");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 0, 36 * MiB, 4096) == 1920,
+              "a 36 MiB zone holds 1920 rows of K=17408, a multiple of 32");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 0, 36 * MiB, 1000) == 992,
+              "the search bound is honoured and rounded down to a multiple of 32");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 20 * MiB, 36 * MiB, 4096) == 832,
+              "other planned RUNTIME consumers come off the capacity first");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 104857600, 20480, 0, 100 * MiB, 4096) == 0,
+              "a weight copy larger than the zone fits no n_ubatch at all");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 40 * MiB, 36 * MiB, 4096) == 0,
+              "other consumers larger than the zone leave nothing");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 0, 512 * MiB, 31) == 0,
+              "a search bound under one row group finds nothing");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(0, 0, 0, 0, 512 * MiB, 4096) == 4096,
+              "with nothing planned every searched rung fits");
+        {
+            // The answer is a fixed point of the total: it fits, and the next row group does not.
+            const uint32_t ub = ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 0, 36 * MiB, 4096);
+            size_t         fits = 0, over = 0;
+            CHECK(ggml_sycl::zone_dense_scratch_total_bytes(19584, 0, 0, ub, &fits) && fits <= 36 * MiB &&
+                      ggml_sycl::zone_dense_scratch_total_bytes(19584, 0, 0, ub + 32, &over) && over > 36 * MiB,
+                  "the largest rung fits and the next row group does not");
+        }
+
+        // The hold: the whole plan of every buffer still short of it.
+        using ggml_sycl::zone_planned_buffer;
+        size_t hold = 1;
+        {
+            const zone_planned_buffer fresh[] = { { 10027264, 0 }, { 0, 0 }, { 0, 0 } };
+            CHECK(ggml_sycl::zone_planned_scratch_hold_bytes(fresh, 3, &hold) && hold == 10027264,
+                  "an unmaterialized plan is held in full: the incident's 9.6 MB");
+        }
+        {
+            const zone_planned_buffer met[] = { { 10027264, 10027264 }, { 4096, 8192 } };
+            CHECK(ggml_sycl::zone_planned_scratch_hold_bytes(met, 2, &hold) && hold == 0,
+                  "a buffer at or above its plan holds nothing back");
+        }
+        {
+            // Growth allocates the replacement while the old backing is live, so the shortfall is not enough.
+            const zone_planned_buffer growing[] = { { 40108288, 10027264 }, { 1048576, 1048576 } };
+            CHECK(ggml_sycl::zone_planned_scratch_hold_bytes(growing, 2, &hold) && hold == 40108288,
+                  "a buffer short of a larger plan holds the whole new plan, not the difference");
+        }
+        {
+            const zone_planned_buffer mixed[] = { { 100, 0 }, { 200, 200 }, { 300, 1 } };
+            CHECK(ggml_sycl::zone_planned_scratch_hold_bytes(mixed, 3, &hold) && hold == 400,
+                  "only the buffers still short of their plan are summed");
+        }
+        {
+            const zone_planned_buffer huge[] = { { SIZE_MAX, 0 }, { 1, 0 } };
+            CHECK(!ggml_sycl::zone_planned_scratch_hold_bytes(huge, 2, &hold), "an overflowing hold is refused");
+        }
+        CHECK(ggml_sycl::zone_planned_scratch_hold_bytes(nullptr, 0, &hold) && hold == 0, "no buffers hold nothing");
+        CHECK(!ggml_sycl::zone_planned_scratch_hold_bytes(nullptr, 0, nullptr), "a null out is refused");
+
+        // A spill-capable request cannot take the held bytes.
+        CHECK(!ggml_sycl::zone_runtime_alloc_respects_hold(64 * MiB, 10027264, 64 * MiB),
+              "a request that would leave less than the hold free spills");
+        CHECK(!ggml_sycl::zone_runtime_alloc_respects_hold(300 * 1024, 10027264, 300 * 1024),
+              "the incident: 0.3 MB free, a 9.6 MB hold, nothing may take the 0.3 MB");
+        CHECK(ggml_sycl::zone_runtime_alloc_respects_hold(100 * MiB, 10027264, 64 * MiB),
+              "a request that leaves the hold free is served from the zone");
+        CHECK(ggml_sycl::zone_runtime_alloc_respects_hold(64 * MiB + 10027264, 10027264, 64 * MiB),
+              "the boundary is inclusive: exactly the hold is left");
+        CHECK(!ggml_sycl::zone_runtime_alloc_respects_hold(64 * MiB + 10027263, 10027264, 64 * MiB),
+              "one byte under the boundary spills");
+        CHECK(ggml_sycl::zone_runtime_alloc_respects_hold(64 * MiB, 0, 64 * MiB),
+              "with no hold the whole zone is available, as before");
+        CHECK(!ggml_sycl::zone_runtime_alloc_respects_hold(64 * MiB, 0, 64 * MiB + 1),
+              "a request larger than the zone never fits");
+        CHECK(!ggml_sycl::zone_runtime_alloc_respects_hold(SIZE_MAX, SIZE_MAX, 1),
+              "a hold that wraps must not read as no hold");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

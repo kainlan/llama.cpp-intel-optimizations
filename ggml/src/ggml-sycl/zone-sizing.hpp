@@ -247,6 +247,55 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
                                  size_t * src1_bytes);
 
 // ---------------------------------------------------------------------------
+// The planned dense scratch as ONE reservation (llama.cpp-kpjw)
+// ---------------------------------------------------------------------------
+//
+// The three buffers above (Q8_1 src1, f16 src0, f16 src1) live in the RUNTIME zone. Two things were
+// missing when they were only COUNTED in the zone requirement:
+//
+//   * They were sized at the load-time n_ubatch. The runtime n_ubatch (auto-ubatch picks it at context
+//     creation) can be 4x larger, so the plan is a function of n_ubatch and the runtime-context
+//     transaction must re-derive it. These helpers are the pure arithmetic of that re-derivation.
+//   * Nothing RESERVED them. A compute buffer asks the same zone, may spill, and fills it before the first
+//     graph materializes the planned buffer, which is then refused with 0.3 MB free. The hold is the part of
+//     the plan a spill-capable allocation must leave alone.
+//
+// Pure: no state, no log.
+
+// Total bytes of the three planned buffers at `n_ubatch`: exactly the sum of zone_mmq_src1_scratch_bytes and
+// both zone_dequant_f16_plan_bytes figures. False on overflow.
+bool zone_dense_scratch_total_bytes(size_t   mmq_bytes_per_token,
+                                    size_t   f16_weight_bytes,
+                                    size_t   f16_src1_bytes_per_token,
+                                    uint32_t n_ubatch,
+                                    size_t * out);
+
+// Largest n_ubatch, a multiple of 32 no larger than `search_max`, whose planned dense scratch plus
+// `other_runtime_bytes` fits `capacity_bytes`. Zero when not even 32 rows fit.
+uint32_t zone_dense_scratch_largest_ubatch(size_t   mmq_bytes_per_token,
+                                           size_t   f16_weight_bytes,
+                                           size_t   f16_src1_bytes_per_token,
+                                           size_t   other_runtime_bytes,
+                                           size_t   capacity_bytes,
+                                           uint32_t search_max);
+
+// One planned buffer: its plan figure and the bytes its backing holds now.
+struct zone_planned_buffer {
+    size_t plan     = 0;
+    size_t capacity = 0;
+};
+
+// Bytes of the RUNTIME zone a spill-capable allocation must leave free: the whole plan of every buffer whose
+// backing is still short of it. The whole plan, not the shortfall, because growth allocates the replacement
+// while the old backing is still live (it retires behind a queue marker). Zero once every buffer holds its plan.
+// False on overflow.
+bool zone_planned_scratch_hold_bytes(const zone_planned_buffer * buffers, size_t count, size_t * out);
+
+// Whether a spill-capable RUNTIME request of `size` bytes may take the zone's `available` bytes while `hold`
+// bytes are held. A request that does not may spill exactly as one does when the zone is full.
+bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size);
+
+// ---------------------------------------------------------------------------
 // Mispredict accounting
 // ---------------------------------------------------------------------------
 //

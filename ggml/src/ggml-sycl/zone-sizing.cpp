@@ -309,6 +309,23 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
     return true;
 }
 
+// RED stubs (llama.cpp-kpjw): every answer is wrong, so the host test fails until the real bodies land.
+bool zone_dense_scratch_total_bytes(size_t, size_t, size_t, uint32_t, size_t *) {
+    return false;
+}
+
+uint32_t zone_dense_scratch_largest_ubatch(size_t, size_t, size_t, size_t, size_t, uint32_t) {
+    return 0;
+}
+
+bool zone_planned_scratch_hold_bytes(const zone_planned_buffer *, size_t, size_t *) {
+    return false;
+}
+
+bool zone_runtime_alloc_respects_hold(size_t, size_t, size_t) {
+    return true;
+}
+
 namespace {
 
 struct underestimate_record {

@@ -340,6 +340,92 @@ def evaluate(backend, common, cache, zone):
     lock_at = graph_entry.find("graph_mutex")
     results["the walks run under the graph lock"] = \
         0 <= lock_at < entry_at and lock_at < dq_entry_at
+
+    # --- llama.cpp-kpjw: the plan is a function of the RUNTIME n_ubatch, and it is RESERVED ----------------
+    # B70, full card, Qwen3.6-27B perplexity: the plan was sized at the load-time n_ubatch (512), auto-ubatch
+    # chose 2048, and the compute buffers of that rung had filled the RUNTIME zone before the first graph
+    # materialized the planned buffer ("zone has 0.3 MB free"). Three defects, one per group below.
+    txn = function_body(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\([^)]*\)\s*\{")
+    hold_refresh = function_body(backend, r"static void ggml_sycl_planned_scratch_hold_refresh\([^)]*\)\s*\{")
+    txn_guard = function_body(backend, r"struct ggml_sycl_dense_scratch_txn_guard\s*\{")
+    replan_fn = function_body(cache, r"bool unified_cache_replan_planned_dense_scratch\([^)]*\)\s*\{")
+    fit_fn = function_body(cache, r"bool unified_cache_dense_scratch_runtime_fit\([^)]*\)\s*\{")
+    quantizing_route = function_body(backend, r"static bool ggml_sycl_mul_mat_src1_quantizing_route\([^)]*\)\s*\{")
+    fallback_decision = function_body(
+        backend, r"static ggml_sycl::MatmulDecision ggml_sycl_mul_mat_legacy_fallback_decision\([^)]*\)\s*\{")
+    results["anchor: runtime-context transaction exists"] = txn is not None
+    results["anchor: hold refresh exists"] = hold_refresh is not None
+    results["anchor: transaction guard exists"] = txn_guard is not None
+    results["anchor: dense replan exists"] = replan_fn is not None
+    results["anchor: dense runtime fit exists"] = fit_fn is not None
+    results["anchor: src1-quantizing route exists"] = quantizing_route is not None
+    results["anchor: legacy fallback decision exists"] = fallback_decision is not None
+    # No early return: a missing anchor must not hide which contract checks fail (a RED run lists every one).
+    txn, hold_refresh, txn_guard, replan_fn, fit_fn, quantizing_route, fallback_decision = (
+        b or "" for b in (txn, hold_refresh, txn_guard, replan_fn, fit_fn, quantizing_route, fallback_decision))
+
+    # D1: planned but not RESERVED. A spill-capable RUNTIME request (a compute buffer) must leave the planned
+    # bytes alone; the planned consumers themselves forbid the spill and are the claimants.
+    zone_at = cache.find("prefer_vram_zone != vram_zone_id::COUNT && vram_arena_enabled()")
+    zone_region = cache[zone_at:zone_at + 2600] if zone_at >= 0 else ""
+    results["a RUNTIME zone request asks the pure hold predicate"] = \
+        "zone_runtime_alloc_respects_hold(" in zone_region and "unified_cache_get_planned_scratch_hold(" in zone_region
+    results["the hold binds only spill-capable requests, never a forbid-spill claimant"] = \
+        re.search(r"!\s*req\.intent\.constraints\.forbid_vram_zone_spill", zone_region) is not None and \
+        "vram_zone_id::RUNTIME" in zone_region
+    results["the hold is derived from the pure helper over the planned buffers"] = \
+        "zone_planned_scratch_hold_bytes(" in hold_refresh and "unified_cache_set_planned_scratch_hold(" in hold_refresh
+    results["the hold covers all three planned buffers"] = \
+        all(s_ in hold_refresh for s_ in ("mmvq_q8_activation_cache", "dequant_f16_src0_scratch",
+                                          "dequant_f16_src1_scratch"))
+    results["the Q8 walk releases the hold it satisfied"] = "ggml_sycl_planned_scratch_hold_refresh(" in q8_walk
+    results["the dequant walk releases the hold it satisfied"] = "ggml_sycl_planned_scratch_hold_refresh(" in dq_walk
+    teardown_at = backend.find("mmvq_q8_activation_cache.release()")
+    results["context teardown drops the hold"] = \
+        teardown_at >= 0 and "unified_cache_set_planned_scratch_hold(" in backend[max(0, teardown_at - 900):teardown_at + 900]
+
+    # D2: the plan follows the runtime n_ubatch, decided in the runtime-context transaction (before any graph
+    # records, so it is not mid-recording growth), and a rung the RUNTIME zone cannot hold is refused there --
+    # the auto-ubatch probe is that same transaction, so rung selection consults the plan without a second source.
+    results["the load-time setters keep their per-token inputs for a re-plan"] = \
+        all(n in cache for n in ("g_planned_mmq_src1_bytes_per_token", "g_planned_dequant_f16_weight_bytes_max",
+                                 "g_planned_dequant_f16_src1_bytes_per_token", "g_planned_dense_scratch_n_ubatch"))
+    results["the re-plan goes through the same two setters as the load-time plan"] = \
+        "unified_cache_set_planned_mmq_src1_scratch(" in replan_fn and \
+        "unified_cache_set_planned_dequant_f16_scratch(" in replan_fn
+    results["the fit check uses the pure largest-ubatch helper"] = "zone_dense_scratch_largest_ubatch(" in fit_fn
+    results["the transaction re-plans at the runtime n_ubatch, publish only"] = \
+        re.search(r"!\s*probe_mode\s*\)\s*\{[^{}]*unified_cache_replan_planned_dense_scratch\(", txn) is not None
+    results["the transaction refuses a rung the RUNTIME zone cannot hold"] = \
+        "unified_cache_dense_scratch_runtime_fit(" in txn and "dense scratch" in txn
+    results["the refusal names the largest -ub that fits"] = \
+        re.search(r"largest -ub[^\"]*", txn) is not None
+    results["the ring admission counts the dense scratch as pending RUNTIME demand"] = \
+        re.search(r"runtime_pending_bytes\s*\+=[^;]*dense", txn) is not None
+    results["a refused or rolled-back transaction restores the plan and the hold"] = \
+        "ggml_sycl_dense_scratch_txn_guard" in txn and \
+        "unified_cache_replan_planned_dense_scratch(" in txn_guard and \
+        "unified_cache_set_planned_scratch_hold(" in txn_guard
+    results["only the success tail commits the guard and refreshes the hold"] = \
+        "commit()" in txn and "ggml_sycl_planned_scratch_hold_refresh(" in txn
+    results["the transaction does not hold while it materializes pools"] = \
+        txn.find("unified_cache_set_planned_scratch_hold(") < 0 or \
+        txn.find("ggml_sycl_dense_scratch_txn_guard") < txn.find("ggml_sycl_materialize_published_mmid_workspaces(")
+
+    # D3: the walk and the dispatch ask ONE question about the route. select() cannot see the unified kernel's
+    # runtime decline (unresolved weight pointer, GGML_SYCL_UNIFIED_FORCE_LEGACY, ...); the dispatch answers that
+    # decline with select(allow_unified=false), so the walk asks the same fallback through the same helper.
+    results["the Q8 walk asks the shared route predicate"] = "ggml_sycl_mul_mat_src1_quantizing_route(" in q8_walk
+    results["the Q8 walk no longer asks select() on its own"] = "matmul_orchestrator.select(" not in q8_walk
+    results["the route predicate asks the shared fallback decision"] = \
+        "ggml_sycl_mul_mat_legacy_fallback_decision(" in quantizing_route and "UnifiedKernel" in quantizing_route
+    results["the route predicate still asks the router first, quietly"] = \
+        "matmul_orchestrator.select(" in quantizing_route
+    results["the dispatch's decline re-select goes through the shared fallback decision"] = \
+        backend.count("ggml_sycl_mul_mat_legacy_fallback_decision(") >= 3
+    results["the allow_unified=false re-select is written once"] = \
+        len(re.findall(r"select\([^;]*std::nullopt,\s*false\)", backend)) == 1 and \
+        re.search(r"select\([^;]*std::nullopt,\s*false\)", fallback_decision) is not None
     return results
 
 
@@ -500,6 +586,52 @@ if args.self_test:
         ("private allocator", "the dequant buffer ensures through the shared allocator",
          (backend, mutate_after(common, "struct dequant_f16_scratch_t", "ggml_sycl_runtime_scratch_ensure<",
                                 "ggml_sycl_XXXX<"), cache, zone)),
+        # llama.cpp-kpjw
+        ("zone request ignores the hold", "a RUNTIME zone request asks the pure hold predicate",
+         (backend, common, mutate(cache, "zone_runtime_alloc_respects_hold(", "zone_runtime_XXXX("), zone)),
+        ("hold binds the claimants too", "the hold binds only spill-capable requests, never a forbid-spill claimant",
+         (backend, common, mutate(cache, "!req.intent.constraints.forbid_vram_zone_spill &&",
+                                  "true &&"), zone)),
+        ("hold from the shortfall", "the hold is derived from the pure helper over the planned buffers",
+         (mutate_in_func(backend, r"static void ggml_sycl_planned_scratch_hold_refresh\(",
+                         "zone_planned_scratch_hold_bytes(", "zone_planned_XXXX("), common, cache, zone)),
+        ("hold forgets the f16 src1 buffer", "the hold covers all three planned buffers",
+         (mutate_in_func(backend, r"static void ggml_sycl_planned_scratch_hold_refresh\(",
+                         "dequant_f16_src1_scratch", "dequant_f16_XXXX"), common, cache, zone)),
+        ("Q8 walk never drops the hold", "the Q8 walk releases the hold it satisfied",
+         (mutate_in_func(backend, r"static bool ggml_sycl_mmq_src1_ensure_for_graph\(",
+                         "ggml_sycl_planned_scratch_hold_refresh(", "ggml_sycl_XXXX("), common, cache, zone)),
+        ("teardown keeps the hold", "context teardown drops the hold",
+         (mutate(backend, "mmvq_q8_activation_cache.release();",
+                 "mmvq_q8_activation_cache.release(); /* hold kept */"), common,
+          mutate(cache, "unified_cache_set_planned_scratch_hold(", "unified_cache_XXXX("), zone)),
+        ("plan frozen at load time", "the transaction re-plans at the runtime n_ubatch, publish only",
+         (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
+                         "unified_cache_replan_planned_dense_scratch(", "unified_cache_XXXX("), common, cache, zone)),
+        ("probe mutates the plan", "the transaction re-plans at the runtime n_ubatch, publish only",
+         (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
+                         "if (!probe_mode) {", "if (true) {"), common, cache, zone)),
+        ("transaction never checks the fit", "the transaction refuses a rung the RUNTIME zone cannot hold",
+         (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
+                         "unified_cache_dense_scratch_runtime_fit(", "unified_cache_XXXX("), common, cache, zone)),
+        ("ring blind to the dense scratch", "the ring admission counts the dense scratch as pending RUNTIME demand",
+         (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
+                         "dense_scratch_runtime_bytes", "dense_XXXX_bytes"), common, cache, zone)),
+        ("no rollback guard", "a refused or rolled-back transaction restores the plan and the hold",
+         (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
+                         "ggml_sycl_dense_scratch_txn_guard", "ggml_sycl_XXXX_guard"), common, cache, zone)),
+        ("load-time inputs dropped", "the load-time setters keep their per-token inputs for a re-plan",
+         (backend, common, mutate(cache, "g_planned_dense_scratch_n_ubatch", "g_planned_XXXX_n_ubatch", 99), zone)),
+        ("Q8 walk back to select()", "the Q8 walk no longer asks select() on its own",
+         (mutate_in_func(backend, r"static bool ggml_sycl_mmq_src1_ensure_for_graph\(",
+                         "ggml_sycl_mul_mat_src1_quantizing_route(",
+                         "ctx.matmul_orchestrator.select("), common, cache, zone)),
+        ("route predicate blind to the decline", "the route predicate asks the shared fallback decision",
+         (mutate_in_func(backend, r"static bool ggml_sycl_mul_mat_src1_quantizing_route\(",
+                         "ggml_sycl_mul_mat_legacy_fallback_decision(", "ggml_sycl_XXXX("), common, cache, zone)),
+        ("second decline re-select", "the allow_unified=false re-select is written once",
+         (backend + "\nstatic void kpjw_second_source(ggml_backend_sycl_context & c) { c.matmul_orchestrator."
+                    "select(nullptr, nullptr, nullptr, nullptr, std::nullopt, false); }", common, cache, zone)),
     ]
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)
