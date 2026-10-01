@@ -227,7 +227,8 @@ Design, revision 7.14ag, by impl-moua-s, 2026-09-30. The revisions answer thirty
   at L4+L6 is 23mk's two-step (b1) rule, with no clamp (a capped model gets G = P = 0 and
   reserves 0 B), P's accessor is the one that exists at `d8a67422d`, the floors arm names each
   cell's vehicle and commit, and the `onednn_pp_declined` census and clause (at) of 7.14af are
-  withdrawn under rulings §M86.
+  withdrawn under rulings §M86. A follow-up commit on the same revision names the reactivation
+  L0 holders, `commit_reactivate` and `rollback_reactivate` (the lead's relay).
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -1894,8 +1895,9 @@ L0, and a failed revalidation under L0 is a bug, not a race.
   - `LOAD`: the load entries, `load_begin`, `stage_inventory_plan` and `load_end` (the weight
     preload runs inside `load_end`);
   - `LIFECYCLE`: every other entry of the list below: the probe, the FA recheck, activate,
-    unload and the quarantine reaper, `can_unload`, shutdown, reactivation and the teardown
-    release proc. None of them grows a pool for planned work. §M9a names the two kinds that
+    unload and the quarantine reaper, `can_unload`, shutdown, `commit_reactivate`,
+    `rollback_reactivate` and the teardown release proc. None of them grows a pool for planned work.
+    §M9a names the two kinds that
     decide the gate; the third only keeps the other holders from being labelled as either.
 
   The accessor is `bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind =
@@ -2004,15 +2006,28 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     `load_begin`'s or the stage's hold those are nested holds; a free on a thread holding no
     token takes L0 in `unloaded_token`. None of them runs under an L1-L5 lock;
   - the model-load entries (below);
-  - **module shutdown and reactivation (rulings §M76.5).** `ggml_backend_sycl_shutdown`
-    (`:109666`; `ggml-sycl.h:71`) drains the quarantine, reaps it and publishes the restored or
-    torn-down plan, so it is an L0 holder like unload; module reactivation takes L0 too. So no
-    publishing entry can overlap either, and a publishing entry that finds the module not ACTIVE
-    while it holds L0 is a caller lifecycle violation: `[CONTEXT-PLAN-BUG]`, with no retry and
-    no `BUSY` (below). **`ggml_backend_sycl_can_unload` (`:109358`) holds L0, taken by a
-    TRY-lock (zhcn 5.5 row 32, r6 m-6; rulings §M11 I-F).** It is what closes module admission:
-    it moves `ACTIVE` to `RETRY_CLOSED`, reserves the Registry's shutdown, and waits up to 5 s
-    for the module's in-flight mutations to drain (`wait_for`, `:109390-109392`), reopening on a
+  - **module shutdown and reactivation (rulings §M76.5).** `ggml_backend_sycl_shutdown` (`:109666`;
+    `ggml-sycl.h:71`) drains the quarantine, reaps it and publishes the restored or torn-down plan,
+    so it is an L0 holder like unload. **Module reactivation is four exported phases at `d8a67422d`,
+    `ggml_backend_sycl_prepare_reactivate` (`gs:109657`), `ggml_backend_sycl_commit_reactivate`
+    (`gs:109670`), `ggml_backend_sycl_finalize_reactivate` (`gs:109678`) and
+    `ggml_backend_sycl_rollback_reactivate` (`gs:109696`); the L0 holders are `commit_reactivate`
+    and `rollback_reactivate`.** `commit_reactivate` is the only phase that touches the registry and
+    the cache (`global_registry().reactivate()` and `prepare_unified_cache_for_module_use()`,
+    `gs:109671-109672`). `rollback_reactivate`, when it rolls back a completed commit, runs
+    `global_registry().complete_shutdown()` and `rollback_unified_cache_module_use()`
+    (`gs:109708-109711`), which is shutdown-equivalent teardown. Each takes the token at the top of
+    its entry, before the admission mutex (a rollback with nothing pending takes and releases it
+    with no effect), so the census (§3.1 H7ai) reads one rule for every exported entry;
+    `prepare_reactivate` and `finalize_reactivate` only flip admission under the admission mutex and
+    take no L0. So no publishing entry can overlap shutdown, `commit_reactivate` or
+    `rollback_reactivate`; zhcn's gate 22b expiry condition keys on `can_unload`, `shutdown`,
+    `commit_reactivate` and `rollback_reactivate`. A publishing entry that finds the module not
+    ACTIVE while it holds L0 is a caller lifecycle violation: `[CONTEXT-PLAN-BUG]`, with no retry
+    and no `BUSY` (below). **`ggml_backend_sycl_can_unload` (`:109358`) holds L0, taken by a
+    TRY-lock (zhcn 5.5 row 32, r6 m-6; rulings §M11 I-F).** It is what closes module admission: it
+    moves `ACTIVE` to `RETRY_CLOSED`, reserves the Registry's shutdown, and waits up to 5 s for the
+    module's in-flight mutations to drain (`wait_for`, `:109390-109392`), reopening on a
     timeout. It is distinct from shutdown (`:109666`). Without L0, a publishing entry that
     already holds L0 could see admission close under it, and the `[CONTEXT-PLAN-BUG]` below
     would fire on a legal `can_unload`. **It never blocks on L0:** it takes a `LIFECYCLE` token
@@ -4759,8 +4774,9 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     (`:18817-18818`), the FA recheck's module guard (`:19036-19039`), unload's (`:12285`),
     activate's module guard (`:15230`) and live-update ticket (`:15238` onward), and the module
     guards of `stage_inventory_plan` (`:16779`) and `load_end` (`:13100`). A module guard that
-    fails under L0 is the §M76.5 case: shutdown and reactivation hold L0, so the module can be
-    found non-ACTIVE by another L0 holder only if a caller used it outside its lifecycle. A
+    fails under L0 is the §M76.5 case: shutdown, `commit_reactivate` and `rollback_reactivate` hold
+    L0, so the module can be found non-ACTIVE by another L0 holder only if a caller used it outside
+    its lifecycle. A
     ticket or a transaction `busy` can fire only if a mutator skipped L0.
 
   `load_begin`'s `LOAD_BUSY` is not in this list. It refuses a concurrent load, or a load into a
@@ -8221,7 +8237,11 @@ means that.
     I-1); `ggml_backend_sycl_set_runtime_context` is not exported; the three orphaned publishers
     are gone, `compute_placement_plan_early`'s body is a static impl behind its public entry,
     and the dead `nullptr` publish at `:14773` is gone (r9 m-2, m-3); and no per-device re-plan
-    mutex exists. Mutation witnesses:
+    mutex exists. **The walk's roots include the four reactivation phases (§2.4.2):**
+    `ggml_backend_sycl_commit_reactivate` and `ggml_backend_sycl_rollback_reactivate` must take the
+    token at the top of the entry, and `prepare_reactivate` and `finalize_reactivate` take none and
+    reach no publish or live-update callee; the gate asserts this by name, so either token deleted
+    fails it. Mutation witnesses:
     **an unlisted exported entry that reaches the CAS** (a new exported function calling the
     transaction body, which the reachability walk must find although no list names it), a
     publisher call site without a token, `ggml_backend_sycl_set_runtime_context` restored as an
@@ -9272,6 +9292,19 @@ means that.
     waits for the unload's L0 and the watchdog fires; with the handshake, the RED cannot pass
     by timing. The wrapper test itself keeps its form; the handshake is used by this arm. A
     second arm, with L0 free, takes the `try_lock` and closes admission as before.
+  - **Reactivation holds L0 in `commit_reactivate` and `rollback_reactivate` (rulings §M76.5; the
+    lead's relay).** In a `GGML_SYCL_PRIVATE_TESTING` build, a publisher parks inside a real entry
+    holding L0 (the park point above), and a positive control at that moment fails a `try_lock` of
+    L0 from the calling thread. Then `commit_reactivate` is called on another thread: it blocks
+    until the holder releases and only then runs, and the admission state reads `COMMITTED_CLOSED`
+    only after the registry and cache hooks ran. The same is run for `rollback_reactivate` after a
+    completed commit (`rollback_committed` true): `complete_shutdown()` and
+    `rollback_unified_cache_module_use()` run only once L0 is free. `prepare_reactivate` and
+    `finalize_reactivate` return at once against the parked holder, since they take no L0. RED: a
+    `commit_reactivate` or `rollback_reactivate` without the token, under which a publisher's
+    publish interleaves between `reactivate()` and the admission flip, or between the rollback's
+    teardown and the previous-state restore, and the arm finds the interleave. A 5 s watchdog fails
+    the arm instead of hanging it.
   - **Load B while A's context holds its rows (llama.cpp-r7fz; rulings §M7 I-4, §M32 I-1,
     §M38 I-2).** Model A's context holds claimed-then-vacated ring rows on device 0; model B
     loads on device 0. After B's load, A's rows (handles, sizes, depth) and A's model's weight
@@ -12270,8 +12303,8 @@ design-moua-r7 found 0 Critical, 7 Important and 11 Minor. The lead ruled in rul
   FA recheck").
 - The wrapper's module-admission `BUSY` (`:18848-18849`) is reachable only when the module is
   not ACTIVE (reactivation or shutdown). Under L0 it becomes `[CONTEXT-PLAN-BUG]` with the
-  wrapper's other returns. Revision 7.6 left a shutdown race open here; rulings §M76.5 closes it
-  in 7.7: shutdown and reactivation take L0 (§2.4.2).
+  wrapper's other returns. Revision 7.6 left a shutdown race open here; rulings §M76.5 closes it in
+  7.7: shutdown, `commit_reactivate` and `rollback_reactivate` take L0 (§2.4.2).
 - The load's L0 span is a choice (per entry, not load_begin..load_end). The alternative covers
   the whole load and needs a callback clause in the deadlock rule.
 - The MMID host pool is held by the model's MMID entry, not a context's reservation, because
@@ -12323,7 +12356,7 @@ master `76c7f6548` at `db609bd15`, and every new line was checked with `git show
 |------|-------------|
 | §M76.1 condition (covered read vs a concurrent L0 holder) | §2.4.2 "Why COVERED is safe without L0" shows condition (a): everything COVERED depends on is owned, not free room. H9 arm with a parked holder running an unload, a quarantine restore and a load. |
 | §M76.2 condition (what an interleave observes) | I-3 above. |
-| §M76.5 (shutdown and reactivation take L0) | In the L0 list; a non-ACTIVE module under L0 is `[CONTEXT-PLAN-BUG]`; H9 arm. |
+| §M76.5 (shutdown and reactivation take L0) | In the L0 list, where reactivation's holders are `commit_reactivate` and `rollback_reactivate` (`gs:109670`, `gs:109696`); a non-ACTIVE module under L0 is `[CONTEXT-PLAN-BUG]`; H9 arm. |
 | §M76a (inventory globals) | §2.4.2 "Per-model plan state"; H7ao with the `:18245` witness, scoped by path set. |
 | llama.cpp-fsgi pointer | One line in §2.4.2: `get_cached_tensor_ptr` (`:19236`) is fsgi's, reuses the snapshot, lands after moua. |
 | §Z42.3 (no per-record zone) | The zone line and the record's zone field are deleted (§2.4.3 "Zone"). |
@@ -12487,8 +12520,9 @@ I-4 and the 85635feee Minors are the ones 7.9 answered (table above); the new it
 **Noted for the lead (7.10).**
 - The token has **three** kinds where §M9a names two. `TRANSACTION` versus `LOAD` is the
   ruling's discrimination and the gates use only `TRANSACTION`; `LIFECYCLE` exists so that the
-  probe, the FA recheck, activate, unload, `can_unload`, shutdown, reactivation and the release
-  proc are not labelled as a transaction or a load. It is still one state and one accessor. If
+  probe, the FA recheck, activate, unload, `can_unload`, shutdown, `commit_reactivate`,
+  `rollback_reactivate` and the release proc are not labelled as a transaction or a load. It is
+  still one state and one accessor. If
   the lead prefers two values, those holders take `LOAD` and nothing else changes.
 - The dead `materialize_moe_tensor_planned_layout` deletion reaches zhcn's row 35 list
   (`:60125`, `:60115`); I am telling zhcn.
@@ -14336,3 +14370,4 @@ lead relays 23mk's final head and the reviewer's old-to-new line map for the fin
 | n-3 | C10's sentence said both figures count the constant's return | **Changed.** "Both count the L4+L6 sizing; on Qwen at `-c 4096` the constant's removal moves nothing." |
 | n-4 | the (b1)-to-L4 interval covered only the pre-§4 half | **Changed.** After §4 and before L4 it is `max(268435456, W + G + P)`, 268435456 B on Qwen at both shapes (23mk:6032-6047). |
 | P's existence at L4+L6 | not flagged; ruled by §M84 | **Unchanged.** llama.cpp-z8fr tracks revisiting P. |
+| reactivation (lead's relay, after the report) | moua said "module reactivation takes L0" with no function | **Changed.** At `d8a67422d` reactivation is `prepare_reactivate` (`gs:109657`), `commit_reactivate` (`gs:109670`), `finalize_reactivate` (`gs:109678`) and `rollback_reactivate` (`gs:109696`). L0 is held in `commit_reactivate` (the only phase that touches the registry and cache) and in `rollback_reactivate` (a committed rollback runs `complete_shutdown()` and `rollback_unified_cache_module_use()`, `gs:109708-109711`); `prepare` and `finalize` only flip admission. Named in §2.4.2's L0 list, the LIFECYCLE kind list, the module-guard note, the census (H7ai: both take the token at the top, the other two none, asserted by name), the H9 arm (a new bullet) and the §M76.5 table row. zhcn's gate 22b expiry keys on `can_unload`, `shutdown`, `commit_reactivate` and `rollback_reactivate`. One design choice for the lead: the token is taken at the top of `rollback_reactivate`, before the admission mutex, so the census rule is uniform; a no-op rollback takes and releases it. |
