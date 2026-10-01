@@ -614,6 +614,75 @@ int main() {
               "an empty inventory plans no Q8 scratch");
     }
 
+    // ---- Case 13: the dense oneDNN f16 dequant scratch (llama.cpp-479i, A5) --
+    // With oneDNN PP off, a dense Q8_0 MUL_MAT still routes through the oneDNN dequant arm
+    // (ONEDNN_SOA / ONEDNN_COALESCED are selected independent of that knob) and minted its f16
+    // copy of the WHOLE weight from the SCRATCH pool per op: Qwen3.6-27B on the B50 logged 11
+    // raw 60 MiB allocations (ssm_out, Q8_0 6144x5120) behind a queue nothing drains. The
+    // goldens are that weight and the largest Q8_0 weight in the same model (10240x5120).
+    {
+        size_t w = 0;
+        CHECK(ggml_sycl::zone_dequant_f16_weight_bytes(6144, 5120, &w) && w == 62914560,
+              "Q8_0 6144x5120 dequantizes to 60 MiB of f16");
+        CHECK(ggml_sycl::zone_dequant_f16_weight_bytes(10240, 5120, &w) && w == 104857600,
+              "Q8_0 10240x5120 dequantizes to 100 MiB of f16");
+        CHECK(!ggml_sycl::zone_dequant_f16_weight_bytes(0, 5120, &w), "a zero extent is not a weight");
+        CHECK(!ggml_sycl::zone_dequant_f16_weight_bytes(INT64_MAX / 2, INT64_MAX / 2, &w),
+              "an overflowing weight is refused, not wrapped into a small size");
+        CHECK(!ggml_sycl::zone_dequant_f16_weight_bytes(6144, 5120, nullptr), "a null out is refused");
+
+        size_t bpt = 0;
+        CHECK(ggml_sycl::zone_dequant_f16_src1_bytes_per_token(6144, 1, 1, &bpt) && bpt == 12288,
+              "one f16 activation row per token: 6144 * 2 bytes");
+        CHECK(ggml_sycl::zone_dequant_f16_src1_bytes_per_token(128, 8, 4, &bpt) && bpt == 128 * 2 * 8 * 4,
+              "ne[2] and ne[3] multiply the activation rows");
+
+        // The exact per-op figure the dispatch computes: [src0 f16 | src1 f16], each 256-aligned.
+        size_t need = 0, src1_off = 0;
+        CHECK(ggml_sycl::zone_dequant_f16_required_bytes(6144LL * 5120, 512LL * 6144, &need, &src1_off) &&
+                  src1_off == 62914560 && need == 62914560 + 6291456,
+              "ssm_out at 512 tokens: 60 MiB weights then 6 MiB activations");
+        CHECK(ggml_sycl::zone_dequant_f16_required_bytes(0, 512LL * 6144, &need, &src1_off) && src1_off == 0 &&
+                  need == 6291456,
+              "an F16 weight needs no src0 region: the activations start at offset 0");
+        CHECK(ggml_sycl::zone_dequant_f16_required_bytes(6144LL * 5120, 0, &need, &src1_off) && need == 62914560,
+              "an F16 activation needs no src1 region");
+        CHECK(ggml_sycl::zone_dequant_f16_required_bytes(3, 5, &need, &src1_off) && src1_off == 256 &&
+                  need == 512,
+              "each region is aligned up to 256 so the second starts aligned");
+        CHECK(!ggml_sycl::zone_dequant_f16_required_bytes(INT64_MAX / 2, 1, &need, &src1_off),
+              "an overflowing demand is refused, not wrapped into a small size");
+
+        // The plan figure: the largest weight plus n_ubatch activation rows at the widest K.
+        size_t plan = 0;
+        CHECK(ggml_sycl::zone_dequant_f16_scratch_bytes(104857600, 20480, 512, &plan) &&
+                  plan == 104857600 + 10485760,
+              "100 MiB weights + 512 tokens of K=10240 f16 rows");
+        CHECK(plan >= 6144u * 5120u * 2u + 512u * 6144u * 2u, "the plan covers the incident op's exact demand");
+        CHECK(ggml_sycl::zone_dequant_f16_scratch_bytes(0, 0, 512, &plan) && plan == 0,
+              "a model with no dense dequant candidate plans nothing");
+        CHECK(!ggml_sycl::zone_dequant_f16_scratch_bytes(SIZE_MAX / 2, SIZE_MAX / 2, 512, &plan),
+              "an overflowing plan is refused, not wrapped into a small size");
+
+        // The maxima take the adapter's marks; the classifier decides nothing from ne[2] or names.
+        std::vector<zone_tensor_desc> inv;
+        zone_tensor_desc              ssm_out = desc("blk.0.attn_q.weight", 33000000, TYPE_Q8_0, 6144, 5120, 1, 1);
+        ssm_out.dequant_f16_weight_bytes      = 62914560;
+        ssm_out.dequant_f16_src1_bytes_per_token = 12288;
+        zone_tensor_desc wide                 = desc("token_embd.weight", 55000000, TYPE_Q8_0, 10240, 5120, 1, 1);
+        wide.dequant_f16_weight_bytes         = 104857600;
+        wide.dequant_f16_src1_bytes_per_token = 20480;
+        zone_tensor_desc unmarked             = desc("blk.1.ffn_down.weight", 90000000, TYPE_Q4_K, 17408, 5120, 1, 1);
+        inv.push_back(ssm_out);
+        inv.push_back(wide);
+        inv.push_back(unmarked);
+        const path_scoped_maxima m = zone_scoped_maxima(inv);
+        CHECK(m.dequant_f16_weight_bytes == 104857600, "the largest marked weight, not the unmarked Q4_K one");
+        CHECK(m.dequant_f16_src1_bytes_per_token == 20480, "the widest marked K");
+        CHECK(zone_scoped_maxima(std::vector<zone_tensor_desc>()).dequant_f16_weight_bytes == 0,
+              "an empty inventory plans no dequant scratch");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
