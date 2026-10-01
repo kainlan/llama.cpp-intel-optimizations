@@ -552,6 +552,30 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 endif()
 
+# Cross-device staging probe (llama.cpp-23mk, design row 113 / G0): does the submit of a leg that
+# depends on another queue's event return before that event completes? Needs two devices and the
+# backend's own queues, so it links the real ggml-sycl library like test-sycl-profiling-queue-property
+# above. Lead-run only (two-device GPU work, one at a time); it exits 77 with fewer than two devices.
+# `mem-handle` keeps it out of the full-sweep form of "Running Tests", and the default selector pins the
+# two discrete cards. It carries no ONEAPI_DEVICE_SELECTOR of its own beyond that pin.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-staging-probe.cpp)
+    set_tests_properties(test-sycl-staging-probe PROPERTIES LABELS "sycl;gpu-serial;mem-handle")
+    target_include_directories(test-sycl-staging-probe PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-staging-probe PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-staging-probe PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-staging-probe PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-staging-probe PRIVATE "-fsycl")
+        target_link_options(test-sycl-staging-probe PRIVATE "-fsycl")
+    endif()
+    set_tests_properties(test-sycl-staging-probe PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 120
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+endif()
+
 # WOQ repack kernel microbench (perf-recovery epic, track D, llama.cpp-0vqt):
 # NOT a ctest -- it is a device-event throughput measurement, not a
 # correctness gate (that's test-sycl-mxfp4-woq-{,tiled-}repack above), so it
