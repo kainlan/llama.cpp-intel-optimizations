@@ -255,8 +255,12 @@ def evaluate(backend, common, memo_hdr):
         graphlets) is not None
     site = r"if\s*\(!" + call % r"sycl_ctx,\s*cgraph,\s*graph_hash" + r"\)\s*\{\s*"
     results["site 3, MoE segment replay: declines, invalidates the segments, runs direct, else replays"] = re.search(
-        site + r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*"
+        site + r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\}\s*else\s*"
+        r"(if\s*\(!sycl_ctx->moe_segments_valid\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*)?\{\s*"
         r"graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*moe_graph_replay_segments\(", compute) is not None
+    results["site 3: segments a staging swap retired run the token direct instead of replaying nothing"] = re.search(
+        site + r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\}\s*else if\s*\(!sycl_ctx->moe_segments_valid\)\s*\{\s*"
+        r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*moe_graph_replay_segments\(", compute) is not None
     results["site 4, MoE segment record: declines and runs direct, else records"] = re.search(
         r"\}\s*else\s*" + site + r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*"
         r"sycl_ctx->invalidate_moe_segments\(\);", compute) is not None
@@ -602,6 +606,10 @@ if args.self_test:
          (mutate_in_func(backend, cmp_sig, "++sycl_ctx->graph_compute_seq;", "if (sycl_ctx->device >= 0) {\n ++sycl_ctx->graph_compute_seq;\n }"), common, mem_)),
         ("the token number is bumped after an early return", "the token number is bumped unconditionally, at top level, before any early return",
          (mutate_in_func(backend, cmp_sig, "++sycl_ctx->graph_compute_seq;", "if (cgraph->n_nodes == 0) { return GGML_STATUS_SUCCESS; }\n ++sycl_ctx->graph_compute_seq;"), common, mem_)),
+        ("segments retired by a swap are replayed", "site 3: segments a staging swap retired run the token direct instead of replaying nothing",
+         (mutate_in_func(backend, cmp_sig, "else if (!sycl_ctx->moe_segments_valid) {", "else if (false) {"), common, mem_)),
+        ("the retired-segments branch is gone", "site 3: segments a staging swap retired run the token direct instead of replaying nothing",
+         (mutate_re(backend, cmp_sig, r"\s*else if \(!sycl_ctx->moe_segments_valid\) \{\s*compute_impl_unlocked\(\);\s*\}", ""), common, mem_)),
         ("a seventh recorder appears", "no unnamed pre-stage consumer: the six recording sites below are all there are",
          (backend + "\nstatic bool new_recorder(ggml_backend_sycl_context * c, const ggml_cgraph * g) "
                     "{ if (!graph_prestage_or_decline(c, g, 1)) { return false; } return true; }\n", common, mem_)),
