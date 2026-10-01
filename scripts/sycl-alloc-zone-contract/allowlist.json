@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clauses e, j; later clauses add entries). Permanent exemptions only, each with a reason. An entry names its subject (file and function, or a node key), the raw `name` where the code is E-RAW, and an exact `count`; it fails if it matches nothing or covers a different number, and `name` pins the allocator so a swapped-in different call does not ride the exemption. Hand-edited; see README.md.",
+  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clauses e, j and q; later clauses add entries). Permanent exemptions only, each with a reason. An entry names its subject (file and function, or a node key), the raw `name` where the code is E-RAW or E-LIBC, and an exact `count`; it fails if it matches nothing or covers a different number, and `name` pins the allocator so a swapped-in different call does not ride the exemption. Hand-edited; see README.md.",
   "entries": [
     {
       "id": "E-TEST",
@@ -126,6 +126,51 @@
       "function": "zone_scoped_maxima",
       "count": 1,
       "reason": "design 7(j): the late stage's classifier. zone_scoped_maxima classifies each tensor once, at the plan, with zone_is_onednn_reorder_eligible; no dispatch path may call it (the plan stores the structural bits a dispatch reads)"
+    },
+    {
+      "id": "E-LIBC-DPCT-MMGR-MMAP",
+      "code": "E-LIBC",
+      "file": "dpct/helper.hpp",
+      "function": "mem_mgr::mem_mgr",
+      "name": "mmap",
+      "count": 1,
+      "reason": "vendored dpct, unreachable from the backend: mem_mgr's constructor reserves PROT_NONE address space on Linux (helper.hpp:1362); canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count). Ruling M265 R2"
+    },
+    {
+      "id": "E-LIBC-DPCT-MMGR-VIRTUALALLOC",
+      "code": "E-LIBC",
+      "file": "dpct/helper.hpp",
+      "function": "mem_mgr::mem_mgr",
+      "name": "VirtualAlloc",
+      "count": 1,
+      "reason": "vendored dpct, unreachable from the backend: the _WIN64 arm of mem_mgr's constructor (helper.hpp:1365), the Windows twin of the mmap above; canonical contract section 9.1. Ruling M265 R2"
+    },
+    {
+      "id": "E-LIBC-DPCT-HOSTBUF-MALLOC",
+      "code": "E-LIBC",
+      "file": "dpct/helper.hpp",
+      "function": "host_buffer::host_buffer",
+      "name": "malloc",
+      "count": 2,
+      "reason": "vendored dpct, unreachable from the backend: the two host_buffer constructors' std::malloc (helper.hpp:1692 and :2368), the buffer behind dpct's async memcpy; canonical contract section 9.1. Ruling M265 R2"
+    },
+    {
+      "id": "E-LIBC-DPCT-DEVMEM-MALLOC",
+      "code": "E-LIBC",
+      "file": "dpct/helper.hpp",
+      "function": "device_memory::device_memory",
+      "name": "malloc",
+      "count": 2,
+      "reason": "vendored dpct, unreachable from the backend: the two device_memory initializer-list constructors' host staging std::malloc (helper.hpp:3005 and :3017); canonical contract section 9.1. Ruling M265 R2"
+    },
+    {
+      "id": "E-LIBC-CACHE-GUARD",
+      "code": "E-LIBC",
+      "file": "unified-cache.hpp",
+      "function": "cache_guard_allocator::allocate",
+      "name": "mmap",
+      "count": 1,
+      "reason": "cache bookkeeping, guard-page debug mode, no tensor/KV/scratch/pinned/USM bytes: cache_guard_allocator backs the cache's own hash maps (unified-cache.hpp:4368, :4552, :5391) when the guard env is set and falls back to std::allocator; the cache cannot allocate its own map nodes through itself. Permanent. Ruling M265 R2"
     }
   ]
 }

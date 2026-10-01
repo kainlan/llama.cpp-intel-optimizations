@@ -25,6 +25,15 @@ Their six hits in `unified-cache.cpp` are allowlisted (`E-CHAIN-HOST-RAW`, `E-CH
 CACHE_BACKING bootstrap sites `E-BACKING-STAGING`, `E-BACKING-FLAG-SLAB`; canonical contract sections 3, 3.1 and 9.1); the
 seventh, `unified_cache::allocate`'s last-resort fallback, is E-RAW debt with fate `deleted-by-D-disposition`.
 
+Clause (q), libc allocation primitives (S3-0): `mmap`, `posix_memalign`, `memalign`, `aligned_alloc`, `malloc`, `calloc`, `realloc` and
+`VirtualAlloc`, called bare or through `std::` / `::` (or taken as a value, or spelled in a `#define` body), are E-LIBC findings. A member
+(`pool.realloc`), a name qualified by another scope (`sycl::malloc` stays clause (e)'s) and a declaration are not. Five allowlist entries
+cover seven sites: the vendored `dpct/helper.hpp` hits (`E-LIBC-DPCT-MMGR-MMAP`, `E-LIBC-DPCT-MMGR-VIRTUALALLOC`,
+`E-LIBC-DPCT-HOSTBUF-MALLOC`, `E-LIBC-DPCT-DEVMEM-MALLOC`; reason "vendored dpct, unreachable from the backend"; ruling M265 R2) and
+`cache_guard_allocator`'s `mmap` (`E-LIBC-CACHE-GUARD`; permanent, "cache bookkeeping, guard-page debug mode, no tensor/KV/scratch/pinned/USM
+bytes"). The dead `weight_cache_allocator`'s `mmap` and `posix_memalign` are E-LIBC debt with fate `deleted-by-step-7` (S7's zero-caller
+census item (f)). The S2c control that used to pin `std::malloc` as a PASS flipped to a FAIL on purpose when this clause landed.
+
 Known gap: an aliased namespace (`namespace sy = sycl; sy::malloc(n, q, sycl::usm::alloc::host)`) escapes the qualified
 `sycl::malloc` / `sycl::aligned_alloc` check, since the match is on the spelled scope. The named forms (`malloc_host` and the
 rest) are matched wherever they appear.
@@ -51,7 +60,9 @@ function's own `cascade_step` parameter, exempted by `file` + `function` for an 
 that stops writing the field fails as an entry matching nothing, which is witness 21's check that a DECLARED
 construction keeps its flag.
 
-Every `E-RAW` debt entry also carries `fate` and `cite`. `fate` is `deleted-by-<step>`, `converted-by-<step>`,
+Every `E-RAW` and `E-LIBC` debt entry also carries `fate` and `cite`. The one other debt entry that carries a `fate` is the `G-CATCH` entry
+for the `CHECK_TRY_ERROR` macro's handler, and its fate is `converted-by-5.4a` and nothing else (the gate pins both directions: that key must
+carry it, and no other entry outside E-RAW/E-LIBC may carry any fate). `fate` is `deleted-by-<step>`, `converted-by-<step>`,
 `sanctioned-internal`, `sanctioned-vendored` (upstream code we do not edit) or `pending-disposition`. A `sanctioned-internal` entry is one no step will ever shrink:
 it is a candidate for the allowlist, and moving it there is the lead's decision, not the implementer's.
 `pending-disposition` marks an entry whose fate nobody has ruled on yet; its `cite` says what is known. Every E-RAW entry needs a `cite`, a ticket id or a design/census row of at

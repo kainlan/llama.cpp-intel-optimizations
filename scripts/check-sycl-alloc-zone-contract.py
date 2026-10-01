@@ -42,6 +42,12 @@ What this unit (S2a, S2b, S2c) enforces
       H-PASS-EXPR, H-UNCONV-EXPR) cannot be exempted. No H-* finding can be debt, and an entry's outcome may not be TERMINAL.
       An allowlisted node that stops writing its field fails as an entry matching nothing (a DECLARED row losing its flag).
       Positional initialisation of a request type and a call through a lambda or function pointer are not followed.
+  (q) libc allocation primitives (S3-0): mmap, posix_memalign, memalign, aligned_alloc, malloc, calloc, realloc and VirtualAlloc, as a
+      call, an address-of or a value, bare or qualified by `std::` or a leading `::`, and in a #define body, outside the allowlist
+      (code E-LIBC, keyed like E-RAW). A member (`pool.realloc`), a name qualified by anything else (`pool_alloc::realloc`;
+      `sycl::malloc` is clause (e)'s) and the declaration of a function with the name are not hits. The unified cache owns every byte the
+      backend allocates, so a libc allocation is a violation unless the allowlist says why it holds no tensor, KV, scratch, pinned or
+      USM bytes. A debt entry for it carries a fate and a cite, as E-RAW's does.
 and the brace rule the construction-site labels need: a braceless `T x;` reports the class
 site (unified-cache.hpp, the comment above alloc_intent), so every value declaration of a
 request type is written `T x{}`.
@@ -232,13 +238,26 @@ RAW_QUALIFIED = ("malloc", "aligned_alloc")
 DPCT_HOME = "dpct/helper.hpp"
 DPCT_FUNCS = ("dpct_malloc",)
 DPCT_CLASSES = ("device_memory", "global_memory", "constant_memory", "shared_memory")
+# Clause (q): the C library's allocation primitives (and Windows' VirtualAlloc). They are matched as a bare name or one qualified
+# by `std::` or a leading `::`, so a member (`pool.realloc`, `pool_alloc::realloc`) and sycl::malloc (clause (e)'s) are not hits,
+# and the declaration of a function with the name is not a use. Code E-LIBC; its debt entries carry a fate and a cite like E-RAW's.
+LIBC_NAMES = ("mmap", "posix_memalign", "memalign", "aligned_alloc", "malloc", "calloc", "realloc", "VirtualAlloc")
+RAW_CODES = ("E-RAW", "E-LIBC")
+LIBC_NAME_RE = r"(?<![A-Za-z0-9_.>:])(?:(?:std)?\s*::\s*)?(%s)" % "|".join(LIBC_NAMES)
+LIBC_BODY_RE = re.compile(LIBC_NAME_RE + r"(?![A-Za-z0-9_])")
+LIBC_CALL_RE = re.compile(LIBC_NAME_RE.encode() + rb"\s*(?:<[^>]*>)?\s*\(")
+# G-CATCH is the one other code whose debt entry carries a fate, and only this key: the CHECK_TRY_ERROR macro's handler, which
+# step 5.4a rewrites. It can carry no other fate, and no other handler carries one.
+CHECK_TRY_ERROR_KEY = "common.hpp::#define CHECK_TRY_ERROR::catch_macro:exception#0"
+CHECK_TRY_ERROR_FATE = "converted-by-5.4a"
 
 SHARDS = 8   # the ctest registers this many shards; cmake_witness pins the registration to it
 
-DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h and n; only N-VOID and N-NODISCARD may be debt). Shrink-only: a violation not listed "
-            "fails, and a listed entry that no longer violates fails. Every E-RAW entry carries a fate (deleted-by-*, "
+DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h, n and q; only N-VOID and N-NODISCARD may be debt). Shrink-only: a violation not listed "
+            "fails, and a listed entry that no longer violates fails. Every E-RAW and E-LIBC entry carries a fate (deleted-by-*, "
             "converted-by-*, sanctioned-internal, sanctioned-vendored or pending-disposition) and a cite, so an entry no step will ever "
-            "shrink is visible as a mislabelled allowlist entry. Regenerate with `python3 "
+            "shrink is visible as a mislabelled allowlist entry; the one G-CATCH entry for the CHECK_TRY_ERROR macro carries "
+            "converted-by-5.4a and no other fate. Regenerate with `python3 "
             "scripts/check-sycl-alloc-zone-contract.py --write-debt` (it refuses to add entries); see README.md.")
 FATE_RE = re.compile(r"^(deleted-by|converted-by)-[A-Za-z0-9._§()-]+$|^sanctioned-internal$|^sanctioned-vendored$|^pending-disposition$")
 CITE_MIN = 12   # a cite names a ticket or a design/census row; "tbd" is not one
@@ -267,7 +286,7 @@ S2D_CODES = ("I-RETRY", "K-INTERIM", "L-CALLER", "L-FREE", "L-GUARD", "J-SOURCE"
 S2D_DEBT = ("N-VOID", "N-NODISCARD")
 S2D_NEVER_ALLOW = ("X-LATCH", "P-ROUTE", "P-HOME", "P-FILL", "P-LAYER", "P-CHARGE")
 CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-FORM", "B-TIER", "C-COHORT", "C-SITE", "D-ZONE",
-         "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "G-CATCH", "DEFER-C") + H_CODES + S2D_CODES
+         "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "E-LIBC", "G-CATCH", "DEFER-C") + H_CODES + S2D_CODES
 
 
 # ---------------------------------------------------------------- tree-sitter accessors
@@ -1937,6 +1956,21 @@ def sycl_qualified_raw(src, n):
     return sc is not None and txt(src, sc).split("::")[-1].strip() == "sycl"
 
 
+def libc_use(src, n):
+    """(top, is_call) for an identifier naming a libc allocation primitive, else None. Not a use: the name of a function
+    declaration or definition, or a name qualified by anything but `std` (sycl::malloc is clause (e)'s)."""
+    p = parent(n)
+    if p is None or kind(p) == "function_declarator":
+        return None
+    if kind(p) == "qualified_identifier":
+        if not same(fld(p, "name"), n):
+            return None
+        sc = fld(p, "scope")
+        if sc is not None and txt(src, sc).strip().lstrip(":").strip() != "std":
+            return None
+    return callee_ident(src, n)
+
+
 def scan_file(rel, src, ctx):
     """Facts about one file, as plain data: constructions, form findings, raw hits, error tokens."""
     value_types, all_types = ctx.value_types, ctx.all_types
@@ -1944,7 +1978,7 @@ def scan_file(rel, src, ctx):
     root = parse(src)
     root_error = kind(root) == "ERROR"
     constructions, raws, errtoks, forms = [], [], [], []
-    catches, hrecs = [], []
+    catches, hrecs, libcs = [], [], []
     h_on = b"cascade_step" in src or b"unconverted_ticket" in src or any(nm.encode() in src for nm in ctx.cascade_funcs)
 
     for n in walk(root):
@@ -2033,6 +2067,9 @@ def scan_file(rel, src, ctx):
                     if re.search(r"(?<![A-Za-z0-9_])" + re.escape(r).replace("sycl::", r"sycl\s*::\s*") + r"(?![A-Za-z0-9_])", b):
                         raws.append({"func": "#define " + txt(src, nm), "name": r, "line": line_of(n),
                                      "form": "macro", "nodekind": "preproc", "text": r, "err": False})
+                for m in LIBC_BODY_RE.finditer(b):
+                    libcs.append({"func": "#define " + txt(src, nm), "name": m.group(1), "line": line_of(n),
+                                  "form": "macro", "nodekind": "preproc", "text": m.group(1), "err": False})
                 if MACRO_WRITE_RE.search(b):
                     forms.append({"func": "#define " + txt(src, nm), "role": "macro-write", "tok": txt(src, nm),
                                   "line": line_of(n), "text": txt(src, n)})
@@ -2052,6 +2089,14 @@ def scan_file(rel, src, ctx):
                          "form": "call" if is_call else "name",
                          "nodekind": "call_expression" if is_call else k,
                          "text": txt(src, top) if is_call else txt(src, n), "err": has_error_ancestor(n)})
+        if k == "identifier" and txt(src, n) in LIBC_NAMES:
+            use = libc_use(src, n)
+            if use is not None:
+                top, is_call = use
+                libcs.append({"func": enclosing(src, n), "name": txt(src, n), "line": line_of(n),
+                              "form": "call" if is_call else "name",
+                              "nodekind": "call_expression" if is_call else "identifier",
+                              "text": txt(src, top) if is_call else txt(src, n), "err": has_error_ancestor(n)})
         if k in ("type_identifier", "identifier") and txt(src, n) in all_types:
             if has_error_ancestor(n) or _a(n, "is_missing"):
                 errtoks.append({"func": enclosing(src, n), "tok": txt(src, n), "line": line_of(n)})
@@ -2074,8 +2119,11 @@ def scan_file(rel, src, ctx):
             for m in re.finditer(rb"(?<![A-Za-z0-9_])" + re.escape(r.encode()) + rb"\s*(?:<[^>]*>)?\s*\(", clean):
                 raws.append({"func": "<lexical>", "name": r, "line": clean.count(b"\n", 0, m.start()) + 1,
                              "form": "lexical", "nodekind": "lexical", "text": r, "err": True})
+        for m in LIBC_CALL_RE.finditer(clean):
+            libcs.append({"func": "<lexical>", "name": m.group(1).decode(), "line": clean.count(b"\n", 0, m.start()) + 1,
+                          "form": "lexical", "nodekind": "lexical", "text": m.group(1).decode(), "err": True})
     return {"constructions": constructions, "raws": raws, "errtoks": errtoks, "forms": forms, "catches": catches,
-            "hrecs": hrecs, "root_error": root_error, "lexical": lexical, "lex_count": lex_count, "ast_count": ast_count}
+            "libcs": libcs, "hrecs": hrecs, "root_error": root_error, "lexical": lexical, "lex_count": lex_count, "ast_count": ast_count}
 
 
 def blank_comments_strings(src, root):
@@ -2271,6 +2319,14 @@ def analyse(files):
             seen[base] = i + 1
             viols.append(V("E-RAW", "%s#%d" % (base, i), rel, r["line"], r["func"], r["name"],
                            "raw allocator name %s (%s) outside the allowlist" % (r["name"], r["form"])))
+        seen = {}
+        for r in fa["libcs"]:
+            base = "%s::%s::%s:%s:%s" % (rel, r["func"], r["nodekind"], r["name"], text_hash(r["text"]))
+            i = seen.get(base, 0)
+            seen[base] = i + 1
+            viols.append(V("E-LIBC", "%s#%d" % (base, i), rel, r["line"], r["func"], r["name"],
+                           "libc allocation primitive %s (%s) outside the allowlist: the unified cache owns every byte "
+                           "the backend allocates" % (r["name"], r["form"])))
     s2d = s2d_findings(files)
     viols.extend(s2d.viols)
     stats["dormant"], stats["active"] = s2d.dormant, sorted(s2d.active)
@@ -3520,7 +3576,7 @@ def validate_data(allowlist, debt):
             errs.append("FAIL allowlist entry #%d is not an object" % i)
             continue
         need = ("id", "code", "reason", "count") + (("key",) if "key" in e else ("file", "function")) \
-            + (("name",) if e.get("code") == "E-RAW" else ())
+            + (("name",) if e.get("code") in RAW_CODES else ())
         miss = [k for k in need if k not in e]
         if miss:
             errs.append("FAIL allowlist entry %s lacks %s" % (e.get("id", "#%d" % i), ", ".join(miss)))
@@ -3560,12 +3616,18 @@ def validate_data(allowlist, debt):
             errs.append("FAIL debt entry %s %s: a finding of this code is allowlisted per node or fixed, never debt (only N-VOID and "
                         "N-NODISCARD, the declined results dropped today, are)" % (d["code"], d["key"]))
         seen[(d["code"], d["key"])] += 1
-        if d["code"] == "E-RAW" and not FATE_RE.match(str(d.get("fate", ""))):
-            errs.append("FAIL debt entry E-RAW %s has no valid fate (deleted-by-*, converted-by-*, sanctioned-internal, "
-                        "sanctioned-vendored, pending-disposition)" % d["key"])
-        if d["code"] == "E-RAW" and (not isinstance(d.get("cite"), str) or len(d["cite"].strip()) < CITE_MIN):
-            errs.append("FAIL debt entry E-RAW %s has no cite (a ticket id or a design/census row, at least %d characters)"
-                        % (d["key"], CITE_MIN))
+        if d["code"] in RAW_CODES and not FATE_RE.match(str(d.get("fate", ""))):
+            errs.append("FAIL debt entry %s %s has no valid fate (deleted-by-*, converted-by-*, sanctioned-internal, "
+                        "sanctioned-vendored, pending-disposition)" % (d["code"], d["key"]))
+        if d["code"] in RAW_CODES and (not isinstance(d.get("cite"), str) or len(d["cite"].strip()) < CITE_MIN):
+            errs.append("FAIL debt entry %s %s has no cite (a ticket id or a design/census row, at least %d characters)"
+                        % (d["code"], d["key"], CITE_MIN))
+        if d["code"] == "G-CATCH" and d["key"] == CHECK_TRY_ERROR_KEY and d.get("fate") != CHECK_TRY_ERROR_FATE:
+            errs.append("FAIL debt entry G-CATCH %s must carry fate %s (step 5.4a rewrites this handler) and no other"
+                        % (d["key"], CHECK_TRY_ERROR_FATE))
+        if "fate" in d and d["code"] not in RAW_CODES and not (d["code"] == "G-CATCH" and d["key"] == CHECK_TRY_ERROR_KEY):
+            errs.append("FAIL debt entry %s %s carries a fate; only E-RAW, E-LIBC and the one CHECK_TRY_ERROR G-CATCH entry may"
+                        % (d["code"], d["key"]))
     errs += ["FAIL debt entry %s %s is listed %d times" % (c, k, v) for (c, k), v in seen.items() if v > 1]
     return errs
 
@@ -3751,6 +3813,10 @@ WITNESSES = {
     "22": "unconverted_ticket is shrink-only and keyed by the construction node", "25": "a forward of cascade_step outside an allowlisted forward",
     "26": "cascade_step = <expr> other than the allowlisted callee's own parameter", "34": "a rethrow-less handler inside a #define body",
     "s2c-host": "host raw allocator names (malloc_host, aligned_alloc_host, zeMemAllocHost, sycl::malloc, the host chain's wrappers)",
+    "s3q": "clause (q): the C library's allocation primitives (mmap, posix_memalign, memalign, aligned_alloc, malloc, calloc, realloc, "
+           "VirtualAlloc) outside the allowlist; the committed entries are pinned by function, name and count",
+    "s3q-data": "an E-LIBC debt entry needs a fate and a cite, and an E-LIBC allowlist entry a name",
+    "s3q-pin": "the CHECK_TRY_ERROR handler's debt entry carries converted-by-5.4a and no other fate, and no other entry may carry a fate",
     "s2c-catch": "spellings and placements of the rethrow clause", "s2c-data": "clause-(h) entries that must be refused by validation",
     "9": "a model-shaped *_bytes() function is called by its allocation sites and by the zone sizing; dormant until defined",
     "27": "clause (j): A's fit and W's term read per-model sources only; the eligibility classifier is not called outside the late stage",
@@ -4702,9 +4768,11 @@ def matrix_cases():
         "#define zz_alloc(n, q) sycl :: malloc(n, q, sycl::usm::alloc::host)\n"), "FAIL", "E-RAW", "#define zz_alloc", planted=False))
     A(Case("s2c-host", "a string naming zeMemAllocHost", plant(
         "void zzplant_host() {\n    const char * s = \"zeMemAllocHost\";\n    (void) s;\n}\n"), "FAIL", "E-RAW", "zzplant_host"))
-    A(Case("s2c-host", "the C library's malloc and aligned_alloc are not USM entry points (control)", plant(
+    # S3-0 flips this on purpose: until then the C library's malloc and aligned_alloc were a PASS control here, because no clause saw
+    # them. Clause (q) now does, so they are findings of that clause (E-LIBC), not of clause (e)'s USM names.
+    A(Case("s2c-host", "the C library's malloc and aligned_alloc are clause (q)'s, not USM entry points: E-LIBC (flipped by S3-0)", plant(
         "void zzplant_host() {\n    void * a = std::malloc(16);\n    void * b = ::aligned_alloc(64, 64);\n    void * c = malloc(8);\n"
-        "    (void) a; (void) b; (void) c;\n}\n"), "PASS", planted=False))
+        "    (void) a; (void) b; (void) c;\n}\n"), "FAIL", "E-LIBC", "malloc"))
     A(Case("s2c-host", "a comment, a string and a longer identifier containing the name are not hits (control)", plant(
         "// sycl::malloc_host(16, q) and zeMemAllocHost\nvoid zzplant_host() {\n    int malloc_hostile = 1;\n    int my_malloc_host_count = 2;\n"
         "    const char * s = \"sycl::malloc_host aligned_alloc_host\";\n    (void) malloc_hostile; (void) my_malloc_host_count; (void) s;\n}\n"),
@@ -4734,6 +4802,7 @@ def matrix_cases():
     c.extend(matrix_cases_s2d3())
     c.extend(matrix_cases_s2d4())
     c.extend(matrix_cases_s2d5())
+    c.extend(matrix_cases_s3q())
     return c
 
 
@@ -5520,6 +5589,136 @@ def s2d_witnesses(files, allowlist, debt):
     return out
 
 
+def matrix_cases_s3q():
+    """S3-0: clause (q), the C library's allocation primitives, and the pin on the one G-CATCH debt entry that carries a fate."""
+    c = []
+    A = c.append
+
+    def plant_q(expr, name="zzplant_q"):
+        return plant("void %s() {\n    void * p = nullptr;\n    (void) %s;\n    (void) p;\n}\n" % (name, expr))
+
+    for nm, call in (("malloc", "std::malloc(16)"), ("malloc", "malloc(16)"), ("malloc", "::malloc(16)"),
+                     ("calloc", "std::calloc(4, 4)"), ("calloc", "calloc(4, 4)"), ("realloc", "realloc(nullptr, 16)"),
+                     ("realloc", "std::realloc(p, 16)"), ("aligned_alloc", "::aligned_alloc(64, 64)"),
+                     ("aligned_alloc", "std::aligned_alloc(64, 64)"), ("posix_memalign", "posix_memalign(&p, 64, 16)"),
+                     ("memalign", "memalign(64, 16)"), ("mmap", "mmap(nullptr, 16, 3, 34, -1, 0)"),
+                     ("mmap", "::mmap(nullptr, 16, 3, 34, -1, 0)"), ("VirtualAlloc", "VirtualAlloc(nullptr, 16, 0, 0)")):
+        A(Case("s3q", "a new call of %s" % call.split("(")[0], plant_q(call), "FAIL", "E-LIBC", nm))
+    A(Case("s3q", "the address of std::malloc taken", plant(
+        "void zzplant_q() {\n    auto f = &std::malloc;\n    (void) f;\n}\n"), "FAIL", "E-LIBC", "malloc"))
+    A(Case("s3q", "malloc used as a value", plant(
+        "void zzplant_q() {\n    auto f = malloc;\n    (void) f;\n}\n"), "FAIL", "E-LIBC", "malloc"))
+    A(Case("s3q", "a macro whose body calls std::malloc", plant("#define zz_alloc(n) std::malloc(n)\n"),
+           "FAIL", "E-LIBC", "#define zz_alloc", planted=False))
+    A(Case("s3q", "a macro whose body calls a bare mmap", plant("#define zz_map(n) mmap(nullptr, n, 3, 34, -1, 0)\n"),
+           "FAIL", "E-LIBC", "#define zz_map", planted=False))
+    A(Case("s3q", "a macro whose body spells a `  ::  calloc` call across spaces", plant("#define zz_calloc(n) ::  calloc(n, 1)\n"),
+           "FAIL", "E-LIBC", "#define zz_calloc", planted=False))
+    A(Case("s3q", "a call planted in the ERROR-root file cpu-dispatch.cpp is found by the lexical pass", append_to("cpu-dispatch.cpp",
+        "void zzplant_q19() {\n    void * p = malloc(16);\n    (void) p;\n}\n"), "FAIL", "E-LIBC", "malloc"))
+    A(Case("s3q", "a member call, a pool-qualified call and a method declaration are not hits (control)", plant(
+        "struct zz_pool {\n    void * malloc(unsigned long n);\n    void * realloc(void * p, unsigned long n);\n};\n"
+        "void * zz_pool::malloc(unsigned long n) { return nullptr; }\n"
+        "void zzplant_q(zz_pool & pool, zz_pool * pp) {\n    void * a = pool.realloc(nullptr, 16);\n    void * b = pp->malloc(16);\n"
+        "    void * c = zz_pool::malloc(8);\n    (void) a; (void) b; (void) c;\n}\n"), "PASS", planted=False))
+    A(Case("s3q", "a declaration of a function named malloc or mmap is not a use (control)", plant(
+        "void * malloc(unsigned long n);\nvoid * mmap(void * a, unsigned long n, int p, int f, int fd, long o);\n"
+        "void zzplant_q() {\n}\n"), "PASS", planted=False))
+    A(Case("s3q", "a comment, a string and longer identifiers containing the names are not hits (control)", plant(
+        "// malloc(16) and std::calloc(4, 4) and mmap(0, 1, 2, 3, 4, 5)\nvoid zzplant_q() {\n    int my_malloc = 1;\n    int mallocs = 2;\n"
+        "    int calloc_count = 3;\n    const char * s = \"malloc posix_memalign mmap\";\n"
+        "    (void) my_malloc; (void) mallocs; (void) calloc_count; (void) s;\n}\n"), "PASS", planted=False))
+    A(Case("s3q", "sycl::malloc stays clause (e)'s: one E-RAW entry covers it and no E-LIBC finding appears (control)", plant(
+        "void zzplant_q(sycl::queue & q) {\n    void * p = sycl::malloc(16, q, sycl::usm::alloc::host);\n    (void) p;\n}\n"),
+        "PASS", allowlist={"id": "E-ZZ-SYCL-MALLOC", "code": "E-RAW", "file": PLANT, "function": "zzplant_q", "name": "malloc",
+                           "count": 1, "reason": "mutation-matrix test entry"}, planted=False))
+    A(Case("s3q", "an E-LIBC allowlist entry covers its function, name and count (control)", plant_q("std::malloc(16)"), "PASS",
+           allowlist={"id": "E-ZZ-LIBC", "code": "E-LIBC", "file": PLANT, "function": "zzplant_q", "name": "malloc", "count": 1,
+                      "reason": "mutation-matrix test entry"}, planted=False))
+    A(Case("s3q", "an E-LIBC entry pins the primitive: a calloc beside the allowlisted malloc is a finding", plant(
+        "void zzplant_q() {\n    void * p = nullptr;\n    (void) std::malloc(16);\n    (void) std::calloc(1, 16);\n    (void) p;\n}\n"),
+        "FAIL", "E-LIBC", "calloc", allowlist={"id": "E-ZZ-LIBC", "code": "E-LIBC", "file": PLANT, "function": "zzplant_q",
+                                              "name": "malloc", "count": 1, "reason": "mutation-matrix test entry"}, planted=False))
+    A(Case("s3q", "an E-LIBC entry pins the count: a second malloc breaks it", plant(
+        "void zzplant_q() {\n    (void) std::malloc(16);\n    (void) std::malloc(32);\n}\n"),
+        "FAIL", "allowlist", "E-ZZ-LIBC covers 2 finding(s) but pins 1", allowlist={
+            "id": "E-ZZ-LIBC", "code": "E-LIBC", "file": PLANT, "function": "zzplant_q", "name": "malloc", "count": 1,
+            "reason": "mutation-matrix test entry"}, planted=False))
+    A(Case("s3q", "an E-LIBC entry for a function that has no such call matches nothing", plant(
+        "void zzplant_q() {\n}\n"), "FAIL", "allowlist", "E-ZZ-LIBC matches nothing", allowlist={
+            "id": "E-ZZ-LIBC", "code": "E-LIBC", "file": PLANT, "function": "zzplant_q", "name": "malloc", "count": 1,
+            "reason": "mutation-matrix test entry"}, planted=False))
+    # the committed entries
+    A(Case("s3q", "a second std::malloc in dpct's host_buffer breaks its pin", replace_in_function(
+        "dpct/helper.hpp", r"host_buffer\(size_t size", "_buf(std::malloc(size))", "_buf(std::malloc(size)), _zz(std::malloc(size))"),
+        "FAIL", "allowlist", "E-LIBC-DPCT-HOSTBUF-MALLOC covers 3 finding(s) but pins 2", planted=False))
+    A(Case("s3q", "calloc swapped in for dpct's malloc is a finding of its own", replace_in_function(
+        "dpct/helper.hpp", r"host_buffer\(size_t size", "std::malloc(size)", "std::calloc(size, 1)"),
+        "FAIL", "E-LIBC", "calloc", planted=False))
+    A(Case("s3q", "dpct's mem_mgr constructor renamed leaves its mmap entry matching nothing", replace_in_function(
+        "dpct/helper.hpp", r"class mem_mgr\s*\{", "mem_mgr()", "mem_mgr_zz()"),
+        "FAIL", "allowlist", "E-LIBC-DPCT-MMGR-MMAP matches nothing", planted=False))
+    A(Case("s3q", "a second mmap in cache_guard_allocator breaks its permanent entry", insert_after(
+        "unified-cache.hpp", "const size_t mapping_size = usable + page_size;",
+        "\n        void * zz_second = mmap(nullptr, mapping_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\n        (void) zz_second;"),
+        "FAIL", "allowlist", "E-LIBC-CACHE-GUARD covers 2 finding(s) but pins 1", planted=False))
+    A(Case("s3q", "cache_guard_allocator renamed leaves its entry matching nothing", replace_token(
+        "unified-cache.hpp", "cache_guard_allocator", "cache_guard_allocator_zz"),
+        "FAIL", "allowlist", "E-LIBC-CACHE-GUARD matches nothing", planted=False))
+    A(Case("s3q", "weight_cache_allocator's mmap deleted leaves its debt entry stale", replace_in_function(
+        "ggml-sycl.cpp", r"template <typename T> struct weight_cache_allocator \{", "mmap(nullptr, mapping_size", "zz_map(nullptr, mapping_size"),
+        "FAIL", "debt", "weight_cache_allocator::allocate::call_expression:mmap", planted=False))
+    A(Case("s3q", "a second posix_memalign in weight_cache_allocator is a new finding", replace_in_function(
+        "ggml-sycl.cpp", r"template <typename T> struct weight_cache_allocator \{", "if (posix_memalign(&base, alignment, aligned_total) != 0 || !base) {",
+        "void * zz_b = nullptr;\n        (void) posix_memalign(&zz_b, alignment, aligned_total);\n"
+        "        if (posix_memalign(&base, alignment, aligned_total) != 0 || !base) {"),
+        "FAIL", "E-LIBC", "posix_memalign", planted=False))
+
+    def libc_debt(edit):
+        return lambda d: dict(d, violations=[edit(e) if e["code"] == "E-LIBC" else e for e in d["violations"]])
+
+    A(Case("s3q-data", "an E-LIBC debt entry without a fate fails", lambda f: f, "FAIL", "data", "no valid fate",
+           edit_debt=libc_debt(lambda e: {k: v for k, v in e.items() if k != "fate"}), planted=False))
+    A(Case("s3q-data", "an E-LIBC debt entry with a made-up fate fails", lambda f: f, "FAIL", "data", "no valid fate",
+           edit_debt=libc_debt(lambda e: dict(e, fate="whatever")), planted=False))
+    A(Case("s3q-data", "an E-LIBC debt entry without a cite fails", lambda f: f, "FAIL", "data", "has no cite",
+           edit_debt=libc_debt(lambda e: {k: v for k, v in e.items() if k != "cite"}), planted=False))
+    A(Case("s3q-data", "an E-LIBC debt entry with a one-word cite fails", lambda f: f, "FAIL", "data", "has no cite",
+           edit_debt=libc_debt(lambda e: dict(e, cite="tbd")), planted=False))
+    A(Case("s3q-data", "an E-LIBC allowlist entry without a name is rejected", lambda f: f, "FAIL", "data", "lacks name",
+           edit_allowlist=lambda al: dict(al, entries=[{k: v for k, v in e.items() if k != "name"} if e["id"] == "E-LIBC-CACHE-GUARD" else e
+                                                       for e in al["entries"]]), planted=False))
+
+    def catch_debt(edit, which):
+        def f(d):
+            out, done = [], False
+            for e in d["violations"]:
+                if not done and which(e):
+                    e, done = edit(e), True
+                out.append(e)
+            return dict(d, violations=out)
+        return f
+
+    def is_check_try(e):
+        return e["code"] == "G-CATCH" and e["key"] == CHECK_TRY_ERROR_KEY
+
+    def is_other_catch(e):
+        return e["code"] == "G-CATCH" and e["key"] != CHECK_TRY_ERROR_KEY
+
+    A(Case("s3q-pin", "the CHECK_TRY_ERROR entry without its fate fails", lambda f: f, "FAIL", "data",
+           "must carry fate converted-by-5.4a", edit_debt=catch_debt(lambda e: {k: v for k, v in e.items() if k != "fate"}, is_check_try),
+           planted=False))
+    for fate in ("deleted-by-step-7", "sanctioned-internal", "pending-disposition", "converted-by-5.4b"):
+        A(Case("s3q-pin", "the CHECK_TRY_ERROR entry with fate %s fails" % fate, lambda f: f, "FAIL", "data",
+               "must carry fate converted-by-5.4a", edit_debt=catch_debt(lambda e, fate=fate: dict(e, fate=fate), is_check_try),
+               planted=False))
+    A(Case("s3q-pin", "another G-CATCH entry carrying converted-by-5.4a fails", lambda f: f, "FAIL", "data", "carries a fate",
+           edit_debt=catch_debt(lambda e: dict(e, fate="converted-by-5.4a"), is_other_catch), planted=False))
+    A(Case("s3q-pin", "an N-VOID entry carrying a fate fails", lambda f: f, "FAIL", "data", "carries a fate",
+           edit_debt=catch_debt(lambda e: dict(e, fate="deleted-by-step-7"), lambda e: e["code"] == "N-VOID"), planted=False))
+    return c
+
+
 def matrix_cases_s2d2():
     """Clause (p), witnesses 37 and 38. A FAIL case mutates the b1 (or b2) fixture; a PASS control asserts the block is active,
     or, on today's tree, dormant."""
@@ -5797,6 +5996,7 @@ def planted_sightings(files):
         n += sum(1 for c in fa["constructions"] if "zz" in c["key"] or "zz" in c["func"])
         n += sum(1 for r in fa["lexical"] if r["var"].startswith("zz"))
         n += sum(1 for r in fa["raws"] if "zz" in r["func"])
+        n += sum(1 for r in fa["libcs"] if "zz" in r["func"])
         n += sum(1 for r in fa["forms"] if "zz" in r["func"])
         n += sum(1 for r in fa["catches"] if "zz" in r["func"])
         n += sum(1 for r in fa["hrecs"] if "zz" in r["func"])
