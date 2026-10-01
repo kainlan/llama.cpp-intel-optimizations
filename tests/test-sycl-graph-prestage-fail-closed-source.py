@@ -29,13 +29,28 @@ host-resident input), so each now goes through graph_prestage_or_decline and, on
 directly. The gate enumerates every call of graph_prestage_leaf_tensors: the only legal caller is
 graph_prestage_or_decline itself, so a new recording site that pre-stages without consuming the result fails.
 
-A declined pre-stage must not leave a recorded graph that points at a staging buffer it may have replaced
-(review r5). graph_input_stage drops an input's staging handle before it allocates the replacement, so a
-failure partway through can leave a live exec graph, MoE segments, block graphlets or dense range graphs
-with a baked pointer to freed memory. The only owner of that handle is the per-context staging map (it is not
-in graph_retained_handles); it is cleared by sycl_exec_graph_clear_active after a queue wait. So each decline
-drops the recorded state it could have invalidated: clear_active (which waits) for the exec graph, and the
-epoch-retiring invalidators the MoE and dense paths already use.
+The staging handle and every recorder that baked its pointer (review r5, r6). graph_input_stage used to drop an
+input's staging handle BEFORE allocating the replacement. The drop frees the buffer with no event gate while a
+replay from the previous token may still be reading it (the pre-stage does not drain), and a failed allocation
+left no entry at all. The only owner of that handle is the per-context staging map; it is not in
+graph_retained_handles, and no recorder's retained set holds it (it is created before any recording starts, so
+the recording sink never sees it). Closing it takes four parts, each pinned below:
+  * graph_input_stage allocates the replacement into a LOCAL and swaps it into the map only on success, so a
+    failure leaves the old entry live;
+  * the displaced handle is RETIRED (graph_input_staging_retired), not freed, and the swap sets
+    graph_input_staging_swapped. The retired list is released only by graph_input_staging_clear, which
+    sycl_exec_graph_clear_active reaches after a queue wait (it waits whenever the retired list is non-empty);
+  * a staging failure for an INPUT tensor is terminal for the pass (all_staged = false). It no longer falls
+    through to the cache or staging-cache paths, which could succeed and let the pre-stage report true with the
+    entry already displaced;
+  * graph_prestage_or_decline, the single gateway every recorder passes, consumes the swapped flag and retires
+    EVERY recorder that may have baked the old pointer (graph_staging_swap_retire: dense range graphs, MoE
+    segments, block graphlets, direct-dispatch and sequence graphs, then the exec graph through clear_active),
+    then pre-stages again, because clear_active empties the staging map.
+Only this swap retire is load-bearing for the pointer. The per-site retires at a DECLINE (dense drop_graphs, MoE
+invalidators, clear_active at the re-record decline) are conservative and are NOT claimed to cover it: a decline
+that follows no swap leaves every recorded pointer valid, and a swap is handled at the gateway whether the
+pass then succeeds or declines.
 
 The decline memo (review fold M2) lives on the context, not in a thread_local slot: a (ctx pointer, hash) slot
 was evicted by every other signature (PP and decode alternate) and was keyed by an address a new context can
@@ -171,8 +186,17 @@ def evaluate(backend, common, memo_hdr):
         "last_seq" in memo_hdr and re.search(r"bool\s+skip\(uint64_t\s+hash,\s*uint64_t\s+seq\)", memo_hdr) is not None
     results["the context numbers its graph computes, so the memo can tell tokens apart"] = \
         re.search(r"graph_compute_seq\s*(=\s*0)?\s*;", common) is not None and \
-        re.search(r"(\+\+\s*sycl_ctx->graph_compute_seq|sycl_ctx->graph_compute_seq\s*\+\+)", compute) is not None and \
+        re.search(r"\+\+sycl_ctx->graph_compute_seq;", compute) is not None and \
         0 <= re.search(r"graph_compute_seq", compute).start() < compute.find("graph_prestage_skip_declined(")
+    # The bump is an UNCONDITIONAL top-level statement ahead of every early return: a bump under an `if`, inside a
+    # nested block, or after a return does not number every token, and the memo then miscounts.
+    bump = re.search(r"\+\+sycl_ctx->graph_compute_seq;", compute)
+    ctx_def = re.search(r"auto \* sycl_ctx = static_cast<ggml_backend_sycl_context \*>\(backend->context\);", compute)
+    results["the token number is bumped unconditionally, at top level, before any early return"] = \
+        bool(bump and ctx_def and bump.start() > ctx_def.end() and
+             compute[:bump.start()].count("{") - compute[:bump.start()].count("}") == 1 and
+             compute[:bump.start()].rstrip()[-1:] in (";", "{", "}") and
+             re.search(r"\breturn\b", compute[ctx_def.end():bump.start()]) is None)
     results["the dense split key is namespaced, so one memo never mixes two key spaces"] = \
         re.search(r"static\s+uint64_t\s+dense_split_key\(", memo_hdr) is not None
     results["a successful pre-stage forgets an earlier decline"] = "prestage_decline_memo.forget(graph_hash)" in decline
@@ -227,7 +251,7 @@ def evaluate(backend, common, memo_hdr):
                   r"\)\s*\{\s*graphs_off_\s*=\s*ggml_sycl::DENSE_GRAPH_OFF_STAGE_FAILED;\s*st\.drop_graphs\(ctx_\);\s*return;\s*\}",
                   dense) is not None
     results["site 2, MoE block graphlets: declines, invalidates them and returns false to the direct fallback"] = re.search(
-        r"if\s*\(!" + call % r"sycl_ctx,\s*cgraph,\s*graph_hash" + r"\)\s*\{[^{}]*invalidate_moe_block_graphs\(\);[^{}]*\breturn false;\s*\}",
+        r"if\s*\(!" + call % r"sycl_ctx,\s*cgraph,\s*graph_hash" + r"\)\s*\{[^{}]*;\s*sycl_ctx->invalidate_moe_block_graphs\(\);\s*return false;\s*\}",
         graphlets) is not None
     site = r"if\s*\(!" + call % r"sycl_ctx,\s*cgraph,\s*graph_hash" + r"\)\s*\{\s*"
     results["site 3, MoE segment replay: declines, invalidates the segments, runs direct, else replays"] = re.search(
@@ -276,6 +300,59 @@ def evaluate(backend, common, memo_hdr):
              ("first-record begin_recording", begin[1] if len(begin) == 2 else -1)]
     results["the recording sites keep their order, each decline between its neighbours (and before its recording)"] = \
         all(at >= 0 for _, at in chain) and all(chain[i][1] < chain[i + 1][1] for i in range(len(chain) - 1))
+
+    # --- staging handle swap (review r6) ------------------------------------------------------------------------
+    stage_fn = function_body(common, r"void \* graph_input_stage\(const ggml_tensor \* owner,[^)]*\)\s*\{") or ""
+    clear_fn = function_body(common, r"void graph_input_staging_clear\(sycl::queue & q\)\s*\{") or ""
+    results["graph_input_stage allocates the replacement before it touches the entry (no drop-then-allocate)"] = \
+        bool(stage_fn) and "unified_allocate_owner(" in stage_fn and \
+        re.search(r"it->second\.handle\s*=\s*ggml_sycl::mem_handle\s*\{\s*\}", stage_fn) is None and \
+        all(m.start() > stage_fn.find("unified_allocate_owner(")
+            for m in re.finditer(r"graph_input_staging\[owner\]|graph_input_staging_retired\.push_back", stage_fn)) and \
+        re.search(r"graph_input_staging\[owner\]", stage_fn) is not None
+    results["the displaced staging handle is retired, not freed, and the swap is flagged"] = \
+        re.search(r"if\s*\(\s*slot\.handle\.valid\(\)\s*\)\s*\{\s*graph_input_staging_retired\.push_back\(std::move\(slot\.handle\)\);\s*"
+                  r"graph_input_staging_swapped\s*=\s*true;\s*\}\s*slot\.handle\s*=\s*std::move\(handle\);", stage_fn) is not None
+    results["the context owns the retired list and the swapped flag, and clear releases the list"] = \
+        re.search(r"std::vector<ggml_sycl::mem_handle>\s+graph_input_staging_retired\s*;", common) is not None and \
+        re.search(r"bool\s+graph_input_staging_swapped\s*=\s*false\s*;", common) is not None and \
+        "graph_input_staging_retired.clear();" in clear_fn
+    results["a staging failure for an INPUT tensor is terminal for the pass (no fallthrough to the cache paths)"] = \
+        re.search(r"graph_input_stage\([^;]*;\s*if\s*\(\s*!dev_ptr\s*\)\s*\{[^{}]*\ball_staged\s*=\s*false;\s*return;\s*\}", prestage) is not None
+    results["the gateway consumes the swapped flag: retire every recorder, then pre-stage again"] = \
+        re.search(r"bool staged = graph_prestage_leaf_tensors\(ctx, cgraph\);\s*if\s*\(ctx->graph_input_staging_swapped\)\s*\{\s*"
+                  r"graph_staging_swap_retire\(ctx\);\s*staged = staged && graph_prestage_leaf_tensors\(ctx, cgraph\);\s*\}\s*"
+                  r"if\s*\(staged\)\s*\{", decline) is not None
+    swap_fn = function_body(backend, r"static void graph_staging_swap_retire\(ggml_backend_sycl_context \* ctx\)\s*\{") or ""
+    order = ["ctx->graph_input_staging_swapped = false;", "ggml_sycl_block_exec_dense_drop_graphs(ctx);",
+             "ctx->invalidate_moe_segments();", "ctx->invalidate_moe_block_graphs();",
+             "ctx->invalidate_moe_direct_dispatch_graphs();", "ctx->invalidate_moe_sequence_graphs();",
+             "sycl_exec_graph_clear_active(ctx, \"staging-swapped\");"]
+    at = [swap_fn.find(t) for t in order]
+    results["the swap retire clears the flag, drops dense, retires every MoE epoch, then clears the exec graph"] = \
+        bool(swap_fn) and all(x >= 0 for x in at) and at == sorted(at)
+    dense_drop = function_body(backend, r"static void ggml_sycl_block_exec_dense_drop_graphs\(ggml_backend_sycl_context \* ctx\)\s*\{") or ""
+    results["the dense drop helper drops a state that exists and does not create one"] = \
+        "drop_graphs(*ctx)" in dense_drop and "find(ctx)" in dense_drop and "state_for(" not in dense_drop
+    gw_at = dense.find("graph_prestage_or_decline(")
+    results["the dense recorder re-sizes its range graphs after the gateway may have retired them"] = \
+        gw_at >= 0 and re.search(r"st\.graphs\.resize\(ranges_\.size\(\)\);", dense[gw_at:]) is not None
+
+    # Every release of recorded state waits first, under the guard that says there is something in flight (review r6).
+    clear_active = function_body(backend, r"static void sycl_exec_graph_clear_active\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{") or ""
+    wait_at = re.search(r"if\s*\(\s*ctx->exec_graph\s*\|\|\s*!ctx->graph_input_staging_retired\.empty\(\)\s*\)\s*\{\s*"
+                        r"ggml_sycl_trace_queue_wait\(ctx->stream\(\)", clear_active)
+    results["clear_active waits on the queue before it resets the exec graph or releases the staging"] = \
+        bool(wait_at) and 0 <= wait_at.start() < clear_active.find("ctx->exec_graph.reset()") < \
+        clear_active.find("graph_input_staging_clear(")
+    drop_fn = function_body(backend, r"void ggml_sycl_block_exec_dense_state::drop_graphs\(ggml_backend_sycl_context & ctx\)\s*\{") or ""
+    results["drop_graphs drains each used device before it clears the range graphs"] = \
+        re.search(r"if\s*\(!used\[d\]\)\s*\{\s*continue;\s*\}\s*try\s*\{\s*ggml_sycl_block_exec_dense_queue\(ctx, d\)->wait_and_throw\(\);", drop_fn) is not None \
+        and drop_fn.find("wait_and_throw()") < drop_fn.find("graphs.clear()")
+    retire_fn = function_body(backend, r"static bool moe_graph_retention_retire_exact\(ggml_backend_sycl_context \* ctx\)\s*\{") or ""
+    results["retire_exact drains every terminal's queue before it retires the epoch"] = \
+        re.search(r"for\s*\(const auto & \[device, _\] : ctx->moe_retention_terminals\)\s*\{\s*ctx->stream\(device, 0\)->wait_and_throw\(\);", retire_fn) is not None \
+        and retire_fn.find("wait_and_throw()") < retire_fn.find("retire_exact(ctx->moe_retention_epoch)")
     return results
 
 
@@ -328,6 +405,12 @@ if args.self_test:
     cmp_sig = r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{"
     # the first full-graph recording site (the debug line just above it is the anchor)
     full_sig = r"Pre-staging leaf tensors before recording[^;]*;"
+    stage_sig = r"void \* graph_input_stage\(const ggml_tensor \* owner,[^)]*\)\s*\{"
+    swap_sig = r"static void graph_staging_swap_retire\(ggml_backend_sycl_context \* ctx\)\s*\{"
+    dense_drop_sig = r"static void ggml_sycl_block_exec_dense_drop_graphs\(ggml_backend_sycl_context \* ctx\)\s*\{"
+    clear_sig = r"static void sycl_exec_graph_clear_active\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{"
+    drop_sig = r"void ggml_sycl_block_exec_dense_state::drop_graphs\(ggml_backend_sycl_context & ctx\)\s*\{"
+    retire_sig = r"static bool moe_graph_retention_retire_exact\(ggml_backend_sycl_context \* ctx\)\s*\{"
     def move_first_record_decline(src):
         """Move the first-record decline block, with its debug string, to just after that recording begins."""
         m = re.search(r"GGML_SYCL_DEBUG\(\"\[SYCL-GRAPH\] Pre-staging leaf tensors before recording[^;]*;\s*"
@@ -463,6 +546,62 @@ if args.self_test:
          (backend, common, mem_.replace("last_seq", "last_sXq"))),
         ("context stops numbering its computes", "the context numbers its graph computes, so the memo can tell tokens apart",
          (mutate_in_func(backend, cmp_sig, "++sycl_ctx->graph_compute_seq", "(void) sycl_ctx"), common, mem_)),
+        # staging swap (review r6)
+        ("drop-then-allocate returns", "graph_input_stage allocates the replacement before it touches the entry (no drop-then-allocate)",
+         (backend, mutate_in_func(common, stage_sig, "ggml_sycl::alloc_request req{};",
+                                  "if (it != graph_input_staging.end()) { it->second.handle = ggml_sycl::mem_handle{}; }\n"
+                                  "        ggml_sycl::alloc_request req{};"), mem_)),
+        ("the displaced handle is freed at the swap", "the displaced staging handle is retired, not freed, and the swap is flagged",
+         (backend, mutate_in_func(common, stage_sig, "graph_input_staging_retired.push_back(std::move(slot.handle));",
+                                  "slot.handle = ggml_sycl::mem_handle{};"), mem_)),
+        ("the swap is not flagged", "the displaced staging handle is retired, not freed, and the swap is flagged",
+         (backend, mutate_in_func(common, stage_sig, "graph_input_staging_swapped = true;", "(void) slot;"), mem_)),
+        ("clear forgets the retired list", "the context owns the retired list and the swapped flag, and clear releases the list",
+         (backend, mutate(common, "graph_input_staging_retired.clear();", "(void) q;"), mem_)),
+        ("an INPUT staging failure falls through", "a staging failure for an INPUT tensor is terminal for the pass (no fallthrough to the cache paths)",
+         (mutate_re(backend, pre_sig, r"if \(!dev_ptr\) \{", "if (false) {"), common, mem_)),
+        ("the gateway ignores the swapped flag", "the gateway consumes the swapped flag: retire every recorder, then pre-stage again",
+         (mutate_in_func(backend, dec_sig, "if (ctx->graph_input_staging_swapped) {", "if (false) {"), common, mem_)),
+        ("the gateway does not pre-stage again", "the gateway consumes the swapped flag: retire every recorder, then pre-stage again",
+         (mutate_in_func(backend, dec_sig, "staged = staged && graph_prestage_leaf_tensors(ctx, cgraph);", "(void) staged;"), common, mem_)),
+        ("the swap retire forgets dense", "the swap retire clears the flag, drops dense, retires every MoE epoch, then clears the exec graph",
+         (mutate_in_func(backend, swap_sig, "ggml_sycl_block_exec_dense_drop_graphs(ctx);", ""), common, mem_)),
+        ("the swap retire forgets the direct-dispatch graphs", "the swap retire clears the flag, drops dense, retires every MoE epoch, then clears the exec graph",
+         (mutate_in_func(backend, swap_sig, "ctx->invalidate_moe_direct_dispatch_graphs();", ""), common, mem_)),
+        ("the swap retire forgets the sequence graphs", "the swap retire clears the flag, drops dense, retires every MoE epoch, then clears the exec graph",
+         (mutate_in_func(backend, swap_sig, "ctx->invalidate_moe_sequence_graphs();", ""), common, mem_)),
+        ("the swap retire clears the exec graph first", "the swap retire clears the flag, drops dense, retires every MoE epoch, then clears the exec graph",
+         (mutate_in_func(backend, swap_sig, "sycl_exec_graph_clear_active(ctx, \"staging-swapped\");", ""), common, mem_)),
+        ("the dense drop helper creates a state", "the dense drop helper drops a state that exists and does not create one",
+         (mutate_in_func(backend, dense_drop_sig, "find(ctx)", "find(ctx); (void) ggml_sycl_block_exec_dense_state_for(*ctx)"), common, mem_)),
+        ("dense does not re-size after the gateway", "the dense recorder re-sizes its range graphs after the gateway may have retired them",
+         (mutate(backend, "if (st.graphs.size() != ranges_.size()) {", "if (false) {"), common, mem_)),
+        # waits before releases (review r6)
+        ("clear_active loses its wait", "clear_active waits on the queue before it resets the exec graph or releases the staging",
+         (mutate_in_func(backend, clear_sig, "ggml_sycl_trace_queue_wait(ctx->stream(), reason ? reason : \"exec-graph-clear\", ctx->device, -1, nullptr);", ""), common, mem_)),
+        ("clear_active's wait guard goes dead", "clear_active waits on the queue before it resets the exec graph or releases the staging",
+         (mutate_in_func(backend, clear_sig, "if (ctx->exec_graph || !ctx->graph_input_staging_retired.empty()) {", "if (false) {"), common, mem_)),
+        ("clear_active's guard forgets the retired list", "clear_active waits on the queue before it resets the exec graph or releases the staging",
+         (mutate_in_func(backend, clear_sig, "if (ctx->exec_graph || !ctx->graph_input_staging_retired.empty()) {", "if (ctx->exec_graph) {"), common, mem_)),
+        ("drop_graphs loses its drain", "drop_graphs drains each used device before it clears the range graphs",
+         (mutate_in_func(backend, drop_sig, "ggml_sycl_block_exec_dense_queue(ctx, d)->wait_and_throw();", "(void) d;"), common, mem_)),
+        ("drop_graphs' drain guard goes dead", "drop_graphs drains each used device before it clears the range graphs",
+         (mutate_in_func(backend, drop_sig, "if (!used[d]) {", "if (true) {"), common, mem_)),
+        ("retire_exact loses its drain", "retire_exact drains every terminal's queue before it retires the epoch",
+         (mutate_in_func(backend, retire_sig, "ctx->stream(device, 0)->wait_and_throw();", "(void) device;"), common, mem_)),
+        ("retire_exact's drain loop goes empty", "retire_exact drains every terminal's queue before it retires the epoch",
+         (mutate_in_func(backend, retire_sig, "for (const auto & [device, _] : ctx->moe_retention_terminals)",
+                         "for (const auto & [device, _] : decltype(ctx->moe_retention_terminals){})"), common, mem_)),
+        # review r6 minors
+        ("the graphlet invalidate sits under a dead if", "site 2, MoE block graphlets: declines, invalidates them and returns false to the direct fallback",
+         (mutate_re(backend, r"static bool moe_graph_try_block_graphlets\([^)]*\)\s*\{", r"\"stage-failed\"\);\s*sycl_ctx->invalidate_moe_block_graphs\(\);",
+                    "\"stage-failed\"); if (false) sycl_ctx->invalidate_moe_block_graphs();"), common, mem_)),
+        ("the token number is bumped under a condition", "the token number is bumped unconditionally, at top level, before any early return",
+         (mutate_in_func(backend, cmp_sig, "++sycl_ctx->graph_compute_seq;", "if (sycl_ctx->exec_graph) ++sycl_ctx->graph_compute_seq;"), common, mem_)),
+        ("the token number is bumped in a nested block", "the token number is bumped unconditionally, at top level, before any early return",
+         (mutate_in_func(backend, cmp_sig, "++sycl_ctx->graph_compute_seq;", "if (sycl_ctx->device >= 0) {\n ++sycl_ctx->graph_compute_seq;\n }"), common, mem_)),
+        ("the token number is bumped after an early return", "the token number is bumped unconditionally, at top level, before any early return",
+         (mutate_in_func(backend, cmp_sig, "++sycl_ctx->graph_compute_seq;", "if (cgraph->n_nodes == 0) { return GGML_STATUS_SUCCESS; }\n ++sycl_ctx->graph_compute_seq;"), common, mem_)),
         ("a seventh recorder appears", "no unnamed pre-stage consumer: the six recording sites below are all there are",
          (backend + "\nstatic bool new_recorder(ggml_backend_sycl_context * c, const ggml_cgraph * g) "
                     "{ if (!graph_prestage_or_decline(c, g, 1)) { return false; } return true; }\n", common, mem_)),
