@@ -386,6 +386,15 @@ void zone_sizing_record_observation(const char * path) {
     state.table[path_key(path)].observations += 1;
 }
 
+void zone_sizing_record_observations(const char * path, size_t count) {
+    if (count == 0) {
+        return;
+    }
+    underestimate_state &       state = underestimates();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.table[path_key(path)].observations += count;
+}
+
 size_t zone_sizing_observation_count(const char * path) {
     return underestimate_field(path, &underestimate_record::observations);
 }

@@ -125,6 +125,8 @@ def evaluate(backend, common, cache, zone):
     acquire = function_body(backend, r"static void \* ggml_sycl_planned_scratch_acquire\([^)]*\)\s*\{")
     runtime_ensure = function_body(common, r"inline void \* ggml_sycl_runtime_scratch_ensure\([^)]*\)\s*\{")
     pin = function_body(backend, r"static void ggml_sycl_planned_scratch_pin\([^)]*\)\s*\{")
+    stats_fn = function_body(backend, r"void ggml_backend_sycl_context::log_planned_scratch_stats\(\)\s*\{") or ""
+    results["anchor: stats function exists"] = bool(stats_fn)
     q8_lambda_at = backend.find("auto acquire_planned_q8")
     q8_lambda = backend[q8_lambda_at:q8_lambda_at + 900] if q8_lambda_at >= 0 else None
     results["anchor: dequant_f16_scratch_t exists"] = dq_struct is not None
@@ -240,7 +242,7 @@ def evaluate(backend, common, cache, zone):
     # The pin is conditional on THIS thread recording, and made once per backing per recording rather than once
     # per op (every pin is a retention-sink entry that lives as long as the graph).
     results["the pin is conditional on this thread recording"] = \
-        re.match(r"\s*if\s*\(\s*!\s*ggml_sycl_graph_recording_this_thread\(\)\s*\)\s*\{?\s*return", pin) is not None
+        re.match(r"\s*\{\s*if\s*\(\s*!\s*ggml_sycl_graph_recording_this_thread\(\)\s*\)\s*\{?\s*return", pin) is not None
     results["the pin is made once per backing per recording"] = \
         "graph_retention_token(" in pin and "owner_control_id(" in pin
     # A cache hit hands out the same pointer: the recorders that use local sinks need the pin there too.
@@ -281,8 +283,6 @@ def evaluate(backend, common, cache, zone):
     results["the shared allocator is RUNTIME-zone and spill-forbidden"] = \
         "vram_zone_id::RUNTIME" in runtime_ensure and "forbid_vram_zone_spill = true" in runtime_ensure
     # Verifiability: a WARN-level line a normal run prints.
-    stats_fn = function_body(backend, r"void ggml_backend_sycl_context::log_planned_scratch_stats\(\)\s*\{") or ""
-    results["anchor: stats function exists"] = bool(stats_fn)
     stats_at = backend.find("[SCRATCH-STATS]")
     results["a WARN-level per-cohort stats line exists"] = \
         stats_at >= 0 and "GGML_LOG_WARN" in backend[max(0, stats_at - 300):stats_at]
@@ -294,7 +294,7 @@ def evaluate(backend, common, cache, zone):
     # growths counted the initial allocation, which is not a growth: the field is allocs.
     results["the stats line counts allocs, not growths"] = \
         stats_at >= 0 and "allocs=%u" in backend[stats_at:stats_at + 400] and \
-        "growths" not in backend[stats_at:stats_at + 400]
+        re.search(r"(?<!op_)growths=", backend[stats_at:stats_at + 400]) is None
     # Nit: the Q8 walk is cheap on the decode hot path.
     results["the Q8 walk does not ask the PP predicate for single-row ops"] = \
         re.search(r"ggml_nrows\(src1\)\s*(<=|==)\s*1", q8_walk) is not None
@@ -431,7 +431,7 @@ if args.self_test:
                                   "const size_t dequant_f16 = unified_cache_get_planned_XXXX("), zone)),
         ("dequant pool restored", "src0 pool alloc is skipped when the planned scratch holds it",
          (mutate(backend, "if (!src0_dq_scratch)", "if (true)"), common, cache, zone)),
-        ("growth while recording", "no growth is attempted while a graph is being recorded",
+        ("growth while recording", "no growth is attempted while this thread is recording a graph",
          (mutate_in_func(backend, r"static void \* ggml_sycl_planned_scratch_acquire\(",
                          "growth refused while recording", "growth allowed"), common, cache, zone)),
         ("Q8 walk ignores the plan", "the Q8 graph walk ensures at least the planned bytes",
@@ -443,7 +443,7 @@ if args.self_test:
                          "unified_cache_get_planned_dequant_f16_buffer_bytes(", "unified_cache_get_planned_XXXX("),
           common, cache, zone)),
         ("no pin", "acquiring while recording pins the handle into the graph's retention",
-         (mutate_in_func(backend, r"static void \* ggml_sycl_planned_scratch_acquire\(",
+         (mutate_in_func(backend, r"static void ggml_sycl_planned_scratch_pin\(",
                          "retain_handles_until_event(", "retain_XXXX("), common, cache, zone)),
         ("silent growth", "in-op growth feeds the mispredict accounting",
          (mutate_in_func(backend, r"static void \* ggml_sycl_planned_scratch_acquire\(",

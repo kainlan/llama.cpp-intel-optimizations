@@ -288,6 +288,8 @@ size_t zone_sizing_max_underestimate_bytes(const char * path);
 // nothing tested it. Observations alone are not a defect and never break the
 // summary's silence.
 void   zone_sizing_record_observation(const char * path);
+// The batched form, for a caller that already counts its own uses: one mutex take for `count` observations.
+void   zone_sizing_record_observations(const char * path, size_t count);
 size_t zone_sizing_observation_count(const char * path);
 
 void zone_sizing_reset_underestimates();

@@ -27038,8 +27038,11 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // moe_q8 workspace). Experts are recognised by the planner's own role function, the same
         // authority plan_moe_mmid_workspaces uses -- NOT by ne[2] > 1, which also matches dense 3-D
         // operands such as the MLA wk_b / wv_b (llama.cpp-8xbt). A mis-prediction is survivable:
-        // ggml_sycl_mmq_src1_ensure_for_graph() sizes the exact demand from the graph's own nodes
-        // before anything is submitted, and refuses by name if the zone cannot hold it.
+        // ggml_sycl_mmq_src1_ensure_for_graph() ensures max(plan, demand) for every device that has a
+        // node drawing from the buffer, the demand taken from the graph's own nodes (the ones the
+        // dispatch's router sends to a kernel that quantizes src1, plus the single-row decode nodes), so
+        // a plan of zero (a quantized K cache with no quantized weights) is covered by the demand. It
+        // does so before anything is submitted, and refuses by name if the zone cannot hold it.
         if (item.has_shape() && ggml_is_quantized(item.type) &&
             expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
             size_t bytes_per_token = 0;

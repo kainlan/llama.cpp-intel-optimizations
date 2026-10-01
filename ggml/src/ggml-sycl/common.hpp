@@ -5665,10 +5665,15 @@ struct ggml_sycl_dequant_f16_retire_marker_kernel;
 // with the arm on and off proves nothing about whether the arm ran.
 struct planned_scratch_stats {
     uint64_t uses        = 0;      // acquisitions by an op (cache hits do not count)
-    uint32_t growths     = 0;      // backing replacements, graph-entry or in-op
+    uint32_t allocs      = 0;      // backing allocations, the first one included, graph-entry or in-op
     uint32_t op_growths  = 0;      // growths forced by an op: the graph-entry prediction was short
     size_t   peak_demand = 0;      // largest single request seen
     bool     warned      = false;  // the in-op growth WARN has been emitted for this slot
+
+    // The recording attachment (graph_retention_token) and the backing (owner_control_id) this slot last pinned into
+    // a graph's retention, so a recording pins a backing once rather than once per op.
+    uint64_t pinned_token   = 0;
+    uint64_t pinned_backing = 0;
 
     void note_use(size_t required) {
         uses++;
@@ -6755,7 +6760,7 @@ struct ggml_backend_sycl_context {
                 // The cached entry described the retired backing.
                 s.invalidate();
                 s.cached_q8_1 = nullptr;
-                s.stats.growths++;
+                s.stats.allocs++;
             }
             return ptr;
         }
@@ -6873,7 +6878,7 @@ struct ggml_backend_sycl_context {
             void *   ptr  = ggml_sycl_runtime_scratch_ensure<ggml_sycl_dequant_f16_retire_marker_kernel>(
                 s.backing_handle, s.backing_capacity, required_size, device, queue, cohort_id, &grew);
             if (grew) {
-                s.stats.growths++;
+                s.stats.allocs++;
             }
             return ptr;
         }
