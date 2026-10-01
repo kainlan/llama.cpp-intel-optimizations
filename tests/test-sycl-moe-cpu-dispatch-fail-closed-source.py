@@ -58,8 +58,8 @@ real corruption and still fails.
      refuses a LIVE one, and is the only registry-presence check before the emplace at either
      site; the claim is logged under the lifetime trace (stale_claim_report), and a release
      records its thread (release_tid, "release-begin" line);
-  8. flush_pending_cpu_scatter asserts a stream, an output buffer and a destination for every
-     entry instead of skipping quietly;
+  8. flush_pending_cpu_scatter and flush_pending_cpu_pipeline assert a stream, an output buffer
+     and a destination for every entry instead of skipping quietly;
   9. every expert_dispatch_entry the HYBRID branch builds (the region between the first and the
      second `std::vector<expert_dispatch_entry> cpu_entries;`) passes allow_cpu_fallback=false.
      That is what keeps dispatch_cpu_compute's allow_cpu_fallback=true arm of the `!host_weight`
@@ -264,6 +264,22 @@ def check_backend(backend_src: str) -> None:
     if re.search(r"if \(g_pending_scatter\.stream && g_pending_scatter\.out_pinned\)", sc):
         raise ContractError(f"FAIL: flush_pending_cpu_scatter makes the scatter conditional on a stream again ({TAG})")
 
+    # 8b. so does the (opt-in) pipeline flush.
+    pipe = squash(block_after(code, r"static void flush_pending_cpu_pipeline\(\)\s*", "flush_pending_cpu_pipeline"))
+    if not re.search(r"GGML_ASSERT\(g_pending_cpu_pipeline\.stream && g_pending_cpu_pipeline\.out_pinned &&", pipe):
+        raise ContractError(
+            f"FAIL: flush_pending_cpu_pipeline does not GGML_ASSERT a stream and an output buffer; a pending pipeline "
+            f"merge without them would be skipped and its rows lost ({TAG})"
+        )
+    if not re.search(r"GGML_ASSERT\(e\.dst_device &&", pipe):
+        raise ContractError(
+            f"FAIL: flush_pending_cpu_pipeline does not GGML_ASSERT every entry's destination ({TAG})"
+        )
+    if re.search(r"if \(e\.dst_device\)", pipe) or re.search(
+        r"if \(g_pending_cpu_pipeline\.stream && g_pending_cpu_pipeline\.out_pinned\)", pipe
+    ):
+        raise ContractError(f"FAIL: flush_pending_cpu_pipeline skips an entry or the merge quietly again ({TAG})")
+
     # 9. the hybrid branch builds only allow_cpu_fallback=false entries.
     decl = [m.start() for m in re.finditer(r"std::vector<expert_dispatch_entry>\s+cpu_entries\s*;", code)]
     if len(decl) != 2:
@@ -403,6 +419,15 @@ def mutants(backend: str, cache: str):
     ), cache
     yield "scatter flush skips a destination-less entry again", mutate(
         backend, "GGML_ASSERT(entries[i].dst_device &&", "if (!entries[i].dst_device) { i++; continue; } GGML_ASSERT(true &&"
+    ), cache
+    yield "pipeline flush skips a missing stream quietly again", mutate(
+        backend, "GGML_ASSERT(g_pending_cpu_pipeline.stream && g_pending_cpu_pipeline.out_pinned &&", "GGML_ASSERT(true &&"
+    ), cache
+    yield "pipeline flush skips a destination-less entry again", mutate(
+        backend, "GGML_ASSERT(e.dst_device &&", "if (!e.dst_device) { continue; } GGML_ASSERT(true &&"
+    ), cache
+    yield "pipeline flush guards on dst_device again", mutate(
+        backend, "GGML_ASSERT(e.dst_device &&", "if (e.dst_device) GGML_ASSERT(true &&"
     ), cache
     yield "a hybrid-branch entry allows CPU fallback", mutate(
         backend, "operand.actual_layout(), operand.lease(), /*allow_cpu_fallback=*/false);",

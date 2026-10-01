@@ -23255,18 +23255,21 @@ static void flush_pending_cpu_pipeline() {
             g_pending_cpu_pipeline.future.get();
         }
         g_pending_cpu_pipeline.scatter_events.clear();
-        if (g_pending_cpu_pipeline.stream && g_pending_cpu_pipeline.out_pinned) {
-            for (auto & e : g_pending_cpu_pipeline.entries) {
-                if (e.dst_device) {
-                    if (!e.dst_handle.valid() || !g_pending_cpu_pipeline.out_handle.valid()) {
-                        GGML_ABORT("[PIPELINE-CPU] Deferred merge missing smart mem_handle for dst=%p device=%d",
-                                   e.dst_device, g_pending_cpu_pipeline.device_id);
-                    }
-                    g_pending_cpu_pipeline.scatter_events.push_back(ggml_sycl::mem_copy_async(
-                        e.dst_handle, e.dst_offset, g_pending_cpu_pipeline.out_handle, e.src_offset,
-                        static_cast<size_t>(e.N) * sizeof(float), *g_pending_cpu_pipeline.stream));
-                }
+        // The producer sets a stream and an output buffer, and every entry names its destination.
+        // Skipping quietly would lose the rows (llama.cpp-93tw), as in flush_pending_cpu_scatter.
+        GGML_ASSERT(g_pending_cpu_pipeline.stream && g_pending_cpu_pipeline.out_pinned &&
+                    "pending CPU pipeline has no stream or output staging; its host-expert rows would be dropped "
+                    "(llama.cpp-93tw)");
+        for (auto & e : g_pending_cpu_pipeline.entries) {
+            GGML_ASSERT(e.dst_device &&
+                        "pending CPU pipeline entry has no destination; its row would be dropped (llama.cpp-93tw)");
+            if (!e.dst_handle.valid() || !g_pending_cpu_pipeline.out_handle.valid()) {
+                GGML_ABORT("[PIPELINE-CPU] Deferred merge missing smart mem_handle for dst=%p device=%d", e.dst_device,
+                           g_pending_cpu_pipeline.device_id);
             }
+            g_pending_cpu_pipeline.scatter_events.push_back(
+                ggml_sycl::mem_copy_async(e.dst_handle, e.dst_offset, g_pending_cpu_pipeline.out_handle, e.src_offset,
+                                          static_cast<size_t>(e.N) * sizeof(float), *g_pending_cpu_pipeline.stream));
         }
     } catch (const std::exception & ex) {
         GGML_ABORT("[PIPELINE-CPU] Deferred merge failed: %s; its host-expert rows would be dropped (llama.cpp-93tw)",

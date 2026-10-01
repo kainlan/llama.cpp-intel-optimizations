@@ -1347,9 +1347,7 @@ struct runtime_alloc_record {
     // Monotonic identity of the current LIVE -> RELEASING claim. Rollback and
     // erase must match this as well as the complete allocation key.
     uint64_t                   release_generation = 0;
-    // Thread that marked the row RELEASING; recorded only while
-    // GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE is on, so a stale-row claim can name its releaser.
-    uint64_t                    release_tid        = 0;
+    uint64_t                    release_tid        = 0;  // releasing thread, trace only
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     bool                       test_no_physical_release = false;
     size_t                     test_exact_leases = 0;
