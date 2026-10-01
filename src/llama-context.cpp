@@ -2230,9 +2230,9 @@ llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
 
-bool llama_context::memory_update(bool optimize) {
+llama_memory_update_result llama_context::memory_update(bool optimize) {
     if (!memory) {
-        return false;
+        return LLAMA_MEMORY_UPDATE_NONE;
     }
 
     {
@@ -2245,13 +2245,13 @@ bool llama_context::memory_update(bool optimize) {
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
                     // no updates need to be performed
-                    return false;
+                    return LLAMA_MEMORY_UPDATE_NONE;
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
                 {
                     LLAMA_LOG_ERROR("%s: failed to prepare memory update\n", __func__);
-                    return false;
+                    return LLAMA_MEMORY_UPDATE_NONE;
                 }
         }
 
@@ -2265,15 +2265,21 @@ bool llama_context::memory_update(bool optimize) {
         gf_res_prev_active = nullptr;
 
         if (!mctx->apply()) {
+            // a failed update stays pending (the K-shift is not marked done), and decode must not run over it
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+            return LLAMA_MEMORY_UPDATE_FAILED;
         }
     }
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
-    {
+    // a failure here (a refusal, or a throw from the memory or the graph build) must not cross decode: the scheduler
+    // is no longer reserved for this graph, so the next decode reserves again
+    try {
         const auto mctx = memory->init_full();
         if (!mctx) {
-            throw std::runtime_error("failed to initialize memory context");
+            LLAMA_LOG_ERROR("%s: failed to initialize memory context\n", __func__);
+            sched_need_reserve = true;
+            return LLAMA_MEMORY_UPDATE_FAILED;
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
@@ -2284,10 +2290,16 @@ bool llama_context::memory_update(bool optimize) {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
+            sched_need_reserve = true;
+            return LLAMA_MEMORY_UPDATE_FAILED;
         }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update: %s\n", __func__, err.what());
+        sched_need_reserve = true;
+        return LLAMA_MEMORY_UPDATE_FAILED;
     }
 
-    return true;
+    return LLAMA_MEMORY_UPDATE_DONE;
 }
 
 enum llama_pooling_type llama_context::pooling_type() const {
@@ -3186,7 +3198,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    if (memory_update(false) == LLAMA_MEMORY_UPDATE_FAILED) {
+        LLAMA_LOG_ERROR("%s: failed to update the memory\n", __func__);
+
+        return -2;
+    }
 
     llama_memory_context_ptr mctx;
 
@@ -3211,7 +3227,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
-                        if (memory_update(true)) {
+                        const auto update_res = memory_update(true);
+                        if (update_res == LLAMA_MEMORY_UPDATE_FAILED) {
+                            LLAMA_LOG_ERROR("%s: failed to update the memory\n", __func__);
+
+                            return -2;
+                        }
+                        if (update_res == LLAMA_MEMORY_UPDATE_DONE) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;

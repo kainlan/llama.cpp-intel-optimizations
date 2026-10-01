@@ -373,6 +373,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # H5 of the zhcn design (structural arm): init_reserve(s) spans s streams in every memory class.
+    # Loads tiny models, so it carries `model`, the label the ctest sweep (form 2 in CLAUDE.md) excludes,
+    # and is run by hand pinned to the discrete cards. Inside this block for the same reason as
+    # test-llama-archs: it uses internal symbols.
+    llama_build_and_test(test-context-measure-h5.cpp LABEL model)
+
+    # H3i (2) and (3) of the zhcn design: a refused allocation during a memory update reaches the
+    # caller as FAILED and as llama_decode() == -2. Loads tiny models and swaps the CPU device's buffer
+    # type for a refusing wrapper, so it is `model`-labelled and lead-run like the one above.
+    llama_build_and_test(test-context-update-failure.cpp LABEL model)
+
     llama_build(test-fusion.cpp)
 endif()
 

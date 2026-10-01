@@ -490,6 +490,13 @@ llama_memory_context_ptr llama_memory_recurrent::init_full() {
     return std::make_unique<llama_memory_recurrent_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_recurrent::init_reserve(uint32_t n_streams) {
+    // the recurrent graph reads its sequence count from the ubatch, not from the memory context
+    GGML_UNUSED(n_streams);
+
+    return init_full();
+}
+
 llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(lctx);
     GGML_UNUSED(optimize);

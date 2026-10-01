@@ -116,6 +116,8 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_streams) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -182,6 +184,9 @@ public:
 
     llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv);
 
+    // a worst-case context over exactly n_streams streams
+    llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv, uint32_t n_streams);
+
     llama_kv_cache_dsv4_raw_context(
             llama_kv_cache_iswa * kv,
             llama_context * lctx,
@@ -239,6 +244,9 @@ public:
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
     llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv);
+
+    // a worst-case context over exactly n_streams streams
+    llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv, uint32_t n_streams);
 
     llama_kv_cache_dsv4_comp_context(
             llama_kv_cache * kv,
@@ -322,6 +330,12 @@ public:
 
     llama_kv_cache_dsv4_context(
             llama_kv_cache_dsv4 * kv);
+
+    // a worst-case context over exactly n_streams streams: each part spans n_streams streams, and the
+    // compressor plans take their graph stream count from the ubatch (dsv4_comp_graph_n_stream)
+    llama_kv_cache_dsv4_context(
+            llama_kv_cache_dsv4 * kv,
+            uint32_t n_streams);
 
     llama_kv_cache_dsv4_context(
             llama_kv_cache_dsv4 * kv,

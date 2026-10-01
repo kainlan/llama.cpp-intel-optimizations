@@ -52,6 +52,8 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_streams) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     void clear(bool data) override;
@@ -108,6 +110,11 @@ public:
 
     // used to create a full-cache context
     explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
+
+    // used to create a worst-case context over exactly n_streams streams
+    explicit llama_memory_hybrid_idx_context(
+            llama_memory_hybrid_idx * mem,
+            uint32_t n_streams);
 
     // used to create an update context
     llama_memory_hybrid_idx_context(

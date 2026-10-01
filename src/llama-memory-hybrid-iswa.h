@@ -54,6 +54,8 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_streams) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -99,6 +101,11 @@ public:
 
     // init full
     explicit llama_memory_hybrid_iswa_context(llama_memory_hybrid_iswa * mem);
+
+    // init a worst-case context over exactly n_streams streams
+    explicit llama_memory_hybrid_iswa_context(
+        llama_memory_hybrid_iswa * mem,
+        uint32_t n_streams);
 
     // init update
     explicit llama_memory_hybrid_iswa_context(

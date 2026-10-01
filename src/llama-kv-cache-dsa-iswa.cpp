@@ -223,6 +223,10 @@ llama_memory_context_ptr llama_kv_cache_dsa_iswa::init_full() {
     return std::make_unique<llama_kv_cache_dsa_iswa_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache_dsa_iswa::init_reserve(uint32_t n_streams) {
+    return std::make_unique<llama_kv_cache_dsa_iswa_context>(this, n_streams);
+}
+
 llama_memory_context_ptr llama_kv_cache_dsa_iswa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_dsa_iswa_context>(this, lctx, optimize);
 }
@@ -267,6 +271,14 @@ llama_kv_cache_dsa_iswa_context::llama_kv_cache_dsa_iswa_context(
         llama_kv_cache_dsa_iswa * kv) :
     ctx_dsa(kv->get_dsa()->init_full()),
     ctx_swa(kv->get_swa()->init_full()),
+    status(llama_memory_status_combine(ctx_dsa->get_status(), ctx_swa->get_status())) {
+}
+
+llama_kv_cache_dsa_iswa_context::llama_kv_cache_dsa_iswa_context(
+        llama_kv_cache_dsa_iswa * kv,
+        uint32_t n_streams) :
+    ctx_dsa(kv->get_dsa()->init_reserve(n_streams)),
+    ctx_swa(kv->get_swa()->init_reserve(n_streams)),
     status(llama_memory_status_combine(ctx_dsa->get_status(), ctx_swa->get_status())) {
 }
 

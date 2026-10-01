@@ -34,6 +34,15 @@ enum llama_memory_status {
     LLAMA_MEMORY_STATUS_FAILED_COMPUTE,
 };
 
+// the outcome of applying pending memory updates (shifts, copies, ...)
+// kept apart from llama_memory_status: "an update was performed" is a retry signal for the decode loop, and a
+// failed update must not share that meaning
+enum llama_memory_update_result {
+    LLAMA_MEMORY_UPDATE_NONE,   // nothing was updated (no pending update, or none that could be prepared)
+    LLAMA_MEMORY_UPDATE_DONE,   // an update was performed
+    LLAMA_MEMORY_UPDATE_FAILED, // an update was attempted and failed; it stays pending
+};
+
 // helper function for combining the status of two memory contexts
 // useful for implementing hybrid memory types (e.g. iSWA)
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1);
@@ -92,6 +101,11 @@ struct llama_memory_i {
 
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
+
+    // like init_full(), for a ubatch that spans exactly n_streams streams (1 <= n_streams <= the memory's stream count)
+    // used for allocating the worst-case compute buffers of a decode over fewer sequences than the cache has streams:
+    // init_full() always spans every stream, so the K/V views and the mask would disagree on the stream count
+    virtual llama_memory_context_ptr init_reserve(uint32_t n_streams) = 0;
 
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update

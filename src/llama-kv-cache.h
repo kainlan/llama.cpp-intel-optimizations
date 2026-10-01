@@ -129,6 +129,8 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_streams) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -204,7 +206,8 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
-    bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+    // FAILED leaves the pending shift recorded, so the next call retries it
+    llama_memory_update_result update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
@@ -364,6 +367,11 @@ public:
     // used to create a full-cache context
     llama_kv_cache_context(
             llama_kv_cache * kv);
+
+    // used to create a worst-case context over exactly n_streams streams (1 <= n_streams <= the cache's stream count)
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t n_streams);
 
     // used to create an update context
     llama_kv_cache_context(

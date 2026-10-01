@@ -1435,6 +1435,10 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_full() {
     return std::make_unique<llama_kv_cache_dsv4_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache_dsv4::init_reserve(uint32_t n_streams) {
+    return std::make_unique<llama_kv_cache_dsv4_context>(this, n_streams);
+}
+
 llama_memory_context_ptr llama_kv_cache_dsv4::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_dsv4_context>(
             this,
@@ -1764,8 +1768,8 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
 // llama_kv_cache_dsv4_raw_context
 //
 
-static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv) {
-    const uint32_t n_stream = kv->get_n_stream();
+static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv, uint32_t n_stream) {
+    GGML_ASSERT(n_stream >= 1 && n_stream <= kv->get_n_stream());
 
     llama_kv_cache::slot_info sinfo;
     sinfo.s0 = 0;
@@ -1785,7 +1789,17 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_
     ctx_swa_mem(nullptr),
     n_kv(kv_swa->get_size()),
     status(LLAMA_MEMORY_STATUS_SUCCESS) {
-    sinfos_read.push_back(dsv4_build_full_sinfo(kv_swa));
+    sinfos_read.push_back(dsv4_build_full_sinfo(kv_swa, kv_swa->get_n_stream()));
+    sinfos_write = sinfos_read;
+}
+
+llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv, uint32_t n_streams) :
+    kv_swa(kv->get_swa()),
+    ctx_base_mem(nullptr),
+    ctx_swa_mem(nullptr),
+    n_kv(kv_swa->get_size()),
+    status(LLAMA_MEMORY_STATUS_SUCCESS) {
+    sinfos_read.push_back(dsv4_build_full_sinfo(kv_swa, n_streams));
     sinfos_write = sinfos_read;
 }
 
@@ -1936,8 +1950,13 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {
 // llama_kv_cache_dsv4_comp_context
 //
 
-llama_kv_cache_dsv4_comp_context::llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv) : kv(kv), n_kv(kv->get_size()) {
-    const uint32_t n_stream = kv->get_n_stream();
+llama_kv_cache_dsv4_comp_context::llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv) :
+    llama_kv_cache_dsv4_comp_context(kv, kv->get_n_stream()) {
+}
+
+llama_kv_cache_dsv4_comp_context::llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv, uint32_t n_stream) :
+    kv(kv), n_kv(kv->get_size()) {
+    GGML_ASSERT(n_stream >= 1 && n_stream <= kv->get_n_stream());
 
     sinfos.resize(1);
     sinfos[0].s0 = 0;
@@ -2006,6 +2025,25 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     ctx_csa(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_csa())),
     ctx_hca(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_hca())),
     ctx_lid(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_lid())),
+    csa_state(kv->get_csa_state()),
+    hca_state(kv->get_hca_state()),
+    lid_state(kv->get_lid_state()),
+    reserve_plans(true),
+    status(llama_memory_status_combine(
+                llama_memory_status_combine(ctx_raw->get_status(), ctx_csa_mem->get_status()),
+                llama_memory_status_combine(ctx_hca_mem->get_status(), ctx_lid_mem->get_status()))) {
+}
+
+llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
+        llama_kv_cache_dsv4 * kv,
+        uint32_t n_streams) :
+    ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw(), n_streams)),
+    ctx_csa_mem(kv->get_csa()->init_reserve(n_streams)),
+    ctx_hca_mem(kv->get_hca()->init_reserve(n_streams)),
+    ctx_lid_mem(kv->get_lid()->init_reserve(n_streams)),
+    ctx_csa(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_csa(), n_streams)),
+    ctx_hca(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_hca(), n_streams)),
+    ctx_lid(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_lid(), n_streams)),
     csa_state(kv->get_csa_state()),
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),

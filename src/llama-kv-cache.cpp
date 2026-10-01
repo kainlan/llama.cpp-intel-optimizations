@@ -871,6 +871,10 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache::init_reserve(uint32_t n_streams) {
+    return std::make_unique<llama_kv_cache_context>(this, n_streams);
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
@@ -945,10 +949,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     return res;
 }
 
-bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+llama_memory_update_result llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
-        return true;
+        return LLAMA_MEMORY_UPDATE_DONE;
     }
 
     bool updated = false;
@@ -1003,14 +1007,14 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             auto * gf = build_graph_shift(res, lctx);
             if (!ggml_backend_sched_alloc_graph(sched, gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
-                return updated;
+                return LLAMA_MEMORY_UPDATE_FAILED;
             }
 
             res->set_inputs(nullptr);
 
             if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
-                return updated;
+                return LLAMA_MEMORY_UPDATE_FAILED;
             }
 
             updated = true;
@@ -1023,7 +1027,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         }
     }
 
-    return updated;
+    return updated ? LLAMA_MEMORY_UPDATE_DONE : LLAMA_MEMORY_UPDATE_NONE;
 }
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
@@ -2926,6 +2930,25 @@ llama_kv_cache_context::llama_kv_cache_context(
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
+        uint32_t n_streams) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+    n_kv = kv->get_size();
+
+    GGML_ASSERT(n_streams >= 1 && n_streams <= kv->get_n_stream());
+
+    // like the full-cache context, but the dummy slot info spans only n_streams streams, which is what a ubatch of
+    // n_streams sequences gets: the K/V views take their stream count from the slot info and the mask from the ubatch
+    sinfos.resize(1);
+    sinfos[0].s0 = 0;
+    sinfos[0].s1 = n_streams - 1;
+    sinfos[0].idxs.resize(n_streams);
+    for (uint32_t s = 0; s < n_streams; ++s) {
+        sinfos[0].strm.push_back(s);
+        sinfos[0].idxs[s].resize(1, 0);
+    }
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
         llama_context * lctx,
         bool do_shift,
         stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
@@ -2957,9 +2980,7 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
-        kv->update(lctx, do_shift, sc_info);
-
-        return true;
+        return kv->update(lctx, do_shift, sc_info) != LLAMA_MEMORY_UPDATE_FAILED;
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);

@@ -21,6 +21,7 @@ struct mock_memory : public llama_memory_i {
 
     llama_memory_context_ptr init_batch(llama_batch_allocr &, uint32_t, bool) override {  GGML_ASSERT(false && "not implemented"); }
     llama_memory_context_ptr init_full() override {  GGML_ASSERT(false && "not implemented"); }
+    llama_memory_context_ptr init_reserve(uint32_t) override { GGML_ASSERT(false && "not implemented"); }
     llama_memory_context_ptr init_update(llama_context *, bool) override { GGML_ASSERT(false && "not implemented"); }
 
     bool get_can_shift() const override { GGML_ASSERT(false && "not implemented"); }
