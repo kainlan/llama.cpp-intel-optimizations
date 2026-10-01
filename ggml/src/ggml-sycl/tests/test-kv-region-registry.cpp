@@ -519,6 +519,8 @@ int case_release_proc() {
     CHECK(dev0.has_layer(2, 0), "another context's entry is untouched");
     CHECK_EQ(retained_handles, 3, "two extents and one tenant slot go to retain_until_event");
     CHECK(!retain_with_lock, "retain ran with no lock held");
+    // The extents arrive at retain_until_event as handles (count above), so the
+    // fencing event, not the release proc, decides when the last generation frees.
     CHECK_EQ(log.drops.load(), 3, "everything but context 2's extent was freed");
     CHECK_EQ(log.drops_with_lock.load(), 0, "no drop under a lock");
 
