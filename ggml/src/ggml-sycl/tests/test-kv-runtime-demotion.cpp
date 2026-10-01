@@ -29,6 +29,10 @@
         }                                                                                                              \
     } while (0)
 
+using ggml_sycl::context_demand_reconcile;
+using ggml_sycl::context_side_demand;
+using ggml_sycl::demand_scope;
+using ggml_sycl::held_slot;
 using ggml_sycl::kv_admission_mismatch;
 using ggml_sycl::kv_alloc_slack_per_layer;
 using ggml_sycl::kv_buffer_layer_owner;
@@ -37,6 +41,9 @@ using ggml_sycl::kv_demotion_result;
 using ggml_sycl::kv_device_fit_input;
 using ggml_sycl::kv_device_residency_changed;
 using ggml_sycl::kv_hot_layers_override_active;
+using ggml_sycl::kv_layer_cells;
+using ggml_sycl::kv_layer_desc;
+using ggml_sycl::kv_layer_tensor_bytes;
 using ggml_sycl::kv_optional_layout_yield;
 using ggml_sycl::kv_optional_layouts;
 using ggml_sycl::kv_reads_device_arena;
@@ -52,6 +59,8 @@ using ggml_sycl::plan_device_kv_fit;
 using ggml_sycl::plan_optional_layout_yield;
 using ggml_sycl::plan_runtime_kv_demotion;
 using ggml_sycl::plan_runtime_kv_residency;
+using ggml_sycl::rs_buffer_bytes;
+using ggml_sycl::rs_layer_desc;
 using ggml_sycl::tlsf_allocator;
 
 // Helper: n_layers alternating geometry like GPT-OSS (even = full-attn, odd = SWA).
@@ -108,6 +117,23 @@ static std::unordered_map<int, int> kv_device_map(const std::vector<int> & kv_de
         map[(int) l] = kv_device[l];
     }
     return map;
+}
+
+// Row sizes for the types the cases use, from ggml's own table (type ids and block
+// sizes of ggml.h); the TU links no ggml-base, so the rule is restated here.
+enum { TEST_TYPE_F32 = 0, TEST_TYPE_F16 = 1, TEST_TYPE_Q8_0 = 8 };
+
+static size_t test_row_size(int32_t type, int64_t n_elements) {
+    switch (type) {
+        case TEST_TYPE_F32:
+            return static_cast<size_t>(n_elements) * 4;
+        case TEST_TYPE_F16:
+            return static_cast<size_t>(n_elements) * 2;
+        case TEST_TYPE_Q8_0:
+            return static_cast<size_t>(n_elements / 32) * 34;
+        default:
+            return 0;
+    }
 }
 
 int main() {
@@ -780,6 +806,150 @@ int main() {
         CHECK_EQ(ggml_sycl::kv_device_leading_layer_bytes(in, 0, 0), 0, "case 36: no layers");
         CHECK_EQ(ggml_sycl::kv_device_leading_layer_bytes(in, 0, 2), 4000, "case 36: the first two, at KV bytes");
         CHECK_EQ(ggml_sycl::kv_device_leading_layer_bytes(in, 0, 99), 4513, "case 36: clamped to the device's");
+    }
+    // 37. The cell arithmetic, on the shapes llama.cpp-3aos and llama.cpp-uajm
+    // verified against live runs, and on the GPT-OSS 20B shape the fit's worked
+    // prediction uses.
+    {
+        using namespace ggml_sycl;
+        // GPT-OSS 20B (n_swa 128) at -c 4096 -np 4 -ub 512, per-stream KV: n_ctx_seq 1024,
+        // PAD(min(1024, 128 + 512), 256) = 768 cells a stream, four streams.
+        CHECK_EQ(kv_layer_cells(KV_CELLS_SWA, 4096, 512, 4, false, false, 128), 3072,
+                 "case 37: GPT-OSS SWA, 4 streams");
+        // Gemma 4 E4B (n_swa 512): PAD(min(1024, 512 + 512), 256) = 1024 a stream.
+        CHECK_EQ(kv_layer_cells(KV_CELLS_SWA, 4096, 512, 4, false, false, 512), 4096, "case 37: Gemma SWA, 4 streams");
+        // kv_unified: one stream whose window scales with n_seq_max, 512 * 4 + 512 = 2560.
+        CHECK_EQ(kv_layer_cells(KV_CELLS_SWA, 4096, 512, 4, true, false, 512), 2560, "case 37: unified SWA window");
+        // swa_full: an SWA layer holds the whole window, like a FULL one.
+        CHECK_EQ(kv_layer_cells(KV_CELLS_SWA, 4096, 512, 4, false, true, 128), 4096, "case 37: swa_full is n_ctx");
+        CHECK_EQ(kv_layer_cells(KV_CELLS_SWA, 4096, 512, 4, true, false, 0), 0, "case 37: no window, no cells");
+        CHECK_EQ(kv_layer_cells(KV_CELLS_FULL, 65536, 1024, 1, false, false, 128), 65536, "case 37: FULL is n_ctx");
+        CHECK_EQ(kv_layer_cells(KV_CELLS_SHARED, 65536, 1024, 1, false, false, 128), 0, "case 37: SHARED holds none");
+        // The fit's worked prediction: PAD(n_swa + n_ubatch, 256) = PAD(128 + 1024, 256) = 1280.
+        CHECK_EQ(kv_layer_cells(KV_CELLS_SWA, 65536, 1024, 1, false, false, 128), 1280, "case 37: GA's SWA cells");
+        // n_seq_max 0 reads as 1, as it always did.
+        CHECK_EQ(kv_layer_cells(KV_CELLS_SWA, 4096, 512, 0, false, false, 128), 768, "case 37: n_seq_max 0 is 1");
+    }
+    // 38. One layer's bytes: the row-size rule per type, K and V separately, each
+    // tensor padded the way ggml_backend_alloc_ctx_tensors_from_buft pads it.
+    {
+        using namespace ggml_sycl;
+        kv_layer_desc gptoss;  // 8 KV heads x head dim 64
+        gptoss.n_embd_k_gqa = 512;
+        gptoss.n_embd_v_gqa = 512;
+        gptoss.has_kv       = 1;
+        // f16: 2 KiB a cell, K and V together; 65536 cells is 128 MiB.
+        CHECK_EQ(kv_layer_tensor_bytes(gptoss, TEST_TYPE_F16, TEST_TYPE_F16, 65536, 1, test_row_size),
+                 128ll * 1024 * 1024, "case 38: f16 layer");
+        // K and V at q8_0: 512 elements are 16 blocks of 34 bytes.
+        CHECK_EQ(kv_layer_tensor_bytes(gptoss, TEST_TYPE_Q8_0, TEST_TYPE_Q8_0, 65536, 1, test_row_size),
+                 2ll * 65536 * 544, "case 38: q8_0 K and V");
+        CHECK_EQ(kv_layer_tensor_bytes(gptoss, TEST_TYPE_Q8_0, TEST_TYPE_F16, 100, 1, test_row_size),
+                 100ll * (544 + 1024), "case 38: q8_0 K, f16 V");
+        // Padding is per tensor: 37 cells of a 96-wide f16 row are 7104 B a tensor, 7168 padded to 128.
+        kv_layer_desc narrow;
+        narrow.n_embd_k_gqa = 96;
+        narrow.n_embd_v_gqa = 96;
+        narrow.has_kv       = 1;
+        CHECK_EQ(kv_layer_tensor_bytes(narrow, TEST_TYPE_F16, TEST_TYPE_F16, 37, 1, test_row_size), 2 * 7104,
+                 "case 38: unpadded");
+        CHECK_EQ(kv_layer_tensor_bytes(narrow, TEST_TYPE_F16, TEST_TYPE_F16, 37, 128, test_row_size), 2 * 7168,
+                 "case 38: each tensor padded to the alignment");
+        // v_trans with a variable V width: llama pads V to n_embd_v_gqa_max, so V is wider than K.
+        kv_layer_desc vtrans = narrow;
+        vtrans.n_embd_v_gqa  = 160;
+        CHECK_EQ(kv_layer_tensor_bytes(vtrans, TEST_TYPE_F16, TEST_TYPE_F16, 64, 1, test_row_size), 64ll * (192 + 320),
+                 "case 38: V wider than K");
+        // MLA: no V at all.
+        kv_layer_desc mla = narrow;
+        mla.n_embd_v_gqa  = 0;
+        CHECK_EQ(kv_layer_tensor_bytes(mla, TEST_TYPE_F16, TEST_TYPE_F16, 64, 128, test_row_size), 64 * 192,
+                 "case 38: MLA has K only");
+        // A filtered, shared or reused layer holds no slot.
+        kv_layer_desc none = narrow;
+        none.has_kv        = 0;
+        CHECK_EQ(kv_layer_tensor_bytes(none, TEST_TYPE_F16, TEST_TYPE_F16, 64, 128, test_row_size), 0,
+                 "case 38: has_kv 0 is 0");
+    }
+    // 39. The recurrent-state buffer: r_l then s_l of every layer, row size times
+    // rows, each tensor padded.  Qwen3.5-35B-A3B at n_seq_max 1 is the doc's 65863680 B.
+    {
+        using namespace ggml_sycl;
+        std::vector<rs_layer_desc> layers;
+        for (uint32_t il = 0; il < 30; ++il) {
+            rs_layer_desc d;
+            d.il       = il;
+            d.type_r   = TEST_TYPE_F32;
+            d.type_s   = TEST_TYPE_F32;
+            d.n_embd_r = 3 * (4096 + 2 * 16 * 128);
+            d.n_embd_s = 128 * 4096;
+            d.n_rows   = 1;
+            layers.push_back(d);
+        }
+        CHECK_EQ(rs_buffer_bytes(layers, 1, test_row_size), 65863680, "case 39: the Qwen recurrent state");
+        for (rs_layer_desc & d : layers) {
+            d.n_rows = 4;
+        }
+        CHECK_EQ(rs_buffer_bytes(layers, 128, test_row_size), 4ll * 65863680, "case 39: scales with n_seq_max");
+        // A padded tensor: 3 rows of a 33-wide f32 r and a 1-wide s.
+        rs_layer_desc odd;
+        odd.type_r   = TEST_TYPE_F32;
+        odd.type_s   = TEST_TYPE_F32;
+        odd.n_embd_r = 33;
+        odd.n_embd_s = 1;
+        odd.n_rows   = 3;
+        CHECK_EQ(rs_buffer_bytes({ odd }, 128, test_row_size), 512 + 128, "case 39: 396 B and 12 B pad to 512 and 128");
+        CHECK_EQ(rs_buffer_bytes({}, 128, test_row_size), 0, "case 39: no layers");
+    }
+    // 40. Reconciliation: a slot is reused in place when its owner holds the same
+    // (cohort, index) with cap >= the need; every other slot is carved, the old
+    // one it supersedes is released at the publish, and a held slot no record
+    // names stays as planned room.
+    {
+        using namespace ggml_sycl;
+        context_side_demand ring;
+        ring.device = 0;
+        ring.owner  = 7;
+        ring.cohort = "ring";
+        ring.slots  = { 400, 500 };
+        context_side_demand compute;
+        compute.device                           = 0;
+        compute.owner                            = 7;
+        compute.cohort                           = "compute";
+        compute.slots                            = { 300 };
+        std::vector<context_side_demand> demands = { ring, compute };
+
+        auto held_at = [](const char * cohort, uint32_t index, size_t cap, uint64_t owner = 7, int device = 0) {
+            held_slot h;
+            h.device = device;
+            h.owner  = owner;
+            h.cohort = cohort;
+            h.index  = index;
+            h.cap    = cap;
+            return h;
+        };
+        // Nothing held: everything is carved.
+        demand_reconciliation r = context_demand_reconcile(demands, {});
+        CHECK_EQ(r.carved.size(), 3, "case 40: three slots carved");
+        CHECK(r.reused.empty() && r.superseded.empty() && r.unused.empty(), "case 40: nothing else");
+        // A larger slot serves a smaller claim; an equal one too; a smaller one is superseded.
+        std::vector<held_slot> held = { held_at("ring", 0, 1000),    held_at("ring", 1, 500),
+                                        held_at("compute", 0, 299),  held_at("ring", 2, 64),
+                                        held_at("ring", 0, 9999, 8), held_at("ring", 0, 9999, 7, 1) };
+        r                           = context_demand_reconcile(demands, held);
+        CHECK_EQ(r.reused.size(), 2, "case 40: ring 0 and ring 1 reused");
+        CHECK_EQ(r.reused[0].held, 0, "case 40: ring 0 is served by the 1000 B slot");
+        CHECK_EQ(r.superseded.size(), 1, "case 40: compute grew");
+        CHECK_EQ(r.superseded[0].held, 2, "case 40: the 299 B slot is the one superseded");
+        CHECK(r.carved.empty(), "case 40: nothing carved with no key held");
+        CHECK(r.unused == std::vector<size_t>({ 3 }),
+              "case 40: ring index 2 is named by no record; another owner's and another device's slots are not ours");
+        // A zero-byte index needs no carve and is served by anything held.
+        context_side_demand zero = ring;
+        zero.slots               = { 0, 0 };
+        r                        = context_demand_reconcile({ zero }, { held_at("ring", 1, 8) });
+        CHECK_EQ(r.reused.size(), 1, "case 40: a held slot serves a zero need");
+        CHECK(r.carved.empty() && r.superseded.empty(), "case 40: a zero need carves nothing");
     }
     std::printf("test-kv-runtime-demotion: all ok\n");
     return 0;

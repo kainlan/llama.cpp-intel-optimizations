@@ -27,6 +27,22 @@ enum shared_zone_tag : uint8_t {
 static_assert(SHARED_ZONE_TAG_OPTIONAL != SHARED_ZONE_TAG_UNTAGGED,
               "frontier_walk treats tag 0 as untagged, so the yieldable class must not be 0");
 
+// The lifetime class a request to the shared zone carries explicitly, because
+// the zone it names and its alloc_role cannot separate them (CONTEXT and
+// TRANSIENT are both alloc_role::COMPUTE; many non-weight requests name WEIGHT
+// only to stay out of the tail zones).  UNSET derives the class from the role:
+// WEIGHT gives WEIGHT and every other role gives TRANSIENT.
+enum class shared_zone_lifetime : uint8_t {
+    UNSET,
+    WEIGHT,
+    OPTIONAL,
+    KV_REGION,
+    CONTEXT,
+    TRANSIENT,
+    // The B50 tail-zone lever: a TRANSIENT request placed on the weight side.
+    WEIGHT_SIDE_TRANSIENT,
+};
+
 }  // namespace ggml_sycl
 
 #endif  // GGML_SYCL_SHARED_ZONE_TAGS_HPP

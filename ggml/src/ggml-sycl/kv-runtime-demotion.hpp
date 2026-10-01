@@ -1,11 +1,14 @@
 #pragma once
+#include "shared-zone-tags.hpp"
+#include "tlsf-allocator.hpp"
+
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
-
-#include "tlsf-allocator.hpp"
 
 namespace ggml_sycl {
 
@@ -306,5 +309,203 @@ int layer_block_kv_device(const std::vector<int> &    kv_device,
                           const std::vector<size_t> & layer_kv_bytes,
                           int                         start_layer,
                           int                         end_layer);
+
+// ---------------------------------------------------------------------------
+// One per-layer KV byte function (llama.cpp-moua).
+//
+// The cell arithmetic below was kv_layer_bytes_for_kind()'s (unified-cache.hpp,
+// llama.cpp-3aos and llama.cpp-uajm own the derivation of every branch there);
+// it lives here, SYCL-free, so the load-time estimate and the context's region
+// slots cannot size one layer two ways.  kv_layer_bytes_for_kind() calls
+// kv_layer_cells() and kv_layer_tensor_bytes() with an f16 shape and no
+// padding; the region fit sizes a slot from the shape llama actually publishes
+// and the tiered buft's alignment.
+// ---------------------------------------------------------------------------
+
+// A layer's attention kind as far as its cell count is concerned.  The values
+// are ggml_sycl_kv_layer_kind's (ggml-sycl.h); unified-cache.hpp static_asserts
+// that, because this header takes no ggml-sycl.h include.
+enum kv_cells_kind : uint8_t {
+    KV_CELLS_FULL   = 0,
+    KV_CELLS_SWA    = 1,
+    KV_CELLS_SHARED = 2,  // no K/V of its own: 0 cells
+};
+
+// Cells one layer of `kind` holds, across all of its streams.  The derivation of
+// each branch is the comment above kv_layer_bytes_for_kind() (unified-cache.hpp,
+// llama.cpp-3aos and llama.cpp-uajm).  Inline: every target that reaches the
+// load-time estimate through unified-cache.hpp needs it without linking this TU.
+inline size_t kv_layer_cells(uint8_t  kind,
+                             uint32_t n_ctx,
+                             uint32_t n_ubatch,
+                             uint32_t n_seq_max,
+                             bool     kv_unified,
+                             bool     swa_full,
+                             uint32_t n_swa) {
+    if (kind == KV_CELLS_SHARED) {
+        return 0;
+    }
+    if (kind == KV_CELLS_SWA && !swa_full) {
+        if (n_swa == 0) {
+            return 0;
+        }
+        const uint32_t seqs = n_seq_max > 0 ? n_seq_max : 1;
+        uint32_t       n_ctx_seq;    // cells per stream in the non-SWA (base) cache
+        uint32_t       n_stream;     // number of independent KV streams
+        uint32_t       window_seqs;  // the "unified ? n_seq_max : 1" term, llama_kv_cache_iswa::llama_kv_cache_iswa()
+        auto           pad256 = [](uint32_t x) {
+            return (x + 255u) & ~255u;
+        };
+        if (kv_unified) {
+            n_ctx_seq   = n_ctx;
+            n_stream    = 1;
+            window_seqs = seqs;
+        } else {
+            // n_ctx is already adjusted to n_ctx_seq * n_seq_max, so dividing
+            // seqs back out reproduces llama's own n_ctx_seq exactly.
+            n_ctx_seq   = pad256(n_ctx / seqs);
+            n_stream    = seqs;
+            window_seqs = 1;
+        }
+        const uint32_t swa_cells_per_stream = pad256(std::min(n_ctx_seq, n_swa * window_seqs + n_ubatch));
+        const uint32_t swa_cells            = swa_cells_per_stream * n_stream;
+        return static_cast<size_t>(swa_cells);
+    }
+    // FULL, and SWA under swa_full: every cell of the context window.  Total
+    // cells across streams is n_ctx_seq * n_stream, which llama_context's
+    // n_ctx_seq invariant makes n_ctx in both modes.
+    return static_cast<size_t>(n_ctx);
+}
+
+// One layer's widths, exactly the ones llama passes to ggml_new_tensor_3d for
+// its K and V (n_embd_v_gqa taken after the [TAG_V_CACHE_VARIABLE] padding, 0
+// when the model has no V).  has_kv == 0 marks a filtered, shared or reused
+// layer, which holds no slot.
+struct kv_layer_desc {
+    uint32_t n_embd_k_gqa  = 0;
+    uint32_t n_embd_v_gqa  = 0;
+    uint32_t n_head_kv     = 0;
+    uint32_t n_embd_head_k = 0;
+    uint8_t  has_kv        = 0;
+    uint8_t  is_swa        = 0;
+};
+
+// ggml_row_size, injected: this header is SYCL-free and its host test links no
+// ggml-base.  Production passes ggml_row_size; a host test passes its own table.
+typedef size_t (*kv_row_size_fn)(int32_t type, int64_t n_elements);
+
+// `bytes` rounded up to a multiple of `pad_to`; 0 and 1 leave it alone.
+inline size_t kv_pad_bytes(size_t bytes, size_t pad_to) {
+    if (pad_to <= 1 || bytes == 0) {
+        return bytes;
+    }
+    return ((bytes + pad_to - 1) / pad_to) * pad_to;
+}
+
+// Bytes of one layer's K and V tensors over `cells` cells:
+// row_size(type, width) * cells for each, each padded to `pad_to` the way
+// ggml_backend_alloc_ctx_tensors_from_buft pads every tensor it places.  A
+// layer with has_kv == 0 is 0.  pad_to is the tiered buft's alignment for a
+// region slot and 1 for the load-time estimate, which never sizes a region.
+inline size_t kv_layer_tensor_bytes(const kv_layer_desc & layer,
+                                    int32_t               type_k,
+                                    int32_t               type_v,
+                                    size_t                cells,
+                                    size_t                pad_to,
+                                    kv_row_size_fn        row_size) {
+    if (!layer.has_kv || row_size == nullptr) {
+        return 0;
+    }
+    const size_t k_bytes = layer.n_embd_k_gqa > 0 ? row_size(type_k, layer.n_embd_k_gqa) * cells : 0;
+    const size_t v_bytes = layer.n_embd_v_gqa > 0 ? row_size(type_v, layer.n_embd_v_gqa) * cells : 0;
+    return kv_pad_bytes(k_bytes, pad_to) + kv_pad_bytes(v_bytes, pad_to);
+}
+
+// One recurrent layer, exactly the arguments llama_memory_recurrent passes to
+// ggml_new_tensor_2d for r_l and s_l (n_rows = mem_size * (1 + n_rs_seq)).
+struct rs_layer_desc {
+    uint32_t il       = 0;
+    int32_t  type_r   = 0;
+    int32_t  type_s   = 0;
+    uint32_t n_embd_r = 0;
+    uint32_t n_embd_s = 0;
+    uint32_t n_rows   = 0;
+};
+
+// Bytes of one device's recurrent-state buffer: r_l then s_l of every layer in
+// order, each tensor row_size(type, n_embd) * n_rows padded to `pad_to`, summed
+// the way ggml_backend_alloc_ctx_tensors_from_buft lays one context out.
+size_t rs_buffer_bytes(const std::vector<rs_layer_desc> & layers, size_t pad_to, kv_row_size_fn row_size);
+
+// ---------------------------------------------------------------------------
+// The context-side demand record (llama.cpp-moua §2.4.3).  A producer lists, by
+// index, the allocations that can be live at once; every claim names its index.
+// ---------------------------------------------------------------------------
+
+// Whose lifetime a reservation follows.  There is no DEVICE scope: the u1bb
+// ring's rows are per-context CONTEXT slots.
+enum class demand_scope : uint8_t { MODEL, CONTEXT };
+
+// How the fit places a record.  A HEAD_SLOT is mandatory and placed before any
+// KV; an AFTER_KV record (23mk's oneDNN Graph scratch) is charged after the KV
+// extents, never demotes KV and never refuses.
+enum class demand_placement : uint8_t { HEAD_SLOT, AFTER_KV };
+
+struct context_side_demand {
+    int                  device   = -1;
+    shared_zone_lifetime lifetime = shared_zone_lifetime::CONTEXT;  // CONTEXT, TRANSIENT or WEIGHT_SIDE_TRANSIENT
+    demand_scope         scope    = demand_scope::CONTEXT;
+    uint64_t             owner    = 0;                              // CONTEXT: the ContextId; MODEL: the ModelId
+    const char *         cohort   = nullptr;                        // the cohort id its claims carry
+    std::vector<size_t>  slots;                                     // slots[i] = cap of slot index i
+    demand_placement     placement = demand_placement::HEAD_SLOT;
+};
+
+// A reserved slot an owner already holds: the key of a claim plus the cap.
+struct held_slot {
+    int          device = -1;
+    demand_scope scope  = demand_scope::CONTEXT;
+    uint64_t     owner  = 0;
+    const char * cohort = nullptr;
+    uint32_t     index  = 0;
+    size_t       cap    = 0;
+};
+
+// Whether `held` is the slot of `demand`'s index `index` (same device, scope,
+// owner, cohort and index), whatever its cap.
+bool demand_slot_key_matches(const held_slot & held, const context_side_demand & demand, uint32_t index);
+
+// The held slot that serves slot `index` of `demand` in place, or SIZE_MAX: the
+// owner already holds the same (cohort, index) with a cap at least `need`.  A
+// larger slot serves a smaller claim (size <= cap[index]), so a shrink is never
+// a carve.
+size_t demand_find_reusable_slot(const std::vector<held_slot> & held,
+                                 const context_side_demand &    demand,
+                                 uint32_t                       index,
+                                 size_t                         need);
+
+// What a transaction does with a context's records against what it holds.
+struct demand_slot_ref {
+    size_t   record = 0;         // index into the demands
+    uint32_t index  = 0;         // slot index within the record
+    size_t   size   = 0;         // the demanded cap
+    size_t   held   = SIZE_MAX;  // index into held, or SIZE_MAX when none
+};
+
+struct demand_reconciliation {
+    std::vector<demand_slot_ref> reused;      // served in place by a held slot of cap >= size
+    std::vector<demand_slot_ref> carved;      // carved new, nothing held at that key
+    std::vector<demand_slot_ref> superseded;  // carved new; `held` is the smaller slot the publish releases
+    std::vector<size_t>          unused;      // held slots (indices) of a demanded owner no record names
+};
+
+// Reuse in place when the owner holds the same (cohort, index) with cap >= the
+// new need; every other slot is carved new, and the old one it supersedes is
+// released at the publish.  A claimed slot is never moved.  A held slot is
+// `unused` when its owner has a record on its device and no record names its
+// (cohort, index): it stays as held planned room (the tenant-only path) and is
+// released only with its owner.
+demand_reconciliation context_demand_reconcile(const std::vector<context_side_demand> & demands,
+                                               const std::vector<held_slot> &           held);
 
 }  // namespace ggml_sycl

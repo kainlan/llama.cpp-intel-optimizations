@@ -55,6 +55,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIFIED_CACHE_HPP = ROOT / "ggml/src/ggml-sycl/unified-cache.hpp"
+KV_RUNTIME_DEMOTION_HPP = ROOT / "ggml/src/ggml-sycl/kv-runtime-demotion.hpp"
 UNIFIED_CACHE_CPP = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
 GGML_SYCL_CPP = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 MEM_HANDLE_CPP = ROOT / "ggml/src/ggml-sycl/mem-handle.cpp"
@@ -62,6 +63,10 @@ LLAMA_MODEL_CPP = ROOT / "src/llama-model.cpp"
 LLAMA_CONTEXT_CPP = ROOT / "src/llama-context.cpp"
 
 KV_LAYER_BYTES_FOR_KIND = "kv_layer_bytes_for_kind"
+# The cell arithmetic, factored out of kv_layer_bytes_for_kind so the load-time
+# estimate and the region fit's slots share it (llama.cpp-moua).
+KV_LAYER_CELLS = "kv_layer_cells"
+KV_LAYER_TENSOR_BYTES = "kv_layer_tensor_bytes"
 # The actual shared transaction body -- ggml_backend_sycl_set_runtime_context_
 # for_model() (the public entry point) and the probe path both call into this
 # one function; it is where next_kv_info/next_plan are built and consumed.
@@ -123,10 +128,12 @@ def function_or_none(text: str, signature: str) -> str | None:
     return function(text, signature)
 
 
-def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
-    body = function_or_none(source, "inline size_t " + KV_LAYER_BYTES_FOR_KIND)
+def kv_layer_cells_violations(source: str) -> list[str]:
+    """The SWA/FULL cell arithmetic, in kv-runtime-demotion.hpp."""
+    body = function_or_none(source, "inline size_t " + KV_LAYER_CELLS)
     if body is None:
-        return [f"{KV_LAYER_BYTES_FOR_KIND} is missing"]
+        return [f"{KV_LAYER_CELLS} is missing"]
+    params = function_signature_params(source, "inline size_t " + KV_LAYER_CELLS)
 
     found: list[str] = []
 
@@ -136,14 +143,13 @@ def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
         found.append("does not derive seqs from n_seq_max (with a >0 guard)")
 
     # Bug 2: the three-way switch, SHARED charged 0.
-    if not re.search(r"kind\s*==\s*GGML_SYCL_KV_LAYER_SHARED\s*\)\s*\{\s*return\s+0\s*;", body):
+    if not re.search(r"kind\s*==\s*KV_CELLS_SHARED\s*\)\s*\{\s*return\s+0\s*;", body):
         found.append("does not return 0 for a SHARED layer")
-    if "GGML_SYCL_KV_LAYER_SWA" not in body:
-        found.append("does not branch on GGML_SYCL_KV_LAYER_SWA")
+    if "KV_CELLS_SWA" not in body:
+        found.append("does not branch on KV_CELLS_SWA")
 
     # Bug 3: the kv_unified two-mode split.
-    if not re.search(r"bool\s+kv_unified\b",
-                     function_signature_params(source, "inline size_t " + KV_LAYER_BYTES_FOR_KIND)):
+    if not re.search(r"bool\s+kv_unified\b", params):
         found.append("has no bool kv_unified parameter")
     if not re.search(r"if\s*\(\s*kv_unified\s*\)\s*\{", body):
         found.append("does not branch on kv_unified")
@@ -151,8 +157,8 @@ def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
     if not re.search(r"n_ctx_seq\s*=\s*n_ctx\s*;\s*\n\s*n_stream\s*=\s*1\s*;\s*\n\s*window_seqs\s*=\s*seqs\s*;", body):
         found.append("kv_unified==true branch does not set n_ctx_seq=n_ctx, n_stream=1, window_seqs=seqs")
     # Non-unified mode: n_seq_max independent streams, each windowed at 1 sequence.
-    if not re.search(r"n_ctx_seq\s*=\s*GGML_PAD\(n_ctx\s*/\s*seqs,\s*256\)", body):
-        found.append("kv_unified==false branch does not derive n_ctx_seq = GGML_PAD(n_ctx / seqs, 256)")
+    if not re.search(r"n_ctx_seq\s*=\s*pad256\(n_ctx\s*/\s*seqs\)", body):
+        found.append("kv_unified==false branch does not derive n_ctx_seq = pad256(n_ctx / seqs)")
     if not re.search(r"n_stream\s*=\s*seqs\s*;\s*\n\s*window_seqs\s*=\s*1\s*;", body):
         found.append("kv_unified==false branch does not set n_stream=seqs, window_seqs=1")
     # The per-stream cap and the stream multiplication must both survive
@@ -166,12 +172,40 @@ def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
     # consulted before the windowed SWA formula -- with swa_full llama
     # allocates an SWA layer at size_base (n_ctx_seq per stream), so the
     # windowed arithmetic above must not run for it.
-    if not re.search(r"bool\s+swa_full\b",
-                     function_signature_params(source, "inline size_t " + KV_LAYER_BYTES_FOR_KIND)):
+    if not re.search(r"bool\s+swa_full\b", params):
         found.append("has no bool swa_full parameter")
-    if not re.search(r"kind\s*==\s*GGML_SYCL_KV_LAYER_SWA\s*&&\s*!\s*swa_full", body):
+    if not re.search(r"kind\s*==\s*KV_CELLS_SWA\s*&&\s*!\s*swa_full", body):
         found.append("does not branch on swa_full")
 
+    return found
+
+
+def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
+    """kv_layer_bytes_for_kind() must take its cells from kv_layer_cells() and
+    its bytes from kv_layer_tensor_bytes(), forwarding every shape input: the
+    one byte function the region fit sizes a slot with, so the load-time
+    estimate cannot drift from it (llama.cpp-moua)."""
+    signature = "inline size_t " + KV_LAYER_BYTES_FOR_KIND
+    body = function_or_none(source, signature)
+    if body is None:
+        return [f"{KV_LAYER_BYTES_FOR_KIND} is missing"]
+    params = function_signature_params(source, signature)
+
+    found: list[str] = []
+    for param in ("kv_unified", "swa_full"):
+        if not re.search(r"bool\s+" + param + r"\b", params):
+            found.append(f"has no bool {param} parameter")
+    call = re.search(re.escape(KV_LAYER_CELLS) + r"\(\s*kind\s*,[^;]*\)", body, re.S)
+    if call is None:
+        found.append(f"does not take its cell count from {KV_LAYER_CELLS}")
+    else:
+        for arg in ("n_ctx", "n_ubatch", "n_seq_max", "kv_unified", "swa_full", "n_swa"):
+            if not re.search(r"\b" + arg + r"\b", call.group(0)):
+                found.append(f"does not forward {arg} to {KV_LAYER_CELLS}")
+    if KV_LAYER_TENSOR_BYTES + "(" not in body:
+        found.append(f"does not size through {KV_LAYER_TENSOR_BYTES}")
+    if "window_seqs" in body or "GGML_PAD" in body:
+        found.append("carries a second copy of the cell arithmetic")
     return found
 
 
@@ -346,7 +380,11 @@ def stale_comment_violations(hpp_source: str, cpp_source: str) -> list[str]:
     return found
 
 
-def test_kv_layer_bytes_for_kind_consumes_n_seq_max_and_kv_unified() -> None:
+def test_kv_layer_cells_consumes_n_seq_max_and_kv_unified() -> None:
+    assert kv_layer_cells_violations(KV_RUNTIME_DEMOTION_HPP.read_text()) == []
+
+
+def test_kv_layer_bytes_for_kind_takes_the_one_byte_function() -> None:
     assert kv_layer_bytes_for_kind_violations(UNIFIED_CACHE_HPP.read_text()) == []
 
 
@@ -391,16 +429,16 @@ def _assert_witnessed(original: str, mutated: str, checker, expected_substring: 
 
 
 def test_mutation_seqs_hardcoded_to_1_is_witnessed() -> None:
-    hpp = UNIFIED_CACHE_HPP.read_text()
+    hpp = KV_RUNTIME_DEMOTION_HPP.read_text()
     mutated = hpp.replace("const uint32_t seqs = n_seq_max > 0 ? n_seq_max : 1;", "const uint32_t seqs = 1;", 1)
-    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not derive seqs from n_seq_max",
+    _assert_witnessed(hpp, mutated, kv_layer_cells_violations, "does not derive seqs from n_seq_max",
                       "seqs hardcoded to 1")
 
 
 def test_mutation_shared_arm_dropped_is_witnessed() -> None:
-    hpp = UNIFIED_CACHE_HPP.read_text()
-    mutated = re.sub(r"if \(kind == GGML_SYCL_KV_LAYER_SHARED\) \{\s*\n\s*return 0;\s*\n\s*\}\s*\n", "", hpp, count=1)
-    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not return 0 for a SHARED layer",
+    hpp = KV_RUNTIME_DEMOTION_HPP.read_text()
+    mutated = re.sub(r"if \(kind == KV_CELLS_SHARED\) \{\s*\n\s*return 0;\s*\n\s*\}\s*\n", "", hpp, count=1)
+    _assert_witnessed(hpp, mutated, kv_layer_cells_violations, "does not return 0 for a SHARED layer",
                       "SHARED arm dropped")
 
 
@@ -417,6 +455,11 @@ def test_mutation_kv_unified_param_renamed_is_witnessed() -> None:
     assert n == 1, "kv_unified parameter pattern did not match the current source"
     _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "has no bool kv_unified parameter",
                       "kv_unified parameter renamed away")
+    cells = KV_RUNTIME_DEMOTION_HPP.read_text()
+    mutated, n = re.subn(r"(bool\s+)kv_unified,", r"\1kv_unified_flag,", cells, count=1)
+    assert n == 1, "kv_unified parameter pattern did not match kv_layer_cells"
+    _assert_witnessed(cells, mutated, kv_layer_cells_violations, "has no bool kv_unified parameter",
+                      "kv_layer_cells kv_unified parameter renamed away")
 
 
 def test_mutation_swa_full_param_renamed_is_witnessed() -> None:
@@ -425,21 +468,25 @@ def test_mutation_swa_full_param_renamed_is_witnessed() -> None:
     assert n == 1, "swa_full parameter pattern did not match the current source"
     _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "has no bool swa_full parameter",
                       "swa_full parameter renamed away")
+    cells = KV_RUNTIME_DEMOTION_HPP.read_text()
+    mutated, n = re.subn(r"(bool\s+)swa_full,", r"\1swa_full_flag,", cells, count=1)
+    assert n == 1, "swa_full parameter pattern did not match kv_layer_cells"
+    _assert_witnessed(cells, mutated, kv_layer_cells_violations, "has no bool swa_full parameter",
+                      "kv_layer_cells swa_full parameter renamed away")
 
 
 def test_mutation_swa_full_branch_dropped_is_witnessed() -> None:
-    hpp = UNIFIED_CACHE_HPP.read_text()
+    hpp = KV_RUNTIME_DEMOTION_HPP.read_text()
     # Back to "size by the window regardless of swa_full" -- the exact
     # llama.cpp-uajm defect.
-    mutated, n = re.subn(r"kind == GGML_SYCL_KV_LAYER_SWA && !swa_full", "kind == GGML_SYCL_KV_LAYER_SWA", hpp,
-                         count=1)
+    mutated, n = re.subn(r"kind == KV_CELLS_SWA && !swa_full", "kind == KV_CELLS_SWA", hpp, count=1)
     assert n == 1, "swa_full branch pattern did not match the current source"
-    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not branch on swa_full",
+    _assert_witnessed(hpp, mutated, kv_layer_cells_violations, "does not branch on swa_full",
                       "swa_full branch dropped")
 
 
 def test_mutation_kv_unified_branch_dropped_is_witnessed() -> None:
-    hpp = UNIFIED_CACHE_HPP.read_text()
+    hpp = KV_RUNTIME_DEMOTION_HPP.read_text()
     # Collapse the two-mode split to the (kv_unified==true) formula
     # unconditionally -- the exact Bug 3 shape (assumes a single shared
     # stream regardless of the caller's real kv_unified). Skips any
@@ -461,8 +508,36 @@ def test_mutation_kv_unified_branch_dropped_is_witnessed() -> None:
         "        } else if (false) {",
         hpp, count=1)
     assert n == 1, "kv_unified branch pattern did not match the current source"
-    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations,
+    _assert_witnessed(hpp, mutated, kv_layer_cells_violations,
                       "does not branch on kv_unified", "kv_unified branch collapsed")
+
+
+def test_mutation_kv_layer_bytes_for_kind_stops_taking_cells_from_the_one_function_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("kv_layer_cells(kind, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full, n_swa)", "n_ctx", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not take its cell count from",
+                      "cells no longer from kv_layer_cells")
+
+
+def test_mutation_kv_layer_bytes_for_kind_stops_forwarding_swa_full_to_the_cells_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("kv_unified, swa_full, n_swa)", "kv_unified, false, n_swa)", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not forward swa_full to",
+                      "swa_full no longer forwarded to kv_layer_cells")
+
+
+def test_mutation_kv_layer_bytes_for_kind_stops_sizing_through_the_one_function_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("return kv_layer_tensor_bytes(", "return legacy_tensor_bytes(", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not size through",
+                      "bytes no longer from kv_layer_tensor_bytes")
+
+
+def test_mutation_kv_layer_bytes_for_kind_grows_a_second_cell_formula_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("    kv_layer_desc layer;", "    const uint32_t window_seqs = 1;\n    kv_layer_desc layer;", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "second copy of the cell arithmetic",
+                      "a second cell formula")
 
 
 def test_mutation_kv_bytes_for_layer_stops_forwarding_kv_unified_is_witnessed() -> None:

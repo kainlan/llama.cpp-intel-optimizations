@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 
 namespace ggml_sycl {
 
@@ -291,6 +292,88 @@ int layer_block_kv_device(const std::vector<int> &    kv_device,
         }
     }
     return owner;
+}
+
+size_t rs_buffer_bytes(const std::vector<rs_layer_desc> & layers, size_t pad_to, kv_row_size_fn row_size) {
+    if (row_size == nullptr) {
+        return 0;
+    }
+    size_t bytes = 0;
+    for (const rs_layer_desc & layer : layers) {
+        const size_t r_bytes = layer.n_embd_r > 0 ? row_size(layer.type_r, layer.n_embd_r) * layer.n_rows : 0;
+        const size_t s_bytes = layer.n_embd_s > 0 ? row_size(layer.type_s, layer.n_embd_s) * layer.n_rows : 0;
+        bytes += kv_pad_bytes(r_bytes, pad_to) + kv_pad_bytes(s_bytes, pad_to);
+    }
+    return bytes;
+}
+
+bool demand_slot_key_matches(const held_slot & held, const context_side_demand & demand, uint32_t index) {
+    return held.device == demand.device && held.scope == demand.scope && held.owner == demand.owner &&
+           held.index == index &&
+           (held.cohort == demand.cohort ||
+            (held.cohort != nullptr && demand.cohort != nullptr && std::strcmp(held.cohort, demand.cohort) == 0));
+}
+
+size_t demand_find_reusable_slot(const std::vector<held_slot> & held,
+                                 const context_side_demand &    demand,
+                                 uint32_t                       index,
+                                 size_t                         need) {
+    for (size_t h = 0; h < held.size(); ++h) {
+        if (demand_slot_key_matches(held[h], demand, index) && held[h].cap >= need) {
+            return h;
+        }
+    }
+    return SIZE_MAX;
+}
+
+demand_reconciliation context_demand_reconcile(const std::vector<context_side_demand> & demands,
+                                               const std::vector<held_slot> &           held) {
+    demand_reconciliation r;
+    std::vector<char>     named(held.size(), 0);
+    for (size_t d = 0; d < demands.size(); ++d) {
+        const context_side_demand & demand = demands[d];
+        for (size_t i = 0; i < demand.slots.size(); ++i) {
+            const uint32_t  index = static_cast<uint32_t>(i);
+            const size_t    need  = demand.slots[i];
+            demand_slot_ref ref;
+            ref.record = d;
+            ref.index  = index;
+            ref.size   = need;
+            for (size_t h = 0; h < held.size(); ++h) {
+                if (demand_slot_key_matches(held[h], demand, index)) {
+                    named[h] = 1;
+                }
+            }
+            const size_t reuse = demand_find_reusable_slot(held, demand, index, need);
+            if (reuse != SIZE_MAX) {
+                ref.held = reuse;
+                r.reused.push_back(ref);
+                continue;
+            }
+            if (need == 0) {
+                continue;  // nothing to carve for an index that needs no bytes
+            }
+            for (size_t h = 0; h < held.size(); ++h) {
+                if (demand_slot_key_matches(held[h], demand, index)) {
+                    ref.held = h;  // held, but too small: the growth supersedes it
+                    break;
+                }
+            }
+            (ref.held == SIZE_MAX ? r.carved : r.superseded).push_back(ref);
+        }
+    }
+    for (size_t h = 0; h < held.size(); ++h) {
+        if (named[h]) {
+            continue;
+        }
+        for (const context_side_demand & demand : demands) {
+            if (demand.device == held[h].device && demand.scope == held[h].scope && demand.owner == held[h].owner) {
+                r.unused.push_back(h);
+                break;
+            }
+        }
+    }
+    return r;
 }
 
 }  // namespace ggml_sycl
