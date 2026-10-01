@@ -11120,7 +11120,7 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
         // control (the pre-teardown census admits it, unable to tell it
         // apart from a real, in-use slab) for the rest of the process.
         onednn_graph_scratch_flag_slab_owner_        = {};
-        onednn_graph_scratch_flag_slab_warned_ = true;
+        onednn_graph_scratch_flag_slab_warned_       = true;
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] Failed to resolve the oneDNN Graph-scratch pool's completion-flag slab owner; "
             "falling back to blocking completion checks for every pooled entry\n");
