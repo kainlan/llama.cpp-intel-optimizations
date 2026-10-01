@@ -822,10 +822,27 @@ int main() {
               "with no hold nothing is held back");
         CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, SIZE_MAX, SIZE_MAX, 1),
               "a hold that wraps must not read as no hold");
+        // Review r2 F1: held back means the ZONE ALONE would have served the request and the hold is what keeps it
+        // out. A request the zone cannot hold anyway spills exactly as it always did, with no hold involved, and
+        // the overcommit guard keeps evicting for it as it did before the hold existed.
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 50, 0, 100),
+              "an ordinary zone-full spill with no hold is not held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 50, 10, 100),
+              "a request larger than the zone's free bytes spills with or without a hold: not held back");
+        CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 10, 95),
+              "a request the zone could serve that would eat into the hold is held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 0, 95),
+              "the same request with no hold is served from the zone");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 10, 90),
+              "a request that leaves exactly the hold is served from the zone");
+        CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 10, 91),
+              "one byte into the hold is held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 300 * 1024, hold, 300 * 1024 + 1),
+              "the incident's zone-full request one byte over the free bytes is an ordinary spill");
         // Argument order is part of the contract: (runtime, forbid, available, hold, size). The zone's free bytes
         // are the first of the three sizes; swapped with the request, the same numbers answer another question.
-        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 10, 50) &&
-                  ggml_sycl::zone_runtime_alloc_held_back(true, false, 50, 10, 100),
+        CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 10, 95) &&
+                  !ggml_sycl::zone_runtime_alloc_held_back(true, false, 95, 10, 100),
               "available is the zone's free bytes and size is the request, not the other way round");
 
         // The route a node takes: the walks and the dispatch must agree, including after a runtime decline.

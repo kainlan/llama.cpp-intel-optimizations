@@ -544,6 +544,68 @@ def evaluate(backend, common, cache, zone):
     results["a rejected figure is flagged, so no plan is derived from the stale inputs"] = \
         "g_planned_dense_scratch_invalid" in set_q8_fn and "g_planned_dense_scratch_invalid" in set_f16_fn and \
         "g_planned_dense_scratch_invalid" in bytes_at_fn and "g_planned_dense_scratch_invalid" in replan_fn
+
+    # --- llama.cpp-kpjw review r2 ---------------------------------------------------------------------------
+    # F1: held back means the zone ALONE would have served the request and the hold is what keeps it out. A
+    # zone-full spill (request larger than the free bytes) is an ordinary spill and keeps its eviction.
+    held_back_fn = function_body(zone, r"bool zone_runtime_alloc_held_back\([^)]*\)\s*\{") or ""
+    results["anchor: held-back predicate defined"] = held_back_fn != ""
+    results["held back requires a hold, a request the zone could serve, and the hold's refusal"] = \
+        re.search(r"\bhold\s*>\s*0\b", held_back_fn) is not None and \
+        re.search(r"\balloc_size\s*<=\s*zone_available\b", held_back_fn) is not None and \
+        "zone_runtime_alloc_respects_hold(" in held_back_fn
+
+    # F2: ONE source for the worst-case outside-arena spill, and it counts the right quantity (the whole request
+    # that can be held back, so the bound is the hold plus the largest spill-capable request seen).
+    recheck_fn = function_body(
+        backend, r"ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn\([^)]*\)\s*\{") or ""
+    bound_fn = function_body(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\([^)]*\)\s*\{") or ""
+    results["anchor: hold-spill bound exists"] = bound_fn != ""
+    results["anchor: recheck exists"] = recheck_fn != ""
+    results["the spill bound is the plan plus the largest spill-capable request"] = \
+        "unified_cache_planned_dense_scratch_bytes_at(" in bound_fn and "unified_cache_get_runtime_request_hwm(" in bound_fn
+    results["the allocator records the largest spill-capable RUNTIME request"] = \
+        "unified_cache_note_runtime_request(" in unified_alloc_fn
+    results["the transaction and the recheck ask the one bound"] = \
+        re.search(r"ggml_sycl_planned_scratch_hold_spill_bound\([^;]*n_ubatch", txn) is not None and \
+        "ggml_sycl_planned_scratch_hold_spill_bound(" in recheck_fn and \
+        "unified_cache_get_planned_scratch_hold(" not in recheck_fn
+
+    # F3: flash attention is the default, so the by-name refusal must cover it too: the same live free-memory
+    # comparison, with the spill figure as the whole demand.
+    hold_headroom_fn = function_body(backend, r"static bool ggml_sycl_check_hold_spill_headroom\([^)]*\)\s*\{") or ""
+    results["anchor: FA-on hold-spill headroom check exists"] = hold_headroom_fn != ""
+    results["the FA-on early return runs the headroom check instead of skipping it"] = \
+        re.search(r"if\s*\(\s*flash_attn_enabled\s*\)\s*\{\s*return ggml_sycl_check_hold_spill_headroom\(", nonfa_check) is not None
+    results["the FA-on check compares the spill with the device's live free memory"] = \
+        "ggml_backend_sycl_get_device_memory(" in hold_headroom_fn and "GGML_SYCL_RUNTIME_TXN_REFUSAL" in hold_headroom_fn
+
+    # M-a / M-b: the plan inputs are merged per device, at re-plan too, and one model's overflow does not
+    # invalidate another live model's plan.
+    results["the dense replan merges across live contexts too"] = \
+        re.search(r"bool unified_cache_replan_planned_dense_scratch\([^)]*other_model_live", cache) is not None and \
+        "other_model_live" in replan_fn
+    results["the transaction asks whether another context is live on THIS device"] = \
+        "ggml_sycl_other_backend_context_live(" in txn and "ggml_sycl_other_backend_context_live(" in backend[
+            max(0, plan_f16_at - 2400):plan_f16_at + 400]
+    results["a rejected figure does not invalidate another live model's plan"] = all(
+        re.search(r"if\s*\(\s*!\s*other_model_live\s*\)\s*\{[^{}]*g_planned_dense_scratch_invalid", f) is not None
+        for f in (set_q8_fn, set_f16_fn))
+
+    # M-d / M-e: the owner is a monotonic id, and the hold state moves as one unit.
+    results["the owner token is a monotonic context id, not an address"] = \
+        "unified_cache_mint_planned_scratch_owner(" in common + backend and \
+        "unified_cache_release_planned_scratch_hold(device, planned_scratch_owner)" in backend
+    results["the hold state is one mutex-guarded unit"] = \
+        re.search(r"struct planned_scratch_hold_state\s*\{[^}]*std::mutex", cache) is not None
+    results["taking the hold spills is scoped to the context that owns them"] = \
+        re.search(r"void unified_cache_take_planned_hold_spills\([^)]*owner", cache) is not None and \
+        "planned_scratch_owner" in stats_fn
+
+    # M-f: the f16 arm's compile condition is written once.
+    results["the f16 arm's compile condition has one source"] = \
+        "GGML_SYCL_DEQUANT_F16_ARM" in dq_walk and "defined(GGML_SYCL_F16)" not in dq_walk and \
+        len(re.findall(r"defined\(GGML_SYCL_F16\)", backend)) <= 2
     return results
 
 
@@ -559,7 +621,11 @@ def run(label, sources, expect_fail=None):
     return [] if fired else [label]
 
 
-backend, common, cache, zone = (read(args.backend), read(args.common), read(args.cache), read(args.zone))
+# The zone-sizing declarations and definitions are one source for the checks (the shape of a pure predicate lives
+# in the .cpp; the contract comments live in the .hpp, which the stripped text drops anyway).
+zone_impl = str(Path(args.zone).with_suffix(".cpp"))
+backend, common, cache, zone = (read(args.backend), read(args.common), read(args.cache),
+                                read(args.zone) + "\n" + (read(zone_impl) if Path(zone_impl).exists() else ""))
 failed = run("tree", (backend, common, cache, zone))
 # A comment is not code, so the stripped sources cannot see it. This one was a false claim a reader acted on
 # : the whole-graph recording path does NOT keep the Q8 buffer's handle alive.
