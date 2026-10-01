@@ -5870,11 +5870,12 @@ own targets from this measurement when DSpark lands.
   (§4.2). A mismatch is a `[HOST-PLAN-BUG]` WARN that aborts under
   `ggml_sycl_strict_enabled()` (`GGML_SYCL_STRICT_LEASES=1`) and otherwise a
   typed refusal: plan != reality is a defect, never tolerated. This is the whole
-  `[HOST-PLAN-BUG]` family's convention (activation check, ring check, zone check,
-  leaked lease, reset failure, concurrent ensure), except `ring_lease::clone()`, whose
-  abort is unconditional (§3.3), the in-tree one of `[CONTEXT-PLAN-BUG]`
-  (`mem-handle.cpp:2239-2271`) and `unified-cache.cpp:7989-8003` (r47 I-4). T4's
-  RED: a fixture whose materialization allocates one extra chunk fails the
+  `[HOST-PLAN-BUG]` family's convention (activation check, ring check, zone
+  check, leaked lease, reset failure, concurrent ensure), except
+  `ring_lease::clone()`, whose abort is unconditional (§3.3), the in-tree one of
+  `[CONTEXT-PLAN-BUG]` (`mem-handle.cpp:2239-2271`) and
+  `unified-cache.cpp:7989-8003` (r47 I-4). T4's RED: a fixture whose
+  materialization allocates one extra chunk fails the
   check, naming both numbers. **The ring has its own check** (r35 m-2; r36 I-1,
   m-2). For the model whose ensure created the ring, `ring=` equals the
   allocated handle size, and `block_ring_ensure` compares them. For any other
