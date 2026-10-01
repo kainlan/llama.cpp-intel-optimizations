@@ -23,9 +23,10 @@
 # graph and trip the dkw0 replay-futility detector. So the backend exports ONE
 # predicate computed from its own placement plan (ggml_backend_sycl_plan_has_cpu_work:
 # a host-planned dense layer or weight under supports_op's own residency rule,
-# host-planned KV, or a fully host-planned expert tensor), llama-context ORs it with its own partial-offload test, and the choice
-# is re-made right before every ggml_backend_sched_new() because the auto-ubatch
-# resyncs re-plan after the constructor's buft enumeration.
+# host-planned KV, or a fully host-planned expert tensor), llama-context ORs it
+# with its own partial-offload test, and the choice is re-made right before every
+# ggml_backend_sched_new() because the auto-ubatch resyncs re-plan after the
+# constructor's buft enumeration.
 #
 # Each check documents its RED state against c9f464b48 (the commit this task
 # branched from). Run with --root <dir> to point at an extracted tree. With

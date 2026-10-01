@@ -108257,6 +108257,9 @@ static const char * ggml_sycl_plan_cpu_work_reason(const ggml_sycl::placement_pl
         }
     }
 
+    // kv_size_for_layer() reads the per-layer KV truth (kind + K/V width), so a layer with no
+    // attention (zero width) owes nothing here. If that truth is absent (the inventory carried no
+    // per-layer widths) it falls back to the uniform kv_per_layer and such a layer would over-select.
     const size_t n_kv_layers = plan.kv_layer_count();
     for (uint32_t l = 0; l < n_kv_layers; ++l) {
         if (plan.kv_size_for_layer(l) > 0 && plan.get_kv_device(static_cast<int>(l)) < 0) {

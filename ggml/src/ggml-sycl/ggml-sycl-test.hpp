@@ -24,6 +24,10 @@ mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id & key,
                                          std::shared_ptr<void>      storage_owner);
 bool       test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease);
 
+// ggml_sycl_plan_has_cpu_work() on a synthetic plan: true when the CPU would
+// execute any part of the graph (llama.cpp-38af).
+bool test_plan_has_cpu_work(const placement_plan & plan);
+
 // Mutable controls are declared only for private direct-source fixtures.
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void test_set_layout_override(ggml_layout_mode layout);
@@ -44,9 +48,6 @@ bool               test_moe_ptr_table_retains_route_lease_until_event();
 bool               test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event();
 bool               test_moe_ptr_table_cached_reuse_is_tensor_specific();
 bool               test_moe_ptr_table_does_not_persist_pointer_cache();
-// ggml_sycl_plan_has_cpu_work() on a synthetic plan: true when the CPU would
-// execute any part of the graph (llama.cpp-38af).
-bool               test_plan_has_cpu_work(const placement_plan & plan);
 bool               test_moe_ptr_table_lease_covers_populated_slots();
 bool               test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
 

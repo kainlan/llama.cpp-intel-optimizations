@@ -39,6 +39,15 @@ void expect(bool got, bool want, const char * what) {
     ++failures;
 }
 
+void require(bool ok, const char * what) {
+    if (ok) {
+        std::printf("  ok  : (precondition) %s\n", what);
+        return;
+    }
+    std::printf("  FAIL: (precondition) %s\n", what);
+    ++failures;
+}
+
 constexpr size_t kBytes = 4096;
 
 // Two layers, everything on device 0: the baseline every case below perturbs.
@@ -120,6 +129,33 @@ int main() {
         expect(has_cpu_work(std::move(plan)), false, "a layer with no KV bytes owes nothing to the KV clause");
     }
     {
+        // The real shape of a recurrent layer (qwen35 hybrid): per-layer KV truth is
+        // present, the layer is FULL-kind with zero K/V width, so it owns no KV bytes
+        // and has no KV owner. It must not read as host KV.
+        auto plan          = full_offload_plan();
+        plan.planner_n_ctx = 512;
+        plan.layer_kind    = { GGML_SYCL_KV_LAYER_FULL, GGML_SYCL_KV_LAYER_FULL };
+        plan.layer_k_width = { 64, 0 };
+        plan.layer_v_width = { 64, 0 };
+        plan.kv_device[1]  = -1;
+        require(plan.has_per_layer_kv_truth(1), "per-layer KV truth is present for the recurrent layer");
+        require(plan.kv_size_for_layer(1) == 0 && plan.kv_size_for_layer(0) > 0,
+                "the recurrent layer owns 0 KV bytes, the attention layer owns some");
+        expect(has_cpu_work(std::move(plan)), false,
+               "a recurrent layer (FULL kind, zero K/V width, no KV owner) owes nothing to the KV clause");
+    }
+    {
+        // Positive control for the case above: the same shape with the ATTENTION
+        // layer's KV on the host is CPU work, so the clause is live under per-layer truth.
+        auto plan          = full_offload_plan();
+        plan.planner_n_ctx = 512;
+        plan.layer_kind    = { GGML_SYCL_KV_LAYER_FULL, GGML_SYCL_KV_LAYER_FULL };
+        plan.layer_k_width = { 64, 0 };
+        plan.layer_v_width = { 64, 0 };
+        plan.kv_device[0]  = -1;
+        expect(has_cpu_work(std::move(plan)), true, "per-layer truth: the attention layer's KV on the host");
+    }
+    {
         auto plan = full_offload_plan();
         add_experts(plan, 0, 4, 0);
         expect(has_cpu_work(std::move(plan)), true, "an expert tensor with NO expert on a device");
@@ -151,6 +187,54 @@ int main() {
             }
         }
         expect(has_cpu_work(std::move(plan)), false, "multi-device: token_embd owned by another GPU");
+    }
+
+    std::printf("=== the dense clause's single/multi-device split reads different fields ===\n");
+    {
+        // The two fields disagree: on one device only on_device decides, on several only
+        // target_device does. entry_off_device() sets both, so it cannot tell them apart.
+        auto plan = full_offload_plan(/*multi_device=*/true);
+        for (auto & e : plan.entries) {
+            if (e.name == "token_embd.weight") {
+                e.on_device     = true;
+                e.target_device = -1;
+            }
+        }
+        expect(has_cpu_work(std::move(plan)), true,
+               "multi-device: on_device=true but target_device=-1 (target decides)");
+    }
+    {
+        auto plan = full_offload_plan(/*multi_device=*/true);
+        for (auto & e : plan.entries) {
+            if (e.name == "token_embd.weight") {
+                e.on_device     = false;
+                e.target_device = 0;
+            }
+        }
+        expect(has_cpu_work(std::move(plan)), false,
+               "multi-device: on_device=false but target_device=0 (target decides)");
+    }
+    {
+        auto plan = full_offload_plan();
+        for (auto & e : plan.entries) {
+            if (e.name == "token_embd.weight") {
+                e.on_device     = false;
+                e.target_device = 0;
+            }
+        }
+        expect(has_cpu_work(std::move(plan)), true,
+               "single device: on_device=false but target_device=0 (on_device decides)");
+    }
+    {
+        auto plan = full_offload_plan();
+        for (auto & e : plan.entries) {
+            if (e.name == "token_embd.weight") {
+                e.on_device     = true;
+                e.target_device = -1;
+            }
+        }
+        expect(has_cpu_work(std::move(plan)), false,
+               "single device: on_device=true but target_device=-1 (on_device decides)");
     }
 
     std::printf("=== layer_device takes precedence for a layer's own weights ===\n");
