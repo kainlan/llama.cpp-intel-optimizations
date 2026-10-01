@@ -55,7 +55,9 @@ const ggml_sycl_context_cohort_info * ggml_sycl_context_cohort_lookup(uint32_t c
 int32_t ggml_sycl_context_cohort_element_device(uint32_t cohort, int32_t device);
 
 // Contract (b): a runtime site claims `bytes` from a slot of `slot_bytes`, and
-// a claim over the slot is a [CONTEXT-PLAN-BUG], never a silent growth.
+// a claim over the slot is a [CONTEXT-PLAN-BUG], never a silent growth. A claim
+// against a slot the section does not carry is a claim against slot_bytes 0: it
+// fails, and is never skipped.
 inline bool ggml_sycl_context_claim_fits(uint64_t bytes, uint64_t slot_bytes) {
     return bytes <= slot_bytes;
 }

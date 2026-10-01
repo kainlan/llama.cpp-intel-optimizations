@@ -1955,7 +1955,7 @@ else()
 endif()
 
 # The measured-tenant section: the tenant element's layout, the cohort table and
-# the visitor accumulator. context-tenant-measure.hpp includes only ggml.h, so
+# the visitor accumulator. context-tenant-measure.hpp names only ggml types, so
 # this needs neither -fsycl nor a device; it compiles the .cpp itself (the same
 # file libggml-sycl gets from the file(GLOB) at :83) and links ggml-base alone.
 add_executable(test-context-tenant-measure
