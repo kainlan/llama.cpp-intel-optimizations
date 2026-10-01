@@ -14,11 +14,64 @@ cpu_cpp = (root / "ggml/src/ggml-cpu/ggml-cpu.cpp").read_text()
 root_cmake = (root / "ggml/src/CMakeLists.txt").read_text()
 sycl_cmake = (sycl_dir / "CMakeLists.txt").read_text()
 
-module_sources = "\n".join(
+
+
+def strip_comments(source):
+    return re.sub(r"//[^\n]*|/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), source, flags=re.S)
+
+
+def dl_view(source):
+    """The text a GGML_BACKEND_DL build compiles: comments gone, and every `#ifndef GGML_BACKEND_DL` branch
+    dropped (its `#else` kept), every `#ifdef GGML_BACKEND_DL` branch kept (its `#else` dropped). Other
+    conditionals are left alone, both branches kept. The TKV-13 host attention dispatch (c099dbc1c) names
+    ggml_backend_graph_compute behind exactly such a guard, so a flat text scan of the file cannot tell a
+    DL-reachable reference from one the DL module never compiles."""
+    out, stack = [], []  # stack entries: [is_dl_conditional, currently_emitting_parent, active_branch_is_dl_visible]
+    emitting = True
+    for line in strip_comments(source).split("\n"):
+        directive = re.match(r"\s*#\s*(ifndef|ifdef|if|else|elif|endif)\b\s*(.*)", line)
+        if directive:
+            kind, rest = directive.group(1), directive.group(2).strip()
+            if kind in ("ifndef", "ifdef", "if"):
+                dl = rest.split("//")[0].strip() == "GGML_BACKEND_DL" and kind in ("ifndef", "ifdef")
+                visible = (kind == "ifdef") if dl else True
+                stack.append([dl, emitting, visible])
+                emitting = emitting and visible
+            elif kind in ("else", "elif") and stack:
+                dl, parent, visible = stack[-1]
+                if dl:
+                    stack[-1][2] = not visible
+                    emitting = parent and stack[-1][2]
+            elif kind == "endif" and stack:
+                _, parent, _ = stack.pop()
+                emitting = parent
+            out.append("")
+            continue
+        out.append(line if emitting else "")
+    return "\n".join(out)
+
+
+sycl_dir_sources = [
     p.read_text(errors="replace") for p in sycl_dir.rglob("*")
     if p.suffix in (".cpp", ".hpp") and "tests" not in p.parts
-)
-calls = len(re.findall(r"ggml_sycl_get_type_traits_cpu\(", sycl_cpp + dispatch))
+]
+module_sources = "\n".join(dl_view(text) for text in sycl_dir_sources)
+module_sources_flat = "\n".join(strip_comments(text) for text in sycl_dir_sources)
+PROVIDER_FILES = ("cpu-traits-support.cpp", "cpu-traits-support.hpp")
+# Comment-blind call-site inventory of the private provider's wrapper, per consumer file. A new consumer, or
+# a consumer growing a call, is a deliberate edit here rather than a drifting literal total.
+EXPECTED_PRIVATE_TRAIT_CALLS = {"cpu-dispatch.cpp": 24, "ggml-sycl.cpp": 7, "unified-cache.cpp": 1}
+private_trait_calls, raw_trait_calls = {}, {}
+for p in sorted(sycl_dir.rglob("*")):
+    if p.suffix not in (".cpp", ".hpp") or "tests" in p.parts or p.name in PROVIDER_FILES:
+        continue
+    text = strip_comments(p.read_text(errors="replace"))
+    n_private = len(re.findall(r"\bggml_sycl_get_type_traits_cpu\(", text))
+    n_raw = len(re.findall(r"\bggml_get_type_traits_cpu\(", text))
+    if n_private:
+        private_trait_calls[p.name] = n_private
+    if n_raw:
+        raw_trait_calls[p.name] = n_raw
 table_types = re.findall(r"^\s*TRAIT\(([A-Z0-9_]+),", provider, re.M)
 expected = "F32 F16 Q1_0 Q2_0 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q8_1 MXFP4 NVFP4 Q2_K Q3_K Q4_K Q5_K Q6_K IQ2_XXS IQ2_XS IQ3_XXS IQ3_S IQ2_S IQ1_S IQ1_M IQ4_NL IQ4_XS BF16 TQ1_0 TQ2_0".split()
 forbidden_registry_symbols = (
@@ -27,7 +80,8 @@ forbidden_registry_symbols = (
 )
 
 checks = {
-    "all original SYCL trait sites use private provider": calls == 27 and "ggml_get_type_traits_cpu(" not in sycl_cpp + dispatch,
+    "SYCL trait call sites are the expected private-provider inventory": private_trait_calls == EXPECTED_PRIVATE_TRAIT_CALLS,
+    "no SYCL consumer calls the raw ggml-cpu trait getter": not raw_trait_calls,
     "exact portable baseline types": table_types == expected and "table[GGML_TYPE_Q8_K]" in provider,
     "bounds checked": "index >= 0 && index < GGML_TYPE_COUNT" in provider,
     "DL local/static optimized split": "#ifndef GGML_BACKEND_DL" in provider
@@ -40,6 +94,11 @@ checks = {
     "traits resolved before row loop": provider.index("ggml_get_type_traits(X)") < provider.index("for (int row = 0;"),
     "canonical Q8_K metadata": "{ from_float_q8_k, nullptr, static_cast<ggml_type>(0), 0 }" in provider,
     "module has no registry references": all(x not in module_sources for x in forbidden_registry_symbols),
+    # Positive control for the DL view above: ggml_backend_graph_compute IS still named in the non-DL
+    # code, so a clean DL view proves the guards are doing the excluding. Without it, an all-comments
+    # or empty view would pass the check above for the wrong reason.
+    "the DL view really excludes the guarded non-DL references":
+        "ggml_backend_graph_compute" in module_sources_flat and "ggml_backend_graph_compute" not in module_sources,
     "DL fallback propagates recoverable status": "throw ggml_sycl_fallback_error(reason)" in sycl_cpp
         and "catch (const ggml_sycl_fallback_error & error)" in sycl_cpp
         and "return GGML_STATUS_FAILED" in sycl_cpp,
