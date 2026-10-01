@@ -190,7 +190,7 @@ if args.self_test:
         ("blas launder", "no 'failed to allocate Q8 scratch' decline remains",
          (backend + '\nGGML_LOG_WARN("[MMVQ-SOA] failed to allocate Q8 scratch");', common, cache, zone)),
         ("planner blind", "the runtime zone requirement folds in the planned src1 bytes",
-         (backend, common, mutate(cache, "unified_cache_get_planned_mmq_src1_scratch_bytes(", "unified_cache_get_planned_XXXX("), zone)),
+         (backend, common, mutate(cache, "const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(", "const size_t mmq_src1 = unified_cache_get_planned_XXXX("), zone)),
         ("expert predicate", "the adapter does not key operand-ness on ne[2] > 1",
          (backend, common, mutate(cache, "zone_mmq_src1_bytes_per_token(", "zone_mmq_src1_bytes_per_token(item.ne[2] > 1 ? 0 : 1 + "), zone)),
     ]

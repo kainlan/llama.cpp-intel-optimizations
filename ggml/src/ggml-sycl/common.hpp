@@ -6664,11 +6664,23 @@ struct ggml_backend_sycl_context {
             req.size                                = required_size;
             req.intent.role                         = ggml_sycl::alloc_role::STAGING;
             req.intent.category                     = ggml_sycl::runtime_category::STAGING;
+            req.intent.cohort_id                          = "mmq-src1-q8";
             req.intent.constraints.must_device      = true;
-            // On B50 with the current Level Zero stack, tiny MMVQ Q8 activation buffers
-            // allocated from arena tail zones can return pointers that fail on first submit.
-            // Weight-zone pointers are already exercised by S1-preloaded weights.
-            req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::WEIGHT;
+            // llama.cpp-479i: the planned home of the dense MMQ/MMVQ Q8_1 src1 buffer is the RUNTIME
+            // zone, sized for it by unified_cache_get_planned_runtime_zone_requirement(), and the spill
+            // to a raw device malloc is FORBIDDEN: a buffer that can fall out of the arena is an
+            // unplanned byte, and 122 such spills (508.5 MB) ran a B50 out of driver headroom.
+            //
+            // This used to prefer the WEIGHT zone (2026-06-09, driver 26.22 era) on the claim that "tiny
+            // MMVQ Q8 activation buffers allocated from arena tail zones can return pointers that fail on
+            // first submit". That zone was 99.8% committed to weights, so the buffer spilled outside the
+            // arena instead. The claim is NOT re-verified here (the loaded driver is 26.31): the RUNTIME
+            // zone's backing is already resident from startup (the 2026-10-01 EXT_ALLOC trace shows it
+            // as the first external allocation), so this draws no new headroom, and fattn, the dense
+            // scheduler and convert already submit from the RUNTIME/SCRATCH tail zones on the B50. If
+            // the B50 acceptance run fails on first submit, report it; do not fall back to WEIGHT.
+            req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
+            req.intent.constraints.forbid_vram_zone_spill = true;
             ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
             if (!allocation) {
                 return nullptr;
@@ -6695,6 +6707,9 @@ struct ggml_backend_sycl_context {
         }
 
         ggml_sycl::mem_handle handle(int device) const { return slot(device).backing_handle; }
+
+        // Bytes the device's backing holds; zero before the first ensure_buffer().
+        size_t capacity(int device) const { return slot(device).backing_capacity; }
 
         void * cached_q8_1(int device) const { return slot(device).cached_q8_1; }
 

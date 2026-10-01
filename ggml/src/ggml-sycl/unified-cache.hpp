@@ -1639,6 +1639,11 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 
 void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
 size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
+// llama.cpp-479i: plan the per-context dense MMQ/MMVQ Q8_1 src1 buffer from the inventory's
+// bytes-per-token (zone_scoped_maxima().mmq_src1_bytes_per_token) at n_ubatch. Folded into
+// unified_cache_get_planned_runtime_zone_requirement(). False on overflow (nothing published).
+bool   unified_cache_set_planned_mmq_src1_scratch(int device_id, size_t bytes_per_token, uint32_t n_ubatch);
+size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id);
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno

@@ -710,6 +710,10 @@ static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_c
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-479i: planned bytes of the per-context dense MMQ/MMVQ Q8_1 src1 buffer
+// (n_ubatch * bytes-per-token from the inventory, 256-aligned), folded into the
+// RUNTIME zone requirement so the zone the buffer lives in is sized for it.
+static std::atomic<size_t>   g_planned_mmq_src1_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
 // window class, the SWA window itself, ubatch size, context length) known at
 // the time the oneDNN scratchpad was last planned for this device
@@ -1647,13 +1651,46 @@ moe_control_requirement unified_cache_get_planned_moe_control_requirement(int de
 
 static size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id);
 
+bool unified_cache_set_planned_mmq_src1_scratch(int device_id, size_t bytes_per_token, uint32_t n_ubatch) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    size_t bytes = 0;
+    if (!zone_mmq_src1_scratch_bytes(bytes_per_token, n_ubatch, &bytes)) {
+        // An overflowing figure must not become a SMALL plan. Publish nothing; the graph-entry
+        // check then refuses by name instead of the zone being sized for a wrapped number.
+        g_planned_mmq_src1_scratch_bytes[device_id].store(0, std::memory_order_release);
+        return false;
+    }
+    g_planned_mmq_src1_scratch_bytes[device_id].store(bytes, std::memory_order_release);
+    return true;
+}
+
+size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_mmq_src1_scratch_bytes[device_id].load(std::memory_order_acquire);
+}
+
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out) {
     // Ring slots placed in the shared KV zone are not RUNTIME demand.
     const size_t ring_bytes    = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device_id);
     const size_t ring_kv_bytes = unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(device_id);
-    return moe_checked_runtime_zone_requirement(unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id),
-                                                ring_bytes > ring_kv_bytes ? ring_bytes - ring_kv_bytes : 0,
-                                                unified_cache_get_planned_moe_control_requirement(device_id), out);
+    size_t       base          = 0;
+    if (!moe_checked_runtime_zone_requirement(unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id),
+                                              ring_bytes > ring_kv_bytes ? ring_bytes - ring_kv_bytes : 0,
+                                              unified_cache_get_planned_moe_control_requirement(device_id), &base)) {
+        return false;
+    }
+    // The dense MMQ/MMVQ Q8_1 src1 buffer lives in this zone (llama.cpp-479i). Checked like
+    // the terms above: a wrapped sum would be a SMALLER zone, not a refusal.
+    const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
+    if (mmq_src1 > SIZE_MAX - base) {
+        return false;
+    }
+    *out = base + mmq_src1;
+    return true;
 }
 
 void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes) {
@@ -26934,6 +26971,12 @@ static size_t zone_onednn_reorder_bytes(const placement_tensor_info & item) {
     return elements * sizeof(sycl::half);
 }
 
+// The pure Q8_1 src1 arithmetic in zone-sizing.hpp restates three backend constants because that TU
+// links nothing; pin each to its source so the planner cannot drift from the dispatch's required_size.
+static_assert(k_zone_mmq_src1_row_padding == MATRIX_ROW_PADDING, "zone-sizing.hpp Q8_1 row padding drifted");
+static_assert(k_zone_mmq_src1_block_elems == QK8_1, "zone-sizing.hpp Q8_1 block width drifted");
+static_assert(k_zone_mmq_src1_block_bytes == sizeof(block_q8_1), "zone-sizing.hpp Q8_1 block size drifted");
+
 std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vector<placement_tensor_info> & inventory) {
     std::vector<zone_tensor_desc> zone_inventory;
     zone_inventory.reserve(inventory.size());
@@ -26947,6 +26990,22 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         }
         desc.name         = item.name;
         desc.reorder_size = zone_onednn_reorder_bytes(item);
+        // llama.cpp-479i: Q8_1 bytes a dense quantized MUL_MAT quantizes its activations into, per
+        // token. Operand-ness is decided HERE, where the traits and the name are, not in the pure
+        // classifier: a quantized weight that is not an expert stack (MUL_MAT_ID keeps its own
+        // moe_q8 workspace). Experts are recognised by the planner's own role function, the same
+        // authority plan_moe_mmid_workspaces uses -- NOT by ne[2] > 1, which also matches dense 3-D
+        // operands such as the MLA wk_b / wv_b (llama.cpp-8xbt). A mis-prediction is survivable:
+        // ggml_sycl_mmq_src1_ensure_for_graph() sizes the exact demand from the graph's own nodes
+        // before anything is submitted, and refuses by name if the zone cannot hold it.
+        if (item.has_shape() && ggml_is_quantized(item.type) &&
+            expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
+            size_t bytes_per_token = 0;
+            if (zone_mmq_src1_bytes_per_token(item.ne[0], item.ne[2] > 0 ? item.ne[2] : 1,
+                                              item.ne[3] > 0 ? item.ne[3] : 1, &bytes_per_token)) {
+                desc.mmq_src1_bytes_per_token = bytes_per_token;
+            }
+        }
         zone_inventory.push_back(std::move(desc));
     }
     return zone_inventory;

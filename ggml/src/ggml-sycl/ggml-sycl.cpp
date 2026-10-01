@@ -15953,6 +15953,18 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         max_tensor_bytes / (1024.0 * 1024.0));
     ggml_sycl::unified_cache_set_planned_onednn_scratchpad_bytes(ctx->device,
                                                                  g_tensor_inventory_onednn_scratchpad_bytes);
+    // llama.cpp-479i: the dense MMQ/MMVQ Q8_1 src1 buffer is a planned byte. Sized here from the
+    // same inventory maxima, at the load-time n_ubatch (512 when the loader says 0); the graph-entry
+    // check ggml_sycl_mmq_src1_ensure_for_graph() sizes the exact demand at the real n_ubatch.
+    {
+        const uint32_t mmq_src1_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
+        const bool     mmq_src1_planned  = ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(
+            ctx->device, inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch);
+        GGML_LOG_INFO("[SYCL-PLAN] dense MMQ src1 Q8_1 scratch: %.1f MB (%zu B/token x n_ubatch=%u, RUNTIME zone)%s\n",
+                      ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(ctx->device) / (1024.0 * 1024.0),
+                      inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch,
+                      mmq_src1_planned ? "" : " -- sizing overflowed, nothing planned");
+    }
     {
         const bool pp_pipeline_enabled               = pp_pipeline_env_enabled();
         g_tensor_inventory_pp_pipeline_scratch_bytes = pp_pipeline_enabled ? inventory->pp_pipeline_scratch_bytes : 0;
@@ -46464,6 +46476,28 @@ static sycl::event ggml_sycl_mul_mat_stream_slice(sycl::queue & queue,
     return queue.ext_oneapi_submit_barrier();
 }
 
+// llama.cpp-479i: the dense MMQ/MMVQ Q8_1 src1 buffer is a PLANNED byte (RUNTIME zone, spill forbidden,
+// sized by unified_cache_get_planned_runtime_zone_requirement() and re-checked against the exact graph
+// demand by ggml_sycl_mmq_src1_ensure_for_graph() before anything is submitted). Reaching this means the
+// plan was breached mid-graph. It is a CAPACITY failure, not a missing kernel, so it must not decline into
+// the orchestrator: a decline falls through to the generic BLAS path, which dequantizes src0 to F16 (~178 MB
+// for ffn_down) -- another unplanned buffer on a resource that just ran out -- and aborts far from the cause.
+[[noreturn]] static void ggml_sycl_mmq_src1_plan_breach(int                 device,
+                                                        const ggml_tensor * src0,
+                                                        int64_t             nrows,
+                                                        int64_t             ne10,
+                                                        size_t              required_bytes) {
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    const size_t zone_avail = cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : static_cast<size_t>(0);
+    GGML_ABORT(
+        "[MMQ-SRC1] planned Q8_1 src1 buffer breached on device %d for %s: needs %zu bytes (rows=%lld ne10=%lld) "
+        "but the RUNTIME zone cannot extend the buffer (planned %.1f MB for n_ubatch, zone has %.1f MB free). "
+        "This is a plan-accounting failure, not a missing kernel; see llama.cpp-479i",
+        device, src0 && src0->name[0] ? src0->name : "?", required_bytes, (long long) nrows, (long long) ne10,
+        ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(device) / (1024.0 * 1024.0),
+        zone_avail / (1024.0 * 1024.0));
+}
+
 template <template <int> typename quantize_f>
 
 static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
@@ -47061,17 +47095,32 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                                 src1->name[0] ? src1->name : "?", (void *) dev[i].src1_ddf, (void *) dev[i].src1_ddq,
                                 (long long) ne10, (long long) nrows1, (long long) src1_padded_row_size);
             }
-            if (!using_cached_q8_activation && use_q8_activation_cache) {
-                void * stable_q8 = ctx.mmvq_q8_activation_cache.ensure_buffer(required_size, i, *stream);
-                if (stable_q8) {
-                    dev[i].src1_ddq               = static_cast<char *>(stable_q8);
-                    dev[i].src1_ddq_handle        = ctx.mmvq_q8_activation_cache.handle(i);
-                    dev[i].src1_ddq_handle_offset = 0;
-                    cache_q8_activation           = true;
-                    GGML_SYCL_DEBUG("[MMVQ-Q8-CACHE] BUFFER ptr=%p size=%zu src1=%s ne10=%lld rows=%lld padded=%lld\n",
-                                    stable_q8, required_size, src1->name[0] ? src1->name : "?", (long long) ne10,
-                                    (long long) nrows1, (long long) src1_padded_row_size);
+            // The ONE planned buffer (llama.cpp-479i): per backend context and device, in the RUNTIME zone, spill
+            // forbidden. The queue is in-order and, outside the row-split path, every producer (quantize) and
+            // consumer (MMQ/MMVQ) of this op is submitted to stream(i, 0), so op N+1's quantize is ordered after op
+            // N's consumer and one buffer is race-free; there is no per-op allocation to pile up behind a queue
+            // that nothing drains. Growth retires the old backing behind a marker (ensure_buffer), so a recorded
+            // graph or pointer table that baked the old pointer keeps its handle (dev[i].src1_ddq_handle).
+            auto acquire_planned_q8 = [&](bool will_cache) {
+                void * planned = ctx.mmvq_q8_activation_cache.ensure_buffer(required_size, i, *stream);
+                if (!planned) {
+                    ggml_sycl_mmq_src1_plan_breach(i, src0, nrows1, ne10, required_size);
                 }
+                if (!will_cache) {
+                    // This op overwrites the shared backing without storing a cache entry, so any entry
+                    // describing the previous contents is stale.
+                    ctx.mmvq_q8_activation_cache.slot(i).invalidate();
+                }
+                dev[i].src1_ddq               = static_cast<char *>(planned);
+                dev[i].src1_ddq_handle        = ctx.mmvq_q8_activation_cache.handle(i);
+                dev[i].src1_ddq_handle_offset = 0;
+            };
+            if (!using_cached_q8_activation && use_q8_activation_cache) {
+                acquire_planned_q8(true);
+                cache_q8_activation = true;
+                GGML_SYCL_DEBUG("[MMVQ-Q8-CACHE] BUFFER ptr=%p size=%zu src1=%s ne10=%lld rows=%lld padded=%lld\n",
+                                (void *) dev[i].src1_ddq, required_size, src1->name[0] ? src1->name : "?",
+                                (long long) ne10, (long long) nrows1, (long long) src1_padded_row_size);
             }
             if (!using_cached_q8_activation && dev[i].src1_ddq == nullptr && use_reordered_prealloc) {
                 // Use pre-allocated buffer for consistent pointer across warmup/recording/replay
@@ -47088,29 +47137,23 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                                     ctx.mmvq_soa_buffers.current_buffer_idx - 1, preallocated, required_size,
 
                                     g_ggml_sycl_graph_recording ? 1 : 0);
+                }
+            }
+            if (!using_cached_q8_activation && dev[i].src1_ddq == nullptr) {
+                if (!split) {
+                    acquire_planned_q8(false);
                 } else {
-                    // Fallback through unified-cache smart ownership. The raw
-                    // pointer is only the kernel ABI value; lifetime is held by
-                    // the mem_handle until the queue marker completes.
+                    // Row-split only: the consumers run on stream(i, is) for is > 0 while this quantize ran on
+                    // stream(i, 0), so one shared buffer would race across ops without cross-stream chaining.
+                    // This per-op scratch is the one allocation left outside the plan; llama.cpp-479i leaves it
+                    // as a known, unplanned exception rather than share a buffer it cannot order.
                     dev[i].src1_ddq = src1_ddq_scratch[i].allocate(*stream, i, required_size);
                     if (!dev[i].src1_ddq) {
-                        GGML_LOG_WARN("[MMVQ-SOA] failed to allocate Q8 scratch on device %d (%zu bytes)\n", i,
-                                      required_size);
-                        return false;
+                        ggml_sycl_mmq_src1_plan_breach(i, src0, nrows1, ne10, required_size);
                     }
                     dev[i].src1_ddq_handle        = src1_ddq_scratch[i].handle;
                     dev[i].src1_ddq_handle_offset = 0;
-                    GGML_SYCL_DEBUG("[MMVQ-SOA] Pre-allocated buffer exhausted, using unified scratch\n");
                 }
-            } else if (!using_cached_q8_activation && dev[i].src1_ddq == nullptr) {
-                dev[i].src1_ddq = src1_ddq_scratch[i].allocate(*stream, i, required_size);
-                if (!dev[i].src1_ddq) {
-                    GGML_LOG_WARN("[MMVQ-SOA] failed to allocate Q8 scratch on device %d (%zu bytes)\n", i,
-                                  required_size);
-                    return false;
-                }
-                dev[i].src1_ddq_handle        = src1_ddq_scratch[i].handle;
-                dev[i].src1_ddq_handle_offset = 0;
             }
 
             exc_ctx.dev[i].src1_ddq = dev[i].src1_ddq;
@@ -98683,6 +98726,76 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
     return true;
 }
 
+// llama.cpp-479i: ensure the planned dense MMQ/MMVQ Q8_1 src1 buffer holds the EXACT demand of this graph,
+// before anything is submitted. The demand is read from what actually consumes the buffer -- the graph's own
+// quantized MUL_MAT nodes, keyed on op identity -- not inferred from tensor shapes in the inventory, so a
+// dense 3-D operand (MLA wk_b / wv_b: nrows1 = n_tokens * n_head) is counted exactly and an expert stack
+// (MUL_MAT_ID) is never mistaken for one. The planner's figure (unified_cache_get_planned_mmq_src1_scratch_bytes,
+// RUNTIME zone) is what makes this a planned byte: the buffer normally already exists at that size and this is
+// a read-only walk. A larger real n_ubatch, or a second live context, grows the backing inside the RUNTIME zone
+// with the spill forbidden; if even that cannot hold it the graph is refused cleanly here, with nothing
+// submitted, instead of failing mid-graph on a raw malloc outside the arena.
+//
+// Row-split weights are skipped: that path keeps its per-op scratch (see ggml_sycl_op_mul_mat).
+static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph) {
+    size_t              max_demand  = 0;
+    const ggml_tensor * demand_node = nullptr;
+    int64_t             demand_rows = 0;
+    int64_t             demand_ne10 = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        if (!src0 || !src1 || !ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32) {
+            continue;
+        }
+        if (src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+            continue;
+        }
+#    if GGML_SYCL_DNNL
+        // oneDNN PP does not quantize src1: same exemption the graph-recording prealloc applies.
+        if (ggml_sycl_onednn_pp_candidate(src0, src1, node, ctx.device)) {
+            continue;
+        }
+#    endif
+        size_t demand = 0;
+        if (!ggml_sycl::zone_mmq_src1_required_bytes(ggml_nrows(src1), src1->ne[0], /*with_overflow_pad=*/true,
+                                                     &demand)) {
+            GGML_LOG_ERROR("[MMQ-SRC1] device %d: Q8_1 src1 demand for %s overflowed (rows=%lld ne10=%lld)\n",
+                           ctx.device, node->name[0] ? node->name : "?", (long long) ggml_nrows(src1),
+                           (long long) src1->ne[0]);
+            return false;
+        }
+        if (demand > max_demand) {
+            max_demand  = demand;
+            demand_node = node;
+            demand_rows = ggml_nrows(src1);
+            demand_ne10 = src1->ne[0];
+        }
+    }
+    if (max_demand == 0 || ctx.mmvq_q8_activation_cache.capacity(ctx.device) >= max_demand) {
+        return true;
+    }
+    if (ctx.mmvq_q8_activation_cache.ensure_buffer(max_demand, ctx.device, *ctx.stream()) != nullptr) {
+        return true;
+    }
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
+    GGML_LOG_ERROR(
+        "[MMQ-SRC1] graph refused before submission on device %d: the dense MMQ/MMVQ Q8_1 src1 buffer needs %.1f MB "
+        "(%s, rows=%lld ne10=%lld) but the RUNTIME zone cannot hold it (planned %.1f MB at the load-time n_ubatch, "
+        "buffer holds %.1f MB, zone has %.1f MB free). Reduce -ub, or free RUNTIME-zone demand; this is a "
+        "plan-accounting refusal, not a missing kernel (llama.cpp-479i)\n",
+        ctx.device, max_demand / (1024.0 * 1024.0), demand_node && demand_node->name[0] ? demand_node->name : "?",
+        (long long) demand_rows, (long long) demand_ne10,
+        ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(ctx.device) / (1024.0 * 1024.0),
+        ctx.mmvq_q8_activation_cache.capacity(ctx.device) / (1024.0 * 1024.0),
+        (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
+    return false;
+}
+
 // Pre-allocate Q8_1 buffers for SoA MMVQ operations before graph recording.
 // MUL_MAT with SoA reorder flag needs Q8_1 quantization buffers which cannot be
 // allocated from pool during graph recording (pointer would change on replay).
@@ -105460,6 +105573,12 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     } offload_stats_guard{ offload_stats_active, sycl_ctx ? sycl_ctx->device : -1 };
 
     ggml_sycl_set_main_device(sycl_ctx->device);
+
+    // llama.cpp-479i: the dense MMQ/MMVQ Q8_1 src1 buffer is planned, and the graph's exact demand is checked
+    // against it here, before anything is submitted. A refusal returns ALLOC_FAILED with nothing in flight.
+    if (!ggml_sycl_mmq_src1_ensure_for_graph(*sycl_ctx, cgraph)) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
 
     // Phase detection: always recompute — n_nodes is the same for PP and TG
     // when GPU prefix mode truncates the graph, so caching by n_nodes alone
