@@ -64,6 +64,14 @@ static bool live_matches(size_t baseline, const dummy_sched_backend & be) {
     return ggml_backend_test_live_buffer_count() == baseline + be.buffers.size();
 }
 
+// The chunk layout the scheduler reports for the backend's buffer: the number of chunks, and the max chunk size
+// the query wrote (0 if it wrote nothing).
+static int reported_chunks(ggml_backend_sched_t sched, ggml_backend_t backend, size_t * max_chunk_size) {
+    size_t peaks[16] = {};
+    *max_chunk_size  = 0;
+    return ggml_backend_sched_get_reserved_chunk_peaks(sched, backend, peaks, 16, max_chunk_size);
+}
+
 int main() {
     const size_t live_baseline = ggml_backend_test_live_buffer_count();
     auto         be            = dummy_sched_backend::make(/*max_buffer_size=*/64);
@@ -72,6 +80,13 @@ int main() {
     ggml_backend_buffer_type_t bufts[1]    = { &be->buffer_type };
     ggml_backend_sched_t       sched       = ggml_backend_sched_new(backends, bufts, 1, 64, false, false);
     CHECK(sched != nullptr, "setup: the scheduler must be created");
+
+    // 0. Before any reserve there is no layout to report; the max chunk size is still written.
+    {
+        size_t m = 0;
+        CHECK(reported_chunks(sched, &be->backend, &m) == 0 && m == 64,
+              "case 0: before any reserve the query reports no chunks and the max chunk size");
+    }
 
     // 1. A graph that fits allocates.
     {
@@ -91,6 +106,9 @@ int main() {
         CHECK(!ggml_backend_sched_alloc_graph(sched, big.graph), "case 2: a refused reallocation must return false");
         CHECK(be->n_refused >= 1, "case 2: the buffer type must have been asked and refused");
         CHECK(live_matches(live_baseline, *be), "case 2: a refused reallocation must not leak a live buffer");
+        size_t m = 0;
+        CHECK(reported_chunks(sched, &be->backend, &m) == 0 && m == 64,
+              "case 2: after a refused reserve the query must not report a layout no buffer backs");
 
         // 3. The same graph again, and a graph of the same shape: still false, and no crash.
         const int refused_before = be->n_refused;
@@ -123,6 +141,33 @@ int main() {
     CHECK(be->buffers.empty(), "teardown: no buffer may outlive the scheduler");
     CHECK(ggml_backend_test_live_buffer_count() == live_baseline,
           "teardown: the live buffer registry must be back at baseline");
+
+    // 6. Two backends that use one buffer type share a single buffer. When growing it is refused, the
+    //    second slot must not keep the freed buffer, or freeing the scheduler frees it twice.
+    {
+        auto shared = dummy_sched_backend::make(/*max_buffer_size=*/64);
+
+        ggml_backend               second = shared->backend;  // same device and buffer type, a second scheduler slot
+        ggml_backend_t             backends[2] = { &shared->backend, &second };
+        ggml_backend_buffer_type_t bufts[2]    = { &shared->buffer_type, &shared->buffer_type };
+        ggml_backend_sched_t       two         = ggml_backend_sched_new(backends, bufts, 2, 64, false, false);
+        CHECK(two != nullptr, "case 6: the shared-buffer-type scheduler must be created");
+
+        test_graph small = make_graph(2, 16);
+        CHECK(ggml_backend_sched_alloc_graph(two, small.graph), "case 6: the first graph must allocate");
+        CHECK(shared->buffers.size() == 1, "case 6: the two slots must share one buffer");
+        ggml_backend_sched_reset(two);
+
+        shared->refuse_alloc = true;
+        test_graph big       = make_graph(4, 24);
+        CHECK(!ggml_backend_sched_alloc_graph(two, big.graph), "case 6: the refused growth must return false");
+        CHECK(shared->buffers.empty(), "case 6: the grown-from buffer is gone");
+
+        ggml_backend_sched_free(two);
+        CHECK(shared->buffers.empty(), "case 6 teardown: no buffer may outlive the scheduler");
+        CHECK(ggml_backend_test_live_buffer_count() == live_baseline,
+              "case 6 teardown: the live buffer registry must be back at baseline");
+    }
 
     std::printf("PASS\n");
     return 0;

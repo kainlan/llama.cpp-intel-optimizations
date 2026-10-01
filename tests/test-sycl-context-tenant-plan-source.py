@@ -6,15 +6,19 @@ in ggml-backend.cpp tests its result and returns false on failure. A reserve
 that fails and is ignored leaves the scheduler believing it holds buffers.
 
 Gate 15 (reserve clause): every `return false;` in ggml_gallocr_reserve_n_impl
-is preceded by the invalidation of the node and leaf layouts. The failed
-reserve has already rewritten node_allocs while its vbuffer is NULL; without
+is preceded, within the failure branch of the vbuffer allocation, by the
+invalidation of the node and leaf layouts, by nulling the alias slots that
+shared the freed vbuffer, and by resetting the tallocs. The failed reserve
+has already rewritten node_allocs while its vbuffer is NULL; without
 `galloc->n_nodes = 0; galloc->n_leafs = 0;` the next same-shape alloc_graph
-finds no reason to reserve again and places tensors in a NULL vbuffer.
+finds no reason to reserve again and places tensors in a NULL vbuffer. Without
+the alias nulling, ggml_gallocr_free frees the shared vbuffer twice. Without
+the reset, the peak query reports a layout no buffer backs.
 
 Both gates prove themselves on mutants of the real source (the gate must fail
 on each) and refuse to pass vacuously. Limits, deliberately: the walk is
 textual, so a reserve reached through a wrapper is not seen, and the
-invalidation is checked as the two statements immediately before the return.
+invalidation is checked as the statements between the vbuffer allocation call and the return.
 argv: [ggml-backend.cpp [ggml-alloc.c]]
 """
 import os
@@ -28,7 +32,13 @@ DEFAULT_ALLOC = os.path.join(REPO, "ggml", "src", "ggml-alloc.c")
 RESERVE_CALL = re.compile(r"\bggml_gallocr_reserve_n\s*\(")
 CHECKED_CALL = re.compile(r"\bif\s*\(\s*!\s*ggml_gallocr_reserve_n\s*\(")
 IMPL_SIGNATURE = "static bool ggml_gallocr_reserve_n_impl("
-INVALIDATE = ("galloc->n_nodes = 0;", "galloc->n_leafs = 0;")
+INVALIDATE = (
+    "galloc->n_nodes = 0;",
+    "galloc->n_leafs = 0;",
+    "galloc->buffers[k] = NULL;",
+    "ggml_dyn_tallocr_reset(galloc->buf_tallocs[k]);",
+)
+VBUFFER_ALLOC = "ggml_vbuffer_alloc("
 
 
 def strip_comments(text):
@@ -87,9 +97,11 @@ def invalidation_violations(text):
         if not re.search(r"\breturn\s+false\s*;", lines[i]):
             continue
         returns += 1
-        prev = [l.strip() for l in lines[:i] if l.strip()][-2:]
-        if tuple(prev) != INVALIDATE:
-            out.append((i + 1, "return false without galloc->n_nodes = 0; galloc->n_leafs = 0; before it"))
+        start = max((j for j in range(bounds[0], i) if VBUFFER_ALLOC in lines[j]), default=bounds[0])
+        window = "\n".join(l.strip() for l in lines[start:i])
+        missing = [stmt for stmt in INVALIDATE if stmt not in window]
+        if missing:
+            out.append((i + 1, "return false without %s before it" % ", ".join(missing)))
     return out, returns
 
 
@@ -116,7 +128,9 @@ def mutants_alloc(text):
                 if k is None:
                     continue
                 yield "dropped `%s`" % stmt, "\n".join(lines[:k] + lines[k + 1:])
-            yield "unguarded extra return false", "\n".join(lines[:i] + ["    if (galloc == NULL) { return false; }"] + lines[i:])
+            k0 = max((j for j in range(i) if INVALIDATE[0] in lines[j]), default=i)
+            yield "extra return false ahead of the invalidation", "\n".join(
+                lines[:k0] + ["    if (galloc == NULL) { return false; }"] + lines[k0:])
             break
 
 

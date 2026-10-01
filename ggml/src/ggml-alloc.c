@@ -945,6 +945,17 @@ static bool ggml_gallocr_reserve_n_impl(
                     // placing tensors in a NULL vbuffer.
                     galloc->n_nodes = 0;
                     galloc->n_leafs = 0;
+                    // A buffer type used by several slots shares one vbuffer, which was just freed: the later slots
+                    // still hold it and ggml_gallocr_free would free it a second time.
+                    for (int k = i + 1; k < galloc->n_buffers; k++) {
+                        if (galloc->buf_tallocs[k] == galloc->buf_tallocs[i]) {
+                            galloc->buffers[k] = NULL;
+                        }
+                    }
+                    // The tallocs hold the layout of the attempt that no buffer backs; a peak query must not report it.
+                    for (int k = 0; k < galloc->n_buffers; k++) {
+                        ggml_dyn_tallocr_reset(galloc->buf_tallocs[k]);
+                    }
                     return false;
                 }
             }

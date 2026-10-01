@@ -72,6 +72,9 @@ GGML_API bool ggml_gallocr_reserve_n(
 // allocator's max chunk size to *max_chunk_size_out (may be NULL). A chunk below the last has capacity
 // MAX(peak, max_chunk_size): a non-oversize chunk holds max_chunk_size, and an oversize chunk holds one tensor
 // at offset 0, so its peak is its capacity.
+// Before any reserve, and after a reserve whose buffer allocation failed, there is no layout: it returns 0 and
+// still writes *max_chunk_size_out. Two buffer ids of the same buffer type share one allocator and report the same
+// layout, so a caller summing over buffer ids must count each buffer type once.
 GGML_API int ggml_gallocr_get_chunk_peaks(
     ggml_gallocr_t galloc,
     int buffer_id,

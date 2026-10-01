@@ -146,6 +146,33 @@ int main() {
         CHECK(measured[1].peaks[0] < measured[0].peaks[0], "case 1: tg must leave chunk 0 under-filled");
         CHECK(measured[1].peaks[1] > measured[0].peaks[1], "case 1: tg must grow chunk 1");
 
+        // The non-oversize arm of the capacity rule: pp fills chunk 0 to exactly M and the next tensor
+        // spills to chunk 1, so chunk 0's capacity is M, not merely what the graph happened to use.
+        CHECK(measured[0].peaks[0] == measured[0].max_chunk_size && measured[0].peaks[1] > 0,
+              "case 1: a chunk below the last is filled to exactly the max chunk size before the next one opens");
+
+        // The query's arguments: max truncates what is written but not what is returned, and a NULL
+        // max_chunk_size_out is allowed.
+        {
+            test_graph g = make_graph(pp_shape);
+            size_t     sizes[1];
+            ggml_backend_sched_reserve_size(sched, g.graph, sizes);
+
+            const size_t sentinel = 0xdeadbeef;
+            size_t       peaks[3] = { sentinel, sentinel, sentinel };
+            size_t       m        = 0;
+            CHECK(ggml_backend_sched_get_reserved_chunk_peaks(sched, &be->backend, peaks, 1, &m) == 2,
+                  "case 1: max below the chunk count still returns the chunk count");
+            CHECK(peaks[0] == measured[0].peaks[0] && peaks[1] == sentinel, "case 1: max bounds the writes");
+            CHECK(m == 64, "case 1: max_chunk_size is written whatever max is");
+
+            peaks[0] = sentinel;
+            CHECK(ggml_backend_sched_get_reserved_chunk_peaks(sched, &be->backend, peaks, 0, nullptr) == 2,
+                  "case 1: max 0 with a NULL max_chunk_size_out returns the chunk count");
+            CHECK(peaks[0] == sentinel, "case 1: max 0 writes nothing");
+            ggml_backend_sched_reset(sched);
+        }
+
         const std::vector<size_t> cap = caps_of(measured);
         CHECK(cap.size() == 2 && cap[0] == 64 && cap[1] == measured[1].peaks[1],
               "case 1: cap[0] is the max chunk size, cap[1] is the last chunk's high-water mark");
@@ -256,7 +283,8 @@ int main() {
         CHECK(sched != nullptr, "setup: the two-backend scheduler must be created");
 
         // Two independent chains: the first on backend a, the second on backend b.
-        auto build = [&](size_t first, size_t second, test_graph * out) {
+        auto build = [&](ggml_backend_sched_t sc, dummy_sched_backend * ba, dummy_sched_backend * bb, size_t first,
+                         size_t second, test_graph * out) {
             ggml_init_params params{};
             params.mem_size = 128 * ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false);
             params.no_alloc = true;
@@ -277,12 +305,12 @@ int main() {
             ggml_set_output(yo);
             ggml_build_forward_expand(out->graph, xo);
             ggml_build_forward_expand(out->graph, yo);
-            ggml_backend_sched_set_tensor_backend(sched, x0, &a->backend);
-            ggml_backend_sched_set_tensor_backend(sched, x1, &a->backend);
-            ggml_backend_sched_set_tensor_backend(sched, xo, &a->backend);
-            ggml_backend_sched_set_tensor_backend(sched, y0, &b->backend);
-            ggml_backend_sched_set_tensor_backend(sched, y1, &b->backend);
-            ggml_backend_sched_set_tensor_backend(sched, yo, &b->backend);
+            ggml_backend_sched_set_tensor_backend(sc, x0, &ba->backend);
+            ggml_backend_sched_set_tensor_backend(sc, x1, &ba->backend);
+            ggml_backend_sched_set_tensor_backend(sc, xo, &ba->backend);
+            ggml_backend_sched_set_tensor_backend(sc, y0, &bb->backend);
+            ggml_backend_sched_set_tensor_backend(sc, y1, &bb->backend);
+            ggml_backend_sched_set_tensor_backend(sc, yo, &bb->backend);
         };
 
         std::vector<layout> la, lb;
@@ -293,7 +321,7 @@ int main() {
         };
         for (const auto & s : shapes) {
             test_graph g;
-            build(s[0], s[1], &g);
+            build(sched, a.get(), b.get(), s[0], s[1], &g);
             CHECK(ggml_backend_sched_reserve(sched, g.graph), "case 3: the reserve must succeed");
             layout x, y;
             CHECK(read_layout(sched, &a->backend, &x) && read_layout(sched, &b->backend, &y),
@@ -306,19 +334,35 @@ int main() {
         const std::vector<size_t> cap_a = caps_of(la);
         const std::vector<size_t> cap_b = caps_of(lb);
 
-        // Second pass: allocate again over the same sched and check each type's requests.
+        // Second pass on a fresh scheduler and fresh buffer types: every request is a real allocation, and
+        // each must fit the cap measured above.
+        ggml_backend_sched_free(sched);
+        auto a2 = dummy_sched_backend::make(/*max_buffer_size=*/64);
+        auto b2 = dummy_sched_backend::make(/*max_buffer_size=*/32);
+
+        ggml_backend_t             backends2[2] = { &a2->backend, &b2->backend };
+        ggml_backend_buffer_type_t bufts2[2]    = { &a2->buffer_type, &b2->buffer_type };
+        ggml_backend_sched_t       sched2       = ggml_backend_sched_new(backends2, bufts2, 2, 64, false, false);
+        CHECK(sched2 != nullptr, "setup: the second two-backend scheduler must be created");
+
+        size_t n_requests_a = 0;
+        size_t n_requests_b = 0;
         for (const auto & s : shapes) {
             test_graph g;
-            build(s[0], s[1], &g);
-            a->requests.clear();
-            b->requests.clear();
-            CHECK(ggml_backend_sched_reserve(sched, g.graph), "case 3: the second-pass reserve must succeed");
+            build(sched2, a2.get(), b2.get(), s[0], s[1], &g);
+            a2->requests.clear();
+            b2->requests.clear();
+            CHECK(ggml_backend_sched_reserve(sched2, g.graph), "case 3: the second-pass reserve must succeed");
             int bad = -1;
-            CHECK(requests_fit(a->requests, cap_a, &bad), "case 3: backend a's request exceeded its chunk's cap");
-            CHECK(requests_fit(b->requests, cap_b, &bad), "case 3: backend b's request exceeded its chunk's cap");
+            CHECK(requests_fit(a2->requests, cap_a, &bad), "case 3: backend a's request exceeded its chunk's cap");
+            CHECK(requests_fit(b2->requests, cap_b, &bad), "case 3: backend b's request exceeded its chunk's cap");
+            n_requests_a += a2->requests.size();
+            n_requests_b += b2->requests.size();
         }
+        CHECK(n_requests_a > 0 && n_requests_b > 0,
+              "case 3: the second pass must have asked both buffer types for memory");
 
-        ggml_backend_sched_free(sched);
+        ggml_backend_sched_free(sched2);
     }
 
     std::printf("PASS\n");

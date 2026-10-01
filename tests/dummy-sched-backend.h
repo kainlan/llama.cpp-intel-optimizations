@@ -5,6 +5,10 @@
 // logs every alloc_buffer request in order, and can refuse a request. It
 // lives wholly on the heap, so the pointers a scheduler keeps stay valid
 // when the handle is moved.
+//
+// tests/test-alloc.cpp carries a similar dummy backend of its own. This one is
+// separate on purpose: that file is upstream's, and editing it would make every
+// merge from upstream a conflict. Do not fold the two together.
 
 #include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-backend.h"
