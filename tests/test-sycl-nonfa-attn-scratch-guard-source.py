@@ -635,7 +635,8 @@ def test_auto_flash_attn_resolution_rechecks_the_guard():
     # call the full-transaction helper (that would needlessly re-run KV/MMID
     # work resolve_fused_ops() has no reason to touch).
     resolve_body = ctx_norm[resolve_start : resolve_start + 4000]
-    assert re.search(r"if \(cparams\.auto_fa\) \{[^}]*resolve\([^;]*flash_attn[^;]*;[^}]*"
+    # the reserve state's cparams: resolve_fused_ops() reads them through it
+    assert re.search(r"if \(state\.cparams\.auto_fa\) \{[^}]*resolve\([^;]*flash_attn[^;]*;[^}]*"
                       r"sycl_recheck_runtime_context_flash_attn\(\);", resolve_body), (
         "resolve_fused_ops() must call sycl_recheck_runtime_context_flash_attn() inside the same "
         "if (cparams.auto_fa) block that resolves flash_attn, so it fires exactly once, right when "

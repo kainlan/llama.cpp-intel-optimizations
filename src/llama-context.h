@@ -1,19 +1,19 @@
 #pragma once
 
-#include "llama.h"
-#include "llama-ext.h"
-#include "llama-cparams.h"
-#include "llama-graph.h"
-#include "llama-adapter.h"
-#include "llama-impl.h"
-#include "llama-memory.h"
-
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 #include "ggml-sycl.h"
+#include "llama-adapter.h"
+#include "llama-cparams.h"
+#include "llama-ext.h"
+#include "llama-graph.h"
+#include "llama-impl.h"
+#include "llama-memory.h"
+#include "llama.h"
 
 #include <array>
 #include <map>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -41,6 +41,35 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// How a reserve ended. There is no busy status: a transient refusal is retried
+// by nobody, it is a plan bug or a plain refusal.
+enum class sched_reserve_status { OK, REFUSED, FAILED };
+
+struct sched_reserve_result {
+    sched_reserve_status status = sched_reserve_status::OK;
+    std::string          reason;
+};
+
+// MEASURE sizes the worst-case graphs without touching the context's own
+// scheduler, graph results, n_outputs or cparams; ALLOC is the reserve the
+// context runs on. Only ALLOC exists so far.
+enum class sched_reserve_mode { MEASURE, ALLOC };
+
+// Everything a reserve reads and writes about the scheduler it reserves on:
+// the scheduler, the two arenas of previous graph results, the reserve-time
+// n_outputs and n_input_tensors, and the cparams the graphs are built with.
+// ALLOC passes the context's own members (llama_context::member_reserve_state),
+// so its behaviour is unchanged; a MEASURE passes storage of its own.
+struct sched_reserve_state {
+    ggml_backend_sched_ptr &              sched;
+    std::array<llm_graph_result_ptr, 2> & gf_res_prev;
+    llm_graph_result_ptr &                gf_res_reserve;
+    llm_graph_result *&                   gf_res_prev_active;
+    uint32_t &                            n_outputs;
+    uint32_t &                            n_input_tensors;
+    llama_cparams &                       cparams;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -56,6 +85,11 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+
+    // The reserve itself. ALLOC reserves on the state's scheduler and returns
+    // a status instead of throwing for a refusal; sched_reserve() turns a
+    // non-OK status back into the exception its callers expect.
+    sched_reserve_result sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state);
 
     void synchronize();
 
@@ -258,6 +292,16 @@ public:
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
+    // the same on an explicit reserve state; the overload above is this call on
+    // the context's own members
+    ggml_cgraph * graph_reserve(sched_reserve_state &          state,
+                                uint32_t                       n_tokens,
+                                uint32_t                       n_seqs,
+                                uint32_t                       n_outputs,
+                                const llama_memory_context_i * mctx,
+                                bool                           split_only = false,
+                                size_t *                       sizes      = nullptr);
+
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
@@ -269,11 +313,24 @@ private:
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
 
+    // the same with the scheduler, cparams and n_outputs a reserve state holds
+    llm_graph_params graph_params(llm_graph_result *             res,
+                                  const llama_ubatch &           ubatch,
+                                  const llama_memory_context_i * mctx,
+                                  llm_graph_type                 gtype,
+                                  ggml_backend_sched_t           sched_arg,
+                                  const llama_cparams &          cparams_arg,
+                                  uint32_t                       n_outputs_arg) const;
+
+    // the context's own scheduler, graph results, n_outputs and cparams, as the
+    // state an ALLOC reserve runs on
+    sched_reserve_state member_reserve_state();
+
     llm_graph_cb graph_get_cb() const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
-    void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
+    void resolve_fused_ops(sched_reserve_state & state, const llama_memory_context_i * mctx, uint32_t n_seqs);
 
     // llama.cpp-oyfl: the SYCL runtime-context call the constructor makes
     // right after model activation, for every SYCL backend -- the FULL
