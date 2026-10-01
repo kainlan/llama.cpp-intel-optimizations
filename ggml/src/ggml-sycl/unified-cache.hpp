@@ -7376,6 +7376,12 @@ ggml_sycl_arena_backing_type ggml_sycl_arena_backing(int device);
 // cache: a device with none has no zones.
 bool ggml_sycl_device_has_zones(int device);
 
+// The device's compute-arena floor for SCRATCH: what the load-time probe (stage (a))
+// sizes the compute chunks against, per device.  INTERIM: moua's accessor of this name
+// replaces this definition (zhcn-design §2.10, rulings §M45); the default and the
+// GGML_SYCL_COMPUTE_ARENA_MB override follow its specification.
+size_t ggml_sycl_compute_arena_bytes(int device);
+
 // (ExpertPlacementTable removed — the cache IS the placement.
 //  Use is_expert_resident() / get_expert_device_ptr() for residency,
 //  get_expert_popularity_rank() for eviction scoring.)

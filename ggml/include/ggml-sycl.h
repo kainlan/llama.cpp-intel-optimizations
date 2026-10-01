@@ -1485,8 +1485,70 @@ GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install(uint64_t  
                                                                       enum ggml_sycl_measure_stage stage);
 GGML_BACKEND_API void ggml_backend_sycl_measure_plan_override_clear(void);
 
+// === Per-context chunk-cap copy and plan scopes (zhcn-design §2.4, §3.4) ===
+//
+// A context that runs the placement fixpoint owns one `ggml_backend_sycl_plan_caps`.
+// It freezes, once, the largest buffer each compute buft may report to ggml-alloc, so
+// every MEASURE and ALLOC of the context splits chunks alike.  Its state moves
+// UNARMED -> FREEZING (the fixpoint's entry) -> FROZEN (its publish commit); there is
+// no transition back, and set_state refuses any other move.
+struct ggml_backend_sycl_plan_caps;
+typedef struct ggml_backend_sycl_plan_caps * ggml_backend_sycl_plan_caps_t;
+
+enum ggml_sycl_plan_caps_state {
+    GGML_SYCL_PLAN_CAPS_UNARMED  = 0,
+    GGML_SYCL_PLAN_CAPS_FREEZING = 1,
+    GGML_SYCL_PLAN_CAPS_FROZEN   = 2,
+};
+
+GGML_BACKEND_API ggml_backend_sycl_plan_caps_t ggml_backend_sycl_plan_caps_new(void);
+GGML_BACKEND_API void                          ggml_backend_sycl_plan_caps_free(ggml_backend_sycl_plan_caps_t caps);
+GGML_BACKEND_API bool                          ggml_backend_sycl_plan_caps_set_state(ggml_backend_sycl_plan_caps_t  caps,
+                                                                                     enum ggml_sycl_plan_caps_state state);
+
+// A plan scope is thread-local and open for one MEASURE or ALLOC of one context.
+// While open, the compute bufts' get_max_size answer from the context's copy.
+// LOAD_MEASURE is the load-time measure's kind: it holds no copy and freezes nothing.
+enum ggml_sycl_plan_scope_mode {
+    GGML_SYCL_PLAN_SCOPE_MEASURE      = 0,
+    GGML_SYCL_PLAN_SCOPE_ALLOC        = 1,
+    GGML_SYCL_PLAN_SCOPE_LOAD_MEASURE = 2,
+};
+
+// Returns an opaque scope, or NULL when one is already open on this thread or the
+// arguments do not fit the mode (MEASURE and ALLOC need `caps`, LOAD_MEASURE none).
+GGML_BACKEND_API void *       ggml_backend_sycl_plan_scope_open(uint32_t                       exec_context_id,
+                                                                enum ggml_sycl_plan_scope_mode mode,
+                                                                ggml_backend_sycl_plan_caps_t  caps);
+// LOAD_MEASURE at one of the measure stages: (a) probes at cap_min, (b) and (c) at the
+// load's to-commit capacities.
+GGML_BACKEND_API void *       ggml_backend_sycl_plan_scope_open_load_measure(enum ggml_sycl_measure_stage stage);
+// NULL when every read in the scope succeeded, else the first failure's text (valid
+// until close).  A reserve ends in a named refusal when this is non-NULL.
+GGML_BACKEND_API const char * ggml_backend_sycl_plan_scope_failure(void * scope);
+GGML_BACKEND_API void         ggml_backend_sycl_plan_scope_close(void * scope);
+
 // === Test-only debug accessors (llama.cpp-dfo0, plan task L2) ===
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+// The freeze's store through the production core, for a host with no SYCL device
+// (zhcn-design §2.4; H6a).  `buft` is stored with the core's value and the copy's
+// per-buft freeze counter is incremented.  Returns the stored value.
+GGML_BACKEND_API size_t                     ggml_backend_sycl_plan_caps_freeze_core(ggml_backend_sycl_plan_caps_t caps,
+                                                                                    ggml_backend_buffer_type_t    buft,
+                                                                                    bool                          is_vm,
+                                                                                    size_t                        runtime,
+                                                                                    size_t                        kv,
+                                                                                    size_t                        scratch,
+                                                                                    size_t                        safe_alloc,
+                                                                                    size_t                        max_alloc);
+GGML_BACKEND_API uint32_t                   ggml_backend_sycl_plan_caps_freeze_count(ggml_backend_sycl_plan_caps_t caps,
+                                                                                     ggml_backend_buffer_type_t    buft);
+GGML_BACKEND_API int                        ggml_backend_sycl_plan_caps_live(void);
+// A device buft that touches no device: the production interface over a context naming
+// `device`.  The in-scope get_max_size branch reads only the thread's scope and the buft.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type_make_for_testing(int device);
+// The SYCL_Host buft with no device behind it: the production host interface, device NULL.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_make_for_testing(void);
 // Process-global by design: ggml_backend_sched does not hand test code the
 // compute buffer it allocates internally, so this reads the last COMPUTE-usage
 // ggml_backend_sycl_buffer_reset's post-release tensor_extras vector size,

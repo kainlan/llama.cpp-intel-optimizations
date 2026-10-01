@@ -3176,6 +3176,32 @@ set_tests_properties(test-sycl-measure-plan-override PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+
+# Test: the chunk-cap core, the plan_caps copy and the plan scopes (zhcn-design §2.4;
+# H6a).  A PRIVATE_TESTING device buft touches no device, so this needs none.
+add_executable(test-sycl-plan-caps
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-plan-caps.cpp
+)
+target_include_directories(test-sycl-plan-caps PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-plan-caps PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-plan-caps PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-plan-caps PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-plan-caps PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-plan-caps COMMAND test-sycl-plan-caps)
+set_tests_properties(test-sycl-plan-caps PROPERTIES
+    LABELS "sycl;h6a;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
 endif()
 
 # Test: ggml_sycl_get_tensor_usage() (ggml-sycl.cpp) -- the production entry

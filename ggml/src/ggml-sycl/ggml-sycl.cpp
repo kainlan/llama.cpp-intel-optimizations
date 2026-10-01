@@ -88,6 +88,7 @@
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/block-exec-dense.hpp"
 #include "ggml-sycl/block-exec-gate.hpp"
+#include "ggml-sycl/chunk-cap.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/convert.hpp"
 #include "ggml-sycl/cpy.hpp"
@@ -38329,13 +38330,412 @@ static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_ty
     GGML_UNUSED(buft);
 }
 
+// ===== Chunk cap, the per-context copy and plan scopes (zhcn-design §2.4, §3.4) =====
+//
+// A device buft's get_max_size is the largest buffer ggml-alloc may request in one
+// allocation.  On the plan path it is one expression, ggml_sycl_chunk_cap_core,
+// reached through one wrapper, ggml_sycl_arena_chunk_cap, which is the only function
+// on this path that names the arena backing kind.
+
+static size_t ggml_backend_sycl_host_buffer_type_chunk_cap();
+
+enum class ggml_sycl_chunk_cap_set {
+    LEDGER_CURRENT,  // the capacities the ledger holds now: the unscoped device function reads these
+    COMMITTED,       // the committed planned capacities: only the freeze reads these
+    LOAD_TO_COMMIT,  // the bound load's to-commit capacities: the load-time (b) and (c) read these
+    PROBE_MIN,       // RUNTIME 0 and SCRATCH the compute-arena floor: the load-time (a) reads this
+};
+
+struct ggml_sycl_arena_chunk_cap_result {
+    bool                       is_vm = false;
+    ggml_sycl_chunk_cap_result value;
+};
+
+static ggml_sycl_arena_chunk_cap_result ggml_sycl_arena_chunk_cap(int device, ggml_sycl_chunk_cap_set set) {
+    ggml_sycl_arena_chunk_cap_result result;
+    result.is_vm   = ggml_sycl::ggml_sycl_arena_backing(device) == ggml_sycl::GGML_SYCL_ARENA_BACKING_TYPE_VM;
+    size_t runtime = 0;
+    size_t kv      = 0;
+    size_t scratch = 0;
+    if (result.is_vm) {
+        // A capacity is read only off VM: USM has no zone cap, and the core takes 0s.
+        auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+        if (cache) {
+            switch (set) {
+                case ggml_sycl_chunk_cap_set::LEDGER_CURRENT:
+                    runtime = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
+                    kv      = cache->zone_capacity(ggml_sycl::vram_zone_id::KV);
+                    scratch = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
+                    break;
+                case ggml_sycl_chunk_cap_set::COMMITTED:
+                    runtime = cache->zone_capacity_committed(ggml_sycl::vram_zone_id::RUNTIME);
+                    kv      = cache->zone_capacity_committed(ggml_sycl::vram_zone_id::KV);
+                    scratch = cache->zone_capacity_committed(ggml_sycl::vram_zone_id::SCRATCH);
+                    break;
+                case ggml_sycl_chunk_cap_set::LOAD_TO_COMMIT:
+                    runtime = cache->zone_capacity_to_commit(ggml_sycl::vram_zone_id::RUNTIME);
+                    kv      = cache->zone_capacity_to_commit(ggml_sycl::vram_zone_id::KV);
+                    scratch = cache->zone_capacity_to_commit(ggml_sycl::vram_zone_id::SCRATCH);
+                    break;
+                case ggml_sycl_chunk_cap_set::PROBE_MIN:
+                    scratch = ggml_sycl::ggml_sycl_compute_arena_bytes(device);
+                    break;
+            }
+        }
+    }
+    const auto & dev = ggml_sycl_info().devices[device];
+    result.value =
+        ggml_sycl_chunk_cap_core(result.is_vm, runtime, kv, scratch, dev.safe_max_alloc_size, dev.max_alloc_size);
+    return result;
+}
+
+// What a read that cannot be answered from the copy returns: the per-process constant,
+// never a fresh read.  A device buft's is min(2 GiB, A(dev)); the SYCL_Host buft's is
+// its chunk cap bounded by one pinned-pool chunk.
+static size_t ggml_sycl_host_chunk_cap_constant() {
+    return std::min(ggml_backend_sycl_host_buffer_type_chunk_cap(),
+                    static_cast<size_t>(ggml_sycl::pinned_chunk_pool::CHUNK_SIZE));
+}
+
+static size_t ggml_sycl_device_chunk_cap_constant(int device) {
+    size_t cap = GGML_SYCL_CHUNK_CAP_MAX;
+    if (device >= 0 && device < ggml_sycl_info().device_count) {
+        const auto & dev = ggml_sycl_info().devices[device];
+        const size_t a   = dev.safe_max_alloc_size > 0 ? dev.safe_max_alloc_size : dev.max_alloc_size;
+        if (a > 0) {
+            cap = std::min(cap, a);
+        }
+    }
+    return cap;
+}
+
+// The context's one copy of the frozen caps.  Its only value writer is the freeze,
+// through ggml_sycl_plan_caps_store.
+struct ggml_backend_sycl_plan_caps {
+    struct slot {
+        ggml_backend_buffer_type_t buft    = nullptr;
+        size_t                     value   = 0;
+        uint32_t                   freezes = 0;
+    };
+
+    std::mutex        mutex;
+    std::atomic<int>  state{ GGML_SYCL_PLAN_CAPS_UNARMED };
+    std::vector<slot> slots;
+};
+
+static std::atomic<int> g_plan_caps_live{ 0 };
+
+static const char * ggml_sycl_plan_caps_state_name(int state) {
+    switch (state) {
+        case GGML_SYCL_PLAN_CAPS_UNARMED:
+            return "UNARMED";
+        case GGML_SYCL_PLAN_CAPS_FREEZING:
+            return "FREEZING";
+        case GGML_SYCL_PLAN_CAPS_FROZEN:
+            return "FROZEN";
+    }
+    return "?";
+}
+
+ggml_backend_sycl_plan_caps_t ggml_backend_sycl_plan_caps_new(void) {
+    try {
+        auto * caps = new ggml_backend_sycl_plan_caps();
+        g_plan_caps_live.fetch_add(1, std::memory_order_acq_rel);
+        return caps;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void ggml_backend_sycl_plan_caps_free(ggml_backend_sycl_plan_caps_t caps) {
+    if (!caps) {
+        return;
+    }
+    delete caps;
+    g_plan_caps_live.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+// UNARMED -> FREEZING at the fixpoint's entry, FREEZING -> FROZEN at its publish commit.
+bool ggml_backend_sycl_plan_caps_set_state(ggml_backend_sycl_plan_caps_t caps, enum ggml_sycl_plan_caps_state next) {
+    if (!caps) {
+        return false;
+    }
+    const int  current = caps->state.load(std::memory_order_acquire);
+    const bool legal   = (current == GGML_SYCL_PLAN_CAPS_UNARMED && next == GGML_SYCL_PLAN_CAPS_FREEZING) ||
+                       (current == GGML_SYCL_PLAN_CAPS_FREEZING && next == GGML_SYCL_PLAN_CAPS_FROZEN);
+    if (!legal) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] plan caps state %s -> %s is not a legal transition\n",
+                      ggml_sycl_plan_caps_state_name(current), ggml_sycl_plan_caps_state_name(next));
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] plan caps state %s -> %s is not a legal transition",
+                       ggml_sycl_plan_caps_state_name(current), ggml_sycl_plan_caps_state_name(next));
+        }
+        return false;
+    }
+    caps->state.store(next, std::memory_order_release);
+    return true;
+}
+
+// The one store: records (buft, value) and counts the freeze for that buft.
+static void ggml_sycl_plan_caps_store(ggml_backend_sycl_plan_caps * caps,
+                                      ggml_backend_buffer_type_t    buft,
+                                      size_t                        value) {
+    std::lock_guard<std::mutex> lock(caps->mutex);
+    for (auto & s : caps->slots) {
+        if (s.buft == buft) {
+            s.value = value;
+            ++s.freezes;
+            return;
+        }
+    }
+    caps->slots.push_back({ buft, value, 1 });
+}
+
+static bool ggml_sycl_plan_caps_find(ggml_backend_sycl_plan_caps * caps,
+                                     ggml_backend_buffer_type_t    buft,
+                                     size_t &                      value) {
+    std::lock_guard<std::mutex> lock(caps->mutex);
+    for (const auto & s : caps->slots) {
+        if (s.buft == buft) {
+            value = s.value;
+            return true;
+        }
+    }
+    return false;
+}
+
+// A plan scope: thread-local, open for one MEASURE or ALLOC of one context (or one
+// load-time measure).  llama opens it; the compute bufts' get_max_size read it.
+struct ggml_sycl_plan_scope {
+    uint32_t                      exec_context_id = 0;
+    ggml_sycl_plan_scope_mode     mode            = GGML_SYCL_PLAN_SCOPE_MEASURE;
+    ggml_backend_sycl_plan_caps * caps            = nullptr;
+    ggml_sycl_measure_stage       stage           = GGML_SYCL_MEASURE_STAGE_PROBE;  // LOAD_MEASURE only
+    // Every (buft, value) the scope answered: the seal's evidence that MEASURE and ALLOC read one copy.
+    std::vector<std::pair<ggml_backend_buffer_type_t, size_t>> reads;
+    std::string                                                failure;  // first failure, empty when none
+};
+
+static thread_local ggml_sycl_plan_scope * g_plan_scope = nullptr;
+
+static void ggml_sycl_plan_scope_fail(ggml_sycl_plan_scope * scope, const std::string & text) {
+    if (scope->failure.empty()) {
+        scope->failure = text;
+    }
+}
+
+enum class ggml_sycl_chunk_cap_buft_kind { DEVICE, HOST, CPU_OFFLOAD };
+
+static bool ggml_sycl_chunk_cap_buft_device(ggml_backend_buffer_type_t buft, int & device) {
+    auto * ctx = buft ? static_cast<ggml_backend_sycl_buffer_type_context *>(buft->context) : nullptr;
+    device     = ctx ? ctx->device : -1;
+    return ctx && device >= 0 && device < ggml_sycl_info().device_count;
+}
+
+// The freeze: the one named place a value enters a context's copy.  An in-scope
+// get_max_size for a buft the copy does not hold calls it, and it runs only in
+// FREEZING, under the fixpoint's TRANSACTION token.
+static size_t ggml_backend_sycl_plan_caps_freeze(ggml_sycl_plan_scope *        scope,
+                                                 ggml_backend_sycl_plan_caps * caps,
+                                                 ggml_backend_buffer_type_t    buft,
+                                                 ggml_sycl_chunk_cap_buft_kind kind) {
+    GGML_SYCL_WITNESS(caps->state.load(std::memory_order_acquire) == GGML_SYCL_PLAN_CAPS_FREEZING &&
+                          ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
+                      "[REPLAN-TOKEN] chunk-cap freeze outside the fixpoint");
+    size_t value = 0;
+    if (kind == ggml_sycl_chunk_cap_buft_kind::HOST) {
+        value = ggml_sycl_host_chunk_cap_constant();
+    } else {
+        int device = -1;
+        if (!ggml_sycl_chunk_cap_buft_device(buft, device)) {
+            ggml_sycl_plan_scope_fail(scope, "chunk cap: the device buft names no device");
+            return GGML_SYCL_CHUNK_CAP_MAX;
+        }
+        const auto frozen = ggml_sycl_arena_chunk_cap(device, ggml_sycl_chunk_cap_set::COMMITTED);
+        if (frozen.value.refusal) {
+            ggml_sycl_plan_scope_fail(scope,
+                                      std::string(frozen.value.refusal) + " for SYCL device " + std::to_string(device));
+        }
+        value = frozen.value.cap;
+    }
+    ggml_sycl_plan_caps_store(caps, buft, value);
+    return value;
+}
+
+static size_t ggml_sycl_plan_scope_load_measure_cap(ggml_sycl_plan_scope *        scope,
+                                                    ggml_sycl_chunk_cap_buft_kind kind,
+                                                    int                           device) {
+    if (kind == ggml_sycl_chunk_cap_buft_kind::HOST) {
+        return ggml_sycl_host_chunk_cap_constant();
+    }
+    if (device < 0 || device >= ggml_sycl_info().device_count) {
+        ggml_sycl_plan_scope_fail(scope, "chunk cap: the device buft names no device");
+        return GGML_SYCL_CHUNK_CAP_MAX;
+    }
+    const bool probe = scope->stage == GGML_SYCL_MEASURE_STAGE_PROBE;
+    const auto read  = ggml_sycl_arena_chunk_cap(
+        device, probe ? ggml_sycl_chunk_cap_set::PROBE_MIN : ggml_sycl_chunk_cap_set::LOAD_TO_COMMIT);
+    if (read.value.refusal) {
+        ggml_sycl_plan_scope_fail(scope,
+                                  std::string(read.value.refusal) + " for SYCL device " + std::to_string(device));
+    }
+    if (!probe && read.is_vm) {
+        // (b) and (c) must not read a cap below (a)'s: a smaller cap at (a) bounds c(P) by chunking.
+        const auto cap_min = ggml_sycl_arena_chunk_cap(device, ggml_sycl_chunk_cap_set::PROBE_MIN);
+        if (read.value.cap < cap_min.value.cap) {
+            GGML_LOG_ERROR("[ZONE-PLAN-BUG] the admitted cap %zu B is below the probe's cap_min %zu B on device %d\n",
+                           read.value.cap, cap_min.value.cap, device);
+            if (ggml_sycl::ggml_sycl_strict_enabled()) {
+                GGML_ABORT("[ZONE-PLAN-BUG] the admitted cap %zu B is below the probe's cap_min %zu B on device %d",
+                           read.value.cap, cap_min.value.cap, device);
+            }
+            ggml_sycl_plan_scope_fail(scope, "the admitted cap is below the probe's cap_min");
+        }
+    }
+    return read.value.cap;
+}
+
+// The in-scope branch of a compute buft's get_max_size: only the copy's value, never a
+// zone read.  A read the copy cannot answer is E5 and returns the per-process constant.
+static size_t ggml_sycl_plan_scope_chunk_cap(ggml_sycl_plan_scope *        scope,
+                                             ggml_backend_buffer_type_t    buft,
+                                             ggml_sycl_chunk_cap_buft_kind kind,
+                                             int                           device) {
+    if (kind == ggml_sycl_chunk_cap_buft_kind::CPU_OFFLOAD) {
+        // D12: a GPU op's compute buffer in host memory is the forbidden zero-copy read.
+        ggml_sycl_plan_scope_fail(scope, "the CPU-offload compute buft is not reachable under a placement plan");
+        return ggml_sycl_host_chunk_cap_constant();
+    }
+    if (scope->mode == GGML_SYCL_PLAN_SCOPE_LOAD_MEASURE) {
+        return ggml_sycl_plan_scope_load_measure_cap(scope, kind, device);
+    }
+    const size_t constant = kind == ggml_sycl_chunk_cap_buft_kind::HOST ? ggml_sycl_host_chunk_cap_constant() :
+                                                                          ggml_sycl_device_chunk_cap_constant(device);
+    size_t       value    = 0;
+    if (ggml_sycl_plan_caps_find(scope->caps, buft, value)) {
+        scope->reads.emplace_back(buft, value);
+        return value;
+    }
+    const int state = scope->caps->state.load(std::memory_order_acquire);
+    if (state != GGML_SYCL_PLAN_CAPS_FREEZING) {
+        const char * name = buft && buft->iface.get_name ? buft->iface.get_name(buft) : "?";
+        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] chunk cap unfrozen at read (state=%s, buft=%s)\n",
+                       ggml_sycl_plan_caps_state_name(state), name);
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] chunk cap unfrozen at read (state=%s, buft=%s)",
+                       ggml_sycl_plan_caps_state_name(state), name);
+        }
+        ggml_sycl_plan_scope_fail(scope, "chunk cap unfrozen during this reserve");
+        return constant;
+    }
+    value = ggml_backend_sycl_plan_caps_freeze(scope, scope->caps, buft, kind);
+    scope->reads.emplace_back(buft, value);
+    return value;
+}
+
+void * ggml_backend_sycl_plan_scope_open(uint32_t                       exec_context_id,
+                                         enum ggml_sycl_plan_scope_mode mode,
+                                         ggml_backend_sycl_plan_caps_t  caps) {
+    if (g_plan_scope) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] plan scope nested\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] plan scope nested");
+        }
+        return nullptr;
+    }
+    if ((mode == GGML_SYCL_PLAN_SCOPE_LOAD_MEASURE) != (caps == nullptr)) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] plan scope constructed with no copy, or the load measure given one\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] plan scope constructed with no copy, or the load measure given one");
+        }
+        return nullptr;
+    }
+    try {
+        auto * scope           = new ggml_sycl_plan_scope();
+        scope->exec_context_id = exec_context_id;
+        scope->mode            = mode;
+        scope->caps            = caps;
+        g_plan_scope           = scope;
+        return scope;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void * ggml_backend_sycl_plan_scope_open_load_measure(enum ggml_sycl_measure_stage stage) {
+    void * handle = ggml_backend_sycl_plan_scope_open(0, GGML_SYCL_PLAN_SCOPE_LOAD_MEASURE, nullptr);
+    if (handle) {
+        static_cast<ggml_sycl_plan_scope *>(handle)->stage = stage;
+    }
+    return handle;
+}
+
+const char * ggml_backend_sycl_plan_scope_failure(void * scope) {
+    auto * s = static_cast<ggml_sycl_plan_scope *>(scope);
+    return s && !s->failure.empty() ? s->failure.c_str() : nullptr;
+}
+
+void ggml_backend_sycl_plan_scope_close(void * scope) {
+    auto * s = static_cast<ggml_sycl_plan_scope *>(scope);
+    if (!s) {
+        return;
+    }
+    if (g_plan_scope == s) {
+        g_plan_scope = nullptr;
+    }
+    delete s;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+size_t ggml_backend_sycl_plan_caps_freeze_core(ggml_backend_sycl_plan_caps_t caps,
+                                               ggml_backend_buffer_type_t    buft,
+                                               bool                          is_vm,
+                                               size_t                        runtime,
+                                               size_t                        kv,
+                                               size_t                        scratch,
+                                               size_t                        safe_alloc,
+                                               size_t                        max_alloc) {
+    const auto core = ggml_sycl_chunk_cap_core(is_vm, runtime, kv, scratch, safe_alloc, max_alloc);
+    ggml_sycl_plan_caps_store(caps, buft, core.cap);
+    return core.cap;
+}
+
+uint32_t ggml_backend_sycl_plan_caps_freeze_count(ggml_backend_sycl_plan_caps_t caps, ggml_backend_buffer_type_t buft) {
+    std::lock_guard<std::mutex> lock(caps->mutex);
+    for (const auto & s : caps->slots) {
+        if (s.buft == buft) {
+            return s.freezes;
+        }
+    }
+    return 0;
+}
+
+int ggml_backend_sycl_plan_caps_live(void) {
+    return g_plan_caps_live.load(std::memory_order_acquire);
+}
+#endif
+
 static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     ggml_backend_sycl_buffer_type_context * ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
     if (ctx && ctx->max_size_override > 0) {
         return ctx->max_size_override;
     }
+    // In a plan scope the answer is the context's copy, never a zone read.  This comes
+    // before the device-index check, so a buft naming a device with no device reaches it.
+    if (g_plan_scope) {
+        return ggml_sycl_plan_scope_chunk_cap(g_plan_scope, buft, ggml_sycl_chunk_cap_buft_kind::DEVICE,
+                                              ctx ? ctx->device : -1);
+    }
     if (!ctx || ctx->device < 0 || ctx->device >= ggml_sycl_info().device_count) {
         return 0;
+    }
+    {
+        // On VM backing the cap is the one expression over the ledger's current capacities.
+        // Otherwise this falls through to the arena branch and the no-arena tail below.
+        const auto vm_cap = ggml_sycl_arena_chunk_cap(ctx->device, ggml_sycl_chunk_cap_set::LEDGER_CURRENT);
+        if (vm_cap.is_vm) {
+            return vm_cap.value.cap;
+        }
     }
 
     // llama.cpp-w1rxh: arena-aware per-chunk limit.
@@ -38502,6 +38902,22 @@ ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device) {
     }
     return &ggml_backend_sycl_buffer_types[device];
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// A device buft that touches no device: the production interface over a context naming
+// `device`.  ggml_backend_sycl_buffer_type(int) asserts device < device_count and gets
+// the device, so a host with none cannot use it.
+ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type_make_for_testing(int device) {
+    return new ggml_backend_buffer_type{
+        /* .iface    = */ ggml_backend_sycl_buffer_type_interface,
+        /* .device   = */ nullptr,
+        /* .context  = */
+        new ggml_backend_sycl_buffer_type_context{ device, GGML_SYCL_NAME + std::to_string(device),
+                                                  GGML_SYCL_MEM_DEVICE, GGML_SYCL_MEM_POLICY_STATIC, false, true, 0,
+                                                  nullptr, nullptr },
+    };
+}
+#endif
 
 static ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(ggml_backend_sycl_context * ctx) {
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_buffer_type\n");
@@ -42819,6 +43235,9 @@ static size_t ggml_backend_sycl_host_buffer_type_chunk_cap() {
 }
 
 static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    if (g_plan_scope) {
+        return ggml_sycl_plan_scope_chunk_cap(g_plan_scope, buft, ggml_sycl_chunk_cap_buft_kind::HOST, -1);
+    }
     const size_t chunk_cap = ggml_backend_sycl_host_buffer_type_chunk_cap();
 
     // When host zones are configured, report the largest single-chunk
@@ -43109,6 +43528,26 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
     return &ggml_backend_sycl_buffer_type_host;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The SYCL_Host buft with no device behind it, for hosts that have none.  Its iface is
+// the production host interface (the same functions the getter above installs).
+ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_make_for_testing() {
+    return new ggml_backend_buffer_type{
+        /* .iface    = */ {
+                           /* .get_name         = */ ggml_backend_sycl_host_buffer_type_name,
+                           /* .alloc_buffer     = */ ggml_backend_sycl_host_buffer_type_alloc_buffer,
+                           /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                           /* .get_max_size     = */ ggml_backend_sycl_host_buffer_type_get_max_size,
+                           /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                           /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+                           },
+        /* .device   = */
+        nullptr,
+        /* .context  = */ nullptr,
+    };
+}
+#endif
+
 static const char * ggml_backend_sycl_kv_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     return GGML_SYCL_NAME "_KV_Host";
@@ -43326,6 +43765,9 @@ static bool ggml_backend_sycl_cpu_offload_compute_is_host(ggml_backend_buffer_ty
 }
 
 static size_t ggml_backend_sycl_cpu_offload_compute_get_max_size(ggml_backend_buffer_type_t buft) {
+    if (g_plan_scope) {
+        return ggml_sycl_plan_scope_chunk_cap(g_plan_scope, buft, ggml_sycl_chunk_cap_buft_kind::CPU_OFFLOAD, -1);
+    }
     // llama.cpp-15li2 CRIT-2: host-pinned memory is limited by system
     // host-zone configuration, not VRAM zones.
     //
@@ -110915,6 +111357,27 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_measure_plan_override_clear") == 0) {
         return (void *) ggml_backend_sycl_measure_plan_override_clear;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_caps_new") == 0) {
+        return (void *) ggml_backend_sycl_plan_caps_new;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_caps_free") == 0) {
+        return (void *) ggml_backend_sycl_plan_caps_free;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_caps_set_state") == 0) {
+        return (void *) ggml_backend_sycl_plan_caps_set_state;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_scope_open") == 0) {
+        return (void *) ggml_backend_sycl_plan_scope_open;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_scope_open_load_measure") == 0) {
+        return (void *) ggml_backend_sycl_plan_scope_open_load_measure;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_scope_failure") == 0) {
+        return (void *) ggml_backend_sycl_plan_scope_failure;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_scope_close") == 0) {
+        return (void *) ggml_backend_sycl_plan_scope_close;
     }
     // llama.cpp-ir18: the model loader asks the placement plan, pre-create_tensor,
     // which dense weights are destined for the host, so it can give those to the CPU

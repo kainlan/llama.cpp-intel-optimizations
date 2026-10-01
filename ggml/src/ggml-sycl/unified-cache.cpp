@@ -14970,6 +14970,22 @@ ggml_sycl_arena_backing_type ggml_sycl_arena_backing(int device) {
     return cache->arena_backing();
 }
 
+size_t ggml_sycl_compute_arena_bytes(int device) {
+    (void) device;
+    static const size_t bytes = [] {
+        size_t       mb  = 512;
+        const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
+        if (env && *env) {
+            const long parsed = std::strtol(env, nullptr, 10);
+            if (parsed > 0) {
+                mb = static_cast<size_t>(parsed);
+            }
+        }
+        return mb * 1024ULL * 1024ULL;
+    }();
+    return bytes;
+}
+
 bool ggml_sycl_device_has_zones(int device) {
     // Never creates: a device with no cache (before its lazy creation, during
     // shutdown, after destruction) has no zones.
