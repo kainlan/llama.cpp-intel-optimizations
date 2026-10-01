@@ -123,7 +123,41 @@ void check_role(const char * name, expert_tensor_role expected) {
 
 }  // namespace
 
+// The hint in front of the republish-into-empty names the owning load and the plan
+// publication epoch, so a re-plan (a publication, which hands out a new id) that adds a
+// device can never be hidden by a "not a participant" hint recorded before it.
+uint64_t ggml_sycl_into_empty_skip_key_for_test(const ggml_sycl::lifecycle::ModelToken & owner, uint64_t epoch);
+
+static bool test_into_empty_hint_is_bound_to_the_publication_epoch() {
+    ggml_sycl::lifecycle::ModelToken a{};
+    a.model.value                                = 7;
+    a.load.value                                 = 3;
+    ggml_sycl::lifecycle::ModelToken other_model = a;
+    other_model.model.value                      = 8;
+    ggml_sycl::lifecycle::ModelToken other_load  = a;
+    other_load.load.value                        = 4;
+
+    const uint64_t epoch = lifecycle_plan_publication_epoch();
+    const uint64_t key   = ggml_sycl_into_empty_skip_key_for_test(a, epoch);
+    bool           ok    = key != 0 && key == ggml_sycl_into_empty_skip_key_for_test(a, epoch);
+    ok                   = ok && epoch == lifecycle_plan_publication_epoch();  // reading it publishes nothing
+    ok                   = ok && key != ggml_sycl_into_empty_skip_key_for_test(other_model, epoch);
+    ok                   = ok && key != ggml_sycl_into_empty_skip_key_for_test(other_load, epoch);
+    // A publication hands out an id: the epoch moves, and the same owner's key with it.
+    (void) lifecycle_next_plan_publication_id();
+    const uint64_t after = lifecycle_plan_publication_epoch();
+    ok                   = ok && after != epoch && ggml_sycl_into_empty_skip_key_for_test(a, after) != key &&
+         ggml_sycl_into_empty_skip_key_for_test(a, after) != 0;
+    return ok;
+}
+
 int main() {
+    if (test_into_empty_hint_is_bound_to_the_publication_epoch()) {
+        n_pass++;
+    } else {
+        printf("FAIL the into_empty skip hint is not bound to the plan publication epoch\n");
+        n_fail++;
+    }
     check_concurrent_snapshot_publication();
     if (test_plan_publication_prepare_failure_is_caught()) {
         n_pass++;

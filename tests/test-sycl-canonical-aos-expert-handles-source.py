@@ -17,7 +17,13 @@ LIFECYCLE_TEST = ROOT / "tests/test-sycl-moe-handle-resolution.cpp"
 
 def function(text: str, signature: str) -> str:
     start = text.index(signature)
-    brace = text.index("{", start)
+    # A forward declaration ends in `;` before any `{`: skip to the definition.
+    while True:
+        brace = text.index("{", start)
+        semi = text.find(";", start)
+        if semi < 0 or brace < semi:
+            break
+        start = text.index(signature, start + 1)
     depth = 0
     state = "code"
     i = brace
@@ -67,7 +73,7 @@ def violations(source: str) -> list[str]:
     memsetter = function(source, "static void ggml_backend_sycl_buffer_memset_tensor")
     copier = function(source, "static bool ggml_backend_sycl_buffer_cpy_tensor")
     clearer = function(source, "static void ggml_backend_sycl_buffer_clear")
-    route = function(source, "static moe_expert_route ggml_sycl_resolve_moe_expert_route")
+    route = function(source, "static moe_expert_route ggml_sycl_resolve_moe_expert_route_core")
     storage_route = function(source, "static bool ggml_sycl_try_moe_storage_handle_route")
     common = COMMON.read_text()
     logical_resolver = function(common, "bool resolve_moe_storage_record")

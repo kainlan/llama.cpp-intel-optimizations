@@ -414,6 +414,20 @@ def violations(files):
         flush_cond = eb[flush_if:flush_at] if flush_if >= 0 else ""
         if "recorded_call" not in flush_cond:
             bad(MAIN, main, exit_fn[0][0], "the exit's flush does not branch on recorded_call (a recording call must not wait)")
+        # the whole condition, not the word: an eager call flushes, and a recording call flushes only with pending state
+        if not re.search(r"if\s*\(\s*\(\s*!\s*recorded_call\s*\|\|\s*scatter_pending\s*\)\s*&&\s*"
+                         r"!\s*ggml_sycl_cpu_tg_exit_flush_skipped_for_test\s*\(\s*\)\s*\)\s*\{[^}]*"
+                         r"ggml_sycl_cpu_tg_flush_pending\s*\(", eb):
+            bad(MAIN, main, exit_fn[0][0], "the exit's flush condition is not (!recorded_call || scatter_pending) "
+                "and the test hook: an eager call must flush, and a recording call only with pending state")
+        if not re.search(r"const\s+bool\s+scatter_pending\s*=\s*recorded_call\s*&&\s*"
+                         r"ggml_sycl_cpu_tg_pending_any\s*\(\s*\)\s*;", eb):
+            bad(MAIN, main, exit_fn[0][0], "scatter_pending is not recorded_call && ggml_sycl_cpu_tg_pending_any()")
+        # (the report's text is a string, which the scrub blanks; the branch must warn and abort under STRICT)
+        if not re.search(r"if\s*\(\s*scatter_pending\s*\)\s*\{\s*GGML_LOG_WARN\s*\([^;]*;\s*"
+                         r"if\s*\(\s*ggml_sycl::ggml_sycl_strict_enabled\s*\(\s*\)\s*\)\s*\{\s*GGML_ABORT\s*\(", eb):
+            bad(MAIN, main, exit_fn[0][0], "pending scatter state at a recording exit is not reported "
+                "(a warning, and an abort under STRICT)")
         if not re.search(r"if\s*\(\s*!\s*recorded_call\s*&&\s*ctx\s*\)\s*\{[^}]*graph_input_staging_release_tenants\(", eb):
             bad(MAIN, main, exit_fn[0][0], "the staging-tenant release is not an eager-exit step (!recorded_call)")
         if "ggml_sycl_cpu_tg_pending_any(" not in eb:
@@ -589,6 +603,25 @@ def mutants(files):
                 "!ggml_sycl_cpu_tg_exit_flush_skipped_for_test()", "k32"), "flush does not branch on recorded_call")
     yield ("a staging-tenant release on a recording exit",
            edit(files, M, "if (!recorded_call && ctx) {", "if (ctx) {", "k33"), "not an eager-exit step")
+    yield ("a recording exit that never flushes pending state",
+           edit(files, M, "(!recorded_call || scatter_pending) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()",
+                "(!recorded_call) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()", "k35"),
+           "flush condition is not (!recorded_call || scatter_pending)")
+    yield ("an eager exit that never flushes",
+           edit(files, M, "(!recorded_call || scatter_pending) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()",
+                "(recorded_call || scatter_pending) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()", "k36"),
+           "flush condition is not (!recorded_call || scatter_pending)")
+    yield ("a flush condition that cannot hold",
+           edit(files, M, "(!recorded_call || scatter_pending) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()",
+                "(false && recorded_call) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()", "k37"),
+           "flush condition is not (!recorded_call || scatter_pending)")
+    yield ("a pending read that is always false",
+           edit(files, M, "const bool scatter_pending = recorded_call && ggml_sycl_cpu_tg_pending_any();",
+                "const bool scatter_pending = false && recorded_call && ggml_sycl_cpu_tg_pending_any();", "k38"),
+           "scatter_pending is not recorded_call && ggml_sycl_cpu_tg_pending_any()")
+    yield ("the pending-state report dropped",
+           edit(files, M, "if (scatter_pending) {\n            GGML_LOG_WARN(", "if (false) {\n            GGML_LOG_WARN(", "k39"),
+           "at a recording exit is not reported")
     yield ("the pending read dropped from the exit",
            edit(files, M, "const bool scatter_pending = recorded_call && ggml_sycl_cpu_tg_pending_any();",
                 "const bool scatter_pending = recorded_call;", "k34"), "does not read the pending MoE scatter state")

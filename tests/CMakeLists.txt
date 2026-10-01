@@ -3774,3 +3774,16 @@ endif()
 llama_build_and_test(test-tuning-cache-io.cpp)
 set_tests_properties(test-tuning-cache-io PROPERTIES
     ENVIRONMENT "XDG_CACHE_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-tuning-cache-io-home;GGML_SYCL_TUNING_CACHE_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-tuning-cache-io-dir")
+
+# The runtime witnesses (GGML_SYCL_WITNESS) enforce the L0 lock order and the
+# nesting rules (unified-cache.cpp, the audit above g_replan_txn_mutex).  A test
+# that links the production backend does not turn them on by itself, so every
+# lifecycle, replan and plan test registered in this directory sets
+# GGML_SYCL_WITNESS_CHECKS=1 too (ggml/src/ggml-sycl/CMakeLists.txt does the same
+# for its own directory; get_property(TESTS) sees only the calling directory).
+get_property(_witness_candidate_tests DIRECTORY PROPERTY TESTS)
+foreach (_witness_test IN LISTS _witness_candidate_tests)
+    if (_witness_test MATCHES "lifecycle|replan|plan")
+        set_property(TEST ${_witness_test} APPEND PROPERTY ENVIRONMENT "GGML_SYCL_WITNESS_CHECKS=1")
+    endif()
+endforeach()

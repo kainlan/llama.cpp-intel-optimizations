@@ -190,7 +190,7 @@ def contract(text: str) -> bool:
         and "GGML_OP_MUL_MAT_ID" in function[early : early_close + 1]
         and router_residency_exception ==
             "constboolis_multi_gpu_router_logits="
-            "g_moe_multi_gpu_active.load(std::memory_order_acquire)&&"
+            "ggml_sycl_moe_multi_gpu_for_executor()&&"
             "ggml_sycl_op_is_moe_router_logits_matmul(op);"
         and planner_control_decisions == (("return", "false"),)
         and executable_body(function[planner_close + 1 : switch]) == ""
@@ -284,11 +284,11 @@ def test_planner_guard_rejects_non_boolean_spelled_early_successes() -> None:
 def test_router_logits_control_flow_mutations_are_rejected() -> None:
     declaration = (
         "    const bool is_multi_gpu_router_logits =\n"
-        "        g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "        ggml_sycl_moe_multi_gpu_for_executor() && "
         "ggml_sycl_op_is_moe_router_logits_matmul(op);\n\n"
     )
     old_early_success = (
-        "    if (g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "    if (ggml_sycl_moe_multi_gpu_for_executor() && "
         "ggml_sycl_op_is_moe_router_logits_matmul(op)) {\n"
         "        return true;\n"
         "    }\n\n"
@@ -304,7 +304,7 @@ def test_router_logits_control_flow_mutations_are_rejected() -> None:
 
     all_ops_bypass_planner = replace_in_supports_function(
         SOURCE,
-        "const bool is_multi_gpu_router_logits =\n        g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "const bool is_multi_gpu_router_logits =\n        ggml_sycl_moe_multi_gpu_for_executor() && "
         "ggml_sycl_op_is_moe_router_logits_matmul(op);",
         "const bool is_multi_gpu_router_logits = true;",
     )

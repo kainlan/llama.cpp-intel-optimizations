@@ -489,7 +489,7 @@ def gate31(files, bad):
         bad("gate 31: the re-plan mutexes are %s (wanted exactly g_replan_txn_mutex)" % sorted(mutexes))
     if not re.search(r"static\s+thread_local\s+int\s+g_replan_token_depth\b", ucc):
         bad("gate 31: the held depth is not a thread_local")
-    # A blocked acquire is never silent and never abandoned (review r1 M13): it waits in timed slices, logs the holder
+    # A blocked acquire is never silent and never abandoned: it waits in timed slices, logs the holder
     # at each, keeps waiting, and aborts only under STRICT.
     acq = func_bodies(ucc, "ggml_sycl_replan_token::acquire")
     ackeep = keep(files, UC_C)
@@ -684,7 +684,7 @@ def gate31_owner(files, bad):
         if min(order) < 0 or order != sorted(order):
             bad("gate 31 (owner): into_empty does not lock, select the owner's snapshot, re-check emptiness, install, "
                 "then compare identity, in that order")
-        # What each cache state gets (review r1 M8-M10): an empty cache gets the owner's snapshot, a cache that
+        # What each cache state gets: an empty cache gets the owner's snapshot, a cache that
         # already holds a plan is left untouched (and a foreign load's plan is witnessed), and a cache that is not
         # one of the plan's devices gets nullptr.  The hint in front of the lock is keyed by owner and set only for
         # a non-participant.
@@ -711,8 +711,18 @@ def gate31_owner(files, bad):
         hint = t.find("into_empty_skip_key() == skip_key")
         if hint < 0 or hint > t.find("std::lock_guard") or "return ggml_sycl_into_empty_result::NOOP" not in t[hint:hint + 120]:
             bad("gate 31 (owner): the owner-keyed hint is not read, with a NOOP, before the lock")
-        if not re.search(r"skip_key\s*=\s*\(\s*owner\.model\.value[^;]*owner\.load\.value\s*\)\s*\|\s*1ULL", t):
-            bad("gate 31 (owner): the hint key is not built from the owner's model and load")
+        # the key names the owning load AND the plan publication epoch, read before the lock: a re-plan that adds
+        # this device is a publication, which moves the epoch, so a stale "not a participant" never matches
+        if not re.search(r"skip_key\s*=\s*ggml_sycl_into_empty_skip_key\s*\(\s*owner\s*,\s*"
+                         r"ggml_sycl::lifecycle_plan_publication_epoch\s*\(\s*\)\s*\)\s*;", t) or \
+                t.find("lifecycle_plan_publication_epoch(") > t.find("std::lock_guard"):
+            bad("gate 31 (owner): the hint key is not built from the owner's load and the plan publication epoch "
+                "before the lock")
+        kf = func_bodies(c, "ggml_sycl_into_empty_skip_key")
+        kt = text_of(c, kf[0]) if len(kf) == 1 else ""
+        if not (re.search(r"owner\.model\.value", kt) and re.search(r"owner\.load\.value", kt) and
+                re.search(r"\bepoch\b", kt) and re.search(r"\|\s*1ULL", kt)):
+            bad("gate 31 (owner): the hint key function does not mix the owner's model, load and the epoch")
         if not all(x in t for x in ("installed->version != selected->version", "installed->model_id != selected->model_id",
                                     "installed->load_txn_id != selected->load_txn_id")):
             bad("gate 31 (owner): into_empty does not compare version, model_id and load_txn_id of the installed snapshot")
@@ -960,6 +970,10 @@ def gate36(files, bad):
             len(readers))
     if c.count("ggml_sycl_compute_arena_bytes(") < 2:
         bad("gate 36: the model-load reservation does not size itself with ggml_sycl_compute_arena_bytes")
+    # the cache's own zone sizing is the third reader of the function: a literal here is a second source
+    zb = body_text(code(files, UC_C), "ensure_planned_arena_zones", bad, "gate 36")
+    if zb and not re.search(r"\bscratch_zone\s*=\s*ggml_sycl_compute_arena_bytes\s*\(\s*dev_id\s*\)\s*;", zb):
+        bad("gate 36: ensure_planned_arena_zones does not size the SCRATCH zone with ggml_sycl_compute_arena_bytes(dev_id)")
     lm = body_text(c, "ggml_sycl_plan_scope_load_measure_cap", bad, "gate 36")
     if lm and re.search(r"\b2\s*\*\s*1024|\bmin\s*\(\s*2|GiB", lm):
         bad("gate 36: the load-time cap carries a literal floor")
@@ -1111,6 +1125,13 @@ def mutants(files):
                 "g31o31"), "does not leave a filled cache untouched")
     yield ("into_empty not witnessing a foreign plan",
            edit(files, M, "cache->set_into_empty_foreign_key(skip_key);", "", "g31o32"), "does not witness a foreign load")
+    yield ("a hint key that ignores the publication epoch",
+           edit(files, M, "(epoch * 0xC2B2AE3D27D4EB4FULL)", "0", "g31o34"),
+           "does not mix the owner's model, load and the epoch")
+    yield ("a hint key read with a constant epoch",
+           edit(files, M, "ggml_sycl_into_empty_skip_key(owner, ggml_sycl::lifecycle_plan_publication_epoch())",
+                "ggml_sycl_into_empty_skip_key(owner, 0)", "g31o35"),
+           "hint key is not built from the owner's load and the plan publication epoch")
     yield ("a non-participant that reports an install",
            edit(files, M, "cache->set_into_empty_skip_key(skip_key);\n        return ggml_sycl_into_empty_result::NOOP;",
                 "cache->set_into_empty_skip_key(skip_key);\n        return ggml_sycl_into_empty_result::INSTALLED;", "g31o33"),
@@ -1332,6 +1353,10 @@ def mutants(files):
     yield ("the reservation without the sizing function",
            edit(files, M, "const size_t arena_bytes = ggml_sycl::ggml_sycl_compute_arena_bytes(0);",
                 "const size_t arena_bytes = 512ULL << 20;", "g36m"), "does not size itself with")
+    yield ("the zone sizing with a literal scratch size",
+           edit(files, UC_C, "size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);",
+                "size_t scratch_zone = 512ULL << 20;", "g36o"),
+           "ensure_planned_arena_zones does not size the SCRATCH zone")
     yield ("a second default in the sizing function's neighbour",
            edit(files, UC_C, "bool ggml_sycl_device_has_zones(int device) {",
                 'size_t ggml_sycl_stray_arena_bytes() { const char * e = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB"); return e ? 1 : 512; }\n'

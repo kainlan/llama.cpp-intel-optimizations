@@ -3205,8 +3205,10 @@ set_tests_properties(test-sycl-plan-caps PROPERTIES
 
 # Test: the re-plan hooks ggml_backend_sycl_synchronize_for_replan and
 # ggml_backend_sycl_graph_invalidate (zhcn-design §3.1; H6a).  Refusals run anywhere; the
-# context arms need a card and run only lead-run, under GGML_SYCL_TEST_REPLAN_DEVICE=1
-# (the test exits 77 without it, which ctest reports as skipped).
+# context arms need a card, so the registration pins level_zero:0,1 and supplies
+# GGML_SYCL_TEST_REPLAN_DEVICE=1; a bare run of the binary without it skips the
+# context arms and exits 77, which ctest reports as skipped.  A registration
+# that left the variable out would report Skipped on a pinned run and prove nothing.
 add_executable(test-sycl-replan-hooks
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-replan-hooks.cpp
 )
@@ -3227,7 +3229,7 @@ target_link_libraries(test-sycl-replan-hooks PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-replan-hooks COMMAND test-sycl-replan-hooks)
 set_tests_properties(test-sycl-replan-hooks PROPERTIES
     LABELS "sycl;h6a;tdd"
-    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "GGML_SYCL_TEST_REPLAN_DEVICE=1;ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
