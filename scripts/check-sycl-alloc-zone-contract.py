@@ -3818,6 +3818,10 @@ WITNESSES = {
     "s31-l": "clause (l) is enforced once mem_handle::owner_use_count exists, and dormant again when it is gone",
     "s3q-data": "an E-LIBC debt entry needs a fate and a cite, and an E-LIBC allowlist entry a name",
     "s3q-pin": "the CHECK_TRY_ERROR handler's debt entry carries converted-by-5.4a and no other fate, and no other entry may carry a fate",
+    "s3f-i1": "clause (q) in a #define body and in the lexical pass reads a qualifier across spaces and line continuations",
+    "s3f-m4": "dpct_memcpy and async_dpct_memcpy, which reach dpct's host_buffer malloc, are forbidden outside dpct/helper.hpp",
+    "s3f-m5": "clause (q) also names mmap64, mremap, valloc, pvalloc, reallocarray, strdup and strndup",
+    "s3f-data": "the CHECK_TRY_ERROR pin cannot lapse by a re-key and carries a cite; no allowlist reason names a source line; no cite names a ruling-ledger id",
     "s2c-catch": "spellings and placements of the rethrow clause", "s2c-data": "clause-(h) entries that must be refused by validation",
     "9": "a model-shaped *_bytes() function is called by its allocation sites and by the zone sizing; dormant until defined",
     "27": "clause (j): A's fit and W's term read per-model sources only; the eligibility classifier is not called outside the late stage",
@@ -4805,6 +4809,7 @@ def matrix_cases():
     c.extend(matrix_cases_s2d5())
     c.extend(matrix_cases_s3q())
     c.extend(matrix_cases_s31())
+    c.extend(matrix_cases_s3f())
     return c
 
 
@@ -5718,6 +5723,95 @@ def matrix_cases_s3q():
            edit_debt=catch_debt(lambda e: dict(e, fate="converted-by-5.4a"), is_other_catch), planted=False))
     A(Case("s3q-pin", "an N-VOID entry carrying a fate fails", lambda f: f, "FAIL", "data", "carries a fate",
            edit_debt=catch_debt(lambda e: dict(e, fate="deleted-by-step-7"), lambda e: e["code"] == "N-VOID"), planted=False))
+    return c
+
+
+def matrix_cases_s3f():
+    """The S3-0 review fold: a qualifier across spaces, the dpct memcpy family, more libc names, and the data rules."""
+    c = []
+    A = c.append
+
+    def plant_q(expr, name="zzplant_q"):
+        return plant("void %s() {\n    void * p = nullptr;\n    (void) %s;\n    (void) p;\n}\n" % (name, expr))
+
+    # I1: a #define body is text, so a qualifier is read across spaces and line continuations, backwards from the name
+    A(Case("s3f-i1", "a macro body `sycl :: malloc` is clause (e)'s one E-RAW hit and no E-LIBC double count (control)", plant(
+        "#define zz_sm(q, n) sycl :: malloc(n, q, sycl::usm::alloc::host)\n"), "PASS",
+        allowlist={"id": "E-ZZ-SM", "code": "E-RAW", "file": PLANT, "function": "#define zz_sm", "name": "sycl::malloc",
+                   "count": 1, "reason": "mutation-matrix test entry"}, planted=False))
+    for lab, body in (("pool :: realloc", "#define zz_p(p, n) pool :: realloc(p, n)\n"),
+                      ("p . malloc", "#define zz_p(p, n) p . malloc(n)\n"),
+                      ("p -> malloc", "#define zz_p(p, n) p -> malloc(n)\n"),
+                      ("p->malloc", "#define zz_p(p, n) p->malloc(n)\n"),
+                      ("a scope split by a line continuation", "#define zz_p(n) my_ns::\\\n    malloc(n)\n"),
+                      ("a scope and a name split by a continuation and spaces", "#define zz_p(n) my_ns  ::  \\\n  calloc(n, 1)\n"),
+                      ("a template-qualified name", "#define zz_p(n) zz_pool<int>::malloc(n)\n")):
+        A(Case("s3f-i1", "a macro body `%s` is not a libc hit (control)" % lab, plant(body), "PASS", planted=False))
+    for lab, body in (("std :: malloc", "#define zz_s(n) std :: malloc(n)\n"), (":: malloc", "#define zz_s(n) :: malloc(n)\n"),
+                      ("std ::<continuation> malloc", "#define zz_s(n) std ::\\\n    malloc(n)\n"),
+                      ("a bare ::<continuation> calloc", "#define zz_s(n) ::\\\n    calloc(n, 1)\n")):
+        A(Case("s3f-i1", "a macro body `%s` is still E-LIBC" % lab, plant(body), "FAIL", "E-LIBC", "#define zz_s", planted=False))
+    # the lexical pass of an ERROR-root file reads the qualifier the same way
+    for lab, body in (("pool :: realloc", "pool :: realloc(p, 1)"), ("p . malloc", "p . malloc(1)"), ("p -> malloc", "p -> malloc(1)"),
+                      ("a scope split by a newline", "my_ns::\n    malloc(1)")):
+        A(Case("s3f-i1", "the lexical pass: `%s` is not a libc hit (control)" % lab, append_to(
+            "cpu-dispatch.cpp", "void zzplant_q() {\n    (void) %s;\n}\n" % body), "PASS", planted=False))
+    A(Case("s3f-i1", "the lexical pass: `std :: malloc` is still E-LIBC", append_to(
+        "cpu-dispatch.cpp", "void zzplant_q() {\n    void * p = std :: malloc(16);\n    (void) p;\n}\n"),
+        "FAIL", "E-LIBC", "malloc"))
+
+    # M4: the 3-D dpct_memcpy paths stage through host_buffer's std::malloc, so a caller outside helper.hpp is a raw allocation
+    for fn, call in (("dpct_memcpy", "dpct::dpct_memcpy(q, a, b, 16, dpct::host_to_device)"),
+                     ("async_dpct_memcpy", "dpct::async_dpct_memcpy(a, b, 16, dpct::host_to_device)"),
+                     ("dpct_memcpy", "dpct_memcpy(q, a, b, 16, dpct::device_to_host)")):
+        A(Case("s3f-m4", "a call of %s outside dpct/helper.hpp is an E-RAW finding (%s)" % (fn, call.split("(")[0]), plant(
+            "void zzplant_d(sycl::queue & q, void * a, const void * b) {\n    %s;\n}\n" % call), "FAIL", "E-RAW", fn))
+    A(Case("s3f-m4", "longer names, a comment and a string holding dpct_memcpy are not hits (control)", plant(
+        "// dpct_memcpy(q, a, b, 16, 0) and async_dpct_memcpy\nvoid zzplant_d() {\n    int my_dpct_memcpy_count = 1;\n"
+        "    const char * s = \"dpct_memcpy\";\n    (void) my_dpct_memcpy_count; (void) s;\n}\n"), "PASS", planted=False))
+
+    # M5: the other mapping and duplicating primitives
+    for nm, call in (("mmap64", "mmap64(nullptr, 16, 3, 34, -1, 0)"), ("mremap", "mremap(p, 16, 32, 1)"), ("valloc", "valloc(16)"),
+                     ("pvalloc", "pvalloc(16)"), ("reallocarray", "reallocarray(p, 4, 4)"), ("strdup", "strdup(\"x\")"),
+                     ("strndup", "strndup(\"x\", 1)"), ("strdup", "std::strdup(\"x\")")):
+        A(Case("s3f-m5", "a new call of %s" % call.split("(")[0], plant_q(call), "FAIL", "E-LIBC", nm))
+    A(Case("s3f-m5", "a macro whose body calls strndup", plant("#define zz_sd(s) strndup(s, 8)\n"), "FAIL", "E-LIBC",
+           "#define zz_sd", planted=False))
+    A(Case("s3f-m5", "a member strdup and a longer identifier are not hits (control)", plant(
+        "struct zz_pool {\n    char * strdup(const char * s);\n};\nvoid zzplant_q(zz_pool & pool) {\n"
+        "    char * a = pool.strdup(\"x\");\n    int my_strdup = 1;\n    (void) a; (void) my_strdup;\n}\n"), "PASS", planted=False))
+
+    # data rules
+    def rekey(d):
+        return dict(d, violations=[dict(e, key=e["key"][:-1] + "1") if e["code"] == "G-CATCH" and e["key"] == CHECK_TRY_ERROR_KEY else e
+                                   for e in d["violations"]])
+
+    def pin_cite(cite):
+        return lambda d: dict(d, violations=[dict(e, cite=cite) if e["code"] == "G-CATCH" and e["key"] == CHECK_TRY_ERROR_KEY else e
+                                             for e in d["violations"]])
+
+    def reason(eid, text):
+        return lambda al: dict(al, entries=[dict(e, reason=text) if e["id"] == eid else e for e in al["entries"]])
+
+    def e_libc_cite(text):
+        return lambda d: dict(d, violations=[dict(e, cite=text) if e["code"] == "E-LIBC" else e for e in d["violations"]])
+
+    A(Case("s3f-data", "re-keying the CHECK_TRY_ERROR debt entry cannot silently un-pin its fate", lambda f: f, "FAIL", "data",
+           "is not the pinned key", edit_debt=rekey, planted=False))
+    A(Case("s3f-data", "the CHECK_TRY_ERROR entry with a one-word cite fails", lambda f: f, "FAIL", "data", "has no cite",
+           edit_debt=pin_cite("tbd"), planted=False))
+    A(Case("s3f-data", "an allowlist reason naming a header line fails", lambda f: f, "FAIL", "data", "names a source line",
+           edit_allowlist=reason("E-LIBC-CACHE-GUARD", "cache bookkeeping with no tensor bytes: the guard allocator (unified-cache.hpp:4368)"),
+           planted=False))
+    A(Case("s3f-data", "an allowlist reason naming a .cpp line fails", lambda f: f, "FAIL", "data", "names a source line",
+           edit_allowlist=reason("E-CHAIN-RAW", "the raw wrapper link; the census row at ggml-sycl.cpp:24338 names it"), planted=False))
+    A(Case("s3f-data", "an allowlist reason citing a ruling-ledger id with a round fails", lambda f: f, "FAIL", "data",
+           "names a ruling-ledger id", edit_allowlist=reason("E-LIBC-CACHE-GUARD", "cache bookkeeping with no tensor bytes. Ruling M265 R2"),
+           planted=False))
+    A(Case("s3f-data", "an E-LIBC debt cite citing a ruling-ledger id with a round fails", lambda f: f, "FAIL", "data",
+           "names a ruling-ledger id", edit_debt=e_libc_cite("ruling M265 R2, step 7 census item (f): deleted with S7(d)"), planted=False))
+    A(Case("s3f-data", "the CHECK_TRY_ERROR cite citing a ruling-ledger id fails", lambda f: f, "FAIL", "data", "names a ruling-ledger id",
+           edit_debt=pin_cite("ruling M265 R3, design 5.4a: the handler is rewritten there"), planted=False))
     return c
 
 
