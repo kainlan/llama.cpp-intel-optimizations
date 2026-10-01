@@ -89,6 +89,19 @@ def function_definition(text: str, signature: str) -> str:
     raise ValueError(f"unclosed function: {signature}")
 
 
+def prompt_ids_snapshotted_once(text: str) -> bool:
+    """The prompt admission reads the device IDs exactly once and takes exactly one host snapshot of them.
+
+    69faeac92 (llama.cpp-e3xj) replaced the direct `ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)`
+    with the graph-local per-layer IDs cache: one refresh of the cache entry (the only D2H wait) and one copy
+    of that entry's host_ids into prompt_ids_snapshot. Both must occur exactly once; matched with \\s* because
+    clang-format aligns the assignment.
+    """
+    refreshes = re.findall(r"ggml_sycl_refresh_moe_ids_cache\(\s*ctx\s*,\s*ids\s*,\s*prompt_ids_entry\s*\)", text)
+    snapshots = re.findall(r"\bprompt_ids_snapshot\s*=\s*prompt_ids_entry\.host_ids\s*;", text)
+    return len(refreshes) == 1 and len(snapshots) == 1
+
+
 def violations(header: str, source: str, host_test: str, mem_handle_source: str) -> list[str]:
     failures: list[str] = []
     required_header = {
@@ -121,11 +134,14 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
             "moe_admitted_recipe_signature(const moe_execution_recipe & recipe, const mem_handle & lease)",
         "recipe signature mixes lease identity":
             "h = (h ^ lease.stable_identity_hash()) * 1099511628211ULL",
+        # llama.cpp-iikr (memo_hit fix) builds these per UNIQUE expert into the shared
+        # moe_resolved_operand_canonical entry that every repeat occurrence's operand points at, so the
+        # authority is assigned onto `canonical_entry`, not onto each operand.
         "lease-bound recipe admission":
-            "operand.admitted_recipe_signature = moe_admitted_recipe_signature(route.recipe, route.lease)",
-        "retained recipe reason": "operand.recipe_reason = route.recipe_reason",
+            "canonical_entry->admitted_recipe_signature = moe_admitted_recipe_signature(route.recipe, route.lease)",
+        "retained recipe reason": "canonical_entry->recipe_reason = route.recipe_reason",
         "retained exact queue capability":
-            "operand.recipe_queue_capability = route.recipe_queue_capability",
+            "canonical_entry->recipe_queue_capability = route.recipe_queue_capability",
     }
     required_source = {
         "canonical resolver": "ggml_sycl_resolve_moe_expert_route_for_dispatch(",
@@ -155,8 +171,9 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
             "normalized.recipe_queue_capability = *queue_capability",
         "direct admission consumes retained queue capability":
             "queue_cap = decode.operands.front().recipe_queue_capability",
-        "fallback uses retained recipe kernel": "moe_route_kernel_name(operand.recipe.kernel)",
-        "fallback uses retained recipe reason": "operand.recipe_reason ? operand.recipe_reason",
+        # The operand's retained fields are read through accessors now (value-owned canonical entry).
+        "fallback uses retained recipe kernel": "moe_route_kernel_name(operand.recipe().kernel)",
+        "fallback uses retained recipe reason": "operand.recipe_reason() ? operand.recipe_reason()",
         "production host recipe executor": "ggml_sycl_cpu_moe_host_aos_execute(task, &reject)",
         "execution-row bounded activation copy":
             "std::memcpy(act, task.activations, rows * static_cast<size_t>(K) * sizeof(float))",
@@ -238,7 +255,11 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "independent up admission": "pair.up_weight, ctx.device, prompt_ids_snapshot.data()",
         "independent down admission": "pair.down_weight, ctx.device, prompt_ids_snapshot.data()",
         "cross-role alignment": "align_moe_retained_role_batches(",
-        "validated pair roles": "const bool prompt_pair_retained_roles_validated = [&]()",
+        # iikr computes the bundle validation once per admission and shares it (retained_prompt_roles_bundle_
+        # validated), so the flag is a conjunction over the cached result, not a lambda that re-derives it.
+        "validated pair roles":
+            "const bool prompt_pair_retained_roles_validated = retained_prompt_roles_result"
+            " && *retained_prompt_roles_result && ne12 > 1 && retained_prompt_roles_bundle_validated",
         # The blanket quarantine was lifted when the route gained its transactional
         # executor; eligibility is now narrowed to the proven MXFP4 all-primary
         # path instead. Score the narrowing -- an unconditional `= true` and a
@@ -251,8 +272,12 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         # terminal token, published through the thread-local store.
         "actual terminal owner":
             "recorder.install_terminal(fused::TerminalToken(std::make_unique<EventOwner>(terminal_event)))",
+        # iikr/kzjv hoisted the store to file scope so an explicit flush() can retire the last publication.
+        # It is still the one thread-local publication authority, and the submit still threads it through.
         "transactional terminal publication":
-            "static thread_local fused::PublicationStore publication_store",
+            "static thread_local ggml_sycl::moe_fused::PublicationStore g_moe_prompt_fusion_publication_store",
+        "prompt fusion submit uses the store":
+            "mmvq_submit_retained_prompt_fusion(fusion_bundle, executor, g_moe_prompt_fusion_publication_store",
         "transactional skip commit": "entry.set->insert(std::move(entry.node))",
         # All three tables are now preflighted together with their ABI resolution
         # and the stable identity of every storage handle, before any submit.
@@ -337,7 +362,7 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     if not admission_tokens < route_mode_tokens < dispatch_gate_tokens or contains_tokens(
             mmid_tokens[specialized_selection_tokens:admission_tokens], "if (moe_hybrid_with_plan)"):
         failures.append("decode route/dispatch precedes admission")
-    if mmid[prompt_admission:admission].count("ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)") != 1:
+    if not prompt_ids_snapshotted_once(mmid[prompt_admission:admission]):
         failures.append("prompt IDs are not snapshotted exactly once")
     if mmid.count("append_retained_operand(") != 2:
         failures.append("decode and hybrid prompt routers share retained dispatch helper")
@@ -389,6 +414,18 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     pair_start = mmid.index("if (cpu_tg_candidate", prompt_admission)
     pair_end = mmid.index("auto record_moe_gpu_path", pair_start)
     prompt_reachable = mmid[prompt_admission:pair_start] + mmid[pair_end:]
+    # The RESTORE-T1 decode pair block (90166d9f9, 2026-08-16) builds the gate/up/down pointer tables in line
+    # on a miss (0d302e41b, 4873207f3), so it legitimately names ggml_sycl_update_moe_ptr_table(). It sits in
+    # the tail this scan reads, but it is the decode-only branch: prove that from its own guard, then take it
+    # out of the prompt-reachable text instead of exempting the symbol everywhere.
+    decode_pair_begin = mmid.index("bool decode_pair_glu_dispatched = false;")
+    decode_pair_end = mmid.index("if (decode_pair_glu_dispatched) {", decode_pair_begin)
+    decode_pair_block = mmid[decode_pair_begin:decode_pair_end]
+    if not has_tokens(decode_pair_block,
+                      "if (ne12 == 1 && !g_ggml_sycl_graph_recording && !xmx_moe_forced"
+                      " && src0->type == GGML_TYPE_MXFP4 && blk_layer_id >= 0 && is_gate_subop) {"):
+        failures.append("decode pair block is not guarded by ne12 == 1")
+    prompt_reachable = prompt_reachable.replace(decode_pair_block, "", 1)
     forbidden_prompt_ownership = (
         "ggml_sycl_resolve_moe_expert_route(",
         "ggml_sycl_resolve_moe_expert_route_for_dispatch(",
@@ -401,7 +438,7 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     for forbidden in forbidden_prompt_ownership:
         if has_tokens(prompt_reachable, forbidden):
             failures.append(f"reachable prompt path reacquires/materializes route: {forbidden}")
-    if prompt_reachable.count("ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)") != 1:
+    if not prompt_ids_snapshotted_once(prompt_reachable):
         failures.append("prompt IDs are copied outside the one admission snapshot")
     # Generic tensor resolution for src1/dst is canonical activation/output
     # resolution. Composite expert-weight resolution is allowed only in the
@@ -471,7 +508,23 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
     assert "record_moe_gpu_path" not in post_mark
     assert "ggml_sycl_fallback_error" not in post_mark
     assert "std::make_shared" not in post_mark
-    assert "std::vector<" not in post_mark
+    # 14e864c86 (2026-08-26, "route raw queue copies through sanctioned mem-ops primitive") replaced the raw
+    # exact_queue copy with ggml_sycl::mem_copy_ptr_async, whose dependency list is a std::vector taken by
+    # value, so the activation copy now builds one (a std::vector<sycl::event>{ ready_event } or an empty one).
+    # That allocation can throw, which is only acceptable because it sits inside the try whose catch(...) takes
+    # the quarantine/recover path. So: allow exactly those two spellings, still forbid every other vector after
+    # the mark, and require the try/catch that makes the allowance sound.
+    allowed_dependency_vectors = (
+        "std::vector<sycl::event>{ retained_table.ready_event }",
+        "std::vector<sycl::event>{}",
+    )
+    post_mark_unallowed = post_mark
+    for spelling in allowed_dependency_vectors:
+        assert spelling in post_mark, spelling
+        post_mark_unallowed = post_mark_unallowed.replace(spelling, "")
+    assert "std::vector<" not in post_mark_unallowed
+    assert "try {" in post_mark and post_mark.index("try {") < post_mark.index("mem_copy_ptr_async(")
+    assert "} catch (...) {" in post_mark
 
     materialize_start = source.index("static bool ggml_sycl_materialize_published_mmid_workspaces(")
     materialize_end = source.index("ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end", materialize_start)
@@ -558,8 +611,12 @@ def test_contract_and_mutation_witnesses() -> None:
     assert not violations(formatted_header, formatted_source, formatted_test, mem_source)
 
     semantic_mutants = [
-        ("slot-zero", header.replace("operand.slot_index       = i % slots_per_token;",
-                                     "operand.slot_index = 0;"), source, host_test, mem_source),
+        # The three header mutants below that delete or rewrite an assignment match it with \s* around the `=`:
+        # clang-format re-aligns those columns whenever a neighbouring field is added, and a literal spelling
+        # then matches nothing, leaving a no-op mutant that "survives" for the wrong reason. Each is also
+        # asserted to have changed its source, below.
+        ("slot-zero", re.sub(r"operand\.slot_index\s*=\s*i % slots_per_token;", "operand.slot_index = 0;", header),
+         source, host_test, mem_source),
         ("recipe-allows-prompt", header,
          source.replace("phase == moe_route_phase::DECODE && rows == 1", "rows >= 1", 1), host_test, mem_source),
         ("recipe-allows-secondary", header,
@@ -573,11 +630,11 @@ def test_contract_and_mutation_witnesses() -> None:
         ("drop-lease-bound-recipe-authority", header.replace(
             "h = (h ^ lease.stable_identity_hash()) * 1099511628211ULL;", "(void) lease;"),
          source, host_test, mem_source),
-        ("drop-retained-recipe-reason", header.replace(
-            "operand.recipe_reason             = route.recipe_reason;", ""),
+        ("drop-retained-recipe-reason",
+         re.sub(r"canonical_entry->recipe_reason\s*=\s*route\.recipe_reason;", "", header),
          source, host_test, mem_source),
-        ("drop-retained-queue-authority", header.replace(
-            "operand.recipe_queue_capability   = route.recipe_queue_capability;", ""),
+        ("drop-retained-queue-authority",
+         re.sub(r"canonical_entry->recipe_queue_capability\s*=\s*route\.recipe_queue_capability;", "", header),
          source, host_test, mem_source),
         ("requery-retained-recipe-authority", header,
          source.replace("(void) phase;", "(void) ggml_sycl_moe_query_route_capability(\n"
@@ -612,8 +669,8 @@ def test_contract_and_mutation_witnesses() -> None:
                         "fused::TerminalToken()"),
          host_test, mem_source),
         ("publication-store-not-retained", header,
-         source.replace("static thread_local fused::PublicationStore publication_store;",
-                        "fused::PublicationStore publication_store;"),
+         source.replace("static thread_local ggml_sycl::moe_fused::PublicationStore g_moe_prompt_fusion_publication_store;",
+                        "static ggml_sycl::moe_fused::PublicationStore g_moe_prompt_fusion_publication_store;"),
          host_test, mem_source),
         ("public-proof", header.replace("  private:\n    // Non-forgeable", "  public:\n    // forged"),
          source, host_test, mem_source),
@@ -717,4 +774,7 @@ def test_contract_and_mutation_witnesses() -> None:
          host_test, mem_source),
     ]
     for name, mutant_header, mutant_source, mutant_test, mutant_mem in semantic_mutants:
+        # A mutant whose literal stopped matching is a no-op that fails (or passes) for no reason; make that loud.
+        assert (mutant_header, mutant_source, mutant_test, mutant_mem) != (header, source, host_test, mem_source), (
+            f"semantic mutation changed nothing: {name}")
         assert violations(mutant_header, mutant_source, mutant_test, mutant_mem), f"semantic mutation survived: {name}"
