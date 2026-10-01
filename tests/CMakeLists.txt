@@ -552,6 +552,12 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 endif()
 
+# The staging probe's verdict table, host-only: the classification is a pure function in
+# tests/sycl-staging-probe-verdict.h, driven here over every (marker x release_sent x leg2_returned)
+# row so a change to the probe's reading order fails on a host with no device.
+llama_build_and_test(test-sycl-staging-probe-verdict.cpp)
+set_tests_properties(test-sycl-staging-probe-verdict PROPERTIES LABELS "sycl;host-only")
+
 # Cross-device staging probe (llama.cpp-23mk, design row 113 / G0): does the submit of a leg that
 # depends on another queue's event return before that event completes? Needs two devices and the
 # backend's own queues, so it links the real ggml-sycl library like test-sycl-profiling-queue-property
