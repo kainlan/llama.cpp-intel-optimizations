@@ -340,7 +340,7 @@ def evaluate(backend, common, memo_hdr):
         "drop_graphs(*ctx)" in dense_drop and "find(ctx)" in dense_drop and "state_for(" not in dense_drop
     gw_at = dense.find("graph_prestage_or_decline(")
     results["the dense recorder re-sizes its range graphs after the gateway may have retired them"] = \
-        gw_at >= 0 and re.search(r"st\.graphs\.resize\(ranges_\.size\(\)\);", dense[gw_at:]) is not None
+        gw_at >= 0 and re.search(r"if\s*\(st\.graphs\.size\(\)\s*!=\s*ranges_\.size\(\)\)\s*\{\s*st\.graphs\.resize\(ranges_\.size\(\)\);", dense[gw_at:]) is not None
 
     # Every release of recorded state waits first, under the guard that says there is something in flight (review r6).
     clear_active = function_body(backend, r"static void sycl_exec_graph_clear_active\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{") or ""
@@ -541,8 +541,8 @@ if args.self_test:
                     r"if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{[^{}]*\}",
                     "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { return false; }"), common, mem_)),
         ("segment replay decline keeps its segments", "site 3, MoE segment replay: declines, invalidates the segments, runs direct, else replays",
-         (mutate_re(backend, cmp_sig, r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\} else \{\s*graph_refresh_input_tensors",
-                    "compute_impl_unlocked();\n } else {\n graph_refresh_input_tensors"), common, mem_)),
+         (mutate_re(backend, cmp_sig, r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\} else if \(!sycl_ctx->moe_segments_valid\)",
+                    "compute_impl_unlocked();\n } else if (!sycl_ctx->moe_segments_valid)"), common, mem_)),
         ("first-record decline moves past begin_recording",
          "the recording sites keep their order, each decline between its neighbours (and before its recording)",
          (move_first_record_decline(backend), common, mem_)),

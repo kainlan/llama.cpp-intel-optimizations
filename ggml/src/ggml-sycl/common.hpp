@@ -6482,6 +6482,15 @@ struct ggml_backend_sycl_context {
     // into it itself, can tell it is still the same entry and still holds
     // those bytes.
     uint64_t                                                           graph_input_staging_generation = 0;
+    // Staging handles a size change displaced. A recorded graph (exec graph, MoE segments, block graphlets, dense
+    // range graphs) bakes the staging POINTER, and a replay from the previous token may still be reading the old
+    // buffer, so the displaced handle is held here instead of freed. graph_input_staging_clear releases it, and
+    // sycl_exec_graph_clear_active reaches that only after a queue wait. No recorder's retained set can hold it:
+    // the buffer is created before any recording starts, and which recorder will bake it is not known then.
+    std::vector<ggml_sycl::mem_handle> graph_input_staging_retired;
+    // Set when a valid handle was displaced. graph_prestage_or_decline consumes it and retires every recorded
+    // graph that may have baked the old pointer.
+    bool                               graph_input_staging_swapped = false;
 
     bool graph_input_stage_lookup(const ggml_tensor *     owner,
                                   size_t                  nbytes,
@@ -6537,12 +6546,9 @@ struct ggml_backend_sycl_context {
             }
         }
 
-        if (it != graph_input_staging.end()) {
-            it->second.handle   = ggml_sycl::mem_handle{};
-            it->second.capacity = 0;
-        }
-        graph_input_staging_generation++;
-
+        // The replacement is built into locals and swapped in only once it exists and holds the bytes. A failure
+        // here leaves the old entry live (and whatever recorded graph baked it valid), and the displaced handle is
+        // never freed under a replay that may still be reading it.
         ggml_sycl::alloc_request req{};
         req.queue                          = &q;
         req.device                         = dev_id;
@@ -6567,8 +6573,15 @@ struct ggml_backend_sycl_context {
         ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
             const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
         ggml_sycl::mem_copy(handle, src_handle, nbytes, q);
-        graph_input_staging[owner] = { std::move(handle), nbytes };
-        return graph_input_staging[owner].handle.resolve(dev_id).ptr;
+        graph_input_staging_entry & slot = graph_input_staging[owner];
+        if (slot.handle.valid()) {
+            graph_input_staging_retired.push_back(std::move(slot.handle));
+            graph_input_staging_swapped = true;
+        }
+        slot.handle   = std::move(handle);
+        slot.capacity = nbytes;
+        graph_input_staging_generation++;
+        return slot.handle.resolve(dev_id).ptr;
     }
 
     bool graph_input_refresh(const ggml_tensor * owner, const void * host_data, size_t nbytes, sycl::queue & q) {
@@ -6601,6 +6614,8 @@ struct ggml_backend_sycl_context {
     void graph_input_staging_clear(sycl::queue & q) {
         GGML_UNUSED(q);
         graph_input_staging.clear();
+        graph_input_staging_retired.clear();
+        graph_input_staging_swapped = false;
         graph_input_staging_generation++;
     }
 

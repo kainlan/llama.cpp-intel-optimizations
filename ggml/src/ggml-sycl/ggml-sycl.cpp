@@ -90275,6 +90275,26 @@ static void ggml_sycl_block_exec_dense_release(ggml_backend_sycl_context * ctx) 
     }
 }
 
+// Drops the dense range graphs of a context that has a dense state, draining first (drop_graphs). A context that
+// never ran the dense recorder has no state, and asking for one here must not make one.
+static void ggml_sycl_block_exec_dense_drop_graphs(ggml_backend_sycl_context * ctx) {
+#ifdef GGML_SYCL_GRAPH
+    ggml_sycl_block_exec_dense_state * state = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_sycl_block_exec_dense_states_mutex);
+        auto                        it = g_ggml_sycl_block_exec_dense_states.find(ctx);
+        if (it != g_ggml_sycl_block_exec_dense_states.end()) {
+            state = it->second.get();
+        }
+    }
+    if (state) {
+        state->drop_graphs(*ctx);
+    }
+#else
+    GGML_UNUSED(ctx);
+#endif
+}
+
 static uint64_t ggml_sycl_graph_signature(const ggml_cgraph * cgraph);
 
 // A decode graph: its first MUL_MAT multiplies a single row. The scan stops at
@@ -90759,10 +90779,16 @@ class ggml_sycl_block_exec_dense_run {
         if (any_missing &&
             !graph_prestage_or_decline(&ctx_, cgraph_, graph_prestage_decline_memo::dense_split_key(key))) {
             graphs_off_ = ggml_sycl::DENSE_GRAPH_OFF_STAGE_FAILED;
-            // A failed staging allocation may already have dropped an old staging buffer that a recorded range
-            // graph still reads, so no recorded range survives the decline.
+            // Conservative: a decline leaves no recorded range graph to be mistaken for a current one. A staging
+            // swap is retired at the gateway whether or not the pass declined.
             st.drop_graphs(ctx_);
             return;
+        }
+        if (st.graphs.size() != ranges_.size()) {
+            // The gateway retired every recorded graph (an input's staging buffer was replaced): record afresh.
+            st.graphs.resize(ranges_.size());
+            st.graphs_key             = key;
+            ctx_.input_tensors_cached = false;
         }
         split_lap(split_.key_us);
         // On a plan-cache hit that records nothing, copy only the inputs
@@ -98702,7 +98728,7 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
     ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
     if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
         // The graphlets would read a host-resident input inside a recording or a replay; the caller runs direct.
-        // Retire the recorded ones: a failed staging allocation may have dropped a buffer they still read.
+        // Conservative: retire the recorded ones so a declined graph leaves none to be mistaken for a current one.
         ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "stage-failed");
         sycl_ctx->invalidate_moe_block_graphs();
         return false;
@@ -99687,13 +99713,20 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
             // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
             // comment on graph_input_staging in common.hpp.
             void * dev_ptr = ctx->graph_input_stage(tensor, tensor->data, nbytes, q);
-            if (dev_ptr) {
-                staged_count++;
-                mark_staged(tensor);
-                GGML_SYCL_DEBUG("[GRAPH-PRESTAGE] INPUT staged %s tensor %s (data=%p, %zu bytes) -> dev %p\n",
-                                source_desc, tensor->name, tensor->data, nbytes, dev_ptr);
+            if (!dev_ptr) {
+                // Terminal for this pass. The cache and staging-cache paths below key on the tensor's current data
+                // address, which an INPUT does not keep across tokens, so a copy they made would not be the one a
+                // replay reads. Declining is the only honest answer.
+                GGML_LOG_WARN("[GRAPH-PRESTAGE] Failed to stage INPUT %s tensor %s (data=%p, %zu bytes)\n",
+                              source_desc, tensor->name, tensor->data, nbytes);
+                all_staged = false;
                 return;
             }
+            staged_count++;
+            mark_staged(tensor);
+            GGML_SYCL_DEBUG("[GRAPH-PRESTAGE] INPUT staged %s tensor %s (data=%p, %zu bytes) -> dev %p\n", source_desc,
+                            tensor->name, tensor->data, nbytes, dev_ptr);
+            return;
         }
 
         // Try unified cache first
@@ -99772,6 +99805,27 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
     return all_staged;
 }
 
+// An input's staging buffer was replaced because its size changed (graph_input_stage). Recorded work bakes the
+// staging POINTER, so every recorder that may hold the old one is retired here, in an order that drains before
+// anything is released: the dense range graphs (drop_graphs drains each device it ran on), then the MoE epochs
+// (each retire waits for its terminals), then the exec graph and the staging map through clear_active, which
+// waits on the stream before it releases the displaced handles. clear_active empties the staging map, so the
+// caller pre-stages again afterwards. The cost is one wait per size change, and a size change is already a
+// re-record (the graph signature mixes every shape), so it adds a wait and a pass, not a recording.
+static void graph_staging_swap_retire(ggml_backend_sycl_context * ctx) {
+    ctx->graph_input_staging_swapped = false;
+    if (ggml_sycl_graph_diag_enabled()) {
+        // The gap between two of these lines, in graph computes, is the swap rate (kq_mask steps every n_kv pad).
+        GGML_LOG_WARN("[GRAPH-DIAG] staging swap at graph compute %llu\n", (unsigned long long) ctx->graph_compute_seq);
+    }
+    ggml_sycl_block_exec_dense_drop_graphs(ctx);
+    ctx->invalidate_moe_segments();
+    ctx->invalidate_moe_block_graphs();
+    ctx->invalidate_moe_direct_dispatch_graphs();
+    ctx->invalidate_moe_sequence_graphs();
+    sycl_exec_graph_clear_active(ctx, "staging-swapped");
+}
+
 // Counts this token against a held decline (it MUTATES the memo): true means skip the pre-stage and run direct,
 // and the retry_after-th counted token forgets the decline and answers false so the pass is re-decided. A token
 // counts once per signature however many callers ask (graph_compute_seq is bumped once per graph_compute call).
@@ -99791,7 +99845,14 @@ static bool graph_prestage_or_decline(ggml_backend_sycl_context * ctx, const ggm
     if (graph_prestage_skip_declined(ctx, graph_hash)) {
         return false;
     }
-    if (graph_prestage_leaf_tensors(ctx, cgraph)) {
+    bool staged = graph_prestage_leaf_tensors(ctx, cgraph);
+    if (ctx->graph_input_staging_swapped) {
+        // An input's staging buffer was replaced (its size changed). Whether the pass then succeeded or declined,
+        // every recorded graph that baked the old pointer is stale.
+        graph_staging_swap_retire(ctx);
+        staged = staged && graph_prestage_leaf_tensors(ctx, cgraph);
+    }
+    if (staged) {
         ctx->prestage_decline_memo.forget(graph_hash);
         return true;
     }
@@ -100289,7 +100350,9 @@ static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const 
     // phase-boundary event (once per prompt/generation transition), never a
     // per-token hot path, so an explicit wait here does not touch the "no
     // host waits" performance rule that governs per-op dispatch.
-    if (ctx->exec_graph) {
+    // The retired staging handles are released below with the staging map, and a replay of ANY recorded graph
+    // may still be reading them, so they need the same wait as a live exec graph.
+    if (ctx->exec_graph || !ctx->graph_input_staging_retired.empty()) {
         ggml_sycl_trace_queue_wait(ctx->stream(), reason ? reason : "exec-graph-clear", ctx->device, -1, nullptr);
     }
     ctx->exec_graph.reset();
@@ -107961,8 +108024,13 @@ normal_dispatch:
                     // Fast path: replay cached segments + dispatch MoE ops
                     if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
                         // An input has no staged copy: the recorded segments would read the host one. Retire them
-                        // (a failed staging allocation may have dropped a buffer they still read) and run direct.
+                        // (conservative: a swap is retired at the gateway) and run direct.
                         sycl_ctx->invalidate_moe_segments();
+                        compute_impl_unlocked();
+                    } else if (!sycl_ctx->moe_segments_valid) {
+                        // The gateway swapped an input's staging buffer and retired the segments after the match
+                        // above was decided: there is nothing recorded to replay. Run this token direct; the next
+                        // one records afresh against the new buffer.
                         compute_impl_unlocked();
                     } else {
                         graph_refresh_input_tensors(sycl_ctx, cgraph);
@@ -108020,8 +108088,8 @@ normal_dispatch:
                             sycl_ctx->moe_graph_rerecord ? "MoE selective" : "rerecord_mode");
             // Decide whether the inputs can be staged before any teardown or attempt count. A declined graph runs
             // on the direct path, and the live exec graph is cleared through the one routine that waits for its
-            // last replay first: a failed staging allocation may already have dropped the buffer it reads, so
-            // keeping the graph would leave it replaying freed staging.
+            // last replay first (conservative: a staging swap is retired at the gateway, whether or not the pass
+            // declined, so this is not what keeps a replay off freed staging).
             if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
                 sycl_exec_graph_clear_active(sycl_ctx, "prestage-declined");
                 compute_impl_unlocked();
