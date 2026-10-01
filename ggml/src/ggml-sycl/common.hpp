@@ -6884,7 +6884,7 @@ struct ggml_backend_sycl_context {
         }
     } dequant_f16_src0_scratch{ "mul-mat-dequant-f16-src0" }, dequant_f16_src1_scratch{ "mul-mat-dequant-f16-src1" };
 
-    // One WARN-level line per planned scratch cohort and device that was used (uses, growths, capacity against the
+    // One WARN-level line per planned scratch cohort and device that was used (uses, allocs, capacity against the
     // plan, peak demand). Emitted once, at teardown, so a normal run proves the planned buffers were exercised.
     void log_planned_scratch_stats();
 

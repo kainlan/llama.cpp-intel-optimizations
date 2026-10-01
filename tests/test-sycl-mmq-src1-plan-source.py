@@ -404,7 +404,7 @@ if args.self_test:
                          "int unrelated = 0;"), common, cache, zone)),
         ("device scan to the maximum", "the walks scan the real device count, not the compile-time maximum",
          (mutate_in_func(backend, r"static bool ggml_sycl_mmq_src1_ensure_for_graph\(",
-                         "for (int d = 0; d < ggml_sycl_info().device_count", "for (int d = 0; d < GGML_SYCL_MAX_DEVICES"),
+                         "for (int d = 0; d < device_count;", "for (int d = 0; d < GGML_SYCL_MAX_DEVICES;"),
           common, cache, zone)),
         ("process-wide recording predicate", "no growth is attempted while this thread is recording a graph",
          (mutate_in_func(backend, r"static void \* ggml_sycl_planned_scratch_acquire\(",

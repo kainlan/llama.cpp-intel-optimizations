@@ -40215,8 +40215,8 @@ static bool ggml_backend_buffer_is_sycl_split(ggml_backend_buffer_t buffer) {
 
 // Whether `src0` lives in a row-split buffer and, if so, its tensor split. The op and the graph-entry walks of the
 // planned scratch buffers both need it, so the derivation exists once.
-static bool ggml_sycl_mul_mat_tensor_split(const ggml_tensor *                        src0,
-                                           std::array<float, GGML_SYCL_MAX_DEVICES> & tensor_split) {
+static bool ggml_sycl_mul_mat_src0_tensor_split(const ggml_tensor *                        src0,
+                                                std::array<float, GGML_SYCL_MAX_DEVICES> & tensor_split) {
     if (!src0->buffer || !ggml_backend_buffer_is_sycl_split(src0->buffer)) {
         return false;
     }
@@ -45626,6 +45626,10 @@ template <typename Scratch> static void ggml_sycl_planned_scratch_pin(Scratch & 
     const uint64_t              token   = ggml_sycl::graph_retention_token();
     const uint64_t              backing = handle.owner_control_id();
     planned_scratch_stats &     stats   = buffer.stats(device);
+    // token == 0 means this thread is recording with no sink attached. That is not an error to assert on (an assert
+    // in an allocation path turns a missed dedupe into an abort): retain_handles_until_event() routes such a handle to
+    // the process-wide graph-lifetime list, which is the conservative home, so the pin is simply repeated each time
+    // because there is no attachment to remember it against.
     if (token != 0 && stats.pinned_token == token && stats.pinned_backing == backing) {
         return;
     }
@@ -46903,7 +46907,7 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
     if (split) {
         // TODO: check that src0->buffer->buft is a split buffer type, replace GGML_BACKEND_TYPE_GPU_SPLIT check
         // GGML_ASSERT(src0->buffer != nullptr && src0->buffer->buft == ...);
-        const bool is_split_buffer = ggml_sycl_mul_mat_tensor_split(src0, tensor_split);
+        const bool is_split_buffer = ggml_sycl_mul_mat_src0_tensor_split(src0, tensor_split);
         GGML_ASSERT(is_split_buffer);
     }
 
@@ -98985,9 +98989,18 @@ static bool ggml_sycl_mul_mat_kernel_quantizes_src1(ggml_sycl_mul_mat_kernel ker
 // question with the same arguments inside a quiet scope (it would otherwise repeat the "kernel not eligible"
 // WARNs the dispatch logs for the same node): a node the router sends to the unified or oneDNN kernel never
 // touches this buffer, so counting it would reserve RUNTIME-zone bytes nothing draws and could refuse a graph whose
-// real route needs none. A multi-row node is counted only when the router picks a kernel that quantizes src1; a
-// single-row (decode) node is counted without asking, which keeps the walk off the token-generation hot path, and
-// its demand is the smallest the buffer ever sees.
+// real route needs none. A multi-row node is counted only when the router picks a kernel that quantizes src1.
+//
+// A single-row (decode) node is counted WITHOUT asking the router, and that is the dispatch's shape, not a shortcut:
+// the TG fast path in the mul_mat dispatch (the GGML_SYCL_TG_FAST block, batch == 1, quantized, single device) runs
+// MMVQ and draws its src1 from this buffer before the orchestrator is ever consulted, so the router is the wrong
+// authority for decode. Do not "optimise" decode back to asking it; that would also put a router call per node on
+// the token-generation hot path.
+//
+// The router is not the dispatch's whole decision: select() does not see GGML_SYCL_UNIFIED_FORCE_LEGACY or the
+// runtime decline for an unresolved weight pointer, so the dispatch's re-select with allow_unified=false can land
+// on a legacy kernel this walk did not count. That case is loud, not silent: the op's in-op growth WARN fires and an
+// underestimate is recorded.
 //
 // The demand is read from the graph's own quantized MUL_MAT nodes, keyed on op identity, not inferred from tensor
 // shapes in the inventory, so a dense 3-D operand (MLA wk_b / wv_b: nrows1 = n_tokens * n_head) is counted exactly
@@ -99015,6 +99028,11 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
     device_demand_t                    demand[GGML_SYCL_MAX_DEVICES];
     bool                               saw_dense_node = false;
     const ggml_sycl_select_quiet_scope quiet_router;
+    // Declared once: the node loop below runs on every graph, decode included. The split is read only for a weight in
+    // a split buffer. The device count is the op's own matmul_device_count.
+    std::array<float, GGML_SYCL_MAX_DEVICES> tensor_split{};
+    const int                                device_count =
+        std::min<int>(std::max(ggml_sycl_info().device_count, ctx.device + 1), GGML_SYCL_MAX_DEVICES);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT) {
@@ -99024,6 +99042,9 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
         const ggml_tensor * src1 = node->src[1];
         if (!src0 || !src1 || !ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32) {
             continue;
+        }
+        if (ggml_nrows(src1) <= 0) {
+            continue;  // no rows, no demand (and not an "overflowed" one)
         }
         const bool decode = ggml_nrows(src1) <= 1;
         if (!decode) {
@@ -99047,11 +99068,10 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
                            (long long) src1->ne[0]);
             return false;
         }
-        std::array<float, GGML_SYCL_MAX_DEVICES> tensor_split{};
-        const bool                               split   = ggml_sycl_mul_mat_tensor_split(src0, tensor_split);
-        const int                                d_begin = split ? 0 : ctx.device;
-        const int d_end = split ? std::min<int>(ggml_sycl_info().device_count, GGML_SYCL_MAX_DEVICES) : ctx.device + 1;
-        for (int d = d_begin; d < d_end && d < GGML_SYCL_MAX_DEVICES; ++d) {
+        const bool split   = ggml_sycl_mul_mat_src0_tensor_split(src0, tensor_split);
+        const int  d_begin = split ? 0 : ctx.device;
+        const int  d_end   = split ? device_count : ctx.device + 1;
+        for (int d = d_begin; d < d_end; ++d) {
             int64_t row_low  = 0;
             int64_t row_high = 0;
             ggml_sycl_mul_mat_device_rows(src0, split, tensor_split, d, &row_low, &row_high);
@@ -99071,7 +99091,7 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
     if (!saw_dense_node) {
         return true;
     }
-    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+    for (int d = 0; d < device_count; ++d) {
         if (!demand[d].counted) {
             continue;
         }
@@ -99122,6 +99142,10 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
 
     device_demand_t                    demand[GGML_SYCL_MAX_DEVICES];
     const ggml_sycl_select_quiet_scope quiet_router;
+    // Declared once, as in the Q8 walk: the node loop runs on every graph.
+    std::array<float, GGML_SYCL_MAX_DEVICES> tensor_split{};
+    const int                                device_count =
+        std::min<int>(std::max(ggml_sycl_info().device_count, ctx.device + 1), GGML_SYCL_MAX_DEVICES);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT) {
@@ -99161,11 +99185,10 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
                 (long long) ggml_nrows(src1));
             return false;
         }
-        std::array<float, GGML_SYCL_MAX_DEVICES> tensor_split{};
-        const bool                               split   = ggml_sycl_mul_mat_tensor_split(src0, tensor_split);
-        const int                                d_begin = split ? 0 : ctx.device;
-        const int d_end = split ? std::min<int>(ggml_sycl_info().device_count, GGML_SYCL_MAX_DEVICES) : ctx.device + 1;
-        for (int d = d_begin; d < d_end && d < GGML_SYCL_MAX_DEVICES; ++d) {
+        const bool split   = ggml_sycl_mul_mat_src0_tensor_split(src0, tensor_split);
+        const int  d_begin = split ? 0 : ctx.device;
+        const int  d_end   = split ? device_count : ctx.device + 1;
+        for (int d = d_begin; d < d_end; ++d) {
             int64_t row_low  = 0;
             int64_t row_high = 0;
             ggml_sycl_mul_mat_device_rows(src0, split, tensor_split, d, &row_low, &row_high);
@@ -99187,7 +99210,7 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         bool                                               is_src1;
     };
 
-    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+    for (int d = 0; d < device_count; ++d) {
         const dequant_buffer_t buffers[] = {
             { ctx.dequant_f16_src0_scratch, demand[d].src0_bytes, "src0", false },
             { ctx.dequant_f16_src1_scratch, demand[d].src1_bytes, "src1", true  },
