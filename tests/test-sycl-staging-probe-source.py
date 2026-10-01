@@ -48,7 +48,16 @@ def violations(text: str) -> list:
     # discriminate where a hang lives run before the cross-context dependency.
     if "_Exit(1)" not in code or "FAIL: HANG at %s" not in code:
         out.append("no step watchdog that names the hung step and leaves with _Exit(1)")
-    controls = ["control_g_gate_alone", "control_i_leg1_alone", "control_ii_leg2_alone",
+    # G0's first probe held leg 1 behind a kernel spinning on a host-USM word the host wrote, and the gate never
+    # opened: discrete Battlemage has no usm_atomic_host_allocations, so a device poll of a host-written word
+    # (and a host read of a device-written one) has no visibility guarantee. The hold is a calibrated busy
+    # kernel, and nothing in the code polls a flag.
+    if re.search(r"\bvolatile\b", code) or re.search(r"while\s*\(\s*\*", code):
+        out.append("a device or host loop polls a memory word (volatile or while(*flag)); the hold must be the "
+                   "calibrated busy kernel")
+    if "submit_busy(" not in code or "k_target_busy_ms" not in code or "staging_probe_classify(busy_ms" not in code:
+        out.append("the hold is not the calibrated busy kernel read against its measured time")
+    controls = ["control_g_busy_alone", "control_i_leg1_alone", "control_ii_leg2_alone",
                 "control_iv_host_wait_between", "iii_leg2_submit"]
     at = [code.find('"%s"' % name) for name in controls]
     if min(at) < 0:
@@ -79,6 +88,10 @@ def mutants_of(text: str) -> dict:
         "watchdog does not exit": replace_last(text, "_Exit(1);", "std::fflush(stdout);"),
         "dependency step before the controls": text.replace(
             "namespace {", 'const char * k_early = "iii_leg2_submit";\nnamespace {', 1),
+        "polling gate re-introduced": replace_last(
+            text, "x ^= x >> 13;", "x ^= x >> 13;\n                volatile int * flag = nullptr;\n"
+            "                while (*flag == 0) {\n                }"),
+        "hold no longer the calibrated kernel": text.replace("k_target_busy_ms", "k_busy"),
         "no physical count": replace_last(text, "ggml_sycl::test_physical_device_count()", "2"),
     }
 

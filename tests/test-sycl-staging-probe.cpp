@@ -7,44 +7,45 @@
 // design takes no host wait on the staging dependency, so "returns before" keeps the legs as written and
 // "blocks" switches leg 2 to the device-marker form.
 //
-// Control. A submit that returns quickly proves nothing if leg 1 was already done, so leg 1 is held in
-// flight:
-//   * leg 1 is submitted behind a gate kernel on the source queue that spins on a host-USM release flag;
-//   * the host sets the flag only after leg 2's submit has returned OR 2 s have passed (a watchdog
-//     thread owns that decision, so a blocking submit cannot keep the gate shut forever);
-//   * a marker kernel, chained behind leg 1 on the source queue, writes a host-USM flag when leg 1 has
-//     completed. The marker is a device write, never a status query: event status is not trusted here.
-// A submit that returns while the gate holds (marker unset, release not yet sent) is "returns_before";
-// a submit that returns only after the 2 s release is "blocks" (a set marker then is expected: leg 1
-// finished once the gate opened); a marker already set while the release has NOT been sent is "void"
-// (the gate did not hold) and proves nothing. The classification is staging_probe_classify() in
-// sycl-staging-probe-verdict.h, which test-sycl-staging-probe-verdict drives over its whole table.
+// Control. A submit that returns quickly proves nothing if leg 1 was already done, so leg 1 is held behind a
+// CALIBRATED BUSY KERNEL on the source queue: pure device arithmetic, sized by a warm-up run inside the probe
+// to about k_target_busy_ms of measured run time (the probe prints busy_iters and the measured busy_ms).
+// Leg 1 depends on it in order on the same queue, so leg 1 cannot complete before about busy_ms. The probe
+// then reads three host clocks from the busy kernel's submit: when leg 2's submit returned (return_ms) and
+// when leg 2 had completed (done_ms), against busy_ms. The classification is staging_probe_classify() in
+// sycl-staging-probe-verdict.h, driven over its whole table by test-sycl-staging-probe-verdict, with its
+// thresholds printed in the result line.
+//
+// Nothing here polls a word the host writes, and the host never reads a word a device wrote: discrete
+// Battlemage has no usm_atomic_host_allocations, so neither direction has a visibility guarantee (G0's first
+// probe held leg 1 behind a gate kernel spinning on a host-USM release flag, and the gate never opened). A
+// "must-fire" control is a kernel of known duration the host waits on, never a host-released gate.
 //
 // The queues are the backend's own, not queues this test constructs: the owner's is the exposed device 0's
 // ggml_backend_sycl_context::stream(), the call the SET_ROWS stage makes, and the source's is
 // ggml_sycl::get_shared_context_queue(1), the per-device single-device-context queue the MoE and split paths
 // use for a secondary card, created in this process by ggml_sycl::init_shared_context_queues() (the call
-// those paths make; nothing else creates them, so a bare get returns null). Neither path builds a multi-device Level Zero context, which is the DEVICE_LOST
-// risk on compute-runtime 26.x. The scheduler exposes only device 0 by default ("Multi-GPU: exposing only
-// device 0 to scheduler"), so ggml_backend_sycl_get_device_count() is 1 on a two-card host and
-// ggml_backend_sycl_init(1) is not available: the probe counts PHYSICAL devices through
-// ggml_sycl::test_physical_device_count() (the backend's total_gpu_count), never the scheduler-visible
-// count; tests/test-sycl-staging-probe-source.py pins that. Every buffer is a
-// unified_allocate() allocation held by a mem_handle that is released before either backend is freed.
-// The gate's host-USM flags are probe code, not a design path.
+// those paths make; nothing else creates them, so a bare get returns null). Neither path builds a
+// multi-device Level Zero context, which is the DEVICE_LOST risk on compute-runtime 26.x. The scheduler
+// exposes only device 0 by default ("Multi-GPU: exposing only device 0 to scheduler"), so
+// ggml_backend_sycl_get_device_count() is 1 on a two-card host and ggml_backend_sycl_init(1) is not
+// available: the probe counts PHYSICAL devices through ggml_sycl::test_physical_device_count() (the
+// backend's total_gpu_count), never the scheduler-visible count; tests/test-sycl-staging-probe-source.py
+// pins that. Every buffer is a unified_allocate() allocation held by a mem_handle that is released before
+// the backend is freed.
 //
-// Bounded steps and controls. A cross-context depends_on can hang on this stack (G0: the submit's host task
+// Bounded steps and controls. A cross-context depends_on can hang on this stack (the submit's host task
 // waits on a foreign-context event that never signals), so every step runs under a deadline enforced by a
 // watchdog thread that prints "FAIL: HANG at <step>" and leaves with _Exit(1); stdout is unbuffered and each
-// step prints begin/end lines. The controls run first, each bounded, in an order that puts the one that can
-// hang last: g (the gate alone: the host releases it and it must finish), i (leg 1 alone, its own event
-// waited), ii (leg 2 alone), iv (the dependency as a host wait between the legs, a CONTROL only: production
-// takes no host wait), then iii, the cross-context depends_on under the gate. If i hangs the defect is leg 1
-// itself, not the dependency; if g hangs the gate cannot hold-then-release and iii proves nothing.
+// step prints begin/end lines. After calibration the controls run, each bounded, with the one that can hang
+// last: g (the busy kernel alone completes within 2x and at least half of its calibrated time), i (leg 1
+// alone, its own event waited), ii (leg 2 alone), iv (the dependency as a host wait between the legs, a
+// CONTROL only: production takes no host wait), then iii, the cross-context depends_on behind the busy
+// kernel. If i hangs the defect is leg 1 itself, not the dependency.
 //
 // Exit codes: 0 for returns_before and for blocks (both are pre-registered outcomes the lead records),
-// 1 for void or a setup failure, 77 when fewer than two PHYSICAL SYCL devices are held (counted with
-// ggml_sycl::test_physical_device_count() before any backend init).
+// 1 for void, undecided, a failed control or a setup failure, 77 when fewer than two PHYSICAL SYCL devices
+// are held (counted with ggml_sycl::test_physical_device_count() before any backend init).
 //
 // GPU binaries in this fork are run only from the lead session, one at a time (CLAUDE.md). The default
 // selector below pins the two discrete cards; the iGPU is never enumerated.
@@ -71,14 +72,14 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
 namespace {
 
-constexpr size_t   k_bytes            = 1u << 20;
-constexpr uint64_t k_gate_spin_cap    = 1ull << 32;  // a hang guard only: the host always releases first
-constexpr int      k_release_after_ms = 2000;
+constexpr size_t k_bytes          = 1u << 20;
+constexpr double k_target_busy_ms = 400.0;
 
 struct probe_buffer {
     ggml_sycl::mem_handle handle;
@@ -146,6 +147,33 @@ struct step_scope {
 
 constexpr int k_step_budget_ms = 20000;
 
+// Microseconds on the steady clock, for the busy-kernel timing.
+long long now_ms_precise() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Pure device arithmetic with a loop-carried non-affine dependence (no closed form for the compiler to take),
+// its result stored so the loop is live. One work item, `iters` rounds.
+sycl::event submit_busy(sycl::queue & q, uint32_t * sink, uint64_t iters) {
+    return q.submit([&](sycl::handler & h) {
+        h.single_task([=]() {
+            uint32_t x = 1;
+            for (uint64_t i = 0; i < iters; ++i) {
+                x = x * 1664525u + 1013904223u;
+                x ^= x >> 13;
+            }
+            sink[0] = x;
+        });
+    });
+}
+
+double busy_ms_of(sycl::queue & q, uint32_t * sink, uint64_t iters) {
+    const long long t0 = now_ms_precise();
+    submit_busy(q, sink, iters).wait();
+    return static_cast<double>(now_ms_precise() - t0) / 1000.0;
+}
+
 }  // namespace
 
 int main(int, char ** argv) {
@@ -192,30 +220,24 @@ int main(int, char ** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::thread(step_watchdog_main).detach();
 
-    int  rc          = 1;
-    char verdict[32] = "";
+    int rc = 1;
     {
         // The handles live in this block, so every buffer is released before the backend is freed.
         probe_buffer src_dev;
         probe_buffer bounce;
         probe_buffer dst_dev;
-        probe_buffer flags;  // release, marker
+        probe_buffer sink;  // the busy kernel's result word, on the source device
         const bool   ok = alloc_probe_buffer(src_dev, q_source, 1, k_bytes, false) &&
                         alloc_probe_buffer(bounce, q_source, 1, k_bytes, true) &&
                         alloc_probe_buffer(dst_dev, q_owner, 0, k_bytes, false) &&
-                        alloc_probe_buffer(flags, q_source, 1, 64, true);
+                        alloc_probe_buffer(sink, q_source, 1, 64, false);
         if (!ok) {
             std::printf("FAIL: could not allocate the probe's buffers through unified_allocate\n");
         } else {
-            // Two ints in host USM: the release flag the gate spins on and the marker leg 1's completion
-            // sets.
-            int *          release_dev = static_cast<int *>(flags.ptr);
-            int *          marker_dev  = release_dev + 1;
-            volatile int * release     = release_dev;
-            volatile int * marker      = marker_dev;
-            void *         src_ptr     = src_dev.ptr;
-            void *         bounce_ptr  = bounce.ptr;
-            void *         dst_ptr     = dst_dev.ptr;
+            void *     src_ptr    = src_dev.ptr;
+            void *     bounce_ptr = bounce.ptr;
+            void *     dst_ptr    = dst_dev.ptr;
+            uint32_t * sink_ptr   = static_cast<uint32_t *>(sink.ptr);
 
             // Which context knows which pointer: a host-USM bounce allocated in one context and copied from
             // on a queue of the other is the first suspect for a leg that never completes.
@@ -224,11 +246,10 @@ int main(int, char ** argv) {
             };
             std::printf(
                 "[SYCL-STAGING-PROBE] contexts same=%d pointer_type(owner_ctx,source_ctx) "
-                "src_dev=(%d,%d) bounce=(%d,%d) dst_dev=(%d,%d) flags=(%d,%d) (0 host, 1 device, 2 shared, 3 "
-                "unknown)\n",
+                "src_dev=(%d,%d) bounce=(%d,%d) dst_dev=(%d,%d) (0 host, 1 device, 2 shared, 3 unknown)\n",
                 q_owner.get_context() == q_source.get_context() ? 1 : 0, kind(src_ptr, q_owner),
                 kind(src_ptr, q_source), kind(bounce_ptr, q_owner), kind(bounce_ptr, q_source), kind(dst_ptr, q_owner),
-                kind(dst_ptr, q_source), kind(release_dev, q_owner), kind(release_dev, q_source));
+                kind(dst_ptr, q_source));
 
             // Runs `fn` as a bounded step. A throw is a step failure, not a crash; a hang is the watchdog's.
             const auto run_step = [&](const char * name, const std::function<void()> & fn) {
@@ -250,172 +271,149 @@ int main(int, char ** argv) {
             };
             bool controls_ok = true;
 
-            // Control g: the gate alone. The host sets the release flag after 100 ms and the gate kernel must
-            // finish; if it does not, the gate cannot hold-then-release and nothing below it is readable.
-            controls_ok &= run_step("control_g_gate_alone", [&]() {
-                *release               = 0;
-                sycl::event gate_alone = q_source.submit([&](sycl::handler & h) {
-                    h.single_task([=]() {
-                        volatile int * flag = release_dev;
-                        uint64_t       n    = 0;
-                        while (*flag == 0 && n < k_gate_spin_cap) {
-                            ++n;
-                        }
-                    });
-                });
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                *release = 1;
-                gate_alone.wait();
-            });
-
-            // Control i: leg 1 alone, no dependency, waited on its own event.
-            controls_ok &= run_step("control_i_leg1_alone", [&]() {
-                sycl::event e = q_source.submit([&](sycl::handler & h) { h.memcpy(bounce_ptr, src_ptr, k_bytes); });
-                e.wait();
-            });
-
-            // Control ii: leg 2 alone, no dependency.
-            controls_ok &= run_step("control_ii_leg2_alone", [&]() {
-                sycl::event e = q_owner.submit([&](sycl::handler & h) { h.memcpy(dst_ptr, bounce_ptr, k_bytes); });
-                e.wait();
-            });
-
-            // Control iv: the dependency expressed as a host wait, leg 1 done before leg 2 is submitted. A
-            // CONTROL only: production takes no host wait. It is run before iii because iii can hang.
-            controls_ok &= run_step("control_iv_host_wait_between", [&]() {
-                sycl::event l1 = q_source.submit([&](sycl::handler & h) { h.memcpy(bounce_ptr, src_ptr, k_bytes); });
-                l1.wait();
-                sycl::event l2 = q_owner.submit([&](sycl::handler & h) { h.memcpy(dst_ptr, bounce_ptr, k_bytes); });
-                l2.wait();
-            });
-
-            // Experiment iii: the cross-context depends_on, with leg 1 held in flight behind the gate.
-            *release = 0;
-            *marker  = 0;
-            sycl::event gate;
-            sycl::event leg1;
-            sycl::event marked;
-            bool        setup_threw = false;
-            {
-                step_scope scope("iii_submit_gate_leg1_marker", k_step_budget_ms);
-                try {
-                    // The gate: holds the source queue until the host releases it.
-                    gate   = q_source.submit([&](sycl::handler & h) {
-                        h.single_task([=]() {
-                            volatile int * flag = release_dev;
-                            uint64_t       n    = 0;
-                            while (*flag == 0 && n < k_gate_spin_cap) {
-                                ++n;
-                            }
-                        });
-                    });
-                    // Leg 1 behind the gate, then the marker behind leg 1.
-                    leg1   = q_source.submit([&](sycl::handler & h) {
-                        h.depends_on(gate);
-                        h.memcpy(bounce_ptr, src_ptr, k_bytes);
-                    });
-                    marked = q_source.submit([&](sycl::handler & h) {
-                        h.depends_on(leg1);
-                        h.single_task([=]() {
-                            // The host reads this flag without a queue operation, so make leg 1's copy
-                            // visible to the system before the flag is (design row 113's marker form).
-                            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                            *reinterpret_cast<volatile int *>(marker_dev) = 1;
-                        });
-                    });
-                } catch (const std::exception & ex) {
-                    setup_threw = true;
-                    std::printf("FAIL: the gate/leg 1/marker submit threw: %s\n", ex.what());
-                }
-            }
-
-            if (!setup_threw) {
-                // The watchdog owns the release: after leg 2's submit returned, or k_release_after_ms,
-                // whichever is first. `release_sent` is set before the flag is written, so a reading of it
-                // at leg 2's return can only be true when the timeout fired first.
-                std::atomic<bool> leg2_returned{ false };
-                std::atomic<bool> release_sent{ false };
-                std::thread       releaser([&]() {
-                    const auto start = std::chrono::steady_clock::now();
-                    while (!leg2_returned.load(std::memory_order_acquire)) {
-                        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                std::chrono::steady_clock::now() - start)
-                                                .count();
-                        if (waited >= k_release_after_ms) {
-                            release_sent.store(true, std::memory_order_release);
-                            break;
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // Calibration: a first tiny run builds the kernel, then the iteration count is scaled twice
+            // from measured run times so the busy kernel runs about k_target_busy_ms. The last measured time
+            // is the reference every verdict reading is held against.
+            uint64_t   busy_iters = 1u << 22;
+            double     busy_ms    = 0.0;
+            const bool calibrated = run_step("calibrate_busy_kernel", [&]() {
+                (void) busy_ms_of(q_source, sink_ptr, 1000);  // compile and first launch
+                for (int round = 0; round < 3; ++round) {
+                    busy_ms = busy_ms_of(q_source, sink_ptr, busy_iters);
+                    std::printf("[SYCL-STAGING-PROBE] calibrate round=%d busy_iters=%llu busy_ms=%.3f\n", round,
+                                static_cast<unsigned long long>(busy_iters), busy_ms);
+                    if (busy_ms < 0.001) {
+                        throw std::runtime_error("the busy kernel measured no run time");
                     }
-                    *release = 1;
+                    if (round < 2) {
+                        double scale = k_target_busy_ms / busy_ms;
+                        scale        = scale < 1.0 / 4096.0 ? 1.0 / 4096.0 : (scale > 4096.0 ? 4096.0 : scale);
+                        busy_iters   = static_cast<uint64_t>(static_cast<double>(busy_iters) * scale);
+                        if (busy_iters < 1000) {
+                            busy_iters = 1000;
+                        }
+                    }
+                }
+                if (busy_ms < 0.5 * k_target_busy_ms || busy_ms > 2.0 * k_target_busy_ms) {
+                    throw std::runtime_error("the busy kernel did not calibrate near its target");
+                }
+            });
+            controls_ok &= calibrated;
+            if (!calibrated) {
+                std::printf("FAIL: calibration failed, so no hold can be sized\n");
+            } else {
+                // Control g: the busy kernel alone, the host waiting on its event (the must-fire control).
+                controls_ok &= run_step("control_g_busy_alone", [&]() {
+                    const double ms = busy_ms_of(q_source, sink_ptr, busy_iters);
+                    std::printf("[SYCL-STAGING-PROBE] control_g busy_ms=%.3f calibrated_ms=%.3f\n", ms, busy_ms);
+                    if (ms > 2.0 * busy_ms || ms < 0.5 * busy_ms) {
+                        throw std::runtime_error("the busy kernel's run time left [0.5x, 2x] of its calibration");
+                    }
                 });
 
-                // Leg 2 depends on leg 1; the thing under test is how long this submit takes to return. A
-                // throw out of the submit must not unwind past the joinable releaser thread
-                // (std::terminate): it is caught, the releaser is joined, and the run is a probe failure.
-                // A submit that never returns is the step watchdog's: "FAIL: HANG at iii_leg2_submit".
+                // Control i: leg 1 alone, no dependency, waited on its own event.
+                controls_ok &= run_step("control_i_leg1_alone", [&]() {
+                    sycl::event e = q_source.submit([&](sycl::handler & h) { h.memcpy(bounce_ptr, src_ptr, k_bytes); });
+                    e.wait();
+                });
+
+                // Control ii: leg 2 alone, no dependency.
+                controls_ok &= run_step("control_ii_leg2_alone", [&]() {
+                    sycl::event e = q_owner.submit([&](sycl::handler & h) { h.memcpy(dst_ptr, bounce_ptr, k_bytes); });
+                    e.wait();
+                });
+
+                // Control iv: the dependency as a host wait, leg 1 done before leg 2 is submitted. A CONTROL
+                // only: production takes no host wait. Run before iii because iii can hang.
+                controls_ok &= run_step("control_iv_host_wait_between", [&]() {
+                    sycl::event l1 =
+                        q_source.submit([&](sycl::handler & h) { h.memcpy(bounce_ptr, src_ptr, k_bytes); });
+                    l1.wait();
+                    sycl::event l2 = q_owner.submit([&](sycl::handler & h) { h.memcpy(dst_ptr, bounce_ptr, k_bytes); });
+                    l2.wait();
+                });
+
+                // Experiment iii: leg 1 held behind the busy kernel, leg 2 depending on it across contexts.
+                // Readings are host clocks from the busy kernel's submit.
+                sycl::event busy_event;
+                sycl::event leg1;
                 sycl::event leg2;
-                bool        submit_threw = false;
-                std::string submit_error;
-                const auto  t0 = std::chrono::steady_clock::now();
+                bool        setup_threw = false;
+                const auto  t0          = std::chrono::steady_clock::now();
+                const auto  since_t0    = [&]() {
+                    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                };
                 {
-                    step_scope scope("iii_leg2_submit", k_step_budget_ms);
+                    step_scope scope("iii_submit_busy_and_leg1", k_step_budget_ms);
                     try {
-                        leg2 = q_owner.submit([&](sycl::handler & h) {
-                            h.depends_on(leg1);
-                            h.memcpy(dst_ptr, bounce_ptr, k_bytes);
+                        busy_event = submit_busy(q_source, sink_ptr, busy_iters);
+                        leg1       = q_source.submit([&](sycl::handler & h) {
+                            h.depends_on(busy_event);
+                            h.memcpy(bounce_ptr, src_ptr, k_bytes);
                         });
                     } catch (const std::exception & ex) {
-                        submit_threw = true;
-                        submit_error = ex.what();
-                    } catch (...) {
-                        submit_threw = true;
-                        submit_error = "non-standard exception";
+                        setup_threw = true;
+                        std::printf("FAIL: the busy kernel / leg 1 submit threw: %s\n", ex.what());
                     }
                 }
-                const auto t1                = std::chrono::steady_clock::now();
-                const int  marker_at_return  = *marker;
-                const bool release_at_return = release_sent.load(std::memory_order_acquire);
-                leg2_returned.store(true, std::memory_order_release);
-                releaser.join();
-
-                // Everything drains before the buffers go, each wait a named bounded step.
-                bool drained = true;
-                try {
+                if (!setup_threw) {
+                    // A hang in this submit is the step watchdog's: "FAIL: HANG at iii_leg2_submit".
+                    bool        submit_threw = false;
+                    std::string error;
+                    {
+                        step_scope scope("iii_leg2_submit", k_step_budget_ms);
+                        try {
+                            leg2 = q_owner.submit([&](sycl::handler & h) {
+                                h.depends_on(leg1);
+                                h.memcpy(dst_ptr, bounce_ptr, k_bytes);
+                            });
+                        } catch (const std::exception & ex) {
+                            submit_threw = true;
+                            error        = ex.what();
+                        } catch (...) {
+                            submit_threw = true;
+                            error        = "non-standard exception";
+                        }
+                    }
+                    const double return_ms = since_t0();
+                    double       done_ms   = -1.0;
+                    bool         drained   = !submit_threw;
                     if (!submit_threw) {
-                        step_scope scope("iii_wait_leg2", k_step_budget_ms);
-                        leg2.wait();
+                        try {
+                            {
+                                step_scope scope("iii_wait_leg2", k_step_budget_ms);
+                                leg2.wait();
+                            }
+                            done_ms = since_t0();
+                            {
+                                step_scope scope("iii_wait_queues", k_step_budget_ms);
+                                q_source.wait();
+                                q_owner.wait();
+                            }
+                        } catch (const std::exception & ex) {
+                            drained = false;
+                            error   = ex.what();
+                        } catch (...) {
+                            drained = false;
+                            error   = "non-standard exception";
+                        }
                     }
-                    {
-                        step_scope scope("iii_wait_marker", k_step_budget_ms);
-                        marked.wait();
+                    if (submit_threw || !drained) {
+                        std::printf("FAIL: the probe's %s threw: %s\n", submit_threw ? "leg 2 submit" : "drain",
+                                    error.c_str());
+                    } else {
+                        const staging_probe_verdict v = staging_probe_classify(busy_ms, return_ms, done_ms);
+                        std::printf(
+                            "[SYCL-STAGING-PROBE] leg2_submit=%s busy_ms=%.3f return_ms=%.3f done_ms=%.3f "
+                            "thresholds(returns_before<%.2f blocks>=%.2f void_done<%.2f of busy_ms) controls_ok=%d\n",
+                            staging_probe_verdict_name(v), busy_ms, return_ms, done_ms,
+                            k_staging_probe_returns_before_frac, k_staging_probe_blocks_frac,
+                            k_staging_probe_void_done_frac, controls_ok ? 1 : 0);
+                        rc = ((v == staging_probe_verdict::RETURNS_BEFORE || v == staging_probe_verdict::BLOCKS) &&
+                              controls_ok) ?
+                                 0 :
+                                 1;
                     }
-                    {
-                        step_scope scope("iii_wait_queues", k_step_budget_ms);
-                        q_source.wait();
-                        q_owner.wait();
-                    }
-                } catch (const std::exception & ex) {
-                    drained      = false;
-                    submit_error = ex.what();
-                } catch (...) {
-                    drained      = false;
-                    submit_error = "non-standard exception";
-                }
-
-                if (submit_threw || !drained) {
-                    std::printf("FAIL: the probe's %s threw: %s\n", submit_threw ? "leg 2 submit" : "drain",
-                                submit_error.c_str());
-                } else {
-                    const double                submit_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                    const staging_probe_verdict v =
-                        staging_probe_classify(marker_at_return != 0, release_at_return, true);
-                    std::snprintf(verdict, sizeof(verdict), "%s", staging_probe_verdict_name(v));
-                    std::printf(
-                        "[SYCL-STAGING-PROBE] leg2_submit=%s submit_ms=%.3f marker_at_return=%d "
-                        "release_sent_at_return=%d controls_ok=%d\n",
-                        verdict, submit_ms, marker_at_return, release_at_return ? 1 : 0, controls_ok ? 1 : 0);
-                    rc = (v == staging_probe_verdict::VOID || !controls_ok) ? 1 : 0;
                 }
             }
         }
