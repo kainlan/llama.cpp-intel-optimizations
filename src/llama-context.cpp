@@ -13,6 +13,7 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-measure-plan.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -2481,7 +2482,44 @@ sched_reserve_result llama_context::sched_measure_impl(sched_reserve_state & sta
     plan.graphs.clear();
     plan.bufts.clear();
 
-    for (size_t gi = 0; gi < graphs.size(); ++gi) {
+    // Two backends of one buffer type share an allocator and report the same layout, so each buffer type
+    // is read once per graph.
+    std::string layout_failure;
+
+    auto read_layout = [&](size_t gi) -> bool {
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            sched_measure_buft * entry = nullptr;
+            for (auto & e : plan.bufts) {
+                if (e.buft == backend_buft[i]) {
+                    entry = &e;
+                    break;
+                }
+            }
+            if (entry == nullptr) {
+                plan.bufts.emplace_back();
+                entry       = &plan.bufts.back();
+                entry->buft = backend_buft[i];
+            }
+            if (entry->peaks.size() > gi) {
+                continue;
+            }
+
+            size_t    max_chunk_size = 0;
+            const int n_chunks       = ggml_backend_sched_get_reserved_chunk_peaks(state.sched.get(), backend_ptrs[i],
+                                                                                   peak.data(), max_chunks, &max_chunk_size);
+            if (gi > 0 && max_chunk_size != entry->max_chunk_size) {
+                layout_failure =
+                    format("the chunk size of %s changed between measured graphs", ggml_backend_buft_name(entry->buft));
+                return false;
+            }
+            entry->max_chunk_size = max_chunk_size;
+            entry->peaks.emplace_back(peak.begin(), peak.begin() + std::max(0, std::min(n_chunks, max_chunks)));
+        }
+        return true;
+    };
+
+    size_t gi = 0;
+    for (; gi < graphs.size(); ++gi) {
         const llama_measure_graph & g = graphs[gi];
 
         state.cparams.embeddings = g.embeddings;
@@ -2509,35 +2547,29 @@ sched_reserve_result llama_context::sched_measure_impl(sched_reserve_state & sta
             return { sched_reserve_status::FAILED, format("failed to measure graph %zu of %zu", gi, graphs.size()) };
         }
 
-        // Two backends of one buffer type share an allocator and report the same layout, so
-        // each buffer type is read once per graph.
-        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            sched_measure_buft * entry = nullptr;
-            for (auto & e : plan.bufts) {
-                if (e.buft == backend_buft[i]) {
-                    entry = &e;
-                    break;
-                }
-            }
-            if (entry == nullptr) {
-                plan.bufts.emplace_back();
-                entry       = &plan.bufts.back();
-                entry->buft = backend_buft[i];
-            }
-            if (entry->peaks.size() > gi) {
-                continue;
-            }
-
-            size_t    max_chunk_size = 0;
-            const int n_chunks       = ggml_backend_sched_get_reserved_chunk_peaks(state.sched.get(), backend_ptrs[i],
-                                                                                   peak.data(), max_chunks, &max_chunk_size);
-            if (gi > 0 && max_chunk_size != entry->max_chunk_size) {
-                return { sched_reserve_status::FAILED, format("the chunk size of %s changed between measured graphs",
-                                                              ggml_backend_buft_name(entry->buft)) };
-            }
-            entry->max_chunk_size = max_chunk_size;
-            entry->peaks.emplace_back(peak.begin(), peak.begin() + std::max(0, std::min(n_chunks, max_chunks)));
+        if (!read_layout(gi)) {
+            return { sched_reserve_status::FAILED, layout_failure };
         }
+    }
+
+    // The K-shift graph of each sub-cache that can shift: update() allocates it on the context's scheduler,
+    // so its compute buffer is part of the plan. It is built with the ALLOC reserve's own cparams.
+    std::vector<const llama_kv_cache *> shift_caches;
+    if (memory) {
+        memory->get_shift_caches(shift_caches);
+    }
+
+    for (const llama_kv_cache * kv : shift_caches) {
+        ggml_cgraph * gf = graph_reserve_shift(state, kv, sizes.data());
+        if (!gf) {
+            return { sched_reserve_status::FAILED, format("failed to measure the K-shift graph %zu of %zu",
+                                                          gi - graphs.size(), shift_caches.size()) };
+        }
+
+        if (!read_layout(gi)) {
+            return { sched_reserve_status::FAILED, layout_failure };
+        }
+        gi++;
     }
 
     // A cap the copy could not answer during this measure leaves peaks nobody sized.
@@ -2553,8 +2585,13 @@ sched_reserve_result llama_context::sched_measure_impl(sched_reserve_state & sta
         }
     }
 
-    plan.graphs     = graphs;
-    plan.n_measured = (uint32_t) graphs.size();
+    plan.graphs = graphs;
+    for (size_t k = 0; k < shift_caches.size(); ++k) {
+        llama_measure_graph shift;
+        shift.kind = LLAMA_MEASURE_KIND_SHIFT;
+        plan.graphs.push_back(shift);
+    }
+    plan.n_measured = (uint32_t) (graphs.size() + shift_caches.size());
     plan.measure_ms = (ggml_time_us() - t_start_us) / 1000.0;
 
     LLAMA_LOG_DEBUG("%s: measured %u graphs in %.2f ms\n", __func__, plan.n_measured, plan.measure_ms);
@@ -3034,8 +3071,8 @@ void llama_context::set_embeddings(bool value) {
 
     cparams.embeddings = value;
 
-    // TODO: not sure yet if we want to reserve here
-    //sched_need_reserve = true;
+    // Both values are in every measured graph set (llama_measure_graph_set), so a toggle needs no
+    // reserve; reserving per toggle would republish per batch on the server.
 }
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
@@ -3043,6 +3080,8 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // Measured, like set_embeddings: with n_layer_nextn > 0 every variant is in the graph set.
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -3058,6 +3097,8 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+
+    // Measured: with n_layer_nextn > 0 every offset is in the graph set.
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -3081,8 +3122,9 @@ void llama_context::set_warmup(bool value) {
 
     cparams.warmup = value;
 
-    // warmups are usually with small batches, so no need to reserve
-    //sched_need_reserve = true;
+    // Fork-local, both directions, only on a change: a planned context measures the warmup graph
+    // (n_expert_used := n_expert) while it is on, and the toggle back is reused in place.
+    sched_need_reserve = true;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -4313,6 +4355,33 @@ ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     sched_reserve_state state = member_reserve_state();
     return graph_reserve(state, n_tokens, n_seqs, n_outputs, mctx, split_only, sizes);
+}
+
+ggml_cgraph * llama_context::graph_reserve_shift(sched_reserve_state &  state,
+                                                 const llama_kv_cache * kv,
+                                                 size_t *               sizes) {
+    GGML_ASSERT(kv != nullptr);
+
+    ggml_backend_sched_reset(state.sched.get());
+
+    // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
+    for (auto & res : state.gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    state.gf_res_prev_active = nullptr;
+
+    auto * res = state.gf_res_reserve.get();
+
+    res->reset();
+
+    auto * gf = kv->build_graph_shift(res, this);
+
+    GGML_ASSERT(sizes != nullptr);
+    ggml_backend_sched_reserve_size(state.sched.get(), gf, sizes);
+
+    return gf;
 }
 
 ggml_cgraph * llama_context::graph_reserve(sched_reserve_state &          state,

@@ -59,6 +59,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    void get_shift_caches(std::vector<const llama_kv_cache *> & caches) const override;
 
     void clear(bool data) override;
 

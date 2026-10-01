@@ -383,6 +383,10 @@ public:
                                 bool                           split_only = false,
                                 size_t *                       sizes      = nullptr);
 
+    // the K-shift graph of one sub-cache on an explicit reserve state, reserved size-only: graph_reserve's sibling
+    // for a graph that llama_kv_cache::update() builds rather than the model
+    ggml_cgraph * graph_reserve_shift(sched_reserve_state & state, const llama_kv_cache * kv, size_t * sizes);
+
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:

@@ -21,6 +21,7 @@ enum llama_measure_kind : uint32_t {
     LLAMA_MEASURE_KIND_TG,        // the token-generation graph
     LLAMA_MEASURE_KIND_PP_AGAIN,  // the reserve's closing pp graph (it may differ for some archs)
     LLAMA_MEASURE_KIND_STREAM,    // a decode ubatch over s streams of a split KV cache
+    LLAMA_MEASURE_KIND_SHIFT,     // the K-shift graph of one sub-cache (llama_kv_cache::update)
 };
 
 // One graph to reserve. `n_streams` is the stream count of the reserve memory

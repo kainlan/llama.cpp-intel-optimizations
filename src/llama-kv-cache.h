@@ -134,6 +134,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    void get_shift_caches(std::vector<const llama_kv_cache *> & caches) const override;
 
     void clear(bool data) override;
 
@@ -231,6 +232,11 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
+
+    // the K-shift graph update() allocates, built into `res`; a planned reserve measures it
+    ggml_cgraph * build_graph_shift(
+               llm_graph_result * res,
+                  llama_context * lctx) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -334,10 +340,6 @@ private:
                           float   freq_base,
                           float   freq_scale,
                        uint32_t   il) const;
-
-    ggml_cgraph * build_graph_shift(
-               llm_graph_result * res,
-                  llama_context * lctx) const;
 
     struct cell_ranges_t {
         uint32_t strm;

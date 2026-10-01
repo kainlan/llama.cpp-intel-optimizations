@@ -744,6 +744,10 @@ bool llama_memory_recurrent::get_can_shift() const {
     return true;
 }
 
+void llama_memory_recurrent::get_shift_caches(std::vector<const llama_kv_cache *> & caches) const {
+    GGML_UNUSED(caches);
+}
+
 size_t llama_memory_recurrent::total_size() const {
     size_t size = 0;
     for (const auto & [_, buf] : ctxs_bufs) {

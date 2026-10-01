@@ -165,6 +165,15 @@ bool llama_kv_cache_dsa::get_can_shift() const {
            kv_mla->get_size() == kv_lid->get_size();
 }
 
+void llama_kv_cache_dsa::get_shift_caches(std::vector<const llama_kv_cache *> & caches) const {
+    if (!get_can_shift()) {
+        return;
+    }
+
+    kv_mla->get_shift_caches(caches);
+    kv_lid->get_shift_caches(caches);
+}
+
 void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     kv_mla->state_write(io, seq_id, flags);
     kv_lid->state_write(io, seq_id, flags);

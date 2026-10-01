@@ -1332,6 +1332,12 @@ bool llama_kv_cache::get_can_shift() const {
     return true;
 }
 
+void llama_kv_cache::get_shift_caches(std::vector<const llama_kv_cache *> & caches) const {
+    if (other == nullptr && get_can_shift() && hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+        caches.push_back(this);
+    }
+}
+
 uint32_t llama_kv_cache::get_size() const {
     const auto & cells = v_cells[seq_to_stream[0]];
 

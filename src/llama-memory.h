@@ -6,10 +6,12 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
 class llama_batch_allocr;
+class llama_kv_cache;
 
 class llama_io_write_i;
 class llama_io_read_i;
@@ -113,6 +115,10 @@ struct llama_memory_i {
 
     // getters
     virtual bool get_can_shift() const = 0;
+
+    // the KV caches whose update() allocates a K-shift graph, one per sub-cache that can shift; none for a memory
+    // that cannot shift or that holds no rope'd KV cache. A planned reserve measures each of those graphs.
+    virtual void get_shift_caches(std::vector<const llama_kv_cache *> & caches) const = 0;
 
     //
     // ops

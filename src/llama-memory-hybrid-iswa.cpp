@@ -144,6 +144,14 @@ bool llama_memory_hybrid_iswa::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+void llama_memory_hybrid_iswa::get_shift_caches(std::vector<const llama_kv_cache *> & caches) const {
+    if (!get_can_shift()) {
+        return;
+    }
+
+    mem_attn->get_shift_caches(caches);
+}
+
 void llama_memory_hybrid_iswa::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

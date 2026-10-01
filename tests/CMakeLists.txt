@@ -3709,6 +3709,29 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# zhcn C7f: the K-shift graphs of the measured set (design section 2.3). A memory
+# reports the sub-caches whose update() allocates a K-shift graph, the one cache
+# that builds it filters on can-shift/shared-cells/rope, and the MEASURE reserves
+# each through graph_reserve_shift and reads its chunk layout.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kshift-measure-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kshift-measure-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# zhcn C7f: setter classification (design gate 16, section 2.3). Every
+# llama_context::set_* definition is classified as reserving, measured or none,
+# and the row's contract is pinned on its body; set_warmup reserves on change.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-setter-classification-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-setter-classification-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # zhcn C7f: the fused-op resolution report (design gate 37, the report-site
 # clauses). resolve_fused_ops records and never logs; one member prints the
 # record through the pure emit function under !measure_only, in two call forms
