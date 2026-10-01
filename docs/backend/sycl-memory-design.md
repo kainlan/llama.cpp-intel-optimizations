@@ -2442,10 +2442,20 @@ the planned scratch still needs, and spills exactly as if the zone were full.** 
 `zone_planned_scratch_hold_bytes()`: the whole plan of every buffer still short of it (the whole plan, not the
 shortfall, because growth allocates the replacement while the old backing is live). A forbid-spill request is a planned
 consumer itself (the ring, the planned scratch) and is the claimant the hold exists for, so it is never held back.
+*Held back* means the hold is what keeps the request out: `hold > 0`, the zone alone could have served it
+(`size <= free`), and the hold refuses it (`zone_runtime_alloc_held_back`, tested on the host). A request larger than the
+zone's free bytes is an ordinary zone-full spill whatever the hold is, and keeps exactly its pre-kpjw path, eviction
+included. (The first version of the predicate was true for any request the zone could not serve, so it refused ordinary
+spills the overcommit guard used to resolve by evicting, logged a false "held back ... (hold 0.0 MB)" and inflated the
+counts; review r2 F1.)
 The hold is per device, published by the context that owns the buffers
 (`ggml_sycl_planned_scratch_hold_refresh()`) with that context recorded as its owner, falls as the graph-entry walks
 bring each buffer to its plan, and is released by the same context's teardown (`unified_cache_release_planned_scratch_hold`
-clears only a hold its caller published, so one context going away cannot drop what another still needs). All three
+clears only a hold its caller published, so one context going away cannot drop what another still needs). The owner is a
+monotonic context id minted at construction (`unified_cache_mint_planned_scratch_owner`), not the context's address,
+which a later context can reuse. The hold bytes, owner, hold-spill counters and the largest-request mark are one
+per-device record behind a mutex, so a set, a release and a take cannot interleave into a torn pair, and one context's
+take of the spill counters leaves another context's alone. All three
 buffers are held by one rule, from the first plan: a buffer short of its plan holds the whole plan, with no wait for a
 first backing. An earlier version held the f16 buffers only once backed, on the argument that the default oneDNN PP route
 serves Q8_0 from the ONEDNN zone; that reserved nothing for the first f16 draw, the one a full zone refuses, and the
@@ -2463,9 +2473,21 @@ naming the requester tag and the bytes (`unified_cache_note_planned_hold_spill`)
 printed as `hold_spills` in the `[SCRATCH-STATS]` lines. The spill path cannot evict weights: the overcommit guard in
 `unified_alloc` runs for every device request, and for a hold-induced one it now refuses loudly instead of calling
 `evict_and_flush` (trading a planned buffer's reservation for the model's own weights is not a trade the hold may make).
-The worst case, the whole hold landing outside the arena, is counted in the transaction's outside-arena headroom check
-(`ggml_sycl_check_nonfa_attn_scratch`, which only runs for a non-FA context; with flash attention on there is no such
-check to extend, and the guard above is the backstop).
+*The worst case, and why it is a heuristic.* A request the hold keeps out spills whole, so what the hold can push
+outside the arena is not "the hold" but at most **the hold plus the largest spill-capable RUNTIME request**: a request r
+is held back only when the zone has less than hold + r free, free only falls while the hold stands, and a run with no
+hold serves at most the zone's free bytes. The hold is at most the plan at the n_ubatch asked about. The transaction does
+not know the compute-buffer sizes (the scheduler reserves them after the plan is published), so the largest request is
+the allocator's own high-water mark of such requests (`unified_cache_note_runtime_request`): exact once the context has
+reserved its compute buffers (the recheck that follows the probe reserve) and only a lower bound before that. Both
+callers ask one function, `ggml_sycl_planned_scratch_hold_spill_bound(device, n_ubatch)`. The bound is checked against
+the live outside-arena headroom whatever the attention mode. A non-FA context counts it together with the non-FA scratch
+in `ggml_sycl_check_nonfa_attn_scratch`. A flash-attention context, the default, asks the same live free-memory question
+without the non-FA reserve (`ggml_sycl_check_hold_spill_headroom`), because the overcommit guard in `unified_alloc` compares
+a spill with the device's total memory minus what the cache itself accounts for: it cannot see another tenant on the card
+or the driver's reserve, so on a shared card a spill it admits can fail late as `OUT_OF_DEVICE_MEMORY` or `DEVICE_LOST`
+instead of being refused by name. The non-FA 928 MB reserve is deliberately not added there: it is the empirical
+outside-arena consumer of the non-FA path and has no bearing on the hold's spill.
 
 *The idle hold, precisely.* The hold persists while a buffer is short of its plan, including across a graph that counts
 no node for it (the Q8 walk now refreshes the hold on that exit too, so it falls the moment the buffers reach their
@@ -2473,6 +2495,9 @@ plan by any route). A graph that counts no node proves nothing about the next gr
 decode graph does not, so the hold is not released on that evidence. The idle part is bounded: the plan exists only for
 a model with dense quantized weights (so the Q8 buffer is drawn by its decode graphs), the hold binds only spill-capable
 RUNTIME requests, and those spill (counted, warned about, refused if the device cannot take them) rather than fail.
+Two runs never draw the f16 buffers, and for them the f16 share of the hold stands for the whole context lifetime: a
+decode-only run, and a run whose prompts all take the oneDNN PP route (which brings its own copies from the ONEDNN zone).
+That is deliberate, because the first f16 draw is the one a full zone refuses, and it is bounded by the f16 plan.
 
 *Hold versus fragmentation.* The hold is an aggregate byte bound (the sum of the plans), not a contiguity guarantee, and
 the planned buffers need contiguous room each. TLSF coalesces adjacent free blocks on free, and the compute buffers (the
@@ -2484,13 +2509,19 @@ cannot place the buffer and the graph is refused before submission, naming the z
 is not consulted: `largest_free_block()` is the head of the largest size class (approximate, by its own comment), so it
 would be a second heuristic beside the aggregate one rather than a contiguity proof.
 
-*Plan inputs are device-global.* The per-token and weight maxima the setters keep are one set per device, and the last
-model loaded would win. While another model is live on the device, the larger of the old and the new input is kept
-(`zone_dense_scratch_merge_input`, tested on the host), so a draft loaded beside a target does not shrink the target's
-plan; with no other model live the new inputs replace the old, so a model swap shrinks it. Two contexts on one device are
+*Plan inputs are per device.* The per-token and weight maxima the setters keep are one set per device, and the last
+model loaded would win. While another backend context is live on the SAME device
+(`ggml_sycl_other_backend_context_live`, which reads the per-device context list, not the process-wide model registry),
+the larger of the old and the new input is kept (`zone_dense_scratch_merge_input`, tested on the host), so a draft loaded
+beside a target does not shrink the target's plan, and a model live on another device is no reason to merge; with no
+other context live the new inputs replace the old, so a model swap shrinks it. The runtime re-plan takes the same
+per-device answer, so a draft context at a small `n_ubatch` does not shrink a live target's plan either, and a rollback
+that restores an exact earlier value passes "none live". Two contexts on one device are
 still unsupported (canonical contract section 5), so the plan's `n_ubatch` is the last transaction's. A setter validates
-its figure before it stores anything: a rejected (overflowing) figure leaves the stored inputs alone, publishes a zero
-plan and marks the plan invalid, so the fit check and a re-plan refuse instead of re-deriving a plan from stale inputs.
+its figure before it stores anything: a rejected (overflowing) figure leaves the stored inputs alone and, with no other
+context live, publishes a zero plan and marks the plan invalid, so the fit check and a re-plan refuse instead of
+re-deriving a plan from stale inputs. With another context live the plan and its inputs are left standing: one model's
+overflow does not invalidate the plan of the model already running.
 
 **D2: the plan followed the load-time `n_ubatch`.** Auto-ubatch chooses the real one at context creation, after load.
 The plan is a function of `n_ubatch` (`zone_dense_scratch_total_bytes()`), so the runtime-context transaction, the
