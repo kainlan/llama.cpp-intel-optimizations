@@ -13,8 +13,13 @@ def prompt_region() -> str:
     return text[start:end]
 
 
+def normalized(text: str) -> str:
+    """Whitespace collapsed to single spaces: wrapped argument lists and aligned `=` are clang-format's, not ours."""
+    return " ".join(text.split())
+
+
 def test_central_prompt_fusion_hook_and_enable_predicate() -> None:
-    region = prompt_region()
+    region = normalized(prompt_region())
     for witness in (
         "prompt_pair_retained_roles_validated && src0->type == GGML_TYPE_MXFP4",
         "src0 == pair.gate_weight && dst == pair.gate_dst",
@@ -24,18 +29,21 @@ def test_central_prompt_fusion_hook_and_enable_predicate() -> None:
         "mmvq_submit_retained_prompt_fusion(",
         "mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(",
         "mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(",
-        "gate_layout == GGML_LAYOUT_SOA && up_layout == gate_layout",
+        # Gate/up: SOA, or XMX_TILED only under the route-policy flag (twl6, 5dc9a2254), and up must agree with
+        # gate. Down: SOA or MXFP4_I8, or XMX_TILED under the flag AND the down-specific opt-out (sk67, a8251fe3f).
+        "gate_layout == GGML_LAYOUT_SOA || (gate_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp())",
+        "executor_layouts_ok = gate_layout_admissible && up_layout == gate_layout",
         "down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8",
         "&glu_event, &glu_event_set, &recorder, &ids_deps",
         "recorder.write_started() ?",
         "fused::ErrorCode::submit_failed_no_write",
     ):
-        assert witness in region, witness
+        assert normalized(witness) in region, witness
     assert "q1_nvfp4_direct_b70_validated" not in region
 
 
 def test_exact_retained_escrow_and_atomic_publication_contract() -> None:
-    region = prompt_region()
+    region = normalized(prompt_region())
     for role in (
         "gate", "gate_table", "up", "up_table", "activation", "ids",
         "glu", "intermediate", "down", "down_table",
@@ -49,7 +57,9 @@ def test_exact_retained_escrow_and_atomic_publication_contract() -> None:
         "ids_resolved.ptr == ids_device",
         "std::vector<sycl::event>{ ids_ready_event }",
         "std::vector<sycl::event> ids_deps{ ids_ready_event }",
-        "static thread_local fused::PublicationStore publication_store",
+        # The store was hoisted to file scope (iikr/kzjv) so an explicit flush() can retire the last
+        # publication; the region must still publish through it by name (declaration checked below).
+        "mmvq_submit_retained_prompt_fusion(fusion_bundle, executor, g_moe_prompt_fusion_publication_store",
         "stage_skip(g_moe_precomputed_mmid_skip, pair.gate_dst)",
         "stage_skip(g_moe_precomputed_mmid_skip, pair.up_dst)",
         "stage_skip(g_moe_precomputed_node_skip, pair.glu_dst)",
@@ -57,7 +67,9 @@ def test_exact_retained_escrow_and_atomic_publication_contract() -> None:
         "ggml_sycl_set_tensor_ready_event(pair.glu_dst",
         "ggml_sycl_set_tensor_ready_event(pair.down_dst",
     ):
-        assert witness in region, witness
+        assert normalized(witness) in region, witness
+    assert "static thread_local ggml_sycl::moe_fused::PublicationStore g_moe_prompt_fusion_publication_store;" in \
+        normalized(SOURCE.read_text())
 
 
 def test_fallback_is_prewrite_only() -> None:
@@ -72,14 +84,23 @@ def test_fallback_is_prewrite_only() -> None:
 
 def test_unsupported_layouts_and_shape_mismatches_refuse_before_artifacts() -> None:
     region = prompt_region()
-    admission = region.index("const bool executor_layouts_ok")
+    # The matrix starts at the two admissibility predicates, which precede executor_layouts_ok. Starting at
+    # executor_layouts_ok (the old anchor) would exclude them, and the XMX_TILED check below would pass
+    # vacuously.
+    matrix_start = region.index("const bool gate_layout_admissible")
+    admission = region.index("const bool executor_layouts_ok", matrix_start)
     shapes = region.index("const bool executor_shapes_ok", admission)
     table_upload = region.index("ggml_sycl_upload_moe_retained_ptr_table_from_batch", shapes)
     ids_stage = region.index("ggml_sycl_get_moe_ids_device_ptr", table_upload)
-    assert admission < shapes < table_upload < ids_stage
-    matrix = region[admission:table_upload]
-    assert "gate_layout == GGML_LAYOUT_XMX_TILED" not in matrix
-    assert "down_layout == GGML_LAYOUT_MXFP4_DPAS" not in matrix
+    assert matrix_start < admission < shapes < table_upload < ids_stage
+    matrix = normalized(region[matrix_start:table_upload])
+    # XMX_TILED is admitted (default-on since rzy7) but only through the route-policy flag, and for down also the
+    # down-specific opt-out; it must never appear bare. Unsupported layouts stay refused.
+    assert matrix.count("GGML_LAYOUT_XMX_TILED") == 2
+    assert "(gate_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp())" in matrix
+    assert ("(down_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp() && "
+            "ggml_sycl_moe_down_xmx_tiled_enabled())") in matrix
+    assert "GGML_LAYOUT_MXFP4_DPAS" not in matrix
     assert "pair.ids->ne[1] == pair.src1->ne[2]" in region[shapes:table_upload]
 
 
@@ -132,7 +153,7 @@ def test_prompt_receipt_prevents_post_boundary_q8_growth_and_retains_owner() -> 
     reserved_arm = publish_fn[publish_fn.index("if (reserved_q8_owner)"):
                               publish_fn.index("} else {", publish_fn.index("if (reserved_q8_owner)"))]
     assert "mxfp4_moe_tg_reuse_get_or_alloc_q8" not in reserved_arm
-    region = prompt_region()
+    region = normalized(prompt_region())
     assert "activation, q8_preflight.q8_owner" in region
     assert "&recorder, &ids_deps, &q8_preflight" in region
     allocator_start = mmvq.index("static void * mxfp4_moe_tg_reuse_get_or_alloc_q8(")
