@@ -391,16 +391,9 @@ demand_reconciliation context_demand_reconcile(const std::vector<context_side_de
 namespace {
 
 // The allocator's block grain: every block offset is a multiple of it, and a top
-// carve needs the free block's top on it (carve_gap).  tlsf_allocator keeps the
-// constant private, so it is read off the allocator itself rather than restated.
-size_t fit_grain() {
-    static const size_t grain = [] {
-        tlsf_allocator probe(1 << 20);
-        const size_t   a = probe.allocate(1);
-        const size_t   b = probe.allocate(1);
-        return a < b ? b - a : a - b;
-    }();
-    return grain;
+// carve needs the free block's top on it (carve_gap).
+constexpr size_t fit_grain() {
+    return tlsf_allocator::block_grain;
 }
 
 enum : uint8_t { PK_FREE, PK_OPT, PK_BARRIER };
@@ -455,13 +448,13 @@ struct fit_state {
 
 // One KV layer in slot-table order.
 struct fit_slot {
-    uint32_t layer       = 0;
-    uint8_t  group       = KV_SLOT_FULL;
-    size_t   kv_alloc    = 0;  // kv_layer_alloc_bytes(kv_bytes)
-    size_t   total       = 0;  // the slot's size, sidecar included
-    bool     sidecar     = false;
-    bool     forced_host = false;
-    bool     self_placed = false;
+    uint32_t      layer       = 0;
+    kv_slot_group group       = KV_SLOT_FULL;
+    size_t        kv_alloc    = 0;  // kv_layer_alloc_bytes(kv_bytes)
+    size_t        total       = 0;  // the slot's size, sidecar included
+    bool          sidecar     = false;
+    bool          forced_host = false;
+    bool          self_placed = false;
 };
 
 bool cohort_equal(const char * a, const char * b) {
@@ -722,6 +715,18 @@ bool piece_carvable(const fit_run & run, size_t idx) {
     return !(above.kind == PK_BARRIER && above.soft);
 }
 
+// Whether the optional tenant at `idx` can contribute room: yielding it merges the
+// FREE/OPT sequence it sits in into one block topped by the sequence's highest
+// piece, and the commit carves in that block only when that top is carvable.
+// pick_yield asks piece_carvable of the same top piece.
+bool opt_reachable(const fit_run & run, size_t idx) {
+    size_t top = idx;
+    while (top + 1 < run.pieces.size() && run.pieces[top + 1].kind != PK_BARRIER) {
+        ++top;
+    }
+    return piece_carvable(run, top);
+}
+
 struct fit_room {
     size_t tlsf     = SIZE_MAX;
     bool   retained = false;
@@ -729,65 +734,71 @@ struct fit_room {
     size_t idx      = 0;  // the piece index
 };
 
-// The cheapest tier 1-3 room for `size`: within a tier the best fit decides, over
-// every TLSF that may take it (the smallest room that holds the slot; the lowest
-// TLSF, then the lowest piece, at a tie).  A slot is never split.
-bool find_room(const fit_state & S, size_t size, int route, fit_room & out) {
-    for (int tier = 1; tier <= 3; ++tier) {
-        size_t   best_free = SIZE_MAX;
-        bool     found     = false;
-        fit_room best;
-        for (size_t t = 0; t < S.t.size(); ++t) {
-            if (!eligible(S.t[t], route)) {
-                continue;
-            }
-            if (tier == 1) {
-                for (size_t i = 0; i < S.t[t].retained.size(); ++i) {
-                    const fit_retained & r = S.t[t].retained[i];
-                    const size_t         f = r.hi - r.lo - r.used;
-                    if (f >= size && f < best_free) {
-                        best_free     = f;
-                        best.tlsf     = t;
-                        best.retained = true;
-                        best.run      = i;
-                        found         = true;
-                    }
-                }
-                continue;
-            }
-            for (size_t ri = 0; ri < S.t[t].runs.size(); ++ri) {
-                const fit_run & run = S.t[t].runs[ri];
-                size_t          gap = SIZE_MAX;
-                size_t          gi  = 0;
-                if (gap_index(run, gi)) {
-                    gap = gi;
-                }
-                for (size_t pi = 0; pi < run.pieces.size(); ++pi) {
-                    const fit_piece & p = run.pieces[pi];
-                    if (p.kind != PK_FREE || p.room() < size || !piece_carvable(run, pi)) {
-                        continue;
-                    }
-                    const bool is_gap = pi == gap;
-                    if (is_gap != (tier == 2)) {
-                        continue;
-                    }
-                    if (p.room() < best_free) {
-                        best_free     = p.room();
-                        best.tlsf     = t;
-                        best.retained = false;
-                        best.run      = ri;
-                        best.idx      = pi;
-                        found         = true;
-                    }
-                }
+// One room a slot could take, in the tier order of §2.4.1.
+struct fit_candidate_room {
+    fit_room room;
+    int      tier = 0;
+    size_t   free = 0;
+};
+
+// Every tier 1-3 room that can hold `size` for `route`, best first: the lowest tier,
+// then the smallest room (the lowest TLSF, run and piece at a tie).  A slot is never
+// split, so a room that cannot hold it whole is not a candidate.
+void candidate_rooms(const fit_state & S, size_t size, int route, std::vector<fit_candidate_room> & out) {
+    out.clear();
+    for (size_t t = 0; t < S.t.size(); ++t) {
+        if (!eligible(S.t[t], route)) {
+            continue;
+        }
+        for (size_t i = 0; i < S.t[t].retained.size(); ++i) {
+            const fit_retained & r = S.t[t].retained[i];
+            const size_t         f = r.hi - r.lo - r.used;
+            if (f >= size) {
+                fit_candidate_room c;
+                c.room.tlsf     = t;
+                c.room.retained = true;
+                c.room.run      = i;
+                c.tier          = 1;
+                c.free          = f;
+                out.push_back(c);
             }
         }
-        if (found) {
-            out = best;
-            return true;
+        for (size_t ri = 0; ri < S.t[t].runs.size(); ++ri) {
+            const fit_run & run = S.t[t].runs[ri];
+            size_t          gap = SIZE_MAX;
+            size_t          gi  = 0;
+            if (gap_index(run, gi)) {
+                gap = gi;
+            }
+            for (size_t pi = 0; pi < run.pieces.size(); ++pi) {
+                const fit_piece & p = run.pieces[pi];
+                if (p.kind != PK_FREE || p.room() < size || !piece_carvable(run, pi)) {
+                    continue;
+                }
+                fit_candidate_room c;
+                c.room.tlsf = t;
+                c.room.run  = ri;
+                c.room.idx  = pi;
+                c.tier      = pi == gap ? 2 : 3;
+                c.free      = p.room();
+                out.push_back(c);
+            }
         }
     }
-    return false;
+    std::stable_sort(out.begin(), out.end(), [](const fit_candidate_room & a, const fit_candidate_room & b) {
+        return a.tier != b.tier ? a.tier < b.tier : a.free < b.free;
+    });
+}
+
+// The cheapest tier 1-3 room for `size`: the first candidate (best fit within a tier).
+bool find_room(const fit_state & S, size_t size, int route, fit_room & out) {
+    std::vector<fit_candidate_room> rooms;
+    candidate_rooms(S, size, route, rooms);
+    if (rooms.empty()) {
+        return false;
+    }
+    out = rooms.front().room;
+    return true;
 }
 
 void carve_room(fit_state & S, const fit_room & room, int assign_id, size_t size) {
@@ -802,6 +813,21 @@ void carve_room(fit_state & S, const fit_room & room, int assign_id, size_t size
     fit_piece & p = t.runs[room.run].pieces[room.idx];
     p.used += size;
     p.assigns.push_back(assign_id);
+}
+
+// Take back carve_room's reservation (the last one made in that room).
+void uncarve_room(fit_state & S, const fit_room & room, int assign_id, size_t size) {
+    fit_tlsf & t        = S.t[room.tlsf];
+    S.a[assign_id].tlsf = SIZE_MAX;
+    if (room.retained) {
+        fit_retained & r = t.retained[room.run];
+        r.used -= size;
+        r.assigns.pop_back();
+        return;
+    }
+    fit_piece & p = t.runs[room.run].pieces[room.idx];
+    p.used -= size;
+    p.assigns.pop_back();
 }
 
 struct fit_candidate {
@@ -859,10 +885,7 @@ bool pick_yield(const fit_state &           S,
                 }
                 // The freed span merges into one block topped by piece `top`; if what
                 // lies above that is a pending or non-owned range, nothing carves in it.
-                const bool carvable_top = run.pieces[top].hi % fit_grain() == 0 &&
-                                          !(top + 1 < run.pieces.size() && run.pieces[top + 1].kind == PK_BARRIER &&
-                                            run.pieces[top + 1].soft);
-                if (!carvable_top) {
+                if (!piece_carvable(run, top)) {
                     first_sequence = false;
                     i              = end;
                     continue;
@@ -960,7 +983,7 @@ size_t room_total(const fit_state & S, size_t t) {
         for (size_t pi = 0; pi < run.pieces.size(); ++pi) {
             const fit_piece & p = run.pieces[pi];
             if (p.kind == PK_OPT) {
-                total += p.size();
+                total += opt_reachable(run, pi) ? p.size() : 0;
             } else if (p.kind == PK_FREE && piece_carvable(run, pi)) {
                 total += p.room();
             }
@@ -984,6 +1007,60 @@ size_t tier13_free(const fit_state & S, size_t t) {
     return total;
 }
 
+// What a commit re-fit needs to re-place the heads together with the KV slots: the
+// state before any head was placed, and the heads in the order they were placed.
+struct fit_refit_ctx {
+    fit_state        pre;
+    std::vector<int> head_ids;    // assignment ids in S0.a, in placement order
+    std::vector<int> head_route;  // parallel: 1 for a head that names weight
+};
+
+struct fit_item {
+    int    id;
+    size_t size;
+    int    route;
+};
+
+// Exact placement for a commit re-fit.  The re-fit's rooms are the plan's own
+// ranges, each room exactly as large as what the plan put in it, so a greedy best
+// fit can take a slot that belongs in a tighter room and strand the slots planned
+// there (the rooms were shrunk to the plan's usage, which changes which one is
+// tightest).  A plan that placed every item has a placement here, so the search tries
+// the best-fit order first and backtracks.  `budget` bounds the nodes; running out
+// reads as "does not fit", which only demotes.
+bool refit_search(fit_state & S, const std::vector<fit_item> & items, size_t n, size_t & budget) {
+    if (n == items.size()) {
+        return true;
+    }
+    if (budget == 0) {
+        return false;
+    }
+    --budget;
+    std::vector<fit_candidate_room> rooms;
+    candidate_rooms(S, items[n].size, items[n].route, rooms);
+    for (size_t k = 0; k < rooms.size(); ++k) {
+        bool twin = false;  // a room already tried with the same tlsf, tier and room is equivalent
+        for (size_t d = 0; d < k && !twin; ++d) {
+            twin = rooms[d].room.tlsf == rooms[k].room.tlsf && rooms[d].tier == rooms[k].tier &&
+                   rooms[d].free == rooms[k].free;
+        }
+        if (twin) {
+            continue;
+        }
+        carve_room(S, rooms[k].room, items[n].id, items[n].size);
+        if (refit_search(S, items, n + 1, budget)) {
+            return true;
+        }
+        uncarve_room(S, rooms[k].room, items[n].id, items[n].size);
+        if (budget == 0) {
+            return false;
+        }
+    }
+    return false;
+}
+
+constexpr size_t FIT_REFIT_NODES = 200000;
+
 struct kv_solve {
     bool              ok = false;
     std::vector<char> device;  // per slot
@@ -994,7 +1071,7 @@ struct kv_solve {
 // The demotion loop of §2.4.1: ask the fit; on a miss demote the highest-index
 // full-attention layer (K and V and sidecar together), then the SWA layers, and
 // ask again.  `S0` already holds the head slots.
-kv_solve solve_kv(const fit_state & S0, const std::vector<fit_slot> & slots) {
+kv_solve solve_kv(const fit_state & S0, const std::vector<fit_slot> & slots, const fit_refit_ctx * refit = nullptr) {
     kv_solve out;
     out.device.assign(slots.size(), 1);
     std::vector<size_t> order;  // slot indices in demotion order
@@ -1022,9 +1099,28 @@ kv_solve solve_kv(const fit_state & S0, const std::vector<fit_slot> & slots) {
                 slot_of.push_back(i);
             }
         }
-        for (size_t n = 0; n < slot_of.size() && ok; ++n) {
-            S.a.push_back({ AS_KV, slot_of[n], slots[slot_of[n]].total, SIZE_MAX });
-            ok = place(S, (int) S.a.size() - 1, 0, true, remaining, n);
+        if (refit != nullptr) {
+            // The heads are re-placed with the slots, so a head's room can give way.
+            S.t = refit->pre.t;
+            for (fit_assign & a : S.a) {
+                a.tlsf = SIZE_MAX;
+            }
+            std::vector<fit_item> items;
+            for (size_t h = 0; h < refit->head_ids.size(); ++h) {
+                const int id = refit->head_ids[h];
+                items.push_back({ id, S.a[id].size, refit->head_route[h] });
+            }
+            for (size_t n = 0; n < slot_of.size(); ++n) {
+                S.a.push_back({ AS_KV, slot_of[n], slots[slot_of[n]].total, SIZE_MAX });
+                items.push_back({ (int) S.a.size() - 1, slots[slot_of[n]].total, 0 });
+            }
+            size_t budget = FIT_REFIT_NODES;
+            ok            = refit_search(S, items, 0, budget);
+        } else {
+            for (size_t n = 0; n < slot_of.size() && ok; ++n) {
+                S.a.push_back({ AS_KV, slot_of[n], slots[slot_of[n]].total, SIZE_MAX });
+                ok = place(S, (int) S.a.size() - 1, 0, true, remaining, n);
+            }
         }
         if (ok) {
             out.ok    = true;
@@ -1080,9 +1176,30 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
     for (size_t t = 0; t < n_tlsf; ++t) {
         reservation_used[t].assign(g.tlsfs[t].reservations.size(), 0);
     }
-    std::vector<size_t>       head_assign(r.head_slots.size(), SIZE_MAX);
-    const std::vector<size_t> no_remaining;
-    for (size_t h = 0; h < r.head_slots.size(); ++h) {
+    std::vector<size_t>                    head_assign(r.head_slots.size(), SIZE_MAX);
+    std::vector<std::pair<size_t, size_t>> head_super(r.head_slots.size(), { SIZE_MAX, SIZE_MAX });
+    const std::vector<size_t>              no_remaining;
+    fit_refit_ctx                          refit;
+    refit.pre = base;
+
+    // Best fit over every TLSF a head may take lets an unconstrained head use up the
+    // tight room the one TLSF a constrained head needs offers, and the constrained
+    // head is then refused where an index-order placement would have fitted both.  So
+    // the heads with the fewest admissible TLSFs go first (request order at a tie),
+    // and best fit decides only inside each head's own admissible set.
+    size_t admissible[2] = { 0, 0 };
+    for (const fit_tlsf & t : base.t) {
+        admissible[0] += eligible(t, 0) ? 1 : 0;
+        admissible[1] += eligible(t, 1) ? 1 : 0;
+    }
+    std::vector<size_t> head_order(r.head_slots.size());
+    for (size_t h = 0; h < head_order.size(); ++h) {
+        head_order[h] = h;
+    }
+    std::stable_sort(head_order.begin(), head_order.end(), [&](size_t a, size_t b) {
+        return admissible[r.head_slots[a].names_weight ? 1 : 0] < admissible[r.head_slots[b].names_weight ? 1 : 0];
+    });
+    for (const size_t h : head_order) {
         const kv_head_slot_request & hs   = r.head_slots[h];
         const size_t                 need = kv_layer_alloc_bytes(hs.size);
         kv_head_placement &          out  = res.heads[h];
@@ -1132,6 +1249,9 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
         base.a.push_back({ AS_HEAD, h, need, SIZE_MAX });
         const int id   = (int) base.a.size() - 1;
         head_assign[h] = (size_t) id;
+        refit.head_ids.push_back(id);
+        refit.head_route.push_back(hs.names_weight ? 1 : 0);
+        head_super[h] = { super_t, super_i };
         if (!place(base, id, hs.names_weight ? 1 : 0, false, no_remaining, 0)) {
             res.refused_heads.push_back(h);
             continue;
@@ -1141,6 +1261,33 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
             res.superseded.push_back({ super_t, super_i });
         }
     }
+    if (r.commit_refit && !res.refused_heads.empty()) {
+        // The greedy placement refused a head.  The re-fit's rooms are the plan's own
+        // ranges, so a placement exists whenever the plan's heads fitted; search for it
+        // before calling the head refused.
+        fit_state S = refit.pre;
+        S.a         = base.a;
+        for (fit_assign & a : S.a) {
+            a.tlsf = SIZE_MAX;
+        }
+        std::vector<fit_item> items;
+        for (size_t k = 0; k < refit.head_ids.size(); ++k) {
+            const int id = refit.head_ids[k];
+            items.push_back({ id, S.a[id].size, refit.head_route[k] });
+        }
+        size_t budget = FIT_REFIT_NODES;
+        if (refit_search(S, items, 0, budget)) {
+            for (const size_t h : res.refused_heads) {
+                if (head_super[h].first != SIZE_MAX) {
+                    reservation_used[head_super[h].first][head_super[h].second] = 1;
+                    res.superseded.push_back({ head_super[h].first, head_super[h].second });
+                }
+            }
+            res.refused_heads.clear();
+            base = std::move(S);
+        }
+    }
+    std::sort(res.refused_heads.begin(), res.refused_heads.end());
     if (!res.refused_heads.empty()) {
         for (size_t t = 0; t < n_tlsf; ++t) {
             res.tlsf_free[t] = tier13_free(base, t);
@@ -1150,7 +1297,7 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
 
     // The demotion loop, and the same loop with each cause's room added.
     const fit_state & S0     = base;
-    kv_solve          solved = solve_kv(S0, slots);
+    kv_solve          solved = solve_kv(S0, slots, r.commit_refit ? &refit : nullptr);
 
     std::vector<char> ring_growth_device;
     if (!res.superseded.empty()) {
@@ -1211,6 +1358,10 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
     }
     std::stable_sort(terms.begin(), terms.end(),
                      [&](size_t a, size_t b) { return res.after_kv[a].size < res.after_kv[b].size; });
+    // An after-KV charge only records a range and carves nothing, yet it goes through
+    // find_room like a slot, so it too needs a carvable piece.  That is deliberate: it
+    // keeps the charge inside room the later carves can really reach, and it must not
+    // be relaxed into a placement the carve chain could not honour.
     for (size_t k : terms) {
         F.a.push_back({ AS_AFTER, k, res.after_kv[k].size, SIZE_MAX });
         const int id             = (int) F.a.size() - 1;

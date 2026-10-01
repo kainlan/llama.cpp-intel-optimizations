@@ -324,6 +324,11 @@ struct lcg {
     }
 };
 
+// Oracles NOT in this property, deferred (the L3 reviews' m-2): the minimality check
+// below asks the fit again, so it is self-referential, and jehw's byte-total oracle
+// over a kv_zone_snapshot is absent until the production census exists (L4).  KV
+// refusal has no independent oracle of its own either; the first-head refusal below
+// and i6's single-gap arithmetic are the independent ones.
 static int case_h2_property() {
     size_t placed  = 0;
     size_t refused = 0;
@@ -507,7 +512,7 @@ static int case_h2_property() {
 
         // The commit re-fit, after the plan's own yield: it may place only inside the
         // ranges the plan carved, and what it places must carve as it says.
-        if (seed % 4 == 0) {
+        {
             for (size_t t = 0; t < before_yield.tlsfs.size(); ++t) {
                 std::vector<size_t> buried;
                 for (const auto & b : f.buried_released) {
@@ -517,10 +522,10 @@ static int case_h2_property() {
                 }
                 before_yield.tlsfs[t].yield(f.yield_prefix[t], buried);
             }
+            // The plan's ranges: every placement records one, including a retained run it
+            // claimed whole and an after-KV charge, which carve nothing.
             for (const auto & op : f.carve_order) {
-                if (op.carve) {
-                    before_yield.tlsfs[op.tlsf].own(op.offset, op.size);
-                }
+                before_yield.tlsfs[op.tlsf].own(op.offset, op.size);
             }
             kv_region_request re         = r;
             re.commit_refit              = true;
@@ -529,7 +534,18 @@ static int case_h2_property() {
                 std::fprintf(stderr, "property: re-fit seed %llu\n", (unsigned long long) seed);
                 CHECK(false, "property: the commit re-fit carves at its offsets, clear of pending ranges");
             }
-            CHECK(device_layers(g) <= device_layers(f), "property: a re-fit inside the plan's ranges places no more");
+            // Nothing changed between the plan and the re-fit but the plan's own carve, so
+            // the re-fit must realize exactly the plan: the same layers on the device, and
+            // no head the plan placed refused (plan == reality, in the refusing direction).
+            if (!g.fits || device_layers(g) != device_layers(f)) {
+                std::fprintf(stderr, "property: re-fit seed %llu fits=%d layers %zu plan %zu\n",
+                             (unsigned long long) seed, (int) g.fits, device_layers(g), device_layers(f));
+            }
+            CHECK(g.fits && g.refused_heads.empty(), "property: the re-fit refuses no head the plan placed");
+            CHECK_EQ(device_layers(g), device_layers(f), "property: the re-fit places exactly the plan's layers");
+            for (size_t i = 0; i < f.layers.size(); ++i) {
+                CHECK(g.layers[i].device == f.layers[i].device, "property: and the same layers, not just as many");
+            }
             ++refits;
         }
     }
@@ -1309,6 +1325,211 @@ static int case_i4_best_fit_across_tlsfs() {
     const kv_region_fit_result g = kv_region_fit(retained.snapshot(), r);
     CHECK(g.fits && device_layers(g) == 1, "best fit, retained: the slot is placed");
     CHECK_EQ(g.extents[0].tlsf, 1, "best fit, retained: the 130 MiB run is the tightest");
+    return 0;
+}
+
+// Best fit must not strand a constrained head: the reviewer's repro.  T0 takes KV
+// only and has a 20 MiB gap; T1 takes KV and weight-named heads and has 10 MiB.  Head
+// a (KV, 10 MiB) then head b (names weight, 10 MiB): a global best fit puts a in T1's
+// tighter room and b has nowhere to go.  The constrained head is placed first.
+static int case_i8_constrained_head_first() {
+    auto zones = [] {
+        krt::device_model dev;
+        dev.tlsfs.emplace_back(MiB + 16 * MiB + 20 * MiB);
+        dev.tlsfs[0].takes_weight_named = false;
+        dev.tlsfs[0].context(16 * MiB);
+        dev.tlsfs.emplace_back(MiB + 16 * MiB + 10 * MiB);
+        dev.tlsfs[1].takes_weight_named = true;
+        dev.tlsfs[1].context(16 * MiB);
+        return dev;
+    };
+    kv_region_request r;
+    r.head_slots.push_back(head_slot("a", 0, 10 * MiB, false));
+    r.head_slots.push_back(head_slot("b", 1, 10 * MiB, true));
+    krt::device_model          dev = zones();
+    const kv_region_fit_result f   = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits && f.refused_heads.empty(), "constrained: both heads are placed");
+    CHECK_EQ(f.heads[0].tlsf, 0, "constrained: the KV head takes the TLSF only it may use");
+    CHECK_EQ(f.heads[1].tlsf, 1, "constrained: the weight-naming head takes the one TLSF that may take it");
+    CHECK(dev.replay(f), "constrained: and both carve at the fit's offsets");
+
+    // The order of the request does not matter, and best fit still decides within a set.
+    kv_region_request swapped;
+    swapped.head_slots.push_back(head_slot("b", 0, 10 * MiB, true));
+    swapped.head_slots.push_back(head_slot("a", 1, 10 * MiB, false));
+    krt::device_model          dev2 = zones();
+    const kv_region_fit_result g    = kv_region_fit(dev2.snapshot(), swapped);
+    CHECK(g.fits && g.heads[0].tlsf == 1 && g.heads[1].tlsf == 0, "constrained: request order is irrelevant");
+    CHECK(dev2.replay(g), "constrained: swapped, the carve still lands");
+
+    // Two unconstrained heads on the same pair still use best fit: the 10 MiB gap first.
+    kv_region_request both;
+    both.head_slots.push_back(head_slot("a", 0, 10 * MiB, false));
+    krt::device_model          dev3 = zones();
+    const kv_region_fit_result h    = kv_region_fit(dev3.snapshot(), both);
+    CHECK(h.fits && h.heads[0].tlsf == 1, "constrained: an unconstrained head alone takes the tighter room");
+
+    // The commit re-fit of the first plan places both heads again.
+    krt::device_model before = zones();
+    for (size_t t = 0; t < before.tlsfs.size(); ++t) {
+        before.tlsfs[t].yield(f.yield_prefix[t], {});
+    }
+    for (const auto & op : f.carve_order) {
+        before.tlsfs[op.tlsf].own(op.offset, op.size);
+    }
+    kv_region_request re         = r;
+    re.commit_refit              = true;
+    const kv_region_fit_result k = kv_region_fit(before.snapshot(), re);
+    CHECK(k.fits && k.refused_heads.empty(), "constrained: the re-fit refuses neither head");
+    CHECK(k.heads[0].tlsf == 0 && k.heads[1].tlsf == 1, "constrained: and puts them where the plan did");
+    return 0;
+}
+
+// A re-fit's rooms are shrunk to what the plan put in them, which changes which room
+// a greedy best fit finds tightest.  Retained runs of 10 and 12 MiB, slots of 4, 6 and
+// 5 MiB: the plan puts 4 and 6 in the 10 and 5 in the 12 (the 12 keeps 7 spare).  A
+// re-fit whose rooms are 10 and 5 puts the 4 in the 5, and the 5 then has no room.
+static int case_i9_refit_exact_in_shrunk_rooms() {
+    auto zones = [] {
+        krt::device_model dev;
+        dev.tlsfs.emplace_back(16 * MiB + 22 * MiB);
+        krt::zone_model & z = dev.tlsfs[0];
+        z.weight(16 * MiB);
+        const size_t x = z.context(10 * MiB);
+        const size_t y = z.context(12 * MiB);
+        z.retain(x, 10 * MiB);
+        z.retain(y, 12 * MiB);
+        return dev;
+    };
+    kv_region_request r             = layers_request(iota_layers(0, 3), 4 * MiB);
+    r.layers[1].kv_bytes            = 6 * MiB;
+    r.layers[2].kv_bytes            = 5 * MiB;
+    krt::device_model          dev  = zones();
+    const kv_region_fit_result plan = kv_region_fit(dev.snapshot(), r);
+    CHECK(plan.fits && device_layers(plan) == 3, "shrunk: the plan places every slot");
+    CHECK(dev.replay(plan), "shrunk: and carves");
+    krt::device_model before = zones();
+    for (const auto & op : plan.carve_order) {
+        before.tlsfs[op.tlsf].own(op.offset, op.size);
+    }
+    kv_region_request re         = r;
+    re.commit_refit              = true;
+    const kv_region_fit_result g = kv_region_fit(before.snapshot(), re);
+    CHECK(g.fits, "shrunk: the re-fit fits");
+    CHECK_EQ(device_layers(g), 3, "shrunk: and places every slot the plan placed");
+    CHECK(before.replay(g), "shrunk: and carves at its offsets");
+    return 0;
+}
+
+// A greedy best fit of the heads can refuse one the plan placed (the L3 r2 fuzz,
+// seed 8989): own rooms of 33 and 48 MiB, heads of 27 (names weight), 33 and 16 MiB.
+// Best fit puts the 27 in the 33 and the 33 in the 48, and the 16 has nowhere to go;
+// the placement the plan had is 27 and 16 in the 48, the 33 in the 33.
+static int case_i12_refit_heads_search() {
+    krt::device_model dev;
+    for (size_t gap : { 33 * MiB, 48 * MiB }) {
+        dev.tlsfs.emplace_back(MiB + 16 * MiB + gap);
+        krt::zone_model & z = dev.tlsfs.back();
+        z.context(MiB);
+        z.weight(16 * MiB);
+        z.own(z.anchor() - gap, gap);
+    }
+    kv_region_request r;
+    r.head_slots.push_back(head_slot("h", 0, 27 * MiB, true));
+    r.head_slots.push_back(head_slot("h", 1, 33 * MiB, false));
+    r.head_slots.push_back(head_slot("h", 2, 16 * MiB, false));
+    r.commit_refit               = true;
+    const kv_region_fit_result f = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits && f.refused_heads.empty(), "heads search: the re-fit refuses no head the rooms can hold");
+    CHECK(f.heads[0].tlsf == 1 && f.heads[2].tlsf == 1 && f.heads[1].tlsf == 0,
+          "heads search: 27 and 16 share the 48, the 33 takes the 33");
+    CHECK(dev.replay(f), "heads search: and the carve lands at the fit's offsets");
+
+    // Control: with the rooms one MiB too small for the three there is no placement,
+    // and the search says so instead of inventing one.
+    krt::device_model tight;
+    for (size_t gap : { 33 * MiB, 42 * MiB }) {
+        tight.tlsfs.emplace_back(MiB + 16 * MiB + gap);
+        krt::zone_model & z = tight.tlsfs.back();
+        z.context(MiB);
+        z.weight(16 * MiB);
+        z.own(z.anchor() - gap, gap);
+    }
+    const kv_region_fit_result g = kv_region_fit(tight.snapshot(), r);
+    CHECK(!g.fits && !g.refused_heads.empty(), "heads search: control: rooms that cannot hold all three refuse");
+    return 0;
+}
+
+// An optional tenant counts as room only where a yield could use it (the L3 r2 review
+// I-2): here nothing carvable holds 100 MiB, so the layer demotes and the room the
+// fit reports is the 21 MiB gap plus the 50 MiB of the hole above its pending range.
+static int case_i10_opt_room_needs_a_carvable_span() {
+    krt::device_model dev;
+    dev.tlsfs.emplace_back(MiB + 16 * MiB + 40 * MiB + 100 * MiB + 60 * MiB + 30 * MiB + 20 * MiB);
+    krt::zone_model & z = dev.tlsfs[0];
+    z.context(16 * MiB);
+    z.weight(40 * MiB);
+    const size_t opt  = z.optional_tenant(100 * MiB);
+    const size_t hole = z.weight(60 * MiB);
+    z.weight(30 * MiB);
+    z.free(hole);
+    z.pend(opt + 100 * MiB, 10 * MiB);  // the bottom of the hole: the tenant's span now tops under it
+    const kv_region_request    r = layers_request(iota_layers(0, 1), 100 * MiB);
+    const kv_region_fit_result f = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits && device_layers(f) == 0, "opt room: no carvable room holds 100 MiB, so the layer demotes");
+    CHECK_EQ(f.free_after_full_kv[0], (71ll - 100ll) * (long long) MiB,
+             "opt room: the tenant under the pending range is not counted (21 + 50 - 100 MiB)");
+    CHECK(f.buried_released.empty(), "opt room: and no yield is claimed for it");
+
+    // The tenant's span tops at the FREE piece above it, not at the tenant: a pending
+    // range at the top of that hole leaves the tenant and the hole both unreachable.
+    krt::device_model above;
+    above.tlsfs.emplace_back(MiB + 16 * MiB + 40 * MiB + 100 * MiB + 60 * MiB + 30 * MiB + 20 * MiB);
+    krt::zone_model & u = above.tlsfs[0];
+    u.context(16 * MiB);
+    u.weight(40 * MiB);
+    u.optional_tenant(100 * MiB);
+    const size_t hole3 = u.weight(60 * MiB);
+    u.weight(30 * MiB);
+    u.free(hole3);
+    u.pend(hole3 + 50 * MiB, 10 * MiB);
+    const kv_region_fit_result t = kv_region_fit(above.snapshot(), r);
+    CHECK(t.fits && device_layers(t) == 0, "opt room: a span topped by a non-carvable hole holds no layer");
+    CHECK_EQ(t.free_after_full_kv[0], (21ll - 100ll) * (long long) MiB,
+             "opt room: neither the tenant nor the hole under the range counts (only the 21 MiB gap)");
+
+    // Control: without the range the tenant is reachable and counts, and a yield places the layer.
+    krt::device_model open;
+    open.tlsfs.emplace_back(MiB + 16 * MiB + 40 * MiB + 100 * MiB + 60 * MiB + 30 * MiB + 20 * MiB);
+    krt::zone_model & w = open.tlsfs[0];
+    w.context(16 * MiB);
+    w.weight(40 * MiB);
+    w.optional_tenant(100 * MiB);
+    const size_t hole2 = w.weight(60 * MiB);
+    w.weight(30 * MiB);
+    w.free(hole2);
+    const kv_region_fit_result g = kv_region_fit(open.snapshot(), r);
+    CHECK(g.free_after_full_kv[0] > f.free_after_full_kv[0], "opt room: control: with no range the room is larger");
+    return 0;
+}
+
+// An optional tenant a pending range covers is a hard barrier (still an allocated
+// block): the free piece under it stays carvable.
+static int case_i11_free_piece_under_a_cut_tenant() {
+    krt::device_model dev;
+    dev.tlsfs.emplace_back(MiB + 16 * MiB + 150 * MiB + 50 * MiB + 10 * MiB + 5 * MiB);
+    krt::zone_model & z = dev.tlsfs[0];
+    z.context(MiB);
+    z.weight(16 * MiB);
+    const size_t hole = z.weight(150 * MiB);
+    const size_t opt  = z.optional_tenant(50 * MiB, false);
+    z.weight(10 * MiB);
+    z.free(hole);
+    z.pend(opt + 10 * MiB, 5 * MiB);  // inside the tenant: it is a barrier whole, not a soft one
+    const kv_region_request    r = layers_request(iota_layers(0, 1), 100 * MiB);
+    const kv_region_fit_result f = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits && device_layers(f) == 1, "cut tenant: the hole under the tenant takes the layer");
+    CHECK(dev.replay(f), "cut tenant: and the carve lands under the allocated tenant");
     return 0;
 }
 
@@ -2353,6 +2574,21 @@ int main() {
         return rc;
     }
     if (int rc = run_case("i4_best_fit_across_tlsfs", case_i4_best_fit_across_tlsfs)) {
+        return rc;
+    }
+    if (int rc = run_case("i8_constrained_head_first", case_i8_constrained_head_first)) {
+        return rc;
+    }
+    if (int rc = run_case("i9_refit_exact_in_shrunk_rooms", case_i9_refit_exact_in_shrunk_rooms)) {
+        return rc;
+    }
+    if (int rc = run_case("i10_opt_room_needs_a_carvable_span", case_i10_opt_room_needs_a_carvable_span)) {
+        return rc;
+    }
+    if (int rc = run_case("i11_free_piece_under_a_cut_tenant", case_i11_free_piece_under_a_cut_tenant)) {
+        return rc;
+    }
+    if (int rc = run_case("i12_refit_heads_search", case_i12_refit_heads_search)) {
         return rc;
     }
     if (int rc = run_case("i5_sub_slot_hole_after_heads", case_i5_sub_slot_hole_after_heads)) {
