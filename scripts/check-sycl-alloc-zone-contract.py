@@ -36,13 +36,17 @@ listed, not missed. An `using R = alloc_request;` or `typedef alloc_request RT;`
 `R r{}` is judged. Constructions that carry no request-type token are found by shape: a braced-init-list
 returned from a request-returning function or passed to a function that takes a request (B-FORM), and an
 `auto x = <request>` copy of a request variable, parameter, member, std::move or call result (DEFER-C).
+Both rules resolve a callee by name against the tree, so these stay unseen: a call through a lambda, a function
+pointer or a std::function, and a call written inside a macro body (`#define ZZ() unified_allocate({})`).
 A #define body that assigns a tracked field is a B-FORM finding (macro-write).
 
 A write only counts when it is bound to the declaration (the nearest enclosing one of that name, looking
 through #if branches), comes before the request is first handed to other code (passed, returned, copied,
 or named in a lambda), and is not under a conditional. A whole-object assignment (`req = {}`,
-`req = other;`) is a copy and defers to clause (c). The other tier flag may only ever be written a
-literal false.
+`req = other;`) is a copy and defers to clause (c). A braced assignment to `intent` or `constraints`
+discards the writes bound to that subtree and re-seeds it from the list. The other tier flag may only ever
+be written a literal false. Write credit is positional and does not follow control flow, so a write after
+`if (b) goto done;` or after an unconditional `return;` is still credited (documented gap).
 
 Not here yet (later units, each lands with its witnesses)
   (c) interprocedural flow, so a copy / helper return / by-reference write is a construction of
@@ -145,7 +149,7 @@ RAW_STRINGS = ("zeMemAllocDevice", "zeMemAllocShared", "zePhysicalMemCreate", "z
 
 DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a, b, d, e). Shrink-only: a violation not listed "
             "fails, and a listed entry that no longer violates fails. Every E-RAW entry carries a fate (deleted-by-*, "
-            "converted-by-*, sanctioned-internal or pending-disposition) and a cite, so an entry no step will ever "
+            "converted-by-*, sanctioned-internal, sanctioned-vendored or pending-disposition) and a cite, so an entry no step will ever "
             "shrink is visible as a mislabelled allowlist entry. Regenerate with `python3 "
             "scripts/check-sycl-alloc-zone-contract.py --write-debt` (it refuses to add entries); see README.md.")
 FATE_RE = re.compile(r"^(deleted-by|converted-by)-[A-Za-z0-9._§()-]+$|^sanctioned-internal$|^sanctioned-vendored$|^pending-disposition$")
@@ -362,10 +366,10 @@ def file_funcs(src):
             if nm is None:
                 continue
             name = callee_last(txt(src, nm))
-            top, byval = n, True
+            byval = True
             q = parent(n)
             while q is not None and kind(q) in ("pointer_declarator", "reference_declarator"):
-                top, byval = q, False
+                byval = False
                 q = parent(q)
             ret = None
             if q is not None and kind(q) in ("declaration", "field_declaration", "function_definition"):
@@ -401,6 +405,22 @@ def file_members(src):
                             out.append((base_type(txt(src, t)), txt(src, d)))
         _MEMBERS[h] = out
     return _MEMBERS[h]
+
+
+def has_braced_arg(src, lst):
+    """True when an argument list or initialiser list has a braced-init-list element. The grammar reads a bare
+    `{}` argument as a compound literal of no type, so that shape counts too."""
+    for c in kids(lst):
+        if kind(c) == "initializer_list":
+            return True
+        if kind(c) == "compound_literal_expression" and (fld(c, "type") is None or not txt(src, fld(c, "type")).strip()):
+            return True
+    return False
+
+
+def literal_content(src, c):
+    """The characters between a string literal's delimiters (a raw string's delimiter and parentheses excluded)."""
+    return "".join(txt(src, x) for x in kids(c) if kind(x) in ("string_content", "raw_string_content", "escape_sequence"))
 
 
 def callee_last(text):
@@ -635,9 +655,31 @@ def binding_decl(src, an, name):
 _ASSIGN_CACHE = {}
 
 
+def unparen(n):
+    """Strip any number of enclosing parentheses: `(req)` is `req`."""
+    while n is not None and kind(n) == "parenthesized_expression":
+        inner = [c for c in kids(n) if _a(c, "is_named")]
+        if len(inner) != 1:
+            break
+        n = inner[0]
+    return n
+
+
+def lhs_chain(src, lhs):
+    """(root identifier node or None, fields written outermost first) of an assignment's left side, looking through
+    parentheses at every level."""
+    chain = []
+    x = unparen(lhs)
+    while x is not None and kind(x) == "field_expression":
+        f = fld(x, "field")
+        chain.append(txt(src, f) if f is not None else "?")
+        x = unparen(fld(x, "argument"))
+    return (x if x is not None and kind(x) == "identifier" else None), chain
+
+
 def assignments_in(src_key, src, block):
     """Every assignment in a block whose left side is an identifier or a field chain rooted at one:
-    [(root name, last field or None for a whole-object assignment, rhs node, assignment node, is compound)]."""
+    [(root name, rhs node, assignment node, is compound)]."""
     key = (src_key, sb(block), eb(block))
     if key in _ASSIGN_CACHE:
         return _ASSIGN_CACHE[key]
@@ -648,16 +690,10 @@ def assignments_in(src_key, src, block):
         op = [txt(src, c) for c in kids(n) if not _a(c, "is_named")]
         if not op or not op[0].endswith("="):
             continue
-        lhs, rhs = fld(n, "left"), fld(n, "right")
-        chain = []
-        x = lhs
-        while x is not None and kind(x) == "field_expression":
-            f = fld(x, "field")
-            chain.append(txt(src, f) if f is not None else "?")
-            x = fld(x, "argument")
-        if x is None or kind(x) != "identifier":
+        x, _ = lhs_chain(src, fld(n, "left"))
+        if x is None:
             continue
-        out.append((txt(src, x), chain[0] if chain else None, rhs, n, op[0] != "="))
+        out.append((txt(src, x), fld(n, "right"), n, op[0] != "="))
     _ASSIGN_CACHE[key] = out
     return out
 
@@ -690,9 +726,11 @@ def is_use(src, ident, decl):
     top = ident
     p = parent(top)
     last = None
-    while p is not None and kind(p) == "field_expression" and same(fld(p, "argument"), top):
-        f = fld(p, "field")
-        last = txt(src, f) if f is not None else "?"
+    while p is not None and (kind(p) == "parenthesized_expression"
+                             or (kind(p) == "field_expression" and same(fld(p, "argument"), top))):
+        if kind(p) == "field_expression":
+            f = fld(p, "field")
+            last = txt(src, f) if f is not None else "?"
         top = p
         p = parent(top)
     if last is not None and last not in STRUCT_FIELDS:
@@ -704,24 +742,19 @@ def is_use(src, ident, decl):
 
 def assign_last_field(src, an):
     """The last field written by an assignment, or None for a whole-object assignment."""
-    chain = []
-    x = fld(an, "left")
-    while x is not None and kind(x) == "field_expression":
-        f = fld(x, "field")
-        chain.append(txt(src, f) if f is not None else "?")
-        x = fld(x, "argument")
+    _, chain = lhs_chain(src, fld(an, "left"))
     return chain[0] if chain else None
 
 
-def request_valued(src, ctx, h, node, auto_names):
+def request_valued(src, ctx, node, auto_names):
     """True when an initialiser expression evidently has a request type: a request variable or parameter, a member
     chain ending in a request member or intent/constraints, std::move of one, or a call returning a request."""
     k = kind(node)
     if k == "parenthesized_expression":
         inner = [c for c in kids(node) if _a(c, "is_named")]
-        return bool(inner) and request_valued(src, ctx, h, inner[0], auto_names)
+        return bool(inner) and request_valued(src, ctx, inner[0], auto_names)
     if k == "conditional_expression":
-        return any(request_valued(src, ctx, h, fld(node, f), auto_names) for f in ("consequence", "alternative")
+        return any(request_valued(src, ctx, fld(node, f), auto_names) for f in ("consequence", "alternative")
                    if fld(node, f) is not None)
     if k == "identifier":
         name = txt(src, node)
@@ -756,7 +789,7 @@ def request_valued(src, ctx, h, node, auto_names):
         ft = re.sub(r"\s+", "", txt(src, fn))
         if ft in ("std::move", "std::forward", "move", "forward"):
             args = [c for c in kids(fld(node, "arguments")) if _a(c, "is_named")]
-            return len(args) == 1 and request_valued(src, ctx, h, args[0], auto_names)
+            return len(args) == 1 and request_valued(src, ctx, args[0], auto_names)
         return callee_last(ft) in ctx.req_returning
     return False
 
@@ -777,7 +810,7 @@ def callee_ident(src, ident):
 # Roles that are known and need no finding; the others are B-FORM.
 FINDING_ROLES = ("array", "new", "template-arg", "base-class", "cast", "range-for-copy", "unclassified", "default-arg",
                  "braced-return", "braced-arg", "macro-write")
-MACRO_WRITE_RE = re.compile(r"(?:\.|->)\s*(?:" + "|".join(TRACKED) + r")\s*[|&^+-]?=(?!=)")
+MACRO_WRITE_RE = re.compile(r"(?:\.|->)\s*(?:" + "|".join(TRACKED) + r")\s*(?:<<|>>|[|&^+*/%-])?=(?!=)")
 PTR_KINDS = ("pointer_declarator", "reference_declarator")
 ABSTRACT_PTR = ("abstract_pointer_declarator", "abstract_reference_declarator")
 
@@ -903,7 +936,7 @@ def scan_file(rel, src, ctx):
             if sb(ident) >= eb(n) and same(binding_decl(src, ident, name), n) and is_use(src, ident, n):
                 first_use = sb(ident)
                 break
-        for root_name, _, rhs, an, compound in assignments_in(h, src, blk):
+        for root_name, rhs, an, compound in assignments_in(h, src, blk):
             if root_name != name or not (eb(n) <= sb(an)):
                 continue
             if not same(binding_decl(src, an, name), n):
@@ -915,7 +948,13 @@ def scan_file(rel, src, ctx):
             if last is None:
                 copied.append("whole-assign")
             elif last in STRUCT_FIELDS:
-                if rhs is not None and kind(rhs) == "initializer_list" and not compound:
+                if rhs is not None and kind(rhs) == "initializer_list" and not compound \
+                        and not is_conditional(an, blk, n) and not late:
+                    # `req.intent = {...}` replaces the subtree: what was written there before is gone, and
+                    # the list re-seeds it (constraints holds every tracked field but the cohort id)
+                    for f in list(fields):
+                        if last == "intent" or f != "cohort_id":
+                            del fields[f]
                     init_fields(src, rhs, fields, copied)
                 else:
                     copied.append(last)
@@ -926,6 +965,21 @@ def scan_file(rel, src, ctx):
 
     for n in walk(root):
         k = kind(n)
+        if k == "declaration":
+            # `scoped_unified_alloc s({.size = 1});` and `s{ {.size = 1} };` build a request inside a constructor call
+            tt = fld(n, "type")
+            if tt is not None and callee_last(txt(src, tt)) in ctx.req_funcs:
+                for d in kids(n):
+                    v = fld(d, "value") if kind(d) == "init_declarator" else None
+                    if v is not None and kind(v) in ("argument_list", "initializer_list") and has_braced_arg(src, v):
+                        forms.append({"func": enclosing(src, n), "role": "braced-arg", "tok": "{...}",
+                                      "line": line_of(n), "text": txt(src, n)})
+        elif k == "new_expression":
+            tt = fld(n, "type")
+            lists = [c for c in kids(n) if kind(c) in ("argument_list", "initializer_list")]
+            if tt is not None and callee_last(txt(src, tt)) in ctx.req_funcs and any(has_braced_arg(src, c) for c in lists):
+                forms.append({"func": enclosing(src, n), "role": "braced-arg", "tok": "{...}", "line": line_of(n),
+                              "text": txt(src, n)})
         if k in ("declaration", "field_declaration"):
             t = fld(n, "type")
             auto_decl = t is not None and k == "declaration" and kind(t) == "placeholder_type_specifier"
@@ -946,7 +1000,7 @@ def scan_file(rel, src, ctx):
                     # `auto x = <request>` copies a request without naming its type; the copy is clause (c)'s
                     name = declared_name(src, d)
                     init = fld(d, "value") if kind(d) == "init_declarator" else None
-                    if name is None or init is None or not request_valued(src, ctx, h, init, auto_names):
+                    if name is None or init is None or not request_valued(src, ctx, init, auto_names):
                         continue
                     auto_names.add((name, sb(n)))
                     form, val = "copy", init
@@ -1021,7 +1075,7 @@ def scan_file(rel, src, ctx):
                     forms.append({"func": enclosing(src, n), "role": "braced-return", "tok": "{...}",
                                   "line": line_of(n), "text": txt(src, n)})
         elif k == "call_expression" and fld(n, "arguments") is not None \
-                and any(kind(c) == "initializer_list" for c in kids(fld(n, "arguments"))) \
+                and has_braced_arg(src, fld(n, "arguments")) \
                 and fld(n, "function") is not None and callee_last(txt(src, fld(n, "function"))) in ctx.req_funcs:
             forms.append({"func": enclosing(src, n), "role": "braced-arg", "tok": "{...}", "line": line_of(n),
                           "text": txt(src, n)})
@@ -1029,9 +1083,8 @@ def scan_file(rel, src, ctx):
             if k != "concatenated_string" and parent(n) is not None and kind(parent(n)) == "concatenated_string":
                 continue  # judged as part of the whole concatenation
             s = txt(src, n)
-            joined = "".join(txt(src, c) for c in kids(n) if kind(c) in ("string_literal", "raw_string_literal")) \
-                if k == "concatenated_string" else s
-            joined = joined.replace('" "', "").replace('""', "")
+            joined = "".join(literal_content(src, c) for c in kids(n) if kind(c) in ("string_literal", "raw_string_literal")) \
+                if k == "concatenated_string" else literal_content(src, n)
             for r in RAW_STRINGS:
                 if r in joined or r in s:
                     raws.append({"func": enclosing(src, n), "name": r, "line": line_of(n), "form": "string",
@@ -1455,6 +1508,9 @@ WITNESSES = {
     "r2m6": "writes after the first use do not satisfy", "r2m7": "a macro body assigning a tracked field",
     "r2m8": "scope: anchored skips, case-insensitive suffixes, required files, floor",
     "r2n": "adjacent string literals are judged joined",
+    "r3i1": "a braced assignment to intent/constraints discards earlier writes",
+    "r3i2": "braced arguments in constructor and new forms", "r3m1": "parenthesised left sides",
+    "r3n": "raw strings split across adjacent literals; compound macro writes",
     "f": "missing tree_sitter_language_pack exits 1", "cmake": "the ctest never passes a regeneration flag",
 }
 WITNESSES_DEFERRED = {"9": "S2d: dormant clause; its *_bytes() subjects are absent from the tree"}
@@ -1815,6 +1871,59 @@ def matrix_cases():
     A(Case("r2m3", "sanctioned-vendored and pending-disposition are valid fates (control)", lambda f: f, "PASS",
            edit_debt=lambda d: dict(d, violations=[dict(e, fate="pending-disposition") if (e["code"] == "E-RAW" and "::unified_alloc::" in e["key"]) else e
                                                    for e in d["violations"]]), planted=False))
+    # r3 I-1: a braced assignment to a sub-struct discards what was written there
+    for lab, stmt in (("req.intent = {}", "req.intent = {};"),
+                      ("req.intent.constraints = {}", "req.intent.constraints = {};"),
+                      ("req.intent = { .role = X }", "req.intent = { .role = ggml_sycl::alloc_role::STAGING };"),
+                      ("req.intent = { .constraints = {} }", "req.intent = { .constraints = {} };"),
+                      ("(req.intent.constraints) = {}", "(req.intent.constraints) = {};")):
+        A(Case("r3i1", "%s after good writes" % lab, plant(good_device("zzplant_r3i1", "    %s\n" % stmt)),
+               "FAIL", "B-TIER", "zzplant_r3i1"))
+    A(Case("r3i1", "a conditional braced reset after good writes", plant(
+        "void zzplant_r3i1(bool b) {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n    if (b) req.intent = {};\n}\n" % REQ),
+        "FAIL", "DEFER-C", "zzplant_r3i1"))
+    A(Case("r3i1", "a braced constraints assignment that re-seeds every flag (control)", plant(
+        "void zzplant_r3i1() {\n    %s req{};\n    req.intent.constraints = { .must_device = true, "
+        ".prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME, .forbid_vram_zone_spill = true };\n}\n" % REQ), "PASS"))
+    A(Case("r3i1", "a braced intent assignment that re-seeds every flag (control)", plant(
+        "void zzplant_r3i1() {\n    %s req{};\n    req.intent = { .constraints = { .must_device = true, "
+        ".prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME, .forbid_vram_zone_spill = true } };\n}\n" % REQ), "PASS"))
+    # r3 I-2: braced request arguments to a constructor, a brace-init and new
+    A(Case("r3i2", "scoped_unified_alloc s({.size = 1})", plant(
+        "void zzplant_r3i2a() {\n    ggml_sycl::scoped_unified_alloc s({.size = 1});\n}\n"), "FAIL", "B-FORM", "zzplant_r3i2a"))
+    A(Case("r3i2", "scoped_unified_alloc s{ {.size = 1} }", plant(
+        "void zzplant_r3i2b() {\n    ggml_sycl::scoped_unified_alloc s{ {.size = 1} };\n}\n"), "FAIL", "B-FORM", "zzplant_r3i2b"))
+    A(Case("r3i2", "new scoped_unified_alloc({.size = 1})", plant(
+        "void zzplant_r3i2c() {\n    auto * p = new ggml_sycl::scoped_unified_alloc({.size = 1});\n    (void) p;\n}\n"),
+        "FAIL", "B-FORM", "zzplant_r3i2c"))
+    A(Case("r3i2", "scoped_unified_alloc over a named request (control)", plant(good_device(
+        "zzplant_r3i2d", "    ggml_sycl::scoped_unified_alloc s(req);\n")), "PASS"))
+    # r3 M-1: parentheses around the left side
+    A(Case("r3m1", "(req) = other after good writes", plant(
+        "void zzplant_r3m1a(const %s & o) {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n    (req) = o;\n}\n" % (REQ, REQ)),
+        "FAIL", "DEFER-C", "zzplant_r3m1a"))
+    A(Case("r3m1", "(req).intent...forbid = false after good writes", plant(good_device(
+        "zzplant_r3m1b", "    (req).intent.constraints.forbid_vram_zone_spill = false;\n")), "FAIL", "D-FORBID-FALSE", "zzplant_r3m1b"))
+    A(Case("r3m1", "every write through parentheses (control)", plant(
+        "void zzplant_r3m1c() {\n    %s req{};\n    (req).intent.constraints.must_device = true;\n"
+        "    ((req).intent).constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    (req.intent.constraints).forbid_vram_zone_spill = true;\n    ggml_sycl::unified_allocate(req);\n}\n" % REQ),
+        "PASS"))
+    # r3 nits: a raw string split across adjacent literals; compound macro writes
+    A(Case("r3n", "R\"(zeMem)\" \"AllocDevice\"", plant(
+        "void zzplant_r3n() {\n    const char * s = R\"(zeMem)\" \"AllocDevice\";\n    (void) s;\n}\n"),
+        "FAIL", "E-RAW", "zzplant_r3n"))
+    A(Case("r3n", "a #define with a compound assignment to a tracked field", plant(
+        "#define ZZ_MUL(r) r.intent.constraints.cascade_step *= 2\n"), "FAIL", "B-FORM", "ZZ_MUL"))
+    A(Case("r3n", "a #define with <<= on a tracked field", plant(
+        "#define ZZ_SHL(r) r.intent.constraints.cascade_step <<= 1\n"), "FAIL", "B-FORM", "ZZ_SHL"))
+    A(Case("r3n", "a #define with a relational compare is not a write (control)", plant(
+        "#define ZZ_LE(r) (r.intent.constraints.cascade_step <= 1 && r.intent.constraints.cascade_step != 2)\n"),
+        "PASS", planted=False))
     return c
 
 

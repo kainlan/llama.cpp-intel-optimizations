@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clauses a, b, d, e). Shrink-only: a violation not listed fails, and a listed entry that no longer violates fails. Every E-RAW entry carries a fate (deleted-by-*, converted-by-*, sanctioned-internal or pending-disposition) and a cite, so an entry no step will ever shrink is visible as a mislabelled allowlist entry. Regenerate with `python3 scripts/check-sycl-alloc-zone-contract.py --write-debt` (it refuses to add entries); see README.md.",
+  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clauses a, b, d, e). Shrink-only: a violation not listed fails, and a listed entry that no longer violates fails. Every E-RAW entry carries a fate (deleted-by-*, converted-by-*, sanctioned-internal, sanctioned-vendored or pending-disposition) and a cite, so an entry no step will ever shrink is visible as a mislabelled allowlist entry. Regenerate with `python3 scripts/check-sycl-alloc-zone-contract.py --write-debt` (it refuses to add entries); see README.md.",
   "violations": [
     {"code": "B-BRACE", "key": "cpu-expert-pool.cpp::CpuExpertPool::init::declaration:c:49299edc#0"},
     {"code": "B-BRACE", "key": "ggml-sycl.cpp::ggml_sycl_attn_host_staging_get::declaration:c:e2526092#0"},
