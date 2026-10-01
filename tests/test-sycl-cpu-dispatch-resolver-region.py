@@ -155,7 +155,9 @@ def main():
         return 1
     if check_external_executors(os.path.dirname(DEFAULT_SOURCE), overrides) != 0:
         return 1
-    print("PASS: every resolver call in cpu-dispatch.cpp sits inside a host-executor region; %d region mutants caught" % len(decls))
+    external = ", ".join(sig.split("(")[0].split()[-1] for _, sig in EXTERNAL_EXECUTORS)
+    print("PASS: every resolver call in cpu-dispatch.cpp and in the external executors (%s) sits inside a "
+          "host-executor region; %d cpu-dispatch region mutants caught" % (external, len(decls)))
     return 0
 
 
