@@ -2300,13 +2300,8 @@ static void ggml_sycl_get_rows_dispatch_slice(ggml_backend_sycl_context & ctx,
                 get_rows_q6_k_aos_sycl(ctx, src0, src1, dst, src0_dd, src1_dd, dst_dd, stream);
             }
             break;
-        case GGML_TYPE_Q4_K:
-            if (!ggml_sycl_get_rows_layout_supported(GGML_TYPE_Q4_K, layout)) {
-                GGML_LOG_ERROR("%s: Q4_K GET_ROWS reads the AoS layout only, got layout %d\n", __func__, (int) layout);
-                GGML_ABORT("fatal error");
-            }
-            get_rows_q4_k_aos_sycl(ctx, src0, src1, dst, src0_dd, src1_dd, dst_dd, stream);
-            break;
+        // No Q4_K arm: this dispatcher serves the host-resident DMA path, and supports_op declines host-planned
+        // weights (placement decides the executor), so Q4_K never streams. The abort below is the backstop.
         default:
             GGML_LOG_ERROR("%s: unsupported type for streaming: %s\n", __func__, ggml_type_name(src0->type));
             GGML_ABORT("fatal error");

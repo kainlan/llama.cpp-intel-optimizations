@@ -5591,13 +5591,12 @@ inline bool ggml_sycl_get_planned_weight_layout(const ggml_tensor * tensor, int 
     if (!plan_owner || plan_owner->entries.empty()) {
         return false;
     }
-    for (const auto & entry : plan_owner->entries) {
-        if (entry.expert_id < 0 && entry.name == tensor->name) {
-            *layout = entry.layout;
-            return true;
-        }
+    const auto * entry = plan_owner->find_dense_entry(std::string(tensor->name));
+    if (entry == nullptr) {
+        return false;
     }
-    return false;
+    *layout = entry->layout;
+    return true;
 }
 
 // True when a multi-device plan places this dense weight on a DIFFERENT device.
