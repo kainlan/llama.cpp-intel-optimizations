@@ -6,6 +6,7 @@
 #include "llama-adapter.h"
 #include "llama-cparams.h"
 #include "llama-ext.h"
+#include "llama-fused-resolution.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-measure-plan.h"
@@ -88,7 +89,8 @@ struct sched_reserve_state {
     uint32_t &                            n_outputs;
     uint32_t &                            n_input_tensors;
     llama_cparams &                       cparams;
-    sched_measure_plan *                  measure = nullptr;
+    sched_measure_plan *                  measure    = nullptr;
+    fused_resolution *                    resolution = nullptr;  // where resolve_fused_ops records its outcome
 };
 
 // The storage a MEASURE reserves on. The scheduler is declared first so it is
@@ -102,11 +104,13 @@ struct sched_measure_storage {
     uint32_t                            n_input_tensors    = 0;
     llama_cparams                       cparams;
     sched_measure_plan                  plan;
+    fused_resolution                    resolution;
 
     explicit sched_measure_storage(const llama_cparams & cparams_in) : cparams(cparams_in) {}
 
     sched_reserve_state state() {
-        return { sched, gf_res_prev, gf_res_reserve, gf_res_prev_active, n_outputs, n_input_tensors, cparams, &plan };
+        return { sched,           gf_res_prev, gf_res_reserve, gf_res_prev_active, n_outputs,
+                 n_input_tensors, cparams,     &plan,          &resolution };
     }
 };
 
@@ -155,6 +159,13 @@ struct llama_context {
     // from what they left. `state` is a sched_measure_storage's; nothing of the context's own
     // is written. Only a context that owns plan_caps measures.
     sched_reserve_result sched_measure_impl(sched_reserve_state & state);
+
+    // The one place a fused-op resolution is printed (upstream's text and levels, prefix
+    // "resolve_fused_ops"). Each entry prints once per resolution: the printed marks outlive a
+    // retried reserve, and a changed resolution reprints once, marked. Silent in a measure-only
+    // context. The lost form is the one fixed line the unwind guard falls back on.
+    void fused_resolution_report(const fused_resolution & record);
+    void fused_resolution_report_lost() noexcept;
 
     // sched_reserve() for decode and encode, which catch nothing above them:
     // a non-OK status or a throw from the reserve is logged and returned as
@@ -537,6 +548,14 @@ private:
     llama_plan_caps_ptr plan_caps;
 
     bool sched_need_reserve = true;
+
+    // true for the transient context a load-time measure builds (set by its constructor); such a
+    // context prints no resolution
+    bool measure_only = false;
+
+    // the text each resolution entry last printed (empty: never), so a retried reserve never
+    // prints one twice. Written only on the thread that constructs or reserves the context.
+    std::string fused_resolution_printed[FUSED_RESOLUTION_N_ENTRIES];
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

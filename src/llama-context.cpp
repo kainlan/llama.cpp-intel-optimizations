@@ -7,23 +7,24 @@
 #endif
 #include "llama-arch.h"
 #include "llama-auto-ubatch.h"
+#include "llama-batch.h"
+#include "llama-ext.h"
+#include "llama-fused-resolution.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
-#include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-measure-plan.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
-#include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
-#include <cinttypes>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -534,6 +535,29 @@ struct llama_plan_scope {
     decltype(&ggml_backend_sycl_plan_scope_close)   close_fn   = nullptr;
     void *                                          scope      = nullptr;
 };
+
+// The sink the resolution report prints through, and the trampolines the unwind guard calls.
+static void fused_resolution_sink(fused_resolution_level level, const char * text) {
+    if (level == FUSED_RESOLUTION_LEVEL_WARN) {
+        LLAMA_LOG_WARN("%s\n", text);
+    } else {
+        LLAMA_LOG_INFO("%s\n", text);
+    }
+}
+
+struct fused_resolution_guard_arg {
+    llama_context *          ctx;
+    const fused_resolution * record;
+};
+
+static void fused_resolution_report_trampoline(void * arg) {
+    auto * a = static_cast<fused_resolution_guard_arg *>(arg);
+    a->ctx->fused_resolution_report(*a->record);
+}
+
+static void fused_resolution_lost_trampoline(void * arg) noexcept {
+    static_cast<fused_resolution_guard_arg *>(arg)->ctx->fused_resolution_report_lost();
+}
 
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
@@ -1339,8 +1363,10 @@ void llama_context::sycl_recheck_runtime_context_flash_attn() {
 void llama_context::resolve_fused_ops(sched_reserve_state &          state,
                                       const llama_memory_context_i * mctx,
                                       uint32_t                       n_seqs) {
-    const char * func = __func__;
-    auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
+    GGML_ASSERT(state.resolution != nullptr);
+    fused_resolution & resolution = *state.resolution;
+
+    auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled, fused_resolution_entry id) {
         if (!enabled) {
             return;
         }
@@ -1352,9 +1378,10 @@ void llama_context::resolve_fused_ops(sched_reserve_state &          state,
             throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
         }
 
-        bool               device_mismatch = false;
-        uint32_t           n_cpu_landings  = 0;
-        int                cpu_landing_il  = -1;
+        fused_resolution_entry_data entry;
+        entry.present    = true;
+        entry.probe_name = probe.name;
+
         ggml_backend_dev_t cpu_landing_dev = nullptr;
 
         for (const auto & node : static_cast<llm_graph_result *>(state.gf_res_reserve.get())->get_fused_nodes()) {
@@ -1384,39 +1411,34 @@ void llama_context::resolve_fused_ops(sched_reserve_state &          state,
                 // compute-buffer request at n_ctx=131072 on GPT-OSS 20B traced to exactly
                 // this codepath).
                 if (!device_fused || ggml_backend_dev_type(device_fused) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    LLAMA_LOG_WARN(
-                        "%s: layer %d is assigned to device %s but %s "
-                                "is assigned to device %s (usually due to missing support)\n",
-                        func, node.il, device_layer ? ggml_backend_dev_name(device_layer) : "none", probe.name,
-                        device_fused ? ggml_backend_dev_name(device_fused) : "none");
-                    device_mismatch = true;
+                    entry.mismatch           = true;
+                    entry.mismatch_layer     = node.il;
+                    entry.mismatch_layer_dev = device_layer ? ggml_backend_dev_name(device_layer) : "none";
+                    entry.mismatch_probe_dev = device_fused ? ggml_backend_dev_name(device_fused) : "none";
                     break;
                 }
 
-                n_cpu_landings++;
-                cpu_landing_il  = node.il;
-                cpu_landing_dev = device_fused;
+                entry.n_cpu_landings++;
+                entry.cpu_landing_layer = node.il;
+                cpu_landing_dev         = device_fused;
             }
         }
 
-        if (device_mismatch) {
-            enabled = false;
-            LLAMA_LOG_WARN("%s: %s not supported, set to disabled\n", func, probe.name);
-        } else {
-            enabled = true;
-            if (n_cpu_landings > 0) {
-                LLAMA_LOG_WARN(
-                    "%s: %s executes on %s for %u layer(s) (e.g. layer %d) -- "
-                            "the executor follows data placement, not a capability gap\n",
-                    func, probe.name, cpu_landing_dev ? ggml_backend_dev_name(cpu_landing_dev) : "CPU", n_cpu_landings,
-                    cpu_landing_il);
-            }
-            LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
-        }
+        entry.enabled         = !entry.mismatch;
+        entry.cpu_landing_dev = cpu_landing_dev ? ggml_backend_dev_name(cpu_landing_dev) : "CPU";
+        enabled               = entry.enabled;
+        resolution.entry[id]  = entry;
+    };
+
+    // A group's header is recorded when its group starts, so a throw in the group's first probe
+    // still has it.
+    auto start_group = [&](fused_resolution_entry id, const char * header) {
+        resolution.entry[id].present = true;
+        resolution.entry[id].header  = header;
     };
 
     if (state.cparams.auto_fa) {
-        resolve(llm_fused_op_flash_attn_probe, state.cparams.flash_attn);
+        resolve(llm_fused_op_flash_attn_probe, state.cparams.flash_attn, FUSED_RESOLUTION_ENTRY_FA);
         state.cparams.auto_fa = false;
 
         // llama.cpp-oyfl: state.cparams.flash_attn just went from "not yet
@@ -1437,23 +1459,23 @@ void llama_context::resolve_fused_ops(sched_reserve_state &          state,
     }
 
     if (state.cparams.auto_fgdn) {
-        LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
-        resolve(llm_fused_op_gdn_ar_probe, state.cparams.fused_gdn_ar);
-        resolve(llm_fused_op_gdn_ch_probe, state.cparams.fused_gdn_ch);
+        start_group(FUSED_RESOLUTION_ENTRY_GDN_HEADER, "resolving fused Gated Delta Net support:");
+        resolve(llm_fused_op_gdn_ar_probe, state.cparams.fused_gdn_ar, FUSED_RESOLUTION_ENTRY_GDN_AR);
+        resolve(llm_fused_op_gdn_ch_probe, state.cparams.fused_gdn_ch, FUSED_RESOLUTION_ENTRY_GDN_CH);
         state.cparams.auto_fgdn = false;
     }
 
     if (state.cparams.auto_flid) {
-        LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
-        resolve(llm_fused_op_lid_probe, state.cparams.fused_lid);
+        start_group(FUSED_RESOLUTION_ENTRY_LID_HEADER, "resolving fused Lightning Indexer support:");
+        resolve(llm_fused_op_lid_probe, state.cparams.fused_lid, FUSED_RESOLUTION_ENTRY_LID);
         state.cparams.auto_flid = false;
     }
 
     if (state.cparams.auto_fhc) {
-        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
-        resolve(llm_fused_op_dsv4_hc_pre_probe, state.cparams.fused_dsv4_hc_pre);
-        resolve(llm_fused_op_dsv4_hc_comb_probe, state.cparams.fused_dsv4_hc_comb);
-        resolve(llm_fused_op_dsv4_hc_post_probe, state.cparams.fused_dsv4_hc_post);
+        start_group(FUSED_RESOLUTION_ENTRY_HC_HEADER, "resolving fused DeepSeek V4 HC support:");
+        resolve(llm_fused_op_dsv4_hc_pre_probe, state.cparams.fused_dsv4_hc_pre, FUSED_RESOLUTION_ENTRY_HC_PRE);
+        resolve(llm_fused_op_dsv4_hc_comb_probe, state.cparams.fused_dsv4_hc_comb, FUSED_RESOLUTION_ENTRY_HC_COMB);
+        resolve(llm_fused_op_dsv4_hc_post_probe, state.cparams.fused_dsv4_hc_post, FUSED_RESOLUTION_ENTRY_HC_POST);
         state.cparams.auto_fhc = false;
     }
 }
@@ -2163,6 +2185,18 @@ bool llama_context::sched_reserve_nothrow() {
     return false;
 }
 
+void llama_context::fused_resolution_report(const fused_resolution & record) {
+    if (!measure_only) {
+        fused_resolution_emit(record, fused_resolution_printed, "resolve_fused_ops", fused_resolution_sink);
+    }
+}
+
+void llama_context::fused_resolution_report_lost() noexcept {
+    if (!measure_only) {
+        LLAMA_LOG_WARN("resolve_fused_ops: resolution lines lost: exception while unwinding\n");
+    }
+}
+
 // The reserve transaction. A planned context measures first, publishes what the measure
 // resolved, and only then allocates; any other context allocates, as it always has. The
 // measure's resolved fused-op flags reach the context's own cparams only after the publish
@@ -2176,6 +2210,9 @@ sched_reserve_result llama_context::sched_reserve_transaction() {
         if (measured.status != sched_reserve_status::OK) {
             return measured;
         }
+
+        // the resolution is printed at the publish attempt, whether it commits or is refused
+        fused_resolution_report(storage.resolution);
 
         const sched_reserve_result published = sycl_publish_runtime_context(storage.cparams.flash_attn);
         if (published.status != sched_reserve_status::OK) {
@@ -2196,10 +2233,19 @@ sched_reserve_result llama_context::sched_reserve_transaction() {
     }
 
     sched_reserve_state state = member_reserve_state();
+    fused_resolution    resolution;
+    state.resolution = &resolution;
     return sched_reserve_impl(sched_reserve_mode::ALLOC, state);
 }
 
 sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state) {
+    // An exception leaving this reserve (a throw inside resolve_fused_ops, say) still prints what the
+    // record holds; a normal return prints nothing here.
+    GGML_ASSERT(state.resolution != nullptr);
+    fused_resolution_guard_arg    guard_arg = { this, state.resolution };
+    fused_resolution_unwind_guard unwind_guard(fused_resolution_report_trampoline, fused_resolution_lost_trampoline,
+                                               &guard_arg);
+
     if (mode == sched_reserve_mode::MEASURE) {
         return sched_measure_impl(state);
     }
@@ -2254,6 +2300,7 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
                     n_outputs);
 
     resolve_fused_ops(state, mctx.get(), n_seqs);
+    fused_resolution_report(*state.resolution);
 
     // reserve worst-case graph
     int n_splits_pp        = -1;

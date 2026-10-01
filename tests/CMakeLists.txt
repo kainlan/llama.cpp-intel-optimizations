@@ -3709,6 +3709,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# zhcn C7f: the fused-op resolution report (design gate 37, the report-site
+# clauses). resolve_fused_ops records and never logs; one member prints the
+# record through the pure emit function under !measure_only, in two call forms
+# plus the unwind guard's; the printed marks are a context data member.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-fused-resolution-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fused-resolution-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # zhcn C7d: the runtime-context publish returns a status and never waits
 # (design gate 22b, and the publish clauses of gate 37). No BUSY retry loop or
 # sleep_for in llama-context.cpp, the shared BUSY-retry constant gone from
@@ -3736,6 +3748,12 @@ llama_build_and_test(test-auto-ubatch-ladder.cpp)
 # and the per-chunk slot caps from the measured chunk peaks. Header-only and
 # pure integers: no device, no model, no allocation.
 llama_build_and_test(test-measure-plan.cpp)
+
+# zhcn C7f (H5r): executes the pure helpers in src/llama-fused-resolution.h --
+# the fused-op resolution record, its once-per-resolution emit with per-entry
+# printed marks (empty, partial, repeated, changed, A/B/B), and the unwind guard
+# that reports only while an exception leaves its scope. Header-only: no device.
+llama_build_and_test(test-fused-resolution-report.cpp)
 
 # llama.cpp-9goq: source gate over ggml/src/ggml-sycl/CMakeLists.txt itself --
 # (A) every target_link_libraries(...) naming the bare `ggml-sycl` MODULE

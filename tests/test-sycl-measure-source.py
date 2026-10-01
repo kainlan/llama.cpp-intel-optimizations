@@ -75,13 +75,13 @@ def types_ok(header: str) -> bool:
     h = code_of(header)
     needed = [
         # the state's trailing field is the measure pointer, null for ALLOC
-        "llama_cparams & cparams; sched_measure_plan * measure = nullptr; };",
+        "llama_cparams & cparams; sched_measure_plan * measure = nullptr; fused_resolution * resolution = nullptr; };",
         # the measure's plan
         "struct sched_measure_buft { ggml_backend_buffer_type_t buft = nullptr; size_t max_chunk_size = 0; std::vector<std::vector<size_t>> peaks; std::vector<size_t> cap; };",
         "struct sched_measure_plan { std::vector<llama_measure_graph> graphs; std::vector<sched_measure_buft> bufts; uint32_t n_measured = 0; double measure_ms = 0.0; };",
         # the storage a MEASURE writes: the scheduler is declared first, so it dies last
         "struct sched_measure_storage { ggml_backend_sched_ptr sched;",
-        "return { sched, gf_res_prev, gf_res_reserve, gf_res_prev_active, n_outputs, n_input_tensors, cparams, &plan };",
+        "return { sched, gf_res_prev, gf_res_reserve, gf_res_prev_active, n_outputs, n_input_tensors, cparams, &plan, &resolution };",
         # the copy and its deleter
         "struct llama_plan_caps_deleter { decltype(&ggml_backend_sycl_plan_caps_free) free_fn = nullptr;",
         "using llama_plan_caps_ptr = std::unique_ptr<ggml_backend_sycl_plan_caps, llama_plan_caps_deleter>;",
@@ -99,9 +99,11 @@ def test_type_mutants():
     h = code_of(CONTEXT_H)
     mutants = [
         ("measure pointer is not null by default", "sched_measure_plan * measure = nullptr;", "sched_measure_plan * measure;"),
-        ("measure pointer is not trailing", "llama_cparams & cparams; sched_measure_plan * measure = nullptr; };", "sched_measure_plan * measure = nullptr; llama_cparams & cparams; };"),
+        ("the state carries no resolution record", "fused_resolution * resolution = nullptr; };", "};"),
+        ("measure pointer is not trailing", "llama_cparams & cparams; sched_measure_plan * measure = nullptr; fused_resolution * resolution = nullptr; };", "sched_measure_plan * measure = nullptr; llama_cparams & cparams; fused_resolution * resolution = nullptr; };"),
         ("a buft keeps no peaks", "std::vector<std::vector<size_t>> peaks;", "std::vector<size_t> peaks;"),
-        ("storage state drops the plan", "n_input_tensors, cparams, &plan };", "n_input_tensors, cparams, nullptr };"),
+        ("storage state drops the plan", "n_input_tensors, cparams, &plan, &resolution };", "n_input_tensors, cparams, nullptr, &resolution };"),
+        ("storage state drops the resolution", "n_input_tensors, cparams, &plan, &resolution };", "n_input_tensors, cparams, &plan, nullptr };"),
         ("the copy is a raw pointer", "llama_plan_caps_ptr plan_caps;", "ggml_backend_sycl_plan_caps * plan_caps = nullptr;"),
         ("the copy has no deleter", "std::unique_ptr<ggml_backend_sycl_plan_caps, llama_plan_caps_deleter>", "std::unique_ptr<ggml_backend_sycl_plan_caps>"),
         ("the deleter loses the proc", "decltype(&ggml_backend_sycl_plan_caps_free) free_fn = nullptr;", "int free_fn = 0;"),
@@ -113,9 +115,9 @@ def test_type_mutants():
 def types_ok_z(text: str) -> bool:
     # types_ok works on raw header text; the mutants arrive already canonical
     needed_mutated = [
-        "llama_cparams & cparams; sched_measure_plan * measure = nullptr; };",
+        "llama_cparams & cparams; sched_measure_plan * measure = nullptr; fused_resolution * resolution = nullptr; };",
         "std::vector<std::vector<size_t>> peaks;",
-        "return { sched, gf_res_prev, gf_res_reserve, gf_res_prev_active, n_outputs, n_input_tensors, cparams, &plan };",
+        "return { sched, gf_res_prev, gf_res_reserve, gf_res_prev_active, n_outputs, n_input_tensors, cparams, &plan, &resolution };",
         "llama_plan_caps_ptr plan_caps;",
         "std::unique_ptr<ggml_backend_sycl_plan_caps, llama_plan_caps_deleter>",
         "decltype(&ggml_backend_sycl_plan_caps_free) free_fn = nullptr;",
@@ -185,7 +187,9 @@ def test_measure_purity_mutants():
 def dispatch_ok(code: str) -> bool:
     b = function_body(code, _IMPL)
     first = z("if (mode == sched_reserve_mode::MEASURE) { return sched_measure_impl(state); }")
-    return b[b.index("{") + 1 :].startswith(first)
+    # only the unwind guard's preamble may precede it: an exception out of a MEASURE must reach the guard
+    preamble = z("GGML_ASSERT(state.resolution != nullptr);") + z("fused_resolution_guard_arg guard_arg = { this, state.resolution };") + z("fused_resolution_unwind_guard unwind_guard(fused_resolution_report_trampoline, fused_resolution_lost_trampoline, &guard_arg);")
+    return b[b.index("{") + 1 :].startswith(preamble + first)
 
 
 def test_measure_is_the_impls_first_branch():
@@ -494,6 +498,7 @@ def txn_ok(code: str) -> bool:
         "sched_reserve_state measure_state = storage.state();",
         "const sched_reserve_result measured = sched_reserve_impl(sched_reserve_mode::MEASURE, measure_state);",
         "if (measured.status != sched_reserve_status::OK) { return measured; }",
+        "fused_resolution_report(storage.resolution);",
         "const sched_reserve_result published = sycl_publish_runtime_context(storage.cparams.flash_attn);",
         "if (published.status != sched_reserve_status::OK) { return published; }",
     ]
@@ -509,7 +514,7 @@ def txn_ok(code: str) -> bool:
         if b.count(w) != 1 or b.index(w) < b.index(z("if (published.status != sched_reserve_status::OK) { return published; }")):
             return False
     # ALLOC runs last, on the member state, for planned and unplanned contexts alike
-    alloc = z("sched_reserve_state state = member_reserve_state(); return sched_reserve_impl(sched_reserve_mode::ALLOC, state); }")
+    alloc = z("sched_reserve_state state = member_reserve_state(); fused_resolution resolution; state.resolution = &resolution; return sched_reserve_impl(sched_reserve_mode::ALLOC, state); }")
     return b.endswith(alloc) and b.index(alloc) > b.index(z("storage.cparams.auto_fhc;"))
 
 
@@ -527,6 +532,7 @@ def test_transaction_mutants():
         ("the measure runs as ALLOC", "sched_reserve_impl(sched_reserve_mode::MEASURE, measure_state)", "sched_reserve_impl(sched_reserve_mode::ALLOC, measure_state)"),
         ("an unplanned context measures", "if (plan_caps) {", "if (true) {"),
         ("the measure runs on the context's own cparams", "sched_measure_storage storage(cparams);", "sched_measure_storage storage(llama_cparams{});"),
+        ("the resolution never reported", "fused_resolution_report(storage.resolution);", ""),
         ("a resolved flag dropped", "cparams.fused_lid = storage.cparams.fused_lid;", ""),
         ("a resolved flag applied twice", "cparams.auto_fa = storage.cparams.auto_fa;", "cparams.auto_fa = storage.cparams.auto_fa; cparams.auto_fa = storage.cparams.auto_fa;"),
     ]
@@ -537,6 +543,10 @@ def test_transaction_mutants():
     pub = z("const sched_reserve_result published = sycl_publish_runtime_context(storage.cparams.flash_attn);")
     early = b.replace(first, "", 1).replace(pub, first + pub, 1)
     assert not txn_ok(code.replace(b, early, 1)), "mutant 'flags applied before the publish' slipped through"
+    # the resolution reported after the publish attempt instead of before it
+    rep = z("fused_resolution_report(storage.resolution);")
+    late = b.replace(rep, "", 1).replace(z("if (published.status != sched_reserve_status::OK) { return published; }"), z("if (published.status != sched_reserve_status::OK) { return published; }") + rep, 1)
+    assert not txn_ok(code.replace(b, late, 1)), "mutant 'the resolution reported after the publish' slipped through"
     # ALLOC dropped from the transaction
-    no_alloc = b.replace(z("sched_reserve_state state = member_reserve_state(); return sched_reserve_impl(sched_reserve_mode::ALLOC, state); }"), "return {}; }", 1)
+    no_alloc = b.replace(z("sched_reserve_state state = member_reserve_state(); fused_resolution resolution; state.resolution = &resolution; return sched_reserve_impl(sched_reserve_mode::ALLOC, state); }"), "return {}; }", 1)
     assert not txn_ok(code.replace(b, no_alloc, 1)), "mutant 'ALLOC dropped' slipped through"
