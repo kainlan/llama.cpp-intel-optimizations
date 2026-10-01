@@ -86,6 +86,15 @@ enum class vram_zone_id : uint8_t {
     COUNT   = 5,
 };
 
+// What backs a device's zones. Fixed when the cache is constructed and never
+// changes, so it is valid before any plan; whether the zones are backed yet is
+// the separate fact ggml_sycl_device_has_zones() answers.
+enum ggml_sycl_arena_backing_type {
+    GGML_SYCL_ARENA_BACKING_TYPE_NONE = 0,  // GGML_SYCL_VRAM_ARENA=0: no arena exists
+    GGML_SYCL_ARENA_BACKING_TYPE_USM  = 1,
+    GGML_SYCL_ARENA_BACKING_TYPE_VM   = 2,
+};
+
 struct vram_zone {
     size_t              start = 0;  // Offset from arena base
     size_t              size  = 0;  // Total zone capacity
@@ -3476,7 +3485,13 @@ class unified_cache {
     bool ensure_planned_arena_zones();
 
     // Is arena active?
-    bool arena_active() const { return arena_base_ != nullptr; }
+    bool arena_active() const { return zone_backed(); }
+
+    // The zones have backing and zone routing applies.
+    bool zone_backed() const { return arena_base_ != nullptr; }
+
+    // The device's backing kind, fixed at construction.
+    ggml_sycl_arena_backing_type arena_backing() const { return arena_backing_; }
 
     // Base pointer.
     void * arena_base() const { return arena_base_; }
@@ -3501,6 +3516,12 @@ class unified_cache {
 
     // Zone capacity and usage.
     size_t zone_capacity(vram_zone_id zone) const;
+    // The committed planned capacity only, never a bound load's view. Read off
+    // a VM device it is a plan defect.
+    size_t zone_capacity_committed(vram_zone_id zone) const;
+    // The calling thread's bound load transaction's to-commit capacity. Read
+    // off a VM device it is a plan defect.
+    size_t zone_capacity_to_commit(vram_zone_id zone) const;
     size_t zone_used(vram_zone_id zone) const;
     size_t zone_available(vram_zone_id zone) const;
     size_t zone_largest_free(vram_zone_id zone) const;
@@ -4567,6 +4588,11 @@ class unified_cache {
     // Gated by GGML_SYCL_VRAM_ARENA=1 env var.
     void * arena_base_ = nullptr;
     size_t arena_size_ = 0;
+
+    // Set by the member initialiser, so it is fixed before the constructor body
+    // reserves the arena and survives a failed reserve and arena_destroy().
+    const ggml_sycl_arena_backing_type arena_backing_ =
+        vram_arena_enabled() ? GGML_SYCL_ARENA_BACKING_TYPE_USM : GGML_SYCL_ARENA_BACKING_TYPE_NONE;
 
     struct arena_chunk {
         void *              ptr  = nullptr;
@@ -7239,6 +7265,13 @@ void unified_cache_test_set_arena_drain_timeout_ms(uint32_t timeout_ms);
 void unified_cache_test_pause_zone_settle(bool pause);
 bool unified_cache_test_zone_settle_reached();
 bool unified_cache_test_arena_destroy_closing_reached();
+// Whether g_device_caches holds an entry for the device; creates nothing.
+bool unified_cache_test_cache_exists(int device);
+// Called from cache destruction once arena_destroy() has returned, with the
+// members the cache still holds then. Pass nullptr to remove it.
+using unified_cache_test_destroy_observer = void (*)(int device, ggml_sycl_arena_backing_type backing,
+                                                     bool zone_backed);
+void unified_cache_test_set_destroy_observer(unified_cache_test_destroy_observer observer);
 #endif
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
 // Private direct-source fixture seam; never compiled into the ordinary backend DSO.
@@ -7257,6 +7290,15 @@ bool ggml_sycl_is_shutting_down();
 // ownership, lifetime or plan defect -- a leaked lease, a [CONTEXT-PLAN-BUG]
 // -- into an abort instead of a WARN. Each family keeps its own log tag.
 bool ggml_sycl_strict_enabled();
+
+// The device's backing kind. Resolves the cache through the creating getter, so
+// the value exists before any plan; a device with no cache is a plan defect
+// (NONE, or an abort under strict).
+ggml_sycl_arena_backing_type ggml_sycl_arena_backing(int device);
+
+// The device's zones have backing and zone routing applies. Never creates a
+// cache: a device with none has no zones.
+bool ggml_sycl_device_has_zones(int device);
 
 // (ExpertPlacementTable removed — the cache IS the placement.
 //  Use is_expert_resident() / get_expert_device_ptr() for residency,
