@@ -2390,6 +2390,14 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
     )
+    # The staging probe's skip counts PHYSICAL devices (the scheduler exposes one); pinned from its source.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-staging-probe-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 60
+    )
 
     # DECLINED, with reasons (llama.cpp-0igs).  Sibling .py gates in this
     # directory that are deliberately left unregistered.  Registering them would

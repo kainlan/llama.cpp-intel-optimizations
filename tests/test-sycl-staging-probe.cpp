@@ -20,14 +20,21 @@
 // (the gate did not hold) and proves nothing. The classification is staging_probe_classify() in
 // sycl-staging-probe-verdict.h, which test-sycl-staging-probe-verdict drives over its whole table.
 //
-// The queues are the backend's own: ggml_backend_sycl_init() per device and ggml_backend_sycl_context::
-// stream(), the same call the SET_ROWS stage makes, not a queue this test constructs. Every buffer is a
+// The queues are the backend's own, not queues this test constructs: the owner's is the exposed device 0's
+// ggml_backend_sycl_context::stream(), the call the SET_ROWS stage makes, and the source's is
+// ggml_sycl::get_shared_context_queue(1), the per-device single-device-context queue the MoE and split paths
+// use for a secondary card. Neither path builds a multi-device Level Zero context, which is the DEVICE_LOST
+// risk on compute-runtime 26.x. The scheduler exposes only device 0 by default ("Multi-GPU: exposing only
+// device 0 to scheduler"), so ggml_backend_sycl_get_device_count() is 1 on a two-card host and
+// ggml_backend_sycl_init(1) is not available: the probe counts PHYSICAL devices through
+// ggml_sycl::test_physical_device_count() (the backend's total_gpu_count), never the scheduler-visible
+// count; tests/test-sycl-staging-probe-source.py pins that. Every buffer is a
 // unified_allocate() allocation held by a mem_handle that is released before either backend is freed.
 // The gate's host-USM flags are probe code, not a design path.
 //
 // Exit codes: 0 for returns_before and for blocks (both are pre-registered outcomes the lead records),
-// 1 for void or a setup failure, 77 when fewer than two SYCL devices are visible (counted with
-// ggml_backend_sycl_get_device_count() before any backend init, which asserts on an absent index).
+// 1 for void or a setup failure, 77 when fewer than two PHYSICAL SYCL devices are held (counted with
+// ggml_sycl::test_physical_device_count() before any backend init).
 //
 // GPU binaries in this fork are run only from the lead session, one at a time (CLAUDE.md). The default
 // selector below pins the two discrete cards; the iGPU is never enumerated.
@@ -39,6 +46,7 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "sycl-staging-probe-verdict.h"
 #include "test-skip.h"
@@ -99,30 +107,31 @@ int main(int, char ** argv) {
                      std::strerror(errno));
     }
 
-    // ggml_backend_sycl_init(i) asserts on an index past the device count and carries on to construct a
-    // context for it, so the skip is decided before any init. Zero devices (no setvars) lands here too.
-    if (ggml_backend_sycl_get_device_count() < 2) {
-        std::printf("SKIP: fewer than two SYCL GPU devices available\n");
+    // The scheduler exposes only device 0 by default, so ggml_backend_sycl_get_device_count() is 1 on a
+    // two-card host; the physical count is what decides the skip. Zero devices (no setvars) lands here too.
+    // ggml_backend_sycl_init(i) asserts on an index past the scheduler-visible count, so the exposed
+    // device 0 is the only one initialised as a backend.
+    const int physical_devices = ggml_sycl::test_physical_device_count();
+    if (physical_devices < 2 || ggml_backend_sycl_get_device_count() < 1) {
+        std::printf("SKIP: fewer than two physical SYCL GPU devices available (physical=%d)\n", physical_devices);
         return LLAMA_TEST_EXIT_SKIP;
     }
 
-    ggml_backend_t backend_owner  = ggml_backend_sycl_init(0);
-    ggml_backend_t backend_source = ggml_backend_sycl_init(1);
-    if (!backend_owner || !backend_source) {
-        std::printf("FAIL: ggml_backend_sycl_init failed on a host that reports two devices\n");
-        if (backend_owner) {
-            ggml_backend_free(backend_owner);
-        }
-        if (backend_source) {
-            ggml_backend_free(backend_source);
-        }
+    ggml_backend_t backend_owner = ggml_backend_sycl_init(0);
+    if (!backend_owner) {
+        std::printf("FAIL: ggml_backend_sycl_init(0) failed on a host that reports two physical devices\n");
+        return 1;
+    }
+    sycl::queue * q_source_ptr = ggml_sycl::get_shared_context_queue(1);
+    if (q_source_ptr == nullptr) {
+        std::printf("FAIL: no shared-context queue for physical device 1\n");
+        ggml_backend_free(backend_owner);
         return 1;
     }
 
-    auto *        owner_ctx  = static_cast<ggml_backend_sycl_context *>(backend_owner->context);
-    auto *        source_ctx = static_cast<ggml_backend_sycl_context *>(backend_source->context);
-    sycl::queue & q_owner    = *owner_ctx->stream(0, 0);
-    sycl::queue & q_source   = *source_ctx->stream(1, 0);
+    auto *        owner_ctx = static_cast<ggml_backend_sycl_context *>(backend_owner->context);
+    sycl::queue & q_owner   = *owner_ctx->stream(0, 0);
+    sycl::queue & q_source  = *q_source_ptr;
 
     int  rc          = 1;
     char verdict[32] = "";
@@ -255,7 +264,6 @@ int main(int, char ** argv) {
         }
     }
 
-    ggml_backend_free(backend_source);
     ggml_backend_free(backend_owner);
     return rc;
 }
