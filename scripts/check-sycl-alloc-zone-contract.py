@@ -30,17 +30,30 @@ request type is written `T x{}`.
 Fail closed on form. Every occurrence of a request-type token is given a syntactic role:
 parameter, return, pointer or reference, a request type's own member, definition, alias,
 friend, scope qualifier, sizeof/cast over a pointer, or construction. An occurrence in any other
-role (an array, a `new`, a template argument such as std::vector<alloc_request>, a base class, ...)
-is a B-FORM finding, so a construction form the gate cannot follow is listed, not missed. An
-`using R = alloc_request;` or `typedef alloc_request RT;` extends the closure, so `R r{}` is judged.
+role (an array, a `new`, a template argument such as std::vector<alloc_request>, a base class, a
+default argument `T r = {}`, ...) is a B-FORM finding, so a construction form the gate cannot follow is
+listed, not missed. An `using R = alloc_request;` or `typedef alloc_request RT;` extends the closure, so
+`R r{}` is judged. Constructions that carry no request-type token are found by shape: a braced-init-list
+returned from a request-returning function or passed to a function that takes a request (B-FORM), and an
+`auto x = <request>` copy of a request variable, parameter, member, std::move or call result (DEFER-C).
+A #define body that assigns a tracked field is a B-FORM finding (macro-write).
+
+A write only counts when it is bound to the declaration (the nearest enclosing one of that name, looking
+through #if branches), comes before the request is first handed to other code (passed, returned, copied,
+or named in a lambda), and is not under a conditional. A whole-object assignment (`req = {}`,
+`req = other;`) is a copy and defers to clause (c). The other tier flag may only ever be written a
+literal false.
 
 Not here yet (later units, each lands with its witnesses)
   (c) interprocedural flow, so a copy / helper return / by-reference write is a construction of
       its own. Until it lands such constructions are listed as DEFER-C debt and are shrink-only,
       so a new copy cannot slip in unseen. Known clause-(c) gaps, listed so S2b closes them: a
       local reference or pointer alias written through (`alloc_constraints & c = req.intent.
-      constraints; c.prefer_vram_zone = COUNT;`, `p->...`), and a callee that writes a request
-      passed by reference.
+      constraints; c.prefer_vram_zone = COUNT;`, `p->...`), a callee that writes a request passed by
+      reference, and writes to a request held as a member, in a method or through `this->`
+      (`struct H { alloc_request r{}; void f() { r.intent.constraints.prefer_vram_zone = COUNT; } };`).
+      Also documented gaps: token pasting (`malloc_##x`) and `#pragma message` can name a raw
+      allocator without the gate seeing it.
   (g)-(p) are S2c/S2d. Witness 9 (a site that stops calling its shared `*_bytes()` function) is
       deferred to S2d as a dormant clause: its subjects, the model-shaped exact `*_bytes()`
       functions (load_reorder_temp_bytes, woq_packed_bytes, ...), do not exist in the tree yet.
@@ -48,8 +61,10 @@ Not here yet (later units, each lands with its witnesses)
 Scope
   Every .cpp/.hpp under ggml/src/ggml-sycl except the skipped directories below. dpct/ is in
   scope (helper.hpp holds raw calls and ggml-sycl.cpp includes it). A new file with another
-  C++-ish extension (.h, .hh, .inl, .cc, ...) is a FAIL until it is scanned or explicitly skipped,
-  and a minimum file count pins that the walk did not silently shrink.
+  C/C++/OpenCL extension (.h, .hh, .inl, .cc, .c, .cl, ... matched case-insensitively) is a FAIL until
+  it is scanned or explicitly skipped, a required-file list and a file-count floor pin that the walk
+  did not silently shrink, and the skipped directories are the scope root's own top-level ones only
+  (a nested tests/ is scanned).
     tests/               test code, outside the design's scope ("non-test ggml-sycl sources")
     docs/                markdown only; nothing to scan
 
@@ -71,7 +86,10 @@ Mutation matrix (--mutation-matrix)
   unmutated baseline must PASS first, or the matrix would be scored against a red baseline. A
   site that does not conform yet cannot be mutated in place (its violation is already in the
   debt list), so a witness plants a twin: a request of the same shape in a fresh function, whose
-  unmutated form must PASS and whose mutated form must FAIL naming the planted node.
+  unmutated form must PASS and whose mutated form must FAIL naming the planted node. A PASS control
+  must have seen a planted construction; the few `planted=False` controls are pure negatives, a form
+  with no construction to see (a pointer parameter, a raw-named function's declaration) whose roles the
+  paired FAIL cases exercise, so a no-op plant cannot hide a missing detection there.
 
 Dependency
   Needs the tree-sitter C++ grammar: `pip install tree-sitter-language-pack` in the python3 that
@@ -101,10 +119,14 @@ except Exception as exc:  # ImportError, or a pack without the grammar
     sys.exit(1)
 
 SCOPE_SUBDIR = "ggml/src/ggml-sycl"
-SKIP_DIRS = {"tests", "docs"}
+SKIP_DIRS = {"tests", "docs"}   # top-level directories of the scope root only; a nested tests/ is scanned
 SCAN_SUFFIXES = (".cpp", ".hpp")
-CXXISH_SUFFIXES = (".h", ".hh", ".hxx", ".cc", ".cxx", ".c++", ".inl", ".ipp", ".tpp", ".cu", ".cuh")
-MIN_FILES = 250
+# Matched case-insensitively. Any other C/C++/OpenCL/CUDA suffix is a FAIL until scanned or skipped on purpose.
+CXXISH_SUFFIXES = (".h", ".hh", ".hxx", ".h++", ".cc", ".cxx", ".c++", ".c", ".inl", ".ipp", ".tpp", ".cl", ".cu",
+                   ".cuh", ".cppm", ".ixx")
+MIN_FILES = 330                  # 335 today; a walk that quietly shrinks below this is a FAIL
+REQUIRED_FILES = ("ggml-sycl.cpp", "unified-cache.cpp", "unified-cache.hpp", "common.cpp", "common.hpp", "mmvq.cpp",
+                  "dpct/helper.hpp")
 BASE_TYPES = ("alloc_request", "alloc_intent", "alloc_constraints")
 ZONES = ("KV", "WEIGHT", "ONEDNN", "RUNTIME", "SCRATCH")
 # Fields whose literal value the rules read. Later clauses add to this set.
@@ -126,7 +148,8 @@ DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a, b, d,
             "converted-by-*, sanctioned-internal or pending-disposition) and a cite, so an entry no step will ever "
             "shrink is visible as a mislabelled allowlist entry. Regenerate with `python3 "
             "scripts/check-sycl-alloc-zone-contract.py --write-debt` (it refuses to add entries); see README.md.")
-FATE_RE = re.compile(r"^(deleted-by|converted-by)-[A-Za-z0-9._§()-]+$|^sanctioned-internal$|^pending-disposition$")
+FATE_RE = re.compile(r"^(deleted-by|converted-by)-[A-Za-z0-9._§()-]+$|^sanctioned-internal$|^sanctioned-vendored$|^pending-disposition$")
+CITE_MIN = 12   # a cite names a ticket or a design/census row; "tbd" is not one
 
 CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-FORM", "B-TIER", "D-ZONE", "D-ZONE-COUNT",
          "D-FORBID", "D-FORBID-FALSE", "E-RAW", "DEFER-C")
@@ -193,11 +216,12 @@ def list_sources(root):
         if not p.is_file():
             continue
         rel = p.relative_to(base)
-        if set(rel.parts[:-1]) & SKIP_DIRS:
+        if len(rel.parts) > 1 and rel.parts[0] in SKIP_DIRS:
             continue
-        if p.suffix in SCAN_SUFFIXES:
+        suffix = p.suffix.lower()
+        if suffix in SCAN_SUFFIXES:
             scanned[str(rel)] = p
-        elif p.suffix in CXXISH_SUFFIXES:
+        elif suffix in CXXISH_SUFFIXES:
             unscanned.append(str(rel))
     return scanned, unscanned
 
@@ -209,6 +233,11 @@ def load_tree(root):
         print("FAIL: C++-ish source(s) neither scanned nor skipped by this gate: %s; add the suffix to "
               "SCAN_SUFFIXES or skip the directory with a reason" % ", ".join(unscanned))
         sys.exit(1)
+    missing = [f for f in REQUIRED_FILES if f not in scanned]
+    if missing:
+        print("FAIL: required source file(s) not found under %s: %s; the walk or the root is wrong"
+              % (Path(root) / SCOPE_SUBDIR, ", ".join(missing)))
+        sys.exit(1)
     if len(scanned) < MIN_FILES:
         print("FAIL: only %d source file(s) under %s, expected at least %d; the walk shrank or the root is wrong"
               % (len(scanned), Path(root) / SCOPE_SUBDIR, MIN_FILES))
@@ -218,7 +247,8 @@ def load_tree(root):
 
 _PARSE = {}      # sha1 -> root node
 _STRUCTS = {}    # sha1 -> ([(struct name, [(member base type, is_value)])], [(alias, target base type, is_value)])
-_FACTS = {}      # (rel, sha1, types key) -> facts dict (every fact key embeds rel, so rel is in the cache key)
+_FUNCS = {}      # sha1 -> file_funcs rows
+_FACTS = {}      # (rel, sha1, ctx digest) -> facts dict (every fact key embeds rel, so rel is in the cache key)
 
 
 def _sha(src):
@@ -316,6 +346,74 @@ def type_closure(files):
                     allt.add(name)
                     changed = True
     return value, allt
+
+
+def file_funcs(src):
+    """Function declarations and definitions of one file: (name, return base type, returns by value, [param (base
+    type, by value or reference)]). A constructor has no return type and is skipped."""
+    h = _sha(src)
+    if h not in _FUNCS:
+        out = []
+        for n in walk(parse(src)):
+            if kind(n) != "function_declarator":
+                continue
+            nm = fld(n, "declarator")
+            if nm is None:
+                continue
+            name = callee_last(txt(src, nm))
+            top, byval = n, True
+            q = parent(n)
+            while q is not None and kind(q) in ("pointer_declarator", "reference_declarator"):
+                top, byval = q, False
+                q = parent(q)
+            ret = None
+            if q is not None and kind(q) in ("declaration", "field_declaration", "function_definition"):
+                t = fld(q, "type")
+                ret = base_type(txt(src, t)) if t is not None else None
+            params = []
+            pl = fld(n, "parameters")
+            for c in (kids(pl) if pl is not None else []):
+                if kind(c) not in ("parameter_declaration", "optional_parameter_declaration"):
+                    continue
+                t = fld(c, "type")
+                if t is None:
+                    continue
+                d = fld(c, "declarator")
+                ptr = d is not None and kind(d) == "pointer_declarator"
+                params.append((base_type(txt(src, t)), not ptr))
+            out.append((name, ret, byval, params))
+        _FUNCS[h] = out
+    return _FUNCS[h]
+
+
+def callee_last(text):
+    """Last component of a callee spelling: a::b.c<int>  ->  c."""
+    text = re.sub(r"<[^<>]*(?:<[^<>]*>[^<>]*)*>", "", text)
+    return re.split(r"::|\.|->", text)[-1].strip()
+
+
+class Ctx:
+    """What a scan needs to know about the whole tree, computed once: the request types, the functions that take
+    or return a request by value, and the members that hold one by value."""
+
+    def __init__(self, files):
+        self.value_types, self.all_types = type_closure(files)
+        self.req_funcs, self.req_returning, self.req_members = set(), set(), set()
+        for src in files.values():
+            for name, ret, byval, params in file_funcs(src):
+                if ret in self.value_types and byval:
+                    self.req_returning.add(name)
+                if any(pb in self.value_types and pv for pb, pv in params):
+                    self.req_funcs.add(name)
+            for n in walk(parse(src)):
+                if kind(n) == "field_declaration":
+                    t = fld(n, "type")
+                    if t is not None and base_type(txt(src, t)) in self.value_types:
+                        for d in kids(n):
+                            if not same(d, t) and kind(d) == "field_identifier":
+                                self.req_members.add(txt(src, d))
+        self.digest = hashlib.sha1(repr((sorted(self.value_types), sorted(self.all_types), sorted(self.req_funcs),
+                                         sorted(self.req_returning), sorted(self.req_members))).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------- naming
@@ -525,8 +623,8 @@ _ASSIGN_CACHE = {}
 
 
 def assignments_in(src_key, src, block):
-    """Every assignment in a block whose left side is a field chain rooted at an identifier:
-    [(root name, last field, rhs node, assignment node, is compound)]."""
+    """Every assignment in a block whose left side is an identifier or a field chain rooted at one:
+    [(root name, last field or None for a whole-object assignment, rhs node, assignment node, is compound)]."""
     key = (src_key, sb(block), eb(block))
     if key in _ASSIGN_CACHE:
         return _ASSIGN_CACHE[key]
@@ -544,14 +642,55 @@ def assignments_in(src_key, src, block):
             f = fld(x, "field")
             chain.append(txt(src, f) if f is not None else "?")
             x = fld(x, "argument")
-        if x is None or kind(x) != "identifier" or not chain:
+        if x is None or kind(x) != "identifier":
             continue
-        out.append((txt(src, x), chain[0] if False else chain[0], rhs, n, op[0] != "="))
+        out.append((txt(src, x), chain[0] if chain else None, rhs, n, op[0] != "="))
     _ASSIGN_CACHE[key] = out
     return out
 
 
+_IDENT_CACHE = {}
+
+
+def idents_in(src_key, src, block):
+    """name -> identifier nodes of a block, in source order."""
+    key = (src_key, sb(block), eb(block))
+    if key not in _IDENT_CACHE:
+        d = {}
+        for n in walk(block):
+            if kind(n) == "identifier":
+                d.setdefault(txt(src, n), []).append(n)
+        _IDENT_CACHE[key] = d
+    return _IDENT_CACHE[key]
+
+
+def is_use(src, ident, decl):
+    """True when an occurrence of a request variable can hand the object, or a sub-object, to code that reads
+    it later: a bare use (argument, address, return, copy source) or a member chain ending in intent/constraints.
+    A scalar field read or write is not a use, and neither is the left side of an assignment. Anything inside a
+    lambda that does not hold the declaration counts, since the lambda may run later."""
+    q = parent(ident)
+    while q is not None and kind(q) not in ("compound_statement", "translation_unit"):
+        if kind(q) == "lambda_expression" and not (sb(q) <= sb(decl) and eb(decl) <= eb(q)):
+            return True
+        q = parent(q)
+    top = ident
+    p = parent(top)
+    last = None
+    while p is not None and kind(p) == "field_expression" and same(fld(p, "argument"), top):
+        f = fld(p, "field")
+        last = txt(src, f) if f is not None else "?"
+        top = p
+        p = parent(top)
+    if last is not None and last not in STRUCT_FIELDS:
+        return False
+    if p is not None and kind(p) == "assignment_expression" and same(fld(p, "left"), top):
+        return False
+    return True
+
+
 def assign_last_field(src, an):
+    """The last field written by an assignment, or None for a whole-object assignment."""
     chain = []
     x = fld(an, "left")
     while x is not None and kind(x) == "field_expression":
@@ -559,6 +698,54 @@ def assign_last_field(src, an):
         chain.append(txt(src, f) if f is not None else "?")
         x = fld(x, "argument")
     return chain[0] if chain else None
+
+
+def request_valued(src, ctx, h, node, auto_names):
+    """True when an initialiser expression evidently has a request type: a request variable or parameter, a member
+    chain ending in a request member or intent/constraints, std::move of one, or a call returning a request."""
+    k = kind(node)
+    if k == "parenthesized_expression":
+        inner = [c for c in kids(node) if _a(c, "is_named")]
+        return bool(inner) and request_valued(src, ctx, h, inner[0], auto_names)
+    if k == "conditional_expression":
+        return any(request_valued(src, ctx, h, fld(node, f), auto_names) for f in ("consequence", "alternative")
+                   if fld(node, f) is not None)
+    if k == "identifier":
+        name = txt(src, node)
+        d = binding_decl(src, node, name)
+        if d is not None:
+            t = fld(d, "type")
+            if t is not None and (base_type(txt(src, t)) in ctx.value_types or
+                                  (kind(t) == "placeholder_type_specifier" and (name, sb(d)) in auto_names)):
+                return True
+        q = parent(node)
+        while q is not None and kind(q) != "function_definition":
+            q = parent(q)
+        if q is not None:
+            fd = fld(q, "declarator")
+            while fd is not None and kind(fd) != "function_declarator":
+                fd = fld(fd, "declarator")
+            pl = fld(fd, "parameters") if fd is not None else None
+            for c in (kids(pl) if pl is not None else []):
+                if kind(c) in ("parameter_declaration", "optional_parameter_declaration"):
+                    t, dd = fld(c, "type"), fld(c, "declarator")
+                    if t is not None and base_type(txt(src, t)) in ctx.value_types and declared_name(src, dd) == name \
+                            and not (dd is not None and kind(dd) == "pointer_declarator"):
+                        return True
+        return False
+    if k == "field_expression":
+        f = fld(node, "field")
+        return f is not None and (txt(src, f) in ctx.req_members or txt(src, f) in STRUCT_FIELDS)
+    if k == "call_expression":
+        fn = fld(node, "function")
+        if fn is None:
+            return False
+        ft = re.sub(r"\s+", "", txt(src, fn))
+        if ft in ("std::move", "std::forward", "move", "forward"):
+            args = [c for c in kids(fld(node, "arguments")) if _a(c, "is_named")]
+            return len(args) == 1 and request_valued(src, ctx, h, args[0], auto_names)
+        return callee_last(ft) in ctx.req_returning
+    return False
 
 
 def callee_ident(src, ident):
@@ -575,7 +762,9 @@ def callee_ident(src, ident):
 
 
 # Roles that are known and need no finding; the others are B-FORM.
-FINDING_ROLES = ("array", "new", "template-arg", "base-class", "cast", "range-for-copy", "unclassified")
+FINDING_ROLES = ("array", "new", "template-arg", "base-class", "cast", "range-for-copy", "unclassified", "default-arg",
+                 "braced-return", "braced-arg", "macro-write")
+MACRO_WRITE_RE = re.compile(r"(?:\.|->)\s*(?:" + "|".join(TRACKED) + r")\s*[|&^+-]?=(?!=)")
 PTR_KINDS = ("pointer_declarator", "reference_declarator")
 ABSTRACT_PTR = ("abstract_pointer_declarator", "abstract_reference_declarator")
 
@@ -594,6 +783,10 @@ def token_role(src, tok, value_types):
     k = kind(p)
     if k == "destructor_name" or (k == "function_declarator" and same(fld(p, "declarator"), T)):
         return "ctor-name"  # a holder's own constructor or destructor declares nothing about a request
+    if k == "optional_parameter_declaration" and any(
+            kind(c) == "initializer_list" or (kind(c) == "compound_literal_expression" and (fld(c, "type") is None or not txt(src, fld(c, "type")).strip()))
+            for c in kids(p)):
+        return "default-arg"  # `T r = {}`: the grammar reads the bare braces as a compound literal of no type
     if k in ("parameter_declaration", "optional_parameter_declaration", "variadic_parameter_declaration"):
         return "param"
     if k in ("struct_specifier", "class_specifier"):
@@ -671,8 +864,10 @@ def statement_of(n):
     return p if p is not None else n
 
 
-def scan_file(rel, src, value_types, all_types):
+def scan_file(rel, src, ctx):
     """Facts about one file, as plain data: constructions, form findings, raw hits, error tokens."""
+    value_types, all_types = ctx.value_types, ctx.all_types
+    auto_names = set()
     h = _sha(src)
     root = parse(src)
     root_error = kind(root) == "ERROR"
@@ -690,6 +885,11 @@ def scan_file(rel, src, value_types, all_types):
         blk = scope_block(n)
         if blk is None:
             return texts
+        first_use = None
+        for ident in idents_in(h, src, blk).get(name, []):
+            if sb(ident) >= eb(n) and same(binding_decl(src, ident, name), n) and is_use(src, ident, n):
+                first_use = sb(ident)
+                break
         for root_name, _, rhs, an, compound in assignments_in(h, src, blk):
             if root_name != name or not (eb(n) <= sb(an)):
                 continue
@@ -697,21 +897,26 @@ def scan_file(rel, src, value_types, all_types):
                 continue
             last = assign_last_field(src, an)
             texts.append(txt(src, an))
-            if last in STRUCT_FIELDS:
+            # a write after the request has first been handed to other code does not set up what that code read
+            late = first_use is not None and sb(an) > first_use
+            if last is None:
+                copied.append("whole-assign")
+            elif last in STRUCT_FIELDS:
                 if rhs is not None and kind(rhs) == "initializer_list" and not compound:
                     init_fields(src, rhs, fields, copied)
                 else:
                     copied.append(last)
             elif last in TRACKED:
                 add_write(fields, last, sb(an), "expr" if compound else classify(src, last, rhs),
-                          is_conditional(an, blk, n), txt(src, rhs) if rhs is not None else "")
+                          is_conditional(an, blk, n) or late, txt(src, rhs) if rhs is not None else "")
         return texts
 
     for n in walk(root):
         k = kind(n)
         if k in ("declaration", "field_declaration"):
             t = fld(n, "type")
-            if t is None or base_type(txt(src, t)) not in value_types:
+            auto_decl = t is not None and k == "declaration" and kind(t) == "placeholder_type_specifier"
+            if t is None or (not auto_decl and base_type(txt(src, t)) not in value_types):
                 continue
             func = enclosing(src, n)
             if k == "field_declaration":
@@ -724,7 +929,16 @@ def scan_file(rel, src, value_types, all_types):
             for ki, d in enumerate(ks):
                 if same(d, t):
                     continue
-                name, form, val = declarator_info(src, d)
+                if auto_decl:
+                    # `auto x = <request>` copies a request without naming its type; the copy is clause (c)'s
+                    name = declared_name(src, d)
+                    init = fld(d, "value") if kind(d) == "init_declarator" else None
+                    if name is None or init is None or not request_valued(src, ctx, h, init, auto_names):
+                        continue
+                    auto_names.add((name, sb(n)))
+                    form, val = "copy", init
+                else:
+                    name, form, val = declarator_info(src, d)
                 if form in ("skip", "array") or name is None:
                     continue
                 if k == "field_declaration" and form == "plain" and ki + 1 < len(ks):
@@ -753,8 +967,8 @@ def scan_file(rel, src, value_types, all_types):
                 constructions.append({
                     "key": key_for(func, kind(n), name, txt(src, n) + " ;; " + " ;; ".join(texts)), "func": func,
                     "var": name, "line": line_of(n), "kind": "member" if k == "field_declaration" else "decl",
-                    "type": base_type(txt(src, t)), "form": form, "err": err, "fields": fields,
-                    "deferred": sorted(set(reason)),
+                    "type": "auto" if auto_decl else base_type(txt(src, t)), "form": form, "err": err, "fields": fields,
+                    "deferred": sorted(set(reason + (["auto-init"] if auto_decl else []))),
                 })
         elif k == "compound_literal_expression" or (k == "call_expression" and fld(n, "function") is not None
                                                     and kind(fld(n, "function")) in ("identifier", "type_identifier",
@@ -782,10 +996,31 @@ def scan_file(rel, src, value_types, all_types):
                 "fields": fields,
                 "deferred": sorted(set(reason + ["positional-init" if c == "positional" else c + "-copied" for c in copied])),
             })
-        elif k in ("string_literal", "raw_string_literal"):
+        elif k == "return_statement":
+            lst = [c for c in kids(n) if kind(c) == "initializer_list"]
+            q = parent(n)
+            while q is not None and kind(q) not in ("function_definition", "lambda_expression"):
+                q = parent(q)
+            if lst and q is not None and kind(q) == "function_definition":
+                rt, rd = fld(q, "type"), fld(q, "declarator")
+                if rt is not None and base_type(txt(src, rt)) in value_types and rd is not None \
+                        and kind(rd) == "function_declarator":
+                    forms.append({"func": enclosing(src, n), "role": "braced-return", "tok": "{...}",
+                                  "line": line_of(n), "text": txt(src, n)})
+        elif k == "call_expression" and fld(n, "arguments") is not None \
+                and any(kind(c) == "initializer_list" for c in kids(fld(n, "arguments"))) \
+                and fld(n, "function") is not None and callee_last(txt(src, fld(n, "function"))) in ctx.req_funcs:
+            forms.append({"func": enclosing(src, n), "role": "braced-arg", "tok": "{...}", "line": line_of(n),
+                          "text": txt(src, n)})
+        elif k in ("string_literal", "raw_string_literal", "concatenated_string"):
+            if k != "concatenated_string" and parent(n) is not None and kind(parent(n)) == "concatenated_string":
+                continue  # judged as part of the whole concatenation
             s = txt(src, n)
+            joined = "".join(txt(src, c) for c in kids(n) if kind(c) in ("string_literal", "raw_string_literal")) \
+                if k == "concatenated_string" else s
+            joined = joined.replace('" "', "").replace('""', "")
             for r in RAW_STRINGS:
-                if r in s:
+                if r in joined or r in s:
                     raws.append({"func": enclosing(src, n), "name": r, "line": line_of(n), "form": "string",
                                  "nodekind": k, "text": s, "err": has_error_ancestor(n)})
         elif k in ("preproc_def", "preproc_function_def"):
@@ -797,6 +1032,9 @@ def scan_file(rel, src, value_types, all_types):
                     if re.search(r"(?<![A-Za-z0-9_])" + re.escape(r) + r"(?![A-Za-z0-9_])", b):
                         raws.append({"func": "#define " + txt(src, nm), "name": r, "line": line_of(n),
                                      "form": "macro", "nodekind": "preproc", "text": r, "err": False})
+                if MACRO_WRITE_RE.search(b):
+                    forms.append({"func": "#define " + txt(src, nm), "role": "macro-write", "tok": txt(src, nm),
+                                  "line": line_of(n), "text": txt(src, n)})
         elif k in ("identifier", "field_identifier") and txt(src, n) in RAW_NAMES:
             pk = kind(parent(n)) if parent(n) is not None else ""
             if pk != "function_declarator":  # the name of a declaration or definition is not a use
@@ -861,10 +1099,10 @@ def lexical_scan(src, clean, value_types):
     return rows
 
 
-def facts_for(rel, src, value_types, all_types):
-    key = (rel, _sha(src), tuple(sorted(value_types)), tuple(sorted(all_types)))
+def facts_for(rel, src, ctx):
+    key = (rel, _sha(src), ctx.digest)
     if key not in _FACTS:
-        _FACTS[key] = scan_file(rel, src, value_types, all_types)
+        _FACTS[key] = scan_file(rel, src, ctx)
     return _FACTS[key]
 
 
@@ -917,9 +1155,11 @@ def judge(c):
         out.append(("B-TIER", "neither must_device nor must_host_pinned is established by an unconditional literal true as its "
                               "last write; unified_select_tier may turn it into HOST"))
         return out
-    other = w.get("must_device" if host else "must_host_pinned", [])
-    if other and other[-1][1] == "expr":
-        out.append(("B-TIER", "the other tier flag's last write is not a literal, so the tier is not decidable"))
+    other_name = "must_device" if host else "must_host_pinned"
+    if any(x[1] != "false" for x in w.get(other_name, [])):
+        # a conditional true, or a non-literal, can make the request the other tier; only a literal false is harmless
+        out.append(("B-TIER", "%s has a write that is not a literal false (a conditional true or a non-literal), so the "
+                              "tier is not decidable" % other_name))
         return out
     if host:
         return out
@@ -937,11 +1177,12 @@ def judge(c):
 
 def analyse(files):
     """Every finding in the tree, before any allowlist or debt is applied."""
-    value_types, all_types = type_closure(files)
+    ctx = Ctx(files)
     viols = []
-    stats = {"constructions": 0, "files": len(files), "value_types": sorted(value_types), "all_types": sorted(all_types)}
+    stats = {"constructions": 0, "files": len(files), "value_types": sorted(ctx.value_types),
+             "all_types": sorted(ctx.all_types)}
     for rel in sorted(files):
-        fa = facts_for(rel, files[rel], value_types, all_types)
+        fa = facts_for(rel, files[rel], ctx)
         ordinal = {}
         for c in fa["constructions"]:
             stats["constructions"] += 1
@@ -965,14 +1206,17 @@ def analyse(files):
                                "lexical hit in a file whose root is ERROR is not host-only by a literal"))
         if fa["lex_count"] != fa["ast_count"]:
             viols.append(V("A-TOKEN", "%s::<tokens>::lexical-vs-ast" % rel, rel, 0, "<file>", "",
-                           "request-type tokens by text (%d) differ from the parse's (%d)" % (fa["lex_count"], fa["ast_count"])))
+                           "request-type tokens by text (%d) differ from the parse's (%d); a request-type name sits where the "
+                           "parse cannot see it (a macro body, a broken #if): needs a clause-(c) follow or a rewrite"
+                           % (fa["lex_count"], fa["ast_count"])))
         seen = {}
         for f in fa["forms"]:
             base = "%s::%s::form:%s:%s" % (rel, f["func"], f["role"], text_hash(f["text"]))
             i = seen.get(base, 0)
             seen[base] = i + 1
             viols.append(V("B-FORM", "%s#%d" % (base, i), rel, f["line"], f["func"], f["tok"],
-                           "%s occurs as a %s, a form the gate cannot follow to a construction" % (f["tok"], f["role"])))
+                           "%s occurs as a %s, a form the gate cannot follow to a construction; write the request as a named "
+                           "`T x{}` with its literal flags, or wait for clause (c) to follow it" % (f["tok"], f["role"])))
         seen = {}
         for r in fa["raws"]:
             base = "%s::%s::%s:%s:%s" % (rel, r["func"], r["nodekind"], r["name"], text_hash(r["text"]))
@@ -985,11 +1229,25 @@ def analyse(files):
 
 # ---------------------------------------------------------------- allowlist and debt
 
-def load_json(path, default):
+class DataError(Exception):
+    pass
+
+
+def load_json(path, default, listkey):
+    """The parsed file, or `default` when it does not exist. Malformed JSON, a non-object file or a non-list
+    `listkey` is a DataError, so the caller prints a FAIL line instead of a traceback."""
     if not Path(path).exists():
         return default
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise DataError("%s is not readable JSON (%s)" % (path, exc))
+    if not isinstance(doc, dict):
+        raise DataError("%s must be a JSON object, got %s" % (path, type(doc).__name__))
+    if not isinstance(doc.get(listkey, []), list):
+        raise DataError("%s: %r must be a list" % (path, listkey))
+    return doc
 
 
 def validate_data(allowlist, debt):
@@ -1000,15 +1258,18 @@ def validate_data(allowlist, debt):
         if not isinstance(e, dict):
             errs.append("FAIL allowlist entry #%d is not an object" % i)
             continue
-        need = ("id", "code", "reason", "count") + (("key",) if "key" in e else ("file", "function"))
+        need = ("id", "code", "reason", "count") + (("key",) if "key" in e else ("file", "function")) \
+            + (("name",) if e.get("code") == "E-RAW" else ())
         miss = [k for k in need if k not in e]
         if miss:
             errs.append("FAIL allowlist entry %s lacks %s" % (e.get("id", "#%d" % i), ", ".join(miss)))
             continue
         if e["code"] not in CODES:
             errs.append("FAIL allowlist entry %s has unknown code %r" % (e["id"], e["code"]))
-        if not isinstance(e["count"], int) or e["count"] < 1:
+        if not isinstance(e["count"], int) or isinstance(e["count"], bool) or e["count"] < 1:
             errs.append("FAIL allowlist entry %s needs an integer count >= 1" % e["id"])
+        if not isinstance(e["reason"], str) or len(e["reason"].strip()) < CITE_MIN:
+            errs.append("FAIL allowlist entry %s needs a reason of at least %d characters" % (e["id"], CITE_MIN))
         ids[e["id"]] += 1
     errs += ["FAIL allowlist id %s is used %d times" % (k, v) for k, v in ids.items() if v > 1]
     seen = Counter()
@@ -1021,7 +1282,10 @@ def validate_data(allowlist, debt):
         seen[(d["code"], d["key"])] += 1
         if d["code"] == "E-RAW" and not FATE_RE.match(str(d.get("fate", ""))):
             errs.append("FAIL debt entry E-RAW %s has no valid fate (deleted-by-*, converted-by-*, sanctioned-internal, "
-                        "pending-disposition)" % d["key"])
+                        "sanctioned-vendored, pending-disposition)" % d["key"])
+        if d["code"] == "E-RAW" and (not isinstance(d.get("cite"), str) or len(d["cite"].strip()) < CITE_MIN):
+            errs.append("FAIL debt entry E-RAW %s has no cite (a ticket id or a design/census row, at least %d characters)"
+                        % (d["key"], CITE_MIN))
     errs += ["FAIL debt entry %s %s is listed %d times" % (c, k, v) for (c, k), v in seen.items() if v > 1]
     return errs
 
@@ -1172,6 +1436,12 @@ WITNESSES = {
     "m5": "allowlist pins name and count", "m6": "argument handling", "m7": "data-file validation",
     "m8": "raw names beyond calls", "m9": "unscanned C++ extensions", "m14": "key-matched allowlist entries",
     "key": "keys survive unrelated edits", "debt": "debt is shrink-only both ways", "fate": "E-RAW fate required",
+    "r2i1": "any non-false write of the other tier flag is B-TIER", "r2i2": "whole-object assignment is a copy",
+    "r2i3": "constructions with no request-type token", "r2m2": "E-RAW allowlist entries need a name",
+    "r2m3": "cite and fate validation", "r2m4": "--write-debt validates its input, no tracebacks",
+    "r2m6": "writes after the first use do not satisfy", "r2m7": "a macro body assigning a tracked field",
+    "r2m8": "scope: anchored skips, case-insensitive suffixes, required files, floor",
+    "r2n": "adjacent string literals are judged joined",
     "f": "missing tree_sitter_language_pack exits 1", "cmake": "the ctest never passes a regeneration flag",
 }
 WITNESSES_DEFERRED = {"9": "S2d: dormant clause; its *_bytes() subjects are absent from the tree"}
@@ -1230,20 +1500,20 @@ def matrix_cases():
     A(Case("7", "E-ARENA-BACKING's function renamed", replace_token("unified-cache.cpp", "arena_reserve", "arena_reserve_zz"),
         "FAIL", "E-RAW", "arena_reserve_zz"))
     A(Case("7", "E-ARENA-BACKING's entry reports the rename", replace_token("unified-cache.cpp", "arena_reserve", "arena_reserve_zz"),
-        "FAIL", "allowlist", "E-ARENA-BACKING"))
+        "FAIL", "allowlist", "E-ARENA-BACKING matches nothing"))
     A(Case("7", "E-TEST's function renamed", replace_token("unified-cache.cpp", "ensure_cached_alloc", "ensure_cached_alloc_zz"),
         "FAIL", "E-RAW", "ensure_cached_alloc_zz"))
     # 8: an allowlist entry that matches nothing, or pins a count the function does not have
-    A(Case("8", "allowlist entry matching nothing", lambda f: f, "FAIL", "allowlist", "E-ZZ-BOGUS",
+    A(Case("8", "allowlist entry matching nothing", lambda f: f, "FAIL", "allowlist", "E-ZZ-BOGUS matches nothing",
            allowlist={"id": "E-ZZ-BOGUS", "code": "E-RAW", "file": "unified-cache.cpp", "function": "no_such_function",
-                      "count": 1, "reason": "matrix"}))
-    A(Case("8", "allowlist entry pinning a count its function does not have", lambda f: f, "FAIL", "allowlist", "E-TEST",
+                      "name": "malloc_device", "count": 1, "reason": "mutation-matrix test entry"}))
+    A(Case("8", "allowlist entry pinning a count its function does not have", lambda f: f, "FAIL", "allowlist", "E-TEST covers 2 finding(s) but pins 3",
            edit_allowlist=lambda al: dict(al, entries=[dict(e, count=3) if e["id"] == "E-TEST" else e for e in al["entries"]])))
     # m5: the allowlist pins a name, not just a count
     A(Case("m5", "a different raw name swapped into an exempt function keeps the count and FAILs",
            replace_in_function("unified-cache.cpp", r"unified_cache::arena_reserve\s*\(", "sycl_aligned_malloc_device(",
-                               "zeMemAllocDevice("), "FAIL", "allowlist", "E-ARENA-BACKING"))
-    A(Case("m5", "an allowlist entry without a count is rejected", lambda f: f, "FAIL", "allowlist", "E-TEST",
+                               "zeMemAllocDevice("), "FAIL", "allowlist", "E-ARENA-BACKING covers 1 finding(s) but pins 2"))
+    A(Case("m5", "an allowlist entry without a count is rejected", lambda f: f, "FAIL", "allowlist", "E-TEST lacks count",
            edit_allowlist=lambda al: dict(al, entries=[{k: v for k, v in e.items() if k != "count"} if e["id"] == "E-TEST" else e
                                                       for e in al["entries"]])))
     # 12: no tier flag
@@ -1434,6 +1704,104 @@ def matrix_cases():
     A(Case("fate", "an E-RAW debt entry without a fate fails", lambda f: f, "FAIL", "data", "no valid fate",
            edit_debt=lambda d: dict(d, violations=[{k: v for k, v in e.items() if k != "fate"} if (e["code"] == "E-RAW" and "::unified_alloc::" in e["key"]) else e
                                                    for e in d["violations"]])))
+
+    # r2 I-1: the other tier flag may only be written a literal false
+    A(Case("r2i1", "device request with a conditional must_host_pinned = true", plant(
+        "void zzplant_r2i1(bool b) {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n"
+        "    if (b) req.intent.constraints.must_host_pinned = true;\n}\n" % REQ), "FAIL", "B-TIER", "zzplant_r2i1"))
+    A(Case("r2i1", "host request with a conditional must_device = true (zone-less device passing as host)", plant(
+        "void zzplant_r2i1(bool b) {\n    %s req{};\n    req.intent.constraints.must_host_pinned = true;\n"
+        "    if (b) req.intent.constraints.must_device = true;\n}\n" % REQ), "FAIL", "B-TIER", "zzplant_r2i1"))
+    A(Case("r2i1", "device request with the other flag written literal false (control)", plant(good_device(
+        "zzplant_r2i1", "    req.intent.constraints.must_host_pinned = false;\n")), "PASS"))
+    # r2 I-2: whole-object assignment is a copy
+    A(Case("r2i2", "req = {} after good flags", plant(good_device("zzplant_r2i2", "    req = {};\n")),
+           "FAIL", "DEFER-C", "zzplant_r2i2"))
+    A(Case("r2i2", "req = other_request after good flags", plant(
+        "void zzplant_r2i2(const %s & other) {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n    req = other;\n}\n" % (REQ, REQ)),
+        "FAIL", "DEFER-C", "zzplant_r2i2"))
+    A(Case("r2i2", "req = a request-returning call after good flags", plant(good_device(
+        "zzplant_r2i2", "    req = zz_make();\n")), "FAIL", "DEFER-C", "zzplant_r2i2"))
+    # r2 I-3: constructions that carry no request-type token
+    A(Case("r2i3", "braced {} returned from a request-returning function", plant(
+        "%s zzplant_r2i3a() {\n    return {};\n}\n" % REQ), "FAIL", "B-FORM", "zzplant_r2i3a"))
+    A(Case("r2i3", "braced designated list returned from a request-returning function", plant(
+        "%s zzplant_r2i3b() {\n    return {.size = 1};\n}\n" % REQ), "FAIL", "B-FORM", "zzplant_r2i3b"))
+    A(Case("r2i3", "unified_allocate({}) with a braced argument", plant(
+        "void zzplant_r2i3c() {\n    ggml_sycl::unified_allocate({});\n}\n"), "FAIL", "B-FORM", "zzplant_r2i3c"))
+    A(Case("r2i3", "unified_alloc({}, h) with a braced argument", plant(
+        "void zzplant_r2i3d(ggml_sycl::alloc_handle * h) {\n    ggml_sycl::unified_alloc({}, h);\n}\n"),
+        "FAIL", "B-FORM", "zzplant_r2i3d"))
+    A(Case("r2i3", "a default argument T r = {}", plant(
+        "void zzplant_r2i3e(%s r = {}) {\n    (void) r;\n}\n" % REQ), "FAIL", "B-FORM", "zzplant_r2i3e"))
+    A(Case("r2i3", "auto r2 = req", plant(good_device("zzplant_r2i3f", "    auto r2 = req;\n    (void) r2;\n")),
+           "FAIL", "DEFER-C", "zzplant_r2i3f::declaration:r2:"))
+    A(Case("r2i3", "auto r2 = std::move(req)", plant(good_device(
+        "zzplant_r2i3g", "    auto r2 = std::move(req);\n    (void) r2;\n")), "FAIL", "DEFER-C", "zzplant_r2i3g::declaration:r2:"))
+    A(Case("r2i3", "auto i = a request-returning call", plant(
+        "void zzplant_r2i3h() {\n    auto i = ggml_sycl_transient_device_intent(\"zz\");\n    (void) i;\n}\n"),
+        "FAIL", "DEFER-C", "zzplant_r2i3h::declaration:i:"))
+    A(Case("r2i3", "auto & alias of a request's intent", plant(good_device(
+        "zzplant_r2i3i", "    auto & in = req.intent;\n    (void) in;\n")), "FAIL", "DEFER-C", "zzplant_r2i3i::declaration:in:"))
+    A(Case("r2i3", "auto of a scalar field, a pointer and a literal (control)", plant(good_device(
+        "zzplant_r2i3j", "    auto n = req.size;\n    auto * p = &req;\n    auto k = 5;\n    (void) n;\n    (void) p;\n    (void) k;\n")),
+        "PASS"))
+    # r2 m-6: a write after the request has been handed on does not set up what that code read
+    A(Case("r2m6", "zone and forbid written after unified_allocate(req)", plant(
+        "void zzplant_r2m6a() {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    ggml_sycl::unified_allocate(req);\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n}\n" % REQ), "FAIL", "D-ZONE", "zzplant_r2m6a"))
+    A(Case("r2m6", "forbid written after an `if (b) { unified_allocate(req); return; }`", plant(
+        "void zzplant_r2m6b(bool b) {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    if (b) {\n        ggml_sycl::unified_allocate(req);\n        return;\n    }\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n}\n" % REQ), "FAIL", "D-FORBID", "zzplant_r2m6b"))
+    A(Case("r2m6", "a use inside a lambda counts as a first use", plant(
+        "void zzplant_r2m6c() {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    auto f = [&]() { ggml_sycl::unified_allocate(req); };\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n    f();\n}\n" % REQ), "FAIL", "D-FORBID", "zzplant_r2m6c"))
+    A(Case("r2m6", "every write before the handoff (control)", plant(good_device(
+        "zzplant_r2m6d", "    ggml_sycl::unified_allocate(req);\n")), "PASS"))
+    A(Case("r2m6", "scalar reads between the writes are not a handoff (control)", plant(
+        "void zzplant_r2m6e() {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    int sz = req.size;\n    (void) sz;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n    ggml_sycl::unified_allocate(req);\n}\n" % REQ),
+        "PASS"))
+    # r2 m-7: a macro body that assigns a tracked field
+    A(Case("r2m7", "#define assigning prefer_vram_zone = COUNT", plant(
+        "#define ZZ_BAD(r) r.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::COUNT\n"),
+        "FAIL", "B-FORM", "ZZ_BAD"))
+    A(Case("r2m7", "#define comparing a tracked field is not a write (control)", plant(
+        "#define ZZ_OK(r) ((r).intent.constraints.must_device == true)\n"), "PASS", planted=False))
+    # r2 nit: adjacent string literals form one literal
+    A(Case("r2n", "\"zeMem\" \"AllocDevice\" adjacent literals", plant(
+        "void zzplant_r2n() {\n    const char * s = \"zeMem\" \"AllocDevice\";\n    (void) s;\n}\n"),
+        "FAIL", "E-RAW", "zzplant_r2n"))
+    A(Case("r2n", "unrelated adjacent literals (control)", plant(
+        "void zzplant_r2n() {\n    const char * s = \"abc\" \"def\";\n    (void) s;\n}\n"), "PASS", planted=False))
+    # r2 m-2 / m-3: allowlist and debt entry validation
+    A(Case("r2m2", "an E-RAW allowlist entry without a name is rejected", lambda f: f, "FAIL", "data", "lacks name",
+           edit_allowlist=lambda al: dict(al, entries=[{k: v for k, v in e.items() if k != "name"} if e["id"] == "E-TEST" else e
+                                                      for e in al["entries"]])))
+    A(Case("r2m3", "an E-RAW debt entry without a cite is rejected", lambda f: f, "FAIL", "data", "has no cite",
+           edit_debt=lambda d: dict(d, violations=[{k: v for k, v in e.items() if k != "cite"} if (e["code"] == "E-RAW" and "::unified_alloc::" in e["key"]) else e
+                                                   for e in d["violations"]])))
+    A(Case("r2m3", "a one-word cite is rejected", lambda f: f, "FAIL", "data", "has no cite",
+           edit_debt=lambda d: dict(d, violations=[dict(e, cite="tbd") if (e["code"] == "E-RAW" and "::unified_alloc::" in e["key"]) else e
+                                                   for e in d["violations"]])))
+    A(Case("r2m3", "an unknown fate is rejected", lambda f: f, "FAIL", "data", "no valid fate",
+           edit_debt=lambda d: dict(d, violations=[dict(e, fate="whatever") if (e["code"] == "E-RAW" and "::unified_alloc::" in e["key"]) else e
+                                                   for e in d["violations"]])))
+    A(Case("r2m3", "sanctioned-vendored and pending-disposition are valid fates (control)", lambda f: f, "PASS",
+           edit_debt=lambda d: dict(d, violations=[dict(e, fate="pending-disposition") if (e["code"] == "E-RAW" and "::unified_alloc::" in e["key"]) else e
+                                                   for e in d["violations"]]), planted=False))
     return c
 
 
@@ -1472,12 +1840,12 @@ def evaluate_case(base_files, allowlist, debt, case):
 
 def planted_sightings(files):
     """Constructions, raw hits, forms and lexical rows the gate sees in a planted function or appended text."""
-    value_types, all_types = type_closure(files)
+    ctx = Ctx(files)
     n = 0
     for rel in files:
         if not (rel.startswith("zz") or "/zz" in rel or rel == "cpu-dispatch.cpp"):
             continue
-        fa = facts_for(rel, files[rel], value_types, all_types)
+        fa = facts_for(rel, files[rel], ctx)
         n += sum(1 for c in fa["constructions"] if "zz" in c["key"] or "zz" in c["func"])
         n += sum(1 for r in fa["lexical"] if r["var"].startswith("zz"))
         n += sum(1 for r in fa["raws"] if "zz" in r["func"])
@@ -1520,6 +1888,63 @@ def m6_witnesses():
     return out
 
 
+def r2m4_witnesses(allowlist):
+    """--write-debt and the gate fail cleanly (a FAIL line, rc 1, no traceback) on data files that are malformed."""
+    import tempfile
+    out = []
+    bad_debts = [("an entry without a key", '{"violations": [{"code": "D-ZONE"}]}', "malformed"),
+                 ("malformed JSON", "{not json", "not readable JSON"),
+                 ("a non-object file", "[1, 2]", "must be a JSON object"),
+                 ("a non-list violations field", '{"violations": 3}', "must be a list")]
+    for label, text, want in bad_debts:
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "allowlist.json").write_text(json.dumps(allowlist))
+            Path(d, "debt.json").write_text(text)
+            for flag in ("--write-debt", None):
+                rc, o = subprocess_gate(["--data", d] + ([flag] if flag else []))
+                ok = rc == 1 and "Traceback" not in o and want in o
+                out.append(("%s in debt.json: %s fails cleanly" % (label, flag or "the gate"), ok, "rc=%d %s" % (rc, o[:60].replace("\n", " "))))
+    return out
+
+
+def r2m8_witnesses():
+    """Scope: skips anchored at the scope root, case-insensitive suffixes, a required-file list and a floor."""
+    import tempfile
+    out = []
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d, SCOPE_SUBDIR)
+        for rel in ("tests/skipped.cpp", "docs/skipped.cpp", "dpct/tests/nested.cpp", "sub/docs/nested2.cpp", "UPPER.CPP",
+                    "lower.HPP"):
+            (base / rel).parent.mkdir(parents=True, exist_ok=True)
+            (base / rel).write_text("int x;\n")
+        scanned, unscanned = list_sources(d)
+        out.append(("a top-level tests/ and docs/ are skipped", "tests/skipped.cpp" not in scanned and "docs/skipped.cpp" not in scanned, sorted(scanned)))
+        out.append(("a nested tests/ or docs/ is scanned", "dpct/tests/nested.cpp" in scanned and "sub/docs/nested2.cpp" in scanned, sorted(scanned)))
+        out.append((".CPP and .HPP are scanned", "UPPER.CPP" in scanned and "lower.HPP" in scanned, sorted(scanned)))
+    for suffix in (".C", ".c", ".cl", ".CC"):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d, SCOPE_SUBDIR)
+            base.mkdir(parents=True)
+            (base / ("x" + suffix)).write_text("int x;\n")
+            rc, o = subprocess_gate(["--root", d])
+            out.append(("an unscanned %s file fails the gate, naming it" % suffix, rc == 1 and ("x" + suffix) in o, "rc=%d %s" % (rc, o[:60])))
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d, SCOPE_SUBDIR)
+        base.mkdir(parents=True)
+        for i in range(MIN_FILES + 5):
+            (base / ("f%d.cpp" % i)).write_text("int x;\n")
+        rc, o = subprocess_gate(["--root", d])
+        out.append(("a full-size tree missing a required file fails, naming it", rc == 1 and "ggml-sycl.cpp" in o, "rc=%d %s" % (rc, o[:80])))
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d, SCOPE_SUBDIR)
+        (base / "dpct").mkdir(parents=True)
+        for f in REQUIRED_FILES:
+            (base / f).write_text("int x;\n")
+        rc, o = subprocess_gate(["--root", d])
+        out.append(("a tree with the required files but below the floor fails", rc == 1 and "expected at least" in o, "rc=%d %s" % (rc, o[:80])))
+    return out
+
+
 def m9_witness():
     """A C++-ish file with an unscanned suffix is a FAIL naming it, before the file-count pin."""
     import tempfile
@@ -1538,14 +1963,16 @@ def cmake_witness(root):
     blocks = [m.group(0) for m in re.finditer(r"add_test\(NAME test-sycl-alloc-zone-contract.*?\)", text, flags=re.S)]
     ok = len(blocks) == 1 and "--write-debt" not in blocks[0] and "--allow-growth" not in blocks[0] \
         and "--mutation-matrix" in blocks[0]
-    return ok, "%d registration(s)" % len(blocks)
+    props = re.findall(r"set_tests_properties\(test-sycl-alloc-zone-contract PROPERTIES[^)]*\)", text)
+    ok = ok and len(props) == 1 and re.search(r"\bTIMEOUT\s+\d+", props[0]) is not None
+    return ok, "%d registration(s), timeout %s" % (len(blocks), "set" if props and "TIMEOUT" in props[0] else "MISSING")
 
 
 def m14_witness(files, allowlist, debt):
     """A key-matched allowlist entry covers exactly its node; it needs its debt entry gone, and fails if stale."""
     viols, _ = analyse(files)
     v = next(x for x in viols if x.code == "D-ZONE" and "graph_input_stage" in x.key)
-    ent = {"id": "E-ZZ-KEY", "code": v.code, "key": v.key, "count": 1, "reason": "matrix"}
+    ent = {"id": "E-ZZ-KEY", "code": v.code, "key": v.key, "count": 1, "reason": "mutation-matrix test entry"}
     al = dict(allowlist, entries=list(allowlist["entries"]) + [ent])
     d2 = dict(debt, violations=[d for d in debt["violations"] if (d["code"], d["key"]) != v.ident()])
     fails, _ = apply_contract(viols, al, d2)
@@ -1573,13 +2000,15 @@ def run_matrix(files, allowlist, debt, root):
         print("FAIL: case witness %s is not in WITNESSES" % w)
         bad += 1
     for w in WITNESSES:
-        if w in ("f", "cmake", "m6", "m9", "m14"):
+        if w in ("f", "cmake", "m6", "m9", "m14", "r2m4", "r2m8"):
             continue
         if not any(c.wid == w and c.expect == "FAIL" for c in cases):
             print("FAIL: witness %s has no FAIL case" % w)
             bad += 1
     print("deferred: " + "; ".join("witness %s (%s)" % kv for kv in WITNESSES_DEFERRED.items()))
-    assert names_new("FAIL new D-ZONE-COUNT x", "D-ZONE-COUNT") and not names_new("FAIL new D-ZONE-COUNT x", "D-ZONE")
+    if not (names_new("FAIL new D-ZONE-COUNT x", "D-ZONE-COUNT") and not names_new("FAIL new D-ZONE-COUNT x", "D-ZONE")):
+        print("FAIL: the matcher's own self-test (prefix collision) is wrong")
+        bad += 1
     for case in cases:
         ok, got = evaluate_case(files, allowlist, debt, case)
         print("%s witness %-4s %-80s expect %s" % ("ok  " if ok else "FAIL", case.wid, case.label, case.expect))
@@ -1593,6 +2022,8 @@ def run_matrix(files, allowlist, debt, root):
              ("m9", "an unscanned .inl file fails the gate") + m9_witness(),
              ("cmake", "the ctest registration carries no regeneration flag") + cmake_witness(root)]
     extra += [("m6", label, ok, d) for label, ok, d in m6_witnesses()]
+    extra += [("r2m4", label, ok, d) for label, ok, d in r2m4_witnesses(allowlist)]
+    extra += [("r2m8", label, ok, d) for label, ok, d in r2m8_witnesses()]
     extra += [("m14", label, ok, d) for label, ok, d in m14_witness(files, allowlist, debt)]
     for wid, label, ok, detail in extra:
         print("%s witness %-4s %-80s (%s)" % ("ok  " if ok else "FAIL", wid, label, str(detail)[:80]))
@@ -1618,8 +2049,18 @@ def main():
     if a.mutation_matrix and (a.list or a.write_debt):
         ap.error("--mutation-matrix cannot be combined with --list or --write-debt")
     data = Path(a.data) if a.data else Path(a.root) / "scripts" / "sycl-alloc-zone-contract"
-    allowlist = load_json(data / "allowlist.json", {"entries": []})
-    debt = load_json(data / "debt.json", {"violations": []})
+    try:
+        allowlist = load_json(data / "allowlist.json", {"entries": []}, "entries")
+        debt = load_json(data / "debt.json", {"violations": []}, "violations")
+    except DataError as exc:
+        print("FAIL: %s" % exc)
+        return 1
+    if a.write_debt:
+        errs = validate_data(allowlist, debt)
+        if errs:
+            print("\n".join(errs))
+            print("FAIL: --write-debt refuses to rewrite from data files that do not validate")
+            return 1
     files = load_tree(a.root)
     if a.list or a.write_debt:
         viols, _ = analyse(files)
@@ -1627,10 +2068,6 @@ def main():
             for v in viols:
                 print(v)
         if a.write_debt:
-            errs = validate_data(allowlist, {"violations": []})
-            if errs:
-                print("\n".join(errs))
-                return 1
             ok, msg, ents = plan_debt_write(viols, allowlist, debt, a.allow_growth)
             if not ok:
                 print("FAIL: " + msg)

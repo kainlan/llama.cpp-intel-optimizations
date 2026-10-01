@@ -143,7 +143,7 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-alloc-zone-contract.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../.. --mutation-matrix)
-    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES LABELS "sycl;host-only;ast;mutation")
+    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES LABELS "sycl;host-only;ast;mutation" TIMEOUT 600)
 endif()
 
 # P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp

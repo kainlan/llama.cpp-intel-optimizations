@@ -12,17 +12,23 @@ llama.cpp-23mk S2). JSON has no comments, so each file also carries a `_doc` fie
   a violation that is not listed fails, and a listed entry that no longer violates fails, naming it.
 
 Every `E-RAW` debt entry also carries `fate` and `cite`. `fate` is `deleted-by-<step>`, `converted-by-<step>`,
-`sanctioned-internal` or `pending-disposition`. A `sanctioned-internal` entry is one no step will ever shrink:
+`sanctioned-internal`, `sanctioned-vendored` (upstream code we do not edit) or `pending-disposition`. A `sanctioned-internal` entry is one no step will ever shrink:
 it is a candidate for the allowlist, and moving it there is the lead's decision, not the implementer's.
-`pending-disposition` marks an entry whose fate nobody has ruled on yet; its `cite` says what is known.
+`pending-disposition` marks an entry whose fate nobody has ruled on yet; its `cite` says what is known. Every E-RAW entry needs a `cite`, a ticket id or a design/census row of at
+least 12 characters.
 
 ## Key shape
 
 `file::function::node-kind:variable:text-hash#ordinal`. The text hash is of the construction's normalized
 declaration text plus the text of every later assignment bound to that declaration (comments dropped,
-whitespace collapsed), so a write added to, or removed from, a listed construction moves its key. The ordinal counts only identical constructions within the
-same function. No line or byte offset appears, so adding code above a construction does not move its key;
+whitespace collapsed), so a write added to, or removed from, a listed construction moves its key. The ordinal counts only identical VIOLATING constructions within the
+same function, so adding a compliant twin cannot move a listed key. No line or byte offset appears, so adding code above a construction does not move its key;
 changing the construction does, which is when its entry should be revisited.
+
+## Dependency
+
+The gate parses C++ with tree-sitter: `pip install tree-sitter-language-pack` in the python3 that CMake finds.
+A missing module is a FAIL naming it, never a skip.
 
 ## Shrinking the debt
 
