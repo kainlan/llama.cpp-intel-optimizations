@@ -3,6 +3,8 @@
 #include "kv-region-test-model.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -133,7 +135,10 @@ static size_t test_row_size(int32_t type, int64_t n_elements) {
         case TEST_TYPE_Q8_0:
             return static_cast<size_t>(n_elements / 32) * 34;
         default:
-            return 0;
+            // A type this table lacks must not read as "0 bytes" and slip through
+            // an equality of zeros.
+            std::fprintf(stderr, "test_row_size: unknown type id %d\n", (int) type);
+            std::abort();
     }
 }
 
@@ -1854,6 +1859,44 @@ int main() {
         r                        = context_demand_reconcile({ zero }, { held_at("ring", 1, 8) });
         CHECK_EQ(r.reused.size(), 1, "case 40: a held slot serves a zero need");
         CHECK(r.carved.empty() && r.superseded.empty(), "case 40: a zero need carves nothing");
+
+        // The scope is part of the key: a MODEL slot of the same owner id, device,
+        // cohort and index is a different reservation from the CONTEXT one.
+        {
+            held_slot other_scope   = held_at("ring", 0, 1000);
+            other_scope.scope       = demand_scope::MODEL;
+            context_side_demand one = ring;
+            one.slots               = { 400 };
+            r                       = context_demand_reconcile({ one }, { other_scope });
+            CHECK(r.reused.empty(), "case 40: a held slot of the other scope does not serve the claim");
+            CHECK_EQ(r.carved.size(), 1, "case 40: so the claim is carved");
+            CHECK(r.unused.empty(), "case 40: and the other-scope slot is not ours to report");
+            CHECK(!demand_slot_key_matches(other_scope, one, 0), "case 40: the key differs by scope alone");
+            other_scope.scope = demand_scope::CONTEXT;
+            CHECK(demand_slot_key_matches(other_scope, one, 0),
+                  "case 40: control: the same key with the scope equal matches");
+        }
+        // Cohorts compare by content, not by pointer: two distinct buffers holding
+        // "ring" match; a different string does not; a null cohort matches only null.
+        {
+            const std::string   spelled = std::string("ri") + "ng";
+            const std::string   other   = std::string("ri") + "ngs";
+            context_side_demand one     = ring;
+            one.slots                   = { 400 };
+            held_slot copy              = held_at(spelled.c_str(), 0, 1000);
+            CHECK(copy.cohort != one.cohort, "case 40: control: the two cohort pointers differ");
+            CHECK(demand_slot_key_matches(copy, one, 0), "case 40: equal cohort text under distinct pointers matches");
+            r = context_demand_reconcile({ one }, { copy });
+            CHECK_EQ(r.reused.size(), 1, "case 40: and the slot is reused");
+            held_slot different = held_at(other.c_str(), 0, 1000);
+            CHECK(!demand_slot_key_matches(different, one, 0), "case 40: different cohort text does not match");
+            context_side_demand null_demand = one;
+            null_demand.cohort              = nullptr;
+            held_slot null_held             = held_at(nullptr, 0, 1000);
+            CHECK(demand_slot_key_matches(null_held, null_demand, 0), "case 40: null matches null");
+            CHECK(!demand_slot_key_matches(null_held, one, 0) && !demand_slot_key_matches(copy, null_demand, 0),
+                  "case 40: null does not match a named cohort");
+        }
     }
     if (int rc = case_h2_a2()) {
         return rc;

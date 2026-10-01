@@ -844,21 +844,22 @@ static size_t real_row_size(int32_t type, int64_t n_elements) {
 
 // kv_layer_bytes_for_kind() keeps its exact results, now computed through the one
 // byte function: every kind, every SWA mode (per-stream, unified, swa_full, no
-// window), n_seq_max 0 to 8, awkward n_ctx values (not a multiple of n_seq_max or
+// window), n_seq_max 0 to 32, n_ctx to 262144, awkward n_ctx values (not a multiple of n_seq_max or
 // of 256), homogeneous, heterogeneous, MLA (no V) and zero widths.
 static void test_kv_layer_bytes_for_kind_keeps_its_results() {
     const uint8_t  kinds[]     = { GGML_SYCL_KV_LAYER_FULL, GGML_SYCL_KV_LAYER_SWA, GGML_SYCL_KV_LAYER_SHARED, 7 };
-    const uint32_t n_ctxs[]    = { 1, 256, 1000, 4096, 4097, 8192, 65536, 131072 };
+    const uint32_t n_ctxs[]    = { 1, 256, 1000, 4096, 4097, 8192, 65536, 131072, 262144 };
     const uint32_t n_swas[]    = { 0, 1, 128, 512, 1024, 4096 };
     const uint32_t n_ubs[]     = { 1, 128, 512, 1024, 2048 };
-    const uint32_t n_seqs[]    = { 0, 1, 2, 3, 4, 8 };
+    const uint32_t n_seqs[]    = { 0, 1, 2, 3, 4, 8, 16, 32 };
     const uint32_t widths[][2] = {
-        { 512,  512 },
-        { 1024, 512 },
-        { 96,   160 },
-        { 0,    0   },
-        { 256,  0   },
-        { 0,    256 }
+        { 512,  512  },
+        { 1024, 1024 },
+        { 1024, 512  },
+        { 96,   160  },
+        { 0,    0    },
+        { 256,  0    },
+        { 0,    256  }
     };
     size_t n_cmp   = 0;
     size_t n_diff  = 0;

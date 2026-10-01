@@ -566,6 +566,8 @@ inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
     layer.n_embd_v_gqa = v_width;
     layer.has_kv       = 1;
     const size_t cells = kv_layer_cells(kind, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full, n_swa);
+    // The row-size lambda restates ggml_row_size for f16 so this header needs no
+    // ggml-base; test-sycl-kv-layer-sizing sweeps it against the real ggml_row_size.
     return kv_layer_tensor_bytes(
         layer, GGML_TYPE_F16, GGML_TYPE_F16, cells, /*pad_to=*/1,
         [](int32_t, int64_t n_elements) { return static_cast<size_t>(n_elements) * sizeof(ggml_fp16_t); });

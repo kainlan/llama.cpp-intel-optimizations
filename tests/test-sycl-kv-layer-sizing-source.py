@@ -163,6 +163,10 @@ def kv_layer_cells_violations(source: str) -> list[str]:
         found.append("kv_unified==false branch does not set n_stream=seqs, window_seqs=1")
     # The per-stream cap and the stream multiplication must both survive
     # into the final formula, in EITHER mode.
+    # The 256-cell padding is the one thing llama pads cells to (GGML_PAD(x, 256));
+    # kv-runtime-demotion.hpp spells it as a lambda so it needs no ggml header.
+    if not re.search(r"pad256\s*=\s*\[\]\(uint32_t\s+x\)\s*\{\s*return\s*\(x\s*\+\s*255u\)\s*&\s*~255u\s*;", body):
+        found.append("pad256 is not (x + 255u) & ~255u")
     if not re.search(r"n_swa\s*\*\s*window_seqs\s*\+\s*n_ubatch", body):
         found.append("does not multiply n_swa by window_seqs in the per-stream window formula")
     if not re.search(r"swa_cells\s*=\s*swa_cells_per_stream\s*\*\s*n_stream", body):
@@ -202,8 +206,34 @@ def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
         for arg in ("n_ctx", "n_ubatch", "n_seq_max", "kv_unified", "swa_full", "n_swa"):
             if not re.search(r"\b" + arg + r"\b", call.group(0)):
                 found.append(f"does not forward {arg} to {KV_LAYER_CELLS}")
+    # The two flags are consumed positionally by kv_layer_cells and by every
+    # caller, so their order is part of the contract, not just their presence.
+    if not re.search(r"bool\s+kv_unified\s*,\s*bool\s+swa_full\s*\)", params):
+        found.append("does not take kv_unified then swa_full, in that order")
+    if call is not None and not re.search(
+            r"\(\s*kind\s*,\s*n_ctx\s*,\s*n_ubatch\s*,\s*n_seq_max\s*,\s*kv_unified\s*,\s*swa_full\s*,\s*n_swa\s*\)",
+            call.group(0)):
+        found.append(f"does not pass {KV_LAYER_CELLS} its arguments in positional order")
     if KV_LAYER_TENSOR_BYTES + "(" not in body:
         found.append(f"does not size through {KV_LAYER_TENSOR_BYTES}")
+    else:
+        # The load-time estimate is the f16, unpadded shape over exactly the
+        # cells kv_layer_cells returned: pin each argument of the byte call.
+        sized = re.search(re.escape(KV_LAYER_TENSOR_BYTES) + r"\(([^\[]*)", body)
+        args = [re.sub(r"/\*.*?\*/", "", a).strip() for a in sized.group(1).split(",")] if sized else []
+        if len(args) < 5:
+            found.append(f"calls {KV_LAYER_TENSOR_BYTES} with too few arguments to check")
+        else:
+            if args[0] != "layer":
+                found.append(f"does not size the layer descriptor through {KV_LAYER_TENSOR_BYTES}")
+            if args[1] != "GGML_TYPE_F16" or args[2] != "GGML_TYPE_F16":
+                found.append(f"does not size an f16 K and V through {KV_LAYER_TENSOR_BYTES}")
+            if args[3] != "cells":
+                found.append(f"does not pass kv_layer_cells' cells to {KV_LAYER_TENSOR_BYTES}")
+            if args[4] != "1":
+                found.append("does not size unpadded: pad_to is not 1")
+    if not re.search(r"n_embd_k_gqa\s*=\s*k_width\s*;", body) or not re.search(r"n_embd_v_gqa\s*=\s*v_width\s*;", body):
+        found.append("does not map k_width to n_embd_k_gqa and v_width to n_embd_v_gqa")
     if "window_seqs" in body or "GGML_PAD" in body:
         found.append("carries a second copy of the cell arithmetic")
     return found
@@ -531,6 +561,35 @@ def test_mutation_kv_layer_bytes_for_kind_stops_sizing_through_the_one_function_
     mutated = hpp.replace("return kv_layer_tensor_bytes(", "return legacy_tensor_bytes(", 1)
     _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not size through",
                       "bytes no longer from kv_layer_tensor_bytes")
+
+
+def test_mutation_kv_layer_bytes_for_kind_swaps_cells_and_pad_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("GGML_TYPE_F16, cells, /*pad_to=*/1", "GGML_TYPE_F16, n_ctx, /*pad_to=*/1", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not pass kv_layer_cells' cells to",
+                      "the byte call no longer gets kv_layer_cells' cells")
+    mutated = hpp.replace("cells, /*pad_to=*/1", "cells, /*pad_to=*/256", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "pad_to is not 1",
+                      "the load-time estimate padded")
+    mutated = hpp.replace("layer, GGML_TYPE_F16, GGML_TYPE_F16, cells", "layer, GGML_TYPE_Q8_0, GGML_TYPE_F16, cells", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not size an f16 K and V",
+                      "the load-time estimate no longer f16")
+
+
+def test_mutation_kv_layer_bytes_for_kind_swaps_the_two_flags_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated, n = re.subn(r"bool(\s+)kv_unified,(\s*)bool(\s+)swa_full\)", r"bool\1swa_full,\2bool\3kv_unified)", hpp, count=1)
+    assert n == 1, "flag parameter pair pattern did not match the current source"
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "in that order", "parameter flags swapped")
+    mutated = hpp.replace("kv_unified, swa_full, n_swa)", "swa_full, kv_unified, n_swa)", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "in positional order",
+                      "call flags swapped")
+
+
+def test_mutation_pad256_changed_is_witnessed() -> None:
+    hpp = KV_RUNTIME_DEMOTION_HPP.read_text()
+    mutated = hpp.replace("return (x + 255u) & ~255u;", "return (x + 256u) & ~255u;", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_cells_violations, "pad256 is not", "pad256 constant changed")
 
 
 def test_mutation_kv_layer_bytes_for_kind_grows_a_second_cell_formula_is_witnessed() -> None:

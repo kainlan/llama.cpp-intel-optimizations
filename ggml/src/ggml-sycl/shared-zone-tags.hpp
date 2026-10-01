@@ -32,15 +32,18 @@ static_assert(SHARED_ZONE_TAG_OPTIONAL != SHARED_ZONE_TAG_UNTAGGED,
 // TRANSIENT are both alloc_role::COMPUTE; many non-weight requests name WEIGHT
 // only to stay out of the tail zones).  UNSET derives the class from the role:
 // WEIGHT gives WEIGHT and every other role gives TRANSIENT.
+//
+// Enumerators carry the enum prefix (the repo's enum convention), which also
+// keeps OPTIONAL clear of the empty OPTIONAL macro windows.h defines.
 enum class shared_zone_lifetime : uint8_t {
-    UNSET,
-    WEIGHT,
-    OPTIONAL,
-    KV_REGION,
-    CONTEXT,
-    TRANSIENT,
+    SHARED_ZONE_LIFETIME_UNSET,
+    SHARED_ZONE_LIFETIME_WEIGHT,
+    SHARED_ZONE_LIFETIME_OPTIONAL,
+    SHARED_ZONE_LIFETIME_KV_REGION,
+    SHARED_ZONE_LIFETIME_CONTEXT,
+    SHARED_ZONE_LIFETIME_TRANSIENT,
     // The B50 tail-zone lever: a TRANSIENT request placed on the weight side.
-    WEIGHT_SIDE_TRANSIENT,
+    SHARED_ZONE_LIFETIME_WEIGHT_SIDE_TRANSIENT,
 };
 
 }  // namespace ggml_sycl

@@ -6,7 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -407,6 +406,10 @@ inline size_t kv_pad_bytes(size_t bytes, size_t pad_to) {
 // ggml_backend_alloc_ctx_tensors_from_buft pads every tensor it places.  A
 // layer with has_kv == 0 is 0.  pad_to is the tiered buft's alignment for a
 // region slot and 1 for the load-time estimate, which never sizes a region.
+// That alignment is the whole of the buft's size rule today: get_alloc_size is
+// NULL (identity) for the tiered buft.  A buft with a real get_alloc_size, such
+// as a future recurrent-state buft, needs a second per-tensor hook applied here
+// before the padding (L4's kv_layer_alloc_bytes is where it goes).
 inline size_t kv_layer_tensor_bytes(const kv_layer_desc & layer,
                                     int32_t               type_k,
                                     int32_t               type_v,
@@ -453,7 +456,8 @@ enum class demand_placement : uint8_t { HEAD_SLOT, AFTER_KV };
 
 struct context_side_demand {
     int                  device   = -1;
-    shared_zone_lifetime lifetime = shared_zone_lifetime::CONTEXT;  // CONTEXT, TRANSIENT or WEIGHT_SIDE_TRANSIENT
+    // CONTEXT, TRANSIENT or WEIGHT_SIDE_TRANSIENT, as SHARED_ZONE_LIFETIME_*
+    shared_zone_lifetime lifetime = shared_zone_lifetime::SHARED_ZONE_LIFETIME_CONTEXT;
     demand_scope         scope    = demand_scope::CONTEXT;
     uint64_t             owner    = 0;                              // CONTEXT: the ContextId; MODEL: the ModelId
     const char *         cohort   = nullptr;                        // the cohort id its claims carry
@@ -504,7 +508,9 @@ struct demand_reconciliation {
 // released at the publish.  A claimed slot is never moved.  A held slot is
 // `unused` when its owner has a record on its device and no record names its
 // (cohort, index): it stays as held planned room (the tenant-only path) and is
-// released only with its owner.
+// released only with its owner.  Precondition: `held` carries no two slots with
+// the same (device, scope, owner, cohort, index); the registry never holds
+// duplicates, and with a duplicate only the first would be reported superseded.
 demand_reconciliation context_demand_reconcile(const std::vector<context_side_demand> & demands,
                                                const std::vector<held_slot> &           held);
 
