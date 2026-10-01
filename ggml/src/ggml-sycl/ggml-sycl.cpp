@@ -3077,6 +3077,133 @@ static bool ggml_sycl_placement_plan_needs_moe_secondary_devices(const ggml_sycl
 static bool ggml_sycl_placement_plan_moe_needs_other_device(const ggml_sycl::placement_plan & plan,
                                                             int                               execution_device);
 
+// ---------------------------------------------------------------------------
+// The dispatch owner (zhcn C6e, rulings M246).
+//
+// Several MoE route chains need the model that the dispatching context executes
+// but hold no context: the resolver and the decode candidate collector. A graph
+// compute root binds that owner here for the extent of the call; an unbound read
+// is null, and the consumer takes its specified refusal path. There is no default
+// owner and no rebinding. Work that crosses threads (a host_task, the CPU expert
+// pool, a worker lambda) captures the owner by value when it is submitted; this
+// thread-local is never read inside a body that runs on another thread.
+// ---------------------------------------------------------------------------
+static bool ggml_sycl_execution_current_owner(const ggml_backend_sycl_context *  ctx,
+                                              ggml_sycl::lifecycle::ModelToken & owner);
+
+static thread_local ggml_sycl::lifecycle::ModelToken g_dispatch_owner{};
+static thread_local bool                             g_dispatch_owner_bound = false;
+static thread_local int                              g_dispatch_owner_depth = 0;
+
+class ggml_sycl_dispatch_owner_scope {
+  public:
+    explicit ggml_sycl_dispatch_owner_scope(const ggml_backend_sycl_context * ctx) {
+        ggml_sycl::lifecycle::ModelToken owner{};
+        const bool                       bound = ggml_sycl_execution_current_owner(ctx, owner);
+        if (g_dispatch_owner_depth > 0 &&
+            (bound != g_dispatch_owner_bound || (bound && !(owner == g_dispatch_owner)))) {
+            GGML_ABORT("[DISPATCH-OWNER] nested scope binds a different owner");
+        }
+        g_dispatch_owner       = owner;
+        g_dispatch_owner_bound = bound;
+        ++g_dispatch_owner_depth;
+    }
+
+    ~ggml_sycl_dispatch_owner_scope() {
+        if (--g_dispatch_owner_depth == 0) {
+            g_dispatch_owner       = {};
+            g_dispatch_owner_bound = false;
+        }
+    }
+
+    ggml_sycl_dispatch_owner_scope(const ggml_sycl_dispatch_owner_scope &)             = delete;
+    ggml_sycl_dispatch_owner_scope & operator=(const ggml_sycl_dispatch_owner_scope &) = delete;
+};
+
+static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {
+    return g_dispatch_owner_bound ? &g_dispatch_owner : nullptr;
+}
+
+enum ggml_sycl_secondary_queue_status {
+    GGML_SYCL_SECONDARY_QUEUE_READY,
+    GGML_SYCL_SECONDARY_QUEUE_NONE,
+    GGML_SYCL_SECONDARY_QUEUE_REFUSED,
+};
+
+enum class ggml_sycl_into_empty_result : uint8_t {
+    NOOP,
+    INSTALLED,
+    REFUSED,
+};
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+static std::atomic<uint64_t> g_into_empty_installs{ 0 };
+
+static uint64_t ggml_sycl_into_empty_install_count() {
+    return g_into_empty_installs.load(std::memory_order_acquire);
+}
+#endif
+
+static bool ggml_sycl_cache_snapshot_empty(const ggml_sycl::unified_cache * cache) {
+    const auto current = cache->get_placement_plan_snapshot();
+    return !current || !current->plan || current->plan->entries.empty();
+}
+
+// Installs the owning model's publication into ONE cache whose plan is empty.
+// It is one critical section under g_tensor_inventory_mutex and writes no
+// device-global: not g_model_n_layer, not g_placement_kv_info, not
+// g_placement_publication, and no other cache's snapshot. The snapshot comes from
+// the owner's own registry row, never from the process-global publication, which
+// with two models loaded may be the other model's.
+static ggml_sycl_into_empty_result ggml_sycl_republish_current_plan_into_empty(
+    ggml_sycl::unified_cache *               cache,
+    const ggml_sycl::lifecycle::ModelToken & owner) {
+    if (!cache) {
+        return ggml_sycl_into_empty_result::NOOP;
+    }
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value, owner.load.value,
+                                                                     owner.owner.slot, owner.owner.generation);
+    if (!selected) {
+        // A model outlives its contexts, so a bound owner whose snapshot is gone
+        // is a defect, never a silent skip and never an empty-plan proceed.
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] into_empty: no snapshot for owner model=%llu load=%llu slot=%u\n",
+                      (unsigned long long) owner.model.value, (unsigned long long) owner.load.value,
+                      (unsigned) owner.owner.slot);
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] into_empty: no snapshot for the bound owner");
+        }
+        return ggml_sycl_into_empty_result::REFUSED;
+    }
+    const auto current = cache->get_placement_plan_snapshot();
+    if (current && current->plan && !current->plan->entries.empty()) {
+        return ggml_sycl_into_empty_result::NOOP;
+    }
+    bool      participates = false;
+    const int total        = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+    for (int d = 0; d < total && !participates; ++d) {
+        participates = ggml_sycl::get_unified_cache_for_device(d) == cache && selected->plan &&
+                       ggml_sycl_placement_plan_uses_device(*selected->plan, d);
+    }
+    cache->set_placement_plan_snapshot(participates ? selected : nullptr);
+    if (!participates) {
+        return ggml_sycl_into_empty_result::NOOP;
+    }
+    const auto installed = cache->get_placement_plan_snapshot();
+    if (!installed || installed->version != selected->version || installed->model_id != selected->model_id ||
+        installed->load_txn_id != selected->load_txn_id) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] into_empty: the installed snapshot is not the owner's\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] into_empty: the installed snapshot is not the owner's");
+        }
+        return ggml_sycl_into_empty_result::REFUSED;
+    }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_into_empty_installs.fetch_add(1, std::memory_order_acq_rel);
+#endif
+    return ggml_sycl_into_empty_result::INSTALLED;
+}
+
 // Thread-local flag: set to true when moe_prefetch_scan() has submitted hints
 // for the current graph. Checked at dispatch time to skip redundant hint() calls.
 static thread_local bool g_prefetch_scan_done = false;
@@ -5818,6 +5945,7 @@ enum class moe_expert_route_kind : uint8_t {
     SECONDARY_DEVICE,
     HOST,
     UNAVAILABLE,
+    REFUSED,
 };
 
 static const char * ggml_sycl_moe_route_kind_name(moe_expert_route_kind kind) {
@@ -5830,6 +5958,8 @@ static const char * ggml_sycl_moe_route_kind_name(moe_expert_route_kind kind) {
             return "host";
         case moe_expert_route_kind::UNAVAILABLE:
             return "unavailable";
+        case moe_expert_route_kind::REFUSED:
+            return "refused";
     }
     return "unknown";
 }
@@ -5921,7 +6051,12 @@ static bool ggml_sycl_moe_route_log_enabled() {
     return v != 0;
 }
 
-static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
+// Whether the secondary device's queue is ready. A null owner is an unbound
+// caller and installs nothing; REFUSED is returned only when the owner's install
+// into an empty cache refused, and it is never a re-route.
+static ggml_sycl_secondary_queue_status ggml_sycl_ensure_moe_secondary_queues_for_plan(
+    int                                      target_device,
+    const ggml_sycl::lifecycle::ModelToken * owner) {
     const auto & info = ggml_sycl_info();
     if (ggml_sycl_moe_route_log_enabled()) {
         static std::atomic<int> logged_ensure{ 0 };
@@ -5936,7 +6071,7 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
         }
     }
     if (target_device < 0) {
-        return false;
+        return GGML_SYCL_SECONDARY_QUEUE_NONE;
     }
 
     const int total_gpus = std::max(info.total_gpu_count, target_device + 1);
@@ -5948,18 +6083,19 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
                 "[MOE-MULTI-GPU] Planner resolved secondary device %d, but only %d physical GPU(s) are known\n",
                 target_device, info.total_gpu_count);
         }
-        return false;
+        return GGML_SYCL_SECONDARY_QUEUE_NONE;
     }
 
     if (sycl::queue * q = ggml_sycl::get_shared_context_queue(target_device)) {
         (void) ggml_sycl::unified_cache_register_for_queue(target_device, *q);
-        if (ggml_sycl_has_global_plan()) {
+        if (owner) {
             if (auto * cache = ggml_sycl::get_unified_cache_for_device(target_device);
-                cache && ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-                ggml_sycl_republish_current_plan();
+                cache && ggml_sycl_cache_snapshot_empty(cache) &&
+                ggml_sycl_republish_current_plan_into_empty(cache, *owner) == ggml_sycl_into_empty_result::REFUSED) {
+                return GGML_SYCL_SECONDARY_QUEUE_REFUSED;
             }
         }
-        return true;
+        return GGML_SYCL_SECONDARY_QUEUE_READY;
     }
 
     static std::mutex           init_mutex;
@@ -5974,10 +6110,11 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
             continue;
         }
         (void) ggml_sycl::unified_cache_register_for_queue(d, *q_d);
-        if (ggml_sycl_has_global_plan()) {
+        if (owner) {
             if (auto * cache = ggml_sycl::get_unified_cache_for_device(d);
-                cache && ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-                ggml_sycl_republish_current_plan();
+                cache && ggml_sycl_cache_snapshot_empty(cache) &&
+                ggml_sycl_republish_current_plan_into_empty(cache, *owner) == ggml_sycl_into_empty_result::REFUSED) {
+                return GGML_SYCL_SECONDARY_QUEUE_REFUSED;
             }
         }
         ++n_registered;
@@ -5998,7 +6135,31 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
         }
     }
 
-    return ggml_sycl::get_shared_context_queue(target_device) != nullptr;
+    return ggml_sycl::get_shared_context_queue(target_device) != nullptr ? GGML_SYCL_SECONDARY_QUEUE_READY :
+                                                                           GGML_SYCL_SECONDARY_QUEUE_NONE;
+}
+
+// A REFUSED install is a clean graph failure through the fallback channel,
+// never a re-route to the host or to another device.
+[[noreturn]] static void ggml_sycl_secondary_queue_refused_fail() {
+    GGML_LOG_WARN("[CONTEXT-PLAN-BUG] secondary queue refused: plan owner\n");
+    if (ggml_sycl::ggml_sycl_strict_enabled()) {
+        GGML_ABORT("[CONTEXT-PLAN-BUG] secondary queue refused: plan owner");
+    }
+    throw ggml_sycl_fallback_error("MUL_MAT_ID secondary queue refused: plan owner");
+}
+
+// The consumers' shared step: ready, absent, or a clean failure.
+static bool ggml_sycl_secondary_queue_ready_or_throw(ggml_sycl_secondary_queue_status status) {
+    switch (status) {
+        case GGML_SYCL_SECONDARY_QUEUE_READY:
+            return true;
+        case GGML_SYCL_SECONDARY_QUEUE_NONE:
+            return false;
+        case GGML_SYCL_SECONDARY_QUEUE_REFUSED:
+            ggml_sycl_secondary_queue_refused_fail();
+    }
+    return false;
 }
 
 static std::vector<ggml_sycl_cache_id> ggml_sycl_get_canonical_moe_expert_keys(const ggml_tensor * src0,
@@ -6493,11 +6654,34 @@ static bool ggml_sycl_moe_plan_admits_current_alternate(const ggml_tensor *     
     return false;
 }
 
+static moe_expert_route ggml_sycl_resolve_moe_expert_route_core(const ggml_tensor * src0,
+                                                                int                 current_device,
+                                                                int                 expert_id,
+                                                                ggml_layout_mode    requested_layout,
+                                                                bool                allow_materialize);
+
+// The one entry every consumer calls. The core reports a refused plan owner as
+// the REFUSED kind; this wrapper turns that into a clean graph failure through
+// the fallback channel, so no consumer can read a refused route as an ordinary
+// miss and re-route it to the host or to another device.
 static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * src0,
                                                            int                 current_device,
                                                            int                 expert_id,
                                                            ggml_layout_mode    requested_layout,
                                                            bool                allow_materialize = false) {
+    moe_expert_route route =
+        ggml_sycl_resolve_moe_expert_route_core(src0, current_device, expert_id, requested_layout, allow_materialize);
+    if (route.kind == moe_expert_route_kind::REFUSED) {
+        ggml_sycl_secondary_queue_refused_fail();
+    }
+    return route;
+}
+
+static moe_expert_route ggml_sycl_resolve_moe_expert_route_core(const ggml_tensor * src0,
+                                                                int                 current_device,
+                                                                int                 expert_id,
+                                                                ggml_layout_mode    requested_layout,
+                                                                bool                allow_materialize) {
     // llama.cpp-1tjn (B3 rework census, temporary): total per-op resolve
     // volume, any caller. See moe_decode_route_census above this namespace.
     g_moe_decode_route_census.raw_resolve_calls.fetch_add(1, std::memory_order_relaxed);
@@ -6530,7 +6714,16 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
             route.planned_device           = placement.on_device ? placement.target_device : -1;
             route.planned_layout           = placement.layout;
             if (route.planned_device_residency && route.planned_device >= 0 && route.planned_device != current_device) {
-                (void) ggml_sycl_ensure_moe_secondary_queues_for_plan(route.planned_device);
+                switch (
+                    ggml_sycl_ensure_moe_secondary_queues_for_plan(route.planned_device, ggml_sycl_dispatch_owner())) {
+                    case GGML_SYCL_SECONDARY_QUEUE_READY:
+                    case GGML_SYCL_SECONDARY_QUEUE_NONE:
+                        break;
+                    case GGML_SYCL_SECONDARY_QUEUE_REFUSED:
+                        route.kind   = moe_expert_route_kind::REFUSED;
+                        route.reason = expert_resolve_reason::NOT_READY;
+                        return route;
+                }
             }
             current_device_planned_alternate =
                 ggml_sycl_moe_plan_admits_current_alternate(src0, current_device, requested_layout, placement);
@@ -9835,6 +10028,11 @@ static void test_init_q8_moe_tensor(ggml_tensor & tensor, const char * name) {
 
 bool test_moe_storage_handle_first_route_and_negatives() {
     constexpr int expert_id = 3;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // This test holds no context and binds no dispatch owner, so every resolve
+    // below runs with an unbound owner and must install nothing (C6e).
+    const uint64_t installs_before = ggml_sycl_into_empty_install_count();
+#endif
     ggml_tensor   tensor{};
     test_init_q8_moe_tensor(tensor, "");
     ggml_tensor_extra_gpu extra{};
@@ -10027,8 +10225,13 @@ bool test_moe_storage_handle_first_route_and_negatives() {
     // cannot bypass lookup and route through an otherwise valid handle.
     ggml_set_name(&tensor, "");
     moe_expert_route unnamed = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
-    return unnamed.plan_missing && !unnamed.plan_found && !unnamed.ptr &&
-           unnamed.kind == moe_expert_route_kind::UNAVAILABLE;
+    const bool       unnamed_ok = unnamed.plan_missing && !unnamed.plan_found && !unnamed.ptr &&
+                            unnamed.kind == moe_expert_route_kind::UNAVAILABLE;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    return unnamed_ok && ggml_sycl_into_empty_install_count() == installs_before;
+#else
+    return unnamed_ok;
+#endif
 }
 
 bool test_moe_route_preserves_ready_event_for_chaining() {
@@ -28453,7 +28656,8 @@ static double ggml_sycl_collect_decode_secondary_candidates(
         if (d == current_device) {
             continue;
         }
-        if (!ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(d)) {
+        if (!ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
+                ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(d, ggml_sycl_dispatch_owner()))) {
             continue;
         }
         const double transfer_penalty = ggml_sycl_decode_remote_transfer_penalty(current_device, d);
@@ -28732,6 +28936,8 @@ const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
             return "workspace_undersized";
         case moe_batch_reject_reason::WORKSPACE_LEASE_MISSING:
             return "workspace_lease_missing";
+        case moe_batch_reject_reason::PLAN_OWNER_REFUSED:
+            return "plan_owner_refused";
     }
     return "unknown";
 }
@@ -28764,6 +28970,11 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 normalized.residency = moe_batch_residency::HOST;
                 break;
             case moe_expert_route_kind::UNAVAILABLE:
+                normalized.residency = moe_batch_residency::UNAVAILABLE;
+                break;
+            case moe_expert_route_kind::REFUSED:
+                // The wrapper throws on a refused route, so none reaches here; a
+                // refused plan owner is never normalized into an executor.
                 normalized.residency = moe_batch_residency::UNAVAILABLE;
                 break;
         }
@@ -72586,6 +72797,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         b3_segment_timing_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     init_moe_debug();
+    // The model this context executes, read once from the context's execution
+    // binding. The secondary-queue ensures below pass it explicitly (null means
+    // unbound: nothing is installed); no thread-local is read here.
+    ggml_sycl::lifecycle::ModelToken mmid_owner{};
+    const bool                       mmid_owner_bound             = ggml_sycl_execution_current_owner(&ctx, mmid_owner);
+    const ggml_sycl::lifecycle::ModelToken * const mmid_owner_ptr = mmid_owner_bound ? &mmid_owner : nullptr;
     // llama.cpp-fwhv (B1): TEMPORARY host-time probe over this function --
     // total CPU-side dispatch cost per MUL_MAT_ID call, all exits included via
     // the destructor. Enabled by GGML_SYCL_MOE_PROLOGUE_TIMING=1; removed by
@@ -75614,8 +75831,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // Detect host-resident weights including SYCL HOST_PINNED buffers
     bool   host_weights  = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
     auto * route_cache   = ggml_sycl::get_unified_cache(*stream);
-    if (route_cache && ggml_sycl_cache_plan_owner(route_cache)->entries.empty() && ggml_sycl_has_global_plan()) {
-        ggml_sycl_republish_current_plan();
+    if (route_cache && mmid_owner_ptr && ggml_sycl_cache_snapshot_empty(route_cache) &&
+        ggml_sycl_republish_current_plan_into_empty(route_cache, *mmid_owner_ptr) ==
+            ggml_sycl_into_empty_result::REFUSED) {
+        ggml_sycl::ggml_sycl_secondary_queue_refused_fail();
     }
     const bool has_placement_plan         = route_cache && !ggml_sycl_cache_plan_owner(route_cache)->entries.empty();
     bool       plan_has_cpu_experts       = false;
@@ -76970,10 +77189,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             auto append_retained_operand = [&](const ggml_sycl::moe_resolved_operand & operand, int64_t iid1,
                                                int64_t id, moe_route_phase phase, size_t rows,
                                                retained_decode_partition_stats & stats) {
-                const bool queue_available =
-                    operand.residency() != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE ||
-                    (operand.owning_device() >= 0 && operand.owning_device() < n_gpu_devs &&
-                     ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(operand.owning_device()));
+                bool queue_available = operand.residency() != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE;
+                if (!queue_available && operand.owning_device() >= 0 && operand.owning_device() < n_gpu_devs) {
+                    const auto queue_status = ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(
+                        operand.owning_device(), mmid_owner_ptr);
+                    if (queue_status == GGML_SYCL_SECONDARY_QUEUE_REFUSED) {
+                        // A refused plan owner is a rejected choice made BEFORE the
+                        // chooser: it must never become queue_available=false, from
+                        // which the chooser could pick HOST_CPU for this operand.
+                        ggml_sycl::moe_batch_executor_choice refused;
+                        refused.reject = ggml_sycl::moe_batch_reject_reason::PLAN_OWNER_REFUSED;
+                        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] secondary queue refused: plan owner\n");
+                        return refused;
+                    }
+                    queue_available = queue_status == GGML_SYCL_SECONDARY_QUEUE_READY;
+                }
                 // Admission already retained the exact capability-derived recipe
                 // and bound its signature to this lease. Never fabricate a second
                 // argument-less capability query at fallback/partition time.
@@ -77352,9 +77582,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         return;
                     }
 
-                    const bool queue_ready =
-                        route.owning_device >= 0 && route.owning_device < n_gpu_devs &&
-                        ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device);
+                    const bool queue_ready = route.owning_device >= 0 && route.owning_device < n_gpu_devs &&
+                                             ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
+                                                 ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(
+                                                     route.owning_device, mmid_owner_ptr));
                     const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
                         src0->type, route.actual_layout, phase, src0->ne[0], src0->ne[1], rows, route.owning_device,
                         moe_layer_route_residency::DEVICE, ctx.device);
@@ -80638,9 +80869,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         moe_profile_state::us(route_resolve_start, moe_profile_state::hrc::now());
                 }
                 if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr) {
-                    const bool queue_ready =
-                        route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
-                        ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device);
+                    const bool queue_ready = route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
+                                             ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
+                                                 ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(
+                                                     route.owning_device, mmid_owner_ptr));
                     const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
                         src0->type, route.actual_layout, moe_route_phase::PROMPT, src0->ne[0], src0->ne[1],
                         static_cast<size_t>(num_src1_rows), route.owning_device, moe_layer_route_residency::DEVICE,
@@ -80677,7 +80909,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                 } else if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr &&
                            route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
-                           ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device)) {
+                           ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
+                               ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device,
+                                                                                         mmid_owner_ptr))) {
                     if (use_expert_cache && has_placement_plan && !route.lease.valid()) {
                         GGML_ABORT(
                             "[MOE-ROUTE] planned secondary PP expert resolved without smart mem_handle tensor=%s "
@@ -108821,6 +109055,9 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     // other thread's re-plan behind a decode. One load and one branch when the
     // witness is off.
     GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(), "[REPLAN-TOKEN] token held in graph compute");
+    // The root that binds the dispatch owner for every ctx-less MoE route chain below.
+    ggml_sycl_dispatch_owner_scope dispatch_owner(
+        backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr);
     // llama.cpp-480a: segment the pinned-staging trace by graph so occupancy can
     // be read as "returns to baseline" vs "climbs". Bracketing both sides is what
     // makes that readable -- an entry sample alone cannot distinguish a graph that

@@ -566,6 +566,206 @@ def gate31(files, bad):
 
 
 # --------------------------------------------------------------------------------------
+# gate 31, owner threading (C6e, rulings M246): the dispatch owner
+# --------------------------------------------------------------------------------------
+OWNER_READERS = ("ggml_sycl_resolve_moe_expert_route_core", "ggml_sycl_collect_decode_secondary_candidates")
+ENSURE = "ggml_sycl_ensure_moe_secondary_queues_for_plan"
+# every function allowed to call ENSURE, with the owner argument it must pass
+ENSURE_CALLERS = {
+    "ggml_sycl_resolve_moe_expert_route_core": "ggml_sycl_dispatch_owner()",
+    "ggml_sycl_collect_decode_secondary_candidates": "ggml_sycl_dispatch_owner()",
+    "ggml_sycl_mul_mat_id": "mmid_owner_ptr",
+}
+# what runs on another thread: the TLS must never be read inside, nor a function that reads it called
+CROSS_THREAD_LAUNCHERS = (r"\bhost_task\s*\(", r"\bstd::async\s*\(", r"\bstd::thread\s*\(", r"\.submit\s*\(", r"\.enqueue\s*\(")
+TLS_REACHERS = ("ggml_sycl_dispatch_owner", "ggml_sycl_resolve_moe_expert_route", "ggml_sycl_resolve_moe_expert_route_core",
+                "ggml_sycl_collect_decode_secondary_candidates", "ggml_sycl_choose_decode_secondary_device")
+
+
+def gate31_owner(files, bad):
+    c = code(files, MAIN)
+    k = keep(files, MAIN)
+    # --- the scope class: one constructor input, execution_current_owner, abort on a different nested owner
+    sc = struct_body(c, "ggml_sycl_dispatch_owner_scope")
+    if sc is None:
+        bad("gate 31 (owner): class ggml_sycl_dispatch_owner_scope is absent")
+        return
+    st = text_of(c, sc)
+    sk = text_of(k, struct_body(k, "ggml_sycl_dispatch_owner_scope"))
+    ctor = re.search(r"explicit\s+ggml_sycl_dispatch_owner_scope\s*\(\s*const\s+ggml_backend_sycl_context\s*\*\s*ctx\s*\)\s*\{", st)
+    if not ctor:
+        bad("gate 31 (owner): the scope's constructor does not take exactly one `const ggml_backend_sycl_context * ctx`")
+    else:
+        cb = st[ctor.end() - 1:close_of(st, ctor.end() - 1) + 1]
+        if not re.search(r"\bbound\s*=\s*ggml_sycl_execution_current_owner\s*\(\s*ctx\s*,\s*owner\s*\)", cb):
+            bad("gate 31 (owner): the scope's owner does not come from ggml_sycl_execution_current_owner(ctx, owner)")
+        if re.search(r"global_registry|current_active_token|g_placement_publication|ggml_sycl_global_plan|getenv", cb):
+            bad("gate 31 (owner): the scope's constructor reads an owner from something other than the context")
+        if not re.search(r"g_dispatch_owner_depth\s*>\s*0\s*&&\s*\(\s*bound\s*!=\s*g_dispatch_owner_bound\s*\|\|\s*\(\s*bound\s*&&\s*!\(\s*owner\s*==\s*g_dispatch_owner\s*\)\s*\)\s*\)", cb):
+            bad("gate 31 (owner): a nested scope's owner is not compared with the bound one")
+    if 'GGML_ABORT("[DISPATCH-OWNER] nested scope binds a different owner")' not in sk:
+        bad("gate 31 (owner): a nested scope with a different owner does not abort with its literal")
+    # the thread-locals are written inside the class and nowhere else
+    outside = c[:sc[0]] + c[sc[1] + 1:]
+    for m in re.finditer(r"(?<![\w])g_dispatch_owner(?:_bound|_depth)?\s*(?:=(?!=)|\+\+|--)", outside):
+        line = outside[outside.rfind("\n", 0, m.start()) + 1:outside.find("\n", m.start())]
+        if "thread_local" not in line:
+            bad("gate 31 (owner): %r writes the dispatch owner outside its scope class" % line.strip()[:60])
+    # --- construction: exactly one root, graph compute, from the backend's context
+    sites = [m for m in re.finditer(r"\bggml_sycl_dispatch_owner_scope\s+\w+\s*\(", c)]
+    if len(sites) != 1:
+        bad("gate 31 (owner): %d dispatch owner scopes are constructed (wanted exactly 1, in graph compute)" % len(sites))
+    for m in sites:
+        if enclosing_top(c, m.start()) != "ggml_backend_sycl_graph_compute":
+            bad("gate 31 (owner): a dispatch owner scope is constructed outside graph compute")
+        arg = c[m.end() - 1:close_of(c, m.end() - 1) + 1]
+        if not re.fullmatch(r"\(\s*backend\s*\?\s*static_cast<const\s+ggml_backend_sycl_context\s*\*>\s*\(\s*backend->context\s*\)\s*:\s*nullptr\s*\)", arg):
+            bad("gate 31 (owner): the scope is not constructed from the backend's own context")
+    # --- readers: only the two ctx-less chains, never inside a lambda
+    for m in re.finditer(r"(?<![\w:])ggml_sycl_dispatch_owner\s*\(", c):
+        fn = enclosing_top(c, m.start())
+        if fn is None or fn == "ggml_sycl_dispatch_owner":  # a declarator or the reader's own definition
+            continue
+        if fn not in OWNER_READERS:
+            bad("gate 31 (owner): ggml_sycl_dispatch_owner() is read in %s, outside any bound scope's chains" % fn)
+    # no TLS read, and no function that reads it, inside anything that runs on another thread
+    for pat in CROSS_THREAD_LAUNCHERS:
+        for path in all_sycl_sources_in(files):
+            cc = code(files, path)
+            for m in re.finditer(pat, cc):
+                op = cc.find("(", m.start())
+                span = cc[op:close_of(cc, op) + 1] if op >= 0 else ""
+                for name in TLS_REACHERS:
+                    if re.search(r"(?<![\w])" + name + r"\s*\(", span):
+                        bad("gate 31 (owner): %s:%d reaches the thread-local dispatch owner through %s inside work that runs on "
+                            "another thread" % (path, line_of(cc, m.start()), name))
+    # --- into_empty: one critical section, the owner's own snapshot, this cache only, no device-global
+    ie = func_bodies(c, "ggml_sycl_republish_current_plan_into_empty")
+    if len(ie) != 1:
+        bad("gate 31 (owner): ggml_sycl_republish_current_plan_into_empty has %d definitions" % len(ie))
+    else:
+        t = text_of(c, ie[0])
+        tk = text_of(k, ie[0])
+        locks = re.findall(r"std::lock_guard<std::mutex>\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\)", t)
+        if len(locks) != 1 or re.search(r"\b(unique_lock|scoped_lock)\b", t):
+            bad("gate 31 (owner): into_empty is not exactly one g_tensor_inventory_mutex critical section")
+        order = [t.find(x) for x in ("g_tensor_inventory_mutex", "lifecycle_select_placement_plan(", "get_placement_plan_snapshot()",
+                                     "set_placement_plan_snapshot(")]
+        order.append(t.find("installed->version", max(order[-1], 0)))
+        if min(order) < 0 or order != sorted(order):
+            bad("gate 31 (owner): into_empty does not lock, select the owner's snapshot, re-check emptiness, install, "
+                "then compare identity, in that order")
+        if not all(x in t for x in ("installed->version != selected->version", "installed->model_id != selected->model_id",
+                                    "installed->load_txn_id != selected->load_txn_id")):
+            bad("gate 31 (owner): into_empty does not compare version, model_id and load_txn_id of the installed snapshot")
+        for tok in ("g_placement_publication", "g_model_n_layer", "g_placement_kv_info", "ggml_sycl_publish_plan_locked",
+                    "ggml_sycl_publish_prepared_plan_locked", "publish_cache_first_global_last", "ggml_sycl_global_plan_snapshot",
+                    "ggml_sycl_republish_current_plan(", "ggml_sycl_has_global_plan", "ggml_sycl_cache_plan_owner"):
+            if tok in t:
+                bad("gate 31 (owner): into_empty reaches %s (it writes no device-global and reads no global authority)" % tok)
+        if "[CONTEXT-PLAN-BUG] into_empty: no snapshot" not in tk or "return ggml_sycl_into_empty_result::REFUSED" not in t:
+            bad("gate 31 (owner): the null selection of a bound owner is not a [CONTEXT-PLAN-BUG] refusal")
+        m = re.search(r"if\s*\(\s*!selected\s*\)\s*\{(.*?)\n    \}", t, re.S)
+        if not m or "REFUSED" not in m.group(1):
+            bad("gate 31 (owner): the null selection branch does not refuse")
+    # --- the one remaining plain republish is the preload's
+    pubs = [m.start() for m in re.finditer(r"(?<![\w:])ggml_sycl_republish_current_plan\s*\(\s*\)\s*;", c)]
+    if len(pubs) != 1 or "preload without a LOAD token" not in text_of(k, func_bodies(k, enclosing_top(c, pubs[0]))[0]):
+        bad("gate 31 (owner): ggml_sycl_republish_current_plan() has %d callers (wanted exactly the preload's)" % len(pubs))
+    # --- ensure: tri-state, owner parameter, into_empty, no global-plan guard, no plain republish
+    eb = func_bodies(c, ENSURE)
+    if len(eb) != 1:
+        bad("gate 31 (owner): %s has %d definitions" % (ENSURE, len(eb)))
+    else:
+        t = text_of(c, eb[0])
+        hdr = c[max(0, eb[0][0] - 400):eb[0][0]]
+        if "ggml_sycl_secondary_queue_status" not in hdr or "const ggml_sycl::lifecycle::ModelToken * owner" not in hdr:
+            bad("gate 31 (owner): ensure does not return the tri-state or does not take the owner")
+        if len(re.findall(r"ggml_sycl_republish_current_plan_into_empty\s*\(", t)) != 2 or \
+                len(re.findall(r"ggml_sycl_into_empty_result::REFUSED\)\s*\{\s*return GGML_SYCL_SECONDARY_QUEUE_REFUSED", t)) != 2:
+            bad("gate 31 (owner): ensure's two installs do not each propagate a refusal")
+        if re.search(r"ggml_sycl_has_global_plan|ggml_sycl_republish_current_plan\s*\(\s*\)|return\s+(?:true|false)\s*;", t):
+            bad("gate 31 (owner): ensure still reads the global plan, republishes it, or returns a bool")
+    # --- every caller of ensure: the three listed functions, the right owner, consumed (never dropped, never a bool)
+    total = 0
+    for m in re.finditer(r"(?<![\w])" + ENSURE + r"\s*\(", c):
+        fn = enclosing_top(c, m.start())
+        if fn is None or fn == ENSURE:  # a declarator or the definition itself
+            continue
+        total += 1
+        if fn not in ENSURE_CALLERS:
+            bad("gate 31 (owner): %s is called from %s, which has no owner source" % (ENSURE, fn))
+            continue
+        op = c.find("(", m.start())
+        args = c[op + 1:close_of(c, op)]
+        want = ENSURE_CALLERS[fn]
+        if not re.search(r",\s*" + re.escape(want) + r"\s*$", args.strip()):
+            bad("gate 31 (owner): a call of %s in %s does not pass %s" % (ENSURE, fn, want))
+        before = c[max(0, m.start() - 160):m.start()]
+        if re.search(r"\(void\)\s*(?:ggml_sycl::)?$", before):
+            bad("gate 31 (owner): a call of %s in %s discards its status" % (ENSURE, fn))
+        elif not re.search(r"(?:switch\s*\(\s*|ggml_sycl_secondary_queue_ready_or_throw\s*\(\s*(?:ggml_sycl::)?|queue_status\s*=\s*)$",
+                           re.sub(r"(?:ggml_sycl::)?$", "", before) + "") and \
+                not re.search(r"(?:switch\s*\(\s*|ready_or_throw\s*\(\s*|queue_status\s*=\s*)(?:ggml_sycl::)?\s*$", before):
+            bad("gate 31 (owner): a call of %s in %s is not consumed by a switch, ready_or_throw or an explicit status" % (ENSURE, fn))
+    if total != 6:
+        bad("gate 31 (owner): %s has %d callers (the census is six)" % (ENSURE, total))
+    # mul_mat_id reads the owner from its own context, once
+    mm = func_bodies(c, "ggml_sycl_mul_mat_id")
+    if len(mm) != 1 or not re.search(r"\bmmid_owner_bound\s*=\s*ggml_sycl_execution_current_owner\s*\(\s*&ctx\s*,\s*mmid_owner\s*\)",
+                                      text_of(c, mm[0])):
+        bad("gate 31 (owner): ggml_sycl_mul_mat_id does not read its owner from ggml_sycl_execution_current_owner(&ctx, ...)")
+    # --- the refusal channel
+    rf = func_bodies(c, "ggml_sycl_secondary_queue_refused_fail")
+    if len(rf) != 1 or "throw ggml_sycl_fallback_error(" not in text_of(c, rf[0]) or \
+            "[[noreturn]]" not in c[max(0, rf[0][0] - 120):rf[0][0]]:
+        bad("gate 31 (owner): the refusal helper is not a [[noreturn]] throw of ggml_sycl_fallback_error")
+    ro = func_bodies(c, "ggml_sycl_secondary_queue_ready_or_throw")
+    if len(ro) != 1 or not re.search(r"case GGML_SYCL_SECONDARY_QUEUE_REFUSED:\s*ggml_sycl_secondary_queue_refused_fail\(\)\s*;",
+                                      text_of(c, ro[0])):
+        bad("gate 31 (owner): ready_or_throw does not fail on REFUSED")
+    wr = func_bodies(c, "ggml_sycl_resolve_moe_expert_route")
+    if len(wr) != 1 or not re.search(r"route\.kind\s*==\s*moe_expert_route_kind::REFUSED\s*\)\s*\{\s*ggml_sycl_secondary_queue_refused_fail\(\)",
+                                      text_of(c, wr[0])):
+        bad("gate 31 (owner): the resolver wrapper does not turn a REFUSED route into the failure")
+    core = func_bodies(c, "ggml_sycl_resolve_moe_expert_route_core")
+    if len(core) == 1:
+        t = text_of(c, core[0])
+        if not re.search(r"case GGML_SYCL_SECONDARY_QUEUE_REFUSED:\s*route\.kind\s*=\s*moe_expert_route_kind::REFUSED\s*;[^}]*return route;", t):
+            bad("gate 31 (owner): the resolver core does not return a REFUSED route on a refusal")
+        for m in re.finditer(r"(?<![\w])ggml_sycl_resolve_moe_expert_route_core\s*\(", c):
+            if enclosing_top(c, m.start()) not in (None, "ggml_sycl_resolve_moe_expert_route",
+                                                   "ggml_sycl_resolve_moe_expert_route_core"):
+                bad("gate 31 (owner): the resolver core is called from %s (only the wrapper may, so no consumer sees REFUSED)" %
+                    enclosing_top(c, m.start()))
+    # a rejected choice BEFORE the chooser, never queue_available = false
+    ap = re.search(r"auto append_retained_operand = \[&\]", c)
+    if not ap:
+        bad("gate 31 (owner): append_retained_operand is absent")
+    else:
+        lam = c[ap.start():close_of(c, c.find("{", ap.end())) + 1]
+        i_ref = lam.find("moe_batch_reject_reason::PLAN_OWNER_REFUSED")
+        i_cho = lam.find("choose_moe_batch_executor(")
+        if i_ref < 0 or i_cho < 0 or i_ref > i_cho or not re.search(r"queue_status\s*==\s*GGML_SYCL_SECONDARY_QUEUE_REFUSED", lam):
+            bad("gate 31 (owner): a refused owner is not a rejected choice made before the executor chooser")
+        if re.search(r"queue_available\s*=\s*false", lam):
+            bad("gate 31 (owner): append_retained_operand assigns queue_available = false")
+    # the mul_mat_id install site fails on a refusal
+    if not re.search(r"ggml_sycl_republish_current_plan_into_empty\(route_cache,\s*\*mmid_owner_ptr\)\s*==\s*"
+                     r"ggml_sycl_into_empty_result::REFUSED\)\s*\{\s*ggml_sycl::ggml_sycl_secondary_queue_refused_fail\(\)", c):
+        bad("gate 31 (owner): the mul_mat_id install does not fail on a refusal")
+    # every catch of the fallback error rethrows, except graph compute's top-level handler
+    for m in re.finditer(r"catch\s*\(\s*const\s+ggml_sycl_fallback_error\s*&[^)]*\)\s*\{", c):
+        body = c[m.end() - 1:close_of(c, m.end() - 1) + 1]
+        if enclosing_top(c, m.start()) != "ggml_backend_sycl_graph_compute" and not re.search(r"\bthrow\s*;", body):
+            bad("gate 31 (owner): a catch of ggml_sycl_fallback_error in %s does not rethrow" % enclosing_top(c, m.start()))
+    # the host test installs nothing: it reads the PRIVATE_TESTING install counter around its resolves
+    ht = func_bodies(c, "test_moe_storage_handle_first_route_and_negatives")
+    if len(ht) != 1 or text_of(c, ht[0]).count("ggml_sycl_into_empty_install_count()") != 2:
+        bad("gate 31 (owner): the context-free host test does not bound the install counter")
+
+
+# --------------------------------------------------------------------------------------
 # gate 36: the override, the latch, the measure backend
 # --------------------------------------------------------------------------------------
 ACCESSORS = ("ggml_sycl_global_plan_snapshot", "ggml_sycl_identity_plan_snapshot", "global_placement_plan_owner",
@@ -718,7 +918,7 @@ def gate37(files, bad):
             bad("gate 37: %s's warning does not name its site" % fn)
 
 
-GATES = (gate3, gate23, gate29, gate30, gate31, gate36, gate37)
+GATES = (gate3, gate23, gate29, gate30, gate31, gate31_owner, gate36, gate37)
 
 
 def violations(files):
@@ -859,6 +1059,108 @@ def mutants(files):
     yield ("load_end not constructing its overlap witness",
            edit(files, M, "    ggml_sycl_load_end_body_witness load_end_body_witness;\n", "", "g31l"),
            "does not construct its overlap witness")
+    # ---- gate 31, owner threading
+    yield ("a thread-local owner read outside any scope's chains",
+           edit(files, M, "static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {\n    return g_dispatch_owner_bound ? &g_dispatch_owner : nullptr;\n}",
+                "static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {\n    return g_dispatch_owner_bound ? &g_dispatch_owner : nullptr;\n}\n"
+                "static bool ggml_sycl_stray_owner_read() { return ggml_sycl_dispatch_owner() != nullptr; }", "o1"),
+           "is read in ggml_sycl_stray_owner_read")
+    yield ("a scope built from the registry instead of the context",
+           edit(files, M, "        const bool                       bound = ggml_sycl_execution_current_owner(ctx, owner);",
+                "        owner = ggml_sycl::lifecycle::global_registry().current_active_token();\n"
+                "        const bool                       bound = true;", "o2"),
+           "does not come from ggml_sycl_execution_current_owner")
+    yield ("a second scope construction",
+           edit(files, M, "void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,",
+                "static void ggml_sycl_stray_scope(const ggml_backend_sycl_context * c) { ggml_sycl_dispatch_owner_scope s(c); }\n"
+                "void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,", "o3"),
+           "dispatch owner scopes are constructed")
+    yield ("a scope constructed from a different argument",
+           edit(files, M, "ggml_sycl_dispatch_owner_scope dispatch_owner(\n        backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr);",
+                "ggml_sycl_dispatch_owner_scope dispatch_owner(nullptr);", "o4"),
+           "not constructed from the backend's own context")
+    yield ("a nested scope that does not abort on a different owner",
+           edit(files, M, "GGML_ABORT(\"[DISPATCH-OWNER] nested scope binds a different owner\");", "(void) 0;", "o5"),
+           "does not abort with its literal")
+    yield ("a nested scope that rebinds without comparing",
+           edit(files, M, "(bound != g_dispatch_owner_bound || (bound && !(owner == g_dispatch_owner)))", "false", "o6"),
+           "is not compared with the bound one")
+    yield ("a thread-local owner read inside a host_task",
+           edit(files, CPUD, "cgh.host_task([=]() { run_mul_mat(); });", "cgh.host_task([=]() { (void) ggml_sycl_dispatch_owner(); run_mul_mat(); });", "o7"),
+           "inside work that runs on another thread")
+    yield ("a pool lambda reaching the resolver",
+           edit(files, CPUD, "cgh.host_task([=]() { run_fused(); }); });\n", "cgh.host_task([=]() { (void) ggml_sycl_resolve_moe_expert_route(nullptr, 0, 0, GGML_LAYOUT_AOS); run_fused(); }); });\n", "o8"),
+           "inside work that runs on another thread")
+    yield ("the owner written outside its scope class",
+           edit(files, M, "static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {\n    return g_dispatch_owner_bound ? &g_dispatch_owner : nullptr;\n}",
+                "static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {\n    g_dispatch_owner_bound = true;\n    return g_dispatch_owner_bound ? &g_dispatch_owner : nullptr;\n}", "o9"),
+           "writes the dispatch owner outside its scope class")
+    yield ("into_empty reading the process-global publication",
+           edit(files, M, "    const auto current = cache->get_placement_plan_snapshot();\n    if (current && current->plan && !current->plan->entries.empty()) {\n        return ggml_sycl_into_empty_result::NOOP;",
+                "    const auto current = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);\n    if (current && current->plan && !current->plan->entries.empty()) {\n        return ggml_sycl_into_empty_result::NOOP;", "o10"),
+           "into_empty reaches g_placement_publication")
+    yield ("into_empty writing a device-global",
+           edit(files, M, "    cache->set_placement_plan_snapshot(participates ? selected : nullptr);",
+                "    g_model_n_layer = selected->model_n_layer;\n    cache->set_placement_plan_snapshot(participates ? selected : nullptr);", "o11"),
+           "into_empty reaches g_model_n_layer")
+    yield ("into_empty without the identity compare",
+           edit(files, M, " || installed->model_id != selected->model_id", "", "o12"),
+           "does not compare version, model_id and load_txn_id")
+    yield ("into_empty turning the null selection into a silent return",
+           edit(files, M, "        return ggml_sycl_into_empty_result::REFUSED;\n    }\n    const auto current = cache->get_placement_plan_snapshot();",
+                "        return ggml_sycl_into_empty_result::NOOP;\n    }\n    const auto current = cache->get_placement_plan_snapshot();", "o13"),
+           "null selection branch does not refuse")
+    yield ("into_empty taking a second lock",
+           edit(files, M, "    const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value,",
+                "    std::lock_guard<std::mutex> second(g_tensor_inventory_mutex);\n    const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value,", "o14"),
+           "not exactly one g_tensor_inventory_mutex critical section")
+    yield ("a plain republish restored in ensure",
+           edit(files, M, "        if (owner) {\n            if (auto * cache = ggml_sycl::get_unified_cache_for_device(target_device);",
+                "        if (ggml_sycl_has_global_plan()) {\n            ggml_sycl_republish_current_plan();\n        }\n        if (owner) {\n            if (auto * cache = ggml_sycl::get_unified_cache_for_device(target_device);", "o15"),
+           "ensure still reads the global plan")
+    yield ("a second plain republish caller",
+           edit(files, M, "static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {",
+                "static void ggml_sycl_stray_republish() { ggml_sycl_republish_current_plan(); }\nstatic const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {", "o16"),
+           "callers (wanted exactly the preload's)")
+    yield ("a default owner passed at a site",
+           edit(files, M, "ggml_sycl_ensure_moe_secondary_queues_for_plan(operand.owning_device(), mmid_owner_ptr);",
+                "ggml_sycl_ensure_moe_secondary_queues_for_plan(operand.owning_device(), nullptr);", "o17"),
+           "does not pass mmid_owner_ptr")
+    yield ("the status discarded at the resolver",
+           edit(files, M, "                switch (ggml_sycl_ensure_moe_secondary_queues_for_plan(route.planned_device,\n                                                                       ggml_sycl_dispatch_owner())) {",
+                "                (void) ggml_sycl_ensure_moe_secondary_queues_for_plan(route.planned_device, ggml_sycl_dispatch_owner());\n"
+                "                switch (GGML_SYCL_SECONDARY_QUEUE_READY) {", "o18"),
+           "discards its status")
+    yield ("REFUSED answered with continue in the collector",
+           edit(files, M, "        if (!ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(\n                ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(d, ggml_sycl_dispatch_owner()))) {\n            continue;",
+                "        if (ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(d, ggml_sycl_dispatch_owner()) != GGML_SYCL_SECONDARY_QUEUE_READY) {\n            continue;", "o19"),
+           "is not consumed by a switch")
+    yield ("REFUSED at the retained operand mapped to queue_available = false",
+           edit(files, M, "                        ggml_sycl::moe_batch_executor_choice refused;\n                        refused.reject = ggml_sycl::moe_batch_reject_reason::PLAN_OWNER_REFUSED;",
+                "                        queue_available = false;\n                        ggml_sycl::moe_batch_executor_choice refused;\n                        refused.reject = ggml_sycl::moe_batch_reject_reason::PLAN_OWNER_REFUSED;", "o20"),
+           "assigns queue_available = false")
+    yield ("the refusal helper not throwing",
+           edit(files, M, "    throw ggml_sycl_fallback_error(\"MUL_MAT_ID secondary queue refused: plan owner\");", "    GGML_ABORT(\"unreachable\");", "o21"),
+           "refusal helper is not a [[noreturn]] throw")
+    yield ("the resolver wrapper not failing on REFUSED",
+           edit(files, M, "    if (route.kind == moe_expert_route_kind::REFUSED) {\n        ggml_sycl_secondary_queue_refused_fail();\n    }", "", "o22"),
+           "resolver wrapper does not turn a REFUSED route")
+    yield ("ready_or_throw answering REFUSED with false",
+           edit(files, M, "        case GGML_SYCL_SECONDARY_QUEUE_REFUSED:\n            ggml_sycl_secondary_queue_refused_fail();\n    }\n    return false;",
+                "        case GGML_SYCL_SECONDARY_QUEUE_REFUSED:\n            return false;\n    }\n    return false;", "o23"),
+           "ready_or_throw does not fail on REFUSED")
+    yield ("a consumer calling the resolver core",
+           edit(files, M, "static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {",
+                "static moe_expert_route ggml_sycl_stray_core_user(const ggml_tensor * t) { return ggml_sycl::ggml_sycl_resolve_moe_expert_route_core(t, 0, 0, GGML_LAYOUT_AOS, false); }\n"
+                "static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {", "o26"),
+           "resolver core is called from ggml_sycl_stray_core_user")
+    yield ("a catch of the fallback error that swallows it",
+           edit(files, M, "static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {",
+                "static void ggml_sycl_stray_swallow() { try { } catch (const ggml_sycl_fallback_error &) { } }\nstatic const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {", "o24"),
+           "does not rethrow")
+    yield ("the host test not bounding the install counter",
+           edit(files, M, "    const uint64_t installs_before = ggml_sycl_into_empty_install_count();\n", "    const uint64_t installs_before = 0;\n", "o25"),
+           "host test does not bound the install counter")
     yield ("the witness macro under NDEBUG",
            edit(files, UC_H, "#define GGML_SYCL_WITNESS(cond, message)                      \\\n    do {                                                      \\\n        if (::ggml_sycl::g_sycl_witness_enabled && !(cond)) { \\",
                 "#define GGML_SYCL_WITNESS(cond, message)                      \\\n    do {                                                      \\\n        if (!NDEBUG && ::ggml_sycl::g_sycl_witness_enabled && !(cond)) { \\", "g31h"),
