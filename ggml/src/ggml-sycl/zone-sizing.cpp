@@ -384,7 +384,11 @@ bool zone_runtime_alloc_held_back(bool   runtime_zone,
                                   size_t zone_available,
                                   size_t hold,
                                   size_t alloc_size) {
-    return runtime_zone && !forbid_spill && !zone_runtime_alloc_respects_hold(zone_available, hold, alloc_size);
+    // Held back means the zone ALONE would have served the request and the hold is what keeps it out. A request
+    // larger than the free bytes spills with or without a hold (an ordinary zone-full spill, which the allocator
+    // handles exactly as it did before the hold existed), and with no hold there is nothing to keep it out.
+    return runtime_zone && !forbid_spill && hold > 0 && alloc_size <= zone_available &&
+           !zone_runtime_alloc_respects_hold(zone_available, hold, alloc_size);
 }
 
 bool zone_route_draws_scratch(bool decision_valid,
