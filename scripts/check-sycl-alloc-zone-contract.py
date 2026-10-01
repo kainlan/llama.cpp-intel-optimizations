@@ -47,6 +47,10 @@ Mutation matrix (--mutation-matrix)
   twin: a request of the same shape in a fresh function, whose unmutated form must PASS and whose
   mutated form must FAIL naming the planted node.
 
+Dependency
+  Needs the tree-sitter C++ grammar: `pip install tree-sitter-language-pack` in the python3 that
+  CMake finds. A missing module is a FAIL (exit 1) and the message names it; there is no skip.
+
 Usage:
   check-sycl-alloc-zone-contract.py [--root REPO] [--mutation-matrix] [--list] [--write-debt]
 """
@@ -85,8 +89,11 @@ RAW_CALLS = (
 )
 RAW_STRINGS = ("zeMemAllocDevice", "zeMemAllocShared", "zePhysicalMemCreate", "zeVirtualMemReserve")
 
-DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a, b, d, e). Shrink-only: a violation not "
-            "listed fails, and a listed entry that no longer violates fails. See README.md for regeneration.")
+DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a, b, d, e). Shrink-only: a violation not listed "
+            "fails, and a listed entry that no longer violates fails. Every E-RAW entry carries a fate (deleted-by-*, "
+            "converted-by-*, or sanctioned-internal) and a cite, so an entry no step will ever shrink is visible as a "
+            "mislabelled allowlist entry. See README.md for regeneration.")
+FATE_RE = re.compile(r"^(deleted-by|converted-by)-[A-Za-z0-9._§()-]+$|^sanctioned-internal$")
 
 CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-TIER", "D-ZONE", "D-ZONE-COUNT",
          "D-FORBID", "D-FORBID-FALSE", "E-RAW", "DEFER-C")
@@ -704,6 +711,9 @@ def apply_contract(viols, allowlist, debt):
         for v in hit:
             remaining.remove(v)
     debt_ids = {(d["code"], d["key"]) for d in debt.get("violations", [])}
+    for d in debt.get("violations", []):
+        if d["code"] == "E-RAW" and not FATE_RE.match(str(d.get("fate", ""))):
+            fails.append("FAIL debt entry E-RAW %s has no valid fate (deleted-by-*, converted-by-*, sanctioned-internal)" % d["key"])
     cur = {v.ident(): v for v in remaining}
     for ident, v in sorted(cur.items()):
         if ident not in debt_ids:
@@ -818,6 +828,16 @@ def matrix_cases():
     A(Case("key", "editing a listed construction itself moves its key (stale entry plus new violation)",
            replace_token("common.cpp", "ggml_sycl_tp_ensure_ffn_buffers", "ggml_sycl_tp_ensure_ffn_buffers_zz"),
            "FAIL", "debt", "ggml_sycl_tp_ensure_ffn_buffers"))
+    # (a) a pointer holder cannot launder the request it points at
+    A(Case("1s", "a scope over a violating request still FAILs at the request's construction", plant(
+        "void zzplant_w1s() {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n    ext_alloc_request_scope scope(&req);\n}\n" % REQ),
+        "FAIL", "D-ZONE", "zzplant_w1s::declaration:req:"))
+    A(Case("1s", "a scope over a clean request adds no finding of its own (control)", plant(
+        good_device("zzplant_w1s", "    ext_alloc_request_scope scope(&req);\n")), "PASS"))
+    A(Case("fate", "an E-RAW debt entry without a fate fails", lambda f: f, "FAIL", "fate", "unified_alloc",
+           edit_debt=lambda d: dict(d, violations=[{k: v for k, v in e.items() if k != "fate"} if (e["code"] == "E-RAW" and "::unified_alloc::" in e["key"]) else e
+                                                   for e in d["violations"]])))
     # debt: the list is shrink-only in both directions
     A(Case("debt", "a debt entry that no longer violates is stale", lambda f: f, "FAIL", "debt", "zzgone",
            edit_debt=lambda d: dict(d, violations=list(d["violations"]) + [{"code": "D-ZONE", "key": "x.cpp::f::zzgone#0"}])))
@@ -882,7 +902,7 @@ def matrix_cases():
     return c
 
 
-REQUIRED_WITNESSES = ("1", "2", "3", "4", "5", "6", "7", "8", "debt", "key", "12", "13", "14", "18", "19", "20", "23")
+REQUIRED_WITNESSES = ("1", "1s", "fate", "2", "3", "4", "5", "6", "7", "8", "debt", "key", "12", "13", "14", "18", "19", "20", "23")
 
 
 def planted_sightings(files):
@@ -899,7 +919,7 @@ def planted_sightings(files):
 
 def evaluate_case(base_files, allowlist, debt, case):
     files = case.mutate(base_files)
-    if case.expect == "PASS" and case.wid in ("1", "6", "12", "14", "18", "19", "20", "23") and planted_sightings(files) == 0:
+    if case.expect == "PASS" and case.wid in ("1", "1s", "6", "12", "14", "18", "19", "20", "23") and planted_sightings(files) == 0:
         return False, ["control saw no planted construction, so its PASS proves nothing"]
     al = allowlist
     if case.allowlist is not None:
@@ -919,6 +939,8 @@ def evaluate_case(base_files, allowlist, debt, case):
             return "allowlist entry" in f and case.naming in f
         if case.code == "debt":
             return f.startswith("FAIL stale debt entry") and case.naming in f
+        if case.code == "fate":
+            return f.startswith("FAIL debt entry E-RAW") and "no valid fate" in f and case.naming in f
         return f.startswith("FAIL new " + (case.code or "")) and case.naming in f
 
     hit = [f for f in fails if names(f)]
@@ -995,6 +1017,7 @@ def main():
                 rest = [v for v in rest if not (v.code == ent["code"] and v.file == ent["file"] and v.func == ent["function"]
                                                 and ("name" not in ent or v.name == ent["name"]))]
             ids = sorted({v.ident() for v in rest})
+            old_meta = {(d["code"], d["key"]): {k: d[k] for k in ("fate", "cite") if k in d} for d in debt.get("violations", [])}
             old_ids = {(d["code"], d["key"]) for d in debt.get("violations", [])}
             grown = sorted(set(ids) - old_ids)
             if grown and old_ids and not a.allow_growth:
@@ -1006,7 +1029,7 @@ def main():
             data.mkdir(parents=True, exist_ok=True)
             with open(data / "debt.json", "w") as f:
                 f.write('{\n  "schema": 1,\n  "_doc": %s,\n  "violations": [\n' % json.dumps(DEBT_DOC))
-                f.write(",\n".join('    {"code": %s, "key": %s}' % (json.dumps(c), json.dumps(k)) for c, k in ids))
+                f.write(",\n".join("    " + json.dumps(dict({"code": c, "key": k}, **old_meta.get((c, k), {}))) for c, k in ids))
                 f.write("\n  ]\n}\n")
             print("wrote %d debt entries to %s" % (len(ids), data / "debt.json"))
         return 0

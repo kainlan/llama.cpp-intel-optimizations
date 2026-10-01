@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clauses a, b, d, e). Shrink-only: a violation not listed fails, and a listed entry that no longer violates fails. See README.md for regeneration.",
+  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clauses a, b, d, e). Shrink-only: a violation not listed fails, and a listed entry that no longer violates fails. Every E-RAW entry carries a fate (deleted-by-*, converted-by-*, or sanctioned-internal) and a cite, so an entry no step will ever shrink is visible as a mislabelled allowlist entry. See README.md for regeneration.",
   "violations": [
     {"code": "B-BRACE", "key": "cpu-expert-pool.cpp::CpuExpertPool::init::declaration:c:96a2b647#0"},
     {"code": "B-BRACE", "key": "ggml-sycl.cpp::ggml_sycl_attn_host_staging_get::declaration:c:a80c4293#0"},
@@ -213,20 +213,20 @@
     {"code": "DEFER-C", "key": "unified-cache.cpp::acquire_offload_buffer::declaration:areq:bdd08933#0"},
     {"code": "DEFER-C", "key": "unified-cache.cpp::acquire_offload_buffer::declaration:req:deb94283#0"},
     {"code": "DEFER-C", "key": "unified-cache.cpp::unified_alloc::declaration:req:73d95236#0"},
-    {"code": "E-RAW", "key": "ggml-sycl.cpp::ggml_backend_sycl_probe_buffer_free_buffer::call_expression:ggml_sycl_free_device_raw:0cce64d6#0"},
-    {"code": "E-RAW", "key": "ggml-sycl.cpp::ggml_backend_sycl_probe_buffer_type_alloc_buffer::call_expression:ggml_sycl_malloc_device_raw:f1df927e#0"},
-    {"code": "E-RAW", "key": "ggml-sycl.cpp::ggml_sycl_free_device_raw::call_expression:unified_cache_raw_free_device:059c729b#0"},
-    {"code": "E-RAW", "key": "ggml-sycl.cpp::ggml_sycl_malloc_device_raw::call_expression:unified_cache_raw_malloc_device:95fca394#0"},
-    {"code": "E-RAW", "key": "unified-cache.cpp::sycl_aligned_malloc_device::call_expression:aligned_alloc_device:a6008ed8#0"},
-    {"code": "E-RAW", "key": "unified-cache.cpp::unified_alloc::call_expression:unified_cache_malloc_device_tracked:00814a8a#0"},
-    {"code": "E-RAW", "key": "unified-cache.cpp::unified_cache::allocate::call_expression:unified_cache_malloc_device_tracked:00814a8a#0"},
-    {"code": "E-RAW", "key": "unified-cache.cpp::unified_cache::ensure_cached::call_expression:unified_cache_malloc_device_tracked:00814a8a#0"},
-    {"code": "E-RAW", "key": "unified-cache.cpp::unified_cache::ensure_cached::call_expression:unified_cache_malloc_device_tracked:00814a8a#1"},
-    {"code": "E-RAW", "key": "unified-cache.cpp::unified_cache_malloc_device_tracked::call_expression:unified_cache_raw_malloc_device:1d1f3ba0#0"},
-    {"code": "E-RAW", "key": "unified-cache.cpp::unified_cache_raw_malloc_device::call_expression:sycl_aligned_malloc_device:08bb0984#0"},
-    {"code": "E-RAW", "key": "vmem-kv.cpp::vmem_kv_pool::init::string_literal:zeVirtualMemReserve:89d46a17#0"},
-    {"code": "E-RAW", "key": "vmem-kv.cpp::vmem_kv_pool::map_layer::string_literal:zePhysicalMemCreate:2511e77f#0"},
-    {"code": "E-RAW", "key": "vmem-kv.cpp::vmem_kv_pool::resolve_l0_functions::string_literal:zePhysicalMemCreate:e3874b8c#0"},
-    {"code": "E-RAW", "key": "vmem-kv.cpp::vmem_kv_pool::resolve_l0_functions::string_literal:zeVirtualMemReserve:f630c79d#0"}
+    {"code": "E-RAW", "key": "ggml-sycl.cpp::ggml_backend_sycl_probe_buffer_free_buffer::call_expression:ggml_sycl_free_device_raw:0cce64d6#0", "fate": "deleted-by-step-7", "cite": "design 2 census row ggml-sycl.cpp:24338->:43022; 11 step 7 widened: the dead probe cluster and its raw wrappers"},
+    {"code": "E-RAW", "key": "ggml-sycl.cpp::ggml_backend_sycl_probe_buffer_type_alloc_buffer::call_expression:ggml_sycl_malloc_device_raw:f1df927e#0", "fate": "deleted-by-step-7", "cite": "design 2 census row ggml-sycl.cpp:24338->:43022; 11 step 7 widened: the dead probe cluster and its raw wrappers"},
+    {"code": "E-RAW", "key": "ggml-sycl.cpp::ggml_sycl_free_device_raw::call_expression:unified_cache_raw_free_device:059c729b#0", "fate": "deleted-by-step-7", "cite": "design 2 census row ggml-sycl.cpp:24338->:43022; 11 step 7 widened: the dead probe cluster and its raw wrappers"},
+    {"code": "E-RAW", "key": "ggml-sycl.cpp::ggml_sycl_malloc_device_raw::call_expression:unified_cache_raw_malloc_device:95fca394#0", "fate": "deleted-by-step-7", "cite": "design 2 census row ggml-sycl.cpp:24338->:43022; 11 step 7 widened: the dead probe cluster and its raw wrappers"},
+    {"code": "E-RAW", "key": "unified-cache.cpp::sycl_aligned_malloc_device::call_expression:aligned_alloc_device:a6008ed8#0", "fate": "sanctioned-internal", "cite": "design 2 census row :18789/:18830/:1433: the chain own links, the raw layer, allowlisted by name"},
+    {"code": "E-RAW", "key": "unified-cache.cpp::unified_alloc::call_expression:unified_cache_malloc_device_tracked:00814a8a#0", "fate": "converted-by-gxur", "cite": "design 2 census row unified-cache.cpp:14964: removed by the 6 dispositions; gxur flips it to fail-closed"},
+    {"code": "E-RAW", "key": "unified-cache.cpp::unified_cache::allocate::call_expression:unified_cache_malloc_device_tracked:00814a8a#0", "fate": "deleted-by-D-disposition", "cite": "design 2 census row :20240: no production caller; D with allocate_expert and unified_cache_allocate"},
+    {"code": "E-RAW", "key": "unified-cache.cpp::unified_cache::ensure_cached::call_expression:unified_cache_malloc_device_tracked:00814a8a#0", "fate": "converted-by-6.5", "cite": "design 2 census rows :5510/:5711: refused under an arena (6.5)"},
+    {"code": "E-RAW", "key": "unified-cache.cpp::unified_cache::ensure_cached::call_expression:unified_cache_malloc_device_tracked:00814a8a#1", "fate": "converted-by-6.5", "cite": "design 2 census rows :5510/:5711: refused under an arena (6.5)"},
+    {"code": "E-RAW", "key": "unified-cache.cpp::unified_cache_malloc_device_tracked::call_expression:unified_cache_raw_malloc_device:1d1f3ba0#0", "fate": "sanctioned-internal", "cite": "design 2 census row :18789/:18830/:1433: the chain own links, the raw layer, allowlisted by name"},
+    {"code": "E-RAW", "key": "unified-cache.cpp::unified_cache_raw_malloc_device::call_expression:sycl_aligned_malloc_device:08bb0984#0", "fate": "sanctioned-internal", "cite": "design 2 census row :18789/:18830/:1433: the chain own links, the raw layer, allowlisted by name"},
+    {"code": "E-RAW", "key": "vmem-kv.cpp::vmem_kv_pool::init::string_literal:zeVirtualMemReserve:89d46a17#0", "fate": "sanctioned-internal", "cite": "design 2 census row vmem-kv.cpp:58/62/120/185 and 6.6: refused under an active arena with one WARN; the dlsym path stays for the no-arena case"},
+    {"code": "E-RAW", "key": "vmem-kv.cpp::vmem_kv_pool::map_layer::string_literal:zePhysicalMemCreate:2511e77f#0", "fate": "sanctioned-internal", "cite": "design 2 census row vmem-kv.cpp:58/62/120/185 and 6.6: refused under an active arena with one WARN; the dlsym path stays for the no-arena case"},
+    {"code": "E-RAW", "key": "vmem-kv.cpp::vmem_kv_pool::resolve_l0_functions::string_literal:zePhysicalMemCreate:e3874b8c#0", "fate": "sanctioned-internal", "cite": "design 2 census row vmem-kv.cpp:58/62/120/185 and 6.6: refused under an active arena with one WARN; the dlsym path stays for the no-arena case"},
+    {"code": "E-RAW", "key": "vmem-kv.cpp::vmem_kv_pool::resolve_l0_functions::string_literal:zeVirtualMemReserve:f630c79d#0", "fate": "sanctioned-internal", "cite": "design 2 census row vmem-kv.cpp:58/62/120/185 and 6.6: refused under an active arena with one WARN; the dlsym path stays for the no-arena case"}
   ]
 }

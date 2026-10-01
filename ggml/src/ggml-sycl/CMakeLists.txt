@@ -136,8 +136,9 @@ if (BUILD_TESTING)
     # ggml-sycl source; each request construction names its tier by literal, a device request names
     # its zone and forbids the spill, and raw allocator names stay inside the allowlisted functions.
     # --mutation-matrix runs the gate and then its witnesses on in-memory mutants of the tree, so a
-    # check that can no longer fail is itself a failure. Needs tree_sitter_language_pack: a missing
-    # pack FAILS (exit 1), it never skips. Allocates nothing; safe at any parallelism.
+    # check that can no longer fail is itself a failure. Needs tree_sitter_language_pack
+    # (`pip install tree-sitter-language-pack` in the Python3 found above): a missing pack FAILS
+    # (exit 1), it never skips. Allocates nothing; safe at any parallelism.
     add_test(NAME test-sycl-alloc-zone-contract
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-alloc-zone-contract.py

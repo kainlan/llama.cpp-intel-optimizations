@@ -9,6 +9,10 @@ llama.cpp-23mk S2). JSON has no comments, so each file also carries a `_doc` fie
 - `debt.json`: the tree's current violations, keyed by construction node. Shrink-only in both directions:
   a violation that is not listed fails, and a listed entry that no longer violates fails, naming it.
 
+Every `E-RAW` debt entry also carries `fate` and `cite`. `fate` is `deleted-by-<step>`, `converted-by-<step>`
+or `sanctioned-internal`. A `sanctioned-internal` entry is one no step will ever shrink: it is a candidate for
+the allowlist, and moving it there is the lead's decision, not the implementer's.
+
 ## Key shape
 
 `file::function::node-kind:variable:text-hash#ordinal`. The text hash is of the construction's normalized
