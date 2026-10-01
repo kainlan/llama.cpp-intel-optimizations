@@ -6339,6 +6339,88 @@ offload_stats_snapshot offload_stats_get();
 void                   offload_stats_log_summary(const char * tag, int device);
 void                   zero_alloc_check(const char * tag, int device);
 
+// ---------------------------------------------------------------------------
+// L0, the process-global re-plan transaction mutex, and the always-compiled
+// witness (llama.cpp-moua, the L0 token; llama.cpp-zhcn C6 defines it).
+//
+// Declared here, beside offload_stats_phase(), because pinned-pool.cpp sits
+// below ggml-sycl.cpp in the layering and reaches this header through
+// common.hpp.  Defined in unified-cache.cpp, together with g_replan_txn_mutex
+// and the thread-local held state.  The token's constructor and destructor are
+// the only writers of that state: there is no setter and no hook, so nothing can
+// mark a thread as holding L0 without locking it.
+// ---------------------------------------------------------------------------
+
+// The outermost token's kind.  ANY is a query value only: an acquire names a
+// concrete kind.  The pool phase gates ask for TRANSACTION, the preload's check
+// asks for LOAD, and a caller that only needs to know whether L0 is held asks ANY.
+enum ggml_sycl_replan_kind : int {
+    GGML_SYCL_REPLAN_KIND_ANY         = 0,
+    GGML_SYCL_REPLAN_KIND_TRANSACTION = 1,  // a context's own planned transaction
+    GGML_SYCL_REPLAN_KIND_LOAD        = 2,  // load_begin, stage_inventory_plan, load_end
+    GGML_SYCL_REPLAN_KIND_LIFECYCLE   = 3,  // every other holder
+};
+
+const char * ggml_sycl_replan_kind_name(ggml_sycl_replan_kind kind);
+
+// True when this thread holds L0 and, unless `kind` is ANY, the OUTERMOST token
+// has that kind.  The one accessor: no second flag exists.
+bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind = GGML_SYCL_REPLAN_KIND_ANY);
+
+struct ggml_sycl_replan_outermost_only_t {
+    explicit ggml_sycl_replan_outermost_only_t() = default;
+};
+
+constexpr ggml_sycl_replan_outermost_only_t ggml_sycl_replan_outermost_only{};
+
+// RAII holder of L0.  An acquire on a thread that already holds L0 is a nested
+// hold: it does not lock and never changes the outermost kind.  An acquire on
+// another thread blocks.  The outermost token unlocks.
+class ggml_sycl_replan_token {
+  public:
+    // Blocking form.
+    explicit ggml_sycl_replan_token(ggml_sycl_replan_kind kind);
+    // Try-lock form (can_unload): owns() is false, and nothing was changed, when
+    // another thread holds L0.
+    ggml_sycl_replan_token(ggml_sycl_replan_kind kind, std::try_to_lock_t);
+    // Outermost-only form (the teardown release proc): entered with L0 already
+    // held on this thread it fails the witness `[REPLAN-TOKEN] release proc
+    // entered with L0 held`, where a nested acquire would not deadlock.
+    ggml_sycl_replan_token(ggml_sycl_replan_kind kind, ggml_sycl_replan_outermost_only_t);
+
+    ~ggml_sycl_replan_token();
+
+    ggml_sycl_replan_token(const ggml_sycl_replan_token &)             = delete;
+    ggml_sycl_replan_token & operator=(const ggml_sycl_replan_token &) = delete;
+
+    bool owns() const { return owns_; }
+
+  private:
+    void acquire(ggml_sycl_replan_kind kind, bool try_only);
+
+    bool owns_ = false;
+};
+
+// GGML_SYCL_WITNESS(cond, message): a check that is compiled in every build and
+// does not depend on NDEBUG (the tests build Release, where an assert compiles
+// out and a test that relies on one passes on the mutant it exists to catch).
+// It is evaluated in a GGML_SYCL_PRIVATE_TESTING build unless the environment
+// sets GGML_SYCL_WITNESS_CHECKS=0, and in any other build only when it sets
+// GGML_SYCL_WITNESS_CHECKS=1.  A failure aborts with `message`, so a death arm
+// scores by message.  The switch is a namespace-scope const bool initialised
+// once at library load and tested before `cond` is evaluated: a disabled check
+// is one plain load and one predictable branch.
+extern const bool g_sycl_witness_enabled;
+
+[[noreturn]] void ggml_sycl_witness_failed(const char * message);
+
+#define GGML_SYCL_WITNESS(cond, message)                      \
+    do {                                                      \
+        if (::ggml_sycl::g_sycl_witness_enabled && !(cond)) { \
+            ::ggml_sycl::ggml_sycl_witness_failed(message);   \
+        }                                                     \
+    } while (0)
+
 bool arena_pp_profile_enabled();
 bool arena_pp_profile_active();
 bool arena_pp_profile_begin(int device, bool is_prompt_phase);

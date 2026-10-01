@@ -2585,6 +2585,106 @@ offload_phase offload_stats_phase() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// L0 and the witness.  Declarations and the contract: unified-cache.hpp, beside
+// the offload stats.  The depth and the outermost kind are one thread-local
+// state, written only by ggml_sycl_replan_token's constructor and destructor.
+// ---------------------------------------------------------------------------
+static std::mutex g_replan_txn_mutex;
+
+static thread_local int                   g_replan_token_depth = 0;
+static thread_local ggml_sycl_replan_kind g_replan_token_outer = GGML_SYCL_REPLAN_KIND_ANY;
+
+static bool ggml_sycl_witness_switch() {
+    const char * env = std::getenv("GGML_SYCL_WITNESS_CHECKS");
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    return !(env != nullptr && std::strcmp(env, "0") == 0);
+#else
+    return env != nullptr && std::strcmp(env, "1") == 0;
+#endif
+}
+
+const bool g_sycl_witness_enabled = ggml_sycl_witness_switch();
+
+void ggml_sycl_witness_failed(const char * message) {
+    GGML_ABORT("%s", message);
+}
+
+const char * ggml_sycl_replan_kind_name(ggml_sycl_replan_kind kind) {
+    switch (kind) {
+        case GGML_SYCL_REPLAN_KIND_TRANSACTION:
+            return "TRANSACTION";
+        case GGML_SYCL_REPLAN_KIND_LOAD:
+            return "LOAD";
+        case GGML_SYCL_REPLAN_KIND_LIFECYCLE:
+            return "LIFECYCLE";
+        default:
+            return "ANY";
+    }
+}
+
+bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind) {
+    if (g_replan_token_depth == 0) {
+        return false;
+    }
+    return kind == GGML_SYCL_REPLAN_KIND_ANY || g_replan_token_outer == kind;
+}
+
+void ggml_sycl_replan_token::acquire(ggml_sycl_replan_kind kind, bool try_only) {
+    GGML_SYCL_WITNESS(kind != GGML_SYCL_REPLAN_KIND_ANY, "[REPLAN-TOKEN] acquire without a concrete kind");
+    if (g_replan_token_depth > 0) {
+        // A nested hold: no lock, and the outermost kind stays. Loads never nest
+        // inside a transaction and a transaction never triggers a load, so
+        // either order is a code defect.
+        const ggml_sycl_replan_kind outer   = g_replan_token_outer;
+        const bool                  illegal = (kind == GGML_SYCL_REPLAN_KIND_TRANSACTION &&
+                              (outer == GGML_SYCL_REPLAN_KIND_LOAD || outer == GGML_SYCL_REPLAN_KIND_LIFECYCLE)) ||
+                             (kind == GGML_SYCL_REPLAN_KIND_LOAD && outer == GGML_SYCL_REPLAN_KIND_TRANSACTION);
+        if (g_sycl_witness_enabled && illegal) {
+            char message[128];
+            std::snprintf(message, sizeof(message), "[REPLAN-TOKEN] illegal nesting: %s under %s",
+                          ggml_sycl_replan_kind_name(kind), ggml_sycl_replan_kind_name(outer));
+            ggml_sycl_witness_failed(message);
+        }
+        ++g_replan_token_depth;
+        owns_ = true;
+        return;
+    }
+    if (try_only) {
+        if (!g_replan_txn_mutex.try_lock()) {
+            return;
+        }
+    } else {
+        g_replan_txn_mutex.lock();
+    }
+    g_replan_token_depth = 1;
+    g_replan_token_outer = kind;
+    owns_                = true;
+}
+
+ggml_sycl_replan_token::ggml_sycl_replan_token(ggml_sycl_replan_kind kind) {
+    acquire(kind, false);
+}
+
+ggml_sycl_replan_token::ggml_sycl_replan_token(ggml_sycl_replan_kind kind, std::try_to_lock_t) {
+    acquire(kind, true);
+}
+
+ggml_sycl_replan_token::ggml_sycl_replan_token(ggml_sycl_replan_kind kind, ggml_sycl_replan_outermost_only_t) {
+    GGML_SYCL_WITNESS(g_replan_token_depth == 0, "[REPLAN-TOKEN] release proc entered with L0 held");
+    acquire(kind, false);
+}
+
+ggml_sycl_replan_token::~ggml_sycl_replan_token() {
+    if (!owns_) {
+        return;
+    }
+    if (--g_replan_token_depth == 0) {
+        g_replan_token_outer = GGML_SYCL_REPLAN_KIND_ANY;
+        g_replan_txn_mutex.unlock();
+    }
+}
+
 static inline offload_phase offload_stats_current_phase() {
     const int phase = g_offload_phase.load(std::memory_order_relaxed);
     switch (phase) {

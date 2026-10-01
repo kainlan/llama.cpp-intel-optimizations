@@ -2802,6 +2802,39 @@ set_tests_properties(test-sycl-retained-reap PROPERTIES
     TIMEOUT 120
 )
 
+# Test: L0, the re-plan transaction mutex, and the always-compiled witness
+# (ggml_sycl_replan_token, ggml_sycl_replan_token_held, GGML_SYCL_WITNESS).
+# The real objects of unified-cache.cpp in the private carrier: nesting, kinds,
+# the try and outermost-only forms, threads, and the witness death arms scored
+# by message in re-exec'd children. No queue is created; the selector is pinned
+# to the OpenCL CPU device anyway: no GPU.
+add_executable(test-sycl-replan-token
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-replan-token.cpp
+)
+target_include_directories(test-sycl-replan-token PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-replan-token PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-replan-token PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-replan-token PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-replan-token PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-replan-token PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-replan-token COMMAND test-sycl-replan-token)
+set_tests_properties(test-sycl-replan-token PROPERTIES
+    LABELS "sycl;handle;hostonly;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 # Test: the two device-level arena accessors (ggml_sycl_arena_backing, the
 # lookup that creates; ggml_sycl_device_has_zones, the one that never does) and
 # the committed-side capacity accessors' non-VM bodies. The cache is a real
