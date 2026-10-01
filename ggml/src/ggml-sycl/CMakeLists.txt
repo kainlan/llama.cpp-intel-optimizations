@@ -504,6 +504,14 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fallback-propagation.py)
     add_test(NAME sycl-fallback-exception-safety
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fallback-exception-safety.py)
+    # llama.cpp-gsb9.  Owner-first allocation migration census.  This gate sat
+    # unregistered, so nothing noticed when a stale count pin aborted it at line
+    # 137 and silenced every later check; it is registered now, and each check runs
+    # independently.  Text-only, allocates nothing, opens no device.
+    add_test(NAME sycl-owner-allocation-migration
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-owner-allocation-migration.py)
+    set_tests_properties(sycl-owner-allocation-migration PROPERTIES
+        LABELS "sycl;host;source-contract")
 endif()
 
 # Enable AVX2 + VNNI for CPU vec_dot kernels in tensor split / CPU offload.

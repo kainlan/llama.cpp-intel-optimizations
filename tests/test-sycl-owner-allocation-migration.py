@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Source gate for owner-first staging and w295 transactional growth contracts."""
+import contextlib
 import os
 import re
 import shutil
+import sys
+import traceback
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,15 +19,48 @@ COMMON = (SYCL / "common.hpp").read_text()
 COMMON_IMPL = (SYCL / "common.cpp").read_text()
 
 
+GATE_RESULTS = []
+
+
+@contextlib.contextmanager
+def gate(name: str):
+    """Run one independent check. The previous layout was one bare-assert chain, so the first stale
+    pin aborted the module and every later check in the file silently never ran (llama.cpp-gsb9).
+    A failure is recorded with its source line and the run continues; report_gates() decides the
+    exit status once every check has had its turn."""
+    try:
+        yield
+    except Exception as error:  # noqa: BLE001 -- any failure, including a missing anchor, fails this check
+        frame = traceback.extract_tb(error.__traceback__)[-1]
+        location = "line %d: %s" % (frame.lineno, (frame.line or "").strip())
+        detail = str(error) or type(error).__name__
+        GATE_RESULTS.append((name, "%s -- %s: %s" % (location, type(error).__name__, detail)))
+    else:
+        GATE_RESULTS.append((name, None))
+
+
+def report_gates() -> None:
+    failed = [(name, why) for name, why in GATE_RESULTS if why is not None]
+    for name, why in failed:
+        print("FAIL %s\n     %s" % (name, why.replace("\n", "\n     ")))
+    print("%d/%d checks passed" % (len(GATE_RESULTS) - len(failed), len(GATE_RESULTS)))
+    sys.exit(1 if failed else 0)
+
+
 def region(source: str, start: str, end: str) -> str:
-    begin = source.index(start)
-    finish = source.index(end, begin)
+    begin = source.find(start)
+    if begin < 0:
+        raise ValueError("region start anchor not found: %r" % start)
+    finish = source.find(end, begin)
+    if finish < 0:
+        raise ValueError("region end anchor not found after %r: %r" % (start, end))
     return source[begin:finish]
 
 
-def _blank_comments(source: str) -> str:
+def _blank_comments(source: str, keep_strings: bool = True) -> str:
     """Replace // and /* */ comment bodies with spaces, preserving offsets and string
-    literals. Without this, prose naming a function reads as a call to it -- both the
+    literals (or, with keep_strings=False, blanking their bodies too: a log message
+    that names a function is not a call to it either). Without this, prose naming a function reads as a call to it -- both the
     census below (a doc-only commit can inflate a raw literal count with no code
     change at all -- see 073078ff1/d431c7e44) and the "scan matched nothing" control
     further down would treat a comment mention as the real thing it describes."""
@@ -36,12 +73,13 @@ def _blank_comments(source: str) -> str:
             index += 1
             while index < size:
                 if source[index] == "\\":
-                    out.append(source[index:index + 2])
+                    out.append(source[index:index + 2] if keep_strings else "  ")
                     index += 2
                     continue
-                out.append(source[index])
+                closes = source[index] == quote
+                out.append(source[index] if keep_strings or closes else ("\n" if source[index] == "\n" else " "))
                 index += 1
-                if source[index - 1] == quote:
+                if closes:
                     break
             continue
         if source.startswith("//", index):
@@ -63,9 +101,10 @@ def _blank_comments(source: str) -> str:
 # Positive control for _blank_comments itself: a comment mention of the token must
 # be stripped (so a documentation-only commit cannot move the census below) while a
 # real call immediately after survives untouched (so the blanking cannot eat code).
-_blank_comments_probe = _blank_comments("// see unified_alloc( in the old code\nunified_alloc(req, &owner);\n")
-assert _blank_comments_probe.count("unified_alloc(") == 1, "comment blinding did not strip a commented mention"
-assert "unified_alloc(req, &owner);" in _blank_comments_probe, "comment blinding ate real code"
+with gate('blank-comments-control'):
+    _blank_comments_probe = _blank_comments("// see unified_alloc( in the old code\nunified_alloc(req, &owner);\n")
+    assert _blank_comments_probe.count("unified_alloc(") == 1, "comment blinding did not strip a commented mention"
+    assert "unified_alloc(req, &owner);" in _blank_comments_probe, "comment blinding ate real code"
 
 
 def owner_first(block: str, mutation: str) -> None:
@@ -80,37 +119,39 @@ def owner_first(block: str, mutation: str) -> None:
 
 
 # All four FATTN legacy-owner sites are closed, including both KV-zone users.
-assert FATTN.count("unified_alloc(") == 0
-assert FATTN.count("from_legacy_owned_alloc(") == 0
-assert FATTN.count("unified_allocate_owner(") == 4
-assert FATTN.count("prefer_vram_zone = ggml_sycl::vram_zone_id::KV") == 2
+with gate('fattn-owner-first'):
+    assert FATTN.count("unified_alloc(") == 0
+    assert FATTN.count("from_legacy_owned_alloc(") == 0
+    assert FATTN.count("unified_allocate_owner(") == 4
+    assert FATTN.count("prefer_vram_zone = ggml_sycl::vram_zone_id::KV") == 2
 
-owner_first(
-    region(FATTN, "bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows", "void ggml_sycl_fattn_xmx_unregister"),
-    "packed.handle = std::move(handle)",
-)
-owner_first(
-    region(FATTN, "static bool ggml_sycl_fattn_alloc_device_owner", "template <typename T>"),
-    "owner = new ggml_sycl::mem_handle",
-)
-owner_first(
-    region(FATTN, "bool ggml_sycl_fattn_xmx_materialize_packed_k", "static void ggml_sycl_fattn_xmx_v2_free"),
-    "out->handle      = std::move(handle)",
-)
-owner_first(
-    region(FATTN, "static bool ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer", "static bool ggml_sycl_fattn_xmx_v2_ensure"),
-    "*out = std::move(handle)",
-)
-print("PASS fattn-owner-first-source-gate")
+    owner_first(
+        region(FATTN, "bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows", "void ggml_sycl_fattn_xmx_unregister"),
+        "packed.handle = std::move(handle)",
+    )
+    owner_first(
+        region(FATTN, "static bool ggml_sycl_fattn_alloc_device_owner", "template <typename T>"),
+        "owner = new ggml_sycl::mem_handle",
+    )
+    owner_first(
+        region(FATTN, "bool ggml_sycl_fattn_xmx_materialize_packed_k", "static void ggml_sycl_fattn_xmx_v2_free"),
+        "out->handle      = std::move(handle)",
+    )
+    owner_first(
+        region(FATTN, "static bool ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer", "static bool ggml_sycl_fattn_xmx_v2_ensure"),
+        "*out = std::move(handle)",
+    )
+    print("PASS fattn-owner-first-source-gate")
 
 # Failure atomicity: no existing output is cleared before allocation and
 # resolution succeed, so allocation failure cannot publish a raw pointer or
-# erase the previous owner.
-sidecar_prefix = region(FATTN, "if (!reuse_alloc) {", "const auto resolved = handle.resolve(target_device);")
-assert "packed.reset()" not in sidecar_prefix
-materializer = region(FATTN, "bool ggml_sycl_fattn_xmx_materialize_packed_k", "// Publish every field used by retry reuse")
-assert materializer.index("const auto resolved") < materializer.index("out->reset()")
-print("PASS fattn-allocation-failure-leaves-output-untouched")
+with gate('fattn-failure-atomicity'):
+    # erase the previous owner.
+    sidecar_prefix = region(FATTN, "if (!reuse_alloc) {", "const auto resolved = handle.resolve(target_device);")
+    assert "packed.reset()" not in sidecar_prefix
+    materializer = region(FATTN, "bool ggml_sycl_fattn_xmx_materialize_packed_k", "// Publish every field used by retry reuse")
+    assert materializer.index("const auto resolved") < materializer.index("out->reset()")
+    print("PASS fattn-allocation-failure-leaves-output-untouched")
 
 # Ten coherent runtime staging/workspace owner sites were migrated. The exact
 # compatibility inventory prevents either a silent regression or an unreviewed
@@ -130,25 +171,114 @@ print("PASS fattn-allocation-failure-leaves-output-untouched")
 # round-tripped 25->27->26, but the comment-blind count never moved off 25. Bisected
 # with `git log -S'<token>(' -- ggml/src/ggml-sycl/ggml-sycl.cpp`; verified per-commit
 # with `git show <sha>:ggml/src/ggml-sycl/ggml-sycl.cpp | grep -o '<token>(' | wc -l`.
-RUNTIME_CODE = _blank_comments(RUNTIME)
-assert RUNTIME_CODE.count("unified_alloc(") == 54
-assert RUNTIME_CODE.count("from_legacy_owned_alloc(") == 42
-assert RUNTIME_CODE.count("unified_allocate_owner(") == 24
-assert CACHE.count("unified_alloc(") == 28
-assert CACHE.count("from_legacy_owned_alloc(") == 12
-assert CACHE.count("unified_allocate_owner(") == 10
-assert COMMON.count("unified_alloc(") == 4
-assert COMMON.count("from_legacy_owned_alloc(") == 4
-assert COMMON.count("unified_allocate_owner(") == 3
-assert COMMON_IMPL.count("unified_alloc(") == 8
-assert COMMON_IMPL.count("from_legacy_owned_alloc(") == 8
-assert COMMON_IMPL.count("unified_allocate_owner(") == 4
+RUNTIME_CODE     = _blank_comments(RUNTIME)
+COMMON_CODE      = _blank_comments(COMMON)
+COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
+
+for _label, _code, _pins in (
+    ("ggml-sycl.cpp", RUNTIME_CODE, (54, 42, 24)),
+    ("common.hpp", COMMON_CODE, (3, 4, 3)),
+    ("common.cpp", COMMON_IMPL_CODE, (8, 8, 4)),
+):
+    for _token, _pinned in zip(("unified_alloc", "from_legacy_owned_alloc", "unified_allocate_owner"), _pins):
+        with gate("census %s %s(" % (_label, _token)):
+            _found = _code.count(_token + "(")
+            assert _found == _pinned, "%s has %d %s( call sites, the reviewed inventory is %d" % (
+                _label, _found, _token, _pinned)
+
+
+def call_sites(code: str, source: str, token: str) -> Counter:
+    """Every call to `token` in `code` (comments and strings already blanked), keyed by the
+    statement head it sits in and its argument text. `source` is the same text unblanked, so
+    the key reads naturally. Two calls with the same key are counted, not merged."""
+    sites = Counter()
+    for match in re.finditer(r"\b%s\(" % token, code):
+        head = " ".join(code[code.rfind("\n", 0, match.start()) + 1:match.start()].split())
+        depth, index = 1, match.end()
+        while depth:
+            depth += (code[index] == "(") - (code[index] == ")")
+            index += 1
+        sites[(head[-45:], " ".join(source[match.end():index - 1].split()))] += 1
+    return sites
+
+
+# unified-cache.cpp is the allocator itself, and the one file whose sites are legitimately
+# still on the legacy alloc_handle form: it implements unified_allocate_owner() on top of
+# unified_alloc() and keeps bootstrap mints that cannot route through the coordinator. A raw
+# literal count of it (28, until llama.cpp-gsb9) drifted with prose -- 12 of the 14 "new"
+# sites were comments and log strings -- so each CODE call site is listed instead. A new
+# site changes a count here and has to be classified against
+# docs/design/sycl-canonical-memory-architecture.md section 3 before it is added.
+CACHE_CODE = _blank_comments(CACHE, keep_strings=False)
+
+# (statement head, argument text) -> number of sites. The comment names the function.
+CACHE_UNIFIED_ALLOC_SITES = Counter({
+    ("bool", "const alloc_request & req_in, alloc_handle * out"): 1,  # the definition of unified_alloc itself
+    ("if (!", "areq, &h"): 1,  # acquire_offload_buffer
+    ("if (!", "req, &legacy"): 1,  # unified_allocate_owner_impl: the legacy bridge it wraps
+    ("if (", "req, &handle"): 2,  # unified_cache_allocate (two tiers)
+    ("if (!", "req, &handle"): 4,  # reserve_onednn_scratch, release_onednn_scratch_reservation,
+    #                                reserve_persistent_scratch, unified_cache_zone_allocate
+    ("if (!", "req, &partial_owner"): 1,  # unified_cache_unpin_model_weights
+    ("if (!", "req, &owner"): 3,  # reserve_compute_arena, reserve_scratch_pool, device_pool_alloc_chunk
+    ("if (!", "req, out"): 1,  # unified_cache_reserve_moe_q8_1_scratch
+    ("if (!", "req, &moe_owner"): 1,  # moe_preallocate_inference_buffers
+    # oneDNN Graph-scratch DIRECT path (dded74997, llama.cpp-0oxf): unified_alloc()
+    # + detail::from_legacy_owned_alloc() with no fallible step between them. Legacy form,
+    # allowlisted; owner-first (unified_allocate_owner) is the migration target.
+    ("ph_scratch_test_should_force_direct_fail() &&", "req, &handle"): 2,
+})
+CACHE_FROM_LEGACY_SITES = Counter({
+    ("staging_owner_ = detail::", "std::move(owner), GGML_LAYOUT_AOS"): 1,  # the cache's own staging adopt
+    ("new_direct_alloc_owner = detail::", "std::move(new_owner), layout"): 2,  # ensure_cached, ensure_cached_alloc
+    ("direct_alloc_owner = detail::", "std::move(owner), layout"): 2,  # ensure_cached, ensure_cached_alloc
+    ("dnn_graph_scratch_flag_slab_owner_ = detail::", "std::move(owner), GGML_LAYOUT_AOS"): 1,  # bootstrap mint
+    ("mem_handle owner = detail::", "std::move(handle), GGML_LAYOUT_AOS"): 1,  # onednn_graph_scratch_alloc
+    ("owner = detail::", "std::move(handle), GGML_LAYOUT_AOS"): 3,  # reserve_onednn_scratch,
+    #                                release_onednn_scratch_reservation, reserve_persistent_scratch
+    ("mem_handle partial_handle = detail::", "std::move(partial_owner), GGML_LAYOUT_SOA"): 1,  # unpin_model_weights
+    ("compute_arena_owner_ = detail::", "std::move(owner), GGML_LAYOUT_AOS"): 1,
+    ("scratch_pool_owner_ = detail::", "std::move(owner), GGML_LAYOUT_AOS"): 1,
+    ("out = std::make_shared<mem_handle>(detail::", "std::move(moe_owner)"): 1,  # moe_preallocate_inference_buffers
+})
+CACHE_OWNER_FIRST_SITES = Counter({
+    ("allocation_result allocation =", "req"): 7,
+    ("allocation_result host_allocation =", "host_req"): 1,
+    ("allocation_result result =", "req"): 1,  # unified_cache_zone_alloc
+    ("allocation_result", "const alloc_request & req"): 1,  # the definition of unified_allocate_owner itself
+})
+
+for _token, _allowed in (
+    ("unified_alloc", CACHE_UNIFIED_ALLOC_SITES),
+    ("from_legacy_owned_alloc", CACHE_FROM_LEGACY_SITES),
+    ("unified_allocate_owner", CACHE_OWNER_FIRST_SITES),
+):
+    with gate("census unified-cache.cpp %s( sites" % _token):
+        _found = call_sites(CACHE_CODE, CACHE, _token)
+        _extra, _missing = _found - _allowed, _allowed - _found
+        assert not _extra and not _missing, (
+            "unified-cache.cpp %s( call sites differ from the reviewed list; unlisted: %s; listed but gone: %s" %
+            (_token, dict(_extra), dict(_missing)))
+
+# The shared planned-scratch allocator (llama.cpp-479i). It replaced two earlier
+# owner-first sites: scoped_mmvq_scratch_handle in ggml-sycl.cpp (retired by 1e4a9bf6a)
+# and the per-slot allocation in the MMQ src1 staging ensure_buffer in common.hpp
+# (retired by 4a348083c). Both now call this one helper, so the owner-first ordering is
+# pinned here once instead of at each caller.
+PLANNED_SCRATCH_HELPER = ("inline void * ggml_sycl_runtime_scratch_ensure(", "struct ggml_backend_sycl_context {")
+
+with gate('planned-scratch-ensure-owner-first'):
+    planned_scratch = region(COMMON, *PLANNED_SCRATCH_HELPER)
+    owner_first(planned_scratch, "backing  = std::move(replacement)")
+    # Both planned callers must keep going through the helper rather than allocating themselves.
+    # Callers in common.hpp: the MMQ/MMVQ Q8_1 src1 buffer and the dense f16 dequant buffers.
+    assert COMMON.count("ggml_sycl_runtime_scratch_ensure<") == 2, "a planned scratch caller stopped using the helper"
+    print("PASS planned-scratch-owner-first-source-gate")
 
 runtime_regions = (
     ("ggml_backend_sycl_context::get_staging_buffer", "ggml_backend_sycl_context::free_staging_buffer"),
     ("ggml_backend_sycl_context::ensure_mmvq_host_staging", "ggml_backend_sycl_context::ensure_readback_staging"),
     ("ggml_backend_sycl_context::ensure_readback_staging", "ggml_backend_sycl_context::new_pool_for_device"),
-    ("struct scoped_mmvq_scratch_handle", "constexpr bool quantize_enabled"),
     ("auto                               allocate_owned_scratch", "auto release_owned_scratch"),
     ("bool ensure_device(T *&", "static bool ggml_sycl_expert_entry_weight_ptr"),
     ("auto ensure_secondary_device_buffer", "// Ensure ALL slots"),
@@ -157,10 +287,11 @@ runtime_regions = (
     ("static void ggml_sycl_mmvq_soa_pre_allocate_buffers", "static void ggml_sycl_xmx_moe_pre_allocate_buffers"),
 )
 for start, end in runtime_regions:
-    block = region(RUNTIME, start, end)
-    assert "unified_allocate_owner(" in block, start
-    assert "unified_alloc(" not in block, start
-    assert "from_legacy_owned_alloc" not in block, start
+    with gate("runtime-owner-first region %s" % start.strip()):
+        block = region(RUNTIME, start, end)
+        assert "unified_allocate_owner(" in block, start
+        assert "unified_alloc(" not in block, start
+        assert "from_legacy_owned_alloc" not in block, start
 
 # Representative replacement paths prove the old owner/raw view is not reset
 # before the replacement has an accepted allocation and validated resolution.
@@ -172,9 +303,9 @@ for start, end, forbidden in (
     ("auto ensure_secondary_device_buffer", "ggml_sycl::allocation_result allocation", "handle = {}"),
     ("// Allocate and validate a replacement before disturbing the published buffer.", "ggml_sycl::allocation_result allocation", "pipe.scratch_handle[b] = {}"),
 ):
-    assert forbidden not in region(RUNTIME, start, end), start
+    with gate("runtime-replacement-keeps-old-owner region %s" % start.strip()):
+        assert forbidden not in region(RUNTIME, start, end), start
 print("PASS runtime-workspace-owner-first-source-gate")
-print("PASS runtime-allocation-failure-leaves-output-untouched")
 
 # The next coherent STAGING batch closes 17 legacy sites: 13 in the runtime,
 # two in unified-cache, and one each in common.hpp/common.cpp. Exact legacy
@@ -191,176 +322,194 @@ staging_runtime_regions = (
     ("static bool split_secondary_gpu_ensure", "static const void * split_secondary_weight_load"),
     ("static ggml_sycl::mem_handle ggml_sycl_block_exec_alloc_host_stage_handle", "static bool ggml_sycl_block_exec_queue_matches_device"),
 )
-staging_runtime = "\n".join(region(RUNTIME, a, b) for a, b in staging_runtime_regions)
 for start, end in staging_runtime_regions:
-    assert "unified_allocate_owner(" in region(RUNTIME, start, end), start
+    with gate("staging-owner-first region %s" % start.strip()):
+        assert "unified_allocate_owner(" in region(RUNTIME, start, end), start
 
-for forbidden in (
-    "alloc_handle xmx_staging_owner", "alloc_handle table_owner", "alloc_handle ids_pack_owner",
-    "alloc_handle device_owner", "alloc_handle q8_owner", "alloc_handle f32_owner",
-    "alloc_handle second_out_owner", "alloc_handle host_stage_owner",
-    "ggml_sycl_take_owned_alloc_handle(alloc",
-):
-    assert forbidden not in staging_runtime, forbidden
-for forbidden_call in (
-    "unified_alloc(staging_req", "unified_alloc(req, &table_owner", "unified_alloc(req, &ids_pack_owner",
-    "unified_alloc(req, &device_owner", "unified_alloc(req, &q8_owner", "unified_alloc(req, &f32_owner",
-    "unified_alloc(req, &second_out_owner", "unified_alloc(req, &host_stage_owner",
-):
-    assert forbidden_call not in RUNTIME, forbidden_call
+with gate('staging-legacy-names-forbidden'):
+    staging_runtime = "\n".join(region(RUNTIME, a, b) for a, b in staging_runtime_regions)
+    for forbidden in (
+        "alloc_handle xmx_staging_owner", "alloc_handle table_owner", "alloc_handle ids_pack_owner",
+        "alloc_handle device_owner", "alloc_handle q8_owner", "alloc_handle f32_owner",
+        "alloc_handle second_out_owner", "alloc_handle host_stage_owner",
+        "ggml_sycl_take_owned_alloc_handle(alloc",
+    ):
+        assert forbidden not in staging_runtime, forbidden
+    for forbidden_call in (
+        "unified_alloc(staging_req", "unified_alloc(req, &table_owner", "unified_alloc(req, &ids_pack_owner",
+        "unified_alloc(req, &device_owner", "unified_alloc(req, &q8_owner", "unified_alloc(req, &f32_owner",
+        "unified_alloc(req, &second_out_owner", "unified_alloc(req, &host_stage_owner",
+    ):
+        assert forbidden_call not in RUNTIME, forbidden_call
 
-cache_reorder = region(CACHE, "bool unified_cache::reserve_reorder_temp", "bool unified_cache::reserve_persistent_scratch")
-cache_fill = region(CACHE, "bool unified_cache_fill_with_host_copy", "bool unified_cache_copy_from_host_async")
-for block in (cache_reorder, cache_fill):
-    assert "unified_allocate_owner(" in block
-    assert "unified_alloc(" not in block
-    assert "from_legacy_owned_alloc" not in block
+# unified-cache and pp-stage staging owners. The common.hpp one (the MMQ src1 Q8_1 buffer)
+# is the shared planned-scratch helper pinned above; it is part of this seam too.
+STAGING_BLOCKS = (
+    ("cache reserve_reorder_temp", CACHE, "bool unified_cache::reserve_reorder_temp",
+     "bool unified_cache::reserve_persistent_scratch", "reorder_temp_owner_  = std::move(replacement)"),
+    ("cache fill_with_host_copy", CACHE, "bool unified_cache_fill_with_host_copy",
+     "bool unified_cache_copy_from_host_async", None),
+    ("common planned scratch", COMMON, PLANNED_SCRATCH_HELPER[0], PLANNED_SCRATCH_HELPER[1],
+     "backing  = std::move(replacement)"),
+    ("common_impl pp stage", COMMON_IMPL, "void * ggml_sycl_pp_ensure_stage_buffer",
+     "sycl::event ggml_sycl_pp_stage_transfer", "g_sycl_pp_config.stage_output_handle[stage] = std::move(replacement)"),
+)
+for label, source, start, end, mutation in STAGING_BLOCKS:
+    with gate("staging-owner-first %s" % label):
+        block = region(source, start, end)
+        assert "unified_allocate_owner(" in block
+        assert "unified_alloc(" not in block
+        assert "from_legacy_owned_alloc" not in block
+    # Representative failure seam: replacement owners are resolved and routing is
+    # validated before old staging metadata is published or cleared.
+    if mutation:
+        with gate("staging-replacement-failure-seam %s" % label):
+            block = region(source, start, end)
+            allocation = block.index("unified_allocate_owner(")
+            resolved = block.index("resolve(", allocation)
+            validation = block.index("resolved.ptr", resolved)
+            publication = block.index(mutation, validation)
+            assert allocation < resolved < validation < publication
 
-common_stage = region(COMMON, "void * ensure_buffer(size_t required_size", "ggml_sycl::mem_handle handle() const")
-pp_stage = region(COMMON_IMPL, "void * ggml_sycl_pp_ensure_stage_buffer", "sycl::event ggml_sycl_pp_stage_transfer")
-for block in (common_stage, pp_stage):
-    assert "unified_allocate_owner(" in block
-    assert "unified_alloc(" not in block
-    assert "from_legacy_owned_alloc" not in block
-
-# Representative failure seam: replacement owners are resolved and routing is
-# validated before old staging metadata is published or cleared.
-for block, mutation in (
-    (region(RUNTIME, "static bool split_secondary_gpu_ensure", "static const void * split_secondary_weight_load"),
-     "g_split_secondary_gpu.q8_handle = std::move(q8_replacement)"),
-    (cache_reorder, "reorder_temp_owner_  = std::move(replacement)"),
-    (common_stage, "backing_handle   = std::move(replacement)"),
-    (pp_stage, "g_sycl_pp_config.stage_output_handle[stage] = std::move(replacement)"),
-):
+with gate('staging-replacement-failure-seam split_secondary'):
+    block = region(RUNTIME, "static bool split_secondary_gpu_ensure", "static const void * split_secondary_weight_load")
     allocation = block.index("unified_allocate_owner(")
     resolved = block.index("resolve(", allocation)
     validation = block.index("resolved.ptr", resolved)
-    publication = block.index(mutation, validation)
+    publication = block.index("g_split_secondary_gpu.q8_handle = std::move(q8_replacement)", validation)
     assert allocation < resolved < validation < publication
 print("PASS staging-owner-first-source-gate-17")
-print("PASS staging-replacement-failure-seam")
 
-# w288: resize helpers qualify success against the requested geometry.  A
-# surviving smaller pointer is never accepted after a failed growth attempt.
-secondary = region(RUNTIME, "static bool split_secondary_gpu_ensure", "// Secondary GPU weight loading")
-assert "q8_size >= q8_bytes" in secondary
-assert "f32_size >= f32_bytes" in secondary
-secondary_call = region(RUNTIME, "// Secondary GPU: H2D src1", "// CPU vec_dot:")
-assert "!split_secondary_gpu_ensure(q8_bytes, src1_f32_bytes, second_out_bytes" in secondary_call
-assert "s_second_out_dev_sz, s_second_out_dev_handle, stream_second" in secondary_call
-persistent = region(RUNTIME, "static bool ensure_split_persistent_resources", "// OOQ merge queue")
-assert "r.q8_staging_size >= need_q8" in persistent
-assert "return false;" in persistent
-assert "if (!ensure_split_persistent_resources(" in RUNTIME
-print("PASS staging-resize-capacity-qualified-source-gate")
+with gate('staging-resize'):
+    # w288: resize helpers qualify success against the requested geometry.  A
+    # surviving smaller pointer is never accepted after a failed growth attempt.
+    secondary = region(RUNTIME, "static bool split_secondary_gpu_ensure", "// Secondary GPU weight loading")
+    assert "q8_size >= q8_bytes" in secondary
+    assert "f32_size >= f32_bytes" in secondary
+    secondary_call = region(RUNTIME, "// Secondary GPU: H2D src1", "// CPU vec_dot:")
+    assert "!split_secondary_gpu_ensure(q8_bytes, src1_f32_bytes, second_out_bytes" in secondary_call
+    assert "s_second_out_dev_sz, s_second_out_dev_handle, stream_second" in secondary_call
+    persistent = region(RUNTIME, "static bool ensure_split_persistent_resources", "// OOQ merge queue")
+    assert "r.q8_staging_size >= need_q8" in persistent
+    assert "return false;" in persistent
+    assert "if (!ensure_split_persistent_resources(" in RUNTIME
+    print("PASS staging-resize-capacity-qualified-source-gate")
 
-# Successful secondary replacements escrow q8/f32/output old owners as one
-# transaction behind the exact queue terminal. The retirement ticket predates
-# owner-vector growth and failed barrier/publication paths drain before unwind.
-retirement = region(RUNTIME, "class ggml_sycl_old_owner_retirement", "// Construct this before direct_stage_expert")
-# Field order (ticket before the owner vector) is the property; match on the
-# declarations rather than on their column alignment, which clang-format moves
-# whenever a neighbouring member name changes length.
-assert retirement.index("publish_ticket_ =") < retirement.index("old_owners_;")
-assert "old_owners_.reserve(owner_capacity)" in retirement
-# The queue is held by pointer so the private host fixture can drive this
-# transaction with no device; null means there is no submission to fence or
-# drain, and every production caller passes a live queue.
-assert "queue_->ext_oneapi_submit_barrier()" in retirement
-assert "retain_handles_until_event_transactional(old_owners_, prior_queue_terminal, publish_ticket_)" in retirement
-assert "ggml_sycl_drain_direct_stage_queue(*queue_)" in retirement
-for owner in ("g_split_secondary_gpu.q8_handle", "g_split_secondary_gpu.f32_handle", "output_handle"):
-    assert f"retirement.hold({owner})" in secondary
-assert secondary.count("retirement.secure()") == 1
-assert secondary.index("retirement.secure()") < secondary.index("g_split_secondary_gpu.q8_handle = std::move")
-assert "secondary_queue.ext_oneapi_submit_barrier()" in persistent
-print("PASS staging-in-flight-resize-owner-retention-source-gate")
+with gate('staging-retirement'):
+    # Successful secondary replacements escrow q8/f32/output old owners as one
+    # transaction behind the exact queue terminal. The retirement ticket predates
+    # owner-vector growth and failed barrier/publication paths drain before unwind.
+    retirement = region(RUNTIME, "class ggml_sycl_old_owner_retirement", "// Construct this before direct_stage_expert")
+    # Field order (ticket before the owner vector) is the property; match on the
+    # declarations rather than on their column alignment, which clang-format moves
+    # whenever a neighbouring member name changes length.
+    assert retirement.index("publish_ticket_ =") < retirement.index("old_owners_;")
+    assert "old_owners_.reserve(owner_capacity)" in retirement
+    # The queue is held by pointer so the private host fixture can drive this
+    # transaction with no device; null means there is no submission to fence or
+    # drain, and every production caller passes a live queue.
+    assert "queue_->ext_oneapi_submit_barrier()" in retirement
+    assert "retain_handles_until_event_transactional(old_owners_, prior_queue_terminal, publish_ticket_)" in retirement
+    assert "ggml_sycl_drain_direct_stage_queue(*queue_)" in retirement
+    for owner in ("g_split_secondary_gpu.q8_handle", "g_split_secondary_gpu.f32_handle", "output_handle"):
+        assert f"retirement.hold({owner})" in secondary
+    assert secondary.count("retirement.secure()") == 1
+    assert secondary.index("retirement.secure()") < secondary.index("g_split_secondary_gpu.q8_handle = std::move")
+    assert "secondary_queue.ext_oneapi_submit_barrier()" in persistent
+    print("PASS staging-in-flight-resize-owner-retention-source-gate")
 
-# XMX staging and MoE pointer-table growth are failure atomic: no old state is
-# cleared before a replacement resolves, and table payload vectors are built
-# locally before the owner/size/validity tuple is published.
-xmx_stage = region(RUNTIME, "const bool staging_too_small", "// Always use host staging")
-assert "xmx_mxfp4_tiled_aos_staging_handle[device_id] = {}" not in xmx_stage
-assert xmx_stage.index("staging_resolved && staging_resolved.on_device") < xmx_stage.index("std::move(staging_handle)")
-moe_table = region(RUNTIME, "static bool ggml_sycl_ensure_moe_ptr_table", "static void ggml_sycl_update_moe_hotset")
-assert "moe_expert_ptrs_handle[device]        = {};" not in moe_table
-# The three publication sites share one constructor helper, so the
-# same-allocation host-vector failure has a single seam. The "built off to the
-# side, published only once complete" property moves with it: assert the call
-# count here and the ordering inside the helper itself.
-assert moe_table.count("ggml_sycl_build_moe_table_views(count,") == 3
-table_views = region(RUNTIME, "static void ggml_sycl_build_moe_table_views", "#if defined(GGML_SYCL_PRIVATE_TESTING)")
-assert "std::vector<ggml_sycl::mem_handle> new_handles(count)" in table_views
-assert "std::vector<void *>                new_payload(count, nullptr)" in table_views
-assert table_views.index("new_payload(count, nullptr)") < table_views.index("handles.swap(new_handles)")
-assert table_views.index("handles.swap(new_handles)") < table_views.index("payload.swap(new_payload)")
-assert moe_table.count("catch (const std::bad_alloc &)") >= 3
-assert "ggml_sycl_checked_mul_size(count, sizeof(void *), &bytes)" in moe_table
-assert "return true;" in moe_table and "return false;" in moe_table
-assert "retirement.hold(extra->moe_expert_ptrs_handle[device])" in moe_table
-print("PASS xmx-moe-replacement-failure-atomic-source-gate")
+with gate('xmx-moe-atomic'):
+    # XMX staging and MoE pointer-table growth are failure atomic: no old state is
+    # cleared before a replacement resolves, and table payload vectors are built
+    # locally before the owner/size/validity tuple is published.
+    xmx_stage = region(RUNTIME, "const bool staging_too_small", "// Always use host staging")
+    assert "xmx_mxfp4_tiled_aos_staging_handle[device_id] = {}" not in xmx_stage
+    assert xmx_stage.index("staging_resolved && staging_resolved.on_device") < xmx_stage.index("std::move(staging_handle)")
+    moe_table = region(RUNTIME, "static bool ggml_sycl_ensure_moe_ptr_table", "static void ggml_sycl_update_moe_hotset")
+    # Whitespace-insensitive: this pin used to be a literal with column-aligned spaces, which a
+    # clang-format realignment would silently turn into a never-matching (vacuous) negative.
+    assert not re.search(r"moe_expert_ptrs_handle\[device\]\s*=\s*\{\};", moe_table)
+    # The three publication sites share one constructor helper, so the
+    # same-allocation host-vector failure has a single seam. The "built off to the
+    # side, published only once complete" property moves with it: assert the call
+    # count here and the ordering inside the helper itself.
+    assert moe_table.count("ggml_sycl_build_moe_table_views(count,") == 3
+    table_views = region(RUNTIME, "static void ggml_sycl_build_moe_table_views", "#if defined(GGML_SYCL_PRIVATE_TESTING)")
+    assert "std::vector<ggml_sycl::mem_handle> new_handles(count)" in table_views
+    assert "std::vector<void *>                new_payload(count, nullptr)" in table_views
+    assert table_views.index("new_payload(count, nullptr)") < table_views.index("handles.swap(new_handles)")
+    assert table_views.index("handles.swap(new_handles)") < table_views.index("payload.swap(new_payload)")
+    assert moe_table.count("catch (const std::bad_alloc &)") >= 3
+    assert "ggml_sycl_checked_mul_size(count, sizeof(void *), &bytes)" in moe_table
+    assert "return true;" in moe_table and "return false;" in moe_table
+    assert "retirement.hold(extra->weight().moe_expert_ptrs_handle[device])" in moe_table
+    print("PASS xmx-moe-replacement-failure-atomic-source-gate")
 
-# w295 geometry is rejected before pointer arithmetic/allocation and a surviving
-# undersized XMX pointer cannot pass the capacity gate.
-xmx_convert = region(RUNTIME, "static bool convert_tensor_layout", "static bool ggml_sycl_select_mul_mat_layout")
-assert "ggml_sycl_checked_mul_size(info.total_bytes" in xmx_convert
-assert "xmx_mxfp4_tiled_aos_staging_size[device_id] < aos_expert_size" in xmx_convert
-assert xmx_convert.index("xmx_mxfp4_tiled_aos_staging_size[device_id] < aos_expert_size") < xmx_convert.index("// Always use host staging")
-assert "ggml_sycl_checked_round_up_size(static_cast<size_t>(K), MATRIX_ROW_PADDING" in RUNTIME
-assert "ggml_sycl_checked_mul_size(q8_blocks, sizeof(block_q8_1), &q8_bytes)" in RUNTIME
-assert "ggml_sycl_checked_mul_size(static_cast<size_t>(N_second), sizeof(float), &second_out_bytes)" in RUNTIME
-assert "ggml_sycl_checked_mul_size(total_batches_size, sizeof(int32_t), &ids_bytes)" in RUNTIME
-print("PASS overflow-safe-staging-geometry-source-gate")
+with gate('overflow-safe'):
+    # w295 geometry is rejected before pointer arithmetic/allocation and a surviving
+    # undersized XMX pointer cannot pass the capacity gate.
+    xmx_convert = region(RUNTIME, "static bool convert_tensor_layout", "static bool ggml_sycl_select_mul_mat_layout")
+    assert "ggml_sycl_checked_mul_size(info.total_bytes" in xmx_convert
+    assert "xmx_mxfp4_tiled_aos_staging_size[device_id] < aos_expert_size" in xmx_convert
+    assert xmx_convert.index("xmx_mxfp4_tiled_aos_staging_size[device_id] < aos_expert_size") < xmx_convert.index("// Always use host staging")
+    assert "ggml_sycl_checked_round_up_size(static_cast<size_t>(K), MATRIX_ROW_PADDING" in RUNTIME
+    assert "ggml_sycl_checked_mul_size(q8_blocks, sizeof(block_q8_1), &q8_bytes)" in RUNTIME
+    assert "ggml_sycl_checked_mul_size(static_cast<size_t>(N_second), sizeof(float), &second_out_bytes)" in RUNTIME
+    assert "ggml_sycl_checked_mul_size(total_batches_size, sizeof(int32_t), &ids_bytes)" in RUNTIME
+    print("PASS overflow-safe-staging-geometry-source-gate")
 
-# Graph-preload failure propagates into graph suppression, rather than logging
-# and continuing through a stale graph path.
-refresh = region(RUNTIME, "if (refresh_moe_after_pp)", "const int descriptor_moe_graph_candidates")
-assert "if (!graph_preload_moe_experts(*sycl_ctx, cgraph))" in refresh
-assert "sycl_ctx->moe_graphs_disabled = true" in refresh
-assert "use_sycl_graph                = false" in refresh
-assert "graph_unpin_moe_experts(sycl_ctx)" in refresh
-print("PASS graph-preload-bool-propagation-source-gate")
+with gate('graph-preload'):
+    # Graph-preload failure propagates into graph suppression, rather than logging
+    # and continuing through a stale graph path.
+    refresh = region(RUNTIME, "if (refresh_moe_after_pp)", "const int descriptor_moe_graph_candidates")
+    assert "if (!graph_preload_moe_experts(*sycl_ctx, cgraph))" in refresh
+    assert "sycl_ctx->moe_graphs_disabled = true" in refresh
+    assert "use_sycl_graph                = false" in refresh
+    assert "graph_unpin_moe_experts(sycl_ctx)" in refresh
+    print("PASS graph-preload-bool-propagation-source-gate")
 
-# Metadata and its derived group registry are built locally and atomically
-# swapped under both writer locks; bad_alloc preserves the old epoch.
-metadata = region(RUNTIME, "// Build both views off to the side", "// Early multi-GPU setup")
-assert "new_expert_meta" in metadata and "new_expert_groups" in metadata
-assert "catch (const std::bad_alloc &)" in metadata
-assert "std::scoped_lock lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" in metadata
-assert metadata.index("catch (const std::bad_alloc &)") < metadata.index("g_moe_expert_meta.swap")
-assert "g_expert_groups.swap(new_expert_groups)" in metadata
-print("PASS moe-metadata-atomic-publication-source-gate")
+with gate('moe-metadata'):
+    # Metadata and its derived group registry are built locally and atomically
+    # swapped under both writer locks; bad_alloc preserves the old epoch.
+    metadata = region(RUNTIME, "// Build both views off to the side", "// Early multi-GPU setup")
+    assert "new_expert_meta" in metadata and "new_expert_groups" in metadata
+    assert "catch (const std::bad_alloc &)" in metadata
+    assert "std::scoped_lock lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" in metadata
+    assert metadata.index("catch (const std::bad_alloc &)") < metadata.index("g_moe_expert_meta.swap")
+    assert "g_expert_groups.swap(new_expert_groups)" in metadata
+    print("PASS moe-metadata-atomic-publication-source-gate")
 
-# Reader side of the same contract. The writer publishing both registries under
-# one scoped_lock buys nothing if readers acquire them separately: a reader that
-# consults BOTH within one logical operation can otherwise pair one model's
-# metadata with the next model's groups, and expert_group_key carries no model
-# identity to catch it. Every such reader must go through one paired snapshot.
-snapshot = region(RUNTIME, "static moe_registry_snapshot moe_snapshot_registries", "// Residency against a caller-held")
-assert "std::scoped_lock      lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" in snapshot
-assert snapshot.index("scoped_lock") < snapshot.index("snapshot.meta   = g_moe_expert_meta")
-assert snapshot.index("snapshot.meta   = g_moe_expert_meta") < snapshot.index("snapshot.groups = g_expert_groups")
+with gate('moe-paired-snapshot'):
+    # Reader side of the same contract. The writer publishing both registries under
+    # one scoped_lock buys nothing if readers acquire them separately: a reader that
+    # consults BOTH within one logical operation can otherwise pair one model's
+    # metadata with the next model's groups, and expert_group_key carries no model
+    # identity to catch it. Every such reader must go through one paired snapshot.
+    snapshot = region(RUNTIME, "static moe_registry_snapshot moe_snapshot_registries", "// Residency against a caller-held")
+    assert "std::scoped_lock      lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" in snapshot
+    assert snapshot.index("scoped_lock") < snapshot.index("snapshot.meta   = g_moe_expert_meta")
+    assert snapshot.index("snapshot.meta   = g_moe_expert_meta") < snapshot.index("snapshot.groups = g_expert_groups")
 
-# is_expert_resident must keep a lock-free overload, or a dual reader holding a
-# paired snapshot would have to re-enter the group lock to ask about residency --
-# reading a newer epoch than the metadata it holds, and deadlocking outright if
-# the snapshot lock were still held (shared_mutex is not recursive).
-assert "static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tensor_group> & groups" in RUNTIME
-resident = region(RUNTIME, "static bool is_expert_resident(int block_id", "// Forward declarations needed by moe_prestage")
-assert "return is_expert_resident_in(g_expert_groups, block_id, expert_id, device_id)" in resident
+    # is_expert_resident must keep a lock-free overload, or a dual reader holding a
+    # paired snapshot would have to re-enter the group lock to ask about residency --
+    # reading a newer epoch than the metadata it holds, and deadlocking outright if
+    # the snapshot lock were still held (shared_mutex is not recursive).
+    assert "static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tensor_group> & groups" in RUNTIME
+    resident = region(RUNTIME, "static bool is_expert_resident(int block_id", "// Forward declarations needed by moe_prestage")
+    assert "return is_expert_resident_in(g_expert_groups, block_id, expert_id, device_id)" in resident
 
-# The two dual-consumer readers take the paired snapshot and never re-acquire
-# either mutex for the rest of the operation.
-for start, end, name in (
-    ("static void moe_prestage_popular_experts", "// SOA-correct expert caching: single-expert wrapper", "prestage"),
-    ("        // We need block_num for the residency checks", "    void worker_loop()", "rebalance"),
-):
-    block = region(RUNTIME, start, end)
-    assert "moe_snapshot_registries()" in block, name
-    assert "g_expert_groups_mutex" not in block, name
-    assert "g_moe_expert_meta_mutex" not in block, name
-    assert "is_expert_resident(" not in block, name
-print("PASS moe-registry-paired-snapshot-reader-source-gate")
+    # The two dual-consumer readers take the paired snapshot and never re-acquire
+    # either mutex for the rest of the operation.
+    for start, end, name in (
+        ("static void moe_prestage_popular_experts", "// SOA-correct expert caching: single-expert wrapper", "prestage"),
+        ("        // We need block_num for the residency checks", "    void worker_loop()", "rebalance"),
+    ):
+        block = region(RUNTIME, start, end)
+        assert "moe_snapshot_registries()" in block, name
+        assert "g_expert_groups_mutex" not in block, name
+        assert "g_moe_expert_meta_mutex" not in block, name
+        assert "is_expert_resident(" not in block, name
+    print("PASS moe-registry-paired-snapshot-reader-source-gate")
 # HM Task 2 (llama.cpp-81gt): CACHE_BACKING classification must be unforgeable.
 # `alloc_constraints.cache_backing` was a public caller-writable bool, so any
 # caller could mint the ownership class that shutdown exempts from destructive
@@ -537,8 +686,19 @@ def check_internal_backing_mint_stays_private(cache_cpp: str) -> list:
     return problems
 
 
-provenance_problems = (check_cache_backing_not_public(CACHE_HPP) + check_provenance_header_private() +
-                       check_dot_directory_skip_is_live() +
-                       check_internal_backing_mint_stays_private(CACHE))
-assert not provenance_problems, "\n".join(provenance_problems)
-print("PASS cache-backing-provenance-private-source-gate")
+
+# Four independent checks: a failure of one must not hide the others.
+with gate('cache-backing-not-public'):
+    problems = check_cache_backing_not_public(CACHE_HPP)
+    assert not problems, "\n".join(problems)
+with gate('provenance-header-private'):
+    problems = check_provenance_header_private()
+    assert not problems, "\n".join(problems)
+with gate('dot-directory-skip-is-live'):
+    problems = check_dot_directory_skip_is_live()
+    assert not problems, "\n".join(problems)
+with gate('internal-backing-mint-stays-private'):
+    problems = check_internal_backing_mint_stays_private(CACHE)
+    assert not problems, "\n".join(problems)
+
+report_gates()
