@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14am, by impl-moua-s, 2026-09-30. The revisions answer forty-three reviews:
+Design, revision 7.14an, by impl-moua-s, 2026-09-30. The revisions answer forty-four reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -258,6 +258,10 @@ Design, revision 7.14am, by impl-moua-s, 2026-09-30. The revisions answer forty-
   Minor, 5 nits), recorded in §6.54. Revision 7.14am is one commit on top of `b3ca5c991`: the
   shutdown body has its own explicit steps, which replace run (1)'s (b) and (c), and the reset
   between bodies is one clause per body.
+- design review r43 (design-moua-r43 on `b3ca5c991..840abd884`: 0 Critical, 0 Important, 1 Minor, 1
+  nit; PASS) and rulings §M116, recorded in §6.55. Revision 7.14an is one commit on top of
+  `840abd884`: the shutdown body gains step (f), a second null-backend holder call after
+  `shutdown` returns.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -9596,20 +9600,25 @@ means that.
     arm adds no hook of its own (7.14ai's "hook that closes the module without shutdown's token" was
     defined nowhere, rulings §M109 N-6): `shutdown` is a fourth protected body of the reactivation
     arm's park point, counter and primary non-strict run, and its steps REPLACE run (1)'s (b) and
-    (c) rather than inheriting them, because `shutdown` writes no admission state
-    (`gs:109883-109887`) and the holder's guard reads only the admission state and the mutation
-    count (`gs:12234-12255`), never `g_sycl_module_shutdown_started`. Setup: none, with no
-    `can_unload` and no `prepare_reactivate`, so the module stays `ACTIVE`. (a) counter == 1,
-    `shutdown` has not returned, slot [0] reads `ACTIVE` and slots [6] and [7] read 0 and 0; (b)
-    zero `[CONTEXT-PLAN-BUG]` lines from the release until after `shutdown` returns; (c) the
-    holder's return `== GGML_SYCL_LIFECYCLE_NULL_OUTPUT` (`gs:18860-18861`) and `!=
+    (c) rather than inheriting them, because `shutdown` does not write `g_sycl_module_admission`
+    (its one admission write is `g_sycl_module_shutdown_started`, under the admission mutex,
+    `gs:109883-109887`) and the holder's guard reads only the admission state and the mutation count
+    (`gs:12234-12255`), never `g_sycl_module_shutdown_started`. Setup: none, with no `can_unload`
+    and no `prepare_reactivate`, so the module stays `ACTIVE`. (a) counter == 1, `shutdown` has not
+    returned, slot [0] reads `ACTIVE` and slots [6] and [7] read 0 and 0; (b) zero
+    `[CONTEXT-PLAN-BUG]` lines from the release until after `shutdown` returns; (c) the holder's
+    return `== GGML_SYCL_LIFECYCLE_NULL_OUTPUT` (`gs:18860-18861`) and `!=
     GGML_SYCL_LIFECYCLE_PLAN_REJECTED` and `!= GGML_SYCL_LIFECYCLE_BUSY`, and it releases L0; (d)
-    `shutdown` returns; (e) slot [0] still reads `ACTIVE` and slots [6] and [7] still read 0 and 0.
-    The RED is the same, the token deleted from `shutdown`; a guard that fired on
-    `shutdown_started`, or returned another code, fails (b) or (c). `shutdown` runs last in the
-    chain: it is destructive, leaving `shutdown_started` true and the cache torn down (`gs:109971`).
-    A holder that finds the module non-ACTIVE is the reactivation bodies' `[CONTEXT-PLAN-BUG]`
-    outcome (§2.4.2), which this arm does not repeat.
+    `shutdown` returns; (e) slot [0] still reads `ACTIVE` and slots [6] and [7] still read 0 and 0;
+    (f) after `shutdown` returns, the arm calls the same null-backend holder again and scores zero
+    `[CONTEXT-PLAN-BUG]` lines and a return `== GGML_SYCL_LIFECYCLE_NULL_OUTPUT`. The RED is the
+    same, the token deleted from `shutdown`; a guard that returned another code fails (c). A guard
+    that fires on `g_sycl_module_shutdown_started` is caught only by (f): the flag is written at
+    `gs:109886`, after `shutdown` takes its token, so while the first holder is parked `shutdown` is
+    blocked at that token and has not set it, and only a call made after `shutdown` returns can see
+    the mutant. `shutdown` runs last in the chain: it is destructive, leaving `shutdown_started`
+    true and the cache torn down (`gs:109971`). A holder that finds the module non-ACTIVE is the
+    reactivation bodies' `[CONTEXT-PLAN-BUG]` outcome (§2.4.2), which this arm does not repeat.
 
   **No other context's ring (rulings §M32 I-1; replaces r4 I6, r5 I-A, r6 I-5's arms).** 7.14e
   carried four skip-L0 routes to an absent device ring (RELEASING observed at step 2, a
@@ -14637,3 +14646,14 @@ every r41 finding closed). The 23mk cites stay at `87da879f1`; the re-pin follow
 | N-3 | "its module guard is its first statement" is master's shape; the design puts the token first | **Changed.** "At master ... the design puts only the L0 token ahead of the guard (§2.4.2)". |
 | N-4 | `test_admission_snapshot` cited as `gs:110009-110022` | **Changed.** `gs:110009-110023`. |
 | N-5 | two ragged lines (the capped-cell fixture sentence, G2's VOID guard) | **Changed.** Both paragraphs reflowed. |
+
+### 6.55 Revision 7.14an: design-moua-r43
+
+Revision 7.14an is one commit on top of `840abd884`, by impl-moua-s. It answers design review r43
+(design-moua-r43 on `b3ca5c991..840abd884`: 0 Critical, 0 Important, 1 Minor, 1 nit; PASS) and
+rulings §M116. The 23mk cites stay at `87da879f1`; the re-pin follows 23mk's review.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| M-1 | "a guard that fired on `shutdown_started` fails (b) or (c)" was false: `shutdown` takes its token before the write at `gs:109886`, so while the holder is parked the flag is unset | **Changed.** The claim is kept and made true by a new step (f): after `shutdown` returns, the same null-backend holder is called again and the arm scores zero BUG lines and `== NULL_OUTPUT`. The text says only this post-shutdown call can catch a guard that reads `shutdown_started`. |
+| N-1 | "`shutdown` writes no admission state" | **Changed.** "does not write `g_sycl_module_admission`"; the one admission write, `g_sycl_module_shutdown_started` under the admission mutex, is stated. |
