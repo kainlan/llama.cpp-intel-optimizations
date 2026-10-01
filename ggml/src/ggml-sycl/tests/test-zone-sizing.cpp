@@ -534,6 +534,86 @@ int main() {
               "one path reaching the global max while the others narrow is not a collapse");
     }
 
+    // ---- Case 12: the dense MMQ/MMVQ Q8_1 src1 scratch (llama.cpp-479i) -----
+    // A dense quantized MUL_MAT quantizes its activations to Q8_1 into a scratch
+    // that nobody planned: Qwen3.6-27B on the B50 with oneDNN PP off minted 122
+    // raw device allocations (508.5 MB) of it and ran the card out. Every golden
+    // below is a size that incident logged: 512 rows * K * 36/32 plus the 32 B
+    // Q6_K scale overflow pad, K = 17408 (ffn_down) and K = 5120 (hidden).
+    {
+        size_t row = 0;
+        CHECK(ggml_sycl::zone_mmq_src1_row_bytes(17408, &row) && row == 19584,
+              "K=17408 is 544 Q8_1 blocks of 36 bytes = 19584 bytes per row");
+        CHECK(ggml_sycl::zone_mmq_src1_row_bytes(5120, &row) && row == 5760, "K=5120 is 160 blocks = 5760 bytes");
+        // K is padded to 512 before blocking: a short K costs a whole padded row.
+        CHECK(ggml_sycl::zone_mmq_src1_row_bytes(128, &row) && row == 576, "K=128 pads to 512 = 16 blocks = 576 bytes");
+        CHECK(ggml_sycl::zone_mmq_src1_row_bytes(2880, &row) && row == 3456, "K=2880 pads to 3072 = 96 blocks");
+        CHECK(!ggml_sycl::zone_mmq_src1_row_bytes(0, &row), "K=0 is not a matmul operand");
+        CHECK(!ggml_sycl::zone_mmq_src1_row_bytes(-1, &row), "a negative K is refused");
+        CHECK(!ggml_sycl::zone_mmq_src1_row_bytes(17408, nullptr), "a null out is refused");
+
+        // The exact per-op figure the dispatch computes (required_size).
+        size_t need = 0;
+        CHECK(ggml_sycl::zone_mmq_src1_required_bytes(512, 17408, false, &need) && need == 10027008,
+              "AOS ffn_down at 512 rows is the logged 10027008");
+        CHECK(ggml_sycl::zone_mmq_src1_required_bytes(512, 17408, true, &need) && need == 10027040,
+              "SOA ffn_down at 512 rows is the logged 10027040");
+        CHECK(ggml_sycl::zone_mmq_src1_required_bytes(512, 5120, false, &need) && need == 2949120,
+              "AOS hidden at 512 rows is the logged 2949120");
+        CHECK(ggml_sycl::zone_mmq_src1_required_bytes(512, 5120, true, &need) && need == 2949152,
+              "SOA hidden at 512 rows is the logged 2949152");
+        CHECK(!ggml_sycl::zone_mmq_src1_required_bytes(INT64_MAX / 2, 17408, true, &need),
+              "an overflowing row count is refused, not wrapped into a small size");
+
+        // bytes per token, which is what the inventory adapter hands the maxima.
+        size_t bpt = 0;
+        CHECK(ggml_sycl::zone_mmq_src1_bytes_per_token(17408, 1, 1, &bpt) && bpt == 19584,
+              "a 2-D weight costs one Q8_1 row per token");
+        // MLA-shaped dense 3-D weight, e.g. wk_b {qk_nope=128, kv_lora_rank=512, n_head=128}: a
+        // dense batched MUL_MAT operand whose src1 has n_tokens * n_head rows, NOT an expert stack.
+        CHECK(ggml_sycl::zone_mmq_src1_bytes_per_token(128, 128, 1, &bpt) && bpt == 576 * 128,
+              "a dense 3-D weight costs ne[2] Q8_1 rows per token");
+        CHECK(ggml_sycl::zone_mmq_src1_bytes_per_token(128, 8, 4, &bpt) && bpt == 576 * 8 * 4,
+              "ne[3] multiplies the rows as well");
+
+        // The plan figure: n_ubatch * bytes per token plus the pad, aligned to 256.
+        size_t plan = 0;
+        CHECK(ggml_sycl::zone_mmq_src1_scratch_bytes(19584, 512, &plan) && plan == 10027264,
+              "ffn_down at n_ubatch 512 plans 10027040 aligned up to 256");
+        CHECK(ggml_sycl::zone_mmq_src1_scratch_bytes(576 * 128, 512, &plan) && plan == 37748992,
+              "the MLA 3-D case at n_ubatch 512 plans 37748768 aligned up to 256");
+        CHECK(plan >= 512u * 576u * 128u, "the plan covers the exact MLA demand, it must not under-reserve it");
+        CHECK(ggml_sycl::zone_mmq_src1_scratch_bytes(0, 512, &plan) && plan == 0,
+              "a model with no dense quantized operand plans nothing");
+        CHECK(!ggml_sycl::zone_mmq_src1_scratch_bytes(SIZE_MAX / 2, 512, &plan),
+              "an overflowing plan is refused, not wrapped into a small size");
+
+        // The maximum over the inventory. The classifier is told by the adapter which
+        // tensors are dense MUL_MAT operands (field > 0); it never decides that from
+        // ne[2] > 1, which is the expert predicate and misclassifies MLA wk_b / wv_b.
+        // Names are deliberately wrong here too.
+        std::vector<zone_tensor_desc> inv;
+        zone_tensor_desc              ffn_down = desc("blk.0.attn_q.weight", 70000000, TYPE_Q6_K, 17408, 5120, 1, 1);
+        ffn_down.mmq_src1_bytes_per_token      = 19584;
+        zone_tensor_desc mla_wk_b              = desc("token_embd.weight", 9000000, TYPE_Q8_0, 128, 512, 128, 1);
+        mla_wk_b.mmq_src1_bytes_per_token      = 576 * 128;
+        // An expert stack the adapter did not mark: ne[2] is large and K is large, and it
+        // must not contribute (its own moe_q8 workspace sizes it).
+        zone_tensor_desc experts = desc("blk.0.ffn_down.weight", GPT_OSS_EXPERT_BYTES, TYPE_MXFP4, 2880, 2880, 32, 1);
+        zone_tensor_desc lm_head = desc("output.weight", MISTRAL_OUTPUT_BYTES, TYPE_Q6_K, 4096, 32000, 1, 1);
+        lm_head.mmq_src1_bytes_per_token = 4608;  // a singleton still counts: it IS a MUL_MAT src0
+        inv.push_back(ffn_down);
+        inv.push_back(mla_wk_b);
+        inv.push_back(experts);
+        inv.push_back(lm_head);
+        inv.push_back(shapeless_desc("mystery", 1, TYPE_Q4_0));
+        const path_scoped_maxima m = zone_scoped_maxima(inv);
+        CHECK(m.mmq_src1_bytes_per_token == 576 * 128,
+              "the maximum is the MLA 3-D dense operand, not the 2-D one and not the expert stack");
+        CHECK(zone_scoped_maxima(std::vector<zone_tensor_desc>()).mmq_src1_bytes_per_token == 0,
+              "an empty inventory plans no Q8 scratch");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
