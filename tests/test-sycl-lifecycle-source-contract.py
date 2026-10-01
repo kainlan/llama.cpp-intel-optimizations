@@ -115,6 +115,42 @@ raw_snapshot_reader_allowlist = (
     "const auto plan_snapshot = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
     "const auto plan = cache ? cache->get_placement_plan_snapshot() : nullptr;",
 )
+# ggml_sycl_republish_current_plan_into_empty is the design's one install path for a cache whose plan is
+# empty (zhcn-design 3.1 step 2; rulings M246 option A).  Its reads and its single writer are named roles
+# too: the emptiness predicate and the in-lock emptiness re-check both read the cache as `current`, and the
+# identity check after the install reads it as `installed`.  The writer is checked to sit in that function.
+raw_snapshot_into_empty_readers = {
+    "const auto current = cache->get_placement_plan_snapshot();": 2,
+    "const auto installed = cache->get_placement_plan_snapshot();": 1,
+}
+raw_snapshot_publication_writer = "publication.caches[i]->set_placement_plan_snapshot(publication.participates[i] ? snapshot : nullptr);"
+raw_snapshot_into_empty_writer = "cache->set_placement_plan_snapshot(participates ? selected : nullptr);"
+BACKEND_PATH = "ggml/src/ggml-sycl/ggml-sycl.cpp"
+
+
+def raw_snapshot_reader_allowlist_ok(sources, backend_text):
+    expected = len(raw_snapshot_reader_allowlist) + sum(raw_snapshot_into_empty_readers.values())
+    found = {
+        path: len(raw_snapshot_reader_re.findall(text))
+        for path, text in sources.items()
+        if raw_snapshot_reader_re.search(text)
+    }
+    return (found == {BACKEND_PATH: expected}
+            and all(backend_text.count(site) == 1 for site in raw_snapshot_reader_allowlist)
+            and all(backend_text.count(site) == n for site, n in raw_snapshot_into_empty_readers.items()))
+
+
+def raw_snapshot_writer_allowlist_ok(sources, backend_text):
+    production = "\n".join(sources.values())
+    if len(raw_snapshot_writer_re.findall(production)) != 2:
+        return False
+    if backend_text.count("set_placement_plan_snapshot") != 2:
+        return False
+    if backend_text.count(raw_snapshot_publication_writer) != 1 or backend_text.count(raw_snapshot_into_empty_writer) != 1:
+        return False
+    active = _strip_cpp_comments(backend_text)
+    at = active.find(raw_snapshot_into_empty_writer)
+    return "ggml_sycl_republish_current_plan_into_empty" in _function_containing(active, at)[:400]
 
 
 def _balanced_body(source, brace):
@@ -598,15 +634,10 @@ checks = {
     in backend
     and "authority.get() == cache.get()" in cache_hpp
     and "authority->version == cache->version" not in cache_hpp,
-    "raw snapshot reader exact allowlist": {
-        path: len(raw_snapshot_reader_re.findall(text))
-        for path, text in placement_sources.items()
-        if raw_snapshot_reader_re.search(text)
-    }
-    == {"ggml/src/ggml-sycl/ggml-sycl.cpp": 4}
-    and all(backend.count(site) == 1 for site in raw_snapshot_reader_allowlist),
-    "raw snapshot writer whitelist": len(raw_snapshot_writer_re.findall(placement_production)) == 1,
-    "same snapshot cache publication": backend.count("set_placement_plan_snapshot") == 1,
+    "raw snapshot reader exact allowlist": raw_snapshot_reader_allowlist_ok(placement_sources, backend),
+    "raw snapshot writer whitelist": raw_snapshot_writer_allowlist_ok(placement_sources, backend),
+    "same snapshot cache publication": backend.count(raw_snapshot_publication_writer) == 1
+    and "ggml_sycl_republish_current_plan_into_empty" in backend,
     "no cache plan reference accessor": "get_placement_plan(" not in cache_hpp
     and "get_placement_plan_owner(" not in cache_hpp,
     "transactional model runtime update": "g_runtime_external_lease" in backend
@@ -1460,6 +1491,9 @@ mutants = (
      "    std::thread escaped_worker([escaped_plan] { (void) escaped_plan; });"),
     ("raw return escape", "backend", raw_snapshot_reader_allowlist[0],
      raw_snapshot_reader_allowlist[0] + "\n    return cached.get();"),
+    ("raw return escape from the into_empty emptiness predicate", "backend",
+     "    const bool empty   = !current || !current->plan || current->plan->entries.empty();\n    return empty;",
+     "    return current.get() != nullptr;"),
     ("retirement helper early storage release", "cache",
      "bool unified_cache::transition_to_retired_locked(unified_cache_entry & entry) noexcept {",
      "bool unified_cache::transition_to_retired_locked(unified_cache_entry & entry) noexcept {\n"
@@ -1503,6 +1537,31 @@ for name, anchor, replacement in nodelete_mutants:
     if nodelete_moe_state_reset_ok(nodelete_mutated, wrapper_text):
         mutant_failures.append(name + ": bypass was not detected")
 
+# Negative controls for the reader and writer allowlists: each mutant adds, moves or renames one access in an
+# in-memory copy of the real backend and asserts the matching predicate goes False.
+snapshot_access_mutants = (
+    ("an unlisted cache snapshot reader", "reader",
+     backend + "\nstatic void sneaky_reader(ggml_sycl::unified_cache * other) {\n"
+     "    const auto sneaky = other->get_placement_plan_snapshot();\n    (void) sneaky;\n}\n"),
+    ("an unlisted cache snapshot writer", "writer",
+     backend + "\nstatic void sneaky_writer(ggml_sycl::unified_cache * other) {\n"
+     "    other->set_placement_plan_snapshot(nullptr);\n}\n"),
+    ("the into_empty install moved out of its function", "writer",
+     backend.replace(raw_snapshot_into_empty_writer, "(void) 0;", 1)
+     + "\nstatic void moved_writer(ggml_sycl::unified_cache * cache, bool participates, "
+     "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> selected) {\n    "
+     + raw_snapshot_into_empty_writer + "\n}\n"),
+    ("the into_empty identity read renamed out of the allowlist", "reader",
+     backend.replace("const auto installed = cache->get_placement_plan_snapshot();",
+                     "const auto reinstalled = cache->get_placement_plan_snapshot();", 1)),
+)
+for name, kind, mutated in snapshot_access_mutants:
+    sources = dict(placement_sources)
+    sources[BACKEND_PATH] = mutated
+    ok = (raw_snapshot_reader_allowlist_ok(sources, mutated) if kind == "reader"
+          else raw_snapshot_writer_allowlist_ok(sources, mutated))
+    if ok:
+        mutant_failures.append(name + ": bypass was not detected")
 if failed or mutant_failures:
     if failed:
         print("lifecycle source contract failed: " + ", ".join(failed), file=sys.stderr)

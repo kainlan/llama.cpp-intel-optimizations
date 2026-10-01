@@ -3158,7 +3158,10 @@ uint64_t ggml_sycl_into_empty_skip_key_for_test(const ggml_sycl::lifecycle::Mode
 
 static bool ggml_sycl_cache_snapshot_empty(const ggml_sycl::unified_cache * cache) {
     const auto current = cache->get_placement_plan_snapshot();
-    return !current || !current->plan || current->plan->entries.empty();
+    // A bool, not a pointer into the snapshot: it is computed while the owner is held
+    // and nothing derived from the snapshot leaves this function.
+    const bool empty   = !current || !current->plan || current->plan->entries.empty();
+    return empty;
 }
 
 // Installs the owning model's publication into ONE cache whose plan is empty.
