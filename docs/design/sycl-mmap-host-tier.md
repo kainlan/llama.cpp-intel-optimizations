@@ -1,6 +1,13 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 3n, not implemented. rev 3n is a new commit on rev 3m
+*Status: DESIGN rev 3o, not implemented. rev 3o is a new commit on rev 3n
+(`714081770`). It folds design-5efe-r11 (`6b674097e..714081770`,
+0C/0I/7m/3n) under the lead's r11 orders and the §M69 (b) amendments 1-4
+(an entry guard on the record function, a fourth case pinned to the
+moe_after site, split RETURN_TO_MARK mutants, a marked-set entry that
+leaves with its chunk, and `configure_zones` refusing over a withdrawn
+chunk); Appendix B's "design-5efe-r11" table keys each item to r11's IDs.
+rev 3n is a new commit on rev 3m
 (`6b674097e`). It folds design-5efe-r10 (`a68508606..6b674097e`,
 0C/1I/5m/8n) under the lead's r10 rulings, including the §M69 (b)
 fourth amendment (submitted executables outlive the throw); Appendix B's
@@ -1937,6 +1944,24 @@ created") describes a path that does not run.
       that is not orphaned tests one flag and does nothing more, so
       dispatch-path frees gain no lookup.
 
+      **Every release removes the chunk's marked-set entry** (r11 m-5).
+      The marked set is the device cache's, and every release of a marked
+      chunk goes through one cache-side function,
+      `release_marked_chunk(dev, chunk_idx)`: it calls
+      `release_zone_chunk` and erases that chunk's entry from the set in
+      the same step, and no code calls `release_zone_chunk` for a marked
+      chunk any other way. Its callers are the begin entry,
+      `RETURN` and `RETURN_TO_MARK`'s immediate release, the owner's end,
+      and the orphaned chunk's emptying free: `zone_free` hands the
+      chunk's index back to its caller (above), the cache's host-zone free
+      path, where the cache is reachable, and that caller calls the same
+      function after the pool's lock drops. So a released chunk is a
+      tombstone in `chunks_` and absent from the marked set at the same
+      moment, and no entry for a tombstone survives for a later begin to
+      meet. A begin's walk also skips an entry whose chunk is already a
+      tombstone, with no print, so a stale entry could not become a null
+      release or a bogus `SCRATCH return refused`.
+
       **A begin and a live owner** (r10 m-3). A begin releases every empty
       chunk in the device's marked set, whatever its owner. It leaves a
       non-empty chunk whose owner is another live context, and prints
@@ -2031,12 +2056,39 @@ created") describes a path that does not run.
       - the header's "Chunks are only released when the pool is
         destroyed" (`pinned-pool.hpp:112`) is rewritten to name this
         release;
-      - **`configure_zones` never meets a withdrawn chunk** (r10 n-3). It
-        gives every zone fresh allocators (`pp:389-417`), so it already
-        presumes no live zone allocation. Its caller first releases every
-        chunk in the device's marked set. Each is empty there by that
-        presumption, and one that is not is the same refusal by name as at
-        a begin. So neither flag has to survive the rebuild.
+      - **`configure_zones` refuses while a withdrawn chunk survives**
+        (r10 n-3, r11 m-6). It rebuilds every zone from scratch
+        (`pp:389-417`: `zone_allocators_[z].clear()` and fresh
+        `zone_chunk_state`s), so it presumes no live zone allocation, and
+        a fresh state carries neither flag. The cache's
+        `configure_host_zones` (`uc:20415-20434`) first releases every
+        chunk in the device's marked set whose allocators are empty. A
+        chunk that is not empty is still withdrawn, and
+        `configure_zones` **refuses the rebuild**: under its lock, before
+        it touches any state, it scans the zones' `zone_chunk_state`s
+        and, if any has `withdrawn` set, prints `[HOST-ARENA]
+        configure_zones refused: chunk %zu still withdrawn, %zu B
+        allocated` (WARN) and returns false. C4 changes its return type
+        from `void` to `bool`; `configure_host_zones` returns without
+        writing `host_zone_reserved_bytes_` when it gets false. A refusal
+        therefore changes nothing: the pool's zones, every flag, the marked
+        set and the reserved figures stay one consistent state. The load
+        that asked for the reconfigure fails with that line and nothing
+        re-routes (P3).
+        **Why refusing is the sound choice.** The flag's one home is the
+        `zone_chunk_state` (above), so the scan reads the one fact and the
+        cache's marked set is not consulted (P4). A rebuild would discard
+        the chunk's allocator and its live allocation while the marked set
+        still named the chunk, and the release would then meet a fresh
+        allocator in a chunk the zones' sizes did not count. Carrying the
+        flags and allocators across the rebuild is rejected: the rebuilt
+        sizes come from the new request, so a surviving allocator would be
+        a second source for the zone's capacity. The case is defensive: the
+        production plan caller (`gs:5615-5623`) returns when the zones are
+        already configured, and a withdrawn chunk exists only under
+        configured zones, so it is reachable only from a direct
+        `configure_host_zones` caller (the tests call it) or a future
+        caller.
     - **A return that finds a live allocation refuses by name.** If a
       marked chunk still holds an allocation or a lease, the release
       prints `[HOST-ARENA] SCRATCH return refused dev=%d chunk=%zu: %zu B
@@ -2200,26 +2252,81 @@ created") describes a path that does not run.
       recorded heap corruption: `sycl_exec_graph_clear_active`'s comment
       (`gs:99522-99538`, llama.cpp-dkw0 defect #4) records a glibc
       "corrupted size vs. prev_size" abort with an `exec_graph_impl`
-      destructor frame, and every other destruction site drains first
-      (`gs:99542-99545`; the MoE retirement, `gs:96549-96553`). This
-      replaces rev 3m's "unverified". So:
+      destructor frame. The clear itself drains before it destroys
+      (`gs:99542-99545`), and `invalidate_moe_segments` retires first, but
+      the retirement drains only when a retention epoch was published:
+      `moe_graph_retention_retire_exact` returns true at once at epoch 0
+      (`gs:96545-96548`), and a graph with `moe_segments` but no
+      `moe_dispatch_graphs` publishes none (`gs:97357-97359`). So not
+      every destruction site drains first (r11 m-7): the invalidate at
+      `gs:107202` and the exit at `gs:97363` (below) do not. This replaces
+      rev 3m's "unverified". So:
+      - **The entry guard** (r11 m-1). `invalidate_moe_segments`
+        (`common.hpp:6234-6244`) does not always clear: when
+        `ggml_sycl_retire_moe_graph_epoch` fails it sets
+        `moe_graphs_disabled` and returns with `moe_segments`,
+        `moe_dispatch_graphs` and `moe_segments_valid` unchanged, because
+        it will not destroy an executable whose submission may be
+        outstanding. `graph_compute` records anyway (`gs:107202`, then the
+        call at `:107206`; nothing between them reads the flag). So "the
+        context vectors are empty at the handler" is not a fact of the
+        call site, and C4 makes it one: at entry to
+        `moe_graph_record_segments`, before it declares its locals or
+        submits anything, a non-empty `moe_segments` or
+        `moe_dispatch_graphs` makes it print `[SYCL-SEG] record refused:
+        the context still holds %zu segment(s) after a failed retire`
+        (WARN) and `return false`, the caller's existing fallback (the
+        disabled flag is already set). **The invariant: the handler, and
+        the success path's move (`gs:97355-97356`), move into empty
+        vectors.** Neither destroys an old executable, and an old
+        executable is destroyed only by a successful retire or by the
+        cleanup step after the waits. The guard also repairs the success
+        path's same defect, which `gs:97355-97356` has today;
       - C4 wraps the record loop, after the two locals' declaration, in
         `try { ... } catch (...) { ...; throw; }`. The handler moves both
-        locals into `sycl_ctx->moe_segments` and `moe_dispatch_graphs`,
-        with `moe_segments_valid` false, and rethrows. Both context
-        vectors are empty there, since `graph_compute` invalidated them
-        before recording (`gs:107202`), and a vector move does not throw,
-        so the unwind that follows destroys two empty locals. The handler
-        sees every exception type from all four sites, including the inner
-        catch's rethrow (`gs:97347-97349`);
+        locals into `sycl_ctx->moe_segments` and `moe_dispatch_graphs`
+        (empty by the guard; a vector move-assignment into an empty
+        `std::allocator` vector does not throw and moves no element), sets
+        `moe_segments_valid` false explicitly (the flag may be stale-true
+        after a refused retire), and rethrows. The unwind that follows
+        destroys two empty locals;
+      - **Which exceptions reach the handler, and where each goes
+        next** (r11 m-3 (c)). The handler sees every exception type from
+        the loop's four sites, including the inner catch's rethrow
+        (`gs:97347-97349`) of a `ggml_sycl_fallback_error`, which goes to
+        `graph_compute`'s fallback catch and its cleanup step (next
+        bullet). It also sees what the inner catches do not take: a
+        `sycl::exception` or any exception from the two direct-dispatch
+        sites (`gs:97234`, `:97240`), which sit outside the per-segment
+        try, and an exception of a type the inner catches miss. Those go
+        to `graph_compute`'s `std::exception` and `...` catches
+        (`gs:107780-107787`), whose shared cleanup
+        (`ggml_backend_sycl_graph_boundary_exception_cleanup`,
+        `gs:107617-107644`) has the same queue waits and the staging
+        drain but never calls `invalidate_moe_segments`. The moved
+        executables then stay in the context, `moe_segments_valid` false,
+        until the next record's invalidate (`gs:107202`), which runs after
+        those waits. That is safe and is the cost of not widening those
+        catches; the cleanup step below is the fallback-error path's;
       - no wait at the throw site: it would precede th32's cancel step;
       - `graph_compute`'s catch destroys them in its cleanup step (next
         bullet), after th32's cancel step and after its own waits.
 
+      **Three pre-existing exits that clear without a drain** (r11 n-3).
       The inner catch's two `return false` exits (`gs:97333`, `:97350`)
-      destroy submitted locals the same way, before `graph_compute`'s
-      fallback runs. That is a pre-existing defect, reported to the lead
-      for its own ticket, and not part of this design.
+      destroy their submitted locals without a drain, before the caller's
+      block-graphlet and per-op fallback (`gs:107214-107231`); they return
+      to `graph_compute_unchecked` (`gs:107206`), not into the
+      fallback-error catch. The third is `gs:97363`: the locals were
+      already moved into the context, `moe_graph_retention_publish`
+      failed, and `invalidate_moe_segments` then runs a retire that is a
+      no-op returning true at epoch 0 (`gs:96545-96548`), so the vectors
+      clear without a drain. All three are pre-existing on master, out of
+      scope here, and tracked as **llama.cpp-7l45** (pre-existing; tracked
+      as llama.cpp-7l45); none is a 5efe fold. 5efe adds no path into any
+      of them: its six throw sites throw `ggml_sycl_fallback_error`,
+      which the inner `std::exception` catch rethrows (it is not a
+      `sycl::exception`, `common.hpp:94`).
     - **The catch's cleanup step** (r9 m-1 (c); r10 I-1, m-1). The
       transient leases are the backend context's `graph_weight_leases`
       and `graph_moe_expert_leases` (`common.hpp:7222-7223`). The unpin
@@ -2259,14 +2366,21 @@ created") describes a path that does not run.
       MoE and weight leases itself (`:99563-99564`), so the catch's unpin
       at `:107768` then runs on empty vectors; and invalidates the MoE
       segments and block graphs (`:99565-99566`). That invalidation
-      retires the MoE graph epoch first, waiting the streams of every
-      device with a retention terminal (`gs:96549-96553`). If retirement
-      fails it keeps the vectors and sets the disabled flag rather than
-      destroy an executable whose submission may be outstanding
-      (`common.hpp:6234-6238`). All of these waits run after th32's cancel
-      step, and the leases and leaf staging are released only after the
-      CPU drains (P2). A whole graph cached for another phase is dropped
-      and re-recorded at its next use.
+      retires the MoE graph epoch first, and the retirement waits the
+      streams of the devices with a retention terminal only when a
+      retention epoch was published (`gs:96545-96553`); at epoch 0 it
+      returns at once without a wait. **So the destruction is safe because
+      of the catch's own waits** (r11 m-7): `gs:107753-107764`, on the
+      same `stream()` the segments were submitted on (`gs:97311`), which
+      precede this step. The retirement is an extra drain when an epoch
+      exists, not the safety argument. If retirement fails it keeps the
+      vectors and sets the disabled flag rather than destroy an executable
+      whose submission may be outstanding (`common.hpp:6234-6238`), and
+      the next record's entry guard refuses to record over them. All of
+      these waits run after th32's cancel step, and the leases and leaf
+      staging are released only after the CPU drains (P2). A whole graph
+      cached for another phase is dropped and re-recorded at its next
+      use.
     - **Scope of the cleanup step** (r10 n-8). The step is in the catch
       that every `ggml_sycl_fallback_error` reaches, so it applies to all
       38 existing throw sites (37 in `ggml-sycl.cpp` and one at
@@ -3884,7 +3998,8 @@ I-5, §F2). It is the commit that changes every SYCL load.
       (r9 m-1 (c); r10 m-1). `moe_graph_record_segments` wraps its record
       loop in a `catch (...)` that moves `recorded_segments` and
       `recorded_moe_graphs` into the context before it rethrows (§M69 (b)
-      fourth amendment).
+      fourth amendment), and returns false at entry, before any
+      submission, while either context vector is non-empty (r11 m-1).
     - No `ggml_sycl_compute_forward(` call in the MoE segmented
       record/replay functions discards its return: each of the six goes
       through the fail-closed helper (§M69 (b) as amended; r6 m-1).
@@ -4250,7 +4365,11 @@ I-5, §F2). It is the commit that changes every SYCL load.
       which `zone_alloc` would visit first (`pp:510-521`), so the stand-in
       fits only the new chunk (r10 n-5). The ladder ends at 192 MiB, the capacity
       that 100 MiB plus the winner's 40 MiB needs, chunk-rounded, with
-      `chunk_count` at the pre-ladder count plus 1, and not at 256 MiB;
+      `chunk_count` at the pre-ladder count plus 1, and not at 256 MiB. The
+      K filler is freed at 1024's simulated scheduler destruction, with the
+      stand-in and before the settle's begin (r11 n-2); 512's settle
+      buffer, if the fixture allocates it, needs 40 MiB and fits K, which
+      is then empty, so no figure read from capacity depends on it;
     - a fixture allocation left live in the loser's chunk makes the return
       refuse by name and keeps the chunk; nothing is released under it;
     - **the cache-path window** (r8 m-1, r9 m-2): a cached candidate 1024
@@ -4277,9 +4396,15 @@ I-5, §F2). It is the commit that changes every SYCL load.
       reserve follows. A second context's begin on the device then leaves
       the chunk and prints no `SCRATCH return refused` line; the chunk is
       still withdrawn, and capacity still excludes it;
+    - **configure over a withdrawn chunk** (r11 m-6): in the same state,
+      `configure_host_zones` with new sizes refuses by name and returns
+      false; capacity, `chunk_count`, the chunk's `withdrawn` flag, the
+      marked set and `host_zone_reserved_bytes_` read as before the call.
+      After the stand-in's free and a begin, the same call succeeds;
     - **the retry's truncation** (r10 m-4): `MARK`, one chunk grown (A)
       with a stand-in live in it, `RETURN_TO_MARK`, then one more chunk
-      grown (B). Two endings:
+      grown (B). Right after `RETURN_TO_MARK` the transaction holds 0
+      chunks and A has one marked-set entry (r11 m-4). Two endings:
       - `RETURN`: A and B are each withdrawn once; after the stand-in is
         freed and the next begin runs, capacity, `chunk_count` and
         `allocated()` are back to their pre-`MARK` values;
@@ -4332,12 +4457,37 @@ I-5, §F2). It is the commit that changes every SYCL load.
     - **A begin refuses any owner's chunk** (r10 m-3): the runtime-throw
       case fails on the second context's `SCRATCH return refused dev=0
       chunk=<idx>` line.
-    - **`RETURN_TO_MARK` leaves its chunks in the set** (r10 m-4): the
-      `RETURN` ending withdraws A twice under a transition-blind
-      decrement, or double-counts it otherwise; it fails with `SCRATCH
-      capacity <wrapped> MiB exceeds the pool's allocated() <x> MiB`. The
-      `KEEP` ending un-withdraws A, which no begin then releases, and
-      fails with `chunk_count <n+2> after the begin, expected <n+1>`.
+    - **`RETURN_TO_MARK` mutants** (r10 m-4, r11 m-4), each with one
+      fault, none depending on a second fault the design's own rules
+      forbid. The host fixture reads the transaction's chunk count and
+      each chunk's marked-set entry count (`marked_entries(dev,
+      chunk_idx)`) through test accessors:
+      - (i) *chunks left in the set only* (the transition guard and the
+        `KEEP` rule intact): right after `RETURN_TO_MARK` the transaction
+        still holds A, and the test fails first with `transaction holds
+        <n> chunk(s) after RETURN_TO_MARK, expected 0`. Run on, the
+        `RETURN` ending files A in the marked set a second time and fails
+        with `chunk <idx> filed <k> times in the marked set after RETURN,
+        expected 1`;
+      - (ii) *chunks left in the set and a transition-blind decrement*:
+        fails the same first check. Run on, the `RETURN` ending withdraws
+        A twice and fails with `SCRATCH capacity <wrapped> MiB exceeds the
+        pool's allocated() <x> MiB`. It carries two faults by
+        construction, and is named so;
+      - (iii) *`KEEP` clears the withdrawn flag*: the `KEEP` ending
+        un-withdraws A, which no begin then releases, and fails with
+        `chunk_count <n+2> after the begin, expected <n+1>`.
+    - **A release leaves no marked-set entry** (r11 m-5): after the empty
+      return's release, the cache-path window's begin release and the
+      retry endings' releases, the device's marked set is empty
+      (`marked_entries(dev)` is 0), and a following begin prints nothing
+      and moves no chunk. Mutant: `release_marked_chunk` not erasing the
+      entry. It fails with `marked set holds <n> entry(ies) after the
+      release of chunk <idx>, expected 0`.
+    - **Configure over a withdrawn chunk** (r11 m-6) mutant:
+      `configure_zones` rebuilds anyway. It fails with `configure_zones
+      rebuilt over withdrawn chunk <idx>: capacity <c> after, <c0>
+      before, marked set holds <n>`.
   - RED `test-sycl-scratch-owner-end` (r9 m-5, r10 m-5; device,
     `sycl;cache;mem-handle`, `level_zero:1`, lead-run, loads no model). It
     creates a real backend with `ggml_backend_sycl_init`, drives its
@@ -4357,12 +4507,19 @@ I-5, §F2). It is the commit that changes every SYCL load.
     - **empty at free**: the stand-in is freed first, and then
       `ggml_backend_free` releases the chunk itself.
 
+    Both cases also assert, right after the release, that the device's
+    marked set is empty and that a following begin on the device prints
+    nothing (r11 m-5): the orphaned chunk's emptying free reaches the same
+    `release_marked_chunk` as every other release.
+
     Mutants, each with its message: the owner-end call removed from
     `ggml_backend_sycl_free`, which fails both cases; the orphaned-free
     branch removed, `chunk_count <n+1> after the stand-in's free, expected
     <n>`; and the empty-at-free branch removed, `chunk_count <n+1> after
     the context is freed, expected <n>: withdrawn chunk <idx> idle until
-    pool destruction`.
+    pool destruction`; and the entry left in the set by the orphaned
+    free's release, which fails the orphaned case with `marked set holds
+    <n> entry(ies) after the release of chunk <idx>, expected 0`.
   - `test-sycl-kv-demand-idx` (`sycl;host`, r3 B). A pure test of
     `kv_demand_for_layer` on a 48-layer plan with Qwen's shape: 12 FULL
     layers of 512 MiB at 262144 cells, `kv_idx_width` 128. Each carries 576
@@ -4441,26 +4598,80 @@ I-5, §F2). It is the commit that changes every SYCL load.
       the branch that needs `exec_graph`, `gs:106944`) and the fa-pointer
       drift clear (`gs:107112-107117`), and the preload and pre-allocation
       skips that a non-null `exec_graph` causes (`gs:107026-107051`).
-      **Precondition:** the seam's snapshot shows `active_exec_graph.valid`
-      set at the refusal; if an earlier path cleared it, the case is
-      VOID. The case asserts 4: the catch's cleanup step is what makes
+      **Preconditions** (r11 m-2): the seam's snapshot shows
+      `active_exec_graph.valid` set at the refusal (if an earlier path
+      cleared it, the case is VOID) and at least one lease pinned by the
+      refused call, in either vector (without it, assertion 4 passes
+      vacuously). The case asserts 4: the catch's cleanup step is what makes
       the unpin run. Mutant: that step removed. It fails with `lease
       vectors <w>+<m> non-empty after a FAILED return; active_exec_graph
       live`, where `<w>` and `<m>` are the seam's snapshot.
-    - A fourth case refuses at the **moe_after site** (`gs:97315`), whose
-      segment was submitted just before (`gs:97311`) (§M69 (b) fourth
-      amendment; r10 I-1). The seam records the number of recorded
-      executables at the throw, which must be at least 1 (precondition),
-      the size of `moe_segments` at the catch's entry, and the order of
-      the catch's steps. It asserts 1-5 and also:
-      - at the catch's entry `moe_segments` holds every executable the
-        throw had recorded: none was destroyed in the unwind;
-      - the cleanup step destroys them after th32's cancel step and after
-        both queue waits, and `moe_segments` is empty after it.
-
-      Mutant: the local unwind restored (no move). It fails with
-      `executables destroyed in the unwind: moe_segments 0 at catch
-      entry, <n> recorded at the throw`.
+    - A fourth case refuses at the **moe_after site of a recorded
+      segment** (`gs:97315`), whose executable was submitted just before
+      (`gs:97311`) (§M69 (b) fourth amendment; r10 I-1; r11 m-2, m-3). For
+      the segment being processed the seam reports its index, its
+      `moe_after`, whether its `exec_graph` is non-null, whether
+      `segment_submitted` was set, and its last recorded node
+      (`recording_node_index`); for the whole call it reports the
+      identities (pointers) of the non-null executables recorded so far.
+      It samples `moe_segments.size()` at three points: **s1**, the first
+      statement of `graph_compute`'s fallback catch; **s2**, the entry of
+      C4's cleanup step, which in source order follows th32's cancel step,
+      both queue waits, the scatter wait and the staging drain; and **s3**,
+      the exit of that step.
+      - **Preconditions; each failure is a fixture error, not a pass:**
+        (a) the seam fired at the node equal to `moe_after` of that
+        segment, and that segment's `exec_graph` is non-null and
+        `segment_submitted` was set, so exactly that segment's executable
+        is the one newly submitted at `gs:97311`; the seam compares its
+        identity with the last pointer of the recorded list, and an
+        earlier recorded segment alone does not satisfy it (a refusal at a
+        direct segment's `moe_after`, `gs:97240`, is a different site and
+        a different case); (b) the inner catch's `[SYCL-SEG] Segment %zu
+        recording failed at node %d` WARN (`gs:97343-97345`) printed for
+        that segment index, naming the segment's **last recorded node**,
+        which is not the seam's moe node (a `moe_after` throw prints
+        `recording_node_index`, not `seg.moe_after`); (c) the lease
+        snapshot shows at least one lease pinned by the refused call, as
+        in the first two cases.
+      - **Assertions, in this order:** assertion 1, then the case's entry
+        assertion **E**, then 2-5. E precedes 2-5 because, on the mutant,
+        the executables are destroyed in the unwind with their submission
+        outstanding (`gs:99522-99538`), and assertion 5's second
+        `graph_compute` on the same context can crash before the test
+        prints the predicted message. **E:** at s1, `moe_segments` holds
+        every executable the throw had recorded: none was destroyed in the
+        unwind. The others: s2 equals s1 (nothing was destroyed before the
+        cleanup step, so none before th32's cancel step or either wait),
+        and s3 is 0.
+      - **Mutants, each failing alone with its derived message; the test
+        asserts that the message quotes it:**
+        - the local unwind restored (no move): fails E with `executables
+          destroyed in the unwind: moe_segments 0 at catch entry, <n>
+          recorded at the throw`;
+        - the destruction placed before the waits
+          (`invalidate_moe_segments` called at the top of the catch, after
+          s1): fails the s2 check with `executables destroyed before the
+          waits: moe_segments <n> at catch entry, 0 at the cleanup step`.
+          s2 is sampled after th32's cancel step and both waits, so any
+          destruction before it is seen, and th32's step needs no sample
+          point of its own.
+    - A fifth case, **stale vectors** (r11 m-1), pins the entry guard. A
+      first `graph_compute` records K >= 1 executables. A seam then makes
+      `moe_graph_retention_retire_exact` fail (test binary only), so the
+      next call's `invalidate_moe_segments` (`gs:107202`) refuses, keeps
+      the vectors and sets `moe_graphs_disabled`, and the call reaches the
+      record function. **Preconditions; each failure is a fixture error:**
+      the seam's snapshot at the record function's entry shows K >= 1
+      segments, the disabled flag set, and the K executables' identities.
+      **Assertions:** the `[SYCL-SEG] record refused` WARN printed once and
+      quoting K; the call returned through the caller's fallback, with no
+      throw; and `moe_segments` still holds the same K identities after
+      it, so no old executable was destroyed while the retirement was
+      refused. Mutant: the guard removed. The record function then records
+      over the kept vectors and the success path's move destroys the K old
+      executables; it fails with `no "record refused" line while the
+      context holds <K> segment(s)`.
 
     **RED: the immediate-return mutant** (rev 3j's exit). It never reaches
     `gs:107778`, so both cases fail **first** on assertion 1, with `no
@@ -5266,7 +5477,7 @@ re-pin, folded in rev 3m:
 
 | finding | disposition | where |
 |---|---|---|
-| m-1 the seg-refusal RED's order, reach and observable | Fixed. (a) The immediate-return mutant fails first on the `gs:107778` line, and the test asserts its message quotes it; the other failures are listed for the record. (b) The recording case requires the `gs:97343-97345` WARN naming the seam's node, else fixture error. (c) The observable is the context's `graph_weight_leases` and `graph_moe_expert_leases` (`common.hpp:7222-7223`), snapshotted by the seam at the refusal; at least one lease pinned by the refused call is a precondition. The unpin is a no-op while `exec_graph` or `active_exec_graph` is live (`gs:61136-61138`), and nothing in the catch clears them before `:107768` (the quarantine and the execution release do not), so C4 amends the catch to call `sycl_exec_graph_clear_active` (`gs:99517-99550`) after its queue waits and before the unpin. A third case with a live cached `exec_graph` pins that clear. | §4.4 staging plan, §7 C4 tests and source gate |
+| m-1 the seg-refusal RED's order, reach and observable | Fixed. (a) The immediate-return mutant fails first on the `gs:107778` line, and the test asserts its message quotes it; the other failures are listed for the record. (b) The recording case requires the `gs:97343-97345` WARN naming the seam's node, else fixture error. (c) The observable is the context's `graph_weight_leases` and `graph_moe_expert_leases` (`common.hpp:7222-7223`), snapshotted by the seam at the refusal; at least one lease pinned by the refused call is a precondition. The unpin is a no-op while `exec_graph` or `active_exec_graph` is live (`gs:61136-61138`), and nothing in the catch clears them before `:107768` (the quarantine and the execution release do not), so C4 amends the catch to call `sycl_exec_graph_clear_active` (`gs:99517-99567`) after its queue waits and before the unpin. A third case with a live cached `exec_graph` pins that clear. Position and third case superseded in rev 3n (design-5efe-r10 table, m-1, m-2). | §4.4 staging plan, §7 C4 tests and source gate |
 | m-2 the window mutants cannot fire | Fixed: the base is filled before the 1 MiB request, so without withdrawal it can only land in the marked chunk; `zone_capacity` is asserted right after `RETURN`; the marks-reset mutant is scored on `chunk_count` and the missing `released` line. Every case that checks capacity also checks `chunk_count` or `allocated()`. | §7 C4 tests |
 | m-3 two decrement sites | Fixed: withdrawal is one per-chunk flag and the one decrement of `zones_[zi].size`; `release_zone_chunk` requires it and does not decrement again; `zone_used`, the segmented early check, `zone_alloc`, `zone_alloc_segmented` and `zone_largest_free_block` all exclude withdrawn chunks. The RED computes sums only and asserts capacity never exceeds `allocated()`, with a double-decrement mutant. | §4.4 staging plan, §7 C4 tests and source gate |
 | m-4 a zero-chunk `returned` line | Fixed: at zero chunks `kept`, `returned` and `released` print nothing, and the own transaction's `KEEP` prints only on growth. Step 4 counts only a `returned` line with at least 1 chunk, else VOID, lists all four pre-`OPEN` losses (`lc:1530-1534` added), and states that the sub-criterion may VOID on Mistral, with the host RED as §M75's binding evidence. | §4.4 staging plan, §7 C4 step 4 |
@@ -5289,7 +5500,7 @@ folded in rev 3n:
 
 | finding | disposition | where |
 |---|---|---|
-| I-1 the unwind destroys submitted executables (§M69 (b) fourth amendment) | Fixed: `moe_graph_record_segments` wraps its record loop in a `catch (...)` that moves `recorded_segments` and `recorded_moe_graphs` (`gs:97159-97160`) into the context before rethrowing, from all four sites (direct `gs:97234`, `:97240`; recording `gs:97285`; moe_after `gs:97315`). The catch's cleanup step destroys them after th32's cancel step and its own waits. No wait at the throw site. The evidence is `gs:99522-99538` (dkw0 #4), which replaces "unverified". New fourth seg-refusal case at the moe_after site, with the local-unwind mutant. The inner catch's `return false` exits (`gs:97333`, `:97350`) have the same shape and were reported to the lead for their own ticket. | §4.4 staging plan, §7 C4 tests and source gate |
+| I-1 the unwind destroys submitted executables (§M69 (b) fourth amendment) | Fixed: `moe_graph_record_segments` wraps its record loop in a `catch (...)` that moves `recorded_segments` and `recorded_moe_graphs` (`gs:97159-97160`) into the context before rethrowing, from all four sites (direct `gs:97234`, `:97240`; recording `gs:97285`; moe_after `gs:97315`). The catch's cleanup step destroys them after th32's cancel step and its own waits. No wait at the throw site. The evidence is `gs:99522-99538` (dkw0 #4), which replaces "unverified". New fourth seg-refusal case at the moe_after site, with the local-unwind mutant. The inner catch's `return false` exits (`gs:97333`, `:97350`) have the same shape; they are pre-existing and tracked as llama.cpp-7l45 (rev 3o, design-5efe-r11 n-3). The premise that the context vectors are empty at the handler is enforced by an entry guard in rev 3o (design-5efe-r11 m-1). | §4.4 staging plan, §7 C4 tests and source gate |
 | m-1 the clear's position, wrapping and body | Fixed: one step immediately after `gs:107767` and before `:107768`, wrapped `try/catch (...)`; it calls the clear when whole-graph state is live, else `invalidate_moe_segments`. The clear's real body (`gs:99517-99567`) is described: its own unpin (`:99563-99564`), the input and leaf staging clears (`:99560`, `:99562`), and the MoE retirement waits (`gs:96549-96553`), all after th32's cancel step. | §4.4 staging plan, §7 C4 source gate |
 | m-2 the third case can pass vacuously | Fixed: the seam sets `active_exec_graph.valid` alone, and the snapshot showing it set at the refusal is a precondition, else VOID; the miss-path and fa-drift clears need `exec_graph` and so cannot run first. | §7 C4 tests |
 | m-3 a runtime throw leaves an empty chunk idle | Fixed: `RETURN` and `RETURN_TO_MARK` release every empty returned chunk at once; a non-empty one stays withdrawn until its owner's next begin or end. A begin leaves another live owner's non-empty chunk silently; `return refused` prints only at the owner's own begin. The runtime throw (`lc:3178`, `:2891`, with `lc:1998` and `lc:5733-5742`) is stated. New host cases: the empty return and the runtime throw with the context kept, each with a mutant. | §4.4 staging plan, §7 C4 tests |
@@ -5297,9 +5508,25 @@ folded in rev 3n:
 | m-5 the owner-end wiring is not pinned | Fixed: the gate pins the owner-end call in `ggml_backend_sycl_free` before `delete sycl_ctx` (`gs:84119`), and `sched_reserve`'s `RETURN` on a throw and `KEEP` on success. The owner-end cases move to a device RED, `test-sycl-scratch-owner-end`, which frees through `ggml_backend_free`, with the orphaned and empty-at-free cases and three mutants. | §7 C4 tests and source gate |
 | n-1 cites | Fixed: the clear's wait `gs:99543`, its body `gs:99517-99567`, `~llama_context` `lc:1066-1107`, and the execution release `gs:15608-15637` calling the tracking helper at `:15632`. | §4.4 staging plan |
 | n-2 where `orphaned` lives | Fixed: `withdrawn` and `orphaned` both live on the chunk's `zone_chunk_state`; the marked set holds only the owner; `zone_free` tests the flag on the entry it already found (`pp:536-541`), with no cache lookup. | §4.4 staging plan |
-| n-3 `configure_zones` drops the flag | Fixed: its caller releases every marked chunk first, since the rebuild (`pp:389-417`) already presumes no live zone allocation; a non-empty one refuses by name. | §4.4 staging plan |
+| n-3 `configure_zones` drops the flag | Fixed: its caller releases every marked chunk first, since the rebuild (`pp:389-417`) already presumes no live zone allocation; a non-empty one refuses by name. Superseded in rev 3o: `configure_zones` itself refuses the rebuild while a withdrawn chunk survives (design-5efe-r11 m-6). | §4.4 staging plan |
 | n-4 the window mutant's first failure | Fixed: the right-after-`RETURN` capacity check fails first, and the test asserts that the message quotes it. | §7 C4 tests |
 | n-5 "fits only that chunk" | Fixed: candidate 512's kept chunk is filled too. | §7 C4 tests |
 | n-6 step 4's zero without liveness | Fixed: the `return refused` absence is informative only beside a counted `returned` line, otherwise reported as not exercised. | §7 C4 step 4 |
 | n-7 `trial` on non-trial lines | Fixed: the line names its transaction, `trial`, `reserve` or `retry`; step 4 counts only `trial` lines. | §4.4 staging plan, §7 C4 step 4 |
 | n-8 the cleanup step's scope | Fixed: it applies to all 38 throw sites (37 in `ggml-sycl.cpp`, one at `getrows.cpp:291`), and that is intended. | §4.4 staging plan |
+
+**design-5efe-r11** (`6b674097e..714081770`, 0C/0I/7m/3n), with the lead's
+r11 orders and the §M69 (b) amendments 1-4, folded in rev 3o:
+
+| finding | disposition | where |
+|---|---|---|
+| m-1 the handler's premise "the vectors are empty" | Fixed: `invalidate_moe_segments` keeps the vectors after a failed retire (`common.hpp:6234-6244`), and `graph_compute` records anyway (`gs:107202`, `:107206`). The record function gets an entry guard: a non-empty `moe_segments` or `moe_dispatch_graphs` prints a WARN and returns false before any submission. The stated invariant is that the handler, and the success path's move, move into empty vectors, so old executables are destroyed only by a successful retire or the cleanup step after the waits. New fifth seg-refusal case (stale vectors) with a guard-removed mutant. | §4.4 staging plan, §7 C4 tests and source gate |
+| m-2 the fourth case's site and case 3's lease | Fixed: the fourth case's preconditions are per-segment (the seam fired at the segment's `moe_after`, its `exec_graph` non-null and `segment_submitted` set, its executable the last recorded identity), the WARN scored is the segment's last recorded node (`gs:97343-97345`), and cases 3 and 4 carry the lease >= 1 precondition. | §7 C4 tests |
+| m-3 the fourth case's order, a mutant for the waits, the exception types | Fixed: E (entry assertion) runs right after assertion 1 and before 2-5, and its mutant quotes `executables destroyed in the unwind`. s1, s2 and s3 sample `moe_segments`; a destruction before the waits has its own mutant and message. The non-fallback exception types, which leave the moved executables in the context until the next record's invalidate (`gs:107780-107787`, `:107617-107644`), are stated. | §4.4 staging plan, §7 C4 tests |
+| m-4 the `RETURN_TO_MARK` mutants | Fixed: three mutants, each with one fault and its derived message (chunks left in the set only, observed by the transaction's chunk count and the marked-set entry count; chunks left plus a transition-blind decrement; `KEEP` clearing the flag). | §7 C4 tests |
+| m-5 a marked-set entry outliving its chunk | Fixed: every release goes through `release_marked_chunk`, which erases the entry in the same step, including the orphaned free's caller; a begin skips tombstones. New assertions in the host RED and the owner-end RED, with an entry-left mutant. | §4.4 staging plan, §7 C4 tests |
+| m-6 `configure_zones` over a non-empty marked chunk | Fixed: it refuses the rebuild by name while any zone's `zone_chunk_state` has `withdrawn` set, returning false (C4 changes `void` to `bool`), and `configure_host_zones` leaves its reserved figures untouched. Flags carried across is rejected as a second source for capacity. The case is defensive (the plan caller returns when zones are configured, `gs:5615-5623`). New host case with a rebuild-anyway mutant. | §4.4 staging plan, §7 C4 tests |
+| m-7 the retirement credited as the drain | Fixed: the destruction is safe because of the catch's own waits (`gs:107753-107764`); the retirement drains only when an epoch exists (`gs:96545-96548`). "Every other destruction site drains first" is dropped. | §4.4 staging plan |
+| n-1 Appendix row cite | Fixed: the r9 m-1 row cites `gs:99517-99567` and notes the supersession in rev 3n. | Appendix B |
+| n-2 the K filler | Fixed: freed at 1024's simulated scheduler destruction, before the settle's begin. | §7 C4 tests |
+| n-3 the return-false paragraph | Fixed: the two inner exits and `gs:97363` (publish failure, then a no-op retire at epoch 0) are listed as pre-existing, tracked as llama.cpp-7l45, not 5efe folds; the "before the fallback" wording now says before the caller's block-graphlet and per-op fallback. | §4.4 staging plan |
