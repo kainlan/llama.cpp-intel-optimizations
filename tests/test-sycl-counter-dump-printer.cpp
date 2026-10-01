@@ -128,6 +128,45 @@ int main(int argc, char ** argv) {
         unsetenv("GGML_SYCL_EXT_ALLOC_TRACE");
     }
 
+    // --- the raw exit's accounting --------------------------------------------------------------
+    // The counters count at every raw exit, whatever the environment says: later fixtures read
+    // ext_alloc_count without setting anything, and a constant 0 would make "does not move" vacuous.
+    // This runs first, with GGML_SYCL_COUNTER_DUMP unset, before anything can have read and cached
+    // it. Device 7 is never printed by the dump section below, so its counts do not disturb it.
+    {
+        static_assert(GGML_SYCL_MAX_DEVICES > 7, "the raw-exit arm uses device 7");
+        unsetenv("GGML_SYCL_COUNTER_DUMP");
+        const int         dev    = 7;
+        const uint64_t    count0 = unified_cache_ext_alloc_count_for_testing(dev);
+        const uint64_t    arena0 = unified_cache_ext_alloc_arena_count_for_testing(dev);
+        const std::string out    = capture_stderr([&] {
+            unified_cache_note_raw_exit(dev, 4096);
+            unified_cache_note_raw_exit(dev, 8192);
+            unified_cache_note_raw_exit(dev, 1);
+        });
+        check(unified_cache_ext_alloc_count_for_testing(dev) == count0 + 3,
+              "a raw exit increments ext_alloc_count whatever the environment says");
+        check(unified_cache_ext_alloc_arena_count_for_testing(dev) == arena0,
+              "ext_alloc_arena does not move while the device's arena is not active");
+        unified_cache_dump_arena_active_for_testing(dev, true);
+        const std::string arena_out = capture_stderr([&] { unified_cache_note_raw_exit(dev, 64); });
+        unified_cache_dump_arena_active_for_testing(dev, false);
+        check(unified_cache_ext_alloc_count_for_testing(dev) == count0 + 4 &&
+                  unified_cache_ext_alloc_arena_count_for_testing(dev) == arena0 + 1,
+              "a raw exit while the arena is active also increments ext_alloc_arena");
+        size_t lines_for_dev = 0;
+        for (const auto & l : split_lines(out + arena_out)) {
+            if (l.compare(0, 20, "[EXT-ALLOC] dev=7 ar") == 0) {
+                lines_for_dev++;
+            }
+        }
+        if (trace_on) {
+            check(lines_for_dev == 4, "under the trace, each raw exit prints one [EXT-ALLOC] line (count == lines)");
+        } else {
+            check((out + arena_out).empty(), "without the trace a raw exit counts and prints nothing");
+        }
+    }
+
     const size_t n_counters  = sizeof(k_counter_names) / sizeof(k_counter_names[0]);
     const size_t n_snapshots = sizeof(k_snapshot_names) / sizeof(k_snapshot_names[0]);
 

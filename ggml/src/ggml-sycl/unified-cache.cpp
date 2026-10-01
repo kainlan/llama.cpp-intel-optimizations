@@ -4105,8 +4105,7 @@ dump_key_slot & dump_key_for(dump_counter_state & c, const char * key) {
     return c.keys[n];
 }
 
-// GGML_SYCL_COUNTER_DUMP=1. Read live (not cached) so a test can flip it; the raw exit caches its
-// own read, because it asks on every allocation.
+// GGML_SYCL_COUNTER_DUMP=1. Read live, not cached, so a test can flip it.
 bool counter_dump_requested() {
     const char * env = std::getenv("GGML_SYCL_COUNTER_DUMP");
     return env != nullptr && std::atoi(env) != 0;
@@ -4184,6 +4183,12 @@ uint64_t unified_cache_dump_counter_for_testing(dump_counter counter, int dev) n
         return 0;
     }
     return dump_tbl().counters[static_cast<size_t>(counter)].total[dev].load(std::memory_order_relaxed);
+}
+
+void unified_cache_dump_arena_active_for_testing(int dev, bool active) noexcept {
+    if (dump_dev_valid(dev)) {
+        dump_tbl().arena_active[dev].store(active, std::memory_order_release);
+    }
 }
 
 uint64_t unified_cache_ext_alloc_count_for_testing(int dev) noexcept {
@@ -19622,36 +19627,15 @@ const weight_entry * unified_cache_lookup_expert(int device_id, ggml_sycl_cache_
 // All consumer code must route through these functions (or higher-level cache APIs).
 // unified-cache.cpp owns raw sycl::malloc_* and sycl::free calls.
 
-// Every raw device exit except the arena backing passes through here: unified_alloc
-// (through the tracked wrapper), ensure_cached, ensure_cached_alloc and allocate(tag).
-// The arena backing calls sycl_aligned_malloc_device directly and is in neither the
-// line nor the counter. The counters are lock-free, because this runs under the cache's
-// own locks, and count only while GGML_SYCL_COUNTER_DUMP or GGML_SYCL_EXT_ALLOC_TRACE is set.
-void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue) {
-    void * ptr = nullptr;
-    try {
-        ptr = sycl_aligned_malloc_device(size, queue);
-    } catch (...) {
-        return nullptr;
-    }
-    if (ptr == nullptr) {
-        return ptr;
-    }
-
-    // The counter exists for the dump and the trace line; with neither requested nothing here
-    // resolves a device id (that lookup takes the dpct device-manager mutexes, and this runs under
-    // the cache's own locks). The counter therefore reads 0 unless one of the two is on.
-    static const bool dump_requested = counter_dump_requested();
-    const bool        trace          = ext_alloc_trace_enabled();
-    if (!dump_requested && !trace) {
-        return ptr;
-    }
-    int dev = -1;
-    try {
-        dev = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
-    } catch (...) {
-        dev = -1;
-    }
+// The raw exit's accounting, split from the allocation so a host test can run it without a device:
+// counts, unconditionally, ext_alloc_count (and ext_alloc_arena while the device's arena is active) and, under
+// GGML_SYCL_EXT_ALLOC_TRACE=1, prints one [EXT-ALLOC] line. Lock-free, because the raw layer runs
+// under the cache's own locks.
+void unified_cache_note_raw_exit(int dev, size_t size) noexcept {
+    // Counted at every raw exit, whatever GGML_SYCL_COUNTER_DUMP and GGML_SYCL_EXT_ALLOC_TRACE say:
+    // the variables select the printers, and a fixture that reads the counter without setting either
+    // must see it move. (scripts/check-sycl-counter-dump.py pins that nothing returns before this.)
+    const bool trace = ext_alloc_trace_enabled();
     const bool arena = dump_dev_valid(dev) && dump_tbl().arena_active[dev].load(std::memory_order_acquire);
     unified_cache_dump_counter_add(dump_counter::ext_alloc_count, dev);
     if (arena) {
@@ -19679,6 +19663,35 @@ void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue) {
                          dev, arena ? 1 : 0, size, tag, total_now);
         }
     }
+}
+
+// Every raw device exit except the arena backing passes through here: unified_alloc
+// (through the tracked wrapper), ensure_cached, ensure_cached_alloc and allocate(tag).
+// The arena backing calls sycl_aligned_malloc_device directly and is in neither the
+// line nor the counter.
+void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue) {
+    void * ptr = nullptr;
+    try {
+        ptr = sycl_aligned_malloc_device(size, queue);
+    } catch (...) {
+        return nullptr;
+    }
+    if (ptr == nullptr) {
+        return ptr;
+    }
+
+    // The device id is resolved on every raw exit, trace or not. The lookup takes the dpct
+    // device-manager mutexes under whatever cache lock the caller holds; that is acceptable here
+    // (a raw exit is the slow path that already crossed into the driver) and is what lets the
+    // counter be unconditional. It must not throw out of an allocator, so a failure is dev -1,
+    // which the counter table ignores.
+    int dev = -1;
+    try {
+        dev = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
+    } catch (...) {
+        dev = -1;
+    }
+    unified_cache_note_raw_exit(dev, size);
     return ptr;
 }
 

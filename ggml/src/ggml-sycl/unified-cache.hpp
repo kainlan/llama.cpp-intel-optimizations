@@ -7339,6 +7339,13 @@ void unified_cache_dump_set_device_count(int device_count) noexcept;
 // Registered with std::atexit; prints only when GGML_SYCL_COUNTER_DUMP=1.
 void unified_cache_test_counter_dump();
 
+// The raw exit's accounting, split out of unified_cache_raw_malloc_device so a host test can run it
+// without a device. Counts ext_alloc_count, and ext_alloc_arena while the device's arena is active;
+// under GGML_SYCL_EXT_ALLOC_TRACE=1 also prints the [EXT-ALLOC] line.
+void unified_cache_note_raw_exit(int dev, size_t size) noexcept;
+// Sets the arena-active mirror the raw exit reads, without an arena, for a host test.
+void unified_cache_dump_arena_active_for_testing(int dev, bool active) noexcept;
+
 uint64_t unified_cache_dump_counter_for_testing(dump_counter counter, int dev) noexcept;
 uint64_t unified_cache_ext_alloc_count_for_testing(int dev) noexcept;
 uint64_t unified_cache_ext_alloc_arena_count_for_testing(int dev) noexcept;

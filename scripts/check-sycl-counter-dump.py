@@ -114,7 +114,9 @@ FORMAT_STRINGS = [
     "[SYCL-COUNTER] end devices=%d",
 ]
 
+# The zone allocator's free-space figures need the zone's group mutex, which a refusal does not hold.
 ZONE_ALLOCATOR_FIGURES = ["zone_available", "zone_largest_free"]
+CHOKEPOINT_CACHE_READS = ["zone_used", "zone_capacity"]
 
 PRINTER = "unified_cache_test_counter_dump"
 SRC_EXT = (".cpp", ".hpp", ".h", ".c", ".inc")
@@ -510,14 +512,36 @@ def check(files, cmake):
         elif not any(m.group(2) == "false" for m in note_re.finditer(body)):
             fails.append(f"H13 M74(m): {fn} does not clear the arena-active mirror")
 
+    # The raw exit counts at every raw exit: nothing returns before the first counter increment.
+    note = function_text(cache_text, "unified_cache_note_raw_exit")
+    if note is None:
+        fails.append("H13 M74(r): unified_cache_note_raw_exit not found")
+    else:
+        count_at = note.find("dump_counter::ext_alloc_count")
+        ret_at = note.find("return")
+        if count_at < 0:
+            fails.append("H13 M74(r): unified_cache_note_raw_exit does not count ext_alloc_count")
+        elif 0 <= ret_at < count_at:
+            fails.append("H13 M74(r): unified_cache_note_raw_exit returns before counting, so ext_alloc_count "
+                         "reads 0 on a run that sets neither environment variable")
+
     # The chokepoint reads no allocator free-space figure, in its body or at any call.
     choke = function_text(cache_text, "unified_cache_zone_refusal")
     if choke is None:
         fails.append("H13 M74(c): unified_cache_zone_refusal not found")
     else:
-        for fig in ZONE_ALLOCATOR_FIGURES:
-            if re.search(r"\b" + fig + r"\s*\(", choke):
-                fails.append(f"H13 M74(c): the chokepoint reads {fig}, which needs the zone group mutex")
+        # An allow-list, so a figure nobody thought to name cannot slip in: the body may read the cache
+        # only through zone_used and zone_capacity (an atomic and a field fixed at arena creation), and
+        # only after the trace gate.
+        gate = re.search(r"if\s*\(\s*!\s*ext_alloc_trace_enabled\s*\(\s*\)\s*\)", choke)
+        for m in re.finditer(r"\bcache\s*->\s*(\w+)", choke):
+            if m.group(1) not in CHOKEPOINT_CACHE_READS:
+                fails.append(f"H13 M74(c): the chokepoint reads cache->{m.group(1)}, outside its allow-list "
+                             f"{CHOKEPOINT_CACHE_READS}")
+            elif gate is None or m.start() < gate.start():
+                fails.append(f"H13 M74(c): the chokepoint reads cache->{m.group(1)} before the trace gate")
+        if re.search(r"\ballocator\b|\blargest_free", choke):
+            fails.append("H13 M74(c): the chokepoint reaches a zone allocator")
     for rel, text in stripped.items():
         for m in re.finditer(r"\bunified_cache_zone_refusal\s*\(([^;]*)\)\s*;", text):
             for fig in ZONE_ALLOCATOR_FIGURES:
@@ -765,9 +789,21 @@ def mutation_matrix(files, cmake):
         muts.append((label, f"H13 M74(m): {qualified} does not clear the arena-active mirror",
                      with_cache(cache_raw[:k] + cache_raw[k + len(clear):]), cmake))
 
+    # The raw exit's accounting gated on the environment again.
+    arena_read = "const bool arena = dump_dev_valid(dev) && dump_tbl().arena_active[dev]"
+    muts.append(("raw exit gated on the trace", "H13 M74(r): unified_cache_note_raw_exit returns before counting",
+                 with_cache(cache_raw.replace(arena_read, "if (!ext_alloc_trace_enabled()) {\n        return;\n    }\n    " + arena_read, 1)),
+                 cmake))
+
     # The chokepoint reads an allocator figure, in its body and at a call.
-    muts.append(("chokepoint reads zone_largest_free", "H13 M74(c): the chokepoint reads zone_largest_free",
+    muts.append(("chokepoint reads zone_largest_free", "H13 M74(c): the chokepoint reads cache->zone_largest_free",
                  with_cache(cache_raw.replace("cache->zone_used(zone)", "cache->zone_largest_free(zone)", 1)), cmake))
+    muts.append(("chokepoint reads an unnamed figure", "H13 M74(c): the chokepoint reads cache->zone_free_bytes",
+                 with_cache(cache_raw.replace("cache->zone_used(zone)", "cache->zone_free_bytes(zone)", 1)), cmake))
+    anchor = "    const alloc_constraints & constraints = req.intent.constraints;\n    if (constraints.cascade_step) {"
+    muts.append(("chokepoint reads the cache before the trace gate",
+                 "H13 M74(c): the chokepoint reads cache->zone_used before the trace gate",
+                 with_cache(cache_raw.replace(anchor, "    (void) cache->zone_used(zone);\n" + anchor, 1)), cmake))
     muts.append(("call passes zone_available", "H13 M74(c): a call of the chokepoint passes zone_available",
                  with_cache(cache_raw.replace("unified_cache_zone_refusal(req, zid, alloc_size, cache);",
                                               "unified_cache_zone_refusal(req, zid, alloc_size, cache->zone_available(zid));",
