@@ -478,6 +478,18 @@ if (BUILD_TESTING)
     # sweep's memory-hazard denylist (see CLAUDE.md's ctest denylist warning).
     set_tests_properties(sycl-host-zone-config-source-contract PROPERTIES
         LABELS "sycl;host-arena;host;source-contract")
+    # llama.cpp-38af: pins the dedicated CPU-activation buft that makes sched
+    # copy CPU-produced activations into planned device memory instead of
+    # letting a SYCL op read pinned host memory raw. --self-test proves each
+    # check flips on a mutant, so a drifted anchor cannot pass vacuously.
+    add_test(NAME sycl-cpu-activation-buft-source
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-cpu-activation-buft-source.py
+            --self-test)
+    # Deliberately NOT labelled "cache"/"mem-handle": text-only, allocates
+    # nothing, opens no device.
+    set_tests_properties(sycl-cpu-activation-buft-source PROPERTIES
+        LABELS "sycl;host;source-contract")
     add_test(NAME sycl-private-cpu-traits-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-cpu-traits-source.py)
     add_test(NAME sycl-fallback-propagation
