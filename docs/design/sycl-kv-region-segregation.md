@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14y, by impl-moua-s, 2026-09-30. The revisions answer thirty-three reviews:
+Design, revision 7.14z, by impl-moua-s, 2026-09-30. The revisions answer thirty-four reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -189,6 +189,12 @@ Design, revision 7.14y, by impl-moua-s, 2026-09-30. The revisions answer thirty-
   §3.2's measurement is a one-off print, its step 4 is unconditional and re-runs F3 at the
   re-pinned bound (§M80 (d)), the WARN's node half is scored only after the re-pin, and H7 (as)
   gains a clause on the finalize's record move.
+- design review r33 (design-moua-r33 on `019f064b4..d7cf431f4`: 0 Critical, 0 Important, 4
+  Minor, 2 nits), recorded in §6.42. Revision 7.14z is one commit on top of `d7cf431f4`: the
+  dedupe table is pre-reserved fixed storage that fails loud when full, §3.2's measurement is
+  keyed by selector and is VOID when empty, the finalize's record move has a pinned form with
+  witnesses, a closing check reads the node half after the re-pin, and the 23mk re-pin to
+  `3bd662261` (rulings §M79 (b), §M78): the routed call's out-parameter and the `txn` pairing.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -1052,7 +1058,7 @@ written:
     (A2), and 23mk's teardown clear names it. It lies in the shared zone like every range a
     transaction records (rulings §M32 I-2; 23mk 4.8a puts it on the RUNTIME TLSF, relayed,
     §6.22). Its commit line is §M30's
-    `[CONTEXT-PLAN] graph scratch range: ctx=%u dev=%d term=ONEDNN_GRAPH_SCRATCH backing=%s
+    `[CONTEXT-PLAN] graph scratch range: ctx=%u dev=%d txn=%u term=ONEDNN_GRAPH_SCRATCH backing=%s
     offset=%zu bytes=%zu admitted=%u of %u layers`, whose suffix, added from (b2) with the
     prefix byte-identical, is the admission witness the SDPA counts are scored against
     (rulings §M71 (b));
@@ -2663,40 +2669,48 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    use (a capture compares nothing, above), before the ordering decision, it
                    tests `use.n_ubatch > bound.n_ubatch || use.graph_nodes > bound.graph_nodes`.
                    An in-bound use takes no lock. An out-of-bound use takes the entry's
-                   `w_order_warn_mutex`, inserts `use.ctx_id` into the entry's
-                   `w_order_warned_ctx` set and keeps the insert's `bool`, and on every
-                   out-of-bound use sets the entry's `std::atomic<bool> w_order_out_of_bound`
-                   flag with a release store. It then **releases the mutex and prints after it
-                   (rulings §M80 (c); r31 m-3)**: if the insert was new, it prints
-                   `[W-ORDER] shape above the measured tail bound on device %d: n_ubatch=%u
-                   graph_nodes=%zu bound=%u/%zu` at WARN, once per (`use.ctx_id`, device).
-                   **`w_order_warn_mutex` is a leaf (r30 n-3).** Two threads' first uses can
-                   reach the insert together, since Form M holds no mutex for the ordering
-                   decision. The mutex is held only for the insert and the flag store, never
-                   across a submit, and nothing is taken under it: the print is after it, so the
-                   installed log callback (`common_log::add` takes its own mutex in every llama
-                   tool) never runs under the lock. That is the contract's rule for its strict-leaf
-                   ledger lock, which bars logging and also allocation
-                   (`sycl-canonical-memory-architecture.md:1551-1553`); this mutex keeps the
-                   first half (r32 n-3). **The choice:** the set's insert can allocate a node
-                   under the mutex, and that allocation is host bookkeeping, not a unified-cache
-                   allocation. It runs before the use's thread-local flag is set, so it is
-                   outside the strict-mode span, and the mutex is a leaf in lock-order terms
-                   only (nothing is acquired under it), not under the ledger lock's stricter
-                   rule. It is not pre-reserved. It is taken before the ordering decision, so it
-                   never nests with Form E's W-order mutex. §2.10's L7 row lists it. A cap
+                   `w_order_warn_mutex`, scans the entry's `w_order_warned_ctx` for
+                   `use.ctx_id`, stores it if absent and there is room, keeps the result as one
+                   `bool`, `print`, and on every out-of-bound use sets the entry's
+                   `std::atomic<bool> w_order_out_of_bound` flag with a release store. It then
+                   **releases the mutex and prints after it (rulings §M80 (c); r31 m-3)**: if
+                   `print`, it prints `[W-ORDER] shape above the measured tail bound on device
+                   %d: n_ubatch=%u graph_nodes=%zu bound=%u/%zu` at WARN, once per
+                   (`use.ctx_id`, device) while the table has room. **`w_order_warned_ctx` is
+                   fixed storage (r33 m-1; rulings §M80 (c) and the lead's r33 fold):** a
+                   `uint64_t[16]` and a count, sized when the entry is constructed, so the scan
+                   and store allocate nothing. **A full table fails loud:** with 16 ids stored,
+                   `print` is true for every id not found, nothing is stored, and every later
+                   out-of-bound use of a 17th or later id prints, with no dedupe. A full table is
+                   never read as "already warned", since that would fail open.
+                   **`w_order_warn_mutex` is a strict leaf (r30 n-3; r33 m-1).** Two threads' first uses can
+                   reach the scan together, since Form M holds no mutex for the ordering
+                   decision. The mutex is held only for the scan, the store and the flag store,
+                   never across a submit, and it is held to the contract's strict-leaf standard
+                   for its ledger lock, "never held while any other lock is acquired, and no
+                   allocation, device work or logging happens under it"
+                   (`sycl-canonical-memory-architecture.md:1551-1553`): nothing is acquired under
+                   it; the fixed storage allocates nothing; no device work happens; and the print
+                   is after it, so the installed log callback (`common_log::add` takes its own
+                   mutex in every llama tool) never runs under the lock. It is taken before the
+                   ordering decision, so it never nests with Form E's W-order mutex. §2.10's L7
+                   row lists it. A cap
                    with the flag set aborts with its own message, `[W-ORDER] marker wait capped
                    on device %d outside the measured tail bound: re-measure G0 F3 at this
                    shape`, so an out-of-bound fault is never read as a lost publisher, and an
                    in-bound one keeps the message below. **Where the WARN's zero is scored (r32
-                   m-3).** G2's bound cell (§3.2) scores it: its cell (c) reads zero `shape above`
-                   lines inside the bound, and the cell is the positive control for the line and
-                   separates the two abort messages (r28 m-4). Any other arm key line that reads
-                   the `[W-ORDER] shape above` count names this rule: the node half of that
-                   reading is scorable only on a tree that contains §3.2's re-pin commit. On an
-                   earlier tree, where the node bound is G0's provisional `N_prov`, that half is
-                   VOID, never unscored and never a pass, and a WARN on a model arm there is
-                   information for §3.2's step 3, not a failure. The
+                   m-3).** G2's bound cell (§3.2) scores the `n_ubatch` half only: every G2
+                   child passes `graph_nodes` 0, so the node comparison is vacuous in all of
+                   them, and cell (c) reads zero `shape above` lines inside the `n_ubatch` bound
+                   and is the positive control for the line and separates the two abort messages
+                   (r28 m-4). The node half has one reader, §3.2's closing check (step 5): on the
+                   re-pinned tree every measured `graph_nodes` is at most `B` and there are zero
+                   `shape above` lines. Any other arm key line that reads the `[W-ORDER] shape
+                   above` count names this rule: the node half of that reading is scorable only
+                   on a tree that contains §3.2's re-pin commit. On an earlier tree, where the
+                   node bound is G0's provisional `N_prov`, that half is VOID, never unscored and
+                   never a pass, and a WARN on a model arm there is information for §3.2's
+                   step 3, not a failure. The
                    comparison and the dedup are inside `ggml_sycl_device_entry_w_ordered` and
                    read only `use`'s fields, never a caller's shape. Each of the three fills
                    takes its fields from its own named source (above). H7 (as) gates both, with
@@ -4024,7 +4038,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         never a discovered miss (rulings §M70 (b), (b')):** in (b1) 23mk's counted seam
         `ggml_sycl_onednn_graph_interim_gate` evaluates 23mk's pure decision, `constexpr
         ggml_sycl_onednn_graph_interim_reason ggml_sycl_onednn_graph_interim_decline(bool tp,
-        bool capped, size_t capacity, size_t term) noexcept` (23mk `bd560d3dd` §4.8 (b1), L4623,
+        bool capped, size_t capacity, size_t term) noexcept` (23mk `3bd662261` §4.8 (b1), L4787,
         first given at `372bb5b16`; inline in `fattn-onednn.hpp`; its reasons
         `GGML_SYCL_ONEDNN_GRAPH_INTERIM_REASON_{NONE, TP, CAPPED, CAPACITY}`), on the call's
         per-shape term and the **planned** interim capacity: `interim_tp`, `interim_capped`
@@ -4033,10 +4047,10 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         interim form, and (b2) deletes it and moves the decision to per-layer admission in the
         fit, `scratch_unplaced`, whose frozen mask the same read then consults. **The reader is
         23mk's routing read, before the plan (23mk `a8cfbf901` rev 4.19a, §4.8 "Routing reads
-        the decline before the plan", at 23mk's head `bd560d3dd`; r28 m-1):** each of the three
+        the decline before the plan", at 23mk's head `3bd662261`, provisional while design-23mk-r23 runs; r28 m-1):** each of the three
         dispatch arms, `fattn.cpp:2788` (FORCE_PATH), `:3123` (every non-D512 shape) and `:3907`
         (D = 512) at `d8a67422d`, calls
-        `ggml_sycl_fattn_onednn_dispatch_routed(ctx, p, d_v, multi_seq, site)`, which reads
+        `ggml_sycl_fattn_onednn_dispatch_routed(ctx, p, d_v, multi_seq, site, route)`, which reads
         `ggml_sycl_onednn_graph_dispatch_declined(ctx, p)` (in (b1) the interim seam above, from
         (b2) the frozen mask's `onednn_graph_route_decline(ctx, p.kv_layer)`) **before**
         `ggml_sycl_flash_attn_ext_onednn_plan`, with `fattn_params::kv_layer` filled at dispatch
@@ -4044,7 +4058,12 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         to its site's key of `onednn_graph_mask_declined{force|default|d512}` and one to its
         total (rulings §M74 (i) (2) as amended; a zero is scored on the total only, §3.4) and
         returns false, so a declined D ≤ 256 layer never reaches the plan and falls through to
-        native FA on its own device (P3). The SDPA entry `ggml_sycl_flash_attn_ext_onednn`
+        native FA on its own device (P3). **The plan reaches the arm through an out-parameter (rulings §M79 (b); 23mk
+        `3bd662261`, rev 4.19h):** the sixth argument is `ggml_sycl_fattn_onednn_route_result &
+        out`, whose `stage` is OFF, DECLINED or PLANNED and whose `plan` is the plan's result
+        once it ran, so each arm keeps its REJECTED, MATERIALIZE_REQUIRED_BUT_UNAVAILABLE and
+        MR debug lines and their `materialize=` fields as at master, with one plan call per
+        dispatch. The decline is read in this routing read, never at the entry. The SDPA entry `ggml_sycl_flash_attn_ext_onednn`
         (`fattn-onednn.cpp:981`) keeps only 23mk's uncounted backstop,
         `ggml_sycl_onednn_graph_declined_quiet`, which adds to `onednn_graph_decline_at_entry`
         when it declines; no dispatch call reaches it, so 23mk predicts that total 0 on every
@@ -4053,7 +4072,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         (§M72). The Qwen arms (Qwen3.6-35B-A3B, D = 256) drive declined layers into dispatch by
         design and depend on it: C9's replay on the Qwen merge gate, pinned and default, the
         four xqex baseline runs, and C10. llama.cpp-03nm's gap is a declined D = 512 call with
-        no tile route (23mk `bd560d3dd` §4.8 "Where a declined layer runs": when
+        no tile route (23mk `3bd662261` §4.8 "Where a declined layer runs": when
         `ggml_sycl_fattn_d512_tile_admissible` rejects the shape, the declined call reaches
         `fattn.cpp:4080-4095`'s `GGML_ABORT`), and it is outside moua's scope: no moua arm
         scores SDPA on a D = 512 model. gemma4 E4B, the only D = 512 model here, appears in the
@@ -4071,10 +4090,10 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         scores them and does not own them:
         - from (b2), the fit's decline, one line per (context, device) per transaction, printed
           only when N ≥ 1 and carrying `txn=%u` with the commit line of the same transaction
-          (rulings §M78, pending 23mk's txn field; §3.3's pairing), N the routed device-KV
+          (rulings §M78; 23mk `3bd662261`; §3.3's pairing), N the routed device-KV
           layers left out and M the routed device-KV candidates, with
           `onednn_graph_route_declined{scratch_unplaced}` raised by N:
-          `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d declined=%u of %u layers
+          `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d txn=%u declined=%u of %u layers
           needed=%zu room=%zu reason=scratch_unplaced`. 1oxa's step 6 reads the same line;
         - in (b1), the interim decline, one line per (context, device, layer) at that layer's
           first decline, its `declined` a running count, so the last line per (context, device)
@@ -4091,8 +4110,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         run. From (b2) it is §M30's commit line, whose prefix stays byte-identical and which
         gains the suffix ` admitted=%u of %u layers` (§2.3.2's `ONEDNN_GRAPH_SCRATCH` term);
         per (context, device) and transaction the decline line's `declined`, 0 when there is
-        none, must equal M − `admitted` of the commit line with the same `txn` (rulings §M78,
-        pending 23mk's txn field; §3.3's pairing), a run with no commit line is VOID, and M = 0
+        none, must equal M − `admitted` of the commit line with the same `txn` (rulings §M78;
+        23mk `3bd662261`; §3.3's pairing), a run with no commit line is VOID, and M = 0
         is VOID for any SDPA claim, never a pass (§M71 (b)). At (b1) it is 23mk's counter dump
         (rulings §M74 (g)-(i); 23mk `a8cfbf901` §5.1), read as §3.4 says: the run sets
         `GGML_SYCL_COUNTER_DUMP=1` in its literal command, and the dump's
@@ -7320,14 +7339,16 @@ L7 documents this limit, and pattern #2 remains the remedy.
     oneDNN pair's weights half W (§2.4.2), kept only inside `ggml_sycl_device_entry_w_ordered`.
     G0 picks the form (§3.2), and this row states both:
     - **Form M has no W-order mutex.** The ordering decision is an atomic `fetch_add` on the
-      entry's sequence counter, and no lock is held across a submit. It adds one leaf lock,
-      the entry's `w_order_warn_mutex` (r30 n-3). Only an out-of-bound use takes it, before
-      the ordering decision, and holds it for the `w_order_warned_ctx` insert and the
-      `w_order_out_of_bound` store, keeping the insert's `bool`. It releases the mutex before the
-      WARN's print, so no logging runs under it (§M80 (c); r31 m-3). Nothing is acquired under it,
-      it is never held across a submit or a wait, and it never nests with Form E's W-order
-      mutex. The set's insert may allocate a host node under it, outside the strict-mode span,
-      so it is a leaf in lock-order terms only (r32 n-3; §2.4.2). Callers may
+      entry's sequence counter, and no lock is held across a submit. It adds one strict-leaf lock,
+      the entry's `w_order_warn_mutex` (r30 n-3; r33 m-1). Only an out-of-bound use takes it,
+      before the ordering decision, and holds it for the scan and store on the fixed
+      `w_order_warned_ctx` (a `uint64_t[16]` sized at the entry's construction, so nothing
+      allocates under it) and the `w_order_out_of_bound` store, keeping the scan's `print`
+      result. It releases the mutex before the WARN's print, so no logging runs under it
+      (§M80 (c); r31 m-3). A full table prints for every id not found: it never reads as
+      already warned. Nothing is acquired under it, no allocation, device work or logging
+      happens under it (the contract's ledger-lock standard, `:1551-1553`), it is never held
+      across a submit or a wait, and it never nests with Form E's W-order mutex. Callers may
       hold `ctx.graph_mutex` and L2 when they take it, since it is a leaf. The oneDNN PP
       fill's read of `execution_context_id` takes `ctx.execution_state_mutex` for that read
       alone, before the use, and releases it before either W lock is taken (§2.4.2).
@@ -8630,8 +8651,8 @@ means that.
       inside its `REGION` ranges and not as a head slot (rulings §M54), and no zone grows after
       the load (rulings §M25 I-6; 23mk's transaction does the charge, and this arm asserts only
       the room). **The placement witness is 23mk's commit line (rulings §M30, §V16a):**
-      `[CONTEXT-PLAN] graph scratch range: ctx=%u dev=%d term=ONEDNN_GRAPH_SCRATCH backing=%s
-      offset=%zu bytes=%zu`, printed by 23mk at its
+      `[CONTEXT-PLAN] graph scratch range: ctx=%u dev=%d txn=%u term=ONEDNN_GRAPH_SCRATCH backing=%s
+      offset=%zu bytes=%zu admitted=%u of %u layers`, printed by 23mk at its
       context-transaction commit, whose offset lies inside the context's `REGION` ranges and
       whose bytes equal 23mk's value function; a missing line makes the arm VOID, never a pass.
       The range is recorded at step 5 under its own `ONEDNN_GRAPH_SCRATCH` pending term, not
@@ -8930,7 +8951,10 @@ means that.
       - a comparison of `use.n_ubatch` against the `n_ubatch` field of
         `ggml_sycl_w_order_bound_for(...)`'s result;
       - a comparison of `use.graph_nodes` against its `graph_nodes` field;
-      - an insert into `w_order_warned_ctx` keyed on `use.ctx_id`.
+      - a scan of `w_order_warned_ctx` for `use.ctx_id` with a store of it when absent and
+        room remains (the dedupe, r33 m-1);
+      - on a full table, `print` is true for an id not found: the full-table branch never
+        yields "already warned".
     - **Restriction clauses.** `ggml_sycl_w_order_bound_for`,
       `GGML_SYCL_W_ORDER_BOUND_N_UBATCH`, `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` and
       `w_order_warned_ctx` occur nowhere else, except in their definitions and in
@@ -8944,16 +8968,23 @@ means that.
       - In the function's capture path, the record's two fields are read from `use.ctx_id`
         and `use.n_ubatch` and, for an entry that recurs, from the record's own `n_ubatch` in
         the keep-largest merge (the larger of the two), and from nothing else (r32 n-2).
-      - In `ggml_sycl_graph_finalize`, meta's record is assigned exactly once, from the
-        thread-local baked-W record, with each entry's `ctx_id` and `n_ubatch` carried
-        unchanged, and the thread-local record is cleared after the move (r32 m-4). A
-        finalize that moves nothing, or moves an entry with either field zeroed or taken from
-        another source, fails.
+      - In `ggml_sycl_graph_finalize`, the record move (r32 m-4; r33 m-4). **The form the
+        clause matches**, on the comment-stripped body: exactly one loop over the thread-local
+        baked-W record, whose body copies the loop element's `entry`, `ctx_id` and `n_ubatch`
+        into one new element of meta's record, each field from the same loop element and
+        unchanged; then exactly one `clear()` of the thread-local record, after the loop; and no
+        other write to meta's record anywhere in the function. A finalize that moves nothing,
+        that copies a field from anything but the loop element (a literal, a global, a
+        previous meta), or that does not clear the thread-local record, fails.
       - In `ggml_sycl_graph_finalize`, meta's node count is assigned exactly once, from
         `get_nodes().size()`. A finalize with no assignment, or one that assigns 0 or any other
         source, fails.
       - In `ggml_sycl_graph_submit`, all three of the descriptor's fields are read from meta's
         record and meta's node count, and from nothing else.
+    - **A measurement print never ships (r33 n-1).** The string `W-ORDER-MEASURE` occurs
+      nowhere in tracked source, and the clause runs on every commit that touches the W-order
+      files. Its mutation witness is the uncommitted print of §3.2 step 3 left in the tree,
+      which fails it.
     - **Mutation witnesses.**
       - The comparison moved into the oneDNN PP caller on `src1->ne[1]`: the positive and
         restriction clauses fail, and the G2 bound cell's (a) prints 0 WARNs.
@@ -8967,8 +8998,18 @@ means that.
         recomputed `src1->ne[1]`, a second context read): its source clause fails.
       - The finalize's move of the record deleted (meta names no entries, so the submit builds
         no use and the check never runs), or the move with an entry's `n_ubatch` or `ctx_id`
-        zeroed: the record-move clause fails. Without it the recorded fill's `ctx_id` and
-        `n_ubatch` halves would be as vacuous as the node count was (r32 m-4).
+        zeroed (a literal in the per-entry copy): the record-move clause fails. Without it the
+        recorded fill's `ctx_id` and `n_ubatch` halves would be as vacuous as the node count
+        was (r32 m-4).
+      - The thread-local record's `clear()` after the move deleted: the next recording's meta
+        would inherit this graph's entries and `n_ubatch` maxima, and the clause, which demands
+        exactly one `clear()` after the loop, fails (r33 m-4).
+      - The move taken from a source other than the thread-local record (a global, or the
+        previous meta): the clause's loop-element source fails (r33 m-4).
+      - A full `w_order_warned_ctx` treated as already warned (`print` false when 16 ids are
+        stored): the full-table clause fails (r33 m-1).
+      - The uncommitted `W-ORDER-MEASURE` print left in the tree: the no-print clause fails
+        (r33 n-1).
       - The finalize count's assignment deleted, or set to 0: the finalize clause fails. With
         the assignment deleted, meta's node count stays at its default 0, which a restriction
         reading would pass; the positive reading does not. Without this witness the node half
@@ -9384,27 +9425,45 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
      `ggml_sycl_graph_finalize` and `ggml_sycl_graph_submit`, and compiles in K, the
      `n_ubatch` bound and `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES = N_prov`. That constant is
      **provisional**, and the commit message says so.
-  3. **A lead-run measurement, with a one-off print that is never committed (r32 m-1).** The
-     lead builds a local tree that adds, in `ggml_sycl_graph_submit`, one raw
+  3. **A lead-run measurement, with a one-off print that is never committed (r32 m-1; r33
+     m-2, m-3, n-1).** The lead builds a **separate worktree**, or an uncommitted stash, never
+     the checkout the re-pin commit is made from, that adds in `ggml_sycl_graph_submit` one raw
      `fprintf(stderr, "[W-ORDER-MEASURE] device=%d ctx_id=%llu n_ubatch=%u graph_nodes=%zu\n",
      ...)` for each entry a submit's meta names, with the three values the submit builds into
      `use`. It is a raw `fprintf` because INFO-level log lines do not reach the sink at the
      default verbosity (CLAUDE.md, `llama-bench` traps). The lead runs the gate shapes with it
      (C2b's ladder, whose top rung is 2048 on Mistral, the GPT-OSS gate, and the no `-c` arm
-     of each), takes the maximum `graph_nodes` per card over every line, `N_max`, and keeps the
-     logs as the evidence the re-pin commit cites. The print and the build are discarded
-     after. The WARN is not a source for this, since it prints once per (`ctx_id`, device),
-     and `ggml_sycl_test_set_w_order_bound` exists only in test binaries. No scored arm reads
-     the WARN's node half before step 4.
+     of each), on each card the shape runs on.
+     - **One log file per run, named by its `ONEAPI_DEVICE_SELECTOR`.** The line's `device`
+       field is the post-selector index, not the card (a B70-only and a B50-only run both
+       print `device=0`), so the file name carries the card.
+     - **`N_max` is the largest `graph_nodes` over every line of every file**, since the
+       compiled constant is one value for both cards.
+     - **Non-vacuity.** Each run's log must carry at least one line with `graph_nodes` > 0. A
+       run with none is VOID for its shape, never a zero, and `N_max` is defined only once every
+       listed run is non-void. A shape that legitimately never takes the oneDNN PP W path is
+       dropped from the list only by a lead ruling, never silently. The per-run line counts are
+       recorded with the logs, which are the evidence the re-pin commit cites.
+     - The WARN is not a source for this, since it prints once per (`ctx_id`, device), and
+       `ggml_sycl_test_set_w_order_bound` exists only in test binaries. The print and its
+       worktree are discarded after step 5. No scored arm reads the WARN's node half before
+       step 5.
   4. **The re-pin commit, unconditional (rulings §M80 (d); r32 m-2).** The lead computes
-     `B = round_up(1.25 * N_max, 16)` and re-runs G0 F3 with `--f3-nodes B`, so that F3's
-     verdict covers the bound that ships and not only the measured maximum. If F3 passes at
-     `B`, the commit sets `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` to `B`, re-pins K from the T
-     that run printed, and drops "provisional" from the constant's comment and from §2.4.2.
-     If F3 fails at `B` (a cell caps with K waiters, or a control fails), that is a stop for a
-     lead ruling, never a silent re-pin. There is no `N_max > N_prov` trigger: the re-run
-     happens whenever the bound is re-pinned.
-  G0 also prints the engine class's xe `job_timeout_ms` for each card, and the cap must sit
+     `B = round_up(1.25 * N_max, 16)`. `B` must be nonzero and no smaller than 1.25 times a line
+     actually read, and a VOID run in step 3 blocks this step. The lead re-runs G0 F3 with
+     `--f3-nodes B` **on both cards** (`level_zero:0`, then `level_zero:1`), so that F3's
+     verdict covers the bound that ships on each, and both must pass. If F3 passes at `B`, the
+     commit sets `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` to `B`, re-pins each card's K from the T that
+     card's run printed, and drops "provisional" from the constant's comment and from §2.4.2. If F3
+     fails at `B` (a cell caps with K waiters, or a control fails), that is a stop for a lead
+     ruling, never a silent re-pin. There is no `N_max > N_prov` trigger: the re-run happens
+     whenever the bound is re-pinned.
+  5. **The closing check (r33 n-2).** On the re-pinned tree, the lead re-runs step 3's runs
+     with the print in a separate worktree. Every `[W-ORDER-MEASURE]` line must read
+     `graph_nodes` <= `B`, and every log must carry zero `[W-ORDER] shape above` lines. A line
+     above `B`, or a WARN, is a stop for a lead ruling. This is the first reading of the WARN's
+     node half that is not VOID (§2.4.2).
+ for each card, and the cap must sit
   below it.
 - **Attribution (r25 m-5 (d)).** Each cell prints `[G0] cell=<H>/<M> start` before it runs and
   `[G0] cell=<H>/<M> submit_ms=%.1f verdict=returns|blocks` after (the controls and F1/F2 print
@@ -9748,9 +9807,10 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
   RED: the function does not set its thread-local flag; the child then allocates and exits 0, as
   the negative control does.
 - **The bound cell (r28 m-4), when G0 picked Form M.** It is the positive control for §2.4.2's
-  out-of-bound WARN, whose zero its cell (c) scores, and it separates the two abort messages. A
-  WARN-0 reading elsewhere is scorable on its node half only on a tree containing the §3.2 re-pin
-  commit, and is VOID on its node half before it (r32 m-3; §2.4.2).
+  out-of-bound WARN, whose `n_ubatch`-half zero its cell (c) scores, and it separates the two abort
+  messages. Every child here passes `graph_nodes` 0, so no G2 cell reads the node half; §3.2's
+  closing check does, and a WARN-0 reading elsewhere is scorable on its node half only on a tree
+  containing the re-pin commit, VOID on that half before it (r32 m-3, r33 n-2; §2.4.2).
   Four children, each the test binary re-executed with the cell's selector. **Binding (r30
   m-2).** Before X1, each child creates two execution contexts with
   `ggml_backend_sycl_execution_context_create` (`ggml-sycl.cpp:14788` at `d8a67422d`) and binds
@@ -9960,7 +10020,7 @@ placement and demotion run. The rules for every such arm:
   **They are scored from two fixed fields, with a witness (rulings §M70 (d), §M71; r26
   I-2).** Both lines are 23mk's, at WARN and not env-gated, so §M66's arming rule does not
   apply (§2.4.2's Graph-scratch commit quotes them): from (b2), the fit's decline line
-  `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d declined=%u of %u layers needed=%zu
+  `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d txn=%u declined=%u of %u layers needed=%zu
   room=%zu reason=scratch_unplaced`, once per (context, device) per transaction, only when
   M − A ≥ 1; and the witness, §M30's commit line with its suffix, `[CONTEXT-PLAN] graph scratch
   range: ... bytes=%zu admitted=%u of %u layers`, once per (context, device) whose Graph
@@ -9971,16 +10031,16 @@ placement and demotion run. The rules for every such arm:
   gives M > 0 is VOID, and M = 0 is VOID for any SDPA claim, never a pass (§M71 (b)). The
   greps, on the arm's stderr, for device 0:
   ```
-  cat <arm>.err | grep -oE 'graph scratch range: ctx=[0-9]+ dev=0 .* admitted=[0-9]+ of [0-9]+ layers'  # A of M; none is VOID
-  cat <arm>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 declined=[0-9]+ of [0-9]+ layers'  # M − A, or none when A = M
+  cat <arm>.err | grep -oE 'graph scratch range: ctx=[0-9]+ dev=0 txn=[0-9]+ .* admitted=[0-9]+ of [0-9]+ layers'  # A of M; none is VOID
+  cat <arm>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 txn=[0-9]+ declined=[0-9]+ of [0-9]+ layers'  # M − A, or none when A = M
   ```
   A model whose attention has sinks, GPT-OSS, routes no layer to SDPA, so M = 0: its arms
   make no SDPA claim and score neither field. The fields come with 23mk's (b2), which charges
   the Graph scratch in the fit, and this replay rule applies from (b2) (§2.4.3's transition
   rule). An arm run between (b1) and (b2) scores (b1)'s interim line instead, pre-registered by
   (b1)'s own rule, never the fit's (r27 m-3). The replay calls 23mk's
-  pure `ggml_sycl_onednn_graph_interim_decline(tp, capped, capacity, term)` (23mk `bd560d3dd`
-  §4.8 (b1), L4623, first given at `372bb5b16`: it reads its four arguments and nothing else,
+  pure `ggml_sycl_onednn_graph_interim_decline(tp, capped, capacity, term)` (23mk `3bd662261`
+  §4.8 (b1), L4787, first given at `372bb5b16`: it reads its four arguments and nothing else,
   and H3 pins it with four `static_assert`s and a source pin; relay (3), answered), so the (b1)
   pre-registration is final. It is evaluated for each SDPA-routed device-KV layer with `tp` =
   false, `capped` the model's capped flag on the device, `capacity` that device's planned
@@ -10012,23 +10072,22 @@ placement and demotion run. The rules for every such arm:
   `end` count, is VOID, an aborting run prints no dump and is VOID, and a reading taken before
   the counters' producer lands is VOID (§M71 (c), §M74 (i) (2)). So an arm run between (b1) and
   (b2) adds `GGML_SYCL_COUNTER_DUMP=1` to its literal command. **Pairing when a (context,
-  device) prints several lines (rulings §M78; r28 m-2), per §M78, pending 23mk's txn field.**
-  From (b2), a GROWTH re-plan is a new transaction and prints its lines again. Under §M78 the
-  decline line and the commit line both carry `txn=%u`, the context transaction's id, unique per
-  (context, device), and any transaction that prints a decline line also prints its commit line,
-  even when the range is unchanged. A decline line pairs with the commit line of the same `txn`;
-  a decline line with no same-`txn` commit line is VOID; a commit line with no same-`txn`
-  decline line pairs with `declined` = 0. The scored pair is the last `txn` per (context,
-  device), the settled state, against the replay of the context's last transaction; earlier
-  pairs are recorded. 7.14t's print-order pairing is withdrawn: under 23mk's rule until §M78
-  lands, which prints the commit line only when the range or its admitted set changes (23mk
-  `bd560d3dd` :5024), the lines C0 (A = M −
-  k), D1 (`declined` = k, from a transaction that changed nothing) and C2 (A = M, from a later
-  transaction with no decline) paired D1 with C2 and failed a correct tree (r28 m-2). **Until
-  the lead relays 23mk's commit** the lines carry no `txn`, and a run is scored only when it
-  prints exactly one decline line (or none) and exactly one commit line per (context, device),
-  which then pair directly; any more lines make the run VOID for the pairing, with the lines
-  recorded. When the field lands, the greps above capture `txn=` at 23mk's position. The
+  device) prints several lines (rulings §M78; r28 m-2; 23mk `3bd662261`).** Both lines carry
+  `txn=%u` directly after `dev=%d`, the context transaction's ordinal on (context, device): 1
+  for the context's first transaction on the device and one more for each later one (a GROWTH
+  re-plan), so (ctx, dev, txn) names one transaction. Any transaction that prints a decline line
+  also prints its commit line, even when the range and mask are unchanged. A decline line pairs
+  with the commit line of the same (ctx, dev, txn); a decline line with no same-`txn` commit
+  line is VOID; a commit line with no same-`txn` decline line pairs with `declined` = 0. The
+  scored pair is the last `txn` per (context, device), the settled state, against the replay of
+  the context's last transaction; earlier pairs are recorded. The interim rule, scoring only a
+  run that prints exactly one decline line (or none) and exactly one commit line per (context,
+  device), is dropped: `txn` pairing replaces it, and a run that reprints lines is scored by its
+  last `txn` and not made VOID. 7.14t's print-order pairing stays withdrawn: before §M78, 23mk
+  printed the commit line only when the range or its admitted set changed, so the lines C0 (A =
+  M − k), D1 (`declined` = k, from a transaction that changed nothing) and C2 (A = M, from a
+  later transaction with no decline) paired D1 with C2 and failed a correct tree (r28 m-2). The
+  greps above capture `txn=` at 23mk's position. The
   SDPA-scoring runs here, C9's Qwen merge-gate blocks and the xqex runs, pin `-ub 512` and make
   one context each, so each is expected to print one pair per (context, device). Through
   `df9803cb8` the replay placed it as a head slot that could demote KV; 23mk's Qwen row cites
@@ -10447,8 +10506,8 @@ placement and demotion run. The rules for every such arm:
         < /dev/null > qx-$sel${carg:+-c4096}.out 2> qx-$sel${carg:+-c4096}.err; echo "rc=$?"
     done; done
     cat qx-<run>.err | grep -oE 'prompt eval time = *[0-9.]+ ms / *[0-9]+ tokens.*tokens per second'
-    cat qx-<run>.err | grep -oE 'graph scratch range: ctx=[0-9]+ dev=0 .* admitted=[0-9]+ of [0-9]+ layers'
-    cat qx-<run>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 declined=[0-9]+ of [0-9]+ layers'
+    cat qx-<run>.err | grep -oE 'graph scratch range: ctx=[0-9]+ dev=0 txn=[0-9]+ .* admitted=[0-9]+ of [0-9]+ layers'
+    cat qx-<run>.err | grep -oE 'graph scratch declined: ctx=[0-9]+ dev=0 txn=[0-9]+ declined=[0-9]+ of [0-9]+ layers'
     cat qx-<run>.err | grep -cx '\[SYCL-COUNTER\] end devices=1'   # 1, else no dump: VOID (§M74 (g))
     cat qx-<run>.err | grep -oxE '\[SYCL-COUNTER\] dev=0 name=onednn_sdpa_(executed|fallback_after_admit) value=[0-9]+'
     ```
@@ -13906,13 +13965,31 @@ re-pin is still queued.
 
 | item | finding / ruling | disposition |
 |---|---|---|
-| m-1 | step 3's WARN route cannot read the maximum (the WARN prints once per (`ctx_id`, device)) and `ggml_sycl_test_set_w_order_bound` runs only in test binaries | **Changed.** The WARN route is deleted. Step 3 is a local, never-committed raw `fprintf(stderr, "[W-ORDER-MEASURE] device=%d ctx_id=%llu n_ubatch=%u graph_nodes=%zu\n", ...)` in `ggml_sycl_graph_submit` for each entry a submit's meta names. The lead takes the maximum per card over the gate-shape runs (C2b's ladder, the GPT-OSS gate and the no `-c` arm of each) and keeps the logs as the re-pin commit's evidence. |
+| m-1 | step 3's WARN route cannot read the maximum (the WARN prints once per (`ctx_id`, device)) and `ggml_sycl_test_set_w_order_bound` runs only in test binaries | **Changed.** The WARN route is deleted. Step 3 is a local, never-committed raw `fprintf(stderr, "[W-ORDER-MEASURE] device=%d ctx_id=%llu n_ubatch=%u graph_nodes=%zu\n", ...)` in `ggml_sycl_graph_submit` for each entry a submit's meta names. The lead takes the maximum per card (amended, §6.42 m-2: keyed by selector, one value over both cards) over the gate-shape runs (C2b's ladder, the GPT-OSS gate and the no `-c` arm of each) and keeps the logs as the re-pin commit's evidence. |
 | m-2; §M80 (d) | step 4 re-ran F3 at `N_max` and only if `N_max > N_prov`, so the shipped bound could exceed what F3 covered | **Changed.** Step 4 is unconditional: `B = round_up(1.25 * N_max, 16)`, F3 re-run with `--f3-nodes B`, the constant and K re-pinned to `B` and that run's T. If F3 fails at `B`, that is a stop for a lead ruling, never a silent re-pin. The trigger is dropped, and the §6.40 row's "for the lead to confirm" now says §M80 (d) accepts the margin. |
 | m-3 | "every scored arm scores the WARN at 0" was unanchored and unreconciled with the provisional bound | **Changed.** §2.4.2 and the bound cell say G2's cell (c) scores the zero. Any other arm key line that reads the count names the rule: its node half is scorable only on a tree containing the re-pin commit, and is VOID on an earlier one, never unscored and never a pass. A model-arm WARN before the re-pin is information for step 3. |
 | m-4 | H7 (as) left the finalize's record move unguarded | **Changed.** A positive clause: meta's record is assigned exactly once from the thread-local record with `ctx_id` and `n_ubatch` unchanged, and the record is cleared. Witnesses: the move deleted, and the move with either field zeroed. The replay child stays declined. |
 | m-5 | F3 was still described as measured behind "the longest graph replay the shape records" | **Changed.** §2.4.2 and §3.2 say T is measured behind a replay of G0's own N-node synthetic recording plus one ubatch's `host_task` backlog at the shape's `n_ubatch`; T and K are valid for that N only, and step 4 re-measures at `B`. |
 | n-1 | the `bind_backend` cite was `:14810` | **Changed.** `:14811` at the three sites (verified at `d8a67422d`). |
 | n-2 | the capture clause omitted the keep-largest merge's read of the record | **Changed.** The clause reads `use` and, for a recurring entry, the record's own `n_ubatch`. |
-| n-3 | the strict-leaf cite was the ledger lock's rule, which also bars allocation, and the set insert allocates | **Changed.** The cite names it as the ledger lock's rule. The choice: the node allocation is host bookkeeping outside the strict span, not pre-reserved, so the mutex is a leaf in lock-order terms only. Stated in §2.4.2 and the L7 row. |
+| n-3 | the strict-leaf cite was the ledger lock's rule, which also bars allocation, and the set insert allocates | **Changed** (amended, §6.42 m-1: "leaf in lock-order terms only" was a third option the ruling does not admit, and is replaced by pre-reserved fixed storage). The cite names it as the ledger lock's rule. The choice: the node allocation is host bookkeeping outside the strict span, not pre-reserved, so the mutex is a leaf in lock-order terms only. Stated in §2.4.2 and the L7 row. |
 | n-4 | §3.2 steps 2-4 were not conditioned on Form M | **Changed.** The commit order opens "when G0 picked Form M". |
 | n-5 | §2.4.2 said G0 F3 "compiles in" the bound | **Changed.** G0 F3 prints it and the W-order commit compiles it in. |
+
+### 6.42 Revision 7.14z: design-moua-r33
+
+Revision 7.14z is one commit on top of `d7cf431f4`, by impl-moua-s. It answers design review r33
+(design-moua-r33 on `019f064b4..d7cf431f4`: 0 Critical, 0 Important, 4 Minor, 2 nits; P1-P3
+pass, and P4 passes once m-2 and m-3 close). It found r32 m-1, m-2, m-3, m-5, n-1, n-2, n-4 and
+n-5 closed. It also folds the queued 23mk re-pin of rulings §M79 (b) and §M78, to 23mk's rev
+4.19h (`3bd662261`), which is provisional while design-23mk-r23 runs.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| m-1 | the r32 n-3 answer, "leaf in lock-order terms only", was a third option beside the ruling's pre-reserve or non-leaf ranking | **Changed, pre-reserve.** `w_order_warned_ctx` is fixed storage, a `uint64_t[16]` and a count, sized when the entry is constructed, so the scan and store allocate nothing. A full table fails loud: with 16 ids stored, every id not found prints and nothing is stored, so a full table is never read as "already warned". The mutex is a strict leaf by the contract's ledger-lock standard (`:1551-1553`, cited), and "The choice", "leaf in lock-order terms only" and the strict-mode-span argument are removed from §2.4.2 and the L7 row. H7 (as)'s third positive clause becomes a scan and store, with a full-table clause and a witness (a full table treated as warned fails it). |
+| m-2 | step 3's "maximum per card" had no card key, and the constant is one value | **Changed.** One log file per run, named by its `ONEAPI_DEVICE_SELECTOR`, since `device=%d` is the post-selector index. `N_max` is the largest `graph_nodes` over every line of every file, because the compiled constant is one value. Step 4 re-runs F3 at `--f3-nodes B` on both cards, both must pass, and each card's K is re-pinned from its own T. |
+| m-3 | step 3 had no non-vacuity condition, and an empty measurement gives `B` = 0 | **Changed.** Each run's log must carry at least one line with `graph_nodes` > 0, or the run is VOID for its shape and blocks step 4. `B` must be nonzero and at least 1.25 times a line read. A shape that never takes the oneDNN PP W path is dropped from the list only by a lead ruling. The per-run line counts are recorded with the logs. |
+| m-4 | the finalize clause's "cleared after the move" and "from another source" sub-claims had no witness | **Changed.** The clause pins its matched form: one loop over the thread-local record copying the loop element's `entry`, `ctx_id` and `n_ubatch` into one new element of meta's record, then exactly one `clear()` after the loop, and no other write to meta's record. Witnesses are added for the clear deleted (the next meta inherits entries), the source taken from a global or the previous meta, and a field zeroed as a literal in the copy. |
+| n-1 | nothing tested that the measurement print never ships | **Changed.** A source clause: `W-ORDER-MEASURE` occurs nowhere in tracked source, with the print left in the tree as its witness. §3.2 step 3 states that the print lives in a separate worktree or an uncommitted stash, never the checkout the re-pin commit is made from. |
+| n-2 | no arm read the WARN's node half, since every G2 child passes `graph_nodes` 0 | **Changed, the stronger option.** §3.2 gains step 5, a closing check: on the re-pinned tree the lead re-runs step 3's runs, and every line must read `graph_nodes` <= `B` with zero `shape above` lines, or it is a stop for a lead ruling. §2.4.2 and the bound cell say G2 scores the `n_ubatch` half only, and step 5 is the node half's reader. |
+| 23mk re-pin; §M79 (b), §M78 (queued) | 23mk rev 4.19h (`3bd662261`): the routed call keeps the plan, the plan lines carry `txn` | **Changed.** §2.4.2 (b1) gives `dispatch_routed(ctx, p, d_v, multi_seq, site, route)` with its `ggml_sycl_fattn_onednn_route_result & out` (stage OFF, DECLINED or PLANNED, and the plan), so each arm keeps its REJECTED, MR and `materialize=` lines with one plan call, and says the decline is read in the routing read, not at the entry. `interim_decline` stays at four arguments, now cited at `3bd662261` §4.8 L4787, and the routing read and the declined-layer note are cited at `3bd662261`. The lines read `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d txn=%u declined=%u of %u layers needed=%zu room=%zu reason=scratch_unplaced` and `[CONTEXT-PLAN] graph scratch range: ctx=%u dev=%d txn=%u term=ONEDNN_GRAPH_SCRATCH backing=%s offset=%zu bytes=%zu admitted=%u of %u layers`, at §2.3.3, §2.4.2, §2.4.3's greps, §3.3's greps and the Qwen block's greps. Pairing is by (ctx, dev, txn), a decline with no same-`txn` commit line is VOID, and the interim "exactly one commit line, decline first" rule is dropped. The head is provisional while design-23mk-r23 runs, so a later 23mk head re-pins the same items. |
