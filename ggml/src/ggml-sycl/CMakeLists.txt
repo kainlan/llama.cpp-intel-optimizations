@@ -3865,6 +3865,35 @@ set_tests_properties(sycl-lifecycle-commit-window-owner PROPERTIES
     TIMEOUT 120
 )
 
+# CPU-work predicate behind the CPU-activation buft selection (llama.cpp-38af).
+# Host-only: it builds synthetic placement plans and asks the pure plan -> verdict
+# seam; no queue, no device, no model.
+add_executable(test-sycl-plan-cpu-work
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-plan-cpu-work.cpp
+)
+target_include_directories(test-sycl-plan-cpu-work PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-plan-cpu-work PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-plan-cpu-work PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-plan-cpu-work PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-plan-cpu-work PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-plan-cpu-work PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-plan-cpu-work COMMAND test-sycl-plan-cpu-work)
+set_tests_properties(sycl-plan-cpu-work PROPERTIES
+    LABELS "sycl;plan;host;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 add_test(NAME test-sycl-moe-handle-resolution COMMAND test-sycl-moe-handle-resolution)
 set_tests_properties(test-sycl-moe-handle-resolution PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"

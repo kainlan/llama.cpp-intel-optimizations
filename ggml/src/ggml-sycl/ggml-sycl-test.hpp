@@ -44,6 +44,9 @@ bool               test_moe_ptr_table_retains_route_lease_until_event();
 bool               test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event();
 bool               test_moe_ptr_table_cached_reuse_is_tensor_specific();
 bool               test_moe_ptr_table_does_not_persist_pointer_cache();
+// ggml_sycl_plan_has_cpu_work() on a synthetic plan: true when the CPU would
+// execute any part of the graph (llama.cpp-38af).
+bool               test_plan_has_cpu_work(const placement_plan & plan);
 bool               test_moe_ptr_table_lease_covers_populated_slots();
 bool               test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
 

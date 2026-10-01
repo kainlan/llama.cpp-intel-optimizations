@@ -22,8 +22,8 @@
 # SYCL_Host, and a dedicated buft there would put '#' split-copy names into the
 # graph and trip the dkw0 replay-futility detector. So the backend exports ONE
 # predicate computed from its own placement plan (ggml_backend_sycl_plan_has_cpu_work:
-# a host-planned dense layer, host-planned KV, or a fully host-planned expert
-# tensor), llama-context ORs it with its own partial-offload test, and the choice
+# a host-planned dense layer or weight under supports_op's own residency rule,
+# host-planned KV, or a fully host-planned expert tensor), llama-context ORs it with its own partial-offload test, and the choice
 # is re-made right before every ggml_backend_sched_new() because the auto-ubatch
 # resyncs re-plan after the constructor's buft enumeration.
 #
@@ -49,9 +49,11 @@ ctx_cpp = (root / "src/llama-context.cpp").read_text()
 BUFT_FN = "ggml_backend_sycl_cpu_activation_buffer_type"
 NAME_FN = BUFT_FN + "_name"
 PRED_FN = "ggml_backend_sycl_plan_has_cpu_work"
-PLAN_HELPER = "ggml_sycl_plan_has_cpu_work"
+PLAN_HELPER = "ggml_sycl_plan_cpu_work_reason"
+PLAN_BOOL = "ggml_sycl_plan_has_cpu_work"
 CTX_PRED = "llama_context_sycl_plan_has_cpu_work"
 CTX_SELECT = "llama_context_cpu_compute_buft"
+NEW_CALL = "ggml_backend_sched_new(backend_ptrs"
 
 
 def function_window(source: str, signature_anchor: str, window: int = 12000) -> str:
@@ -100,7 +102,7 @@ texts = {
         ctx_cpp, "if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {", window=1800),
     "ctx_cpp": ctx_cpp,
     "plan_helper": function_window(
-        sycl_cpp, "static bool " + PLAN_HELPER + "(const ggml_sycl::placement_plan & plan) {", window=8000),
+        sycl_cpp, "static const char * " + PLAN_HELPER + "(const ggml_sycl::placement_plan & plan) {", window=8000),
     "pred_fn": function_window(sycl_cpp, "bool " + PRED_FN + "(ggml_backend_dev_t dev) {"),
     "ctx_select_fn": function_window(
         ctx_cpp, "static ggml_backend_buffer_type_t " + CTX_SELECT + "(", window=4000),
@@ -218,12 +220,15 @@ def check_vi_predicate_reads_the_plan(t):
     helper = t["plan_helper"]
     return (bool(wrapper) and bool(helper)
             and "ggml_sycl_global_plan_snapshot()" in wrapper
-            and PLAN_HELPER + "(" in wrapper
+            and PLAN_BOOL + "(" in wrapper
+            and "[SYCL-CPU-ACT]" in wrapper     # which clause fired, for the -v log
             and "layer_device" in helper        # host-planned dense layer
             and "get_kv_device(" in helper      # host-planned KV
             and "expert_on_device(" in helper   # fully host-planned expert tensor
-            and "return true;" in helper
-            and "return false;" in helper)
+            and "multi_device" in helper        # dense residency follows supports_op's rule
+            and "target_device" in helper
+            and "return nullptr;" in helper
+            and 'return "' in helper)
 
 
 def witness_vi_plan(t):
@@ -275,6 +280,36 @@ def witness_viii_order(t):
     return t
 
 
+# --- (ix) the selection is the LAST thing that can see a stale plan: the only
+# scheduler constructions are inside sched_reserve(), no plan-mutating call sits
+# between the selection and the first one, and the narrow flash-attn recheck
+# (allow_replan=false) comes only after it. The plan mutators -- the constructor,
+# candidate and settle resyncs -- all run in callers, before sched_reserve().
+def check_ix_selection_follows_last_plan_mutation(t):
+    sched = t["sched_reserve_fn"]
+    ctx = t["ctx_cpp"]
+    if not sched:
+        return False
+    sel = sched.find(CTX_SELECT + "(")
+    new = sched.find(NEW_CALL)
+    between = sched[sel:new] if 0 <= sel < new else None
+    recheck = sched.find("\n    resolve_fused_ops(mctx")
+    mutators = ("sycl_resync_runtime_context_flash_attn(", "ggml_backend_sycl_set_runtime_context",
+                "set_runtime_context_for_model")
+    return (between is not None
+            and not any(m in between for m in mutators)
+            and sched.count(NEW_CALL) >= 1
+            and ctx.count(NEW_CALL) == sched.count(NEW_CALL)
+            and recheck > new)
+
+
+def witness_ix(t):
+    sched = t["sched_reserve_fn"]
+    t["sched_reserve_fn"] = sched.replace(
+        NEW_CALL, "sycl_resync_runtime_context_flash_attn(); " + NEW_CALL, 1)
+    return t
+
+
 checks = [
     ("i: the CPU-activation buft is a host-buft clone with its own .get_name", check_i_distinct_identity, witness_i),
     ("ii: supports_buft never accepts it and still accepts SYCL_Host (weights keep their executor)",
@@ -294,6 +329,8 @@ checks = [
      check_viii_selection_is_gated, witness_viii_gate),
     ("viii-b: the selection is re-made before ggml_backend_sched_new() in sched_reserve()",
      check_viii_selection_is_gated, witness_viii_order),
+    ("ix: the selection follows the last plan mutation (only sched constructions are in sched_reserve)",
+     check_ix_selection_follows_last_plan_mutation, witness_ix),
 ]
 
 failed = [name for name, check, _w in checks if not check(texts)]

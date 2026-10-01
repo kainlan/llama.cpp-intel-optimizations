@@ -108271,6 +108271,16 @@ bool ggml_backend_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
     return ggml_sycl_plan_has_cpu_work(*snapshot->plan);
 }
 
+namespace ggml_sycl {
+// Pure plan -> verdict seam for tests/test-sycl-plan-cpu-work.cpp. It skips the
+// snapshot publication on purpose: publishing enumerates devices
+// (ggml_sycl_prepare_plan_publication_locked), and the predicate itself reads
+// nothing but the plan.
+bool test_plan_has_cpu_work(const placement_plan & plan) {
+    return ::ggml_sycl_plan_has_cpu_work(plan);
+}
+}  // namespace ggml_sycl
+
 static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_backend_dev_t dev,
                                                                            void *             ptr,
                                                                            size_t             size,
