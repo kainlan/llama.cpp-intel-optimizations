@@ -55,7 +55,7 @@ def test_initial_fill_throw_erases_owner_before_retry() -> None:
     new_alloc = section(update, "if (!reuse_alloc) {", "} else {")
     ordered(
         new_alloc,
-        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-before-initial-fill")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-before-initial-fill")',
         "zero_event = ggml_sycl::mem_fill_async",
         "catch (const sycl::exception & e)",
         'GGML_LOG_WARN("[SYCL] packed-K sidecar initial fill submit failed:',
@@ -87,7 +87,7 @@ def test_new_sidecar_publishes_retry_identity_before_injected_throw() -> None:
         "packed.batch       = batch",
         "packed.n_blocks    = n_blocks",
         "packed.total_bytes = total_bytes",
-        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-zero-to-update")',
     )
 
     # These are the exact production predicates a retry uses to rediscover and reuse the surviving owner.
@@ -126,7 +126,7 @@ def test_sidecar_propagates_prior_event_and_replaces_each_accepted_submit() -> N
         update,
         "zero_event = ggml_sycl::mem_fill_async",
         "packed.ready_event = zero_event",
-        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-zero-to-update")',
         "ggml_sycl_fattn_xmx_submit_set_rows_update",
     )
     assert update.count("&packed.ready_event") == 2
@@ -145,7 +145,7 @@ def test_forced_materializer_propagates_prior_event_and_replaces_success() -> No
         "zero_deps.push_back(previous_use)",
         "ggml_sycl::mem_fill_async(out->handle, 0, desc.total_packed_bytes, *stream, zero_deps)",
         "out->ready_event = zero_event",
-        'ggml_sycl_fattn_xmx_test_failpoint("materializer-zero-to-pack")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("materializer-zero-to-pack")',
         "cgh.depends_on(zero_event)",
         "out->ready_event = pack_event",
     )
@@ -164,7 +164,7 @@ def test_packed_consumer_propagates_prior_event_then_replaces_first_and_merge() 
         "ggml_sycl_should_add_dependency(packed_ready_event)",
         "cgh.depends_on(packed_ready_event)",
         "*packed_k_ready_event = first_event",
-        'ggml_sycl_fattn_xmx_test_failpoint("packed-first-to-merge")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("packed-first-to-merge")',
         "cgh.depends_on(first_event)",
         "return merge_event",
     )
