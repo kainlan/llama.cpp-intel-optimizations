@@ -888,7 +888,16 @@ llama_context::llama_context(
             else if (backend_type == GGML_BACKEND_DEVICE_TYPE_GPU && llama_context_dev_is_sycl(dev)) {
                 const int sycl_dev = llama_context_sycl_device_index(dev, sycl_gpu_idx);
 
+                const bool plan_active =
+                    llama_context_sycl_hooks_enabled() && ggml_backend_sycl_has_active_placement_plan();
+
                 if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                    if (plan_active) {
+                        // Its alloc_buffer takes a direct host-pinned allocation before any scope
+                        // check: an unscoped GPU compute buffer in host memory.
+                        throw std::runtime_error(
+                            "tensor-split host compute buffer under an active SYCL placement plan");
+                    }
                     buft = ggml_backend_sycl_host_compute_buffer_type(sycl_dev);
                     LLAMA_LOG_DEBUG("%s: using SYCL host compute buffer for GPU %d in tensor split mode\n",
                                     __func__, sycl_dev);
@@ -917,6 +926,20 @@ llama_context::llama_context(
                             }
                         }
                     }
+                    if (use_host_compute && plan_active) {
+                        // D12: a GPU op's compute buffer in host memory is the forbidden GPU
+                        // zero-copy read of host memory, so the device buft stays.
+                        static bool warned_host_compute_plan = false;
+                        if (!warned_host_compute_plan) {
+                            LLAMA_LOG_WARN(
+                                "%s: GGML_SYCL_HOST_COMPUTE=1 is not honoured under an active SYCL "
+                                "placement plan: a GPU op's compute buffer in host memory is a GPU "
+                                "zero-copy read of host memory; keeping the device compute buffer\n",
+                                __func__);
+                            warned_host_compute_plan = true;
+                        }
+                        use_host_compute = false;
+                    }
                     if (use_host_compute) {
                         buft = ggml_backend_sycl_cpu_offload_compute_buffer_type(sycl_dev);
                         LLAMA_LOG_INFO("%s: using SYCL host-pinned compute buffer for GPU %d\n", __func__, sycl_dev);
@@ -930,10 +953,27 @@ llama_context::llama_context(
                 const auto hooks = llama_context_sycl_compute_procs(dev);
                 if (hooks.host_compute && hooks.cpu_compute && hooks.cpu_available) {
                     const int sycl_dev = hooks.device_index;
+                    const bool plan_active = hooks.has_active_plan && hooks.has_active_plan();
                     if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                        if (plan_active) {
+                            throw std::runtime_error(
+                                "tensor-split host compute buffer under an active SYCL placement plan");
+                        }
                         buft = hooks.host_compute(sycl_dev);
                     } else if (const char * env = std::getenv("GGML_SYCL_HOST_COMPUTE"); env && std::atoi(env) != 0) {
-                        buft = hooks.cpu_compute(sycl_dev);
+                        if (plan_active) {
+                            static bool warned_host_compute_plan = false;
+                            if (!warned_host_compute_plan) {
+                                LLAMA_LOG_WARN(
+                                    "%s: GGML_SYCL_HOST_COMPUTE=1 is not honoured under an active SYCL "
+                                    "placement plan: a GPU op's compute buffer in host memory is a GPU "
+                                    "zero-copy read of host memory; keeping the device compute buffer\n",
+                                    __func__);
+                                warned_host_compute_plan = true;
+                            }
+                        } else {
+                            buft = hooks.cpu_compute(sycl_dev);
+                        }
                     } else if (const char * env = std::getenv("GGML_SYCL_CPU_OFFLOAD"); env && std::atoi(env) != 0) {
                         (void) hooks.cpu_available();
                     }

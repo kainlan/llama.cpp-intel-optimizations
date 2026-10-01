@@ -38715,10 +38715,19 @@ int ggml_backend_sycl_plan_caps_live(void) {
 }
 #endif
 
+static bool ggml_backend_sycl_buffer_type_is_host_compute(ggml_backend_buffer_type_t buft);
+
 static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     ggml_backend_sycl_buffer_type_context * ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
     if (ctx && ctx->max_size_override > 0) {
         return ctx->max_size_override;
+    }
+    if (g_plan_scope && ggml_backend_sycl_buffer_type_is_host_compute(buft)) {
+        // The tensor-split host compute buft is refused under a plan by pointer (r4 m-1,
+        // m-3): its alloc_buffer takes a direct host-pinned allocation before any scope check.
+        ggml_sycl_plan_scope_fail(g_plan_scope,
+                                  "the tensor-split host compute buft is not reachable under a placement plan");
+        return ggml_sycl_device_chunk_cap_constant(ctx ? ctx->device : -1);
     }
     // In a plan scope the answer is the context's copy, never a zone read.  This comes
     // before the device-index check, so a buft naming a device with no device reaches it.
@@ -43716,6 +43725,23 @@ static const ggml_backend_buffer_type_i ggml_backend_sycl_host_compute_buffer_ty
     /* .is_host          = */ NULL,  // Not a CPU host buffer - it's SYCL host memory
 };
 
+// The per-device tensor-split host compute bufts.  File scope so a plan scope can name one
+// by pointer (zhcn-design §2.4, r4 m-3) without creating it.
+static struct ggml_backend_buffer_type ggml_backend_sycl_host_compute_buffer_types[GGML_SYCL_MAX_DEVICES];
+static bool                            g_host_compute_buffer_types_initialized = false;
+
+static bool ggml_backend_sycl_buffer_type_is_host_compute(ggml_backend_buffer_type_t buft) {
+    if (!buft) {
+        return false;
+    }
+    for (int i = 0; i < GGML_SYCL_MAX_DEVICES; ++i) {
+        if (buft == &ggml_backend_sycl_host_compute_buffer_types[i]) {
+            return g_host_compute_buffer_types_initialized;
+        }
+    }
+    return false;
+}
+
 ggml_backend_buffer_type_t ggml_backend_sycl_host_compute_buffer_type(int device) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return nullptr;
@@ -43727,8 +43753,7 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_compute_buffer_type(int device
                        device, dev_count - 1);
         GGML_ASSERT(device < dev_count);
     }
-    static struct ggml_backend_buffer_type ggml_backend_sycl_host_compute_buffer_types[GGML_SYCL_MAX_DEVICES];
-    static bool                            initialized = false;
+    bool & initialized = g_host_compute_buffer_types_initialized;
     if (!initialized) {
         for (int i = 0; i < dev_count; i++) {
             auto &    device_i                             = ggml_sycl_get_device(i);
