@@ -604,7 +604,7 @@ fit_state build_state(const shared_zone_geometry & g, const kv_region_request & 
                 blocked.push_back({ p.offset, p.size });
             }
         }
-        if (r.commit_refit) {
+        if (r.commit_plan != nullptr) {
             const std::vector<zone_range> outside = complement_ranges(in.own_ranges);
             blocked.insert(blocked.end(), outside.begin(), outside.end());
         }
@@ -636,7 +636,7 @@ fit_state build_state(const shared_zone_geometry & g, const kv_region_request & 
                 }
             }
         }
-        if (r.commit_refit) {
+        if (r.commit_plan != nullptr) {
             // No yield on a re-fit: the ranges are the whole room.
             for (fit_run & run : out.runs) {
                 for (fit_piece & p : run.pieces) {
@@ -813,21 +813,6 @@ void carve_room(fit_state & S, const fit_room & room, int assign_id, size_t size
     fit_piece & p = t.runs[room.run].pieces[room.idx];
     p.used += size;
     p.assigns.push_back(assign_id);
-}
-
-// Take back carve_room's reservation (the last one made in that room).
-void uncarve_room(fit_state & S, const fit_room & room, int assign_id, size_t size) {
-    fit_tlsf & t        = S.t[room.tlsf];
-    S.a[assign_id].tlsf = SIZE_MAX;
-    if (room.retained) {
-        fit_retained & r = t.retained[room.run];
-        r.used -= size;
-        r.assigns.pop_back();
-        return;
-    }
-    fit_piece & p = t.runs[room.run].pieces[room.idx];
-    p.used -= size;
-    p.assigns.pop_back();
 }
 
 struct fit_candidate {
@@ -1007,59 +992,19 @@ size_t tier13_free(const fit_state & S, size_t t) {
     return total;
 }
 
-// What a commit re-fit needs to re-place the heads together with the KV slots: the
-// state before any head was placed, and the heads in the order they were placed.
-struct fit_refit_ctx {
-    fit_state        pre;
-    std::vector<int> head_ids;    // assignment ids in S0.a, in placement order
-    std::vector<int> head_route;  // parallel: 1 for a head that names weight
-};
-
-struct fit_item {
-    int    id;
-    size_t size;
-    int    route;
-};
-
-// Exact placement for a commit re-fit.  The re-fit's rooms are the plan's own
-// ranges, each room exactly as large as what the plan put in it, so a greedy best
-// fit can take a slot that belongs in a tighter room and strand the slots planned
-// there (the rooms were shrunk to the plan's usage, which changes which one is
-// tightest).  A plan that placed every item has a placement here, so the search tries
-// the best-fit order first and backtracks.  `budget` bounds the nodes; running out
-// reads as "does not fit", which only demotes.
-bool refit_search(fit_state & S, const std::vector<fit_item> & items, size_t n, size_t & budget) {
-    if (n == items.size()) {
-        return true;
-    }
-    if (budget == 0) {
-        return false;
-    }
-    --budget;
-    std::vector<fit_candidate_room> rooms;
-    candidate_rooms(S, items[n].size, items[n].route, rooms);
-    for (size_t k = 0; k < rooms.size(); ++k) {
-        bool twin = false;  // a room already tried with the same tlsf, tier and room is equivalent
-        for (size_t d = 0; d < k && !twin; ++d) {
-            twin = rooms[d].room.tlsf == rooms[k].room.tlsf && rooms[d].tier == rooms[k].tier &&
-                   rooms[d].free == rooms[k].free;
-        }
-        if (twin) {
-            continue;
-        }
-        carve_room(S, rooms[k].room, items[n].id, items[n].size);
-        if (refit_search(S, items, n + 1, budget)) {
-            return true;
-        }
-        uncarve_room(S, rooms[k].room, items[n].id, items[n].size);
-        if (budget == 0) {
-            return false;
+// The demotion order of §2.4.1 over slot indices: the highest-index full-attention
+// layer first, then the SWA layers the same way.
+std::vector<size_t> demotion_order(const std::vector<fit_slot> & slots) {
+    std::vector<size_t> order;
+    for (int group = KV_SLOT_FULL; group <= KV_SLOT_SWA; ++group) {
+        for (size_t i = slots.size(); i-- > 0;) {
+            if (slots[i].group == group && !slots[i].forced_host && !slots[i].self_placed) {
+                order.push_back(i);
+            }
         }
     }
-    return false;
+    return order;
 }
-
-constexpr size_t FIT_REFIT_NODES = 200000;
 
 struct kv_solve {
     bool              ok = false;
@@ -1071,17 +1016,10 @@ struct kv_solve {
 // The demotion loop of §2.4.1: ask the fit; on a miss demote the highest-index
 // full-attention layer (K and V and sidecar together), then the SWA layers, and
 // ask again.  `S0` already holds the head slots.
-kv_solve solve_kv(const fit_state & S0, const std::vector<fit_slot> & slots, const fit_refit_ctx * refit = nullptr) {
+kv_solve solve_kv(const fit_state & S0, const std::vector<fit_slot> & slots) {
     kv_solve out;
     out.device.assign(slots.size(), 1);
-    std::vector<size_t> order;  // slot indices in demotion order
-    for (int group = KV_SLOT_FULL; group <= KV_SLOT_SWA; ++group) {
-        for (size_t i = slots.size(); i-- > 0;) {
-            if (slots[i].group == group && !slots[i].forced_host && !slots[i].self_placed) {
-                order.push_back(i);
-            }
-        }
-    }
+    const std::vector<size_t> order = demotion_order(slots);
     for (size_t i = 0; i < slots.size(); ++i) {
         if (slots[i].forced_host) {
             out.device[i] = 0;
@@ -1099,28 +1037,9 @@ kv_solve solve_kv(const fit_state & S0, const std::vector<fit_slot> & slots, con
                 slot_of.push_back(i);
             }
         }
-        if (refit != nullptr) {
-            // The heads are re-placed with the slots, so a head's room can give way.
-            S.t = refit->pre.t;
-            for (fit_assign & a : S.a) {
-                a.tlsf = SIZE_MAX;
-            }
-            std::vector<fit_item> items;
-            for (size_t h = 0; h < refit->head_ids.size(); ++h) {
-                const int id = refit->head_ids[h];
-                items.push_back({ id, S.a[id].size, refit->head_route[h] });
-            }
-            for (size_t n = 0; n < slot_of.size(); ++n) {
-                S.a.push_back({ AS_KV, slot_of[n], slots[slot_of[n]].total, SIZE_MAX });
-                items.push_back({ (int) S.a.size() - 1, slots[slot_of[n]].total, 0 });
-            }
-            size_t budget = FIT_REFIT_NODES;
-            ok            = refit_search(S, items, 0, budget);
-        } else {
-            for (size_t n = 0; n < slot_of.size() && ok; ++n) {
-                S.a.push_back({ AS_KV, slot_of[n], slots[slot_of[n]].total, SIZE_MAX });
-                ok = place(S, (int) S.a.size() - 1, 0, true, remaining, n);
-            }
+        for (size_t n = 0; n < slot_of.size() && ok; ++n) {
+            S.a.push_back({ AS_KV, slot_of[n], slots[slot_of[n]].total, SIZE_MAX });
+            ok = place(S, (int) S.a.size() - 1, 0, true, remaining, n);
         }
         if (ok) {
             out.ok    = true;
@@ -1135,16 +1054,8 @@ kv_solve solve_kv(const fit_state & S0, const std::vector<fit_slot> & slots, con
     }
 }
 
-}  // namespace
-
-kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_region_request & r) {
-    kv_region_fit_result res;
-    const size_t         n_tlsf = g.tlsfs.size();
-    res.yield_prefix.assign(n_tlsf, 0);
-    res.free_after_full_kv.assign(n_tlsf, 0);
-    res.tlsf_free.assign(n_tlsf, 0);
-
-    // The slot table: full attention first, then SWA, each in layer order.
+// The slot table: full attention first, then SWA, each in layer order.
+std::vector<fit_slot> build_slots(const kv_region_request & r) {
     std::vector<fit_slot> slots;
     for (const kv_layer_slot_request & l : r.layers) {
         fit_slot s;
@@ -1166,6 +1077,418 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
     std::stable_sort(slots.begin(), slots.end(), [](const fit_slot & a, const fit_slot & b) {
         return a.group != b.group ? a.group < b.group : a.layer < b.layer;
     });
+    return slots;
+}
+
+// Best fit over every TLSF a head may take lets an unconstrained head use up the
+// tight room the one TLSF a constrained head needs offers, and the constrained
+// head is then refused where an index-order placement would have fitted both.  So
+// the heads with the fewest admissible TLSFs go first (request order at a tie),
+// and best fit decides only inside each head's own admissible set.
+std::vector<size_t> head_placement_order(const shared_zone_geometry & g, const kv_region_request & r) {
+    size_t admissible[2] = { 0, 0 };
+    for (const tlsf_geometry & t : g.tlsfs) {
+        admissible[0] += t.takes_kv ? 1 : 0;
+        admissible[1] += t.takes_weight_named ? 1 : 0;
+    }
+    std::vector<size_t> order(r.head_slots.size());
+    for (size_t h = 0; h < order.size(); ++h) {
+        order[h] = h;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return admissible[r.head_slots[a].names_weight ? 1 : 0] < admissible[r.head_slots[b].names_weight ? 1 : 0];
+    });
+    return order;
+}
+
+struct verify_span {
+    size_t lo = 0;
+    size_t hi = 0;
+};
+
+// Merge touching spans so a range that crosses two of them is one.
+void merge_spans(std::vector<verify_span> & v) {
+    std::sort(v.begin(), v.end(), [](const verify_span & a, const verify_span & b) { return a.lo < b.lo; });
+    std::vector<verify_span> out;
+    for (const verify_span & s : v) {
+        if (s.hi <= s.lo) {
+            continue;
+        }
+        if (!out.empty() && out.back().hi >= s.lo) {
+            out.back().hi = std::max(out.back().hi, s.hi);
+        } else {
+            out.push_back(s);
+        }
+    }
+    v.swap(out);
+}
+
+bool spans_hold(const std::vector<verify_span> & v, size_t lo, size_t hi) {
+    for (const verify_span & s : v) {
+        if (s.lo <= lo && hi <= s.hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// `v` less `taken`.
+std::vector<verify_span> spans_minus(const std::vector<verify_span> & v, const std::vector<verify_span> & taken) {
+    std::vector<verify_span> out;
+    for (const verify_span & s : v) {
+        size_t at = s.lo;
+        for (const verify_span & t : taken) {
+            if (t.hi <= at || t.lo >= s.hi) {
+                continue;
+            }
+            if (t.lo > at) {
+                out.push_back({ at, t.lo });
+            }
+            at = std::max(at, t.hi);
+        }
+        if (at < s.hi) {
+            out.push_back({ at, s.hi });
+        }
+    }
+    return out;
+}
+
+// §2.4.2 step 6, the commit re-fit.  Inside this call's own ranges nothing can have
+// changed since the plan but a shortfall: another transaction's range or a weight
+// that took part of a room the plan reserved.  So the re-fit does not solve again, it
+// verifies the plan.  Solving again from the shrunk rooms is a second source for a
+// fact the plan already fixed: best fit over rooms the size of the plan's usage picks
+// differently from the plan's, and can place what the plan declined.
+//
+// Every planned head slot, KV layer slot and admitted after-KV term is a
+// (TLSF, offset, bytes) extent in the plan.  One that is still wholly free in the
+// re-snapshot stays exactly where it was.  A layer slot that is not free demotes
+// that layer, and every survivor keeps its planned offset, which the commit's
+// offset-fixed carve honours.  A head slot that is not free is the one thing
+// re-placed: by best fit in the room the survivors leave, demoting layers in the
+// demotion order until it fits.  Nothing is added: no layer the plan demoted, no
+// after-KV term it declined.
+kv_region_fit_result commit_verify(const shared_zone_geometry &  g,
+                                   const kv_region_request &     r,
+                                   const std::vector<fit_slot> & slots) {
+    const kv_region_fit_result & plan   = *r.commit_plan;
+    const size_t                 n_tlsf = g.tlsfs.size();
+    kv_region_fit_result         res    = plan;
+    res.yield_prefix.assign(n_tlsf, 0);
+    res.buried_released.clear();
+    res.tlsf_free.assign(n_tlsf, 0);
+    res.refused_heads.clear();
+    if (!plan.fits || plan.layers.size() != slots.size()) {
+        res.fits          = false;
+        res.refused_heads = plan.refused_heads;
+        return res;
+    }
+
+    // The room this call owns, as the re-snapshot sees it: free blocks, and retained
+    // runs a placement claims whole.
+    const fit_state                       S = build_state(g, r);
+    std::vector<std::vector<verify_span>> room_free(n_tlsf);
+    std::vector<std::vector<verify_span>> room_retained(n_tlsf);
+    for (size_t t = 0; t < n_tlsf; ++t) {
+        for (const fit_run & run : S.t[t].runs) {
+            for (const fit_piece & p : run.pieces) {
+                if (p.kind == PK_FREE) {
+                    room_free[t].push_back({ p.lo, p.hi });
+                }
+            }
+        }
+        for (const fit_retained & rr : S.t[t].retained) {
+            room_retained[t].push_back({ rr.lo, rr.hi });
+        }
+        merge_spans(room_free[t]);
+        merge_spans(room_retained[t]);
+    }
+    auto still_free = [&](size_t t, size_t lo, size_t hi) {
+        return spans_hold(room_free[t], lo, hi) || spans_hold(room_retained[t], lo, hi);
+    };
+
+    // Layer slots.  A self-placed slot is already carved and is not the re-fit's.
+    std::vector<char>   device(slots.size(), 0);
+    std::vector<size_t> slot_lo(slots.size(), 0);
+    for (size_t i = 0; i < slots.size(); ++i) {
+        const kv_layer_placement & lp = plan.layers[i];
+        if (!lp.device) {
+            continue;
+        }
+        const kv_region_extent & e = plan.extents[lp.extent];
+        slot_lo[i]                 = e.offset + lp.slot_offset;
+        device[i]                  = e.kind == KV_EXTENT_SELF || still_free(e.tlsf, slot_lo[i], slot_lo[i] + lp.size);
+    }
+    std::vector<kv_demotion_cause> cause(slots.size(), KV_DEMOTE_NONE);
+    for (size_t i = 0; i < slots.size(); ++i) {
+        if (plan.layers[i].device && !device[i]) {
+            cause[i] = KV_DEMOTE_CAPACITY;
+        }
+    }
+
+    // Head slots and after-KV terms, the plan's own.  A head served by a reservation
+    // or settled earlier carries no carve op and is not the re-fit's.
+    struct head_state {
+        bool   planned  = false;  // the plan carved it
+        bool   placed   = false;
+        bool   retained = false;
+        size_t tlsf     = 0;
+        size_t offset   = 0;
+        size_t size     = 0;
+    };
+
+    std::vector<head_state> heads(plan.heads.size());
+    for (const kv_carve_op & op : plan.carve_order) {
+        if (op.kind != KV_CARVE_HEAD) {
+            continue;
+        }
+        head_state & hs = heads[op.index];
+        hs.planned      = true;
+        hs.retained     = !op.carve;
+        hs.tlsf         = op.tlsf;
+        hs.offset       = op.offset;
+        hs.size         = op.size;
+        hs.placed       = still_free(op.tlsf, op.offset, op.offset + op.size);
+    }
+    std::vector<char> term_ok(plan.after_kv.size(), 0);
+    for (size_t k = 0; k < plan.after_kv.size(); ++k) {
+        const kv_after_kv_placement & ap        = plan.after_kv[k];
+        bool                          on_device = false;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            on_device = on_device || (slots[i].layer == r.after_kv[k].layer && device[i]);
+        }
+        term_ok[k] = ap.admitted && on_device && still_free(ap.tlsf, ap.offset, ap.offset + ap.size);
+    }
+
+    // What the survivors, the placed heads and the admitted terms occupy, per TLSF.
+    auto occupied = [&](size_t t) {
+        std::vector<verify_span> v;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if (device[i] && plan.extents[plan.layers[i].extent].tlsf == t) {
+                v.push_back({ slot_lo[i], slot_lo[i] + plan.layers[i].size });
+            }
+        }
+        for (const head_state & hs : heads) {
+            if (hs.planned && hs.placed && hs.tlsf == t) {
+                v.push_back({ hs.offset, hs.offset + hs.size });
+            }
+        }
+        for (size_t k = 0; k < plan.after_kv.size(); ++k) {
+            if (term_ok[k] && plan.after_kv[k].tlsf == t) {
+                v.push_back({ plan.after_kv[k].offset, plan.after_kv[k].offset + plan.after_kv[k].size });
+            }
+        }
+        // Not merged: spans_minus walks `taken` in offset order only.
+        std::sort(v.begin(), v.end(), [](const verify_span & a, const verify_span & b) { return a.lo < b.lo; });
+        return v;
+    };
+
+    // The displaced heads, constrained first like the plan, each by best fit.
+    const std::vector<size_t> demote = demotion_order(slots);
+    size_t                    next   = 0;
+    std::vector<size_t>       refused;
+    for (const size_t h : head_placement_order(g, r)) {
+        head_state & hs = heads[h];
+        if (!hs.planned || hs.placed) {
+            continue;
+        }
+        const bool names_weight = r.head_slots[h].names_weight;
+        for (;;) {
+            // Retained room first, then the smallest free room that holds it: the
+            // plan's tier order, over what the survivors leave.
+            bool   found     = false;
+            bool   retained  = false;
+            size_t best_t    = 0;
+            size_t best_lo   = 0;
+            size_t best_room = SIZE_MAX;
+            for (size_t t = 0; t < n_tlsf; ++t) {
+                if (!(names_weight ? g.tlsfs[t].takes_weight_named : g.tlsfs[t].takes_kv)) {
+                    continue;
+                }
+                const std::vector<verify_span> taken = occupied(t);
+                for (int pass = 0; pass < 2; ++pass) {
+                    const bool                     from_retained = pass == 0;
+                    const std::vector<verify_span> spans =
+                        spans_minus(from_retained ? room_retained[t] : room_free[t], taken);
+                    for (const verify_span & s : spans) {
+                        // A free room is carved at its top, on the allocator's grain;
+                        // a retained run packs upward from its bottom.
+                        size_t at = s.lo;
+                        if (!from_retained) {
+                            if (s.hi - s.lo < hs.size) {
+                                continue;
+                            }
+                            at = (s.hi - hs.size) / tlsf_allocator::block_grain * tlsf_allocator::block_grain;
+                        }
+                        if (at < s.lo || at + hs.size > s.hi) {
+                            continue;
+                        }
+                        const bool better = !found || (from_retained && !retained) ||
+                                            (from_retained == retained && s.hi - s.lo < best_room);
+                        if (better) {
+                            found     = true;
+                            retained  = from_retained;
+                            best_t    = t;
+                            best_lo   = at;
+                            best_room = s.hi - s.lo;
+                        }
+                    }
+                }
+            }
+            if (found) {
+                hs.placed   = true;
+                hs.retained = retained;
+                hs.tlsf     = best_t;
+                hs.offset   = best_lo;
+                break;
+            }
+            // Nothing holds it: demote the next surviving layer, which frees its slot.
+            while (next < demote.size() && !device[demote[next]]) {
+                ++next;
+            }
+            if (next >= demote.size()) {
+                refused.push_back(h);
+                break;
+            }
+            device[demote[next]] = 0;
+            cause[demote[next]]  = KV_DEMOTE_HEAD_SLOT;
+            ++next;
+            for (size_t k = 0; k < plan.after_kv.size(); ++k) {
+                if (r.after_kv[k].layer == slots[demote[next - 1]].layer) {
+                    term_ok[k] = 0;
+                }
+            }
+        }
+    }
+
+    // Rebuild the result from the survivors.  Each plan extent becomes the maximal
+    // runs of surviving slots in it, at the planned offsets.
+    res.extents.clear();
+    std::vector<std::vector<size_t>> runs_of(plan.extents.size());
+    std::vector<size_t>              self_index(plan.extents.size(), SIZE_MAX);
+    for (size_t ei = 0; ei < plan.extents.size(); ++ei) {
+        const kv_region_extent & e = plan.extents[ei];
+        if (e.kind == KV_EXTENT_SELF) {
+            self_index[ei] = res.extents.size();
+            res.extents.push_back(e);
+            continue;
+        }
+        std::vector<size_t> members;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if (plan.layers[i].device && plan.layers[i].extent == ei) {
+                members.push_back(i);
+            }
+        }
+        std::sort(members.begin(), members.end(),
+                  [&](size_t a, size_t b) { return plan.layers[a].slot_offset < plan.layers[b].slot_offset; });
+        size_t at   = 0;
+        bool   open = false;
+        for (size_t i : members) {
+            if (!device[i]) {
+                open = false;
+                continue;
+            }
+            if (!open) {
+                kv_region_extent run;
+                run.tlsf   = e.tlsf;
+                run.offset = slot_lo[i];
+                run.size   = 0;
+                run.kind   = e.kind;
+                res.extents.push_back(run);
+                runs_of[ei].push_back(res.extents.size() - 1);
+                at   = 0;
+                open = true;
+            }
+            kv_layer_placement & lp = res.layers[i];
+            lp.extent               = res.extents.size() - 1;
+            lp.slot_offset          = at;
+            lp.sidecar_offset       = slots[i].sidecar ? at + slots[i].kv_alloc : SIZE_MAX;
+            at += slots[i].total;
+            res.extents.back().size = at;
+        }
+    }
+    for (size_t i = 0; i < slots.size(); ++i) {
+        kv_layer_placement & lp = res.layers[i];
+        if (plan.layers[i].device && plan.extents[plan.layers[i].extent].kind == KV_EXTENT_SELF) {
+            lp.extent = self_index[plan.layers[i].extent];
+        }
+        if (plan.layers[i].device && !device[i]) {
+            lp.device         = false;
+            lp.cause          = cause[i];
+            lp.extent         = SIZE_MAX;
+            lp.slot_offset    = 0;
+            lp.sidecar_offset = SIZE_MAX;
+        }
+    }
+    for (size_t h = 0; h < heads.size(); ++h) {
+        if (heads[h].planned && heads[h].placed) {
+            res.heads[h].tlsf   = heads[h].tlsf;
+            res.heads[h].offset = heads[h].offset;
+        }
+    }
+    for (size_t k = 0; k < plan.after_kv.size(); ++k) {
+        res.after_kv[k].admitted = term_ok[k] != 0;
+    }
+    res.carve_order.clear();
+    for (const kv_carve_op & op : plan.carve_order) {
+        if (op.kind == KV_CARVE_EXTENT) {
+            std::vector<size_t> runs = runs_of[op.index];
+            if (op.carve) {
+                std::reverse(runs.begin(), runs.end());  // a carve chain runs from the top down
+            }
+            for (size_t ni : runs) {
+                kv_carve_op o = op;
+                o.index       = ni;
+                o.offset      = res.extents[ni].offset;
+                o.size        = res.extents[ni].size;
+                o.demand      = res.extents[ni].size;
+                res.carve_order.push_back(o);
+            }
+        } else if (op.kind == KV_CARVE_HEAD) {
+            const head_state & hs = heads[op.index];
+            if (hs.placed) {
+                kv_carve_op o = op;
+                o.tlsf        = hs.tlsf;
+                o.offset      = hs.offset;
+                o.size        = hs.size;
+                o.demand      = hs.size;
+                o.carve       = !hs.retained;
+                res.carve_order.push_back(o);
+            }
+        } else if (term_ok[op.index]) {
+            res.carve_order.push_back(op);
+        }
+    }
+
+    res.refused_heads = refused;
+    std::sort(res.refused_heads.begin(), res.refused_heads.end());
+    res.fits = refused.empty();
+    if (!res.fits) {
+        for (size_t t = 0; t < n_tlsf; ++t) {
+            const std::vector<verify_span> taken = occupied(t);
+            for (const verify_span & s : spans_minus(room_free[t], taken)) {
+                res.tlsf_free[t] += s.hi - s.lo;
+            }
+            for (const verify_span & s : spans_minus(room_retained[t], taken)) {
+                res.tlsf_free[t] += s.hi - s.lo;
+            }
+        }
+    }
+    return res;
+}
+
+}  // namespace
+
+kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_region_request & r) {
+    const std::vector<fit_slot> slots = build_slots(r);
+    if (r.commit_plan != nullptr) {
+        return commit_verify(g, r, slots);
+    }
+    kv_region_fit_result res;
+    const size_t         n_tlsf = g.tlsfs.size();
+    res.yield_prefix.assign(n_tlsf, 0);
+    res.free_after_full_kv.assign(n_tlsf, 0);
+    res.tlsf_free.assign(n_tlsf, 0);
 
     fit_state base = build_state(g, r);
 
@@ -1176,29 +1499,10 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
     for (size_t t = 0; t < n_tlsf; ++t) {
         reservation_used[t].assign(g.tlsfs[t].reservations.size(), 0);
     }
-    std::vector<size_t>                    head_assign(r.head_slots.size(), SIZE_MAX);
-    std::vector<std::pair<size_t, size_t>> head_super(r.head_slots.size(), { SIZE_MAX, SIZE_MAX });
-    const std::vector<size_t>              no_remaining;
-    fit_refit_ctx                          refit;
-    refit.pre = base;
+    std::vector<size_t>       head_assign(r.head_slots.size(), SIZE_MAX);
+    const std::vector<size_t> no_remaining;
 
-    // Best fit over every TLSF a head may take lets an unconstrained head use up the
-    // tight room the one TLSF a constrained head needs offers, and the constrained
-    // head is then refused where an index-order placement would have fitted both.  So
-    // the heads with the fewest admissible TLSFs go first (request order at a tie),
-    // and best fit decides only inside each head's own admissible set.
-    size_t admissible[2] = { 0, 0 };
-    for (const fit_tlsf & t : base.t) {
-        admissible[0] += eligible(t, 0) ? 1 : 0;
-        admissible[1] += eligible(t, 1) ? 1 : 0;
-    }
-    std::vector<size_t> head_order(r.head_slots.size());
-    for (size_t h = 0; h < head_order.size(); ++h) {
-        head_order[h] = h;
-    }
-    std::stable_sort(head_order.begin(), head_order.end(), [&](size_t a, size_t b) {
-        return admissible[r.head_slots[a].names_weight ? 1 : 0] < admissible[r.head_slots[b].names_weight ? 1 : 0];
-    });
+    const std::vector<size_t> head_order = head_placement_order(g, r);
     for (const size_t h : head_order) {
         const kv_head_slot_request & hs   = r.head_slots[h];
         const size_t                 need = kv_layer_alloc_bytes(hs.size);
@@ -1249,9 +1553,6 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
         base.a.push_back({ AS_HEAD, h, need, SIZE_MAX });
         const int id   = (int) base.a.size() - 1;
         head_assign[h] = (size_t) id;
-        refit.head_ids.push_back(id);
-        refit.head_route.push_back(hs.names_weight ? 1 : 0);
-        head_super[h] = { super_t, super_i };
         if (!place(base, id, hs.names_weight ? 1 : 0, false, no_remaining, 0)) {
             res.refused_heads.push_back(h);
             continue;
@@ -1259,32 +1560,6 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
         if (super_t != SIZE_MAX) {
             reservation_used[super_t][super_i] = 1;
             res.superseded.push_back({ super_t, super_i });
-        }
-    }
-    if (r.commit_refit && !res.refused_heads.empty()) {
-        // The greedy placement refused a head.  The re-fit's rooms are the plan's own
-        // ranges, so a placement exists whenever the plan's heads fitted; search for it
-        // before calling the head refused.
-        fit_state S = refit.pre;
-        S.a         = base.a;
-        for (fit_assign & a : S.a) {
-            a.tlsf = SIZE_MAX;
-        }
-        std::vector<fit_item> items;
-        for (size_t k = 0; k < refit.head_ids.size(); ++k) {
-            const int id = refit.head_ids[k];
-            items.push_back({ id, S.a[id].size, refit.head_route[k] });
-        }
-        size_t budget = FIT_REFIT_NODES;
-        if (refit_search(S, items, 0, budget)) {
-            for (const size_t h : res.refused_heads) {
-                if (head_super[h].first != SIZE_MAX) {
-                    reservation_used[head_super[h].first][head_super[h].second] = 1;
-                    res.superseded.push_back({ head_super[h].first, head_super[h].second });
-                }
-            }
-            res.refused_heads.clear();
-            base = std::move(S);
         }
     }
     std::sort(res.refused_heads.begin(), res.refused_heads.end());
@@ -1297,7 +1572,7 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
 
     // The demotion loop, and the same loop with each cause's room added.
     const fit_state & S0     = base;
-    kv_solve          solved = solve_kv(S0, slots, r.commit_refit ? &refit : nullptr);
+    kv_solve          solved = solve_kv(S0, slots);
 
     std::vector<char> ring_growth_device;
     if (!res.superseded.empty()) {

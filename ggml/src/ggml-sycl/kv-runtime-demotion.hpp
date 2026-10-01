@@ -651,6 +651,8 @@ struct kv_self_head {
     size_t size   = 0;
 };
 
+struct kv_region_fit_result;
+
 struct kv_region_request {
     std::vector<kv_layer_slot_request> layers;  // any order; the fit orders them full first, then SWA, each by layer
     std::vector<kv_head_slot_request>  head_slots;   // placed first, in this order
@@ -658,7 +660,15 @@ struct kv_region_request {
     std::vector<uint32_t>              forced_host;  // layers an earlier fit demoted; never promoted
     std::vector<kv_self_extent>        self_extents;
     std::vector<kv_self_head>          self_heads;
-    bool commit_refit  = false;  // place only inside geometry.own_ranges, with no yield (§2.4.2 step 6)
+    // §2.4.2 step 6, the commit re-fit.  Set, the call does not solve: it checks the
+    // plan it points at against `geometry` (inside own_ranges only, with no yield) and
+    // returns the plan itself when every planned extent is still free.  A planned
+    // layer extent that is not free demotes that layer, every survivor keeping its
+    // planned offset; a planned head slot that is not free is re-placed by best fit
+    // in the room the survivors leave, demoting layers in the demotion order until it
+    // fits.  It never adds a layer, admits a term the plan declined or moves anything
+    // else, so what it returns is a subset of the plan at the plan's offsets.
+    const kv_region_fit_result *       commit_plan   = nullptr;
     bool first_context = false;  // the model's FIRST_CONTEXT ranges count as free room
 };
 
