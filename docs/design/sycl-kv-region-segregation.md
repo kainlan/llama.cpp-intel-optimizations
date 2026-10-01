@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14ap, by impl-moua-s, 2026-10-01. The revisions answer forty-five reviews:
+Design, revision 7.14aq, by impl-moua-s, 2026-10-01. The revisions answer forty-five reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -269,6 +269,11 @@ Design, revision 7.14ap, by impl-moua-s, 2026-10-01. The revisions answer forty-
   one commit on top of `f5e3444f4` and answers no review: every live 23mk cite moves from
   `87da879f1`, the Qwen move of 35651584 B belongs to 23mk's step 4, and the oneDNN PP decline is
   23mk's verdict with its `fits`, `serves` and `plan_admits` predicates, with no flag.
+- the re-pin of the remaining live 23mk cites, whatever their old sha, recorded in §6.58. Revision
+  7.14aq is one commit on top of `9ae4776a2` and answers no review: the older pins (`cfb99d924`,
+  `e81dc2327`, `003bce159`, `93050c979`, `8547a22f0`, `50b1f8f50`, `a8cfbf901`, `db61cb321`,
+  `c3942d236`, `437073a29`) move to `ebc9c73e0`, and the Graph-scratch range's placement is stated
+  as 23mk now has it.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -1130,8 +1135,8 @@ written:
     many times in one hold, through
     `allocate_within({CONTEXT, id}, ONEDNN_GRAPH_SCRATCH, size, align, tag, consume = false)`
     (A2), and 23mk's teardown clear names it. It lies in the shared zone like every range a
-    transaction records (rulings §M32 I-2; 23mk 4.8a puts it on the RUNTIME TLSF, relayed,
-    §6.22). Its commit line is §M30's
+    transaction records (rulings §M32 I-2; 23mk puts it in `dev`'s `REGION`, the shared zone's
+    TLSFs, `ebc9c73e0`:6799; 4.8a said the RUNTIME TLSF, §6.22). Its commit line is §M30's
     `[CONTEXT-PLAN] graph scratch range: ctx=%u dev=%d txn=%u term=ONEDNN_GRAPH_SCRATCH backing=%s
     offset=%zu bytes=%zu admitted=%u of %u layers`, whose suffix, added from (b2) with the
     prefix byte-identical, is the admission witness the SDPA counts are scored against
@@ -1285,7 +1290,7 @@ written:
     interim ring uses the same query. §Z13.4 had it exclude `({CONTEXT, id}, REGION)`, which
     names nothing before L4, since only L4 records `REGION` ranges. **Before L4 the ring owns no
     range (rulings §Z15):** the interim ring passes `except_owner = pending_owner{}` (kind
-    `NONE`), which matches no range, so every range counts as taken (23mk 4.7 `cfb99d924`, accepted
+    `NONE`), which matches no range, so every range counts as taken (23mk `ebc9c73e0`:3282-3292, accepted
     over the §Z13.4 tuple). No caller sums other owners' ranges by hand. Like `pending_bytes`, it
     is accounting; a fit places by the ranges.
 
@@ -3265,10 +3270,10 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            `REGION`), so master counts W twice. **The site is not deleted (rulings §M32 I-4,
            §M33 I-G):** 23mk's §4 commit re-points it to `onednn_pp_w`'s value function and
            renames the store for W (`unified_cache_set_planned_onednn_pp_w_bytes`; 23mk §4.3 at
-           `003bce159`), and moua adopts the names. 7.14e said the value was deleted from both
+           `ebc9c73e0`:2419-2431), and moua adopts the names. 7.14e said the value was deleted from both
            sites, which left the W getter 0 and one fact with two sources (r15 I-4);
          - `pp_pipeline` (RUNTIME), **one term, whose value function is 23mk's (rulings §Z15;
-           23mk 4.7b `e81dc2327`)**: the allocation site's own bytes, `pp_pipeline_weight_bytes`
+           23mk `ebc9c73e0`:8613-8620)**: the allocation site's own bytes, `pp_pipeline_weight_bytes`
            (the allocation at `ggml-sycl.cpp:92998-93031` at `3d9414c8c`: the maximum
            `weight_bytes` over the schedule, times every buffer `b` the site sizes, and 0 when
            `pp_pipeline_env_enabled()` is off). The pack charges it by calling that function.
@@ -3390,8 +3395,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            the transitional terms' stores** on an arena device (r15 I-3, m-8; rulings §M38 C-2):
            `moe_onednn`'s weight-slot store (the entries of the load that laid out the arena,
            and during a load that load's pending entry; step 3), `pp_pipeline`'s, 23mk's
-           `unified_cache_set_planned_moe_ptr_table_bytes(dev, k × stride)` (23mk 4.8a L50,
-           L5489), and `XMX_MOE_BUFFERS`'s until beni converts rows 13 and 14. At master it sums
+           `unified_cache_set_planned_moe_ptr_table_bytes(dev, k × stride)` (23mk `ebc9c73e0`:8520-8523), and `XMX_MOE_BUFFERS`'s until beni converts rows 13 and 14. At master it sums
            `pp_pipeline`, the ring less its KV-zone part and `moe_control` (`:1569-1574`); the
            L4+L6 commit rewrites it to those stores, `moe_control` leaving as class C and the
            KV-zone split with the device ring (rulings §M32 I-1). The load-stage case is a
@@ -3531,7 +3535,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         (`unified-cache.cpp:15231-15320`), which is P1's violation. **The census:** every draw
         that names RUNTIME at `c69d5774d`, by an anchored search of the tracked tree for
         `vram_zone_id::RUNTIME` and every `prefer_vram_zone` assignment through a variable
-        (tests excluded), with 23mk 4.10's rows (census at `003bce159`, master `2c4f5e45d`), its
+        (tests excluded), with 23mk's rows (appendix at `ebc9c73e0`, master `2c4f5e45d`; the row numbers are those of
+        4.10), its
         owner, and where it lands relative to L4+L6:
         | site at `c69d5774d` | 23mk row | what it is | owner | its RUNTIME term after L4+L6 |
         |---|---|---|---|---|
@@ -3902,13 +3907,13 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           grows ONEDNN to W + G + P;
         - **SCRATCH.** Its floor is load-bearing today, and the consumers that need it are named
           here as defects: every SCRATCH draw in 23mk's allocation census that no enum term
-          covers. **The list is the one 23mk's appendix derives (23mk rev 4.11, `93050c979`;
+          covers. **The list is the one 23mk's appendix derives (23mk `ebc9c73e0` §4.8, :7353-7378;
           rulings §Z-23mk-411), and this design keeps no second hand list of it.** For reading
-          only, at `93050c979` it has 22 rows: beni's 17, 21, 31, 33, 34, 61 (the pool's peak,
+          only, at `ebc9c73e0` it has 22 rows: beni's 17, 21, 31, 33, 34, 61 (the pool's peak,
           which covers row 62), 68, 69, 74, 81, 90 and 106; pqmm's 59, 60, 66, 67 and 91; zhcn's
           51 (the compute-buffer chain's SCRATCH leg); 6lfq's 9 and 103; and the two named
           exemptions, 101 and 138, which also draw SCRATCH with no term and need one, or another
-          source, first. 7.14h named 14 of them from 23mk 4.10 (`003bce159`) and missed 66, 67,
+          source, first. 7.14h named 14 of them from 23mk 4.10 and missed 66, 67,
           68, 69, 74, 91, 103 and 106 (23mk r12 I-3). Each becomes its owner's term or head
           slot. The appendix excludes the core-planned rows (18, 32, 43, 47, 48, 70 and 100),
           the D rows 102, 111 and 127, which have no production caller and are deleted, row 137
@@ -4000,7 +4005,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         planned maximum (rulings §M29a):** it is allocated once, at the context transaction, as
         a head slot in the context's `REGION` headroom (the first context's in the load's
         reservation, step 3), and never grown. **A request above it is a DECLINE (rulings §M36
-        I-3; 23mk 4.10 §4.8, `003bce159`).** DECLINE is the fourth miss class, and it is outside
+        I-3; 23mk `ebc9c73e0` §4.8, :3950-3972).** DECLINE is the fourth miss class, and it is outside
         23mk's chokepoint, since the check is a size compare in `get_scratchpad_mem`, not a
         forbid refusal. Above the planned max of this (context, queue), `get_scratchpad_mem`:
         1. emits `[ZONE-PLAN-BUG] decline dev=%d site=%s bytes=%zu planned_max=%zu next=%s` at
@@ -4166,7 +4171,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         breaks P1, P2 and P4 on its own: a legacy `alloc_handle` outside the arena, a map keyed
         by raw pointer, a host headroom poll with a 2 s drain, and an abort on exhaustion.
         **What a runtime ONEDNN-zone miss does from (b1) on (rulings §M70 with its amendment,
-        §M72; matching 23mk `8547a22f0` §4.8 (b1); r26 I-3):** (b1) replaces the call at
+        §M72; matching 23mk `ebc9c73e0` §4.8 (b1), :6484-6492; r26 I-3):** (b1) replaces the call at
         `:11708` with the TERMINAL `[ZONE-PLAN-BUG]` channel, which never allocates. It **aborts
         unconditionally** with its scorable `[ZONE-PLAN-BUG]` message, whatever
         `GGML_SYCL_STRICT_LEASES` and STRICT say (rulings §M72): returning null would fault the
@@ -4177,8 +4182,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         wrong, and the fix is the plan, never a fallback allocation (P4). From (b1) on
         `onednn_graph_scratch_alloc_direct_locked` has no caller. (b1) does not delete the
         DIRECT reuse pool's try (`onednn_graph_scratch_try_pool_locked`, `:11704`): 23mk keeps
-        the pool through (b1) (`50b1f8f50` §4.8 (b1)), and its (b2) item 8 deletes the try with
-        the direct path (`50b1f8f50` :4786), so that deletion has one owner too (rulings §M68;
+        the pool through (b1) (`ebc9c73e0` §4.8, :7035-7041), and its (b2) item 8 deletes the try with
+        the direct path (`ebc9c73e0`:7105), so that deletion has one owner too (rulings §M68;
         r27 m-1). From (b1) the pool is empty, since it holds only parked direct allocations and
         none is made, so it serves nothing: a zone miss still runs the try at `:11704`, which
         returns null, and then reaches the TERMINAL channel. **The decline reads a planned fact,
@@ -4194,8 +4199,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         `interim_capacity` (the term above G). That is an allowed interim form, and (b2) deletes it
         and moves the decision to per-layer admission in the fit, `scratch_unplaced`, whose frozen
         mask the same read then consults. **The reader is 23mk's routing read, before the plan (23mk
-        `a8cfbf901` rev 4.19a, §4.8 "Routing reads the decline before the plan", at 23mk's head
-        `ebc9c73e0`; r28 m-1):** each of the three dispatch
+        rev 4.19a, §4.8 "Routing reads the decline before the plan", at 23mk's head
+        `ebc9c73e0`, :6696; r28 m-1):** each of the three dispatch
         arms, `fattn.cpp:2788` (FORCE_PATH), `:3123` (every non-D512 shape) and `:3907` (D = 512) at
         `d8a67422d`, calls
         `ggml_sycl_fattn_onednn_dispatch_routed(ctx, p, d_v, multi_seq, site, route)`, which
@@ -4262,7 +4267,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         none, must equal M − `admitted` of the commit line with the same `txn` (rulings §M78;
         23mk `ebc9c73e0`; §3.3's pairing), a run with no commit line is VOID, and M = 0
         is VOID for any SDPA claim, never a pass (§M71 (b)). At (b1) it is 23mk's counter dump
-        (rulings §M74 (g)-(i); 23mk `a8cfbf901` §5.1), read as §3.4 says: the run sets
+        (rulings §M74 (g)-(i); 23mk `ebc9c73e0` §5.1), read as §3.4 says: the run sets
         `GGML_SYCL_COUNTER_DUMP=1` in its literal command, and the dump's
         `[SYCL-COUNTER] end devices=%d` line, with that many devices listed, is its live check
         (§M66). N = 0 is valid only with
@@ -4278,13 +4283,13 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         `GGML_SYCL_PRIVATE_TESTING` exit dump, which never prints in `llama-completion`, `llama-cli`
         or `llama-server`, since the macro is defined only on test targets (§M74), so every vehicle
         arm that scored it was VOID by construction. The deletion of the direct path has one owner:
-        23mk `8547a22f0` (b2) item 8 deletes it with its reuse pool, the pool try at `:11704` and
-        its test hooks (rulings §M68 (b); E-ONEDNN-GRAPH-DIRECT; `50b1f8f50` :4786), and 23mk's H3
+        23mk `ebc9c73e0` (b2) item 8 (:7105) deletes it with its reuse pool, the pool try at `:11704`
+        and its test hooks (rulings §M68 (b); E-ONEDNN-GRAPH-DIRECT), and 23mk's H3
         "(b1)'s interim G" arm pins that it has no caller from (b1) on. **The runtime miss's arm
         (r26 I-3; rulings §M72), 23mk's to carry and moua's to
         cite:** a fixture draw one byte above the planned within-ubatch peak prints
         `[ZONE-PLAN-BUG]` once and aborts, with `GGML_SYCL_STRICT_LEASES` unset, and allocates
-        nothing. **It is 23mk H3's TERMINAL death test (23mk `db61cb321`):** the channel is a
+        nothing. **It is 23mk H3's TERMINAL death test (23mk `ebc9c73e0`:11795-11815):** the channel is a
         `[[noreturn]]` `ggml_sycl_onednn_graph_scratch_plan_miss`, run with STRICT unset inside
         a catch-all wrapper. GREEN is SIGABRT and exactly one `[ZONE-PLAN-BUG]` line. Its REDs
         are a mutant that returns nullptr, one that throws (which the wrapper, like
@@ -4306,7 +4311,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         - the draw itself, moved out of the ONEDNN zone into the context's `REGION` range
           (`onednn_graph_scratch_alloc`, `unified-cache.cpp:11655`, draws from the ONEDNN zone
           at master), with the direct overflow (`onednn_graph_scratch_alloc_direct_locked`,
-          `:11721`), uncalled since (b1), deleted by 23mk `8547a22f0` (b2) item 8 (rulings §M68
+          `:11721`), uncalled since (b1), deleted by 23mk `ebc9c73e0` (b2) item 8, :7105 (rulings §M68
           (b));
         - the load getter switch, `:4464` and `:27658` from the with-floor getter to the W
           getter, `unified_cache_get_planned_onednn_pp_w_bytes` (today `:2148`'s `_stored` getter),
@@ -4408,7 +4413,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       `size_t` summed beside master's `has_live_scratch` bool from each member's recorded size
       (`compute_arena_used()`, the scratch pool, the two oneDNN scratches, the reorder temp buffer,
       each persistent scratch and each PP MoE oneDNN slot); and the pending ranges are the `size_t`
-      count of pending ranges on the device's TLSFs (23mk §6.8, unchanged since `437073a29`). The
+      count of pending ranges on the device's TLSFs (23mk §6.8, `ebc9c73e0`:8399). The
       late stage never calls the ensure, so this refusal is reachable only at the early stage;
     - **The admitting stage is the early stage (rulings §X7 I-3).** llama calls
       `stage_inventory_plan` twice. The early call is `llama_model_sycl_compute_early_plan`'s
@@ -5099,8 +5104,8 @@ prompt-processing performance, never correctness, and the yield WARN names them.
      and the yield, is withdrawn: where the RUNTIME demand exceeds its 512 MiB floor, as on
      both MoE merge-gate shapes, step 4 sizes RUNTIME to exactly the load's terms, and that fit
      found no room (§6.19's question, answered by §M27 (1)).
-   - **Step 5 has two L1-released windows, in this order (23mk r8 m14; 23mk `c3942d236`
-     L1351-1353: "A's reap window (L1 released) sits before the yield's"):
+   - **Step 5 has two L1-released windows, in this order (23mk r8 m14; 23mk `ebc9c73e0`
+     :3180-3186: "A's reap window is a second L1-released window inside moua's step 5"):
      1. **23mk's A reap window**, before the yield. 23mk releases L1 for A's reap and relocks.
         After that relock the plan identity is checked under L0 (a change is
         `[CONTEXT-PLAN-BUG]`); this call's `REGION` ranges, A's placement among them, are still
@@ -5907,7 +5912,7 @@ them. It never re-fits KV and never yields.
   surfaces the refusal as a decode error naming the tenant bytes. It is not a runtime race: no
   allocation that skips L0 can take the room (rulings §M7 I-5; r7 I-5), and zhcn's ladder revert
   republishes the previous candidate.
-- **23mk's A step on this path, after L4 (rulings §Z15; 23mk 4.7 `cfb99d924`, adopted).** The
+- **23mk's A step on this path, after L4 (rulings §Z15; 23mk `ebc9c73e0`:3206, adopted).** The
   auto-ubatch ladder, where A grows, arrives as a same-key republish and takes this path, which
   has no step 5 and no yield, so the full path's slot (between step 5's recording and the yield)
   does not exist here. A's three parts sit as follows:
@@ -6655,10 +6660,10 @@ is withdrawn. RUNTIME has no floor on an arena device (rulings §M32 I-2; the en
 in the commit that moves its zone's last unplanned consumer (rulings §M37 Q3; the end
 states), after which `ensured_Z = demand_Z + charged_Z` for them too.
 
-**Agreed with impl-23mk** (23mk rev 4.7b `e81dc2327`, which agreed the enum with three
-amendments: the C class, `onednn_pp_pool` on SCRATCH, and `pp_pipeline` as one term with 23mk's
-value function; and 4.7c `175dcd51b`, whose §6.8 term table, L2986-3011, confirms these names,
-`load_reorder_temp` included). The owners of the two oneDNN scratches are the lead's (rulings
+**Agreed with impl-23mk** (23mk `ebc9c73e0` §6.8's term enum, :8528-8558, which agrees
+the enum with three amendments: the C class, `onednn_pp_pool` on SCRATCH, and `pp_pipeline` as one
+term with 23mk's value function, and whose table confirms these names, `load_reorder_temp`
+included). The owners of the two oneDNN scratches are the lead's (rulings
 §M19). One term, one owner, one value function:
 
 | term (`%s`) | zone | class | owner | value function / source |
@@ -6843,7 +6848,7 @@ The device-planned branch (master `ggml-sycl.cpp` ~38590-39200):
 4. **VMEM: the region takes precedence (audit I4; supersedes r1 M5's disposition). The refusal
    itself is carried by llama.cpp-23mk core (lead ruling), which lands before moua L4-L7:** 23mk
    refuses vmem-kv on an arena device (§2's fact 2, `ggml_sycl_device_has_zones(dev)`) with one
-   WARN (23mk rev 3.1 §6.6), so L6 adds no vmem code. The facts below are why the refusal is
+   WARN (23mk `ebc9c73e0` §6.6, :8282-8300), so L6 adds no vmem code. The facts below are why the refusal is
    needed; G1 still checks it.
    - The opt-in `GGML_SYCL_VMEM_KV=1` branch (master `:38846-38925`) runs only under an
      active arena, runs before the per-layer path, and returns early. It maps KV in physical
@@ -11136,9 +11141,9 @@ placement and demotion run. The rules for every such arm:
       raw allocation that succeeds (`if (ptr && ext_alloc_trace_enabled())`,
       `unified-cache.cpp:15308-15318` at `e2461d4fb`), and after the cut 1oxa's row C9 refuses
       the raw exit on VM, so the line can never print there, and its zero would be vacuous; 23mk
-      withdrew G1's line check for the same reason (`50b1f8f50` §9, G1). The raw exits are
+      withdrew G1's line check for the same reason (23mk `ebc9c73e0`:12548). The raw exits are
       scored instead by 23mk's always-compiled counter, the dump's `ext_alloc_count` field
-      (rulings §M74 (h); it lands in 23mk step 0, `a8cfbf901` §5.1: incremented at every raw
+      (rulings §M74 (h); it lands in 23mk step 0, `ebc9c73e0` §5.1: incremented at every raw
       exit, whatever the trace says), read through its unconditional accessor
       `unified_cache_ext_alloc_count_for_testing(0)`, with 0 the post-selector index of
       `level_zero:1`, which each child prints before and after its pass: the two are equal. The
@@ -11323,7 +11328,7 @@ so it moves to 23mk's always-compiled counter dump (§M74 (a), (g), (h)), and th
 at the print site it witnesses (§M74 (e)). **(f)** is an always-compiled WARN line its owner
 already prints in the shipped library.
 
-**How a dump is read (rulings §M74 (g)-(i); 23mk `a8cfbf901` §5.1).** The arm's literal command
+**How a dump is read (rulings §M74 (g)-(i); 23mk `ebc9c73e0` §5.1).** The arm's literal command
 sets `GGML_SYCL_COUNTER_DUMP=1`. `unified_cache_test_counter_dump()` runs from `std::atexit` and
 prints with `fprintf(stderr)`, so neither log filter drops it and no `-v` is needed. For each
 initialised device, in post-selector index order, it prints one line per counter of a fixed,
@@ -11540,7 +11545,7 @@ ordered list, zeros included, `[SYCL-COUNTER] dev=%d name=%s value=%llu`, then o
   ONEDNN sizing on both sides of the dry run until the Graph-scratch commit's (b2), less the
   constant from L4+L6 (rulings §M44 C-1).
 - **Not moua's:** the load getter switch, the with-floor getter's and the clamp's deletion, the
-  direct overflow's deletion (23mk `8547a22f0` (b2) item 8, rulings §M68 (b)), the draw's
+  direct overflow's deletion (23mk `ebc9c73e0` (b2) item 8, :7105; rulings §M68 (b)), the draw's
   move and the m-14 test and comment updates are the
   Graph-scratch commit's (23mk, in beni; rulings §M26a I-4), all in its (b2); its (b1) is the
   sinks-aware G input, before L4 (rulings §M44 C-1). 7.14b and 7.14c placed the switch in L6 and
@@ -11772,10 +11777,11 @@ zhcn 5.16).**
   RED. 7.14j's hard
   edge, the whole commit before L4+L6, was cyclic, since the conversion needs L4's pending
   ranges and claims and L6's transaction steps (r18 C-1). The tracker edges are added when the
-  implementation tickets are filed, and 23mk's "whichever of moua L4+L6 and the Graph-scratch
-  commit lands later" (23mk 4.11 L3421) is relayed as the split and its two edges. The order
+  implementation tickets are filed, and 23mk's former "whichever of moua L4+L6 and the Graph-scratch
+  commit lands later" (23mk 4.11 L3421), which its §M44 C-1 replaced with the edges (b1) → moua L4
+  and moua L6 → (b2) (23mk `ebc9c73e0`:1098-1102), is relayed as the split and its two edges. The order
   is fixed as (b1) → fkpg (a) → L4 → L6 → (b2) (rulings §M44b, §M46b I-4), and 23mk §6.8's
-  scoping note is mirrored:
+  scoping note (23mk:8498-8503) is mirrored:
   the converting commit is (b2), and H7ap's C-rule arm targets the tree after it.
 
 **Landing order (lead ruling; r4 I10).** jehw lands on master first (u1bb already has). Then:
@@ -14701,3 +14707,30 @@ range `87da879f1..ebc9c73e0` is 13 commits, revs 4.19m to 4.19y). History rows k
 | the no-block carve | 23mk's `zones_sufficient` return on a blockless arena carves a block when the device has no TP queue and the largest free ONEDNN run holds G_new + stored_new (since rev 4.19i; unchanged by 4.19m to 4.19y) | **Changed (SUBSTANTIVE, a mismatch with 87da879f1 too).** Old: "a `zones_sufficient` return on an arena that has no block leaves it 0". New: it leaves it 0 unless that carve places one (23mk:6198-6211). The replay's derivation for a fresh arena is unchanged. |
 | Graph-scratch terminal | `[ZONE-PLAN-BUG]` on the Graph scratch is still the unconditional `[[noreturn]]` abort | **No change.** Rev 4.19x and 4.19y's WARN-plus-strict level (rulings §M145) applies to the plane-W and activations acquire terminals, which moua does not cite. |
 | rulings §M113 to §M148 | the context ubatch refusal (§M118 m-4), the verdict's selector and legacy-callback reads (§M136), the loaded-layout key record (§M139) | **No moua text depends on them.** The ubatch refusal is 23mk's code at its own pre-yield point in the context transaction (23mk:2954-3085, "the same class of refusal as moua's fit refusal"); moua's step list is not changed. Reported to the lead as a question. |
+
+### 6.58 Revision 7.14aq: the remaining 23mk cites re-pinned to ebc9c73e0
+
+Revision 7.14aq is one commit on top of `9ae4776a2`, by impl-moua-s. It answers no review. The lead
+widened the re-pin of §6.57 to every live 23mk cite, whatever its old sha. Each was checked against
+`ebc9c73e0` for a change of meaning. History rows keep their old pins.
+
+| item | cite | disposition |
+|---|---|---|
+| ring exclusion | `cfb99d924` (4.7), the `pending_owner{}` exclusion accepted over §Z13.4 | **Re-pinned** to 23mk:3282-3292; the text is unchanged. |
+| value functions | `e81dc2327` (4.7b) and `175dcd51b` (4.7c): `pp_pipeline_weight_bytes`, the term enum and table | **Re-pinned** to 23mk:8613-8620 and :8528-8558; the three enum amendments still hold. The "L2986-3011" cite is replaced by the enum's range. |
+| census rows | `003bce159` (4.10): rows 13, 14, 20, 25, 26, 28, 30, 49, 92, 122, 125, 126 | **Re-pinned** to the appendix at `ebc9c73e0`; every row number and meaning is unchanged. |
+| SCRATCH list | `93050c979` (4.11): the 22-row list | **Re-pinned** to 23mk:7353-7378; the list is identical. |
+| rename | 23mk §4.3 at `003bce159` | **Re-pinned** to 23mk:2419-2431. |
+| scratchpad DECLINE | `003bce159` §4.8 | **Re-pinned** to 23mk:3950-3972; the steps are unchanged. |
+| runtime miss and direct path | `8547a22f0`, `50b1f8f50` (:4786), `db61cb321` | **Re-pinned** to 23mk:6484-6492, :7035-7041, :7105 (the (b2) item 8) and :11795-11815 (H3's TERMINAL death test). The old `:4786` was a line of a commit this design no longer cites; item 8 is at :7105. |
+| dump and routing read | `a8cfbf901` (§5.1, rev 4.19a) | **Re-pinned** to 23mk §5.1 and :6696; the dump's fields and format are unchanged. |
+| A's reap window | `c3942d236` L1351-1353, quoted | **Changed.** The quoted sentence no longer exists; the cite is :3180-3186 and quotes the present sentence ("a second L1-released window inside moua's step 5"). |
+| A on the republish path | `cfb99d924`, the auto-ubatch same-key republish | **Re-pinned** to 23mk:3206. |
+| `moe_ptr_table` setter | 4.8a "L50, L5489" | **Re-pinned** to 23mk:8520-8523. |
+| pending-range count | §6.8 "unchanged since `437073a29`" | **Re-pinned** to 23mk:8399. |
+| vmem-kv, G1 | rev 3.1 §6.6; `50b1f8f50` §9 G1 | **Re-pinned** to 23mk:8282-8300 and :12548. |
+| the order edges | 4.11 L3421, the "whichever ... lands later" quote | **Changed.** The quote is 23mk's former text; its §M44 C-1 replaced it with the edges (b1) → moua L4 and moua L6 → (b2) (23mk:1098-1102). The text says so and is otherwise unchanged. |
+| the Graph-scratch range | "23mk 4.8a puts it on the RUNTIME TLSF" | **Changed (SUBSTANTIVE).** Old: a RUNTIME TLSF placement, relayed. New: 23mk puts the range in `dev`'s `REGION`, the shared zone's TLSFs (23mk:6799). The sentence already led with "the shared zone"; only the parenthetical changes. |
+
+Cites that name only a 23mk revision (4.4, 4.5, 4.8, 4.13, 4.14, 4.16, 4.19i, 4.19j, 4.19l) carry no
+sha and no line, so they are left as the names of those revisions.
