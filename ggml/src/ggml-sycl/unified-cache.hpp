@@ -3504,6 +3504,11 @@ class unified_cache {
     size_t zone_used(vram_zone_id zone) const;
     size_t zone_available(vram_zone_id zone) const;
     size_t zone_largest_free(vram_zone_id zone) const;
+    // Both free-space figures of one zone, read together under its allocator group's mutex: the
+    // allocators' figures are only coherent under it (zone_available and zone_largest_free read
+    // them bare). Takes the group mutex, so a caller already inside the group (an allocation, a
+    // refusal) must not call it. False when no arena is active.
+    bool   zone_free_figures(vram_zone_id zone, size_t & available, size_t & largest_free);
     void   dump_live_zone_allocations(vram_zone_id zone, const char * where, size_t max_entries = 32) const;
 
     const vram_zone & get_zone(vram_zone_id zone) const { return arena_zones_[static_cast<int>(zone)]; }
@@ -3694,7 +3699,10 @@ class unified_cache {
                                  dma_stream_slice_fn              slice_fn,
                                  const void *                     ctx,
                                  const std::vector<sycl::event> & deps,
-                                 dma_stream_copy_fn               copy_fn = nullptr);
+                                 dma_stream_copy_fn               copy_fn     = nullptr,
+                                 // The caller's own file, defaulted at the call site, names the caller in
+                                 // the stream_dma_non_device_arrivals dump key. Pass nothing.
+                                 const char *                     caller_file = __builtin_FILE());
 
     // Defer freeing host allocations until the associated event completes.
     void defer_host_free(void * ptr, size_t size, const sycl::event & event);
@@ -7333,6 +7341,35 @@ void unified_cache_dump_counter_add_key(dump_counter counter, int dev, const cha
 void unified_cache_dump_snapshot_set(dump_snapshot snapshot, int dev, uint64_t value) noexcept;
 // Captures only the first time per device (the first_decode point).
 void unified_cache_dump_snapshot_set_once(dump_snapshot snapshot, int dev, uint64_t value) noexcept;
+// Back to not_captured: a point that no longer holds (load_2 once only one model is live).
+void unified_cache_dump_snapshot_clear(dump_snapshot snapshot, int dev) noexcept;
+// True until set_once has claimed the entry on `dev`, so a once-only capture can skip its reads.
+bool unified_cache_dump_snapshot_pending(dump_snapshot snapshot, int dev) noexcept;
+
+// The points a zone figure is captured at. FIRST_DECODE: the entry of the device's first graph_compute
+// whose batch is one token (WEIGHT free and largest-free, captured once). CONTEXT_TXN: the commit of a
+// context transaction (RUNTIME free and largest-free, ONEDNN capacity, overwritten at each commit).
+// Nothing is captured while the device has no arena, so the entry stays not_captured rather than 0.
+enum class dump_point : uint8_t { FIRST_DECODE, CONTEXT_TXN };
+void unified_cache_dump_capture_zone_figures(int dev, dump_point point) noexcept;
+
+// === G0 report lines (GGML_SYCL_COUNTER_DUMP=1) ===
+//
+// A figure G0 reads that is a line at its instant rather than a counter or a snapshot entry. Each
+// prints as `[SYCL-REPORT] <kind> key=value ...` on stderr, only while the dump is armed, and never
+// takes part in the counter table or its gate. The kinds, and where each is produced:
+//   landing         ggml_backend_sycl_buffer_publish: one per backend buffer, with the path that took it
+//   zone_figures    capacity, used, free and largest-free of one zone, read under its group mutex: the
+//                   RUNTIME and SCRATCH rooms after each backend buffer, the ONEDNN room after each load
+//   row73_own_alloc ggml_sycl_ensure_moe_ptr_table's own-allocation fallback, with the table_index
+//   arm_a_kernel    ggml_sycl_dispatch_mul_mat_kernel: the kernel and layout the selector chose for the
+//                   LM head (output.weight), with its type and ne11; once per distinct reading
+bool unified_cache_dump_report_enabled() noexcept;
+void unified_cache_dump_report(const char * text) noexcept;
+// Prints `text` the first time `key` is seen on this process, nothing after; false once the table of
+// 64 keys is full, so a flood of distinct readings is bounded rather than silent.
+bool unified_cache_dump_report_once(const char * key, const char * text) noexcept;
+void unified_cache_dump_report_zone_figures(int dev, const char * point, vram_zone_id zone) noexcept;
 // Recorded once by ggml_sycl_init, the post-selector count; the printer's loop
 // and its `end` line read it, never a query at exit.
 void unified_cache_dump_set_device_count(int device_count) noexcept;

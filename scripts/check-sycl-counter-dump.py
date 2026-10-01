@@ -102,7 +102,63 @@ ROUTE_INTERIM_KEYS = ["interim_tp", "interim_capped", "interim_capacity"]
 
 # Counters whose producer is on the tree at step 0 and must have a compiled increment.
 REQUIRED_PRODUCERS = ["ext_alloc_count", "ext_alloc_arena", "zone_cascade_miss", "zone_unconverted_miss",
-                      "zone_plan_refusal"]
+                      "zone_plan_refusal", "stream_dma_non_device_arrivals", "onednn_pp_record_mode_acquires",
+                      "set_rows_stage_arrivals", "set_rows_stage_record_mode_acquires", "onednn_sdpa_admitted",
+                      "onednn_sdpa_executed", "onednn_sdpa_fallback_after_admit"]
+
+# The G0 counters whose increment must sit in a named function, so a producer that drifted into an
+# unrelated function (or a second copy of the site) fails the gate rather than reading as live:
+# (counter, file under ggml/src/ggml-sycl, qualified function name).
+PRODUCER_SITES = [
+    ("stream_dma_non_device_arrivals", "unified-cache.cpp", "unified_cache::stream_dma"),
+    ("onednn_pp_record_mode_acquires", "ggml-sycl.cpp", "acquire_onednn_pp_scratch"),
+    ("set_rows_stage_arrivals", "set_rows.cpp", "ggml_sycl_set_rows_stage_ptr"),
+    ("set_rows_stage_record_mode_acquires", "set_rows.cpp", "ggml_sycl_set_rows_stage_ptr"),
+    ("onednn_sdpa_admitted", "fattn-onednn.cpp", "ggml_sycl_flash_attn_ext_onednn"),
+    ("onednn_sdpa_executed", "fattn-onednn.cpp", "ggml_sycl_flash_attn_ext_onednn"),
+    ("onednn_sdpa_fallback_after_admit", "fattn-onednn.cpp", "ggml_sycl_flash_attn_ext_onednn"),
+]
+
+# The snapshot entries' producers: id -> (file, function that holds the capture). The two zone-figure
+# points share one capture function that takes the point as a parameter and so names every entry; the
+# load-end entries share the load-end capture. onednn_pp_a_bytes lands at step 4 and has no producer.
+SNAPSHOT_SITES = {
+    "zone_available_weight_first_decode": ("unified-cache.cpp", "unified_cache_dump_capture_zone_figures"),
+    "zone_largest_free_weight_first_decode": ("unified-cache.cpp", "unified_cache_dump_capture_zone_figures"),
+    "zone_available_runtime_context_txn": ("unified-cache.cpp", "unified_cache_dump_capture_zone_figures"),
+    "zone_largest_free_runtime_context_txn": ("unified-cache.cpp", "unified_cache_dump_capture_zone_figures"),
+    "zone_capacity_onednn_context_txn": ("unified-cache.cpp", "unified_cache_dump_capture_zone_figures"),
+    "weight_host_tiered_bytes_load_1": ("unified-cache.cpp", "unified_cache_dump_capture_load_end"),
+    "weight_host_tiered_bytes_load_2": ("unified-cache.cpp", "unified_cache_dump_capture_load_end"),
+    "weight_planned_device_bytes_load_1": ("unified-cache.cpp", "unified_cache_dump_capture_load_end"),
+    "weight_planned_device_bytes_load_2": ("unified-cache.cpp", "unified_cache_dump_capture_load_end"),
+    "weight_live_bytes_last_load_end": ("unified-cache.cpp", "unified_cache_dump_capture_load_end"),
+}
+
+# Where each capture function is called from: (file, enclosing function, text the call carries). A
+# capture that nothing calls prints not_captured on every run, which G0 would read as VOID, not as a bug.
+CAPTURE_CALLERS = [
+    ("ggml-sycl.cpp", "ggml_sycl_run_runtime_context_transaction", "dump_point::CONTEXT_TXN"),
+    ("ggml-sycl.cpp", "ggml_backend_sycl_graph_compute_unchecked", "dump_point::FIRST_DECODE"),
+    ("unified-cache.cpp", "unified_cache_note_model_load_end", "unified_cache_dump_capture_load_end"),
+]
+
+# The G0 report lines: (kind, file, function, text that must appear in the function). A report is a
+# line at its instant, not a table entry, so the gate pins that its producer exists and says its kind.
+REPORT_SITES = [
+    ("landing", "ggml-sycl.cpp", "ggml_backend_sycl_buffer_publish", '"landing dev='),
+    ("landing", "ggml-sycl.cpp", "ggml_backend_sycl_buffer_publish", "vram_zone_id::RUNTIME"),
+    ("landing", "ggml-sycl.cpp", "ggml_backend_sycl_buffer_publish", "vram_zone_id::SCRATCH"),
+    ("zone_figures", "unified-cache.cpp", "dump_report_zone_figures_for", "[SYCL-REPORT] zone_figures dev="),
+    ("zone_figures", "unified-cache.cpp", "unified_cache_dump_capture_load_end", "vram_zone_id::ONEDNN"),
+    ("row73_own_alloc", "ggml-sycl.cpp", "bool ggml_sycl_ensure_moe_ptr_table", '"row73_own_alloc dev='),
+    ("arm_a_kernel", "ggml-sycl.cpp", "bool ggml_sycl_dispatch_mul_mat_kernel", '"arm_a_kernel dev='),
+]
+
+# A field whose producer cannot land yet prints value=not_captured, never a zero: its definition
+# needs the request's pending_owner (a load's request always carries its hold's owner), which lands
+# with moua L4L6 / 23mk S4a. The printer reads one predicate for the set, and the gate pins both.
+NOT_CAPTURED_FIELDS = ["load_row_op_time_arrivals"]
 
 # The tree's own facts: which landing steps are on it.
 B2_SENTINEL = re.compile(r"\bggml_sycl_onednn_graph_scratch_range_miss\s*\([^;{]*\)\s*(?:noexcept\s*)?\{")
@@ -484,6 +540,54 @@ def check(files, cmake):
         if live == 0:
             fails.append(f"H13 M74: counter {name} gated: no compiled use on this tree")
 
+    # Every step-0 snapshot entry has a compiled producer, in the function that owns its capture point.
+    for sid, printed, lands, retired in SNAPSHOTS:
+        if lands != "step0":
+            continue
+        rel, fn = SNAPSHOT_SITES[sid]
+        body = function_text(stripped.get(rel, ""), fn)
+        if body is None:
+            fails.append(f"H13 G0: {fn} not found in {rel}, the capture site of {printed}")
+            continue
+        m = re.search(r"\bdump_snapshot::" + sid + r"\b", body)
+        if not m:
+            fails.append(f"H13 G0: snapshot {printed} has no producer in {fn} ({rel})")
+        else:
+            ln = line_of(stripped[rel], stripped[rel].find(body) + m.start())
+            if not comp[rel][ln - 1][0]:
+                fails.append(f"H13 G0: snapshot {printed} producer is gated by PRIVATE_TESTING ({rel}:{ln})")
+
+    for name, rel, fn in PRODUCER_SITES:
+        body = function_text(stripped.get(rel, ""), fn)
+        if body is None:
+            fails.append(f"H13 G0: {fn} not found in {rel}, the producer site of {name}")
+        elif not re.search(r"dump_counter_add(?:_key)?\s*\(\s*(?:ggml_sycl::)?dump_counter::" + name + r"\b", body):
+            fails.append(f"H13 G0: counter {name} has no increment in {fn} ({rel})")
+
+    for kind, rel, fn, needle in REPORT_SITES:
+        body = function_text(stripped.get(rel, ""), fn)
+        if body is None:
+            fails.append(f"H13 G0: {fn} not found in {rel}, the producer of the {kind} report")
+        elif needle not in body:
+            fails.append(f"H13 G0: {fn} ({rel}) lost the {kind} report (`{needle}`)")
+
+    for rel, fn, needle in CAPTURE_CALLERS:
+        body = function_text(stripped.get(rel, ""), fn)
+        if body is None:
+            fails.append(f"H13 G0: {fn} not found in {rel}, the caller of a snapshot capture")
+        elif needle not in body:
+            fails.append(f"H13 G0: {fn} ({rel}) does not call the snapshot capture `{needle}`")
+
+    # A not-captured field has no increment anywhere and the printer reads the one predicate.
+    pred = function_text(cache_text, "dump_counter_captured")
+    for name in NOT_CAPTURED_FIELDS:
+        if pred is None or not re.search(r"\bdump_counter::" + name + r"\b", pred):
+            fails.append(f"H13 G0: {name} is not named by dump_counter_captured, so the printer would print a zero")
+        for rel, text in stripped.items():
+            for m in re.finditer(r"dump_counter_add(?:_key)?\s*\(\s*(?:ggml_sycl::)?dump_counter::" + name + r"\b", text):
+                fails.append(f"H13 G0: {name} has an increment ({rel}:{line_of(text, m.start())}) "
+                             f"but is declared not captured")
+
     # The interim keys of onednn_graph_route_declined.
     key_re = re.compile(r"dump_counter_add_key\s*\(\s*dump_counter::" + ROUTE_COUNTER + r"\s*,[^;]*?\"(\w+)\"",
                         re.S)
@@ -808,6 +912,83 @@ def mutation_matrix(files, cmake):
                  with_cache(cache_raw.replace("unified_cache_zone_refusal(req, zid, alloc_size, cache);",
                                               "unified_cache_zone_refusal(req, zid, alloc_size, cache->zone_available(zid));",
                                               1)), cmake))
+
+    # The G0 producers: each counter's increment dropped from its named function, one counter's
+    # increment moved into another function of the file, a not-captured field given an increment, and
+    # the printer's predicate no longer naming it.
+
+    for name, rel, fn in PRODUCER_SITES:
+        text = files[rel]
+        stripped_text = strip_comments(text)
+        body = function_text(stripped_text, fn)
+        # Blank every occurrence of the counter's name inside the function body, in the raw text.
+        raw_at = text.find(body.split("\n", 1)[0])
+        raw_body_end = raw_at + len(body)
+        mutated_body = re.sub(r"dump_counter::" + name + r"\b", "dump_counter::COUNT", text[raw_at:raw_body_end])
+        f = clone()
+        f[rel] = text[:raw_at] + mutated_body + text[raw_body_end:]
+        muts.append((f"{name} increment dropped", f"H13 G0: counter {name} has no increment in {fn}", f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"].replace(
+        "dump_counter::onednn_pp_record_mode_acquires", "dump_counter::COUNT", 1) + (
+        "\nstatic void h13_moved_producer(int d) { ggml_sycl::unified_cache_dump_counter_add("
+        "ggml_sycl::dump_counter::onednn_pp_record_mode_acquires, d); }\n")
+    muts.append(("record-mode increment moved to another function",
+                 "H13 G0: counter onednn_pp_record_mode_acquires has no increment in acquire_onednn_pp_scratch",
+                 f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"] + (
+        "\nstatic void h13_extra(int d) { ggml_sycl::unified_cache_dump_counter_add("
+        "ggml_sycl::dump_counter::load_row_op_time_arrivals, d); }\n")
+    muts.append(("not-captured field given an increment",
+                 "H13 G0: load_row_op_time_arrivals has an increment", f, cmake))
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
+        "return c != static_cast<size_t>(dump_counter::load_row_op_time_arrivals);", "return true;", 1)
+    muts.append(("predicate no longer names the not-captured field",
+                 "H13 G0: load_row_op_time_arrivals is not named by dump_counter_captured", f, cmake))
+
+    # The snapshot producers and their callers, and the report lines.
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
+        "dump_snapshot::weight_live_bytes_last_load_end, dev, cache->weight_bytes()",
+        "dump_snapshot::COUNT, dev, cache->weight_bytes()", 1)
+    muts.append(("load-end live-bytes snapshot producer dropped",
+                 "H13 G0: snapshot weight_live_bytes@last_load_end has no producer", f, cmake))
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
+        "dump_snapshot::zone_capacity_onednn_context_txn, dev,", "dump_snapshot::COUNT, dev,", 1)
+    muts.append(("onednn capacity snapshot producer dropped",
+                 "H13 G0: snapshot zone_capacity{ONEDNN}@context_txn has no producer", f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"].replace(
+        "ctx->device, ggml_sycl::dump_point::CONTEXT_TXN", "ctx->device, ggml_sycl::dump_point::FIRST_DECODE", 1)
+    muts.append(("context transaction no longer captures",
+                 "H13 G0: ggml_sycl_run_runtime_context_transaction (ggml-sycl.cpp) does not call the snapshot capture",
+                 f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"].replace(
+        "sycl_ctx->device, ggml_sycl::dump_point::FIRST_DECODE", "sycl_ctx->device, ggml_sycl::dump_point::CONTEXT_TXN", 1)
+    muts.append(("first decode no longer captures",
+                 "H13 G0: ggml_backend_sycl_graph_compute_unchecked (ggml-sycl.cpp) does not call the snapshot capture",
+                 f, cmake))
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
+        "unified_cache_dump_capture_load_end(device_id, cache.get(), slot, load_txn_id);", "", 1)
+    muts.append(("load end no longer captures",
+                 "H13 G0: unified_cache_note_model_load_end (unified-cache.cpp) does not call the snapshot capture",
+                 f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"].replace('"row73_own_alloc dev=', '"row73 dev=', 1)
+    muts.append(("row 73 report dropped", "H13 G0: bool ggml_sycl_ensure_moe_ptr_table", f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"].replace('"arm_a_kernel dev=', '"arm_a dev=', 1)
+    muts.append(("arm A kernel report dropped", "H13 G0: bool ggml_sycl_dispatch_mul_mat_kernel", f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"].replace(
+        'ggml_sycl::unified_cache_dump_report_zone_figures(ctx->device, "after_backend_buffer",\n'
+        '                                                          ggml_sycl::vram_zone_id::SCRATCH);', "", 1)
+    muts.append(("landing no longer reports SCRATCH", "H13 G0: ggml_backend_sycl_buffer_publish", f, cmake))
 
     # The ggml-sycl target given the macro.
     muts.append(("ggml-sycl defines the macro", "H13 M74: the ggml-sycl target defines GGML_SYCL_PRIVATE_TESTING",

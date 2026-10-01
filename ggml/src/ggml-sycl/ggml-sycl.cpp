@@ -1490,6 +1490,14 @@ static bool acquire_onednn_pp_scratch(int                       device_id,
     if (!weights_scratch || !activations_scratch || !onednn_pp_unified_scratch_enabled(type)) {
         return false;
     }
+    if (g_ggml_sycl_graph_recording) {
+        // A's acquire reached while a graph records: the count decides whether the activation scratch
+        // waits for the graph invalidation (G0 reads it; the key carries the bytes either way).
+        char key[64];
+        std::snprintf(key, sizeof(key), "weights=%zu,activations=%zu", weights_bytes, activations_bytes);
+        ggml_sycl::unified_cache_dump_counter_add_key(ggml_sycl::dump_counter::onednn_pp_record_mode_acquires,
+                                                      device_id, key);
+    }
     ggml_sycl::onednn_scratch_result scratch =
         ggml_sycl::unified_cache_get_onednn_scratch(device_id, weights_bytes, activations_bytes);
     if (!scratch.ok && ggml_sycl::unified_cache_reserve_onednn_scratch(device_id, weights_bytes, activations_bytes)) {
@@ -18662,6 +18670,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     }
     g_runtime_update_succeeded = true;
     announce_kv_host_demotions(*immutable->plan);
+    // The commit point the dump's context_txn snapshot entries name: the RUNTIME room and the ONEDNN
+    // capacity as they stand once this transaction has published.
+    ggml_sycl::unified_cache_dump_capture_zone_figures(ctx->device, ggml_sycl::dump_point::CONTEXT_TXN);
 
 #if GGML_SYCL_DNNL
     // llama.cpp-0oxf: a pooled DIRECT Graph-scratch buffer was sized for the
@@ -37570,6 +37581,19 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish(ggml_backend_buffe
     // never leaves an owner behind.  A buffer whose backing allocation carries
     // no id simply gets no owner and behaves exactly as it did before.
     ctx->buffer_owner = ggml_sycl_mint_buffer_owner(ctx->managed_meta.id);
+    if (ggml_sycl::unified_cache_dump_report_enabled()) {
+        // Where this backend buffer landed, and what the zones it competes for hold afterwards: the
+        // RUNTIME and SCRATCH rooms G0 prints next to the planned terms.
+        char line[256];
+        std::snprintf(line, sizeof(line), "landing dev=%d buft=%s size=%zu origin=\"%s\" tier=%d", ctx->device,
+                      ggml_backend_sycl_buffer_type_get_name(buft), size, origin,
+                      static_cast<int>(ctx->managed_meta.tier));
+        ggml_sycl::unified_cache_dump_report(line);
+        ggml_sycl::unified_cache_dump_report_zone_figures(ctx->device, "after_backend_buffer",
+                                                          ggml_sycl::vram_zone_id::RUNTIME);
+        ggml_sycl::unified_cache_dump_report_zone_figures(ctx->device, "after_backend_buffer",
+                                                          ggml_sycl::vram_zone_id::SCRATCH);
+    }
     if (ctx->buffer_owner.model.value != 0) {
         if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
             cache->note_buffer_owner_live(ctx->buffer_owner.model.value);
@@ -56589,6 +56613,18 @@ static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
     }
 
     // Fallback: runtime allocation via unified_alloc.
+    if (ggml_sycl::unified_cache_dump_report_enabled()) {
+        // Row 73's own-allocation fallback, as master takes it: the bytes it asks for and the
+        // table_index that sent it here (-1, or out of the preallocated range), beside the
+        // preallocated block's own table size and count. A baseline for a path the conversion deletes.
+        const auto * report_bufs = ggml_sycl::moe_get_inference_buffers(device);
+        char         line[192];
+        std::snprintf(line, sizeof(line),
+                      "row73_own_alloc dev=%d bytes=%zu table_index=%d prealloc_table_bytes=%zu prealloc_n_tables=%d",
+                      device, bytes, table_index, report_bufs ? report_bufs->table_bytes : (size_t) 0,
+                      report_bufs ? report_bufs->n_tables : -1);
+        ggml_sycl::unified_cache_dump_report(line);
+    }
     ggml_sycl::alloc_request req{};
     req.queue                          = &queue;
     req.device                         = device;
@@ -61940,6 +61976,20 @@ static bool ggml_sycl_dispatch_mul_mat_kernel(ggml_backend_sycl_context & ctx,
         std::strstr(src0->name, "attn_output") == nullptr) {
         GGML_SYCL_DEBUG("[SYCL] output.weight dispatch kernel=%s layout=%d batch=%lld\n",
                         ggml_sycl_mul_mat_kernel_name(kernel), (int) layout, (long long) src1->ne[1]);
+    }
+    if (ggml_sycl::unified_cache_dump_report_enabled() && src0 && src0->name &&
+        std::strstr(src0->name, "output.weight") != nullptr && std::strstr(src0->name, "attn_output") == nullptr) {
+        // The LM head's (type, layout, kernel) pairing as the selector resolved it, once per distinct
+        // reading: arm A's kernel at the batch G1h and rivk read (ne11 = 512 and 16), and the pairing
+        // check's input. The step-0 build still routes this weight by the selector, whatever it holds.
+        char key[128];
+        char line[256];
+        std::snprintf(key, sizeof(key), "arm_a_kernel:%d:%s:%d:%d:%lld", ctx.device, ggml_type_name(src0->type),
+                      (int) layout, (int) kernel, (long long) src1->ne[1]);
+        std::snprintf(line, sizeof(line), "arm_a_kernel dev=%d weight=%s type=%s kernel=%s kernel_layout=%d ne11=%lld",
+                      ctx.device, src0->name, ggml_type_name(src0->type), ggml_sycl_mul_mat_kernel_name(kernel),
+                      (int) layout, (long long) src1->ne[1]);
+        (void) ggml_sycl::unified_cache_dump_report_once(key, line);
     }
 
     switch (kernel) {
@@ -105360,6 +105410,11 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     // returns stale PP phase during TG, causing graph replay with wrong shapes.
     // Computed BEFORE arena reset so per-PP profiling can include reset cost.
     const bool cached_is_decode = ggml_sycl_graph_is_decode(cgraph);
+    if (cached_is_decode) {
+        // Once per device, at the entry of its first one-token graph: the WEIGHT room G0 prints beside
+        // the bytes each interim WEIGHT row requests.
+        ggml_sycl::unified_cache_dump_capture_zone_figures(sycl_ctx->device, ggml_sycl::dump_point::FIRST_DECODE);
+    }
     ggml_sycl::offload_stats_set_phase(cached_is_decode ? ggml_sycl::offload_phase::TG : ggml_sycl::offload_phase::PP);
     const bool arena_pp_profile_active = ggml_sycl::arena_pp_profile_begin(sycl_ctx->device, !cached_is_decode);
     pp_scratch_profile_begin(!cached_is_decode);

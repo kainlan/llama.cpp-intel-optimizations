@@ -991,11 +991,19 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     if (layout_plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT) {
         return false;
     }
+    // Admitted: the plan is not a reject. Every `return false` below is a fallback after admission,
+    // counted with the site that took it (G1h scores executed == admitted and a fallback total of 0).
+    ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::onednn_sdpa_admitted, ctx.device);
+    auto decline = [&ctx](const char * site) {
+        ggml_sycl::unified_cache_dump_counter_add_key(ggml_sycl::dump_counter::onednn_sdpa_fallback_after_admit,
+                                                      ctx.device, site);
+        return false;
+    };
     // oneDNN graph execute and the materialization allocation/repack are not
     // compatible with SYCL command graph recording. Follow the same policy as
     // DnnlMatMulWrapper: native FA handles recorded graphs.
     if (g_ggml_sycl_graph_recording) {
-        return false;
+        return decline("graph_recording");
     }
 
     // oneDNN graph SYCL execute requires device USM for ALL input tensors.
@@ -1010,11 +1018,11 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     // call which syncs the L0 driver.
     static constexpr uintptr_t kDeviceVAThreshold = (uintptr_t) 1 << 47;  // ~128 TB
     if (reinterpret_cast<uintptr_t>(params.Q) < kDeviceVAThreshold) {
-        return false;                                                     // Q is host/mmap — skip oneDNN
+        return decline("q_host");                                         // Q is host/mmap — skip oneDNN
     }
     if (reinterpret_cast<uintptr_t>(params.K) < kDeviceVAThreshold ||
         reinterpret_cast<uintptr_t>(params.V) < kDeviceVAThreshold) {
-        return false;  // K/V source is host/mmap — skip oneDNN and native FA will handle it.
+        return decline("kv_host");  // K/V source is host/mmap — skip oneDNN and native FA will handle it.
     }
 
     fattn_params                        active_params = params;
@@ -1089,7 +1097,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
                         D, params.ne01, params.ne11, H_q, H_kv, params.nb11, (long long) params.nb12, params.nb21,
                         (long long) params.nb22);
             }
-            return false;
+            return decline("materialize_desc");
         }
         if (!ggml_sycl_flash_attn_ext_onednn_materialize_kv(desc, params, *stream, &materialized)) {
             if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
@@ -1098,7 +1106,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
                         "D=%d ne01=%d ne11=%d H_q=%d H_kv=%d bytes=%zu\n",
                         D, params.ne01, params.ne11, H_q, H_kv, desc.bytes_per_tensor);
             }
-            return false;
+            return decline("materialize_kv");
         }
         auto k_resolved = materialized.K.resolve(ctx.device);
         auto v_resolved = materialized.V.resolve(ctx.device);
@@ -1109,7 +1117,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
                         "device=%d\n",
                         ctx.device);
             }
-            return false;
+            return decline("materialize_resolve");
         }
         if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
             fprintf(stderr, "[SYCL] fattn: oneDNN MATERIALIZED D=%d ne01=%d ne11=%d H_q=%d H_kv=%d bytes=%zu\n", D,
@@ -1134,11 +1142,11 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
                 fprintf(stderr, "[SYCL] fattn: oneDNN Q_F32_MATERIALIZE_FAILED D=%d ne01=%d H_q=%d\n", D,
                         active_params.ne01, H_q);
             }
-            return false;
+            return decline("q_f32_materialize");
         }
         auto q_resolved = materialized.Q.resolve(ctx.device);
         if (!q_resolved || !q_resolved.on_device) {
-            return false;
+            return decline("q_resolve");
         }
         active_params.Q      = static_cast<const char *>(q_resolved.ptr);
         active_params.Q_type = GGML_TYPE_F16;
@@ -1207,7 +1215,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
 
         // Negative cache — previous compile for this shape failed; fall through fast.
         if (cache->negative.count(key)) {
-            return false;
+            return decline("negative_cache");
         }
 
         auto it = cache->hits.find(key);
@@ -1239,7 +1247,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
                 fprintf(stderr, "[SYCL] oneDNN SDPA compile failed for D=%d ncols=%d ne11=%d H_q=%d H_kv=%d: %s\n", D,
                         active_params.ne01, active_params.ne11, H_q, H_kv, e.what());
                 cache->negative[key] = true;
-                return false;
+                return decline("compile_failed");
             }
         }
     }
@@ -1267,7 +1275,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     // formula check: unlike the old 1/sqrt(D)-only invariant, it must hold for
     // every finite nonzero scale, not just the historical one.
     if (active_params.scale == 0.0f || !std::isfinite(active_params.scale)) {
-        return false;  // the planner gate should have rejected this already; defensive only
+        return decline("scale_guard");  // the planner gate should have rejected this already; defensive only
     }
     GGML_ASSERT(active_params.scale == entry->scale &&
                 "oneDNN SDPA: cached partition's baked scale does not match the runtime scale (cache key/scale "
@@ -1360,9 +1368,10 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
 
         release_guard.terminal      = exec_event;
         release_guard.have_terminal = true;
+        ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::onednn_sdpa_executed, ctx.device);
     } catch (std::exception & e) {
         fprintf(stderr, "[SYCL] oneDNN SDPA execute failed: %s\n", e.what());
-        return false;
+        return decline("execute_threw");
     }
 
     return true;

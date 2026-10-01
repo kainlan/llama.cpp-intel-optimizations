@@ -4119,6 +4119,15 @@ const char * dump_site_basename(const char * file) {
     return slash ? slash + 1 : file;
 }
 
+// A counter whose producer cannot land on this tree prints the not_captured sentinel instead of a
+// zero: load_row_op_time_arrivals counts a request from the four load rows that carries no
+// pending_owner, and the request has no such field until moua L4L6 / 23mk S4a. A zero printed here
+// would read as "predicted 0, observed 0" on a dump that never counted. scripts/check-sycl-counter-dump.py
+// pins the set against any increment, so landing the producer means flipping this predicate.
+bool dump_counter_captured(size_t c) {
+    return c != static_cast<size_t>(dump_counter::load_row_op_time_arrivals);
+}
+
 // How a request is named in a line or a key: `site` is its construction site, `cohort` its cohort,
 // or the site when it has none, so every cohort-less request is distinct. Written once, for the raw
 // exit and the chokepoint alike.
@@ -4130,6 +4139,28 @@ struct request_label {
 void request_label_fill(const alloc_request & req, request_label & out) {
     std::snprintf(out.site, sizeof(out.site), "%s:%d", dump_site_basename(req.site_file), req.site_line);
     out.cohort = (req.intent.cohort_id != nullptr && req.intent.cohort_id[0] != '\0') ? req.intent.cohort_id : out.site;
+}
+
+// One record per (device, ownership slot) of what the last load of that model planned, so the
+// load-end snapshot can name every live model by load order. Static storage, trivially destructible,
+// guarded by its own leaf spin lock: it is read and written from the load-end and slot-release paths
+// and nowhere under an allocation.
+struct dump_load_model {
+    bool     live;
+    uint64_t order;
+    uint64_t host_tiered_bytes;
+    uint64_t planned_device_bytes;
+};
+
+struct dump_load_models {
+    dump_leaf_lock  lock;
+    uint64_t        next_order;
+    dump_load_model models[k_dump_devices][MODEL_SLOT_COUNT];
+};
+
+dump_load_models & dump_load_models_table() {
+    static dump_load_models t;
+    return t;
 }
 
 }  // namespace
@@ -4172,6 +4203,70 @@ void unified_cache_dump_snapshot_set_once(dump_snapshot snapshot, int dev, uint6
         s.value[dev].store(value, std::memory_order_relaxed);
         s.captured[dev].store(true, std::memory_order_release);
     }
+}
+
+void unified_cache_dump_snapshot_clear(dump_snapshot snapshot, int dev) noexcept {
+    if (!dump_dev_valid(dev) || snapshot >= dump_snapshot::COUNT) {
+        return;
+    }
+    dump_snapshot_state & s = dump_tbl().snapshots[static_cast<size_t>(snapshot)];
+    s.captured[dev].store(false, std::memory_order_release);
+    s.claimed[dev].store(false, std::memory_order_relaxed);
+}
+
+bool unified_cache_dump_snapshot_pending(dump_snapshot snapshot, int dev) noexcept {
+    if (!dump_dev_valid(dev) || snapshot >= dump_snapshot::COUNT) {
+        return false;
+    }
+    return !dump_tbl().snapshots[static_cast<size_t>(snapshot)].claimed[dev].load(std::memory_order_relaxed);
+}
+
+bool unified_cache_dump_report_enabled() noexcept {
+    return counter_dump_requested();
+}
+
+void unified_cache_dump_report(const char * text) noexcept {
+    if (text == nullptr || !counter_dump_requested()) {
+        return;
+    }
+    std::fprintf(stderr, "[SYCL-REPORT] %s\n", text);
+}
+
+namespace {
+constexpr size_t k_report_once_capacity = 64;
+constexpr size_t k_report_once_key_len  = 96;
+
+struct report_once_table {
+    dump_leaf_lock lock;
+    size_t         count;
+    char           keys[k_report_once_capacity][k_report_once_key_len];
+};
+
+report_once_table & report_once_tbl() {
+    static report_once_table t;  // static storage, trivially destructible: nothing allocates on first use
+    return t;
+}
+}  // namespace
+
+bool unified_cache_dump_report_once(const char * key, const char * text) noexcept {
+    if (key == nullptr || text == nullptr || !counter_dump_requested()) {
+        return false;
+    }
+    {
+        report_once_table & t = report_once_tbl();
+        dump_leaf_guard     guard(t.lock);
+        for (size_t i = 0; i < t.count; ++i) {
+            if (std::strncmp(t.keys[i], key, k_report_once_key_len - 1) == 0) {
+                return true;
+            }
+        }
+        if (t.count >= k_report_once_capacity) {
+            return false;
+        }
+        std::snprintf(t.keys[t.count++], k_report_once_key_len, "%s", key);
+    }
+    std::fprintf(stderr, "[SYCL-REPORT] %s\n", text);
+    return true;
 }
 
 void unified_cache_dump_set_device_count(int device_count) noexcept {
@@ -4223,10 +4318,18 @@ void unified_cache_test_counter_dump() {
     const int    devices = std::min(t.device_count.load(std::memory_order_relaxed), k_dump_devices);
     for (int dev = 0; dev < devices; ++dev) {
         for (size_t c = 0; c < static_cast<size_t>(dump_counter::COUNT); ++c) {
+            if (!dump_counter_captured(c)) {
+                std::fprintf(stderr, "[SYCL-COUNTER] dev=%d name=%s value=not_captured\n", dev,
+                             k_dump_counter_names[c]);
+                continue;
+            }
             std::fprintf(stderr, "[SYCL-COUNTER] dev=%d name=%s value=%llu\n", dev, k_dump_counter_names[c],
                          static_cast<unsigned long long>(t.counters[c].total[dev].load(std::memory_order_relaxed)));
         }
         for (size_t c = 0; c < static_cast<size_t>(dump_counter::COUNT); ++c) {
+            if (!dump_counter_captured(c)) {
+                continue;
+            }
             const uint32_t keys = t.counters[c].key_count.load(std::memory_order_acquire);
             for (uint32_t k = 0; k < keys; ++k) {
                 const uint64_t v = t.counters[c].keys[k].value[dev].load(std::memory_order_relaxed);
@@ -14466,7 +14569,8 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
                                                            dma_stream_slice_fn              slice_fn,
                                                            const void *                     ctx,
                                                            const std::vector<sycl::event> & deps,
-                                                           dma_stream_copy_fn               copy_fn) {
+                                                           dma_stream_copy_fn               copy_fn,
+                                                           const char *                     caller_file) {
     dma_stream_result result{};
     result.queue = &queue_;
     if (!src.ptr || !slice_fn) {
@@ -14502,6 +14606,14 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
         result.ok             = true;
         result.slices         = 1;
         return result;
+    }
+
+    // A source that is not device-resident reached a device executor: placement is predicted to leave
+    // none, and the arena must exist for the count to mean that (before its first publish a zero is
+    // zero by construction). G0 reads this total, and its voiding rule voids G1-G5 when it is not 0.
+    if (arena_active()) {
+        unified_cache_dump_counter_add_key(dump_counter::stream_dma_non_device_arrivals,
+                                           ggml_sycl_get_device_id_from_queue(queue_), dump_site_basename(caller_file));
     }
 
     if (src.location == cache_location::HOST_MMAP) {
@@ -22611,11 +22723,111 @@ bool unified_cache_note_model_load_abort(uint64_t load_txn_id) noexcept {
     }
 }
 
+// The zone_figures report line for a cache the caller already holds, so a caller inside the cache
+// registry's shared lock (the load-end path) does not take it a second time.
+static void dump_report_zone_figures_for(unified_cache * cache, int dev, const char * point, vram_zone_id zone) {
+    size_t available = 0;
+    size_t largest   = 0;
+    if (cache == nullptr || !counter_dump_requested() || !cache->zone_free_figures(zone, available, largest)) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "[SYCL-REPORT] zone_figures dev=%d point=%s zone=%s capacity=%zu used=%zu available=%zu "
+                 "largest_free=%zu\n",
+                 dev, point != nullptr ? point : "-", vram_zone_name(zone), cache->zone_capacity(zone),
+                 cache->zone_used(zone), available, largest);
+}
+
+// The load-end snapshot entries of `dev`: this model's planned bytes from its candidate plan (device
+// bytes charged on `dev`, host-tiered bytes), recorded against its ownership slot with a load order;
+// then the first two live models by load order publish as load_1 and load_2 (load_2 reads
+// not_captured while one model is live), beside the device's live WEIGHT bytes. A model with no plan
+// leaves its entries not_captured, never zero. The load-end call runs before the plan publishes, so
+// the plan is still the candidate. A third live model is recorded but not printed.
+static void unified_cache_dump_capture_load_end(int             dev,
+                                                unified_cache * cache,
+                                                uint32_t        slot,
+                                                uint64_t        load_txn_id) noexcept {
+    if (!dump_dev_valid(dev) || cache == nullptr || slot >= MODEL_SLOT_COUNT) {
+        return;
+    }
+    bool     have_plan = false;
+    uint64_t host      = 0;
+    uint64_t planned   = 0;
+    try {
+        const auto snap = lifecycle_find_candidate_placement_plan(load_txn_id);
+        if (snap && snap->plan) {
+            have_plan = true;
+            for (const placement_entry & e : snap->plan->entries) {
+                if (e.on_device) {
+                    const int target = e.target_device >= 0 ? e.target_device : snap->plan->device_id;
+                    if (target == dev) {
+                        planned += e.vram_charge_size != 0 ? e.vram_charge_size : e.dst_size;
+                    }
+                } else if (snap->plan->multi_device || snap->plan->device_id == dev) {
+                    host += e.src_size;
+                }
+            }
+        }
+    } catch (...) {
+        have_plan = false;
+    }
+
+    dump_load_models & t = dump_load_models_table();
+    dump_load_model    first{};
+    dump_load_model    second{};
+    int                live_with_plan = 0;  // 0, 1 or 2: how many of load_1 / load_2 hold a model
+    {
+        dump_leaf_guard guard(t.lock);
+        t.models[dev][slot] = { have_plan, ++t.next_order, host, planned };
+        // The two live models with the smallest load orders: `first`, then the smallest order above it.
+        for (uint32_t i = 0; i < MODEL_SLOT_COUNT; ++i) {
+            const dump_load_model & m = t.models[dev][i];
+            if (m.live && (live_with_plan == 0 || m.order < first.order)) {
+                first          = m;
+                live_with_plan = 1;
+            }
+        }
+        bool have_second = false;
+        for (uint32_t i = 0; live_with_plan >= 1 && i < MODEL_SLOT_COUNT; ++i) {
+            const dump_load_model & m = t.models[dev][i];
+            if (m.live && m.order > first.order && (!have_second || m.order < second.order)) {
+                second      = m;
+                have_second = true;
+            }
+        }
+        live_with_plan = have_second ? 2 : live_with_plan;
+    }
+    if (live_with_plan >= 1) {
+        unified_cache_dump_snapshot_set(dump_snapshot::weight_host_tiered_bytes_load_1, dev, first.host_tiered_bytes);
+        unified_cache_dump_snapshot_set(dump_snapshot::weight_planned_device_bytes_load_1, dev,
+                                        first.planned_device_bytes);
+    } else {
+        unified_cache_dump_snapshot_clear(dump_snapshot::weight_host_tiered_bytes_load_1, dev);
+        unified_cache_dump_snapshot_clear(dump_snapshot::weight_planned_device_bytes_load_1, dev);
+    }
+    if (live_with_plan >= 2) {
+        unified_cache_dump_snapshot_set(dump_snapshot::weight_host_tiered_bytes_load_2, dev, second.host_tiered_bytes);
+        unified_cache_dump_snapshot_set(dump_snapshot::weight_planned_device_bytes_load_2, dev,
+                                        second.planned_device_bytes);
+    } else {
+        unified_cache_dump_snapshot_clear(dump_snapshot::weight_host_tiered_bytes_load_2, dev);
+        unified_cache_dump_snapshot_clear(dump_snapshot::weight_planned_device_bytes_load_2, dev);
+    }
+    unified_cache_dump_snapshot_set(dump_snapshot::weight_live_bytes_last_load_end, dev, cache->weight_bytes());
+    // G0 prints the ONEDNN room after each load, beside the model's W; this tree has no W term yet.
+    try {
+        dump_report_zone_figures_for(cache, dev, "load_end", vram_zone_id::ONEDNN);
+    } catch (...) {
+    }
+}
+
 void unified_cache_note_model_load_end(uint32_t slot, uint64_t load_txn_id) {
     std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
     for (auto & [device_id, cache] : g_device_caches) {
         if (cache) {
             cache->note_model_load_end(slot, load_txn_id);
+            unified_cache_dump_capture_load_end(device_id, cache.get(), slot, load_txn_id);
         }
     }
 }
@@ -22626,6 +22838,12 @@ size_t unified_cache_release_model_slot(uint32_t slot) {
     for (auto & [device_id, cache] : g_device_caches) {
         if (cache) {
             reclaimed += cache->release_model_slot(slot);
+            if (dump_dev_valid(device_id) && slot < MODEL_SLOT_COUNT) {
+                // A released model is no longer live: the next load end must not name it.
+                dump_load_models & t = dump_load_models_table();
+                dump_leaf_guard    guard(t.lock);
+                t.models[device_id][slot].live = false;
+            }
         }
     }
     return reclaimed;
@@ -24318,6 +24536,62 @@ size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
     }
 
     return zone_available(zone);
+}
+
+bool unified_cache::zone_free_figures(vram_zone_id zone, size_t & available, size_t & largest_free) {
+    if (!arena_active()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+    available    = zone_available(zone);
+    largest_free = zone_largest_free(zone);
+    return true;
+}
+
+void unified_cache_dump_report_zone_figures(int dev, const char * point, vram_zone_id zone) noexcept {
+    if (!counter_dump_requested()) {
+        return;
+    }
+    try {
+        dump_report_zone_figures_for(get_cache_shared(dev), dev, point, zone);
+    } catch (...) {
+    }
+}
+
+// Reads happen here and only here for the zone-figure snapshots: under the zone's group mutex, at a
+// point no allocation or refusal is inside (the first decode's entry, a context transaction's commit),
+// never from the chokepoint. Without an arena nothing is captured, so the entry reads not_captured.
+void unified_cache_dump_capture_zone_figures(int dev, dump_point point) noexcept {
+    if (!dump_dev_valid(dev)) {
+        return;
+    }
+    if (point == dump_point::FIRST_DECODE &&
+        !unified_cache_dump_snapshot_pending(dump_snapshot::zone_available_weight_first_decode, dev)) {
+        return;
+    }
+    try {
+        unified_cache * cache = get_cache_shared(dev);
+        if (cache == nullptr) {
+            return;
+        }
+        size_t available = 0;
+        size_t largest   = 0;
+        if (point == dump_point::FIRST_DECODE) {
+            if (cache->zone_free_figures(vram_zone_id::WEIGHT, available, largest)) {
+                unified_cache_dump_snapshot_set_once(dump_snapshot::zone_available_weight_first_decode, dev, available);
+                unified_cache_dump_snapshot_set_once(dump_snapshot::zone_largest_free_weight_first_decode, dev,
+                                                     largest);
+            }
+            return;
+        }
+        if (cache->zone_free_figures(vram_zone_id::RUNTIME, available, largest)) {
+            unified_cache_dump_snapshot_set(dump_snapshot::zone_available_runtime_context_txn, dev, available);
+            unified_cache_dump_snapshot_set(dump_snapshot::zone_largest_free_runtime_context_txn, dev, largest);
+            unified_cache_dump_snapshot_set(dump_snapshot::zone_capacity_onednn_context_txn, dev,
+                                            cache->zone_capacity(vram_zone_id::ONEDNN));
+        }
+    } catch (...) {
+    }
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)

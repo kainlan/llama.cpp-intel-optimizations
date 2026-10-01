@@ -174,8 +174,11 @@ int main(int argc, char ** argv) {
     unified_cache_dump_set_device_count(2);
     unified_cache_dump_counter_add(dump_counter::ext_alloc_count, 0, 3);
     unified_cache_dump_counter_add(dump_counter::ext_alloc_count, 1, 5);
-    unified_cache_dump_counter_add_key(dump_counter::load_row_op_time_arrivals, 0, "convert.cpp:48", 2);
-    unified_cache_dump_counter_add_key(dump_counter::load_row_op_time_arrivals, 0, "set_rows.cpp:465");
+    unified_cache_dump_counter_add_key(dump_counter::set_rows_stage_arrivals, 0, "convert.cpp:48", 2);
+    unified_cache_dump_counter_add_key(dump_counter::set_rows_stage_arrivals, 0, "set_rows.cpp:465");
+    unified_cache_dump_counter_add_key(dump_counter::set_rows_stage_arrivals, 0, "convert.cpp:48");
+    // A field with no producer on this tree is counted by nothing and prints the sentinel, so the
+    // increment below (which a test can make, a shipped path cannot) must not surface as a value.
     unified_cache_dump_counter_add_key(dump_counter::load_row_op_time_arrivals, 0, "convert.cpp:48");
     unified_cache_dump_snapshot_set(dump_snapshot::zone_capacity_onednn_context_txn, 1, 4096);
     unified_cache_dump_snapshot_set_once(dump_snapshot::zone_available_weight_first_decode, 0, 111);
@@ -185,7 +188,7 @@ int main(int argc, char ** argv) {
     unified_cache_dump_counter_add(dump_counter::ext_alloc_count, 9999, 7);
 
     check(unified_cache_ext_alloc_count_for_testing(0) == 3, "ext_alloc_count accessor reads the counter");
-    check(unified_cache_dump_counter_for_testing(dump_counter::load_row_op_time_arrivals, 0) == 4,
+    check(unified_cache_dump_counter_for_testing(dump_counter::set_rows_stage_arrivals, 0) == 4,
           "a keyed counter's total is the sum of its key counts");
 
     unsetenv("GGML_SYCL_COUNTER_DUMP");
@@ -200,14 +203,20 @@ int main(int argc, char ** argv) {
     check(has_line(lines, "[SYCL-COUNTER] dev=0 name=ext_alloc_count value=3"), "dev 0 ext_alloc_count");
     check(has_line(lines, "[SYCL-COUNTER] dev=1 name=ext_alloc_count value=5"), "dev 1 ext_alloc_count");
     check(has_line(lines, "[SYCL-COUNTER] dev=0 name=zone_plan_refusal value=0"), "a zero counter prints");
-    check(has_line(lines, "[SYCL-COUNTER] dev=0 name=load_row_op_time_arrivals value=4"),
+    check(has_line(lines, "[SYCL-COUNTER] dev=0 name=set_rows_stage_arrivals value=4"),
           "keyed counter prints its total");
-    check(has_line(lines, "[SYCL-COUNTER] dev=0 name=load_row_op_time_arrivals{convert.cpp:48} value=3"),
+    check(has_line(lines, "[SYCL-COUNTER] dev=0 name=set_rows_stage_arrivals{convert.cpp:48} value=3"),
           "key line carries its count");
-    check(has_line(lines, "[SYCL-COUNTER] dev=0 name=load_row_op_time_arrivals{set_rows.cpp:465} value=1"),
+    check(has_line(lines, "[SYCL-COUNTER] dev=0 name=set_rows_stage_arrivals{set_rows.cpp:465} value=1"),
           "second key line");
-    check(!has_line(lines, "[SYCL-COUNTER] dev=1 name=load_row_op_time_arrivals{convert.cpp:48} value=0"),
+    check(!has_line(lines, "[SYCL-COUNTER] dev=1 name=set_rows_stage_arrivals{convert.cpp:48} value=0"),
           "a key that has not counted on a device prints no line there");
+
+    check(has_line(lines, "[SYCL-COUNTER] dev=0 name=load_row_op_time_arrivals value=not_captured") &&
+              has_line(lines, "[SYCL-COUNTER] dev=1 name=load_row_op_time_arrivals value=not_captured"),
+          "a field whose producer has not landed prints not_captured on every device, never a zero");
+    check(!has_line(lines, "[SYCL-COUNTER] dev=0 name=load_row_op_time_arrivals{convert.cpp:48} value=1"),
+          "a not-captured field prints no key lines");
 
     // Order on dev 0: the fixed list in the table's order, then key lines, then the snapshots.
     bool in_order = true;
@@ -221,7 +230,7 @@ int main(int argc, char ** argv) {
     }
     check(in_order, "dev 0 prints the fixed list in table order, one line per counter");
     const size_t first_key =
-        index_of(lines, "[SYCL-COUNTER] dev=0 name=load_row_op_time_arrivals{convert.cpp:48} value=3");
+        index_of(lines, "[SYCL-COUNTER] dev=0 name=set_rows_stage_arrivals{convert.cpp:48} value=3");
     const size_t first_snap =
         index_of(lines, std::string("[SYCL-COUNTER] dev=0 name=") + k_snapshot_names[0] + " value=111");
     check(first_key >= n_counters && first_snap > first_key,
@@ -430,6 +439,55 @@ int main(int argc, char ** argv) {
           "a flood of distinct tuples counts every refusal");
     check(flood_out.find("(dedupe-full)") != std::string::npos,
           "a full dedupe table prints the line with (dedupe-full), never silently");
+
+    // --- report lines and snapshot control -----------------------------------------------------------
+    {
+        unsetenv("GGML_SYCL_COUNTER_DUMP");
+        check(!unified_cache_dump_report_enabled(), "reports are off without GGML_SYCL_COUNTER_DUMP");
+        check(capture_stderr([] { unified_cache_dump_report("landing dev=0"); }).empty() &&
+                  capture_stderr([] { (void) unified_cache_dump_report_once("k-off", "landing dev=0"); }).empty(),
+              "a report prints nothing while the dump is not armed");
+        setenv("GGML_SYCL_COUNTER_DUMP", "1", 1);
+        check(unified_cache_dump_report_enabled(), "reports are on under GGML_SYCL_COUNTER_DUMP=1");
+        const auto r1 = split_lines(capture_stderr([] { unified_cache_dump_report("landing dev=0 size=1"); }));
+        check(r1.size() == 1 && r1[0] == "[SYCL-REPORT] landing dev=0 size=1",
+              "a report prints as [SYCL-REPORT] <text>");
+        const auto o1 = split_lines(
+            capture_stderr([] { (void) unified_cache_dump_report_once("arm_a:0:Q6_K:512", "arm_a_kernel ne11=512"); }));
+        const auto o2 = split_lines(
+            capture_stderr([] { (void) unified_cache_dump_report_once("arm_a:0:Q6_K:512", "arm_a_kernel ne11=512"); }));
+        const auto o3 = split_lines(
+            capture_stderr([] { (void) unified_cache_dump_report_once("arm_a:0:Q6_K:16", "arm_a_kernel ne11=16"); }));
+        check(o1.size() == 1 && o2.empty() && o3.size() == 1,
+              "report_once prints a key's first reading only, and a distinct key prints again");
+        bool full_reported = true;
+        for (int i = 0; i < 80; ++i) {
+            char key[32];
+            std::snprintf(key, sizeof(key), "flood-%d", i);
+            full_reported = unified_cache_dump_report_once(key, "flood") && full_reported;
+        }
+        check(!full_reported, "a full report_once table says so (returns false), never drops silently");
+
+        // set / pending / clear: the load-end entries overwrite, and load_2 returns to not_captured.
+        check(unified_cache_dump_snapshot_pending(dump_snapshot::weight_planned_device_bytes_load_2, 0),
+              "an untouched snapshot is pending");
+        unified_cache_dump_snapshot_set(dump_snapshot::weight_planned_device_bytes_load_2, 0, 77);
+        unified_cache_dump_snapshot_set(dump_snapshot::weight_planned_device_bytes_load_2, 0, 88);
+        const auto s1 = split_lines(capture_stderr([] { unified_cache_test_counter_dump(); }));
+        check(has_line(s1, "[SYCL-COUNTER] dev=0 name=weight_planned_device_bytes{load_2}@last_load_end value=88"),
+              "set overwrites the previous capture");
+        unified_cache_dump_snapshot_clear(dump_snapshot::weight_planned_device_bytes_load_2, 0);
+        const auto s2 = split_lines(capture_stderr([] { unified_cache_test_counter_dump(); }));
+        check(has_line(s2,
+                       "[SYCL-COUNTER] dev=0 name=weight_planned_device_bytes{load_2}@last_load_end "
+                       "value=not_captured") &&
+                  unified_cache_dump_snapshot_pending(dump_snapshot::weight_planned_device_bytes_load_2, 0),
+              "clear returns a snapshot to not_captured and pending");
+        // set_once after a clear captures again (the first_decode claim is released with the value).
+        unified_cache_dump_snapshot_set_once(dump_snapshot::weight_planned_device_bytes_load_2, 0, 5);
+        check(!unified_cache_dump_snapshot_pending(dump_snapshot::weight_planned_device_bytes_load_2, 0),
+              "a claimed once-only snapshot is no longer pending");
+    }
 
     (void) n_snapshots;
 
