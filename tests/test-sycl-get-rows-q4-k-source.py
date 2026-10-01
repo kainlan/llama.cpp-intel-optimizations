@@ -30,6 +30,11 @@ Pinned here:
     (placement decides the executor: a host-resident weight runs on the CPU). A Q4_K arm there would be weight
     streaming, which the architecture forbids, and it would hide a supports_op defect behind a working path;
     the dispatcher's default abort is the right backstop;
+  * a Q4_K weight that the cache tiers to host AFTER placement (weights-evictable mode, under pressure) fails
+    loudly and says why. Without the slice arm it reaches the streaming path and aborts; the abort is the
+    right shape (no streaming, a missing executor path is a support gap) but "unsupported type for streaming"
+    names neither the tensor nor the situation. get_rows_host_weight_unsupported() does, cites llama.cpp-iqzl,
+    and ggml_sycl_op_get_rows calls it for Q4_K before it builds any stream segments;
   * the K-quant scale/min unpack exists once in ggml-sycl: dequantize.hpp and cpy.hpp carried their own copies
     until they were folded into ggml_sycl_kquant_scale_min_k4, and a second definition is how Q4_K and Q5_K
     decode would drift apart;
@@ -191,6 +196,18 @@ def evaluate(backend, getrows, support, kquant, common, sources, raw_support):
         abort = re.search(r"GGML_ABORT", q4k)
         results["op: the Q4_K arm asks the layout predicate before it launches"] = \
             bool(refuse and launch and abort) and refuse.start() < launch.start()
+    helper = function_body(getrows, r"\[\[noreturn\]\] static void get_rows_host_weight_unsupported\([^)]*\)\s*\{")
+    results["anchor: the host-weight refusal helper exists"] = helper is not None
+    if helper is not None:
+        results["the host-weight refusal names the tensor, the tiering and its ticket"] = \
+            "tiered to host" in helper and "llama.cpp-iqzl" in helper and "src0->name" in helper and \
+            "GGML_ABORT" in helper
+    default_arm = slice_[slice_.find("default:"):] if "default:" in slice_ else ""
+    results["slice: the default arm refuses through the helper"] = "get_rows_host_weight_unsupported(" in default_arm
+    q4k_guard = re.search(r"GGML_TYPE_Q4_K[^;{]*\)\s*\{\s*get_rows_host_weight_unsupported\(", op)
+    stream_at = op.find("get_rows_build_stream_segments(")
+    results["op: a Q4_K weight that is not on the device is refused before any stream segments are built"] = \
+        q4k_guard is not None and 0 <= q4k_guard.start() < stream_at
     results["slice: the streamed-slice dispatcher has no Q4_K arm (host-resident weights are declined)"] = \
         case_arm(slice_, "Q4_K") is None and "get_rows_q4_k_aos_sycl(" not in slice_
 
@@ -287,6 +304,13 @@ if args.self_test:
          with_(getrows=mutate(getrows, SLICE_SIG, "default:",
                               "case GGML_TYPE_Q4_K: get_rows_q4_k_aos_sycl(ctx, src0, src1, dst, src0_dd, "
                               "src1_dd, dst_dd, stream); break; default:"))),
+        ("op skips the early host-weight refusal",
+         "op: a Q4_K weight that is not on the device is refused before any stream segments are built",
+         with_(getrows=mutate(getrows, OP_SIG, "get_rows_host_weight_unsupported(", "get_rows_host_weight_unsupportedX("))),
+        ("slice default aborts anonymously", "slice: the default arm refuses through the helper",
+         with_(getrows=mutate(getrows, SLICE_SIG, "get_rows_host_weight_unsupported(", "GGML_ABORT_X("))),
+        ("refusal loses its ticket", "the host-weight refusal names the tensor, the tiering and its ticket",
+         with_(getrows=getrows.replace("llama.cpp-iqzl", "llama.cpp-XXXX"))),
         ("second scale/min definition in dequantize.hpp",
          "the K-quant scale/min unpack is defined once, as ggml_sycl_kquant_scale_min_k4",
          with_(sources=dict(sources, **{"dequantize.hpp": sources["dequantize.hpp"] +
