@@ -8,19 +8,25 @@
 // sched_need_reserve set when the post-update reserve was the refusal), and llama_decode() returns -2.
 //
 // The refusal is injected below the context: the CPU device's get_buffer_type is replaced, in this
-// process only, by a wrapper buffer type that forwards to the CPU one, can cap its max buffer size
-// (which makes the scheduler plan many chunks, so a graph that differs from the last one allocates), and
-// refuses every allocation request from the n-th one after being armed, like an allocator that is out of
-// memory. The refusal is deliberately sticky: ggml_backend_sched_alloc_splits answers a failed
-// ggml_gallocr_alloc_graph (whose automatic reserve is the first request) with a second, explicit
-// ggml_gallocr_reserve_n, so a one-shot refusal is retried and succeeds, and the update correctly never fails
-// (measured: the first version of this test refused only request 0, the retry was request 1, and the update
-// returned DONE). The sweep is over n, so every request an update makes -- the K-shift graph of each
-// sub-cache and the post-update reserve -- starts a refusal once.
+// process only, by a wrapper buffer type that forwards to the CPU one and refuses every allocation request
+// from the n-th one after being armed, like an allocator that is out of memory. The refusal is deliberately
+// sticky: ggml_backend_sched_alloc_splits answers a failed ggml_gallocr_alloc_graph (whose automatic reserve
+// is the first request) with a second, explicit ggml_gallocr_reserve_n, so a one-shot refusal is retried and
+// succeeds, and the update correctly never fails (measured: the first version of this test refused only
+// request 0, the retry was request 1, and the update returned DONE).
 //
-// Controls: a clean armed update must make at least one request (else the wrapper is not on the
-// scheduler's path and every "refused" arm below would be vacuous), and every refusing arm must report
-// at least one refused request.
+// What the sweep covers: the requests a K-shift update makes. On every arch the control measures exactly one
+// (the K-shift graph's growth of the compute buffer; the post-update reserve fits the buffer that growth leaves
+// and makes none), so the sweep is {k = 0}. The wrapper does not cap the buffer's max size: the scheduler's
+// gallocr reads that once, at creation (ggml_gallocr_new_n), before the wrapper is armed.
+//
+// Controls: the wrapper must see allocations while the fixture is built (else it is not on the scheduler's
+// path), a clean update must make at least one request (else there is nothing to refuse and every "refused"
+// arm below would be vacuous), and every refusing arm must report at least one refused request.
+//
+// Not covered here: a refusal of the post-update graph_reserve (the `!gf` branch of memory_update and its
+// sched_need_reserve store). That reserve makes no allocation request on these fixtures, so nothing can be
+// refused there; gate 15 pins the branch textually (FAILED return, flag, and their order).
 //
 // Not covered here: llama_decode's second memory_update call (the retry after a FAILED_PREPARE slot search).
 // For these memories nothing can be pending there: the first call at the top of decode already consumed the
@@ -69,8 +75,7 @@ struct refusing_buft {
     ggml_backend_buffer_type_t inner = nullptr;
     ggml_backend_buffer_type   self  = {};
 
-    bool    armed         = false;   // while armed the max buffer size is capped
-    size_t  armed_max     = 1024 * 1024;
+    bool    armed         = false;   // while armed the requests are counted, and refused from refuse_at on
     int64_t refuse_at     = -1;      // refuse every request from this index on, among those made while armed; -1 refuses none
     int     n_requests    = 0;       // requests made while armed
     int     n_refused     = 0;
@@ -112,8 +117,7 @@ static size_t rb_alignment(ggml_backend_buffer_type_t) {
 }
 
 static size_t rb_max_size(ggml_backend_buffer_type_t) {
-    const size_t inner = ggml_backend_buft_get_max_size(g_buft.inner);
-    return g_buft.armed && g_buft.armed_max < inner ? g_buft.armed_max : inner;
+    return ggml_backend_buft_get_max_size(g_buft.inner);
 }
 
 static size_t rb_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tensor) {
@@ -165,7 +169,7 @@ static const arch_case arch_cases[] = {
 // refuse. Only a QUANTIZED K cache takes the other branch -- ggml_cast to f32, hadamard, rope, hadamard,
 // ggml_cpy back -- whose f32 temporary is n_ctx x n_embd_k_gqa x 4 bytes per layer. So the fixture's K type is
 // Q8_0, and n_ctx and n_ubatch are chosen so that temporary (8 MiB here) is far larger than the reserved pp
-// graph (n_ubatch tokens) and than the cap below: the update must grow the buffer, in many chunk requests.
+// graph (n_ubatch tokens): the update must grow the compute buffer, which is the request that is refused.
 //
 // Flash attention is OFF in this fixture. In a SYCL build llama-graph.cpp casts Q to f16 at graph build, and
 // the CPU FA kernel accepts Q only as the K type's vec_dot_type or f32, so a Q8_0 K under CPU-executed FA
@@ -278,8 +282,8 @@ static void run_arch(const arch_case & ac) {
 
         CHECK(res == LLAMA_MEMORY_UPDATE_DONE, "%s: the clean control update returned %s, want DONE", ac.name, res_name(res));
         CHECK(n_update_requests >= 1,
-                "%s: VOID: the clean update made %d allocation requests under a %zu byte cap, nothing could be refused",
-                ac.name, n_update_requests, g_buft.armed_max);
+                "%s: VOID: the clean update made %d allocation requests, nothing could be refused",
+                ac.name, n_update_requests);
         fprintf(stderr, "%s: a clean update makes %d allocation requests\n", ac.name, n_update_requests);
     }
     if (n_update_requests < 1) {
@@ -313,10 +317,11 @@ static void run_arch(const arch_case & ac) {
             CHECK(res == LLAMA_MEMORY_UPDATE_FAILED, "%s k=%d: memory_update returned %s after a refused request, want FAILED",
                     ac.name, k, res_name(res));
 
-            // the refusal ended the update early or in the re-reserve: either way a retry must not fail, and
-            // the next decode must run (a refused re-reserve left sched_need_reserve set)
+            // the refusal was the K-shift's own request (the control above: the update makes no other), so the
+            // shift is still pending and the retry applies it: DONE. NONE would mean the shift was dropped.
             const auto retry = fx.ctx->memory_update(false);
-            CHECK(retry != LLAMA_MEMORY_UPDATE_FAILED, "%s k=%d: the retry returned FAILED", ac.name, k);
+            CHECK(retry == LLAMA_MEMORY_UPDATE_DONE, "%s k=%d: the retry returned %s, want DONE (the shift is still pending)",
+                    ac.name, k, res_name(retry));
             const int rc = decode_n(fx.ctx.get(), 1, n_prompt);
             CHECK(rc == 0, "%s k=%d: decode after the failed update and its retry returned %d", ac.name, k, rc);
         }
@@ -341,7 +346,9 @@ static void run_arch(const arch_case & ac) {
             const int rc2 = decode_n(fx.ctx.get(), 1, n_prompt);
             CHECK(rc2 == 0, "%s k=%d: the decode after the refusal returned %d, want 0", ac.name, k, rc2);
 
-            // that decode retried the pending shift and applied it: nothing is left to update
+            // that decode consumed the pending shift (the K-shift refusal left it pending, and its own
+            // memory_update applied it): nothing is left to update. NONE shows the shift is consumed, not that K
+            // was rotated correctly; the K-shift's compute is not what this test is about
             const auto after = fx.ctx->memory_update(false);
             CHECK(after == LLAMA_MEMORY_UPDATE_NONE, "%s k=%d: after the recovering decode memory_update returned %s, want NONE (the shift is still pending)",
                     ac.name, k, res_name(after));

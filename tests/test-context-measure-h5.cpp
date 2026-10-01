@@ -70,6 +70,8 @@ static constexpr uint32_t n_ubatch  = 64;
 // below n_ubatch, so the output cap of the n_outputs rule is exercised (it defaults to n_batch, which would make
 // min(n_tokens, n_outputs_max) always n_tokens)
 static constexpr uint32_t n_outputs_max = 24;
+// note: 24 is below every s's token count (63 or 64), so the cap binds at every s and the n_tokens half of
+// min(n_tokens, n_outputs_max) is the unexercised one; one context has one cap, so both halves cannot bind in a run
 
 enum mem_class {
     MEM_KV,
