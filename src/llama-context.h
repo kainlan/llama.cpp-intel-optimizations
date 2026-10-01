@@ -75,7 +75,8 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
-    // return true if the memory was updated
+    // DONE if the memory was updated, NONE if there was nothing to do, FAILED if an update could not be applied
+    // (it stays pending, the scheduler is marked for a re-reserve, and decode returns -2)
     llama_memory_update_result memory_update(bool optimize);
 
     enum llama_pooling_type pooling_type() const;

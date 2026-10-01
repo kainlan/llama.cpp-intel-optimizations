@@ -2265,8 +2265,11 @@ llama_memory_update_result llama_context::memory_update(bool optimize) {
         gf_res_prev_active = nullptr;
 
         if (!mctx->apply()) {
-            // a failed update stays pending (the K-shift is not marked done), and decode must not run over it
+            // a failed update stays pending (the K-shift is not marked done), and decode must not run over it.
+            // The K-shift has already reset the scheduler, and a refused allocation lost its buffers, so the next
+            // decode reserves again even if the pending update is dropped before it is retried
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+            sched_need_reserve = true;
             return LLAMA_MEMORY_UPDATE_FAILED;
         }
     }

@@ -949,7 +949,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     return res;
 }
 
-llama_memory_update_result llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+llama_memory_update_result llama_kv_cache::update(
+        llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return LLAMA_MEMORY_UPDATE_DONE;
@@ -2911,21 +2912,9 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
 
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
+// the full-cache context is the reserve context over every stream, by construction
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
-
-    const uint32_t n_stream = kv->get_n_stream();
-
-    // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
-    sinfos.resize(1);
-    sinfos[0].s0 = 0;
-    sinfos[0].s1 = n_stream - 1;
-    sinfos[0].idxs.resize(n_stream);
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        sinfos[0].strm.push_back(s);
-        sinfos[0].idxs[s].resize(1, 0);
-    }
+        llama_kv_cache * kv) : llama_kv_cache_context(kv, kv->get_n_stream()) {
 }
 
 llama_kv_cache_context::llama_kv_cache_context(
@@ -2935,8 +2924,9 @@ llama_kv_cache_context::llama_kv_cache_context(
 
     GGML_ASSERT(n_streams >= 1 && n_streams <= kv->get_n_stream());
 
-    // like the full-cache context, but the dummy slot info spans only n_streams streams, which is what a ubatch of
-    // n_streams sequences gets: the K/V views take their stream count from the slot info and the mask from the ubatch
+    // create a dummy slot info - the actual data is irrelevant. we just need to build the graph. It spans n_streams
+    // streams, which is what a ubatch of n_streams sequences gets: the K/V views take their stream count from the
+    // slot info and the mask from the ubatch
     sinfos.resize(1);
     sinfos[0].s0 = 0;
     sinfos[0].s1 = n_streams - 1;

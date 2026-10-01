@@ -1784,13 +1784,7 @@ static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv
 }
 
 llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv) :
-    kv_swa(kv->get_swa()),
-    ctx_base_mem(nullptr),
-    ctx_swa_mem(nullptr),
-    n_kv(kv_swa->get_size()),
-    status(LLAMA_MEMORY_STATUS_SUCCESS) {
-    sinfos_read.push_back(dsv4_build_full_sinfo(kv_swa, kv_swa->get_n_stream()));
-    sinfos_write = sinfos_read;
+    llama_kv_cache_dsv4_raw_context(kv, kv->get_swa()->get_n_stream()) {
 }
 
 llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv, uint32_t n_streams) :
@@ -2049,8 +2043,8 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     lid_state(kv->get_lid_state()),
     reserve_plans(true),
     status(llama_memory_status_combine(
-                llama_memory_status_combine(ctx_raw->get_status(), ctx_csa_mem->get_status()),
-                llama_memory_status_combine(ctx_hca_mem->get_status(), ctx_lid_mem->get_status()))) {
+        llama_memory_status_combine(ctx_raw->get_status(), ctx_csa_mem->get_status()),
+        llama_memory_status_combine(ctx_hca_mem->get_status(), ctx_lid_mem->get_status()))) {
 }
 
 llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
