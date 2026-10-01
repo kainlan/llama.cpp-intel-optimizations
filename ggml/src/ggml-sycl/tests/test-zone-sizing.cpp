@@ -652,16 +652,24 @@ int main() {
               "an overflowing demand is refused, not wrapped into a small size");
         CHECK(!ggml_sycl::zone_dequant_f16_region_bytes(1, nullptr), "a null out is refused");
 
-        // The plan figure: the largest weight plus n_ubatch activation rows at the widest K.
-        size_t plan = 0;
-        CHECK(ggml_sycl::zone_dequant_f16_scratch_bytes(104857600, 20480, 512, &plan) &&
-                  plan == 104857600 + 10485760,
+        // The plan figure, per buffer: the largest weight copy, and n_ubatch activation rows at the widest K,
+        // each 256-aligned. They are separate numbers because they are separate buffers: the graph walk ensures
+        // each at max(plan, demand) so a later graph never regrows (and retires) a buffer a recorded graph baked.
+        size_t plan0 = 0, plan1 = 0;
+        CHECK(ggml_sycl::zone_dequant_f16_plan_bytes(104857600, 20480, 512, &plan0, &plan1) && plan0 == 104857600 &&
+                  plan1 == 10485760,
               "100 MiB weights + 512 tokens of K=10240 f16 rows");
-        CHECK(plan >= 6144u * 5120u * 2u + 512u * 6144u * 2u, "the plan covers the incident op's exact demand");
-        CHECK(ggml_sycl::zone_dequant_f16_scratch_bytes(0, 0, 512, &plan) && plan == 0,
+        CHECK(plan0 >= 6144u * 5120u * 2u && plan1 >= 512u * 6144u * 2u,
+              "each buffer covers the incident op's exact demand");
+        CHECK(ggml_sycl::zone_dequant_f16_plan_bytes(100, 100, 1, &plan0, &plan1) && plan0 == 256 && plan1 == 256,
+              "each buffer is aligned up to 256");
+        CHECK(ggml_sycl::zone_dequant_f16_plan_bytes(0, 0, 512, &plan0, &plan1) && plan0 == 0 && plan1 == 0,
               "a model with no dense dequant candidate plans nothing");
-        CHECK(!ggml_sycl::zone_dequant_f16_scratch_bytes(SIZE_MAX / 2, SIZE_MAX / 2, 512, &plan),
+        CHECK(!ggml_sycl::zone_dequant_f16_plan_bytes(SIZE_MAX / 2, SIZE_MAX / 2, 512, &plan0, &plan1),
               "an overflowing plan is refused, not wrapped into a small size");
+        CHECK(!ggml_sycl::zone_dequant_f16_plan_bytes(1, 1, 1, nullptr, &plan1) &&
+                  !ggml_sycl::zone_dequant_f16_plan_bytes(1, 1, 1, &plan0, nullptr),
+              "a null out is refused");
 
         // The maxima take the adapter's marks; the classifier decides nothing from ne[2] or names.
         std::vector<zone_tensor_desc> inv;

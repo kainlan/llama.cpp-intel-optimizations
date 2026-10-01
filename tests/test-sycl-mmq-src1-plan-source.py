@@ -121,12 +121,22 @@ def evaluate(backend, common, cache, zone):
     dq_acquire = function_body(backend, r"static void \* ggml_sycl_dequant_f16_scratch\([^)]*\)\s*\{")
     dq_walk = function_body(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\([^)]*\)\s*\{")
     op_sycl = function_body(backend, r"inline void ggml_sycl_op_mul_mat_sycl\([^)]*\)\s*try\s*\{")
+    q8_walk = function_body(backend, r"static bool ggml_sycl_mmq_src1_ensure_for_graph\([^)]*\)\s*\{")
+    acquire = function_body(backend, r"static void \* ggml_sycl_planned_scratch_acquire\([^)]*\)\s*\{")
+    runtime_ensure = function_body(common, r"inline void \* ggml_sycl_runtime_scratch_ensure\([^)]*\)\s*\{")
+    q8_lambda_at = backend.find("auto acquire_planned_q8")
+    q8_lambda = backend[q8_lambda_at:q8_lambda_at + 900] if q8_lambda_at >= 0 else None
     results["anchor: dequant_f16_scratch_t exists"] = dq_struct is not None
     results["anchor: dequant ensure_buffer exists"] = dq_ensure is not None
     results["anchor: dequant acquire helper exists"] = dq_acquire is not None
     results["anchor: dequant graph walk exists"] = dq_walk is not None
     results["anchor: op_mul_mat_sycl exists"] = op_sycl is not None
-    if None in (ensure_body, graph_entry, req_fn, adapter, dq_struct, dq_ensure, dq_acquire, dq_walk, op_sycl):
+    results["anchor: Q8 graph walk exists"] = q8_walk is not None
+    results["anchor: shared planned-scratch acquire exists"] = acquire is not None
+    results["anchor: shared runtime-scratch ensure exists"] = runtime_ensure is not None
+    results["anchor: Q8 acquire lambda exists"] = q8_lambda is not None
+    if None in (ensure_body, graph_entry, req_fn, adapter, dq_struct, dq_ensure, dq_acquire, dq_walk, op_sycl,
+                q8_walk, acquire, runtime_ensure, q8_lambda):
         return results
 
     # --- the buffer is a RUNTIME-zone, spill-forbidden, planned allocation ---
@@ -136,15 +146,11 @@ def evaluate(backend, common, cache, zone):
     results["ensure_buffer no longer prefers the WEIGHT zone"] = "vram_zone_id::WEIGHT" not in ensure_body
 
     # --- the per-op scratch is gone from the non-split dispatch --------------
-    # The only remaining src1_ddq_scratch allocation is the row-split (multi-stream) path,
-    # whose buffer cannot be shared across ops without cross-stream chaining.
-    allocs = [m.start() for m in re.finditer(r"src1_ddq_scratch\[i\]\.allocate\(", backend)]
-    results["exactly one per-op scratch allocation remains"] = len(allocs) == 1
-    if len(allocs) == 1:
-        window = backend[max(0, allocs[0] - 700):allocs[0]]
-        results["the remaining per-op scratch is split-only"] = re.search(r"\bsplit\b", window) is not None
-    else:
-        results["the remaining per-op scratch is split-only"] = False
+    # No per-op scratch remains anywhere (review r1, I4): ctx.stream(device, idx) returns the SAME in-order
+    # queue for every idx, so the row-split path orders its producer and consumers on the queue the planned
+    # buffer already lives on. The premise that retained a per-op allocation there was false.
+    results["no per-op Q8 scratch allocation remains"] = "src1_ddq_scratch" not in backend
+    results["the per-op scratch type is gone"] = "scoped_mmvq_scratch_handle" not in backend
     # ABSENCE: the old resource-failure laundering. A failed Q8 buffer used to warn and
     # `return false`, which fell through to the generic BLAS dequant path (another unplanned
     # buffer, ~178 MB for ffn_down) and then aborted far from the cause.
@@ -190,7 +196,8 @@ def evaluate(backend, common, cache, zone):
         re.search(r"stream\s*==\s*ctx\.stream\(", op_sycl) is not None
     results["the dequant breach is a plan breach, not a decline"] = "ggml_sycl_dequant_f16_plan_breach(" in backend and \
         "ggml_sycl_dequant_f16_plan_breach(" in dq_acquire
-    results["no growth is attempted while a graph is being recorded"] = "ggml_sycl_graph_recording_active()" in dq_acquire
+    results["no growth is attempted while a graph is being recorded"] = \
+        "ggml_sycl_graph_recording_active()" in acquire and "growth refused while recording" in acquire
     # The walk predicts the route with the dispatch's own router (one fact, one source).
     results["the dequant walk asks the dispatch's router"] = "matmul_orchestrator.select(" in dq_walk
     results["the dequant walk fails closed on an overflowing demand"] = "return false" in dq_walk
@@ -202,12 +209,58 @@ def evaluate(backend, common, cache, zone):
         "zone_dequant_f16_weight_bytes(" in adapter and "zone_dequant_f16_src1_bytes_per_token(" in adapter
     results["the zone header exposes the dequant helpers"] = \
         all(s in zone for s in ("zone_dequant_f16_weight_bytes", "zone_dequant_f16_src1_bytes_per_token",
-                                "zone_dequant_f16_region_bytes", "zone_dequant_f16_scratch_bytes"))
+                                "zone_dequant_f16_region_bytes", "zone_dequant_f16_plan_bytes"))
     dq_entry_at = graph_entry.find("ggml_sycl_dequant_f16_ensure_for_graph(")
     results["graph entry ensures the dequant scratch before any submission"] = \
         dq_entry_at >= 0 and dq_entry_at < graph_entry.find("compute_impl")
     results["a failed dequant ensure refuses the graph cleanly"] = \
         dq_entry_at >= 0 and "GGML_STATUS_ALLOC_FAILED" in graph_entry[dq_entry_at:dq_entry_at + 900]
+
+    # --- review r1 -----------------------------------------------------------
+    # C1: a recorded decode graph bakes the buffer's raw pointer. Three independent defences.
+    results["C1a: the Q8 graph walk ensures at least the planned bytes"] = \
+        "unified_cache_get_planned_mmq_src1_scratch_bytes(" in q8_walk
+    results["C1a: the dequant graph walk ensures at least the planned bytes"] = \
+        "unified_cache_get_planned_dequant_f16_buffer_bytes(" in dq_walk
+    results["C1b: acquiring while recording pins the handle into the graph's retention"] = \
+        "retain_handles_until_event(" in acquire and "buffer.handle(" in acquire
+    results["C1c: growth is refused while recording, by name"] = \
+        "growth refused while recording" in acquire
+    results["both consumers acquire through the shared helper"] = \
+        "ggml_sycl_planned_scratch_acquire(" in q8_lambda and "ggml_sycl_planned_scratch_acquire(" in dq_acquire
+    results["the Q8 breach is still a plan breach"] = "ggml_sycl_mmq_src1_plan_breach(" in q8_lambda
+    # I1: in-op growth is visible and counted.
+    results["I1: in-op growth warns once, naming the cohort"] = \
+        "GGML_LOG_WARN" in acquire and "cohort" in acquire
+    results["I1: in-op growth feeds the mispredict accounting"] = "zone_sizing_record_underestimate(" in acquire
+    results["I1: every use is an observation"] = "zone_sizing_record_observation(" in acquire
+    # I2: the walk does not repeat dispatch's logging.
+    results["I2: the dequant walk asks the router quietly"] = "ggml_sycl_select_quiet_scope" in dq_walk
+    results["I2: the router's forced-kernel WARNs honour the quiet scope"] = \
+        re.search(r"ggml_sycl_select_quiet\(\)[^;{]*\)\s*\{?\s*GGML_LOG_WARN\(\"\[SYCL\] %s kernel %s not eligible for batch", backend) is not None
+    # I3: the generic BLAS fallback names itself when it breaches.
+    fallback_at = backend.find('trace_decision("dispatch-generic-blas-fallback"')
+    results["I3: the generic BLAS fallback sets the caller scope"] = \
+        fallback_at >= 0 and "ggml_sycl_scratch_caller_scope" in backend[fallback_at:fallback_at + 2500]
+    results["I3: both breaches print the caller"] = backend.count("ggml_sycl_scratch_caller()") >= 2
+    # I4: the shared ensure asserts the one fact the shared buffer rests on.
+    results["I4: the shared ensure asserts an in-order queue"] = \
+        "has_property<sycl::property::queue::in_order>" in runtime_ensure and "GGML_ASSERT" in runtime_ensure
+    # M1: one allocator for both buffers.
+    results["M1: the Q8 buffer ensures through the shared allocator"] = \
+        "ggml_sycl_runtime_scratch_ensure<" in ensure_body
+    results["M1: the dequant buffer ensures through the shared allocator"] = \
+        "ggml_sycl_runtime_scratch_ensure<" in dq_ensure
+    results["M1: the shared allocator is RUNTIME-zone and spill-forbidden"] = \
+        "vram_zone_id::RUNTIME" in runtime_ensure and "forbid_vram_zone_spill = true" in runtime_ensure
+    # Verifiability: a WARN-level line a normal run prints.
+    stats_at = backend.find("[SCRATCH-STATS]")
+    results["a WARN-level per-cohort stats line exists"] = \
+        stats_at >= 0 and "GGML_LOG_WARN" in backend[max(0, stats_at - 300):stats_at]
+    results["the stats are printed at context teardown"] = "log_planned_scratch_stats()" in backend
+    # Nit: the Q8 walk is cheap on the decode hot path.
+    results["the Q8 walk does not ask the PP predicate for single-row ops"] = \
+        re.search(r"ggml_nrows\(src1\)\s*(<=|==)\s*1", q8_walk) is not None
     return results
 
 
@@ -225,6 +278,14 @@ def run(label, sources, expect_fail=None):
 
 backend, common, cache, zone = (read(args.backend), read(args.common), read(args.cache), read(args.zone))
 failed = run("tree", (backend, common, cache, zone))
+# A comment is not code, so the stripped sources cannot see it. This one was a false claim a reader acted on
+# (review r1, C1): the whole-graph recording path does NOT keep the Q8 buffer's handle alive.
+raw_backend = re.sub(r"\s*\n\s*//\s*", " ", Path(args.backend).read_text())  # un-wrap line comments
+if "recorded graph or pointer table that baked the old pointer keeps its handle" in raw_backend:
+    print("FAIL: the false 'recorded graph keeps its handle' comment is still in ggml-sycl.cpp")
+    failed.append("false recorded-graph comment")
+else:
+    print("PASS: the false 'recorded graph keeps its handle' comment is gone")
 
 if args.self_test:
     def mutate(src, old, new, count=1):
@@ -275,9 +336,32 @@ if args.self_test:
                                   "const size_t dequant_f16 = unified_cache_get_planned_XXXX("), zone)),
         ("dequant pool restored", "src0 pool alloc is skipped when the planned scratch holds it",
          (mutate(backend, "if (!src0_dq_scratch)", "if (true)"), common, cache, zone)),
-        ("dequant growth while recording", "no growth is attempted while a graph is being recorded",
-         (mutate_in_func(backend, r"static void \* ggml_sycl_dequant_f16_scratch\(",
-                         "ggml_sycl_graph_recording_active()", "false"), common, cache, zone)),
+        ("growth while recording", "no growth is attempted while a graph is being recorded",
+         (mutate_in_func(backend, r"static void \* ggml_sycl_planned_scratch_acquire\(",
+                         "growth refused while recording", "growth allowed"), common, cache, zone)),
+        ("C1a Q8 walk ignores the plan", "C1a: the Q8 graph walk ensures at least the planned bytes",
+         (mutate_in_func(backend, r"static bool ggml_sycl_mmq_src1_ensure_for_graph\(",
+                         "unified_cache_get_planned_mmq_src1_scratch_bytes(", "unified_cache_get_planned_XXXX("),
+          common, cache, zone)),
+        ("C1a dequant walk ignores the plan", "C1a: the dequant graph walk ensures at least the planned bytes",
+         (mutate_in_func(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\(",
+                         "unified_cache_get_planned_dequant_f16_buffer_bytes(", "unified_cache_get_planned_XXXX("),
+          common, cache, zone)),
+        ("C1b no pin", "C1b: acquiring while recording pins the handle into the graph's retention",
+         (mutate_in_func(backend, r"static void \* ggml_sycl_planned_scratch_acquire\(",
+                         "retain_handles_until_event(", "retain_XXXX("), common, cache, zone)),
+        ("I1 silent growth", "I1: in-op growth feeds the mispredict accounting",
+         (mutate_in_func(backend, r"static void \* ggml_sycl_planned_scratch_acquire\(",
+                         "zone_sizing_record_underestimate(", "zone_sizing_record_XXXX("), common, cache, zone)),
+        ("I2 loud walk", "I2: the dequant walk asks the router quietly",
+         (mutate_in_func(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\(",
+                         "ggml_sycl_select_quiet_scope", "ggml_sycl_select_XXXX"), common, cache, zone)),
+        ("I4 out-of-order queue allowed", "I4: the shared ensure asserts an in-order queue",
+         (backend, mutate_in_func(common, r"inline void \* ggml_sycl_runtime_scratch_ensure\(",
+                                  "has_property<sycl::property::queue::in_order>", "has_property<XXXX>"), cache, zone)),
+        ("M1 private allocator", "M1: the dequant buffer ensures through the shared allocator",
+         (backend, mutate_after(common, "struct dequant_f16_scratch_t", "ggml_sycl_runtime_scratch_ensure<",
+                                "ggml_sycl_XXXX<"), cache, zone)),
     ]
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)
