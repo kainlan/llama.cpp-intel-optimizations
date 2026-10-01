@@ -75713,29 +75713,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const int64_t N = ne01;  // output rows per expert
 
             // ---------------------------------------------------------------
-            // Flush whatever scatter is still pending, consumed or not.  There
-            // is ONE g_pending_scatter slot, and this op records its own CPU
-            // result into it: a bias-less MoE (qwen2moe/qwen3moe/qwen3vlmoe/
-            // qwen3next) runs the up MUL_MAT_ID and then the gate one with no
-            // ADD_ID between them, so gate does not consume up's output and the
-            // consumption flush above leaves up pending.  A flush that only ran
-            // when the CPU future was already ready let gate overwrite up's
-            // still-running scatter, and up's host-expert rows were never
-            // H2D-scattered (llama.cpp-3bww).
-            //
-            // It has to be HERE, ahead of the shared activation D2H, and not at
-            // the point this op records its result: the pool ring is disjoint
-            // only within one op (pinned-buffer-pool.hpp reserve()), so by then
-            // this op's CPU kernels have written the pinned bytes that up's
-            // H2D has not read.  Flushing enqueues that H2D on the in-order
-            // queue first, and the D2H completing proves it has run.
-            //
-            // The wait this can add is the CPU future up already owes: the
-            // GLU that consumes up flushes it a few nodes later anyway.  What
-            // is lost is only the overlap of up's CPU compute with this op's
-            // GPU expert work.  Cross-layer deferral, where CPU experts run
-            // under the next layer's attention, is untouched: attention does
-            // not enter this block, and the ADD_ID/consumer flushes cover it.
+            // INVARIANT: no scatter is pending once this op starts, consumed or
+            // not.  g_pending_scatter is ONE slot and this op records into it:
+            // bias-less MoE (qwen2moe/qwen3moe/qwen3vlmoe/qwen3next) runs up and
+            // then gate with no ADD_ID between, so gate does not consume up's
+            // output and would overwrite it, dropping up's host-expert rows
+            // (llama.cpp-3bww).  It is a blocking flush because a no-wait
+            // chain would first need the two protections below to be replaced
+            // (llama.cpp-8k68).  It has to be HERE, ahead of the shared
+            // activation D2H, for two reasons:
+            //  - the pool ring is disjoint only within one op, so this op's CPU
+            //    kernels would write pinned bytes the pending H2D has not read;
+            //    flushing enqueues that H2D first, and the D2H completing
+            //    proves it ran;
+            //  - the pending CPU workers read the shared activation staging
+            //    buffer directly (task.activations), and this op's D2H rewrites
+            //    it and may reallocate it in ensure().
             // ---------------------------------------------------------------
             flush_pending_cpu_scatter();
 
@@ -75881,7 +75874,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // source of an earlier op's scatter H2D.  What makes the write safe is ordering:
                 //   (1) that op's scatter was flushed -- its H2D enqueued on the in-order
                 //       compute queue -- BEFORE this op's activation D2H was enqueued (the
-                //       consumed flushes and try_flush at op entry run ahead of that D2H), and
+                //       op-entry flushes of any pending scatter run ahead of that D2H), and
                 //   (2) the memset and the CPU kernels run only after that D2H completed, and
                 //       completing an event on an in-order queue completes every earlier
                 //       command, the H2D included.
@@ -76185,6 +76178,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (!r.valid) {
                     return;
                 }
+                // Same one-slot overwrite as g_pending_scatter, still open under the opt-in
+                // GGML_SYCL_PIPELINE_CPU=1: abort rather than corrupt (fix: llama.cpp-ytc9).
+                GGML_ASSERT(!g_pending_cpu_pipeline.active &&
+                            "hybrid MUL_MAT_ID reached apply_cpu_result_to_pipeline with a pending pipeline slot "
+                            "that was not flushed; its host-expert rows would be dropped (llama.cpp-ytc9)");
                 g_pending_cpu_pipeline.future       = std::move(r.future);
                 g_pending_cpu_pipeline.out_pinned   = r.out_pinned;
                 g_pending_cpu_pipeline.act_pinned   = r.act_pinned;

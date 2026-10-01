@@ -84,8 +84,11 @@ scatter events and was rejected for that reason).  It is DISJOINT REGIONS:
      `GGML_ASSERT(!g_pending_scatter.active ...)` (pin A1), so a path that reaches it with an
      unflushed scatter aborts instead of dropping rows.  The flush has to be at op ENTRY, not in
      apply: by apply time this op's CPU kernels have already written the pool bytes that the
-     pending H2D has not read yet (the ring is disjoint only within one op).  Pin A2: the only other
-     writer of `g_pending_scatter.active = true` (the direct CPU-TG path) flushes first.
+     pending H2D has not read yet (the ring is disjoint only within one op), and the pending CPU
+     workers read the shared activation staging buffer that this op's D2H rewrites.  Pin A2: the
+     only other writer of `g_pending_scatter.active = true` (the direct CPU-TG path) flushes first.
+     Pin A3: the opt-in pipeline slot (GGML_SYCL_PIPELINE_CPU=1) has the same overwrite and aborts
+     through the same kind of assertion until llama.cpp-ytc9 fixes it.
 
 WHAT THIS DOES NOT PROVE.  It reads source text.  It shows the shortcut can no longer
 be taken when ne11 > 1 and that the per-expert path it falls to is still the
@@ -299,6 +302,7 @@ def check_pool_ring(pool_src: str) -> None:
 
 
 APPLY_MARKER = "auto apply_cpu_result_to_scatter = [&]("
+PIPELINE_APPLY_MARKER = "auto apply_cpu_result_to_pipeline = [&]("
 
 
 def check_pending_scatter(code: str) -> None:
@@ -319,6 +323,22 @@ def check_pending_scatter(code: str) -> None:
         )
     require_unconditional(apply_body, apply_body.find("GGML_ASSERT(!g_pending_scatter.active"),
                           header=None, pin="A1", what="the pending-scatter assertion in apply_cpu_result_to_scatter")
+
+    # A3: the opt-in pipeline slot has the same one-slot overwrite; until it is fixed (llama.cpp-ytc9) it
+    # must abort instead of dropping rows.
+    pl_at = code.find(PIPELINE_APPLY_MARKER)
+    if pl_at < 0 or code.count(PIPELINE_APPLY_MARKER) != 1:
+        raise ContractError("FAIL [pin A3]: apply_cpu_result_to_pipeline lambda not found exactly once (llama.cpp-ytc9)")
+    pl_body = squash(brace_block_from(code, pl_at))
+    pl_guard = pl_body.find("if (!r.valid) { return; } GGML_ASSERT(!g_pending_cpu_pipeline.active &&")
+    pl_write = pl_body.find("g_pending_cpu_pipeline.future =")
+    if pl_guard < 0 or pl_write < 0 or pl_guard > pl_write:
+        raise ContractError(
+            "FAIL [pin A3]: apply_cpu_result_to_pipeline does not open with `GGML_ASSERT(!g_pending_cpu_pipeline.active "
+            "&& ...)` straight after its validity check and before its first write (llama.cpp-ytc9)"
+        )
+    require_unconditional(pl_body, pl_body.find("GGML_ASSERT(!g_pending_cpu_pipeline.active"),
+                          header=None, pin="A3", what="the pending-pipeline assertion in apply_cpu_result_to_pipeline")
 
     # A2: every other writer of `active = true` flushes first.  A new writer must be added here on purpose.
     writers = [m.start() for m in re.finditer(r"g_pending_scatter\.active\s*=\s*true\s*;", code)]
@@ -414,7 +434,7 @@ def check_hot_cold(code: str) -> None:
     ]
     at = -1
     for needle, pin in order:
-        # A bare call: `flush_pending_cpu_scatter();` is also the tail of `try_flush_pending_cpu_scatter();`.
+        # A bare call: match on a word boundary so a longer name ending in this call does not count.
         bare = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(needle))
         if len(bare.findall(entry)) != 1:
             raise ContractError(
@@ -423,7 +443,7 @@ def check_hot_cold(code: str) -> None:
             )
         nxt = bare.search(entry).start()
         if nxt < at:
-            raise ContractError(f"FAIL [pin {pin}]: `{needle}` is out of order; the op-entry flushes run consumed, pipeline, try (llama.cpp-4hg7)")
+            raise ContractError(f"FAIL [pin {pin}]: `{needle}` is out of order; the op-entry flushes run consumed, pipeline, then the unconditional scatter flush (llama.cpp-4hg7)")
         at = nxt
         require_unconditional(entry, nxt, header="if (moe_hybrid_with_plan)", pin=pin, what=f"`{needle}`")
 
@@ -574,13 +594,13 @@ def self_test(backend_src: str) -> int:
     expect_fail("consumed-and-pipeline-flushes-swapped", sub(consumed + pipeline, pipeline + consumed,
                                                              in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F2")
     # F3/F1 (structure): present, in order, exactly once -- but dead (the body of `if (false)`).
-    expect_fail("try-flush-under-if-false", sub("            flush_pending_cpu_scatter();\n",
+    expect_fail("entry-flush-under-if-false", sub("            flush_pending_cpu_scatter();\n",
                                                 "            if (false) flush_pending_cpu_scatter();\n",
                                                 in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F3")
     expect_fail("consumed-flush-under-if-false", sub(consumed, "            if (false) flush_pending_cpu_scatter_if_consumed(dst, ctx.device);\n",
                                                      in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F1")
     # I2(a)/(b): the op-entry flushes that put the earlier scatter's H2D ahead of this op's D2H.
-    expect_fail("try-flush-dropped", sub("            flush_pending_cpu_scatter();\n", "",
+    expect_fail("entry-flush-dropped", sub("            flush_pending_cpu_scatter();\n", "",
                                          in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F3")
     expect_fail("consumed-flush-dropped", sub("            flush_pending_cpu_scatter_if_consumed(dst, ctx.device);\n", "",
                                               in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F1")
@@ -606,6 +626,14 @@ def self_test(backend_src: str) -> int:
         in_lambda=False, after=APPLY_MARKER), None, "A1")
     expect_fail("apply-assert-under-if-false", sub(assert_line, "                if (false)\n" + assert_line,
                                                    in_lambda=False, after=APPLY_MARKER), None, "A1")
+    # A3: the pipeline slot's assertion.
+    pl_start = backend_src.find("                GGML_ASSERT(!g_pending_cpu_pipeline.active &&", backend_src.find(PIPELINE_APPLY_MARKER))
+    pl_assert = backend_src[pl_start : backend_src.find(");\n", pl_start) + 3] if pl_start >= 0 else "<assertion missing>"
+    expect_fail("pipeline-assert-dropped", sub(pl_assert, "", in_lambda=False, after=PIPELINE_APPLY_MARKER), None, "A3")
+    expect_fail("pipeline-assert-vacuous", sub("GGML_ASSERT(!g_pending_cpu_pipeline.active &&", "GGML_ASSERT(true &&",
+                                               in_lambda=False, after=PIPELINE_APPLY_MARKER), None, "A3")
+    expect_fail("pipeline-assert-under-if-false", sub(pl_assert, "                if (false)\n" + pl_assert,
+                                                      in_lambda=False, after=PIPELINE_APPLY_MARKER), None, "A3")
     # A2: the direct CPU-TG writer stops flushing, or a third writer appears.
     expect_fail("direct-path-flush-dropped", sub(
         "if (g_pending_scatter.active) {\n                    flush_pending_cpu_scatter();\n                }\n\n                const int64_t         K ",
@@ -649,7 +677,7 @@ def self_test(backend_src: str) -> int:
     if failures:
         print(f"SELF-TEST FAIL: {', '.join(failures)}")
         return 1
-    print("SELF-TEST PASS: 41 mutants caught, unmodified tree passes")
+    print("SELF-TEST PASS: 44 mutants caught, unmodified tree passes")
     return 0
 
 
