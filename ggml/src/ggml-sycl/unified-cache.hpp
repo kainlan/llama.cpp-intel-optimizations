@@ -1642,15 +1642,23 @@ size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
 // llama.cpp-479i: plan the per-context dense MMQ/MMVQ Q8_1 src1 buffer from the inventory's
 // bytes-per-token (zone_scoped_maxima().mmq_src1_bytes_per_token) at n_ubatch. Folded into
 // unified_cache_get_planned_runtime_zone_requirement(). False on overflow (nothing published).
-bool   unified_cache_set_planned_mmq_src1_scratch(int device_id, size_t bytes_per_token, uint32_t n_ubatch);
+// `other_model_live`: the inputs are device-global, so while another model is live on the device the larger of
+// the old and the new input is kept (a draft loaded beside a target must not shrink the target's plan). The
+// figure is validated BEFORE anything is stored: a rejected one leaves the stored inputs alone, publishes a zero
+// plan and marks the dense scratch invalid, so the fit check refuses instead of trusting stale inputs.
+bool         unified_cache_set_planned_mmq_src1_scratch(int      device_id,
+                                                        size_t   bytes_per_token,
+                                                        uint32_t n_ubatch,
+                                                        bool     other_model_live = false);
 size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id);
 // llama.cpp-479i: plan the per-context dense f16 dequant buffers (src0 copy + src1 copy) from
 // the inventory maxima (zone_scoped_maxima().dequant_f16_weight_bytes / _src1_bytes_per_token) at
 // n_ubatch. Folded into unified_cache_get_planned_runtime_zone_requirement(). False on overflow.
-bool   unified_cache_set_planned_dequant_f16_scratch(int      device_id,
-                                                     size_t   max_weight_bytes,
-                                                     size_t   src1_bytes_per_token,
-                                                     uint32_t n_ubatch);
+bool         unified_cache_set_planned_dequant_f16_scratch(int      device_id,
+                                                           size_t   max_weight_bytes,
+                                                           size_t   src1_bytes_per_token,
+                                                           uint32_t n_ubatch,
+                                                           bool     other_model_live = false);
 // Both buffers' bytes together (what the RUNTIME zone requirement folds in), and each alone: the graph walk
 // ensures each buffer at max(its own plan, the graph's demand).
 size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id);
@@ -1674,8 +1682,23 @@ bool     unified_cache_dense_scratch_runtime_fit(int        device_id,
 // RUNTIME-zone bytes a spill-capable allocation must leave free for the planned dense scratch
 // (zone_planned_scratch_hold_bytes). Published by the backend context that owns the buffers; zero when every
 // planned buffer holds its plan. Forbid-spill requests are the claimants and are never held back.
-void     unified_cache_set_planned_scratch_hold(int device_id, size_t bytes);
+// The hold records WHICH backend context published it: a context that goes away releases only its own hold
+// (unified_cache_release_planned_scratch_hold returns false and changes nothing for any other owner), so the
+// teardown of one context cannot drop the hold another live context still depends on.
+void         unified_cache_set_planned_scratch_hold(int device_id, size_t bytes, const void * owner);
 size_t   unified_cache_get_planned_scratch_hold(int device_id);
+const void * unified_cache_get_planned_scratch_hold_owner(int device_id);
+bool         unified_cache_release_planned_scratch_hold(int device_id, const void * owner);
+// A spill-capable RUNTIME request that the hold kept out of the zone (it spills exactly as it would if the zone
+// were full). Counted per device, and the first one since the last take is a WARN naming the requester `tag` and
+// the bytes: a hold-induced spill was silent. The context takes (and so resets) the count at teardown and
+// reports it with its [SCRATCH-STATS] lines.
+void         unified_cache_note_planned_hold_spill(int          device_id,
+                                                   const char * tag,
+                                                   size_t       bytes,
+                                                   size_t       hold,
+                                                   size_t       available);
+void         unified_cache_take_planned_hold_spills(int device_id, uint64_t * count, size_t * bytes);
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno
