@@ -660,6 +660,8 @@ struct kv_region_request {
     std::vector<uint32_t>              forced_host;  // layers an earlier fit demoted; never promoted
     std::vector<kv_self_extent>        self_extents;
     std::vector<kv_self_head>          self_heads;
+    bool                               first_context = false;  // the model's FIRST_CONTEXT ranges count as free room
+
     // §2.4.2 step 6, the commit re-fit.  Set, the call does not solve: it checks the
     // plan it points at against `geometry` (inside own_ranges only, with no yield) and
     // returns the plan itself when every planned extent is still free.  A planned
@@ -668,8 +670,10 @@ struct kv_region_request {
     // in the room the survivors leave, demoting layers in the demotion order until it
     // fits.  It never adds a layer, admits a term the plan declined or moves anything
     // else, so what it returns is a subset of the plan at the plan's offsets.
-    const kv_region_fit_result *       commit_plan   = nullptr;
-    bool first_context = false;  // the model's FIRST_CONTEXT ranges count as free room
+    // The plan must be the result of a fit of this same request (same layers, head
+    // slots and after-KV terms): anything else is misuse and aborts.  The pointer is
+    // not owned and must outlive the call.
+    const kv_region_fit_result * commit_plan = nullptr;
 };
 
 enum kv_demotion_cause : uint8_t {
@@ -746,6 +750,12 @@ struct kv_carve_op {
     bool          carve  = true;
 };
 
+// A fit's result is the plan.  A commit re-fit's result (kv_region_request::commit_plan)
+// is an assignment only: layers, extents, heads, after_kv, carve_order and refused_heads
+// say what the commit carves, while free_after_full_kv, sub_slot_holes and superseded are
+// empty (they describe the room and the reservations of the plan's own geometry, which a
+// shortfall has changed; the plan's stay with the plan), yield_prefix and buried_released
+// are zero and empty (a re-fit yields nothing), and tlsf_free is set only on a refusal.
 struct kv_region_fit_result {
     bool fits = false;
 

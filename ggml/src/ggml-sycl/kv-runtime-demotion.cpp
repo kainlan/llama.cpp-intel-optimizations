@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace ggml_sycl {
@@ -744,7 +746,11 @@ struct fit_candidate_room {
 // Every tier 1-3 room that can hold `size` for `route`, best first: the lowest tier,
 // then the smallest room (the lowest TLSF, run and piece at a tie).  A slot is never
 // split, so a room that cannot hold it whole is not a candidate.
-void candidate_rooms(const fit_state & S, size_t size, int route, std::vector<fit_candidate_room> & out) {
+void candidate_rooms(const fit_state &                 S,
+                     size_t                            size,
+                     int                               route,
+                     std::vector<fit_candidate_room> & out,
+                     bool                              by_tlsf = false) {
     out.clear();
     for (size_t t = 0; t < S.t.size(); ++t) {
         if (!eligible(S.t[t], route)) {
@@ -785,15 +791,21 @@ void candidate_rooms(const fit_state & S, size_t size, int route, std::vector<fi
             }
         }
     }
-    std::stable_sort(out.begin(), out.end(), [](const fit_candidate_room & a, const fit_candidate_room & b) {
-        return a.tier != b.tier ? a.tier < b.tier : a.free < b.free;
+    std::stable_sort(out.begin(), out.end(), [by_tlsf](const fit_candidate_room & a, const fit_candidate_room & b) {
+        if (a.tier != b.tier) {
+            return a.tier < b.tier;
+        }
+        if (by_tlsf && a.room.tlsf != b.room.tlsf) {
+            return a.room.tlsf < b.room.tlsf;
+        }
+        return a.free < b.free;
     });
 }
 
 // The cheapest tier 1-3 room for `size`: the first candidate (best fit within a tier).
-bool find_room(const fit_state & S, size_t size, int route, fit_room & out) {
+bool find_room(const fit_state & S, size_t size, int route, fit_room & out, bool by_tlsf = false) {
     std::vector<fit_candidate_room> rooms;
-    candidate_rooms(S, size, route, rooms);
+    candidate_rooms(S, size, route, rooms, by_tlsf);
     if (rooms.empty()) {
         return false;
     }
@@ -937,10 +949,11 @@ bool place(fit_state &                 S,
            int                         route,
            bool                        allow_yield,
            const std::vector<size_t> & remaining,
-           size_t                      from) {
+           size_t                      from,
+           bool                        by_tlsf = false) {
     const size_t size = S.a[assign_id].size;
     fit_room     room;
-    if (find_room(S, size, route, room)) {
+    if (find_room(S, size, route, room, by_tlsf)) {
         carve_room(S, room, assign_id, size);
         return true;
     }
@@ -1080,11 +1093,14 @@ std::vector<fit_slot> build_slots(const kv_region_request & r) {
     return slots;
 }
 
-// Best fit over every TLSF a head may take lets an unconstrained head use up the
-// tight room the one TLSF a constrained head needs offers, and the constrained
-// head is then refused where an index-order placement would have fitted both.  So
-// the heads with the fewest admissible TLSFs go first (request order at a tie),
-// and best fit decides only inside each head's own admissible set.
+// The constrained-heads-first order: the heads with the fewest admissible TLSFs go
+// first (request order at a tie).  Best fit over every TLSF a head may take lets an
+// unconstrained head use up the tight room a constrained head needs, and the
+// constrained head is then refused where placing it first would have fitted both.
+// This is a heuristic, not a guarantee: takes_kv and takes_weight_named are
+// independent flags, so two heads can have equally many admissible TLSFs and
+// different sets.  The fit therefore never relies on it alone: head_attempts tries
+// the request order first and uses this order only when that refuses a head.
 std::vector<size_t> head_placement_order(const shared_zone_geometry & g, const kv_region_request & r) {
     size_t admissible[2] = { 0, 0 };
     for (const tlsf_geometry & t : g.tlsfs) {
@@ -1099,6 +1115,14 @@ std::vector<size_t> head_placement_order(const shared_zone_geometry & g, const k
         return admissible[r.head_slots[a].names_weight ? 1 : 0] < admissible[r.head_slots[b].names_weight ? 1 : 0];
     });
     return order;
+}
+
+// A broken contract of the commit re-fit.  This TU is linked by a host test with no
+// ggml-base, so it cannot call GGML_ABORT; it prints the named abort the backend's
+// would and stops.
+[[noreturn]] void fit_misuse(const char * what) {
+    std::fprintf(stderr, "[KV-FIT-MISUSE] commit re-fit: %s\n", what);
+    std::abort();
 }
 
 struct verify_span {
@@ -1178,10 +1202,34 @@ kv_region_fit_result commit_verify(const shared_zone_geometry &  g,
     res.buried_released.clear();
     res.tlsf_free.assign(n_tlsf, 0);
     res.refused_heads.clear();
-    if (!plan.fits || plan.layers.size() != slots.size()) {
+    // An assignment only: what describes the plan's own room stays with the plan.
+    res.free_after_full_kv.clear();
+    res.sub_slot_holes.clear();
+    res.superseded.clear();
+    if (!plan.fits) {
         res.fits          = false;
         res.refused_heads = plan.refused_heads;
         return res;
+    }
+    // The plan must answer this request.  A mismatch is the caller's bug, not a plan that
+    // does not fit, so it never reads as a refusal.
+    if (plan.heads.size() != r.head_slots.size() || plan.after_kv.size() != r.after_kv.size() ||
+        plan.layers.size() != slots.size()) {
+        fit_misuse("the plan was made for a request with other layers, head slots or after-KV terms");
+    }
+    for (size_t i = 0; i < slots.size(); ++i) {
+        if (plan.layers[i].layer != slots[i].layer ||
+            (plan.layers[i].device && plan.layers[i].extent >= plan.extents.size())) {
+            fit_misuse("a plan layer does not match the request's slot table");
+        }
+    }
+    for (const kv_carve_op & op : plan.carve_order) {
+        const size_t bound = op.kind == KV_CARVE_HEAD   ? plan.heads.size() :
+                             op.kind == KV_CARVE_EXTENT ? plan.extents.size() :
+                                                          plan.after_kv.size();
+        if (op.index >= bound || op.tlsf >= n_tlsf) {
+            fit_misuse("a plan carve op names a head, extent, term or TLSF the request does not have");
+        }
     }
 
     // The room this call owns, as the re-snapshot sees it: free blocks, and retained
@@ -1477,36 +1525,36 @@ kv_region_fit_result commit_verify(const shared_zone_geometry &  g,
     return res;
 }
 
-}  // namespace
+// What the head phase leaves: the state with the head slots placed, the placements,
+// the reservations a grown slot supersedes, and the heads no room holds.
+struct head_phase {
+    fit_state                       base;
+    std::vector<kv_head_placement>  heads;
+    std::vector<kv_superseded_slot> superseded;
+    std::vector<size_t>             refused;
+};
 
-kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_region_request & r) {
-    const std::vector<fit_slot> slots = build_slots(r);
-    if (r.commit_plan != nullptr) {
-        return commit_verify(g, r, slots);
-    }
-    kv_region_fit_result res;
-    const size_t         n_tlsf = g.tlsfs.size();
-    res.yield_prefix.assign(n_tlsf, 0);
-    res.free_after_full_kv.assign(n_tlsf, 0);
-    res.tlsf_free.assign(n_tlsf, 0);
-
-    fit_state base = build_state(g, r);
-
-    // Head slots, in request order, before any KV.  A head slot is served in
-    // place by a reserved slot of the same key with cap >= the planned size.
-    res.heads.resize(r.head_slots.size());
+// Place the head slots in `order`, before any KV.  A head slot is served in place by a
+// reserved slot of the same key with cap >= the planned size.  `by_tlsf` takes the
+// first TLSF with a room in a tier instead of the tightest room across TLSFs.
+head_phase place_heads(const shared_zone_geometry & g,
+                       const kv_region_request &    r,
+                       const fit_state &            start,
+                       const std::vector<size_t> &  order,
+                       bool                         by_tlsf) {
+    const size_t n_tlsf = g.tlsfs.size();
+    head_phase   ph;
+    ph.base = start;
+    ph.heads.resize(r.head_slots.size());
     std::vector<std::vector<char>> reservation_used(n_tlsf);
     for (size_t t = 0; t < n_tlsf; ++t) {
         reservation_used[t].assign(g.tlsfs[t].reservations.size(), 0);
     }
-    std::vector<size_t>       head_assign(r.head_slots.size(), SIZE_MAX);
     const std::vector<size_t> no_remaining;
-
-    const std::vector<size_t> head_order = head_placement_order(g, r);
-    for (const size_t h : head_order) {
+    for (const size_t h : order) {
         const kv_head_slot_request & hs   = r.head_slots[h];
         const size_t                 need = kv_layer_alloc_bytes(hs.size);
-        kv_head_placement &          out  = res.heads[h];
+        kv_head_placement &          out  = ph.heads[h];
         out.head                          = h;
         out.size                          = need;
         bool settled                      = false;
@@ -1550,18 +1598,63 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
         if (settled) {
             continue;
         }
-        base.a.push_back({ AS_HEAD, h, need, SIZE_MAX });
-        const int id   = (int) base.a.size() - 1;
-        head_assign[h] = (size_t) id;
-        if (!place(base, id, hs.names_weight ? 1 : 0, false, no_remaining, 0)) {
-            res.refused_heads.push_back(h);
+        ph.base.a.push_back({ AS_HEAD, h, need, SIZE_MAX });
+        const int id = (int) ph.base.a.size() - 1;
+        if (!place(ph.base, id, hs.names_weight ? 1 : 0, false, no_remaining, 0, by_tlsf)) {
+            ph.refused.push_back(h);
             continue;
         }
         if (super_t != SIZE_MAX) {
             reservation_used[super_t][super_i] = 1;
-            res.superseded.push_back({ super_t, super_i });
+            ph.superseded.push_back({ super_t, super_i });
         }
     }
+    return ph;
+}
+
+// The head phase for a plan.  The request order is tried first, with the tightest room
+// across TLSFs; when that refuses a head, the constrained-heads-first order, and then
+// the request order with the first TLSF that has room in each tier, whatever its size.
+// The first attempt that places every head wins, so whatever
+// the request order places is placed exactly as before and no attempt can turn a
+// placement into a refusal.  When none fits, the refusal is the request order's.  This
+// is three greedy attempts, not a search over head orders: a placement some other order
+// would find can still be refused.
+head_phase head_attempts(const shared_zone_geometry & g, const kv_region_request & r, const fit_state & start) {
+    std::vector<size_t> request_order(r.head_slots.size());
+    for (size_t h = 0; h < request_order.size(); ++h) {
+        request_order[h] = h;
+    }
+    head_phase first = place_heads(g, r, start, request_order, false);
+    if (first.refused.empty()) {
+        return first;
+    }
+    head_phase constrained = place_heads(g, r, start, head_placement_order(g, r), false);
+    if (constrained.refused.empty()) {
+        return constrained;
+    }
+    head_phase by_index = place_heads(g, r, start, request_order, true);
+    return by_index.refused.empty() ? by_index : first;
+}
+
+}  // namespace
+
+kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_region_request & r) {
+    const std::vector<fit_slot> slots = build_slots(r);
+    if (r.commit_plan != nullptr) {
+        return commit_verify(g, r, slots);
+    }
+    kv_region_fit_result res;
+    const size_t         n_tlsf = g.tlsfs.size();
+    res.yield_prefix.assign(n_tlsf, 0);
+    res.free_after_full_kv.assign(n_tlsf, 0);
+    res.tlsf_free.assign(n_tlsf, 0);
+
+    head_phase phase  = head_attempts(g, r, build_state(g, r));
+    fit_state  base   = std::move(phase.base);
+    res.heads         = std::move(phase.heads);
+    res.superseded    = std::move(phase.superseded);
+    res.refused_heads = std::move(phase.refused);
     std::sort(res.refused_heads.begin(), res.refused_heads.end());
     if (!res.refused_heads.empty()) {
         for (size_t t = 0; t < n_tlsf; ++t) {
@@ -1633,6 +1726,7 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
     }
     std::stable_sort(terms.begin(), terms.end(),
                      [&](size_t a, size_t b) { return res.after_kv[a].size < res.after_kv[b].size; });
+    const std::vector<size_t> no_remaining;
     // An after-KV charge only records a range and carves nothing, yet it goes through
     // find_room like a slot, so it too needs a carvable piece.  That is deliberate: it
     // keeps the charge inside room the later carves can really reach, and it must not

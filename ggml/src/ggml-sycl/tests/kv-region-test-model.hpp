@@ -232,8 +232,13 @@ class zone_model {
     // is not the free block's (a survivor of a commit re-fit that kept its planned
     // offset under a slot that is gone) is the offset-fixed carve of the spec's
     // allocate_at, which the model builds from the same primitives: a plug allocated
-    // below the block's top, the carve below the plug, then the plug freed.  Returns
-    // false, printing why, when the allocator's offset is not the fit's.
+    // below the block's top, the carve below the plug, then the plug freed.
+    //
+    // The contract the production allocate_at must keep, and L4 reruns these cases
+    // against it: the block is carved at exactly [offset, offset + demand) or nothing
+    // changes.  A failed carve leaves the allocator as it found it, so the model frees
+    // the plug and anything it carved on every failure path.  Returns false, printing
+    // why, on failure.
     bool carve(const kv_carve_op & op) {
         if (!op.carve) {
             return true;
@@ -259,6 +264,9 @@ class zone_model {
             plug = tlsf_.allocate_below(top_anchor, hi - end, 256, ggml_sycl::SHARED_ZONE_TAG_CONTEXT);
             if (plug != end) {
                 std::fprintf(stderr, "carve mismatch: no plug at %zu for the carve at %zu\n", end, op.offset);
+                if (plug != SIZE_MAX) {
+                    tlsf_.free(plug);
+                }
                 return false;
             }
         }
@@ -268,6 +276,12 @@ class zone_model {
         if (off != op.offset) {
             std::fprintf(stderr, "carve mismatch: fit offset %zu size %zu demand %zu, allocator gave %zu\n", op.offset,
                          op.size, op.demand, off);
+            if (off != SIZE_MAX) {
+                tlsf_.free(off);
+            }
+            if (plug != SIZE_MAX) {
+                tlsf_.free(plug);
+            }
             return false;
         }
         census_[off] = { off, tlsf_.used() - used, ggml_sycl::SHARED_ZONE_TAG_CONTEXT, false };
@@ -278,6 +292,26 @@ class zone_model {
             anchor_ = off;
         }
         return true;
+    }
+
+    // Everything the allocator's public surface shows of its state: the byte counts, each
+    // allocated block with the gap under it, and the free blocks from the top down.  Two
+    // equal fingerprints mean a carve that failed changed nothing.
+    std::vector<size_t> fingerprint() const {
+        std::vector<size_t> f = { tlsf_.used(), tlsf_.available(), tlsf_.largest_free_block(), census_.size(),
+                                  anchor_ };
+        for (const auto & kv : census_) {
+            f.push_back(kv.first);
+            f.push_back(kv.second.size);
+            f.push_back(tlsf_.gap_below(kv.first));
+        }
+        for (const tlsf_allocator::extent & e :
+             tlsf_.frontier_walk(tlsf_allocator::no_anchor, ggml_sycl::SHARED_ZONE_TAG_OPTIONAL)) {
+            f.push_back(e.offset);
+            f.push_back(e.size);
+            f.push_back(e.free ? 1 : 0);
+        }
+        return f;
     }
 
     bool invariants() const { return tlsf_.check_invariants(); }
