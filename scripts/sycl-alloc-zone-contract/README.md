@@ -78,8 +78,8 @@ pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause
   `unified_cache_get_planned_(pp_moe_)onednn_*`), `J-DISPATCH` (a call of `zone_is_onednn_reorder_eligible`; the one real
   call, in `zone_scoped_maxima`, is allowlist entry `E-J-CLASSIFIER`).
 - (m) `M-SCRATCH`, `M-STALE`, `M-FLOOR`, `M-DATA`. `appendix-rows.json` is the 139-row census table (zone columns) of the
-  design appendix at master `2c4f5e45d` rev 4.16, because the appendix is not in the repository; regenerate it from the design
-  table when the appendix changes. The gate's own tables (`M_TABLES`: the floor list with each row's owner ticket, the
+  design appendix at master `2c4f5e45d` rev 4.16, because the appendix is not in the repository. Regenerate it, never hand-edit it:
+  `python3 scripts/sycl-alloc-zone-contract/gen-appendix-rows.py --design <design.md> --master 2c4f5e45d --rev 4.16`. The gate's own tables (`M_TABLES`: the floor list with each row's owner ticket, the
   covered-by-peak rows, the unreachable rows) are checked against it, and `ensure_planned_arena_zones` must apply the
   `GGML_SYCL_COMPUTE_ARENA_MB` floor while the floor list is non-empty (and must not once it is empty).
 - (n) `N-VOID` and `N-NODISCARD`, the only S2d codes that may be debt. The names are the declined-result consumers
@@ -96,7 +96,8 @@ pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause
   `set_rows_stage_bytes` that is defined must be called by each of its allocation sites and by `zone-sizing.cpp` or
   `unified-cache.cpp`.
 
-Gaps stated rather than hidden: the names of (j)'s fit function, reserve target and selector bit reads are not fixed yet, so only
+Gaps stated rather than hidden (the gate prints a `TODO j`, `TODO l` and `TODO p-route` line for the narrowings, so they are visible
+in its output):  the names of (j)'s fit function, reserve target and selector bit reads are not fixed yet, so only
 the two `*_bytes` names are covered; (l)'s five count-caller functions do not exist, so the allowlist entries are added as each
 lands. Today's 24 N-* debt entries were seeded once with `--write-debt --allow-growth` (834 to 858 entries).
 

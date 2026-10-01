@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py clause (m) (the SCRATCH floor list). The census table of the 23mk design's appendix (master 2c4f5e45d, rev 4.16), reduced to the columns the clause reads: row, site (as at that master), function, zone today, code (the reach class: R, F, T, B, H, X, D, REF, ZH...), core zone, exact term. The design is not in the repository, so this table is the clause's input; regenerate it, with the SCRATCH_FLOOR_CONSUMERS table in the gate, in the commit that changes a row's zone or term.",
+  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py clause (m) (the SCRATCH floor list). The census table of the 23mk design's appendix (master 2c4f5e45d, rev 4.16), reduced to the columns the clause reads: row, site (as at that master), function, zone today, code (the reach class: R, F, T, B, H, X, D, REF, ZH...), core zone, exact term. The design is not in the repository, so this table is the clause's input; regenerate it with scripts/sycl-alloc-zone-contract/gen-appendix-rows.py, with the SCRATCH_FLOOR_CONSUMERS table in the gate, in the commit that changes a row's zone or term.",
   "rows": [
     {"row": 1, "site": "binbcast.cpp:838", "function": "lambda in ggml_sycl_op_bin_bcast", "zone": "-", "code": "REF", "core": "- (host-source staging refused)", "term": "-"},
     {"row": 2, "site": "ccl-comm.cpp:338", "function": "ggml_sycl_ccl_allreduce_sum_f32", "zone": "-", "code": "R", "core": "RUNTIME", "term": "pqmm"},
