@@ -53,7 +53,13 @@ def test_packed_k_sidecar_records_kv_bytes_without_ownership_change() -> None:
     begin = src.index("ggml_sycl_fattn_xmx_packed_k_sidecar_entry * entry = nullptr")
     end = src.index("void ggml_sycl_fattn_xmx_unregister_packed_k_range", begin)
     body = src[begin:end]
-    handle = body.index("packed.handle = ggml_sycl::mem_handle::from_owned_alloc")
+    # 3bbf55198 (owner migration) mints the handle into a local first
+    # (`mem_handle handle = mem_handle::from_owned_alloc(...)`) and only then
+    # moves it into `packed.handle`. Both steps are scored: the owner-first
+    # mint, then the install, and the ordering below runs from the install.
+    mint = body.index("ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner)")
+    handle = body.index("packed.handle = std::move(handle)")
+    assert mint < handle
     # The ready event is published by the submit helper through its accepted-event
     # out-parameter, not by an assignment after the call: e07bfa26c ("sycl: publish
     # packed-K accepted events before profiling") moved the publication inside the
