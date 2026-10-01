@@ -23,6 +23,24 @@ Finding codes added by clause (c): `C-COHORT` (a copy of a request that is hande
 literal) and `C-SITE` (a wrapper from one request type to another that does not copy the source's site fields).
 `DEFER-C` now marks only what the gate still cannot follow (a helper with several returns, a lambda or function-pointer call).
 
+Clause (g), `G-CATCH`: every `catch (...)`, `catch (std::exception &)` and `catch (const std::exception &)` (any spelling:
+east const, by value, with or without `std::`) must be preceded in the same try by a `ggml_sycl_fallback_error` handler whose
+body is exactly `throw;`. The same pattern runs over the `catch_clause` nodes and over every `#define` body (a macro handler
+is keyed `(file, #define NAME)`; its guard must come earlier in the body with no `try` between). The unguarded handlers
+today are the shrink-only debt, keyed `file::function::catch_clause:<all|exception>#ordinal`, so a new handler in a listed
+function takes the next ordinal and fails. Exemptions are allowlist entries `code: "G-CATCH"` by `file` + `function`
+with a `count` and a reason (`file` + `function: "#define NAME"` for a macro).
+
+Clause (h), `H-*`: `cascade_step` and `unconverted_ticket` have no writer today, so every write is a finding. Each is
+exempted by an allowlist entry keyed by the construction or call node (the declaration of the object whose field is written,
+never the function), with an `outcome` (`CASCADE`, or `UNCONVERTED` for `H-UNCONV`, which also names the `ticket` it
+sets). A `TERMINAL` outcome is refused. `H-CASCADE` is `cascade_step = true`; `H-CASCADE-PARAM` is a copy of the enclosing
+function's own `cascade_step` parameter, exempted by `file` + `function` for an allowlisted callee; `H-PASS-TRUE` and
+`H-PASS-FORWARD` are a call that passes `true` or forwards its own parameter to a function that takes one. The `*-EXPR` codes
+(any other expression) cannot be exempted, and no `H-*` finding can be debt (`--write-debt` refuses it). An allowlisted node
+that stops writing the field fails as an entry matching nothing, which is witness 21's check that a DECLARED
+construction keeps its flag.
+
 Every `E-RAW` debt entry also carries `fate` and `cite`. `fate` is `deleted-by-<step>`, `converted-by-<step>`,
 `sanctioned-internal`, `sanctioned-vendored` (upstream code we do not edit) or `pending-disposition`. A `sanctioned-internal` entry is one no step will ever shrink:
 it is a candidate for the allowlist, and moving it there is the lead's decision, not the implementer's.

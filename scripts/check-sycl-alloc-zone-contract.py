@@ -10,7 +10,7 @@ hash covers the construction's declaration and the field writes bound to it, and
 counts only identical constructions in the same function, so a key survives an unrelated edit
 above it and moves only when the construction itself changes.
 
-What this unit (S2a, S2b) enforces
+What this unit (S2a, S2b, S2c) enforces
   (a) a request-type token inside an ERROR/MISSING region fails; a file whose root is ERROR
       (today cpu-dispatch.cpp) is also scanned lexically, and each lexical request must be
       host-only by a literal on its statement run
@@ -26,6 +26,19 @@ What this unit (S2a, S2b) enforces
       outside dpct/helper.hpp; helper.hpp's own three raw calls are allowlisted by function name and count
       (rulings M247: vendored upstream, not edited, dead in-tree)
   (f) a missing tree_sitter_language_pack is a FAIL, never a skip
+  (g) rethrow first: every `catch (...)`, `catch (std::exception &)` and `catch (const std::exception &)`, in any
+      spelling (east const, by value, with or without std::), is preceded in its try by a ggml_sycl_fallback_error handler
+      whose body is exactly `throw;`. The scope is every scanned file, which includes every file that holds a handler.
+      #define bodies are scanned lexically with the same pattern, keyed (file, macro). The unguarded handlers are shrink-only
+      debt (G-CATCH, keyed file::function::catch_clause:<kind>#ordinal); exemptions are allowlist entries by file and function.
+  (h) cascade_step and unconverted_ticket, keyed by the construction node, never by function. Nothing writes either today,
+      so every write is a finding that only an allowlist entry for that node exempts: cascade_step = true (H-CASCADE), a copy
+      of the enclosing function's own cascade_step parameter (H-CASCADE-PARAM, exempt by the allowlisted callee), a call that
+      passes true (H-PASS-TRUE) or forwards its own parameter (H-PASS-FORWARD) to a function with such a parameter, and an
+      unconverted_ticket string literal (H-UNCONV, the entry names the ticket). Any other expression (H-CASCADE-EXPR,
+      H-PASS-EXPR, H-UNCONV-EXPR) cannot be exempted. No H-* finding can be debt, and an entry's outcome may not be TERMINAL.
+      An allowlisted node that stops writing its field fails as an entry matching nothing (a DECLARED row losing its flag).
+      Positional initialisation of a request type and a call through a lambda or function pointer are not followed.
 and the brace rule the construction-site labels need: a braceless `T x;` reports the class
 site (unified-cache.hpp, the comment above alloc_intent), so every value declaration of a
 request type is written `T x{}`.
@@ -70,7 +83,7 @@ be written a literal false. Write credit is positional and does not follow contr
       constraints.must_device; r = false;`), a call through a lambda, a function pointer or a std::function, a
       call written inside a macro body, a helper with several returns, positional goto/return control flow,
       token pasting (`malloc_##x`), `#pragma message`, and the constructor-form alias `T & c(x)`.
-  (g)-(p) are S2c/S2d. Witness 9 (a site that stops calling its shared `*_bytes()` function) is
+  (i)-(p) are S2d. Witness 9 (a site that stops calling its shared `*_bytes()` function) is
       deferred to S2d as a dormant clause: its subjects, the model-shaped exact `*_bytes()`
       functions (load_reorder_temp_bytes, woq_packed_bytes, ...), do not exist in the tree yet.
 
@@ -172,7 +185,7 @@ DPCT_HOME = "dpct/helper.hpp"
 DPCT_FUNCS = ("dpct_malloc",)
 DPCT_CLASSES = ("device_memory", "global_memory", "constant_memory", "shared_memory")
 
-DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-e). Shrink-only: a violation not listed "
+DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h). Shrink-only: a violation not listed "
             "fails, and a listed entry that no longer violates fails. Every E-RAW entry carries a fate (deleted-by-*, "
             "converted-by-*, sanctioned-internal, sanctioned-vendored or pending-disposition) and a cite, so an entry no step will ever "
             "shrink is visible as a mislabelled allowlist entry. Regenerate with `python3 "
@@ -180,8 +193,24 @@ DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-e). Sh
 FATE_RE = re.compile(r"^(deleted-by|converted-by)-[A-Za-z0-9._§()-]+$|^sanctioned-internal$|^sanctioned-vendored$|^pending-disposition$")
 CITE_MIN = 12   # a cite names a ticket or a design/census row; "tbd" is not one
 
+# Clause (g): a handler that can swallow ggml_sycl_fallback_error must be preceded, in the same try, by a handler for it
+# whose body is exactly `throw;`. One pattern for the AST and for macro bodies, so no spelling escapes (a const in either
+# position, with or without std::, with or without the &).
+HANDLER_RE = re.compile(r"catch\s*\(\s*(\.\.\.|(const\s+)?(std::)?exception(?![A-Za-z0-9_])(\s+const)?\s*&?)")
+GUARD_RE = re.compile(r"catch\s*\(\s*(const\s+)?(?:ggml_sycl::)?ggml_sycl_fallback_error(?![A-Za-z0-9_])(\s+const)?\s*&?\s*"
+                      r"(?:[A-Za-z_][A-Za-z0-9_]*\s*)?\)\s*\{\s*throw\s*;\s*\}")
+# Clause (h): the two class fields every writer must name by node.
+H_FIELDS = ("cascade_step", "unconverted_ticket")
+# What each code of clause (h) may be exempted by: a node key (or the callee's file and function for H-CASCADE-PARAM).
+# The expression forms are never exempt, and no clause-(h) finding may sit in the debt list.
+H_CODES = ("H-CASCADE", "H-CASCADE-PARAM", "H-CASCADE-EXPR", "H-PASS-TRUE", "H-PASS-FORWARD", "H-PASS-EXPR", "H-UNCONV",
+           "H-UNCONV-EXPR")
+H_NEVER_EXEMPT = ("H-CASCADE-EXPR", "H-PASS-EXPR", "H-UNCONV-EXPR")
+H_OUTCOME = {"H-CASCADE": "CASCADE", "H-CASCADE-PARAM": "CASCADE", "H-PASS-TRUE": "CASCADE", "H-PASS-FORWARD": "CASCADE",
+             "H-UNCONV": "UNCONVERTED"}
+
 CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-FORM", "B-TIER", "C-COHORT", "C-SITE", "D-ZONE",
-         "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "DEFER-C")
+         "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "G-CATCH", "DEFER-C") + H_CODES
 
 
 # ---------------------------------------------------------------- tree-sitter accessors
@@ -498,6 +527,27 @@ def file_defs(src):
     return _DEFS[h]
 
 
+_CASCADE_FUNCS = {}    # sha1 -> {function name: [index of a parameter named cascade_step]}
+
+
+def file_cascade_funcs(src):
+    """Functions of one file that take a parameter named `cascade_step`, by parameter position. A file that never spells
+    the name skips the walk."""
+    h = _sha(src)
+    if h not in _CASCADE_FUNCS:
+        out = {}
+        if b"cascade_step" in src:
+            for n in walk(parse(src)):
+                if kind(n) != "function_declarator" or fld(n, "declarator") is None or fld(n, "parameters") is None:
+                    continue
+                ps = [c for c in kids(fld(n, "parameters")) if kind(c) in ("parameter_declaration", "optional_parameter_declaration")]
+                for i, c in enumerate(ps):
+                    if param_name(src, c) == "cascade_step":
+                        out.setdefault(callee_last(txt(src, fld(n, "declarator"))), []).append(i)
+        _CASCADE_FUNCS[h] = out
+    return _CASCADE_FUNCS[h]
+
+
 def has_braced_arg(src, lst):
     """True when an argument list or initialiser list has a braced-init-list element. The grammar reads a bare
     `{}` argument as a compound literal of no type, so that shape counts too."""
@@ -536,6 +586,10 @@ class Ctx:
             for tbase, name in file_members(src):
                 if tbase in self.value_types:
                     self.req_members.add(name)
+        self.cascade_funcs = {}
+        for src in files.values():
+            for name, idx in file_cascade_funcs(src).items():
+                self.cascade_funcs.setdefault(name, set()).update(idx)
         self.member_order = {}
         for src in files.values():
             for sname, members in file_struct_members(src).items():
@@ -554,6 +608,7 @@ class Ctx:
         call-summary facts under the names it mentions. A function added elsewhere does not move its facts."""
         return hashlib.sha1(repr((self.digest, sorted(self.req_funcs & names), sorted(self.req_returning & names),
                                   sorted(self.req_members & names),
+                                  sorted((n, sorted(v)) for n, v in self.cascade_funcs.items() if n in names),
                                   [(n, self.ret_sum[n]) for n in sorted(self.ret_sum) if n in names],
                                   [(n, self.ev_sum[n]) for n in sorted(self.ev_sum) if n in names])).encode()).hexdigest()
 
@@ -656,7 +711,7 @@ def str_class(src, n):
 
 
 def classify(src, field, n):
-    if field == "cohort_id":
+    if field in ("cohort_id", "unconverted_ticket"):
         return str_class(src, n)
     if field == "prefer_vram_zone":
         return zone_class(src, n)
@@ -1625,6 +1680,157 @@ def param_and_stray_records(env, root):
     return out
 
 
+COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
+
+
+def handler_kind(text):
+    """'all' for `catch (...)`, 'exception' for a std::exception handler of any spelling, else None."""
+    m = HANDLER_RE.match(text)
+    return None if m is None else ("all" if m.group(1) == "..." else "exception")
+
+
+def catch_records(env, n):
+    """The record of one catch clause that can swallow ggml_sycl_fallback_error: guarded when an earlier clause of the same
+    try handles that type and rethrows with nothing else in its body."""
+    src = env.src
+    params = fld(n, "parameters")
+    head = "catch" + (txt(src, params) if params is not None else "")
+    hk = handler_kind(head)
+    if hk is None:
+        return []
+    guarded = False
+    p = parent(n)
+    for c in (kids(p) if p is not None else []):
+        if kind(c) != "catch_clause" or sb(c) >= sb(n):
+            continue
+        if GUARD_RE.fullmatch(COMMENT_RE.sub("", txt(src, c)).strip()):
+            guarded = True
+    return [{"func": enclosing(src, n), "kind": hk, "line": line_of(n), "guarded": guarded, "form": "clause"}]
+
+
+def macro_catch_records(src, n, name):
+    """Handlers spelled inside a #define body (tree-sitter keeps the body as one text node). A guard counts when it comes
+    earlier in the body with no `try` between it and the handler."""
+    body = COMMENT_RE.sub(" ", txt(src, fld(n, "value")).replace("\\\n", " "))
+    out = []
+    guards = [g.end() for g in GUARD_RE.finditer(body)]
+    for m in HANDLER_RE.finditer(body):
+        guarded = any(e <= m.start() and not re.search(r"\btry\b", body[e:m.start()]) for e in guards)
+        out.append({"func": "#define " + name, "kind": "all" if m.group(1) == "..." else "exception", "line": line_of(n),
+                    "guarded": guarded, "form": "macro"})
+    return out
+
+
+def own_param(src, ident):
+    """True when `ident` names the enclosing function's own parameter called cascade_step (not a shadowing local)."""
+    d = bound_decl(src, ident, "cascade_step")
+    return d is not None and kind(d) in ("parameter_declaration", "optional_parameter_declaration")
+
+
+def h_key_base(env, n, root, func):
+    """Key of the construction node a write belongs to: the declaration of the object whose field is written, so a new
+    construction planted beside a listed one is a different node. A write through a member, `this` or a call result is
+    keyed by its own left side."""
+    src = env.src
+    if root is not None:
+        d = bound_decl(src, root, txt(src, root))
+        if d is not None:
+            return env.key_for(func, "declaration" if kind(d) == "declaration" else "parameter", txt(src, root), txt(src, d))
+    return env.key_for(func, "assignment", "<lhs>", txt(src, fld(n, "left")))
+
+
+def h_records(env, n, k):
+    """Writes of cascade_step / unconverted_ticket and the calls that pass a cascade_step parameter, as plain records."""
+    src, ctx = env.src, env.ctx
+    func = enclosing(src, n)
+    if k == "assignment_expression":
+        root, chain = lhs_chain(src, fld(n, "left"))
+        if not chain or chain[0] not in H_FIELDS:
+            return []
+        field, rhs = chain[0], unparen(fld(n, "right"))
+        compound = [txt(src, c) for c in kids(n) if not _a(c, "is_named")][:1] != ["="]
+        base, text = h_key_base(env, n, root, func), txt(src, n)
+    elif k == "initializer_pair":
+        desig = [x for x in kids(n) if kind(x) == "field_designator"]
+        fi = [x for x in kids(desig[-1]) if kind(x) == "field_identifier"] if desig else []
+        field = txt(src, fi[0]) if fi else None
+        if field not in H_FIELDS or fld(n, "value") is None:
+            return []
+        rhs, compound, text = unparen(fld(n, "value")), False, txt(src, n)
+        q = parent(n)
+        while q is not None and kind(q) not in ("declaration", "field_declaration", "expression_statement", "return_statement",
+                                                "function_definition", "translation_unit"):
+            q = parent(q)
+        if q is not None and kind(q) in ("declaration", "field_declaration"):
+            var = next((declared_name(src, d) for d in kids(q) if sb(d) <= sb(n) < eb(d) and declared_name(src, d)), "<temp>")
+            base = env.key_for(func, "declaration", var, txt(src, q))
+        else:
+            base = env.key_for(func, "init", "<temp>", txt(src, q) if q is not None and kind(q) != "translation_unit" else text)
+    elif k == "call_expression" and ctx.cascade_funcs:
+        fn, al = fld(n, "function"), fld(n, "arguments")
+        idxs = ctx.cascade_funcs.get(callee_last(txt(src, fn))) if fn is not None else None
+        if not idxs or al is None:
+            return []
+        args = [c for c in kids(al) if _a(c, "is_named") and kind(c) != "comment"]
+        out = []
+        for i in sorted(idxs):
+            if i >= len(args):
+                continue  # the default is passed
+            a = unparen(args[i])
+            t = txt(src, a).strip()
+            cls = "true" if t == "true" else "default" if t == "false" else \
+                "forward" if kind(a) == "identifier" and t == "cascade_step" and own_param(src, a) else "expr"
+            out.append({"form": "pass", "field": "cascade_step", "cls": cls, "func": func, "line": line_of(n),
+                        "base": env.key_for(func, "call_expression", callee_last(txt(src, fn)), txt(src, n)),
+                        "name": callee_last(txt(src, fn))})
+        return out
+    else:
+        return []
+    if field == "cascade_step":
+        c = "expr" if compound else bool_class(src, rhs)
+        if c == "expr" and not compound and kind(rhs) == "identifier" and txt(src, rhs) == "cascade_step" and own_param(src, rhs):
+            c = "param"
+        name = ""
+    else:
+        c = "expr" if compound else str_class(src, rhs)
+        direct = kind(rhs) in ("string_literal", "concatenated_string", "raw_string_literal")
+        c = "expr" if c == "lit" and not direct else c
+        name = ""
+        if c == "lit":
+            name = "".join(literal_content(src, x) for x in (kids(rhs) if kind(rhs) == "concatenated_string" else [rhs]))
+    return [{"form": "write", "field": field, "cls": c, "func": func, "line": line_of(n), "base": base, "name": name}]
+
+
+def h_findings(r):
+    """(code, message) of one clause-(h) record, or None when it is the default or a reset."""
+    f, c = r["field"], r["cls"]
+    if r["form"] == "write" and f == "cascade_step":
+        if c == "true":
+            return "H-CASCADE", "cascade_step = true is written at a construction that is not an allowlisted node"
+        if c == "param":
+            return "H-CASCADE-PARAM", "cascade_step is copied from the enclosing function's own parameter, which is only " \
+                                      "allowed in an allowlisted callee"
+        if c == "expr":
+            return "H-CASCADE-EXPR", "cascade_step is written from an expression; only the literal true at an allowlisted node " \
+                                     "or the enclosing allowlisted callee's own cascade_step parameter may be"
+    elif r["form"] == "write":
+        if c == "lit":
+            return "H-UNCONV", "unconverted_ticket is set to %r at a construction that is not an allowlisted node for that ticket" \
+                % r["name"]
+        if c == "expr":
+            return "H-UNCONV-EXPR", "unconverted_ticket is set from something that is not a string literal"
+    else:
+        if c == "true":
+            return "H-PASS-TRUE", "a call passes cascade_step = true at a node that is not allowlisted"
+        if c == "forward":
+            return "H-PASS-FORWARD", "a call forwards the enclosing function's cascade_step parameter at a node that is not " \
+                                     "an allowlisted forward"
+        if c == "expr":
+            return "H-PASS-EXPR", "a call passes a cascade_step that is neither the default nor the literal true nor the " \
+                                  "enclosing function's own parameter"
+    return None
+
+
 def scan_file(rel, src, ctx):
     """Facts about one file, as plain data: constructions, form findings, raw hits, error tokens."""
     value_types, all_types = ctx.value_types, ctx.all_types
@@ -1633,9 +1839,15 @@ def scan_file(rel, src, ctx):
     root = parse(src)
     root_error = kind(root) == "ERROR"
     constructions, raws, errtoks, forms = [], [], [], []
+    catches, hrecs = [], []
+    h_on = b"cascade_step" in src or b"unconverted_ticket" in src or any(nm.encode() in src for nm in ctx.cascade_funcs)
 
     for n in walk(root):
         k = kind(n)
+        if k == "catch_clause":
+            catches.extend(catch_records(env, n))
+        elif h_on and k in ("assignment_expression", "initializer_pair", "call_expression"):
+            hrecs.extend(h_records(env, n, k))
         if k == "declaration":
             # `scoped_unified_alloc s({.size = 1});` and `s{ {.size = 1} };` build a request inside a constructor call
             tt = fld(n, "type")
@@ -1710,6 +1922,7 @@ def scan_file(rel, src, ctx):
             body = fld(n, "value")
             nm = fld(n, "name")
             if body is not None and nm is not None:
+                catches.extend(macro_catch_records(src, n, txt(src, nm)))
                 b = txt(src, body)
                 for r in RAW_NAMES:
                     if re.search(r"(?<![A-Za-z0-9_])" + re.escape(r) + r"(?![A-Za-z0-9_])", b):
@@ -1756,8 +1969,8 @@ def scan_file(rel, src, ctx):
             for m in re.finditer(rb"(?<![A-Za-z0-9_])" + re.escape(r.encode()) + rb"\s*(?:<[^>]*>)?\s*\(", clean):
                 raws.append({"func": "<lexical>", "name": r, "line": clean.count(b"\n", 0, m.start()) + 1,
                              "form": "lexical", "nodekind": "lexical", "text": r, "err": True})
-    return {"constructions": constructions, "raws": raws, "errtoks": errtoks, "forms": forms,
-            "root_error": root_error, "lexical": lexical, "lex_count": lex_count, "ast_count": ast_count}
+    return {"constructions": constructions, "raws": raws, "errtoks": errtoks, "forms": forms, "catches": catches,
+            "hrecs": hrecs, "root_error": root_error, "lexical": lexical, "lex_count": lex_count, "ast_count": ast_count}
 
 
 def blank_comments_strings(src, root):
@@ -1927,6 +2140,25 @@ def analyse(files):
                            "%s occurs as a %s, a form the gate cannot follow to a construction; write the request as a named "
                            "`T x{}` with its literal flags, or wait for clause (c) to follow it" % (f["tok"], f["role"])))
         seen = {}
+        for r in fa["catches"]:
+            if r["guarded"]:
+                continue
+            base = "%s::%s::catch_%s:%s" % (rel, r["func"], "macro" if r["form"] == "macro" else "clause", r["kind"])
+            i = seen.get(base, 0)
+            seen[base] = i + 1
+            viols.append(V("G-CATCH", "%s#%d" % (base, i), rel, r["line"], r["func"], r["kind"],
+                           "a %s handler is not preceded in its try by `catch (const ggml_sycl_fallback_error &) { throw; }`, "
+                           "so it can swallow a planned refusal" % ("catch (...)" if r["kind"] == "all" else "std::exception")))
+        seen = {}
+        for r in fa["hrecs"]:
+            found = h_findings(r)
+            if found is None:
+                continue
+            base = "%s::%s:%s" % (r["base"], r["form"], r["field"])
+            i = seen.get(base, 0)
+            seen[base] = i + 1
+            viols.append(V(found[0], "%s#%d" % (base, i), rel, r["line"], r["func"], r.get("name", ""), found[1]))
+        seen = {}
         for r in fa["raws"]:
             base = "%s::%s::%s:%s:%s" % (rel, r["func"], r["nodekind"], r["name"], text_hash(r["text"]))
             i = seen.get(base, 0)
@@ -1975,6 +2207,17 @@ def validate_data(allowlist, debt):
             continue
         if e["code"] not in CODES:
             errs.append("FAIL allowlist entry %s has unknown code %r" % (e["id"], e["code"]))
+        if e["code"] in H_NEVER_EXEMPT:
+            errs.append("FAIL allowlist entry %s: %s cannot be exempted; only the literal true at an allowlisted node or the "
+                        "enclosing callee's own parameter is a cascade_step write" % (e["id"], e["code"]))
+        if e["code"] in H_OUTCOME:
+            if e.get("outcome") != H_OUTCOME[e["code"]]:
+                errs.append("FAIL allowlist entry %s needs outcome %s (a TERMINAL row may set neither cascade_step nor "
+                            "unconverted_ticket)" % (e["id"], H_OUTCOME[e["code"]]))
+            if e["code"] != "H-CASCADE-PARAM" and "key" not in e:
+                errs.append("FAIL allowlist entry %s must be keyed by the construction or call node, never by function" % e["id"])
+        if e["code"] == "H-UNCONV" and not (isinstance(e.get("ticket"), str) and e["ticket"].strip()):
+            errs.append("FAIL allowlist entry %s needs the ticket its construction names" % e["id"])
         if not isinstance(e["count"], int) or isinstance(e["count"], bool) or e["count"] < 1:
             errs.append("FAIL allowlist entry %s needs an integer count >= 1" % e["id"])
         if not isinstance(e["reason"], str) or len(e["reason"].strip()) < CITE_MIN:
@@ -1988,6 +2231,8 @@ def validate_data(allowlist, debt):
             continue
         if d["code"] not in CODES:
             errs.append("FAIL debt entry %s %s has unknown code" % (d["code"], d["key"]))
+        if d["code"] in H_CODES:
+            errs.append("FAIL debt entry %s %s: a clause-(h) finding is allowlisted per node or fixed, never debt" % (d["code"], d["key"]))
         seen[(d["code"], d["key"])] += 1
         if d["code"] == "E-RAW" and not FATE_RE.match(str(d.get("fate", ""))):
             errs.append("FAIL debt entry E-RAW %s has no valid fate (deleted-by-*, converted-by-*, sanctioned-internal, "
@@ -2003,7 +2248,7 @@ def entry_matches(ent, v):
     if v.code != ent["code"]:
         return False
     if "key" in ent:
-        return v.key == ent["key"]
+        return v.key == ent["key"] and ("ticket" not in ent or v.name == ent["ticket"])
     return v.file == ent["file"] and v.func == ent["function"] and ("name" not in ent or v.name == ent["name"])
 
 
@@ -2050,6 +2295,10 @@ def run_gate(files, allowlist, debt):
 def plan_debt_write(viols, allowlist, old_debt, allow_growth):
     """(ok, message, entries). Rewriting the debt list may drop entries; adding one needs --allow-growth."""
     rest = [v for v in viols if not any(entry_matches(e, v) for e in allowlist.get("entries", []))]
+    bad = sorted({v.ident() for v in rest if v.code in H_CODES})
+    if bad:
+        return False, "clause-(h) findings cannot be debt; fix them or allowlist each node:\n%s" % "\n".join(
+            "  %s %s" % b for b in bad[:20]), []
     ids = sorted({v.ident() for v in rest})
     old = {(d["code"], d["key"]): {k: d[k] for k in ("fate", "cite") if k in d} for d in old_debt.get("violations", [])}
     grown = sorted(set(ids) - set(old))
@@ -2124,10 +2373,13 @@ class Case:
     (`planted=False` opts out for a mutation that adds no construction)."""
 
     def __init__(self, wid, label, mutate, expect, code=None, naming=None, allowlist=None, edit_allowlist=None,
-                 edit_debt=None, planted=True):
+                 edit_debt=None, planted=True, allow_nodes=None, allow_from=None):
         self.wid, self.label, self.mutate, self.expect = wid, label, mutate, expect
         self.code, self.naming, self.allowlist = code, naming, allowlist
         self.edit_allowlist, self.edit_debt, self.planted = edit_allowlist, edit_debt, planted
+        # allow_nodes: [{"code", "func", "nth", "extra"}]. Each becomes a key-matched allowlist entry for the node the gate
+        # finds in the tree `allow_from` builds (default: the case's own), so a node can be listed and then mutated away.
+        self.allow_nodes, self.allow_from = allow_nodes, allow_from
 
 
 # witness id -> what it pins. Every id must have a FAIL case; 9 is deferred and says so.
@@ -2164,6 +2416,12 @@ WITNESSES = {
     "s2b-firstuse": "the address of a scalar field or a method call on the request is a first handoff",
     "s2b-dpct": "dpct entry points are forbidden names outside dpct/helper.hpp; its three sites are pinned by function and count",
     "s2b-chain": "the raw chain's three links are allowlisted by name and exact count",
+    "15": "a catch (...) or std::exception handler without the rethrow clause before it",
+    "16": "cascade_step = true outside an allowlisted construction node", "16b": "a call passing cascade_step = true outside an allowlisted node",
+    "21": "a DECLARED construction that loses its cascade_step leaves its entry matching nothing",
+    "22": "unconverted_ticket is shrink-only and keyed by the construction node", "25": "a forward of cascade_step outside an allowlisted forward",
+    "26": "cascade_step = <expr> other than the allowlisted callee's own parameter", "34": "a rethrow-less handler inside a #define body",
+    "s2c-catch": "spellings and placements of the rethrow clause", "s2c-data": "clause-(h) entries that must be refused by validation",
 }
 WITNESSES_DEFERRED = {"9": "S2d: dormant clause; its *_bytes() subjects are absent from the tree"}
 
@@ -2862,6 +3120,214 @@ def matrix_cases():
     A(Case("s2b-chain", "a new caller of the chain's raw wrapper in another function is a finding", plant(
         "void zzplant_chain(const sycl::queue & q) {\n    void * p = unified_cache_raw_malloc_device(16, q);\n    (void) p;\n}\n"),
         "FAIL", "E-RAW", "unified_cache_raw_malloc_device"))
+    # S2c, clause (g): every handler that can swallow ggml_sycl_fallback_error is preceded, in its try, by a handler that
+    # rethrows it. Witnesses 15 and 34 (the macro form), with each spelling the rule is spelling-independent over.
+    G = "catch (const ggml_sycl_fallback_error &) { throw; } "
+
+    def tryfn(name, handlers, body="zz_op();"):
+        return "void %s() {\n    try { %s } %s\n}\n" % (name, body, handlers)
+
+    A(Case("15", "a catch (...) added in a dispatch function without the rethrow", plant(
+        tryfn("zzplant_w15", "catch (...) { }")), "FAIL", "G-CATCH", "zzplant_w15"))
+    A(Case("15", "the same handler after the rethrow clause (control)", plant(
+        tryfn("zzplant_w15", G + "catch (...) { }")), "PASS"))
+    A(Case("15", "a catch (const std::exception &) without the rethrow", plant(
+        tryfn("zzplant_w15", "catch (const std::exception & e) { (void) e; }")), "FAIL", "G-CATCH", "zzplant_w15"))
+    A(Case("15", "the rethrow clause with a named parameter keeps a std::exception handler legal (control)", plant(
+        tryfn("zzplant_w15", "catch (const ggml_sycl_fallback_error & fe) { throw; } catch (const std::exception & e) { (void) e; }")),
+        "PASS"))
+    A(Case("s2c-catch", "east const: catch (std::exception const &) without the rethrow", plant(
+        tryfn("zzplant_catch", "catch (std::exception const & e) { (void) e; }")), "FAIL", "G-CATCH", "zzplant_catch"))
+    A(Case("s2c-catch", "east const with the rethrow kept (control)", plant(
+        tryfn("zzplant_catch", G + "catch (std::exception const & e) { (void) e; }")), "PASS"))
+    A(Case("s2c-catch", "a by-value handler slices the fallback error too", plant(
+        tryfn("zzplant_catch", "catch (std::exception e) { }")), "FAIL", "G-CATCH", "zzplant_catch"))
+    A(Case("s2c-catch", "a rethrow clause whose body does more than throw does not count", plant(
+        tryfn("zzplant_catch", "catch (const ggml_sycl_fallback_error &) { zz_log(); throw; } catch (...) { }")),
+        "FAIL", "G-CATCH", "zzplant_catch"))
+    A(Case("s2c-catch", "a rethrow clause that throws a copy does not count", plant(
+        tryfn("zzplant_catch", "catch (const ggml_sycl_fallback_error & e) { throw e; } catch (...) { }")),
+        "FAIL", "G-CATCH", "zzplant_catch"))
+    A(Case("s2c-catch", "a rethrow clause placed after the handler does not count", plant(
+        tryfn("zzplant_catch", "catch (...) { } catch (const ggml_sycl_fallback_error &) { throw; }")),
+        "FAIL", "G-CATCH", "zzplant_catch"))
+    A(Case("s2c-catch", "a rethrow clause in another try does not count", plant(
+        "void zzplant_catch() {\n    try { zz_a(); } " + G + "\n    try { zz_b(); } catch (...) { }\n}\n"),
+        "FAIL", "G-CATCH", "zzplant_catch"))
+    A(Case("s2c-catch", "a comment inside the rethrow clause is still exactly `throw;` (control)", plant(
+        tryfn("zzplant_catch", "catch (const ggml_sycl_fallback_error &) { /* keep */ throw; } catch (...) { }")), "PASS"))
+    A(Case("s2c-catch", "handlers for other types are outside the rule (control)", plant(
+        tryfn("zzplant_catch", "catch (const std::runtime_error & e) { (void) e; } catch (const sycl::exception & e) { (void) e; } "
+              "catch (std::exception_ptr p) { (void) p; }")), "PASS", planted=False))
+    A(Case("s2c-catch", "a catch spelled in a comment or a string is not a handler (control)", plant(
+        "// try { x(); } catch (...) { }\nvoid zzplant_catch() {\n    const char * s = \"catch (...) { }\";\n    (void) s;\n}\n"),
+        "PASS", planted=False))
+    A(Case("s2c-catch", "a catch in a lambda is a handler of the function that holds it", plant(
+        "void zzplant_catch() {\n    auto f = [&]() { try { zz_op(); } catch (...) { } };\n    f();\n}\n"), "FAIL", "G-CATCH", "zzplant_catch"))
+    A(Case("s2c-catch", "two unguarded handlers in an exempted function break the exemption's count", plant(
+        "void zzplant_catch() {\n    try { zz_a(); } catch (...) { }\n    try { zz_b(); } catch (...) { }\n}\n"), "FAIL", "allowlist",
+        "E-ZZ-CATCH covers 2 finding(s) but pins 1",
+        allowlist={"id": "E-ZZ-CATCH", "code": "G-CATCH", "file": PLANT, "function": "zzplant_catch", "count": 1,
+                   "reason": "mutation-matrix test entry"}))
+    A(Case("s2c-catch", "the same two handlers under an exemption that pins both (control)", plant(
+        "void zzplant_catch() {\n    try { zz_a(); } catch (...) { }\n    try { zz_b(); } catch (...) { }\n}\n"), "PASS",
+        allowlist={"id": "E-ZZ-CATCH", "code": "G-CATCH", "file": PLANT, "function": "zzplant_catch", "count": 2,
+                   "reason": "mutation-matrix test entry"}))
+    A(Case("s2c-catch", "a G-CATCH debt entry whose handler is gone is stale", lambda f: f, "FAIL", "debt",
+           "no longer violates", edit_debt=lambda d: dict(d, violations=d["violations"] + [{
+               "code": "G-CATCH", "key": "zz-plant.cpp::zzplant_gone::catch_clause:all#0"}]), planted=False))
+    mac = "#define zz_try(x) do { try { x; } %s %s } while (0)\n"
+    A(Case("34", "a macro handler with no rethrow clause", plant(mac % ("", "catch (const std::exception & e) { (void) e; }")),
+        "FAIL", "G-CATCH", "#define zz_try", planted=False))
+    A(Case("34", "the same macro with its rethrow clause (control)", plant(mac % (G, "catch (const std::exception & e) { (void) e; }")),
+        "PASS"))
+    A(Case("34", "the macro respelled std::exception const & keeps the rethrow (control)", plant(
+        mac % (G, "catch (std::exception const & e) { (void) e; }")), "PASS"))
+    A(Case("34", "the respelled macro with the rethrow removed", plant(mac % ("", "catch (std::exception const & e) { (void) e; }")),
+        "FAIL", "G-CATCH", "#define zz_try", planted=False))
+    A(Case("34", "a by-value handler in a macro with the rethrow removed", plant(mac % ("", "catch (std::exception e) { }")),
+        "FAIL", "G-CATCH", "#define zz_try", planted=False))
+    A(Case("34", "a catch (...) in a macro with no rethrow", plant(mac % ("", "catch (...) { }")), "FAIL", "G-CATCH",
+        "#define zz_try", planted=False))
+    A(Case("34", "a macro whose rethrow clause guards only an earlier try", plant(
+        "#define zz_try(x) do { try { x; } " + G + "try { x; } catch (...) { } } while (0)\n"), "FAIL", "G-CATCH", "#define zz_try",
+        planted=False))
+    A(Case("34", "the real CHECK_TRY_ERROR handler is a finding, keyed (file, macro)", lambda f: f, "FAIL", "G-CATCH",
+        "common.hpp::#define CHECK_TRY_ERROR::catch_macro:exception#0", planted=False,
+        edit_debt=lambda d: dict(d, violations=[e for e in d["violations"] if "CHECK_TRY_ERROR" not in e["key"]])))
+    A(Case("34", "guarding the real CHECK_TRY_ERROR leaves its debt entry stale", lambda f: dict(f, **{"common.hpp": f["common.hpp"].replace(
+        b"        } catch (std::exception const & e) {", b"        } catch (const ggml_sycl_fallback_error &) {  \\\n            throw;  \\\n        } catch (std::exception const & e) {", 1)}),
+        "FAIL", "debt", "CHECK_TRY_ERROR", planted=False))
+
+    # S2c, clause (h): cascade_step and unconverted_ticket, keyed by node. Nothing writes either today, so every write is new.
+    CS = "    req.intent.constraints.cascade_step = true;\n"
+    A(Case("16", "cascade_step = true written at a construction outside the allowlist", plant(
+        good_device("zzplant_w16", CS)), "FAIL", "H-CASCADE", "zzplant_w16"))
+    A(Case("16", "the same write at an allowlisted node (control)", plant(good_device("zzplant_w16", CS)), "PASS",
+        allow_nodes=[{"code": "H-CASCADE", "func": "zzplant_w16"}]))
+    A(Case("16", "cascade_step in a designated initialiser", plant(
+        "void zzplant_w16() {\n    %s req{ .intent = { .constraints = { .must_device = true, .cascade_step = true } } };\n"
+        "    (void) req;\n}\n" % REQ), "FAIL", "H-CASCADE", "zzplant_w16", planted=False))
+    A(Case("16", "cascade_step written through a reference alias of the constraints", plant(good_device(
+        "zzplant_w16", "    ggml_sycl::alloc_constraints & c = req.intent.constraints;\n    c.cascade_step = true;\n")),
+        "FAIL", "H-CASCADE", "zzplant_w16"))
+    A(Case("16", "cascade_step written through a pointer", plant(good_device(
+        "zzplant_w16", "    ggml_sycl::alloc_constraints * p = &req.intent.constraints;\n    p->cascade_step = true;\n")),
+        "FAIL", "H-CASCADE", "zzplant_w16"))
+    A(Case("16", "cascade_step written inside a helper that takes the request by reference", plant(
+        "void zzplant_w16(%s & r) {\n    r.intent.constraints.cascade_step = true;\n}\n" % REQ), "FAIL", "H-CASCADE", "zzplant_w16",
+        planted=False))
+    A(Case("16", "a reset to false is not a writer (control)", plant(good_device(
+        "zzplant_w16", "    req.intent.constraints.cascade_step = false;\n")), "PASS"))
+    A(Case("16", "a compound assignment is an expression write", plant(good_device(
+        "zzplant_w16", "    req.intent.constraints.cascade_step |= true;\n")), "FAIL", "H-CASCADE-EXPR", "zzplant_w16"))
+    A(Case("16", "a second construction planted beside a listed one is a new node", plant(
+        "void zzplant_w16() {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n%s"
+        "    %s req2{};\n    req2.intent.constraints.must_device = true;\n"
+        "    req2.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req2.intent.constraints.forbid_vram_zone_spill = true;\n    req2.intent.constraints.cascade_step = true;\n}\n"
+        % (REQ, CS, REQ)), "FAIL", "H-CASCADE", "zzplant_w16", allow_nodes=[{"code": "H-CASCADE", "func": "zzplant_w16", "nth": 0}]))
+    # 21: a DECLARED row that loses its flag leaves its allowlist entry matching nothing
+    A(Case("21", "a DECLARED construction with its cascade_step removed", plant(good_device("zzplant_w21")), "FAIL", "allowlist",
+        "matches nothing", allow_nodes=[{"code": "H-CASCADE", "func": "zzplant_w21"}],
+        allow_from=plant(good_device("zzplant_w21", CS))))
+    A(Case("21", "the same construction still writing it (control)", plant(good_device("zzplant_w21", CS)), "PASS",
+        allow_nodes=[{"code": "H-CASCADE", "func": "zzplant_w21"}]))
+    # 16b, 25: a call that passes a cascade_step parameter
+    CF = "void zz_reserve(int a, bool cascade_step = false);\n"
+    A(Case("16b", "a dispatch caller passing cascade_step = true", plant(CF + "void zzplant_w16b() {\n    zz_reserve(1, true);\n}\n"),
+        "FAIL", "H-PASS-TRUE", "zzplant_w16b", planted=False))
+    A(Case("16b", "the transaction's call passing true at an allowlisted node (control)", plant(
+        CF + "void zzplant_w16b() {\n    zz_reserve(1, true);\n}\n"), "PASS",
+        allow_nodes=[{"code": "H-PASS-TRUE", "func": "zzplant_w16b"}]))
+    A(Case("16b", "a caller that passes the default, spelled or omitted (control)", plant(
+        CF + "void zzplant_w16b() {\n    zz_reserve(1);\n    zz_reserve(2, false);\n}\n"), "PASS"))
+    A(Case("16b", "a method call passing true is the same call", plant(
+        "struct zz_ring { void reserve(int a, bool cascade_step = false); };\n"
+        "void zzplant_w16b(zz_ring & r) {\n    r.reserve(1, true);\n}\n"), "FAIL", "H-PASS-TRUE", "zzplant_w16b", planted=False))
+    A(Case("25", "the replan's restore forwarding its cascade_step parameter", plant(
+        CF + "void zzplant_w25(bool cascade_step) {\n    zz_reserve(1, cascade_step);\n    zz_reserve(2, cascade_step);\n}\n"),
+        "FAIL", "H-PASS-FORWARD", "zzplant_w25", planted=False,
+        allow_nodes=[{"code": "H-PASS-FORWARD", "func": "zzplant_w25", "nth": 0}]))
+    A(Case("25", "the new-size reserve's forward alone at an allowlisted node (control)", plant(
+        CF + "void zzplant_w25(bool cascade_step) {\n    zz_reserve(1, cascade_step);\n    zz_reserve(2);\n}\n"), "PASS",
+        allow_nodes=[{"code": "H-PASS-FORWARD", "func": "zzplant_w25"}]))
+    A(Case("25", "a forward of a local that shadows the parameter name is an expression", plant(
+        CF + "void zzplant_w25(bool b) {\n    bool cascade_step = b;\n    zz_reserve(1, cascade_step);\n}\n"),
+        "FAIL", "H-PASS-EXPR", "zzplant_w25", planted=False))
+    A(Case("25", "a call passing some other expression", plant(
+        CF + "void zzplant_w25(bool b) {\n    zz_reserve(1, b);\n}\n"), "FAIL", "H-PASS-EXPR", "zzplant_w25", planted=False))
+    # 26: cascade_step = <expr> only as the enclosing allowlisted callee's own parameter
+    A(Case("26", "req.cascade_step = flag where flag is a local", plant(good_device(
+        "zzplant_w26", "    bool flag = zz_flag();\n    req.intent.constraints.cascade_step = flag;\n")), "FAIL", "H-CASCADE-EXPR",
+        "zzplant_w26"))
+    A(Case("26", "req.cascade_step = flag where flag is a member", plant(
+        "struct zz_holder { bool flag = false;\n    void zzplant_w26() {\n        %s req{};\n"
+        "        req.intent.constraints.cascade_step = flag;\n    }\n};\n" % REQ), "FAIL", "H-CASCADE-EXPR", "zzplant_w26",
+        planted=False))
+    A(Case("26", "the same statement copying the function's own parameter, with no callee entry", plant(
+        "void zzplant_w26(bool cascade_step) {\n    %s req{};\n    req.intent.constraints.cascade_step = cascade_step;\n}\n" % REQ),
+        "FAIL", "H-CASCADE-PARAM", "zzplant_w26", planted=False))
+    A(Case("26", "the same statement inside an allowlisted callee (control, try_alloc's shape)", plant(
+        "void zzplant_w26(bool cascade_step) {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n"
+        "    req.intent.constraints.cascade_step = cascade_step;\n}\n" % REQ),
+        "PASS",
+        allowlist={"id": "E-ZZ-CALLEE", "code": "H-CASCADE-PARAM", "file": PLANT, "function": "zzplant_w26", "count": 1,
+                   "outcome": "CASCADE", "reason": "mutation-matrix test entry"}))
+    A(Case("26", "a callee entry pins its count: a second copy fails", plant(
+        "void zzplant_w26(bool cascade_step) {\n    %s a{};\n    a.intent.constraints.cascade_step = cascade_step;\n"
+        "    %s b{};\n    b.intent.constraints.cascade_step = cascade_step;\n}\n" % (REQ, REQ)),
+        "FAIL", "allowlist", "E-ZZ-CALLEE covers 2 finding(s) but pins 1", planted=False,
+        allowlist={"id": "E-ZZ-CALLEE", "code": "H-CASCADE-PARAM", "file": PLANT, "function": "zzplant_w26", "count": 1,
+                   "outcome": "CASCADE", "reason": "mutation-matrix test entry"}))
+    A(Case("26", "a shadowing local named cascade_step is not the parameter", plant(
+        "void zzplant_w26(bool b) {\n    bool cascade_step = b;\n    %s req{};\n    req.intent.constraints.cascade_step = cascade_step;\n}\n"
+        % REQ), "FAIL", "H-CASCADE-EXPR", "zzplant_w26", planted=False))
+    # 22: unconverted_ticket is shrink-only and keyed by the construction node
+    UT = "    req.intent.constraints.unconverted_ticket = \"llama.cpp-zz1\";\n"
+    one = good_device("zzplant_w22", UT)
+    two = ("void zzplant_w22() {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+           "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+           "    req.intent.constraints.forbid_vram_zone_spill = true;\n%s"
+           "    %s req2{};\n    req2.intent.constraints.must_device = true;\n"
+           "    req2.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+           "    req2.intent.constraints.forbid_vram_zone_spill = true;\n"
+           "    req2.intent.constraints.unconverted_ticket = \"llama.cpp-zz1\";\n}\n" % (REQ, UT, REQ))
+    A(Case("22", "a new construction setting the ticket inside a function that already holds a listed one", plant(two), "FAIL",
+        "H-UNCONV", "zzplant_w22", allow_nodes=[{"code": "H-UNCONV", "func": "zzplant_w22", "nth": 0}], allow_from=plant(one)))
+    A(Case("22", "the listed construction itself (control)", plant(one), "PASS",
+        allow_nodes=[{"code": "H-UNCONV", "func": "zzplant_w22"}]))
+    A(Case("22", "the listed construction naming a different ticket", plant(one.replace("zz1", "zz2")), "FAIL", "H-UNCONV",
+        "zzplant_w22", allow_nodes=[{"code": "H-UNCONV", "func": "zzplant_w22"}], allow_from=plant(one)))
+    A(Case("22", "unconverted_ticket on a construction nobody listed", plant(one), "FAIL", "H-UNCONV", "zzplant_w22"))
+    A(Case("22", "unconverted_ticket set from a variable", plant(good_device(
+        "zzplant_w22", "    const char * t = zz_ticket();\n    req.intent.constraints.unconverted_ticket = t;\n")),
+        "FAIL", "H-UNCONV-EXPR", "zzplant_w22"))
+    A(Case("22", "unconverted_ticket reset to nullptr is not a setter (control)", plant(good_device(
+        "zzplant_w22", "    req.intent.constraints.unconverted_ticket = nullptr;\n")), "PASS"))
+    A(Case("22", "unconverted_ticket in a designated initialiser", plant(
+        "void zzplant_w22() {\n    %s req{ .intent = { .constraints = { .must_device = true, .unconverted_ticket = \"llama.cpp-zz1\" } } };\n"
+        "    (void) req;\n}\n" % REQ), "FAIL", "H-UNCONV", "zzplant_w22", planted=False))
+    A(Case("22", "an entry declaring a TERMINAL outcome for a writer is rejected", plant(one), "FAIL", "data",
+        "needs outcome UNCONVERTED", allow_nodes=[{"code": "H-UNCONV", "func": "zzplant_w22",
+                                                    "extra": {"outcome": "TERMINAL"}}], planted=False))
+    A(Case("s2c-data", "a function-keyed entry for a cascade_step write is rejected", plant(good_device("zzplant_data", CS)), "FAIL",
+        "data", "must be keyed by the construction or call node", planted=False,
+        allowlist={"id": "E-ZZ-FN", "code": "H-CASCADE", "file": PLANT, "function": "zzplant_data", "count": 1, "outcome": "CASCADE",
+                   "reason": "mutation-matrix test entry"}))
+    A(Case("s2c-data", "an entry exempting an expression write is rejected", plant(good_device(
+        "zzplant_data", "    req.intent.constraints.cascade_step = zz_flag();\n")), "FAIL", "data", "cannot be exempted", planted=False,
+        allowlist={"id": "E-ZZ-EXPR", "code": "H-CASCADE-EXPR", "file": PLANT, "function": "zzplant_data", "count": 1,
+                   "reason": "mutation-matrix test entry"}))
+    A(Case("s2c-data", "a clause-(h) finding listed as debt is rejected", plant(good_device("zzplant_data", CS)), "FAIL", "data",
+        "never debt", planted=False, edit_debt=lambda d: dict(d, violations=d["violations"] + [{
+            "code": "H-CASCADE", "key": "zz-plant.cpp::zzplant_data::declaration:req:00000000::write:cascade_step#0"}])))
+    A(Case("s2c-data", "an H-UNCONV entry without its ticket is rejected", plant(one), "FAIL", "data", "needs the ticket",
+        planted=False, allow_nodes=[{"code": "H-UNCONV", "func": "zzplant_w22", "extra": {"ticket": ""}}]))
     return c
 
 
@@ -2876,6 +3342,22 @@ def evaluate_case(base_files, allowlist, debt, case):
     al = allowlist
     if case.allowlist is not None:
         al = dict(allowlist, entries=list(allowlist.get("entries", [])) + [case.allowlist])
+    if case.allow_nodes:
+        found, _ = analyse(case.allow_from(base_files) if case.allow_from else files)
+        ents = []
+        for j, spec in enumerate(case.allow_nodes):
+            hit = sorted([v for v in found if v.code == spec["code"] and spec["func"] in v.func], key=lambda v: v.line)
+            if len(hit) <= spec.get("nth", 0):
+                raise SystemExit("matrix setup error: no %s finding in %s for allow_nodes of %r" % (spec["code"], spec["func"], case.label))
+            v = hit[spec.get("nth", 0)]
+            e = {"id": "E-ZZ-N%d" % j, "code": spec["code"], "key": v.key, "count": 1, "reason": "mutation-matrix planted node"}
+            if spec["code"] in H_OUTCOME:
+                e["outcome"] = H_OUTCOME[spec["code"]]
+            if spec["code"] == "H-UNCONV":
+                e["ticket"] = v.name
+            e.update(spec.get("extra", {}))
+            ents.append(e)
+        al = dict(al, entries=list(al.get("entries", [])) + ents)
     if case.edit_allowlist is not None:
         al = case.edit_allowlist(al)
     if case.edit_debt is not None:
@@ -2910,6 +3392,8 @@ def planted_sightings(files):
         n += sum(1 for r in fa["lexical"] if r["var"].startswith("zz"))
         n += sum(1 for r in fa["raws"] if "zz" in r["func"])
         n += sum(1 for r in fa["forms"] if "zz" in r["func"])
+        n += sum(1 for r in fa["catches"] if "zz" in r["func"])
+        n += sum(1 for r in fa["hrecs"] if "zz" in r["func"])
     return n
 
 
