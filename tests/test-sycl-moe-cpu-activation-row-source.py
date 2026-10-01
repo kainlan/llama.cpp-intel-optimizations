@@ -34,6 +34,20 @@ ne11 == 1.  Inside dispatch_cpu_compute (comments blanked):
   5. the per-expert fall-through survives: it copies row (entry.id % ne11) of token
      entry.iid1 to ci * K, and both builders still fall back to act_pinned + ci * K.
 
+SECOND CONTRACT (the hot/cold hazard, same ticket).  The synchronous CPU dispatch
+(do_cpu_dispatch) splits the host experts into hot and cold groups.  The hot group's
+scatter is published by flush_pending_cpu_scatter(), which submits the H2D copies from
+the PinnedBufferPool out buffer ASYNCHRONOUSLY and parks their events in
+g_pending_scatter.prev_bufs.scatter_events.  The cold dispatch that follows takes the
+SAME pool out buffer (acquire() returns one fixed pair) and memsets it on the host
+before any wait, which zeroes the hot slot-0 region before the H2D has executed.  So,
+in do_cpu_dispatch (comments blanked):
+
+  6. wait_prev_scatter_events() is defined, waits on exactly prev_bufs.scatter_events
+     with sycl::event::wait (an event wait, never a queue/stream wait) and clears them;
+  7. the hot dispatch, flush_pending_cpu_scatter(), wait_prev_scatter_events() and the
+     cold dispatch occur in that order.
+
 WHAT THIS DOES NOT PROVE.  It reads source text.  It shows the shortcut can no longer
 be taken when ne11 > 1 and that the per-expert path it falls to is still the
 row-selecting one.  It does not show that the numbers are right, that the CPU kernel
@@ -44,6 +58,9 @@ NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real source 
 requires each to FAIL, then requires the unmodified tree to pass.  Run it that way
 (it is how ctest registers it): a text check whose anchors stop matching passes
 vacuously, and the mutants prove each anchor is still load-bearing.
+
+THE RED FOR THE SECOND CONTRACT (against f0ffc6746, before the wait existed):
+  FAIL: wait_prev_scatter_events() is not defined ... (llama.cpp-4hg7)
 
 THE ORIGINAL RED, recorded before the fix (against master d8a67422d):
   FAIL: cpu_shared_act is not defined exactly once, ahead of dispatch_cpu_compute, as
@@ -179,6 +196,54 @@ def check(backend_src: str) -> None:
     if "src_off" not in body or not re.search(r"static_cast<size_t>\(i11\)\s*\*\s*nb11", body):
         raise ContractError("FAIL: the per-expert D2H source offset no longer uses i11 * nb11 (llama.cpp-4hg7)")
 
+    check_hot_cold(code)
+
+
+HELPER_MARKER = "static void wait_prev_scatter_events("
+DISPATCH_MARKER = "auto do_cpu_dispatch = [&]("
+
+
+def check_hot_cold(code: str) -> None:
+    # 6. the helper: scoped event wait on exactly the parked scatter events.
+    h_at = code.find(HELPER_MARKER)
+    if h_at < 0:
+        raise ContractError(
+            "FAIL: wait_prev_scatter_events() is not defined, so nothing waits for the hot scatter's H2D "
+            "before the cold dispatch memsets the shared pool out buffer (llama.cpp-4hg7)"
+        )
+    helper = squash(brace_block_from(code, h_at))
+    if "prev_bufs.scatter_events" not in helper and "pb.scatter_events" not in helper:
+        raise ContractError("FAIL: wait_prev_scatter_events() does not look at prev_bufs.scatter_events (llama.cpp-4hg7)")
+    if not re.search(r"sycl::event::wait\(\s*(?:pb|g_pending_scatter\.prev_bufs)\.scatter_events\s*\)", helper):
+        raise ContractError(
+            "FAIL: wait_prev_scatter_events() does not sycl::event::wait on prev_bufs.scatter_events (llama.cpp-4hg7)"
+        )
+    if re.search(r"stream->wait|\bq\.wait|queue\.wait|wait_and_throw|ext_oneapi_submit_barrier", helper):
+        raise ContractError("FAIL: wait_prev_scatter_events() waits on a whole queue instead of its events (llama.cpp-4hg7)")
+    if not re.search(r"(?:pb|g_pending_scatter\.prev_bufs)\.scatter_events\.clear\(\)", helper):
+        raise ContractError("FAIL: wait_prev_scatter_events() does not clear the events it waited on (llama.cpp-4hg7)")
+
+    # 7. ordering inside do_cpu_dispatch.
+    d_at = code.find(DISPATCH_MARKER)
+    if d_at < 0:
+        raise ContractError("FAIL: do_cpu_dispatch lambda not found (llama.cpp-4hg7)")
+    body = squash(brace_block_from(code, d_at))
+    order = [
+        "dispatch_cpu_and_scatter(hot_entries)",
+        "flush_pending_cpu_scatter()",
+        "wait_prev_scatter_events()",
+        "dispatch_cpu_and_scatter(cold_entries)",
+    ]
+    at = -1
+    for needle in order:
+        nxt = body.find(needle, at + 1)
+        if nxt < 0:
+            raise ContractError(
+                f"FAIL: do_cpu_dispatch has no `{needle}` after the previous step; the hot/cold order must be "
+                "hot dispatch, flush, wait_prev_scatter_events(), cold dispatch (llama.cpp-4hg7)"
+            )
+        at = nxt
+
 
 def self_test(backend_src: str) -> int:
     failures: list[str] = []
@@ -196,13 +261,13 @@ def self_test(backend_src: str) -> int:
         failures.append(f"{name}: mutant survived")
         print(f"  mutant {name}: SURVIVED")
 
-    def sub(old: str, new: str, in_lambda: bool = True) -> str:
+    def sub(old: str, new: str, in_lambda: bool = True, after: str | None = None) -> str:
         """Replace the first `old` at or after the dispatch_cpu_compute lambda.
 
         The secondary-GPU dispatch earlier in the file carries look-alike lines
         (i11/i12/dst_off); a mutant must land in the lambda under test.
         """
-        start = backend_src.find(LAMBDA_MARKER) if in_lambda else 0
+        start = backend_src.find(after if after else (LAMBDA_MARKER if in_lambda else ""))
         at = backend_src.find(old, max(start, 0))
         if at < 0:
             return backend_src
@@ -235,6 +300,28 @@ def self_test(backend_src: str) -> int:
     expect_fail("per-expert-dst-collapsed", sub(
         "const size_t dst_off = ci * static_cast<size_t>(K) * sizeof(float);",
         "const size_t dst_off = 0;"))
+    # m10: the wait call is removed from the hot/cold split.
+    expect_fail("hot-cold-wait-removed", sub("wait_prev_scatter_events();\n", "", in_lambda=False, after=DISPATCH_MARKER))
+    # m11: wait and flush swap places (the wait would run before anything is parked).
+    d_at = backend_src.find(DISPATCH_MARKER)
+    f_at = backend_src.find("flush_pending_cpu_scatter();", d_at)
+    w_at = backend_src.find("wait_prev_scatter_events();", f_at)
+    swapped = backend_src
+    if d_at >= 0 and 0 <= f_at < w_at:
+        swapped = (backend_src[:f_at] + "wait_prev_scatter_events();" + backend_src[f_at + len("flush_pending_cpu_scatter();") : w_at]
+                   + "flush_pending_cpu_scatter();" + backend_src[w_at + len("wait_prev_scatter_events();") :])
+    expect_fail("hot-cold-wait-before-flush", swapped)
+    # m12: the wait slides after the cold dispatch (too late: the memset has already run).
+    expect_fail("hot-cold-wait-after-cold", sub(
+        "wait_prev_scatter_events();\n                    }\n                    dispatch_cpu_and_scatter(cold_entries);",
+        "}\n                    dispatch_cpu_and_scatter(cold_entries);\n                    wait_prev_scatter_events();",
+        in_lambda=False, after=DISPATCH_MARKER))
+    # m13: the helper stops waiting on the events.
+    expect_fail("helper-no-event-wait", sub("sycl::event::wait(pb.scatter_events);", "", in_lambda=False, after=HELPER_MARKER))
+    # m14: the helper becomes a whole-queue wait.
+    expect_fail("helper-queue-wide-wait", sub("sycl::event::wait(pb.scatter_events);",
+                                              "g_pending_scatter.stream->wait(); sycl::event::wait(pb.scatter_events);",
+                                              in_lambda=False, after=HELPER_MARKER))
     # m9: a second, unconditioned shared decision appears in the lambda.
     expect_fail("second-source-in-lambda", sub(
         "if (act_on_host && cpu_shared_act) {",
@@ -250,7 +337,7 @@ def self_test(backend_src: str) -> int:
     if failures:
         print(f"SELF-TEST FAIL: {', '.join(failures)}")
         return 1
-    print("SELF-TEST PASS: 9 mutants caught, unmodified tree passes")
+    print("SELF-TEST PASS: 14 mutants caught, unmodified tree passes")
     return 0
 
 
@@ -265,7 +352,7 @@ def main(argv: list[str]) -> int:
         return 1
     print(
         "PASS: the host-expert CPU dispatch shares one activation only when ne11 == 1, and otherwise copies "
-        "each slot's own row (llama.cpp-4hg7)"
+        "each slot's own row, and the hot scatter H2D is waited on before the cold dispatch reuses the pool out buffer (llama.cpp-4hg7)"
     )
     return 0
 

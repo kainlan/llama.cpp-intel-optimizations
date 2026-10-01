@@ -23053,6 +23053,24 @@ static void flush_pending_cpu_scatter() {
 // done (future ready), flush immediately to overlap H2D scatter with the
 // current layer's activation D2H.  If CPU compute is still running, skip —
 // the next consumption point will do a blocking flush.
+// Wait for the H2D copies that the last flush_pending_cpu_scatter() submitted
+// (parked in prev_bufs.scatter_events) and drop the events; the buffers stay
+// parked for flush_prev_scatter_bufs().  Event wait only -- the compute queue is
+// not drained.  Main thread only: prev_bufs is thread_local.
+//
+// Needed before a second dispatch reuses the PinnedBufferPool out buffer:
+// acquire() hands back the same pair every time and dispatch_cpu_compute memsets
+// it on the host, so without this wait the memset can zero a slot whose scatter
+// copy has been enqueued but has not executed yet (llama.cpp-4hg7).
+static void wait_prev_scatter_events() {
+    auto & pb = g_pending_scatter.prev_bufs;
+    if (pb.scatter_events.empty()) {
+        return;
+    }
+    sycl::event::wait(pb.scatter_events);
+    pb.scatter_events.clear();
+}
+
 static bool try_flush_pending_cpu_scatter() {
     if (!g_pending_scatter.active) {
         return false;
@@ -76894,6 +76912,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     if (!hot_entries.empty()) {
                         dispatch_cpu_and_scatter(hot_entries);
                         flush_pending_cpu_scatter();
+                        // The flush only enqueued the hot scatter's H2D copies from
+                        // the shared pool out buffer.  The cold dispatch below takes
+                        // that same buffer and memsets it before any wait, which would
+                        // zero the hot slot's region before its copy has executed.
+                        wait_prev_scatter_events();
                     }
                     dispatch_cpu_and_scatter(cold_entries);
                 }
