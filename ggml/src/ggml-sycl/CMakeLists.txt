@@ -3202,6 +3202,35 @@ set_tests_properties(test-sycl-plan-caps PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+
+# Test: the re-plan hooks ggml_backend_sycl_synchronize_for_replan and
+# ggml_backend_sycl_graph_invalidate (zhcn-design §3.1; H6a).  Refusals run anywhere; the
+# context arms need a card and run only lead-run, under GGML_SYCL_TEST_REPLAN_DEVICE=1
+# (the test exits 77 without it, which ctest reports as skipped).
+add_executable(test-sycl-replan-hooks
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-replan-hooks.cpp
+)
+target_include_directories(test-sycl-replan-hooks PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-replan-hooks PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-replan-hooks PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-replan-hooks PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-replan-hooks PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-replan-hooks COMMAND test-sycl-replan-hooks)
+set_tests_properties(test-sycl-replan-hooks PROPERTIES
+    LABELS "sycl;h6a;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
 endif()
 
 # Test: ggml_sycl_get_tensor_usage() (ggml-sycl.cpp) -- the production entry

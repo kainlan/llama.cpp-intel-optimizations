@@ -1528,6 +1528,13 @@ GGML_BACKEND_API void *       ggml_backend_sycl_plan_scope_open_load_measure(enu
 GGML_BACKEND_API const char * ggml_backend_sycl_plan_scope_failure(void * scope);
 GGML_BACKEND_API void         ggml_backend_sycl_plan_scope_close(void * scope);
 
+// A re-plan's per-context steps (zhcn-design §3.1).  synchronize_for_replan waits every
+// queue that can reach a slice of the context, after llama's synchronize(); it returns
+// false if a wait failed.  graph_invalidate drops this context's own recorded graph
+// state, only when it has some, and reaches no process-global effect.
+GGML_BACKEND_API bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend);
+GGML_BACKEND_API void ggml_backend_sycl_graph_invalidate(ggml_backend_t backend, const char * reason);
+
 // === Test-only debug accessors (llama.cpp-dfo0, plan task L2) ===
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The freeze's store through the production core, for a host with no SYCL device

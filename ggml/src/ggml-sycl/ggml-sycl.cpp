@@ -48958,6 +48958,10 @@ int g_ggml_sycl_tp_threaded_ffn = 0;  // DISABLED - causes hangs at MMVQ kernel
 
 static void tp_device1_worker_thread_func();
 
+// The worker's own in-order queue, created by the worker thread.  Namespace-scope so
+// that ggml_backend_sycl_synchronize_for_replan can wait it when it exists.
+static sycl::queue * g_tp_device1_worker_queue = nullptr;
+
 // Worker thread function: runs FFN computations on device 1
 static void tp_device1_worker_thread_func() {
     auto &    w      = g_tp_device1_worker;
@@ -48966,12 +48970,11 @@ static void tp_device1_worker_thread_func() {
     // Using the shared TP queue causes hangs due to SYCL queue contention
 
     ggml_sycl_set_device(device);
-    sycl::device         dev          = ggml_sycl_get_device(device);
-    static sycl::queue * worker_queue = nullptr;
-    if (!worker_queue) {
-        worker_queue = new sycl::queue(dev, default_queue_properties());
+    sycl::device dev = ggml_sycl_get_device(device);
+    if (!g_tp_device1_worker_queue) {
+        g_tp_device1_worker_queue = new sycl::queue(dev, default_queue_properties());
     }
-    queue_ptr stream = worker_queue;
+    queue_ptr stream = g_tp_device1_worker_queue;
 
     if (!stream) {
         fprintf(stderr, "SYCL TP WORKER: Failed to create worker queue for device %d!\n", device);
@@ -90779,6 +90782,13 @@ static ggml_sycl_block_exec_dense_state & ggml_sycl_block_exec_dense_state_for(c
     return *state;
 }
 
+// The context's dense state if it has one; never creates it.
+static ggml_sycl_block_exec_dense_state * ggml_sycl_block_exec_dense_state_find(const ggml_backend_sycl_context * ctx) {
+    std::lock_guard<std::mutex> lock(g_ggml_sycl_block_exec_dense_states_mutex);
+    auto                        it = g_ggml_sycl_block_exec_dense_states.find(ctx);
+    return it == g_ggml_sycl_block_exec_dense_states.end() ? nullptr : it->second.get();
+}
+
 static void ggml_sycl_block_exec_dense_release(ggml_backend_sycl_context * ctx) {
     std::unique_ptr<ggml_sycl_block_exec_dense_state> state;
     {
@@ -100533,12 +100543,15 @@ static void sycl_exec_graph_mark_active(ggml_backend_sycl_context &             
     }
 }
 
-static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ctx) {
+// The context-scoped half of the retained-handle release: this context's own list and
+// its pools' graph-retained lists.  It does not touch the process-global
+// graph_unwaitable swap, which other contexts' entries can back executable graphs
+// through.
+static void sycl_exec_graph_release_pool_retained_scoped(ggml_backend_sycl_context * ctx) {
     if (!ctx) {
         return;
     }
     ctx->graph_retained_handles.clear();
-    ggml_sycl::release_graph_retained_handles();
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
         if (ctx->pools[d]) {
             ctx->pools[d]->release_graph_retained();
@@ -100559,16 +100572,41 @@ static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ct
     }
 }
 
-// llama.cpp-dkw0: NOT side-effect-free even when exec_graph is already null --
-// besides tearing down the executable graph, this unconditionally unpins MoE
-// experts/weights, clears the CPU staging cache, and invalidates MoE
-// segment/phase-layout/input-tensor caches. Calling it at a point where
-// nothing was recorded still perturbs that other state; a caller with
-// nothing to release should skip the call rather than rely on this being a
-// no-op (measured regression: calling it unconditionally at a preventive,
-// nothing-recorded-yet trip site altered gemma's decode output relative to
-// GGML_SYCL_DISABLE_GRAPH=1 at identical settings).
-static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason) {
+static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    sycl_exec_graph_release_pool_retained_scoped(ctx);
+    ggml_sycl::release_graph_retained_handles();
+}
+
+// Every kind of recorded state this context holds (zhcn-design §3.1 step 5(a)).  The
+// one statement of what "has recorded state" means: the re-plan's invalidate proc
+// tests it before any clear, and a context with nothing recorded does nothing.
+static bool sycl_exec_graph_has_recorded_state(ggml_backend_sycl_context * ctx) {
+    if (!ctx) {
+        return false;
+    }
+    if (ctx->exec_graph || ctx->active_exec_graph.valid || !ctx->graph_retained_handles.empty()) {
+        return true;
+    }
+    if (ctx->moe_segments_valid || ctx->moe_block_graphs_valid || !ctx->moe_direct_dispatch_graphs.empty() ||
+        !ctx->moe_sequence_graphs.empty()) {
+        return true;
+    }
+#ifdef GGML_SYCL_GRAPH
+    if (const auto * dense = ggml_sycl_block_exec_dense_state_find(ctx); dense && !dense->graphs.empty()) {
+        return true;
+    }
+#endif
+    return ctx->unified_kernel && ctx->unified_kernel->has_cached_plan();
+}
+
+// The context-scoped clear body: what a re-plan must drop for THIS context's own
+// recorded state, and nothing process-global.  It never releases the graph_unwaitable
+// swap, clears the static CPU staging cache or unpins weights: other contexts'
+// entries back their live executable graphs, and the staging cache has no lock.
+static void sycl_exec_graph_clear_scoped(ggml_backend_sycl_context * ctx, const char * reason) {
     if (!ctx) {
         return;
     }
@@ -100597,7 +100635,7 @@ static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const 
         ggml_sycl_trace_queue_wait(ctx->stream(), reason ? reason : "exec-graph-clear", ctx->device, -1, nullptr);
     }
     ctx->exec_graph.reset();
-    sycl_exec_graph_release_pool_retained(ctx);
+    sycl_exec_graph_release_pool_retained_scoped(ctx);
     ctx->active_exec_graph.valid = false;
     ctx->exec_graph_n_nodes      = 0;
     ctx->exec_graph_hash         = 0;
@@ -100613,11 +100651,44 @@ static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const 
     // it alongside the other per-generation input caches above.
     ctx->graph_input_staging_clear(*ctx->stream());
 
+    ctx->invalidate_moe_segments();
+    ctx->invalidate_moe_block_graphs();
+    // A re-plan drops every kind of recording (zhcn-design §Z14.1): the graphlets, the
+    // block-exec range graphs and the unified kernel's plan cache (with its micro graph
+    // and update recipe) all bake addresses of the scheduler being replaced.
+    ctx->invalidate_moe_sequence_graphs();
+    ctx->invalidate_moe_direct_dispatch_graphs();
+#ifdef GGML_SYCL_GRAPH
+    if (auto * dense = ggml_sycl_block_exec_dense_state_find(ctx)) {
+        dense->drop_graphs(*ctx);
+    }
+#endif
+    if (ctx->unified_kernel) {
+        ctx->unified_kernel->invalidate_plan_cache();
+    }
+}
+
+// llama.cpp-dkw0: NOT side-effect-free even when exec_graph is already null --
+// besides tearing down the executable graph, this unconditionally unpins MoE
+// experts/weights, clears the CPU staging cache, and invalidates MoE
+// segment/phase-layout/input-tensor caches. Calling it at a point where
+// nothing was recorded still perturbs that other state; a caller with
+// nothing to release should skip the call rather than rely on this being a
+// no-op (measured regression: calling it unconditionally at a preventive,
+// nothing-recorded-yet trip site altered gemma's decode output relative to
+// GGML_SYCL_DISABLE_GRAPH=1 at identical settings).
+// The scoped body plus the process-global effects: the graph_unwaitable swap, the
+// static CPU staging cache and the weight unpins.  Its callers are the phase
+// boundaries, the replay-management trips and teardown, none of them a re-plan path.
+static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason) {
+    if (!ctx) {
+        return;
+    }
+    sycl_exec_graph_clear_scoped(ctx, reason);
+    ggml_sycl::release_graph_retained_handles();
     ggml_sycl_cpu_staging_cache_clear();
     graph_unpin_moe_experts(ctx);
     graph_unpin_weights(ctx);
-    ctx->invalidate_moe_segments();
-    ctx->invalidate_moe_block_graphs();
 }
 
 // Owner-targeted replacement for the historical all-device graph-lease sweep at
@@ -100636,6 +100707,91 @@ static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::Model
         // Teardown effects report failure through their caller's result; a
         // throwing lease release must not escape into a noexcept unload path.
     }
+}
+
+// A re-plan's invalidation of ONE context's own recorded graph state (zhcn-design §3.1
+// step 5(a)).  Runs on the owner thread, outside graph_compute.  With nothing recorded
+// it does nothing; otherwise it runs the context-scoped clear body, which reaches none
+// of the process-global effects sycl_exec_graph_clear_active adds.
+void ggml_backend_sycl_graph_invalidate(ggml_backend_t backend, const char * reason) {
+    if (!backend || !ggml_backend_is_sycl(backend)) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    if (!sycl_exec_graph_has_recorded_state(ctx)) {
+        return;
+    }
+    sycl_exec_graph_clear_scoped(ctx, reason ? reason : "context-replan");
+}
+
+// Waits every queue that can reach a slice of this context, after llama's synchronize()
+// (zhcn-design §3.1 step 3).  llama's synchronize() waits only the device execution
+// queue (or the deferred-decode event) and flushes the thread-local C2t lists; the
+// queues below carry other work too, which is allowed only here, on the rare re-plan
+// path under L0.  Gate 30 censuses every queue and names the line that waits it.
+bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
+    if (!backend || !ggml_backend_is_sycl(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    try {
+        // The device execution queue, waited unconditionally (not last_graph_event).
+        // exact_queue is this queue (ctx.stream()), so the row covers it.
+        ctx->stream(ctx->device, 0)->wait();
+        // The split secondary, merge and coord queues.
+        if (g_split_config.enabled) {
+            if (g_split_secondary_queue_owner) {
+                g_split_secondary_queue_owner->wait();
+            }
+            if (g_split_merge_queue_owner) {
+                g_split_merge_queue_owner->wait();
+            }
+            if (g_split_coord_queue_owner) {
+                g_split_coord_queue_owner->wait();
+            }
+        }
+        // The MoE shared-context queues.
+        const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+        for (int d = 0; d < total; ++d) {
+            if (sycl::queue * q = ggml_sycl::get_shared_context_queue(d)) {
+                q->wait();
+            }
+        }
+        // The unified cache's queues.
+        if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
+            cache->get_queue().wait();
+            cache->get_bcs_queue().wait();
+        }
+        // The CPU-dispatch queue.
+        if (sycl::queue * q = ggml_sycl_get_cpu_queue()) {
+            q->wait();
+        }
+        // The TP queues (unreachable under a plan, waited if non-null) and the TP
+        // device-1 worker's own queue.
+        for (int d = 0; d < total; ++d) {
+            if (sycl::queue * q = ggml_sycl_get_tp_queue(d)) {
+                q->wait();
+            }
+        }
+        if (g_tp_device1_worker_queue) {
+            g_tp_device1_worker_queue->wait();
+        }
+        // The PP pipeline copy queues, when GGML_SYCL_PP_PIPELINE created them.
+        {
+            std::lock_guard<std::mutex> lock(g_pipeline_copy_queue_mutex);
+            for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+                if (g_pipeline_copy_queue[d]) {
+                    g_pipeline_copy_queue[d]->wait();
+                }
+            }
+        }
+        return true;
+    } catch (const std::exception & exc) {
+        GGML_LOG_ERROR("[SYCL-REPLAN] synchronize_for_replan failed on device %d: %s\n", ctx->device, exc.what());
+    } catch (...) {
+        GGML_LOG_ERROR("[SYCL-REPLAN] synchronize_for_replan failed on device %d\n", ctx->device);
+    }
+    return false;
 }
 
 // =============================================================================
@@ -111357,6 +111513,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_measure_plan_override_clear") == 0) {
         return (void *) ggml_backend_sycl_measure_plan_override_clear;
+    }
+    if (strcmp(name, "ggml_backend_sycl_graph_invalidate") == 0) {
+        return (void *) ggml_backend_sycl_graph_invalidate;
+    }
+    if (strcmp(name, "ggml_backend_sycl_synchronize_for_replan") == 0) {
+        return (void *) ggml_backend_sycl_synchronize_for_replan;
     }
     if (strcmp(name, "ggml_backend_sycl_plan_caps_new") == 0) {
         return (void *) ggml_backend_sycl_plan_caps_new;
