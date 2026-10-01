@@ -3715,6 +3715,13 @@ endif()
 # model, no allocation, so it builds and runs in every configuration.
 llama_build_and_test(test-auto-ubatch-ladder.cpp)
 
+# zhcn C7f: executes the pure helpers in src/llama-measure-plan.h -- the graph
+# set one planned reserve measures ((3 + S) * 2 * N graphs: the allocating
+# reserve's own pp, tg and closing pp, then one decode graph per stream count)
+# and the per-chunk slot caps from the measured chunk peaks. Header-only and
+# pure integers: no device, no model, no allocation.
+llama_build_and_test(test-measure-plan.cpp)
+
 # llama.cpp-9goq: source gate over ggml/src/ggml-sycl/CMakeLists.txt itself --
 # (A) every target_link_libraries(...) naming the bare `ggml-sycl` MODULE
 # target must sit under a guard that guarantees GGML_BACKEND_DL is off (the
