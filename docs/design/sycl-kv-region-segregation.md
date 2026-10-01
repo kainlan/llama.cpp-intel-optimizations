@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14aj, by impl-moua-s, 2026-09-30. The revisions answer forty-one reviews:
+Design, revision 7.14ak, by impl-moua-s, 2026-09-30. The revisions answer forty-one reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -245,6 +245,10 @@ Design, revision 7.14aj, by impl-moua-s, 2026-09-30. The revisions answer forty-
 - rulings §M101, recorded in §6.52. Revision 7.14aj is one commit on top of `691200e39`: an L0
   holder whose module guard finds the module non-ACTIVE is `[CONTEXT-PLAN-BUG]` whatever the state
   at its acquire, and the named non-BUG refusal and the state-at-acquire split are deleted.
+- rulings §M106, recorded in §6.52. Revision 7.14ak is one commit on top of `4c427a16f`: the H9
+  reactivation arm is two runs, a primary in-process non-strict run that scores the guard line
+  before the call returns and the post-release slot readings, and one strict child per arm
+  family that proves the abort channel.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -9379,26 +9383,33 @@ means that.
     `complete_unload` has not returned and slots [0] and [7] do not yet show `COMPLETE_CLOSED` and
     1. `prepare_reactivate` and `finalize_reactivate` return at once against the parked holder,
     since they take no L0. The arm writes each reading to stderr as a marker line before it releases
-    the holder. **Expected outcome after the release (rulings §M101):** the holder's module guard
-    finds the module non-ACTIVE, because no holder's change completed while it was parked, and
-    reports exactly one `[CONTEXT-PLAN-BUG]` line naming the entry: a caller lifecycle violation
-    (§2.4.2), whatever the admission state was at the token's acquire. The guard runs under the
-    holder's token, so the blocked call has not returned when the line appears; the line is the
-    evidence that the holder ran after the transition. **Strict, from the guard's source:** the line
-    is strict-gated. The guard's `[CONTEXT-PLAN-BUG]` reads `ggml_sycl_strict_enabled()` (declared
-    `unified-cache.hpp:7259`, defined `unified-cache.cpp:13009-13011` over the once-read
-    `GGML_SYCL_STRICT_LEASES`, `:13001-13007`), which `unified-cache.hpp:7256-7258` names as the one
-    switch that turns a `[CONTEXT-PLAN-BUG]` into an abort; master's module guards return `BUSY`
-    with no log, so this guard is moua's own code, and it reads that switch like every other L0
-    guard return (§2.4.2). The arm therefore runs each of the three cases in a child
-    process under `GGML_SYCL_STRICT_LEASES=1` (the §G1 subprocess pattern) and scores three things:
-    the child's abort exit (SIGABRT, status 134); exactly one `[CONTEXT-PLAN-BUG]` line naming the
-    entry; and the pre-release marker lines above, with no 'returned' marker, since the abort fires
-    under the holder's token and the call never returns. The post-release slot readings are
-    therefore not scored by this arm. **RED, scored on "the call returned while the holder was
-    parked":** the token deleted from any of the three; the call returns with the holder still
-    parked and the counter stays 0. No publish interleave is scored beyond the one guard line: the
-    blocking is the observable.
+    the holder. **Run (1), the primary run: in-process, non-strict (`GGML_SYCL_STRICT_LEASES` unset;
+    rulings §M106), per protected body.** The arm scores, in this order: (a) counter == 1, so the
+    call is blocked in its L0 acquire, with the pre-release readings above; (b) exactly one
+    `[CONTEXT-PLAN-BUG]` line from the holder's module guard, while the call has not returned; (c)
+    the holder returns its failure and releases L0; (d) the call returns; (e) the post-release slot
+    readings. For `commit_reactivate`, slot [0] reads `COMMITTED_CLOSED`. For `rollback_reactivate`,
+    slot [0] reads the previous state (the source order is restore, `gs:109702`, then teardown,
+    `gs:109709-109710`), with slots [6] and [7] as `complete_shutdown()` leaves them. For
+    `complete_unload`, slots [0] and [7] show `COMPLETE_CLOSED` and 1. The guard finds the module
+    non-ACTIVE because no holder's change completed while the holder was parked (§2.4.2, rulings
+    §M101), and it runs under the holder's token, so the line precedes (d): the blocked call cannot
+    have returned when it appears (rulings §M106 corrects §M101's "after the call returned"). **What
+    the non-strict BUG path returns, from source.** The guard tests `ggml_sycl_strict_enabled()`
+    (declared `unified-cache.hpp:7259`, defined `unified-cache.cpp:13009-13011` over the once-read
+    `GGML_SYCL_STRICT_LEASES` switch, `:13001-13007`). With it false the guard does not abort: it
+    logs the one line at WARN, so that it reaches the default-verbosity callback the arm counts it
+    through, and returns the entry's non-`BUSY` failure return with no retry, which releases the
+    token as the entry unwinds. Master's module guards return `BUSY` with no log, so this guard is
+    moua's own code. **Run (2), one strict child per arm family, not per body:**
+    `GGML_SYCL_STRICT_LEASES=1`, in a child process because the switch is read once into a
+    function-local static (`:13002-13007`), so the primary run's process cannot be re-armed. The
+    child runs one body's case, scores exit status 134 (SIGABRT) and exactly one
+    `[CONTEXT-PLAN-BUG]` line, and so proves the abort channel; the other bodies reach the same
+    switch through the same guard, so they need no child of their own. **RED, scored on "the call
+    returned while the holder was parked":** the token deleted from any of the three; the call
+    returns with the holder still parked and the counter stays 0. No publish interleave is scored
+    beyond the one guard line: the blocking is the observable.
   - **Load B while A's context holds its rows (llama.cpp-r7fz; rulings §M7 I-4, §M32 I-1,
     §M38 I-2).** Model A's context holds claimed-then-vacated ring rows on device 0; model B
     loads on device 0. After B's load, A's rows (handles, sizes, depth) and A's model's weight
@@ -14524,14 +14535,17 @@ and rulings §M98 and §M99. The 23mk cites stay at `87da879f1`; the 23mk re-pin
 | N-2 | a ragged line at the `-c 4096 -ub 512` shape sentence | **Changed.** Reflowed. |
 | N-3 | the §6.49 I-1 row's formula read `charged_ONEDNN` as the cap base, unmarked | **Changed.** "(base `stored` from 7.14ah, §6.50 M-4)". |
 
-### 6.52 Revision 7.14aj: rulings §M101
+### 6.52 Revisions 7.14aj and 7.14ak: rulings §M101 and §M106
 
 Revision 7.14aj is one commit on top of `691200e39`, by impl-moua-s. It applies rulings §M101, which
-withdraws §M99 M-1's named non-BUG refusal.
+withdraws §M99 M-1's named non-BUG refusal. Revision 7.14ak is one commit on top of `4c427a16f`. It
+applies rulings §M106, which corrects §M101's evidence order and replaces the arm's all-strict
+scoring with two runs.
 
 | item | finding / ruling | disposition |
 |---|---|---|
 | §M101 (1) | 7.14ai made the module guard under L0 two outcomes, split by the admission state the token's acquire read, so the same situation was a BUG in zhcn and a non-BUG refusal in moua; the "ACTIVE at acquire, non-ACTIVE at guard" half is unreachable | **Changed.** One rule, zhcn's: an L0 holder whose module guard finds the module non-ACTIVE is `[CONTEXT-PLAN-BUG]`, with no retry and no `BUSY`, whatever the state at the acquire. The `[SYCL-PLAN] module not ACTIVE: <entry> refused` line and the state-at-acquire split are deleted from §2.4.2, the `BUSY`-list note, the wrapper note and the "Shutdown takes L0" arm. |
-| §M101 (2) | the H9 reactivation arm's released-holder outcome | **Changed.** The ordering (L0 after `can_unload`/`complete_unload` and `prepare_reactivate`, for rollback after the completed commit) and the "counter == 1 OR the call returned" wait are kept. The expected outcome is exactly one `[CONTEXT-PLAN-BUG]` line. The guard is strict-gated (`ggml_sycl_strict_enabled()`, `unified-cache.hpp:7259`, `unified-cache.cpp:13009-13011`), so each case runs in a child process under `GGML_SYCL_STRICT_LEASES=1` and scores the abort exit, the one line, and the pre-release markers. |
-| §M101 (3) | the line's position relative to the call | **Question.** §M101 says the line is "emitted after the protected call returned". The guard runs under the holder's token, so it is emitted while the blocked entry has not returned, and under strict the call never returns. The arm states that order, and the post-release slot readings are not scored (the abort precedes them). The line still proves the holder ran after the transition. |
+| §M101 (2) | the H9 reactivation arm's released-holder outcome | **Changed in 7.14aj; the scoring is replaced by §M106 (row (4)).** The ordering (L0 after `can_unload`/`complete_unload` and `prepare_reactivate`, for rollback after the completed commit) and the "counter == 1 OR the call returned" wait are kept. The expected outcome is exactly one `[CONTEXT-PLAN-BUG]` line. The guard is strict-gated (`ggml_sycl_strict_enabled()`, `unified-cache.hpp:7259`, `unified-cache.cpp:13009-13011`), so each case runs in a child process under `GGML_SYCL_STRICT_LEASES=1` and scores the abort exit, the one line, and the pre-release markers. |
+| §M101 (3) | the line's position relative to the call | **Question, answered by §M106 (row (4)).** §M101 says the line is "emitted after the protected call returned". The guard runs under the holder's token, so it is emitted while the blocked entry has not returned, and under strict the call never returns. The arm states that order, and the post-release slot readings are not scored (the abort precedes them). The line still proves the holder ran after the transition. |
 | §6.51 M-1 | the row recorded the named non-BUG refusal | **Marked superseded** by this section. |
+| §M106 (4) | §M101's "emitted after the protected call returned" was wrong: the guard runs under the holder's token while the call is blocked on L0, so the line comes before the call returns | **Changed.** The H9 arm is two runs. (1) Primary, in-process, non-strict, per protected body, scored in order: counter == 1; exactly one `[CONTEXT-PLAN-BUG]` line while the call has not returned; the holder returns its failure and releases L0; the call returns; the post-release slot readings (slot [0] `COMMITTED_CLOSED` for `commit_reactivate`, the previous state for `rollback_reactivate`, `COMPLETE_CLOSED` and slot [7] = 1 for `complete_unload`). The non-strict path logs the line at WARN and returns the entry's non-`BUSY` failure (`ggml_sycl_strict_enabled()` false, `unified-cache.cpp:13001-13011`). (2) One strict child per arm family under `GGML_SYCL_STRICT_LEASES=1`, scoring exit 134 and exactly one line; a child because the switch is a once-read static. The post-release readings dropped in 7.14aj are scored again, by run (1). |
