@@ -2490,20 +2490,36 @@ instead of being refused by name. The non-FA 928 MB reserve is deliberately not 
 outside-arena consumer of the non-FA path and has no bearing on the hold's spill.
 
 *A rung's own spill is counted in its fit.* The bound above is a transaction-time estimate; the exact figure exists
-only after the rung's compute buffers do. The narrow recheck that `sched_reserve()` runs after its probe
-`graph_reserve()` (and whose refusal makes an auto-ubatch candidate lose) therefore also asks
-`ggml_sycl_check_hold_spill_realized`: if this plan's own reserve spilled hold-held requests outside the arena
-(`unified_cache_get_recent_planned_hold_spills`), the card must still have the driver headroom the arena expects
-outside itself (`kSyclArenaMinExternalHeadroomBytes`, 256 MB, the graph-entry check's constant;
-`zone_hold_spill_realized_fits`, tested on the host), otherwise the rung does not fit and the ladder lands lower.
+only once the rung's buffers do. The auto-ubatch trial (`llama_context::sycl_select_auto_ubatch`) therefore asks
+`ggml_backend_sycl_planned_hold_spill_fits` from `try_candidate`, right after the candidate's `sched_reserve()` has
+returned, for every rung, every flash-attention mode and the cached rung. It is not asked from the recheck inside
+`sched_reserve()`: that recheck runs after a 1-token flash-attention probe reserve and before the worst-case pp/tg
+reserves that make the large compute buffers, and only for the first rung under `auto_fa`, so it cannot see them. The
+check (`ggml_sycl_check_hold_spill_realized`) reads the hold-induced spills of this plan since its publish
+(`unified_cache_get_recent_planned_hold_spills`) and the live free memory, and applies `zone_hold_spill_realized_fits`
+(host-tested): the hold is blamed only when ITS spill is what pushed the card under the driver headroom the arena expects
+outside itself (`kSyclArenaMinExternalHeadroomBytes`, 256 MB, the graph-entry check's one constant), i.e.
+`free < headroom && free + spill >= headroom`. A card that was already short without the spill (a full B70 with
+KB-scale spills) is not blamed, and a rung with no hold-induced spill is never refused. A refusal makes the candidate
+lose with the stop reason "hold spill left no headroom" and the ladder lands lower.
 Measured on the B50 (Qwen PPL, auto-ub1024): a 461 MB compute buffer was held back (zone free 512 MB, hold 75.6 MB),
 spilled, left 107.8 MB against 256 MB, and flash attention then ran out of resources at the first graph; the
-ladder had accepted the rung because nothing in its fit saw the spill. A run the hold never touches asks nothing.
+ladder had accepted the rung because nothing in its fit saw the spill.
+The transaction-time bound asks the same question of a prediction: `zone_hold_spill_bound` is the plan plus the largest
+spill-capable request observed since the previous publish, scaled to the candidate n_ubatch (the request is recorded
+with the n_ubatch it was made under, from the first publish on, so load-time requests do not count), and the FA-on
+check asks `zone_hold_spill_realized_fits(free - bound, ...)`. The scaling matters on an ascending ladder, where the
+previous rung's request under-estimates the next by the rung ratio. It remains a heuristic in the request term. An
+explicit `-ub` (no trial) is covered by that bound only.
 A publish starts a new epoch (`unified_cache_begin_planned_hold_epoch`), so a losing rung's spills and largest-request
 mark do not decide the next rung. The persisted auto-ubatch cache is not a hole here: a cached rung is re-validated
 by the same per-candidate trial on every start (`try_candidate`), and one that now fails is reported as
 "cached N refused" and the ladder runs from the bottom; only the rungs ABOVE a non-terminal cached value are
 re-attempted ("resuming"), never trusted.
+Two defects found on the way are tickets, not part of this change: the process hang after a graph fails with
+"CPU fallback also failed" (`llama.cpp-8dd9`, inside the cleanup block of the `ggml_sycl_fallback_error` handler in
+`ggml_backend_sycl_graph_compute`), and the f16 buffers never being planned for non-Q8_0 dense weights below the f16
+route's floor (`llama.cpp-ejr2`).
 
 *The idle hold, precisely.* The hold persists while a buffer is short of its plan, including across a graph that counts
 no node for it (the Q8 walk now refreshes the hold on that exit too, so it falls the moment the buffers reach their
