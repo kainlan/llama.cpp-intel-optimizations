@@ -857,20 +857,10 @@ llama_context::llama_context(
         }
     }
 
-    // init the memory module
-    if (!hparams.vocab_only) {
-        llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
-        };
-
-        memory.reset(model.create_memory(params_mem, cparams));
-    }
-
     // init backends
+    // The backend enumeration and the pipeline-parallel decision read the model, cparams and the backends, never
+    // the memory module, so they run first: whatever measures the compute buffers during construction needs the
+    // bufts and the final pipeline_parallel flag.
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
 
@@ -1008,7 +998,23 @@ llama_context::llama_context(
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
+    }
 
+    // init the memory module
+    if (!hparams.vocab_only) {
+        llama_memory_params params_mem = {
+            /*.type_k    =*/ params.type_k,
+            /*.type_v    =*/ params.type_v,
+            /*.swa_full  =*/ params.swa_full,
+            /*.ctx_type  =*/ cparams.ctx_type,
+            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+        };
+
+        memory.reset(model.create_memory(params_mem, cparams));
+    }
+
+    // reserve the compute buffers
+    if (!hparams.vocab_only) {
         // llama.cpp-xojq (nphx Task 4b, c-wgxn): run the SYCL auto
         // micro-batch selection trial IN PLACE OF the unconditional
         // sched_reserve() below, when all four conditions hold: the caller

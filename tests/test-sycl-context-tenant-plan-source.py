@@ -15,12 +15,19 @@ finds no reason to reserve again and places tensors in a NULL vbuffer. Without
 the alias nulling, ggml_gallocr_free frees the shared vbuffer twice. Without
 the reset, the peak query reports a layout no buffer backs.
 
-Both gates prove themselves on mutants of the real source (the gate must fail
+Gate 28 (order half): in the llama_context constructor, the backend_buft.push_back
+loop and the final `cparams.pipeline_parallel = pipeline_parallel;` decision come
+before model.create_memory(. Anything that measures the compute buffers during
+construction needs the bufts and the final flag, and create_memory is the first
+thing that can allocate. The later clauses of gate 28 (the fixpoint call and the
+trial-decision arguments) arrive with the code they name.
+
+All three gates prove themselves on mutants of the real source (the gate must fail
 on each) and refuse to pass vacuously. Limits, deliberately: the walk is
 textual, so a reserve reached through a wrapper is not seen, and the
 invalidation is checked as the statements between the vbuffer allocation
 call and the return.
-argv: [ggml-backend.cpp [ggml-alloc.c]]
+argv: [ggml-backend.cpp [ggml-alloc.c [llama-context.cpp]]]
 """
 import os
 import re
@@ -29,6 +36,7 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_BACKEND = os.path.join(REPO, "ggml", "src", "ggml-backend.cpp")
 DEFAULT_ALLOC = os.path.join(REPO, "ggml", "src", "ggml-alloc.c")
+DEFAULT_CONTEXT = os.path.join(REPO, "src", "llama-context.cpp")
 
 RESERVE_CALL = re.compile(r"\bggml_gallocr_reserve_n\s*\(")
 CHECKED_CALL = re.compile(r"\bif\s*\(\s*!\s*ggml_gallocr_reserve_n\s*\(")
@@ -135,13 +143,74 @@ def mutants_alloc(text):
             break
 
 
+CTOR_SIGNATURE = "llama_context::llama_context("
+BUFT_PUSH = re.compile(r"\bbackend_buft\.push_back\(")
+PP_DECISION = re.compile(r"\bcparams\.pipeline_parallel\s*=\s*pipeline_parallel\s*;")
+CREATE_MEMORY = re.compile(r"\bmodel\.create_memory\(")
+
+
+def ctor_lines(text):
+    """The comment-stripped lines of the llama_context constructor, or None."""
+    lines = strip_comments(text).split("\n")
+    start = next((i for i, l in enumerate(lines) if l.startswith(CTOR_SIGNATURE)), None)
+    if start is None:
+        return None
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("}")), len(lines) - 1)
+    return lines[start:end + 1]
+
+
+def ctor_order_violations(text):
+    """(violations, counts): enumeration and the pipeline-parallel decision precede create_memory."""
+    lines = ctor_lines(text)
+    if lines is None:
+        return [(0, "llama_context constructor not found")], None
+    pushes = [i for i, l in enumerate(lines) if BUFT_PUSH.search(l)]
+    decisions = [i for i, l in enumerate(lines) if PP_DECISION.search(l)]
+    creates = [i for i, l in enumerate(lines) if CREATE_MEMORY.search(l)]
+    counts = (len(pushes), len(decisions), len(creates))
+    out = []
+    if len(pushes) != 1 or len(decisions) != 1 or len(creates) != 1:
+        out.append((0, "expected exactly one backend_buft.push_back, one pipeline_parallel decision and one "
+                       "model.create_memory in the constructor, found %d, %d and %d" % counts))
+        return out, counts
+    if pushes[0] > creates[0]:
+        out.append((creates[0], "model.create_memory runs before the backend_buft.push_back loop"))
+    if decisions[0] > creates[0]:
+        out.append((creates[0], "model.create_memory runs before cparams.pipeline_parallel is decided"))
+    if decisions[0] < pushes[0]:
+        out.append((decisions[0], "pipeline_parallel is decided before the backends are enumerated"))
+    return out, counts
+
+
+def mutants_context(text):
+    """Move model.create_memory( ahead of each of the two things it must follow; drop the decision."""
+    lines = text.split("\n")
+    stripped = strip_comments(text).split("\n")
+    start = next((i for i, l in enumerate(stripped) if l.startswith(CTOR_SIGNATURE)), None)
+    if start is None:
+        return
+    end = next((i for i in range(start + 1, len(stripped)) if stripped[i].startswith("}")), len(stripped) - 1)
+    find = lambda rx: next((i for i in range(start, end + 1) if rx.search(stripped[i])), None)
+    push, decision, create = find(BUFT_PUSH), find(PP_DECISION), find(CREATE_MEMORY)
+    if None in (push, decision, create):
+        return
+    # create_memory's statement is one line, ahead of whatever line `target` names
+    for name, target in (("create_memory ahead of the enumeration", push), ("create_memory ahead of the decision", decision)):
+        mutated = lines[:target] + [lines[create]] + lines[target:create] + lines[create + 1:]
+        yield name, "\n".join(mutated)
+    yield "pipeline_parallel decision dropped", "\n".join(lines[:decision] + lines[decision + 1:])
+
+
 def main():
     backend_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BACKEND
     alloc_path = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_ALLOC
+    context_path = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_CONTEXT
     with open(backend_path, encoding="utf-8") as f:
         backend = f.read()
     with open(alloc_path, encoding="utf-8") as f:
         alloc = f.read()
+    with open(context_path, encoding="utf-8") as f:
+        context = f.read()
     status = 0
 
     bad, calls = reserve_call_violations(backend)
@@ -177,10 +246,24 @@ def main():
         print("FAIL: gate 15: mutant went undetected: %s" % name)
         status = 1
 
+    bad, counts = ctor_order_violations(context)
+    for line_no, why in bad:
+        print("FAIL: gate 28: %s:%d: %s" % (context_path, line_no, why))
+        status = 1
+    muts28 = list(mutants_context(context))
+    if len(muts28) < 3:
+        print("FAIL: gate 28: only %d mutants could be built" % len(muts28))
+        status = 1
+    for name, m in muts28:
+        if not ctor_order_violations(m)[0]:
+            print("FAIL: gate 28: mutant went undetected: %s" % name)
+            status = 1
+
     if status == 0:
         print("PASS: %d scheduler reserve calls are tested and return false (%d mutants caught); "
-              "%d reserve_n_impl failure return(s) invalidate the layout first (%d mutants caught)" %
-              (calls, n13, returns, n15))
+              "%d reserve_n_impl failure return(s) invalidate the layout first (%d mutants caught); "
+              "the constructor enumerates backends and decides pipeline_parallel before create_memory "
+              "(%d mutants caught)" % (calls, n13, returns, n15, len(muts28)))
     return status
 
 
