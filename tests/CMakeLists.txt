@@ -1577,6 +1577,23 @@ if (NOT WIN32)
         TIMEOUT 120
     )
 
+    # Scorer gate for the `[GRAPH-DIAG] phase=final` line that
+    # ggml_backend_sycl_free prints. scripts/sycl-graph-diag-score.sh is the one
+    # authority GW7 and GRP read their counts through; this test runs that script
+    # over a synthetic log formatted from the real literal in ggml-sycl.cpp
+    # (last qualifying line, left-anchored keys, VOID instead of a zero).
+    # Pure Python and host-only: it allocates nothing and loads no model.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-graph-diag-final-scorer
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-graph-diag-final-scorer.py
+    )
+    set_tests_properties(test-sycl-graph-diag-final-scorer PROPERTIES
+        LABELS "sycl;profiling;tdd"
+        TIMEOUT 120
+    )
+
     # Regression + arithmetic gate for parse-sycl-gap-device-split.py, the
     # device-clock A/B decomposition the Cluster B verdict rests on. Registered
     # because that script shipped with a reproducible ZeroDivisionError: its

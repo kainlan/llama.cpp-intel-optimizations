@@ -4587,6 +4587,25 @@ inline void ggml_sycl_refresh_cached_input_ptr(void * dst, const void * src, siz
 // Defined in ggml-sycl.cpp to avoid inlining a 100-line function.
 void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device);
 
+// Bytes a graph prestage copies to `device` for `tensor`, or 0 when it makes no
+// copy: weights, control-vector storage, device USM, INPUT tensors (their own
+// stable staging) and anything in the KV-host buft count 0. `src_buft` is the
+// buffer type the tensor lives in. The prestage and the resolver counter below
+// both read this one predicate.
+size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
+                                            ggml_backend_buffer_type_t src_buft,
+                                            int                        device);
+
+// Called from a resolver branch that is about to hand a HOST_PINNED/SHARED
+// pointer to a device kernel. Counts the return, in the bucket of the current
+// offload phase, when the calling thread is dispatching a device graph and
+// `tensor`, or the root it views, is a source the prestage copies.
+void ggml_sycl_resolver_count_host_return(const ggml_tensor * tensor, int device);
+
+// The count `ggml_sycl_resolver_count_host_return` accumulated in the bucket
+// `phase` falls in: PP, TG, or every other phase.
+uint64_t ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase phase);
+
 inline bool ggml_sycl_checked_size_add(size_t a, size_t b, size_t & out) {
     if (b > SIZE_MAX - a) return false;
     out = a + b;
@@ -4779,6 +4798,9 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
                 auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                 extra->set_data_device(device, ptr, GGML_LAYOUT_AOS, base_on_device);
             }
+            if (!base_on_device) {
+                ggml_sycl_resolver_count_host_return(tensor, device);
+            }
             return ptr;
         }
         return ggml_sycl_get_data_ptr_slow(tensor, device);
@@ -4808,6 +4830,9 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
         const auto * info = ggml_sycl::alloc_registry::instance().lookup(tensor->data);
         if (info && ((info->type == ggml_sycl::alloc_type::DEVICE && info->device_id == device) ||
                      info->type == ggml_sycl::alloc_type::HOST_PINNED || info->type == ggml_sycl::alloc_type::SHARED)) {
+            if (info->type != ggml_sycl::alloc_type::DEVICE) {
+                ggml_sycl_resolver_count_host_return(tensor, device);
+            }
             return tensor->data;
         }
     }

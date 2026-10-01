@@ -804,7 +804,8 @@ static void ggml_sycl_graph_diag_report(const char * phase, bool use_graph, cons
             "sequence_graphlet_direct_replay_calls=%llu sequence_graphlet_segmented_replay_calls=%llu "
             "sequence_submit=%.3fms sequence_drain=%.3fms/%llu waits pending=%d "
             "sequence_refresh=%.3fms sequence_match=%.3fms sequence_direct_gap=%.3fms "
-            "sequence_fail=%llu\n",
+            "sequence_fail=%llu "
+            "stage_host_returns_pp=%llu stage_host_returns_tg=%llu stage_host_returns_other=%llu\n",
             phase ? phase : "?", use_graph ? 1 : 0, (ctx && ctx->exec_graph) ? 1 : 0,
             (ctx && ctx->moe_graph_rerecord) ? 1 : 0, (ctx && ctx->moe_segments_valid) ? 1 : 0,
             (unsigned long long) ggml_sycl_graph_diag_load(g_graph_diag_counters.calls),
@@ -840,8 +841,12 @@ static void ggml_sycl_graph_diag_report(const char * phase, bool use_graph, cons
             sequence_submit_ns / 1000000.0, sequence_drain_ns / 1000000.0, (unsigned long long) sequence_waits,
             g_moe_sequence_graphlet_pending_replays, sequence_refresh_ns / 1000000.0, sequence_match_ns / 1000000.0,
             sequence_direct_gap_ns / 1000000.0,
-            (unsigned long long) ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_failures));
-    if (ggml_sycl::e2e_tg_profile_enabled()) {
+            (unsigned long long) ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_failures),
+            (unsigned long long) ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase::PP),
+            (unsigned long long) ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase::TG),
+            (unsigned long long) ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase::UNKNOWN));
+    // The final summary is not a frame: it records nothing into the TG profile.
+    if (ggml_sycl::e2e_tg_profile_enabled() && !(phase && std::strcmp(phase, "final") == 0)) {
         ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::GRAPH, use_graph ? "use_graph_1" : "use_graph_0", 0.0,
                                          0.0, 0, 1);
     }
@@ -23983,6 +23988,9 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                 auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                 extra->set_data_device(device, result, GGML_LAYOUT_AOS, base_on_device);
             }
+            if (!base_on_device) {
+                ggml_sycl_resolver_count_host_return(tensor, device);
+            }
             return result;
         }
     }
@@ -24100,6 +24108,9 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                     auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                     extra->set_data_device(device, result, GGML_LAYOUT_AOS, base_on_device);
                 }
+                if (!base_on_device) {
+                    ggml_sycl_resolver_count_host_return(tensor, device);
+                }
                 return result;
             }
         }
@@ -24142,6 +24153,9 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                         auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                         extra->set_data_device(device, result, GGML_LAYOUT_AOS, base_device_matches);
                     }
+                    if (!base_device_matches) {
+                        ggml_sycl_resolver_count_host_return(tensor, device);
+                    }
                     return result;
                 }
             }
@@ -24169,6 +24183,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
             // Host-pinned is GPU-accessible via PCIe zero-copy — return directly
             g_data_ptr_cache[{ tensor, device }] = ggml_sycl::mem_handle::from_direct(
                 tensor->data, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+            ggml_sycl_resolver_count_host_return(tensor, device);
             return tensor->data;
         }
 
@@ -83955,6 +83970,12 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     ggml_sycl_q1_nvfp4_test_revoke_backend(backend);
 #endif
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
+#ifdef GGML_SYCL_GRAPH
+    // The whole GRAPH_DIAG summary, once, before any teardown. A persistent
+    // decode frame returns before the per-frame summary, so only this line
+    // carries the decode counts. It is the scored line (scripts/sycl-graph-diag-score.sh).
+    ggml_sycl_graph_diag_report("final", sycl_ctx && sycl_ctx->exec_graph, sycl_ctx);
+#endif
     // Stop adaptive prestage background thread before tearing down SYCL resources.
     g_adaptive_prestage.stop();
     // Flush any deferred CPU scatter before tearing down SYCL resources.
@@ -98817,6 +98838,142 @@ static void ggml_sycl_xmx_moe_pre_allocate_buffers(ggml_backend_sycl_context & c
 
 #endif
 
+// What a graph prestage does with one source tensor. The first three classes
+// are decided without copying; COPY is the only class whose bytes the
+// predicate reports. INPUT and KV_HOST are not counted but still reach the
+// prestage's copy path: INPUT has its own stable staging, and a KV-host source
+// is staged as before.
+enum class ggml_sycl_prestage_class {
+    CONTROL,
+    WEIGHT,
+    DEVICE,
+    INPUT,
+    KV_HOST,
+    COPY,
+};
+
+// The buffer type `tensor`'s bytes live in. A view lives in its source's buffer.
+static ggml_backend_buffer_type_t ggml_sycl_prestage_source_buft(const ggml_tensor * tensor) {
+    if (!tensor) {
+        return nullptr;
+    }
+    const ggml_backend_buffer_t buf =
+        (tensor->view_src && tensor->view_src->buffer) ? tensor->view_src->buffer : tensor->buffer;
+    return buf ? buf->buft : nullptr;
+}
+
+// Requires tensor->data: a tensor with no storage yet has nothing to classify.
+static ggml_sycl_prestage_class ggml_sycl_prestage_classify(const ggml_tensor *        tensor,
+                                                            ggml_backend_buffer_type_t src_buft) {
+    if (ggml_sycl_tensor_uses_cross_device_control_storage(tensor)) {
+        return ggml_sycl_prestage_class::CONTROL;
+    }
+    if (ggml_sycl_tensor_is_weight(tensor)) {
+        return ggml_sycl_prestage_class::WEIGHT;
+    }
+    if (ggml_sycl_get_alloc_type(tensor->data) == sycl::usm::alloc::device) {
+        return ggml_sycl_prestage_class::DEVICE;
+    }
+    if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0) {
+        return ggml_sycl_prestage_class::INPUT;
+    }
+    if (src_buft && src_buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name) {
+        return ggml_sycl_prestage_class::KV_HOST;
+    }
+    return ggml_sycl_prestage_class::COPY;
+}
+
+size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
+                                            ggml_backend_buffer_type_t src_buft,
+                                            int                        device) {
+    GGML_UNUSED(device);
+    if (!tensor || !tensor->data) {
+        return 0;
+    }
+    return ggml_sycl_prestage_classify(tensor, src_buft) == ggml_sycl_prestage_class::COPY ? ggml_nbytes(tensor) : 0;
+}
+
+// Depth of device-graph dispatch on this thread. A resolver return is only a
+// zero-copy read of a staged source while a device kernel is being dispatched.
+static thread_local int g_device_dispatch_depth = 0;
+
+struct ggml_sycl_device_dispatch_region {
+    ggml_sycl_device_dispatch_region() { ++g_device_dispatch_depth; }
+
+    ~ggml_sycl_device_dispatch_region() { --g_device_dispatch_depth; }
+
+    ggml_sycl_device_dispatch_region(const ggml_sycl_device_dispatch_region &)             = delete;
+    ggml_sycl_device_dispatch_region & operator=(const ggml_sycl_device_dispatch_region &) = delete;
+};
+
+// Resolver host returns of staged sources, by offload phase: PP, TG, and every
+// other phase (UNKNOWN, LOAD, WARMUP). The phase is process-global, so another
+// thread's load can move it during a frame.
+enum {
+    GGML_SYCL_RESOLVER_BUCKET_PP,
+    GGML_SYCL_RESOLVER_BUCKET_TG,
+    GGML_SYCL_RESOLVER_BUCKET_OTHER,
+    GGML_SYCL_RESOLVER_BUCKETS
+};
+
+static std::atomic<uint64_t> g_resolver_host_returns[GGML_SYCL_RESOLVER_BUCKETS];
+
+static int ggml_sycl_resolver_bucket(ggml_sycl::offload_phase phase) {
+    switch (phase) {
+        case ggml_sycl::offload_phase::PP:
+            return GGML_SYCL_RESOLVER_BUCKET_PP;
+        case ggml_sycl::offload_phase::TG:
+            return GGML_SYCL_RESOLVER_BUCKET_TG;
+        default:
+            return GGML_SYCL_RESOLVER_BUCKET_OTHER;
+    }
+}
+
+void ggml_sycl_resolver_count_host_return(const ggml_tensor * tensor, int device) {
+    if (g_device_dispatch_depth == 0 || !tensor) {
+        return;
+    }
+    size_t              view_offs = 0;
+    const ggml_tensor * root      = ggml_sycl_view_root_and_offset(tensor, view_offs);
+    const bool          counted =
+        ggml_sycl_prestage_needs_device_copy(tensor, ggml_sycl_prestage_source_buft(tensor), device) != 0 ||
+        (root && root != tensor &&
+         ggml_sycl_prestage_needs_device_copy(root, ggml_sycl_prestage_source_buft(root), device) != 0);
+    if (counted) {
+        g_resolver_host_returns[ggml_sycl_resolver_bucket(ggml_sycl::offload_stats_phase())].fetch_add(
+            1, std::memory_order_relaxed);
+    }
+}
+
+uint64_t ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase phase) {
+    return g_resolver_host_returns[ggml_sycl_resolver_bucket(phase)].load(std::memory_order_relaxed);
+}
+
+// The sources a prestage of `cgraph` copies to `device`, in the prestage's own
+// walk: leafs, then every node's sources.
+static size_t ggml_sycl_graph_stage_source_count(const ggml_cgraph * cgraph, int device) {
+    std::unordered_set<const ggml_tensor *> seen;
+    size_t                                  count = 0;
+    auto                                    visit = [&](const ggml_tensor * tensor) {
+        if (!tensor || !seen.insert(tensor).second) {
+            return;
+        }
+        if (ggml_sycl_prestage_needs_device_copy(tensor, ggml_sycl_prestage_source_buft(tensor), device) != 0) {
+            count++;
+        }
+    };
+    for (int i = 0; i < cgraph->n_leafs; i++) {
+        visit(cgraph->leafs[i]);
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int j = 0; node && j < GGML_MAX_SRC; j++) {
+            visit(node->src[j]);
+        }
+    }
+    return count;
+}
+
 // Pre-stage all non-device tensors in a compute graph before SYCL graph recording.
 // This ensures that all non-device (mmap'd) tensors are uploaded to device memory
 // BEFORE graph recording begins, since we cannot use .wait() during recording.
@@ -98915,7 +99072,10 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
             return;
         }
 
-        if (ggml_sycl_tensor_uses_cross_device_control_storage(tensor)) {
+        const ggml_sycl_prestage_class source_class =
+            ggml_sycl_prestage_classify(tensor, ggml_sycl_prestage_source_buft(tensor));
+
+        if (source_class == ggml_sycl_prestage_class::CONTROL) {
             skipped_control++;
             mark_staged(tensor);
             GGML_SYCL_DEBUG("[GRAPH-PRESTAGE] CONTROL host tensor %s left on shared HOST_DEVICE storage (%p)\n",
@@ -98929,7 +99089,7 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         }
 
         // Handle weight tensors specially in tiered mode
-        if (ggml_sycl_tensor_is_weight(tensor)) {
+        if (source_class == ggml_sycl_prestage_class::WEIGHT) {
             if (cache && ggml_sycl_weight_is_planned_on_host(tensor, device)) {
                 skipped_weight_count++;
                 skipped_host_planned++;
@@ -98966,8 +99126,7 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         }
 
         // Check if this is already device memory
-        sycl::usm::alloc ptr_type = ggml_sycl_get_alloc_type(tensor->data);
-        if (ptr_type == sycl::usm::alloc::device) {
+        if (source_class == ggml_sycl_prestage_class::DEVICE) {
             already_device_count++;
             mark_staged(tensor);
             return;
@@ -100222,6 +100381,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
             return resolved;
         }
 
+        ggml_sycl_resolver_count_host_return(tensor, ctx.device);
         return const_cast<void *>(ggml_sycl_host_data(tensor));
     };
 
@@ -105360,6 +105520,12 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     // Computed BEFORE arena reset so per-PP profiling can include reset cost.
     const bool cached_is_decode = ggml_sycl_graph_is_decode(cgraph);
     ggml_sycl::offload_stats_set_phase(cached_is_decode ? ggml_sycl::offload_phase::TG : ggml_sycl::offload_phase::PP);
+
+    // Every device kernel this call dispatches, on every path below, runs in
+    // this region.
+    ggml_sycl_device_dispatch_region device_dispatch_region;
+    GGML_SYCL_DEBUG("[GRAPH-STAGE] cohort=%zu phase=%s\n", ggml_sycl_graph_stage_source_count(cgraph, sycl_ctx->device),
+                    cached_is_decode ? "tg" : "pp");
     const bool arena_pp_profile_active = ggml_sycl::arena_pp_profile_begin(sycl_ctx->device, !cached_is_decode);
     pp_scratch_profile_begin(!cached_is_decode);
 
