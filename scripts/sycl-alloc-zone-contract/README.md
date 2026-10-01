@@ -25,14 +25,32 @@ Their six hits in `unified-cache.cpp` are allowlisted (`E-CHAIN-HOST-RAW`, `E-CH
 CACHE_BACKING bootstrap sites `E-BACKING-STAGING`, `E-BACKING-FLAG-SLAB`; canonical contract sections 3, 3.1 and 9.1); the
 seventh, `unified_cache::allocate`'s last-resort fallback, is E-RAW debt with fate `deleted-by-D-disposition`.
 
-Clause (q), libc allocation primitives (S3-0): `mmap`, `posix_memalign`, `memalign`, `aligned_alloc`, `malloc`, `calloc`, `realloc` and
-`VirtualAlloc`, called bare or through `std::` / `::` (or taken as a value, or spelled in a `#define` body), are E-LIBC findings. A member
+Clause (q), libc allocation primitives (S3-0): `mmap`, `mmap64`, `mremap`, `posix_memalign`, `memalign`, `aligned_alloc`, `valloc`,
+`pvalloc`, `malloc`, `calloc`, `realloc`, `reallocarray`, `strdup`, `strndup` and `VirtualAlloc`, called bare or through `std::` / `::` (or taken as a value, or spelled in a `#define` body), are E-LIBC findings. A member
 (`pool.realloc`), a name qualified by another scope (`sycl::malloc` stays clause (e)'s) and a declaration are not. Five allowlist entries
 cover seven sites: the vendored `dpct/helper.hpp` hits (`E-LIBC-DPCT-MMGR-MMAP`, `E-LIBC-DPCT-MMGR-VIRTUALALLOC`,
-`E-LIBC-DPCT-HOSTBUF-MALLOC`, `E-LIBC-DPCT-DEVMEM-MALLOC`; reason "vendored dpct, unreachable from the backend"; ruling M265 R2) and
+`E-LIBC-DPCT-HOSTBUF-MALLOC`, `E-LIBC-DPCT-DEVMEM-MALLOC`; reason "vendored dpct, unreachable from the backend"; canonical contract section 9.1) and
 `cache_guard_allocator`'s `mmap` (`E-LIBC-CACHE-GUARD`; permanent, "cache bookkeeping, guard-page debug mode, no tensor/KV/scratch/pinned/USM
 bytes"). The dead `weight_cache_allocator`'s `mmap` and `posix_memalign` are E-LIBC debt with fate `deleted-by-step-7` (S7's zero-caller
-census item (f)). The S2c control that used to pin `std::malloc` as a PASS flipped to a FAIL on purpose when this clause landed.
+step 7's "dead weight_cache_allocator, whole" bullet in the 23mk design). The S2c control that used to pin `std::malloc` as a PASS flipped
+to a FAIL on purpose when this clause landed.
+
+"Unreachable from the backend" is a gated claim, not a hope: clause (e) forbids `dpct_malloc`, the dpct memory classes and the two
+`dpct_memcpy` entry points (`dpct_memcpy`, `async_dpct_memcpy`, whose 3-D host-staged paths are the only users of `host_buffer`) outside
+`dpct/helper.hpp`, so a backend caller of any path that reaches an allowlisted dpct libc site is itself a finding.
+
+In a `#define` body and in the lexical pass of an ERROR-root file there is no tree, so the qualifier is read backwards across spaces,
+newlines and `\`-continuations: `sycl :: malloc` is clause (e)'s only, `pool :: realloc`, `p . malloc` and `p->malloc` are not hits, and
+`std :: malloc` and a bare `:: malloc` are.
+
+Fail-closed false positives, cleared by a rename: a local variable, a parameter or a lambda named `mmap`, `malloc`, `realloc`, `strdup`
+and so on that is *called* or *taken as a value* is an E-LIBC finding, because the clause matches the identifier and does not resolve
+scope; and so is an implicit-`this` member call of a method with such a name (`realloc(p, n)` inside a class that declares `realloc`),
+which the tree cannot tell from the C library's. Rename the local or call it as `this->realloc(...)`; do not allowlist it.
+
+Out of scope, on purpose: `free` (releasing is not allocating), `new`, `operator new` and the STL containers' own allocators. This is a
+boundary the gate states, not one it proves: a `new` of a request type is clause (a)'s B-FORM, but a `new` or a container that holds
+tensor, KV, scratch, pinned or USM bytes is a `mem_handle` ownership question and is reviewed as one.
 
 Known gap: an aliased namespace (`namespace sy = sycl; sy::malloc(n, q, sycl::usm::alloc::host)`) escapes the qualified
 `sycl::malloc` / `sycl::aligned_alloc` check, since the match is on the spelled scope. The named forms (`malloc_host` and the
@@ -65,8 +83,10 @@ for the `CHECK_TRY_ERROR` macro's handler, and its fate is `converted-by-5.4a` a
 carry it, and no other entry outside E-RAW/E-LIBC may carry any fate). `fate` is `deleted-by-<step>`, `converted-by-<step>`,
 `sanctioned-internal`, `sanctioned-vendored` (upstream code we do not edit) or `pending-disposition`. A `sanctioned-internal` entry is one no step will ever shrink:
 it is a candidate for the allowlist, and moving it there is the lead's decision, not the implementer's.
-`pending-disposition` marks an entry whose fate nobody has ruled on yet; its `cite` says what is known. Every E-RAW entry needs a `cite`, a ticket id or a design/census row of at
-least 12 characters.
+`pending-disposition` marks an entry whose fate nobody has ruled on yet; its `cite` says what is known. Every E-RAW and E-LIBC entry, and the CHECK_TRY_ERROR entry, needs a `cite`, a ticket id or a design/census row of at
+least 12 characters. A cite or an allowlist reason names no source line (`file.cpp:1234`, which rots with the next edit) and no ruling-ledger
+id with a round (`ruling M265 R2`, a ledger that is not in the repo); `validate_data` refuses both. A second `G-CATCH` debt key that names the
+CHECK_TRY_ERROR macro (a re-key of the pinned one) is refused too, so the fate pin cannot lapse by renumbering.
 
 ## Clauses (i)-(o) and witness 9 (S2d)
 

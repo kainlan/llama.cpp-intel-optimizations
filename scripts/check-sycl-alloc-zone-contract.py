@@ -10,7 +10,7 @@ hash covers the construction's declaration and the field writes bound to it, and
 counts only identical constructions in the same function, so a key survives an unrelated edit
 above it and moves only when the construction itself changes.
 
-What this unit (S2a, S2b, S2c) enforces
+What this unit (S2a-S2d, S3-0 and its review fold) enforces
   (a) a request-type token inside an ERROR/MISSING region fails; a file whose root is ERROR
       (today cpu-dispatch.cpp) is also scanned lexically, and each lexical request must be
       host-only by a literal on its statement run
@@ -24,7 +24,9 @@ What this unit (S2a, S2b, S2c) enforces
       #define body) outside the allowlist. dpct's allocating entry points, `dpct_malloc` (identifier) and
       the classes `device_memory`, `global_memory`, `constant_memory`, `shared_memory` (type names), are forbidden
       outside dpct/helper.hpp; helper.hpp's own three raw calls are allowlisted by function name and count
-      (canonical contract section 9.1, the dpct row; vendored upstream, not edited, dead in-tree; rulings M247 second)
+      (canonical contract section 9.1, the dpct row; vendored upstream, not edited, dead in-tree; rulings M247 second).
+      `dpct_memcpy` and `async_dpct_memcpy` are forbidden there too: their 3-D host-staged paths build the host_buffer whose
+      std::malloc is allowlisted under clause (q), so a caller outside helper.hpp is what would make that allowlist reachable
       The host side is covered too: malloc_host, aligned_alloc_host, zeMemAllocHost, the generic `sycl::malloc` and
       `sycl::aligned_alloc` (qualified by sycl:: only, because the bare names are the C library's), and the host raw
       chain's wrappers unified_cache_raw_malloc_host and unified_cache_malloc_host_tracked.
@@ -42,10 +44,14 @@ What this unit (S2a, S2b, S2c) enforces
       H-PASS-EXPR, H-UNCONV-EXPR) cannot be exempted. No H-* finding can be debt, and an entry's outcome may not be TERMINAL.
       An allowlisted node that stops writing its field fails as an entry matching nothing (a DECLARED row losing its flag).
       Positional initialisation of a request type and a call through a lambda or function pointer are not followed.
-  (q) libc allocation primitives (S3-0): mmap, posix_memalign, memalign, aligned_alloc, malloc, calloc, realloc and VirtualAlloc, as a
-      call, an address-of or a value, bare or qualified by `std::` or a leading `::`, and in a #define body, outside the allowlist
-      (code E-LIBC, keyed like E-RAW). A member (`pool.realloc`), a name qualified by anything else (`pool_alloc::realloc`;
-      `sycl::malloc` is clause (e)'s) and the declaration of a function with the name are not hits. The unified cache owns every byte the
+  (q) libc allocation primitives (S3-0): mmap, mmap64, mremap, posix_memalign, memalign, aligned_alloc, valloc, pvalloc, malloc, calloc,
+      realloc, reallocarray, strdup, strndup and VirtualAlloc, as a call, an address-of or a value, bare or qualified by `std::` or a
+      leading `::`, and in a #define body, outside the allowlist (code E-LIBC, keyed like E-RAW). A member (`pool.realloc`), a name
+      qualified by anything else (`pool_alloc::realloc`; `sycl::malloc` is clause (e)'s) and the declaration of a function with the
+      name are not hits. In a #define body and in the lexical pass the qualifier is read backwards across spaces, newlines and
+      backslash continuations, so `pool :: realloc` and `p . malloc` are not hits and `std :: malloc` is. `free`, `new`, `operator new` and
+      the STL containers' allocators are out of scope (see the README). A reason or a cite names no source line (file:NNN) and no
+      ruling-ledger id (ruling Mnnn Rn); the CHECK_TRY_ERROR debt entry carries a cite, and a re-key of it fails. The unified cache owns every byte the
       backend allocates, so a libc allocation is a violation unless the allowlist says why it holds no tensor, KV, scratch, pinned or
       USM bytes. A debt entry for it carries a fate and a cite, as E-RAW's does.
 and the brace rule the construction-site labels need: a braceless `T x;` reports the class
@@ -236,20 +242,29 @@ RAW_QUALIFIED = ("malloc", "aligned_alloc")
 # Outside that file the function is matched as an identifier and the classes as type names, never as substrings: a
 # parameter that happens to be spelled `device_memory` (memory-budget.hpp) is an identifier, not the class.
 DPCT_HOME = "dpct/helper.hpp"
-DPCT_FUNCS = ("dpct_malloc",)
+# dpct_memcpy and async_dpct_memcpy are in the list because their 3-D host-staged paths build a host_buffer, whose constructor
+# std::mallocs (the E-LIBC-DPCT-HOSTBUF-MALLOC entries): a caller outside helper.hpp is what would make those allowlisted sites reachable.
+DPCT_FUNCS = ("dpct_malloc", "dpct_memcpy", "async_dpct_memcpy")
 DPCT_CLASSES = ("device_memory", "global_memory", "constant_memory", "shared_memory")
 # Clause (q): the C library's allocation primitives (and Windows' VirtualAlloc). They are matched as a bare name or one qualified
 # by `std::` or a leading `::`, so a member (`pool.realloc`, `pool_alloc::realloc`) and sycl::malloc (clause (e)'s) are not hits,
 # and the declaration of a function with the name is not a use. Code E-LIBC; its debt entries carry a fate and a cite like E-RAW's.
-LIBC_NAMES = ("mmap", "posix_memalign", "memalign", "aligned_alloc", "malloc", "calloc", "realloc", "VirtualAlloc")
+LIBC_NAMES = ("mmap", "mmap64", "mremap", "posix_memalign", "memalign", "aligned_alloc", "valloc", "pvalloc", "malloc", "calloc",
+              "realloc", "reallocarray", "strdup", "strndup", "VirtualAlloc")
 RAW_CODES = ("E-RAW", "E-LIBC")
-LIBC_NAME_RE = r"(?<![A-Za-z0-9_.>:])(?:(?:std)?\s*::\s*)?(%s)" % "|".join(LIBC_NAMES)
-LIBC_BODY_RE = re.compile(LIBC_NAME_RE + r"(?![A-Za-z0-9_])")
-LIBC_CALL_RE = re.compile(LIBC_NAME_RE.encode() + rb"\s*(?:<[^>]*>)?\s*\(")
+# Text (a #define body, the lexical pass of an ERROR-root file) has no tree, so the qualifier is read backwards from the name,
+# across spaces, newlines and `\`-continuations (libc_text_hit). The name itself is a whole word.
+LIBC_WORD_RE = re.compile(r"(?<![A-Za-z0-9_])(%s)(?![A-Za-z0-9_])" % "|".join(LIBC_NAMES))
+LIBC_CALL_TAIL_RE = re.compile(r"\s*(?:<[^>]*>)?\s*\(")
+LIBC_CONT_RE = re.compile(r"\\(?=\r?\n)")
 # G-CATCH is the one other code whose debt entry carries a fate, and only this key: the CHECK_TRY_ERROR macro's handler, which
 # step 5.4a rewrites. It can carry no other fate, and no other handler carries one.
 CHECK_TRY_ERROR_KEY = "common.hpp::#define CHECK_TRY_ERROR::catch_macro:exception#0"
 CHECK_TRY_ERROR_FATE = "converted-by-5.4a"
+# A reason or a cite names something a reader can open in the repo. A source line rots with the next edit, and a ruling-ledger id
+# with a round ("ruling M265 R2") names a ledger that is not in the tree: cite the design step or the contract section instead.
+SRC_LINE_RE = re.compile(r"\.(?:hpp|cpp|h|c):\d+")
+LEDGER_RE = re.compile(r"\b[Rr]ulings? M\d+ R\d+\b")
 
 SHARDS = 8   # the ctest registers this many shards; cmake_witness pins the registration to it
 
@@ -1956,6 +1971,39 @@ def sycl_qualified_raw(src, n):
     return sc is not None and txt(src, sc).split("::")[-1].strip() == "sycl"
 
 
+def libc_text_hits(text, need_call):
+    """(name, offset) of each libc allocation primitive in text with no tree: a #define body, or the blanked text of an
+    ERROR-root file (need_call: the name must be called). A member (`p . malloc`, `p->malloc`) and a name qualified by anything
+    but `std` or a bare `::` (`pool :: realloc`, `sycl :: malloc`, `T<x>::malloc`) are not hits; the qualifier is read across
+    spaces, newlines and line continuations."""
+    text = LIBC_CONT_RE.sub(" ", text)
+    out = []
+    for m in LIBC_WORD_RE.finditer(text):
+        if need_call and not LIBC_CALL_TAIL_RE.match(text, m.end()):
+            continue
+        i = m.start()
+        while i > 0 and text[i - 1].isspace():
+            i -= 1
+        if i >= 1 and text[i - 1] == ".":
+            continue
+        if i >= 2 and text[i - 2:i] == "->":
+            continue
+        if i >= 2 and text[i - 2:i] == "::":
+            j = i - 2
+            while j > 0 and text[j - 1].isspace():
+                j -= 1
+            k = j
+            while k > 0 and (text[k - 1].isalnum() or text[k - 1] == "_"):
+                k -= 1
+            if k < j:
+                if text[k:j] != "std":
+                    continue
+            elif j > 0 and text[j - 1] == ">":
+                continue
+        out.append((m.group(1), m.start()))
+    return out
+
+
 def libc_use(src, n):
     """(top, is_call) for an identifier naming a libc allocation primitive, else None. Not a use: the name of a function
     declaration or definition, or a name qualified by anything but `std` (sycl::malloc is clause (e)'s)."""
@@ -2062,14 +2110,14 @@ def scan_file(rel, src, ctx):
             nm = fld(n, "name")
             if body is not None and nm is not None:
                 catches.extend(macro_catch_records(src, n, txt(src, nm)))
-                b = txt(src, body)
+                b = LIBC_CONT_RE.sub(" ", txt(src, body))
                 for r in RAW_NAMES + tuple("sycl::" + q for q in RAW_QUALIFIED):
                     if re.search(r"(?<![A-Za-z0-9_])" + re.escape(r).replace("sycl::", r"sycl\s*::\s*") + r"(?![A-Za-z0-9_])", b):
                         raws.append({"func": "#define " + txt(src, nm), "name": r, "line": line_of(n),
                                      "form": "macro", "nodekind": "preproc", "text": r, "err": False})
-                for m in LIBC_BODY_RE.finditer(b):
-                    libcs.append({"func": "#define " + txt(src, nm), "name": m.group(1), "line": line_of(n),
-                                  "form": "macro", "nodekind": "preproc", "text": m.group(1), "err": False})
+                for lname, _ in libc_text_hits(b, False):
+                    libcs.append({"func": "#define " + txt(src, nm), "name": lname, "line": line_of(n),
+                                  "form": "macro", "nodekind": "preproc", "text": lname, "err": False})
                 if MACRO_WRITE_RE.search(b):
                     forms.append({"func": "#define " + txt(src, nm), "role": "macro-write", "tok": txt(src, nm),
                                   "line": line_of(n), "text": txt(src, n)})
@@ -2119,9 +2167,10 @@ def scan_file(rel, src, ctx):
             for m in re.finditer(rb"(?<![A-Za-z0-9_])" + re.escape(r.encode()) + rb"\s*(?:<[^>]*>)?\s*\(", clean):
                 raws.append({"func": "<lexical>", "name": r, "line": clean.count(b"\n", 0, m.start()) + 1,
                              "form": "lexical", "nodekind": "lexical", "text": r, "err": True})
-        for m in LIBC_CALL_RE.finditer(clean):
-            libcs.append({"func": "<lexical>", "name": m.group(1).decode(), "line": clean.count(b"\n", 0, m.start()) + 1,
-                          "form": "lexical", "nodekind": "lexical", "text": m.group(1).decode(), "err": True})
+        ctext = clean.decode("utf-8", "replace")
+        for lname, off in libc_text_hits(ctext, True):
+            libcs.append({"func": "<lexical>", "name": lname, "line": ctext.count("\n", 0, off) + 1,
+                          "form": "lexical", "nodekind": "lexical", "text": lname, "err": True})
     return {"constructions": constructions, "raws": raws, "errtoks": errtoks, "forms": forms, "catches": catches,
             "libcs": libcs, "hrecs": hrecs, "root_error": root_error, "lexical": lexical, "lex_count": lex_count, "ast_count": ast_count}
 
@@ -3601,6 +3650,12 @@ def validate_data(allowlist, debt):
             errs.append("FAIL allowlist entry %s needs an integer count >= 1" % e["id"])
         if not isinstance(e["reason"], str) or len(e["reason"].strip()) < CITE_MIN:
             errs.append("FAIL allowlist entry %s needs a reason of at least %d characters" % (e["id"], CITE_MIN))
+        elif SRC_LINE_RE.search(e["reason"]):
+            errs.append("FAIL allowlist entry %s reason names a source line (file:NNN), which rots with the next edit; name the function"
+                        % e["id"])
+        elif LEDGER_RE.search(e["reason"]):
+            errs.append("FAIL allowlist entry %s reason names a ruling-ledger id (ruling Mnnn Rn), a ledger outside the repo; cite the "
+                        "design step or the contract section" % e["id"])
         ids[e["id"]] += 1
     errs += ["FAIL allowlist id %s is used %d times" % (k, v) for k, v in ids.items() if v > 1]
     seen = Counter()
@@ -3619,12 +3674,19 @@ def validate_data(allowlist, debt):
         if d["code"] in RAW_CODES and not FATE_RE.match(str(d.get("fate", ""))):
             errs.append("FAIL debt entry %s %s has no valid fate (deleted-by-*, converted-by-*, sanctioned-internal, "
                         "sanctioned-vendored, pending-disposition)" % (d["code"], d["key"]))
-        if d["code"] in RAW_CODES and (not isinstance(d.get("cite"), str) or len(d["cite"].strip()) < CITE_MIN):
+        pinned = d["code"] == "G-CATCH" and d["key"] == CHECK_TRY_ERROR_KEY
+        if (d["code"] in RAW_CODES or pinned) and (not isinstance(d.get("cite"), str) or len(d["cite"].strip()) < CITE_MIN):
             errs.append("FAIL debt entry %s %s has no cite (a ticket id or a design/census row, at least %d characters)"
                         % (d["code"], d["key"], CITE_MIN))
-        if d["code"] == "G-CATCH" and d["key"] == CHECK_TRY_ERROR_KEY and d.get("fate") != CHECK_TRY_ERROR_FATE:
+        elif isinstance(d.get("cite"), str) and LEDGER_RE.search(d["cite"]):
+            errs.append("FAIL debt entry %s %s cite names a ruling-ledger id (ruling Mnnn Rn), a ledger outside the repo; cite the "
+                        "design step" % (d["code"], d["key"]))
+        if pinned and d.get("fate") != CHECK_TRY_ERROR_FATE:
             errs.append("FAIL debt entry G-CATCH %s must carry fate %s (step 5.4a rewrites this handler) and no other"
                         % (d["key"], CHECK_TRY_ERROR_FATE))
+        if d["code"] == "G-CATCH" and d["key"] != CHECK_TRY_ERROR_KEY and d["key"].startswith(CHECK_TRY_ERROR_KEY.split("::catch_macro")[0] + "::"):
+            errs.append("FAIL debt entry G-CATCH %s names the CHECK_TRY_ERROR macro's handler but is not the pinned key %s; a re-key must "
+                        "move CHECK_TRY_ERROR_KEY with it, or the fate pin lapses without a failure" % (d["key"], CHECK_TRY_ERROR_KEY))
         if "fate" in d and d["code"] not in RAW_CODES and not (d["code"] == "G-CATCH" and d["key"] == CHECK_TRY_ERROR_KEY):
             errs.append("FAIL debt entry %s %s carries a fate; only E-RAW, E-LIBC and the one CHECK_TRY_ERROR G-CATCH entry may"
                         % (d["code"], d["key"]))
