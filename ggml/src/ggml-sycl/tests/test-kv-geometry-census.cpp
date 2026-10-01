@@ -20,9 +20,14 @@
 #include "../kv-geometry-census.hpp"
 #include "kv-region-test-model.hpp"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <set>
+#include <string>
 #include <vector>
 
 #define CHECK(cond, msg)                                                         \
@@ -247,32 +252,153 @@ void case_predicate_scope() {
 // C5: the run cutter is total over any block list.  A hand-built census can end in
 // a releasable block under the floor, which an allocator never produces (the walk
 // takes those into the frontier); the open run must still be reported, and a block
-// that ends exactly at the floor is below it.
+// that ends exactly at the floor is below it.  A block of another tag (a context-side
+// block, a weight) is never releasable, whatever the predicate says.
 void case_run_cutter_is_total() {
     using ext                     = tlsf_allocator::extent;
     const std::vector<ext> census = {
         { 0,      4 * K, false, ggml_sycl::SHARED_ZONE_TAG_WEIGHT   },
         { 4 * K,  4 * K, true,  0                                   },
-        { 8 * K,  4 * K, false, ggml_sycl::SHARED_ZONE_TAG_OPTIONAL },
-        { 12 * K, 4 * K, true,  0                                   },
+        { 8 * K,  4 * K, false, ggml_sycl::SHARED_ZONE_TAG_CONTEXT  },
+        { 12 * K, 4 * K, false, ggml_sycl::SHARED_ZONE_TAG_OPTIONAL },
+        { 16 * K, 4 * K, true,  0                                   },
     };
     const auto yes = [](size_t) {
         return true;
     };
-    const auto runs = ggml_sycl::kv_side_runs_from_census(census, 16 * K, yes);
-    CHECK(runs.size() == 1 && runs[0].size() == 3, "C5: the run open at the floor is reported whole");
-    CHECK(runs[0][2].offset == 12 * K && runs[0][2].free, "C5: the block ending exactly at the floor is in the run");
+    const auto runs = ggml_sycl::kv_side_runs_from_census(census, 20 * K, yes);
+    CHECK(runs.size() == 2 && runs[0].size() == 1 && runs[0][0].offset == 4 * K,
+          "C5: the free block under the context-side block is its own run");
+    CHECK(runs[1].size() == 2 && runs[1][0].offset == 12 * K && runs[1][1].offset == 16 * K && runs[1][1].free,
+          "C5: the run open at the floor is reported whole, with the block ending exactly at the floor");
 
     const auto none = [](size_t) {
         return false;
     };
-    const auto cut = ggml_sycl::kv_side_runs_from_census(census, 16 * K, none);
-    CHECK(cut.size() == 2 && cut[0].size() == 1 && cut[1].size() == 1,
-          "C5: a refused optional tenant splits the run it sits in");
+    const auto cut = ggml_sycl::kv_side_runs_from_census(census, 20 * K, none);
+    CHECK(cut.size() == 2 && cut[0].size() == 1 && cut[1].size() == 1 && cut[1][0].offset == 16 * K,
+          "C5: a refused optional tenant leaves its free neighbour as a run of its own");
 
     CHECK(ggml_sycl::kv_side_runs_from_census(census, 0, yes).empty(), "C5: nothing lies below a floor of 0");
     CHECK(ggml_sycl::kv_side_runs_from_census({}, SIZE_MAX, yes).empty(), "C5: an empty census has no runs");
     std::printf("case_run_cutter_is_total: PASSED\n");
+}
+
+// C6: where the floor comes from.
+void case_floor_sources() {
+    const auto yes_for = [](const zone_model & z) {
+        return [&z](size_t off) {
+            return z.optional_yieldable(off);
+        };
+    };
+    {
+        // The anchor is the floor when the walk is empty: a weight directly under the anchor, with
+        // a free hole ABOVE the anchor where a freed context block was.  The hole is the context
+        // side's, not the weight side's, so no run may contain it.
+        zone_model z(64 * K);
+        (void) z.weight(40 * K);
+        const size_t c1 = z.context(16 * K);
+        const size_t c2 = z.context(8 * K);
+        CHECK(c1 != SIZE_MAX && c2 != SIZE_MAX, "C6: layout");
+        z.free(c1);
+        const tlsf_geometry g = kv_geometry_from_tlsf(z.allocator(), z.anchor(), yes_for(z));
+        CHECK(g.frontier.empty(), "C6: a weight directly under the anchor leaves an empty frontier");
+        CHECK(g.side_runs.empty(), "C6: the freed context hole above the anchor is no weight-side run");
+        CHECK(same_geometry(g, z.snapshot()), "C6: and it agrees with the model");
+    }
+    {
+        // No anchor, an occupied top block: the walk is empty and the whole census is below the floor.
+        zone_model   z(64 * K);
+        const size_t o1 = z.optional_tenant(8 * K);
+        (void) z.weight(8 * K);
+        const size_t o2 = z.optional_tenant(8 * K);
+        CHECK(z.context(32 * K) != SIZE_MAX, "C6: layout");
+        const tlsf_geometry g = kv_geometry_from_tlsf(z.allocator(), tlsf_allocator::no_anchor, yes_for(z));
+        CHECK(g.frontier.empty(), "C6: the context block at the region end stops the walk at once");
+        CHECK(g.side_runs.size() == 2 && g.side_runs[0].size() == 1 && g.side_runs[0][0].offset == o1 &&
+                  g.side_runs[1].size() == 2 && g.side_runs[1][0].offset == o2 && g.side_runs[1][1].free,
+              "C6: with no anchor the whole census is read: o1, then o2 with the hole above it");
+    }
+    std::printf("case_floor_sources: PASSED\n");
+}
+
+// C7: the anchor precondition is asserted.  The abort runs in a child, whose stderr is read.
+bool child_aborts_with(void (*fn)(), const char * what) {
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return false;
+    }
+    const pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], 2);
+        fn();
+        _exit(0);
+    }
+    close(fds[1]);
+    std::string out;
+    char        buf[256];
+    ssize_t     n;
+    while ((n = read(fds[0], buf, sizeof(buf))) > 0) {
+        out.append(buf, (size_t) n);
+    }
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT && out.find("[KV-FIT-MISUSE]") != std::string::npos &&
+           out.find(what) != std::string::npos;
+}
+
+bool child_exits_clean(void (*fn)()) {
+    const pid_t pid = fork();
+    if (pid == 0) {
+        fn();
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+// weight | context c1 | context c2, then c2 freed: the model keeps c2's offset as its anchor.
+void build_stale_anchor_zone(zone_model & z, size_t * stale, size_t * live) {
+    (void) z.weight(40 * K);
+    const size_t c1 = z.context(16 * K);
+    const size_t c2 = z.context(8 * K);
+    z.free(c2);
+    *stale = c2;
+    *live  = c1;
+}
+
+void geometry_with_stale_anchor() {
+    zone_model z(64 * K);
+    size_t     stale, live;
+    build_stale_anchor_zone(z, &stale, &live);
+    (void) kv_geometry_from_tlsf(z.allocator(), stale, [](size_t) { return true; });
+}
+
+void geometry_with_interior_anchor() {
+    zone_model z(64 * K);
+    size_t     stale, live;
+    build_stale_anchor_zone(z, &stale, &live);
+    (void) kv_geometry_from_tlsf(z.allocator(), live + 256, [](size_t) { return true; });
+}
+
+void geometry_with_live_anchor() {
+    zone_model z(64 * K);
+    size_t     stale, live;
+    build_stale_anchor_zone(z, &stale, &live);
+    (void) kv_geometry_from_tlsf(z.allocator(), live, [](size_t) { return true; });
+    (void) kv_geometry_from_tlsf(z.allocator(), tlsf_allocator::no_anchor, [](size_t) { return true; });
+}
+
+void case_anchor_precondition() {
+    CHECK(child_aborts_with(geometry_with_stale_anchor, "not an allocated block"),
+          "C7: an anchor that names a freed block aborts through the misuse channel");
+    CHECK(child_aborts_with(geometry_with_interior_anchor, "not an allocated block"),
+          "C7: an anchor inside a block aborts too");
+    CHECK(child_exits_clean(geometry_with_live_anchor), "C7: control: a live anchor and no_anchor do not abort");
+    std::printf("case_anchor_precondition: PASSED\n");
 }
 
 }  // namespace
@@ -283,5 +409,7 @@ int main() {
     case_agreement_random();
     case_predicate_scope();
     case_run_cutter_is_total();
+    case_floor_sources();
+    case_anchor_precondition();
     return 0;
 }

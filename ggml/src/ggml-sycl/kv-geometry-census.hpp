@@ -77,18 +77,29 @@ inline std::vector<std::vector<zone_block>> kv_side_runs_from_census(const std::
 // The frontier walk below `anchor` (tlsf_allocator::no_anchor for the region
 // end), highest block first, and the census below its floor as runs.  `anchor`
 // is no_anchor or the offset of an allocated block, as in frontier_walk(); a
-// stale offset inside a free block would not clip the block that holds it.
+// stale offset (a freed block's) would let the free block that now holds it
+// straddle the floor, so it aborts through the KV-fit misuse channel instead.
 inline tlsf_geometry kv_geometry_from_tlsf(const tlsf_allocator &  tlsf,
                                            size_t                  anchor,
                                            const kv_yieldable_fn & yieldable) {
-    tlsf_geometry g;
+    tlsf_geometry                             g;
+    const std::vector<tlsf_allocator::extent> census = tlsf.block_census();
+    if (anchor != tlsf_allocator::no_anchor) {
+        bool live = false;
+        for (const tlsf_allocator::extent & e : census) {
+            live = live || (e.offset == anchor && !e.free);
+        }
+        if (!live) {
+            KV_FIT_MISUSE("geometry census: the anchor is not an allocated block of the TLSF");
+        }
+    }
     // no_anchor is SIZE_MAX, so with no walk the whole census is below the floor.
-    size_t        floor = anchor;
+    size_t floor = anchor;
     for (const tlsf_allocator::extent & e : tlsf.frontier_walk(anchor, SHARED_ZONE_TAG_OPTIONAL)) {
         g.frontier.push_back(kv_zone_block_from_extent(e, yieldable));
         floor = e.offset;
     }
-    g.side_runs = kv_side_runs_from_census(tlsf.block_census(), floor, yieldable);
+    g.side_runs = kv_side_runs_from_census(census, floor, yieldable);
     return g;
 }
 
