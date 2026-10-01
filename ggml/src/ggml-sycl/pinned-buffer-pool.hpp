@@ -48,6 +48,16 @@ class PinnedBufferPool {
 
     BufferPair acquire(size_t n_experts);
 
+    // Reserve n_experts consecutive entries and return the index of the first one.
+    // The pool is a ring over its max_experts_ entries: successive reservations
+    // advance, and one that would run past the end restarts at entry 0.  The caller
+    // addresses its entries as acquire().act + first * K and acquire().out + first * N,
+    // so two reservations that are live together get DISJOINT regions -- which is
+    // how a dispatch avoids overwriting a buffer an earlier scatter's H2D may still
+    // be reading, without any host wait (llama.cpp-4hg7).  Requires can_serve(n).
+    // Main thread only (one MUL_MAT_ID at a time), like g_pending_scatter.
+    size_t reserve(size_t n_experts);
+
     // Whether acquire(n_experts) would be served. The pool's capacity is fixed
     // at init() and the buffers really are max_experts_ * dim floats, so an
     // over-capacity request cannot be served at all -- acquire() asserts on it.
@@ -71,6 +81,7 @@ class PinnedBufferPool {
     size_t     act_stride_  = 0;  // floats per expert (K)
     size_t     out_stride_  = 0;  // floats per expert (N)
     size_t     max_experts_ = 0;
+    size_t     next_entry_  = 0;  // ring cursor for reserve()
     int        device_id_   = -1;
     mem_handle act_handle_;
     mem_handle out_handle_;

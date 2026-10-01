@@ -23053,24 +23053,6 @@ static void flush_pending_cpu_scatter() {
 // done (future ready), flush immediately to overlap H2D scatter with the
 // current layer's activation D2H.  If CPU compute is still running, skip —
 // the next consumption point will do a blocking flush.
-// Wait for the H2D copies that the last flush_pending_cpu_scatter() submitted
-// (parked in prev_bufs.scatter_events) and drop the events; the buffers stay
-// parked for flush_prev_scatter_bufs().  Event wait only -- the compute queue is
-// not drained.  Main thread only: prev_bufs is thread_local.
-//
-// Needed before a second dispatch reuses the PinnedBufferPool out buffer:
-// acquire() hands back the same pair every time and dispatch_cpu_compute memsets
-// it on the host, so without this wait the memset can zero a slot whose scatter
-// copy has been enqueued but has not executed yet (llama.cpp-4hg7).
-static void wait_prev_scatter_events() {
-    auto & pb = g_pending_scatter.prev_bufs;
-    if (pb.scatter_events.empty()) {
-        return;
-    }
-    sycl::event::wait(pb.scatter_events);
-    pb.scatter_events.clear();
-}
-
 static bool try_flush_pending_cpu_scatter() {
     if (!g_pending_scatter.active) {
         return false;
@@ -75800,12 +75782,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
 
+            // dispatch_cpu_compute's pool_first_entry: first PinnedBufferPool entry this dispatch owns.  A caller
+            // that issues several dispatches in one MUL_MAT_ID (the hot/cold split)
+            // reserves the whole span once and hands each dispatch its own slice, so
+            // their act/out regions are disjoint.  npos = reserve one here.
+            constexpr size_t pool_entry_npos = static_cast<size_t>(-1);
+
             // CPU expert compute: alloc pinned buffers, D2H activations,
             // build tasks, submit to CPU pool.  Returns a cpu_dispatch_result
             // carrying the compute future and metadata — does NOT touch
             // g_pending_scatter (which is thread_local and must only be
             // written from the main thread).
-            auto dispatch_cpu_compute = [&](const std::vector<expert_dispatch_entry> & entries) -> cpu_dispatch_result {
+            auto dispatch_cpu_compute = [&](const std::vector<expert_dispatch_entry> & entries,
+                                            size_t pool_first_entry = pool_entry_npos) -> cpu_dispatch_result {
                 cpu_dispatch_result result;
                 if (entries.empty()) {
                     return result;
@@ -75827,6 +75816,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 float *               out_pinned = nullptr;
                 float *               act_pinned = nullptr;
                 bool                  from_pool  = false;
+                size_t                pool_base  = 0;  // first pool entry (0 off the pool)
                 ggml_sycl::mem_handle out_owner;
                 ggml_sycl::mem_handle act_owner;
 
@@ -75838,8 +75828,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // managed host-pinned path below instead of asserting in acquire().
                 if (pool.can_serve(n_cpu) && !immutable_host_recipe) {
                     auto bp    = pool.acquire(n_cpu);
-                    act_pinned = bp.act;
-                    out_pinned = bp.out;
+                    pool_base  = pool_first_entry != pool_entry_npos ? pool_first_entry : pool.reserve(n_cpu);
+                    act_pinned = bp.act + pool_base * static_cast<size_t>(K);
+                    out_pinned = bp.out + pool_base * static_cast<size_t>(N);
                     from_pool  = true;
                 } else {
                     if (pool.is_initialized() && !immutable_host_recipe) {
@@ -75880,12 +75871,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return result;
                 }
 
-                // Zero the output buffer
-                if (from_pool) {
-                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));
-                } else if (!out_owner.valid()) {
-                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));
-                }
+                // The output region is zeroed further down, after the activation wait: it
+                // may still be the source of an earlier scatter's H2D, and only a completed
+                // activation D2H on the same in-order queue proves that copy has run.
+                const bool zero_out_after_act_wait = from_pool || !out_owner.valid();
 
                 ggml_sycl_tensor_storage_handle src1_storage{};
                 if (!ggml_sycl_ensure_tensor_storage_handle(src1, ctx.device, &src1_storage, "MUL_MAT_ID CPU dispatch",
@@ -75942,9 +75931,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // Single D2H: all experts share the same activation at offset 0.
                     // Submit async — wait deferred until just before CPU pool submission
                     // to overlap D2H with task struct building below.
-                    act_deferred_evt =
-                        ggml_sycl::mem_copy_async(act_handle, 0, src1_storage.handle, src1_storage.view_offset,
-                                                  static_cast<size_t>(K) * sizeof(float), *stream);
+                    act_deferred_evt = ggml_sycl::mem_copy_async(
+                        act_handle, pool_base * static_cast<size_t>(K) * sizeof(float), src1_storage.handle,
+                        src1_storage.view_offset, static_cast<size_t>(K) * sizeof(float), *stream);
                     act_deferred_pending = true;
                 } else {
                     // Per-expert D2H: collect events and batch-wait instead
@@ -75957,7 +75946,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         const int64_t i12     = entry.iid1;
                         const size_t  src_off = src1_storage.view_offset + static_cast<size_t>(i11) * nb11 +
                                                static_cast<size_t>(i12) * nb12;
-                        const size_t dst_off = ci * static_cast<size_t>(K) * sizeof(float);
+                        const size_t dst_off = (pool_base + ci) * static_cast<size_t>(K) * sizeof(float);
                         copy_events.push_back(ggml_sycl::mem_copy_async(act_handle, dst_off, src1_storage.handle,
                                                                         src_off, static_cast<size_t>(K) * sizeof(float),
                                                                         *stream));
@@ -76073,6 +76062,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (act_deferred_pending) {
                     act_deferred_evt.wait();
                 }
+                if (zero_out_after_act_wait) {
+                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));
+                }
                 // Host CPU traits consume the retained host handle only after
                 // its producer event is complete. The lease then moves into
                 // the future-owned task vector through completion.
@@ -76128,7 +76120,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     char *        dst_d = dst_original + i1 * nb1 + i2 * nb2;
                     result.entries.push_back({ dst_d, static_cast<int>(N), dst_storage.handle,
                                                dst_storage.view_offset + static_cast<size_t>(dst_d - dst_original),
-                                               ci * static_cast<size_t>(N) * sizeof(float) });
+                                               (pool_base + ci) * static_cast<size_t>(N) * sizeof(float) });
                 }
 
                 result.out_pinned   = out_pinned;
@@ -76197,8 +76189,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
             // Synchronous dispatch + scatter setup: used by the sequential
             // (PP) path and the hot/cold deferral path.
-            auto dispatch_cpu_and_scatter = [&](const std::vector<expert_dispatch_entry> & entries) {
-                auto r = dispatch_cpu_compute(entries);
+            auto dispatch_cpu_and_scatter = [&](const std::vector<expert_dispatch_entry> & entries,
+                                                size_t pool_first_entry = pool_entry_npos) {
+                auto r = dispatch_cpu_compute(entries, pool_first_entry);
                 apply_cpu_result_to_scatter(r);
             };
 
@@ -76889,7 +76882,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             auto do_cpu_dispatch = [&]() {
                 const int defer_n = 1;
 
-                if (defer_n == 0 || static_cast<int>(cpu_entries.size()) <= defer_n) {
+                // The hot and cold dispatches must not share pool entries: the hot scatter's
+                // H2D reads its out region asynchronously while the cold dispatch zeroes
+                // and fills its own.  So the split needs one pool span for both; when the
+                // pool cannot hold all of them, dispatch them as one group instead.
+                auto &       hc_pool       = g_pinned_buffer_pools[ctx.device];
+                const size_t n_cpu_entries = cpu_entries.size();
+                if (defer_n == 0 || static_cast<int>(cpu_entries.size()) <= defer_n ||
+                    !hc_pool.can_serve(n_cpu_entries)) {
                     dispatch_cpu_and_scatter(cpu_entries);
                 } else {
                     const int64_t                      cold_threshold = n_ids - defer_n;
@@ -76909,16 +76909,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     GGML_SYCL_DEBUG("[MoE-DEFER] L%d: hot=%zu cold=%zu (defer_n=%d threshold=%lld)\n", layer_id,
                                     hot_entries.size(), cold_entries.size(), defer_n, (long long) cold_threshold);
 
+                    // One reservation covers both groups; each takes its own slice.
+                    const size_t hot_first  = hc_pool.reserve(n_cpu_entries);
+                    const size_t cold_first = hot_first + hot_entries.size();
                     if (!hot_entries.empty()) {
-                        dispatch_cpu_and_scatter(hot_entries);
+                        dispatch_cpu_and_scatter(hot_entries, hot_first);
                         flush_pending_cpu_scatter();
-                        // The flush only enqueued the hot scatter's H2D copies from
-                        // the shared pool out buffer.  The cold dispatch below takes
-                        // that same buffer and memsets it before any wait, which would
-                        // zero the hot slot's region before its copy has executed.
-                        wait_prev_scatter_events();
                     }
-                    dispatch_cpu_and_scatter(cold_entries);
+                    dispatch_cpu_and_scatter(cold_entries, cold_first);
                 }
             };
 
