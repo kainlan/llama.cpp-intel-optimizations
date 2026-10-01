@@ -43,6 +43,18 @@ parser.add_argument("--self-test", action="store_true",
 args = parser.parse_args()
 
 
+def reserve_call_arguments(source):
+    """Argument text of every `->reserve_pp_moe_onednn_scratch(...)` call in `source`."""
+    calls = []
+    for match in re.finditer(r"->\s*reserve_pp_moe_onednn_scratch\s*\(", source):
+        depth, index = 1, match.end()
+        while index < len(source) and depth:
+            depth += (source[index] == "(") - (source[index] == ")")
+            index += 1
+        calls.append(source[match.end():index - 1])
+    return calls
+
+
 def strip_comments(source):
     """Remove C and C++ comments, preserving string literals and line count.
 
@@ -208,8 +220,11 @@ def evaluate(sycl, cache, module, header, doc=""):
                 for region in (batched, staging)),
         # ABSENCE: the bug this task exists for. max(planned, required) turns a
         # budgeted zone into a high-water mark of every shape ever seen.
+        # Scoped to the arguments of the PP MoE reservation itself. A file-wide `std::max(planned` ban
+        # also hit llama.cpp-479i's dense Q8_1 src1 buffer (`std::max(planned_bytes, demand[d].bytes)`),
+        # a different cohort that is planned to its own graph-entry demand and logs any in-op growth.
         "no PP MoE scratch reservation upsizes past the plan":
-            "std::max(planned" not in sycl,
+            reserve_call_arguments(sycl) != [] and not any("std::max(" in call for call in reserve_call_arguments(sycl)),
         # ABSENCE: with a general fallback present, refusing costs nothing and
         # the cap is decorative -- the batch simply allocates its own scratch.
         "the batched executor keeps no general temporary fallback":
