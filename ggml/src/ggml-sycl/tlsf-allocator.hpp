@@ -143,6 +143,35 @@ class tlsf_allocator {
     size_t available() const;           // Bytes available for allocation
     size_t largest_free_block() const;  // Size of largest contiguous free block
 
+    // ------------------------------------------------------------------
+    // Whole-TLSF block census (llama.cpp-moua L4 1b).
+    //
+    // Every block of the region, physically LOW to HIGH, free and allocated:
+    // the list tiles [0, size) with no gap or overlap and no two free blocks
+    // adjacent.  A free block has tag 0.  frontier_walk() is its high end read
+    // top-down and stopped at the first block that is neither free nor
+    // `pass_tag`; this is the whole of it, for the buried-optional and
+    // weight-hole census of kv_region_fit's geometry (§2.4.1).
+    //
+    // Read-only, O(blocks), and group-mutex-only like frontier_walk(): it
+    // walks blocks_, which a concurrent split_block() may reallocate.  Kept as
+    // one contiguous block with its definition inline so the pending-range
+    // primitives (llama.cpp-23mk S4a) merge beside it without touching it.
+    // ------------------------------------------------------------------
+    std::vector<extent> block_census() const {
+        std::vector<extent> census;
+        for (int id = last_block_; id >= 0; id = blocks_[id].prev_block) {
+            const block_meta & b = blocks_[id];
+            census.push_back({ b.offset, b.size, b.free, b.free ? (uint8_t) 0 : b.tag });
+        }
+        for (size_t lo = 0, hi = census.size(); lo + 1 < hi; ++lo, --hi) {
+            const extent t = census[lo];
+            census[lo]     = census[hi - 1];
+            census[hi - 1] = t;
+        }
+        return census;
+    }
+
     // No header overhead in the managed region (metadata is external).
     static constexpr size_t header_overhead() { return 0; }
 

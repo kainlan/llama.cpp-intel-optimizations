@@ -1844,6 +1844,23 @@ set_tests_properties(sycl-kv-region-registry PROPERTIES
     TIMEOUT 60
 )
 
+# Production geometry census (llama.cpp-moua L4 1b): kv-geometry-census.hpp reads
+# one shared-zone TLSF (frontier_walk + block_census) into the geometry
+# kv_region_fit consumes. Header-only and SYCL-free like the targets above; the
+# test also drives tests/kv-region-test-model.hpp and pins the two readings equal.
+add_executable(test-kv-geometry-census
+    tests/test-kv-geometry-census.cpp
+    kv-runtime-demotion.cpp
+)
+target_include_directories(test-kv-geometry-census PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME sycl-kv-geometry-census COMMAND test-kv-geometry-census)
+set_tests_properties(sycl-kv-geometry-census PROPERTIES
+    LABELS "sycl;kv;hostonly"
+    TIMEOUT 60
+)
+
 # oneDNN PP placement answers (llama.cpp-1d0n): which devices may run oneDNN PP
 # on a multi-device plan, and whether the plan may add WOQ second copies; and
 # the admission predicate plus per-route batch floor (llama.cpp-je3b).
