@@ -1,12 +1,13 @@
 {
   "schema": 1,
-  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clause e; later clauses add entries). Permanent exemptions only, each with a reason. An entry that matches nothing, or whose count differs from what it covers, fails. Hand-edited; see README.md.",
+  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clause e; later clauses add entries). Permanent exemptions only, each with a reason. An entry names its subject (file and function, or a node key), the raw `name` where the code is E-RAW, and an exact `count`; it fails if it matches nothing or covers a different number, and `name` pins the allocator so a swapped-in different call does not ride the exemption. Hand-edited; see README.md.",
   "entries": [
     {
       "id": "E-TEST",
       "code": "E-RAW",
       "file": "unified-cache.cpp",
       "function": "unified_cache::ensure_cached_alloc",
+      "name": "unified_cache_malloc_device_tracked",
       "count": 2,
       "reason": "design 6.14 E-TEST: the PRIVATE_TESTING allocation entry, a test seam; its two raw calls are exempt, a third is not"
     },
@@ -15,6 +16,7 @@
       "code": "E-RAW",
       "file": "unified-cache.cpp",
       "function": "unified_cache::arena_reserve",
+      "name": "sycl_aligned_malloc_device",
       "count": 2,
       "reason": "design 6.14 E-ARENA-BACKING: arena_reserve is the arena; its two backing allocations are what every zone is carved from"
     }
