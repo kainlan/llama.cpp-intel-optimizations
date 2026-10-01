@@ -352,15 +352,25 @@ struct kv_slot_retention {
 
 class kv_tenant_slots {
   public:
-    void add(const std::string & cohort, uint32_t index, kv_region_handle handle, size_t cap) {
-        slot replaced;  // dropped after the lock: a replaced slot's handle may be a final drop
+    // Install a slot at (cohort, index).  Over a live key it replaces the slot,
+    // clears its claim state, and returns the replaced row's slot-state retention for
+    // the caller to hand to retain_handles_until_event with its event: dropping it
+    // here would free a row under the work that may still read it.  The replaced
+    // slot's own handle is dropped after the lock.
+    [[nodiscard]] kv_slot_retention add(const std::string & cohort,
+                                        uint32_t            index,
+                                        kv_region_handle    handle,
+                                        size_t              cap) {
+        slot replaced;
         {
             std::lock_guard<kv_witnessed_mutex> g(mu_);
             slot &                              s = slots_[{ cohort, index }];
             replaced                              = std::move(s);
+            s                                     = slot();
             s.handle                              = std::move(handle);
             s.cap                                 = cap;
         }
+        return std::move(replaced.retention);  // replaced.handle drops here, after the unlock
     }
 
     kv_claim_result claim(const std::string & cohort, uint32_t index, size_t size) {

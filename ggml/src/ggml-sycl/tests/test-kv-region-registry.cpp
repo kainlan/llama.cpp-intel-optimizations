@@ -113,17 +113,29 @@ struct abort_capture {
 struct drop_log {
     std::atomic<int> drops{ 0 };
     std::atomic<int> drops_with_lock{ 0 };
+    std::atomic<int> drops_with_l0{ 0 };  // drops that ran with the re-plan token held
 };
 
 kv_region_handle make_handle(drop_log & log) {
     return kv_region_handle(new int(0), [&log](void * p) {
         log.drops.fetch_add(1);
+        if (kv_lock_witness::holds(KV_LOCK_L0_REPLAN)) {
+            log.drops_with_l0.fetch_add(1);
+        }
         // The release proc holds L0 to its end; no other lock may be held at a drop.
         if (kv_lock_witness::held_count_besides(KV_LOCK_L0_REPLAN) != 0) {
             log.drops_with_lock.fetch_add(1);
         }
         delete static_cast<int *>(p);
     });
+}
+
+// A slot added at a key that holds none: nothing is replaced, so nothing is returned.
+void add_fresh(kv_tenant_slots & t, const std::string & cohort, uint32_t index, kv_region_handle h, size_t cap) {
+    const kv_slot_retention previous = t.add(cohort, index, std::move(h), cap);
+    if (previous.owner) {
+        std::abort();
+    }
 }
 
 kv_region_entry make_entry(drop_log & log, std::initializer_list<uint32_t> layers, uint64_t shape_key = 1) {
@@ -704,9 +716,9 @@ int case_release_proc() {
     // Context 1's tenant table holds two ring rows, each with a slot-state
     // retention of its last generation (owner + done event), and one slot with none.
     auto tenants = std::make_shared<kv_tenant_slots>();
-    tenants->add("ring", 0, make_handle(log), 1024);
-    tenants->add("ring", 1, make_handle(log), 1024);
-    tenants->add("rows", 2, make_handle(log), 512);
+    add_fresh(*tenants, "ring", 0, make_handle(log), 1024);
+    add_fresh(*tenants, "ring", 1, make_handle(log), 1024);
+    add_fresh(*tenants, "rows", 2, make_handle(log), 512);
     kv_slot_retention first = tenants->exchange_retention("ring", 0, { make_handle(log), 100 });
     CHECK(!first.owner, "the first generation of a row has no previous retention");
     first = tenants->exchange_retention("ring", 1, { make_handle(log), 101 });
@@ -752,6 +764,7 @@ int case_release_proc() {
     // 2 extents + 3 slot handles + 2 retention owners; context 2's extent stays.
     CHECK_EQ(log.drops.load(), 7, "everything of context 1 was freed, nothing of context 2");
     CHECK_EQ(log.drops_with_lock.load(), 0, "no drop under a lock");
+    CHECK_EQ(log.drops_with_l0.load(), 7, "and every one of them ran with L0 still held");
 
     // Idempotent: a second call finds nothing, aborts nothing.
     const size_t aborts_before = abort_count();
@@ -823,7 +836,7 @@ int case_release_proc() {
     // under work that may still read it; no retention and no callback is quiet.
     {
         auto t = std::make_shared<kv_tenant_slots>();
-        t->add("ring", 0, make_handle(log), 64);
+        add_fresh(*t, "ring", 0, make_handle(log), 64);
         t->exchange_retention("ring", 0, { make_handle(log), 7 });
         kv_region_entry e = make_entry(log, { 0 });
         e.tenants         = t;
@@ -844,8 +857,8 @@ int case_release_proc() {
     // A callback that throws aborts by name and does not stop the other retentions.
     {
         auto t = std::make_shared<kv_tenant_slots>();
-        t->add("ring", 0, make_handle(log), 64);
-        t->add("ring", 1, make_handle(log), 64);
+        add_fresh(*t, "ring", 0, make_handle(log), 64);
+        add_fresh(*t, "ring", 1, make_handle(log), 64);
         t->exchange_retention("ring", 0, { make_handle(log), 21 });
         t->exchange_retention("ring", 1, { make_handle(log), 22 });
         kv_region_entry e = make_entry(log, { 0 });
@@ -964,9 +977,9 @@ int case_tenant_slots_and_retentions() {
     abort_capture   cap;
     drop_log        log;
     kv_tenant_slots slots;
-    slots.add("rows", 0, make_handle(log), 1000);
-    slots.add("rows", 1, make_handle(log), 500);
-    slots.add("per-op", 0, make_handle(log), 64);  // a DEVICE-scope slot: its own key
+    add_fresh(slots, "rows", 0, make_handle(log), 1000);
+    add_fresh(slots, "rows", 1, make_handle(log), 500);
+    add_fresh(slots, "per-op", 0, make_handle(log), 64);  // a DEVICE-scope slot: its own key
 
     CHECK(slots.claim("rows", 0, 1000) == kv_claim_result::OK, "claim at the cap is OK");
     CHECK(slots.claim("rows", 0, 10) == kv_claim_result::ALREADY_CLAIMED, "a second claim of the slot is refused");
@@ -989,17 +1002,37 @@ int case_tenant_slots_and_retentions() {
 
     // add() over a live key drops the old handle after the lock.
     kv_tenant_slots again;
-    again.add("rows", 0, make_handle(log), 10);
+    add_fresh(again, "rows", 0, make_handle(log), 10);
     const int before = log.drops.load();
-    again.add("rows", 0, make_handle(log), 20);
+    CHECK(!again.add("rows", 0, make_handle(log), 20).owner, "a replaced slot with no retention returns none");
     CHECK_EQ(log.drops.load(), before + 1, "a replaced slot's handle is dropped");
     CHECK_EQ(log.drops_with_lock.load(), 0, "outside the slot-state lock");
     CHECK_EQ(again.cap("rows", 0), 20, "and the cap is the new one");
 
+    // Over a CLAIMED row that holds a live retention (a re-plan installing a new slot):
+    // the retention comes back with its event for the caller to fence, the claim state
+    // does not carry over, and nothing is freed unfenced.
+    kv_tenant_slots over;
+    add_fresh(over, "ring", 0, make_handle(log), 64);
+    CHECK(over.claim("ring", 0, 10) == kv_claim_result::OK, "claim the row");
+    CHECK(!over.exchange_retention("ring", 0, { make_handle(log), 5 }).owner, "record its retention");
+    const int         drops_over = log.drops.load();
+    kv_slot_retention back       = over.add("ring", 0, make_handle(log), 128);
+    CHECK(back.owner && back.done_event == 5, "the replaced row's retention comes back with its event");
+    CHECK_EQ(log.drops.load(), drops_over + 1, "only the replaced slot's own handle dropped; the retention did not");
+    CHECK(!over.claimed("ring", 0), "the new slot does not inherit the old claim");
+    CHECK(over.claim("ring", 0, 100) == kv_claim_result::OK, "and can be claimed");
+    std::vector<kv_slot_retention> left;
+    over.take_retentions(left);
+    CHECK(left.empty(), "the old retention is not left in the table for the release proc to fence twice");
+    back = kv_slot_retention();
+    CHECK_EQ(log.drops.load(), drops_over + 2, "dropped by the caller after fencing");
+    CHECK_EQ(log.drops_with_lock.load(), 0, "never under a lock");
+
     // Slot-state retentions: a re-claim hands the previous generation's back, with its
     // event, and a slot with no record keeps nothing.
     kv_tenant_slots ring;
-    ring.add("ring", 0, make_handle(log), 64);
+    add_fresh(ring, "ring", 0, make_handle(log), 64);
     kv_slot_retention prev = ring.exchange_retention("ring", 0, { make_handle(log), 1 });
     CHECK(!prev.owner, "a row's first record has no previous retention");
     const int drops_r = log.drops.load();
