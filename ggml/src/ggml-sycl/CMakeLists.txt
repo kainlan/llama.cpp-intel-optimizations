@@ -403,6 +403,14 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-control-plan-contract.py
             --self-test)
     set_tests_properties(sycl-moe-control-plan-contract PROPERTIES LABELS "sycl;moe;host;source-contract")
+    # llama.cpp-479i: the planned dense MMQ/MMVQ Q8_1 src1 buffer. test-zone-sizing Case 12 proves the
+    # arithmetic; this proves the production dispatch, planner and graph entry use it and that the per-op
+    # scratch that ran a B50 out of driver headroom is gone. --self-test: five of its checks are
+    # absence-based and cannot fail on a tree that never had the thing they forbid.
+    add_test(NAME sycl-mmq-src1-plan-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mmq-src1-plan-source.py
+            --self-test)
+    set_tests_properties(sycl-mmq-src1-plan-source PROPERTIES LABELS "sycl;memory;planner;host;source-contract")
     # --self-test likewise: eight of this gate's checks are absence-based, and
     # the construct they forbid -- max(planned, required), the general temporary
     # fallback, admission after the lock, a debug-gated refusal warning -- is
