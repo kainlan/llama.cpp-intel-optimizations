@@ -600,10 +600,10 @@ enum kv_slot_group : uint8_t { KV_SLOT_FULL = 0, KV_SLOT_SWA = 1 };
 // kv_layer_alloc_bytes(sidecar_bytes): the sidecar is a slice of the same slot
 // at sidecar_offset = kv_layer_alloc_bytes(kv_bytes).
 struct kv_layer_slot_request {
-    uint32_t layer         = 0;
-    uint8_t  group         = KV_SLOT_FULL;
-    size_t   kv_bytes      = 0;  // kv_layer_tensor_bytes over the published shape (§2.4.4)
-    size_t   sidecar_bytes = 0;  // 0: no companion slot
+    uint32_t      layer         = 0;
+    kv_slot_group group         = KV_SLOT_FULL;
+    size_t        kv_bytes      = 0;  // kv_layer_tensor_bytes over the published shape (§2.4.4)
+    size_t        sidecar_bytes = 0;  // 0: no companion slot
 };
 
 // A head slot (§2.4.1): an indexed slot of a demand record, mandatory, placed
@@ -678,20 +678,20 @@ enum kv_extent_kind : uint8_t {
 };
 
 struct kv_region_extent {
-    size_t  tlsf   = 0;
-    size_t  offset = 0;
-    size_t  size   = 0;
-    uint8_t kind   = KV_EXTENT_FRONTIER;
+    size_t         tlsf   = 0;
+    size_t         offset = 0;
+    size_t         size   = 0;
+    kv_extent_kind kind   = KV_EXTENT_FRONTIER;
 };
 
 struct kv_layer_placement {
-    uint32_t layer          = 0;
-    bool     device         = false;
-    uint8_t  cause          = KV_DEMOTE_NONE;  // set for a host layer
-    size_t   extent         = SIZE_MAX;        // index into kv_region_fit_result::extents
-    size_t   slot_offset    = 0;               // from the extent's base
-    size_t   size           = 0;
-    size_t   sidecar_offset = SIZE_MAX;        // from the extent's base; SIZE_MAX: no sidecar
+    uint32_t          layer          = 0;
+    bool              device         = false;
+    kv_demotion_cause cause          = KV_DEMOTE_NONE;  // set for a host layer
+    size_t            extent         = SIZE_MAX;        // index into kv_region_fit_result::extents
+    size_t            slot_offset    = 0;               // from the extent's base
+    size_t            size           = 0;
+    size_t            sidecar_offset = SIZE_MAX;        // from the extent's base; SIZE_MAX: no sidecar
 };
 
 struct kv_head_placement {
@@ -727,13 +727,13 @@ enum kv_carve_kind : uint8_t { KV_CARVE_HEAD = 0, KV_CARVE_EXTENT = 1, KV_CARVE_
 // false when nothing goes through the allocator: a retained run is claimed, and
 // an after-KV charge is only recorded as a range.
 struct kv_carve_op {
-    uint8_t kind   = KV_CARVE_HEAD;
-    size_t  index  = 0;  // head index, extent index or after-KV term
-    size_t  tlsf   = 0;
-    size_t  offset = 0;  // the block's base: what the carve returns
-    size_t  size   = 0;  // the block's size, which a whole-gap take makes larger than `demand`
-    size_t  demand = 0;  // the size asked of the allocator
-    bool    carve  = true;
+    kv_carve_kind kind   = KV_CARVE_HEAD;
+    size_t        index  = 0;  // head index, extent index or after-KV term
+    size_t        tlsf   = 0;
+    size_t        offset = 0;  // the block's base: what the carve returns
+    size_t        size   = 0;  // the block's size, which a whole-gap take makes larger than `demand`
+    size_t        demand = 0;  // the size asked of the allocator
+    bool          carve  = true;
 };
 
 struct kv_region_fit_result {

@@ -390,21 +390,30 @@ demand_reconciliation context_demand_reconcile(const std::vector<context_side_de
 // ---------------------------------------------------------------------------
 namespace {
 
-// tlsf_allocator::MIN_BLOCK_SIZE, which is private to the allocator: the gap
-// smaller than size + this that a carve takes whole.  The fit == carve cases of
-// test-kv-runtime-demotion run the real allocator and fail if the two differ.
-constexpr size_t FIT_MIN_BLOCK = 256;
+// The allocator's block grain: every block offset is a multiple of it, and a top
+// carve needs the free block's top on it (carve_gap).  tlsf_allocator keeps the
+// constant private, so it is read off the allocator itself rather than restated.
+size_t fit_grain() {
+    static const size_t grain = [] {
+        tlsf_allocator probe(1 << 20);
+        const size_t   a = probe.allocate(1);
+        const size_t   b = probe.allocate(1);
+        return a < b ? b - a : a - b;
+    }();
+    return grain;
+}
 
 enum : uint8_t { PK_FREE, PK_OPT, PK_BARRIER };
 
 enum : uint8_t { AS_HEAD, AS_KV, AS_AFTER };
 
 struct fit_piece {
-    size_t           lo   = 0;
-    size_t           hi   = 0;
-    uint8_t          kind = PK_FREE;
-    size_t           used = 0;  // FREE: bytes reserved at the top by assignments
-    std::vector<int> assigns;   // FREE: assignment ids in carve order
+    size_t  lo   = 0;
+    size_t  hi   = 0;
+    uint8_t kind = PK_FREE;
+    bool    soft = false;  // BARRIER only: free in the allocator (a pending or non-owned range), not an allocated block
+    size_t  used = 0;      // FREE: bytes reserved at the top by assignments
+    std::vector<int> assigns;  // FREE: assignment ids in carve order
 
     size_t size() const { return hi - lo; }
 
@@ -461,7 +470,8 @@ bool cohort_equal(const char * a, const char * b) {
 
 // Split `p` around [a, b): the overlap becomes a BARRIER, the rest keeps its
 // kind.  An OPT piece the range touches is a BARRIER whole: a tenant that is
-// partly under a pending range cannot be released.
+// partly under a pending range cannot be released (it is still an allocated
+// block, so a piece under it stays carvable).
 void cut_piece(std::vector<fit_piece> & out, const fit_piece & p, size_t a, size_t b) {
     if (b <= p.lo || a >= p.hi || p.kind == PK_BARRIER) {
         out.push_back(p);
@@ -484,6 +494,7 @@ void cut_piece(std::vector<fit_piece> & out, const fit_piece & p, size_t a, size
     bar.lo        = cut_lo;
     bar.hi        = cut_hi;
     bar.kind      = PK_BARRIER;
+    bar.soft      = true;  // a range is not an allocated block: nothing carves under it
     out.push_back(bar);
     if (cut_hi < p.hi) {
         fit_piece q = p;
@@ -534,6 +545,36 @@ std::vector<zone_range> complement_ranges(std::vector<zone_range> own) {
     }
     out.push_back({ at, SIZE_MAX - at });
     return out;
+}
+
+// `r` minus every range in `blocked`: the fragments no blocked range covers.
+std::vector<zone_range> clip_range(const zone_range & r, const std::vector<zone_range> & blocked) {
+    std::vector<zone_range> frags;
+    if (r.size != 0) {
+        frags.push_back(r);
+    }
+    for (const zone_range & b : blocked) {
+        if (b.size == 0) {
+            continue;
+        }
+        std::vector<zone_range> next;
+        for (const zone_range & f : frags) {
+            const size_t f_hi = f.offset + f.size;
+            const size_t b_hi = b.offset + b.size;
+            if (b.offset >= f_hi || b_hi <= f.offset) {
+                next.push_back(f);
+                continue;
+            }
+            if (b.offset > f.offset) {
+                next.push_back({ f.offset, b.offset - f.offset });
+            }
+            if (b_hi < f_hi) {
+                next.push_back({ b_hi, f_hi - b_hi });
+            }
+        }
+        frags.swap(next);
+    }
+    return frags;
 }
 
 void coalesce_free(fit_run & run) {
@@ -615,16 +656,39 @@ fit_state build_state(const shared_zone_geometry & g, const kv_region_request & 
         for (fit_run & run : out.runs) {
             coalesce_free(run);
         }
+        // A retained run is claimed whole, with no carve, so it obeys the same ranges
+        // as everything else: what another transaction's pending range covers, and
+        // what a commit re-fit does not own, is allocated to this call.
         for (const zone_range & rr : in.retained_runs) {
-            if (rr.size != 0) {
+            for (const zone_range & frag : clip_range(rr, blocked)) {
                 fit_retained ret;
-                ret.lo = rr.offset;
-                ret.hi = rr.offset + rr.size;
+                ret.lo = frag.offset;
+                ret.hi = frag.offset + frag.size;
                 out.retained.push_back(ret);
             }
         }
     }
     return S;
+}
+
+// Add FREE piece `p` to `t`, at the top of the run it continues, under the run it
+// is the top neighbour of, or as a run of its own, and coalesce.
+void add_free_piece(fit_tlsf & t, const fit_piece & p) {
+    for (fit_run & run : t.runs) {
+        if (!run.pieces.empty() && run.pieces.back().hi == p.lo) {
+            run.pieces.push_back(p);
+            coalesce_free(run);
+            return;
+        }
+        if (!run.pieces.empty() && run.pieces.front().lo == p.hi) {
+            run.pieces.insert(run.pieces.begin(), p);
+            coalesce_free(run);
+            return;
+        }
+    }
+    fit_run run;
+    run.pieces.push_back(p);
+    t.runs.push_back(std::move(run));
 }
 
 bool eligible(const fit_tlsf & t, int route) {
@@ -640,6 +704,24 @@ bool gap_index(const fit_run & run, size_t & idx) {
     return true;
 }
 
+// Whether the commit can carve at the top of FREE piece `idx`.  allocate_below
+// takes the top of the free block directly under an ALLOCATED block, or the region
+// end: the piece above must be an optional tenant or a hard barrier, or the piece
+// must top the run.  A pending or non-owned range above is not an allocated block
+// (the allocator does not know it), so a carve under it would land where the
+// allocator puts it, not where the fit says; a top off the allocator's grain
+// cannot be top-carved at all.
+bool piece_carvable(const fit_run & run, size_t idx) {
+    if (run.pieces[idx].hi % fit_grain() != 0) {
+        return false;
+    }
+    if (idx + 1 >= run.pieces.size()) {
+        return true;
+    }
+    const fit_piece & above = run.pieces[idx + 1];
+    return !(above.kind == PK_BARRIER && above.soft);
+}
+
 struct fit_room {
     size_t tlsf     = SIZE_MAX;
     bool   retained = false;
@@ -647,33 +729,29 @@ struct fit_room {
     size_t idx      = 0;  // the piece index
 };
 
-// The cheapest tier 1-3 room for `size`: the first TLSF with room, best fit
-// within it.  A slot is never split.
+// The cheapest tier 1-3 room for `size`: within a tier the best fit decides, over
+// every TLSF that may take it (the smallest room that holds the slot; the lowest
+// TLSF, then the lowest piece, at a tie).  A slot is never split.
 bool find_room(const fit_state & S, size_t size, int route, fit_room & out) {
-    // Tier 1: retained runs.
     for (int tier = 1; tier <= 3; ++tier) {
+        size_t   best_free = SIZE_MAX;
+        bool     found     = false;
+        fit_room best;
         for (size_t t = 0; t < S.t.size(); ++t) {
             if (!eligible(S.t[t], route)) {
                 continue;
             }
-            size_t   best      = SIZE_MAX;
-            size_t   best_free = SIZE_MAX;
-            fit_room cand;
-            cand.tlsf = t;
             if (tier == 1) {
                 for (size_t i = 0; i < S.t[t].retained.size(); ++i) {
                     const fit_retained & r = S.t[t].retained[i];
                     const size_t         f = r.hi - r.lo - r.used;
                     if (f >= size && f < best_free) {
-                        best      = i;
-                        best_free = f;
+                        best_free     = f;
+                        best.tlsf     = t;
+                        best.retained = true;
+                        best.run      = i;
+                        found         = true;
                     }
-                }
-                if (best != SIZE_MAX) {
-                    cand.retained = true;
-                    cand.run      = best;
-                    out           = cand;
-                    return true;
                 }
                 continue;
             }
@@ -686,7 +764,7 @@ bool find_room(const fit_state & S, size_t size, int route, fit_room & out) {
                 }
                 for (size_t pi = 0; pi < run.pieces.size(); ++pi) {
                     const fit_piece & p = run.pieces[pi];
-                    if (p.kind != PK_FREE || p.room() < size) {
+                    if (p.kind != PK_FREE || p.room() < size || !piece_carvable(run, pi)) {
                         continue;
                     }
                     const bool is_gap = pi == gap;
@@ -694,17 +772,19 @@ bool find_room(const fit_state & S, size_t size, int route, fit_room & out) {
                         continue;
                     }
                     if (p.room() < best_free) {
-                        best_free = p.room();
-                        cand.run  = ri;
-                        cand.idx  = pi;
-                        best      = pi;
+                        best_free     = p.room();
+                        best.tlsf     = t;
+                        best.retained = false;
+                        best.run      = ri;
+                        best.idx      = pi;
+                        found         = true;
                     }
                 }
             }
-            if (best != SIZE_MAX) {
-                out = cand;
-                return true;
-            }
+        }
+        if (found) {
+            out = best;
+            return true;
         }
     }
     return false;
@@ -776,6 +856,16 @@ bool pick_yield(const fit_state &           S,
                 size_t end = top;
                 while (end > 0 && (run.pieces[end - 1].kind == PK_FREE || run.pieces[end - 1].kind == PK_OPT)) {
                     --end;
+                }
+                // The freed span merges into one block topped by piece `top`; if what
+                // lies above that is a pending or non-owned range, nothing carves in it.
+                const bool carvable_top = run.pieces[top].hi % fit_grain() == 0 &&
+                                          !(top + 1 < run.pieces.size() && run.pieces[top + 1].kind == PK_BARRIER &&
+                                            run.pieces[top + 1].soft);
+                if (!carvable_top) {
+                    first_sequence = false;
+                    i              = end;
+                    continue;
                 }
                 std::vector<size_t> released;
                 size_t              span = 0;
@@ -867,9 +957,12 @@ size_t room_total(const fit_state & S, size_t t) {
         total += r.hi - r.lo - r.used;
     }
     for (const fit_run & run : S.t[t].runs) {
-        for (const fit_piece & p : run.pieces) {
-            if (p.kind == PK_FREE || p.kind == PK_OPT) {
-                total += p.kind == PK_OPT ? p.size() : p.room();
+        for (size_t pi = 0; pi < run.pieces.size(); ++pi) {
+            const fit_piece & p = run.pieces[pi];
+            if (p.kind == PK_OPT) {
+                total += p.size();
+            } else if (p.kind == PK_FREE && piece_carvable(run, pi)) {
+                total += p.room();
             }
         }
     }
@@ -882,9 +975,9 @@ size_t tier13_free(const fit_state & S, size_t t) {
         total += r.hi - r.lo - r.used;
     }
     for (const fit_run & run : S.t[t].runs) {
-        for (const fit_piece & p : run.pieces) {
-            if (p.kind == PK_FREE) {
-                total += p.room();
+        for (size_t pi = 0; pi < run.pieces.size(); ++pi) {
+            if (run.pieces[pi].kind == PK_FREE && piece_carvable(run, pi)) {
+                total += run.pieces[pi].room();
             }
         }
     }
@@ -1063,14 +1156,14 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
     if (!res.superseded.empty()) {
         fit_state S = S0;
         for (const kv_superseded_slot & sup : res.superseded) {
+            // The old slot as FREE room, merged with whatever free block it touches:
+            // freeing it would do exactly that.
             const zone_reservation & rv = g.tlsfs[sup.tlsf].reservations[sup.reservation];
-            fit_run                  run;
             fit_piece                p;
             p.lo   = rv.offset;
             p.hi   = rv.offset + rv.size;
             p.kind = PK_FREE;
-            run.pieces.push_back(p);
-            S.t[sup.tlsf].runs.push_back(std::move(run));
+            add_free_piece(S.t[sup.tlsf], p);
         }
         ring_growth_device = solve_kv(S, slots).device;
     }
@@ -1125,7 +1218,7 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
     }
 
     // Layout: replay each TLSF's carves in placement order.
-    auto emit_extent = [&](size_t t, size_t base_off, size_t size, size_t demand, uint8_t kind, bool carve,
+    auto emit_extent = [&](size_t t, size_t base_off, size_t size, size_t demand, kv_extent_kind kind, bool carve,
                            const std::vector<int> & kv_ids) {
         kv_region_extent e;
         e.tlsf   = t;
@@ -1179,6 +1272,36 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
         }
         res.carve_order.push_back(op);
     };
+    // One chain of assignments in carve order.  A FREE piece's chain top-carves
+    // downward from the piece's top edge; a retained run's packs upward from its
+    // bottom and carves nothing.  Consecutive KV assigns are one extent.
+    auto emit_chain = [&](size_t t, const std::vector<int> & assigns, size_t edge, bool downward,
+                          kv_extent_kind kv_kind, bool carve) {
+        size_t cur = edge;
+        size_t k   = 0;
+        while (k < assigns.size()) {
+            const fit_assign & a = F.a[assigns[k]];
+            if (a.kind == AS_KV) {
+                size_t           k2    = k;
+                size_t           total = 0;
+                std::vector<int> ids;
+                while (k2 < assigns.size() && F.a[assigns[k2]].kind == AS_KV) {
+                    ids.push_back(assigns[k2]);
+                    total += F.a[assigns[k2]].size;
+                    ++k2;
+                }
+                const size_t b = downward ? cur - total : cur;
+                emit_extent(t, b, total, total, kv_kind, carve, ids);
+                cur = downward ? b : cur + total;
+                k   = k2;
+            } else {
+                const size_t b = downward ? cur - a.size : cur;
+                emit_single(a, t, b, a.size, carve && a.kind == AS_HEAD);
+                cur = downward ? b : cur + a.size;
+                ++k;
+            }
+        }
+    };
     for (size_t t = 0; t < n_tlsf; ++t) {
         const fit_tlsf & ft = F.t[t];
         for (const fit_run & run : ft.runs) {
@@ -1187,63 +1310,16 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
                 if (p.kind != PK_FREE || p.assigns.empty()) {
                     continue;
                 }
-                // What is left under the carved bytes is part of the last carve
-                // when it is smaller than MIN_BLOCK_SIZE (carve_gap's whole take).
-                const size_t left   = p.room();
-                const size_t absorb = left < FIT_MIN_BLOCK ? left : 0;
-                size_t       cur    = p.hi;
-                size_t       k      = 0;
-                while (k < p.assigns.size()) {
-                    const fit_assign & a = F.a[p.assigns[k]];
-                    if (a.kind == AS_KV) {
-                        size_t           k2    = k;
-                        size_t           total = 0;
-                        std::vector<int> ids;
-                        while (k2 < p.assigns.size() && F.a[p.assigns[k2]].kind == AS_KV) {
-                            ids.push_back(p.assigns[k2]);
-                            total += F.a[p.assigns[k2]].size;
-                            ++k2;
-                        }
-                        const size_t extra = k2 == p.assigns.size() ? absorb : 0;
-                        const size_t b     = cur - total - extra;
-                        emit_extent(t, b, total + extra, total,
-                                    run.frontier && pi + 1 == run.pieces.size() ? KV_EXTENT_FRONTIER : KV_EXTENT_HOLE,
-                                    true, ids);
-                        cur = b;
-                        k   = k2;
-                    } else {
-                        const size_t extra = k + 1 == p.assigns.size() ? absorb : 0;
-                        const size_t b     = cur - a.size - extra;
-                        emit_single(a, t, b, a.size + extra, a.kind == AS_HEAD);
-                        cur = b;
-                        ++k;
-                    }
-                }
+                // Every offset and size is on the allocator's grain, so a piece's
+                // carves tile its top exactly; a piece off the grain was never
+                // offered a placement (piece_carvable).
+                emit_chain(t, p.assigns, p.hi, /*downward=*/true,
+                           run.frontier && pi + 1 == run.pieces.size() ? KV_EXTENT_FRONTIER : KV_EXTENT_HOLE,
+                           /*carve=*/true);
             }
         }
         for (const fit_retained & rr : ft.retained) {
-            size_t cur = rr.lo;
-            size_t k   = 0;
-            while (k < rr.assigns.size()) {
-                const fit_assign & a = F.a[rr.assigns[k]];
-                if (a.kind == AS_KV) {
-                    size_t           k2    = k;
-                    size_t           total = 0;
-                    std::vector<int> ids;
-                    while (k2 < rr.assigns.size() && F.a[rr.assigns[k2]].kind == AS_KV) {
-                        ids.push_back(rr.assigns[k2]);
-                        total += F.a[rr.assigns[k2]].size;
-                        ++k2;
-                    }
-                    emit_extent(t, cur, total, total, KV_EXTENT_RETAINED, false, ids);
-                    cur += total;
-                    k = k2;
-                } else {
-                    emit_single(a, t, cur, a.size, false);
-                    cur += a.size;
-                    ++k;
-                }
-            }
+            emit_chain(t, rr.assigns, rr.lo, /*downward=*/false, KV_EXTENT_RETAINED, /*carve=*/false);
         }
         res.yield_prefix[t] = ft.yield_prefix;
         for (size_t off : ft.buried) {
@@ -1322,7 +1398,10 @@ kv_region_fit_result kv_region_fit(const shared_zone_geometry & g, const kv_regi
                 size_t gap = gap_index(run, gi) ? gi : SIZE_MAX;
                 for (size_t pi = 0; pi < run.pieces.size(); ++pi) {
                     const fit_piece & p = run.pieces[pi];
-                    if (p.kind == PK_FREE && pi != gap && p.size() != 0 && p.size() < smallest) {
+                    // The room a hole has left (a head slot may already fill it), as a
+                    // slot would see it.
+                    if (p.kind == PK_FREE && pi != gap && p.room() != 0 && p.room() < smallest &&
+                        piece_carvable(run, pi)) {
                         res.sub_slot_holes.push_back({ t, p.lo });
                     }
                 }

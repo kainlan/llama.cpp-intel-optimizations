@@ -161,12 +161,12 @@ def kv_layer_cells_violations(source: str) -> list[str]:
         found.append("kv_unified==false branch does not derive n_ctx_seq = pad256(n_ctx / seqs)")
     if not re.search(r"n_stream\s*=\s*seqs\s*;\s*\n\s*window_seqs\s*=\s*1\s*;", body):
         found.append("kv_unified==false branch does not set n_stream=seqs, window_seqs=1")
-    # The per-stream cap and the stream multiplication must both survive
-    # into the final formula, in EITHER mode.
     # The 256-cell padding is the one thing llama pads cells to (GGML_PAD(x, 256));
     # kv-runtime-demotion.hpp spells it as a lambda so it needs no ggml header.
     if not re.search(r"pad256\s*=\s*\[\]\(uint32_t\s+x\)\s*\{\s*return\s*\(x\s*\+\s*255u\)\s*&\s*~255u\s*;", body):
         found.append("pad256 is not (x + 255u) & ~255u")
+    # The per-stream cap and the stream multiplication must both survive
+    # into the final formula, in EITHER mode.
     if not re.search(r"n_swa\s*\*\s*window_seqs\s*\+\s*n_ubatch", body):
         found.append("does not multiply n_swa by window_seqs in the per-stream window formula")
     if not re.search(r"swa_cells\s*=\s*swa_cells_per_stream\s*\*\s*n_stream", body):

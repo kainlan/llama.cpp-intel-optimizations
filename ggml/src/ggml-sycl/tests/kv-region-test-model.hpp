@@ -88,6 +88,74 @@ class zone_model {
 
     size_t size() const { return size_; }
 
+    const std::vector<zone_pending_range> & pending() const { return pending_; }
+
+    // The chunks a placement could occupy, computed from the census and the
+    // pending ranges alone (not from the fit's pieces): every free stretch up to
+    // the allocated block above it, cut to the part above the highest other-
+    // transaction pending range it contains, and the fragments of each retained
+    // run that no such range covers.  A stretch whose top is off the 256 grid
+    // cannot be top-carved.  An independent reading of "what the commit can
+    // carve", for the refusal oracle.
+    std::vector<size_t> carvable_chunks() const {
+        std::vector<size_t> out;
+        auto                cut_floor = [&](size_t a, size_t b) {
+            size_t floor = a;
+            for (const zone_pending_range & p : pending_) {
+                if (p.first_context || p.size == 0 || p.offset >= b || p.offset + p.size <= a) {
+                    continue;
+                }
+                floor = std::max(floor, p.offset + p.size);
+            }
+            return floor;
+        };
+        auto stretch = [&](size_t a, size_t b) {
+            if (b > a && b % 256 == 0) {
+                const size_t f = cut_floor(a, b);
+                if (f < b) {
+                    out.push_back(b - f);
+                }
+            }
+        };
+        size_t at = 0;
+        for (const auto & kv : census_) {
+            stretch(at, kv.first);
+            at = kv.first + kv.second.size;
+        }
+        stretch(at, size_);
+        for (const zone_range & r : retained_) {
+            size_t                  lo    = r.offset;
+            size_t                  hi    = r.offset + r.size;
+            std::vector<zone_range> frags = {
+                { lo, hi - lo }
+            };
+            for (const zone_pending_range & p : pending_) {
+                if (p.first_context || p.size == 0) {
+                    continue;
+                }
+                std::vector<zone_range> next;
+                for (const zone_range & f : frags) {
+                    const size_t f_hi = f.offset + f.size;
+                    if (p.offset >= f_hi || p.offset + p.size <= f.offset) {
+                        next.push_back(f);
+                        continue;
+                    }
+                    if (p.offset > f.offset) {
+                        next.push_back({ f.offset, p.offset - f.offset });
+                    }
+                    if (p.offset + p.size < f_hi) {
+                        next.push_back({ p.offset + p.size, f_hi - (p.offset + p.size) });
+                    }
+                }
+                frags.swap(next);
+            }
+            for (const zone_range & f : frags) {
+                out.push_back(f.size);
+            }
+        }
+        return out;
+    }
+
     size_t anchor() const { return anchor_; }
 
     tlsf_allocator & allocator() { return tlsf_; }
@@ -258,6 +326,32 @@ struct device_model {
         }
         for (const zone_model & z : tlsfs) {
             if (!z.invariants()) {
+                return false;
+            }
+        }
+        // plan == reality: nothing the fit placed may lie on another
+        // transaction's pending range, whether it was carved or not.
+        auto clear_of_pending = [&](size_t t, size_t off, size_t size, const char * what) {
+            for (const zone_pending_range & p : tlsfs[t].pending()) {
+                if (!p.first_context && p.size != 0 && off < p.offset + p.size && p.offset < off + size) {
+                    std::fprintf(stderr, "replay: %s at %zu size %zu on tlsf %zu overlaps pending [%zu, %zu)\n", what,
+                                 off, size, t, p.offset, p.offset + p.size);
+                    return false;
+                }
+            }
+            return true;
+        };
+        for (const ggml_sycl::kv_region_extent & e : fit.extents) {
+            if (e.kind != ggml_sycl::KV_EXTENT_SELF && !clear_of_pending(e.tlsf, e.offset, e.size, "extent")) {
+                return false;
+            }
+        }
+        for (const ggml_sycl::kv_head_placement & h : fit.heads) {
+            bool refused = false;
+            for (size_t rh : fit.refused_heads) {
+                refused = refused || rh == h.head;
+            }
+            if (h.size != 0 && !h.reused && !refused && !clear_of_pending(h.tlsf, h.offset, h.size, "head slot")) {
                 return false;
             }
         }
