@@ -137,8 +137,9 @@ if (BUILD_TESTING)
     # its zone and forbids the spill, and raw allocator names stay inside the allowlisted functions.
     # The plain gate is its own fast test. --mutation-matrix then runs the witnesses on in-memory mutants of the
     # tree, so a check that can no longer fail is itself a failure; the matrix is sharded (--shard K/N, every
-    # n-th case) so each test stays far inside its TIMEOUT as cases grow. Every shard re-checks the unmutated
-    # baseline; shard 0 also runs the coverage and process-level witnesses, and checks this registration.
+    # n-th case) so each test stays at least 3x inside its TIMEOUT under host load as cases grow. Every shard
+    # re-checks the unmutated baseline. --witnesses is its own test: the coverage checks, the process-level
+    # witnesses (each spawns the gate) and the check of this registration.
     # Needs tree_sitter_language_pack (`pip install tree-sitter-language-pack` in the Python3 found above):
     # a missing pack FAILS (exit 1), it never skips. Allocates nothing; safe at any parallelism.
     add_test(NAME test-sycl-alloc-zone-contract
@@ -146,11 +147,16 @@ if (BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-alloc-zone-contract.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
     set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES LABELS "sycl;host-only;ast" TIMEOUT 120)
-    foreach(zc_shard 0 1 2 3)
+    add_test(NAME test-sycl-alloc-zone-contract-w
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-alloc-zone-contract.py
+                --root ${CMAKE_CURRENT_SOURCE_DIR}/../../.. --witnesses)
+    set_tests_properties(test-sycl-alloc-zone-contract-w PROPERTIES LABELS "sycl;host-only;ast;mutation" TIMEOUT 600)
+    foreach(zc_shard 0 1 2 3 4 5 6 7)
         add_test(NAME test-sycl-alloc-zone-contract-m${zc_shard}
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-alloc-zone-contract.py
-                    --root ${CMAKE_CURRENT_SOURCE_DIR}/../../.. --mutation-matrix --shard ${zc_shard}/4)
+                    --root ${CMAKE_CURRENT_SOURCE_DIR}/../../.. --mutation-matrix --shard ${zc_shard}/8)
         set_tests_properties(test-sycl-alloc-zone-contract-m${zc_shard} PROPERTIES LABELS "sycl;host-only;ast;mutation" TIMEOUT 600)
     endforeach()
 endif()

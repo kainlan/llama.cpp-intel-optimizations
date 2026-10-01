@@ -78,8 +78,12 @@ pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause
   `unified_cache_get_planned_(pp_moe_)onednn_*`), `J-DISPATCH` (a call of `zone_is_onednn_reorder_eligible`; the one real
   call, in `zone_scoped_maxima`, is allowlist entry `E-J-CLASSIFIER`).
 - (m) `M-SCRATCH`, `M-STALE`, `M-FLOOR`, `M-DATA`. `appendix-rows.json` is the 139-row census table (zone columns) of the
-  design appendix at master `2c4f5e45d` rev 4.16, because the appendix is not in the repository. Regenerate it, never hand-edit it:
-  `python3 scripts/sycl-alloc-zone-contract/gen-appendix-rows.py --design <design.md> --master 2c4f5e45d --rev 4.16`. The gate's own tables (`M_TABLES`: the floor list with each row's owner ticket, the
+  design appendix at master `2c4f5e45d`, because the appendix is not in the repository. The design in force is rev 4.19z, whose
+  appendix header still reads 4.16; the file's `_doc` therefore says 4.16, and the generator run against the rev 4.19z design
+  reproduces the committed file byte for byte. Regenerate it, never hand-edit it (the generator reads the `row`, `site`, `function`, `zone`, `code`, `core` and `term`
+  columns of the table whose header starts `| # | site (master`):
+  `python3 scripts/sycl-alloc-zone-contract/gen-appendix-rows.py --design <design.md> --master 2c4f5e45d --rev 4.16`. A missing or
+  malformed file, or a row without a key the clause reads, is `M-DATA`, never a traceback. The gate's own tables (`M_TABLES`: the floor list with each row's owner ticket, the
   covered-by-peak rows, the unreachable rows) are checked against it, and `ensure_planned_arena_zones` must apply the
   `GGML_SYCL_COMPUTE_ARENA_MB` floor while the floor list is non-empty (and must not once it is empty).
 - (n) `N-VOID` and `N-NODISCARD`, the only S2d codes that may be debt. The names are the declined-result consumers
@@ -87,14 +91,22 @@ pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause
   `ggml_sycl_mul_mat_batched_sycl`); a class member matches as `Class::name(` anywhere or a bare `name(` inside that class.
   Test sources that spell a listed name are read for this clause only (keys are `tests/...`); clauses (a)-(h) never see them.
   Reading of the spec: a call fails only when its value is discarded (an expression statement, the left of a comma, a cast to
-  `void`); an assignment, initializer, return, condition or argument counts as consuming it.
+  `void`, a for-loop increment); an assignment, initializer, return, condition or argument counts as consuming it. The walk
+  passes through parentheses, the right operand of `&&` / `||`, the arms of `?:` and the right of a comma, so `ok && f();` and
+  `ok ? f() : g();` are discards. A `using` or `typedef` alias of a listed class resolves to it.
 - (o) `O-NOROW`, `O-ROW`, `O-QUEUE`: each call of an acquire token (`acquire_onednn_pp_scratch`,
   `ggml_sycl_set_rows_stage_ptr`, the oneDNN graph `execute`) must sit in a function with a census row (`O_ROWS`), and each
   consuming call of that row pins its queue argument by position and exact text; a callee that takes no queue pins its own
   stream declarations.
-- Witness 9 `Z9-SITE`, `Z9-SIZING`: each of `load_reorder_temp_bytes`, `woq_packed_bytes`, `mmq_work_counter_bytes`,
-  `set_rows_stage_bytes` that is defined must be called by each of its allocation sites and by `zone-sizing.cpp` or
+- Witness 9 `Z9-SITE`, `Z9-SIZING`: each of `load_reorder_temp_bytes` (six sites, the sixth being
+  `unified_cache::reserve_reorder_temp`), `woq_packed_bytes`, `mmq_work_counter_bytes`, `set_rows_stage_bytes` that is defined
+  must be called by each of its allocation sites and, from a function that is not one of those sites, by `zone-sizing.cpp` or
   `unified-cache.cpp`.
+- Latches: a subject that appears in a shape a clause cannot read is an `X-LATCH` finding. That covers a macro, a lambda or
+  variable, a pointer to member, and a name declared as a type (`using`, `typedef` of a function pointer, a functor struct).
+  Clause (k) latches its transaction, its reap and its mode constant (a `#define` of the mode, or a constant initialised from it);
+  clauses (i) and (j) latch the retired functions and the eligibility call. No `X-LATCH` or `P-*` finding can be debt or
+  allowlisted: `validate_data` refuses both.
 
 Gaps stated rather than hidden (the gate prints a `TODO j`, `TODO l` and `TODO p-route` line for the narrowings, so they are visible
 in its output):  the names of (j)'s fit function, reserve target and selector bit reads are not fixed yet, so only
@@ -117,9 +129,13 @@ anchored edit: when a tree edit moves an anchor, the matrix fails with a setup e
 When beni b1 lands, the dormant lines turn into active checks of the real tree and the fixture's b1 transform becomes a no-op
 to delete.
 
-Stated gaps: the route's D=512 hatch is exempt from the head-dim literal rule as any `if` whose condition spells 512 and calls
-`ggml_sycl_fa_onednn_d512_enabled`; "the routing function reads the decline before the plan" is not checked (the decline reader
-has no name); the charge side's walk helpers are unnamed, so the head-dim and helper rules cover the bodies of the two named
+The route's D=512 hatch is exempt from the head-dim literal rule only in its exact text: the latch
+`static const bool V = ggml_sycl_fa_onednn_d512_enabled();` and either `if (HD == 512 && !V) { return false; }` (operands in
+either order) or `if (HD == 512) { if (!V) { return false; } }`; any other head-dim literal beside it is a finding. The routing
+function must read `ggml_sycl_onednn_graph_dispatch_declined` before its first call of the routed predicate, and every call of
+the predicate in the value function ends `..., nullptr, nullptr`.
+
+Stated gaps: the charge side's walk helpers are unnamed, so the head-dim and helper rules cover the bodies of the two named
 charge functions and the helper-name rule covers all of `unified-cache.cpp` and `.hpp`.
 
 ## Key shape
@@ -132,11 +148,12 @@ changing the construction does, which is when its entry should be revisited.
 
 ## Tests and sharding
 
-Five ctests register the gate (`ggml/src/ggml-sycl/CMakeLists.txt`): `test-sycl-alloc-zone-contract` is the plain gate (fast), and
-`test-sycl-alloc-zone-contract-m0` .. `-m3` run the mutation matrix in four shards (`--mutation-matrix --shard K/N`, every n-th
-case from K, TIMEOUT 600 each). Every shard re-checks the unmutated baseline; shard 0 also runs the coverage checks (every
-witness has a FAIL case), the process-level witnesses and the check of this registration. The matrix costs about 0.7 s a case,
-so grow N (and the `foreach` list, which the check pins) before a shard approaches its TIMEOUT.
+Ten ctests register the gate (`ggml/src/ggml-sycl/CMakeLists.txt`): `test-sycl-alloc-zone-contract` is the plain gate (fast),
+`test-sycl-alloc-zone-contract-w` runs `--witnesses` (the coverage checks, the process-level witnesses that each spawn the gate,
+and the check of this registration), and `test-sycl-alloc-zone-contract-m0` .. `-m7` run the mutation matrix in eight shards
+(`--mutation-matrix --shard K/N`, every n-th case from K, TIMEOUT 600 each). Every shard re-checks the unmutated baseline.
+The rule for N: the worst shard must take at most a third of its TIMEOUT under host load, so grow N (and the `foreach` list,
+which the check pins) as the matrix grows, in preference to raising a TIMEOUT.
 
 ## Dependency
 

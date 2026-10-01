@@ -168,6 +168,7 @@ Dependency
 
 Usage:
   check-sycl-alloc-zone-contract.py [--root REPO] [--mutation-matrix [--shard K/N]]
+  check-sycl-alloc-zone-contract.py [--root REPO] --witnesses
   check-sycl-alloc-zone-contract.py [--root REPO] --list
   check-sycl-alloc-zone-contract.py [--root REPO] --write-debt [--allow-growth]
 """
@@ -232,7 +233,7 @@ DPCT_HOME = "dpct/helper.hpp"
 DPCT_FUNCS = ("dpct_malloc",)
 DPCT_CLASSES = ("device_memory", "global_memory", "constant_memory", "shared_memory")
 
-SHARDS = 4   # the ctest registers this many shards; cmake_witness pins the registration to it
+SHARDS = 8   # the ctest registers this many shards; cmake_witness pins the registration to it
 
 DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h and n; only N-VOID and N-NODISCARD may be debt). Shrink-only: a violation not listed "
             "fails, and a listed entry that no longer violates fails. Every E-RAW entry carries a fate (deleted-by-*, "
@@ -264,6 +265,7 @@ S2D_CODES = ("I-RETRY", "K-INTERIM", "L-CALLER", "L-FREE", "L-GUARD", "J-SOURCE"
              "M-DATA", "N-VOID", "N-NODISCARD", "O-NOROW", "O-ROW", "O-QUEUE", "Z9-SITE", "Z9-SIZING", "P-ROUTE", "P-HOME", "P-FILL",
              "P-LAYER", "P-CHARGE", "X-LATCH")
 S2D_DEBT = ("N-VOID", "N-NODISCARD")
+S2D_NEVER_ALLOW = ("X-LATCH", "P-ROUTE", "P-HOME", "P-FILL", "P-LAYER", "P-CHARGE")
 CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-FORM", "B-TIER", "C-COHORT", "C-SITE", "D-ZONE",
          "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "G-CATCH", "DEFER-C") + H_CODES + S2D_CODES
 
@@ -2314,18 +2316,20 @@ Z9_SIZING_FILES = ("zone-sizing.cpp", "unified-cache.cpp")
 Z9_SITES = (
     ("load_reorder_temp_bytes", (("convert.cpp", "convert_alloc_device_scratch"), ("ggml-sycl.cpp", "arena_device_alloc"),
                                  ("ggml-sycl.cpp", "ggml_sycl_fill_xmx_tiled"), ("ggml-sycl.cpp", "ggml_sycl_fill_xmx_tiled_host"),
-                                 ("ggml-sycl.cpp", "sycl_unified_device_temp_alloc"))),
+                                 ("ggml-sycl.cpp", "sycl_unified_device_temp_alloc"),
+                                 ("unified-cache.cpp", "unified_cache::reserve_reorder_temp"))),
     ("woq_packed_bytes", (("gemm.hpp", "woq_gemm_q4_0_impl"),)),
     ("mmq_work_counter_bytes", (("mmq.cpp", "get_mmq_work_counter"),)),
     ("set_rows_stage_bytes", (("set_rows.cpp", "ggml_sycl_set_rows_stage_ptr"),)),
 )
 
 # Clause (p): one routed predicate, one home for the support decision. Each block is keyed on a subject the tree gains with
-# beni (b1) and says so while it is absent. Blocks: route (r13 m6), home (the support decision), fill (kv_is_fp8), layer
-# (the KV layer name), charge (the charge side calls no support helper).
+# beni (b1) and says so while it is absent. Blocks: route (the route's gates and the plan are combined in one function), home
+# (the support decision), fill (kv_is_fp8), layer (the KV layer name), charge (the charge side calls no support helper).
 P_ENV = "GGML_SYCL_FLASH_ATTN_EXT"
 P_ADMITS, P_ROUTED, P_ROUTE_ENABLED, P_DISPATCH = ("ggml_sycl_fattn_onednn_route_admits", "ggml_sycl_fattn_onednn_routed",
                                                    "ggml_sycl_fattn_onednn_route_enabled", "ggml_sycl_fattn_onednn_dispatch_routed")
+P_DECLINED = "ggml_sycl_onednn_graph_dispatch_declined"     # the one counting and logging read of the per-context decline
 P_ENABLED, P_SHAPE_SUPPORTED, P_SUPPORTED = ("ggml_sycl_flash_attn_ext_enabled", "ggml_sycl_fattn_shape_supported",
                                              "ggml_sycl_flash_attn_ext_supported")
 P_SHAPE_OF, P_KV_PAIR_OF, P_LAYER_OF = "ggml_sycl_fattn_shape_of", "ggml_sycl_fattn_kv_pair_of", "ggml_sycl_kv_cache_layer_of"
@@ -2336,6 +2340,7 @@ P_FLASH, P_FAST_POLICY, P_SUPPORTS_OP = ("ggml_sycl_flash_attn_ext", "ggml_sycl_
                                          "ggml_backend_sycl_device_supports_op")
 P_FLAGS = ("g_sycl_fa_onednn_enabled", "g_sycl_paged_v2_enabled", "ggml_sycl_fa_onednn_d512_enabled")
 P_BODY_BANNED = (P_VEC, P_ENABLED, P_KV_PAIR_OF, P_TILE)               # support clauses the supported/route bodies may not hold
+P_FP8_CALL_RE = re.compile(r"(?<![\w.>])(\w*fp8\w*)\s*\(")               # ... nor any fp8 type helper (ggml_sycl_type_is_fp8_e4m3)
 P_SUPPORT_HELPERS = (P_VEC, P_ENABLED, P_SHAPE_SUPPORTED, P_TILE)      # support helpers the charge side may not name
 P_ROUTED_BODY = "return ggml_sycl_fattn_onednn_route_admits(p, multi_seq, ctx, plan_out) && ggml_sycl_fattn_shape_supported(p, d_v);"
 P_CASE = "case GGML_OP_FLASH_ATTN_EXT: return ggml_sycl_flash_attn_ext_supported(op);"
@@ -2344,19 +2349,26 @@ P_WRITE_RE = re.compile(rb"(?:\.|->)kv_is_fp8[ \t\r\n]*(?:[|&^]?=)[^=]")
 P_GETENV_RE = re.compile(rb'(?:std\s*::\s*)?getenv\s*\(\s*"%s"\s*\)' % P_ENV.encode())
 P_LAYER_RE = re.compile(rb'"cache_[kv]_l')
 P_D512_LINE = "if(params.ne00==512){"
-P_HEADDIM = r"(?:\w+(?:\.|->))*(?:ne00|ne10|ne\[0\]|head_dim_k|head_dim_v|d_v|D)"
+P_HEADDIM = r"(?:\w+(?:\[[^\]]*\])*(?:\.|->))*(?:ne00|ne10|ne\[\s*0\s*\]|head_dim_k|head_dim_v|d_v|D)"
 P_CMP = r"(?:==|!=|<=|>=|<|>)"
 P_LITERAL_CMP_RE = re.compile(r"(?<![\w.>])%s\s*%s\s*(\d+)|(\d+)\s*%s\s*%s(?!\w)" % (P_HEADDIM, P_CMP, P_CMP, P_HEADDIM))
-P_TYPE_CMP_RE = re.compile(r"(?:==|!=)\s*GGML_TYPE_\w+|GGML_TYPE_\w+\s*(?:==|!=)")
+P_NAMED = r"(?:[A-Z][A-Z0-9_]{2,}|k_\w+|k[A-Z]\w*)(?![\w(])"
+P_NAMED_CMP_RE = re.compile(r"(?<![\w.>])%s\s*%s\s*%s|%s\s*%s\s*%s(?!\w)" % (P_HEADDIM, P_CMP, P_NAMED, P_NAMED, P_CMP, P_HEADDIM))
+P_ARITH_RE = re.compile(r"(?<![\w.>])%s\s*[%%&]\s*[\w(]" % P_HEADDIM)
+P_SWITCH_RE = re.compile(r"switch\s*\(\s*%s\s*\)" % P_HEADDIM)
+P_CASE_RE = re.compile(r"case\s+(\d+|(?!GGML_TYPE_)[A-Z][A-Z0-9_]+)\s*:")
+P_TYPE_CMP_RE = re.compile(r"(?:==|!=)\s*GGML_TYPE_\w+|GGML_TYPE_\w+\s*(?:==|!=)|case\s+GGML_TYPE_\w+\s*:")
+P_LATCH_RE = re.compile(r"static\s+const\s+bool\s+(\w+)\s*=\s*ggml_sycl_fa_onednn_d512_enabled\s*\(\s*\)\s*;")
+P_HD512 = P_HEADDIM + r"==512"
 P_COMMENT_RE = re.compile(rb'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*', re.S)
 P_NAMES = frozenset([P_ADMITS, P_ROUTED, P_ROUTE_ENABLED, P_DISPATCH, P_ENABLED, P_SHAPE_SUPPORTED, P_SUPPORTED, P_SHAPE_OF,
-                     P_KV_PAIR_OF, P_LAYER_OF, P_LOADFILL, P_VALUEFN, P_ONEDNN, P_PLAN, P_VEC, P_TILE])
-
+                     P_KV_PAIR_OF, P_LAYER_OF, P_LOADFILL, P_VALUEFN, P_ONEDNN, P_PLAN, P_VEC, P_TILE, P_DECLINED])
 
 
 S2D_NAMES = frozenset({I_ACCESSOR, K_TXN, K_REAP, K_MODE, K_INTERIM, L_COUNT, L_REPLACE, L_GUARD, J_ELIGIBLE, M_FLOOR_FN}
                       | set(I_RETIRED) | set(J_FIT) | set(N_LAST) | set(O_ACQUIRE) | {b for b, _ in Z9_SITES} | P_NAMES)
-S2D_BYTES = tuple(sorted(n.encode() for n in S2D_NAMES)) + (O_EXECUTE.encode(),)
+N_CLASSES = tuple(sorted({c for c, _ in N_MEMBERS}))
+S2D_BYTES = tuple(sorted(n.encode() for n in S2D_NAMES)) + (O_EXECUTE.encode(),) + tuple(c.encode() for c in N_CLASSES)
 
 _S2D = {}   # sha1 -> facts
 MACRO_NOISE_RE = re.compile(r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*', re.S)   # strings and comments of a #define body
@@ -2409,11 +2421,11 @@ def s2d_facts(src):
     h = _sha(src)
     if h in _S2D:
         return _S2D[h]
-    occ, fdefs = [], []
+    occ, fdefs, aliases = [], [], []
     if any(b in src for b in S2D_BYTES):
         for n in walk(parse(src)):
             k = kind(n)
-            if k in ("identifier", "field_identifier"):
+            if k in ("identifier", "field_identifier", "type_identifier", "namespace_identifier"):
                 nm = txt(src, n)
                 if nm in S2D_NAMES:
                     role, top, call = name_role(src, n)
@@ -2429,6 +2441,10 @@ def s2d_facts(src):
                 body = fld(n, "body")
                 if d is not None and fld(d, "declarator") is not None and body is not None:
                     fdefs.append((callee_last(txt(src, fld(d, "declarator"))), enclosing(src, body), n))
+            elif k == "alias_declaration" or k == "type_definition":
+                nm, tgt = (fld(n, "name"), fld(n, "type")) if k == "alias_declaration" else (fld(n, "declarator"), fld(n, "type"))
+                if nm is not None and tgt is not None and kind(nm) == "type_identifier":
+                    aliases.append((txt(src, nm), re.sub(r"\b(?:const|volatile|struct|class)\b|[*&\s]", "", txt(src, tgt)).split("::")[-1]))
             elif k in ("preproc_def", "preproc_function_def"):
                 nm, body = fld(n, "name"), fld(n, "value")
                 words = set(re.findall(r"[A-Za-z_]\w*", MACRO_NOISE_RE.sub(" ", txt(src, body)))) if body is not None else set()
@@ -2437,7 +2453,7 @@ def s2d_facts(src):
                 for w in sorted(words & S2D_NAMES):
                     occ.append(Occ(w, "other", n, n, None, "#define " + (txt(src, nm) if nm is not None else "?"),
                                    line_of(n), None, "macro"))
-    _S2D[h] = {"occ": occ, "fdefs": fdefs}
+    _S2D[h] = {"occ": occ, "fdefs": fdefs, "aliases": aliases}
     return _S2D[h]
 
 
@@ -2447,14 +2463,26 @@ class Index:
     def __init__(self, files):
         self.files = files
         self.src = files
-        self.by_name, self.defs, self.def_by_func = {}, {}, {}
+        self.by_name, self.defs, self.def_by_func, self.alias_of = {}, {}, {}, {}
         for rel in sorted(files):
             fa = s2d_facts(files[rel])
+            for alias, target in fa["aliases"]:
+                self.alias_of.setdefault(alias, set()).add(target)
             for o in fa["occ"]:
                 self.by_name.setdefault(o.name, []).append((rel, o))
             for name, func, node in fa["fdefs"]:
                 self.defs.setdefault(name, []).append((rel, func, node))
                 self.def_by_func.setdefault((rel, func), []).append(node)
+
+    def resolve(self, name):
+        """Every class name `name` can stand for through `using X = Y;` / `typedef Y X;` chains (the name itself included)."""
+        seen, todo = {name}, [name]
+        while todo:
+            for t in self.alias_of.get(todo.pop(), ()):
+                if t not in seen:
+                    seen.add(t)
+                    todo.append(t)
+        return seen
 
     def occ(self, name, roles=None):
         return [(r, o) for r, o in self.by_name.get(name, []) if roles is None or o.role in roles]
@@ -2512,6 +2540,8 @@ def clause_i(ix, out):
     function_definition node whose declarator names the accessor; a call or a `;` declaration is not one."""
     defined = has_name(ix, I_ACCESSOR, "def")
     out.latch("i", ix, I_ACCESSOR, "a call, a declaration or a function definition", "an alias, a macro or a lambda hides it")
+    for nm in I_RETIRED:
+        out.latch("i", ix, nm, "a call, a declaration or a function definition", "a static lambda, a macro or an alias hides it")
     if not defined:
         out.dormant.append("DORMANT i: subject %s (a function definition) absent" % I_ACCESSOR)
         return
@@ -2525,6 +2555,16 @@ def clause_i(ix, out):
 def clause_k(ix, out):
     """(k): once §B's COMPLETE-mode reap sits in the transaction, the pre-§B reclaim-query interim must be gone."""
     reaped = False
+    for nm, why in ((K_TXN, "a lambda, a macro or an alias hides the transaction"), (K_REAP, "a macro, a lambda or an alias hides the reap")):
+        out.latch("k", ix, nm, "a call, a declaration or a function definition", why)
+    for rel, o in ix.occ(K_MODE):
+        p = None if o.form == "macro" else parent(o.node)
+        if o.form == "macro" or (p is not None and kind(p) in ("init_declarator", "assignment_expression") and same(
+                fld(p, "value" if kind(p) == "init_declarator" else "right"), o.node)):
+            out.add("X-LATCH", rel, o.line, o.func, K_MODE, "%s::%s::latch:k:%s:alias" % (rel, o.func, K_MODE),
+                    "clause (k) is keyed on a call of %s whose arguments name %s; %s is aliased here (%s), so the reap's mode "
+                    "would be read through a name the clause does not follow: respell it, or extend the matcher" % (
+                        K_REAP, K_MODE, K_MODE, "a macro" if o.form == "macro" else "a constant or variable initialiser"))
     for rel, func, node in ix.fdefs(K_TXN):
         src = ix.files[rel]
         calls = calls_in_node(src, body_of(node), K_REAP)
@@ -2672,6 +2712,8 @@ def clause_j(ix, out):
     late stage's classifier calls zone_is_onednn_reorder_eligible (J-DISPATCH)."""
     for nm in J_FIT:
         out.latch("j", ix, nm, "a call, a declaration or a function definition", "an alias, a macro or a lambda hides it")
+    out.latch("j", ix, J_ELIGIBLE, "a call, a declaration or a function definition",
+              "a macro, an alias or a taken address hides a call from J-DISPATCH")
     out.dormant.append("TODO j: only %s are covered; the design names no fit function for the reserve's target nor the "
                        "candidate/selector bit reads, so those are not checked yet" % " / ".join(J_FIT))
     fits = [(rel, func, node) for nm in J_FIT for rel, func, node in ix.fdefs(nm)]
@@ -2705,21 +2747,37 @@ S2D_DATA = {"dir": None}
 
 
 def appendix_rows():
-    """row number -> {zone, core, code, term}, from appendix-rows.json beside the allowlist; None when it is missing."""
+    """(rows, problem): row number -> {function, zone, core, code, term}, from appendix-rows.json beside the allowlist. `rows`
+    is None, with the problem named, when the file is missing, is not JSON, or has a row the clause cannot read."""
     d = S2D_DATA["dir"] or Path(__file__).resolve().parent / "sycl-alloc-zone-contract"
     p = Path(d) / "appendix-rows.json"
     if not p.exists():
-        return None
-    return {int(r["row"]): r for r in json.loads(p.read_text())["rows"]}
+        return None, "appendix-rows.json is missing"
+    try:
+        doc = json.loads(p.read_text())
+    except (OSError, ValueError) as exc:
+        return None, "appendix-rows.json is not readable JSON (%s)" % exc
+    rows = doc.get("rows") if isinstance(doc, dict) else None
+    if not isinstance(rows, list):
+        return None, "appendix-rows.json has no `rows` list"
+    out = {}
+    for i, r in enumerate(rows):
+        try:
+            if not isinstance(r, dict) or any(not isinstance(r[k], str) for k in ("function", "zone", "core", "code", "term")):
+                raise KeyError
+            out[int(r["row"])] = r
+        except (KeyError, TypeError, ValueError):
+            return None, "appendix-rows.json row #%d is malformed (needs an integer row and string function, zone, core, code, term)" % i
+    return out, None
 
 
 def clause_m(ix, out):
     """(m): every appendix row whose zone today or core zone is SCRATCH is listed, covered by a named peak, or excluded by
     class (core-planned, D, REF, unreachable); a listed row whose zone is not SCRATCH fails; and the floor tie."""
-    rows = appendix_rows()
+    rows, problem = appendix_rows()
     if rows is None:
-        out.add("M-DATA", "appendix-rows.json", 0, "<table>", "", "appendix::missing", "appendix-rows.json is missing: clause (m) "
-                "reads the census table's zone columns from it")
+        out.add("M-DATA", "appendix-rows.json", 0, "<table>", "", "appendix::%s" % ("missing" if "missing" in problem else "malformed"),
+                "%s: clause (m) reads the census table's zone columns from it" % problem)
         return
     floor, covered, unreach = M_TABLES["floor"], M_TABLES["covered"], M_TABLES["unreachable"]
     for r in sorted(rows):
@@ -2774,13 +2832,17 @@ def encl_class(src, node):
     return None
 
 
-def n_listed(src, o):
-    """The listed name an occurrence spells, as (class or None, name), or None: `Class::name` anywhere, a bare member name
-    only inside that class, the two unique names anywhere."""
+def n_listed(ix, src, o):
+    """The listed name an occurrence spells, as (class or None, name), or None: `Class::name` anywhere (the scope may be an
+    alias of the class: `using W = DnnlGemmWrapper; W::row_gemm(...)`), a bare member name only inside that class, the two
+    unique names anywhere."""
     if o.name in N_UNIQUE:
         return (None, o.name)
     if o.scope is not None:
-        return (o.scope, o.name) if (o.scope, o.name) in N_MEMBERS else None
+        for c in sorted(ix.resolve(o.scope)):
+            if (c, o.name) in N_MEMBERS:
+                return (c, o.name)
+        return None
     if kind(o.top) == "identifier" or o.role in ("def", "decl"):
         c = encl_class(src, o.node) or class_of(o.func)
         if c is not None and (c, o.name) in N_MEMBERS:
@@ -2789,13 +2851,20 @@ def n_listed(src, o):
 
 
 def value_use(src, call):
-    """'void-cast' for `(void) f()` and `static_cast<void>(f())`, 'discard' for a call that is its own expression statement
-    (or the left operand of a comma), else 'used'."""
+    """'void-cast' for `(void) f()` and `static_cast<void>(f())`, 'discard' for a call whose value nothing reads, else
+    'used'. The value of `ok && f()`, `ok || f()`, `c ? f() : x` and the right operand of a comma is the value of the whole
+    expression, so those operands are followed up to the expression that consumes (or drops) it; a call that is a
+    for-loop's initializer or update expression is dropped too."""
     n, p = call, parent(call)
-    while p is not None and kind(p) == "parenthesized_expression":
-        n, p = p, parent(p)
-    while p is not None and kind(p) == "comma_expression" and not same(fld(p, "left"), n):
-        n, p = p, parent(p)
+    while p is not None:
+        k = kind(p)
+        if k == "parenthesized_expression" or \
+                (k == "binary_expression" and txt(src, fld(p, "operator")) in ("&&", "||") and same(fld(p, "right"), n)) or \
+                (k == "conditional_expression" and not same(fld(p, "condition"), n)) or \
+                (k == "comma_expression" and not same(fld(p, "left"), n)):
+            n, p = p, parent(p)
+            continue
+        break
     if p is None:
         return "used"
     if kind(p) == "cast_expression":
@@ -2805,7 +2874,9 @@ def value_use(src, call):
         f = fld(parent(p), "function")
         if f is not None and re.sub(r"\s+", "", txt(src, f)).startswith("static_cast<void>"):
             return "void-cast"
-    if kind(p) == "comma_expression" or kind(p) == "expression_statement":
+    if kind(p) in ("comma_expression", "expression_statement"):
+        return "discard"
+    if kind(p) == "for_statement" and (same(fld(p, "update"), n) or same(fld(p, "initializer"), n)):
         return "discard"
     return "used"
 
@@ -2826,9 +2897,10 @@ def clause_n(ixt, out):
     expression statement, or is cast to void, fails (N-VOID); each listed declaration carries [[nodiscard]] (N-NODISCARD)."""
     for nm in sorted(N_LAST):
         for rel, o in ixt.occ(nm):
-            lst = n_listed(ixt.files[rel], o)
+            lst = n_listed(ixt, ixt.files[rel], o)
             if lst is None or o.role == "other":
                 continue
+            out.active.add("n")
             cname = ("%s::%s" % lst) if lst[0] else lst[1]
             src = ixt.files[rel]
             if o.role == "call":
@@ -2946,6 +3018,8 @@ def clause_o(ix, out):
 def clause_z9(ix, out):
     """Witness 9: every model-shaped exact `*_bytes()` function is called by its allocation sites and by the zone sizing;
     dormant while the function is not defined."""
+    out.dormant.append("TODO 9: the design names no zone-sizing function, so any call of the bytes function in %s from a function "
+                       "that is not one of its allocation sites counts as the sizing" % " or ".join(Z9_SIZING_FILES))
     for fn, sites in Z9_SITES:
         out.latch("9", ix, fn, "a call or a function definition", "an alias, a macro or a lambda hides it")
         if not has_name(ix, fn, "def"):
@@ -2961,11 +3035,12 @@ def clause_z9(ix, out):
                 out.add("Z9-SITE", rel, line_of(hits[0][1]), site, fn, "%s::%s::bytes-site:%s" % (rel, site, fn),
                         "%s no longer calls %s: the site and the zone sizing must share the one function, or the plan "
                         "reserves what the site does not draw" % (site, fn))
-        sized = [(rel, o) for rel, o in ix.occ(fn, ("call",)) if rel in Z9_SIZING_FILES]
+        site_fns = {fn} | {site.split("::")[-1] for _, site in sites}
+        sized = [(rel, o) for rel, o in ix.occ(fn, ("call",)) if rel in Z9_SIZING_FILES and fn_name(o.func) not in site_fns]
         if not sized:
             out.add("Z9-SIZING", Z9_SIZING_FILES[0], 0, "<zone sizing>", fn, "sizing::bytes-fn:%s" % fn,
-                    "%s is called by no function of %s: the zone sizing must charge what its sites draw, through the same "
-                    "function" % (fn, " or ".join(Z9_SIZING_FILES)))
+                    "%s is called by no sizing function of %s: a call from one of its own allocation sites is not the zone "
+                    "sizing, which must charge what the sites draw through the same function" % (fn, " or ".join(Z9_SIZING_FILES)))
 
 
 def strip_comments_b(b):
@@ -2986,27 +3061,54 @@ def p_dormant(out, block, subject, shape="a function definition"):
     out.dormant.append("DORMANT p-%s: subject %s (%s) absent" % (block, subject, shape))
 
 
+def p_routed_vars(src, call):
+    """Names of the locals, in the function holding `call`, that are initialised from a call of the routing function (the
+    FORCE arm of the design keeps its routing call in `const bool routed = ...;` and conditions the entry on `routed`)."""
+    f = call
+    while f is not None and kind(f) != "function_definition":
+        f = parent(f)
+    names = set()
+    for x in (walk(f) if f is not None else ()):
+        if kind(x) == "init_declarator" and fld(x, "value") is not None and \
+                any(callee_last(txt(src, fld(c, "function"))) == P_DISPATCH for c in calls_in_node(src, fld(x, "value"))):
+            names.add(declared_name(src, fld(x, "declarator")))
+    return names
+
+
 def p_dispatch_branch(src, call):
-    """(ok, why): the call sits in the consequence of an `if` whose condition calls the routing function and tests none of the
-    flags the routing function owns."""
+    """(ok, why): the call sits in the consequence of an `if` whose condition calls the routing function, or reads a local that
+    was initialised from it, and tests none of the flags the routing function owns."""
     p, why = parent(call), "no enclosing branch whose condition calls %s" % P_DISPATCH
+    viaVars = None
     while p is not None:
         if kind(p) == "if_statement":
             cond, cons = fld(p, "condition"), fld(p, "consequence")
-            if cond is not None and cons is not None and in_span(call, cons) and \
-                    any(callee_last(txt(src, fld(c, "function"))) == P_DISPATCH for c in calls_in_node(src, cond)):
-                bad = [f for f in P_FLAGS if re.search(r"(?<![\w])%s(?![\w])" % f, clean_text(src, cond))]
-                if not bad:
-                    return True, ""
-                why = "its branch condition also tests %s" % ", ".join(bad)
+            if cond is not None and cons is not None and in_span(call, cons):
+                if viaVars is None:
+                    viaVars = p_routed_vars(src, call)
+                words = set(re.findall(r"[A-Za-z_]\w*", clean_text(src, cond)))
+                if any(callee_last(txt(src, fld(c, "function"))) == P_DISPATCH for c in calls_in_node(src, cond)) or (viaVars & words):
+                    bad = [f for f in P_FLAGS if re.search(r"(?<![\w])%s(?![\w])" % f, clean_text(src, cond))]
+                    if not bad:
+                        return True, ""
+                    why = "its branch condition also tests %s" % ", ".join(bad)
         p = parent(p)
     return False, why
 
 
+def p_callers(ix, out, code, tag, table):
+    """Each (callee, allowed caller names) of `table`: a call of the callee from any other function is a finding."""
+    for callee, allowed in table:
+        for rel, o in ix.occ(callee, ("call",)):
+            if fn_name(o.func) not in allowed:
+                out.add(code, rel, o.line, o.func, callee, "%s::%s::%s:%s" % (rel, o.func, tag, callee),
+                        "%s is called in %s; its callers are %s only" % (callee, o.func, ", ".join(allowed)))
+
+
 def p_route(ix, out):
-    out.dormant.append("TODO p-route: the D=512 hatch line's text and the routing function's decline reader are unnamed in the "
-                       "design, so neither is pinned; the charge side's walk helpers are unnamed too")
+    out.dormant.append("TODO p-route: the charge side's walk helpers are unnamed in the design, so they are not pinned")
     out.latch("p-route", ix, P_ADMITS, "a call or a function definition", "an alias, a macro or a lambda hides it")
+    out.latch("p-route", ix, P_DECLINED, "a call or a function definition", "an alias, a macro or a lambda hides it")
     if not has_name(ix, P_ADMITS, "def"):
         p_dormant(out, "route", P_ADMITS)
         return
@@ -3030,49 +3132,84 @@ def p_route(ix, out):
         if calls_in_node(src, body_of(node), P_PLAN):
             out.add("P-ROUTE", rel, line_of(node), func, P_PLAN, "%s::%s::p-route:value-plan" % (rel, func),
                     "the value function %s calls %s directly; it calls %s with nullptr, nullptr" % (func, P_PLAN, P_ROUTED))
-        ok = False
-        for c in calls_in_node(src, body_of(node), P_ROUTED):
+        calls = calls_in_node(src, body_of(node), P_ROUTED)
+        bad = []
+        for c in calls:
             args = [squash(txt(src, a)) for a in arg_nodes(c)]
-            ok = ok or args[2:4] == ["nullptr", "nullptr"]
-        if not ok:
-            out.add("P-ROUTE", rel, line_of(node), func, P_ROUTED, "%s::%s::p-route:value-predicate" % (rel, func),
-                    "the value function %s must call %s with nullptr, nullptr as its context and plan arguments" % (func, P_ROUTED))
-    for callee, allowed in ((P_ADMITS, (P_ROUTED, P_SHAPE_SUPPORTED)), (P_ROUTE_ENABLED, (P_ADMITS, P_DISPATCH))):
-        for rel, o in ix.occ(callee, ("call",)):
-            if fn_name(o.func) not in allowed:
-                out.add("P-ROUTE", rel, o.line, o.func, callee, "%s::%s::p-route:caller:%s" % (rel, o.func, callee),
-                        "%s is called in %s; its callers are %s only" % (callee, o.func, " and ".join(allowed)))
+            if not (len(args) >= 4 and args[-2:] == ["nullptr", "nullptr"]):
+                bad.append(c)
+        for c in bad or ([] if calls else [node]):
+            out.add("P-ROUTE", rel, line_of(c), func, P_ROUTED, "%s::%s::p-route:value-predicate" % (rel, func),
+                    "the value function %s must call %s, every time, with nullptr, nullptr as its last two (context and plan) "
+                    "arguments%s" % (func, P_ROUTED, "" if calls else " (it makes no call)"))
+    for rel, func, node in ix.fdefs(P_DISPATCH):
+        src = ix.files[rel]
+        dec = [sb(c) for c in calls_in_node(src, body_of(node), P_DECLINED)]
+        routed = [sb(c) for c in calls_in_node(src, body_of(node), P_ROUTED)]
+        if not dec or (routed and min(routed) < min(dec)):
+            out.add("P-ROUTE", rel, line_of(node), func, P_DECLINED, "%s::%s::p-route:%s" % (
+                rel, func, "decline-order" if dec else "decline-read"),
+                    "%s must call %s before it calls %s: every decline is read in the routing condition, before the plan, "
+                    "and %s" % (func, P_DECLINED, P_ROUTED, "the first call of the predicate comes first here" if dec else
+                                "no read of it is made here"))
+    p_callers(ix, out, "P-ROUTE", "p-route:caller", ((P_ADMITS, (P_ROUTED, P_SHAPE_SUPPORTED)), (P_ROUTE_ENABLED, (P_ADMITS, P_DISPATCH))))
+
+
+P_HATCH_BODIES = ("{if(!%s){returnfalse;}}", "if(!%s){returnfalse;}", "{if(!%s)returnfalse;}", "if(!%s)returnfalse;")
 
 
 def p_blank_hatch(src, body):
-    """The route's D=512 hatch: an `if` whose condition spells the 512 literal and calls ggml_sycl_fa_onednn_d512_enabled is
-    blanked before the literal scan (its text is not pinned beyond that)."""
-    text = bytearray(strip_comments_b(src[sb(body):eb(body)]))
+    """`body`'s text with the route's D=512 hatch blanked, and nothing else. The route latches the hatch once, in a function-local
+    `static const bool V = ggml_sycl_fa_onednn_d512_enabled();`. The exempt text is then an `if` whose whole condition is
+    `<head dim> == 512 && !V` (either order), or `<head dim> == 512` alone over a body that is exactly `if (!V) { return false; }`.
+    A condition with any other term, or a V that is not that latch, keeps its 512 literal for the literal scan to see."""
+    raw = strip_comments_b(src[sb(body):eb(body)])
+    text = bytearray(raw)
+    latches = [(m.group(1), m.start()) for m in P_LATCH_RE.finditer(raw.decode("utf-8", "replace"))]
     for n in walk(body):
-        if kind(n) == "if_statement":
-            cond = fld(n, "condition")
-            if cond is not None:
-                c = clean_text(src, cond)
-                if "ggml_sycl_fa_onednn_d512_enabled" in c and re.search(r"\b512\b", c):
-                    a, b = sb(cond) - sb(body), eb(cond) - sb(body)
-                    text[a:b] = re.sub(rb"[^\n]", b" ", bytes(text[a:b]))
+        if kind(n) != "if_statement" or fld(n, "condition") is None:
+            continue
+        cond = fld(n, "condition")
+        c = squash(clean_text(src, cond))
+        m = re.fullmatch(r"\((.*)\)", c)
+        inner = m.group(1) if m else c
+        cons = squash(clean_text(src, fld(n, "consequence"))) if fld(n, "consequence") is not None else ""
+        for v, at in latches:
+            ev = re.escape(v)
+            if at < sb(n) - sb(body) and (re.fullmatch(P_HD512 + "&&!" + ev, inner) or re.fullmatch("!" + ev + "&&" + P_HD512, inner)
+                                          or (re.fullmatch(P_HD512, inner) and cons in [b % v for b in P_HATCH_BODIES])):
+                a, b = sb(cond) - sb(body), eb(cond) - sb(body)
+                text[a:b] = re.sub(rb"[^\n]", b" ", bytes(text[a:b]))
+                break
     return bytes(text).decode("utf-8", "replace")
 
 
-def p_support_clauses(text, headdim=True, types=True):
-    """(kind, snippet) for each support clause in comment-stripped function text."""
-    hits = []
-    for nm in P_BODY_BANNED:
-        if re.search(r"(?<![\w])%s\s*\(" % nm, text):
-            hits.append(("call", nm))
-    if types:
-        hits += [("type-compare", squash(m.group(0))) for m in P_TYPE_CMP_RE.finditer(text)]
-    if headdim:
-        hits += [("head-dim-literal", squash(m.group(0))) for m in P_LITERAL_CMP_RE.finditer(text)]
+def p_support_clauses(text):
+    """(kind, snippet) for each support clause in comment-stripped function text: a call of a support helper or of an fp8
+    type helper, a GGML_TYPE_ comparison or case, and a head dim compared with an integer or a named constant, taken modulo
+    or masked, or switched on."""
+    names = {nm for nm in P_BODY_BANNED if re.search(r"(?<![\w])%s\s*\(" % nm, text)}
+    names |= {m.group(1) for m in P_FP8_CALL_RE.finditer(text)}
+    hits = [("call", nm) for nm in sorted(names)]
+    hits += [("type-compare", squash(m.group(0))) for m in P_TYPE_CMP_RE.finditer(text)]
+    hits += [("head-dim-literal", squash(m.group(0))) for m in P_LITERAL_CMP_RE.finditer(text)]
+    hits += [("head-dim-named", squash(m.group(0))) for m in P_NAMED_CMP_RE.finditer(text)]
+    hits += [("head-dim-arith", squash(m.group(0))) for m in P_ARITH_RE.finditer(text)]
+    if P_SWITCH_RE.search(text):
+        hits += [("head-dim-case", "case" + m.group(1)) for m in P_CASE_RE.finditer(text)]
     return hits
 
 
+def p_fill_sites(ix):
+    """((file, function) of each pinned fill, whether the b2 value function exists): the shape function, the dispatch function
+    and the charge side's one fill (the load-maxima fill in b1, the value function in b2)."""
+    b2 = bool(ix.fdefs(P_VALUEFN))
+    return [("fattn.cpp", P_SHAPE_OF), ("fattn.cpp", P_FLASH), ("unified-cache.cpp", P_VALUEFN if b2 else P_LOADFILL)], b2
+
+
 def p_home(ix, files, out):
+    out.dormant.append("TODO p-home: a head dim copied into a local, a switch or comparison on such a local, and a support clause "
+                       "spelled through a predicate other than the listed helpers are not followed (no dataflow)")
     out.latch("p-home", ix, P_ENABLED, "a call or a function definition", "an alias, a macro or a lambda hides it")
     enabled = ix.fdefs(P_ENABLED)
     if not enabled:
@@ -3119,10 +3256,10 @@ def p_home(ix, files, out):
         if body != squash("{ %s }" % P_ROUTED_BODY):
             out.add("P-HOME", rel, line_of(node), func, P_ROUTED, "%s::%s::p-home:routed-body" % (rel, func),
                     "the body of %s must be exactly `%s`, the support decision is not restated here" % (P_ROUTED, P_ROUTED_BODY))
-    for name in (P_SUPPORTED, P_ADMITS):
+    for name in (P_SUPPORTED, P_ADMITS, P_ROUTE_ENABLED):
         for rel, func, node in ix.fdefs(name):
             src = ix.files[rel]
-            text = p_blank_hatch(src, body_of(node)) if name == P_ADMITS else clean_text(src, body_of(node))
+            text = clean_text(src, body_of(node)) if name == P_SUPPORTED else p_blank_hatch(src, body_of(node))
             for knd, what in p_support_clauses(text):
                 out.add("P-HOME", rel, line_of(node), func, what, "%s::%s::p-home:clause:%s:%s" % (rel, func, knd, what),
                         "%s holds a support clause (%s %s): the support decision lives in %s alone" % (
@@ -3132,13 +3269,19 @@ def p_home(ix, files, out):
                 if n != 1:
                     out.add("P-HOME", rel, line_of(node), func, P_SHAPE_SUPPORTED, "%s::%s::p-home:shape-call" % (rel, func),
                             "%s must call %s exactly once (%d found)" % (P_SUPPORTED, P_SHAPE_SUPPORTED, n))
-    fills = (P_SHAPE_SUPPORTED, P_SHAPE_OF, P_FLASH, P_VALUEFN if ix.fdefs(P_VALUEFN) else P_LOADFILL)
-    for callee, allowed in ((P_VEC, (P_SHAPE_SUPPORTED, P_FAST_POLICY)), (P_TILE, (P_SHAPE_SUPPORTED, P_FLASH)),
-                            (P_KV_PAIR_OF, fills)):
-        for rel, o in ix.occ(callee, ("call",)):
-            if fn_name(o.func) not in allowed:
-                out.add("P-HOME", rel, o.line, o.func, callee, "%s::%s::p-home:census:%s" % (rel, o.func, callee),
-                        "%s is called in %s; its callers are %s only" % (callee, o.func, ", ".join(allowed)))
+    sites, _ = p_fill_sites(ix)
+    fill_names = tuple(n for _, n in sites)
+    p_callers(ix, out, "P-HOME", "p-home:census", ((P_VEC, (P_SHAPE_SUPPORTED, P_FAST_POLICY)), (P_TILE, (P_SHAPE_SUPPORTED, P_FLASH)),
+                                                  (P_KV_PAIR_OF, (P_SHAPE_SUPPORTED,) + fill_names)))
+    for rel, o in ix.occ(P_KV_PAIR_OF, ("call",)):
+        if fn_name(o.func) in fill_names:
+            st = o.call
+            while st is not None and not (parent(st) is not None and kind(parent(st)) == "compound_statement"):
+                st = parent(st)
+            if st is None or not P_FILL_RE.match(squash(clean_text(ix.files[rel], st))):
+                out.add("P-HOME", rel, o.line, o.func, P_KV_PAIR_OF, "%s::%s::p-home:census-fill:%s" % (rel, o.func, P_KV_PAIR_OF),
+                        "%s is called in %s outside the pinned fill line: its callers are the shape function and the pinned "
+                        "`<v>.kv_is_fp8 = ...` lines only" % (P_KV_PAIR_OF, o.func))
     n_tile = sum(1 for _, o in ix.occ(P_TILE, ("call",)) if fn_name(o.func) == P_FLASH)
     if n_tile != 2:
         out.add("P-HOME", "fattn.cpp", 0, P_FLASH, P_TILE, "p-home:tile-dispatch-sites",
@@ -3163,8 +3306,7 @@ def p_fill(ix, out):
         p_dormant(out, "fill", P_KV_PAIR_OF)
         return
     out.active.add("p-fill")
-    b2 = bool(ix.fdefs(P_VALUEFN))
-    fills = [("fattn.cpp", P_SHAPE_OF), ("fattn.cpp", P_FLASH), ("unified-cache.cpp", P_VALUEFN if b2 else P_LOADFILL)]
+    fills, b2 = p_fill_sites(ix)
     if b2 and ix.fdefs(P_LOADFILL):
         rel, func, node = ix.fdefs(P_LOADFILL)[0]
         out.add("P-FILL", rel, line_of(node), func, P_LOADFILL, "%s::%s::p-fill:load-fill-in-b2" % (rel, func),
@@ -3181,7 +3323,8 @@ def p_fill(ix, out):
             src = ix.files[rel]
             own = set(re.findall(r"fattn_params\s*[&*]?\s*(\w+)", clean_text(src, node)))
             n = 0
-            for m in re.finditer(r"[^;{}]*;", clean_text(src, body_of(node))):
+            body_text = clean_text(src, body_of(node))
+            for m in re.finditer(r"[^;{}]*;", body_text):
                 st = squash(m.group(0))
                 mm = P_FILL_RE.match(st)
                 n += bool(mm and mm.group(1) in own)
@@ -3264,9 +3407,10 @@ def p_charge(ix, out):
                     "the only literal is the walk's D512 count" % (func, st))
         if name == P_VALUEFN:
             lines = [squash(m.group(0)) for m in re.finditer(r"if\s*\(\s*params\.ne00\s*==\s*512\s*\)\s*\{", text)]
-            if lines.count(P_D512_LINE) != 1:
+            if lines.count(P_D512_LINE) != 1 or d512 != 1:
                 out.add("P-CHARGE", rel, line_of(node), func, "512", "%s::%s::p-charge:d512-count" % (rel, func),
-                        "%s must hold the line `if (params.ne00 == 512) {` exactly once (%d found)" % (func, lines.count(P_D512_LINE)))
+                        "%s must hold the line `if (params.ne00 == 512) {` exactly once, and no other comparison of the head dim "
+                        "with 512 (%d such line(s), %d exempt comparison(s) found)" % (func, lines.count(P_D512_LINE), d512))
 
 
 def s2d_findings(files):
@@ -3330,6 +3474,9 @@ def validate_data(allowlist, debt):
             continue
         if e["code"] not in CODES:
             errs.append("FAIL allowlist entry %s has unknown code %r" % (e["id"], e["code"]))
+        if e["code"] in S2D_NEVER_ALLOW:
+            errs.append("FAIL allowlist entry %s: a finding of code %s is fixed, never exempted (an X-LATCH means the clause cannot "
+                        "see the code; a P-* finding is a design pin)" % (e["id"], e["code"]))
         if e["code"] in H_NEVER_EXEMPT:
             errs.append("FAIL allowlist entry %s: %s cannot be exempted; only the literal true at an allowlisted node or the "
                         "enclosing callee's own parameter is a cascade_step write" % (e["id"], e["code"]))
@@ -3511,7 +3658,7 @@ class Case:
         self.allow_nodes, self.allow_from = allow_nodes, allow_from
 
 
-# witness id -> what it pins. Every id must have a FAIL case; 9 is deferred and says so.
+# witness id -> what it pins. Every id (the process-level ones aside) must have a FAIL case.
 WITNESSES = {
     "1": "device request with no zone", "1s": "a pointer-holder scope cannot launder a request",
     "2": "forbid removed or false", "3": "? COUNT : ONEDNN", "4": "COUNT retry after a zoned request",
@@ -3535,7 +3682,7 @@ WITNESSES = {
     "r3i1": "a braced assignment to intent/constraints discards earlier writes",
     "r3i2": "braced arguments in constructor and new forms", "r3m1": "parenthesised left sides",
     "r3n": "raw strings split across adjacent literals; compound macro writes",
-    "f": "missing tree_sitter_language_pack exits 1", "cmake": "the ctest registrations: the plain gate and all four shards, their TIMEOUTs and labels, no regeneration flag",
+    "f": "missing tree_sitter_language_pack exits 1", "cmake": "the ctest registrations: the plain gate, the witnesses test and every shard, their TIMEOUTs and labels, no regeneration flag",
     "10": "a helper writing COUNT through a by-reference request fails at the caller",
     "11": "a helper writing forbid false (or a conditional other tier) through a by-reference request fails at the caller",
     "17": "a copy is a construction of its own and must assign its own cohort literal",
@@ -3565,7 +3712,9 @@ WITNESSES = {
     "37": "clause (p): the oneDNN SDPA arms sit in routed branches; the plan is read only by route_admits",
     "38": "clause (p): the support decision has one home (switch read, shape function, fills, layer name, case line, charge side)",
 }
-WITNESSES_DEFERRED = {}
+
+# the witnesses that run as process-level checks in `--witnesses` rather than as matrix cases
+PROCESS_WITNESSES = ("f", "cmake", "m6", "m9", "m14", "r2m4", "r2m8", "s2d")
 
 
 def matrix_cases():
@@ -4529,6 +4678,7 @@ def matrix_cases():
     c.extend(matrix_cases_s2d1())
     c.extend(matrix_cases_s2d1b())
     c.extend(matrix_cases_s2d2())
+    c.extend(matrix_cases_s2d3())
     return c
 
 
@@ -4592,7 +4742,7 @@ void placement_plan_set_routed_head_maxima(placement_plan & plan, const std::vec
         params.K_type    = f.K_type;
         params.V_type    = f.V_type;
         params.kv_is_fp8 = ggml_sycl_fattn_kv_pair_of(params.K_type, params.V_type) == GGML_SYCL_FATTN_KV_PAIR_FP8;
-        if (!ggml_sycl_fattn_onednn_routed(params, false, nullptr, nullptr, f.head_dim_v)) {
+        if (!ggml_sycl_fattn_onednn_routed(params, f.head_dim_v, false, nullptr, nullptr)) {
             continue;
         }
         plan.planner_n_head_ctx_max = std::max(plan.planner_n_head_ctx_max, f.n_head);
@@ -4609,7 +4759,7 @@ size_t onednn_graph_scratch_bytes(const std::vector<kv_layer_facts> & layers) {
         params.K_type    = f.K_type;
         params.V_type    = f.V_type;
         params.kv_is_fp8 = ggml_sycl_fattn_kv_pair_of(params.K_type, params.V_type) == GGML_SYCL_FATTN_KV_PAIR_FP8;
-        if (!ggml_sycl_fattn_onednn_routed(params, false, nullptr, nullptr, f.head_dim_v)) {
+        if (!ggml_sycl_fattn_onednn_routed(params, f.head_dim_v, false, nullptr, nullptr)) {
             continue;
         }
         if (params.ne00 == 512) {
@@ -4655,15 +4805,19 @@ bool ggml_sycl_fattn_shape_supported(const fattn_params & p, int d_v) {
            (p.ne00 != 512 || ggml_sycl_fattn_d512_tile_admissible(nullptr));
 }
 
-bool ggml_sycl_fattn_onednn_route_enabled() {
-    return g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled;
-}
-
-bool ggml_sycl_fattn_onednn_route_admits(const fattn_params & p, bool multi_seq, void * ctx, ggml_sycl_onednn_fa_layout_plan * plan_out) {
-    if (!ggml_sycl_fattn_onednn_route_enabled()) {
+static bool ggml_sycl_fattn_onednn_route_enabled(const fattn_params & p) {
+    if (!g_sycl_fa_onednn_enabled || g_sycl_paged_v2_enabled) {
         return false;
     }
-    if (p.ne00 == 512 && !ggml_sycl_fa_onednn_d512_enabled()) {
+    static const bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();
+    if (p.ne00 == 512 && !d512_onednn_enabled) {
+        return false;
+    }
+    return true;
+}
+
+bool ggml_sycl_fattn_onednn_route_admits(const fattn_params & p, bool multi_seq, const ggml_backend_sycl_context * ctx, ggml_sycl_onednn_fa_layout_plan * plan_out) {
+    if (!ggml_sycl_fattn_onednn_route_enabled(p)) {
         return false;
     }
     const ggml_sycl_onednn_fa_layout_plan plan =
@@ -4675,15 +4829,29 @@ bool ggml_sycl_fattn_onednn_route_admits(const fattn_params & p, bool multi_seq,
            plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED;
 }
 
-bool ggml_sycl_fattn_onednn_routed(const fattn_params & p, bool multi_seq, void * ctx, ggml_sycl_onednn_fa_layout_plan * plan_out, int d_v) {
+bool ggml_sycl_fattn_onednn_routed(const fattn_params & p, int32_t d_v, bool multi_seq, const ggml_backend_sycl_context * ctx, ggml_sycl_onednn_fa_layout_plan * plan_out) {
     return ggml_sycl_fattn_onednn_route_admits(p, multi_seq, ctx, plan_out) && ggml_sycl_fattn_shape_supported(p, d_v);
 }
 
-bool ggml_sycl_fattn_onednn_dispatch_routed(const fattn_params & p, bool multi_seq, void * ctx, ggml_sycl_onednn_fa_layout_plan * plan_out) {
-    if (!ggml_sycl_fattn_onednn_route_enabled()) {
+bool ggml_sycl_fattn_onednn_dispatch_routed(ggml_backend_sycl_context & ctx, const fattn_params & p, int32_t d_v, bool multi_seq,
+                                            ggml_sycl_fattn_onednn_route_site site, ggml_sycl_fattn_onednn_route_result & out) {
+    out = {};
+    if (!ggml_sycl_fattn_onednn_route_enabled(p)) {
         return false;
     }
-    return ggml_sycl_fattn_onednn_routed(p, multi_seq, ctx, plan_out, 0);
+    if (ggml_sycl_onednn_graph_dispatch_declined(ctx, p)) {
+        out.stage = GGML_SYCL_FATTN_ONEDNN_ROUTE_STAGE_DECLINED;
+        unified_cache_count_onednn_graph_mask_declined(ctx.device, static_cast<int>(site));
+        return false;
+    }
+    out.stage = GGML_SYCL_FATTN_ONEDNN_ROUTE_STAGE_PLANNED;
+    return ggml_sycl_fattn_onednn_routed(p, d_v, multi_seq, &ctx, &out.plan);
+}
+"""
+B1_ONEDNN_TAIL = """
+bool ggml_sycl_onednn_graph_dispatch_declined(ggml_backend_sycl_context & ctx, const fattn_params & p) {
+    return onednn_graph_allocator_enabled() &&
+           ggml_sycl_onednn_graph_interim_gate(ctx, p.kv_layer, onednn_graph_scratch_term_bytes(p.ne02, p.ne01, p.ne11));
 }
 """
 B1_COMMON_TAIL = """
@@ -4720,7 +4888,15 @@ def replace_regex(rel, pattern, new, count):
     return f
 
 
-ROUTE_GATE = "ggml_sycl_fattn_onednn_dispatch_routed(params, params.n_seqs > 1, &ctx, nullptr)"
+def route_call(site, d_v="d_v"):
+    return "ggml_sycl_fattn_onednn_dispatch_routed(ctx, params, %s, multi_seq, GGML_SYCL_FATTN_ONEDNN_ROUTE_SITE_%s, route)" % (d_v, site)
+
+
+GATE_DEFAULT, GATE_D512 = route_call("DEFAULT"), route_call("D512", "V->ne[0]")
+FORCE_OPEN = ('if (strcmp(force, "onednn") == 0) {\n                force_known = true;\n'
+              "                const bool multi_seq = (params.n_seqs > 1);\n                ggml_sycl_fattn_onednn_route_result route;\n"
+              "                const bool routed = " + route_call("FORCE") + ";\n"
+              "                const ggml_sycl_onednn_fa_layout_plan & plan = route.plan;\n                if (routed) {\n")
 FILL_LINE = "params.kv_is_fp8 = ggml_sycl_fattn_kv_pair_of(params.K_type, params.V_type) == GGML_SYCL_FATTN_KV_PAIR_FP8;"
 
 
@@ -4735,14 +4911,15 @@ def b1_tree(files, keep_test_reads=False):
                      "    params.n_seqs    = 0;", "    ggml_sycl_fattn_apply_shape(params, dst);\n    params.n_seqs    = 0;"),
         replace_once("fattn.cpp", "    params.kv_is_fp8 = (ggml_sycl_type_is_fp8_e4m3(K->type) && ggml_sycl_type_is_fp8_e4m3(V->type));\n\n"
                      "    // Multi-token decode support", "    " + FILL_LINE + "\n\n    // Multi-token decode support"),
-        replace_regex("fattn.cpp", r"ggml_sycl_flash_attn_ext_onednn_plan\((?=\s*params)", "ggml_sycl_fattn_routed_plan(", 4),
-        replace_once("fattn.cpp", 'strcmp(force, "onednn") == 0 && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {',
-                     'strcmp(force, "onednn") == 0 && ' + ROUTE_GATE + ") {"),
+        replace_between("fattn.cpp", 'if (strcmp(force, "onednn") == 0 && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {',
+                        '                    GGML_SYCL_KTRACE("fattn FORCE=onednn"', FORCE_OPEN),
+        replace_regex("fattn.cpp", r"ggml_sycl_flash_attn_ext_onednn_plan\((?=\s*params)", "ggml_sycl_fattn_routed_plan(", 3),
         replace_once("fattn.cpp", "if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {",
-                     "if (!safe_decode && " + ROUTE_GATE + ") {"),
+                     "if (!safe_decode && " + GATE_DEFAULT + ") {"),
         replace_once("fattn.cpp", "if (d512_onednn_enabled && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {",
-                     "if (" + ROUTE_GATE + ") {"),
+                     "if (d512_onednn_enabled && " + GATE_D512 + ") {"),
         append_to("fattn.cpp", B1_FATTN_TAIL),
+        append_to("fattn-onednn.cpp", B1_ONEDNN_TAIL),
         append_to("common.cpp", B1_COMMON_TAIL),
         append_to("unified-cache.cpp", B1_LOADFILL),
         replace_once("ggml-sycl.cpp", '    const char * prefix_k = "cache_k_l";\n    const char * prefix_v = "cache_v_l";\n'
@@ -5009,17 +5186,152 @@ def matrix_cases_s2d1b():
     return c
 
 
+def matrix_cases_s2d3():
+    """The S2d review fold: each case plants a respelling or a conformant shape the first S2d matrix did not."""
+    c = []
+    A = c.append
+    CALL = "DnnlGemmWrapper::row_gemm(ctx, 1, 2, 3, a, t, b, t, d, t, q, 4)"
+
+    def body(stmt, name="zzplant_n"):
+        return "void %s(ggml_backend_sycl_context & ctx) {\n    %s\n}\n" % (name, stmt)
+
+    def b1(*muts):
+        return chain(b1_tree, *muts)
+
+    def b2(*muts):
+        return chain(b2_tree, *muts)
+
+    ROUTED_CALL = "if (!ggml_sycl_fattn_onednn_routed(params, f.head_dim_v, false, nullptr, nullptr)) {"
+    HATCH = "    if (p.ne00 == 512 && !d512_onednn_enabled) {\n        return false;\n    }\n"
+    SHAPE_CALL = "    const fattn_params p = ggml_sycl_fattn_shape_of(dst);\n"
+    DECLINE = ("    if (ggml_sycl_onednn_graph_dispatch_declined(ctx, p)) {\n        out.stage = GGML_SYCL_FATTN_ONEDNN_ROUTE_STAGE_DECLINED;\n"
+               "        unified_cache_count_onednn_graph_mask_declined(ctx.device, static_cast<int>(site));\n        return false;\n    }\n")
+    # I-1: the value function's predicate calls, in the design's argument order
+    A(Case("37", "the value function calling the predicate a second time with a context (b2)", b2(replace_once(
+        "unified-cache.cpp", "    return d512;\n",
+        "    (void) ggml_sycl_fattn_onednn_routed(params, 0, false, &ctx, nullptr);\n    return d512;\n")),
+        "FAIL", "P-ROUTE", "value-predicate", planted=False))
+    A(Case("37", "the value function making no call of the predicate (b2)", b2(replace_once(
+        "unified-cache.cpp", ROUTED_CALL, "if (false) {")), "FAIL", "P-ROUTE", "makes no call", planted=False))
+    A(Case("37", "the value function's predicate call with the design's order and nullptr, nullptr last (control)", b2(),
+           "PASS", planted=False, active="p-charge"))
+    # I-4: the decline read comes before the routed call
+    A(Case("37", "the routing function with no read of the decline", b1(replace_once("fattn.cpp", DECLINE, "")),
+           "FAIL", "P-ROUTE", "decline-read", planted=False))
+    A(Case("37", "the routing function calling the predicate before it reads the decline", b1(replace_once(
+        "fattn.cpp", DECLINE, "    (void) ggml_sycl_fattn_onednn_routed(p, d_v, multi_seq, &ctx, &out.plan);\n" + DECLINE)),
+        "FAIL", "P-ROUTE", "decline-order", planted=False))
+    A(Case("37", "the routing function with the design's decline-first body (control)", b1(), "PASS", planted=False, active="p-route"))
+    # I-2 / I-3: the hatch is latched in a function-local static; only that exact text is exempt
+    A(Case("38", "the hatch in its nested-if form (control)", b1(replace_once(
+        "fattn.cpp", HATCH, "    if (p.ne00 == 512) {\n        if (!d512_onednn_enabled) {\n            return false;\n        }\n    }\n")),
+        "PASS", planted=False, active="p-home"))
+    A(Case("38", "the hatch with its operands swapped (control)", b1(replace_once(
+        "fattn.cpp", HATCH, "    if (!d512_onednn_enabled && p.ne00 == 512) {\n        return false;\n    }\n")),
+        "PASS", planted=False, active="p-home"))
+    A(Case("38", "a head dim literal OR-ed into the hatch condition", b1(replace_once(
+        "fattn.cpp", HATCH, "    if (p.ne00 == 512 && !d512_onednn_enabled || p.ne00 == 80) {\n        return false;\n    }\n")),
+        "FAIL", "P-HOME", "head-dim-literal", planted=False))
+    A(Case("38", "a head dim literal in the nested hatch's outer condition", b1(replace_once(
+        "fattn.cpp", HATCH, "    if (p.ne00 == 512 || p.ne00 == 80) {\n        if (!d512_onednn_enabled) {\n            return false;\n        }\n    }\n")),
+        "FAIL", "P-HOME", "head-dim-literal", planted=False))
+    # m-3: the other spellings of a support clause in the supported / route bodies
+    for label, text in (
+            ("a switch over a GGML_TYPE case", "    switch (dst->src[0]->type) {\n        case GGML_TYPE_F16:\n            return false;\n        default:\n            break;\n    }\n"),
+            ("a case of a head dim literal", "    switch (p.ne00) {\n        case 64:\n            return false;\n        default:\n            break;\n    }\n"),
+            ("a head dim compared with a named constant", "    constexpr int kD = 80;\n    if (p.ne00 == kD) {\n        return false;\n    }\n"),
+            ("a head dim reduced modulo a literal", "    if (p.ne00 % 64 != 0) {\n        return false;\n    }\n"),
+            ("an fp8 type test", "    if (ggml_sycl_type_is_fp8_e4m3(dst->src[0]->type)) {\n        return false;\n    }\n")):
+        A(Case("38", "%s in ggml_sycl_flash_attn_ext_supported" % label, b1(replace_once("fattn.cpp", SHAPE_CALL, SHAPE_CALL + text)),
+               "FAIL", "P-HOME", "ggml_sycl_flash_attn_ext_supported", planted=False))
+    # I-6: the charge side's head-dim literals, in the old code's spelling and as extra D512 comparisons
+    for label, text in (("dst->src[0]->ne[0] == 80", "        if (dst->src[0]->ne[0] == 80) {\n            continue;\n        }\n"),
+                        ("f.head_dim_k != 80", "        if (f.head_dim_k != 80) {\n            continue;\n        }\n"),
+                        ("src0->ne[0] != 128", "        if (src0->ne[0] != 128) {\n            continue;\n        }\n")):
+        A(Case("38", "the charge side comparing %s" % label, b1(replace_once(
+            "unified-cache.cpp", "        " + ROUTED_CALL, text + "        " + ROUTED_CALL)), "FAIL", "P-CHARGE", "literal", planted=False))
+    A(Case("38", "a second D512 comparison that is not an if-line in the value function (b2)", b2(replace_once(
+        "unified-cache.cpp", "        if (params.ne00 == 512) {\n            ++d512;\n        }\n",
+        "        const bool zz512 = params.ne00 == 512;\n        if (params.ne00 == 512) {\n            ++d512;\n        }\n")),
+        "FAIL", "P-CHARGE", "d512-count", planted=False))
+    # I-5: a result consumed by nothing, in the expression forms the walk must follow
+    A(Case("35", "row_gemm's result as the right operand of a discarded &&", plant(body("ok && " + CALL + ";")), "FAIL", "N-VOID", "DnnlGemmWrapper::row_gemm"))
+    A(Case("35", "row_gemm's result as the right operand of a discarded ||", plant(body("ok || " + CALL + ";")), "FAIL", "N-VOID", "DnnlGemmWrapper::row_gemm"))
+    A(Case("35", "row_gemm's result as an arm of a discarded ?:", plant(body("ok ? " + CALL + " : sycl::event();")), "FAIL", "N-VOID", "DnnlGemmWrapper::row_gemm"))
+    A(Case("35", "row_gemm's result as a for-loop increment", plant(body("for (int i = 0; i < 2; " + CALL + ") {\n    }")), "FAIL", "N-VOID", "DnnlGemmWrapper::row_gemm"))
+    A(Case("35", "row_gemm reached through a using alias of its class, discarded", plant(
+        "using W = DnnlGemmWrapper;\nvoid zzplant_n(ggml_backend_sycl_context & ctx) {\n    W::row_gemm(ctx, 1, 2, 3, a, t, b, t, d, t, q, 4);\n}\n"),
+        "FAIL", "N-VOID", "row_gemm"))
+    A(Case("35", "row_gemm reached through a typedef of its class, discarded", plant(
+        "typedef DnnlGemmWrapper W2;\nvoid zzplant_n(ggml_backend_sycl_context & ctx) {\n    W2::row_gemm(ctx, 1, 2, 3, a, t, b, t, d, t, q, 4);\n}\n"),
+        "FAIL", "N-VOID", "row_gemm"))
+    A(Case("35", "row_gemm's result consumed through &&, ?: and a call argument (control)", plant(
+        "bool zzplant_n(ggml_backend_sycl_context & ctx) {\n    const bool a1 = ok && " + CALL + ";\n    const auto a2 = ok ? " + CALL + " : sycl::event();\n"
+        "    consume(" + CALL + ");\n    return ok && " + CALL + ";\n}\n"), "PASS"))
+    # m-5: a listed twin beside the unlisted member
+    A(Case("35", "an unlisted member beside a listed, consumed twin: the listed one is checked, the other is not (control)", plant(
+        "struct DnnlGemmWrapper {\n    static void zz_unlisted(int a) {\n        zz_other(a);\n    }\n    [[nodiscard]] static int gemm(int a);\n"
+        "    static int zz_use(int a) {\n        return gemm(a);\n    }\n};\n"), "PASS", planted=False, active="n"))
+    A(Case("35", "the listed twin without [[nodiscard]] beside an unlisted member", plant(
+        "struct DnnlGemmWrapper {\n    static void zz_unlisted(int a) {\n    }\n    static int gemm(int a);\n};\n"),
+        "FAIL", "N-NODISCARD", "DnnlGemmWrapper::gemm"))
+    # I-8 (a): a subject named as a type is not invisible
+    RET = "void onednn_w_retry_lost_cas() {\n}\n"
+    for label, text in (("a using alias of a function pointer", "using ggml_sycl_replan_token_held = bool (*)(int);\n"),
+                        ("a typedef of a function pointer", "typedef bool (*ggml_sycl_replan_token_held)(int);\n"),
+                        ("a functor struct", "struct ggml_sycl_replan_token_held {\n    bool operator()(int) const;\n};\n")):
+        A(Case("28", "the accessor spelled as %s: the latch fails" % label, plant(text + RET), "FAIL", "X-LATCH", "latch:i", planted=False))
+    # I-8 (c): a retired function spelled where the definition matcher cannot see it
+    ACC = "bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind) {\n    return true;\n}\n"
+    A(Case("28", "the retired retry spelled as a lambda variable beside the accessor: the latch fails", plant(
+        ACC + "static auto onednn_w_retry_lost_cas = []() {};\n"), "FAIL", "X-LATCH", "latch:i", planted=False))
+    A(Case("28", "the retired retry spelled as a macro beside the accessor: the latch fails", plant(
+        ACC + "#define onednn_w_retry_lost_cas() 0\n"), "FAIL", "X-LATCH", "latch:i", planted=False))
+    A(Case("31", "the retired busy return spelled as a lambda variable beside the accessor: the latch fails", plant(
+        ACC + "static auto onednn_pp_a_relock_busy_pre_l0 = []() {};\n"), "FAIL", "X-LATCH", "latch:i", planted=False))
+    # I-8 (d): the selector's eligibility call spelled as a macro or taken by address
+    A(Case("27", "zone_is_onednn_reorder_eligible spelled as a macro: the latch fails", plant(
+        "#define ELIG(t) zone_is_onednn_reorder_eligible(t)\n"), "FAIL", "X-LATCH", "latch:j", planted=False))
+    A(Case("27", "zone_is_onednn_reorder_eligible taken by address: the latch fails", plant(
+        "bool zzplant_select() {\n    auto f = &zone_is_onednn_reorder_eligible;\n    return f != nullptr;\n}\n"), "FAIL", "X-LATCH", "latch:j", planted=False))
+    # I-8 (b): clause (k)'s subjects spelled where its matcher cannot see them
+    INTERIM = "bool onednn_pp_a_reclaim_query_interim() {\n    return false;\n}\n"
+    A(Case("30", "the reap spelled as a macro: the latch fails", plant("#define release_retained_referencing(h, m) 0\n" + INTERIM),
+           "FAIL", "X-LATCH", "latch:k", planted=False))
+    A(Case("30", "the transaction spelled as a lambda variable: the latch fails", plant(
+        "static auto ggml_sycl_run_runtime_context_transaction = []() {};\n" + INTERIM), "FAIL", "X-LATCH", "latch:k", planted=False))
+    A(Case("30", "the COMPLETE mode held in a constexpr alias: the latch fails", plant(
+        "constexpr auto REAP_NOW = RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER;\n" + INTERIM), "FAIL", "X-LATCH", "latch:k", planted=False))
+    A(Case("30", "the COMPLETE mode behind a macro: the latch fails", plant(
+        "#define REAP_NOW RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER\n" + INTERIM), "FAIL", "X-LATCH", "latch:k", planted=False))
+    # m-1: the sixth allocation site of witness 9
+    A(Case("9", "load_reorder_temp_bytes defined, but unified_cache::reserve_reorder_temp does not call it", plant(
+        "size_t load_reorder_temp_bytes(int n) {\n    return (size_t) n;\n}\n"), "FAIL", "Z9-SITE", "unified_cache::reserve_reorder_temp"))
+    # m-4: an allowlist entry can never exempt an S2d finding that must be fixed
+    for code in ("X-LATCH", "P-ROUTE", "P-CHARGE"):
+        A(Case("m5", "an allowlist entry for %s is refused" % code, lambda f: f, "FAIL", "allowlist", "never exempted",
+               edit_allowlist=with_allow((code, "fattn.cpp", "zz"))))
+    return c
+
+
 def s2d_witnesses(files, allowlist, debt):
     """The census table is data: with appendix-rows.json missing the gate fails naming M-DATA, never passes."""
     import tempfile
     out = []
     saved = S2D_DATA["dir"]
+    real = (Path(saved) if saved else Path(__file__).resolve().parent / "sycl-alloc-zone-contract") / "appendix-rows.json"
+    doc = json.loads(real.read_text())
+    short = dict(doc, rows=[{k: v for k, v in doc["rows"][0].items() if k != "zone"}] + doc["rows"][1:])
     try:
-        with tempfile.TemporaryDirectory() as d:
-            S2D_DATA["dir"] = d
-            fails, _, _, _ = run_gate(files, allowlist, debt)
-        out.append(("a missing appendix-rows.json fails (M-DATA), it does not pass", any(names_new(f, "M-DATA") for f in fails),
-                    "%d finding(s)" % len(fails)))
+        for label, text in (("a missing appendix-rows.json", None), ("an appendix-rows.json that is not JSON", "{not json"),
+                            ("an appendix-rows.json with a row that lacks its zone", json.dumps(short))):
+            with tempfile.TemporaryDirectory() as d:
+                if text is not None:
+                    (Path(d) / "appendix-rows.json").write_text(text)
+                S2D_DATA["dir"] = d
+                fails, _, _, _ = run_gate(files, allowlist, debt)
+            out.append(("%s fails (M-DATA), it does not pass or raise" % label, any(names_new(f, "M-DATA") for f in fails),
+                        "%d finding(s)" % len(fails)))
     finally:
         S2D_DATA["dir"] = saved
     fails, _, _, stats = run_gate(files, allowlist, debt)
@@ -5046,9 +5358,10 @@ def matrix_cases_s2d2():
         return on(b2_tree, *muts)
 
     SHAPE_CALL = "    const fattn_params p = ggml_sycl_fattn_shape_of(dst);\n"
-    ROUTED_CALL = "if (!ggml_sycl_fattn_onednn_routed(params, false, nullptr, nullptr, f.head_dim_v)) {"
+    ROUTED_CALL = "if (!ggml_sycl_fattn_onednn_routed(params, f.head_dim_v, false, nullptr, nullptr)) {"
     FLASH_OPEN = "void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor safe_dst) {\n"
-    DEFAULT_ARM = "if (!safe_decode && " + ROUTE_GATE + ") {"
+    DEFAULT_ARM = "if (!safe_decode && " + GATE_DEFAULT + ") {"
+    D512_ARM = "if (d512_onednn_enabled && " + GATE_D512 + ") {"
     # 37: the default oneDNN SDPA arm and the route
     A(Case("37", "the default arm restored to its inline flag test and direct plan call", b1(
         replace_once("fattn.cpp", DEFAULT_ARM, "if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {"),
@@ -5059,15 +5372,16 @@ def matrix_cases_s2d2():
         replace_once("fattn.cpp", "plan      = ggml_sycl_fattn_routed_plan(params,", "plan      = ggml_sycl_flash_attn_ext_onednn_plan(params,")),
         "FAIL", "P-ROUTE", "plan-call", planted=False))
     A(Case("37", "the default arm's branch also tests g_sycl_fa_onednn_enabled", b1(
-        replace_once("fattn.cpp", DEFAULT_ARM, "if (!safe_decode && g_sycl_fa_onednn_enabled && " + ROUTE_GATE + ") {")),
+        replace_once("fattn.cpp", DEFAULT_ARM, "if (!safe_decode && g_sycl_fa_onednn_enabled && " + GATE_DEFAULT + ") {")),
         "FAIL", "P-ROUTE", "onednn-call", planted=False))
     A(Case("37", "the default arm's branch also tests g_sycl_paged_v2_enabled", b1(
-        replace_once("fattn.cpp", DEFAULT_ARM, "if (!safe_decode && !g_sycl_paged_v2_enabled && " + ROUTE_GATE + ") {")),
+        replace_once("fattn.cpp", DEFAULT_ARM, "if (!safe_decode && !g_sycl_paged_v2_enabled && " + GATE_DEFAULT + ") {")),
         "FAIL", "P-ROUTE", "onednn-call", planted=False))
-    A(Case("37", "the d512 arm's branch also tests ggml_sycl_fa_onednn_d512_enabled()", b1(
-        replace_once("fattn.cpp", "if (" + ROUTE_GATE + ") {\n            const bool                            multi_seq = (params.n_seqs > 1);",
-                     "if (ggml_sycl_fa_onednn_d512_enabled() && " + ROUTE_GATE + ") {\n            const bool                            multi_seq = (params.n_seqs > 1);")),
+    A(Case("37", "the d512 arm's branch also tests g_sycl_fa_onednn_enabled", b1(
+        replace_once("fattn.cpp", D512_ARM, "if (d512_onednn_enabled && g_sycl_fa_onednn_enabled && " + GATE_D512 + ") {")),
         "FAIL", "P-ROUTE", "onednn-call", planted=False))
+    A(Case("37", "the d512 arm without its own d512_onednn_enabled local: the routed branch alone is conformant (control)", b1(
+        replace_once("fattn.cpp", D512_ARM, "if (" + GATE_D512 + ") {")), "PASS", planted=False, active="p-route"))
     A(Case("37", "the plan called directly in a new function of fattn.cpp", b1(append_to(
         "fattn.cpp", "void zzplant_p(const fattn_params & p) {\n    (void) ggml_sycl_flash_attn_ext_onednn_plan(p, 1, 1, false, false);\n}\n")),
         "FAIL", "P-ROUTE", "zzplant_p"))
@@ -5078,12 +5392,12 @@ def matrix_cases_s2d2():
         "fattn.cpp", "bool zzplant_p(const fattn_params & p) {\n    return ggml_sycl_fattn_onednn_route_admits(p, false, nullptr, nullptr);\n}\n")),
         "FAIL", "P-ROUTE", "zzplant_p"))
     A(Case("37", "the route's static gate called outside route_admits and the routing function", b1(append_to(
-        "fattn.cpp", "bool zzplant_p() {\n    return ggml_sycl_fattn_onednn_route_enabled();\n}\n")), "FAIL", "P-ROUTE", "zzplant_p"))
+        "fattn.cpp", "bool zzplant_p(const fattn_params & p) {\n    return ggml_sycl_fattn_onednn_route_enabled(p);\n}\n")), "FAIL", "P-ROUTE", "zzplant_p"))
     A(Case("37", "the value function calling the plan directly (b2)", b2(replace_once(
         "unified-cache.cpp", "    return d512;\n", "    (void) ggml_sycl_flash_attn_ext_onednn_plan(params, 1, 1, false, false);\n    return d512;\n")),
         "FAIL", "P-ROUTE", "value-plan", planted=False))
     A(Case("37", "the value function giving the predicate a context (b2)", b2(replace_once(
-        "unified-cache.cpp", ROUTED_CALL, "if (!ggml_sycl_fattn_onednn_routed(params, false, &ctx, nullptr, f.head_dim_v)) {")),
+        "unified-cache.cpp", ROUTED_CALL, "if (!ggml_sycl_fattn_onednn_routed(params, f.head_dim_v, false, &ctx, nullptr)) {")),
         "FAIL", "P-ROUTE", "value-predicate", planted=False))
     A(Case("37", "the b1 tree: every arm sits in a routed branch (control)", b1(), "PASS", planted=False, active="p-route"))
     A(Case("37", "today's tree: the inline arms are not yet a finding, the clause is dormant (control)", lambda f: f, "PASS", planted=False,
@@ -5110,8 +5424,9 @@ def matrix_cases_s2d2():
         "fattn.cpp", "&& ggml_sycl_fattn_shape_supported(p, d_v);", "&& ggml_sycl_fattn_shape_supported(p, d_v) && p.ne00 != 80;")),
         "FAIL", "P-HOME", "routed-body", planted=False))
     A(Case("38", "std::getenv of the switch planted in the route's static gate (the read count is 2)", b1(replace_once(
-        "fattn.cpp", "    return g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled;\n",
-        '    const char * zz_env = std::getenv("GGML_SYCL_FLASH_ATTN_EXT");\n    return zz_env && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled;\n')),
+        "fattn.cpp", "    static const bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();\n    if (p.ne00 == 512",
+        '    const char * zz_env = std::getenv("GGML_SYCL_FLASH_ATTN_EXT");\n    if (zz_env == nullptr) {\n        return false;\n    }\n'
+        "    static const bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();\n    if (p.ne00 == 512")),
         "FAIL", "P-HOME", "is read at", planted=False))
     A(Case("38", "the switch read through a bare getenv in a source outside the scope", b1(plant(
         'void zz() {\n    const char * e = getenv( "GGML_SYCL_FLASH_ATTN_EXT" );\n}\n', "repo/zz-read.cpp")),
@@ -5133,7 +5448,7 @@ def matrix_cases_s2d2():
         "fattn.cpp", FLASH_OPEN, "    (void) ggml_sycl_fattn_d512_tile_admissible(nullptr);\n")),
         "FAIL", "P-HOME", "tile-dispatch-sites", planted=False))
     A(Case("38", "the route's hatch without the d512 flag: a head dim literal in route_admits", b1(replace_once(
-        "fattn.cpp", "    if (p.ne00 == 512 && !ggml_sycl_fa_onednn_d512_enabled()) {", "    if (p.ne00 == 512) {")),
+        "fattn.cpp", "    if (p.ne00 == 512 && !d512_onednn_enabled) {", "    if (p.ne00 == 512) {")),
         "FAIL", "P-HOME", "head-dim-literal", planted=False))
     A(Case("38", "ggml_sycl_fattn_kv_pair_of called outside the shape function and the fills", b1(append_to(
         "fattn.cpp", "int zzplant_p(const fattn_params & p) {\n    return (int) ggml_sycl_fattn_kv_pair_of(p.K_type, p.V_type);\n}\n")),
@@ -5430,10 +5745,15 @@ def cmake_witness(root):
              if "test-sycl-alloc-zone-contract-m" in m.group(3)]
     loop = loops[0] if len(loops) == 1 else None
     plain_props = re.findall(r"set_tests_properties\(test-sycl-alloc-zone-contract PROPERTIES[^)]*\)", text)
-    ok = len(plain) == 1 and "--mutation-matrix" not in plain[0] and loop is not None \
+    wit = [m.group(0) for m in re.finditer(r"add_test\(NAME test-sycl-alloc-zone-contract-w\s[^)]*\)", text, flags=re.S)]
+    wit_props = re.findall(r"set_tests_properties\(test-sycl-alloc-zone-contract-w PROPERTIES[^)]*\)", text)
+    ok = len(wit) == 1 and "--witnesses" in wit[0] and "--mutation-matrix" not in wit[0] and len(wit_props) == 1 \
+        and 'LABELS "sycl;host-only;ast;mutation"' in wit_props[0] and re.search(r"\bTIMEOUT\s+600\b", wit_props[0]) is not None
+    detail = "%d witnesses registration(s)" % len(wit)
+    ok = ok and len(plain) == 1 and "--mutation-matrix" not in plain[0] and loop is not None \
         and len(plain_props) == 1 and 'LABELS "sycl;host-only;ast"' in plain_props[0] \
         and re.search(r"\bTIMEOUT\s+120\b", plain_props[0]) is not None
-    detail = "%d plain registration(s)" % len(plain)
+    detail += ", %d plain registration(s)" % len(plain)
     if loop is not None:
         var, idx, body = loop.group(1), [int(x) for x in loop.group(2).split()], loop.group(3)
         m = re.search(r"--shard\s+\$\{%s\}/(\d+)" % re.escape(var), body)
@@ -5444,7 +5764,7 @@ def cmake_witness(root):
             and len(props) == 1 and re.search(r"\bTIMEOUT\s+600\b", props[0]) is not None \
             and 'LABELS "sycl;host-only;ast;mutation"' in props[0]
         detail += ", %d shard(s) of %d, timeout %s" % (len(idx), n, "set" if props and "TIMEOUT" in props[0] else "MISSING")
-    region = "".join(plain) + (loop.group(0) if loop is not None else "")
+    region = "".join(plain) + "".join(wit) + (loop.group(0) if loop is not None else "")
     ok = ok and "--write-debt" not in region and "--allow-growth" not in region
     return ok, detail
 
@@ -5456,12 +5776,18 @@ def cmake_mutants(root):
     rel = "ggml/src/ggml-sycl/CMakeLists.txt"
     text = (Path(root) / rel).read_text()
     mutants = [
-        ("drops shard 3 from the foreach", lambda t: t.replace("foreach(zc_shard 0 1 2 3)", "foreach(zc_shard 0 1 2)", 1)),
-        ("passes the wrong shard count", lambda t: t.replace("${zc_shard}/4", "${zc_shard}/5", 1)),
+        ("drops the last shard from the foreach", lambda t: t.replace(
+            "foreach(zc_shard %s)" % " ".join(str(i) for i in range(SHARDS)), "foreach(zc_shard %s)" % " ".join(str(i) for i in range(SHARDS - 1)), 1)),
+        ("passes the wrong shard count", lambda t: t.replace("${zc_shard}/%d" % SHARDS, "${zc_shard}/%d" % (SHARDS + 1), 1)),
+        ("loses the witnesses test", lambda t: t.replace("add_test(NAME test-sycl-alloc-zone-contract-w\n", "add_test(NAME test-sycl-alloc-zone-contract-x\n", 1)),
+        ("runs the matrix in the witnesses test", lambda t: t.replace("--witnesses)", "--witnesses --mutation-matrix)", 1)),
+        ("loses the witnesses test's TIMEOUT", lambda t: t.replace('test-sycl-alloc-zone-contract-w PROPERTIES LABELS "sycl;host-only;ast;mutation" TIMEOUT 600',
+                                                                    'test-sycl-alloc-zone-contract-w PROPERTIES LABELS "sycl;host-only;ast;mutation"', 1)),
         ("passes --write-debt to a shard", lambda t: t.replace("--mutation-matrix --shard", "--write-debt --mutation-matrix --shard", 1)),
         ("loses the plain gate's test", lambda t: t.replace("add_test(NAME test-sycl-alloc-zone-contract\n", "add_test(NAME test-sycl-alloc-zone-contract-x\n", 1)),
         ("drops the plain gate's TIMEOUT", lambda t: t.replace('PROPERTIES LABELS "sycl;host-only;ast" TIMEOUT 120)', 'PROPERTIES LABELS "sycl;host-only;ast")', 1)),
-        ("loses a shard's TIMEOUT", lambda t: t.replace('"sycl;host-only;ast;mutation" TIMEOUT 600', '"sycl;host-only;ast;mutation"', 1)),
+        ("loses a shard's TIMEOUT", lambda t: t.replace('-m${zc_shard} PROPERTIES LABELS "sycl;host-only;ast;mutation" TIMEOUT 600',
+                                                       '-m${zc_shard} PROPERTIES LABELS "sycl;host-only;ast;mutation"', 1)),
         ("runs the matrix in the plain test", lambda t: t.replace("../../..)\n    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES",
                                                                     "../../.. --mutation-matrix)\n    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES", 1)),
     ]
@@ -5517,18 +5843,12 @@ def parse_shard(text):
     return k, n
 
 
-def run_matrix(files, allowlist, debt, root, shard=None):
-    """`shard` is (k, n) or None. Every shard re-checks the unmutated baseline and runs its slice of the cases. Shard 0 also
-    runs the coverage checks (every witness has a FAIL case, no case names an unknown witness, the matcher's self-test)
-    and the process-level witnesses, so the whole matrix is still checked exactly once; a plain run is shard 0 of 1."""
+def run_matrix(files, allowlist, debt, shard=None):
+    """`shard` is (k, n) or None. Every shard re-checks the unmutated baseline and runs its slice of the cases; a plain run
+    is shard 0 of 1. The coverage checks and the process-level witnesses run once, in `--witnesses`."""
     k, n = shard if shard else (0, 1)
-    fails, report, _, _ = run_gate(files, allowlist, debt)
-    if fails:
-        print("FAIL: the unmutated baseline is red, so a matrix scored against it proves nothing:")
-        for f in fails[:20]:
-            print("  " + f)
+    if not baseline_green(files, allowlist, debt):
         return 1
-    print("baseline: PASS (the matrix is scored against a green tree)")
     bad = 0
     all_cases = matrix_cases()
     cases = shard_slice(all_cases, k, n)
@@ -5536,21 +5856,6 @@ def run_matrix(files, allowlist, debt, root, shard=None):
         print("FAIL: shard %d/%d selects no case; an empty shard checks nothing" % (k, n))
         return 1
     print("shard %d/%d: %d of %d case(s)" % (k, n, len(cases), len(all_cases)))
-    if k == 0:
-        for w in sorted(set(c.wid for c in all_cases) - set(WITNESSES)):
-            print("FAIL: case witness %s is not in WITNESSES" % w)
-            bad += 1
-        for w in WITNESSES:
-            if w in ("f", "cmake", "m6", "m9", "m14", "r2m4", "r2m8", "s2d"):
-                continue
-            if not any(c.wid == w and c.expect == "FAIL" for c in all_cases):
-                print("FAIL: witness %s has no FAIL case" % w)
-                bad += 1
-        if WITNESSES_DEFERRED:
-            print("deferred: " + "; ".join("witness %s (%s)" % kv for kv in WITNESSES_DEFERRED.items()))
-        if not (names_new("FAIL new D-ZONE-COUNT x", "D-ZONE-COUNT") and not names_new("FAIL new D-ZONE-COUNT x", "D-ZONE")):
-            print("FAIL: the matcher's own self-test (prefix collision) is wrong")
-            bad += 1
     for case in cases:
         ok, got = evaluate_case(files, allowlist, debt, case)
         print("%s witness %-4s %-80s expect %s" % ("ok  " if ok else "FAIL", case.wid, case.label, case.expect))
@@ -5560,20 +5865,52 @@ def run_matrix(files, allowlist, debt, root, shard=None):
                 print("       got: " + g)
             if not got:
                 print("       got: PASS")
-    extra = []
-    if k == 0:
-        extra = [("f", "missing tree_sitter_language_pack exits 1 and names it") + f_witness_missing_pack(),
-                 ("m9", "an unscanned .inl file fails the gate") + m9_witness()]
-        extra += [("cmake", label, ok, d) for label, ok, d in cmake_mutants(root)]
-        extra += [("m6", label, ok, d) for label, ok, d in m6_witnesses()]
-        extra += [("r2m4", label, ok, d) for label, ok, d in r2m4_witnesses(allowlist)]
-        extra += [("r2m8", label, ok, d) for label, ok, d in r2m8_witnesses()]
-        extra += [("m14", label, ok, d) for label, ok, d in m14_witness(files, allowlist, debt)]
-        extra += [("s2d", label, ok, d) for label, ok, d in s2d_witnesses(files, allowlist, debt)]
+    print("matrix shard %d/%d: %d case(s), %d wrong" % (k, n, len(cases), bad))
+    return 1 if bad else 0
+
+
+def baseline_green(files, allowlist, debt):
+    fails, _, _, _ = run_gate(files, allowlist, debt)
+    if fails:
+        print("FAIL: the unmutated baseline is red, so a matrix scored against it proves nothing:")
+        for f in fails[:20]:
+            print("  " + f)
+        return False
+    print("baseline: PASS (the matrix is scored against a green tree)")
+    return True
+
+
+def run_witnesses(files, allowlist, debt, root):
+    """The coverage checks (every witness has a FAIL case, no case names an unknown witness, the matcher's self-test) and the
+    process-level witnesses. Run once, by its own ctest, so no matrix shard carries them."""
+    if not baseline_green(files, allowlist, debt):
+        return 1
+    bad = 0
+    all_cases = matrix_cases()
+    for w in sorted(set(c.wid for c in all_cases) - set(WITNESSES)):
+        print("FAIL: case witness %s is not in WITNESSES" % w)
+        bad += 1
+    for w in WITNESSES:
+        if w in PROCESS_WITNESSES:
+            continue
+        if not any(c.wid == w and c.expect == "FAIL" for c in all_cases):
+            print("FAIL: witness %s has no FAIL case" % w)
+            bad += 1
+    if not (names_new("FAIL new D-ZONE-COUNT x", "D-ZONE-COUNT") and not names_new("FAIL new D-ZONE-COUNT x", "D-ZONE")):
+        print("FAIL: the matcher's own self-test (prefix collision) is wrong")
+        bad += 1
+    extra = [("f", "missing tree_sitter_language_pack exits 1 and names it") + f_witness_missing_pack(),
+             ("m9", "an unscanned .inl file fails the gate") + m9_witness()]
+    extra += [("cmake", label, ok, d) for label, ok, d in cmake_mutants(root)]
+    extra += [("m6", label, ok, d) for label, ok, d in m6_witnesses()]
+    extra += [("r2m4", label, ok, d) for label, ok, d in r2m4_witnesses(allowlist)]
+    extra += [("r2m8", label, ok, d) for label, ok, d in r2m8_witnesses()]
+    extra += [("m14", label, ok, d) for label, ok, d in m14_witness(files, allowlist, debt)]
+    extra += [("s2d", label, ok, d) for label, ok, d in s2d_witnesses(files, allowlist, debt)]
     for wid, label, ok, detail in extra:
         print("%s witness %-4s %-80s (%s)" % ("ok  " if ok else "FAIL", wid, label, str(detail)[:80]))
         bad += 0 if ok else 1
-    print("matrix shard %d/%d: %d case(s), %d wrong" % (k, n, len(cases) + len(extra), bad))
+    print("witnesses: %d check(s), %d wrong" % (len(extra), bad))
     return 1 if bad else 0
 
 
@@ -5584,8 +5921,9 @@ def main():
     ap.add_argument("--root", default=str(Path(__file__).resolve().parent.parent))
     ap.add_argument("--data", default=None, help="directory holding allowlist.json and debt.json")
     ap.add_argument("--mutation-matrix", action="store_true")
-    ap.add_argument("--shard", default=None, metavar="K/N",
-                    help="with --mutation-matrix, run shard K of N (shard 0 also runs the coverage and process-level witnesses)")
+    ap.add_argument("--shard", default=None, metavar="K/N", help="with --mutation-matrix, run shard K of N")
+    ap.add_argument("--witnesses", action="store_true",
+                    help="run the coverage checks and the process-level witnesses (the cases are run by --mutation-matrix)")
     ap.add_argument("--list", action="store_true", help="print every finding before the allowlist and debt")
     ap.add_argument("--write-debt", action="store_true",
                     help="rewrite debt.json from the current tree; refuses to add entries. Never used by the ctest")
@@ -5593,8 +5931,10 @@ def main():
     a = ap.parse_args()
     if a.allow_growth and not a.write_debt:
         ap.error("--allow-growth only means something with --write-debt")
-    if a.mutation_matrix and (a.list or a.write_debt):
-        ap.error("--mutation-matrix cannot be combined with --list or --write-debt")
+    if (a.mutation_matrix or a.witnesses) and (a.list or a.write_debt):
+        ap.error("--mutation-matrix and --witnesses cannot be combined with --list or --write-debt")
+    if a.witnesses and (a.mutation_matrix or a.shard is not None):
+        ap.error("--witnesses is its own run, not a shard of the matrix")
     if a.shard is not None and not a.mutation_matrix:
         ap.error("--shard only means something with --mutation-matrix")
     shard = None
@@ -5655,7 +5995,9 @@ def main():
         return 1
     print("PASS: no new violation, no stale debt, no stale allowlist entry")
     if a.mutation_matrix:
-        return run_matrix(files, allowlist, debt, a.root, shard)
+        return run_matrix(files, allowlist, debt, shard)
+    if a.witnesses:
+        return run_witnesses(files, allowlist, debt, a.root)
     return 0
 
 
