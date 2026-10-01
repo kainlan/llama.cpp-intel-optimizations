@@ -17,6 +17,16 @@
 # split-input copy lands the activation in planned device memory before the
 # SYCL split runs. Weights stay in SYCL_Host and are untouched.
 #
+# The buft is SELECTED, not unconditional (owner ruling, llama.cpp-38af): a
+# default full-offload run has no CPU work, every input is read zero-copy out of
+# SYCL_Host, and a dedicated buft there would put '#' split-copy names into the
+# graph and trip the dkw0 replay-futility detector. So the backend exports ONE
+# predicate computed from its own placement plan (ggml_backend_sycl_plan_has_cpu_work:
+# a host-planned dense layer, host-planned KV, or a fully host-planned expert
+# tensor), llama-context ORs it with its own partial-offload test, and the choice
+# is re-made right before every ggml_backend_sched_new() because the auto-ubatch
+# resyncs re-plan after the constructor's buft enumeration.
+#
 # Each check documents its RED state against c9f464b48 (the commit this task
 # branched from). Run with --root <dir> to point at an extracted tree. With
 # --self-test every check is re-evaluated against a mutated copy of the text it
@@ -38,6 +48,10 @@ ctx_cpp = (root / "src/llama-context.cpp").read_text()
 
 BUFT_FN = "ggml_backend_sycl_cpu_activation_buffer_type"
 NAME_FN = BUFT_FN + "_name"
+PRED_FN = "ggml_backend_sycl_plan_has_cpu_work"
+PLAN_HELPER = "ggml_sycl_plan_has_cpu_work"
+CTX_PRED = "llama_context_sycl_plan_has_cpu_work"
+CTX_SELECT = "llama_context_cpu_compute_buft"
 
 
 def function_window(source: str, signature_anchor: str, window: int = 12000) -> str:
@@ -85,6 +99,14 @@ texts = {
     "ctx_cpu_branch": statement_window(
         ctx_cpp, "if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {", window=1800),
     "ctx_cpp": ctx_cpp,
+    "plan_helper": function_window(
+        sycl_cpp, "static bool " + PLAN_HELPER + "(const placement_plan & plan) {", window=8000),
+    "pred_fn": function_window(sycl_cpp, "bool " + PRED_FN + "(ggml_backend_dev_t dev) {"),
+    "ctx_select_fn": function_window(
+        ctx_cpp, "static ggml_backend_buffer_type_t " + CTX_SELECT + "(", window=4000),
+    "ctx_pred_fn": function_window(
+        ctx_cpp, "static bool " + CTX_PRED + "(ggml_backend_dev_t dev) {", window=3000),
+    "sched_reserve_fn": function_window(ctx_cpp, "void llama_context::sched_reserve() {", window=40000),
 }
 
 
@@ -132,13 +154,14 @@ def check_iii_context_selects_it(t):
     usm_arm = BUFT_FN + "()" in ctx and "#ifdef GGML_USE_SYCL" in ctx
     dl_arm = ('"' + BUFT_FN + '"' in ctx) and "ggml_backend_reg_get_proc_address" in ctx
     return (bool(branch)
-            and "llama_context_sycl_cpu_activation_buft(" in branch
+            and CTX_SELECT + "(" in branch
+            and "llama_context_sycl_cpu_activation_buft(" in t["ctx_select_fn"]
             and usm_arm
             and dl_arm)
 
 
 def witness_iii(t):
-    t["ctx_cpu_branch"] = t["ctx_cpu_branch"].replace("llama_context_sycl_cpu_activation_buft(", "unrelated(")
+    t["ctx_cpu_branch"] = t["ctx_cpu_branch"].replace(CTX_SELECT + "(", "unrelated(")
     return t
 
 
@@ -175,6 +198,83 @@ def witness_v(t):
     return t
 
 
+# --- (vi) the backend predicate is exported, computed from the plan, and is not
+# a constant. RED at c9f464b48: none of it exists.
+def check_vi_predicate_exported(t):
+    proc = t["get_proc_address_fn"]
+    return (bool(proc)
+            and ("GGML_BACKEND_API bool " + PRED_FN + "(ggml_backend_dev_t dev);") in t["sycl_h"]
+            and ('strcmp(name, "' + PRED_FN + '") == 0') in proc
+            and ("(void *) " + PRED_FN + ";") in proc)
+
+
+def witness_vi(t):
+    t["sycl_h"] = t["sycl_h"].replace(PRED_FN + "(ggml_backend_dev_t dev);", "unrelated_fn(ggml_backend_dev_t dev);")
+    return t
+
+
+def check_vi_predicate_reads_the_plan(t):
+    wrapper = t["pred_fn"]
+    helper = t["plan_helper"]
+    return (bool(wrapper) and bool(helper)
+            and "ggml_sycl_global_plan_snapshot()" in wrapper
+            and PLAN_HELPER + "(" in wrapper
+            and "layer_device" in helper        # host-planned dense layer
+            and "get_kv_device(" in helper      # host-planned KV
+            and "expert_on_device(" in helper   # fully host-planned expert tensor
+            and "return true;" in helper
+            and "return false;" in helper)
+
+
+def witness_vi_plan(t):
+    t["plan_helper"] = "{ return true; }"
+    return t
+
+
+# --- (vii) the llama-context wrapper reaches the predicate in BOTH arms.
+def check_vii_context_predicate_both_arms(t):
+    fn = t["ctx_pred_fn"]
+    return (bool(fn)
+            and "#if defined(GGML_USE_SYCL)" in fn
+            and PRED_FN + "(" in fn
+            and "#elif defined(GGML_BACKEND_DL)" in fn
+            and ('"' + PRED_FN + '"') in fn
+            and "llama_context_sycl_proc_addr(" in fn)
+
+
+def witness_vii(t):
+    t["ctx_pred_fn"] = t["ctx_pred_fn"].replace('"' + PRED_FN + '"', '"unrelated"')
+    return t
+
+
+# --- (viii) the selection is GATED by the predicate (backend plan OR partial
+# offload), so a constant-true / constant-false gate is RED; and it is re-made
+# before each ggml_backend_sched_new() in sched_reserve(), after the resyncs.
+def check_viii_selection_is_gated(t):
+    fn = t["ctx_select_fn"]
+    sched = t["sched_reserve_fn"]
+    if not fn or not sched:
+        return False
+    gate = fn.split("llama_context_sycl_cpu_activation_buft(", 1)[0]
+    new_idx = sched.find("ggml_backend_sched_new(")
+    sel_idx = sched.find(CTX_SELECT + "(")
+    return (CTX_PRED + "(" in gate
+            and "n_gpu_layers()" in gate
+            and "n_layer_all" in gate
+            and "||" in gate
+            and 0 <= sel_idx < new_idx)
+
+
+def witness_viii_gate(t):
+    t["ctx_select_fn"] = t["ctx_select_fn"].replace(CTX_PRED + "(", "true || (")
+    return t
+
+
+def witness_viii_order(t):
+    t["sched_reserve_fn"] = t["sched_reserve_fn"].replace(CTX_SELECT + "(", "unrelated(")
+    return t
+
+
 checks = [
     ("i: the CPU-activation buft is a host-buft clone with its own .get_name", check_i_distinct_identity, witness_i),
     ("ii: supports_buft never accepts it and still accepts SYCL_Host (weights keep their executor)",
@@ -184,6 +284,16 @@ checks = [
     ("iv: exported in ggml-sycl.h and through the backend proc-address table", check_iv_exported, witness_iv),
     ("v: the graph_compute debug whitelist does not admit it (tripwire for an uncopied activation)",
      check_v_not_whitelisted, witness_v),
+    ("vi-a: the plan predicate is exported in ggml-sycl.h and through the proc-address table",
+     check_vi_predicate_exported, witness_vi),
+    ("vi-b: the plan predicate reads layer_device / KV device / expert residency and is not a constant",
+     check_vi_predicate_reads_the_plan, witness_vi_plan),
+    ("vii: llama-context reaches the predicate in both the GGML_USE_SYCL and BACKEND_DL arms",
+     check_vii_context_predicate_both_arms, witness_vii),
+    ("viii-a: the buft selection is gated by (plan predicate OR partial offload)",
+     check_viii_selection_is_gated, witness_viii_gate),
+    ("viii-b: the selection is re-made before ggml_backend_sched_new() in sched_reserve()",
+     check_viii_selection_is_gated, witness_viii_order),
 ]
 
 failed = [name for name, check, _w in checks if not check(texts)]
