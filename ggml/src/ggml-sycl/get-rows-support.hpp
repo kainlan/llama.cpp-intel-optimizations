@@ -42,7 +42,7 @@ inline bool ggml_sycl_get_rows_type_supported(ggml_type type) {
 // Q4_K has an AoS kernel only. layout_policy::get_optimal returns AoS for Q4_K for every usage (its MMQ kernels
 // are AoS-only), so AoS is the one layout the planner materialises; a Q4_K table in any other layout is a pair
 // this function declines. The Q4_K GET_ROWS non-AoS layouts are a support gap to close with kernels, not a
-// routing problem: llama.cpp-qhfp-followup. Every other type keeps the arms it already had.
+// routing problem: llama.cpp-duke. Every other type keeps the arms it already had.
 inline bool ggml_sycl_get_rows_layout_supported(ggml_type type, ggml_layout_mode layout) {
     switch (type) {
         case GGML_TYPE_Q4_K:
