@@ -2227,8 +2227,8 @@ STRICT_SWITCH_SUFFIXES = {".c", ".cpp", ".h", ".hpp"}
 # Assembled, so a grep of the tree finds the one real reader and no mention of
 # the retired switch. The quoted name, closing quote included, appears only
 # where the variable is read: every message that names it says "=1".
-STRICT_LEASES_LITERAL = '"GGML_SYCL_STRICT_' + 'LEASES"'
-RETIRED_STRICT_SWITCH = "GGML_SYCL_STRICT_" + "PLAN"
+STRICT_LEASES_LITERAL = '"GGML_SYCL_' + 'STRICT_LEASES"'
+RETIRED_STRICT_SWITCH = "GGML_SYCL_" + "STRICT_PLAN"
 STRICT_ACCESSOR = "ggml_sycl_strict_enabled"
 STRICT_ACCESSOR_USE = re.compile(r"(?:::)?(?:ggml_sycl::)?\bggml_sycl_strict_enabled\s*\(\s*\)")
 STRICT_CACHE_CPP = "ggml/src/ggml-sycl/unified-cache.cpp"
