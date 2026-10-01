@@ -111514,6 +111514,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_measure_plan_override_clear") == 0) {
         return (void *) ggml_backend_sycl_measure_plan_override_clear;
     }
+    if (strcmp(name, "ggml_backend_sycl_measure_backend_init") == 0) {
+        return (void *) ggml_backend_sycl_measure_backend_init;
+    }
     if (strcmp(name, "ggml_backend_sycl_graph_invalidate") == 0) {
         return (void *) ggml_backend_sycl_graph_invalidate;
     }
@@ -111792,6 +111795,65 @@ extern "C" void ggml_backend_sycl_test_fail_next_backend_publish() {
     g_test_fail_next_backend_publish.store(true, std::memory_order_release);
 }
 #endif
+
+// The load-time measure's backend (zhcn-design §2.10).  It is a ggml_backend_t the
+// scheduler can reserve against, and nothing else: no SYCL context, no refcount, no
+// lifecycle registration.  Its interface is its own, never ggml_backend_sycl_interface,
+// and every slot but get_name and free is NULL.  synchronize is NULL on purpose: the
+// llama_context destructor's ggml_backend_synchronize returns on a NULL slot, where the
+// real one would dereference a context this backend never built and wait queues.  The
+// guid is its own too, so ggml_backend_is_sycl() is false for it and no proc in this
+// file reads a context out of it.
+static const char * ggml_backend_sycl_measure_get_name(ggml_backend_t) {
+    return "SYCL-measure";
+}
+
+// Deletes the backend object and nothing else.  Not ggml_backend_sycl_free: its
+// process-global tail must not run for a backend that was never counted.
+static void ggml_backend_sycl_measure_free(ggml_backend_t backend) {
+    delete backend;
+}
+
+static ggml_backend_i ggml_backend_sycl_measure_interface = {
+    /* .get_name                = */ ggml_backend_sycl_measure_get_name,
+    /* .free                    = */ ggml_backend_sycl_measure_free,
+    /* .set_tensor_async        = */ NULL,
+    /* .get_tensor_async        = */ NULL,
+    /* .set_tensor_2d_async     = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
+    /* .cpy_tensor_async        = */ NULL,
+    /* .synchronize             = */ NULL,
+    /* .graph_plan_create       = */ NULL,
+    /* .graph_plan_free         = */ NULL,
+    /* .graph_plan_update       = */ NULL,
+    /* .graph_plan_compute      = */ NULL,
+    /* .graph_compute           = */ NULL,
+    /* .event_record            = */ NULL,
+    /* .event_wait              = */ NULL,
+    /* .graph_optimize          = */ NULL,
+};
+
+static ggml_guid_t ggml_backend_sycl_measure_guid() {
+    static ggml_guid guid = { 0x6d, 0x65, 0x61, 0x73, 0x75, 0x72, 0x65, 0x2d,
+                              0x73, 0x79, 0x63, 0x6c, 0x2d, 0x7a, 0x68, 0x63 };
+    return &guid;
+}
+
+ggml_backend_t ggml_backend_sycl_measure_backend_init(int device) {
+    if (device < 0 || device >= ggml_backend_sycl_get_device_count()) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), device);
+    if (!dev) {
+        return nullptr;
+    }
+    return new ggml_backend{
+        /* .guid    = */ ggml_backend_sycl_measure_guid(),
+        /* .iface   = */ ggml_backend_sycl_measure_interface,
+        /* .device  = */ dev,
+        /* .context = */ nullptr,
+    };
+}
 
 ggml_backend_t ggml_backend_sycl_init(int device) {
     sycl_module_mutation_guard module_guard;

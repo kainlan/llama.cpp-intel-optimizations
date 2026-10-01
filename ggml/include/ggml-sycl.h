@@ -1528,6 +1528,11 @@ GGML_BACKEND_API void *       ggml_backend_sycl_plan_scope_open_load_measure(enu
 GGML_BACKEND_API const char * ggml_backend_sycl_plan_scope_failure(void * scope);
 GGML_BACKEND_API void         ggml_backend_sycl_plan_scope_close(void * scope);
 
+// The load-time measure's backend (zhcn-design §2.10): non-owning, no SYCL context, no
+// refcount, no lifecycle registration, its own interface with every slot but get_name and
+// free NULL.  ggml_backend_free on it deletes the object only.  NULL on a bad device index.
+GGML_BACKEND_API ggml_backend_t ggml_backend_sycl_measure_backend_init(int device);
+
 // A re-plan's per-context steps (zhcn-design §3.1).  synchronize_for_replan waits every
 // queue that can reach a slice of the context, after llama's synchronize(); it returns
 // false if a wait failed.  graph_invalidate drops this context's own recorded graph
