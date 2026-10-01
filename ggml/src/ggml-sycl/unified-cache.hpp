@@ -5733,13 +5733,35 @@ struct alloc_constraints {
     // crashed mid-prefill with UR_RESULT_ERROR_OUT_OF_RESOURCES instead of
     // refusing at context init.
     bool         forbid_vram_zone_spill     = false;
+    // Miss classes of the zone chokepoint (unified_cache_zone_refusal). Both are
+    // request parameters, never inferred from the calling function: the request
+    // says whether its refusal has a declared next path in the caller.
+    //   cascade_step        the request's next path is planned (a later step of
+    //                       the same chain, or the caller's own fallback), so a
+    //                       refusal is a counted cascade miss, not a plan bug.
+    //   unconverted_ticket  a literal naming the ticket whose exact term still
+    //                       owns this row's capacity; a refusal is an
+    //                       interim-floor miss reported against that ticket.
+    bool         cascade_step               = false;
+    const char * unconverted_ticket         = nullptr;
 };
 
+// Construction-site label. Each type a site builds and hands to an allocator
+// carries the file and line of that construction as default member
+// initialisers, so the raw-exit trace and the chokepoint name the row that asked.
+// The initialisers evaluate where the object is brace-initialised (`T x{}`, a
+// designated initialiser, a helper's default arguments); a braceless `T x;`
+// reports the class definition, so every such declaration is written `T x{}`.
+// An allocator reads the site of the object it receives, never the nested
+// `intent`'s, and a wrapper that builds one request type from another copies
+// the site explicitly.
 struct alloc_intent {
     alloc_role        role      = alloc_role::OTHER;
     runtime_category  category  = runtime_category::OTHER;
     const char *      cohort_id = nullptr;
     alloc_constraints constraints;
+    const char *      site_file = __builtin_FILE();
+    int               site_line = __builtin_LINE();
 };
 
 struct alloc_request {
@@ -5749,6 +5771,8 @@ struct alloc_request {
     size_t        alignment            = 0;  // 0 = allocator default; otherwise power-of-two
     bool          suppress_failure_log = false;  // Caller handles nullptr locally (e.g. back-pressure/reuse).
     alloc_intent  intent;
+    const char *  site_file            = __builtin_FILE();
+    int           site_line            = __builtin_LINE();
 };
 
 // Copyable, non-owning exact allocation identity and geometry. Registry rows,
@@ -6032,6 +6056,8 @@ struct offload_buffer_request {
     size_t              alignment = 64;
     offload_buffer_role role      = offload_buffer_role::OTHER;
     alloc_intent        intent{};
+    const char *        site_file = __builtin_FILE();
+    int                 site_line = __builtin_LINE();
 };
 
 struct offload_buffer_lease {
@@ -7221,6 +7247,115 @@ void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue);
 void * unified_cache_raw_malloc_host(size_t size, const sycl::queue & queue);
 void * unified_cache_raw_malloc_host(size_t size, const sycl::context & ctx);
 bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
+
+// === Counter dump (GGML_SYCL_COUNTER_DUMP=1) ===
+//
+// Every counter below counts whether or not the dump is armed, and the table,
+// the printer and every registration compile into the ggml-sycl library with
+// no GGML_SYCL_PRIVATE_TESTING gate: that macro is defined only on test
+// targets, so a counter behind it would never print in llama-cli,
+// llama-completion, llama-server or llama-bench. An increment may sit under a
+// build switch (the onednn_* counters' under GGML_SYCL_DNNL); a registration
+// never does. scripts/check-sycl-counter-dump.py gates both facts.
+//
+// The two lists are the dump's fixed field list and snapshot list, in print
+// order. A field prints on every tree from the step that registered it, zeros
+// included, until its retiring step; the gate carries each entry's lands and
+// retired step. Add a new entry here and in the gate together.
+//
+// A keyed counter (a cohort, a site, a ticket) prints its unlabelled total in
+// the fixed list and one `name=<counter>{<key>}` line per key that has counted.
+#define GGML_SYCL_DUMP_COUNTERS(X)          \
+    X(ext_alloc_count)                      \
+    X(ext_alloc_arena)                      \
+    X(zone_cascade_miss)                    \
+    X(zone_unconverted_miss)                \
+    X(zone_plan_refusal)                    \
+    X(refusal_unattributed)                 \
+    X(refusal_late)                         \
+    X(onednn_scratchpad_over_plan_declined) \
+    X(late_term_shrink_admitted)            \
+    X(arena_policy_refusal)                 \
+    X(stream_dma_non_device_arrivals)       \
+    X(onednn_pp_record_mode_acquires)       \
+    X(set_rows_stage_arrivals)              \
+    X(set_rows_stage_record_mode_acquires)  \
+    X(load_row_op_time_arrivals)            \
+    X(onednn_sdpa_admitted)                 \
+    X(onednn_sdpa_executed)                 \
+    X(onednn_sdpa_fallback_after_admit)     \
+    X(onednn_fa_plan_calls)                 \
+    X(onednn_graph_mask_declined)           \
+    X(onednn_graph_route_declined)          \
+    X(onednn_graph_decline_at_entry)        \
+    X(onednn_graph_scratch_barrier_failed)
+
+// A byte figure an arm scores that is not a counter: captured at a named point
+// and printed at exit after the key lines as `name=<figure>@<point>`. An entry
+// whose point was never reached prints the value `not_captured`.
+//   first_decode  the entry of the device's first graph_compute whose batch is
+//                 one token, captured once
+//   context_txn   the commit of the device's last context transaction
+//   last_load_end the end of the device's last model load, one entry per live
+//                 model keyed load_1 and load_2 by load order
+#define GGML_SYCL_DUMP_SNAPSHOTS(X)                                                            \
+    X(zone_available_weight_first_decode, "zone_available{WEIGHT}@first_decode")               \
+    X(zone_largest_free_weight_first_decode, "zone_largest_free{WEIGHT}@first_decode")         \
+    X(zone_available_runtime_context_txn, "zone_available{RUNTIME}@context_txn")               \
+    X(zone_largest_free_runtime_context_txn, "zone_largest_free{RUNTIME}@context_txn")         \
+    X(zone_capacity_onednn_context_txn, "zone_capacity{ONEDNN}@context_txn")                   \
+    X(onednn_pp_a_bytes_context_txn, "onednn_pp_a_bytes@context_txn")                          \
+    X(weight_host_tiered_bytes_load_1, "weight_host_tiered_bytes{load_1}@last_load_end")       \
+    X(weight_host_tiered_bytes_load_2, "weight_host_tiered_bytes{load_2}@last_load_end")       \
+    X(weight_planned_device_bytes_load_1, "weight_planned_device_bytes{load_1}@last_load_end") \
+    X(weight_planned_device_bytes_load_2, "weight_planned_device_bytes{load_2}@last_load_end") \
+    X(weight_live_bytes_last_load_end, "weight_live_bytes@last_load_end")
+
+enum class dump_counter : uint8_t {
+#define GGML_SYCL_DUMP_COUNTER_ENUM(name) name,
+    GGML_SYCL_DUMP_COUNTERS(GGML_SYCL_DUMP_COUNTER_ENUM)
+#undef GGML_SYCL_DUMP_COUNTER_ENUM
+        COUNT
+};
+
+enum class dump_snapshot : uint8_t {
+#define GGML_SYCL_DUMP_SNAPSHOT_ENUM(id, printed) id,
+    GGML_SYCL_DUMP_SNAPSHOTS(GGML_SYCL_DUMP_SNAPSHOT_ENUM)
+#undef GGML_SYCL_DUMP_SNAPSHOT_ENUM
+        COUNT
+};
+
+// Lock-free, relaxed; safe under any caller's lock. `dev` is the in-process
+// index after ONEAPI_DEVICE_SELECTOR filtering; an index outside the table is
+// ignored. add_key also adds to the total, so the two cannot drift.
+void unified_cache_dump_counter_add(dump_counter counter, int dev, uint64_t n = 1) noexcept;
+void unified_cache_dump_counter_add_key(dump_counter counter, int dev, const char * key, uint64_t n = 1) noexcept;
+void unified_cache_dump_snapshot_set(dump_snapshot snapshot, int dev, uint64_t value) noexcept;
+// Captures only the first time per device (the first_decode point).
+void unified_cache_dump_snapshot_set_once(dump_snapshot snapshot, int dev, uint64_t value) noexcept;
+// Recorded once by ggml_sycl_init, the post-selector count; the printer's loop
+// and its `end` line read it, never a query at exit.
+void unified_cache_dump_set_device_count(int device_count) noexcept;
+// Registered with std::atexit; prints only when GGML_SYCL_COUNTER_DUMP=1.
+void unified_cache_test_counter_dump();
+
+uint64_t unified_cache_dump_counter_for_testing(dump_counter counter, int dev) noexcept;
+uint64_t unified_cache_ext_alloc_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_ext_alloc_arena_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_zone_cascade_miss_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_zone_unconverted_miss_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_zone_plan_refusal_count_for_testing(int dev) noexcept;
+
+// The one chokepoint for a forbid refusal: called where unified_alloc refuses a
+// request whose preferred zone could not hold it. It classifies the miss by the
+// request alone (cascade_step, unconverted_ticket, else terminal), counts it,
+// and prints its line under GGML_SYCL_EXT_ALLOC_TRACE=1 only; it never allocates, takes no lock of any rank, and changes no
+// outcome -- the caller still returns its own refusal.
+void unified_cache_zone_refusal(const alloc_request & req,
+                                vram_zone_id          zone,
+                                size_t                bytes,
+                                size_t                zone_free,
+                                size_t                zone_largest) noexcept;
 
 // === Shutdown API ===
 

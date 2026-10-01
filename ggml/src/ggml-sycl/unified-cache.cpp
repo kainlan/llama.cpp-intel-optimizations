@@ -3976,6 +3976,397 @@ static bool ext_alloc_trace_enabled() {
     return enabled != 0;
 }
 
+// ---------------------------------------------------------------------------
+// Counter dump (GGML_SYCL_COUNTER_DUMP=1) and the zone chokepoint.
+//
+// The table, its printer and every registration are compiled unconditionally:
+// GGML_SYCL_PRIVATE_TESTING is defined only on test targets, so a counter
+// behind it would never print in a shipped tool (see the hpp comment above
+// GGML_SYCL_DUMP_COUNTERS). The table is deliberately leaked, as zone_audit()
+// is, so no static destructor has run on it when the atexit printer runs.
+// ---------------------------------------------------------------------------
+static const char * vram_zone_name(vram_zone_id zone);
+
+namespace {
+
+constexpr int    k_dump_devices  = GGML_SYCL_MAX_DEVICES;
+constexpr size_t k_dump_max_keys = 32;
+constexpr size_t k_dump_key_len  = 64;
+
+const char * const k_dump_counter_names[] = {
+#define GGML_SYCL_DUMP_COUNTER_NAME(name) #name,
+    GGML_SYCL_DUMP_COUNTERS(GGML_SYCL_DUMP_COUNTER_NAME)
+#undef GGML_SYCL_DUMP_COUNTER_NAME
+};
+static_assert(sizeof(k_dump_counter_names) / sizeof(k_dump_counter_names[0]) ==
+                  static_cast<size_t>(dump_counter::COUNT),
+              "every dump counter needs its printed name");
+
+const char * const k_dump_snapshot_names[] = {
+#define GGML_SYCL_DUMP_SNAPSHOT_NAME(id, printed) printed,
+    GGML_SYCL_DUMP_SNAPSHOTS(GGML_SYCL_DUMP_SNAPSHOT_NAME)
+#undef GGML_SYCL_DUMP_SNAPSHOT_NAME
+};
+static_assert(sizeof(k_dump_snapshot_names) / sizeof(k_dump_snapshot_names[0]) ==
+                  static_cast<size_t>(dump_snapshot::COUNT),
+              "every dump snapshot needs its printed name");
+
+struct dump_key_slot {
+    char                  name[k_dump_key_len] = {};
+    std::atomic<uint64_t> value[k_dump_devices];
+};
+
+struct dump_counter_state {
+    std::atomic<uint64_t> total[k_dump_devices];
+    mem_handle_spin_lock  key_lock;
+    std::atomic<uint32_t> key_count{ 0 };
+    dump_key_slot         keys[k_dump_max_keys];
+};
+
+struct dump_snapshot_state {
+    std::atomic<uint64_t> value[k_dump_devices];
+    std::atomic<bool>     captured[k_dump_devices];
+};
+
+struct dump_table {
+    std::atomic<int>    device_count{ 0 };
+    dump_counter_state  counters[static_cast<size_t>(dump_counter::COUNT)];
+    dump_snapshot_state snapshots[static_cast<size_t>(dump_snapshot::COUNT)];
+    // Per device: whether an arena was active when a raw exit happened. Written
+    // where the arena is created or released, read lock-free by the raw layer,
+    // which can run under the cache's own locks.
+    std::atomic<bool>   arena_active[k_dump_devices];
+
+    dump_table() {
+        for (auto & c : counters) {
+            for (auto & v : c.total) {
+                v.store(0, std::memory_order_relaxed);
+            }
+            for (auto & k : c.keys) {
+                for (auto & v : k.value) {
+                    v.store(0, std::memory_order_relaxed);
+                }
+            }
+        }
+        for (auto & s : snapshots) {
+            for (int d = 0; d < k_dump_devices; ++d) {
+                s.value[d].store(0, std::memory_order_relaxed);
+                s.captured[d].store(false, std::memory_order_relaxed);
+            }
+        }
+        for (auto & a : arena_active) {
+            a.store(false, std::memory_order_relaxed);
+        }
+    }
+};
+
+dump_table & dump_tbl() {
+    static dump_table * t = new dump_table();
+    return *t;
+}
+
+bool dump_dev_valid(int dev) {
+    return dev >= 0 && dev < k_dump_devices;
+}
+
+// The key slot for `key`, claimed under the counter's leaf spin lock on first
+// use. A full table folds into its last slot so a count is never dropped.
+dump_key_slot & dump_key_for(dump_counter_state & c, const char * key) {
+    const uint32_t seen = c.key_count.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < seen; ++i) {
+        if (std::strncmp(c.keys[i].name, key, k_dump_key_len - 1) == 0) {
+            return c.keys[i];
+        }
+    }
+    mem_handle_lock_guard guard(c.key_lock);
+    uint32_t              n = c.key_count.load(std::memory_order_relaxed);
+    for (uint32_t i = seen; i < n; ++i) {
+        if (std::strncmp(c.keys[i].name, key, k_dump_key_len - 1) == 0) {
+            return c.keys[i];
+        }
+    }
+    if (n + 1 >= k_dump_max_keys) {
+        dump_key_slot & overflow = c.keys[k_dump_max_keys - 1];
+        if (overflow.name[0] == '\0') {
+            std::snprintf(overflow.name, sizeof(overflow.name), "(overflow)");
+            c.key_count.store(static_cast<uint32_t>(k_dump_max_keys), std::memory_order_release);
+        }
+        return overflow;
+    }
+    std::snprintf(c.keys[n].name, sizeof(c.keys[n].name), "%s", key);
+    c.key_count.store(n + 1, std::memory_order_release);
+    return c.keys[n];
+}
+
+const char * dump_site_basename(const char * file) {
+    if (file == nullptr) {
+        return "-";
+    }
+    const char * slash = std::strrchr(file, '/');
+    return slash ? slash + 1 : file;
+}
+
+}  // namespace
+
+void unified_cache_dump_counter_add(dump_counter counter, int dev, uint64_t n) noexcept {
+    if (!dump_dev_valid(dev) || counter >= dump_counter::COUNT) {
+        return;
+    }
+    dump_tbl().counters[static_cast<size_t>(counter)].total[dev].fetch_add(n, std::memory_order_relaxed);
+}
+
+void unified_cache_dump_counter_add_key(dump_counter counter, int dev, const char * key, uint64_t n) noexcept {
+    if (!dump_dev_valid(dev) || counter >= dump_counter::COUNT) {
+        return;
+    }
+    dump_counter_state & c = dump_tbl().counters[static_cast<size_t>(counter)];
+    c.total[dev].fetch_add(n, std::memory_order_relaxed);
+    dump_key_for(c, key != nullptr && key[0] != '\0' ? key : "-").value[dev].fetch_add(n, std::memory_order_relaxed);
+}
+
+void unified_cache_dump_snapshot_set(dump_snapshot snapshot, int dev, uint64_t value) noexcept {
+    if (!dump_dev_valid(dev) || snapshot >= dump_snapshot::COUNT) {
+        return;
+    }
+    dump_snapshot_state & s = dump_tbl().snapshots[static_cast<size_t>(snapshot)];
+    s.value[dev].store(value, std::memory_order_relaxed);
+    s.captured[dev].store(true, std::memory_order_release);
+}
+
+void unified_cache_dump_snapshot_set_once(dump_snapshot snapshot, int dev, uint64_t value) noexcept {
+    if (!dump_dev_valid(dev) || snapshot >= dump_snapshot::COUNT) {
+        return;
+    }
+    dump_snapshot_state & s        = dump_tbl().snapshots[static_cast<size_t>(snapshot)];
+    bool                  expected = false;
+    if (s.captured[dev].compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        s.value[dev].store(value, std::memory_order_relaxed);
+    }
+}
+
+void unified_cache_dump_set_device_count(int device_count) noexcept {
+    dump_tbl().device_count.store(device_count, std::memory_order_relaxed);
+}
+
+uint64_t unified_cache_dump_counter_for_testing(dump_counter counter, int dev) noexcept {
+    if (!dump_dev_valid(dev) || counter >= dump_counter::COUNT) {
+        return 0;
+    }
+    return dump_tbl().counters[static_cast<size_t>(counter)].total[dev].load(std::memory_order_relaxed);
+}
+
+uint64_t unified_cache_ext_alloc_count_for_testing(int dev) noexcept {
+    return unified_cache_dump_counter_for_testing(dump_counter::ext_alloc_count, dev);
+}
+
+uint64_t unified_cache_ext_alloc_arena_count_for_testing(int dev) noexcept {
+    return unified_cache_dump_counter_for_testing(dump_counter::ext_alloc_arena, dev);
+}
+
+uint64_t unified_cache_zone_cascade_miss_count_for_testing(int dev) noexcept {
+    return unified_cache_dump_counter_for_testing(dump_counter::zone_cascade_miss, dev);
+}
+
+uint64_t unified_cache_zone_unconverted_miss_count_for_testing(int dev) noexcept {
+    return unified_cache_dump_counter_for_testing(dump_counter::zone_unconverted_miss, dev);
+}
+
+uint64_t unified_cache_zone_plan_refusal_count_for_testing(int dev) noexcept {
+    return unified_cache_dump_counter_for_testing(dump_counter::zone_plan_refusal, dev);
+}
+
+// Writes with fprintf(stderr), not the log, so neither log-drop mechanism
+// (llama-bench's null callback, common's INFO-to-TRACE mapping) drops it and no
+// log callback has to survive to exit. abort() and _Exit() skip atexit, so an
+// aborting run prints no `end` line and no dump-scored reading of it counts.
+void unified_cache_test_counter_dump() {
+    const char * env = std::getenv("GGML_SYCL_COUNTER_DUMP");
+    if (env == nullptr || std::atoi(env) == 0) {
+        return;
+    }
+    dump_table & t       = dump_tbl();
+    const int    devices = std::min(t.device_count.load(std::memory_order_relaxed), k_dump_devices);
+    for (int dev = 0; dev < devices; ++dev) {
+        for (size_t c = 0; c < static_cast<size_t>(dump_counter::COUNT); ++c) {
+            std::fprintf(stderr, "[SYCL-COUNTER] dev=%d name=%s value=%llu\n", dev, k_dump_counter_names[c],
+                         static_cast<unsigned long long>(t.counters[c].total[dev].load(std::memory_order_relaxed)));
+        }
+        for (size_t c = 0; c < static_cast<size_t>(dump_counter::COUNT); ++c) {
+            const uint32_t keys = t.counters[c].key_count.load(std::memory_order_acquire);
+            for (uint32_t k = 0; k < keys; ++k) {
+                const uint64_t v = t.counters[c].keys[k].value[dev].load(std::memory_order_relaxed);
+                if (v == 0) {
+                    continue;
+                }
+                std::fprintf(stderr, "[SYCL-COUNTER] dev=%d name=%s{%s} value=%llu\n", dev, k_dump_counter_names[c],
+                             t.counters[c].keys[k].name, static_cast<unsigned long long>(v));
+            }
+        }
+        for (size_t s = 0; s < static_cast<size_t>(dump_snapshot::COUNT); ++s) {
+            if (t.snapshots[s].captured[dev].load(std::memory_order_acquire)) {
+                std::fprintf(
+                    stderr, "[SYCL-COUNTER] dev=%d name=%s value=%llu\n", dev, k_dump_snapshot_names[s],
+                    static_cast<unsigned long long>(t.snapshots[s].value[dev].load(std::memory_order_relaxed)));
+            } else {
+                std::fprintf(stderr, "[SYCL-COUNTER] dev=%d name=%s value=not_captured\n", dev,
+                             k_dump_snapshot_names[s]);
+            }
+        }
+    }
+    std::fprintf(stderr, "[SYCL-COUNTER] end devices=%d\n", devices);
+}
+
+// The raw exit's view of the request that caused it. unified_alloc sets the
+// request around its raw call and the tracked wrapper sets the tag; a raw exit
+// reached without either (ensure_cached, allocate(tag)) prints cohort=- with
+// its own tag. Thread-local, so a concurrent allocation never sees another's.
+namespace {
+thread_local const alloc_request * g_ext_alloc_request = nullptr;
+thread_local const char *          g_ext_alloc_tag     = nullptr;
+
+struct ext_alloc_request_scope {
+    const alloc_request * saved;
+
+    explicit ext_alloc_request_scope(const alloc_request * req) : saved(g_ext_alloc_request) {
+        g_ext_alloc_request = req;
+    }
+
+    ~ext_alloc_request_scope() { g_ext_alloc_request = saved; }
+
+    ext_alloc_request_scope(const ext_alloc_request_scope &)             = delete;
+    ext_alloc_request_scope & operator=(const ext_alloc_request_scope &) = delete;
+};
+
+struct ext_alloc_tag_scope {
+    const char * saved;
+
+    explicit ext_alloc_tag_scope(const char * tag) : saved(g_ext_alloc_tag) { g_ext_alloc_tag = tag; }
+
+    ~ext_alloc_tag_scope() { g_ext_alloc_tag = saved; }
+
+    ext_alloc_tag_scope(const ext_alloc_tag_scope &)             = delete;
+    ext_alloc_tag_scope & operator=(const ext_alloc_tag_scope &) = delete;
+};
+
+void ext_alloc_note_arena_state(const sycl::queue & queue, bool active) {
+    const int dev = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
+    if (dump_dev_valid(dev)) {
+        dump_tbl().arena_active[dev].store(active, std::memory_order_release);
+    }
+}
+
+// One dedupe table serves the TERMINAL and UNCONVERTED classes: the key is the
+// tuple (class, dev, zone, cohort, site_file, site_line), compared field by
+// field, so two keys never collide. The leaf spin lock guards nothing that
+// allocates, logs or takes another lock. A full table says so.
+enum class zone_refusal_class : uint8_t { TERMINAL = 0, UNCONVERTED = 1 };
+
+struct zone_refusal_key {
+    zone_refusal_class cls;
+    int                dev;
+    vram_zone_id       zone;
+    int                site_line;
+    char               cohort[48];
+    char               site_file[48];
+};
+
+constexpr size_t k_zone_refusal_dedupe_capacity = 128;
+
+struct zone_refusal_dedupe {
+    mem_handle_spin_lock lock;
+    size_t               count = 0;
+    zone_refusal_key     keys[k_zone_refusal_dedupe_capacity];
+};
+
+zone_refusal_dedupe & zone_refusal_dedupe_table() {
+    static zone_refusal_dedupe * t = new zone_refusal_dedupe();
+    return *t;
+}
+
+enum class dedupe_result : uint8_t { FIRST, SEEN, FULL };
+
+dedupe_result zone_refusal_dedupe_note(const zone_refusal_key & key) {
+    zone_refusal_dedupe & t = zone_refusal_dedupe_table();
+    mem_handle_lock_guard guard(t.lock);
+    for (size_t i = 0; i < t.count; ++i) {
+        const zone_refusal_key & k = t.keys[i];
+        if (k.cls == key.cls && k.dev == key.dev && k.zone == key.zone && k.site_line == key.site_line &&
+            std::strcmp(k.cohort, key.cohort) == 0 && std::strcmp(k.site_file, key.site_file) == 0) {
+            return dedupe_result::SEEN;
+        }
+    }
+    if (t.count >= k_zone_refusal_dedupe_capacity) {
+        return dedupe_result::FULL;
+    }
+    t.keys[t.count++] = key;
+    return dedupe_result::FIRST;
+}
+
+}  // namespace
+
+// Every class counts always; its line prints only under GGML_SYCL_EXT_ALLOC_TRACE=1. Until the
+// requests carry cascade_step / unconverted_ticket (their writers land later), every refusal
+// classifies TERMINAL, including a planned forbid, so a line at default verbosity would be a false
+// alarm. The default-verbosity ERROR line for a terminal miss lands with those writers.
+void unified_cache_zone_refusal(const alloc_request & req,
+                                vram_zone_id          zone,
+                                size_t                bytes,
+                                size_t                zone_free,
+                                size_t                zone_largest) noexcept {
+    const char * site_file = dump_site_basename(req.site_file);
+    // A cohort-less request is named by its construction site, so every one is distinct.
+    char         site[96];
+    std::snprintf(site, sizeof(site), "%s:%d", site_file, req.site_line);
+    const char * cohort =
+        (req.intent.cohort_id != nullptr && req.intent.cohort_id[0] != '\0') ? req.intent.cohort_id : site;
+
+    const alloc_constraints & constraints = req.intent.constraints;
+    if (constraints.cascade_step) {
+        // The next path is planned, so this is not a plan bug: counted, and a line only under the trace.
+        unified_cache_dump_counter_add_key(dump_counter::zone_cascade_miss, req.device, cohort);
+        if (ext_alloc_trace_enabled()) {
+            std::fprintf(stderr, "[ZONE-CASCADE] dev=%d zone=%s cohort=%s site=%s bytes=%zu\n", req.device,
+                         vram_zone_name(zone), cohort, site, bytes);
+        }
+        return;
+    }
+
+    zone_refusal_key key{};
+    key.cls =
+        constraints.unconverted_ticket != nullptr ? zone_refusal_class::UNCONVERTED : zone_refusal_class::TERMINAL;
+    key.dev       = req.device;
+    key.zone      = zone;
+    key.site_line = req.site_line;
+    std::snprintf(key.cohort, sizeof(key.cohort), "%s", cohort);
+    std::snprintf(key.site_file, sizeof(key.site_file), "%s", site_file);
+
+    if (key.cls == zone_refusal_class::UNCONVERTED) {
+        // An interim-floor row whose exact term another ticket still owns.
+        unified_cache_dump_counter_add_key(dump_counter::zone_unconverted_miss, req.device,
+                                           constraints.unconverted_ticket);
+        if (ext_alloc_trace_enabled()) {
+            const dedupe_result seen = zone_refusal_dedupe_note(key);
+            if (seen != dedupe_result::SEEN) {
+                std::fprintf(stderr, "[ZONE-UNCONVERTED] dev=%d zone=%s cohort=%s site=%s bytes=%zu ticket=%s%s\n",
+                             req.device, vram_zone_name(zone), cohort, site, bytes, constraints.unconverted_ticket,
+                             seen == dedupe_result::FULL ? " (dedupe-full)" : "");
+            }
+        }
+        return;
+    }
+
+    unified_cache_dump_counter_add(dump_counter::zone_plan_refusal, req.device);
+    if (ext_alloc_trace_enabled()) {
+        const dedupe_result seen = zone_refusal_dedupe_note(key);
+        if (seen != dedupe_result::SEEN) {
+            std::fprintf(
+                stderr, "[ZONE-PLAN-BUG] dev=%d zone=%s cohort=%s site=%s bytes=%zu zone_free=%zu zone_largest=%zu%s\n",
+                req.device, vram_zone_name(zone), cohort, site, bytes, zone_free, zone_largest,
+                seen == dedupe_result::FULL ? " (dedupe-full)" : "");
+        }
+    }
+}
+
 // llama.cpp-2gag bisection: trace every allocation that lands in a host
 // zone (pointer, byte range, zone, role/category, cohort tag) so a run can
 // be checked for address overlap between the persistent attn-host staging
@@ -4060,6 +4451,9 @@ unified_cache::unified_cache(sycl::queue & queue,
     bool expected = false;
     if (g_atexit_registered.compare_exchange_strong(expected, true)) {
         std::atexit(unified_cache_atexit_handler);
+        // Registered after the shutdown handler, so it runs before it; it prints only under
+        // GGML_SYCL_COUNTER_DUMP=1 and the table it reads is leaked, so no destructor has run on it.
+        std::atexit(unified_cache_test_counter_dump);
     }
 
     // Allocate staging buffer (pinned host memory)
@@ -15314,6 +15708,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // ever ran, not that one failed -- forbid_vram_zone_spill
                 // must not fire on that case.
                 if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {
+                    unified_cache_zone_refusal(req, zid, alloc_size, cache->zone_available(zid),
+                                               cache->zone_largest_free(zid));
                     return false;
                 }
             }
@@ -15362,18 +15758,10 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             }
         }
         if (!ptr && !kv_spill_to_host) {
+            // The raw exit prints and counts itself; this scope hands it the
+            // request that caused it (see unified_cache_raw_malloc_device).
+            ext_alloc_request_scope raw_exit_request(&req);
             ptr = unified_cache_malloc_device_tracked(alloc_size, *req.queue, "unified_alloc:device");
-            if (ptr && ext_alloc_trace_enabled()) {
-                static std::atomic<size_t> total_external_bytes{ 0 };
-                const size_t               total_now =
-                    total_external_bytes.fetch_add(alloc_size, std::memory_order_relaxed) + alloc_size;
-                fprintf(stderr,
-                        "[EXT-ALLOC] device=%d bytes=%zu cohort=%s role=%d category=%d prefer_vram_zone=%d "
-                        "total_external=%zu\n",
-                        req.device, alloc_size, req.intent.cohort_id ? req.intent.cohort_id : "?",
-                        static_cast<int>(req.intent.role), static_cast<int>(req.intent.category),
-                        static_cast<int>(req.intent.constraints.prefer_vram_zone), total_now);
-            }
         }
         // KV arena spill: redirect to host-pinned path.
         if (!ptr && kv_spill_to_host) {
@@ -15702,6 +16090,10 @@ bool acquire_offload_buffer(const offload_buffer_request & req_in, offload_buffe
     areq.device = req.device;
     areq.size   = alloc_size;
     areq.intent = req.intent;
+    // The allocator reads the site of the object it receives, so the wrapper reports its
+    // caller's construction (`req` is a copy of `req_in`), never this line.
+    areq.site_file = req_in.site_file;
+    areq.site_line = req_in.site_line;
     if (areq.intent.role == alloc_role::OTHER) {
         areq.intent.role = alloc_role::STAGING;
     }
@@ -16263,7 +16655,7 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         if (binding == bindings.end() || binding->queue == nullptr || bytes == 0) {
             return {};
         }
-        alloc_request request;
+        alloc_request request{};
         request.queue                = binding->queue;
         request.device               = device;
         request.size                 = bytes;
@@ -19184,12 +19576,51 @@ const weight_entry * unified_cache_lookup_expert(int device_id, ggml_sycl_cache_
 // All consumer code must route through these functions (or higher-level cache APIs).
 // unified-cache.cpp owns raw sycl::malloc_* and sycl::free calls.
 
+// Every raw device exit except the arena backing passes through here: unified_alloc
+// (through the tracked wrapper), ensure_cached, ensure_cached_alloc and allocate(tag).
+// The arena backing calls sycl_aligned_malloc_device directly and is in neither the
+// line nor the counter. The counters count whatever GGML_SYCL_EXT_ALLOC_TRACE says,
+// lock-free, because this runs under the cache's own locks.
 void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue) {
     void * ptr = nullptr;
     try {
         ptr = sycl_aligned_malloc_device(size, queue);
     } catch (...) {
         return nullptr;
+    }
+    if (ptr == nullptr) {
+        return ptr;
+    }
+
+    const int  dev   = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
+    const bool arena = dump_dev_valid(dev) && dump_tbl().arena_active[dev].load(std::memory_order_acquire);
+    unified_cache_dump_counter_add(dump_counter::ext_alloc_count, dev);
+    if (arena) {
+        unified_cache_dump_counter_add(dump_counter::ext_alloc_arena, dev);
+    }
+    if (ext_alloc_trace_enabled()) {
+        static std::atomic<size_t> total_external_bytes{ 0 };
+        const size_t               total_now = total_external_bytes.fetch_add(size, std::memory_order_relaxed) + size;
+        const alloc_request *      req       = g_ext_alloc_request;
+        const char *               tag       = g_ext_alloc_tag != nullptr ? g_ext_alloc_tag : "raw";
+        if (req != nullptr) {
+            const bool named = req->intent.cohort_id != nullptr && req->intent.cohort_id[0] != '\0';
+            // A cohort-less request is named by its site, so every one is distinct.
+            char       site[96];
+            std::snprintf(site, sizeof(site), "%s:%d", dump_site_basename(req->site_file), req->site_line);
+            std::fprintf(stderr,
+                         "[EXT-ALLOC] dev=%d arena=%d bytes=%zu tag=%s cohort=%s site=%s role=%d category=%d "
+                         "prefer_vram_zone=%d total_external=%zu\n",
+                         dev, arena ? 1 : 0, size, tag, named ? req->intent.cohort_id : site, site,
+                         static_cast<int>(req->intent.role), static_cast<int>(req->intent.category),
+                         static_cast<int>(req->intent.constraints.prefer_vram_zone), total_now);
+        } else {
+            // Class (d): a raw exit with no request behind it prints its tag alone.
+            std::fprintf(stderr,
+                         "[EXT-ALLOC] dev=%d arena=%d bytes=%zu tag=%s cohort=- site=-:0 role=-1 category=-1 "
+                         "prefer_vram_zone=-1 total_external=%zu\n",
+                         dev, arena ? 1 : 0, size, tag, total_now);
+        }
     }
     return ptr;
 }
@@ -19228,7 +19659,8 @@ bool unified_cache_raw_free_device(void * ptr, const sycl::queue & queue) {
 }
 
 static void * unified_cache_malloc_device_tracked(size_t size, const sycl::queue & queue, const char * tag) {
-    void * ptr = unified_cache_raw_malloc_device(size, queue);
+    ext_alloc_tag_scope raw_exit_tag(tag);
+    void *              ptr = unified_cache_raw_malloc_device(size, queue);
     if (!ptr) {
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] malloc_device failed (%zu bytes, %s)\n", size, tag ? tag : "unknown");
         return nullptr;
@@ -22631,6 +23063,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             g_live_arena_chunks.fetch_add(1, std::memory_order_acq_rel);
             arena_base_ = ptr;
             arena_size_ = alloc_size;
+            ext_alloc_note_arena_state(queue, true);
 
             // Single-chunk zone layout:
             //   [KV→ ...free... ←WEIGHT] [ONEDNN] [RUNTIME] [SCRATCH]
@@ -22832,6 +23265,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
     arena_base_ = arena_chunks_.front().ptr;
     arena_size_ = alloc_size;
+    ext_alloc_note_arena_state(queue, true);
 
     // Logical-offset layout (cumulative across chunks; offset_to_ptr/ptr_to_offset translate):
     //   [WEIGHT (chunks 0..N-2, weight_total bytes)]
@@ -24022,6 +24456,7 @@ bool unified_cache::arena_destroy() {
     for (auto & group : arena_allocator_groups_) group.allocations.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
+    ext_alloc_note_arena_state(queue_, false);
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];

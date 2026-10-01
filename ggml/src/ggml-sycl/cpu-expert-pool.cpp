@@ -59,7 +59,7 @@ void CpuExpertPool::init(int n_threads, size_t max_experts, size_t act_dim, size
     const size_t total              = per_slot * RING_SLOTS;
 
     if (total > 0) {
-        alloc_request req;
+        alloc_request req{};
         req.queue  = &q;
         req.device = -1;  // Host allocation
         req.size   = total;

@@ -462,7 +462,7 @@ static const void * ggml_sycl_set_rows_stage_ptr(ggml_backend_sycl_context &    
 
     queue_ptr stream = ctx.stream(owner_device, 0);
 
-    ggml_sycl::alloc_request req;
+    ggml_sycl::alloc_request req{};
     req.queue                          = stream;
     req.device                         = owner_device;
     req.size                           = bytes;

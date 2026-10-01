@@ -935,7 +935,8 @@ def test_unified_alloc_enforces_forbid_vram_zone_spill():
     that nothing reads."""
     body_norm = _normalize_ws(_bounded_body(CACHE_CPP_CODE, _UNIFIED_ALLOC_START, _ACQUIRE_OFFLOAD_BUFFER_START))
     guard_match = re.search(
-        r"if\s*\(\s*!\s*ptr\s*&&\s*req\.intent\.constraints\.forbid_vram_zone_spill\s*\)\s*\{\s*return\s+false\s*;",
+        r"if\s*\(\s*!\s*ptr\s*&&\s*req\.intent\.constraints\.forbid_vram_zone_spill\s*\)\s*\{\s*"
+        r"unified_cache_zone_refusal\([^;]*\)\s*;\s*return\s+false\s*;",
         body_norm,
     )
     assert guard_match is not None, (
@@ -990,6 +991,8 @@ def test_unified_alloc_spill_guard_has_a_mutation_witness():
     raw = CACHE_CPP
     guard_block = (
         "                if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {\n"
+        "                    unified_cache_zone_refusal(req, zid, alloc_size, cache->zone_available(zid),\n"
+        "                                               cache->zone_largest_free(zid));\n"
         "                    return false;\n"
         "                }\n"
     )
@@ -998,9 +1001,10 @@ def test_unified_alloc_spill_guard_has_a_mutation_witness():
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _UNIFIED_ALLOC_START, _ACQUIRE_OFFLOAD_BUFFER_START)
-    assert not re.search(r"forbid_vram_zone_spill\s*\)\s*\{\s*return\s+false\s*;", mutated_body_norm), (
-        "mutation witness is broken: deleting the enforcement left a reference to it behind"
-    )
+    assert not re.search(
+        r"forbid_vram_zone_spill\s*\)\s*\{\s*unified_cache_zone_refusal\([^;]*\)\s*;\s*return\s+false\s*;",
+        mutated_body_norm,
+    ), "mutation witness is broken: deleting the enforcement left a reference to it behind"
 
 
 def test_unified_alloc_spill_guard_nesting_has_a_mutation_witness():
@@ -1016,6 +1020,8 @@ def test_unified_alloc_spill_guard_nesting_has_a_mutation_witness():
     raw = CACHE_CPP
     nested_guard = (
         "                if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {\n"
+        "                    unified_cache_zone_refusal(req, zid, alloc_size, cache->zone_available(zid),\n"
+        "                                               cache->zone_largest_free(zid));\n"
         "                    return false;\n"
         "                }\n"
         "            }\n"
@@ -1026,6 +1032,8 @@ def test_unified_alloc_spill_guard_nesting_has_a_mutation_witness():
         "            }\n"
         "        }\n"
         "        if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {\n"
+        "            unified_cache_zone_refusal(req, zid, alloc_size, cache->zone_available(zid),\n"
+        "                                       cache->zone_largest_free(zid));\n"
         "            return false;\n"
         "        }\n"
     )
@@ -1034,7 +1042,8 @@ def test_unified_alloc_spill_guard_nesting_has_a_mutation_witness():
 
     mutated_body_norm = _body_of(mutated_raw, _UNIFIED_ALLOC_START, _ACQUIRE_OFFLOAD_BUFFER_START)
     guard_match = re.search(
-        r"if\s*\(\s*!\s*ptr\s*&&\s*req\.intent\.constraints\.forbid_vram_zone_spill\s*\)\s*\{\s*return\s+false\s*;",
+        r"if\s*\(\s*!\s*ptr\s*&&\s*req\.intent\.constraints\.forbid_vram_zone_spill\s*\)\s*\{\s*"
+        r"unified_cache_zone_refusal\([^;]*\)\s*;\s*return\s+false\s*;",
         mutated_body_norm,
     )
     kv_fallback_idx = mutated_body_norm.find("!ptr && req.intent.role == alloc_role::KV && vram_arena_enabled()")

@@ -61,7 +61,7 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, 
     // branch, which is never swept by host_zone_settle(), while leaving the
     // EXPERT_STAGING-role-first SCRATCH routing that 0igs/7f2e protect
     // untouched for every other (genuinely ephemeral) EXPERT_STAGING caller.
-    alloc_request req_act;
+    alloc_request req_act{};
     req_act.queue                               = &q;
     req_act.device                              = device_id;
     req_act.size                                = act_bytes;

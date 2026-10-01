@@ -123,6 +123,15 @@ if (BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-unified-private-seams.py
                 $<TARGET_FILE:ggml-sycl>)
     set_tests_properties(sycl-unified-private-seams PROPERTIES LABELS "sycl;source-contract;artifact")
+    # H13: the exit counter dump is compiled into the shipped library. GGML_SYCL_PRIVATE_TESTING is
+    # defined only on test targets, so a dump behind it never prints in llama-cli/-server/-bench.
+    # Pure Python over source text: allocates nothing, safe at any parallelism. It also runs its
+    # own mutation matrix, so a check that can no longer fail is itself a failure.
+    add_test(NAME test-sycl-counter-dump-gate
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-counter-dump.py
+                --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
+    set_tests_properties(test-sycl-counter-dump-gate PROPERTIES LABELS "sycl;source-contract;host")
 endif()
 
 # P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp
@@ -2886,6 +2895,73 @@ endif()
 add_test(NAME test-sycl-transient-alloc-intent-scope COMMAND test-sycl-transient-alloc-intent-scope)
 set_tests_properties(test-sycl-transient-alloc-intent-scope PROPERTIES
     LABELS "sycl;alloc;concurrency;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# H0 (llama.cpp-23mk step 0): the construction-site label on alloc_request, alloc_intent and
+# offload_buffer_request.  The labels are default member initialisers (__builtin_FILE/__builtin_LINE),
+# whose value depends on where the toolchain evaluates them, so the test asserts it on icpx: `T x{}`
+# reports the construction, a braceless `T x;` reports the class definition (why every production
+# declaration is written `T x{}`).  CPU-only: nothing allocates or reaches a device or the cache.
+add_executable(test-sycl-alloc-site-label
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-alloc-site-label.cpp
+)
+target_include_directories(test-sycl-alloc-site-label PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-alloc-site-label PRIVATE ${TRANSIENT_INTENT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-alloc-site-label PRIVATE ${TRANSIENT_INTENT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-alloc-site-label PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-alloc-site-label PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-alloc-site-label PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-alloc-site-label COMMAND test-sycl-alloc-site-label)
+set_tests_properties(test-sycl-alloc-site-label PROPERTIES
+    LABELS "sycl;alloc;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# What the exit counter dump prints and what the zone chokepoint counts and reports
+# (llama.cpp-23mk step 0).  Plain host code over a leaked table: no device, queue or cache is
+# reached, so it runs anywhere the library loads.  scripts/check-sycl-counter-dump.py gates that
+# the table is compiled into the shipped library; this gates what it does.
+add_executable(test-sycl-counter-dump-printer
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-counter-dump-printer.cpp
+)
+target_include_directories(test-sycl-counter-dump-printer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-counter-dump-printer PRIVATE ${TRANSIENT_INTENT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-counter-dump-printer PRIVATE ${TRANSIENT_INTENT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-counter-dump-printer PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-counter-dump-printer PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-counter-dump-printer PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-counter-dump-printer COMMAND test-sycl-counter-dump-printer)
+set_tests_properties(test-sycl-counter-dump-printer PROPERTIES
+    LABELS "sycl;alloc;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+add_test(NAME test-sycl-counter-dump-printer-trace-off COMMAND test-sycl-counter-dump-printer --trace-off)
+set_tests_properties(test-sycl-counter-dump-printer-trace-off PROPERTIES
+    LABELS "sycl;alloc;tdd"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )

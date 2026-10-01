@@ -495,10 +495,14 @@ inline bool ggml_sycl_graph_recording_this_thread() {
 // tests/test-sycl-transient-alloc-intent-scope.cpp reproduces all seven against the pre-fix
 // predicate. The wide predicate also disagreed with the release side, which has routed on the
 // calling thread since llama.cpp-oze0.
-inline ggml_sycl::alloc_intent ggml_sycl_transient_device_intent(const char * cohort_id) {
+inline ggml_sycl::alloc_intent ggml_sycl_transient_device_intent(const char * cohort_id,
+                                                                 const char * site_file = __builtin_FILE(),
+                                                                 int          site_line = __builtin_LINE()) {
     const bool graph_lifetime = ggml_sycl_graph_recording_this_thread();
 
     ggml_sycl::alloc_intent intent{};
+    intent.site_file = site_file;
+    intent.site_line = site_line;
     intent.role      = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::COMPUTE;
     intent.category  = graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::COMPUTE;
     intent.cohort_id = cohort_id;
@@ -523,10 +527,14 @@ inline ggml_sycl::alloc_intent ggml_sycl_transient_device_intent(const char * co
 // thread was paying for a standalone sycl::malloc_host, and skipping the pool, to satisfy a
 // graph it has no part in. Correctness is unchanged either way; this is the allocator-path half
 // of llama.cpp-f9tg.
-inline ggml_sycl::alloc_intent ggml_sycl_transient_host_pinned_intent(const char * cohort_id) {
+inline ggml_sycl::alloc_intent ggml_sycl_transient_host_pinned_intent(const char * cohort_id,
+                                                                      const char * site_file = __builtin_FILE(),
+                                                                      int          site_line = __builtin_LINE()) {
     const bool graph_lifetime = ggml_sycl_graph_recording_this_thread();
 
     ggml_sycl::alloc_intent intent{};
+    intent.site_file = site_file;
+    intent.site_line = site_line;
     intent.role      = graph_lifetime ? ggml_sycl::alloc_role::GRAPH_TMP : ggml_sycl::alloc_role::CONTROL;
     intent.category  = graph_lifetime ? ggml_sycl::runtime_category::GRAPH : ggml_sycl::runtime_category::CONTROL;
     intent.cohort_id = cohort_id;

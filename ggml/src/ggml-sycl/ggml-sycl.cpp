@@ -25152,6 +25152,7 @@ static ggml_sycl_device_info ggml_sycl_init() {
     }
 
     info.device_count = static_cast<int>(device_map.size());
+    ggml_sycl::unified_cache_dump_set_device_count(info.device_count);
     ggml_sycl_set_device_map(full_gpu_device_map.data(), static_cast<int>(full_gpu_device_map.size()));
     if (g_ggml_sycl_debug && !device_map.empty()) {
         std::string mapped;
@@ -37790,7 +37791,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
         }
     }
 
-    ggml_sycl::alloc_request req;
+    ggml_sycl::alloc_request req{};
     req.queue                               = alloc_stream;
     req.device                              = buft_ctx->device;
     req.size                                = size;
@@ -42839,7 +42840,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_ba
             primary_stream          = &(primary_dpct_dev.default_queue());
         }
 
-        ggml_sycl::alloc_request req;
+        ggml_sycl::alloc_request req{};
         req.queue                               = primary_stream;
         req.device                              = primary_device;
         req.size                                = size;
@@ -82004,7 +82005,7 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
             const size_t                 rounded = (bytes + 64 + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
             ggml_sycl::alloc_constraints c;
             c.must_host_pinned = true;
-            ggml_sycl::alloc_request req;
+            ggml_sycl::alloc_request req{};
             req.queue  = &q_dev;
             req.device = -1;
             req.size   = rounded;
@@ -82024,7 +82025,7 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
         // slot held but NEVER handed out; the caller gets a per-call buffer
         ggml_sycl::alloc_constraints c;
         c.must_host_pinned = true;
-        ggml_sycl::alloc_request req;
+        ggml_sycl::alloc_request req{};
         req.queue       = &q_dev;
         req.device      = -1;
         req.size        = bytes;
@@ -82035,7 +82036,7 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
     if (!ggml_sycl_attn_host_staging_enabled(kind)) {
         ggml_sycl::alloc_constraints c;
         c.must_host_pinned = true;
-        ggml_sycl::alloc_request req;
+        ggml_sycl::alloc_request req{};
         req.queue       = &q_dev;
         req.device      = -1;
         req.size        = bytes;
@@ -82053,7 +82054,7 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
         const size_t                 rounded = (bytes + 64 + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
         ggml_sycl::alloc_constraints c;
         c.must_host_pinned = true;
-        ggml_sycl::alloc_request req;
+        ggml_sycl::alloc_request req{};
         req.queue  = &q_dev;
         req.device = -1;
         req.size   = rounded;
@@ -82686,7 +82687,7 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
     if (attn_profile) {
         ggml_sycl::alloc_constraints vc;
         vc.must_host_pinned = true;
-        ggml_sycl::alloc_request vreq;
+        ggml_sycl::alloc_request vreq{};
         vreq.queue  = &q_dev;
         vreq.device = -1;
         vreq.size   = q_bytes;
@@ -100344,7 +100345,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
             return true;
         }
 
-        ggml_sycl::alloc_request rope_req;
+        ggml_sycl::alloc_request rope_req{};
         rope_req.queue                          = q;
         rope_req.device                         = ctx.device;
         rope_req.size                           = half_dim * sizeof(float);
@@ -100412,7 +100413,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
         }
 
         const size_t             bytes = ggml_nbytes(tensor);
-        ggml_sycl::alloc_request mat_req;
+        ggml_sycl::alloc_request mat_req{};
         mat_req.queue                          = q;
         mat_req.device                         = ctx.device;
         mat_req.size                           = bytes;
@@ -100579,7 +100580,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
             return ptr;
         }
 
-        ggml_sycl::alloc_request stage_req;
+        ggml_sycl::alloc_request stage_req{};
         stage_req.queue                          = q;
         stage_req.device                         = ctx.device;
         stage_req.size                           = bytes;
@@ -104431,7 +104432,7 @@ static void debug_validate_persistent_set_rows(ggml_backend_sycl_context & ctx) 
         GGML_LOG_WARN("[PERSISTENT-TG] SET_ROWS validate skipped: zero-sized dst buffer\n");
         return;
     }
-    ggml_sycl::alloc_request tmp_req;
+    ggml_sycl::alloc_request tmp_req{};
     tmp_req.queue                          = q;
     tmp_req.device                         = ctx.device;
     tmp_req.size                           = dst_bytes;
