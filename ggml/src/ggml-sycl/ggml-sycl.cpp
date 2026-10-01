@@ -42791,6 +42791,45 @@ ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type() {
     return &buffer_type_kv_host;
 }
 
+static const char * ggml_backend_sycl_cpu_activation_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return GGML_SYCL_NAME "_CpuActivation";
+}
+
+// Compute-buffer buft for the CPU backend (llama.cpp-38af). Same alloc/free/
+// accessor iface and context as the generic host buft -- the CPU backend's
+// activations are still pinned host memory from the same unified-cache path --
+// but a distinct identity via .get_name, and ggml_backend_sycl_device_supports_buft
+// deliberately does NOT list it.
+//
+// Why the identity matters: the CPU backend used to compute into the generic
+// SYCL_Host buft, which supports_buft accepts (weights live there too).
+// ggml_backend_sched_buffer_supported therefore reported "SYCL supports the
+// source buffer" for every CPU-produced activation, inserted no split-input
+// copy, and a SYCL op read that activation raw out of pinned host memory: a GPU
+// zero-copy read (placement ruling 2026-08-16), refused by binbcast while a
+// command graph records and silently performed by every other consumer. With
+// this buft the scheduler's standard split-input copy lands the activation in
+// the SYCL backend's own (planned, gallocr-sized) device compute buffer before
+// the SYCL split runs, outside any recording, at an address that is stable
+// across graph replay. Weights keep SYCL_Host and their executor.
+//
+// As with KV_Host, the keying mechanism is the .get_name FUNCTION POINTER: a
+// clone that reused the generic name function would be accepted by
+// supports_buft and silently defeat all of the above.
+ggml_backend_buffer_type_t ggml_backend_sycl_cpu_activation_buffer_type() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return nullptr;
+    }
+    static ggml_backend_buffer_type buffer_type_cpu_activation = [] {
+        ggml_backend_buffer_type t = *ggml_backend_sycl_host_buffer_type();
+        t.iface.get_name           = ggml_backend_sycl_cpu_activation_buffer_type_name;
+        return t;
+    }();
+    return &buffer_type_cpu_activation;
+}
+
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return nullptr;
@@ -110256,6 +110295,11 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_kv_host_buffer_type") == 0) {
         return (void *) ggml_backend_sycl_kv_host_buffer_type;
+    }
+    // llama.cpp-38af: llama-context picks the CPU backend's compute buft through
+    // this proc address under GGML_BACKEND_DL.
+    if (strcmp(name, "ggml_backend_sycl_cpu_activation_buffer_type") == 0) {
+        return (void *) ggml_backend_sycl_cpu_activation_buffer_type;
     }
     if (strcmp(name, "ggml_backend_sycl_kv_layer_on_device_from_dev") == 0) {
         return (void *) ggml_backend_sycl_kv_layer_on_device_from_dev;

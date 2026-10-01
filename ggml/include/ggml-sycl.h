@@ -99,6 +99,13 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_f
 // without perturbing other pinned-host consumers).
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type(void);
 
+// Compute-buffer type for the CPU backend: the same pinned host memory as the
+// generic host buft, with its own identity ("SYCL_CpuActivation") that SYCL
+// never reports as supported. The scheduler therefore copies every CPU-produced
+// activation into the SYCL backend's device compute buffer before a SYCL split
+// consumes it, instead of the SYCL op reading pinned host memory in place.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_cpu_activation_buffer_type(void);
+
 // Host compute buffer type - uses SYCL host memory (malloc_host) with SYCL buffer interface
 // This is used for TP compute buffers to allow cross-device data sharing.
 // Unlike host_buffer_type, this uses the SYCL buffer interface so it works with SYCL kernels.

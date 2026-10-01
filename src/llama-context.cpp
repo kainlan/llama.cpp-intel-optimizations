@@ -399,6 +399,26 @@ static decltype(&ggml_backend_sycl_ubatch_cache_store_layout1) llama_context_syc
 }
 #endif
 
+// llama.cpp-38af: the compute-buffer buft for the CPU backend when the first
+// device is a SYCL device. It is the generic host buft's pinned memory under a
+// distinct identity that the SYCL backend never reports as supported, so
+// ggml-backend-sched copies every CPU-produced activation into the SYCL
+// backend's device compute buffer instead of a SYCL op reading pinned host
+// memory in place. Returns nullptr for a non-SYCL device, or a SYCL module that
+// predates the export; the caller then keeps the device's generic host buft.
+static ggml_backend_buffer_type_t llama_context_sycl_cpu_activation_buft(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_SYCL)
+    return llama_context_dev_is_sycl(dev) ? ggml_backend_sycl_cpu_activation_buffer_type() : nullptr;
+#elif defined(GGML_BACKEND_DL)
+    auto proc = reinterpret_cast<decltype(&ggml_backend_sycl_cpu_activation_buffer_type)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_cpu_activation_buffer_type"));
+    return proc ? proc() : nullptr;
+#else
+    GGML_UNUSED(dev);
+    return nullptr;
+#endif
+}
+
 // llama.cpp-7n6n (wires nphx Task 5): a cheap, deterministic FNV-1a hash
 // over every loaded tensor's (name, byte size) -- a proxy for "this exact
 // set of quantized weights", used only to invalidate the persisted auto
@@ -892,6 +912,11 @@ llama_context::llama_context(
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
                 if (host_buft) {
                     buft = host_buft;
+                }
+                // SYCL: same pinned memory under an identity SYCL does not accept, so the
+                // scheduler copies CPU-produced activations to the device (llama.cpp-38af).
+                if (auto * activation_buft = llama_context_sycl_cpu_activation_buft(dev.dev)) {
+                    buft = activation_buft;
                 }
             }
 #ifdef GGML_USE_SYCL
