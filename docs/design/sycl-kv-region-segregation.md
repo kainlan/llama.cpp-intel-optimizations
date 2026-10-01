@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14af, by impl-moua-s, 2026-09-30. The revisions answer thirty-eight reviews:
+Design, revision 7.14ag, by impl-moua-s, 2026-09-30. The revisions answer thirty-nine reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -222,6 +222,12 @@ Design, revision 7.14af, by impl-moua-s, 2026-09-30. The revisions answer thirty
   §6.48. Revision 7.14af is one commit on top of `152cbc5bb` and answers no new review: 23mk's
   per-step figures confirm the §M84 re-derivation, `onednn_pp_declined` joins L4's census with a
   gate clause, and a decline withdraws the declined model's W publication.
+- design review r38 (design-moua-r38 on `eece79b83..152cbc5bb`: 0 Critical, 1 Important, 7
+  Minor, 4 nits), recorded in §6.49. Revision 7.14ag is one commit on top of `37cec63f2`: step 4
+  at L4+L6 is 23mk's two-step (b1) rule, with no clamp (a capped model gets G = P = 0 and
+  reserves 0 B), P's accessor is the one that exists at `d8a67422d`, the floors arm names each
+  cell's vehicle and commit, and the `onednn_pp_declined` census and clause (at) of 7.14af are
+  withdrawn under rulings §M86.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -2690,7 +2696,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    (`GGML_SYCL_PRIVATE_TESTING`). A correct run then has twice its measured
                    worst tail before the fault, so a fault means a lost publisher, not a slow
                    one. **That holds inside the measured shapes only, and the bound is stated
-                   and guarded (r27 m-9).** G0's F3 prints, with T and K, the bound its cells
+                   and guarded (r27 m-9).** G0's F3 prints, with `T_i` and K_i, the bound its cells
                    cover per card: the largest `n_ubatch` among the gate shapes, which include
                    C2b's ladder, whose top rung is 2048 at the default `n_batch`, and a
                    **provisional** node bound, the command-graph node count of the synthetic
@@ -3293,12 +3299,11 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            §M26a I-4, §M44 C-1), the load-stage ONEDNN sizing (`ensure_planned_arena_zones`,
            `:4464`, and the plan's twin at `:27658`) reads the no-floor getter, which carries W:
            `unified_cache_get_planned_onednn_pp_w_bytes` (today
-           `unified_cache_get_planned_onednn_scratchpad_bytes_stored`, `:2141`; renamed by
-           23mk's §4 commit; rulings §M32 I-4, §M33 I-G), and the with-floor one (`:2148-2160`)
-           is deleted, its floor branch gone with the term to 23mk's context transaction
-           (rulings §M21.3). Until (b2) both sides keep master's ONEDNN sizing less the
-           constant, W plus the sinks-aware G plus P (below, rulings §M84), so the witness compares
-           like with like.
+           `unified_cache_get_planned_onednn_scratchpad_bytes_stored`, `:2141`; renamed by 23mk's §4
+           commit; rulings §M32 I-4, §M33 I-G), and the with-floor one (`:2148-2160`) is deleted,
+           its floor branch gone with the term to 23mk's context transaction (rulings §M21.3). Until
+           (b2) both sides keep master's ONEDNN sizing less the constant, W plus the sinks-aware G
+           plus P (below, rulings §M84), so the witness compares like with like.
            **This dry run is the one definition both designs use (rulings §M26a m13):** the
            pack's charge ledger compared with the published getters; 23mk mirrors it. **The
            RUNTIME getter it reads (`unified-cache.cpp:1566-1575`) sums the D terms' stores and
@@ -3411,30 +3416,31 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         **The pack's capacity is that zone less the device's first-context reservation** (step
         3): 1132462080 B of ring rows, the same bytes master's RUNTIME held for the rows at 512
         (1696497664 − 564035584), plus the other C head slots;
-      - **Qwen3.5-35B-A3B** (256 experts, 512 × 2048 and 2048 × 512): weight slot 256 × (524288
-        + 32768) = **142606336 B** (136.0 MiB), which is `moe_onednn` at `local(t)` = 256.
-        RUNTIME = **142606336 + k × 2048 B**, with no floor (rulings §M32 I-2). At L4+L6 ONEDNN
-        is W + G + P = 33554432 + 201326592 + 33554432 = **268435456 B**. **P (rulings
-        §M84)** is one superseded pair of headroom, equal to the ONEDNN zone's stored value at
-        the step being sized, read from the W getter
-        (`unified_cache_get_planned_onednn_pp_w_bytes`) where the zone is sized, never carried
-        over from another step. At (b1), before 23mk's §4, that value is `onednn_reorder +
-        onednn_eligible` (Qwen at `-c 4096`: 51380224 B, 23mk:4770); at L4 and L6, after §4,
-        it is W alone (23mk 87da879f1:2001-2014), 33554432 B on Qwen; it is 0 on GPT-OSS 120B
-        and from (b2), where there is no block (an upper bound, ticket llama.cpp-z8fr;
-        23mk:4831-4865). The weight zone is **14380171264 − k × 2048 B** (13714.0 MiB before
-        `moe_ptr_table`); from (b2) ONEDNN is W, 33554432 B,
-        and the weight zone = **14615052288 − k × 2048 B** (13938.0 MiB), the Graph scratch
-        having moved into the first-context reservation (§2.4.3). 7.14e held RUNTIME at master's
-        536870912 B floor, so 394264576 − k × 2048 B of it (about 376 MiB) was room no planned
-        consumer drew, and its weight zone was 13985906688 B; that state is withdrawn. So are
-        7.14f to 7.14i's with-floor figures, a 14522777600 B pre-plan split and weight zones of
-        13958742016 − k × 1024 B and 14380171264 − k × 2048 B: they held ONEDNN at its
-        268435456 B constant at L4+L6, which §M37 Q3 removes there. On Qwen at `-c 4096` the
-        constant and W + G + P are the same number, so 14380171264 − k × 2048 B is also this
-        tree's weight zone, and the floors arm scores the constant's removal where the two
-        differ (§3.3). The pack's capacity is the zone less the reservation: 1610612736 B of
-        ring rows plus the other C head slots;
+      - **Qwen3.5-35B-A3B** (256 experts, 512 × 2048 and 2048 × 512): weight slot 256 × (524288 +
+        32768) = **142606336 B** (136.0 MiB), which is `moe_onednn` at `local(t)` = 256. RUNTIME =
+        **142606336 + k × 2048 B**, with no floor (rulings §M32 I-2). At L4+L6 ONEDNN is W + G + P =
+        33554432 + 201326592 + 33554432 = **268435456 B**. **P (rulings §M84)** is one superseded
+        pair of headroom, equal to the ONEDNN zone's stored value at the step being sized, read
+        where the zone is sized and never carried over from another step. The accessor is the stored
+        getter, `unified_cache_get_planned_onednn_scratchpad_bytes_stored` (`unified-cache.cpp:2148`
+        at `d8a67422d`), until 23mk's §4 commit renames it
+        `unified_cache_get_planned_onednn_pp_w_bytes` (23mk:2027); 23mk names no accessor for P
+        (23mk:4857-4865), so this sentence is the pin both designs read. At (b1), before 23mk's §4,
+        that value is `onednn_reorder + onednn_eligible` (Qwen at `-c 4096`: 51380224 B, 23mk:4770);
+        at L4 and L6, after §4, it is W alone (23mk 87da879f1:2001-2014), 33554432 B on Qwen; it is
+        0 on GPT-OSS 120B and from (b2), where there is no block (an upper bound, ticket
+        llama.cpp-z8fr; 23mk:4831-4865). The weight zone is **14380171264 − k × 2048 B** (13714.0
+        MiB before `moe_ptr_table`); from (b2) ONEDNN is W, 33554432 B, and the weight zone =
+        **14615052288 − k × 2048 B** (13938.0 MiB), the Graph scratch having moved into the
+        first-context reservation (§2.4.3). 7.14e held RUNTIME at master's 536870912 B floor, so
+        394264576 − k × 2048 B of it (about 376 MiB) was room no planned consumer drew, and its
+        weight zone was 13985906688 B; that state is withdrawn. So are 7.14f to 7.14i's with-floor
+        figures, a 14522777600 B pre-plan split and weight zones of 13958742016 − k × 1024 B and
+        14380171264 − k × 2048 B: they held ONEDNN at its 268435456 B constant at L4+L6, which §M37
+        Q3 removes there. On Qwen at `-c 4096` the constant and W + G + P are the same number, so
+        14380171264 − k × 2048 B is also this tree's weight zone, and the floors arm scores the
+        constant's removal where the two differ (§3.3). The pack's capacity is the zone less the
+        reservation: 1610612736 B of ring rows plus the other C head slots;
       - **RUNTIME's capacity is the planned sum of its named consumers (rulings §M32 I-2,
         §M38 C-2).** 7.14f said two consumers drew master's floor with no term, the
         compute-buffer chain and the MMID pools, and concluded that nothing planned drew it
@@ -3786,9 +3792,9 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           (1)), the scratchpad from L4+L6 (§M29a), and the Graph scratch from 23mk's `REGION`
           conversion, (b2), which lands after L6 (the Graph-scratch commit, below; rulings §M44
           C-1). **At L4+L6 the zone's consumers are W and the Graph scratch, each sized by its
-          own function,** so the 268435456 B constant and the `max(268435456, …)` form go in
-          L4+L6, and step 4 sizes ONEDNN at W + G + P (P as §2.4.2 defines it, rulings §M84: the W
-          getter's value at this step, 0 where G = 0), G being master's floor function over the
+          own function,** so the 268435456 B constant and the `max(268435456, …)` form go in L4+L6,
+          and step 4 sizes ONEDNN at W + G + P (P as §2.4.2 pins it, rulings §M84: the ONEDNN zone's
+          stored value at this step, 0 where G = 0), G being master's floor function over the
           envelope's shape with (b1)'s sinks input. From (b2) W is the zone's only consumer and
           `ensured_ONEDNN = onednn_pp_w`. **(b1) lands before fkpg (a) and L4, so G is 0 B on
           GPT-OSS 120B (rulings §M44 C-1, §M46b I-4):** without it master's function counts
@@ -3812,9 +3818,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           (b1)'s 304087040 B zone (14344519680 − k × 2048 B). From (b2) ONEDNN is W and the weight
           zone gains a further **234881024 B** (224.0 MiB), 270532608 B (258.0 MiB) in all over
           (b1)'s, to become **14615052288 − k × 2048 B** (13938.0 MiB). From L4+L6 the pre-plan
-          layout puts
-          ONEDNN at 0 as well, the split is **14791213056 B** (14106.0 MiB), and step 4 grows
-          ONEDNN to W + G + P;
+          layout puts ONEDNN at 0 as well, the split is **14791213056 B** (14106.0 MiB), and step 4
+          grows ONEDNN to W + G + P;
         - **SCRATCH.** Its floor is load-bearing today, and the consumers that need it are named
           here as defects: every SCRATCH draw in 23mk's allocation census that no enum term
           covers. **The list is the one 23mk's appendix derives (23mk rev 4.11, `93050c979`;
@@ -4105,15 +4110,14 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         `GGML_SYCL_ONEDNN_GRAPH_INTERIM_REASON_{NONE, TP, CAPPED, CAPACITY}`), on the call's
         per-shape term and the **planned** interim capacity, the Graph block's size G
         (rulings §M79 (a)): `interim_tp`, `interim_capped` (stored + G + P over the ONEDNN cap,
-        23mk:4795-4796: 0 B
-        reserved for G, SDPA declined on that device) or `interim_capacity` (the term above G).
-        That is an allowed interim form, and (b2) deletes it and moves the decision to per-layer
-        admission in the
-        fit, `scratch_unplaced`, whose frozen mask the same read then consults. **The reader is
-        23mk's routing read, before the plan (23mk `a8cfbf901` rev 4.19a, §4.8 "Routing reads
-        the decline before the plan", at 23mk's head `87da879f1`, provisional while
-        design-23mk-r25 runs; r28 m-1):** each of the three dispatch arms, `fattn.cpp:2788`
-        (FORCE_PATH), `:3123` (every non-D512 shape) and `:3907` (D = 512) at `d8a67422d`, calls
+        23mk:4795-4796: G = P = 0, so 0 B is reserved, and SDPA is declined on that device) or
+        `interim_capacity` (the term above G). That is an allowed interim form, and (b2) deletes it
+        and moves the decision to per-layer admission in the fit, `scratch_unplaced`, whose frozen
+        mask the same read then consults. **The reader is 23mk's routing read, before the plan (23mk
+        `a8cfbf901` rev 4.19a, §4.8 "Routing reads the decline before the plan", at 23mk's head
+        `87da879f1`, provisional while design-23mk-r25 runs; r28 m-1):** each of the three dispatch
+        arms, `fattn.cpp:2788` (FORCE_PATH), `:3123` (every non-D512 shape) and `:3907` (D = 512) at
+        `d8a67422d`, calls
         `ggml_sycl_fattn_onednn_dispatch_routed(ctx, p, d_v, multi_seq, site, route)`, which
         reads `ggml_sycl_onednn_graph_dispatch_declined(ctx, p)` (in (b1) the interim seam above,
         from (b2) the frozen mask's `onednn_graph_route_decline(ctx, p.kv_layer)`) **before**
@@ -4186,19 +4190,18 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         `[SYCL-COUNTER] dev=<d> name=onednn_sdpa_fallback_after_admit value=0` on that device
         (§M74 (h), (i) (4): the total, never a sum over the `{site}` lines); a run with no `end`
         line, or an `end` count that differs from the devices listed, is VOID, an aborting run
-        prints no dump and is VOID, and N > 0 needs no witness (§M71 (c)). A reading taken
-        before the SDPA counters' producer lands prints 0 and is VOID (§M74 (i) (2)). 23mk 4.19j
-        (`87da879f1`, r24 m-6) prints every listed
-        snapshot entry of the §5.1 dump from step 0, as `value=not_captured` before its lands step;
-        no moua arm reads one, and one read here that prints `not_captured` is VOID, never a zero.
-        7.14s read
-        a `GGML_SYCL_PRIVATE_TESTING` exit dump, which never prints in `llama-completion`,
-        `llama-cli` or `llama-server`, since the macro is defined only on test targets (§M74),
-        so every vehicle arm that scored it was VOID by construction. The deletion of the direct
-        path has one owner: 23mk `8547a22f0` (b2) item 8 deletes it with its reuse pool, the
-        pool try at `:11704` and its test hooks (rulings §M68 (b); E-ONEDNN-GRAPH-DIRECT;
-        `50b1f8f50` :4786), and 23mk's H3 "(b1)'s interim G" arm pins that it has no caller from
-        (b1) on. **The runtime miss's arm (r26 I-3; rulings §M72), 23mk's to carry and moua's to
+        prints no dump and is VOID, and N > 0 needs no witness (§M71 (c)). A reading taken before
+        the SDPA counters' producer lands prints 0 and is VOID (§M74 (i) (2)). 23mk 4.19j
+        (`87da879f1`, r24 m-6) prints every listed snapshot entry of the §5.1 dump from step 0, as
+        `value=not_captured` before its lands step; no moua arm reads one, and one read here that
+        prints `not_captured` is VOID, never a zero (§3.4, "How a dump is read"). 7.14s read a
+        `GGML_SYCL_PRIVATE_TESTING` exit dump, which never prints in `llama-completion`, `llama-cli`
+        or `llama-server`, since the macro is defined only on test targets (§M74), so every vehicle
+        arm that scored it was VOID by construction. The deletion of the direct path has one owner:
+        23mk `8547a22f0` (b2) item 8 deletes it with its reuse pool, the pool try at `:11704` and
+        its test hooks (rulings §M68 (b); E-ONEDNN-GRAPH-DIRECT; `50b1f8f50` :4786), and 23mk's H3
+        "(b1)'s interim G" arm pins that it has no caller from (b1) on. **The runtime miss's arm
+        (r26 I-3; rulings §M72), 23mk's to carry and moua's to
         cite:** a fixture draw one byte above the planned within-ubatch peak prints
         `[ZONE-PLAN-BUG]` once and aborts, with `GGML_SYCL_STRICT_LEASES` unset, and allocates
         nothing. **It is 23mk H3's TERMINAL death test (23mk `db61cb321`):** the channel is a
@@ -4249,45 +4252,56 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           `ggml/src/ggml-sycl/tests/test-unified-runtime-alloc.cpp:996`, "inventory would exceed
           the conservative ONEDNN tail bound", reads the W getter, since it bounds the
           load-stage tail.
-      **The order is (b1) → fkpg (a) → L4 → L6 → (b2) (rulings §M44 C-1, §M44b, §M46b I-4; L4,
-      L5, L6 and L7 are one commit with no merge point between them, §4, rulings §M46 m-5),** so
-      no landing leaves a gap (the floor gone, the charge not yet landed) or a double charge.
-      **Between L4+L6 and (b2)** step 4 sizes ONEDNN as master does, less the constant, over the
-      ledger: `min(charged_ONEDNN + G + P, max(available / 4, charged_ONEDNN))`, where G is (b1)'s
-      sinks-aware floor over the published shape (`onednn_graph_scratch_zone_floor_bytes_swa`,
-      `:2148-2160`; 0 with the allocator off) and P is the W getter's value when G > 0 (§2.4.2,
-      rulings §M84; 0 otherwise). G and P are capacity for the interim, like a floor (§2.4.5,
-      "A floor is not a term"), never ledger entries, and witness 1's ONEDNN check reads that
-      sizing. The dry run computes the same expression from the getters, P read from the same W
-      getter, so it grows nothing exactly when the published W bytes are at most the ledger's
-      ONEDNN terms, which is what it tests. The cap test is on `stored + G + P`, as 23mk:4795-4796
-      tests it at (b1), so one model is capped by one rule at (b1) and at L4+L6. The clamp
-      cannot bind on the merge-gate shapes, so ONEDNN is 23592960 B on GPT-OSS 120B and
-      268435456 B on Qwen there. Where it binds, the Graph draw that no longer
-      fits is not sent to the direct overflow: (b1) declines oneDNN SDPA on that device as
-      `interim_capped`, with one `oneDNN SDPA declined` WARN per (context, device, layer)
-      carrying the running count (rulings §M71 (a)), and a runtime miss is the TERMINAL
-      `[ZONE-PLAN-BUG]` channel, which aborts (rulings §M64 (a), §M70, §M72; "The Graph-scratch
-      commit", above). The constant goes in L4+L6 (rulings §M37 Q3),
-      since the zone's remaining consumers, W and the Graph scratch, are then each sized by its
-      own function. Between (b1) and L4 the load stage is master's with (b1)'s G and P: 268435456 B
-      on both gate shapes at the published 512, and 304087040 B on Qwen at `-c 4096` once fkpg (a)
-      lands (P is `onednn_reorder + onednn_eligible` before 23mk's §4). **The final sizing is not
-      268435456 B (rulings §M37 Q3; 23mk 4.10
-      relay):** from (b2) ONEDNN is `onednn_pp_w` exactly, 23592960 B on GPT-OSS 120B and
-      33554432 B on Qwen (the end states, above). 7.14f to 7.14h said "the interim and the final
-      sizing are both 268435456 B", which predates §M37 Q3. 7.14j's hard edge, the whole commit
-      before L4+L6, was cyclic: the conversion needs L4's pending ranges and claims and L6's
-      transaction steps (r18 C-1). H7ap's C-rule arm is an arm of (b2) again (rulings §M26a
-      I-4), scored on the post-(b2) tree, which carries step 4's ledger since (b2) lands after
-      L6 (rulings §M44 addendum; §3.3). §M43's L4+L6 scoring belonged to the hard edge and goes
-      with it. So the early stage packs against the zones it admits, and B's ranges are recorded
-      inside them. **The shared rule (rulings §Z8 I-3, §M13a): the sentence is this design's,
-      the message is 23mk's, and each design mirrors both byte for byte.** The sentence: "an
-      arena rebuild that meets live bytes or any pending range refuses by name; it never
-      destroys them, and the `GGML_ABORT` at `ggml-sycl.cpp:16215` becomes that named refusal."
-      `ensure_planned_arena_zones` counts any pending range on the device as live, beside zone
-      bytes, chunk leases and live scratch, and `compute_and_store_plan_for_inventory` returns
+      **The order is (b1) → fkpg (a) → L4 → L6 → (b2) (rulings §M44 C-1, §M44b, §M46b I-4; L4, L5,
+      L6 and L7 are one commit with no merge point between them, §4, rulings §M46 m-5),** so no
+      landing leaves a gap (the floor gone, the charge not yet landed) or a double charge. **Between
+      L4+L6 and (b2)** step 4 sizes ONEDNN as master does, less the constant, over the ledger, by
+      23mk's (b1) rule (23mk:4795-4796) in two steps, never by master's clamp to the cap. G_raw is
+      (b1)'s sinks-aware floor over the published shape
+      (`onednn_graph_scratch_zone_floor_bytes_swa`, `unified-cache.cpp:2034-2111` at `d8a67422d`; 0
+      with the allocator off) and P_raw is the ONEDNN zone's stored value when G_raw > 0 (§2.4.2,
+      rulings §M84; 0 otherwise). **If `charged_ONEDNN + G_raw + P_raw > max(available / 4,
+      charged_ONEDNN)`, then G = P = 0, the model's oneDNN SDPA declines on that device
+      (`interim_capped`) and ONEDNN = `charged_ONEDNN`; otherwise ONEDNN = `charged_ONEDNN + G_raw +
+      P_raw`.** The sum is replaced, never cut to the cap: master's `min(charged + G + P, cap)`
+      clamp does not survive, because it would reserve up to a quarter of the device budget for a
+      model that declined, an idle reservation that breaks plan == reality (P4). The cap test reads
+      the pre-cap G_raw and P_raw; every later reader (the replay, the per-step P) reads the
+      post-cap G. G and P are capacity for the interim, like a floor (§2.4.5, "A floor is not a
+      term"), never ledger entries, and witness 1's ONEDNN check reads that same two-step rule. The
+      dry run computes the same rule from the getters, so it grows nothing exactly when the
+      published W bytes are at most the ledger's ONEDNN terms, which is what it tests. The cap test
+      is on `stored + G_raw + P_raw`, as 23mk:4795-4796 tests it at (b1), so one model is capped by
+      one rule at (b1) and at L4+L6. The cap cannot bind on the merge-gate shapes, so no gate figure
+      moves: ONEDNN is 23592960 B on GPT-OSS 120B and 268435456 B on Qwen there. **The capped cell
+      (r38 I-1), an arm of the L4+L6 commit:** a pure-host fixture whose `charged_ONEDNN + G_raw +
+      P_raw` exceeds the cap pins ONEDNN = `charged_ONEDNN`, G = P = 0 and the `interim_capped`
+      decline; its RED is a tree that keeps `min(...)`, which reads the cap, and the cell is VOID if
+      its sum does not exceed the cap. 23mk H3's "(b1)'s interim G" capped fixture is the same cell
+      at (b1). Where it binds, the Graph draw that no longer fits is not sent to the direct
+      overflow: (b1) declines oneDNN SDPA on that device as `interim_capped`, with one `oneDNN SDPA
+      declined` WARN per (context, device, layer) carrying the running count (rulings §M71 (a)), and
+      a runtime miss is the TERMINAL `[ZONE-PLAN-BUG]` channel, which aborts (rulings §M64 (a),
+      §M70, §M72; "The Graph-scratch commit", above). The constant goes in L4+L6 (rulings §M37 Q3),
+      since the zone's remaining consumers, W and the Graph scratch, are then each sized by its own
+      function. Between (b1) and L4 the load stage is master's with (b1)'s G and P: 268435456 B on
+      both gate shapes at the published 512, and 304087040 B on Qwen at `-c 4096` once fkpg (a)
+      lands (P is `onednn_reorder + onednn_eligible` before 23mk's §4); after §4 and before L4 it is
+      `max(268435456, W + G + P)`, 268435456 B on Qwen at both shapes (23mk:6032-6047). **The final
+      sizing is not 268435456 B (rulings §M37 Q3; 23mk 4.10 relay):** from (b2) ONEDNN is
+      `onednn_pp_w` exactly, 23592960 B on GPT-OSS 120B and 33554432 B on Qwen (the end states,
+      above). 7.14f to 7.14h said "the interim and the final sizing are both 268435456 B", which
+      predates §M37 Q3. 7.14j's hard edge, the whole commit before L4+L6, was cyclic: the conversion
+      needs L4's pending ranges and claims and L6's transaction steps (r18 C-1). H7ap's C-rule arm
+      is an arm of (b2) again (rulings §M26a I-4), scored on the post-(b2) tree, which carries step
+      4's ledger since (b2) lands after L6 (rulings §M44 addendum; §3.3). §M43's L4+L6 scoring
+      belonged to the hard edge and goes with it. So the early stage packs against the zones it
+      admits, and B's ranges are recorded inside them. **The shared rule (rulings §Z8 I-3, §M13a):
+      the sentence is this design's, the message is 23mk's, and each design mirrors both byte for
+      byte.** The sentence: "an arena rebuild that meets live bytes or any pending range refuses by
+      name; it never destroys them, and the `GGML_ABORT` at `ggml-sycl.cpp:16215` becomes that named
+      refusal." `ensure_planned_arena_zones` counts any pending range on the device as live, beside
+      zone bytes, chunk leases and live scratch, and `compute_and_store_plan_for_inventory` returns
       `bool`. On the refusal it logs the message, `[SYCL-PLAN] model load refused: arena zones
       on device %d cannot be rebuilt while live allocations or pending ranges remain (zone bytes
       %.1f MB, chunk leases %zu, scratch %.1f MB, pending ranges %zu)`, stores no plan and
@@ -8429,8 +8443,8 @@ means that.
       read from the plan (rulings §M23 (2)), and `ring`, `moe_control` and `mmid_workspace` no
       zone term (class C; their first-context values go to the reservation, below); step 4,
       sized from the ledger, grows RUNTIME from 0 (no floor on an arena device, rulings §M32
-      I-2) to 564035584 + k × 1024 B, leaves SCRATCH at 536870912 B, its floor (rulings §M25
-      I-1), and grows ONEDNN from 0 to its D term, 23mk's `onednn_pp_w`, plus G: 23592960 + 0 B
+      I-2) to 564035584 + k × 1024 B, leaves SCRATCH at 536870912 B, its floor (rulings §M25 I-1),
+      and grows ONEDNN from 0 to its D term, 23mk's `onednn_pp_w`, plus G and P: 23592960 + 0 + 0 B
       (the floors arm, below; rulings §M44 C-1); the weight zone is 14203584512 − k × 1024 B;
       `plan.weight_vram_bytes` plus the device's `FIRST_CONTEXT` reservation is at most it; B's
       ranges fit; and the late stage rebuilds nothing and refuses nothing. Qwen3.5-35B-A3B on
@@ -8484,10 +8498,17 @@ means that.
       (7.14f to 7.14i's figures). RED: that tree ensures 244842496 B of ONEDNN no term charged
       on GPT-OSS 120B at L4+L6, 234881024 B on Qwen from (b2), and, at `n_ctx` 512, 134217728 B
       on Qwen at L4+L6, and the exact ONEDNN bytes catch it; a scorer that reads 256.0 MB on
-      GPT-OSS 120B is the arm's own RED. **Non-vacuity (rulings §M84):** on Qwen at `-c 4096`
-      at L4+L6 the kept tree and the correct tree are the same number, 268435456 B, so that
-      cell cannot fire and is not scored as a RED; the RED rests on the three cells above,
-      each nonzero by arithmetic, and the arm is VOID if none of them is run.
+      GPT-OSS 120B is the arm's own RED. **Non-vacuity (rulings §M84):** on Qwen at `-c 4096` at
+      L4+L6 the kept tree and the correct tree are the same number, 268435456 B, so that cell cannot
+      fire and is not scored as a RED; the RED rests on the three cells above, each nonzero by
+      arithmetic. **The arm is VOID unless, at the commit under test, at least one cell runnable at
+      that commit ran to a non-VOID reading and scored its exact kept-tree-minus-correct-tree bytes
+      (r38 m-3).** A cell that ran and came back VOID counts as not run, and VOID is never a pass.
+      Runnable at L4+L6: GPT-OSS 120B at `-c 4096 -ub 512` (244842496 B) and Qwen at `-c 512 -ub
+      512` on the landed tree (134217728 B; fixture: the gate's Qwen model,
+      `Qwen3.6-35B-A3B-UD-Q5_K_S.gguf`, where G is the 64 MiB minimum, 67108864 B, since the shape's
+      25165824 B is below it, and P = W = 33554432 B, a block existing since G > 0). Runnable at
+      (b2), an arm of that commit too: Qwen at `-c 4096 -ub 512` (234881024 B).
       **The interim is pre-registered (rulings §M44 C-1):** GPT-OSS 120B's G is 0 B at L4+L6, by
       (b1)'s sinks input. RED: L4+L6 with (b1)'s sinks input reverted (7.14k called it "the
       pre-(b1) tree", which read as master; rulings §M46 m-4), where master's function counts
@@ -8499,9 +8520,9 @@ means that.
       bytes catch it. These per-step figures agree with 23mk 4.13's for GPT-OSS 120B, whose whole
       244842496 B lands at L6. Qwen's split is re-derived from (b1)'s 304087040 B zone, not from
       the constant (23mk 4.19i's relay; rulings §M84; 23mk:6032-6047): 35651584 B at L6 and
-      234881024 B at (b2). 7.14j's order check for the hard edge is
-      withdrawn with the edge (rulings §M44 C-1); (b2) cannot
-      land before L6, whose steps it calls. **Per step (rulings §M44b (4); 23mk's relay), ONEDNN
+      234881024 B at (b2). 7.14j's order check for the hard edge is withdrawn with the edge (rulings
+      §M44 C-1); (b2) cannot land before L6, whose steps it calls. **Per step (rulings §M44b (4);
+      23mk's relay), ONEDNN
       on the two gates, each figure exact:**
 
       | step | GPT-OSS 120B ONEDNN | moved | Qwen ONEDNN | moved |
@@ -9089,21 +9110,22 @@ means that.
         source, fails.
       - In `ggml_sycl_graph_submit`, all three of the descriptor's fields are read from meta's
         record and meta's node count, and from nothing else.
-    - **A measurement print never ships (r33 n-1; r34 m-6; r35 m-4; rulings §M81 (a)).** The
-      clause is `git grep -n 'W-ORDER-MEASURE' -- ':!docs/' ':!.llm-wiki/'
-      ':!tests/test-sycl-kv-region-source.py'` returning nothing, and it runs on every commit
-      that touches the W-order files. The design docs and the wiki legitimately quote the
-      string, and the gate's own file, `tests/test-sycl-kv-region-source.py` (the H7 source gate,
-      §3.1), necessarily contains it, so all three are excluded. No split literal is used. The
-      gate's own run on a correct tree returns 0. **Its positive control runs on a throwaway
-      tree (r36 m-5):** `git worktree add --detach <tmp>` at the tested commit; the print of
-      §3.2 step 3 is written into a new file there, outside `docs/`, `.llm-wiki/` and the gate
-      file, and `git add`ed (index only, never committed), so `git grep` sees it as tracked;
-      the exact clause above is run there and must return exactly that one hit; the worktree
-      is then removed with `git worktree remove --force <tmp>`, which the staged file makes
-      necessary, in a trap that also runs on interrupt. `<tmp>` is a fresh path under the
-      gate's scratch directory, outside the repo. The correct-tree run is the real
-      checkout's, and the real checkout is never edited.
+    - **A measurement print never ships (r33 n-1; r34 m-6; r35 m-4; rulings §M81 (a)).** The clause
+      is `git grep -n 'W-ORDER-MEASURE' -- ':!docs/' ':!.llm-wiki/'
+      ':!tests/test-sycl-kv-region-source.py'` returning nothing, and it runs on every commit that
+      touches the W-order files. The design docs and the wiki legitimately quote the string, and the
+      gate's own file, `tests/test-sycl-kv-region-source.py` (the H7 source gate, §3.1), necessarily
+      contains it, so all three are excluded. No split literal is used. The gate's own run on a
+      correct tree returns 0. **Its positive control runs on a throwaway tree (r36 m-5):** `git
+      worktree add --detach <tmp>` at the tested commit; the print of §3.2 step 3 is written into a
+      new file there, outside `docs/`, `.llm-wiki/` and the gate file, and `git add`ed (index only,
+      never committed), so `git grep` sees it as tracked; the exact clause above is run there and
+      must return exactly that one hit; the worktree is then removed with `git worktree remove
+      --force <tmp>`, which the staged file makes necessary, in a `finally` block with a SIGTERM
+      handler. `<tmp>` is a fresh `tempfile.mkdtemp` path under the gate's scratch directory,
+      outside the repo, and the gate runs `git worktree prune` before the add, so a run killed
+      without cleanup (SIGKILL, the harness timeout) leaves nothing that a later run trips on (r38
+      m-7). The correct-tree run is the real checkout's, and the real checkout is never edited.
     - **Mutation witnesses.**
       - The comparison moved into the oneDNN PP caller on `src1->ne[1]`: the positive and
         restriction clauses fail, and the G2 bound cell's (a) prints 0 WARNs.
@@ -9135,15 +9157,6 @@ means that.
         the assignment deleted, meta's node count stays at its default 0, which a restriction
         reading would pass; the positive reading does not. Without this witness the node half
         of every scored replay's WARN 0 would be vacuous.
-  - (at) **L4 leaves no `onednn_pp_declined` (23mk 4.19j and 4.19l; §2.4.2).** On the tree that
-    lands L4, `git grep -n -w 'onednn_pp_declined' -- ':!docs/' ':!.llm-wiki/'
-    ':!tests/test-sycl-kv-region-source.py'` returns nothing: the plan flag, the context member
-    `ggml_backend_sycl_context::onednn_pp_declined`, the WARN's caller and 23mk's H3 setter for the
-    flag are all gone with the lazy W grow they guard. It is scored on L4's tree only, since a
-    (b1) tree legitimately carries the identifier. Its positive control is the throwaway worktree
-    of the no-print clause: a new file naming the identifier, `git add`ed there, returns exactly
-    that one hit. Mutation witness: the flag kept in the plan struct or the context member kept,
-    which the clause finds.
   RED: every check fires on the pre-change tree, and the count is recorded.
 - **H8 region scope under concurrency (r1 I6, third point).**
   - The registry and scope logic is factored into a SYCL-free header, `kv-region-registry.hpp`.
@@ -9580,10 +9593,10 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
        listed run is non-void. A shape that legitimately never takes the oneDNN PP W path is
        dropped from the list only by a lead ruling, never silently.
      - **The evidence record is the re-pin commit's message (r34 n-2)**, since `/tmp` does not
-       survive a reboot. It carries, for each per-selector log: its file name, shape, selector,
-       line count and its single maximum `graph_nodes` line verbatim; then `N_max`, `B`, and
-       each card's `T` and `C`. The log directory is named on the ticket, and the logs are
-       supporting files.
+       survive a reboot. It carries, for each per-selector log: its file name, shape, selector, line
+       count and its single maximum `graph_nodes` line verbatim; then `N_max`, `B`, and each card's
+       `C_i`, `job_timeout_ms_i`, `T_i` and `t_i`, then POLLS, `t_min`, `T_max` and K (r38 m-6). The
+       log directory is named on the ticket, and the logs are supporting files.
      - The WARN is not a source for this, since it prints once per (`ctx_id`, device), and
        `ggml_sycl_test_set_w_order_bound` exists only in test binaries. The print and its
        worktree are discarded after step 5's record is written. No scored arm reads the WARN's node
@@ -9595,16 +9608,14 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
      lead re-runs G0 F3 with `--f3-nodes B` **on both cards** (`level_zero:0`, then `level_zero:1`),
      so that F3's
      verdict covers the bound that ships on each, and both must pass. If F3 passes at `B`, the
-     commit sets `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` to `B`, re-pins
-     `GGML_SYCL_W_ORDER_CHAIN_K` to ⌈2 `T_max` / `t_min`⌉, where `T_max` is the larger of the
-     two cards' `T_i` printed at `B` and `t_min` the smaller of the two cards' `t_i` =
-     (POLLS / `C_i`) × (`job_timeout_ms_i` / 2) from G0's printed values, the poll count
-     staying as step 2 compiled it; this is step 2's formula, at `B` (r36 m-3, m-4), the
-     conservative K, one value for both cards, and drops "provisional" from the constant's comment
-     and from §2.4.2. If F3
-     fails at `B` (a cell caps with K waiters, or a control fails), that is a stop for a lead
-     ruling, never a silent re-pin. There is no `N_max > N_prov` trigger: the re-run happens
-     whenever the bound is re-pinned.
+     commit sets `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` to `B`, re-pins `GGML_SYCL_W_ORDER_CHAIN_K`
+     to ⌈2 `T_max` / `t_min`⌉, where `T_max` is the larger of the two cards' `T_i` printed at `B`
+     and `t_min` the smaller of the two cards' `t_i` = (POLLS / `C_i`) × (`job_timeout_ms_i` / 2)
+     from G0's printed values, the poll count staying as step 2 compiled it; this is step 2's
+     formula, at `B` (r36 m-3, m-4), the conservative K, one value for both cards, and drops
+     "provisional" from the constant's comment and from §2.4.2. If F3 fails at `B` (a cell caps with
+     K waiters, or a control fails), that is a stop for a lead ruling, never a silent re-pin. There
+     is no `N_max > N_prov` trigger: the re-run happens whenever the bound is re-pinned.
   5. **The closing check (r33 n-2; r34 m-5).** On the re-pinned tree, the lead re-runs step 3's
      runs, the same list and one log file per run named by its selector, with the print in a
      separate worktree. Each run's log must carry at least one `[W-ORDER-MEASURE]` line with
@@ -11015,19 +11026,18 @@ placement and demotion run. The rules for every such arm:
     (`gptoss120b-b1-2026-09-17.log:196`, `:2026`); Qwen `device_groups=4646 host_groups=5594`,
     KV 5 device / 5 host layers (`glkg-qwen35b-a3b-b1-2026-09-17.log:222`, `:2730`).
   - **Orientation, not a gate.** The pack's capacity is this design's weight zone less the
-    reservation, which on Qwen at L4+L6 is 559.8 MiB below master's weight zone: 12178.0 −
-    (13714.0 − 2095.8) = 559.8 MiB, about 271 fewer groups at 2.0625 MiB per group (9582.4 MiB /
-    4646). On GPT-OSS 120B it is 12232.1 − (13545.6 − 1488.0) = 174.5 MiB, about 14 fewer groups
-    at 12.61 MiB. Both already count the ONEDNN constant's return at L4+L6 (rulings §M37 Q3). On
-    Qwen that figure has the Graph scratch's 192.0 MiB and P's 32.0 MiB (P = W, rulings §M84)
-    still in ONEDNN. **From (b2) it moves
-    (rulings §M54):** ONEDNN returns G and the reservation does not take it, so the capacity is
-    13938.0 − 2095.8 = 11842.2 MiB, 335.8 MiB below master's weight zone, about 163 fewer
-    groups. The Graph scratch is then charged by the context's fit after the KV extents, from
-    whatever `REGION` room the pack and the KV leave, and a layer it does not fit declines SDPA.
-    Master already demotes KV at this shape (5 of 10 layers above), so the replay may admit few
-    or no Qwen layers to SDPA from (b2); that is §M54's order, and the replay pre-registers the
-    count (§3.3). jzvq's terms reduce both a little more.
+    reservation, which on Qwen at L4+L6 is 559.8 MiB below master's weight zone: 12178.0 − (13714.0
+    − 2095.8) = 559.8 MiB, about 271 fewer groups at 2.0625 MiB per group (9582.4 MiB / 4646). On
+    GPT-OSS 120B it is 12232.1 − (13545.6 − 1488.0) = 174.5 MiB, about 14 fewer groups at 12.61 MiB.
+    Both count the L4+L6 sizing; on Qwen at `-c 4096` the constant's removal moves nothing
+    (268435456 B either way, §3.3), and that figure has the Graph scratch's 192.0 MiB and P's 32.0
+    MiB (P = W, rulings §M84) still in ONEDNN. **From (b2) it moves (rulings §M54):** ONEDNN returns
+    G and the reservation does not take it, so the capacity is 13938.0 − 2095.8 = 11842.2 MiB, 335.8
+    MiB below master's weight zone, about 163 fewer groups. The Graph scratch is then charged by the
+    context's fit after the KV extents, from whatever `REGION` room the pack and the KV leave, and a
+    layer it does not fit declines SDPA. Master already demotes KV at this shape (5 of 10 layers
+    above), so the replay may admit few or no Qwen layers to SDPA from (b2); that is §M54's order,
+    and the replay pre-registers the count (§3.3). jzvq's terms reduce both a little more.
   - **llama-server's default launch (rulings §M41 I-3):** a replay row, not a GPU run. The
     replay also packs Qwen at `n_seq_max` 4 and computes its `device_groups`, `host_groups` and
     KV layer counts the same way; the recurrent state's 197591040 B (188.4 MiB) more is about 91
@@ -11101,6 +11111,10 @@ ordered list, zeros included, `[SYCL-COUNTER] dev=%d name=%s value=%llu`, then o
   `{force|default|d512}` by the reading site (§M74 (i) (2) as amended); and this design scores
   none of that counter's keys, nor its total.
 - **Before the producer lands** a field prints 0, and a reading of it is VOID (§M74 (i) (2)).
+- **Snapshot entries (23mk 4.19j, `87da879f1`, r24 m-6):** 23mk prints every listed snapshot
+  entry of the §5.1 dump from step 0, as `value=not_captured` before its lands step. No moua
+  arm reads one, since no arm here names a snapshot-keyed entry, and a read that prints
+  `not_captured` is VOID, never a zero.
 - **Names** are §M74 (h)'s, one per counter. This design reads `onednn_sdpa_executed`, the
   `onednn_sdpa_fallback_after_admit` total, and `ext_alloc_count` (the last through its
   accessor, in a test child). A bare `fallback_after_admit` is not a field name.
@@ -11343,25 +11357,18 @@ I-A, §V16a).**
   the `FIRST_CONTEXT` pending term recorded with the `WEIGHT` ranges, retagged at A4 step 3,
   taken over at the first context's step 5 in one group-mutex section, re-recorded by guard
   phase 1, and cleared at unload; H7ap's first-context arm.
-- **L4+L6, the zones (rulings §M32 I-2; §M34 (4)):** RUNTIME with no floor on arena devices,
-  laid out at 0 before the pack; the MMID pools in `REGION`; the host runtime pre-size at
-  `ggml-sycl.cpp:5647-5652` re-derived to the host-tier terms; and the ONEDNN constant, removed
-  in L4+L6, where ONEDNN becomes W + G + P (P as §2.4.2 defines it), with (b1)'s G pre-registered
-  (0 B on GPT-OSS 120B) and
-  L4+L6 with (b1)'s sinks input reverted as its RED (rulings §M37 Q3, §M44 C-1, §M46 m-4; the
-  end states). L4 also removes 23mk 4.19j's reused-arena decline (23mk `87da879f1`:4887-4911): the
-  plan flag `onednn_pp_declined`, its context member `ggml_backend_sycl_context::onednn_pp_declined`
-  and the `[SYCL-PLAN] oneDNN PP W packing declined on device %d` WARN, which guard the lazy W grow
-  that L4 replaces ("the flag goes with the lazy W grow it guards, at the step that replaces it
-  (moua L4)"), since from L4 W is planned into the zone before any draw. So no L4+ arm can read
-  that WARN, and one read on a (b1) tree scores the declined model's PP matmuls as non-oneDNN, never
-  as a placement miss. On a decline 23mk withdraws the declined model's W publication in the
-  decline's own plan transaction (its plan value for the device is set to 0 and the stored getter
-  is re-published from the live models; 23mk:4904-4911), so P's source, the W getter, reads what
-  is actually packed. L4's census carries the identifier: `git grep -n -w 'onednn_pp_declined'`
-  returns nothing on L4's tree (H7 (at)). The SCRATCH floor is
-  not L4+L6's: it goes in the commit that converts the last untermed SCRATCH census row, whoever
-  owns it (the end states).
+- **L4+L6, the zones (rulings §M32 I-2; §M34 (4)):** RUNTIME with no floor on arena devices, laid
+  out at 0 before the pack; the MMID pools in `REGION`; the host runtime pre-size at
+  `ggml-sycl.cpp:5647-5652` re-derived to the host-tier terms; and the ONEDNN constant, removed in
+  L4+L6, where ONEDNN becomes W + G + P (P as §2.4.2 defines it), with (b1)'s G pre-registered (0 B
+  on GPT-OSS 120B) and L4+L6 with (b1)'s sinks input reverted as its RED (rulings §M37 Q3, §M44 C-1,
+  §M46 m-4; the end states). The oneDNN PP decline is 23mk's, not moua's (rulings §M86): a
+  per-tensor refusal in `acquire_onednn_pp_scratch` against the ONEDNN zone's realized W window,
+  with a reporting-only plan census, and 23mk deletes the context-latched `onednn_pp_declined` flag.
+  So moua L4 carries no census, gate clause or deletion-list entry for it, and the cite lines are
+  left to the final re-pin. The ensure withdraws nothing and mutates no planned getter, so P's
+  source is unchanged. The SCRATCH floor is not L4+L6's: it goes in the commit that converts the
+  last untermed SCRATCH census row, whoever owns it (the end states).
 - **L4+L6, the oneDNN scratchpad (rulings §M31, §M32 I-5, §V16 I-A, §M35):** the load's
   descriptor table over every family under its gate; the per-context queue set, frozen at the
   transaction; `assert_scratchpad_planned(stream)` in place of `pre_allocate_scratchpad`'s
@@ -14265,13 +14272,13 @@ into the r36 fold's tree. The §M78 decline and commit strings are unchanged at 
 | item | relay | disposition |
 |---|---|---|
 | re-pin | every 23mk cite moves from `3bd662261` to `9c3d84ec1`, with line numbers re-verified | **Changed.** Every hash in the live text reads `9c3d84ec1` (rev 4.19i); the line numbers moved as follows. The interim decision's signature L4787 is L4926 (23mk:4926-4928). The floor function and its basis, 23mk:4586-4640, is 23mk:4631-4680. The getter's zero rule 23mk:4628-4634 is 23mk:4673-4680, and the cap rule :4679 is :4735-4736 (the cap now tests stored + G + P). The Graph block, 23mk:4702-4733, is 23mk:4760-4835. The Qwen formula 23mk:4596-4598 is :4640-4642, and :4633-4634 is :4677-4679. The term figures, 23mk:4945-4950, are :5084-5088 (Qwen's 25165824 B at :5087). Mistral's G, 23mk:9611-9615, is :9792-9796. The replay's after-the-fact form, 23mk:4828, is :4966. History rows keep their old hashes and numbers. |
-| (a) | L6's "W + G" keeps the block's P while the block exists, until (b2) | **Changed.** Verified at 23mk:4771-4804 (P = stored, an upper bound; the request is max(268435456, stored + G + P)), :5902-5904 and :7063. At L4+L6 ONEDNN is W + G + P: GPT-OSS 120B 23592960 B (no block, P = 0), Qwen 33554432 + 201326592 + 51380224 = 286261248 B, weight zone 14362345472 − k × 2048 B (14413725696 − 51380224). The pack-before-ensure RED's Qwen excess is 428867584 + k × 2048 B (the weight slot plus W + G + P). (b2) is unchanged: ONEDNN is W, 33554432 B, weight zone 14615052288 − k × 2048 B. The `interim_capped` text reads stored + G + P over the cap, and the replay's G stays the block's size alone: P sits beside the block and is never capacity. |
-| (b) | the Qwen `-c 4096` per-step split starts from (b1)'s 304087040 B zone, not 268435456 | **Changed.** Verified at 23mk:4710, :4716-4722 and :5902-5904. The Qwen column of the per-step table reads 268435456 (master), 304087040 (+35651584 at (b1) then fkpg (a): 2 × 51380224 + 201326592), 286261248 (−17825792 at L6), 33554432 (−252706816 at (b2)), 270532608 B in all from (b1)'s zone. GPT-OSS 120B's column does not move (no block). The RED rows read 268435456 for fkpg (a) without (b1), unchanged, and, at `n_ctx` 512, 152043520 B at L6 (33554432 + 67108864 + 51380224, −116391936 from (b1)'s unmoved 268435456) with (b2) moving 118489088 B. The floors arm's RED is a tree that keeps (b1)'s sizing: 17825792 B over at L4+L6 and 270532608 B from (b2) on Qwen. |
+| (a) | L6's "W + G" keeps the block's P while the block exists, until (b2) | **Superseded by §6.47 and rulings §M84 (r38 n-2):** the figures below rest on P = 51380224 at L4 and L6, which §M84 withdraws. **Changed.** Verified at 23mk:4771-4804 (P = stored, an upper bound; the request is max(268435456, stored + G + P)), :5902-5904 and :7063. At L4+L6 ONEDNN is W + G + P: GPT-OSS 120B 23592960 B (no block, P = 0), Qwen 33554432 + 201326592 + 51380224 = 286261248 B, weight zone 14362345472 − k × 2048 B (14413725696 − 51380224). The pack-before-ensure RED's Qwen excess is 428867584 + k × 2048 B (the weight slot plus W + G + P). (b2) is unchanged: ONEDNN is W, 33554432 B, weight zone 14615052288 − k × 2048 B. The `interim_capped` text reads stored + G + P over the cap, and the replay's G stays the block's size alone: P sits beside the block and is never capacity. |
+| (b) | the Qwen `-c 4096` per-step split starts from (b1)'s 304087040 B zone, not 268435456 | **Superseded by §6.47 and rulings §M84 (r38 n-2):** the split below is replaced by the §6.47 column, 268435456, 304087040, 268435456, 33554432. **Changed.** Verified at 23mk:4710, :4716-4722 and :5902-5904. The Qwen column of the per-step table reads 268435456 (master), 304087040 (+35651584 at (b1) then fkpg (a): 2 × 51380224 + 201326592), 286261248 (−17825792 at L6), 33554432 (−252706816 at (b2)), 270532608 B in all from (b1)'s zone. GPT-OSS 120B's column does not move (no block). The RED rows read 268435456 for fkpg (a) without (b1), unchanged, and, at `n_ctx` 512, 152043520 B at L6 (33554432 + 67108864 + 51380224, −116391936 from (b1)'s unmoved 268435456) with (b2) moving 118489088 B. The floors arm's RED is a tree that keeps (b1)'s sizing: 17825792 B over at L4+L6 and 270532608 B from (b2) on Qwen. |
 
-The new Qwen figures are this revision's derivation from 23mk's published inputs (P = stored =
-51380224 B from 23mk:4710 and :4781-4783, G, W); 23mk's own text still gives the old
-no-P split at :5902-5906 and says moua re-derives it. The lead should have them checked
-against 23mk's next head.
+Superseded by §6.47 and rulings §M84 (r38 n-2): the new Qwen figures were this revision's derivation
+from 23mk's published inputs (P = stored = 51380224 B from 23mk:4710 and :4781-4783, G, W); 23mk's
+own text still gives the old no-P split at :5902-5906 and says moua re-derives it. The lead should
+have them checked against 23mk's next head.
 
 ### 6.47 Revision 7.14ae: design-moua-r37
 
@@ -14283,14 +14290,14 @@ lead relays 23mk's next head for the final re-pin.
 
 | item | finding / ruling | disposition |
 |---|---|---|
-| I-1; §M84 | P at L4+L6 had no named source, and the stored value it used does not exist after 23mk's §4 | **Changed.** P is the ONEDNN zone's stored value at the step being sized, read from the W getter: `onednn_reorder + onednn_eligible` at (b1) (Qwen 51380224), W alone at L4 and L6 (33554432), 0 on GPT-OSS 120B and from (b2). Qwen at `-c 4096` L4+L6 is W + G + P = 33554432 + 201326592 + 33554432 = 268435456 B, weight zone 14380171264 − k × 2048 B (13714.0 MiB). The per-step column reads 268435456, 304087040 (+35651584), 268435456 (−35651584), 33554432 (−234881024). The pack-before-ensure excess is 411041792 + k × 2048 B, and the n_ctx 512 RED row reads 134217728 B at L6 (−134217728) with (b2) moving 100663296. GPT-OSS 120B is unchanged. The floors arm has one kept tree (the 268435456 B constant); its Qwen cell at L4+L6 and `-c 4096` coincides with the correct tree and is not scored, so the RED rests on GPT-OSS 120B at L4+L6 (244842496 B), Qwen from (b2) (234881024 B) and Qwen at `n_ctx` 512 (134217728 B), with the arm VOID if none of them is run. |
-| I-2 | the step-4 formula, the dry run, the like-with-like sentence and the cap test omitted P | **Changed.** `min(charged_ONEDNN + G + P, max(available / 4, charged_ONEDNN))`, P read from the same W getter and never a ledger entry; the dry run reads it too; the cap test is on stored + G + P as 23mk:4735-4736 tests it; the like-with-like sentence reads W plus G plus P. |
+| I-1; §M84 | P at L4+L6 had no named source, and the stored value it used does not exist after 23mk's §4 | **Changed.** P is the ONEDNN zone's stored value at the step being sized, read from the stored getter (the accessor is pinned at §2.4.2, §6.49 m-2): `onednn_reorder + onednn_eligible` at (b1) (Qwen 51380224), W alone at L4 and L6 (33554432), 0 on GPT-OSS 120B and from (b2). Qwen at `-c 4096` L4+L6 is W + G + P = 33554432 + 201326592 + 33554432 = 268435456 B, weight zone 14380171264 − k × 2048 B (13714.0 MiB). The per-step column reads 268435456, 304087040 (+35651584), 268435456 (−35651584), 33554432 (−234881024). The pack-before-ensure excess is 411041792 + k × 2048 B, and the n_ctx 512 RED row reads 134217728 B at L6 (−134217728) with (b2) moving 100663296. GPT-OSS 120B is unchanged. The floors arm has one kept tree (the 268435456 B constant); its Qwen cell at L4+L6 and `-c 4096` coincides with the correct tree and is not scored, so the RED rests on GPT-OSS 120B at L4+L6 (244842496 B), Qwen from (b2) (234881024 B) and Qwen at `n_ctx` 512 (134217728 B), with the arm VOID if none of them is run. |
+| I-2 | the step-4 formula, the dry run, the like-with-like sentence and the cap test omitted P | **Changed, the clamp form superseded by §6.49 I-1.** `min(charged_ONEDNN + G + P, max(available / 4, charged_ONEDNN))`, P read from the same stored value and never a ledger entry; the dry run reads it too; the cap test is on stored + G + P as 23mk:4735-4736 tests it; the like-with-like sentence reads W plus G plus P. |
 | m-1 | stale Qwen L4+L6 figures at the displayed values, C10's orientation and the §4 zones row | **Changed.** 13714.0 MiB; C10 reads 13714.0 − 2095.8, 559.8 MiB below master's, about 271 fewer groups, with ONEDNN holding the Graph scratch's 192.0 MiB and P's 32.0 MiB; §4's row reads W + G + P. |
 | m-2 | two "kept" trees and a stale "survive only as the floors arm's RED" clause | **Changed.** One kept tree, stated once, with the 7.14f to 7.14i figures; §2.4.2's clause points at §3.3. |
 | m-3 | C was a poll count and a time | **Changed.** `C_i` and POLLS are poll counts; `job_timeout_ms_i`, `T_i`, `t_i` and `t_min` are ms; per-card K_i = ⌈2 `T_i` / (`job_timeout_ms_i` / 2)⌉ and the shipped K = ⌈2 `T_max` / `t_min`⌉ use times only; step 1 prints `job_timeout_ms_i`. C_min is renamed `t_min`. |
-| m-4 | the throwaway worktree's removal was not executable | **Changed.** `git worktree remove --force <tmp>` in a trap that also runs on interrupt, `<tmp>` a fresh path under the gate's scratch directory outside the repo. |
+| m-4 | the throwaway worktree's removal was not executable | **Changed (the "trap" wording is superseded by §6.49 m-7).** `git worktree remove --force <tmp>` in a trap that also runs on interrupt, `<tmp>` a fresh path under the gate's scratch directory outside the repo. |
 | n-1 to n-4 | a 102-column line and ragged reflows; "which is P"; the :8484 row indent; :4681 | **Changed.** The long line is rewrapped; the move is "P less the constant's 15728640 B of slack"; the row is indented like its neighbours; the cite reads 23mk:4631-4680 (also in §6.46). |
-| 23mk 4.19j (`257b35c58`) | `onednn_pp_declined` plan flag, context member and WARN, removed by moua L4; snapshot entries print `not_captured` before their lands step | **Accounted.** L4's deletion list names the flag, the member and the WARN, with the reason (they guard the lazy W grow L4 replaces); §3.4 states that no moua arm reads a snapshot entry and that a `not_captured` read is VOID. |
+| 23mk 4.19j (`257b35c58`) | `onednn_pp_declined` plan flag, context member and WARN, removed by moua L4; snapshot entries print `not_captured` before their lands step | **Withdrawn for the flag (§6.49 m-5; rulings §M86).** The deletion-list text is gone. The `not_captured` rule now stands in §3.4's "How a dump is read" (a bullet after "Before the producer lands"), and §2.4.3 points at it; no moua arm reads a snapshot entry, and a `not_captured` read is VOID. |
 
 ### 6.48 Revision 7.14af: the 23mk re-pin to 87da879f1 (rev 4.19l)
 
@@ -14304,5 +14311,28 @@ design-23mk-r25 runs), which implements §M84. The lead relays the final head af
 | per-step figures | use 23mk's figures as the source, verified at the SHA | **Confirmed.** Verified at 23mk:6032-6047: Qwen at `-c 4096` reads 268435456, 304087040, 268435456 (L4), 268435456 (L6), 33554432; at 512 it reads 268435456 through L4, then 134217728 and 33554432; GPT-OSS 120B reads 268435456 through L4, then 23592960, and (b2) moves 0. Every moua figure from rev 7.14ae matches. 23mk lists L4 and L6 apart; the table records that they are one commit here. Mistral's 368050176, 301989888, 301989888 and 117440512 are recorded as unscored. |
 | P per step | (b1) reorder + eligible; L4 and L6 W; 0 for GPT-OSS and at (b2) | **Confirmed** at 23mk:4857-4865, as §2.4.2 states it. |
 | floors arm | the Qwen -c 4096 L6 cell is vacuous | **Already so** in 7.14ae: the RED rests on GPT-OSS 120B at L4+L6, Qwen at 512 and Qwen from (b2), with non-vacuity stated. |
-| `onednn_pp_declined` | belongs to moua L4's census, with a git-grep check | **Changed.** L4's census names the flag, its member and the WARN, and a new H7 clause (at) states that `git grep -n -w 'onednn_pp_declined'` returns nothing on L4's tree (positive control on the throwaway worktree, mutation witness: the flag or member kept). |
-| decline | a decline withdraws the declined model's W publication | **Changed.** Stated at L4's census (23mk:4904-4911): the model's plan value for the device is set to 0 in the decline's own plan transaction and the stored getter is re-published, so P's source reads what is packed. |
+| `onednn_pp_declined` | belongs to moua L4's census, with a git-grep check | **Withdrawn (§6.49 m-5; rulings §M86).** 23mk rebuilds the decline as a per-tensor refusal against the zone's realized W window and deletes the context-latched flag, so L4's census text and H7 clause (at) are removed. |
+| decline | a decline withdraws the declined model's W publication | **Withdrawn (§6.49 m-5; rulings §M86).** The ensure withdraws nothing and mutates no planned getter; P's source is unchanged. |
+
+### 6.49 Revision 7.14ag: design-moua-r38
+
+Revision 7.14ag is one commit on top of `37cec63f2`, by impl-moua-s. It answers design review r38
+(design-moua-r38 on `eece79b83..152cbc5bb`: 0 Critical, 1 Important, 7 Minor, 4 nits; P1-P3 pass
+and P4 failed on I-1) and the lead's rulings §M84 and §M86. The 23mk cites stay at `87da879f1`; the
+lead relays 23mk's final head and the reviewer's old-to-new line map for the final re-pin.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| I-1 | the L4+L6 step-4 formula clamped to the cap, but 23mk's (b1) rule and §2.4.2's own text decline and reserve 0 B | **Changed.** Step 4 is two steps: G_raw and P_raw are tested as `charged_ONEDNN + G_raw + P_raw > max(available / 4, charged_ONEDNN)`; over the cap, G = P = 0, SDPA declines as `interim_capped` and ONEDNN = `charged_ONEDNN`; otherwise ONEDNN is the sum. The sum is replaced, never cut to the cap. The dry run and witness 1 read the same rule, and the cap test reads the pre-cap G_raw and P_raw. No gate figure moves, since the cap cannot bind on the gate shapes. A capped cell (a pure-host fixture whose sum exceeds the cap, with a RED that keeps `min(...)`) is an arm of the L4+L6 commit, and 23mk H3's capped fixture is the same cell at (b1). |
+| m-1 | "every sizing site carries P" was false at the early-stage sizing | **Changed.** That site reads "plus G and P: 23592960 + 0 + 0 B". |
+| m-2 | P's getter was named where it does not exist | **Changed.** P is the ONEDNN zone's stored value at the step: `unified_cache_get_planned_onednn_scratchpad_bytes_stored` (`unified-cache.cpp:2148` at `d8a67422d`) until 23mk's §4 commit renames it `unified_cache_get_planned_onednn_pp_w_bytes` (23mk:2027). 23mk names no accessor for P (23mk:4857-4865), so §2.4.2's sentence is the pin both designs read. |
+| m-3 | the floors arm counted a VOID cell as run, mixed commits, and left the 512 cell's vehicle unstated | **Changed.** The arm is VOID unless at least one cell runnable at the commit under test ran to a non-VOID reading; VOID is not a pass. L4+L6 runs GPT-OSS 120B (244842496 B) and Qwen at `-c 512 -ub 512` (134217728 B, G the 64 MiB minimum, P = W); (b2) runs Qwen at `-c 4096 -ub 512` (234881024 B). |
+| m-4 | the §3.4 claim was in §2.4.3 only | **Changed.** A bullet in §3.4's "How a dump is read" states that no moua arm reads a snapshot entry and that a `not_captured` read is VOID; §2.4.3 points at it; the §6.47 row now cites it. |
+| m-5 | L4's census had no check for `onednn_pp_declined` | **Withdrawn, not added (rulings §M86).** 23mk deletes the context-latched flag and rebuilds the decline as a per-tensor refusal in `acquire_onednn_pp_scratch` against the zone's realized W window, with a reporting-only plan census. moua L4 carries no census, gate clause or deletion-list entry for it; clause (at), the L4 text and the §6.47 and §6.48 rows are removed or marked withdrawn. The cite lines are left to the final re-pin. |
+| m-6 | the evidence record did not carry what K is derived from, and one spot said "T and K" | **Changed.** The record carries each card's `C_i`, `job_timeout_ms_i`, `T_i` and `t_i`, then POLLS, `t_min`, `T_max` and K; the F3 print reads `T_i` and K_i. |
+| m-7 | "trap" is shell vocabulary and the gate is Python | **Changed.** The worktree is removed in a `finally` block with a SIGTERM handler, `<tmp>` is a `tempfile.mkdtemp` path, and the gate runs `git worktree prune` before the add, so a SIGKILL leaves nothing a later run trips on. |
+| n-1 | ragged short lines at the r37 fold's edit boundaries | **Changed.** Each named paragraph is reflowed at 100 columns. |
+| n-2 | §6.46's rows still stated the P = 51380224 figures in the present tense | **Changed.** Rows (a), (b) and the closing paragraph are marked superseded by §6.47 and §M84. |
+| n-3 | C10's sentence said both figures count the constant's return | **Changed.** "Both count the L4+L6 sizing; on Qwen at `-c 4096` the constant's removal moves nothing." |
+| n-4 | the (b1)-to-L4 interval covered only the pre-§4 half | **Changed.** After §4 and before L4 it is `max(268435456, W + G + P)`, 268435456 B on Qwen at both shapes (23mk:6032-6047). |
+| P's existence at L4+L6 | not flagged; ruled by §M84 | **Unchanged.** llama.cpp-z8fr tracks revisiting P. |
