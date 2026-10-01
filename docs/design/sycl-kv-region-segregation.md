@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14ab, by impl-moua-s, 2026-09-30. The revisions answer thirty-six reviews:
+Design, revision 7.14ac, by impl-moua-s, 2026-09-30. The revisions answer thirty-seven reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -205,6 +205,11 @@ Design, revision 7.14ab, by impl-moua-s, 2026-09-30. The revisions answer thirty
   derived from 23mk's floor function, the waiter's poll count is one compiled constant
   (rulings §M81 (b)), the dedupe's count is named, the restriction and no-print clauses are
   corrected (§M81 (a)), and step 5 leaves a record.
+- design review r36 (design-moua-r36 on `ab09af4ff..98dfaf726`: 0 Critical, 0 Important, 5
+  Minor, 3 nits), recorded in §6.45. Revision 7.14ac is one commit on top of `98dfaf726`: the
+  replay's G is the with-floor getter's, the restriction clause is per name, step 2 compiles
+  the same K formula as step 4, `t_i` is derived from printed values, the no-print gate's
+  positive control runs on a throwaway worktree, and the path is confirmed.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -2643,12 +2648,17 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    capped, and the cap is derived from the worst case, not from a delay G0
                    happened to use (r26 m-10).** Two bounds set it. A single kernel may not
                    spin past the engine's xe `job_timeout_ms`, or the GT resets, so each waiter
-                   kernel's poll count is sized by G0 to half that timeout on each card, C. And
+                   kernel's poll count is capped at half that timeout; G0 sizes that per-card cap
+                   C, in
+                   polls at the card's poll rate, and production compiles one poll count from the
+                   two cards
+                   (below). And
                    the tail a correct predecessor can have is not one F2 delay: its use can sit
                    behind a replayed graph and the `host_task` backlog on its queue. So the use
                    submits a chain of K waiter kernels, each capped at C, and each returns at
                    once when the marker has already reached n − 1, so a satisfied chain costs
-                   K − 1 near-empty launches. K = ⌈2 T / C⌉ per card, where T is the worst
+                   K − 1 near-empty launches. G0's per-card derivation is K = ⌈2 T / C⌉ (the K that
+                   ships is the one constant below), where T is the worst
                    predecessor tail G0 measures on the gate shapes (F3, §3.2: behind a replay of
                    G0's own
                    synthetic recording of N nodes, plus one ubatch's `host_task` backlog at the
@@ -2657,11 +2667,17 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    what makes them cover it (r32 m-5). **The production poll count is one compiled
                    constant (r35 m-5; rulings §M81 (b)):** `GGML_SYCL_W_ORDER_POLLS`, the minimum
                    over both cards of the poll count G0 printed for C (C in polls), and it is
-                   never calibrated at runtime. So on every card one launch's time, POLLS divided
-                   by that card's poll rate, is at most half the xe job timeout. `C_min` is the
-                   minimum over the cards of that time, and the one compiled
+                   never calibrated at runtime. **One launch's time on card i is `t_i` = (POLLS /
+                   `C_i`) ×
+                   (`job_timeout_ms_i` / 2) (r36 m-4)**, from the two values G0 prints for the
+                   card, C in polls
+                   and the xe `job_timeout_ms`; no poll rate is printed or needed. Since POLLS <=
+                   `C_i`, `t_i`
+                   is at most half the xe job timeout on every card. `C_min` is the minimum over
+                   the cards
+                   of `t_i`, and the one compiled
                    `GGML_SYCL_W_ORDER_CHAIN_K` is ⌈2 `T_max` / `C_min`⌉, which bounds every card's
-                   ⌈2 T / t⌉ (t the launch's time on that card).
+                   ⌈2 T_i / t_i⌉.
                    Only the last waiter of the chain faults: at its cap it sets the fault word
                    and returns, and counts `w_order_wait_exhausted`
                    (`GGML_SYCL_PRIVATE_TESTING`). A correct run then has twice its measured
@@ -7970,7 +7986,7 @@ means that.
   last weight chunk, KV-naming ones to the KV TLSF, and each record's head slots are placed and
   carved on its zone's TLSF (r2 m7; the per-TLSF reserve is gone, r3 C1).
 - **H7 source gates** (python; the kv-layer-sizing family plus a new
-  `test-sycl-kv-region-source.py`, each check with a mutation witness):
+  `tests/test-sycl-kv-region-source.py`, each check with a mutation witness):
   - (a) the region reservation never reaches `unified_cache_malloc_device_tracked`;
   - (b) the tiered device-planned branch issues no per-layer `unified_alloc`;
   - (c) the optional pass runs after all S1 staging, dense *and* expert/DPAS;
@@ -8985,16 +9001,20 @@ means that.
         leaves `print` true for an id not found, and the full-table branch never yields
         "already warned". `GGML_SYCL_W_ORDER_WARNED_CTX_MAX` is defined once, with the
         array, and the storage and this clause both read it.
-    - **Restriction clauses (r35 m-2, m-3, m-5).** `ggml_sycl_w_order_bound_for`,
-      `GGML_SYCL_W_ORDER_BOUND_N_UBATCH`, `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES`,
-      `w_order_warned_ctx`, `w_order_warned_ctx_count`, `GGML_SYCL_W_ORDER_WARNED_CTX_MAX` and
-      `GGML_SYCL_W_ORDER_POLLS` occur nowhere else, except in their definitions, in the body of
-      `ggml_sycl_device_entry_w_ordered` (which the positive clauses above require to read
-      `ggml_sycl_w_order_bound_for`, the array, its count and the guard, and which reads
-      `GGML_SYCL_W_ORDER_POLLS` at the waiter's submit), in the body of
-      `ggml_sycl_w_order_bound_for` (the only reader of the two bound constants), and in
-      `ggml_sycl_test_set_w_order_bound`'s body. So no caller names the bound. Every caller
-      passes a `ggml_sycl_w_use_desc`.
+    - **Restriction clauses (r35 m-2, m-3, m-5; r36 m-2).** Each name has its own allowance:
+      a mention outside the row for that name fails, and a name in another name's row does not
+      lend it that allowance.
+
+      | name | may occur only in |
+      |---|---|
+      | `GGML_SYCL_W_ORDER_BOUND_N_UBATCH`, `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` (each) | its definition and the body of `ggml_sycl_w_order_bound_for`. Not the entry function: a comparison against a constant there would bypass the test override on one half. |
+      | `ggml_sycl_w_order_bound_for` | its definition and the body of `ggml_sycl_device_entry_w_ordered` (the positive clauses above require the read). |
+      | `w_order_warned_ctx`, `w_order_warned_ctx_count`, `GGML_SYCL_W_ORDER_WARNED_CTX_MAX` (each) | its definition, with the array's and count's initializers, and the body of `ggml_sycl_device_entry_w_ordered`. |
+      | `GGML_SYCL_W_ORDER_POLLS` | its definition and the body of `ggml_sycl_device_entry_w_ordered` (the waiter's submit). |
+
+      `ggml_sycl_test_set_w_order_bound`'s body names none of the seven: it writes only the
+      override that `ggml_sycl_w_order_bound_for` reads. So no caller names the bound. Every
+      caller passes a `ggml_sycl_w_use_desc`.
     - **Source clauses on the fills (r30 m-3; r31 m-2).** Each is positive: it must match at
       least once, and every assignment of the field it names must match it, so a deleted
       assignment fails the clause just as a wrong source does.
@@ -9020,10 +9040,15 @@ means that.
       clause is `git grep -n 'W-ORDER-MEASURE' -- ':!docs/' ':!.llm-wiki/'
       ':!tests/test-sycl-kv-region-source.py'` returning nothing, and it runs on every commit
       that touches the W-order files. The design docs and the wiki legitimately quote the
-      string, and the gate's own file, `test-sycl-kv-region-source.py` (the H7 source gate,
+      string, and the gate's own file, `tests/test-sycl-kv-region-source.py` (the H7 source gate,
       §3.1), necessarily contains it, so all three are excluded. No split literal is used. The
-      gate's own run on a correct tree returns 0. Its positive control is the uncommitted print
-      of §3.2 step 3, planted in a tracked non-excluded file, which must make it fail.
+      gate's own run on a correct tree returns 0. **Its positive control runs on a throwaway
+      tree (r36 m-5):** `git worktree add --detach <tmp>` at the tested commit; the print of
+      §3.2 step 3 is written into a new file there, outside `docs/`, `.llm-wiki/` and the gate
+      file, and `git add`ed (index only, never committed), so `git grep` sees it as tracked;
+      the exact clause above is run there and must return exactly that one hit; the worktree
+      is then removed. The correct-tree run is the real checkout's, and the real checkout is
+      never edited.
     - **Mutation witnesses.**
       - The comparison moved into the oneDNN PP caller on `src1->ne[1]`: the positive and
         restriction clauses fail, and the G2 bound cell's (a) prints 0 WARNs.
@@ -9437,8 +9462,9 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
 - **Form M's premise, and its cap.** Form M's waiter on one queue must see a publisher on
   another queue run. G0 first calibrates: a waiter alone on Q2, with a fixed poll count and
   nothing to wait for, is timed, which gives the card's poll rate; Form M's per-kernel cap C is
-  half the engine's `job_timeout_ms` in polls at that rate, and G0 prints it (r26 m-10; §2.4.2's
-  derivation). Then three cells, each with that cap: **F1**, a waiter on
+  half the engine's `job_timeout_ms` in polls at that rate, and G0 prints C with the card's
+  `job_timeout_ms`, not the rate, since §2.4.2 derives `t_i` from those two (r26 m-10; r36 m-4;
+  §2.4.2's derivation). Then three cells, each with that cap: **F1**, a waiter on
   Q2 and, after it, a publisher on Q1 with nothing ahead of it; **F2**, the same with the
   publisher behind a pending H1 that the watcher opens after 0.5 s, the production delay of a
   previous use behind a `host_task`; and **F3**, the tail T that sets the chain length K: on
@@ -9446,7 +9472,8 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
   behind a replay of G0's own synthetic recording of N nodes (below) and one ubatch's
   `host_task` backlog at the shape's `n_ubatch`, timed from the waiter's start to the publisher's store with the device timestamps of the two
   kernels. "Progresses": the waiter ends without writing the fault word. "Capped": it writes the
-  fault word. F1 and F2 must progress within one C, and F3 gives T, from which K = ⌈2 T / C⌉; a
+  fault word. F1 and F2 must progress within one C, and F3 gives T, from which the per-card K = ⌈2
+  T / C⌉ (the shipped K is §2.4.2's one constant); a
   cell that caps with K waiters on a correct run voids the derivation. F3 also prints the bound
   its cells cover, the largest `n_ubatch` and W-touching graph node count, which §2.4.2's
   out-of-bound WARN compares against (r27 m-9). **The node bound is provisional at G0 (r31 m-1;
@@ -9465,8 +9492,9 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
   2. **The L4+L6 W-order commit.** It adds `ggml_sycl_device_entry_w_ordered`,
      `ggml_sycl_graph_finalize` and `ggml_sycl_graph_submit`, and compiles in
      `GGML_SYCL_W_ORDER_POLLS` (the minimum over both cards of G0's printed C in polls),
-     `GGML_SYCL_W_ORDER_CHAIN_K` (one constant for both cards: the larger of the two cards'
-     ⌈2 T / C⌉ as G0 printed them), the `n_ubatch` bound and
+     `GGML_SYCL_W_ORDER_CHAIN_K` (one constant for both cards: ⌈2 `T_max` / `C_min`⌉, with
+     `T_max` the larger of the two cards' T that G0 printed at `N_prov` and `C_min` as §2.4.2
+     defines it from `t_i`; step 4's formula, at `N_prov`; r36 m-3), the `n_ubatch` bound and
      `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES = N_prov`. That constant is
      **provisional**, and the commit message says so.
   3. **A lead-run measurement, with a one-off print that is never committed (r32 m-1; r33
@@ -9505,9 +9533,10 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
      verdict covers the bound that ships on each, and both must pass. If F3 passes at `B`, the
      commit sets `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` to `B`, re-pins
      `GGML_SYCL_W_ORDER_CHAIN_K` to ⌈2 `T_max` / `C_min`⌉, where `T_max` is the larger of the two
-     cards' T printed at `B` and `C_min` the smaller of the two cards' times for
-     `GGML_SYCL_W_ORDER_POLLS` launches (POLLS divided by each card's printed poll rate; the
-     poll count itself stays as step 2 compiled it), the conservative K, one value for both
+     cards' T printed at `B` and `C_min` the smaller of the two cards' `t_i` = (POLLS / `C_i`) ×
+     (`job_timeout_ms_i` / 2) from G0's printed values, the poll count staying as step 2
+     compiled it; this is step 2's formula, at `B` (r36 m-3, m-4), the conservative K, one value
+     for both
      cards, and drops "provisional" from the constant's comment and from §2.4.2. If F3
      fails at `B` (a cell caps with K waiters, or a control fails), that is a stop for a lead
      ruling, never a silent re-pin. There is no `N_max > N_prov` trigger: the re-run happens
@@ -9521,8 +9550,8 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
      `[W-ORDER] shape above` lines. A line
      above `B`, or a WARN, is a stop for a lead ruling. This is the first reading of the WARN's
      node half that is not VOID (§2.4.2). **The closing check's record (r35 m-7)** goes on the
-     ticket and in a follow-up commit's message (or the re-pin commit's, if step 5 runs before
-     that commit is final): for each per-selector log, its file name, selector, shape,
+     ticket and in the message of whichever commit follows step 5 (r36 n-3): for each per-selector
+     log, its file name, selector, shape,
      `[W-ORDER-MEASURE]` line count, the single maximum `graph_nodes` line verbatim, and the
      count of `shape above` lines, then `B`. The worktree is discarded only after that record
      is written.
@@ -10118,19 +10147,23 @@ placement and demotion run. The rules for every such arm:
   definition, the built zone less the stored W, counted bytes that W's regrow could split, and
   is retired. It is 0 on a device without an active arena, without the zone, or whose G was 0
   at the build (GPT-OSS, a capped model), and a `zones_sufficient` return on an arena that has
-  no block leaves it 0. The replay derives G before the run by calling 23mk's pure floor function,
-  `onednn_graph_scratch_zone_floor_bytes_swa` (23mk `3bd662261` §4.8 (b1)'s interim G,
-  23mk:4586-4640), over the arm's published shape: `n_ctx` the envelope's, `ne01` the plan's
-  `n_ubatch`, the routed head maxima, the 64 MiB minimum, and 0 when both routed maxima are 0
-  or after the cap rule. The figures below hold at `-ub` 512 with
+  no block leaves it 0. The replay derives G before the run as the with-floor getter publishes it
+  (r36 m-1; 23mk
+  `3bd662261` §4.8 (b1), 23mk:4628-4634 and :4679): 0 when both routed head maxima are 0 or
+  after the cap rule, otherwise the value of
+  `onednn_graph_scratch_zone_floor_bytes_swa(n_head_ctx_max, n_head_swa_max, n_swa, n_ubatch,
+  n_ctx)` (the formula; 23mk:4586-4640 and unified-cache.cpp:2034-2111 at `d8a67422d`, where
+  the 64 MiB minimum applies), over the arm's published shape: `n_ctx` the envelope's,
+  `n_ubatch` the plan's, and the routed head maxima and `n_swa` the plan's. GPT-OSS replays
+  to 0, which the pure function alone would not give. The figures below hold at `-ub` 512 with
   `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` unset, and an arm's literal command never sets it: a set
   override changes G, and the `capacity=` check then reads VOID, as it should. Before fkpg (a)
   the envelope's `n_ctx` is 512 at every load, so G is 67108864 B on Mistral and on the Qwen
   gate (23mk:4945-4950, the 64 MiB minimum). From fkpg (a) the block follows the published
   `n_ctx`: at `-c 4096` Mistral's G is 1.5 x 32 x 512 x 4096 x 4 = 402653184 B and the Qwen
-  gate's is 1.5 x 16 x 512 x 4096 x 4 = 201326592 B (23mk:4596-4598, :4633-4634, with
-  `n_head_ctx_max` 16 for Qwen). The replay is derived before the run; 23mk:4828's replay,
-  which takes `capacity` from the printed line, is the after-the-fact form of the same fact.
+  gate's is 1.5 x 16 x 512 x 4096 x 4 = 201326592 B (Qwen: 23mk:4596-4598, :4633-4634, with
+  `n_head_ctx_max` 16; Mistral: 23mk:9611-9615). The replay is derived before the run; 23mk:4828's
+  replay, which takes `capacity` from the printed line, is the after-the-fact form of the same fact.
   The line's `capacity=` is the check on this derivation, the two directions of one fact and
   never a second source: where the run prints an interim line, its `capacity=` must equal the
   derived G, and a mismatch is VOID, never a re-fit.
@@ -14120,9 +14153,27 @@ the right companion to `T_max`: a larger K is the safe direction. 23mk cites sta
 | m-1 | G's derivation was unnamed, and one cite was a fixture bullet | **Changed.** The replay calls 23mk's pure `onednn_graph_scratch_zone_floor_bytes_swa` (23mk:4586-4640) over the arm's published shape, and the text states that the figures hold at `-ub` 512 with `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` unset and that an arm never sets it. The Qwen and Mistral figures cite the formula (23mk:4596-4598, :4633-4634), not the fixture line. The 23mk:4828 parenthetical now says the replay is the after-the-fact form of the same fact and the line's `capacity=` is the check on the derivation, never a second source. |
 | m-2 | the restriction clause's exemption list contradicted the positive clauses | **Changed.** It exempts the definitions, `ggml_sycl_device_entry_w_ordered`'s body, `ggml_sycl_w_order_bound_for`'s body (the only reader of the two bound constants) and `ggml_sycl_test_set_w_order_bound`'s body; its list gains the MAX constant, the count member and `GGML_SYCL_W_ORDER_POLLS`. |
 | m-3 | the dedupe clause matched a `count` that nothing named | **Changed.** The member is `uint32_t w_order_warned_ctx_count`, beside the array, named in §2.4.2, the L7 row and the clause (the loop bound, and the guard `w_order_warned_ctx_count < GGML_SYCL_W_ORDER_WARNED_CTX_MAX`). |
-| m-4; §M81 (a) | the no-print gate matched its own source and the wiki | **Changed.** The clause is `git grep -n 'W-ORDER-MEASURE' -- ':!docs/' ':!.llm-wiki/' ':!tests/test-sycl-kv-region-source.py'` returning 0 on a correct tree, with no split literal and the planted print as its positive control. The gate file is the H7 source gate named at §3.1; its path under `tests/` is this revision's reading, for the lead to confirm. |
+| m-4; §M81 (a) | the no-print gate matched its own source and the wiki | **Changed.** The clause is `git grep -n 'W-ORDER-MEASURE' -- ':!docs/' ':!.llm-wiki/' ':!tests/test-sycl-kv-region-source.py'` returning 0 on a correct tree, with no split literal and the planted print as its positive control. The gate file is the H7 source gate named at §3.1; its path, `tests/test-sycl-kv-region-source.py`, is confirmed by the lead. |
 | m-5; §M81 (b) | K was one constant but C is per card, and the production poll count had no stated source | **Changed.** `GGML_SYCL_W_ORDER_POLLS` is compiled once as the minimum over both cards of G0's printed C in polls, and is never calibrated at runtime. `C_min` is the minimum over cards of that count's time, and `GGML_SYCL_W_ORDER_CHAIN_K` = ⌈2 `T_max` / `C_min`⌉ stays, bounding every card's ⌈2 T / t⌉. §2.4.2, step 2, step 4 and H7 (as)'s restriction list name it. This closes the `C_min` question. |
 | m-6 | the restored `job_timeout_ms` sentence read as part of step 5 | **Changed.** A blank line precedes it, so it is its own paragraph. |
 | m-7 | step 5's reading left no record | **Changed.** The closing check's record goes on the ticket and in a commit message: each log's file name, selector, shape, line count and verbatim maximum line, the count of `shape above` lines, then `B`. The worktree is discarded only after that. |
 | n-1 | the fold added ten lines past the wrap | **Changed.** The edited paragraphs are reflowed at the surrounding width. |
 | n-2 | "17th or later id" restated the constant as a literal | **Changed.** "an id beyond `GGML_SYCL_W_ORDER_WARNED_CTX_MAX`". |
+
+### 6.45 Revision 7.14ac: design-moua-r36
+
+Revision 7.14ac is one commit on top of `98dfaf726`, by impl-moua-s. It answers design review r36
+(design-moua-r36 on `ab09af4ff..98dfaf726`: 0 Critical, 0 Important, 5 Minor, 3 nits; P1-P3 pass,
+and P4 passes with m-3 and m-4). It closed every r35 item in substance. 23mk cites stay at
+`3bd662261`; the lead relays 23mk's next head for one final re-pin.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| m-1 | the replay's zero rule was attributed to the pure function, n_swa was missing from the shape, and Mistral's figure had no cite | **Changed.** G is the with-floor getter's (23mk:4628-4634, :4679): 0 when both routed maxima are 0 or after the cap rule, else the floor function's value over `(n_head_ctx_max, n_head_swa_max, n_swa, n_ubatch, n_ctx)`, kept as the formula cite. GPT-OSS replays to 0. Mistral's figure cites 23mk:9611-9615. |
+| m-2 | the exemption list was flat across all seven names | **Changed.** A per-name table: the bound constants only in their definitions and `ggml_sycl_w_order_bound_for`'s body; that function only in its definition and the entry function's body; the dedupe names and `GGML_SYCL_W_ORDER_POLLS` only in their definitions and the entry function's body; the setter names none. |
+| m-3 | step 2 compiled K from the pre-POLLS formula | **Changed.** Step 2 compiles ⌈2 `T_max` / `C_min`⌉ at `N_prov`, the same formula as step 4 at `B`. |
+| m-4 | step 4 divided by a poll rate G0 does not print | **Changed.** `t_i` = (POLLS / `C_i`) × (`job_timeout_ms_i` / 2) from the two printed values, in §2.4.2, step 4 and step 2; `C_min` is the minimum `t_i`. No rate is printed. |
+| m-5 | the no-print gate's positive control had no stated mechanism | **Changed.** A throwaway `git worktree add --detach` at the tested commit, a new file with the print `git add`ed (index only), the exact clause expected to return exactly that hit, the worktree removed; the real checkout is never edited. |
+| n-1 | the gate's path was written bare in two places and flagged "for the lead to confirm" | **Changed.** `tests/test-sycl-kv-region-source.py` in full at §3.1 and in the clause; the §6.44 row reads "confirmed by the lead". |
+| n-2 | §2.4.2's first sentences read as a per-card production cap | **Changed.** G0 sizes a per-card cap C and a per-card K; production compiles one poll count and one K, below. |
+| n-3 | step 5's record named a commit that already exists | **Changed.** The record goes on the ticket and in the message of whichever commit follows step 5. |
