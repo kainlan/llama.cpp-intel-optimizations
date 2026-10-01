@@ -41,8 +41,17 @@ def test_current_packed_m2_route_uses_272_byte_groups_for_tile_n_16() -> None:
     )
     assert "const int64_t group_bytes     = tile_n_total * (1 + k_per / 2)" in body
     assert "const int64_t kt_group_stride = n_tile_groups_n * group_bytes" in body
-    assert "mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group0" in body
-    assert "mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group0" in body
+    # e8484d7a7 (llama.cpp-lis9) hoisted the K-tile loop out of this kernel into a helper shared with the
+    # K-split variant, so the 272-byte-group A loads now live in the helper. Require the kernel to still drive
+    # that helper (not a private copy of the loop) and score the loads where they are.
+    assert "mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce<Repeat" in body
+    k_reduce = slice_between(
+        mmvq,
+        "SYCL_ESIMD_FUNCTION inline void mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce(",
+        "static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl",
+    )
+    assert "mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group0" in k_reduce
+    assert "mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group0" in k_reduce
     registry = REGISTRY.read_text(encoding="utf-8")
     assert "mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias" in registry
 
