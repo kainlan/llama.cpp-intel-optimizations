@@ -1,5 +1,5 @@
 // Test: ggml_backend_sycl_synchronize_for_replan, ggml_backend_sycl_graph_invalidate
-// (zhcn-design §3.1 steps 3 and 5(a)) and ggml_backend_sycl_measure_backend_init
+// (llama.cpp-zhcn)) and ggml_backend_sycl_measure_backend_init
 // (§2.10); H6a.
 //
 // Both are reached by llama through the backend proc table, so this resolves them the

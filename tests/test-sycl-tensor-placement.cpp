@@ -123,12 +123,15 @@ void check_role(const char * name, expert_tensor_role expected) {
 
 }  // namespace
 
-// The hint in front of the republish-into-empty names the owning load and the plan
-// publication epoch, so a re-plan (a publication, which hands out a new id) that adds a
-// device can never be hidden by a "not a participant" hint recorded before it.
-uint64_t ggml_sycl_into_empty_skip_key_for_test(const ggml_sycl::lifecycle::ModelToken & owner, uint64_t epoch);
+// The hint in front of the republish-into-empty names the owning load and the tenant
+// publish generation, which every plan publication bumps.  A stable-MMID re-publish keeps
+// the plan version (it hands out no id) yet re-decides kv_device, so it can add a
+// participant device; a hint keyed on the id epoch would survive it.
+uint64_t ggml_sycl_into_empty_skip_key_for_test(const ggml_sycl::lifecycle::ModelToken & owner, uint64_t publish_gen);
+uint64_t ggml_sycl_tenant_publish_gen();
+void     ggml_sycl_tenant_publish_gen_bump();
 
-static bool test_into_empty_hint_is_bound_to_the_publication_epoch() {
+static bool test_into_empty_hint_is_bound_to_the_publication_generation() {
     ggml_sycl::lifecycle::ModelToken a{};
     a.model.value                                = 7;
     a.load.value                                 = 3;
@@ -137,25 +140,31 @@ static bool test_into_empty_hint_is_bound_to_the_publication_epoch() {
     ggml_sycl::lifecycle::ModelToken other_load  = a;
     other_load.load.value                        = 4;
 
-    const uint64_t epoch = lifecycle_plan_publication_epoch();
-    const uint64_t key   = ggml_sycl_into_empty_skip_key_for_test(a, epoch);
-    bool           ok    = key != 0 && key == ggml_sycl_into_empty_skip_key_for_test(a, epoch);
-    ok                   = ok && epoch == lifecycle_plan_publication_epoch();  // reading it publishes nothing
-    ok                   = ok && key != ggml_sycl_into_empty_skip_key_for_test(other_model, epoch);
-    ok                   = ok && key != ggml_sycl_into_empty_skip_key_for_test(other_load, epoch);
-    // A publication hands out an id: the epoch moves, and the same owner's key with it.
+    const uint64_t gen = ggml_sycl_tenant_publish_gen();
+    const uint64_t key = ggml_sycl_into_empty_skip_key_for_test(a, gen);
+    bool           ok  = key != 0 && key == ggml_sycl_into_empty_skip_key_for_test(a, gen);
+    ok                 = ok && gen == ggml_sycl_tenant_publish_gen();  // reading it publishes nothing
+    ok                 = ok && key != ggml_sycl_into_empty_skip_key_for_test(other_model, gen);
+    ok                 = ok && key != ggml_sycl_into_empty_skip_key_for_test(other_load, gen);
+    // A publication that reuses the plan version (a stable-MMID re-publish) hands out no
+    // plan id, but it still bumps the generation: the same owner's key moves with it.
+    ggml_sycl_tenant_publish_gen_bump();
+    const uint64_t same_version = ggml_sycl_tenant_publish_gen();
+    ok = ok && same_version != gen && ggml_sycl_into_empty_skip_key_for_test(a, same_version) != key &&
+         ggml_sycl_into_empty_skip_key_for_test(a, same_version) != 0;
+    // A publication that does hand out an id moves it too.
     (void) lifecycle_next_plan_publication_id();
-    const uint64_t after = lifecycle_plan_publication_epoch();
-    ok                   = ok && after != epoch && ggml_sycl_into_empty_skip_key_for_test(a, after) != key &&
-         ggml_sycl_into_empty_skip_key_for_test(a, after) != 0;
+    ggml_sycl_tenant_publish_gen_bump();
+    ok = ok && ggml_sycl_into_empty_skip_key_for_test(a, ggml_sycl_tenant_publish_gen()) !=
+                   ggml_sycl_into_empty_skip_key_for_test(a, same_version);
     return ok;
 }
 
 int main() {
-    if (test_into_empty_hint_is_bound_to_the_publication_epoch()) {
+    if (test_into_empty_hint_is_bound_to_the_publication_generation()) {
         n_pass++;
     } else {
-        printf("FAIL the into_empty skip hint is not bound to the plan publication epoch\n");
+        printf("FAIL the into_empty skip hint is not bound to the tenant publish generation\n");
         n_fail++;
     }
     check_concurrent_snapshot_publication();

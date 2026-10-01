@@ -1,5 +1,4 @@
-// Host test for mem_handle_identity and the tenant cohort tag (zhcn-design §3.1.1,
-// lead ruling §B.2).
+// Host test for mem_handle_identity and the tenant cohort tag (llama.cpp-zhcn).
 //
 // A cache that only COMPARES a source must not hold it.  mem_handle_identity is the
 // plain value such a cache keeps instead of a mem_handle: built only from the

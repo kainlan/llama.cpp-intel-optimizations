@@ -2682,7 +2682,7 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_bound
     }
 }
 
-// The load-time measure's plan override (zhcn-design §2.10): the plan every plan
+// The load-time measure's plan override: the plan every plan
 // accessor answers from on THIS thread while a measure context is built and
 // reserved.  It is written only by the install and clear procs below, never
 // published, and never read by another thread.  An empty pointer is "no override".
@@ -3142,17 +3142,26 @@ static uint64_t ggml_sycl_into_empty_install_count() {
 }
 #endif
 
-// The key of the into_empty hint: the owning load, bound to the plan publication
-// epoch.  A publication (a re-plan that may add this device) changes the epoch, so a
-// non-participant hint recorded before it never matches after it.  A re-publish that
-// reuses the current version (stable MMID) hands out no id and keeps the plan's devices.
-static uint64_t ggml_sycl_into_empty_skip_key(const ggml_sycl::lifecycle::ModelToken & owner, uint64_t epoch) {
-    return (owner.model.value * 0x9E3779B97F4A7C15ULL ^ owner.load.value ^ (epoch * 0xC2B2AE3D27D4EB4FULL)) | 1ULL;
+// The key of the into_empty hint: the owning load, bound to the tenant publish
+// generation.  The generation is bumped by every plan publication, including a stable-MMID
+// re-publish that keeps the plan version: that re-publish re-decides kv_device, and
+// ggml_sycl_placement_plan_uses_device counts it, so it can add a participant device while
+// handing out no new id.  A non-participant hint recorded before any publication therefore
+// never matches after it.  (A teardown release also bumps it; that only costs one locked pass.)
+static uint64_t ggml_sycl_into_empty_skip_key(const ggml_sycl::lifecycle::ModelToken & owner, uint64_t publish_gen) {
+    return (owner.model.value * 0x9E3779B97F4A7C15ULL ^ owner.load.value ^ (publish_gen * 0xC2B2AE3D27D4EB4FULL)) |
+           1ULL;
+}
+
+// The key of the once-per-owner foreign-plan WARN: the owning load alone, so a later
+// publication does not warn again for an owner that was already told.
+static uint64_t ggml_sycl_into_empty_foreign_warn_key(const ggml_sycl::lifecycle::ModelToken & owner) {
+    return (owner.model.value * 0x9E3779B97F4A7C15ULL ^ owner.load.value) | 1ULL;
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-uint64_t ggml_sycl_into_empty_skip_key_for_test(const ggml_sycl::lifecycle::ModelToken & owner, uint64_t epoch) {
-    return ggml_sycl_into_empty_skip_key(owner, epoch);
+uint64_t ggml_sycl_into_empty_skip_key_for_test(const ggml_sycl::lifecycle::ModelToken & owner, uint64_t publish_gen) {
+    return ggml_sycl_into_empty_skip_key(owner, publish_gen);
 }
 #endif
 
@@ -3180,9 +3189,10 @@ static ggml_sycl_into_empty_result ggml_sycl_republish_current_plan_into_empty(
     // owner's plan, so a participant-less cache does not take the inventory lock
     // on every MUL_MAT_ID.  The key names the owning load, so another owner never
     // matches, and the locked pass below remains the authority.  The key also names
-    // the publication epoch read before the lock: a publication that lands later
-    // changes the epoch, so a stale "not a participant" is never trusted past a re-plan.
-    const uint64_t skip_key = ggml_sycl_into_empty_skip_key(owner, ggml_sycl::lifecycle_plan_publication_epoch());
+    // the tenant publish generation read before the lock: a publication that lands later
+    // (a stable-MMID re-publish included) changes it, so a stale "not a participant" is
+    // never trusted past a re-plan.
+    const uint64_t skip_key = ggml_sycl_into_empty_skip_key(owner, ggml_sycl_tenant_publish_gen());
     if (cache->into_empty_skip_key() == skip_key) {
         return ggml_sycl_into_empty_result::NOOP;
     }
@@ -3205,9 +3215,10 @@ static ggml_sycl_into_empty_result ggml_sycl_republish_current_plan_into_empty(
         // Never overwritten.  A cache that already holds another load's plan is not
         // this owner's to fill; say so once per owner so the two-model case is
         // visible, and leave it alone.
+        const uint64_t warn_key = ggml_sycl_into_empty_foreign_warn_key(owner);
         if ((current->model_id != selected->model_id || current->load_txn_id != selected->load_txn_id) &&
-            cache->into_empty_foreign_key() != skip_key) {
-            cache->set_into_empty_foreign_key(skip_key);
+            cache->into_empty_foreign_key() != warn_key) {
+            cache->set_into_empty_foreign_key(warn_key);
             GGML_LOG_WARN(
                 "[CONTEXT-PLAN] into_empty: this device's cache holds model=%llu load=%llu's plan, not the owner's "
                 "model=%llu load=%llu; left as it is\n",
@@ -15122,7 +15133,7 @@ bool ggml_backend_sycl_has_active_placement_plan(void) {
     return ggml_sycl_has_global_plan();
 }
 
-// The measure plan override's two writers (zhcn-design §2.10).  The thread-local is
+// The measure plan override's two writers.  The thread-local is
 // written only here.  Install builds nothing: it finds the plan moua staged for the
 // load -- the probe placement's at (a), the load's candidate at (b) and (c) -- and
 // holds it, in the candidate's shape, for this thread until clear.
@@ -19750,7 +19761,7 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
 // resolution for the same tensor/device pair within a single graph compute.
 // Cleared at the start and at the exit of each graph compute, and at each publish.
 //
-// An entry holds NO mem_handle (zhcn-design §3.1.1): a
+// An entry holds NO mem_handle: a
 // pointer cache that owned a handle would be a holder of whatever slice it
 // names.  It stores the pointer, where it lives, the non-owning identity of the
 // tensor's storage slice at fill time, and the process tenant-publish generation
@@ -19802,7 +19813,7 @@ void ggml_sycl_tenant_publish_gen_bump() {
 
 // Fills that found no allocator identity and so cached nothing (a miss is
 // today's slow path).  Always compiled, as every dump-table counter is; the
-// name is zhcn's and is registered in 23mk step 0's table by that step.
+// name is llama.cpp-zhcn's and is registered in llama.cpp-23mk's table by that task's step 0.
 static std::atomic<uint64_t> g_graph_ptr_cache_uncached_fill{ 0 };
 
 uint64_t ggml_sycl_graph_ptr_cache_uncached_fill() {
@@ -21700,7 +21711,7 @@ struct moe_down_shadow_entry {
 
 // The key names its source by a non-owning mem_handle_identity: the shadow only
 // compares it (its entries' bytes are a host copy, never a slice), so it must
-// not keep an activation slice alive past its graph (zhcn-design §3.1.1).
+// not keep an activation slice alive past its graph.
 struct moe_down_shadow_key {
     ggml_sycl_cache_id             id{};
     ggml_sycl::mem_handle_identity handle{};
@@ -38482,7 +38493,7 @@ static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_ty
     GGML_UNUSED(buft);
 }
 
-// ===== Chunk cap, the per-context copy and plan scopes (zhcn-design §2.4, §3.4) =====
+// ===== Chunk cap, the per-context copy and plan scopes =====
 //
 // A device buft's get_max_size is the largest buffer ggml-alloc may request in one
 // allocation.  On the plan path it is one expression, ggml_sycl_chunk_cap_core,
@@ -43884,7 +43895,7 @@ static const ggml_backend_buffer_type_i ggml_backend_sycl_host_compute_buffer_ty
 };
 
 // The per-device tensor-split host compute bufts.  File scope so a plan scope can name one
-// by pointer (zhcn-design §2.4, r4 m-3) without creating it.
+// by pointer without creating it.
 static struct ggml_backend_buffer_type ggml_backend_sycl_host_compute_buffer_types[GGML_SYCL_MAX_DEVICES];
 static bool                            g_host_compute_buffer_types_initialized = false;
 
@@ -53247,7 +53258,7 @@ static bool ggml_sycl_narrow_storage_identity(const ggml_sycl::mem_handle_identi
     return true;
 }
 
-// The data-pointer cache's one identity function (zhcn-design §3.1.1): the non-owning
+// The data-pointer cache's one identity function: the non-owning
 // identity of the slice of storage a tensor occupies, used at fill and at lookup
 // of g_data_ptr_cache so the two sides can never compare a whole allocation
 // against a slice.
@@ -100668,7 +100679,7 @@ static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ct
     ggml_sycl::release_graph_retained_handles();
 }
 
-// Every kind of recorded state this context holds (zhcn-design §3.1 step 5(a)).  The
+// Every kind of recorded state this context holds).  The
 // one statement of what "has recorded state" means: the re-plan's invalidate proc
 // tests it before any clear, and a context with nothing recorded does nothing.
 static bool sycl_exec_graph_has_recorded_state(ggml_backend_sycl_context * ctx) {
@@ -100741,7 +100752,7 @@ static void sycl_exec_graph_clear_scoped(ggml_backend_sycl_context * ctx, const 
 
     ctx->invalidate_moe_segments();
     ctx->invalidate_moe_block_graphs();
-    // A re-plan drops every kind of recording (zhcn-design §Z14.1): the graphlets, the
+    // A re-plan drops every kind of recording: the graphlets, the
     // block-exec range graphs and the unified kernel's plan cache (with its micro graph
     // and update recipe) all bake addresses of the scheduler being replaced.
     ctx->invalidate_moe_sequence_graphs();
@@ -100797,8 +100808,7 @@ static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::Model
     }
 }
 
-// A re-plan's invalidation of ONE context's own recorded graph state (zhcn-design §3.1
-// step 5(a)).  Runs on the owner thread, outside graph_compute.  With nothing recorded
+// A re-plan's invalidation of ONE context's own recorded graph state.  Runs on the owner thread, outside graph_compute.  With nothing recorded
 // it does nothing; otherwise it runs the context-scoped clear body, which reaches none
 // of the process-global effects sycl_exec_graph_clear_active adds.
 void ggml_backend_sycl_graph_invalidate(ggml_backend_t backend, const char * reason) {
@@ -100812,8 +100822,7 @@ void ggml_backend_sycl_graph_invalidate(ggml_backend_t backend, const char * rea
     sycl_exec_graph_clear_scoped(ctx, reason ? reason : "context-replan");
 }
 
-// Waits every queue that can reach a slice of this context, after llama's synchronize()
-// (zhcn-design §3.1 step 3).  llama's synchronize() waits only the device execution
+// Waits every queue that can reach a slice of this context, after llama's synchronize().  llama's synchronize() waits only the device execution
 // queue (or the deferred-decode event) and flushes the thread-local pending-scatter lists; the
 // queues below carry other work too, which is allowed only here, on the rare re-plan
 // path under L0.  Gate 30 censuses every queue and names the line that waits it.
@@ -108947,7 +108956,7 @@ normal_dispatch:
 }
 
 // Publishes the per-graph staged owners (the llama.cpp-1df8 keep-alive, kept out
-// of g_data_ptr_cache; zhcn-design §3.1.1).  An eager call retained them in
+// of g_data_ptr_cache).  An eager call retained them in
 // g_graph_staged_owners; they leave through the retained store bound to the
 // graph's completion, never parked in a cache.  A recording call handed its
 // owners to the recording sink when it staged them.
@@ -108979,7 +108988,7 @@ static void ggml_sycl_graph_staged_owners_publish(ggml_backend_sycl_context * ct
 // The exit of every graph_compute call, on every return path.  It runs the
 // steps that keep a graph's transient holders from outliving it, so no tenant
 // slice stays parked in a thread-local or per-context structure past the call
-// (zhcn-design §3.1.1).
+//.
 //
 //  * Pending scatter work: an EAGER call flushes every thread-local MoE scatter
 //    and CPU-expert list.  A RECORDING call is exempt: CPU-expert
@@ -111939,7 +111948,7 @@ extern "C" void ggml_backend_sycl_test_fail_next_backend_publish() {
 }
 #endif
 
-// The load-time measure's backend (zhcn-design §2.10).  It is a ggml_backend_t the
+// The load-time measure's backend.  It is a ggml_backend_t the
 // scheduler can reserve against, and nothing else: no SYCL context, no refcount, no
 // lifecycle registration.  Its interface is its own, never ggml_backend_sycl_interface,
 // and every slot but get_name and free is NULL.  synchronize is NULL on purpose: the

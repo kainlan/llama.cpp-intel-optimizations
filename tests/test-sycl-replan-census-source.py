@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gates 3, 23, 29, 30, 31, 36 and 37 (zhcn-design §5.2): the backend half of the re-plan protocol.
+"""Gates 3, 23, 29, 30, 31, 36 and 37 (llama.cpp-zhcn): the backend half of the re-plan protocol.
 
 C6 landed the backend side of the context-tenant plan: the chunk-cap wrapper and the
 plan scopes that read it, the measure plan override and the non-owning measure backend,
@@ -702,6 +702,16 @@ def gate31_owner(files, bad):
                 bad("gate 31 (owner): into_empty does not witness a foreign load's plan in a filled cache")
             if non_empty.start() > t.find("set_placement_plan_snapshot("):
                 bad("gate 31 (owner): the filled-cache test comes after the install")
+            # the once-per-owner WARN is keyed by the owner alone: a key that mixed the publish generation would
+            # warn once per owner per publication
+            if not re.search(r"warn_key\s*=\s*ggml_sycl_into_empty_foreign_warn_key\s*\(\s*owner\s*\)\s*;", nb) or \
+                    "set_into_empty_foreign_key(warn_key)" not in nb or "into_empty_foreign_key() != warn_key" not in nb:
+                bad("gate 31 (owner): the foreign-plan WARN is not deduplicated on its own owner-only key")
+            wf = func_bodies(c, "ggml_sycl_into_empty_foreign_warn_key")
+            wt = text_of(c, wf[0]) if len(wf) == 1 else ""
+            if not (re.search(r"owner\.model\.value", wt) and re.search(r"owner\.load\.value", wt)) or \
+                    re.search(r"publish_gen|epoch|tenant_publish_gen", wt):
+                bad("gate 31 (owner): the foreign-plan WARN key is not the owner's model and load alone")
         np_ = re.search(r"if\s*\(\s*!participates\s*\)\s*\{(.*?)\n    \}", t, re.S)
         if not np_ or "return ggml_sycl_into_empty_result::NOOP" not in np_.group(1) or \
                 "set_into_empty_skip_key(skip_key)" not in np_.group(1):
@@ -711,18 +721,19 @@ def gate31_owner(files, bad):
         hint = t.find("into_empty_skip_key() == skip_key")
         if hint < 0 or hint > t.find("std::lock_guard") or "return ggml_sycl_into_empty_result::NOOP" not in t[hint:hint + 120]:
             bad("gate 31 (owner): the owner-keyed hint is not read, with a NOOP, before the lock")
-        # the key names the owning load AND the plan publication epoch, read before the lock: a re-plan that adds
-        # this device is a publication, which moves the epoch, so a stale "not a participant" never matches
+        # the key names the owning load AND the tenant publish generation, read before the lock: every plan
+        # publication bumps the generation -- a stable-MMID re-publish too, which keeps the plan version yet can
+        # add this device through kv_device -- so a stale "not a participant" never matches
         if not re.search(r"skip_key\s*=\s*ggml_sycl_into_empty_skip_key\s*\(\s*owner\s*,\s*"
-                         r"ggml_sycl::lifecycle_plan_publication_epoch\s*\(\s*\)\s*\)\s*;", t) or \
-                t.find("lifecycle_plan_publication_epoch(") > t.find("std::lock_guard"):
-            bad("gate 31 (owner): the hint key is not built from the owner's load and the plan publication epoch "
+                         r"ggml_sycl_tenant_publish_gen\s*\(\s*\)\s*\)\s*;", t) or \
+                t.find("ggml_sycl_tenant_publish_gen(") > t.find("std::lock_guard"):
+            bad("gate 31 (owner): the hint key is not built from the owner's load and the tenant publish generation "
                 "before the lock")
         kf = func_bodies(c, "ggml_sycl_into_empty_skip_key")
         kt = text_of(c, kf[0]) if len(kf) == 1 else ""
         if not (re.search(r"owner\.model\.value", kt) and re.search(r"owner\.load\.value", kt) and
-                re.search(r"\bepoch\b", kt) and re.search(r"\|\s*1ULL", kt)):
-            bad("gate 31 (owner): the hint key function does not mix the owner's model, load and the epoch")
+                re.search(r"\bpublish_gen\b", kt) and re.search(r"\|\s*1ULL", kt)):
+            bad("gate 31 (owner): the hint key function does not mix the owner's model, load and the publish generation")
         if not all(x in t for x in ("installed->version != selected->version", "installed->model_id != selected->model_id",
                                     "installed->load_txn_id != selected->load_txn_id")):
             bad("gate 31 (owner): into_empty does not compare version, model_id and load_txn_id of the installed snapshot")
@@ -1124,14 +1135,27 @@ def mutants(files):
                 "g_into_empty_foreign.fetch_add(1, std::memory_order_acq_rel);\n            cache->set_placement_plan_snapshot(selected);",
                 "g31o31"), "does not leave a filled cache untouched")
     yield ("into_empty not witnessing a foreign plan",
-           edit(files, M, "cache->set_into_empty_foreign_key(skip_key);", "", "g31o32"), "does not witness a foreign load")
-    yield ("a hint key that ignores the publication epoch",
-           edit(files, M, "(epoch * 0xC2B2AE3D27D4EB4FULL)", "0", "g31o34"),
-           "does not mix the owner's model, load and the epoch")
-    yield ("a hint key read with a constant epoch",
-           edit(files, M, "ggml_sycl_into_empty_skip_key(owner, ggml_sycl::lifecycle_plan_publication_epoch())",
+           edit(files, M, "cache->set_into_empty_foreign_key(warn_key);", "", "g31o32"), "does not witness a foreign load")
+    yield ("a hint key that ignores the publish generation",
+           edit(files, M, "(publish_gen * 0xC2B2AE3D27D4EB4FULL)", "0", "g31o34"),
+           "does not mix the owner's model, load and the publish generation")
+    yield ("a hint key read with a constant generation",
+           edit(files, M, "ggml_sycl_into_empty_skip_key(owner, ggml_sycl_tenant_publish_gen())",
                 "ggml_sycl_into_empty_skip_key(owner, 0)", "g31o35"),
-           "hint key is not built from the owner's load and the plan publication epoch")
+           "hint key is not built from the owner's load and the tenant publish generation")
+    yield ("a hint key reverted to the plan id epoch, which a stable re-publish does not move",
+           edit(files, M, "ggml_sycl_into_empty_skip_key(owner, ggml_sycl_tenant_publish_gen())",
+                "ggml_sycl_into_empty_skip_key(owner, ggml_sycl::lifecycle_plan_publication_epoch())", "g31o36"),
+           "hint key is not built from the owner's load and the tenant publish generation")
+    yield ("a foreign WARN deduplicated on the per-publication key",
+           edit(files, M, "const uint64_t warn_key = ggml_sycl_into_empty_foreign_warn_key(owner);",
+                "const uint64_t warn_key = skip_key;", "g31o37"),
+           "foreign-plan WARN is not deduplicated on its own owner-only key")
+    yield ("a foreign WARN key that mixes the publish generation",
+           edit(files, M, "return (owner.model.value * 0x9E3779B97F4A7C15ULL ^ owner.load.value) | 1ULL;",
+                "return (owner.model.value * 0x9E3779B97F4A7C15ULL ^ owner.load.value ^ ggml_sycl_tenant_publish_gen()) | 1ULL;",
+                "g31o38"),
+           "foreign-plan WARN key is not the owner's model and load alone")
     yield ("a non-participant that reports an install",
            edit(files, M, "cache->set_into_empty_skip_key(skip_key);\n        return ggml_sycl_into_empty_result::NOOP;",
                 "cache->set_into_empty_skip_key(skip_key);\n        return ggml_sycl_into_empty_result::INSTALLED;", "g31o33"),

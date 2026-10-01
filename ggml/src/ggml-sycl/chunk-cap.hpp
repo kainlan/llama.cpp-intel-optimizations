@@ -1,6 +1,6 @@
 #pragma once
 
-// The pure chunk-cap expression (zhcn-design §2.4).  A cap is the largest single
+// The pure chunk-cap expression.  A cap is the largest single
 // buffer a device buft's get_max_size reports to ggml-alloc.  Every cap on the
 // plan path is this one expression, so MEASURE and ALLOC, the freeze and the
 // load-time scope agree by construction.  Host-only: it names no device, backing

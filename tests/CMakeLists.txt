@@ -373,13 +373,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 
-    # H5 of the zhcn design (structural arm): init_reserve(s) spans s streams in every memory class.
+    # H5 of llama.cpp-zhcn (structural arm): init_reserve(s) spans s streams in every memory class.
     # Loads tiny models, so it carries `model`, the label the ctest sweep (form 2 in CLAUDE.md) excludes,
     # and is run by hand pinned to the discrete cards. Inside this block for the same reason as
     # test-llama-archs: it uses internal symbols.
     llama_build_and_test(test-context-measure-h5.cpp LABEL model)
 
-    # H3i (2) and (3) of the zhcn design: a refused allocation during a memory update reaches the
+    # H3i (2) and (3) of llama.cpp-zhcn: a refused allocation during a memory update reaches the
     # caller as FAILED and as llama_decode() == -2. Loads tiny models and swaps the CPU device's buffer
     # type for a refusing wrapper, so it is `model`-labelled and lead-run like the one above.
     llama_build_and_test(test-context-update-failure.cpp LABEL model)
@@ -1634,7 +1634,7 @@ if (NOT WIN32)
         TIMEOUT 180
     )
 
-    # Gate 27 (zhcn-design §5.2): the holder census, producer half.  A cache that only
+    # Gate 27 (llama.cpp-zhcn): the holder census, producer half.  A cache that only
     # compares a source holds a mem_handle_identity, never a mem_handle (§B.2); the
     # gate pins the producer fixes and proves itself on mutants of the real source.
     llama_test_cmd(
@@ -1648,7 +1648,7 @@ if (NOT WIN32)
         TIMEOUT 180
     )
 
-    # Gates 3, 23, 29, 30, 31, 36 and 37 (zhcn-design §5.2): the backend half of the
+    # Gates 3, 23, 29, 30, 31, 36 and 37 (llama.cpp-zhcn): the backend half of the
     # re-plan protocol (chunk cap, graph clear, host_task and queue censuses, the L0
     # token and its witnesses, the plan override, the measure backend, the pool gates).
     llama_test_cmd(

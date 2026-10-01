@@ -1,5 +1,5 @@
 // Host test for L0, the re-plan transaction mutex, and the always-compiled
-// witness (llama.cpp-moua's token, defined by llama.cpp-zhcn C6; H9's real-object
+// witness (llama.cpp-moua's token, defined by llama.cpp-zhcn; H9's real-object
 // half).  The mechanics under test are the REAL ggml_sycl_replan_token and
 // GGML_SYCL_WITNESS of unified-cache.cpp, built into the private fixture carrier:
 //

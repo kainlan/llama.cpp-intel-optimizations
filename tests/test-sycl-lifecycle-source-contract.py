@@ -107,37 +107,57 @@ legacy_cache_re = re.compile(
 raw_snapshot_reader_re = re.compile(r"(?:->|\.)\s*get_placement_plan_snapshot\s*\(")
 raw_snapshot_writer_re = re.compile(r"(?:->|\.)\s*set_placement_plan_snapshot\s*\(")
 # Cache snapshot reads return shared_ptr owners, despite the historical "raw
-# snapshot" contract name. Keep the four synchronous roles explicit so a new
-# cache-authority read cannot enter production merely by incrementing a count.
-raw_snapshot_reader_allowlist = (
-    "const auto cached = cache->get_placement_plan_snapshot();",
-    "const auto recipe_plan = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
-    "const auto plan_snapshot = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
-    "const auto plan = cache ? cache->get_placement_plan_snapshot() : nullptr;",
+# snapshot" contract name. Each read is a named role: the exact statement AND the
+# function it sits in, so a new cache-authority read cannot enter production by
+# incrementing a count, and a listed statement cannot be pasted into another function.
+raw_snapshot_reader_roles = (
+    ("const auto cached = cache->get_placement_plan_snapshot();", "cache_placement_coherence"),
+    ("const auto recipe_plan = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
+     "ggml_sycl_mul_mat_id"),
+    ("const auto plan_snapshot = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
+     "ggml_sycl_mul_mat_id"),
+    ("const auto plan = cache ? cache->get_placement_plan_snapshot() : nullptr;",
+     "ggml_sycl_recover_exact_mmid_after_drain"),
+    # ggml_sycl_republish_current_plan_into_empty is the one install path for a cache whose plan is empty
+    # (llama.cpp-zhcn).  The emptiness predicate and the in-lock emptiness re-check both read the cache
+    # as `current`; the identity check after the install reads it as `installed`.
+    ("const auto current = cache->get_placement_plan_snapshot();", "ggml_sycl_cache_snapshot_empty"),
+    ("const auto current = cache->get_placement_plan_snapshot();", "ggml_sycl_republish_current_plan_into_empty"),
+    ("const auto installed = cache->get_placement_plan_snapshot();", "ggml_sycl_republish_current_plan_into_empty"),
 )
-# ggml_sycl_republish_current_plan_into_empty is the design's one install path for a cache whose plan is
-# empty (zhcn-design 3.1 step 2; rulings M246 option A).  Its reads and its single writer are named roles
-# too: the emptiness predicate and the in-lock emptiness re-check both read the cache as `current`, and the
-# identity check after the install reads it as `installed`.  The writer is checked to sit in that function.
-raw_snapshot_into_empty_readers = {
-    "const auto current = cache->get_placement_plan_snapshot();": 2,
-    "const auto installed = cache->get_placement_plan_snapshot();": 1,
-}
+raw_snapshot_reader_allowlist = tuple(site for site, _ in raw_snapshot_reader_roles[:4])
 raw_snapshot_publication_writer = "publication.caches[i]->set_placement_plan_snapshot(publication.participates[i] ? snapshot : nullptr);"
 raw_snapshot_into_empty_writer = "cache->set_placement_plan_snapshot(participates ? selected : nullptr);"
 BACKEND_PATH = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 
 
+def _sites_in_function(active, site, function):
+    """How many occurrences of site sit inside a function whose signature names `function`."""
+    count = 0
+    at = active.find(site)
+    while at >= 0:
+        # any enclosing definition may carry the name: a lambda inside the named function is inside it
+        for _, body in _functions_containing(active, at):
+            if re.search(r"\b" + re.escape(function) + r"\s*\(", body[:body.find("{")]):
+                count += 1
+                break
+        at = active.find(site, at + 1)
+    return count
+
+
 def raw_snapshot_reader_allowlist_ok(sources, backend_text):
-    expected = len(raw_snapshot_reader_allowlist) + sum(raw_snapshot_into_empty_readers.values())
     found = {
         path: len(raw_snapshot_reader_re.findall(text))
         for path, text in sources.items()
         if raw_snapshot_reader_re.search(text)
     }
-    return (found == {BACKEND_PATH: expected}
-            and all(backend_text.count(site) == 1 for site in raw_snapshot_reader_allowlist)
-            and all(backend_text.count(site) == n for site, n in raw_snapshot_into_empty_readers.items()))
+    active = _strip_cpp_comments(backend_text)
+    per_site = {}
+    for site, _ in raw_snapshot_reader_roles:
+        per_site[site] = per_site.get(site, 0) + 1
+    return (found == {BACKEND_PATH: len(raw_snapshot_reader_roles)}
+            and all(_sites_in_function(active, site, function) == 1 for site, function in raw_snapshot_reader_roles)
+            and all(active.count(site) == n for site, n in per_site.items()))
 
 
 def raw_snapshot_writer_allowlist_ok(sources, backend_text):
@@ -149,8 +169,9 @@ def raw_snapshot_writer_allowlist_ok(sources, backend_text):
     if backend_text.count(raw_snapshot_publication_writer) != 1 or backend_text.count(raw_snapshot_into_empty_writer) != 1:
         return False
     active = _strip_cpp_comments(backend_text)
-    at = active.find(raw_snapshot_into_empty_writer)
-    return "ggml_sycl_republish_current_plan_into_empty" in _function_containing(active, at)[:400]
+    return (_sites_in_function(active, raw_snapshot_into_empty_writer, "ggml_sycl_republish_current_plan_into_empty") == 1
+            and _sites_in_function(active, raw_snapshot_publication_writer,
+                                   "ggml_sycl_publish_prepared_plan_locked") == 1)
 
 
 def _balanced_body(source, brace):
@@ -184,6 +205,12 @@ def _strip_cpp_comments(source):
 
 def _function_containing(source, position):
     """Lightweight function parser: choose the smallest definition containing position."""
+    candidates = _functions_containing(source, position)
+    return min(candidates)[1] if candidates else ""
+
+
+def _functions_containing(source, position):
+    """Every parsed definition (a lambda included) that contains position, as (length, text)."""
     candidates = []
     definition = re.compile(
         r"(?:^|\n)(?P<signature>[^;{}\n]*(?:\n[^;{}\n]*){0,8}?\([^;{}]*?\)\s*)"
@@ -196,7 +223,7 @@ def _function_containing(source, position):
         body = _balanced_body(source, brace)
         if body and brace <= position < brace + len(body):
             candidates.append((len(body), signature + body))
-    return min(candidates)[1] if candidates else ""
+    return candidates
 
 
 def _raw_snapshot_escape_failures(source):
@@ -637,7 +664,8 @@ checks = {
     "raw snapshot reader exact allowlist": raw_snapshot_reader_allowlist_ok(placement_sources, backend),
     "raw snapshot writer whitelist": raw_snapshot_writer_allowlist_ok(placement_sources, backend),
     "same snapshot cache publication": backend.count(raw_snapshot_publication_writer) == 1
-    and "ggml_sycl_republish_current_plan_into_empty" in backend,
+    and _sites_in_function(_strip_cpp_comments(backend), raw_snapshot_publication_writer,
+                           "ggml_sycl_publish_prepared_plan_locked") == 1,
     "no cache plan reference accessor": "get_placement_plan(" not in cache_hpp
     and "get_placement_plan_owner(" not in cache_hpp,
     "transactional model runtime update": "g_runtime_external_lease" in backend
@@ -1551,6 +1579,24 @@ snapshot_access_mutants = (
      + "\nstatic void moved_writer(ggml_sycl::unified_cache * cache, bool participates, "
      "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> selected) {\n    "
      + raw_snapshot_into_empty_writer + "\n}\n"),
+    # R4: the listed statement deleted from its function and the same line added in an unrelated one.
+    ("the predicate's read deleted and the same line added in an unrelated function", "reader",
+     backend.replace(
+         "    const auto current = cache->get_placement_plan_snapshot();\n"
+         "    // A bool, not a pointer into the snapshot",
+         "    // A bool, not a pointer into the snapshot", 1)
+     + "\nstatic void unrelated_reader(const ggml_sycl::unified_cache * cache) {\n"
+     "    const auto current = cache->get_placement_plan_snapshot();\n    (void) current;\n}\n"),
+    ("a listed read pasted into another function in place of its own", "reader",
+     backend.replace("const auto cached = cache->get_placement_plan_snapshot();",
+                     "const auto cached = nullptr;", 1)
+     + "\nstatic void unrelated_cached(const ggml_sycl::unified_cache * cache) {\n"
+     "    const auto cached = cache->get_placement_plan_snapshot();\n    (void) cached;\n}\n"),
+    ("the publication writer moved out of the prepared publish", "writer",
+     backend.replace(raw_snapshot_publication_writer, "(void) 0;", 1)
+     + "\nstatic void moved_publish(ggml_sycl_prepared_plan_publication & publication, int i, "
+     "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot) {\n    "
+     + raw_snapshot_publication_writer + "\n}\n"),
     ("the into_empty identity read renamed out of the allowlist", "reader",
      backend.replace("const auto installed = cache->get_placement_plan_snapshot();",
                      "const auto reinstalled = cache->get_placement_plan_snapshot();", 1)),

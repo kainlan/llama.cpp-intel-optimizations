@@ -133,7 +133,7 @@ int main() {
     }
 
     // A second load_end of the same transaction cannot overlap the first: the LOAD
-    // token (L0) serialises them (zhcn-design C6, rulings section B.2).  The first
+    // token (L0) serialises them.  The first
     // call parks inside candidate binding holding L0; the second must still be
     // waiting when we look, and runs only after the first has finished.  The
     // first one's binding allocation then fails, which durably aborts the

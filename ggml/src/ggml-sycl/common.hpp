@@ -4004,7 +4004,7 @@ struct ggml_tensor_extra_gpu {
     // (ensure_root_extra), so the root lies outside every SYCL device buffer and
     // the extra is released only with its backend context.  The persistent
     // publishers must never leave a tenant-tagged handle in one, which would
-    // outlive its graph (zhcn-design §3.1.1).
+    // outlive its graph.
     bool runtime_minted = false;
 
     // llama.cpp-asdt (plan task L2b, jemalloc-profile bug fix): set once, at
@@ -5780,8 +5780,7 @@ struct ggml_backend_sycl_context {
 
     // The key names its source by a non-owning mem_handle_identity, never by a
     // mem_handle: the cache compares a source and never dereferences it, so it
-    // must not keep the activation's slice alive past its graph (zhcn-design
-    // §3.1.1).  The context member and both thread_local
+    // must not keep the activation's slice alive past its graph.  The context member and both thread_local
     // maps keyed by this type convert with this one change.
     struct moe_ids_cache_key {
         ggml_sycl_cache_id             id{};
@@ -6694,7 +6693,7 @@ struct ggml_backend_sycl_context {
 
             // The source is named by a non-owning identity, never held: this cache
             // only compares it, so it must not keep an activation slice alive
-            // past its graph (zhcn-design §3.1.1).
+            // past its graph.
             void *                         cached_q8_1       = nullptr;
             const ggml_tensor *            cached_tensor     = nullptr;
             ggml_sycl::mem_handle_identity cached_src        = {};

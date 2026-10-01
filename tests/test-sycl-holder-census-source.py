@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate 27 (zhcn-design §5.2): the holder census of the context-tenant plan, producer half.
+"""Gate 27 (llama.cpp-zhcn): the holder census of the context-tenant plan, producer half.
 
 Lead ruling §B.2: there is no fourth holder class.  A cache that only COMPARES a
 source holds a `mem_handle_identity` (a value built from the allocator's monotonic

@@ -146,10 +146,6 @@ uint64_t lifecycle_next_plan_publication_id() noexcept {
     }
 }
 
-uint64_t lifecycle_plan_publication_epoch() noexcept {
-    return g_lifecycle_plan_next_version.load(std::memory_order_acquire);
-}
-
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept {
     g_lifecycle_plan_next_version.store(next, std::memory_order_relaxed);
@@ -927,7 +923,7 @@ const alloc_metadata & alloc_owner::metadata() const noexcept {
 }
 
 // No production code sets a tenant cohort yet; whoever makes it live must first
-// close two hazards at the graph_compute exit (zhcn-design, the commit-7 list):
+// close two hazards at the graph_compute exit (llama.cpp-zhcn's commit-7 list):
 //  * a recording call keeps its tenant staging entries in graph_input_staging
 //    past the graph, because the exit skips the tenant release for it; and
 //  * a replay-only call begins no recording, so it is classified eager and its

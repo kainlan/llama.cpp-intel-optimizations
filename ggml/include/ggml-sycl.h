@@ -1485,7 +1485,7 @@ GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install(uint64_t  
                                                                       enum ggml_sycl_measure_stage stage);
 GGML_BACKEND_API void ggml_backend_sycl_measure_plan_override_clear(void);
 
-// === Per-context chunk-cap copy and plan scopes (zhcn-design §2.4, §3.4) ===
+// === Per-context chunk-cap copy and plan scopes ===
 //
 // A context that runs the placement fixpoint owns one `ggml_backend_sycl_plan_caps`.
 // It freezes, once, the largest buffer each compute buft may report to ggml-alloc, so
@@ -1528,12 +1528,12 @@ GGML_BACKEND_API void *       ggml_backend_sycl_plan_scope_open_load_measure(enu
 GGML_BACKEND_API const char * ggml_backend_sycl_plan_scope_failure(void * scope);
 GGML_BACKEND_API void         ggml_backend_sycl_plan_scope_close(void * scope);
 
-// The load-time measure's backend (zhcn-design §2.10): non-owning, no SYCL context, no
+// The load-time measure's backend: non-owning, no SYCL context, no
 // refcount, no lifecycle registration, its own interface with every slot but get_name and
 // free NULL.  ggml_backend_free on it deletes the object only.  NULL on a bad device index.
 GGML_BACKEND_API ggml_backend_t ggml_backend_sycl_measure_backend_init(int device);
 
-// A re-plan's per-context steps (zhcn-design §3.1).  synchronize_for_replan waits every
+// A re-plan's per-context steps.  synchronize_for_replan waits every
 // queue that can reach a slice of the context, after llama's synchronize(); it returns
 // false if a wait failed.  graph_invalidate drops this context's own recorded graph
 // state, only when it has some, and reaches no process-global effect.
@@ -1543,7 +1543,7 @@ GGML_BACKEND_API void ggml_backend_sycl_graph_invalidate(ggml_backend_t backend,
 // === Test-only debug accessors (llama.cpp-dfo0, plan task L2) ===
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The freeze's store through the production core, for a host with no SYCL device
-// (zhcn-design §2.4; H6a).  `buft` is stored with the core's value and the copy's
+//.  `buft` is stored with the core's value and the copy's
 // per-buft freeze counter is incremented.  Returns the stored value.
 GGML_BACKEND_API size_t                     ggml_backend_sycl_plan_caps_freeze_core(ggml_backend_sycl_plan_caps_t caps,
                                                                                     ggml_backend_buffer_type_t    buft,

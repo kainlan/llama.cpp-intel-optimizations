@@ -277,9 +277,8 @@ class mem_handle_lock_guard {
 
 // A plain-value name for "this slice of that allocation", for caches that only
 // ever compare a source and must not keep it alive.  It holds no control, so a
-// cache keyed on it is never a holder of the allocation (zhcn-design §3.1.1,
-// lead ruling §B.2: an owning handle held only to compare identity is a holder
-// to fix, not to exempt).
+// cache keyed on it is never a holder of the allocation.  An owning handle held
+// only to compare identity is a holder to fix, not to exempt.
 //
 // It is built only from the allocator's monotonic retention id
 // (unified_cache_mint_retention_identity(): never an address, never reused, and

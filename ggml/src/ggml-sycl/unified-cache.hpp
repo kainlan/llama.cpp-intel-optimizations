@@ -1517,13 +1517,10 @@ std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unifie
 std::shared_ptr<const placement_plan> coherent_cache_placement_plan_owner(const unified_cache * cache) noexcept;
 placement_cache_read                  cache_placement_coherence(const unified_cache * cache) noexcept;
 uint64_t                              lifecycle_next_plan_publication_id() noexcept;
-// How many plan publication ids have been handed out.  It changes whenever a plan is
-// published or re-published, so a hint that must not outlive a re-plan binds to it.
-uint64_t                              lifecycle_plan_publication_epoch() noexcept;
 
 // The one builder of a candidate-shaped snapshot (model_id 0, the load's transaction,
 // version 0).  Staging calls it and stores the result; the load-time measure's plan
-// override calls it and never stores (zhcn-design §2.10).
+// override calls it and never stores.
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_make_candidate_snapshot(uint64_t                  load_txn_id,
                                                                                  placement_plan            plan,
                                                                                  const placement_kv_info & kv_info = {},
@@ -6384,7 +6381,7 @@ void                   zero_alloc_check(const char * tag, int device);
 
 // ---------------------------------------------------------------------------
 // L0, the process-global re-plan transaction mutex, and the always-compiled
-// witness (llama.cpp-moua, the L0 token; llama.cpp-zhcn C6 defines it).
+// witness (llama.cpp-moua's L0 token, defined in this file's companion unified-cache.cpp).
 //
 // Declared here, beside offload_stats_phase(), because pinned-pool.cpp sits
 // below ggml-sycl.cpp in the layering and reaches this header through
@@ -7436,7 +7433,7 @@ bool ggml_sycl_device_has_zones(int device);
 // sizes the compute chunks against.  512 MB, or GGML_SYCL_COMPUTE_ARENA_MB
 // (0 turns the reservation off).  A second reader of that variable is a second
 // source for one fact; gate 36 pins that there is none.  moua's accessor of this
-// name replaces this definition (zhcn-design §2.10, rulings §M45).
+// name replaces this definition.
 size_t ggml_sycl_compute_arena_bytes(int device);
 
 // (ExpertPlacementTable removed — the cache IS the placement.

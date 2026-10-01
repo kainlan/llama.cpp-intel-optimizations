@@ -1,4 +1,4 @@
-// Test: the load-time measure's plan override (zhcn-design §2.10; H5L (a), (d), (k4),
+// Test: the load-time measure's plan override (llama.cpp-zhcn), (d), (k4),
 // (l)).
 //
 // While a measure context is built and reserved, every plan accessor on the loading

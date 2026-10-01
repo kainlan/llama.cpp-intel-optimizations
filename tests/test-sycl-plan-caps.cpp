@@ -1,5 +1,5 @@
 // Test: the chunk-cap core, the per-context plan_caps copy and the plan scopes
-// (zhcn-design §2.4, §3.4; H6a).
+// (llama.cpp-zhcn).
 //
 // A device buft made by the PRIVATE_TESTING factory touches no device, so this runs
 // where there is none.  The copy is frozen through the production core and store

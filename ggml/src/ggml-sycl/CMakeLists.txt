@@ -3147,7 +3147,7 @@ set_tests_properties(test-sycl-tensor-placement PROPERTIES
     TIMEOUT 120
 )
 
-# Test: the load-time measure's plan override (zhcn-design §2.10; H5L).  Drives the
+# Test: the load-time measure's plan override (llama.cpp-zhcn).  Drives the
 # install/clear procs and the plan accessors, the publish refusal and the
 # plan-derived multi-GPU latch read.  Host code only: no queue or cache is touched.
 # The publish and latch controls it drives are compiled only into the private
@@ -3177,7 +3177,7 @@ set_tests_properties(test-sycl-measure-plan-override PROPERTIES
     TIMEOUT 120
 )
 
-# Test: the chunk-cap core, the plan_caps copy and the plan scopes (zhcn-design §2.4;
+# Test: the chunk-cap core, the plan_caps copy and the plan scopes (llama.cpp-zhcn;
 # H6a).  A PRIVATE_TESTING device buft touches no device, so this needs none.
 add_executable(test-sycl-plan-caps
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-plan-caps.cpp
@@ -3204,7 +3204,7 @@ set_tests_properties(test-sycl-plan-caps PROPERTIES
 )
 
 # Test: the re-plan hooks ggml_backend_sycl_synchronize_for_replan and
-# ggml_backend_sycl_graph_invalidate (zhcn-design §3.1; H6a).  Refusals run anywhere; the
+# ggml_backend_sycl_graph_invalidate (llama.cpp-zhcn).  Refusals run anywhere; the
 # context arms need a card, so the registration pins level_zero:0,1 and supplies
 # GGML_SYCL_TEST_REPLAN_DEVICE=1; a bare run of the binary without it skips the
 # context arms and exits 77, which ctest reports as skipped.  A registration
