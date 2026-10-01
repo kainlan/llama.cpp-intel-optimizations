@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14x, by impl-moua-s, 2026-09-30. The revisions answer thirty-two reviews:
+Design, revision 7.14y, by impl-moua-s, 2026-09-30. The revisions answer thirty-three reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -184,6 +184,11 @@ Design, revision 7.14x, by impl-moua-s, 2026-09-30. The revisions answer thirty-
   the W-order commit, H7 (as)'s source clauses are positive and every fill has a witness, the
   WARN prints after `w_order_warn_mutex` is released, and the FIRST_CONTEXT accessor is
   unconditional.
+- design review r32 (design-moua-r32 on `6d6c5c230..019f064b4`: 0 Critical, 0 Important, 5
+  Minor, 5 nits), recorded in §6.41. Revision 7.14y is one commit on top of `019f064b4`:
+  §3.2's measurement is a one-off print, its step 4 is unconditional and re-runs F3 at the
+  re-pinned bound (§M80 (d)), the WARN's node half is scored only after the re-pin, and H7 (as)
+  gains a clause on the finalize's record move.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -2546,7 +2551,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                  `execution_context_id` (`uint64_t`, `common.hpp:5667` at `d8a67422d`), the
                  value of the `ContextId` (`execution-lifecycle.hpp:20`) that
                  `ggml_backend_sycl_execution_context_bind_backend` binds
-                 (`ggml-sycl.cpp:14810`, written at `:14841` and `:14873`) (r30 n-1). **0 means
+                 (`ggml-sycl.cpp:14811`, written at `:14841` and `:14873`) (r30 n-1). **0 means
                  unbound (r30 m-2):** the registry issues ids from 1 (`next_context_id_ = 1`,
                  `execution-lifecycle.hpp:480`), and the reset zeroes the field
                  (`ggml-sycl.cpp:11877`). A llama context binds its backends, so its uses carry
@@ -2572,9 +2577,10 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                      `graph.get_nodes().size()` on the modifiable `command_graph` before it
                      finalizes. That is the SYCL command-graph node count, the one unit every
                      finalize site can read, since the `unified-kernel.cpp` sites have no ggml
-                     cgraph. G0 F3 compiles in a **provisional** node bound in the same unit,
-                     and a lead-run measurement after the W-order commit re-pins it from the
-                     meta this finalize fills (§3.2 gives the commit order; rulings §M80 (b)).
+                     cgraph. G0 F3 prints a **provisional** node bound in the same unit, which
+                     the W-order commit compiles in, and a lead-run measurement after that
+                     commit re-pins it from the meta this finalize fills (§3.2 gives the commit
+                     order, which applies when G0 picked Form M; rulings §M80 (b)).
                    - **Submit.** For each entry meta names, `ggml_sycl_graph_submit(queue,
                      exec, meta)` builds `use` = {the record's `ctx_id`, the record's
                      `n_ubatch`, meta's node count} and calls the function. So the check runs
@@ -2627,8 +2633,11 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    submits a chain of K waiter kernels, each capped at C, and each returns at
                    once when the marker has already reached n − 1, so a satisfied chain costs
                    K − 1 near-empty launches. K = ⌈2 T / C⌉, where T is the worst predecessor
-                   tail G0 measures on the gate shapes (F3, §3.2: the longest replayed graph
-                   plus one ubatch's `host_task` backlog, per card), and G0 prints C, T and K.
+                   tail G0 measures on the gate shapes (F3, §3.2: behind a replay of G0's own
+                   synthetic recording of N nodes, plus one ubatch's `host_task` backlog at the
+                   shape's `n_ubatch`, per card), and G0 prints C, T and K. T and K are valid for
+                   that N only; §3.2's step 4 re-runs F3 at the node bound that ships, which is
+                   what makes them cover it (r32 m-5).
                    Only the last waiter of the chain faults: at its cap it sets the fault word
                    and returns, and counts `w_order_wait_exhausted`
                    (`GGML_SYCL_PRIVATE_TESTING`). A correct run then has twice its measured
@@ -2639,7 +2648,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    C2b's ladder, whose top rung is 2048 at the default `n_batch`, and a
                    **provisional** node bound, the command-graph node count of the synthetic
                    recording F3's cells replay (G0 is model-less and has no production
-                   recording, §3.2; r31 m-1). The W-order commit compiles both in with K, as
+                   recording, §3.2; r31 m-1). The W-order commit compiles both in, with K, as
                    `GGML_SYCL_W_ORDER_BOUND_N_UBATCH` and `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES`
                    (r30 m-4), and the node constant is provisional until a follow-up commit
                    re-pins it from a lead-run measurement of the production recordings' meta
@@ -2666,17 +2675,28 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    decision. The mutex is held only for the insert and the flag store, never
                    across a submit, and nothing is taken under it: the print is after it, so the
                    installed log callback (`common_log::add` takes its own mutex in every llama
-                   tool) never runs under the lock, as the canonical contract's strict-leaf
-                   standard requires (no logging under a leaf). It is taken before the ordering
-                   decision, so it never nests with Form E's W-order mutex.
-                   The set's host allocation happens before the use's thread-local flag is set,
-                   so it is outside the strict-mode span. §2.10's L7 row lists it. A cap
+                   tool) never runs under the lock. That is the contract's rule for its strict-leaf
+                   ledger lock, which bars logging and also allocation
+                   (`sycl-canonical-memory-architecture.md:1551-1553`); this mutex keeps the
+                   first half (r32 n-3). **The choice:** the set's insert can allocate a node
+                   under the mutex, and that allocation is host bookkeeping, not a unified-cache
+                   allocation. It runs before the use's thread-local flag is set, so it is
+                   outside the strict-mode span, and the mutex is a leaf in lock-order terms
+                   only (nothing is acquired under it), not under the ledger lock's stricter
+                   rule. It is not pre-reserved. It is taken before the ordering decision, so it
+                   never nests with Form E's W-order mutex. §2.10's L7 row lists it. A cap
                    with the flag set aborts with its own message, `[W-ORDER] marker wait capped
                    on device %d outside the measured tail bound: re-measure G0 F3 at this
                    shape`, so an out-of-bound fault is never read as a lost publisher, and an
-                   in-bound one keeps the message below. Every scored arm here runs inside the
-                   bound, and scores the WARN at 0; G2's bound cell (§3.2) is that zero's
-                   positive control, and it separates the two abort messages (r28 m-4). The
+                   in-bound one keeps the message below. **Where the WARN's zero is scored (r32
+                   m-3).** G2's bound cell (§3.2) scores it: its cell (c) reads zero `shape above`
+                   lines inside the bound, and the cell is the positive control for the line and
+                   separates the two abort messages (r28 m-4). Any other arm key line that reads
+                   the `[W-ORDER] shape above` count names this rule: the node half of that
+                   reading is scorable only on a tree that contains §3.2's re-pin commit. On an
+                   earlier tree, where the node bound is G0's provisional `N_prov`, that half is
+                   VOID, never unscored and never a pass, and a WARN on a model arm there is
+                   information for §3.2's step 3, not a failure. The
                    comparison and the dedup are inside `ggml_sycl_device_entry_w_ordered` and
                    read only `use`'s fields, never a caller's shape. Each of the three fills
                    takes its fields from its own named source (above). H7 (as) gates both, with
@@ -7304,8 +7324,10 @@ L7 documents this limit, and pattern #2 remains the remedy.
       the entry's `w_order_warn_mutex` (r30 n-3). Only an out-of-bound use takes it, before
       the ordering decision, and holds it for the `w_order_warned_ctx` insert and the
       `w_order_out_of_bound` store, keeping the insert's `bool`. It releases the mutex before the
-      WARN's print, so no logging runs under it (§M80 (c); r31 m-3). Nothing is taken under it,
-      it is never held across a submit or a wait, and it never nests with Form E's W-order mutex. Callers may
+      WARN's print, so no logging runs under it (§M80 (c); r31 m-3). Nothing is acquired under it,
+      it is never held across a submit or a wait, and it never nests with Form E's W-order
+      mutex. The set's insert may allocate a host node under it, outside the strict-mode span,
+      so it is a leaf in lock-order terms only (r32 n-3; §2.4.2). Callers may
       hold `ctx.graph_mutex` and L2 when they take it, since it is a leaf. The oneDNN PP
       fill's read of `execution_context_id` takes `ctx.execution_state_mutex` for that read
       alone, before the use, and releases it before either W lock is taken (§2.4.2).
@@ -8920,7 +8942,13 @@ means that.
       - In the oneDNN PP branch, the descriptor's initializer takes `n_ubatch` from
         `src1->ne[1]` and `ctx_id` from `ctx.execution_context_id`.
       - In the function's capture path, the record's two fields are read from `use.ctx_id`
-        and `use.n_ubatch`, and from nothing else.
+        and `use.n_ubatch` and, for an entry that recurs, from the record's own `n_ubatch` in
+        the keep-largest merge (the larger of the two), and from nothing else (r32 n-2).
+      - In `ggml_sycl_graph_finalize`, meta's record is assigned exactly once, from the
+        thread-local baked-W record, with each entry's `ctx_id` and `n_ubatch` carried
+        unchanged, and the thread-local record is cleared after the move (r32 m-4). A
+        finalize that moves nothing, or moves an entry with either field zeroed or taken from
+        another source, fails.
       - In `ggml_sycl_graph_finalize`, meta's node count is assigned exactly once, from
         `get_nodes().size()`. A finalize with no assignment, or one that assigns 0 or any other
         source, fails.
@@ -8937,6 +8965,10 @@ means that.
         source clause fails, since the clause needs a match and finds none.
       - The capture record's `ctx_id` or `n_ubatch` taken from something other than `use` (a
         recomputed `src1->ne[1]`, a second context read): its source clause fails.
+      - The finalize's move of the record deleted (meta names no entries, so the submit builds
+        no use and the check never runs), or the move with an entry's `n_ubatch` or `ctx_id`
+        zeroed: the record-move clause fails. Without it the recorded fill's `ctx_id` and
+        `n_ubatch` halves would be as vacuous as the node count was (r32 m-4).
       - The finalize count's assignment deleted, or set to 0: the finalize clause fails. With
         the assignment deleted, meta's node count stays at its default 0, which a restriction
         reading would pass; the positive reading does not. Without this witness the node half
@@ -9329,8 +9361,8 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
   publisher behind a pending H1 that the watcher opens after 0.5 s, the production delay of a
   previous use behind a `host_task`; and **F3**, the tail T that sets the chain length K: on
   each gate shape (C2b's top rung, `n_ubatch` 2048 on Mistral, included), a W use's predecessor
-  behind the longest graph replay the shape records and one ubatch's `host_task` backlog, timed
-  from the waiter's start to the publisher's store with the device timestamps of the two
+  behind a replay of G0's own synthetic recording of N nodes (below) and one ubatch's
+  `host_task` backlog at the shape's `n_ubatch`, timed from the waiter's start to the publisher's store with the device timestamps of the two
   kernels. "Progresses": the waiter ends without writing the fault word. "Capped": it writes the
   fault word. F1 and F2 must progress within one C, and F3 gives T, from which K = ⌈2 T / C⌉; a
   cell that caps with K waiters on a correct run voids the derivation. F3 also prints the bound
@@ -9340,28 +9372,38 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
   exist, so it has no production recording and no wrapper to read one through. F3's graph is a
   synthetic recording on Q1 whose node count G0 chooses, `N_prov`, takes from
   `--f3-nodes <N>` (default fixed in the source) and prints as `[G0] F3 graph_nodes=%zu
-  provisional`; T and K are measured behind a replay of it. The unit is the SYCL command-graph
+  provisional`; T and K are measured behind a replay of it, so they are valid for that N only,
+  and step 4 re-measures them at the bound that ships (r32 m-5). The unit is the SYCL command-graph
   node count, `get_nodes().size()` on the modifiable `command_graph`, the unit the submit passes
   as `use.graph_nodes` (r30 m-1), so the provisional and the re-pinned bound are in the same
-  unit. **The commit order**, recorded on the ticket and in each commit's message:
+  unit. **The commit order (when G0 picked Form M; Form E has no bound, K or constants, r32
+  n-4)**, recorded on the ticket and in each commit's message:
   1. **The G0 commit** (this section). It picks the W-order form, prints C, T, K, the largest
      gate `n_ubatch` and `N_prov`, and changes no backend code.
   2. **The L4+L6 W-order commit.** It adds `ggml_sycl_device_entry_w_ordered`,
      `ggml_sycl_graph_finalize` and `ggml_sycl_graph_submit`, and compiles in K, the
      `n_ubatch` bound and `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES = N_prov`. That constant is
      **provisional**, and the commit message says so.
-  3. **A lead-run measurement.** On the gate shapes (C2b's ladder, whose top rung is 2048 on
-     Mistral, and the GPT-OSS gate), the lead reads each W-touching recording's `graph_nodes`
-     from meta through the landed submit path: the value the submit builds into
-     `use.graph_nodes`, read either from the WARN's `graph_nodes=%zu` with the node bound
-     lowered to 0 through `ggml_sycl_test_set_w_order_bound` in a `GGML_SYCL_PRIVATE_TESTING`
-     build, or from a one-off print at the submit that is not committed. It takes the largest
-     count per card, `N_max`. No scored arm reads the WARN's zero before step 4.
-  4. **The re-pin commit.** It sets `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` to `N_max` plus a
-     25% margin, rounded up to a multiple of 16, and drops "provisional" from the constant's
-     comment and from §2.4.2. If `N_max` exceeds `N_prov`, the lead first re-runs G0 F3 with
-     `--f3-nodes N_max`, since T was measured behind a shorter replay, and the same commit
-     re-pins K from that T.
+  3. **A lead-run measurement, with a one-off print that is never committed (r32 m-1).** The
+     lead builds a local tree that adds, in `ggml_sycl_graph_submit`, one raw
+     `fprintf(stderr, "[W-ORDER-MEASURE] device=%d ctx_id=%llu n_ubatch=%u graph_nodes=%zu\n",
+     ...)` for each entry a submit's meta names, with the three values the submit builds into
+     `use`. It is a raw `fprintf` because INFO-level log lines do not reach the sink at the
+     default verbosity (CLAUDE.md, `llama-bench` traps). The lead runs the gate shapes with it
+     (C2b's ladder, whose top rung is 2048 on Mistral, the GPT-OSS gate, and the no `-c` arm
+     of each), takes the maximum `graph_nodes` per card over every line, `N_max`, and keeps the
+     logs as the evidence the re-pin commit cites. The print and the build are discarded
+     after. The WARN is not a source for this, since it prints once per (`ctx_id`, device),
+     and `ggml_sycl_test_set_w_order_bound` exists only in test binaries. No scored arm reads
+     the WARN's node half before step 4.
+  4. **The re-pin commit, unconditional (rulings §M80 (d); r32 m-2).** The lead computes
+     `B = round_up(1.25 * N_max, 16)` and re-runs G0 F3 with `--f3-nodes B`, so that F3's
+     verdict covers the bound that ships and not only the measured maximum. If F3 passes at
+     `B`, the commit sets `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` to `B`, re-pins K from the T
+     that run printed, and drops "provisional" from the constant's comment and from §2.4.2.
+     If F3 fails at `B` (a cell caps with K waiters, or a control fails), that is a stop for a
+     lead ruling, never a silent re-pin. There is no `N_max > N_prov` trigger: the re-run
+     happens whenever the bound is re-pinned.
   G0 also prints the engine class's xe `job_timeout_ms` for each card, and the cap must sit
   below it.
 - **Attribution (r25 m-5 (d)).** Each cell prints `[G0] cell=<H>/<M> start` before it runs and
@@ -9706,12 +9748,14 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
   RED: the function does not set its thread-local flag; the child then allocates and exits 0, as
   the negative control does.
 - **The bound cell (r28 m-4), when G0 picked Form M.** It is the positive control for §2.4.2's
-  out-of-bound WARN, whose zero every scored arm reads, and it separates the two abort messages.
+  out-of-bound WARN, whose zero its cell (c) scores, and it separates the two abort messages. A
+  WARN-0 reading elsewhere is scorable on its node half only on a tree containing the §3.2 re-pin
+  commit, and is VOID on its node half before it (r32 m-3; §2.4.2).
   Four children, each the test binary re-executed with the cell's selector. **Binding (r30
   m-2).** Before X1, each child creates two execution contexts with
   `ggml_backend_sycl_execution_context_create` (`ggml-sycl.cpp:14788` at `d8a67422d`) and binds
   X's backend to one and Y's to the other with
-  `ggml_backend_sycl_execution_context_bind_backend` (`:14810`). The child is VOID unless both
+  `ggml_backend_sycl_execution_context_bind_backend` (`:14811`). The child is VOID unless both
   calls return OK and the two backends' `execution_context_id`s then read non-zero and
   distinct, printed as `[G2] bound ctx x=%llu y=%llu`. An unbound fixture context reads 0, so X
   and Y would share one dedup key and (a) would print 1. Children (a) to (c) run X's and Y's
@@ -13825,7 +13869,7 @@ waits for the lead's relay of 23mk's commit, and is not in this revision.
 | item | finding / ruling | disposition |
 |---|---|---|
 | m-1 | the recorded use's descriptor had no named carrier, caller or unit; §2.4.2 said "the graph wrapper" and §6.38 said "the finalize wrapper" | **Changed.** §2.4.2 names the three fills. For a recorded use: at capture the function adds {entry, `use.ctx_id`, `use.n_ubatch`} to the thread-local record and compares nothing. `ggml_sycl_graph_finalize` moves the record into meta and adds the node count as `get_nodes().size()` on the modifiable `command_graph`. `ggml_sycl_graph_submit` builds the descriptor from meta and calls the function, so the check runs at submit. The unit is the SYCL command-graph node count, the only unit every finalize site can read, and G0 F3 prints its bound in that unit from the same meta (amended, §6.40 m-1: G0 cannot read meta, so its node bound is provisional). The recording bullet, the §2.10 census's finalize and submit sentence, and the `ggml_sycl_test_w_order_uses` seam now say "submit", and the §6.38 m-1 row is marked amended. |
-| m-2 | the cell's two distinct `ctx_id`s rested on a binding G2 never made; an unbound context reads 0 | **Changed.** Each child creates two execution contexts, `ggml_backend_sycl_execution_context_create` (`ggml-sycl.cpp:14788`), and binds X and Y with `..._bind_backend` (`:14810`). It is VOID unless both ids read non-zero and distinct (printed as `[G2] bound ctx`). §2.4.2 states that 0 means unbound: the registry issues ids from 1 (`execution-lifecycle.hpp:480`), and all unbound contexts on a device share one dedup key, so they get one WARN between them. The flag is per entry, so only the WARN's per-context count is lost. |
+| m-2 | the cell's two distinct `ctx_id`s rested on a binding G2 never made; an unbound context reads 0 | **Changed.** Each child creates two execution contexts, `ggml_backend_sycl_execution_context_create` (`ggml-sycl.cpp:14788`), and binds X and Y with `..._bind_backend` (`:14811`, amended, §6.41 n-1). It is VOID unless both ids read non-zero and distinct (printed as `[G2] bound ctx`). §2.4.2 states that 0 means unbound: the registry issues ids from 1 (`execution-lifecycle.hpp:480`), and all unbound contexts on a device share one dedup key, so they get one WARN between them. The flag is per entry, so only the WARN's per-context count is lost. |
 | m-3 | the WARN's scored zero had a positive control only on the marker fill | **Changed, both options.** H7 (as) gains source clauses on each fill: the PP initializer's `n_ubatch` is `src1->ne[1]` and its `ctx_id` is `ctx.execution_context_id`; the capture record reads `use`; finalize's count is `get_nodes().size()`; and the submit's fields are read from meta. Each clause has a mutation witness (amended, §6.40 m-2: three clauses had none). The bound cell gains (d), X's production `MUL_MAT` with `src1` of 32 columns under a bound of 16. GREEN is exactly one WARN reading `n_ubatch=32 graph_nodes=0`, and a third RED (the fill's `n_ubatch` set to 0) reads 0. |
 | m-4 | H7 (as) had only restriction clauses, so it held on the pre-change tree | **Changed.** Positive clauses, each at least once inside the function: `use.n_ubatch` and `use.graph_nodes` compared against `ggml_sycl_w_order_bound_for(...)`'s fields, and an insert into `w_order_warned_ctx` keyed on `use.ctx_id`. The names are fixed: `ggml_sycl_w_order_bound_for`, `ggml_sycl_w_order_bound`, `GGML_SYCL_W_ORDER_BOUND_N_UBATCH`, `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES`, `w_order_warned_ctx`, `w_order_warn_mutex` and `w_order_out_of_bound`. The restriction clauses match four of those names outside the function (`ggml_sycl_w_order_bound_for`, the two `GGML_SYCL_W_ORDER_BOUND_*` constants and `w_order_warned_ctx`). The other three are read elsewhere by design, so the clause leaves them out (amended, §6.40 n-3). |
 | n-1 | `uint32_t ctx_id` narrowed the id | **Changed.** `uint64_t`, the type of `execution_context_id` (`common.hpp:5667`) and of `ContextId::value`. |
@@ -13844,9 +13888,31 @@ r30 m-1 and m-3 closed in substance. 23mk's §M79 (b) re-pin still waits for the
 
 | item | finding / ruling | disposition |
 |---|---|---|
-| m-1; §M80 (b) | G0 F3 was to read its node bound "from the meta of the graphs it replays" through "the same wrapper", but G0 lands before finalize and meta exist, has no model, and compiles in the bound the W-order commit then reads through | **Changed, the reviewer's first option.** G0 picks the W-order form and prints a **provisional** node bound, `N_prov`, the node count of the synthetic recording its F3 cells replay (`--f3-nodes`). "Through the same wrapper" and "from the meta" are gone from G0's side. §3.2 states the commit order: (1) the G0 commit; (2) the L4+L6 W-order commit, which compiles in K, the `n_ubatch` bound and `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES = N_prov`, marked provisional; (3) a lead-run measurement on the gate shapes that reads `graph_nodes` from meta through the landed submit path; (4) a re-pin commit to the measured maximum plus a 25% margin, rounded up to 16, re-running F3 first and re-pinning K if the measurement exceeds `N_prov`. No scored arm reads the WARN's zero before (4). §2.4.2 and the §6.39 m-1 row say the same. The margin is this revision's figure, for the lead to confirm. |
+| m-1; §M80 (b) | G0 F3 was to read its node bound "from the meta of the graphs it replays" through "the same wrapper", but G0 lands before finalize and meta exist, has no model, and compiles in the bound the W-order commit then reads through | **Changed, the reviewer's first option.** G0 picks the W-order form and prints a **provisional** node bound, `N_prov`, the node count of the synthetic recording its F3 cells replay (`--f3-nodes`). "Through the same wrapper" and "from the meta" are gone from G0's side. §3.2 states the commit order: (1) the G0 commit; (2) the L4+L6 W-order commit, which compiles in K, the `n_ubatch` bound and `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES = N_prov`, marked provisional; (3) a lead-run measurement on the gate shapes that reads `graph_nodes` from meta through the landed submit path; (4) a re-pin commit to the measured maximum plus a 25% margin, rounded up to 16, re-running F3 first and re-pinning K if the measurement exceeds `N_prov`. No scored arm reads the WARN's zero before (4). §2.4.2 and the §6.39 m-1 row say the same. §M80 (d) accepts the 25% margin, rounded up to a multiple of 16 (amended, §6.41 m-1, m-2: step 3's method and step 4's trigger changed). |
 | m-2 | the source clauses' polarity was unstated and three had no witness (the PP fill's `ctx_id`, the capture record, the finalize count); §6.39 said "each clause has a mutation witness" | **Changed.** H7 (as)'s source clauses are stated positive: each must match at least once, and every assignment of its field must match, so a deleted assignment fails. The finalize clause requires exactly one assignment from `get_nodes().size()`. Three witnesses are added: the PP fill's `ctx_id` a literal 0, the capture record's field taken from something other than `use`, and the finalize count deleted or set to 0 (which leaves meta's node count at its default 0 and would make the node half of every replay's WARN 0 vacuous). The §6.39 m-3 row is marked amended. The replay child was not added: the reviewer offered it as the alternative. |
 | m-3; §M80 (c) | `w_order_warn_mutex` was called a leaf with "nothing taken under it", but the WARN printed under it, and the log callback takes its own mutex | **Changed.** Under the mutex the function runs the `w_order_warned_ctx` insert and the `w_order_out_of_bound` store and keeps the insert's `bool`; it releases the mutex and prints if the insert was new. Fixed in both places: §2.4.2 and the §2.10 L7 row. |
 | m-4, n-2; §M80 (a) | the FIRST_CONTEXT accessor was called a `GGML_SYCL_PRIVATE_TESTING` accessor, which §M74 (h) forbids for a read accessor, and its owner for a device-only signature was unstated | **Changed.** It is unconditional. It takes the device only, enumerates the unfiltered `pending_ranges(c, dev)`, keeps the `FIRST_CONTEXT`-term ranges and sums their bytes across all owners, and never uses `pending_bytes()`. H5L (n)'s fixture loads one model, so the sum is that model's figure; a second model on the device makes the reading VOID. It is read after the load commits and before the context transaction reaches step 5; a 0 in that window, or a reading on a tree from before L4, is VOID. §2.3.3 and §2.4.2 (b) step 3 are aligned. The §6.39 zhcn row is marked amended. |
 | n-1 | (d)'s "any other constant prints a different `n_ubatch`" was false for the constant 32 | **Changed.** (d) witnesses the fill at this shape, and the text says it cannot tell a literal 32 from `src1->ne[1]`; only H7 (as)'s source clause on the PP initializer covers a constant equal to the fixture's shape. |
 | n-3 | the §6.39 m-4 row said the restriction clauses match seven names outside the function; the body's clause lists four | **Changed.** The row names the four (`ggml_sycl_w_order_bound_for`, the two `GGML_SYCL_W_ORDER_BOUND_*` constants, `w_order_warned_ctx`) and says the other three are read elsewhere by design, as the abort path reads `w_order_out_of_bound` at `ggml_backend_sycl_synchronize`. |
+
+### 6.41 Revision 7.14y: design-moua-r32
+
+Revision 7.14y is one commit on top of `019f064b4`, by impl-moua-s. It answers design review r32
+(design-moua-r32 on `6d6c5c230..019f064b4`: 0 Critical, 0 Important, 5 Minor, 5 nits; P1-P3
+pass, and P4 passes once m-1, m-2 and m-5 close). It found r31 m-3, m-4, n-1, n-2 and n-3
+closed, and r31 m-1 and m-2 closed for what they named, with defects in the fold's own
+commit-order text. It also folds the lead's §M80 (d) ruling on the re-pin. 23mk's §M79 (b)
+re-pin is still queued.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| m-1 | step 3's WARN route cannot read the maximum (the WARN prints once per (`ctx_id`, device)) and `ggml_sycl_test_set_w_order_bound` runs only in test binaries | **Changed.** The WARN route is deleted. Step 3 is a local, never-committed raw `fprintf(stderr, "[W-ORDER-MEASURE] device=%d ctx_id=%llu n_ubatch=%u graph_nodes=%zu\n", ...)` in `ggml_sycl_graph_submit` for each entry a submit's meta names. The lead takes the maximum per card over the gate-shape runs (C2b's ladder, the GPT-OSS gate and the no `-c` arm of each) and keeps the logs as the re-pin commit's evidence. |
+| m-2; §M80 (d) | step 4 re-ran F3 at `N_max` and only if `N_max > N_prov`, so the shipped bound could exceed what F3 covered | **Changed.** Step 4 is unconditional: `B = round_up(1.25 * N_max, 16)`, F3 re-run with `--f3-nodes B`, the constant and K re-pinned to `B` and that run's T. If F3 fails at `B`, that is a stop for a lead ruling, never a silent re-pin. The trigger is dropped, and the §6.40 row's "for the lead to confirm" now says §M80 (d) accepts the margin. |
+| m-3 | "every scored arm scores the WARN at 0" was unanchored and unreconciled with the provisional bound | **Changed.** §2.4.2 and the bound cell say G2's cell (c) scores the zero. Any other arm key line that reads the count names the rule: its node half is scorable only on a tree containing the re-pin commit, and is VOID on an earlier one, never unscored and never a pass. A model-arm WARN before the re-pin is information for step 3. |
+| m-4 | H7 (as) left the finalize's record move unguarded | **Changed.** A positive clause: meta's record is assigned exactly once from the thread-local record with `ctx_id` and `n_ubatch` unchanged, and the record is cleared. Witnesses: the move deleted, and the move with either field zeroed. The replay child stays declined. |
+| m-5 | F3 was still described as measured behind "the longest graph replay the shape records" | **Changed.** §2.4.2 and §3.2 say T is measured behind a replay of G0's own N-node synthetic recording plus one ubatch's `host_task` backlog at the shape's `n_ubatch`; T and K are valid for that N only, and step 4 re-measures at `B`. |
+| n-1 | the `bind_backend` cite was `:14810` | **Changed.** `:14811` at the three sites (verified at `d8a67422d`). |
+| n-2 | the capture clause omitted the keep-largest merge's read of the record | **Changed.** The clause reads `use` and, for a recurring entry, the record's own `n_ubatch`. |
+| n-3 | the strict-leaf cite was the ledger lock's rule, which also bars allocation, and the set insert allocates | **Changed.** The cite names it as the ledger lock's rule. The choice: the node allocation is host bookkeeping outside the strict span, not pre-reserved, so the mutex is a leaf in lock-order terms only. Stated in §2.4.2 and the L7 row. |
+| n-4 | §3.2 steps 2-4 were not conditioned on Form M | **Changed.** The commit order opens "when G0 picked Form M". |
+| n-5 | §2.4.2 said G0 F3 "compiles in" the bound | **Changed.** G0 F3 prints it and the W-order commit compiles it in. |
