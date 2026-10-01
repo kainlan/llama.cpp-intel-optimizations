@@ -5,6 +5,12 @@ the backend exposes only device 0 by default ("Multi-GPU: exposing only device 0
 is 1 on a two-card host and the probe exited 77 without running. These pins keep the skip on the physical
 device count and keep the source queue off ggml_backend_sycl_init(1), which does not exist in that mode.
 Each pin proves itself on a mutant.
+
+Known limit of the bounded-wait pin: it is lexical. A lambda or std::function that contains a wait, assigned
+inside a bounded block and CALLED after that block has closed, is not seen (the wait sits inside the block that
+defines it). The only waiting helpers allowed by name are busy_ms_of, prime and dst_holds_pattern, and each of
+their call sites is pinned to a bounded step, so a new waiting helper under any other name fails the pin at its
+definition unless it is defined inside a bounded block; that remaining case is the one this gate does not close.
 """
 import re
 import sys
@@ -115,12 +121,12 @@ def violations(text: str) -> list:
     # Every wait() sits inside a bounded step: a step_scope declared at the top level of an enclosing block,
     # the body of a run_step lambda, or the busy_ms_of helper (only ever called from run_step bodies). The
     # earlier pin found the word step_scope anywhere above and so passed for any wait.
-    for m in re.finditer(r"(?:\.|->)wait(?:_and_throw)?\(\)", skel):
+    for m in re.finditer(r"(?:\.|->|::)\s*wait(?:_and_throw)?\s*\(", skel):
         if not in_bounded_step(skel, m.start()):
             out.append("a wait() outside any bounded step (line %d of the code)" % (skel.count("\n", 0, m.start()) + 1))
     # The helper lambdas that wait (prime, the destination readback) are only called inside bounded steps.
-    for m in re.finditer(r"\b(?:prime|dst_holds_pattern|bounce_holds_pattern)\(\)", skel):
-        if not in_bounded_step(skel, m.start()):
+    for m in re.finditer(r"\b(?:prime|dst_holds_pattern|bounce_holds_pattern)\(\)|\bbusy_ms_of\s*\(", skel):
+        if m.start() > main_at and not in_bounded_step(skel, m.start()):
             out.append("%s called outside a bounded step" % m.group(0))
     # Backend init, queue creation, allocation and teardown are bounded steps too, and the watchdog starts first.
     dog = skel.find("std::thread(step_watchdog_main).detach()")
@@ -141,6 +147,35 @@ def violations(text: str) -> list:
         out.append("the destination readback compare is gone")
     if not re.search(r"const bool pass\s*=[^;]*\bcontrols_ok\s*&&\s*dst_ok\s*;", code):
         out.append("the exit status does not require controls_ok and dst_ok")
+    # The bytes: the sentinels differ from each other and from the pattern (prime() must seed the destination
+    # and the bounce with them, not with the pattern), dst_ok is assigned FROM the readback compare, and the
+    # bounce compare covers the whole buffer.
+    sent = re.findall(r"sentinel_(?:bounce|dst)\(\s*k_bytes\s*,\s*(0x[0-9A-Fa-f]{2})\s*\)", code)
+    if len(sent) != 2 or sent[0].lower() == sent[1].lower():
+        out.append("the bounce and destination sentinels are not two distinct constants")
+    if not re.search(r"q_owner\.memcpy\(\s*dst_ptr\s*,\s*sentinel_dst\.data\(\)\s*,\s*k_bytes\s*\)", code) or \
+            not re.search(r"std::memcpy\(\s*bounce_ptr\s*,\s*sentinel_bounce\.data\(\)\s*,\s*k_bytes\s*\)", code):
+        out.append("prime() does not seed the destination and the bounce with their sentinels")
+    if not re.search(r"\bdst_ok\s*=\s*dst_holds_pattern\(\)\s*;", code) or \
+            not re.search(r"\bbool\s+dst_ok\s*=\s*false\s*;", code):
+        out.append("dst_ok is not initialised false and assigned from dst_holds_pattern()")
+    if "std::memcmp(bounce_ptr, pattern.data(), k_bytes) == 0" not in code:
+        out.append("the bounce compare does not cover the full k_bytes")
+    # The drain guard exists, is declared after every probe_buffer (so it runs before any handle is released),
+    # records a failed drain, and that flag reaches the exit status.
+    guard = re.search(r"\bqueue_drain_guard\s+\w+\s*\(", skel[main_at:]) if main_at >= 0 else None
+    bufs = [m.start() for m in re.finditer(r"\bprobe_buffer\s+\w+\s*;", skel[main_at:])] if main_at >= 0 else []
+    if guard is None or not bufs or guard.start() < max(bufs):
+        out.append("queue_drain_guard is missing or declared before a probe_buffer")
+    gstruct = re.search(r"struct queue_drain_guard\s*\{.*?\n\};", code, re.S)
+    if gstruct is None or not re.search(r"\bfailed\s*=\s*true\s*;", gstruct.group(0)):
+        out.append("the drain guard does not record a failed drain")
+    if not re.search(r"if\s*\(\s*drain_failed\s*\)\s*\{\s*rc\s*=\s*1\s*;\s*\}", code):
+        out.append("a drain that threw does not make the exit status non-zero")
+    # A throw while priming iii's bytes or querying pointer types unwinds through the drain guard.
+    for step in ("iii_prime_bytes", "query_pointer_types"):
+        if not re.search(r"try\s*\{\s*step_scope\s+\w+\(\s*\"%s\"" % step, code):
+            out.append("step %s is not inside a try block" % step)
     if re.search(r"physical_devices\s*<\s*2", code) is None:
         out.append("the skip does not compare the physical count against two")
     return out
@@ -179,6 +214,33 @@ def mutants_of(text: str) -> dict:
         "backend init outside a step": text.replace('step_scope scope("init_backend_owner", k_step_budget_ms);', "", 1),
         "watchdog started after init": text.replace("std::thread(step_watchdog_main).detach();", "", 1).replace(
             "    int rc = 1;", "    std::thread(step_watchdog_main).detach();\n    int rc = 1;", 1),
+        "busy kernel timed outside a step": text.replace(
+            "std::thread(step_watchdog_main).detach();",
+            "std::thread(step_watchdog_main).detach();\n    (void) busy_ms_of(*ggml_sycl::get_shared_context_queue(1), nullptr, 1);", 1),
+        "spaced wait": text.replace("std::thread(step_watchdog_main).detach();",
+                                    "std::thread(step_watchdog_main).detach();\n    "
+                                    "ggml_sycl::get_shared_context_queue(0)->wait ();", 1),
+        "static event wait": text.replace("std::thread(step_watchdog_main).detach();",
+                                          "std::thread(step_watchdog_main).detach();\n    "
+                                          "sycl::event::wait(std::vector<sycl::event>{});", 1),
+        "destination seeded with the pattern": text.replace("q_owner.memcpy(dst_ptr, sentinel_dst.data(), k_bytes)",
+                                                            "q_owner.memcpy(dst_ptr, pattern.data(), k_bytes)", 1),
+        "sentinels equal": text.replace("sentinel_dst(k_bytes, 0x55)", "sentinel_dst(k_bytes, 0xAA)", 1),
+        "dst_ok initialised true": re.sub(r"bool\s+dst_ok\s*=\s*false\s*;", "bool dst_ok = true;", text, count=1),
+        "dst_ok result discarded": re.sub(r"dst_ok\s*=\s*dst_holds_pattern\(\)\s*;", "dst_holds_pattern();", text,
+                                          count=1),
+        "bounce compare half length": text.replace("std::memcmp(bounce_ptr, pattern.data(), k_bytes) == 0",
+                                                   "std::memcmp(bounce_ptr, pattern.data(), k_bytes / 2) == 0", 1),
+        "drain guard dropped": re.sub(r"queue_drain_guard\s+drain\([^;]*;", "", text, count=1),
+        "drain guard before the buffers": re.sub(r"queue_drain_guard\s+drain\([^;]*;", "", text, count=1).replace(
+            "        probe_buffer src_dev;",
+            "        queue_drain_guard drain(q_source, q_owner, drain_failed);\n        probe_buffer src_dev;", 1),
+        "drain failure not recorded": text.replace("failed = true;", "", 1),
+        "drain failure not in the exit status": re.sub(r"if \(drain_failed\) \{\s*rc = 1;\s*\}", "", text, count=1),
+        "prime step outside a try": re.sub(r"try \{\s*step_scope scope\(\"iii_prime_bytes\"", "{\n step_scope scope(\"iii_prime_bytes\"",
+                                           text, count=1),
+        "pointer query outside a try": re.sub(r"try \{\s*step_scope scope\(\"query_pointer_types\"", "{\n step_scope scope(\"query_pointer_types\"",
+                                              text, count=1),
         "no physical count": replace_last(text, "ggml_sycl::test_physical_device_count()", "2"),
     }
 

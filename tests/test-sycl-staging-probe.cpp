@@ -168,8 +168,9 @@ long long now_ms_precise() {
 struct queue_drain_guard {
     sycl::queue & a;
     sycl::queue & b;
+    bool &        failed;
 
-    queue_drain_guard(sycl::queue & qa, sycl::queue & qb) : a(qa), b(qb) {}
+    queue_drain_guard(sycl::queue & qa, sycl::queue & qb, bool & flag) : a(qa), b(qb), failed(flag) {}
 
     ~queue_drain_guard() {
         step_scope scope("teardown_drain_queues", k_step_budget_ms);
@@ -177,6 +178,8 @@ struct queue_drain_guard {
             a.wait();
             b.wait();
         } catch (...) {
+            // The probe's exit status reads this: a drain that threw at teardown is not a pass.
+            failed = true;
             std::printf("FAIL: the final queue drain threw\n");
         }
     }
@@ -266,7 +269,8 @@ int main(int, char ** argv) {
     sycl::queue & q_owner   = *owner_ctx->stream(0, 0);
     sycl::queue & q_source  = *q_source_ptr;
 
-    int rc = 1;
+    int  rc           = 1;
+    bool drain_failed = false;
     {
         // The handles live in this block, so every buffer is released before the backend is freed.
         probe_buffer src_dev;
@@ -283,7 +287,7 @@ int main(int, char ** argv) {
         }
         // Declared after the handles, so it runs before any of them is released: every command the probe
         // queued on either queue (the busy kernel, leg 1, leg 2, on a failure path too) is finished first.
-        queue_drain_guard drain(q_source, q_owner);
+        queue_drain_guard drain(q_source, q_owner, drain_failed);
         if (!ok) {
             std::printf("FAIL: could not allocate the probe's buffers through unified_allocate\n");
         } else {
@@ -297,7 +301,8 @@ int main(int, char ** argv) {
             const auto kind = [&](void * ptr, sycl::queue & q) {
                 return static_cast<int>(sycl::get_pointer_type(ptr, q.get_context()));
             };
-            {
+            bool controls_ok = true;
+            try {
                 step_scope scope("query_pointer_types", k_step_budget_ms);
                 std::printf(
                     "[SYCL-STAGING-PROBE] contexts same=%d pointer_type(owner_ctx,source_ctx) "
@@ -305,6 +310,12 @@ int main(int, char ** argv) {
                     q_owner.get_context() == q_source.get_context() ? 1 : 0, kind(src_ptr, q_owner),
                     kind(src_ptr, q_source), kind(bounce_ptr, q_owner), kind(bounce_ptr, q_source),
                     kind(dst_ptr, q_owner), kind(dst_ptr, q_source));
+            } catch (const std::exception & ex) {
+                controls_ok = false;
+                std::printf("FAIL: the pointer-type query threw: %s\n", ex.what());
+            } catch (...) {
+                controls_ok = false;
+                std::printf("FAIL: the pointer-type query threw a non-standard exception\n");
             }
 
             // The bytes the legs move. Leg 2's destination is read back and compared, so a copy that moved
@@ -348,7 +359,6 @@ int main(int, char ** argv) {
                 std::printf("[SYCL-STAGING-PROBE] control=%s result=%s\n", name, ok_step ? "completes" : "THREW");
                 return ok_step;
             };
-            bool controls_ok = true;
 
             // Calibration: a first tiny run builds the kernel, then the iteration count is scaled twice
             // from measured run times so the busy kernel runs about k_target_busy_ms. The last calibration
@@ -440,19 +450,25 @@ int main(int, char ** argv) {
 
                 // Experiment iii: leg 1 held behind the busy kernel, leg 2 depending on it across contexts.
                 // Readings are host clocks from the busy kernel's submit.
-                {
+                bool primed = false;
+                try {
                     step_scope scope("iii_prime_bytes", k_step_budget_ms);
                     prime();
+                    primed = true;
+                } catch (const std::exception & ex) {
+                    std::printf("FAIL: priming iii's bytes threw: %s\n", ex.what());
+                } catch (...) {
+                    std::printf("FAIL: priming iii's bytes threw a non-standard exception\n");
                 }
                 sycl::event busy_event;
                 sycl::event leg1;
                 sycl::event leg2;
-                bool        setup_threw = false;
+                bool        setup_threw = !primed;
                 const auto  t0          = std::chrono::steady_clock::now();
                 const auto  since_t0    = [&]() {
                     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 };
-                {
+                if (!setup_threw) {
                     step_scope scope("iii_submit_busy_and_leg1", k_step_budget_ms);
                     try {
                         busy_event = submit_busy(q_source, sink_ptr, busy_iters);
@@ -539,6 +555,10 @@ int main(int, char ** argv) {
         }
     }
 
+    // The drain guard ran when the probe block closed; a drain that threw there is not a pass.
+    if (drain_failed) {
+        rc = 1;
+    }
     {
         step_scope scope("teardown_free_backend", k_step_budget_ms);
         ggml_backend_free(backend_owner);
