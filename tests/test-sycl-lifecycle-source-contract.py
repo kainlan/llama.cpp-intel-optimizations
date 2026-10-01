@@ -2,6 +2,7 @@
 from pathlib import Path
 import re
 import sys
+from collections import Counter
 
 root = Path(__file__).resolve().parents[1]
 hpp = (root / "ggml/src/ggml-sycl/model-lifecycle.hpp").read_text()
@@ -417,6 +418,91 @@ def nodelete_moe_state_reset_ok(source, wrapper_source):
     )
 
 
+# Statement lines (code only, whitespace collapsed) that call a placement-plan owning reader, per file,
+# including the four reader definitions and declarations themselves. An explicit list rather than a
+# count: a raw literal count of this set drifted with prose (and with every unrelated edit), and a
+# count cannot say WHICH reader a new site is. A new reader, or a changed statement, fails here and is
+# reviewed against docs/design/sycl-canonical-memory-architecture.md before it is added (llama.cpp-qeld).
+OWNING_READER_NAMES = (
+    "global_placement_plan_owner",
+    "coherent_placement_plan_owner",
+    "coherent_cache_placement_plan_owner",
+    "cache_placement_coherence",
+)
+OWNING_READER_SITES = {
+    "ggml/src/ggml-sycl/common.hpp": Counter({
+        "if (ggml_sycl::coherent_placement_plan_owner(cache)->entries.size() != 0 && is_composite_moe_weight) {": 1,
+        "const auto plan_owner = ggml_sycl::coherent_placement_plan_owner(cache);": 2,
+        "return !ggml_sycl::coherent_placement_plan_owner(cache)->entries.empty();": 1,
+    }),
+    "ggml/src/ggml-sycl/expert-prefetch.cpp": Counter({
+        # hint_locked is the sole policy reader (b8bb8562 removed demand_load's second read).
+        "if (!coherent_placement_plan_owner(cache)->entries.empty()) {": 1,
+    }),
+    "ggml/src/ggml-sycl/ggml-sycl.cpp": Counter({
+        "return ggml_sycl::global_placement_plan_owner();": 1,
+        "std::shared_ptr<const placement_plan> global_placement_plan_owner() noexcept {": 1,
+        "return global_placement_plan_owner();": 1,
+        "std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unified_cache * cache) noexcept {": 1,
+        "return ggml_sycl::coherent_placement_plan_owner(cache);": 1,
+        "std::shared_ptr<const placement_plan> coherent_cache_placement_plan_owner(const unified_cache * cache) noexcept {": 1,
+        "const auto plan_owner = ggml_sycl::coherent_cache_placement_plan_owner(cache);": 1,
+        "const auto woq_plan_owner = ggml_sycl::coherent_cache_placement_plan_owner(cache);": 1,
+        "placement_cache_read cache_placement_coherence(const unified_cache * cache) noexcept {": 1,
+        "return cache_placement_coherence(cache).owner;": 1,
+    }),
+    "ggml/src/ggml-sycl/mmvq.cpp": Counter({
+        "const auto plan_owner = ggml_sycl::coherent_cache_placement_plan_owner(route_cache);": 1,
+    }),
+    "ggml/src/ggml-sycl/unified-cache.cpp": Counter({
+        "if (!ptr && !!coherent_cache_placement_plan_owner(this)->entries.empty()) {": 2,
+        "!coherent_cache_placement_plan_owner(this)->entries.empty() ? 1 : 0, arena_active() ? 1 : 0,": 1,
+        "if (!coherent_cache_placement_plan_owner(this)->entries.empty()) {": 1,
+        "const bool skip_pool = !coherent_cache_placement_plan_owner(this)->entries.empty();": 1,
+        "const auto owned_read = retained_read ? placement_cache_read{} : cache_placement_coherence(this);": 2,
+        "const auto placement = cache_placement_coherence(this);": 5,
+        "if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {": 1,
+        "if (!key_id.valid || cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {": 1,
+    }),
+    "ggml/src/ggml-sycl/unified-cache.hpp": Counter({
+        "std::shared_ptr<const placement_plan> global_placement_plan_owner() noexcept;": 1,
+        "std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unified_cache * cache) noexcept;": 1,
+        "std::shared_ptr<const placement_plan> coherent_cache_placement_plan_owner(const unified_cache * cache) noexcept;": 1,
+        "placement_cache_read cache_placement_coherence(const unified_cache * cache) noexcept;": 1,
+    }),
+}
+
+
+def _owning_reader_sites():
+    sites = {}
+    for path, text in placement_sources.items():
+        code = _strip_cpp_comments(text)
+        lines = Counter()
+        for name in OWNING_READER_NAMES:
+            for match in re.finditer(re.escape(name) + r"\(", code):
+                start = code.rfind("\n", 0, match.start()) + 1
+                end = code.find("\n", match.start())
+                lines[" ".join(code[start:end if end >= 0 else len(code)].split())] += 1
+        if lines:
+            sites[path] = lines
+    return sites
+
+
+# The wrapper reads in ggml-sycl.cpp are too numerous to list one by one (~170), so they stay counts, but
+# comment-blind: the previous raw count moved with prose alone (ggml_sycl_global_plan_owner( appears in two
+# comments). Each unit change still needs a reviewer, who reads the delta against docs/design/
+# sycl-canonical-memory-architecture.md section 5. History of the pins, so the next delta is easy to
+# explain: abecb785/90a3f2a/75883a6 (127+1-6-2 readers), f5f0d3758 (+1, kv_layer_on_device), oyfl (+2,
+# AUTO-FA re-check), tsfl (+1, probe entry), glkg 8c8a0afae (-1), nsl3 reconciliation, y2zx (+1, dense
+# overflow filter). 64ec60199 left the pins one reader away from the tree and later work moved them
+# further (119/14/12/26 at a882b9c2a, the last green tree, against 117/13/14/25 now).
+INTERNAL_WRAPPER_COUNTS = {
+    "ggml_sycl_cache_plan_owner": 117,
+    "ggml_sycl_global_plan_owner": 13,
+    "ggml_sycl_global_plan_snapshot": 14,
+    "ggml_sycl_has_global_plan": 25,
+}
+
 checks = {
     "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
     and "uint64_t generation" in hpp,
@@ -506,94 +592,12 @@ checks = {
     "global census positive control": len(legacy_global_re.findall(census_fixture))
     == 2,
     "cache census positive control": len(legacy_cache_re.findall(census_fixture)) == 1,
-    "exact owning reader call census": {
-        path: sum(
-            text.count(name + "(")
-            for name in (
-                "global_placement_plan_owner",
-                "coherent_placement_plan_owner",
-                "coherent_cache_placement_plan_owner",
-                "cache_placement_coherence",
-            )
-        )
-        for path, text in placement_sources.items()
-        if any(
-            name + "(" in text
-            for name in (
-                "global_placement_plan_owner",
-                "coherent_placement_plan_owner",
-                "coherent_cache_placement_plan_owner",
-                "cache_placement_coherence",
-            )
-        )
-    }
-    == {
-        "ggml/src/ggml-sycl/common.hpp": 3,
-        # b8bb8562 removed demand_load's raw-pointer return and its second
-        # placement read; hint_locked is now the sole policy reader while
-        # await/is_cached resolve ownership-carrying cache leases.
-        "ggml/src/ggml-sycl/expert-prefetch.cpp": 1,
-        "ggml/src/ggml-sycl/ggml-sycl.cpp": 8,
-        "ggml/src/ggml-sycl/mmvq.cpp": 1,
-        "ggml/src/ggml-sycl/unified-cache.cpp": 14,
-        "ggml/src/ggml-sycl/unified-cache.hpp": 4,
-    },
+    "exact owning reader call census": _owning_reader_sites() == OWNING_READER_SITES,
     "exact internal wrapper census": {
-        name: backend.count(name + "(")
-        for name in (
-            "ggml_sycl_cache_plan_owner",
-            "ggml_sycl_global_plan_owner",
-            "ggml_sycl_global_plan_snapshot",
-            "ggml_sycl_has_global_plan",
-        )
+        name: len(re.findall(re.escape(name) + r"\(", _strip_cpp_comments(backend)))
+        for name in INTERNAL_WRAPPER_COUNTS
     }
-    == {
-        # The seven-reader reduction is deliberate: abecb785 removed six
-        # retired prompt-fusion routes and 90a3f2a removed two decode bypasses,
-        # after 75883a6 added one owned host-recipe reader (127 + 1 - 6 - 2).
-        # f5f0d3758 (llama.cpp-tnse) added an eighth->ninth reader:
-        # ggml_backend_sycl_kv_layer_on_device_from_dev consults the active
-        # plan snapshot's get_kv_device(il) (8 + 1). llama.cpp-oyfl added a
-        # ninth->eleventh pair: the new narrow AUTO-flash-attn re-check
-        # entry point, ggml_backend_sycl_recheck_runtime_context_flash_attn(),
-        # reads the snapshot once lock-free (its own identity check against
-        # the caller's model token) and once again under
-        # g_tensor_inventory_mutex to confirm that snapshot is still the
-        # live one before acting on it (9 + 2). llama.cpp-tsfl added an
-        # eleventh->twelfth reader: the new non-publishing probe entry
-        # point, ggml_backend_sycl_probe_runtime_context_for_model(), reads
-        # the snapshot once lock-free for its own up-front identity check
-        # (the candidate's model token against the currently published
-        # plan) before deferring into the shared transaction body -- it
-        # arms no lease of its own and takes no second, in-lock read the
-        # way the narrow re-check above does, since it never mutates the
-        # published plan (11 + 1). llama.cpp-glkg (8c8a0afae) then took
-        # one reader away: the one-arg
-        # ggml_sycl_configure_host_zones_for_plan(cache) overload used to
-        # read the cache plan owner twice (once in its
-        # `->entries.empty()` early-return guard, once into its
-        # `plan_owner` local); it is now a forwarding shim whose single
-        # ggml_sycl_cache_plan_owner(cache) read is passed straight into
-        # the two-arg overload that the guarded inventory path calls with
-        # the exact candidate captured under g_tensor_inventory_mutex
-        # (12 - 1). Census reconciled by llama.cpp-nsl3. llama.cpp-y2zx then
-        # added one reader back: the overflow site that decides to stream a
-        # dense model larger than the VRAM budget used to register ALL layers
-        # with the layer-stream manager without ever consulting the placement
-        # plan, so it claimed the ~15 layers the planner had deliberately
-        # tiered to host -- and which ggml_backend_sched was ALREADY executing
-        # on the CPU backend regardless (measured with GGML_SCHED_DEBUG=2 on
-        # 2026-09-18: MUL_MAT assignment is identical with and without the
-        # filter, so this read buys placement correctness, not throughput).
-        # It now reads the cache plan owner once to filter those layers out
-        # of the inventory it hands to build_layer_map(), which is the single
-        # authority for that fact -- the read is the fix, not an extra
-        # source (119 + 1).
-        "ggml_sycl_cache_plan_owner": 120,
-        "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 12,
-        "ggml_sycl_has_global_plan": 26,
-    },
+    == INTERNAL_WRAPPER_COUNTS,
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
     in backend
     and "authority.get() == cache.get()" in cache_hpp
