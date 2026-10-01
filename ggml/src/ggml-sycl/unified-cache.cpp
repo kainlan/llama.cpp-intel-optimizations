@@ -714,9 +714,10 @@ static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEV
 // (n_ubatch * bytes-per-token from the inventory, 256-aligned), folded into the
 // RUNTIME zone requirement so the zone the buffer lives in is sized for it.
 static std::atomic<size_t>   g_planned_mmq_src1_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
-// llama.cpp-479i (A5): planned bytes of the per-context dense f16 dequant buffers (the src0 copy
+// llama.cpp-479i: planned bytes of the per-context dense f16 dequant buffers (the src0 copy
 // plus the src1 copy, see zone_dequant_f16_*), folded into the same RUNTIME zone requirement.
-static std::atomic<size_t>   g_planned_dequant_f16_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_dequant_f16_src0_bytes[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
 // window class, the SWA window itself, ubatch size, context length) known at
 // the time the oneDNN scratchpad was last planned for this device
@@ -1683,21 +1684,32 @@ bool unified_cache_set_planned_dequant_f16_scratch(int      device_id,
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return false;
     }
-    size_t bytes = 0;
-    if (!zone_dequant_f16_scratch_bytes(max_weight_bytes, src1_bytes_per_token, n_ubatch, &bytes)) {
+    size_t src0_bytes = 0;
+    size_t src1_bytes = 0;
+    if (!zone_dequant_f16_plan_bytes(max_weight_bytes, src1_bytes_per_token, n_ubatch, &src0_bytes, &src1_bytes)) {
         // Same rule as the Q8 figure: an overflow must not become a SMALL plan.
-        g_planned_dequant_f16_scratch_bytes[device_id].store(0, std::memory_order_release);
+        g_planned_dequant_f16_src0_bytes[device_id].store(0, std::memory_order_release);
+        g_planned_dequant_f16_src1_bytes[device_id].store(0, std::memory_order_release);
         return false;
     }
-    g_planned_dequant_f16_scratch_bytes[device_id].store(bytes, std::memory_order_release);
+    g_planned_dequant_f16_src0_bytes[device_id].store(src0_bytes, std::memory_order_release);
+    g_planned_dequant_f16_src1_bytes[device_id].store(src1_bytes, std::memory_order_release);
     return true;
 }
 
-size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id) {
+size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool src1) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return 0;
     }
-    return g_planned_dequant_f16_scratch_bytes[device_id].load(std::memory_order_acquire);
+    return (src1 ? g_planned_dequant_f16_src1_bytes : g_planned_dequant_f16_src0_bytes)[device_id].load(
+        std::memory_order_acquire);
+}
+
+size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id) {
+    // The two buffers are planned together; a sum that wrapped would be a SMALLER zone.
+    const size_t src0 = unified_cache_get_planned_dequant_f16_buffer_bytes(device_id, false);
+    const size_t src1 = unified_cache_get_planned_dequant_f16_buffer_bytes(device_id, true);
+    return src0 > SIZE_MAX - src1 ? SIZE_MAX : src0 + src1;
 }
 
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out) {
@@ -1713,7 +1725,7 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
     // The dense MMQ/MMVQ Q8_1 src1 buffer lives in this zone (llama.cpp-479i). Checked like
     // the terms above: a wrapped sum would be a SMALLER zone, not a refusal.
     const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
-    // The dense f16 dequant buffer lives in this zone too (llama.cpp-479i, A5), checked the same way.
+    // The dense f16 dequant buffer lives in this zone too (llama.cpp-479i), checked the same way.
     const size_t dequant_f16 = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);
     if (mmq_src1 > SIZE_MAX - base || dequant_f16 > SIZE_MAX - base - mmq_src1) {
         return false;
@@ -27036,7 +27048,7 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
                 desc.mmq_src1_bytes_per_token = bytes_per_token;
             }
         }
-        // llama.cpp-479i (A5): f16 bytes the f16 dequant arm materializes for a dense weight. The
+        // llama.cpp-479i: f16 bytes the f16 dequant arm materializes for a dense weight. The
         // planned candidate set is Q8_0: ONEDNN_SOA / ONEDNN_COALESCED are the planned route for its
         // materialized layouts and are selected whatever GGML_SYCL_ONEDNN_PP says, so they are the
         // consumer that was observed minting per-op copies. Another type reaching the arm (an AOS-layout

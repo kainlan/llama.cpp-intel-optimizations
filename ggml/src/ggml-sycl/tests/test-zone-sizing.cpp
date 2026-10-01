@@ -614,7 +614,7 @@ int main() {
               "an empty inventory plans no Q8 scratch");
     }
 
-    // ---- Case 13: the dense f16 dequant scratch (llama.cpp-479i, A5) --
+    // ---- Case 13: the dense f16 dequant scratch (llama.cpp-479i) --
     // With oneDNN PP off, a dense Q8_0 MUL_MAT still routes through the f16 dequant arm
     // (ONEDNN_SOA / ONEDNN_COALESCED are selected independent of that knob) and minted its f16
     // copy of the WHOLE weight from the SCRATCH pool per op: Qwen3.6-27B on the B50 logged 11

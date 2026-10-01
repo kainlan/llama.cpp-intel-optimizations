@@ -288,31 +288,24 @@ bool zone_dequant_f16_region_bytes(int64_t elems, size_t * out) {
     return true;
 }
 
-bool zone_dequant_f16_scratch_bytes(size_t   max_weight_bytes,
-                                    size_t   src1_bytes_per_token,
-                                    uint32_t n_ubatch,
-                                    size_t * out) {
-    if (!out) {
+bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
+                                 size_t   src1_bytes_per_token,
+                                 uint32_t n_ubatch,
+                                 size_t * src0_bytes,
+                                 size_t * src1_bytes) {
+    if (!src0_bytes || !src1_bytes) {
         return false;
-    }
-    if (max_weight_bytes == 0 && src1_bytes_per_token == 0) {
-        *out = 0;
-        return true;
     }
     const size_t align = k_zone_dequant_f16_align;
-    if (src1_bytes_per_token != 0 && n_ubatch != 0 && src1_bytes_per_token > (SIZE_MAX - (align - 1)) / n_ubatch) {
-        return false;
-    }
     if (max_weight_bytes > SIZE_MAX - (align - 1)) {
         return false;
     }
-    const size_t weights  = (max_weight_bytes + align - 1) / align * align;
-    const size_t acts_raw = src1_bytes_per_token * n_ubatch;
-    const size_t acts     = (acts_raw + align - 1) / align * align;
-    if (weights > SIZE_MAX - acts) {
+    if (src1_bytes_per_token != 0 && n_ubatch != 0 && src1_bytes_per_token > (SIZE_MAX - (align - 1)) / n_ubatch) {
         return false;
     }
-    *out = weights + acts;
+    const size_t acts_raw = src1_bytes_per_token * n_ubatch;
+    *src0_bytes           = (max_weight_bytes + align - 1) / align * align;
+    *src1_bytes           = (acts_raw + align - 1) / align * align;
     return true;
 }
 

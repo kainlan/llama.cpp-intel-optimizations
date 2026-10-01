@@ -133,7 +133,7 @@ print("PASS fattn-allocation-failure-leaves-output-untouched")
 RUNTIME_CODE = _blank_comments(RUNTIME)
 assert RUNTIME_CODE.count("unified_alloc(") == 54
 assert RUNTIME_CODE.count("from_legacy_owned_alloc(") == 42
-assert RUNTIME_CODE.count("unified_allocate_owner(") == 25
+assert RUNTIME_CODE.count("unified_allocate_owner(") == 24
 assert CACHE.count("unified_alloc(") == 28
 assert CACHE.count("from_legacy_owned_alloc(") == 12
 assert CACHE.count("unified_allocate_owner(") == 10

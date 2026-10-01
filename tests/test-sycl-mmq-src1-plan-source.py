@@ -17,7 +17,7 @@ the exact graph demand BEFORE any submission. The companion unit test
 (test-zone-sizing, Case 12) proves the arithmetic; this gate proves the
 production code actually uses it and that the old per-op path is gone.
 
-A5 (same task): the dense f16 dequant arm of ggml_sycl_op_mul_mat_sycl minted an f16 copy of
+(same task): the dense f16 dequant arm of ggml_sycl_op_mul_mat_sycl minted an f16 copy of
 the WHOLE weight (and of the activations) from the SCRATCH pool per op -- 11 raw 60 MiB spills on
 the same run once the Q8 buffer was planned. It gets the same treatment: one persistent
 RUNTIME-zone, spill-forbidden buffer (common.hpp dequant_f16_scratch_t), planned from the
@@ -140,10 +140,13 @@ def evaluate(backend, common, cache, zone):
         return results
 
     # --- the buffer is a RUNTIME-zone, spill-forbidden, planned allocation ---
-    results["ensure_buffer routes to the RUNTIME zone"] = "vram_zone_id::RUNTIME" in ensure_body
-    results["ensure_buffer forbids the raw-malloc spill"] = "forbid_vram_zone_spill = true" in ensure_body
+    # Both buffers allocate through ggml_sycl_runtime_scratch_ensure (M1), so the zone and spill facts are
+    # properties of that one helper; ensure_buffer itself must only delegate to it.
+    results["ensure_buffer routes to the RUNTIME zone"] = "vram_zone_id::RUNTIME" in runtime_ensure
+    results["ensure_buffer forbids the raw-malloc spill"] = "forbid_vram_zone_spill = true" in runtime_ensure
     # ABSENCE: the weight-zone routing that let the buffer spill outside the arena.
-    results["ensure_buffer no longer prefers the WEIGHT zone"] = "vram_zone_id::WEIGHT" not in ensure_body
+    results["ensure_buffer no longer prefers the WEIGHT zone"] = \
+        "vram_zone_id::WEIGHT" not in ensure_body and "vram_zone_id::WEIGHT" not in dq_ensure
 
     # --- the per-op scratch is gone from the non-split dispatch --------------
     # No per-op scratch remains anywhere (review r1, I4): ctx.stream(device, idx) returns the SAME in-order
@@ -180,10 +183,13 @@ def evaluate(backend, common, cache, zone):
         entry_at >= 0 and "GGML_STATUS_ALLOC_FAILED" in graph_entry[entry_at:entry_at + 900]
 
     # --- A5: the dense f16 dequant scratch ----------------------------------
-    results["dequant scratch routes to the RUNTIME zone"] = "vram_zone_id::RUNTIME" in dq_ensure
-    results["dequant scratch forbids the raw-malloc spill"] = "forbid_vram_zone_spill = true" in dq_ensure
+    results["dequant scratch routes to the RUNTIME zone"] = \
+        "vram_zone_id::RUNTIME" in runtime_ensure and "ggml_sycl_runtime_scratch_ensure<" in dq_ensure
+    results["dequant scratch forbids the raw-malloc spill"] = \
+        "forbid_vram_zone_spill = true" in runtime_ensure and "ggml_sycl_runtime_scratch_ensure<" in dq_ensure
     results["dequant scratch never prefers the WEIGHT or SCRATCH zone"] = \
-        "vram_zone_id::WEIGHT" not in dq_ensure and "vram_zone_id::SCRATCH" not in dq_ensure
+        "vram_zone_id::SCRATCH" not in runtime_ensure and "vram_zone_id::SCRATCH" not in dq_ensure and \
+        "ggml_sycl_runtime_scratch_ensure<" in dq_ensure
     # The f16 arm takes its operands from the planned buffer; the pool is the named residual only.
     results["the f16 arm acquires the planned dequant scratch"] = "ggml_sycl_dequant_f16_scratch(" in op_sycl
     results["src0 pool alloc is skipped when the planned scratch holds it"] = "if (!src0_dq_scratch)" in op_sycl
@@ -316,9 +322,11 @@ if args.self_test:
 
     mutants = [
         ("weight zone", "ensure_buffer routes to the RUNTIME zone",
-         (backend, mutate(common, "vram_zone_id::RUNTIME", "vram_zone_id::XXXX"), cache, zone)),
+         (backend, mutate_after(common, "inline void * ggml_sycl_runtime_scratch_ensure(", "vram_zone_id::RUNTIME",
+                                "vram_zone_id::XXXX"), cache, zone)),
         ("spill allowed", "ensure_buffer forbids the raw-malloc spill",
-         (backend, mutate(common, "forbid_vram_zone_spill = true", "forbid_vram_zone_spill = false"), cache, zone)),
+         (backend, mutate_after(common, "inline void * ggml_sycl_runtime_scratch_ensure(",
+                                "forbid_vram_zone_spill = true", "forbid_vram_zone_spill = false"), cache, zone)),
         ("blas launder", "no 'failed to allocate Q8 scratch' decline remains",
          (backend + '\nGGML_LOG_WARN("[MMVQ-SOA] failed to allocate Q8 scratch");', common, cache, zone)),
         ("planner blind", "the runtime zone requirement folds in the planned src1 bytes",
@@ -326,11 +334,11 @@ if args.self_test:
         ("expert predicate", "the adapter does not key operand-ness on ne[2] > 1",
          (backend, common, mutate(cache, "zone_mmq_src1_bytes_per_token(", "zone_mmq_src1_bytes_per_token(item.ne[2] > 1 ? 0 : 1 + "), zone)),
         ("dequant spill allowed", "dequant scratch forbids the raw-malloc spill",
-         (backend, mutate_after(common, "struct dequant_f16_scratch_t", "forbid_vram_zone_spill = true",
-                                "forbid_vram_zone_spill = false"), cache, zone)),
+         (backend, mutate_after(common, "inline void * ggml_sycl_runtime_scratch_ensure(",
+                                "forbid_vram_zone_spill = true", "forbid_vram_zone_spill = false"), cache, zone)),
         ("dequant weight zone", "dequant scratch never prefers the WEIGHT or SCRATCH zone",
-         (backend, mutate_after(common, "struct dequant_f16_scratch_t", "vram_zone_id::RUNTIME",
-                                "vram_zone_id::WEIGHT"), cache, zone)),
+         (backend, mutate_after(common, "struct dequant_f16_scratch_t", "ggml_sycl_runtime_scratch_ensure<",
+                                "ggml_sycl_runtime_scratch_ensure_scratch_zone<"), cache, zone)),
         ("dequant planner blind", "the runtime zone requirement folds in the planned dequant bytes",
          (backend, common, mutate(cache, "const size_t dequant_f16 = unified_cache_get_planned_dequant_f16_scratch_bytes(",
                                   "const size_t dequant_f16 = unified_cache_get_planned_XXXX("), zone)),

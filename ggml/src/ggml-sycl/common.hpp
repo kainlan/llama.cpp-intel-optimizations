@@ -5660,6 +5660,100 @@ struct ggml_sycl_mmvq_q8_retire_marker_kernel;
 // Kernel name for the marker that retires a grown dense f16 dequant backing.
 struct ggml_sycl_dequant_f16_retire_marker_kernel;
 
+// Counters for one planned RUNTIME-zone scratch slot (llama.cpp-479i). They exist so a normal run can PROVE the
+// planned buffer was used, at WARN level (INFO is invisible at default verbosity): a perplexity that is the same
+// with the arm on and off proves nothing about whether the arm ran.
+struct planned_scratch_stats {
+    uint64_t uses        = 0;      // acquisitions by an op (cache hits do not count)
+    uint32_t growths     = 0;      // backing replacements, graph-entry or in-op
+    uint32_t op_growths  = 0;      // growths forced by an op: the graph-entry prediction was short
+    size_t   peak_demand = 0;      // largest single request seen
+    bool     warned      = false;  // the in-op growth WARN has been emitted for this slot
+
+    void note_use(size_t required) {
+        uses++;
+        if (required > peak_demand) {
+            peak_demand = required;
+        }
+    }
+};
+
+// ONE allocator for every planned RUNTIME-zone scratch buffer (the dense MMQ/MMVQ Q8_1 src1 buffer and the two
+// dense f16 dequant buffers). `backing` / `capacity` are the slot's state; returns the device pointer of a backing
+// holding at least `required_size` bytes, growing it if it is short, or nullptr when the RUNTIME zone cannot.
+// `grew` (optional) reports whether a new backing was installed.
+//
+// The destination is the RUNTIME zone, sized for it by unified_cache_get_planned_runtime_zone_requirement(), and
+// the spill to a raw device malloc is FORBIDDEN: a buffer that can fall out of the arena is an unplanned byte, and
+// 122 such spills (508.5 MB) ran a B50 out of driver headroom.
+//
+// This used to prefer the WEIGHT zone (2026-06-09, driver 26.22 era) on the claim that "tiny MMVQ Q8 activation
+// buffers allocated from arena tail zones can return pointers that fail on first submit". That zone was 99.8%
+// committed to weights, so the buffer spilled outside the arena instead. The claim is NOT re-verified here (the
+// loaded driver is 26.31): the RUNTIME zone's backing is already resident from startup (the 2026-10-01 EXT_ALLOC
+// trace shows it as the first external allocation), so this draws no new headroom, and fattn, the dense scheduler
+// and convert already submit from the RUNTIME/SCRATCH tail zones on the B50, which the B50 acceptance runs
+// confirmed. If a future driver fails on first submit, report it; do not fall back to WEIGHT.
+//
+// A buffer shared across ops is race-free only on an in-order queue, where op N+1's producer is ordered after op
+// N's consumer. ctx.stream(device, idx) returns one in-order queue for every idx, so this holds for every path
+// that reaches here; the assertion turns a future out-of-order queue into a stop instead of a data race.
+template <typename MarkerKernel>
+inline void * ggml_sycl_runtime_scratch_ensure(ggml_sycl::mem_handle & backing,
+                                               size_t &                capacity,
+                                               size_t                  required_size,
+                                               int                     device,
+                                               sycl::queue &           queue,
+                                               const char *            cohort,
+                                               bool *                  grew = nullptr) {
+    if (grew) {
+        *grew = false;
+    }
+    if (required_size == 0) {
+        return nullptr;
+    }
+    GGML_ASSERT(queue.has_property<sycl::property::queue::in_order>() &&
+                "a shared planned scratch buffer requires an in-order queue");
+    if (backing.valid() && capacity >= required_size) {
+        auto resolved = backing.resolve(device);
+        return resolved ? resolved.ptr : nullptr;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                                     = &queue;
+    req.device                                    = device;
+    req.size                                      = required_size;
+    req.intent.role                               = ggml_sycl::alloc_role::STAGING;
+    req.intent.category                           = ggml_sycl::runtime_category::STAGING;
+    req.intent.cohort_id                          = cohort;
+    req.intent.constraints.must_device            = true;
+    req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
+    req.intent.constraints.forbid_vram_zone_spill = true;
+    ggml_sycl::allocation_result allocation       = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
+        return nullptr;
+    }
+    const size_t          allocation_size = allocation.owner.metadata().size;
+    ggml_sycl::mem_handle replacement =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto resolved = replacement.resolve(device);
+    if (!resolved.ptr || !resolved.on_device) {
+        return nullptr;
+    }
+    if (backing.valid()) {
+        // Growth: kernels already queued on this device may still read the old backing, so it lives until the
+        // queue passes this marker. A recorded graph that baked the old pointer holds its own handle (the
+        // caller pins it while recording), so this retirement does not free memory such a graph replays against.
+        ggml_sycl::retain_handles_until_event({ std::move(backing) }, ggml_sycl_submit_marker<MarkerKernel>(queue));
+    }
+    backing  = std::move(replacement);
+    capacity = allocation_size;
+    if (grew) {
+        *grew = true;
+    }
+    return resolved.ptr;
+}
+
 struct ggml_backend_sycl_context {
     // Retained by MMID queue capabilities so an exact queue binding cannot
     // outlive the backend context that selected it.
@@ -6597,6 +6691,7 @@ struct ggml_backend_sycl_context {
         struct slot_t {
             ggml_sycl::mem_handle backing_handle;
             size_t                backing_capacity = 0;
+            planned_scratch_stats stats;
 
             void *                cached_q8_1         = nullptr;
             const ggml_tensor *   cached_tensor       = nullptr;
@@ -6652,62 +6747,20 @@ struct ggml_backend_sycl_context {
         }
 
         void * ensure_buffer(size_t required_size, int device, sycl::queue & queue) {
-            if (required_size == 0) {
-                return nullptr;
+            slot_t & s    = slot(device);
+            bool     grew = false;
+            void *   ptr  = ggml_sycl_runtime_scratch_ensure<ggml_sycl_mmvq_q8_retire_marker_kernel>(
+                s.backing_handle, s.backing_capacity, required_size, device, queue, "mmq-src1-q8", &grew);
+            if (grew) {
+                // The cached entry described the retired backing.
+                s.invalidate();
+                s.cached_q8_1 = nullptr;
+                s.stats.growths++;
             }
-            slot_t & s = slot(device);
-            if (s.backing_handle.valid() && s.backing_capacity >= required_size) {
-                auto resolved = s.backing_handle.resolve(device);
-                return resolved ? resolved.ptr : nullptr;
-            }
-
-            ggml_sycl::alloc_request req{};
-            req.queue                               = &queue;
-            req.device                              = device;
-            req.size                                = required_size;
-            req.intent.role                         = ggml_sycl::alloc_role::STAGING;
-            req.intent.category                     = ggml_sycl::runtime_category::STAGING;
-            req.intent.cohort_id                          = "mmq-src1-q8";
-            req.intent.constraints.must_device      = true;
-            // llama.cpp-479i: the planned home of the dense MMQ/MMVQ Q8_1 src1 buffer is the RUNTIME
-            // zone, sized for it by unified_cache_get_planned_runtime_zone_requirement(), and the spill
-            // to a raw device malloc is FORBIDDEN: a buffer that can fall out of the arena is an
-            // unplanned byte, and 122 such spills (508.5 MB) ran a B50 out of driver headroom.
-            //
-            // This used to prefer the WEIGHT zone (2026-06-09, driver 26.22 era) on the claim that "tiny
-            // MMVQ Q8 activation buffers allocated from arena tail zones can return pointers that fail on
-            // first submit". That zone was 99.8% committed to weights, so the buffer spilled outside the
-            // arena instead. The claim is NOT re-verified here (the loaded driver is 26.31): the RUNTIME
-            // zone's backing is already resident from startup (the 2026-10-01 EXT_ALLOC trace shows it
-            // as the first external allocation), so this draws no new headroom, and fattn, the dense
-            // scheduler and convert already submit from the RUNTIME/SCRATCH tail zones on the B50. If
-            // the B50 acceptance run fails on first submit, report it; do not fall back to WEIGHT.
-            req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
-            req.intent.constraints.forbid_vram_zone_spill = true;
-            ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
-            if (!allocation) {
-                return nullptr;
-            }
-            const size_t allocation_size = allocation.owner.metadata().size;
-            ggml_sycl::mem_handle replacement =
-                ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
-            const auto resolved = replacement.resolve(device);
-            if (!resolved.ptr || !resolved.on_device) {
-                return nullptr;
-            }
-            if (s.backing_handle.valid()) {
-                // Growth: kernels already queued on this device may still read the
-                // old backing, so it lives until the queue passes this marker.
-                ggml_sycl::retain_handles_until_event(
-                    { std::move(s.backing_handle) },
-                    ggml_sycl_submit_marker<ggml_sycl_mmvq_q8_retire_marker_kernel>(queue));
-            }
-            s.invalidate();
-            s.cached_q8_1      = nullptr;
-            s.backing_handle   = std::move(replacement);
-            s.backing_capacity = allocation_size;
-            return resolved.ptr;
+            return ptr;
         }
+
+        planned_scratch_stats & stats(int device) { return slot(device).stats; }
 
         ggml_sycl::mem_handle handle(int device) const { return slot(device).backing_handle; }
 
@@ -6766,18 +6819,17 @@ struct ggml_backend_sycl_context {
         }
     } mmvq_q8_activation_cache;
 
-    // NOT the oneDNN PP reorder scratch (the ONEDNN zone, acquire_onednn_pp_scratch): that one is only used when
-    // ggml_sycl_onednn_pp_candidate() holds, and this is what the same arm falls back to when it does not, so the
-    // two zones never share a consumer's sizing facts.
-    // Per-context, per-device dense f16 dequant scratch (llama.cpp-479i, A5): one buffer for the f16 copy
-    // of src0 and one for the f16 copy of src1 in the f16 arm of ggml_sycl_op_mul_mat_sycl, which used to
-    // take both from the SCRATCH pool per op. They are two buffers, not one with two regions, because the
-    // src0 copy is needed only when the oneDNN WoQ arm declines and is acquired lazily after src1 is
-    // already converted: growing a shared backing at that point would strand the converted src1 in the
-    // retired one. Same ownership story as the Q8_1 buffer above: the unified cache owns the backing, the
-    // mem_handle is the identity, the RUNTIME zone is the planned home and the raw-malloc spill is
-    // forbidden. A buffer is shared across ops only on the context's main in-order stream (the caller
-    // checks that); a row-split op runs its consumers on other streams and keeps the per-op pool.
+    // Per-context, per-device dense f16 dequant scratch (llama.cpp-479i): one buffer for the f16 copy of src0 and
+    // one for the f16 copy of src1 in the f16 arm of ggml_sycl_op_mul_mat_sycl, which used to take both from the
+    // SCRATCH pool per op. NOT the oneDNN PP reorder scratch (the ONEDNN zone, acquire_onednn_pp_scratch): that one
+    // is only used when ggml_sycl_onednn_pp_candidate() holds, and this is what the same arm falls back to when it
+    // does not, so the two zones never share a consumer's sizing facts.
+    //
+    // They are two buffers, not one with two regions, because the src0 copy is needed only when the oneDNN WoQ arm
+    // declines and is acquired lazily after src1 is already converted: growing a shared backing at that point
+    // would strand the converted src1 in the retired one. Same ownership story as the Q8_1 buffer above (see
+    // ggml_sycl_runtime_scratch_ensure): the unified cache owns the backing, the mem_handle is the identity, the
+    // RUNTIME zone is the planned home and the raw-malloc spill is forbidden.
     struct dequant_f16_scratch_t {
         explicit dequant_f16_scratch_t(const char * cohort) : cohort_id(cohort) {}
 
@@ -6786,6 +6838,7 @@ struct ggml_backend_sycl_context {
         struct slot_t {
             ggml_sycl::mem_handle backing_handle;
             size_t                backing_capacity = 0;
+            planned_scratch_stats stats;
         };
 
         std::array<slot_t, GGML_SYCL_MAX_DEVICES> slots;
@@ -6812,53 +6865,23 @@ struct ggml_backend_sycl_context {
 
         ggml_sycl::mem_handle handle(int device) const { return slot(device).backing_handle; }
 
-        void * ensure_buffer(size_t required_size, int device, sycl::queue & queue) {
-            if (required_size == 0) {
-                return nullptr;
-            }
-            slot_t & s = slot(device);
-            if (s.backing_handle.valid() && s.backing_capacity >= required_size) {
-                auto resolved = s.backing_handle.resolve(device);
-                return resolved ? resolved.ptr : nullptr;
-            }
+        planned_scratch_stats & stats(int device) { return slot(device).stats; }
 
-            ggml_sycl::alloc_request req{};
-            req.queue                                     = &queue;
-            req.device                                    = device;
-            req.size                                      = required_size;
-            req.intent.role                               = ggml_sycl::alloc_role::STAGING;
-            req.intent.category                           = ggml_sycl::runtime_category::STAGING;
-            req.intent.cohort_id                          = cohort_id;
-            req.intent.constraints.must_device            = true;
-            // RUNTIME zone, spill forbidden: sized by unified_cache_get_planned_runtime_zone_requirement()
-            // (see the Q8_1 buffer's ensure_buffer for the full reasoning, including the first-submit
-            // caveat for tail-zone pointers, which applies here unchanged). A copy of a whole weight that
-            // can fall out of the arena is exactly the 60 MiB-per-op spill this replaces.
-            req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::RUNTIME;
-            req.intent.constraints.forbid_vram_zone_spill = true;
-            ggml_sycl::allocation_result allocation       = ggml_sycl::unified_allocate_owner(req);
-            if (!allocation) {
-                return nullptr;
+        void * ensure_buffer(size_t required_size, int device, sycl::queue & queue) {
+            slot_t & s    = slot(device);
+            bool     grew = false;
+            void *   ptr  = ggml_sycl_runtime_scratch_ensure<ggml_sycl_dequant_f16_retire_marker_kernel>(
+                s.backing_handle, s.backing_capacity, required_size, device, queue, cohort_id, &grew);
+            if (grew) {
+                s.stats.growths++;
             }
-            const size_t          allocation_size = allocation.owner.metadata().size;
-            ggml_sycl::mem_handle replacement =
-                ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
-            const auto resolved = replacement.resolve(device);
-            if (!resolved.ptr || !resolved.on_device) {
-                return nullptr;
-            }
-            if (s.backing_handle.valid()) {
-                // Growth: kernels already queued on this device may still read the old backing, so it
-                // lives until the queue passes this marker.
-                ggml_sycl::retain_handles_until_event(
-                    { std::move(s.backing_handle) },
-                    ggml_sycl_submit_marker<ggml_sycl_dequant_f16_retire_marker_kernel>(queue));
-            }
-            s.backing_handle   = std::move(replacement);
-            s.backing_capacity = allocation_size;
-            return resolved.ptr;
+            return ptr;
         }
     } dequant_f16_src0_scratch{ "mul-mat-dequant-f16-src0" }, dequant_f16_src1_scratch{ "mul-mat-dequant-f16-src1" };
+
+    // One WARN-level line per planned scratch cohort and device that was used (uses, growths, capacity against the
+    // plan, peak demand). Emitted once, at teardown, so a normal run proves the planned buffers were exercised.
+    void log_planned_scratch_stats();
 
     // Pre-allocated buffers for XMX MoE graph recording
     // XMX MoE needs various temporary buffers that can't be allocated during graph recording

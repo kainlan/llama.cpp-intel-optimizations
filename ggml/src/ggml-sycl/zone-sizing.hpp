@@ -82,7 +82,7 @@ struct zone_tensor_desc {
     // operands such as the MLA wk_b / wv_b (llama.cpp-8xbt).
     size_t mmq_src1_bytes_per_token = 0;
 
-    // dense f16 dequant scratch (llama.cpp-479i, A5): f16 bytes of the WHOLE dequantized weight a
+    // dense f16 dequant scratch (llama.cpp-479i): f16 bytes of the WHOLE dequantized weight a
     // dense MUL_MAT's oneDNN arm materializes (zone_dequant_f16_weight_bytes(ne[0], ne[1])), and the
     // f16 activation bytes per token it converts alongside (zone_dequant_f16_src1_bytes_per_token).
     // Supplied by the adapter, which knows the type and the expert role; zero means "not a candidate".
@@ -217,7 +217,7 @@ bool zone_mmq_src1_bytes_per_token(int64_t ne0, int64_t ne2, int64_t ne3, size_t
 bool zone_mmq_src1_scratch_bytes(size_t bytes_per_token, uint32_t n_ubatch, size_t * out);
 
 // ---------------------------------------------------------------------------
-// dense f16 dequant scratch (llama.cpp-479i, A5)
+// dense f16 dequant scratch (llama.cpp-479i)
 // ---------------------------------------------------------------------------
 //
 // ggml_sycl_op_mul_mat_sycl's f16 arm converts the WHOLE src0 weight and the src1 activations to f16
@@ -236,12 +236,15 @@ bool zone_dequant_f16_src1_bytes_per_token(int64_t ne0, int64_t ne2, int64_t ne3
 // to the region alignment. `elems` is 0 for an operand that needs no copy. False on a negative count or overflow.
 bool zone_dequant_f16_region_bytes(int64_t elems, size_t * out);
 
-// The plan figure: the largest weight copy plus n_ubatch activation rows at the widest K, each buffer
-// aligned to 256 (the two buffers are planned together). Zero when there is no candidate.
-bool zone_dequant_f16_scratch_bytes(size_t   max_weight_bytes,
-                                    size_t   src1_bytes_per_token,
-                                    uint32_t n_ubatch,
-                                    size_t * out);
+// The plan figure, one number PER BUFFER (they are separate buffers): the largest weight copy, and n_ubatch
+// activation rows at the widest K, each aligned to 256. Zero when there is no candidate. Separate numbers
+// because the graph walk ensures each buffer at max(plan, demand), so a later graph never regrows (and
+// retires) a buffer that a recorded graph baked.
+bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
+                                 size_t   src1_bytes_per_token,
+                                 uint32_t n_ubatch,
+                                 size_t * src0_bytes,
+                                 size_t * src1_bytes);
 
 // ---------------------------------------------------------------------------
 // Mispredict accounting
