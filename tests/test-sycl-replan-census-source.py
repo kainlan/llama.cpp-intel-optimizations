@@ -543,8 +543,18 @@ def gate31(files, bad):
             bad("gate 31: the check for %r is not a GGML_SYCL_WITNESS" % msg)
         if re.search(r"\bassert\s*\(|NDEBUG", text_c):
             bad("gate 31: %s uses assert( or NDEBUG next to its witness" % fn)
-    # The preload's check is held(LOAD), not weakened to any kind.
+    # load_end's bodies never overlap: a witness counts them, and load_end
+    # constructs it right after the LOAD token (so the count is taken under L0).
     kk = keep(files, MAIN)
+    if not re.search(r"struct\s+ggml_sycl_load_end_body_witness\s*\{\s*ggml_sycl_load_end_body_witness\(\)\s*\{[^}]*"
+                     r"GGML_SYCL_WITNESS\(\s*running\s*==\s*0\s*,\s*\"\[REPLAN-TOKEN\] two load_end bodies overlapped\"\s*\)",
+                     kk, re.S):
+        bad("gate 31: the load_end overlap witness is missing, weakened or renamed")
+    lb = func_bodies(code(files, MAIN), "ggml_backend_sycl_model_load_end")
+    lt = text_of(code(files, MAIN), lb[0]) if len(lb) == 1 else ""
+    if not re.search(r"ggml_sycl_replan_token\s+l0\(GGML_SYCL_REPLAN_KIND_LOAD\);\s*ggml_sycl_load_end_body_witness\s+\w+\s*;", lt):
+        bad("gate 31: load_end does not construct its overlap witness right after the LOAD token")
+    # The preload's check is held(LOAD), not weakened to any kind.
     m = re.search(r"GGML_SYCL_WITNESS\(\s*(ggml_sycl_replan_token_held\([^)]*\))\s*,\s*\"\[REPLAN-TOKEN\] preload without a LOAD token\"",
                   kk)
     if not m or "GGML_SYCL_REPLAN_KIND_LOAD" not in m.group(1):
@@ -840,6 +850,15 @@ def mutants(files):
            edit(files, M, "GGML_SYCL_WITNESS(ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_LOAD),",
                 "GGML_SYCL_WITNESS(ggml_sycl_replan_token_held(),", "g31g"),
            "preload's witness is not held(LOAD)")
+    yield ("the load_end overlap witness removed",
+           edit(files, M, "GGML_SYCL_WITNESS(running == 0, \"[REPLAN-TOKEN] two load_end bodies overlapped\");", "", "g31j"),
+           "overlap witness is missing")
+    yield ("the load_end overlap witness weakened",
+           edit(files, M, "GGML_SYCL_WITNESS(running == 0,", "GGML_SYCL_WITNESS(running >= 0,", "g31k"),
+           "overlap witness is missing")
+    yield ("load_end not constructing its overlap witness",
+           edit(files, M, "    ggml_sycl_load_end_body_witness load_end_body_witness;\n", "", "g31l"),
+           "does not construct its overlap witness")
     yield ("the witness macro under NDEBUG",
            edit(files, UC_H, "#define GGML_SYCL_WITNESS(cond, message)                      \\\n    do {                                                      \\\n        if (::ggml_sycl::g_sycl_witness_enabled && !(cond)) { \\",
                 "#define GGML_SYCL_WITNESS(cond, message)                      \\\n    do {                                                      \\\n        if (!NDEBUG && ::ggml_sycl::g_sycl_witness_enabled && !(cond)) { \\", "g31h"),

@@ -13170,10 +13170,27 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
     return false;
 }
 
+// Counts the load_end bodies running at once. The LOAD token serialises them, so
+// the count is 0 on every entry; the witness checks that rather than assuming it.
+static std::atomic<int> g_load_end_bodies_running{ 0 };
+
+namespace {
+struct ggml_sycl_load_end_body_witness {
+    ggml_sycl_load_end_body_witness() {
+        const int running = g_load_end_bodies_running.fetch_add(1, std::memory_order_acq_rel);
+        GGML_SYCL_WITNESS(running == 0, "[REPLAN-TOKEN] two load_end bodies overlapped");
+        (void) running;
+    }
+
+    ~ggml_sycl_load_end_body_witness() { g_load_end_bodies_running.fetch_sub(1, std::memory_order_acq_rel); }
+};
+}  // namespace
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn      txn,
                                                             bool                    explicit_success,
                                                             ggml_sycl_model_token * model) {
-    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
+    ggml_sycl_replan_token          l0(GGML_SYCL_REPLAN_KIND_LOAD);
+    ggml_sycl_load_end_body_witness load_end_body_witness;
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     ggml_sycl::lifecycle::Registry *    registry = nullptr;
