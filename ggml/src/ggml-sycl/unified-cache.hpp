@@ -7349,13 +7349,16 @@ uint64_t unified_cache_zone_plan_refusal_count_for_testing(int dev) noexcept;
 // The one chokepoint for a forbid refusal: called where unified_alloc refuses a
 // request whose preferred zone could not hold it. It classifies the miss by the
 // request alone (cascade_step, unconverted_ticket, else terminal), counts it,
-// and prints its line under GGML_SYCL_EXT_ALLOC_TRACE=1 only; it never allocates, takes no lock of any rank, and changes no
-// outcome -- the caller still returns its own refusal.
+// and prints its line under GGML_SYCL_EXT_ALLOC_TRACE=1 only; it changes no
+// outcome -- the caller still returns its own refusal. It takes only a counter
+// table's leaf spin lock, and under the trace the dedupe table's; it reads the
+// zone's atomic `used` and fixed capacity through `cache` (null prints no
+// figures), never the allocator's free-space figures, which need the zone's
+// group mutex that a refusal does not hold.
 void unified_cache_zone_refusal(const alloc_request & req,
                                 vram_zone_id          zone,
                                 size_t                bytes,
-                                size_t                zone_free,
-                                size_t                zone_largest) noexcept;
+                                const unified_cache * cache) noexcept;
 
 // === Shutdown API ===
 

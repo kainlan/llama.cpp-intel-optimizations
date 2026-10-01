@@ -9,8 +9,9 @@
 //
 //   * `T x{}`, a designated initialiser and a helper's defaulted arguments report the line of the
 //     construction;
-//   * a braceless `T x;` -- as a local, at namespace scope and as a class member -- reports the
-//     CLASS DEFINITION, which is why every production declaration of these types is written `T x{}`;
+//   * a braceless `T x;` -- as a local, at namespace scope and as a class member -- is REPORTED, not
+//     asserted: on icpx it names the CLASS DEFINITION, which is why every production declaration of
+//     these types is written `T x{}`, but a toolchain that fixes that would not make anything wrong;
 //   * a copy reports the source's site, so a copy that reaches an allocator for a different purpose
 //     must carry its own cohort;
 //   * an aggregate that holds one of the types reports the aggregate's construction when it is
@@ -50,8 +51,11 @@ void expect_site(const char * what, const char * file, int line, const char * wa
 // Each construction shares a physical line with its expected `__LINE__`; a formatter that splits
 // the line would move the construction off it, so the cases are not reformatted.
 
-// Where the label is expected to resolve for a braceless declaration: the class definition.
-constexpr const char * k_class_site_file = "unified-cache.hpp";
+// A braceless declaration's label depends on the toolchain, so it is reported, never asserted.
+void note_braceless(const char * what, const char * file, int line) {
+    std::printf("note [%s]: reports %s:%d\n", what, base_name(file), line);
+}
+
 constexpr const char * k_this_file       = "test-sycl-alloc-site-label.cpp";
 
 struct request_holder {
@@ -82,53 +86,31 @@ int main() {
     expect_site("offload_buffer_request x{}", offload_braced.site_file, offload_braced.site_line, k_this_file,
                 offload_braced_line);
 
-    // T x;: the class definition, not the declaration. This is the case that forces the braces.
+    // T x;: reported, not asserted. On the toolchain this was written against it names the class
+    // definition, which is why production declarations are written `T x{}`; a toolchain that names
+    // the declaration instead would make the braces unnecessary but not wrong, so this never fails.
     alloc_request req_braceless;
-    expect_site("alloc_request x; (class site, not the declaration)", req_braceless.site_file,
-                req_braceless.site_line, k_class_site_file, req_braceless.site_line);
-    if (std::strcmp(base_name(req_braceless.site_file), k_this_file) == 0) {
-        std::fprintf(stderr, "FAIL [braceless declaration]: reported its own line; the braces are no longer needed\n");
-        g_failures++;
-    }
-
+    note_braceless("alloc_request x;", req_braceless.site_file, req_braceless.site_line);
     alloc_intent intent_braceless;
-    if (std::strcmp(base_name(intent_braceless.site_file), k_class_site_file) != 0) {
-        std::fprintf(stderr, "FAIL [alloc_intent x; class site]: reports %s\n", base_name(intent_braceless.site_file));
-        g_failures++;
-    }
-
+    note_braceless("alloc_intent x;", intent_braceless.site_file, intent_braceless.site_line);
     offload_buffer_request offload_braceless;
-    if (std::strcmp(base_name(offload_braceless.site_file), k_class_site_file) != 0) {
-        std::fprintf(stderr, "FAIL [offload_buffer_request x; class site]: reports %s\n",
-                     base_name(offload_braceless.site_file));
-        g_failures++;
-    }
+    note_braceless("offload_buffer_request x;", offload_braceless.site_file, offload_braceless.site_line);
+    note_braceless("namespace-scope alloc_request;", g_namespace_braceless.site_file, g_namespace_braceless.site_line);
+    request_holder holder_braceless;
+    note_braceless("class member, holder;", holder_braceless.request.site_file, holder_braceless.request.site_line);
 
-    // Namespace scope.
-    if (std::strcmp(base_name(g_namespace_braceless.site_file), k_class_site_file) != 0) {
-        std::fprintf(stderr, "FAIL [namespace-scope alloc_request;]: reports %s\n",
-                     base_name(g_namespace_braceless.site_file));
-        g_failures++;
-    }
     expect_site("namespace-scope alloc_request x{}", g_namespace_braced.site_file, g_namespace_braced.site_line,
                 k_this_file, g_namespace_braced_line);
 
-    // A class member: an aggregate that is brace-initialised reports its own construction, one that is
-    // default-initialised reports the member's class.
+    // A class member: an aggregate that is brace-initialised reports its own construction.
     request_holder holder_braced{}; const int holder_braced_line = __LINE__;
     expect_site("class member, holder{}", holder_braced.request.site_file, holder_braced.request.site_line,
                 k_this_file, holder_braced_line);
-    request_holder holder_braceless;
-    if (std::strcmp(base_name(holder_braceless.request.site_file), k_class_site_file) != 0) {
-        std::fprintf(stderr, "FAIL [class member, holder;]: reports %s\n",
-                     base_name(holder_braceless.request.site_file));
-        g_failures++;
-    }
 
-    // The nested member of a brace-initialised request is never what an allocator reads, but it is
-    // not the class site either: it follows the enclosing construction.
-    expect_site("alloc_request{}.intent (nested; never read by an allocator)", req_braced.intent.site_file,
-                req_braced.intent.site_line, k_this_file, req_braced_line);
+    // The nested member of a brace-initialised request is never what an allocator reads (it reads the
+    // request's own site); where it points is reported for the record.
+    note_braceless("alloc_request{}.intent (nested; never read by an allocator)", req_braced.intent.site_file,
+                   req_braced.intent.site_line);
 
     // A designated initialiser reports its own line.
 #if defined(__clang__)

@@ -17,7 +17,12 @@ It checks, with comments stripped, over ggml/src/ggml-sycl excluding tests/:
   * neither the printer, nor its atexit registration, nor the table, nor a registered
     counter's definition or increment, nor a _for_testing accessor that reads one,
     lies in a branch that is not compiled when GGML_SYCL_PRIVATE_TESTING is undefined;
-  * the ggml-sycl target is given no GGML_SYCL_PRIVATE_TESTING definition.
+  * the ggml-sycl target is given no GGML_SYCL_PRIVATE_TESTING definition;
+  * the arena-active mirror the raw exit reads is set where an arena is created and
+    cleared where it is destroyed and where it is abandoned;
+  * the zone chokepoint, and every call of it, reads none of the zone allocator's
+    free-space figures (zone_available, zone_largest_free), which need a mutex a
+    refusal does not hold.
 
 The region scanner has a positive control: it must find at least one
 GGML_SYCL_PRIVATE_TESTING region in unified-cache.cpp, else the gate is VOID, because
@@ -44,13 +49,18 @@ MACRO = "GGML_SYCL_PRIVATE_TESTING"
 # "lands" only decides whether a reading of it is VOID. "retired" is the step after
 # which the field is absent (none of the fields themselves retire; the interim keys of
 # onednn_graph_route_declined do, see ROUTE_KEYS).
+#
+# refusal_unattributed lands at step 3, so it has no producer before then and a reading of
+# it on a tree earlier than step 3 is VOID, not 0: its definition (a refusal on an unmarked
+# thread during compute) needs the per-context marker that lands with step 3, and a step-0
+# producer would count every refusal.
 FIELDS = [
     ("ext_alloc_count", "step0", None),
     ("ext_alloc_arena", "step0", None),
     ("zone_cascade_miss", "step0", None),
     ("zone_unconverted_miss", "step0", None),
     ("zone_plan_refusal", "step0", None),
-    ("refusal_unattributed", "step0", None),
+    ("refusal_unattributed", "step3", None),
     ("refusal_late", "step3", None),
     ("onednn_scratchpad_over_plan_declined", "step3", None),
     ("late_term_shrink_admitted", "step4", None),
@@ -103,6 +113,8 @@ FORMAT_STRINGS = [
     "[SYCL-COUNTER] dev=%d name=%s value=not_captured",
     "[SYCL-COUNTER] end devices=%d",
 ]
+
+ZONE_ALLOCATOR_FIGURES = ["zone_available", "zone_largest_free"]
 
 PRINTER = "unified_cache_test_counter_dump"
 SRC_EXT = (".cpp", ".hpp", ".h", ".c", ".inc")
@@ -275,6 +287,31 @@ def function_body_range(text, name):
     return line_of(text, m.start()), line_of(text, i)
 
 
+def function_text(text, qualified_name):
+    """The text of the function definition `qualified_name(...) ... { ... }`, or None."""
+    for m in re.finditer(r"\b" + re.escape(qualified_name) + r"\s*\(", text):
+        i = m.end()
+        depth = 1
+        while i < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[i], 0)
+            i += 1
+        j = i
+        while j < len(text) and text[j] not in "{;":
+            j += 1
+        if j < len(text) and text[j] == "{":
+            depth = 0
+            k = j
+            while k < len(text):
+                if text[k] == "{":
+                    depth += 1
+                elif text[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[m.start():k + 1]
+                k += 1
+    return None
+
+
 def cmake_targets_with_macro(cmake):
     """Targets that receive the macro through target_compile_definitions/options."""
     targets = set()
@@ -341,8 +378,8 @@ def check(files, cmake):
         rel, ln = registrations[0]
         ok, cause = comp[rel][ln - 1]
         if not ok:
-            fails.append("H13 M74: counter dump in the #else of an #ifndef" if cause == "else-of-negated" else
-                         "H13 M74: counter dump gated by PRIVATE_TESTING")
+            fails.append("H13 M74: dump registration in the #else of an #ifndef" if cause == "else-of-negated" else
+                         "H13 M74: dump registration gated by PRIVATE_TESTING")
 
     # Which landing steps are on this tree.
     b2_landed = bool(B2_SENTINEL.search(cache_text))
@@ -366,7 +403,7 @@ def check(files, cmake):
         for off in range(span):
             ok, cause = comp[where][counter_line - 1 + off]
             if not ok:
-                fails.append("H13 M74: counter dump gated by PRIVATE_TESTING")
+                fails.append("H13 M74: counter table gated by PRIVATE_TESTING")
                 break
 
     expected = [name for name, lands, retired in FIELDS if not (retired == "b2" and b2_landed)]
@@ -405,7 +442,7 @@ def check(files, cmake):
         for off in range(span):
             ok, cause = comp[snap_where][snap_line - 1 + off]
             if not ok:
-                fails.append("H13 M74: counter dump gated by PRIVATE_TESTING")
+                fails.append("H13 M74: snapshot table gated by PRIVATE_TESTING")
                 break
     snap_expected = [(sid, printed) for sid, printed, lands, retired in SNAPSHOTS]
     if snap_registered != snap_expected:
@@ -459,6 +496,33 @@ def check(files, cmake):
         for key in ROUTE_INTERIM_KEYS:
             if key not in route_keys:
                 fails.append(f"H13 M79(d): field dropped before its retiring step: {ROUTE_COUNTER}{{{key}}}")
+
+    # The arena-active mirror: set where an arena is created, cleared where it is destroyed and
+    # where it is abandoned. arena_base_ is a plain pointer the raw layer cannot read lock-free.
+    note_re = re.compile(r"\bext_alloc_note_arena_state\s*\(([^;]*?),\s*(true|false)\s*\)\s*;")
+    sets = len([m for m in note_re.finditer(cache_text) if m.group(2) == "true"])
+    if sets < 2:
+        fails.append(f"H13 M74(m): arena-active mirror set at {sets} site(s), expected the single-chunk and N-chunk reserve")
+    for fn in ("unified_cache::arena_destroy", "unified_cache::arena_abandon"):
+        body = function_text(cache_text, fn)
+        if body is None:
+            fails.append(f"H13 M74(m): {fn} not found")
+        elif not any(m.group(2) == "false" for m in note_re.finditer(body)):
+            fails.append(f"H13 M74(m): {fn} does not clear the arena-active mirror")
+
+    # The chokepoint reads no allocator free-space figure, in its body or at any call.
+    choke = function_text(cache_text, "unified_cache_zone_refusal")
+    if choke is None:
+        fails.append("H13 M74(c): unified_cache_zone_refusal not found")
+    else:
+        for fig in ZONE_ALLOCATOR_FIGURES:
+            if re.search(r"\b" + fig + r"\s*\(", choke):
+                fails.append(f"H13 M74(c): the chokepoint reads {fig}, which needs the zone group mutex")
+    for rel, text in stripped.items():
+        for m in re.finditer(r"\bunified_cache_zone_refusal\s*\(([^;]*)\)\s*;", text):
+            for fig in ZONE_ALLOCATOR_FIGURES:
+                if re.search(r"\b" + fig + r"\b", m.group(1)):
+                    fails.append(f"H13 M74(c): a call of the chokepoint passes {fig} ({rel}:{line_of(text, m.start())})")
 
     # The ggml-sycl target is given no macro definition.
     targets, other_forms = cmake_targets_with_macro(cmake)
@@ -520,7 +584,7 @@ def scanner_fixture():
         got = flags[lines.index(text)][0]
         if got != expect:
             fails.append(f"H13 scanner fixture: `{text}` classified compiled={got}, expected {expect}")
-    return fails
+    return fails, len(want)
 
 
 def wrap_in_macro(text, start_line, end_line, negate=False):
@@ -620,6 +684,95 @@ def mutation_matrix(files, cmake):
         " 0, \"interim_capacity\"); }\n")
     muts.append(("(b1) with interim_tp missing", "H13 M79(d): field dropped before its retiring step", f, cmake))
 
+    cache_raw = files["unified-cache.cpp"]
+
+    def with_cache(text):
+        g = clone()
+        g["unified-cache.cpp"] = text
+        return g
+
+    # The registration under the macro.
+    m = re.search(r"^[^\n]*std::atexit\(\s*" + PRINTER + r"\s*\)[^\n]*$", cache_raw, re.M)
+    ln = line_of(cache_raw, m.start())
+    muts.append(("atexit registration gated", "H13 M74: dump registration gated by PRIVATE_TESTING",
+                 with_cache(wrap_in_macro(cache_raw, ln, ln)), cmake))
+
+    # Each table's whole span under the macro.
+    for rel, text in files.items():
+        for define, label, message in (("GGML_SYCL_DUMP_COUNTERS", "counter table gated",
+                                        "H13 M74: counter table gated by PRIVATE_TESTING"),
+                                       ("GGML_SYCL_DUMP_SNAPSHOTS", "snapshot table gated",
+                                        "H13 M74: snapshot table gated by PRIVATE_TESTING")):
+            t, first = macro_list(strip_comments(text), define)
+            if t is None:
+                continue
+            g = clone()
+            g[rel] = wrap_in_macro(text, first, first + t.count("\n"))
+            muts.append((label, message, g, cmake))
+
+    # Every compiled use of a step-0 producer under the macro: no compiled use is left.
+    lines = cache_raw.split("\n")
+    hits = [i + 1 for i, l in enumerate(lines) if "dump_counter::zone_plan_refusal" in l]
+    mutated = cache_raw
+    for ln in reversed(hits):
+        mutated = wrap_in_macro(mutated, ln, ln)
+    g = with_cache(mutated)
+    for rel, text in files.items():
+        if rel != "unified-cache.cpp" and "dump_counter::zone_plan_refusal" in text:
+            tl = text.split("\n")
+            mm = text
+            for ln in reversed([i + 1 for i, l in enumerate(tl) if "dump_counter::zone_plan_refusal" in l]):
+                mm = wrap_in_macro(mm, ln, ln)
+            g[rel] = mm
+    muts.append(("zone_plan_refusal has no compiled use", "H13 M74: counter zone_plan_refusal gated: no compiled use",
+                 g, cmake))
+
+    # Each of the printer's three format strings, and the sentinel.
+    muts.append(("value format changed", "format string missing from the printer: [SYCL-COUNTER] dev=%d name=%s value=%llu",
+                 with_cache(cache_raw.replace("name=%s value=%llu", "name=%s val=%llu")), cmake))
+    muts.append(("not_captured format changed",
+                 "format string missing from the printer: [SYCL-COUNTER] dev=%d name=%s value=not_captured",
+                 with_cache(cache_raw.replace("value=not_captured", "value=none")), cmake))
+    muts.append(("end line format changed", "format string missing from the printer: [SYCL-COUNTER] end devices=%d",
+                 with_cache(cache_raw.replace("[SYCL-COUNTER] end devices=%d", "[SYCL-COUNTER] done devices=%d")), cmake))
+    muts.append(("not_captured sentinel gone", "the printer carries no value=not_captured sentinel",
+                 with_cache(cache_raw.replace("value=not_captured", "value=none")), cmake))
+
+    # The printed names built without the table macro.
+    muts.append(("printed names without the table macro",
+                 "unified-cache.cpp builds the printed names without the table macro",
+                 with_cache(cache_raw.replace("GGML_SYCL_DUMP_COUNTERS(", "GGML_SYCL_DUMP_COUNTERS_BY_HAND(")), cmake))
+
+    # The retired-at-step-3 field has no producer on this tree, so dropping it is caught by its lands step.
+    f = clone()
+    f[where] = re.sub(r"^[ \t]*X\(refusal_unattributed\)[ \t]*\\\n", "", ctext, count=1, flags=re.M)
+    muts.append(("refusal_unattributed dropped", "H13 M79(d): field absent before its lands step: refusal_unattributed",
+                 f, cmake))
+
+    # The arena-active mirror: set sites and the two clears.
+    note_call = "ext_alloc_note_arena_state(queue, true);"
+    first = cache_raw.index(note_call)
+    muts.append(("arena mirror set once", "H13 M74(m): arena-active mirror set at 1 site(s)",
+                 with_cache(cache_raw[:first] + cache_raw[first + len(note_call):]), cmake))
+    for fn, label in (("void unified_cache::arena_abandon()", "arena_abandon leaves the mirror set"),
+                      ("bool unified_cache::arena_destroy()", "arena_destroy leaves the mirror set")):
+        at = cache_raw.find(fn)
+        if at < 0:
+            at = cache_raw.find(fn.replace("bool ", "void ", 1))
+        clear = "ext_alloc_note_arena_state(queue_, false);"
+        k = cache_raw.index(clear, at)
+        qualified = "unified_cache::" + fn.split("::")[1].split("(")[0]
+        muts.append((label, f"H13 M74(m): {qualified} does not clear the arena-active mirror",
+                     with_cache(cache_raw[:k] + cache_raw[k + len(clear):]), cmake))
+
+    # The chokepoint reads an allocator figure, in its body and at a call.
+    muts.append(("chokepoint reads zone_largest_free", "H13 M74(c): the chokepoint reads zone_largest_free",
+                 with_cache(cache_raw.replace("cache->zone_used(zone)", "cache->zone_largest_free(zone)", 1)), cmake))
+    muts.append(("call passes zone_available", "H13 M74(c): a call of the chokepoint passes zone_available",
+                 with_cache(cache_raw.replace("unified_cache_zone_refusal(req, zid, alloc_size, cache);",
+                                              "unified_cache_zone_refusal(req, zid, alloc_size, cache->zone_available(zid));",
+                                              1)), cmake))
+
     # The ggml-sycl target given the macro.
     muts.append(("ggml-sycl defines the macro", "H13 M74: the ggml-sycl target defines GGML_SYCL_PRIVATE_TESTING",
                  files, cmake + "\ntarget_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_PRIVATE_TESTING=1)\n"))
@@ -628,11 +781,12 @@ def mutation_matrix(files, cmake):
 
 def run_mutations(files, cmake):
     fails = []
-    for label, message, mfiles, mcmake in mutation_matrix(files, cmake):
+    matrix = mutation_matrix(files, cmake)
+    for label, message, mfiles, mcmake in matrix:
         got = check(mfiles, mcmake)
         if not any(message in g for g in got):
             fails.append(f"H13 mutation `{label}` was not caught: expected `{message}`, gate said {got or 'PASS'}")
-    return fails
+    return fails, len(matrix)
 
 
 def main():
@@ -643,16 +797,19 @@ def main():
     args = ap.parse_args()
 
     files, cmake = read_tree(os.path.abspath(args.root))
-    failures = scanner_fixture()
+    failures, fixture_cases = scanner_fixture()
     if not args.mutations_only:
         failures += check(files, cmake)
+    mutation_count = 0
     if not args.no_mutations and not failures:
-        failures += run_mutations(files, cmake)
+        mutation_fails, mutation_count = run_mutations(files, cmake)
+        failures += mutation_fails
     if failures:
         for f in failures:
             print(f"FAIL: {f}")
         return 1
-    print("PASS: the counter dump is compiled into the shipped library and its table matches the contract")
+    print("PASS: the counter dump is compiled into the shipped library and its table matches the contract"
+          f" ({mutation_count} mutations caught, {fixture_cases} scanner-fixture cases)")
     return 0
 
 

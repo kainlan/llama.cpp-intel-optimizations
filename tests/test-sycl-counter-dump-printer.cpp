@@ -255,7 +255,7 @@ int main(int argc, char ** argv) {
         req.intent.cohort_id = cohort;
     };
     auto refuse = [](const alloc_request & req, vram_zone_id zone) {
-        return capture_stderr([&] { unified_cache_zone_refusal(req, zone, 4096, 1024, 512); });
+        return capture_stderr([&] { unified_cache_zone_refusal(req, zone, 4096, nullptr); });
     };
     auto count_lines = [](const std::string & text, const char * tag) {
         size_t n = 0;
@@ -309,8 +309,10 @@ int main(int argc, char ** argv) {
 
     check(count_lines(t1, "[ZONE-PLAN-BUG] dev=0 zone=RUNTIME cohort=chk-terminal site=") == 1 &&
               t1.find("test-sycl-counter-dump-printer.cpp:" + std::to_string(terminal_line)) != std::string::npos &&
-              t1.find("bytes=4096 zone_free=1024 zone_largest=512") != std::string::npos,
-          "terminal prints one [ZONE-PLAN-BUG] line naming the zone, cohort, construction site and room");
+              t1.find("bytes=4096") != std::string::npos && t1.find("zone_largest") == std::string::npos &&
+              t1.find("zone_free") == std::string::npos,
+          "terminal prints one [ZONE-PLAN-BUG] line naming the zone, cohort, construction site and bytes, and no "
+          "allocator free-space figure");
     check(refuse(terminal, vram_zone_id::RUNTIME).empty() &&
               unified_cache_zone_plan_refusal_count_for_testing(0) == refusals0 + 2,
           "a repeat of the same tuple counts again and prints no second line");

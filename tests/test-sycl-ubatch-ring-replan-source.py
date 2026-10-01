@@ -991,8 +991,7 @@ def test_unified_alloc_spill_guard_has_a_mutation_witness():
     raw = CACHE_CPP
     guard_block = (
         "                if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {\n"
-        "                    unified_cache_zone_refusal(req, zid, alloc_size, cache->zone_available(zid),\n"
-        "                                               cache->zone_largest_free(zid));\n"
+        "                    unified_cache_zone_refusal(req, zid, alloc_size, cache);\n"
         "                    return false;\n"
         "                }\n"
     )
@@ -1020,8 +1019,7 @@ def test_unified_alloc_spill_guard_nesting_has_a_mutation_witness():
     raw = CACHE_CPP
     nested_guard = (
         "                if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {\n"
-        "                    unified_cache_zone_refusal(req, zid, alloc_size, cache->zone_available(zid),\n"
-        "                                               cache->zone_largest_free(zid));\n"
+        "                    unified_cache_zone_refusal(req, zid, alloc_size, cache);\n"
         "                    return false;\n"
         "                }\n"
         "            }\n"
@@ -1032,8 +1030,7 @@ def test_unified_alloc_spill_guard_nesting_has_a_mutation_witness():
         "            }\n"
         "        }\n"
         "        if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {\n"
-        "            unified_cache_zone_refusal(req, zid, alloc_size, cache->zone_available(zid),\n"
-        "                                       cache->zone_largest_free(zid));\n"
+        "            unified_cache_zone_refusal(req, zid, alloc_size, cache);\n"
         "            return false;\n"
         "        }\n"
     )
