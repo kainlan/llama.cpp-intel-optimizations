@@ -17235,6 +17235,11 @@ static size_t ggml_sycl_planned_scratch_hold_spill_bound(int device, uint32_t n_
     return r_max > SIZE_MAX - plan ? SIZE_MAX : plan + r_max;
 }
 
+// llama.cpp-kpjw: the driver headroom the arena expects the card to keep OUTSIDE it (and that the graph-entry check
+// reports against). One constant for that figure: the graph-entry check, and the check that counts a rung's own
+// hold-induced spills against it (ggml_sycl_check_hold_spill_realized), must not name two different numbers.
+static constexpr size_t kSyclArenaMinExternalHeadroomBytes = 256ull * 1024ull * 1024ull;
+
 // llama.cpp-kpjw: the live outside-arena headroom check for the hold's worst-case spill, run whatever the attention
 // mode. The unified allocator's overcommit guard compares a spill with the device's TOTAL memory minus what the
 // cache itself accounts for; it cannot see another tenant on the card or the driver's own reserve, so on a shared
@@ -17262,6 +17267,38 @@ static bool ggml_sycl_check_hold_spill_headroom(int device, size_t spill_bytes, 
         "device %d's live free memory (%.1f MB, over_by=%.1f MB); free VRAM on this card (another process, or a "
         "smaller -ub / -c) before loading\n",
         spill_bytes / mb, device, free_mem / mb, (spill_bytes - free_mem) / mb);
+    return false;
+}
+
+// llama.cpp-kpjw: what the rung's own reserve actually did. The bound above is a transaction-time heuristic (the
+// compute buffers do not exist yet); this runs inside sched_reserve(), after the probe graph_reserve() has made them,
+// when the hold-induced spills of THIS plan (since its publish) are known exactly. A spill that leaves the card
+// below the driver headroom the arena expects outside itself exhausts the card at the first graph (B50, Qwen PPL
+// at auto-ub1024: a 461 MB buffer held back, 107.8 MB left, flash attention out of resources), so the rung does
+// not fit: the refusal throws out of the reserve like any other loser and the ladder lands on a smaller rung.
+// With no hold-induced spill the check asks nothing, so a run the hold never touched is unchanged.
+static bool ggml_sycl_check_hold_spill_realized(int device, uint64_t owner, bool probe_mode) {
+    uint64_t spills      = 0;
+    size_t   spill_bytes = 0;
+    ggml_sycl::unified_cache_get_recent_planned_hold_spills(device, owner, &spills, &spill_bytes);
+    if (spill_bytes == 0) {
+        return true;
+    }
+    size_t free_mem = 0, total_mem = 0;
+    ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
+    if (total_mem == 0 ||
+        ggml_sycl::zone_hold_spill_realized_fits(free_mem, kSyclArenaMinExternalHeadroomBytes, spill_bytes)) {
+        return true;
+    }
+    const double mb = 1024.0 * 1024.0;
+    GGML_SYCL_RUNTIME_TXN_REFUSAL(
+        probe_mode,
+        "[SYCL-PLAN] runtime context update rejected: %llu compute-buffer request(s) totalling %.1f MB were held "
+        "out of the RUNTIME zone for the planned dense scratch and now live outside the arena, leaving device %d "
+        "%.1f MB free against the %.1f MB driver headroom the arena expects (short by %.1f MB); a smaller -ub or -c "
+        "keeps those buffers in the zone\n",
+        (unsigned long long) spills, spill_bytes / mb, device, free_mem / mb, kSyclArenaMinExternalHeadroomBytes / mb,
+        (kSyclArenaMinExternalHeadroomBytes - free_mem) / mb);
     return false;
 }
 
@@ -18910,6 +18947,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // Published: the plan stands, so the hold is recomputed from it (and from what this context already holds).
     dense_guard.commit();
     ggml_sycl_planned_scratch_hold_refresh(*ctx);
+    // This plan's own reserve is what the realized-spill check (in the recheck) must see, not a losing rung's.
+    ggml_sycl::unified_cache_begin_planned_hold_epoch(ctx->device, ctx->planned_scratch_owner);
     announce_kv_host_demotions(*immutable->plan);
 
 #if GGML_SYCL_DNNL
@@ -19340,7 +19379,12 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
         current->plan->planner_n_head_all_max, flash_attn_enabled,
         /*allow_replan=*/false, /*probe_mode=*/false,
         ggml_sycl_planned_scratch_hold_spill_bound(ctx->device, current->plan->planner_n_ubatch));
-    return ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+    // llama.cpp-kpjw: and the rung's own compute buffers are made by now (the probe graph_reserve() ran), so what the
+    // hold spilled outside the arena is known exactly, not bounded: count it against the card's driver headroom, so
+    // an auto-ubatch rung that would exhaust the card at its first graph loses here and the ladder lands lower.
+    const bool realized_ok =
+        ok && ggml_sycl_check_hold_spill_realized(ctx->device, ctx->planned_scratch_owner, /*probe_mode=*/false);
+    return realized_ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
 }
 
 void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx) {
@@ -92728,7 +92772,7 @@ static void ggml_sycl_trace_queue_wait(queue_ptr           q,
 
 static void ggml_sycl_check_graph_scratch_headroom(int device) {
     constexpr size_t non_arena_min_external_headroom = 512ull * 1024ull * 1024ull;
-    constexpr size_t arena_min_external_headroom     = 256ull * 1024ull * 1024ull;
+    constexpr size_t arena_min_external_headroom     = kSyclArenaMinExternalHeadroomBytes;
     constexpr size_t arena_min_scratch_capacity      = 512ull * 1024ull * 1024ull;
 
     size_t free_vram  = 0;

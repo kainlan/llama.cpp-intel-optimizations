@@ -308,6 +308,13 @@ bool zone_runtime_alloc_held_back(bool   runtime_zone,
                                   size_t hold,
                                   size_t alloc_size);
 
+// Whether a rung still fits after the compute buffers the hold kept out of the RUNTIME zone have landed outside the
+// arena: with no such spill the question is not asked (true); with one, the card must still have the driver headroom
+// the arena expects outside itself (live_free >= headroom_target). The plan is the reality only if the rung's own
+// spills are counted in its fit, so the ladder lands on a rung that runs instead of one that exhausts the card at
+// the first graph (B50, Qwen PPL at auto-ub1024: 461 MB spilled, 107.8 MB left against 256 MB).
+bool zone_hold_spill_realized_fits(size_t live_free, size_t headroom_target, size_t spill_bytes);
+
 // Whether a multi-row MUL_MAT draws a given planned scratch (the Q8_1 src1 buffer, the f16 dequant buffers),
 // from the two answers the dispatch can give. `primary_*` is the router's first decision; when it picks the
 // unified kernel the dispatch can still decline at run time and re-select a legacy kernel, which is

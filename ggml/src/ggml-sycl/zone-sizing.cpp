@@ -379,6 +379,10 @@ bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size
     return hold <= available && size <= available - hold;
 }
 
+bool zone_hold_spill_realized_fits(size_t live_free, size_t headroom_target, size_t spill_bytes) {
+    return spill_bytes == 0 || live_free >= headroom_target;
+}
+
 bool zone_runtime_alloc_held_back(bool   runtime_zone,
                                   bool   forbid_spill,
                                   size_t zone_available,

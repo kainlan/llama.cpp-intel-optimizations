@@ -1709,6 +1709,13 @@ void     unified_cache_note_planned_hold_spill(int          device_id,
                                                size_t       hold,
                                                size_t       available);
 void     unified_cache_take_planned_hold_spills(int device_id, uint64_t owner, uint64_t * count, size_t * bytes);
+// A publish starts a new epoch for the owner: the hold spills and the largest request seen since the previous
+// publish are forgotten (teardown's counters are not). The runtime-context transaction calls this when it publishes,
+// so what the get below reports is what THIS plan's own reserve did: a losing auto-ubatch rung's spills do not
+// decide the next rung. A call by anyone but the hold's owner changes nothing.
+void         unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner);
+void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, uint64_t * count, size_t * bytes);
+
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno

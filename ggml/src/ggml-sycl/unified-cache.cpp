@@ -740,6 +740,11 @@ struct planned_scratch_hold_state {
     size_t     spill_bytes = 0;
     uint64_t   spill_owner = 0;  // the hold's owner when the first spill since the last take was noted
     size_t     request_hwm = 0;
+    // The same two quantities since the owner's last publish (unified_cache_begin_planned_hold_epoch): what the
+    // current rung's own reserve spilled, and the largest request it made. A losing rung's figures must not
+    // decide the next rung, so these restart at every publish; spill_count/spill_bytes above feed teardown stats.
+    uint64_t   recent_count = 0;
+    size_t     recent_bytes = 0;
 };
 
 static planned_scratch_hold_state g_planned_scratch_hold_state[GGML_SYCL_MAX_DEVICES];
@@ -1936,6 +1941,8 @@ bool unified_cache_release_planned_scratch_hold(int device_id, uint64_t owner) {
     state.hold        = 0;
     state.owner       = 0;
     state.request_hwm = 0;  // the largest request seen belongs to the context that is going away
+    state.recent_count = 0;
+    state.recent_bytes = 0;
     return true;
 }
 
@@ -1975,6 +1982,8 @@ void unified_cache_note_planned_hold_spill(int          device_id,
         }
         state.spill_count++;
         state.spill_bytes += bytes;
+        state.recent_count++;
+        state.recent_bytes += bytes;
     }
     // Once per device per context: the owning context's take (at teardown) resets the count.
     if (first) {
@@ -1984,6 +1993,43 @@ void unified_cache_note_planned_hold_spill(int          device_id,
             "ones are counted, not logged (see hold_spills in [SCRATCH-STATS])\n",
             device_id, tag && tag[0] ? tag : "?", bytes / (1024.0 * 1024.0), hold / (1024.0 * 1024.0),
             available / (1024.0 * 1024.0));
+    }
+}
+
+void unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
+        return;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    if (state.owner != owner) {
+        return;
+    }
+    state.request_hwm  = 0;
+    state.recent_count = 0;
+    state.recent_bytes = 0;
+}
+
+void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, uint64_t * count, size_t * bytes) {
+    if (count) {
+        *count = 0;
+    }
+    if (bytes) {
+        *bytes = 0;
+    }
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
+        return;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    if (state.owner != owner) {
+        return;
+    }
+    if (count) {
+        *count = state.recent_count;
+    }
+    if (bytes) {
+        *bytes = state.recent_bytes;
     }
 }
 
