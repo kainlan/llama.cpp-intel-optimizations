@@ -66,6 +66,7 @@ invalidation is checked as the statements between the vbuffer allocation
 call and the return.
 argv: [ggml-backend.cpp [ggml-alloc.c [llama-context.cpp [checkout-root]]]]
 """
+import bisect
 import os
 import re
 import subprocess
@@ -437,6 +438,23 @@ def update_clause_mutants(files):
         "llama-kv-cache.cpp", kv.replace("return updated ? LLAMA_MEMORY_UPDATE_DONE : LLAMA_MEMORY_UPDATE_NONE;", "return LLAMA_MEMORY_UPDATE_DONE;", 1))
 
 
+def update_line_pin_violations(files):
+    """The branch-line fix, pinned: dropping the flag from memory_update's `if (!gf)` branch is reported at that
+    branch's own line, not at the signature's."""
+    ctx = files.get("llama-context.cpp", "")
+    sig = ctx.find("llama_memory_update_result llama_context::memory_update(")
+    at = ctx.find("if (!gf) {", sig) if sig >= 0 else -1
+    if at < 0:
+        return ["no `if (!gf) {` branch found in memory_update"]
+    end = ctx.index("}", at)
+    mutant = ctx[:at] + ctx[at:end].replace("sched_need_reserve = true;", "") + ctx[end:]
+    got = update_clause_violations({**files, "llama-context.cpp": mutant})
+    want = ctx[:at].count("\n") + 1
+    if [(n, l) for n, l, _ in got] != [("llama-context.cpp", want)]:
+        return ["a dropped flag in the `if (!gf)` branch reported %s, expected llama-context.cpp:%d" % (got, want)]
+    return []
+
+
 COMPOSITES = (
     # (class, source file, number of init_reserve( calls its context constructor must make with n_streams, extra tokens)
     ("llama_kv_cache_iswa_context", "llama-kv-cache-iswa.cpp", 2, ()),
@@ -631,15 +649,24 @@ STRICT_NAME_DOCS = (
     "docs/design/sycl-canonical-memory-architecture.md",
 )
 STRICT_CODE_DIRS = ("ggml/", "src/", "common/", "tools/", "tests/")
-STRICT_CODE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".cu", ".cuh", ".m", ".mm")
+STRICT_CODE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".cu", ".cuh", ".m", ".mm", ".inc", ".inl",
+                        ".ipp", ".tpp", ".sycl", ".hip", ".cl")
 STRICT_LEASES = "GGML_SYCL_" + "STRICT_LEASES"
 STRICT_ALLOC = "GGML_SYCL_" + "UNIFIED_ALLOC_STRICT"
 STRICT_HANDLE = "GGML_SYCL_" + "HANDLE_STRICT"
 STRICT_HANDLE_VAR = "g_ggml_sycl_" + "handle_strict"
+# Built with join, not by concatenation: the names clause folds "a" + "b" and "a" "b" before it matches, so a
+# concatenated spelling here would be seen in this very file.
+STRICT_RETIRED = "_".join(("GGML", "SYCL", "STRICT", "PLAN"))
+STRICT_SECOND = "_".join(("GGML", "SYCL", "PLAN", "STRICT"))
 # name -> why it is allowed. The UNIFIED_ALLOC entry carries its retirement ticket.
 STRICT_NAMES_ALLOWED = {
     STRICT_LEASES: "the one abort switch",
     STRICT_ALLOC: "the single exception, until llama.cpp-1obo retires it",
+}
+# Retired names, allowed ONLY in the gate files that assert their absence (after folding string concatenation).
+STRICT_NAMES_RETIRED = {
+    STRICT_RETIRED: ("tests/test-sycl-kv-layer-sizing-source.py",),
 }
 # Excluded by name and not by the allowlist: a diagnostic report switch, not an
 # abort switch (rulings section M41 m-4). Clause 3 holds it to that.
@@ -658,7 +685,8 @@ STRICT_CENSUS = {
 }
 STRICT_ACCESSOR_NAME = "ggml_sycl_strict_enabled"
 STRICT_ACCESSOR_COND = re.compile(r"^(?:::)?(?:ggml_sycl::)?ggml_sycl_strict_enabled\(\s*\)$")
-STRICT_PLAN_BUG = re.compile(r"GGML_ABORT\s*\(\s*\"(\[[A-Z0-9]+(?:-[A-Z0-9]+)*-PLAN-BUG\])")
+STRICT_PLAN_BUG = re.compile(r"(?:GGML_ABORT\s*\(|\bggml_abort\s*\(\s*__FILE__\s*,\s*__LINE__\s*,)\s*"
+                             r"\"(\[[A-Z0-9]+(?:-[A-Z0-9]+)*-PLAN-BUG\])")
 # the aborts of the post-uwlx base; zhcn's own add theirs as they land
 STRICT_ABORT_CENSUS = (
     ("ggml/src/ggml-sycl/mem-handle.cpp", "[CONTEXT-PLAN-BUG] retained-reap backstop", 1),
@@ -698,16 +726,20 @@ def scrub_c(text, keep_strings):
 
 
 _SCRUB_CACHE = {}
+_SCRUB_BYTES = [0]
+_SCRUB_LIMIT = 400 * 1024 * 1024
 
 
 def scrubbed(text, keep_strings):
     key = (hash(text), len(text), keep_strings)
     hit = _SCRUB_CACHE.get(key)
     if hit is None or hit[0] != text:
-        if len(_SCRUB_CACHE) > 24:
+        if _SCRUB_BYTES[0] > _SCRUB_LIMIT:
             _SCRUB_CACHE.clear()
+            _SCRUB_BYTES[0] = 0
         hit = (text, scrub_c(text, keep_strings))
         _SCRUB_CACHE[key] = hit
+        _SCRUB_BYTES[0] += 2 * len(text)
     return hit[1]
 
 
@@ -823,8 +855,12 @@ def controlled_region(s, cond_close):
     return parts
 
 
+LOG_ARG_CALLS_ALLOWED = ("sizeof",)
+
+
 def only_log_calls(region):
-    """True when region, with its GGML_LOG_* calls removed, holds no call, jump or throw."""
+    """True when region holds nothing but GGML_LOG_* calls: with those removed only `;` and space remain, and
+    their arguments hold no assignment, increment, or call (sizeof aside); reading a field or an element is fine."""
     rest = region
     while True:
         m = re.search(r"\bGGML_LOG_[A-Z]+\s*\(", rest)
@@ -833,8 +869,48 @@ def only_log_calls(region):
         end = close_of(rest, m.end() - 1)
         if end < 0:
             return False
+        args = rest[m.end():end]
+        if re.search(r"(?<![=!<>])=(?!=)|\+\+|--|[-+*/%&|^]=|<<=|>>=", args):
+            return False
+        if any(c.group(1) not in LOG_ARG_CALLS_ALLOWED for c in re.finditer(r"([A-Za-z_]\w*)\s*\(", args)):
+            return False
         rest = rest[:m.start()] + rest[end + 1:]
-    return not re.search(r"[A-Za-z_]\w*\s*\(|\b(?:return|throw|goto|break|continue)\b", rest)
+    return re.fullmatch(r"[\s;]*", rest) is not None
+
+
+_ADJ_C = re.compile(r'"\s*"')
+_ADJ_PY = re.compile(r"""(["'])[ \t]*\+[ \t\n]*(["'])|(["'])[ \t]+(["'])""")
+
+
+def fold_literals(text, path):
+    """(folded, orig): text with string-literal concatenation joined, so a name split across literals is seen whole:
+    C/C++ adjacent literals ("a" "b") and, in .py files, "a" + "b" and "a" "b". orig(i) maps an index of the
+    folded text back to the input, for line numbers and span checks."""
+    rxs = []
+    if path.endswith(STRICT_CODE_SUFFIXES):
+        rxs.append(_ADJ_C)
+    elif path.endswith(".py"):
+        rxs.append(_ADJ_PY)
+    if not rxs or '"' not in text and "'" not in text:
+        return text, lambda i: i
+    cuts = []
+    out = []
+    last = 0
+    removed = 0
+    for m in rxs[0].finditer(text):
+        # keep nothing of the closing and opening quotes and what lies between them
+        out.append(text[last:m.start()])
+        removed += m.end() - m.start()
+        cuts.append((m.start() - (removed - (m.end() - m.start())), m.end() - m.start()))
+        last = m.end()
+    out.append(text[last:])
+    folded = "".join(out)
+    starts = [c[0] for c in cuts]
+
+    def orig(i):
+        k = bisect.bisect_right(starts, i)
+        return i + sum(c[1] for c in cuts[:k])
+    return folded, orig
 
 
 def strict_scope(files):
@@ -856,19 +932,30 @@ def function_bodies(code, name):
 
 
 def strict_names_violations(name_files):
-    out = []
+    out = set()
     for name, text in sorted(name_files.items()):
-        if "STRICT" not in text:
+        if "STRICT" not in text and "_STRICT_" not in text and "GGML_SYCL_" not in text:
             continue
-        for m in STRICT_NAME_RX.finditer(text):
-            found = m.group(0)
-            if found in STRICT_NAMES_ALLOWED or found in STRICT_NAMES_NONMEMBER:
-                continue
-            out.append((name, line_of(text, m.start()),
-                        "%s is not the strict switch or one of its two named exceptions" % found))
+        folded, orig = fold_literals(text, name)
+        for body, mapper in ((text, lambda i: i), (folded, orig)):
+            for m in STRICT_NAME_RX.finditer(body):
+                found = m.group(0)
+                line = line_of(text, mapper(m.start()))
+                if found in STRICT_NAMES_ALLOWED or found in STRICT_NAMES_NONMEMBER:
+                    continue
+                if found in STRICT_NAMES_RETIRED:
+                    if name not in STRICT_NAMES_RETIRED[found]:
+                        out.add((name, line, "%s is retired and may be named only in %s" %
+                                 (found, ", ".join(STRICT_NAMES_RETIRED[found]))))
+                    continue
+                out.add((name, line, "%s is not the strict switch or one of its two named exceptions" % found))
+    out = sorted(out)
     for required in STRICT_NAME_DOCS + ("ggml/src/ggml-sycl/ggml-sycl.cpp", "ggml/src/ggml-sycl/unified-cache.cpp"):
         if required not in name_files:
             out.append((required, 0, "the scan did not read this tracked file; the names clause would pass vacuously"))
+    for path in sorted(p for paths in STRICT_NAMES_RETIRED.values() for p in paths):
+        if path not in name_files:
+            out.append((path, 0, "a pinned gate file that may name a retired switch is missing; the list rotted"))
     return out
 
 
@@ -876,7 +963,9 @@ def strict_census_violations(name_files):
     out = []
     for name, where in STRICT_CENSUS.items():
         for path in where:
-            if path in name_files and name not in name_files[path]:
+            if path not in name_files:
+                out.append((path, 0, "census file is missing; %s was last seen here on the post-uwlx base" % name))
+            elif name not in name_files[path]:
                 out.append((path, 0, "%s no longer occurs here; the census was taken on the post-uwlx base" % name))
     for name, why in list(STRICT_NAMES_ALLOWED.items()) + list(STRICT_NAMES_NONMEMBER.items()):
         if not why:
@@ -887,27 +976,29 @@ def strict_census_violations(name_files):
 
 
 def strict_getenv_violations(code_files):
-    """Exactly one getenv of the switch, inside the function ggml_sycl_strict_enabled() resolves to."""
+    """Exactly one getenv of the switch, inside the function ggml_sycl_strict_enabled() resolves to. String
+    literals are folded first, so getenv("GGML_SYCL_" "STRICT_LEASES") is seen as the read it is."""
     out = []
     calls = []
     literal_starts = set()
     for name, text in sorted(code_files.items()):
-        if STRICT_LEASES not in text:
+        if "STRICT" not in text:
             continue
-        code = scrubbed(text, True)
-        for m in re.finditer(r"getenv\s*\(\s*(\"" + STRICT_LEASES + r"\")", code):
-            calls.append((name, m.start()))
+        folded, orig = fold_literals(scrubbed(text, True), name)
+        for m in re.finditer(r"getenv\s*\(\s*(\"" + STRICT_LEASES + r"\")", folded):
+            calls.append((name, orig(m.start())))
             literal_starts.add((name, m.start(1)))
     if len(calls) != 1:
         out.append(("tree", 0, "found %d getenv of the strict switch, expected exactly 1: %s" %
                     (len(calls), ["%s:%d" % (n, line_of(code_files[n], p)) for n, p in calls])))
     # a second reader that does not spell getenv: the quoted name held in a variable. Tests may set and unset it.
     for name, text in sorted(code_files.items()):
-        if "/tests/" in name or name.startswith("tests/") or STRICT_LEASES not in text:
+        if "/tests/" in name or name.startswith("tests/") or "STRICT" not in text:
             continue
-        for m in re.finditer(r"\"" + STRICT_LEASES + r"\"", scrubbed(text, True)):
+        folded, orig = fold_literals(scrubbed(text, True), name)
+        for m in re.finditer(r"\"" + STRICT_LEASES + r"\"", folded):
             if (name, m.start()) not in literal_starts:
-                out.append((name, line_of(text, m.start()), "the quoted strict switch name appears outside its one reader"))
+                out.append((name, line_of(text, orig(m.start())), "the quoted strict switch name appears outside its one reader"))
     exports = []
     for name, text in sorted(code_files.items()):
         if STRICT_ACCESSOR_NAME not in text:
@@ -969,6 +1060,20 @@ def strict_handle_violations(code_files):
                 kind = "read"
                 reads += 1
             seen[(name, kind)] = seen.get((name, kind), 0) + 1
+    # the env-var name itself is read nowhere: its one quoted use in non-test code is the env-table entry
+    quoted = 0
+    for name, text in sorted(code_files.items()):
+        if "/tests/" in name or name.startswith("tests/") or STRICT_HANDLE not in text:
+            continue
+        folded, orig = fold_literals(scrubbed(text, True), name)
+        for m in re.finditer(r"\"" + STRICT_HANDLE + r"\"", folded):
+            quoted += 1
+            row = folded[folded.rfind("\n", 0, m.start()) + 1:m.start()]
+            if name != "ggml/src/ggml-sycl/ggml-sycl.cpp" or not re.fullmatch(r"\s*\{\s*", row):
+                out.append((name, line_of(text, orig(m.start())), "the quoted %s is used other than as the env-table entry"
+                            % STRICT_HANDLE))
+    if quoted < 1:
+        out.append(("tree", 0, "no env-table entry for %s found; the clause would pass vacuously" % STRICT_HANDLE))
     for key in sorted(set(seen) | set(STRICT_HANDLE_SITES)):
         if seen.get(key, 0) != STRICT_HANDLE_SITES.get(key, 0):
             out.append((key[0], 0, "%s: %d %s site(s), the closed set has %d" %
@@ -987,18 +1092,18 @@ def strict_accessor_violations(code_files):
     for name, text in sorted(code_files.items()):
         if "PLAN-BUG" not in text and STRICT_ACCESSOR_NAME not in text:
             continue
-        keep = scrubbed(text, True)
+        # folded, so a tag split across adjacent literals is read whole; pos maps back into `code`
+        folded, orig = fold_literals(scrubbed(text, True), name)
         code = scrubbed(text, False)
-        for m in re.finditer(r"(\w+)\s*\(\s*\)\s*\{\s*return\s+(?:::)?(?:ggml_sycl::)?"
-                             + STRICT_ACCESSOR_NAME + r"\s*\(\s*\)\s*;\s*\}", code):
+        for m in re.finditer(r"(\w+)\s*\(\s*(?:void)?\s*\)\s*(?:const\s*)?(?:noexcept\s*)?(?:->\s*\w+\s*)?\{\s*return\s+"
+                             r"(?:::)?(?:ggml_sycl::)?" + STRICT_ACCESSOR_NAME + r"\s*\(\s*(?:void)?\s*\)\s*;\s*\}", code):
             out.append((name, line_of(text, m.start()), "%s only returns %s(): a second name for one fact"
                         % (m.group(1), STRICT_ACCESSOR_NAME)))
-        for m in STRICT_PLAN_BUG.finditer(keep):
+        for m in STRICT_PLAN_BUG.finditer(folded):
             total += 1
-            pos = m.start()
+            pos = orig(m.start())
             line = line_of(text, pos)
-            literal = re.match(r"GGML_ABORT\s*\(\s*((?:\"(?:\\.|[^\"\\])*\"\s*)+)", keep[pos:pos + 600])
-            message = "".join(re.findall(r"\"((?:\\.|[^\"\\])*)\"", literal.group(1))) if literal else m.group(1)
+            message = re.match(r"((?:\\.|[^\"\\])*)\"", folded[m.start(1):]).group(1)
             for want_file, want_text, _ in STRICT_ABORT_CENSUS:
                 if want_file == name and message.startswith(want_text):
                     found[(want_file, want_text)] = found.get((want_file, want_text), 0) + 1
@@ -1023,7 +1128,9 @@ def strict_accessor_violations(code_files):
     if total < 1:
         out.append(("tree", 0, "no [<FAMILY>-PLAN-BUG] abort found; the clause would pass vacuously"))
     for want_file, want_text, count in STRICT_ABORT_CENSUS:
-        if want_file in code_files and found.get((want_file, want_text), 0) != count:
+        if want_file not in code_files:
+            out.append((want_file, 0, "census file is missing; it held the abort tagged `%s`" % want_text))
+        elif found.get((want_file, want_text), 0) != count:
             out.append((want_file, 0, "expected %d abort(s) tagged `%s`, found %d"
                         % (count, want_text, found.get((want_file, want_text), 0))))
     return out
@@ -1038,7 +1145,8 @@ def strict_violations(files):
 
 
 def tracked_files(root):
-    """{path: text} of every tracked file in gate 22's scope, via git ls-files; None when git cannot list them."""
+    """{path: text} of every tracked file in gate 22's scope, via git ls-files; None when git cannot list them
+    (an environment failure: main() fails the gate rather than skipping it)."""
     try:
         listing = subprocess.run(["git", "-C", root, "ls-files", "-z"], check=True, capture_output=True).stdout
     except (OSError, subprocess.CalledProcessError):
@@ -1054,8 +1162,6 @@ def tracked_files(root):
     return out
 
 
-STRICT_RETIRED = "GGML_SYCL_" + "STRICT_PLAN"
-STRICT_SECOND = "GGML_SYCL_" + "PLAN_STRICT"
 _GS = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 _UC = "ggml/src/ggml-sycl/unified-cache.cpp"
 _MH = "ggml/src/ggml-sycl/mem-handle.cpp"
@@ -1078,7 +1184,7 @@ def strict_mutants(files):
     wrapper = "static bool strict_plan_checks_enabled() { return ggml_sycl_strict_enabled(); }\n\n"
     handle_if = "        if (!installed_source_handle) {"
     yield ("planted retired switch in ggml-sycl.cpp", append(_GS, 'static const char * g_retired = "%s";' % STRICT_RETIRED),
-           "is not the strict switch")
+           "is retired and may be named only in")
     yield ("planted second switch in a test", append("tests/test-sycl-env-report.cpp", "// reads %s" % STRICT_SECOND),
            "is not the strict switch")
     yield ("planted second switch in a script", append("scripts/sycl-build.sh", "# export %s=1" % STRICT_SECOND),
@@ -1160,6 +1266,58 @@ def strict_mutants(files):
     yield ("the switch dropped from a user-facing doc",
            {**files, "docs/backend/sycl-memory-design.md": files["docs/backend/sycl-memory-design.md"].replace(STRICT_LEASES, "X")},
            "no longer occurs here")
+    # a name assembled from adjacent or added literals is read whole (M-1)
+    foo = "_".join(("STRICT", "FOO"))
+    yield ("a second switch split across adjacent C literals",
+           append(_GS, 'static const char * k = "GGML_SYCL_" "%s";' % foo), "is not the strict switch")
+    yield ("a second switch split across added Python literals",
+           append("tests/test-sycl-kv-layer-sizing-source.py", 'ODD = "GGML_SYCL_" + "%s"' % foo), "is not the strict switch")
+    yield ("the retired switch assembled in a file that is not pinned",
+           append("tests/test-sycl-env-report.cpp", 'static const char * k = "GGML_SYCL_" "%s";' % STRICT_RETIRED[len("GGML_SYCL_"):]),
+           "is retired and may be named only in")
+    yield ("a second getenv of the real switch split across literals",
+           append(_MH, 'static bool second() { return getenv("GGML_SYCL_" "%s") != nullptr; }' % STRICT_LEASES[len("GGML_SYCL_"):]),
+           "found 2 getenv")
+    yield ("a second getenv in a file with an unusual suffix",
+           {**files, "ggml/src/ggml-sycl/second.inl": 'static bool s() { return getenv("%s") != nullptr; }\n' % STRICT_LEASES},
+           "found 2 getenv")
+    # the non-member's existing read blocks hold log calls and nothing else (M-2)
+    log_at = '                        GGML_LOG_WARN(\n                            "[SYCL] extra data_handle/raw pointer mismatch'
+    yield ("an assignment beside the log in a non-member read",
+           edit(_CH, log_at, "                        stale_flag = 1;\n" + log_at, "assignment beside log"),
+           "gates something other than GGML_LOG_*")
+    yield ("an assignment hidden in the log arguments of a non-member read",
+           edit(_CH, "dev, resolved.ptr, data_device[dev]);", "dev, resolved.ptr, data_device[dev] = nullptr);", "assignment in args"),
+           "gates something other than GGML_LOG_*")
+    yield ("a call hidden in the log arguments of a non-member read",
+           edit(_CH, "dev, resolved.ptr, data_device[dev]);", "dev, resolved.ptr, data_device_of(dev));", "call in args"),
+           "gates something other than GGML_LOG_*")
+    yield ("an increment hidden in the log arguments of a non-member read",
+           edit(_CH, "dev, resolved.ptr, data_device[dev]);", "dev++, resolved.ptr, data_device[dev]);", "increment in args"),
+           "gates something other than GGML_LOG_*")
+    yield ("the non-member's env var read directly",
+           append(_MH, 'static bool h() { return getenv("%s") != nullptr; }' % STRICT_HANDLE),
+           "used other than as the env-table entry")
+    # a census file that is gone is a failure, not a skip (M-3)
+    yield ("a census test file renamed away",
+           {k: v for k, v in files.items() if k != "ggml/src/ggml-sycl/tests/test-unified-runtime-alloc.cpp"},
+           "census file is missing")
+    yield ("the file that holds two census aborts renamed away",
+           {k: v for k, v in files.items() if k != _MH}, "census file is missing")
+    yield ("the pinned retired-name gate file renamed away",
+           {k: v for k, v in files.items() if k != "tests/test-sycl-kv-layer-sizing-source.py"}, "the list rotted")
+    # wrapper and tag spellings (N-2, N-3)
+    yield ("a wrapper spelled with void, noexcept and a trailing return",
+           append(_MH, "static auto strict_wrap( void ) noexcept -> bool { return ggml_sycl_strict_enabled( ); }"),
+           "second name for one fact")
+    yield ("a plan-bug tag split across adjacent literals under the wrong condition",
+           append("src/llama-context.cpp",
+                  'static void bug() { if (ggml_sycl::unified_alloc_strict_mode()) { GGML_ABORT("[CONTEXT-" "PLAN-BUG] z"); } }'),
+           "not a direct statement")
+    yield ("a plan-bug tag aborted through ggml_abort under the wrong condition",
+           append("src/llama-context.cpp",
+                  'static void bug() { if (ggml_sycl::unified_alloc_strict_mode()) { ggml_abort(__FILE__, __LINE__, "[CONTEXT-PLAN-BUG] z"); } }'),
+           "not a direct statement")
     # positive controls: legitimate shapes the clauses must not refuse
     folded = edit(_UC, "static bool strict_lease_checks_enabled() {\n    static const bool enabled = [] {\n"
                        "        const char * env = std::getenv(\"%s\");\n        return env != nullptr && std::atoi(env) != 0;\n"
@@ -1171,6 +1329,8 @@ def strict_mutants(files):
     yield ("positive control: an unbraced plan-bug abort on the accessor",
            append("src/llama-context.cpp", "static void ok() { if (ggml_sycl_strict_enabled()) GGML_ABORT(\"[CONTEXT-PLAN-BUG] z\"); }"),
            None)
+    yield ("positive control: the retired name in the pinned gate file",
+           append("tests/test-sycl-kv-layer-sizing-source.py", "# the retired switch %s is gone" % STRICT_RETIRED), None)
     yield ("positive control: a qualified accessor call",
            append("src/llama-context.cpp", "static void ok() { if (::ggml_sycl_strict_enabled()) { GGML_ABORT(\"[CONTEXT-PLAN-BUG] z\"); } }"),
            None)
@@ -1236,6 +1396,10 @@ def main():
             print("FAIL: gate 28: mutant went undetected: %s" % name)
             status = 1
 
+    for why in update_line_pin_violations(src_files):
+        print("FAIL: gate 15: %s" % why)
+        status = 1
+
     for tag, check, mutants in (("15", update_clause_violations, update_clause_mutants),
                                 ("24", reserve_clause_violations, reserve_clause_mutants)):
         bad = check(src_files)
@@ -1254,12 +1418,16 @@ def main():
                 status = 1
         mutant_counts[tag] = len(built)
 
+    if tracked_files(os.path.join(REPO, "no-such-checkout")) is not None:
+        print("FAIL: gate 22: tracked_files did not report a directory git cannot list")
+        status = 1
     strict_root = sys.argv[4] if len(sys.argv) > 4 else REPO
     tracked = tracked_files(strict_root)
     strict_counts = None
     if tracked is None:
-        print("SKIP: gate 22: git cannot list the tracked files under %s; this run proves nothing about the strict "
-              "switch" % strict_root)
+        print("FAIL: gate 22: git cannot list the tracked files under %s; a source gate fails closed, so this run "
+              "proves nothing and is not a skip" % strict_root)
+        status = 1
     else:
         bad = strict_violations(tracked)
         for name, line_no, why in bad:
@@ -1267,7 +1435,7 @@ def main():
             status = 1
         if not bad:
             built = list(strict_mutants(tracked))
-            if sum(1 for _, _, frag in built if frag is not None) < 25:
+            if sum(1 for _, _, frag in built if frag is not None) < 45:
                 print("FAIL: gate 22: only %d mutants could be built" % len(built))
                 status = 1
             for name, m, frag in built:
@@ -1280,8 +1448,6 @@ def main():
                     status = 1
             strict_counts = (sum(1 for _, _, f in built if f is not None), sum(1 for _, _, f in built if f is None))
 
-    if status == 0 and tracked is None:
-        return 77
     if status == 0:
         print("PASS: %d scheduler reserve calls are tested and return false (%d mutants caught); "
               "%d reserve_n_impl failure return(s) invalidate the layout first (%d mutants caught); "
