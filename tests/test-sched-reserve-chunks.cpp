@@ -345,8 +345,21 @@ int main() {
         ggml_backend_sched_t       sched2       = ggml_backend_sched_new(backends2, bufts2, 2, 64, false, false);
         CHECK(sched2 != nullptr, "setup: the second two-backend scheduler must be created");
 
-        size_t n_requests_a = 0;
-        size_t n_requests_b = 0;
+        size_t              n_requests_a = 0;
+        size_t              n_requests_b = 0;
+        // Negative control: the same requests against a cap of half the planned one must be refused, so
+        // the comparison below can fail.
+        std::vector<size_t> low_a        = cap_a;
+        std::vector<size_t> low_b        = cap_b;
+        for (size_t & c : low_a) {
+            c /= 2;
+        }
+        for (size_t & c : low_b) {
+            c /= 2;
+        }
+        bool low_refused_a = false;
+        bool low_refused_b = false;
+        bool first_shape   = true;
         for (const auto & s : shapes) {
             test_graph g;
             build(sched2, a2.get(), b2.get(), s[0], s[1], &g);
@@ -356,13 +369,44 @@ int main() {
             int bad = -1;
             CHECK(requests_fit(a2->requests, cap_a, &bad), "case 3: backend a's request exceeded its chunk's cap");
             CHECK(requests_fit(b2->requests, cap_b, &bad), "case 3: backend b's request exceeded its chunk's cap");
+            if (first_shape) {
+                CHECK(!a2->requests.empty() && !b2->requests.empty(),
+                      "case 3: the first reserve on a fresh scheduler must ask both buffer types for memory");
+                first_shape = false;
+            }
+            low_refused_a = low_refused_a || !requests_fit(a2->requests, low_a, &bad);
+            low_refused_b = low_refused_b || !requests_fit(b2->requests, low_b, &bad);
             n_requests_a += a2->requests.size();
             n_requests_b += b2->requests.size();
         }
+        CHECK(low_refused_a && low_refused_b, "case 3 control: a cap of half the planned one must refuse the requests");
         CHECK(n_requests_a > 0 && n_requests_b > 0,
               "case 3: the second pass must have asked both buffer types for memory");
 
         ggml_backend_sched_free(sched2);
+    }
+
+    // ---- two scheduler slots on one buffer type share one allocator and report one layout ----
+    {
+        auto a = dummy_sched_backend::make(/*max_buffer_size=*/64);
+
+        ggml_backend               second      = a->backend;  // same device and buffer type, a second slot
+        ggml_backend_t             backends[2] = { &a->backend, &second };
+        ggml_backend_buffer_type_t bufts[2]    = { &a->buffer_type, &a->buffer_type };
+        ggml_backend_sched_t       sched       = ggml_backend_sched_new(backends, bufts, 2, 64, false, false);
+        CHECK(sched != nullptr, "setup: the shared-buffer-type scheduler must be created");
+
+        test_graph g = make_graph({ 8, 8, 8, 40 });
+        size_t     sizes[2];
+        ggml_backend_sched_reserve_size(sched, g.graph, sizes);
+        layout first, other;
+        CHECK(read_layout(sched, &a->backend, &first) && read_layout(sched, &second, &other),
+              "case 4: both layouts must be readable");
+        CHECK(first.peaks.size() == 2, "case 4: the graph uses two chunks");
+        CHECK(first.peaks == other.peaks && first.max_chunk_size == other.max_chunk_size,
+              "case 4: two slots on one buffer type must report the same layout");
+
+        ggml_backend_sched_free(sched);
     }
 
     std::printf("PASS\n");

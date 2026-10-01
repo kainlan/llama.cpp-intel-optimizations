@@ -75,6 +75,8 @@ GGML_API bool ggml_gallocr_reserve_n(
 // Before any reserve, and after a reserve whose buffer allocation failed, there is no layout: it returns 0 and
 // still writes *max_chunk_size_out. Two buffer ids of the same buffer type share one allocator and report the same
 // layout, so a caller summing over buffer ids must count each buffer type once.
+// After a failed reserve the query returns 0 chunks for every buffer id, including ids whose buffers are live
+// and sized; ggml_gallocr_get_buffer_size still reports those.
 GGML_API int ggml_gallocr_get_chunk_peaks(
     ggml_gallocr_t galloc,
     int buffer_id,

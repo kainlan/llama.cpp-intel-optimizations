@@ -18,7 +18,8 @@ the reset, the peak query reports a layout no buffer backs.
 Both gates prove themselves on mutants of the real source (the gate must fail
 on each) and refuse to pass vacuously. Limits, deliberately: the walk is
 textual, so a reserve reached through a wrapper is not seen, and the
-invalidation is checked as the statements between the vbuffer allocation call and the return.
+invalidation is checked as the statements between the vbuffer allocation
+call and the return.
 argv: [ggml-backend.cpp [ggml-alloc.c]]
 """
 import os
