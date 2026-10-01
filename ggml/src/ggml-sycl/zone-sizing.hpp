@@ -325,6 +325,24 @@ bool zone_hold_spill_realized_fits(size_t free_after, size_t headroom_target, si
 // request term is a heuristic (it is what a previous rung asked), a lower bound before any rung has reserved.
 size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_ubatch, uint32_t n_ubatch);
 
+// The part of a worst-case spill (zone_hold_spill_bound) that lands OUTSIDE the arena. A compute buffer the RUNTIME
+// zone will not serve is placed in the arena's KV zone first (zone_runtime_spill_prefers_kv_zone), so only what the
+// KV zone cannot take is raw device memory, the thing that eats the driver headroom. `kv_zone_free` is the KV
+// zone's free bytes now; it is an estimate (other buffers may take it before the spill does), which is why the
+// realized check stays the backstop.
+size_t zone_hold_spill_raw_demand(size_t spill_bound, size_t kv_zone_free);
+
+// Whether a RUNTIME-zone request goes to the KV zone instead of the zone / raw device memory: only a request the
+// caller marked as a compute buffer (`compute_spill_flag`), spill-capable (not `forbid_spill`), that the RUNTIME zone
+// will not serve (`zone_misses`: held back by the hold, or larger than the zone's free bytes), and only when the KV
+// zone can hold it whole. Any other request class keeps the pre-existing path unchanged.
+bool zone_runtime_spill_prefers_kv_zone(bool   compute_spill_flag,
+                                        bool   runtime_zone,
+                                        bool   forbid_spill,
+                                        bool   zone_misses,
+                                        size_t kv_zone_free,
+                                        size_t alloc_size);
+
 // Whether a multi-row MUL_MAT draws a given planned scratch (the Q8_1 src1 buffer, the f16 dequant buffers),
 // from the two answers the dispatch can give. `primary_*` is the router's first decision; when it picks the
 // unified kernel the dispatch can still decline at run time and re-select a legacy kernel, which is

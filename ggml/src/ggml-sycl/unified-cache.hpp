@@ -1701,22 +1701,33 @@ bool     unified_cache_release_planned_scratch_hold(int device_id, uint64_t owne
 // `bytes` when `record` (a spill-capable request) and returns the hold the caller decides with.
 size_t       unified_cache_note_runtime_request(int device_id, size_t bytes, bool record);
 void         unified_cache_get_runtime_request_hwm(int device_id, size_t * bytes, uint32_t * n_ubatch);
-// A spill-capable RUNTIME request that the hold kept out of the zone (it spills exactly as it would if the zone
-// were full). Counted per device, and the first one since the last take is a WARN naming the requester `tag` and
-// the bytes: a hold-induced spill was silent. The owning context takes (and so resets) the count at teardown and
-// reports it with its [SCRATCH-STATS] lines; a take by any other context leaves the count alone.
-void     unified_cache_note_planned_hold_spill(int          device_id,
-                                               const char * tag,
-                                               size_t       bytes,
-                                               size_t       hold,
-                                               size_t       available);
-void     unified_cache_take_planned_hold_spills(int device_id, uint64_t owner, uint64_t * count, size_t * bytes);
+// A spill-capable RUNTIME request that the hold kept out of the zone, counted per device by where the buffer landed:
+// `in_arena` is a placement in the arena's KV zone (the compute-buffer path tries it first), otherwise raw device
+// memory outside the arena, which is what eats the driver headroom. The first one of each kind since the last take
+// is a WARN naming the requester `tag` and the bytes: a hold-induced spill was silent. The owning context takes
+// (and so resets) the counts at teardown and reports them with its [SCRATCH-STATS] lines; a take by any other
+// context leaves them alone.
+void         unified_cache_note_planned_hold_spill(int          device_id,
+                                                   const char * tag,
+                                                   size_t       bytes,
+                                                   size_t       hold,
+                                                   size_t       available,
+                                                   bool         in_arena);
+
+struct planned_hold_spill_totals {
+    uint64_t raw_count   = 0;  // outside the arena
+    size_t   raw_bytes   = 0;
+    uint64_t arena_count = 0;  // in the arena's KV zone
+    size_t   arena_bytes = 0;
+};
+
+void         unified_cache_take_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out);
 // A publish starts a new epoch for the owner at `n_ubatch`: the hold spills and the largest request seen since the
 // previous publish are forgotten (teardown's counters are not). The runtime-context transaction calls this when it publishes,
 // so what the get below reports is what THIS plan's own reserve did: a losing auto-ubatch rung's spills do not
 // decide the next rung. A call by anyone but the hold's owner changes nothing.
 void         unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner, uint32_t n_ubatch);
-void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, uint64_t * count, size_t * bytes);
+void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out);
 
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
 // The primitive-API weights+activations pair's own planned requirement,
@@ -5812,6 +5823,13 @@ struct alloc_constraints {
     // crashed mid-prefill with UR_RESULT_ERROR_OUT_OF_RESOURCES instead of
     // refusing at context init.
     bool         forbid_vram_zone_spill     = false;
+    // llama.cpp-kpjw: a compute buffer (the scheduler's backend buffers) that the RUNTIME zone will not serve --
+    // held back by the planned dense scratch's hold, or larger than the zone's free bytes -- is placed in the arena's
+    // KV zone first, and falls to raw device memory outside the arena only when that has no room. Raw spill eats the
+    // driver headroom the arena expects the card to keep outside itself; the KV zone is the in-arena home for the
+    // request class (it was the caller's own fallback, reached only when the allocator refused outright). Set by
+    // the buffer allocator alone; every other request class keeps the pre-existing spill path.
+    bool         spill_to_kv_zone_before_raw = false;
 };
 
 struct alloc_intent {

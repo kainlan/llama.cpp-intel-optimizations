@@ -403,6 +403,19 @@ size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_uba
     return request > SIZE_MAX - plan ? SIZE_MAX : plan + request;
 }
 
+size_t zone_hold_spill_raw_demand(size_t spill_bound, size_t kv_zone_free) {
+    return spill_bound > kv_zone_free ? spill_bound - kv_zone_free : 0;
+}
+
+bool zone_runtime_spill_prefers_kv_zone(bool   compute_spill_flag,
+                                        bool   runtime_zone,
+                                        bool   forbid_spill,
+                                        bool   zone_misses,
+                                        size_t kv_zone_free,
+                                        size_t alloc_size) {
+    return compute_spill_flag && runtime_zone && !forbid_spill && zone_misses && alloc_size <= kv_zone_free;
+}
+
 bool zone_runtime_alloc_held_back(bool   runtime_zone,
                                   bool   forbid_spill,
                                   size_t zone_available,

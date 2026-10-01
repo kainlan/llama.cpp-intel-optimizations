@@ -17238,7 +17238,13 @@ static size_t ggml_sycl_planned_scratch_hold_spill_bound(int device, uint32_t n_
     size_t   r_max    = 0;
     uint32_t r_max_ub = 0;
     ggml_sycl::unified_cache_get_runtime_request_hwm(device, &r_max, &r_max_ub);
-    return ggml_sycl::zone_hold_spill_bound(plan, r_max, r_max_ub, n_ubatch);
+    const size_t               bound = ggml_sycl::zone_hold_spill_bound(plan, r_max, r_max_ub, n_ubatch);
+    // A compute buffer the RUNTIME zone will not serve is placed in the arena's KV zone first, so only what that
+    // zone cannot take is outside-arena demand. Its free bytes now are an estimate (other buffers may take them
+    // first); the realized check, which counts the RAW spills a rung actually made, is the backstop.
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    const size_t kv_free = cache && cache->arena_active() ? cache->zone_available(ggml_sycl::vram_zone_id::KV) : 0;
+    return ggml_sycl::zone_hold_spill_raw_demand(bound, kv_free);
 }
 
 // llama.cpp-kpjw: the driver headroom the arena expects the card to keep OUTSIDE it (and that the graph-entry check
@@ -17291,9 +17297,12 @@ static bool ggml_sycl_check_hold_spill_headroom(int device, size_t spill_bytes, 
 // resources), so the rung does not fit and the ladder lands on a smaller one. Only a spill that CROSSED the
 // headroom is blamed on the hold (zone_hold_spill_realized_fits); with no hold-induced spill nothing is asked.
 static bool ggml_sycl_check_hold_spill_realized(int device, uint64_t owner, bool probe_mode) {
-    uint64_t spills      = 0;
-    size_t   spill_bytes = 0;
-    ggml_sycl::unified_cache_get_recent_planned_hold_spills(device, owner, &spills, &spill_bytes);
+    // Only the RAW spills (outside the arena) eat the driver headroom; a buffer placed in the arena's KV zone does
+    // not, and is not counted here.
+    ggml_sycl::planned_hold_spill_totals spill_totals;
+    ggml_sycl::unified_cache_get_recent_planned_hold_spills(device, owner, &spill_totals);
+    const uint64_t spills      = spill_totals.raw_count;
+    const size_t   spill_bytes = spill_totals.raw_bytes;
     if (spill_bytes == 0) {
         return true;
     }
@@ -38020,6 +38029,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 runtime_req.intent.cohort_id                    = "backend-buffer-runtime-zone";
                 runtime_req.intent.constraints.must_device      = true;
                 runtime_req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
+                // llama.cpp-kpjw: a compute buffer the RUNTIME zone will not serve goes to the arena's KV zone
+                // before raw device memory outside the arena (see alloc_constraints::spill_to_kv_zone_before_raw).
+                runtime_req.intent.constraints.spill_to_kv_zone_before_raw = true;
                 ggml_sycl::alloc_handle runtime_h{};
                 ggml_sycl::unified_alloc(runtime_req, &runtime_h);
                 if (runtime_h.ptr) {
@@ -44349,12 +44361,16 @@ void ggml_backend_sycl_context::log_planned_scratch_stats() {
         }
         // Spill-capable RUNTIME requests the hold kept out of the zone (compute buffers spilling outside the arena
         // so the planned scratch could still be materialized). Taken here, so the count is per context.
-        uint64_t hold_spills      = 0;
-        size_t   hold_spill_bytes = 0;
-        ggml_sycl::unified_cache_take_planned_hold_spills(dev, planned_scratch_owner, &hold_spills, &hold_spill_bytes);
-        if (hold_spills != 0) {
-            GGML_LOG_WARN("[SCRATCH-STATS] device=%d hold_spills=%llu hold_spill_bytes=%.1f KB\n", dev,
-                          (unsigned long long) hold_spills, hold_spill_bytes / 1024.0);
+        ggml_sycl::planned_hold_spill_totals hold_spills;
+        ggml_sycl::unified_cache_take_planned_hold_spills(dev, planned_scratch_owner, &hold_spills);
+        if (hold_spills.raw_count != 0 || hold_spills.arena_count != 0) {
+            // Split by where the buffer landed: RAW is outside the arena (eats the driver headroom), KV zone is
+            // inside it.
+            GGML_LOG_WARN(
+                "[SCRATCH-STATS] device=%d hold_spills_raw=%llu hold_spills_raw_bytes=%.1f KB hold_spills_kv_zone=%llu "
+                "hold_spills_kv_zone_bytes=%.1f KB\n",
+                dev, (unsigned long long) hold_spills.raw_count, hold_spills.raw_bytes / 1024.0,
+                (unsigned long long) hold_spills.arena_count, hold_spills.arena_bytes / 1024.0);
         }
     }
 }

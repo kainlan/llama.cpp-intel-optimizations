@@ -512,7 +512,7 @@ def evaluate(backend, common, cache, zone):
     results["the warning names the requester and the bytes"] = \
         "tag" in note_spill_fn and re.search(r"GGML_LOG_WARN\([^;]*%\.1f MB", note_spill_fn) is not None
     results["teardown reports the hold spills with the scratch stats"] = \
-        "unified_cache_take_planned_hold_spills(" in stats_fn and "hold_spills=" in stats_fn
+        "unified_cache_take_planned_hold_spills(" in stats_fn and "hold_spills_raw=" in stats_fn
     evict_at = unified_alloc_fn.find("evict_and_flush(")
     results["the overcommit guard refuses a hold-induced spill instead of evicting weights"] = \
         0 <= unified_alloc_fn.find("hold_spill") < evict_at and \
@@ -691,8 +691,8 @@ def evaluate(backend, common, cache, zone):
         0 <= pred_at < kv_at < guard_at < raw_at and "spill_to_kv_zone_before_raw" in ua and \
         re.search(r"zone_runtime_spill_prefers_kv_zone\([^;]*zone_available\(\s*vram_zone_id::KV\s*\)", ua) is not None
     results["a placement in the KV zone is skipped by the guard and the zone routing, and counts as an in-arena hold spill"] = \
-        re.search(r"unified_cache_note_planned_hold_spill\([^;]*/\*in_arena=\*/\s*true", ua) is not None and \
-        re.search(r"unified_cache_note_planned_hold_spill\([^;]*/\*in_arena=\*/\s*false", ua) is not None and \
+        re.search(r"unified_cache_note_planned_hold_spill\([^;]*,\s*true\s*\)\s*;", ua) is not None and \
+        re.search(r"unified_cache_note_planned_hold_spill\([^;]*,\s*false\s*\)\s*;", ua) is not None and \
         len(re.findall(r"!\s*kv_placed", ua)) >= 2 and "kv_placed" in ua
     kv_flag_site = backend.find('"backend-buffer-runtime-zone"')
     results["the runtime buffer allocator asks for the KV-zone-first placement"] = \
@@ -1003,20 +1003,20 @@ if args.self_test:
          (mutate_in_func(backend, r"static void ggml_sycl_planned_scratch_hold_refresh\(",
                          "hold, ctx.planned_scratch_owner)", "hold, 0)"), common, cache, zone)),
         ("hold spill not counted", "a held-back request is counted and warned about",
-         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
-                                          "unified_cache_note_planned_hold_spill(", "unified_cache_XXXX("), zone)),
+         (backend, common, mutate_all_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
+                                              "unified_cache_note_planned_hold_spill(", "unified_cache_XXXX(", 2), zone)),
         ("hold spill warned every time", "the warning is once per device per context (the take resets the count)",
          (backend, common, mutate_in_func(cache, r"void unified_cache_note_planned_hold_spill\(",
                                           "spill_count == 0;", "spill_count >= 0;"), zone)),
         ("take does not reset", "the warning is once per device per context (the take resets the count)",
          (backend, common, mutate_in_func(cache, r"void unified_cache_take_planned_hold_spills\(",
-                                          "state.spill_count = 0;", "state.spill_count += 0;"), zone)),
+                                          "state.spill_count       = 0;", "state.spill_count       += 0;"), zone)),
         ("stats omit the hold spills", "teardown reports the hold spills with the scratch stats",
          (mutate_in_func(backend, r"void ggml_backend_sycl_context::log_planned_scratch_stats\(\)",
-                         "hold_spills=", "hold_XXXX="), common, cache, zone)),
+                         "hold_spills_raw=", "hold_XXXX="), common, cache, zone)),
         ("guard evicts weights for a hold spill", "the overcommit guard refuses a hold-induced spill instead of evicting weights",
-         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
-                                          "if (hold_spill) {", "if (false) {"), zone)),
+         (backend, common, mutate_after(cache, "used_vram + alloc_size > total_vram) {",
+                                        "if (hold_spill) {", "if (false) {"), zone)),
         ("held-back request never spills", "the held-back request still takes the ordinary spill path",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
                                           "if (!hold_spill) {", "if (true) {"), zone)),
@@ -1117,8 +1117,8 @@ if args.self_test:
                          "ggml_sycl_planned_scratch_hold_refresh(ctx);\n#    else", "(void) ctx;\n#    else"),
           common, cache, zone)),
         ("guard refuses every spill", "the overcommit guard refuses only a hold-induced spill",
-         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
-                                          "if (hold_spill) {", "if (true) {"), zone)),
+         (backend, common, mutate_after(cache, "used_vram + alloc_size > total_vram) {",
+                                        "if (hold_spill) {", "if (true) {"), zone)),
         ("realized check moved back into the recheck",
          "the recheck no longer claims the realized spill (it runs before the rung's worst-case reserves)",
          (mutate_in_func(backend, r"ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn\(",
@@ -1144,6 +1144,34 @@ if args.self_test:
         ("graph-entry check keeps its own 256", "the driver headroom the realized check uses is the graph-entry check's constant (one source)",
          (mutate_in_func(backend, r"static void ggml_sycl_check_graph_scratch_headroom\(",
                          "= kSyclArenaMinExternalHeadroomBytes;", "= 256ull * 1024ull * 1024ull;"), common, cache, zone)),
+        # r3 design change: the KV zone before raw memory
+        ("compute buffer goes raw before the KV zone", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the overcommit guard and raw memory",
+         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "kv_cache->zone_alloc(vram_zone_id::KV,",
+                                          "kv_cache->zone_alloc(vram_zone_id::SCRATCH,"), zone)),
+        ("KV placement not asked for", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the overcommit guard and raw memory",
+         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "zone_runtime_spill_prefers_kv_zone(",
+                                          "zone_runtime_XXXX("), zone)),
+        ("KV placement ignores the KV room", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the overcommit guard and raw memory",
+         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "kv_cache->zone_available(vram_zone_id::KV), alloc_size)",
+                                          "alloc_size, alloc_size)"), zone)),
+        ("guard runs for a KV placement", "a placement in the KV zone is skipped by the guard and the zone routing, and counts as an in-arena hold spill",
+         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "if (!kv_placed && req.device >= 0", "if (req.device >= 0"), zone)),
+        ("zone routing runs for a KV placement", "a placement in the KV zone is skipped by the guard and the zone routing, and counts as an in-arena hold spill",
+         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "if (!kv_placed && req.intent.constraints.prefer_vram_zone",
+                                          "if (req.intent.constraints.prefer_vram_zone"), zone)),
+        ("KV placement counted as raw", "a placement in the KV zone is skipped by the guard and the zone routing, and counts as an in-arena hold spill",
+         (backend, common, mutate_after(cache, "bool kv_placed = false;", "true);", "false);"), zone)),
+        ("buffer allocator does not ask for the KV zone", "the runtime buffer allocator asks for the KV-zone-first placement",
+         (mutate(backend, "spill_to_kv_zone_before_raw = true", "spill_to_kv_zone_before_raw = false"), common, cache, zone)),
+        ("stats do not split the landing site", "the hold-spill counters are split by where the buffer landed (raw outside the arena, KV zone)",
+         (mutate_in_func(backend, r"void ggml_backend_sycl_context::log_planned_scratch_stats\(\)",
+                         "hold_spills_kv_zone=", "hold_XXXX="), common, cache, zone)),
+        ("realized check counts KV-zone placements", "the realized check counts only the raw outside-arena portion",
+         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_realized\(", "spill_totals.raw_bytes;",
+                         "spill_totals.raw_bytes + spill_totals.arena_bytes;"), common, cache, zone)),
+        ("bound ignores the KV room", "the transaction-time bound is the part of the worst-case spill the KV zone cannot take",
+         (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(", "zone_hold_spill_raw_demand(bound, kv_free)",
+                         "zone_hold_spill_XXXX(bound, kv_free)"), common, cache, zone)),
         ("replan trusts stale inputs", "a rejected figure is flagged, so no plan is derived from the stale inputs",
          (backend, common, mutate_in_func(mutate_in_func(cache, r"bool unified_cache_replan_planned_dense_scratch\(",
                                                          "g_planned_dense_scratch_invalid", "g_planned_XXXX"),

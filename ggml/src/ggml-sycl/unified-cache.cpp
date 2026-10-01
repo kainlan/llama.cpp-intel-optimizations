@@ -736,9 +736,13 @@ struct planned_scratch_hold_state {
     std::mutex mutex;
     size_t     hold        = 0;
     uint64_t   owner       = 0;  // 0: nobody published the hold
-    uint64_t   spill_count = 0;
-    size_t     spill_bytes = 0;
-    uint64_t   spill_owner = 0;  // the hold's owner when the first spill since the last take was noted
+    // Hold-induced spills since the last take, by where the buffer landed: RAW (outside the arena, eats the driver
+    // headroom) and in the arena's KV zone (does not).
+    uint64_t   spill_count          = 0;
+    size_t     spill_bytes          = 0;
+    uint64_t   spill_arena_count    = 0;
+    size_t     spill_arena_bytes    = 0;
+    uint64_t   spill_owner          = 0;  // the hold's owner when the first spill since the last take was noted
     size_t     request_hwm = 0;
     // The n_ubatch the current epoch's plan was published at (0 before the first publish), and the n_ubatch the
     // largest request was observed under. Requests before the first publish are load-time ones, not compute-buffer
@@ -748,8 +752,10 @@ struct planned_scratch_hold_state {
     // The same two quantities since the owner's last publish (unified_cache_begin_planned_hold_epoch): what the
     // current rung's own reserve spilled, and the largest request it made. A losing rung's figures must not
     // decide the next rung, so these restart at every publish; spill_count/spill_bytes above feed teardown stats.
-    uint64_t   recent_count = 0;
-    size_t     recent_bytes = 0;
+    uint64_t   recent_count         = 0;
+    size_t     recent_bytes         = 0;
+    uint64_t   recent_arena_count   = 0;
+    size_t     recent_arena_bytes   = 0;
 };
 
 static planned_scratch_hold_state g_planned_scratch_hold_state[GGML_SYCL_MAX_DEVICES];
@@ -1903,11 +1909,15 @@ void unified_cache_set_planned_scratch_hold(int device_id, size_t bytes, uint64_
     // A different owner takes the hold over (the unsupported two-context case, or a first publish): it starts with its
     // own spill counts, so a context is never reported another context's spills.
     if (owner != 0 && state.owner != owner) {
-        state.spill_count  = 0;
-        state.spill_bytes  = 0;
-        state.spill_owner  = 0;
-        state.recent_count = 0;
-        state.recent_bytes = 0;
+        state.spill_count        = 0;
+        state.spill_bytes        = 0;
+        state.spill_arena_count  = 0;
+        state.spill_arena_bytes  = 0;
+        state.spill_owner        = 0;
+        state.recent_count       = 0;
+        state.recent_bytes       = 0;
+        state.recent_arena_count = 0;
+        state.recent_arena_bytes = 0;
     }
     state.hold  = bytes;
     state.owner = owner;
@@ -1957,8 +1967,10 @@ bool unified_cache_release_planned_scratch_hold(int device_id, uint64_t owner) {
     state.request_hwm = 0;  // the largest request seen belongs to the context that is going away
     state.request_hwm_n_ubatch = 0;
     state.epoch_n_ubatch       = 0;
-    state.recent_count = 0;
-    state.recent_bytes = 0;
+    state.recent_count         = 0;
+    state.recent_bytes         = 0;
+    state.recent_arena_count   = 0;
+    state.recent_arena_bytes   = 0;
     return true;
 }
 
@@ -2001,7 +2013,8 @@ void unified_cache_note_planned_hold_spill(int          device_id,
                                            const char * tag,
                                            size_t       bytes,
                                            size_t       hold,
-                                           size_t       available) {
+                                           size_t       available,
+                                           bool         in_arena) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
@@ -2009,23 +2022,32 @@ void unified_cache_note_planned_hold_spill(int          device_id,
     bool                         first = false;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
-        first = state.spill_count == 0;
-        if (first) {
+        if (state.spill_count + state.spill_arena_count == 0) {
             state.spill_owner = state.owner;
         }
-        state.spill_count++;
-        state.spill_bytes += bytes;
-        state.recent_count++;
-        state.recent_bytes += bytes;
+        if (in_arena) {
+            first = state.spill_arena_count == 0;
+            state.spill_arena_count++;
+            state.spill_arena_bytes += bytes;
+            state.recent_arena_count++;
+            state.recent_arena_bytes += bytes;
+        } else {
+            first = state.spill_count == 0;
+            state.spill_count++;
+            state.spill_bytes += bytes;
+            state.recent_count++;
+            state.recent_bytes += bytes;
+        }
     }
-    // Once per device per context: the owning context's take (at teardown) resets the count.
+    // Once per device per context and landing site: the owning context's take (at teardown) resets the counts.
     if (first) {
         GGML_LOG_WARN(
             "[SCRATCH] device %d: the RUNTIME-zone request '%s' (%.1f MB) was held back so the planned dense "
-            "scratch can still be materialized (hold %.1f MB, zone free %.1f MB) and spills outside the arena; later "
-            "ones are counted, not logged (see hold_spills in [SCRATCH-STATS])\n",
+            "scratch can still be materialized (hold %.1f MB, zone free %.1f MB) and %s; later ones are counted, "
+            "not logged (see hold_spills_raw / hold_spills_kv_zone in [SCRATCH-STATS])\n",
             device_id, tag && tag[0] ? tag : "?", bytes / (1024.0 * 1024.0), hold / (1024.0 * 1024.0),
-            available / (1024.0 * 1024.0));
+            available / (1024.0 * 1024.0),
+            in_arena ? "was placed in the arena's KV zone" : "spills outside the arena (raw device memory)");
     }
 }
 
@@ -2043,15 +2065,15 @@ void unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner, uint3
     state.epoch_n_ubatch       = n_ubatch;
     state.recent_count         = 0;
     state.recent_bytes         = 0;
+    state.recent_arena_count   = 0;
+    state.recent_arena_bytes   = 0;
 }
 
-void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, uint64_t * count, size_t * bytes) {
-    if (count) {
-        *count = 0;
+void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out) {
+    if (!out) {
+        return;
     }
-    if (bytes) {
-        *bytes = 0;
-    }
+    *out = {};
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
         return;
     }
@@ -2060,21 +2082,17 @@ void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner,
     if (state.owner != owner) {
         return;
     }
-    if (count) {
-        *count = state.recent_count;
-    }
-    if (bytes) {
-        *bytes = state.recent_bytes;
-    }
+    out->raw_count   = state.recent_count;
+    out->raw_bytes   = state.recent_bytes;
+    out->arena_count = state.recent_arena_count;
+    out->arena_bytes = state.recent_arena_bytes;
 }
 
-void unified_cache_take_planned_hold_spills(int device_id, uint64_t owner, uint64_t * count, size_t * bytes) {
-    if (count) {
-        *count = 0;
+void unified_cache_take_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out) {
+    if (!out) {
+        return;
     }
-    if (bytes) {
-        *bytes = 0;
-    }
+    *out = {};
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
         return;
     }
@@ -2084,15 +2102,15 @@ void unified_cache_take_planned_hold_spills(int device_id, uint64_t owner, uint6
     if (state.spill_owner != owner) {
         return;
     }
-    if (count) {
-        *count = state.spill_count;
-    }
-    if (bytes) {
-        *bytes = state.spill_bytes;
-    }
-    state.spill_count = 0;
-    state.spill_bytes = 0;
-    state.spill_owner = 0;
+    out->raw_count          = state.spill_count;
+    out->raw_bytes          = state.spill_bytes;
+    out->arena_count        = state.spill_arena_count;
+    out->arena_bytes        = state.spill_arena_bytes;
+    state.spill_count       = 0;
+    state.spill_bytes       = 0;
+    state.spill_arena_count = 0;
+    state.spill_arena_bytes = 0;
+    state.spill_owner       = 0;
 }
 
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out) {
@@ -15793,12 +15811,53 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                                                       hold_cache->zone_available(zid), hold_at_decision, alloc_size);
         }
     }
+    // llama.cpp-kpjw: a compute buffer the RUNTIME zone will not serve (held back by the hold above, or larger than
+    // the zone's free bytes) is placed in the arena's KV zone before anything else is tried. Raw device memory
+    // outside the arena is the last resort: it is what eats the driver headroom (B50 / B70 Qwen at auto-ub1024: a
+    // 460-512 MB buffer). The attempt is ahead of the overcommit guard below on purpose: an in-arena placement is
+    // memory the arena already reserved, so it cannot overcommit the device and must not evict cached weights.
+    // Only a request the caller marked (spill_to_kv_zone_before_raw) takes this path; every other class, and a
+    // compute buffer the KV zone cannot hold whole, falls through to the unchanged code below.
+    bool kv_placed = false;
+    if (tier == alloc_tier::DEVICE_VRAM && req.intent.constraints.spill_to_kv_zone_before_raw &&
+        req.intent.constraints.prefer_vram_zone == vram_zone_id::RUNTIME && vram_arena_enabled()) {
+        auto * kv_cache = get_unified_cache_for_device(req.device);
+        if (kv_cache && kv_cache->arena_active() &&
+            zone_runtime_spill_prefers_kv_zone(
+                true, true, req.intent.constraints.forbid_vram_zone_spill,
+                hold_spill || kv_cache->zone_available(vram_zone_id::RUNTIME) < alloc_size,
+                kv_cache->zone_available(vram_zone_id::KV), alloc_size)) {
+            if (!prepare_arena_publication(vram_zone_id::KV)) {
+                return false;
+            }
+            ptr = kv_cache->zone_alloc(vram_zone_id::KV, alloc_size, req.alignment != 0 ? req.alignment : 64,
+                                       reserved_alloc_id, &exact_arena, arena_runtime_registry_commit,
+                                       &arena_publication);
+            if (!ptr && arena_publication.attempted) {
+                return false;
+            }
+            if (ptr) {
+                kv_placed                    = true;
+                from_arena                   = true;
+                output_metadata.zone_managed = true;
+                output_metadata.vram_zone    = vram_zone_id::KV;
+                GGML_SYCL_DEBUG("[UNIFIED-ALLOC] compute buffer placed in the KV zone: dev=%d size=%.1f MB ptr=%p\n",
+                                req.device, alloc_size / (1024.0 * 1024.0), ptr);
+                if (hold_spill) {
+                    unified_cache_note_planned_hold_spill(req.device, req.intent.cohort_id, alloc_size,
+                                                          hold_at_decision,
+                                                          kv_cache->zone_available(vram_zone_id::RUNTIME),
+                                                          /*in_arena=*/true);
+                }
+            }
+        }
+    }
     if (tier == alloc_tier::DEVICE_VRAM) {
         // Guard against Level Zero overcommit: if this allocation would exceed
         // the device's total VRAM, fail early so the caller can retry with
         // host-pinned.  Without this check, L0 may return a valid pointer but
         // a subsequent memset/memcpy triggers DEVICE_LOST.
-        if (req.device >= 0 && req.device < GGML_SYCL_MAX_DEVICES) {
+        if (!kv_placed && req.device >= 0 && req.device < GGML_SYCL_MAX_DEVICES) {
             const size_t total_vram   = unified_alloc_total_vram(req.device, *req.queue);
             const size_t runtime_vram = unified_cache_arena_non_weight_used(req.device);
             // Include weight cache usage (SOA entries on device VRAM)
@@ -15858,19 +15917,21 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         // prefer_vram_zone: explicit zone routing for RUNTIME/SCRATCH/ONEDNN/KV zones.
         // Caller sets alloc_constraints::prefer_vram_zone to request a specific TLSF zone.
         // unified_free() calls cache->zone_free(vram_zone, ptr) for TLSF reclaim.
-        if (req.intent.constraints.prefer_vram_zone != vram_zone_id::COUNT && vram_arena_enabled()) {
+        if (!kv_placed && req.intent.constraints.prefer_vram_zone != vram_zone_id::COUNT && vram_arena_enabled()) {
             auto * cache = get_unified_cache_for_device(req.device);
             if (cache && cache->arena_active()) {
                 const vram_zone_id zid = req.intent.constraints.prefer_vram_zone;
                 if (!prepare_arena_publication(zid)) return false;
-                // llama.cpp-kpjw: a request the hold keeps out (hold_spill, decided above) falls through to the raw
-                // device allocation below like one that found the zone full, and is counted and warned about once.
+                // llama.cpp-kpjw: a request the hold keeps out (hold_spill, decided above) that the KV zone could
+                // not take falls through to the raw device allocation below like one that found the zone full, and
+                // is counted (as a RAW spill) and warned about once.
                 if (!hold_spill) {
                     ptr = cache->zone_alloc(zid, alloc_size, req.alignment != 0 ? req.alignment : 64, reserved_alloc_id,
                                             &exact_arena, arena_runtime_registry_commit, &arena_publication);
                 } else {
                     unified_cache_note_planned_hold_spill(req.device, req.intent.cohort_id, alloc_size,
-                                                          hold_at_decision, cache->zone_available(zid));
+                                                          hold_at_decision, cache->zone_available(zid),
+                                                          /*in_arena=*/false);
                 }
                 if (!ptr && arena_publication.attempted) return false;
                 if (ptr) {
