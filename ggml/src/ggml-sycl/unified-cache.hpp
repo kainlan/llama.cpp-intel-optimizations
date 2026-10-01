@@ -6121,6 +6121,9 @@ registered_release_status allocation_registry_test_release_exact(
 registered_release_status allocation_registry_test_claim(const alloc_metadata & metadata, bool intrusive) noexcept;
 void allocation_registry_test_pause_claim(bool pause) noexcept;
 bool allocation_registry_test_claim_reached() noexcept;
+// Claim `ptr` for a new registry row: true when no row is there or the row is a stale RELEASING one
+// (erased); false for a LIVE row (llama.cpp-93tw).
+bool                      allocation_registry_test_claim_ptr(void * ptr) noexcept;
 void allocation_registry_test_erase(void * ptr) noexcept;
 #endif
 

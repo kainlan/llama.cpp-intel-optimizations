@@ -22941,7 +22941,13 @@ static void flush_pending_cpu_scatter() {
         double total_bytes = 0;
         int    n_entries   = 0;
         g_pending_scatter.scatter_events.clear();
-        if (g_pending_scatter.stream && g_pending_scatter.out_pinned) {
+        // Both producers of an active pending scatter set a stream and an output buffer.  A pending
+        // scatter without them used to be skipped quietly, which loses its host-expert rows
+        // (llama.cpp-93tw).
+        GGML_ASSERT(g_pending_scatter.stream && g_pending_scatter.out_pinned &&
+                    "pending CPU scatter has no stream or output staging; its host-expert rows would be dropped "
+                    "(llama.cpp-93tw)");
+        {
             // Batch contiguous scatter entries into single memcpy calls.
             // Source (out_pinned) is always contiguous; check if destination
             // addresses are also contiguous to merge.
@@ -22949,11 +22955,9 @@ static void flush_pending_cpu_scatter() {
             const float * src_base = g_pending_scatter.out_pinned;
             size_t        i        = 0;
             while (i < entries.size()) {
-                if (!entries[i].dst_device) {
-                    src_base += entries[i].N;
-                    i++;
-                    continue;
-                }
+                // Every entry names its destination; skipping one would drop that row (llama.cpp-93tw).
+                GGML_ASSERT(entries[i].dst_device &&
+                            "pending CPU scatter entry has no destination; its row would be dropped (llama.cpp-93tw)");
                 if (!entries[i].dst_handle.valid() || !g_pending_scatter.out_handle.valid()) {
                     GGML_ABORT("[CPU-TG] Deferred scatter missing smart mem_handle for dst=%p device=%d",
                                entries[i].dst_device, g_pending_scatter.device_id);
@@ -22994,13 +22998,12 @@ static void flush_pending_cpu_scatter() {
                 double submit_us   = std::chrono::duration<double, std::micro>(t2 - t1).count();
                 g_moe_profile.moe_scatter_detail(cpu_wait_us, submit_us, 0, n_entries, total_bytes);
             }
-        } else if (g_moe_profile_enabled) {
-            // No stream/output — record only CPU wait
-            double cpu_wait_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-            g_moe_profile.moe_scatter_detail(cpu_wait_us, 0, 0, 0, 0);
         }
     } catch (const std::exception & ex) {
-        GGML_LOG_ERROR("[CPU-TG] Deferred scatter failed: %s\n", ex.what());
+        // Logging and carrying on cleared the pending state below, so a throwing CPU worker or a
+        // failed scatter submission lost every host-expert row of this op (llama.cpp-93tw).
+        GGML_ABORT("[CPU-TG] Deferred scatter failed: %s; its host-expert rows would be dropped (llama.cpp-93tw)",
+                   ex.what());
     }
 
     // Defer buffer cleanup: memcpys are submitted but may not have executed
@@ -23252,21 +23255,25 @@ static void flush_pending_cpu_pipeline() {
             g_pending_cpu_pipeline.future.get();
         }
         g_pending_cpu_pipeline.scatter_events.clear();
-        if (g_pending_cpu_pipeline.stream && g_pending_cpu_pipeline.out_pinned) {
-            for (auto & e : g_pending_cpu_pipeline.entries) {
-                if (e.dst_device) {
-                    if (!e.dst_handle.valid() || !g_pending_cpu_pipeline.out_handle.valid()) {
-                        GGML_ABORT("[PIPELINE-CPU] Deferred merge missing smart mem_handle for dst=%p device=%d",
-                                   e.dst_device, g_pending_cpu_pipeline.device_id);
-                    }
-                    g_pending_cpu_pipeline.scatter_events.push_back(ggml_sycl::mem_copy_async(
-                        e.dst_handle, e.dst_offset, g_pending_cpu_pipeline.out_handle, e.src_offset,
-                        static_cast<size_t>(e.N) * sizeof(float), *g_pending_cpu_pipeline.stream));
-                }
+        // The producer sets a stream and an output buffer, and every entry names its destination.
+        // Skipping quietly would lose the rows (llama.cpp-93tw), as in flush_pending_cpu_scatter.
+        GGML_ASSERT(g_pending_cpu_pipeline.stream && g_pending_cpu_pipeline.out_pinned &&
+                    "pending CPU pipeline has no stream or output staging; its host-expert rows would be dropped "
+                    "(llama.cpp-93tw)");
+        for (auto & e : g_pending_cpu_pipeline.entries) {
+            GGML_ASSERT(e.dst_device &&
+                        "pending CPU pipeline entry has no destination; its row would be dropped (llama.cpp-93tw)");
+            if (!e.dst_handle.valid() || !g_pending_cpu_pipeline.out_handle.valid()) {
+                GGML_ABORT("[PIPELINE-CPU] Deferred merge missing smart mem_handle for dst=%p device=%d", e.dst_device,
+                           g_pending_cpu_pipeline.device_id);
             }
+            g_pending_cpu_pipeline.scatter_events.push_back(
+                ggml_sycl::mem_copy_async(e.dst_handle, e.dst_offset, g_pending_cpu_pipeline.out_handle, e.src_offset,
+                                          static_cast<size_t>(e.N) * sizeof(float), *g_pending_cpu_pipeline.stream));
         }
     } catch (const std::exception & ex) {
-        GGML_LOG_ERROR("[PIPELINE-CPU] Deferred merge failed: %s\n", ex.what());
+        GGML_ABORT("[PIPELINE-CPU] Deferred merge failed: %s; its host-expert rows would be dropped (llama.cpp-93tw)",
+                   ex.what());
     }
     static std::atomic<int> pipeline_log{ 0 };
     if (pipeline_log.fetch_add(1, std::memory_order_relaxed) < 5) {
@@ -75890,15 +75897,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
 
                 if (!act_pinned || !out_pinned) {
-                    GGML_LOG_ERROR(
-                        "[MoE-CPU] Failed to allocate pinned host memory "
-                        "(%zu act + %zu out bytes)\n",
-                        n_cpu * static_cast<size_t>(K) * sizeof(float), n_cpu * static_cast<size_t>(N) * sizeof(float));
-                    if (!from_pool) {
-                        act_owner = {};
-                        out_owner = {};
-                    }
-                    return result;
+                    // Fail closed (llama.cpp-93tw).  This used to log and return an invalid result,
+                    // which apply_cpu_result_to_scatter drops: every host-expert row of this op was
+                    // never computed or scattered, dst kept stale values, and inference carried on.
+                    // No correct fallback exists -- the rows can only be produced from this staging,
+                    // and a GPU PCIe read of host memory or a weight stream is forbidden by the
+                    // placement-decides-executor rule -- so refuse to continue.
+                    GGML_ABORT(
+                        "[MoE-CPU] pinned host staging allocation failed for %s: %zu act + %zu out bytes "
+                        "(n_cpu=%zu K=%lld N=%lld device=%d from_pool=%d act_ok=%d out_ok=%d); refusing to drop "
+                        "host-expert rows (llama.cpp-93tw)",
+                        src0 && src0->name ? src0->name : "?", n_cpu * static_cast<size_t>(K) * sizeof(float),
+                        n_cpu * static_cast<size_t>(N) * sizeof(float), n_cpu, (long long) K, (long long) N, ctx.device,
+                        from_pool ? 1 : 0, act_pinned ? 1 : 0, out_pinned ? 1 : 0);
                 }
 
                 // The output region is zeroed further down, after the activation wait.  Across
@@ -76026,8 +76037,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const auto &          entry       = entries[ci];
                     const void *          host_weight = nullptr;
                     ggml_sycl::mem_handle host_lease{};  // llama.cpp-0k543
-                    const void *          candidate_ptr       = nullptr;
-                    bool                  candidate_is_device = false;
                     if (!entry.allow_cpu_fallback && entry.lease.valid()) {
                         auto resolved = entry.lease.resolve(entry.device_id);
                         if (resolved.ptr && !resolved.on_device) {
@@ -76052,14 +76061,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 "[MOE-ROUTE] planner-host expert missing resolved host handle tensor=%s expert=%d",
                                 src0 && src0->name ? src0->name : "?", (int) entry.expert_id);
                         }
-                        // Expert weight is truly inaccessible (no host copy, no
-                        // mmap data) — skip CPU dispatch.  This should be extremely
-                        // rare now that the src0_host_storage fallback is active.
-                        GGML_LOG_WARN(
-                            "[MoE-CPU] Skipping expert %d: no host-accessible weight "
-                            "(tensor=%s, expert_ptrs_host=%p, src0_host=%p)\n",
-                            entry.expert_id, src0->name ? src0->name : "?", candidate_ptr, src0_host_storage);
-                        continue;
+                        // Skipping the expert would leave it without a task while its scatter
+                        // entry (zeroed output rows) is still published below: silent wrong
+                        // output.  Nothing else computes these rows, so abort (llama.cpp-93tw).
+                        GGML_ABORT(
+                            "[MoE-CPU] expert has no host-accessible weight; refusing to drop its rows "
+                            "(expert=%d tensor=%s src0_host=%p) (llama.cpp-93tw)",
+                            entry.expert_id, src0->name ? src0->name : "?", src0_host_storage);
                     }
 
                     if (immutable_host_recipe) {
@@ -76241,7 +76249,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // (PP) path and the hot/cold deferral path.
             auto dispatch_cpu_and_scatter = [&](const std::vector<expert_dispatch_entry> & entries,
                                                 size_t pool_first_entry = pool_entry_npos) {
+                if (entries.empty()) {
+                    return;
+                }
                 auto r = dispatch_cpu_compute(entries, pool_first_entry);
+                // A non-empty dispatch always yields a valid result or aborts inside; an invalid one
+                // here would be dropped by apply_cpu_result_to_scatter (llama.cpp-93tw).
+                GGML_ASSERT(r.valid &&
+                            "dispatch_cpu_compute returned an invalid result for a non-empty dispatch; "
+                            "its host-expert rows would be dropped (llama.cpp-93tw)");
                 apply_cpu_result_to_scatter(r);
             };
 
@@ -77193,6 +77209,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // Standard: store in g_pending_scatter (intra-layer deferral).
             if (cpu_async_safe && cpu_compute_future.valid()) {
                 auto cpu_result = cpu_compute_future.get();
+                GGML_ASSERT(cpu_result.valid &&
+                            "async dispatch_cpu_compute returned an invalid result for a "
+                            "non-empty dispatch; its host-expert rows would be dropped "
+                            "(llama.cpp-93tw)");
                 if (ggml_sycl_pipeline_cpu_enabled()) {
                     apply_cpu_result_to_pipeline(cpu_result);
                 } else {
@@ -77373,12 +77393,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
 
                 if (!act_pinned || !out_pinned || (need_weight_d2h && !weight_pinned)) {
-                    GGML_LOG_ERROR("[MoE] Failed planner CPU dispatch staging alloc for %s (%zu entries)\n",
-                                   src0->name ? src0->name : "?", n_cpu);
-                    act_owner    = {};
-                    out_owner    = {};
-                    weight_owner = {};
-                    return;
+                    // Returning here left dst unwritten for every entry of this dispatch (llama.cpp-93tw).
+                    GGML_ABORT(
+                        "[MoE] Failed planner CPU dispatch staging alloc for %s (%zu entries, K=%lld N=%lld "
+                        "act_ok=%d out_ok=%d weight_needed=%d weight_ok=%d); refusing to drop host-expert rows "
+                        "(llama.cpp-93tw)",
+                        src0->name ? src0->name : "?", n_cpu, (long long) K, (long long) N, act_pinned ? 1 : 0,
+                        out_pinned ? 1 : 0, need_weight_d2h ? 1 : 0, weight_pinned ? 1 : 0);
                 }
 
                 ggml_sycl_tensor_storage_handle src1_storage{};
