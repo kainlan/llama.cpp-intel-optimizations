@@ -2342,6 +2342,12 @@ P_FLAGS = ("g_sycl_fa_onednn_enabled", "g_sycl_paged_v2_enabled", "ggml_sycl_fa_
 P_BODY_BANNED = (P_VEC, P_ENABLED, P_KV_PAIR_OF, P_TILE)               # support clauses the supported/route bodies may not hold
 P_FP8_CALL_RE = re.compile(r"(?<![\w.>])(\w*fp8\w*)\s*\(")               # ... nor any fp8 type helper (ggml_sycl_type_is_fp8_e4m3)
 P_SUPPORT_HELPERS = (P_VEC, P_ENABLED, P_SHAPE_SUPPORTED, P_TILE)      # support helpers the charge side may not name
+P_DISPATCH_BODY = (
+    "out = {}; if (!ggml_sycl_fattn_onednn_route_enabled(p)) { return false; } "
+    "if (ggml_sycl_onednn_graph_dispatch_declined(ctx, p)) { out.stage = GGML_SYCL_FATTN_ONEDNN_ROUTE_STAGE_DECLINED; "
+    "unified_cache_count_onednn_graph_mask_declined(ctx.device, static_cast<int>(site)); return false; } "
+    "out.stage = GGML_SYCL_FATTN_ONEDNN_ROUTE_STAGE_PLANNED; "
+    "return ggml_sycl_fattn_onednn_routed(p, d_v, multi_seq, &ctx, &out.plan);")
 P_ROUTED_BODY = "return ggml_sycl_fattn_onednn_route_admits(p, multi_seq, ctx, plan_out) && ggml_sycl_fattn_shape_supported(p, d_v);"
 P_CASE = "case GGML_OP_FLASH_ATTN_EXT: return ggml_sycl_flash_attn_ext_supported(op);"
 P_FILL_RE = re.compile(r"^(\w+)\.kv_is_fp8=ggml_sycl_fattn_kv_pair_of\(\1\.K_type,\1\.V_type\)==GGML_SYCL_FATTN_KV_PAIR_FP8;$")
@@ -2558,9 +2564,12 @@ def clause_k(ix, out):
     for nm, why in ((K_TXN, "a lambda, a macro or an alias hides the transaction"), (K_REAP, "a macro, a lambda or an alias hides the reap")):
         out.latch("k", ix, nm, "a call, a declaration or a function definition", why)
     for rel, o in ix.occ(K_MODE):
-        p = None if o.form == "macro" else parent(o.node)
+        p, top = (None, None) if o.form == "macro" else (parent(o.node), o.node)
+        while p is not None and (kind(p) == "parenthesized_expression" or (kind(p) == "conditional_expression" and not same(
+                fld(p, "condition"), top))):
+            top, p = p, parent(p)
         if o.form == "macro" or (p is not None and kind(p) in ("init_declarator", "assignment_expression") and same(
-                fld(p, "value" if kind(p) == "init_declarator" else "right"), o.node)):
+                fld(p, "value" if kind(p) == "init_declarator" else "right"), top)):
             out.add("X-LATCH", rel, o.line, o.func, K_MODE, "%s::%s::latch:k:%s:alias" % (rel, o.func, K_MODE),
                     "clause (k) is keyed on a call of %s whose arguments name %s; %s is aliased here (%s), so the reap's mode "
                     "would be read through a name the clause does not follow: respell it, or extend the matcher" % (
@@ -2853,13 +2862,28 @@ def n_listed(ix, src, o):
 def value_use(src, call):
     """'void-cast' for `(void) f()` and `static_cast<void>(f())`, 'discard' for a call whose value nothing reads, else
     'used'. The value of `ok && f()`, `ok || f()`, `c ? f() : x` and the right operand of a comma is the value of the whole
-    expression, so those operands are followed up to the expression that consumes (or drops) it; a call that is a
-    for-loop's initializer or update expression is dropped too."""
+    expression, and so is the value under a `!`, a binary operator, a cast to another type or `static_cast<T>(...)`; those
+    operands are followed up to the expression that consumes (or drops) it. A call that is a for-loop's initializer or
+    update expression is dropped too, and so is one assigned to `std::ignore`."""
     n, p = call, parent(call)
     while p is not None:
         k = kind(p)
-        if k == "parenthesized_expression" or \
-                (k == "binary_expression" and txt(src, fld(p, "operator")) in ("&&", "||") and same(fld(p, "right"), n)) or \
+        if k == "cast_expression":
+            t = fld(p, "type")
+            if t is not None and norm(txt(src, t)) == "void":
+                return "void-cast"
+            n, p = p, parent(p)
+            continue
+        if k == "argument_list" and parent(p) is not None and kind(parent(p)) == "call_expression":
+            f = fld(parent(p), "function")
+            ft = re.sub(r"\s+", "", txt(src, f)) if f is not None else ""
+            if ft.startswith("static_cast<void>"):
+                return "void-cast"
+            if ft.startswith("static_cast<"):
+                n, p = parent(p), parent(parent(p))
+                continue
+        if k in ("parenthesized_expression", "unary_expression") or \
+                (k == "binary_expression" and (txt(src, fld(p, "operator")) not in ("&&", "||") or same(fld(p, "right"), n))) or \
                 (k == "conditional_expression" and not same(fld(p, "condition"), n)) or \
                 (k == "comma_expression" and not same(fld(p, "left"), n)):
             n, p = p, parent(p)
@@ -2867,13 +2891,9 @@ def value_use(src, call):
         break
     if p is None:
         return "used"
-    if kind(p) == "cast_expression":
-        t = fld(p, "type")
-        return "void-cast" if t is not None and norm(txt(src, t)) == "void" else "used"
-    if kind(p) == "argument_list" and parent(p) is not None and kind(parent(p)) == "call_expression":
-        f = fld(parent(p), "function")
-        if f is not None and re.sub(r"\s+", "", txt(src, f)).startswith("static_cast<void>"):
-            return "void-cast"
+    if kind(p) == "assignment_expression" and same(fld(p, "right"), n) and fld(p, "left") is not None and \
+            re.sub(r"\s+", "", txt(src, fld(p, "left"))).endswith("std::ignore"):
+        return "discard"
     if kind(p) in ("comma_expression", "expression_statement"):
         return "discard"
     if kind(p) == "for_statement" and (same(fld(p, "update"), n) or same(fld(p, "initializer"), n)):
@@ -2895,10 +2915,19 @@ def clause_n(ixt, out):
     """(n): a declined result is consumed. Each call of a listed name is the initializer of a declaration, the right side of
     an assignment, a return operand or a condition (here: anything but a discarded value); a call that is its own
     expression statement, or is cast to void, fails (N-VOID); each listed declaration carries [[nodiscard]] (N-NODISCARD)."""
+    out.dormant.append("TODO n: an alias chain whose intermediate alias is declared in a file that spells no listed name or class is "
+                       "not followed")
     for nm in sorted(N_LAST):
         for rel, o in ixt.occ(nm):
             lst = n_listed(ixt, ixt.files[rel], o)
-            if lst is None or o.role == "other":
+            if o.role == "other":
+                if o.form == "macro" or lst is not None:
+                    out.add("X-LATCH", rel, o.line, o.func, nm, "%s::%s::latch:n:%s" % (rel, o.func, nm),
+                            "clause (n) is keyed on calls of %s, which appears here as something other than a call, a declaration "
+                            "or a function definition (%s): a call through it would not be checked, so respell it, or extend the "
+                            "matcher" % (nm, "a macro" if o.form == "macro" else "a pointer to member or another reference"))
+                continue
+            if lst is None:
                 continue
             out.active.add("n")
             cname = ("%s::%s" % lst) if lst[0] else lst[1]
@@ -2959,6 +2988,9 @@ def clause_o(ix, out):
     """(o): every call of an acquire token sits in a function that has a census row, and each consuming call of that row
     keeps the row's queue. A presence test could not fail (`ggml_sycl_mul_mat` holds dozens of `ctx.stream()`), so the
     pin is on the consuming call's own argument."""
+    out.dormant.append("TODO o: a macro or alias that hides %s is not followed (the name is a qualified call, not an identifier)" % O_EXECUTE)
+    for tok in O_ACQUIRE:
+        out.latch("o", ix, tok, "a call, a declaration or a function definition", "a macro, a lambda, a pointer or an alias hides it")
     tokens = set(O_ACQUIRE) | {O_EXECUTE}
     rowkey = {(r["token"], r["file"], r["func"]) for r in O_ROWS}
     for tok in sorted(tokens):
@@ -3109,6 +3141,8 @@ def p_route(ix, out):
     out.dormant.append("TODO p-route: the charge side's walk helpers are unnamed in the design, so they are not pinned")
     out.latch("p-route", ix, P_ADMITS, "a call or a function definition", "an alias, a macro or a lambda hides it")
     out.latch("p-route", ix, P_DECLINED, "a call or a function definition", "an alias, a macro or a lambda hides it")
+    for nm in (P_ROUTE_ENABLED, P_DISPATCH, P_ROUTED):
+        out.latch("p-route", ix, nm, "a call or a function definition", "an alias, a macro or a lambda hides it")
     if not has_name(ix, P_ADMITS, "def"):
         p_dormant(out, "route", P_ADMITS)
         return
@@ -3146,6 +3180,9 @@ def p_route(ix, out):
         src = ix.files[rel]
         dec = [sb(c) for c in calls_in_node(src, body_of(node), P_DECLINED)]
         routed = [sb(c) for c in calls_in_node(src, body_of(node), P_ROUTED)]
+        if squash(clean_text(src, body_of(node))) != squash("{ %s }" % P_DISPATCH_BODY):
+            out.add("P-ROUTE", rel, line_of(node), func, P_DISPATCH, "%s::%s::p-route:dispatch-body" % (rel, func),
+                    "the body of %s must be exactly the pinned text (whitespace and comments aside): `%s`" % (P_DISPATCH, P_DISPATCH_BODY))
         if not dec or (routed and min(routed) < min(dec)):
             out.add("P-ROUTE", rel, line_of(node), func, P_DECLINED, "%s::%s::p-route:%s" % (
                 rel, func, "decline-order" if dec else "decline-read"),
@@ -3210,7 +3247,8 @@ def p_fill_sites(ix):
 def p_home(ix, files, out):
     out.dormant.append("TODO p-home: a head dim copied into a local, a switch or comparison on such a local, and a support clause "
                        "spelled through a predicate other than the listed helpers are not followed (no dataflow)")
-    out.latch("p-home", ix, P_ENABLED, "a call or a function definition", "an alias, a macro or a lambda hides it")
+    for nm in (P_ENABLED, P_SUPPORTED, P_SHAPE_SUPPORTED):
+        out.latch("p-home", ix, nm, "a call or a function definition", "an alias, a macro or a lambda hides it")
     enabled = ix.fdefs(P_ENABLED)
     if not enabled:
         p_dormant(out, "home", P_ENABLED)
@@ -3247,6 +3285,9 @@ def p_home(ix, files, out):
             out.add("P-HOME", rel, line_of(node), func, P_ENABLED, "%s::%s::p-home:first-statement" % (rel, func),
                     "%s must be called exactly once under ggml/src/ggml-sycl, as the first statement of %s (%d call(s) found)" % (
                         P_ENABLED, P_SHAPE_SUPPORTED, len(calls)))
+    if not ix.fdefs(P_SUPPORTED):
+        out.add("P-HOME", "fattn.cpp", 0, P_SUPPORTED, P_SUPPORTED, "p-home:supported-missing",
+                "%s is defined but %s is not: its body is where the no-support-clause pin is checked" % (P_ENABLED, P_SUPPORTED))
     routed = ix.fdefs(P_ROUTED)
     if not routed:
         out.add("P-HOME", "fattn.cpp", 0, P_ROUTED, P_ROUTED, "p-home:routed-missing",
@@ -3405,6 +3446,11 @@ def p_charge(ix, out):
             out.add("P-CHARGE", rel, ln, func, st, "%s::%s::p-charge:literal:%s" % (rel, func, st),
                     "%s compares a head dim with an integer literal (`%s`): the charge side takes its dims from the facts, "
                     "the only literal is the walk's D512 count" % (func, st))
+        for knd, what in p_support_clauses(text):
+            if knd in ("head-dim-named", "head-dim-arith", "head-dim-case"):
+                out.add("P-CHARGE", rel, line_of(node), func, what, "%s::%s::p-charge:%s:%s" % (rel, func, knd, what),
+                        "%s tests a head dim (%s `%s`): the charge side takes its dims from the facts, never from a support rule" % (
+                            func, knd, what))
         if name == P_VALUEFN:
             lines = [squash(m.group(0)) for m in re.finditer(r"if\s*\(\s*params\.ne00\s*==\s*512\s*\)\s*\{", text)]
             if lines.count(P_D512_LINE) != 1 or d512 != 1:
@@ -4679,6 +4725,7 @@ def matrix_cases():
     c.extend(matrix_cases_s2d1b())
     c.extend(matrix_cases_s2d2())
     c.extend(matrix_cases_s2d3())
+    c.extend(matrix_cases_s2d4())
     return c
 
 
@@ -5311,6 +5358,98 @@ def matrix_cases_s2d3():
     for code in ("X-LATCH", "P-ROUTE", "P-CHARGE"):
         A(Case("m5", "an allowlist entry for %s is refused" % code, lambda f: f, "FAIL", "allowlist", "never exempted",
                edit_allowlist=with_allow((code, "fattn.cpp", "zz"))))
+    return c
+
+
+def matrix_cases_s2d4():
+    """The S2d re-review fold: clause (p)'s other subjects latch, the dispatch body is pinned, clauses (n) and (o) latch, and
+    the value walk follows the statement-level wrappers."""
+    c = []
+    A = c.append
+    CALL = "DnnlGemmWrapper::row_gemm(ctx, 1, 2, 3, a, t, b, t, d, t, q, 4)"
+
+    def body(stmt, name="zzplant_n"):
+        return "void %s(ggml_backend_sycl_context & ctx) {\n    %s\n}\n" % (name, stmt)
+
+    def b1(*muts):
+        return chain(b1_tree, *muts)
+
+    ROUTED_CALL = "if (!ggml_sycl_fattn_onednn_routed(params, f.head_dim_v, false, nullptr, nullptr)) {"
+    FLASH_OPEN = "void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor safe_dst) {\n"
+    DECLINE = ("    if (ggml_sycl_onednn_graph_dispatch_declined(ctx, p)) {\n        out.stage = GGML_SYCL_FATTN_ONEDNN_ROUTE_STAGE_DECLINED;\n"
+               "        unified_cache_count_onednn_graph_mask_declined(ctx.device, static_cast<int>(site));\n        return false;\n    }\n")
+    COUNT = "        unified_cache_count_onednn_graph_mask_declined(ctx.device, static_cast<int>(site));\n"
+    # I-A: every clause (p) subject latches, in the shapes the definition matcher cannot see
+    for blk, nm, text in (
+            ("p-home", "ggml_sycl_flash_attn_ext_supported", "#define ggml_sycl_flash_attn_ext_supported(dst) (dst->src[0]->ne[0] != 80)\n"),
+            ("p-home", "ggml_sycl_fattn_shape_supported", "static auto ggml_sycl_fattn_shape_supported = [](const fattn_params & p, int d) { return p.ne00 != 80; };\n"),
+            ("p-route", "ggml_sycl_fattn_onednn_route_enabled", "#define ggml_sycl_fattn_onednn_route_enabled(p) ((p).ne00 != 80)\n"),
+            ("p-route", "ggml_sycl_fattn_onednn_route_enabled", "static auto ggml_sycl_fattn_onednn_route_enabled = [](const fattn_params & p) { return p.ne00 != 80; };\n"),
+            ("p-route", "ggml_sycl_fattn_onednn_dispatch_routed", "static auto ggml_sycl_fattn_onednn_dispatch_routed = [](int x) { return x > 0; };\n"),
+            ("p-route", "ggml_sycl_fattn_onednn_routed", "#define ggml_sycl_fattn_onednn_routed(p, d, m, c, o) true\n")):
+        A(Case("38", "%s spelled as %s: the latch fails" % (nm, "a macro" if text.startswith("#") else "a lambda variable"),
+               b1(append_to("fattn.cpp", text)), "FAIL", "X-LATCH", "latch:%s:%s" % (blk, nm), planted=False))
+    A(Case("38", "ggml_sycl_flash_attn_ext_supported renamed away while still called: it is missing", b1(replace_once(
+        "fattn.cpp", "bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {", "bool ggml_sycl_flash_attn_ext_supported_zz(const ggml_tensor * dst) {")),
+        "FAIL", "P-HOME", "supported-missing", planted=False))
+    # N1: the hatch spellings the exemption does not recognise fail loudly
+    LATCH = "    static const bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();\n"
+    HATCH = "    if (p.ne00 == 512 && !d512_onednn_enabled) {\n"
+    A(Case("38", "the hatch with the literal on the left: 512 == p.ne00 && !V", b1(replace_once(
+        "fattn.cpp", HATCH, "    if (512 == p.ne00 && !d512_onednn_enabled) {\n")), "FAIL", "P-HOME", "head-dim-literal", planted=False))
+    A(Case("38", "the hatch's latch written with braces: static const bool V{...}", b1(replace_once(
+        "fattn.cpp", LATCH + HATCH, "    static const bool d512_onednn_enabled{ggml_sycl_fa_onednn_d512_enabled()};\n" + HATCH)),
+        "FAIL", "P-HOME", "head-dim-literal", planted=False))
+    A(Case("38", "the hatch's latch written const static", b1(replace_once(
+        "fattn.cpp", LATCH + HATCH, "    const static bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();\n" + HATCH)),
+        "FAIL", "P-HOME", "head-dim-literal", planted=False))
+    # M-2: the census-fill pin
+    A(Case("38", "a second kv_pair_of call in the dispatch function, off the pinned fill line", b1(insert_after(
+        "fattn.cpp", FLASH_OPEN, "    (void) ggml_sycl_fattn_kv_pair_of(params.K_type, params.V_type);\n")),
+        "FAIL", "P-HOME", "census-fill", planted=False))
+    # M-3: the routing function's body is exactly the design's
+    DECL_CALL = "ggml_sycl_onednn_graph_dispatch_declined(ctx, p)"
+    for label, mut in (
+            ("the decline call discarded in place of its branch", replace_once("fattn.cpp", DECLINE, "    " + DECL_CALL + ";\n")),
+            ("the decline call cast to void ahead of the branch", replace_once("fattn.cpp", DECLINE, "    (void) " + DECL_CALL + ";\n" + DECLINE)),
+            ("the decline read inside a dead `if (false)`", replace_once(
+                "fattn.cpp", DECLINE, "    if (false) {\n        (void) " + DECL_CALL + ";\n    }\n")),
+            ("the declined-mask counter call deleted", replace_once("fattn.cpp", COUNT, ""))):
+        A(Case("37", "the routing function with %s" % label, b1(mut), "FAIL", "P-ROUTE", "dispatch-body", planted=False))
+    # M-4: the charge side's head-dim tests of every kind
+    for label, text, kind_ in (
+            ("params.ne00 % 64", "        if (params.ne00 % 64 != 0) {\n            continue;\n        }\n", "head-dim-arith"),
+            ("a named constant", "        if (f.head_dim_k == kD) {\n            continue;\n        }\n", "head-dim-named"),
+            ("a switch over params.ne00", "        switch (params.ne00) {\n            case 64:\n                continue;\n            default:\n                break;\n        }\n",
+             "head-dim-case")):
+        A(Case("38", "the charge side testing %s" % label, b1(replace_once(
+            "unified-cache.cpp", "        " + ROUTED_CALL, text + "        " + ROUTED_CALL)), "FAIL", "P-CHARGE", kind_, planted=False))
+    # M-5: the COMPLETE mode behind a ternary, and handed to a macro inside the transaction
+    INTERIM = "bool onednn_pp_a_reclaim_query_interim() {\n    return false;\n}\n"
+    A(Case("30", "the COMPLETE mode as an arm of a ternary initialiser: the latch fails", plant(
+        "constexpr auto REAP_NOW = flag ? RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER : RETAINED_REAP_NONE;\n" + INTERIM),
+        "FAIL", "X-LATCH", "latch:k", planted=False))
+    A(Case("30", "the COMPLETE mode handed to a macro inside the transaction: the latch fails", plant(
+        "void ggml_sycl_run_runtime_context_transaction() {\n    RELEASE_MACRO(h, RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER);\n}\n" + INTERIM),
+        "FAIL", "X-LATCH", "latch:k", planted=False))
+    # M-1: clauses (n) and (o) latch, and the statement-level wrappers are discards
+    A(Case("35", "row_gemm spelled inside a macro: the latch fails", plant(
+        "#define RG() " + CALL + "\n"), "FAIL", "X-LATCH", "latch:n", planted=False))
+    A(Case("35", "row_gemm taken as a pointer to member: the latch fails", plant(
+        "void zzplant_n() {\n    auto fp = &DnnlGemmWrapper::row_gemm;\n    (void) fp;\n}\n"), "FAIL", "X-LATCH", "latch:n", planted=False))
+    A(Case("36", "acquire_onednn_pp_scratch spelled inside a macro: the latch fails", plant(
+        "#define ACQ() acquire_onednn_pp_scratch(0, t, 1, 2, &s, &a)\n"), "FAIL", "X-LATCH", "latch:o", planted=False))
+    A(Case("36", "acquire_onednn_pp_scratch taken by address: the latch fails", plant(
+        "void zzplant_o() {\n    auto f = &acquire_onednn_pp_scratch;\n    (void) f;\n}\n"), "FAIL", "X-LATCH", "latch:o", planted=False))
+    for label, stmt in (("assigned to std::ignore", "std::ignore = " + CALL + ";"),
+                        ("under static_cast<bool> as a statement", "static_cast<bool>(" + CALL + ");"),
+                        ("under a ! as a statement", "!" + CALL + ";"),
+                        ("compared as a statement", CALL + " == x;"),
+                        ("cast to another type as a statement", "(bool) " + CALL + ";")):
+        A(Case("35", "row_gemm's result %s" % label, plant(body(stmt)), "FAIL", "N-VOID", "DnnlGemmWrapper::row_gemm"))
+    A(Case("35", "row_gemm's result under !, a cast and static_cast<bool>, consumed by a condition and a return (control)", plant(
+        "bool zzplant_n(ggml_backend_sycl_context & ctx) {\n    if (!" + CALL + ") {\n        return false;\n    }\n"
+        "    const bool b = !" + CALL + ";\n    return static_cast<bool>(" + CALL + ") && b && (bool) " + CALL + ";\n}\n"), "PASS"))
     return c
 
 
