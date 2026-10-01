@@ -1648,6 +1648,20 @@ if (NOT WIN32)
         TIMEOUT 120
     )
 
+    # Gates 3, 23, 29, 30, 31, 36 and 37 (zhcn-design §5.2): the backend half of the
+    # re-plan protocol (chunk cap, graph clear, host_task and queue censuses, the L0
+    # token and its witnesses, the plan override, the measure backend, the pool gates).
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-replan-census-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-replan-census-source.py
+    )
+    set_tests_properties(test-sycl-replan-census-source PROPERTIES
+        LABELS "sycl;tdd"
+        TIMEOUT 300
+    )
+
     # Regression + arithmetic gate for parse-sycl-gap-device-split.py, the
     # device-clock A/B decomposition the Cluster B verdict rests on. Registered
     # because that script shipped with a reproducible ZeroDivisionError: its

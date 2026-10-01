@@ -88091,16 +88091,20 @@ static sycl::queue * ggml_sycl_block_exec_queue_for_device(ggml_backend_sycl_con
     return nullptr;
 }
 
+// The dense block executor's per-device copy queues.  File scope so the re-plan wait
+// can reach them (ggml_backend_sycl_synchronize_for_replan).
+static std::mutex                                                      g_block_exec_copy_queue_mutex;
+static std::array<std::unique_ptr<sycl::queue>, GGML_SYCL_MAX_DEVICES> g_block_exec_copy_queues;
+
 static sycl::queue * ggml_sycl_block_exec_copy_queue_for_device(int device) {
     sycl::queue * base = ggml_sycl_block_exec_queue_for_device(device);
     if (!base || !ggml_sycl_block_exec_queue_matches_device(*base, device, true)) {
         return base;
     }
 
-    static std::mutex                                                      copy_queue_mutex;
-    static std::array<std::unique_ptr<sycl::queue>, GGML_SYCL_MAX_DEVICES> copy_queues;
+    auto & copy_queues = g_block_exec_copy_queues;
 
-    std::lock_guard<std::mutex> lock(copy_queue_mutex);
+    std::lock_guard<std::mutex> lock(g_block_exec_copy_queue_mutex);
     if (copy_queues[device] && ggml_sycl_block_exec_queue_matches_device(*copy_queues[device], device, true)) {
         return copy_queues[device].get();
     }
@@ -100553,9 +100557,15 @@ bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
     }
     auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     try {
-        // The device execution queue, waited unconditionally (not last_graph_event).
-        // exact_queue is this queue (ctx.stream()), so the row covers it.
+        const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+        // The device execution queues, waited unconditionally (not last_graph_event): this
+        // context's own, then every other device's, which a split graph also submits to.
         ctx->stream(ctx->device, 0)->wait();
+        for (int d = 0; d < total; ++d) {
+            if (sycl::queue * q = ggml_sycl_execution_queue_for_device(d)) {
+                q->wait();
+            }
+        }
         // The split secondary, merge and coord queues.
         if (g_split_config.enabled) {
             if (g_split_secondary_queue_owner) {
@@ -100569,7 +100579,6 @@ bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
             }
         }
         // The MoE shared-context queues.
-        const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
         for (int d = 0; d < total; ++d) {
             if (sycl::queue * q = ggml_sycl::get_shared_context_queue(d)) {
                 q->wait();
@@ -100593,6 +100602,15 @@ bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
         }
         if (g_tp_device1_worker_queue) {
             g_tp_device1_worker_queue->wait();
+        }
+        // The dense block executor's copy queues.
+        {
+            std::lock_guard<std::mutex> lock(g_block_exec_copy_queue_mutex);
+            for (auto & q : g_block_exec_copy_queues) {
+                if (q) {
+                    q->wait();
+                }
+            }
         }
         // The PP pipeline copy queues, when GGML_SYCL_PP_PIPELINE created them.
         {
