@@ -3694,6 +3694,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# zhcn C7d: the runtime-context publish returns a status and never waits
+# (design gate 22b, and the publish clauses of gate 37). No BUSY retry loop or
+# sleep_for in llama-context.cpp, the shared BUSY-retry constant gone from
+# src/ and tests/, the publish's BUSY arm in the form moua's L0 (E) selects.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-publish-status-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-publish-status-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pyu4: executes the pure helpers in src/llama-auto-ubatch.h --
 # llama_auto_ubatch_ladder_has_candidate(), the predicate behind the trial's
 # early exit before its ladder loop, on the shapes where no rung lies in

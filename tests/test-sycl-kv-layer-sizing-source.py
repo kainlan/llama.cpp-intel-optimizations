@@ -390,8 +390,8 @@ def llama_context_swa_full_violations(source: str) -> list[str]:
     # search to one statement so a later call cannot satisfy an earlier one.
     for fn in ("runtime_context_fn", "probe_fn"):
         calls = re.findall(fn + r"\([^;]*?\)\s*;", source)
-        if len(calls) < 2:
-            found.append(f"expected at least two {fn}(...) call sites, found {len(calls)}")
+        if len(calls) < 1:
+            found.append(f"expected at least one {fn}(...) call site, found {len(calls)}")
         for call in calls:
             if "cparams.swa_full" not in call:
                 found.append(f"cparams.swa_full is not forwarded to {fn}")
@@ -987,7 +987,7 @@ KV_CAPACITY_SIGNATURE = "static size_t ggml_sycl_kv_capacity_live"
 TRY_DEMOTE_SIGNATURE = "static bool ggml_sycl_try_demote_runtime_kv"
 CTX_HINT_SIGNATURE = "static std::string ggml_sycl_all_vram_ctx_hint"
 LLAMA_CONTEXT_CTOR_SIGNATURE = "llama_context::llama_context("
-RESYNC_SIGNATURE = "void llama_context::sycl_resync_runtime_context_flash_attn()"
+RESYNC_SIGNATURE = "sched_reserve_result llama_context::sycl_publish_runtime_context()"
 PLAN_OWNED_BLOCK = "if (kv_plan && kv_geometry.valid()) {"
 MODE_IS_GLOBAL_SIGNATURE = "bool unified_cache_mode_is_global()"
 ANNOUNCE_LAMBDA = "auto announce_kv_host_demotions = [&](const ggml_sycl::placement_plan & final_plan) {"

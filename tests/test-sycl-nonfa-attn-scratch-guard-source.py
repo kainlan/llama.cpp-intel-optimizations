@@ -138,9 +138,9 @@ def test_llama_context_threads_real_flash_attn_state():
     matches = re.findall(
         r"runtime_context_fn\([^;]*?cparams\.n_seq_max,(?:\s*cparams\.\w+,)*\s*cparams\.flash_attn\)", ctx_norm
     )
-    assert len(matches) >= 2, (
-        "expected at least two runtime_context_fn(...) call sites in llama-context.cpp "
-        "(the initial call and the BUSY-retry loop) to pass cparams.flash_attn -- found "
+    assert len(matches) >= 1, (
+        "expected a runtime_context_fn(...) call site in llama-context.cpp (the publish; it no longer "
+        "retries on BUSY) to pass cparams.flash_attn -- found "
         f"{len(matches)}"
     )
 

@@ -18,9 +18,9 @@ call). Per c-wgxn and the task's own acceptance criteria:
   MoE model, by the GPU MoE routing ceiling
   (`ggml_backend_sycl_moe_gpu_ubatch_max()`, comment c-s747 / llama.cpp-ohkx).
 - Per candidate: Task 2's non-publishing probe
-  (`ggml_backend_sycl_probe_runtime_context_for_model`) is consulted first,
-  with a bounded exponential BUSY backoff (comment c-rkye item 3, mirroring
-  `sycl_resync_runtime_context_flash_attn()`'s own retry); STALE_IDENTITY is
+  (`ggml_backend_sycl_probe_runtime_context_for_model`) is consulted first
+  (a BUSY answer loses the candidate at once: the retry loop it once had is
+  gone, design gate 22b); STALE_IDENTITY is
   branched distinctly ("not the published model", c-rkye item 2); a refused
   or demoting candidate stops the ladder. Only a probe-accepted candidate is
   PUBLISHED (`sycl_resync_runtime_context_flash_attn()`) and given a full
@@ -563,32 +563,22 @@ def test_probe_is_called_with_the_candidate_shape():
     ), "the probe must be called with (backend, token, n_ctx, the CANDIDATE c, n_seq_max, flash_attn, &probe)"
 
 
-def test_probe_busy_retries_with_bounded_exponential_backoff():
-    """A GGML_SYCL_LIFECYCLE_BUSY probe result must retry with the same
-    bounded exponential backoff sycl_resync_runtime_context_flash_attn()
-    uses (max 7 waits, 1<<wait ms), not spin immediately or retry
-    unbounded. Quality round 1 Q5: both retries share ONE named file-scope
-    constant, llama_context_sycl_max_busy_waits -- neither loop may
-    re-declare its own local max_busy_waits."""
+def test_probe_busy_is_not_retried():
+    """A GGML_SYCL_LIFECYCLE_BUSY probe result is the module-admission
+    refusal, not lock contention: the candidate loses with "transaction
+    busy" at once. llama-context.cpp has no retry loop over a lifecycle
+    result, no sleep_for, and no llama_context_sycl_max_busy_waits (design
+    gate 22b; tests/test-sycl-publish-status-source.py pins the same for the
+    whole file and the publish)."""
+    assert "llama_context_sycl_max_busy_waits" not in LLAMA_CONTEXT_CPP_CODE, (
+        "the shared BUSY-retry bound is gone along with both retry loops"
+    )
+    assert "sleep_for" not in LLAMA_CONTEXT_CPP_CODE
+    body_norm = _normalize_ws(_try_candidate_body())
+    assert not re.search(r"for\s*\(\s*int\s+wait\b", body_norm), "the probe is not retried"
     assert re.search(
-        r"static\s+constexpr\s+int\s+llama_context_sycl_max_busy_waits\s*=\s*7\s*;", LLAMA_CONTEXT_CPP_CODE
-    ), "the shared BUSY-retry bound must be declared once as llama_context_sycl_max_busy_waits = 7"
-    assert not re.search(r"constexpr\s+int\s+max_busy_waits\s*=\s*7\s*;", LLAMA_CONTEXT_CPP_CODE), (
-        "neither retry loop may re-declare its own local max_busy_waits -- both must use the shared constant"
-    )
-
-    body_norm = _normalize_ws(_trial_body())
-    assert re.search(
-        r"for\s*\(\s*int\s+wait\s*=\s*0\s*;\s*rc\s*==\s*GGML_SYCL_LIFECYCLE_BUSY\s*&&\s*wait\s*<\s*"
-        r"llama_context_sycl_max_busy_waits\s*;\s*\+\+wait\s*\)\s*\{",
-        body_norm,
-    ), (
-        "the BUSY retry loop must be gated on rc == GGML_SYCL_LIFECYCLE_BUSY && wait < "
-        "llama_context_sycl_max_busy_waits"
-    )
-    assert "std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait))" in body_norm, (
-        "the BUSY retry must sleep 1u << wait milliseconds, matching the exponential backoff shape"
-    )
+        r'if\s*\(\s*rc\s*==\s*GGML_SYCL_LIFECYCLE_BUSY\s*\)\s*\{\s*return\s*"transaction busy"\s*;\s*\}', body_norm
+    ), 'a BUSY probe must return "transaction busy" directly'
 
 
 def test_stale_identity_branches_to_not_the_published_model():

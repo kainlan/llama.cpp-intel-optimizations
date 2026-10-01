@@ -1159,24 +1159,17 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
-#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-// llama.cpp-xojq (quality round 1 Q5): shared by this function's own BUSY
-// retry below and sycl_select_auto_ubatch()'s per-candidate probe retry --
-// previously each declared its own local `constexpr int max_busy_waits = 7;`
-// with only a comment tying the two together.
-static constexpr int llama_context_sycl_max_busy_waits = 7;
-#endif
-
-// llama.cpp-oyfl: the constructor's own call, right after model activation,
-// before any auto flash_attn_type is resolved -- the FULL runtime-context
-// transaction (KV replan, MoE MMID reaccount/materialize, plan republish),
-// since this is where n_ctx/n_ubatch are established for the context in the
-// first place. See the declaration in llama-context.h. resolve_fused_ops()
-// does NOT call this: once an AUTO flash_attn_type resolves, only
-// flash_attn_enabled has changed, so it calls the narrow
-// sycl_recheck_runtime_context_flash_attn() below instead, rather than
-// re-running this whole transaction for no reason.
-void llama_context::sycl_resync_runtime_context_flash_attn() {
+// The publish: the FULL runtime-context transaction (KV replan, MoE MMID
+// reaccount/materialize, plan republish) on every SYCL backend this context
+// has, since this is where n_ctx/n_ubatch are established for the context in
+// the first place. It returns what happened instead of throwing, and it never
+// waits: a result that is not OK is mapped by value, not retried.
+//   - every non-OK result is a REFUSED naming the result code, BUSY included;
+//     BUSY is also named a [CONTEXT-PLAN-BUG], since under the replan scope
+//     the backend answers a non-ACTIVE module with PLAN_REJECTED instead.
+// sycl_resync_runtime_context_flash_attn() below is the throwing form for the
+// callers that still run before a reserve of their own.
+sched_reserve_result llama_context::sycl_publish_runtime_context() {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     for (auto & backend : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -1200,23 +1193,38 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
             // declaration comment, ggml-sycl.h). llama.cpp-uajm:
             // cparams.swa_full likewise -- with it set llama_kv_cache_iswa
             // allocates SWA layers at full n_ctx and the planner must too.
-            auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                         cparams.kv_unified, cparams.swa_full, cparams.flash_attn);
-            // Context construction may overlap enough live updates to
-            // exhaust the model's finite ticket pool transiently. Wait
-            // with bounded exponential backoff instead of spinning three
-            // immediate calls; preserve BUSY if capacity never frees.
-            for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < llama_context_sycl_max_busy_waits; ++wait) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
-                rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                        cparams.kv_unified, cparams.swa_full, cparams.flash_attn);
+            const auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
+                                               cparams.kv_unified, cparams.swa_full, cparams.flash_attn);
+            // Under the process-global replan scope (L0) the backend's module
+            // guard is the single emission site for "the module is not
+            // ACTIVE": it logs, aborts under strict and answers PLAN_REJECTED,
+            // never BUSY. A BUSY that still reaches this call means the guard
+            // drifted, so say so; the REFUSED below carries the result code.
+            if (rc == GGML_SYCL_LIFECYCLE_BUSY) {
+                LLAMA_LOG_ERROR(
+                    "[CONTEXT-PLAN-BUG] publish answered BUSY under the replan scope: module guard drifted\n");
             }
             if (rc != GGML_SYCL_LIFECYCLE_OK) {
-                throw std::runtime_error(format("failed to activate exact SYCL model plan: result=%d", (int) rc));
+                return { sched_reserve_status::REFUSED,
+                         format("failed to activate exact SYCL model plan: result=%d", (int) rc) };
             }
         }
     }
 #endif
+    return { sched_reserve_status::OK, "" };
+}
+
+// llama.cpp-oyfl: the constructor's own call, right after model activation,
+// before any auto flash_attn_type is resolved. See the declaration in
+// llama-context.h. resolve_fused_ops() does NOT call this: once an AUTO
+// flash_attn_type resolves, only flash_attn_enabled has changed, so it calls
+// the narrow sycl_recheck_runtime_context_flash_attn() below instead, rather
+// than re-running this whole transaction for no reason.
+void llama_context::sycl_resync_runtime_context_flash_attn() {
+    const sched_reserve_result result = sycl_publish_runtime_context();
+    if (result.status != sched_reserve_status::OK) {
+        throw std::runtime_error(result.reason);
+    }
 }
 
 // llama.cpp-oyfl: the narrow re-check, called ONLY by resolve_fused_ops()
@@ -1561,20 +1569,11 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
             // actually publish with, or its accept/reject answer is for the
             // wrong KV shape (ggml-sycl.h, this probe's declaration).
             // llama.cpp-uajm: and the same swa_full, for the same reason.
-            auto rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.kv_unified,
-                               cparams.swa_full, cparams.flash_attn, &probe);
+            const auto rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.kv_unified,
+                                     cparams.swa_full, cparams.flash_attn, &probe);
 
-            // Same bounded exponential backoff as
-            // sycl_resync_runtime_context_flash_attn()'s own BUSY retry
-            // above -- transient lease/lock contention, not a
-            // candidate-shape refusal. Shares llama_context_sycl_max_busy_
-            // waits with that retry (quality round 1 Q5).
-            for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < llama_context_sycl_max_busy_waits; ++wait) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
-                rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.kv_unified,
-                              cparams.swa_full, cparams.flash_attn, &probe);
-            }
-
+            // BUSY is the module-admission refusal, not lock contention, so
+            // the probe is not retried: the candidate simply loses.
             if (rc == GGML_SYCL_LIFECYCLE_BUSY) {
                 return "transaction busy";
             }

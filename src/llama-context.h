@@ -341,6 +341,12 @@ private:
     // then only flash_attn_enabled has changed, not n_ctx/n_ubatch.
     void sycl_resync_runtime_context_flash_attn();
 
+    // The same transaction as a status instead of an exception, never
+    // retrying: every non-OK result is REFUSED (a BUSY is additionally a
+    // [CONTEXT-PLAN-BUG]). sycl_resync_runtime_context_flash_attn() is this
+    // call, throwing the reason of a non-OK result.
+    sched_reserve_result sycl_publish_runtime_context();
+
     // llama.cpp-oyfl: a NARROW re-check of only the non-FA attention
     // scratch guard, called once from resolve_fused_ops()
     // when an AUTO flash_attn_type actually resolves -- the constructor's

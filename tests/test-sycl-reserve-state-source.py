@@ -178,7 +178,7 @@ def test_wrapper_mutants():
     mutants = [
         ("a member dropped from the state", "n_input_tensors, cparams };", "cparams };"),
         ("members in the wrong order", "return { sched, gf_res_prev, gf_res_reserve,", "return { sched, gf_res_reserve, gf_res_prev,"),
-        ("status ignored", "if (result.status != sched_reserve_status::OK) {", "if (false) {"),
+        ("status ignored", "sched_reserve_impl(sched_reserve_mode::ALLOC, state); if (result.status != sched_reserve_status::OK) {", "sched_reserve_impl(sched_reserve_mode::ALLOC, state); if (false) {"),
         ("MEASURE passed by the wrapper", "sched_reserve_impl(sched_reserve_mode::ALLOC, state);", "sched_reserve_impl(sched_reserve_mode::MEASURE, state);"),
         ("early return dropped", "if (!sched_need_reserve) { return; }", ""),
     ]
