@@ -1378,6 +1378,32 @@ static std::atomic<bool> g_test_pause_arena_registry_commit{ false };
 static std::atomic<bool> g_test_arena_registry_commit_reached{ false };
 #endif
 
+// Claim `ptr` for a registry row that is about to be inserted.  Caller holds g_runtime_alloc_mutex.
+//
+// A release marks its row RELEASING, drops the mutex, frees the physical block (a host zone
+// returns it to the TLSF immediately) and only then re-locks to erase the row.  In that window an
+// allocation on another thread can be handed the recycled address.  The row found there is not
+// live authority: the allocator just handed the address out, so the block it described is already
+// free.  Failing the allocation on it (the old behaviour) surfaced as alloc_err=4
+// (metadata_publication_failed) on a 2.5 MB staging request with ~195 GB free, and as the MoE CPU
+// path's "Failed to allocate pinned host memory" (llama.cpp-93tw).  The releaser's later erase and
+// rollback both match the complete allocation key (id included) and the claim's release
+// generation, so they leave a row that replaced the stale one alone.
+//
+// A LIVE row at the address is a different matter: two live allocations sharing an address is
+// corruption, and that still refuses.
+static bool runtime_registry_claim_ptr_locked(void * ptr) noexcept {
+    const auto it = g_runtime_alloc_registry.find(ptr);
+    if (it == g_runtime_alloc_registry.end()) {
+        return true;
+    }
+    if (it->second.state != runtime_alloc_state::RELEASING) {
+        return false;
+    }
+    g_runtime_alloc_registry.erase(it);
+    return true;
+}
+
 static bool arena_runtime_registry_commit(void * ptr, const arena_authority::allocation_record & exact,
                                           void * opaque) noexcept {
     auto & context = *static_cast<arena_runtime_publication_context *>(opaque);
@@ -1402,8 +1428,11 @@ static bool arena_runtime_registry_commit(void * ptr, const arena_authority::all
         if (context.control) rec.handle = context.control->metadata();
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         // A live pointer row is authority. Never replace it with an allocation
-        // from a recycled TLSF address; failure rolls this allocation back.
-        if (g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end()) return false;
+        // from a recycled TLSF address; failure rolls this allocation back. A row
+        // already RELEASING is stale by construction (llama.cpp-93tw).
+        if (!runtime_registry_claim_ptr_locked(ptr)) {
+            return false;
+        }
         auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
         if (!inserted.second) return false;
         try {
@@ -15639,7 +15668,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     g_host_zone_epoch[static_cast<size_t>(rec.handle.host_zone)].load(std::memory_order_relaxed);
             }
             try {
-                if (g_runtime_alloc_registry.find(ptr) == g_runtime_alloc_registry.end()) {
+                if (runtime_registry_claim_ptr_locked(ptr)) {
                     auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
                     if (inserted.second) {
                         try {
