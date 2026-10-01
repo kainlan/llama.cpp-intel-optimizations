@@ -248,6 +248,7 @@ def load_tree(root):
 _PARSE = {}      # sha1 -> root node
 _STRUCTS = {}    # sha1 -> ([(struct name, [(member base type, is_value)])], [(alias, target base type, is_value)])
 _FUNCS = {}      # sha1 -> file_funcs rows
+_MEMBERS = {}    # sha1 -> file_members rows
 _FACTS = {}      # (rel, sha1, ctx digest) -> facts dict (every fact key embeds rel, so rel is in the cache key)
 
 
@@ -386,6 +387,22 @@ def file_funcs(src):
     return _FUNCS[h]
 
 
+def file_members(src):
+    """(declared base type, member name) of every field declaration in a file; cached, since Ctx is rebuilt per case."""
+    h = _sha(src)
+    if h not in _MEMBERS:
+        out = []
+        for n in walk(parse(src)):
+            if kind(n) == "field_declaration":
+                t = fld(n, "type")
+                if t is not None:
+                    for d in kids(n):
+                        if not same(d, t) and kind(d) == "field_identifier":
+                            out.append((base_type(txt(src, t)), txt(src, d)))
+        _MEMBERS[h] = out
+    return _MEMBERS[h]
+
+
 def callee_last(text):
     """Last component of a callee spelling: a::b.c<int>  ->  c."""
     text = re.sub(r"<[^<>]*(?:<[^<>]*>[^<>]*)*>", "", text)
@@ -405,13 +422,9 @@ class Ctx:
                     self.req_returning.add(name)
                 if any(pb in self.value_types and pv for pb, pv in params):
                     self.req_funcs.add(name)
-            for n in walk(parse(src)):
-                if kind(n) == "field_declaration":
-                    t = fld(n, "type")
-                    if t is not None and base_type(txt(src, t)) in self.value_types:
-                        for d in kids(n):
-                            if not same(d, t) and kind(d) == "field_identifier":
-                                self.req_members.add(txt(src, d))
+            for tbase, name in file_members(src):
+                if tbase in self.value_types:
+                    self.req_members.add(name)
         self.digest = hashlib.sha1(repr((sorted(self.value_types), sorted(self.all_types), sorted(self.req_funcs),
                                          sorted(self.req_returning), sorted(self.req_members))).encode()).hexdigest()
 
