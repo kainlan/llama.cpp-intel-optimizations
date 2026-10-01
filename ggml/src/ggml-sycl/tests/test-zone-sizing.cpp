@@ -839,6 +839,13 @@ int main() {
               "one byte into the hold is held back");
         CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 300 * 1024, hold, 300 * 1024 + 1),
               "the incident's zone-full request one byte over the free bytes is an ordinary spill");
+        // The B70 / Qwen3.6-27B run at auto-ub2048 (hardware, review r2): three compute-buffer requests of about
+        // 1 GiB each asked a RUNTIME zone with 0.3 MB free while the hold was 9.6 MB. They are ordinary zone-full
+        // spills, 2.9 GB in all; none of them is held back by the hold.
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 300 * 1024, 10027264, 1003413 * 1024),
+              "a ~1 GiB compute buffer asking a 0.3 MB-free zone is an ordinary spill, not held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 300 * 1024, 10027264, (size_t) 3 << 30),
+              "a multi-GB request larger than the free bytes is never held back");
         // Argument order is part of the contract: (runtime, forbid, available, hold, size). The zone's free bytes
         // are the first of the three sizes; swapped with the request, the same numbers answer another question.
         CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 10, 95) &&
