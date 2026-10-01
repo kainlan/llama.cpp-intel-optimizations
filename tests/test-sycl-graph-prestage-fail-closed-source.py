@@ -29,6 +29,14 @@ host-resident input), so each now goes through graph_prestage_or_decline and, on
 directly. The gate enumerates every call of graph_prestage_leaf_tensors: the only legal caller is
 graph_prestage_or_decline itself, so a new recording site that pre-stages without consuming the result fails.
 
+A declined pre-stage must not leave a recorded graph that points at a staging buffer it may have replaced
+(review r5). graph_input_stage drops an input's staging handle before it allocates the replacement, so a
+failure partway through can leave a live exec graph, MoE segments, block graphlets or dense range graphs
+with a baked pointer to freed memory. The only owner of that handle is the per-context staging map (it is not
+in graph_retained_handles); it is cleared by sycl_exec_graph_clear_active after a queue wait. So each decline
+drops the recorded state it could have invalidated: clear_active (which waits) for the exec graph, and the
+epoch-retiring invalidators the MoE and dense paths already use.
+
 The decline memo (review fold M2) lives on the context, not in a thread_local slot: a (ctx pointer, hash) slot
 was evicted by every other signature (PP and decode alternate) and was keyed by an address a new context can
 reuse. A staging failure is also not permanent for a signature: the memo forgets it after a bounded number of
@@ -151,7 +159,7 @@ def evaluate(backend, common, memo_hdr):
     results["the decline returns false on failure"] = "return false" in decline
     results["a declined graph is remembered on the context, so the pass is not repeated per token"] = \
         "prestage_decline_memo.remember(graph_hash)" in decline and \
-        "prestage_decline_memo.skip(graph_hash)" in declined
+        re.search(r"prestage_decline_memo\.skip\(graph_hash,\s*ctx->graph_compute_seq\)", declined) is not None
     results["the decline memo is not a thread-local or process-wide slot"] = \
         "thread_local" not in decline and "thread_local" not in declined and "g_graph_prestage_skip_declined" not in backend
     results["the context owns the decline memo"] = re.search(r"graph_prestage_decline_memo\s+prestage_decline_memo\s*;", common) is not None
@@ -159,6 +167,12 @@ def evaluate(backend, common, memo_hdr):
         re.search(r"retry_after\s*=\s*\d+", memo_hdr) is not None and "erase(" in memo_hdr
     results["the memo holds several signatures at once"] = \
         "std::vector" in memo_hdr and re.search(r"max_entries\s*=\s*\d+", memo_hdr) is not None
+    results["the memo counts a signature once per token, however many sites ask"] = \
+        "last_seq" in memo_hdr and re.search(r"bool\s+skip\(uint64_t\s+hash,\s*uint64_t\s+seq\)", memo_hdr) is not None
+    results["the context numbers its graph computes, so the memo can tell tokens apart"] = \
+        re.search(r"graph_compute_seq\s*;", common) is not None and \
+        re.search(r"(\+\+\s*sycl_ctx->graph_compute_seq|sycl_ctx->graph_compute_seq\s*\+\+)", compute) is not None and \
+        0 <= re.search(r"graph_compute_seq", compute).start() < compute.find("graph_prestage_skip_declined(")
     results["the dense split key is namespaced, so one memo never mixes two key spaces"] = \
         re.search(r"static\s+uint64_t\s+dense_split_key\(", memo_hdr) is not None
     results["a successful pre-stage forgets an earlier decline"] = "prestage_decline_memo.forget(graph_hash)" in decline
@@ -207,15 +221,17 @@ def evaluate(backend, common, memo_hdr):
     call = r"graph_prestage_or_decline\(%s\)"
     dense = function_body(backend, r"void prepare_graphs\(\)\s*\{") or ""
     graphlets = function_body(backend, r"static bool moe_graph_try_block_graphlets\([^)]*\)\s*\{") or ""
-    results["site 1, dense split recorder: declines with STAGE_FAILED and returns"] = \
+    results["site 1, dense split recorder: declines with STAGE_FAILED, drops its graphs and returns"] = \
         re.search(r"if\s*\(any_missing\s*&&\s*!" + call % r"&ctx_,\s*cgraph_,\s*graph_prestage_decline_memo::dense_split_key\(key\)" +
-                  r"\)\s*\{\s*graphs_off_\s*=\s*ggml_sycl::DENSE_GRAPH_OFF_STAGE_FAILED;\s*return;\s*\}", dense) is not None
-    results["site 2, MoE block graphlets: declines and returns false to the direct fallback"] = re.search(
-        r"if\s*\(!" + call % r"sycl_ctx,\s*cgraph,\s*graph_hash" + r"\)\s*\{[^{}]*\breturn false;\s*\}", graphlets) is not None
+                  r"\)\s*\{\s*graphs_off_\s*=\s*ggml_sycl::DENSE_GRAPH_OFF_STAGE_FAILED;\s*st\.drop_graphs\(ctx_\);\s*return;\s*\}",
+                  dense) is not None
+    results["site 2, MoE block graphlets: declines, invalidates them and returns false to the direct fallback"] = re.search(
+        r"if\s*\(!" + call % r"sycl_ctx,\s*cgraph,\s*graph_hash" + r"\)\s*\{[^{}]*invalidate_moe_block_graphs\(\);[^{}]*\breturn false;\s*\}",
+        graphlets) is not None
     site = r"if\s*\(!" + call % r"sycl_ctx,\s*cgraph,\s*graph_hash" + r"\)\s*\{\s*"
-    results["site 3, MoE segment replay: declines and runs direct, else replays"] = re.search(
-        site + r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*"
-        r"moe_graph_replay_segments\(", compute) is not None
+    results["site 3, MoE segment replay: declines, invalidates the segments, runs direct, else replays"] = re.search(
+        site + r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*"
+        r"graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*moe_graph_replay_segments\(", compute) is not None
     results["site 4, MoE segment record: declines and runs direct, else records"] = re.search(
         r"\}\s*else\s*" + site + r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*"
         r"sycl_ctx->invalidate_moe_segments\(\);", compute) is not None
@@ -223,18 +239,42 @@ def evaluate(backend, common, memo_hdr):
     rerecord_at = compute.find("re-record + update (%s)")
     # the FIRST pre-stage after the re-record anchor, matched from its own `if` (a later site must not satisfy it)
     rr_call = compute.find("graph_prestage_or_decline(", rerecord_at) if rerecord_at >= 0 else -1
-    rr_decline = re.match(site + exit_direct, compute[compute.rfind("if", 0, rr_call):]) if rr_call >= 0 else None
-    results["site 5, full re-record: declines and leaves for the direct path"] = rr_decline is not None
+    rr_decline = re.match(site + r"sycl_exec_graph_clear_active\(sycl_ctx, \"prestage-declined\"\);\s*" + exit_direct,
+                          compute[compute.rfind("if", 0, rr_call):]) if rr_call >= 0 else None
+    results["site 5, full re-record: declines, clears the live graph (after a wait) and leaves for the direct path"] = \
+        rr_decline is not None
     first_at = compute.find("Pre-staging leaf tensors before recording")
     results["site 6, full first record: declines and leaves for the direct path"] = \
         first_at >= 0 and re.match(r"[^;]*;\s*" + site + exit_direct, compute[first_at:]) is not None
 
     # Re-record tears the live exec graph down (reset, release the retained pool, mark inactive). The decline is
-    # decided BEFORE that: a transient staging failure must not destroy a graph the last replay may still have in
-    # flight, nor leave its pins and hash stale.
-    teardown = compute.find("exec_graph.reset()", rerecord_at) if rerecord_at >= 0 else -1
-    results["re-record decides the decline before tearing the live graph down"] = \
-        rr_decline is not None and teardown >= 0 and rr_call < teardown
+    # decided BEFORE every one of them: a transient staging failure must not destroy a graph the last replay may
+    # still have in flight, nor leave its pins and hash stale, and the attempt is only counted once the pre-stage
+    # let it proceed.
+    def first_after(needle):
+        return compute.find(needle, rerecord_at) if rerecord_at >= 0 else -1
+
+    actions = {"exec_graph.reset()": first_after("exec_graph.reset()"),
+               "release_pool_retained(": first_after("release_pool_retained("),
+               "active_exec_graph.valid = false": first_after("active_exec_graph.valid = false"),
+               "rerecord_attempts": first_after("rerecord_attempts.fetch_add")}
+    results["re-record decides the decline before every teardown action and before counting the attempt"] = \
+        rr_decline is not None and all(at >= 0 and rr_call < at for at in actions.values())
+
+    # The six sites appear in this order, each decline strictly between its neighbours' anchors. A decline block
+    # that moved (with its debug string) past a begin_recording, or into another site's region, still satisfies
+    # every per-site shape above; the order is what pins where it sits.
+    begin = [m.start() for m in re.finditer(r"model_sycl_graph\.begin_recording\(", compute)]
+    s3 = re.search(r"moe_graph_replay_segments\(", compute)
+    s4 = re.search(r"moe_graph_record_segments\(", compute)
+    first_call = compute.find("graph_prestage_or_decline(", first_at) if first_at >= 0 else -1
+    chain = [("segment replay", s3.start() if s3 else -1), ("segment record", s4.start() if s4 else -1),
+             ("re-record anchor", rerecord_at), ("re-record decline", rr_call),
+             ("re-record begin_recording", begin[0] if len(begin) == 2 else -1),
+             ("first-record anchor", first_at), ("first-record decline", first_call),
+             ("first-record begin_recording", begin[1] if len(begin) == 2 else -1)]
+    results["the recording sites keep their order, each decline between its neighbours (and before its recording)"] = \
+        all(at >= 0 for _, at in chain) and all(chain[i][1] < chain[i + 1][1] for i in range(len(chain) - 1))
     return results
 
 
@@ -287,6 +327,19 @@ if args.self_test:
     cmp_sig = r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{"
     # the first full-graph recording site (the debug line just above it is the anchor)
     full_sig = r"Pre-staging leaf tensors before recording[^;]*;"
+    def move_first_record_decline(src):
+        """Move the first-record decline block, with its debug string, to just after that recording begins."""
+        m = re.search(r"GGML_SYCL_DEBUG\(\"\[SYCL-GRAPH\] Pre-staging leaf tensors before recording[^;]*;\s*"
+                      r"if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{[^{}]*\}", src)
+        if not m:
+            print("FAIL: self-test anchor missing: first-record decline block")
+            failed.append("self-test anchor first-record decline block")
+            return src
+        block = m.group(0)
+        rest = src[:m.start()] + src[m.end():]
+        b = re.compile(r"model_sycl_graph\.begin_recording\([^;]*;").search(rest, m.start())
+        return rest[:b.end()] + "\n" + block + "\n" + rest[b.end():]
+
     mem_ = memo_hdr
     mutants = [
         ("flag-only INPUT test in pre-stage", "pre-stage has no flag-only INPUT test left",
@@ -338,40 +391,77 @@ if args.self_test:
          (mutate_in_func(backend, cmp_sig, "if (!graph_prestage_or_decline(", "(void) (graph_prestage_or_decline("),
           common, mem_)),
         ("dense decline without its return",
-         "site 1, dense split recorder: declines with STAGE_FAILED and returns",
+         "site 1, dense split recorder: declines with STAGE_FAILED, drops its graphs and returns",
          (mutate_re(backend, r"void prepare_graphs\(\)\s*\{", r"DENSE_GRAPH_OFF_STAGE_FAILED;\s*return;",
                     "DENSE_GRAPH_OFF_STAGE_FAILED;"), common, mem_)),
         ("dense key not namespaced",
-         "site 1, dense split recorder: declines with STAGE_FAILED and returns",
+         "site 1, dense split recorder: declines with STAGE_FAILED, drops its graphs and returns",
          (mutate_in_func(backend, r"void prepare_graphs\(\)\s*\{", "graph_prestage_decline_memo::dense_split_key(key)",
                          "key"), common, mem_)),
         ("memo drops its dense key helper", "the dense split key is namespaced, so one memo never mixes two key spaces",
          (backend, common, mem_.replace("dense_split_key", "dense_split_keyX"))),
-        ("block graphlets drop their decline", "site 2, MoE block graphlets: declines and returns false to the direct fallback",
+        ("block graphlets drop their decline", "site 2, MoE block graphlets: declines, invalidates them and returns false to the direct fallback",
          (mutate_in_func(backend, r"static bool moe_graph_try_block_graphlets\([^)]*\)\s*\{",
                          "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash))", "if (false)"), common, mem_)),
         ("block graphlet decline falls through",
-         "site 2, MoE block graphlets: declines and returns false to the direct fallback",
+         "site 2, MoE block graphlets: declines, invalidates them and returns false to the direct fallback",
          (mutate_in_func(backend, r"static bool moe_graph_try_block_graphlets\([^)]*\)\s*\{",
                          "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {",
                          "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { (void) 0;"
                          " } if (false) {"), common, mem_)),
-        ("segment replay decline is dead", "site 3, MoE segment replay: declines and runs direct, else replays",
+        ("segment replay decline is dead", "site 3, MoE segment replay: declines, invalidates the segments, runs direct, else replays",
          (mutate_in_func(backend, cmp_sig, "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {",
                          "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash) && false) {"), common, mem_)),
         ("segment record decline loses its direct run", "site 4, MoE segment record: declines and runs direct, else records",
          (mutate_re(backend, cmp_sig, r"\}\s*else if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{\s*compute_impl_unlocked\(\);",
                     "} else if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { (void) 0;"), common, mem_)),
-        ("re-record decline is unconditional-tail", "site 5, full re-record: declines and leaves for the direct path",
+        ("re-record decline is unconditional-tail", "site 5, full re-record: declines, clears the live graph (after a wait) and leaves for the direct path",
          (mutate_re(backend, r"re-record \+ update \(%s\)", r"if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{",
                     "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash) || true) {"), common, mem_)),
         ("first record decline does not leave", "site 6, full first record: declines and leaves for the direct path",
          (mutate_re(backend, full_sig, r"compute_impl_unlocked\(\);\s*record_completion\(false\);\s*return GGML_STATUS_SUCCESS;",
                     "compute_impl_unlocked();"), common, mem_)),
-        ("re-record tears down before it decides", "re-record decides the decline before tearing the live graph down",
-         (mutate_re(backend, r"re-record \+ update \(%s\)", r"g_graph_diag_counters\.rerecord_attempts\.fetch_add\(1, std::memory_order_relaxed\);",
+        ("re-record resets the exec graph before it decides",
+         "re-record decides the decline before every teardown action and before counting the attempt",
+         (mutate_re(backend, r"re-record \+ update \(%s\)", r"if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{\s*sycl_exec_graph_clear_active",
+                    "sycl_ctx->exec_graph.reset(); if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { "
+                    "sycl_exec_graph_clear_active"), common, mem_)),
+        ("re-record releases the retained pool before it decides",
+         "re-record decides the decline before every teardown action and before counting the attempt",
+         (mutate_re(backend, r"re-record \+ update \(%s\)", r"if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{\s*sycl_exec_graph_clear_active",
+                    "sycl_exec_graph_release_pool_retained(sycl_ctx); if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { "
+                    "sycl_exec_graph_clear_active"), common, mem_)),
+        ("re-record marks the graph inactive before it decides",
+         "re-record decides the decline before every teardown action and before counting the attempt",
+         (mutate_re(backend, r"re-record \+ update \(%s\)", r"if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{\s*sycl_exec_graph_clear_active",
+                    "sycl_ctx->active_exec_graph.valid = false; if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { "
+                    "sycl_exec_graph_clear_active"), common, mem_)),
+        ("re-record counts the attempt before it decides",
+         "re-record decides the decline before every teardown action and before counting the attempt",
+         (mutate_re(backend, r"re-record \+ update \(%s\)", r"if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{\s*sycl_exec_graph_clear_active",
                     "g_graph_diag_counters.rerecord_attempts.fetch_add(1, std::memory_order_relaxed); "
-                    "sycl_ctx->exec_graph.reset();"), common, mem_)),
+                    "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { sycl_exec_graph_clear_active"),
+          common, mem_)),
+        ("re-record decline stops clearing the graph", "site 5, full re-record: declines, clears the live graph (after a wait) and leaves for the direct path",
+         (mutate_in_func(backend, r"re-record \+ update \(%s\)", "sycl_exec_graph_clear_active(sycl_ctx, \"prestage-declined\");",
+                         ""), common, mem_)),
+        ("dense decline keeps its graphs", "site 1, dense split recorder: declines with STAGE_FAILED, drops its graphs and returns",
+         (mutate_re(backend, r"void prepare_graphs\(\)\s*\{", r"st\.drop_graphs\(ctx_\);\s*return;", "return;"),
+          common, mem_)),
+        ("graphlet decline keeps its graphs", "site 2, MoE block graphlets: declines, invalidates them and returns false to the direct fallback",
+         (mutate_re(backend, r"static bool moe_graph_try_block_graphlets\([^)]*\)\s*\{",
+                    r"if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{[^{}]*\}",
+                    "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { return false; }"), common, mem_)),
+        ("segment replay decline keeps its segments", "site 3, MoE segment replay: declines, invalidates the segments, runs direct, else replays",
+         (mutate_re(backend, cmp_sig, r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\} else \{\s*graph_refresh_input_tensors",
+                    "compute_impl_unlocked();\n } else {\n graph_refresh_input_tensors"), common, mem_)),
+        ("first-record decline moves past begin_recording",
+         "the recording sites keep their order, each decline between its neighbours (and before its recording)",
+         (move_first_record_decline(backend), common, mem_)),
+        ("memo ignores the token number", "the memo counts a signature once per token, however many sites ask",
+         (backend, common, mem_.replace("last_seq", "last_sXq"))),
+        ("context stops numbering its computes", "the context numbers its graph computes, so the memo can tell tokens apart",
+         (mutate_in_func(backend, cmp_sig, "++sycl_ctx->graph_compute_seq", "(void) sycl_ctx"), common, mem_)),
         ("a seventh recorder appears", "no unnamed pre-stage consumer: the six recording sites below are all there are",
          (backend + "\nstatic bool new_recorder(ggml_backend_sycl_context * c, const ggml_cgraph * g) "
                     "{ if (!graph_prestage_or_decline(c, g, 1)) { return false; } return true; }\n", common, mem_)),

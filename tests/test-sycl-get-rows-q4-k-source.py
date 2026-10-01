@@ -204,7 +204,11 @@ def evaluate(backend, getrows, support, kquant, common, sources, raw_support):
             "GGML_ABORT" in helper
     default_arm = slice_[slice_.find("default:"):] if "default:" in slice_ else ""
     results["slice: the default arm refuses through the helper"] = "get_rows_host_weight_unsupported(" in default_arm
-    q4k_guard = re.search(r"GGML_TYPE_Q4_K[^;{]*\)\s*\{\s*get_rows_host_weight_unsupported\(", op)
+    # the EXACT condition: a `&& false`, an inverted location test or a dropped cache_view_valid would each slip
+    # past a loose match (the inverted one would abort every device-resident token_embd)
+    q4k_guard = re.search(r"if\s*\(src0->type\s*==\s*GGML_TYPE_Q4_K\s*&&\s*cache_view_valid\s*&&\s*"
+                          r"cache_view\.location\s*!=\s*ggml_sycl::cache_location::DEVICE\)\s*\{\s*"
+                          r"get_rows_host_weight_unsupported\(src0\);\s*\}", op)
     stream_at = op.find("get_rows_build_stream_segments(")
     results["op: a Q4_K weight that is not on the device is refused before any stream segments are built"] = \
         q4k_guard is not None and 0 <= q4k_guard.start() < stream_at
@@ -307,6 +311,17 @@ if args.self_test:
         ("op skips the early host-weight refusal",
          "op: a Q4_K weight that is not on the device is refused before any stream segments are built",
          with_(getrows=mutate(getrows, OP_SIG, "get_rows_host_weight_unsupported(", "get_rows_host_weight_unsupportedX("))),
+        ("host-weight refusal gets a dead tail", "op: a Q4_K weight that is not on the device is refused before any stream segments are built",
+         with_(getrows=mutate(getrows, OP_SIG, "cache_view.location != ggml_sycl::cache_location::DEVICE) {\n        get_rows_host_weight_unsupported",
+                              "cache_view.location != ggml_sycl::cache_location::DEVICE && false) {\n        get_rows_host_weight_unsupported"))),
+        ("host-weight refusal tests the location inverted",
+         "op: a Q4_K weight that is not on the device is refused before any stream segments are built",
+         with_(getrows=mutate(getrows, OP_SIG, "cache_view.location != ggml_sycl::cache_location::DEVICE) {\n        get_rows_host_weight_unsupported",
+                              "cache_view.location == ggml_sycl::cache_location::DEVICE) {\n        get_rows_host_weight_unsupported"))),
+        ("host-weight refusal drops cache_view_valid",
+         "op: a Q4_K weight that is not on the device is refused before any stream segments are built",
+         with_(getrows=mutate(getrows, OP_SIG, "src0->type == GGML_TYPE_Q4_K && cache_view_valid && cache_view.location",
+                              "src0->type == GGML_TYPE_Q4_K && cache_view.location"))),
         ("slice default aborts anonymously", "slice: the default arm refuses through the helper",
          with_(getrows=mutate(getrows, SLICE_SIG, "get_rows_host_weight_unsupported(", "GGML_ABORT_X("))),
         ("refusal loses its ticket", "the host-weight refusal names the tensor, the tiering and its ticket",
