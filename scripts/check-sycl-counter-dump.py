@@ -746,6 +746,16 @@ def check(files, cmake):
                 fails.append(f"H13 G0: {name} has an increment ({rel}:{line_of(text, m.start())}) "
                              f"but is declared not captured")
 
+    # An armed-only counter prints not_captured unless the report sites' armed flag read armed, and that flag
+    # records its reading for the printer, so an unarmed or never-evaluated 0 cannot read as a measured 0.
+    for name in ARMED_ONLY_COUNTERS:
+        if pred is None or not (re.search(r"\bdump_counter::" + name + r"\b", pred) and "g_dump_armed_state" in pred):
+            fails.append(f"H13 G0: armed-only counter {name} is not tied to the armed reading in dump_counter_captured")
+    armed_fn = function_text(stripped.get("ggml-sycl.cpp", ""), "ggml_sycl_dump_report_armed")
+    if armed_fn is None or "unified_cache_dump_note_armed" not in armed_fn:
+        fails.append("H13 G0: ggml_sycl_dump_report_armed does not record its reading for the dump "
+                     "(unified_cache_dump_note_armed)")
+
     # The interim keys of onednn_graph_route_declined.
     key_re = re.compile(r"dump_counter_add_key\s*\(\s*dump_counter::" + ROUTE_COUNTER + r"\s*,[^;]*?\"(\w+)\"",
                         re.S)
@@ -1202,6 +1212,16 @@ def mutation_matrix(files, cmake):
         "ggml_sycl::dump_counter::onednn_graph_callback_unmarked_mallocs, d); }\n")
     muts.append(("callback unmarked-malloc field given an increment",
                  "H13 G0: onednn_graph_callback_unmarked_mallocs has an increment", f, cmake))
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
+        "return g_dump_armed_state.load(std::memory_order_relaxed) == 1;", "return true;", 1)
+    muts.append(("armed-only counter no longer tied to the armed reading",
+                 "H13 G0: armed-only counter moe_table_reach_zero_gpu_expert is not tied to the armed reading", f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"].replace(
+        "ggml_sycl::unified_cache_dump_note_armed(a);", "(void) a;", 1)
+    muts.append(("armed flag no longer records its reading",
+                 "H13 G0: ggml_sycl_dump_report_armed does not record its reading", f, cmake))
     f = clone()
     f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
         "           c != static_cast<size_t>(dump_counter::onednn_graph_callback_unmarked_mallocs);", "           true;", 1)

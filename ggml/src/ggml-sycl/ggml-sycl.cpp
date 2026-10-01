@@ -26051,7 +26051,11 @@ static bool ggml_sycl_moe_plan_has_host_experts(const ggml_tensor * src0, int de
 // G0 report sites sit on per-op paths (mul_mat dispatch, the MoE pointer-table entries), where a getenv
 // per call is a libc scan per op. A host test that needs both arms runs each in its own process.
 static bool ggml_sycl_dump_report_armed() {
-    static const bool armed = ggml_sycl::unified_cache_dump_report_enabled();
+    static const bool armed = [] {
+        const bool a = ggml_sycl::unified_cache_dump_report_enabled();
+        ggml_sycl::unified_cache_dump_note_armed(a);  // the dump marks the armed-only counter by this
+        return a;
+    }();
     return armed;
 }
 

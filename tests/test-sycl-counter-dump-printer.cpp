@@ -255,6 +255,26 @@ int main(int argc, char ** argv) {
     check(index_of(lines, "[SYCL-COUNTER] dev=1 name=ext_alloc_count value=5") > first_snap,
           "device 1 follows device 0's snapshots");
 
+    // --- the armed-only counter -----------------------------------------------------------------------
+    // moe_table_reach_zero_gpu_expert evaluates only in a run whose report flag read armed, so the dump
+    // marks it: not_captured until that reading is recorded armed, never a bare 0.
+    {
+        const char * armed_only = "[SYCL-COUNTER] dev=0 name=moe_table_reach_zero_gpu_expert value=";
+        const auto   never      = split_lines(capture_stderr([] { unified_cache_test_counter_dump(); }));
+        check(has_line(never, std::string(armed_only) + "not_captured"),
+              "an armed-only counter whose flag was never read prints not_captured");
+        unified_cache_dump_note_armed(false);
+        check(has_line(split_lines(capture_stderr([] { unified_cache_test_counter_dump(); })),
+                       std::string(armed_only) + "not_captured"),
+              "an armed-only counter prints not_captured when the flag read unarmed");
+        unified_cache_dump_counter_add_key(dump_counter::moe_table_reach_zero_gpu_expert, 0, "update:preload", 2);
+        unified_cache_dump_note_armed(true);
+        const auto armed = split_lines(capture_stderr([] { unified_cache_test_counter_dump(); }));
+        check(has_line(armed, std::string(armed_only) + "2") &&
+                  has_line(armed, "[SYCL-COUNTER] dev=0 name=moe_table_reach_zero_gpu_expert{update:preload} value=2"),
+              "an armed-only counter prints its value and keys once the flag read armed");
+    }
+
     // --- the key table ---------------------------------------------------------------------------
     for (int i = 0; i < 64; ++i) {
         char key[32];

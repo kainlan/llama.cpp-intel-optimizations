@@ -4128,7 +4128,16 @@ const char * dump_site_basename(const char * file) {
 // onednn_graph_callback_unmarked_mallocs is the same case: it counts a Graph-callback malloc with no
 // compute marker set, and the marker (design §5.4(b), g_sycl_compute_marker) lands at step 3 with the
 // late-refusal channel, so nothing on this tree can say whether a marker is set. Step 3 flips it.
+//
+// moe_table_reach_zero_gpu_expert has a producer but evaluates only when the report sites' armed flag read
+// armed (its zero test walks the plan once per expert per call), so it reads not_captured unless that flag
+// has been read and read armed: an unarmed or never-evaluated 0 is not a measured 0.
+std::atomic<int> g_dump_armed_state{ 0 };  // 0 never read, 1 read armed, 2 read unarmed
+
 bool dump_counter_captured(size_t c) {
+    if (c == static_cast<size_t>(dump_counter::moe_table_reach_zero_gpu_expert)) {
+        return g_dump_armed_state.load(std::memory_order_relaxed) == 1;
+    }
     return c != static_cast<size_t>(dump_counter::load_row_op_time_arrivals) &&
            c != static_cast<size_t>(dump_counter::onednn_graph_callback_unmarked_mallocs);
 }
@@ -4232,6 +4241,10 @@ bool unified_cache_dump_snapshot_pending(dump_snapshot snapshot, int dev) noexce
 
 bool unified_cache_dump_report_enabled() noexcept {
     return counter_dump_requested();
+}
+
+void unified_cache_dump_note_armed(bool armed) noexcept {
+    g_dump_armed_state.store(armed ? 1 : 2, std::memory_order_relaxed);
 }
 
 void unified_cache_dump_report(const char * text) noexcept {

@@ -7364,6 +7364,12 @@ bool unified_cache_dump_snapshot_pending(dump_snapshot snapshot, int dev) noexce
 enum class dump_point : uint8_t { FIRST_DECODE, CONTEXT_TXN };
 void unified_cache_dump_capture_zone_figures(int dev, dump_point point) noexcept;
 
+// Recorded once by the report sites' per-process armed flag (ggml_sycl_dump_report_armed) when it first
+// reads the environment. A counter evaluated only in an armed run (moe_table_reach_zero_gpu_expert, whose
+// zero test walks the plan per call) prints value=not_captured unless that flag read armed, so a 0 from a
+// process that never evaluated it cannot read as a measured 0.
+void unified_cache_dump_note_armed(bool armed) noexcept;
+
 // Draws the oneDNN Graph allocator callback has made and not yet freed, process-wide. The SDPA compile
 // brackets it so a draw that outlives compile() is counted (onednn_graph_compile_live_draws).
 int64_t unified_cache_onednn_graph_live_draws() noexcept;
