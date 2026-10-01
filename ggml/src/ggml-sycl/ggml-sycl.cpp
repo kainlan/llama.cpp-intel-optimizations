@@ -44183,6 +44183,9 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
     GGML_UNUSED(ctx);
     throw ggml_sycl_fallback_error(reason);
 #else
+    // A ggml-cpu graph on the dispatching thread: it resolves host tensors by
+    // design, so its resolver calls are not device kernels' reads.
+    ggml_sycl_host_executor_region host_executor;
 
     if (!dst) {
         return false;
@@ -99070,6 +99073,16 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
             return;
         }
 
+        // CONTROL is tested before the staged check so a revisited control
+        // tensor is still counted, as the prestage always did.
+        if (ggml_sycl_tensor_uses_cross_device_control_storage(tensor)) {
+            skipped_control++;
+            mark_staged(tensor);
+            GGML_SYCL_DEBUG("[GRAPH-PRESTAGE] CONTROL host tensor %s left on shared HOST_DEVICE storage (%p)\n",
+                            tensor->name, tensor->data);
+            return;
+        }
+
         // Skip if already staged by stable tensor identity.
         if (already_staged(tensor)) {
             return;
@@ -99077,14 +99090,6 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
 
         const ggml_sycl_prestage_class source_class =
             ggml_sycl_prestage_classify(tensor, ggml_sycl_prestage_source_buft(tensor));
-
-        if (source_class == ggml_sycl_prestage_class::CONTROL) {
-            skipped_control++;
-            mark_staged(tensor);
-            GGML_SYCL_DEBUG("[GRAPH-PRESTAGE] CONTROL host tensor %s left on shared HOST_DEVICE storage (%p)\n",
-                            tensor->name, tensor->data);
-            return;
-        }
 
         // Handle weight tensors specially in tiered mode
         if (source_class == ggml_sycl_prestage_class::WEIGHT) {

@@ -207,6 +207,25 @@ def main():
             check(rc == 0, "mutant scanner was not fooled by the adjacent duplicate (the case does not "
                   "discriminate): rc=%d %r" % (rc, out))
 
+        # VOID: a value that does not end at the token boundary ("k=42x"), so the
+        # key is absent rather than read as 42.
+        want_tg = sentinel_of(last, "stage_host_returns_tg")
+        trailing = last.replace(" stage_host_returns_tg=%d " % want_tg, " stage_host_returns_tg=%dx " % want_tg, 1)
+        check(trailing != last, "could not build the trailing-garbage line")
+        log = write_log("trailing-garbage.log", [load_time, trailing])
+        rc, out = run_scorer(script, log, "stage_host_returns_tg")
+        check(rc == 3 and out == "VOID", "a value with trailing garbage must be VOID: rc=%d %r" % (rc, out))
+
+        # Mutant: a scanner that only requires the value to START with a digit
+        # must read it as 42, or the case does not discriminate.
+        loose_text = text.replace("/^[0-9]+$/", "/^[0-9]/", 1)
+        check(loose_text != text, "could not build the loose-boundary mutant")
+        loose = os.path.join(tmp, "loose-score.sh")
+        with open(loose, "w", encoding="utf-8") as f:
+            f.write(loose_text)
+        rc, out = run_scorer(loose, log, "stage_host_returns_tg")
+        check(rc == 0, "loose-boundary mutant was not fooled by trailing garbage: rc=%d %r" % (rc, out))
+
         # VOID: the literal this one replaced carried no key of its own.
         legacy = last.replace(
             "stage_host_returns_pp=", "stage_host_returns pp=", 1).replace(
