@@ -18972,7 +18972,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // Published: the plan stands, so the hold is recomputed from it (and from what this context already holds).
     dense_guard.commit();
     ggml_sycl_planned_scratch_hold_refresh(*ctx);
-    // This plan's own reserve is what the realized-spill check (in the recheck) must see, not a losing rung's.
+    // This plan's own reserve is what the realized-spill check (try_candidate, after sched_reserve()) must see, not a losing rung's.
     ggml_sycl::unified_cache_begin_planned_hold_epoch(ctx->device, ctx->planned_scratch_owner, next_kv_info.n_ubatch);
     announce_kv_host_demotions(*immutable->plan);
 
