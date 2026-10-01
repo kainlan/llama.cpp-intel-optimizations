@@ -82,6 +82,10 @@ using namespace ggml_sycl;
 #endif
 
 // The allocation detector: a replaced global operator new that counts on a thread that armed it.
+// The TSan target defines KV_REGISTRY_TEST_NO_ALLOC_DETECTOR: the sanitizer runtime interposes
+// operator new itself (a second definition is a link error) and must see every allocation, so
+// the allocation case is skipped there and runs, unchanged, in the plain target.
+#ifndef KV_REGISTRY_TEST_NO_ALLOC_DETECTOR
 thread_local bool   g_count_allocations = false;
 thread_local size_t g_allocations       = 0;
 
@@ -103,6 +107,7 @@ void operator delete(void * p) noexcept {
 void operator delete(void * p, std::size_t) noexcept {
     std::free(p);
 }
+#endif  // KV_REGISTRY_TEST_NO_ALLOC_DETECTOR
 
 namespace {
 
@@ -1263,6 +1268,12 @@ int case_claim_generation_token() {
 // The claim path holds the slot's spin lock and the witness is reading the lock stack: neither
 // may allocate (and a lookup must not copy the cohort string).  The detector is the replaced
 // global operator new above, armed per thread; a control proves it counts.
+#ifdef KV_REGISTRY_TEST_NO_ALLOC_DETECTOR
+int case_claim_path_does_not_allocate() {
+    std::printf("skip claim_path_does_not_allocate: the sanitizer runtime owns operator new in this target\n");
+    return 0;
+}
+#else
 int case_claim_path_does_not_allocate() {
     abort_capture     cap;
     drop_log          log;
@@ -1302,6 +1313,7 @@ int case_claim_path_does_not_allocate() {
     CHECK_EQ(kv_lock_witness::violations(), 0, "no lock violation");
     return 0;
 }
+#endif  // KV_REGISTRY_TEST_NO_ALLOC_DETECTOR
 
 // ---- claims: exclusion and concurrency ------------------------------------------
 int case_claim_exclusion() {
