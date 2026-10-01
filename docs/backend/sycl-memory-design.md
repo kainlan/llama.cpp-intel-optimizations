@@ -2431,7 +2431,7 @@ the spill forbidden, sized by the planner. Three defects in how the plan met the
 ```
 [SYCL-PLAN] auto n_ubatch=2048 for n_ctx=2048 n_batch=2048 (tried 512,1024,2048; ladder exhausted)
 [MMQ-SRC1] graph refused before submission ... (planned 9.6 MB at the load-time n_ubatch, buffer holds 0.0 MB,
-           zone has 0.3 MB free)
+           zone has 0.3 MB free)   <- the text of the original failure; the message now says "runtime n_ubatch=N"
 ```
 
 **D1: counted, not reserved.** The plan was folded into `unified_cache_get_planned_runtime_zone_requirement()`, so the
@@ -2443,11 +2443,54 @@ the planned scratch still needs, and spills exactly as if the zone were full.** 
 shortfall, because growth allocates the replacement while the old backing is live). A forbid-spill request is a planned
 consumer itself (the ring, the planned scratch) and is the claimant the hold exists for, so it is never held back.
 The hold is per device, published by the context that owns the buffers
-(`ggml_sycl_planned_scratch_hold_refresh()`), falls as the graph-entry walks bring each buffer to its plan, and drops
-with the context. The Q8 buffer is held from the first plan because a decode graph of any quantized dense model draws
-from it; the two f16 buffers are held only once they have a backing (to grow it), because their plan exists for every
-dense Q8_0 weight while the default oneDNN PP route serves those from the ONEDNN zone, and holding ~100 MB for a buffer
-that route never touches would be an idle reservation.
+(`ggml_sycl_planned_scratch_hold_refresh()`) with that context recorded as its owner, falls as the graph-entry walks
+bring each buffer to its plan, and is released by the same context's teardown (`unified_cache_release_planned_scratch_hold`
+clears only a hold its caller published, so one context going away cannot drop what another still needs). All three
+buffers are held by one rule, from the first plan: a buffer short of its plan holds the whole plan, with no wait for a
+first backing. An earlier version held the f16 buffers only once backed, on the argument that the default oneDNN PP route
+serves Q8_0 from the ONEDNN zone; that reserved nothing for the first f16 draw, the one a full zone refuses, and the
+argument was only half true. The f16 arm IS reached by the default route: a batch below the oneDNN PP floor (a short
+prompt, the last chunk of a long one), `GGML_SYCL_ONEDNN_PP=0`, and any node the unified kernel declines at run time. The
+GPU run on Qwen3.6-27B showed it (`cohort=mul-mat-dequant-f16-src0 uses=48`). Where the f16 arm is *unreachable* the plan
+is zero, and then the hold, the fit check and the ring's pending RUNTIME demand all count nothing, because all three read
+the same planned figures: a build without oneDNN or `GGML_SYCL_F16` plans no f16 bytes
+(`ggml_sycl_dequant_f16_scratch_drawable()`), and a model with no dense Q8_0 weight has no f16 candidate in the zone
+adapter. Where it is reachable all three count it.
+
+A hold-induced spill is not silent. The request falls through to the ordinary spill path (stats and miss accounting see
+it exactly as they see a zone-full spill), is counted per device, and the first one since the last teardown is a WARN
+naming the requester tag and the bytes (`unified_cache_note_planned_hold_spill`); the count is taken at teardown and
+printed as `hold_spills` in the `[SCRATCH-STATS]` lines. The spill path cannot evict weights: the overcommit guard in
+`unified_alloc` runs for every device request, and for a hold-induced one it now refuses loudly instead of calling
+`evict_and_flush` (trading a planned buffer's reservation for the model's own weights is not a trade the hold may make).
+The worst case, the whole hold landing outside the arena, is counted in the transaction's outside-arena headroom check
+(`ggml_sycl_check_nonfa_attn_scratch`, which only runs for a non-FA context; with flash attention on there is no such
+check to extend, and the guard above is the backstop).
+
+*The idle hold, precisely.* The hold persists while a buffer is short of its plan, including across a graph that counts
+no node for it (the Q8 walk now refreshes the hold on that exit too, so it falls the moment the buffers reach their
+plan by any route). A graph that counts no node proves nothing about the next graph, since a PP graph can draw what a
+decode graph does not, so the hold is not released on that evidence. The idle part is bounded: the plan exists only for
+a model with dense quantized weights (so the Q8 buffer is drawn by its decode graphs), the hold binds only spill-capable
+RUNTIME requests, and those spill (counted, warned about, refused if the device cannot take them) rather than fail.
+
+*Hold versus fragmentation.* The hold is an aggregate byte bound (the sum of the plans), not a contiguity guarantee, and
+the planned buffers need contiguous room each. TLSF coalesces adjacent free blocks on free, and the compute buffers (the
+consumers the hold constrains) are allocated after the MoE pools and the ring, which the transaction places first, so
+what the compute buffers free is the contiguous tail of the zone, not holes between long-lived allocations. The plan
+sizes seen on the B70 are a 39.2 MB Q8 buffer and a 61.4 MB + 24.6 MB f16 pair in a 512 MB default RUNTIME zone. If a
+layout nonetheless fragmented the zone, the failure is the clean one that already exists: the walk's `ensure_buffer`
+cannot place the buffer and the graph is refused before submission, naming the zone's free bytes. `zone_largest_free`
+is not consulted: `largest_free_block()` is the head of the largest size class (approximate, by its own comment), so it
+would be a second heuristic beside the aggregate one rather than a contiguity proof.
+
+*Plan inputs are device-global.* The per-token and weight maxima the setters keep are one set per device, and the last
+model loaded would win. While another model is live on the device, the larger of the old and the new input is kept
+(`zone_dense_scratch_merge_input`, tested on the host), so a draft loaded beside a target does not shrink the target's
+plan; with no other model live the new inputs replace the old, so a model swap shrinks it. Two contexts on one device are
+still unsupported (canonical contract section 5), so the plan's `n_ubatch` is the last transaction's. A setter validates
+its figure before it stores anything: a rejected (overflowing) figure leaves the stored inputs alone, publishes a zero
+plan and marks the plan invalid, so the fit check and a re-plan refuse instead of re-deriving a plan from stale inputs.
 
 **D2: the plan followed the load-time `n_ubatch`.** Auto-ubatch chooses the real one at context creation, after load.
 The plan is a function of `n_ubatch` (`zone_dense_scratch_total_bytes()`), so the runtime-context transaction, the
@@ -2472,11 +2515,16 @@ buffer was grown in-op. Now the question is written once, `ggml_sycl_mul_mat_leg
 dispatch and the walk (`ggml_sycl_mul_mat_src1_quantizing_route()`) ask it. A node the unified kernel then serves is
 counted too, which costs nothing: its demand is bounded by the plan.
 
-Known gap: the f16 dequant walk (`ggml_sycl_dequant_f16_ensure_for_graph`) still asks `select()` alone. It is loud
-(the in-op growth WARN fires and an under-estimate is recorded), and extending it the same way would allocate a
-~100 MB f16 weight copy for Q8_0 models where the unified kernel always serves the op.
+The f16 dequant walk asks the same route (`ggml_sycl_mul_mat_f16_dequant_route()`): both walks are built on one core,
+`ggml_sycl_mul_mat_scratch_route()`, which asks the router and then, for a node the unified kernel took, the shared
+fallback decision, and returns the verdict of `zone_route_draws_scratch()` (pure, host-tested) for the kernels that draw
+the buffer in question (MMVQ/MMQ/XMX for Q8_1, the oneDNN legacy kernels for f16). A node the unified kernel declines and
+a oneDNN legacy kernel then serves is therefore counted by the f16 walk rather than found by in-op growth. Each walk asks
+once per multi-row node, so such a node costs the router two calls per walk; the walks run once per graph and the answer
+is a table lookup, and a per-node cache would need per-graph storage on this path.
 
-Host tests: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` Case 14 pins the arithmetic;
+Host tests: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` Case 14 pins the arithmetic and Case 15 the held-back branch,
+the route after a decline and the merged inputs;
 `tests/test-sycl-mmq-src1-plan-source.py` pins the wiring, with a mutation witness per check.
 
 ### Known limits (load-bearing — read before changing any of this)
