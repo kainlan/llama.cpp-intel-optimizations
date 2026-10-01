@@ -54,7 +54,7 @@
       "function": "dpct_malloc",
       "name": "malloc_device",
       "count": 1,
-      "reason": "dpct_malloc's one sycl::malloc_device call: rulings M247: dpct/helper.hpp is vendored upstream code and is not edited (rebase churn); the call is dead in-tree, reached only through dpct::device_memory and the dpct_malloc overloads (git grep 2026-10-01). The canonical contract has no row for it (sections 3, 8 and 9.1 checked in S2b), so this pin plus clause (e)'s forbidden dpct names outside dpct/helper.hpp (dpct_malloc, device_memory, global_memory, constant_memory, shared_memory) are what keep it dead"
+      "reason": "dpct_malloc's one sycl::malloc_device call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Secondary: rulings M247 (vendored, not edited, dead in-tree)"
     },
     {
       "id": "E-DPCT-DEVMEM-DEVICE",
@@ -63,7 +63,7 @@
       "function": "device_memory::allocate_device",
       "name": "malloc_device",
       "count": 1,
-      "reason": "device_memory::allocate_device's device-read-only malloc_device call: rulings M247: dpct/helper.hpp is vendored upstream code and is not edited (rebase churn); the call is dead in-tree, reached only through dpct::device_memory and the dpct_malloc overloads (git grep 2026-10-01). The canonical contract has no row for it (sections 3, 8 and 9.1 checked in S2b), so this pin plus clause (e)'s forbidden dpct names outside dpct/helper.hpp (dpct_malloc, device_memory, global_memory, constant_memory, shared_memory) are what keep it dead"
+      "reason": "device_memory::allocate_device's device-read-only malloc_device call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Secondary: rulings M247 (vendored, not edited, dead in-tree)"
     },
     {
       "id": "E-DPCT-DEVMEM-SHARED",
@@ -72,7 +72,52 @@
       "function": "device_memory::allocate_device",
       "name": "malloc_shared",
       "count": 1,
-      "reason": "device_memory::allocate_device's malloc_shared call: rulings M247: dpct/helper.hpp is vendored upstream code and is not edited (rebase churn); the call is dead in-tree, reached only through dpct::device_memory and the dpct_malloc overloads (git grep 2026-10-01). The canonical contract has no row for it (sections 3, 8 and 9.1 checked in S2b), so this pin plus clause (e)'s forbidden dpct names outside dpct/helper.hpp (dpct_malloc, device_memory, global_memory, constant_memory, shared_memory) are what keep it dead"
+      "reason": "device_memory::allocate_device's malloc_shared call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Secondary: rulings M247 (vendored, not edited, dead in-tree)"
+    },
+    {
+      "id": "E-CHAIN-HOST-RAW",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache_raw_malloc_host",
+      "name": "malloc_host",
+      "count": 2,
+      "reason": "the host raw wrapper's two overloads (queue and context) each call sycl::malloc_host once: canonical contract section 3 (Allocator Entry Points: unified_cache_raw_malloc_host is a raw sycl::malloc_host wrapper, callable only from unified_cache internals) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway)"
+    },
+    {
+      "id": "E-CHAIN-HOST-TRACKED",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache_malloc_host_tracked",
+      "name": "unified_cache_raw_malloc_host",
+      "count": 1,
+      "reason": "the tracked host allocation's link to the raw wrapper: canonical contract section 3 (Allocator Entry Points: unified_cache_raw_malloc_host is a raw sycl::malloc_host wrapper, callable only from unified_cache internals) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway)"
+    },
+    {
+      "id": "E-HOST-USM-BASE",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_alloc",
+      "name": "unified_cache_raw_malloc_host",
+      "count": 1,
+      "reason": "unified_alloc's require_host_usm_base path, a standalone host USM base owned through the handle it returns: canonical contract section 3 (Allocator Entry Points: unified_cache_raw_malloc_host is a raw sycl::malloc_host wrapper, callable only from unified_cache internals) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway)"
+    },
+    {
+      "id": "E-BACKING-STAGING",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache::unified_cache",
+      "name": "unified_cache_malloc_host_tracked",
+      "count": 1,
+      "reason": "the cache's own staging buffer, tag unified_cache:staging, one of the two CACHE_BACKING bootstrap sites: canonical contract section 3.1 (mechanism 2, the two-site allowlist) and section 9.1"
+    },
+    {
+      "id": "E-BACKING-FLAG-SLAB",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache::onednn_graph_scratch_ensure_flag_slab_locked",
+      "name": "unified_cache_malloc_host_tracked",
+      "count": 1,
+      "reason": "the oneDNN Graph-scratch completion-flag slab, tag unified_cache:onednn_graph_scratch_flag_slab, the second CACHE_BACKING bootstrap site: canonical contract section 3.1 (mechanism 2, the two-site allowlist) and section 9.1"
     }
   ]
 }

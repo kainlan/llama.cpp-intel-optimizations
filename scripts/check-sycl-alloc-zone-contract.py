@@ -25,6 +25,9 @@ What this unit (S2a, S2b, S2c) enforces
       the classes `device_memory`, `global_memory`, `constant_memory`, `shared_memory` (type names), are forbidden
       outside dpct/helper.hpp; helper.hpp's own three raw calls are allowlisted by function name and count
       (rulings M247: vendored upstream, not edited, dead in-tree)
+      The host side is covered too: malloc_host, aligned_alloc_host, zeMemAllocHost, the generic `sycl::malloc` and
+      `sycl::aligned_alloc` (qualified by sycl:: only, because the bare names are the C library's), and the host raw
+      chain's wrappers unified_cache_raw_malloc_host and unified_cache_malloc_host_tracked.
   (f) a missing tree_sitter_language_pack is a FAIL, never a skip
   (g) rethrow first: every `catch (...)`, `catch (std::exception &)` and `catch (const std::exception &)`, in any
       spelling (east const, by value, with or without std::), is preceded in its try by a ggml_sycl_fallback_error handler
@@ -173,11 +176,15 @@ NEGATIVE_FIELDS = ("prefer_vram_zone", "forbid_vram_zone_spill")
 # Clause (e). Names match as identifiers (a call, an address-of, a use as a value), strings on substring.
 RAW_NAMES = (
     "unified_cache_malloc_device_tracked", "unified_cache_raw_malloc_device", "sycl_aligned_malloc_device",
+    "unified_cache_malloc_host_tracked", "unified_cache_raw_malloc_host",
     "ggml_sycl_malloc_device_raw", "ggml_sycl_free_device_raw", "unified_cache_raw_free_device",
-    "malloc_device", "malloc_shared", "aligned_alloc_device", "aligned_alloc_shared",
-    "zeMemAllocDevice", "zeMemAllocShared", "zePhysicalMemCreate", "zeVirtualMemReserve",
+    "malloc_device", "malloc_shared", "malloc_host", "aligned_alloc_device", "aligned_alloc_shared", "aligned_alloc_host",
+    "zeMemAllocDevice", "zeMemAllocShared", "zeMemAllocHost", "zePhysicalMemCreate", "zeVirtualMemReserve",
 )
-RAW_STRINGS = ("zeMemAllocDevice", "zeMemAllocShared", "zePhysicalMemCreate", "zeVirtualMemReserve")
+RAW_STRINGS = ("zeMemAllocDevice", "zeMemAllocShared", "zeMemAllocHost", "zePhysicalMemCreate", "zeVirtualMemReserve")
+# The generic USM entry points take the kind as an argument (`sycl::malloc(n, q, usm::alloc::host)`). The bare names are the
+# C library's too, so they count only when qualified by sycl::.
+RAW_QUALIFIED = ("malloc", "aligned_alloc")
 # dpct's allocating entry points are raw allocators too (helper.hpp is vendored and holds the three raw calls they reach).
 # Outside that file the function is matched as an identifier and the classes as type names, never as substrings: a
 # parameter that happens to be spelled `device_memory` (memory-budget.hpp) is an identifier, not the class.
@@ -1831,6 +1838,19 @@ def h_findings(r):
     return None
 
 
+def sycl_qualified_raw(src, n):
+    """True for the name of a `sycl::malloc` / `sycl::aligned_alloc` call (with or without template arguments)."""
+    if kind(n) != "identifier" or txt(src, n) not in RAW_QUALIFIED:
+        return False
+    p = parent(n)
+    if p is not None and kind(p) == "template_function":
+        p = parent(p)
+    if p is None or kind(p) != "qualified_identifier":
+        return False
+    sc = fld(p, "scope")
+    return sc is not None and txt(src, sc).split("::")[-1].strip() == "sycl"
+
+
 def scan_file(rel, src, ctx):
     """Facts about one file, as plain data: constructions, form findings, raw hits, error tokens."""
     value_types, all_types = ctx.value_types, ctx.all_types
@@ -1924,14 +1944,14 @@ def scan_file(rel, src, ctx):
             if body is not None and nm is not None:
                 catches.extend(macro_catch_records(src, n, txt(src, nm)))
                 b = txt(src, body)
-                for r in RAW_NAMES:
-                    if re.search(r"(?<![A-Za-z0-9_])" + re.escape(r) + r"(?![A-Za-z0-9_])", b):
+                for r in RAW_NAMES + tuple("sycl::" + q for q in RAW_QUALIFIED):
+                    if re.search(r"(?<![A-Za-z0-9_])" + re.escape(r).replace("sycl::", r"sycl\s*::\s*") + r"(?![A-Za-z0-9_])", b):
                         raws.append({"func": "#define " + txt(src, nm), "name": r, "line": line_of(n),
                                      "form": "macro", "nodekind": "preproc", "text": r, "err": False})
                 if MACRO_WRITE_RE.search(b):
                     forms.append({"func": "#define " + txt(src, nm), "role": "macro-write", "tok": txt(src, nm),
                                   "line": line_of(n), "text": txt(src, n)})
-        elif k in ("identifier", "field_identifier") and txt(src, n) in RAW_NAMES:
+        elif k in ("identifier", "field_identifier") and (txt(src, n) in RAW_NAMES or sycl_qualified_raw(src, n)):
             pk = kind(parent(n)) if parent(n) is not None else ""
             if pk != "function_declarator":  # the name of a declaration or definition is not a use
                 top, is_call = callee_ident(src, n)
@@ -2421,6 +2441,7 @@ WITNESSES = {
     "21": "a DECLARED construction that loses its cascade_step leaves its entry matching nothing",
     "22": "unconverted_ticket is shrink-only and keyed by the construction node", "25": "a forward of cascade_step outside an allowlisted forward",
     "26": "cascade_step = <expr> other than the allowlisted callee's own parameter", "34": "a rethrow-less handler inside a #define body",
+    "s2c-host": "host raw allocator names (malloc_host, aligned_alloc_host, zeMemAllocHost, sycl::malloc, the host chain's wrappers)",
     "s2c-catch": "spellings and placements of the rethrow clause", "s2c-data": "clause-(h) entries that must be refused by validation",
 }
 WITNESSES_DEFERRED = {"9": "S2d: dormant clause; its *_bytes() subjects are absent from the tree"}
@@ -3328,6 +3349,53 @@ def matrix_cases():
             "code": "H-CASCADE", "key": "zz-plant.cpp::zzplant_data::declaration:req:00000000::write:cascade_step#0"}])))
     A(Case("s2c-data", "an H-UNCONV entry without its ticket is rejected", plant(one), "FAIL", "data", "needs the ticket",
         planted=False, allow_nodes=[{"code": "H-UNCONV", "func": "zzplant_w22", "extra": {"ticket": ""}}]))
+    # S2c: the host side of clause (e). malloc_host, aligned_alloc_host, zeMemAllocHost, the generic sycl::malloc and
+    # sycl::aligned_alloc (qualified only: the bare names are the C library's) and the host raw chain's own wrappers.
+    for nm, call in (("malloc_host", "sycl::malloc_host(16, q)"), ("malloc_host", "sycl::malloc_host<int>(4, q)"),
+                     ("aligned_alloc_host", "sycl::aligned_alloc_host(64, 16, q)"),
+                     ("malloc", "sycl::malloc(16, q, sycl::usm::alloc::host)"),
+                     ("aligned_alloc", "sycl::aligned_alloc(64, 16, q, sycl::usm::alloc::host)"),
+                     ("zeMemAllocHost", "zeMemAllocHost(ctx, &desc, 16, 64, &p)"),
+                     ("unified_cache_raw_malloc_host", "unified_cache_raw_malloc_host(16, q)"),
+                     ("unified_cache_malloc_host_tracked", "unified_cache_malloc_host_tracked(16, q, \"zz\")")):
+        A(Case("s2c-host", "a new caller of %s" % call.split("(")[0], plant(
+            "void zzplant_host(sycl::queue & q, void * ctx) {\n    void * desc = nullptr;\n    void * p = (void *) %s;\n    (void) p; (void) desc;\n}\n"
+            % call), "FAIL", "E-RAW", nm))
+    A(Case("s2c-host", "a new caller through a using-declaration is still the name", plant(
+        "using sycl::malloc_host;\nvoid zzplant_host(sycl::queue & q) {\n    void * p = malloc_host(16, q);\n    (void) p;\n}\n"),
+        "FAIL", "E-RAW", "malloc_host"))
+    A(Case("s2c-host", "a macro that expands to sycl::malloc_host", plant(
+        "#define zz_alloc(n, q) sycl::malloc_host(n, q)\n"), "FAIL", "E-RAW", "#define zz_alloc", planted=False))
+    A(Case("s2c-host", "a macro that expands to the generic sycl::malloc", plant(
+        "#define zz_alloc(n, q) sycl :: malloc(n, q, sycl::usm::alloc::host)\n"), "FAIL", "E-RAW", "#define zz_alloc", planted=False))
+    A(Case("s2c-host", "a string naming zeMemAllocHost", plant(
+        "void zzplant_host() {\n    const char * s = \"zeMemAllocHost\";\n    (void) s;\n}\n"), "FAIL", "E-RAW", "zzplant_host"))
+    A(Case("s2c-host", "the C library's malloc and aligned_alloc are not USM entry points (control)", plant(
+        "void zzplant_host() {\n    void * a = std::malloc(16);\n    void * b = ::aligned_alloc(64, 64);\n    void * c = malloc(8);\n"
+        "    (void) a; (void) b; (void) c;\n}\n"), "PASS", planted=False))
+    A(Case("s2c-host", "a comment, a string and a longer identifier containing the name are not hits (control)", plant(
+        "// sycl::malloc_host(16, q) and zeMemAllocHost\nvoid zzplant_host() {\n    int malloc_hostile = 1;\n    int my_malloc_host_count = 2;\n"
+        "    const char * s = \"sycl::malloc_host aligned_alloc_host\";\n    (void) malloc_hostile; (void) my_malloc_host_count; (void) s;\n}\n"),
+        "PASS", planted=False))
+    A(Case("s2c-host", "a declaration of a function named malloc_host is not a use (control)", plant(
+        "void * malloc_host(unsigned long n);\nvoid zzplant_host() {\n}\n"), "PASS", planted=False))
+    A(Case("s2c-host", "a second sycl::malloc_host call in the raw wrapper breaks its pin", replace_in_function(
+        "unified-cache.cpp", r"void \* unified_cache_raw_malloc_host\(size_t size, const sycl::queue & queue\) \{",
+        "ptr = sycl::malloc_host(size, queue);", "ptr = sycl::malloc_host(size, queue);\n        ptr = sycl::malloc_host(size, queue);"),
+        "FAIL", "allowlist", "E-CHAIN-HOST-RAW covers 3 finding(s) but pins 2"))
+    A(Case("s2c-host", "the raw host wrapper renamed leaves its exemption matching nothing", replace_token(
+        "unified-cache.cpp", "unified_cache_raw_malloc_host", "unified_cache_raw_malloc_host_zz"), "FAIL", "allowlist",
+        "E-CHAIN-HOST-RAW matches nothing"))
+    A(Case("s2c-host", "a second call in the raw wrapper's context overload breaks the same pin", replace_in_function(
+        "unified-cache.cpp", r"void \* unified_cache_raw_malloc_host\(size_t size, const sycl::context & ctx\) \{",
+        "ptr = sycl::malloc_host(size, ctx);", "ptr = sycl::malloc_host(size, ctx);\n        ptr = sycl::malloc_host(size, ctx);"),
+        "FAIL", "allowlist", "E-CHAIN-HOST-RAW covers 3 finding(s) but pins 2"))
+    A(Case("s2c-host", "a third caller of the tracked host allocation beside the two CACHE_BACKING sites", plant(
+        "void zzplant_host(sycl::queue & q) {\n    void * p = unified_cache_malloc_host_tracked(16, q, \"zz\");\n    (void) p;\n}\n"),
+        "FAIL", "E-RAW", "unified_cache_malloc_host_tracked"))
+    A(Case("s2c-host", "the staging buffer's site renamed leaves E-BACKING-STAGING matching nothing", replace_token(
+        "unified-cache.cpp", "onednn_graph_scratch_ensure_flag_slab_locked", "onednn_graph_scratch_ensure_flag_slab_locked_zz"),
+        "FAIL", "allowlist", "E-BACKING-FLAG-SLAB matches nothing"))
     return c
 
 

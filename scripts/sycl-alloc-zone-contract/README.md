@@ -19,6 +19,12 @@ renamed function or a swapped allocator fails. The canonical contract has no row
 the names `dpct_malloc` (identifier) and `device_memory`, `global_memory`, `constant_memory`, `shared_memory` (type
 names) are clause (e) hits; a variable or parameter that is merely spelled `device_memory` is not.
 
+Host raw allocator names (S2c): `malloc_host`, `aligned_alloc_host`, `zeMemAllocHost`, `sycl::malloc` and `sycl::aligned_alloc`
+(qualified only) and the host chain's `unified_cache_raw_malloc_host` / `unified_cache_malloc_host_tracked` are clause (e) names.
+Their six hits in `unified-cache.cpp` are allowlisted (`E-CHAIN-HOST-RAW`, `E-CHAIN-HOST-TRACKED`, `E-HOST-USM-BASE`, and the two
+CACHE_BACKING bootstrap sites `E-BACKING-STAGING`, `E-BACKING-FLAG-SLAB`; canonical contract sections 3, 3.1 and 9.1); the
+seventh, `unified_cache::allocate`'s last-resort fallback, is E-RAW debt with fate `deleted-by-D-disposition`.
+
 Finding codes added by clause (c): `C-COHORT` (a copy of a request that is handed on without its own cohort
 literal) and `C-SITE` (a wrapper from one request type to another that does not copy the source's site fields).
 `DEFER-C` now marks only what the gate still cannot follow (a helper with several returns, a lambda or function-pointer call).
