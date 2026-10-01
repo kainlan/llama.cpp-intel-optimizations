@@ -469,6 +469,9 @@ WITNESS_SITES = (
     (MAIN, "ggml_backend_sycl_buffer_type_alloc_buffer", "[REPLAN-TOKEN] TRANSACTION token held at alloc_buffer host fallback"),
     (MAIN, "ggml_backend_sycl_graph_compute", "[REPLAN-TOKEN] token held in graph compute"),
     (MAIN, "ggml_backend_sycl_plan_caps_freeze", "[REPLAN-TOKEN] chunk-cap freeze outside the fixpoint"),
+    (MAIN, "ggml_backend_sycl_replan_scope_open", "[REPLAN-TOKEN] growth scope not outermost: under TRANSACTION"),
+    (MAIN, "ggml_backend_sycl_replan_scope_open", "[REPLAN-TOKEN] growth scope not outermost: under LOAD"),
+    (MAIN, "ggml_backend_sycl_replan_scope_open", "[REPLAN-TOKEN] growth scope not outermost: under LIFECYCLE"),
     (UC_C, "ggml_sycl_replan_token", "[REPLAN-TOKEN] release proc entered with L0 held"),
 )
 
@@ -520,9 +523,37 @@ def gate31(files, bad):
         cc = code(files, path)
         for head, o, e in top_spans(cc):
             hdr = strip_pp(cc[head:o])
+            # The one sanctioned owner of a token outside an automatic variable is the public scope's
+            # state: ggml_backend_sycl_replan_scope_open hands it to a caller that cannot hold a C++ object
+            # across the backend boundary, and gate 31's scope clause below pins its shape.
+            if "ggml_backend_sycl_replan_scope_state" in hdr:
+                continue
             if re.search(r"\b(struct|class)\s+\w+[^;(]*$", hdr) and "ggml_sycl_replan_token" not in hdr.split("{")[0].split()[-1:]:
                 if re.search(r"(?m)^\s*(?:mutable\s+)?(?:ggml_sycl::)?ggml_sycl_replan_token\s+\w+\s*(?:;|\{|=)", cc[o:e]):
                     bad("gate 31: a class member of type ggml_sycl_replan_token in %s" % path)
+    # The public scope (ggml-sycl.h): llama's L0 for the fixpoint and the growth path. One owner struct holds
+    # the token, only the TRANSACTION kind is open to a caller, and both functions are served as procs.
+    so = func_bodies(c, "ggml_backend_sycl_replan_scope_open")
+    sx = func_bodies(c, "ggml_backend_sycl_replan_scope_close")
+    if len(so) != 1 or len(sx) != 1:
+        bad("gate 31: the public replan scope has %d open and %d close definitions" % (len(so), len(sx)))
+    else:
+        sot = text_of(c, so[0])
+        if not re.search(r"if\s*\(\s*kind\s*!=\s*GGML_SYCL_REPLAN_SCOPE_TRANSACTION\s*\)\s*\{\s*return\s+nullptr\s*;", sot):
+            bad("gate 31: the public replan scope accepts a kind other than TRANSACTION")
+        if not re.search(r"new\s+ggml_backend_sycl_replan_scope_state\s*\(\s*(?:ggml_sycl::)?GGML_SYCL_REPLAN_KIND_TRANSACTION\s*\)", sot):
+            bad("gate 31: the public replan scope does not construct a TRANSACTION token")
+        if "delete" not in text_of(c, sx[0]):
+            bad("gate 31: the public replan scope's close does not release the owner")
+    if len(re.findall(r"\bstruct\s+ggml_backend_sycl_replan_scope_state\s*\{", c)) != 1:
+        bad("gate 31: ggml_backend_sycl_replan_scope_state is not defined exactly once")
+    else:
+        sb = struct_body(c, "ggml_backend_sycl_replan_scope_state")
+        if sb is None or len(re.findall(r"\bggml_sycl_replan_token\s+\w+\s*(?:;|\{)", text_of(c, sb))) != 1:
+            bad("gate 31: the public replan scope's state does not hold exactly one token")
+    for proc in ("ggml_backend_sycl_replan_scope_open", "ggml_backend_sycl_replan_scope_close"):
+        if not re.search(r"strcmp\(name,\s*\"%s\"\)\s*==\s*0\)\s*\{\s*return\s*\(void\s*\*\)\s*%s;" % (proc, proc), keep(files, MAIN)):
+            bad("gate 31: %s is not served by the backend's proc table" % proc)
     # Entries.
     for fn, kind in TOKEN_ENTRIES.items():
         bodies = func_bodies(c, fn)
@@ -1184,6 +1215,26 @@ def mutants(files):
            edit(files, M, "struct ggml_sycl_prepared_plan_publication {",
                 "struct ggml_sycl_prepared_plan_publication {\n    ggml_sycl_replan_token held_token{ GGML_SYCL_REPLAN_KIND_LOAD };", "g31b"),
            "a class member of type ggml_sycl_replan_token")
+    yield ("a public scope that accepts any kind",
+           edit(files, M, "if (kind != GGML_SYCL_REPLAN_SCOPE_TRANSACTION) {\n        return nullptr;", "if (false) {\n        return nullptr;", "g31s1"),
+           "accepts a kind other than TRANSACTION")
+    yield ("a public scope that holds a LOAD token",
+           edit(files, M, "return new ggml_backend_sycl_replan_scope_state(ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION);",
+                "return new ggml_backend_sycl_replan_scope_state(ggml_sycl::GGML_SYCL_REPLAN_KIND_LOAD);", "g31s2"),
+           "does not construct a TRANSACTION token")
+    yield ("a public scope that never releases",
+           edit(files, M, "delete static_cast<ggml_backend_sycl_replan_scope_state *>(scope);", "(void) scope;", "g31s3"),
+           "close does not release the owner")
+    yield ("a public scope whose outermost witness message changed",
+           edit(files, M, '"[REPLAN-TOKEN] growth scope not outermost: under LOAD"', '"[REPLAN-TOKEN] scope under LOAD"', "g31s4"),
+           "witness message")
+    yield ("a public scope open that is not served as a proc",
+           edit(files, M, 'if (strcmp(name, "ggml_backend_sycl_replan_scope_open") == 0) {', 'if (strcmp(name, "ggml_backend_sycl_replan_scope_open_") == 0) {', "g31s5"),
+           "is not served by the backend's proc table")
+    yield ("a public scope state as a second token owner",
+           edit(files, M, "struct ggml_backend_sycl_replan_scope_state {",
+                "struct ggml_backend_sycl_replan_scope_state {\n    ggml_sycl_replan_token held_token{ GGML_SYCL_REPLAN_KIND_LOAD };", "g31s6"),
+           "does not hold exactly one token")
     yield ("an entry without its token",
            edit(files, M, "void ggml_backend_sycl_commit_reactivate(void) {\n    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);",
                 "void ggml_backend_sycl_commit_reactivate(void) {", "g31c"),

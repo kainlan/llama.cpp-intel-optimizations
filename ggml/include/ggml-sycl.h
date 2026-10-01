@@ -1533,6 +1533,24 @@ GGML_BACKEND_API void         ggml_backend_sycl_plan_scope_close(void * scope);
 // free NULL.  ggml_backend_free on it deletes the object only.  NULL on a bad device index.
 GGML_BACKEND_API ggml_backend_t ggml_backend_sycl_measure_backend_init(int device);
 
+// L0, the process-global re-plan transaction mutex, held by a caller outside the backend.
+// A context's own transaction (the placement fixpoint at construction, and the growth
+// path of a re-plan) holds it for its whole extent so that no other load, publish or
+// re-plan interleaves.  Only the TRANSACTION kind is open to a caller: the backend's own
+// holders (loads, lifecycle entries) take their kinds themselves.  The hold is
+// thread-local, so close must run on the thread that opened.  A nested open on the
+// holding thread is a no-op hold and the outermost close unlocks.  `require_outermost`
+// asserts, through the always-compiled witness, that no token is held on entry:
+// `[REPLAN-TOKEN] growth scope not outermost: under <kind>`.  Returns NULL for a kind
+// other than TRANSACTION.
+enum ggml_sycl_replan_scope_kind {
+    GGML_SYCL_REPLAN_SCOPE_TRANSACTION = 1,
+};
+
+GGML_BACKEND_API void * ggml_backend_sycl_replan_scope_open(enum ggml_sycl_replan_scope_kind kind,
+                                                            bool                             require_outermost);
+GGML_BACKEND_API void   ggml_backend_sycl_replan_scope_close(void * scope);
+
 // A re-plan's per-context steps.  synchronize_for_replan waits every
 // queue that can reach a slice of the context, after llama's synchronize(); it returns
 // false if a wait failed.  graph_invalidate drops this context's own recorded graph

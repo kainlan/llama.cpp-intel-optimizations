@@ -38855,6 +38855,37 @@ void ggml_backend_sycl_plan_scope_close(void * scope) {
     delete s;
 }
 
+// L0 for a caller outside the backend (ggml-sycl.h).  The token is thread-local state, so
+// the scope is just its owner: open constructs it, close destroys it.
+struct ggml_backend_sycl_replan_scope_state {
+    explicit ggml_backend_sycl_replan_scope_state(ggml_sycl::ggml_sycl_replan_kind kind) : token(kind) {}
+
+    ggml_sycl::ggml_sycl_replan_token token;
+};
+
+void * ggml_backend_sycl_replan_scope_open(enum ggml_sycl_replan_scope_kind kind, bool require_outermost) {
+    if (kind != GGML_SYCL_REPLAN_SCOPE_TRANSACTION) {
+        return nullptr;
+    }
+    if (require_outermost) {
+        GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION),
+                          "[REPLAN-TOKEN] growth scope not outermost: under TRANSACTION");
+        GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_LOAD),
+                          "[REPLAN-TOKEN] growth scope not outermost: under LOAD");
+        GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_LIFECYCLE),
+                          "[REPLAN-TOKEN] growth scope not outermost: under LIFECYCLE");
+    }
+    try {
+        return new ggml_backend_sycl_replan_scope_state(ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void ggml_backend_sycl_replan_scope_close(void * scope) {
+    delete static_cast<ggml_backend_sycl_replan_scope_state *>(scope);
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 size_t ggml_backend_sycl_plan_caps_freeze_core(ggml_backend_sycl_plan_caps_t caps,
                                                ggml_backend_buffer_type_t    buft,
@@ -111736,6 +111767,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_plan_caps_set_state") == 0) {
         return (void *) ggml_backend_sycl_plan_caps_set_state;
+    }
+    if (strcmp(name, "ggml_backend_sycl_replan_scope_open") == 0) {
+        return (void *) ggml_backend_sycl_replan_scope_open;
+    }
+    if (strcmp(name, "ggml_backend_sycl_replan_scope_close") == 0) {
+        return (void *) ggml_backend_sycl_replan_scope_close;
     }
     if (strcmp(name, "ggml_backend_sycl_plan_scope_open") == 0) {
         return (void *) ggml_backend_sycl_plan_scope_open;

@@ -14,6 +14,9 @@
 //     Release with -DNDEBUG, so a death arm that passes here is not an assert);
 //   * with GGML_SYCL_WITNESS_CHECKS=0 the same illegal nesting runs unchecked and
 //     the witness does not evaluate its condition;
+//   * the public scope (ggml_backend_sycl_replan_scope_open/_close) is L0 for a caller
+//     outside the backend: TRANSACTION kind only, nested holds are no-ops, and
+//     `require_outermost` is a witness naming the token it found;
 //   * a blocked acquire logs a WARN naming the holder at each interval and still
 //     enters once L0 is released, and aborts at the first interval under
 //     GGML_SYCL_STRICT_LEASES=1; the wait watch logs the site it is told about.
@@ -25,6 +28,7 @@
 //   ./build/bin/test-sycl-replan-token             # every case
 //   ./build/bin/test-sycl-replan-token <child>     # one death child (see main)
 
+#include "ggml-sycl.h"
 #include "ggml.h"
 #include "unified-cache.hpp"
 
@@ -324,6 +328,76 @@ int witness_lazy() {
     return child_marker();
 }
 
+int scope_not_outermost_txn() {
+    ggml_sycl_replan_token o(TXN);
+    void *                 scope = ggml_backend_sycl_replan_scope_open(GGML_SYCL_REPLAN_SCOPE_TRANSACTION, true);
+    ggml_backend_sycl_replan_scope_close(scope);
+    return child_marker();
+}
+
+int scope_not_outermost_load() {
+    ggml_sycl_replan_token o(LOAD);
+    void *                 scope = ggml_backend_sycl_replan_scope_open(GGML_SYCL_REPLAN_SCOPE_TRANSACTION, true);
+    ggml_backend_sycl_replan_scope_close(scope);
+    return child_marker();
+}
+
+void test_public_scope() {
+    CHECK(!ggml_sycl_replan_token_held(), "scope: free at the start");
+    void * scope = ggml_backend_sycl_replan_scope_open(GGML_SYCL_REPLAN_SCOPE_TRANSACTION, true);
+    CHECK(scope != nullptr, "scope: a TRANSACTION scope opens on a free thread");
+    CHECK(ggml_sycl_replan_token_held(TXN), "scope: it holds L0 as a TRANSACTION token");
+    {
+        // The backend's own entries nest under it.
+        ggml_sycl_replan_token inner(LIFE);
+        CHECK(ggml_sycl_replan_token_held(TXN) && !ggml_sycl_replan_token_held(LIFE),
+              "scope: a nested backend token never changes the outermost kind");
+    }
+    // A second scope without require_outermost is a nested hold.
+    void * nested = ggml_backend_sycl_replan_scope_open(GGML_SYCL_REPLAN_SCOPE_TRANSACTION, false);
+    CHECK(nested != nullptr && ggml_sycl_replan_token_held(TXN), "scope: a nested scope is a no-op hold");
+    ggml_backend_sycl_replan_scope_close(nested);
+    CHECK(ggml_sycl_replan_token_held(TXN), "scope: closing the nested scope keeps the hold");
+    ggml_backend_sycl_replan_scope_close(scope);
+    CHECK(!ggml_sycl_replan_token_held(), "scope: closing the outermost scope releases L0");
+
+    // Another thread can take L0 only after the close.
+    scope = ggml_backend_sycl_replan_scope_open(GGML_SYCL_REPLAN_SCOPE_TRANSACTION, false);
+    std::atomic<bool> got{ false };
+    std::thread       t([&] {
+        ggml_sycl_replan_token try_it(LIFE, std::try_to_lock);
+        got.store(try_it.owns());
+    });
+    t.join();
+    CHECK(!got.load(), "scope: another thread cannot take L0 while the scope is open");
+    ggml_backend_sycl_replan_scope_close(scope);
+    std::thread t2([&] {
+        ggml_sycl_replan_token try_it(LIFE, std::try_to_lock);
+        got.store(try_it.owns());
+    });
+    t2.join();
+    CHECK(got.load(), "scope: another thread can take L0 after the scope closes");
+
+    // Only the TRANSACTION kind is open to a caller.
+    CHECK(ggml_backend_sycl_replan_scope_open((enum ggml_sycl_replan_scope_kind) 2, false) == nullptr,
+          "scope: the LOAD kind is refused");
+    CHECK(ggml_backend_sycl_replan_scope_open((enum ggml_sycl_replan_scope_kind) 3, false) == nullptr,
+          "scope: the LIFECYCLE kind is refused");
+    CHECK(ggml_backend_sycl_replan_scope_open((enum ggml_sycl_replan_scope_kind) 0, false) == nullptr,
+          "scope: the ANY kind is refused");
+    CHECK(!ggml_sycl_replan_token_held(), "scope: a refused open holds nothing");
+    ggml_backend_sycl_replan_scope_close(nullptr);
+
+    // The registry serves both procs.
+    ggml_backend_reg_t reg = ggml_backend_sycl_reg();
+    CHECK(reg && ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_replan_scope_open") ==
+                     (void *) ggml_backend_sycl_replan_scope_open,
+          "scope: the open proc is the exported function");
+    CHECK(reg && ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_replan_scope_close") ==
+                     (void *) ggml_backend_sycl_replan_scope_close,
+          "scope: the close proc is the exported function");
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -344,6 +418,12 @@ int main(int argc, char ** argv) {
         if (std::strcmp(c, "outermost-only-free") == 0) {
             return outermost_only_free();
         }
+        if (std::strcmp(c, "scope-not-outermost-txn") == 0) {
+            return scope_not_outermost_txn();
+        }
+        if (std::strcmp(c, "scope-not-outermost-load") == 0) {
+            return scope_not_outermost_load();
+        }
         if (std::strcmp(c, "blocked-acquire") == 0) {
             return blocked_acquire();
         }
@@ -362,11 +442,14 @@ int main(int argc, char ** argv) {
     test_single();
     test_legal_nesting();
     test_threads();
+    test_public_scope();
     test_death(argv[0], "nest-txn-under-load", "[REPLAN-TOKEN] illegal nesting: TRANSACTION under LOAD");
     test_death(argv[0], "nest-txn-under-lifecycle", "[REPLAN-TOKEN] illegal nesting: TRANSACTION under LIFECYCLE");
     test_death(argv[0], "nest-load-under-txn", "[REPLAN-TOKEN] illegal nesting: LOAD under TRANSACTION");
     test_death(argv[0], "outermost-only-held", "[REPLAN-TOKEN] release proc entered with L0 held");
     test_death(argv[0], "witness-false", "[REPLAN-TOKEN] test witness fired");
+    test_death(argv[0], "scope-not-outermost-txn", "[REPLAN-TOKEN] growth scope not outermost: under TRANSACTION");
+    test_death(argv[0], "scope-not-outermost-load", "[REPLAN-TOKEN] growth scope not outermost: under LOAD");
     // A blocked acquire warns with the holder's kind at each interval and still enters; under STRICT it aborts at
     // the first interval; the watch names the wait it is told about.
     test_waits(argv[0], "GGML_SYCL_WITNESS_CHECKS=1 GGML_SYCL_REPLAN_WAIT_WARN_MS=300", "blocked-acquire", false,
@@ -381,6 +464,7 @@ int main(int argc, char ** argv) {
     test_unchecked(argv[0], "nest-load-under-txn");
     test_unchecked(argv[0], "outermost-only-held");
     test_unchecked(argv[0], "witness-false");
+    test_unchecked(argv[0], "scope-not-outermost-txn");
     test_unchecked(argv[0], "witness-lazy");
     // Controls: the outermost-only form is legal on a free thread.
     test_unchecked(argv[0], "outermost-only-free");
