@@ -781,7 +781,8 @@ def check(files, cmake):
     # and the planned device bytes are the one per-entry sum (never the single-device recorded figure).
     le = function_text(cache_text, "unified_cache_dump_capture_load_end")
     if le is not None:
-        # D2: weight_live_bytes reads cache->weight_bytes() only without an arena (an arena weight is not
+        # D2 (source-pinned only: a behavioural case needs an arena cache; the behavioural check is the lead's
+        # G0 rerun): weight_live_bytes reads cache->weight_bytes() only without an arena (an arena weight is not
         # in that figure), and prints not_captured, never a zero that means "not counted", with one.
         m = re.search(r"if\s*\(\s*cache->arena_active\(\)\s*\)\s*\{([^{}]*)\}\s*else\s*\{([^{}]*)\}", le)
         if m is None or "snapshot_clear(dump_snapshot::weight_live_bytes_last_load_end" not in m.group(1) or \
