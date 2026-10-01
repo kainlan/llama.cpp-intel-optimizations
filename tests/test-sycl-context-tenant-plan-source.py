@@ -727,7 +727,7 @@ def scrub_c(text, keep_strings):
 
 _SCRUB_CACHE = {}
 _SCRUB_BYTES = [0]
-_SCRUB_LIMIT = 400 * 1024 * 1024
+_SCRUB_LIMIT = 900 * 1024 * 1024
 
 
 def scrubbed(text, keep_strings):
@@ -855,12 +855,15 @@ def controlled_region(s, cond_close):
     return parts
 
 
-LOG_ARG_CALLS_ALLOWED = ("sizeof",)
+LOG_ARG_ALLOWED = re.compile(r"[\w\s.,\[\]*&:>\-\"']*")
+LOG_ARG_FORBIDDEN = re.compile(r"--|\b(?:throw|delete|new|co_await|co_yield|sizeof)\b")
 
 
 def only_log_calls(region):
     """True when region holds nothing but GGML_LOG_* calls: with those removed only `;` and space remain, and
-    their arguments hold no assignment, increment, or call (sizeof aside); reading a field or an element is fine."""
+    their arguments are an allowlist, not a blacklist: names, `.`, `->`, `::`, `[ ]`, `*`, `&`, `-`, `,`,
+    numbers and string or char literals (blanked here). That is a read of a variable, a field or an element; any call, assignment, increment, throw or
+    delete falls outside it."""
     rest = region
     while True:
         m = re.search(r"\bGGML_LOG_[A-Z]+\s*\(", rest)
@@ -870,39 +873,53 @@ def only_log_calls(region):
         if end < 0:
             return False
         args = rest[m.end():end]
-        if re.search(r"(?<![=!<>])=(?!=)|\+\+|--|[-+*/%&|^]=|<<=|>>=", args):
-            return False
-        if any(c.group(1) not in LOG_ARG_CALLS_ALLOWED for c in re.finditer(r"([A-Za-z_]\w*)\s*\(", args)):
+        if not LOG_ARG_ALLOWED.fullmatch(args) or LOG_ARG_FORBIDDEN.search(args):
             return False
         rest = rest[:m.start()] + rest[end + 1:]
     return re.fullmatch(r"[\s;]*", rest) is not None
 
 
-_ADJ_C = re.compile(r'"\s*"')
-_ADJ_PY = re.compile(r"""(["'])[ \t]*\+[ \t\n]*(["'])|(["'])[ \t]+(["'])""")
+_ADJ_C = re.compile(r'"\s*(?:u8|[uUL])?"')
+_PY_Q = r"""(?:\"\"\"|\'\'\'|\"|\')"""
+_PY_JOIN = r"(?:\s|\\\n)*(?:\+(?:\s|\\\n)*)?"
+# a closing quote, whitespace and backslash-newlines (a `+` among them), an optional string prefix, an opening quote
+_ADJ_PY = re.compile("(" + _PY_Q + ")" + _PY_JOIN + "[rRbBfFuU]{0,2}(" + _PY_Q + ")")
+_PY_LITERAL = re.compile(
+    r"[rRbBfFuU]{0,2}(?:\"\"\"|\'\'\').*?(?:\"\"\"|\'\'\')"
+    r"|\"(?:\\.|[^\"\\\n])*\""
+    r"|'(?:\\.|[^'\\\n])*'"
+    r"|#[^\n]*",
+    re.S)
+
+
+def scrub_py(text):
+    """Blank # comments with spaces (offsets and newlines kept); strings, triple-quoted ones included, are kept."""
+    return _PY_LITERAL.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)) if m.group(0).startswith("#") else m.group(0), text)
 
 
 def fold_literals(text, path):
     """(folded, orig): text with string-literal concatenation joined, so a name split across literals is seen whole:
-    C/C++ adjacent literals ("a" "b") and, in .py files, "a" + "b" and "a" "b". orig(i) maps an index of the
-    folded text back to the input, for line numbers and span checks."""
-    rxs = []
+    C/C++ adjacent literals ("a" "b") and, in .py files, "a" + "b" and "a" "b" across lines, backslash
+    continuations, triple quotes and string prefixes. orig(i) maps an index of the folded text back to the input,
+    for line numbers and span checks."""
     if path.endswith(STRICT_CODE_SUFFIXES):
-        rxs.append(_ADJ_C)
+        rx = _ADJ_C
     elif path.endswith(".py"):
-        rxs.append(_ADJ_PY)
-    if not rxs or '"' not in text and "'" not in text:
+        rx = _ADJ_PY
+    else:
         return text, lambda i: i
     cuts = []
     out = []
     last = 0
     removed = 0
-    for m in rxs[0].finditer(text):
+    for m in rx.finditer(text):
         # keep nothing of the closing and opening quotes and what lies between them
         out.append(text[last:m.start()])
+        cuts.append((m.start() - removed, m.end() - m.start()))
         removed += m.end() - m.start()
-        cuts.append((m.start() - (removed - (m.end() - m.start())), m.end() - m.start()))
         last = m.end()
+    if not cuts:
+        return text, lambda i: i
     out.append(text[last:])
     folded = "".join(out)
     starts = [c[0] for c in cuts]
@@ -911,6 +928,42 @@ def fold_literals(text, path):
         k = bisect.bisect_right(starts, i)
         return i + sum(c[1] for c in cuts[:k])
     return folded, orig
+
+
+_VIEW_CACHE = {}
+
+
+def folded_view(name, text):
+    """(folded, orig) of text with comments blanked and string concatenation joined, the view every strict clause
+    matches against, so a comment or a split between literals cannot hide a name. Cached per file."""
+    key = (name, len(text), hash(text))
+    hit = _VIEW_CACHE.get(key)
+    if hit is None:
+        if _SCRUB_BYTES[0] > _SCRUB_LIMIT:
+            _VIEW_CACHE.clear()
+            _SCRUB_BYTES[0] = 0
+        if name.endswith(STRICT_CODE_SUFFIXES):
+            base = scrubbed(text, True)
+        elif name.endswith(".py"):
+            base = scrub_py(text)
+        else:
+            base = text
+        hit = fold_literals(base, name)
+        _VIEW_CACHE[key] = hit
+        _SCRUB_BYTES[0] += 2 * len(hit[0])
+    return hit
+
+
+_FACTS = {}
+
+
+def per_file(tag, name, text, scan):
+    """scan(name, text), remembered per file: the sweep reruns every clause on a tree where one file differs."""
+    key = (tag, name, len(text), hash(text))
+    hit = _FACTS.get(key)
+    if hit is None:
+        hit = _FACTS[key] = scan(name, text)
+    return hit
 
 
 def strict_scope(files):
@@ -931,24 +984,29 @@ def function_bodies(code, name):
     return out
 
 
+def _names_scan(name, text):
+    out = set()
+    folded, orig = folded_view(name, text)
+    for body, mapper in ((text, lambda i: i), (folded, orig)):
+        for m in STRICT_NAME_RX.finditer(body):
+            found = m.group(0)
+            line = line_of(text, mapper(m.start()))
+            if found in STRICT_NAMES_ALLOWED or found in STRICT_NAMES_NONMEMBER:
+                continue
+            if found in STRICT_NAMES_RETIRED:
+                if name not in STRICT_NAMES_RETIRED[found]:
+                    out.add((name, line, "%s is retired and may be named only in %s" %
+                             (found, ", ".join(STRICT_NAMES_RETIRED[found]))))
+                continue
+            out.add((name, line, "%s is not the strict switch or one of its two named exceptions" % found))
+    return out
+
+
 def strict_names_violations(name_files):
+    # every file is read, split or not: a pre-filter on a token would be defeated by a split inside that token
     out = set()
     for name, text in sorted(name_files.items()):
-        if "STRICT" not in text and "_STRICT_" not in text and "GGML_SYCL_" not in text:
-            continue
-        folded, orig = fold_literals(text, name)
-        for body, mapper in ((text, lambda i: i), (folded, orig)):
-            for m in STRICT_NAME_RX.finditer(body):
-                found = m.group(0)
-                line = line_of(text, mapper(m.start()))
-                if found in STRICT_NAMES_ALLOWED or found in STRICT_NAMES_NONMEMBER:
-                    continue
-                if found in STRICT_NAMES_RETIRED:
-                    if name not in STRICT_NAMES_RETIRED[found]:
-                        out.add((name, line, "%s is retired and may be named only in %s" %
-                                 (found, ", ".join(STRICT_NAMES_RETIRED[found]))))
-                    continue
-                out.add((name, line, "%s is not the strict switch or one of its two named exceptions" % found))
+        out |= per_file("names", name, text, _names_scan)
     out = sorted(out)
     for required in STRICT_NAME_DOCS + ("ggml/src/ggml-sycl/ggml-sycl.cpp", "ggml/src/ggml-sycl/unified-cache.cpp"):
         if required not in name_files:
@@ -975,30 +1033,36 @@ def strict_census_violations(name_files):
     return out
 
 
+def _getenv_scan(name, text):
+    """(getenv calls of the switch as original offsets, their literal starts in folded text, every exact quoted
+    switch name as (folded start, original offset))."""
+    folded, orig = folded_view(name, text)
+    calls = []
+    starts = []
+    for m in re.finditer(r"getenv\s*\(\s*(\"" + STRICT_LEASES + r"\")", folded):
+        calls.append(orig(m.start()))
+        starts.append(m.start(1))
+    quoted = [(m.start(), orig(m.start())) for m in re.finditer(r"\"" + STRICT_LEASES + r"\"", folded)]
+    return calls, starts, quoted
+
+
 def strict_getenv_violations(code_files):
     """Exactly one getenv of the switch, inside the function ggml_sycl_strict_enabled() resolves to. String
     literals are folded first, so getenv("GGML_SYCL_" "STRICT_LEASES") is seen as the read it is."""
     out = []
     calls = []
-    literal_starts = set()
     for name, text in sorted(code_files.items()):
-        if "STRICT" not in text:
+        found, starts, quoted = per_file("getenv", name, text, _getenv_scan)
+        calls += [(name, pos) for pos in found]
+        # a second reader that does not spell getenv: the quoted name held in a variable. Tests may set and unset it.
+        if "/tests/" in name or name.startswith("tests/"):
             continue
-        folded, orig = fold_literals(scrubbed(text, True), name)
-        for m in re.finditer(r"getenv\s*\(\s*(\"" + STRICT_LEASES + r"\")", folded):
-            calls.append((name, orig(m.start())))
-            literal_starts.add((name, m.start(1)))
+        for fstart, pos in quoted:
+            if fstart not in starts:
+                out.append((name, line_of(text, pos), "the quoted strict switch name appears outside its one reader"))
     if len(calls) != 1:
         out.append(("tree", 0, "found %d getenv of the strict switch, expected exactly 1: %s" %
                     (len(calls), ["%s:%d" % (n, line_of(code_files[n], p)) for n, p in calls])))
-    # a second reader that does not spell getenv: the quoted name held in a variable. Tests may set and unset it.
-    for name, text in sorted(code_files.items()):
-        if "/tests/" in name or name.startswith("tests/") or "STRICT" not in text:
-            continue
-        folded, orig = fold_literals(scrubbed(text, True), name)
-        for m in re.finditer(r"\"" + STRICT_LEASES + r"\"", folded):
-            if (name, m.start()) not in literal_starts:
-                out.append((name, line_of(text, orig(m.start())), "the quoted strict switch name appears outside its one reader"))
     exports = []
     for name, text in sorted(code_files.items()):
         if STRICT_ACCESSOR_NAME not in text:
@@ -1023,6 +1087,13 @@ def strict_getenv_violations(code_files):
         out.append((calls[0][0], line_of(code_files[calls[0][0]], calls[0][1]),
                     "the one getenv of the switch is not inside the function the accessor resolves to"))
     return out
+
+
+def _handle_quoted_scan(name, text):
+    """[(original offset, the text before it on its row)] of every exact quoted env-var name of the non-member."""
+    folded, orig = folded_view(name, text)
+    return [(orig(m.start()), folded[folded.rfind("\n", 0, m.start()) + 1:m.start()])
+            for m in re.finditer(r"\"" + STRICT_HANDLE + r"\"", folded)]
 
 
 def strict_handle_violations(code_files):
@@ -1063,14 +1134,12 @@ def strict_handle_violations(code_files):
     # the env-var name itself is read nowhere: its one quoted use in non-test code is the env-table entry
     quoted = 0
     for name, text in sorted(code_files.items()):
-        if "/tests/" in name or name.startswith("tests/") or STRICT_HANDLE not in text:
+        if "/tests/" in name or name.startswith("tests/"):
             continue
-        folded, orig = fold_literals(scrubbed(text, True), name)
-        for m in re.finditer(r"\"" + STRICT_HANDLE + r"\"", folded):
+        for pos, row in per_file("handle-quoted", name, text, _handle_quoted_scan):
             quoted += 1
-            row = folded[folded.rfind("\n", 0, m.start()) + 1:m.start()]
             if name != "ggml/src/ggml-sycl/ggml-sycl.cpp" or not re.fullmatch(r"\s*\{\s*", row):
-                out.append((name, line_of(text, orig(m.start())), "the quoted %s is used other than as the env-table entry"
+                out.append((name, line_of(text, pos), "the quoted %s is used other than as the env-table entry"
                             % STRICT_HANDLE))
     if quoted < 1:
         out.append(("tree", 0, "no env-table entry for %s found; the clause would pass vacuously" % STRICT_HANDLE))
@@ -1083,6 +1152,49 @@ def strict_handle_violations(code_files):
     return out
 
 
+def _accessor_scan(name, text):
+    """(violations, aborts found by census entry, plan-bug aborts seen) for one file."""
+    out = []
+    found = {}
+    total = 0
+    # the filter is on identifiers, which cannot be split; the tag may be, so it is matched on the folded view
+    if "GGML_ABORT" not in text and "ggml_abort" not in text and STRICT_ACCESSOR_NAME not in text:
+        return out, found, total
+    folded, orig = folded_view(name, text)
+    code = scrubbed(text, False)
+    for m in re.finditer(r"(\w+)\s*\(\s*(?:void)?\s*\)\s*(?:const\s*)?(?:noexcept\s*)?(?:->\s*\w+\s*)?\{\s*return\s+"
+                         r"(?:::)?(?:ggml_sycl::)?" + STRICT_ACCESSOR_NAME + r"\s*\(\s*(?:void)?\s*\)\s*;\s*\}", code):
+        out.append((name, line_of(text, m.start()), "%s only returns %s(): a second name for one fact"
+                    % (m.group(1), STRICT_ACCESSOR_NAME)))
+    for m in STRICT_PLAN_BUG.finditer(folded):
+        total += 1
+        pos = orig(m.start())
+        line = line_of(text, pos)
+        message = re.match(r"((?:\\.|[^\"\\])*)\"", folded[m.start(1):]).group(1)
+        for want_file, want_text, _ in STRICT_ABORT_CENSUS:
+            if want_file == name and message.startswith(want_text):
+                found[(want_file, want_text)] = found.get((want_file, want_text), 0) + 1
+        cond = None
+        # unbraced: `if (cond) GGML_ABORT(...)`; braced: the abort sits directly in the block of `if (cond) {`
+        prev = code[:pos].rstrip()
+        if prev.endswith(")"):
+            op = open_of(code, len(prev) - 1)
+            if re.search(r"(?<![\w])if$", code[:op].rstrip()):
+                cond = re.sub(r"\s+", "", code[op + 1:len(prev) - 1])
+        else:
+            brace = enclosing_brace(code, pos)
+            head = code[:brace].rstrip() if brace >= 0 else ""
+            if head.endswith(")"):
+                op = open_of(code, len(head) - 1)
+                before = code[:op].rstrip()
+                if re.search(r"(?<![\w])if$", before) and not re.search(r"\belse\s+if$", before):
+                    cond = re.sub(r"\s+", "", code[op + 1:len(head) - 1])
+        if cond is None or not STRICT_ACCESSOR_COND.match(cond):
+            out.append((name, line, "%s abort is not a direct statement of `if (%s())` (condition: %s)"
+                        % (m.group(1), STRICT_ACCESSOR_NAME, cond if cond is not None else "none")))
+    return out, found, total
+
+
 def strict_accessor_violations(code_files):
     """Every [<FAMILY>-PLAN-BUG] GGML_ABORT is a direct statement of an if whose whole condition is one call of
     ggml_sycl_strict_enabled(); no function is a second name for that call."""
@@ -1090,41 +1202,11 @@ def strict_accessor_violations(code_files):
     found = {}
     total = 0
     for name, text in sorted(code_files.items()):
-        if "PLAN-BUG" not in text and STRICT_ACCESSOR_NAME not in text:
-            continue
-        # folded, so a tag split across adjacent literals is read whole; pos maps back into `code`
-        folded, orig = fold_literals(scrubbed(text, True), name)
-        code = scrubbed(text, False)
-        for m in re.finditer(r"(\w+)\s*\(\s*(?:void)?\s*\)\s*(?:const\s*)?(?:noexcept\s*)?(?:->\s*\w+\s*)?\{\s*return\s+"
-                             r"(?:::)?(?:ggml_sycl::)?" + STRICT_ACCESSOR_NAME + r"\s*\(\s*(?:void)?\s*\)\s*;\s*\}", code):
-            out.append((name, line_of(text, m.start()), "%s only returns %s(): a second name for one fact"
-                        % (m.group(1), STRICT_ACCESSOR_NAME)))
-        for m in STRICT_PLAN_BUG.finditer(folded):
-            total += 1
-            pos = orig(m.start())
-            line = line_of(text, pos)
-            message = re.match(r"((?:\\.|[^\"\\])*)\"", folded[m.start(1):]).group(1)
-            for want_file, want_text, _ in STRICT_ABORT_CENSUS:
-                if want_file == name and message.startswith(want_text):
-                    found[(want_file, want_text)] = found.get((want_file, want_text), 0) + 1
-            cond = None
-            # unbraced: `if (cond) GGML_ABORT(...)`; braced: the abort sits directly in the block of `if (cond) {`
-            prev = code[:pos].rstrip()
-            if prev.endswith(")"):
-                op = open_of(code, len(prev) - 1)
-                if re.search(r"(?<![\w])if$", code[:op].rstrip()):
-                    cond = re.sub(r"\s+", "", code[op + 1:len(prev) - 1])
-            else:
-                brace = enclosing_brace(code, pos)
-                head = code[:brace].rstrip() if brace >= 0 else ""
-                if head.endswith(")"):
-                    op = open_of(code, len(head) - 1)
-                    before = code[:op].rstrip()
-                    if re.search(r"(?<![\w])if$", before) and not re.search(r"\belse\s+if$", before):
-                        cond = re.sub(r"\s+", "", code[op + 1:len(head) - 1])
-            if cond is None or not STRICT_ACCESSOR_COND.match(cond):
-                out.append((name, line, "%s abort is not a direct statement of `if (%s())` (condition: %s)"
-                            % (m.group(1), STRICT_ACCESSOR_NAME, cond if cond is not None else "none")))
+        f_out, f_found, f_total = per_file("accessor", name, text, _accessor_scan)
+        out += f_out
+        total += f_total
+        for key, n in f_found.items():
+            found[key] = found.get(key, 0) + n
     if total < 1:
         out.append(("tree", 0, "no [<FAMILY>-PLAN-BUG] abort found; the clause would pass vacuously"))
     for want_file, want_text, count in STRICT_ABORT_CENSUS:
@@ -1318,6 +1400,36 @@ def strict_mutants(files):
            append("src/llama-context.cpp",
                   'static void bug() { if (ggml_sycl::unified_alloc_strict_mode()) { ggml_abort(__FILE__, __LINE__, "[CONTEXT-PLAN-BUG] z"); } }'),
            "not a direct statement")
+    # Python concatenation across lines, continuations, triple quotes and prefixes (m-1)
+    pyfile = "tests/test-sycl-kv-layer-sizing-source.py"
+    for label, shape in (
+            ("a parenthesised multi-line adjacent pair", 'ODD = ("GGML_SYCL_"\n        "%s")'),
+            ("a multi-line pair joined by a leading +", 'ODD = ("GGML_SYCL_"\n        + "%s")'),
+            ("a pair joined by a trailing + and a backslash continuation", 'ODD = "GGML_SYCL_" + \\\n    "%s"'),
+            ("triple-quoted pieces", 'ODD = """GGML_SYCL_""" """%s"""'),
+            ("an f-prefixed second piece", 'ODD = "GGML_SYCL_" f"%s"'),
+            ("an r-prefixed second piece", 'ODD = "GGML_SYCL_" r"%s"'),
+            ("a b-prefixed second piece", 'ODD = "GGML_SYCL_" b"%s"'),
+            ("a comment between the Python pieces", 'ODD = ("GGML_SYCL_"  # a note\n        "%s")')):
+        yield ("a second switch as " + label, append(pyfile, shape % foo), "is not the strict switch")
+    # a split inside the tokens a pre-filter would test for, and a comment between C pieces (n-1, n-2)
+    yield ("a second getenv of the real switch split inside STRICT, in a file with no other STRICT",
+           {**files, "ggml/src/ggml-sycl/second.cpp":
+            'static bool s() { return getenv("GGML_SYCL_STR" "ICT_LEASES") != nullptr; }\n'}, "found 2 getenv")
+    yield ("a second switch split inside GGML, in a file with no other STRICT",
+           {**files, "ggml/src/ggml-sycl/third.cpp": 'static const char * k = "GG" "ML_SYCL_%s" "ICT_FOO";\n' % "STR"},
+           "is not the strict switch")
+    yield ("a block comment between C pieces of a second switch",
+           append(_GS, 'static const char * k = "GGML_SYCL_" /* a note */ "%s";' % foo), "is not the strict switch")
+    yield ("a line comment between C pieces of a second switch",
+           append(_GS, 'static const char * k = "GGML_SYCL_" // a note\n    "%s";' % foo), "is not the strict switch")
+    # more than a call or an assignment in a log argument (n-3)
+    yield ("a throw hidden in the log arguments of a non-member read",
+           edit(_CH, "dev, resolved.ptr, data_device[dev]);", "dev, resolved.ptr, throw 1);", "throw in args"),
+           "gates something other than GGML_LOG_*")
+    yield ("a delete hidden in the log arguments of a non-member read",
+           edit(_CH, "dev, resolved.ptr, data_device[dev]);", "dev, resolved.ptr, delete data_device[dev]);", "delete in args"),
+           "gates something other than GGML_LOG_*")
     # positive controls: legitimate shapes the clauses must not refuse
     folded = edit(_UC, "static bool strict_lease_checks_enabled() {\n    static const bool enabled = [] {\n"
                        "        const char * env = std::getenv(\"%s\");\n        return env != nullptr && std::atoi(env) != 0;\n"
@@ -1435,7 +1547,7 @@ def main():
             status = 1
         if not bad:
             built = list(strict_mutants(tracked))
-            if sum(1 for _, _, frag in built if frag is not None) < 45:
+            if sum(1 for _, _, frag in built if frag is not None) < 60:
                 print("FAIL: gate 22: only %d mutants could be built" % len(built))
                 status = 1
             for name, m, frag in built:
