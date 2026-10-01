@@ -23706,6 +23706,7 @@ size_t unified_cache::zone_capacity_to_commit(vram_zone_id zone) const {
         }
         return zone_capacity(zone);
     }
+    // No VM backing exists yet, so nothing can reach this; the VM arm lands with it.
     GGML_ABORT("zone_capacity_to_commit: no VM backing exists to read a load's to-commit capacity from");
 }
 

@@ -131,12 +131,13 @@ unified_cache * make_mock(sycl::queue & q) {
 }
 
 // Instant 4: destroy the cache and read what the observer saw inside its
-// destruction. Returns whether the destruction reached the observer.
+// destruction.
 void check_instant_4(ggml_sycl_arena_backing_type want_backing) {
     unified_cache_test_set_destroy_observer(observe_destroy);
     CHECK(shutdown_unified_cache(), "instant 4: the cache shut down");
     unified_cache_test_set_destroy_observer(nullptr);
     CHECK_EQ(g_destroy.calls.load(), 1, "instant 4: the observer ran once, inside destruction");
+    CHECK_EQ(g_destroy.device, MOCK_DEVICE, "instant 4: the observer names the cache's device");
     CHECK_EQ(g_destroy.backing, want_backing, "instant 4: the member backing survives arena_destroy()");
     CHECK(!g_destroy.zone_backed, "instant 4: arena_destroy() left no backed zone");
     CHECK(!unified_cache_test_cache_exists(MOCK_DEVICE), "instant 4: the cache is gone");
@@ -147,8 +148,7 @@ int none_child(sycl::queue & q) {
     ggml_log_set(capture_log, nullptr);
     set_mock_environment();
     check_instant_0();
-    unified_cache * cache = make_mock(q);
-    (void) cache;
+    (void) make_mock(q);
     CHECK_EQ(ggml_sycl_arena_backing(MOCK_DEVICE), GGML_SYCL_ARENA_BACKING_TYPE_NONE, "NONE 1: backing");
     CHECK(!ggml_sycl_device_has_zones(MOCK_DEVICE), "NONE 1: no arena, no zones");
     check_instant_4(GGML_SYCL_ARENA_BACKING_TYPE_NONE);
@@ -207,6 +207,8 @@ int usm_main(sycl::queue & q) {
 
     unified_cache * cache = make_usm_mock(q);
     CHECK_EQ(cache->budget(), MOCK_BUDGET, "USM 1: the budget is the one the arm set");
+    CHECK_EQ(count_lines("[VRAM-ARENA] Active on device 0: 1 chunk(s), 320.0 MB total"), 1,
+             "USM 1: the early reserve printed its Active line (a failed reserve would WARN instead)");
     CHECK_EQ(cache->arena_total_size(), MOCK_BUDGET, "USM 1: the arena is the whole budget, in one chunk");
     CHECK_EQ(ggml_sycl_arena_backing(MOCK_DEVICE), GGML_SYCL_ARENA_BACKING_TYPE_USM, "USM 1: backing");
     CHECK(ggml_sycl_device_has_zones(MOCK_DEVICE), "USM 1: the reserved arena backs the zones");
@@ -222,6 +224,9 @@ int usm_main(sycl::queue & q) {
 }
 
 int strict_backing_child() {
+    // Without per_device a direct run resolves to GLOBAL, where every id maps to cache 0 and -1 is
+    // served instead of refused.
+    setenv("GGML_SYCL_UNIFIED_CACHE_MODE", "per_device", 1);
     ggml_log_set(capture_log, nullptr);
     (void) ggml_sycl_arena_backing(-1);
     std::printf("strict-child: returned without aborting\n");
@@ -302,6 +307,9 @@ int main(int argc, char ** argv) {
         return strict_capacity_child(q, true);
     }
 
+    // strict_lease_checks_enabled() latches this variable on first read; an exported value would abort
+    // the non-STRICT arms below before the STRICT children run.
+    unsetenv("GGML_SYCL_STRICT_LEASES");
     usm_main(q);
     test_none_process(argv[0]);
     test_strict_aborts(argv[0], "strict-backing-child",
