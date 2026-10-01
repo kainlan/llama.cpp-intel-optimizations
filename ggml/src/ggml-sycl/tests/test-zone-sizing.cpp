@@ -876,6 +876,25 @@ int main() {
         CHECK(ggml_sycl::zone_dense_scratch_merge_input(0, 0, true) == 0, "nothing planned stays nothing");
     }
 
+    // ---- Case 16: review r2 (hardware): a rung whose hold-induced spill leaves the card below the driver headroom
+    // does not fit. B50, Qwen PPL at auto-ub1024: a 461 MB compute buffer was held back, spilled outside the arena,
+    // the card was left with 107.8 MB free against the 256 MB the arena expects outside it, and flash attention then
+    // ran out of resources. The ladder must see that at the rung, not at the first graph. -------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(!ggml_sycl::zone_hold_spill_realized_fits(108 * MiB, 256 * MiB, 461 * MiB),
+              "the B50 ub1024 rung: a 461 MB hold spill leaves 107.8 MB free, below the 256 MB headroom: no fit");
+        CHECK(ggml_sycl::zone_hold_spill_realized_fits(0, 256 * MiB, 0),
+              "no hold-induced spill: the check asks nothing, whatever the free memory is");
+        CHECK(ggml_sycl::zone_hold_spill_realized_fits(256 * MiB, 256 * MiB, 1),
+              "a spill that leaves exactly the headroom fits");
+        CHECK(!ggml_sycl::zone_hold_spill_realized_fits(256 * MiB - 1, 256 * MiB, 1),
+              "one byte below the headroom after a spill does not fit");
+        CHECK(ggml_sycl::zone_hold_spill_realized_fits(4096 * MiB, 256 * MiB, 461 * MiB),
+              "a spill the card can take with its headroom intact fits: the hold costs a rung only when it must");
+        CHECK(!ggml_sycl::zone_hold_spill_realized_fits(0, 256 * MiB, 1), "a spill with no free memory left does not fit");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

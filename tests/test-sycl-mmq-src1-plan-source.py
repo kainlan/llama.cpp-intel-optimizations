@@ -619,6 +619,25 @@ def evaluate(backend, common, cache, zone):
     # evicts for it (the guard refuses only on hold_spill, which F1's predicate no longer sets for it).
     results["the overcommit guard refuses only a hold-induced spill"] = \
         re.search(r"if\s*\(\s*hold_spill\s*\)\s*\{[^{}]*return false;", unified_alloc_fn) is not None
+
+    # r2 (hardware, B50 auto-ub1024): the ladder's "does this rung fit" must see a hold-induced spill that leaves
+    # the card below the driver headroom. The spill is realized during the rung's own compute-buffer reserve, so
+    # the narrow recheck that runs inside it (and whose refusal makes the candidate lose) is where it is counted.
+    realized_fn = function_body(backend, r"static bool ggml_sycl_check_hold_spill_realized\([^)]*\)\s*\{") or ""
+    graph_headroom_fn = function_body(backend, r"static void ggml_sycl_check_graph_scratch_headroom\([^)]*\)\s*\{") or ""
+    results["anchor: realized hold-spill check exists"] = realized_fn != ""
+    results["the realized check asks the pure rule, the live free memory and the spills since this publish"] = \
+        "zone_hold_spill_realized_fits(" in realized_fn and "ggml_backend_sycl_get_device_memory(" in realized_fn and \
+        "unified_cache_get_recent_planned_hold_spills(" in realized_fn and "GGML_SYCL_RUNTIME_TXN_REFUSAL" in realized_fn
+    results["the recheck inside the rung's reserve runs the realized check for this context"] = \
+        re.search(r"ggml_sycl_check_hold_spill_realized\([^;]*planned_scratch_owner", recheck_fn) is not None
+    results["a publish starts a new spill epoch (a losing rung's spills and mark do not carry to the next rung)"] = \
+        "unified_cache_begin_planned_hold_epoch(" in txn and \
+        re.search(r"void unified_cache_begin_planned_hold_epoch\([^)]*\)\s*\{[^}]*request_hwm\s*=\s*0", cache) is not None and \
+        re.search(r"void unified_cache_begin_planned_hold_epoch\([^)]*\)\s*\{[^}]*recent_bytes\s*=\s*0", cache) is not None
+    results["the driver headroom the realized check uses is the graph-entry check's constant (one source)"] = \
+        "kSyclArenaMinExternalHeadroomBytes" in realized_fn and "kSyclArenaMinExternalHeadroomBytes" in graph_headroom_fn and \
+        re.search(r"arena_min_external_headroom\s*=\s*256", graph_headroom_fn) is None
     return results
 
 
