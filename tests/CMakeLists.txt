@@ -383,6 +383,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # caller as FAILED and as llama_decode() == -2. Loads tiny models and swaps the CPU device's buffer
     # type for a refusing wrapper, so it is `model`-labelled and lead-run like the one above.
     llama_build_and_test(test-context-update-failure.cpp LABEL model)
+    # H3i (4): a failed reserve reaches decode and encode as -2; loads a tiny model, so `model` as above.
+    llama_build_and_test(test-context-reserve-failure.cpp LABEL model)
 
     llama_build(test-fusion.cpp)
 endif()
