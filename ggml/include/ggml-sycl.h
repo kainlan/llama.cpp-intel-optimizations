@@ -77,6 +77,13 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_kv_buffer_type_fro
 // plan. Returns true (today's tiered-device behavior) when no plan is active.
 GGML_BACKEND_API bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32_t il);
 
+// Whether the active placement plan leaves any part of the graph for the CPU to
+// execute: a host-planned dense layer, host-planned KV, or an expert tensor with
+// no expert on a device. False when no plan is active. llama-context reads it to
+// decide whether the CPU backend's compute buffer needs the dedicated activation
+// buffer type above; it must be read AFTER the last placement re-plan.
+GGML_BACKEND_API bool ggml_backend_sycl_plan_has_cpu_work(ggml_backend_dev_t dev);
+
 // Get the byte offset for reading this rank's shard from GGUF file
 // For column-parallel tensors, this is the offset into the tensor data
 // For row-parallel tensors, returns 0 (requires special handling due to interleaved data)

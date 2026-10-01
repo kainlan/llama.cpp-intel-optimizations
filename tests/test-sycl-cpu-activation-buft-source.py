@@ -100,7 +100,7 @@ texts = {
         ctx_cpp, "if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {", window=1800),
     "ctx_cpp": ctx_cpp,
     "plan_helper": function_window(
-        sycl_cpp, "static bool " + PLAN_HELPER + "(const placement_plan & plan) {", window=8000),
+        sycl_cpp, "static bool " + PLAN_HELPER + "(const ggml_sycl::placement_plan & plan) {", window=8000),
     "pred_fn": function_window(sycl_cpp, "bool " + PRED_FN + "(ggml_backend_dev_t dev) {"),
     "ctx_select_fn": function_window(
         ctx_cpp, "static ggml_backend_buffer_type_t " + CTX_SELECT + "(", window=4000),

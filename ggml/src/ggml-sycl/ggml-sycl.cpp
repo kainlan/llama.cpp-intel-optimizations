@@ -108207,6 +108207,70 @@ bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32
     return snapshot->plan->get_kv_device(static_cast<int>(il)) >= 0;
 }
 
+// llama.cpp-38af: whether the CPU will execute any part of this model's graph,
+// read from the PUBLISHED placement plan -- the same authority supports_op
+// consults when it declines an op because its data is host-planned. Each clause
+// below is one of those declines: a dense layer planned on the host
+// (layer_device < 0, ggml_sycl_op_is_planned_on_host), a layer whose KV is
+// planned on the host (ggml_sycl_tensor_is_in_kv_host_buft), and an expert
+// tensor with NO expert on a device (ggml_sycl_moe_tensor_all_experts_on_host).
+// A partially-host expert tensor deliberately does not count: those experts run
+// in-backend through the CPU expert pool, never as a CPU split.
+//
+// llama-context uses this to decide whether the CPU backend's compute buffer
+// needs the dedicated activation buft (ggml_backend_sycl_cpu_activation_buffer_type):
+// with no CPU work every input is read out of SYCL_Host in place, and giving
+// that run split-copy names would only trip the replay-futility detector.
+static bool ggml_sycl_plan_has_cpu_work(const ggml_sycl::placement_plan & plan) {
+    for (const auto & [layer_id, layer_dev] : plan.layer_device) {
+        GGML_UNUSED(layer_id);
+        if (layer_dev < 0) {
+            return true;
+        }
+    }
+
+    const size_t n_kv_layers = plan.kv_layer_count();
+    for (uint32_t l = 0; l < n_kv_layers; ++l) {
+        if (plan.kv_size_for_layer(l) > 0 && plan.get_kv_device(static_cast<int>(l)) < 0) {
+            return true;
+        }
+    }
+
+    // Per expert tensor: does ANY of its experts have a device placement?
+    std::unordered_map<std::string, bool> expert_tensor_has_device_expert;
+    for (const auto & e : plan.entries) {
+        if (e.expert_id < 0) {
+            if (e.layer_id >= 0 && !e.on_device) {
+                return true;  // a dense block weight planned on the host
+            }
+            continue;
+        }
+        bool & any_on_device = expert_tensor_has_device_expert[e.name];
+        any_on_device        = any_on_device || plan.expert_on_device(e.name, e.expert_id);
+    }
+    for (const auto & [name, any_on_device] : expert_tensor_has_device_expert) {
+        GGML_UNUSED(name);
+        if (!any_on_device) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ggml_backend_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return false;  // neutral: keep today's host buft
+    }
+    GGML_UNUSED(dev);  // the placement plan is process-global, not per-device
+    const auto snapshot = ggml_sycl_global_plan_snapshot();
+    if (!snapshot || !snapshot->plan) {
+        return false;
+    }
+    return ggml_sycl_plan_has_cpu_work(*snapshot->plan);
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_backend_dev_t dev,
                                                                            void *             ptr,
                                                                            size_t             size,
@@ -110300,6 +110364,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     // this proc address under GGML_BACKEND_DL.
     if (strcmp(name, "ggml_backend_sycl_cpu_activation_buffer_type") == 0) {
         return (void *) ggml_backend_sycl_cpu_activation_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_has_cpu_work") == 0) {
+        return (void *) ggml_backend_sycl_plan_has_cpu_work;
     }
     if (strcmp(name, "ggml_backend_sycl_kv_layer_on_device_from_dev") == 0) {
         return (void *) ggml_backend_sycl_kv_layer_on_device_from_dev;
