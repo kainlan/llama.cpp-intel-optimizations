@@ -1821,7 +1821,7 @@ static int case_h2_refit_fuzz() {
     };
 
     size_t placed = 0, identity = 0, lost = 0, multi = 0, layer_and_head = 0, head_lost = 0, extra_dem = 0,
-           head_refused = 0, terms = 0, term_drop = 0;
+           head_refused = 0, terms = 0, term_drop = 0, with_holes = 0, with_super = 0;
     for (uint64_t seed = 1; seed <= 3000; ++seed) {
         lcg               rng(seed);
         krt::device_model dev;
@@ -1979,9 +1979,18 @@ static int case_h2_refit_fuzz() {
             std::fprintf(stderr, "fuzz seed %llu: %s\n", (unsigned long long) seed, what);
             return 1;
         };
+        // A re-fit is an assignment only: what describes the plan's own room is empty.
+        with_holes += f.sub_slot_holes.empty() ? 0 : 1;
+        with_super += f.superseded.empty() ? 0 : 1;
+        if (!g.free_after_full_kv.empty() || !g.sub_slot_holes.empty() || !g.superseded.empty()) {
+            return fail("a re-fit carries the plan's own room");
+        }
         // Nothing is added, and nothing moves.
         for (size_t i = 0; i < f.layers.size(); ++i) {
             size_t tg = 0, og = 0, tp = 0, op = 0;
+            if (g.layers[i].size != f.layers[i].size) {
+                return fail("a layer's size changed");
+            }
             if (layer_site(g, i, tg, og) && (!layer_site(f, i, tp, op) || tg != tp || og != op)) {
                 return fail("a layer moved or was added");
             }
@@ -2219,10 +2228,11 @@ static int case_h2_refit_fuzz() {
     }
     std::fprintf(stderr,
                  "refit fuzz: placed=%zu identity=%zu lost=%zu multi=%zu layer+head=%zu head_lost=%zu "
-                 "extra_dem=%zu head_refused=%zu terms=%zu term_drop=%zu\n",
-                 placed, identity, lost, multi, layer_and_head, head_lost, extra_dem, head_refused, terms, term_drop);
+                 "extra_dem=%zu head_refused=%zu terms=%zu term_drop=%zu holes=%zu superseded=%zu\n",
+                 placed, identity, lost, multi, layer_and_head, head_lost, extra_dem, head_refused, terms, term_drop,
+                 with_holes, with_super);
     CHECK(identity > 100 && lost > 200 && multi > 100 && layer_and_head > 20 && head_lost > 50 && extra_dem > 20 &&
-              head_refused > 0 && terms > 500 && term_drop > 50,
+              head_refused > 0 && terms > 500 && term_drop > 50 && with_holes > 20,
           "fuzz: the generator exercises every arm");
     return 0;
 }
@@ -2405,63 +2415,102 @@ static int case_i17_refit_replaces_by_route() {
     return 0;
 }
 
-// The head phase is three greedy attempts, never worse than the request order.  An
-// oracle for zones that are one gap each (so a head's room is a number): the request order
-// with the tightest room, the constrained-heads-first order, and the request order with
-// the first TLSF that has room.  The fit must place the heads exactly when one of them
-// does, and so can never refuse what the request order places.
+// The head phase is up to three greedy attempts: the request order with the tightest room,
+// the constrained-heads-first order with the tightest room, and the request order with the
+// first TLSF that has room in each tier.  An oracle for zones whose rooms are a number each:
+// a top gap (tier 2) and, on some TLSFs, a hole between two walls (tier 3).  The fit must
+// place the heads exactly when one attempt does, take the first attempt that does, and
+// assign each head to the TLSF that attempt chose, so the attempt order and the tier rule
+// of the third attempt are both pinned, not only whether the heads fit.
 static int case_i15_head_attempts_oracle() {
+    struct room {
+        size_t tlsf;
+        int    tier;
+        size_t left;
+    };
+
     size_t refused_request = 0;
     size_t rescued         = 0;
-    for (uint64_t seed = 1; seed <= 3000; ++seed) {
-        lcg                 rng(seed);
-        krt::device_model   dev;
-        const uint32_t      n = 2 + rng.next(3);
-        std::vector<bool>   kv(n), weight(n);
-        std::vector<size_t> cap(n);
+    size_t order_differs   = 0;  // attempts 2 and 3 both place every head, differently
+    size_t tier_differs    = 0;  // attempt 3 wins and comparing the TLSF before the tier would not agree
+    for (uint64_t seed = 1; seed <= 40000; ++seed) {
+        lcg               rng(seed);
+        krt::device_model dev;
+        const uint32_t    n = 2 + rng.next(3);
+        std::vector<bool> kv(n), weight(n);
+        std::vector<room> rooms;
         for (uint32_t t = 0; t < n; ++t) {
-            const size_t gap = (5 + rng.next(40)) * MiB;
-            dev.tlsfs.emplace_back(MiB + 16 * MiB + gap);
+            const size_t gap       = (3 + rng.next(24)) * MiB;
+            const bool   has_hole  = rng.next(2) != 0;
+            const size_t hole_size = (3 + rng.next(20)) * MiB;
+            dev.tlsfs.emplace_back(16 * MiB + (has_hole ? 16 * MiB + hole_size : 0) + MiB + gap);
             auto & z             = dev.tlsfs.back();
             z.takes_kv           = rng.next(3) != 0;
             z.takes_weight_named = rng.next(2) != 0;
             z.context(16 * MiB);
+            if (has_hole) {
+                z.weight(8 * MiB);
+                const size_t h = z.weight(hole_size);
+                z.weight(8 * MiB);
+                z.free(h);
+                rooms.push_back({ t, 3, hole_size });
+            }
+            rooms.push_back({ t, 2, MiB + gap });
             kv[t]     = z.takes_kv;
             weight[t] = z.takes_weight_named;
-            cap[t]    = MiB + gap;
         }
         kv_region_request r;
-        for (uint32_t h = 2 + rng.next(3); h > 0; --h) {
+        for (uint32_t h = 3 + rng.next(3); h > 0; --h) {
             r.head_slots.push_back(
-                head_slot("h", (uint32_t) r.head_slots.size(), (2 + rng.next(18)) * MiB, rng.next(2) != 0));
+                head_slot("h", (uint32_t) r.head_slots.size(), (2 + rng.next(14)) * MiB, rng.next(2) != 0));
         }
-        // The oracle: one attempt places the heads in `order`, each in the room `by_tlsf`
-        // or the tightest fit chooses, and returns the heads no room held.
-        auto attempt = [&](const std::vector<size_t> & order, bool by_tlsf) {
-            std::vector<size_t> left = cap;
+
+        // One attempt places the heads in `order`, each in the best room: the lowest tier,
+        // then the smallest room, or with `by_tlsf` then the lowest TLSF.  `ignore_tier`
+        // compares the TLSF first, which the fit must not do.
+        struct outcome {
             std::vector<size_t> refused;
+            std::vector<size_t> where;
+        };
+
+        auto attempt = [&](const std::vector<size_t> & order, bool by_tlsf, bool ignore_tier) {
+            std::vector<room> left = rooms;
+            outcome           out;
+            out.where.assign(r.head_slots.size(), SIZE_MAX);
             for (size_t h : order) {
                 const size_t need = r.head_slots[h].size;
                 size_t       pick = SIZE_MAX;
-                for (size_t t = 0; t < n; ++t) {
-                    if (!(r.head_slots[h].names_weight ? weight[t] : kv[t]) || left[t] < need) {
+                for (size_t i = 0; i < left.size(); ++i) {
+                    const room & c = left[i];
+                    if (!(r.head_slots[h].names_weight ? weight[c.tlsf] : kv[c.tlsf]) || c.left < need) {
                         continue;
                     }
-                    if (pick == SIZE_MAX || (!by_tlsf && left[t] < left[pick])) {
-                        pick = t;
+                    bool better = pick == SIZE_MAX;
+                    if (!better) {
+                        const room & b = left[pick];
+                        if (ignore_tier && c.tlsf != b.tlsf) {
+                            better = c.tlsf < b.tlsf;
+                        } else if (c.tier != b.tier) {
+                            better = c.tier < b.tier;
+                        } else if (by_tlsf && c.tlsf != b.tlsf) {
+                            better = c.tlsf < b.tlsf;
+                        } else {
+                            better = c.left < b.left;
+                        }
                     }
-                    if (by_tlsf) {
-                        break;
+                    if (better) {
+                        pick = i;
                     }
                 }
                 if (pick == SIZE_MAX) {
-                    refused.push_back(h);
+                    out.refused.push_back(h);
                 } else {
-                    left[pick] -= need;
+                    out.where[h] = left[pick].tlsf;
+                    left[pick].left -= need;
                 }
             }
-            std::sort(refused.begin(), refused.end());
-            return refused;
+            std::sort(out.refused.begin(), out.refused.end());
+            return out;
         };
         std::vector<size_t> request(r.head_slots.size());
         for (size_t h = 0; h < request.size(); ++h) {
@@ -2476,50 +2525,182 @@ static int case_i15_head_attempts_oracle() {
         std::stable_sort(constrained.begin(), constrained.end(), [&](size_t a, size_t b) {
             return admissible[r.head_slots[a].names_weight ? 1 : 0] < admissible[r.head_slots[b].names_weight ? 1 : 0];
         });
-        const std::vector<size_t>  by_request   = attempt(request, false);
-        const bool                 by_first     = attempt(request, true).empty();
-        const bool                 by_constrain = attempt(constrained, false).empty();
-        const kv_region_fit_result f            = kv_region_fit(dev.snapshot(), r);
-        if (f.fits != (by_request.empty() || by_first || by_constrain)) {
+        const outcome              one   = attempt(request, false, false);
+        const outcome              two   = attempt(constrained, false, false);
+        const outcome              three = attempt(request, true, false);
+        const outcome              win   = one.refused.empty() ? one : two.refused.empty() ? two : three;
+        const bool                 want  = win.refused.empty();
+        const kv_region_fit_result f     = kv_region_fit(dev.snapshot(), r);
+        if (f.fits != want) {
             std::fprintf(stderr, "head attempts seed %llu\n", (unsigned long long) seed);
             CHECK(false, "head attempts: the fit places the heads exactly when one of the three attempts does");
         }
         if (!f.fits) {
-            CHECK(f.refused_heads == by_request, "head attempts: a refusal names the heads the request order refused");
+            CHECK(f.refused_heads == one.refused, "head attempts: a refusal names the heads the request order refused");
+        } else {
+            for (size_t h = 0; h < r.head_slots.size(); ++h) {
+                if (f.heads[h].tlsf != win.where[h]) {
+                    std::fprintf(stderr, "head attempts seed %llu head %zu\n", (unsigned long long) seed, h);
+                    CHECK(false, "head attempts: each head is on the TLSF of the first attempt that places them all");
+                }
+            }
         }
-        if (!by_request.empty()) {
+        if (!one.refused.empty()) {
             ++refused_request;
             rescued += f.fits ? 1 : 0;
+            if (two.refused.empty() && three.refused.empty() && two.where != three.where) {
+                ++order_differs;
+            }
+            if (two.refused.empty() == false && three.refused.empty() &&
+                attempt(request, true, true).where != three.where) {
+                ++tier_differs;
+            }
         }
         if (f.fits) {
             krt::device_model d = dev;
             CHECK(d.replay(f), "head attempts: the heads carve at the fit's offsets");
         }
     }
+    std::fprintf(stderr, "head attempts: refused_request=%zu rescued=%zu order_differs=%zu tier_differs=%zu\n",
+                 refused_request, rescued, order_differs, tier_differs);
     CHECK(refused_request > 50 && rescued > 20, "head attempts: the generator makes the request order refuse");
+    CHECK(order_differs > 10, "head attempts: the generator makes attempts 2 and 3 place the heads differently");
+    CHECK(tier_differs > 5, "head attempts: the generator makes the TLSF-before-tier reading differ in attempt 3");
+    return 0;
+}
+
+// The two things the oracle above pins at random, as hand-made zones.  Each TLSF is a top
+// gap of `gap` + 1 MiB (tier 2) and optionally a `hole` MiB hole between two walls (tier 3).
+struct attempts_tlsf {
+    size_t gap;
+    size_t hole;  // 0: none
+    bool   kv;
+    bool   weight;
+};
+
+static krt::device_model attempts_zone(const std::vector<attempts_tlsf> & tlsfs) {
+    krt::device_model dev;
+    for (const attempts_tlsf & s : tlsfs) {
+        dev.tlsfs.emplace_back(16 * MiB + (s.hole != 0 ? 16 * MiB + s.hole * MiB : 0) + MiB + s.gap * MiB);
+        auto & z             = dev.tlsfs.back();
+        z.takes_kv           = s.kv;
+        z.takes_weight_named = s.weight;
+        z.context(16 * MiB);
+        if (s.hole != 0) {
+            z.weight(8 * MiB);
+            const size_t h = z.weight(s.hole * MiB);
+            z.weight(8 * MiB);
+            z.free(h);
+        }
+    }
+    return dev;
+}
+
+static int case_i21_head_attempts_order_and_tiers() {
+    // The request order with the tightest room refuses, and attempts 2 and 3 both place
+    // both heads, on different TLSFs.  T1 alone takes the weight head, so the constrained
+    // order puts it first: it takes T1 and the KV head the tightest of T0 (40) and T2 (25),
+    // which is T2.  The request order with the first TLSF puts the KV head on T0.  Attempt 1
+    // gives the KV head T1 (the tightest room, 20) and leaves the weight head none.
+    krt::device_model dev = attempts_zone({
+        { 39, 0, true, false },
+        { 19, 0, true, true  },
+        { 24, 0, true, false },
+    });
+    kv_region_request r;
+    r.head_slots.push_back(head_slot("kv", 0, 10 * MiB, /*names_weight=*/false));
+    r.head_slots.push_back(head_slot("w", 1, 15 * MiB, /*names_weight=*/true));
+    kv_region_fit_result f = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits, "attempt order: a later attempt places both heads");
+    CHECK_EQ(f.heads[1].tlsf, 1, "attempt order: the weight head is on the only TLSF that takes it");
+    CHECK_EQ(f.heads[0].tlsf, 2, "attempt order: the constrained-first attempt wins over the first-TLSF one");
+    CHECK(dev.replay(f), "attempt order: the heads carve at the fit's offsets");
+
+    // Only the request order with the first TLSF places these five weight heads (the
+    // admissible TLSFs are equal, so the constrained order is the request order).  Its tier
+    // rule decides head 0: T0 offers a 14 MiB hole (tier 3) and a 13 MiB gap (tier 2), T1 a
+    // 22 MiB gap (tier 2).  The 14 MiB head fits the hole and T1's gap: the tier outranks the
+    // TLSF, so it goes to T1's gap.
+    krt::device_model tier = attempts_zone({
+        { 12, 14, true, true },
+        { 21, 0,  true, true },
+    });
+    kv_region_request w;
+    for (size_t sz : { 14, 3, 8, 14, 7 }) {
+        w.head_slots.push_back(head_slot("w", (uint32_t) w.head_slots.size(), sz * MiB, /*names_weight=*/true));
+    }
+    f = kv_region_fit(tier.snapshot(), w);
+    CHECK(f.fits, "tier rule: the first-TLSF attempt places all five heads");
+    CHECK_EQ(f.heads[0].tlsf, 1, "tier rule: a tier-2 gap on a later TLSF beats a tier-3 hole on the first");
+    CHECK_EQ(f.heads[1].tlsf, 0, "tier rule: the 3 MiB head takes the first TLSF's gap");
+    CHECK_EQ(f.heads[3].tlsf, 0, "tier rule: and the second 14 MiB head the hole nothing else could take");
+    CHECK(tier.replay(f), "tier rule: the heads carve at the fit's offsets");
     return 0;
 }
 
 #if defined(__unix__) || defined(__APPLE__)
-// Whether running `fn` in a child process ends in SIGABRT.
-template <class F> static bool child_aborts(F fn) {
+struct child_result {
+    bool        aborted = false;  // ended in SIGABRT
+    std::string err;              // what it wrote to stderr
+};
+
+// Runs `fn` in a child process with its stderr piped back.
+template <class F> static child_result run_child(F fn) {
     std::fflush(nullptr);
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return {};
+    }
     const pid_t pid = fork();
     if (pid == 0) {
-        if (std::freopen("/dev/null", "w", stderr) == nullptr) {
+        close(fds[0]);
+        if (dup2(fds[1], 2) < 0) {
             _exit(2);
         }
         fn();
         _exit(0);
     }
+    close(fds[1]);
+    child_result out;
+    char         buf[512];
+    ssize_t      n = 0;
+    while ((n = read(fds[0], buf, sizeof buf)) > 0) {
+        out.err.append(buf, (size_t) n);
+    }
+    close(fds[0]);
     int status = 0;
     waitpid(pid, &status, 0);
-    return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+    out.aborted = WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+    return out;
+}
+
+// Whether the child ended in SIGABRT through the fit's named misuse abort: stderr carries
+// "<file>:<line>: [KV-FIT-MISUSE]" and names `detail`.  A bare SIGABRT is not enough: a
+// checked vector read (-D_GLIBCXX_ASSERTIONS) ends the same way when the guard that should
+// have fired is gone, and a weakened count check can be caught by the next check instead,
+// which names something else.
+static bool child_misuses(const child_result & c, const char * detail) {
+    const size_t at = c.err.find(": [KV-FIT-MISUSE] ");
+    if (!c.aborted || at == std::string::npos || at == 0 || c.err[at - 1] < '0' || c.err[at - 1] > '9' ||
+        c.err.find(detail, at) == std::string::npos) {
+        return false;
+    }
+    size_t digits = at;
+    while (digits > 0 && c.err[digits - 1] >= '0' && c.err[digits - 1] <= '9') {
+        --digits;
+    }
+    return digits > 1 && c.err[digits - 1] == ':' && c.err.find(".cpp:") != std::string::npos;
+}
+
+static void record_misuse(const char * file, int line, const char * detail) {
+    std::fprintf(stderr, "HANDLER %s:%d %s\n", file, line, detail);
 }
 #endif
 
 // A plan that does not answer the request is misuse, not "does not fit": the re-fit aborts
-// (the named [KV-FIT-MISUSE]) instead of reading past the request's vectors.
+// through the named [KV-FIT-MISUSE] (with a file:line) instead of reading past the
+// request's vectors.  Each arm is a plan or a request that differs from the one the
+// control passes, in the direction of "more" as well as "fewer".
 static int case_i18_refit_misuse_aborts() {
 #if defined(__unix__) || defined(__APPLE__)
     kv_region_request r = layers_request(iota_layers(0, 2), 100 * MiB);
@@ -2527,30 +2708,90 @@ static int case_i18_refit_misuse_aborts() {
     r.after_kv.push_back({ 0, 4 * MiB });
     krt::device_model          dev  = gap_zone(500 * MiB);
     const kv_region_fit_result plan = kv_region_fit(dev.snapshot(), r);
-    CHECK(plan.fits, "misuse: the plan");
+    CHECK(plan.fits && !plan.extents.empty() && plan.after_kv[0].admitted, "misuse: the plan");
     krt::device_model before = gap_zone(500 * MiB);
     for (const auto & op : plan.carve_order) {
         before.tlsfs[op.tlsf].own(op.offset, op.size);
     }
     const auto geo = before.snapshot();
-    auto       run = [&](const kv_region_request & request) {
+    auto       run = [&](const kv_region_request & request, const kv_region_fit_result & p) {
         kv_region_request re = request;
-        re.commit_plan       = &plan;
-        (void) kv_region_fit(geo, re);
+        re.commit_plan       = &p;
+        return run_child([&] { (void) kv_region_fit(geo, re); });
     };
-    CHECK(!child_aborts([&] { run(r); }), "misuse: control: the request the plan answered does not abort");
+    const child_result control = run(r, plan);
+    CHECK(!control.aborted && control.err.empty(), "misuse: control: the request the plan answered does not abort");
+
+    // The request differs from the plan's.
     kv_region_request fewer_heads = r;
     fewer_heads.head_slots.clear();
-    CHECK(child_aborts([&] { run(fewer_heads); }), "misuse: another head count aborts");
+    CHECK(child_misuses(run(fewer_heads, plan), "other layers, head slots or after-KV terms"),
+          "misuse: fewer head slots abort");
+    kv_region_request more_heads = r;
+    more_heads.head_slots.push_back(head_slot("ring", 1, 10 * MiB));
+    CHECK(child_misuses(run(more_heads, plan), "other layers, head slots or after-KV terms"),
+          "misuse: more head slots abort");
     kv_region_request fewer_terms = r;
     fewer_terms.after_kv.clear();
-    CHECK(child_aborts([&] { run(fewer_terms); }), "misuse: another after-KV count aborts");
+    CHECK(child_misuses(run(fewer_terms, plan), "other layers, head slots or after-KV terms"),
+          "misuse: fewer after-KV terms abort");
+    kv_region_request more_terms = r;
+    more_terms.after_kv.push_back({ 1, 4 * MiB });
+    CHECK(child_misuses(run(more_terms, plan), "other layers, head slots or after-KV terms"),
+          "misuse: more after-KV terms abort");
     kv_region_request other_layers = r;
     other_layers.layers[1].layer   = 7;
-    CHECK(child_aborts([&] { run(other_layers); }), "misuse: another layer id aborts");
+    CHECK(child_misuses(run(other_layers, plan), "a plan layer does not match"), "misuse: another layer id aborts");
     kv_region_request fewer_layers = r;
     fewer_layers.layers.pop_back();
-    CHECK(child_aborts([&] { run(fewer_layers); }), "misuse: another layer count aborts");
+    CHECK(child_misuses(run(fewer_layers, plan), "other layers, head slots or after-KV terms"),
+          "misuse: fewer layers abort");
+    kv_region_request more_layers = layers_request(iota_layers(0, 3), 100 * MiB);
+    more_layers.head_slots        = r.head_slots;
+    more_layers.after_kv          = r.after_kv;
+    CHECK(child_misuses(run(more_layers, plan), "other layers, head slots or after-KV terms"),
+          "misuse: more layers abort");
+
+    // The plan is not a plan of this request or this geometry.
+    kv_region_fit_result bad_extent = plan;
+    bad_extent.layers[0].extent     = bad_extent.extents.size();
+    CHECK(child_misuses(run(r, bad_extent), "a plan layer does not match"),
+          "misuse: a layer's extent index past the plan's extents aborts");
+    kv_region_fit_result bad_extent_tlsf = plan;
+    bad_extent_tlsf.extents[0].tlsf      = 5;
+    CHECK(child_misuses(run(r, bad_extent_tlsf), "a plan extent names a TLSF"),
+          "misuse: an extent on a TLSF the geometry lacks aborts");
+    kv_region_fit_result bad_term_tlsf = plan;
+    bad_term_tlsf.after_kv[0].tlsf     = 5;
+    CHECK(child_misuses(run(r, bad_term_tlsf), "an after-KV term names a TLSF"),
+          "misuse: an admitted term on a TLSF the geometry lacks aborts");
+    kv_region_fit_result other_geometry = plan;
+    other_geometry.yield_prefix.push_back(0);
+    CHECK(child_misuses(run(r, other_geometry), "another TLSF count"),
+          "misuse: a plan of a geometry with another TLSF count aborts");
+    for (size_t o = 0; o < plan.carve_order.size(); ++o) {
+        kv_region_fit_result bad_index = plan;
+        bad_index.carve_order[o].index = 99;
+        CHECK(child_misuses(run(r, bad_index), "a plan carve op names"),
+              "misuse: a carve op past its head, extent or term table aborts");
+        kv_region_fit_result bad_tlsf = plan;
+        bad_tlsf.carve_order[o].tlsf  = 5;
+        CHECK(child_misuses(run(r, bad_tlsf), "a plan carve op names"),
+              "misuse: a carve op on a TLSF the geometry lacks aborts");
+    }
+
+    // A handler is the backend's way in (L4 installs GGML_ABORT here): it sees the file, the
+    // line and the detail, and the fit still stops when it returns.
+    const child_result handled = run_child([&] {
+        ggml_sycl::kv_fit_misuse_handler().store(record_misuse);
+        kv_region_request re = fewer_heads;
+        re.commit_plan       = &plan;
+        (void) kv_region_fit(geo, re);
+    });
+    CHECK(handled.aborted && handled.err.find("HANDLER ") != std::string::npos &&
+              handled.err.find(".cpp:") != std::string::npos &&
+              handled.err.find("[KV-FIT-MISUSE]") == std::string::npos,
+          "misuse: an installed handler is called with the site, then the fit aborts");
     return 0;
 #else
     std::fprintf(stderr, "SKIP: misuse aborts need fork\n");
@@ -2681,6 +2922,53 @@ static int case_i5_sub_slot_hole_after_heads() {
     CHECK_EQ(f.sub_slot_holes.size(), 1, "sub-slot: only the hole the head slot left is reported");
     CHECK_EQ(f.sub_slot_holes[0].offset, h1, "sub-slot: it is the upper one");
     CHECK(dev.replay(f), "sub-slot: the head slot carves at the fit's offset");
+    return 0;
+}
+
+// A re-fit result is an assignment only: none of the plan's own room, holes or reservations
+// come with it, on the identity path and on the path that re-places a head.  The plan here
+// carries both a superseded ring row and a sub-slot hole, so a result that kept either would
+// differ from the empty vectors the header promises.
+static int case_i20_refit_result_is_an_assignment_only() {
+    auto zone = [] {
+        krt::device_model dev;
+        dev.tlsfs.emplace_back((8 + 33 + 16 + 130 + 60 + 1) * MiB);
+        krt::zone_model & z = dev.tlsfs[0];
+        z.context(MiB);
+        const size_t row = z.context(60 * MiB);
+        z.weight(8 * MiB);
+        const size_t hole = z.weight(33 * MiB);
+        z.weight(16 * MiB);
+        z.free(hole);
+        z.reserve(ggml_sycl::demand_scope::CONTEXT, 1, "ring", 0, row, 60 * MiB);
+        return dev;
+    };
+    kv_region_request r = layers_request(iota_layers(0, 2), 100 * MiB);
+    r.head_slots.push_back(head_slot("ring", 0, 80 * MiB));
+    krt::device_model          dev  = zone();
+    const kv_region_fit_result plan = kv_region_fit(dev.snapshot(), r);
+    CHECK(plan.fits && plan.superseded.size() == 1 && !plan.sub_slot_holes.empty() && !plan.free_after_full_kv.empty(),
+          "assignment only: the plan carries a superseded row, a sub-slot hole and its room");
+    krt::device_model before = zone();
+    for (const auto & op : plan.carve_order) {
+        before.tlsfs[op.tlsf].own(op.offset, op.size);
+    }
+    kv_region_request re            = r;
+    re.commit_plan                  = &plan;
+    const kv_region_fit_result same = kv_region_fit(before.snapshot(), re);
+    CHECK(same.fits && same_assignment(same, plan), "assignment only: with nothing lost the re-fit is the plan");
+    CHECK(same.free_after_full_kv.empty() && same.sub_slot_holes.empty() && same.superseded.empty(),
+          "assignment only: and it carries none of the plan's room, holes or reservations");
+
+    // The head's place is taken: it is re-placed, and the result is still an assignment only.
+    krt::device_model lost = zone();
+    for (const auto & op : plan.carve_order) {
+        lost.tlsfs[op.tlsf].own(op.offset, op.size);
+    }
+    lost.tlsfs[plan.heads[0].tlsf].pend(plan.heads[0].offset, 4 * MiB);
+    const kv_region_fit_result g = kv_region_fit(lost.snapshot(), re);
+    CHECK(g.free_after_full_kv.empty() && g.sub_slot_holes.empty() && g.superseded.empty(),
+          "assignment only: a re-fit that displaces a head carries none of the plan's room either");
     return 0;
 }
 
@@ -3737,10 +4025,16 @@ int main() {
     if (int rc = run_case("i17_refit_replaces_by_route", case_i17_refit_replaces_by_route)) {
         return rc;
     }
+    if (int rc = run_case("i21_head_attempts_order_and_tiers", case_i21_head_attempts_order_and_tiers)) {
+        return rc;
+    }
     if (int rc = run_case("i18_refit_misuse_aborts", case_i18_refit_misuse_aborts)) {
         return rc;
     }
     if (int rc = run_case("i19_allocate_at_stand_in_is_atomic", case_i19_allocate_at_stand_in_is_atomic)) {
+        return rc;
+    }
+    if (int rc = run_case("i20_refit_result_is_an_assignment_only", case_i20_refit_result_is_an_assignment_only)) {
         return rc;
     }
     if (int rc = run_case("h2_refit_fuzz", case_h2_refit_fuzz)) {

@@ -3,8 +3,10 @@
 #include "tlsf-allocator.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
 #include <vector>
@@ -753,9 +755,12 @@ struct kv_carve_op {
 // A fit's result is the plan.  A commit re-fit's result (kv_region_request::commit_plan)
 // is an assignment only: layers, extents, heads, after_kv, carve_order and refused_heads
 // say what the commit carves, while free_after_full_kv, sub_slot_holes and superseded are
-// empty (they describe the room and the reservations of the plan's own geometry, which a
-// shortfall has changed; the plan's stay with the plan), yield_prefix and buried_released
-// are zero and empty (a re-fit yields nothing), and tlsf_free is set only on a refusal.
+// empty, not n_tlsf-sized (they describe the room and the reservations of the plan's own
+// geometry, which a shortfall has changed; the plan's stay with the plan, and zeros would
+// read as "no room" rather than "not computed", so a consumer that indexes
+// free_after_full_kv by TLSF must be handed a fit's result, never a re-fit's),
+// yield_prefix and buried_released are zero and empty (a re-fit yields nothing), and
+// tlsf_free is set only on a refusal.
 struct kv_region_fit_result {
     bool fits = false;
 
@@ -792,5 +797,31 @@ struct kv_region_fit_result {
 };
 
 kv_region_fit_result kv_region_fit(const shared_zone_geometry & geometry, const kv_region_request & request);
+
+// The abort channel of the fit's contracts (a commit re-fit handed a plan that does not
+// answer its request).  This TU is linked by host tests with no ggml-base, so it cannot
+// call GGML_ABORT; the same problem kv-region-registry.hpp solves with a handler pointer,
+// solved the same way.  With no handler the default prints
+// "file:line: [KV-FIT-MISUSE] <detail>" on stderr and aborts.  The backend installs a
+// handler that calls GGML_ABORT when the first production caller appears (L4).  A handler
+// that returns does not resume the fit: the abort follows it, because the fit cannot
+// continue past a plan that is not its request's.
+using kv_fit_misuse_fn = void (*)(const char * file, int line, const char * detail);
+
+inline std::atomic<kv_fit_misuse_fn> & kv_fit_misuse_handler() {
+    static std::atomic<kv_fit_misuse_fn> handler{ nullptr };
+    return handler;
+}
+
+[[noreturn]] inline void kv_fit_misuse(const char * file, int line, const char * detail) {
+    if (kv_fit_misuse_fn h = kv_fit_misuse_handler().load()) {
+        h(file, line, detail);
+    } else {
+        std::fprintf(stderr, "%s:%d: [KV-FIT-MISUSE] %s\n", file, line, detail);
+    }
+    std::abort();
+}
+
+#define KV_FIT_MISUSE(detail) ::ggml_sycl::kv_fit_misuse(__FILE__, __LINE__, detail)
 
 }  // namespace ggml_sycl

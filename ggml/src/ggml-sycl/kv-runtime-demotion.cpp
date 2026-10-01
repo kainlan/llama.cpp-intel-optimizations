@@ -1117,14 +1117,6 @@ std::vector<size_t> head_placement_order(const shared_zone_geometry & g, const k
     return order;
 }
 
-// A broken contract of the commit re-fit.  This TU is linked by a host test with no
-// ggml-base, so it cannot call GGML_ABORT; it prints the named abort the backend's
-// would and stops.
-[[noreturn]] void fit_misuse(const char * what) {
-    std::fprintf(stderr, "[KV-FIT-MISUSE] commit re-fit: %s\n", what);
-    std::abort();
-}
-
 struct verify_span {
     size_t lo = 0;
     size_t hi = 0;
@@ -1211,16 +1203,29 @@ kv_region_fit_result commit_verify(const shared_zone_geometry &  g,
         res.refused_heads = plan.refused_heads;
         return res;
     }
-    // The plan must answer this request.  A mismatch is the caller's bug, not a plan that
-    // does not fit, so it never reads as a refusal.
+    // The plan must answer this request, in this geometry.  A mismatch is the caller's bug,
+    // not a plan that does not fit, so it never reads as a refusal.
     if (plan.heads.size() != r.head_slots.size() || plan.after_kv.size() != r.after_kv.size() ||
         plan.layers.size() != slots.size()) {
-        fit_misuse("the plan was made for a request with other layers, head slots or after-KV terms");
+        KV_FIT_MISUSE("commit re-fit: the plan was made for other layers, head slots or after-KV terms");
+    }
+    if (plan.yield_prefix.size() != n_tlsf) {
+        KV_FIT_MISUSE("commit re-fit: the plan was made for a geometry with another TLSF count");
+    }
+    for (const kv_region_extent & e : plan.extents) {
+        if (e.tlsf >= n_tlsf) {
+            KV_FIT_MISUSE("commit re-fit: a plan extent names a TLSF the geometry does not have");
+        }
     }
     for (size_t i = 0; i < slots.size(); ++i) {
         if (plan.layers[i].layer != slots[i].layer ||
             (plan.layers[i].device && plan.layers[i].extent >= plan.extents.size())) {
-            fit_misuse("a plan layer does not match the request's slot table");
+            KV_FIT_MISUSE("commit re-fit: a plan layer does not match the request's slot table");
+        }
+    }
+    for (const kv_after_kv_placement & ap : plan.after_kv) {
+        if (ap.admitted && ap.tlsf >= n_tlsf) {
+            KV_FIT_MISUSE("commit re-fit: a plan after-KV term names a TLSF the geometry does not have");
         }
     }
     for (const kv_carve_op & op : plan.carve_order) {
@@ -1228,7 +1233,8 @@ kv_region_fit_result commit_verify(const shared_zone_geometry &  g,
                              op.kind == KV_CARVE_EXTENT ? plan.extents.size() :
                                                           plan.after_kv.size();
         if (op.index >= bound || op.tlsf >= n_tlsf) {
-            fit_misuse("a plan carve op names a head, extent, term or TLSF the request does not have");
+            KV_FIT_MISUSE(
+                "commit re-fit: a plan carve op names a head, extent, term or TLSF the request does not have");
         }
     }
 
@@ -1612,14 +1618,18 @@ head_phase place_heads(const shared_zone_geometry & g,
     return ph;
 }
 
-// The head phase for a plan.  The request order is tried first, with the tightest room
-// across TLSFs; when that refuses a head, the constrained-heads-first order, and then
-// the request order with the first TLSF that has room in each tier, whatever its size.
-// The first attempt that places every head wins, so whatever
-// the request order places is placed exactly as before and no attempt can turn a
-// placement into a refusal.  When none fits, the refusal is the request order's.  This
-// is three greedy attempts, not a search over head orders: a placement some other order
-// would find can still be refused.
+// The head phase for a plan: up to three greedy attempts, each placing every head or
+// refusing some.  Attempt 1 is the request order with the tightest room across TLSFs, the
+// behaviour of 589836b41 unchanged.  Attempt 2 is the constrained-heads-first order (fewest
+// admissible TLSFs first), still the tightest room.  Attempt 3 is the request order with
+// the first TLSF that has room in each tier, whatever its size (the 935ff260f rule).  The
+// first attempt that places every head wins, so a request the request order places is
+// placed exactly as it was, and when none places every head the refusal is attempt 1's.
+// The guarantee is that the fit never refuses what the 935ff260f rule places on a carvable
+// piece: attempt 3 shares the carvability and clipped ranges of the other attempts, so a
+// placement that rule would make on a piece the carve cannot take is refused by design.
+// It is not a search over head orders, so a placement some other order would find can
+// still be refused.
 head_phase head_attempts(const shared_zone_geometry & g, const kv_region_request & r, const fit_state & start) {
     std::vector<size_t> request_order(r.head_slots.size());
     for (size_t h = 0; h < request_order.size(); ++h) {
