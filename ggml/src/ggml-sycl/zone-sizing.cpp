@@ -309,21 +309,74 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
     return true;
 }
 
-// RED stubs (llama.cpp-kpjw): every answer is wrong, so the host test fails until the real bodies land.
-bool zone_dense_scratch_total_bytes(size_t, size_t, size_t, uint32_t, size_t *) {
-    return false;
+bool zone_dense_scratch_total_bytes(size_t   mmq_bytes_per_token,
+                                    size_t   f16_weight_bytes,
+                                    size_t   f16_src1_bytes_per_token,
+                                    uint32_t n_ubatch,
+                                    size_t * out) {
+    if (!out) {
+        return false;
+    }
+    size_t q8   = 0;
+    size_t src0 = 0;
+    size_t src1 = 0;
+    if (!zone_mmq_src1_scratch_bytes(mmq_bytes_per_token, n_ubatch, &q8) ||
+        !zone_dequant_f16_plan_bytes(f16_weight_bytes, f16_src1_bytes_per_token, n_ubatch, &src0, &src1)) {
+        return false;
+    }
+    if (q8 > SIZE_MAX - src0 || q8 + src0 > SIZE_MAX - src1) {
+        return false;
+    }
+    *out = q8 + src0 + src1;
+    return true;
 }
 
-uint32_t zone_dense_scratch_largest_ubatch(size_t, size_t, size_t, size_t, size_t, uint32_t) {
+uint32_t zone_dense_scratch_largest_ubatch(size_t   mmq_bytes_per_token,
+                                           size_t   f16_weight_bytes,
+                                           size_t   f16_src1_bytes_per_token,
+                                           size_t   other_runtime_bytes,
+                                           size_t   capacity_bytes,
+                                           uint32_t search_max) {
+    constexpr uint32_t k_row_group = 32;
+    if (other_runtime_bytes >= capacity_bytes) {
+        return 0;
+    }
+    const size_t avail = capacity_bytes - other_runtime_bytes;
+    uint32_t     ub    = search_max / k_row_group * k_row_group;
+    // The total is monotonic in n_ubatch, so step down from the bound until it fits. A hopeless zone (the weight
+    // copy alone is too big) walks the whole range, at most search_max / 32 cheap steps, once per transaction.
+    for (; ub >= k_row_group; ub -= k_row_group) {
+        size_t total = 0;
+        if (zone_dense_scratch_total_bytes(mmq_bytes_per_token, f16_weight_bytes, f16_src1_bytes_per_token, ub,
+                                           &total) &&
+            total <= avail) {
+            return ub;
+        }
+    }
     return 0;
 }
 
-bool zone_planned_scratch_hold_bytes(const zone_planned_buffer *, size_t, size_t *) {
-    return false;
+bool zone_planned_scratch_hold_bytes(const zone_planned_buffer * buffers, size_t count, size_t * out) {
+    if (!out || (count != 0 && !buffers)) {
+        return false;
+    }
+    size_t hold = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (buffers[i].capacity >= buffers[i].plan) {
+            continue;
+        }
+        if (buffers[i].plan > SIZE_MAX - hold) {
+            return false;
+        }
+        hold += buffers[i].plan;
+    }
+    *out = hold;
+    return true;
 }
 
-bool zone_runtime_alloc_respects_hold(size_t, size_t, size_t) {
-    return true;
+bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size) {
+    // Written as two comparisons so that neither a huge hold nor a huge size can wrap into "fits".
+    return hold <= available && size <= available - hold;
 }
 
 namespace {
