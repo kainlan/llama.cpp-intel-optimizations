@@ -43,6 +43,13 @@
 // CONTROL only: production takes no host wait), then iii, the cross-context depends_on behind the busy
 // kernel. If i hangs the defect is leg 1 itself, not the dependency.
 //
+// Bytes. Timing alone cannot show a copy that moved stale or no bytes, so src holds a pattern, the bounce and
+// the destination start as distinct sentinels, and leg 2's destination is read back and compared after every
+// control that moves bytes and after iii (control iv is the positive control for iii's check). A mismatch is
+// "FAIL: leg 2 destination bytes wrong" and rc=1. Every step, backend init, queue creation, allocation and
+// teardown included, is bounded by the watchdog, which starts first, and a drain guard waits both queues before
+// any probe buffer's handle is released, on every path out.
+//
 // Exit codes: 0 for returns_before and for blocks (both are pre-registered outcomes the lead records),
 // 1 for void, undecided, a failed control or a setup failure, 77 when fewer than two PHYSICAL SYCL devices
 // are held (counted with ggml_sycl::test_physical_device_count() before any backend init).
@@ -64,6 +71,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -75,6 +83,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -153,6 +162,26 @@ long long now_ms_precise() {
         .count();
 }
 
+// Waits both queues before the probe's mem_handles are released, on every path out of the block: a
+// handle must outlive the work that uses its allocation, a failure path included. It is itself a bounded
+// step, so a drain that hangs is named by the watchdog.
+struct queue_drain_guard {
+    sycl::queue & a;
+    sycl::queue & b;
+
+    queue_drain_guard(sycl::queue & qa, sycl::queue & qb) : a(qa), b(qb) {}
+
+    ~queue_drain_guard() {
+        step_scope scope("teardown_drain_queues", k_step_budget_ms);
+        try {
+            a.wait();
+            b.wait();
+        } catch (...) {
+            std::printf("FAIL: the final queue drain threw\n");
+        }
+    }
+};
+
 // Pure device arithmetic with a loop-carried non-affine dependence (no closed form for the compiler to take),
 // its result stored so the loop is live. One work item, `iters` rounds.
 sycl::event submit_busy(sycl::queue & q, uint32_t * sink, uint64_t iters) {
@@ -188,27 +217,47 @@ int main(int, char ** argv) {
                      std::strerror(errno));
     }
 
+    // The watchdog starts before anything that can hang: backend init, queue creation, allocation and
+    // teardown are named steps too, because this stack hangs in exactly that area.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::thread(step_watchdog_main).detach();
+
     // The scheduler exposes only device 0 by default, so ggml_backend_sycl_get_device_count() is 1 on a
     // two-card host; the physical count is what decides the skip. Zero devices (no setvars) lands here too.
     // ggml_backend_sycl_init(i) asserts on an index past the scheduler-visible count, so the exposed
     // device 0 is the only one initialised as a backend.
-    const int physical_devices = ggml_sycl::test_physical_device_count();
-    if (physical_devices < 2 || ggml_backend_sycl_get_device_count() < 1) {
+    int physical_devices = 0;
+    int visible_devices  = 0;
+    {
+        step_scope scope("init_device_counts", k_step_budget_ms);
+        physical_devices = ggml_sycl::test_physical_device_count();
+        visible_devices  = ggml_backend_sycl_get_device_count();
+    }
+    if (physical_devices < 2 || visible_devices < 1) {
         std::printf("SKIP: fewer than two physical SYCL GPU devices available (physical=%d)\n", physical_devices);
         return LLAMA_TEST_EXIT_SKIP;
     }
 
-    ggml_backend_t backend_owner = ggml_backend_sycl_init(0);
+    ggml_backend_t backend_owner = nullptr;
+    {
+        step_scope scope("init_backend_owner", k_step_budget_ms);
+        backend_owner = ggml_backend_sycl_init(0);
+    }
     if (!backend_owner) {
         std::printf("FAIL: ggml_backend_sycl_init(0) failed on a host that reports two physical devices\n");
         return 1;
     }
     // The queues are created lazily by the MoE and split paths, so a standalone process creates them the way
     // those paths do: init_shared_context_queues(total_gpu_count), one single-device context per card.
-    ggml_sycl::init_shared_context_queues(physical_devices);
-    sycl::queue * q_source_ptr = ggml_sycl::get_shared_context_queue(1);
+    sycl::queue * q_source_ptr = nullptr;
+    {
+        step_scope scope("init_shared_context_queues", k_step_budget_ms);
+        ggml_sycl::init_shared_context_queues(physical_devices);
+        q_source_ptr = ggml_sycl::get_shared_context_queue(1);
+    }
     if (q_source_ptr == nullptr) {
         std::printf("FAIL: no shared-context queue for physical device 1\n");
+        step_scope scope("teardown_free_backend", k_step_budget_ms);
         ggml_backend_free(backend_owner);
         return 1;
     }
@@ -217,9 +266,6 @@ int main(int, char ** argv) {
     sycl::queue & q_owner   = *owner_ctx->stream(0, 0);
     sycl::queue & q_source  = *q_source_ptr;
 
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::thread(step_watchdog_main).detach();
-
     int rc = 1;
     {
         // The handles live in this block, so every buffer is released before the backend is freed.
@@ -227,10 +273,17 @@ int main(int, char ** argv) {
         probe_buffer bounce;
         probe_buffer dst_dev;
         probe_buffer sink;  // the busy kernel's result word, on the source device
-        const bool   ok = alloc_probe_buffer(src_dev, q_source, 1, k_bytes, false) &&
-                        alloc_probe_buffer(bounce, q_source, 1, k_bytes, true) &&
-                        alloc_probe_buffer(dst_dev, q_owner, 0, k_bytes, false) &&
-                        alloc_probe_buffer(sink, q_source, 1, 64, false);
+        bool         ok = false;
+        {
+            step_scope scope("alloc_probe_buffers", k_step_budget_ms);
+            ok = alloc_probe_buffer(src_dev, q_source, 1, k_bytes, false) &&
+                 alloc_probe_buffer(bounce, q_source, 1, k_bytes, true) &&
+                 alloc_probe_buffer(dst_dev, q_owner, 0, k_bytes, false) &&
+                 alloc_probe_buffer(sink, q_source, 1, 64, false);
+        }
+        // Declared after the handles, so it runs before any of them is released: every command the probe
+        // queued on either queue (the busy kernel, leg 1, leg 2, on a failure path too) is finished first.
+        queue_drain_guard drain(q_source, q_owner);
         if (!ok) {
             std::printf("FAIL: could not allocate the probe's buffers through unified_allocate\n");
         } else {
@@ -244,12 +297,38 @@ int main(int, char ** argv) {
             const auto kind = [&](void * ptr, sycl::queue & q) {
                 return static_cast<int>(sycl::get_pointer_type(ptr, q.get_context()));
             };
-            std::printf(
-                "[SYCL-STAGING-PROBE] contexts same=%d pointer_type(owner_ctx,source_ctx) "
-                "src_dev=(%d,%d) bounce=(%d,%d) dst_dev=(%d,%d) (0 host, 1 device, 2 shared, 3 unknown)\n",
-                q_owner.get_context() == q_source.get_context() ? 1 : 0, kind(src_ptr, q_owner),
-                kind(src_ptr, q_source), kind(bounce_ptr, q_owner), kind(bounce_ptr, q_source), kind(dst_ptr, q_owner),
-                kind(dst_ptr, q_source));
+            {
+                step_scope scope("query_pointer_types", k_step_budget_ms);
+                std::printf(
+                    "[SYCL-STAGING-PROBE] contexts same=%d pointer_type(owner_ctx,source_ctx) "
+                    "src_dev=(%d,%d) bounce=(%d,%d) dst_dev=(%d,%d) (0 host, 1 device, 2 shared, 3 unknown)\n",
+                    q_owner.get_context() == q_source.get_context() ? 1 : 0, kind(src_ptr, q_owner),
+                    kind(src_ptr, q_source), kind(bounce_ptr, q_owner), kind(bounce_ptr, q_source),
+                    kind(dst_ptr, q_owner), kind(dst_ptr, q_source));
+            }
+
+            // The bytes the legs move. Leg 2's destination is read back and compared, so a copy that moved
+            // stale or no bytes cannot pass on timing alone: src holds `pattern`, the bounce and the
+            // destination start as distinct sentinels.
+            std::vector<unsigned char> pattern(k_bytes);
+            for (size_t b = 0; b < k_bytes; ++b) {
+                pattern[b] = static_cast<unsigned char>((b * 131 + 7) & 0xFF);
+            }
+            const std::vector<unsigned char> sentinel_bounce(k_bytes, 0xAA);
+            const std::vector<unsigned char> sentinel_dst(k_bytes, 0x55);
+            const auto                       prime = [&]() {
+                q_source.memcpy(src_ptr, pattern.data(), k_bytes).wait();
+                std::memcpy(bounce_ptr, sentinel_bounce.data(), k_bytes);
+                q_owner.memcpy(dst_ptr, sentinel_dst.data(), k_bytes).wait();
+            };
+            const auto bounce_holds_pattern = [&]() {
+                return std::memcmp(bounce_ptr, pattern.data(), k_bytes) == 0;
+            };
+            const auto dst_holds_pattern = [&]() {
+                std::vector<unsigned char> readback(k_bytes, 0);
+                q_owner.memcpy(readback.data(), dst_ptr, k_bytes).wait();
+                return std::memcmp(readback.data(), pattern.data(), k_bytes) == 0;
+            };
 
             // Runs `fn` as a bounded step. A throw is a step failure, not a crash; a hang is the watchdog's.
             const auto run_step = [&](const char * name, const std::function<void()> & fn) {
@@ -272,8 +351,9 @@ int main(int, char ** argv) {
             bool controls_ok = true;
 
             // Calibration: a first tiny run builds the kernel, then the iteration count is scaled twice
-            // from measured run times so the busy kernel runs about k_target_busy_ms. The last measured time
-            // is the reference every verdict reading is held against.
+            // from measured run times so the busy kernel runs about k_target_busy_ms. The last calibration
+            // round is a first estimate; control g's two further runs join it, and the verdict's reference
+            // is the median of the three (one noisy run cannot move the thresholds).
             uint64_t   busy_iters = 1u << 22;
             double     busy_ms    = 0.0;
             const bool calibrated = run_step("calibrate_busy_kernel", [&]() {
@@ -304,37 +384,66 @@ int main(int, char ** argv) {
             } else {
                 // Control g: the busy kernel alone, the host waiting on its event (the must-fire control).
                 controls_ok &= run_step("control_g_busy_alone", [&]() {
-                    const double ms = busy_ms_of(q_source, sink_ptr, busy_iters);
-                    std::printf("[SYCL-STAGING-PROBE] control_g busy_ms=%.3f calibrated_ms=%.3f\n", ms, busy_ms);
-                    if (ms > 2.0 * busy_ms || ms < 0.5 * busy_ms) {
-                        throw std::runtime_error("the busy kernel's run time left [0.5x, 2x] of its calibration");
+                    const double calibrated_ms = busy_ms;
+                    const double a             = busy_ms_of(q_source, sink_ptr, busy_iters);
+                    const double b             = busy_ms_of(q_source, sink_ptr, busy_iters);
+                    std::printf("[SYCL-STAGING-PROBE] control_g busy_ms=%.3f,%.3f calibrated_ms=%.3f\n", a, b,
+                                calibrated_ms);
+                    for (const double ms : { a, b }) {
+                        if (ms > 2.0 * calibrated_ms || ms < 0.5 * calibrated_ms) {
+                            throw std::runtime_error("the busy kernel's run time left [0.5x, 2x] of its calibration");
+                        }
+                    }
+                    // The median of the calibration's last round and these two.
+                    const double lo = std::min(calibrated_ms, std::min(a, b));
+                    const double hi = std::max(calibrated_ms, std::max(a, b));
+                    busy_ms         = calibrated_ms + a + b - lo - hi;
+                    std::printf("[SYCL-STAGING-PROBE] busy_ms reference (median of three)=%.3f\n", busy_ms);
+                });
+
+                // Control i: leg 1 alone, no dependency, waited on its own event; the bounce must hold the
+                // pattern afterwards.
+                controls_ok &= run_step("control_i_leg1_alone", [&]() {
+                    prime();
+                    sycl::event e = q_source.submit([&](sycl::handler & h) { h.memcpy(bounce_ptr, src_ptr, k_bytes); });
+                    e.wait();
+                    if (!bounce_holds_pattern()) {
+                        throw std::runtime_error("leg 1 bounce bytes wrong");
                     }
                 });
 
-                // Control i: leg 1 alone, no dependency, waited on its own event.
-                controls_ok &= run_step("control_i_leg1_alone", [&]() {
-                    sycl::event e = q_source.submit([&](sycl::handler & h) { h.memcpy(bounce_ptr, src_ptr, k_bytes); });
-                    e.wait();
-                });
-
-                // Control ii: leg 2 alone, no dependency.
+                // Control ii: leg 2 alone, no dependency, from a bounce that holds the pattern.
                 controls_ok &= run_step("control_ii_leg2_alone", [&]() {
+                    prime();
+                    std::memcpy(bounce_ptr, pattern.data(), k_bytes);
                     sycl::event e = q_owner.submit([&](sycl::handler & h) { h.memcpy(dst_ptr, bounce_ptr, k_bytes); });
                     e.wait();
+                    if (!dst_holds_pattern()) {
+                        throw std::runtime_error("leg 2 destination bytes wrong");
+                    }
                 });
 
                 // Control iv: the dependency as a host wait, leg 1 done before leg 2 is submitted. A CONTROL
-                // only: production takes no host wait. Run before iii because iii can hang.
+                // only: production takes no host wait. Run before iii because iii can hang. It is also the
+                // positive control for the byte check iii makes.
                 controls_ok &= run_step("control_iv_host_wait_between", [&]() {
+                    prime();
                     sycl::event l1 =
                         q_source.submit([&](sycl::handler & h) { h.memcpy(bounce_ptr, src_ptr, k_bytes); });
                     l1.wait();
                     sycl::event l2 = q_owner.submit([&](sycl::handler & h) { h.memcpy(dst_ptr, bounce_ptr, k_bytes); });
                     l2.wait();
+                    if (!dst_holds_pattern()) {
+                        throw std::runtime_error("leg 2 destination bytes wrong");
+                    }
                 });
 
                 // Experiment iii: leg 1 held behind the busy kernel, leg 2 depending on it across contexts.
                 // Readings are host clocks from the busy kernel's submit.
+                {
+                    step_scope scope("iii_prime_bytes", k_step_budget_ms);
+                    prime();
+                }
                 sycl::event busy_event;
                 sycl::event leg1;
                 sycl::event leg2;
@@ -359,6 +468,7 @@ int main(int, char ** argv) {
                 if (!setup_threw) {
                     // A hang in this submit is the step watchdog's: "FAIL: HANG at iii_leg2_submit".
                     bool        submit_threw = false;
+                    double      return_ms    = -1.0;
                     std::string error;
                     {
                         step_scope scope("iii_leg2_submit", k_step_budget_ms);
@@ -374,21 +484,27 @@ int main(int, char ** argv) {
                             submit_threw = true;
                             error        = "non-standard exception";
                         }
+                        // Read before the scope's destructor prints its end line.
+                        return_ms = since_t0();
                     }
-                    const double return_ms = since_t0();
-                    double       done_ms   = -1.0;
-                    bool         drained   = !submit_threw;
+                    double done_ms = -1.0;
+                    bool   drained = !submit_threw;
+                    bool   dst_ok  = false;
                     if (!submit_threw) {
                         try {
                             {
                                 step_scope scope("iii_wait_leg2", k_step_budget_ms);
                                 leg2.wait();
+                                done_ms = since_t0();
                             }
-                            done_ms = since_t0();
                             {
                                 step_scope scope("iii_wait_queues", k_step_budget_ms);
                                 q_source.wait();
                                 q_owner.wait();
+                            }
+                            {
+                                step_scope scope("iii_verify_destination_bytes", k_step_budget_ms);
+                                dst_ok = dst_holds_pattern();
                             }
                         } catch (const std::exception & ex) {
                             drained = false;
@@ -405,20 +521,27 @@ int main(int, char ** argv) {
                         const staging_probe_verdict v = staging_probe_classify(busy_ms, return_ms, done_ms);
                         std::printf(
                             "[SYCL-STAGING-PROBE] leg2_submit=%s busy_ms=%.3f return_ms=%.3f done_ms=%.3f "
-                            "thresholds(returns_before<%.2f blocks>=%.2f void_done<%.2f of busy_ms) controls_ok=%d\n",
+                            "thresholds(returns_before<%.2f blocks>=%.2f void_done<%.2f of busy_ms) "
+                            "controls_ok=%d dst_ok=%d\n",
                             staging_probe_verdict_name(v), busy_ms, return_ms, done_ms,
                             k_staging_probe_returns_before_frac, k_staging_probe_blocks_frac,
-                            k_staging_probe_void_done_frac, controls_ok ? 1 : 0);
-                        rc = ((v == staging_probe_verdict::RETURNS_BEFORE || v == staging_probe_verdict::BLOCKS) &&
-                              controls_ok) ?
-                                 0 :
-                                 1;
+                            k_staging_probe_void_done_frac, controls_ok ? 1 : 0, dst_ok ? 1 : 0);
+                        if (!dst_ok) {
+                            std::printf("FAIL: leg 2 destination bytes wrong\n");
+                        }
+                        const bool pass =
+                            (v == staging_probe_verdict::RETURNS_BEFORE || v == staging_probe_verdict::BLOCKS) &&
+                            controls_ok && dst_ok;
+                        rc = pass ? 0 : 1;
                     }
                 }
             }
         }
     }
 
-    ggml_backend_free(backend_owner);
+    {
+        step_scope scope("teardown_free_backend", k_step_budget_ms);
+        ggml_backend_free(backend_owner);
+    }
     return rc;
 }
