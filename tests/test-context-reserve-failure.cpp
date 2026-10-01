@@ -136,8 +136,8 @@ struct fixture {
     llama_context_ptr ctx;
 };
 
-static bool build_fixture(fixture & fx) {
-    gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_LLAMA, moe_mandatory(LLM_ARCH_LLAMA));
+static bool build_fixture(fixture & fx, llm_arch arch) {
+    gguf_context_ptr gguf = get_gguf_ctx(arch, moe_mandatory(arch));
 
     llama_model_params mp                   = llama_model_default_params();
     mp.progress_callback                    = silent_model_load_progress;
@@ -184,12 +184,15 @@ static int encode_n(llama_context * ctx, int n, int first_token) {
 }
 
 // One call of `call` while the reserve is refused, then once more with it healthy.
-template <typename Call> static void run_call(const char * name, Call call) {
+//
+// `arch` is the architecture the call is legal on: llama_decode runs a decoder, but llama_encode builds an encoder
+// graph with no memory context, which a decoder-only model's attention input cannot be built without.
+template <typename Call> static void run_call(const char * name, llm_arch arch, Call call) {
     fprintf(stderr, "--- %s\n", name);
     g_buft.disarm();
 
     fixture    fx;
-    const bool built = build_fixture(fx);
+    const bool built = build_fixture(fx, arch);
     CHECK(built, "%s: fixture did not build", name);
     if (!built) {
         return;
@@ -220,8 +223,8 @@ template <typename Call> static void run_call(const char * name, Call call) {
 int main() {
     install_refusing_buft();
 
-    run_call("decode", decode_n);
-    run_call("encode", encode_n);
+    run_call("decode", LLM_ARCH_LLAMA, decode_n);
+    run_call("encode", LLM_ARCH_T5, encode_n);
 
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
