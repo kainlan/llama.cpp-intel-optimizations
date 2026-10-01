@@ -39915,51 +39915,6 @@ struct ggml_backend_sycl_split_buffer_type_context {
     std::array<float, GGML_SYCL_MAX_DEVICES> tensor_split;
 };
 
-// Whether `src0` lives in a row-split buffer and, if so, its tensor split. The op and the graph-entry walks of the
-// planned scratch buffers both need it, so the derivation exists once.
-static bool ggml_sycl_mul_mat_tensor_split(const ggml_tensor *                        src0,
-                                           std::array<float, GGML_SYCL_MAX_DEVICES> & tensor_split) {
-    if (!src0->buffer || !ggml_backend_buffer_is_sycl_split(src0->buffer)) {
-        return false;
-    }
-    const ggml_backend_sycl_split_buffer_type_context * buft_ctx =
-        (const ggml_backend_sycl_split_buffer_type_context *) src0->buffer->buft->context;
-    tensor_split = buft_ctx->tensor_split;
-    return true;
-}
-
-// The rows [row_low, row_high) of `src0` that device `i` computes: every row for a weight that is not row-split,
-// otherwise the slice the tensor split assigns it, rounded to the mul_mat_q tile size. The op and the graph-entry
-// walks share this one derivation, so a walk primes exactly the devices the op will run on.
-static void ggml_sycl_mul_mat_device_rows(const ggml_tensor *                              src0,
-                                          bool                                             split,
-                                          const std::array<float, GGML_SYCL_MAX_DEVICES> & tensor_split,
-                                          int                                              i,
-                                          int64_t *                                        row_low,
-                                          int64_t *                                        row_high) {
-    const int64_t ne01 = src0->ne[1];
-    // by default, use all rows
-    *row_low           = 0;
-    *row_high          = ne01;
-    // for multi GPU, get the row boundaries from tensor split and round to mul_mat_q tile sizes
-    if (split) {
-        const int64_t rounding = get_row_rounding(src0->type, tensor_split);
-
-        if (i != 0) {
-            *row_low = ne01 * tensor_split[i];
-            if (*row_low < ne01) {
-                *row_low -= *row_low % rounding;
-            }
-        }
-        if (i != ggml_sycl_info().device_count - 1) {
-            *row_high = ne01 * tensor_split[i + 1];
-            if (*row_high < ne01) {
-                *row_high -= *row_high % rounding;
-            }
-        }
-    }
-}
-
 struct ggml_backend_sycl_split_buffer_context {
     ~ggml_backend_sycl_split_buffer_context() try {
         for (auto & [tensor, extra] : tensor_extras) {
@@ -40256,6 +40211,51 @@ static const char * ggml_backend_sycl_split_buffer_type_get_name(ggml_backend_bu
 
 static bool ggml_backend_buffer_is_sycl_split(ggml_backend_buffer_t buffer) {
     return buffer->buft->iface.get_name == ggml_backend_sycl_split_buffer_type_get_name;
+}
+
+// Whether `src0` lives in a row-split buffer and, if so, its tensor split. The op and the graph-entry walks of the
+// planned scratch buffers both need it, so the derivation exists once.
+static bool ggml_sycl_mul_mat_tensor_split(const ggml_tensor *                        src0,
+                                           std::array<float, GGML_SYCL_MAX_DEVICES> & tensor_split) {
+    if (!src0->buffer || !ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+        return false;
+    }
+    const ggml_backend_sycl_split_buffer_type_context * buft_ctx =
+        (const ggml_backend_sycl_split_buffer_type_context *) src0->buffer->buft->context;
+    tensor_split = buft_ctx->tensor_split;
+    return true;
+}
+
+// The rows [row_low, row_high) of `src0` that device `i` computes: every row for a weight that is not row-split,
+// otherwise the slice the tensor split assigns it, rounded to the mul_mat_q tile size. The op and the graph-entry
+// walks share this one derivation, so a walk primes exactly the devices the op will run on.
+static void ggml_sycl_mul_mat_device_rows(const ggml_tensor *                              src0,
+                                          bool                                             split,
+                                          const std::array<float, GGML_SYCL_MAX_DEVICES> & tensor_split,
+                                          int                                              i,
+                                          int64_t *                                        row_low,
+                                          int64_t *                                        row_high) {
+    const int64_t ne01 = src0->ne[1];
+    // by default, use all rows
+    *row_low           = 0;
+    *row_high          = ne01;
+    // for multi GPU, get the row boundaries from tensor split and round to mul_mat_q tile sizes
+    if (split) {
+        const int64_t rounding = get_row_rounding(src0->type, tensor_split);
+
+        if (i != 0) {
+            *row_low = ne01 * tensor_split[i];
+            if (*row_low < ne01) {
+                *row_low -= *row_low % rounding;
+            }
+        }
+        if (i != ggml_sycl_info().device_count - 1) {
+            *row_high = ne01 * tensor_split[i + 1];
+            if (*row_high < ne01) {
+                *row_high -= *row_high % rounding;
+            }
+        }
+    }
 }
 
 static ggml_backend_buffer_t ggml_backend_sycl_split_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
@@ -99016,7 +99016,7 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
     bool                               saw_dense_node = false;
     const ggml_sycl_select_quiet_scope quiet_router;
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        const ggml_tensor * node = cgraph->nodes[i];
+        ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT) {
             continue;
         }
