@@ -4490,7 +4490,7 @@ class unified_cache {
     int32_t *                    onednn_graph_scratch_flag_slab_ = nullptr;
     std::vector<uint32_t>        onednn_graph_scratch_flag_slot_free_list_;
     uint32_t                     onednn_graph_scratch_flag_generation_counter_     = 0;
-    bool                         onednn_graph_scratch_flag_slab_alloc_warned_      = false;
+    bool                         onednn_graph_scratch_flag_slab_warned_            = false;
     bool                         onednn_graph_scratch_flag_slots_exhausted_warned_ = false;
     // llama.cpp-c6ah: see the public accessor's own comment above.
     // Incremented only in onednn_graph_scratch_clear_pool_locked(), the one
