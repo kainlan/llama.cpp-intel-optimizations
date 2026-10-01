@@ -804,6 +804,54 @@ int main() {
               "a hold that wraps must not read as no hold");
     }
 
+    // ---- Case 15: review r1 of llama.cpp-kpjw: the held-back branch, the route a decline serves, merged inputs --
+    {
+        const size_t MiB  = 1024 * 1024;
+        const size_t hold = 10027264;
+
+        // The branch unified_alloc takes. Only a spill-capable request for the RUNTIME zone can be held back.
+        CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, 300 * 1024, hold, 300 * 1024),
+              "the incident: a compute buffer asking a 0.3 MB-free zone is held back and spills");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 100 * MiB, hold, 64 * MiB),
+              "a request that leaves the hold free is served from the zone");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, true, 300 * 1024, hold, 300 * 1024),
+              "a forbid-spill request is a claimant of the plan and is never held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(false, false, 300 * 1024, hold, 300 * 1024),
+              "the hold is a RUNTIME-zone fact: no other zone's request is held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 300 * 1024, 0, 300 * 1024),
+              "with no hold nothing is held back");
+        CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, SIZE_MAX, SIZE_MAX, 1),
+              "a hold that wraps must not read as no hold");
+        // Argument order is part of the contract: (runtime, forbid, available, hold, size). The zone's free bytes
+        // are the first of the three sizes; swapped with the request, the same numbers answer another question.
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 10, 50) &&
+                  ggml_sycl::zone_runtime_alloc_held_back(true, false, 50, 10, 100),
+              "available is the zone's free bytes and size is the request, not the other way round");
+
+        // The route a node takes: the walks and the dispatch must agree, including after a runtime decline.
+        // (valid, unified, primary draws, fallback valid, fallback draws)
+        CHECK(ggml_sycl::zone_route_draws_scratch(true, false, true, false, false),
+              "a legacy kernel that draws the scratch is counted");
+        CHECK(!ggml_sycl::zone_route_draws_scratch(true, false, false, true, true),
+              "a legacy kernel that does not draw it is not counted, whatever the fallback would be");
+        CHECK(!ggml_sycl::zone_route_draws_scratch(true, true, false, false, false),
+              "a unified kernel the dispatch does not decline draws nothing");
+        CHECK(ggml_sycl::zone_route_draws_scratch(true, true, false, true, true),
+              "a node the unified kernel declines and a drawing legacy kernel then serves is counted: the f16 gap");
+        CHECK(!ggml_sycl::zone_route_draws_scratch(true, true, true, false, true),
+              "a decline with no valid legacy fallback draws nothing");
+        CHECK(!ggml_sycl::zone_route_draws_scratch(false, false, true, true, true), "an invalid decision draws nothing");
+
+        // Plan inputs are device-global. A second model on the device must not shrink the first one's plan.
+        CHECK(ggml_sycl::zone_dense_scratch_merge_input(19584, 4096, true) == 19584,
+              "another live model's larger plan input survives the load of a smaller one (draft + target)");
+        CHECK(ggml_sycl::zone_dense_scratch_merge_input(4096, 19584, true) == 19584,
+              "the larger of two live models wins either way");
+        CHECK(ggml_sycl::zone_dense_scratch_merge_input(19584, 4096, false) == 4096,
+              "with no other live model the new inputs replace the old: a model swap shrinks the plan");
+        CHECK(ggml_sycl::zone_dense_scratch_merge_input(0, 0, true) == 0, "nothing planned stays nothing");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
