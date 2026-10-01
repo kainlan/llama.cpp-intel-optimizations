@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14ai, by impl-moua-s, 2026-09-30. The revisions answer forty-one reviews:
+Design, revision 7.14aj, by impl-moua-s, 2026-09-30. The revisions answer forty-one reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -239,8 +239,12 @@ Design, revision 7.14ai, by impl-moua-s, 2026-09-30. The revisions answer forty-
 - design review r40 (design-moua-r40 on `79fa71b00..1c9edf1cb`: 0 Critical, 1 Important, 5 Minor, 3
   nits), recorded in §6.51. Revision 7.14ai is one commit on top of `1c9edf1cb`: H7ai's callee list
   derives exactly the five L0 holders, §M98's discriminator is adopted verbatim, the H9 reactivation
-  arm parks after the holder's change and expects a named non-BUG refusal, the capped cell has a
-  placed seam and is a G1 cell, and G2's predicate is `admits()` (rulings §M93, §M95).
+  arm parks after the holder's change and expects a named non-BUG refusal (withdrawn in 7.14aj,
+  §6.52), the capped cell has a placed seam and is a G1 cell, and G2's predicate is `admits()`
+  (rulings §M93, §M95).
+- rulings §M101, recorded in §6.52. Revision 7.14aj is one commit on top of `691200e39`: an L0
+  holder whose module guard finds the module non-ACTIVE is `[CONTEXT-PLAN-BUG]` whatever the state
+  at its acquire, and the named non-BUG refusal and the state-at-acquire split are deleted.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -2050,15 +2054,12 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     admission or cache entry. **Caveat:** on a non-ACTIVE module `reg` clears that flag before
     `commit_reactivate` runs, by design for `RTLD_NODELETE` reload (`gs:110392-110393`). So no
     publishing entry can overlap any of the five; zhcn's rev 5.42 applies the same classification,
-    and its gate 22b expiry condition keys on the same holders. **The module guard under L0 tells
-    two cases apart (rulings §M99 M-1), by the admission state the token's acquire read.** Every
-    transition out of ACTIVE is an L0 holder's, so a module cannot leave ACTIVE while another entry
-    holds L0 across the change. An entry that **acquires L0 on a module that is already non-ACTIVE**
-    (a holder's change finished first, for example after `can_unload` or `prepare_reactivate`) is
-    reachable, and is refused by a named non-BUG line, `[SYCL-PLAN] module not ACTIVE: <entry>
-    refused`, returned as the entry's refusal with no retry. An entry that read ACTIVE at its
-    acquire and finds the module non-ACTIVE at its guard while it holds L0 is impossible by
-    construction: `[CONTEXT-PLAN-BUG]`, with no retry and no `BUSY` (below).
+    and its gate 22b expiry condition keys on the same holders. **The module guard under L0 (rulings
+    §M101).** An L0 holder whose module guard finds the module non-ACTIVE is a caller lifecycle
+    violation: `[CONTEXT-PLAN-BUG]`, with no retry and no `BUSY` (below), whatever the admission
+    state was when its token was acquired. Every transition out of ACTIVE is an L0 holder's, so a
+    holder finds the module non-ACTIVE only if a caller ran the entry outside the module's
+    lifecycle; zhcn's design states the same rule (`zhcn-design.md:2170`, gate 22b).
     **`ggml_backend_sycl_can_unload` holds L0, taken by a TRY-lock
     (zhcn 5.5 row 32, r6 m-6; rulings §M11 I-F).** It is what closes module admission: it moves
     `ACTIVE` to `RETRY_CLOSED`, reserves the Registry's shutdown, and waits up to 5 s for the
@@ -4823,11 +4824,10 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     (`:18817-18818`), the FA recheck's module guard (`:19036-19039`), unload's (`:12285`),
     activate's module guard (`:15230`) and live-update ticket (`:15238` onward), and the module
     guards of `stage_inventory_plan` (`:16779`) and `load_end` (`:13100`). A module guard that fails
-    under L0 is one of two cases (§2.4.2): the module was already non-ACTIVE at the token's acquire,
-    a named non-BUG refusal, or it was ACTIVE at the acquire and non-ACTIVE at the guard, which no
-    other L0 holder can cause (shutdown, `commit_reactivate`, `rollback_reactivate` and
-    `complete_unload` hold L0) and which is `[CONTEXT-PLAN-BUG]`. A ticket or a transaction `busy`
-    can fire only if a mutator skipped L0.
+    under L0 is `[CONTEXT-PLAN-BUG]` (§2.4.2, rulings §M101): shutdown, `commit_reactivate`,
+    `rollback_reactivate` and `complete_unload` hold L0, so another L0 holder finds the module
+    non-ACTIVE only if a caller used it outside its lifecycle. A ticket or a transaction `busy` can
+    fire only if a mutator skipped L0.
 
   `load_begin`'s `LOAD_BUSY` is not in this list. It refuses a concurrent load, or a load into a
   closed module (`:12729-12732`), by name, as on master, and this design keeps it (above).
@@ -9360,34 +9360,45 @@ means that.
     second arm, with L0 free, takes the `try_lock` and closes admission as before.
   - **Reactivation and complete unload hold L0 (rulings §M76.5; the lead's relay).** In a
     `GGML_SYCL_PRIVATE_TESTING` build, on a model-less module, for `commit_reactivate`,
-    `rollback_reactivate` and `complete_unload`. **Module state and order (rulings §M99 M-1):**
-    `can_unload` moves `ACTIVE` to `RETRY_CLOSED` (or `complete_unload` to `COMPLETE_CLOSED`) and
-    `prepare_reactivate` runs, which needs one of those two states (`gs:109659-109662`); for the
-    rollback case a completed `commit_reactivate` runs first. Only then does the holder park inside
-    a real entry, after taking L0 and before its module guard. It cannot park earlier: `can_unload`
-    takes L0 by try-lock and would return at once, so the module would never leave `ACTIVE`, and
-    `commit_reactivate` would block on the holder. A `try_lock` of L0 from the calling thread fails
-    at that moment (positive control). The holder's entry acquired L0 on a non-ACTIVE module, so
-    after the release it is refused by the named non-BUG line of §2.4.2, `[SYCL-PLAN] module not
-    ACTIVE: <entry> refused`; the arm expects that line, expects no `[CONTEXT-PLAN-BUG]`, and does
-    not score the entry's result otherwise. **Observable:**
+    `rollback_reactivate` and `complete_unload`. **Module state and order (rulings §M99 M-1, kept by
+    §M101):** `can_unload` moves `ACTIVE` to `RETRY_CLOSED` (or `complete_unload` to
+    `COMPLETE_CLOSED`) and `prepare_reactivate` runs, which needs one of those two states
+    (`gs:109659-109662`); for the rollback case a completed `commit_reactivate` runs first. Only
+    then does the holder park inside a real entry, after taking L0 and before its module guard. It
+    cannot park earlier: `can_unload` takes L0 by try-lock and would return at once, so the module
+    would never leave `ACTIVE`, and `commit_reactivate` would block on the holder. A `try_lock` of
+    L0 from the calling thread fails at that moment (positive control). **Observable:**
     `ggml_backend_sycl_test_admission_snapshot` (`gs:110009-110022`) slots [0] (admission), [6]
     (shutdown_reserved) and [7] (shutdown_completed). **Handshake, with no timing:** a
     `GGML_SYCL_PRIVATE_TESTING` counter of threads blocked in the token's acquire, and one condition
     variable. The arm waits on "counter == 1 OR the call returned" and releases the holder only on
     `counter == 1`; "returned" is the RED's reading, never the 5 s watchdog, which only guards a
     hang. While the holder is parked, `commit_reactivate` runs on another thread and the arm asserts
-    that it has not returned and that slot [0] still reads `PREPARING`; after the release it returns
-    and slot [0] reads `COMMITTED_CLOSED`. `rollback_reactivate`, after the completed commit, has
-    not returned while the holder is parked; after the release slot [0] reads the previous state
-    (the source order is restore, `gs:109702`, then teardown, `gs:109709-109710`), with slots [6]
-    and [7] as `complete_shutdown()` leaves them. `complete_unload` has not returned while parked,
-    and slots [0] and [7] show `COMPLETE_CLOSED` and 1 only after the release. `prepare_reactivate`
-    and `finalize_reactivate` return at once against the parked holder, since they take no L0.
-    **RED, scored on "the call returned while the holder was parked":** the token deleted from any
-    of the three; the call returns with the holder still parked and the counter stays 0. No publish
-    interleave is scored: a non-ACTIVE module refuses every publishing entry at its module guard, so
-    the blocking is the observable.
+    that it has not returned and that slot [0] still reads `PREPARING`; `rollback_reactivate`, after
+    the completed commit, has not returned and slot [0] still reads `COMMITTED_CLOSED`;
+    `complete_unload` has not returned and slots [0] and [7] do not yet show `COMPLETE_CLOSED` and
+    1. `prepare_reactivate` and `finalize_reactivate` return at once against the parked holder,
+    since they take no L0. The arm writes each reading to stderr as a marker line before it releases
+    the holder. **Expected outcome after the release (rulings §M101):** the holder's module guard
+    finds the module non-ACTIVE, because no holder's change completed while it was parked, and
+    reports exactly one `[CONTEXT-PLAN-BUG]` line naming the entry: a caller lifecycle violation
+    (§2.4.2), whatever the admission state was at the token's acquire. The guard runs under the
+    holder's token, so the blocked call has not returned when the line appears; the line is the
+    evidence that the holder ran after the transition. **Strict, from the guard's source:** the line
+    is strict-gated. The guard's `[CONTEXT-PLAN-BUG]` reads `ggml_sycl_strict_enabled()` (declared
+    `unified-cache.hpp:7259`, defined `unified-cache.cpp:13009-13011` over the once-read
+    `GGML_SYCL_STRICT_LEASES`, `:13001-13007`), which `unified-cache.hpp:7256-7258` names as the one
+    switch that turns a `[CONTEXT-PLAN-BUG]` into an abort; master's module guards return `BUSY`
+    with no log, so this guard is moua's own code, and it reads that switch like every other L0
+    guard return (§2.4.2). The arm therefore runs each of the three cases in a child
+    process under `GGML_SYCL_STRICT_LEASES=1` (the §G1 subprocess pattern) and scores three things:
+    the child's abort exit (SIGABRT, status 134); exactly one `[CONTEXT-PLAN-BUG]` line naming the
+    entry; and the pre-release marker lines above, with no 'returned' marker, since the abort fires
+    under the holder's token and the call never returns. The post-release slot readings are
+    therefore not scored by this arm. **RED, scored on "the call returned while the holder was
+    parked":** the token deleted from any of the three; the call returns with the holder still
+    parked and the counter stays 0. No publish interleave is scored beyond the one guard line: the
+    blocking is the observable.
   - **Load B while A's context holds its rows (llama.cpp-r7fz; rulings §M7 I-4, §M32 I-1,
     §M38 I-2).** Model A's context holds claimed-then-vacated ring rows on device 0; model B
     loads on device 0. After B's load, A's rows (handles, sizes, depth) and A's model's weight
@@ -9536,8 +9547,8 @@ means that.
     across the whole run, and A's next claims are in plan.
   - **Shutdown takes L0 (rulings §M76.5).** Shutdown waits for a parked L0 holder, then runs. A
     publishing entry that finds the module non-ACTIVE while it holds L0 (forced by a hook that
-    closes the module without shutdown's token, after the entry read ACTIVE at its acquire) reports
-    `[CONTEXT-PLAN-BUG]`, returns no `BUSY`, and does not retry.
+    closes the module without shutdown's token) reports `[CONTEXT-PLAN-BUG]`, returns no `BUSY`, and
+    does not retry.
 
   **No other context's ring (rulings §M32 I-1; replaces r4 I6, r5 I-A, r6 I-5's arms).** 7.14e
   carried four skip-L0 routes to an absent device ring (RELEASING observed at step 2, a
@@ -12403,10 +12414,10 @@ design-moua-r7 found 0 Critical, 7 Important and 11 Minor. The lead ruled in rul
   rulings §FM forbids; on arena devices it now reads the registry (§2.4.2 "The probe and the
   FA recheck").
 - The wrapper's module-admission `BUSY` (`:18848-18849`) is reachable only when the module is not
-  ACTIVE (reactivation or shutdown). Under L0 it is a named non-BUG refusal when the module was
-  already non-ACTIVE at the token's acquire, and `[CONTEXT-PLAN-BUG]` when it left ACTIVE under the
-  held token (§2.4.2). Revision 7.6 left a shutdown race open here; rulings §M76.5 closes it in 7.7:
-  shutdown, `commit_reactivate`, `rollback_reactivate` and `complete_unload` take L0 (§2.4.2).
+  ACTIVE (reactivation or shutdown). Under L0 it is `[CONTEXT-PLAN-BUG]`, with the wrapper's other
+  returns (§2.4.2, rulings §M101). Revision 7.6 left a shutdown race open here; rulings §M76.5
+  closes it in 7.7: shutdown, `commit_reactivate`, `rollback_reactivate` and `complete_unload` take
+  L0 (§2.4.2).
 - The load's L0 span is a choice (per entry, not load_begin..load_end). The alternative covers
   the whole load and needs a callback clause in the deadlock rule.
 - The MMID host pool is held by the model's MMID entry, not a context's reservation, because
@@ -14504,7 +14515,7 @@ and rulings §M98 and §M99. The 23mk cites stay at `87da879f1`; the 23mk re-pin
 | item | finding / ruling | disposition |
 |---|---|---|
 | I-1 | the H7ai derivation did not equal the five holders: `shutdown` calls none of the four names, and three of four exclusions were not in the derived set | **Changed.** The callee list is `reactivate` (the call expression `Registry::reactivate`), `complete_shutdown`, `reserve_shutdown`, `cancel_shutdown`, `shutdown_unified_cache`, `prepare_unified_cache_for_module_use` and `rollback_unified_cache_module_use`; "calls" is a direct call in the body; "exported" is `ggml-sycl.h` plus the proc-address table (`gs:110115-110140`). Derived at `d8a67422d`: `can_unload`, `cancel_unload`, `complete_unload`, `commit_reactivate`, `rollback_reactivate`, `shutdown`, `reg`; minus `cancel_unload` and `reg` it is the five. `prepare` and `finalize` call none and are classified by inspection. §M98's discriminator replaces the "tears down or reactivates" wording, verbatim, with the exclusions' wording (`cancel_unload` reopens only if no shutdown began and clears only the reservation; `reg` clears only the cache flag, outside any protocol step). |
-| M-1 | the H9 reactivation arm's park placement, post-release outcome and wait | **Changed.** The holder takes L0 after `can_unload` (or `complete_unload`) and `prepare_reactivate`, and for rollback after the completed commit. A holder that acquires L0 on an already non-ACTIVE module is refused by the named non-BUG line `[SYCL-PLAN] module not ACTIVE: <entry> refused`, which the arm expects; `[CONTEXT-PLAN-BUG]` is only for an entry that read ACTIVE at its acquire and finds the module non-ACTIVE at its guard. The guard text (§2.4.2, the `BUSY` list note, the wrapper note and the "Shutdown takes L0" arm) now tells the two apart. The wait is "counter == 1 OR the call returned", never the watchdog. |
+| M-1 | the H9 reactivation arm's park placement, post-release outcome and wait | **Changed; the non-BUG refusal and the state-at-acquire split are withdrawn by §6.52 (rulings §M101).** The holder takes L0 after `can_unload` (or `complete_unload`) and `prepare_reactivate`, and for rollback after the completed commit. A holder that acquires L0 on an already non-ACTIVE module is refused by the named non-BUG line `[SYCL-PLAN] module not ACTIVE: <entry> refused`, which the arm expects; `[CONTEXT-PLAN-BUG]` is only for an entry that read ACTIVE at its acquire and finds the module non-ACTIVE at its guard. The guard text (§2.4.2, the `BUSY` list note, the wrapper note and the "Shutdown takes L0" arm) now tells the two apart. The wait is "counter == 1 OR the call returned", never the watchdog. |
 | M-2 | the new test-only sites were not in §3.4's census | **Changed.** Rows for the blocked-in-acquire counter, the park point, and the `available_budget` override. |
 | M-3 | the capped cell's seam and "pure-host" | **Changed.** The seam is `unified_cache_test_set_available_budget_override(size_t bytes)` (`unified-cache.cpp`, declared in `unified-cache.hpp`), a `GGML_SYCL_PRIVATE_TESTING` override of the `available_budget()` read in `ensure_planned_arena_zones` (`uc:4495-4496`). G_raw and P_raw come from the with-floor getter (`uc:2155-2169`) with the allocator on and Qwen's shape published; the cell needs `GGML_SYCL_DNNL` (exit 77 without). It is a G1 cell, lead-run, not pure-host, and is in G1's list and §3.3. |
 | M-4 | §6.50 claimed an edit to the §6.49 reactivation row that was not made | **Changed.** The §6.49 row is marked superseded by §2.4.2 and §6.51. |
@@ -14512,3 +14523,15 @@ and rulings §M98 and §M99. The 23mk cites stay at `87da879f1`; the 23mk re-pin
 | N-1 | the `onednn_graph_scratch` row cited the with-floor getter at `:2148-2160` | **Changed.** `:2160-2167`. |
 | N-2 | a ragged line at the `-c 4096 -ub 512` shape sentence | **Changed.** Reflowed. |
 | N-3 | the §6.49 I-1 row's formula read `charged_ONEDNN` as the cap base, unmarked | **Changed.** "(base `stored` from 7.14ah, §6.50 M-4)". |
+
+### 6.52 Revision 7.14aj: rulings §M101
+
+Revision 7.14aj is one commit on top of `691200e39`, by impl-moua-s. It applies rulings §M101, which
+withdraws §M99 M-1's named non-BUG refusal.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| §M101 (1) | 7.14ai made the module guard under L0 two outcomes, split by the admission state the token's acquire read, so the same situation was a BUG in zhcn and a non-BUG refusal in moua; the "ACTIVE at acquire, non-ACTIVE at guard" half is unreachable | **Changed.** One rule, zhcn's: an L0 holder whose module guard finds the module non-ACTIVE is `[CONTEXT-PLAN-BUG]`, with no retry and no `BUSY`, whatever the state at the acquire. The `[SYCL-PLAN] module not ACTIVE: <entry> refused` line and the state-at-acquire split are deleted from §2.4.2, the `BUSY`-list note, the wrapper note and the "Shutdown takes L0" arm. |
+| §M101 (2) | the H9 reactivation arm's released-holder outcome | **Changed.** The ordering (L0 after `can_unload`/`complete_unload` and `prepare_reactivate`, for rollback after the completed commit) and the "counter == 1 OR the call returned" wait are kept. The expected outcome is exactly one `[CONTEXT-PLAN-BUG]` line. The guard is strict-gated (`ggml_sycl_strict_enabled()`, `unified-cache.hpp:7259`, `unified-cache.cpp:13009-13011`), so each case runs in a child process under `GGML_SYCL_STRICT_LEASES=1` and scores the abort exit, the one line, and the pre-release markers. |
+| §M101 (3) | the line's position relative to the call | **Question.** §M101 says the line is "emitted after the protected call returned". The guard runs under the holder's token, so it is emitted while the blocked entry has not returned, and under strict the call never returns. The arm states that order, and the post-release slot readings are not scored (the abort precedes them). The line still proves the holder ran after the transition. |
+| §6.51 M-1 | the row recorded the named non-BUG refusal | **Marked superseded** by this section. |
