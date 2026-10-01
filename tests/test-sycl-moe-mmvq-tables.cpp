@@ -334,6 +334,41 @@ int main() {
         ++failures;
     }
 
+    // 9. A prompt-phase layout over a MIXED tensor is executable (llama.cpp-f6zo).
+    //    GPT-OSS at PCT=60 keeps blk.12 as 12 device experts (xmx_tiled) and 20 host
+    //    experts (host AOS, executed on the CPU). The prompt probe found local=12 host=20
+    //    missing=0 for xmx_tiled and still aborted, because admission demanded
+    //    local == n_experts && host == 0 -- "all experts on the device" -- and so asked for
+    //    a SOA copy the planner never builds. Placement decides the executor: device entries
+    //    at their loaded layout plus host entries on the CPU cover every expert.
+    //    Host-only (local == 0) stays with the SOA/host path; a missing or secondary expert,
+    //    or a cover that does not add up to the tensor, is not executable.
+    const struct {
+        size_t       local, secondary, host, missing, n_experts;
+        bool         want;
+        const char * name;
+    } prompt_cover_cases[] = {
+        { 12, 0, 20, 0, 32, true,  "mixed tensor, 12 device + 20 host (f6zo)"                 },
+        { 1,  0, 31, 0, 32, true,  "mixed tensor, one device expert"                          },
+        { 31, 0, 1,  0, 32, true,  "mixed tensor, one host expert"                            },
+        { 32, 0, 0,  0, 32, true,  "all device (the case the strict check always accepted)"   },
+        { 0,  0, 32, 0, 32, false, "all host is not a device-layout cover"                    },
+        { 0,  0, 0,  1, 32, false, "SOA asked of xmx_tiled entries: local=0 host=0 missing=1" },
+        { 12, 0, 19, 1, 32, false, "one expert missing"                                       },
+        { 12, 0, 20, 1, 32, false, "an expert counted missing on top of a full cover"         },
+        { 12, 1, 20, 0, 32, false, "a secondary expert counted on top of a full cover"        },
+        { 12, 0, 18, 0, 32, false, "cover does not add up to the tensor"                      },
+        { 11, 1, 20, 0, 32, false, "a secondary-device expert (PP is unvalidated there)"      },
+        { 12, 0, 20, 0, 0,  false, "empty tensor"                                             },
+    };
+
+    for (const auto & c : prompt_cover_cases) {
+        if (moe_mmvq_prompt_layout_cover_executable(c.local, c.secondary, c.host, c.missing, c.n_experts) != c.want) {
+            std::printf("FAIL: prompt layout cover policy wrong for: %s (want %d)\n", c.name, c.want ? 1 : 0);
+            ++failures;
+        }
+    }
+
     if (failures != 0) {
         std::printf("test-sycl-moe-mmvq-tables: FAILED (%d)\n", failures);
         return 1;

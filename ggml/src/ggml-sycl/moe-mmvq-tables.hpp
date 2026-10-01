@@ -125,6 +125,25 @@ inline bool moe_mmvq_mxfp4_direct_reads_layout(enum ggml_layout_mode layout) {
     return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED;
 }
 
+// Whether a prompt-phase MoE layout is executable over a tensor whose probe at that layout found
+// `local` device entries, `secondary` entries on another device, `host` host-planned entries and
+// `missing` unresolved ones, out of n_experts.
+//
+// Placement decides the executor: a device entry runs on the device at the layout it is loaded in,
+// a host entry runs on the CPU. So every expert is covered when nothing is missing, nothing sits on
+// a secondary device (the secondary prompt executor is unvalidated), and device + host add up to the
+// whole tensor. Requiring host == 0 -- "all experts on the device" -- turned a mixed tensor (a few
+// experts in VRAM, the rest on the host) into an abort that asked for a SOA copy the single-layout
+// planner never builds (llama.cpp-f6zo). local > 0 keeps an all-host tensor on the host path, where
+// it needs no device layout at all.
+inline bool moe_mmvq_prompt_layout_cover_executable(size_t local,
+                                                    size_t secondary,
+                                                    size_t host,
+                                                    size_t missing,
+                                                    size_t n_experts) {
+    return missing == 0 && secondary == 0 && local > 0 && local + host == n_experts;
+}
+
 inline bool moe_mmvq_any_dispatch_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     return moe_mmvq_batched_dispatch_supports_layout(type, layout) ||
            moe_mmvq_pair_glu_dispatch_supports_layout(type, layout);

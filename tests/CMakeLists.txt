@@ -717,6 +717,15 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-xmx-tiled-partial-cover-source.py --self-test)
     set_tests_properties(test-sycl-xmx-tiled-partial-cover-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+    # A prompt-phase MoE layout over a MIXED tensor (a few experts in VRAM, the
+    # rest host-planned) is admitted by the loaded layout plus the host entries
+    # the CPU runs, at every prompt admission site (llama.cpp-f6zo: the
+    # [GRAPH-MOE-LAYOUT] "incomplete executable layout" abort at PCT<100).
+    # WITH --self-test so each pin is proven load-bearing.
+    add_test(NAME test-sycl-moe-prompt-hybrid-layout-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-prompt-hybrid-layout-source.py --self-test)
+    set_tests_properties(test-sycl-moe-prompt-hybrid-layout-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
     # A MoE host-expert dispatch must bridge a storage-handle miss, not kill the
     # graph (llama.cpp-srti). Also runs WITH --self-test: the per-site checks are
     # anchored on refusal-message text, so a renamed site would silently stop

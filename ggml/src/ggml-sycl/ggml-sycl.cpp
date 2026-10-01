@@ -29414,6 +29414,22 @@ static bool ggml_sycl_moe_planned_layout_complete(const ggml_tensor * src0, int 
     return probe.ok && probe.local == static_cast<size_t>(n_experts) && probe.secondary == 0 && probe.host == 0;
 }
 
+// Prompt admission asks a different question from the fused executors above. Those need one device
+// pointer table, so they keep the strict "every expert is local" test. A prompt over a MIXED tensor
+// (a few experts in VRAM at `layout`, the rest host-planned and run by the CPU) is executable as it
+// stands: the hybrid executor partitions every occurrence by operand residency and dispatches each
+// device operand by the layout it is actually loaded in. Asking for all-local instead sent a mixed
+// tensor to a SOA probe that the single-layout planner can never satisfy (llama.cpp-f6zo).
+static bool ggml_sycl_moe_prompt_layout_executable(const ggml_tensor * src0, int device, layout_mode layout) {
+    if (!src0) {
+        return false;
+    }
+    const int64_t                  n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+    const moe_planned_layout_probe probe     = ggml_sycl_probe_moe_planned_layout(src0, device, layout);
+    return moe_mmvq_prompt_layout_cover_executable(probe.local, probe.secondary, probe.host, probe.missing,
+                                                   static_cast<size_t>(n_experts));
+}
+
 static bool ggml_sycl_moe_prompt_specialized_layouts_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_PP_SPECIALIZED_LAYOUTS");
@@ -29562,7 +29578,7 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
                 }
             }
         } else if (!prompt_mxfp4_moe || cached_layout == GGML_LAYOUT_AOS ||
-                   ggml_sycl_moe_planned_layout_complete(src0, device, cached_layout)) {
+                   ggml_sycl_moe_prompt_layout_executable(src0, device, cached_layout)) {
             return cached_layout;
         }
         // weight_ext is confirmed non-null by the guard entering this block.
@@ -29629,7 +29645,7 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
                            (planned_layout != GGML_LAYOUT_XMX_TILED ||
                             (ggml_sycl_xmx_moe_allow_unsafe_pp() && ggml_sycl_moe_down_xmx_tiled_enabled())) &&
                            ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, planned_layout) &&
-                           ggml_sycl_moe_planned_layout_complete(src0, device, planned_layout)) {
+                           ggml_sycl_moe_prompt_layout_executable(src0, device, planned_layout)) {
                     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                         fprintf(stderr,
                                 "[GRAPH-MOE-LAYOUT] tensor=%s device=%d plan=1 selected=%s host_weights=%d "
@@ -29653,16 +29669,19 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
                 const moe_planned_layout_probe gateup_xmx_probe =
                     ggml_sycl_probe_moe_planned_layout(src0, device, GGML_LAYOUT_XMX_TILED);
                 const int64_t n_experts_gateup = src0->ne[2] > 0 ? src0->ne[2] : 1;
-                if (gateup_xmx_probe.ok &&
-                    gateup_xmx_probe.local == static_cast<size_t>(std::max<int64_t>(0, n_experts_gateup)) &&
-                    gateup_xmx_probe.secondary == 0 && gateup_xmx_probe.host == 0) {
+                if (moe_mmvq_prompt_layout_cover_executable(
+                        gateup_xmx_probe.local, gateup_xmx_probe.secondary, gateup_xmx_probe.host,
+                        gateup_xmx_probe.missing, static_cast<size_t>(std::max<int64_t>(0, n_experts_gateup)))) {
                     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                         fprintf(stderr,
                                 "[GRAPH-MOE-LAYOUT] tensor=%s device=%d plan=1 selected=%s host_weights=%d "
-                                "local=%zu secondary=%zu host=%zu missing=%zu reason=prompt-gateup-xmx-tiled-complete\n",
-                                src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(GGML_LAYOUT_XMX_TILED),
-                                host_weights ? 1 : 0, gateup_xmx_probe.local, gateup_xmx_probe.secondary,
-                                gateup_xmx_probe.host, gateup_xmx_probe.missing);
+                                "local=%zu secondary=%zu host=%zu missing=%zu reason=%s\n",
+                                src0->name ? src0->name : "?", device,
+                                ggml_sycl_layout_mode_name(GGML_LAYOUT_XMX_TILED), host_weights ? 1 : 0,
+                                gateup_xmx_probe.local, gateup_xmx_probe.secondary, gateup_xmx_probe.host,
+                                gateup_xmx_probe.missing,
+                                gateup_xmx_probe.host == 0 ? "prompt-gateup-xmx-tiled-complete" :
+                                                             "prompt-gateup-xmx-tiled-hybrid-cover");
                     }
                     return remember_layout(GGML_LAYOUT_XMX_TILED);
                 }
@@ -30033,8 +30052,9 @@ static layout_mode ggml_sycl_moe_layout_for_selected_rows(const ggml_tensor * sr
             (moe_kind == MOE_TENSOR_GATE || moe_kind == MOE_TENSOR_UP)) {
             const moe_planned_layout_probe xmx_probe = ggml_sycl_probe_moe_planned_layout(src0, device, layout);
             const int64_t                  n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
-            if (xmx_probe.ok && xmx_probe.local == static_cast<size_t>(std::max<int64_t>(0, n_experts)) &&
-                xmx_probe.secondary == 0 && xmx_probe.host == 0) {
+            if (moe_mmvq_prompt_layout_cover_executable(xmx_probe.local, xmx_probe.secondary, xmx_probe.host,
+                                                        xmx_probe.missing,
+                                                        static_cast<size_t>(std::max<int64_t>(0, n_experts)))) {
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> prompt_xmx_keep_log{ 0 };
                     if (prompt_xmx_keep_log.fetch_add(1, std::memory_order_relaxed) < 96) {
