@@ -5335,6 +5335,19 @@ set_tests_properties(zone-sizing PROPERTIES
     TIMEOUT 60
 )
 
+# Test: element width of the recording-time copy kernel (llama.cpp-qhfp).
+# Host-only, same arrangement as test-zone-sizing above: graph-safe-memcpy-width.hpp is pure C++ with no SYCL
+# header, so no -fsycl, no device and no libggml-sycl link.
+add_executable(test-graph-safe-memcpy-width
+    tests/test-graph-safe-memcpy-width.cpp
+)
+target_include_directories(test-graph-safe-memcpy-width PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME graph-safe-memcpy-width COMMAND test-graph-safe-memcpy-width)
+set_tests_properties(graph-safe-memcpy-width PROPERTIES
+    LABELS "sycl;graph;host;tdd"
+    TIMEOUT 60
+)
+
 # Test: GGML_SYCL_HOST_RESERVE_MB parse robustness (llama.cpp-16el).
 # Host-only, same arrangement as test-zone-sizing above and for the same
 # reason: host-reserve-env.cpp includes no SYCL header, so the parser is

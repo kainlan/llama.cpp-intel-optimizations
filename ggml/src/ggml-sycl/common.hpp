@@ -15,6 +15,7 @@
 
 #include "alloc-registry.hpp"
 #include "dpct/helper.hpp"
+#include "graph-safe-memcpy-width.hpp"
 #include "ggml-sycl.h"
 #include "kv-offload.hpp"
 #include "layer-streaming.hpp"
@@ -381,30 +382,36 @@ inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, cons
             profile_label.device     = ggml_sycl_get_device_id_from_queue(q);
         }
 
-        const size_t n_i32 = nbytes / sizeof(int32_t);
-        auto *       d     = static_cast<int32_t *>(dst);
-        const auto * s     = static_cast<const int32_t *>(src);
-        if (n_i32 > 0) {
-            sycl::event body_event = q.parallel_for(sycl::range<1>(n_i32), [=](sycl::id<1> i) { d[i] = s[i]; });
-            if (profile_enabled) {
-                profile_label.bytes = n_i32 * sizeof(int32_t);
-                ggml_sycl_kernel_profile_record_event(profile_label, body_event);
-            }
+        // One kernel at the widest element every operand allows. dst and src come from callers that place copies at
+        // arbitrary byte offsets (dim==3 CONCAT puts the second copy at dst + src0 bytes), so alignment is a property
+        // of the operands, not of nbytes, and an int32 body with a byte tail would misalign the body.
+        const size_t width = ggml_sycl_graph_safe_memcpy_width(dst, src, nbytes);
+        sycl::event  copy_event;
+        if (width == 4) {
+            auto *       d = static_cast<int32_t *>(dst);
+            const auto * s = static_cast<const int32_t *>(src);
+            copy_event     = q.parallel_for(sycl::range<1>(nbytes / 4), [=](sycl::id<1> i) { d[i] = s[i]; });
+        } else if (width == 2) {
+            auto *       d = static_cast<int16_t *>(dst);
+            const auto * s = static_cast<const int16_t *>(src);
+            copy_event     = q.parallel_for(sycl::range<1>(nbytes / 2), [=](sycl::id<1> i) { d[i] = s[i]; });
+        } else {
+            auto *       d = static_cast<char *>(dst);
+            const auto * s = static_cast<const char *>(src);
+            copy_event     = q.parallel_for(sycl::range<1>(nbytes), [=](sycl::id<1> i) { d[i] = s[i]; });
         }
-        const size_t tail = nbytes % sizeof(int32_t);
-        if (tail > 0) {
-            auto *       dc         = static_cast<char *>(dst) + n_i32 * sizeof(int32_t);
-            const auto * sc         = static_cast<const char *>(src) + n_i32 * sizeof(int32_t);
-            sycl::event  tail_event = q.parallel_for(sycl::range<1>(tail), [=](sycl::id<1> i) { dc[i] = sc[i]; });
-            if (profile_enabled) {
-                profile_label.bytes = tail;
-                ggml_sycl_kernel_profile_record_event(profile_label, tail_event);
-            }
+        if (profile_enabled) {
+            profile_label.bytes = nbytes;
+            ggml_sycl_kernel_profile_record_event(profile_label, copy_event);
         }
         return sycl::event{};
     }
 #endif
 
+    // Outside recording this goes through mem_copy_async. For same-device USM operands that is a plain queue
+    // memcpy with no host wait, which is what op code relies on (CONCAT dim==3 drops its wait on that basis).
+    // It is NOT wait-free in general: a non-USM host operand or a cross-device copy stages through a path that
+    // does wait_and_throw, so a caller that may see such operands must not read "no host wait" off this helper.
     const int             queue_device = ggml_sycl_get_device_id_from_queue(q);
     // This raw-pointer API's nbytes contract is the authority for this one
     // operation; generic mem_handle consumers still reject unknown extents.

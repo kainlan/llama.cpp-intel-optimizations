@@ -178,6 +178,9 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor ds
 
             // No host wait: the compute stream is in-order, so whatever consumes dst is ordered after
             // both copies. A wait here is what kept CONCAT out of recorded graphs (llama.cpp-qhfp).
+            // The assert keeps that order a checked fact rather than an assumption, the way the planned-scratch
+            // path does it: check_queue_order (ggml-sycl.cpp, the block-exec dense path) aborts unless copies and
+            // kernels share one in-order queue, and that precedent is why a slice may be reused with no wait.
             GGML_ASSERT(stream->has_property<sycl::property::queue::in_order>());
             SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_graph_safe_memcpy(*stream, dst_d, src0_d, size0)));
             SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_graph_safe_memcpy(*stream, dst_d + size0 / type_size, src1_d, size1)));
