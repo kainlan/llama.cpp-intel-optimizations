@@ -1,5 +1,6 @@
 #include "../kv-runtime-demotion.hpp"
 #include "../tlsf-allocator.hpp"
+#include "kv-region-test-model.hpp"
 
 #include <cstdio>
 #include <unordered_map>
@@ -134,6 +135,909 @@ static size_t test_row_size(int32_t type, int64_t n_elements) {
         default:
             return 0;
     }
+}
+
+// ---------------------------------------------------------------------------
+// kv_region_fit cases (llama.cpp-moua H2, H3, H6).  Every case runs the fit on a
+// geometry copied out of the real allocator and replays its carve on that
+// allocator, so fit == carve is checked against tlsf_allocator, not a model of it.
+// ---------------------------------------------------------------------------
+namespace krt = kv_region_test;
+using ggml_sycl::kv_head_slot_request;
+using ggml_sycl::kv_layer_alloc_bytes;
+using ggml_sycl::kv_layer_slot_request;
+using ggml_sycl::kv_region_fit;
+using ggml_sycl::kv_region_fit_result;
+using ggml_sycl::kv_region_request;
+using krt::KiB;
+using krt::MiB;
+
+static kv_region_request layers_request(const std::vector<uint32_t> & full,
+                                        size_t                        full_bytes,
+                                        const std::vector<uint32_t> & swa       = {},
+                                        size_t                        swa_bytes = 0) {
+    kv_region_request r;
+    for (uint32_t l : full) {
+        kv_layer_slot_request s;
+        s.layer    = l;
+        s.group    = ggml_sycl::KV_SLOT_FULL;
+        s.kv_bytes = full_bytes;
+        r.layers.push_back(s);
+    }
+    for (uint32_t l : swa) {
+        kv_layer_slot_request s;
+        s.layer    = l;
+        s.group    = ggml_sycl::KV_SLOT_SWA;
+        s.kv_bytes = swa_bytes;
+        r.layers.push_back(s);
+    }
+    return r;
+}
+
+static kv_head_slot_request head_slot(const char * cohort,
+                                      uint32_t     index,
+                                      size_t       size,
+                                      bool         names_weight = false,
+                                      uint64_t     owner        = 1) {
+    kv_head_slot_request h;
+    h.cohort       = cohort;
+    h.index        = index;
+    h.size         = size;
+    h.owner        = owner;
+    h.names_weight = names_weight;
+    return h;
+}
+
+static std::vector<uint32_t> iota_layers(uint32_t from, uint32_t to) {
+    std::vector<uint32_t> v;
+    for (uint32_t l = from; l < to; ++l) {
+        v.push_back(l);
+    }
+    return v;
+}
+
+static size_t device_layers(const kv_region_fit_result & f) {
+    size_t n = 0;
+    for (const auto & l : f.layers) {
+        n += l.device ? 1 : 0;
+    }
+    return n;
+}
+
+// The smallest k with gap + the top k ladder entries >= need.
+static size_t min_prefix(const std::vector<size_t> & ladder, size_t gap, size_t need) {
+    size_t acc = gap;
+    for (size_t k = 0; k <= ladder.size(); ++k) {
+        if (acc >= need) {
+            return k;
+        }
+        if (k < ladder.size()) {
+            acc += ladder[k];
+        }
+    }
+    return SIZE_MAX;
+}
+
+// H2's A2 zone: a 64 MiB context block at the top, a gap of 84.1 MiB under it,
+// seven yieldable optional tenants (2870 MiB) below the gap, weights below
+// those.  After the full yield the zone has 2954.1 MiB for KV and head slots.
+struct a2_zone {
+    krt::device_model   dev;
+    std::vector<size_t> ladder;    // highest first
+    size_t              gap  = 84 * MiB + 100 * KiB;
+    size_t              room = 0;  // gap + every tenant
+};
+
+static a2_zone make_a2_zone() {
+    a2_zone      a;
+    const size_t tenants[7] = { 370 * MiB, 500 * MiB, 400 * MiB, 600 * MiB, 300 * MiB, 200 * MiB, 500 * MiB };
+    size_t       total      = 0;
+    for (size_t t : tenants) {
+        total += t;
+    }
+    const size_t size = 1024 * MiB + total + a.gap + 64 * MiB;
+    a.dev.tlsfs.emplace_back(size);
+    krt::zone_model & z = a.dev.tlsfs[0];
+    z.context(64 * MiB);
+    z.weight(1024 * MiB);
+    for (int i = 6; i >= 0; --i) {
+        z.optional_tenant(tenants[i]);
+    }
+    for (size_t t : tenants) {
+        a.ladder.push_back(t);
+    }
+    a.room = a.gap + total;
+    return a;
+}
+
+// H2 A2: device = 23 - ceil(max(0, H - 10.1 MiB) / 128 MiB), host = 32 - device,
+// and a yield prefix equal to the minimal strict prefix covering
+// 128 MiB * device + H - gap.
+static int case_h2_a2() {
+    const size_t slack   = 10 * MiB + 100 * KiB;  // 10.1 MiB
+    const size_t hs[3]   = { 0, 10 * MiB, 11 * MiB };
+    const size_t want[3] = { 23, 23, 22 };
+    for (int c = 0; c < 3; ++c) {
+        a2_zone a = make_a2_zone();
+        CHECK_EQ(a.room, 23 * 128 * MiB + slack, "h2: A2's room is 23 slots and 10.1 MiB");
+        kv_region_request r = layers_request(iota_layers(0, 32), 128 * MiB);
+        if (hs[c] != 0) {
+            r.head_slots.push_back(head_slot("ring", 0, hs[c]));
+        }
+        const kv_region_fit_result f = kv_region_fit(a.dev.snapshot(), r);
+        CHECK(f.fits, "h2: A2 fits");
+        CHECK_EQ(device_layers(f), want[c], "h2: A2 device layers");
+        CHECK_EQ(f.layers.size() - device_layers(f), 32 - want[c], "h2: A2 host layers");
+        for (size_t l = 0; l < f.layers.size(); ++l) {
+            CHECK(f.layers[l].device == (l < want[c]), "h2: the highest-indexed layers are the ones demoted");
+        }
+        const size_t need = 128 * MiB * want[c] + hs[c];
+        CHECK_EQ(f.yield_prefix[0], min_prefix(a.ladder, a.gap, need),
+                 "h2: the yield prefix is the minimal strict prefix");
+        CHECK(a.dev.replay(f), "h2: A2's carve lands at the fit's offsets");
+        for (size_t l = want[c]; l < 32; ++l) {
+            // With the head slot removed one more layer would have stayed (H = 11 MiB),
+            // and none would at H = 0 and 10 MiB: layer 22 is the head slot's, the rest are capacity.
+            const uint8_t cause = (c == 2 && l == 22) ? ggml_sycl::KV_DEMOTE_HEAD_SLOT : ggml_sycl::KV_DEMOTE_CAPACITY;
+            CHECK_EQ(f.layers[l].cause, cause, "h2: the demotion cause");
+        }
+    }
+    return 0;
+}
+
+// The RED: the same zone with its top optional copy leased.  The ladder ends at a
+// block that cannot be released, so nothing yields and every layer demotes.
+static int case_h2_a2_red() {
+    krt::device_model dev;
+    dev.tlsfs.emplace_back(1024 * MiB + 2870 * MiB + 84 * MiB + 64 * MiB);
+    krt::zone_model & z = dev.tlsfs[0];
+    z.context(64 * MiB);
+    z.weight(1024 * MiB);
+    const size_t tenants[7] = { 370 * MiB, 500 * MiB, 400 * MiB, 600 * MiB, 300 * MiB, 200 * MiB, 500 * MiB };
+    for (int i = 6; i >= 0; --i) {
+        z.optional_tenant(tenants[i], /*leased=*/i == 0);
+    }
+    const kv_region_fit_result f = kv_region_fit(dev.snapshot(), layers_request(iota_layers(0, 32), 128 * MiB));
+    CHECK(f.fits, "h2 red: the fit itself succeeds");
+    CHECK_EQ(device_layers(f), 0, "h2 red: expected 0 device layers behind a leased top copy (23 when it yields)");
+    CHECK_EQ(f.yield_prefix[0], 0, "h2 red: nothing yields");
+    return 0;
+}
+
+// P4: seeded random zones and requests.  For every request the fit's plan must
+// carve at the fit's offsets on the real allocator, and the demotion must be
+// minimal: asking again with one more layer cannot place everything.
+struct lcg {
+    uint64_t s;
+
+    explicit lcg(uint64_t x) : s(x * 2862933555777941757ull + 3037000493ull) {}
+
+    uint32_t next(uint32_t n) {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return (uint32_t) ((s >> 33) % n);
+    }
+};
+
+static int case_h2_property() {
+    size_t placed  = 0;
+    size_t refused = 0;
+    size_t yielded = 0;
+    size_t demoted = 0;
+    for (uint64_t seed = 1; seed <= 400; ++seed) {
+        lcg               rng(seed);
+        krt::device_model dev;
+        const uint32_t    n_tlsf = 1 + rng.next(3);
+        for (uint32_t t = 0; t < n_tlsf; ++t) {
+            struct item {
+                bool   optional;
+                bool   leased;
+                size_t size;
+            };
+
+            std::vector<size_t> ctx;
+            for (uint32_t i = rng.next(3); i > 0; --i) {
+                ctx.push_back((4 + rng.next(60)) * MiB);
+            }
+            std::vector<item> items;
+            for (uint32_t i = 1 + rng.next(4); i > 0; --i) {
+                items.push_back({ false, false, (20 + rng.next(180)) * MiB });
+            }
+            for (uint32_t i = rng.next(5); i > 0; --i) {
+                items.push_back({ true, rng.next(4) == 0, (20 + rng.next(280)) * MiB });
+            }
+            for (size_t i = items.size(); i > 1; --i) {
+                std::swap(items[i - 1], items[rng.next((uint32_t) i)]);
+            }
+            const size_t gap   = rng.next(400) * MiB + 256 * rng.next(64);
+            size_t       total = gap;
+            for (size_t c : ctx) {
+                total += c;
+            }
+            for (const item & it : items) {
+                total += it.size;
+            }
+            dev.tlsfs.emplace_back(total + 4 * MiB);
+            krt::zone_model & z  = dev.tlsfs.back();
+            z.takes_kv           = t == 0 || rng.next(2);
+            z.takes_weight_named = t + 1 == n_tlsf || rng.next(2);
+            for (size_t c : ctx) {
+                z.context(c);
+            }
+            std::vector<std::pair<size_t, bool>> carved;  // offset, freeable
+            for (const item & it : items) {
+                const size_t off = it.optional ? z.optional_tenant(it.size, it.leased) : z.weight(it.size);
+                carved.push_back({ off, !it.leased });
+            }
+            for (auto & c : carved) {
+                if (c.second && rng.next(10) < 3) {
+                    z.free(c.first);
+                }
+            }
+        }
+        kv_region_request r;
+        const uint32_t    n_layers = 2 + rng.next(13);
+        for (uint32_t l = 0; l < n_layers; ++l) {
+            kv_layer_slot_request s;
+            s.layer         = l;
+            s.group         = (l % 2 == 0) ? ggml_sycl::KV_SLOT_FULL : ggml_sycl::KV_SLOT_SWA;
+            s.kv_bytes      = (s.group == ggml_sycl::KV_SLOT_FULL ? 8 + rng.next(120) : 1 + rng.next(8)) * MiB;
+            s.sidecar_bytes = rng.next(10) < 3 ? MiB : 0;
+            r.layers.push_back(s);
+        }
+        for (uint32_t h = rng.next(4); h > 0; --h) {
+            r.head_slots.push_back(
+                head_slot("head", (uint32_t) r.head_slots.size(), (1 + rng.next(40)) * MiB, rng.next(3) == 0));
+        }
+        const ggml_sycl::shared_zone_geometry geo = dev.snapshot();
+        const kv_region_fit_result            f   = kv_region_fit(geo, r);
+        if (!f.fits) {
+            CHECK(!f.refused_heads.empty(), "property: a refusal names its head slots");
+            ++refused;
+            continue;
+        }
+        ++placed;
+        if (!dev.replay(f)) {
+            std::fprintf(stderr, "property: seed %llu\n", (unsigned long long) seed);
+            CHECK(false, "property: the carve lands at the fit's offsets");
+        }
+        // Slots lie inside their extents and no two placements overlap.
+        std::vector<std::pair<size_t, size_t>> ranges;  // tlsf-tagged absolute [lo, hi)
+        for (const auto & e : f.extents) {
+            ranges.push_back({ e.tlsf * (1ull << 40) + e.offset, e.tlsf * (1ull << 40) + e.offset + e.size });
+        }
+        for (const auto & h : f.heads) {
+            if (!h.reused) {
+                ranges.push_back({ h.tlsf * (1ull << 40) + h.offset, h.tlsf * (1ull << 40) + h.offset + h.size });
+            }
+        }
+        std::sort(ranges.begin(), ranges.end());
+        for (size_t i = 1; i < ranges.size(); ++i) {
+            CHECK(ranges[i - 1].second <= ranges[i].first, "property: placements are disjoint");
+        }
+        for (const auto & l : f.layers) {
+            if (l.device) {
+                CHECK(l.slot_offset + l.size <= f.extents[l.extent].size,
+                      "property: a slot is never split across extents");
+            }
+        }
+        // The demotion order: per group a suffix by layer, and SWA only after every full layer.
+        bool any_full_device = false;
+        bool swa_host        = false;
+        for (const auto & l : f.layers) {
+            const bool full = (l.layer % 2) == 0;
+            if (full && l.device) {
+                any_full_device = true;
+            }
+            if (!full && !l.device) {
+                swa_host = true;
+            }
+        }
+        CHECK(!(any_full_device && swa_host), "property: an SWA layer demotes only after every full layer");
+        for (int parity = 0; parity < 2; ++parity) {
+            bool seen_host = false;
+            for (const auto & l : f.layers) {
+                if ((int) (l.layer % 2) != parity) {
+                    continue;
+                }
+                CHECK(!(seen_host && l.device), "property: a group's host layers are its highest indices");
+                seen_host = seen_host || !l.device;
+            }
+        }
+        // Minimality: restore the last layer the loop demoted and the fit cannot
+        // place everything.  Demotion order is full attention highest first, then SWA.
+        int64_t last = -1;
+        for (int group = 0; group < 2; ++group) {
+            for (size_t i = f.layers.size(); i-- > 0;) {
+                if (((f.layers[i].layer % 2) == (group == 0 ? 0u : 1u)) && !f.layers[i].device) {
+                    last = (int64_t) f.layers[i].layer;
+                }
+            }
+        }
+        if (last >= 0) {
+            ++demoted;
+            kv_region_request r2 = r;
+            r2.layers.clear();
+            for (const auto & l : r.layers) {
+                bool keep = (int64_t) l.layer == last;
+                for (const auto & p : f.layers) {
+                    keep = keep || (p.layer == l.layer && p.device);
+                }
+                if (keep) {
+                    r2.layers.push_back(l);
+                }
+            }
+            const kv_region_fit_result f2 = kv_region_fit(geo, r2);
+            CHECK(f2.fits && device_layers(f2) < r2.layers.size(),
+                  "property: with the last demoted layer restored the fit cannot place everything");
+        }
+        yielded += f.yield_prefix[0] + f.buried_released.size();
+    }
+    CHECK(placed > 100 && refused > 0 && yielded > 50 && demoted > 50,
+          "property: the generator exercises every outcome");
+    return 0;
+}
+
+// A zone of one gap: a context block at the top, weights at the bottom, `gap`
+// between them.
+static krt::device_model gap_zone(size_t gap) {
+    krt::device_model dev;
+    dev.tlsfs.emplace_back(MiB + 16 * MiB + gap);
+    dev.tlsfs[0].context(MiB);
+    dev.tlsfs[0].weight(16 * MiB);
+    return dev;
+}
+
+// Commit under churn (r2 N-I7; r4 I8).  The plan's yield is done and its ranges
+// are recorded; the re-fit may place only inside them.
+static int case_h2_churn() {
+    kv_region_request r = layers_request(iota_layers(0, 32), 128 * MiB);
+    r.head_slots.push_back(head_slot("ring", 0, 10 * MiB));
+    // Churn outside the ranges: a weight at the bottom and another transaction's range.
+    {
+        a2_zone                    a    = make_a2_zone();
+        const kv_region_fit_result plan = kv_region_fit(a.dev.snapshot(), r);
+        CHECK(plan.fits && device_layers(plan) == 23, "churn: the plan");
+        krt::zone_model & z = a.dev.tlsfs[0];
+        z.yield(plan.yield_prefix[0]);
+        size_t lowest = SIZE_MAX;
+        for (const auto & op : plan.carve_order) {
+            if (op.carve) {
+                z.own(op.offset, op.size);
+                lowest = std::min(lowest, op.offset);
+            }
+        }
+        // The minimal prefix leaves 100 KiB of slack under the ranges: a weight and
+        // another transaction's pending range live there.
+        const size_t slack_lo = z.anchor() - z.allocator().gap_below(z.anchor());
+        CHECK_EQ(lowest - slack_lo, 100 * KiB, "churn: 100 KiB of slack under the planned ranges");
+        CHECK(z.weight(64 * KiB) == slack_lo, "churn: the weight lands in the slack");
+        z.pend(slack_lo + 64 * KiB, 32 * KiB);
+        kv_region_request re         = r;
+        re.commit_refit              = true;
+        const kv_region_fit_result f = kv_region_fit(a.dev.snapshot(), re);
+        CHECK(f.fits && device_layers(f) == 23, "churn: outside the ranges nothing changes");
+        CHECK_EQ(f.yield_prefix[0], 0, "churn: a re-fit yields nothing");
+        for (const auto & op : plan.carve_order) {
+            bool found = false;
+            for (const auto & o2 : f.carve_order) {
+                found = found || (o2.offset == op.offset && o2.size == op.size && o2.kind == op.kind);
+            }
+            CHECK(found, "churn: the commit carves exactly the planned offsets");
+        }
+        CHECK(a.dev.replay(f), "churn: the carve succeeds beside another transaction's range");
+    }
+    // A weight that landed in the planned room: the intersection shrinks, the
+    // re-fit demotes inside the ranges and ends.
+    {
+        a2_zone                    a    = make_a2_zone();
+        const kv_region_fit_result plan = kv_region_fit(a.dev.snapshot(), r);
+        krt::zone_model &          z    = a.dev.tlsfs[0];
+        z.yield(plan.yield_prefix[0]);
+        size_t lowest = SIZE_MAX;
+        for (const auto & op : plan.carve_order) {
+            if (op.carve) {
+                z.own(op.offset, op.size);
+                lowest = std::min(lowest, op.offset);
+            }
+        }
+        // A weight that took everything below the lowest range and 130 MiB of it.
+        const size_t gap_lo = z.anchor() - z.allocator().gap_below(z.anchor());
+        CHECK(z.weight(lowest - gap_lo + 130 * MiB) != SIZE_MAX, "churn: the weight lands in the planned room");
+        kv_region_request re         = r;
+        re.commit_refit              = true;
+        const kv_region_fit_result f = kv_region_fit(a.dev.snapshot(), re);
+        CHECK(f.fits, "churn: the re-fit fits");
+        CHECK_EQ(device_layers(f), 21, "churn: 130 MiB lost from the bottom of the planned room costs two slots");
+        CHECK(a.dev.replay(f), "churn: and what is left carves at the fit's offsets");
+    }
+    return 0;
+}
+
+// The ring rows are a head slot (r3 I5): KV plus the rows does not fit, KV minus
+// one layer plus the rows does, so the fit demotes one layer and places the rows;
+// and rows that do not fit with every KV layer on the host refuse, naming them.
+static int case_h2_ring_head_slot() {
+    krt::device_model dev = gap_zone(900 * MiB);
+    kv_region_request r   = layers_request(iota_layers(0, 8), 100 * MiB);
+    r.head_slots.push_back(head_slot("ring", 0, 150 * MiB));
+    kv_region_fit_result f = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits, "ring: fits after one demotion");
+    CHECK_EQ(device_layers(f), 7, "ring: one layer demoted for the rows");
+    CHECK(!f.layers[7].device, "ring: the highest layer is the one");
+    CHECK_EQ(f.layers[7].cause, ggml_sycl::KV_DEMOTE_HEAD_SLOT, "ring: the rows are the cause");
+    CHECK(f.heads[0].size == 150 * MiB, "ring: the rows are placed");
+    CHECK(dev.replay(f), "ring: the carve lands at the fit's offsets");
+
+    krt::device_model small = gap_zone(100 * MiB);
+    f                       = kv_region_fit(small.snapshot(), r);
+    CHECK(!f.fits, "ring: rows that do not fit with every KV layer on the host refuse");
+    CHECK(f.refused_heads == std::vector<size_t>({ 0 }), "ring: the refusal names the rows");
+    CHECK_EQ(f.tlsf_free[0], 100 * MiB, "ring: and the TLSF's free space");
+    return 0;
+}
+
+// Head slots are mandatory and only tiers 1-3 serve them; the byte budget is not
+// an input at all.
+static int case_h2_head_slot_rules() {
+    // A head slot that would fit only by yielding an optional copy is refused,
+    // while KV of the same size yields.
+    krt::device_model dev;
+    dev.tlsfs.emplace_back(MiB + 16 * MiB + 100 * MiB + 10 * MiB);
+    krt::zone_model & z = dev.tlsfs[0];
+    z.context(MiB);
+    z.weight(16 * MiB);
+    z.optional_tenant(100 * MiB);
+    kv_region_request r;
+    r.head_slots.push_back(head_slot("moe_control", 0, 50 * MiB));
+    kv_region_fit_result f = kv_region_fit(dev.snapshot(), r);
+    CHECK(!f.fits && f.refused_heads == std::vector<size_t>({ 0 }), "head: no yield is made for a head slot");
+    r = layers_request({ 0 }, 50 * MiB);
+    f = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits && device_layers(f) == 1 && f.yield_prefix[0] == 1, "head: KV of the same size yields the copy");
+    CHECK(dev.replay(f), "head: and carves where the fit said");
+
+    // A head slot that fits the geometry is placed whatever any budget says: KV
+    // demotes only by what the geometry needs.
+    krt::device_model two = gap_zone(250 * MiB);
+    r                     = layers_request(iota_layers(0, 4), 50 * MiB);
+    r.head_slots.push_back(head_slot("ring", 0, 100 * MiB));
+    f = kv_region_fit(two.snapshot(), r);
+    CHECK(f.fits && device_layers(f) == 3, "head: the geometry alone decides");
+    return 0;
+}
+
+// The ring-held yield (§2.7): the rows the context already holds are reused in
+// place and counted once.  The jehw-merge order held the rows while the yield
+// modelled the KV zone and then admitted them again: it places fewer layers.
+static int case_h2_ring_held_yield() {
+    auto zone = [](uint64_t owner) {
+        krt::device_model dev;
+        dev.tlsfs.emplace_back(500 * MiB + 16 * MiB + 600 * MiB + 800 * MiB);
+        krt::zone_model & z    = dev.tlsfs[0];
+        const size_t      rows = z.context(500 * MiB);
+        z.weight(16 * MiB);
+        z.optional_tenant(400 * MiB);
+        z.optional_tenant(400 * MiB);
+        z.reserve(ggml_sycl::demand_scope::CONTEXT, owner, "ring", 0, rows, 500 * MiB);
+        return dev;
+    };
+    kv_region_request r = layers_request(iota_layers(0, 8), 200 * MiB);
+    r.head_slots.push_back(head_slot("ring", 0, 500 * MiB, false, /*owner=*/1));
+    krt::device_model          held = zone(1);
+    const kv_region_fit_result f    = kv_region_fit(held.snapshot(), r);
+    CHECK(f.fits && f.heads[0].reused && f.heads[0].reservation == 0, "ring held: the rows are reused in place");
+    CHECK_EQ(device_layers(f), 7, "ring held: 1400 MiB of room holds seven 200 MiB layers with the rows counted once");
+    for (const auto & op : f.carve_order) {
+        CHECK(op.kind != ggml_sycl::KV_CARVE_HEAD, "ring held: nothing is carved for the rows");
+    }
+    CHECK(held.replay(f), "ring held: the carve lands at the fit's offsets");
+    // Another owner's rows are not ours: the same zone with the rows re-admitted.
+    krt::device_model          other = zone(2);
+    const kv_region_fit_result g     = kv_region_fit(other.snapshot(), r);
+    CHECK(g.fits && !g.heads[0].reused, "ring held: another context's rows are not reused");
+    CHECK_EQ(device_layers(g), 4, "ring held: re-admitting the rows (900 MiB left) places fewer layers");
+    return 0;
+}
+
+// The rows are per context, in REGION (rulings §M32 I-1, I-2).
+static int case_h2_rows_per_context() {
+    krt::device_model dev = gap_zone(2000 * MiB);
+    kv_region_request a   = layers_request(iota_layers(0, 4), 100 * MiB);
+    a.head_slots.push_back(head_slot("ring", 0, 100 * MiB, false, 1));  // -ub 512
+    kv_region_request b = layers_request(iota_layers(0, 4), 100 * MiB);
+    b.head_slots.push_back(head_slot("ring", 0, 200 * MiB, false, 2));  // -ub 1024
+    const kv_region_fit_result fa = kv_region_fit(dev.snapshot(), a);
+    CHECK(fa.fits && dev.replay(fa), "rows: the first context places its rows");
+    dev.tlsfs[0].reserve(ggml_sycl::demand_scope::CONTEXT, 1, "ring", 0, fa.heads[0].offset, fa.heads[0].size);
+    const kv_region_fit_result fb = kv_region_fit(dev.snapshot(), b);
+    CHECK(fb.fits && !fb.heads[0].reused, "rows: the second context's rows are its own");
+    CHECK(dev.replay(fb), "rows: and carve at the fit's offsets");
+    CHECK(fb.heads[0].offset + fb.heads[0].size <= fa.heads[0].offset ||
+              fa.heads[0].offset + fa.heads[0].size <= fb.heads[0].offset,
+          "rows: the two contexts' rows are disjoint");
+    CHECK_EQ(fa.heads[0].size, 100 * MiB, "rows: at its own n_ubatch");
+    CHECK_EQ(fb.heads[0].size, 200 * MiB, "rows: at its own n_ubatch");
+    // Closing the -ub 1024 context releases its rows and leaves the other's.
+    dev.tlsfs[0].free(fb.heads[0].offset);
+    CHECK(dev.tlsfs[0].allocator().tag_at(fa.heads[0].offset) == ggml_sycl::SHARED_ZONE_TAG_CONTEXT,
+          "rows: closing one context leaves the other's rows allocated");
+    CHECK(dev.tlsfs[0].invariants(), "rows: the allocator stays consistent");
+    // The context's rows grow: the smaller slot is superseded and the publish releases it.
+    kv_region_request grown       = a;
+    grown.head_slots[0].size      = 300 * MiB;
+    const kv_region_fit_result fg = kv_region_fit(dev.snapshot(), grown);
+    CHECK(fg.fits && !fg.heads[0].reused, "rows: a larger claim is carved new");
+    CHECK(fg.superseded.size() == 1 && fg.superseded[0].reservation == 0, "rows: the smaller slot is superseded");
+    return 0;
+}
+
+// Demotion order and free_after_full_kv (§2.4.1; rulings §M32 I-2, §M60).  A
+// GPT-OSS-shaped fixture with the fixture's own room and heads: 12 full layers of
+// 128 MiB and 12 SWA layers of 2.5 MiB, both ring rows (540 MiB), a compute head
+// slot and the small ones, room set so free_after_full_kv is -700.0 MiB.
+static int case_h2_demotion_order() {
+    const size_t          full_bytes = 128 * MiB;
+    const size_t          swa_bytes  = 5 * MiB / 2;
+    std::vector<uint32_t> full, swa;
+    for (uint32_t l = 0; l < 24; ++l) {
+        (l % 2 == 0 ? full : swa).push_back(l);
+    }
+    kv_region_request r = layers_request(full, full_bytes, swa, swa_bytes);
+    r.head_slots.push_back(head_slot("ring_act", 0, 180 * MiB));
+    r.head_slots.push_back(head_slot("ring_out", 0, 360 * MiB));
+    r.head_slots.push_back(head_slot("compute", 0, 400 * MiB));
+    r.head_slots.push_back(head_slot("moe_control", 0, 33024));
+    r.head_slots.push_back(head_slot("onednn_pp_a", 0, 8388608));
+    r.head_slots.push_back(head_slot("jzvq", 0, 223560));
+    size_t heads = 0;
+    for (const auto & h : r.head_slots) {
+        heads += kv_layer_alloc_bytes(h.size);
+    }
+    CHECK_EQ(12 * full_bytes + 12 * swa_bytes, 1566 * MiB, "demotion: 1536 MiB of full KV and 30 MiB of SWA");
+
+    krt::device_model    dev = gap_zone(heads + 866 * MiB);
+    kv_region_fit_result f   = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits, "demotion: fits");
+    CHECK_EQ(f.free_after_full_kv[0], -700ll * (long long) MiB, "demotion: free_after_full_kv reads -700.0 MiB");
+    size_t host_full = 0;
+    for (const auto & l : f.layers) {
+        if (l.layer % 2 == 1) {
+            CHECK(l.device, "demotion: no SWA layer is demoted");
+        } else if (!l.device) {
+            ++host_full;
+            CHECK(l.layer >= 12, "demotion: the highest-indexed full layers go");
+            CHECK_EQ(l.cause, ggml_sycl::KV_DEMOTE_HEAD_SLOT, "demotion: every cause is the head slots");
+        }
+    }
+    CHECK_EQ(host_full, 6, "demotion: 5 x 128 = 640 is short by 60, 6 x 128 = 768 covers it");
+    CHECK(f.sub_slot_holes.empty(), "demotion: no sub-slot hole, no WARN");
+    CHECK(dev.replay(f), "demotion: the carve lands at the fit's offsets");
+
+    // The same deficit with 166 MiB of the room in sub-slot weight holes demotes 7.
+    krt::device_model holes;
+    holes.tlsfs.emplace_back(MiB + (6 * 10 + 4 * 33 + 34) * MiB + heads + 700 * MiB);
+    krt::zone_model & z = holes.tlsfs[0];
+    z.context(MiB);
+    std::vector<size_t> hole_offsets;
+    z.weight(10 * MiB);
+    for (int i = 0; i < 5; ++i) {
+        hole_offsets.push_back(z.weight((i == 4 ? 34 : 33) * MiB));
+        z.weight(10 * MiB);
+    }
+    for (size_t o : hole_offsets) {
+        z.free(o);
+    }
+    f = kv_region_fit(holes.snapshot(), r);
+    CHECK(f.fits, "demotion holes: fits");
+    CHECK_EQ(f.free_after_full_kv[0], -700ll * (long long) MiB, "demotion holes: the room is the same -700.0 MiB");
+    size_t demoted = 0;
+    for (const auto & l : f.layers) {
+        demoted += l.device ? 0 : 1;
+    }
+    CHECK_EQ(demoted, 7, "demotion holes: the holes take no 128 MiB slot, so 7 demote");
+    CHECK_EQ(f.sub_slot_holes.size(), 5, "demotion holes: the sub-slot WARN names the five holes");
+    CHECK(holes.replay(f), "demotion holes: the carve lands at the fit's offsets");
+    return 0;
+}
+
+// Recurrent state (r4 I9): the RS slot is placed first, attention KV demotes
+// around it, and an RS slot that cannot fit with every KV layer on the host
+// refuses the transaction, naming it.
+static int case_h2_recurrent_state() {
+    kv_region_request r = layers_request(iota_layers(0, 8), 100 * MiB);
+    r.head_slots.push_back(head_slot("rs", 0, 300 * MiB));
+    krt::device_model          dev = gap_zone(1000 * MiB);
+    const kv_region_fit_result f   = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits && device_layers(f) == 7, "rs: KV demotes around the recurrent slot");
+    CHECK_EQ(f.layers[7].cause, ggml_sycl::KV_DEMOTE_HEAD_SLOT, "rs: the slot is the cause");
+    CHECK(dev.replay(f), "rs: the carve lands at the fit's offsets");
+    krt::device_model          tiny = gap_zone(200 * MiB);
+    const kv_region_fit_result g    = kv_region_fit(tiny.snapshot(), r);
+    CHECK(!g.fits && g.refused_heads == std::vector<size_t>({ 0 }), "rs: a slot that cannot fit refuses, naming it");
+    return 0;
+}
+
+static std::vector<uint32_t> host_layers(const kv_region_fit_result & f) {
+    std::vector<uint32_t> v;
+    for (const auto & l : f.layers) {
+        if (!l.device) {
+            v.push_back(l.layer);
+        }
+    }
+    return v;
+}
+
+// H3: the slot table, the demotion order, and packing that never splits a slot.
+static int case_h3_slot_table_and_order() {
+    // Interleaved full and SWA layers, SWA listed first: the table is full first, then SWA.
+    kv_region_request r = layers_request({ 0, 2, 4 }, 100 * MiB, { 1, 3, 5 }, 10 * MiB);
+    std::reverse(r.layers.begin(), r.layers.end());
+    krt::device_model     dev = gap_zone(1000 * MiB);
+    kv_region_fit_result  f   = kv_region_fit(dev.snapshot(), r);
+    std::vector<uint32_t> order;
+    for (const auto & l : f.layers) {
+        order.push_back(l.layer);
+    }
+    CHECK(order == std::vector<uint32_t>({ 0, 2, 4, 1, 3, 5 }),
+          "h3: the slot table groups full attention first, then SWA");
+    CHECK(dev.replay(f), "h3: the carve lands at the fit's offsets");
+    // 135 MiB: full layers 4 then 2 demote (latest first), no SWA layer.
+    krt::device_model a = gap_zone(135 * MiB);
+    f                   = kv_region_fit(a.snapshot(), r);
+    CHECK(host_layers(f) == std::vector<uint32_t>({ 2, 4 }), "h3: latest full layers first");
+    CHECK(a.replay(f), "h3: and the carve matches");
+    // 90 MiB: every full layer, SWA stays.
+    krt::device_model b = gap_zone(90 * MiB);
+    f                   = kv_region_fit(b.snapshot(), r);
+    CHECK(host_layers(f) == std::vector<uint32_t>({ 0, 2, 4 }), "h3: every full layer before any SWA");
+    // 25 MiB: the SWA layers demote, latest first, after every full layer.
+    krt::device_model c = gap_zone(25 * MiB);
+    f                   = kv_region_fit(c.snapshot(), r);
+    CHECK(host_layers(f) == std::vector<uint32_t>({ 0, 2, 4, 5 }), "h3: then the latest SWA layer");
+    CHECK(c.replay(f), "h3: and the carve matches");
+    return 0;
+}
+
+// Multi-extent packing: retained run first, the gap second, a weight hole last;
+// a slot is never split, and each tier is a separate extent.
+static int case_h3_multi_extent() {
+    krt::device_model dev;
+    dev.tlsfs.emplace_back(300 * MiB + 16 * MiB + 150 * MiB + 16 * MiB + 250 * MiB);
+    krt::zone_model & z        = dev.tlsfs[0];
+    const size_t      retained = z.context(300 * MiB);
+    z.weight(16 * MiB);
+    const size_t hole = z.weight(150 * MiB);
+    z.weight(16 * MiB);
+    z.free(hole);
+    z.retain(retained, 300 * MiB);
+    const kv_region_request    r = layers_request(iota_layers(0, 6), 100 * MiB);
+    const kv_region_fit_result f = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits && device_layers(f) == 6, "multi: all six slots are placed");
+    CHECK_EQ(f.extents.size(), 3, "multi: three extents");
+    size_t kinds[4] = { 0, 0, 0, 0 };
+    for (const auto & e : f.extents) {
+        ++kinds[e.kind];
+    }
+    CHECK(kinds[ggml_sycl::KV_EXTENT_RETAINED] == 1 && kinds[ggml_sycl::KV_EXTENT_FRONTIER] == 1 &&
+              kinds[ggml_sycl::KV_EXTENT_HOLE] == 1,
+          "multi: a retained run, the frontier and a hole");
+    for (size_t l = 0; l < 6; ++l) {
+        const auto & lp = f.layers[l];
+        const auto & e  = f.extents[lp.extent];
+        CHECK(lp.slot_offset + lp.size <= e.size, "multi: a slot is never split across extents");
+        const uint8_t want =
+            l < 3 ? ggml_sycl::KV_EXTENT_RETAINED : (l < 5 ? ggml_sycl::KV_EXTENT_FRONTIER : ggml_sycl::KV_EXTENT_HOLE);
+        CHECK_EQ(e.kind, want, "multi: retained, then the gap, then a hole");
+    }
+    CHECK(dev.replay(f), "multi: the carve lands at the fit's offsets");
+    return 0;
+}
+
+// The cost-ordered pack: nothing yields while the gap holds the slots; when one
+// must, the cheaper of the frontier prefix and a buried run goes, the frontier
+// first at a tie.
+static int case_h3_cost_order() {
+    // [buried B][weight][T1][gap 200 MiB]
+    auto zone = [](size_t b, size_t t1) {
+        krt::device_model dev;
+        dev.tlsfs.emplace_back(MiB + b + 16 * MiB + t1 + 200 * MiB);
+        krt::zone_model & z = dev.tlsfs[0];
+        z.context(MiB);
+        z.optional_tenant(b);
+        z.weight(16 * MiB);
+        z.optional_tenant(t1);
+        return dev;
+    };
+    krt::device_model    dev = zone(120 * MiB, 100 * MiB);
+    kv_region_fit_result f   = kv_region_fit(dev.snapshot(), layers_request(iota_layers(0, 2), 100 * MiB));
+    CHECK(f.fits && device_layers(f) == 2 && f.yield_prefix[0] == 0 && f.buried_released.empty(),
+          "cost: the gap alone holds two");
+    // Three slots: the third yields.  T1 (100) is cheaper than B (120).
+    f = kv_region_fit(dev.snapshot(), layers_request(iota_layers(0, 3), 100 * MiB));
+    CHECK(f.fits && device_layers(f) == 3 && f.yield_prefix[0] == 1 && f.buried_released.empty(),
+          "cost: the frontier prefix is cheaper");
+    CHECK(dev.replay(f), "cost: and carves where the fit said");
+    // B and T1 equal: the frontier first.
+    krt::device_model tie = zone(100 * MiB, 100 * MiB);
+    f                     = kv_region_fit(tie.snapshot(), layers_request(iota_layers(0, 3), 100 * MiB));
+    CHECK(f.yield_prefix[0] == 1 && f.buried_released.empty(), "cost: the frontier before a buried run at a tie");
+    // T1 dearer than B: the buried run goes.
+    krt::device_model buried = zone(100 * MiB, 150 * MiB);
+    f                        = kv_region_fit(buried.snapshot(), layers_request(iota_layers(0, 3), 100 * MiB));
+    CHECK(f.fits && device_layers(f) == 3 && f.yield_prefix[0] == 0 && f.buried_released.size() == 1,
+          "cost: the buried run is cheaper");
+    CHECK(buried.replay(f), "cost: the buried hole carves where the fit said");
+    bool hole = false;
+    for (const auto & e : f.extents) {
+        hole = hole || e.kind == ggml_sycl::KV_EXTENT_HOLE;
+    }
+    CHECK(hole, "cost: the buried slot sits in a hole extent");
+    return 0;
+}
+
+// The strict prefix and the two-way classification (r4 addendum D).
+static int case_h3_strict_prefix() {
+    // ladder: T1 yieldable, T2 leased, T3 yieldable; gap 50 MiB.
+    krt::device_model dev;
+    dev.tlsfs.emplace_back(MiB + 16 * MiB + 300 * MiB + 50 * MiB);
+    krt::zone_model & z = dev.tlsfs[0];
+    z.context(MiB);
+    z.weight(16 * MiB);
+    z.optional_tenant(100 * MiB);                   // T3
+    z.optional_tenant(100 * MiB, /*leased=*/true);  // T2
+    z.optional_tenant(100 * MiB);                   // T1
+    const kv_region_fit_result f = kv_region_fit(dev.snapshot(), layers_request(iota_layers(0, 3), 100 * MiB));
+    CHECK(f.fits && device_layers(f) == 1, "strict: the ladder ends at the leased copy; T3 is not skipped to");
+    CHECK_EQ(f.yield_prefix[0], 1, "strict: only T1 is released");
+    CHECK(dev.replay(f), "strict: and carves where the fit said");
+    return 0;
+}
+
+// Pending ranges are allocated; the model's first context counts its FIRST_CONTEXT ranges.
+static int case_h3_pending_ranges() {
+    auto zone = [](bool first_context) {
+        krt::device_model dev = gap_zone(300 * MiB);
+        krt::zone_model & z   = dev.tlsfs[0];
+        const size_t      top = z.anchor() - 75 * MiB;
+        z.pend(top - 150 * MiB, 150 * MiB, first_context);
+        return dev;
+    };
+    const kv_region_request r = layers_request(iota_layers(0, 3), 100 * MiB);
+    kv_region_fit_result    f = kv_region_fit(zone(false).snapshot(), r);
+    CHECK_EQ(device_layers(f), 0,
+             "pending: a pending range splits the gap into two 75 MiB pieces that take no 100 MiB slot");
+    kv_region_request first = r;
+    first.first_context     = true;
+    f                       = kv_region_fit(zone(true).snapshot(), first);
+    CHECK_EQ(device_layers(f), 3, "pending: the first context counts its FIRST_CONTEXT ranges as free");
+    f = kv_region_fit(zone(true).snapshot(), r);
+    CHECK_EQ(device_layers(f), 0, "pending: another context does not");
+    return 0;
+}
+
+// forced_host, self extents, sidecars, and the after-KV charge.
+static int case_h3_request_forms() {
+    // forced_host layers are never promoted.
+    krt::device_model dev  = gap_zone(1000 * MiB);
+    kv_region_request r    = layers_request(iota_layers(0, 4), 100 * MiB);
+    r.forced_host          = { 3 };
+    kv_region_fit_result f = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits && host_layers(f) == std::vector<uint32_t>({ 3 }), "forms: a forced-host layer stays on the host");
+    CHECK_EQ(f.layers[3].cause, ggml_sycl::KV_DEMOTE_FORCED_HOST, "forms: its cause is the inherited demotion");
+
+    // The packed-K sidecar is a slice of the layer's slot.
+    kv_region_request s       = layers_request(iota_layers(0, 2), 100 * MiB);
+    s.layers[0].sidecar_bytes = 10 * MiB + 1;
+    s.layers[1].sidecar_bytes = 10 * MiB + 1;
+    krt::device_model sd      = gap_zone(1000 * MiB);
+    f                         = kv_region_fit(sd.snapshot(), s);
+    const size_t slot         = 100 * MiB + kv_layer_alloc_bytes(10 * MiB + 1);
+    CHECK(f.fits && f.layers[0].size == slot && f.layers[1].slot_offset == slot,
+          "forms: the sidecar is part of the slot");
+    CHECK_EQ(f.layers[0].sidecar_offset, 100 * MiB, "forms: at the aligned end of the KV bytes");
+    CHECK(sd.replay(f), "forms: the carve is one extent of both slots");
+
+    // Self extents: layers 0 and 1 are already carved by this call.
+    krt::device_model         self = gap_zone(450 * MiB);  // 250 MiB remain under the self extent
+    const size_t              off  = self.tlsfs[0].context(200 * MiB);
+    kv_region_request         q    = layers_request(iota_layers(0, 4), 100 * MiB);
+    ggml_sycl::kv_self_extent ext;
+    ext.tlsf   = 0;
+    ext.offset = off;
+    ext.size   = 200 * MiB;
+    ext.slots  = {
+        { 0, 0,         100 * MiB },
+        { 1, 100 * MiB, 100 * MiB }
+    };
+    q.self_extents.push_back(ext);
+    f = kv_region_fit(self.snapshot(), q);
+    CHECK(f.fits && device_layers(f) == 4, "forms: the self layers are device, the others fit the remaining 250 MiB");
+    CHECK(f.layers[0].extent != SIZE_MAX && f.extents[f.layers[0].extent].kind == ggml_sycl::KV_EXTENT_SELF,
+          "forms: a self extent is copied in");
+    CHECK_EQ(f.layers[1].slot_offset, 100 * MiB, "forms: with its slot offsets");
+
+    // After-KV: ascending admission, declined when it does not fit, never a demotion cause.
+    krt::device_model ak = gap_zone(300 * MiB + 65 * MiB);  // three layers, 65 MiB left
+    kv_region_request a  = layers_request(iota_layers(0, 4), 100 * MiB);
+    a.forced_host        = { 3 };
+    a.after_kv           = {
+        { 0, 50 * MiB },
+        { 1, 10 * MiB },
+        { 2, 30 * MiB },
+        { 3, 20 * MiB }
+    };
+    f = kv_region_fit(ak.snapshot(), a);
+    CHECK(f.fits && device_layers(f) == 3, "after-KV: three layers stay; the charge demotes nothing");
+    CHECK(f.after_kv[1].admitted && f.after_kv[2].admitted, "after-KV: the 10 and 30 MiB terms are admitted");
+    CHECK(!f.after_kv[0].admitted, "after-KV: the 50 MiB term no longer fits and is declined");
+    CHECK(!f.after_kv[3].admitted, "after-KV: a host layer's term is not charged");
+    CHECK(ak.replay(f), "after-KV: the carve of what is carved lands at the fit's offsets");
+    return 0;
+}
+
+// Carve mirroring (r1 M1): the extent is top-carved, and the same rule decides
+// the offset when the gap is exactly the size or one MIN_BLOCK_SIZE over it.
+static int case_h3_carve_mirroring() {
+    for (size_t extra : { size_t(0), size_t(256), size_t(512), 4 * MiB }) {
+        krt::device_model dev = gap_zone(150 * MiB + extra);
+        kv_region_request r   = layers_request(iota_layers(0, 1), 100 * MiB);
+        r.head_slots.push_back(head_slot("ring", 0, 50 * MiB));
+        const kv_region_fit_result f = kv_region_fit(dev.snapshot(), r);
+        CHECK(f.fits && device_layers(f) == 1, "mirror: both fit");
+        CHECK(dev.replay(f), "mirror: the offsets are the allocator's");
+        CHECK_EQ(f.extents[0].size, 100 * MiB, "mirror: a top carve takes exactly the slots' bytes");
+    }
+    return 0;
+}
+
+// H6: two weight TLSFs plus the tail KV TLSF.
+static int case_h6_n_chunk() {
+    krt::device_model dev;
+    for (int t = 0; t < 3; ++t) {
+        dev.tlsfs.emplace_back(MiB + 16 * MiB + 250 * MiB);
+        dev.tlsfs[t].context(MiB);
+        dev.tlsfs[t].weight(16 * MiB);
+    }
+    dev.tlsfs[0].takes_kv           = false;
+    dev.tlsfs[0].takes_weight_named = false;
+    dev.tlsfs[1].takes_kv           = false;  // the last weight chunk
+    dev.tlsfs[1].takes_weight_named = true;
+    dev.tlsfs[2].takes_kv           = true;   // the tail chunk's KV TLSF
+    dev.tlsfs[2].takes_weight_named = false;
+    kv_region_request r             = layers_request(iota_layers(0, 2), 100 * MiB);
+    r.head_slots.push_back(head_slot("moe_control", 0, 20 * MiB, /*names_weight=*/true));
+    r.head_slots.push_back(head_slot("ring", 0, 30 * MiB, /*names_weight=*/false));
+    kv_region_fit_result f = kv_region_fit(dev.snapshot(), r);
+    CHECK(f.fits && device_layers(f) == 2, "h6: fits");
+    CHECK_EQ(f.heads[0].tlsf, 1, "h6: a WEIGHT-naming head slot goes to the last weight chunk");
+    CHECK_EQ(f.heads[1].tlsf, 2, "h6: a KV-naming head slot goes to the KV TLSF");
+    for (const auto & e : f.extents) {
+        CHECK_EQ(e.tlsf, 2, "h6: KV goes to the KV TLSF");
+    }
+    CHECK(dev.replay(f), "h6: each carve lands at the fit's offsets on its own TLSF");
+
+    // Greedy across TLSFs: both weight chunks take KV too; slots fill the first TLSF with room.
+    krt::device_model many;
+    for (int t = 0; t < 3; ++t) {
+        many.tlsfs.emplace_back(MiB + 16 * MiB + 250 * MiB);
+        many.tlsfs[t].context(MiB);
+        many.tlsfs[t].weight(16 * MiB);
+    }
+    kv_region_request k = layers_request(iota_layers(0, 6), 100 * MiB);
+    f                   = kv_region_fit(many.snapshot(), k);
+    CHECK(f.fits && device_layers(f) == 6, "h6: six slots over three TLSFs");
+    size_t per_tlsf[3] = { 0, 0, 0 };
+    for (const auto & l : f.layers) {
+        ++per_tlsf[f.extents[l.extent].tlsf];
+    }
+    CHECK(per_tlsf[0] == 2 && per_tlsf[1] == 2 && per_tlsf[2] == 2,
+          "h6: each TLSF takes the two slots it has room for, in order");
+    CHECK_EQ(f.layers[0].extent, f.layers[1].extent, "h6: slots of one TLSF share its extent");
+    CHECK(many.replay(f), "h6: fit == carve across TLSFs and extents");
+    CHECK_EQ(f.free_after_full_kv[0] + f.free_after_full_kv[1] + f.free_after_full_kv[2],
+             3 * 250ll * (long long) MiB - 600ll * (long long) MiB,
+             "h6: free_after_full_kv is signed per TLSF and sums to room minus KV");
+    return 0;
 }
 
 int main() {
@@ -950,6 +1854,60 @@ int main() {
         r                        = context_demand_reconcile({ zero }, { held_at("ring", 1, 8) });
         CHECK_EQ(r.reused.size(), 1, "case 40: a held slot serves a zero need");
         CHECK(r.carved.empty() && r.superseded.empty(), "case 40: a zero need carves nothing");
+    }
+    if (int rc = case_h2_a2()) {
+        return rc;
+    }
+    if (int rc = case_h2_a2_red()) {
+        return rc;
+    }
+    if (int rc = case_h2_property()) {
+        return rc;
+    }
+    if (int rc = case_h2_churn()) {
+        return rc;
+    }
+    if (int rc = case_h2_ring_head_slot()) {
+        return rc;
+    }
+    if (int rc = case_h2_head_slot_rules()) {
+        return rc;
+    }
+    if (int rc = case_h2_ring_held_yield()) {
+        return rc;
+    }
+    if (int rc = case_h2_rows_per_context()) {
+        return rc;
+    }
+    if (int rc = case_h2_demotion_order()) {
+        return rc;
+    }
+    if (int rc = case_h2_recurrent_state()) {
+        return rc;
+    }
+    if (int rc = case_h3_slot_table_and_order()) {
+        return rc;
+    }
+    if (int rc = case_h3_multi_extent()) {
+        return rc;
+    }
+    if (int rc = case_h3_cost_order()) {
+        return rc;
+    }
+    if (int rc = case_h3_strict_prefix()) {
+        return rc;
+    }
+    if (int rc = case_h3_pending_ranges()) {
+        return rc;
+    }
+    if (int rc = case_h3_carve_mirroring()) {
+        return rc;
+    }
+    if (int rc = case_h3_request_forms()) {
+        return rc;
+    }
+    if (int rc = case_h6_n_chunk()) {
+        return rc;
     }
     std::printf("test-kv-runtime-demotion: all ok\n");
     return 0;
