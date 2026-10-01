@@ -31,7 +31,8 @@ THE CONTRACT.
      is refused with GGML_ABORT, before any src0_data is used.  The same predicate guards the
      resolve_weight fallback.  Pins: I1a (abort decided on the effective layout, after the
      reconcile), I1b (the non-forced src0->extra branch is part of the effective layout), I1c (the
-     resolve fallback).  A pre-reconcile abort is the defect this ordering replaces: it turned a
+     resolve fallback), I1d (ONE fact, ONE source: the effective layout is derived once, and both the
+     kernel-ABI mapping `data_layout` and the refusal read that single value, not a second copy).  A pre-reconcile abort is the defect this ordering replaces: it turned a
      forced-vs-stored mismatch that used to warn and fall through into a crash.
      Reachable on GPT-OSS at full budget only if the grouped xmx_tiled / I8 kernel declines for a
      reason other than coverage (caps, shape, tile-n-total, route arrays, kernel-row-limit with the
@@ -191,6 +192,21 @@ def check_backend(src: str) -> None:
             "FAIL [pin I1a]: the abort precedes the reconcile guard; the loaded layout is the answer, so reconcile "
             "FIRST and abort only on the effective layout (llama.cpp-4hg7)"
         )
+    # I1d.  One derivation.  Up to the first use of src0_data the layout is derived exactly once;
+    # the kernel-ABI mapping (data_layout) is a switch on that value, and nothing re-derives it from
+    # the forced layout or the tensor's extra.
+    upto = body[: body.find("const void * src0_data = nullptr;")]
+    if (
+        len(re.findall(r"const layout_mode direct_effective_layout =", upto)) != 1
+        or len(re.findall(r"get_effective_layout_mode\(static_cast<const ggml_tensor_extra_gpu \*>\(src0->extra\)\)", upto)) != 1
+        or "switch (*forced_layout)" in upto
+        or not re.search(r"direct_effective_layout = .*? switch \(direct_effective_layout\) \{ case GGML_LAYOUT_SOA:", upto)
+    ):
+        raise ContractError(
+            "FAIL [pin I1d]: the MXFP4 direct path derives the effective layout more than once (one fact, two "
+            "sources): data_layout must be a switch on the single direct_effective_layout that the refusal also "
+            "reads (llama.cpp-4hg7)"
+        )
     src0_data_at = body.find("const void * src0_data = nullptr;")
     if src0_data_at < guard.start():
         raise ContractError("FAIL [pin I1a]: the abort must precede the first use of src0_data (llama.cpp-4hg7)")
@@ -263,12 +279,12 @@ def self_test(mmvq_src: str, backend_src: str) -> int:
 
     abort_after = ("        if (layout_reconciled && !moe_mmvq_mxfp4_direct_reads_layout(direct_effective_layout)) {")
     # I1(a): the very same abort block, textually moved in front of the reconcile guard.
-    blk_start = backend_src.find("        const layout_mode direct_effective_layout =")
-    blk_end = backend_src.find("\n        const void * src0_data = nullptr;", blk_start)
+    blk_start = backend_src.find(abort_after)
+    blk_end = backend_src.find("\n        }\n", blk_start) + len("\n        }\n")
     rec_start = backend_src.find("        bool layout_reconciled = true;\n")
-    if 0 <= blk_start < blk_end and 0 <= rec_start < blk_start:
-        block = backend_src[blk_start:blk_end] + "\n"
-        moved = backend_src[:rec_start] + block + backend_src[rec_start:blk_start] + backend_src[blk_end + 1:]
+    if 0 <= rec_start < blk_start < blk_end:
+        block = backend_src[blk_start:blk_end]
+        moved = backend_src[:rec_start] + block + backend_src[rec_start:blk_start] + backend_src[blk_end:]
     else:
         moved = backend_src
     expect_fail("abort-before-reconcile", None, moved, "I1a")
@@ -282,6 +298,14 @@ def self_test(mmvq_src: str, backend_src: str) -> int:
     expect_fail("effective-layout-ignores-extra", None, sub(backend_src,
                 "src0->extra   ? get_effective_layout_mode(static_cast<const ggml_tensor_extra_gpu *>(src0->extra)) :\n                            GGML_LAYOUT_AOS;",
                 "GGML_LAYOUT_AOS;"), "I1b")
+    # I1(d): the data_layout mapping re-derives from the forced layout instead of reading the single value.
+    expect_fail("data-layout-rederives-from-forced", None, sub(backend_src,
+                "switch (direct_effective_layout) {\n            case GGML_LAYOUT_SOA:",
+                "switch (forced_layout ? *forced_layout : GGML_LAYOUT_AOS) {\n            case GGML_LAYOUT_SOA:"), "I1d")
+    # I1(d'): ... or from the tensor's extra.
+    expect_fail("data-layout-rederives-from-extra", None, sub(backend_src,
+                "switch (direct_effective_layout) {\n            case GGML_LAYOUT_SOA:",
+                "switch (get_effective_layout_mode(static_cast<const ggml_tensor_extra_gpu *>(src0->extra))) {\n            case GGML_LAYOUT_SOA:"), "I1d")
     # I1(c): the resolve_weight fallback maps a resolved unreadable layout onto AOS again.
     expect_fail("resolved-fallback-unguarded", None, sub(backend_src,
                 "if (!moe_mmvq_mxfp4_direct_reads_layout(resolved.layout)) {", "if (false) {"), "I1c")
@@ -296,7 +320,7 @@ def self_test(mmvq_src: str, backend_src: str) -> int:
     if failures:
         print(f"SELF-TEST FAIL: {', '.join(failures)}")
         return 1
-    print("SELF-TEST PASS: 12 mutants caught, unmodified tree passes")
+    print("SELF-TEST PASS: 14 mutants caught, unmodified tree passes")
     return 0
 
 

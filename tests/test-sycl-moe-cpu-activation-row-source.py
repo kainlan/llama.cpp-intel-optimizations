@@ -62,7 +62,16 @@ scatter events and was rejected for that reason).  It is DISJOINT REGIONS:
      it follows the wait in control flow, not only in the text); and the op-entry flushes --
      flush_pending_cpu_scatter_if_consumed, flush_pending_cpu_pipeline_if_consumed,
      try_flush_pending_cpu_scatter, in that order -- precede the shared activation D2H (pins
-     F1/F2/F3: the earlier scatter's H2D must be enqueued before this op's D2H).
+     F1/F2/F3: the earlier scatter's H2D must be enqueued before this op's D2H).  Three more pins
+     close the ways a pinned statement can be present and still not run: W3 (the memset's guard is
+     defined exactly once as `from_pool || !out_owner.valid()`, so `= false` cannot drop the zeroing),
+     and, for W2 and F1-F3, a structural test of each pinned statement -- it follows a statement or
+     block boundary (`;`, `{`, `}`), so it is not the body of an `if (...)`/`else`/loop header, and
+     the innermost block that holds it is the expected one (the lambda body for the wait+memset pair,
+     `if (moe_hybrid_with_plan)` for the three flushes), so it is not wrapped in a block of its own.
+     These are TEXTUAL and STRUCTURAL pins (brace and statement adjacency), not control-flow analysis:
+     a conditional hidden behind a macro or a helper function, or an early `return` above the
+     statement, is outside what they can see.
 
 WHAT THIS DOES NOT PROVE.  It reads source text.  It shows the shortcut can no longer
 be taken when ne11 > 1 and that the per-expert path it falls to is still the
@@ -154,6 +163,47 @@ def brace_block_from(src: str, start: int) -> str:
 def squash(text: str) -> str:
     """Collapse whitespace, and drop it after `(` so a wrapped call reads like an unwrapped one."""
     return re.sub(r"\(\s+", "(", re.sub(r"\s+", " ", text))
+
+
+def statement_context(text: str, pos: int) -> tuple[str, int, str]:
+    """Where the statement starting at `pos` sits: (previous token char, enclosing `{` index, its header).
+
+    Structural, not control-flow analysis.  The previous non-space character is `;`, `{` or `}` for a
+    statement that is not the body of an `if (...)`/`else`/loop header (those leave `)` or a keyword's
+    last letter there).  The enclosing block is the innermost unclosed `{`; its header is the text since
+    the previous `;`, `{` or `}`, so a statement wrapped in `if (false) { ... }` reports that header.
+    """
+    prev = text[:pos].rstrip()[-1:]
+    depth = 0
+    k = pos - 1
+    while k >= 0:
+        c = text[k]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            if depth == 0:
+                break
+            depth -= 1
+        k -= 1
+    j = k - 1
+    while j >= 0 and text[j] not in ";{}":
+        j -= 1
+    return prev, k, " ".join(text[j + 1 : k].split()) if k >= 0 else ""
+
+
+def require_unconditional(text: str, pos: int, *, header: str | None, pin: str, what: str) -> None:
+    """The statement at `pos` must follow a statement/block boundary and sit in the expected block.
+
+    header=None means the enclosing block must be the text's own outermost block (index 0).
+    """
+    prev, block_at, block_header = statement_context(text, pos)
+    where_ok = (block_at == 0) if header is None else (block_header == header)
+    if prev not in (";", "{", "}") or not where_ok:
+        raise ContractError(
+            f"FAIL [pin {pin}]: {what} is not an unconditional statement of its block (preceded by {prev!r}, "
+            f"enclosing block `{block_header}`): it is the body of an if/else/loop header, or wrapped in a block "
+            "of its own, so the ordering argument does not hold on every path (llama.cpp-4hg7)"
+        )
 
 
 def check(backend_src: str, pool_src: str | None = None) -> None:
@@ -278,6 +328,19 @@ def check_hot_cold(code: str) -> None:
             "region an earlier scatter's H2D has not read yet (llama.cpp-4hg7)"
         )
 
+    # The guard of that memset is a one-line definition; `= false` would silently drop the zeroing
+    # while every textual neighbour (W1/W2) still matches.
+    if lam.count("const bool zero_out_after_act_wait = from_pool || !out_owner.valid();") != 1:
+        raise ContractError(
+            "FAIL [pin W3]: zero_out_after_act_wait is not defined exactly once as `from_pool || "
+            "!out_owner.valid()` in dispatch_cpu_compute; the memset it guards is the zeroing of a region the "
+            "CPU kernels accumulate into (llama.cpp-4hg7)"
+        )
+    # W2, structural half: the wait+memset pair is a direct statement of the lambda body -- not under an
+    # `if (...)`, an `else`, or a block of its own.
+    require_unconditional(lam, lam.find("if (act_deferred_pending) { act_deferred_evt.wait(); }"),
+                          header=None, pin="W2", what="the activation wait + out-region memset pair")
+
     # 9. (I2) the flushes that make the ordering argument true come before the shared D2H.
     entry_marker = '"[MoE-HYBRID] ne12=%ld hybrid_active=%d plan_hybrid=%d cpu_tg=%d expert_cache=%d\\n"'
     anchor = code.find(entry_marker)
@@ -304,6 +367,7 @@ def check_hot_cold(code: str) -> None:
         if nxt < at:
             raise ContractError(f"FAIL [pin {pin}]: `{needle}` is out of order; the op-entry flushes run consumed, pipeline, try (llama.cpp-4hg7)")
         at = nxt
+        require_unconditional(entry, nxt, header="if (moe_hybrid_with_plan)", pin=pin, what=f"`{needle}`")
 
     # 7. the split.
     d_at = code.find(DISPATCH_MARKER)
@@ -438,6 +502,25 @@ def self_test(backend_src: str) -> int:
         "if (zero_out_after_act_wait) {\n                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));",
         "if (zero_out_after_act_wait && n_cpu > 1) {\n                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));"),
         None, "W2")
+    # W3: the memset's guard is defined away, so the zeroing is silently dropped (W1/W2 text still matches).
+    expect_fail("memset-guard-defined-false", sub(
+        "const bool zero_out_after_act_wait = from_pool || !out_owner.valid();",
+        "const bool zero_out_after_act_wait = false;"), None, "W3")
+    # W2 (structure): the wait+memset pair, textually adjacent and exact, wrapped in a block of its own.
+    pair = ("if (act_deferred_pending) {\n                    act_deferred_evt.wait();\n                }\n"
+            "                if (zero_out_after_act_wait) {\n                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));\n                }")
+    expect_fail("wait-memset-pair-wrapped-in-if-false", sub(pair, "if (false) {\n                " + pair + "\n                }"), None, "W2")
+    # F2 (order): the consumed and pipeline flushes exchanged.
+    consumed = "            flush_pending_cpu_scatter_if_consumed(dst, ctx.device);\n"
+    pipeline = "            flush_pending_cpu_pipeline_if_consumed(dst, ctx.device);\n"
+    expect_fail("consumed-and-pipeline-flushes-swapped", sub(consumed + pipeline, pipeline + consumed,
+                                                             in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F2")
+    # F3/F1 (structure): present, in order, exactly once -- but dead (the body of `if (false)`).
+    expect_fail("try-flush-under-if-false", sub("            try_flush_pending_cpu_scatter();\n",
+                                                "            if (false) try_flush_pending_cpu_scatter();\n",
+                                                in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F3")
+    expect_fail("consumed-flush-under-if-false", sub(consumed, "            if (false) flush_pending_cpu_scatter_if_consumed(dst, ctx.device);\n",
+                                                     in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F1")
     # I2(a)/(b): the op-entry flushes that put the earlier scatter's H2D ahead of this op's D2H.
     expect_fail("try-flush-dropped", sub("            try_flush_pending_cpu_scatter();\n", "",
                                          in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F3")
@@ -481,7 +564,7 @@ def self_test(backend_src: str) -> int:
     if failures:
         print(f"SELF-TEST FAIL: {', '.join(failures)}")
         return 1
-    print("SELF-TEST PASS: 29 mutants caught, unmodified tree passes")
+    print("SELF-TEST PASS: 34 mutants caught, unmodified tree passes")
     return 0
 
 

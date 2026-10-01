@@ -64120,39 +64120,25 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // FULL weight buffer pointer (same for every expert), which is wrong.
         // For non-MoE tensors, tensor storage and get_layout_ptr_for return the same thing.
 
-        // Determine the data layout: use forced_layout from mul_mat_id if provided,
-        // else check src0->extra->layout.mode, else default to AOS.
+        // Determine the layout of the bytes this path is about to decode: the forced layout from
+        // mul_mat_id if provided, else src0->extra->layout.mode, else AOS.  This is the ONE
+        // derivation -- data_layout (the kernel ABI) and the refusal below are both read from it.
+        const layout_mode direct_effective_layout =
+            forced_layout ? *forced_layout :
+            src0->extra   ? get_effective_layout_mode(static_cast<const ggml_tensor_extra_gpu *>(src0->extra)) :
+                            GGML_LAYOUT_AOS;
         ggml_sycl_unified::LayoutMode data_layout = ggml_sycl_unified::LayoutMode::AOS;
-        if (forced_layout) {
-            switch (*forced_layout) {
-                case GGML_LAYOUT_AOS:
-                    data_layout = ggml_sycl_unified::LayoutMode::AOS;
-                    break;
-                case GGML_LAYOUT_SOA:
-                    data_layout = ggml_sycl_unified::LayoutMode::SOA;
-                    break;
-                case GGML_LAYOUT_COALESCED:
-                    data_layout = ggml_sycl_unified::LayoutMode::COALESCED;
-                    break;
-                default:
-                    data_layout = ggml_sycl_unified::LayoutMode::AOS;
-                    break;
-            }
-        } else if (src0->extra) {
-            const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-            if (extra) {
-                switch (get_effective_layout_mode(extra)) {
-                    case GGML_LAYOUT_SOA:
-                        data_layout = ggml_sycl_unified::LayoutMode::SOA;
-                        break;
-                    case GGML_LAYOUT_COALESCED:
-                        data_layout = ggml_sycl_unified::LayoutMode::COALESCED;
-                        break;
-                    default:
-                        data_layout = ggml_sycl_unified::LayoutMode::AOS;
-                        break;
-                }
-            }
+        switch (direct_effective_layout) {
+            case GGML_LAYOUT_SOA:
+                data_layout = ggml_sycl_unified::LayoutMode::SOA;
+                break;
+            case GGML_LAYOUT_COALESCED:
+                data_layout = ggml_sycl_unified::LayoutMode::COALESCED;
+                break;
+            default:
+                // AOS, or a layout the refusal below turns away before data_layout is used.
+                data_layout = ggml_sycl_unified::LayoutMode::AOS;
+                break;
         }
 
         // Reconcile the advertised layout against what the cache actually
@@ -64182,18 +64168,13 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             }
         }
 
-        // The layout of the bytes this path is about to decode, AFTER the reconcile above: the
-        // advertised one when forced (reconciled, so equal to the stored one) or the tensor's own
-        // effective one. A layout that disagrees with storage was already refused above and falls
-        // through; what is left is the loaded layout, which is the answer. The switches above map
-        // anything they do not know onto AOS, so a loaded layout none of these kernels decodes
+        // The refusal is decided on direct_effective_layout (derived once, above), AFTER the
+        // reconcile: a layout that disagrees with storage was already refused and falls through;
+        // what is left is the loaded layout, which is the answer.  The data_layout switch maps
+        // anything it does not know onto AOS, so a loaded layout none of these kernels decodes
         // (xmx_tiled, I8, DPAS, ...) would be read as AOS: deterministic garbage (llama.cpp-4hg7,
-        // xmx_tiled hybrid expert). Refuse loudly instead: a missing kernel for the loaded layout is
+        // xmx_tiled hybrid expert).  Refuse loudly instead: a missing kernel for the loaded layout is
         // a support gap to close, not an input to re-route, and a crash beats wrong tokens.
-        const layout_mode direct_effective_layout =
-            forced_layout ? *forced_layout :
-            src0->extra   ? get_effective_layout_mode(static_cast<const ggml_tensor_extra_gpu *>(src0->extra)) :
-                            GGML_LAYOUT_AOS;
         if (layout_reconciled && !moe_mmvq_mxfp4_direct_reads_layout(direct_effective_layout)) {
             GGML_ABORT(
                 "[MXFP4-DIRECT] %s: no decode for loaded layout=%s on this path -- refusing instead of "
