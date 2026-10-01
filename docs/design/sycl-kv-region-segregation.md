@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14ak, by impl-moua-s, 2026-09-30. The revisions answer forty-one reviews:
+Design, revision 7.14al, by impl-moua-s, 2026-09-30. The revisions answer forty-two reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -249,6 +249,11 @@ Design, revision 7.14ak, by impl-moua-s, 2026-09-30. The revisions answer forty-
   reactivation arm is two runs, a primary in-process non-strict run that scores the guard line
   before the call returns and the post-release slot readings, and one strict child per arm
   family that proves the abort channel.
+- design review r41 (design-moua-r41 on `1c9edf1cb..7461d67c5`: 0 Critical, 0 Important, 3
+  Minor, 7 nits) and rulings §M109, recorded in §6.53. Revision 7.14al is one commit on top of
+  `7461d67c5`: the backend guard is the single emission site and returns `PLAN_REJECTED`, the arm
+  names its holder entry and scores that code, the primary run unsets the strict switch first, and
+  the seven nits are folded.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -2063,7 +2068,12 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     violation: `[CONTEXT-PLAN-BUG]`, with no retry and no `BUSY` (below), whatever the admission
     state was when its token was acquired. Every transition out of ACTIVE is an L0 holder's, so a
     holder finds the module non-ACTIVE only if a caller ran the entry outside the module's
-    lifecycle; zhcn's design states the same rule (`zhcn-design.md:2170`, gate 22b).
+    lifecycle; zhcn's design states the same rule (`zhcn-design.md:2170`, gate 22b). **The backend
+    guard is the single emission site (rulings §M109).** It logs `[CONTEXT-PLAN-BUG]` at WARN,
+    aborts under `GGML_SYCL_STRICT_LEASES=1`, and returns `GGML_SYCL_LIFECYCLE_PLAN_REJECTED`
+    (`ggml-sycl.h:1209`), never `BUSY`. llama maps `PLAN_REJECTED` to REFUSED by zhcn's generic rule
+    and emits no second BUG line; its own `BUSY` conversion stays only as the drift detector for a
+    `BUSY` that should no longer reach it (`zhcn-design.md:2174`).
     **`ggml_backend_sycl_can_unload` holds L0, taken by a TRY-lock
     (zhcn 5.5 row 32, r6 m-6; rulings §M11 I-F).** It is what closes module admission: it moves
     `ACTIVE` to `RETRY_CLOSED`, reserves the Registry's shutdown, and waits up to 5 s for the
@@ -4342,50 +4352,50 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       ONEDNN = 33554432, G = P = 0, `interim_capped`. RED: a tree that keeps `min(...)` reads
       134217728. The cell is VOID unless the sum exceeds the cap AND `available / 4 > stored`
       (otherwise the cap is `stored` itself and `min(...)` equals the correct value, so the cell
-      would pass a clamping tree). G_raw and P_raw come from the with-floor getter
-      (`unified-cache.cpp:2155-2169` at `d8a67422d`) with the Graph allocator on and Qwen's shape
-      published (`n_head_ctx_max` 16, `n_ubatch` 512, `n_ctx` 4096), which needs `GGML_SYCL_DNNL`: a
-      build without it exits 77, a skip and not a pass. 23mk H3's "(b1)'s interim G" capped fixture
+      would pass a clamping tree). P_raw is the stored getter's value
+      (`unified-cache.cpp:2148-2153`) and G_raw is the floor that the with-floor getter adds to it
+      (`:2155-2169`; the getter returns stored + floor, `:2160-2167`), both at `d8a67422d`, with the
+      Graph allocator on and Qwen's shape published (`n_head_ctx_max` 16, `n_ubatch` 512, `n_ctx`
+      4096), which needs `GGML_SYCL_DNNL`: a build without it exits 77, a skip and not a pass. 23mk
+      H3's "(b1)'s interim G" capped fixture
       is the same cell at (b1). Where it binds, the Graph draw that no longer fits is not sent to
-      the direct
-      overflow: (b1) declines oneDNN SDPA on that device as `interim_capped`, with one `oneDNN SDPA
-      declined` WARN per (context, device, layer) carrying the running count (rulings §M71 (a)), and
-      a runtime miss is the TERMINAL `[ZONE-PLAN-BUG]` channel, which aborts (rulings §M64 (a),
-      §M70, §M72; "The Graph-scratch commit", above). The constant goes in L4+L6 (rulings §M37 Q3),
-      since the zone's remaining consumers, W and the Graph scratch, are then each sized by its own
-      function. Between (b1) and L4 the load stage is master's with (b1)'s G and P: 268435456 B on
-      both gate shapes at the published 512, and 304087040 B on Qwen at `-c 4096` once fkpg (a)
-      lands (P is `onednn_reorder + onednn_eligible` before 23mk's §4); after §4 and before L4 it is
-      `max(268435456, W + G + P)`, 268435456 B on Qwen at both shapes (23mk:6032-6047). **The final
-      sizing is not 268435456 B (rulings §M37 Q3; 23mk 4.10 relay):** from (b2) ONEDNN is
-      `onednn_pp_w` exactly, 23592960 B on GPT-OSS 120B and 33554432 B on Qwen (the end states,
-      above). 7.14f to 7.14h said "the interim and the final sizing are both 268435456 B", which
-      predates §M37 Q3. 7.14j's hard edge, the whole commit before L4+L6, was cyclic: the conversion
-      needs L4's pending ranges and claims and L6's transaction steps (r18 C-1). H7ap's C-rule arm
-      is an arm of (b2) again (rulings §M26a I-4), scored on the post-(b2) tree, which carries step
-      4's ledger since (b2) lands after L6 (rulings §M44 addendum; §3.3). §M43's L4+L6 scoring
-      belonged to the hard edge and goes with it. So the early stage packs against the zones it
-      admits, and B's ranges are recorded inside them. **The shared rule (rulings §Z8 I-3, §M13a):
-      the sentence is this design's, the message is 23mk's, and each design mirrors both byte for
-      byte.** The sentence: "an arena rebuild that meets live bytes or any pending range refuses by
-      name; it never destroys them, and the `GGML_ABORT` at `ggml-sycl.cpp:16215` becomes that named
-      refusal." `ensure_planned_arena_zones` counts any pending range on the device as live, beside
-      zone bytes, chunk leases and live scratch, and `compute_and_store_plan_for_inventory` returns
-      `bool`. On the refusal it logs the message, `[SYCL-PLAN] model load refused: arena zones
-      on device %d cannot be rebuilt while live allocations or pending ranges remain (zone bytes
-      %.1f MB, chunk leases %zu, scratch %.1f MB, pending ranges %zu)`, stores no plan and
-      returns false, and the stage passes that up as its refusal
-      (`GGML_SYCL_LIFECYCLE_EFFECT_FAILED`, through the stage's rollback guard), never the
+      the direct overflow: (b1) declines oneDNN SDPA on that device as `interim_capped`, with one
+      `oneDNN SDPA declined` WARN per (context, device, layer) carrying the running count (rulings
+      §M71 (a)), and a runtime miss is the TERMINAL `[ZONE-PLAN-BUG]` channel, which aborts (rulings
+      §M64 (a), §M70, §M72; "The Graph-scratch commit", above). The constant goes in L4+L6 (rulings
+      §M37 Q3), since the zone's remaining consumers, W and the Graph scratch, are then each sized
+      by its own function. Between (b1) and L4 the load stage is master's with (b1)'s G and P:
+      268435456 B on both gate shapes at the published 512, and 304087040 B on Qwen at `-c 4096`
+      once fkpg (a) lands (P is `onednn_reorder + onednn_eligible` before 23mk's §4); after §4 and
+      before L4 it is `max(268435456, W + G + P)`, 268435456 B on Qwen at both shapes
+      (23mk:6032-6047). **The final sizing is not 268435456 B (rulings §M37 Q3; 23mk 4.10 relay):**
+      from (b2) ONEDNN is `onednn_pp_w` exactly, 23592960 B on GPT-OSS 120B and 33554432 B on Qwen
+      (the end states, above). 7.14f to 7.14h said "the interim and the final sizing are both
+      268435456 B", which predates §M37 Q3. 7.14j's hard edge, the whole commit before L4+L6, was
+      cyclic: the conversion needs L4's pending ranges and claims and L6's transaction steps (r18
+      C-1). H7ap's C-rule arm is an arm of (b2) again (rulings §M26a I-4), scored on the post-(b2)
+      tree, which carries step 4's ledger since (b2) lands after L6 (rulings §M44 addendum; §3.3).
+      §M43's L4+L6 scoring belonged to the hard edge and goes with it. So the early stage packs
+      against the zones it admits, and B's ranges are recorded inside them. **The shared rule
+      (rulings §Z8 I-3, §M13a): the sentence is this design's, the message is 23mk's, and each
+      design mirrors both byte for byte.** The sentence: "an arena rebuild that meets live bytes or
+      any pending range refuses by name; it never destroys them, and the `GGML_ABORT` at
+      `ggml-sycl.cpp:16215` becomes that named refusal." `ensure_planned_arena_zones` counts any
+      pending range on the device as live, beside zone bytes, chunk leases and live scratch, and
+      `compute_and_store_plan_for_inventory` returns `bool`. On the refusal it logs the message,
+      `[SYCL-PLAN] model load refused: arena zones on device %d cannot be rebuilt while live
+      allocations or pending ranges remain (zone bytes %.1f MB, chunk leases %zu, scratch %.1f MB,
+      pending ranges %zu)`, stores no plan and returns false, and the stage passes that up as its
+      refusal (`GGML_SYCL_LIFECYCLE_EFFECT_FAILED`, through the stage's rollback guard), never the
       abort. **Its arguments (r12 m-7; relayed to 23mk, whose string it is):** at
       `unified-cache.cpp:4572-4588`, `%d` is the device; the zone bytes are `(double)
       live_zone_bytes / MiB`; the chunk leases are `(size_t) chunk_leases`, since the count is a
       `uint32_t` on master; the scratch is `(double) live_scratch_bytes / MiB`, a new `size_t`
       summed beside master's `has_live_scratch` bool from each member's recorded size
-      (`compute_arena_used()`, the scratch pool, the two oneDNN scratches, the reorder temp
-      buffer, each persistent scratch and each PP MoE oneDNN slot); and the pending ranges are
-      the `size_t` count of pending ranges on the device's TLSFs (23mk §6.8, unchanged since
-      `437073a29`). The late stage never calls the ensure, so this refusal is reachable only at
-      the early stage;
+      (`compute_arena_used()`, the scratch pool, the two oneDNN scratches, the reorder temp buffer,
+      each persistent scratch and each PP MoE oneDNN slot); and the pending ranges are the `size_t`
+      count of pending ranges on the device's TLSFs (23mk §6.8, unchanged since `437073a29`). The
+      late stage never calls the ensure, so this refusal is reachable only at the early stage;
     - **The admitting stage is the early stage (rulings §X7 I-3).** llama calls
       `stage_inventory_plan` twice. The early call is `llama_model_sycl_compute_early_plan`'s
       apply (`llama-model.cpp:657`); the function is called at `:2106` today and after `:2211`
@@ -8298,7 +8308,9 @@ means that.
     `reserve_shutdown`, `cancel_shutdown`, `shutdown_unified_cache`,
     `prepare_unified_cache_for_module_use` and `rollback_unified_cache_module_use`. An entry is
     "exported" if `ggml-sycl.h` declares it or `ggml_backend_sycl_reg_get_proc_address` names it
-    (`gs:110115-110140`). At `d8a67422d` the derived set is `can_unload` (`gs:109592-109594`),
+    (the whole table, `gs:110050-110379`; its unload and reactivation block is `gs:110115-110140`,
+    and the gate scans all of it). At `d8a67422d` the derived set is `can_unload`
+    (`gs:109592-109594`),
     `cancel_unload` (`gs:109632`), `complete_unload` (`gs:109643`), `commit_reactivate`
     (`gs:109671-109672`), `rollback_reactivate` (`gs:109709-109710`), `shutdown` (`gs:109971`) and
     `reg` (`gs:110394`); minus the two named exclusions `cancel_unload` and `reg` (each with its
@@ -8632,44 +8644,41 @@ means that.
       B at L4 and L6 and 117440512 B at (b2) (23mk:6042-6044); no moua arm scores it. The weight
       zone moves by the same bytes each step, and the end states do not change. **The arm is scored
       at the gates' shape, `-c 4096 -ub 512`, which fkpg (a) carries (r20 m-13; 23mk 4.14).** G
-      follows the caller's
-      `-c`: at `n_ctx` 512 Qwen's G is the 64 MiB minimum, 67108864 B, so a tree without fkpg
-      (a) reads 134217728 B at L4+L6 and (b2) moves 100663296 B, the last RED row, which the
-      exact bytes catch. The fkpg (a) → L4 edge keeps that tree from landing. GPT-OSS 120B's
-      rows do not depend on `n_ctx`, since sinks make its G 0. (b1) moves neither gate's ONEDNN at
-      the published `n_ctx` 512 (the Graph-scratch commit, above); with fkpg (a) at `-c 4096` it
-      moves Qwen's by +35651584 B, which is P less the constant's 15728640 B of
-      slack (23mk:4776-4782), and GPT-OSS's not at all; the L6
-      row is this arm's, the (b2) row the (b2) arm's. **The master row
-      holds only on a tree without fkpg (a) (rulings §M46b I-4):** master publishes `n_ctx=512`
-      at load (`gptoss120b-b1-2026-09-17.log:181`, "n_ctx=512 (conservative)"), so G is
-      100663296 B on GPT-OSS 120B and 67108864 B on Qwen, under the constant; 805306368 B needs
-      fkpg (a)'s `n_ctx=4096`. Master's stored value is W + E, E being `onednn_eligible`, the
-      largest eligible weight as stored (`zone-sizing.cpp:168`; summed at
+      follows the caller's `-c`: at `n_ctx` 512 Qwen's G is the 64 MiB minimum, 67108864 B, so a
+      tree without fkpg (a) reads 134217728 B at L4+L6 and (b2) moves 100663296 B, the last RED row,
+      which the exact bytes catch. The fkpg (a) → L4 edge keeps that tree from landing. GPT-OSS
+      120B's rows do not depend on `n_ctx`, since sinks make its G 0. (b1) moves neither gate's
+      ONEDNN at the published `n_ctx` 512 (the Graph-scratch commit, above); with fkpg (a) at `-c
+      4096` it moves Qwen's by +35651584 B, which is P less the constant's 15728640 B of slack
+      (23mk:4776-4782), and GPT-OSS's not at all; the L6 row is this arm's, the (b2) row the (b2)
+      arm's. **The master row holds only on a tree without fkpg (a) (rulings §M46b I-4):** master
+      publishes `n_ctx=512` at load (`gptoss120b-b1-2026-09-17.log:181`, "n_ctx=512
+      (conservative)"), so G is 100663296 B on GPT-OSS 120B and 67108864 B on Qwen, under the
+      constant; 805306368 B needs fkpg (a)'s `n_ctx=4096`. Master's stored value is W + E, E being
+      `onednn_eligible`, the largest eligible weight as stored (`zone-sizing.cpp:168`; summed at
       `unified-cache.cpp:27565`): 34.5 = 22.5 + 12.0 MB on GPT-OSS 120B
       (`gptoss120b-b1-2026-09-17.log:202`) and 49.0 = 32.0 + 17.0 MB on Qwen
-      (`glkg-qwen35b-a3b-b1-2026-09-17.log:228`), so E is the stored size of the largest
-      eligible weight: on GPT-OSS 120B the Q8_0 attention weight whose reorder is W, 2880 · 4096
-      / 32 · 34 = **12533760 B** (11.95 MiB, which the log prints as 12.0 MB; 7.14l read
-      12582912 B back from that one-decimal line, r20 m-1), and on Qwen the Q8_0 2048 × 8192
-      weight, 17825792 B. Master's zone is `max(268435456, W + E + G)`. **fkpg (a) landing
-      before (b1) is the RED row:** GPT-OSS 120B's ONEDNN becomes 36126720 + 805306368 =
-      841433088 B, the idle reservation for a route that sinks forbid that rulings §M42 and §M44
-      refused (P4); Qwen's 252706816 B stays under the constant. The edge (b1) → fkpg (a)
-      forbids that order; they stay separate landings (§4). **SCRATCH**, from the commit that
-      converts the last untermed census row (the end states): after step 4 SCRATCH is exactly
-      the ledger's SCRATCH terms, and `ggml_sycl_compute_arena_bytes(dev)` returns
-      `demand_SCRATCH(dev)`, the class-P part, `mmq_work_counter`'s fixed bytes, on both gates
-      (rulings §Z26.1). It sizes nothing: the compute arena is still `reserve_compute_arena`
-      over the whole zone (zhcn r20 m-8). The arm asserts, per device, that the accessor's value
-      read before the pack is at most step 4's SCRATCH. RED: an accessor that counts D terms
-      before the pack, at their pre-pack bound (every term at its largest, as the first
-      context's bound is). On a fixture whose pack tiers the output head to the host, (a) reads
-      `lm_head_f16`'s bytes into `cap_min`, step 4 sizes SCRATCH without them, and zhcn's
-      witness fires naming the admitted cap below `cap_min`. Its precondition, asserted first or
-      the arm is VOID: the census gate finds no SCRATCH draw without a term. RED: the floor
-      kept, which ensures 536870912 B less the terms that no term charged. Both arms also run
-      the dry-run witness, which must grow nothing;
+      (`glkg-qwen35b-a3b-b1-2026-09-17.log:228`), so E is the stored size of the largest eligible
+      weight: on GPT-OSS 120B the Q8_0 attention weight whose reorder is W, 2880 · 4096 / 32 · 34 =
+      **12533760 B** (11.95 MiB, which the log prints as 12.0 MB; 7.14l read 12582912 B back from
+      that one-decimal line, r20 m-1), and on Qwen the Q8_0 2048 × 8192 weight, 17825792 B. Master's
+      zone is `max(268435456, W + E + G)`. **fkpg (a) landing before (b1) is the RED row:** GPT-OSS
+      120B's ONEDNN becomes 36126720 + 805306368 = 841433088 B, the idle reservation for a route
+      that sinks forbid that rulings §M42 and §M44 refused (P4); Qwen's 252706816 B stays under the
+      constant. The edge (b1) → fkpg (a) forbids that order; they stay separate landings (§4).
+      **SCRATCH**, from the commit that converts the last untermed census row (the end states):
+      after step 4 SCRATCH is exactly the ledger's SCRATCH terms, and
+      `ggml_sycl_compute_arena_bytes(dev)` returns `demand_SCRATCH(dev)`, the class-P part,
+      `mmq_work_counter`'s fixed bytes, on both gates (rulings §Z26.1). It sizes nothing: the
+      compute arena is still `reserve_compute_arena` over the whole zone (zhcn r20 m-8). The arm
+      asserts, per device, that the accessor's value read before the pack is at most step 4's
+      SCRATCH. RED: an accessor that counts D terms before the pack, at their pre-pack bound (every
+      term at its largest, as the first context's bound is). On a fixture whose pack tiers the
+      output head to the host, (a) reads `lm_head_f16`'s bytes into `cap_min`, step 4 sizes SCRATCH
+      without them, and zhcn's witness fires naming the admitted cap below `cap_min`. Its
+      precondition, asserted first or the arm is VOID: the census gate finds no SCRATCH draw without
+      a term. RED: the floor kept, which ensures 536870912 B less the terms that no term charged.
+      Both arms also run the dry-run witness, which must grow nothing;
     - **the interim cap's cell (r39 M-3):** the capped fixture of §2.4.2 step 4, Qwen's `-c 4096`
       shape with available = 536870912, pre-registered there; it is a G1 cell (lead-run, label
       `cache`, not pure-host), an arm of the L4+L6 commit, and VOID unless its sum exceeds the cap
@@ -9365,13 +9374,14 @@ means that.
   - **Reactivation and complete unload hold L0 (rulings §M76.5; the lead's relay).** In a
     `GGML_SYCL_PRIVATE_TESTING` build, on a model-less module, for `commit_reactivate`,
     `rollback_reactivate` and `complete_unload`. **Module state and order (rulings §M99 M-1, kept by
-    §M101):** `can_unload` moves `ACTIVE` to `RETRY_CLOSED` (or `complete_unload` to
-    `COMPLETE_CLOSED`) and `prepare_reactivate` runs, which needs one of those two states
-    (`gs:109659-109662`); for the rollback case a completed `commit_reactivate` runs first. Only
-    then does the holder park inside a real entry, after taking L0 and before its module guard. It
-    cannot park earlier: `can_unload` takes L0 by try-lock and would return at once, so the module
-    would never leave `ACTIVE`, and `commit_reactivate` would block on the holder. A `try_lock` of
-    L0 from the calling thread fails at that moment (positive control). **Observable:**
+    §M101):** For `commit_reactivate`, `can_unload` moves `ACTIVE` to `RETRY_CLOSED` and
+    `prepare_reactivate` runs, which needs `RETRY_CLOSED` or `COMPLETE_CLOSED` (`gs:109659-109662`);
+    for `rollback_reactivate` a completed `commit_reactivate` runs after that; for `complete_unload`
+    only `can_unload` runs first, since the body itself sets `COMPLETE_CLOSED`. Only then does the
+    holder park inside a real entry, after taking L0 and before its module guard. It cannot park
+    earlier: `can_unload` takes L0 by try-lock and would return at once, so the module would never
+    leave `ACTIVE`, and `commit_reactivate` would block on the holder. A `try_lock` of L0 from the
+    calling thread fails at that moment (positive control). **Observable:**
     `ggml_backend_sycl_test_admission_snapshot` (`gs:110009-110022`) slots [0] (admission), [6]
     (shutdown_reserved) and [7] (shutdown_completed). **Handshake, with no timing:** a
     `GGML_SYCL_PRIVATE_TESTING` counter of threads blocked in the token's acquire, and one condition
@@ -9379,37 +9389,52 @@ means that.
     `counter == 1`; "returned" is the RED's reading, never the 5 s watchdog, which only guards a
     hang. While the holder is parked, `commit_reactivate` runs on another thread and the arm asserts
     that it has not returned and that slot [0] still reads `PREPARING`; `rollback_reactivate`, after
-    the completed commit, has not returned and slot [0] still reads `COMMITTED_CLOSED`;
-    `complete_unload` has not returned and slots [0] and [7] do not yet show `COMPLETE_CLOSED` and
-    1. `prepare_reactivate` and `finalize_reactivate` return at once against the parked holder,
-    since they take no L0. The arm writes each reading to stderr as a marker line before it releases
-    the holder. **Run (1), the primary run: in-process, non-strict (`GGML_SYCL_STRICT_LEASES` unset;
-    rulings §M106), per protected body.** The arm scores, in this order: (a) counter == 1, so the
-    call is blocked in its L0 acquire, with the pre-release readings above; (b) exactly one
-    `[CONTEXT-PLAN-BUG]` line from the holder's module guard, while the call has not returned; (c)
-    the holder returns its failure and releases L0; (d) the call returns; (e) the post-release slot
-    readings. For `commit_reactivate`, slot [0] reads `COMMITTED_CLOSED`. For `rollback_reactivate`,
-    slot [0] reads the previous state (the source order is restore, `gs:109702`, then teardown,
-    `gs:109709-109710`), with slots [6] and [7] as `complete_shutdown()` leaves them. For
-    `complete_unload`, slots [0] and [7] show `COMPLETE_CLOSED` and 1. The guard finds the module
-    non-ACTIVE because no holder's change completed while the holder was parked (§2.4.2, rulings
-    §M101), and it runs under the holder's token, so the line precedes (d): the blocked call cannot
-    have returned when it appears (rulings §M106 corrects §M101's "after the call returned"). **What
-    the non-strict BUG path returns, from source.** The guard tests `ggml_sycl_strict_enabled()`
-    (declared `unified-cache.hpp:7259`, defined `unified-cache.cpp:13009-13011` over the once-read
-    `GGML_SYCL_STRICT_LEASES` switch, `:13001-13007`). With it false the guard does not abort: it
-    logs the one line at WARN, so that it reaches the default-verbosity callback the arm counts it
-    through, and returns the entry's non-`BUSY` failure return with no retry, which releases the
-    token as the entry unwinds. Master's module guards return `BUSY` with no log, so this guard is
-    moua's own code. **Run (2), one strict child per arm family, not per body:**
-    `GGML_SYCL_STRICT_LEASES=1`, in a child process because the switch is read once into a
-    function-local static (`:13002-13007`), so the primary run's process cannot be re-armed. The
-    child runs one body's case, scores exit status 134 (SIGABRT) and exactly one
-    `[CONTEXT-PLAN-BUG]` line, and so proves the abort channel; the other bodies reach the same
-    switch through the same guard, so they need no child of their own. **RED, scored on "the call
-    returned while the holder was parked":** the token deleted from any of the three; the call
-    returns with the holder still parked and the counter stays 0. No publish interleave is scored
-    beyond the one guard line: the blocking is the observable.
+    the completed commit, has not returned and slot [0] still reads `COMMITTED_CLOSED`, with slots
+    [6] and [7] 0 and 0; `complete_unload` has not returned and slot [0] still reads `RETRY_CLOSED`
+    and slot [7] 0. `prepare_reactivate` and `finalize_reactivate` return at once against the parked
+    holder, since they take no L0.  **Run (1), the primary run: in-process, non-strict, per
+    protected body (rulings §M106, §M109).** The run `unsetenv()`s `GGML_SYCL_STRICT_LEASES` in its
+    own environment before any backend call, because the switch is read once into a function-local
+    static (`unified-cache.cpp:13001-13007`) and gates run with it set, and asserts
+    `!ggml_sycl_strict_enabled()` as its first check; a true reading makes the run VOID, never a
+    pass. The holder is `ggml_backend_sycl_set_runtime_context_for_model` called with a null
+    backend: its module guard is its first statement (`gs:18858-18859`), before any argument check
+    (`gs:18860`), so a null backend reaches the guard on the model-less module. The log callback
+    snapshots the call's `returned` flag at the instant it receives the BUG line. The arm scores, in
+    this order: (a) counter == 1, so the call is blocked in its L0 acquire, with the pre-release
+    readings above; (b) exactly one `[CONTEXT-PLAN-BUG]` line from the holder's guard, whose
+    snapshot reads `returned` false; (c) the holder's return value `==
+    GGML_SYCL_LIFECYCLE_PLAN_REJECTED && != GGML_SYCL_LIFECYCLE_BUSY`, and it releases L0; (d) the
+    call returns; (e) the post-release slot readings. For `commit_reactivate`, slot [0] reads
+    `COMMITTED_CLOSED`. For `rollback_reactivate`, slot [0] reads `RETRY_CLOSED`, the previous state
+    on the `can_unload` route (`g_sycl_reactivation_previous`, saved at `gs:109663`, restored at
+    `gs:109702`, then teardown, `gs:109709-109710`), and slots [6] and [7] read 0 and 1, as
+    `complete_shutdown()` leaves them (`model-lifecycle.cpp:1037-1045`). For `complete_unload`,
+    slots [0] and [7] read `COMPLETE_CLOSED` and 1. The guard finds the module non-ACTIVE because no
+    holder's change completed while the holder was parked (§2.4.2, rulings §M101), and it runs under
+    the holder's token, so the line precedes (d): the blocked call cannot have returned when it
+    appears (rulings §M106 corrects §M101's "after the call returned"). **What the backend guard's
+    non-strict path returns, from source.** The guard tests `ggml_sycl_strict_enabled()` (declared
+    `unified-cache.hpp:7259`, defined `unified-cache.cpp:13009-13011` over the once-read switch).
+    With it false the guard does not abort: it logs the one line at WARN, so that it reaches the
+    default-verbosity callback the arm counts it through, and returns
+    `GGML_SYCL_LIFECYCLE_PLAN_REJECTED` (`ggml-sycl.h:1209`), the enum's one deterministic refusal,
+    appended after the transient `GGML_SYCL_LIFECYCLE_BUSY` (`:1201`) and not to be retried
+    (`:1203-1208`); the unwinding entry releases the token. Master's module guards end in `return
+    GGML_SYCL_LIFECYCLE_BUSY` with no log (`gs:18859`), so this guard is moua's own code, and a
+    guard that kept that `BUSY` return fails (c): that is step (c)'s RED. llama maps `PLAN_REJECTED`
+    to REFUSED and emits no second BUG line (§2.4.2). **Between bodies** the arm returns the module
+    to `ACTIVE` with `prepare_reactivate`, `commit_reactivate` and `finalize_reactivate`:
+    `rollback_reactivate` leaves `shutdown_started` and `g_sycl_shutting_down` true (`gs:109705`;
+    `unified-cache.cpp:19364-19366`), and `cancel_unload` would not reopen it. **Run (2), one strict
+    child per arm family, not per body:** the child sets `GGML_SYCL_STRICT_LEASES=1` in its own exec
+    environment, and it is a child because the switch is read once into a static (`:13002-13007`),
+    so the primary run's process cannot be re-armed. It runs the `commit_reactivate` case, scores
+    exit status 134 (SIGABRT) and exactly one `[CONTEXT-PLAN-BUG]` line, and so proves the abort
+    channel; the other bodies reach the same switch through the same guard, so they need no child of
+    their own. **RED, scored on "the call returned while the holder was parked":** the token deleted
+    from any of the three; the call returns with the holder still parked and the counter stays 0. No
+    publish interleave is scored beyond the one guard line: the blocking is the observable.
   - **Load B while A's context holds its rows (llama.cpp-r7fz; rulings §M7 I-4, §M32 I-1,
     §M38 I-2).** Model A's context holds claimed-then-vacated ring rows on device 0; model B
     loads on device 0. After B's load, A's rows (handles, sizes, depth) and A's model's weight
@@ -9556,10 +9581,15 @@ means that.
     each park point, without blocking, and answers COVERED each time; A's slot handles, its host
     reservations, its ring rows, and A's MMID workspaces are unchanged
     across the whole run, and A's next claims are in plan.
-  - **Shutdown takes L0 (rulings §M76.5).** Shutdown waits for a parked L0 holder, then runs. A
-    publishing entry that finds the module non-ACTIVE while it holds L0 (forced by a hook that
-    closes the module without shutdown's token) reports `[CONTEXT-PLAN-BUG]`, returns no `BUSY`, and
-    does not retry.
+  - **Shutdown takes L0 (rulings §M76.5).** Shutdown waits for a parked L0 holder, then runs. This
+    arm adds no hook of its own (7.14ai's "hook that closes the module without shutdown's token" was
+    defined nowhere, rulings §M109 N-6): it is the reactivation arm's park point, counter and
+    primary non-strict run, with `shutdown` as a fourth protected body. The module is `ACTIVE` while
+    the holder is parked, so the released holder's guard passes and it returns
+    `GGML_SYCL_LIFECYCLE_NULL_OUTPUT` (`gs:18860-18861`); the arm scores that `shutdown` has not
+    returned while the holder is parked (counter == 1) and returns after the release, with the same
+    RED, the token deleted from `shutdown`. A holder that does find the module non-ACTIVE is the
+    reactivation arm's `[CONTEXT-PLAN-BUG]` outcome (§2.4.2), which this arm does not repeat.
 
   **No other context's ring (rulings §M32 I-1; replaces r4 I6, r5 I-A, r6 I-5's arms).** 7.14e
   carried four skip-L0 routes to an absent device ring (RELEASING observed at step 2, a
@@ -9887,13 +9917,15 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
     matmul, so the function anchors the use on the reader's event. A marker use of a pool term is a
     pool draw of the term followed by the same two steps. **Under rulings §M93 and §M95:** the
     refusal is `admits()`, the one predicate W_old + W_pending + W_new <= the zone's realized window
-    from step 4 (at (b1) the predicate the lazy reserve uses), applied by the routing read and by
-    the acquire's backstop; a refused tensor takes the non-oneDNN PP path, with no pool fallback. G2
-    drives several fixture models (A, B, C, Z), so one model's W <= the window does not predict
-    admission. **The VOID guard, re-derived for the multi-model G2:** before each marker or
-    production use the arm reads `admits()` for the fixture's loaded set through the accessor, and a
-    use for which it is false is VOID, since the refused tensor never reaches the W steps; an arm
-    that expects a refusal scores it from the census count, never from the use. A fixture that
+    from step 4 (at (b1) the predicate the lazy reserve uses; 23mk's predicate, re-pinned per §M103
+    at the 23mk re-pin), applied by the routing read and by the acquire's backstop; a refused tensor
+    takes the non-oneDNN PP path, with no pool fallback. G2 drives several fixture models (A, B, C,
+    Z), so one model's W <= the window does not predict admission. **The VOID guard, re-derived for
+    the multi-model G2:** before each marker or production use the arm reads `admits()` for the
+    fixture's loaded set through 23mk's accessor `unified_cache_get_onednn_pp_window(int device)`
+    and its `admits()`, and a use for which it is false is VOID, since the refused tensor never
+    reaches the W steps; an arm that expects a refusal scores it from the census count, never from
+    the use. A fixture that
     drives the acquire states that no block is live or that `admits()` passes for its loaded set;
   - a **production use**: a fixture ggml graph of one `MUL_MAT`, with a Q4_0 `src0` whose pair
     demand is the fixture model's `onednn_pp_w` term and an F32 `src1` of 32 columns, above
@@ -11519,12 +11551,13 @@ I-A, §V16a).**
   on GPT-OSS 120B) and L4+L6 with (b1)'s sinks input reverted as its RED (rulings §M37 Q3, §M44 C-1,
   §M46 m-4; the end states). The oneDNN PP decline is 23mk's, not moua's (rulings §M86): a refusal
   from the one `admits()` predicate (W_old + W_pending + W_new <= the ONEDNN zone's realized window;
-  rulings §M93, §M95), which the routing read and the acquire's backstop apply, with a
-  reporting-only plan census, and 23mk deletes the context-latched `onednn_pp_declined` flag. So
-  moua L4 carries no census, gate clause or deletion-list entry for it, and the cite lines are left
-  to the final re-pin. The ensure withdraws nothing and mutates no planned getter, so P's
-  source is unchanged. The SCRATCH floor is not L4+L6's: it goes in the commit that converts the
-  last untermed SCRATCH census row, whoever owns it (the end states).
+  rulings §M93, §M95; 23mk's predicate, re-pinned per §M103 at the 23mk re-pin), which the routing
+  read and the acquire's backstop apply, with a reporting-only plan census, and 23mk deletes the
+  context-latched `onednn_pp_declined` flag. So moua L4 carries no census, gate clause or
+  deletion-list entry for it, and the cite lines are left to the final re-pin. The ensure withdraws
+  nothing and mutates no planned getter, so P's source is unchanged. The SCRATCH floor is not
+  L4+L6's: it goes in the commit that converts the last untermed SCRATCH census row, whoever owns it
+  (the end states).
 - **L4+L6, the oneDNN scratchpad (rulings §M31, §M32 I-5, §V16 I-A, §M35):** the load's
   descriptor table over every family under its gate; the per-context queue set, frozen at the
   transaction; `assert_scratchpad_planned(stream)` in place of `pre_allocate_scratchpad`'s
@@ -14549,3 +14582,23 @@ scoring with two runs.
 | §M101 (3) | the line's position relative to the call | **Question, answered by §M106 (row (4)).** §M101 says the line is "emitted after the protected call returned". The guard runs under the holder's token, so it is emitted while the blocked entry has not returned, and under strict the call never returns. The arm states that order, and the post-release slot readings are not scored (the abort precedes them). The line still proves the holder ran after the transition. |
 | §6.51 M-1 | the row recorded the named non-BUG refusal | **Marked superseded** by this section. |
 | §M106 (4) | §M101's "emitted after the protected call returned" was wrong: the guard runs under the holder's token while the call is blocked on L0, so the line comes before the call returns | **Changed.** The H9 arm is two runs. (1) Primary, in-process, non-strict, per protected body, scored in order: counter == 1; exactly one `[CONTEXT-PLAN-BUG]` line while the call has not returned; the holder returns its failure and releases L0; the call returns; the post-release slot readings (slot [0] `COMMITTED_CLOSED` for `commit_reactivate`, the previous state for `rollback_reactivate`, `COMPLETE_CLOSED` and slot [7] = 1 for `complete_unload`). The non-strict path logs the line at WARN and returns the entry's non-`BUSY` failure (`ggml_sycl_strict_enabled()` false, `unified-cache.cpp:13001-13011`). (2) One strict child per arm family under `GGML_SYCL_STRICT_LEASES=1`, scoring exit 134 and exactly one line; a child because the switch is a once-read static. The post-release readings dropped in 7.14aj are scored again, by run (1). |
+
+### 6.53 Revision 7.14al: design-moua-r41
+
+Revision 7.14al is one commit on top of `7461d67c5`, by impl-moua-s. It answers design review r41
+(design-moua-r41 on `1c9edf1cb..7461d67c5`: 0 Critical, 0 Important, 3 Minor, 7 nits; P1-P4 pass;
+every r40 finding closed) and rulings §M109. The 23mk cites stay at `87da879f1`; the re-pin follows
+23mk's review.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| M-1 | the arm's non-strict return was "the entry's non-`BUSY` failure", and the holder entry was unnamed, so step (c) could not be scored | **Changed.** The backend guard is the single `[CONTEXT-PLAN-BUG]` emission site for "L0 held, module non-ACTIVE": WARN, an abort under strict, return `GGML_SYCL_LIFECYCLE_PLAN_REJECTED` (`ggml-sycl.h:1209`), never `BUSY` (`:1201`). The holder is `ggml_backend_sycl_set_runtime_context_for_model` with a null backend (guard first statement, `gs:18858-18859`). Step (c) is `== PLAN_REJECTED && != BUSY`; its RED is a guard that keeps master's `BUSY`. llama maps `PLAN_REJECTED` to REFUSED and emits no second BUG line (§2.4.2); zhcn mirrors at its re-pin. |
+| M-2 | the "exported" definition cited `gs:110115-110140`, only the unload block | **Changed.** The whole table, `gs:110050-110379`; the gate scans all of it. |
+| M-3 | the primary non-strict run did not state its precondition on the once-read switch | **Changed.** It `unsetenv()`s `GGML_SYCL_STRICT_LEASES` before any backend call and asserts `!ggml_sycl_strict_enabled()` first (VOID otherwise); the strict child sets the variable in its own exec environment. |
+| N-1 | G2's VOID guard named no accessor | **Changed.** 23mk's `unified_cache_get_onednn_pp_window(int device)` and its `admits()`. |
+| N-2 | the `admits()` formula read as final at G2 and L4 | **Changed.** Both carry "23mk's predicate, re-pinned per §M103 at the 23mk re-pin"; §M103 is not restated. |
+| N-3 | ragged lines at the capped-cell and `-c 4096 -ub 512` sentences | **Changed.** Reflowed. |
+| N-4 | a vestigial stderr-marker sentence in the arm | **Changed.** Deleted; run (1) reads the slots in-process. |
+| N-5 | unpinned values: rollback's previous state, `complete_unload`'s pre-release slots, the setup parenthetical, the strict child's body, chaining, the callback's snapshot | **Changed.** Rollback ends `RETRY_CLOSED` with slots [6]/[7] 0/1 (pre-release 0/0); `complete_unload` is `RETRY_CLOSED`/0 before and `COMPLETE_CLOSED`/1 after, and its setup is `can_unload` only; the strict child runs `commit_reactivate`; the arm resets with prepare, commit and finalize between bodies (rollback leaves `shutdown_started` and `g_sycl_shutting_down` true); the callback snapshots `returned` when the BUG line is logged. |
+| N-6 | the "Shutdown takes L0" arm relied on an undefined hook and named neither run | **Changed.** No hook: `shutdown` is a fourth protected body of the reactivation arm's primary non-strict run, with the same RED. |
+| N-7 | `G_raw` and `P_raw` were both attributed to the with-floor getter | **Changed.** `P_raw` is the stored getter (`uc:2148-2153`); `G_raw` is the floor the with-floor getter adds (`uc:2155-2169`). |
