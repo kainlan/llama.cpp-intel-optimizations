@@ -2630,10 +2630,10 @@ IO pool registry of §3.3 is a different object):
   wrapper maps with: T1 defines it and the wrapper maps with it, and T2 owns the
   assertion, under the test hook, that the wrapper's mapped size equals
   `charged_bytes` (T2 owns the field and the hook table, and T1 lands first; r52
-  M-9). **The charge is a plain field with an exactly-one-handler rule** (r51 I-1;
-  the registry copies the record, so the charge is a plain copyable field). The
-  owner entry holds the charge in a local token, a `size_t charged_bytes` and a
-  `taken` flag, and hands it to `unified_alloc` through the thread-local
+  M-9). **The charge is a plain field with an exactly-one-handler rule** (r51
+  I-1; the registry copies the record, so the charge is a plain copyable field).
+  The owner entry holds the charge in a local token, a `size_t charged_bytes`
+  and a `taken` flag, and hands it to `unified_alloc` through the thread-local
   `g_allocating_charge`. Every `adapter_scope` (`uc:16155-16167`), which runs
   for every owner entry, a nested one included, saves the thread-local, sets it
   (to the token for a charging request, to null for any other) and restores it,
