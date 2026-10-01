@@ -142,8 +142,10 @@ def evaluate(backend, common):
         re.search(r"all_staged\s*=\s*false", prestage) is not None and "return all_staged" in prestage
     results["the decline names itself at WARN"] = "GGML_LOG_WARN" in decline and "not recording" in decline
     results["the decline returns false on failure"] = "return false" in decline
+    memo = re.search(r"static thread_local struct\s*\{[^}]*\}\s*g_graph_prestage_declined\s*;", backend)
     results["a declined graph is remembered, so the pass is not repeated per token"] = \
-        "thread_local" in decline + declined and "graph_hash" in decline
+        memo is not None and "g_graph_prestage_declined.hash = graph_hash" in decline and \
+        "g_graph_prestage_declined.hash == graph_hash" in declined
     sites = [m.start() for m in re.finditer(r"model_sycl_graph\.begin_recording\(", compute)]
     results["both full-graph recording sites exist"] = len(sites) == 2
     ok_sites = True
@@ -153,10 +155,12 @@ def evaluate(backend, common):
         if call < 0:
             ok_sites = False
             continue
-        between = before[call:]
+        between = before[call - 20:]
         # the decline must leave the function (direct path) before recording begins, and no void pre-stage
         # may sit between the check and the recording.
-        if "return GGML_STATUS_SUCCESS" not in between or "compute_impl_unlocked()" not in between:
+        if re.match(r"\s*if\s*\(\s*!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\s*\)\s*\{\s*"
+                    r"compute_impl_unlocked\(\);\s*record_completion\(false\);\s*return GGML_STATUS_SUCCESS;",
+                    between[between.find("if"):]) is None:
             ok_sites = False
         if "graph_prestage_leaf_tensors(" in between:
             ok_sites = False
@@ -169,7 +173,7 @@ def evaluate(backend, common):
     results["the observation can say whether anything was observed"] = "observed_any" in obs
     results["the observation remembers the blocking kernel's name"] = \
         "last_other_kernel" in obs and re.search(r"last_other_kernel\s*=\s*kernel", obs) is not None
-    log_at = compute.find("keeping attention nodes out of SYCL command graphs")
+    log_at = compute.find("keeping attention nodes out of SYCL command")
     guard_at = compute.rfind("observed_any()", 0, log_at) if log_at >= 0 else -1
     results["no block is claimed before a decode FA was observed"] = 0 <= guard_at < log_at
     results["the block line names the kernel"] = log_at >= 0 and "last_other=" in compute[log_at - 600:log_at + 1200]
@@ -229,8 +233,11 @@ if args.self_test:
         ("decline is silent", "the decline names itself at WARN",
          (mutate_in_func(backend, dec_sig, "GGML_LOG_WARN", "GGML_SYCL_DEBUG"), common)),
         ("decline not remembered", "a declined graph is remembered, so the pass is not repeated per token",
-         (mutate(mutate_in_func(backend, dec_sig, "thread_local", "static"),
-                 "static bool graph_prestage_declined", "static bool graph_prestage_declined"), common)),
+         (mutate_in_func(backend, dec_sig, "g_graph_prestage_declined.hash = graph_hash",
+                         "(void) graph_hash"), common)),
+        ("memo made process-wide", "a declined graph is remembered, so the pass is not repeated per token",
+         (mutate(backend, "static thread_local struct {\n    const ggml_backend_sycl_context * ctx",
+                 "static struct {\n    const ggml_backend_sycl_context * ctx"), common)),
         ("recording site loses its decline", "every full-graph recording is preceded by a pre-stage that can decline it",
          (mutate_in_func(backend, cmp_sig, "graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)",
                          "graph_prestage_leaf_tensors(sycl_ctx, cgraph)"), common)),

@@ -7320,6 +7320,9 @@ struct ggml_backend_sycl_context {
         uint64_t esimd_partitioned_count = 0;
         uint64_t d512_tile_count         = 0;
         uint64_t other_kernel_count      = 0;
+        // Name of the most recent kernel that landed in OTHER (a string literal from the dispatcher), so the
+        // graph gate's "attention kept out" line can name what is blocking engagement.
+        const char * last_other_kernel   = nullptr;
 
         static kernel_family classify(const char * kernel) {
             if (std::strcmp(kernel, "esimd_f16") == 0) {
@@ -7344,9 +7347,14 @@ struct ggml_backend_sycl_context {
                     break;
                 case kernel_family::OTHER:
                     other_kernel_count++;
+                    last_other_kernel = kernel;
                     break;
             }
         }
+
+        // False until the first decode-shape FA dispatch: before that every count is zero, which says nothing
+        // about which kernel will run.
+        bool observed_any() const { return (esimd_partitioned_count + d512_tile_count + other_kernel_count) > 0; }
 
         // True once at least one decode-shape FA dispatch has been observed
         // and every one of them reached a kernel in the verified-safe
