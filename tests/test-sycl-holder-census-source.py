@@ -409,11 +409,14 @@ def violations(files):
 
 
 def edit(files, path, old, new, label, count=1):
+    """Replace `old` by `new` in one file.  The anchor is matched token by token with any whitespace (or none)
+    between tokens, so a clang-format realignment or rewrap does not strand it."""
+    pattern = r"\s*".join(re.escape(tok) for tok in re.findall(r"\w+|[^\w\s]", old))
     text = files[path]
-    if text.count(old) < 1:
+    if not re.search(pattern, text):
         raise SystemExit("gate 27: mutant %r: anchor not found in %s: %r" % (label, path, old[:80]))
     out = dict(files)
-    out[path] = text.replace(old, new, count)
+    out[path] = re.sub(pattern, lambda m: new, text, count=count)
     return out
 
 
