@@ -56,6 +56,21 @@ class PinnedBufferPool {
     // how a dispatch avoids overwriting a buffer an earlier scatter's H2D may still
     // be reading, without any host wait (llama.cpp-4hg7).  Requires can_serve(n).
     // Main thread only (one MUL_MAT_ID at a time), like g_pending_scatter.
+    //
+    // WHEN A WRAPPED SPAN MAY ALIAS AN EARLIER ONE.  A span handed out after a wrap can overlap
+    // a region that an earlier MUL_MAT_ID's scatter H2D has enqueued but not yet executed.  That
+    // is safe only because of two facts the CALLER must keep true:
+    //   (1) the earlier op's scatter was flushed -- its H2D enqueued on the in-order compute
+    //       queue -- BEFORE this op's activation D2H was enqueued (the hybrid MUL_MAT_ID flushes
+    //       a consumed or finished scatter at op entry, ahead of that D2H); and
+    //   (2) the caller does not write the region (zero it, or let CPU kernels fill it) until
+    //       that activation D2H has completed.  Completion of an event on an in-order queue
+    //       implies every earlier command, including the H2D, has completed.
+    // Within ONE op the hot and cold groups never alias: they are slices of one reservation,
+    // and the split is taken only when the pool can hold the whole span.  A scatter left
+    // pending (not flushed) across ops is outside this argument -- its out region is still
+    // awaiting the CPU, not the queue, and nothing here protects it (see the g_pending_scatter
+    // overwrite gap noted on llama.cpp-4hg7).
     size_t reserve(size_t n_experts);
 
     // Whether acquire(n_experts) would be served. The pool's capacity is fixed

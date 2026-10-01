@@ -75885,7 +75885,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                 // The output region is zeroed further down, after the activation wait: it
                 // may still be the source of an earlier scatter's H2D, and only a completed
-                // activation D2H on the same in-order queue proves that copy has run.
+                // activation D2H on the same in-order queue proves that copy has run.  That
+                // proof needs the earlier scatter's H2D to have been ENQUEUED before this
+                // op's activation D2H: the consumed/try flushes at op entry run first.  See
+                // PinnedBufferPool::reserve for the wrap-around condition.
                 const bool zero_out_after_act_wait = from_pool || !out_owner.valid();
 
                 ggml_sycl_tensor_storage_handle src1_storage{};
