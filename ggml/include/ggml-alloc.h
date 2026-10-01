@@ -84,6 +84,10 @@ GGML_API int ggml_gallocr_get_chunk_peaks(
     int max,
     size_t * max_chunk_size_out);
 
+// the largest number of chunks one buffer's allocator opens: a layout that reaches chunk index
+// ggml_gallocr_max_chunks() - 1 has an unbounded final chunk and no capacity a planner can name
+GGML_API int ggml_gallocr_max_chunks(void);
+
 // automatic reallocation if the topology changes when using a single buffer
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);

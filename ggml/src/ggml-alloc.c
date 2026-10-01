@@ -989,6 +989,10 @@ int ggml_gallocr_get_chunk_peaks(ggml_gallocr_t galloc, int buffer_id, size_t * 
     return talloc->n_chunks;
 }
 
+int ggml_gallocr_max_chunks(void) {
+    return GGML_VBUFFER_MAX_CHUNKS;
+}
+
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
 }

@@ -11,6 +11,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-measure-plan.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -464,6 +465,75 @@ static const char * sycl_recheck_lifecycle_result_name(ggml_sycl_lifecycle_resul
     }
 }
 #endif
+
+// The backend's plan-scope entry points. A SYCL DSO that does not export them leaves
+// every proc null; a planned context cannot exist without them, because the copy that
+// owns the scopes is acquired through the same table.
+struct llama_context_sycl_plan_procs {
+    decltype(&ggml_backend_sycl_plan_scope_open)    scope_open    = nullptr;
+    decltype(&ggml_backend_sycl_plan_scope_failure) scope_failure = nullptr;
+    decltype(&ggml_backend_sycl_plan_scope_close)   scope_close   = nullptr;
+};
+
+static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std::vector<ggml_backend_ptr> & backends) {
+    llama_context_sycl_plan_procs procs;
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (!llama_context_dev_is_sycl(dev)) {
+            continue;
+        }
+#ifdef GGML_USE_SYCL
+        procs.scope_open    = &ggml_backend_sycl_plan_scope_open;
+        procs.scope_failure = &ggml_backend_sycl_plan_scope_failure;
+        procs.scope_close   = &ggml_backend_sycl_plan_scope_close;
+#elif defined(GGML_BACKEND_DL)
+        procs.scope_open = reinterpret_cast<decltype(procs.scope_open)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_scope_open"));
+        procs.scope_failure = reinterpret_cast<decltype(procs.scope_failure)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_scope_failure"));
+        procs.scope_close = reinterpret_cast<decltype(procs.scope_close)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_scope_close"));
+#endif
+        break;
+    }
+    return procs;
+}
+
+// A plan scope open on the calling thread for one MEASURE or ALLOC of one context,
+// closed when it leaves scope. While it is open the compute bufts' get_max_size answer
+// from the context's chunk-cap copy. It opens only for a context that owns that copy
+// (`caps` non-null): for any other it stays closed, and the caller does not ask.
+struct llama_plan_scope {
+    llama_plan_scope(const llama_context_sycl_plan_procs & procs,
+                     uint32_t                              context_id,
+                     enum ggml_sycl_plan_scope_mode        mode,
+                     ggml_backend_sycl_plan_caps_t         caps) :
+        failure_fn(procs.scope_failure),
+        close_fn(procs.scope_close) {
+        if (caps != nullptr && procs.scope_open != nullptr && close_fn != nullptr) {
+            scope = procs.scope_open(context_id, mode, caps);
+        }
+    }
+
+    ~llama_plan_scope() {
+        if (scope != nullptr) {
+            close_fn(scope);
+        }
+    }
+
+    llama_plan_scope(const llama_plan_scope &)             = delete;
+    llama_plan_scope & operator=(const llama_plan_scope &) = delete;
+
+    bool is_open() const { return scope != nullptr; }
+
+    // The first failed read in the scope (a cap the copy could not answer), or null.
+    const char * failure() const { return scope != nullptr && failure_fn != nullptr ? failure_fn(scope) : nullptr; }
+
+  private:
+    decltype(&ggml_backend_sycl_plan_scope_failure) failure_fn = nullptr;
+    decltype(&ggml_backend_sycl_plan_scope_close)   close_fn   = nullptr;
+    void *                                          scope      = nullptr;
+};
 
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
@@ -1360,7 +1430,10 @@ void llama_context::resolve_fused_ops(sched_reserve_state &          state,
         // not a mid-prefill abort. Narrow re-check only: n_ctx/n_ubatch
         // have not changed, only flash_attn_enabled has, so this does not
         // need the full runtime-context transaction.
-        sycl_recheck_runtime_context_flash_attn();
+        // A MEASURE publishes nothing, so there is nothing for the re-check to check.
+        if (state.measure == nullptr) {
+            sycl_recheck_runtime_context_flash_attn();
+        }
     }
 
     if (state.cparams.auto_fgdn) {
@@ -2093,8 +2166,9 @@ bool llama_context::sched_reserve_nothrow() {
 }
 
 sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state) {
-    // MEASURE lands with the measure function; until then every caller is ALLOC.
-    GGML_ASSERT(mode == sched_reserve_mode::ALLOC);
+    if (mode == sched_reserve_mode::MEASURE) {
+        return sched_measure_impl(state);
+    }
 
     LLAMA_LOG_INFO("%s: reserving ...\n", "sched_reserve");
 
@@ -2114,6 +2188,15 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
     }
     state.gf_res_reserve.reset(new llm_graph_result(max_nodes));
     state.gf_res_prev_active = nullptr;
+
+    // The scheduler is created inside the scope, so its allocator reads the context's frozen
+    // chunk caps. Only a context that owns the copy opens one.
+    const llama_context_sycl_plan_procs plan_procs = llama_context_sycl_plan_procs_for(backends);
+    llama_plan_scope plan_scope(plan_procs, (uint32_t) sycl_exec_context.value, GGML_SYCL_PLAN_SCOPE_ALLOC,
+                                plan_caps.get());
+    if (plan_caps && !plan_scope.is_open()) {
+        return { sched_reserve_status::FAILED, "the ALLOC plan scope did not open" };
+    }
 
     state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
                                              state.cparams.pipeline_parallel, state.cparams.op_offload));
@@ -2157,6 +2240,10 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
                                   model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (state.cparams.pipeline_parallel) {
+                // A planned context never has pipeline parallelism (the constructor turns it
+                // off under a plan), so this retry cannot rebuild a scheduler the scope has
+                // already handed its caps to.
+                GGML_ASSERT(!plan_caps);
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n",
                                "sched_reserve");
                 state.cparams.pipeline_parallel = false;
@@ -2243,6 +2330,153 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n", "sched_reserve", (t_end_us - t_start_us) / 1000.0,
                    ggml_backend_sched_get_n_copies(state.sched.get()));
+
+    // A cap the copy could not answer during this reserve leaves chunks the plan did not size.
+    if (const char * failure = plan_scope.failure()) {
+        return { sched_reserve_status::REFUSED, failure };
+    }
+
+    return { sched_reserve_status::OK, "" };
+}
+
+sched_reserve_result llama_context::sched_measure_impl(sched_reserve_state & state) {
+    GGML_ASSERT(state.measure != nullptr);
+    GGML_ASSERT(!state.cparams.pipeline_parallel);
+
+    if (!plan_caps) {
+        return { sched_reserve_status::FAILED, "a measure needs the context's chunk-cap copy" };
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+
+    // The scheduler below is created inside the scope, so its allocator reads the frozen caps.
+    const llama_context_sycl_plan_procs plan_procs = llama_context_sycl_plan_procs_for(backends);
+    llama_plan_scope plan_scope(plan_procs, (uint32_t) sycl_exec_context.value, GGML_SYCL_PLAN_SCOPE_MEASURE,
+                                plan_caps.get());
+    if (!plan_scope.is_open()) {
+        return { sched_reserve_status::FAILED, "the MEASURE plan scope did not open" };
+    }
+
+    const uint32_t n_seqs   = state.cparams.n_seq_max;
+    const uint32_t n_tokens = std::min(state.cparams.n_ctx, state.cparams.n_ubatch);
+
+    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+
+    state.gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    state.gf_res_prev_active = nullptr;
+
+    state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
+                                             false, state.cparams.op_offload));
+#ifdef GGML_USE_SYCL
+    llama_context_sycl_attach_sched_plan(state.sched.get(), backends);
+#endif
+
+    llama_memory_context_ptr mctx;
+    if (memory) {
+        mctx = memory->init_full();
+        if (!mctx) {
+            return { sched_reserve_status::FAILED, "failed to initialize memory module" };
+        }
+    }
+
+    resolve_fused_ops(state, mctx.get(), n_seqs);
+
+    llama_measure_set_params params;
+    params.n_tokens            = n_tokens;
+    params.n_seq_max           = n_seqs;
+    params.n_outputs_max       = state.cparams.n_outputs_max;
+    params.kv_unified          = state.cparams.kv_unified;
+    params.n_layer_nextn       = model.hparams.n_layer_nextn;
+    params.warmup              = state.cparams.warmup;
+    params.pp_again_single_seq = model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01;
+
+    const std::vector<llama_measure_graph> graphs = llama_measure_graph_set(params);
+
+    const int           max_chunks = ggml_gallocr_max_chunks();
+    std::vector<size_t> sizes(backend_ptrs.size(), 0);
+    std::vector<size_t> peak(max_chunks, 0);
+
+    sched_measure_plan & plan = *state.measure;
+    plan.graphs.clear();
+    plan.bufts.clear();
+
+    for (size_t gi = 0; gi < graphs.size(); ++gi) {
+        const llama_measure_graph & g = graphs[gi];
+
+        state.cparams.embeddings = g.embeddings;
+        state.cparams.warmup     = g.warmup;
+        if (model.hparams.n_layer_nextn > 0) {
+            state.cparams.embeddings_nextn        = g.nextn;
+            state.cparams.embeddings_nextn_masked = g.nextn_masked;
+            state.cparams.nextn_layer_offset      = g.nextn_offset;
+        }
+
+        // A stream graph is built on a memory context that spans exactly its streams.
+        llama_memory_context_ptr       stream_mctx;
+        const llama_memory_context_i * graph_mctx = mctx.get();
+        if (g.n_streams != 0 && memory) {
+            stream_mctx = memory->init_reserve(g.n_streams);
+            if (!stream_mctx) {
+                return { sched_reserve_status::FAILED,
+                         format("failed to initialize the %u-stream reserve memory", g.n_streams) };
+            }
+            graph_mctx = stream_mctx.get();
+        }
+
+        auto * gf = graph_reserve(state, g.n_tokens, g.n_seqs, g.n_outputs, graph_mctx, true, sizes.data());
+        if (!gf) {
+            return { sched_reserve_status::FAILED, format("failed to measure graph %zu of %zu", gi, graphs.size()) };
+        }
+
+        // Two backends of one buffer type share an allocator and report the same layout, so
+        // each buffer type is read once per graph.
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            sched_measure_buft * entry = nullptr;
+            for (auto & e : plan.bufts) {
+                if (e.buft == backend_buft[i]) {
+                    entry = &e;
+                    break;
+                }
+            }
+            if (entry == nullptr) {
+                plan.bufts.emplace_back();
+                entry       = &plan.bufts.back();
+                entry->buft = backend_buft[i];
+            }
+            if (entry->peaks.size() > gi) {
+                continue;
+            }
+
+            size_t    max_chunk_size = 0;
+            const int n_chunks       = ggml_backend_sched_get_reserved_chunk_peaks(state.sched.get(), backend_ptrs[i],
+                                                                                   peak.data(), max_chunks, &max_chunk_size);
+            if (gi > 0 && max_chunk_size != entry->max_chunk_size) {
+                return { sched_reserve_status::FAILED, format("the chunk size of %s changed between measured graphs",
+                                                              ggml_backend_buft_name(entry->buft)) };
+            }
+            entry->max_chunk_size = max_chunk_size;
+            entry->peaks.emplace_back(peak.begin(), peak.begin() + std::max(0, std::min(n_chunks, max_chunks)));
+        }
+    }
+
+    // A cap the copy could not answer during this measure leaves peaks nobody sized.
+    if (const char * failure = plan_scope.failure()) {
+        return { sched_reserve_status::REFUSED, failure };
+    }
+
+    for (auto & entry : plan.bufts) {
+        std::string reason;
+        if (!llama_measure_chunk_plan(entry.peaks, entry.max_chunk_size, (size_t) max_chunks, entry.cap, reason)) {
+            return { sched_reserve_status::REFUSED,
+                     format("%s (compute buffer type %s)", reason.c_str(), ggml_backend_buft_name(entry.buft)) };
+        }
+    }
+
+    plan.graphs     = graphs;
+    plan.n_measured = (uint32_t) graphs.size();
+    plan.measure_ms = (ggml_time_us() - t_start_us) / 1000.0;
+
+    LLAMA_LOG_DEBUG("%s: measured %u graphs in %.2f ms\n", __func__, plan.n_measured, plan.measure_ms);
 
     return { sched_reserve_status::OK, "" };
 }
@@ -5024,6 +5258,12 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
 }
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
+    if (plan_caps) {
+        GGML_ABORT(
+            "training is not supported while a SYCL placement plan is active: ggml-opt would reallocate this "
+            "context's planned scheduler outside its claim scope; llama.cpp-q64b");
+    }
+
     GGML_ASSERT(!opt_ctx);
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
     const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);

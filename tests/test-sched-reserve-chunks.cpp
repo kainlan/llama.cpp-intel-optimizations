@@ -7,6 +7,7 @@
 // the buffer type for, at chunk index c, must fit cap[c]. Release builds define
 // NDEBUG, so every check here is explicit and always runs.
 
+#include "../src/llama-measure-plan.h"
 #include "dummy-sched-backend.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define CHECK(cond, msg)                                                        \
@@ -111,6 +113,9 @@ static bool requests_fit(const std::vector<size_t> & requests, const std::vector
 }
 
 int main() {
+    // The planner's bound on the chunk count is the allocator's own, not a second copy.
+    CHECK(ggml_gallocr_max_chunks() == MAX_CHUNKS, "the allocator reports the chunk bound the planner uses");
+
     // ---- one buffer type, max chunk size 64: pp, then a tg that grows chunk 1 only, then pp ----
     {
         auto be = dummy_sched_backend::make(/*max_buffer_size=*/64);
@@ -176,6 +181,20 @@ int main() {
         const std::vector<size_t> cap = caps_of(measured);
         CHECK(cap.size() == 2 && cap[0] == 64 && cap[1] == measured[1].peaks[1],
               "case 1: cap[0] is the max chunk size, cap[1] is the last chunk's high-water mark");
+
+        // The llama helper plans exactly these caps from the same layouts.
+        {
+            std::vector<std::vector<size_t>> by_graph;
+            for (const layout & l : measured) {
+                by_graph.push_back(l.peaks);
+            }
+            std::vector<size_t> plan;
+            std::string         reason;
+            CHECK(llama_measure_chunk_plan(by_graph, measured[0].max_chunk_size, (size_t) ggml_gallocr_max_chunks(),
+                                           plan, reason),
+                  "case 1: the llama chunk plan must succeed on the measured layouts");
+            CHECK(plan == cap, "case 1: the llama chunk plan equals the caps the layouts imply");
+        }
 
         // Control: a per-chunk cap derived from the totals alone (total - M for the
         // spill chunk) would have refused tg's chunk-1 request. The query is needed.
@@ -250,6 +269,15 @@ int main() {
             } else {
                 CHECK(cap[c] == l.max_chunk_size, "case 2: a non-oversize chunk below the last has the max chunk size");
             }
+        }
+
+        {
+            std::vector<size_t> plan;
+            std::string         reason;
+            CHECK(llama_measure_chunk_plan({ l.peaks }, l.max_chunk_size, (size_t) ggml_gallocr_max_chunks(), plan,
+                                           reason) &&
+                      plan == cap,
+                  "case 2: the llama chunk plan equals the caps the oversize layout implies");
         }
 
         be->requests.clear();

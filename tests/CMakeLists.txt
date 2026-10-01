@@ -3694,6 +3694,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# zhcn C7f: the MEASURE reserve and the plan scopes (design gates 6, 19 and 25,
+# as far as the llama side can satisfy them before the fixpoint acquires the
+# chunk-cap copy). sched_measure_impl touches only its state, opens a MEASURE
+# scope before its scheduler, plans the chunks through the pure helper; the
+# ALLOC reserve opens its own scope; training aborts under a copy.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-measure-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-measure-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # zhcn C7d: the runtime-context publish returns a status and never waits
 # (design gate 22b, and the publish clauses of gate 37). No BUSY retry loop or
 # sleep_for in llama-context.cpp, the shared BUSY-retry constant gone from

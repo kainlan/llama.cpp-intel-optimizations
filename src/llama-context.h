@@ -8,11 +8,13 @@
 #include "llama-ext.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-measure-plan.h"
 #include "llama-memory.h"
 #include "llama.h"
 
 #include <array>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -52,14 +54,32 @@ struct sched_reserve_result {
 
 // MEASURE sizes the worst-case graphs without touching the context's own
 // scheduler, graph results, n_outputs or cparams; ALLOC is the reserve the
-// context runs on. Only ALLOC exists so far.
+// context runs on.
 enum class sched_reserve_mode { MEASURE, ALLOC };
+
+// What a MEASURE leaves for the caller: the graphs it reserved, and for each
+// compute buffer type the chunk layout every graph left in the scheduler and
+// the slot caps llama_measure_chunk_plan derives from them.
+struct sched_measure_buft {
+    ggml_backend_buffer_type_t       buft           = nullptr;
+    size_t                           max_chunk_size = 0;
+    std::vector<std::vector<size_t>> peaks;  // [graph][chunk]
+    std::vector<size_t>              cap;    // [chunk]
+};
+
+struct sched_measure_plan {
+    std::vector<llama_measure_graph> graphs;
+    std::vector<sched_measure_buft>  bufts;
+    uint32_t                         n_measured = 0;
+    double                           measure_ms = 0.0;
+};
 
 // Everything a reserve reads and writes about the scheduler it reserves on:
 // the scheduler, the two arenas of previous graph results, the reserve-time
 // n_outputs and n_input_tensors, and the cparams the graphs are built with.
 // ALLOC passes the context's own members (llama_context::member_reserve_state),
-// so its behaviour is unchanged; a MEASURE passes storage of its own.
+// so its behaviour is unchanged; a MEASURE passes storage of its own
+// (sched_measure_storage) and sets `measure`, which ALLOC leaves null.
 struct sched_reserve_state {
     ggml_backend_sched_ptr &              sched;
     std::array<llm_graph_result_ptr, 2> & gf_res_prev;
@@ -68,7 +88,41 @@ struct sched_reserve_state {
     uint32_t &                            n_outputs;
     uint32_t &                            n_input_tensors;
     llama_cparams &                       cparams;
+    sched_measure_plan *                  measure = nullptr;
 };
+
+// The storage a MEASURE reserves on. The scheduler is declared first so it is
+// destroyed last, as it is in the context.
+struct sched_measure_storage {
+    ggml_backend_sched_ptr              sched;
+    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    llm_graph_result_ptr                gf_res_reserve;
+    llm_graph_result *                  gf_res_prev_active = nullptr;
+    uint32_t                            n_outputs          = 0;
+    uint32_t                            n_input_tensors    = 0;
+    llama_cparams                       cparams;
+    sched_measure_plan                  plan;
+
+    explicit sched_measure_storage(const llama_cparams & cparams_in) : cparams(cparams_in) {}
+
+    sched_reserve_state state() {
+        return { sched, gf_res_prev, gf_res_reserve, gf_res_prev_active, n_outputs, n_input_tensors, cparams, &plan };
+    }
+};
+
+// The deleter of the context's chunk-cap copy: it holds the backend's _free, looked up
+// when the copy was acquired, so a copy is released by the entry point that made it.
+struct llama_plan_caps_deleter {
+    decltype(&ggml_backend_sycl_plan_caps_free) free_fn = nullptr;
+
+    void operator()(ggml_backend_sycl_plan_caps * caps) const {
+        if (caps != nullptr && free_fn != nullptr) {
+            free_fn(caps);
+        }
+    }
+};
+
+using llama_plan_caps_ptr = std::unique_ptr<ggml_backend_sycl_plan_caps, llama_plan_caps_deleter>;
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -90,6 +144,12 @@ struct llama_context {
     // a status instead of throwing for a refusal; sched_reserve() turns a
     // non-OK status back into the exception its callers expect.
     sched_reserve_result sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state);
+
+    // MEASURE: reserve every graph the context can reach (llama_measure_graph_set) on a
+    // scheduler of its own, inside a MEASURE plan scope, and plan each compute buft's chunks
+    // from what they left. `state` is a sched_measure_storage's; nothing of the context's own
+    // is written. Only a context that owns plan_caps measures.
+    sched_reserve_result sched_measure_impl(sched_reserve_state & state);
 
     // sched_reserve() for decode and encode, which catch nothing above them:
     // a non-OK status or a throw from the reserve is logged and returned as
@@ -465,6 +525,9 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // The chunk-cap copy of a planned context. Plan scopes open only where it exists.
+    llama_plan_caps_ptr plan_caps;
 
     bool sched_need_reserve = true;
 
