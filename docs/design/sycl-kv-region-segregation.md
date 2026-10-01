@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14z, by impl-moua-s, 2026-09-30. The revisions answer thirty-four reviews:
+Design, revision 7.14aa, by impl-moua-s, 2026-09-30. The revisions answer thirty-five reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -195,6 +195,11 @@ Design, revision 7.14z, by impl-moua-s, 2026-09-30. The revisions answer thirty-
   keyed by selector and is VOID when empty, the finalize's record move has a pinned form with
   witnesses, a closing check reads the node half after the re-pin, and the 23mk re-pin to
   `3bd662261` (rulings §M79 (b), §M78): the routed call's out-parameter and the `txn` pairing.
+- design review r34 (design-moua-r34 on `d7cf431f4..bd3d7f7d4`: 0 Critical, 2 Important, 6
+  Minor, 2 nits), recorded in §6.43. Revision 7.14aa is one commit on top of `bd3d7f7d4`: the
+  (b1) replay's capacity is 23mk's Graph block G (rulings §M79 (a)), the G0 `job_timeout_ms`
+  sentence is restored, K is one named constant, the dedupe clause has a pinned form and a named
+  constant, and the measurement's checks and evidence record are tightened.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -2654,7 +2659,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    C2b's ladder, whose top rung is 2048 at the default `n_batch`, and a
                    **provisional** node bound, the command-graph node count of the synthetic
                    recording F3's cells replay (G0 is model-less and has no production
-                   recording, §3.2; r31 m-1). The W-order commit compiles both in, with K, as
+                   recording, §3.2; r31 m-1). The W-order commit compiles both in, with K (one constant for both cards,
+                   `GGML_SYCL_W_ORDER_CHAIN_K`), as
                    `GGML_SYCL_W_ORDER_BOUND_N_UBATCH` and `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES`
                    (r30 m-4), and the node constant is provisional until a follow-up commit
                    re-pins it from a lead-run measurement of the production recordings' meta
@@ -2678,8 +2684,9 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    %d: n_ubatch=%u graph_nodes=%zu bound=%u/%zu` at WARN, once per
                    (`use.ctx_id`, device) while the table has room. **`w_order_warned_ctx` is
                    fixed storage (r33 m-1; rulings §M80 (c) and the lead's r33 fold):** a
-                   `uint64_t[16]` and a count, sized when the entry is constructed, so the scan
-                   and store allocate nothing. **A full table fails loud:** with 16 ids stored,
+                   `uint64_t[GGML_SYCL_W_ORDER_WARNED_CTX_MAX]` (16) and a count, sized when the entry is
+                   constructed, so the scan and store allocate nothing. **A full table fails
+                   loud:** with `GGML_SYCL_W_ORDER_WARNED_CTX_MAX` ids stored,
                    `print` is true for every id not found, nothing is stored, and every later
                    out-of-bound use of a 17th or later id prints, with no dedupe. A full table is
                    never read as "already warned", since that would fail open.
@@ -2723,7 +2730,7 @@ L0, and a failed revalidation under L0 is a bug, not a race.
                    step still publishes after the last event it returned. **Cost:** K + 1
                    single-work-item kernels per eager W use (the waiter chain and the
                    publisher), one use per oneDNN PP `MUL_MAT`, and K + 1 per replay; C6's PP
-                   ABBA arms score it, with K as G0 printed it for that card.
+                   ABBA arms score it, with K as §3.2 pins it.
                  - **Form E, an event section (the fallback).** The entry holds one slot,
                    `last_w_event`, and a **W-order mutex**. Under it the function reads
                    `last_w_event`, calls the steps (the first step's submit carries
@@ -4041,29 +4048,30 @@ L0, and a failed revalidation under L0 is a bug, not a race.
         bool capped, size_t capacity, size_t term) noexcept` (23mk `3bd662261` §4.8 (b1), L4787,
         first given at `372bb5b16`; inline in `fattn-onednn.hpp`; its reasons
         `GGML_SYCL_ONEDNN_GRAPH_INTERIM_REASON_{NONE, TP, CAPPED, CAPACITY}`), on the call's
-        per-shape term and the **planned** interim capacity: `interim_tp`, `interim_capped`
-        (stored + G over the ONEDNN cap: 0 B reserved for G, SDPA declined on that device) or
-        `interim_capacity` (the term above the zone's planned Graph room). That is an allowed
+        per-shape term and the **planned** interim capacity, the Graph block's size G
+        (rulings §M79 (a)): `interim_tp`, `interim_capped` (stored + G over the ONEDNN cap: 0 B
+        reserved for G, SDPA declined on that device) or `interim_capacity` (the term above G). That is an allowed
         interim form, and (b2) deletes it and moves the decision to per-layer admission in the
         fit, `scratch_unplaced`, whose frozen mask the same read then consults. **The reader is
         23mk's routing read, before the plan (23mk `a8cfbf901` rev 4.19a, §4.8 "Routing reads
-        the decline before the plan", at 23mk's head `3bd662261`, provisional while design-23mk-r23 runs; r28 m-1):** each of the three
-        dispatch arms, `fattn.cpp:2788` (FORCE_PATH), `:3123` (every non-D512 shape) and `:3907`
-        (D = 512) at `d8a67422d`, calls
-        `ggml_sycl_fattn_onednn_dispatch_routed(ctx, p, d_v, multi_seq, site, route)`, which reads
-        `ggml_sycl_onednn_graph_dispatch_declined(ctx, p)` (in (b1) the interim seam above, from
-        (b2) the frozen mask's `onednn_graph_route_decline(ctx, p.kv_layer)`) **before**
+        the decline before the plan", at 23mk's head `3bd662261`, provisional while
+        design-23mk-r23 runs; r28 m-1):** each of the three dispatch arms, `fattn.cpp:2788`
+        (FORCE_PATH), `:3123` (every non-D512 shape) and `:3907` (D = 512) at `d8a67422d`, calls
+        `ggml_sycl_fattn_onednn_dispatch_routed(ctx, p, d_v, multi_seq, site, route)`, which
+        reads `ggml_sycl_onednn_graph_dispatch_declined(ctx, p)` (in (b1) the interim seam above,
+        from (b2) the frozen mask's `onednn_graph_route_decline(ctx, p.kv_layer)`) **before**
         `ggml_sycl_flash_attn_ext_onednn_plan`, with `fattn_params::kv_layer` filled at dispatch
         (the field and its fill land in (b1) by §M71 (a) as amended). A declined read adds one
         to its site's key of `onednn_graph_mask_declined{force|default|d512}` and one to its
         total (rulings §M74 (i) (2) as amended; a zero is scored on the total only, §3.4) and
         returns false, so a declined D ≤ 256 layer never reaches the plan and falls through to
-        native FA on its own device (P3). **The plan reaches the arm through an out-parameter (rulings §M79 (b); 23mk
-        `3bd662261`, rev 4.19h):** the sixth argument is `ggml_sycl_fattn_onednn_route_result &
-        out`, whose `stage` is OFF, DECLINED or PLANNED and whose `plan` is the plan's result
-        once it ran, so each arm keeps its REJECTED, MATERIALIZE_REQUIRED_BUT_UNAVAILABLE and
-        MR debug lines and their `materialize=` fields as at master, with one plan call per
-        dispatch. The decline is read in this routing read, never at the entry. The SDPA entry `ggml_sycl_flash_attn_ext_onednn`
+        native FA on its own device (P3). **The plan reaches the arm through an out-parameter
+        (rulings §M79 (b); 23mk `3bd662261`, rev 4.19h):** the sixth argument is
+        `ggml_sycl_fattn_onednn_route_result & out`, whose `stage` is OFF, DECLINED or PLANNED
+        and whose `plan` is the plan's result once it ran, so each arm keeps its REJECTED,
+        MATERIALIZE_REQUIRED_BUT_UNAVAILABLE and MR debug lines and their `materialize=` fields
+        as at master, with one plan call per dispatch. The decline is read in this routing read,
+        never at the entry. The SDPA entry `ggml_sycl_flash_attn_ext_onednn`
         (`fattn-onednn.cpp:981`) keeps only 23mk's uncounted backstop,
         `ggml_sycl_onednn_graph_declined_quiet`, which adds to `onednn_graph_decline_at_entry`
         when it declines; no dispatch call reaches it, so 23mk predicts that total 0 on every
@@ -7342,7 +7350,8 @@ L7 documents this limit, and pattern #2 remains the remedy.
       entry's sequence counter, and no lock is held across a submit. It adds one strict-leaf lock,
       the entry's `w_order_warn_mutex` (r30 n-3; r33 m-1). Only an out-of-bound use takes it,
       before the ordering decision, and holds it for the scan and store on the fixed
-      `w_order_warned_ctx` (a `uint64_t[16]` sized at the entry's construction, so nothing
+      `w_order_warned_ctx` (a `uint64_t[GGML_SYCL_W_ORDER_WARNED_CTX_MAX]`, 16, sized at the
+      entry's construction, so nothing
       allocates under it) and the `w_order_out_of_bound` store, keeping the scan's `print`
       result. It releases the mutex before the WARN's print, so no logging runs under it
       (§M80 (c); r31 m-3). A full table prints for every id not found: it never reads as
@@ -8951,13 +8960,17 @@ means that.
       - a comparison of `use.n_ubatch` against the `n_ubatch` field of
         `ggml_sycl_w_order_bound_for(...)`'s result;
       - a comparison of `use.graph_nodes` against its `graph_nodes` field;
-      - a scan of `w_order_warned_ctx` for `use.ctx_id` with a store of it when absent and
-        room remains (the dedupe, r33 m-1);
-      - on a full table, `print` is true for an id not found: the full-table branch never
-        yields "already warned".
+      - the dedupe (r33 m-1; r34 m-2). **The form the clause matches**, on the comment-stripped
+        body: `print` is initialised true; one loop over the array's `count` entries compares
+        each to `use.ctx_id` and sets `print` false only on a match; the store of `use.ctx_id`
+        is guarded by `count < GGML_SYCL_W_ORDER_WARNED_CTX_MAX` and runs only when `print` is
+        true; and there is no other assignment to `print`. So a full table, which has no room to
+        store, still leaves `print` true for an id not found, and the full-table branch never
+        yields "already warned". `GGML_SYCL_W_ORDER_WARNED_CTX_MAX` is defined once, with the
+        array, and the storage and this clause both read it.
     - **Restriction clauses.** `ggml_sycl_w_order_bound_for`,
-      `GGML_SYCL_W_ORDER_BOUND_N_UBATCH`, `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` and
-      `w_order_warned_ctx` occur nowhere else, except in their definitions and in
+      `GGML_SYCL_W_ORDER_BOUND_N_UBATCH`, `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES`,
+      `w_order_warned_ctx` and `GGML_SYCL_W_ORDER_WARNED_CTX_MAX` occur nowhere else, except in their definitions and in
       `ggml_sycl_test_set_w_order_bound`'s body. So no caller names the bound. Every caller
       passes a `ggml_sycl_w_use_desc`.
     - **Source clauses on the fills (r30 m-3; r31 m-2).** Each is positive: it must match at
@@ -8981,9 +8994,10 @@ means that.
         source, fails.
       - In `ggml_sycl_graph_submit`, all three of the descriptor's fields are read from meta's
         record and meta's node count, and from nothing else.
-    - **A measurement print never ships (r33 n-1).** The string `W-ORDER-MEASURE` occurs
-      nowhere in tracked source, and the clause runs on every commit that touches the W-order
-      files. Its mutation witness is the uncommitted print of §3.2 step 3 left in the tree,
+    - **A measurement print never ships (r33 n-1; r34 m-6).** "Tracked source" is `git ls-files`
+      outside `docs/`, because the design docs legitimately quote the string. The clause is
+      `git grep -n 'W-ORDER-MEASURE' -- ':!docs/'` returning nothing, and it runs on every
+      commit that touches the W-order files. Its mutation witness is the uncommitted print of §3.2 step 3 left in the tree,
       which fails it.
     - **Mutation witnesses.**
       - The comparison moved into the oneDNN PP caller on `src1->ne[1]`: the positive and
@@ -9006,8 +9020,10 @@ means that.
         exactly one `clear()` after the loop, fails (r33 m-4).
       - The move taken from a source other than the thread-local record (a global, or the
         previous meta): the clause's loop-element source fails (r33 m-4).
-      - A full `w_order_warned_ctx` treated as already warned (`print` false when 16 ids are
-        stored): the full-table clause fails (r33 m-1).
+      - A full `w_order_warned_ctx` treated as already warned (an `else print = false` on the
+        full branch, or `print` false when `GGML_SYCL_W_ORDER_WARNED_CTX_MAX` ids are stored):
+        the "no other assignment to `print`" and match-only-false parts of the dedupe clause
+        fail (r33 m-1; r34 m-2).
       - The uncommitted `W-ORDER-MEASURE` print left in the tree: the no-print clause fails
         (r33 n-1).
       - The finalize count's assignment deleted, or set to 0: the finalize clause fails. With
@@ -9422,8 +9438,9 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
   1. **The G0 commit** (this section). It picks the W-order form, prints C, T, K, the largest
      gate `n_ubatch` and `N_prov`, and changes no backend code.
   2. **The L4+L6 W-order commit.** It adds `ggml_sycl_device_entry_w_ordered`,
-     `ggml_sycl_graph_finalize` and `ggml_sycl_graph_submit`, and compiles in K, the
-     `n_ubatch` bound and `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES = N_prov`. That constant is
+     `ggml_sycl_graph_finalize` and `ggml_sycl_graph_submit`, and compiles in
+     `GGML_SYCL_W_ORDER_CHAIN_K` (one constant for both cards: the larger of the two cards'
+     ⌈2 T / C⌉ as G0 printed them), the `n_ubatch` bound and `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES = N_prov`. That constant is
      **provisional**, and the commit message says so.
   3. **A lead-run measurement, with a one-off print that is never committed (r32 m-1; r33
      m-2, m-3, n-1).** The lead builds a **separate worktree**, or an uncommitted stash, never
@@ -9442,28 +9459,38 @@ counter-based events every backend stream uses). It runs on `level_zero:0`, then
      - **Non-vacuity.** Each run's log must carry at least one line with `graph_nodes` > 0. A
        run with none is VOID for its shape, never a zero, and `N_max` is defined only once every
        listed run is non-void. A shape that legitimately never takes the oneDNN PP W path is
-       dropped from the list only by a lead ruling, never silently. The per-run line counts are
-       recorded with the logs, which are the evidence the re-pin commit cites.
+       dropped from the list only by a lead ruling, never silently.
+     - **The evidence record is the re-pin commit's message (r34 n-2)**, since `/tmp` does not
+       survive a reboot. It carries, for each per-selector log: its file name, shape, selector,
+       line count and its single maximum `graph_nodes` line verbatim; then `N_max`, `B`, and
+       each card's `T` and `C`. The log directory is named on the ticket, and the logs are
+       supporting files.
      - The WARN is not a source for this, since it prints once per (`ctx_id`, device), and
        `ggml_sycl_test_set_w_order_bound` exists only in test binaries. The print and its
        worktree are discarded after step 5. No scored arm reads the WARN's node half before
        step 5.
   4. **The re-pin commit, unconditional (rulings §M80 (d); r32 m-2).** The lead computes
-     `B = round_up(1.25 * N_max, 16)`. `B` must be nonzero and no smaller than 1.25 times a line
-     actually read, and a VOID run in step 3 blocks this step. The lead re-runs G0 F3 with
+     `B = round_up(1.25 * N_max, 16)`. `B` must be nonzero and at least 1.25 times `N_max`, and
+     `N_max` must equal the `graph_nodes` of a line actually present in a non-void log (the
+     commit message names that line's file and number). A VOID run in step 3 blocks this step. The lead re-runs G0 F3 with
      `--f3-nodes B` **on both cards** (`level_zero:0`, then `level_zero:1`), so that F3's
      verdict covers the bound that ships on each, and both must pass. If F3 passes at `B`, the
-     commit sets `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` to `B`, re-pins each card's K from the T that
-     card's run printed, and drops "provisional" from the constant's comment and from §2.4.2. If F3
+     commit sets `GGML_SYCL_W_ORDER_BOUND_GRAPH_NODES` to `B`, re-pins
+     `GGML_SYCL_W_ORDER_CHAIN_K` to ⌈2 `T_max` / `C_min`⌉, where `T_max` is the larger of the two
+     cards' T printed at `B` and `C_min` the smaller of their caps (the conservative K, one value
+     for both cards), and drops "provisional" from the constant's comment and from §2.4.2. If F3
      fails at `B` (a cell caps with K waiters, or a control fails), that is a stop for a lead
      ruling, never a silent re-pin. There is no `N_max > N_prov` trigger: the re-run happens
      whenever the bound is re-pinned.
-  5. **The closing check (r33 n-2).** On the re-pinned tree, the lead re-runs step 3's runs
-     with the print in a separate worktree. Every `[W-ORDER-MEASURE]` line must read
+  5. **The closing check (r33 n-2; r34 m-5).** On the re-pinned tree, the lead re-runs step 3's
+     runs, the same list and one log file per run named by its selector, with the print in a
+     separate worktree. Each run's log must carry at least one `[W-ORDER-MEASURE]` line with
+     `graph_nodes` > 0, as in step 3; a run that does not is VOID and blocks the check, never a
+     pass, since the WARN's zero needs the measurement line as its positive control. Every `[W-ORDER-MEASURE]` line must read
      `graph_nodes` <= `B`, and every log must carry zero `[W-ORDER] shape above` lines. A line
      above `B`, or a WARN, is a stop for a lead ruling. This is the first reading of the WARN's
      node half that is not VOID (§2.4.2).
- for each card, and the cap must sit
+  G0 also prints the engine class's xe `job_timeout_ms` for each card, and the cap must sit
   below it.
 - **Attribution (r25 m-5 (d)).** Each cell prints `[G0] cell=<H>/<M> start` before it runs and
   `[G0] cell=<H>/<M> submit_ms=%.1f verdict=returns|blocks` after (the controls and F1/F2 print
@@ -10041,12 +10068,31 @@ placement and demotion run. The rules for every such arm:
   (b1)'s own rule, never the fit's (r27 m-3). The replay calls 23mk's
   pure `ggml_sycl_onednn_graph_interim_decline(tp, capped, capacity, term)` (23mk `3bd662261`
   §4.8 (b1), L4787, first given at `372bb5b16`: it reads its four arguments and nothing else,
-  and H3 pins it with four `static_assert`s and a source pin; relay (3), answered), so the (b1)
-  pre-registration is final. It is evaluated for each SDPA-routed device-KV layer with `tp` =
-  false, `capped` the model's capped flag on the device, `capacity` that device's planned
-  interim capacity (the ONEDNN zone's ensured bytes less its stored W, 0 on a device without the
-  zone), and `term` from the pure `onednn_graph_scratch_term_bytes(n_head, ne01, ne11)`, and
+  and H3 pins it with six `static_assert`s (four reasons and two precedence pins) and a source
+  pin; relay (3), answered), so the (b1) pre-registration is final. It is evaluated for each SDPA-routed device-KV layer with `tp` =
+  false, `capped` the model's capped flag on the device, `capacity` that device's Graph
+  block's size G, and `term` from the pure `onednn_graph_scratch_term_bytes(n_head, ne01, ne11)`, and
   gives the (b1) N and each declined layer's reason, `interim_capped` or `interim_capacity`.
+  **`capacity` is G, never the zone less W (r34 I-1; rulings §M79 (a); 23mk `3bd662261` §4.8
+  (b1), 23mk:4702-4733).** G is the one contiguous block that 23mk carves first in the ONEDNN
+  zone at the ensure, drawn only by Graph scratch, and its size is the per-device fact 23mk
+  publishes (`unified_cache_get_onednn_graph_interim_capacity(int device)`); the 4.19g
+  definition, the built zone less the stored W, counted bytes that W's regrow could split, and
+  is retired. It is 0 on a device without an active arena, without the zone, or whose G was 0
+  at the build (GPT-OSS, a capped model), and a `zones_sufficient` return on an arena that has
+  no block leaves it 0. The replay derives G before the run from 23mk's rule at the envelope's
+  `n_ctx`: before fkpg (a) the envelope is 512 at every load, so G is 67108864 B on Mistral
+  and on the Qwen gate (23mk:4945-4950, the 64 MiB minimum), and from fkpg (a) the block
+  follows the published `n_ctx`: at `-c 4096` Mistral's G is 402653184 B (zone 520093696 B,
+  23mk:22-23) and the Qwen gate's is 201326592 B (23mk:5752). The run's own `capacity=` field
+  is the check, not the source: where the run prints an interim line, its `capacity=` must
+  equal the pre-registered G, and a mismatch is VOID, never a re-fit (23mk:4828 gives the
+  line's `capacity` as the replay's input, which makes it a second reading of the same fact).
+  **It passes a correct tree:** on the Qwen gate at pp512 and `-ub` 512 the term at `ne01` 512
+  and `ne11` 512 is 25165824 B (23mk:4945-4950), under both 67108864 B and 201326592 B, so
+  N = 0 on both. On Mistral at the 512 envelope a call routes only up to `ne11` 512 (term
+  50331648 B) and declines from `ne11` 768 (75497472 B), so a Mistral arm with a longer KV is
+  pre-registered to decline, and the replay computes that and never assumes N = 0.
   **Which shapes (r28 m-1).** The routing read runs before the plan, so every FA call that
   reaches the routing read is checked. That includes every decode call that reaches the routing
   read, which is one that passes its arm's first terms (the `:3123` arm reads after its
@@ -13987,9 +14033,30 @@ n-5 closed. It also folds the queued 23mk re-pin of rulings §M79 (b) and §M78,
 | item | finding / ruling | disposition |
 |---|---|---|
 | m-1 | the r32 n-3 answer, "leaf in lock-order terms only", was a third option beside the ruling's pre-reserve or non-leaf ranking | **Changed, pre-reserve.** `w_order_warned_ctx` is fixed storage, a `uint64_t[16]` and a count, sized when the entry is constructed, so the scan and store allocate nothing. A full table fails loud: with 16 ids stored, every id not found prints and nothing is stored, so a full table is never read as "already warned". The mutex is a strict leaf by the contract's ledger-lock standard (`:1551-1553`, cited), and "The choice", "leaf in lock-order terms only" and the strict-mode-span argument are removed from §2.4.2 and the L7 row. H7 (as)'s third positive clause becomes a scan and store, with a full-table clause and a witness (a full table treated as warned fails it). |
-| m-2 | step 3's "maximum per card" had no card key, and the constant is one value | **Changed.** One log file per run, named by its `ONEAPI_DEVICE_SELECTOR`, since `device=%d` is the post-selector index. `N_max` is the largest `graph_nodes` over every line of every file, because the compiled constant is one value. Step 4 re-runs F3 at `--f3-nodes B` on both cards, both must pass, and each card's K is re-pinned from its own T. |
+| m-2 | step 3's "maximum per card" had no card key, and the constant is one value | **Changed** (K amended, §6.43 m-3). One log file per run, named by its `ONEAPI_DEVICE_SELECTOR`, since `device=%d` is the post-selector index. `N_max` is the largest `graph_nodes` over every line of every file, because the compiled constant is one value. Step 4 re-runs F3 at `--f3-nodes B` on both cards, both must pass, and each card's K is re-pinned from its own T. |
 | m-3 | step 3 had no non-vacuity condition, and an empty measurement gives `B` = 0 | **Changed.** Each run's log must carry at least one line with `graph_nodes` > 0, or the run is VOID for its shape and blocks step 4. `B` must be nonzero and at least 1.25 times a line read. A shape that never takes the oneDNN PP W path is dropped from the list only by a lead ruling. The per-run line counts are recorded with the logs. |
 | m-4 | the finalize clause's "cleared after the move" and "from another source" sub-claims had no witness | **Changed.** The clause pins its matched form: one loop over the thread-local record copying the loop element's `entry`, `ctx_id` and `n_ubatch` into one new element of meta's record, then exactly one `clear()` after the loop, and no other write to meta's record. Witnesses are added for the clear deleted (the next meta inherits entries), the source taken from a global or the previous meta, and a field zeroed as a literal in the copy. |
 | n-1 | nothing tested that the measurement print never ships | **Changed.** A source clause: `W-ORDER-MEASURE` occurs nowhere in tracked source, with the print left in the tree as its witness. §3.2 step 3 states that the print lives in a separate worktree or an uncommitted stash, never the checkout the re-pin commit is made from. |
 | n-2 | no arm read the WARN's node half, since every G2 child passes `graph_nodes` 0 | **Changed, the stronger option.** §3.2 gains step 5, a closing check: on the re-pinned tree the lead re-runs step 3's runs, and every line must read `graph_nodes` <= `B` with zero `shape above` lines, or it is a stop for a lead ruling. §2.4.2 and the bound cell say G2 scores the `n_ubatch` half only, and step 5 is the node half's reader. |
 | 23mk re-pin; §M79 (b), §M78 (queued) | 23mk rev 4.19h (`3bd662261`): the routed call keeps the plan, the plan lines carry `txn` | **Changed.** §2.4.2 (b1) gives `dispatch_routed(ctx, p, d_v, multi_seq, site, route)` with its `ggml_sycl_fattn_onednn_route_result & out` (stage OFF, DECLINED or PLANNED, and the plan), so each arm keeps its REJECTED, MR and `materialize=` lines with one plan call, and says the decline is read in the routing read, not at the entry. `interim_decline` stays at four arguments, now cited at `3bd662261` §4.8 L4787, and the routing read and the declined-layer note are cited at `3bd662261`. The lines read `[CONTEXT-PLAN] graph scratch declined: ctx=%u dev=%d txn=%u declined=%u of %u layers needed=%zu room=%zu reason=scratch_unplaced` and `[CONTEXT-PLAN] graph scratch range: ctx=%u dev=%d txn=%u term=ONEDNN_GRAPH_SCRATCH backing=%s offset=%zu bytes=%zu admitted=%u of %u layers`, at §2.3.3, §2.4.2, §2.4.3's greps, §3.3's greps and the Qwen block's greps. Pairing is by (ctx, dev, txn), a decline with no same-`txn` commit line is VOID, and the interim "exactly one commit line, decline first" rule is dropped. The head is provisional while design-23mk-r23 runs, so a later 23mk head re-pins the same items. |
+
+### 6.43 Revision 7.14aa: design-moua-r34
+
+Revision 7.14aa is one commit on top of `bd3d7f7d4`, by impl-moua-s. It answers design review r34
+(design-moua-r34 on `d7cf431f4..bd3d7f7d4`: 0 Critical, 2 Important, 6 Minor, 2 nits; P1-P3 pass,
+and P4 conditional on I-1, m-3 and m-5). It found every r33 item closed as ruled, and the 23mk
+re-pin to `3bd662261` accurate except I-1 and m-1. The 23mk head is still provisional while
+design-23mk-r23 runs.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| I-1; §M79 (a) | the (b1) replay's `capacity` was 4.19g's "the ONEDNN zone's ensured bytes less its stored W", which §M79 (a) retired | **Changed.** `capacity` is G, the one contiguous Graph block 23mk carves first in the ONEDNN zone at the ensure, published through `unified_cache_get_onednn_graph_interim_capacity(int device)`, 0 on a device without an active arena, without the zone, or with G = 0 at the build (23mk `3bd662261` §4.8 (b1), 23mk:4702-4733). The replay derives G before the run at the envelope's `n_ctx`: 67108864 B on Mistral and the Qwen gate before fkpg (a) (23mk:4945-4950), and at `-c 4096` 402653184 B on Mistral (zone 520093696 B, 23mk:22-23) and 201326592 B on the Qwen gate (23mk:5752). The run's `capacity=` field is the check, not the source; a mismatch is VOID. The sentence at the (b1) bullet ("the term above the zone's planned Graph room") now reads G as well. The text shows it passes a correct tree: the Qwen gate's pp512 term is 25165824 B, under both G, so N = 0; Mistral at 512 declines from `ne11` 768 and is pre-registered to. |
+| I-2 | an edit deleted "G0 also prints the engine class's xe `job_timeout_ms` for each card" and left a fragment | **Changed.** The sentence is restored whole, as its own paragraph after step 5, at the step list's indent. |
+| m-1 | "four `static_assert`s" was stale at `3bd662261` | **Changed.** "six `static_assert`s (four reasons and two precedence pins)", 23mk:9564-9570. |
+| m-2 | the full-table clause had no pinned form and the 16 was a literal in four places | **Changed.** `GGML_SYCL_W_ORDER_WARNED_CTX_MAX` (16) is defined once, with the array, and read by the storage and the clause, and is added to the restriction list. The clause pins its form: `print` initialised true; a loop that sets it false only on a match; the store guarded by `count < MAX` and run only when `print` is true; no other assignment to `print`. The witness is an `else print = false` on the full branch. |
+| m-3 | step 4 re-pinned "each card's K", but K is one compiled constant | **Changed.** `GGML_SYCL_W_ORDER_CHAIN_K` is named, compiled once for both cards. Step 2 compiles it from the larger of G0's two ⌈2 T / C⌉, and step 4 re-pins it to ⌈2 `T_max` / `C_min`⌉ over both cards' F3 runs at `B`. §6.42's m-2 row is marked amended. |
+| m-4 | the B check was "1.25 times a line actually read" | **Changed.** `B` must be nonzero and at least 1.25 times `N_max`, and `N_max` must equal the `graph_nodes` of a line present in a non-void log, whose file and number the commit message names. |
+| m-5 | step 5 had no non-vacuity condition | **Changed.** Each run's log must carry at least one `[W-ORDER-MEASURE]` line with `graph_nodes` > 0, on the same list of runs as step 3; otherwise it is VOID and blocks the check, never a pass. |
+| m-6 | "tracked source" was undefined, and the design doc itself quotes the string | **Changed.** "Tracked source" is `git ls-files` outside `docs/`; the check is `git grep -n 'W-ORDER-MEASURE' -- ':!docs/'` returning nothing. |
+| n-1 | three new lines ran past the wrap | **Changed.** The routing-read paragraph is reflowed, and its two run-together sentences are split. The old 141-column line at the F3 text is not part of this fold. |
+| n-2 | the evidence for `N_max` and `B` was only "the logs" | **Changed.** The re-pin commit's message is the record: each log's name, shape, selector, line count and maximum line verbatim, then `N_max`, `B`, and each card's `T` and `C`. The log directory is named on the ticket. |
