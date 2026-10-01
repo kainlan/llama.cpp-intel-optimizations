@@ -2392,11 +2392,12 @@ accepted size; an explicit one fails context creation.
 **The compute-buffer reserve is a known gap, not a solved term.** Neither the
 compute buffers nor the flash-attention K/V conversion buffers are in the
 placement plan (`llama.cpp-zhcn`). A compute buffer that misses the RUNTIME
-zone does not go straight to the KV zone. Its RUNTIME request does not forbid a
-spill, so it first falls through to raw device memory outside the arena, when
-the physical-VRAM overcommit guard allows that. It reaches the KV zone ("Arena
-RUNTIME zone full, runtime buffer ... allocated from KV zone") only when the
-guard refuses. The guard decides which, not the plan (`llama.cpp-23mk`). When
+zone is placed in the KV zone first (`alloc_constraints::spill_to_kv_zone_before_raw`, set by the buffer allocator;
+`llama.cpp-kpjw`). Before that it did not: its RUNTIME request does not forbid a spill, so it fell through to raw device
+memory outside the arena, when the physical-VRAM overcommit guard allowed that, and reached the KV zone ("Arena RUNTIME
+zone full, runtime buffer ... allocated from KV zone") only when the guard refused (`llama.cpp-23mk`). Raw memory is now
+the last resort, after the KV zone cannot hold the buffer whole.
+When
 the ring fills RUNTIME, GPT-OSS's compute buffer (about 404 MiB at `-ub 512`)
 misses it and goes down that chain. `ggml-alloc` sizes
 compute buffers from the graph at `graph_reserve`, which runs after the
@@ -2467,14 +2468,31 @@ the same planned figures: a build without oneDNN or `GGML_SYCL_F16` plans no f16
 (`ggml_sycl_dequant_f16_scratch_drawable()`), and a model with no dense Q8_0 weight has no f16 candidate in the zone
 adapter. Where it is reachable all three count it.
 
-A hold-induced spill is not silent. The request falls through to the ordinary spill path (stats and miss accounting see
-it exactly as they see a zone-full spill), is counted per device, and the first one since the last teardown is a WARN
-naming the requester tag and the bytes (`unified_cache_note_planned_hold_spill`); the count is taken at teardown and
-printed as `hold_spills` in the `[SCRATCH-STATS]` lines. The spill path cannot evict weights: the overcommit guard in
-`unified_alloc` runs for every device request, and for a hold-induced one it now refuses loudly instead of calling
-`evict_and_flush` (trading a planned buffer's reservation for the model's own weights is not a trade the hold may make).
+A compute buffer that the RUNTIME zone will not serve lands in the arena's KV zone, not in raw device memory. The
+zone is a fixed 512 MB by default (`GGML_SYCL_RUNTIME_ARENA_MB`, raised only to the planned PP/MoE/dense requirement),
+it is built once, and it cannot be rebuilt once weights are live, so a 460-512 MB compute buffer plus the planned dense
+scratch does not fit it and one of the two must live elsewhere; the planned consumers forbid spill, so the compute
+buffer is the one that moves. It used to move to raw device memory outside the arena, which is where the driver headroom
+lives (B50, Qwen PPL at auto-ub1024: a 461 MB buffer held back, 107.8 MB left against 256 MB, flash attention out of
+resources). The buffer allocator now marks its request (`alloc_constraints::spill_to_kv_zone_before_raw`), and
+`unified_alloc` places such a request, when the zone will not serve it (held back by the hold, or larger than the zone's
+free bytes), in the KV zone before the overcommit guard and before anything raw
+(`zone_runtime_spill_prefers_kv_zone`, host-tested). The attempt is ahead of the guard on purpose: an in-arena placement
+is memory the arena already reserved, so it cannot overcommit the device and must not evict cached weights. Only that
+request class takes the path; a forbid-spill claimant is still refused, and any other RUNTIME request keeps the previous
+spill path unchanged. Raw device memory is the last resort, taken only when the KV zone cannot hold the buffer whole.
+
+A hold-induced spill is not silent, and is counted by where it landed (`unified_cache_note_planned_hold_spill`): in the
+KV zone (inside the arena, free for the driver headroom) or RAW (outside the arena, which is what eats it). The first
+one of each kind since the last teardown is a WARN naming the requester tag and the bytes; the counts are taken at
+teardown and printed as `hold_spills_raw` / `hold_spills_kv_zone` (with bytes) in the `[SCRATCH-STATS]` lines. A raw
+spill cannot evict weights: the overcommit guard in `unified_alloc` runs for every raw device request, and for a
+hold-induced one it refuses loudly instead of calling `evict_and_flush` (trading a planned buffer's reservation for the
+model's own weights is not a trade the hold may make).
 *The worst case, and why it is a heuristic.* A request the hold keeps out spills whole, so what the hold can push
-outside the arena is not "the hold" but at most **the hold plus the largest spill-capable RUNTIME request**: a request r
+out of the zone is not "the hold" but at most **the hold plus the largest spill-capable RUNTIME request**, and of that
+only the part the KV zone cannot take is outside-arena demand (`zone_hold_spill_raw_demand`, with the KV zone's free
+bytes at the transaction; they are an estimate, and the realized check below is the backstop). The bound: a request r
 is held back only when the zone has less than hold + r free, free only falls while the hold stands, and a run with no
 hold serves at most the zone's free bytes. The hold is at most the plan at the n_ubatch asked about. The transaction does
 not know the compute-buffer sizes (the scheduler reserves them after the plan is published), so the largest request is
@@ -2495,7 +2513,8 @@ only once the rung's buffers do. The auto-ubatch trial (`llama_context::sycl_sel
 returned, for every rung, every flash-attention mode and the cached rung. It is not asked from the recheck inside
 `sched_reserve()`: that recheck runs after a 1-token flash-attention probe reserve and before the worst-case pp/tg
 reserves that make the large compute buffers, and only for the first rung under `auto_fa`, so it cannot see them. The
-check (`ggml_sycl_check_hold_spill_realized`) reads the hold-induced spills of this plan since its publish
+check (`ggml_sycl_check_hold_spill_realized`) reads the RAW hold-induced spills of this plan since its publish (a buffer
+placed in the KV zone does not touch the driver headroom and is not counted)
 (`unified_cache_get_recent_planned_hold_spills`) and the live free memory, and applies `zone_hold_spill_realized_fits`
 (host-tested): the hold is blamed only when ITS spill is what pushed the card under the driver headroom the arena expects
 outside itself (`kSyclArenaMinExternalHeadroomBytes`, 256 MB, the graph-entry check's one constant), i.e.
