@@ -3501,9 +3501,11 @@ def m6_witnesses():
     out.append(("--write-debt --allow-growth seeds", ok and len(ents) == 1, msg[:40]))
     ok, msg, ents = plan_debt_write([], {"entries": []}, {"violations": [{"code": "D-ZONE", "key": "k"}]}, False)
     out.append(("--write-debt may shrink", ok and ents == [], msg[:40]))
-    for arg, why in (("4/4", "K not below N"), ("x", "not K/N"), ("0/0", "N of zero"), ("299/300", "a slice with no case")):
+    n_cases = len(matrix_cases())
+    for arg, name, why in (("4/4", "4/4", "K not below N"), ("x", "x", "not K/N"), ("0/0", "0/0", "N of zero"),
+                           ("%d/%d" % (n_cases, n_cases + 1), "<cases>/<cases+1>", "a slice with no case")):
         rc, text = subprocess_gate(["--mutation-matrix", "--shard", arg])
-        out.append(("--shard %s (%s) is refused before the gate runs" % (arg, why), rc == 2, "rc=%d" % rc))
+        out.append(("--shard %s (%s) is refused before the gate runs" % (name, why), rc == 2, "rc=%d" % rc))
     rc, text = subprocess_gate(["--shard", "0/4"])
     out.append(("--shard without --mutation-matrix is an error", rc == 2, "rc=%d" % rc))
     return out
@@ -3668,8 +3670,9 @@ def parse_shard(text):
     if not m or not (0 <= int(m.group(1)) < int(m.group(2))):
         raise ValueError("--shard takes K/N with 0 <= K < N, got %r" % text)
     k, n = int(m.group(1)), int(m.group(2))
-    if not shard_slice(matrix_cases(), k, n):
-        raise ValueError("--shard %s selects no case (the matrix has %d); an empty shard checks nothing" % (text, len(matrix_cases())))
+    cases = matrix_cases()
+    if not shard_slice(cases, k, n):
+        raise ValueError("--shard %s selects no case (the matrix has %d); an empty shard checks nothing" % (text, len(cases)))
     return k, n
 
 
