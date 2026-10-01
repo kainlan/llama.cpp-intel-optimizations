@@ -571,6 +571,11 @@ int main() {
               "AOS hidden at 512 rows is the logged 2949120");
         CHECK(ggml_sycl::zone_mmq_src1_required_bytes(512, 5120, true, &need) && need == 2949152,
               "SOA hidden at 512 rows is the logged 2949152");
+        // A src1 with no rows has no demand and is refused here, so the graph-entry walk must skip it by its own
+        // predicate (a ubatch with no outputs trims the last layer to zero rows) rather than treat the refusal as an
+        // overflow.
+        CHECK(!ggml_sycl::zone_mmq_src1_required_bytes(0, 4096, true, &need), "zero rows must be refused, not sized");
+        CHECK(!ggml_sycl::zone_mmq_src1_required_bytes(-1, 4096, true, &need), "negative rows must be refused");
         CHECK(!ggml_sycl::zone_mmq_src1_required_bytes(INT64_MAX / 2, 17408, true, &need),
               "an overflowing row count is refused, not wrapped into a small size");
 

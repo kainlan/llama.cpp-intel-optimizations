@@ -319,6 +319,11 @@ def evaluate(backend, common, cache, zone):
     # A src1 with no rows has no demand; it must not reach the overflow refusal, whose message would lie.
     results["the Q8 walk skips a src1 with no rows"] = \
         re.search(r"ggml_nrows\(src1\)\s*<=\s*0", q8_walk) is not None
+    # A ubatch that produces no outputs has its last layer trimmed to ZERO rows by the output gather, so a zero-row
+    # MUL_MAT is on every multi-ubatch prompt. The dispatch treats it as a no-op (ggml_sycl_is_noop); the walks must
+    # ask the same predicate rather than re-deriving "empty", or they refuse a graph the dispatch would have run.
+    results["both walks skip the nodes the dispatch treats as no-ops"] = \
+        "ggml_sycl_is_noop(" in q8_walk and "ggml_sycl_is_noop(" in dq_walk
     # The walks run once per graph, decode included: no per-node zero-initialised array, and no scan of the
     # compile-time device maximum when the real device count is known.
     walk_loop = "for (int i = 0; i < cgraph->n_nodes; i++)"
@@ -395,6 +400,12 @@ if args.self_test:
         return src[:k] + new + src[k + len(old):]
 
     mutants = [
+        ("Q8 walk counts no-op nodes", "both walks skip the nodes the dispatch treats as no-ops",
+         (mutate_in_func(backend, r"static bool ggml_sycl_mmq_src1_ensure_for_graph\(",
+                         "ggml_sycl_is_noop(", "ggml_sycl_XXXX("), common, cache, zone)),
+        ("dequant walk counts no-op nodes", "both walks skip the nodes the dispatch treats as no-ops",
+         (mutate_in_func(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\(",
+                         "ggml_sycl_is_noop(", "ggml_sycl_XXXX("), common, cache, zone)),
         ("zero-row src1 reaches the overflow refusal", "the Q8 walk skips a src1 with no rows",
          (mutate_in_func(backend, r"static bool ggml_sycl_mmq_src1_ensure_for_graph\(",
                          "ggml_nrows(src1) <= 0", "ggml_nrows(src1) < -1"), common, cache, zone)),
