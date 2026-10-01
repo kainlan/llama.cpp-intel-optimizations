@@ -411,12 +411,13 @@ def evaluate(backend, common, cache, zone):
     teardown_at = backend.find("mmvq_q8_activation_cache.release()")
     results["context teardown drops only the hold this context published"] = \
         teardown_at >= 0 and \
-        "unified_cache_release_planned_scratch_hold(device, this)" in backend[max(0, teardown_at - 900):teardown_at + 900] and \
+        "unified_cache_release_planned_scratch_hold(device, planned_scratch_owner)" in backend[max(0, teardown_at - 900):teardown_at + 900] and \
         re.search(r"unified_cache_set_planned_scratch_hold\(\s*device\s*,\s*0\s*\)",
                   backend[max(0, teardown_at - 900):teardown_at + 900]) is None
     release_fn = function_body(cache, r"bool unified_cache_release_planned_scratch_hold\([^)]*\)\s*\{") or ""
     results["the release clears the hold only for its owner"] = \
-        "compare_exchange_strong(" in release_fn and release_fn.find("compare_exchange_strong(") < release_fn.find(".store(0")
+        re.search(r"if\s*\(\s*state\.owner\s*!=\s*owner\s*\)\s*\{\s*return false;", release_fn) is not None and \
+        release_fn.find("state.owner != owner") < release_fn.find("state.hold")
 
     # D2: the plan follows the runtime n_ubatch, decided in the runtime-context transaction (before any graph
     # records, so it is not mid-recording growth), and a rung the RUNTIME zone cannot hold is refused there --
@@ -492,7 +493,7 @@ def evaluate(backend, common, cache, zone):
         "unified_cache_get_planned_dequant_f16_buffer_bytes(d, true)" in hold_refresh
     results["the hold is published for this context's device and owner"] = \
         re.search(r"const\s+int\s+d\s*=\s*ctx\.device\s*;", hold_refresh) is not None and \
-        re.search(r"unified_cache_set_planned_scratch_hold\(\s*d\s*,\s*hold\s*,\s*&ctx\s*\)", hold_refresh) is not None
+        re.search(r"unified_cache_set_planned_scratch_hold\(\s*d\s*,\s*hold\s*,\s*ctx\.planned_scratch_owner\s*\)", hold_refresh) is not None
     plan_f16_at = backend.find("unified_cache_set_planned_dequant_f16_scratch(")
     results["an f16 plan the build cannot draw is not planned (it would reserve bytes nothing draws)"] = \
         "ggml_sycl_dequant_f16_scratch_drawable()" in backend[max(0, plan_f16_at - 700):plan_f16_at + 400] if plan_f16_at >= 0 else False
@@ -500,9 +501,10 @@ def evaluate(backend, common, cache, zone):
     # I2: a hold-induced spill is not silent, and it can never cost cached weights.
     results["a held-back request is counted and warned about"] = \
         "unified_cache_note_planned_hold_spill(" in unified_alloc_fn and "GGML_LOG_WARN" in note_spill_fn and \
-        "fetch_add(" in note_spill_fn
+        "state.spill_count++" in note_spill_fn
     results["the warning is once per device per context (the take resets the count)"] = \
-        re.search(r"fetch_add\([^)]*\)\s*==\s*0", note_spill_fn) is not None and ".exchange(0" in take_spill_fn
+        re.search(r"first\s*=\s*state\.spill_count\s*==\s*0", note_spill_fn) is not None and \
+        re.search(r"state\.spill_count\s*=\s*0\s*;", take_spill_fn) is not None
     results["the warning names the requester and the bytes"] = \
         "tag" in note_spill_fn and re.search(r"GGML_LOG_WARN\([^;]*%\.1f MB", note_spill_fn) is not None
     results["teardown reports the hold spills with the scratch stats"] = \
@@ -516,7 +518,7 @@ def evaluate(backend, common, cache, zone):
     results["the outside-arena headroom check is told the worst-case hold spill"] = \
         "hold_spill_bytes" in nonfa_check and \
         re.search(r"ggml_sycl_check_nonfa_attn_scratch\([^;]*hold_spill_bytes", txn) is not None and \
-        re.search(r"unified_cache_planned_dense_scratch_bytes_at\([^;]*&hold_spill_bytes", txn) is not None
+        re.search(r"hold_spill_bytes\s*=\s*ggml_sycl_planned_scratch_hold_spill_bound\(", txn) is not None
 
     # I3: the Q8 walk refreshes the hold on every successful exit, including the one that saw no counted node.
     returns_true = [m.start() for m in re.finditer(r"return true;", q8_walk)]
@@ -531,7 +533,7 @@ def evaluate(backend, common, cache, zone):
 
     # M4: the plan inputs are device-global; a second live model must not shrink the first one's plan.
     results["the load-time plan keeps another live model's inputs"] = \
-        "lifecycle::global_registry().live_mask()" in backend[max(0, plan_f16_at - 2400):plan_f16_at + 400] and \
+        "ggml_sycl_other_backend_context_live(ctx->device, ctx)" in backend[max(0, plan_f16_at - 2400):plan_f16_at + 400] and \
         "zone_dense_scratch_merge_input(" in set_q8_fn and "zone_dense_scratch_merge_input(" in set_f16_fn
 
     # M8: validate first, then store: a rejected figure leaves the stored inputs alone.
@@ -605,7 +607,18 @@ def evaluate(backend, common, cache, zone):
     # M-f: the f16 arm's compile condition is written once.
     results["the f16 arm's compile condition has one source"] = \
         "GGML_SYCL_DEQUANT_F16_ARM" in dq_walk and "defined(GGML_SYCL_F16)" not in dq_walk and \
-        len(re.findall(r"defined\(GGML_SYCL_F16\)", backend)) <= 2
+        len(re.findall(r"GGML_SYCL_DNNL\s*&&\s*defined\(GGML_SYCL_F16\)", backend)) == 1 and \
+        "GGML_SYCL_DEQUANT_F16_ARM != 0" in (function_body(backend, r"static constexpr bool ggml_sycl_dequant_f16_scratch_drawable\(\)\s*\{") or "")
+
+    # M-c: the f16 walk has one success exit and it refreshes the hold, so a walk that satisfied the plan releases
+    # what was held for it (and a walk that counted nothing proves nothing, so the hold stands -- by design).
+    results["the f16 walk's success exit refreshes the hold"] = \
+        re.search(r"ggml_sycl_planned_scratch_hold_refresh\(ctx\);\s*#\s*else", dq_walk) is not None
+    # F1 once more, on the allocator side: a request the hold keeps out of a zone that COULD serve it never reaches
+    # zone_alloc; a request larger than the zone's free bytes is an ordinary spill, so the overcommit guard still
+    # evicts for it (the guard refuses only on hold_spill, which F1's predicate no longer sets for it).
+    results["the overcommit guard refuses only a hold-induced spill"] = \
+        re.search(r"if\s*\(\s*hold_spill\s*\)\s*\{[^{}]*return false;", unified_alloc_fn) is not None
     return results
 
 
@@ -805,15 +818,16 @@ if args.self_test:
                              "ggml_sycl_planned_scratch_hold_refresh(", "ggml_sycl_XXXX(", 2), common, cache, zone)),
         ("teardown keeps the hold", "context teardown drops only the hold this context published",
          (mutate_after(backend, "mmvq_q8_activation_cache.release();",
-                       "ggml_sycl::unified_cache_release_planned_scratch_hold(device, this);", "(void) device;"),
+                       "ggml_sycl::unified_cache_release_planned_scratch_hold(device, planned_scratch_owner);",
+                       "(void) device;"),
           common, cache, zone)),
         ("teardown drops any context's hold", "context teardown drops only the hold this context published",
          (mutate_after(backend, "mmvq_q8_activation_cache.release();",
-                       "ggml_sycl::unified_cache_release_planned_scratch_hold(device, this);",
+                       "ggml_sycl::unified_cache_release_planned_scratch_hold(device, planned_scratch_owner);",
                        "ggml_sycl::unified_cache_set_planned_scratch_hold(device, 0);"), common, cache, zone)),
         ("release ignores the owner", "the release clears the hold only for its owner",
          (backend, common, mutate_in_func(cache, r"bool unified_cache_release_planned_scratch_hold\(",
-                                          "compare_exchange_strong(", "exchange_XXXX("), zone)),
+                                          "if (state.owner != owner) {", "if (false) {"), zone)),
         ("plan frozen at load time", "the transaction re-plans at the runtime n_ubatch, publish only",
          (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
                          "unified_cache_replan_planned_dense_scratch(", "unified_cache_XXXX("), common, cache, zone)),
@@ -864,16 +878,16 @@ if args.self_test:
          (mutate(backend, "ggml_sycl_dequant_f16_scratch_drawable();", "true;"), common, cache, zone)),
         ("hold published without an owner", "the hold is published for this context's device and owner",
          (mutate_in_func(backend, r"static void ggml_sycl_planned_scratch_hold_refresh\(",
-                         "hold, &ctx)", "hold, nullptr)"), common, cache, zone)),
+                         "hold, ctx.planned_scratch_owner)", "hold, 0)"), common, cache, zone)),
         ("hold spill not counted", "a held-back request is counted and warned about",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
                                           "unified_cache_note_planned_hold_spill(", "unified_cache_XXXX("), zone)),
         ("hold spill warned every time", "the warning is once per device per context (the take resets the count)",
          (backend, common, mutate_in_func(cache, r"void unified_cache_note_planned_hold_spill\(",
-                                          "== 0)", ">= 0)"), zone)),
+                                          "spill_count == 0;", "spill_count >= 0;"), zone)),
         ("take does not reset", "the warning is once per device per context (the take resets the count)",
-         (backend, common, mutate_all_in_func(cache, r"void unified_cache_take_planned_hold_spills\(",
-                                              ".exchange(0", ".fetch_add(0", 2), zone)),
+         (backend, common, mutate_in_func(cache, r"void unified_cache_take_planned_hold_spills\(",
+                                          "state.spill_count = 0;", "state.spill_count += 0;"), zone)),
         ("stats omit the hold spills", "teardown reports the hold spills with the scratch stats",
          (mutate_in_func(backend, r"void ggml_backend_sycl_context::log_planned_scratch_stats\(\)",
                          "hold_spills=", "hold_XXXX="), common, cache, zone)),
@@ -913,8 +927,8 @@ if args.self_test:
          (backend, common, mutate_all_in_func(cache, r"bool unified_cache_set_planned_mmq_src1_scratch\(",
                                               "zone_dense_scratch_merge_input(", "zone_XXXX(", 2), zone)),
         ("planning ignores live models", "the load-time plan keeps another live model's inputs",
-         (mutate_after(backend, "const bool other_model_live", "global_registry().live_mask() != 0",
-                       "global_registry().XXXX() != 0"), common, cache, zone)),
+         (mutate_after(backend, "const bool other_model_live", "ggml_sycl_other_backend_context_live(ctx->device, ctx)",
+                       "false"), common, cache, zone)),
         ("Q8 setter stores before validating", "the Q8 setter validates before it stores",
          (backend, common, mutate_in_func(cache, r"bool unified_cache_set_planned_mmq_src1_scratch\(",
                                           "if (!zone_mmq_src1_scratch_bytes(",
@@ -925,6 +939,63 @@ if args.self_test:
                                           "if (!zone_dequant_f16_plan_bytes(",
                                           "g_planned_dequant_f16_weight_bytes_max[device_id].store(max_weight_bytes, "
                                           "std::memory_order_release); if (!zone_dequant_f16_plan_bytes("), zone)),
+        ("held back without requiring a hold", "held back requires a hold, a request the zone could serve, and the hold's refusal",
+         (backend, common, cache, mutate_in_func(zone, r"bool zone_runtime_alloc_held_back\(", "hold > 0 &&", "hold >= 0 &&"))),
+        ("zone-full spill counts as held back", "held back requires a hold, a request the zone could serve, and the hold's refusal",
+         (backend, common, cache, mutate_in_func(zone, r"bool zone_runtime_alloc_held_back\(",
+                                                 "alloc_size <= zone_available", "alloc_size <= SIZE_MAX"))),
+        ("bound ignores the largest request", "the spill bound is the plan plus the largest spill-capable request",
+         (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(",
+                         "unified_cache_get_runtime_request_hwm(", "unified_cache_XXXX("), common, cache, zone)),
+        ("allocator does not record requests", "the allocator records the largest spill-capable RUNTIME request",
+         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
+                                          "unified_cache_note_runtime_request(", "unified_cache_XXXX("), zone)),
+        ("recheck passes the current hold", "the transaction and the recheck ask the one bound",
+         (mutate_in_func(backend, r"ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn\(",
+                         "ggml_sycl_planned_scratch_hold_spill_bound(",
+                         "ggml_sycl::unified_cache_get_planned_scratch_hold(ctx->device); (void) ggml_sycl_XXXX("),
+          common, cache, zone)),
+        ("FA-on skips the headroom check", "the FA-on early return runs the headroom check instead of skipping it",
+         (mutate_in_func(backend, r"static bool ggml_sycl_check_nonfa_attn_scratch\(",
+                         "return ggml_sycl_check_hold_spill_headroom(device, hold_spill_bytes, probe_mode);",
+                         "return true;"), common, cache, zone)),
+        ("FA-on check ignores live memory", "the FA-on check compares the spill with the device's live free memory",
+         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(",
+                         "ggml_backend_sycl_get_device_memory(", "ggml_backend_sycl_XXXX("), common, cache, zone)),
+        ("replan ignores other live contexts", "the dense replan merges across live contexts too",
+         (backend, common, mutate(cache, "uint32_t n_ubatch, bool other_model_live) {",
+                                  "uint32_t n_ubatch) {"), zone)),
+        ("transaction ignores other live contexts", "the transaction asks whether another context is live on THIS device",
+         (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
+                         "ggml_sycl_other_backend_context_live(", "ggml_sycl_XXXX("), common, cache, zone)),
+        ("Q8 overflow invalidates every model", "a rejected figure does not invalidate another live model's plan",
+         (backend, common, mutate_in_func(cache, r"bool unified_cache_set_planned_mmq_src1_scratch\(",
+                                          "if (!other_model_live) {", "if (true) {"), zone)),
+        ("f16 overflow invalidates every model", "a rejected figure does not invalidate another live model's plan",
+         (backend, common, mutate_in_func(cache, r"bool unified_cache_set_planned_dequant_f16_scratch\(",
+                                          "if (!other_model_live) {", "if (true) {"), zone)),
+        ("owner is not minted", "the owner token is a monotonic context id, not an address",
+         (backend, mutate(common, "unified_cache_mint_planned_scratch_owner()", "0"), cache, zone)),
+        ("owner is an address again", "the owner token is a monotonic context id, not an address",
+         (mutate(backend, "unified_cache_release_planned_scratch_hold(device, planned_scratch_owner)",
+                 "unified_cache_release_planned_scratch_hold(device, (uint64_t) (uintptr_t) this)"),
+          common, cache, zone)),
+        ("hold state without a mutex", "the hold state is one mutex-guarded unit",
+         (backend, common, mutate(cache, "    std::mutex mutex;\n    size_t     hold ", "    int        mutex;\n    size_t     hold "), zone)),
+        ("any context resets the spill count", "taking the hold spills is scoped to the context that owns them",
+         (mutate_in_func(backend, r"void ggml_backend_sycl_context::log_planned_scratch_stats\(\)",
+                         "planned_scratch_owner", "0"), common, cache, zone)),
+        ("f16 arm condition written twice", "the f16 arm's compile condition has one source",
+         (mutate_in_func(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\(",
+                         "#    if GGML_SYCL_DEQUANT_F16_ARM", "#    if GGML_SYCL_DNNL && defined(GGML_SYCL_F16)"),
+          common, cache, zone)),
+        ("f16 walk exit skips the refresh", "the f16 walk's success exit refreshes the hold",
+         (mutate_in_func(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\(",
+                         "ggml_sycl_planned_scratch_hold_refresh(ctx);\n#    else", "(void) ctx;\n#    else"),
+          common, cache, zone)),
+        ("guard refuses every spill", "the overcommit guard refuses only a hold-induced spill",
+         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
+                                          "if (hold_spill) {", "if (true) {"), zone)),
         ("replan trusts stale inputs", "a rejected figure is flagged, so no plan is derived from the stale inputs",
          (backend, common, mutate_in_func(mutate_in_func(cache, r"bool unified_cache_replan_planned_dense_scratch\(",
                                                          "g_planned_dense_scratch_invalid", "g_planned_XXXX"),

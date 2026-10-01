@@ -15888,13 +15888,21 @@ static size_t get_system_memory_bytes() {
 // its dispatch arm are compiled only with oneDNN and GGML_SYCL_F16; without them nothing ever draws the planned f16
 // buffers, so planning them would reserve RUNTIME bytes for nothing. Where it is true, whether a given model draws
 // them is the zone adapter's candidate set (dense Q8_0 weights) and the route at run time.
-static constexpr bool ggml_sycl_dequant_f16_scratch_drawable() {
+// ONE source for that condition: the planning site reads the constexpr below and the f16 walk and its dispatch arm
+// are compiled under the same macro, so the two cannot drift apart.
 #if GGML_SYCL_DNNL && defined(GGML_SYCL_F16)
-    return true;
+#    define GGML_SYCL_DEQUANT_F16_ARM 1
 #else
-    return false;
+#    define GGML_SYCL_DEQUANT_F16_ARM 0
 #endif
+static constexpr bool ggml_sycl_dequant_f16_scratch_drawable() {
+    return GGML_SYCL_DEQUANT_F16_ARM != 0;
 }
+
+// llama.cpp-kpjw: whether a backend context other than `self` is live on `device`. The plan inputs and the hold are
+// per device, so this (and not the process-wide model registry, which counts models on other devices too) is the
+// question a plan merge asks. Defined with the context list below.
+static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_sycl_context * self);
 
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
@@ -15968,9 +15976,10 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // llama.cpp-479i: the dense MMQ/MMVQ Q8_1 src1 buffer is a planned byte. Sized here from the
     // same inventory maxima, at the load-time n_ubatch (512 when the loader says 0); the graph-entry
     // check ggml_sycl_mmq_src1_ensure_for_graph() sizes the exact demand at the real n_ubatch.
-    // The plan inputs are device-global: another model that is live on this device keeps its larger inputs (a
-    // draft loaded beside a target must not under-plan the target). The loading model is not live yet.
-    const bool other_model_live = ggml_sycl::lifecycle::global_registry().live_mask() != 0;
+    // The plan inputs are per device: another context that is live on THIS device keeps its larger inputs (a draft
+    // loaded beside a target must not under-plan the target); a model live on another device is no reason to merge.
+    // The loading context is already in the device's context list, so it is excluded by identity.
+    const bool other_model_live = ggml_sycl_other_backend_context_live(ctx->device, ctx);
     {
         const uint32_t mmq_src1_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
         const bool     mmq_src1_planned  = ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(
@@ -17206,6 +17215,56 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
 // already-published shape still fits), or restore anything on refusal --
 // it only asks whether the ALREADY-PUBLISHED shape still fits the device's
 // current outside-arena headroom.
+// llama.cpp-kpjw: the planned dense scratch is held out of the RUNTIME zone's spill-capable requests (the compute
+// buffers), so a request the hold keeps out spills OUTSIDE the arena exactly as one that found the zone full does.
+// How much can that be? For a request r that is held back, the zone has less than hold + r free (it is refused only
+// when free < hold + r), free only falls while the hold stands, and a run with no hold serves at most the zone's free
+// bytes, so the extra spill the hold causes is at most hold + r_max, r_max being the largest spill-capable RUNTIME
+// request. The hold is at most the whole plan at the n_ubatch asked about. The transaction does not know the compute
+// buffer sizes (sched_reserve derives them after the plan is published), so r_max is the allocator's own high-water
+// mark of such requests, the largest the device has been asked for since this context's hold was published: a
+// HEURISTIC, exact once the context has reserved its compute buffers (the recheck runs after the probe reserve) and
+// a lower bound before. It is one source: the transaction and the recheck both call this. Saturating.
+static size_t ggml_sycl_planned_scratch_hold_spill_bound(int device, uint32_t n_ubatch) {
+    size_t plan = 0;
+    if (n_ubatch == 0 || !ggml_sycl::unified_cache_planned_dense_scratch_bytes_at(device, n_ubatch, &plan) ||
+        plan == 0) {
+        return 0;  // no plan, no hold, nothing a hold can push out
+    }
+    const size_t r_max = ggml_sycl::unified_cache_get_runtime_request_hwm(device);
+    return r_max > SIZE_MAX - plan ? SIZE_MAX : plan + r_max;
+}
+
+// llama.cpp-kpjw: the live outside-arena headroom check for the hold's worst-case spill, run whatever the attention
+// mode. The unified allocator's overcommit guard compares a spill with the device's TOTAL memory minus what the
+// cache itself accounts for; it cannot see another tenant on the card or the driver's own reserve, so on a shared
+// card a spill it admits can fail late as OUT_OF_DEVICE_MEMORY or DEVICE_LOST. This asks the live free-memory
+// reading instead, once, at the transaction, so the context is refused by name. No non-FA reserve is added: that
+// constant is the empirical outside-arena consumer of the non-FA path and has no bearing on the hold's spill.
+static bool ggml_sycl_check_hold_spill_headroom(int device, size_t spill_bytes, bool probe_mode) {
+    if (spill_bytes == 0) {
+        return true;
+    }
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (!cache || !cache->arena_active()) {
+        return true;  // no arena, no hold
+    }
+    size_t free_mem = 0, total_mem = 0;
+    ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
+    if (total_mem == 0 || spill_bytes <= free_mem) {
+        return true;
+    }
+    const double mb = 1024.0 * 1024.0;
+    GGML_SYCL_RUNTIME_TXN_REFUSAL(
+        probe_mode,
+        "[SYCL-PLAN] runtime context update rejected: the planned dense scratch holds back the RUNTIME zone and "
+        "its worst-case spill outside the arena (%.1f MB: the plan plus the largest compute-buffer request) exceeds "
+        "device %d's live free memory (%.1f MB, over_by=%.1f MB); free VRAM on this card (another process, or a "
+        "smaller -ub / -c) before loading\n",
+        spill_bytes / mb, device, free_mem / mb, (spill_bytes - free_mem) / mb);
+    return false;
+}
+
 static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
                                                uint32_t n_ctx,
                                                uint32_t n_ubatch,
@@ -17215,7 +17274,8 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
                                                bool     probe_mode       = false,
                                                size_t   hold_spill_bytes = 0) {
     if (flash_attn_enabled) {
-        return true;
+        // The non-FA attention scratch does not exist with flash attention on, but the hold's spill does.
+        return ggml_sycl_check_hold_spill_headroom(device, hold_spill_bytes, probe_mode);
     }
     if (ggml_sycl::unified_cache_nonfa_attn_scratch_guard_disabled()) {
         // llama.cpp-pvjr: an explicit GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is a
@@ -17315,12 +17375,11 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     // already published still fits the device's current outside-arena
     // headroom, using the free-memory reading taken above.
 
-    // llama.cpp-kpjw: the worst case of a hold-induced spill is counted here, in the check that already asks what
-    // the device can take outside the arena. The planned dense scratch is held out of the RUNTIME zone's compute
-    // buffers, so up to the hold of them can land outside it; those bytes and the non-FA scratch compete for the
-    // same headroom. (Only a non-FA context is asked: with flash attention on this guard does not run, and the
-    // unified allocator's overcommit guard refuses a hold-induced spill the device cannot take, never evicting
-    // weights for it.) Saturating: a wrapped sum must not read as a small demand.
+    // llama.cpp-kpjw: the worst case of a hold-induced spill (ggml_sycl_planned_scratch_hold_spill_bound: the plan
+    // plus the largest spill-capable compute-buffer request, a bound that is a heuristic in r_max) is counted here,
+    // in the check that already asks what the device can take outside the arena; those bytes and the non-FA scratch
+    // compete for the same headroom. (A flash-attention context asks the same live free-memory question without the
+    // non-FA terms, at the top of this function.) Saturating: a wrapped sum must not read as a small demand.
     const size_t nonfa_scratch_demand =
         ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);
     const size_t nonfa_demand =
@@ -17355,7 +17414,7 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: non-FA attention scratch exceeds the device's "
         "outside-arena headroom -- n_ctx=%u n_ubatch=%u n_head=%u needs=%.1f MB (demand %.1f MB, of which %.1f MB "
-        "is the planned dense scratch's worst-case hold spill, + reserve %.1f MB) free=%.1f MB over_by=%.1f MB\n",
+        "is the planned dense scratch's worst-case hold spill bound, + reserve %.1f MB) free=%.1f MB over_by=%.1f MB\n",
         n_ctx, n_ubatch, n_head, needs_mb, demand_mb, hold_spill_bytes / mb, reserve_mb, free_mb, needs_mb - free_mb);
     // GGML_SYCL_NONFA_ATTN_SCRATCH_MB is NOT offered as a remediation here:
     // it only replaces the demand term d, not the reserve or the headroom
@@ -17879,14 +17938,20 @@ static void ggml_sycl_optional_layouts_retired() {
 // zero, all three count it where it is not. (The previous rule held f16 only once it was backed and so reserved
 // nothing for the first draw, the one that is refused when the zone is full.)
 //
-// The hold is per device, and the context that publishes it is recorded as its owner (teardown releases only its
-// own). Two live contexts on one device are not supported (canonical contract section 5), so the owner is not a
-// queue of holds: it is what stops one context's teardown dropping the hold the other still needs.
+// The hold is per device, and the context that publishes it is recorded as its owner, a monotonic context id (never
+// an address, which a later context can reuse); teardown releases only its own. Two live contexts on one device are
+// not supported (canonical contract section 5), so the owner is not a queue of holds: it is what stops one context's
+// teardown dropping the hold the other still needs.
 //
 // A hold persists while a buffer is short of its plan, including for a graph that counts no node for it: such a
 // graph proves nothing about the next one (a PP graph can draw what a decode graph does not). The idle part is
 // bounded by the plan, which exists only for a model with dense quantized weights, and it binds only spill-capable
 // RUNTIME requests, which spill (counted, warned about, refused if the device cannot take them) rather than fail.
+// That bound is permanent in two runs that never draw the f16 buffers: a decode-only run (n_batch below every f16
+// route's floor, no prompt batch large enough) and a run whose prompts all take the oneDNN PP route, which brings
+// its own copies from the ONEDNN zone. The f16 plan stays unmet there, so its share of the hold stands for the whole
+// context lifetime. That is deliberate (the first draw is the one that is refused when the zone is full), and it is
+// bounded: the f16 plan only.
 static void ggml_sycl_planned_scratch_hold_refresh(ggml_backend_sycl_context & ctx) {
     const int                            d         = ctx.device;
     const ggml_sycl::zone_planned_buffer buffers[] = {
@@ -17900,7 +17965,7 @@ static void ggml_sycl_planned_scratch_hold_refresh(ggml_backend_sycl_context & c
     if (!ggml_sycl::zone_planned_scratch_hold_bytes(buffers, 3, &hold)) {
         hold = 0;  // an overflowing plan was published as zero; there is nothing coherent to hold
     }
-    ggml_sycl::unified_cache_set_planned_scratch_hold(d, hold, &ctx);
+    ggml_sycl::unified_cache_set_planned_scratch_hold(d, hold, ctx.planned_scratch_owner);
 }
 
 // llama.cpp-kpjw: the runtime-context transaction re-plans the dense scratch at the runtime n_ubatch and drops the
@@ -17908,22 +17973,21 @@ static void ggml_sycl_planned_scratch_hold_refresh(ggml_backend_sycl_context & c
 // changes nothing, so its guard is inert. The hold is the OWNER's: the guard zeroes it for this context and puts
 // back whatever (hold, owner) pair it found.
 struct ggml_sycl_dense_scratch_txn_guard {
-    int          device;
-    const void * owner;
-    bool         active;
-    bool         committed     = false;
-    uint32_t     prev_n_ubatch = 0;
-    size_t       prev_hold     = 0;
-    const void * prev_owner    = nullptr;
+    int      device;
+    uint64_t owner;
+    bool     active;
+    bool     committed     = false;
+    uint32_t prev_n_ubatch = 0;
+    size_t   prev_hold     = 0;
+    uint64_t prev_owner    = 0;
 
     ggml_sycl_dense_scratch_txn_guard(ggml_backend_sycl_context & ctx, bool publish) :
         device(ctx.device),
-        owner(&ctx),
+        owner(ctx.planned_scratch_owner),
         active(publish) {
         if (active) {
             prev_n_ubatch = ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(device);
-            prev_hold     = ggml_sycl::unified_cache_get_planned_scratch_hold(device);
-            prev_owner    = ggml_sycl::unified_cache_get_planned_scratch_hold_owner(device);
+            ggml_sycl::unified_cache_get_planned_scratch_hold_state(device, &prev_hold, &prev_owner);
             // The transaction places the MoE MMID pools in this zone; they are not the compute buffers the hold
             // exists to keep out, and the ring admission already counts the plan against the zone.
             ggml_sycl::unified_cache_set_planned_scratch_hold(device, 0, owner);
@@ -17935,7 +17999,8 @@ struct ggml_sycl_dense_scratch_txn_guard {
     ~ggml_sycl_dense_scratch_txn_guard() {
         if (active && !committed) {
             if (prev_n_ubatch != 0) {
-                (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(device, prev_n_ubatch);
+                // A rollback restores an exact earlier plan, not a merge, so it never keeps a larger input.
+                (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(device, prev_n_ubatch, false);
             }
             ggml_sycl::unified_cache_set_planned_scratch_hold(device, prev_hold, prev_owner);
         }
@@ -18598,13 +18663,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // n_ubatch/n_head arguments directly, against a fresh live free-memory
     // read that always happens) -- so allow_replan=false gives the identical
     // answer for a probe, just without the zone-growth side effect.
-    // llama.cpp-kpjw: the plan this transaction is about to publish is the most the hold can be, and what a
-    // hold-induced spill can add outside the arena; the check below counts it with the non-FA scratch.
-    size_t hold_spill_bytes = 0;
-    if (next_kv_info.n_ubatch != 0) {
-        (void) ggml_sycl::unified_cache_planned_dense_scratch_bytes_at(ctx->device, next_kv_info.n_ubatch,
-                                                                       &hold_spill_bytes);
-    }
+    // llama.cpp-kpjw: the worst-case outside-arena spill the hold can cause at the n_ubatch this transaction is about
+    // to publish; the check below counts it (with the non-FA scratch when flash attention is off).
+    const size_t hold_spill_bytes = ggml_sycl_planned_scratch_hold_spill_bound(ctx->device, next_kv_info.n_ubatch);
     if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head_all_max,
                                             flash_attn_enabled,
                                             /*allow_replan=*/!probe_mode, probe_mode, hold_spill_bytes)) {
@@ -18642,7 +18703,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     }
     ggml_sycl_dense_scratch_txn_guard dense_guard(*ctx, !probe_mode);
     if (!probe_mode && next_kv_info.n_ubatch != 0) {
-        (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(ctx->device, next_kv_info.n_ubatch);
+        // Another context live on this device keeps the larger n_ubatch in the plan it is running on.
+        (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(
+            ctx->device, next_kv_info.n_ubatch, ggml_sycl_other_backend_context_live(ctx->device, ctx));
     }
 
     // llama.cpp-ibj0: the PP MoE oneDNN scratch ring was sized at model load
@@ -19275,7 +19338,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
     const bool ok = ggml_sycl_check_nonfa_attn_scratch(
         ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
         current->plan->planner_n_head_all_max, flash_attn_enabled,
-        /*allow_replan=*/false, /*probe_mode=*/false, ggml_sycl::unified_cache_get_planned_scratch_hold(ctx->device));
+        /*allow_replan=*/false, /*probe_mode=*/false,
+        ggml_sycl_planned_scratch_hold_spill_bound(ctx->device, current->plan->planner_n_ubatch));
     return ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
 }
 
@@ -26168,6 +26232,19 @@ static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int 
     std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
     const auto & contexts = g_backend_context_by_device[device];
     return contexts.empty() ? nullptr : contexts.back();
+}
+
+static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_sycl_context * self) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
+    for (const ggml_backend_sycl_context * c : g_backend_context_by_device[device]) {
+        if (c != self) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Check if a tensor's buffer allocation is in device VRAM (not host-pinned fallback).
@@ -44205,7 +44282,7 @@ void ggml_backend_sycl_context::log_planned_scratch_stats() {
         // so the planned scratch could still be materialized). Taken here, so the count is per context.
         uint64_t hold_spills      = 0;
         size_t   hold_spill_bytes = 0;
-        ggml_sycl::unified_cache_take_planned_hold_spills(dev, &hold_spills, &hold_spill_bytes);
+        ggml_sycl::unified_cache_take_planned_hold_spills(dev, planned_scratch_owner, &hold_spills, &hold_spill_bytes);
         if (hold_spills != 0) {
             GGML_LOG_WARN("[SCRATCH-STATS] device=%d hold_spills=%llu hold_spill_bytes=%.1f KB\n", dev,
                           (unsigned long long) hold_spills, hold_spill_bytes / 1024.0);
@@ -44247,7 +44324,7 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     dequant_f16_src1_scratch.release();
     // The buffers this context was owed are gone with it; nothing is left to hold the zone for. Only a hold this
     // context published: another live context's hold is not ours to clear.
-    (void) ggml_sycl::unified_cache_release_planned_scratch_hold(device, this);
+    (void) ggml_sycl::unified_cache_release_planned_scratch_hold(device, planned_scratch_owner);
     for (auto & [tensor, extra] : runtime_tensor_extras) {
         (void) tensor;
         release_extra_gpu(extra);
@@ -99206,9 +99283,9 @@ static bool ggml_sycl_mul_mat_kernel_draws_dequant_f16(ggml_sycl_mul_mat_kernel 
 // reserves nothing the plan did not.
 //
 // Each walk asks this once per multi-row node, so a node the unified kernel declines costs the router two calls
-// per walk and four per graph. The walks run once per graph on the submission thread, not per token, and the
-// router answer is a table lookup; a per-node cache would have to be sized per graph on this path, which costs
-// more than the repeated lookup.
+// per walk and four per graph. The walks run once per graph on the submission thread, not per token. The cost of
+// the repeated select() calls has NOT been measured; a per-node cache was not added because it would have to be
+// sized per graph on this path, and nothing here shows the repeated calls are the larger cost.
 using ggml_sycl_kernel_draws_fn = bool (*)(ggml_sycl_mul_mat_kernel);
 
 static bool ggml_sycl_mul_mat_scratch_route(ggml_backend_sycl_context & ctx,
@@ -99403,7 +99480,7 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
 // a quiet scope: it would otherwise repeat, once per node per graph, the "kernel not eligible" WARNs that the
 // dispatch itself logs for the same node.
 static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
-#    if GGML_SYCL_DNNL && defined(GGML_SYCL_F16)
+#    if GGML_SYCL_DEQUANT_F16_ARM
     struct device_demand_t {
         size_t              src0_bytes = 0;
         size_t              src1_bytes = 0;

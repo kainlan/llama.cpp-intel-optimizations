@@ -1666,7 +1666,9 @@ size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool sr
 // llama.cpp-kpjw: re-derive both dense scratch plans at `n_ubatch` from the inputs the load-time setters were last
 // given. The runtime-context transaction calls it with the runtime n_ubatch (auto-ubatch picks it after load).
 // False when nothing was planned for the device or a figure overflowed.
-bool     unified_cache_replan_planned_dense_scratch(int device_id, uint32_t n_ubatch);
+// `other_model_live`: another context is live on THIS device, so the plan's n_ubatch is the larger of the stored
+// and the new one (a rollback that restores an exact earlier value passes false).
+bool     unified_cache_replan_planned_dense_scratch(int device_id, uint32_t n_ubatch, bool other_model_live = false);
 uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id);
 // The plan's total bytes at `n_ubatch` without changing the published plan (a probe asks this).
 bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out);
@@ -1682,23 +1684,31 @@ bool     unified_cache_dense_scratch_runtime_fit(int        device_id,
 // RUNTIME-zone bytes a spill-capable allocation must leave free for the planned dense scratch
 // (zone_planned_scratch_hold_bytes). Published by the backend context that owns the buffers; zero when every
 // planned buffer holds its plan. Forbid-spill requests are the claimants and are never held back.
-// The hold records WHICH backend context published it: a context that goes away releases only its own hold
-// (unified_cache_release_planned_scratch_hold returns false and changes nothing for any other owner), so the
-// teardown of one context cannot drop the hold another live context still depends on.
-void         unified_cache_set_planned_scratch_hold(int device_id, size_t bytes, const void * owner);
+// The hold records WHICH backend context published it, as a monotonic context id (unified_cache_mint_planned_
+// scratch_owner; never an address, which a later context can reuse). A context that goes away releases only its
+// own hold (unified_cache_release_planned_scratch_hold returns false and changes nothing for any other owner), so
+// the teardown of one context cannot drop the hold another live context still depends on. The (bytes, owner) pair
+// moves as one unit behind a mutex.
+uint64_t unified_cache_mint_planned_scratch_owner();
+void     unified_cache_set_planned_scratch_hold(int device_id, size_t bytes, uint64_t owner);
 size_t   unified_cache_get_planned_scratch_hold(int device_id);
-const void * unified_cache_get_planned_scratch_hold_owner(int device_id);
-bool         unified_cache_release_planned_scratch_hold(int device_id, const void * owner);
+void     unified_cache_get_planned_scratch_hold_state(int device_id, size_t * bytes, uint64_t * owner);
+bool     unified_cache_release_planned_scratch_hold(int device_id, uint64_t owner);
+// The largest spill-capable RUNTIME request seen on the device since the hold's owner last released it. A held-back
+// request spills WHOLE, so the most the hold can push outside the arena is the hold plus the largest such request
+// (when a request is spilled, the zone has less than hold + request free, and free only falls).
+void     unified_cache_note_runtime_request(int device_id, size_t bytes);
+size_t   unified_cache_get_runtime_request_hwm(int device_id);
 // A spill-capable RUNTIME request that the hold kept out of the zone (it spills exactly as it would if the zone
 // were full). Counted per device, and the first one since the last take is a WARN naming the requester `tag` and
-// the bytes: a hold-induced spill was silent. The context takes (and so resets) the count at teardown and
-// reports it with its [SCRATCH-STATS] lines.
-void         unified_cache_note_planned_hold_spill(int          device_id,
-                                                   const char * tag,
-                                                   size_t       bytes,
-                                                   size_t       hold,
-                                                   size_t       available);
-void         unified_cache_take_planned_hold_spills(int device_id, uint64_t * count, size_t * bytes);
+// the bytes: a hold-induced spill was silent. The owning context takes (and so resets) the count at teardown and
+// reports it with its [SCRATCH-STATS] lines; a take by any other context leaves the count alone.
+void     unified_cache_note_planned_hold_spill(int          device_id,
+                                               const char * tag,
+                                               size_t       bytes,
+                                               size_t       hold,
+                                               size_t       available);
+void     unified_cache_take_planned_hold_spills(int device_id, uint64_t owner, uint64_t * count, size_t * bytes);
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno
