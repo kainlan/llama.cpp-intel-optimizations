@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,10 @@ def graph_compute_impl_body(src: str) -> str:
     return src[open_brace:close_brace]
 
 
+def strip_comments(source: str) -> str:
+    return re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.DOTALL)
+
+
 def assert_no_waits(source: str) -> None:
     assert ".wait(" not in source
     assert "wait_and_throw" not in source
@@ -50,7 +55,10 @@ def test_graph_compute_impl_notes_timeline_decode_step_once_without_waits() -> N
     local_hook_window = body[max(0, hook_pos - 200) : min(len(body), hook_pos + 400)]
 
     assert hook_pos < spans_enabled < guard
-    assert_no_waits_or_flush(local_hook_window)
+    # Comment-blind: llama.cpp-os8k (95adb0460) put a comment about flushing the PREVIOUS graph_compute's e2e
+    # stage split right after this hook, which is not a flush of anything here. The call it describes,
+    # e2e_tg_profile_note_new_graph_compute(), only prints the host-side stats under its own env gate.
+    assert_no_waits_or_flush(strip_comments(local_hook_window))
 
 
 def test_graph_compute_impl_has_timeline_scope_after_reentry_guard() -> None:
@@ -92,7 +100,8 @@ def test_compute_forward_early_handled_route_has_timeline_scope_metadata() -> No
 
 def test_compute_forward_switch_has_timeline_scope_metadata() -> None:
     src = read_source()
-    begin = src.index("static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {")
+    # The dispatch body lives in ggml_sycl_compute_forward_impl since 2c3367985 (2gag/sbky); the old name is a wrapper.
+    begin = src.index("static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {")
     switch = src.index("switch (dst->op)", begin)
     preceding_window = src[max(0, switch - 2500) : switch]
 
