@@ -861,6 +861,13 @@ mem_handle detail::from_legacy_owned_alloc(alloc_handle && handle, ggml_layout_m
     return promotion ? mem_handle::from_owned_alloc(std::move(promotion.owner), layout) : mem_handle{};
 }
 
+uint32_t mem_handle::owner_use_count() const noexcept {
+    // Taken for the reason owns_allocation() takes it: copy- and move-assignment replace
+    // owned_alloc_ under lock_, so an unlocked read would race an assignment into this object.
+    mem_handle_lock_guard g(lock_);
+    return owned_alloc_.use_count();
+}
+
 mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
     // An ownerless DIRECT may derive a view only when its creator explicitly
     // minted a finite extent. This is bounded address authority, not lifetime

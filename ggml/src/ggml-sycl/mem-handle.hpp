@@ -447,6 +447,13 @@ class mem_handle {
         return static_cast<bool>(owned_alloc_);
     }
 
+    // Read-only snapshot of how many references share this handle's intrusive
+    // allocation owner: every mem_handle copy, assignment and slice of it (all
+    // three copy owned_alloc_). 0 means the handle carries no intrusive owner,
+    // which says nothing about whether anyone else holds the storage.
+    // Never a release decision: release happens only through a handle.
+    uint32_t owner_use_count() const noexcept;
+
     // Identity of the allocation owner control this handle retains: the one
     // from_owned_alloc() adopted, shared by every copy and slice of it. It is
     // minted once per control and never reused, so it cannot name a later

@@ -3815,6 +3815,7 @@ WITNESSES = {
     "s2c-host": "host raw allocator names (malloc_host, aligned_alloc_host, zeMemAllocHost, sycl::malloc, the host chain's wrappers)",
     "s3q": "clause (q): the C library's allocation primitives (mmap, posix_memalign, memalign, aligned_alloc, malloc, calloc, realloc, "
            "VirtualAlloc) outside the allowlist; the committed entries are pinned by function, name and count",
+    "s31-l": "clause (l) is enforced once mem_handle::owner_use_count exists, and dormant again when it is gone",
     "s3q-data": "an E-LIBC debt entry needs a fate and a cite, and an E-LIBC allowlist entry a name",
     "s3q-pin": "the CHECK_TRY_ERROR handler's debt entry carries converted-by-5.4a and no other fate, and no other entry may carry a fate",
     "s2c-catch": "spellings and placements of the rethrow clause", "s2c-data": "clause-(h) entries that must be refused by validation",
@@ -4803,6 +4804,7 @@ def matrix_cases():
     c.extend(matrix_cases_s2d4())
     c.extend(matrix_cases_s2d5())
     c.extend(matrix_cases_s3q())
+    c.extend(matrix_cases_s31())
     return c
 
 
@@ -5716,6 +5718,20 @@ def matrix_cases_s3q():
            edit_debt=catch_debt(lambda e: dict(e, fate="converted-by-5.4a"), is_other_catch), planted=False))
     A(Case("s3q-pin", "an N-VOID entry carrying a fate fails", lambda f: f, "FAIL", "data", "carries a fate",
            edit_debt=catch_debt(lambda e: dict(e, fate="deleted-by-step-7"), lambda e: e["code"] == "N-VOID"), planted=False))
+    return c
+
+
+def matrix_cases_s31():
+    """S3-1: mem_handle::owner_use_count exists, so clause (l) is enforced on the real tree."""
+    c = []
+    A = c.append
+    A(Case("s31-l", "the real tree declares and defines owner_use_count, so clause (l) is enforced, not dormant", lambda f: f, "PASS",
+           active="l", planted=False))
+    A(Case("s31-l", "a new caller of owner_use_count outside the allowlist is a finding on the real tree", plant(
+        "bool zzplant_l(mem_handle & h) {\n    return h.owner_use_count() > 1;\n}\n"), "FAIL", "L-CALLER", "zzplant_l"))
+    A(Case("s31-l", "the accessor renamed in mem-handle.hpp and mem-handle.cpp makes the clause dormant again", lambda f: dict(
+        f, **{rel: f[rel].replace(b"owner_use_count", b"owner_use_count_zz") for rel in ("mem-handle.hpp", "mem-handle.cpp")}),
+        "PASS", dormant="l", planted=False))
     return c
 
 
