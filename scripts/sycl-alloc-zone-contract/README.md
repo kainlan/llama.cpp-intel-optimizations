@@ -61,6 +61,14 @@ whitespace collapsed), so a write added to, or removed from, a listed constructi
 same function, so adding a compliant twin cannot move a listed key. No line or byte offset appears, so adding code above a construction does not move its key;
 changing the construction does, which is when its entry should be revisited.
 
+## Tests and sharding
+
+Five ctests register the gate (`ggml/src/ggml-sycl/CMakeLists.txt`): `test-sycl-alloc-zone-contract` is the plain gate (fast), and
+`test-sycl-alloc-zone-contract-m0` .. `-m3` run the mutation matrix in four shards (`--mutation-matrix --shard K/N`, every n-th
+case from K, TIMEOUT 600 each). Every shard re-checks the unmutated baseline; shard 0 also runs the coverage checks (every
+witness has a FAIL case), the process-level witnesses and the check of this registration. The matrix costs about 0.7 s a case,
+so grow N (and the `foreach` list, which the check pins) before a shard approaches its TIMEOUT.
+
 ## Dependency
 
 The gate parses C++ with tree-sitter: `pip install tree-sitter-language-pack` in the python3 that CMake finds.

@@ -128,7 +128,7 @@ Dependency
   CMake finds. A missing module is a FAIL (exit 1) and the message names it; there is no skip.
 
 Usage:
-  check-sycl-alloc-zone-contract.py [--root REPO] [--mutation-matrix]
+  check-sycl-alloc-zone-contract.py [--root REPO] [--mutation-matrix [--shard K/N]]
   check-sycl-alloc-zone-contract.py [--root REPO] --list
   check-sycl-alloc-zone-contract.py [--root REPO] --write-debt [--allow-growth]
 """
@@ -3570,14 +3570,58 @@ def m9_witness():
 
 
 def cmake_witness(root):
-    """The ctest registration must never pass a regeneration flag."""
+    """The ctest registrations never pass a regeneration flag, the plain gate is its own test, and the matrix shards are
+    registered in full: a foreach over 0..N-1 whose command passes `--shard ${var}/N`, each with a TIMEOUT."""
     text = (Path(root) / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
-    blocks = [m.group(0) for m in re.finditer(r"add_test\(NAME test-sycl-alloc-zone-contract.*?\)", text, flags=re.S)]
-    ok = len(blocks) == 1 and "--write-debt" not in blocks[0] and "--allow-growth" not in blocks[0] \
-        and "--mutation-matrix" in blocks[0]
-    props = re.findall(r"set_tests_properties\(test-sycl-alloc-zone-contract PROPERTIES[^)]*\)", text)
-    ok = ok and len(props) == 1 and re.search(r"\bTIMEOUT\s+\d+", props[0]) is not None
-    return ok, "%d registration(s), timeout %s" % (len(blocks), "set" if props and "TIMEOUT" in props[0] else "MISSING")
+    plain = [m.group(0) for m in re.finditer(r"add_test\(NAME test-sycl-alloc-zone-contract\s[^)]*\)", text, flags=re.S)]
+    loops = [m for m in re.finditer(r"foreach\((\w+)((?:\s+\d+)+)\s*\)(.*?)endforeach\(\)", text, flags=re.S)
+             if "test-sycl-alloc-zone-contract-m" in m.group(3)]
+    loop = loops[0] if len(loops) == 1 else None
+    ok = len(plain) == 1 and "--mutation-matrix" not in plain[0] and loop is not None
+    detail = "%d plain registration(s)" % len(plain)
+    if loop is not None:
+        var, idx, body = loop.group(1), [int(x) for x in loop.group(2).split()], loop.group(3)
+        m = re.search(r"--shard\s+\$\{%s\}/(\d+)" % re.escape(var), body)
+        n = int(m.group(1)) if m else -1
+        props = re.findall(r"set_tests_properties\([^)]*\)", body)
+        ok = ok and "--mutation-matrix" in body and n == len(idx) == SHARDS and idx == list(range(n)) \
+            and "NAME test-sycl-alloc-zone-contract-m${%s}" % var in body \
+            and len(props) == 1 and re.search(r"\bTIMEOUT\s+\d+", props[0]) is not None
+        detail += ", %d shard(s) of %d, timeout %s" % (len(idx), n, "set" if props and "TIMEOUT" in props[0] else "MISSING")
+    region = "".join(plain) + (loop.group(0) if loop is not None else "")
+    ok = ok and "--write-debt" not in region and "--allow-growth" not in region
+    return ok, detail
+
+
+def cmake_mutants(root):
+    """cmake_witness must fail on a registration that drops a shard, miscounts them, passes a regeneration flag, loses
+    the plain test or a TIMEOUT, and pass on the real one: a witness that cannot fail proves nothing."""
+    import tempfile
+    rel = "ggml/src/ggml-sycl/CMakeLists.txt"
+    text = (Path(root) / rel).read_text()
+    mutants = [
+        ("drops shard 3 from the foreach", lambda t: t.replace("foreach(zc_shard 0 1 2 3)", "foreach(zc_shard 0 1 2)", 1)),
+        ("passes the wrong shard count", lambda t: t.replace("${zc_shard}/4", "${zc_shard}/5", 1)),
+        ("passes --write-debt to a shard", lambda t: t.replace("--mutation-matrix --shard", "--write-debt --mutation-matrix --shard", 1)),
+        ("loses the plain gate's test", lambda t: t.replace("add_test(NAME test-sycl-alloc-zone-contract\n", "add_test(NAME test-sycl-alloc-zone-contract-x\n", 1)),
+        ("loses a shard's TIMEOUT", lambda t: t.replace('"sycl;host-only;ast;mutation" TIMEOUT 600', '"sycl;host-only;ast;mutation"', 1)),
+        ("runs the matrix in the plain test", lambda t: t.replace("../../..)\n    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES",
+                                                                    "../../.. --mutation-matrix)\n    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES", 1)),
+    ]
+    out = []
+    for label, fn in mutants:
+        m = fn(text)
+        if m == text:
+            out.append(("a registration that %s is refused" % label, False, "mutation did not apply"))
+            continue
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "ggml/src/ggml-sycl").mkdir(parents=True)
+            (Path(d) / rel).write_text(m)
+            ok, detail = cmake_witness(d)
+        out.append(("a registration that %s is refused" % label, not ok, detail))
+    ok, detail = cmake_witness(root)
+    out.append(("the real registration is accepted", ok, detail))
+    return out
 
 
 def m14_witness(files, allowlist, debt):
@@ -3598,7 +3642,26 @@ def m14_witness(files, allowlist, debt):
     return res
 
 
-def run_matrix(files, allowlist, debt, root):
+SHARDS = 4   # the ctest registers this many shards; cmake_witness pins the registration to it
+
+
+def shard_slice(cases, k, n):
+    """Shard k of n: every n-th case from k. Deterministic, so the union over k is the case list and no case repeats."""
+    return cases[k::n]
+
+
+def parse_shard(text):
+    m = re.fullmatch(r"(\d+)/(\d+)", text or "")
+    if not m or not (0 <= int(m.group(1)) < int(m.group(2))):
+        raise SystemExit("--shard takes K/N with 0 <= K < N, got %r" % text)
+    return int(m.group(1)), int(m.group(2))
+
+
+def run_matrix(files, allowlist, debt, root, shard=None):
+    """`shard` is (k, n) or None. Every shard re-checks the unmutated baseline and runs its slice of the cases. Shard 0 also
+    runs the coverage checks (every witness has a FAIL case, no case names an unknown witness, the matcher's self-test)
+    and the process-level witnesses, so the whole matrix is still checked exactly once; a plain run is shard 0 of 1."""
+    k, n = shard if shard else (0, 1)
     fails, report, _, _ = run_gate(files, allowlist, debt)
     if fails:
         print("FAIL: the unmutated baseline is red, so a matrix scored against it proves nothing:")
@@ -3607,20 +3670,23 @@ def run_matrix(files, allowlist, debt, root):
         return 1
     print("baseline: PASS (the matrix is scored against a green tree)")
     bad = 0
-    cases = matrix_cases()
-    for w in sorted(set(c.wid for c in cases) - set(WITNESSES)):
-        print("FAIL: case witness %s is not in WITNESSES" % w)
-        bad += 1
-    for w in WITNESSES:
-        if w in ("f", "cmake", "m6", "m9", "m14", "r2m4", "r2m8"):
-            continue
-        if not any(c.wid == w and c.expect == "FAIL" for c in cases):
-            print("FAIL: witness %s has no FAIL case" % w)
+    all_cases = matrix_cases()
+    cases = shard_slice(all_cases, k, n)
+    print("shard %d/%d: %d of %d case(s)" % (k, n, len(cases), len(all_cases)))
+    if k == 0:
+        for w in sorted(set(c.wid for c in all_cases) - set(WITNESSES)):
+            print("FAIL: case witness %s is not in WITNESSES" % w)
             bad += 1
-    print("deferred: " + "; ".join("witness %s (%s)" % kv for kv in WITNESSES_DEFERRED.items()))
-    if not (names_new("FAIL new D-ZONE-COUNT x", "D-ZONE-COUNT") and not names_new("FAIL new D-ZONE-COUNT x", "D-ZONE")):
-        print("FAIL: the matcher's own self-test (prefix collision) is wrong")
-        bad += 1
+        for w in WITNESSES:
+            if w in ("f", "cmake", "m6", "m9", "m14", "r2m4", "r2m8"):
+                continue
+            if not any(c.wid == w and c.expect == "FAIL" for c in all_cases):
+                print("FAIL: witness %s has no FAIL case" % w)
+                bad += 1
+        print("deferred: " + "; ".join("witness %s (%s)" % kv for kv in WITNESSES_DEFERRED.items()))
+        if not (names_new("FAIL new D-ZONE-COUNT x", "D-ZONE-COUNT") and not names_new("FAIL new D-ZONE-COUNT x", "D-ZONE")):
+            print("FAIL: the matcher's own self-test (prefix collision) is wrong")
+            bad += 1
     for case in cases:
         ok, got = evaluate_case(files, allowlist, debt, case)
         print("%s witness %-4s %-80s expect %s" % ("ok  " if ok else "FAIL", case.wid, case.label, case.expect))
@@ -3630,17 +3696,20 @@ def run_matrix(files, allowlist, debt, root):
                 print("       got: " + g)
             if not got:
                 print("       got: PASS")
-    extra = [("f", "missing tree_sitter_language_pack exits 1 and names it") + f_witness_missing_pack(),
-             ("m9", "an unscanned .inl file fails the gate") + m9_witness(),
-             ("cmake", "the ctest registration carries no regeneration flag") + cmake_witness(root)]
-    extra += [("m6", label, ok, d) for label, ok, d in m6_witnesses()]
-    extra += [("r2m4", label, ok, d) for label, ok, d in r2m4_witnesses(allowlist)]
-    extra += [("r2m8", label, ok, d) for label, ok, d in r2m8_witnesses()]
-    extra += [("m14", label, ok, d) for label, ok, d in m14_witness(files, allowlist, debt)]
+    extra = []
+    if k == 0:
+        extra = [("f", "missing tree_sitter_language_pack exits 1 and names it") + f_witness_missing_pack(),
+                 ("m9", "an unscanned .inl file fails the gate") + m9_witness(),
+                 ]
+        extra += [("cmake", label, ok, d) for label, ok, d in cmake_mutants(root)]
+        extra += [("m6", label, ok, d) for label, ok, d in m6_witnesses()]
+        extra += [("r2m4", label, ok, d) for label, ok, d in r2m4_witnesses(allowlist)]
+        extra += [("r2m8", label, ok, d) for label, ok, d in r2m8_witnesses()]
+        extra += [("m14", label, ok, d) for label, ok, d in m14_witness(files, allowlist, debt)]
     for wid, label, ok, detail in extra:
         print("%s witness %-4s %-80s (%s)" % ("ok  " if ok else "FAIL", wid, label, str(detail)[:80]))
         bad += 0 if ok else 1
-    print("matrix: %d case(s), %d wrong" % (len(cases) + len(extra), bad))
+    print("matrix shard %d/%d: %d case(s), %d wrong" % (k, n, len(cases) + len(extra), bad))
     return 1 if bad else 0
 
 
@@ -3651,6 +3720,8 @@ def main():
     ap.add_argument("--root", default=str(Path(__file__).resolve().parent.parent))
     ap.add_argument("--data", default=None, help="directory holding allowlist.json and debt.json")
     ap.add_argument("--mutation-matrix", action="store_true")
+    ap.add_argument("--shard", default=None, metavar="K/N",
+                    help="with --mutation-matrix, run shard K of N (shard 0 also runs the coverage and process-level witnesses)")
     ap.add_argument("--list", action="store_true", help="print every finding before the allowlist and debt")
     ap.add_argument("--write-debt", action="store_true",
                     help="rewrite debt.json from the current tree; refuses to add entries. Never used by the ctest")
@@ -3660,6 +3731,8 @@ def main():
         ap.error("--allow-growth only means something with --write-debt")
     if a.mutation_matrix and (a.list or a.write_debt):
         ap.error("--mutation-matrix cannot be combined with --list or --write-debt")
+    if a.shard is not None and not a.mutation_matrix:
+        ap.error("--shard only means something with --mutation-matrix")
     data = Path(a.data) if a.data else Path(a.root) / "scripts" / "sycl-alloc-zone-contract"
     try:
         allowlist = load_json(data / "allowlist.json", {"entries": []}, "entries")
@@ -3707,7 +3780,7 @@ def main():
         return 1
     print("PASS: no new violation, no stale debt, no stale allowlist entry")
     if a.mutation_matrix:
-        return run_matrix(files, allowlist, debt, a.root)
+        return run_matrix(files, allowlist, debt, a.root, parse_shard(a.shard) if a.shard else None)
     return 0
 
 

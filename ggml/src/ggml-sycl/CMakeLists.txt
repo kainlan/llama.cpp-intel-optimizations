@@ -135,15 +135,24 @@ if (BUILD_TESTING)
     # llama.cpp-23mk S2: the allocation-zone contract. A tree-sitter parse of every non-test
     # ggml-sycl source; each request construction names its tier by literal, a device request names
     # its zone and forbids the spill, and raw allocator names stay inside the allowlisted functions.
-    # --mutation-matrix runs the gate and then its witnesses on in-memory mutants of the tree, so a
-    # check that can no longer fail is itself a failure. Needs tree_sitter_language_pack
-    # (`pip install tree-sitter-language-pack` in the Python3 found above): a missing pack FAILS
-    # (exit 1), it never skips. Allocates nothing; safe at any parallelism.
+    # The plain gate is its own fast test. --mutation-matrix then runs the witnesses on in-memory mutants of the
+    # tree, so a check that can no longer fail is itself a failure; the matrix is sharded (--shard K/N, every
+    # n-th case) so each test stays far inside its TIMEOUT as cases grow. Every shard re-checks the unmutated
+    # baseline; shard 0 also runs the coverage and process-level witnesses, and checks this registration.
+    # Needs tree_sitter_language_pack (`pip install tree-sitter-language-pack` in the Python3 found above):
+    # a missing pack FAILS (exit 1), it never skips. Allocates nothing; safe at any parallelism.
     add_test(NAME test-sycl-alloc-zone-contract
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-alloc-zone-contract.py
-                --root ${CMAKE_CURRENT_SOURCE_DIR}/../../.. --mutation-matrix)
-    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES LABELS "sycl;host-only;ast;mutation" TIMEOUT 600)
+                --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
+    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES LABELS "sycl;host-only;ast" TIMEOUT 120)
+    foreach(zc_shard 0 1 2 3)
+        add_test(NAME test-sycl-alloc-zone-contract-m${zc_shard}
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-alloc-zone-contract.py
+                    --root ${CMAKE_CURRENT_SOURCE_DIR}/../../.. --mutation-matrix --shard ${zc_shard}/4)
+        set_tests_properties(test-sycl-alloc-zone-contract-m${zc_shard} PROPERTIES LABELS "sycl;host-only;ast;mutation" TIMEOUT 600)
+    endforeach()
 endif()
 
 # P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp
