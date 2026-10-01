@@ -3,16 +3,43 @@
 //
 // What this proves, and what it does not.  The header models the lock order, the
 // thread_local scope, the residency answer, the two-phase guard and the release
-// proc over opaque handles.  H8's registry arms (the scope, the residency answer
-// under and outside a scope, a mixed device set, publish A / publish B / create
-// A) and H9's lock-discipline arms that need no device are scored here.  The arms
-// that need a lifecycle body, a ledger, MMID or the republish allowlist are L4+
-// work and are not scored here.
+// proc over opaque handles.  Scored here:
+//   H8   the scope is thread_local; nested begin aborts and a refused guard does
+//        not close the outer scope; the residency answer under, outside and
+//        across scopes (mixed device set; publish A / publish B / create A); the
+//        attach reads the owner device's registry; four contexts x two buffers on
+//        four threads, every thread's slots checked, one thread parked mid-attach
+//        and its own result read after the release, with a global-scope control;
+//   H9   the lock witness and its controls; registry copy-in/copy-out and drops
+//        outside the lock; the outermost-only token; the two-phase guard; the
+//        release proc (steps 1-3 of §2.4.2) with its fence hand-off, idempotence,
+//        L0 wait, re-entry, order and lock-failure arms.
+//
+// Deferred, by H9 sub-id, and not scored here (each needs a lifecycle body, the
+// ledger, MMID or the republish allowlist, so it belongs to L4 or later):
+//   H9 failpoint sweep  head-slot refusal, accounting refusal, non-FA refusal,
+//                       yield relock, carve of device 0 of 2, MMID, CAS; each with
+//                       "registry and slot table unchanged", "no yield before step
+//                       5" and ring rows still in their original slots at MMID/CAS;
+//   H9 first-context    the FIRST_CONTEXT range re-record in the guard (the guard
+//                       here takes a generic callback);
+//   H9 concurrency      serialized concurrent re-plan pairings (zero busy or lost
+//                       CAS, with their REDs); A's transaction between B's early
+//                       stage and load_end; A in a transaction then B loads (the
+//                       probe and FA recheck);
+//   H9 lifecycle        can_unload against a pending unload; reactivation and
+//                       complete_unload holding L0 (runs 1 and 2); load-B-while-A-
+//                       holds-rows (r7fz) fixtures (1), (2), (3);
+//   H9 (4) ONEDNN, (5) SCRATCH, (5b), (5c)  the ledger arms, including the later-
+//                       load weight-slot store;
+//   H2  the H_A2 constant and the jehw-pipeline capacity RED (A2 runs at H = 0, 10
+//                       and 11 MiB here; the RED is a leased top copy), and the
+//                       MTP and assistant shapes.
 //
 // Every arm that asserts an absence (no violation, no drop under a lock, no
 // block) is paired with a positive control that provokes the very thing it looks
-// for, so a zero is a measurement.  The mutations that were run against this file
-// are listed with each arm.
+// for, so a zero is a measurement.  The mutations run against the arms are
+// recorded in the commit messages of this file, not here.
 //
 // The build is -DNDEBUG, so CHECK is explicit and always runs.
 
@@ -23,6 +50,7 @@
 #include <cstdio>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -90,7 +118,8 @@ struct drop_log {
 kv_region_handle make_handle(drop_log & log) {
     return kv_region_handle(new int(0), [&log](void * p) {
         log.drops.fetch_add(1);
-        if (kv_lock_witness::held_count() != 0) {
+        // The release proc holds L0 to its end; no other lock may be held at a drop.
+        if (kv_lock_witness::held_count_besides(KV_LOCK_L0_REPLAN) != 0) {
             log.drops_with_lock.fetch_add(1);
         }
         delete static_cast<int *>(p);
@@ -167,6 +196,18 @@ int case_scope_nested_begin_aborts() {
     } catch (int) {
     }
     CHECK(!kv_region_scope::active(), "the guard closed the scope on the throw");
+
+    // A guard whose begin was refused must not close the scope it did not open.
+    {
+        kv_region_scope::guard outer(31);
+        const size_t           before = abort_count();
+        {
+            kv_region_scope::guard inner(32);
+            CHECK_EQ(abort_count(), before + 1, "the nested guard's begin aborts once");
+        }
+        CHECK(kv_region_scope::active(&id) && id == 31, "the refused nested guard left the outer scope open");
+    }
+    CHECK(!kv_region_scope::active(), "and the outer guard closed it");
     return 0;
 }
 
@@ -325,20 +366,176 @@ int case_attach_reads_the_owner_registry() {
     return 0;
 }
 
+// ---- H8: four contexts, two buffers each, on four threads --------------------
+// A reusable barrier over the threads of one arm.
+class arm_barrier {
+  public:
+    explicit arm_barrier(int n) : n_(n) {}
+
+    void wait() {
+        const int gen = gen_.load();
+        if (arrived_.fetch_add(1) + 1 == n_) {
+            arrived_.store(0);
+            gen_.fetch_add(1);
+            return;
+        }
+        while (gen_.load() == gen) {
+            std::this_thread::yield();
+        }
+    }
+
+  private:
+    int              n_;
+    std::atomic<int> arrived_{ 0 };
+    std::atomic<int> gen_{ 0 };
+};
+
+// Context `c`'s region: its own offsets, so a slot read from the wrong context is visible.
+kv_region_entry make_context_entry(drop_log & log, kv_context_id c, std::initializer_list<uint32_t> layers) {
+    kv_region_entry e;
+    e.extents.push_back(make_handle(log));
+    for (uint32_t l : layers) {
+        kv_layer_slice s;
+        s.slot_offset = 1000000ull * c + 4096ull * l;
+        s.slot_size   = 4096;
+        e.layout[l]   = s;
+    }
+    return e;
+}
+
+bool wired_to(const kv_attach_result & r, kv_context_id c) {
+    if (!r.ok || r.context != c || r.slots.empty()) {
+        return false;
+    }
+    for (const kv_attached_slot & s : r.slots) {
+        if (s.context != c || s.slice.slot_offset != 1000000ull * c + 4096ull * s.layer) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int case_h8_four_contexts_two_buffers() {
+    abort_capture                cap;
+    drop_log                     log;
+    kv_region_registry           dev0;
+    kv_region_registry           dev1;
+    constexpr int                N = 4;
+    std::vector<kv_region_entry> keep;
+    for (kv_context_id c = 1; c <= N; ++c) {
+        keep.push_back(dev0.publish(c, make_context_entry(log, c, { 0, 1 })));
+        keep.push_back(dev1.publish(c, make_context_entry(log, c, { 2, 3 })));
+    }
+    const std::vector<const kv_region_registry *> regs  = { &dev0, &dev1 };
+    const std::vector<kv_layer_plan>              buf_a = {
+        { 0, 0 },
+        { 1, 0 },
+        { 2, 1 }
+    };
+    const std::vector<kv_layer_plan> buf_b = {
+        { 2, 1 },
+        { 3, 1 },
+        { 1, 0 }
+    };
+
+    arm_barrier       in_scope(N);
+    std::atomic<bool> release_a{ false };
+    std::atomic<int>  parked{ 0 };
+    kv_attach_result  first[N + 1];
+    kv_attach_result  second[N + 1];
+    std::atomic<bool> done[N + 1];
+    for (std::atomic<bool> & d : done) {
+        d.store(false);
+    }
+    std::vector<std::thread> threads;
+    for (int c = 1; c <= N; ++c) {
+        threads.emplace_back([&, c] {
+            kv_region_scope::guard g((kv_context_id) c);
+            in_scope.wait();  // every context is inside its own scope at once
+            first[c]  = kv_region_attach_buffer(regs, buf_a, [&] {
+                if (c == 1) {
+                    // Parked mid-attach, with the other three scopes open and attaching.
+                    parked.store(1);
+                    while (!release_a.load()) {
+                        std::this_thread::yield();
+                    }
+                }
+            });
+            second[c] = kv_region_attach_buffer(regs, buf_b);
+            done[c].store(true);
+        });
+    }
+    while (parked.load() == 0) {
+        std::this_thread::yield();
+    }
+    for (int spin = 0; spin < 2000 && !(done[2].load() && done[3].load() && done[4].load()); ++spin) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(done[2].load() && done[3].load() && done[4].load(),
+          "three contexts finish both buffers while the first is parked mid-attach");
+    CHECK(!done[1].load(), "control: the parked thread has not finished");
+    release_a.store(true);
+    for (std::thread & t : threads) {
+        t.join();
+    }
+    for (int c = 1; c <= N; ++c) {
+        CHECK(wired_to(first[c], (kv_context_id) c), "buffer 1 of every context attaches that context's slots");
+        CHECK(wired_to(second[c], (kv_context_id) c), "buffer 2 of every context attaches the same region");
+        CHECK(first[c].slots.size() == 3 && second[c].slots.size() == 3, "three slots per buffer");
+    }
+    CHECK(wired_to(first[1], 1) && wired_to(second[1], 1),
+          "the parked thread's own results, read after its release, are its own");
+    CHECK_EQ(abort_count(), 0, "no abort across four concurrent scopes");
+    CHECK_EQ(kv_lock_witness::violations(), 0, "no lock violation");
+
+    // Positive control: the same arm with a process-global current context.  Every
+    // thread then attaches from whichever begin ran last, so all but one are cross-wired.
+    std::atomic<kv_context_id> global_id{ 0 };
+    arm_barrier                begun(N);
+    std::atomic<int>           correct{ 0 };
+    std::vector<std::thread>   ctl;
+    for (int c = 1; c <= N; ++c) {
+        ctl.emplace_back([&, c] {
+            global_id.store((kv_context_id) c);
+            begun.wait();
+            const kv_attach_result r = kv_region_attach_for(global_id.load(), regs, buf_a);
+            correct.fetch_add(wired_to(r, (kv_context_id) c) ? 1 : 0);
+        });
+    }
+    for (std::thread & t : ctl) {
+        t.join();
+    }
+    CHECK_EQ(correct.load(), 1, "control: a global scope wires exactly one of four threads to its own context");
+    return 0;
+}
+
 // ---- H9: the lock witness, with positive controls --------------------------
 int case_witness_positive_controls() {
     abort_capture      cap;
     kv_witnessed_mutex l1{ KV_LOCK_L1_INVENTORY, "L1" };
     kv_witnessed_mutex l3{ KV_LOCK_L3_REGISTRY, "kv_region_mutex_" };
-    kv_witnessed_mutex l4{ KV_LOCK_L4_SLOT_STATE, "L4" };
+    kv_witnessed_mutex slot{ KV_LOCK_L5_SLOT_STATE, "slot-state lock" };
     kv_witnessed_mutex l5{ KV_LOCK_L5_GROUP, "L5" };
 
     {
         std::lock_guard<kv_witnessed_mutex> a(l1);
-        std::lock_guard<kv_witnessed_mutex> b(l4);
-        std::lock_guard<kv_witnessed_mutex> c(l5);
+        std::lock_guard<kv_witnessed_mutex> b(slot);
     }
-    CHECK_EQ(kv_lock_witness::violations(), 0, "L1, L4, L5 in rank order is clean");
+    {
+        std::lock_guard<kv_witnessed_mutex> a(l1);
+        std::lock_guard<kv_witnessed_mutex> b(l5);
+    }
+    CHECK_EQ(kv_lock_witness::violations(), 0, "L1 then the slot-state lock, and L1 then a group mutex, are clean");
+
+    // Same rank, different instance: the slot-state lock and a group mutex are both
+    // L5, and the model has no tie-break between L5 peers, so holding both is flagged.
+    {
+        std::lock_guard<kv_witnessed_mutex> a(l5);
+        std::lock_guard<kv_witnessed_mutex> b(slot);
+    }
+    CHECK_EQ(kv_lock_witness::violations(), 1, "control: two L5 peers held together are flagged");
+    CHECK(kv_lock_witness::last().find("order") != std::string::npos, "as an order violation");
+    kv_lock_witness::reset();
 
     {
         std::lock_guard<kv_witnessed_mutex> a(l3);
@@ -480,13 +677,23 @@ int case_replan_token_nesting() {
         kv_replan_scope held(l0);
         l0.acquire_outermost();
         CHECK_EQ(abort_count(), 1, "outermost-only acquire aborts when already held");
-        CHECK(last_abort().find("re-plan token") != std::string::npos, "and names the token");
+        CHECK(last_abort().find("[REPLAN-TOKEN] release proc entered with L0 held") != std::string::npos,
+              "and says what the spec's witness says");
         CHECK_EQ(l0.lock_count(), 2, "it did not lock again");
     }
     return 0;
 }
 
 // ---- the release proc -----------------------------------------------------
+// What the retention callback saw, standing in for retain_handles_until_event.
+struct retain_probe {
+    std::vector<uint64_t> events;
+    size_t                handed        = 0;
+    bool                  with_lock     = false;  // a lock other than L0 held at the call
+    bool                  l0_held       = true;   // L0 held at every call (the proc holds it to the end)
+    bool                  extents_alive = true;   // the batch was still intact at every call
+};
+
 int case_release_proc() {
     abort_capture      cap;
     drop_log           log;
@@ -494,22 +701,39 @@ int case_release_proc() {
     kv_region_registry dev0;
     kv_region_registry dev1;
 
+    // Context 1's tenant table holds two ring rows, each with a slot-state
+    // retention of its last generation (owner + done event), and one slot with none.
     auto tenants = std::make_shared<kv_tenant_slots>();
-    tenants->add("c", 0, make_handle(log), 1024);
+    tenants->add("ring", 0, make_handle(log), 1024);
+    tenants->add("ring", 1, make_handle(log), 1024);
+    tenants->add("rows", 2, make_handle(log), 512);
+    kv_slot_retention first = tenants->exchange_retention("ring", 0, { make_handle(log), 100 });
+    CHECK(!first.owner, "the first generation of a row has no previous retention");
+    first = tenants->exchange_retention("ring", 1, { make_handle(log), 101 });
+    CHECK(!first.owner, "nor does the second row");
+
     kv_region_entry e0 = make_entry(log, { 0 });
     e0.tenants         = tenants;
+    std::vector<std::weak_ptr<void>> extents;
+    extents.push_back(e0.extents[0]);
     kv_region_entry p0 = dev0.publish(1, std::move(e0));
-    kv_region_entry p1 = dev1.publish(1, make_entry(log, { 1 }));
+    kv_region_entry e1 = make_entry(log, { 1 });
+    extents.push_back(e1.extents[0]);
+    kv_region_entry p1 = dev1.publish(1, std::move(e1));
     kv_region_entry p2 = dev0.publish(2, make_entry(log, { 0 }));  // another context: untouched
     tenants.reset();
 
-    std::vector<kv_region_registry *> regs             = { &dev0, &dev1 };
-    size_t                            retained_handles = 0;
-    bool                              retain_with_lock = false;
-    auto                              retain           = [&](std::vector<kv_region_handle> && v) {
-        retained_handles += v.size();
-        retain_with_lock = retain_with_lock || kv_lock_witness::held_count() != 0;
-        v.clear();  // the "event" has passed
+    std::vector<kv_region_registry *> regs = { &dev0, &dev1 };
+    retain_probe                      probe;
+    auto                              retain = [&](kv_region_handle && h, uint64_t event) {
+        ++probe.handed;
+        probe.events.push_back(event);
+        probe.with_lock = probe.with_lock || kv_lock_witness::held_count_besides(KV_LOCK_L0_REPLAN) != 0;
+        probe.l0_held = probe.l0_held && l0.held_by_this_thread();
+        for (const std::weak_ptr<void> & w : extents) {
+            probe.extents_alive = probe.extents_alive && !w.expired();
+        }
+        h.reset();  // the event has passed
     };
 
     kv_region_release(regs, 1, l0, retain);
@@ -517,19 +741,24 @@ int case_release_proc() {
     CHECK_EQ(l0.unlock_count(), 1, "and releases it");
     CHECK(!dev0.has_layer(1, 0) && !dev1.has_layer(1, 1), "context 1 is gone from every device");
     CHECK(dev0.has_layer(2, 0), "another context's entry is untouched");
-    CHECK_EQ(retained_handles, 3, "two extents and one tenant slot go to retain_until_event");
-    CHECK(!retain_with_lock, "retain ran with no lock held");
-    // The extents arrive at retain_until_event as handles (count above), so the
-    // fencing event, not the release proc, decides when the last generation frees.
-    CHECK_EQ(log.drops.load(), 3, "everything but context 2's extent was freed");
+    CHECK_EQ(probe.handed, 2, "only the two ring rows' slot-state retentions are fenced");
+    CHECK(probe.events.size() == 2 && ((probe.events[0] == 100 && probe.events[1] == 101) ||
+                                       (probe.events[0] == 101 && probe.events[1] == 100)),
+          "each retention is handed with its own done event");
+    CHECK(!probe.with_lock, "retain ran with no lock held but L0");
+    CHECK(probe.l0_held, "and with L0 held, which the proc holds to its end");
+    CHECK(probe.extents_alive, "the extents are still in the batch when the retentions are handed over");
+    CHECK(extents[0].expired() && extents[1].expired(), "the extents drop with the batch, not through the callback");
+    // 2 extents + 3 slot handles + 2 retention owners; context 2's extent stays.
+    CHECK_EQ(log.drops.load(), 7, "everything of context 1 was freed, nothing of context 2");
     CHECK_EQ(log.drops_with_lock.load(), 0, "no drop under a lock");
 
     // Idempotent: a second call finds nothing, aborts nothing.
-    const size_t aborts_before   = abort_count();
-    const size_t retained_before = retained_handles;
+    const size_t aborts_before = abort_count();
+    const size_t handed_before = probe.handed;
     kv_region_release(regs, 1, l0, retain);
     CHECK_EQ(abort_count(), aborts_before, "a second release does not abort");
-    CHECK_EQ(retained_handles, retained_before, "and retains nothing");
+    CHECK_EQ(probe.handed, handed_before, "and retains nothing");
 
     // It really takes L0: a parked holder blocks it until the holder lets go.
     kv_region_entry   again = dev0.publish(3, make_entry(log, { 0 }));
@@ -564,7 +793,8 @@ int case_release_proc() {
         kv_replan_scope held(l0);
         kv_region_release(regs, 4, l0, retain);
     }
-    CHECK(last_abort().find("re-plan token") != std::string::npos, "release under a held token aborts by name");
+    CHECK(last_abort().find("[REPLAN-TOKEN] release proc entered with L0 held") != std::string::npos,
+          "release under a held token aborts by name");
     CHECK(dev0.has_layer(4, 0), "and leaves the entry alone");
 
     // Under L1 the order is flagged: the proc takes L0, never L1.
@@ -588,6 +818,52 @@ int case_release_proc() {
     CHECK_EQ(abort_count(), before + 1, "a lock failure aborts once");
     CHECK(last_abort().find("kv_region_mutex_") != std::string::npos, "naming the registry lock");
     CHECK(l0.probe_free(), "and L0 was released on the failure path");
+
+    // A retention with no fence callback aborts by name instead of freeing the row
+    // under work that may still read it; no retention and no callback is quiet.
+    {
+        auto t = std::make_shared<kv_tenant_slots>();
+        t->add("ring", 0, make_handle(log), 64);
+        t->exchange_retention("ring", 0, { make_handle(log), 7 });
+        kv_region_entry e = make_entry(log, { 0 });
+        e.tenants         = t;
+        t.reset();
+        kv_region_entry held = dev0.publish(8, std::move(e));
+        const size_t    n0   = abort_count();
+        kv_region_release(regs, 8, l0, kv_retain_fn());
+        CHECK_EQ(abort_count(), n0 + 1, "retentions and no callback abort once");
+        CHECK(last_abort().find("no retain_handles_until_event callback") != std::string::npos, "naming the callback");
+        CHECK(l0.probe_free(), "and L0 was released");
+
+        kv_region_entry bare = dev0.publish(9, make_entry(log, { 0 }));
+        const size_t    n1   = abort_count();
+        kv_region_release(regs, 9, l0, kv_retain_fn());
+        CHECK_EQ(abort_count(), n1, "no retention and no callback is not an error");
+    }
+
+    // A callback that throws aborts by name and does not stop the other retentions.
+    {
+        auto t = std::make_shared<kv_tenant_slots>();
+        t->add("ring", 0, make_handle(log), 64);
+        t->add("ring", 1, make_handle(log), 64);
+        t->exchange_retention("ring", 0, { make_handle(log), 21 });
+        t->exchange_retention("ring", 1, { make_handle(log), 22 });
+        kv_region_entry e = make_entry(log, { 0 });
+        e.tenants         = t;
+        t.reset();
+        kv_region_entry held  = dev0.publish(10, std::move(e));
+        int             calls = 0;
+        const size_t    n0    = abort_count();
+        kv_region_release(regs, 10, l0, [&](kv_region_handle &&, uint64_t) {
+            if (++calls == 1) {
+                throw std::runtime_error("boom");
+            }
+        });
+        CHECK_EQ(abort_count(), n0 + 1, "a throwing callback aborts once");
+        CHECK(last_abort().find("retain_handles_until_event threw") != std::string::npos, "by name");
+        CHECK_EQ(calls, 2, "and the second retention was still handed over");
+        CHECK(l0.probe_free() && !dev0.has_layer(10, 0), "L0 released and the entry is gone");
+    }
     return 0;
 }
 
@@ -683,8 +959,8 @@ int case_txn_guard_two_phases() {
     return 0;
 }
 
-// ---- tenant slots and the weight-slot store ---------------------------------------
-int case_tenant_slots_and_weight_slots() {
+// ---- tenant slots and their slot-state retentions ---------------------------------------
+int case_tenant_slots_and_retentions() {
     abort_capture   cap;
     drop_log        log;
     kv_tenant_slots slots;
@@ -720,28 +996,27 @@ int case_tenant_slots_and_weight_slots() {
     CHECK_EQ(log.drops_with_lock.load(), 0, "outside the slot-state lock");
     CHECK_EQ(again.cap("rows", 0), 20, "and the cap is the new one");
 
-    // The weight slot: one per (model, device), shared by contexts of a model.
-    kv_weight_slot_store store;
-    CHECK(store.record(1, 0, make_handle(log), 111), "record the model-1 slot on device 0");
-    CHECK(!store.record(1, 0, make_handle(log), 222), "no setter: a second record for the key is refused");
-    CHECK(store.record(1, 1, make_handle(log), 333), "the same model on device 1 is its own key");
-    CHECK(store.record(2, 0, make_handle(log), 444), "another model on device 0 is its own key");
-    size_t b = 0;
-    CHECK(store.find(1, 0, &b) && b == 111, "the first record stands");
-    CHECK(store.find(1, 1, &b) && b == 333, "device 1's slot is distinct");
-    CHECK(store.find(2, 0, &b) && b == 444, "model 2's slot is distinct");
-    CHECK(!store.find(2, 1), "no slot recorded for (2, 1)");
-    kv_region_handle shared_a = store.handle(1, 0);
-    kv_region_handle shared_b = store.handle(1, 0);
-    CHECK(shared_a && shared_a == shared_b, "two contexts of one model on one device share its slot");
-    const int        drops0 = log.drops.load();
-    kv_region_handle taken  = store.take(1, 0);
-    CHECK(!store.find(1, 0), "taken");
-    taken.reset();
-    shared_a.reset();
-    CHECK_EQ(log.drops.load(), drops0, "a claim's copy keeps the slot alive past the store's erase");
-    shared_b.reset();
-    CHECK_EQ(log.drops.load(), drops0 + 1, "the last holder's drop frees it");
+    // Slot-state retentions: a re-claim hands the previous generation's back, with its
+    // event, and a slot with no record keeps nothing.
+    kv_tenant_slots ring;
+    ring.add("ring", 0, make_handle(log), 64);
+    kv_slot_retention prev = ring.exchange_retention("ring", 0, { make_handle(log), 1 });
+    CHECK(!prev.owner, "a row's first record has no previous retention");
+    const int drops_r = log.drops.load();
+    prev              = ring.exchange_retention("ring", 0, { make_handle(log), 2 });
+    CHECK(prev.owner && prev.done_event == 1, "a re-record returns the previous generation with its own event");
+    CHECK_EQ(log.drops.load(), drops_r, "moved out under the lock, not dropped");
+    prev = kv_slot_retention();
+    CHECK_EQ(log.drops.load(), drops_r + 1, "dropped by the caller after the lock");
+    CHECK(!ring.exchange_retention("ring", 9, { make_handle(log), 3 }).owner,
+          "a row with no slot returns nothing, and its offered owner is the caller's to drop");
+    std::vector<kv_slot_retention> kept;
+    ring.take_retentions(kept);
+    CHECK(kept.size() == 1 && kept[0].done_event == 2, "take_retentions moves the live generation out");
+    kept.clear();
+    ring.take_retentions(kept);
+    CHECK(kept.empty(), "and a second take finds nothing");
+    CHECK_EQ(ring.size(), 1, "the slot itself stays: it drops with the entry");
     CHECK_EQ(log.drops_with_lock.load(), 0, "never under a lock");
     CHECK_EQ(kv_lock_witness::violations(), 0, "no lock violation");
     return 0;
@@ -760,13 +1035,14 @@ int main() {
         { "scope_nested_begin_aborts",       case_scope_nested_begin_aborts       },
         { "residency_answer",                case_residency_answer                },
         { "attach_reads_the_owner_registry", case_attach_reads_the_owner_registry },
+        { "h8_four_contexts_two_buffers",    case_h8_four_contexts_two_buffers    },
         { "witness_positive_controls",       case_witness_positive_controls       },
         { "registry_drops_outside_the_lock", case_registry_drops_outside_the_lock },
         { "registry_concurrent_churn",       case_registry_concurrent_churn       },
         { "replan_token_nesting",            case_replan_token_nesting            },
         { "release_proc",                    case_release_proc                    },
         { "txn_guard_two_phases",            case_txn_guard_two_phases            },
-        { "tenant_slots_and_weight_slots",   case_tenant_slots_and_weight_slots   },
+        { "tenant_slots_and_retentions",     case_tenant_slots_and_retentions     },
     };
     for (const test_case & c : cases) {
         if (c.fn() != 0) {

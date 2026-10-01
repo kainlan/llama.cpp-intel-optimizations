@@ -19,11 +19,17 @@
 //   * kv_tenant_slots      the published slot table a context claims from (§2.3.2);
 //   * kv_lock_witness, kv_witnessed_mutex, kv_replan_token
 //                          the lock order the model checks on every path: L0 (the
-//                          outermost-only re-plan token) before L1, then L3, L4, L5;
+//                          outermost-only re-plan token) before L1, then L3, then L5
+//                          (the arena group mutexes and the slot-state lock);
 //   * kv_txn_guard         the two-phase rollback of §2.4.2: phase 1 clears this
 //                          call's pending ranges under the group mutex with no L1
 //                          held; phase 2 drops the handles with no lock held;
 //   * kv_region_release    the teardown proc: idempotent, L0 and no L1, noexcept.
+//
+// Left to later steps, not modelled here: the later-load weight-slot store
+// (H9 (4)'s ledger step, which is L4+L6 work), the per-slot claim spin lock (the
+// model's slot-state lock is one table-wide mutex), and any tie-break between two
+// L5 peers (see kv_lock_witness).
 
 #ifndef GGML_SYCL_KV_REGION_REGISTRY_HPP
 #define GGML_SYCL_KV_REGION_REGISTRY_HPP
@@ -72,10 +78,13 @@ inline void kv_region_abort(const std::string & message) {
 
 // ---------------------------------------------------------------------------
 // The lock witness.  Ranks follow the contract's table (§2.3.1): the re-plan
-// token L0, the tensor-inventory lock L1, the registry lock L3 (a leaf), the
-// slot-state locks L4, the arena group mutex L5.  Acquiring a lock whose rank is
-// not above every lock the thread holds is an order violation; acquiring
-// anything while holding the registry lock is a leaf violation.  The witness
+// token L0, the tensor-inventory lock L1, the registry lock L3 (a leaf), then L5,
+// which both the arena group mutexes and the slot-state locks hold (the release
+// proc's step 2 text calls the slot-state lock L5).  Acquiring a lock whose rank
+// is not above every lock the thread holds is an order violation; acquiring
+// anything while holding the registry lock is a leaf violation.  Two L5 peers held
+// together are therefore a violation here: the production witness's instance
+// tie-break between L5 peers is not modelled, and no path in the model needs it.  The witness
 // counts and remembers violations instead of aborting, so a test can assert on
 // them, and a "no lock held" check reads the same stack.
 // ---------------------------------------------------------------------------
@@ -83,8 +92,8 @@ enum kv_lock_rank : int {
     KV_LOCK_L0_REPLAN     = 0,
     KV_LOCK_L1_INVENTORY  = 1,
     KV_LOCK_L3_REGISTRY   = 3,
-    KV_LOCK_L4_SLOT_STATE = 4,
     KV_LOCK_L5_GROUP      = 5,
+    KV_LOCK_L5_SLOT_STATE = 5,
 };
 
 class kv_lock_witness {
@@ -122,6 +131,16 @@ class kv_lock_witness {
     }
 
     static size_t held_count() { return stack().size(); }
+
+    // The locks held other than `rank`: the release proc holds L0 to its end, so
+    // its "no lock held" checks (a drop, the retain call) read this.
+    static size_t held_count_besides(int rank) {
+        size_t n = 0;
+        for (const held & h : stack()) {
+            n += h.rank != rank ? 1 : 0;
+        }
+        return n;
+    }
 
     static size_t violations() { return count().load(); }
 
@@ -241,8 +260,7 @@ class kv_replan_token {
     // Returns false, after reporting, when this thread already holds the token.
     bool acquire_outermost() {
         if (depth() > 0) {
-            kv_region_abort(
-                "kv region: the release proc was reached with this thread already holding the re-plan token");
+            kv_region_abort("[REPLAN-TOKEN] release proc entered with L0 held");
             return false;
         }
         acquire();
@@ -323,6 +341,15 @@ enum class kv_claim_result : uint8_t {
     ALREADY_CLAIMED,  // a previous claim is still live
 };
 
+// The slot-state retention of one ring row's last generation: the owner handle
+// the row's record kept (retained_owners[slot]) and the event that fences the
+// work that read it (done_events[slot]).  A superseded or torn-down row frees
+// only after that event, so it travels to retain_handles_until_event.
+struct kv_slot_retention {
+    kv_region_handle owner;
+    uint64_t         done_event = 0;
+};
+
 class kv_tenant_slots {
   public:
     void add(const std::string & cohort, uint32_t index, kv_region_handle handle, size_t cap) {
@@ -331,7 +358,8 @@ class kv_tenant_slots {
             std::lock_guard<kv_witnessed_mutex> g(mu_);
             slot &                              s = slots_[{ cohort, index }];
             replaced                              = std::move(s);
-            s                                     = { std::move(handle), cap, false, 0 };
+            s.handle                              = std::move(handle);
+            s.cap                                 = cap;
         }
     }
 
@@ -348,7 +376,6 @@ class kv_tenant_slots {
             return kv_claim_result::ALREADY_CLAIMED;
         }
         it->second.claimed = true;
-        ++it->second.generation;
         return kv_claim_result::OK;
     }
 
@@ -389,6 +416,35 @@ class kv_tenant_slots {
         return it == slots_.end() ? nullptr : it->second.handle;
     }
 
+    // Record the row's retention for the generation just recorded and return the
+    // previous generation's, moved out: the caller hands it to
+    // retain_handles_until_event(previous.done_event) before the new record is
+    // used, and never drops it under the lock.  A row with no slot keeps nothing.
+    kv_slot_retention exchange_retention(const std::string & cohort, uint32_t index, kv_slot_retention next) {
+        kv_slot_retention                   previous;
+        std::lock_guard<kv_witnessed_mutex> g(mu_);
+        auto                                it = slots_.find({ cohort, index });
+        if (it == slots_.end()) {
+            return previous;
+        }
+        previous             = std::move(it->second.retention);
+        it->second.retention = std::move(next);
+        return previous;  // NRVO'd out: the caller's drop is after the guard's unlock
+    }
+
+    // The release proc's step 2: move out every row's slot-state retention, for
+    // the caller to hand to retain_handles_until_event with no lock held.  The
+    // slots themselves stay: they drop with the entry's batch.
+    void take_retentions(std::vector<kv_slot_retention> & out) {
+        std::lock_guard<kv_witnessed_mutex> g(mu_);
+        for (auto & s : slots_) {
+            if (s.second.retention.owner) {
+                out.push_back(std::move(s.second.retention));
+                s.second.retention = kv_slot_retention();
+            }
+        }
+    }
+
     // Move out the slots no claim holds, for the caller to drop with no lock held
     // (the tenant-only path's step (i)).  Returns false and moves nothing when a
     // slot is still claimed: that is a [CONTEXT-PLAN-BUG] for the caller.
@@ -413,80 +469,17 @@ class kv_tenant_slots {
 
   private:
     struct slot {
-        kv_region_handle handle;
-        size_t           cap        = 0;
-        bool             claimed    = false;
-        uint64_t         generation = 0;
+        kv_region_handle  handle;
+        size_t            cap     = 0;
+        bool              claimed = false;
+        kv_slot_retention retention;
     };
 
-    mutable kv_witnessed_mutex                       mu_{ KV_LOCK_L4_SLOT_STATE, "slot-state lock" };
+    // One table-wide mutex.  The contract's claim path is a per-slot leaf spin
+    // lock; the rank (L5) and the "move out under the lock, drop after it" rule are
+    // the same, and the model has no concurrent-claim arm that needs the finer lock.
+    mutable kv_witnessed_mutex                       mu_{ KV_LOCK_L5_SLOT_STATE, "slot-state lock" };
     std::map<std::pair<std::string, uint32_t>, slot> slots_;
-};
-
-// ---------------------------------------------------------------------------
-// The weight-slot store (§2.4.2 (b) step 3, §2.4.5): the ring's weight slot is
-// one slot per (model, device), recorded by the load's own transaction with no
-// setter, and shared by every context of that model on that device.  Keyed by
-// (model, device), never by a pointer.
-// ---------------------------------------------------------------------------
-class kv_weight_slot_store {
-  public:
-    // Records the slot; false (and nothing changes) when one is already recorded.
-    bool record(uint64_t model, int device, kv_region_handle handle, size_t bytes) {
-        // A refused record leaves `handle` with the caller's parameter, which is
-        // destroyed after the guard: the refusal is not a drop under the lock.
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
-        if (slots_.count({ model, device }) != 0) {
-            return false;
-        }
-        slots_.emplace(std::make_pair(model, device), entry{ std::move(handle), bytes });
-        return true;
-    }
-
-    bool find(uint64_t model, int device, size_t * bytes = nullptr) const {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
-        auto                                it = slots_.find({ model, device });
-        if (it == slots_.end()) {
-            return false;
-        }
-        if (bytes != nullptr) {
-            *bytes = it->second.bytes;
-        }
-        return true;
-    }
-
-    // The slot's handle, copied out for a claim's lifetime.
-    kv_region_handle handle(uint64_t model, int device) const {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
-        auto                                it = slots_.find({ model, device });
-        return it == slots_.end() ? nullptr : it->second.handle;
-    }
-
-    // Moves the slot out for the caller to drop with no lock held.
-    kv_region_handle take(uint64_t model, int device) {
-        kv_region_handle                    h;
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
-        auto                                it = slots_.find({ model, device });
-        if (it != slots_.end()) {
-            h = std::move(it->second.handle);
-            slots_.erase(it);
-        }
-        return h;  // NRVO'd out: the caller's drop is after the guard's unlock
-    }
-
-    size_t size() const {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
-        return slots_.size();
-    }
-
-  private:
-    struct entry {
-        kv_region_handle handle;
-        size_t           bytes = 0;
-    };
-
-    mutable kv_witnessed_mutex                mu_{ KV_LOCK_L4_SLOT_STATE, "weight-slot store lock" };
-    std::map<std::pair<uint64_t, int>, entry> slots_;
 };
 
 // ---------------------------------------------------------------------------
@@ -613,15 +606,18 @@ class kv_region_registry {
 // ---------------------------------------------------------------------------
 class kv_region_scope {
   public:
-    static void begin(kv_context_id id) {
+    // Returns false, after reporting, when a scope is already open: the refused
+    // begin changes nothing, so its caller must not end() the outer scope.
+    static bool begin(kv_context_id id) {
         State & s = state();
         if (s.open) {
             kv_region_abort("kv region scope: nested begin for context " + std::to_string(id) +
                             " inside the scope of context " + std::to_string(s.id));
-            return;
+            return false;
         }
         s.open = true;
         s.id   = id;
+        return true;
     }
 
     static void end() { state().open = false; }
@@ -637,12 +633,20 @@ class kv_region_scope {
     // The RAII guard llama_context wraps create_memory in, so the scope ends on a throw too.
     class guard {
       public:
-        explicit guard(kv_context_id id) { begin(id); }
+        explicit guard(kv_context_id id) : opened_(begin(id)) {}
 
-        ~guard() { end(); }
+        // Only a guard that opened the scope closes it.
+        ~guard() {
+            if (opened_) {
+                end();
+            }
+        }
 
         guard(const guard &)             = delete;
         guard & operator=(const guard &) = delete;
+
+      private:
+        bool opened_;
     };
 
   private:
@@ -684,15 +688,15 @@ struct kv_attach_result {
 // iSWA's two buffers attach to the same region.  `registries[d]` is null for a
 // device that reserves no regions.  `mid_attach` is the test seam that holds a
 // thread inside the attach (g_test_block_next_region_attach).
-inline kv_attach_result kv_region_attach_buffer(const std::vector<const kv_region_registry *> & registries,
-                                                const std::vector<kv_layer_plan> &              layers,
-                                                const std::function<void()> &                   mid_attach = {}) {
+//
+// kv_region_attach_for is the body with the context id as a parameter, which the
+// scoped entry point reads from the thread_local scope.  A test drives it with an
+// id from a global to show what a process-global scope would do.
+inline kv_attach_result kv_region_attach_for(kv_context_id                                   id,
+                                             const std::vector<const kv_region_registry *> & registries,
+                                             const std::vector<kv_layer_plan> &              layers,
+                                             const std::function<void()> &                   mid_attach = {}) {
     kv_attach_result r;
-    kv_context_id    id = 0;
-    if (!kv_region_scope::active(&id)) {
-        r.no_scope = true;
-        return r;
-    }
     r.context = id;
     if (mid_attach) {
         mid_attach();
@@ -712,6 +716,18 @@ inline kv_attach_result kv_region_attach_buffer(const std::vector<const kv_regio
     }
     r.ok = r.missing.empty();
     return r;
+}
+
+inline kv_attach_result kv_region_attach_buffer(const std::vector<const kv_region_registry *> & registries,
+                                                const std::vector<kv_layer_plan> &              layers,
+                                                const std::function<void()> &                   mid_attach = {}) {
+    kv_context_id id = 0;
+    if (!kv_region_scope::active(&id)) {
+        kv_attach_result r;
+        r.no_scope = true;
+        return r;
+    }
+    return kv_region_attach_for(id, registries, layers, mid_attach);
 }
 
 // llama's residency answer for layer `il`, whose planned device is `d` (§2.5).
@@ -802,18 +818,25 @@ class kv_txn_guard {
 // ---------------------------------------------------------------------------
 // The teardown proc (§2.4.2 "Teardown"): run from the plan guard's destructor
 // with the ContextId captured at create_exec.  Idempotent: a second call finds
-// nothing.  It takes L0 (outermost-only) and no L1, empties (c, *) in every
-// device's registry under kv_region_mutex_, hands each entry's retained
-// last-generation handles to `retain_until_event`, and drops everything with no
-// lock held.  noexcept: a failure to take a lock aborts with a named message.
+// nothing.  It takes L0 (outermost-only) and no L1, holds L0 to the end, and runs
+//   1. under kv_region_mutex_, move every (c, *) entry out into a local batch;
+//   2. under each entry's slot-state lock, move out each ring row's slot-state
+//      retention (the owner handle and its done event);
+//   3. with no instrumented lock but L0 held, hand each retention to
+//      `retain_until_event` with its event, then drop the batch.
+// The batch's extents and slot handles are not fenced here: anything still queued
+// holds its own lease (§2.3.2), so the last reference frees each block by refcount.
+// noexcept: a failure to take a lock, a missing fence callback and an exception
+// from it each abort with a named message.
 // ---------------------------------------------------------------------------
-using kv_retain_fn = std::function<void(std::vector<kv_region_handle> &&)>;
+using kv_retain_fn = std::function<void(kv_region_handle &&, uint64_t done_event)>;
 
 inline void kv_region_release(const std::vector<kv_region_registry *> & registries,
                               kv_context_id                             ctx,
                               kv_replan_token &                         l0,
                               const kv_retain_fn &                      retain_until_event) noexcept {
-    std::vector<kv_region_entry> taken;
+    std::vector<kv_region_entry>   batch;
+    std::vector<kv_slot_retention> retentions;
     if (!l0.acquire_outermost()) {
         return;  // the re-entry was reported, and the handler returned
     }
@@ -824,7 +847,12 @@ inline void kv_region_release(const std::vector<kv_region_registry *> & registri
             }
             kv_region_entry e;
             if (reg->take(ctx, e)) {
-                taken.push_back(std::move(e));
+                batch.push_back(std::move(e));
+            }
+        }
+        for (kv_region_entry & e : batch) {
+            if (e.tenants) {
+                e.tenants->take_retentions(retentions);
             }
         }
     } catch (const std::system_error &) {
@@ -836,29 +864,23 @@ inline void kv_region_release(const std::vector<kv_region_registry *> & registri
         kv_region_abort("kv region release: an exception escaped the release proc");
         return;
     }
-    l0.release();
-    // No instrumented lock is held from here.
-    std::vector<kv_region_handle> retained;
-    for (kv_region_entry & e : taken) {
-        // The extents are the last generation's: the backend holds them until
-        // the event that fences the context's last submission has passed.
-        for (kv_region_handle & h : e.extents) {
-            retained.push_back(std::move(h));
-        }
-        e.extents.clear();
-        if (e.tenants) {
-            std::vector<kv_region_handle> slots;
-            e.tenants->take_unclaimed(slots);
-            // A claimed slot's handle stays with the claim; the entry's copy goes with the entry.
-            for (kv_region_handle & h : slots) {
-                retained.push_back(std::move(h));
+    // Step 3: no instrumented lock but L0 is held from here.
+    if (!retentions.empty() && !retain_until_event) {
+        // Freeing them here would drop a row under the work that may still read it.
+        kv_region_abort("kv region release: " + std::to_string(retentions.size()) +
+                        " slot-state retention(s) and no retain_handles_until_event callback");
+    } else {
+        for (kv_slot_retention & r : retentions) {
+            try {
+                retain_until_event(std::move(r.owner), r.done_event);
+            } catch (...) {
+                kv_region_abort("kv region release: retain_handles_until_event threw in the release proc");
             }
         }
     }
-    if (retain_until_event && !retained.empty()) {
-        retain_until_event(std::move(retained));
-    }
-    taken.clear();
+    retentions.clear();
+    batch.clear();
+    l0.release();
 }
 
 }  // namespace ggml_sycl
