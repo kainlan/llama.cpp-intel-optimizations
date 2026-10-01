@@ -100,6 +100,27 @@ Gaps stated rather than hidden: the names of (j)'s fit function, reserve target 
 the two `*_bytes` names are covered; (l)'s five count-caller functions do not exist, so the allowlist entries are added as each
 lands. Today's 24 N-* debt entries were seeded once with `--write-debt --allow-growth` (834 to 858 entries).
 
+## Clause (p): one routed predicate, one home for the support decision
+
+Dormant until beni's b1 lands: `ggml_sycl_fattn_onednn_route_admits`, `ggml_sycl_flash_attn_ext_enabled`,
+`ggml_sycl_fattn_kv_pair_of`, `ggml_sycl_kv_cache_layer_of` and `placement_plan_set_routed_head_maxima` /
+`onednn_graph_scratch_bytes` are all undefined today, so the five blocks print `DORMANT p-route`, `p-home`, `p-fill`, `p-layer`
+and `p-charge`. Each wakes on its own subject. The gate reads the whole repository once for the switch
+`getenv("GGML_SYCL_FLASH_ATTN_EXT")` (every C or C++ source outside `docs/`, `.llm-wiki/`, `build*/`; keys `repo/...` and `tests/...`),
+and `kv_is_fp8` writes and `"cache_[kv]_l` spellings under the scope. Findings: `P-ROUTE`, `P-HOME`, `P-FILL`, `P-LAYER`,
+`P-CHARGE`, none of which may be debt.
+
+The matrix cannot plant a twin beside functions the clause constrains in place, so witnesses 37 and 38 transform today's
+tree into the b1 tree (`b1_tree`) and the b2 tree (`b2_tree`) the clause describes, then mutate that. Each transform is an exact
+anchored edit: when a tree edit moves an anchor, the matrix fails with a setup error naming it, and the fixture is re-derived.
+When beni b1 lands, the dormant lines turn into active checks of the real tree and the fixture's b1 transform becomes a no-op
+to delete.
+
+Stated gaps: the route's D=512 hatch is exempt from the head-dim literal rule as any `if` whose condition spells 512 and calls
+`ggml_sycl_fa_onednn_d512_enabled`; "the routing function reads the decline before the plan" is not checked (the decline reader
+has no name); the charge side's walk helpers are unnamed, so the head-dim and helper rules cover the bodies of the two named
+charge functions and the helper-name rule covers all of `unified-cache.cpp` and `.hpp`.
+
 ## Key shape
 
 `file::function::node-kind:variable:text-hash#ordinal`. The text hash is of the construction's normalized

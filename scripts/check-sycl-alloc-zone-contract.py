@@ -109,7 +109,25 @@ be written a literal false. Write credit is positional and does not follow contr
       (Z9-SITE, Z9-SIZING), dormant until it is defined.
       Known S2d gaps: (n) counts every consuming position (assignment, return, condition, argument) as used;
       (j) covers only the two named fit functions; (l)'s count callers are allowlist entries added as each lands.
-  (p) is S2d-2 (witnesses 37-38).
+  (p) one routed predicate and one home for the support decision (witnesses 37-38), in five blocks, each dormant until
+      its subject is defined (the subjects arrive with beni b1/b2): p-route (the oneDNN SDPA calls sit in branches that call
+      ggml_sycl_fattn_onednn_dispatch_routed and test none of its flags; ggml_sycl_flash_attn_ext_onednn_plan is called in
+      fattn.cpp only in ggml_sycl_fattn_onednn_route_admits, and the value function calls the routed predicate with nullptr,
+      nullptr for its context and plan), p-home (getenv of GGML_SYCL_FLASH_ATTN_EXT is read once in the whole repository,
+      inside ggml_sycl_flash_attn_ext_enabled, which is called once, first, in ggml_sycl_fattn_shape_supported; the routed
+      predicate's body is pinned; ggml_sycl_flash_attn_ext_supported and route_admits hold no support clause; the call-site
+      censuses of fattn_vec_supports_head_dim, the tile screen and kv_pair_of; the supports_op case line), p-fill (the pinned
+      kv_is_fp8 fill line per fill function, and every write of kv_is_fp8 is one of them), p-layer (the KV layer name is
+      parsed once, in ggml_sycl_kv_cache_layer_of) and p-charge (the charge side names no support helper, compares no head
+      dim with a literal, and holds `if (params.ne00 == 512) {` once in the value function in b2 and nowhere in b1). The
+      phase is b2 when onednn_graph_scratch_bytes is defined, else b1; a b2 tree that defines
+      placement_plan_set_routed_head_maxima fails. Codes P-ROUTE, P-HOME, P-FILL, P-LAYER, P-CHARGE are never debt.
+      The matrix builds the b1 and b2 trees by transforming today's (b1_tree, b2_tree), since a twin cannot be planted
+      beside functions the clause constrains in place.
+      Known (p) gaps: the route's D=512 hatch line is not pinned by text, any `if` whose condition spells 512 and calls
+      ggml_sycl_fa_onednn_d512_enabled passes; the routing function's "reads the decline first" is not checked (its decline
+      reader has no name yet); the charge side's walk helpers are not named, so the head-dim and helper rules cover the two
+      named charge functions' bodies and the helper-name rule covers all of unified-cache.cpp/.hpp.
 
 Scope
   Every .cpp/.hpp under ggml/src/ggml-sycl except the skipped directories below. dpct/ is in
@@ -243,7 +261,8 @@ H_OUTCOME = {"H-CASCADE": "CASCADE", "H-CASCADE-PARAM": "CASCADE", "H-PASS-TRUE"
 # Clauses (i)-(o), witness 9 and the dormancy latch (S2d). Only a declined result that is dropped today (N-*) is debt; the rest
 # are clean on today's tree, so a finding of any other code is an allowlisted node or a fix, never a list entry.
 S2D_CODES = ("I-RETRY", "K-INTERIM", "L-CALLER", "L-FREE", "L-GUARD", "J-SOURCE", "J-DISPATCH", "M-SCRATCH", "M-STALE", "M-FLOOR",
-             "M-DATA", "N-VOID", "N-NODISCARD", "O-NOROW", "O-ROW", "O-QUEUE", "Z9-SITE", "Z9-SIZING", "X-LATCH")
+             "M-DATA", "N-VOID", "N-NODISCARD", "O-NOROW", "O-ROW", "O-QUEUE", "Z9-SITE", "Z9-SIZING", "P-ROUTE", "P-HOME", "P-FILL",
+             "P-LAYER", "P-CHARGE", "X-LATCH")
 S2D_DEBT = ("N-VOID", "N-NODISCARD")
 CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-FORM", "B-TIER", "C-COHORT", "C-SITE", "D-ZONE",
          "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "G-CATCH", "DEFER-C") + H_CODES + S2D_CODES
@@ -341,13 +360,13 @@ def load_tree(root):
 
 def core_files(files):
     """The scanned tree without the test sources that clause (n) reads."""
-    return {r: s for r, s in files.items() if not r.startswith(TEST_PREFIX)}
+    return {r: s for r, s in files.items() if not r.startswith((TEST_PREFIX, REPO_PREFIX))}
 
 
 def load_test_sources(root):
     """Test sources that spell a name clause (n) lists, keyed `tests/<path>`: the repository's tests/ and the scope's own
     tests/ directory. Read for clause (n) only; the other clauses never see them."""
-    names = [m[1].encode() for m in N_MEMBERS] + [u.encode() for u in N_UNIQUE]
+    names = [m[1].encode() for m in N_MEMBERS] + [u.encode() for u in N_UNIQUE] + [P_ENV.encode()]
     out = {}
     for base, prefix in ((Path(root) / "tests", TEST_PREFIX), (Path(root) / SCOPE_SUBDIR / "tests", TEST_PREFIX + "ggml-sycl/")):
         if not base.is_dir():
@@ -357,6 +376,27 @@ def load_test_sources(root):
                 b = p.read_bytes()
                 if any(n in b for n in names):
                     out[prefix + str(p.relative_to(base))] = b
+    return out
+
+
+REPO_PREFIX = "repo/"   # sources outside the scope that read the switch, for clause (p)'s read count only
+REPO_SKIP_DIRS = frozenset([".git", "docs", ".llm-wiki", "node_modules", "__pycache__"])
+REPO_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cu", ".cuh", ".m", ".mm", ".inl", ".cl")
+
+
+def load_repo_reads(root):
+    """Every C or C++ source under the repository, outside docs/, .llm-wiki/, build directories, the scope itself and the two
+    tests/ directories already read, that spells the switch clause (p) counts, keyed `repo/<path>`."""
+    base, scope = Path(root), (Path(root) / SCOPE_SUBDIR).resolve()
+    out = {}
+    for d, dirs, names in os.walk(base):
+        dirs[:] = sorted(x for x in dirs if x not in REPO_SKIP_DIRS and not x.startswith("build") and
+                         (Path(d) / x).resolve() != scope and (Path(d) / x) != base / "tests")
+        for n in sorted(names):
+            if n.lower().endswith(REPO_SUFFIXES):
+                b = (Path(d) / n).read_bytes()
+                if P_ENV.encode() in b:
+                    out[REPO_PREFIX + str((Path(d) / n).relative_to(base))] = b
     return out
 
 
@@ -2280,8 +2320,42 @@ Z9_SITES = (
     ("set_rows_stage_bytes", (("set_rows.cpp", "ggml_sycl_set_rows_stage_ptr"),)),
 )
 
+# Clause (p): one routed predicate, one home for the support decision. Each block is keyed on a subject the tree gains with
+# beni (b1) and says so while it is absent. Blocks: route (r13 m6), home (the support decision), fill (kv_is_fp8), layer
+# (the KV layer name), charge (the charge side calls no support helper).
+P_ENV = "GGML_SYCL_FLASH_ATTN_EXT"
+P_ADMITS, P_ROUTED, P_ROUTE_ENABLED, P_DISPATCH = ("ggml_sycl_fattn_onednn_route_admits", "ggml_sycl_fattn_onednn_routed",
+                                                   "ggml_sycl_fattn_onednn_route_enabled", "ggml_sycl_fattn_onednn_dispatch_routed")
+P_ENABLED, P_SHAPE_SUPPORTED, P_SUPPORTED = ("ggml_sycl_flash_attn_ext_enabled", "ggml_sycl_fattn_shape_supported",
+                                             "ggml_sycl_flash_attn_ext_supported")
+P_SHAPE_OF, P_KV_PAIR_OF, P_LAYER_OF = "ggml_sycl_fattn_shape_of", "ggml_sycl_fattn_kv_pair_of", "ggml_sycl_kv_cache_layer_of"
+P_LOADFILL, P_VALUEFN = "placement_plan_set_routed_head_maxima", "onednn_graph_scratch_bytes"
+P_ONEDNN, P_PLAN, P_VEC, P_TILE = ("ggml_sycl_flash_attn_ext_onednn", "ggml_sycl_flash_attn_ext_onednn_plan",
+                                   "fattn_vec_supports_head_dim", "ggml_sycl_fattn_d512_tile_admissible")
+P_FLASH, P_FAST_POLICY, P_SUPPORTS_OP = ("ggml_sycl_flash_attn_ext", "ggml_sycl_fattn_fast_decode_policy",
+                                         "ggml_backend_sycl_device_supports_op")
+P_FLAGS = ("g_sycl_fa_onednn_enabled", "g_sycl_paged_v2_enabled", "ggml_sycl_fa_onednn_d512_enabled")
+P_BODY_BANNED = (P_VEC, P_ENABLED, P_KV_PAIR_OF, P_TILE)               # support clauses the supported/route bodies may not hold
+P_SUPPORT_HELPERS = (P_VEC, P_ENABLED, P_SHAPE_SUPPORTED, P_TILE)      # support helpers the charge side may not name
+P_ROUTED_BODY = "return ggml_sycl_fattn_onednn_route_admits(p, multi_seq, ctx, plan_out) && ggml_sycl_fattn_shape_supported(p, d_v);"
+P_CASE = "case GGML_OP_FLASH_ATTN_EXT: return ggml_sycl_flash_attn_ext_supported(op);"
+P_FILL_RE = re.compile(r"^(\w+)\.kv_is_fp8=ggml_sycl_fattn_kv_pair_of\(\1\.K_type,\1\.V_type\)==GGML_SYCL_FATTN_KV_PAIR_FP8;$")
+P_WRITE_RE = re.compile(rb"(?:\.|->)kv_is_fp8[ \t\r\n]*(?:[|&^]?=)[^=]")
+P_GETENV_RE = re.compile(rb'(?:std\s*::\s*)?getenv\s*\(\s*"%s"\s*\)' % P_ENV.encode())
+P_LAYER_RE = re.compile(rb'"cache_[kv]_l')
+P_D512_LINE = "if(params.ne00==512){"
+P_HEADDIM = r"(?:\w+(?:\.|->))*(?:ne00|ne10|ne\[0\]|head_dim_k|head_dim_v|d_v|D)"
+P_CMP = r"(?:==|!=|<=|>=|<|>)"
+P_LITERAL_CMP_RE = re.compile(r"(?<![\w.>])%s\s*%s\s*(\d+)|(\d+)\s*%s\s*%s(?!\w)" % (P_HEADDIM, P_CMP, P_CMP, P_HEADDIM))
+P_TYPE_CMP_RE = re.compile(r"(?:==|!=)\s*GGML_TYPE_\w+|GGML_TYPE_\w+\s*(?:==|!=)")
+P_COMMENT_RE = re.compile(rb'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*', re.S)
+P_NAMES = frozenset([P_ADMITS, P_ROUTED, P_ROUTE_ENABLED, P_DISPATCH, P_ENABLED, P_SHAPE_SUPPORTED, P_SUPPORTED, P_SHAPE_OF,
+                     P_KV_PAIR_OF, P_LAYER_OF, P_LOADFILL, P_VALUEFN, P_ONEDNN, P_PLAN, P_VEC, P_TILE])
+
+
+
 S2D_NAMES = frozenset({I_ACCESSOR, K_TXN, K_REAP, K_MODE, K_INTERIM, L_COUNT, L_REPLACE, L_GUARD, J_ELIGIBLE, M_FLOOR_FN}
-                      | set(I_RETIRED) | set(J_FIT) | set(N_LAST) | set(O_ACQUIRE) | {b for b, _ in Z9_SITES})
+                      | set(I_RETIRED) | set(J_FIT) | set(N_LAST) | set(O_ACQUIRE) | {b for b, _ in Z9_SITES} | P_NAMES)
 S2D_BYTES = tuple(sorted(n.encode() for n in S2D_NAMES)) + (O_EXECUTE.encode(),)
 
 _S2D = {}   # sha1 -> facts
@@ -2890,11 +2964,310 @@ def clause_z9(ix, out):
                     "function" % (fn, " or ".join(Z9_SIZING_FILES)))
 
 
+def strip_comments_b(b):
+    """`b` with every comment blanked (newlines and offsets kept); string and character literals stay."""
+    return P_COMMENT_RE.sub(lambda m: m.group(0) if m.group(0)[:1] in (b'"', b"'") else re.sub(rb"[^\n]", b" ", m.group(0)), b)
+
+
+def clean_text(src, node):
+    return strip_comments_b(src[sb(node):eb(node)]).decode("utf-8", "replace")
+
+
+def fn_name(func):
+    """The unqualified function a finding sits in (`lambda in X` is X, `C::m` is m)."""
+    return re.sub(r"^lambda in ", "", func).split("::")[-1]
+
+
+def p_dormant(out, block, subject, shape="a function definition"):
+    out.dormant.append("DORMANT p-%s: subject %s (%s) absent" % (block, subject, shape))
+
+
+def p_dispatch_branch(src, call):
+    """(ok, why): the call sits in the consequence of an `if` whose condition calls the routing function and tests none of the
+    flags the routing function owns."""
+    p, why = parent(call), "no enclosing branch whose condition calls %s" % P_DISPATCH
+    while p is not None:
+        if kind(p) == "if_statement":
+            cond, cons = fld(p, "condition"), fld(p, "consequence")
+            if cond is not None and cons is not None and in_span(call, cons) and \
+                    any(callee_last(txt(src, fld(c, "function"))) == P_DISPATCH for c in calls_in_node(src, cond)):
+                bad = [f for f in P_FLAGS if re.search(r"(?<![\w])%s(?![\w])" % f, clean_text(src, cond))]
+                if not bad:
+                    return True, ""
+                why = "its branch condition also tests %s" % ", ".join(bad)
+        p = parent(p)
+    return False, why
+
+
+def p_route(ix, out):
+    out.latch("p-route", ix, P_ADMITS, "a call or a function definition", "an alias, a macro or a lambda hides it")
+    if not has_name(ix, P_ADMITS, "def"):
+        p_dormant(out, "route", P_ADMITS)
+        return
+    out.active.add("p-route")
+    fa = "fattn.cpp"
+    adm = [(r, n) for r, _, n in ix.fdefs(P_ADMITS)]
+    for rel, o in ix.occ(P_ONEDNN, ("call",)):
+        if rel != fa:
+            continue
+        ok, why = p_dispatch_branch(ix.files[rel], o.call)
+        if not ok:
+            out.add("P-ROUTE", rel, o.line, o.func, P_ONEDNN, "%s::%s::p-route:onednn-call" % (rel, o.func),
+                    "the call of %s in %s is not inside a branch the routing function governs (%s): the route's gates and "
+                    "the plan are combined once, in %s" % (P_ONEDNN, o.func, why, P_ADMITS))
+    for rel, o in ix.occ(P_PLAN, ("call",)):
+        if rel == fa and not any(r == rel and in_span(o.call, body_of(n)) for r, n in adm):
+            out.add("P-ROUTE", rel, o.line, o.func, P_PLAN, "%s::%s::p-route:plan-call" % (rel, o.func),
+                    "%s is called in %s outside %s: the plan is read only through the one predicate" % (P_PLAN, o.func, P_ADMITS))
+    for rel, func, node in ix.fdefs(P_VALUEFN):
+        src = ix.files[rel]
+        if calls_in_node(src, body_of(node), P_PLAN):
+            out.add("P-ROUTE", rel, line_of(node), func, P_PLAN, "%s::%s::p-route:value-plan" % (rel, func),
+                    "the value function %s calls %s directly; it calls %s with nullptr, nullptr" % (func, P_PLAN, P_ROUTED))
+        ok = False
+        for c in calls_in_node(src, body_of(node), P_ROUTED):
+            args = [squash(txt(src, a)) for a in arg_nodes(c)]
+            ok = ok or args[2:4] == ["nullptr", "nullptr"]
+        if not ok:
+            out.add("P-ROUTE", rel, line_of(node), func, P_ROUTED, "%s::%s::p-route:value-predicate" % (rel, func),
+                    "the value function %s must call %s with nullptr, nullptr as its context and plan arguments" % (func, P_ROUTED))
+    for callee, allowed in ((P_ADMITS, (P_ROUTED, P_SHAPE_SUPPORTED)), (P_ROUTE_ENABLED, (P_ADMITS, P_DISPATCH))):
+        for rel, o in ix.occ(callee, ("call",)):
+            if fn_name(o.func) not in allowed:
+                out.add("P-ROUTE", rel, o.line, o.func, callee, "%s::%s::p-route:caller:%s" % (rel, o.func, callee),
+                        "%s is called in %s; its callers are %s only" % (callee, o.func, " and ".join(allowed)))
+
+
+def p_blank_hatch(src, body):
+    """The route's D=512 hatch: an `if` whose condition spells the 512 literal and calls ggml_sycl_fa_onednn_d512_enabled is
+    blanked before the literal scan (its text is not pinned beyond that)."""
+    text = bytearray(strip_comments_b(src[sb(body):eb(body)]))
+    for n in walk(body):
+        if kind(n) == "if_statement":
+            cond = fld(n, "condition")
+            if cond is not None:
+                c = clean_text(src, cond)
+                if "ggml_sycl_fa_onednn_d512_enabled" in c and re.search(r"\b512\b", c):
+                    a, b = sb(cond) - sb(body), eb(cond) - sb(body)
+                    text[a:b] = re.sub(rb"[^\n]", b" ", bytes(text[a:b]))
+    return bytes(text).decode("utf-8", "replace")
+
+
+def p_support_clauses(text, headdim=True, types=True):
+    """(kind, snippet) for each support clause in comment-stripped function text."""
+    hits = []
+    for nm in P_BODY_BANNED:
+        if re.search(r"(?<![\w])%s\s*\(" % nm, text):
+            hits.append(("call", nm))
+    if types:
+        hits += [("type-compare", squash(m.group(0))) for m in P_TYPE_CMP_RE.finditer(text)]
+    if headdim:
+        hits += [("head-dim-literal", squash(m.group(0))) for m in P_LITERAL_CMP_RE.finditer(text)]
+    return hits
+
+
+def p_home(ix, files, out):
+    out.latch("p-home", ix, P_ENABLED, "a call or a function definition", "an alias, a macro or a lambda hides it")
+    enabled = ix.fdefs(P_ENABLED)
+    if not enabled:
+        p_dormant(out, "home", P_ENABLED)
+        return
+    out.active.add("p-home")
+    reads = []
+    for rel, src in sorted(files.items()):
+        if P_ENV.encode() in src:
+            clean = strip_comments_b(src)
+            for m in P_GETENV_RE.finditer(clean):
+                reads.append((rel, m.start(), clean.count(b"\n", 0, m.start()) + 1))
+    spans = [(rel, sb(body_of(n)), eb(body_of(n))) for rel, _, n in enabled]
+    inside = [r for r in reads if any(r[0] == a and b <= r[1] < c for a, b, c in spans)]
+    for rel, off, line in reads:
+        if (rel, off, line) not in inside or len(inside) > 1:
+            out.add("P-HOME", rel, line, "<read>", P_ENV, "%s::p-home:getenv:%d" % (rel, line),
+                    "getenv(\"%s\") is read at %s:%d; the one read of the switch is inside %s" % (P_ENV, rel, line, P_ENABLED))
+    if not inside:
+        rel, func, node = enabled[0]
+        out.add("P-HOME", rel, line_of(node), func, P_ENV, "%s::%s::p-home:no-read" % (rel, func),
+                "%s does not read getenv(\"%s\")" % (P_ENABLED, P_ENV))
+    shape = ix.fdefs(P_SHAPE_SUPPORTED)
+    calls = ix.occ(P_ENABLED, ("call",))
+    if not shape:
+        out.add("P-HOME", "fattn.cpp", 0, P_SHAPE_SUPPORTED, P_SHAPE_SUPPORTED, "p-home:shape-missing",
+                "%s is defined but %s is not: the shape function is the one caller of the switch" % (P_ENABLED, P_SHAPE_SUPPORTED))
+    else:
+        good = False
+        for rel, func, node in shape:
+            st = first_statement(node)
+            good = good or (st is not None and len(calls) == 1 and calls[0][0] == rel and in_span(calls[0][1].call, st))
+        if not good:
+            rel, func, node = shape[0]
+            out.add("P-HOME", rel, line_of(node), func, P_ENABLED, "%s::%s::p-home:first-statement" % (rel, func),
+                    "%s must be called exactly once under ggml/src/ggml-sycl, as the first statement of %s (%d call(s) found)" % (
+                        P_ENABLED, P_SHAPE_SUPPORTED, len(calls)))
+    routed = ix.fdefs(P_ROUTED)
+    if not routed:
+        out.add("P-HOME", "fattn.cpp", 0, P_ROUTED, P_ROUTED, "p-home:routed-missing",
+                "%s is defined but %s is not" % (P_ENABLED, P_ROUTED))
+    for rel, func, node in routed:
+        body = squash(clean_text(ix.files[rel], body_of(node)))
+        if body != squash("{ %s }" % P_ROUTED_BODY):
+            out.add("P-HOME", rel, line_of(node), func, P_ROUTED, "%s::%s::p-home:routed-body" % (rel, func),
+                    "the body of %s must be exactly `%s`, the support decision is not restated here" % (P_ROUTED, P_ROUTED_BODY))
+    for name in (P_SUPPORTED, P_ADMITS):
+        for rel, func, node in ix.fdefs(name):
+            src = ix.files[rel]
+            text = p_blank_hatch(src, body_of(node)) if name == P_ADMITS else clean_text(src, body_of(node))
+            for knd, what in p_support_clauses(text):
+                out.add("P-HOME", rel, line_of(node), func, what, "%s::%s::p-home:clause:%s:%s" % (rel, func, knd, what),
+                        "%s holds a support clause (%s %s): the support decision lives in %s alone" % (
+                            name, knd, what, P_SHAPE_SUPPORTED))
+            if name == P_SUPPORTED:
+                n = len(calls_in_node(src, body_of(node), P_SHAPE_SUPPORTED))
+                if n != 1:
+                    out.add("P-HOME", rel, line_of(node), func, P_SHAPE_SUPPORTED, "%s::%s::p-home:shape-call" % (rel, func),
+                            "%s must call %s exactly once (%d found)" % (P_SUPPORTED, P_SHAPE_SUPPORTED, n))
+    fills = (P_SHAPE_SUPPORTED, P_SHAPE_OF, P_FLASH, P_VALUEFN if ix.fdefs(P_VALUEFN) else P_LOADFILL)
+    for callee, allowed in ((P_VEC, (P_SHAPE_SUPPORTED, P_FAST_POLICY)), (P_TILE, (P_SHAPE_SUPPORTED, P_FLASH)),
+                            (P_KV_PAIR_OF, fills)):
+        for rel, o in ix.occ(callee, ("call",)):
+            if fn_name(o.func) not in allowed:
+                out.add("P-HOME", rel, o.line, o.func, callee, "%s::%s::p-home:census:%s" % (rel, o.func, callee),
+                        "%s is called in %s; its callers are %s only" % (callee, o.func, ", ".join(allowed)))
+    n_tile = sum(1 for _, o in ix.occ(P_TILE, ("call",)) if fn_name(o.func) == P_FLASH)
+    if n_tile != 2:
+        out.add("P-HOME", "fattn.cpp", 0, P_FLASH, P_TILE, "p-home:tile-dispatch-sites",
+                "%s is called at exactly the two dispatch sites of %s (%d found)" % (P_TILE, P_FLASH, n_tile))
+    sup = [(rel, func, n) for rel, func, n in ix.fdefs(P_SUPPORTS_OP) if rel == "ggml-sycl.cpp"]
+    found = False
+    for rel, func, node in sup:
+        for n in walk(body_of(node)):
+            if kind(n) == "case_statement" and "GGML_OP_FLASH_ATTN_EXT" in clean_text(ix.files[rel], fld(n, "value") or n):
+                found = True
+                if squash(clean_text(ix.files[rel], n)) != squash(P_CASE):
+                    out.add("P-HOME", rel, line_of(n), func, "GGML_OP_FLASH_ATTN_EXT", "%s::%s::p-home:case-line" % (rel, func),
+                            "the FLASH_ATTN_EXT case of %s must be exactly `%s`" % (P_SUPPORTS_OP, P_CASE))
+    if not found:
+        out.add("P-HOME", "ggml-sycl.cpp", 0, P_SUPPORTS_OP, "GGML_OP_FLASH_ATTN_EXT", "p-home:case-missing",
+                "%s has no GGML_OP_FLASH_ATTN_EXT case" % P_SUPPORTS_OP)
+
+
+def p_fill(ix, out):
+    out.latch("p-fill", ix, P_KV_PAIR_OF, "a call or a function definition", "an alias, a macro or a lambda hides it")
+    if not has_name(ix, P_KV_PAIR_OF, "def"):
+        p_dormant(out, "fill", P_KV_PAIR_OF)
+        return
+    out.active.add("p-fill")
+    b2 = bool(ix.fdefs(P_VALUEFN))
+    fills = [("fattn.cpp", P_SHAPE_OF), ("fattn.cpp", P_FLASH), ("unified-cache.cpp", P_VALUEFN if b2 else P_LOADFILL)]
+    if b2 and ix.fdefs(P_LOADFILL):
+        rel, func, node = ix.fdefs(P_LOADFILL)[0]
+        out.add("P-FILL", rel, line_of(node), func, P_LOADFILL, "%s::%s::p-fill:load-fill-in-b2" % (rel, func),
+                "%s is deleted in b2 (the load-maxima fill is D once the value function exists)" % P_LOADFILL)
+    fill_funcs = set()
+    for rel, name in fills:
+        defs = [(f, n) for r, f, n in ix.fdefs(name) if r == rel]
+        if not defs:
+            out.add("P-FILL", rel, 0, name, name, "%s::%s::p-fill:function-missing" % (rel, name),
+                    "%s must define the fill function %s" % (rel, name))
+            continue
+        for func, node in defs:
+            fill_funcs.add((rel, sb(node), eb(node)))
+            src = ix.files[rel]
+            own = set(re.findall(r"fattn_params\s*[&*]?\s*(\w+)", clean_text(src, node)))
+            n = 0
+            for m in re.finditer(r"[^;{}]*;", clean_text(src, body_of(node))):
+                st = squash(m.group(0))
+                mm = P_FILL_RE.match(st)
+                n += bool(mm and mm.group(1) in own)
+            if n != 1:
+                out.add("P-FILL", rel, line_of(node), func, name, "%s::%s::p-fill:pin" % (rel, func),
+                        "%s must hold exactly one line `<v>.kv_is_fp8 = ggml_sycl_fattn_kv_pair_of(<v>.K_type, <v>.V_type) == "
+                        "GGML_SYCL_FATTN_KV_PAIR_FP8;` on its own fattn_params variable (%d found)" % (func, n))
+    for rel, src in sorted(ix.files.items()):
+        clean = strip_comments_b(src)
+        for m in P_WRITE_RE.finditer(clean):
+            a = clean.rfind(b";", 0, m.start()) + 1
+            a = max(a, clean.rfind(b"{", 0, m.start()) + 1, clean.rfind(b"}", 0, m.start()) + 1)
+            e = clean.find(b";", m.end() - 1) + 1
+            st = squash(clean[a:e].decode("utf-8", "replace"))
+            ok = bool(P_FILL_RE.match(st)) and any(r == rel and s <= m.start() < t for r, s, t in fill_funcs)
+            if not ok:
+                line = clean.count(b"\n", 0, m.start()) + 1
+                out.add("P-FILL", rel, line, "<write>", "kv_is_fp8", "%s::p-fill:write:%s" % (rel, text_hash(st)),
+                        "%s:%d writes kv_is_fp8 (`%s`) outside the pinned fill lines: one fact, one source" % (rel, line, st[:80]))
+
+
+def p_layer(ix, out):
+    out.latch("p-layer", ix, P_LAYER_OF, "a call or a function definition", "an alias, a macro or a lambda hides it")
+    if not has_name(ix, P_LAYER_OF, "def"):
+        p_dormant(out, "layer", P_LAYER_OF)
+        return
+    out.active.add("p-layer")
+    helper = [(rel, sb(n), eb(n)) for rel, _, n in ix.fdefs(P_LAYER_OF) if rel == "common.cpp"]
+    n_helper = 0
+    for rel, src in sorted(ix.files.items()):
+        clean = strip_comments_b(src)
+        for m in P_LAYER_RE.finditer(clean):
+            ls = clean.rfind(b"\n", 0, m.start()) + 1
+            le = clean.find(b"\n", m.end())
+            line = clean[ls:le if le >= 0 else len(clean)].decode("utf-8", "replace")
+            ok = False
+            if any(rel == r and a <= m.start() < b for r, a, b in helper):
+                n_helper += 1
+                ok = True
+            elif rel == "fattn.cpp" and squash(line) == squash('return tensor && strncmp(tensor->name, "cache_k_l", 9) == 0;'):
+                ok = True
+            elif rel == "ggml-sycl.cpp" and re.search(rb'"cache_[kv]_l0"', clean[m.start():m.start() + 12]):
+                ok = True
+            if not ok:
+                ln = clean.count(b"\n", 0, m.start()) + 1
+                out.add("P-LAYER", rel, ln, "<line>", "cache_[kv]_l", "%s::p-layer:%s" % (rel, text_hash(squash(line))),
+                        "%s:%d spells a KV layer-name prefix (`%s`): the layer id is parsed once, in %s" % (
+                            rel, ln, line.strip()[:80], P_LAYER_OF))
+    if n_helper != 2:
+        out.add("P-LAYER", "common.cpp", 0, P_LAYER_OF, P_LAYER_OF, "p-layer:helper-formats",
+                "%s holds exactly two format strings, cache_k_l and cache_v_l (%d found)" % (P_LAYER_OF, n_helper))
+
+
+def p_charge(ix, out):
+    for nm in (P_LOADFILL, P_VALUEFN):
+        out.latch("p-charge", ix, nm, "a call or a function definition", "an alias, a macro or a lambda hides it")
+    subjects = [(n, rel, func, node) for n in (P_LOADFILL, P_VALUEFN) for rel, func, node in ix.fdefs(n)]
+    if not subjects:
+        p_dormant(out, "charge", "%s / %s" % (P_LOADFILL, P_VALUEFN))
+        return
+    out.active.add("p-charge")
+    for rel in ("unified-cache.cpp", "unified-cache.hpp"):
+        clean = strip_comments_b(ix.files.get(rel, b"")).decode("utf-8", "replace")
+        for nm in P_SUPPORT_HELPERS:
+            for m in re.finditer(r"(?<![\w])%s(?![\w])" % nm, clean):
+                out.add("P-CHARGE", rel, clean.count("\n", 0, m.start()) + 1, "<charge side>", nm,
+                        "%s::p-charge:helper:%s" % (rel, nm),
+                        "the charge side (%s) names %s: a support clause there makes the charge stricter than supports_op" % (rel, nm))
+    for name, rel, func, node in subjects:
+        text = clean_text(ix.files[rel], body_of(node))
+        d512 = 0
+        for m in P_LITERAL_CMP_RE.finditer(text):
+            st = squash(m.group(0))
+            ln = text[:m.start()].count("\n") + line_of(body_of(node))
+            if re.search(r"(?<![\w.>])params\.ne00\s*==\s*512", m.group(0)) and name == P_VALUEFN:
+                d512 += 1
+                continue
+            out.add("P-CHARGE", rel, ln, func, st, "%s::%s::p-charge:literal:%s" % (rel, func, st),
+                    "%s compares a head dim with an integer literal (`%s`): the charge side takes its dims from the facts, "
+                    "the only literal is the walk's D512 count" % (func, st))
+        if name == P_VALUEFN:
+            lines = [squash(m.group(0)) for m in re.finditer(r"if\s*\(\s*params\.ne00\s*==\s*512\s*\)\s*\{", text)]
+            if lines.count(P_D512_LINE) != 1:
+                out.add("P-CHARGE", rel, line_of(node), func, "512", "%s::%s::p-charge:d512-count" % (rel, func),
+                        "%s must hold the line `if (params.ne00 == 512) {` exactly once (%d found)" % (func, lines.count(P_D512_LINE)))
+
+
 def s2d_findings(files):
     """(violations, dormant lines, active clauses) of clauses (i)-(o) and witness 9's clause. Tests are read for clause (n)
     only."""
-    core = {r: s for r, s in files.items() if not r.startswith(TEST_PREFIX)}
-    ix, ixt = Index(core), Index(files)
+    core = core_files(files)
+    ix, ixt = Index(core), Index({r: s for r, s in files.items() if not r.startswith(REPO_PREFIX)})
     out = S2dOut()
     clause_i(ix, out)
     clause_k(ix, out)
@@ -2904,6 +3277,11 @@ def s2d_findings(files):
     clause_n(ixt, out)
     clause_o(ix, out)
     clause_z9(ix, out)
+    p_route(ix, out)
+    p_home(ix, files, out)
+    p_fill(ix, out)
+    p_layer(ix, out)
+    p_charge(ix, out)
     return out
 
 
@@ -3178,8 +3556,10 @@ WITNESSES = {
     "35": "clause (n): a declined result is consumed, and each listed declaration is [[nodiscard]]",
     "36": "clause (o): each C-term consumer submits on its census row's queue; every acquire has a row",
     "s2d": "the appendix census table is data: a missing appendix-rows.json fails",
+    "37": "clause (p): the oneDNN SDPA arms sit in routed branches; the plan is read only by route_admits",
+    "38": "clause (p): the support decision has one home (switch read, shape function, fills, layer name, case line, charge side)",
 }
-WITNESSES_DEFERRED = {"37": "S2d-2: clause (p) is dormant until its subject exists", "38": "S2d-2: clause (p) is dormant until its subject exists"}
+WITNESSES_DEFERRED = {}
 
 
 def matrix_cases():
@@ -4142,6 +4522,7 @@ def matrix_cases():
         "FAIL", "allowlist", "E-BACKING-FLAG-SLAB matches nothing"))
     c.extend(matrix_cases_s2d1())
     c.extend(matrix_cases_s2d1b())
+    c.extend(matrix_cases_s2d2())
     return c
 
 
@@ -4188,6 +4569,189 @@ def m_set(table, key, val):
     def f(t):
         t[table][key] = val
     return f
+
+
+# ---------------------------------------------------------------- clause (p) fixtures
+# Clause (p) is dormant on today's tree: its subjects arrive with beni (b1, then b2). A matrix witness cannot plant a twin of
+# a function the rules constrain in place, so it builds the tree the rules describe by transforming today's: b1_tree() is
+# today's tree with the routed predicate, the support helpers, the pinned fills, the layer helper and the load-maxima fill
+# in the shapes the clause pins; b2_tree() is b1 with that fill replaced by the value function. Each transform is an exact
+# anchored edit (a missing or ambiguous anchor is a setup error), so a tree edit that moves an anchor fails loudly here.
+B1_LOADFILL = """
+void placement_plan_set_routed_head_maxima(placement_plan & plan, const std::vector<kv_layer_facts> & layers) {
+    fattn_params params{};
+    for (const auto & f : layers) {
+        params.ne00      = f.head_dim_k;
+        params.ne10      = f.head_dim_v;
+        params.K_type    = f.K_type;
+        params.V_type    = f.V_type;
+        params.kv_is_fp8 = ggml_sycl_fattn_kv_pair_of(params.K_type, params.V_type) == GGML_SYCL_FATTN_KV_PAIR_FP8;
+        if (!ggml_sycl_fattn_onednn_routed(params, false, nullptr, nullptr, f.head_dim_v)) {
+            continue;
+        }
+        plan.planner_n_head_ctx_max = std::max(plan.planner_n_head_ctx_max, f.n_head);
+    }
+}
+"""
+B2_VALUEFN = """
+size_t onednn_graph_scratch_bytes(const std::vector<kv_layer_facts> & layers) {
+    fattn_params params{};
+    size_t       d512 = 0;
+    for (const auto & f : layers) {
+        params.ne00      = f.head_dim_k;
+        params.ne10      = f.head_dim_v;
+        params.K_type    = f.K_type;
+        params.V_type    = f.V_type;
+        params.kv_is_fp8 = ggml_sycl_fattn_kv_pair_of(params.K_type, params.V_type) == GGML_SYCL_FATTN_KV_PAIR_FP8;
+        if (!ggml_sycl_fattn_onednn_routed(params, false, nullptr, nullptr, f.head_dim_v)) {
+            continue;
+        }
+        if (params.ne00 == 512) {
+            ++d512;
+        }
+    }
+    return d512;
+}
+"""
+B1_FATTN_TAIL = """
+ggml_sycl_fattn_kv_pair ggml_sycl_fattn_kv_pair_of(ggml_type k, ggml_type v) {
+    if (k == GGML_TYPE_F16 && v == GGML_TYPE_F16) {
+        return GGML_SYCL_FATTN_KV_PAIR_F16;
+    }
+    return ggml_sycl_type_is_fp8_e4m3(k) && ggml_sycl_type_is_fp8_e4m3(v) ? GGML_SYCL_FATTN_KV_PAIR_FP8 : GGML_SYCL_FATTN_KV_PAIR_NONE;
+}
+
+bool ggml_sycl_flash_attn_ext_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_FLASH_ATTN_EXT");
+        return !env || !(strcmp(env, "0") == 0 || strcmp(env, "false") == 0);
+    }();
+    return enabled;
+}
+
+fattn_params ggml_sycl_fattn_shape_of(const ggml_tensor * dst) {
+    fattn_params params{};
+    params.ne00      = dst->src[0]->ne[0];
+    params.K_type    = dst->src[1]->type;
+    params.V_type    = dst->src[2]->type;
+    params.kv_is_fp8 = ggml_sycl_fattn_kv_pair_of(params.K_type, params.V_type) == GGML_SYCL_FATTN_KV_PAIR_FP8;
+    return params;
+}
+
+bool ggml_sycl_fattn_shape_supported(const fattn_params & p, int d_v) {
+    if (!ggml_sycl_flash_attn_ext_enabled()) {
+        return false;
+    }
+    if (!fattn_vec_supports_head_dim(p.ne00) && !(p.ne00 == 512 && ggml_sycl_fattn_onednn_route_admits(p, false, nullptr, nullptr))) {
+        return false;
+    }
+    return ggml_sycl_fattn_kv_pair_of(p.K_type, p.V_type) != GGML_SYCL_FATTN_KV_PAIR_NONE && d_v > 0 &&
+           (p.ne00 != 512 || ggml_sycl_fattn_d512_tile_admissible(nullptr));
+}
+
+bool ggml_sycl_fattn_onednn_route_enabled() {
+    return g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled;
+}
+
+bool ggml_sycl_fattn_onednn_route_admits(const fattn_params & p, bool multi_seq, void * ctx, ggml_sycl_onednn_fa_layout_plan * plan_out) {
+    if (!ggml_sycl_fattn_onednn_route_enabled()) {
+        return false;
+    }
+    if (p.ne00 == 512 && !ggml_sycl_fa_onednn_d512_enabled()) {
+        return false;
+    }
+    const ggml_sycl_onednn_fa_layout_plan plan =
+        ggml_sycl_flash_attn_ext_onednn_plan(p, p.ne02, p.ne12, p.kv_is_fp8, multi_seq);
+    if (plan_out != nullptr) {
+        *plan_out = plan;
+    }
+    return plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT ||
+           plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED;
+}
+
+bool ggml_sycl_fattn_onednn_routed(const fattn_params & p, bool multi_seq, void * ctx, ggml_sycl_onednn_fa_layout_plan * plan_out, int d_v) {
+    return ggml_sycl_fattn_onednn_route_admits(p, multi_seq, ctx, plan_out) && ggml_sycl_fattn_shape_supported(p, d_v);
+}
+
+bool ggml_sycl_fattn_onednn_dispatch_routed(const fattn_params & p, bool multi_seq, void * ctx, ggml_sycl_onednn_fa_layout_plan * plan_out) {
+    if (!ggml_sycl_fattn_onednn_route_enabled()) {
+        return false;
+    }
+    return ggml_sycl_fattn_onednn_routed(p, multi_seq, ctx, plan_out, 0);
+}
+"""
+B1_COMMON_TAIL = """
+int ggml_sycl_kv_cache_layer_of(const char * name) {
+    int id = -1;
+    if (sscanf(name, "cache_k_l%d", &id) == 1) {
+        return id;
+    }
+    if (sscanf(name, "cache_v_l%d", &id) == 1) {
+        return id;
+    }
+    return -1;
+}
+"""
+
+
+def replace_between(rel, start, end, new):
+    """Replace the text from `start` up to (not including) `end` in one file; both anchors must occur exactly once."""
+    def f(files):
+        src = files[rel].decode()
+        if src.count(start) != 1 or src.count(end) != 1 or src.index(start) > src.index(end):
+            raise SystemExit("matrix setup error: anchors of replace_between not unique or out of order in %s" % rel)
+        i, j = src.index(start), src.index(end)
+        return dict(files, **{rel: (src[:i] + new + src[j:]).encode()})
+    return f
+
+
+def replace_regex(rel, pattern, new, count):
+    def f(files):
+        out, n = re.subn(pattern, new, files[rel].decode())
+        if n != count:
+            raise SystemExit("matrix setup error: %r matched %d times in %s, expected %d" % (pattern, n, rel, count))
+        return dict(files, **{rel: out.encode()})
+    return f
+
+
+ROUTE_GATE = "ggml_sycl_fattn_onednn_dispatch_routed(params, params.n_seqs > 1, &ctx, nullptr)"
+FILL_LINE = "params.kv_is_fp8 = ggml_sycl_fattn_kv_pair_of(params.K_type, params.V_type) == GGML_SYCL_FATTN_KV_PAIR_FP8;"
+
+
+def b1_tree(files, keep_test_reads=False):
+    steps = (
+        replace_between("fattn.cpp", "bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {\n    // Enabled by default;",
+                        "\n// =============================================================================\n// Shape-aware FA dispatch table",
+                        "bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {\n"
+                        "    const fattn_params p = ggml_sycl_fattn_shape_of(dst);\n"
+                        "    return ggml_sycl_fattn_shape_supported(p, (int) dst->src[2]->ne[0]);\n}\n"),
+        replace_once("fattn.cpp", "    params.kv_is_fp8 = (ggml_sycl_type_is_fp8_e4m3(K->type) && ggml_sycl_type_is_fp8_e4m3(V->type));\n"
+                     "    params.n_seqs    = 0;", "    ggml_sycl_fattn_apply_shape(params, dst);\n    params.n_seqs    = 0;"),
+        replace_once("fattn.cpp", "    params.kv_is_fp8 = (ggml_sycl_type_is_fp8_e4m3(K->type) && ggml_sycl_type_is_fp8_e4m3(V->type));\n\n"
+                     "    // Multi-token decode support", "    " + FILL_LINE + "\n\n    // Multi-token decode support"),
+        replace_regex("fattn.cpp", r"ggml_sycl_flash_attn_ext_onednn_plan\((?=\s*params)", "ggml_sycl_fattn_routed_plan(", 4),
+        replace_once("fattn.cpp", 'strcmp(force, "onednn") == 0 && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {',
+                     'strcmp(force, "onednn") == 0 && ' + ROUTE_GATE + ") {"),
+        replace_once("fattn.cpp", "if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {",
+                     "if (!safe_decode && " + ROUTE_GATE + ") {"),
+        replace_once("fattn.cpp", "if (d512_onednn_enabled && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {",
+                     "if (" + ROUTE_GATE + ") {"),
+        append_to("fattn.cpp", B1_FATTN_TAIL),
+        append_to("common.cpp", B1_COMMON_TAIL),
+        append_to("unified-cache.cpp", B1_LOADFILL),
+        replace_once("ggml-sycl.cpp", '    const char * prefix_k = "cache_k_l";\n    const char * prefix_v = "cache_v_l";\n'
+                     "    if (strncmp(name, prefix_k, 9) == 0) {\n        layer_id = atoi(name + 9);\n"
+                     "    } else if (strncmp(name, prefix_v, 9) == 0) {\n        layer_id = atoi(name + 9);\n    }\n",
+                     "    layer_id = ggml_sycl_kv_cache_layer_of(name);\n"),
+    ) + (() if keep_test_reads else (
+        replace_regex("tests/test-sycl-fattn-onednn-gates.cpp", r'std::getenv\("GGML_SYCL_FLASH_ATTN_EXT"\)', "nullptr", 2),))
+    for st in steps:
+        files = st(files)
+    return files
+
+
+def b2_tree(files):
+    return replace_once("unified-cache.cpp", B1_LOADFILL, B2_VALUEFN)(b1_tree(files))
 
 
 def matrix_cases_s2d1():
@@ -4457,6 +5021,196 @@ def s2d_witnesses(files, allowlist, debt):
     return out
 
 
+def matrix_cases_s2d2():
+    """Clause (p), witnesses 37 and 38. A FAIL case mutates the b1 (or b2) fixture; a PASS control asserts the block is active,
+    or, on today's tree, dormant."""
+    c = []
+    A = c.append
+
+    def on(tree, *muts):
+        return chain(tree, *muts)
+
+    def b1(*muts):
+        return on(b1_tree, *muts)
+
+    def b2(*muts):
+        return on(b2_tree, *muts)
+
+    SHAPE_CALL = "    const fattn_params p = ggml_sycl_fattn_shape_of(dst);\n"
+    ROUTED_CALL = "if (!ggml_sycl_fattn_onednn_routed(params, false, nullptr, nullptr, f.head_dim_v)) {"
+    FLASH_OPEN = "void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor safe_dst) {\n"
+    DEFAULT_ARM = "if (!safe_decode && " + ROUTE_GATE + ") {"
+    # 37: the default oneDNN SDPA arm and the route
+    A(Case("37", "the default arm restored to its inline flag test and direct plan call", b1(
+        replace_once("fattn.cpp", DEFAULT_ARM, "if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {"),
+        replace_once("fattn.cpp", "plan      = ggml_sycl_fattn_routed_plan(params,", "plan      = ggml_sycl_flash_attn_ext_onednn_plan(params,")),
+        "FAIL", "P-ROUTE", "onednn-call", planted=False))
+    A(Case("37", "the default arm restored: its direct plan call is named too", b1(
+        replace_once("fattn.cpp", DEFAULT_ARM, "if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {"),
+        replace_once("fattn.cpp", "plan      = ggml_sycl_fattn_routed_plan(params,", "plan      = ggml_sycl_flash_attn_ext_onednn_plan(params,")),
+        "FAIL", "P-ROUTE", "plan-call", planted=False))
+    A(Case("37", "the default arm's branch also tests g_sycl_fa_onednn_enabled", b1(
+        replace_once("fattn.cpp", DEFAULT_ARM, "if (!safe_decode && g_sycl_fa_onednn_enabled && " + ROUTE_GATE + ") {")),
+        "FAIL", "P-ROUTE", "onednn-call", planted=False))
+    A(Case("37", "the default arm's branch also tests g_sycl_paged_v2_enabled", b1(
+        replace_once("fattn.cpp", DEFAULT_ARM, "if (!safe_decode && !g_sycl_paged_v2_enabled && " + ROUTE_GATE + ") {")),
+        "FAIL", "P-ROUTE", "onednn-call", planted=False))
+    A(Case("37", "the d512 arm's branch also tests ggml_sycl_fa_onednn_d512_enabled()", b1(
+        replace_once("fattn.cpp", "if (" + ROUTE_GATE + ") {\n            const bool                            multi_seq = (params.n_seqs > 1);",
+                     "if (ggml_sycl_fa_onednn_d512_enabled() && " + ROUTE_GATE + ") {\n            const bool                            multi_seq = (params.n_seqs > 1);")),
+        "FAIL", "P-ROUTE", "onednn-call", planted=False))
+    A(Case("37", "the plan called directly in a new function of fattn.cpp", b1(append_to(
+        "fattn.cpp", "void zzplant_p(const fattn_params & p) {\n    (void) ggml_sycl_flash_attn_ext_onednn_plan(p, 1, 1, false, false);\n}\n")),
+        "FAIL", "P-ROUTE", "zzplant_p"))
+    A(Case("37", "a new call of the oneDNN SDPA outside any routed branch", b1(append_to(
+        "fattn.cpp", "void zzplant_p(ggml_backend_sycl_context & ctx, const fattn_params & p) {\n    (void) ggml_sycl_flash_attn_ext_onednn(ctx, p);\n}\n")),
+        "FAIL", "P-ROUTE", "zzplant_p"))
+    A(Case("37", "route_admits called from a function that is neither the predicate nor the shape function", b1(append_to(
+        "fattn.cpp", "bool zzplant_p(const fattn_params & p) {\n    return ggml_sycl_fattn_onednn_route_admits(p, false, nullptr, nullptr);\n}\n")),
+        "FAIL", "P-ROUTE", "zzplant_p"))
+    A(Case("37", "the route's static gate called outside route_admits and the routing function", b1(append_to(
+        "fattn.cpp", "bool zzplant_p() {\n    return ggml_sycl_fattn_onednn_route_enabled();\n}\n")), "FAIL", "P-ROUTE", "zzplant_p"))
+    A(Case("37", "the value function calling the plan directly (b2)", b2(replace_once(
+        "unified-cache.cpp", "    return d512;\n", "    (void) ggml_sycl_flash_attn_ext_onednn_plan(params, 1, 1, false, false);\n    return d512;\n")),
+        "FAIL", "P-ROUTE", "value-plan", planted=False))
+    A(Case("37", "the value function giving the predicate a context (b2)", b2(replace_once(
+        "unified-cache.cpp", ROUTED_CALL, "if (!ggml_sycl_fattn_onednn_routed(params, false, &ctx, nullptr, f.head_dim_v)) {")),
+        "FAIL", "P-ROUTE", "value-predicate", planted=False))
+    A(Case("37", "the b1 tree: every arm sits in a routed branch (control)", b1(), "PASS", planted=False, active="p-route"))
+    A(Case("37", "today's tree: the inline arms are not yet a finding, the clause is dormant (control)", lambda f: f, "PASS", planted=False,
+           dormant="p-route"))
+    A(Case("37", "today's tree plus a direct plan call: dormant, nothing named (control)", append_to(
+        "fattn.cpp", "void zzplant_p(const fattn_params & p) {\n    (void) ggml_sycl_flash_attn_ext_onednn_plan(p, 1, 1, false, false);\n}\n"),
+        "PASS", dormant="p-route"))
+    A(Case("37", "route_admits spelled as a lambda variable: the latch fails", plant(
+        "static auto ggml_sycl_fattn_onednn_route_admits = [](int p) { return p > 0; };\n"), "FAIL", "X-LATCH", "latch:p-route"))
+    # 38: the support decision has one home
+    A(Case("38", "fattn_vec_supports_head_dim re-added in ggml_sycl_flash_attn_ext_supported", b1(replace_once(
+        "fattn.cpp", SHAPE_CALL, SHAPE_CALL + "    if (!fattn_vec_supports_head_dim(dst->src[0]->ne[0])) {\n        return false;\n    }\n")),
+        "FAIL", "P-HOME", "fattn_vec_supports_head_dim", planted=False))
+    A(Case("38", "a GGML_TYPE_ comparison in ggml_sycl_flash_attn_ext_supported", b1(replace_once(
+        "fattn.cpp", SHAPE_CALL, SHAPE_CALL + "    if (dst->src[0]->type != GGML_TYPE_F32) {\n        return false;\n    }\n")),
+        "FAIL", "P-HOME", "type-compare", planted=False))
+    A(Case("38", "a head dim compared with a literal in ggml_sycl_flash_attn_ext_supported", b1(replace_once(
+        "fattn.cpp", SHAPE_CALL, SHAPE_CALL + "    if (p.ne00 == 80) {\n        return false;\n    }\n")),
+        "FAIL", "P-HOME", "head-dim-literal", planted=False))
+    A(Case("38", "ggml_sycl_flash_attn_ext_supported not calling the shape function", b1(replace_once(
+        "fattn.cpp", "    return ggml_sycl_fattn_shape_supported(p, (int) dst->src[2]->ne[0]);\n", "    return true;\n")),
+        "FAIL", "P-HOME", "shape-call", planted=False))
+    A(Case("38", "&& p.ne00 != 80 appended to the routed predicate's return", b1(replace_once(
+        "fattn.cpp", "&& ggml_sycl_fattn_shape_supported(p, d_v);", "&& ggml_sycl_fattn_shape_supported(p, d_v) && p.ne00 != 80;")),
+        "FAIL", "P-HOME", "routed-body", planted=False))
+    A(Case("38", "std::getenv of the switch planted in the route's static gate (the read count is 2)", b1(replace_once(
+        "fattn.cpp", "    return g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled;\n",
+        '    const char * zz_env = std::getenv("GGML_SYCL_FLASH_ATTN_EXT");\n    return zz_env && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled;\n')),
+        "FAIL", "P-HOME", "is read at", planted=False))
+    A(Case("38", "the switch read through a bare getenv in a source outside the scope", b1(plant(
+        'void zz() {\n    const char * e = getenv( "GGML_SYCL_FLASH_ATTN_EXT" );\n}\n', "repo/zz-read.cpp")),
+        "FAIL", "P-HOME", "repo/zz-read.cpp"))
+    A(Case("38", "the tests' two reads of the switch kept (the count is 3, as before b1)", lambda f: b1_tree(f, keep_test_reads=True),
+           "FAIL", "P-HOME", "tests/test-sycl-fattn-onednn-gates.cpp", planted=False))
+    A(Case("38", "the shape function's call of ggml_sycl_flash_attn_ext_enabled() removed", b1(replace_once(
+        "fattn.cpp", "    if (!ggml_sycl_flash_attn_ext_enabled()) {\n        return false;\n    }\n    if (!fattn_vec_supports_head_dim(p.ne00)",
+        "    if (!fattn_vec_supports_head_dim(p.ne00)")), "FAIL", "P-HOME", "first-statement", planted=False))
+    A(Case("38", "fattn_vec_supports_head_dim planted in the D512 dispatch arm's function", b1(insert_after(
+        "fattn.cpp", FLASH_OPEN, "    if (!fattn_vec_supports_head_dim(32) && 32 != 512) {\n        return;\n    }\n")),
+        "FAIL", "P-HOME", "census:fattn_vec_supports_head_dim", planted=False))
+    A(Case("38", "ggml_sycl_fattn_d512_tile_admissible called in route_admits", b1(replace_once(
+        "fattn.cpp", "    const ggml_sycl_onednn_fa_layout_plan plan =\n        ggml_sycl_flash_attn_ext_onednn_plan(p,",
+        "    if (!ggml_sycl_fattn_d512_tile_admissible(nullptr)) {\n        return false;\n    }\n"
+        "    const ggml_sycl_onednn_fa_layout_plan plan =\n        ggml_sycl_flash_attn_ext_onednn_plan(p,")),
+        "FAIL", "P-HOME", "ggml_sycl_fattn_d512_tile_admissible", planted=False))
+    A(Case("38", "a third tile-screen call in the dispatch function", b1(insert_after(
+        "fattn.cpp", FLASH_OPEN, "    (void) ggml_sycl_fattn_d512_tile_admissible(nullptr);\n")),
+        "FAIL", "P-HOME", "tile-dispatch-sites", planted=False))
+    A(Case("38", "the route's hatch without the d512 flag: a head dim literal in route_admits", b1(replace_once(
+        "fattn.cpp", "    if (p.ne00 == 512 && !ggml_sycl_fa_onednn_d512_enabled()) {", "    if (p.ne00 == 512) {")),
+        "FAIL", "P-HOME", "head-dim-literal", planted=False))
+    A(Case("38", "ggml_sycl_fattn_kv_pair_of called outside the shape function and the fills", b1(append_to(
+        "fattn.cpp", "int zzplant_p(const fattn_params & p) {\n    return (int) ggml_sycl_fattn_kv_pair_of(p.K_type, p.V_type);\n}\n")),
+        "FAIL", "P-HOME", "census:ggml_sycl_fattn_kv_pair_of"))
+    A(Case("38", "the FLASH_ATTN_EXT case guarded by a head-dim test in ggml_backend_sycl_device_supports_op", b1(replace_once(
+        "ggml-sycl.cpp", "            return ggml_sycl_flash_attn_ext_supported(op);\n",
+        "            return fattn_vec_supports_head_dim(op->src[0]->ne[0]) && ggml_sycl_flash_attn_ext_supported(op);\n")),
+        "FAIL", "P-HOME", "case-line", planted=False))
+    for ph, tree in (("b1", b1), ("b2", b2)):
+        fills = [("fattn.cpp", "    " + FILL_LINE + "\n    return params;", "shape_of"),
+                 ("fattn.cpp", "    " + FILL_LINE + "\n\n    // Multi-token decode support", "flash_attn_ext"),
+                 ("unified-cache.cpp", "        " + FILL_LINE + "\n", "value function" if ph == "b2" else "load-maxima fill")]
+        for rel, anchor, nm in fills:
+            tail = anchor[len("    " + FILL_LINE):] if rel == "fattn.cpp" else "\n"
+            ind = anchor[:len(anchor) - len(anchor.lstrip())]
+            A(Case("38", "kv_is_fp8 = false replacing the pinned fill in %s (%s)" % (nm, ph), tree(replace_once(
+                rel, anchor, ind + "params.kv_is_fp8 = false;" + tail)), "FAIL", "P-FILL", "p-fill:pin", planted=False))
+            A(Case("38", "kv_is_fp8 = false appended after the pinned fill in %s (%s)" % (nm, ph), tree(replace_once(
+                rel, anchor, ind + FILL_LINE + "\n" + ind + "params.kv_is_fp8 = false;" + tail)),
+                "FAIL", "P-FILL", "p-fill:write", planted=False))
+    A(Case("38", "a kv_is_fp8 write outside every fill", b1(append_to(
+        "fattn.cpp", "void zzplant_p(fattn_params & params) {\n    params.kv_is_fp8 |= true;\n}\n")), "FAIL", "P-FILL", "p-fill:write"))
+    A(Case("38", "a kv_is_fp8 member write through a pointer, outside every fill", b1(append_to(
+        "fattn.cpp", "void zzplant_p(fattn_params * params) {\n    params->kv_is_fp8 = true;\n}\n")), "FAIL", "P-FILL", "p-fill:write"))
+    A(Case("38", "the local bool kv_is_fp8 is not a member write (control)", b1(append_to(
+        "fattn.cpp", "bool zzplant_p() {\n    bool kv_is_fp8 = true;\n    kv_is_fp8 = false;\n    return kv_is_fp8;\n}\n")), "PASS", active="p-fill"))
+    A(Case("38", "the load-maxima fill still defined in b2", b2(append_to("unified-cache.cpp", B1_LOADFILL)),
+           "FAIL", "P-FILL", "load-fill-in-b2", planted=False))
+    A(Case("38", "the KV buffer's strncmp parse kept in ggml-sycl.cpp beside the helper", b1(replace_once(
+        "ggml-sycl.cpp", "    layer_id = ggml_sycl_kv_cache_layer_of(name);\n",
+        '    layer_id = ggml_sycl_kv_cache_layer_of(name);\n    const char * prefix_v = "cache_v_l";\n    if (strncmp(name, prefix_v, 9) == 0) {\n        layer_id = atoi(name + 9);\n    }\n')),
+        "FAIL", "P-LAYER", "ggml-sycl.cpp", planted=False))
+    A(Case("38", "sscanf(name, \"cache_k_l%d\", &il) planted in ggml-sycl.cpp", b1(append_to(
+        "ggml-sycl.cpp", 'void zzplant_p(const char * name) {\n    int il = -1;\n    sscanf(name, "cache_k_l%d", &il);\n}\n')),
+        "FAIL", "P-LAYER", "ggml-sycl.cpp"))
+    A(Case("38", "the helper holding a third format string", b1(replace_once(
+        "common.cpp", '    return -1;\n}\n', '    if (sscanf(name, "cache_v_l%d", &id) == 1) {\n        return id;\n    }\n    return -1;\n}\n')),
+        "FAIL", "P-LAYER", "helper-formats", planted=False))
+    A(Case("38", "a comment that spells the layer prefix is not a parse (control)", b1(append_to(
+        "fattn.cpp", '// the name is "cache_k_l0" for layer zero\nvoid zzplant_p() {\n}\n')), "PASS", active="p-layer"))
+    A(Case("38", "ggml_sycl_kv_cache_layer_of spelled as a macro: the latch fails", plant(
+        "#define ggml_sycl_kv_cache_layer_of(n) -1\n"), "FAIL", "X-LATCH", "latch:p-layer", planted=False))
+    A(Case("38", "ggml_sycl_fattn_kv_pair_of spelled as a lambda variable: the latch fails", plant(
+        "static auto ggml_sycl_fattn_kv_pair_of = [](int k, int v) { return k == v; };\n"), "FAIL", "X-LATCH", "latch:p-fill"))
+    A(Case("38", "ggml_sycl_flash_attn_ext_enabled spelled as a macro: the latch fails", plant(
+        "#define ggml_sycl_flash_attn_ext_enabled() true\n"), "FAIL", "X-LATCH", "latch:p-home", planted=False))
+    A(Case("38", "onednn_graph_scratch_bytes spelled as a lambda variable: the latch fails", plant(
+        "static auto onednn_graph_scratch_bytes = [](int n) { return (size_t) n; };\n"), "FAIL", "X-LATCH", "latch:p-charge"))
+    # the charge side
+    CHARGE_HELPER = "        if (!fattn_vec_supports_head_dim(f.head_dim_k) && f.head_dim_k != 512) {\n            continue;\n        }\n"
+    CHARGE_LITERAL = ("        if (f.head_dim_k != 64 && f.head_dim_k != 128 && f.head_dim_k != 256 && f.head_dim_k != 512) {\n"
+                      "            continue;\n        }\n")
+    for ph, tree in (("b1", b1), ("b2", b2)):
+        where = "placement_plan_set_routed_head_maxima's layer loop" if ph == "b1" else "onednn_graph_scratch_bytes's walk"
+        A(Case("38", "the support helper and a 512 literal planted in %s" % where, tree(replace_once(
+            "unified-cache.cpp", "        " + ROUTED_CALL, CHARGE_HELPER + "        " + ROUTED_CALL)),
+            "FAIL", "P-CHARGE", "fattn_vec_supports_head_dim", planted=False))
+        A(Case("38", "the same without the helper, four literals, planted in %s" % where, tree(replace_once(
+            "unified-cache.cpp", "        " + ROUTED_CALL, CHARGE_LITERAL + "        " + ROUTED_CALL)),
+            "FAIL", "P-CHARGE", "literal", planted=False))
+        A(Case("38", "the charge side calling ggml_sycl_fattn_shape_supported (%s)" % ph, tree(replace_once(
+            "unified-cache.cpp", "        " + ROUTED_CALL,
+            "        if (!ggml_sycl_fattn_shape_supported(params, 0)) {\n            continue;\n        }\n        " + ROUTED_CALL)),
+            "FAIL", "P-CHARGE", "ggml_sycl_fattn_shape_supported", planted=False))
+    A(Case("38", "the D512 count line missing from the value function (b2)", b2(replace_once(
+        "unified-cache.cpp", "        if (params.ne00 == 512) {\n            ++d512;\n        }\n", "        ++d512;\n")),
+        "FAIL", "P-CHARGE", "d512-count", planted=False))
+    A(Case("38", "the D512 count line twice in the value function (b2)", b2(replace_once(
+        "unified-cache.cpp", "        if (params.ne00 == 512) {\n            ++d512;\n        }\n",
+        "        if (params.ne00 == 512) {\n            ++d512;\n        }\n        if (params.ne00 == 512) {\n            ++d512;\n        }\n")),
+        "FAIL", "P-CHARGE", "d512-count", planted=False))
+    A(Case("38", "the D512 count line in the b1 load-maxima fill (it lands in b2 only)", b1(replace_once(
+        "unified-cache.cpp", "        " + ROUTED_CALL, "        if (params.ne00 == 512) {\n            continue;\n        }\n        " + ROUTED_CALL)),
+        "FAIL", "P-CHARGE", "literal", planted=False))
+    A(Case("38", "the b1 tree: one read of the switch, one call of it, every block keyed on its subject (control)", b1(), "PASS",
+           planted=False, active="p-home"))
+    A(Case("38", "the b2 tree: the value function replaces the load-maxima fill (control)", b2(), "PASS", planted=False, active="p-charge"))
+    A(Case("38", "a setenv of the switch and a commented getenv are not reads (control)", b1(plant(
+        'void zz() {\n    // getenv("GGML_SYCL_FLASH_ATTN_EXT")\n    setenv("GGML_SYCL_FLASH_ATTN_EXT", "0", 1);\n}\n', "repo/zz-set.cpp")),
+        "PASS", active="p-home"))
+    for blk, subj in (("p-home", "ggml_sycl_flash_attn_ext_enabled"), ("p-fill", "ggml_sycl_fattn_kv_pair_of"),
+                      ("p-layer", "ggml_sycl_kv_cache_layer_of"), ("p-charge", "placement_plan_set_routed_head_maxima")):
+        A(Case("38", "today's tree: %s is absent, so %s is dormant (control)" % (subj, blk), lambda f: f, "PASS", planted=False, dormant=blk))
+    return c
+
+
 def names_new(f, code):
     return f.startswith("FAIL new %s " % code)
 
@@ -4528,10 +5282,12 @@ def planted_sightings(files):
     n = 0
     for rel in files:
         if not (rel.startswith("zz") or "/zz" in rel or rel == "cpu-dispatch.cpp"):
+            # a planted function appended to a real file (clause (p)'s fixtures are real files)
+            n += sum(1 for name, _, _ in s2d_facts(files[rel])["fdefs"] if name.startswith("zzplant"))
             continue
         if rel.startswith("zz") or "/zz" in rel:
             fa2 = s2d_facts(files[rel])
-            n += len(fa2["occ"]) + len(fa2["fdefs"])
+            n += len(fa2["occ"]) + len(fa2["fdefs"]) + (P_ENV.encode() in files[rel])
         if rel in core:
             fa = facts_for(rel, core[rel], ctx)
         else:
@@ -4781,7 +5537,8 @@ def run_matrix(files, allowlist, debt, root, shard=None):
             if not any(c.wid == w and c.expect == "FAIL" for c in all_cases):
                 print("FAIL: witness %s has no FAIL case" % w)
                 bad += 1
-        print("deferred: " + "; ".join("witness %s (%s)" % kv for kv in WITNESSES_DEFERRED.items()))
+        if WITNESSES_DEFERRED:
+            print("deferred: " + "; ".join("witness %s (%s)" % kv for kv in WITNESSES_DEFERRED.items()))
         if not (names_new("FAIL new D-ZONE-COUNT x", "D-ZONE-COUNT") and not names_new("FAIL new D-ZONE-COUNT x", "D-ZONE")):
             print("FAIL: the matcher's own self-test (prefix collision) is wrong")
             bad += 1
@@ -4852,6 +5609,7 @@ def main():
             return 1
     files = load_tree(a.root)
     files.update(load_test_sources(a.root))
+    files.update(load_repo_reads(a.root))
     S2D_DATA["dir"] = str(data)
     if a.list or a.write_debt:
         viols, _ = analyse(files)
