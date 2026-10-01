@@ -75750,6 +75750,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             ggml_sycl::mem_handle shared_act_handle;
 
             const bool multi_gpu = g_moe_multi_gpu_active.load(std::memory_order_acquire);
+            // One fact, one source: every host expert reads the same activation
+            // row only when src1 has a single row (ne11 == 1: MoE gate/up).  For
+            // the down projection src1 is [n_ff, n_used, n_tokens], one row per
+            // expert slot, so each host expert needs the row of its own slot.
+            // Everything below that decides "shared" reads this, never
+            // cpu_expert_tg_active alone (llama.cpp-4hg7).
+            const bool cpu_shared_act = cpu_expert_tg_active && ne11 == 1;
             if (ne11 == 1 && src0->type != GGML_TYPE_Q1_0 && src0->type != GGML_TYPE_NVFP4 &&
                 (cpu_expert_tg_active || multi_gpu)) {
                 static thread_local managed_host_pinned_buffer s_act_staging;
@@ -75908,12 +75915,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 sycl::event act_deferred_evt;
                 bool        act_deferred_pending = false;
 
-                if (act_on_host && cpu_expert_tg_active) {
+                if (act_on_host && cpu_shared_act) {
                     // Use shared activation — defer wait until after task building.
                     // Tasks will point directly to shared_act_host.
                     act_deferred_evt     = act_d2h_event;
                     act_deferred_pending = true;
-                } else if (cpu_expert_tg_active && n_cpu > 1) {
+                } else if (cpu_shared_act && n_cpu > 1) {
                     // Single D2H: all experts share the same activation at offset 0.
                     // Submit async — wait deferred until just before CPU pool submission
                     // to overlap D2H with task struct building below.
@@ -76014,9 +76021,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         task.recipe                    = entry.admitted_recipe_ticket.recipe();
                         task.admitted_recipe_signature = entry.admitted_recipe_ticket.signature();
                         task.weight_lease              = std::move(host_lease);
-                        task.activations               = cpu_expert_tg_active ?
-                                                             (act_on_host ? shared_act_host : act_pinned) :
-                                                             act_pinned + ci * static_cast<size_t>(K);
+                        task.activations               = cpu_shared_act ? (act_on_host ? shared_act_host : act_pinned) :
+                                                                          act_pinned + ci * static_cast<size_t>(K);
                         task.output                    = out_pinned + ci * static_cast<size_t>(N);
                         task.workspace                 = recipe_workspace;
                         task.workspace_bytes           = recipe_workspace_bytes;
@@ -76028,13 +76034,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                     cpu_expert_task t;
                     t.weight_host  = host_weight;
-                    // When cpu_expert_tg_active, all tasks share the single
+                    // When cpu_shared_act, all tasks share the single
                     // activation copy; batched dispatch deduplicates Q8_0
                     // quantization via act_host pointer equality.
                     // When act_on_host, point directly to shared staging buffer
                     // (skip intermediate memcpy).
-                    t.act_host     = cpu_expert_tg_active ? (act_on_host ? shared_act_host : act_pinned) :
-                                                            act_pinned + ci * static_cast<size_t>(K);
+                    t.act_host     = cpu_shared_act ? (act_on_host ? shared_act_host : act_pinned) :
+                                                      act_pinned + ci * static_cast<size_t>(K);
                     t.output_host  = out_pinned + ci * static_cast<size_t>(N);
                     t.type         = src0->type;
                     t.K            = static_cast<int>(K);
