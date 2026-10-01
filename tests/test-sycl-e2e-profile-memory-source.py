@@ -70,7 +70,7 @@ def test_unified_cache_records_host_fallback_and_zone_failures() -> None:
         assert f'e2e_tg_profile_record_cache_event("host_fallback", {bytes_arg}, 0.0)' in src[record:gate_close]
 
     zone_begin = src.index("void * unified_cache::zone_alloc")
-    zone_end = src.index("void unified_cache::zone_free", zone_begin)
+    zone_end = src.index("bool unified_cache::zone_free(", zone_begin)
     zone_body = src[zone_begin:zone_end]
     assert zone_body.count("zone_alloc_failures") == 2
     zone_records = positions(zone_body, 'e2e_tg_profile_record_cache_event("zone_alloc_failed"')
