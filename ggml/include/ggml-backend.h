@@ -368,6 +368,8 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // the chunk layout of the sched's last reserve for this backend's buffer (see ggml_gallocr_get_chunk_peaks)
+    GGML_API int                        ggml_backend_sched_get_reserved_chunk_peaks(ggml_backend_sched_t sched, ggml_backend_t backend, size_t * peak_out, int max, size_t * max_chunk_size_out);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

@@ -1608,6 +1608,20 @@ if (NOT WIN32)
         TIMEOUT 60
     )
 
+    # ggml core clauses of the context-tenant planning path: the scheduler tests
+    # every gallocr reserve, and a failed reserve invalidates the node layout so
+    # the next same-shape alloc_graph reserves again instead of using a NULL buffer.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-context-tenant-plan-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-context-tenant-plan-source.py
+    )
+    set_tests_properties(test-sycl-context-tenant-plan-source PROPERTIES
+        LABELS "sycl;tdd"
+        TIMEOUT 60
+    )
+
     # Regression + arithmetic gate for parse-sycl-gap-device-split.py, the
     # device-clock A/B decomposition the Cluster B verdict rests on. Registered
     # because that script shipped with a reproducible ZeroDivisionError: its
@@ -3190,6 +3204,12 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+
+    # The scheduler's chunk query and its clean failure on a refused buffer.
+    # Both need ggml-backend-impl.h for the dummy backend's interface structs
+    # and host-only: no device, no model.
+    llama_build_and_test(test-sched-reserve-chunks.cpp)
+    llama_build_and_test(test-sched-alloc-failure.cpp)
 endif()
 
 # -------------------------------------------------------------------------

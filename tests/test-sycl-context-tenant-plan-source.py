@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Source gates for the context-tenant planning path (ggml core clauses).
+
+Gate 13: every scheduler call of ggml_gallocr_reserve_n (not the _size form)
+in ggml-backend.cpp tests its result and returns false on failure. A reserve
+that fails and is ignored leaves the scheduler believing it holds buffers.
+
+Gate 15 (reserve clause): every `return false;` in ggml_gallocr_reserve_n_impl
+is preceded by the invalidation of the node and leaf layouts. The failed
+reserve has already rewritten node_allocs while its vbuffer is NULL; without
+`galloc->n_nodes = 0; galloc->n_leafs = 0;` the next same-shape alloc_graph
+finds no reason to reserve again and places tensors in a NULL vbuffer.
+
+Both gates prove themselves on mutants of the real source (the gate must fail
+on each) and refuse to pass vacuously. Limits, deliberately: the walk is
+textual, so a reserve reached through a wrapper is not seen, and the
+invalidation is checked as the two statements immediately before the return.
+argv: [ggml-backend.cpp [ggml-alloc.c]]
+"""
+import os
+import re
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_BACKEND = os.path.join(REPO, "ggml", "src", "ggml-backend.cpp")
+DEFAULT_ALLOC = os.path.join(REPO, "ggml", "src", "ggml-alloc.c")
+
+RESERVE_CALL = re.compile(r"\bggml_gallocr_reserve_n\s*\(")
+CHECKED_CALL = re.compile(r"\bif\s*\(\s*!\s*ggml_gallocr_reserve_n\s*\(")
+IMPL_SIGNATURE = "static bool ggml_gallocr_reserve_n_impl("
+INVALIDATE = ("galloc->n_nodes = 0;", "galloc->n_leafs = 0;")
+
+
+def strip_comments(text):
+    text = re.sub(r"/\*.*?\*/", lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+
+def reserve_call_violations(text):
+    """(violations, call_count): each call must be `if (!call)` with a `return false;` before the block closes."""
+    lines = strip_comments(text).split("\n")
+    out = []
+    calls = 0
+    for i, line in enumerate(lines):
+        if not RESERVE_CALL.search(line):
+            continue
+        calls += 1
+        if not CHECKED_CALL.search(line):
+            out.append((i + 1, "result of ggml_gallocr_reserve_n is not tested"))
+            continue
+        depth = 0
+        opened = False
+        returned = False
+        for j in range(i, len(lines)):
+            for ch in lines[j]:
+                if ch == "{":
+                    depth += 1
+                    opened = True
+                elif ch == "}":
+                    depth -= 1
+            if opened and re.search(r"\breturn\s+false\s*;", lines[j]):
+                returned = True
+            if opened and depth == 0:
+                break
+        if not returned:
+            out.append((i + 1, "failed reserve does not return false"))
+    return out, calls
+
+
+def impl_bounds(lines):
+    start = next((i for i, l in enumerate(lines) if l.startswith(IMPL_SIGNATURE)), None)
+    if start is None:
+        return None
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("}")), len(lines) - 1)
+    return start, end
+
+
+def invalidation_violations(text):
+    """(violations, return_count) for every `return false;` in ggml_gallocr_reserve_n_impl."""
+    lines = strip_comments(text).split("\n")
+    bounds = impl_bounds(lines)
+    if bounds is None:
+        return [(0, "ggml_gallocr_reserve_n_impl not found")], 0
+    out = []
+    returns = 0
+    for i in range(bounds[0], bounds[1] + 1):
+        if not re.search(r"\breturn\s+false\s*;", lines[i]):
+            continue
+        returns += 1
+        prev = [l.strip() for l in lines[:i] if l.strip()][-2:]
+        if tuple(prev) != INVALIDATE:
+            out.append((i + 1, "return false without galloc->n_nodes = 0; galloc->n_leafs = 0; before it"))
+    return out, returns
+
+
+def mutants_backend(text):
+    yield "untested reserve", text.replace("if (!ggml_gallocr_reserve_n(", "(void) (ggml_gallocr_reserve_n(", 1)
+    lines = text.split("\n")
+    for i, l in enumerate(lines):
+        if RESERVE_CALL.search(l) and CHECKED_CALL.search(l):
+            for j in range(i + 1, min(i + 4, len(lines))):
+                if re.search(r"\breturn\s+false\s*;", lines[j]):
+                    yield "dropped return false at line %d" % (j + 1), "\n".join(lines[:j] + ["        (void) 0;"] + lines[j + 1:])
+                    break
+
+
+def mutants_alloc(text):
+    lines = text.split("\n")
+    bounds = impl_bounds(lines)
+    if bounds is None:
+        return
+    for i in range(bounds[0], bounds[1] + 1):
+        if re.search(r"\breturn\s+false\s*;", lines[i]):
+            for stmt in INVALIDATE:
+                k = max((j for j in range(i) if stmt in lines[j]), default=None)
+                if k is None:
+                    continue
+                yield "dropped `%s`" % stmt, "\n".join(lines[:k] + lines[k + 1:])
+            yield "unguarded extra return false", "\n".join(lines[:i] + ["    if (galloc == NULL) { return false; }"] + lines[i:])
+            break
+
+
+def main():
+    backend_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BACKEND
+    alloc_path = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_ALLOC
+    with open(backend_path, encoding="utf-8") as f:
+        backend = f.read()
+    with open(alloc_path, encoding="utf-8") as f:
+        alloc = f.read()
+    status = 0
+
+    bad, calls = reserve_call_violations(backend)
+    if calls < 2:
+        print("FAIL: gate 13: found %d ggml_gallocr_reserve_n calls in %s (expected the alloc and the reserve path); "
+              "the gate would pass vacuously" % (calls, backend_path))
+        status = 1
+    for line_no, why in bad:
+        print("FAIL: gate 13: %s:%d: %s" % (backend_path, line_no, why))
+        status = 1
+    missed13 = [name for name, m in mutants_backend(backend) if not reserve_call_violations(m)[0]]
+    n13 = sum(1 for _ in mutants_backend(backend))
+    if n13 < 3:
+        print("FAIL: gate 13: only %d mutants could be built" % n13)
+        status = 1
+    for name in missed13:
+        print("FAIL: gate 13: mutant went undetected: %s" % name)
+        status = 1
+
+    bad, returns = invalidation_violations(alloc)
+    if returns < 1:
+        print("FAIL: gate 15: no `return false;` found in ggml_gallocr_reserve_n_impl; the gate would pass vacuously")
+        status = 1
+    for line_no, why in bad:
+        print("FAIL: gate 15: %s:%d: %s" % (alloc_path, line_no, why))
+        status = 1
+    missed15 = [name for name, m in mutants_alloc(alloc) if not invalidation_violations(m)[0]]
+    n15 = sum(1 for _ in mutants_alloc(alloc))
+    if n15 < 3:
+        print("FAIL: gate 15: only %d mutants could be built" % n15)
+        status = 1
+    for name in missed15:
+        print("FAIL: gate 15: mutant went undetected: %s" % name)
+        status = 1
+
+    if status == 0:
+        print("PASS: %d scheduler reserve calls are tested and return false (%d mutants caught); "
+              "%d reserve_n_impl failure return(s) invalidate the layout first (%d mutants caught)" %
+              (calls, n13, returns, n15))
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

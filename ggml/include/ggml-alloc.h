@@ -67,6 +67,18 @@ GGML_API bool ggml_gallocr_reserve_n(
     const int * node_buffer_ids,
     const int * leaf_buffer_ids);
 
+// the chunk layout of the last reserve (or reserve_n_size) of buffer buffer_id: returns the number of chunks,
+// writes the peak of chunk c (the bytes the graph used in it) to peak_out[c] for c < min(chunks, max), and the
+// allocator's max chunk size to *max_chunk_size_out (may be NULL). A chunk below the last has capacity
+// MAX(peak, max_chunk_size): a non-oversize chunk holds max_chunk_size, and an oversize chunk holds one tensor
+// at offset 0, so its peak is its capacity.
+GGML_API int ggml_gallocr_get_chunk_peaks(
+    ggml_gallocr_t galloc,
+    int buffer_id,
+    size_t * peak_out,
+    int max,
+    size_t * max_chunk_size_out);
+
 // automatic reallocation if the topology changes when using a single buffer
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);

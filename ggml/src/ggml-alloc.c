@@ -940,6 +940,11 @@ static bool ggml_gallocr_reserve_n_impl(
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                    // node_allocs and leaf_allocs now describe a layout whose buffer is gone. Invalidate them so the
+                    // next alloc_graph of a same-shape graph sees needs_realloc and reserves again, instead of
+                    // placing tensors in a NULL vbuffer.
+                    galloc->n_nodes = 0;
+                    galloc->n_leafs = 0;
                     return false;
                 }
             }
@@ -958,6 +963,19 @@ void ggml_gallocr_reserve_n_size(
             sizes[i] += galloc->buf_tallocs[i]->chunks[c]->max_size;
         }
     }
+}
+
+int ggml_gallocr_get_chunk_peaks(ggml_gallocr_t galloc, int buffer_id, size_t * peak_out, int max, size_t * max_chunk_size_out) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    const struct ggml_dyn_tallocr * talloc = galloc->buf_tallocs[buffer_id];
+    if (max_chunk_size_out) {
+        *max_chunk_size_out = talloc->max_chunk_size;
+    }
+    for (int c = 0; c < talloc->n_chunks && c < max; c++) {
+        peak_out[c] = talloc->chunks[c]->max_size;
+    }
+    return talloc->n_chunks;
 }
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
