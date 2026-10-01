@@ -554,50 +554,23 @@ inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
                                       uint32_t n_seq_max,
                                       bool     kv_unified,
                                       bool     swa_full) {
-    if (kind == GGML_SYCL_KV_LAYER_SHARED) {
-        return 0;
-    }
-    if (kind == GGML_SYCL_KV_LAYER_SWA && !swa_full) {
-        if (n_swa == 0) {
-            return 0;
-        }
-        const uint32_t seqs = n_seq_max > 0 ? n_seq_max : 1;
-        uint32_t       n_ctx_seq;    // cells per stream in the non-SWA (base) cache
-        uint32_t       n_stream;     // number of independent KV streams
-        uint32_t       window_seqs;  // the "unified ? n_seq_max : 1" term, llama_kv_cache_iswa::llama_kv_cache_iswa()
-        if (kv_unified) {
-            // llama_context::llama_context() sets cparams.n_ctx_seq =
-            // cparams.n_ctx.
-            n_ctx_seq   = n_ctx;
-            n_stream    = 1;
-            window_seqs = seqs;
-        } else {
-            // llama_context::llama_context() computes n_ctx_seq =
-            // GGML_PAD(n_ctx / n_seq_max, 256), and n_ctx itself is then
-            // adjusted to n_ctx_seq * n_seq_max exactly -- so dividing the
-            // (already-adjusted) n_ctx this function receives back out by
-            // seqs reproduces llama's own n_ctx_seq exactly (no remainder,
-            // and re-padding an already-256-aligned value is a no-op).
-            n_ctx_seq   = GGML_PAD(n_ctx / seqs, 256);
-            n_stream    = seqs;
-            window_seqs = 1;
-        }
-        // llama_kv_cache_iswa::llama_kv_cache_iswa()'s size_swa =
-        // GGML_PAD(min(size_base, n_swa*(unified?n_seq_max:1) + n_ubatch),
-        // 256), one size PER STREAM; llama_kv_cache::llama_kv_cache()'s
-        // per-stream K/V tensor creation allocates n_stream such streams.
-        const uint32_t swa_cells_per_stream = GGML_PAD(std::min(n_ctx_seq, n_swa * window_seqs + n_ubatch), 256);
-        const uint32_t swa_cells            = swa_cells_per_stream * n_stream;
-        return static_cast<size_t>(swa_cells) * static_cast<size_t>(k_width + v_width) * sizeof(ggml_fp16_t);
-    }
-    // GGML_SYCL_KV_LAYER_FULL (and GGML_SYCL_KV_LAYER_SWA under swa_full --
-    // llama.cpp-uajm, see above): the whole context window, every cell. Total
-    // cells across streams is n_ctx_seq * n_stream, which by the same
-    // llama_context::llama_context()'s n_ctx_seq invariant equals n_ctx
-    // exactly in both modes (kv_unified==true: n_stream=1, n_ctx_seq=n_ctx;
-    // kv_unified==false: n_ctx already adjusted to n_ctx_seq * n_seq_max)
-    // -- so this branch needs no unified/non-unified split.
-    return static_cast<size_t>(n_ctx) * static_cast<size_t>(k_width + v_width) * sizeof(ggml_fp16_t);
+    // The cell arithmetic, and the K/V byte rule, are the one pair of functions
+    // the region fit's slots use too (kv-runtime-demotion.hpp); this is the
+    // load-time estimate, which has no context to ask: an f16 shape, unpadded.
+    static_assert(static_cast<int>(KV_CELLS_FULL) == static_cast<int>(GGML_SYCL_KV_LAYER_FULL) &&
+                      static_cast<int>(KV_CELLS_SWA) == static_cast<int>(GGML_SYCL_KV_LAYER_SWA) &&
+                      static_cast<int>(KV_CELLS_SHARED) == static_cast<int>(GGML_SYCL_KV_LAYER_SHARED),
+                  "kv_cells_kind must mirror ggml_sycl_kv_layer_kind");
+    kv_layer_desc layer;
+    layer.n_embd_k_gqa = k_width;
+    layer.n_embd_v_gqa = v_width;
+    layer.has_kv       = 1;
+    const size_t cells = kv_layer_cells(kind, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full, n_swa);
+    // The row-size lambda restates ggml_row_size for f16 so this header needs no
+    // ggml-base; test-sycl-kv-layer-sizing sweeps it against the real ggml_row_size.
+    return kv_layer_tensor_bytes(
+        layer, GGML_TYPE_F16, GGML_TYPE_F16, cells, /*pad_to=*/1,
+        [](int32_t, int64_t n_elements) { return static_cast<size_t>(n_elements) * sizeof(ggml_fp16_t); });
 }
 
 // Explicit planner inputs used for KV sizing and placement.
