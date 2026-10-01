@@ -1,11 +1,15 @@
 #pragma once
+#include "shared-zone-tags.hpp"
+#include "tlsf-allocator.hpp"
+
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
 #include <vector>
-
-#include "tlsf-allocator.hpp"
 
 namespace ggml_sycl {
 
@@ -306,5 +310,518 @@ int layer_block_kv_device(const std::vector<int> &    kv_device,
                           const std::vector<size_t> & layer_kv_bytes,
                           int                         start_layer,
                           int                         end_layer);
+
+// ---------------------------------------------------------------------------
+// One per-layer KV byte function (llama.cpp-moua).
+//
+// The cell arithmetic below was kv_layer_bytes_for_kind()'s (unified-cache.hpp,
+// llama.cpp-3aos and llama.cpp-uajm own the derivation of every branch there);
+// it lives here, SYCL-free, so the load-time estimate and the context's region
+// slots cannot size one layer two ways.  kv_layer_bytes_for_kind() calls
+// kv_layer_cells() and kv_layer_tensor_bytes() with an f16 shape and no
+// padding; the region fit sizes a slot from the shape llama actually publishes
+// and the tiered buft's alignment.
+// ---------------------------------------------------------------------------
+
+// A layer's attention kind as far as its cell count is concerned.  The values
+// are ggml_sycl_kv_layer_kind's (ggml-sycl.h); unified-cache.hpp static_asserts
+// that, because this header takes no ggml-sycl.h include.
+enum kv_cells_kind : uint8_t {
+    KV_CELLS_FULL   = 0,
+    KV_CELLS_SWA    = 1,
+    KV_CELLS_SHARED = 2,  // no K/V of its own: 0 cells
+};
+
+// Cells one layer of `kind` holds, across all of its streams.  The derivation of
+// each branch is the comment above kv_layer_bytes_for_kind() (unified-cache.hpp,
+// llama.cpp-3aos and llama.cpp-uajm).  Inline: every target that reaches the
+// load-time estimate through unified-cache.hpp needs it without linking this TU.
+inline size_t kv_layer_cells(uint8_t  kind,
+                             uint32_t n_ctx,
+                             uint32_t n_ubatch,
+                             uint32_t n_seq_max,
+                             bool     kv_unified,
+                             bool     swa_full,
+                             uint32_t n_swa) {
+    if (kind == KV_CELLS_SHARED) {
+        return 0;
+    }
+    if (kind == KV_CELLS_SWA && !swa_full) {
+        if (n_swa == 0) {
+            return 0;
+        }
+        const uint32_t seqs = n_seq_max > 0 ? n_seq_max : 1;
+        uint32_t       n_ctx_seq;    // cells per stream in the non-SWA (base) cache
+        uint32_t       n_stream;     // number of independent KV streams
+        uint32_t       window_seqs;  // the "unified ? n_seq_max : 1" term, llama_kv_cache_iswa::llama_kv_cache_iswa()
+        auto           pad256 = [](uint32_t x) {
+            return (x + 255u) & ~255u;
+        };
+        if (kv_unified) {
+            n_ctx_seq   = n_ctx;
+            n_stream    = 1;
+            window_seqs = seqs;
+        } else {
+            // n_ctx is already adjusted to n_ctx_seq * n_seq_max, so dividing
+            // seqs back out reproduces llama's own n_ctx_seq exactly.
+            n_ctx_seq   = pad256(n_ctx / seqs);
+            n_stream    = seqs;
+            window_seqs = 1;
+        }
+        const uint32_t swa_cells_per_stream = pad256(std::min(n_ctx_seq, n_swa * window_seqs + n_ubatch));
+        const uint32_t swa_cells            = swa_cells_per_stream * n_stream;
+        return static_cast<size_t>(swa_cells);
+    }
+    // FULL, and SWA under swa_full: every cell of the context window.  Total
+    // cells across streams is n_ctx_seq * n_stream, which llama_context's
+    // n_ctx_seq invariant makes n_ctx in both modes.
+    return static_cast<size_t>(n_ctx);
+}
+
+// One layer's widths, exactly the ones llama passes to ggml_new_tensor_3d for
+// its K and V (n_embd_v_gqa taken after the [TAG_V_CACHE_VARIABLE] padding, 0
+// when the model has no V).  has_kv == 0 marks a filtered, shared or reused
+// layer, which holds no slot.
+struct kv_layer_desc {
+    uint32_t n_embd_k_gqa  = 0;
+    uint32_t n_embd_v_gqa  = 0;
+    uint32_t n_head_kv     = 0;
+    uint32_t n_embd_head_k = 0;
+    uint8_t  has_kv        = 0;
+    uint8_t  is_swa        = 0;
+};
+
+// ggml_row_size, injected: this header is SYCL-free and its host test links no
+// ggml-base.  Production passes ggml_row_size; a host test passes its own table.
+typedef size_t (*kv_row_size_fn)(int32_t type, int64_t n_elements);
+
+// `bytes` rounded up to a multiple of `pad_to`; 0 and 1 leave it alone.
+inline size_t kv_pad_bytes(size_t bytes, size_t pad_to) {
+    if (pad_to <= 1 || bytes == 0) {
+        return bytes;
+    }
+    return ((bytes + pad_to - 1) / pad_to) * pad_to;
+}
+
+// Bytes of one layer's K and V tensors over `cells` cells:
+// row_size(type, width) * cells for each, each padded to `pad_to` the way
+// ggml_backend_alloc_ctx_tensors_from_buft pads every tensor it places.  A
+// layer with has_kv == 0 is 0.  pad_to is the tiered buft's alignment for a
+// region slot and 1 for the load-time estimate, which never sizes a region.
+// That alignment is the whole of the buft's size rule today: get_alloc_size is
+// NULL (identity) for the tiered buft.  A buft with a real get_alloc_size, such
+// as a future recurrent-state buft, needs a second per-tensor hook applied here
+// before the padding (L4's kv_layer_alloc_bytes is where it goes).
+inline size_t kv_layer_tensor_bytes(const kv_layer_desc & layer,
+                                    int32_t               type_k,
+                                    int32_t               type_v,
+                                    size_t                cells,
+                                    size_t                pad_to,
+                                    kv_row_size_fn        row_size) {
+    if (!layer.has_kv || row_size == nullptr) {
+        return 0;
+    }
+    const size_t k_bytes = layer.n_embd_k_gqa > 0 ? row_size(type_k, layer.n_embd_k_gqa) * cells : 0;
+    const size_t v_bytes = layer.n_embd_v_gqa > 0 ? row_size(type_v, layer.n_embd_v_gqa) * cells : 0;
+    return kv_pad_bytes(k_bytes, pad_to) + kv_pad_bytes(v_bytes, pad_to);
+}
+
+// One recurrent layer, exactly the arguments llama_memory_recurrent passes to
+// ggml_new_tensor_2d for r_l and s_l (n_rows = mem_size * (1 + n_rs_seq)).
+struct rs_layer_desc {
+    uint32_t il       = 0;
+    int32_t  type_r   = 0;
+    int32_t  type_s   = 0;
+    uint32_t n_embd_r = 0;
+    uint32_t n_embd_s = 0;
+    uint32_t n_rows   = 0;
+};
+
+// Bytes of one device's recurrent-state buffer: r_l then s_l of every layer in
+// order, each tensor row_size(type, n_embd) * n_rows padded to `pad_to`, summed
+// the way ggml_backend_alloc_ctx_tensors_from_buft lays one context out.
+size_t rs_buffer_bytes(const std::vector<rs_layer_desc> & layers, size_t pad_to, kv_row_size_fn row_size);
+
+// ---------------------------------------------------------------------------
+// The context-side demand record (llama.cpp-moua §2.4.3).  A producer lists, by
+// index, the allocations that can be live at once; every claim names its index.
+// ---------------------------------------------------------------------------
+
+// Whose lifetime a reservation follows.  There is no DEVICE scope: the u1bb
+// ring's rows are per-context CONTEXT slots.
+enum class demand_scope : uint8_t { MODEL, CONTEXT };
+
+// How the fit places a record.  A HEAD_SLOT is mandatory and placed before any
+// KV; an AFTER_KV record (23mk's oneDNN Graph scratch) is charged after the KV
+// extents, never demotes KV and never refuses.
+enum class demand_placement : uint8_t { HEAD_SLOT, AFTER_KV };
+
+struct context_side_demand {
+    int                  device   = -1;
+    // CONTEXT, TRANSIENT or WEIGHT_SIDE_TRANSIENT, as SHARED_ZONE_LIFETIME_*
+    shared_zone_lifetime lifetime = shared_zone_lifetime::SHARED_ZONE_LIFETIME_CONTEXT;
+    demand_scope         scope    = demand_scope::CONTEXT;
+    uint64_t             owner    = 0;                              // CONTEXT: the ContextId; MODEL: the ModelId
+    const char *         cohort   = nullptr;                        // the cohort id its claims carry
+    std::vector<size_t>  slots;                                     // slots[i] = cap of slot index i
+    demand_placement     placement = demand_placement::HEAD_SLOT;
+};
+
+// A reserved slot an owner already holds: the key of a claim plus the cap.
+struct held_slot {
+    int          device = -1;
+    demand_scope scope  = demand_scope::CONTEXT;
+    uint64_t     owner  = 0;
+    const char * cohort = nullptr;
+    uint32_t     index  = 0;
+    size_t       cap    = 0;
+};
+
+// Whether `held` is the slot of `demand`'s index `index` (same device, scope,
+// owner, cohort and index), whatever its cap.
+bool demand_slot_key_matches(const held_slot & held, const context_side_demand & demand, uint32_t index);
+
+// The held slot that serves slot `index` of `demand` in place, or SIZE_MAX: the
+// owner already holds the same (cohort, index) with a cap at least `need`.  A
+// larger slot serves a smaller claim (size <= cap[index]), so a shrink is never
+// a carve.
+size_t demand_find_reusable_slot(const std::vector<held_slot> & held,
+                                 const context_side_demand &    demand,
+                                 uint32_t                       index,
+                                 size_t                         need);
+
+// What a transaction does with a context's records against what it holds.
+struct demand_slot_ref {
+    size_t   record = 0;         // index into the demands
+    uint32_t index  = 0;         // slot index within the record
+    size_t   size   = 0;         // the demanded cap
+    size_t   held   = SIZE_MAX;  // index into held, or SIZE_MAX when none
+};
+
+struct demand_reconciliation {
+    std::vector<demand_slot_ref> reused;      // served in place by a held slot of cap >= size
+    std::vector<demand_slot_ref> carved;      // carved new, nothing held at that key
+    std::vector<demand_slot_ref> superseded;  // carved new; `held` is the smaller slot the publish releases
+    std::vector<size_t>          unused;      // held slots (indices) of a demanded owner no record names
+};
+
+// Reuse in place when the owner holds the same (cohort, index) with cap >= the
+// new need; every other slot is carved new, and the old one it supersedes is
+// released at the publish.  A claimed slot is never moved.  A held slot is
+// `unused` when its owner has a record on its device and no record names its
+// (cohort, index): it stays as held planned room (the tenant-only path) and is
+// released only with its owner.  Precondition: `held` carries no two slots with
+// the same (device, scope, owner, cohort, index); the registry never holds
+// duplicates, and with a duplicate only the first would be reported superseded.
+demand_reconciliation context_demand_reconcile(const std::vector<context_side_demand> & demands,
+                                               const std::vector<held_slot> &           held);
+
+// ---------------------------------------------------------------------------
+// kv_region_fit (llama.cpp-moua §2.4.1): the pure fit of one context's KV
+// region and head slots onto one device's shared-zone TLSFs.
+//
+// It reads a copy of the geometry (taken under the group mutex, §2.3.1) and a
+// request, runs no allocator and touches no device, and its offsets are the
+// carve's: a top carve below an anchor takes (end - size), and a gap smaller
+// than size + MIN_BLOCK_SIZE is taken whole, exactly as tlsf_allocator's
+// carve_gap does (§2.4.1 "Carve mirroring").
+// ---------------------------------------------------------------------------
+
+// One block of a TLSF, as the snapshot copies it out.  Every size and offset is
+// in bytes within that TLSF's region.
+struct zone_block {
+    size_t offset          = 0;
+    size_t size            = 0;
+    bool   free            = false;  // an unallocated block
+    bool   optional_tenant = false;  // an allocated block tagged SHARED_ZONE_TAG_OPTIONAL
+    bool   yieldable       = false;  // optional_layout_yieldable_locked's answer (jehw); read only for optional_tenant
+};
+
+struct zone_range {
+    size_t offset = 0;
+    size_t size   = 0;
+};
+
+// A range some transaction has planned but not yet carved (§2.3.1).  The fit
+// treats it as allocated.  `first_context` marks the model's FIRST_CONTEXT
+// reservation (§2.3.3 A1), which the model's first context counts as free room.
+struct zone_pending_range {
+    size_t offset        = 0;
+    size_t size          = 0;
+    bool   first_context = false;
+};
+
+// A reserved slot already on the TLSF (§2.3.2).  It is an allocated block the
+// fit never moves or frees; its only use is reuse in place.
+struct zone_reservation {
+    demand_scope scope  = demand_scope::CONTEXT;
+    uint64_t     owner  = 0;
+    const char * cohort = nullptr;
+    uint32_t     index  = 0;
+    size_t       offset = 0;
+    size_t       size   = 0;
+};
+
+// One TLSF of the device's shared zone.
+struct tlsf_geometry {
+    // May this TLSF hold KV, and may it hold a head slot whose request names
+    // WEIGHT (§2.4.1 N-chunk routing; H6): the last weight chunk takes the
+    // WEIGHT-naming slots, the KV TLSF takes KV and the KV-naming slots.
+    bool takes_kv           = true;
+    bool takes_weight_named = true;
+
+    // frontier_walk(anchor, SHARED_ZONE_TAG_OPTIONAL), highest block first: the
+    // gap under the context side's lowest block, then the optional tenants and
+    // free blocks below it up to the first block that is neither.  An optional
+    // tenant that is not yieldable ends the ladder (§2.4.1 "Inputs").
+    std::vector<zone_block> frontier;
+
+    // The weight side outside the frontier walk, one run per maximal
+    // low-to-high stretch of free blocks and lease-free optional tenants (the
+    // whole-TLSF census of §2.4.1).  Its free blocks are the weight holes
+    // (tier 3) and its optional tenants the buried ones (tier 4).
+    std::vector<std::vector<zone_block>> side_runs;
+
+    // RETAINED context-side runs: allocated to no live context, taken whole
+    // with no carve (tier 1).
+    std::vector<zone_range> retained_runs;
+
+    std::vector<zone_pending_range> pending_ranges;  // other transactions', treated as allocated
+    std::vector<zone_range>         own_ranges;      // this call's REGION ranges; used by a commit re-fit
+    std::vector<zone_reservation>   reservations;
+};
+
+struct shared_zone_geometry {
+    std::vector<tlsf_geometry> tlsfs;  // the device's shared-zone TLSFs, in zone order
+};
+
+enum kv_slot_group : uint8_t { KV_SLOT_FULL = 0, KV_SLOT_SWA = 1 };
+
+// One KV layer's slot request (§2.4.1 "The request").  A layer's slot is
+// kv_layer_alloc_bytes(kv_bytes) plus, with the persistent packed-K sidecar,
+// kv_layer_alloc_bytes(sidecar_bytes): the sidecar is a slice of the same slot
+// at sidecar_offset = kv_layer_alloc_bytes(kv_bytes).
+struct kv_layer_slot_request {
+    uint32_t      layer         = 0;
+    kv_slot_group group         = KV_SLOT_FULL;
+    size_t        kv_bytes      = 0;  // kv_layer_tensor_bytes over the published shape (§2.4.4)
+    size_t        sidecar_bytes = 0;  // 0: no companion slot
+};
+
+// A head slot (§2.4.1): an indexed slot of a demand record, mandatory, placed
+// before any KV and in tiers 1-3 only.
+struct kv_head_slot_request {
+    demand_scope scope        = demand_scope::CONTEXT;
+    uint64_t     owner        = 0;
+    const char * cohort       = nullptr;
+    uint32_t     index        = 0;
+    size_t       size         = 0;      // the planned size, before the 512 B slot rounding
+    bool         names_weight = false;  // its zone request names WEIGHT: it goes to a takes_weight_named TLSF
+};
+
+// A device-resident attention layer's charge placed after the KV extents
+// (23mk's oneDNN Graph scratch, rulings §M54): admitted in ascending order of
+// size in tiers 1-3, declined when it does not fit; never a head slot, a
+// demotion cause or a refusal.
+struct kv_after_kv_request {
+    uint32_t layer = 0;
+    size_t   size  = 0;
+};
+
+// A KV slot this call already carved earlier in the same transaction (§2.4.1
+// self_extents).  Its bytes are allocated in the geometry; the fit counts the
+// layer device-resident, never re-places or demotes it, and copies it into the
+// result.
+struct kv_self_slot {
+    uint32_t layer       = 0;
+    size_t   slot_offset = 0;
+    size_t   size        = 0;
+};
+
+struct kv_self_extent {
+    size_t                    tlsf   = 0;
+    size_t                    offset = 0;
+    size_t                    size   = 0;
+    std::vector<kv_self_slot> slots;
+};
+
+// A head slot this call already carved earlier in the transaction.
+struct kv_self_head {
+    size_t head   = 0;  // index into kv_region_request::head_slots
+    size_t tlsf   = 0;
+    size_t offset = 0;
+    size_t size   = 0;
+};
+
+struct kv_region_fit_result;
+
+struct kv_region_request {
+    std::vector<kv_layer_slot_request> layers;  // any order; the fit orders them full first, then SWA, each by layer
+    std::vector<kv_head_slot_request>  head_slots;   // placed first, in this order
+    std::vector<kv_after_kv_request>   after_kv;
+    std::vector<uint32_t>              forced_host;  // layers an earlier fit demoted; never promoted
+    std::vector<kv_self_extent>        self_extents;
+    std::vector<kv_self_head>          self_heads;
+    bool                               first_context = false;  // the model's FIRST_CONTEXT ranges count as free room
+
+    // §2.4.2 step 6, the commit re-fit.  Set, the call does not solve: it checks the
+    // plan it points at against `geometry` (inside own_ranges only, with no yield) and
+    // returns the plan itself when every planned extent is still free.  A planned
+    // layer extent that is not free demotes that layer, every survivor keeping its
+    // planned offset; a planned head slot that is not free is re-placed by best fit
+    // in the room the survivors leave, demoting layers in the demotion order until it
+    // fits.  It never adds a layer, admits a term the plan declined or moves anything
+    // else, so what it returns is a subset of the plan at the plan's offsets.
+    // The plan must be the result of a fit of this same request (same layers, head
+    // slots and after-KV terms): anything else is misuse and aborts.  The pointer is
+    // not owned and must outlive the call.
+    const kv_region_fit_result * commit_plan = nullptr;
+};
+
+enum kv_demotion_cause : uint8_t {
+    KV_DEMOTE_NONE        = 0,
+    KV_DEMOTE_FORCED_HOST = 1,  // inherited from forced_host
+    KV_DEMOTE_RING_GROWTH = 2,  // would have stayed on the device with the superseded slots counted free
+    KV_DEMOTE_HEAD_SLOT   = 3,  // would have stayed on the device with this request's head slots removed
+    KV_DEMOTE_CAPACITY    = 4,
+};
+
+enum kv_extent_kind : uint8_t {
+    KV_EXTENT_FRONTIER = 0,  // the gap, grown by the yield prefix
+    KV_EXTENT_RETAINED = 1,
+    KV_EXTENT_HOLE     = 2,  // a weight hole, or the run formed by releasing buried optional tenants
+    KV_EXTENT_SELF     = 3,
+};
+
+struct kv_region_extent {
+    size_t         tlsf   = 0;
+    size_t         offset = 0;
+    size_t         size   = 0;
+    kv_extent_kind kind   = KV_EXTENT_FRONTIER;
+};
+
+struct kv_layer_placement {
+    uint32_t          layer          = 0;
+    bool              device         = false;
+    kv_demotion_cause cause          = KV_DEMOTE_NONE;  // set for a host layer
+    size_t            extent         = SIZE_MAX;        // index into kv_region_fit_result::extents
+    size_t            slot_offset    = 0;               // from the extent's base
+    size_t            size           = 0;
+    size_t            sidecar_offset = SIZE_MAX;        // from the extent's base; SIZE_MAX: no sidecar
+};
+
+struct kv_head_placement {
+    size_t head        = 0;         // index into kv_region_request::head_slots
+    bool   reused      = false;     // served in place by a reserved slot; nothing is carved
+    size_t reservation = SIZE_MAX;  // index into the TLSF's reservations when reused
+    size_t tlsf        = 0;
+    size_t offset      = 0;
+    size_t size        = 0;
+};
+
+struct kv_after_kv_placement {
+    size_t term     = 0;  // index into kv_region_request::after_kv
+    bool   admitted = false;
+    size_t tlsf     = 0;
+    size_t offset   = 0;
+    size_t size     = 0;
+};
+
+struct kv_superseded_slot {
+    size_t tlsf        = 0;
+    size_t reservation = 0;  // index into that TLSF's reservations; the publish releases it
+};
+
+struct kv_buried_release {
+    size_t tlsf   = 0;
+    size_t offset = 0;  // a lease-free optional tenant the fit releases ahead of the carve
+};
+
+enum kv_carve_kind : uint8_t { KV_CARVE_HEAD = 0, KV_CARVE_EXTENT = 1, KV_CARVE_AFTER_KV = 2 };
+
+// One step of the commit's carve, in the order the fit placed them.  `carve` is
+// false when nothing goes through the allocator: a retained run is claimed, and
+// an after-KV charge is only recorded as a range.
+struct kv_carve_op {
+    kv_carve_kind kind   = KV_CARVE_HEAD;
+    size_t        index  = 0;  // head index, extent index or after-KV term
+    size_t        tlsf   = 0;
+    size_t        offset = 0;  // the block's base: what the carve returns
+    size_t        size   = 0;  // the block's size, which a whole-gap take makes larger than `demand`
+    size_t        demand = 0;  // the size asked of the allocator
+    bool          carve  = true;
+};
+
+// A fit's result is the plan.  A commit re-fit's result (kv_region_request::commit_plan)
+// is an assignment only: layers, extents, heads, after_kv, carve_order and refused_heads
+// say what the commit carves, while free_after_full_kv, sub_slot_holes and superseded are
+// empty, not n_tlsf-sized (they describe the room and the reservations of the plan's own
+// geometry, which a shortfall has changed; the plan's stay with the plan, and zeros would
+// read as "no room" rather than "not computed", so a consumer that indexes
+// free_after_full_kv by TLSF must be handed a fit's result, never a re-fit's),
+// yield_prefix and buried_released are zero and empty (a re-fit yields nothing), and
+// tlsf_free is set only on a refusal.
+struct kv_region_fit_result {
+    bool fits = false;
+
+    // Every requested layer, in slot-table order (full attention first, then
+    // SWA, each by layer index), with its residency after the demotion loop.
+    std::vector<kv_layer_placement>    layers;
+    std::vector<kv_region_extent>      extents;
+    std::vector<kv_head_placement>     heads;
+    std::vector<kv_after_kv_placement> after_kv;
+    std::vector<kv_superseded_slot>    superseded;
+
+    // The strict LIFO yield prefix per TLSF: how many optional tenants the
+    // frontier gives up, highest first; and the buried tenants released.
+    std::vector<size_t>            yield_prefix;
+    std::vector<kv_buried_release> buried_released;
+
+    // free_after_full_kv (zhcn GA): per TLSF, the room the fit can place into
+    // after the head slots (free, retained and yieldable bytes) minus every
+    // requested KV slot with every KV layer device-resident, sidecars included.
+    // A KV slot that no tier can place is charged to the last takes_kv TLSF.
+    // Signed: a negative value is the deficit the demotion loop covers.
+    std::vector<long long> free_after_full_kv;
+
+    std::vector<kv_carve_op> carve_order;
+
+    // Weight-side holes smaller than the smallest slot the loop demoted, listed when it
+    // demoted: they are counted as room but no demoted layer fits one (§2.9 sub-slot WARN).
+    std::vector<kv_buried_release> sub_slot_holes;
+
+    // On a refusal: the head slots that did not fit (indices into
+    // head_slots) and each TLSF's free bytes in tiers 1-3.
+    std::vector<size_t> refused_heads;
+    std::vector<size_t> tlsf_free;
+};
+
+kv_region_fit_result kv_region_fit(const shared_zone_geometry & geometry, const kv_region_request & request);
+
+// The abort channel of the fit's contracts (a commit re-fit handed a plan that does not
+// answer its request).  This TU is linked by host tests with no ggml-base, so it cannot
+// call GGML_ABORT; the same problem kv-region-registry.hpp solves with a handler pointer,
+// solved the same way.  With no handler the default prints
+// "file:line: [KV-FIT-MISUSE] <detail>" on stderr and aborts.  The backend installs a
+// handler that calls GGML_ABORT when the first production caller appears (L4).  A handler
+// that returns does not resume the fit: the abort follows it, because the fit cannot
+// continue past a plan that is not its request's.
+using kv_fit_misuse_fn = void (*)(const char * file, int line, const char * detail);
+
+inline std::atomic<kv_fit_misuse_fn> & kv_fit_misuse_handler() {
+    static std::atomic<kv_fit_misuse_fn> handler{ nullptr };
+    return handler;
+}
+
+[[noreturn]] inline void kv_fit_misuse(const char * file, int line, const char * detail) {
+    if (kv_fit_misuse_fn h = kv_fit_misuse_handler().load()) {
+        h(file, line, detail);
+    } else {
+        std::fprintf(stderr, "%s:%d: [KV-FIT-MISUSE] %s\n", file, line, detail);
+    }
+    std::abort();
+}
+
+#define KV_FIT_MISUSE(detail) ::ggml_sycl::kv_fit_misuse(__FILE__, __LINE__, detail)
 
 }  // namespace ggml_sycl

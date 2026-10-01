@@ -41,6 +41,11 @@ namespace ggml_sycl {
 
 class tlsf_allocator {
   public:
+    // The block grain: every block offset is a multiple of it, and a top carve
+    // (allocate_below) needs the free block's top on it.  Public so the KV fit
+    // reads the rule it must mirror instead of restating the number.
+    static constexpr size_t block_grain = 256;
+
     // Initialize with the SIZE of the managed region [0, size).
     // No pointer to the managed region is needed — all bookkeeping is
     // in host memory.  min_alloc_size: minimum block granularity
@@ -167,7 +172,7 @@ class tlsf_allocator {
     // For 16 GB: need FL_OFFSET + FL_COUNT - 1 >= 34, so FL_COUNT >= 27.
     static constexpr int    FL_COUNT       = 28;
     // Minimum block size.  Must be >= 256 for GPU alignment.
-    static constexpr size_t MIN_BLOCK_SIZE = 256;
+    static constexpr size_t MIN_BLOCK_SIZE = block_grain;
 
     // ------------------------------------------------------------------
     // Host-side metadata

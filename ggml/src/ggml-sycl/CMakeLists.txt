@@ -1826,6 +1826,24 @@ set_tests_properties(sycl-kv-runtime-demotion PROPERTIES
     TIMEOUT 60
 )
 
+# KV region registry, scope and guard (llama.cpp-moua L3c): header-only
+# (kv-region-registry.hpp), SYCL-free like test-kv-runtime-demotion above, so it
+# needs neither SYCL_LINK_ONLY_TEST_OPTIONS nor ggml-base. The tests run threads
+# (the scope is thread_local, the lock witness is per thread), hence Threads.
+add_executable(test-kv-region-registry
+    tests/test-kv-region-registry.cpp
+)
+target_include_directories(test-kv-region-registry PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+find_package(Threads REQUIRED)
+target_link_libraries(test-kv-region-registry PRIVATE Threads::Threads)
+add_test(NAME sycl-kv-region-registry COMMAND test-kv-region-registry)
+set_tests_properties(sycl-kv-region-registry PROPERTIES
+    LABELS "sycl;kv;hostonly"
+    TIMEOUT 60
+)
+
 # oneDNN PP placement answers (llama.cpp-1d0n): which devices may run oneDNN PP
 # on a multi-device plan, and whether the plan may add WOQ second copies; and
 # the admission predicate plus per-route batch floor (llama.cpp-je3b).
