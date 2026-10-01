@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14aq, by impl-moua-s, 2026-10-01. The revisions answer forty-five reviews:
+Design, revision 7.14ar, by impl-moua-s, 2026-10-01. The revisions answer forty-five reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -274,6 +274,8 @@ Design, revision 7.14aq, by impl-moua-s, 2026-10-01. The revisions answer forty-
   `e81dc2327`, `003bce159`, `93050c979`, `8547a22f0`, `50b1f8f50`, `a8cfbf901`, `db61cb321`,
   `c3942d236`, `437073a29`) move to `ebc9c73e0`, and the Graph-scratch range's placement is stated
   as 23mk now has it.
+- the lead's answer on 23mk's `n_ubatch` context refusal, recorded in §6.59. Revision 7.14ar is one
+  commit on top of `dd2b889b9` and answers no review: step 4 names that refusal as 23mk-owned code.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -5047,6 +5049,13 @@ prompt-processing performance, never correctness, and the yield WARN names them.
      `!tenants_planned` context remains possible only where zhcn's MEASURE did not run for it,
      and there the check reads the registry's residency answer (the fit's ledger), as the FA
      recheck does. A device with no arena keeps master's read.
+   - **23mk's `n_ubatch` refusal is one more refusal that can fire here, and it is 23mk's code
+     (23mk `ebc9c73e0`:2954-3085; rulings §M118 m-4).** With a live Graph block on the device and
+     `n_ubatch > MMQ_MAX_BATCH_SIZE`, 23mk refuses the context, naming the support gap, when an
+     optional oneDNN PP weight plane of the model exceeds the shared ONEDNN window W and has no
+     non-oneDNN kernel. It runs before the yield, in the same window as the fit's refusals, records
+     no pending range and carves nothing, and leaves through `refuse()`, so the transaction
+     guard's rollback covers it unchanged.
    - The ring has no separate "does not fit" refusal (u1bb `:18388`) and no budget-room check
      (u1bb `:18362`, deleted, r4 I7): its slots are head slots of step 2's fit.
    - Nothing after the yield can fail for a runtime reason (rulings §M7 I-5, §E.2). The MMID
@@ -14706,7 +14715,7 @@ range `87da879f1..ebc9c73e0` is 13 commits, revs 4.19m to 4.19y). History rows k
 | the flag | rev 4.19m: there is no `onednn_pp_declined` flag, withdrawal or store, and an H3 pin finds no such identifier | **Changed (SUBSTANTIVE).** Old: "23mk deletes the context-latched flag". New: 23mk never has one. moua L4 carries no census, gate clause or deletion-list entry for it, as 7.14ag decided. |
 | the no-block carve | 23mk's `zones_sufficient` return on a blockless arena carves a block when the device has no TP queue and the largest free ONEDNN run holds G_new + stored_new (since rev 4.19i; unchanged by 4.19m to 4.19y) | **Changed (SUBSTANTIVE, a mismatch with 87da879f1 too).** Old: "a `zones_sufficient` return on an arena that has no block leaves it 0". New: it leaves it 0 unless that carve places one (23mk:6198-6211). The replay's derivation for a fresh arena is unchanged. |
 | Graph-scratch terminal | `[ZONE-PLAN-BUG]` on the Graph scratch is still the unconditional `[[noreturn]]` abort | **No change.** Rev 4.19x and 4.19y's WARN-plus-strict level (rulings §M145) applies to the plane-W and activations acquire terminals, which moua does not cite. |
-| rulings §M113 to §M148 | the context ubatch refusal (§M118 m-4), the verdict's selector and legacy-callback reads (§M136), the loaded-layout key record (§M139) | **No moua text depends on them.** The ubatch refusal is 23mk's code at its own pre-yield point in the context transaction (23mk:2954-3085, "the same class of refusal as moua's fit refusal"); moua's step list is not changed. Reported to the lead as a question. |
+| rulings §M113 to §M148 | the context ubatch refusal (§M118 m-4), the verdict's selector and legacy-callback reads (§M136), the loaded-layout key record (§M139) | **The ubatch refusal is named in step 4 (7.14ar, §6.59).** The other two touch no moua text. |
 
 ### 6.58 Revision 7.14aq: the remaining 23mk cites re-pinned to ebc9c73e0
 
@@ -14734,3 +14743,13 @@ widened the re-pin of §6.57 to every live 23mk cite, whatever its old sha. Each
 
 Cites that name only a 23mk revision (4.4, 4.5, 4.8, 4.13, 4.14, 4.16, 4.19i, 4.19j, 4.19l) carry no
 sha and no line, so they are left as the names of those revisions.
+
+### 6.59 Revision 7.14ar: 23mk's ubatch refusal in step 4
+
+Revision 7.14ar is one commit on top of `dd2b889b9`, by impl-moua-s. It answers no review and
+records the lead's answer to the question in §6.57.
+
+| item | ruling | disposition |
+|---|---|---|
+| 23mk's `n_ubatch > MMQ_MAX_BATCH_SIZE` context refusal | name it, with one sentence and no new design: moua owns the transaction's step list, so every refusal that can fire inside it is named, here as 23mk-owned code (23mk:2954-3085, §M118 m-4), and the existing rollback must cover it | **Changed.** Step 4 has a bullet naming it. The rollback covers it as written: the guard is declared before L1 and runs on every exit other than a committed publish (a `refuse()` among them), and this refusal records no pending range and carves nothing, so phase 1 has nothing of its own to clear. No question follows. |
+| §6.57's last row | drop "no moua text depends on it" | **Changed.** The row now points here. |
