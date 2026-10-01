@@ -44,6 +44,22 @@ def violations(text: str) -> list:
         out.append("the shared-context queues are fetched without init_shared_context_queues(physical_devices)")
     elif get is not None and init.start() > get.start():
         out.append("init_shared_context_queues() runs after the queue fetch")
+    # No wait may be unbounded: a watchdog thread leaves the process, naming the step, and the controls that
+    # discriminate where a hang lives run before the cross-context dependency.
+    if "_Exit(1)" not in code or "FAIL: HANG at %s" not in code:
+        out.append("no step watchdog that names the hung step and leaves with _Exit(1)")
+    controls = ["control_g_gate_alone", "control_i_leg1_alone", "control_ii_leg2_alone",
+                "control_iv_host_wait_between", "iii_leg2_submit"]
+    at = [code.find('"%s"' % name) for name in controls]
+    if min(at) < 0:
+        out.append("a control or step is missing: " + ", ".join(n for n, a in zip(controls, at) if a < 0))
+    elif at != sorted(at):
+        out.append("the controls do not run before the cross-context dependency step")
+    for m in re.finditer(r"\b(\w+)\.wait\(\)", code):
+        before = code[: m.start()]
+        # Every .wait() sits after a step_scope or inside a run_step lambda opened earlier in main.
+        if before.rfind("step_scope") < 0 and before.rfind("run_step") < 0:
+            out.append("a wait() before any bounded step")
     if re.search(r"physical_devices\s*<\s*2", code) is None:
         out.append("the skip does not compare the physical count against two")
     return out
@@ -60,6 +76,9 @@ def mutants_of(text: str) -> dict:
             "sycl::queue * q_source_ptr = ggml_sycl::get_shared_context_queue(1);",
             "sycl::queue * q_source_ptr = ggml_sycl::get_shared_context_queue(1);\n"
             "    ggml_sycl::init_shared_context_queues(physical_devices);"),
+        "watchdog does not exit": replace_last(text, "_Exit(1);", "std::fflush(stdout);"),
+        "dependency step before the controls": text.replace(
+            "namespace {", 'const char * k_early = "iii_leg2_submit";\nnamespace {', 1),
         "no physical count": replace_last(text, "ggml_sycl::test_physical_device_count()", "2"),
     }
 
