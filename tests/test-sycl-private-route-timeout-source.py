@@ -36,5 +36,8 @@ def test_private_route_watchdog_is_explicit_bounded_and_isolated() -> None:
     assert watchdog_ms > 30_000, "cold AOT must not inherit the 30 s failure mode"
     assert outer_ms - watchdog_ms >= MIN_CTEST_MARGIN_MS
 
-    # Production defaults and unrelated tests must remain untouched.
-    assert cmake.count(WATCHDOG_ENV) == 1
+    # Production defaults and unrelated tests must remain untouched: this is the only place the file SETS the
+    # watchdog. Counted over code with the CMake comments removed -- 4432f195d (llama.cpp-u1pn) explains the
+    # AOT choice in a comment that names the variable, and that prose is not a setting.
+    code = re.sub(r"(?m)^\s*#.*$", "", cmake)
+    assert code.count(WATCHDOG_ENV) == 1
