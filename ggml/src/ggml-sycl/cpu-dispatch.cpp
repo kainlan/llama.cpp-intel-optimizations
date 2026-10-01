@@ -2215,6 +2215,7 @@ void * ggml_sycl_cpu_retained_alloc_output(const ggml_tensor * dst) {
 }
 
 void ggml_sycl_cpu_retained_flush_all(int device, sycl::queue * gpu_q) {
+    ggml_sycl_host_executor_region host_executor;
     if (g_retained_map.empty()) {
         return;
     }
@@ -2257,6 +2258,7 @@ void ggml_sycl_cpu_retained_flush_selective(int                         device,
                                             sycl::queue *               gpu_q,
                                             const ggml_tensor * const * gpu_nodes,
                                             int                         n_gpu_nodes) {
+    ggml_sycl_host_executor_region host_executor;
     if (g_retained_map.empty() || !gpu_nodes || n_gpu_nodes <= 0) {
         g_retained_map.clear();
         scratch_reset();
@@ -2718,6 +2720,7 @@ static void * get_host_ptr(const ggml_tensor *     t,
                            sycl::queue *           gpu_q,
                            sycl::event *           out_event = nullptr,
                            ggml_sycl::mem_handle * out_lease = nullptr) {
+    ggml_sycl_host_executor_region host_executor;
     // Check retained activation map first — if this tensor's data was
     // produced by a prior CPU op in the same layer block, return the
     // host pointer directly without any D2H copy.
@@ -2993,6 +2996,7 @@ static void flush_output(ggml_tensor *       t,
                          sycl::queue *       gpu_q,
                          const sycl::event * dep_evt              = nullptr,
                          bool                dep_event_same_queue = false) {
+    ggml_sycl_host_executor_region host_executor;
     if (!t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
         return;
     }
@@ -3046,6 +3050,7 @@ static void flush_output(ggml_tensor *       t,
 // Get host pointer for output tensor.
 // Uses staging slot 2 of the current bank.
 static void * get_host_output_ptr(ggml_tensor * t, int device, sycl::queue * gpu_q) {
+    ggml_sycl_host_executor_region host_executor;
     // Host-accessible buffer → use resolved host-visible storage.
     if (!t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
         void * resolved = ggml_sycl_resolve_tensor_ptr(t, device);
@@ -3069,6 +3074,7 @@ static void * get_host_output_ptr(ggml_tensor * t, int device, sycl::queue * gpu
 // Helper: get output pointer from retained scratch or staging fallback.
 // Sets *retained to true if output goes to scratch, false for staging.
 static void * get_retained_or_staging_output(ggml_tensor * dst, int device, sycl::queue * gpu_q, bool * retained) {
+    ggml_sycl_host_executor_region host_executor;
     // Batched mode: output directly to host-pinned resolved storage.
     if (g_batched_mode) {
         void * dst_ptr = ggml_sycl_resolve_tensor_ptr(dst, device);
@@ -5878,6 +5884,7 @@ static bool cpu_cpy(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 // ---------------------------------------------------------------------------
 
 static bool cpu_rope(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    ggml_sycl_host_executor_region host_executor;
     const bool batched   = batched_mode_active();
     const bool host_task = !batched && host_task_mode_active();
 
@@ -6209,6 +6216,7 @@ bool ggml_sycl_compute_fused_rms_norm_mul(ggml_backend_sycl_context & ctx,
 bool ggml_sycl_compute_fused_add_rms_norm(ggml_backend_sycl_context & ctx,
                                           ggml_tensor *               add_dst,
                                           ggml_tensor *               rms_dst) {
+    ggml_sycl_host_executor_region host_executor;
     const ggml_tensor * add_src0 = add_dst->src[0];
     const ggml_tensor * add_src1 = add_dst->src[1];
     const ggml_tensor * rms_src0 = rms_dst->src[0];  // should == add_dst

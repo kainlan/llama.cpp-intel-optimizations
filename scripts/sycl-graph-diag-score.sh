@@ -22,7 +22,9 @@ diag_final() {  # the scored line; exit status 3 when there is none
 }
 
 diag_key() {    # diag_key "<line>" <key>: every match, one per line
-    printf '%s\n' "$1" | grep -oE "(^| )$2=[0-9]+( |\$)" | grep -oE '[0-9]+'
+    # Whole whitespace-delimited tokens: a regex that consumes the trailing
+    # space would skip an adjacent repeat ("k=1 k=2") and report one match.
+    printf '%s\n' "$1" | awk -v key="$2" '{ for (i = 1; i <= NF; i++) if (index($i, key "=") == 1 && substr($i, length(key) + 2) ~ /^[0-9]+$/) print substr($i, length(key) + 2) }'
 }
 
 diag_score() {  # diag_score <log> <key>: the value, or VOID with exit status 3

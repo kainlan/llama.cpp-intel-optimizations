@@ -183,6 +183,30 @@ def main():
         rc, out = run_scorer(script, log, "stage_host_returns_tg")
         check(rc == 3 and out == "VOID", "a key matching twice must be VOID: rc=%d %r" % (rc, out))
 
+        # VOID: a key that matches twice in ADJACENT tokens. A scanner that
+        # consumes the separator after each match reads "k=42 k=N" as one match.
+        adjacent = last.replace(" stage_host_returns_tg=", " stage_host_returns_tg=42 stage_host_returns_tg=", 1)
+        check(adjacent != last, "could not build the adjacent-duplicate line")
+        log = write_log("adjacent.log", [load_time, adjacent])
+        rc, out = run_scorer(script, log, "stage_host_returns_tg")
+        check(rc == 3 and out == "VOID", "an adjacent duplicate key must be VOID: rc=%d %r" % (rc, out))
+
+        # Mutant: the separator-consuming scanner the scorer used to carry must
+        # be fooled by the adjacent case, or the case does not discriminate.
+        with open(script, encoding="utf-8") as f:
+            text = f.read()
+        body = re.search(r"diag_key\(\) \{.*?\n\}\n", text, re.S)
+        check(body is not None, "could not locate diag_key in the scorer")
+        if body:
+            old_scan = ("diag_key() {\n    printf '%s\\n' \"$1\" | "
+                        "grep -oE \"(^| )$2=[0-9]+( |\\$)\" | grep -oE '[0-9]+'\n}\n")
+            mutant = os.path.join(tmp, "mutant-score.sh")
+            with open(mutant, "w", encoding="utf-8") as f:
+                f.write(text.replace(body.group(0), old_scan, 1))
+            rc, out = run_scorer(mutant, log, "stage_host_returns_tg")
+            check(rc == 0, "mutant scanner was not fooled by the adjacent duplicate (the case does not "
+                  "discriminate): rc=%d %r" % (rc, out))
+
         # VOID: the literal this one replaced carried no key of its own.
         legacy = last.replace(
             "stage_host_returns_pp=", "stage_host_returns pp=", 1).replace(
@@ -196,7 +220,7 @@ def main():
         for f in failures:
             print("FAIL:", f)
         return 1
-    print("PASS: %d scored keys, last-qualifying-line, collision and VOID cases" % len(SCORED_KEYS))
+    print("PASS: %d scored keys, last-qualifying-line, collision, adjacent-duplicate and VOID cases" % len(SCORED_KEYS))
     return 0
 
 

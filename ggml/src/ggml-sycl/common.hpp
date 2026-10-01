@@ -4596,10 +4596,46 @@ size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
                                             ggml_backend_buffer_type_t src_buft,
                                             int                        device);
 
+// Depth of device-graph dispatch on this thread. A resolver return is only a
+// zero-copy read of a staged source while a device kernel is being dispatched.
+extern thread_local int g_ggml_sycl_device_dispatch_depth;
+
+// Opened at the entry of ggml_backend_sycl_graph_compute_unchecked, so every
+// device kernel that call dispatches runs inside it.
+struct ggml_sycl_device_dispatch_region {
+    ggml_sycl_device_dispatch_region() { ++g_ggml_sycl_device_dispatch_depth; }
+
+    ~ggml_sycl_device_dispatch_region() { --g_ggml_sycl_device_dispatch_depth; }
+
+    ggml_sycl_device_dispatch_region(const ggml_sycl_device_dispatch_region &)             = delete;
+    ggml_sycl_device_dispatch_region & operator=(const ggml_sycl_device_dispatch_region &) = delete;
+};
+
+// Closes the device-dispatch region for its scope. A host executor resolves the
+// pointers of tensors it reads and writes itself on the dispatching thread;
+// those resolutions are not device kernels reading a staged source.
+struct ggml_sycl_host_executor_region {
+    ggml_sycl_host_executor_region() : saved_depth(g_ggml_sycl_device_dispatch_depth) {
+        g_ggml_sycl_device_dispatch_depth = 0;
+    }
+
+    ~ggml_sycl_host_executor_region() { g_ggml_sycl_device_dispatch_depth = saved_depth; }
+
+    ggml_sycl_host_executor_region(const ggml_sycl_host_executor_region &)             = delete;
+    ggml_sycl_host_executor_region & operator=(const ggml_sycl_host_executor_region &) = delete;
+
+  private:
+    const int saved_depth;
+};
+
 // Called from a resolver branch that is about to hand a HOST_PINNED/SHARED
-// pointer to a device kernel. Counts the return, in the bucket of the current
-// offload phase, when the calling thread is dispatching a device graph and
-// `tensor`, or the root it views, is a source the prestage copies.
+// pointer to a device kernel. Counts the resolution, in the bucket of the
+// current offload phase, when the calling thread is inside the device-dispatch
+// region and `tensor`, or the root it views, is a source the prestage copies.
+// The branches that call it are the host-returning ones of the inline resolver,
+// the slow resolver (its per-graph cache hit included) and the persistent
+// builder's get_tensor_ptr_fast. A pointer taken from an extra's data_device
+// or the tiered cache is not examined, so the count is a lower bound.
 void ggml_sycl_resolver_count_host_return(const ggml_tensor * tensor, int device);
 
 // The count `ggml_sycl_resolver_count_host_return` accumulated in the bucket

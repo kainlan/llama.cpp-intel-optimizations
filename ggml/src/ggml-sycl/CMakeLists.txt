@@ -1954,6 +1954,49 @@ else()
         LABELS "sycl;attn;tkv13;hostonly;not-built")
 endif()
 
+# The resolver counter's gating: a host return of a staged source counts only
+# inside the device-dispatch region and not inside a host executor. Synthetic
+# tensors, no device (an F32 tensor never reaches the multi-GPU control-storage
+# query), so it carries `hostonly` like test-attn-host-pool above. It links the
+# ordinary ggml-sycl module for the counter's object code, so it is guarded and
+# placeholdered for GGML_BACKEND_DL exactly as that test is.
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-resolver-host-return-count
+        tests/test-resolver-host-return-count.cpp
+    )
+    target_include_directories(test-resolver-host-return-count PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-resolver-host-return-count PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_link_options(test-resolver-host-return-count PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_compile_definitions(test-resolver-host-return-count PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-resolver-host-return-count PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-resolver-host-return-count PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    set_target_properties(test-resolver-host-return-count PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-resolver-host-return-count COMMAND test-resolver-host-return-count)
+    set_tests_properties(sycl-resolver-host-return-count PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;resolver;hostonly"
+        TIMEOUT 30
+    )
+else()
+    add_test(NAME sycl-resolver-host-return-count
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "not built: needs -DGGML_BACKEND_DL=OFF (test links ggml-sycl directly for the resolver counter)")
+    set_tests_properties(sycl-resolver-host-return-count PROPERTIES
+        DISABLED TRUE
+        LABELS "sycl;resolver;hostonly;not-built")
+endif()
+
 # TKV-13 (B2) step 4: identity-case correctness harness
 # (docs/plans/2026-08-27-tkv13-b2-addendum.md §4.3, §7 step 4). Proves the
 # landed wrapper's mechanism -- routing FLASH_ATTN_EXT through AttnHostPool

@@ -1594,6 +1594,20 @@ if (NOT WIN32)
         TIMEOUT 120
     )
 
+    # cpu-dispatch.cpp functions are host executors inside a device dispatch;
+    # their resolver calls must sit inside a ggml_sycl_host_executor_region or
+    # the resolver host-return counter reads host execution as device reads.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-cpu-dispatch-resolver-region
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-dispatch-resolver-region.py
+    )
+    set_tests_properties(test-sycl-cpu-dispatch-resolver-region PROPERTIES
+        LABELS "sycl;profiling;tdd"
+        TIMEOUT 60
+    )
+
     # Regression + arithmetic gate for parse-sycl-gap-device-split.py, the
     # device-clock A/B decomposition the Cluster B verdict rests on. Registered
     # because that script shipped with a reproducible ZeroDivisionError: its
