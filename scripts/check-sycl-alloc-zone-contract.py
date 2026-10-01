@@ -5,7 +5,10 @@ Every construction of a request type must say, by literal, which tier it asks fo
 request must name its arena zone and forbid the spill. Raw allocator names stay outside the
 unified-cache's own allowlisted functions. The gate parses the tree with tree-sitter, so a
 comment or a string literal never counts as code, and it keys every finding by AST node
-(`file::function::variable#ordinal`), never by line.
+(`file::function::node-kind:variable:text-hash#ordinal`), never by line or byte offset. The text
+hash is of the construction's normalized text (comments dropped, whitespace collapsed) and the
+ordinal counts only identical constructions in the same function, so a key survives an unrelated
+edit above it and moves only when the construction itself changes.
 
 What this unit (S2a) enforces
   (a) a request-type token inside an ERROR/MISSING region fails; a file whose root is ERROR
@@ -82,6 +85,9 @@ RAW_CALLS = (
 )
 RAW_STRINGS = ("zeMemAllocDevice", "zeMemAllocShared", "zePhysicalMemCreate", "zeVirtualMemReserve")
 
+DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a, b, d, e). Shrink-only: a violation not "
+            "listed fails, and a listed entry that no longer violates fails. See README.md for regeneration.")
+
 CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-TIER", "D-ZONE", "D-ZONE-COUNT",
          "D-FORBID", "D-FORBID-FALSE", "E-RAW", "DEFER-C")
 
@@ -119,6 +125,12 @@ def walk(n):
 
 def txt(src, n):
     return src[sb(n):eb(n)].decode("utf-8", "replace")
+
+
+def text_hash(s):
+    """Short hash of a construction's text with comments dropped and whitespace collapsed."""
+    s = re.sub(r"/\*.*?\*/|//[^\n]*", " ", s, flags=re.S)
+    return hashlib.sha1(re.sub(r"\s+", " ", s).strip().encode()).hexdigest()[:8]
 
 
 def base_type(s):
@@ -393,10 +405,11 @@ def scan_file(rel, src, value_types, all_types):
     constructions, raws, errtoks, funcs = [], [], [], []
     ordinal = {}
 
-    def key_for(func, var):
-        i = ordinal.get((func, var), 0)
-        ordinal[(func, var)] = i + 1
-        return "%s::%s::%s#%d" % (rel, func, var, i)
+    def key_for(func, nodekind, var, node):
+        base = "%s::%s::%s:%s:%s" % (rel, func, nodekind, var, text_hash(txt(src, node)))
+        i = ordinal.get(base, 0)
+        ordinal[base] = i + 1
+        return "%s#%d" % (base, i)
 
     for n in walk(root):
         k = kind(n)
@@ -469,7 +482,7 @@ def scan_file(rel, src, value_types, all_types):
                     # only a member initialiser that carries a flag is a construction of its own
                     continue
                 constructions.append({
-                    "key": key_for(func, name), "func": func, "var": name, "line": line_of(n),
+                    "key": key_for(func, kind(n), name, n), "func": func, "var": name, "line": line_of(n),
                     "kind": "member" if k == "field_declaration" else "decl", "type": base_type(txt(src, t)),
                     "form": form, "err": err, "fields": fields, "deferred": sorted(set(reason)),
                 })
@@ -483,7 +496,7 @@ def scan_file(rel, src, value_types, all_types):
             if val is not None and kind(val) == "initializer_list":
                 init_fields(src, val, fields, copied)
             constructions.append({
-                "key": key_for(func, "<temp %s>" % base_type(txt(src, t))), "func": func, "var": "<temp>",
+                "key": key_for(func, kind(n), "<temp %s>" % base_type(txt(src, t)), n), "func": func, "var": "<temp>",
                 "line": line_of(n), "kind": "temp", "type": base_type(txt(src, t)), "form": "braced",
                 "err": has_error_ancestor(n), "fields": fields,
                 "deferred": sorted(set("positional-init" if c == "positional" else c + "-copied" for c in copied)),
@@ -495,14 +508,14 @@ def scan_file(rel, src, value_types, all_types):
             if last in RAW_CALLS:
                 func, _ = enclosing(src, n)
                 raws.append({"func": func, "name": last, "line": line_of(n), "form": "call",
-                             "err": has_error_ancestor(n)})
+                             "nodekind": "call_expression", "text": ft, "err": has_error_ancestor(n)})
         elif k == "string_literal":
             s = txt(src, n)
             for r in RAW_STRINGS:
                 if r in s:
                     func, _ = enclosing(src, n)
                     raws.append({"func": func, "name": r, "line": line_of(n), "form": "string",
-                                 "err": has_error_ancestor(n)})
+                                 "nodekind": "string_literal", "text": s, "err": has_error_ancestor(n)})
         elif k in ("preproc_def", "preproc_function_def"):
             body = fld(n, "value")
             nm = fld(n, "name")
@@ -511,7 +524,7 @@ def scan_file(rel, src, value_types, all_types):
                 for r in RAW_CALLS:
                     if re.search(r"(?<![A-Za-z0-9_])" + re.escape(r) + r"\s*(?:<[^>]*>)?\s*\(", b):
                         raws.append({"func": "#define " + txt(src, nm), "name": r, "line": line_of(n),
-                                     "form": "macro", "err": False})
+                                     "form": "macro", "nodekind": "preproc", "text": r, "err": False})
         if k in ("type_identifier", "identifier") and txt(src, n) in all_types:
             if has_error_ancestor(n) or _a(n, "is_missing"):
                 func, _ = enclosing(src, n)
@@ -527,7 +540,7 @@ def scan_file(rel, src, value_types, all_types):
         for r in RAW_CALLS:
             for m in re.finditer(rb"(?<![A-Za-z0-9_])" + re.escape(r.encode()) + rb"\s*(?:<[^>]*>)?\s*\(", clean):
                 raws.append({"func": "<lexical>", "name": r, "line": clean.count(b"\n", 0, m.start()) + 1,
-                             "form": "lexical", "err": True})
+                             "form": "lexical", "nodekind": "lexical", "text": r, "err": True})
     return {"constructions": constructions, "raws": raws, "errtoks": errtoks, "funcs": funcs,
             "root_error": root_error, "lexical": lexical, "lex_count": lex_count, "ast_count": ast_count}
 
@@ -559,7 +572,7 @@ def lexical_scan(src, clean, value_types):
         dev = bool(re.search(r"\bmust_device\s*=\s*true\b", body))
         i = ordinal.get(name, 0)
         ordinal[name] = i + 1
-        rows.append({"var": name, "key": "<lexical>::%s#%d" % (name, i), "line": text.count("\n", 0, m.start()) + 1,
+        rows.append({"var": name, "key": "<lexical>::lexical:%s#%d" % (name, i), "line": text.count("\n", 0, m.start()) + 1,
                      "host_only": host and not dev})
     return rows
 
@@ -643,7 +656,7 @@ def analyse(files):
         for t in fa["errtoks"]:
             i = seen.get((t["func"], t["tok"]), 0)
             seen[(t["func"], t["tok"])] = i + 1
-            viols.append(V("A-ERROR", "%s::%s::%s#%d" % (rel, t["func"], t["tok"], i), rel, t["line"], t["func"], t["tok"],
+            viols.append(V("A-ERROR", "%s::%s::token:%s#%d" % (rel, t["func"], t["tok"], i), rel, t["line"], t["func"], t["tok"],
                            "request-type token %s inside an ERROR/MISSING region" % t["tok"]))
         for r in fa["lexical"]:
             if not r["host_only"]:
@@ -654,9 +667,10 @@ def analyse(files):
                            "request-type tokens by text (%d) differ from the parse's (%d)" % (fa["lex_count"], fa["ast_count"])))
         seen = {}
         for r in fa["raws"]:
-            i = seen.get((r["func"], r["name"]), 0)
-            seen[(r["func"], r["name"])] = i + 1
-            viols.append(V("E-RAW", "%s::%s::%s#%d" % (rel, r["func"], r["name"], i), rel, r["line"], r["func"], r["name"],
+            base = "%s::%s::%s:%s:%s" % (rel, r["func"], r["nodekind"], r["name"], text_hash(r["text"]))
+            i = seen.get(base, 0)
+            seen[base] = i + 1
+            viols.append(V("E-RAW", "%s#%d" % (base, i), rel, r["line"], r["func"], r["name"],
                            "raw allocator name %s (%s) outside the allowlist" % (r["name"], r["form"])))
     return viols, stats, funcs
 
@@ -798,6 +812,12 @@ def matrix_cases():
            allowlist={"id": "E-ZZ-BOGUS", "code": "E-RAW", "file": "unified-cache.cpp", "function": "no_such_function", "count": 1}))
     A(Case("8", "allowlist entry pinning a count its function does not have", lambda f: f, "FAIL", "allowlist", "E-TEST",
            edit_allowlist=lambda al: dict(al, entries=[dict(e, count=3) if e["id"] == "E-TEST" else e for e in al["entries"]])))
+    # keys: an unrelated edit above a listed construction must not move its key
+    A(Case("key", "lines and a function added above listed constructions leave every key in place",
+           lambda f: dict(f, **{"common.cpp": b"// unrelated\n\nstatic int zz_unrelated_above() { return 1; }\n\n" + f["common.cpp"]}), "PASS"))
+    A(Case("key", "editing a listed construction itself moves its key (stale entry plus new violation)",
+           replace_token("common.cpp", "ggml_sycl_tp_ensure_ffn_buffers", "ggml_sycl_tp_ensure_ffn_buffers_zz"),
+           "FAIL", "debt", "ggml_sycl_tp_ensure_ffn_buffers"))
     # debt: the list is shrink-only in both directions
     A(Case("debt", "a debt entry that no longer violates is stale", lambda f: f, "FAIL", "debt", "zzgone",
            edit_debt=lambda d: dict(d, violations=list(d["violations"]) + [{"code": "D-ZONE", "key": "x.cpp::f::zzgone#0"}])))
@@ -853,7 +873,7 @@ def matrix_cases():
     A(Case("23", "braceless request at class-member scope", plant(
         "struct zzplant_w23 {\n    %s req;\n};\n" % REQ), "FAIL", "B-BRACE", "zzplant_w23"))
     A(Case("23", "braceless request at namespace scope", plant(
-        "namespace zzplant_w23ns {\n%s req;\n}\n" % REQ), "FAIL", "B-BRACE", "zz-plant.cpp::<file scope>::req"))
+        "namespace zzplant_w23ns {\n%s req;\n}\n" % REQ), "FAIL", "B-BRACE", "zz-plant.cpp::<file scope>::declaration:req:"))
     A(Case("23", "braceless request in a function", plant(
         "void zzplant_w23f() {\n    %s req;\n    req.intent.constraints.must_host_pinned = true;\n}\n" % REQ),
         "FAIL", "B-BRACE", "zzplant_w23f"))
@@ -862,7 +882,7 @@ def matrix_cases():
     return c
 
 
-REQUIRED_WITNESSES = ("1", "2", "3", "4", "5", "6", "7", "8", "debt", "12", "13", "14", "18", "19", "20", "23")
+REQUIRED_WITNESSES = ("1", "2", "3", "4", "5", "6", "7", "8", "debt", "key", "12", "13", "14", "18", "19", "20", "23")
 
 
 def planted_sightings(files):
@@ -956,7 +976,9 @@ def main():
     ap.add_argument("--data", default=None, help="directory holding allowlist.json and debt.json")
     ap.add_argument("--mutation-matrix", action="store_true")
     ap.add_argument("--list", action="store_true", help="print every finding before the allowlist and debt")
-    ap.add_argument("--write-debt", action="store_true", help="regenerate debt.json from the current tree (seeding only)")
+    ap.add_argument("--write-debt", action="store_true",
+                    help="rewrite debt.json from the current tree; refuses to add entries. Never used by the ctest")
+    ap.add_argument("--allow-growth", action="store_true", help="with --write-debt, permit new entries (key migration only)")
     a = ap.parse_args()
     data = Path(a.data) if a.data else Path(a.root) / "scripts" / "sycl-alloc-zone-contract"
     allowlist = load_json(data / "allowlist.json", {"entries": []})
@@ -973,9 +995,17 @@ def main():
                 rest = [v for v in rest if not (v.code == ent["code"] and v.file == ent["file"] and v.func == ent["function"]
                                                 and ("name" not in ent or v.name == ent["name"]))]
             ids = sorted({v.ident() for v in rest})
+            old_ids = {(d["code"], d["key"]) for d in debt.get("violations", [])}
+            grown = sorted(set(ids) - old_ids)
+            if grown and old_ids and not a.allow_growth:
+                print("FAIL: --write-debt would ADD %d entr%s; debt may only shrink. Fix the violation, or pass "
+                      "--allow-growth for a deliberate key migration:" % (len(grown), "y" if len(grown) == 1 else "ies"))
+                for g in grown[:20]:
+                    print("  %s %s" % g)
+                return 1
             data.mkdir(parents=True, exist_ok=True)
             with open(data / "debt.json", "w") as f:
-                f.write('{\n  "schema": 1,\n  "violations": [\n')
+                f.write('{\n  "schema": 1,\n  "_doc": %s,\n  "violations": [\n' % json.dumps(DEBT_DOC))
                 f.write(",\n".join('    {"code": %s, "key": %s}' % (json.dumps(c), json.dumps(k)) for c, k in ids))
                 f.write("\n  ]\n}\n")
             print("wrote %d debt entries to %s" % (len(ids), data / "debt.json"))

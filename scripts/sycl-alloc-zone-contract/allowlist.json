@@ -1,5 +1,6 @@
 {
   "schema": 1,
+  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clause e; later clauses add entries). Permanent exemptions only, each with a reason. An entry that matches nothing, or whose count differs from what it covers, fails. Hand-edited; see README.md.",
   "entries": [
     {
       "id": "E-TEST",
