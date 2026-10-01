@@ -5861,7 +5861,12 @@ class alloc_owner_control final {
     uint32_t use_count() const noexcept { return refs_.load(std::memory_order_acquire); }
     // Minted once per control from a process-wide counter: never 0, never
     // reused, so it cannot name a later control at a recycled address.
-    uint64_t control_id() const noexcept { return control_id_; }
+    uint64_t                 control_id() const noexcept { return control_id_; }
+
+    // The context-tenant cohort this allocation was tagged with by the carve
+    // (null: not a tenant).  A relaxed atomic: it is written before the owner
+    // is shared and read thereafter.
+    const char * tenant_cohort() const noexcept { return tenant_cohort_.load(std::memory_order_acquire); }
 
   private:
     friend class alloc_owner;
@@ -5879,6 +5884,7 @@ class alloc_owner_control final {
     void abandon() noexcept;
 
     std::atomic<uint32_t> refs_{ 1 };
+    std::atomic<const char *>                       tenant_cohort_{ nullptr };
     uint64_t control_id_ = 0;
     alloc_metadata metadata_{};
     allocation_control_class ownership_class_ = allocation_control_class::EXTERNAL_EXACT;

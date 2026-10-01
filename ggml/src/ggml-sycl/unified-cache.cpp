@@ -876,6 +876,12 @@ const alloc_metadata & alloc_owner::metadata() const noexcept {
     static const alloc_metadata empty{};
     return control_ ? control_->metadata() : empty;
 }
+
+void alloc_owner::set_tenant_cohort(const char * cohort) noexcept {
+    if (control_) {
+        control_->tenant_cohort_.store(cohort, std::memory_order_release);
+    }
+}
 release_attempt alloc_owner::reset() noexcept {
     alloc_owner_control * control = std::exchange(control_, nullptr);
     return control ? control->release_ref() : release_attempt{};
@@ -911,6 +917,10 @@ uint32_t shared_alloc_owner::use_count() const noexcept {
 }
 uint64_t shared_alloc_owner::control_id() const noexcept {
     return control_ ? control_->control_id() : 0;
+}
+
+const char * shared_alloc_owner::tenant_cohort() const noexcept {
+    return control_ ? control_->tenant_cohort() : nullptr;
 }
 release_attempt shared_alloc_owner::reset() noexcept {
     alloc_owner_control * control = std::exchange(control_, nullptr);

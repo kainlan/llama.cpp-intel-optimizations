@@ -2833,6 +2833,37 @@ set_tests_properties(test-sycl-pool-phase-gate PROPERTIES
     TIMEOUT 120
 )
 
+# Test: mem_handle_identity (the non-owning value a compare-only cache keeps in
+# place of a mem_handle) and the tenant cohort tag.  Real owner controls from the
+# private fixture factory with an injected release backend, so the selector is
+# pinned to the OpenCL CPU device: no GPU.
+add_executable(test-sycl-mem-handle-identity
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mem-handle-identity.cpp
+)
+target_include_directories(test-sycl-mem-handle-identity PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-mem-handle-identity PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-mem-handle-identity PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-mem-handle-identity PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-mem-handle-identity PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-mem-handle-identity PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-mem-handle-identity COMMAND test-sycl-mem-handle-identity)
+set_tests_properties(test-sycl-mem-handle-identity PROPERTIES
+    LABELS "sycl;handle;hostonly;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 # Test: L0, the re-plan transaction mutex, and the always-compiled witness
 # (ggml_sycl_replan_token, ggml_sycl_replan_token_held, GGML_SYCL_WITNESS).
 # The real objects of unified-cache.cpp in the private carrier: nesting, kinds,

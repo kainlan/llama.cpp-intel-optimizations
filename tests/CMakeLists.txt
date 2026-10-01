@@ -1634,6 +1634,20 @@ if (NOT WIN32)
         TIMEOUT 180
     )
 
+    # Gate 27 (zhcn-design §5.2): the holder census, producer half.  A cache that only
+    # compares a source holds a mem_handle_identity, never a mem_handle (§B.2); the
+    # gate pins the producer fixes and proves itself on mutants of the real source.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-holder-census-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-holder-census-source.py
+    )
+    set_tests_properties(test-sycl-holder-census-source PROPERTIES
+        LABELS "sycl;tdd"
+        TIMEOUT 120
+    )
+
     # Regression + arithmetic gate for parse-sycl-gap-device-split.py, the
     # device-clock A/B decomposition the Cluster B verdict rests on. Registered
     # because that script shipped with a reproducible ZeroDivisionError: its

@@ -89,7 +89,12 @@ def sycl_sources():
 GENERATION = "graph_input_staging_generation"
 
 # The members that write or replace an entry, and the one that only reads.
-STAGING_WRITERS = ("graph_input_stage(", "graph_input_refresh(", "graph_input_staging_clear(")
+STAGING_WRITERS = (
+    "graph_input_stage(",
+    "graph_input_refresh(",
+    "graph_input_staging_clear(",
+    "graph_input_staging_release_tenants(",
+)
 STAGING_READERS = ("graph_input_stage_lookup(",)
 
 
