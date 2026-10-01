@@ -3506,9 +3506,11 @@ class unified_cache {
     size_t zone_largest_free(vram_zone_id zone) const;
     // Both free-space figures of one zone, read together under its allocator group's mutex: the
     // allocators' figures are only coherent under it (zone_available and zone_largest_free read
-    // them bare), with the zone's capacity and used bytes read at the same instant so a line's four
-    // figures satisfy used + available == capacity. Takes the group mutex, so a caller already inside
-    // the group (an allocation, a refusal) must not call it. False when no arena is active.
+    // them bare), with the zone's capacity and used bytes read at the same instant. For a zone with its
+    // own allocator (RUNTIME, SCRATCH, ONEDNN: the zones the reports print) the four figures satisfy
+    // used + available == capacity; WEIGHT in single-chunk mode takes its availability from the KV
+    // allocator, so that identity is not promised for it. Takes the group mutex, so a caller already
+    // inside the group (an allocation, a refusal) must not call it. False when no arena is active.
     bool   zone_free_figures(vram_zone_id zone,
                              size_t &     capacity,
                              size_t &     used,
@@ -7281,6 +7283,12 @@ bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
 //
 // A keyed counter (a cohort, a site, a ticket) prints its unlabelled total in
 // the fixed list and one `name=<counter>{<key>}` line per key that has counted.
+//
+// moe_table_reach_zero_gpu_expert is the one counter whose total is a SUM OF NOTES: a reach is noted at
+// the callee's ensure site and again at each caller above it, so the total double-counts a reach that
+// came through a caller. Its reach count is the `ensure:` keys (one per ensure_moe_ptr_table call site);
+// the `update:` and `upload:` keys say which caller it came through. It also evaluates only in an armed
+// run, so it prints not_captured unless the report flag read armed.
 #define GGML_SYCL_DUMP_COUNTERS(X)            \
     X(ext_alloc_count)                        \
     X(ext_alloc_arena)                        \

@@ -26022,6 +26022,20 @@ static bool ggml_sycl_is_device_vram_buffer(const ggml_tensor * t) {
     return buf_ctx->managed_meta.tier == ggml_sycl::alloc_tier::DEVICE_VRAM;
 }
 
+// The placement plan the MoE residency queries read for `device`: the cache's plan when it holds one, else
+// the global plan, else none. The one place that resolution is written; the owners are shared_ptrs returned
+// by value, so the caller holds the result for the walk.
+static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_moe_plan_owner_for_device(int device) {
+    auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
+        return ggml_sycl_cache_plan_owner(cache);
+    }
+    if (ggml_sycl_has_global_plan()) {
+        return ggml_sycl_global_plan_owner();
+    }
+    return nullptr;
+}
+
 static bool ggml_sycl_moe_plan_has_host_experts(const ggml_tensor * src0, int device, bool * known = nullptr) {
     if (known) {
         *known = false;
@@ -26029,27 +26043,21 @@ static bool ggml_sycl_moe_plan_has_host_experts(const ggml_tensor * src0, int de
     if (!src0 || device < 0 || ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT) {
         return false;
     }
-    auto *        cache     = ggml_sycl::get_unified_cache_for_device(device);
-    const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
-    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-        if (known) {
-            *known = true;
-        }
-        return ggml_sycl_cache_plan_owner(cache)->has_host_experts(src0->name ? src0->name : "", n_experts, device);
+    const auto plan = ggml_sycl_moe_plan_owner_for_device(device);
+    if (!plan) {
+        return false;
     }
-    const auto plan_owner = ggml_sycl_global_plan_owner();
-    if (ggml_sycl_has_global_plan()) {
-        if (known) {
-            *known = true;
-        }
-        return plan_owner->has_host_experts(src0->name ? src0->name : "", n_experts, device);
+    if (known) {
+        *known = true;
     }
-    return false;
+    return plan->has_host_experts(src0->name ? src0->name : "", src0->ne[2] > 0 ? src0->ne[2] : 1, device);
 }
 
 // The dump-armed flag, read from the environment once per process (the g_ggml_sycl_debug precedent): the
 // G0 report sites sit on per-op paths (mul_mat dispatch, the MoE pointer-table entries), where a getenv
-// per call is a libc scan per op. A host test that needs both arms runs each in its own process.
+// per call is a libc scan per op. A host test that needs both arms runs each in its own process. This
+// helper is the only reader of the live accessor outside unified-cache.cpp (scripts/check-sycl-counter-dump.py
+// pins that and the function-local static).
 static bool ggml_sycl_dump_report_armed() {
     static const bool armed = [] {
         const bool a = ggml_sycl::unified_cache_dump_report_enabled();
@@ -26060,26 +26068,19 @@ static bool ggml_sycl_dump_report_armed() {
 }
 
 // How many of the tensor's experts the admitted placement plan executes on `device`'s GPU, from the same
-// plan source ggml_sycl_moe_plan_has_host_experts reads. False when no plan is known (the count is then
-// not a zero).
+// plan source ggml_sycl_moe_plan_has_host_experts reads. False when no plan is known: the caller then
+// counts nothing, since an unknown plan is not a measured zero.
 static bool ggml_sycl_moe_plan_gpu_expert_count(const ggml_tensor * src0, int device, int64_t * count) {
     if (!src0 || !count || device < 0 || ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT) {
         return false;
     }
-    const int64_t                                    n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
-    const char *                                     name      = src0->name ? src0->name : "";
-    // The owners are shared_ptrs returned by value: hold one for the walk.
-    std::shared_ptr<const ggml_sycl::placement_plan> plan;
-    auto *                                           cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-        plan = ggml_sycl_cache_plan_owner(cache);
-    } else if (ggml_sycl_has_global_plan()) {
-        plan = ggml_sycl_global_plan_owner();
-    }
+    const auto plan = ggml_sycl_moe_plan_owner_for_device(device);
     if (!plan) {
         return false;
     }
-    int64_t n = 0;
+    const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+    const char *  name      = src0->name ? src0->name : "";
+    int64_t       n         = 0;
     for (int64_t e = 0; e < n_experts; ++e) {
         n += plan->expert_on_device(name, static_cast<int>(e), device) ? 1 : 0;
     }
@@ -26093,9 +26094,16 @@ static bool ggml_sycl_moe_plan_gpu_expert_count(const ggml_tensor * src0, int de
 // `<callee kind>:<function>[/<role>]`. The count is predicted 0 everywhere but the preload; it is
 // moe_table_reach_zero_gpu_expert in the dump.
 //
+// One real reach is noted at BOTH the callee's ensure site and each caller above it (an upload from
+// mul_mat_id reaches the transient helper's ensure), so the unkeyed total is a sum of notes, not a count
+// of reaches. A reach is read from the `ensure:` keys (one per ensure_moe_ptr_table call site:
+// ensure:graph_preload_moe_experts is the preload, the case the conversion skips); the `update:` and
+// `upload:` keys say which caller a reach came through.
+//
 // The zero test walks the plan once per expert, so it runs only in a run that arms the dump (the
 // counter is read only from that dump). That is the one counter here whose evaluation is armed-only,
-// and it is named as such in scripts/check-sycl-counter-dump.py (ARMED_ONLY_COUNTERS).
+// and it is named as such in scripts/check-sycl-counter-dump.py (ARMED_ONLY_COUNTERS); the dump prints it
+// as not_captured unless the armed flag was read armed.
 static void ggml_sycl_note_moe_table_reach(const char * site, const ggml_tensor * src0, int device) {
     if (!ggml_sycl_dump_report_armed()) {
         return;
@@ -62056,9 +62064,9 @@ static bool ggml_sycl_dispatch_mul_mat_kernel(ggml_backend_sycl_context & ctx,
                                               ggml_tensor *               dst,
                                               ggml_sycl_mul_mat_kernel    kernel) {
     const layout_mode layout = ggml_sycl_mul_mat_kernel_layout(kernel);
-    // The name test is first and the report flag is a once-per-process static, so a run that does not arm
-    // the dump pays two strstr calls at most, and only on a debug run.
-    const bool        is_lm_head = ggml_sycl_is_lm_head_weight(src0);
+    // The LM head test runs only on a debug or armed run: the other runs pay one flag test (a static read),
+    // not the name scan, so an unarmed dispatch has no per-op string work here.
+    const bool is_lm_head = (g_ggml_sycl_debug || ggml_sycl_dump_report_armed()) && ggml_sycl_is_lm_head_weight(src0);
     if (g_ggml_sycl_debug && is_lm_head) {
         GGML_SYCL_DEBUG("[SYCL] output.weight dispatch kernel=%s layout=%d batch=%lld\n",
                         ggml_sycl_mul_mat_kernel_name(kernel), (int) layout, (long long) src1->ne[1]);

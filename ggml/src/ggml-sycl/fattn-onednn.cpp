@@ -906,8 +906,8 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
 
     // G0's second Graph-callback count: draws made during compile() that are still live when it returns
     // (predicted 0: the partition declares no constant tensor, so every draw is an execute's scratch).
-    // Process-wide live count before and after; the compile runs under the cache mutex, so no other
-    // SDPA compile interleaves, and a draw an execute makes on another thread is the only noise.
+    // The count is process-wide and live, so it is exact for the single-threaded G0 run: an execute's draw
+    // on another thread over-counts, and its free landing here nets against a compile draw and under-counts.
     const int64_t draws_before = ggml_sycl::unified_cache_onednn_graph_live_draws();
     auto          cp           = parts[0].compile(in_ports, out_ports, eng);
     const int64_t draws_after  = ggml_sycl::unified_cache_onednn_graph_live_draws();

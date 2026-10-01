@@ -4129,6 +4129,9 @@ const char * dump_site_basename(const char * file) {
 // compute marker set, and the marker (design §5.4(b), g_sycl_compute_marker) lands at step 3 with the
 // late-refusal channel, so nothing on this tree can say whether a marker is set. Step 3 flips it.
 //
+// (moe_table_reach_zero_gpu_expert's printed total is a sum of notes, not a count of reaches; its reach
+// count is the `ensure:` key lines. See the table's comment in unified-cache.hpp.)
+//
 // moe_table_reach_zero_gpu_expert has a producer but evaluates only when the report sites' armed flag read
 // armed (its zero test walks the plan once per expert per call), so it reads not_captured unless that flag
 // has been read and read armed: an unarmed or never-evaluated 0 is not a measured 0.
@@ -11497,8 +11500,9 @@ bool unified_cache::event_complete(const sycl::event & evt) {
     }
 }
 
-// Draws the oneDNN Graph allocator callback has made and not yet freed, process-wide. Counted in the
-// callbacks themselves (below, GGML_SYCL_DNNL only), read by the SDPA compile's bracket.
+// Draws the oneDNN Graph allocator callback has made and not yet freed, process-wide: a live count, not
+// a drawn count. Counted in the callbacks themselves (below, GGML_SYCL_DNNL only), read by the SDPA
+// compile's bracket.
 static std::atomic<int64_t> g_onednn_graph_live_draws{ 0 };
 
 int64_t unified_cache_onednn_graph_live_draws() noexcept {
@@ -12926,8 +12930,10 @@ void onednn_graph_sycl_free(void * buf, const void * dev, const void * ctx, void
             }
             return;
         }
-        cache->onednn_graph_scratch_free(buf, ev);
+        // Counted before the free: oneDNN considers the draw returned once it called us, whether or not the
+        // cache's free then throws (swallowed below), so the count must not depend on that outcome.
         g_onednn_graph_live_draws.fetch_sub(1, std::memory_order_relaxed);
+        cache->onednn_graph_scratch_free(buf, ev);
     } catch (...) {
     }
 }
@@ -22801,11 +22807,13 @@ static void dump_report_zone_figures_for(unified_cache * cache, int dev, const c
 // bytes. A model with no plan leaves its entries not_captured, never zero. The load-end call runs before
 // the plan publishes, so the plan is still the candidate. A third live model is recorded but not printed.
 //
-// The figures are the plan's own, not a second derivation of them. A single-device plan records its
-// weight_vram_bytes and weight_host_bytes, and those are the entries. A multi-device plan records no
-// per-device weight figure, so the device's bytes are the sum of its entries under the plan's own charge
-// (vram_charge_size, else placement_vram_charge_bytes(dst_size), the rule every plan edit uses); its
-// host-tiered bytes are plan-wide and are reported once as `planned_host`, not credited to each device.
+// weight_planned_device_bytes means one thing for every plan: the sum, over the plan's primary weight
+// entries placed on `dev`, of the plan's own charge (vram_charge_size, else
+// placement_vram_charge_bytes(dst_size), the rule every plan edit uses). Alternate and extra layout
+// copies are not entries and are not in it, so the figure is comparable between a single-device and a
+// multi-device load. Host-tiered bytes are the plan's recorded weight_host_bytes, plan-wide: a
+// multi-device plan, or a device a single-device plan does not name, reads not_captured and the figure
+// is reported once as `planned_host`, not credited to each device.
 //
 // It also prints, per device, the plan's MoE tensors and how many have zero GPU-executed experts on it:
 // G0's VOID test for the preload arm of the row-134 reach counts.
@@ -22827,17 +22835,12 @@ static void unified_cache_dump_capture_load_end(int             dev,
             have_plan                   = true;
             // Host bytes are plan-wide: a device the plan does not name has no host figure of its own.
             host_plan_wide              = plan.multi_device || plan.device_id != dev;
-            if (!plan.multi_device) {
-                if (plan.device_id == dev) {
-                    planned = plan.weight_vram_bytes;
-                    host    = plan.weight_host_bytes;
-                }
-            } else {
-                for (const placement_entry & e : plan.entries) {
-                    if (e.on_device && (e.target_device >= 0 ? e.target_device : plan.device_id) == dev) {
-                        planned +=
-                            e.vram_charge_size != 0 ? e.vram_charge_size : placement_vram_charge_bytes(e.dst_size);
-                    }
+            if (!plan.multi_device && plan.device_id == dev) {
+                host = plan.weight_host_bytes;
+            }
+            for (const placement_entry & e : plan.entries) {
+                if (e.on_device && (e.target_device >= 0 ? e.target_device : plan.device_id) == dev) {
+                    planned += e.vram_charge_size != 0 ? e.vram_charge_size : placement_vram_charge_bytes(e.dst_size);
                 }
             }
             if (counter_dump_requested()) {
@@ -22850,26 +22853,29 @@ static void unified_cache_dump_capture_load_end(int             dev,
                               plan.multi_device ? 1 : 0);
                 (void) unified_cache_dump_report_once(key, text);
 
-                // MoE tensors are the (layer, role) groups of expert entries; one has zero GPU-executed
-                // experts on `dev` when none of its experts is planned on that device.
-                std::map<std::pair<int, int>, size_t> on_dev;
+                // MoE tensors are the composite names of the plan's expert entries; one has zero GPU-executed
+                // experts on `dev` when expert_on_device(name, e, dev) is false for every expert e of it:
+                // the predicate the runtime reach counter asks (ggml_sycl_moe_plan_gpu_expert_count), not a
+                // second derivation of "on device".
+                std::map<std::string, int> n_experts;
                 for (const placement_entry & e : plan.entries) {
-                    if (e.expert_id < 0) {
-                        continue;
-                    }
-                    size_t & n = on_dev[{ e.layer_id, static_cast<int>(e.expert_role) }];
-                    if (e.on_device && (e.target_device >= 0 ? e.target_device : plan.device_id) == dev) {
-                        ++n;
+                    if (e.expert_id >= 0) {
+                        int & n = n_experts[e.name];
+                        n       = std::max(n, e.expert_id + 1);
                     }
                 }
                 size_t zero = 0;
-                for (const auto & kv : on_dev) {
-                    zero += kv.second == 0 ? 1 : 0;
+                for (const auto & kv : n_experts) {
+                    bool any = false;
+                    for (int e = 0; e < kv.second && !any; ++e) {
+                        any = plan.expert_on_device(kv.first, e, dev);
+                    }
+                    zero += any ? 0 : 1;
                 }
                 std::fprintf(stderr,
                              "[SYCL-REPORT] moe_zero_gpu_expert_tensors dev=%d load_txn=%llu moe_tensors=%zu "
                              "zero_gpu_expert_tensors=%zu\n",
-                             dev, static_cast<unsigned long long>(load_txn_id), on_dev.size(), zero);
+                             dev, static_cast<unsigned long long>(load_txn_id), n_experts.size(), zero);
             }
         }
     } catch (...) {

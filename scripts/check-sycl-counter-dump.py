@@ -163,6 +163,7 @@ REPORT_EMITTERS = [
     ("unified-cache.cpp", "unified_cache_dump_report_once"),
     ("unified-cache.cpp", "dump_report_zone_figures_for"),
     ("unified-cache.cpp", "unified_cache_test_counter_dump"),
+    ("unified-cache.cpp", "unified_cache_dump_capture_load_end"),
 ]
 
 # The snapshot entries' producers: id -> (file, function that holds the capture). The two zone-figure
@@ -756,6 +757,40 @@ def check(files, cmake):
         fails.append("H13 G0: ggml_sycl_dump_report_armed does not record its reading for the dump "
                      "(unified_cache_dump_note_armed)")
 
+    # The report sites read the dump flag once per process (a getenv per op is a libc scan on a hot path):
+    # the helper holds a function-local static, and nothing outside unified-cache.cpp, the helper aside,
+    # calls the live accessor.
+    if armed_fn is not None and not re.search(r"\bstatic\s+const\s+bool\b", armed_fn):
+        fails.append("H13 I-2: ggml_sycl_dump_report_armed is not a function-local static const bool, so every "
+                     "call reads the environment")
+    for rel, text in stripped.items():
+        if rel in ("unified-cache.cpp", "unified-cache.hpp"):
+            continue
+        scan = text.replace(armed_fn, "") if (rel == "ggml-sycl.cpp" and armed_fn) else text
+        for m in re.finditer(r"\bunified_cache_dump_report_enabled\s*\(", scan):
+            fails.append(f"H13 I-2: the live dump accessor is called outside ggml_sycl_dump_report_armed "
+                         f"({rel}:{line_of(scan, m.start())})")
+
+    # The stream_dma per-caller key names the file and the function, so two callers in one file stay apart.
+    sd = function_text(cache_text, "unified_cache::stream_dma")
+    if sd is None or "caller_func" not in sd or '"%s:%s"' not in sd:
+        fails.append("H13 M-3: unified_cache::stream_dma's non-device-arrival key does not carry the caller's "
+                     "function (`<file>:<function>`)")
+
+    # The load-end report asks the plan's own predicate for "on device", as the runtime reach counter does,
+    # and the planned device bytes are the one per-entry sum (never the single-device recorded figure).
+    le = function_text(cache_text, "unified_cache_dump_capture_load_end")
+    if le is not None:
+        if "expert_on_device(" not in le:
+            fails.append("H13 M-5: unified_cache_dump_capture_load_end does not use expert_on_device, the "
+                         "predicate the reach counter uses")
+        if "weight_vram_bytes" in le:
+            fails.append("H13 M-4: unified_cache_dump_capture_load_end reads weight_vram_bytes, a second "
+                         "meaning for weight_planned_device_bytes")
+    gc = function_text(stripped.get("ggml-sycl.cpp", ""), "ggml_sycl_moe_plan_gpu_expert_count")
+    if gc is None or "expert_on_device(" not in gc:
+        fails.append("H13 M-5: ggml_sycl_moe_plan_gpu_expert_count does not use expert_on_device")
+
     # The interim keys of onednn_graph_route_declined.
     key_re = re.compile(r"dump_counter_add_key\s*\(\s*dump_counter::" + ROUTE_COUNTER + r"\s*,[^;]*?\"(\w+)\"",
                         re.S)
@@ -1237,6 +1272,52 @@ def mutation_matrix(files, cmake):
     f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
         "[SYCL-REPORT] moe_zero_gpu_expert_tensors dev=", "[SYCL-REPORT] moe_zero dev=", 1)
     muts.append(("zero-GPU-expert report dropped", "H13 G0: unified_cache_dump_capture_load_end", f, cmake))
+
+    # §M205 r2: the load-end zero-tensor report is a report emitter; the I-2 split is pinned; the stream_dma
+    # key carries the function; the load-end figures read the plan's predicate and one per-entry sum.
+    f = clone()
+    f["unified-cache.cpp"] = re.sub(r'std::fprintf\(stderr,\s*"\[SYCL-REPORT\] moe_zero_gpu_expert_tensors',
+                                    'GGML_LOG_INFO("[SYCL-REPORT] moe_zero_gpu_expert_tensors',
+                                    files["unified-cache.cpp"], count=1)
+    muts.append(("zero-tensor report swapped to GGML_LOG_INFO",
+                 "H13 G0: report emitter unified_cache_dump_capture_load_end (unified-cache.cpp) calls GGML_LOG_*", f,
+                 cmake))
+    live = "ggml_sycl::unified_cache_dump_report_enabled()"
+    gtext = files["ggml-sycl.cpp"]
+    f = clone()
+    f["ggml-sycl.cpp"] = gtext.replace("if (is_lm_head && ggml_sycl_dump_report_armed()) {",
+                                       "if (is_lm_head && " + live + ") {", 1)
+    muts.append(("arm-A site reads the live accessor", "H13 I-2: the live dump accessor is called outside", f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = gtext.replace("    if (ggml_sycl_dump_report_armed()) {\n        // Row 73's own-allocation fallback",
+                                       "    if (" + live + ") {\n        // Row 73's own-allocation fallback", 1)
+    muts.append(("row-73 site reads the live accessor", "H13 I-2: the live dump accessor is called outside", f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = gtext.replace("    if (!ggml_sycl_dump_report_armed()) {\n        return;\n    }\n    int64_t gpu_experts",
+                                       "    if (!" + live + ") {\n        return;\n    }\n    int64_t gpu_experts", 1)
+    muts.append(("reach note reads the live accessor", "H13 I-2: the live dump accessor is called outside", f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = gtext.replace("    static const bool armed = [] {", "    const bool armed = [] {", 1)
+    muts.append(("armed helper no longer a function-local static",
+                 "H13 I-2: ggml_sycl_dump_report_armed is not a function-local static const bool", f, cmake))
+    f = clone()
+    f["unified-cache.cpp"] = re.sub(r'std::snprintf\(caller_key, sizeof\(caller_key\), "%s:%s",\s*dump_site_basename\(caller_file\),\s*'
+                                    r'caller_func != nullptr \? caller_func : "-"\);',
+                                    'std::snprintf(caller_key, sizeof(caller_key), "%s", dump_site_basename(caller_file));',
+                                    files["unified-cache.cpp"], count=1)
+    muts.append(("stream_dma key reduced to the file basename",
+                 "H13 M-3: unified_cache::stream_dma's non-device-arrival key does not carry the caller's function", f,
+                 cmake))
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace("any = plan.expert_on_device(kv.first, e, dev);",
+                                                                "any = e == 0;", 1)
+    muts.append(("zero-tensor report re-derives on-device by hand",
+                 "H13 M-5: unified_cache_dump_capture_load_end does not use expert_on_device", f, cmake))
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace("host = plan.weight_host_bytes;",
+                                                                "host = plan.weight_host_bytes;\n                planned = plan.weight_vram_bytes;", 1)
+    muts.append(("planned device bytes read the recorded single-device figure",
+                 "H13 M-4: unified_cache_dump_capture_load_end reads weight_vram_bytes", f, cmake))
 
     # The ggml-sycl target given the macro.
     muts.append(("ggml-sycl defines the macro", "H13 M74: the ggml-sycl target defines GGML_SYCL_PRIVATE_TESTING",
