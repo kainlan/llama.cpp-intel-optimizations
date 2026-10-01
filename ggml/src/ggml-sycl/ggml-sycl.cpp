@@ -83571,6 +83571,9 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
                 case GGML_UNARY_OP_EXP:
                     ggml_sycl_exp(ctx, safe_dst);
                     break;
+                case GGML_UNARY_OP_SOFTPLUS:
+                    ggml_sycl_softplus(ctx, safe_dst);
+                    break;
                 case GGML_UNARY_OP_GELU_ERF:
                     ggml_sycl_gelu_erf(ctx, safe_dst);
                     break;
@@ -108549,6 +108552,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_UNARY_OP_GELU_QUICK:
                     case GGML_UNARY_OP_GELU_ERF:
                     case GGML_UNARY_OP_EXP:
+                    case GGML_UNARY_OP_SOFTPLUS:
                     case GGML_UNARY_OP_ELU:
 
                         return unary_type_supported(src0_type, dst_type);
