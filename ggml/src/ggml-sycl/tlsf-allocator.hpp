@@ -150,10 +150,11 @@ class tlsf_allocator {
     // Every block of the region, physically LOW to HIGH, free and allocated:
     // for a region of at least MIN_BLOCK_SIZE the list tiles [0, size) with no
     // gap or overlap and no two free blocks adjacent (a smaller region has no
-    // blocks, so its census is empty).  A free block has tag 0.  frontier_walk() is its high end read
-    // top-down and stopped at the first block that is neither free nor
-    // `pass_tag`; this is the whole of it, for the buried-optional and
-    // weight-hole census of kv_region_fit's geometry (§2.4.1).
+    // blocks, so its census is empty).  A free block has tag 0.  frontier_walk()
+    // is its high end read top-down and stopped at the first block that is
+    // neither free nor `pass_tag`; this is the whole of it, for the
+    // buried-optional and weight-hole census of kv_region_fit's geometry
+    // (§2.4.1).
     //
     // Read-only, O(blocks), and group-mutex-only like frontier_walk(): it
     // walks blocks_, which a concurrent split_block() may reallocate.  Kept as

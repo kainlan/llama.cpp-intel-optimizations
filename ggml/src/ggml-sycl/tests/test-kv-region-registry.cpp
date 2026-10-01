@@ -1157,6 +1157,17 @@ int case_l5_tie_break() {
         std::lock_guard<kv_witnessed_mutex> b(g2b);
     }
     CHECK_EQ(kv_lock_witness::violations(), 1, "control: equal ordinal and instance is flagged");
+    CHECK(kv_lock_witness::last().find("instance collision") != std::string::npos &&
+              kv_lock_witness::last().find("witness instance 2") != std::string::npos,
+          "the equal-instance report names the possible collision and the instance");
+    kv_lock_witness::reset();
+    {
+        std::lock_guard<kv_witnessed_mutex> a(g2);
+        std::lock_guard<kv_witnessed_mutex> b(g1);
+    }
+    CHECK(kv_lock_witness::last().find("collision") == std::string::npos,
+          "control: a plain descending pair is reported as an order violation, not a collision");
+    kv_lock_witness::reset();
 
     // Two slots' spin locks are the same subsystem with their serials as instances.
     kv_lock_witness::reset();
@@ -1514,27 +1525,34 @@ int case_stale_release_race() {
     return 0;
 }
 
-// The two events a slot holds are two facts (kv_tenant_slots::slot): the claimant chains on
-// the last RELEASED claim's event, and the retention fences the last RECORDED generation.
+// The two events a slot holds come from two different calls (kv_tenant_slots::slot): the
+// claimant chains on what the RELEASING caller passed, the retained owner's drop is fenced
+// on what the RECORDING caller passed.  The case gives them different values, so a registry
+// that read one for the other fails.
 int case_slot_events_are_two_facts() {
     drop_log        log;
     kv_tenant_slots slots;
     add_fresh(slots, "ring", 0, make_handle(log), 100);
 
     const kv_claim g1 = slots.claim("ring", 0, 10);
-    (void) slots.exchange_retention("ring", 0, { make_handle(log), 7 });
-    CHECK(slots.release_claim("ring", 0, g1.generation, 7), "generation 1 releases with its event");
+    (void) slots.exchange_retention("ring", 0, { make_handle(log), 5 });
+    CHECK(slots.release_claim("ring", 0, g1.generation, 4), "generation 1 releases with event 4");
 
     const kv_claim g2 = slots.claim("ring", 0, 10);
-    CHECK_EQ(g2.wait_event, 7, "the claimant chains on the last released claim's event");
-    // Generation 2 records its own work (event 9) while it still holds the slot.
+    CHECK_EQ(g2.wait_event, 4,
+             "the claimant chains on the event the releasing caller passed (4, not the retention's 5)");
+    // Generation 2 records its retention with event 9 and then releases with event 8.
     const kv_slot_retention prev = slots.exchange_retention("ring", 0, { make_handle(log), 9 });
-    CHECK(prev.owner && prev.done_event == 7, "the retention handed back carries the previous generation's event");
-    // Mid-generation the chain target is still generation 1's: a claimant is refused, and after the
-    // release it chains on generation 2's event, not on anything the retention says.
+    CHECK(prev.owner && prev.done_event == 5,
+          "the owner handed back carries the event its recorder passed (5), not the release's 4");
     CHECK(slots.claim("ring", 0, 10).result == kv_claim_result::ALREADY_CLAIMED, "the slot is held");
-    CHECK(slots.release_claim("ring", 0, g2.generation, 9), "generation 2 releases with its event");
-    CHECK_EQ(slots.claim("ring", 0, 10).wait_event, 9, "the next claimant chains on generation 2's release");
+    CHECK(slots.release_claim("ring", 0, g2.generation, 8), "generation 2 releases with event 8");
+    const kv_claim g3 = slots.claim("ring", 0, 10);
+    CHECK_EQ(g3.wait_event, 8, "the next claimant chains on the release's event (8), not the retention's 9");
+    std::vector<kv_slot_retention> kept;
+    slots.take_retentions(kept);
+    CHECK(kept.size() == 1 && kept[0].done_event == 9,
+          "and the retained owner is fenced on the event its recorder passed (9), not the release's 8");
     return 0;
 }
 

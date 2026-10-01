@@ -93,7 +93,9 @@ inline void kv_region_abort(const std::string & message) {
 // within an ordinal: the table's pin is instance 0 and each table numbers its slot
 // serials from 1, so two tables' slots, or two default-constructed mutexes (instance
 // 0), collide and read as one lock taken twice.  The production instance must be
-// process-unique (the zone id for a group mutex, a mem_handle serial for a slot).
+// process-unique (the zone id for a group mutex, a mem_handle serial for a slot).  The
+// witness cannot tell a collision from one lock taken twice, so its report for an equal
+// ordinal and instance names both readings; there is no registry of live instances.
 // The ordinal order below is the model's reading of
 // §2.10: the spec fixes group mutex < arena authority < g_runtime_alloc_mutex (the
 // existing nesting of every registered zone_alloc), the slot-state lock before the
@@ -137,7 +139,14 @@ class kv_lock_witness {
             if (h.rank == KV_LOCK_L3_REGISTRY) {
                 violation(std::string("leaf: ") + name + " acquired while holding " + h.name);
             } else if (h.rank > rank || (h.rank == rank && !ascends(h, ordinal, instance))) {
-                violation(std::string("order: ") + name + " acquired while holding " + h.name);
+                std::string what = std::string("order: ") + name + " acquired while holding " + h.name;
+                if (h.rank == rank && h.ordinal == ordinal && h.instance == instance) {
+                    // Equal ordinal and instance: one lock taken twice, or two locks that were
+                    // given the same instance.  The second is a collision, not an order bug.
+                    what += " (equal ordinal and witness instance " + std::to_string(instance) +
+                            ": the same lock twice, or an instance collision)";
+                }
+                violation(what);
             }
         }
         if (s.n == kCapacity) {
@@ -687,13 +696,12 @@ class kv_tenant_slots {
         std::atomic<bool> claimed{ false };  // written under `spin`, read without it
         kv_slot_spin_lock spin;              // guards the three fields below
         uint64_t          generation = 0;    // the live claim's token
-        // TWO events, because they are two facts that coincide only AFTER a release.
-        // `last_event` is the event of the last RELEASED claim: what the next claimant
-        // chains on (claim() returns it as wait_event).  `retention.done_event` is the
-        // event of the last RECORDED generation's work, written when that generation
-        // records and fencing the drop of its retained owner.  While a generation holds
-        // the slot the two differ: last_event is still the previous generation's, and
-        // retention.done_event is this one's.  The claimant chains on last_event.
+        // TWO events, supplied by two different calls, and the registry never assumes they are
+        // the same.  `last_event` is the event the RELEASING caller passes to release_claim():
+        // what the next claimant chains on (claim() returns it as wait_event).
+        // `retention.done_event` is the event the RECORDING caller passes with the retained
+        // owner (exchange_retention()): it fences the drop of that owner.  A caller may pass
+        // one event to both, and the production ring does; nothing here depends on it.
         uint64_t          last_event = 0;
         kv_slot_retention retention;
     };

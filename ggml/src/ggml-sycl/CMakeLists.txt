@@ -1867,7 +1867,10 @@ int main() { int x = 0; std::thread t([&] { x = 1; }); t.join(); return x - 1; }
 unset(CMAKE_REQUIRED_FLAGS)
 unset(CMAKE_REQUIRED_LINK_OPTIONS)
 unset(CMAKE_REQUIRED_LIBRARIES)
-if (GGML_SYCL_HAVE_TSAN)
+# GGML_SANITIZE_ADDRESS / GGML_SANITIZE_THREAD add their sanitizer at directory scope
+# (ggml/src/CMakeLists.txt), which the check above does not see: with either set this target
+# would carry two sanitizers (or the same one twice), and ASan and TSan do not combine.
+if (GGML_SYCL_HAVE_TSAN AND NOT GGML_SANITIZE_ADDRESS AND NOT GGML_SANITIZE_THREAD)
     add_executable(test-sycl-kv-region-registry-tsan
         tests/test-kv-region-registry.cpp
     )
@@ -1885,9 +1888,12 @@ if (GGML_SYCL_HAVE_TSAN)
         TIMEOUT 300
         ENVIRONMENT "TSAN_OPTIONS=detect_deadlocks=0:halt_on_error=1:exitcode=66"
     )
-else()
+elseif (NOT GGML_SYCL_HAVE_TSAN)
     message(STATUS "ggml-sycl: no ThreadSanitizer support in this compiler; "
                    "sycl-kv-region-registry-tsan is not registered")
+else()
+    message(STATUS "ggml-sycl: GGML_SANITIZE_ADDRESS or GGML_SANITIZE_THREAD is set, which already "
+                   "instruments this build; sycl-kv-region-registry-tsan is not registered")
 endif()
 
 # Production geometry census (llama.cpp-moua L4 1b): kv-geometry-census.hpp reads
