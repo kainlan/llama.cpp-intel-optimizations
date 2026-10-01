@@ -15,8 +15,9 @@ write to the context's members. This gate pins, on comment-stripped text:
   n_input_tensors and `this->n_outputs` only through the state, and the impl
   throws nothing: its three refusals are FAILED returns;
 - the member-backed state names exactly the context's own members;
-- `sched_reserve()` reaches the impl as ALLOC and throws the reason of any
-  non-OK result, so its callers see today's exceptions;
+- `sched_reserve()` runs the reserve transaction (ALLOC for an unplanned
+  context) and throws the reason of any non-OK result, so its callers see
+  today's exceptions;
 - the compute line is printed in exactly one place, inside the impl, with the
   literal prefix "sched_reserve";
 - decode and encode reserve through `sched_reserve_nothrow()`, never the
@@ -163,17 +164,16 @@ def wrapper_ok(code: str) -> bool:
         return False
     w = function_body(code, _WRAPPER)
     return (
-        z("sched_reserve_state state = member_reserve_state();") in w
-        and z("sched_reserve_impl(sched_reserve_mode::ALLOC, state);") in w
+        z("const sched_reserve_result result = sched_reserve_transaction();") in w
         and z("if (result.status != sched_reserve_status::OK) { throw std::runtime_error(result.reason); }") in w
         and z("if (!sched_need_reserve) { return; }") in w
     )
 
 
-def test_wrapper_runs_alloc_on_the_member_state():
+def test_wrapper_runs_the_transaction():
     assert wrapper_ok(code_of(CONTEXT_CPP)), (
-        "sched_reserve() must build the member-backed state, run the impl as ALLOC and throw the reason of "
-        "any non-OK result; member_reserve_state() must name the context's own members in the state's order"
+        "sched_reserve() must run the reserve transaction and throw the reason of any non-OK result; "
+        "member_reserve_state() must name the context's own members in the state's order"
     )
 
 
@@ -182,8 +182,8 @@ def test_wrapper_mutants():
     mutants = [
         ("a member dropped from the state", "n_input_tensors, cparams };", "cparams };"),
         ("members in the wrong order", "return { sched, gf_res_prev, gf_res_reserve,", "return { sched, gf_res_reserve, gf_res_prev,"),
-        ("status ignored", "sched_reserve_impl(sched_reserve_mode::ALLOC, state); if (result.status != sched_reserve_status::OK) {", "sched_reserve_impl(sched_reserve_mode::ALLOC, state); if (false) {"),
-        ("MEASURE passed by the wrapper", "sched_reserve_impl(sched_reserve_mode::ALLOC, state);", "sched_reserve_impl(sched_reserve_mode::MEASURE, state);"),
+        ("status ignored", "sched_reserve_transaction(); if (result.status != sched_reserve_status::OK) {", "sched_reserve_transaction(); if (false) {"),
+        ("the transaction bypassed", "const sched_reserve_result result = sched_reserve_transaction();", "const sched_reserve_result result = {};"),
         ("early return dropped", "if (!sched_need_reserve) { return; }", ""),
     ]
     for name, old, new in mutants:
@@ -345,7 +345,7 @@ _CALL_SITE = z("if (!sched_reserve_nothrow()) { LLAMA_LOG_ERROR(\"%s: failed to 
 
 def nothrow_ok(code: str) -> bool:
     b = function_body(code, _NOTHROW)
-    impl_call = z("sched_reserve_impl(sched_reserve_mode::ALLOC, state);")
+    impl_call = z("const sched_reserve_result result = sched_reserve_transaction();")
     if impl_call not in b or "catch(conststd::exception&" not in b.replace(" ", ""):
         return False
     # success returns true; every other path logs, re-arms the reserve and returns false
@@ -388,7 +388,7 @@ def test_nothrow_mutants():
         ("the catch dropped", "catch (const std::exception & err) {", "catch (const int & err) {"),
         ("the re-arm dropped", "sched_need_reserve = true; return false; }", "return false; }"),
         ("a failure reported as success", "sched_need_reserve = true; return false; }", "sched_need_reserve = true; return true; }"),
-        ("the impl run as MEASURE", "const sched_reserve_result result = sched_reserve_impl(sched_reserve_mode::ALLOC, state); if (result.status == sched_reserve_status::OK) {", "const sched_reserve_result result = sched_reserve_impl(sched_reserve_mode::MEASURE, state); if (result.status == sched_reserve_status::OK) {"),
+        ("the transaction bypassed", "const sched_reserve_result result = sched_reserve_transaction(); if (result.status == sched_reserve_status::OK) {", "const sched_reserve_result result = {}; if (result.status == sched_reserve_status::OK) {"),
         ("the early return removed", "if (!sched_need_reserve) { return true; }", ""),
     ]
     body = function_body(code, _NOTHROW)

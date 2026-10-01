@@ -77,7 +77,7 @@ def brace_body(code: str, start: int) -> str:
     raise AssertionError("unbalanced braces")
 
 
-_PUBLISH_SIGNATURE = "sched_reserve_result llama_context::sycl_publish_runtime_context()"
+_PUBLISH_SIGNATURE = "sched_reserve_result llama_context::sycl_publish_runtime_context(bool flash_attn)"
 
 
 def publish_body(raw: str = CONTEXT_CPP) -> str:
@@ -250,7 +250,7 @@ def test_throwing_form_delegates_to_the_publish():
     body = brace_body(code, at)
     assert body == z(
         "void llama_context::sycl_resync_runtime_context_flash_attn() { "
-        "const sched_reserve_result result = sycl_publish_runtime_context(); "
+        "const sched_reserve_result result = sycl_publish_runtime_context(cparams.flash_attn); "
         "if (result.status != sched_reserve_status::OK) { throw std::runtime_error(result.reason); } }"
     )
 

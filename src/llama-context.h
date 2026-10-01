@@ -145,6 +145,11 @@ struct llama_context {
     // non-OK status back into the exception its callers expect.
     sched_reserve_result sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state);
 
+    // What sched_reserve() and sched_reserve_nothrow() run: ALLOC on the member state for a
+    // context without a chunk-cap copy; for a planned one, MEASURE, then the publish of what
+    // the measure resolved, then ALLOC.
+    sched_reserve_result sched_reserve_transaction();
+
     // MEASURE: reserve every graph the context can reach (llama_measure_graph_set) on a
     // scheduler of its own, inside a MEASURE plan scope, and plan each compute buft's chunks
     // from what they left. `state` is a sched_measure_storage's; nothing of the context's own
@@ -408,9 +413,11 @@ private:
 
     // The same transaction as a status instead of an exception, never
     // retrying: every non-OK result is REFUSED (a BUSY is additionally a
-    // [CONTEXT-PLAN-BUG]). sycl_resync_runtime_context_flash_attn() is this
-    // call, throwing the reason of a non-OK result.
-    sched_reserve_result sycl_publish_runtime_context();
+    // [CONTEXT-PLAN-BUG]). It carries the flash-attention state the caller
+    // names, so a MEASURE's resolution is what a planned context publishes.
+    // sycl_resync_runtime_context_flash_attn() is this call over the
+    // context's own flash_attn, throwing the reason of a non-OK result.
+    sched_reserve_result sycl_publish_runtime_context(bool flash_attn);
 
     // llama.cpp-oyfl: a NARROW re-check of only the non-FA attention
     // scratch guard, called once from resolve_fused_ops()

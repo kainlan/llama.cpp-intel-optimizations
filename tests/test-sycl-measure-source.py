@@ -26,6 +26,10 @@ chunks from the layouts they left. This gate pins, on comment-stripped text:
   reserves size-only, reads the layout through the sched query, and plans
   through `llama_measure_chunk_plan` with `ggml_gallocr_max_chunks()`;
 - a failed scope read refuses before the chunk plan and before ALLOC's OK;
+- the reserve transaction: a planned context runs MEASURE, then publishes what
+  the measure resolved, then ALLOC, returns the first non-OK status, and the
+  resolved fused-op flags reach the context's cparams only after the publish
+  succeeded;
 - the training abort and the re-check guard.
 
 Every clause has a mutant that must fail it. Host-only; collected by pytest.
@@ -168,7 +172,7 @@ def test_measure_purity_mutants():
         ("a member cparams read", "const uint32_t n_seqs = state.cparams.n_seq_max;", "const uint32_t n_seqs = cparams.n_seq_max;"),
         ("the expected sizes written", "plan.graphs = graphs;", "backend_buf_exp_size[0] = 0; plan.graphs = graphs;"),
         ("the context synchronized", "const int64_t t_start_us = ggml_time_us();", "synchronize(); const int64_t t_start_us = ggml_time_us();"),
-        ("the context published", "const int64_t t_start_us = ggml_time_us();", "sycl_publish_runtime_context(); const int64_t t_start_us = ggml_time_us();"),
+        ("the context published", "const int64_t t_start_us = ggml_time_us();", "sycl_publish_runtime_context(false); const int64_t t_start_us = ggml_time_us();"),
         ("the context reserved", "const int64_t t_start_us = ggml_time_us();", "sched_reserve(); const int64_t t_start_us = ggml_time_us();"),
         ("the re-check called", "const int64_t t_start_us = ggml_time_us();", "sycl_recheck_runtime_context_flash_attn(); const int64_t t_start_us = ggml_time_us();"),
         ("need-reserve cleared", "plan.graphs = graphs;", "sched_need_reserve = false; plan.graphs = graphs;"),
@@ -471,3 +475,68 @@ def test_recheck_mutants():
         ("the guard inverted", "if (state.measure == nullptr) {", "if (state.measure != nullptr) {"),
     ]:
         assert not recheck_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
+
+
+# --- the reserve transaction ---------------------------------------------------
+
+_TXN = "sched_reserve_result llama_context::sched_reserve_transaction()"
+_FLAGS = [
+    "flash_attn", "auto_fa", "fused_gdn_ar", "fused_gdn_ch", "auto_fgdn", "fused_lid", "auto_flid",
+    "fused_dsv4_hc_pre", "fused_dsv4_hc_comb", "fused_dsv4_hc_post", "auto_fhc",
+]
+
+
+def txn_ok(code: str) -> bool:
+    b = function_body(code, _TXN)
+    steps = [
+        "if (plan_caps) {",
+        "sched_measure_storage storage(cparams);",
+        "sched_reserve_state measure_state = storage.state();",
+        "const sched_reserve_result measured = sched_reserve_impl(sched_reserve_mode::MEASURE, measure_state);",
+        "if (measured.status != sched_reserve_status::OK) { return measured; }",
+        "const sched_reserve_result published = sycl_publish_runtime_context(storage.cparams.flash_attn);",
+        "if (published.status != sched_reserve_status::OK) { return published; }",
+    ]
+    at = 0
+    for step in steps:
+        i = b.find(z(step), at)
+        if i == -1:
+            return False
+        at = i + len(z(step))
+    # the resolved flags are applied after the publish check, and all of them are
+    for flag in _FLAGS:
+        w = z(f"cparams.{flag} = storage.cparams.{flag};")
+        if b.count(w) != 1 or b.index(w) < b.index(z("if (published.status != sched_reserve_status::OK) { return published; }")):
+            return False
+    # ALLOC runs last, on the member state, for planned and unplanned contexts alike
+    alloc = z("sched_reserve_state state = member_reserve_state(); return sched_reserve_impl(sched_reserve_mode::ALLOC, state); }")
+    return b.endswith(alloc) and b.index(alloc) > b.index(z("storage.cparams.auto_fhc;"))
+
+
+def test_transaction_measures_publishes_then_allocates():
+    assert txn_ok(code_of(CONTEXT_CPP))
+
+
+def test_transaction_mutants():
+    code = code_of(CONTEXT_CPP)
+    b = function_body(code, _TXN)
+    mutants = [
+        ("measured status ignored", "if (measured.status != sched_reserve_status::OK) { return measured; }", ""),
+        ("published status ignored", "if (published.status != sched_reserve_status::OK) { return published; }", ""),
+        ("the publish carries the context's own flash_attn", "sycl_publish_runtime_context(storage.cparams.flash_attn)", "sycl_publish_runtime_context(cparams.flash_attn)"),
+        ("the measure runs as ALLOC", "sched_reserve_impl(sched_reserve_mode::MEASURE, measure_state)", "sched_reserve_impl(sched_reserve_mode::ALLOC, measure_state)"),
+        ("an unplanned context measures", "if (plan_caps) {", "if (true) {"),
+        ("the measure runs on the context's own cparams", "sched_measure_storage storage(cparams);", "sched_measure_storage storage(llama_cparams{});"),
+        ("a resolved flag dropped", "cparams.fused_lid = storage.cparams.fused_lid;", ""),
+        ("a resolved flag applied twice", "cparams.auto_fa = storage.cparams.auto_fa;", "cparams.auto_fa = storage.cparams.auto_fa; cparams.auto_fa = storage.cparams.auto_fa;"),
+    ]
+    for name, old, new in mutants:
+        assert not txn_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through the transaction gate"
+    # the flags applied before the publish is checked
+    first = z("cparams.flash_attn = storage.cparams.flash_attn;")
+    pub = z("const sched_reserve_result published = sycl_publish_runtime_context(storage.cparams.flash_attn);")
+    early = b.replace(first, "", 1).replace(pub, first + pub, 1)
+    assert not txn_ok(code.replace(b, early, 1)), "mutant 'flags applied before the publish' slipped through"
+    # ALLOC dropped from the transaction
+    no_alloc = b.replace(z("sched_reserve_state state = member_reserve_state(); return sched_reserve_impl(sched_reserve_mode::ALLOC, state); }"), "return {}; }", 1)
+    assert not txn_ok(code.replace(b, no_alloc, 1)), "mutant 'ALLOC dropped' slipped through"

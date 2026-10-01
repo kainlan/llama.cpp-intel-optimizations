@@ -1239,7 +1239,7 @@ llama_context::~llama_context() {
 //     the backend answers a non-ACTIVE module with PLAN_REJECTED instead.
 // sycl_resync_runtime_context_flash_attn() below is the throwing form for the
 // callers that still run before a reserve of their own.
-sched_reserve_result llama_context::sycl_publish_runtime_context() {
+sched_reserve_result llama_context::sycl_publish_runtime_context(bool flash_attn) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     for (auto & backend : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -1264,7 +1264,7 @@ sched_reserve_result llama_context::sycl_publish_runtime_context() {
             // cparams.swa_full likewise -- with it set llama_kv_cache_iswa
             // allocates SWA layers at full n_ctx and the planner must too.
             const auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                               cparams.kv_unified, cparams.swa_full, cparams.flash_attn);
+                                               cparams.kv_unified, cparams.swa_full, flash_attn);
             // Under the process-global replan scope (L0) the backend's module
             // guard is the single emission site for "the module is not
             // ACTIVE": it logs, aborts under strict and answers PLAN_REJECTED,
@@ -1291,7 +1291,7 @@ sched_reserve_result llama_context::sycl_publish_runtime_context() {
 // the narrow sycl_recheck_runtime_context_flash_attn() below instead, rather
 // than re-running this whole transaction for no reason.
 void llama_context::sycl_resync_runtime_context_flash_attn() {
-    const sched_reserve_result result = sycl_publish_runtime_context();
+    const sched_reserve_result result = sycl_publish_runtime_context(cparams.flash_attn);
     if (result.status != sched_reserve_status::OK) {
         throw std::runtime_error(result.reason);
     }
@@ -2134,8 +2134,7 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
-    sched_reserve_state        state  = member_reserve_state();
-    const sched_reserve_result result = sched_reserve_impl(sched_reserve_mode::ALLOC, state);
+    const sched_reserve_result result = sched_reserve_transaction();
     if (result.status != sched_reserve_status::OK) {
         throw std::runtime_error(result.reason);
     }
@@ -2149,8 +2148,7 @@ bool llama_context::sched_reserve_nothrow() {
     sched_need_reserve = false;
 
     try {
-        sched_reserve_state        state  = member_reserve_state();
-        const sched_reserve_result result = sched_reserve_impl(sched_reserve_mode::ALLOC, state);
+        const sched_reserve_result result = sched_reserve_transaction();
         if (result.status == sched_reserve_status::OK) {
             return true;
         }
@@ -2163,6 +2161,42 @@ bool llama_context::sched_reserve_nothrow() {
     // next decode or encode reserves again from the start.
     sched_need_reserve = true;
     return false;
+}
+
+// The reserve transaction. A planned context measures first, publishes what the measure
+// resolved, and only then allocates; any other context allocates, as it always has. The
+// measure's resolved fused-op flags reach the context's own cparams only after the publish
+// has succeeded, so a refused publish leaves the context as it found it.
+sched_reserve_result llama_context::sched_reserve_transaction() {
+    if (plan_caps) {
+        sched_measure_storage storage(cparams);
+        sched_reserve_state   measure_state = storage.state();
+
+        const sched_reserve_result measured = sched_reserve_impl(sched_reserve_mode::MEASURE, measure_state);
+        if (measured.status != sched_reserve_status::OK) {
+            return measured;
+        }
+
+        const sched_reserve_result published = sycl_publish_runtime_context(storage.cparams.flash_attn);
+        if (published.status != sched_reserve_status::OK) {
+            return published;
+        }
+
+        cparams.flash_attn         = storage.cparams.flash_attn;
+        cparams.auto_fa            = storage.cparams.auto_fa;
+        cparams.fused_gdn_ar       = storage.cparams.fused_gdn_ar;
+        cparams.fused_gdn_ch       = storage.cparams.fused_gdn_ch;
+        cparams.auto_fgdn          = storage.cparams.auto_fgdn;
+        cparams.fused_lid          = storage.cparams.fused_lid;
+        cparams.auto_flid          = storage.cparams.auto_flid;
+        cparams.fused_dsv4_hc_pre  = storage.cparams.fused_dsv4_hc_pre;
+        cparams.fused_dsv4_hc_comb = storage.cparams.fused_dsv4_hc_comb;
+        cparams.fused_dsv4_hc_post = storage.cparams.fused_dsv4_hc_post;
+        cparams.auto_fhc           = storage.cparams.auto_fhc;
+    }
+
+    sched_reserve_state state = member_reserve_state();
+    return sched_reserve_impl(sched_reserve_mode::ALLOC, state);
 }
 
 sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state) {

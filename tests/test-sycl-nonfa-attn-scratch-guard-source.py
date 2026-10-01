@@ -136,7 +136,12 @@ def test_llama_context_threads_real_flash_attn_state():
     # check's intent is "flash_attn is the real cparams field, passed all
     # the way to the call", not "these two arguments are adjacent".
     matches = re.findall(
-        r"runtime_context_fn\([^;]*?cparams\.n_seq_max,(?:\s*cparams\.\w+,)*\s*cparams\.flash_attn\)", ctx_norm
+        r"runtime_context_fn\([^;]*?cparams\.n_seq_max,(?:\s*cparams\.\w+,)*\s*flash_attn\)", ctx_norm
+    )
+    # the publish takes the resolved state as a parameter: the context's own cparams.flash_attn
+    # must reach it from the throwing form's call, never a literal
+    assert "sycl_publish_runtime_context(cparams.flash_attn)" in ctx_norm, (
+        "the throwing publish form must pass the context's own cparams.flash_attn"
     )
     assert len(matches) >= 1, (
         "expected a runtime_context_fn(...) call site in llama-context.cpp (the publish; it no longer "
