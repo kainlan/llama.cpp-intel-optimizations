@@ -20,7 +20,9 @@ loop and the final `cparams.pipeline_parallel = pipeline_parallel;` decision com
 before model.create_memory(. Anything that measures the compute buffers during
 construction needs the bufts and the final flag, and create_memory is the first
 thing that can allocate. The later clauses of gate 28 (the fixpoint call and the
-trial-decision arguments) arrive with the code they name.
+trial-decision arguments) arrive with the code they name. A dropped decision is
+caught by the count check (exactly one of each statement), the two moved
+create_memory mutants by the order checks.
 
 All three gates prove themselves on mutants of the real source (the gate must fail
 on each) and refuse to pass vacuously. Limits, deliberately: the walk is
@@ -156,14 +158,17 @@ def ctor_lines(text):
     if start is None:
         return None
     end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("}")), len(lines) - 1)
-    return lines[start:end + 1]
+    return start, lines[start:end + 1]
 
 
 def ctor_order_violations(text):
     """(violations, counts): enumeration and the pipeline-parallel decision precede create_memory."""
-    lines = ctor_lines(text)
-    if lines is None:
+    ctor = ctor_lines(text)
+    if ctor is None:
         return [(0, "llama_context constructor not found")], None
+    first, lines = ctor
+    # file line numbers: the slice's start plus its own offset, 1-based
+    at = lambda i: first + 1 + i
     pushes = [i for i, l in enumerate(lines) if BUFT_PUSH.search(l)]
     decisions = [i for i, l in enumerate(lines) if PP_DECISION.search(l)]
     creates = [i for i, l in enumerate(lines) if CREATE_MEMORY.search(l)]
@@ -174,11 +179,11 @@ def ctor_order_violations(text):
                        "model.create_memory in the constructor, found %d, %d and %d" % counts))
         return out, counts
     if pushes[0] > creates[0]:
-        out.append((creates[0], "model.create_memory runs before the backend_buft.push_back loop"))
+        out.append((at(creates[0]), "model.create_memory runs before the backend_buft.push_back loop"))
     if decisions[0] > creates[0]:
-        out.append((creates[0], "model.create_memory runs before cparams.pipeline_parallel is decided"))
+        out.append((at(creates[0]), "model.create_memory runs before cparams.pipeline_parallel is decided"))
     if decisions[0] < pushes[0]:
-        out.append((decisions[0], "pipeline_parallel is decided before the backends are enumerated"))
+        out.append((at(decisions[0]), "pipeline_parallel is decided before the backends are enumerated"))
     return out, counts
 
 
