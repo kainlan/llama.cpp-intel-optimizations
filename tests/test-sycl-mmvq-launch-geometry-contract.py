@@ -236,18 +236,14 @@ def evaluate(mmvq, header):
 # written after this fix -- which is every tree from here on.
 MUTANTS = {
     # Half one: the pre-99ke geometry, restored at a single site. One unpadded
-    # site out of eleven is exactly how this would regress.
+    # site out of eleven is exactly how this would regress. The anchor is the one
+    # line that carries the padded range, not the statements around it: the Q4_0
+    # reorder site grew a profiler wrapper (llama.cpp-0av5) between the range and
+    # its submit, and a mutant spelled as a multi-statement block broke with it.
     "no launch site still submits the raw row count": (
         "mmvq",
-        "const int padded_num_y = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);\n\n"
-        " const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);\n"
-        " const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);\n\n"
-        " stream->submit([&](sycl::handler & cgh) {\n"
-        " cgh.parallel_for<mmvq_reorder_kernel_name<GGML_TYPE_Q4_0>>(",
-        "\n const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);\n"
-        " const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);\n\n"
-        " stream->submit([&](sycl::handler & cgh) {\n"
-        " cgh.parallel_for<mmvq_reorder_kernel_name<GGML_TYPE_Q4_0>>("),
+        "global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE)",
+        "global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE)"),
     # Half two: the guard removed from the kernel eight of the eleven sites
     # share. Padding without it writes past the end of a row slice.
     "every kernel reached from a padded site rejects rows past nrows": (
@@ -266,10 +262,8 @@ MUTANTS = {
     # looking correct.
     "every launch site names the kernel it submits": (
         "mmvq",
-        " mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>(\n"
-        " vx, vy, dst, ncols, nrows, total_nrows, row_low, nd_item, fused_add, fused_add_ne0, fused_add_nb0,",
-        " some_other_kernel<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>(\n"
-        " vx, vy, dst, ncols, nrows, total_nrows, row_low, nd_item, fused_add, fused_add_ne0, fused_add_nb0,"),
+        "mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>(",
+        "some_other_kernel<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>("),
     "the geometry header includes no SYCL or backend header": (
         "header",
         "#pragma once",
