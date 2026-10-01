@@ -2251,6 +2251,14 @@ if (NOT WIN32)
         # ~570k-character ggml_sycl_mul_mat_id body once per mutant. 120 s made a green run a timeout failure.
         TIMEOUT 600
     )
+    # Registered by llama.cpp-qeld: it sat unregistered while its pins went stale. Host-only source scan.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-retained-prompt-fusion-central-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;moe;retained-route"
+        TIMEOUT 60
+    )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-canonical-aos-expert-handles-source.py
