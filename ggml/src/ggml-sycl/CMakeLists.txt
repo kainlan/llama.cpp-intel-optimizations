@@ -2719,6 +2719,39 @@ set_tests_properties(test-sycl-retained-reap PROPERTIES
     TIMEOUT 120
 )
 
+# Test: the two device-level arena accessors (ggml_sycl_arena_backing, the
+# lookup that creates; ggml_sycl_device_has_zones, the one that never does) and
+# the committed-side capacity accessors' non-VM bodies. The cache is a real
+# unified_cache on the OpenCL CPU device, registered through
+# unified_cache_register_for_queue(), so the selector is pinned to it: no GPU.
+add_executable(test-sycl-arena-accessors
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-arena-accessors.cpp
+)
+target_include_directories(test-sycl-arena-accessors PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-arena-accessors PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-arena-accessors PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-arena-accessors PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-arena-accessors PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-arena-accessors PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-arena-accessors COMMAND test-sycl-arena-accessors)
+set_tests_properties(test-sycl-arena-accessors PROPERTIES
+    LABELS "sycl;hostonly;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+    SKIP_RETURN_CODE 77
+)
+
 # Test: retain_handles_until_event() must route a handle by THIS thread's
 # recording state (llama.cpp-oze0).  Its guard was
 # ggml_sycl_graph_recording_active(), true whenever ANY thread records, while

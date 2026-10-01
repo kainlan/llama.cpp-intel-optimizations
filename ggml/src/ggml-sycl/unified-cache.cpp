@@ -773,6 +773,7 @@ static std::atomic<uint32_t> g_test_arena_drain_timeout_ms{ 5000 };
 static std::atomic<bool>     g_test_pause_zone_settle{ false };
 static std::atomic<bool>     g_test_zone_settle_reached{ false };
 static std::atomic<bool>     g_test_arena_destroy_closing_reached{ false };
+static std::atomic<unified_cache_test_destroy_observer> g_test_destroy_observer{ nullptr };
 static std::atomic<uint32_t> g_test_fail_control_allocations{ 0 };
 static std::atomic<bool>     g_test_pause_control_publication{ false };
 static std::atomic<bool>     g_test_control_publication_reached{ false };
@@ -5276,6 +5277,11 @@ bool unified_cache::shutdown_resources() {
     if (!arena_destroy()) {
         return false;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (auto * observer = g_test_destroy_observer.load(std::memory_order_acquire)) {
+        observer(ggml_sycl_get_device_id_from_queue(queue_), arena_backing(), zone_backed());
+    }
+#endif
     resources_shutdown_ = true;
     return true;
 }
@@ -14797,6 +14803,25 @@ unified_cache * get_unified_cache_for_device(int    device_id,
     return get_unified_cache_for_device_impl(device_id, &hint);
 }
 
+ggml_sycl_arena_backing_type ggml_sycl_arena_backing(int device) {
+    unified_cache * cache = get_unified_cache_for_device(device);
+    if (cache == nullptr) {
+        GGML_LOG_ERROR("[VM-PLAN-BUG] ggml_sycl_arena_backing read with no cache for device %d\n", device);
+        if (ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[VM-PLAN-BUG] ggml_sycl_arena_backing read with no cache for device %d", device);
+        }
+        return GGML_SYCL_ARENA_BACKING_TYPE_NONE;
+    }
+    return cache->arena_backing();
+}
+
+bool ggml_sycl_device_has_zones(int device) {
+    // Never creates: a device with no cache (before its lazy creation, during
+    // shutdown, after destruction) has no zones.
+    unified_cache * cache = get_existing_cache_for_device(device);
+    return cache != nullptr && cache->zone_backed();
+}
+
 void set_unified_cache_budget(size_t bytes) {
     std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
     if (g_cache_mode_locked) {
@@ -23657,6 +23682,33 @@ size_t unified_cache::zone_capacity(vram_zone_id zone) const {
     return arena_zones_[static_cast<int>(zone)].size;
 }
 
+size_t unified_cache::zone_capacity_committed(vram_zone_id zone) const {
+    if (arena_backing() != GGML_SYCL_ARENA_BACKING_TYPE_VM) {
+        const int device = ggml_sycl_get_device_id_from_queue(queue_);
+        GGML_LOG_ERROR("[VM-PLAN-BUG] zone_capacity_committed read on a non-VM device (device %d, zone %d)\n", device,
+                       static_cast<int>(zone));
+        if (ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[VM-PLAN-BUG] zone_capacity_committed read on a non-VM device (device %d, zone %d)", device,
+                       static_cast<int>(zone));
+        }
+    }
+    return zone_capacity(zone);
+}
+
+size_t unified_cache::zone_capacity_to_commit(vram_zone_id zone) const {
+    if (arena_backing() != GGML_SYCL_ARENA_BACKING_TYPE_VM) {
+        const int device = ggml_sycl_get_device_id_from_queue(queue_);
+        GGML_LOG_ERROR("[VM-PLAN-BUG] zone_capacity_to_commit read on a non-VM device (device %d, zone %d)\n", device,
+                       static_cast<int>(zone));
+        if (ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[VM-PLAN-BUG] zone_capacity_to_commit read on a non-VM device (device %d, zone %d)", device,
+                       static_cast<int>(zone));
+        }
+        return zone_capacity(zone);
+    }
+    GGML_ABORT("zone_capacity_to_commit: no VM backing exists to read a load's to-commit capacity from");
+}
+
 size_t unified_cache::zone_used(vram_zone_id zone) const {
     return arena_zones_[static_cast<int>(zone)].used.load(std::memory_order_relaxed);
 }
@@ -23843,6 +23895,14 @@ bool unified_cache_test_zone_settle_reached() {
 
 bool unified_cache_test_arena_destroy_closing_reached() {
     return g_test_arena_destroy_closing_reached.load(std::memory_order_acquire);
+}
+
+bool unified_cache_test_cache_exists(int device) {
+    return get_existing_cache_for_device(device) != nullptr;
+}
+
+void unified_cache_test_set_destroy_observer(unified_cache_test_destroy_observer observer) {
+    g_test_destroy_observer.store(observer, std::memory_order_release);
 }
 #endif
 
