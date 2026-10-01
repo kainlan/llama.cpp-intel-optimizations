@@ -86,7 +86,9 @@ def _blocks(count):
 
 def _contract(convert_source: str, support_source: str = SUPPORT_SOURCE) -> bool:
     try:
-        getter = _function(convert_source, "to_fp16_sycl_t ggml_get_to_fp16_sycl(")
+        # The (type, dst) entry point now only derives the operand's layout and delegates; the type switch lives
+        # in the layout-keyed getter, which is where the Q1_0/NVFP4 registrations are scored.
+        getter = _function(convert_source, "to_fp16_sycl_t ggml_get_to_fp16_sycl_for_layout(")
         kernel = _function(convert_source, "static void dequantize_block_nvfp4_fp16(")
         launch = _function(convert_source, "static void dequantize_row_nvfp4_fp16_sycl(")
         dense = _function(support_source, "static bool ggml_sycl_mul_mat_type_supported(")
