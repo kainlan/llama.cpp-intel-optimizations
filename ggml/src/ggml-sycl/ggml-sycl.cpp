@@ -343,6 +343,16 @@ static void pp_scratch_profile_end() {
 #include "ggml.h"
 #include "mem-handle.hpp"
 
+// L0, the re-plan transaction mutex (unified-cache.hpp): every public entry that can
+// publish the plan or prepare a live update constructs the token as its first
+// statement, before the module admission guard and before any ticket.
+using ggml_sycl::ggml_sycl_replan_kind;
+using ggml_sycl::GGML_SYCL_REPLAN_KIND_ANY;
+using ggml_sycl::GGML_SYCL_REPLAN_KIND_LIFECYCLE;
+using ggml_sycl::GGML_SYCL_REPLAN_KIND_LOAD;
+using ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION;
+using ggml_sycl::ggml_sycl_replan_token;
+using ggml_sycl::ggml_sycl_replan_token_held;
 using ggml_sycl::moe_gate_up_pair;
 using ggml_sycl::moe_layer_decode_artifact_plan;
 using ggml_sycl::moe_layer_decode_plan;
@@ -12286,6 +12296,7 @@ void ggml_backend_sycl_model_unloaded(uint32_t slot) {
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_model_token token) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     const auto                            owner = ggml_sycl_cpp_token(token);
@@ -12731,6 +12742,7 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
     sycl_module_mutation_guard module_guard;
     // A closed module is the same load-admission condition as the Registry's
     // shutdown gate, not the generic operation BUSY result.
@@ -13101,6 +13113,7 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn      txn,
                                                             bool                    explicit_success,
                                                             ggml_sycl_model_token * model) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     ggml_sycl::lifecycle::Registry *    registry = nullptr;
@@ -15231,6 +15244,7 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_session_finish_reset(
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(ggml_sycl_model_token model) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     try {
@@ -16780,6 +16794,7 @@ static std::atomic<bool> g_test_fail_next_stage_inventory_plan_late_after_first_
 ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
                                                                   const ggml_sycl_placement_envelope * envelope,
                                                                   bool                                 early) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     if (!inventory || (inventory->count > 0 && !inventory->tensors)) {
@@ -18720,6 +18735,7 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                            bool           kv_unified,
                                            bool           swa_full,
                                            bool           flash_attn_enabled) {
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_TRANSACTION);
     (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
                                                      flash_attn_enabled,
                                                      /*probe_mode=*/false, /*out=*/nullptr);
@@ -18749,6 +18765,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(ggm
                                                                              bool                  swa_full,
                                                                              bool                  flash_attn_enabled,
                                                                              ggml_sycl_runtime_context_probe * out) {
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     if (!out) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
@@ -18860,6 +18877,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                                                                            bool                  kv_unified,
                                                                            bool                  swa_full,
                                                                            bool                  flash_attn_enabled) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_TRANSACTION);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     if (!backend || !backend->context || n_ctx == 0) {
@@ -19039,6 +19057,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
 ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(ggml_backend_t        backend,
                                                                                 ggml_sycl_model_token model,
                                                                                 bool flash_attn_enabled) {
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     if (!backend || !backend->context) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
@@ -33799,6 +33818,10 @@ static void ggml_sycl_preload_model_weights() {
             // is silent stale-pointer corruption, not a crash.
             g_moe_prompt_admission_cache.clear();
             if (global_plan != nullptr) {
+                // The preload runs inside load_end's LOAD-kind token (it is not a
+                // public entry), so this republish is an L0-held load-path site.
+                GGML_SYCL_WITNESS(ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_LOAD),
+                                  "[REPLAN-TOKEN] preload without a LOAD token");
                 ggml_sycl_republish_current_plan();
             }
 
@@ -37602,6 +37625,12 @@ static const char * ggml_backend_sycl_buffer_type_get_name(ggml_backend_buffer_t
 
 static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                                                         size_t                     size) try {
+    // The shared invariant: no TRANSACTION token is held at gallocr ALLOC or at
+    // this function's host-pinned fallback. The planner's own carve is exempt from
+    // the pool phase gates only because it runs inside that token; an allocation
+    // reached from here is not planner work.
+    GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
+                      "[REPLAN-TOKEN] TRANSACTION token held at alloc_buffer entry");
     ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
     ggml_sycl_set_device(buft_ctx->device);
     const queue_ptr stream                = buft_ctx->stream;
@@ -37894,6 +37923,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
             // allocation-failure ERROR just past this block, a hard
             // failure, not a successful landing in host memory).
             GGML_LOG_WARN("SYCL: Alloc failed (%zu MB), retrying with host-pinned fallback\n", size / (1024 * 1024));
+            GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
+                              "[REPLAN-TOKEN] TRANSACTION token held at alloc_buffer host fallback");
             req.intent.constraints.must_device      = false;
             req.intent.constraints.must_host_pinned = true;
             if (ggml_sycl::unified_alloc(req, &main_alloc) && main_alloc.ptr != nullptr) {
@@ -107828,6 +107859,10 @@ static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl
 }
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    // Graph compute never runs under L0: a token held here would serialize every
+    // other thread's re-plan behind a decode. One load and one branch when the
+    // witness is off.
+    GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(), "[REPLAN-TOKEN] token held in graph compute");
     // llama.cpp-480a: segment the pinned-staging trace by graph so occupancy can
     // be read as "returns to baseline" vs "climbs". Bracketing both sides is what
     // makes that readable -- an entry sample alone cannot distinguish a graph that
@@ -109742,6 +109777,14 @@ static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
 };
 
 bool ggml_backend_sycl_can_unload(void) {
+    // It never blocks on L0: it closes module admission and waits for the module's
+    // in-flight mutations to drain, and a thread that holds L0 and a lifecycle
+    // lease can be the one calling it. Another thread's L0 hold is an answer:
+    // false at once, which ggml_backend_unload_checked reports as BUSY.
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE, std::try_to_lock);
+    if (!l0.owns()) {
+        return false;
+    }
     bool newly_closed = false;
     {
         std::unique_lock<std::mutex> lock(g_sycl_module_admission_mutex);
@@ -109807,6 +109850,7 @@ void ggml_backend_sycl_cancel_unload(void) {
 }
 
 void ggml_backend_sycl_complete_unload(void) {
+    ggml_sycl_replan_token      l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
     g_sycl_module_admission = sycl_module_admission_state::COMPLETE_CLOSED;
     ggml_sycl::lifecycle::global_registry().complete_shutdown();
@@ -109837,6 +109881,7 @@ bool ggml_backend_sycl_prepare_reactivate(void) {
 }
 
 void ggml_backend_sycl_commit_reactivate(void) {
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     ggml_sycl::lifecycle::global_registry().reactivate();
     ggml_sycl::prepare_unified_cache_for_module_use();
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
@@ -109863,6 +109908,7 @@ void ggml_backend_sycl_finalize_reactivate(void) {
 }
 
 void ggml_backend_sycl_rollback_reactivate(void) {
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     bool rollback_committed = false;
     {
         std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
@@ -110050,6 +110096,7 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
 }
 
 void ggml_backend_sycl_shutdown(void) {
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     {
         std::lock_guard<std::mutex> admission_lock(g_sycl_module_admission_mutex);
         g_sycl_module_shutdown_started = true;
