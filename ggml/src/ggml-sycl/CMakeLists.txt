@@ -426,6 +426,13 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-prestage-fail-closed-source.py
             --self-test)
     set_tests_properties(sycl-graph-prestage-fail-closed-source PROPERTIES LABELS "sycl;graph;host;source-contract")
+    # llama.cpp-qhfp: GET_ROWS runs Q4_K on the device through one shared support predicate, so qwen35's q4_K
+    # token_embd.weight no longer forces a CPU split whose host-memory output cannot be recorded. --self-test:
+    # the private-type-list and missing-arm checks are absence-based.
+    add_test(NAME sycl-get-rows-q4-k-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-get-rows-q4-k-source.py
+            --self-test)
+    set_tests_properties(sycl-get-rows-q4-k-source PROPERTIES LABELS "sycl;graph;host;source-contract")
     # --self-test likewise: eight of this gate's checks are absence-based, and
     # the construct they forbid -- max(planned, required), the general temporary
     # fallback, admission after the lock, a debug-gated refusal warning -- is
@@ -5344,6 +5351,23 @@ add_executable(test-graph-safe-memcpy-width
 target_include_directories(test-graph-safe-memcpy-width PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME graph-safe-memcpy-width COMMAND test-graph-safe-memcpy-width)
 set_tests_properties(graph-safe-memcpy-width PROPERTIES
+    LABELS "sycl;graph;host;tdd"
+    TIMEOUT 60
+)
+
+# Test: SYCL GET_ROWS Q4_K element decode against ggml's reference, plus the support predicate
+# (llama.cpp-qhfp). Host-only: get-rows-q4-k.hpp and get-rows-support.hpp include no SYCL header, so the
+# device kernel's decode function runs here unchanged. ggml-base supplies the reference quantiser.
+add_executable(test-get-rows-q4-k
+    tests/test-get-rows-q4-k.cpp
+)
+target_include_directories(test-get-rows-q4-k PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-get-rows-q4-k PRIVATE ggml-base)
+add_test(NAME get-rows-q4-k COMMAND test-get-rows-q4-k)
+set_tests_properties(get-rows-q4-k PROPERTIES
     LABELS "sycl;graph;host;tdd"
     TIMEOUT 60
 )

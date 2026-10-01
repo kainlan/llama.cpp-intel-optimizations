@@ -16,9 +16,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-#include "ggml.h"
 #include "get-rows-q4-k.hpp"
 #include "get-rows-support.hpp"
+#include "ggml.h"
 
 #include <cmath>
 #include <cstdint>
@@ -54,8 +54,8 @@ int main() {
     CHECK(ggml_blck_size(GGML_TYPE_Q4_K) == QK_K_ELEMS, "block_q4_K holds 256 elements");
 
     // A few rows of a token-embedding-shaped table: 5120 columns is 20 blocks, qwen35's width.
-    const int64_t n_cols = 5120;
-    const int64_t n_rows = 7;
+    const int64_t      n_cols = 5120;
+    const int64_t      n_rows = 7;
     std::vector<float> src(static_cast<size_t>(n_cols * n_rows));
     uint32_t           state = 12345u;
     for (auto & v : src) {
@@ -63,9 +63,9 @@ int main() {
         v     = (static_cast<float>(state >> 8) / static_cast<float>(1 << 24) - 0.5f) * 0.1f;
     }
 
-    const size_t       row_bytes = ggml_row_size(GGML_TYPE_Q4_K, n_cols);
+    const size_t         row_bytes = ggml_row_size(GGML_TYPE_Q4_K, n_cols);
     std::vector<uint8_t> quant(row_bytes * static_cast<size_t>(n_rows));
-    const size_t       written = ggml_quantize_chunk(GGML_TYPE_Q4_K, src.data(), quant.data(), 0, n_rows, n_cols, nullptr);
+    const size_t written = ggml_quantize_chunk(GGML_TYPE_Q4_K, src.data(), quant.data(), 0, n_rows, n_cols, nullptr);
     CHECK(written == quant.size(), "quantiser wrote every row");
 
     const ggml_type_traits * traits = ggml_get_type_traits(GGML_TYPE_Q4_K);
@@ -77,9 +77,9 @@ int main() {
         traits->to_float(row, ref.data(), n_cols);
         for (int64_t i = 0; i < n_cols; ++i) {
             const uint8_t * block = row + static_cast<size_t>(i / QK_K_ELEMS) * Q4_K_BLOCK_BYTES;
-            const float     got   = ggml_sycl_get_rows_q4_k_elem(half_at(block + Q4_K_OFF_D), half_at(block + Q4_K_OFF_DMIN),
-                                                                 block + Q4_K_OFF_SCALES, block + Q4_K_OFF_QS,
-                                                                 static_cast<int>(i % QK_K_ELEMS));
+            const float got = ggml_sycl_get_rows_q4_k_elem(half_at(block + Q4_K_OFF_D), half_at(block + Q4_K_OFF_DMIN),
+                                                           block + Q4_K_OFF_SCALES, block + Q4_K_OFF_QS,
+                                                           static_cast<int>(i % QK_K_ELEMS));
             // ggml's reference is d1 * q - m1 in float; the shared function does the same arithmetic.
             const float tol = 1e-6f * std::fmax(1.0f, std::fabs(ref[static_cast<size_t>(i)]));
             if (!(std::fabs(got - ref[static_cast<size_t>(i)]) <= tol)) {

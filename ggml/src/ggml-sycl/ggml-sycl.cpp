@@ -109446,21 +109446,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             // OUT_PROD shows NaNs on SYCL for some shapes; disable until fixed.
             return false;
         case GGML_OP_GET_ROWS:
-            {
-                switch (op->src[0]->type) {
-                    case GGML_TYPE_F16:
-                    case GGML_TYPE_F32:
-                    case GGML_TYPE_Q4_0:
-                    case GGML_TYPE_Q4_1:
-                    case GGML_TYPE_Q5_0:
-                    case GGML_TYPE_Q5_1:
-                    case GGML_TYPE_Q8_0:
-                    case GGML_TYPE_Q6_K:
-                        return true;
-                    default:
-                        return false;
-                }
-            }
+            // One predicate (get-rows-support.hpp) for the types ggml_sycl_op_get_rows computes. A type declined
+            // here runs in a CPU split whose output a SYCL op reads out of pinned host memory, and a graph with
+            // that read cannot be recorded (llama.cpp-qhfp: qwen35's q4_K token_embd.weight).
+            return ggml_sycl_get_rows_type_supported(op->src[0]->type);
         case GGML_OP_SET:
             return (op->type == GGML_TYPE_F32) && (op->src[0] && op->src[1]) && (op->src[0]->type == GGML_TYPE_F32) &&
                    (op->src[1]->type == GGML_TYPE_F32);
