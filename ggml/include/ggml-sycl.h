@@ -476,6 +476,14 @@ GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backe
 // out-of-range device.
 GGML_BACKEND_API uint64_t ggml_backend_sycl_compute_buffer_host_fallbacks(int device);
 
+// llama.cpp-kpjw: whether `backend`'s context still fits the card after the compute buffers the planned dense
+// scratch's hold kept out of the RUNTIME zone have spilled outside the arena: false only when THAT spill pushed the
+// device under the driver headroom the arena expects outside itself (a rung that would exhaust the card at its first
+// graph). True when the hold spilled nothing, for a null/foreign backend, and on a card that was short anyway. The
+// auto-ubatch trial (llama_context::sycl_select_auto_ubatch) calls it after a candidate's sched_reserve() returned,
+// when every buffer of the rung exists. Reads state and the live free memory; changes nothing.
+GGML_BACKEND_API bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend);
+
 // llama.cpp-nphx: whether the SYCL auto micro-batch selection trial
 // (llama_context::sycl_select_auto_ubatch(), llama.cpp-xojq Task 4b) is
 // enabled -- GGML_SYCL_AUTO_UBATCH, default ON.

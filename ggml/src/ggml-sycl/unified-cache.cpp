@@ -740,6 +740,11 @@ struct planned_scratch_hold_state {
     size_t     spill_bytes = 0;
     uint64_t   spill_owner = 0;  // the hold's owner when the first spill since the last take was noted
     size_t     request_hwm = 0;
+    // The n_ubatch the current epoch's plan was published at (0 before the first publish), and the n_ubatch the
+    // largest request was observed under. Requests before the first publish are load-time ones, not compute-buffer
+    // requests of a rung, and are not recorded.
+    uint32_t   epoch_n_ubatch       = 0;
+    uint32_t   request_hwm_n_ubatch = 0;
     // The same two quantities since the owner's last publish (unified_cache_begin_planned_hold_epoch): what the
     // current rung's own reserve spilled, and the largest request it made. A losing rung's figures must not
     // decide the next rung, so these restart at every publish; spill_count/spill_bytes above feed teardown stats.
@@ -1895,6 +1900,15 @@ void unified_cache_set_planned_scratch_hold(int device_id, size_t bytes, uint64_
     }
     planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
     std::lock_guard<std::mutex>  lock(state.mutex);
+    // A different owner takes the hold over (the unsupported two-context case, or a first publish): it starts with its
+    // own spill counts, so a context is never reported another context's spills.
+    if (owner != 0 && state.owner != owner) {
+        state.spill_count  = 0;
+        state.spill_bytes  = 0;
+        state.spill_owner  = 0;
+        state.recent_count = 0;
+        state.recent_bytes = 0;
+    }
     state.hold  = bytes;
     state.owner = owner;
 }
@@ -1941,27 +1955,46 @@ bool unified_cache_release_planned_scratch_hold(int device_id, uint64_t owner) {
     state.hold        = 0;
     state.owner       = 0;
     state.request_hwm = 0;  // the largest request seen belongs to the context that is going away
+    state.request_hwm_n_ubatch = 0;
+    state.epoch_n_ubatch       = 0;
     state.recent_count = 0;
     state.recent_bytes = 0;
     return true;
 }
 
-void unified_cache_note_runtime_request(int device_id, size_t bytes) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return;
-    }
-    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
-    std::lock_guard<std::mutex>  lock(state.mutex);
-    state.request_hwm = std::max(state.request_hwm, bytes);
-}
-
-size_t unified_cache_get_runtime_request_hwm(int device_id) {
+size_t unified_cache_note_runtime_request(int device_id, size_t bytes, bool record) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return 0;
     }
     planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
     std::lock_guard<std::mutex>  lock(state.mutex);
-    return state.request_hwm;
+    // Only a rung's own requests (from the first publish on) are recorded, with the n_ubatch they were made under;
+    // a larger request replaces the mark, an equal one under another n_ubatch does not.
+    if (record && state.epoch_n_ubatch != 0 && bytes > state.request_hwm) {
+        state.request_hwm          = bytes;
+        state.request_hwm_n_ubatch = state.epoch_n_ubatch;
+    }
+    return state.hold;
+}
+
+void unified_cache_get_runtime_request_hwm(int device_id, size_t * bytes, uint32_t * n_ubatch) {
+    if (bytes) {
+        *bytes = 0;
+    }
+    if (n_ubatch) {
+        *n_ubatch = 0;
+    }
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    if (bytes) {
+        *bytes = state.request_hwm;
+    }
+    if (n_ubatch) {
+        *n_ubatch = state.request_hwm_n_ubatch;
+    }
 }
 
 void unified_cache_note_planned_hold_spill(int          device_id,
@@ -1996,7 +2029,7 @@ void unified_cache_note_planned_hold_spill(int          device_id,
     }
 }
 
-void unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner) {
+void unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner, uint32_t n_ubatch) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
         return;
     }
@@ -2005,9 +2038,11 @@ void unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner) {
     if (state.owner != owner) {
         return;
     }
-    state.request_hwm  = 0;
-    state.recent_count = 0;
-    state.recent_bytes = 0;
+    state.request_hwm          = 0;
+    state.request_hwm_n_ubatch = 0;
+    state.epoch_n_ubatch       = n_ubatch;
+    state.recent_count         = 0;
+    state.recent_bytes         = 0;
 }
 
 void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, uint64_t * count, size_t * bytes) {
@@ -15742,20 +15777,20 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // scratch), the claimant the hold exists for, and is never held back. Decided before the overcommit guard
     // below, so that guard can refuse a spill the hold caused instead of evicting cached weights to make room
     // for it.
-    bool hold_spill = false;
+    bool   hold_spill       = false;
+    size_t hold_at_decision = 0;
     {
         const vram_zone_id zid = req.intent.constraints.prefer_vram_zone;
         if (tier == alloc_tier::DEVICE_VRAM && zid == vram_zone_id::RUNTIME && vram_arena_enabled()) {
-            if (!req.intent.constraints.forbid_vram_zone_spill) {
-                // The largest spill-capable request is what the worst-case outside-arena bound adds to the hold.
-                unified_cache_note_runtime_request(req.device, alloc_size);
-            }
+            // One take of the hold state per request: it records the largest spill-capable request (what the
+            // worst-case outside-arena bound adds to the hold) and returns the hold the decision below uses.
+            hold_at_decision  = unified_cache_note_runtime_request(req.device, alloc_size,
+                                                                   !req.intent.constraints.forbid_vram_zone_spill);
             auto * hold_cache = get_unified_cache_for_device(req.device);
             hold_spill        = hold_cache && hold_cache->arena_active() &&
                          zone_runtime_alloc_held_back(zid == vram_zone_id::RUNTIME,
                                                       req.intent.constraints.forbid_vram_zone_spill,
-                                                      hold_cache->zone_available(zid),
-                                                      unified_cache_get_planned_scratch_hold(req.device), alloc_size);
+                                                      hold_cache->zone_available(zid), hold_at_decision, alloc_size);
         }
     }
     if (tier == alloc_tier::DEVICE_VRAM) {
@@ -15835,8 +15870,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                                             &exact_arena, arena_runtime_registry_commit, &arena_publication);
                 } else {
                     unified_cache_note_planned_hold_spill(req.device, req.intent.cohort_id, alloc_size,
-                                                          unified_cache_get_planned_scratch_hold(req.device),
-                                                          cache->zone_available(zid));
+                                                          hold_at_decision, cache->zone_available(zid));
                 }
                 if (!ptr && arena_publication.attempted) return false;
                 if (ptr) {

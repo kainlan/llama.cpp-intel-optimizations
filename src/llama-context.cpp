@@ -355,6 +355,13 @@ static decltype(&ggml_backend_sycl_compute_buffer_host_fallbacks) llama_context_
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_compute_buffer_host_fallbacks"));
 }
 
+// llama.cpp-kpjw: the per-rung hold-spill check (see ggml_backend_sycl_planned_hold_spill_fits in ggml-sycl.h). A SYCL
+// DSO that predates it exports nothing; the trial then skips the check, never dereferences a null.
+static decltype(&ggml_backend_sycl_planned_hold_spill_fits) llama_context_sycl_hold_spill_proc(ggml_backend_dev_t dev) {
+    return reinterpret_cast<decltype(&ggml_backend_sycl_planned_hold_spill_fits)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_planned_hold_spill_fits"));
+}
+
 static decltype(&ggml_backend_sycl_auto_ubatch_enabled) llama_context_sycl_auto_ubatch_enabled_proc(
     ggml_backend_dev_t dev) {
     return reinterpret_cast<decltype(&ggml_backend_sycl_auto_ubatch_enabled)>(
@@ -1433,14 +1440,18 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 // it. The second, `[SYCL-PLAN] tuning cache store failed: %s`, is emitted
 // only when the cache store below actually runs and returns false --
 // not on every start. The third (the pre-existing one) is
-// `[SYCL-PLAN] auto n_ubatch=...`, with one of these nine stop reasons:
+// `[SYCL-PLAN] auto n_ubatch=...`, with one of these ten stop reasons:
 // "ladder exhausted" (no candidate lost -- either the cap stopped the ladder or
 // all four rungs were accepted), "MoE GPU routing ceiling" (the MoE cap bound,
 // whether it narrowed a larger batch/ctx cap or merely matched it),
 // "transaction refused", "transaction busy" (BUSY persisted past the backoff),
 // "not the published model" (GGML_SYCL_LIFECYCLE_STALE_IDENTITY -- a second
 // model published after this one loaded), "KV would be demoted", "compute
-// buffer fell back to host", "compute buffers did not fit" (the in-loop
+// buffer fell back to host", "hold spill left no headroom" (the rung's own
+// compute buffers were kept out of the RUNTIME zone by the planned dense
+// scratch's hold, spilled, and left a card under the driver headroom; checked
+// after sched_reserve() returns, because only then do the buffers exist),
+// "compute buffers did not fit" (the in-loop
 // candidate's own sched_reserve() threw -- e.g. its host-pinned retry inside
 // graph_reserve() also failed -- caught like the candidate publish;
 // non-terminal, so a later start can still resume the ladder above the cached
@@ -1471,13 +1482,15 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     }
 
 #    ifdef GGML_USE_SYCL
-    auto probe_fn    = &ggml_backend_sycl_probe_runtime_context_for_model;
-    auto fallback_fn = &ggml_backend_sycl_compute_buffer_host_fallbacks;
+    auto probe_fn      = &ggml_backend_sycl_probe_runtime_context_for_model;
+    auto fallback_fn   = &ggml_backend_sycl_compute_buffer_host_fallbacks;
+    auto hold_spill_fn = &ggml_backend_sycl_planned_hold_spill_fits;
 #    else
     ggml_backend_dev_t first_dev   = ggml_backend_get_device(sycl_backends.front().backend);
     auto               probe_fn    = llama_context_sycl_probe_proc(first_dev);
     auto               fallback_fn = llama_context_sycl_fallbacks_proc(first_dev);
     auto               moe_cap_fn  = llama_context_sycl_moe_gpu_ubatch_max_proc(first_dev);
+    auto               hold_spill_fn = llama_context_sycl_hold_spill_proc(first_dev);
     if (!probe_fn || !fallback_fn) {
         // A SYCL DSO too old to export the trial's own entry points --
         // ggml_backend_sycl_auto_ubatch_enabled() should already have kept
@@ -1697,6 +1710,19 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
                 cparams.pipeline_parallel = pipeline_parallel_before_reserve;
                 sched_matches_last_good   = false;
                 return "compute buffer fell back to host";
+            }
+        }
+        // llama.cpp-kpjw: every buffer of this rung exists now, so the compute buffers the planned dense scratch's
+        // hold kept out of the RUNTIME zone are known exactly. A rung whose spill pushed a card under the driver
+        // headroom the arena expects outside itself would exhaust it at its first graph (B50, Qwen PPL at
+        // auto-ub1024): it loses here, for every rung, every flash-attention mode and the cached rung, and the
+        // ladder lands lower. The recheck inside sched_reserve() cannot do this: it runs after a 1-token probe
+        // reserve, before the worst-case reserves, and only for the first rung under auto_fa.
+        for (auto & sb : sycl_backends) {
+            if (hold_spill_fn && !hold_spill_fn(sb.backend)) {
+                cparams.pipeline_parallel = pipeline_parallel_before_reserve;
+                sched_matches_last_good   = false;
+                return "hold spill left no headroom";
             }
         }
         return nullptr;

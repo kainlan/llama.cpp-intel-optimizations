@@ -902,17 +902,22 @@ def test_pipeline_parallel_is_restored_on_every_losing_path_after_the_reserve():
         m.start()
         for m in re.finditer(r"cparams\.pipeline_parallel\s*=\s*pipeline_parallel_before_reserve\s*;", body_norm)
     ]
-    assert len(restores) == 2, (
-        f"expected exactly 2 restores of cparams.pipeline_parallel (reserve-throws and host-fallback paths) -- "
-        f"found {len(restores)}"
+    assert len(restores) == 3, (
+        f"expected exactly 3 restores of cparams.pipeline_parallel (reserve-throws, host-fallback and "
+        f"hold-spill paths) -- found {len(restores)}"
     )
     assert all(idx > reserve_idx for idx in restores), (
-        "both restores must appear after the in-loop sched_reserve() call"
+        "all restores must appear after the in-loop sched_reserve() call"
     )
     fallback_return_idx = body_norm.find('return "compute buffer fell back to host";')
     assert fallback_return_idx != -1
     assert restores[1] < fallback_return_idx, (
         "the host-fallback loss must restore cparams.pipeline_parallel before returning its reason"
+    )
+    hold_spill_return_idx = body_norm.find('return "hold spill left no headroom";')
+    assert hold_spill_return_idx != -1
+    assert restores[1] < restores[2] < hold_spill_return_idx, (
+        "the hold-spill loss (llama.cpp-kpjw) must restore cparams.pipeline_parallel before returning its reason"
     )
 
 
@@ -948,7 +953,7 @@ def test_pipeline_parallel_restore_has_a_mutation_witness():
     restores = re.findall(
         r"cparams\.pipeline_parallel\s*=\s*pipeline_parallel_before_reserve\s*;", mutated_body_norm
     )
-    assert len(restores) != 2, (
+    assert len(restores) != 3, (
         "mutation witness is broken: deleting the host-fallback restore should make the restore-count check fail"
     )
 
@@ -1241,8 +1246,8 @@ def test_exactly_one_sycl_plan_auto_warn_in_the_body():
     )
 
 
-def test_all_nine_stop_reasons_are_present():
-    """The trial's stop-reason vocabulary must be EXACTLY the nine strings
+def test_all_ten_stop_reasons_are_present():
+    """The trial's stop-reason vocabulary must be EXACTLY the ten strings
     the task spec names -- the original seven (llama.cpp-xojq Task 4b),
     "cached" (llama.cpp-7n6n, Task 5: a persisted-cache hit that
     revalidates cleanly skips the ladder with this stop reason), and
@@ -1258,7 +1263,7 @@ def test_all_nine_stop_reasons_are_present():
     drawn from and must match this one set, with none missing and none
     extra."""
     body_norm = _normalize_ws(_trial_body())
-    nine = {
+    ten = {
         "ladder exhausted",
         "MoE GPU routing ceiling",
         "transaction refused",
@@ -1266,10 +1271,11 @@ def test_all_nine_stop_reasons_are_present():
         "not the published model",
         "KV would be demoted",
         "compute buffer fell back to host",
+        "hold spill left no headroom",
         "compute buffers did not fit",
         "cached",
     }
-    for reason in nine:
+    for reason in ten:
         assert f'"{reason}"' in body_norm, f"missing stop reason literal: {reason!r}"
 
     # Presence alone (the loop above) would pass even if a tenth string had
@@ -1278,7 +1284,7 @@ def test_all_nine_stop_reasons_are_present():
     found = set(re.findall(r'stop\s*=\s*"([^"]*)"', body_norm)) | set(
         re.findall(r'return\s*"([^"]*)"\s*;', body_norm)
     )
-    assert found == nine, f"stop-reason literal set does not match exactly -- found {found}"
+    assert found == ten, f"stop-reason literal set does not match exactly -- found {found}"
 
 
 # ---------------------------------------------------------------------------

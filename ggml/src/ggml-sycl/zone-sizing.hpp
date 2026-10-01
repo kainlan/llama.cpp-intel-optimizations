@@ -308,12 +308,22 @@ bool zone_runtime_alloc_held_back(bool   runtime_zone,
                                   size_t hold,
                                   size_t alloc_size);
 
-// Whether a rung still fits after the compute buffers the hold kept out of the RUNTIME zone have landed outside the
-// arena: with no such spill the question is not asked (true); with one, the card must still have the driver headroom
-// the arena expects outside itself (live_free >= headroom_target). The plan is the reality only if the rung's own
-// spills are counted in its fit, so the ladder lands on a rung that runs instead of one that exhausts the card at
-// the first graph (B50, Qwen PPL at auto-ub1024: 461 MB spilled, 107.8 MB left against 256 MB).
-bool zone_hold_spill_realized_fits(size_t live_free, size_t headroom_target, size_t spill_bytes);
+// Whether a rung still fits once the compute buffers the hold kept out of the RUNTIME zone are outside the arena.
+// `free_after` is the card's free memory with those spills in place (the live reading after the rung's reserve, or
+// the prediction `free_before - spill`). The hold is blamed only when ITS spill is what pushed the card under the
+// driver headroom the arena expects outside itself: free_after < headroom_target while free_after + spill_bytes
+// >= headroom_target. A card that was already short without the spill (a full B70 with KB-scale spills) is not
+// the hold's doing, and a rung with no hold-induced spill is never refused. The ladder then lands on a rung that
+// runs instead of one that exhausts the card at its first graph (B50, Qwen PPL at auto-ub1024: a 461 MB spill left
+// 107.8 MB against 256 MB, and flash attention ran out of resources).
+bool zone_hold_spill_realized_fits(size_t free_after, size_t headroom_target, size_t spill_bytes);
+
+// The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the
+// hold can be) plus the largest spill-capable RUNTIME request, because a held-back request spills whole. The
+// request was observed at `hwm_n_ubatch`; compute buffers scale about linearly with n_ubatch, so it is scaled to
+// the candidate (up or down) when both are known. No plan means no hold and the bound is 0. Saturating. The
+// request term is a heuristic (it is what a previous rung asked), a lower bound before any rung has reserved.
+size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_ubatch, uint32_t n_ubatch);
 
 // Whether a multi-row MUL_MAT draws a given planned scratch (the Q8_1 src1 buffer, the f16 dequant buffers),
 // from the two answers the dispatch can give. `primary_*` is the router's first decision; when it picks the

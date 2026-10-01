@@ -379,8 +379,28 @@ bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size
     return hold <= available && size <= available - hold;
 }
 
-bool zone_hold_spill_realized_fits(size_t live_free, size_t headroom_target, size_t spill_bytes) {
-    return spill_bytes == 0 || live_free >= headroom_target;
+bool zone_hold_spill_realized_fits(size_t free_after, size_t headroom_target, size_t spill_bytes) {
+    if (spill_bytes == 0 || free_after >= headroom_target) {
+        return true;
+    }
+    const size_t free_before = spill_bytes > SIZE_MAX - free_after ? SIZE_MAX : free_after + spill_bytes;
+    return free_before < headroom_target;  // short without the spill too: not the hold's doing
+}
+
+size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_ubatch, uint32_t n_ubatch) {
+    if (plan == 0) {
+        return 0;
+    }
+    size_t request = request_hwm;
+    if (hwm_n_ubatch != 0 && n_ubatch != 0 && hwm_n_ubatch != n_ubatch && request_hwm != 0) {
+        if (request_hwm > SIZE_MAX / n_ubatch) {
+            request = SIZE_MAX;
+        } else {
+            const size_t product = request_hwm * n_ubatch;
+            request = product > SIZE_MAX - (hwm_n_ubatch - 1) ? SIZE_MAX : (product + hwm_n_ubatch - 1) / hwm_n_ubatch;
+        }
+    }
+    return request > SIZE_MAX - plan ? SIZE_MAX : plan + request;
 }
 
 bool zone_runtime_alloc_held_back(bool   runtime_zone,

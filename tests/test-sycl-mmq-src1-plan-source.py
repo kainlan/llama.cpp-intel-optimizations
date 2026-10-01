@@ -393,14 +393,16 @@ def evaluate(backend, common, cache, zone):
     # D1: planned but not RESERVED. A spill-capable RUNTIME request (a compute buffer) must leave the planned
     # bytes alone; the planned consumers themselves forbid the spill and are the claimants.
     results["a RUNTIME zone request asks the pure held-back predicate"] = \
-        "zone_runtime_alloc_held_back(" in unified_alloc_fn and "unified_cache_get_planned_scratch_hold(" in unified_alloc_fn
+        "zone_runtime_alloc_held_back(" in unified_alloc_fn and "unified_cache_note_runtime_request(" in unified_alloc_fn
     # Argument order is the contract (runtime zone, forbid-spill, zone free bytes, hold, request size) and the hold is
     # read for THIS request's device. A swapped pair compiles and answers a different question.
-    results["the held-back predicate gets (runtime zone, forbid-spill, free, hold, size) for this device"] = \
+    results["the held-back predicate gets (runtime zone, forbid-spill, free, hold, size) for this device"] = (
         re.search(r"zone_runtime_alloc_held_back\(\s*zid\s*==\s*vram_zone_id::RUNTIME\s*,\s*"
                   r"req\.intent\.constraints\.forbid_vram_zone_spill\s*,\s*[\w>.-]*zone_available\(\s*zid\s*\)\s*,\s*"
-                  r"unified_cache_get_planned_scratch_hold\(\s*req\.device\s*\)\s*,\s*alloc_size\s*\)",
-                  unified_alloc_fn) is not None
+                  r"hold_at_decision\s*,\s*alloc_size\s*\)",
+                  unified_alloc_fn) is not None and
+        re.search(r"hold_at_decision\s*=\s*unified_cache_note_runtime_request\(\s*req\.device\s*,\s*alloc_size",
+                  unified_alloc_fn) is not None)
     results["the hold binds only spill-capable requests, never a forbid-spill claimant"] = \
         re.search(r"zone_runtime_alloc_held_back\([^;]*forbid_vram_zone_spill", unified_alloc_fn) is not None
     results["the hold is derived from the pure helper over the planned buffers"] = \
@@ -894,12 +896,12 @@ if args.self_test:
                                           "req.intent.constraints.forbid_vram_zone_spill,", "false,"), zone)),
         ("hold arguments swapped", "the held-back predicate gets (runtime zone, forbid-spill, free, hold, size) for this device",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
-                                          "unified_cache_get_planned_scratch_hold(req.device), alloc_size)",
-                                          "alloc_size, unified_cache_get_planned_scratch_hold(req.device))"), zone)),
+                                          "hold_at_decision, alloc_size)",
+                                          "alloc_size, hold_at_decision)"), zone)),
         ("hold read for the wrong device", "the held-back predicate gets (runtime zone, forbid-spill, free, hold, size) for this device",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
-                                          "unified_cache_get_planned_scratch_hold(req.device), alloc_size)",
-                                          "unified_cache_get_planned_scratch_hold(0), alloc_size)"), zone)),
+                                          "unified_cache_note_runtime_request(req.device, alloc_size",
+                                          "unified_cache_note_runtime_request(0, alloc_size"), zone)),
         ("hold from the shortfall", "the hold is derived from the pure helper over the planned buffers",
          (mutate_in_func(backend, r"static void ggml_sycl_planned_scratch_hold_refresh\(",
                          "zone_planned_scratch_hold_bytes(", "zone_planned_XXXX("), common, cache, zone)),
@@ -1089,9 +1091,12 @@ if args.self_test:
         ("guard refuses every spill", "the overcommit guard refuses only a hold-induced spill",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
                                           "if (hold_spill) {", "if (true) {"), zone)),
-        ("realized check not run in the recheck", "the recheck inside the rung's reserve runs the realized check for this context",
+        ("realized check moved back into the recheck",
+         "the recheck no longer claims the realized spill (it runs before the rung's worst-case reserves)",
          (mutate_in_func(backend, r"ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn\(",
-                         "ggml_sycl_check_hold_spill_realized(", "ggml_sycl_XXXX("), common, cache, zone)),
+                         "const auto current = ggml_sycl_global_plan_snapshot();",
+                         "ggml_sycl_check_hold_spill_realized(0, 0, false); const auto current = ggml_sycl_global_plan_snapshot();"),
+          common, cache, zone)),
         ("realized check ignores the pure rule", "the realized check asks the pure rule, the live free memory and the spills since this publish",
          (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_realized\(",
                          "zone_hold_spill_realized_fits(", "zone_XXXX("), common, cache, zone)),
@@ -1104,10 +1109,10 @@ if args.self_test:
                          "unified_cache_begin_planned_hold_epoch(", "unified_cache_XXXX("), common, cache, zone)),
         ("epoch keeps the request mark", "a publish starts a new spill epoch (a losing rung's spills and mark do not carry to the next rung)",
          (backend, common, mutate_in_func(cache, r"void unified_cache_begin_planned_hold_epoch\(",
-                                          "state.request_hwm  = 0;", "state.request_hwm  += 0;"), zone)),
+                                          "state.request_hwm          = 0;", "state.request_hwm          += 0;"), zone)),
         ("epoch keeps the spilled bytes", "a publish starts a new spill epoch (a losing rung's spills and mark do not carry to the next rung)",
          (backend, common, mutate_in_func(cache, r"void unified_cache_begin_planned_hold_epoch\(",
-                                          "state.recent_bytes = 0;", "state.recent_bytes += 0;"), zone)),
+                                          "state.recent_bytes         = 0;", "state.recent_bytes         += 0;"), zone)),
         ("graph-entry check keeps its own 256", "the driver headroom the realized check uses is the graph-entry check's constant (one source)",
          (mutate_in_func(backend, r"static void ggml_sycl_check_graph_scratch_headroom\(",
                          "= kSyclArenaMinExternalHeadroomBytes;", "= 256ull * 1024ull * 1024ull;"), common, cache, zone)),
@@ -1116,9 +1121,51 @@ if args.self_test:
                                                          "g_planned_dense_scratch_invalid", "g_planned_XXXX"),
                                           r"bool unified_cache_replan_planned_dense_scratch\(",
                                           "g_planned_dense_scratch_invalid", "g_planned_XXXX"), zone)),
+
+        # r3 backend-side mutants
+        ("entry not registered for backend-DL", "the exported entry is registered for a backend-DL build",
+         (mutate(backend, 'strcmp(name, "ggml_backend_sycl_planned_hold_spill_fits")',
+                 'strcmp(name, "ggml_backend_sycl_XXXX")'), common, cache, zone)),
+        ("entry checks another owner", "the exported entry asks the realized check for this backend's context and owner",
+         (mutate_in_func(backend, r"bool ggml_backend_sycl_planned_hold_spill_fits\(", "planned_scratch_owner", "planned_XXXX"),
+          common, cache, zone)),
+        ("bound unscaled", "the spill bound scales the largest request to the candidate rung",
+         (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(", "zone_hold_spill_bound(",
+                         "zone_XXXX("), common, cache, zone)),
+        ("FA-on check keeps a second criterion", "the FA-on check asks the realized rule (predicted free after the spill), not a second one",
+         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(", "zone_hold_spill_realized_fits(",
+                         "zone_XXXX("), common, cache, zone)),
+        ("request mark has no n_ubatch", "the largest request is recorded with the n_ubatch it was seen at, from the first publish on",
+         (backend, common, mutate_in_func(cache, r"size_t unified_cache_note_runtime_request\(", "request_hwm_n_ubatch",
+                                          "request_hwm_XXXX"), zone)),
+        ("alloc takes the hold twice", "unified_alloc takes the hold state once per request",
+         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
+                                          "hold_at_decision  = unified_cache_note_runtime_request(",
+                                          "hold_at_decision  = unified_cache_get_planned_scratch_hold(req.device) + "
+                                          "unified_cache_note_runtime_request("), zone)),
+        ("new owner inherits spill counts", "a new owner starts with its own spill counts",
+         (backend, common, mutate_in_func(cache, r"void unified_cache_set_planned_scratch_hold\(", "spill_count", "spill_XXXX"),
+          zone)),
+        ("f16 dispatch arm outside the macro", "both f16 buffer acquisitions in the dispatch arm sit under the one macro",
+         (mutate(backend, "#if GGML_SYCL_DEQUANT_F16_ARM", "#if 1", 1), common, cache, zone)),
     ]
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)
+    ctx_mutants = [
+        ("check before the reserve", "the hold-spill check runs in try_candidate, after sched_reserve() and before the rung is accepted",
+         (mutate_after(context_src, "auto try_candidate = [&](uint32_t c) -> const char * {", "sched_reserve();",
+                       "(void) hold_spill_fn(nullptr); sched_reserve();"), header_src)),
+        ("hook dropped", "the hold-spill check runs in try_candidate, after sched_reserve() and before the rung is accepted",
+         (context_src.replace("hold_spill_fn(", "hold_XXXX(", 1), header_src)),
+        ("refusal keeps the rung", "a rung whose hold spill pushed the card under its headroom loses with its own stop reason",
+         (context_src.replace("return \"hold spill left no headroom\";", "(void) 0;", 1), header_src)),
+        ("no DL resolution", "the hook is resolved for a direct build and for a backend-DL build",
+         (context_src.replace("\"ggml_backend_sycl_planned_hold_spill_fits\"", "\"ggml_backend_sycl_XXXX\"", 1), header_src)),
+        ("header lacks the entry", "the header declares the exported entry",
+         (context_src, header_src.replace("ggml_backend_sycl_planned_hold_spill_fits", "ggml_backend_sycl_XXXX"))),
+    ]
+    for label, expect, sources in ctx_mutants:
+        failed += run_context(label, sources, expect)
 
 if failed:
     print("\nFAILED: " + ", ".join(failed))
