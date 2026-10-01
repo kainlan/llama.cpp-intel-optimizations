@@ -90759,6 +90759,9 @@ class ggml_sycl_block_exec_dense_run {
         if (any_missing &&
             !graph_prestage_or_decline(&ctx_, cgraph_, graph_prestage_decline_memo::dense_split_key(key))) {
             graphs_off_ = ggml_sycl::DENSE_GRAPH_OFF_STAGE_FAILED;
+            // A failed staging allocation may already have dropped an old staging buffer that a recorded range
+            // graph still reads, so no recorded range survives the decline.
+            st.drop_graphs(ctx_);
             return;
         }
         split_lap(split_.key_us);
@@ -98699,7 +98702,9 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
     ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
     if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
         // The graphlets would read a host-resident input inside a recording or a replay; the caller runs direct.
+        // Retire the recorded ones: a failed staging allocation may have dropped a buffer they still read.
         ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "stage-failed");
+        sycl_ctx->invalidate_moe_block_graphs();
         return false;
     }
     graph_refresh_input_tensors(sycl_ctx, cgraph);
@@ -99767,6 +99772,13 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
     return all_staged;
 }
 
+// Counts this token against a held decline (it MUTATES the memo): true means skip the pre-stage and run direct,
+// and the retry_after-th counted token forgets the decline and answers false so the pass is re-decided. A token
+// counts once per signature however many callers ask (graph_compute_seq is bumped once per graph_compute call).
+static bool graph_prestage_skip_declined(ggml_backend_sycl_context * ctx, uint64_t graph_hash) {
+    return ctx != nullptr && ctx->prestage_decline_memo.skip(graph_hash, ctx->graph_compute_seq);
+}
+
 // Pre-stage for a graph that is about to be RECORDED or REPLAYED. False means the graph must not be recorded or
 // replayed: its inputs are not all on the device, so a consumer would fall back to a host path whose wait is
 // illegal inside a recording (a GET_ROWS CPU fallback aborted llama-bench on qwen35 exactly this way). The caller
@@ -99775,12 +99787,6 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
 // afresh, and the memo forgets a signature after a bounded number of skipped tokens so a transient failure
 // recovers (graph-prestage-decline-memo.hpp). Every recorder must come through here: calling the pre-stage as a
 // statement ignores its failure.
-// Counts this token against a held decline (it MUTATES the memo): true means skip the pre-stage and run direct,
-// and the retry_after-th ask forgets the decline and answers false so the pass is re-decided.
-static bool graph_prestage_skip_declined(ggml_backend_sycl_context * ctx, uint64_t graph_hash) {
-    return ctx != nullptr && ctx->prestage_decline_memo.skip(graph_hash);
-}
-
 static bool graph_prestage_or_decline(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, uint64_t graph_hash) {
     if (graph_prestage_skip_declined(ctx, graph_hash)) {
         return false;
@@ -99789,7 +99795,7 @@ static bool graph_prestage_or_decline(ggml_backend_sycl_context * ctx, const ggm
         ctx->prestage_decline_memo.forget(graph_hash);
         return true;
     }
-    ctx->prestage_decline_memo.remember(graph_hash);
+    ctx->prestage_decline_memo.remember(graph_hash, ctx->graph_compute_seq);
     GGML_LOG_WARN(
         "[SYCL-GRAPH] graph inputs could not all be staged onto the device; not recording this graph (signature "
         "%llu), running it on the direct path\n",
@@ -106069,6 +106075,8 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     GGML_SYCL_DEBUG("[DEBUG-GRAPH-COMPUTE] sycl_ctx=%p device=%d\n", (void *) sycl_ctx,
                     sycl_ctx ? sycl_ctx->device : -1);
+    // One token per call: the decline memo counts a signature once per token however many recorders ask.
+    ++sycl_ctx->graph_compute_seq;
     const bool offload_stats_active = ggml_sycl::offload_stats_enabled();
     if (offload_stats_active) {
         ggml_sycl::offload_stats_reset();
@@ -107952,7 +107960,9 @@ normal_dispatch:
                 if (segments_match) {
                     // Fast path: replay cached segments + dispatch MoE ops
                     if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
-                        // An input has no staged copy: the recorded segments would read the host one. Run direct.
+                        // An input has no staged copy: the recorded segments would read the host one. Retire them
+                        // (a failed staging allocation may have dropped a buffer they still read) and run direct.
+                        sycl_ctx->invalidate_moe_segments();
                         compute_impl_unlocked();
                     } else {
                         graph_refresh_input_tensors(sycl_ctx, cgraph);
@@ -108008,15 +108018,17 @@ normal_dispatch:
             // or segmented disabled).
             GGML_SYCL_DEBUG("[SYCL-GRAPH] re-record + update (%s)...\n",
                             sycl_ctx->moe_graph_rerecord ? "MoE selective" : "rerecord_mode");
-            g_graph_diag_counters.rerecord_attempts.fetch_add(1, std::memory_order_relaxed);
-            // Decide whether the inputs can be staged BEFORE tearing anything down: a transient staging failure
-            // must not destroy the live exec graph (the last replay may still have it in flight) or leave its pins
-            // and hash stale. A declined graph runs on the direct path and the graph stays as it was.
+            // Decide whether the inputs can be staged before any teardown or attempt count. A declined graph runs
+            // on the direct path, and the live exec graph is cleared through the one routine that waits for its
+            // last replay first: a failed staging allocation may already have dropped the buffer it reads, so
+            // keeping the graph would leave it replaying freed staging.
             if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
+                sycl_exec_graph_clear_active(sycl_ctx, "prestage-declined");
                 compute_impl_unlocked();
                 record_completion(false);
                 return GGML_STATUS_SUCCESS;
             }
+            g_graph_diag_counters.rerecord_attempts.fetch_add(1, std::memory_order_relaxed);
             sycl_ctx->exec_graph.reset();
             sycl_exec_graph_release_pool_retained(sycl_ctx);
             sycl_ctx->active_exec_graph.valid = false;

@@ -158,7 +158,7 @@ def evaluate(backend, common, memo_hdr):
     results["the decline names itself at WARN"] = "GGML_LOG_WARN" in decline and "not recording" in decline
     results["the decline returns false on failure"] = "return false" in decline
     results["a declined graph is remembered on the context, so the pass is not repeated per token"] = \
-        "prestage_decline_memo.remember(graph_hash)" in decline and \
+        "prestage_decline_memo.remember(graph_hash, ctx->graph_compute_seq)" in decline and \
         re.search(r"prestage_decline_memo\.skip\(graph_hash,\s*ctx->graph_compute_seq\)", declined) is not None
     results["the decline memo is not a thread-local or process-wide slot"] = \
         "thread_local" not in decline and "thread_local" not in declined and "g_graph_prestage_skip_declined" not in backend
@@ -170,7 +170,7 @@ def evaluate(backend, common, memo_hdr):
     results["the memo counts a signature once per token, however many sites ask"] = \
         "last_seq" in memo_hdr and re.search(r"bool\s+skip\(uint64_t\s+hash,\s*uint64_t\s+seq\)", memo_hdr) is not None
     results["the context numbers its graph computes, so the memo can tell tokens apart"] = \
-        re.search(r"graph_compute_seq\s*;", common) is not None and \
+        re.search(r"graph_compute_seq\s*(=\s*0)?\s*;", common) is not None and \
         re.search(r"(\+\+\s*sycl_ctx->graph_compute_seq|sycl_ctx->graph_compute_seq\s*\+\+)", compute) is not None and \
         0 <= re.search(r"graph_compute_seq", compute).start() < compute.find("graph_prestage_skip_declined(")
     results["the dense split key is namespaced, so one memo never mixes two key spaces"] = \
@@ -189,6 +189,7 @@ def evaluate(backend, common, memo_hdr):
         # the decline must leave the function (direct path) before recording begins, and no void pre-stage
         # may sit between the check and the recording.
         if re.match(r"\s*if\s*\(\s*!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\s*\)\s*\{\s*"
+                    r"(sycl_exec_graph_clear_active\(sycl_ctx, \"prestage-declined\"\);\s*)?"
                     r"compute_impl_unlocked\(\);\s*record_completion\(false\);\s*return GGML_STATUS_SUCCESS;",
                     between[between.find("if"):]) is None:
             ok_sites = False
@@ -358,10 +359,10 @@ if args.self_test:
         ("decline is silent", "the decline names itself at WARN",
          (mutate_in_func(backend, dec_sig, "GGML_LOG_WARN", "GGML_SYCL_DEBUG"), common, mem_)),
         ("decline not remembered", "a declined graph is remembered on the context, so the pass is not repeated per token",
-         (mutate_in_func(backend, dec_sig, "prestage_decline_memo.remember(graph_hash)", "(void) graph_hash"),
+         (mutate_in_func(backend, dec_sig, "prestage_decline_memo.remember(graph_hash, ctx->graph_compute_seq)", "(void) graph_hash"),
           common, mem_)),
         ("memo made thread-local", "the decline memo is not a thread-local or process-wide slot",
-         (mutate_in_func(backend, dec_sig, "prestage_decline_memo.remember(graph_hash)",
+         (mutate_in_func(backend, dec_sig, "prestage_decline_memo.remember(graph_hash, ctx->graph_compute_seq)",
                          "static thread_local int slot; slot = (int) graph_hash"), common, mem_)),
         ("context loses the memo", "the context owns the decline memo",
          (backend, common.replace("graph_prestage_decline_memo prestage_decline_memo;", ""), mem_)),
@@ -392,8 +393,8 @@ if args.self_test:
           common, mem_)),
         ("dense decline without its return",
          "site 1, dense split recorder: declines with STAGE_FAILED, drops its graphs and returns",
-         (mutate_re(backend, r"void prepare_graphs\(\)\s*\{", r"DENSE_GRAPH_OFF_STAGE_FAILED;\s*return;",
-                    "DENSE_GRAPH_OFF_STAGE_FAILED;"), common, mem_)),
+         (mutate_re(backend, r"void prepare_graphs\(\)\s*\{", r"st\.drop_graphs\(ctx_\);\s*return;",
+                    "st.drop_graphs(ctx_);"), common, mem_)),
         ("dense key not namespaced",
          "site 1, dense split recorder: declines with STAGE_FAILED, drops its graphs and returns",
          (mutate_in_func(backend, r"void prepare_graphs\(\)\s*\{", "graph_prestage_decline_memo::dense_split_key(key)",

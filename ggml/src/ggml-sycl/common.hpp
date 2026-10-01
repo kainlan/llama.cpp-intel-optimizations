@@ -7393,6 +7393,8 @@ struct ggml_backend_sycl_context {
     // Graph signatures this context declined to record because their inputs could not all be staged onto the
     // device (graph_prestage_or_decline). Per context so it dies with it; see graph-prestage-decline-memo.hpp.
     graph_prestage_decline_memo prestage_decline_memo;
+    // Bumped once per ggml_backend_sycl_graph_compute call; the decline memo counts a token once by it.
+    uint64_t                    graph_compute_seq = 0;
 
     // Flag to disable graphs when weight streaming is active
     bool                                                    weight_streaming_graphs_disabled = false;

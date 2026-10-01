@@ -40,8 +40,11 @@ struct graph_prestage_decline_memo {
     static constexpr size_t   max_entries = 16;
 
     struct entry {
-        uint64_t hash  = 0;
-        uint32_t skips = 0;
+        uint64_t hash     = 0;
+        uint32_t skips    = 0;
+        // Token (graph-compute call) that last counted against this entry. A token can ask about one signature
+        // more than once (the early check, then the recorder), and must still count once.
+        uint64_t last_seq = 0;
     };
 
     // Tag for the dense split recorder's plan hash, so it cannot be mistaken for a graph signature.
@@ -58,28 +61,34 @@ struct graph_prestage_decline_memo {
         return false;
     }
 
-    // Record a decline. A signature already held starts its skip count again.
-    void remember(uint64_t hash) {
+    // Record a decline made on token `seq`. A signature already held starts its skip count again.
+    void remember(uint64_t hash, uint64_t seq) {
         for (entry & e : entries) {
             if (e.hash == hash) {
-                e.skips = 0;
+                e.skips    = 0;
+                e.last_seq = seq;
                 return;
             }
         }
         if (entries.size() >= max_entries) {
             entries.erase(entries.begin());
         }
-        entries.push_back({ hash, 0 });
+        entries.push_back({ hash, 0, seq });
     }
 
-    // One token asks whether `hash` is still declined. True means skip the pass. The retry_after-th ask forgets
-    // the signature and answers false, so the caller re-decides on this token. This MUTATES the memo (it counts
-    // the ask), which is why the backend wrapper is called graph_prestage_skip_declined.
-    bool skip(uint64_t hash) {
+    // Token `seq` asks whether `hash` is still declined. True means skip the pass. Each token counts once: a
+    // second ask on the same `seq` (or on the token that declined) answers true without counting. The
+    // retry_after-th counted token forgets the signature and answers false, so the caller re-decides on it. This
+    // MUTATES the memo (it counts the ask), which is why the backend wrapper is called graph_prestage_skip_declined.
+    bool skip(uint64_t hash, uint64_t seq) {
         for (size_t i = 0; i < entries.size(); ++i) {
             if (entries[i].hash != hash) {
                 continue;
             }
+            if (entries[i].last_seq == seq) {
+                return true;
+            }
+            entries[i].last_seq = seq;
             if (++entries[i].skips >= retry_after) {
                 entries.erase(entries.begin() + (std::ptrdiff_t) i);
                 return false;
