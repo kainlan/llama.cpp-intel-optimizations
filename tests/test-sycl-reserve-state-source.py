@@ -18,7 +18,11 @@ write to the context's members. This gate pins, on comment-stripped text:
 - `sched_reserve()` reaches the impl as ALLOC and throws the reason of any
   non-OK result, so its callers see today's exceptions;
 - the compute line is printed in exactly one place, inside the impl, with the
-  literal prefix "sched_reserve".
+  literal prefix "sched_reserve";
+- decode and encode reserve through `sched_reserve_nothrow()`, never the
+  throwing `sched_reserve()`: nothing above them catches, so the nothrow form
+  catches std::exception, logs, returns false and leaves sched_need_reserve
+  set so the next call starts over (gate 26).
 
 Every clause has a mutant that must fail it. Host-only; collected by pytest.
 """
@@ -183,7 +187,10 @@ def test_wrapper_mutants():
         ("early return dropped", "if (!sched_need_reserve) { return; }", ""),
     ]
     for name, old, new in mutants:
-        assert not wrapper_ok(mutate(code, old, new)), f"mutant {name!r} slipped through the wrapper gate"
+        # the impl call recurs in the nothrow wrapper: mutate inside whichever of the two bodies carries the anchor
+        scope = next(b for b in (function_body(code, _WRAPPER), function_body(code, _MEMBER_STATE)) if z(old) in b)
+        mutated = code.replace(scope, mutate(scope, old, new), 1)
+        assert not wrapper_ok(mutated), f"mutant {name!r} slipped through the wrapper gate"
 
 
 # --- the types ----------------------------------------------------------------
@@ -326,3 +333,83 @@ def test_graph_params_mutants():
     ]
     for name, old, new in pairs:
         assert not graph_params_ok(mutate(code, old, new)), f"mutant {name!r} slipped through the graph_params gate"
+
+
+# --- gate 26: decode and encode reserve without throwing ----------------------
+
+_NOTHROW = "bool llama_context::sched_reserve_nothrow()"
+_ENCODE = "int llama_context::encode(const llama_batch_ext & batch_inp)"
+_DECODE = "int llama_context::decode(const llama_batch_ext & batch_inp)"
+_CALL_SITE = z("if (!sched_reserve_nothrow()) { LLAMA_LOG_ERROR(\"%s: failed to reserve the compute buffers\\n\", __func__); return -2; }")
+
+
+def nothrow_ok(code: str) -> bool:
+    b = function_body(code, _NOTHROW)
+    impl_call = z("sched_reserve_impl(sched_reserve_mode::ALLOC, state);")
+    if impl_call not in b or "catch(conststd::exception&" not in b.replace(" ", ""):
+        return False
+    # success returns true; every other path logs, re-arms the reserve and returns false
+    tail = z("sched_need_reserve = true; return false; }")
+    if not b.endswith(tail):
+        return False
+    if b.count("return true;") != 2 or b.count("return false;") != 1:
+        return False
+    # `sched_reserve_nothrow` itself contains "throw": only a bare throw statement counts
+    return z("if (!sched_need_reserve) { return true; }") in b and not re.search(r"(?<![A-Za-z_])throw(?![A-Za-z_])", b)
+
+
+def call_sites_ok(code: str) -> bool:
+    for sig in (_ENCODE, _DECODE):
+        b = function_body(code, sig)
+        if _CALL_SITE not in b or z("sched_reserve();") in b:
+            return False
+        if b.count("sched_reserve_nothrow()") != 1:
+            return False
+    return True
+
+
+def test_nothrow_form_catches_and_rearms():
+    assert nothrow_ok(code_of(CONTEXT_CPP)), (
+        "sched_reserve_nothrow must run the impl as ALLOC, catch std::exception, log, set sched_need_reserve "
+        "again and return false"
+    )
+
+
+def test_decode_and_encode_reserve_without_throwing():
+    assert call_sites_ok(code_of(CONTEXT_CPP)), (
+        "encode and decode must call sched_reserve_nothrow() once, return -2 on false, and not call "
+        "the throwing sched_reserve()"
+    )
+
+
+def test_nothrow_mutants():
+    code = code_of(CONTEXT_CPP)
+    mutants = [
+        ("the catch dropped", "catch (const std::exception & err) {", "catch (const int & err) {"),
+        ("the re-arm dropped", "sched_need_reserve = true; return false; }", "return false; }"),
+        ("a failure reported as success", "sched_need_reserve = true; return false; }", "sched_need_reserve = true; return true; }"),
+        ("the impl run as MEASURE", "const sched_reserve_result result = sched_reserve_impl(sched_reserve_mode::ALLOC, state); if (result.status == sched_reserve_status::OK) {", "const sched_reserve_result result = sched_reserve_impl(sched_reserve_mode::MEASURE, state); if (result.status == sched_reserve_status::OK) {"),
+        ("the early return removed", "if (!sched_need_reserve) { return true; }", ""),
+    ]
+    body = function_body(code, _NOTHROW)
+    for name, old, new in mutants:
+        # mutate the wrapper body only: the same text recurs in other functions
+        mutated = code.replace(body, mutate(body, old, new), 1)
+        assert mutated != code
+        assert not nothrow_ok(mutated), f"mutant {name!r} slipped through the nothrow gate"
+
+
+def test_call_site_mutants():
+    code = code_of(CONTEXT_CPP)
+    # the throwing form back in the encode path, then in the decode path
+    for anchor_sig in (_ENCODE, _DECODE):
+        b = function_body(code, anchor_sig)
+        mutated_body = b.replace(_CALL_SITE, z("sched_reserve();"), 1)
+        assert mutated_body != b
+        assert not call_sites_ok(code.replace(b, mutated_body, 1)), anchor_sig
+        # the nothrow call kept but its failure ignored
+        ignored = b.replace(_CALL_SITE, z("sched_reserve_nothrow();"), 1)
+        assert not call_sites_ok(code.replace(b, ignored, 1)), anchor_sig
+        # a second reserve call
+        doubled = b.replace(_CALL_SITE, _CALL_SITE + z("sched_reserve();"), 1)
+        assert not call_sites_ok(code.replace(b, doubled, 1)), anchor_sig

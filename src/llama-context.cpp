@@ -2068,6 +2068,30 @@ void llama_context::sched_reserve() {
     }
 }
 
+bool llama_context::sched_reserve_nothrow() {
+    if (!sched_need_reserve) {
+        return true;
+    }
+
+    sched_need_reserve = false;
+
+    try {
+        sched_reserve_state        state  = member_reserve_state();
+        const sched_reserve_result result = sched_reserve_impl(sched_reserve_mode::ALLOC, state);
+        if (result.status == sched_reserve_status::OK) {
+            return true;
+        }
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, result.reason.c_str());
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+    }
+
+    // The scheduler is no longer reserved for the graphs decode builds, so the
+    // next decode or encode reserves again from the start.
+    sched_need_reserve = true;
+    return false;
+}
+
 sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state) {
     // MEASURE lands with the measure function; until then every caller is ALLOC.
     GGML_ASSERT(mode == sched_reserve_mode::ALLOC);
@@ -2980,7 +3004,10 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
 
-    sched_reserve();
+    if (!sched_reserve_nothrow()) {
+        LLAMA_LOG_ERROR("%s: failed to reserve the compute buffers\n", __func__);
+        return -2;
+    }
 
     n_queued_tokens += n_tokens;
 
@@ -3267,7 +3294,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
 
-    sched_reserve();
+    if (!sched_reserve_nothrow()) {
+        LLAMA_LOG_ERROR("%s: failed to reserve the compute buffers\n", __func__);
+        return -2;
+    }
 
     bool did_optimize = false;
 

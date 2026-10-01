@@ -91,6 +91,11 @@ struct llama_context {
     // non-OK status back into the exception its callers expect.
     sched_reserve_result sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state);
 
+    // sched_reserve() for decode and encode, which catch nothing above them:
+    // a non-OK status or a throw from the reserve is logged and returned as
+    // false, with sched_need_reserve left set so the next call starts over.
+    bool sched_reserve_nothrow();
+
     void synchronize();
 
     const llama_model   & get_model()   const;
