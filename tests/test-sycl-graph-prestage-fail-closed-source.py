@@ -22,10 +22,18 @@ Two defects, one chain:
       host path whose wait is illegal inside a recording. A graph whose inputs cannot be staged must decline
       recording BEFORE it starts and run on the direct path.
 
-B2 (diagnostic). The "keeping attention nodes out" line is logged once, on the FIRST decode call, when no
-decode FA has dispatched yet, so every observed count reads zero and the line says nothing about the kernel
-that is actually blocking engagement. It must not claim a block before anything was observed, and when it
-does claim one it must name the kernel.
+Every recorder honours it (review fold I2). The two full-graph sites were not the only ones that pre-stage and
+then record or replay: the dense split recorder, the MoE block graphlets and the MoE segment replay and record
+all called the pre-stage as a statement and carried on. They are the same hazard (a recorded graph reading a
+host-resident input), so each now goes through graph_prestage_or_decline and, on a decline, runs the graph
+directly. The gate enumerates every call of graph_prestage_leaf_tensors: the only legal caller is
+graph_prestage_or_decline itself, so a new recording site that pre-stages without consuming the result fails.
+
+The decline memo (review fold M2) lives on the context, not in a thread_local slot: a (ctx pointer, hash) slot
+was evicted by every other signature (PP and decode alternate) and was keyed by an address a new context can
+reuse. A staging failure is also not permanent for a signature: the memo forgets it after a bounded number of
+skipped tokens, so a transient failure (a staging allocation) recovers while a structural one (a
+host-resident input) re-declines at the cost of one pass.
 
 Run with --self-test to prove every check fires against a mutant of the thing it forbids.
 """
@@ -40,6 +48,7 @@ sycl = root / "ggml/src/ggml-sycl"
 parser = argparse.ArgumentParser()
 parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--common", default=str(sycl / "common.hpp"))
+parser.add_argument("--memo", default=str(sycl / "graph-prestage-decline-memo.hpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -105,7 +114,7 @@ def function_body(source, signature_regex):
     return None
 
 
-def evaluate(backend, common):
+def evaluate(backend, common, memo_hdr):
     results = {}
 
     prestage = function_body(backend, r"static bool graph_prestage_leaf_tensors\([^)]*\)\s*\{")
@@ -114,15 +123,13 @@ def evaluate(backend, common):
     decline = function_body(backend, r"static bool graph_prestage_or_decline\([^)]*\)\s*\{")
     declined = function_body(backend, r"static bool graph_prestage_declined\([^)]*\)\s*\{")
     compute = function_body(backend, r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{")
-    obs = function_body(common, r"struct fa_decode_kernel_observation\s*\{")
     results["anchor: prestage returns bool"] = prestage is not None
     results["anchor: graph_refresh_input_tensors exists"] = refresh is not None
     results["anchor: graph_tensor_is_input exists"] = is_input is not None
     results["anchor: graph_prestage_or_decline exists"] = decline is not None
     results["anchor: graph_prestage_declined exists"] = declined is not None
     results["anchor: graph_compute_unchecked exists"] = compute is not None
-    results["anchor: fa_decode_kernel_observation exists"] = obs is not None
-    if None in (prestage, refresh, is_input, decline, declined, compute, obs):
+    if None in (prestage, refresh, is_input, decline, declined, compute):
         return results
 
     # --- (a) a view of an INPUT is that input -------------------------------------------------
@@ -142,10 +149,17 @@ def evaluate(backend, common):
         re.search(r"all_staged\s*=\s*false", prestage) is not None and "return all_staged" in prestage
     results["the decline names itself at WARN"] = "GGML_LOG_WARN" in decline and "not recording" in decline
     results["the decline returns false on failure"] = "return false" in decline
-    memo = re.search(r"static thread_local struct\s*\{[^}]*\}\s*g_graph_prestage_declined\s*;", backend)
-    results["a declined graph is remembered, so the pass is not repeated per token"] = \
-        memo is not None and "g_graph_prestage_declined.hash = graph_hash" in decline and \
-        "g_graph_prestage_declined.hash == graph_hash" in declined
+    results["a declined graph is remembered on the context, so the pass is not repeated per token"] = \
+        "prestage_decline_memo.remember(graph_hash)" in decline and \
+        "prestage_decline_memo.skip(graph_hash)" in declined
+    results["the decline memo is not a thread-local or process-wide slot"] = \
+        "thread_local" not in decline and "thread_local" not in declined and "g_graph_prestage_declined" not in backend
+    results["the context owns the decline memo"] = re.search(r"graph_prestage_decline_memo\s+prestage_decline_memo\s*;", common) is not None
+    results["the memo forgets a decline after a bounded number of skips"] = \
+        re.search(r"retry_after\s*=\s*\d+", memo_hdr) is not None and "erase(" in memo_hdr
+    results["the memo holds several signatures at once"] = \
+        "std::vector" in memo_hdr and re.search(r"max_entries\s*=\s*\d+", memo_hdr) is not None
+    results["a successful pre-stage forgets an earlier decline"] = "prestage_decline_memo.forget(graph_hash)" in decline
     sites = [m.start() for m in re.finditer(r"model_sycl_graph\.begin_recording\(", compute)]
     results["both full-graph recording sites exist"] = len(sites) == 2
     ok_sites = True
@@ -169,14 +183,38 @@ def evaluate(backend, common):
         "graph_prestage_declined(" in compute and \
         0 <= compute.find("graph_prestage_declined(") < compute.find("model_sycl_graph.begin_recording(")
 
-    # --- B2: the FA gate's diagnostic ------------------------------------------------------------
-    results["the observation can say whether anything was observed"] = "observed_any" in obs
-    results["the observation remembers the blocking kernel's name"] = \
-        "last_other_kernel" in obs and re.search(r"last_other_kernel\s*=\s*kernel", obs) is not None
-    log_at = compute.find("keeping attention nodes out of SYCL command")
-    guard_at = compute.rfind("observed_any()", 0, log_at) if log_at >= 0 else -1
-    results["no block is claimed before a decode FA was observed"] = 0 <= guard_at < log_at
-    results["the block line names the kernel"] = log_at >= 0 and "last_other=" in compute[log_at - 600:log_at + 1200]
+    # --- every pre-stage consumer honours the result ------------------------------------------------------
+    def calls(name):
+        # a call, not the declaration or definition ("static bool name(")
+        return [m.start() for m in re.finditer(r"(?<!bool )\b%s\(" % name, backend)]
+
+    decl_span = (backend.find(decline), backend.find(decline) + len(decline))
+    stray = [at for at in calls("graph_prestage_leaf_tensors") if not decl_span[0] <= at < decl_span[1]]
+    results["no code pre-stages as a statement: graph_prestage_or_decline is the only caller of the pre-stage"] = \
+        not stray
+    consumers = calls("graph_prestage_or_decline")
+    consumed = [at for at in consumers
+                if re.search(r"if\s*\([^;{]*!\s*$", backend[max(0, at - 160):at]) is not None]
+    results["every pre-stage consumer tests the result (void-style calls ignore a failure)"] = \
+        len(consumers) > 0 and len(consumers) == len(consumed)
+    results["the dense split recorder, the block graphlets, the segment replay and record, and both full-graph "
+            "sites all pre-stage through the declining form"] = len(consumers) >= 6
+    exits = True
+    for at in consumers:
+        open_at = backend.find("{", at)
+        depth, k = 0, open_at
+        while k < len(backend):
+            if backend[k] == "{":
+                depth += 1
+            elif backend[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        body = backend[open_at:k + 1]
+        if re.search(r"\breturn\b|compute_impl_unlocked\(\)|graphs_off_\s*=", body) is None:
+            exits = False
+    results["a declined pre-stage runs the graph directly instead of recording or replaying"] = exits
     return results
 
 
@@ -193,7 +231,8 @@ def run(label, sources, expect_fail=None):
 
 
 backend, common = read(args.backend), read(args.common)
-failed = run("tree", (backend, common))
+memo_hdr = read(args.memo) if Path(args.memo).exists() else ""
+failed = run("tree", (backend, common, memo_hdr))
 
 if args.self_test:
     def mutate(src, old, new, count=1):
@@ -216,41 +255,68 @@ if args.self_test:
     ref_sig = r"static void graph_refresh_input_tensors\([^)]*\)\s*\{"
     dec_sig = r"static bool graph_prestage_or_decline\([^)]*\)\s*\{"
     cmp_sig = r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{"
+    mem_ = memo_hdr
     mutants = [
         ("flag-only INPUT test in pre-stage", "pre-stage has no flag-only INPUT test left",
          (mutate_in_func(backend, pre_sig, "graph_tensor_is_input(tensor)",
-                         "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common)),
+                         "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),
         ("flag-only INPUT test in refresh", "refresh discovery has no flag-only INPUT test left",
          (mutate_in_func(backend, ref_sig, "graph_tensor_is_input(tensor)",
-                         "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common)),
+                         "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),
         ("view walk dropped", "the INPUT test walks view_src",
          (mutate_in_func(backend, r"static bool graph_tensor_is_input\([^)]*\)\s*\{", "view_src", "view_XXXX"),
-          common)),
+          common, mem_)),
         ("zero-byte failure restored", "a zero-byte tensor is a no-op, not a staging failure",
-         (mutate_in_func(backend, pre_sig, "ggml_nbytes(tensor) == 0", "ggml_nbytes(tensor) == 12345"), common)),
+         (mutate_in_func(backend, pre_sig, "ggml_nbytes(tensor) == 0", "ggml_nbytes(tensor) == 12345"), common, mem_)),
         ("failure swallowed", "a staging failure is reported to the caller",
-         (mutate_in_func(backend, pre_sig, "return all_staged", "return true"), common)),
+         (mutate_in_func(backend, pre_sig, "return all_staged", "return true"), common, mem_)),
         ("decline is silent", "the decline names itself at WARN",
-         (mutate_in_func(backend, dec_sig, "GGML_LOG_WARN", "GGML_SYCL_DEBUG"), common)),
-        ("decline not remembered", "a declined graph is remembered, so the pass is not repeated per token",
-         (mutate_in_func(backend, dec_sig, "g_graph_prestage_declined.hash = graph_hash",
-                         "(void) graph_hash"), common)),
-        ("memo made process-wide", "a declined graph is remembered, so the pass is not repeated per token",
-         (mutate(backend, "static thread_local struct {\n    const ggml_backend_sycl_context * ctx",
-                 "static struct {\n    const ggml_backend_sycl_context * ctx"), common)),
+         (mutate_in_func(backend, dec_sig, "GGML_LOG_WARN", "GGML_SYCL_DEBUG"), common, mem_)),
+        ("decline not remembered", "a declined graph is remembered on the context, so the pass is not repeated per token",
+         (mutate_in_func(backend, dec_sig, "prestage_decline_memo.remember(graph_hash)", "(void) graph_hash"),
+          common, mem_)),
+        ("memo made thread-local", "the decline memo is not a thread-local or process-wide slot",
+         (mutate_in_func(backend, dec_sig, "prestage_decline_memo.remember(graph_hash)",
+                         "static thread_local int slot; slot = (int) graph_hash"), common, mem_)),
+        ("context loses the memo", "the context owns the decline memo",
+         (backend, common.replace("graph_prestage_decline_memo prestage_decline_memo;", ""), mem_)),
+        ("memo never forgets", "the memo forgets a decline after a bounded number of skips",
+         (backend, common, re.sub(r"retry_after\s*=\s*\d+", "retry_never = 0", mem_))),
+        ("memo holds one signature", "the memo holds several signatures at once",
+         (backend, common, re.sub(r"max_entries\s*=\s*\d+", "one_slot = 1", mem_))),
+        ("success keeps an old decline", "a successful pre-stage forgets an earlier decline",
+         (mutate_in_func(backend, dec_sig, "prestage_decline_memo.forget(graph_hash)", "(void) graph_hash"),
+          common, mem_)),
         ("recording site loses its decline", "every full-graph recording is preceded by a pre-stage that can decline it",
          (mutate_in_func(backend, cmp_sig, "graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)",
-                         "graph_prestage_leaf_tensors(sycl_ctx, cgraph)"), common)),
+                         "graph_prestage_leaf_tensors(sycl_ctx, cgraph)"), common, mem_)),
         ("decline does not leave", "every full-graph recording is preceded by a pre-stage that can decline it",
          (mutate_in_func(backend, cmp_sig, "graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)",
-                         "graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash) || true"), common)),
-        ("block claimed before observation", "no block is claimed before a decode FA was observed",
-         (mutate_in_func(backend, cmp_sig, "observed_any()", "true"), common)),
-        ("block names no kernel", "the block line names the kernel",
-         (mutate_in_func(backend, cmp_sig, "last_other=", "last_XXXX="), common)),
-        ("observation forgets the kernel", "the observation remembers the blocking kernel's name",
-         (backend, mutate_in_func(common, r"struct fa_decode_kernel_observation\s*\{", "last_other_kernel = kernel",
-                                  "last_other_kernel = nullptr"))),
+                         "graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash) || true"), common, mem_)),
+        ("block graphlets pre-stage as a statement",
+         "no code pre-stages as a statement: graph_prestage_or_decline is the only caller of the pre-stage",
+         (mutate_in_func(backend, r"static bool moe_graph_try_block_graphlets\([^)]*\)\s*\{",
+                         "graph_prestage_or_decline(", "graph_prestage_leaf_tensors("), common, mem_)),
+        ("a new recorder pre-stages as a statement",
+         "no code pre-stages as a statement: graph_prestage_or_decline is the only caller of the pre-stage",
+         (backend + "\nstatic void new_recorder(ggml_backend_sycl_context * c, const ggml_cgraph * g) "
+                    "{ graph_prestage_leaf_tensors(c, g); }\n", common, mem_)),
+        ("segment replay ignores the result",
+         "every pre-stage consumer tests the result (void-style calls ignore a failure)",
+         (mutate_in_func(backend, cmp_sig, "if (!graph_prestage_or_decline(", "(void) (graph_prestage_or_decline("),
+          common, mem_)),
+        ("a recorder is dropped",
+         "the dense split recorder, the block graphlets, the segment replay and record, and both full-graph "
+         "sites all pre-stage through the declining form",
+         (mutate_in_func(backend, r"static bool moe_graph_try_block_graphlets\([^)]*\)\s*\{",
+                         "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash))",
+                         "if (false)"), common, mem_)),
+        ("a decline falls through",
+         "a declined pre-stage runs the graph directly instead of recording or replaying",
+         (mutate_in_func(backend, r"static bool moe_graph_try_block_graphlets\([^)]*\)\s*\{",
+                         "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {",
+                         "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { (void) 0;"
+                         " } if (false) {"), common, mem_)),
     ]
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)

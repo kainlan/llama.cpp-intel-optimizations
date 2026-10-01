@@ -25,7 +25,16 @@ Pinned here:
     layout the placement plan actually materialises the weight in, so a pair no kernel covers is
     declined before placement routes it. The dispatch arm asks the same predicate; its abort is a
     backstop for a pair supports_op already refused, never the way a pair is declined;
-  * the streamed-slice dispatcher has the arm too;
+  * the streamed-slice dispatcher has NO Q4_K arm. That dispatcher is the host-resident DMA streaming path
+    (a weight whose cache view is not on the device), and supports_op already declines host-planned weights
+    (placement decides the executor: a host-resident weight runs on the CPU). A Q4_K arm there would be weight
+    streaming, which the architecture forbids, and it would hide a supports_op defect behind a working path;
+    the dispatcher's default abort is the right backstop;
+  * the K-quant scale/min unpack exists once in ggml-sycl: dequantize.hpp and cpy.hpp carried their own copies
+    until they were folded into ggml_sycl_kquant_scale_min_k4, and a second definition is how Q4_K and Q5_K
+    decode would drift apart;
+  * the planned-layout lookup uses the plan's name index (find_dense_entry), not a scan of every entry, and the
+    "Q4_K GET_ROWS non-AoS layouts" gap in get-rows-support.hpp cites the ticket that owns it;
   * the kernel decodes through the K-quant element function the host test checks against ggml, which
     unpacks scales through the one shared scale/min helper (Q5_K reuses it).
 
@@ -45,6 +54,8 @@ parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--getrows", default=str(sycl / "getrows.cpp"))
 parser.add_argument("--support", default=str(sycl / "get-rows-support.hpp"))
 parser.add_argument("--kquant", default=str(sycl / "get-rows-kquant.hpp"))
+parser.add_argument("--common", default=str(sycl / "common.hpp"))
+parser.add_argument("--sycl-dir", default=str(sycl))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -130,7 +141,11 @@ SLICE_SIG = r"static void ggml_sycl_get_rows_dispatch_slice\([^)]*\)\s*\{"
 KERNEL_SIG = r"static void k_get_rows_q4_k_aos\([^)]*\)\s*\{"
 
 
-def evaluate(backend, getrows, support, kquant):
+SCALE_DEF_RE = re.compile(r"\b(\w*get_scale_min_k4\w*|\w*kquant_scale_min\w*)\s*\([^;{)]*\)\s*\{")
+PLANNED_LAYOUT_SIG = r"inline bool ggml_sycl_get_planned_weight_layout\([^)]*\)\s*\{"
+
+
+def evaluate(backend, getrows, support, kquant, common, sources, raw_support):
     results = {}
 
     pred = function_body(support, SUPPORT_SIG)
@@ -176,9 +191,8 @@ def evaluate(backend, getrows, support, kquant):
         abort = re.search(r"GGML_ABORT", q4k)
         results["op: the Q4_K arm asks the layout predicate before it launches"] = \
             bool(refuse and launch and abort) and refuse.start() < launch.start()
-    sq4k = case_arm(slice_, "Q4_K")
-    results["slice: the streamed-slice dispatcher has a Q4_K arm"] = \
-        sq4k is not None and "get_rows_q4_k_aos_sycl(" in sq4k
+    results["slice: the streamed-slice dispatcher has no Q4_K arm (host-resident weights are declined)"] = \
+        case_arm(slice_, "Q4_K") is None and "get_rows_q4_k_aos_sycl(" not in slice_
 
     # --- the kernel decodes through the function the host test checks ---------
     kernel = function_body(getrows, KERNEL_SIG)
@@ -192,6 +206,22 @@ def evaluate(backend, getrows, support, kquant):
     results["the K-quant header has the shared scale/min helper"] = scale is not None
     results["the Q4_K element decode unpacks scales through the shared helper"] = \
         elem is not None and "ggml_sycl_kquant_scale_min_k4(" in elem
+
+    # --- one scale/min unpack in the whole backend -----------------------------
+    defs = []
+    for name, text in sorted(sources.items()):
+        defs += [(name, m.group(1)) for m in SCALE_DEF_RE.finditer(text)]
+    results["the K-quant scale/min unpack is defined once, as ggml_sycl_kquant_scale_min_k4"] = \
+        defs == [("get-rows-kquant.hpp", "ggml_sycl_kquant_scale_min_k4")]
+
+    # --- the planned-layout lookup uses the name index ---------------------------
+    planned = function_body(common, PLANNED_LAYOUT_SIG)
+    results["anchor: the planned-layout lookup exists"] = planned is not None
+    if planned is not None:
+        results["the planned-layout lookup uses the plan's name index, not a scan of every entry"] = \
+            "find_dense_entry(" in planned and re.search(r"for\s*\([^)]*->entries\)", planned) is None
+    results["the unimplemented non-AoS layouts cite their ticket"] = \
+        re.search(r"non-AoS[^\n]*\n?[^\n]*llama\.cpp-[a-z0-9]+", raw_support) is not None
     return results
 
 
@@ -208,7 +238,13 @@ def run(label, sources, expect_fail=None):
 
 
 backend, getrows, support, kquant = read(args.backend), read(args.getrows), read(args.support), read(args.kquant)
-failed = run("tree", (backend, getrows, support, kquant))
+common = read(args.common)
+raw_support = Path(args.support).read_text()
+sources = {}
+for path in sorted(Path(args.sycl_dir).iterdir()):
+    if path.suffix in (".hpp", ".cpp", ".h"):
+        sources[path.name] = backend if str(path) == args.backend else read(path)
+failed = run("tree", (backend, getrows, support, kquant, common, sources, raw_support))
 
 if args.self_test:
 
@@ -223,7 +259,8 @@ if args.self_test:
 
     def with_(**kw):
         return (kw.get("backend", backend), kw.get("getrows", getrows), kw.get("support", support),
-                kw.get("kquant", kquant))
+                kw.get("kquant", kquant), kw.get("common", common), kw.get("sources", sources),
+                kw.get("raw_support", raw_support))
 
     mutants = [
         ("Q4_K dropped from the predicate", "the predicate admits Q4_K",
@@ -245,8 +282,28 @@ if args.self_test:
         ("op arm skips the layout predicate", "op: the Q4_K arm asks the layout predicate before it launches",
          with_(getrows=mutate(getrows, OP_SIG, "ggml_sycl_get_rows_layout_supported(",
                               "ggml_sycl_get_rows_layout_supportedX("))),
-        ("streamed arm dropped", "slice: the streamed-slice dispatcher has a Q4_K arm",
-         with_(getrows=mutate(getrows, SLICE_SIG, "case GGML_TYPE_Q4_K:", "case GGML_TYPE_IQ4_NL:"))),
+        ("streamed arm added",
+         "slice: the streamed-slice dispatcher has no Q4_K arm (host-resident weights are declined)",
+         with_(getrows=mutate(getrows, SLICE_SIG, "default:",
+                              "case GGML_TYPE_Q4_K: get_rows_q4_k_aos_sycl(ctx, src0, src1, dst, src0_dd, "
+                              "src1_dd, dst_dd, stream); break; default:"))),
+        ("second scale/min definition in dequantize.hpp",
+         "the K-quant scale/min unpack is defined once, as ggml_sycl_kquant_scale_min_k4",
+         with_(sources=dict(sources, **{"dequantize.hpp": sources["dequantize.hpp"] +
+                                        "\nstatic inline void get_scale_min_k4(int j, const uint8_t * q, "
+                                        "uint8_t & d, uint8_t & m) { d = q[j]; m = q[j]; }\n"}))),
+        ("second scale/min definition under another name",
+         "the K-quant scale/min unpack is defined once, as ggml_sycl_kquant_scale_min_k4",
+         with_(sources=dict(sources, **{"cpy.hpp": sources["cpy.hpp"] +
+                                        "\ninline void get_scale_min_k4_local(int j, const uint8_t * q, "
+                                        "uint8_t & d, uint8_t & m) { d = q[j]; m = q[j]; }\n"}))),
+        ("planned layout scans every entry",
+         "the planned-layout lookup uses the plan's name index, not a scan of every entry",
+         with_(common=mutate(common, PLANNED_LAYOUT_SIG, "find_dense_entry(",
+                             "scan_entries(); for (const auto & e : plan_owner->entries) { (void) e; } "
+                             "plan_owner->find_dense_entry_unused("))),
+        ("ticket citation dropped", "the unimplemented non-AoS layouts cite their ticket",
+         with_(raw_support=re.sub(r"llama\.cpp-[a-z0-9-]+", "TODO", raw_support))),
         ("kernel stops using the shared decode", "the Q4_K kernel decodes through the shared element function",
          with_(getrows=mutate(getrows, KERNEL_SIG, "ggml_sycl_get_rows_q4_k_elem(",
                               "ggml_sycl_get_rows_q4_k_elemX("))),
