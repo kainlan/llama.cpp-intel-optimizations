@@ -86,9 +86,30 @@ be written a literal false. Write credit is positional and does not follow contr
       constraints.must_device; r = false;`), a call through a lambda, a function pointer or a std::function, a
       call written inside a macro body, a helper with several returns, positional goto/return control flow,
       token pasting (`malloc_##x`), `#pragma message`, and the constructor-form alias `T & c(x)`.
-  (i)-(p) are S2d. Witness 9 (a site that stops calling its shared `*_bytes()` function) is
-      deferred to S2d as a dormant clause: its subjects, the model-shaped exact `*_bytes()`
-      functions (load_reorder_temp_bytes, woq_packed_bytes, ...), do not exist in the tree yet.
+  (i)-(o) and witness 9 (S2d-1). Each is keyed on a subject the tree may not have yet, and says so:
+      `DORMANT <clause>: subject <symbol> absent` is printed, never a silent pass. A subject name that appears in a
+      shape the matcher misses (a macro, a lambda or variable, an alias, a pointer to member) is an X-LATCH
+      failure, so a clause cannot stay dormant for ever behind a respelling.
+      (i) defining ggml_sycl_replan_token_held retires onednn_w_retry_lost_cas and onednn_pp_a_relock_busy_pre_l0
+      (I-RETRY). (k) release_retained_referencing(... RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER ...) inside
+      ggml_sycl_run_runtime_context_transaction retires onednn_pp_a_reclaim_query_interim (K-INTERIM).
+      (l) owner_use_count: its callers outside mem-handle.* are allowlisted (L-CALLER), no free is controlled by it,
+      directly or through a local (L-FREE), and replace_within begins with replace_within_count_guard (L-GUARD).
+      (j) the fit functions onednn_pp_a_bytes / onednn_pp_w_bytes read per-model sources only (J-SOURCE), and
+      zone_is_onednn_reorder_eligible is called only by the late stage's classifier (J-DISPATCH).
+      (m) every appendix row whose zone is SCRATCH is on the floor list, covered by a named peak, or excluded by class
+      (M-SCRATCH); the lists carry no stale row (M-STALE); the floor is tied to GGML_SYCL_COMPUTE_ARENA_MB (M-FLOOR);
+      the census table is scripts/sycl-alloc-zone-contract/appendix-rows.json (M-DATA when missing).
+      (n) the result of each declined-result consumer (DnnlGemmWrapper::gemm, row_gemm, ..., get_scratchpad_mem) is
+      consumed, in the library and in the tests that call it: an expression statement, a comma's left operand or a
+      void cast fails (N-VOID); each listed declaration carries [[nodiscard]] (N-NODISCARD). Both may be debt.
+      (o) each C-term consumer submits on its census row's queue, pinned at the call's argument; an acquire call
+      with no row fails (O-NOROW, O-ROW, O-QUEUE).
+      Witness 9: each model-shaped *_bytes() function is called by its allocation sites and by the zone sizing
+      (Z9-SITE, Z9-SIZING), dormant until it is defined.
+      Known S2d gaps: (n) counts every consuming position (assignment, return, condition, argument) as used;
+      (j) covers only the two named fit functions; (l)'s count callers are allowlist entries added as each lands.
+  (p) is S2d-2 (witnesses 37-38).
 
 Scope
   Every .cpp/.hpp under ggml/src/ggml-sycl except the skipped directories below. dpct/ is in
@@ -133,6 +154,7 @@ Usage:
   check-sycl-alloc-zone-contract.py [--root REPO] --write-debt [--allow-growth]
 """
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -194,7 +216,7 @@ DPCT_CLASSES = ("device_memory", "global_memory", "constant_memory", "shared_mem
 
 SHARDS = 4   # the ctest registers this many shards; cmake_witness pins the registration to it
 
-DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h). Shrink-only: a violation not listed "
+DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h and n; only N-VOID and N-NODISCARD may be debt). Shrink-only: a violation not listed "
             "fails, and a listed entry that no longer violates fails. Every E-RAW entry carries a fate (deleted-by-*, "
             "converted-by-*, sanctioned-internal, sanctioned-vendored or pending-disposition) and a cite, so an entry no step will ever "
             "shrink is visible as a mislabelled allowlist entry. Regenerate with `python3 "
@@ -218,8 +240,13 @@ H_NEVER_EXEMPT = ("H-CASCADE-EXPR", "H-PASS-EXPR", "H-UNCONV-EXPR")
 H_OUTCOME = {"H-CASCADE": "CASCADE", "H-CASCADE-PARAM": "CASCADE", "H-PASS-TRUE": "CASCADE", "H-PASS-FORWARD": "CASCADE",
              "H-UNCONV": "UNCONVERTED"}
 
+# Clauses (i)-(o), witness 9 and the dormancy latch (S2d). Only a declined result that is dropped today (N-*) is debt; the rest
+# are clean on today's tree, so a finding of any other code is an allowlisted node or a fix, never a list entry.
+S2D_CODES = ("I-RETRY", "K-INTERIM", "L-CALLER", "L-FREE", "L-GUARD", "J-SOURCE", "J-DISPATCH", "M-SCRATCH", "M-STALE", "M-FLOOR",
+             "M-DATA", "N-VOID", "N-NODISCARD", "O-NOROW", "O-ROW", "O-QUEUE", "Z9-SITE", "Z9-SIZING", "X-LATCH")
+S2D_DEBT = ("N-VOID", "N-NODISCARD")
 CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-FORM", "B-TIER", "C-COHORT", "C-SITE", "D-ZONE",
-         "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "G-CATCH", "DEFER-C") + H_CODES
+         "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "G-CATCH", "DEFER-C") + H_CODES + S2D_CODES
 
 
 # ---------------------------------------------------------------- tree-sitter accessors
@@ -310,6 +337,27 @@ def load_tree(root):
               % (len(scanned), Path(root) / SCOPE_SUBDIR, MIN_FILES))
         sys.exit(1)
     return {rel: p.read_bytes() for rel, p in scanned.items()}
+
+
+def core_files(files):
+    """The scanned tree without the test sources that clause (n) reads."""
+    return {r: s for r, s in files.items() if not r.startswith(TEST_PREFIX)}
+
+
+def load_test_sources(root):
+    """Test sources that spell a name clause (n) lists, keyed `tests/<path>`: the repository's tests/ and the scope's own
+    tests/ directory. Read for clause (n) only; the other clauses never see them."""
+    names = [m[1].encode() for m in N_MEMBERS] + [u.encode() for u in N_UNIQUE]
+    out = {}
+    for base, prefix in ((Path(root) / "tests", TEST_PREFIX), (Path(root) / SCOPE_SUBDIR / "tests", TEST_PREFIX + "ggml-sycl/")):
+        if not base.is_dir():
+            continue
+        for p in sorted(base.rglob("*")):
+            if p.is_file() and p.suffix.lower() in SCAN_SUFFIXES:
+                b = p.read_bytes()
+                if any(n in b for n in names):
+                    out[prefix + str(p.relative_to(base))] = b
+    return out
 
 
 _PARSE = {}      # sha1 -> root node
@@ -2114,12 +2162,13 @@ def judge(c):
 
 def analyse(files):
     """Every finding in the tree, before any allowlist or debt is applied."""
-    ctx = Ctx(files)
+    core = core_files(files)
+    ctx = Ctx(core)
     viols = []
-    stats = {"constructions": 0, "files": len(files), "value_types": sorted(ctx.value_types),
+    stats = {"constructions": 0, "files": len(core), "value_types": sorted(ctx.value_types),
              "all_types": sorted(ctx.all_types)}
-    for rel in sorted(files):
-        fa = facts_for(rel, files[rel], ctx)
+    for rel in sorted(core):
+        fa = facts_for(rel, core[rel], ctx)
         ordinal = {}
         for c in fa["constructions"]:
             stats["constructions"] += 1
@@ -2180,7 +2229,682 @@ def analyse(files):
             seen[base] = i + 1
             viols.append(V("E-RAW", "%s#%d" % (base, i), rel, r["line"], r["func"], r["name"],
                            "raw allocator name %s (%s) outside the allowlist" % (r["name"], r["form"])))
+    s2d = s2d_findings(files)
+    viols.extend(s2d.viols)
+    stats["dormant"], stats["active"] = s2d.dormant, sorted(s2d.active)
     return viols, stats
+
+
+# ---------------------------------------------------------------- S2d: clauses (i)-(o) and the dormancy latch
+# These clauses key on named functions, so their facts are per-file occurrences of the names they care about, cached by
+# content like the (a)-(h) facts. They hold tree-sitter nodes and live as long as the process, as _PARSE does.
+
+TEST_PREFIX = "tests/"   # test sources, read for clause (n) only: clauses (a)-(h) never see them (the scope excludes tests)
+
+I_ACCESSOR = "ggml_sycl_replan_token_held"
+I_RETIRED = ("onednn_w_retry_lost_cas", "onednn_pp_a_relock_busy_pre_l0")
+K_TXN, K_REAP, K_MODE = "ggml_sycl_run_runtime_context_transaction", "release_retained_referencing", \
+    "RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER"
+K_INTERIM = "onednn_pp_a_reclaim_query_interim"
+L_COUNT, L_REPLACE, L_GUARD = "owner_use_count", "replace_within", "replace_within_count_guard"
+L_FREES = ("unified_free", "zone_free", "reset", "enqueue_deferred_zone_free")
+L_TLSF_FREE = re.compile(r"tlsf\w*free|free\w*tlsf", re.I)
+L_MEM_HANDLE = ("mem-handle.cpp", "mem-handle.hpp")   # the count's own implementation
+J_FIT = ("onednn_pp_a_bytes", "onednn_pp_w_bytes")      # A's fit and W's term: per-model sources only
+J_BANNED = re.compile(r"g_tensor_inventory_\w*|unified_cache_get_planned_(?:pp_moe_)?onednn_\w*")
+J_ELIGIBLE = "zone_is_onednn_reorder_eligible"
+M_FLOOR_FN, M_FLOOR_ENV = "ensure_planned_arena_zones", "GGML_SYCL_COMPUTE_ARENA_MB"
+
+# Clause (n): the declined-result consumers. A class member is matched as `Class::name(` anywhere, or as a bare `name(`
+# only inside that class; the two unique names match anywhere.
+N_MEMBERS = (("DnnlGemmWrapper", "gemm"), ("DnnlGemmWrapper", "row_gemm"), ("DnnlGemmWrapper", "woq_gemm_q4_0"),
+             ("DnnlGemmWrapper", "woq_gemm_q8_0"), ("DnnlGemmWrapper", "woq_gemm_q4_0_impl"),
+             ("DnnlGemmWrapper", "gemm_batch_strided"), ("DnnlGemmWrapper", "woq_gemm_batch_mxfp4"),
+             ("DnnlSoftmaxWrapper", "softmax"), ("DnnlEltwiseWrapper", "eltwise"), ("DnnlBinaryWrapper", "binary_broadcast_row"))
+N_UNIQUE = ("get_scratchpad_mem", "ggml_sycl_mul_mat_batched_sycl")
+N_LAST = frozenset([m[1] for m in N_MEMBERS] + list(N_UNIQUE))
+
+# Clause (o): the acquire tokens whose consumers must submit on their census row's queue.
+O_ACQUIRE = ("acquire_onednn_pp_scratch", "ggml_sycl_set_rows_stage_ptr")
+O_EXECUTE = "dnnl::graph::sycl_interop::execute"
+
+# Witness 9: each model-shaped exact `*_bytes()` function is called by every allocation site that draws it and by the
+# zone sizing. (function, [(file, site function)]). The subjects are absent from the tree today.
+Z9_SIZING_FILES = ("zone-sizing.cpp", "unified-cache.cpp")
+Z9_SITES = (
+    ("load_reorder_temp_bytes", (("convert.cpp", "convert_alloc_device_scratch"), ("ggml-sycl.cpp", "arena_device_alloc"),
+                                 ("ggml-sycl.cpp", "ggml_sycl_fill_xmx_tiled"), ("ggml-sycl.cpp", "ggml_sycl_fill_xmx_tiled_host"),
+                                 ("ggml-sycl.cpp", "sycl_unified_device_temp_alloc"))),
+    ("woq_packed_bytes", (("gemm.hpp", "woq_gemm_q4_0_impl"),)),
+    ("mmq_work_counter_bytes", (("mmq.cpp", "get_mmq_work_counter"),)),
+    ("set_rows_stage_bytes", (("set_rows.cpp", "ggml_sycl_set_rows_stage_ptr"),)),
+)
+
+S2D_NAMES = frozenset({I_ACCESSOR, K_TXN, K_REAP, K_MODE, K_INTERIM, L_COUNT, L_REPLACE, L_GUARD, J_ELIGIBLE, M_FLOOR_FN}
+                      | set(I_RETIRED) | set(J_FIT) | set(N_LAST) | set(O_ACQUIRE) | {b for b, _ in Z9_SITES})
+S2D_BYTES = tuple(sorted(n.encode() for n in S2D_NAMES)) + (O_EXECUTE.encode(),)
+
+_S2D = {}   # sha1 -> facts
+MACRO_NOISE_RE = re.compile(r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*', re.S)   # strings and comments of a #define body
+
+
+class Occ:
+    """One spelling of a name the S2d clauses key on: a definition, a declaration, a call, or any other shape."""
+    __slots__ = ("name", "role", "node", "top", "call", "func", "line", "scope", "form")
+
+    def __init__(self, name, role, node, top, call, func, line, scope, form):
+        self.name, self.role, self.node, self.top, self.call = name, role, node, top, call
+        self.func, self.line, self.scope, self.form = func, line, scope, form
+
+
+def name_role(src, n):
+    """(role, top, call) for an identifier that spells a function name: 'call' (callee of a call_expression), 'def' (the name
+    of a function_definition), 'decl' (a `;`-terminated declaration), else 'other'."""
+    top, is_call = callee_ident(src, n)
+    if is_call:
+        return "call", top, parent(top)
+    top = n
+    p = parent(top)
+    while p is not None and kind(p) in ("qualified_identifier", "template_function") and same(fld(p, "name"), top):
+        top, p = p, parent(p)
+    if p is not None and kind(p) == "function_declarator" and same(fld(p, "declarator"), top):
+        q = parent(p)
+        while q is not None and kind(q) in ("pointer_declarator", "reference_declarator", "parenthesized_declarator"):
+            q = parent(q)
+        if q is not None and kind(q) == "function_definition":
+            return "def", top, None
+        if q is not None and kind(q) in ("declaration", "field_declaration"):
+            return "decl", top, None
+    return "other", top, None
+
+
+def scope_of(src, top):
+    """The last scope component of a qualified spelling (`DnnlGemmWrapper` in `DnnlGemmWrapper::row_gemm`), else None."""
+    q = top
+    if kind(q) == "template_function":
+        q = fld(q, "name") or q
+    if kind(q) == "qualified_identifier":
+        sc = fld(q, "scope")
+        return None if sc is None else txt(src, sc).split("::")[-1].strip()
+    return None
+
+
+def s2d_facts(src):
+    """{'occ': [Occ], 'fdefs': [(last name, enclosing name, function_definition node)]} for one file. A file that spells none
+    of the names is not walked."""
+    h = _sha(src)
+    if h in _S2D:
+        return _S2D[h]
+    occ, fdefs = [], []
+    if any(b in src for b in S2D_BYTES):
+        for n in walk(parse(src)):
+            k = kind(n)
+            if k in ("identifier", "field_identifier"):
+                nm = txt(src, n)
+                if nm in S2D_NAMES:
+                    role, top, call = name_role(src, n)
+                    occ.append(Occ(nm, role, n, top, call, enclosing(src, n), line_of(n), scope_of(src, top), "ast"))
+            elif k == "call_expression":
+                f = fld(n, "function")
+                if f is not None and kind(f) == "qualified_identifier" and norm(txt(src, f)).replace(" ", "") == O_EXECUTE:
+                    occ.append(Occ(O_EXECUTE, "call", f, f, n, enclosing(src, n), line_of(n), None, "ast"))
+            elif k == "function_definition":
+                d = fld(n, "declarator")
+                while d is not None and kind(d) != "function_declarator":
+                    d = fld(d, "declarator")
+                body = fld(n, "body")
+                if d is not None and fld(d, "declarator") is not None and body is not None:
+                    fdefs.append((callee_last(txt(src, fld(d, "declarator"))), enclosing(src, body), n))
+            elif k in ("preproc_def", "preproc_function_def"):
+                nm, body = fld(n, "name"), fld(n, "value")
+                words = set(re.findall(r"[A-Za-z_]\w*", MACRO_NOISE_RE.sub(" ", txt(src, body)))) if body is not None else set()
+                if nm is not None:
+                    words.add(txt(src, nm))
+                for w in sorted(words & S2D_NAMES):
+                    occ.append(Occ(w, "other", n, n, None, "#define " + (txt(src, nm) if nm is not None else "?"),
+                                   line_of(n), None, "macro"))
+    _S2D[h] = {"occ": occ, "fdefs": fdefs}
+    return _S2D[h]
+
+
+class Index:
+    """The S2d facts of a whole tree, by name."""
+
+    def __init__(self, files):
+        self.files = files
+        self.src = files
+        self.by_name, self.defs, self.def_by_func = {}, {}, {}
+        for rel in sorted(files):
+            fa = s2d_facts(files[rel])
+            for o in fa["occ"]:
+                self.by_name.setdefault(o.name, []).append((rel, o))
+            for name, func, node in fa["fdefs"]:
+                self.defs.setdefault(name, []).append((rel, func, node))
+                self.def_by_func.setdefault((rel, func), []).append(node)
+
+    def occ(self, name, roles=None):
+        return [(r, o) for r, o in self.by_name.get(name, []) if roles is None or o.role in roles]
+
+    def fdefs(self, name):
+        return self.defs.get(name, [])
+
+
+def has_name(ix, name, role):
+    return any(o.role == role for _, o in ix.occ(name))
+
+
+class S2dOut:
+    """Findings of one S2d pass, with the ordinal rule of the other clauses (a key is `base#ordinal`)."""
+
+    def __init__(self):
+        self.viols, self.dormant, self.seen, self.active = [], [], {}, set()
+
+    def add(self, code, rel, line, func, name, base, msg):
+        i = self.seen.get(base, 0)
+        self.seen[base] = i + 1
+        self.viols.append(V(code, "%s#%d" % (base, i), rel, line, func, name, msg))
+
+    def latch(self, clause, ix, name, shapes, why):
+        """Clause `clause` is keyed on `name`, which appears in a shape its matcher misses: fail loudly, never pass forever."""
+        for rel, o in ix.occ(name):
+            if o.role == "other":
+                self.add("X-LATCH", rel, o.line, o.func, name, "%s::%s::latch:%s:%s" % (rel, o.func, clause, name),
+                         "clause (%s) is keyed on %s, which appears here as something other than %s (%s); the clause "
+                         "matches nothing, so it would stay dormant for ever: respell it, or extend the matcher" % (
+                             clause, name, shapes, why))
+
+
+def body_of(node):
+    return fld(node, "body")
+
+
+def calls_in_node(src, n, last=None):
+    """call_expression nodes under `n` whose callee ends in `last` (any when None)."""
+    out = []
+    for c in walk(n):
+        if kind(c) == "call_expression":
+            f = fld(c, "function")
+            if f is not None and (last is None or callee_last(txt(src, f)) == last):
+                out.append(c)
+    return out
+
+
+def in_span(inner, outer):
+    return sb(outer) <= sb(inner) and eb(inner) <= eb(outer)
+
+
+def clause_i(ix, out):
+    """(i): once L0's accessor is defined, the pre-L0 retry and busy branch must be gone. A definition is a
+    function_definition node whose declarator names the accessor; a call or a `;` declaration is not one."""
+    defined = has_name(ix, I_ACCESSOR, "def")
+    out.latch("i", ix, I_ACCESSOR, "a call, a declaration or a function definition", "an alias, a macro or a lambda hides it")
+    if not defined:
+        out.dormant.append("DORMANT i: subject %s (a function definition) absent" % I_ACCESSOR)
+        return
+    out.active.add("i")
+    for nm in I_RETIRED:
+        for rel, o in ix.occ(nm, ("def",)):
+            out.add("I-RETRY", rel, o.line, o.func, nm, "%s::%s::retired-function:%s" % (rel, o.func, nm),
+                    "%s is defined while %s is defined: L0 has landed, so the pre-L0 path it served must be deleted" % (nm, I_ACCESSOR))
+
+
+def clause_k(ix, out):
+    """(k): once §B's COMPLETE-mode reap sits in the transaction, the pre-§B reclaim-query interim must be gone."""
+    reaped = False
+    for rel, func, node in ix.fdefs(K_TXN):
+        src = ix.files[rel]
+        calls = calls_in_node(src, body_of(node), K_REAP)
+        for n in walk(body_of(node)):
+            if kind(n) in ("identifier", "field_identifier") and txt(src, n) == K_MODE:
+                if any(in_span(n, fld(c, "arguments")) for c in calls if fld(c, "arguments") is not None):
+                    reaped = True
+                else:
+                    out.add("X-LATCH", rel, line_of(n), func, K_MODE, "%s::%s::latch:k:%s" % (rel, func, K_MODE),
+                            "clause (k) is keyed on a call of %s whose arguments name %s, inside %s; %s appears here outside "
+                            "any such call, so the clause would stay dormant: respell it, or extend the matcher" % (
+                                K_REAP, K_MODE, K_TXN, K_MODE))
+    if not reaped:
+        out.dormant.append("DORMANT k: subject %s(... %s ...) inside %s absent" % (K_REAP, K_MODE, K_TXN))
+        return
+    out.active.add("k")
+    for rel, o in ix.occ(K_INTERIM, ("def",)):
+        out.add("K-INTERIM", rel, o.line, o.func, K_INTERIM, "%s::%s::interim-after-reap:%s" % (rel, o.func, K_INTERIM),
+                "%s is defined while %s reaps in COMPLETE mode: the arithmetic refusal cannot outlive the path that removes "
+                "its cause" % (K_INTERIM, K_TXN))
+
+
+JUMP_KINDS = ("return_statement", "break_statement", "continue_statement", "goto_statement", "throw_statement")
+
+
+def reads_count(src, n, tainted):
+    for x in walk(n):
+        if kind(x) in ("identifier", "field_identifier") and (txt(src, x) == L_COUNT or txt(src, x) in tainted):
+            return True
+    return False
+
+
+def count_controlled_frees(src, fnode):
+    """call_expression nodes that free or release storage and whose execution depends on a condition that reads the count,
+    directly or through a local assigned from an expression that does (the laundering form), to a fixpoint. A branch that
+    leaves the function or loop also controls the statements after it in its block."""
+    body = body_of(fnode)
+    pairs = []
+    for x in walk(body):
+        if kind(x) == "init_declarator" and fld(x, "declarator") is not None and fld(x, "value") is not None:
+            pairs.append((declared_name(src, fld(x, "declarator")), fld(x, "value")))
+        elif kind(x) == "assignment_expression" and fld(x, "left") is not None and kind(fld(x, "left")) == "identifier":
+            pairs.append((txt(src, fld(x, "left")), fld(x, "right")))
+    tainted, changed = set(), True
+    while changed:
+        changed = False
+        for name, val in pairs:
+            if name and name not in tainted and val is not None and reads_count(src, val, tainted):
+                tainted.add(name)
+                changed = True
+    regions = []
+    for x in walk(body):
+        k = kind(x)
+        cond = None
+        if k in ("if_statement", "while_statement", "do_statement", "switch_statement", "conditional_expression"):
+            cond = fld(x, "condition")
+        elif k == "for_statement":
+            cond = fld(x, "condition")
+        elif k == "for_range_loop":
+            cond = fld(x, "right")
+        elif k == "binary_expression" and txt(src, fld(x, "operator")) in ("&&", "||"):
+            if reads_count(src, fld(x, "left"), tainted):
+                regions.append(fld(x, "right"))
+            continue
+        if cond is None or not reads_count(src, cond, tainted):
+            continue
+        if k == "if_statement":
+            branches = [b for b in (fld(x, "consequence"), fld(x, "alternative")) if b is not None]
+            regions += branches
+            p = parent(x)
+            if p is not None and kind(p) == "compound_statement" and any(kind(y) in JUMP_KINDS for b in branches for y in walk(b)):
+                regions += [c for c in kids(p) if sb(c) > sb(x) and _a(c, "is_named")]
+        elif k == "conditional_expression":
+            regions += [b for b in (fld(x, "consequence"), fld(x, "alternative")) if b is not None]
+        else:
+            b = fld(x, "body")
+            if b is not None:
+                regions.append(b)
+    found, seen = [], set()
+    for r in regions:
+        for c in calls_in_node(src, r):
+            last = callee_last(txt(src, fld(c, "function")))
+            if (last in L_FREES or L_TLSF_FREE.search(last)) and sb(c) not in seen:
+                seen.add(sb(c))
+                found.append((c, last))
+    return found
+
+
+def first_statement(node):
+    for c in kids(body_of(node)):
+        if _a(c, "is_named") and kind(c) != "comment":
+            return c
+    return None
+
+
+def clause_l(ix, out):
+    """(l): the owner count never consumes a shared handle. Callers outside mem-handle.* are an allowlist (L-CALLER); no
+    freeing call is controlled by a condition that depends on the count (L-FREE); replace_within's first statement is
+    replace_within_count_guard(old) (L-GUARD)."""
+    out.latch("l", ix, L_COUNT, "a call", "a pointer-to-member, a macro or an alias hides it")
+    out.latch("l", ix, L_REPLACE, "a call, a declaration or a function definition", "an alias, a macro or a lambda hides it")
+    if not ix.occ(L_COUNT, ("call", "decl", "def")):
+        out.dormant.append("DORMANT l: subject %s absent" % L_COUNT)
+    else:
+        out.active.add("l")
+        funcs = {}
+        for rel, o in ix.occ(L_COUNT, ("call",)):
+            if rel in L_MEM_HANDLE:
+                continue
+            out.add("L-CALLER", rel, o.line, o.func, L_COUNT, "%s::%s::count-caller:%s" % (rel, o.func, L_COUNT),
+                    "%s is called outside mem-handle.* from a function that is not on the allowlist of the five count "
+                    "consumers" % L_COUNT)
+            funcs[(rel, o.func)] = True
+        for (rel, func) in sorted(funcs):
+            for node in ix.def_by_func.get((rel, re.sub(r"^lambda in ", "", func)), []):
+                for c, last in count_controlled_frees(ix.files[rel], node):
+                    out.add("L-FREE", rel, line_of(c), func, last, "%s::%s::count-controlled-free:%s:%s" % (
+                        rel, func, last, text_hash(txt(ix.files[rel], c))),
+                            "%s is called under a condition that depends on %s: the count may select a path that keeps the "
+                            "handle's ownership intact, never one that frees or releases storage outside it" % (last, L_COUNT))
+    defs = ix.fdefs(L_REPLACE)
+    if not defs:
+        out.dormant.append("DORMANT l: subject %s (a function definition) absent" % L_REPLACE)
+        return
+    out.active.add("l")
+    for rel, func, node in defs:
+        st = first_statement(node)
+        src = ix.files[rel]
+        ok = False
+        if st is not None and kind(st) == "expression_statement":
+            for c in kids(st):
+                if kind(c) == "call_expression" and callee_last(txt(src, fld(c, "function"))) == L_GUARD \
+                        and re.sub(r"\s+", "", txt(src, fld(c, "arguments"))) == "(old)":
+                    ok = True
+        if not ok:
+            out.add("L-GUARD", rel, line_of(node), func, L_REPLACE, "%s::%s::first-statement:%s" % (rel, func, L_GUARD),
+                    "%s must call %s(old) as its first statement, so the one count-selected consumer re-checks before "
+                    "it consumes anything" % (L_REPLACE, L_GUARD))
+
+
+def clause_j(ix, out):
+    """(j): A's fit and W's term read per-model sources only (J-SOURCE, dormant until they exist); nothing outside the
+    late stage's classifier calls zone_is_onednn_reorder_eligible (J-DISPATCH)."""
+    for nm in J_FIT:
+        out.latch("j", ix, nm, "a call, a declaration or a function definition", "an alias, a macro or a lambda hides it")
+    fits = [(rel, func, node) for nm in J_FIT for rel, func, node in ix.fdefs(nm)]
+    if not fits:
+        out.dormant.append("DORMANT j: subject %s (a function definition) absent" % " / ".join(J_FIT))
+    else:
+        out.active.add("j")
+        for rel, func, node in fits:
+            src = ix.files[rel]
+            for x in walk(body_of(node)):
+                if kind(x) in ("identifier", "field_identifier") and J_BANNED.fullmatch(txt(src, x)):
+                    out.add("J-SOURCE", rel, line_of(x), func, txt(src, x), "%s::%s::per-model-source:%s" % (rel, func, txt(src, x)),
+                            "%s reads %s, which is process- or device-global: A's fit and W's term read per-model sources only"
+                            % (func, txt(src, x)))
+    for rel, o in ix.occ(J_ELIGIBLE, ("call",)):
+        out.add("J-DISPATCH", rel, o.line, o.func, J_ELIGIBLE, "%s::%s::eligibility-call:%s" % (rel, o.func, J_ELIGIBLE),
+                "%s is called outside the late stage's classifier; the classification is made once, at the plan, and a "
+                "dispatch path reads its stored bits" % J_ELIGIBLE)
+
+
+# Clause (m): the SCRATCH floor list. The appendix's census table is committed as appendix-rows.json (generated from the
+# design's table); SCRATCH_FLOOR_CONSUMERS is the gate's own table of (row, owner ticket).
+M_TABLES = {
+    "floor": {17: "beni", 21: "beni", 31: "beni", 33: "beni", 34: "beni", 61: "beni", 68: "beni", 69: "beni", 74: "beni",
+              81: "beni", 90: "beni", 106: "beni", 59: "pqmm", 60: "pqmm", 66: "pqmm", 67: "pqmm", 91: "pqmm", 51: "zhcn",
+              9: "6lfq", 103: "6lfq", 101: "pending (lead)", 138: "pending (lead)"},
+    "covered": {62: 61},                      # row -> the listed row whose pool peak covers it
+    "unreachable": {129: "reserve_compute_arena draws no SCRATCH under an arena"},
+}
+S2D_DATA = {"dir": None}
+
+
+def appendix_rows():
+    """row number -> {zone, core, code, term}, from appendix-rows.json beside the allowlist; None when it is missing."""
+    d = S2D_DATA["dir"] or Path(__file__).resolve().parent / "sycl-alloc-zone-contract"
+    p = Path(d) / "appendix-rows.json"
+    if not p.exists():
+        return None
+    return {int(r["row"]): r for r in json.loads(p.read_text())["rows"]}
+
+
+def clause_m(ix, out):
+    """(m): every appendix row whose zone today or core zone is SCRATCH is listed, covered by a named peak, or excluded by
+    class (core-planned, D, REF, unreachable); a listed row whose zone is not SCRATCH fails; and the floor tie."""
+    rows = appendix_rows()
+    if rows is None:
+        out.add("M-DATA", "appendix-rows.json", 0, "<table>", "", "appendix::missing", "appendix-rows.json is missing: clause (m) "
+                "reads the census table's zone columns from it")
+        return
+    floor, covered, unreach = M_TABLES["floor"], M_TABLES["covered"], M_TABLES["unreachable"]
+    for r in sorted(rows):
+        row = rows[r]
+        scratch = "SCRATCH" in row["zone"] or "SCRATCH" in row["core"]
+        if not scratch:
+            continue
+        if r in floor or (r in covered and covered[r] in floor):
+            continue
+        if row["term"].startswith("core") or row["code"] in ("D", "REF") or r in unreach:
+            continue
+        out.add("M-SCRATCH", "appendix-rows.json", 0, "row %d" % r, str(r), "appendix::row:%d:scratch" % r,
+                "appendix row %d (%s) draws SCRATCH and is neither on the floor list, covered by a named peak, nor excluded by "
+                "class" % (r, row["function"]))
+    for r in sorted(floor):
+        if r not in rows or not ("SCRATCH" in rows[r]["zone"] or "SCRATCH" in rows[r]["core"]):
+            out.add("M-STALE", "appendix-rows.json", 0, "row %d" % r, str(r), "appendix::row:%d:stale-floor" % r,
+                    "floor row %d is not a SCRATCH row of the appendix: the list cannot carry a stale number" % r)
+    for r, peak in sorted(covered.items()):
+        if peak not in floor:
+            out.add("M-STALE", "appendix-rows.json", 0, "row %d" % r, str(r), "appendix::row:%d:stale-peak" % r,
+                    "row %d is covered by row %d's peak, which is not on the floor list" % (r, peak))
+    fn = [(rel, func, node) for rel, func, node in ix.fdefs(M_FLOOR_FN) if rel == "unified-cache.cpp"]
+    has_floor = any(M_FLOOR_ENV in txt(ix.files[rel], body_of(node)) and re.search(
+        r'getenv\s*\(\s*"%s"\s*\)' % M_FLOOR_ENV, txt(ix.files[rel], body_of(node))) for rel, _, node in fn)
+    if floor and not has_floor:
+        out.add("M-FLOOR", "unified-cache.cpp", 0, M_FLOOR_FN, M_FLOOR_FN, "appendix::floor-tie",
+                "%d SCRATCH consumers still draw without a term, but %s does not apply the %s floor" % (len(floor), M_FLOOR_FN, M_FLOOR_ENV))
+    if not floor and has_floor:
+        out.add("M-FLOOR", "unified-cache.cpp", 0, M_FLOOR_FN, M_FLOOR_FN, "appendix::floor-tie",
+                "the SCRATCH floor list is empty, so %s must no longer apply the %s floor" % (M_FLOOR_FN, M_FLOOR_ENV))
+
+
+def class_of(func):
+    """The class a function name carries (`DnnlGemmWrapper` for `DnnlGemmWrapper::row_gemm` or `<member of DnnlGemmWrapper>`)."""
+    f = re.sub(r"^lambda in ", "", func)
+    m = re.match(r"<member of (\w+)>$", f)
+    if m:
+        return m.group(1)
+    return f.split("::")[-2] if "::" in f else None
+
+
+def encl_class(src, node):
+    """The name of the class or struct whose body holds `node`, else None (a prototype in a class body has no enclosing
+    function, so `enclosing()` cannot name its class)."""
+    p = parent(node)
+    while p is not None:
+        if kind(p) in ("class_specifier", "struct_specifier"):
+            nm = fld(p, "name")
+            return txt(src, nm).split("::")[-1].strip() if nm is not None else None
+        p = parent(p)
+    return None
+
+
+def n_listed(src, o):
+    """The listed name an occurrence spells, as (class or None, name), or None: `Class::name` anywhere, a bare member name
+    only inside that class, the two unique names anywhere."""
+    if o.name in N_UNIQUE:
+        return (None, o.name)
+    if o.scope is not None:
+        return (o.scope, o.name) if (o.scope, o.name) in N_MEMBERS else None
+    if kind(o.top) == "identifier" or o.role in ("def", "decl"):
+        c = encl_class(src, o.node) or class_of(o.func)
+        if c is not None and (c, o.name) in N_MEMBERS:
+            return (c, o.name)
+    return None
+
+
+def value_use(src, call):
+    """'void-cast' for `(void) f()` and `static_cast<void>(f())`, 'discard' for a call that is its own expression statement
+    (or the left operand of a comma), else 'used'."""
+    n, p = call, parent(call)
+    while p is not None and kind(p) == "parenthesized_expression":
+        n, p = p, parent(p)
+    while p is not None and kind(p) == "comma_expression" and not same(fld(p, "left"), n):
+        n, p = p, parent(p)
+    if p is None:
+        return "used"
+    if kind(p) == "cast_expression":
+        t = fld(p, "type")
+        return "void-cast" if t is not None and norm(txt(src, t)) == "void" else "used"
+    if kind(p) == "argument_list" and parent(p) is not None and kind(parent(p)) == "call_expression":
+        f = fld(parent(p), "function")
+        if f is not None and re.sub(r"\s+", "", txt(src, f)).startswith("static_cast<void>"):
+            return "void-cast"
+    if kind(p) == "comma_expression" or kind(p) == "expression_statement":
+        return "discard"
+    return "used"
+
+
+def has_nodiscard(src, top):
+    p = parent(top)
+    while p is not None and kind(p) != "function_declarator":
+        p = parent(p)
+    q = parent(p) if p is not None else None
+    while q is not None and kind(q) in ("pointer_declarator", "reference_declarator", "parenthesized_declarator"):
+        q = parent(q)
+    return q is not None and any(kind(c) == "attribute_declaration" and "nodiscard" in txt(src, c) for c in kids(q))
+
+
+def clause_n(ixt, out):
+    """(n): a declined result is consumed. Each call of a listed name is the initializer of a declaration, the right side of
+    an assignment, a return operand or a condition (here: anything but a discarded value); a call that is its own
+    expression statement, or is cast to void, fails (N-VOID); each listed declaration carries [[nodiscard]] (N-NODISCARD)."""
+    for nm in sorted(N_LAST):
+        for rel, o in ixt.occ(nm):
+            lst = n_listed(ixt.files[rel], o)
+            if lst is None or o.role == "other":
+                continue
+            cname = ("%s::%s" % lst) if lst[0] else lst[1]
+            src = ixt.files[rel]
+            if o.role == "call":
+                use = value_use(src, o.call)
+                if use != "used":
+                    out.add("N-VOID", rel, o.line, o.func, cname, "%s::%s::%s:%s:%s" % (rel, o.func, use, cname, text_hash(txt(src, o.call))),
+                            "the result of %s is %s: a declined result is consumed (assigned, returned or tested)" % (
+                                cname, "cast to void" if use == "void-cast" else "discarded"))
+            elif o.scope is None and not has_nodiscard(src, o.top):
+                out.add("N-NODISCARD", rel, o.line, o.func, cname, "%s::%s::nodiscard:%s" % (rel, o.func, cname),
+                        "%s is declared without [[nodiscard]], so a caller can drop the declined result silently" % cname)
+
+
+# Clause (o): each C-term consumer submits on its census row's queue. A row pins, at the submission that consumes the
+# acquired bytes, the call's queue argument (by position and exact text, whitespace normalised), or, for a callee that
+# takes no queue, the declaration of its queue inside the callee. `consumers` entries are (callee, an identifier that must
+# appear among the arguments or None, queue argument index, queue text).
+O_ROWS = (
+    {"term": "onednn_graph_scratch", "token": O_EXECUTE, "file": "fattn-onednn.cpp", "func": "ggml_sycl_flash_attn_ext_onednn",
+     "consumers": ((O_EXECUTE, None, 1, "dnnl_stream"),),
+     "decls": (("dnnl_stream", "ctx.stream_dnnl(stream)"), ("stream", "ctx.stream()")), "callee_decls": ()},
+    {"term": "onednn_pp_a", "token": "acquire_onednn_pp_scratch", "file": "ggml-sycl.cpp", "func": "ggml_sycl_op_mul_mat_sycl",
+     "consumers": (("to_fp16_sycl", "dst_f16", 3, "stream"),
+                   ("dequantize_row_q8_0_soa_to_fp16_rowmajor", "dst_f16", 4, "stream"),
+                   ("dequantize_row_q8_0_coalesced_to_fp16_rowmajor", "dst_f16", 4, "stream"),
+                   ("row_gemm", None, 10, "stream")), "decls": (), "callee_decls": ()},
+    {"term": "onednn_pp_a", "token": "acquire_onednn_pp_scratch", "file": "ggml-sycl.cpp", "func": "ggml_sycl_mul_mat",
+     "consumers": (("dequant_weights_to_fp16", "weights_scratch", 3, "ctx.stream()"),
+                   ("f32_to_fp16", "activations_scratch", 3, "ctx.stream()"),
+                   ("store", "weights_scratch", 3, "*ctx.stream()"),
+                   ("row_gemm", "activations_scratch", 10, "ctx.stream()")), "decls": (), "callee_decls": ()},
+    {"term": "set_rows_stage", "token": "ggml_sycl_set_rows_stage_ptr", "file": "set_rows.cpp", "func": "ggml_sycl_op_set_rows",
+     "consumers": (("set_rows_validate_indices", "plan", 0, "*ctx.stream(plan.owner_device, 0)"),
+                   ("ggml_sycl_fattn_xmx_update_packed_k_from_set_rows", "plan", 6, "ctx.stream(plan.owner_device, 0)")),
+     "decls": (), "callee_decls": (("set_rows_sycl", (("stream", "ctx.stream(device, 0)"), ("device", "plan.owner_device"))),)},
+)
+
+
+def arg_nodes(call):
+    a = fld(call, "arguments")
+    return [c for c in kids(a) if _a(c, "is_named") and kind(c) != "comment"] if a is not None else []
+
+
+def squash(s):
+    return re.sub(r"\s+", "", norm(s))
+
+
+def var_inits(src, body, var):
+    """The initializer texts (whitespace removed) of every declaration `T var = ...;` under `body`, read from the text: a
+    macro with no `;` before the declaration (`GGML_TENSOR_BINARY_OP_LOCALS`) makes the parse swallow the declared name."""
+    text = norm(txt(src, body))
+    return [re.sub(r"\s+", "", m.group(1)) for m in re.finditer(r"[\w>*&]\s+%s\s*=\s*([^;{}]*);" % re.escape(var), text)]
+
+
+def clause_o(ix, out):
+    """(o): every call of an acquire token sits in a function that has a census row, and each consuming call of that row
+    keeps the row's queue. A presence test could not fail (`ggml_sycl_mul_mat` holds dozens of `ctx.stream()`), so the
+    pin is on the consuming call's own argument."""
+    tokens = set(O_ACQUIRE) | {O_EXECUTE}
+    rowkey = {(r["token"], r["file"], r["func"]) for r in O_ROWS}
+    for tok in sorted(tokens):
+        for rel, o in ix.occ(tok, ("call",)):
+            fn = re.sub(r"^lambda in ", "", o.func)
+            if (tok, rel, fn) not in rowkey:
+                out.add("O-NOROW", rel, o.line, fn, tok, "%s::%s::o-acquire:%s" % (rel, fn, tok),
+                        "%s is called in %s, which has no census row (clause (o)): add its row, with the queue its "
+                        "consumers submit on" % (tok, fn))
+    for row in O_ROWS:
+        defs = [(f, n) for r, f, n in ix.fdefs(row["func"]) if r == row["file"]]
+        if not defs:
+            out.add("O-ROW", row["file"], 0, row["func"], row["term"], "%s::%s::o-row:%s:function-missing" % (row["file"], row["func"], row["term"]),
+                    "census row %s names %s in %s, which has no such function" % (row["term"], row["func"], row["file"]))
+            continue
+        src = ix.files[row["file"]]
+        for func, node in defs:
+            body = body_of(node)
+            calls = calls_in_node(src, body)
+            if not any(callee_last(txt(src, fld(c, "function"))) == row["token"] or
+                       re.sub(r"\s+", "", txt(src, fld(c, "function"))) == row["token"] for c in calls):
+                out.add("O-ROW", row["file"], line_of(node), func, row["term"], "%s::%s::o-row:%s:acquire-missing" % (row["file"], func, row["term"]),
+                        "census row %s: %s no longer calls %s" % (row["term"], func, row["token"]))
+            for callee, has, qi, qtext in row["consumers"]:
+                found = []
+                for c in calls:
+                    f = re.sub(r"\s+", "", txt(src, fld(c, "function")))
+                    if (f == callee if "::" in callee else callee_last(f) == callee) and \
+                            (has is None or re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(has), txt(src, fld(c, "arguments")))):
+                        found.append(c)
+                if not found:
+                    out.add("O-ROW", row["file"], line_of(node), func, callee, "%s::%s::o-row:%s:consumer-missing:%s" % (row["file"], func, row["term"], callee),
+                            "census row %s: no call of %s%s remains in %s" % (row["term"], callee, " taking " + has if has else "", func))
+                for c in found:
+                    args = arg_nodes(c)
+                    got = squash(txt(src, args[qi])) if qi < len(args) else "<no argument %d>" % qi
+                    if got != squash(qtext):
+                        out.add("O-QUEUE", row["file"], line_of(c), func, callee, "%s::%s::o-queue:%s:%s:%s" % (
+                            row["file"], func, row["term"], callee, text_hash(txt(src, c))),
+                                "census row %s: %s consumes the acquired bytes on queue `%s`, the row pins `%s`" % (
+                                    row["term"], callee, got, qtext))
+            for var, init in row["decls"]:
+                inits = var_inits(src, body, var)
+                if init.replace(" ", "") not in inits:
+                    out.add("O-QUEUE", row["file"], line_of(node), func, var, "%s::%s::o-decl:%s:%s" % (row["file"], func, row["term"], var),
+                            "census row %s: `%s` is no longer declared as `%s` in %s (declared as %s)" % (
+                                row["term"], var, init, func, inits or "nothing"))
+            for callee, decls in row["callee_decls"]:
+                cdefs = [n for r, f, n in ix.fdefs(callee) if r == row["file"]]
+                ok = any(all(init.replace(" ", "") in var_inits(src, body_of(n), var) for var, init in decls) for n in cdefs)
+                if not ok:
+                    out.add("O-QUEUE", row["file"], line_of(node), func, callee, "%s::%s::o-callee-decl:%s:%s" % (row["file"], func, row["term"], callee),
+                            "census row %s: %s takes no queue, so the row pins its own declarations %s inside it, and none of "
+                            "its definitions holds them" % (row["term"], callee, ", ".join("%s = %s" % d for d in decls)))
+
+
+def clause_z9(ix, out):
+    """Witness 9: every model-shaped exact `*_bytes()` function is called by its allocation sites and by the zone sizing;
+    dormant while the function is not defined."""
+    for fn, sites in Z9_SITES:
+        out.latch("9", ix, fn, "a call or a function definition", "an alias, a macro or a lambda hides it")
+        if not has_name(ix, fn, "def"):
+            out.dormant.append("DORMANT 9: subject %s (a function definition) absent" % fn)
+            continue
+        out.active.add("9")
+        for rel, site in sites:
+            hits = [(f, n) for r, f, n in ix.fdefs(site.split("::")[-1]) if r == rel]
+            if not hits:
+                out.add("Z9-SITE", rel, 0, site, fn, "%s::%s::bytes-site:%s:missing" % (rel, site, fn),
+                        "%s is an allocation site of %s but %s defines no function of that name" % (site, fn, rel))
+            elif not any(calls_in_node(ix.files[rel], body_of(n), fn) for _, n in hits):
+                out.add("Z9-SITE", rel, line_of(hits[0][1]), site, fn, "%s::%s::bytes-site:%s" % (rel, site, fn),
+                        "%s no longer calls %s: the site and the zone sizing must share the one function, or the plan "
+                        "reserves what the site does not draw" % (site, fn))
+        sized = [(rel, o) for rel, o in ix.occ(fn, ("call",)) if rel in Z9_SIZING_FILES]
+        if not sized:
+            out.add("Z9-SIZING", Z9_SIZING_FILES[0], 0, "<zone sizing>", fn, "sizing::bytes-fn:%s" % fn,
+                    "%s is called by no function of %s: the zone sizing must charge what its sites draw, through the same "
+                    "function" % (fn, " or ".join(Z9_SIZING_FILES)))
+
+
+def s2d_findings(files):
+    """(violations, dormant lines, active clauses) of clauses (i)-(o) and witness 9's clause. Tests are read for clause (n)
+    only."""
+    core = {r: s for r, s in files.items() if not r.startswith(TEST_PREFIX)}
+    ix, ixt = Index(core), Index(files)
+    out = S2dOut()
+    clause_i(ix, out)
+    clause_k(ix, out)
+    clause_l(ix, out)
+    clause_j(ix, out)
+    clause_m(ix, out)
+    clause_n(ixt, out)
+    clause_o(ix, out)
+    clause_z9(ix, out)
+    return out
 
 
 # ---------------------------------------------------------------- allowlist and debt
@@ -2248,6 +2972,9 @@ def validate_data(allowlist, debt):
             errs.append("FAIL debt entry %s %s has unknown code" % (d["code"], d["key"]))
         if d["code"] in H_CODES:
             errs.append("FAIL debt entry %s %s: a clause-(h) finding is allowlisted per node or fixed, never debt" % (d["code"], d["key"]))
+        if d["code"] in S2D_CODES and d["code"] not in S2D_DEBT:
+            errs.append("FAIL debt entry %s %s: a finding of this code is allowlisted per node or fixed, never debt (only N-VOID and "
+                        "N-NODISCARD, the declined results dropped today, are)" % (d["code"], d["key"]))
         seen[(d["code"], d["key"])] += 1
         if d["code"] == "E-RAW" and not FATE_RE.match(str(d.get("fate", ""))):
             errs.append("FAIL debt entry E-RAW %s has no valid fate (deleted-by-*, converted-by-*, sanctioned-internal, "
@@ -2388,8 +3115,11 @@ class Case:
     (`planted=False` opts out for a mutation that adds no construction)."""
 
     def __init__(self, wid, label, mutate, expect, code=None, naming=None, allowlist=None, edit_allowlist=None,
-                 edit_debt=None, planted=True, allow_nodes=None, allow_from=None):
+                 edit_debt=None, planted=True, allow_nodes=None, allow_from=None, active=None, dormant=None, m_edit=None):
         self.wid, self.label, self.mutate, self.expect = wid, label, mutate, expect
+        # active / dormant: a clause letter the S2d pass must report as keyed on a subject / as still dormant. m_edit edits
+        # a copy of M_TABLES for the run.
+        self.active, self.dormant, self.m_edit = active, dormant, m_edit
         self.code, self.naming, self.allowlist = code, naming, allowlist
         self.edit_allowlist, self.edit_debt, self.planted = edit_allowlist, edit_debt, planted
         # allow_nodes: [{"code", "func", "nth", "extra"}]. Each becomes a key-matched allowlist entry for the node the gate
@@ -2438,8 +3168,18 @@ WITNESSES = {
     "26": "cascade_step = <expr> other than the allowlisted callee's own parameter", "34": "a rethrow-less handler inside a #define body",
     "s2c-host": "host raw allocator names (malloc_host, aligned_alloc_host, zeMemAllocHost, sycl::malloc, the host chain's wrappers)",
     "s2c-catch": "spellings and placements of the rethrow clause", "s2c-data": "clause-(h) entries that must be refused by validation",
+    "9": "a model-shaped *_bytes() function is called by its allocation sites and by the zone sizing; dormant until defined",
+    "27": "clause (j): A's fit and W's term read per-model sources only; the eligibility classifier is not called outside the late stage",
+    "28": "clause (i): defining L0's replan-token accessor retires the W lost-CAS retry", "31": "clause (i): ... and A's pre-L0 busy return",
+    "30": "clause (k): §B's COMPLETE reap in the transaction retires the pre-§B interim",
+    "29": "clause (l): the owner count never selects a free, its callers are listed, replace_within guards first",
+    "32": "clause (m): every SCRATCH row of the appendix is on the floor list, covered, or excluded by class; the floor is tied to its env",
+    "33": "clause (n) in tests: a declined result is consumed where a test calls the listed names",
+    "35": "clause (n): a declined result is consumed, and each listed declaration is [[nodiscard]]",
+    "36": "clause (o): each C-term consumer submits on its census row's queue; every acquire has a row",
+    "s2d": "the appendix census table is data: a missing appendix-rows.json fails",
 }
-WITNESSES_DEFERRED = {"9": "S2d: dormant clause; its *_bytes() subjects are absent from the tree"}
+WITNESSES_DEFERRED = {"37": "S2d-2: clause (p) is dormant until its subject exists", "38": "S2d-2: clause (p) is dormant until its subject exists"}
 
 
 def matrix_cases():
@@ -3400,7 +4140,321 @@ def matrix_cases():
     A(Case("s2c-host", "the staging buffer's site renamed leaves E-BACKING-STAGING matching nothing", replace_token(
         "unified-cache.cpp", "onednn_graph_scratch_ensure_flag_slab_locked", "onednn_graph_scratch_ensure_flag_slab_locked_zz"),
         "FAIL", "allowlist", "E-BACKING-FLAG-SLAB matches nothing"))
+    c.extend(matrix_cases_s2d1())
+    c.extend(matrix_cases_s2d1b())
     return c
+
+
+def replace_once(rel, old, new):
+    """Replace the one occurrence of `old` in a file; a missing or ambiguous anchor is a setup error."""
+    def f(files):
+        src = files[rel].decode()
+        if src.count(old) != 1:
+            raise SystemExit("matrix setup error: %r occurs %d times in %s, expected once" % (old, src.count(old), rel))
+        return dict(files, **{rel: src.replace(old, new).encode()})
+    return f
+
+
+def chain(*fns):
+    def f(files):
+        for fn in fns:
+            files = fn(files)
+        return files
+    return f
+
+
+def drop_debt(code, *needles):
+    """edit_debt: drop the debt entries of `code` whose key holds every needle (a planted fix that retires them)."""
+    return lambda debt: dict(debt, violations=[d for d in debt["violations"]
+                                               if not (d["code"] == code and all(n in d["key"] for n in needles))])
+
+
+def with_allow(*specs):
+    """edit_allowlist: add one count-1 entry per (code, file, function)."""
+    def f(al):
+        ents = [{"id": "E-ZZ-S%d" % i, "code": c, "file": fl, "function": fn, "count": 1, "reason": "mutation-matrix planted function"}
+                for i, (c, fl, fn) in enumerate(specs)]
+        return dict(al, entries=list(al.get("entries", [])) + ents)
+    return f
+
+
+def m_without(table, key):
+    def f(t):
+        t[table].pop(key, None)
+    return f
+
+
+def m_set(table, key, val):
+    def f(t):
+        t[table][key] = val
+    return f
+
+
+def matrix_cases_s2d1():
+    """Clauses (i)-(o) and witness 9 (S2d-1). Every FAIL case plants a violation; every PASS control either plants the
+    compliant shape or edits the real tree so that the subject is present and active (`active`), or asserts the clause is
+    still dormant (`dormant`)."""
+    c = []
+    A = c.append
+    TP = "zz-plant.cpp"
+    RET = "void onednn_w_retry_lost_cas() {\n}\n"
+    ACC = "bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind) {\n    return true;\n}\n"
+    # 28 / 31: the pre-L0 retry and the busy branch leave once L0's accessor is defined
+    A(Case("28", "the accessor defined while the W retry still exists", plant(ACC + RET), "FAIL", "I-RETRY", "onednn_w_retry_lost_cas"))
+    A(Case("28", "the accessor with its default argument, split across lines, while the retry exists", plant(
+        "bool\nggml_sycl_replan_token_held(\n    ggml_sycl_replan_kind kind = ggml_sycl_replan_kind::ANY) {\n    return true;\n}\n" + RET),
+        "FAIL", "I-RETRY", "onednn_w_retry_lost_cas"))
+    A(Case("28", "the accessor qualified by a namespace, defined out of line", plant(
+        "bool ggml_sycl::ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind) {\n    return true;\n}\n" + RET),
+        "FAIL", "I-RETRY", "onednn_w_retry_lost_cas"))
+    A(Case("28", "the same tree with the retry deleted (control)", plant(ACC), "PASS", active="i"))
+    A(Case("28", "the retry with no accessor: dormant (control)", plant(RET), "PASS", dormant="i"))
+    A(Case("28", "the accessor planted only as a call site, with the retry (control)", plant(
+        "void zzplant_i() {\n    (void) ggml_sycl_replan_token_held(ggml_sycl_replan_kind::ANY);\n}\n" + RET), "PASS", dormant="i"))
+    A(Case("28", "the accessor planted only as a ;-terminated declaration, with the retry (control)", plant(
+        "bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind = ggml_sycl_replan_kind::ANY);\n" + RET), "PASS", dormant="i"))
+    A(Case("28", "the accessor spelled as a lambda variable, a shape the matcher misses: the latch fails", plant(
+        "static auto ggml_sycl_replan_token_held = [](int kind) { return kind != 0; };\n" + RET), "FAIL", "X-LATCH", "latch:i"))
+    A(Case("28", "the accessor spelled as a macro: the latch fails", plant(
+        "#define ggml_sycl_replan_token_held(kind) true\n" + RET), "FAIL", "X-LATCH", "latch:i", planted=False))
+    A(Case("31", "the accessor defined while A's pre-L0 busy return still exists", plant(
+        ACC + "void onednn_pp_a_relock_busy_pre_l0() {\n}\n"), "FAIL", "I-RETRY", "onednn_pp_a_relock_busy_pre_l0"))
+    A(Case("31", "the busy branch with no accessor: dormant (control)", plant(
+        "void onednn_pp_a_relock_busy_pre_l0() {\n}\n"), "PASS", dormant="i"))
+    A(Case("31", "the accessor with both retired functions deleted (control)", plant(ACC), "PASS", active="i"))
+    # 30: §B's COMPLETE reap in the transaction retires the pre-§B interim
+    REAP = ("void ggml_sycl_run_runtime_context_transaction() {\n    release_retained_referencing(h, "
+            "{ RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER });\n}\n")
+    INTERIM = "bool onednn_pp_a_reclaim_query_interim() {\n    return false;\n}\n"
+    A(Case("30", "the COMPLETE reap planted in the transaction while the interim exists", plant(REAP + INTERIM),
+           "FAIL", "K-INTERIM", "onednn_pp_a_reclaim_query_interim"))
+    A(Case("30", "the same tree with the interim deleted (control)", plant(REAP), "PASS", active="k"))
+    A(Case("30", "today's tree: the interim and no reap (control)", plant(INTERIM), "PASS", dormant="k"))
+    A(Case("30", "a reap of another mode in the transaction, with the interim (control)", plant(
+        "void ggml_sycl_run_runtime_context_transaction() {\n    release_retained_referencing(h, { RETAINED_REAP_NONE });\n}\n" + INTERIM),
+        "PASS", dormant="k"))
+    A(Case("30", "the COMPLETE reap in another function, with the interim (control)", plant(
+        "void zzplant_k() {\n    release_retained_referencing(h, { RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER });\n}\n" + INTERIM),
+        "PASS", dormant="k"))
+    A(Case("30", "the mode held in a local, a shape the matcher misses: the latch fails", plant(
+        "void ggml_sycl_run_runtime_context_transaction() {\n    auto mode = RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER;\n"
+        "    release_retained_referencing(h, mode);\n}\n" + INTERIM), "FAIL", "X-LATCH", "latch:k"))
+    # 29: the owner count never consumes a shared handle
+    ALLOW = ("L-CALLER", TP, "zzplant_l")
+    A(Case("29", "(a) a free controlled by the count in an allowlisted function", plant(
+        "void zzplant_l(mem_handle & h) {\n    if (h.owner_use_count() == 1) unified_free(h.get());\n}\n"),
+        "FAIL", "L-FREE", "zzplant_l", edit_allowlist=with_allow(ALLOW)))
+    A(Case("29", "(b) the same laundered through a local bool", plant(
+        "void zzplant_l(mem_handle & h) {\n    const bool sole = h.owner_use_count() == 1;\n    (void) h;\n    if (sole) zone_free(z, p);\n}\n"),
+        "FAIL", "L-FREE", "zone_free", edit_allowlist=with_allow(ALLOW)))
+    A(Case("29", "(b) laundered through an integer and a second local", plant(
+        "void zzplant_l(mem_handle & h) {\n    size_t n = h.owner_use_count();\n    bool shared = n > 1;\n"
+        "    if (!shared) {\n        z.reset();\n    }\n}\n"), "FAIL", "L-FREE", "reset", edit_allowlist=with_allow(ALLOW)))
+    A(Case("29", "(b) a free after a count-controlled early return", plant(
+        "void zzplant_l(mem_handle & h) {\n    if (h.owner_use_count() > 1) {\n        return;\n    }\n    zone_free(z, p);\n}\n"),
+        "FAIL", "L-FREE", "zone_free", edit_allowlist=with_allow(ALLOW)))
+    A(Case("29", "(b) a free on the right of a && whose left reads the count", plant(
+        "bool zzplant_l(mem_handle & h) {\n    return h.owner_use_count() == 1 && unified_free(h.get());\n}\n"),
+        "FAIL", "L-FREE", "unified_free", edit_allowlist=with_allow(ALLOW)))
+    A(Case("29", "(b) an enqueue_deferred_zone_free under the count", plant(
+        "void zzplant_l(mem_handle & h) {\n    if (h.owner_use_count() == 1) {\n        enqueue_deferred_zone_free(z, p);\n    }\n}\n"),
+        "FAIL", "L-FREE", "enqueue_deferred_zone_free", edit_allowlist=with_allow(ALLOW)))
+    A(Case("29", "(c) replace_within without its guard call", plant(
+        "mem_handle replace_within(mem_handle & old) {\n    return mem_handle();\n}\n"), "FAIL", "L-GUARD", "replace_within"))
+    A(Case("29", "(c) replace_within with the guard moved below its first statement", plant(
+        "mem_handle replace_within(mem_handle & old) {\n    int n = 0;\n    replace_within_count_guard(old);\n    return mem_handle();\n}\n"),
+        "FAIL", "L-GUARD", "replace_within"))
+    A(Case("29", "(c) replace_within whose first statement guards another handle", plant(
+        "mem_handle replace_within(mem_handle & old) {\n    replace_within_count_guard(other);\n    return mem_handle();\n}\n"),
+        "FAIL", "L-GUARD", "replace_within"))
+    A(Case("29", "(c) replace_within with the guard first (control)", plant(
+        "mem_handle replace_within(mem_handle & old) {\n    // the one count-selected consumer re-checks first\n"
+        "    replace_within_count_guard(old);\n    return mem_handle();\n}\n"), "PASS", active="l"))
+    A(Case("29", "(d) a new caller of owner_use_count outside the allowlist", plant(
+        "bool zzplant_l(mem_handle & h) {\n    return h.owner_use_count() > 1;\n}\n"), "FAIL", "L-CALLER", "zzplant_l"))
+    A(Case("29", "an allowlisted caller selecting between replace_within and the retired list on the count (control)", plant(
+        "void zzplant_l(mem_handle & h, std::vector<mem_handle> & retired) {\n    if (h.owner_use_count() > 1) {\n"
+        "        h = replace_within(h);\n    } else {\n        retired.push_back(std::move(h));\n    }\n}\n"),
+        "PASS", active="l", edit_allowlist=with_allow(ALLOW)))
+    A(Case("29", "an allowlisted teardown check that drops the handle unconditionally after it (control)", plant(
+        "void zzplant_l(mem_handle & h) {\n    const size_t n = h.owner_use_count();\n    if (n != 1) {\n"
+        "        GGML_LOG_WARN(\"shared at teardown\\n\");\n    }\n    h = mem_handle();\n}\n"),
+        "PASS", active="l", edit_allowlist=with_allow(ALLOW)))
+    A(Case("29", "owner_use_count named as a pointer to member, a shape the matcher misses: the latch fails", plant(
+        "void zzplant_l() {\n    auto pm = &mem_handle::owner_use_count;\n    (void) pm;\n}\n"), "FAIL", "X-LATCH", "latch:l"))
+    # 27: per-model sources only
+    A(Case("27", "g_tensor_inventory_detail read in A's fit", plant(
+        "size_t onednn_pp_a_bytes(const model_inventory & inv) {\n    return g_tensor_inventory_detail.size();\n}\n"),
+        "FAIL", "J-SOURCE", "g_tensor_inventory_detail"))
+    A(Case("27", "the planned weight slot getter read in A's fit", plant(
+        "size_t onednn_pp_a_bytes(int dev) {\n    return unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(dev);\n}\n"),
+        "FAIL", "J-SOURCE", "unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes"))
+    A(Case("27", "the planned oneDNN scratchpad getter read in W's term", plant(
+        "size_t onednn_pp_w_bytes(int dev) {\n    return unified_cache_get_planned_onednn_scratchpad_bytes(dev);\n}\n"),
+        "FAIL", "J-SOURCE", "unified_cache_get_planned_onednn_scratchpad_bytes"))
+    A(Case("27", "zone_is_onednn_reorder_eligible called in the MUL_MAT selector", plant(
+        "bool zzplant_select(const zone_tensor_desc & t, size_t n) {\n    return zone_is_onednn_reorder_eligible(t, n);\n}\n"),
+        "FAIL", "J-DISPATCH", "zzplant_select"))
+    A(Case("27", "A's fit reading the model's own inventory only (control)", plant(
+        "size_t onednn_pp_a_bytes(const model_inventory & inv) {\n    return inv.max_weight_bytes();\n}\n"), "PASS", active="j"))
+    A(Case("27", "A's fit spelled as a lambda variable: the latch fails", plant(
+        "static auto onednn_pp_a_bytes = [](int dev) { return g_tensor_inventory_detail.size(); };\n"), "FAIL", "X-LATCH", "latch:j"))
+    A(Case("27", "the classifier's own call is the allowlisted node: it moved to another function", chain(
+        replace_once("zone-sizing.cpp", "path_scoped_maxima zone_scoped_maxima(", "path_scoped_maxima zone_scoped_maxima_zz("),
+        ), "FAIL", "allowlist", "E-J-CLASSIFIER matches nothing", planted=False))
+    # 32: the SCRATCH floor list
+    A(Case("32", "appendix row 106 dropped from the floor list", plant("void zzplant_m() {\n}\n"), "FAIL", "M-SCRATCH", "appendix row 106",
+           m_edit=m_without("floor", 106)))
+    A(Case("32", "row 62 dropped from the covered-by-peak table: neither listed, covered nor excluded", plant("void zzplant_m() {\n}\n"),
+           "FAIL", "M-SCRATCH", "appendix row 62", m_edit=m_without("covered", 62)))
+    A(Case("32", "row 61, the peak that covers row 62, dropped from the floor list", plant("void zzplant_m() {\n}\n"), "FAIL", "M-SCRATCH",
+           "appendix row 61", m_edit=m_without("floor", 61)))
+    A(Case("32", "a floor row that is not a SCRATCH row of the appendix", plant("void zzplant_m() {\n}\n"), "FAIL", "M-STALE", "floor row 5",
+           m_edit=m_set("floor", 5, "beni")))
+    A(Case("32", "a floor row the appendix does not have", plant("void zzplant_m() {\n}\n"), "FAIL", "M-STALE", "floor row 999",
+           m_edit=m_set("floor", 999, "beni")))
+    A(Case("32", "a covered row whose peak left the list", plant("void zzplant_m() {\n}\n"), "FAIL", "M-STALE", "row 62 is covered",
+           m_edit=chain_m(m_set("covered", 62, 17), m_without("floor", 17))))
+    A(Case("32", "the SCRATCH floor deleted from ensure_planned_arena_zones while rows still draw", replace_once(
+        "unified-cache.cpp", 'const char * arena_mb_env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");',
+        "const char * arena_mb_env = nullptr;"), "FAIL", "M-FLOOR", "does not apply"))
+    A(Case("32", "the unmutated tables and floor (control)", plant("void zzplant_m() {\n}\n"), "PASS", planted=False))
+    return c
+
+
+def chain_m(*edits):
+    def f(t):
+        for e in edits:
+            e(t)
+    return f
+
+
+def matrix_cases_s2d1b():
+    """Clauses (n) and (o) and witness 9."""
+    c = []
+    A = c.append
+    CALL = "DnnlGemmWrapper::row_gemm(ctx, 1, 2, 3, a, t, b, t, d, t, q, 4)"
+    TN = "tests/zz-n.cpp"
+
+    def body(stmt, name="zzplant_n"):
+        return "void %s(ggml_backend_sycl_context & ctx) {\n    %s\n}\n" % (name, stmt)
+
+    # 35: a declined result in the library sources
+    A(Case("35", "row_gemm's result discarded as an expression statement", plant(body(CALL + ";")), "FAIL", "N-VOID", "DnnlGemmWrapper::row_gemm"))
+    A(Case("35", "row_gemm's result cast to void", plant(body("(void) " + CALL + ";")), "FAIL", "N-VOID", "cast to void"))
+    A(Case("35", "row_gemm's result cast with static_cast<void>", plant(body("static_cast<void>(" + CALL + ");")), "FAIL", "N-VOID", "DnnlGemmWrapper::row_gemm"))
+    A(Case("35", "row_gemm's result as the left operand of a comma", plant(body("(" + CALL + ", 0);")), "FAIL", "N-VOID", "DnnlGemmWrapper::row_gemm"))
+    A(Case("35", "woq_gemm_q4_0 discarded", plant(body("DnnlGemmWrapper::woq_gemm_q4_0(ctx, 1, 2, 3, a, t, b, s, z, 4, c, t, q);")),
+           "FAIL", "N-VOID", "DnnlGemmWrapper::woq_gemm_q4_0"))
+    A(Case("35", "get_scratchpad_mem discarded, a unique name matched anywhere", plant(body("get_scratchpad_mem(scratchpad_md, eng, ptr);")),
+           "FAIL", "N-VOID", "get_scratchpad_mem"))
+    A(Case("35", "ggml_sycl_mul_mat_batched_sycl discarded", plant(body("ggml_sycl_mul_mat_batched_sycl(ctx, s0, s1, dst);")),
+           "FAIL", "N-VOID", "ggml_sycl_mul_mat_batched_sycl"))
+    A(Case("35", "a bare softmax discarded inside DnnlSoftmaxWrapper", plant(
+        "struct DnnlSoftmaxWrapper {\n    [[nodiscard]] static int softmax(int a);\n    static void zzplant_in(int a) {\n        softmax(a);\n    }\n};\n"),
+        "FAIL", "N-VOID", "DnnlSoftmaxWrapper::softmax"))
+    A(Case("35", "a bare softmax consumed inside DnnlSoftmaxWrapper (control)", plant(
+        "struct DnnlSoftmaxWrapper {\n    [[nodiscard]] static int softmax(int a);\n    static int zzplant_in(int a) {\n        return softmax(a);\n    }\n};\n"),
+        "PASS"))
+    A(Case("35", "the result assigned, returned, tested and asserted (control)", plant(
+        "sycl::event zzplant_n(ggml_backend_sycl_context & ctx) {\n    sycl::event e = " + CALL + ";\n    e = " + CALL + ";\n"
+        "    if (DnnlGemmWrapper::woq_gemm_q4_0(ctx, 1, 2, 3, a, t, b, s, z, 4, c, t, q)) {\n        e.wait();\n    }\n"
+        "    GGML_ASSERT(DnnlGemmWrapper::woq_gemm_q4_0(ctx, 1, 2, 3, a, t, b, s, z, 4, c, t, q));\n    return " + CALL + ";\n}\n"), "PASS"))
+    A(Case("35", "dpct::gemm, UnifiedKernel::softmax and an unqualified oneMath gemm, all discarded (control)", plant(
+        body("dpct::gemm(q, a, b);\n    UnifiedKernel::softmax(x);\n    gemm(q, a, b);\n    Other::row_gemm(q);")), "PASS"))
+    A(Case("35", "a bare gemm discarded inside another class (control)", plant(
+        "struct Other {\n    void f(int a) {\n        gemm(a);\n    }\n};\n"), "PASS"))
+    # 33: the same, in the tests that call a listed name
+    A(Case("33", "a test source discarding row_gemm's result", plant(body(CALL + ";"), TN), "FAIL", "N-VOID", "tests/zz-n.cpp"))
+    A(Case("33", "a test source casting row_gemm's result to void", plant(body("(void) " + CALL + ";"), TN), "FAIL", "N-VOID", "tests/zz-n.cpp"))
+    A(Case("33", "a test source consuming the result (control)", plant(
+        "bool zzplant_n(ggml_backend_sycl_context & ctx) {\n    sycl::event e = " + CALL + ";\n    e.wait();\n    return true;\n}\n", TN), "PASS"))
+    A(Case("33", "a test source's discard is not hidden by the scope exclusion of tests: clause (a)-(h) findings stay out of it", plant(
+        body(CALL + ";\n    sycl::malloc_device<char>(1, q);"), TN), "FAIL", "N-VOID", "tests/zz-n.cpp"))
+    A(Case("33", "the one real discard converted to a consumed result, its debt entry dropped (control)", replace_once(
+        "tests/test-onednn-woq.cpp", "        DnnlGemmWrapper::row_gemm(*ctx, batch, out_rows, k, act_dev,",
+        "        sycl::event zz_ev = DnnlGemmWrapper::row_gemm(*ctx, batch, out_rows, k, act_dev,"),
+        "PASS", planted=False, edit_debt=drop_debt("N-VOID", "test-onednn-woq", "row_gemm")))
+    A(Case("33", "the same conversion leaves its debt entry stale", replace_once(
+        "tests/test-onednn-woq.cpp", "        DnnlGemmWrapper::row_gemm(*ctx, batch, out_rows, k, act_dev,",
+        "        sycl::event zz_ev = DnnlGemmWrapper::row_gemm(*ctx, batch, out_rows, k, act_dev,"),
+        "FAIL", "debt", "test-onednn-woq"))
+    # N-NODISCARD
+    A(Case("35", "a listed declaration without [[nodiscard]]", plant("struct DnnlBinaryWrapper {\n    static void binary_broadcast_row(int a);\n};\n"),
+           "FAIL", "N-NODISCARD", "DnnlBinaryWrapper::binary_broadcast_row"))
+    A(Case("35", "a listed declaration with [[nodiscard]] (control)", plant(
+        "struct DnnlBinaryWrapper {\n    [[nodiscard]] static void binary_broadcast_row(int a);\n};\n"), "PASS"))
+    A(Case("35", "a listed declaration with [[nodiscard]] split over lines, a pointer return (control)", plant(
+        "struct DnnlGemmWrapper {\n    [[nodiscard]]\n    static const void *\n    gemm(int a);\n};\n"), "PASS"))
+    A(Case("35", "an unlisted member of a listed class carries no duty (control)", plant(
+        "struct DnnlGemmWrapper {\n    static void zz_unlisted(int a) {\n    }\n};\n"), "PASS", planted=False))
+    # 36: each C-term consumer submits on its census row's queue
+    SC = "ggml-sycl.cpp"
+    AC = "bool zzplant_o() {\n    return acquire_onednn_pp_scratch(0, t, 1, 2, &s, &a);\n}\n"
+    A(Case("36", "a third acquire_onednn_pp_scratch caller with no census row", plant(AC), "FAIL", "O-NOROW", "acquire_onednn_pp_scratch"))
+    A(Case("36", "a second set_rows stage acquire outside the census row", plant(
+        "void zzplant_o() {\n    const void * p = ggml_sycl_set_rows_stage_ptr(ctx, plan);\n}\n"), "FAIL", "O-NOROW", "ggml_sycl_set_rows_stage_ptr"))
+    A(Case("36", "a graph execute planted in the SDPA file outside the census row", append_to(
+        "fattn-onednn.cpp", "void zzplant_o() {\n    dnnl::graph::sycl_interop::execute(cp, s, a, b, d);\n}\n"), "FAIL", "O-NOROW",
+        "dnnl::graph::sycl_interop::execute"))
+    A(Case("36", "to_fp16_sycl on a queue other than stream, in the A row of ggml_sycl_op_mul_mat_sycl", replace_once(
+        SC, "to_fp16_sycl(src0_dd_i, dst_f16, ne, stream);", "to_fp16_sycl(src0_dd_i, dst_f16, ne, ctx.stream());"),
+        "FAIL", "O-QUEUE", "to_fp16_sycl", planted=False))
+    A(Case("36", "set_rows_validate_indices on another queue", replace_once(
+        "set_rows.cpp", "*ctx.stream(plan.owner_device, 0), dst, src1, plan.index_ptr", "*ctx.stream(plan.owner_device, 1), dst, src1, plan.index_ptr"),
+        "FAIL", "O-QUEUE", "set_rows_validate_indices", planted=False))
+    A(Case("36", "set_rows_sycl's own stream moved off the owner device", replace_once(
+        "set_rows.cpp", "dpct::queue_ptr stream = ctx.stream(device, 0);", "dpct::queue_ptr stream = ctx.stream(0, 0);"),
+        "FAIL", "O-QUEUE", "set_rows_sycl", planted=False))
+    A(Case("36", "f32_to_fp16 in the unified PP arm on another queue", replace_once(
+        SC, "f32_to_fp16(src1_data, activations_scratch, src1_elems, ctx.stream());",
+        "f32_to_fp16(src1_data, activations_scratch, src1_elems, ctx.stream(ctx.device, 1));"), "FAIL", "O-QUEUE", "f32_to_fp16", planted=False))
+    A(Case("36", "the SDPA's dnnl stream built from another stream", replace_once(
+        "fattn-onednn.cpp", "dnnl::stream dnnl_stream = ctx.stream_dnnl(stream);", "dnnl::stream dnnl_stream = ctx.stream_dnnl(ctx.stream());"),
+        "FAIL", "O-QUEUE", "dnnl_stream", planted=False))
+    A(Case("36", "a comment and a string that spell the acquire call and the graph execute (control)", plant(
+        "void zzplant_o() {\n    // acquire_onednn_pp_scratch(0, t, 1, 2, &s, &a);\n    const char * s = \"dnnl::graph::sycl_interop::execute(\";\n}\n"),
+        "PASS"))
+    A(Case("36", "a gemm.hpp-style dnnl::sycl_interop::execute is not the graph execute (control)", plant(
+        "void zzplant_o() {\n    // acquire_onednn_pp_scratch is the token this file mentions\n"
+        "    dnnl::sycl_interop::execute(prim, stream, args, deps);\n}\n"), "PASS"))
+    A(Case("36", "an unmodified tree: every census row holds (control)", lambda f: f, "PASS", planted=False))
+    # 9: the model-shaped *_bytes() functions
+    DEF = "size_t woq_packed_bytes(int n, int k) {\n    return (size_t) n * k / 2;\n}\n"
+    A(Case("9", "woq_packed_bytes defined, but its allocation site does not call it", plant(DEF), "FAIL", "Z9-SITE", "woq_packed_bytes"))
+    A(Case("9", "woq_packed_bytes defined, but no zone sizing calls it", plant(DEF), "FAIL", "Z9-SIZING", "woq_packed_bytes"))
+    A(Case("9", "woq_packed_bytes called by its site and by the zone sizing (control)", chain(
+        plant(DEF),
+        replace_once("gemm.hpp", "                                   int64_t                     c_stride1) {\n"
+                     "        if (!a || !b_data || !scales || !zero_points || !c) {\n",
+                     "                                   int64_t                     c_stride1) {\n        (void) woq_packed_bytes(m, k);\n"
+                     "        if (!a || !b_data || !scales || !zero_points || !c) {\n"),
+        replace_once("zone-sizing.cpp", "    const std::map<zone_group_key, size_t> freq = zone_group_frequencies(inventory);\n\n    path_scoped_maxima maxima;",
+                     "    const std::map<zone_group_key, size_t> freq = zone_group_frequencies(inventory);\n    (void) woq_packed_bytes(1, 1);\n\n"
+                     "    path_scoped_maxima maxima;")), "PASS", active="9"))
+    A(Case("9", "woq_packed_bytes only called, never defined: dormant (control)", plant(
+        "void zzplant_9() {\n    (void) woq_packed_bytes(1, 1);\n}\n"), "PASS", dormant="9"))
+    A(Case("9", "woq_packed_bytes spelled as a lambda variable: the latch fails", plant(
+        "static auto woq_packed_bytes = [](int n, int k) { return (size_t) n * k; };\n"), "FAIL", "X-LATCH", "latch:9"))
+    return c
+
+
+def s2d_witnesses(files, allowlist, debt):
+    """The census table is data: with appendix-rows.json missing the gate fails naming M-DATA, never passes."""
+    import tempfile
+    out = []
+    saved = S2D_DATA["dir"]
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            S2D_DATA["dir"] = d
+            fails, _, _, _ = run_gate(files, allowlist, debt)
+        out.append(("a missing appendix-rows.json fails (M-DATA), it does not pass", any(names_new(f, "M-DATA") for f in fails),
+                    "%d finding(s)" % len(fails)))
+    finally:
+        S2D_DATA["dir"] = saved
+    fails, _, _, _ = run_gate(files, allowlist, debt)
+    out.append(("the committed appendix-rows.json is read (control)", not fails, "%d finding(s)" % len(fails)))
+    return out
 
 
 def names_new(f, code):
@@ -3434,7 +4488,22 @@ def evaluate_case(base_files, allowlist, debt, case):
         al = case.edit_allowlist(al)
     if case.edit_debt is not None:
         debt = case.edit_debt(debt)
-    fails, _, _, _ = run_gate(files, al, debt)
+    saved_m = copy.deepcopy(M_TABLES)
+    try:
+        if case.m_edit is not None:
+            edited = copy.deepcopy(M_TABLES)
+            case.m_edit(edited)
+            M_TABLES.clear()
+            M_TABLES.update(edited)
+        fails, _, _, stats = run_gate(files, al, debt)
+    finally:
+        M_TABLES.clear()
+        M_TABLES.update(saved_m)
+    if case.active is not None and case.active not in stats["active"]:
+        return False, ["clause (%s) is not keyed on a subject in this tree, so the case did not exercise it" % case.active]
+    if case.dormant is not None and (case.dormant in stats["active"]
+                                     or not any(l.startswith("DORMANT %s:" % case.dormant) for l in stats["dormant"])):
+        return False, ["clause (%s) is not dormant in this tree, so the control did not test dormancy" % case.dormant]
     if case.expect == "PASS":
         return (not fails), fails
     if not fails:
@@ -3454,12 +4523,19 @@ def evaluate_case(base_files, allowlist, debt, case):
 
 def planted_sightings(files):
     """Constructions, raw hits, forms and lexical rows the gate sees in a planted function or appended text."""
-    ctx = Ctx(files)
+    core = core_files(files)
+    ctx = Ctx(core)
     n = 0
     for rel in files:
         if not (rel.startswith("zz") or "/zz" in rel or rel == "cpu-dispatch.cpp"):
             continue
-        fa = facts_for(rel, files[rel], ctx)
+        if rel.startswith("zz") or "/zz" in rel:
+            fa2 = s2d_facts(files[rel])
+            n += len(fa2["occ"]) + len(fa2["fdefs"])
+        if rel in core:
+            fa = facts_for(rel, core[rel], ctx)
+        else:
+            continue
         n += sum(1 for c in fa["constructions"] if "zz" in c["key"] or "zz" in c["func"])
         n += sum(1 for r in fa["lexical"] if r["var"].startswith("zz"))
         n += sum(1 for r in fa["raws"] if "zz" in r["func"])
@@ -3700,7 +4776,7 @@ def run_matrix(files, allowlist, debt, root, shard=None):
             print("FAIL: case witness %s is not in WITNESSES" % w)
             bad += 1
         for w in WITNESSES:
-            if w in ("f", "cmake", "m6", "m9", "m14", "r2m4", "r2m8"):
+            if w in ("f", "cmake", "m6", "m9", "m14", "r2m4", "r2m8", "s2d"):
                 continue
             if not any(c.wid == w and c.expect == "FAIL" for c in all_cases):
                 print("FAIL: witness %s has no FAIL case" % w)
@@ -3727,6 +4803,7 @@ def run_matrix(files, allowlist, debt, root, shard=None):
         extra += [("r2m4", label, ok, d) for label, ok, d in r2m4_witnesses(allowlist)]
         extra += [("r2m8", label, ok, d) for label, ok, d in r2m8_witnesses()]
         extra += [("m14", label, ok, d) for label, ok, d in m14_witness(files, allowlist, debt)]
+        extra += [("s2d", label, ok, d) for label, ok, d in s2d_witnesses(files, allowlist, debt)]
     for wid, label, ok, detail in extra:
         print("%s witness %-4s %-80s (%s)" % ("ok  " if ok else "FAIL", wid, label, str(detail)[:80]))
         bad += 0 if ok else 1
@@ -3774,6 +4851,8 @@ def main():
             print("FAIL: --write-debt refuses to rewrite from data files that do not validate")
             return 1
     files = load_tree(a.root)
+    files.update(load_test_sources(a.root))
+    S2D_DATA["dir"] = str(data)
     if a.list or a.write_debt:
         viols, _ = analyse(files)
         if a.list:
@@ -3794,6 +4873,8 @@ def main():
     fails, report, viols, stats = run_gate(files, allowlist, debt)
     print("scope: %d files, %d constructions of %s" % (stats["files"], stats["constructions"], " ".join(stats["value_types"])))
     for r in report:
+        print(r)
+    for r in stats["dormant"]:
         print(r)
     by_code = {}
     for d in debt.get("violations", []):

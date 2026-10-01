@@ -57,6 +57,49 @@ it is a candidate for the allowlist, and moving it there is the lead's decision,
 `pending-disposition` marks an entry whose fate nobody has ruled on yet; its `cite` says what is known. Every E-RAW entry needs a `cite`, a ticket id or a design/census row of at
 least 12 characters.
 
+## Clauses (i)-(o) and witness 9 (S2d)
+
+Each is keyed on a subject that may not exist yet. Today's tree has no `ggml_sycl_replan_token_held` definition, no COMPLETE
+reap in `ggml_sycl_run_runtime_context_transaction`, no `owner_use_count` or `replace_within`, no `onednn_pp_a_bytes` /
+`onednn_pp_w_bytes`, and none of the four model-shaped `*_bytes()` functions, so those clauses print
+`DORMANT <clause>: subject <symbol> absent` after the report: a visible state, not a pass. They wake the moment the subject is
+defined. A subject name that appears in a shape the matcher does not read (a `#define` body, a lambda or variable, an alias, a
+pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause dormant for ever; X-LATCH is never debt.
+
+- (i) `I-RETRY`: defining `ggml_sycl_replan_token_held` (a call or a `;` declaration does not count) while
+  `onednn_w_retry_lost_cas` or `onednn_pp_a_relock_busy_pre_l0` is still defined.
+- (k) `K-INTERIM`: `release_retained_referencing(... RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER ...)` inside
+  `ggml_sycl_run_runtime_context_transaction` while `onednn_pp_a_reclaim_query_interim` is still defined.
+- (l) `L-CALLER` (a caller of `owner_use_count` outside `mem-handle.*` that is not an allowlist entry, `code: "L-CALLER"`,
+  `file` + `function`), `L-FREE` (a free, `unified_free` / `zone_free` / `reset` / `enqueue_deferred_zone_free` or a TLSF free,
+  whose execution the count controls, directly, through a local, after an early return, or through `&&`/`||`/`?:`),
+  `L-GUARD` (`replace_within`'s first statement is not `replace_within_count_guard(...)`).
+- (j) `J-SOURCE` (`onednn_pp_a_bytes` / `onednn_pp_w_bytes` reading `g_tensor_inventory_*` or
+  `unified_cache_get_planned_(pp_moe_)onednn_*`), `J-DISPATCH` (a call of `zone_is_onednn_reorder_eligible`; the one real
+  call, in `zone_scoped_maxima`, is allowlist entry `E-J-CLASSIFIER`).
+- (m) `M-SCRATCH`, `M-STALE`, `M-FLOOR`, `M-DATA`. `appendix-rows.json` is the 139-row census table (zone columns) of the
+  design appendix at master `2c4f5e45d` rev 4.16, because the appendix is not in the repository; regenerate it from the design
+  table when the appendix changes. The gate's own tables (`M_TABLES`: the floor list with each row's owner ticket, the
+  covered-by-peak rows, the unreachable rows) are checked against it, and `ensure_planned_arena_zones` must apply the
+  `GGML_SYCL_COMPUTE_ARENA_MB` floor while the floor list is non-empty (and must not once it is empty).
+- (n) `N-VOID` and `N-NODISCARD`, the only S2d codes that may be debt. The names are the declined-result consumers
+  (`DnnlGemmWrapper::gemm`, `row_gemm`, `woq_gemm_*`, the softmax / eltwise / binary wrappers, `get_scratchpad_mem`,
+  `ggml_sycl_mul_mat_batched_sycl`); a class member matches as `Class::name(` anywhere or a bare `name(` inside that class.
+  Test sources that spell a listed name are read for this clause only (keys are `tests/...`); clauses (a)-(h) never see them.
+  Reading of the spec: a call fails only when its value is discarded (an expression statement, the left of a comma, a cast to
+  `void`); an assignment, initializer, return, condition or argument counts as consuming it.
+- (o) `O-NOROW`, `O-ROW`, `O-QUEUE`: each call of an acquire token (`acquire_onednn_pp_scratch`,
+  `ggml_sycl_set_rows_stage_ptr`, the oneDNN graph `execute`) must sit in a function with a census row (`O_ROWS`), and each
+  consuming call of that row pins its queue argument by position and exact text; a callee that takes no queue pins its own
+  stream declarations.
+- Witness 9 `Z9-SITE`, `Z9-SIZING`: each of `load_reorder_temp_bytes`, `woq_packed_bytes`, `mmq_work_counter_bytes`,
+  `set_rows_stage_bytes` that is defined must be called by each of its allocation sites and by `zone-sizing.cpp` or
+  `unified-cache.cpp`.
+
+Gaps stated rather than hidden: the names of (j)'s fit function, reserve target and selector bit reads are not fixed yet, so only
+the two `*_bytes` names are covered; (l)'s five count-caller functions do not exist, so the allowlist entries are added as each
+lands. Today's 24 N-* debt entries were seeded once with `--write-debt --allow-growth` (834 to 858 entries).
+
 ## Key shape
 
 `file::function::node-kind:variable:text-hash#ordinal`. The text hash is of the construction's normalized

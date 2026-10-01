@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clause e; later clauses add entries). Permanent exemptions only, each with a reason. An entry names its subject (file and function, or a node key), the raw `name` where the code is E-RAW, and an exact `count`; it fails if it matches nothing or covers a different number, and `name` pins the allocator so a swapped-in different call does not ride the exemption. Hand-edited; see README.md.",
+  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clauses e, j; later clauses add entries). Permanent exemptions only, each with a reason. An entry names its subject (file and function, or a node key), the raw `name` where the code is E-RAW, and an exact `count`; it fails if it matches nothing or covers a different number, and `name` pins the allocator so a swapped-in different call does not ride the exemption. Hand-edited; see README.md.",
   "entries": [
     {
       "id": "E-TEST",
@@ -118,6 +118,14 @@
       "name": "unified_cache_malloc_host_tracked",
       "count": 1,
       "reason": "the oneDNN Graph-scratch completion-flag slab, tag unified_cache:onednn_graph_scratch_flag_slab, the second CACHE_BACKING bootstrap site: canonical contract section 3.1 (mechanism 2, the two-site allowlist) and section 9.1"
+    },
+    {
+      "id": "E-J-CLASSIFIER",
+      "code": "J-DISPATCH",
+      "file": "zone-sizing.cpp",
+      "function": "zone_scoped_maxima",
+      "count": 1,
+      "reason": "design 7(j): the late stage's classifier. zone_scoped_maxima classifies each tensor once, at the plan, with zone_is_onednn_reorder_eligible; no dispatch path may call it (the plan stores the structural bits a dispatch reads)"
     }
   ]
 }
