@@ -1065,9 +1065,14 @@ llama_context::llama_context(
         // falls through to today's single sched_reserve() call, unchanged.
         bool sycl_auto_ubatch_trial = false;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-        if (params.n_ubatch_auto && cparams.causal_attn && llama_context_has_sycl_backend(backends)) {
+        const bool sycl_backend_present     = llama_context_has_sycl_backend(backends);
+        bool       sycl_auto_ubatch_enabled = false;
+        // The accessor is consulted only once the cheap conditions hold, so an
+        // older SYCL DSO's proc lookup does not run for a pinned -ub or a
+        // non-causal model.
+        if (params.n_ubatch_auto && cparams.causal_attn && sycl_backend_present) {
 #    ifdef GGML_USE_SYCL
-            sycl_auto_ubatch_trial = ggml_backend_sycl_auto_ubatch_enabled();
+            sycl_auto_ubatch_enabled = ggml_backend_sycl_auto_ubatch_enabled();
 #    else
             ggml_backend_dev_t sycl_dev = nullptr;
             for (auto & backend : backends) {
@@ -1078,9 +1083,11 @@ llama_context::llama_context(
                 }
             }
             auto auto_ubatch_enabled_fn = llama_context_sycl_auto_ubatch_enabled_proc(sycl_dev);
-            sycl_auto_ubatch_trial      = auto_ubatch_enabled_fn && auto_ubatch_enabled_fn();
+            sycl_auto_ubatch_enabled    = auto_ubatch_enabled_fn && auto_ubatch_enabled_fn();
 #    endif
         }
+        sycl_auto_ubatch_trial = llama_auto_ubatch_trial_runs(params.n_ubatch_auto, cparams.causal_attn,
+                                                              sycl_backend_present, sycl_auto_ubatch_enabled);
 #endif
         if (sycl_auto_ubatch_trial) {
             sycl_select_auto_ubatch(params.type_k, params.type_v);
@@ -1465,36 +1472,29 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
 
     const auto & ladder = llama_auto_ubatch_ladder;
 
-    uint32_t     cap  = std::min(cparams.n_batch, cparams.n_ctx);
-    const char * stop = "ladder exhausted";
-    if (model.hparams.n_expert > 0) {
-        // A direct GGML_USE_SYCL build's accessor is a real, always-defined
-        // function -- called unconditionally, no null check (there is
-        // nothing to be null). The DL-without-SYCL lookup genuinely can
-        // return nullptr on an older SYCL DSO, so it degrades to `cap`
-        // (no MoE-specific narrowing) rather than dereferencing one.
+    // A direct GGML_USE_SYCL build's accessor is a real, always-defined
+    // function -- called unconditionally, no null check (there is nothing to
+    // be null). The DL-without-SYCL lookup genuinely can return nullptr on an
+    // older SYCL DSO, so it reports the ceiling unavailable and the cap gets
+    // no MoE-specific narrowing. A dense model never consults the ceiling.
 #    ifdef GGML_USE_SYCL
-        const uint32_t moe_cap           = ggml_backend_sycl_moe_gpu_ubatch_max();
-        const bool     moe_cap_available = true;
+    const uint32_t moe_cap           = model.hparams.n_expert > 0 ? ggml_backend_sycl_moe_gpu_ubatch_max() : 0;
+    const bool     moe_cap_available = true;
 #    else
-        const uint32_t moe_cap           = moe_cap_fn ? moe_cap_fn() : cap;
-        const bool     moe_cap_available = moe_cap_fn != nullptr;
+    const uint32_t moe_cap           = (model.hparams.n_expert > 0 && moe_cap_fn) ? moe_cap_fn() : 0;
+    const bool     moe_cap_available = moe_cap_fn != nullptr;
 #    endif
-        // Report the MoE ceiling reason whenever it is the BINDING cap,
-        // not only when it strictly narrows a larger batch/ctx cap -- a MoE
-        // context whose batch/ctx cap already equals moe_cap (e.g. cap ==
-        // 512) is bound by the ceiling exactly as much as one where moe_cap
-        // is smaller, so "ladder exhausted" would misreport why the ladder
-        // stopped. Gated on moe_cap_available: the DL-without-SYCL branch
-        // above degrades moe_cap to `cap` itself (no MoE-specific narrowing)
-        // when the accessor is absent, which would otherwise satisfy
-        // `moe_cap <= cap` trivially and report the ceiling reason for every
-        // such MoE model even though no ceiling was ever consulted.
-        if (moe_cap_available && moe_cap <= cap) {
-            cap  = moe_cap;
-            stop = "MoE GPU routing ceiling";
-        }
-    }
+    // The MoE ceiling is the binding cap whenever it does not exceed the
+    // batch/ctx cap, not only when it strictly narrows it -- a context whose
+    // batch/ctx cap already equals moe_cap is bound by the ceiling exactly as
+    // much as one where moe_cap is smaller, so "ladder exhausted" would
+    // misreport why the ladder stopped. The helper gates on
+    // moe_cap_available so a DSO without the accessor never reports a ceiling
+    // that was never consulted.
+    bool           moe_bound = false;
+    const uint32_t cap       = llama_auto_ubatch_cap(cparams.n_batch, cparams.n_ctx, model.hparams.n_expert, moe_cap,
+                                                     moe_cap_available, &moe_bound);
+    const char *   stop      = moe_bound ? "MoE GPU routing ceiling" : "ladder exhausted";
 
     // llama.cpp-xojq (quality round 1 Q2a): the smallest ladder rung does
     // not fit at all -- any -c below 512, or llama-bench's own pp128/tg128
@@ -1774,15 +1774,34 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     uint32_t     cache_resume_ubatch = 0;  // the validated value the resume started from
     std::string  cache_resume_reason;      // its stored reason, for the "unchanged outcome" compare at the store gate
 
+    // The one tuning-cache lookup. A cached value below fallback_ubatch must
+    // not win either (the "never silently shrink" contract applies to a cached
+    // hit exactly as much as to a fresh ladder rung), so the value counts only
+    // when llama_auto_ubatch_cached_valid accepts it; that same value feeds
+    // the rung set, so a cache candidate is always a member of it.
+    uint32_t   cached_ubatch         = 0;
+    char       cached_reason_buf[64] = { 0 };
+    const bool cache_found =
+        cache_available && cache_lookup_fn(&cache_key, &cached_ubatch, cached_reason_buf, sizeof(cached_reason_buf));
+    const bool     cache_usable = cache_found && llama_auto_ubatch_cached_valid(ladder, llama_auto_ubatch_ladder_size,
+                                                                                cached_ubatch, fallback_ubatch, cap);
+    const uint32_t cache_set_value = cache_usable ? cached_ubatch : 0;
+
+    // The candidates this trial may try: fallback_ubatch, the ladder rungs in
+    // [fallback_ubatch, cap] and the usable cached value, ascending. The loop
+    // below iterates the set's ladder members, so it carries no bound checks
+    // of its own -- a rung outside [fallback_ubatch, cap] is not in the set.
+    uint32_t     rung_set[llama_auto_ubatch_rung_set_capacity];
+    uint32_t     rungs[llama_auto_ubatch_rung_set_capacity];
+    const size_t n_rung_set =
+        llama_auto_ubatch_rung_set(ladder, llama_auto_ubatch_ladder_size, fallback_ubatch, cap, cache_set_value,
+                                   rung_set, llama_auto_ubatch_rung_set_capacity);
+    const size_t n_rungs = llama_auto_ubatch_ladder_members(rung_set, n_rung_set, ladder, llama_auto_ubatch_ladder_size,
+                                                            rungs, llama_auto_ubatch_rung_set_capacity);
+    std::vector<uint32_t> rung_ladder(rungs, rungs + n_rungs);
+
     if (cache_available) {
-        uint32_t cached_ubatch         = 0;
-        char     cached_reason_buf[64] = { 0 };
-        // A cached value below fallback_ubatch must not win either -- see the
-        // ladder loop's own floor-skip comment below for why (the "never
-        // silently shrink" contract applies to a cached hit exactly as much as
-        // to a fresh ladder rung).
-        if (!cache_lookup_fn(&cache_key, &cached_ubatch, cached_reason_buf, sizeof(cached_reason_buf)) ||
-            cached_ubatch < ladder[0] || cached_ubatch > cap || cached_ubatch < fallback_ubatch) {
+        if (!cache_usable) {
             cache_state = "miss";
         } else {
             // The cached candidate was actually validated here (whether it
@@ -1852,30 +1871,24 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         return;
     }
 
-    for (uint32_t c : ladder) {
+    // Never let the ladder pick something SMALLER than the caller's own
+    // explicit n_ubatch (fallback_ubatch) -- a raw-API caller can set
+    // llama_context_params.n_ubatch above the ladder's first rung together
+    // with n_ubatch_auto=true, and the "never silently shrink" gotcha
+    // (docs/plans/2026-09-10-auto-ubatch.md) applies to that value too, not
+    // only to a rung the trial itself already accepted. rung_ladder holds no
+    // rung under fallback_ubatch or over cap, so a rung the ladder never tries
+    // can never become last_good; if nothing wins, last_good falls through to
+    // fallback_ubatch itself below, which was always safe -- it is exactly
+    // today's pre-trial default.
+    for (uint32_t c : rung_ladder) {
         if (!ladder_needed) {
-            break;
-        }
-        if (c > cap) {
             break;
         }
         // llama.cpp-7n6n: a non-terminal cache hit
         // already validated `cache_resume_above` (0 when there was no such
         // hit) -- do not re-try rungs at or below it.
         if (c <= cache_resume_above) {
-            continue;
-        }
-        // Never let the ladder pick something SMALLER than the caller's own
-        // explicit n_ubatch (fallback_ubatch) -- a raw-API caller can set
-        // llama_context_params.n_ubatch above the ladder's first rung together
-        // with n_ubatch_auto=true, and the "never silently shrink" gotcha
-        // (docs/plans/2026-09-10-auto-ubatch.md) applies to that value too,
-        // not only to a rung the trial itself already accepted. A rung the
-        // ladder never tries can never become last_good, so this cannot
-        // introduce a value BELOW fallback_ubatch; if nothing at or above it
-        // wins, last_good falls through to fallback_ubatch itself below, which
-        // was always safe -- it is exactly today's pre-trial default.
-        if (c < fallback_ubatch) {
             continue;
         }
         tried += (tried.empty() ? "" : ",") + std::to_string(c);

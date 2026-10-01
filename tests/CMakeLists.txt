@@ -3667,6 +3667,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# zhcn C7b: the planned auto-ubatch ladder (design gate 34, partial). The
+# constructor decides the trial with llama_auto_ubatch_trial_runs(), the
+# trial's cap is written once by llama_auto_ubatch_cap(), and the ladder
+# loop iterates only the ladder members of llama_auto_ubatch_rung_set().
+# Source-only; the helpers themselves run in test-auto-ubatch-ladder below.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-planned-ladder-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-planned-ladder-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pyu4: executes the pure helpers in src/llama-auto-ubatch.h --
 # llama_auto_ubatch_ladder_has_candidate(), the predicate behind the trial's
 # early exit before its ladder loop, on the shapes where no rung lies in

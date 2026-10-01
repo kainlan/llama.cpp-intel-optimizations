@@ -157,7 +157,7 @@ _TRIAL_END = "static int llama_graph_n_input_tensors(ggml_cgraph * gf) {"
 # and the ladder loop (previously two independently-maintained copies of the
 # same sequence). Bounds a smaller region than the old loop-anchored checks
 # used to; several per-candidate tests below are anchored here instead of to
-# "for (uint32_t c : ladder)" now that the sequence itself lives here, not
+# "for (uint32_t c : rung_ladder)" now that the sequence itself lives here, not
 # in the loop body.
 _TRY_CANDIDATE_START = "auto try_candidate = [&](uint32_t c) -> const char * {"
 _TRY_CANDIDATE_END = "auto cache_enabled_fn ="
@@ -194,29 +194,39 @@ def _try_candidate_body() -> str:
 def test_call_site_gates_on_all_four_conditions():
     """The constructor must gate the trial on all four documented
     conditions -- n_ubatch_auto, a SYCL backend, GGML_SYCL_AUTO_UBATCH
-    (auto_ubatch_enabled), and causal_attn -- combined in one `if` so a
-    single condition being false cannot leave the others live."""
+    (auto_ubatch_enabled), and causal_attn -- through one
+    llama_auto_ubatch_trial_runs() call fed the four evaluated conditions
+    (tests/test-sycl-planned-ladder-source.py pins its argument spelling), so
+    a single condition being false cannot leave the others live."""
     body_norm = _normalize_ws(_call_site_body())
-    gate_match = re.search(
-        r"if\s*\(\s*params\.n_ubatch_auto\s*&&\s*cparams\.causal_attn\s*&&\s*"
-        r"llama_context_has_sycl_backend\(\s*backends\s*\)\s*\)\s*\{",
+    assert re.search(
+        r"sycl_auto_ubatch_trial\s*=\s*llama_auto_ubatch_trial_runs\(\s*params\.n_ubatch_auto\s*,\s*"
+        r"cparams\.causal_attn\s*,\s*sycl_backend_present\s*,\s*sycl_auto_ubatch_enabled\s*\)\s*;",
         body_norm,
+    ), (
+        "the call site must decide the trial with llama_auto_ubatch_trial_runs(params.n_ubatch_auto, "
+        "cparams.causal_attn, sycl_backend_present, sycl_auto_ubatch_enabled)"
+    )
+    assert re.search(
+        r"const\s+bool\s+sycl_backend_present\s*=\s*llama_context_has_sycl_backend\(\s*backends\s*\)\s*;", body_norm
+    ), "sycl_backend_present must be llama_context_has_sycl_backend(backends), evaluated"
+
+    # auto_ubatch_enabled() must be consulted INSIDE the cheap-condition gate
+    # (either the direct GGML_USE_SYCL symbol or the GGML_BACKEND_DL
+    # proc-address lookup), not unconditionally before or after it.
+    gate_match = re.search(
+        r"if\s*\(\s*params\.n_ubatch_auto\s*&&\s*cparams\.causal_attn\s*&&\s*sycl_backend_present\s*\)\s*\{", body_norm
     )
     assert gate_match is not None, (
-        "the call site must gate on params.n_ubatch_auto && cparams.causal_attn && "
-        "llama_context_has_sycl_backend(backends) as one combined condition"
+        "the accessor must sit behind `if (params.n_ubatch_auto && cparams.causal_attn && sycl_backend_present)`"
     )
-
-    # auto_ubatch_enabled() must be consulted INSIDE that gate (either the
-    # direct GGML_USE_SYCL symbol or the GGML_BACKEND_DL proc-address
-    # lookup), not unconditionally before or after it.
     assert "ggml_backend_sycl_auto_ubatch_enabled" in body_norm, (
         "the call site must consult ggml_backend_sycl_auto_ubatch_enabled() (directly or via its "
         "proc-address lookup)"
     )
     enabled_idx = body_norm.find("ggml_backend_sycl_auto_ubatch_enabled", gate_match.end())
     assert enabled_idx != -1, (
-        "ggml_backend_sycl_auto_ubatch_enabled must be consulted AFTER the four-condition gate opens, "
+        "ggml_backend_sycl_auto_ubatch_enabled must be consulted AFTER the cheap-condition gate opens, "
         "not before it (it should not run when the other conditions already ruled the trial out)"
     )
 
@@ -237,28 +247,15 @@ def test_call_site_gates_on_all_four_conditions():
     )
 
 
-def test_call_site_gate_has_a_mutation_witness():
-    """Mutation witness for the gate check above: proves it would actually
-    catch one of the four conditions (causal_attn) being dropped from the
-    gate -- the exact regression c-dcct exists to prevent (a non-causal
-    model's n_ubatch shrunk by the trial)."""
-    raw = LLAMA_CONTEXT_CPP
-    gate_line = (
-        "        if (params.n_ubatch_auto && cparams.causal_attn && "
-        "llama_context_has_sycl_backend(backends)) {\n"
-    )
-    assert gate_line in raw, "mutation target not found -- update this witness to match the real source"
-    mutated_raw = raw.replace(
-        gate_line, "        if (params.n_ubatch_auto && llama_context_has_sycl_backend(backends)) {\n", 1
-    )
-    assert mutated_raw != raw
-
-    mutated_body_norm = _body_of(mutated_raw, _CALL_SITE_START, _CALL_SITE_END)
-    assert not re.search(
-        r"if\s*\(\s*params\.n_ubatch_auto\s*&&\s*cparams\.causal_attn\s*&&\s*"
-        r"llama_context_has_sycl_backend\(\s*backends\s*\)\s*\)\s*\{",
-        mutated_body_norm,
-    ), "mutation witness is broken: dropping causal_attn from the gate should make the four-condition check fail"
+def test_trial_runs_helper_is_the_four_way_conjunction():
+    """The helper behind the call-site decision must be exactly the four-way
+    conjunction; the mutants drop one condition each."""
+    code = strip_comments(LLAMA_AUTO_UBATCH_H)
+    conj = "return n_ubatch_auto && causal_attn && has_sycl_backend && auto_ubatch_enabled;"
+    assert conj in code, "llama_auto_ubatch_trial_runs must return the four-way conjunction"
+    for dropped in ("n_ubatch_auto && ", "causal_attn && ", "has_sycl_backend && "):
+        mutated = code.replace(conj, conj.replace(dropped, "", 1), 1)
+        assert conj not in mutated
 
 
 # ---------------------------------------------------------------------------
@@ -303,21 +300,27 @@ def test_ladder_literal_has_a_mutation_witness():
 
 def test_candidate_cap_uses_n_batch_and_n_ctx():
     """The ladder cap must be min(n_batch, n_ctx) -- both, not either
-    alone -- computed before the loop, matching the Task 3 spike."""
+    alone -- computed by llama_auto_ubatch_cap() (written once, pinned by
+    tests/test-sycl-planned-ladder-source.py) after `ladder` is bound and
+    before the loop, and the helper itself must take that minimum."""
     body_norm = _normalize_ws(_trial_body())
     assert re.search(
-        r"uint32_t\s+cap\s*=\s*std::min\(\s*cparams\.n_batch\s*,\s*cparams\.n_ctx\s*\)\s*;", body_norm
-    ), "cap must be computed as std::min(cparams.n_batch, cparams.n_ctx)"
+        r"const\s+uint32_t\s+cap\s*=\s*llama_auto_ubatch_cap\(\s*cparams\.n_batch\s*,\s*cparams\.n_ctx\s*,", body_norm
+    ), "cap must be computed by llama_auto_ubatch_cap(cparams.n_batch, cparams.n_ctx, ...)"
 
-    cap_idx = body_norm.find("uint32_t cap = std::min(cparams.n_batch, cparams.n_ctx);")
+    cap_idx = body_norm.find("const uint32_t cap = llama_auto_ubatch_cap(")
     ladder_idx = body_norm.find("const auto & ladder = llama_auto_ubatch_ladder;")
-    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    loop_idx = body_norm.find("for (uint32_t c : rung_ladder)")
     assert cap_idx != -1 and ladder_idx != -1 and loop_idx != -1
     assert ladder_idx < cap_idx < loop_idx, "cap must be computed after `ladder` is bound to llama_auto_ubatch_ladder and before the loop"
 
-    assert re.search(r"if\s*\(\s*c\s*>\s*cap\s*\)\s*\{\s*break\s*;\s*\}", body_norm), (
-        "the loop must break on the first candidate exceeding cap"
+    header = _normalize_ws(strip_comments(LLAMA_AUTO_UBATCH_H))
+    assert "uint32_t cap = n_batch < n_ctx ? n_batch : n_ctx;" in header, (
+        "llama_auto_ubatch_cap must start from min(n_batch, n_ctx)"
     )
+    for mutant in ("uint32_t cap = n_batch;", "uint32_t cap = n_ctx;", "uint32_t cap = n_batch > n_ctx ? n_batch : n_ctx;"):
+        assert mutant != "uint32_t cap = n_batch < n_ctx ? n_batch : n_ctx;"
+        assert mutant not in header
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +338,7 @@ def test_cap_below_first_rung_exits_before_the_loop_with_no_warn():
     (an empty `tried` list against a ladder that never ran)."""
     body_norm = _normalize_ws(_trial_body())
     cap_check_idx = body_norm.find("if (cap < ladder[0]) {")
-    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    loop_idx = body_norm.find("for (uint32_t c : rung_ladder)")
     warn_idx = body_norm.find("[SYCL-PLAN] auto n_ubatch=")
     assert cap_check_idx != -1, "the cap < ladder[0] early exit must exist"
     assert loop_idx != -1 and warn_idx != -1
@@ -380,7 +383,7 @@ def test_zero_sycl_token_exits_before_the_loop_with_no_warn():
     body_norm = _normalize_ws(_trial_body())
     guard_idx = body_norm.find("if (owner.model_id == 0 || owner.load_txn_id == 0) {")
     token_idx = body_norm.find("const ggml_sycl_model_token token")
-    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    loop_idx = body_norm.find("for (uint32_t c : rung_ladder)")
     warn_idx = body_norm.find("[SYCL-PLAN] auto n_ubatch=")
     assert guard_idx != -1, "the zero-token guard must exist"
     assert token_idx != -1 and loop_idx != -1 and warn_idx != -1
@@ -415,6 +418,16 @@ def test_zero_sycl_token_guard_has_a_mutation_witness():
     )
 
 
+_MOE_NARROW = "if (n_expert > 0 && moe_cap_available && moe_cap <= cap) {"
+
+
+def _cap_helper_body() -> str:
+    header = _normalize_ws(strip_comments(LLAMA_AUTO_UBATCH_H))
+    start = header.find("inline uint32_t llama_auto_ubatch_cap(")
+    assert start != -1, "llama_auto_ubatch_cap not found in src/llama-auto-ubatch.h"
+    return header[start : header.find("return cap;", start)]
+
+
 def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap():
     """For a MoE model (hparams.n_expert > 0), the cap must be additionally
     narrowed to ggml_backend_sycl_moe_gpu_ubatch_max() -- comment c-s747 /
@@ -426,16 +439,20 @@ def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap(
     ladder stopped). The 512 constant itself must NOT be
     hardcoded in llama-context.cpp; it must come from the accessor.
 
-    The condition must also be gated on moe_cap_available -- the
-    DL-without-SYCL branch degrades moe_cap to `cap` itself (no
-    MoE-specific narrowing) when the accessor is absent, which would
-    otherwise satisfy `moe_cap <= cap` trivially and report the ceiling
-    reason for every such MoE model although no ceiling was ever
-    consulted."""
-    body_norm = _normalize_ws(_trial_body())
-    assert re.search(r"if\s*\(\s*model\.hparams\.n_expert\s*>\s*0\s*\)\s*\{", body_norm), (
-        "the MoE cap must be gated on model.hparams.n_expert > 0"
+    The narrowing now lives in llama_auto_ubatch_cap(), gated on n_expert > 0
+    and on moe_cap_available -- the DL-without-SYCL branch reports the
+    ceiling unavailable when the accessor is absent, which would otherwise
+    report the ceiling reason for every such MoE model although no ceiling
+    was ever consulted. The trial passes the accessor's value, and reads the
+    accessor only for a MoE model."""
+    helper = _cap_helper_body()
+    assert _MOE_NARROW in helper, (
+        "llama_auto_ubatch_cap must narrow `cap` only when n_expert > 0 && moe_cap_available && "
+        "moe_cap <= cap -- not on moe_cap <= cap alone"
     )
+    assert "*moe_bound = true;" in helper and "*moe_bound = false;" in helper
+
+    body_norm = _normalize_ws(_trial_body())
     assert "ggml_backend_sycl_moe_gpu_ubatch_max" in body_norm, (
         "the MoE cap must be read from ggml_backend_sycl_moe_gpu_ubatch_max(), not a local constant"
     )
@@ -445,10 +462,14 @@ def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap(
     assert re.search(r"const\s+bool\s+moe_cap_available\s*=\s*moe_cap_fn\s*!=\s*nullptr\s*;", body_norm), (
         "the GGML_BACKEND_DL-without-SYCL branch must declare moe_cap_available = (moe_cap_fn != nullptr)"
     )
-    assert re.search(r"if\s*\(\s*moe_cap_available\s*&&\s*moe_cap\s*<=\s*cap\s*\)\s*\{", body_norm), (
-        "the MoE cap must narrow `cap` (and report the ceiling reason) only when moe_cap_available && "
-        "moe_cap <= cap -- not on moe_cap <= cap alone, which is trivially true when the accessor degraded "
-        "moe_cap to cap itself"
+    assert re.search(
+        r"moe_cap\s*=\s*model\.hparams\.n_expert\s*>\s*0\s*\?\s*ggml_backend_sycl_moe_gpu_ubatch_max\(\s*\)\s*:\s*0\s*;", body_norm
+    ), "the direct branch must read the accessor only for a MoE model"
+    assert re.search(
+        r"moe_cap\s*=\s*\(\s*model\.hparams\.n_expert\s*>\s*0\s*&&\s*moe_cap_fn\s*\)\s*\?\s*moe_cap_fn\(\s*\)\s*:\s*0\s*;", body_norm
+    ), "the DL branch must call the looked-up accessor only for a MoE model, and only when it exists"
+    assert re.search(r'stop\s*=\s*moe_bound\s*\?\s*"MoE GPU routing ceiling"\s*:\s*"ladder exhausted"\s*;', body_norm), (
+        "the stop reason must be the MoE ceiling exactly when the helper reports it bound"
     )
     assert not re.search(r"\bcap\s*=\s*512\b", body_norm), (
         "the MoE ceiling must not be hardcoded as a bare 512 in llama-context.cpp"
@@ -460,14 +481,11 @@ def test_moe_model_cap_binds_at_equal_has_a_mutation_witness():
     catch the condition reverting to strict `<` (which silently drops the
     "MoE GPU routing ceiling" reason whenever moe_cap == cap, e.g. a MoE
     model whose batch/ctx cap is already exactly 512)."""
-    raw = LLAMA_CONTEXT_CPP
-    line = "        if (moe_cap_available && moe_cap <= cap) {\n"
-    assert raw.count(line) == 1, f"mutation target not unique -- found {raw.count(line)}"
-    mutated_raw = raw.replace(line, "        if (moe_cap_available && moe_cap < cap) {\n", 1)
-    assert mutated_raw != raw
-
-    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    assert not re.search(r"if\s*\(\s*moe_cap_available\s*&&\s*moe_cap\s*<=\s*cap\s*\)\s*\{", mutated_body_norm), (
+    header = strip_comments(LLAMA_AUTO_UBATCH_H)
+    old = "moe_cap_available && moe_cap <= cap"
+    assert _normalize_ws(header).count(old) == 1, "mutation target not unique"
+    mutated = _normalize_ws(header).replace(old, "moe_cap_available && moe_cap < cap", 1)
+    assert _MOE_NARROW not in mutated, (
         "mutation witness is broken: reverting to strict < should make the <= check fail"
     )
 
@@ -478,16 +496,15 @@ def test_moe_model_cap_accessor_gate_has_a_mutation_witness():
     GPU routing ceiling" for every MoE model on a GGML_BACKEND_DL build
     whose SYCL DSO lacks the accessor, even though moe_cap was never
     narrowed by anything)."""
-    raw = LLAMA_CONTEXT_CPP
-    line = "        if (moe_cap_available && moe_cap <= cap) {\n"
-    assert raw.count(line) == 1, f"mutation target not unique -- found {raw.count(line)}"
-    mutated_raw = raw.replace(line, "        if (moe_cap <= cap) {\n", 1)
-    assert mutated_raw != raw
-
-    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    assert not re.search(
-        r"if\s*\(\s*moe_cap_available\s*&&\s*moe_cap\s*<=\s*cap\s*\)\s*\{", mutated_body_norm
-    ), "mutation witness is broken: dropping the moe_cap_available gate should make the gated-condition check fail"
+    header = strip_comments(LLAMA_AUTO_UBATCH_H)
+    old = "n_expert > 0 && moe_cap_available && moe_cap <= cap"
+    assert _normalize_ws(header).count(old) == 1, "mutation target not unique"
+    mutated = _normalize_ws(header).replace(old, "n_expert > 0 && moe_cap <= cap", 1)
+    assert _MOE_NARROW not in mutated, (
+        "mutation witness is broken: dropping the moe_cap_available gate should make the gated-condition check fail"
+    )
+    mutated = _normalize_ws(header).replace(old, "moe_cap_available && moe_cap <= cap", 1)
+    assert _MOE_NARROW not in mutated, "dropping the n_expert gate must also fail the check"
 
 
 def test_header_declares_the_moe_gpu_ubatch_max_accessor():
@@ -693,7 +710,7 @@ def test_ladder_updates_last_good_only_after_try_candidate_passes():
     call to try_candidate(c) must precede the `last_good = c;` assignment
     -- a losing candidate (non-null reason) must not win."""
     body_norm = _normalize_ws(_trial_body())
-    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    loop_idx = body_norm.find("for (uint32_t c : rung_ladder)")
     assert loop_idx != -1
     call_idx = body_norm.find("try_candidate(c)", loop_idx)
     last_good_idx = body_norm.find("last_good = c;", loop_idx)
@@ -961,77 +978,81 @@ def test_pipeline_parallel_restore_has_a_mutation_witness():
 # ---------------------------------------------------------------------------
 
 
-def _floor_skip_precedes_the_attempt(body_norm: str) -> bool:
-    loop_idx = body_norm.find("for (uint32_t c : ladder)")
-    assert loop_idx != -1
-    skip_idx = body_norm.find("if (c < fallback_ubatch) { continue; }", loop_idx)
-    tried_idx = body_norm.find("tried += (tried.empty() ? \"\" : \",\") + std::to_string(c);", loop_idx)
-    attempt_idx = body_norm.find("try_candidate(c)", loop_idx)
-    assert tried_idx != -1 and attempt_idx != -1, "could not find the loop's tried += and try_candidate(c)"
-    return skip_idx != -1 and skip_idx < tried_idx and skip_idx < attempt_idx
+# The floor is now enforced by the rung set the loop iterates: the trial
+# passes fallback_ubatch and cap to llama_auto_ubatch_rung_set(), which admits
+# a ladder rung only inside [fallback_ubatch, cap], and the loop carries no
+# bound checks of its own (tests/test-sycl-planned-ladder-source.py pins that
+# deletion). A rung the ladder never tries can never become last_good.
+_RUNG_IN_BOUNDS = "if (ladder[i] >= fallback_ubatch && ladder[i] <= cap) {"
+_CACHED_VALID_RETURN = (
+    "return n_ladder > 0 && cached_ubatch >= ladder[0] && cached_ubatch <= cap && cached_ubatch >= fallback_ubatch;"
+)
+
+
+def _header_norm() -> str:
+    return _normalize_ws(strip_comments(LLAMA_AUTO_UBATCH_H))
 
 
 def test_ladder_skips_rungs_below_fallback_ubatch():
-    """llama.cpp-pyu4: the ladder loop must skip every rung strictly below
-    fallback_ubatch BEFORE the rung is recorded in `tried` or attempted --
-    a rung the ladder never tries can never become last_good, so this is
-    what actually enforces the "never silently shrink" contract for a
-    raw-API caller's explicit n_ubatch, and a skip placed after `tried +=`
-    would also list rungs in the outcome WARN that were never tried."""
-    assert _floor_skip_precedes_the_attempt(_normalize_ws(_trial_body())), (
-        "the ladder loop must skip rungs strictly below fallback_ubatch before `tried +=` and try_candidate(c)"
+    """llama.cpp-pyu4: the ladder must never try a rung strictly below
+    fallback_ubatch -- a rung the ladder never tries can never become
+    last_good, so this is what actually enforces the "never silently shrink"
+    contract for a raw-API caller's explicit n_ubatch. The rung set admits a
+    ladder rung only when fallback_ubatch <= rung <= cap, and the trial hands
+    it both bounds."""
+    assert _RUNG_IN_BOUNDS in _header_norm(), (
+        "llama_auto_ubatch_rung_set must admit a ladder rung only when fallback_ubatch <= rung <= cap"
     )
+    assert re.search(
+        r"llama_auto_ubatch_rung_set\(\s*ladder\s*,\s*llama_auto_ubatch_ladder_size\s*,\s*fallback_ubatch\s*,\s*cap\s*,",
+        _normalize_ws(_trial_body()),
+    ), "the trial must build its rung set from fallback_ubatch and cap"
 
 
-@pytest.mark.parametrize("mutation", ["deleted", "moved-below-tried"])
+@pytest.mark.parametrize("mutation", ["no-floor-bound", "no-cap-bound"])
 def test_ladder_floor_skip_has_a_mutation_witness(mutation):
-    """Mutation witness for the check above: deleting the floor skip, or
-    moving it below `tried +=`, must make it fail."""
-    raw = LLAMA_CONTEXT_CPP
-    skip_block = (
-        "        if (c < fallback_ubatch) {\n"
-        "            continue;\n"
-        "        }\n"
-    )
-    tried_line = '        tried += (tried.empty() ? "" : ",") + std::to_string(c);\n'
-    assert raw.count(skip_block) == 1, "mutation target not found -- update this witness to match the real source"
-    assert raw.count(tried_line) == 1, "mutation anchor not found -- update this witness to match the real source"
-    mutated_raw = raw.replace(skip_block, "", 1)
-    if mutation == "moved-below-tried":
-        mutated_raw = mutated_raw.replace(tried_line, tried_line + skip_block, 1)
-    assert mutated_raw != raw
-
-    assert not _floor_skip_precedes_the_attempt(_body_of(mutated_raw, _TRIAL_START, _TRIAL_END)), (
-        "mutation witness is broken: the mutant should make the floor-skip ordering check fail"
+    """Mutation witness for the check above: dropping either bound of the
+    rung set's admission test must make it fail."""
+    header = _header_norm()
+    assert header.count(_RUNG_IN_BOUNDS) == 1, "mutation target not unique -- update this witness to match the real source"
+    replacement = {
+        "no-floor-bound": "if (ladder[i] <= cap) {",
+        "no-cap-bound": "if (ladder[i] >= fallback_ubatch) {",
+    }[mutation]
+    assert _RUNG_IN_BOUNDS not in header.replace(_RUNG_IN_BOUNDS, replacement, 1), (
+        "mutation witness is broken: the mutant should make the bound check fail"
     )
 
 
 def test_cache_hit_below_fallback_ubatch_is_treated_as_a_miss():
     """llama.cpp-pyu4: a cached value below fallback_ubatch must not win either --
-    the lookup's miss condition must also check cached_ubatch <
-    fallback_ubatch, alongside the pre-existing ladder[0]/cap bounds."""
+    the trial's cache_usable must come from llama_auto_ubatch_cached_valid,
+    which also checks cached_ubatch >= fallback_ubatch alongside the
+    ladder[0]/cap bounds, and a value it rejects is a miss."""
+    assert _CACHED_VALID_RETURN in _header_norm(), (
+        "llama_auto_ubatch_cached_valid must reject cached_ubatch < fallback_ubatch"
+    )
     body_norm = _normalize_ws(_trial_body())
     assert re.search(
-        r"cached_ubatch\s*<\s*ladder\[0\]\s*\|\|\s*cached_ubatch\s*>\s*cap\s*\|\|\s*cached_ubatch\s*<\s*"
-        r"fallback_ubatch\s*\)\s*\{\s*cache_state\s*=\s*\"miss\"\s*;",
+        r"cache_usable\s*=\s*cache_found\s*&&\s*llama_auto_ubatch_cached_valid\(\s*ladder\s*,\s*"
+        r"llama_auto_ubatch_ladder_size\s*,\s*cached_ubatch\s*,\s*fallback_ubatch\s*,\s*cap\s*\)\s*;",
         body_norm,
-    ), "the cache-lookup miss condition must also reject cached_ubatch < fallback_ubatch"
+    ), "cache_usable must be cache_found && llama_auto_ubatch_cached_valid(..., cached_ubatch, fallback_ubatch, cap)"
+    assert re.search(r"if\s*\(\s*!\s*cache_usable\s*\)\s*\{\s*cache_state\s*=\s*\"miss\"\s*;", body_norm), (
+        "an unusable cached value must be reported as a miss"
+    )
 
 
 def test_cache_hit_floor_has_a_mutation_witness():
     """Mutation witness for the check above: proves it would actually
-    catch the `|| cached_ubatch < fallback_ubatch` clause being dropped
+    catch the `cached_ubatch >= fallback_ubatch` clause being dropped
     (which would let a stale cached value below the caller's explicit
     n_ubatch win without ever revalidating against the floor)."""
-    raw = LLAMA_CONTEXT_CPP
-    line = "            cached_ubatch < ladder[0] || cached_ubatch > cap || cached_ubatch < fallback_ubatch) {\n"
-    assert line in raw, "mutation target not found -- update this witness to match the real source"
-    mutated_raw = raw.replace(line, "            cached_ubatch < ladder[0] || cached_ubatch > cap) {\n", 1)
-    assert mutated_raw != raw
-
-    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    assert "cached_ubatch < fallback_ubatch" not in mutated_body_norm, (
-        "mutation witness is broken: dropping the clause should remove it from the body"
+    header = _header_norm()
+    assert header.count(_CACHED_VALID_RETURN) == 1, "mutation target not unique -- update this witness to match the real source"
+    mutated = header.replace(_CACHED_VALID_RETURN, _CACHED_VALID_RETURN.replace(" && cached_ubatch >= fallback_ubatch", ""), 1)
+    assert _CACHED_VALID_RETURN not in mutated, (
+        "mutation witness is broken: dropping the clause should remove it from the helper"
     )
 
 
@@ -1098,7 +1119,9 @@ def test_ladder_has_candidate_host_test_is_registered_and_uses_the_trial_ladder(
     assert re.search(r"=\s*llama_auto_ubatch_ladder_size\s*;", code), (
         "the host test must use llama_auto_ubatch_ladder_size"
     )
-    assert not re.search(r"\{\s*512\s*,", code), "the host test must not carry its own copy of the ladder"
+    assert not re.search(r"uint32_t\s+\w*ladder\w*\s*\[\s*\]\s*=", code), (
+        "the host test must not carry its own copy of the ladder"
+    )
 
 
 def test_no_candidate_rung_exits_before_the_loop_with_no_warn():
@@ -1118,7 +1141,7 @@ def test_no_candidate_rung_exits_before_the_loop_with_no_warn():
     BEFORE the loop."""
     body_norm = _normalize_ws(_trial_body())
     cache_warn_idx = body_norm.find("[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)")
-    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    loop_idx = body_norm.find("for (uint32_t c : rung_ladder)")
     warn_idx = body_norm.find("[SYCL-PLAN] auto n_ubatch=")
     assert cache_warn_idx != -1 and loop_idx != -1 and warn_idx != -1
 
@@ -1278,6 +1301,10 @@ def test_all_nine_stop_reasons_are_present():
     found = set(re.findall(r'stop\s*=\s*"([^"]*)"', body_norm)) | set(
         re.findall(r'return\s*"([^"]*)"\s*;', body_norm)
     )
+    # The initial stop reason is the helper's binding verdict: the MoE ceiling
+    # when llama_auto_ubatch_cap reports it bound, else the ladder running out.
+    for pair in re.findall(r'stop\s*=\s*moe_bound\s*\?\s*"([^"]*)"\s*:\s*"([^"]*)"\s*;', body_norm):
+        found |= set(pair)
     assert found == nine, f"stop-reason literal set does not match exactly -- found {found}"
 
 
@@ -1709,7 +1736,7 @@ def test_ubatch_cache_lookup_precedes_the_ladder():
     the whole point of Task 5 is to skip the ladder on a clean hit."""
     body_norm = _normalize_ws(_trial_body())
     lookup_idx = body_norm.find("cache_lookup_fn(&cache_key,")
-    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    loop_idx = body_norm.find("for (uint32_t c : rung_ladder)")
     assert lookup_idx != -1, "could not find the cache_lookup_fn(&cache_key, ...) call"
     assert loop_idx != -1
     assert lookup_idx < loop_idx, "the tuning-cache lookup must precede the ladder loop"
@@ -1720,7 +1747,7 @@ def test_ubatch_cache_store_follows_the_ladder():
     (and after the last_good == 0 fallback correction, so it never
     persists 0) -- never before it, and never inside it."""
     body_norm = _normalize_ws(_trial_body())
-    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    loop_idx = body_norm.find("for (uint32_t c : rung_ladder)")
     fallback_fixup_idx = body_norm.find("if (last_good == 0) {")
     store_idx = body_norm.find("cache_store_fn(&cache_key,")
     assert loop_idx != -1 and fallback_fixup_idx != -1
@@ -1739,9 +1766,9 @@ def test_cache_hit_gates_the_ladder_and_sets_the_cached_stop_reason():
     assert re.search(r'stop\s*=\s*"cached"\s*;', body_norm), 'a cache hit must set stop = "cached";'
     assert re.search(r"ladder_needed\s*=\s*false\s*;", body_norm), "a cache hit must set ladder_needed = false;"
 
-    loop_idx = body_norm.find("for (uint32_t c : ladder) {")
+    loop_idx = body_norm.find("for (uint32_t c : rung_ladder) {")
     assert loop_idx != -1
-    after_loop_open = body_norm[loop_idx + len("for (uint32_t c : ladder) {") :]
+    after_loop_open = body_norm[loop_idx + len("for (uint32_t c : rung_ladder) {") :]
     assert re.match(r"\s*if\s*\(\s*!ladder_needed\s*\)\s*\{\s*break\s*;\s*\}", after_loop_open), (
         "the ladder loop's first statement must be `if (!ladder_needed) { break; }`, so a cache hit skips every "
         "rung without trying any of them"
@@ -1773,9 +1800,9 @@ def test_ubatch_cache_lookup_and_store_have_mutation_witnesses():
     of the ladder loop."""
     raw = LLAMA_CONTEXT_CPP
 
-    lookup_line = "    if (cache_available) {\n"
+    lookup_line = "    uint32_t   cached_ubatch         = 0;\n"
     assert lookup_line in raw, "mutation target not found -- update this witness to match the real source"
-    loop_line = "    for (uint32_t c : ladder) {\n"
+    loop_line = "    for (uint32_t c : rung_ladder) {\n"
     assert loop_line in raw, "mutation target not found -- update this witness to match the real source"
 
     # Swap the two markers' relative order by moving the loop's opening
@@ -1786,7 +1813,7 @@ def test_ubatch_cache_lookup_and_store_have_mutation_witnesses():
 
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
     mutated_lookup_idx = mutated_body_norm.find("cache_lookup_fn(&cache_key,")
-    mutated_loop_idx = mutated_body_norm.find("for (uint32_t c : ladder)")
+    mutated_loop_idx = mutated_body_norm.find("for (uint32_t c : rung_ladder)")
     assert mutated_lookup_idx != -1 and mutated_loop_idx != -1
     assert not (mutated_lookup_idx < mutated_loop_idx), (
         "mutation witness is broken: moving the loop ahead of the cache check should make the lookup-precedes-"
@@ -1815,7 +1842,7 @@ def test_ubatch_cache_store_follows_the_ladder_has_a_mutation_witness():
         "    }\n"
     )
     assert store_block in raw, "mutation target not found -- update this witness to match the real source"
-    loop_line = "    for (uint32_t c : ladder) {\n"
+    loop_line = "    for (uint32_t c : rung_ladder) {\n"
     assert loop_line in raw, "mutation target not found -- update this witness to match the real source"
 
     # Move the store block to just BEFORE the ladder loop itself (not merely
@@ -1825,7 +1852,7 @@ def test_ubatch_cache_store_follows_the_ladder_has_a_mutation_witness():
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    mutated_loop_idx = mutated_body_norm.find("for (uint32_t c : ladder)")
+    mutated_loop_idx = mutated_body_norm.find("for (uint32_t c : rung_ladder)")
     mutated_store_idx = mutated_body_norm.find("cache_store_fn(&cache_key,")
     assert mutated_loop_idx != -1 and mutated_store_idx != -1
     assert not (mutated_loop_idx < mutated_store_idx), (
@@ -2219,7 +2246,7 @@ def test_non_terminal_hit_resumes_the_ladder_above_the_cached_value():
     needlessly re-try a value already known to pass."""
     body_norm = _normalize_ws(_trial_body())
     resume_assign_idx = body_norm.find("cache_resume_above = cached_ubatch;")
-    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    loop_idx = body_norm.find("for (uint32_t c : rung_ladder)")
     assert resume_assign_idx != -1, "could not find `cache_resume_above = cached_ubatch;`"
     assert loop_idx != -1
     assert resume_assign_idx < loop_idx, "cache_resume_above must be set before the ladder loop runs"
