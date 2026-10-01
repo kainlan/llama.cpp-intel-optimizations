@@ -27,14 +27,21 @@ create_memory mutants by the order checks.
 Gate 15 (update clauses): llama_kv_cache::update returns FAILED from both K-shift
 failure exits (the pending shift stays recorded, so the next decode retries it);
 no `->update(` result is discarded in the memory files; memory_update returns
-llama_memory_update_result, and both of decode's call sites compare it with FAILED;
-the post-update graph_reserve sits inside a try.
+llama_memory_update_result, and both of decode's call sites compare it with FAILED
+and return -2 (the retry site's DONE continues); each of memory_update's four failure
+branches (apply, null init_full, refused post-update reserve, catch) sets
+sched_need_reserve BEFORE it returns FAILED; the post-update graph_reserve sits inside
+a try; update() ends `updated ? DONE : NONE`.
 
 Gate 24: every class that overrides init_full overrides init_reserve, in the header
-and in the definitions; each composite's s-stream context constructor forwards
-n_streams to every part it builds (dsv4 forwards to csa, hca and lid, or returns the
-named refusal); llama_kv_cache_context's s-stream constructor spans exactly n_streams
-streams (s1 = n_streams - 1).
+and in the definitions; every init_reserve body is `make_unique<X_context>(this,
+n_streams)` (recurrent: init_full()); each composite's s-stream context constructor
+forwards n_streams to every part it builds (dsv4 forwards to csa, hca and lid;
+hybrid_idx also takes ns_ubatch{ n_streams }); llama_kv_cache_context's s-stream
+constructor asserts 1 <= n_streams <= n_stream and spans exactly n_streams streams
+(s1 = n_streams - 1, strm.push_back(s), idxs.resize(n_streams)); dsv4's
+dsv4_build_full_sinfo builds s1 = n_stream - 1 and strm[s] = s; the full kv and dsv4
+raw contexts delegate to the s-stream constructors.
 
 All gates prove themselves on mutants of the real source (the gate must fail
 on each) and refuse to pass vacuously. Limits, deliberately: the walk is
@@ -325,6 +332,9 @@ def update_clause_violations(files):
                 out.append(("llama-context.cpp", first + 1, "the memory_update branch `%s` does not return FAILED" % anchor))
             if needs_flag and "sched_need_reserve = true;" not in blk:
                 out.append(("llama-context.cpp", first + 1, "the memory_update branch `%s` does not set sched_need_reserve" % anchor))
+            elif needs_flag and "return LLAMA_MEMORY_UPDATE_FAILED;" in blk and \
+                    blk.index("sched_need_reserve = true;") > blk.index("return LLAMA_MEMORY_UPDATE_FAILED;"):
+                out.append(("llama-context.cpp", first + 1, "the memory_update branch `%s` sets sched_need_reserve after it returns" % anchor))
         body_stmts = [l.strip() for l in lines if l.strip()]
         if len(body_stmts) < 2 or body_stmts[-2] != "return LLAMA_MEMORY_UPDATE_DONE;":
             out.append(("llama-context.cpp", first + 1, "memory_update does not end by returning DONE"))
@@ -397,6 +407,13 @@ def update_clause_mutants(files):
             "llama-context.cpp", cc[:base] + drop_after(cc[base:], anchor, "return LLAMA_MEMORY_UPDATE_FAILED;", "return LLAMA_MEMORY_UPDATE_NONE;"))
         yield "memory_update %s: no longer sets sched_need_reserve" % name, with_file(
             "llama-context.cpp", cc[:base] + drop_after(cc[base:], anchor, "sched_need_reserve = true;"))
+    base = cc.index("llama_memory_update_result llama_context::memory_update(")
+    ap = cc.index("if (!mctx->apply()) {", base)
+    fl = cc.index("return LLAMA_MEMORY_UPDATE_FAILED;", ap)
+    st = cc.index("sched_need_reserve = true;", ap)
+    swapped = (cc[:st] + cc[fl:fl + len("return LLAMA_MEMORY_UPDATE_FAILED;")] + cc[st + len("sched_need_reserve = true;"):fl]
+               + "sched_need_reserve = true;" + cc[fl + len("return LLAMA_MEMORY_UPDATE_FAILED;"):])
+    yield "apply failure: sched_need_reserve stored after the return", with_file("llama-context.cpp", swapped)
     yield "update tail returns DONE unconditionally", with_file(
         "llama-kv-cache.cpp", kv.replace("return updated ? LLAMA_MEMORY_UPDATE_DONE : LLAMA_MEMORY_UPDATE_NONE;", "return LLAMA_MEMORY_UPDATE_DONE;", 1))
 
@@ -491,14 +508,24 @@ def reserve_clause_violations(files):
     else:
         body = m.group(1)
         for tok in ("sinfos[0].s1 = n_streams - 1;", "sinfos[0].idxs.resize(n_streams);", "s < n_streams",
-                    "GGML_ASSERT(n_streams >= 1 && n_streams <= kv->get_n_stream());"):
+                    "GGML_ASSERT(n_streams >= 1 && n_streams <= kv->get_n_stream());", "sinfos[0].strm.push_back(s);"):
             if tok not in body:
                 out.append(("llama-kv-cache.cpp", 0, "the s-stream constructor lacks `%s`" % tok))
     # the full contexts are the s-stream ones over every stream, by delegation, so their equality is not a convention
     full_kv = " ".join(kv.split())
     if "llama_kv_cache_context::llama_kv_cache_context( llama_kv_cache * kv) : llama_kv_cache_context(kv, kv->get_n_stream()) {" not in full_kv:
         out.append(("llama-kv-cache.cpp", 0, "the full llama_kv_cache_context does not delegate to the s-stream constructor"))
-    dsv4 = " ".join(strip_comments(files.get("llama-kv-cache-dsv4.cpp", "")).split())
+    dsv4_text = strip_comments(files.get("llama-kv-cache-dsv4.cpp", ""))
+    helper = body_of(dsv4_text, r"^static llama_kv_cache::slot_info dsv4_build_full_sinfo\(")
+    if helper is None:
+        out.append(("llama-kv-cache-dsv4.cpp", 0, "dsv4_build_full_sinfo is missing"))
+    else:
+        htext = "\n".join(helper[1])
+        for tok in ("GGML_ASSERT(n_stream >= 1 && n_stream <= kv->get_n_stream());", "sinfo.s1 = n_stream - 1;",
+                    "sinfo.resize(n_stream);", "s < n_stream", "sinfo.strm[s] = s;"):
+            if tok not in htext:
+                out.append(("llama-kv-cache-dsv4.cpp", helper[0] + 1, "dsv4_build_full_sinfo lacks `%s`" % tok))
+    dsv4 = " ".join(dsv4_text.split())
     if ("llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv) : "
             "llama_kv_cache_dsv4_raw_context(kv, kv->get_swa()->get_n_stream()) {") not in dsv4:
         out.append(("llama-kv-cache-dsv4.cpp", 0, "the full dsv4 raw context does not delegate to the s-stream constructor"))
@@ -538,6 +565,13 @@ def reserve_clause_mutants(files):
         idx.replace("std::vector<uint32_t>{ n_streams }", "std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }", 1))
     yield "kv s-stream constructor assert dropped", with_file(
         "llama-kv-cache.cpp", kv.replace("GGML_ASSERT(n_streams >= 1 && n_streams <= kv->get_n_stream());", "", 1))
+    yield "kv s-stream constructor maps every stream to stream 0", with_file(
+        "llama-kv-cache.cpp", kv.replace("sinfos[0].strm.push_back(s);", "sinfos[0].strm.push_back(0);", 1))
+    dvh = files["llama-kv-cache-dsv4.cpp"]
+    yield "dsv4_build_full_sinfo s1 off by one", with_file(
+        "llama-kv-cache-dsv4.cpp", dvh.replace("sinfo.s1 = n_stream - 1;", "sinfo.s1 = n_stream;", 1))
+    yield "dsv4_build_full_sinfo maps every stream to stream 0", with_file(
+        "llama-kv-cache-dsv4.cpp", dvh.replace("sinfo.strm[s] = s;", "sinfo.strm[s] = 0;", 1))
     yield "full kv context no longer delegates", with_file(
         "llama-kv-cache.cpp", kv.replace(": llama_kv_cache_context(kv, kv->get_n_stream()) {", ": status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {", 1))
     dv = files["llama-kv-cache-dsv4.cpp"]
