@@ -876,23 +876,55 @@ int main() {
         CHECK(ggml_sycl::zone_dense_scratch_merge_input(0, 0, true) == 0, "nothing planned stays nothing");
     }
 
-    // ---- Case 16: review r2 (hardware): a rung whose hold-induced spill leaves the card below the driver headroom
-    // does not fit. B50, Qwen PPL at auto-ub1024: a 461 MB compute buffer was held back, spilled outside the arena,
-    // the card was left with 107.8 MB free against the 256 MB the arena expects outside it, and flash attention then
-    // ran out of resources. The ladder must see that at the rung, not at the first graph. -------------------------
+    // ---- Case 16: review r2/r3 (hardware): a rung is refused for its hold-induced spill only when that spill is
+    // what pushed the card under the driver headroom. B50, Qwen PPL at auto-ub1024: a 461 MB compute buffer was
+    // held back, spilled outside the arena, the card was left with 107.8 MB free against the 256 MB the arena
+    // expects outside it, and flash attention then ran out of resources. A card that was ALREADY under the headroom
+    // for another reason (a full B70, KB-scale spills) is not blamed on the hold. -----------------------------
     {
         const size_t MiB = 1024 * 1024;
         CHECK(!ggml_sycl::zone_hold_spill_realized_fits(108 * MiB, 256 * MiB, 461 * MiB),
-              "the B50 ub1024 rung: a 461 MB hold spill leaves 107.8 MB free, below the 256 MB headroom: no fit");
+              "the B50 ub1024 rung: 107.8 MB free after a 461 MB spill, 569 MB before: the spill pushed it under");
         CHECK(ggml_sycl::zone_hold_spill_realized_fits(0, 256 * MiB, 0),
               "no hold-induced spill: the check asks nothing, whatever the free memory is");
         CHECK(ggml_sycl::zone_hold_spill_realized_fits(256 * MiB, 256 * MiB, 1),
               "a spill that leaves exactly the headroom fits");
         CHECK(!ggml_sycl::zone_hold_spill_realized_fits(256 * MiB - 1, 256 * MiB, 1),
-              "one byte below the headroom after a spill does not fit");
+              "one byte below the headroom, and the spill's one byte is what crossed it: blamed");
         CHECK(ggml_sycl::zone_hold_spill_realized_fits(4096 * MiB, 256 * MiB, 461 * MiB),
               "a spill the card can take with its headroom intact fits: the hold costs a rung only when it must");
-        CHECK(!ggml_sycl::zone_hold_spill_realized_fits(0, 256 * MiB, 1), "a spill with no free memory left does not fit");
+        CHECK(ggml_sycl::zone_hold_spill_realized_fits(100 * MiB, 256 * MiB, 300 * 1024),
+              "a full card with a KB-scale spill was under the headroom before the spill: not blamed on the hold");
+        CHECK(ggml_sycl::zone_hold_spill_realized_fits(0, 256 * MiB, 1),
+              "a spill too small to have crossed the headroom is not what made the card short");
+        CHECK(ggml_sycl::zone_hold_spill_realized_fits(100 * MiB, 256 * MiB, 100 * MiB),
+              "free plus the spill is still under the headroom: the card was short without the hold");
+        CHECK(!ggml_sycl::zone_hold_spill_realized_fits(100, 256 * MiB, SIZE_MAX),
+              "an overflowing spill must not read as a small one");
+    }
+
+    // ---- Case 17: the spill bound follows the candidate rung (review r3 I1). The largest compute-buffer request
+    // is observed at one n_ubatch; a rung above it asks for proportionally more, so the bound scales with the rung. --
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 230 * MiB, 512, 1024) == 536 * MiB,
+              "B50: a 230 MB request seen at ub512 scales to 460 MB at ub1024, plus the 76 MB plan");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 230 * MiB, 512, 512) == 306 * MiB,
+              "the rung the request was seen at needs no scaling");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 460 * MiB, 1024, 512) == 306 * MiB,
+              "a smaller rung than the one observed scales down (the settle re-publish of last_good)");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 230 * MiB, 0, 1024) == 306 * MiB,
+              "a request seen at an unknown n_ubatch is not scaled");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 0, 512, 1024) == 76 * MiB,
+              "nothing observed yet: the bound is the plan alone, and the comments say it is a lower bound");
+        CHECK(ggml_sycl::zone_hold_spill_bound(0, 230 * MiB, 512, 1024) == 0,
+              "no plan, no hold, nothing a hold can push out");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, SIZE_MAX, 1, 2) == SIZE_MAX,
+              "a scaled request that overflows saturates");
+        CHECK(ggml_sycl::zone_hold_spill_bound(SIZE_MAX - 1, 230 * MiB, 512, 512) == SIZE_MAX,
+              "a plan plus a request that overflows saturates");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 230 * MiB, 512, 0) == 306 * MiB,
+              "an unknown candidate n_ubatch is not scaled");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");

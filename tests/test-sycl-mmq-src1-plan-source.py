@@ -39,6 +39,8 @@ parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--common", default=str(sycl / "common.hpp"))
 parser.add_argument("--cache", default=str(sycl / "unified-cache.cpp"))
 parser.add_argument("--zone", default=str(sycl / "zone-sizing.hpp"))
+parser.add_argument("--context", default=str(root / "src/llama-context.cpp"))
+parser.add_argument("--header", default=str(root / "ggml/include/ggml-sycl.h"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -620,18 +622,26 @@ def evaluate(backend, common, cache, zone):
     results["the overcommit guard refuses only a hold-induced spill"] = \
         re.search(r"if\s*\(\s*hold_spill\s*\)\s*\{[^{}]*return false;", unified_alloc_fn) is not None
 
-    # r2 (hardware, B50 auto-ub1024): the ladder's "does this rung fit" must see a hold-induced spill that leaves
-    # the card below the driver headroom. The spill is realized during the rung's own compute-buffer reserve, so
-    # the narrow recheck that runs inside it (and whose refusal makes the candidate lose) is where it is counted.
+    # r2/r3 (hardware, B50 auto-ub1024): the ladder's "does this rung fit" must see a hold-induced spill that
+    # pushed the card under the driver headroom. The rung's compute buffers exist only after sched_reserve()
+    # returns (the recheck inside it runs after a 1-token probe reserve, before the worst-case pp/tg reserves, and
+    # only for the first rung under auto_fa), so the check runs from try_candidate, after sched_reserve(); see
+    # evaluate_context. This half pins the backend entry and the one rule it and the transaction share.
+    epoch_fn = function_body(cache, r"void unified_cache_begin_planned_hold_epoch\([^)]*\)\s*\{") or ""
     realized_fn = function_body(backend, r"static bool ggml_sycl_check_hold_spill_realized\([^)]*\)\s*\{") or ""
     graph_headroom_fn = function_body(backend, r"static void ggml_sycl_check_graph_scratch_headroom\([^)]*\)\s*\{") or ""
+    entry_fn = function_body(backend, r"bool ggml_backend_sycl_planned_hold_spill_fits\([^)]*\)\s*\{") or ""
+    hold_headroom_fn = function_body(backend, r"static bool ggml_sycl_check_hold_spill_headroom\([^)]*\)\s*\{") or ""
     results["anchor: realized hold-spill check exists"] = realized_fn != ""
     results["the realized check asks the pure rule, the live free memory and the spills since this publish"] = \
         "zone_hold_spill_realized_fits(" in realized_fn and "ggml_backend_sycl_get_device_memory(" in realized_fn and \
         "unified_cache_get_recent_planned_hold_spills(" in realized_fn and "GGML_SYCL_RUNTIME_TXN_REFUSAL" in realized_fn
-    results["the recheck inside the rung's reserve runs the realized check for this context"] = \
-        re.search(r"ggml_sycl_check_hold_spill_realized\([^;]*planned_scratch_owner", recheck_fn) is not None
-    epoch_fn = function_body(cache, r"void unified_cache_begin_planned_hold_epoch\([^)]*\)\s*\{") or ""
+    results["the exported entry asks the realized check for this backend's context and owner"] = \
+        entry_fn != "" and re.search(r"ggml_sycl_check_hold_spill_realized\([^;]*planned_scratch_owner", entry_fn) is not None
+    results["the exported entry is registered for a backend-DL build"] = \
+        re.search(r'strcmp\(name,\s*"ggml_backend_sycl_planned_hold_spill_fits"\)\s*==\s*0\)\s*\{\s*return \(void \*\)\s*ggml_backend_sycl_planned_hold_spill_fits;', backend) is not None
+    results["the recheck no longer claims the realized spill (it runs before the rung's worst-case reserves)"] = \
+        "ggml_sycl_check_hold_spill_realized(" not in recheck_fn
     results["a publish starts a new spill epoch (a losing rung's spills and mark do not carry to the next rung)"] = \
         "unified_cache_begin_planned_hold_epoch(" in txn and \
         re.search(r"request_hwm\s*=\s*0\s*;", epoch_fn) is not None and \
@@ -640,7 +650,66 @@ def evaluate(backend, common, cache, zone):
     results["the driver headroom the realized check uses is the graph-entry check's constant (one source)"] = \
         "kSyclArenaMinExternalHeadroomBytes" in realized_fn and "kSyclArenaMinExternalHeadroomBytes" in graph_headroom_fn and \
         re.search(r"arena_min_external_headroom\s*=\s*256", graph_headroom_fn) is None
+    # I1: the bound follows the candidate rung, and the FA-on check and the realized check ask ONE question.
+    results["the spill bound scales the largest request to the candidate rung"] = \
+        "zone_hold_spill_bound(" in bound_fn and "unified_cache_get_runtime_request_hwm(" in bound_fn
+    results["the FA-on check asks the realized rule (predicted free after the spill), not a second one"] = \
+        "zone_hold_spill_realized_fits(" in hold_headroom_fn and "spill_bytes <= free_mem" not in hold_headroom_fn
+    note_fn = function_body(cache, r"size_t unified_cache_note_runtime_request\([^)]*\)\s*\{") or ""
+    results["the largest request is recorded with the n_ubatch it was seen at, from the first publish on"] = \
+        "epoch_n_ubatch" in note_fn and "request_hwm_n_ubatch" in note_fn
+    # M3: one take of the leaf hold mutex per RUNTIME request on the allocation path.
+    results["unified_alloc takes the hold state once per request"] = \
+        len(re.findall(r"unified_cache_note_runtime_request\(", unified_alloc_fn)) == 1 and \
+        "unified_cache_get_planned_scratch_hold(" not in unified_alloc_fn
+    # M4: spill attribution follows the current owner.
+    set_hold_fn = function_body(cache, r"void unified_cache_set_planned_scratch_hold\([^)]*\)\s*\{") or ""
+    results["a new owner starts with its own spill counts"] = \
+        "state.owner != owner" in set_hold_fn and re.search(r"spill_count\s*=\s*0\s*;", set_hold_fn) is not None
+    # M1: the dispatch arm that draws the planned f16 buffers is compiled under the one macro too.
+    op_body = op_sycl or ""
+    dq_calls = [m.start() for m in re.finditer(r"ggml_sycl_dequant_f16_scratch\(", op_body)]
+    results["both f16 buffer acquisitions in the dispatch arm sit under the one macro"] = \
+        len(dq_calls) == 2 and all(
+            re.findall(r"#\s*if[^\n]*", op_body[:at])[-1:] == ["#if GGML_SYCL_DEQUANT_F16_ARM"] or
+            re.findall(r"#\s*if[^\n]*", op_body[:at])[-1:] == ["#    if GGML_SYCL_DEQUANT_F16_ARM"]
+            for at in dq_calls)
     return results
+
+
+def evaluate_context(context, header):
+    """r3 C1: WHERE the hold-spill fit check runs in the auto-ubatch trial. A rung's compute buffers exist only once
+    sched_reserve() has returned, so the check belongs in try_candidate, after it, for every rung, every
+    flash-attention mode and the cached rung -- not in the recheck inside the reserve."""
+    results = {}
+    try_fn = function_body(context, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{") or ""
+    results["anchor: try_candidate exists"] = try_fn != ""
+    reserve_at = try_fn.find("sched_reserve();")
+    hook_at = try_fn.find("hold_spill_fn(")
+    last_ok = try_fn.rfind("return nullptr;")
+    results["the hold-spill check runs in try_candidate, after sched_reserve() and before the rung is accepted"] = \
+        0 <= reserve_at < hook_at < last_ok
+    results["a rung whose hold spill pushed the card under its headroom loses with its own stop reason"] = \
+        re.search(r"if\s*\(\s*hold_spill_fn\s*&&\s*!\s*hold_spill_fn\([^)]*\)\s*\)\s*\{[^{}]*return \"[^\"]+\";", try_fn) is not None and \
+        "sched_matches_last_good" in try_fn[hook_at:last_ok]
+    results["the hook is resolved for a direct build and for a backend-DL build"] = \
+        "&ggml_backend_sycl_planned_hold_spill_fits" in context and \
+        re.search(r'llama_context_sycl_proc_addr\([^;]*"ggml_backend_sycl_planned_hold_spill_fits"', context) is not None
+    results["the header declares the exported entry"] = \
+        re.search(r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_planned_hold_spill_fits\(\s*ggml_backend_t", header) is not None
+    return results
+
+
+def run_context(label, sources, expect_fail=None):
+    results = evaluate_context(*sources)
+    failed = sorted(k for k, v in results.items() if not v)
+    if expect_fail is None:
+        for k in sorted(results):
+            print(("PASS: " if results[k] else "FAIL: ") + k)
+        return failed
+    fired = expect_fail in failed
+    print(("PASS" if fired else "FAIL") + f": mutant '{label}' fires '{expect_fail}'")
+    return [] if fired else [label]
 
 
 def run(label, sources, expect_fail=None):
@@ -660,7 +729,10 @@ def run(label, sources, expect_fail=None):
 zone_impl = str(Path(args.zone).with_suffix(".cpp"))
 backend, common, cache, zone = (read(args.backend), read(args.common), read(args.cache),
                                 read(args.zone) + "\n" + (read(zone_impl) if Path(zone_impl).exists() else ""))
+context_src = read(args.context)
+header_src = read(args.header)
 failed = run("tree", (backend, common, cache, zone))
+failed += run_context("tree", (context_src, header_src))
 # A comment is not code, so the stripped sources cannot see it. This one was a false claim a reader acted on
 # : the whole-graph recording path does NOT keep the Q8 buffer's handle alive.
 raw_backend = re.sub(r"\s*\n\s*//\s*", " ", Path(args.backend).read_text())  # un-wrap line comments
