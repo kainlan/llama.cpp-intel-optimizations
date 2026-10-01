@@ -17405,12 +17405,6 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     log_xmx_reject("coverage");
                     return false;
                 }
-                if (!xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) ||
-                    !xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG) ||
-                    caps.optimal_tiles_n <= 0) {
-                    log_xmx_reject("caps");
-                    return false;
-                }
                 if (device_grouped_xmx_shape && !xmx_route_arrays_ok) {
                     const int n_experts_i = n_experts;
                     const int max_chunks  = n_experts_i * ((static_cast<int>(total_batches) + exec_n - 1) / exec_n);
@@ -17518,11 +17512,14 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
 
                 grouped_n_groups = static_cast<int>(grouped_experts_host.size());
                 grouped_n_chunks = static_cast<int>(grouped_chunk_groups_host.size());
-                if (grouped_n_groups <= 0 || grouped_n_chunks <= 0 ||
-                    grouped_rows_host.size() != static_cast<size_t>(n_gpu_entries)) {
+                if (grouped_n_groups <= 0 || grouped_n_chunks <= 0) {
                     log_xmx_reject("group-empty");
                     return false;
                 }
+                // Every device entry owns a distinct slot (the slot-duplicate test above), and
+                // each contributes exactly one row, so this holds by construction.
+                GGML_ASSERT(grouped_rows_host.size() == static_cast<size_t>(n_gpu_entries) &&
+                            "one grouped row per device entry");
                 const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
                 const auto   occupancy = ggml_sycl_select_mxfp4_grouped_dpas_occupancy(
                     caps, grouped_counts_host.data(), grouped_counts_host.size(), row_limit);

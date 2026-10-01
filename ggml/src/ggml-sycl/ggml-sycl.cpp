@@ -64123,18 +64123,6 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // Determine the data layout: use forced_layout from mul_mat_id if provided,
         // else check src0->extra->layout.mode, else default to AOS.
         ggml_sycl_unified::LayoutMode data_layout = ggml_sycl_unified::LayoutMode::AOS;
-        if (forced_layout && !moe_mmvq_mxfp4_direct_reads_layout(*forced_layout)) {
-            // The switch below would map this layout onto AOS (its default arm) and the
-            // reconcile guard further down compares stored against ADVERTISED, so a
-            // tensor stored in this layout passes it -- and is then decoded as AOS:
-            // deterministic garbage (llama.cpp-4hg7, xmx_tiled hybrid expert). The
-            // kernels here do not decode it, so refuse. A crash is strictly better
-            // than wrong tokens; the fix for a missing kernel is the kernel.
-            GGML_ABORT(
-                "[MXFP4-DIRECT] %s: no decode for advertised layout=%s on this path -- refusing instead of "
-                "reading it as AOS (support gap; llama.cpp-4hg7)",
-                src0->name ? src0->name : "(null)", ggml_sycl_layout_mode_name(*forced_layout));
-        }
         if (forced_layout) {
             switch (*forced_layout) {
                 case GGML_LAYOUT_AOS:
@@ -64194,6 +64182,25 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             }
         }
 
+        // The layout of the bytes this path is about to decode, AFTER the reconcile above: the
+        // advertised one when forced (reconciled, so equal to the stored one) or the tensor's own
+        // effective one. A layout that disagrees with storage was already refused above and falls
+        // through; what is left is the loaded layout, which is the answer. The switches above map
+        // anything they do not know onto AOS, so a loaded layout none of these kernels decodes
+        // (xmx_tiled, I8, DPAS, ...) would be read as AOS: deterministic garbage (llama.cpp-4hg7,
+        // xmx_tiled hybrid expert). Refuse loudly instead: a missing kernel for the loaded layout is
+        // a support gap to close, not an input to re-route, and a crash beats wrong tokens.
+        const layout_mode direct_effective_layout =
+            forced_layout ? *forced_layout :
+            src0->extra   ? get_effective_layout_mode(static_cast<const ggml_tensor_extra_gpu *>(src0->extra)) :
+                            GGML_LAYOUT_AOS;
+        if (layout_reconciled && !moe_mmvq_mxfp4_direct_reads_layout(direct_effective_layout)) {
+            GGML_ABORT(
+                "[MXFP4-DIRECT] %s: no decode for loaded layout=%s on this path -- refusing instead of "
+                "reading it as AOS (support gap; llama.cpp-4hg7)",
+                src0->name ? src0->name : "(null)", ggml_sycl_layout_mode_name(direct_effective_layout));
+        }
+
         const void * src0_data = nullptr;
         if (layout_reconciled && src0_storage) {
             const sycl::usm::alloc alloc = ggml_sycl_get_alloc_type(src0_storage);
@@ -64213,6 +64220,12 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         if (layout_reconciled && !src0_data) {
             auto resolved = ggml_sycl_resolve(src0, ctx.device);
             if (resolved) {
+                if (!moe_mmvq_mxfp4_direct_reads_layout(resolved.layout)) {
+                    GGML_ABORT(
+                        "[MXFP4-DIRECT] %s: no decode for resolved layout=%s on this path -- refusing instead of "
+                        "reading it as AOS (support gap; llama.cpp-4hg7)",
+                        src0->name ? src0->name : "(null)", ggml_sycl_layout_mode_name(resolved.layout));
+                }
                 src0_data = resolved.ptr;
                 switch (resolved.layout) {
                     case GGML_LAYOUT_SOA:
@@ -75769,6 +75782,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // Everything below that decides "shared" reads this, never
             // cpu_expert_tg_active alone (llama.cpp-4hg7).
             const bool cpu_shared_act = cpu_expert_tg_active && ne11 == 1;
+            // Q1_0/NVFP4 host experts run an immutable admitted recipe with its own managed
+            // buffers; they never use the PinnedBufferPool, so they neither reserve a pool span
+            // nor depend on the pool's capacity.
+            const bool immutable_host_recipe = src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4;
             if (ne11 == 1 && src0->type != GGML_TYPE_Q1_0 && src0->type != GGML_TYPE_NVFP4 &&
                 (cpu_expert_tg_active || multi_gpu)) {
                 static thread_local managed_host_pinned_buffer s_act_staging;
@@ -75794,10 +75811,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
 
-            // dispatch_cpu_compute's pool_first_entry: first PinnedBufferPool entry this dispatch owns.  A caller
-            // that issues several dispatches in one MUL_MAT_ID (the hot/cold split)
-            // reserves the whole span once and hands each dispatch its own slice, so
-            // their act/out regions are disjoint.  npos = reserve one here.
+            // dispatch_cpu_compute's pool_first_entry is the first PinnedBufferPool entry the
+            // dispatch owns.  A caller that issues several dispatches in one MUL_MAT_ID (the
+            // hot/cold split) reserves the whole span once and hands each dispatch its own
+            // slice, so their act/out regions are disjoint.  npos = reserve one here.
             constexpr size_t pool_entry_npos = static_cast<size_t>(-1);
 
             // CPU expert compute: alloc pinned buffers, D2H activations,
@@ -75813,8 +75830,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
 
                 const size_t n_cpu = entries.size();
-                const bool immutable_host_recipe =
-                    src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4;
                 if (immutable_host_recipe) {
                     for (const expert_dispatch_entry & entry : entries) {
                         if (!entry.admitted_recipe_ticket.valid() ||
@@ -75883,12 +75898,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return result;
                 }
 
-                // The output region is zeroed further down, after the activation wait: it
-                // may still be the source of an earlier scatter's H2D, and only a completed
-                // activation D2H on the same in-order queue proves that copy has run.  That
-                // proof needs the earlier scatter's H2D to have been ENQUEUED before this
-                // op's activation D2H: the consumed/try flushes at op entry run first.  See
-                // PinnedBufferPool::reserve for the wrap-around condition.
+                // The output region is zeroed further down, after the activation wait.  Across
+                // ops the pool is NOT kept disjoint (entry offsets use each op's own K/N, and a
+                // top-K-sized pool restarts at entry 0 every op), so this region can be the
+                // source of an earlier op's scatter H2D.  What makes the write safe is ordering:
+                //   (1) that op's scatter was flushed -- its H2D enqueued on the in-order
+                //       compute queue -- BEFORE this op's activation D2H was enqueued (the
+                //       consumed flushes and try_flush at op entry run ahead of that D2H), and
+                //   (2) the memset and the CPU kernels run only after that D2H completed, and
+                //       completing an event on an in-order queue completes every earlier
+                //       command, the H2D included.
+                // Within ONE op the hot and cold groups are slices of one reservation and are
+                // disjoint (PinnedBufferPool::reserve).
                 const bool zero_out_after_act_wait = from_pool || !out_owner.valid();
 
                 ggml_sycl_tensor_storage_handle src1_storage{};
@@ -76899,12 +76920,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                 // The hot and cold dispatches must not share pool entries: the hot scatter's
                 // H2D reads its out region asynchronously while the cold dispatch zeroes
-                // and fills its own.  So the split needs one pool span for both; when the
-                // pool cannot hold all of them, dispatch them as one group instead.
+                // and fills its own.  So the split needs one pool span for both.  When the
+                // pool cannot hold all of them -- notably the synchronous PP path, where
+                // the pool is sized from the 2-token warmup graph and an ubatch needs far
+                // more entries -- everything is dispatched as ONE group: no hot/cold
+                // split, hence no deferral of the cold scatter (llama.cpp-4hg7; pp512
+                // throughput is the cost to measure).  Recipe types never touch the pool,
+                // so they keep splitting regardless of its capacity.
                 auto &       hc_pool       = g_pinned_buffer_pools[ctx.device];
                 const size_t n_cpu_entries = cpu_entries.size();
+                const bool   split_needs_pool = !immutable_host_recipe;
                 if (defer_n == 0 || static_cast<int>(cpu_entries.size()) <= defer_n ||
-                    !hc_pool.can_serve(n_cpu_entries)) {
+                    (split_needs_pool && !hc_pool.can_serve(n_cpu_entries))) {
                     dispatch_cpu_and_scatter(cpu_entries);
                 } else {
                     const int64_t                      cold_threshold = n_ids - defer_n;
@@ -76925,7 +76952,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     hot_entries.size(), cold_entries.size(), defer_n, (long long) cold_threshold);
 
                     // One reservation covers both groups; each takes its own slice.
-                    const size_t hot_first  = hc_pool.reserve(n_cpu_entries);
+                    const size_t hot_first  = split_needs_pool ? hc_pool.reserve(n_cpu_entries) : 0;
                     const size_t cold_first = hot_first + hot_entries.size();
                     if (!hot_entries.empty()) {
                         dispatch_cpu_and_scatter(hot_entries, hot_first);

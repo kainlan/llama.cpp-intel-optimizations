@@ -53,7 +53,16 @@ scatter events and was rejected for that reason).  It is DISJOINT REGIONS:
      everything is one dispatch;
   8. the out-region memset is not before the activation D2H wait (that wait, on the
      in-order queue, is what proves an earlier scatter's H2D from this region has run);
-  9. no host wait is (re)introduced in do_cpu_dispatch.
+  9. no host wait is (re)introduced in do_cpu_dispatch;
+ 10. CROSS-OP safety is by ORDERING, not by the ring (entry offsets scale with each op's own K/N
+     and a top-K pool restarts at entry 0, so different ops DO alias).  Three premises are pinned:
+     the deferred activation wait is exactly `if (act_deferred_pending) { act_deferred_evt.wait(); }`
+     (pin W1: with an extra conjunct such as n_cpu > 1 the memset and the CPU read run before the
+     D2H lands); the memset is the very next statement after it at the same nesting level (pin W2:
+     it follows the wait in control flow, not only in the text); and the op-entry flushes --
+     flush_pending_cpu_scatter_if_consumed, flush_pending_cpu_pipeline_if_consumed,
+     try_flush_pending_cpu_scatter, in that order -- precede the shared activation D2H (pins
+     F1/F2/F3: the earlier scatter's H2D must be enqueued before this op's D2H).
 
 WHAT THIS DOES NOT PROVE.  It reads source text.  It shows the shortcut can no longer
 be taken when ne11 > 1 and that the per-expert path it falls to is still the
@@ -231,8 +240,9 @@ def check_hot_cold(code: str) -> None:
 
     # 6. the dispatch addresses its own slice of the ring.
     if "size_t pool_first_entry" not in head:
-        raise ContractError("FAIL: dispatch_cpu_compute takes no pool_first_entry, so a second dispatch cannot get a disjoint region (llama.cpp-4hg7)")
+        raise ContractError("FAIL [pin R1]: dispatch_cpu_compute takes no pool_first_entry, so a second dispatch cannot get a disjoint region (llama.cpp-4hg7)")
     needles = {
+        "if (pool.can_serve(n_cpu) && !immutable_host_recipe) {": "the pool branch is not conditioned on can_serve and a non-recipe type",
         "pool_base = pool_first_entry != pool_entry_npos ? pool_first_entry : pool.reserve(n_cpu)": "the pool entry is not the caller's slice or a fresh reservation",
         "act_pinned = bp.act + pool_base * static_cast<size_t>(K)": "act_pinned does not start at the dispatch's own pool entry",
         "out_pinned = bp.out + pool_base * static_cast<size_t>(N)": "out_pinned does not start at the dispatch's own pool entry",
@@ -242,29 +252,73 @@ def check_hot_cold(code: str) -> None:
     }
     for needle, why in needles.items():
         if needle not in lam:
-            raise ContractError(f"FAIL: dispatch_cpu_compute: {why} (llama.cpp-4hg7)")
+            raise ContractError(f"FAIL [pin R2]: dispatch_cpu_compute: {why} (llama.cpp-4hg7)")
 
-    # 8. the out memset sits after the activation wait, and only there.
+    # 8. (I2) the deferred activation wait and the memset that depends on it.
+    #    The wait runs whenever the D2H is pending -- no extra conjunct: with n_cpu == 1 the memset
+    #    and the CPU read would otherwise race the D2H.  The memset is the very next statement at
+    #    the same nesting level, so it follows the wait in control flow, not only in the text.
     memsets = [m.start() for m in re.finditer(r"std::memset\(\s*out_pinned\b", lam)]
-    wait_at = lam.find("act_deferred_evt.wait();")
-    if len(memsets) != 1 or wait_at < 0 or memsets[0] < wait_at:
+    if len(memsets) != 1:
+        raise ContractError("FAIL [pin W1]: the out-region memset must occur exactly once in dispatch_cpu_compute (llama.cpp-4hg7)")
+    if "if (act_deferred_pending) { act_deferred_evt.wait(); }" not in lam:
         raise ContractError(
-            "FAIL: the out-region memset must occur exactly once, after act_deferred_evt.wait() -- before it, "
-            "it can zero a region an earlier scatter's H2D has not read yet (llama.cpp-4hg7)"
+            "FAIL [pin W1]: the deferred activation wait is not exactly `if (act_deferred_pending) { "
+            "act_deferred_evt.wait(); }` -- an extra conjunct (e.g. n_cpu > 1) lets the memset and the CPU "
+            "read run before the D2H lands (llama.cpp-4hg7)"
         )
+    if not re.search(
+        r"if \(act_deferred_pending\) \{ act_deferred_evt\.wait\(\); \} "
+        r"if \(zero_out_after_act_wait\) \{ std::memset\(out_pinned, 0, n_cpu \* static_cast<size_t>\(N\) \* sizeof\(float\)\); \}",
+        lam,
+    ):
+        raise ContractError(
+            "FAIL [pin W2]: the out-region memset is not the statement that directly follows the activation "
+            "wait at the same nesting level; before it, or under a condition that skips it, it can zero a "
+            "region an earlier scatter's H2D has not read yet (llama.cpp-4hg7)"
+        )
+
+    # 9. (I2) the flushes that make the ordering argument true come before the shared D2H.
+    entry_marker = '"[MoE-HYBRID] ne12=%ld hybrid_active=%d plan_hybrid=%d cpu_tg=%d expert_cache=%d\\n"'
+    anchor = code.find(entry_marker)
+    if code.count(entry_marker) != 1 or anchor < 0:
+        raise ContractError("FAIL [pin F0]: the hybrid-op entry anchor is not unique (llama.cpp-4hg7)")
+    after = squash(code[anchor:])
+    d2h = after.find("act_d2h_event = ggml_sycl::mem_copy_async(shared_act_handle")
+    if d2h < 0:
+        raise ContractError("FAIL [pin F0]: the shared activation D2H was not found after the hybrid-op entry (llama.cpp-4hg7)")
+    entry = after[:d2h]
+    order = [
+        ("flush_pending_cpu_scatter_if_consumed(dst, ctx.device);", "F1"),
+        ("flush_pending_cpu_pipeline_if_consumed(dst, ctx.device);", "F2"),
+        ("try_flush_pending_cpu_scatter();", "F3"),
+    ]
+    at = -1
+    for needle, pin in order:
+        if entry.count(needle) != 1:
+            raise ContractError(
+                f"FAIL [pin {pin}]: `{needle}` must appear exactly once between the hybrid-op entry and the shared "
+                "activation D2H; the earlier op's scatter H2D has to be enqueued BEFORE this op's D2H (llama.cpp-4hg7)"
+            )
+        nxt = entry.find(needle)
+        if nxt < at:
+            raise ContractError(f"FAIL [pin {pin}]: `{needle}` is out of order; the op-entry flushes run consumed, pipeline, try (llama.cpp-4hg7)")
+        at = nxt
 
     # 7. the split.
     d_at = code.find(DISPATCH_MARKER)
     if d_at < 0:
         raise ContractError("FAIL: do_cpu_dispatch lambda not found (llama.cpp-4hg7)")
     body = squash(brace_block_from(code, d_at))
-    if not re.search(r"\|\|\s*!\s*hc_pool\.can_serve\(\s*n_cpu_entries\s*\)\s*\)\s*\{\s*dispatch_cpu_and_scatter\(cpu_entries\)", body):
+    if "const bool split_needs_pool = !immutable_host_recipe;" not in body:
+        raise ContractError("FAIL [pin S2]: do_cpu_dispatch does not derive split_needs_pool from immutable_host_recipe, so recipe types reserve a span they never use (llama.cpp-4hg7)")
+    if not re.search(r"\|\| \(split_needs_pool && !hc_pool\.can_serve\(n_cpu_entries\)\)\) \{ dispatch_cpu_and_scatter\(cpu_entries\)", body):
         raise ContractError(
-            "FAIL: do_cpu_dispatch splits hot/cold without checking the pool can hold both groups; an over-capacity "
-            "split would wrap and overlap the hot region (llama.cpp-4hg7)"
+            "FAIL [pin S1]: do_cpu_dispatch splits hot/cold without checking the pool can hold both groups (for "
+            "types that use the pool); an over-capacity split would wrap and overlap the hot region (llama.cpp-4hg7)"
         )
     order = [
-        "const size_t hot_first = hc_pool.reserve(n_cpu_entries);",
+        "const size_t hot_first = split_needs_pool ? hc_pool.reserve(n_cpu_entries) : 0;",
         "const size_t cold_first = hot_first + hot_entries.size();",
         "dispatch_cpu_and_scatter(hot_entries, hot_first)",
         "flush_pending_cpu_scatter()",
@@ -275,29 +329,33 @@ def check_hot_cold(code: str) -> None:
         nxt = body.find(needle, at + 1)
         if nxt < 0:
             raise ContractError(
-                f"FAIL: do_cpu_dispatch has no `{needle}` after the previous step; the split must reserve one "
+                f"FAIL [pin S3]: do_cpu_dispatch has no `{needle}` after the previous step; the split must reserve one "
                 "span, give hot its start and cold start + hot count (llama.cpp-4hg7)"
             )
         at = nxt
 
-    # 9. no host wait of any kind in the split.
+    # 10. no host wait of any kind in the split.
     if re.search(r"event::wait|\.wait\(\)|wait_prev_scatter_events|stream->wait|wait_and_throw", body):
-        raise ContractError("FAIL: do_cpu_dispatch waits on the host; the hot/cold hazard is closed by disjoint regions, not a wait (llama.cpp-4hg7)")
+        raise ContractError("FAIL [pin S4]: do_cpu_dispatch waits on the host; the hot/cold hazard is closed by disjoint regions, not a wait (llama.cpp-4hg7)")
 
 
 def self_test(backend_src: str) -> int:
     failures: list[str] = []
     pool_src = POOL_CPP.read_text()
 
-    def expect_fail(name: str, mutated: str, mutated_pool: str | None = None) -> None:
+    def expect_fail(name: str, mutated: str, mutated_pool: str | None = None, pin: str | None = None) -> None:
         if mutated == backend_src and (mutated_pool is None or mutated_pool == pool_src):
             failures.append(f"{name}: mutation did not change the source (anchor stale)")
             print(f"  mutant {name}: NOT APPLIED")
             return
         try:
             check(mutated, mutated_pool)
-        except ContractError:
-            print(f"  mutant {name}: caught")
+        except ContractError as e:
+            if pin is not None and f"[pin {pin}]" not in str(e):
+                failures.append(f"{name}: failed, but not on pin {pin}: {str(e)[:120]}")
+                print(f"  mutant {name}: caught by the WRONG pin ({str(e)[:70]}...)")
+                return
+            print(f"  mutant {name}: caught" + (f" (pin {pin})" if pin else ""))
             return
         failures.append(f"{name}: mutant survived")
         print(f"  mutant {name}: SURVIVED")
@@ -344,41 +402,67 @@ def self_test(backend_src: str) -> int:
     # m10: the cold group shares the hot group's entries (the original hot/cold overwrite).
     expect_fail("cold-shares-hot-region", sub("const size_t cold_first = hot_first + hot_entries.size();",
                                               "const size_t cold_first = hot_first;",
-                                              in_lambda=False, after=DISPATCH_MARKER))
+                                              in_lambda=False, after=DISPATCH_MARKER), None, "S3")
     # m11: the hot group is not handed its slice (it would reserve its own and the cold one overlaps).
     expect_fail("hot-not-given-slice", sub("dispatch_cpu_and_scatter(hot_entries, hot_first);",
                                            "dispatch_cpu_and_scatter(hot_entries);",
-                                           in_lambda=False, after=DISPATCH_MARKER))
+                                           in_lambda=False, after=DISPATCH_MARKER), None, "S3")
     # m12: no single reservation for the split.
-    expect_fail("split-without-reservation", sub("const size_t hot_first  = hc_pool.reserve(n_cpu_entries);",
+    expect_fail("split-without-reservation", sub("const size_t hot_first  = split_needs_pool ? hc_pool.reserve(n_cpu_entries) : 0;",
                                                  "const size_t hot_first  = 0;",
-                                                 in_lambda=False, after=DISPATCH_MARKER))
+                                                 in_lambda=False, after=DISPATCH_MARKER), None, "S3")
     # m13: the split no longer checks the pool can hold both groups.
-    expect_fail("split-unguarded-by-capacity", sub("||\n                    !hc_pool.can_serve(n_cpu_entries)) {", ") {",
-                                                   in_lambda=False, after=DISPATCH_MARKER))
+    expect_fail("split-unguarded-by-capacity", sub("(split_needs_pool && !hc_pool.can_serve(n_cpu_entries))) {",
+                                                   "false) {", in_lambda=False, after=DISPATCH_MARKER), None, "S1")
+    # M2: recipe types (Q1_0/NVFP4) reserve a span they never use.
+    expect_fail("recipe-types-reserve-pool", sub("const bool   split_needs_pool = !immutable_host_recipe;",
+                                                 "const bool   split_needs_pool = true;",
+                                                 in_lambda=False, after=DISPATCH_MARKER), None, "S2")
     # m14: the memset returns to before the activation wait.
     expect_fail("memset-before-act-wait", sub(
         "const bool zero_out_after_act_wait = from_pool || !out_owner.valid();",
         "const bool zero_out_after_act_wait = from_pool || !out_owner.valid();\n"
-        "                if (zero_out_after_act_wait) { std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float)); }"))
+        "                if (zero_out_after_act_wait) { std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float)); }"),
+        None, "W1")
+    # I2(c): the deferred wait gains a conjunct -- with n_cpu == 1 the memset and the CPU read run before the D2H lands.
+    expect_fail("act-wait-needs-n-cpu-gt-1", sub("if (act_deferred_pending) {\n                    act_deferred_evt.wait();",
+                                                 "if (act_deferred_pending && n_cpu > 1) {\n                    act_deferred_evt.wait();"),
+                None, "W1")
+    # I2: the memset moves under the wait's own block -- the guard is no longer exactly the wait.
+    expect_fail("memset-inside-wait-block", sub(
+        "if (act_deferred_pending) {\n                    act_deferred_evt.wait();\n                }\n                if (zero_out_after_act_wait) {\n                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));\n                }",
+        "if (act_deferred_pending) {\n                    act_deferred_evt.wait();\n                    if (zero_out_after_act_wait) {\n                        std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));\n                    }\n                }"),
+        None, "W1")
+    # I2: the wait is exact, but the memset that must follow it in control flow can be skipped.
+    expect_fail("memset-conditioned-away", sub(
+        "if (zero_out_after_act_wait) {\n                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));",
+        "if (zero_out_after_act_wait && n_cpu > 1) {\n                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));"),
+        None, "W2")
+    # I2(a)/(b): the op-entry flushes that put the earlier scatter's H2D ahead of this op's D2H.
+    expect_fail("try-flush-dropped", sub("            try_flush_pending_cpu_scatter();\n", "",
+                                         in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F3")
+    expect_fail("consumed-flush-dropped", sub("            flush_pending_cpu_scatter_if_consumed(dst, ctx.device);\n", "",
+                                              in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F1")
+    expect_fail("pipeline-flush-dropped", sub("            flush_pending_cpu_pipeline_if_consumed(dst, ctx.device);\n", "",
+                                              in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F2")
     # m15..m19: each offset that names the slot must carry the pool entry.
     expect_fail("out-ptr-ignores-pool-entry", sub("out_pinned = bp.out + pool_base * static_cast<size_t>(N);",
-                                                  "out_pinned = bp.out;"))
+                                                  "out_pinned = bp.out;"), None, "R2")
     expect_fail("act-ptr-ignores-pool-entry", sub("act_pinned = bp.act + pool_base * static_cast<size_t>(K);",
-                                                  "act_pinned = bp.act;"))
+                                                  "act_pinned = bp.act;"), None, "R2")
     expect_fail("scatter-src-offset-ignores-pool-entry", sub(
         "(pool_base + ci) * static_cast<size_t>(N) * sizeof(float) });",
-        "ci * static_cast<size_t>(N) * sizeof(float) });"))
+        "ci * static_cast<size_t>(N) * sizeof(float) });"), None, "R2")
     expect_fail("single-d2h-ignores-pool-entry", sub(
         "act_handle, pool_base * static_cast<size_t>(K) * sizeof(float), src1_storage.handle,",
-        "act_handle, 0, src1_storage.handle,"))
+        "act_handle, 0, src1_storage.handle,"), None, "R2")
     expect_fail("per-expert-d2h-ignores-pool-entry", sub(
         "const size_t dst_off = (pool_base + ci) * static_cast<size_t>(K) * sizeof(float);",
         "const size_t dst_off = ci * static_cast<size_t>(K) * sizeof(float);"))
     # m20: a host wait comes back into the split.
     expect_fail("host-wait-in-split", sub("flush_pending_cpu_scatter();\n                    }\n                    dispatch_cpu_and_scatter(cold_entries, cold_first);",
                                           "flush_pending_cpu_scatter();\n                        sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);\n                    }\n                    dispatch_cpu_and_scatter(cold_entries, cold_first);",
-                                          in_lambda=False, after=DISPATCH_MARKER))
+                                          in_lambda=False, after=DISPATCH_MARKER), None, "S4")
     # m21/m22: the ring itself.
     expect_fail("ring-never-wraps", backend_src, pool_src.replace("next_entry_ = 0;\n    }\n    const size_t first", "}\n    const size_t first"))
     expect_fail("ring-cursor-not-advanced", backend_src, pool_src.replace("next_entry_        = (first + n_experts) % max_experts_;", ""))
@@ -397,7 +481,7 @@ def self_test(backend_src: str) -> int:
     if failures:
         print(f"SELF-TEST FAIL: {', '.join(failures)}")
         return 1
-    print("SELF-TEST PASS: 23 mutants caught, unmodified tree passes")
+    print("SELF-TEST PASS: 29 mutants caught, unmodified tree passes")
     return 0
 
 

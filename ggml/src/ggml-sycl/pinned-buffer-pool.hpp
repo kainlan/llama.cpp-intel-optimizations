@@ -38,9 +38,11 @@ class PinnedBufferPool {
     // Release all buffers via unified_free().
     void shutdown();
 
-    // Acquire buffers for n_experts.
-    // act: n_experts * act_stride_ floats for activation staging (D2H target).
-    // out: n_experts * out_stride_ floats for CPU output (H2D source).
+    // Acquire the pool's buffer pair for n_experts entries.
+    // act: base of the activation staging region (D2H target), K floats per entry.
+    // out: base of the CPU output region (H2D source), N floats per entry.
+    // The pair is always the pool BASE: it is the same pair on every call. Which entries of it a
+    // dispatch owns is decided by reserve(); address them as act + first * K and out + first * N.
     struct BufferPair {
         float * act = nullptr;
         float * out = nullptr;
@@ -49,28 +51,29 @@ class PinnedBufferPool {
     BufferPair acquire(size_t n_experts);
 
     // Reserve n_experts consecutive entries and return the index of the first one.
-    // The pool is a ring over its max_experts_ entries: successive reservations
-    // advance, and one that would run past the end restarts at entry 0.  The caller
-    // addresses its entries as acquire().act + first * K and acquire().out + first * N,
-    // so two reservations that are live together get DISJOINT regions -- which is
-    // how a dispatch avoids overwriting a buffer an earlier scatter's H2D may still
-    // be reading, without any host wait (llama.cpp-4hg7).  Requires can_serve(n).
-    // Main thread only (one MUL_MAT_ID at a time), like g_pending_scatter.
+    // The pool is a ring over its max_experts_ entries: successive reservations advance, and one
+    // that would run past the end restarts at entry 0.  Requires can_serve(n).
     //
-    // WHEN A WRAPPED SPAN MAY ALIAS AN EARLIER ONE.  A span handed out after a wrap can overlap
-    // a region that an earlier MUL_MAT_ID's scatter H2D has enqueued but not yet executed.  That
-    // is safe only because of two facts the CALLER must keep true:
+    // WHAT THE RING GUARANTEES, AND WHAT IT DOES NOT.  It makes two dispatches of ONE
+    // MUL_MAT_ID disjoint: the hot and cold groups are slices of a single reservation, so the
+    // cold dispatch cannot overwrite the region the hot scatter's H2D is still reading, with no
+    // host wait (llama.cpp-4hg7).  It does NOT keep different ops disjoint.  Entry offsets scale
+    // with each op's own K and N (gate/up and down differ), so spans of different ops alias
+    // byte-wise without any wrap; and a pool sized to the top-K (GPT-OSS: 4) restarts at entry 0
+    // on every op that uses all of it.  Never rely on the ring for cross-op safety.
+    //
+    // CROSS-OP SAFETY comes from ordering, which the CALLER must keep true:
     //   (1) the earlier op's scatter was flushed -- its H2D enqueued on the in-order compute
     //       queue -- BEFORE this op's activation D2H was enqueued (the hybrid MUL_MAT_ID flushes
     //       a consumed or finished scatter at op entry, ahead of that D2H); and
-    //   (2) the caller does not write the region (zero it, or let CPU kernels fill it) until
-    //       that activation D2H has completed.  Completion of an event on an in-order queue
-    //       implies every earlier command, including the H2D, has completed.
-    // Within ONE op the hot and cold groups never alias: they are slices of one reservation,
-    // and the split is taken only when the pool can hold the whole span.  A scatter left
-    // pending (not flushed) across ops is outside this argument -- its out region is still
-    // awaiting the CPU, not the queue, and nothing here protects it (see the g_pending_scatter
-    // overwrite gap noted on llama.cpp-4hg7).
+    //   (2) the caller does not write the region (zero it, or let the CPU kernels fill it)
+    //       until that activation D2H has completed.  Completing an event on an in-order queue
+    //       completes every earlier command on it, the H2D included.
+    // A scatter left pending (not flushed) across ops is outside this argument; see llama.cpp-3bww.
+    //
+    // Threading: one MUL_MAT_ID at a time, joined before the next.  It is not main-thread-only:
+    // the cpu_async_safe path calls it from the async CPU thread, which the main thread joins
+    // before the next op touches the pool.
     size_t reserve(size_t n_experts);
 
     // Whether acquire(n_experts) would be served. The pool's capacity is fixed
