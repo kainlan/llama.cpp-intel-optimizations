@@ -61,7 +61,7 @@ scatter events and was rejected for that reason).  It is DISJOINT REGIONS:
      D2H lands); the memset is the very next statement after it at the same nesting level (pin W2:
      it follows the wait in control flow, not only in the text); and the op-entry flushes --
      flush_pending_cpu_scatter_if_consumed, flush_pending_cpu_pipeline_if_consumed,
-     try_flush_pending_cpu_scatter, in that order -- precede the shared activation D2H (pins
+     flush_pending_cpu_scatter, in that order -- precede the shared activation D2H (pins
      F1/F2/F3: the earlier scatter's H2D must be enqueued before this op's D2H).  Three more pins
      close the ways a pinned statement can be present and still not run: W3 (the memset's guard is
      defined exactly once as `from_pool || !out_owner.valid()`, so `= false` cannot drop the zeroing),
@@ -72,6 +72,23 @@ scatter events and was rejected for that reason).  It is DISJOINT REGIONS:
      These are TEXTUAL and STRUCTURAL pins (brace and statement adjacency), not control-flow analysis:
      a conditional hidden behind a macro or a helper function, or an early `return` above the
      statement, is outside what they can see.
+
+11. A PENDING SCATTER IS NEVER OVERWRITTEN (llama.cpp-3bww).  g_pending_scatter holds ONE deferred
+     CPU result.  Bias-less MoE (qwen2moe/qwen3moe/qwen3vlmoe/qwen3next) runs the up MUL_MAT_ID and
+     then the gate MUL_MAT_ID with no ADD_ID between them, so gate does not consume up's output.
+     The op-entry flush used to be a non-blocking try (flush only if the CPU future was already
+     ready); with up's CPU compute still running, gate's apply_cpu_result_to_scatter overwrote the
+     pending state and up's host-expert rows were never H2D-scattered.  Pinned: the third op-entry
+     flush (F3) is the UNCONDITIONAL `flush_pending_cpu_scatter();`, and
+     apply_cpu_result_to_scatter opens, right after its validity check, with
+     `GGML_ASSERT(!g_pending_scatter.active ...)` (pin A1), so a path that reaches it with an
+     unflushed scatter aborts instead of dropping rows.  The flush has to be at op ENTRY, not in
+     apply: by apply time this op's CPU kernels have already written the pool bytes that the
+     pending H2D has not read yet (the ring is disjoint only within one op), and the pending CPU
+     workers read the shared activation staging buffer that this op's D2H rewrites.  Pin A2: the
+     only other writer of `g_pending_scatter.active = true` (the direct CPU-TG path) flushes first.
+     Pin A3: the opt-in pipeline slot (GGML_SYCL_PIPELINE_CPU=1) has the same overwrite and aborts
+     through the same kind of assertion until llama.cpp-ytc9 fixes it.
 
 WHAT THIS DOES NOT PROVE.  It reads source text.  It shows the shortcut can no longer
 be taken when ne11 > 1 and that the per-expert path it falls to is still the
@@ -264,6 +281,7 @@ def check(backend_src: str, pool_src: str | None = None) -> None:
         raise ContractError("FAIL: the per-expert D2H source offset no longer uses i11 * nb11 (llama.cpp-4hg7)")
 
     check_hot_cold(code)
+    check_pending_scatter(code)
     check_pool_ring(pool_src if pool_src is not None else POOL_CPP.read_text())
 
 
@@ -281,6 +299,64 @@ def check_pool_ring(pool_src: str) -> None:
         raise ContractError("FAIL: PinnedBufferPool::reserve() does not wrap to entry 0 past the end (llama.cpp-4hg7)")
     if not re.search(r"next_entry_\s*=\s*\(\s*first\s*\+\s*n_experts\s*\)\s*%\s*max_experts_", body):
         raise ContractError("FAIL: PinnedBufferPool::reserve() does not advance its cursor past the span (llama.cpp-4hg7)")
+
+
+APPLY_MARKER = "auto apply_cpu_result_to_scatter = [&]("
+PIPELINE_APPLY_MARKER = "auto apply_cpu_result_to_pipeline = [&]("
+
+
+def check_pending_scatter(code: str) -> None:
+    """Pin A1/A2: g_pending_scatter is never assigned while it still holds an unflushed scatter."""
+    ap_at = code.find(APPLY_MARKER)
+    if ap_at < 0 or code.count(APPLY_MARKER) != 1:
+        raise ContractError("FAIL [pin A1]: apply_cpu_result_to_scatter lambda not found exactly once (llama.cpp-3bww)")
+    apply_body = squash(brace_block_from(code, ap_at))
+    guard = "if (!r.valid) { return; } GGML_ASSERT(!g_pending_scatter.active &&"
+    guard_at = apply_body.find(guard)
+    first_write = apply_body.find("g_pending_scatter.future =")
+    if guard_at < 0 or first_write < 0 or guard_at > first_write:
+        raise ContractError(
+            "FAIL [pin A1]: apply_cpu_result_to_scatter does not open with `GGML_ASSERT(!g_pending_scatter.active "
+            "&& ...)` straight after its validity check and before its first write to g_pending_scatter; a "
+            "still-pending scatter would be overwritten and its host-expert rows never reach the device "
+            "(llama.cpp-3bww)"
+        )
+    require_unconditional(apply_body, apply_body.find("GGML_ASSERT(!g_pending_scatter.active"),
+                          header=None, pin="A1", what="the pending-scatter assertion in apply_cpu_result_to_scatter")
+
+    # A3: the opt-in pipeline slot has the same one-slot overwrite; until it is fixed (llama.cpp-ytc9) it
+    # must abort instead of dropping rows.
+    pl_at = code.find(PIPELINE_APPLY_MARKER)
+    if pl_at < 0 or code.count(PIPELINE_APPLY_MARKER) != 1:
+        raise ContractError("FAIL [pin A3]: apply_cpu_result_to_pipeline lambda not found exactly once (llama.cpp-ytc9)")
+    pl_body = squash(brace_block_from(code, pl_at))
+    pl_guard = pl_body.find("if (!r.valid) { return; } GGML_ASSERT(!g_pending_cpu_pipeline.active &&")
+    pl_write = pl_body.find("g_pending_cpu_pipeline.future =")
+    if pl_guard < 0 or pl_write < 0 or pl_guard > pl_write:
+        raise ContractError(
+            "FAIL [pin A3]: apply_cpu_result_to_pipeline does not open with `GGML_ASSERT(!g_pending_cpu_pipeline.active "
+            "&& ...)` straight after its validity check and before its first write (llama.cpp-ytc9)"
+        )
+    require_unconditional(pl_body, pl_body.find("GGML_ASSERT(!g_pending_cpu_pipeline.active"),
+                          header=None, pin="A3", what="the pending-pipeline assertion in apply_cpu_result_to_pipeline")
+
+    # A2: every other writer of `active = true` flushes first.  A new writer must be added here on purpose.
+    writers = [m.start() for m in re.finditer(r"g_pending_scatter\.active\s*=\s*true\s*;", code)]
+    if len(writers) != 2:
+        raise ContractError(
+            f"FAIL [pin A2]: g_pending_scatter.active is set true at {len(writers)} sites, expected 2 (the hybrid "
+            "apply lambda and the direct CPU-TG path); a new writer needs its own flush-before-write proof "
+            "(llama.cpp-3bww)"
+        )
+    direct_at = code.find("auto dispatch_cpu_entries_now = [&](")
+    if direct_at < 0:
+        raise ContractError("FAIL [pin A2]: the direct CPU-TG dispatch_cpu_entries_now lambda was not found (llama.cpp-3bww)")
+    direct = squash(brace_block_from(code, direct_at))
+    if not re.search(r"if \(entries\.empty\(\)\) \{ return; \} if \(g_pending_scatter\.active\) \{ flush_pending_cpu_scatter\(\); \}", direct):
+        raise ContractError(
+            "FAIL [pin A2]: dispatch_cpu_entries_now no longer flushes an active pending scatter before it writes "
+            "its own (llama.cpp-3bww)"
+        )
 
 
 def check_hot_cold(code: str) -> None:
@@ -354,18 +430,20 @@ def check_hot_cold(code: str) -> None:
     order = [
         ("flush_pending_cpu_scatter_if_consumed(dst, ctx.device);", "F1"),
         ("flush_pending_cpu_pipeline_if_consumed(dst, ctx.device);", "F2"),
-        ("try_flush_pending_cpu_scatter();", "F3"),
+        ("flush_pending_cpu_scatter();", "F3"),
     ]
     at = -1
     for needle, pin in order:
-        if entry.count(needle) != 1:
+        # A bare call: match on a word boundary so a longer name ending in this call does not count.
+        bare = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(needle))
+        if len(bare.findall(entry)) != 1:
             raise ContractError(
                 f"FAIL [pin {pin}]: `{needle}` must appear exactly once between the hybrid-op entry and the shared "
                 "activation D2H; the earlier op's scatter H2D has to be enqueued BEFORE this op's D2H (llama.cpp-4hg7)"
             )
-        nxt = entry.find(needle)
+        nxt = bare.search(entry).start()
         if nxt < at:
-            raise ContractError(f"FAIL [pin {pin}]: `{needle}` is out of order; the op-entry flushes run consumed, pipeline, try (llama.cpp-4hg7)")
+            raise ContractError(f"FAIL [pin {pin}]: `{needle}` is out of order; the op-entry flushes run consumed, pipeline, then the unconditional scatter flush (llama.cpp-4hg7)")
         at = nxt
         require_unconditional(entry, nxt, header="if (moe_hybrid_with_plan)", pin=pin, what=f"`{needle}`")
 
@@ -516,18 +594,53 @@ def self_test(backend_src: str) -> int:
     expect_fail("consumed-and-pipeline-flushes-swapped", sub(consumed + pipeline, pipeline + consumed,
                                                              in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F2")
     # F3/F1 (structure): present, in order, exactly once -- but dead (the body of `if (false)`).
-    expect_fail("try-flush-under-if-false", sub("            try_flush_pending_cpu_scatter();\n",
-                                                "            if (false) try_flush_pending_cpu_scatter();\n",
+    expect_fail("entry-flush-under-if-false", sub("            flush_pending_cpu_scatter();\n",
+                                                "            if (false) flush_pending_cpu_scatter();\n",
                                                 in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F3")
     expect_fail("consumed-flush-under-if-false", sub(consumed, "            if (false) flush_pending_cpu_scatter_if_consumed(dst, ctx.device);\n",
                                                      in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F1")
     # I2(a)/(b): the op-entry flushes that put the earlier scatter's H2D ahead of this op's D2H.
-    expect_fail("try-flush-dropped", sub("            try_flush_pending_cpu_scatter();\n", "",
+    expect_fail("entry-flush-dropped", sub("            flush_pending_cpu_scatter();\n", "",
                                          in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F3")
     expect_fail("consumed-flush-dropped", sub("            flush_pending_cpu_scatter_if_consumed(dst, ctx.device);\n", "",
                                               in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F1")
     expect_fail("pipeline-flush-dropped", sub("            flush_pending_cpu_pipeline_if_consumed(dst, ctx.device);\n", "",
                                               in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F2")
+    # llama.cpp-3bww: the third entry flush degrades to the non-blocking "only if ready" form, which
+    # lets gate's dispatch overwrite up's still-running pending scatter.
+    expect_fail("entry-flush-only-when-ready", sub(
+        "            flush_pending_cpu_scatter();\n",
+        "            if (g_pending_scatter.future.valid() && g_pending_scatter.future.wait_for(std::chrono::seconds(0)) "
+        "== std::future_status::ready) { flush_pending_cpu_scatter(); }\n",
+        in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F3")
+    # A1: the assertion that a pending scatter is never overwritten.
+    # The assertion statement, lifted from the source so the mutants cannot drift from its layout.
+    a_start = backend_src.find("                GGML_ASSERT(!g_pending_scatter.active &&", backend_src.find(APPLY_MARKER))
+    assert_line = backend_src[a_start : backend_src.find(");\n", a_start) + 3] if a_start >= 0 else "<assertion missing>"
+    expect_fail("apply-assert-dropped", sub(assert_line, "", in_lambda=False, after=APPLY_MARKER), None, "A1")
+    expect_fail("apply-assert-vacuous", sub("GGML_ASSERT(!g_pending_scatter.active &&", "GGML_ASSERT(true &&",
+                                            in_lambda=False, after=APPLY_MARKER), None, "A1")
+    expect_fail("apply-assert-after-first-write", sub(
+        assert_line + "                g_pending_scatter.future        = std::move(r.future);\n",
+        "                g_pending_scatter.future        = std::move(r.future);\n" + assert_line,
+        in_lambda=False, after=APPLY_MARKER), None, "A1")
+    expect_fail("apply-assert-under-if-false", sub(assert_line, "                if (false)\n" + assert_line,
+                                                   in_lambda=False, after=APPLY_MARKER), None, "A1")
+    # A3: the pipeline slot's assertion.
+    pl_start = backend_src.find("                GGML_ASSERT(!g_pending_cpu_pipeline.active &&", backend_src.find(PIPELINE_APPLY_MARKER))
+    pl_assert = backend_src[pl_start : backend_src.find(");\n", pl_start) + 3] if pl_start >= 0 else "<assertion missing>"
+    expect_fail("pipeline-assert-dropped", sub(pl_assert, "", in_lambda=False, after=PIPELINE_APPLY_MARKER), None, "A3")
+    expect_fail("pipeline-assert-vacuous", sub("GGML_ASSERT(!g_pending_cpu_pipeline.active &&", "GGML_ASSERT(true &&",
+                                               in_lambda=False, after=PIPELINE_APPLY_MARKER), None, "A3")
+    expect_fail("pipeline-assert-under-if-false", sub(pl_assert, "                if (false)\n" + pl_assert,
+                                                      in_lambda=False, after=PIPELINE_APPLY_MARKER), None, "A3")
+    # A2: the direct CPU-TG writer stops flushing, or a third writer appears.
+    expect_fail("direct-path-flush-dropped", sub(
+        "if (g_pending_scatter.active) {\n                    flush_pending_cpu_scatter();\n                }\n\n                const int64_t         K ",
+        "const int64_t         K ", in_lambda=False, after="auto dispatch_cpu_entries_now = [&]("), None, "A2")
+    expect_fail("third-writer-appears", sub("g_pending_scatter.active        = true;\n                g_pending_scatter.dst_tensor    = dst;\n                g_pending_scatter.entries",
+                                            "g_pending_scatter.active        = true;\n                g_pending_scatter.active = true;\n                g_pending_scatter.dst_tensor    = dst;\n                g_pending_scatter.entries",
+                                            in_lambda=False, after=APPLY_MARKER), None, "A2")
     # m15..m19: each offset that names the slot must carry the pool entry.
     expect_fail("out-ptr-ignores-pool-entry", sub("out_pinned = bp.out + pool_base * static_cast<size_t>(N);",
                                                   "out_pinned = bp.out;"), None, "R2")
@@ -564,7 +677,7 @@ def self_test(backend_src: str) -> int:
     if failures:
         print(f"SELF-TEST FAIL: {', '.join(failures)}")
         return 1
-    print("SELF-TEST PASS: 34 mutants caught, unmodified tree passes")
+    print("SELF-TEST PASS: 44 mutants caught, unmodified tree passes")
     return 0
 
 
@@ -579,7 +692,8 @@ def main(argv: list[str]) -> int:
         return 1
     print(
         "PASS: the host-expert CPU dispatch shares one activation only when ne11 == 1, and otherwise copies "
-        "each slot's own row, and the hot and cold dispatches use disjoint pool regions with no host wait (llama.cpp-4hg7)"
+        "each slot's own row, the hot and cold dispatches use disjoint pool regions with no host wait (llama.cpp-4hg7), "
+        "and a pending CPU scatter is flushed before another is recorded (llama.cpp-3bww)"
     )
     return 0
 

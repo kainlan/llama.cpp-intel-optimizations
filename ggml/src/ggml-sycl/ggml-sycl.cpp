@@ -23049,28 +23049,6 @@ static void flush_pending_cpu_scatter() {
     g_pending_scatter.dst_tensor   = nullptr;
 }
 
-// Non-blocking try-flush: if CPU compute from the previous layer is already
-// done (future ready), flush immediately to overlap H2D scatter with the
-// current layer's activation D2H.  If CPU compute is still running, skip —
-// the next consumption point will do a blocking flush.
-static bool try_flush_pending_cpu_scatter() {
-    if (!g_pending_scatter.active) {
-        return false;
-    }
-    if (!g_pending_scatter.future.valid()) {
-        // No future — flush unconditionally (e.g. already waited)
-        flush_pending_cpu_scatter();
-        return true;
-    }
-    // Check if CPU compute is already done (zero-timeout poll)
-    auto status = g_pending_scatter.future.wait_for(std::chrono::seconds(0));
-    if (status == std::future_status::ready) {
-        flush_pending_cpu_scatter();
-        return true;
-    }
-    return false;  // CPU compute still running — skip for now
-}
-
 // Selective flush: only flush if the pending scatter's destination tensor
 // is consumed by the given op (i.e., dst_tensor matches one of consuming_dst's
 // sources).  Returns true if a flush was performed.
@@ -75768,13 +75746,24 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const int64_t N = ne01;  // output rows per expert
 
             // ---------------------------------------------------------------
-            // Opportunistic try-flush: if the previous layer's CPU compute
-            // is already done, flush its scatter now.  The H2D memcpys are
-            // submitted to the in-order queue and can overlap with the
-            // activation D2H below.  If CPU compute is still running, skip —
-            // the consumption-based flush above will handle it.
+            // INVARIANT: no scatter is pending once this op starts, consumed or
+            // not.  g_pending_scatter is ONE slot and this op records into it:
+            // bias-less MoE (qwen2moe/qwen3moe/qwen3vlmoe/qwen3next) runs up and
+            // then gate with no ADD_ID between, so gate does not consume up's
+            // output and would overwrite it, dropping up's host-expert rows
+            // (llama.cpp-3bww).  It is a blocking flush because a no-wait
+            // chain would first need the two protections below to be replaced
+            // (llama.cpp-8k68).  It has to be HERE, ahead of the shared
+            // activation D2H, for two reasons:
+            //  - the pool ring is disjoint only within one op, so this op's CPU
+            //    kernels would write pinned bytes the pending H2D has not read;
+            //    flushing enqueues that H2D first, and the D2H completing
+            //    proves it ran;
+            //  - the pending CPU workers read the shared activation staging
+            //    buffer directly (task.activations), and this op's D2H rewrites
+            //    it and may reallocate it in ensure().
             // ---------------------------------------------------------------
-            try_flush_pending_cpu_scatter();
+            flush_pending_cpu_scatter();
 
             // ---------------------------------------------------------------
             // Shared activation D2H: for batch=1 TG, all experts in a layer
@@ -75918,7 +75907,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // source of an earlier op's scatter H2D.  What makes the write safe is ordering:
                 //   (1) that op's scatter was flushed -- its H2D enqueued on the in-order
                 //       compute queue -- BEFORE this op's activation D2H was enqueued (the
-                //       consumed flushes and try_flush at op entry run ahead of that D2H), and
+                //       op-entry flushes of any pending scatter run ahead of that D2H), and
                 //   (2) the memset and the CPU kernels run only after that D2H completed, and
                 //       completing an event on an in-order queue completes every earlier
                 //       command, the H2D included.
@@ -76192,6 +76181,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (!r.valid) {
                     return;
                 }
+                // One pending slot: a scatter still held here is overwritten and
+                // its host-expert rows are never H2D-scattered (llama.cpp-3bww).
+                // The op-entry flush above is what keeps this false.
+                GGML_ASSERT(!g_pending_scatter.active &&
+                            "hybrid MUL_MAT_ID reached apply_cpu_result_to_scatter with a pending scatter that was "
+                            "not flushed at op entry; its host-expert rows would be dropped (llama.cpp-3bww)");
                 g_pending_scatter.future        = std::move(r.future);
                 g_pending_scatter.out_pinned    = r.out_pinned;
                 g_pending_scatter.act_pinned    = r.act_pinned;
@@ -76216,6 +76211,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (!r.valid) {
                     return;
                 }
+                // Same one-slot overwrite as g_pending_scatter, still open under the opt-in
+                // GGML_SYCL_PIPELINE_CPU=1: abort rather than corrupt (fix: llama.cpp-ytc9).
+                GGML_ASSERT(!g_pending_cpu_pipeline.active &&
+                            "hybrid MUL_MAT_ID reached apply_cpu_result_to_pipeline with a pending pipeline slot "
+                            "that was not flushed; its host-expert rows would be dropped (llama.cpp-ytc9)");
                 g_pending_cpu_pipeline.future       = std::move(r.future);
                 g_pending_cpu_pipeline.out_pinned   = r.out_pinned;
                 g_pending_cpu_pipeline.act_pinned   = r.act_pinned;

@@ -65,11 +65,15 @@ class PinnedBufferPool {
     // CROSS-OP SAFETY comes from ordering, which the CALLER must keep true:
     //   (1) the earlier op's scatter was flushed -- its H2D enqueued on the in-order compute
     //       queue -- BEFORE this op's activation D2H was enqueued (the hybrid MUL_MAT_ID flushes
-    //       a consumed or finished scatter at op entry, ahead of that D2H); and
+    //       any pending scatter at op entry, consumed or not, ahead of that D2H); and
     //   (2) the caller does not write the region (zero it, or let the CPU kernels fill it)
     //       until that activation D2H has completed.  Completing an event on an in-order queue
     //       completes every earlier command on it, the H2D included.
-    // A scatter left pending (not flushed) across ops is outside this argument; see llama.cpp-3bww.
+    // (1) covers a scatter left pending by an op that nothing consumed (up's, with gate next)
+    // (llama.cpp-3bww).  The same flush also keeps the shared activation staging buffer safe: the
+    // pending CPU workers read it directly and the next op's D2H rewrites it.  A caller that kept
+    // a scatter pending ACROSS a following reserve() would be outside this argument and would have
+    // to retain its slice and its staging until the scatter event instead (llama.cpp-8k68).
     //
     // Threading: one MUL_MAT_ID at a time, joined before the next.  It is not main-thread-only:
     // the cpu_async_safe path calls it from the async CPU thread, which the main thread joins
