@@ -1954,6 +1954,28 @@ else()
         LABELS "sycl;attn;tkv13;hostonly;not-built")
 endif()
 
+# The measured-tenant section: the tenant element's layout, the cohort table and
+# the visitor accumulator. context-tenant-measure.hpp includes only ggml.h, so
+# this needs neither -fsycl nor a device; it compiles the .cpp itself (the same
+# file libggml-sycl gets from the file(GLOB) at :83) and links ggml-base alone.
+add_executable(test-context-tenant-measure
+    tests/test-context-tenant-measure.cpp
+    context-tenant-measure.cpp
+)
+target_include_directories(test-context-tenant-measure PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-context-tenant-measure PRIVATE ggml-base)
+set_target_properties(test-context-tenant-measure PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-context-tenant-measure COMMAND test-context-tenant-measure)
+set_tests_properties(sycl-context-tenant-measure PROPERTIES
+    LABELS "sycl;tenant;hostonly"
+    TIMEOUT 30
+)
+
 # The resolver counter's gating: a host return of a staged source counts only
 # inside the device-dispatch region and not inside a host executor. Synthetic
 # tensors, no device (an F32 tensor never reaches the multi-GPU control-storage
