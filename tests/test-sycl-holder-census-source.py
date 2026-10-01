@@ -428,8 +428,12 @@ def violations(files):
                          r"if\s*\(\s*ggml_sycl::ggml_sycl_strict_enabled\s*\(\s*\)\s*\)\s*\{\s*GGML_ABORT\s*\(", eb):
             bad(MAIN, main, exit_fn[0][0], "pending scatter state at a recording exit is not reported "
                 "(a warning, and an abort under STRICT)")
-        if not re.search(r"if\s*\(\s*!\s*recorded_call\s*&&\s*ctx\s*\)\s*\{[^}]*graph_input_staging_release_tenants\(", eb):
-            bad(MAIN, main, exit_fn[0][0], "the staging-tenant release is not an eager-exit step (!recorded_call)")
+        # a call that REPLAYS a recorded graph begins no recording but the graph it submits has its staging
+        # addresses baked in, so only a call that neither recorded nor submitted an executable graph is eager
+        if not re.search(r"if\s*\(\s*!\s*recorded_call\s*&&\s*!\s*replayed_call\s*&&\s*ctx\s*\)\s*\{[^}]*"
+                         r"graph_input_staging_release_tenants\(", eb):
+            bad(MAIN, main, exit_fn[0][0], "the staging-tenant release is not an eager-exit step "
+                "(!recorded_call && !replayed_call)")
         if "ggml_sycl_cpu_tg_pending_any(" not in eb:
             bad(MAIN, main, exit_fn[0][0], "the exit does not read the pending MoE scatter state of a recording call")
         # recorded_call has one source: the recorder's begin counter, read before and after the call
@@ -438,6 +442,41 @@ def violations(files):
         st = func_bodies(main, "ggml_sycl_graph_compute_exit_status")
         if len(st) != 1 or not re.search(r"graph_record_begins\(\)\s*!=\s*record_begins_before", text_of(main, st[0])):
             out.append("%s: graph_compute_exit_status does not derive recorded_call from graph_record_begins()" % MAIN)
+        # replayed_call has one source too: the executable-graph submission counter, read before and after
+        if "ggml_sycl::graph_exec_submits()" not in text_of(main, gc[0]):
+            bad(MAIN, main, gc[0][0], "graph_compute does not read ggml_sycl::graph_exec_submits() before the call")
+        if len(st) != 1 or not re.search(r"graph_exec_submits\(\)\s*!=\s*exec_submits_before", text_of(main, st[0])):
+            out.append("%s: graph_compute_exit_status does not derive replayed_call from graph_exec_submits()" % MAIN)
+    # A recording or replaying call keeps its tenant staging entries past the exit (the graph has their
+    # addresses baked in), so the re-plan's invalidation must NAME them: "has recorded state" is true while a
+    # tenant entry is parked, so the scoped clear runs and graph_input_staging_clear drops it.  Without it the
+    # invalidate proc would return early over a graph that was discarded (a failed recording) and leave the
+    # slice held where the reap's use_count check would find it.
+    hs = func_bodies(main, "sycl_exec_graph_has_recorded_state")
+    if len(hs) != 1 or "graph_input_staging_has_tenants(" not in text_of(main, hs[0]):
+        out.append("%s: sycl_exec_graph_has_recorded_state does not name the parked tenant staging entries" % MAIN)
+    com = code(files, COMMON)
+    ct = re.search(r"size_t\s+graph_input_staging_tenant_count\s*\(\s*\)\s*const\s*\{(?P<body>[^}]*)\}", com)
+    ht = re.search(r"bool\s+graph_input_staging_has_tenants\s*\(\s*\)\s*const\s*\{(?P<body>[^}]*)\}", com)
+    rt = re.search(r"size_t\s+graph_input_staging_release_tenants\s*\(\s*\)\s*\{", com)
+    if not ct or "tenant_cohort()" not in ct.group("body") or not rt or not ht or \
+            "graph_input_staging_tenant_count(" not in ht.group("body"):
+        out.append("%s: graph_input_staging_has_tenants() does not test the tenant tag the release tests" % COMMON)
+    sc = func_bodies(main, "sycl_exec_graph_clear_scoped")
+    if len(sc) != 1 or "graph_input_staging_clear(" not in text_of(main, sc[0]):
+        out.append("%s: the scoped clear body does not clear graph_input_staging" % MAIN)
+    # every executable-graph submission counts itself: the raw queue call exists only inside the counting helper
+    rec_h = code(files, RECS)
+    raw = [m.start() for m in re.finditer(r"\.\s*ext_oneapi_graph\s*\(|->\s*ext_oneapi_graph\s*\(", main)]
+    for at in raw:
+        bad(MAIN, main, at, "an executable graph is submitted without ggml_sycl::graph_exec_submit() (the replay is uncounted)")
+    helper = re.search(r"\bgraph_exec_submit\s*\([^)]*\)\s*\{(?P<body>[^}]*)\}", rec_h)
+    if not helper or "graph_exec_note(" not in helper.group("body") or \
+            len(re.findall(r"\.\s*ext_oneapi_graph\s*\(", helper.group("body"))) != 1:
+        out.append("%s: graph_exec_submit() does not count and then submit" % RECS)
+    if len(re.findall(r"\bgraph_exec_submit\s*\(", main)) < 8:
+        out.append("%s: only %d graph_exec_submit() sites; the census would pass vacuously" %
+                   (MAIN, len(re.findall(r"\bgraph_exec_submit\s*\(", main))))
     # (H2) every recorder counts itself: the scope's constructor, and each hand-ordered recorder, note a begin
     rec = code(files, RECS)
     ctor = re.search(r"graph_recorder_scope\s*\(\s*const\s+slots\s*&\s*s\b[^{]*\{", rec)
@@ -556,14 +595,14 @@ def mutants(files):
            edit(files, M, 'if (!ggml_sycl_persistent_publish_allowed(extra, published_handle, "publish_f16_attention_dst_handle")) {',
                 "if (false) {", "k17"), "lacks the runtime_minted belt")
     yield ("a graph_compute return that skips the exit hooks",
-           edit(files, M, "return ggml_sycl_graph_compute_exit_status(\n            backend, ggml_backend_sycl_graph_compute_unchecked(backend, cgraph), record_begins_before);",
+           edit(files, M, "return ggml_sycl_graph_compute_exit_status(backend, ggml_backend_sycl_graph_compute_unchecked(backend, cgraph),\n                                                   record_begins_before, exec_submits_before);",
                 "return ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);", "k18"), "skips the exit hooks")
     yield ("an exit without the eager flush",
            edit(files, M, "            ggml_sycl_cpu_tg_flush_pending();\n        }\n        ggml_sycl_moe_ids_cache_new_graph();",
                 "        }\n        ggml_sycl_moe_ids_cache_new_graph();", "k19"), "does not call ggml_sycl_cpu_tg_flush_pending(")
     yield ("an exit without the staged-owner publish",
-           edit(files, M, "        ggml_sycl_graph_staged_owners_publish(ctx);\n        if (!recorded_call && ctx) {",
-                "        if (!recorded_call && ctx) {", "k20"), "does not call ggml_sycl_graph_staged_owners_publish(")
+           edit(files, M, "        ggml_sycl_graph_staged_owners_publish(ctx);\n        if (!recorded_call && !replayed_call && ctx) {",
+                "        if (!recorded_call && !replayed_call && ctx) {", "k20"), "does not call ggml_sycl_graph_staged_owners_publish(")
     yield ("an exit without the staging-tenant release",
            edit(files, M, "(void) ctx->graph_input_staging_release_tenants();", "(void) 0;", "k21"),
            "does not call graph_input_staging_release_tenants(")
@@ -602,7 +641,35 @@ def mutants(files):
            edit(files, M, "(!recorded_call || scatter_pending) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()",
                 "!ggml_sycl_cpu_tg_exit_flush_skipped_for_test()", "k32"), "flush does not branch on recorded_call")
     yield ("a staging-tenant release on a recording exit",
-           edit(files, M, "if (!recorded_call && ctx) {", "if (ctx) {", "k33"), "not an eager-exit step")
+           edit(files, M, "if (!recorded_call && !replayed_call && ctx) {", "if (ctx) {", "k33"), "not an eager-exit step")
+    yield ("a recorded-state predicate that ignores parked tenant staging",
+           edit(files, M, "if (ctx->graph_input_staging_has_tenants()) {\n        return true;\n    }\n", "", "k46"),
+           "does not name the parked tenant staging entries")
+    yield ("a has-tenants test that tests nothing",
+           edit(files, COMMON, "n += entry.second.handle.tenant_cohort() != nullptr ? 1 : 0;", "n += 0;", "k47"), "does not test the tenant tag")
+    yield ("a scoped clear that leaves the staging map",
+           edit(files, M, "ctx->graph_input_staging_clear(*ctx->stream());", "(void) 0;", "k48"),
+           "does not clear graph_input_staging")
+    yield ("a staging-tenant release on a replay-only exit",
+           edit(files, M, "if (!recorded_call && !replayed_call && ctx) {", "if (!recorded_call && ctx) {", "k40"),
+           "not an eager-exit step")
+    yield ("replayed_call not derived from the counter",
+           edit(files, M, "ggml_sycl::graph_exec_submits() != exec_submits_before", "false", "k41"),
+           "does not derive replayed_call from graph_exec_submits()")
+    yield ("the replay before-read dropped",
+           edit(files, M, "const uint64_t exec_submits_before = ggml_sycl::graph_exec_submits();",
+                "const uint64_t exec_submits_before = 0;", "k42"), "does not read ggml_sycl::graph_exec_submits() before")
+    yield ("a raw executable-graph submission",
+           edit(files, M, "static void ggml_sycl_moe_ids_cache_new_graph() {",
+                "static void ggml_sycl_stray_replay(sycl::queue & q, sycl_ex::command_graph<sycl_ex::graph_state::executable> & e) {"
+                " q.ext_oneapi_graph(e); }\nstatic void ggml_sycl_moe_ids_cache_new_graph() {", "k43"),
+           "submitted without ggml_sycl::graph_exec_submit()")
+    yield ("a replay site that bypasses the counting helper",
+           edit(files, M, "ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);", "stream->ext_oneapi_graph(*seg.exec_graph);", "k44"),
+           "submitted without ggml_sycl::graph_exec_submit()")
+    yield ("the counting helper that does not count",
+           edit(files, RECS, "graph_exec_note();\n        q.ext_oneapi_graph(exec);", "q.ext_oneapi_graph(exec);", "k45"),
+           "does not count and then submit")
     yield ("a recording exit that never flushes pending state",
            edit(files, M, "(!recorded_call || scatter_pending) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()",
                 "(!recorded_call) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()", "k35"),

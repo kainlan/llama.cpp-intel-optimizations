@@ -91624,7 +91624,7 @@ class ggml_sycl_block_exec_dense_run {
                             sycl::queue &                                              q,
                             const char *                                               what) {
         try {
-            q.ext_oneapi_graph(exec);
+            ggml_sycl::graph_exec_submit(q, exec);
         } catch (const std::exception & e) {
             disable_range_graphs(idx, what, e.what());
             throw;
@@ -95275,7 +95275,7 @@ gpu_dispatch:
                                 throw std::runtime_error("MMID direct graphlet publication is not invokable");
                             }
                             try {
-                                sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
+                                ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *exec_graph);
                                 if (!moe_graph_retention_finish_replay(sycl_ctx, retained_invocation)) {
                                     throw std::runtime_error("MMID direct graphlet terminal publication failed");
                                 }
@@ -98076,9 +98076,9 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
         try {
             if (timeline_graphlet_spans) {
                 GGML_SYCL_TIMELINE_SCOPE("sycl.graph", "moe_sequence_graphlet_replay", graphlet_timeline_metadata.c_str());
-                sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
+                ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *exec_graph);
             } else {
-                sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
+                ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *exec_graph);
             }
             if (!moe_graph_retention_finish_replay(sycl_ctx, retained_invocation)) {
                 throw std::runtime_error("MMID graph retention terminal publication failed");
@@ -98337,7 +98337,7 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             // Mark first so exception cleanup retains handles unless completion
             // is successfully drained by a higher-level cleanup path.
             segment_submitted = true;
-            stream->ext_oneapi_graph(*recorded_segments.back().exec_graph);
+            ggml_sycl::graph_exec_submit(*stream, *recorded_segments.back().exec_graph);
             if (seg.moe_after >= 0) {
                 ggml_tensor * moe_node = cgraph->nodes[seg.moe_after];
                 if (moe_node) {
@@ -98566,7 +98566,7 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
             // Replay this segment
             const auto & seg = sycl_ctx->moe_segments[seg_idx];
             if (seg.exec_graph) {
-                stream->ext_oneapi_graph(*seg.exec_graph);
+                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);
                 GGML_SYCL_DEBUG(
                     "[SYCL-SEG] Replayed segment %zu "
                     "[%d-%d)\n",
@@ -98610,7 +98610,7 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
                         throw std::runtime_error("MMID segmented graph publication is not invokable");
                     }
                     try {
-                        stream->ext_oneapi_graph(*moe_graph);
+                        ggml_sycl::graph_exec_submit(*stream, *moe_graph);
                         if (!moe_graph_retention_finish_replay(sycl_ctx, retained_invocation)) {
                             throw std::runtime_error("MMID segmented graph terminal publication failed");
                         }
@@ -98843,7 +98843,7 @@ static void moe_graph_submit_block_graphlet(sycl::queue &                       
     if (ggml_sycl_graph_diag_enabled()) {
         t_submit_start = std::chrono::high_resolution_clock::now();
     }
-    stream.ext_oneapi_graph(exec_graph);
+    ggml_sycl::graph_exec_submit(stream, exec_graph);
     g_graph_diag_counters.block_graphlet_replay.fetch_add(1, std::memory_order_relaxed);
     if (ggml_sycl_graph_diag_enabled()) {
         const auto t_submit_end = std::chrono::high_resolution_clock::now();
@@ -100679,7 +100679,7 @@ static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ct
     ggml_sycl::release_graph_retained_handles();
 }
 
-// Every kind of recorded state this context holds).  The
+// Every kind of recorded state this context holds.  The
 // one statement of what "has recorded state" means: the re-plan's invalidate proc
 // tests it before any clear, and a context with nothing recorded does nothing.
 static bool sycl_exec_graph_has_recorded_state(ggml_backend_sycl_context * ctx) {
@@ -100687,6 +100687,11 @@ static bool sycl_exec_graph_has_recorded_state(ggml_backend_sycl_context * ctx) 
         return false;
     }
     if (ctx->exec_graph || ctx->active_exec_graph.valid || !ctx->graph_retained_handles.empty()) {
+        return true;
+    }
+    // A tenant staging entry parked by a recording or replaying call is a holder of the slot, whether or not
+    // the graph that baked it survived (a failed recording leaves the entry and no graph).
+    if (ctx->graph_input_staging_has_tenants()) {
         return true;
     }
     if (ctx->moe_segments_valid || ctx->moe_block_graphs_valid || !ctx->moe_direct_dispatch_graphs.empty() ||
@@ -100808,7 +100813,8 @@ static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::Model
     }
 }
 
-// A re-plan's invalidation of ONE context's own recorded graph state.  Runs on the owner thread, outside graph_compute.  With nothing recorded
+// A re-plan's invalidation of ONE context's own recorded graph state.  Runs on the
+// owner thread, outside graph_compute.  With nothing recorded
 // it does nothing; otherwise it runs the context-scoped clear body, which reaches none
 // of the process-global effects sycl_exec_graph_clear_active adds.
 void ggml_backend_sycl_graph_invalidate(ggml_backend_t backend, const char * reason) {
@@ -100822,9 +100828,10 @@ void ggml_backend_sycl_graph_invalidate(ggml_backend_t backend, const char * rea
     sycl_exec_graph_clear_scoped(ctx, reason ? reason : "context-replan");
 }
 
-// Waits every queue that can reach a slice of this context, after llama's synchronize().  llama's synchronize() waits only the device execution
-// queue (or the deferred-decode event) and flushes the thread-local pending-scatter lists; the
-// queues below carry other work too, which is allowed only here, on the rare re-plan
+// Waits every queue that can reach a slice of this context, after llama's
+// synchronize().  llama's synchronize() waits only the device execution queue (or the
+// deferred-decode event) and flushes the thread-local pending-scatter lists; the queues
+// below carry other work too, which is allowed only here, on the rare re-plan
 // path under L0.  Gate 30 censuses every queue and names the line that waits it.
 bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
     if (!backend || !ggml_backend_is_sycl(backend)) {
@@ -108637,7 +108644,7 @@ normal_dispatch:
                 sycl_exec_graph_mark_active(*sycl_ctx, graph_key, cgraph);
 
                 graph_executed = true;
-                sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+                ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *(sycl_ctx->exec_graph));
                 g_graph_diag_counters.rerecord_success.fetch_add(1, std::memory_order_relaxed);
                 recording_guard.committed = true;
                 // llama.cpp-dkw0 (N8): if THIS record just tripped replay
@@ -108668,7 +108675,7 @@ normal_dispatch:
 
             graph_executed = true;
             sycl_ctx->test_graph_replay_count++;
-            sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+            ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *(sycl_ctx->exec_graph));
             g_graph_diag_counters.full_replay.fetch_add(1, std::memory_order_relaxed);
 
             GGML_SYCL_DEBUG("[SYCL-GRAPH] execute done\n");
@@ -108780,7 +108787,7 @@ normal_dispatch:
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] execute new graph...\n");
 
                 graph_executed = true;
-                sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+                ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *(sycl_ctx->exec_graph));
                 g_graph_diag_counters.full_record_success.fetch_add(1, std::memory_order_relaxed);
                 recording_guard.committed = true;
                 // llama.cpp-dkw0 (N8): same reasoning as the re-record site
@@ -108987,8 +108994,7 @@ static void ggml_sycl_graph_staged_owners_publish(ggml_backend_sycl_context * ct
 
 // The exit of every graph_compute call, on every return path.  It runs the
 // steps that keep a graph's transient holders from outliving it, so no tenant
-// slice stays parked in a thread-local or per-context structure past the call
-//.
+// slice stays parked in a thread-local or per-context structure past the call.
 //
 //  * Pending scatter work: an EAGER call flushes every thread-local MoE scatter
 //    and CPU-expert list.  A RECORDING call is exempt: CPU-expert
@@ -109009,13 +109015,20 @@ static void ggml_sycl_graph_staged_owners_publish(ggml_backend_sycl_context * ct
 //  * The data-pointer cache is dropped likewise, and the staged owners go to
 //    the retained store.
 //  * Staging entries that are tenant slices are released on an eager exit.
-//    A recording call keeps them: the graph it recorded has their addresses baked in.
+//    A call that recorded a graph, or replayed one, keeps them: the graph has their
+//    addresses baked in.  They are then named by the re-plan's invalidation
+//    (sycl_exec_graph_has_recorded_state), which clears them with the graph.
 //
 // `recorded_call` is true when a command graph began recording on this thread
 // during the call, from any recorder (ggml_sycl::graph_record_begins).
+// `replayed_call` is true when the call submitted an executable graph, which a
+// replay-only call does without beginning a recording
+// (ggml_sycl::graph_exec_submits).  Only the staging release reads it: a
+// replay has no scatter lists of its own, so the flush classification stays
+// recorded_call's.
 //
 // Returns false when a step failed (the caller reports GGML_STATUS_FAILED).
-static bool ggml_sycl_graph_compute_exit(ggml_backend_sycl_context * ctx, bool recorded_call) {
+static bool ggml_sycl_graph_compute_exit(ggml_backend_sycl_context * ctx, bool recorded_call, bool replayed_call) {
     try {
         const bool scatter_pending = recorded_call && ggml_sycl_cpu_tg_pending_any();
         if (scatter_pending) {
@@ -109035,7 +109048,7 @@ static bool ggml_sycl_graph_compute_exit(ggml_backend_sycl_context * ctx, bool r
         ggml_sycl_moe_ids_cache_new_graph();
         ggml_sycl_data_ptr_cache_new_graph();
         ggml_sycl_graph_staged_owners_publish(ctx);
-        if (!recorded_call && ctx) {
+        if (!recorded_call && !replayed_call && ctx) {
             (void) ctx->graph_input_staging_release_tenants();
         }
         return true;
@@ -109049,13 +109062,52 @@ static bool ggml_sycl_graph_compute_exit(ggml_backend_sycl_context * ctx, bool r
 
 static ggml_status ggml_sycl_graph_compute_exit_status(ggml_backend_t backend,
                                                        ggml_status    status,
-                                                       uint64_t       record_begins_before) {
+                                                       uint64_t       record_begins_before,
+                                                       uint64_t       exec_submits_before) {
     auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
-    if (!ggml_sycl_graph_compute_exit(ctx, ggml_sycl::graph_record_begins() != record_begins_before)) {
+    if (!ggml_sycl_graph_compute_exit(ctx, ggml_sycl::graph_record_begins() != record_begins_before,
+                                      ggml_sycl::graph_exec_submits() != exec_submits_before)) {
         return GGML_STATUS_FAILED;
     }
     return status;
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+size_t ggml_backend_sycl_test_park_tenant_staging(ggml_backend_t backend, size_t nbytes) {
+    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+    if (!ctx || nbytes == 0) {
+        return 0;
+    }
+    ggml_sycl::alloc_request req{};
+    req.queue                               = ctx->stream();
+    req.device                              = ctx->device;
+    req.size                                = nbytes;
+    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+    req.intent.category                     = ggml_sycl::runtime_category::STAGING;
+    req.intent.constraints.must_device      = true;
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
+        return 0;
+    }
+    allocation.owner.set_tenant_cohort("test-tenant-cohort");
+    static ggml_tensor keys[8];
+    static size_t      next_key = 0;
+    ctx->graph_input_staging_adopt_for_test(
+        &keys[next_key++ % 8], ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS),
+        nbytes);
+    return ctx->graph_input_staging_tenant_count();
+}
+
+size_t ggml_backend_sycl_test_tenant_staging_count(ggml_backend_t backend) {
+    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+    return ctx ? ctx->graph_input_staging_tenant_count() : 0;
+}
+
+bool ggml_backend_sycl_test_graph_exit(ggml_backend_t backend, bool recorded, bool replayed) {
+    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+    return ggml_sycl_graph_compute_exit(ctx, recorded, replayed);
+}
+#endif
 
 // The same drops for an exceptional exit, where the stream may be unusable: no
 // barrier is submitted, so the staged owners go to the retained store with an
@@ -109165,6 +109217,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                                 std::chrono::steady_clock::now() };
 
     const uint64_t record_begins_before = ggml_sycl::graph_record_begins();
+    const uint64_t exec_submits_before  = ggml_sycl::graph_exec_submits();
     try {
 #if GGML_SYCL_DNNL
         // llama.cpp-6405: GGML_SYCL_MXFP4_PP_PROFILE component 5 ("everything
@@ -109214,12 +109267,12 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 // wait time has nowhere to land but "other".
                 end_ev.wait();
                 mxfp4_pp_batched_profile_record_graph_total(mxfp4_pp_event_span_us(begin_ev, end_ev));
-                return ggml_sycl_graph_compute_exit_status(backend, status, record_begins_before);
+                return ggml_sycl_graph_compute_exit_status(backend, status, record_begins_before, exec_submits_before);
             }
         }
 #endif
         return ggml_sycl_graph_compute_exit_status(backend, ggml_backend_sycl_graph_compute_unchecked(backend, cgraph),
-                                                   record_begins_before);
+                                                   record_begins_before, exec_submits_before);
     } catch (const ggml_sycl_fallback_error & error) {
         auto * cleanup_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
         try { ggml_sycl_cpu_tg_flush_pending(); } catch (...) {}

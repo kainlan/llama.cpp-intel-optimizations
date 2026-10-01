@@ -1542,8 +1542,7 @@ GGML_BACKEND_API void ggml_backend_sycl_graph_invalidate(ggml_backend_t backend,
 
 // === Test-only debug accessors (llama.cpp-dfo0, plan task L2) ===
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-// The freeze's store through the production core, for a host with no SYCL device
-//.  `buft` is stored with the core's value and the copy's
+// The freeze's store through the production core, for a host with no SYCL device.  `buft` is stored with the core's value and the copy's
 // per-buft freeze counter is incremented.  Returns the stored value.
 GGML_BACKEND_API size_t                     ggml_backend_sycl_plan_caps_freeze_core(ggml_backend_sycl_plan_caps_t caps,
                                                                                     ggml_backend_buffer_type_t    buft,
@@ -1553,6 +1552,15 @@ GGML_BACKEND_API size_t                     ggml_backend_sycl_plan_caps_freeze_c
                                                                                     size_t                        scratch,
                                                                                     size_t                        safe_alloc,
                                                                                     size_t                        max_alloc);
+// The graph_compute exit's staging step on a real context, with the call's classification
+// chosen by the caller, and the tenant staging the exit and the re-plan's invalidation act on.
+// park_tenant_staging allocates through the production staging path, tags the slice as a
+// tenant cohort's, and parks it in the context's graph_input_staging; it returns the number
+// of tenant entries now parked (0 when it could not allocate).  graph_exit runs the exit hooks
+// as a call that recorded and/or replayed a graph would, and returns the exit's success.
+GGML_BACKEND_API size_t ggml_backend_sycl_test_park_tenant_staging(ggml_backend_t backend, size_t nbytes);
+GGML_BACKEND_API size_t ggml_backend_sycl_test_tenant_staging_count(ggml_backend_t backend);
+GGML_BACKEND_API bool   ggml_backend_sycl_test_graph_exit(ggml_backend_t backend, bool recorded, bool replayed);
 GGML_BACKEND_API uint32_t                   ggml_backend_sycl_plan_caps_freeze_count(ggml_backend_sycl_plan_caps_t caps,
                                                                                      ggml_backend_buffer_type_t    buft);
 GGML_BACKEND_API int                        ggml_backend_sycl_plan_caps_live(void);

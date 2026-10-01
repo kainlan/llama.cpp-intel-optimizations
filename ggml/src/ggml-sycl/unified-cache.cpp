@@ -922,13 +922,12 @@ const alloc_metadata & alloc_owner::metadata() const noexcept {
     return control_ ? control_->metadata() : empty;
 }
 
-// No production code sets a tenant cohort yet; whoever makes it live must first
-// close two hazards at the graph_compute exit (llama.cpp-zhcn's commit-7 list):
-//  * a recording call keeps its tenant staging entries in graph_input_staging
-//    past the graph, because the exit skips the tenant release for it; and
-//  * a replay-only call begins no recording, so it is classified eager and its
-//    exit releases tenant staging entries whose addresses the replayed graph has
-//    baked in.
+// No production code sets a tenant cohort yet.  The two hazards at the graph_compute exit
+// that making it live would have exposed are closed there: a call that recorded OR replayed
+// a graph keeps its tenant staging entries (the graph has their addresses baked in), so the
+// exit's release runs only for a call that did neither; and the entries a recording call
+// parks are named by the re-plan's recorded-state predicate, so its invalidation clears them
+// even when the recording that parked them produced no graph.
 void alloc_owner::set_tenant_cohort(const char * cohort) noexcept {
     if (!control_ || cohort == nullptr) {
         return;

@@ -94,8 +94,13 @@ STAGING_WRITERS = (
     "graph_input_refresh(",
     "graph_input_staging_clear(",
     "graph_input_staging_release_tenants(",
+    "graph_input_staging_adopt_for_test(",
 )
-STAGING_READERS = ("graph_input_stage_lookup(",)
+STAGING_READERS = (
+    "graph_input_stage_lookup(",
+    "graph_input_staging_tenant_count(",
+    "graph_input_staging_has_tenants(",
+)
 
 
 def matching_brace(text, open_idx):

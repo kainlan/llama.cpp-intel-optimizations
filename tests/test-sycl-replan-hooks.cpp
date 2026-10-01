@@ -1,6 +1,5 @@
 // Test: ggml_backend_sycl_synchronize_for_replan, ggml_backend_sycl_graph_invalidate
-// (llama.cpp-zhcn)) and ggml_backend_sycl_measure_backend_init
-// (§2.10); H6a.
+// (llama.cpp-zhcn) and ggml_backend_sycl_measure_backend_init; H6a.
 //
 // Both are reached by llama through the backend proc table, so this resolves them the
 // same way.  A backend that is not a SYCL backend is refused (false / no-op) without
@@ -103,6 +102,28 @@ int main() {
     inv(backend, "test");
     inv(backend, nullptr);
     CHECK(sync(backend), "the context still waits clean after an invalidate that found nothing");
+
+    // The tenant staging a recording or replaying call parks past its exit.  An eager exit releases
+    // it; a call that recorded, and a call that only replayed a recorded graph (it begins no
+    // recording, so the begin counter cannot tell it from an eager call), keep it, because the graph
+    // has its addresses baked in; and the re-plan's invalidation then names the parked entry and
+    // clears it, with no graph left for the predicate to find.
+    CHECK(ggml_backend_sycl_test_tenant_staging_count(backend) == 0, "no tenant staging is parked at the start");
+    CHECK(ggml_backend_sycl_test_park_tenant_staging(backend, 4096) == 1, "a tenant staging entry parks");
+    CHECK(ggml_backend_sycl_test_graph_exit(backend, /*recorded=*/false, /*replayed=*/false), "an eager exit succeeds");
+    CHECK(ggml_backend_sycl_test_tenant_staging_count(backend) == 0, "an eager exit releases the tenant staging");
+    CHECK(ggml_backend_sycl_test_park_tenant_staging(backend, 4096) == 1, "a tenant staging entry parks again");
+    CHECK(ggml_backend_sycl_test_graph_exit(backend, /*recorded=*/true, /*replayed=*/false),
+          "a recording exit succeeds");
+    CHECK(ggml_backend_sycl_test_tenant_staging_count(backend) == 1, "a recording exit keeps the tenant staging");
+    CHECK(ggml_backend_sycl_test_graph_exit(backend, /*recorded=*/false, /*replayed=*/true),
+          "a replay-only exit succeeds");
+    CHECK(ggml_backend_sycl_test_tenant_staging_count(backend) == 1,
+          "a replay-only exit keeps the tenant staging: it is not an eager call");
+    inv(backend, "test");
+    CHECK(ggml_backend_sycl_test_tenant_staging_count(backend) == 0,
+          "the re-plan's invalidation names and clears the parked tenant staging");
+    CHECK(sync(backend), "the context still waits clean after the parked entry was cleared");
     ggml_backend_free(backend);
 
     // The measure backend: its own object, not a SYCL one, with no synchronize slot.

@@ -433,6 +433,30 @@ void test_begin_counter() {
     check(ggml_sycl::graph_record_begins() == before + 3, "a hand-ordered recorder counts through the note");
 }
 
+// A call that only replays a recorded graph begins no recording, so graph_compute cannot tell it
+// from an eager call by the begin counter.  Every executable-graph submission counts itself through
+// graph_exec_submit(), beside the begin counter, and the exit reads both.
+struct fake_exec_queue {
+    int submitted = 0;
+
+    template <typename Exec> void ext_oneapi_graph(Exec & exec) { submitted += exec; }
+};
+
+void test_exec_submit_counter() {
+    fake_exec_queue q;
+    int             exec   = 1;
+    const uint64_t  before = ggml_sycl::graph_exec_submits();
+    const uint64_t  begins = ggml_sycl::graph_record_begins();
+    ggml_sycl::graph_exec_submit(q, exec);
+    check(q.submitted == 1, "the submission reaches the queue");
+    check(ggml_sycl::graph_exec_submits() == before + 1, "a submission counts one");
+    check(ggml_sycl::graph_record_begins() == begins, "a replay is not a recording begin");
+    ggml_sycl::graph_exec_submit(q, exec);
+    check(ggml_sycl::graph_exec_submits() == before + 2, "a second submission counts again");
+    ggml_sycl::graph_record_begin_note();
+    check(ggml_sycl::graph_exec_submits() == before + 2, "a recording begin is not a submission");
+}
+
 }  // namespace
 
 int main() {
@@ -457,6 +481,7 @@ int main() {
         { "exception-after-resume",       test_exception_after_resume       },
         { "active-scope",                 test_active_scope                 },
         { "begin-counter",                test_begin_counter                },
+        { "exec-submit-counter",          test_exec_submit_counter          },
     };
 
     int failed = 0;

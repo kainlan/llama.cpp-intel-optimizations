@@ -100,6 +100,31 @@ inline void graph_record_begin_note() {
     ++graph_record_begin_slot();
 }
 
+// How many executable command graphs this thread has submitted, from every site the backend
+// has (whole-graph, segment, block, graphlet and dense-range replays, and the submit right
+// after a recording).  A call that only replays a recorded graph begins no recording, so the
+// begin counter above cannot see it; yet the graph it submits has its staging addresses
+// baked in, so graph_compute's exit must not treat it as an eager call.  Every submission goes
+// through graph_exec_submit(), so a site cannot submit one uncounted.
+inline uint64_t & graph_exec_submit_slot() {
+    static thread_local uint64_t submits = 0;
+    return submits;
+}
+
+inline uint64_t graph_exec_submits() {
+    return graph_exec_submit_slot();
+}
+
+inline void graph_exec_note() {
+    ++graph_exec_submit_slot();
+}
+
+// Counts first: a submission that throws still ran on this call.
+template <typename Queue, typename Exec> inline void graph_exec_submit(Queue & q, Exec & exec) {
+    graph_exec_note();
+    q.ext_oneapi_graph(exec);
+}
+
 template <typename Graph, typename Queue, typename Sink, typename Depth = std::atomic<int>>
 struct graph_recording_slots {
     bool &   recording;        // this thread records

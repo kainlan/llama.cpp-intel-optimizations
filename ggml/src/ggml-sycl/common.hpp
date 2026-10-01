@@ -6565,6 +6565,29 @@ struct ggml_backend_sycl_context {
         return dropped;
     }
 
+    // How many entries are tenant slices, by the same tag the release above tests.  A
+    // recording or replaying call parks such entries past its exit (the graph has their
+    // addresses baked in), so the re-plan's recorded-state predicate asks has_tenants to
+    // name them.
+    size_t graph_input_staging_tenant_count() const {
+        size_t n = 0;
+        for (const auto & entry : graph_input_staging) {
+            n += entry.second.handle.tenant_cohort() != nullptr ? 1 : 0;
+        }
+        return n;
+    }
+
+    bool graph_input_staging_has_tenants() const { return graph_input_staging_tenant_count() != 0; }
+
+#    if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Parks an entry the production staging path did not build, for a test that needs a tenant
+    // slice in the map.  A writer like the others: it bumps the generation.
+    void graph_input_staging_adopt_for_test(const ggml_tensor * owner, ggml_sycl::mem_handle && handle, size_t nbytes) {
+        graph_input_staging[owner] = { std::move(handle), nbytes };
+        graph_input_staging_generation++;
+    }
+#    endif
+
     // Pre-allocated buffers for MoE graph recording
     // MUL_MAT_ID needs Q8_1 quantization buffers which cannot be allocated during graph recording
     struct moe_graph_buffers {
