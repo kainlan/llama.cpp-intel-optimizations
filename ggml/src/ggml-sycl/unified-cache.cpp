@@ -1347,6 +1347,9 @@ struct runtime_alloc_record {
     // Monotonic identity of the current LIVE -> RELEASING claim. Rollback and
     // erase must match this as well as the complete allocation key.
     uint64_t                   release_generation = 0;
+    // Thread that marked the row RELEASING; recorded only while
+    // GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE is on, so a stale-row claim can name its releaser.
+    uint64_t                    release_tid        = 0;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     bool                       test_no_physical_release = false;
     size_t                     test_exact_leases = 0;
@@ -1378,27 +1381,72 @@ static std::atomic<bool> g_test_pause_arena_registry_commit{ false };
 static std::atomic<bool> g_test_arena_registry_commit_reached{ false };
 #endif
 
+static bool unified_alloc_lifetime_trace_enabled();
+
+static uint64_t alloc_trace_thread_id() noexcept {
+    return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+// What runtime_registry_claim_ptr_locked saw when it displaced a stale row.  It is filled while
+// g_runtime_alloc_mutex is held and logged by the destructor, so a caller declares it BEFORE its
+// lock guard and the line is emitted after the mutex is dropped.  Filled only while
+// GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE=1.
+struct stale_claim_report {
+    bool        claimed     = false;
+    void *      ptr         = nullptr;
+    uint64_t    id          = 0;
+    size_t      size        = 0;
+    int         role        = 0;
+    uint64_t    release_tid = 0;
+    std::string cohort;
+
+    ~stale_claim_report() {
+        if (!claimed) {
+            return;
+        }
+        GGML_LOG_WARN(
+            "[UNIFIED-ALLOC-STALE-CLAIM] allocation at ptr=%p displaced a RELEASING row (id=%llu size=%zu role=%d "
+            "cohort=%s); releaser_tid=%llu claimer_tid=%llu (llama.cpp-93tw)\n",
+            ptr, (unsigned long long) id, size, role, cohort.empty() ? "(none)" : cohort.c_str(),
+            (unsigned long long) release_tid, (unsigned long long) alloc_trace_thread_id());
+    }
+};
+
 // Claim `ptr` for a registry row that is about to be inserted.  Caller holds g_runtime_alloc_mutex.
 //
-// A release marks its row RELEASING, drops the mutex, frees the physical block (a host zone
-// returns it to the TLSF immediately) and only then re-locks to erase the row.  In that window an
-// allocation on another thread can be handed the recycled address.  The row found there is not
-// live authority: the allocator just handed the address out, so the block it described is already
-// free.  Failing the allocation on it (the old behaviour) surfaced as alloc_err=4
-// (metadata_publication_failed) on a 2.5 MB staging request with ~195 GB free, and as the MoE CPU
-// path's "Failed to allocate pinned host memory" (llama.cpp-93tw).  The releaser's later erase and
-// rollback both match the complete allocation key (id included) and the claim's release
-// generation, so they leave a row that replaced the stale one alone.
+// Most likely cause of the intermittent metadata_publication_failed / "Failed to allocate pinned
+// host memory" on a small staging request with ample free memory (llama.cpp-93tw; the claim is not
+// yet observed directly -- run with GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE=1 and look for
+// [UNIFIED-ALLOC-STALE-CLAIM]).  A release marks its row RELEASING, drops the mutex, frees the
+// physical block (a host zone returns it to the TLSF immediately) and only then re-locks to erase
+// the row.  In that window an allocation on another thread can be handed the recycled address.
+// The row found there is not live authority: the allocator just handed the address out, so the
+// block it described is already free.  Failing the allocation on it (the old behaviour) surfaced
+// as alloc_err=4 (metadata_publication_failed).  The releaser's later erase and rollback both
+// match the complete allocation key (id included) and the claim's release generation, so they
+// leave a row that replaced the stale one alone.
 //
 // A LIVE row at the address is a different matter: two live allocations sharing an address is
 // corruption, and that still refuses.
-static bool runtime_registry_claim_ptr_locked(void * ptr) noexcept {
+static bool runtime_registry_claim_ptr_locked(void * ptr, stale_claim_report & report) noexcept {
     const auto it = g_runtime_alloc_registry.find(ptr);
     if (it == g_runtime_alloc_registry.end()) {
         return true;
     }
     if (it->second.state != runtime_alloc_state::RELEASING) {
         return false;
+    }
+    if (unified_alloc_lifetime_trace_enabled()) {
+        report.claimed     = true;
+        report.ptr         = ptr;
+        report.id          = it->second.handle.id;
+        report.size        = it->second.handle.size;
+        report.role        = static_cast<int>(it->second.handle.role);
+        report.release_tid = it->second.release_tid;
+        try {
+            report.cohort = it->second.cohort_id;
+        } catch (...) {
+        }
     }
     g_runtime_alloc_registry.erase(it);
     return true;
@@ -1426,11 +1474,12 @@ static bool arena_runtime_registry_commit(void * ptr, const arena_authority::all
         rec.handle.arena_extent          = exact.extent;
         if (!allocation_owner_internal_access::publish(context.control, rec.handle)) return false;
         if (context.control) rec.handle = context.control->metadata();
+        stale_claim_report          stale_claim;  // declared before the lock: logs after it is dropped
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         // A live pointer row is authority. Never replace it with an allocation
         // from a recycled TLSF address; failure rolls this allocation back. A row
         // already RELEASING is stale by construction (llama.cpp-93tw).
-        if (!runtime_registry_claim_ptr_locked(ptr)) {
+        if (!runtime_registry_claim_ptr_locked(ptr, stale_claim)) {
             return false;
         }
         auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
@@ -15659,7 +15708,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             return false;
         }
         if (owner_control) rec.handle = owner_control->metadata();
-        bool registered = false;
+        bool               registered = false;
+        stale_claim_report stale_claim;  // declared before the lock: logs after it is dropped
         {
             std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
             // Epoch and row publication share this mutex with host settle.
@@ -15668,7 +15718,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     g_host_zone_epoch[static_cast<size_t>(rec.handle.host_zone)].load(std::memory_order_relaxed);
             }
             try {
-                if (runtime_registry_claim_ptr_locked(ptr)) {
+                if (runtime_registry_claim_ptr_locked(ptr, stale_claim)) {
                     auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
                     if (inserted.second) {
                         try {
@@ -16493,9 +16543,18 @@ static registered_release_status release_registered_allocation_owned(
 #endif
         it->second.promotion_cleanup_pending = false;
         it->second.state = runtime_alloc_state::RELEASING;
+        if (unified_alloc_lifetime_trace_enabled()) {
+            it->second.release_tid = alloc_trace_thread_id();
+        }
         // Release-only adjuncts have a single claimant and are never copied to
         // lookup output or another concurrent releaser.
         detached.owned_segments = std::move(it->second.owned_segments);
+    }
+
+    if (unified_alloc_lifetime_trace_enabled()) {
+        GGML_LOG_WARN("[UNIFIED-ALLOC-LIFE] release-begin ptr=%p id=%llu size=%zu role=%d tid=%llu\n",
+                      detached.handle.ptr, (unsigned long long) detached.handle.id, detached.handle.size,
+                      static_cast<int>(detached.handle.role), (unsigned long long) alloc_trace_thread_id());
     }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -16699,6 +16758,12 @@ void allocation_registry_test_pause_claim(bool pause) noexcept {
 
 bool allocation_registry_test_claim_reached() noexcept {
     return g_test_registry_claim_reached.load(std::memory_order_acquire);
+}
+
+bool allocation_registry_test_claim_ptr(void * ptr) noexcept {
+    stale_claim_report          report;
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return runtime_registry_claim_ptr_locked(ptr, report);
 }
 
 void allocation_registry_test_erase(void * ptr) noexcept {

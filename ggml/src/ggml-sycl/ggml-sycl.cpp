@@ -22941,7 +22941,13 @@ static void flush_pending_cpu_scatter() {
         double total_bytes = 0;
         int    n_entries   = 0;
         g_pending_scatter.scatter_events.clear();
-        if (g_pending_scatter.stream && g_pending_scatter.out_pinned) {
+        // Both producers of an active pending scatter set a stream and an output buffer.  A pending
+        // scatter without them used to be skipped quietly, which loses its host-expert rows
+        // (llama.cpp-93tw).
+        GGML_ASSERT(g_pending_scatter.stream && g_pending_scatter.out_pinned &&
+                    "pending CPU scatter has no stream or output staging; its host-expert rows would be dropped "
+                    "(llama.cpp-93tw)");
+        {
             // Batch contiguous scatter entries into single memcpy calls.
             // Source (out_pinned) is always contiguous; check if destination
             // addresses are also contiguous to merge.
@@ -22949,11 +22955,9 @@ static void flush_pending_cpu_scatter() {
             const float * src_base = g_pending_scatter.out_pinned;
             size_t        i        = 0;
             while (i < entries.size()) {
-                if (!entries[i].dst_device) {
-                    src_base += entries[i].N;
-                    i++;
-                    continue;
-                }
+                // Every entry names its destination; skipping one would drop that row (llama.cpp-93tw).
+                GGML_ASSERT(entries[i].dst_device &&
+                            "pending CPU scatter entry has no destination; its row would be dropped (llama.cpp-93tw)");
                 if (!entries[i].dst_handle.valid() || !g_pending_scatter.out_handle.valid()) {
                     GGML_ABORT("[CPU-TG] Deferred scatter missing smart mem_handle for dst=%p device=%d",
                                entries[i].dst_device, g_pending_scatter.device_id);
@@ -22994,10 +22998,6 @@ static void flush_pending_cpu_scatter() {
                 double submit_us   = std::chrono::duration<double, std::micro>(t2 - t1).count();
                 g_moe_profile.moe_scatter_detail(cpu_wait_us, submit_us, 0, n_entries, total_bytes);
             }
-        } else if (g_moe_profile_enabled) {
-            // No stream/output — record only CPU wait
-            double cpu_wait_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-            g_moe_profile.moe_scatter_detail(cpu_wait_us, 0, 0, 0, 0);
         }
     } catch (const std::exception & ex) {
         // Logging and carrying on cleared the pending state below, so a throwing CPU worker or a
@@ -76034,8 +76034,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const auto &          entry       = entries[ci];
                     const void *          host_weight = nullptr;
                     ggml_sycl::mem_handle host_lease{};  // llama.cpp-0k543
-                    const void *          candidate_ptr       = nullptr;
-                    bool                  candidate_is_device = false;
                     if (!entry.allow_cpu_fallback && entry.lease.valid()) {
                         auto resolved = entry.lease.resolve(entry.device_id);
                         if (resolved.ptr && !resolved.on_device) {
@@ -76065,8 +76063,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         // output.  Nothing else computes these rows, so abort (llama.cpp-93tw).
                         GGML_ABORT(
                             "[MoE-CPU] expert has no host-accessible weight; refusing to drop its rows "
-                            "(expert=%d tensor=%s expert_ptrs_host=%p src0_host=%p) (llama.cpp-93tw)",
-                            entry.expert_id, src0->name ? src0->name : "?", candidate_ptr, src0_host_storage);
+                            "(expert=%d tensor=%s src0_host=%p) (llama.cpp-93tw)",
+                            entry.expert_id, src0->name ? src0->name : "?", src0_host_storage);
                     }
 
                     if (immutable_host_recipe) {

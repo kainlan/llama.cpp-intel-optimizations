@@ -39,8 +39,10 @@ request (GGML_ABORT), instead of returning, continuing or logging:
   5. dispatch_cpu_entries_now's staging-failure block aborts and contains no return;
   6. the catch blocks in flush_pending_cpu_scatter and flush_pending_cpu_pipeline abort.
 
-THE ROOT CAUSE of the intermittent allocation failure (the other half of llama.cpp-93tw).  A
-release marks its registry row RELEASING under g_runtime_alloc_mutex, drops the lock, frees the
+THE MOST LIKELY CAUSE of the intermittent allocation failure (the other half of llama.cpp-93tw;
+inferred from the source, supported by the GPU result alloc_err=4 in 6 of 9 runs before the fix
+and 0 of 14 after, and not yet observed directly -- run with GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE=1
+and look for [UNIFIED-ALLOC-STALE-CLAIM]).  A release marks its registry row RELEASING under g_runtime_alloc_mutex, drops the lock, frees the
 physical block (host_zone_free returns it to the TLSF immediately), and only then re-locks to
 erase the row.  An allocation on another thread that is handed the recycled address in that
 window published its control, found the stale row, "never replaced a live pointer row" and
@@ -52,8 +54,17 @@ handed out is by construction stale (its block is already free); a LIVE row at t
 real corruption and still fails.
 
   7. both registration sites (arena_runtime_registry_commit and unified_alloc's registration)
-     go through runtime_registry_claim_ptr_locked(ptr), which erases a RELEASING row, refuses a
-     LIVE one, and is the only registry-presence check before the emplace at either site.
+     go through runtime_registry_claim_ptr_locked(ptr, report), which erases a RELEASING row,
+     refuses a LIVE one, and is the only registry-presence check before the emplace at either
+     site; the claim is logged under the lifetime trace (stale_claim_report), and a release
+     records its thread (release_tid, "release-begin" line);
+  8. flush_pending_cpu_scatter asserts a stream, an output buffer and a destination for every
+     entry instead of skipping quietly;
+  9. every expert_dispatch_entry the HYBRID branch builds (the region between the first and the
+     second `std::vector<expert_dispatch_entry> cpu_entries;`) passes allow_cpu_fallback=false.
+     That is what keeps dispatch_cpu_compute's allow_cpu_fallback=true arm of the `!host_weight`
+     block dead: the planner CPU path (second cpu_entries, built with allow_cpu_fallback=true)
+     is consumed by dispatch_cpu_entries_now, which already aborted on an unresolved weight.
 
 WHAT THIS DOES NOT PROVE.  It reads source text.  It does not show the race is the cause of the
 observed 1-in-4 failure (that needs the GPU repro: repeat the PCT=30 Qwen1.5 run serially), and
@@ -235,11 +246,59 @@ def check_backend(backend_src: str) -> None:
         catch = block_after(body, r"catch\s*\(\s*const std::exception\s*&\s*ex\s*\)", f"the catch block of {fn}")
         require_abort(catch, f"the catch block of {fn} ({tagname})")
 
+    # 8. the scatter flush does not skip quietly.
+    scatter = block_after(code, r"static void flush_pending_cpu_scatter\(\)\s*", "flush_pending_cpu_scatter")
+    sc = squash(scatter)
+    if not re.search(r"GGML_ASSERT\(g_pending_scatter\.stream && g_pending_scatter\.out_pinned &&", sc):
+        raise ContractError(
+            f"FAIL: flush_pending_cpu_scatter does not GGML_ASSERT a stream and an output buffer; a pending scatter "
+            f"without them would be skipped and its rows lost ({TAG})"
+        )
+    if not re.search(r"GGML_ASSERT\(entries\[i\]\.dst_device &&", sc):
+        raise ContractError(
+            f"FAIL: flush_pending_cpu_scatter does not GGML_ASSERT every entry's destination; a null one would be "
+            f"skipped and its row lost ({TAG})"
+        )
+    if re.search(r"if \(!entries\[i\]\.dst_device\)", sc):
+        raise ContractError(f"FAIL: flush_pending_cpu_scatter skips a destination-less entry again ({TAG})")
+    if re.search(r"if \(g_pending_scatter\.stream && g_pending_scatter\.out_pinned\)", sc):
+        raise ContractError(f"FAIL: flush_pending_cpu_scatter makes the scatter conditional on a stream again ({TAG})")
+
+    # 9. the hybrid branch builds only allow_cpu_fallback=false entries.
+    decl = [m.start() for m in re.finditer(r"std::vector<expert_dispatch_entry>\s+cpu_entries\s*;", code)]
+    if len(decl) != 2:
+        raise ContractError(
+            f"FAIL: expected exactly two `cpu_entries` declarations (hybrid, then planner), found {len(decl)} ({TAG})"
+        )
+    region = backend_src[decl[0] : decl[1]]  # comment-blanking preserves offsets; the marker is a comment
+    calls = [m.start() for m in re.finditer(r"ggml_sycl_make_(secondary_)?expert_dispatch_entry\(", region)]
+    if len(calls) < 2:
+        raise ContractError(f"FAIL: found {len(calls)} entry constructions in the hybrid branch, expected at least 2 ({TAG})")
+    for at in calls:
+        depth = 0
+        end = at
+        for k in range(region.index("(", at), len(region)):
+            if region[k] == "(":
+                depth += 1
+            elif region[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = k
+                    break
+        call = region[at:end]
+        if "/*allow_cpu_fallback=*/false" not in call:
+            raise ContractError(
+                f"FAIL: a hybrid-branch expert_dispatch_entry does not pass `/*allow_cpu_fallback=*/false`: "
+                f"{' '.join(call.split())[:100]!r}; dispatch_cpu_compute's allow_cpu_fallback=true arm would be live ({TAG})"
+            )
+
 
 def check_cache(cache_src: str) -> None:
     code = blank_comments(cache_src)
     helper = block_after(
-        code, r"static bool runtime_registry_claim_ptr_locked\s*\(\s*void\s*\*\s*ptr\s*\)", "runtime_registry_claim_ptr_locked"
+        code,
+        r"static bool runtime_registry_claim_ptr_locked\s*\(\s*void\s*\*\s*ptr\s*,\s*stale_claim_report\s*&\s*report\s*\)",
+        "runtime_registry_claim_ptr_locked",
     )
     h = squash(helper)
     if not re.search(r"state\s*!=\s*runtime_alloc_state::RELEASING\s*\)\s*\{\s*return false;", h):
@@ -249,7 +308,7 @@ def check_cache(cache_src: str) -> None:
 
     commit = block_after(code, r"static bool arena_runtime_registry_commit\s*\(", "arena_runtime_registry_commit")
     c = squash(commit)
-    if not re.search(r"if \(!runtime_registry_claim_ptr_locked\(ptr\)\) (\{ )?return false;", c):
+    if not re.search(r"if \(!runtime_registry_claim_ptr_locked\(ptr, stale_claim\)\) (\{ )?return false;", c):
         raise ContractError(f"FAIL: arena_runtime_registry_commit does not claim the pointer through the helper ({TAG})")
     if re.search(r"g_runtime_alloc_registry\.find\(ptr\)\s*!=\s*g_runtime_alloc_registry\.end\(\)", c):
         raise ContractError(
@@ -260,7 +319,7 @@ def check_cache(cache_src: str) -> None:
     if reg_at < 0:
         raise ContractError(f"FAIL: unified_alloc's registration site was not found ({TAG})")
     site = squash(code[reg_at : reg_at + 2500])
-    if "runtime_registry_claim_ptr_locked(ptr)" not in site.split("g_runtime_alloc_registry.emplace(ptr, rec)")[0]:
+    if "runtime_registry_claim_ptr_locked(ptr, stale_claim)" not in site.split("g_runtime_alloc_registry.emplace(ptr, rec)")[0]:
         raise ContractError(f"FAIL: unified_alloc's registration does not claim the pointer through the helper before its emplace ({TAG})")
     if re.search(r"g_runtime_alloc_registry\.find\(ptr\)\s*==\s*g_runtime_alloc_registry\.end\(\)", site):
         raise ContractError(
@@ -268,9 +327,26 @@ def check_cache(cache_src: str) -> None:
         )
 
 
+def check_cache_trace(cache_src: str) -> None:
+    code = blank_comments(cache_src)
+    if not re.search(r"struct stale_claim_report \{.*?~stale_claim_report\(\)", squash(code), re.S) or \
+            "[UNIFIED-ALLOC-STALE-CLAIM]" not in code:
+        raise ContractError(f"FAIL: the stale-claim report (struct + [UNIFIED-ALLOC-STALE-CLAIM] line) is gone ({TAG})")
+    helper = squash(block_after(
+        code, r"static bool runtime_registry_claim_ptr_locked\s*\(", "runtime_registry_claim_ptr_locked"))
+    if "unified_alloc_lifetime_trace_enabled()" not in helper or "report.claimed = true" not in helper:
+        raise ContractError(f"FAIL: the claim helper no longer records the stale row under the lifetime trace ({TAG})")
+    rel = squash(block_after(
+        code, r"static registered_release_status release_registered_allocation_owned\(\s*const alloc_metadata & requested",
+        "release_registered_allocation_owned"))
+    if "it->second.release_tid = alloc_trace_thread_id();" not in rel or "[UNIFIED-ALLOC-LIFE] release-begin" not in rel:
+        raise ContractError(f"FAIL: the release path no longer records/logs its thread at the RELEASING point ({TAG})")
+
+
 def check(backend_src: str, cache_src: str) -> None:
     check_backend(backend_src)
     check_cache(cache_src)
+    check_cache_trace(cache_src)
 
 
 def mutate(src: str, old: str, new: str, *, count: int = 1) -> str:
@@ -322,6 +398,20 @@ def mutants(backend: str, cache: str):
     yield "deferred scatter swallows exceptions again", mutate(
         backend, 'GGML_ABORT("[CPU-TG] Deferred scatter failed', 'GGML_LOG_ERROR("[CPU-TG] Deferred scatter failed'
     ), cache
+    yield "scatter flush skips a missing stream quietly again", mutate(
+        backend, "GGML_ASSERT(g_pending_scatter.stream && g_pending_scatter.out_pinned &&", "GGML_ASSERT(true &&"
+    ), cache
+    yield "scatter flush skips a destination-less entry again", mutate(
+        backend, "GGML_ASSERT(entries[i].dst_device &&", "if (!entries[i].dst_device) { i++; continue; } GGML_ASSERT(true &&"
+    ), cache
+    yield "a hybrid-branch entry allows CPU fallback", mutate(
+        backend, "operand.actual_layout(), operand.lease(), /*allow_cpu_fallback=*/false);",
+        "operand.actual_layout(), operand.lease(), /*allow_cpu_fallback=*/true);",
+    ), cache
+    yield "a hybrid-branch entry omits allow_cpu_fallback (default true)", mutate(
+        backend, "operand.actual_layout(), operand.lease(), /*allow_cpu_fallback=*/false);",
+        "operand.actual_layout(), operand.lease());",
+    ), cache
     yield "deferred pipeline merge swallows exceptions again", mutate(
         backend, 'GGML_ABORT("[PIPELINE-CPU] Deferred merge failed', 'GGML_LOG_ERROR("[PIPELINE-CPU] Deferred merge failed'
     ), cache
@@ -334,12 +424,21 @@ def mutants(backend: str, cache: str):
     )
     yield "unified_alloc registration is back to a bare find", backend, mutate(
         cache,
-        "if (runtime_registry_claim_ptr_locked(ptr)) {\n                    auto inserted",
+        "if (runtime_registry_claim_ptr_locked(ptr, stale_claim)) {\n                    auto inserted",
         "if (g_runtime_alloc_registry.find(ptr) == g_runtime_alloc_registry.end()) {\n                    auto inserted",
+    )
+    yield "claim helper stops recording the stale row", backend, mutate(
+        cache, "report.claimed     = true;", "report.claimed     = false;"
+    )
+    yield "release stops recording its thread", backend, mutate(
+        cache, "it->second.release_tid = alloc_trace_thread_id();", "it->second.release_tid = 0;"
+    )
+    yield "release-begin trace line is gone", backend, mutate(
+        cache, "[UNIFIED-ALLOC-LIFE] release-begin", "[UNIFIED-ALLOC-LIFE] release"
     )
     yield "arena commit is back to the bare live-row check", backend, mutate(
         cache,
-        "if (!runtime_registry_claim_ptr_locked(ptr)) {\n            return false;\n        }",
+        "if (!runtime_registry_claim_ptr_locked(ptr, stale_claim)) {\n            return false;\n        }",
         "if (g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end()) return false;",
     )
 
