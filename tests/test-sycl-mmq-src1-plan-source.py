@@ -316,6 +316,21 @@ def evaluate(backend, common, cache, zone):
     results["the walks prime every device a row-split weight touches"] = \
         "ggml_sycl_mul_mat_device_rows(" in q8_walk and "ggml_sycl_mul_mat_device_rows(" in dq_walk and \
         backend.count("ggml_sycl_mul_mat_device_rows(") >= 4
+    # A src1 with no rows has no demand; it must not reach the overflow refusal, whose message would lie.
+    results["the Q8 walk skips a src1 with no rows"] = \
+        re.search(r"ggml_nrows\(src1\)\s*<=\s*0", q8_walk) is not None
+    # The walks run once per graph, decode included: no per-node zero-initialised array, and no scan of the
+    # compile-time device maximum when the real device count is known.
+    walk_loop = "for (int i = 0; i < cgraph->n_nodes; i++)"
+    results["the walks declare the tensor split once, outside the node loop"] = \
+        0 <= q8_walk.find("tensor_split") < q8_walk.find(walk_loop) and \
+        0 <= dq_walk.find("tensor_split") < dq_walk.find(walk_loop)
+    results["the walks scan the real device count, not the compile-time maximum"] = \
+        re.search(r"for\s*\(int d = 0;\s*d < GGML_SYCL_MAX_DEVICES", q8_walk + dq_walk) is None
+    # Two unrelated functions were named alike: the cooperative split and the row-split weight lookup.
+    results["the row-split weight lookup does not overload the cooperative split's name"] = \
+        re.search(r"ggml_sycl_mul_mat_tensor_split\(\s*const ggml_tensor", backend) is None and \
+        backend.count("ggml_sycl_mul_mat_src0_tensor_split(") >= 4
     # The walks mutate slots the context owns, so they run under the graph lock (still before any submission).
     lock_at = graph_entry.find("graph_mutex")
     results["the walks run under the graph lock"] = \
@@ -340,6 +355,12 @@ failed = run("tree", (backend, common, cache, zone))
 # A comment is not code, so the stripped sources cannot see it. This one was a false claim a reader acted on
 # : the whole-graph recording path does NOT keep the Q8 buffer's handle alive.
 raw_backend = re.sub(r"\s*\n\s*//\s*", " ", Path(args.backend).read_text())  # un-wrap line comments
+raw_common = Path(args.common).read_text()
+if "uses, growths, capacity" in raw_common:
+    print("FAIL: a common.hpp comment still names the stats field 'growths' (it is 'allocs')")
+    failed.append("stale growths comment")
+else:
+    print("PASS: the stats comment names allocs")
 if "recorded graph or pointer table that baked the old pointer keeps its handle" in raw_backend:
     print("FAIL: the false 'recorded graph keeps its handle' comment is still in ggml-sycl.cpp")
     failed.append("false recorded-graph comment")
@@ -374,6 +395,17 @@ if args.self_test:
         return src[:k] + new + src[k + len(old):]
 
     mutants = [
+        ("zero-row src1 reaches the overflow refusal", "the Q8 walk skips a src1 with no rows",
+         (mutate_in_func(backend, r"static bool ggml_sycl_mmq_src1_ensure_for_graph\(",
+                         "ggml_nrows(src1) <= 0", "ggml_nrows(src1) < -1"), common, cache, zone)),
+        ("per-node tensor split", "the walks declare the tensor split once, outside the node loop",
+         (mutate_in_func(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\(",
+                         "std::array<float, GGML_SYCL_MAX_DEVICES> tensor_split{};",
+                         "int unrelated = 0;"), common, cache, zone)),
+        ("device scan to the maximum", "the walks scan the real device count, not the compile-time maximum",
+         (mutate_in_func(backend, r"static bool ggml_sycl_mmq_src1_ensure_for_graph\(",
+                         "for (int d = 0; d < ggml_sycl_info().device_count", "for (int d = 0; d < GGML_SYCL_MAX_DEVICES"),
+          common, cache, zone)),
         ("process-wide recording predicate", "no growth is attempted while this thread is recording a graph",
          (mutate_in_func(backend, r"static void \* ggml_sycl_planned_scratch_acquire\(",
                          "ggml_sycl_graph_recording_this_thread()", "ggml_sycl_graph_recording_active()"),
