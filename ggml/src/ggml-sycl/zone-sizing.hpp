@@ -295,6 +295,33 @@ bool zone_planned_scratch_hold_bytes(const zone_planned_buffer * buffers, size_t
 // bytes are held. A request that does not may spill exactly as one does when the zone is full.
 bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size);
 
+// The decision unified_alloc takes for a request that prefers a zone: true when the request must NOT be served
+// from the zone and spills instead. Only a spill-capable request for the RUNTIME zone is ever held back; a
+// forbid-spill request is one of the planned consumers the hold exists for, and no other zone has a hold. The
+// zone's free bytes come first, then the hold, then the request size: swapped, the same numbers answer a
+// different question.
+bool zone_runtime_alloc_held_back(bool   runtime_zone,
+                                  bool   forbid_spill,
+                                  size_t zone_available,
+                                  size_t hold,
+                                  size_t alloc_size);
+
+// Whether a multi-row MUL_MAT draws a given planned scratch (the Q8_1 src1 buffer, the f16 dequant buffers),
+// from the two answers the dispatch can give. `primary_*` is the router's first decision; when it picks the
+// unified kernel the dispatch can still decline at run time and re-select a legacy kernel, which is
+// `fallback_*`. A node the unified kernel serves draws neither buffer; a node it declines draws what the
+// legacy kernel draws. One function for both buffers: two predicates for one fact eventually disagree.
+bool zone_route_draws_scratch(bool decision_valid,
+                              bool primary_is_unified,
+                              bool primary_draws,
+                              bool fallback_valid,
+                              bool fallback_draws);
+
+// The planned dense scratch's inputs are device-global, so a second model loaded on a device while another is
+// live must not shrink the first one's plan (a draft and a target on one card). The larger input survives
+// while another model is live; with none live the new input replaces the old, so a model swap shrinks the plan.
+size_t zone_dense_scratch_merge_input(size_t prev, size_t next, bool other_model_live);
+
 // ---------------------------------------------------------------------------
 // Mispredict accounting
 // ---------------------------------------------------------------------------

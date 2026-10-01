@@ -379,6 +379,32 @@ bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size
     return hold <= available && size <= available - hold;
 }
 
+bool zone_runtime_alloc_held_back(bool   runtime_zone,
+                                  bool   forbid_spill,
+                                  size_t zone_available,
+                                  size_t hold,
+                                  size_t alloc_size) {
+    return runtime_zone && !forbid_spill && !zone_runtime_alloc_respects_hold(zone_available, hold, alloc_size);
+}
+
+bool zone_route_draws_scratch(bool decision_valid,
+                              bool primary_is_unified,
+                              bool primary_draws,
+                              bool fallback_valid,
+                              bool fallback_draws) {
+    if (!decision_valid) {
+        return false;
+    }
+    if (!primary_is_unified) {
+        return primary_draws;
+    }
+    return fallback_valid && fallback_draws;
+}
+
+size_t zone_dense_scratch_merge_input(size_t prev, size_t next, bool other_model_live) {
+    return other_model_live && prev > next ? prev : next;
+}
+
 namespace {
 
 struct underestimate_record {
