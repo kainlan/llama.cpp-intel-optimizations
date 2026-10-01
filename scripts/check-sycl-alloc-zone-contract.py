@@ -10,7 +10,7 @@ hash covers the construction's declaration and the field writes bound to it, and
 counts only identical constructions in the same function, so a key survives an unrelated edit
 above it and moves only when the construction itself changes.
 
-What this unit (S2a) enforces
+What this unit (S2a, S2b) enforces
   (a) a request-type token inside an ERROR/MISSING region fails; a file whose root is ERROR
       (today cpu-dispatch.cpp) is also scanned lexically, and each lexical request must be
       host-only by a literal on its statement run
@@ -21,7 +21,10 @@ What this unit (S2a) enforces
       is that literal. A write nested under a conditional below the construction's own block
       does not establish a flag (fail closed), though it can break one.
   (e) raw allocator names (as a call, an identifier, a string or raw-string literal, or in a
-      #define body) outside the allowlist
+      #define body) outside the allowlist. dpct's allocating entry points, `dpct_malloc` (identifier) and
+      the classes `device_memory`, `global_memory`, `constant_memory`, `shared_memory` (type names), are forbidden
+      outside dpct/helper.hpp; helper.hpp's own three raw calls are allowlisted by function name and count
+      (rulings M247: vendored upstream, not edited, dead in-tree)
   (f) a missing tree_sitter_language_pack is a FAIL, never a skip
 and the brace rule the construction-site labels need: a braceless `T x;` reports the class
 site (unified-cache.hpp, the comment above alloc_intent), so every value declaration of a
@@ -48,16 +51,25 @@ discards the writes bound to that subtree and re-seeds it from the list. The oth
 be written a literal false. Write credit is positional and does not follow control flow, so a write after
 `if (b) goto done;` or after an unconditional `return;` is still credited (documented gap).
 
-Not here yet (later units, each lands with its witnesses)
-  (c) interprocedural flow, so a copy / helper return / by-reference write is a construction of
-      its own. Until it lands such constructions are listed as DEFER-C debt and are shrink-only,
-      so a new copy cannot slip in unseen. Known clause-(c) gaps, listed so S2b closes them: a
-      local reference or pointer alias written through (`alloc_constraints & c = req.intent.
-      constraints; c.prefer_vram_zone = COUNT;`, `p->...`), a callee that writes a request passed by
-      reference, and writes to a request held as a member, in a method or through `this->`
-      (`struct H { alloc_request r{}; void f() { r.intent.constraints.prefer_vram_zone = COUNT; } };`).
-      Also documented gaps: token pasting (`malloc_##x`) and `#pragma message` can name a raw
-      allocator without the gate seeing it.
+  (c) interprocedural flow. A copy of a request (`T r = req;`, `r = req;`, `auto r = std::move(req)`) inherits the
+      source's fields and is a construction of its own: handed on, it must write its own cohort literal
+      (C-COHORT), and its own writes are judged like any request's. A copy whose source is a parameter is a
+      pass-through: the caller's request was already judged, so only the negative rules (COUNT, forbid false,
+      B-TIER) and C-SITE apply to it. A callee that writes through a by-reference or pointer request parameter
+      is summarised by name (to a fixpoint) and its writes are applied at the caller's call. A helper whose single
+      return is a locally built request or intent is summarised the same way; a helper with several returns
+      stays opaque (DEFER-C). A write through a reference or pointer alias of a request or sub-object
+      (`alloc_constraints & c = req.intent.constraints; c.prefer_vram_zone = COUNT;`, `p->...`, `(*p)`, a chain
+      of aliases) is a write to the root. COUNT or forbid-false written anywhere else (a member, `this->`,
+      a holder, a file-scope request, the body of a by-reference callee) is a stray finding, and a by-value
+      request parameter's own writes are judged as a pass-through record. A wrapper from one request type to
+      another (alloc_intent -> alloc_request) must copy the source's site (C-SITE). Handing the address of a
+      scalar field (`zz_f(&req.intent.constraints.must_device)`) or calling a method on the request is a first
+      handoff, so a later write is not credited.
+      Known clause-(c) gaps: a reference or pointer bound to a SCALAR field (`bool & r = req.intent.
+      constraints.must_device; r = false;`), a call through a lambda, a function pointer or a std::function, a
+      call written inside a macro body, a helper with several returns, positional goto/return control flow,
+      token pasting (`malloc_##x`), `#pragma message`, and the constructor-form alias `T & c(x)`.
   (g)-(p) are S2c/S2d. Witness 9 (a site that stops calling its shared `*_bytes()` function) is
       deferred to S2d as a dormant clause: its subjects, the model-shaped exact `*_bytes()`
       functions (load_reorder_temp_bytes, woq_packed_bytes, ...), do not exist in the tree yet.
@@ -138,6 +150,13 @@ TRACKED = ("must_device", "must_host_pinned", "prefer_vram_zone", "forbid_vram_z
            "cascade_step", "unconverted_ticket", "cohort_id")
 # Fields of a request that are themselves structs: a write to one is a copy, not a literal.
 STRUCT_FIELDS = ("intent", "constraints")
+# Members of alloc_constraints the rules read (the tracked fields that are not the cohort).
+CONSTRAINT_FIELDS = tuple(f for f in TRACKED if f != "cohort_id")
+# A wrapper that builds one site-carrying request type from another must copy these (witness 24). A write to the
+# nested intent's own site is keyed `intent.site_file`, so it is never mistaken for the request's.
+SITE_FIELDS = ("site_file", "site_line")
+# Writes the gate refuses wherever they land, even through a member or an alias it cannot attribute to a request.
+NEGATIVE_FIELDS = ("prefer_vram_zone", "forbid_vram_zone_spill")
 # Clause (e). Names match as identifiers (a call, an address-of, a use as a value), strings on substring.
 RAW_NAMES = (
     "unified_cache_malloc_device_tracked", "unified_cache_raw_malloc_device", "sycl_aligned_malloc_device",
@@ -146,8 +165,14 @@ RAW_NAMES = (
     "zeMemAllocDevice", "zeMemAllocShared", "zePhysicalMemCreate", "zeVirtualMemReserve",
 )
 RAW_STRINGS = ("zeMemAllocDevice", "zeMemAllocShared", "zePhysicalMemCreate", "zeVirtualMemReserve")
+# dpct's allocating entry points are raw allocators too (helper.hpp is vendored and holds the three raw calls they reach).
+# Outside that file the function is matched as an identifier and the classes as type names, never as substrings: a
+# parameter that happens to be spelled `device_memory` (memory-budget.hpp) is an identifier, not the class.
+DPCT_HOME = "dpct/helper.hpp"
+DPCT_FUNCS = ("dpct_malloc",)
+DPCT_CLASSES = ("device_memory", "global_memory", "constant_memory", "shared_memory")
 
-DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a, b, d, e). Shrink-only: a violation not listed "
+DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-e). Shrink-only: a violation not listed "
             "fails, and a listed entry that no longer violates fails. Every E-RAW entry carries a fate (deleted-by-*, "
             "converted-by-*, sanctioned-internal, sanctioned-vendored or pending-disposition) and a cite, so an entry no step will ever "
             "shrink is visible as a mislabelled allowlist entry. Regenerate with `python3 "
@@ -155,8 +180,8 @@ DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a, b, d,
 FATE_RE = re.compile(r"^(deleted-by|converted-by)-[A-Za-z0-9._§()-]+$|^sanctioned-internal$|^sanctioned-vendored$|^pending-disposition$")
 CITE_MIN = 12   # a cite names a ticket or a design/census row; "tbd" is not one
 
-CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-FORM", "B-TIER", "D-ZONE", "D-ZONE-COUNT",
-         "D-FORBID", "D-FORBID-FALSE", "E-RAW", "DEFER-C")
+CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-FORM", "B-TIER", "C-COHORT", "C-SITE", "D-ZONE",
+         "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "DEFER-C")
 
 
 # ---------------------------------------------------------------- tree-sitter accessors
@@ -407,6 +432,72 @@ def file_members(src):
     return _MEMBERS[h]
 
 
+_IDENTS = {}           # sha1 -> every identifier spelled in a file
+_STRUCT_MEMBERS = {}   # sha1 -> {struct name: [(member name, member base type)]}
+_DEFS = {}             # sha1 -> [(name, return base type, returns by value, function_definition node)]
+
+
+def file_idents(src):
+    """Every identifier a file spells, for deciding which call summaries can reach it; cached."""
+    h = _sha(src)
+    if h not in _IDENTS:
+        _IDENTS[h] = frozenset(txt(src, n) for n in walk(parse(src)) if kind(n) in ("identifier", "field_identifier"))
+    return _IDENTS[h]
+
+
+def file_struct_members(src):
+    """Member names, in declaration order, of every struct in a file: a positional initialiser maps onto them."""
+    h = _sha(src)
+    if h not in _STRUCT_MEMBERS:
+        out = {}
+        for n in walk(parse(src)):
+            if kind(n) not in ("struct_specifier", "class_specifier"):
+                continue
+            nm, body = fld(n, "name"), fld(n, "body")
+            if nm is None or body is None:
+                continue
+            members = []
+            for c in kids(body):
+                if kind(c) != "field_declaration":
+                    continue
+                t = fld(c, "type")
+                if t is None:
+                    continue
+                for d in kids(c):
+                    if same(d, t) or kind(d) not in ("field_identifier", "init_declarator", "pointer_declarator",
+                                                     "reference_declarator", "array_declarator"):
+                        continue
+                    mn = declared_name(src, d)
+                    if mn:
+                        members.append((mn, base_type(txt(src, t))))
+            out[txt(src, nm)] = members
+        _STRUCT_MEMBERS[h] = out
+    return _STRUCT_MEMBERS[h]
+
+
+def file_defs(src):
+    """Function definitions of one file: (name, return base type, returns by value, node)."""
+    h = _sha(src)
+    if h not in _DEFS:
+        out = []
+        for n in walk(parse(src)):
+            if kind(n) != "function_definition":
+                continue
+            d = fld(n, "declarator")
+            byval = True
+            while d is not None and kind(d) != "function_declarator":
+                if kind(d) in ("pointer_declarator", "reference_declarator"):
+                    byval = False
+                d = fld(d, "declarator")
+            if d is None or fld(d, "declarator") is None or fld(n, "body") is None:
+                continue
+            t = fld(n, "type")
+            out.append((callee_last(txt(src, fld(d, "declarator"))), base_type(txt(src, t)) if t is not None else None,
+                        byval, n))
+        _DEFS[h] = out
+    return _DEFS[h]
+
+
 def has_braced_arg(src, lst):
     """True when an argument list or initialiser list has a braced-init-list element. The grammar reads a bare
     `{}` argument as a compound literal of no type, so that shape counts too."""
@@ -445,8 +536,26 @@ class Ctx:
             for tbase, name in file_members(src):
                 if tbase in self.value_types:
                     self.req_members.add(name)
-        self.digest = hashlib.sha1(repr((sorted(self.value_types), sorted(self.all_types), sorted(self.req_funcs),
-                                         sorted(self.req_returning), sorted(self.req_members))).encode()).hexdigest()
+        self.member_order = {}
+        for src in files.values():
+            for sname, members in file_struct_members(src).items():
+                if sname in self.all_types:
+                    self.member_order[sname] = members
+        self.site_types = {t for t, m in self.member_order.items() if {"site_file", "site_line"} <= {x[0] for x in m}}
+        # What a call tells the caller about a request, found by name and refined to a fixpoint: the constructions a
+        # helper returns (`ret_sum`) and the writes a callee makes through a request it takes by reference (`ev_sum`).
+        self.digest = hashlib.sha1(repr((sorted(self.value_types), sorted(self.all_types),
+                                         sorted(self.member_order.items()), sorted(self.site_types))).encode()).hexdigest()
+        self.ret_sum, self.ev_sum = {}, {}
+        build_summaries(self, files)
+
+    def file_key(self, names):
+        """What a file that spells `names` can learn from the tree: the request types, and the function, member and
+        call-summary facts under the names it mentions. A function added elsewhere does not move its facts."""
+        return hashlib.sha1(repr((self.digest, sorted(self.req_funcs & names), sorted(self.req_returning & names),
+                                  sorted(self.req_members & names),
+                                  [(n, self.ret_sum[n]) for n in sorted(self.ret_sum) if n in names],
+                                  [(n, self.ev_sum[n]) for n in sorted(self.ev_sum) if n in names])).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------- naming
@@ -532,7 +641,23 @@ def zone_class(src, n):
     return "nonliteral"
 
 
+def str_class(src, n):
+    """'lit' for a string literal (or a ternary whose arms all are), 'null' for nullptr, else 'expr'."""
+    k = kind(n)
+    if k == "parenthesized_expression":
+        inner = [c for c in kids(n) if _a(c, "is_named")]
+        return str_class(src, inner[0]) if inner else "expr"
+    if k == "conditional_expression":
+        arms = [str_class(src, fld(n, "consequence")), str_class(src, fld(n, "alternative"))]
+        return "lit" if arms == ["lit", "lit"] else "expr"
+    if k in ("string_literal", "concatenated_string", "raw_string_literal"):
+        return "lit"
+    return "null" if txt(src, n).strip() in ("nullptr", "NULL", "0") else "expr"
+
+
 def classify(src, field, n):
+    if field == "cohort_id":
+        return str_class(src, n)
     if field == "prefer_vram_zone":
         return zone_class(src, n)
     if field in ("must_device", "must_host_pinned", "forbid_vram_zone_spill", "cascade_step"):
@@ -544,9 +669,41 @@ def add_write(out, field, pos, cls, cond, text):
     out.setdefault(field, []).append((pos, cls, cond, re.sub(r"\s+", " ", text)[:80]))
 
 
-def init_fields(src, lst, out, copied):
-    """Fold a braced initialiser into `out` (field -> [(pos, class, conditional, text)]). A designated
-    pair that names a struct member with a non-list value is a copy; a positional element is unresolvable."""
+def merge_known(out, known, pos, which):
+    """Fold a resolved copy source's writes into `out`, in order, at `pos`. A whole-request or constraints copy
+    leaves the destination's own cohort alone: the cohort is exactly what a copy must name for itself."""
+    for f, ws in known.items():
+        if f == "cohort_id" and which != "intent":
+            continue
+        for i, w in enumerate(ws):
+            out.setdefault(f, []).append((pos + i / 1000.0, w[1], w[2], w[3]))
+
+
+def init_fields(env, lst, stype, out, copied, pfx=""):
+    """Fold a braced initialiser into `out` (field -> [(pos, class, conditional, text)]). `stype` is the struct the
+    list initialises, so a positional element maps onto the member in that position. A struct-valued member that is
+    not itself a list is resolved against the copy sources the scan can follow, or recorded as a copy."""
+    src = env.src
+    order = env.ctx.member_order.get(stype) or []
+    ordinal = 0
+
+    def element(name, val):
+        if val is None:
+            return
+        if kind(val) == "initializer_list":
+            member_type = {"intent": "alloc_intent", "constraints": "alloc_constraints"}.get(name)
+            init_fields(env, val, member_type, out, copied, "intent." if name == "intent" else pfx)
+        elif name in STRUCT_FIELDS:
+            r = resolve_source(env, val, name)
+            if r is None:
+                copied.append(name)
+            else:
+                merge_known(out, r[1], sb(val), name)
+        elif name in TRACKED:
+            add_write(out, name, sb(val), classify(src, name, val), False, txt(src, val))
+        elif name in SITE_FIELDS:
+            add_write(out, pfx + name, sb(val), "expr", False, txt(src, val))
+
     for c in kids(lst):
         k = kind(c)
         if k == "initializer_pair":
@@ -555,19 +712,16 @@ def init_fields(src, lst, out, copied):
             if desig:
                 fi = [x for x in kids(desig[-1]) if kind(x) == "field_identifier"]
                 name = txt(src, fi[0]) if fi else None
-            val = fld(c, "value")
-            if val is None:
-                continue
-            if kind(val) == "initializer_list":
-                init_fields(src, val, out, copied)
-            elif name in STRUCT_FIELDS:
-                copied.append(name)
-            elif name in TRACKED:
-                add_write(out, name, sb(val), classify(src, name, val), False, txt(src, val))
+            element(name, fld(c, "value"))
         elif k in ("{", "}", ",", "comment"):
             continue
         else:
-            copied.append("positional")
+            name = order[ordinal][0] if ordinal < len(order) else None
+            ordinal += 1
+            if name is None:
+                copied.append("positional")
+                continue
+            element(name, c)
 
 
 # ---------------------------------------------------------------- extraction
@@ -665,15 +819,25 @@ def unparen(n):
     return n
 
 
+def strip_ref(n):
+    """The object an expression names: look through parentheses, `*p` and `&x` at any depth."""
+    while True:
+        n = unparen(n)
+        if n is not None and kind(n) == "pointer_expression" and fld(n, "argument") is not None:
+            n = fld(n, "argument")
+            continue
+        return n
+
+
 def lhs_chain(src, lhs):
     """(root identifier node or None, fields written outermost first) of an assignment's left side, looking through
-    parentheses at every level."""
+    parentheses and `*p` at every level."""
     chain = []
-    x = unparen(lhs)
+    x = strip_ref(lhs)
     while x is not None and kind(x) == "field_expression":
         f = fld(x, "field")
         chain.append(txt(src, f) if f is not None else "?")
-        x = unparen(fld(x, "argument"))
+        x = strip_ref(fld(x, "argument"))
     return (x if x is not None and kind(x) == "identifier" else None), chain
 
 
@@ -733,6 +897,13 @@ def is_use(src, ident, decl):
             last = txt(src, f) if f is not None else "?"
         top = p
         p = parent(top)
+    if last is not None and p is not None:
+        # `zz(&req.intent.constraints.must_device)` can write the flag later, and `req.m()` can write anything
+        if kind(p) == "pointer_expression" and fld(p, "argument") is not None and same(fld(p, "argument"), top) \
+                and txt(src, kids(p)[0]) == "&":
+            return True
+        if kind(p) == "call_expression" and same(fld(p, "function"), top):
+            return True
     if last is not None and last not in STRUCT_FIELDS:
         return False
     if p is not None and kind(p) == "assignment_expression" and same(fld(p, "left"), top):
@@ -805,6 +976,497 @@ def callee_ident(src, ident):
     if p is not None and kind(p) == "call_expression" and same(fld(p, "function"), top):
         return top, True
     return ident, False
+
+
+# ---------------------------------------------------------------- interprocedural follow (clause c)
+
+def fn_params(n):
+    """The parameter_declaration nodes of a function definition or a lambda."""
+    d = fld(n, "declarator")
+    while d is not None:
+        pl = fld(d, "parameters")
+        if pl is not None:
+            return [c for c in kids(pl) if kind(c) in ("parameter_declaration", "optional_parameter_declaration")]
+        d = fld(d, "declarator")
+    return []
+
+
+def param_name(src, c):
+    dd = fld(c, "declarator")
+    return declared_name(src, dd) if dd is not None else None
+
+
+def param_decl_of(src, node, name):
+    """The parameter declaration a name refers to at `node`, looking outward through lambdas to the function."""
+    q = parent(node)
+    while q is not None:
+        if kind(q) in ("function_definition", "lambda_expression"):
+            for c in fn_params(q):
+                if param_name(src, c) == name:
+                    return c
+            if kind(q) == "function_definition":
+                return None
+        q = parent(q)
+    return None
+
+
+def bound_decl(src, node, name):
+    """The declaration or parameter a name binds to at `node`."""
+    d = binding_decl(src, node, name)
+    return d if d is not None else param_decl_of(src, node, name)
+
+
+def param_style(src, c, ctx):
+    """'value', 'ref' or 'ptr' for a writable parameter of a request type, else None (a const one cannot be written)."""
+    t = fld(c, "type")
+    if t is None or base_type(txt(src, t)) not in ctx.value_types:
+        return None
+    if any(kind(x) == "type_qualifier" and txt(src, x) == "const" for x in kids(c)):
+        return None
+    dd = fld(c, "declarator")
+    if dd is None:
+        return None
+    if kind(dd) == "reference_declarator":
+        return "ref"
+    if kind(dd) == "pointer_declarator":
+        return "ptr"
+    return "value" if declared_name(src, dd) else None
+
+
+_REFDECL_CACHE = {}
+_CALL_CACHE = {}
+
+
+def ref_decls_in(src_key, src, block):
+    """Reference and pointer declarations with an initialiser in a block: [(declaration, declarator, name, value)]."""
+    key = (src_key, sb(block), eb(block))
+    if key not in _REFDECL_CACHE:
+        out = []
+        for n in walk(block):
+            if kind(n) != "declaration":
+                continue
+            for d in kids(n):
+                if kind(d) != "init_declarator":
+                    continue
+                top, val = fld(d, "declarator"), fld(d, "value")
+                if top is not None and val is not None and kind(top) in PTR_KINDS:
+                    nm = declared_name(src, d)
+                    if nm:
+                        out.append((n, d, nm, val))
+        _REFDECL_CACHE[key] = out
+    return _REFDECL_CACHE[key]
+
+
+def calls_in(src_key, src, block):
+    """Every call in a block: [(call node, callee's last name, [argument nodes])]."""
+    key = (src_key, sb(block), eb(block))
+    if key not in _CALL_CACHE:
+        out = []
+        for n in walk(block):
+            if kind(n) != "call_expression":
+                continue
+            fn, args = fld(n, "function"), fld(n, "arguments")
+            if fn is None or args is None:
+                continue
+            out.append((n, callee_last(txt(src, fn)), [c for c in kids(args) if _a(c, "is_named") and kind(c) != "comment"]))
+        _CALL_CACHE[key] = out
+    return _CALL_CACHE[key]
+
+
+def ref_root(src, val):
+    """(root identifier, fields) of an initialiser naming a request or a sub-object of one (`req`, `&req`,
+    `req.intent.constraints`), or None."""
+    x = strip_ref(val)
+    chain = []
+    while x is not None and kind(x) == "field_expression":
+        f = fld(x, "field")
+        chain.append(txt(src, f) if f is not None else "?")
+        x = strip_ref(fld(x, "argument"))
+    if x is None or kind(x) != "identifier" or any(c not in STRUCT_FIELDS for c in chain):
+        return None
+    return x, chain
+
+
+def arg_root(src, a):
+    """The identifier a call argument is rooted at: `req`, `&req`, `req.intent`, `*p`, or None."""
+    x = strip_ref(a)
+    while x is not None and kind(x) == "field_expression":
+        x = strip_ref(fld(x, "argument"))
+    return x if x is not None and kind(x) == "identifier" else None
+
+
+def braced_of(src, ctx, n):
+    """The initializer_list of a braced value: `{...}`, the grammar's empty-type reading of a bare `{...}`, or `T{...}`."""
+    if n is None:
+        return None
+    if kind(n) == "initializer_list":
+        return n
+    if kind(n) == "compound_literal_expression":
+        t, v = fld(n, "type"), fld(n, "value")
+        if v is not None and kind(v) == "initializer_list" and (
+                t is None or not txt(src, t).strip() or base_type(txt(src, t)) in ctx.value_types):
+            return v
+    return None
+
+
+class Env:
+    """One file's scan state: the request locals built so far (a copy resolves its source against them) and the
+    assignments that some request has claimed."""
+
+    def __init__(self, rel, src, ctx):
+        self.rel, self.src, self.ctx, self.h = rel, src, ctx, _sha(src)
+        self.auto_names = set()
+        self.built = {}      # (declaration start byte, name) -> construction record
+        self.handled = set()  # start bytes of assignments attributed to a request or an alias of one
+        self.done = {}       # declaration start byte -> its records (a source declared after its copy is built on demand)
+        self.building = set()
+
+    def key_for(self, func, nodekind, var, text):
+        """Key without its ordinal; analyse() numbers identical keys among the constructions that violate."""
+        return "%s::%s::%s:%s:%s" % (self.rel, func, nodekind, var, text_hash(text))
+
+
+def resolve_source(env, val, which):
+    """What the source of a copy evaluates to: ('known', fields, passthrough) for a local request this scan built or a
+    helper's single returned construction, ('pass', {}, True) for a parameter (the caller's own request, judged at the
+    caller's construction), or None when the gate cannot follow it. `which` names the destination: request, intent or
+    constraints."""
+    src, ctx = env.src, env.ctx
+    n = unparen(val)
+    if n is None:
+        return None
+    if kind(n) == "call_expression":
+        fn = fld(n, "function")
+        if fn is None:
+            return None
+        ft = re.sub(r"\s+", "", txt(src, fn))
+        if ft in ("std::move", "std::forward", "move", "forward"):
+            args = [c for c in kids(fld(n, "arguments")) if _a(c, "is_named")]
+            return resolve_source(env, args[0], which) if len(args) == 1 else None
+        rs = ctx.ret_sum.get(callee_last(ft))
+        return ("known", rs, False) if rs is not None else None
+    chain = []
+    x = n
+    while x is not None and kind(x) == "field_expression":
+        f = fld(x, "field")
+        chain.append(txt(src, f) if f is not None else "?")
+        x = strip_ref(fld(x, "argument"))
+    if x is None or kind(x) != "identifier" or any(c not in STRUCT_FIELDS for c in chain):
+        return None
+    name = txt(src, x)
+    d = binding_decl(src, x, name)
+    if d is not None:
+        rec = env.built.get((sb(d), name))
+        if rec is None and kind(d) == "declaration" and sb(d) not in env.building and sb(d) not in env.done:
+            env.building.add(sb(d))
+            process_declaration(env, d)
+            env.building.discard(sb(d))
+            rec = env.built.get((sb(d), name))
+        if rec is None or rec["deferred"] or rec["err"]:
+            return None
+        return ("known", rec["fields"], rec["pass"])
+    p = param_decl_of(src, x, name)
+    if p is not None and base_type(txt(src, fld(p, "type"))) in ctx.value_types:
+        return ("pass", {}, True)
+    return None
+
+
+def reset_subtree(fields, which):
+    """A braced or copied assignment to `intent` or `constraints` discards what was written under it."""
+    for f in list(fields):
+        if which == "intent":
+            if f not in SITE_FIELDS:
+                del fields[f]
+        elif f in CONSTRAINT_FIELDS:
+            del fields[f]
+
+
+def writes_for(env, decl, name, blk, fields, copied, reason, st, callee_mode, stype):
+    """Fold into `fields` every write bound to the object declared at `decl`: assignments through the name or through a
+    reference or pointer alias of it, and the writes a callee makes through a by-reference parameter. Returns the
+    statement texts of the assignments and whether the object is ever handed to other code. `callee_mode` is a
+    by-reference parameter's own summary: whole-object assignments there are opaque to the caller."""
+    src, h, ctx = env.src, env.h, env.ctx
+    names = [(name, decl)]
+    spans = []
+    for dn, d, an_name, val in ref_decls_in(h, src, blk):
+        if sb(dn) < eb(decl):
+            continue
+        r = ref_root(src, val)
+        if r is None:
+            continue
+        ident = r[0]
+        nm = txt(src, ident)
+        if any(n0 == nm and same(bound_decl(src, ident, nm), d0) for n0, d0 in names):
+            names.append((an_name, dn))
+            spans.append((sb(val), eb(val)))
+
+    def binds(node, nm):
+        for n0, d0 in names:
+            if n0 == nm and sb(node) >= eb(d0) and same(bound_decl(src, node, nm), d0):
+                return d0
+        return None
+
+    first_use = None
+    for nm, dnode in names:
+        for ident in idents_in(h, src, blk).get(nm, []):
+            if sb(ident) < eb(dnode) or not same(bound_decl(src, ident, nm), dnode):
+                continue
+            if any(a <= sb(ident) < b for a, b in spans):
+                continue  # the alias's own initialiser names the object without handing it anywhere
+            if is_use(src, ident, dnode):
+                first_use = sb(ident) if first_use is None else min(first_use, sb(ident))
+                break
+    items = []
+    for root_name, rhs, an, compound in assignments_in(h, src, blk):
+        d0 = binds(an, root_name)
+        if d0 is not None:
+            items.append((sb(an), 0, (rhs, an, compound, d0)))
+    for call, cname, al in calls_in(h, src, blk):
+        if cname not in ctx.ev_sum:
+            continue
+        for idx, a in enumerate(al):
+            ident = arg_root(src, a)
+            d0 = binds(ident, txt(src, ident)) if ident is not None else None
+            if d0 is not None:
+                items.append((sb(ident), 1, (call, idx, ident, d0)))
+    items.sort(key=lambda x: (x[0], x[1]))
+    texts = []
+    for pos, which_item, payload in items:
+        if which_item == 1:
+            call, idx, ident, d0 = payload
+            hits = [dfn for dfn in ctx.ev_sum[callee_last(txt(src, fld(call, "function")))] if idx in dfn["events"]]
+            late = first_use is not None and pos > first_use
+            cond_call = is_conditional(call, blk, d0) or late or len(hits) > 1
+            for dfn in hits:
+                evs, cps = dfn["events"][idx]
+                for f, ws in evs.items():
+                    for i, (cls, cnd, text) in enumerate(ws):
+                        add_write(fields, f, pos + i / 1000.0, cls, cnd or cond_call, text)
+                copied.extend(cps)
+            continue
+        rhs, an, compound, d0 = payload
+        if not callee_mode:
+            env.handled.add(sb(an))  # a by-reference parameter's own writes stay unclaimed: a COUNT there is refused in place
+        _, chain = lhs_chain(src, fld(an, "left"))
+        last = chain[0] if chain else None
+        texts.append(txt(src, an))
+        late = first_use is not None and pos > first_use
+        cond = is_conditional(an, blk, d0)
+        clean = not compound and not cond and not late and not callee_mode and rhs is not None
+        if last is None:
+            bl = braced_of(src, ctx, rhs) if clean else None
+            if bl is not None:
+                fields.clear()
+                del copied[:], reason[:]
+                init_fields(env, bl, stype, fields, copied)
+                st["pass"], st["copy"] = False, False
+                continue
+            r = resolve_source(env, rhs, "request") if clean else None
+            if r is None:
+                copied.append("whole-assign")
+            else:
+                fields.clear()
+                del copied[:], reason[:]
+                merge_known(fields, r[1], pos, "request")
+                st["pass"], st["copy"] = r[2], stype != "alloc_constraints"
+        elif last in STRUCT_FIELDS:
+            sub = "alloc_intent" if last == "intent" else "alloc_constraints"
+            bl = braced_of(src, ctx, rhs) if clean else None
+            if bl is not None:
+                reset_subtree(fields, last)
+                init_fields(env, bl, sub, fields, copied)
+                st["pass"] = False  # the list re-seeds what the caller's request carried; it is judged here now
+                continue
+            r = resolve_source(env, rhs, last) if clean else None
+            if r is None:
+                copied.append(last)
+            else:
+                reset_subtree(fields, last)
+                merge_known(fields, r[1], pos, last)
+                st["pass"] = r[2]
+        elif last in TRACKED:
+            add_write(fields, last, pos, "expr" if compound else classify(src, last, rhs), cond or late,
+                      txt(src, rhs) if rhs is not None else "")
+        elif last in SITE_FIELDS:
+            key = "intent." + last if "intent" in chain[1:] else last
+            add_write(fields, key, pos, "expr", cond or late, txt(src, rhs) if rhs is not None else "")
+    return texts, first_use is not None
+
+
+def process_declaration(env, n):
+    """The construction records of one declaration or member declaration (one per declarator)."""
+    if sb(n) in env.done:
+        return env.done[sb(n)]
+    env.done[sb(n)] = recs_out = []
+    src, ctx = env.src, env.ctx
+    k = kind(n)
+    t = fld(n, "type")
+    auto_decl = t is not None and k == "declaration" and kind(t) == "placeholder_type_specifier"
+    if t is None or (not auto_decl and base_type(txt(src, t)) not in ctx.value_types):
+        return []
+    func = enclosing(src, n)
+    if k == "field_declaration":
+        holder = parent(parent(n))
+        hn = fld(holder, "name") if holder is not None and kind(holder) in ("struct_specifier", "class_specifier") else None
+        if hn is not None and txt(src, hn) in BASE_TYPES:
+            return []  # the request types' own members define their defaults; they construct nothing
+    err = has_error_ancestor(n)
+    ks = kids(n)
+    stype = None if auto_decl else base_type(txt(src, t))
+    which = {"alloc_intent": "intent", "alloc_constraints": "constraints"}.get(stype, "request")
+    fnode = parent(n)
+    while fnode is not None and kind(fnode) != "function_definition":
+        fnode = parent(fnode)
+    recs = recs_out
+    for ki, d in enumerate(ks):
+        if same(d, t):
+            continue
+        if auto_decl:
+            # `auto x = <request>` copies a request without naming its type
+            name = declared_name(src, d)
+            init = fld(d, "value") if kind(d) == "init_declarator" else None
+            if name is None or init is None or not request_valued(src, ctx, init, env.auto_names):
+                continue
+            env.auto_names.add((name, sb(n)))
+            form, val = "copy", init
+        else:
+            name, form, val = declarator_info(src, d)
+        if form in ("skip", "array") or name is None:
+            continue
+        if k == "field_declaration" and form == "plain" and ki + 1 < len(ks):
+            # a default member initialiser is a sibling of the field name, not an init_declarator
+            nxt = ks[ki + 1]
+            if kind(nxt) == "initializer_list":
+                form, val = "braced", nxt
+            elif txt(src, nxt) == "=" and ki + 2 < len(ks):
+                form, val = ("braced", ks[ki + 2]) if kind(ks[ki + 2]) == "initializer_list" else ("copy", ks[ki + 2])
+        fields, copied, reason = {}, [], []
+        st = {"pass": False, "copy": False}
+        if form == "braced":
+            init_fields(env, val, stype, fields, copied)
+        elif form == "copy":
+            r = resolve_source(env, val, which)
+            if r is None:
+                reason.append("copy-init")
+            else:
+                merge_known(fields, r[1], sb(val), which)
+                st["pass"], st["copy"] = r[2], stype != "alloc_constraints"
+        elif form == "ctor":
+            reason.append("ctor-args")
+        texts, handed = [], False
+        if k == "declaration" and in_function(n) and not err:
+            blk = scope_block(n)
+            if blk is not None:
+                texts, handed = writes_for(env, n, name, blk, fields, copied, reason, st, False, stype)
+        for c in copied:
+            reason.append(c + "-copied" if c != "positional" else "positional-init")
+        if k == "field_declaration" and form == "braced" and not fields and not reason:
+            # `T x{}` in a holder struct is storage whose value is set elsewhere (clause (c));
+            # only a member initialiser that carries a flag is a construction of its own
+            continue
+        for f in fields:
+            fields[f].sort()
+        inputs = []
+        if k == "declaration" and fnode is not None and stype in ctx.site_types:
+            for c in fn_params(fnode):
+                pt, pn = fld(c, "type"), param_name(src, c)
+                if pt is not None and pn and base_type(txt(src, pt)) in ctx.site_types and base_type(txt(src, pt)) != stype:
+                    inputs.append(pn)
+        rec = {
+            "key": env.key_for(func, kind(n), name, txt(src, n) + " ;; " + " ;; ".join(texts)), "func": func,
+            "var": name, "line": line_of(n), "kind": "member" if k == "field_declaration" else "decl",
+            "type": "auto" if auto_decl else stype, "form": form, "err": err, "fields": fields,
+            "deferred": sorted(set(reason + (["auto-init"] if auto_decl else []))),
+            "pass": st["pass"], "needs_cohort": bool(st["copy"] and not st["pass"] and handed),
+            "wrapper_inputs": inputs,
+        }
+        if k == "declaration":
+            env.built[(sb(n), name)] = rec
+        recs.append(rec)
+    return recs
+
+
+def owner_fn(n):
+    p = parent(n)
+    while p is not None and kind(p) not in ("function_definition", "lambda_expression"):
+        p = parent(p)
+    return p
+
+
+_SUMCACHE = {}
+
+
+def memo_summary(tag, fn, ctx, rel, src, fnode):
+    """A summary depends on the function's file and on the summaries of the names that file spells."""
+    key = (tag, _sha(src), sb(fnode), ctx.file_key(file_idents(src)))
+    if key not in _SUMCACHE:
+        _SUMCACHE[key] = fn(ctx, rel, src, fnode)
+    return _SUMCACHE[key]
+
+
+def return_fields(ctx, rel, src, fnode):
+    """The fields of the one construction a helper returns by name, or None when the helper is not that simple."""
+    env = Env(rel, src, ctx)
+    body = fld(fnode, "body")
+    rets = []
+    for n in walk(body):
+        if kind(n) == "declaration" and owner_fn(n) is not None and same(owner_fn(n), fnode):
+            process_declaration(env, n)
+        elif kind(n) == "return_statement" and owner_fn(n) is not None and same(owner_fn(n), fnode):
+            rets.append(n)
+    if len(rets) != 1:
+        return None
+    exprs = [c for c in kids(rets[0]) if _a(c, "is_named")]
+    x = unparen(exprs[0]) if len(exprs) == 1 else None
+    if x is None or kind(x) != "identifier":
+        return None
+    d = binding_decl(src, x, txt(src, x))
+    rec = env.built.get((sb(d), txt(src, x))) if d is not None else None
+    if rec is None or rec["deferred"] or rec["err"]:
+        return None
+    return {f: list(ws) for f, ws in rec["fields"].items()}
+
+
+def param_events(ctx, rel, src, fnode):
+    """What a function does to each request it takes by reference or pointer: {param index: ({field: [(class,
+    conditional, text)]}, copy reasons)}."""
+    env = Env(rel, src, ctx)
+    body = fld(fnode, "body")
+    for n in walk(body):
+        if kind(n) == "declaration":
+            process_declaration(env, n)
+    out = {}
+    for idx, c in enumerate(fn_params(fnode)):
+        if param_style(src, c, ctx) not in ("ref", "ptr"):
+            continue
+        fields, copied, reason, st = {}, [], [], {"pass": False, "copy": False}
+        writes_for(env, c, param_name(src, c), body, fields, copied, reason, st, True, base_type(txt(src, fld(c, "type"))))
+        evs = {f: [(w[1], w[2], w[3]) for w in sorted(ws)] for f, ws in fields.items()}
+        out[idx] = (evs, sorted(set(copied)))
+    return {"events": out}
+
+
+def build_summaries(ctx, files):
+    """Fill ctx.ret_sum and ctx.ev_sum by iterating to a fixpoint (a helper may use another helper)."""
+    ret_defs, ev_defs = {}, {}
+    for rel, src in files.items():
+        for name, ret, byval, fnode in file_defs(src):
+            if ret in ctx.value_types and byval:
+                ret_defs.setdefault(name, []).append((rel, src, fnode))
+            if any(param_style(src, c, ctx) in ("ref", "ptr") for c in fn_params(fnode)):
+                ev_defs.setdefault(name, []).append((rel, src, fnode))
+    for _ in range(5):
+        before = repr((sorted(ctx.ret_sum.items()), sorted(ctx.ev_sum.items())))
+        ret = {}
+        for name, defs in ret_defs.items():
+            rs = memo_summary("ret", return_fields, ctx, *defs[0]) if len(defs) == 1 else None
+            if rs is not None:
+                ret[name] = rs
+        ctx.ret_sum = ret
+        ctx.ev_sum = {name: [memo_summary("ev", param_events, ctx, *d) for d in defs] for name, defs in ev_defs.items()}
+        if repr((sorted(ctx.ret_sum.items()), sorted(ctx.ev_sum.items()))) == before:
+            break
 
 
 # Roles that are known and need no finding; the others are B-FORM.
@@ -910,58 +1572,67 @@ def statement_of(n):
     return p if p is not None else n
 
 
+def param_and_stray_records(env, root):
+    """Writes the declaration pass cannot attribute to a local construction. A by-value request parameter is a
+    pass-through construction of its own; a by-reference one is the caller's object (its writes are summarised for
+    the callers). What no request claims -- a member written in a method or through `this->`, an alias of a member --
+    is still refused when it writes COUNT to the zone or false to the forbid, and so is a helper that does so through a
+    request it takes by reference (its callers fail too, since they inherit the write)."""
+    src, ctx, rel = env.src, env.ctx, env.rel
+    out = []
+    for fnode in (d[3] for d in file_defs(src)):
+        body = fld(fnode, "body")
+        for c in fn_params(fnode):
+            style = param_style(src, c, ctx)
+            if style is None:
+                continue
+            name = param_name(src, c)
+            stype = base_type(txt(src, fld(c, "type")))
+            fields, copied, reason, st = {}, [], [], {"pass": True, "copy": False}
+            texts, _ = writes_for(env, c, name, body, fields, copied, reason, st, style != "value", stype)
+            if style != "value" or not texts:
+                continue
+            for f in fields:
+                fields[f].sort()
+            reason = ["positional-init" if x == "positional" else x + "-copied" for x in copied]
+            func = enclosing(src, body)
+            out.append({
+                "key": env.key_for(func, kind(c), name, txt(src, c) + " ;; " + " ;; ".join(texts)), "func": func,
+                "var": name, "line": line_of(c), "kind": "param", "type": stype, "form": "param",
+                "err": has_error_ancestor(c), "fields": fields, "deferred": sorted(set(reason)), "pass": True,
+                "needs_cohort": False, "wrapper_inputs": [],
+            })
+    for an in walk(root):
+        if kind(an) != "assignment_expression" or sb(an) in env.handled:
+            continue
+        _, chain = lhs_chain(src, fld(an, "left"))
+        if not chain or chain[0] not in NEGATIVE_FIELDS:
+            continue
+        rhs = fld(an, "right")
+        cls = classify(src, chain[0], rhs) if rhs is not None else "expr"
+        op = [txt(src, x) for x in kids(an) if not _a(x, "is_named")]
+        if (chain[0] == "prefer_vram_zone" and cls != "count") or (chain[0] == "forbid_vram_zone_spill" and cls != "false"):
+            continue
+        if not op or op[0] != "=":
+            continue
+        func = enclosing(src, an)
+        out.append({
+            "key": env.key_for(func, "assignment_expression", txt(src, fld(an, "left")), txt(src, an)), "func": func,
+            "var": txt(src, fld(an, "left")), "line": line_of(an), "kind": "stray", "type": "stray", "form": "stray",
+            "err": has_error_ancestor(an), "fields": {chain[0]: [(sb(an), cls, False, txt(src, rhs))]}, "deferred": [],
+            "pass": True, "needs_cohort": False, "wrapper_inputs": [],
+        })
+    return out
+
+
 def scan_file(rel, src, ctx):
     """Facts about one file, as plain data: constructions, form findings, raw hits, error tokens."""
     value_types, all_types = ctx.value_types, ctx.all_types
-    auto_names = set()
-    h = _sha(src)
+    env = Env(rel, src, ctx)
+    h = env.h
     root = parse(src)
     root_error = kind(root) == "ERROR"
     constructions, raws, errtoks, forms = [], [], [], []
-
-    def key_for(func, nodekind, var, text):
-        """Key without its ordinal; analyse() numbers identical keys among the constructions that violate."""
-        return "%s::%s::%s:%s:%s" % (rel, func, nodekind, var, text_hash(text))
-
-    def bind_writes(n, name, fields, copied, err):
-        """Fold the later writes bound to declaration `n` into `fields`; return their statement texts."""
-        texts = []
-        if not in_function(n) or err:
-            return texts
-        blk = scope_block(n)
-        if blk is None:
-            return texts
-        first_use = None
-        for ident in idents_in(h, src, blk).get(name, []):
-            if sb(ident) >= eb(n) and same(binding_decl(src, ident, name), n) and is_use(src, ident, n):
-                first_use = sb(ident)
-                break
-        for root_name, rhs, an, compound in assignments_in(h, src, blk):
-            if root_name != name or not (eb(n) <= sb(an)):
-                continue
-            if not same(binding_decl(src, an, name), n):
-                continue
-            last = assign_last_field(src, an)
-            texts.append(txt(src, an))
-            # a write after the request has first been handed to other code does not set up what that code read
-            late = first_use is not None and sb(an) > first_use
-            if last is None:
-                copied.append("whole-assign")
-            elif last in STRUCT_FIELDS:
-                if rhs is not None and kind(rhs) == "initializer_list" and not compound \
-                        and not is_conditional(an, blk, n) and not late:
-                    # `req.intent = {...}` replaces the subtree: what was written there before is gone, and
-                    # the list re-seeds it (constraints holds every tracked field but the cohort id)
-                    for f in list(fields):
-                        if last == "intent" or f != "cohort_id":
-                            del fields[f]
-                    init_fields(src, rhs, fields, copied)
-                else:
-                    copied.append(last)
-            elif last in TRACKED:
-                add_write(fields, last, sb(an), "expr" if compound else classify(src, last, rhs),
-                          is_conditional(an, blk, n) or late, txt(src, rhs) if rhs is not None else "")
-        return texts
 
     for n in walk(root):
         k = kind(n)
@@ -981,62 +1652,7 @@ def scan_file(rel, src, ctx):
                 forms.append({"func": enclosing(src, n), "role": "braced-arg", "tok": "{...}", "line": line_of(n),
                               "text": txt(src, n)})
         if k in ("declaration", "field_declaration"):
-            t = fld(n, "type")
-            auto_decl = t is not None and k == "declaration" and kind(t) == "placeholder_type_specifier"
-            if t is None or (not auto_decl and base_type(txt(src, t)) not in value_types):
-                continue
-            func = enclosing(src, n)
-            if k == "field_declaration":
-                holder = parent(parent(n))
-                hn = fld(holder, "name") if holder is not None and kind(holder) in ("struct_specifier", "class_specifier") else None
-                if hn is not None and txt(src, hn) in BASE_TYPES:
-                    continue  # the request types' own members define their defaults; they construct nothing
-            err = has_error_ancestor(n)
-            ks = kids(n)
-            for ki, d in enumerate(ks):
-                if same(d, t):
-                    continue
-                if auto_decl:
-                    # `auto x = <request>` copies a request without naming its type; the copy is clause (c)'s
-                    name = declared_name(src, d)
-                    init = fld(d, "value") if kind(d) == "init_declarator" else None
-                    if name is None or init is None or not request_valued(src, ctx, init, auto_names):
-                        continue
-                    auto_names.add((name, sb(n)))
-                    form, val = "copy", init
-                else:
-                    name, form, val = declarator_info(src, d)
-                if form in ("skip", "array") or name is None:
-                    continue
-                if k == "field_declaration" and form == "plain" and ki + 1 < len(ks):
-                    # a default member initialiser is a sibling of the field name, not an init_declarator
-                    nxt = ks[ki + 1]
-                    if kind(nxt) == "initializer_list":
-                        form, val = "braced", nxt
-                    elif txt(src, nxt) == "=" and ki + 2 < len(ks):
-                        form, val = ("braced", ks[ki + 2]) if kind(ks[ki + 2]) == "initializer_list" else ("copy", ks[ki + 2])
-                fields, copied, reason = {}, [], []
-                if form == "braced":
-                    init_fields(src, val, fields, copied)
-                elif form == "copy":
-                    reason.append("copy-init")
-                elif form == "ctor":
-                    reason.append("ctor-args")
-                texts = bind_writes(n, name, fields, copied, err) if k == "declaration" else []
-                for c in copied:
-                    reason.append(c + "-copied" if c != "positional" else "positional-init")
-                if k == "field_declaration" and form == "braced" and not fields and not reason:
-                    # `T x{}` in a holder struct is storage whose value is set elsewhere (clause (c));
-                    # only a member initialiser that carries a flag is a construction of its own
-                    continue
-                for f in fields:
-                    fields[f].sort()
-                constructions.append({
-                    "key": key_for(func, kind(n), name, txt(src, n) + " ;; " + " ;; ".join(texts)), "func": func,
-                    "var": name, "line": line_of(n), "kind": "member" if k == "field_declaration" else "decl",
-                    "type": "auto" if auto_decl else base_type(txt(src, t)), "form": form, "err": err, "fields": fields,
-                    "deferred": sorted(set(reason + (["auto-init"] if auto_decl else []))),
-                })
+            constructions.extend(process_declaration(env, n))
         elif k == "compound_literal_expression" or (k == "call_expression" and fld(n, "function") is not None
                                                     and kind(fld(n, "function")) in ("identifier", "type_identifier",
                                                                                      "qualified_identifier")
@@ -1049,7 +1665,7 @@ def scan_file(rel, src, ctx):
             val = fld(n, "value") if k == "compound_literal_expression" else None
             reason = []
             if val is not None and kind(val) == "initializer_list":
-                init_fields(src, val, fields, copied)
+                init_fields(env, val, base_type(txt(src, t)), fields, copied)
             elif k == "call_expression":
                 args = fld(n, "arguments")
                 if args is not None and any(_a(c, "is_named") for c in kids(args)):
@@ -1058,10 +1674,11 @@ def scan_file(rel, src, ctx):
                 fields[f].sort()
             tn = base_type(txt(src, t))
             constructions.append({
-                "key": key_for(func, kind(n), "<temp %s>" % tn, txt(src, n)), "func": func, "var": "<temp>",
+                "key": env.key_for(func, kind(n), "<temp %s>" % tn, txt(src, n)), "func": func, "var": "<temp>",
                 "line": line_of(n), "kind": "temp", "type": tn, "form": "braced", "err": has_error_ancestor(n),
                 "fields": fields,
                 "deferred": sorted(set(reason + ["positional-init" if c == "positional" else c + "-copied" for c in copied])),
+                "pass": False, "needs_cohort": False, "wrapper_inputs": [],
             })
         elif k == "return_statement":
             lst = [c for c in kids(n) if kind(c) == "initializer_list"]
@@ -1109,6 +1726,14 @@ def scan_file(rel, src, ctx):
                              "form": "call" if is_call else "name",
                              "nodekind": "call_expression" if is_call else "identifier",
                              "text": txt(src, top) if is_call else txt(src, n), "err": has_error_ancestor(n)})
+        if rel != DPCT_HOME and k in ("identifier", "field_identifier", "type_identifier") \
+                and (txt(src, n) in DPCT_FUNCS or (k == "type_identifier" and txt(src, n) in DPCT_CLASSES)) \
+                and kind(parent(n)) != "function_declarator":
+            top, is_call = callee_ident(src, n)
+            raws.append({"func": enclosing(src, n), "name": txt(src, n), "line": line_of(n),
+                         "form": "call" if is_call else "name",
+                         "nodekind": "call_expression" if is_call else k,
+                         "text": txt(src, top) if is_call else txt(src, n), "err": has_error_ancestor(n)})
         if k in ("type_identifier", "identifier") and txt(src, n) in all_types:
             if has_error_ancestor(n) or _a(n, "is_missing"):
                 errtoks.append({"func": enclosing(src, n), "tok": txt(src, n), "line": line_of(n)})
@@ -1117,6 +1742,8 @@ def scan_file(rel, src, ctx):
                 if role in FINDING_ROLES:
                     forms.append({"func": enclosing(src, n), "role": role, "tok": txt(src, n), "line": line_of(n),
                                   "text": txt(src, statement_of(n))})
+
+    constructions.extend(param_and_stray_records(env, root))
 
     clean = blank_comments_strings(src, root)
     lexical = []
@@ -1166,7 +1793,7 @@ def lexical_scan(src, clean, value_types):
 
 
 def facts_for(rel, src, ctx):
-    key = (rel, _sha(src), ctx.digest)
+    key = (rel, _sha(src), ctx.file_key(file_idents(src)))
     if key not in _FACTS:
         _FACTS[key] = scan_file(rel, src, ctx)
     return _FACTS[key]
@@ -1211,9 +1838,23 @@ def judge(c):
             out.append(("D-ZONE-COUNT", "the last prefer_vram_zone write names COUNT (arena bypass)"))
         if forbid_ws and forbid_ws[-1][1] == "false":
             out.append(("D-FORBID-FALSE", "the last forbid_vram_zone_spill write is false"))
+    for inp in [c["wrapper_inputs"]] if c["wrapper_inputs"] else []:
+        # a wrapper that builds one site-carrying request type from another copies the input's site (witness 24)
+        miss = [f for f in SITE_FIELDS
+                if not any(not x[2] and any(re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(i), x[3]) for i in inp)
+                           for x in w.get(f, []))]
+        if miss:
+            out.append(("C-SITE", "built from %s but %s not copied from it by an unconditional assignment; the allocator "
+                                  "would report this wrapper's line, not the caller's construction"
+                        % (", ".join(inp), " and ".join(miss) + (" is" if len(miss) == 1 else " are"))))
+    if c["needs_cohort"] and not established(w.get("cohort_id", []), "lit"):
+        out.append(("C-COHORT", "a copy that is handed on must assign its own cohort_id literal; it inherits its source's "
+                                "site, so without one its trace and refusal lines read as the original's"))
     if c["deferred"]:
         out.append(("DEFER-C", "built from a copy or call (%s); clause (c) will follow it" % ",".join(c["deferred"])))
         return out
+    if c["form"] == "stray" or c["pass"]:
+        return out  # a pass-through's tier and zone are the caller's, judged at the caller's construction
     if dev and host:
         out.append(("B-TIER", "both must_device and must_host_pinned are established true; the tier is not decidable"))
         return out
@@ -1222,8 +1863,10 @@ def judge(c):
                               "last write; unified_select_tier may turn it into HOST"))
         return out
     other_name = "must_device" if host else "must_host_pinned"
-    if any(x[1] != "false" for x in w.get(other_name, [])):
-        # a conditional true, or a non-literal, can make the request the other tier; only a literal false is harmless
+    ows = w.get(other_name, [])
+    if ows and not (ows[-1][1] == "false" and not ows[-1][2]):
+        # a write that is a conditional, a non-literal or a true can make the request the other tier unless an
+        # unconditional literal false comes after it (a copy may inherit such a write and overwrite it)
         out.append(("B-TIER", "%s has a write that is not a literal false (a conditional true or a non-literal), so the "
                               "tier is not decidable" % other_name))
         return out
@@ -1512,6 +2155,15 @@ WITNESSES = {
     "r3i2": "braced arguments in constructor and new forms", "r3m1": "parenthesised left sides",
     "r3n": "raw strings split across adjacent literals; compound macro writes",
     "f": "missing tree_sitter_language_pack exits 1", "cmake": "the ctest never passes a regeneration flag",
+    "10": "a helper writing COUNT through a by-reference request fails at the caller",
+    "11": "a helper writing forbid false (or a conditional other tier) through a by-reference request fails at the caller",
+    "17": "a copy is a construction of its own and must assign its own cohort literal",
+    "24": "a wrapper building one request type from another copies the input's site_file and site_line",
+    "s2b-alias": "a write through a reference or pointer alias of a request is a write to it",
+    "s2b-member": "COUNT or forbid false written to a member, through this->, a holder or a by-value parameter",
+    "s2b-firstuse": "the address of a scalar field or a method call on the request is a first handoff",
+    "s2b-dpct": "dpct entry points are forbidden names outside dpct/helper.hpp; its three sites are pinned by function and count",
+    "s2b-chain": "the raw chain's three links are allowlisted by name and exact count",
 }
 WITNESSES_DEFERRED = {"9": "S2d: dormant clause; its *_bytes() subjects are absent from the tree"}
 
@@ -1786,13 +2438,17 @@ def matrix_cases():
     A(Case("r2i1", "device request with the other flag written literal false (control)", plant(good_device(
         "zzplant_r2i1", "    req.intent.constraints.must_host_pinned = false;\n")), "PASS"))
     # r2 I-2: whole-object assignment is a copy
-    A(Case("r2i2", "req = {} after good flags", plant(good_device("zzplant_r2i2", "    req = {};\n")),
-           "FAIL", "DEFER-C", "zzplant_r2i2"))
-    A(Case("r2i2", "req = other_request after good flags", plant(
-        "void zzplant_r2i2(const %s & other) {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+    A(Case("r2i2", "req = {} after good flags (the reset discards them)", plant(good_device("zzplant_r2i2", "    req = {};\n")),
+           "FAIL", "B-TIER", "zzplant_r2i2"))
+    A(Case("r2i2", "req = other_request after good flags (a local source with no flags discards them)", plant(
+        "void zzplant_r2i2() {\n    %s other{};\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
         "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
         "    req.intent.constraints.forbid_vram_zone_spill = true;\n    req = other;\n}\n" % (REQ, REQ)),
-        "FAIL", "DEFER-C", "zzplant_r2i2"))
+        "FAIL", "B-TIER", "zzplant_r2i2"))
+    A(Case("r2i2", "req = a parameter after good flags is a pass-through of the caller's request (control)", plant(
+        "void zzplant_r2i2(const %s & other) {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n    req = other;\n}\n" % (REQ, REQ)), "PASS"))
     A(Case("r2i2", "req = a request-returning call after good flags", plant(good_device(
         "zzplant_r2i2", "    req = zz_make();\n")), "FAIL", "DEFER-C", "zzplant_r2i2"))
     # r2 I-3: constructions that carry no request-type token
@@ -1902,10 +2558,10 @@ def matrix_cases():
         "zzplant_r3i2d", "    ggml_sycl::scoped_unified_alloc s(req);\n")), "PASS"))
     # r3 M-1: parentheses around the left side
     A(Case("r3m1", "(req) = other after good writes", plant(
-        "void zzplant_r3m1a(const %s & o) {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "void zzplant_r3m1a() {\n    %s o{};\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
         "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
         "    req.intent.constraints.forbid_vram_zone_spill = true;\n    (req) = o;\n}\n" % (REQ, REQ)),
-        "FAIL", "DEFER-C", "zzplant_r3m1a"))
+        "FAIL", "B-TIER", "zzplant_r3m1a"))
     A(Case("r3m1", "(req).intent...forbid = false after good writes", plant(good_device(
         "zzplant_r3m1b", "    (req).intent.constraints.forbid_vram_zone_spill = false;\n")), "FAIL", "D-FORBID-FALSE", "zzplant_r3m1b"))
     A(Case("r3m1", "every write through parentheses (control)", plant(
@@ -1924,6 +2580,288 @@ def matrix_cases():
     A(Case("r3n", "a #define with a relational compare is not a write (control)", plant(
         "#define ZZ_LE(r) (r.intent.constraints.cascade_step <= 1 && r.intent.constraints.cascade_step != 2)\n"),
         "PASS", planted=False))
+    # ---- S2b: clause (c). The value is followed through by-reference callees, copies, helper returns and aliases.
+    ZN = "ggml_sycl::vram_zone_id::"
+    DEVF = ("    req.intent.constraints.must_device = true;\n"
+            "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+            "    req.intent.constraints.forbid_vram_zone_spill = true;\n")
+
+    def caller(name, stmts, flags=DEVF, handoff="    ggml_sycl::unified_allocate(req);\n", params=""):
+        return "void %s(%s) {\n    %s req{};\n%s%s%s}\n" % (name, params, REQ, flags, stmts, handoff)
+
+    # 10: a helper that writes COUNT into a request it takes by reference fails at the caller
+    h10 = "static void zzhelper_w10(%s & r) {\n    r.intent.constraints.prefer_vram_zone = " + ZN + "COUNT;\n}\n"
+    A(Case("10", "a helper writing COUNT through a reference parameter, called after good flags",
+           plant(h10 % REQ + caller("zzplant_w10", "    zzhelper_w10(req);\n")), "FAIL", "D-ZONE-COUNT", "zzplant_w10"))
+    A(Case("10", "the same helper reached through a pointer parameter and `&req`", plant(
+        "static void zzhelper_w10(%s * r) {\n    r->intent.constraints.prefer_vram_zone = " % REQ + ZN + "COUNT;\n}\n"
+        + caller("zzplant_w10", "    zzhelper_w10(&req);\n")), "FAIL", "D-ZONE-COUNT", "zzplant_w10"))
+    A(Case("10", "the helper takes the constraints sub-object and the caller passes req.intent.constraints", plant(
+        "static void zzhelper_w10(ggml_sycl::alloc_constraints & c) {\n    c.prefer_vram_zone = " + ZN + "COUNT;\n}\n"
+        + caller("zzplant_w10", "    zzhelper_w10(req.intent.constraints);\n")), "FAIL", "D-ZONE-COUNT", "zzplant_w10"))
+    A(Case("10", "a helper that forwards the request to a second helper that writes COUNT", plant(
+        h10 % REQ + "static void zzhelper_w10b(%s & r) {\n    zzhelper_w10(r);\n}\n" % REQ
+        + caller("zzplant_w10", "    zzhelper_w10b(req);\n")), "FAIL", "D-ZONE-COUNT", "zzplant_w10"))
+    A(Case("10", "a helper whose COUNT write sits under a condition", plant(
+        "static void zzhelper_w10(%s & r, bool b) {\n    if (b) r.intent.constraints.prefer_vram_zone = " % REQ + ZN + "COUNT;\n}\n"
+        + caller("zzplant_w10", "    zzhelper_w10(req, true);\n")), "FAIL", "D-ZONE-COUNT", "zzplant_w10"))
+    A(Case("10", "a helper writing a non-COUNT zone through a reference (control)", plant(
+        "static void zzhelper_w10(%s & r) {\n    r.intent.constraints.prefer_vram_zone = " % REQ + ZN + "KV;\n}\n"
+        + caller("zzplant_w10", "    zzhelper_w10(req);\n")), "PASS"))
+    A(Case("10", "a helper that establishes the tier, zone and forbid for a bare request (control)", plant(
+        "static void zzhelper_w10(%s & r) {\n    r.intent.constraints.must_device = true;\n    r.intent.constraints.prefer_vram_zone = " % REQ
+        + ZN + "RUNTIME;\n    r.intent.constraints.forbid_vram_zone_spill = true;\n}\n"
+        + caller("zzplant_w10", "    zzhelper_w10(req);\n", flags="")), "PASS"))
+    A(Case("10", "a helper taking the request by const reference writes nothing (control)", plant(
+        "static void zzhelper_w10(const %s & r) {\n    (void) r;\n}\n" % REQ + caller("zzplant_w10", "    zzhelper_w10(req);\n")),
+        "PASS"))
+    A(Case("10", "a helper that writes through a reference after the request was handed to an allocator", plant(
+        h10 % REQ + caller("zzplant_w10", "", handoff="    ggml_sycl::unified_allocate(req);\n    zzhelper_w10(req);\n")),
+        "FAIL", "D-ZONE-COUNT", "zzplant_w10"))
+    # 11: a helper that writes forbid_vram_zone_spill = false fails at the caller
+    h11 = "static void zzhelper_w11(%s & r) {\n    r.intent.constraints.forbid_vram_zone_spill = false;\n}\n"
+    A(Case("11", "a helper writing forbid = false through a reference parameter", plant(
+        h11 % REQ + caller("zzplant_w11", "    zzhelper_w11(req);\n")), "FAIL", "D-FORBID-FALSE", "zzplant_w11"))
+    A(Case("11", "a helper writing a conditional must_host_pinned = true makes the tier undecidable", plant(
+        "static void zzhelper_w11(%s & r, bool b) {\n    if (b) r.intent.constraints.must_host_pinned = true;\n}\n" % REQ
+        + caller("zzplant_w11", "    zzhelper_w11(req, true);\n")), "FAIL", "B-TIER", "zzplant_w11"))
+    A(Case("11", "a helper writing forbid = true through a reference (control)", plant(
+        "static void zzhelper_w11(%s & r) {\n    r.intent.constraints.forbid_vram_zone_spill = true;\n}\n" % REQ
+        + caller("zzplant_w11", "    zzhelper_w11(req);\n", flags=DEVF.replace("    req.intent.constraints.forbid_vram_zone_spill = true;\n", ""))),
+        "PASS"))
+    A(Case("11", "a helper that reassigns the whole request it was given is opaque to the caller", plant(
+        "static void zzhelper_w11(%s & r) {\n    r = {};\n}\n" % REQ + caller("zzplant_w11", "    zzhelper_w11(req);\n")),
+        "FAIL", "DEFER-C", "zzplant_w11"))
+
+    # 17: a copy is a construction of its own and must assign its own cohort literal
+    cp = "    ggml_sycl::alloc_request tp_req = req;\n    tp_req.queue = nullptr;\n"
+    cp_hand = "    ggml_sycl::alloc_handle h{};\n    ggml_sycl::unified_alloc(tp_req, &h);\n"
+    A(Case("17", "a copy of a good request with no cohort of its own reaches unified_alloc (the tp_req shape)", plant(
+        "void zzplant_w17() {\n    %s req{};\n%s%s%s}\n" % (REQ, DEVF, cp, cp_hand)), "FAIL", "C-COHORT", "zzplant_w17"))
+    A(Case("17", "a copy of a request with no zone or forbid, even with a cohort of its own", plant(
+        "void zzplant_w17() {\n    %s req{};\n    req.intent.constraints.must_device = true;\n%s"
+        "    tp_req.intent.cohort_id = \"zz-tp\";\n%s}\n" % (REQ, cp, cp_hand)), "FAIL", "D-ZONE", "zzplant_w17"))
+    A(Case("17", "the same copy with its own cohort literal (control: today's tp_req once converted)", plant(
+        "void zzplant_w17() {\n    %s req{};\n%s%s    tp_req.intent.cohort_id = \"zz-tp\";\n%s}\n" % (REQ, DEVF, cp, cp_hand)),
+        "PASS"))
+    A(Case("17", "a copy by assignment (`T tp{}; tp = req;`) with no cohort", plant(
+        "void zzplant_w17() {\n    %s req{};\n%s    %s tp_req{};\n    tp_req = req;\n%s}\n" % (REQ, DEVF, REQ, cp_hand)),
+        "FAIL", "C-COHORT", "zzplant_w17"))
+    A(Case("17", "a copy by assignment with its own cohort literal (control)", plant(
+        "void zzplant_w17() {\n    %s req{};\n%s    %s tp_req{};\n    tp_req = req;\n    tp_req.intent.cohort_id = \"zz-tp\";\n%s}\n"
+        % (REQ, DEVF, REQ, cp_hand)), "PASS"))
+    A(Case("17", "`auto tp_req = req` with no cohort", plant(
+        "void zzplant_w17() {\n    %s req{};\n%s    auto tp_req = req;\n%s}\n" % (REQ, DEVF, cp_hand)),
+        "FAIL", "C-COHORT", "zzplant_w17"))
+    A(Case("17", "a copy through std::move with no cohort", plant(
+        "void zzplant_w17() {\n    %s req{};\n%s    %s tp_req = std::move(req);\n%s}\n" % (REQ, DEVF, REQ, cp_hand)),
+        "FAIL", "C-COHORT", "zzplant_w17"))
+    A(Case("17", "a copy whose cohort is a variable, not a literal", plant(
+        "void zzplant_w17(const char * name) {\n    %s req{};\n%s%s    tp_req.intent.cohort_id = name;\n%s}\n"
+        % (REQ, DEVF, cp, cp_hand)), "FAIL", "C-COHORT", "zzplant_w17"))
+    A(Case("17", "a copy whose cohort literal is written under a condition", plant(
+        "void zzplant_w17(bool b) {\n    %s req{};\n%s%s    if (b) tp_req.intent.cohort_id = \"zz-tp\";\n%s}\n"
+        % (REQ, DEVF, cp, cp_hand)), "FAIL", "C-COHORT", "zzplant_w17"))
+    A(Case("17", "a copy of a copy needs its own cohort too", plant(
+        "void zzplant_w17() {\n    %s req{};\n%s%s    tp_req.intent.cohort_id = \"zz-tp\";\n"
+        "    %s tp2_req = tp_req;\n    ggml_sycl::alloc_handle h{};\n    ggml_sycl::unified_alloc(tp2_req, &h);\n}\n"
+        % (REQ, DEVF, cp, REQ)), "FAIL", "C-COHORT", "zzplant_w17"))
+    A(Case("17", "a copy that is never handed on reaches no allocator (control)", plant(
+        "void zzplant_w17() {\n    %s req{};\n%s    %s tp_req = req;\n    (void) tp_req.size;\n}\n" % (REQ, DEVF, REQ)),
+        "PASS"))
+    A(Case("17", "a copy that writes COUNT to the zone", plant(
+        "void zzplant_w17() {\n    %s req{};\n%s%s    tp_req.intent.cohort_id = \"zz-tp\";\n"
+        "    tp_req.intent.constraints.prefer_vram_zone = " % (REQ, DEVF, cp) + ZN + "COUNT;\n" + cp_hand + "}\n"),
+        "FAIL", "D-ZONE-COUNT", "zzplant_w17"))
+    A(Case("17", "a copy that turns a device request into a host one and says so (control)", plant(
+        "void zzplant_w17() {\n    %s req{};\n%s%s    tp_req.intent.cohort_id = \"zz-tp\";\n"
+        "    tp_req.intent.constraints.must_device = false;\n    tp_req.intent.constraints.must_host_pinned = true;\n%s}\n"
+        % (REQ, DEVF, cp, cp_hand)), "PASS"))
+    A(Case("17", "a copy that adds the host tier without clearing the device tier", plant(
+        "void zzplant_w17() {\n    %s req{};\n%s%s    tp_req.intent.cohort_id = \"zz-tp\";\n"
+        "    tp_req.intent.constraints.must_host_pinned = true;\n%s}\n" % (REQ, DEVF, cp, cp_hand)),
+        "FAIL", "B-TIER", "zzplant_w17"))
+    # copies of a parameter, and an intent taken from a helper's return
+    A(Case("17", "a copy of the caller's request (a wrapper) takes no cohort and no flags of its own (control)", plant(
+        "void zzplant_w17(const %s & in) {\n    %s req = in;\n    req.size = 1;\n    ggml_sycl::unified_allocate(req);\n}\n"
+        % (REQ, REQ)), "PASS"))
+    A(Case("17", "a copy of the caller's request that writes COUNT", plant(
+        "void zzplant_w17(const %s & in) {\n    %s req = in;\n    req.intent.constraints.prefer_vram_zone = " % (REQ, REQ)
+        + ZN + "COUNT;\n    ggml_sycl::unified_allocate(req);\n}\n"), "FAIL", "D-ZONE-COUNT", "zzplant_w17"))
+    A(Case("17", "a copy of the caller's request whose constraints are then wiped by a braced reset", plant(
+        "void zzplant_w17(const %s & in) {\n    %s req = in;\n    req.intent.constraints = {};\n"
+        "    ggml_sycl::unified_allocate(req);\n}\n" % (REQ, REQ)), "FAIL", "B-TIER", "zzplant_w17"))
+    mk_good = ("static ggml_sycl::alloc_intent zzmk_w17(const char * c) {\n    ggml_sycl::alloc_intent intent{};\n"
+               "    intent.cohort_id = c;\n    intent.constraints.must_device = true;\n"
+               "    intent.constraints.prefer_vram_zone = " + ZN + "RUNTIME;\n"
+               "    intent.constraints.forbid_vram_zone_spill = true;\n    return intent;\n}\n")
+    A(Case("17", "an intent taken from a helper that returns a fully established one (control)", plant(
+        mk_good + "void zzplant_w17() {\n    %s req{};\n    req.intent = zzmk_w17(\"zz\");\n    ggml_sycl::unified_allocate(req);\n}\n" % REQ),
+        "PASS"))
+    A(Case("17", "an intent taken from a helper that returns a COUNT zone", plant(
+        mk_good.replace(ZN + "RUNTIME", ZN + "COUNT") + "void zzplant_w17() {\n    %s req{};\n    req.intent = zzmk_w17(\"zz\");\n"
+        "    ggml_sycl::unified_allocate(req);\n}\n" % REQ), "FAIL", "D-ZONE-COUNT", "zzplant_w17"))
+    A(Case("17", "an intent taken from a helper with two returns stays opaque", plant(
+        mk_good.replace("    return intent;\n", "    if (c) return intent;\n    return intent;\n")
+        + "void zzplant_w17() {\n    %s req{};\n    req.intent = zzmk_w17(\"zz\");\n    ggml_sycl::unified_allocate(req);\n}\n" % REQ),
+        "FAIL", "DEFER-C", "zzplant_w17"))
+    # 24: a wrapper that builds one request type from another copies the input's site
+    wrap = ("ggml_sycl::mem_handle zzwrap_w24(const ggml_sycl::alloc_intent & intent) {\n    %s req{};\n    req.intent = intent;\n%s"
+            "    return ggml_sycl::unified_allocate(req);\n}\n")
+    site_both = "    req.site_file = intent.site_file;\n    req.site_line = intent.site_line;\n"
+    A(Case("24", "a wrapper from alloc_intent to alloc_request with both site fields copied (control)", plant(
+        wrap % (REQ, site_both)), "PASS"))
+    A(Case("24", "the same wrapper copying neither site field", plant(wrap % (REQ, "")), "FAIL", "C-SITE", "zzwrap_w24"))
+    A(Case("24", "the same wrapper copying only site_file", plant(wrap % (REQ, "    req.site_file = intent.site_file;\n")),
+           "FAIL", "C-SITE", "zzwrap_w24"))
+    A(Case("24", "the same wrapper copying only site_line", plant(wrap % (REQ, "    req.site_line = intent.site_line;\n")),
+           "FAIL", "C-SITE", "zzwrap_w24"))
+    A(Case("24", "a site copy under a condition does not count", plant(
+        wrap % (REQ, "    if (intent.site_line) { req.site_file = intent.site_file; req.site_line = intent.site_line; }\n")),
+        "FAIL", "C-SITE", "zzwrap_w24"))
+    A(Case("24", "a site taken from the wrapper's own line, not its input's", plant(
+        wrap % (REQ, "    req.site_file = __FILE__;\n    req.site_line = __LINE__;\n")), "FAIL", "C-SITE", "zzwrap_w24"))
+    A(Case("24", "the nested intent's site copied instead of the request's own", plant(
+        wrap % (REQ, "    req.intent.site_file = intent.site_file;\n    req.intent.site_line = intent.site_line;\n")),
+        "FAIL", "C-SITE", "zzwrap_w24"))
+    A(Case("24", "an offload_buffer_request wrapper that copies neither", plant(
+        "void zzwrap_w24(const ggml_sycl::offload_buffer_request & in) {\n    %s areq{};\n    areq.size = in.size;\n"
+        "    areq.intent = in.intent;\n    ggml_sycl::unified_allocate(areq);\n}\n" % REQ), "FAIL", "C-SITE", "zzwrap_w24"))
+    A(Case("24", "an offload_buffer_request wrapper that copies both (control)", plant(
+        "void zzwrap_w24(const ggml_sycl::offload_buffer_request & in) {\n    %s areq{};\n    areq.size = in.size;\n"
+        "    areq.intent = in.intent;\n    areq.site_file = in.site_file;\n    areq.site_line = in.site_line;\n    ggml_sycl::unified_allocate(areq);\n}\n" % REQ),
+        "PASS"))
+    A(Case("24", "a function taking a request and building one of the same type owes no site copy (control)", plant(
+        "void zzwrap_w24(const %s & in) {\n    %s req = in;\n    req.size = in.size;\n    ggml_sycl::unified_allocate(req);\n}\n"
+        % (REQ, REQ)), "PASS"))
+    # ---- S2b: the gaps S2a listed. Aliases, members, parameters and the first handoff.
+    ROUTE = "ggml_sycl::vram_zone_id::RUNTIME"
+    A(Case("s2b-alias", "a constraints reference written COUNT through the alias", plant(good_device(
+        "zzplant_alias", "    ggml_sycl::alloc_constraints & c = req.intent.constraints;\n    c.prefer_vram_zone = " + ZN + "COUNT;\n")),
+        "FAIL", "D-ZONE-COUNT", "zzplant_alias"))
+    A(Case("s2b-alias", "a pointer to the constraints written forbid = false through `p->`", plant(good_device(
+        "zzplant_alias", "    auto * p = &req.intent.constraints;\n    p->forbid_vram_zone_spill = false;\n")),
+        "FAIL", "D-FORBID-FALSE", "zzplant_alias"))
+    A(Case("s2b-alias", "a pointer to the whole request written COUNT through `p->intent...`", plant(good_device(
+        "zzplant_alias", "    %s * p = &req;\n    p->intent.constraints.prefer_vram_zone = %sCOUNT;\n" % (REQ, ZN))),
+        "FAIL", "D-ZONE-COUNT", "zzplant_alias"))
+    A(Case("s2b-alias", "an alias of an alias written COUNT", plant(good_device(
+        "zzplant_alias", "    auto & in = req.intent;\n    auto & c = in.constraints;\n    c.prefer_vram_zone = " + ZN + "COUNT;\n")),
+        "FAIL", "D-ZONE-COUNT", "zzplant_alias"))
+    A(Case("s2b-alias", "a dereferenced alias `(*p).intent...` written COUNT", plant(good_device(
+        "zzplant_alias", "    %s * p = &req;\n    (*p).intent.constraints.prefer_vram_zone = %sCOUNT;\n" % (REQ, ZN))),
+        "FAIL", "D-ZONE-COUNT", "zzplant_alias"))
+    A(Case("s2b-alias", "every flag established through a constraints alias (control)", plant(
+        "void zzplant_alias() {\n    %s req{};\n    ggml_sycl::alloc_constraints & c = req.intent.constraints;\n"
+        "    c.must_device = true;\n    c.prefer_vram_zone = %s;\n    c.forbid_vram_zone_spill = true;\n"
+        "    ggml_sycl::unified_allocate(req);\n}\n" % (REQ, ROUTE)), "PASS"))
+    A(Case("s2b-alias", "the alias's own initialiser does not hand the request over (control)", plant(
+        "void zzplant_alias() {\n    %s req{};\n    ggml_sycl::alloc_constraints * p = &req.intent.constraints;\n"
+        "    p->must_device = true;\n    p->prefer_vram_zone = %s;\n    p->forbid_vram_zone_spill = true;\n"
+        "    ggml_sycl::unified_allocate(req);\n}\n" % (REQ, ROUTE)), "PASS"))
+    A(Case("s2b-alias", "an alias of a holder's member written COUNT (no request of its own to blame)", plant(
+        "struct zzholder { %s r{}; };\nvoid zzplant_alias(zzholder & h) {\n    ggml_sycl::alloc_constraints & c = h.r.intent.constraints;\n"
+        "    c.prefer_vram_zone = %sCOUNT;\n}\n" % (REQ, ZN)), "FAIL", "D-ZONE-COUNT", "zzplant_alias"))
+    A(Case("s2b-alias", "an alias of a holder's member written a real zone (control)", plant(
+        "struct zzholder { %s r{}; };\nvoid zzplant_alias(zzholder & h) {\n    ggml_sycl::alloc_constraints & c = h.r.intent.constraints;\n"
+        "    c.prefer_vram_zone = %s;\n}\n" % (REQ, ROUTE)), "PASS", planted=False))
+    A(Case("s2b-member", "a method writing COUNT to a request member", plant(
+        "struct zzmember { %s r{};\n    void zzf() { r.intent.constraints.prefer_vram_zone = %sCOUNT; }\n};\n" % (REQ, ZN)),
+        "FAIL", "D-ZONE-COUNT", "zzmember::zzf"))
+    A(Case("s2b-member", "a method writing forbid = false through `this->`", plant(
+        "struct zzmember { %s r{};\n    void zzf() { this->r.intent.constraints.forbid_vram_zone_spill = false; }\n};\n" % REQ),
+        "FAIL", "D-FORBID-FALSE", "zzmember::zzf"))
+    A(Case("s2b-member", "a free function writing COUNT through a pointer to a holder", plant(
+        "struct zzholder { %s r{}; };\nvoid zzplant_member(zzholder * h) {\n    h->r.intent.constraints.prefer_vram_zone = %sCOUNT;\n}\n"
+        % (REQ, ZN)), "FAIL", "D-ZONE-COUNT", "zzplant_member"))
+    A(Case("s2b-member", "a file-scope request written forbid = false", plant(
+        "static %s zzglobal{};\nvoid zzplant_member() {\n    zzglobal.intent.constraints.forbid_vram_zone_spill = false;\n}\n" % REQ),
+        "FAIL", "D-FORBID-FALSE", "zzplant_member"))
+    A(Case("s2b-member", "a method writing a real zone and forbid = true to a member (control)", plant(
+        "struct zzmember { %s r{};\n    void zzf() { r.intent.constraints.prefer_vram_zone = %s;\n"
+        "        this->r.intent.constraints.forbid_vram_zone_spill = true; }\n};\n" % (REQ, ROUTE)), "PASS", planted=False))
+    A(Case("s2b-member", "a by-value request parameter written COUNT", plant(
+        "void zzplant_member(%s req) {\n    req.intent.constraints.prefer_vram_zone = %sCOUNT;\n    ggml_sycl::unified_allocate(req);\n}\n"
+        % (REQ, ZN)), "FAIL", "D-ZONE-COUNT", "zzplant_member"))
+    A(Case("s2b-member", "a by-value request parameter whose only writes are not flags (control)", plant(
+        "void zzplant_member(%s req) {\n    req.size = 4;\n    ggml_sycl::unified_allocate(req);\n}\n" % REQ), "PASS", planted=False))
+    A(Case("s2b-member", "a by-value request parameter with a cohort and a real zone written (control)", plant(
+        "void zzplant_member(%s req) {\n    req.intent.cohort_id = \"zz\";\n    req.intent.constraints.prefer_vram_zone = %s;\n"
+        "    ggml_sycl::unified_allocate(req);\n}\n" % (REQ, ROUTE)), "PASS"))
+    # the first handoff: the address of a scalar field, and a method call on the request
+    pre = ("    req.intent.constraints.prefer_vram_zone = " + ROUTE + ";\n"
+           "    req.intent.constraints.forbid_vram_zone_spill = true;\n")
+    A(Case("s2b-firstuse", "the tier flag written after its address was handed to a function", plant(
+        "void zzplant_firstuse() {\n    %s req{};\n%s    zz_f(&req.intent.constraints.must_device);\n"
+        "    req.intent.constraints.must_device = true;\n    ggml_sycl::unified_allocate(req);\n}\n" % (REQ, pre)),
+        "FAIL", "B-TIER", "zzplant_firstuse"))
+    A(Case("s2b-firstuse", "the address handed over after every write (control)", plant(
+        "void zzplant_firstuse() {\n    %s req{};\n%s    req.intent.constraints.must_device = true;\n"
+        "    zz_f(&req.intent.constraints.must_device);\n    ggml_sycl::unified_allocate(req);\n}\n" % (REQ, pre)), "PASS"))
+    A(Case("s2b-firstuse", "the tier flag written after a method was called on the request", plant(
+        "void zzplant_firstuse() {\n    %s req{};\n%s    req.zz_m();\n"
+        "    req.intent.constraints.must_device = true;\n    ggml_sycl::unified_allocate(req);\n}\n" % (REQ, pre)),
+        "FAIL", "B-TIER", "zzplant_firstuse"))
+    A(Case("s2b-firstuse", "a method called on the sub-object after every write (control)", plant(
+        "void zzplant_firstuse() {\n    %s req{};\n%s    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.zz_m();\n    ggml_sycl::unified_allocate(req);\n}\n" % (REQ, pre)), "PASS"))
+    A(Case("s2b-firstuse", "a scalar field read before the tier write is not a handoff (control)", plant(
+        "void zzplant_firstuse() {\n    %s req{};\n%s    (void) req.intent.constraints.must_device;\n"
+        "    req.intent.constraints.must_device = true;\n    ggml_sycl::unified_allocate(req);\n}\n" % (REQ, pre)), "PASS"))
+    A(Case("s2b-firstuse", "documented gap: a reference bound to a scalar field is not followed (the gate passes it)", plant(
+        "void zzplant_firstuse() {\n    %s req{};\n%s    req.intent.constraints.must_device = true;\n"
+        "    bool & zz_ref = req.intent.constraints.must_device;\n    zz_ref = false;\n    ggml_sycl::unified_allocate(req);\n}\n"
+        % (REQ, pre)), "PASS"))
+    # S2b: dpct is sanctioned-vendored (rulings M247). Its three sites are allowlisted by function name and count;
+    # the entry points are forbidden names outside dpct/helper.hpp, matched as identifiers, never as substrings.
+    for nm in ("dpct_malloc", "dpct::dpct_malloc", "dpct::detail::dpct_malloc"):
+        A(Case("s2b-dpct", "a new caller of %s outside helper.hpp" % nm, plant(
+            "void zzplant_dpct(sycl::queue & q) {\n    void * p = %s(16, q);\n    (void) p;\n}\n" % nm),
+            "FAIL", "E-RAW", "dpct_malloc"))
+    for cls in ("device_memory", "global_memory", "constant_memory", "shared_memory"):
+        A(Case("s2b-dpct", "a new %s object outside helper.hpp" % cls, plant(
+            "void zzplant_dpct(sycl::queue & q) {\n    dpct::%s<int, 1> m(16);\n    (void) m;\n}\n" % cls),
+            "FAIL", "E-RAW", cls))
+    A(Case("s2b-dpct", "a new caller under dpct/ but not in helper.hpp", plant(
+        "inline void zzplant_dpct(sycl::queue & q) { void * p = dpct::dpct_malloc(16, q); (void) p; }\n",
+        name="dpct/zz-plant.hpp"), "FAIL", "E-RAW", "dpct_malloc"))
+    A(Case("s2b-dpct", "names that merely contain a dpct name are not hits (control)", plant(
+        "void zzplant_dpct_ok(sycl::queue & q) {\n    int my_dpct_malloc_count = 0;\n    int device_memory = 1;\n"
+        "    int shared_memory = 2;\n    int global_memory_total = 3;\n    struct zz_constant_memory_pool {} z;\n"
+        "    (void) my_dpct_malloc_count; (void) device_memory; (void) shared_memory; (void) global_memory_total; (void) z;\n}\n"),
+        "PASS", planted=False))
+    A(Case("s2b-dpct", "a comment and a string naming dpct_malloc are not hits (control)", plant(
+        "// dpct_malloc(16, q) and dpct::device_memory<int, 1>\n"
+        "void zzplant_dpct_ok() {\n    const char * s = \"dpct_malloc dpct::shared_memory\";\n    (void) s;\n}\n"),
+        "PASS", planted=False))
+    A(Case("s2b-dpct", "a second raw call inside dpct_malloc breaks its count pin", replace_in_function(
+        "dpct/helper.hpp", r"static inline void \*dpct_malloc\(size_t size", "return sycl::malloc_device(size, q.get_device(), q.get_context());",
+        "sycl::malloc_device(size, q.get_device(), q.get_context());\n            return sycl::malloc_device(size, q.get_device(), q.get_context());"),
+        "FAIL", "allowlist", "E-DPCT-MALLOC covers 2 finding(s) but pins 1"))
+    A(Case("s2b-dpct", "dpct_malloc's function renamed in helper.hpp leaves its entry matching nothing", replace_in_function(
+        "dpct/helper.hpp", r"static inline void \*(?=dpct_malloc\(size_t size)", "dpct_malloc(size_t size", "dpct_malloc_zz(size_t size"),
+        "FAIL", "allowlist", "E-DPCT-MALLOC"))
+    A(Case("s2b-dpct", "a third raw call added to device_memory::allocate_device breaks its pin", replace_in_function(
+        "dpct/helper.hpp", r"void allocate_device\(sycl::queue &q\)", "_device_ptr = (value_t *)detail::dpct_malloc(_size, q);",
+        "_device_ptr = (value_t *)sycl::malloc_device(_size, q.get_device(), q.get_context());\n"
+        "                _device_ptr = (value_t *)detail::dpct_malloc(_size, q);"),
+        "FAIL", "allowlist", "E-DPCT-DEVMEM-DEVICE covers 2 finding(s) but pins 1"))
+    A(Case("s2b-dpct", "a different raw name swapped into dpct_malloc keeps the count and FAILs", replace_in_function(
+        "dpct/helper.hpp", r"static inline void \*dpct_malloc\(size_t size", "sycl::malloc_device(size", "sycl::malloc_shared(size"),
+        "FAIL", "E-RAW", "malloc_shared"))
+    # S2b: the raw chain's three links are allowlisted by name and count (canonical contract sections 3 and 9.1)
+    A(Case("s2b-chain", "a second aligned_alloc_device call in sycl_aligned_malloc_device breaks its pin", replace_in_function(
+        "unified-cache.cpp", r"static void \* sycl_aligned_malloc_device\(size_t size, const sycl::queue & queue\) \{",
+        "aligned_alloc_device(", "aligned_alloc_device(0, 0, queue); aligned_alloc_device("),
+        "FAIL", "allowlist", "E-CHAIN-ALIGNED covers 2 finding(s) but pins 1"))
+    A(Case("s2b-chain", "a second link call in unified_cache_raw_malloc_device breaks its pin", replace_in_function(
+        "unified-cache.cpp", r"void \* unified_cache_raw_malloc_device\(size_t size, const sycl::queue & queue\) \{",
+        "ptr = sycl_aligned_malloc_device(size, queue);",
+        "ptr = sycl_aligned_malloc_device(size, queue);\n        ptr = sycl_aligned_malloc_device(size, queue);"),
+        "FAIL", "allowlist", "E-CHAIN-RAW covers 2 finding(s) but pins 1"))
+    A(Case("s2b-chain", "a new caller of the chain's raw wrapper in another function is a finding", plant(
+        "void zzplant_chain(const sycl::queue & q) {\n    void * p = unified_cache_raw_malloc_device(16, q);\n    (void) p;\n}\n"),
+        "FAIL", "E-RAW", "unified_cache_raw_malloc_device"))
     return c
 
 

@@ -19,6 +19,60 @@
       "name": "sycl_aligned_malloc_device",
       "count": 2,
       "reason": "design 6.14 E-ARENA-BACKING: arena_reserve is the arena; its two backing allocations are what every zone is carved from"
+    },
+    {
+      "id": "E-CHAIN-ALIGNED",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "sycl_aligned_malloc_device",
+      "name": "aligned_alloc_device",
+      "count": 1,
+      "reason": "the aligned-allocation link of the raw chain: canonical contract section 3 (Allocator Entry Points, allowlist: unified_cache_raw_malloc_device is an allowed raw-malloc wrapper, internal to unified_cache) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway); 23mk census row :18789/:18830/:1433: the chain's own links, the raw layer, allowlisted by name with an exact count"
+    },
+    {
+      "id": "E-CHAIN-TRACKED",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache_malloc_device_tracked",
+      "name": "unified_cache_raw_malloc_device",
+      "count": 1,
+      "reason": "the tracked-allocation link of the raw chain: canonical contract section 3 (Allocator Entry Points, allowlist: unified_cache_raw_malloc_device is an allowed raw-malloc wrapper, internal to unified_cache) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway); 23mk census row :18789/:18830/:1433: the chain's own links, the raw layer, allowlisted by name with an exact count"
+    },
+    {
+      "id": "E-CHAIN-RAW",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache_raw_malloc_device",
+      "name": "sycl_aligned_malloc_device",
+      "count": 1,
+      "reason": "the raw-wrapper link of the raw chain: canonical contract section 3 (Allocator Entry Points, allowlist: unified_cache_raw_malloc_device is an allowed raw-malloc wrapper, internal to unified_cache) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway); 23mk census row :18789/:18830/:1433: the chain's own links, the raw layer, allowlisted by name with an exact count"
+    },
+    {
+      "id": "E-DPCT-MALLOC",
+      "code": "E-RAW",
+      "file": "dpct/helper.hpp",
+      "function": "dpct_malloc",
+      "name": "malloc_device",
+      "count": 1,
+      "reason": "dpct_malloc's one sycl::malloc_device call: rulings M247: dpct/helper.hpp is vendored upstream code and is not edited (rebase churn); the call is dead in-tree, reached only through dpct::device_memory and the dpct_malloc overloads (git grep 2026-10-01). The canonical contract has no row for it (sections 3, 8 and 9.1 checked in S2b), so this pin plus clause (e)'s forbidden dpct names outside dpct/helper.hpp (dpct_malloc, device_memory, global_memory, constant_memory, shared_memory) are what keep it dead"
+    },
+    {
+      "id": "E-DPCT-DEVMEM-DEVICE",
+      "code": "E-RAW",
+      "file": "dpct/helper.hpp",
+      "function": "device_memory::allocate_device",
+      "name": "malloc_device",
+      "count": 1,
+      "reason": "device_memory::allocate_device's device-read-only malloc_device call: rulings M247: dpct/helper.hpp is vendored upstream code and is not edited (rebase churn); the call is dead in-tree, reached only through dpct::device_memory and the dpct_malloc overloads (git grep 2026-10-01). The canonical contract has no row for it (sections 3, 8 and 9.1 checked in S2b), so this pin plus clause (e)'s forbidden dpct names outside dpct/helper.hpp (dpct_malloc, device_memory, global_memory, constant_memory, shared_memory) are what keep it dead"
+    },
+    {
+      "id": "E-DPCT-DEVMEM-SHARED",
+      "code": "E-RAW",
+      "file": "dpct/helper.hpp",
+      "function": "device_memory::allocate_device",
+      "name": "malloc_shared",
+      "count": 1,
+      "reason": "device_memory::allocate_device's malloc_shared call: rulings M247: dpct/helper.hpp is vendored upstream code and is not edited (rebase churn); the call is dead in-tree, reached only through dpct::device_memory and the dpct_malloc overloads (git grep 2026-10-01). The canonical contract has no row for it (sections 3, 8 and 9.1 checked in S2b), so this pin plus clause (e)'s forbidden dpct names outside dpct/helper.hpp (dpct_malloc, device_memory, global_memory, constant_memory, shared_memory) are what keep it dead"
     }
   ]
 }

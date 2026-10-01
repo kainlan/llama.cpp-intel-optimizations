@@ -11,6 +11,18 @@ llama.cpp-23mk S2). JSON has no comments, so each file also carries a `_doc` fie
 - `debt.json`: the tree's current violations, keyed by construction node. Shrink-only in both directions:
   a violation that is not listed fails, and a listed entry that no longer violates fails, naming it.
 
+Allowlist entries added in S2b (clause e): the raw allocator chain's three links in `unified-cache.cpp`
+(`E-CHAIN-ALIGNED`, `E-CHAIN-TRACKED`, `E-CHAIN-RAW`; canonical contract sections 3 and 9.1, 23mk census row
+`:18789/:18830/:1433`) and the three raw calls in vendored `dpct/helper.hpp` (`E-DPCT-MALLOC`,
+`E-DPCT-DEVMEM-DEVICE`, `E-DPCT-DEVMEM-SHARED`; rulings M247). Each pins its function and count, so a second call, a
+renamed function or a swapped allocator fails. The canonical contract has no row for dpct. Outside `dpct/helper.hpp`
+the names `dpct_malloc` (identifier) and `device_memory`, `global_memory`, `constant_memory`, `shared_memory` (type
+names) are clause (e) hits; a variable or parameter that is merely spelled `device_memory` is not.
+
+Finding codes added by clause (c): `C-COHORT` (a copy of a request that is handed on without its own cohort
+literal) and `C-SITE` (a wrapper from one request type to another that does not copy the source's site fields).
+`DEFER-C` now marks only what the gate still cannot follow (a helper with several returns, a lambda or function-pointer call).
+
 Every `E-RAW` debt entry also carries `fate` and `cite`. `fate` is `deleted-by-<step>`, `converted-by-<step>`,
 `sanctioned-internal`, `sanctioned-vendored` (upstream code we do not edit) or `pending-disposition`. A `sanctioned-internal` entry is one no step will ever shrink:
 it is a candidate for the allowlist, and moving it there is the lead's decision, not the implementer's.
