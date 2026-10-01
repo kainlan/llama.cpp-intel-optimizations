@@ -10,12 +10,22 @@
 // The refusal is injected below the context: the CPU device's get_buffer_type is replaced, in this
 // process only, by a wrapper buffer type that forwards to the CPU one, can cap its max buffer size
 // (which makes the scheduler plan many chunks, so a graph that differs from the last one allocates), and
-// refuses the n-th allocation request after being armed. The sweep is over n, so every request an update
-// makes -- the K-shift graph of each sub-cache and the post-update reserve -- is refused once.
+// refuses every allocation request from the n-th one after being armed, like an allocator that is out of
+// memory. The refusal is deliberately sticky: ggml_backend_sched_alloc_splits answers a failed
+// ggml_gallocr_alloc_graph (whose automatic reserve is the first request) with a second, explicit
+// ggml_gallocr_reserve_n, so a one-shot refusal is retried and succeeds, and the update correctly never fails
+// (measured: the first version of this test refused only request 0, the retry was request 1, and the update
+// returned DONE). The sweep is over n, so every request an update makes -- the K-shift graph of each
+// sub-cache and the post-update reserve -- starts a refusal once.
 //
 // Controls: a clean armed update must make at least one request (else the wrapper is not on the
 // scheduler's path and every "refused" arm below would be vacuous), and every refusing arm must report
-// that exactly one request was refused.
+// at least one refused request.
+//
+// Not covered here: llama_decode's second memory_update call (the retry after a FAILED_PREPARE slot search).
+// For these memories nothing can be pending there: the first call at the top of decode already consumed the
+// shift and the stream copies, and optimize is ignored by llama_kv_cache::init_update, so memory_update(true)
+// returns NONE. Its `-2` on FAILED and `continue` on DONE are pinned textually by gate 15.
 //
 // Not covered here: a post-update graph_reserve that THROWS. That needs an injected throw from inside the
 // memory or the graph build; gate 15 pins the try/catch textually. This test loads models, so it is
@@ -60,8 +70,8 @@ struct refusing_buft {
     ggml_backend_buffer_type   self  = {};
 
     bool    armed         = false;   // while armed the max buffer size is capped
-    size_t  armed_max     = 256 * 1024;
-    int64_t refuse_at     = -1;      // index among the requests made while armed; -1 refuses none
+    size_t  armed_max     = 1024 * 1024;
+    int64_t refuse_at     = -1;      // refuse every request from this index on, among those made while armed; -1 refuses none
     int     n_requests    = 0;       // requests made while armed
     int     n_refused     = 0;
     int     n_requests_all = 0;      // requests ever, armed or not (the on-path control)
@@ -89,7 +99,7 @@ static ggml_backend_buffer_t rb_alloc(ggml_backend_buffer_type_t, size_t size) {
     g_buft.n_requests_all++;
     if (g_buft.armed) {
         const int idx = g_buft.n_requests++;
-        if (g_buft.refuse_at == idx) {
+        if (g_buft.refuse_at >= 0 && idx >= g_buft.refuse_at) {
             g_buft.n_refused++;
             return nullptr;
         }
@@ -150,7 +160,23 @@ static const arch_case arch_cases[] = {
     { LLM_ARCH_QWEN3NEXT,  "qwen3next", false }, // hybrid: the attention part shifts, if the memory allows it
 };
 
-static constexpr uint32_t n_ubatch = 64;
+// llama_kv_cache::build_rope_shift rotates an f16/f32 K cache with ggml_rope_ext_inplace on the cache view:
+// no temporary, so the K-shift allocates nothing out of the reserved compute buffer and there is nothing to
+// refuse. Only a QUANTIZED K cache takes the other branch -- ggml_cast to f32, hadamard, rope, hadamard,
+// ggml_cpy back -- whose f32 temporary is n_ctx x n_embd_k_gqa x 4 bytes per layer. So the fixture's K type is
+// Q8_0, and n_ctx and n_ubatch are chosen so that temporary (8 MiB here) is far larger than the reserved pp
+// graph (n_ubatch tokens) and than the cap below: the update must grow the buffer, in many chunk requests.
+//
+// Flash attention is OFF in this fixture. In a SYCL build llama-graph.cpp casts Q to f16 at graph build, and
+// the CPU FA kernel accepts Q only as the K type's vec_dot_type or f32, so a Q8_0 K under CPU-executed FA
+// aborts ("fattn: unsupported Q-type"); that is llama.cpp-o6bi, not something this test works around. A
+// quantized K without FA is allowed (only a quantized V needs it), the non-FA path never builds that cast,
+// and build_rope_shift's quantized branch still forces the f32 temporary. This test is about the update-failure
+// plumbing, not about attention.
+static constexpr ggml_type type_k = GGML_TYPE_Q8_0;
+static constexpr uint32_t n_ctx    = 8192;
+static constexpr uint32_t n_batch  = 16;
+static constexpr uint32_t n_ubatch = 8;
 static constexpr int      n_prompt = 16;
 static constexpr int      n_keep   = 4;
 static constexpr int      n_discard = 4;
@@ -178,8 +204,10 @@ static bool build_fixture(const arch_case & ac, fixture & fx) {
     }
 
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx           = 256;
-    cp.n_batch         = n_ubatch;
+    cp.n_ctx           = n_ctx;
+    cp.type_k          = type_k;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.n_batch         = n_batch;
     cp.n_ubatch        = n_ubatch;
     cp.n_seq_max       = 1;
     cp.n_threads       = 4;
@@ -281,7 +309,7 @@ static void run_arch(const arch_case & ac) {
             const int  refused = g_buft.n_refused;
             g_buft.disarm();
 
-            CHECK(refused == 1, "%s k=%d: %d requests were refused, want exactly 1 (VOID if 0)", ac.name, k, refused);
+            CHECK(refused >= 1, "%s k=%d: %d requests were refused, want at least 1 (VOID if 0)", ac.name, k, refused);
             CHECK(res == LLAMA_MEMORY_UPDATE_FAILED, "%s k=%d: memory_update returned %s after a refused request, want FAILED",
                     ac.name, k, res_name(res));
 
@@ -307,11 +335,16 @@ static void run_arch(const arch_case & ac) {
             const int refused = g_buft.n_refused;
             g_buft.disarm();
 
-            CHECK(refused == 1, "%s k=%d: decode: %d requests were refused, want exactly 1 (VOID if 0)", ac.name, k, refused);
+            CHECK(refused >= 1, "%s k=%d: decode: %d requests were refused, want at least 1 (VOID if 0)", ac.name, k, refused);
             CHECK(rc == -2, "%s k=%d: llama_decode returned %d after a refused update allocation, want -2", ac.name, k, rc);
 
             const int rc2 = decode_n(fx.ctx.get(), 1, n_prompt);
             CHECK(rc2 == 0, "%s k=%d: the decode after the refusal returned %d, want 0", ac.name, k, rc2);
+
+            // that decode retried the pending shift and applied it: nothing is left to update
+            const auto after = fx.ctx->memory_update(false);
+            CHECK(after == LLAMA_MEMORY_UPDATE_NONE, "%s k=%d: after the recovering decode memory_update returned %s, want NONE (the shift is still pending)",
+                    ac.name, k, res_name(after));
         }
     }
 }
