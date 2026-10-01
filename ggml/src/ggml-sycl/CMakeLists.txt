@@ -132,6 +132,15 @@ if (BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-counter-dump.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
     set_tests_properties(test-sycl-counter-dump-gate PROPERTIES LABELS "sycl;source-contract;host")
+    # llama.cpp-23mk S3-3: the three oneDNN wrappers that ask get_scratchpad_mem (softmax, eltwise,
+    # binary_broadcast_row) return a [[nodiscard]] bool, decide a declined scratchpad before their first write to
+    # the output, and every caller falls through to its default path. Pure Python over source text, with its own
+    # mutants (a check that can no longer fail is itself a failure). Allocates nothing.
+    add_test(NAME test-sycl-dnnl-decline-consumers
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-dnnl-decline-consumers.py
+                --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
+    set_tests_properties(test-sycl-dnnl-decline-consumers PROPERTIES LABELS "sycl;source-contract;host" TIMEOUT 60)
     # llama.cpp-23mk S2: the allocation-zone contract. A tree-sitter parse of every non-test
     # ggml-sycl source; each request construction names its tier by literal, a device request names
     # its zone and forbids the spill, and raw allocator names stay inside the allowlisted functions.
