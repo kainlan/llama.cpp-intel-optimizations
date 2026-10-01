@@ -64120,39 +64120,25 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // FULL weight buffer pointer (same for every expert), which is wrong.
         // For non-MoE tensors, tensor storage and get_layout_ptr_for return the same thing.
 
-        // Determine the data layout: use forced_layout from mul_mat_id if provided,
-        // else check src0->extra->layout.mode, else default to AOS.
+        // Determine the layout of the bytes this path is about to decode: the forced layout from
+        // mul_mat_id if provided, else src0->extra->layout.mode, else AOS.  This is the ONE
+        // derivation -- data_layout (the kernel ABI) and the refusal below are both read from it.
+        const layout_mode direct_effective_layout =
+            forced_layout ? *forced_layout :
+            src0->extra   ? get_effective_layout_mode(static_cast<const ggml_tensor_extra_gpu *>(src0->extra)) :
+                            GGML_LAYOUT_AOS;
         ggml_sycl_unified::LayoutMode data_layout = ggml_sycl_unified::LayoutMode::AOS;
-        if (forced_layout) {
-            switch (*forced_layout) {
-                case GGML_LAYOUT_AOS:
-                    data_layout = ggml_sycl_unified::LayoutMode::AOS;
-                    break;
-                case GGML_LAYOUT_SOA:
-                    data_layout = ggml_sycl_unified::LayoutMode::SOA;
-                    break;
-                case GGML_LAYOUT_COALESCED:
-                    data_layout = ggml_sycl_unified::LayoutMode::COALESCED;
-                    break;
-                default:
-                    data_layout = ggml_sycl_unified::LayoutMode::AOS;
-                    break;
-            }
-        } else if (src0->extra) {
-            const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-            if (extra) {
-                switch (get_effective_layout_mode(extra)) {
-                    case GGML_LAYOUT_SOA:
-                        data_layout = ggml_sycl_unified::LayoutMode::SOA;
-                        break;
-                    case GGML_LAYOUT_COALESCED:
-                        data_layout = ggml_sycl_unified::LayoutMode::COALESCED;
-                        break;
-                    default:
-                        data_layout = ggml_sycl_unified::LayoutMode::AOS;
-                        break;
-                }
-            }
+        switch (direct_effective_layout) {
+            case GGML_LAYOUT_SOA:
+                data_layout = ggml_sycl_unified::LayoutMode::SOA;
+                break;
+            case GGML_LAYOUT_COALESCED:
+                data_layout = ggml_sycl_unified::LayoutMode::COALESCED;
+                break;
+            default:
+                // AOS, or a layout the refusal below turns away before data_layout is used.
+                data_layout = ggml_sycl_unified::LayoutMode::AOS;
+                break;
         }
 
         // Reconcile the advertised layout against what the cache actually
@@ -64182,6 +64168,20 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             }
         }
 
+        // The refusal is decided on direct_effective_layout (derived once, above), AFTER the
+        // reconcile: a layout that disagrees with storage was already refused and falls through;
+        // what is left is the loaded layout, which is the answer.  The data_layout switch maps
+        // anything it does not know onto AOS, so a loaded layout none of these kernels decodes
+        // (xmx_tiled, I8, DPAS, ...) would be read as AOS: deterministic garbage (llama.cpp-4hg7,
+        // xmx_tiled hybrid expert).  Refuse loudly instead: a missing kernel for the loaded layout is
+        // a support gap to close, not an input to re-route, and a crash beats wrong tokens.
+        if (layout_reconciled && !moe_mmvq_mxfp4_direct_reads_layout(direct_effective_layout)) {
+            GGML_ABORT(
+                "[MXFP4-DIRECT] %s: no decode for loaded layout=%s on this path -- refusing instead of "
+                "reading it as AOS (support gap; llama.cpp-4hg7)",
+                src0->name ? src0->name : "(null)", ggml_sycl_layout_mode_name(direct_effective_layout));
+        }
+
         const void * src0_data = nullptr;
         if (layout_reconciled && src0_storage) {
             const sycl::usm::alloc alloc = ggml_sycl_get_alloc_type(src0_storage);
@@ -64201,6 +64201,12 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         if (layout_reconciled && !src0_data) {
             auto resolved = ggml_sycl_resolve(src0, ctx.device);
             if (resolved) {
+                if (!moe_mmvq_mxfp4_direct_reads_layout(resolved.layout)) {
+                    GGML_ABORT(
+                        "[MXFP4-DIRECT] %s: no decode for resolved layout=%s on this path -- refusing instead of "
+                        "reading it as AOS (support gap; llama.cpp-4hg7)",
+                        src0->name ? src0->name : "(null)", ggml_sycl_layout_mode_name(resolved.layout));
+                }
                 src0_data = resolved.ptr;
                 switch (resolved.layout) {
                     case GGML_LAYOUT_SOA:
@@ -75750,6 +75756,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             ggml_sycl::mem_handle shared_act_handle;
 
             const bool multi_gpu = g_moe_multi_gpu_active.load(std::memory_order_acquire);
+            // One fact, one source: every host expert reads the same activation
+            // row only when src1 has a single row (ne11 == 1: MoE gate/up).  For
+            // the down projection src1 is [n_ff, n_used, n_tokens], one row per
+            // expert slot, so each host expert needs the row of its own slot.
+            // Everything below that decides "shared" reads this, never
+            // cpu_expert_tg_active alone (llama.cpp-4hg7).
+            const bool cpu_shared_act = cpu_expert_tg_active && ne11 == 1;
+            // Q1_0/NVFP4 host experts run an immutable admitted recipe with its own managed
+            // buffers; they never use the PinnedBufferPool, so they neither reserve a pool span
+            // nor depend on the pool's capacity.
+            const bool immutable_host_recipe = src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4;
             if (ne11 == 1 && src0->type != GGML_TYPE_Q1_0 && src0->type != GGML_TYPE_NVFP4 &&
                 (cpu_expert_tg_active || multi_gpu)) {
                 static thread_local managed_host_pinned_buffer s_act_staging;
@@ -75775,20 +75792,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
 
+            // dispatch_cpu_compute's pool_first_entry is the first PinnedBufferPool entry the
+            // dispatch owns.  A caller that issues several dispatches in one MUL_MAT_ID (the
+            // hot/cold split) reserves the whole span once and hands each dispatch its own
+            // slice, so their act/out regions are disjoint.  npos = reserve one here.
+            constexpr size_t pool_entry_npos = static_cast<size_t>(-1);
+
             // CPU expert compute: alloc pinned buffers, D2H activations,
             // build tasks, submit to CPU pool.  Returns a cpu_dispatch_result
             // carrying the compute future and metadata — does NOT touch
             // g_pending_scatter (which is thread_local and must only be
             // written from the main thread).
-            auto dispatch_cpu_compute = [&](const std::vector<expert_dispatch_entry> & entries) -> cpu_dispatch_result {
+            auto dispatch_cpu_compute = [&](const std::vector<expert_dispatch_entry> & entries,
+                                            size_t pool_first_entry = pool_entry_npos) -> cpu_dispatch_result {
                 cpu_dispatch_result result;
                 if (entries.empty()) {
                     return result;
                 }
 
                 const size_t n_cpu = entries.size();
-                const bool immutable_host_recipe =
-                    src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4;
                 if (immutable_host_recipe) {
                     for (const expert_dispatch_entry & entry : entries) {
                         if (!entry.admitted_recipe_ticket.valid() ||
@@ -75802,6 +75824,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 float *               out_pinned = nullptr;
                 float *               act_pinned = nullptr;
                 bool                  from_pool  = false;
+                size_t                pool_base  = 0;  // first pool entry (0 off the pool)
                 ggml_sycl::mem_handle out_owner;
                 ggml_sycl::mem_handle act_owner;
 
@@ -75813,8 +75836,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // managed host-pinned path below instead of asserting in acquire().
                 if (pool.can_serve(n_cpu) && !immutable_host_recipe) {
                     auto bp    = pool.acquire(n_cpu);
-                    act_pinned = bp.act;
-                    out_pinned = bp.out;
+                    pool_base  = pool_first_entry != pool_entry_npos ? pool_first_entry : pool.reserve(n_cpu);
+                    act_pinned = bp.act + pool_base * static_cast<size_t>(K);
+                    out_pinned = bp.out + pool_base * static_cast<size_t>(N);
                     from_pool  = true;
                 } else {
                     if (pool.is_initialized() && !immutable_host_recipe) {
@@ -75855,12 +75879,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return result;
                 }
 
-                // Zero the output buffer
-                if (from_pool) {
-                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));
-                } else if (!out_owner.valid()) {
-                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));
-                }
+                // The output region is zeroed further down, after the activation wait.  Across
+                // ops the pool is NOT kept disjoint (entry offsets use each op's own K/N, and a
+                // top-K-sized pool restarts at entry 0 every op), so this region can be the
+                // source of an earlier op's scatter H2D.  What makes the write safe is ordering:
+                //   (1) that op's scatter was flushed -- its H2D enqueued on the in-order
+                //       compute queue -- BEFORE this op's activation D2H was enqueued (the
+                //       consumed flushes and try_flush at op entry run ahead of that D2H), and
+                //   (2) the memset and the CPU kernels run only after that D2H completed, and
+                //       completing an event on an in-order queue completes every earlier
+                //       command, the H2D included.
+                // Within ONE op the hot and cold groups are slices of one reservation and are
+                // disjoint (PinnedBufferPool::reserve).
+                const bool zero_out_after_act_wait = from_pool || !out_owner.valid();
 
                 ggml_sycl_tensor_storage_handle src1_storage{};
                 if (!ggml_sycl_ensure_tensor_storage_handle(src1, ctx.device, &src1_storage, "MUL_MAT_ID CPU dispatch",
@@ -75908,18 +75939,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 sycl::event act_deferred_evt;
                 bool        act_deferred_pending = false;
 
-                if (act_on_host && cpu_expert_tg_active) {
+                if (act_on_host && cpu_shared_act) {
                     // Use shared activation — defer wait until after task building.
                     // Tasks will point directly to shared_act_host.
                     act_deferred_evt     = act_d2h_event;
                     act_deferred_pending = true;
-                } else if (cpu_expert_tg_active && n_cpu > 1) {
+                } else if (cpu_shared_act && n_cpu > 1) {
                     // Single D2H: all experts share the same activation at offset 0.
                     // Submit async — wait deferred until just before CPU pool submission
                     // to overlap D2H with task struct building below.
-                    act_deferred_evt =
-                        ggml_sycl::mem_copy_async(act_handle, 0, src1_storage.handle, src1_storage.view_offset,
-                                                  static_cast<size_t>(K) * sizeof(float), *stream);
+                    act_deferred_evt = ggml_sycl::mem_copy_async(
+                        act_handle, pool_base * static_cast<size_t>(K) * sizeof(float), src1_storage.handle,
+                        src1_storage.view_offset, static_cast<size_t>(K) * sizeof(float), *stream);
                     act_deferred_pending = true;
                 } else {
                     // Per-expert D2H: collect events and batch-wait instead
@@ -75932,7 +75963,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         const int64_t i12     = entry.iid1;
                         const size_t  src_off = src1_storage.view_offset + static_cast<size_t>(i11) * nb11 +
                                                static_cast<size_t>(i12) * nb12;
-                        const size_t dst_off = ci * static_cast<size_t>(K) * sizeof(float);
+                        const size_t dst_off = (pool_base + ci) * static_cast<size_t>(K) * sizeof(float);
                         copy_events.push_back(ggml_sycl::mem_copy_async(act_handle, dst_off, src1_storage.handle,
                                                                         src_off, static_cast<size_t>(K) * sizeof(float),
                                                                         *stream));
@@ -76014,9 +76045,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         task.recipe                    = entry.admitted_recipe_ticket.recipe();
                         task.admitted_recipe_signature = entry.admitted_recipe_ticket.signature();
                         task.weight_lease              = std::move(host_lease);
-                        task.activations               = cpu_expert_tg_active ?
-                                                             (act_on_host ? shared_act_host : act_pinned) :
-                                                             act_pinned + ci * static_cast<size_t>(K);
+                        task.activations               = cpu_shared_act ? (act_on_host ? shared_act_host : act_pinned) :
+                                                                          act_pinned + ci * static_cast<size_t>(K);
                         task.output                    = out_pinned + ci * static_cast<size_t>(N);
                         task.workspace                 = recipe_workspace;
                         task.workspace_bytes           = recipe_workspace_bytes;
@@ -76028,13 +76058,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                     cpu_expert_task t;
                     t.weight_host  = host_weight;
-                    // When cpu_expert_tg_active, all tasks share the single
+                    // When cpu_shared_act, all tasks share the single
                     // activation copy; batched dispatch deduplicates Q8_0
                     // quantization via act_host pointer equality.
                     // When act_on_host, point directly to shared staging buffer
                     // (skip intermediate memcpy).
-                    t.act_host     = cpu_expert_tg_active ? (act_on_host ? shared_act_host : act_pinned) :
-                                                            act_pinned + ci * static_cast<size_t>(K);
+                    t.act_host     = cpu_shared_act ? (act_on_host ? shared_act_host : act_pinned) :
+                                                      act_pinned + ci * static_cast<size_t>(K);
                     t.output_host  = out_pinned + ci * static_cast<size_t>(N);
                     t.type         = src0->type;
                     t.K            = static_cast<int>(K);
@@ -76048,6 +76078,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // to overlap the transfer with task struct building.
                 if (act_deferred_pending) {
                     act_deferred_evt.wait();
+                }
+                if (zero_out_after_act_wait) {
+                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));
                 }
                 // Host CPU traits consume the retained host handle only after
                 // its producer event is complete. The lease then moves into
@@ -76104,7 +76137,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     char *        dst_d = dst_original + i1 * nb1 + i2 * nb2;
                     result.entries.push_back({ dst_d, static_cast<int>(N), dst_storage.handle,
                                                dst_storage.view_offset + static_cast<size_t>(dst_d - dst_original),
-                                               ci * static_cast<size_t>(N) * sizeof(float) });
+                                               (pool_base + ci) * static_cast<size_t>(N) * sizeof(float) });
                 }
 
                 result.out_pinned   = out_pinned;
@@ -76173,8 +76206,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
             // Synchronous dispatch + scatter setup: used by the sequential
             // (PP) path and the hot/cold deferral path.
-            auto dispatch_cpu_and_scatter = [&](const std::vector<expert_dispatch_entry> & entries) {
-                auto r = dispatch_cpu_compute(entries);
+            auto dispatch_cpu_and_scatter = [&](const std::vector<expert_dispatch_entry> & entries,
+                                                size_t pool_first_entry = pool_entry_npos) {
+                auto r = dispatch_cpu_compute(entries, pool_first_entry);
                 apply_cpu_result_to_scatter(r);
             };
 
@@ -76865,7 +76899,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             auto do_cpu_dispatch = [&]() {
                 const int defer_n = 1;
 
-                if (defer_n == 0 || static_cast<int>(cpu_entries.size()) <= defer_n) {
+                // The hot and cold dispatches must not share pool entries: the hot scatter's
+                // H2D reads its out region asynchronously while the cold dispatch zeroes
+                // and fills its own.  So the split needs one pool span for both.  When the
+                // pool cannot hold all of them -- notably the synchronous PP path, where
+                // the pool is sized from the 2-token warmup graph and an ubatch needs far
+                // more entries -- everything is dispatched as ONE group: no hot/cold
+                // split, hence no deferral of the cold scatter (llama.cpp-4hg7; pp512
+                // throughput is the cost to measure).  Recipe types never touch the pool,
+                // so they keep splitting regardless of its capacity.
+                auto &       hc_pool       = g_pinned_buffer_pools[ctx.device];
+                const size_t n_cpu_entries = cpu_entries.size();
+                const bool   split_needs_pool = !immutable_host_recipe;
+                if (defer_n == 0 || static_cast<int>(cpu_entries.size()) <= defer_n ||
+                    (split_needs_pool && !hc_pool.can_serve(n_cpu_entries))) {
                     dispatch_cpu_and_scatter(cpu_entries);
                 } else {
                     const int64_t                      cold_threshold = n_ids - defer_n;
@@ -76885,11 +76932,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     GGML_SYCL_DEBUG("[MoE-DEFER] L%d: hot=%zu cold=%zu (defer_n=%d threshold=%lld)\n", layer_id,
                                     hot_entries.size(), cold_entries.size(), defer_n, (long long) cold_threshold);
 
+                    // One reservation covers both groups; each takes its own slice.
+                    const size_t hot_first  = split_needs_pool ? hc_pool.reserve(n_cpu_entries) : 0;
+                    const size_t cold_first = hot_first + hot_entries.size();
                     if (!hot_entries.empty()) {
-                        dispatch_cpu_and_scatter(hot_entries);
+                        dispatch_cpu_and_scatter(hot_entries, hot_first);
                         flush_pending_cpu_scatter();
                     }
-                    dispatch_cpu_and_scatter(cold_entries);
+                    dispatch_cpu_and_scatter(cold_entries, cold_first);
                 }
             };
 
