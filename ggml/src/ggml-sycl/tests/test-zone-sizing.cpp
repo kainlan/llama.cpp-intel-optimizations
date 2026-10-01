@@ -413,6 +413,15 @@ int main() {
 
         ggml_sycl::zone_sizing_reset_underestimates();
         CHECK(ggml_sycl::zone_sizing_observation_count("onednn") == 0, "reset must clear observations too");
+
+        // A caller that already counts its own uses reports them in one call (one mutex take, not one per use).
+        ggml_sycl::zone_sizing_record_observations("mmq-src1-q8", 1387);
+        ggml_sycl::zone_sizing_record_observations("mmq-src1-q8", 0);
+        CHECK(ggml_sycl::zone_sizing_observation_count("mmq-src1-q8") == 1387,
+              "a batched observation must add its whole count, and a zero batch must add nothing");
+        CHECK(ggml_sycl::zone_sizing_underestimate_count("mmq-src1-q8") == 0,
+              "a batched observation is not an under-estimate");
+        ggml_sycl::zone_sizing_reset_underestimates();
     }
 
     // ---- Case 10: classifier collapse ---------------------------------------
