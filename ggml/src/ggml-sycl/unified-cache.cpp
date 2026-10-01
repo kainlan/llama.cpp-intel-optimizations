@@ -11089,7 +11089,7 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
     if (onednn_graph_scratch_flag_slab_ != nullptr) {
         return true;
     }
-    if (onednn_graph_scratch_flag_slab_alloc_warned_) {
+    if (onednn_graph_scratch_flag_slab_warned_) {
         // Already failed once this process; do not retry (and re-log) on
         // every subsequent park -- a process-wide degradation to the
         // blocking fallback, not a per-entry one.
@@ -11098,7 +11098,7 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
     const size_t bytes = kOnednnGraphScratchFlagSlabCapacity * sizeof(int32_t);
     void *       raw = unified_cache_malloc_host_tracked(bytes, queue_, "unified_cache:onednn_graph_scratch_flag_slab");
     if (!raw) {
-        onednn_graph_scratch_flag_slab_alloc_warned_ = true;
+        onednn_graph_scratch_flag_slab_warned_ = true;
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] Failed to allocate the oneDNN Graph-scratch pool's completion-flag slab (%zu "
             "bytes); falling back to blocking completion checks for every pooled entry\n",
@@ -11120,7 +11120,7 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
         // control (the pre-teardown census admits it, unable to tell it
         // apart from a real, in-use slab) for the rest of the process.
         onednn_graph_scratch_flag_slab_owner_        = {};
-        onednn_graph_scratch_flag_slab_alloc_warned_ = true;
+        onednn_graph_scratch_flag_slab_warned_ = true;
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] Failed to resolve the oneDNN Graph-scratch pool's completion-flag slab owner; "
             "falling back to blocking completion checks for every pooled entry\n");
