@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14an, by impl-moua-s, 2026-09-30. The revisions answer forty-four reviews:
+Design, revision 7.14ao, by impl-moua-s, 2026-09-30. The revisions answer forty-five reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -262,6 +262,9 @@ Design, revision 7.14an, by impl-moua-s, 2026-09-30. The revisions answer forty-
   nit; PASS) and rulings §M116, recorded in §6.55. Revision 7.14an is one commit on top of
   `840abd884`: the shutdown body gains step (f), a second null-backend holder call after
   `shutdown` returns.
+- design review r44 (design-moua-r44 on `840abd884..fdd5db3ca`: 0 Critical, 0 Important, 0 Minor, 1
+  nit; PASS), recorded in §6.56. Revision 7.14ao is one commit on top of `fdd5db3ca`: step (f)
+  states that the park hook is disarmed before its call.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -9610,7 +9613,8 @@ means that.
     return `== GGML_SYCL_LIFECYCLE_NULL_OUTPUT` (`gs:18860-18861`) and `!=
     GGML_SYCL_LIFECYCLE_PLAN_REJECTED` and `!= GGML_SYCL_LIFECYCLE_BUSY`, and it releases L0; (d)
     `shutdown` returns; (e) slot [0] still reads `ACTIVE` and slots [6] and [7] still read 0 and 0;
-    (f) after `shutdown` returns, the arm calls the same null-backend holder again and scores zero
+    (f) after `shutdown` returns, the arm calls the same null-backend holder again (the park hook is
+    disarmed after the first holder releases L0, so (f)'s call does not park) and scores zero
     `[CONTEXT-PLAN-BUG]` lines and a return `== GGML_SYCL_LIFECYCLE_NULL_OUTPUT`. The RED is the
     same, the token deleted from `shutdown`; a guard that returned another code fails (c). A guard
     that fires on `g_sycl_module_shutdown_started` is caught only by (f): the flag is written at
@@ -14657,3 +14661,13 @@ rulings §M116. The 23mk cites stay at `87da879f1`; the re-pin follows 23mk's re
 |---|---|---|
 | M-1 | "a guard that fired on `shutdown_started` fails (b) or (c)" was false: `shutdown` takes its token before the write at `gs:109886`, so while the holder is parked the flag is unset | **Changed.** The claim is kept and made true by a new step (f): after `shutdown` returns, the same null-backend holder is called again and the arm scores zero BUG lines and `== NULL_OUTPUT`. The text says only this post-shutdown call can catch a guard that reads `shutdown_started`. |
 | N-1 | "`shutdown` writes no admission state" | **Changed.** "does not write `g_sycl_module_admission`"; the one admission write, `g_sycl_module_shutdown_started` under the admission mutex, is stated. |
+
+### 6.56 Revision 7.14ao: design-moua-r44
+
+Revision 7.14ao is one commit on top of `fdd5db3ca`, by impl-moua-s. It answers design review r44
+(design-moua-r44 on `840abd884..fdd5db3ca`: 0 Critical, 0 Important, 0 Minor, 1 nit; PASS). The 23mk
+cites stay at `87da879f1`; the re-pin follows 23mk's review.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| N-1 | step (f) did not say its call does not park | **Changed.** "The park hook is disarmed after the first holder releases L0, so (f)'s call does not park": an armed hook would park the post-shutdown call and hang it. |
