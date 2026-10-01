@@ -241,6 +241,31 @@ def body_of(text, signature_rx):
     return start, lines[start:end + 1]
 
 
+def block_of(lines, anchor_rx):
+    """The statements inside the first block opened by a line matching anchor_rx (up to the closing brace at or
+    left of the anchor's indentation), as a joined string; None when the anchor is missing."""
+    start = next((i for i, l in enumerate(lines) if re.search(anchor_rx, l)), None)
+    if start is None:
+        return None
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = start + 1
+    while end < len(lines):
+        l = lines[end]
+        if l.strip() and len(l) - len(l.lstrip()) <= indent and l.lstrip().startswith("}"):
+            break
+        end += 1
+    return "\n".join(lines[start + 1:end])
+
+
+# the failure exits of memory_update: (anchor, whether the branch must set sched_need_reserve)
+MEMORY_UPDATE_EXITS = (
+    (r"if \(!mctx->apply\(\)\) \{", True),
+    (r"if \(!mctx\) \{", True),
+    (r"if \(!gf\) \{", True),
+    (r"\} catch \(", True),
+)
+
+
 def update_clause_violations(files):
     """Gate 15's update clauses over the llama-kv-cache / llama-memory / llama-context files."""
     out = []
@@ -260,6 +285,9 @@ def update_clause_violations(files):
                 out.append(("llama-kv-cache.cpp", first + i + 2, "a K-shift failure exit does not return FAILED"))
         if any(re.search(r"\breturn\s+updated\s*;", l) for l in lines):
             out.append(("llama-kv-cache.cpp", first + 1, "update still returns a bool-style `updated`"))
+        stmts = [l.strip() for l in lines if l.strip()]
+        if len(stmts) < 2 or stmts[-2] != "return updated ? LLAMA_MEMORY_UPDATE_DONE : LLAMA_MEMORY_UPDATE_NONE;":
+            out.append(("llama-kv-cache.cpp", first + 1, "update's tail does not return `updated ? DONE : NONE`"))
 
     discarded = 0
     seen = 0
@@ -288,6 +316,18 @@ def update_clause_violations(files):
         ca = next((i for i, l in enumerate(lines) if re.search(r"\bcatch\s*\(", l)), None)
         if gr is None or tr is None or ca is None or not (tr < gr < ca):
             out.append(("llama-context.cpp", first + 1, "the post-update graph_reserve is not inside a try"))
+        for anchor, needs_flag in MEMORY_UPDATE_EXITS:
+            blk = block_of(lines, anchor)
+            if blk is None:
+                out.append(("llama-context.cpp", first + 1, "memory_update has no failure branch matching `%s`" % anchor))
+                continue
+            if "return LLAMA_MEMORY_UPDATE_FAILED;" not in blk:
+                out.append(("llama-context.cpp", first + 1, "the memory_update branch `%s` does not return FAILED" % anchor))
+            if needs_flag and "sched_need_reserve = true;" not in blk:
+                out.append(("llama-context.cpp", first + 1, "the memory_update branch `%s` does not set sched_need_reserve" % anchor))
+        body_stmts = [l.strip() for l in lines if l.strip()]
+        if len(body_stmts) < 2 or body_stmts[-2] != "return LLAMA_MEMORY_UPDATE_DONE;":
+            out.append(("llama-context.cpp", first + 1, "memory_update does not end by returning DONE"))
     calls = 0
     cl = strip_comments(ctx_cpp).split("\n")
     for i, line in enumerate(cl):
@@ -298,6 +338,19 @@ def update_clause_violations(files):
                 out.append(("llama-context.cpp", i + 1, "a memory_update call does not check LLAMA_MEMORY_UPDATE_FAILED"))
     if calls < 2:
         out.append(("llama-context.cpp", 0, "found %d memory_update call sites, expected decode's two" % calls))
+    # each decode FAILED compare returns -2 and the retry site's DONE compare continues
+    n_failed = 0
+    for i, line in enumerate(cl):
+        if "LLAMA_MEMORY_UPDATE_FAILED" in line and re.search(r"\bif\b", line):
+            blk = block_of(cl, re.escape(line.strip()))
+            if blk is None or not re.search(r"\breturn -2;", blk):
+                out.append(("llama-context.cpp", i + 1, "a decode FAILED branch does not return -2"))
+            n_failed += 1
+    if n_failed < 2:
+        out.append(("llama-context.cpp", 0, "found %d decode FAILED branches, expected two" % n_failed))
+    done = [i for i, l in enumerate(cl) if re.search(r"\bif\b.*LLAMA_MEMORY_UPDATE_DONE", l)]
+    if len(done) != 1 or not re.search(r"\bcontinue;", block_of(cl, re.escape(cl[done[0]].strip())) or ""):
+        out.append(("llama-context.cpp", 0, "the retry site's DONE branch must exist once and continue"))
     return out
 
 
@@ -326,6 +379,27 @@ def update_clause_mutants(files):
     t = cc.index("    try {", a)
     yield "post-update reserve outside a try", with_file("llama-context.cpp", cc[:t] + "    {" + cc[t + len("    try {"):])
 
+    def drop_after(text, anchor, token, replacement=""):
+        i = text.index(anchor)
+        j = text.index(token, i)
+        return text[:j] + replacement + text[j + len(token):]
+
+    d1 = "if (memory_update(false) == LLAMA_MEMORY_UPDATE_FAILED) {"
+    yield "first decode call: `return -2;` deleted", with_file("llama-context.cpp", drop_after(cc, d1, "return -2;"))
+    d2 = "if (update_res == LLAMA_MEMORY_UPDATE_FAILED) {"
+    yield "retry site: `return -2;` deleted", with_file("llama-context.cpp", drop_after(cc, d2, "return -2;"))
+    d3 = "if (update_res == LLAMA_MEMORY_UPDATE_DONE) {"
+    yield "retry site: DONE no longer continues", with_file("llama-context.cpp", drop_after(cc, d3, "continue;"))
+    for anchor, name in (("if (!mctx->apply()) {", "apply failure"), ("if (!mctx) {", "null init_full"),
+                         ("if (!gf) {", "refused post-update reserve"), ("} catch (const std::exception & err) {", "catch handler")):
+        base = cc.index("llama_memory_update_result llama_context::memory_update(")
+        yield "memory_update %s: no longer returns FAILED" % name, with_file(
+            "llama-context.cpp", cc[:base] + drop_after(cc[base:], anchor, "return LLAMA_MEMORY_UPDATE_FAILED;", "return LLAMA_MEMORY_UPDATE_NONE;"))
+        yield "memory_update %s: no longer sets sched_need_reserve" % name, with_file(
+            "llama-context.cpp", cc[:base] + drop_after(cc[base:], anchor, "sched_need_reserve = true;"))
+    yield "update tail returns DONE unconditionally", with_file(
+        "llama-kv-cache.cpp", kv.replace("return updated ? LLAMA_MEMORY_UPDATE_DONE : LLAMA_MEMORY_UPDATE_NONE;", "return LLAMA_MEMORY_UPDATE_DONE;", 1))
+
 
 COMPOSITES = (
     # (class, source file, number of init_reserve( calls its context constructor must make with n_streams, extra tokens)
@@ -335,15 +409,16 @@ COMPOSITES = (
     ("llama_kv_cache_msa_context", "llama-kv-cache-msa.cpp", 2, ()),
     ("llama_memory_hybrid_context", "llama-memory-hybrid.cpp", 2, ()),
     ("llama_memory_hybrid_iswa_context", "llama-memory-hybrid-iswa.cpp", 2, ()),
+    # the indexer's per-part stream count (ns_ubatch) is s too, not the idx cache's own n_stream
     ("llama_memory_hybrid_idx_context", "llama-memory-hybrid-idx.cpp", 0,
-     ("llama_memory_hybrid_context(mem, n_streams)", "llama_kv_cache_context(mem->get_mem_idx(), n_streams)")),
+     ("llama_memory_hybrid_context(mem, n_streams)", "std::vector<uint32_t>{ n_streams }",
+      "llama_kv_cache_context(mem->get_mem_idx(), n_streams)")),
     ("llama_kv_cache_dsv4_context", "llama-kv-cache-dsv4.cpp", 3,
      ("llama_kv_cache_dsv4_raw_context>(kv->get_raw(), n_streams)",
       "llama_kv_cache_dsv4_comp_context>(kv->get_csa(), n_streams)",
       "llama_kv_cache_dsv4_comp_context>(kv->get_hca(), n_streams)",
       "llama_kv_cache_dsv4_comp_context>(kv->get_lid(), n_streams)")),
 )
-DSV4_REFUSAL = "dsv4 s-stream reserve not ported"
 
 
 def stream_ctor(text, cls):
@@ -364,8 +439,8 @@ def reserve_clause_violations(files):
     heads = {n: strip_comments(t) for n, t in files.items() if n.endswith(".h")}
     n_full = sum(len(re.findall(r"init_full\(\)\s+override\s*;", t)) for t in heads.values())
     n_res = sum(len(re.findall(r"init_reserve\(uint32_t n_streams\)\s+override\s*;", t)) for t in heads.values())
-    if n_full < 9:
-        out.append(("src", 0, "found %d init_full overrides, expected at least nine; the gate would pass vacuously" % n_full))
+    if n_full < 10:
+        out.append(("src", 0, "found %d init_full overrides, expected at least ten; the gate would pass vacuously" % n_full))
     if n_res != n_full:
         out.append(("src", 0, "%d init_reserve overrides against %d init_full overrides" % (n_res, n_full)))
     full_defs, res_defs = set(), set()
@@ -377,6 +452,23 @@ def reserve_clause_violations(files):
     for c in sorted(full_defs - res_defs):
         out.append(("src", 0, "%s defines init_full but not init_reserve" % c))
 
+    # what init_reserve builds: the class's own context over (this, n_streams); the recurrent memory ignores s
+    bodies = 0
+    for n, t in files.items():
+        if not n.endswith(".cpp"):
+            continue
+        for cls, body in re.findall(r"(\w+)::init_reserve\(uint32_t n_streams\)\s*\{(.*?)\n\}", strip_comments(t), re.S):
+            bodies += 1
+            got = " ".join(body.split())
+            if cls == "llama_memory_recurrent":
+                want = "GGML_UNUSED(n_streams); return init_full();"
+            else:
+                want = "return std::make_unique<%s_context>(this, n_streams);" % cls
+            if got != want:
+                out.append((n, 0, "%s::init_reserve must be `%s`, found `%s`" % (cls, want, got)))
+    if bodies < n_res:
+        out.append(("src", 0, "read %d init_reserve bodies against %d declarations" % (bodies, n_res)))
+
     for cls, fname, n_calls, tokens in COMPOSITES:
         text = files.get(fname, "")
         ctor = stream_ctor(text, cls)
@@ -385,10 +477,6 @@ def reserve_clause_violations(files):
             continue
         first, chunk = ctor
         calls = re.findall(r"init_reserve\(([^)]*)\)", chunk)
-        if cls == "llama_kv_cache_dsv4_context":
-            dsv4_fn = body_of(text, r"^llama_memory_context_ptr llama_kv_cache_dsv4::init_reserve\(")
-            if dsv4_fn is not None and DSV4_REFUSAL in "\n".join(dsv4_fn[1]) or DSV4_REFUSAL in text and not calls:
-                continue
         if len(calls) != n_calls or any(a.strip() != "n_streams" for a in calls):
             out.append((fname, first + 1, "%s must forward n_streams to its %d init_reserve calls, found %r" %
                         (cls, n_calls, calls)))
@@ -402,9 +490,18 @@ def reserve_clause_violations(files):
         out.append(("llama-kv-cache.cpp", 0, "llama_kv_cache_context has no s-stream constructor"))
     else:
         body = m.group(1)
-        for tok in ("sinfos[0].s1 = n_streams - 1;", "sinfos[0].idxs.resize(n_streams);", "s < n_streams"):
+        for tok in ("sinfos[0].s1 = n_streams - 1;", "sinfos[0].idxs.resize(n_streams);", "s < n_streams",
+                    "GGML_ASSERT(n_streams >= 1 && n_streams <= kv->get_n_stream());"):
             if tok not in body:
                 out.append(("llama-kv-cache.cpp", 0, "the s-stream constructor lacks `%s`" % tok))
+    # the full contexts are the s-stream ones over every stream, by delegation, so their equality is not a convention
+    full_kv = " ".join(kv.split())
+    if "llama_kv_cache_context::llama_kv_cache_context( llama_kv_cache * kv) : llama_kv_cache_context(kv, kv->get_n_stream()) {" not in full_kv:
+        out.append(("llama-kv-cache.cpp", 0, "the full llama_kv_cache_context does not delegate to the s-stream constructor"))
+    dsv4 = " ".join(strip_comments(files.get("llama-kv-cache-dsv4.cpp", "")).split())
+    if ("llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv) : "
+            "llama_kv_cache_dsv4_raw_context(kv, kv->get_swa()->get_n_stream()) {") not in dsv4:
+        out.append(("llama-kv-cache-dsv4.cpp", 0, "the full dsv4 raw context does not delegate to the s-stream constructor"))
     return out
 
 
@@ -428,13 +525,36 @@ def reserve_clause_mutants(files):
             j = text.index("init_reserve(n_streams)", i)
             yield "%s forwards 1 instead of n_streams" % cls, with_file(
                 fname, text[:j] + "init_reserve(1)" + text[j + len("init_reserve(n_streams)"):])
-        if tokens:
-            k = text.index(tokens[-1].replace("n_streams)", "n_streams)"), i)
-            yield "%s drops `%s`" % (cls, tokens[-1][:40]), with_file(
-                fname, text[:k] + tokens[-1].replace("n_streams)", "1)") + text[k + len(tokens[-1]):])
+        for tok in tokens:
+            k = text.index(tok, i)
+            yield "%s drops `%s`" % (cls, tok[:40]), with_file(
+                fname, text[:k] + tok.replace("n_streams", "1") + text[k + len(tok):])
     kv = files["llama-kv-cache.cpp"]
     yield "kv s-stream constructor spans every stream", with_file(
         "llama-kv-cache.cpp", kv.replace("sinfos[0].s1 = n_streams - 1;", "sinfos[0].s1 = kv->get_n_stream() - 1;", 1))
+    idx = files["llama-memory-hybrid-idx.cpp"]
+    yield "hybrid_idx ns_ubatch takes the idx cache's own stream count", with_file(
+        "llama-memory-hybrid-idx.cpp",
+        idx.replace("std::vector<uint32_t>{ n_streams }", "std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }", 1))
+    yield "kv s-stream constructor assert dropped", with_file(
+        "llama-kv-cache.cpp", kv.replace("GGML_ASSERT(n_streams >= 1 && n_streams <= kv->get_n_stream());", "", 1))
+    yield "full kv context no longer delegates", with_file(
+        "llama-kv-cache.cpp", kv.replace(": llama_kv_cache_context(kv, kv->get_n_stream()) {", ": status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {", 1))
+    dv = files["llama-kv-cache-dsv4.cpp"]
+    yield "full dsv4 raw context no longer delegates", with_file(
+        "llama-kv-cache-dsv4.cpp", dv.replace("llama_kv_cache_dsv4_raw_context(kv, kv->get_swa()->get_n_stream()) {", "llama_kv_cache_dsv4_raw_context(kv, 1) {", 1))
+    # an init_reserve that ignores n_streams, one mutant per class that builds a context
+    for fname, t in files.items():
+        if not fname.endswith(".cpp"):
+            continue
+        for cls in re.findall(r"(\w+)::init_reserve\(uint32_t n_streams\)\s*\{", t):
+            a = t.index("%s::init_reserve(uint32_t n_streams)" % cls)
+            if cls == "llama_memory_recurrent":
+                j = t.index("return init_full();", a)
+                yield "%s::init_reserve returns nullptr" % cls, with_file(fname, t[:j] + "return nullptr;" + t[j + len("return init_full();"):])
+            else:
+                j = t.index("(this, n_streams)", a)
+                yield "%s::init_reserve ignores n_streams" % cls, with_file(fname, t[:j] + "(this)" + t[j + len("(this, n_streams)"):])
     rec = files["llama-memory-recurrent.cpp"]
     yield "recurrent init_reserve dropped", with_file(
         "llama-memory-recurrent.cpp", rec.replace("llama_memory_context_ptr llama_memory_recurrent::init_reserve(uint32_t n_streams) {", "static void unused_reserve(uint32_t n_streams) {", 1))
