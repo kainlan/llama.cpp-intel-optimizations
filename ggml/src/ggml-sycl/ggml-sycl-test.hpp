@@ -480,6 +480,11 @@ bool test_plan_publication_prepare_failure_is_caught();
 bool test_provisional_placement_id_exhaustion_is_caught();
 void test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, size_t kv_per_layer);
 void test_clear_kv_placement_plan();
+// The executor-deciding latch read (override-aware), the process latch itself, and the
+// writer's plan condition.
+bool test_moe_multi_gpu_for_executor();
+bool test_moe_multi_gpu_latch();
+bool test_moe_multi_gpu_wanted(const placement_plan & plan);
 void test_set_sycl_info_override(const ggml_sycl_device_info & info);
 void test_clear_sycl_info_override();
 #endif

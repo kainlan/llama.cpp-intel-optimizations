@@ -1470,6 +1470,21 @@ GGML_BACKEND_API void ggml_backend_sycl_release_host_weight_extras(void);
 GGML_BACKEND_API void ggml_backend_sycl_set_sched_placement_plan(ggml_backend_sched_t sched);
 GGML_BACKEND_API bool ggml_backend_sycl_has_active_placement_plan(void);
 
+// The load-time measure's plan override.  While installed, every plan accessor on the
+// calling thread answers from the plan named by `stage` for the load `load_txn`,
+// and nothing is published.  Written only by these two functions; llama reaches them
+// through one RAII guard.  Install returns false (and installs nothing) when an
+// override is already installed on this thread or no plan is staged for the load.
+enum ggml_sycl_measure_stage {
+    GGML_SYCL_MEASURE_STAGE_PROBE       = 0,  // (a): the probe placement's unpublished plan
+    GGML_SYCL_MEASURE_STAGE_CANDIDATE_B = 1,  // (b): the load's candidate plan
+    GGML_SYCL_MEASURE_STAGE_CANDIDATE_C = 2,  // (c): the load's candidate plan, after the sync
+};
+
+GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install(uint64_t                     load_txn,
+                                                                      enum ggml_sycl_measure_stage stage);
+GGML_BACKEND_API void ggml_backend_sycl_measure_plan_override_clear(void);
+
 // === Test-only debug accessors (llama.cpp-dfo0, plan task L2) ===
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // Process-global by design: ggml_backend_sched does not hand test code the

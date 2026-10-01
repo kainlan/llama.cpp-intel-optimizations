@@ -1518,6 +1518,21 @@ std::shared_ptr<const placement_plan> coherent_cache_placement_plan_owner(const 
 placement_cache_read                  cache_placement_coherence(const unified_cache * cache) noexcept;
 uint64_t                              lifecycle_next_plan_publication_id() noexcept;
 
+// The one builder of a candidate-shaped snapshot (model_id 0, the load's transaction,
+// version 0).  Staging calls it and stores the result; the load-time measure's plan
+// override calls it and never stores (zhcn-design §2.10).
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_make_candidate_snapshot(uint64_t                  load_txn_id,
+                                                                                 placement_plan            plan,
+                                                                                 const placement_kv_info & kv_info = {},
+                                                                                 uint32_t model_n_layer            = 0);
+// The (a)-stage probe placement's plan for a load: the plan the pack would emit if it demoted nothing, owned
+// by the load until aborted, and read by no one outside the measure.
+void                                           lifecycle_stage_probe_placement_plan(uint64_t                  load_txn_id,
+                                                                                    placement_plan            plan,
+                                                                                    const placement_kv_info & kv_info = {},
+                                                                                    uint32_t                  model_n_layer = 0);
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_plan(uint64_t load_txn_id) noexcept;
+void                                           lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept;
 void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
                                     placement_plan            plan,
                                     const placement_kv_info & kv_info       = {},

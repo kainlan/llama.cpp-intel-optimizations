@@ -2683,6 +2683,16 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_bound
         return nullptr;
     }
 }
+
+// The load-time measure's plan override (zhcn-design §2.10): the plan every plan
+// accessor answers from on THIS thread while a measure context is built and
+// reserved.  It is written only by the install and clear procs below, never
+// published, and never read by another thread.  An empty pointer is "no override".
+static thread_local std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> g_measure_plan_override;
+
+static bool ggml_sycl_measure_plan_override_active() noexcept {
+    return g_measure_plan_override != nullptr;
+}
 static thread_local bool                                                      g_runtime_expected_model_set = false;
 static thread_local ggml_sycl_model_token                                     g_runtime_expected_model{};
 static thread_local bool                                                      g_runtime_update_succeeded = false;
@@ -2717,10 +2727,16 @@ uint64_t ggml_sycl_tenant_publish_gen();
 void     ggml_sycl_tenant_publish_gen_bump();
 
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_global_plan_snapshot() {
+    if (g_measure_plan_override) {
+        return g_measure_plan_override;
+    }
     return std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
 }
 
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_identity_plan_snapshot() {
+    if (g_measure_plan_override) {
+        return g_measure_plan_override;
+    }
     const auto candidate = ggml_sycl_bound_load_candidate();
     return candidate ? candidate : ggml_sycl_global_plan_snapshot();
 }
@@ -2949,6 +2965,9 @@ static const std::shared_ptr<const placement_plan> & empty_placement_plan_owner(
 }
 
 std::shared_ptr<const placement_plan> global_placement_plan_owner() noexcept {
+    if (g_measure_plan_override) {
+        return g_measure_plan_override->plan ? g_measure_plan_override->plan : empty_placement_plan_owner();
+    }
     const auto candidate = ggml_sycl_bound_load_candidate();
     const auto authority =
         candidate ? candidate : std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
@@ -2966,6 +2985,15 @@ std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unifie
 placement_cache_read cache_placement_coherence(const unified_cache * cache) noexcept {
     placement_cache_read result;
     result.owner = empty_placement_plan_owner();
+    if (g_measure_plan_override) {
+        // The override names the plan; there is no cache snapshot to compare it with.
+        result.coherence = g_measure_plan_override->plan ? placement_cache_coherence::MATCH :
+                                                           placement_cache_coherence::GENUINE_NO_PLAN;
+        if (g_measure_plan_override->plan) {
+            result.owner = g_measure_plan_override->plan;
+        }
+        return result;
+    }
     const auto candidate = ggml_sycl_bound_load_candidate();
     if (candidate && candidate->plan) {
         result.coherence = placement_cache_coherence::MATCH;
@@ -14834,6 +14862,41 @@ bool ggml_backend_sycl_has_active_placement_plan(void) {
     return ggml_sycl_has_global_plan();
 }
 
+// The measure plan override's two writers (zhcn-design §2.10).  The thread-local is
+// written only here.  Install builds nothing: it finds the plan moua staged for the
+// load -- the probe placement's at (a), the load's candidate at (b) and (c) -- and
+// holds it, in the candidate's shape, for this thread until clear.
+bool ggml_backend_sycl_measure_plan_override_install(uint64_t load_txn, ggml_sycl_measure_stage stage) {
+    if (g_measure_plan_override) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override nested\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested");
+        }
+        return false;
+    }
+    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;
+    switch (stage) {
+        case GGML_SYCL_MEASURE_STAGE_PROBE:
+            snapshot = ggml_sycl::lifecycle_find_probe_placement_plan(load_txn);
+            break;
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_B:
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_C:
+            snapshot = ggml_sycl::lifecycle_find_candidate_placement_plan(load_txn);
+            break;
+    }
+    if (!snapshot || !snapshot->plan) {
+        GGML_LOG_WARN("[LOAD-PLAN] measure plan override: no plan staged for load %llu at stage %d\n",
+                      (unsigned long long) load_txn, (int) stage);
+        return false;
+    }
+    g_measure_plan_override = std::move(snapshot);
+    return true;
+}
+
+void ggml_backend_sycl_measure_plan_override_clear(void) {
+    g_measure_plan_override.reset();
+}
+
 ggml_sycl_execution_result ggml_backend_sycl_execution_context_create(ggml_sycl_exec_context_id * context) {
     try {
         sycl_module_mutation_guard module_guard;
@@ -15393,6 +15456,16 @@ static ggml_sycl_prepared_plan_publication ggml_sycl_prepare_plan_publication_lo
 }
 
 static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publication & publication) noexcept {
+    // The measure's plan override is never published, and neither is anything
+    // derived from it (a copy of an accessor's answer included, so a pointer match
+    // would miss it).  This runs before any write below.
+    if (ggml_sycl_measure_plan_override_active()) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override reached a publish\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override reached a publish");
+        }
+        return;
+    }
     // A plan publication can move or release the storage a cached data pointer
     // names; entries filled before it must miss.
     ggml_sycl_tenant_publish_gen_bump();
@@ -15883,6 +15956,28 @@ static bool ggml_sycl_placement_plan_needs_moe_secondary_devices(const ggml_sycl
     return false;
 }
 
+// Was multi-GPU MoE asked for on this host?  Two or more GPUs and not switched off.
+static bool ggml_sycl_moe_multi_gpu_requested() {
+    const char * env = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
+    return ggml_sycl_info().total_gpu_count >= 2 && (!env || std::atoi(env) != 0);
+}
+
+// The one function that turns a plan into "this plan wants the multi-GPU MoE path".
+// The latch's writer applies it to the plan it computes, and the measure's executor
+// reads apply it to the override's plan, so both answer from the same condition.
+static bool ggml_sycl_moe_multi_gpu_wanted(const ggml_sycl::placement_plan & plan) {
+    return ggml_sycl_moe_multi_gpu_requested() && ggml_sycl_placement_plan_needs_moe_secondary_devices(plan);
+}
+
+// The latch as the executor-deciding reads see it: the override's plan under a
+// measure, the process latch otherwise.
+static bool ggml_sycl_moe_multi_gpu_for_executor() {
+    if (g_measure_plan_override) {
+        return g_measure_plan_override->plan && ggml_sycl_moe_multi_gpu_wanted(*g_measure_plan_override->plan);
+    }
+    return g_moe_multi_gpu_active.load(std::memory_order_acquire);
+}
+
 static bool ggml_sycl_placement_plan_moe_needs_other_device(const ggml_sycl::placement_plan & plan,
                                                             int                               execution_device) {
     if (!plan.multi_device) {
@@ -16228,6 +16323,18 @@ void test_clear_kv_placement_plan() {
     g_model_n_layer     = 0;
     g_placement_kv_info = {};
 }
+
+bool test_moe_multi_gpu_for_executor() {
+    return ggml_sycl_moe_multi_gpu_for_executor();
+}
+
+bool test_moe_multi_gpu_latch() {
+    return g_moe_multi_gpu_active.load(std::memory_order_acquire);
+}
+
+bool test_moe_multi_gpu_wanted(const placement_plan & plan) {
+    return ggml_sycl_moe_multi_gpu_wanted(plan);
+}
 #endif
 }  // namespace ggml_sycl
 
@@ -16478,11 +16585,8 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     // weight-zone capacity.  S1 materialization must follow this final plan.
     if (have_plan) {
         const bool   plan_needs_moe_secondary = ggml_sycl_placement_plan_needs_moe_secondary_devices(plan);
-        const auto & info              = ggml_sycl_info();
-        const char * moe_multi_gpu_env = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
-        const bool   moe_multi_gpu_requested =
-            info.total_gpu_count >= 2 && (!moe_multi_gpu_env || std::atoi(moe_multi_gpu_env) != 0);
-        if (moe_multi_gpu_requested && plan_needs_moe_secondary) {
+        const auto & info                     = ggml_sycl_info();
+        if (ggml_sycl_moe_multi_gpu_wanted(plan)) {
             ggml_sycl::init_shared_context_queues(info.total_gpu_count);
 
             int n_registered = 0;
@@ -109006,7 +109110,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
     // to stay ordered with the smart handles that consume them.  This exception
     // applies only to planner residency; normal MUL_MAT validation still applies.
     const bool is_multi_gpu_router_logits =
-        g_moe_multi_gpu_active.load(std::memory_order_acquire) && ggml_sycl_op_is_moe_router_logits_matmul(op);
+        ggml_sycl_moe_multi_gpu_for_executor() && ggml_sycl_op_is_moe_router_logits_matmul(op);
 
     if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {
         GGML_SYCL_DEBUG("[SYCL-SUPPORT] planner rejects %s on SYCL backend (op=%s layer=%d)\n",
@@ -109820,7 +109924,7 @@ static bool ggml_sycl_op_is_host_gate_activation_chain(const ggml_tensor * op, i
         case GGML_OP_RMS_NORM:
             return ggml_sycl_tensor_depends_on_planned_host_weight(op, device, 0);
         case GGML_OP_GLU:
-            return g_moe_multi_gpu_active.load(std::memory_order_acquire) &&
+            return ggml_sycl_moe_multi_gpu_for_executor() &&
                    ggml_sycl_tensor_depends_on_planned_host_weight(op, device, 0);
         default:
             return false;
@@ -110010,7 +110114,7 @@ static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) 
 
     if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && op->src[0] != nullptr &&
         ggml_sycl_weight_executes_on_host(op->src[0], device)) {
-        if (g_moe_multi_gpu_active.load(std::memory_order_acquire) &&
+        if (ggml_sycl_moe_multi_gpu_for_executor() &&
             (ggml_sycl_op_is_moe_routing_subgraph(op) || ggml_sycl_op_is_host_gate_activation_chain(op, device))) {
             return n04bq_tr_final(false, "multi_gpu_moe_routing");
         }
@@ -110027,7 +110131,7 @@ static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) 
 
     if ((op->op == GGML_OP_ADD_ID || op->op == GGML_OP_GLU) &&
         ggml_sycl_tensor_depends_on_planned_host_weight(op, device)) {
-        if (g_moe_multi_gpu_active.load(std::memory_order_acquire) && op->op == GGML_OP_GLU) {
+        if (ggml_sycl_moe_multi_gpu_for_executor() && op->op == GGML_OP_GLU) {
             return n04bq_tr_final(false, "multi_gpu_moe_glu");
         }
         return n04bq_tr_final(true, "addid_glu_depends_host");
@@ -110075,7 +110179,7 @@ static bool ggml_backend_sycl_device_offload_op(ggml_backend_dev_t dev, const gg
         // expert tensors through the wrong contract.
         return true;
     }
-    if (g_moe_multi_gpu_active.load(std::memory_order_acquire) &&
+    if (ggml_sycl_moe_multi_gpu_for_executor() &&
         (ggml_sycl_op_is_moe_routing_subgraph(op) || ggml_sycl_op_is_host_gate_activation_chain(op, device_index))) {
         return true;
     }
@@ -110805,6 +110909,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_has_active_placement_plan") == 0) {
         return (void *) ggml_backend_sycl_has_active_placement_plan;
+    }
+    if (strcmp(name, "ggml_backend_sycl_measure_plan_override_install") == 0) {
+        return (void *) ggml_backend_sycl_measure_plan_override_install;
+    }
+    if (strcmp(name, "ggml_backend_sycl_measure_plan_override_clear") == 0) {
+        return (void *) ggml_backend_sycl_measure_plan_override_clear;
     }
     // llama.cpp-ir18: the model loader asks the placement plan, pre-create_tensor,
     // which dense weights are destined for the host, so it can give those to the CPU

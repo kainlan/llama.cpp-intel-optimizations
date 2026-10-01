@@ -3147,6 +3147,37 @@ set_tests_properties(test-sycl-tensor-placement PROPERTIES
     TIMEOUT 120
 )
 
+# Test: the load-time measure's plan override (zhcn-design §2.10; H5L).  Drives the
+# install/clear procs and the plan accessors, the publish refusal and the
+# plan-derived multi-GPU latch read.  Host code only: no queue or cache is touched.
+# The publish and latch controls it drives are compiled only into the private
+# object backend.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-sycl-measure-plan-override
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-measure-plan-override.cpp
+)
+target_include_directories(test-sycl-measure-plan-override PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-measure-plan-override PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-measure-plan-override PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-measure-plan-override PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-measure-plan-override PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-measure-plan-override COMMAND test-sycl-measure-plan-override)
+set_tests_properties(test-sycl-measure-plan-override PROPERTIES
+    LABELS "sycl;moe;tensor-placement;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+endif()
+
 # Test: ggml_sycl_get_tensor_usage() (ggml-sycl.cpp) -- the production entry
 # point wrapping infer_tensor_usage() with a name->usage cache -- must
 # classify real ggml_tensor objects (via ggml_new_tensor_2d + ggml_set_name)

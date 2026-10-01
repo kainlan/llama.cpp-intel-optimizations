@@ -124,6 +124,8 @@ void stamp_pending_owner(unified_cache_entry & entry, const cache_load_effect & 
 
 std::mutex                                                                   g_lifecycle_plan_mutex;
 std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_plan_candidates;
+// Unpublished probe-placement plans (the load-time measure's (a) stage), keyed by the load's transaction.
+std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_probe_plans;
 std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>>
     g_lifecycle_plan_models;
 std::atomic<uint64_t> g_lifecycle_plan_next_version{ 1 };
@@ -150,14 +152,16 @@ void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept {
 }
 #endif
 
-void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
-                                    placement_plan            plan,
-                                    const placement_kv_info & kv_info,
-                                    uint32_t                  model_n_layer) {
-    if (load_txn_id == 0) {
-        return;
-    }
-    auto snapshot         = std::make_shared<lifecycle_plan_snapshot>();
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_make_candidate_snapshot(uint64_t                  load_txn_id,
+                                                                                 placement_plan            plan,
+                                                                                 const placement_kv_info & kv_info,
+                                                                                 uint32_t model_n_layer) {
+    // A candidate's shape: model_id 0, the load's transaction, version 0 and the
+    // slot fields at their defaults.  The load's own token is derived from the
+    // active transaction, so every identity reader sees the same owner whether the
+    // snapshot is staged (and later stored) or only measured against (the measure
+    // builds one and never stores it).
+    auto snapshot                = std::make_shared<lifecycle_plan_snapshot>();
     snapshot->load_txn_id   = load_txn_id;
     snapshot->model_n_layer = model_n_layer;
     snapshot->kv_info       = kv_info;
@@ -169,6 +173,17 @@ void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
     // current-model tiering verdict kept answering from the PREVIOUS model
     // until commit.
     snapshot->planned_host_bytes = snapshot->plan->weight_host_bytes;
+    return snapshot;
+}
+
+void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
+                                    placement_plan            plan,
+                                    const placement_kv_info & kv_info,
+                                    uint32_t                  model_n_layer) {
+    if (load_txn_id == 0) {
+        return;
+    }
+    auto snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
     std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
     g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
 }
@@ -195,6 +210,36 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placemen
         return candidate == g_lifecycle_plan_candidates.end() ? nullptr : candidate->second;
     } catch (...) {
         return nullptr;
+    }
+}
+
+void lifecycle_stage_probe_placement_plan(uint64_t                  load_txn_id,
+                                          placement_plan            plan,
+                                          const placement_kv_info & kv_info,
+                                          uint32_t                  model_n_layer) {
+    if (load_txn_id == 0) {
+        return;
+    }
+    auto snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
+    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    g_lifecycle_probe_plans[load_txn_id] = std::move(snapshot);
+}
+
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_plan(uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        const auto                  probe = g_lifecycle_probe_plans.find(load_txn_id);
+        return probe == g_lifecycle_probe_plans.end() ? nullptr : probe->second;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        g_lifecycle_probe_plans.erase(load_txn_id);
+    } catch (...) {
     }
 }
 
