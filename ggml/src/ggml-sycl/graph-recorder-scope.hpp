@@ -75,8 +75,30 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 
 namespace ggml_sycl {
+
+// How many command-graph recordings this thread has begun, from every recorder
+// the backend has: the scope below (whole-graph and dense-range recording) and
+// the three hand-ordered MoE recorders, which call graph_record_begin_note() at
+// the point they turn their recording flag on. graph_compute reads it before
+// and after a call, and a difference means the call recorded; that is the one
+// fact the exit hooks branch on (a recording call keeps its staging and has no
+// scatter work to wait for). It lives here, beside the code that begins a
+// recording, so a recorder cannot begin one without being counted.
+inline uint64_t & graph_record_begin_slot() {
+    static thread_local uint64_t begins = 0;
+    return begins;
+}
+
+inline uint64_t graph_record_begins() {
+    return graph_record_begin_slot();
+}
+
+inline void graph_record_begin_note() {
+    ++graph_record_begin_slot();
+}
 
 template <typename Graph, typename Queue, typename Sink, typename Depth = std::atomic<int>>
 struct graph_recording_slots {
@@ -115,6 +137,7 @@ template <typename Graph, typename Queue, typename Sink, typename Depth = std::a
         s_.queue     = queue;
         s_.dispatch  = true;
         active_      = this;
+        graph_record_begin_note();
     }
 
     // Scopes on a thread end in reverse order of construction, so this hands

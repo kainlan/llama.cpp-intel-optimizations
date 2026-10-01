@@ -412,9 +412,6 @@ int g_ggml_sycl_xmx_threshold = 0;
 // Unified dispatch: Set GGML_SYCL_UNIFIED_DISPATCH=1 to use the unified kernel dispatch path
 static std::atomic<int> g_ggml_sycl_unified_dispatch{ -1 };   // -1 = not initialized, 0 = disabled, 1 = enabled
 thread_local bool       g_ggml_sycl_graph_recording = false;  // True when SYCL graph is recording
-// How many recordings this thread has begun.  graph_compute reads it before and
-// after a call to tell a recording call from an eager one (the C2t exit flush).
-static thread_local uint64_t g_graph_record_begins       = 0;
 #ifdef GGML_SYCL_GRAPH
 // Selective graph recording: pause/resume around MoE ops so non-MoE ops
 // get recorded while MoE ops execute outside the graph.
@@ -3078,7 +3075,7 @@ static bool ggml_sycl_placement_plan_moe_needs_other_device(const ggml_sycl::pla
                                                             int                               execution_device);
 
 // ---------------------------------------------------------------------------
-// The dispatch owner (zhcn C6e, rulings M246).
+// The dispatch owner (rulings M246, option A).
 //
 // Several MoE route chains need the model that the dispatching context executes
 // but hold no context: the resolver and the decode candidate collector. A graph
@@ -3138,6 +3135,7 @@ enum class ggml_sycl_into_empty_result : uint8_t {
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<uint64_t> g_into_empty_installs{ 0 };
+static std::atomic<uint64_t> g_into_empty_foreign{ 0 };
 
 static uint64_t ggml_sycl_into_empty_install_count() {
     return g_into_empty_installs.load(std::memory_order_acquire);
@@ -3161,6 +3159,14 @@ static ggml_sycl_into_empty_result ggml_sycl_republish_current_plan_into_empty(
     if (!cache) {
         return ggml_sycl_into_empty_result::NOOP;
     }
+    // The hint: an earlier locked pass found this cache is not a device of this
+    // owner's plan, so a participant-less cache does not take the inventory lock
+    // on every MUL_MAT_ID.  The key names the owning load, so another owner never
+    // matches, and the locked pass below remains the authority.
+    const uint64_t skip_key = (owner.model.value * 0x9E3779B97F4A7C15ULL ^ owner.load.value) | 1ULL;
+    if (cache->into_empty_skip_key() == skip_key) {
+        return ggml_sycl_into_empty_result::NOOP;
+    }
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
     const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value, owner.load.value,
                                                                      owner.owner.slot, owner.owner.generation);
@@ -3177,6 +3183,23 @@ static ggml_sycl_into_empty_result ggml_sycl_republish_current_plan_into_empty(
     }
     const auto current = cache->get_placement_plan_snapshot();
     if (current && current->plan && !current->plan->entries.empty()) {
+        // Never overwritten.  A cache that already holds another load's plan is not
+        // this owner's to fill; say so once per owner so the two-model case is
+        // visible, and leave it alone.
+        if ((current->model_id != selected->model_id || current->load_txn_id != selected->load_txn_id) &&
+            cache->into_empty_foreign_key() != skip_key) {
+            cache->set_into_empty_foreign_key(skip_key);
+            GGML_LOG_WARN(
+                "[CONTEXT-PLAN] into_empty: this device's cache holds model=%llu load=%llu's plan, not the owner's "
+                "model=%llu load=%llu; left as it is\n",
+                (unsigned long long) current->model_id, (unsigned long long) current->load_txn_id,
+                (unsigned long long) owner.model.value, (unsigned long long) owner.load.value);
+        }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        if (current->model_id != selected->model_id || current->load_txn_id != selected->load_txn_id) {
+            g_into_empty_foreign.fetch_add(1, std::memory_order_acq_rel);
+        }
+#endif
         return ggml_sycl_into_empty_result::NOOP;
     }
     bool      participates = false;
@@ -3187,6 +3210,7 @@ static ggml_sycl_into_empty_result ggml_sycl_republish_current_plan_into_empty(
     }
     cache->set_placement_plan_snapshot(participates ? selected : nullptr);
     if (!participates) {
+        cache->set_into_empty_skip_key(skip_key);
         return ggml_sycl_into_empty_result::NOOP;
     }
     const auto installed = cache->get_placement_plan_snapshot();
@@ -10030,7 +10054,7 @@ bool test_moe_storage_handle_first_route_and_negatives() {
     constexpr int expert_id = 3;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     // This test holds no context and binds no dispatch owner, so every resolve
-    // below runs with an unbound owner and must install nothing (C6e).
+    // below runs with an unbound owner and must install nothing (the owner is bound only inside graph compute).
     const uint64_t installs_before = ggml_sycl_into_empty_install_count();
 #endif
     ggml_tensor   tensor{};
@@ -12731,15 +12755,11 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
         // --- Compute Arena: reserve VRAM for compute scratch BEFORE weight preload ---
         // This guarantees FP16 attention scratch has VRAM even after weights fill budget.
         // Reserved unconditionally (arena is needed regardless of weight placement).
-        // Default 512 MB; override with GGML_SYCL_COMPUTE_ARENA_MB=N (0 to disable).
-        size_t       arena_mb = 512;
-        const char * env      = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
-        if (env) {
-            arena_mb = static_cast<size_t>(std::max(0, std::atoi(env)));
-        }
-        if (arena_mb > 0) {
-            const size_t arena_bytes = arena_mb * 1024 * 1024;
-            const int    total_gpus  = ggml_sycl_info().total_gpu_count;
+        // Sized by ggml_sycl_compute_arena_bytes (512 MB, or GGML_SYCL_COMPUTE_ARENA_MB=N,
+        // 0 to disable): the same function the chunk cap's probe set reads.
+        const size_t arena_bytes = ggml_sycl::ggml_sycl_compute_arena_bytes(0);
+        if (arena_bytes > 0) {
+            const int total_gpus = ggml_sycl_info().total_gpu_count;
             for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
                 if (ggml_sycl::unified_cache_total_managed(d) > 0) {
                     if (!ggml_sycl::unified_cache_reserve_compute_arena(d, arena_bytes)) {
@@ -19814,6 +19834,18 @@ static bool ggml_sycl_data_ptr_on_device(const void * ptr) {
 
 // A hit needs the generation AND the tensor's slice identity (computed now) to
 // match the entry's; otherwise the entry is dropped and the caller re-resolves.
+//
+// What the identity compare costs per lookup, so the TG A/B has a bound to be
+// read against: ggml_sycl_tensor_slice_identity walks the tensor's view chain
+// (its depth), then scans the root's extra for a storage handle, which is at most
+// two passes over the routable devices (device-resident first, then any), each
+// pass one mem_handle::resolve(device) per device, plus one resolve of the found
+// handle, one identity() and one narrow.  So it is O(view depth + devices), with
+// devices <= GGML_SYCL_MAX_DEVICES.  It is NOT lock-free: each resolve takes that
+// handle's own leaf spin lock (uncontended on the owner thread) and copies the
+// resolved view, which carries a ready event, so it is an atomic refcount bump.
+// It takes no allocation-registry or zone lock and makes no unified-cache call on
+// a hit (resolve_slow runs only after a cache-generation change).
 static bool ggml_sycl_data_ptr_cache_lookup(const ggml_tensor * tensor, int device, void ** ptr, bool * on_device) {
     auto it = g_data_ptr_cache.find({ tensor, device });
     if (it == g_data_ptr_cache.end()) {
@@ -28597,48 +28629,6 @@ struct ggml_sycl_decode_secondary_candidate {
     int    device = -1;
     double score  = 0.0;
 };
-
-static const sycl_peer_link_info * ggml_sycl_decode_peer_link(int src_device, int dst_device) {
-    return src_device == dst_device ? nullptr : ggml_sycl_get_peer_link_info(src_device, dst_device);
-}
-
-static bool ggml_sycl_decode_remote_direct_path_available(int src_device, int dst_device) {
-    const sycl_peer_link_info * link = ggml_sycl_decode_peer_link(src_device, dst_device);
-    return link && link->valid && link->same_sycl_context && (link->direct_copy_measured || link->l0_can_access_peer);
-}
-
-static double ggml_sycl_decode_remote_estimated_us(int    src_device,
-                                                   int    dst_device,
-                                                   size_t activation_bytes,
-                                                   size_t output_bytes) {
-    if (src_device == dst_device) {
-        return 0.0;
-    }
-    const sycl_peer_link_info * link = ggml_sycl_decode_peer_link(src_device, dst_device);
-    if (!link || !link->valid || std::strcmp(link->preferred_transfer, "unsupported") == 0) {
-        return std::numeric_limits<double>::infinity();
-    }
-
-    const size_t bytes = activation_bytes + output_bytes;
-    if (link->host_bounce_measured && link->host_bounce_us > 0.0 && link->measured_bytes > 0) {
-        // The measured value is one ordered device->host->device bounce.  Decode
-        // secondary work bounces activation bytes to the remote device and
-        // output bytes back, so scale by their sum rather than assuming direct
-        // peer events can be chained.
-        const double scale = static_cast<double>(std::max<size_t>(bytes, link->measured_bytes)) /
-                             static_cast<double>(link->measured_bytes);
-        return link->host_bounce_us * scale;
-    }
-    if (link->direct_copy_measured && link->direct_copy_us > 0.0 && link->measured_bytes > 0) {
-        const double scale = static_cast<double>(std::max<size_t>(bytes, link->measured_bytes)) /
-                             static_cast<double>(link->measured_bytes);
-        return link->direct_copy_us * scale;
-    }
-    if (!link->same_sycl_context) {
-        return std::numeric_limits<double>::infinity();
-    }
-    return 0.0;
-}
 
 static double ggml_sycl_collect_decode_secondary_candidates(
     const ggml_tensor *                                 src0,
@@ -97387,7 +97377,7 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
         recording_depth_incremented = true;
         ggml_sycl::set_graph_retained_handle_sink(retained_handle_sink);
         g_ggml_sycl_graph_recording = true;
-        ++g_graph_record_begins;
+        ggml_sycl::graph_record_begin_note();
         g_recording_graph_ptr       = &moe_graph;
         g_recording_queue_ptr       = stream;
         recording_stage             = "begin-recording";
@@ -98274,7 +98264,7 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             depth_owner.acquire();
             ggml_sycl::set_graph_retained_handle_sink(&sycl_ctx->graph_retained_handles);
             g_ggml_sycl_graph_recording = true;
-            ++g_graph_record_begins;
+            ggml_sycl::graph_record_begin_note();
             g_recording_graph_ptr       = &seg_graph;
             g_recording_queue_ptr       = stream;
             seg_graph.begin_recording(*stream);
@@ -99060,7 +99050,7 @@ static bool moe_graph_record_block_graphs(ggml_backend_sycl_context * sycl_ctx,
             std::vector<ggml_sycl::mem_handle> retained_handles;
             ggml_sycl::set_graph_retained_handle_sink(&retained_handles);
             g_ggml_sycl_graph_recording = true;
-            ++g_graph_record_begins;
+            ggml_sycl::graph_record_begin_note();
             g_recording_graph_ptr       = &block_graph;
             g_recording_queue_ptr       = stream;
             block_graph.begin_recording(*stream);
@@ -100814,16 +100804,23 @@ bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
     }
     auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     try {
-        const int total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+        // The queue waits below have no timeout of their own and run under L0, so a
+        // stuck queue would hold every other thread's re-plan.  The watch logs which
+        // wait is running each interval and never abandons one; under STRICT it aborts.
+        ggml_sycl::ggml_sycl_wait_watch watch("synchronize_for_replan");
+        const int                       total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
         // The device execution queues, waited unconditionally (not last_graph_event): this
         // context's own, then every other device's, which a split graph also submits to.
+        watch.site("the context's device execution queue");
         ctx->stream(ctx->device, 0)->wait();
+        watch.site("another device's execution queue");
         for (int d = 0; d < total; ++d) {
             if (sycl::queue * q = ggml_sycl_execution_queue_for_device(d)) {
                 q->wait();
             }
         }
         // The split secondary, merge and coord queues.
+        watch.site("a split secondary, merge or coord queue");
         if (g_split_config.enabled) {
             if (g_split_secondary_queue_owner) {
                 g_split_secondary_queue_owner->wait();
@@ -100836,20 +100833,24 @@ bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
             }
         }
         // The MoE shared-context queues.
+        watch.site("a MoE shared-context queue");
         for (int d = 0; d < total; ++d) {
             if (sycl::queue * q = ggml_sycl::get_shared_context_queue(d)) {
                 q->wait();
             }
         }
         // The unified cache's queues.
+        watch.site("the unified cache's queues");
         if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
             cache->get_queue().wait();
             cache->get_bcs_queue().wait();
         }
         // The CPU-dispatch queue.
+        watch.site("the CPU-dispatch queue");
         if (sycl::queue * q = ggml_sycl_get_cpu_queue()) {
             q->wait();
         }
+        watch.site("a tensor-parallel queue");
         // The TP queues (unreachable under a plan, waited if non-null) and the TP
         // device-1 worker's own queue.
         for (int d = 0; d < total; ++d) {
@@ -100860,6 +100861,7 @@ bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
         if (g_tp_device1_worker_queue) {
             g_tp_device1_worker_queue->wait();
         }
+        watch.site("a dense block executor copy queue");
         // The dense block executor's copy queues.
         {
             std::lock_guard<std::mutex> lock(g_block_exec_copy_queue_mutex);
@@ -100869,6 +100871,7 @@ bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
                 }
             }
         }
+        watch.site("a PP pipeline copy queue");
         // The PP pipeline copy queues, when GGML_SYCL_PP_PIPELINE created them.
         {
             std::lock_guard<std::mutex> lock(g_pipeline_copy_queue_mutex);
@@ -108929,6 +108932,18 @@ normal_dispatch:
 // g_graph_staged_owners; they leave through the retained store bound to the
 // graph's completion, never parked in a cache.  A recording call handed its
 // owners to the recording sink when it staged them.
+//
+// Why this is safe after the C6 drop and with no L0 token held: the list is
+// thread_local, filled only by ggml_sycl_graph_staged_owner_add on the thread
+// that runs this graph_compute and emptied only here and in the exceptional
+// exit on that same thread, so nothing else can observe it half-moved.  The one
+// shared step is retain_handles_until_event, which takes the retained store's
+// own lock.  A re-plan that reaps the store concurrently either runs before this
+// publish (and finds the store without these owners, which no re-plan may claim:
+// the call that holds them has not returned) or after it (and finds them bound
+// to this graph's completion event, which it waits).  graph_compute holds no L0
+// token (witnessed at its entry), so the publish never nests a store lock inside
+// one.
 static void ggml_sycl_graph_staged_owners_publish(ggml_backend_sycl_context * ctx) {
     if (g_graph_staged_owners.empty()) {
         return;
@@ -108948,20 +108963,33 @@ static void ggml_sycl_graph_staged_owners_publish(ggml_backend_sycl_context * ct
 // (zhcn-design §3.1.1: C2t, C5a, C6, C13).
 //
 //  * C2t: an EAGER call flushes every thread-local MoE scatter and CPU-expert
-//    list.  A RECORDING call must reach its exit with all four empty (its scatter
-//    state is the recording sink's, or the record is refused); a non-empty list
-//    there is a [CONTEXT-PLAN-BUG], and it is flushed anyway, so a scatter is never
-//    skipped.  The flush is legal here: the recording has ended.
+//    list (zhcn-design 3.1.1 C2t).  A RECORDING call is exempt: CPU-expert
+//    dispatch is off while a graph records (ggml_sycl_cpu_offload_active_for_compute
+//    reads the recording state), so its four lists are empty at the exit and it
+//    waits for nothing.  Non-empty lists at a recording exit mean a producer ran
+//    inside a recording, which is a [CONTEXT-PLAN-BUG]; they are drained anyway,
+//    so a scatter is never skipped, and that drain is the only wait a recording
+//    call can reach.  (The three MoE segment recorders turn the flag off between
+//    their segments, so CPU work they run there is eager work: it is drained
+//    here, and its WARN is what a producer inside a recording looks like too.)
+//    The eager flush is itself a host wait, which principle P4 forbids; the spec
+//    keeps it for now (it is the base's own end-of-graph fence), and
+//    llama.cpp-flv8 tracks replacing it by an event chain.
 //  * C5a: the activation-keyed MoE maps are dropped now, not at the next graph's
-//    start (they hold only identities, so this is the extra measure §B.2 allows).
+//    start (they hold only identities, so this is the extra measure 3.1.1 allows).
 //  * C6: the data-pointer cache is dropped likewise, and the staged owners go to
 //    the retained store.
 //  * C13: staging entries that are tenant slices are released on an eager exit.
+//    A recording call keeps them: the graph it recorded has their addresses baked in.
+//
+// `recorded_call` is true when a command graph began recording on this thread
+// during the call, from any recorder (ggml_sycl::graph_record_begins).
 //
 // Returns false when a step failed (the caller reports GGML_STATUS_FAILED).
 static bool ggml_sycl_graph_compute_exit(ggml_backend_sycl_context * ctx, bool recorded_call) {
     try {
-        if (recorded_call && ggml_sycl_cpu_tg_pending_any()) {
+        const bool scatter_pending = recorded_call && ggml_sycl_cpu_tg_pending_any();
+        if (scatter_pending) {
             GGML_LOG_WARN(
                 "[CONTEXT-PLAN-BUG] a recording graph_compute reached its exit with MoE scatter state "
                 "pending\n");
@@ -108971,7 +108999,8 @@ static bool ggml_sycl_graph_compute_exit(ggml_backend_sycl_context * ctx, bool r
                     "pending");
             }
         }
-        if (!ggml_sycl_cpu_tg_exit_flush_skipped_for_test()) {
+        if ((!recorded_call || scatter_pending) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()) {
+            // A host wait (P4): the eager exit fence the spec keeps; llama.cpp-flv8.
             ggml_sycl_cpu_tg_flush_pending();
         }
         ggml_sycl_moe_ids_cache_new_graph();
@@ -108993,7 +109022,7 @@ static ggml_status ggml_sycl_graph_compute_exit_status(ggml_backend_t backend,
                                                        ggml_status    status,
                                                        uint64_t       record_begins_before) {
     auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
-    if (!ggml_sycl_graph_compute_exit(ctx, g_graph_record_begins != record_begins_before)) {
+    if (!ggml_sycl_graph_compute_exit(ctx, ggml_sycl::graph_record_begins() != record_begins_before)) {
         return GGML_STATUS_FAILED;
     }
     return status;
@@ -109106,7 +109135,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     } attn_graph_profile_guard{ ggml_sycl_attn_sync_profile_enabled(), cgraph ? cgraph->n_nodes : -1,
                                 std::chrono::steady_clock::now() };
 
-    const uint64_t record_begins_before = g_graph_record_begins;
+    const uint64_t record_begins_before = ggml_sycl::graph_record_begins();
     try {
 #if GGML_SYCL_DNNL
         // llama.cpp-6405: GGML_SYCL_MXFP4_PP_PROFILE component 5 ("everything

@@ -65,7 +65,9 @@ class alloc_owner {
     // literal or other externally-owned stable string).  The tag lives on the
     // intrusive control, so every copy and slice of the handle reads the same
     // one through mem_handle::tenant_cohort().  Set by the tenant carve before
-    // the owner is shared; null (the default) means "not a tenant".
+    // the owner is shared, and only once: a second set with any cohort aborts
+    // ("[TENANT] allocation already tagged"), and a null cohort is ignored.
+    // Null (the default) means "not a tenant".
     void set_tenant_cohort(const char * cohort) noexcept;
 
   private:
