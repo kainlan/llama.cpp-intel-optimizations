@@ -29427,7 +29427,7 @@ static bool ggml_sycl_moe_prompt_layout_executable(const ggml_tensor * src0, int
     const int64_t                  n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
     const moe_planned_layout_probe probe     = ggml_sycl_probe_moe_planned_layout(src0, device, layout);
     return moe_mmvq_prompt_layout_cover_executable(probe.local, probe.secondary, probe.host, probe.missing,
-                                                   static_cast<size_t>(n_experts));
+                                                   static_cast<size_t>(std::max<int64_t>(0, n_experts)));
 }
 
 static bool ggml_sycl_moe_prompt_specialized_layouts_enabled() {
@@ -29688,10 +29688,13 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     fprintf(stderr,
                             "[GRAPH-MOE-LAYOUT] tensor=%s device=%d plan=1 skip=%s host_weights=%d local=%zu "
-                            "secondary=%zu host=%zu missing=%zu reason=prompt-gateup-xmx-tiled-incomplete\n",
+                            "secondary=%zu host=%zu missing=%zu reason=%s\n",
                             src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(GGML_LAYOUT_XMX_TILED),
                             host_weights ? 1 : 0, gateup_xmx_probe.local, gateup_xmx_probe.secondary,
-                            gateup_xmx_probe.host, gateup_xmx_probe.missing);
+                            gateup_xmx_probe.host, gateup_xmx_probe.missing,
+                            gateup_xmx_probe.local == 0 && gateup_xmx_probe.missing == 0 ?
+                                "prompt-gateup-xmx-tiled-no-device-entries" :
+                                "prompt-gateup-xmx-tiled-incomplete");
                 }
             }
             const moe_planned_layout_probe soa_probe =
@@ -29982,11 +29985,17 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
                     best_probe.local, best_probe.secondary, best_probe.host, best_probe.missing, host_weights ? 1 : 0);
         }
         if (prompt_incomplete_layout) {
+            // best_layout is the least-bad candidate, usually SOA, whose probe is "no entry at that layout".
+            // The layout the planner actually loaded is what an operator needs to see, so print its cover too.
+            const moe_planned_layout_probe loaded_xmx_probe =
+                ggml_sycl_probe_moe_planned_layout(src0, device, GGML_LAYOUT_XMX_TILED);
             GGML_ABORT(
                 "[GRAPH-MOE-LAYOUT] prompt MoE plan selected incomplete executable layout tensor=%s device=%d "
-                "layout=%s local=%zu secondary=%zu host=%zu missing=%zu; planner must budget a complete PP layout",
+                "layout=%s local=%zu secondary=%zu host=%zu missing=%zu; at xmx_tiled local=%zu secondary=%zu "
+                "host=%zu missing=%zu; planner must budget a complete PP layout",
                 src0 && src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(best_layout),
-                best_probe.local, best_probe.secondary, best_probe.host, best_probe.missing);
+                best_probe.local, best_probe.secondary, best_probe.host, best_probe.missing, loaded_xmx_probe.local,
+                loaded_xmx_probe.secondary, loaded_xmx_probe.host, loaded_xmx_probe.missing);
         }
         const bool decode_incomplete_layout =
             n_tokens <= 1 && src0 && src0->type == GGML_TYPE_MXFP4 && best_layout != GGML_LAYOUT_AOS;
@@ -30048,8 +30057,12 @@ static layout_mode ggml_sycl_moe_layout_for_selected_rows(const ggml_tensor * sr
     }
     if (n_tokens > 1) {
         const bool allow_prompt_xmx = ggml_sycl_xmx_moe_allow_unsafe_pp();
-        if (allow_prompt_xmx && ggml_sycl_planner_authoritative_residency_active(device) &&
-            (moe_kind == MOE_TENSOR_GATE || moe_kind == MOE_TENSOR_UP)) {
+        // DOWN is kept only where admission could have chosen XMX_TILED for it (the same opt-in that the
+        // planned-primary and gate/up-style admission check); otherwise a mixed DOWN admitted at XMX_TILED
+        // would be rewritten to a SOA route over xmx-only entries.
+        const bool keep_xmx_role    = moe_kind == MOE_TENSOR_GATE || moe_kind == MOE_TENSOR_UP ||
+                                   (moe_kind == MOE_TENSOR_DOWN && ggml_sycl_moe_down_xmx_tiled_enabled());
+        if (allow_prompt_xmx && ggml_sycl_planner_authoritative_residency_active(device) && keep_xmx_role) {
             const moe_planned_layout_probe xmx_probe = ggml_sycl_probe_moe_planned_layout(src0, device, layout);
             const int64_t                  n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
             if (moe_mmvq_prompt_layout_cover_executable(xmx_probe.local, xmx_probe.secondary, xmx_probe.host,

@@ -131,11 +131,15 @@ inline bool moe_mmvq_mxfp4_direct_reads_layout(enum ggml_layout_mode layout) {
 //
 // Placement decides the executor: a device entry runs on the device at the layout it is loaded in,
 // a host entry runs on the CPU. So every expert is covered when nothing is missing, nothing sits on
-// a secondary device (the secondary prompt executor is unvalidated), and device + host add up to the
-// whole tensor. Requiring host == 0 -- "all experts on the device" -- turned a mixed tensor (a few
+// a secondary device (the secondary prompt executor is unvalidated), and at least one entry is on
+// the device. Requiring host == 0 -- "all experts on the device" -- turned a mixed tensor (a few
 // experts in VRAM, the rest on the host) into an abort that asked for a SOA copy the single-layout
-// planner never builds (llama.cpp-f6zo). local > 0 keeps an all-host tensor on the host path, where
-// it needs no device layout at all.
+// planner never builds (llama.cpp-f6zo).
+//
+// local > 0 only separates the two outcomes for an all-host tensor: its route layout stays SOA with
+// host operands, because a host entry needs no device layout. local + host == n_experts is a defence
+// of the probe's invariant (each expert is counted exactly once), not a condition production can
+// reach with missing == 0 and secondary == 0; it fails closed if the probe ever double counts.
 inline bool moe_mmvq_prompt_layout_cover_executable(size_t local,
                                                     size_t secondary,
                                                     size_t host,

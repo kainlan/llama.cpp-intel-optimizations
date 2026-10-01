@@ -42,6 +42,16 @@ THE CONTRACT.
   A3. the cached planned layout is revalidated by the same predicate, or a mixed tensor would be
       invalidated and recomputed on every call.
   A4. the prompt DOWN planned-primary admission uses it too.
+  A2b. selected-rows keeps XMX_TILED for DOWN exactly where admission could have chosen it for DOWN
+      (GGML_SYCL_MOE_DOWN_XMX_TILED), or a mixed DOWN admitted at XMX_TILED is rewritten to a SOA route
+      over xmx-only entries.
+  K.  the abort prints the cover at xmx_tiled -- the layout the planner loaded -- next to the SOA
+      candidate's, whose "local=0 missing=1" alone is what sent the first report astray.
+  L.  an all-host tensor is logged as `no-device-entries`, not `incomplete` (it has missing=0).
+  C.  counts that make a NEW strict or loose spelling fail the gate: the strict
+      ggml_sycl_moe_planned_layout_complete keeps exactly its current callers (the fused executors and
+      the materializers), the loose wrapper keeps exactly its two callers, and the strict probe
+      spelling `.local == static_cast<size_t>` appears only where decode needs it.
   S.  ggml_sycl_moe_planned_layout_complete stays STRICT (all experts local): the fused PP executors
       and the materializers read it as "a single device pointer table exists" and must keep
       declining a mixed tensor.
@@ -132,7 +142,7 @@ def check(src: str) -> None:
     gateup = region(
         code,
         "const moe_planned_layout_probe gateup_xmx_probe =",
-        "reason=prompt-gateup-xmx-tiled-incomplete",
+        "prompt-gateup-xmx-tiled-incomplete",
     )
     if not re.search(r"if \(" + predicate_call("gateup_xmx_probe") + r"\) \{", gateup) or re.search(
         r"if \([^{]*(gateup_xmx_probe\.host == 0|gateup_xmx_probe\.local == static_cast)", gateup
@@ -186,6 +196,44 @@ def check(src: str) -> None:
             f"(ggml_sycl_moe_planned_layout_complete) {TAG}"
         )
 
+    # A2b.  selected-rows keeps XMX_TILED for the roles admission can choose it for.
+    keep_role = re.search(r"const bool keep_xmx_role = ([^;]*);", squash(code))
+    if (
+        not keep_role
+        or "MOE_TENSOR_GATE" not in keep_role.group(1)
+        or "MOE_TENSOR_UP" not in keep_role.group(1)
+        or not re.search(r"MOE_TENSOR_DOWN && ggml_sycl_moe_down_xmx_tiled_enabled\(\)", keep_role.group(1))
+        or not re.search(r"authoritative_residency_active\(device\) && keep_xmx_role\) \{", squash(code))
+    ):
+        raise ContractError(
+            "FAIL [pin A2b]: ggml_sycl_moe_layout_for_selected_rows does not keep XMX_TILED for a DOWN tensor that "
+            "admission may have chosen it for (keep_xmx_role = GATE || UP || DOWN && "
+            f"ggml_sycl_moe_down_xmx_tiled_enabled()); a mixed DOWN becomes a SOA route over xmx-only entries {TAG}"
+        )
+
+    # K.  The abort names the cover at the layout the planner loaded.
+    abort_body = region(code, "const moe_planned_layout_probe loaded_xmx_probe =", "const bool decode_incomplete_layout")
+    if "ggml_sycl_probe_moe_planned_layout(src0, device, GGML_LAYOUT_XMX_TILED)" not in abort_body or not re.search(
+        r"at xmx_tiled local=%zu secondary=%zu (?:\" \")?host=%zu missing=%zu.*loaded_xmx_probe\.local, loaded_xmx_probe\.secondary, "
+        r"loaded_xmx_probe\.host, loaded_xmx_probe\.missing",
+        abort_body,
+    ):
+        raise ContractError(
+            "FAIL [pin K]: the incomplete-prompt-layout abort prints only the SOA candidate's probe (local=0 missing=1 "
+            f"for a tensor whose entries are xmx_tiled); it must also print the cover at xmx_tiled {TAG}"
+        )
+
+    # L.  An all-host tensor is not "incomplete".
+    if "prompt-gateup-xmx-tiled-no-device-entries" not in code or not re.search(
+        r"gateup_xmx_probe\.local == 0 && gateup_xmx_probe\.missing == 0 \? \"prompt-gateup-xmx-tiled-no-device-entries\" : "
+        r"\"prompt-gateup-xmx-tiled-incomplete\"",
+        squash(code),
+    ):
+        raise ContractError(
+            "FAIL [pin L]: an all-host tensor (local=0 missing=0) is logged as `prompt-gateup-xmx-tiled-incomplete`; "
+            f"it must say `no-device-entries` {TAG}"
+        )
+
     # S.  The strict test stays strict.
     strict = region(
         code,
@@ -204,11 +252,36 @@ def check(src: str) -> None:
 
     # G.  The abort stays: a prompt layout with a missing expert must still refuse loudly.
     if len(re.findall(r"prompt MoE plan selected incomplete executable layout", code)) != 1 or not re.search(
-        r"if \(prompt_incomplete_layout\) \{ GGML_ABORT\(", squash(code)
+        r"if \(prompt_incomplete_layout\) \{ const moe_planned_layout_probe loaded_xmx_probe = [^;]*; GGML_ABORT\(\"\[GRAPH-MOE-LAYOUT\] prompt MoE plan selected",
+        squash(code),
     ):
         raise ContractError(
             f"FAIL [pin G]: the incomplete-prompt-layout abort was removed or weakened; the fix is to ask the loaded "
             f"layout, not to stop refusing a missing expert {TAG}"
+        )
+
+    # C.  Counts: a new strict or loose spelling fails the gate and must be decided on purpose.
+    flat = squash(code)
+    n_strict_callers = len(re.findall(r"ggml_sycl_moe_planned_layout_complete\(", flat))
+    if n_strict_callers != 18:
+        raise ContractError(
+            f"FAIL [pin C1]: ggml_sycl_moe_planned_layout_complete( appears {n_strict_callers} times, expected 18 "
+            "(its definition and 17 fused-executor / materializer callers); a caller that moved to the loose wrapper "
+            "would let the fused path take a mixed tensor, a new caller must decide strict vs "
+            f"ggml_sycl_moe_prompt_layout_executable on purpose and update this count {TAG}"
+        )
+    n_loose = len(re.findall(r"ggml_sycl_moe_prompt_layout_executable\(", flat))
+    if n_loose != 3:
+        raise ContractError(
+            f"FAIL [pin C2]: ggml_sycl_moe_prompt_layout_executable( appears {n_loose} times, expected 3 (its "
+            f"definition, the cached-layout revalidation and the DOWN planned-primary admission) {TAG}"
+        )
+    n_spell = len(re.findall(r"\.local == static_cast<size_t>", flat))
+    if n_spell != 3:
+        raise ContractError(
+            f"FAIL [pin C3]: the strict probe spelling `.local == static_cast<size_t>` appears {n_spell} times, expected "
+            "3 (ggml_sycl_moe_planned_layout_complete and the two decode phase-complete admissions); a new one in a "
+            f"prompt admission path is the defect this ticket removed {TAG}"
         )
 
     # H.  The backend wrapper: the probe at the REQUESTED layout, judged by the predicate.
@@ -218,7 +291,7 @@ def check(src: str) -> None:
         "static bool ggml_sycl_moe_prompt_specialized_layouts_enabled(",
     )
     if "ggml_sycl_probe_moe_planned_layout(src0, device, layout)" not in helper or not re.search(
-        predicate_call("probe", r"static_cast<size_t>\(n_experts\)"), helper
+        predicate_call("probe", r"static_cast<size_t>\(std::max<int64_t>\(0, n_experts\)\)"), helper
     ):
         raise ContractError(
             "FAIL [pin H]: ggml_sycl_moe_prompt_layout_executable must probe the REQUESTED layout and judge the probe "
@@ -332,8 +405,49 @@ def self_test(src: str) -> int:
         "H",
     )
     expect_fail(
+        "selected-rows-keeps-gateup-only",
+        resub(
+            r"(keep_xmx_role\s*=\s*moe_kind == MOE_TENSOR_GATE \|\| moe_kind == MOE_TENSOR_UP)\s*\|\|\s*\(moe_kind == MOE_TENSOR_DOWN"
+            r" && ggml_sycl_moe_down_xmx_tiled_enabled\(\)\);",
+            r"\g<1>;",
+        ),
+        "A2b",
+    )
+    expect_fail(
+        "abort-drops-the-xmx-cover",
+        resub(r"at xmx_tiled local=%zu secondary=%zu \"\s*\"host=%zu missing=%zu; ", ""),
+        "K",
+    )
+    expect_fail(
+        "all-host-still-called-incomplete",
+        resub(r"gateup_xmx_probe\.local == 0 && gateup_xmx_probe\.missing == 0 \?\s*\"prompt-gateup-xmx-tiled-no-device-entries\" :\s*",
+              ""),
+        "L",
+    )
+    expect_fail(
+        "fused-caller-moved-to-loose-wrapper",
+        sub("!ggml_sycl_moe_planned_layout_complete(src0, device, GGML_LAYOUT_XMX_TILED)) {\n        return false;",
+            "!ggml_sycl_moe_prompt_layout_executable(src0, device, GGML_LAYOUT_XMX_TILED)) {\n        return false;"),
+        "C1",
+    )
+    expect_fail(
+        "new-loose-caller",
+        sub("static bool ggml_sycl_moe_prompt_specialized_layouts_enabled() {",
+            "static bool ggml_sycl_moe_prompt_specialized_layouts_enabled() {\n"
+            "    (void) ggml_sycl_moe_prompt_layout_executable(nullptr, 0, GGML_LAYOUT_SOA);"),
+        "C2",
+    )
+    expect_fail(
+        "new-strict-spelling",
+        sub("static bool ggml_sycl_moe_prompt_specialized_layouts_enabled() {",
+            "static bool ggml_sycl_moe_prompt_specialized_layouts_enabled() {\n"
+            "    (void) (moe_planned_layout_probe{}.local == static_cast<size_t>(1));"),
+        "C3",
+    )
+    expect_fail(
         "abort-removed",
-        sub("if (prompt_incomplete_layout) {\n            GGML_ABORT(", "if (false) {\n            GGML_ABORT("),
+        sub("GGML_ABORT(\n                \"[GRAPH-MOE-LAYOUT] prompt MoE plan selected",
+            "GGML_LOG_ERROR(\n                \"[GRAPH-MOE-LAYOUT] prompt MoE plan selected"),
         "G",
     )
 
@@ -347,7 +461,7 @@ def self_test(src: str) -> int:
     if failures:
         print(f"SELF-TEST FAIL: {', '.join(failures)}")
         return 1
-    print("SELF-TEST PASS: 9 mutants caught, each on its own pin; unmodified tree passes")
+    print("SELF-TEST PASS: 15 mutants caught, each on its own pin; unmodified tree passes")
     return 0
 
 
