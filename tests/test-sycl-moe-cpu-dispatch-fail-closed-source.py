@@ -39,10 +39,9 @@ request (GGML_ABORT), instead of returning, continuing or logging:
   5. dispatch_cpu_entries_now's staging-failure block aborts and contains no return;
   6. the catch blocks in flush_pending_cpu_scatter and flush_pending_cpu_pipeline abort.
 
-THE MOST LIKELY CAUSE of the intermittent allocation failure (the other half of llama.cpp-93tw;
-inferred from the source, supported by the GPU result alloc_err=4 in 6 of 9 runs before the fix
-and 0 of 14 after, and not yet observed directly -- run with GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE=1
-and look for [UNIFIED-ALLOC-STALE-CLAIM]).  A release marks its registry row RELEASING under g_runtime_alloc_mutex, drops the lock, frees the
+THE CAUSE of the intermittent allocation failure (the other half of llama.cpp-93tw; observed
+with GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE=1, which logs each [UNIFIED-ALLOC-STALE-CLAIM]).  A
+release marks its registry row RELEASING under g_runtime_alloc_mutex, drops the lock, frees the
 physical block (host_zone_free returns it to the TLSF immediately), and only then re-locks to
 erase the row.  An allocation on another thread that is handed the recycled address in that
 window published its control, found the stale row, "never replaced a live pointer row" and

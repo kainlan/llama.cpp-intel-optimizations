@@ -1412,12 +1412,11 @@ struct stale_claim_report {
 
 // Claim `ptr` for a registry row that is about to be inserted.  Caller holds g_runtime_alloc_mutex.
 //
-// Most likely cause of the intermittent metadata_publication_failed / "Failed to allocate pinned
-// host memory" on a small staging request with ample free memory (llama.cpp-93tw; the claim is not
-// yet observed directly -- run with GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE=1 and look for
-// [UNIFIED-ALLOC-STALE-CLAIM]).  A release marks its row RELEASING, drops the mutex, frees the
-// physical block (a host zone returns it to the TLSF immediately) and only then re-locks to erase
-// the row.  In that window an allocation on another thread can be handed the recycled address.
+// Observed cause (llama.cpp-93tw) of the intermittent metadata_publication_failed / "Failed to
+// allocate pinned host memory" on a small staging request with ample free memory; run with
+// GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE=1 and look for [UNIFIED-ALLOC-STALE-CLAIM] to see it.
+// A release on another thread marks its row RELEASING, drops the mutex, frees the physical block
+// (a host zone returns it to the TLSF immediately) and only then re-locks to erase the row.  In that window an allocation on another thread can be handed the recycled address.
 // The row found there is not live authority: the allocator just handed the address out, so the
 // block it described is already free.  Failing the allocation on it (the old behaviour) surfaced
 // as alloc_err=4 (metadata_publication_failed).  The releaser's later erase and rollback both
