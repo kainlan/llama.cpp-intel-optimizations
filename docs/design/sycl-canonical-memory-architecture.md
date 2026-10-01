@@ -946,7 +946,7 @@ are grouped by subsystem:
 | `fused-moe-esimd.hpp`, `gpu-sampler.hpp` | ~10 | `llama.cpp-32dg8.6` | Migrate to `unified_allocate` |
 | `ggml-sycl.cpp` MoE + TP paths | ~30 | `llama.cpp-32dg8.6` | Migrate to planner + `unified_allocate` |
 | `unified-cache.cpp` internals | all | — | Allowed permanently as raw-malloc gateway |
-| `dpct/helper.hpp` (vendored upstream) | 3, pinned by function, raw name and count 1 each: `dpct_malloc` / `malloc_device`; `device_memory::allocate_device` / `malloc_shared` and / `malloc_device` | — (sanctioned-vendored; rulings §M247) | Allowed permanently, not edited (rebase churn). `test-sycl-alloc-zone-contract` clause (e) pins the three sites and forbids `dpct_malloc` and the `dpct::device_memory`, `global_memory`, `constant_memory` and `shared_memory` names everywhere outside `dpct/helper.hpp`. Any transient intent for these sites belongs to `llama.cpp-6lfq` |
+| `dpct/helper.hpp` (vendored upstream) | 3, pinned by function, raw name and count 1 each: `dpct_malloc` / `malloc_device`; `device_memory::allocate_device` / `malloc_shared` and / `malloc_device` | — (sanctioned-vendored; disposition carried by `llama.cpp-23mk`) | Allowed permanently, not edited (rebase churn). `test-sycl-alloc-zone-contract` clause (e) pins the three sites and forbids `dpct_malloc` and the `dpct::device_memory`, `global_memory`, `constant_memory` and `shared_memory` names everywhere outside `dpct/helper.hpp`. Any transient intent for these sites belongs to `llama.cpp-6lfq` |
 | Test files under `tests/` | all | — | Allowed permanently (see §8) |
 
 ### 9.2 Host-residency predicates (caller-side "is on host?" checks)

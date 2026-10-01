@@ -14,8 +14,8 @@ llama.cpp-23mk S2). JSON has no comments, so each file also carries a `_doc` fie
 Allowlist entries added in S2b (clause e): the raw allocator chain's three links in `unified-cache.cpp`
 (`E-CHAIN-ALIGNED`, `E-CHAIN-TRACKED`, `E-CHAIN-RAW`; canonical contract sections 3 and 9.1, 23mk census row
 `:18789/:18830/:1433`) and the three raw calls in vendored `dpct/helper.hpp` (`E-DPCT-MALLOC`,
-`E-DPCT-DEVMEM-DEVICE`, `E-DPCT-DEVMEM-SHARED`; rulings M247). Each pins its function and count, so a second call, a
-renamed function or a swapped allocator fails. The canonical contract has no row for dpct. Outside `dpct/helper.hpp`
+`E-DPCT-DEVMEM-DEVICE`, `E-DPCT-DEVMEM-SHARED`; canonical contract section 9.1, the dpct row, with rulings M247 second). Each pins its function and count, so a second call, a
+renamed function or a swapped allocator fails. Outside `dpct/helper.hpp`
 the names `dpct_malloc` (identifier) and `device_memory`, `global_memory`, `constant_memory`, `shared_memory` (type
 names) are clause (e) hits; a variable or parameter that is merely spelled `device_memory` is not.
 
@@ -24,6 +24,10 @@ Host raw allocator names (S2c): `malloc_host`, `aligned_alloc_host`, `zeMemAlloc
 Their six hits in `unified-cache.cpp` are allowlisted (`E-CHAIN-HOST-RAW`, `E-CHAIN-HOST-TRACKED`, `E-HOST-USM-BASE`, and the two
 CACHE_BACKING bootstrap sites `E-BACKING-STAGING`, `E-BACKING-FLAG-SLAB`; canonical contract sections 3, 3.1 and 9.1); the
 seventh, `unified_cache::allocate`'s last-resort fallback, is E-RAW debt with fate `deleted-by-D-disposition`.
+
+Known gap: an aliased namespace (`namespace sy = sycl; sy::malloc(n, q, sycl::usm::alloc::host)`) escapes the qualified
+`sycl::malloc` / `sycl::aligned_alloc` check, since the match is on the spelled scope. The named forms (`malloc_host` and the
+rest) are matched wherever they appear.
 
 Finding codes added by clause (c): `C-COHORT` (a copy of a request that is handed on without its own cohort
 literal) and `C-SITE` (a wrapper from one request type to another that does not copy the source's site fields).

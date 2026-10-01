@@ -24,7 +24,7 @@ What this unit (S2a, S2b, S2c) enforces
       #define body) outside the allowlist. dpct's allocating entry points, `dpct_malloc` (identifier) and
       the classes `device_memory`, `global_memory`, `constant_memory`, `shared_memory` (type names), are forbidden
       outside dpct/helper.hpp; helper.hpp's own three raw calls are allowlisted by function name and count
-      (rulings M247: vendored upstream, not edited, dead in-tree)
+      (canonical contract section 9.1, the dpct row; vendored upstream, not edited, dead in-tree; rulings M247 second)
       The host side is covered too: malloc_host, aligned_alloc_host, zeMemAllocHost, the generic `sycl::malloc` and
       `sycl::aligned_alloc` (qualified by sycl:: only, because the bare names are the C library's), and the host raw
       chain's wrappers unified_cache_raw_malloc_host and unified_cache_malloc_host_tracked.
@@ -192,6 +192,8 @@ DPCT_HOME = "dpct/helper.hpp"
 DPCT_FUNCS = ("dpct_malloc",)
 DPCT_CLASSES = ("device_memory", "global_memory", "constant_memory", "shared_memory")
 
+SHARDS = 4   # the ctest registers this many shards; cmake_witness pins the registration to it
+
 DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h). Shrink-only: a violation not listed "
             "fails, and a listed entry that no longer violates fails. Every E-RAW entry carries a fate (deleted-by-*, "
             "converted-by-*, sanctioned-internal, sanctioned-vendored or pending-disposition) and a cite, so an entry no step will ever "
@@ -203,8 +205,8 @@ CITE_MIN = 12   # a cite names a ticket or a design/census row; "tbd" is not one
 # Clause (g): a handler that can swallow ggml_sycl_fallback_error must be preceded, in the same try, by a handler for it
 # whose body is exactly `throw;`. One pattern for the AST and for macro bodies, so no spelling escapes (a const in either
 # position, with or without std::, with or without the &).
-HANDLER_RE = re.compile(r"catch\s*\(\s*(\.\.\.|(const\s+)?(std::)?exception(?![A-Za-z0-9_])(\s+const)?\s*&?)")
-GUARD_RE = re.compile(r"catch\s*\(\s*(const\s+)?(?:ggml_sycl::)?ggml_sycl_fallback_error(?![A-Za-z0-9_])(\s+const)?\s*&?\s*"
+HANDLER_RE = re.compile(r"catch\s*\(\s*(\.\.\.|(const\s+)?(?:::)?(?:std::)?exception(?![A-Za-z0-9_])(\s+const)?\s*&?)")
+GUARD_RE = re.compile(r"catch\s*\(\s*(const\s+)?(?:::)?(?:ggml_sycl::)?ggml_sycl_fallback_error(?![A-Za-z0-9_])(\s+const)?\s*&?\s*"
                       r"(?:[A-Za-z_][A-Za-z0-9_]*\s*)?\)\s*\{\s*throw\s*;\s*\}")
 # Clause (h): the two class fields every writer must name by node.
 H_FIELDS = ("cascade_step", "unconverted_ticket")
@@ -973,12 +975,6 @@ def is_use(src, ident, decl):
     return True
 
 
-def assign_last_field(src, an):
-    """The last field written by an assignment, or None for a whole-object assignment."""
-    _, chain = lhs_chain(src, fld(an, "left"))
-    return chain[0] if chain else None
-
-
 def request_valued(src, ctx, node, auto_names):
     """True when an initialiser expression evidently has a request type: a request variable or parameter, a member
     chain ending in a request member or intent/constraints, std::move of one, or a call returning a request."""
@@ -1640,7 +1636,7 @@ def param_and_stray_records(env, root):
     the callers). What no request claims -- a member written in a method or through `this->`, an alias of a member --
     is still refused when it writes COUNT to the zone or false to the forbid, and so is a helper that does so through a
     request it takes by reference (its callers fail too, since they inherit the write)."""
-    src, ctx, rel = env.src, env.ctx, env.rel
+    src, ctx = env.src, env.ctx
     out = []
     for fnode in (d[3] for d in file_defs(src)):
         body = fld(fnode, "body")
@@ -1855,7 +1851,6 @@ def scan_file(rel, src, ctx):
     """Facts about one file, as plain data: constructions, form findings, raw hits, error tokens."""
     value_types, all_types = ctx.value_types, ctx.all_types
     env = Env(rel, src, ctx)
-    h = env.h
     root = parse(src)
     root_error = kind(root) == "ERROR"
     constructions, raws, errtoks, forms = [], [], [], []
@@ -2426,7 +2421,7 @@ WITNESSES = {
     "r3i1": "a braced assignment to intent/constraints discards earlier writes",
     "r3i2": "braced arguments in constructor and new forms", "r3m1": "parenthesised left sides",
     "r3n": "raw strings split across adjacent literals; compound macro writes",
-    "f": "missing tree_sitter_language_pack exits 1", "cmake": "the ctest never passes a regeneration flag",
+    "f": "missing tree_sitter_language_pack exits 1", "cmake": "the ctest registrations: the plain gate and all four shards, their TIMEOUTs and labels, no regeneration flag",
     "10": "a helper writing COUNT through a by-reference request fails at the caller",
     "11": "a helper writing forbid false (or a conditional other tier) through a by-reference request fails at the caller",
     "17": "a copy is a construction of its own and must assign its own cohort literal",
@@ -3091,7 +3086,7 @@ def matrix_cases():
         "void zzplant_firstuse() {\n    %s req{};\n%s    req.intent.constraints.must_device = true;\n"
         "    bool & zz_ref = req.intent.constraints.must_device;\n    zz_ref = false;\n    ggml_sycl::unified_allocate(req);\n}\n"
         % (REQ, pre)), "PASS"))
-    # S2b: dpct is sanctioned-vendored (rulings M247). Its three sites are allowlisted by function name and count;
+    # S2b: dpct is sanctioned-vendored (canonical contract section 9.1, then rulings M247). Its three sites are allowlisted by function name and count;
     # the entry points are forbidden names outside dpct/helper.hpp, matched as identifiers, never as substrings.
     for nm in ("dpct_malloc", "dpct::dpct_malloc", "dpct::detail::dpct_malloc"):
         A(Case("s2b-dpct", "a new caller of %s outside helper.hpp" % nm, plant(
@@ -3159,6 +3154,13 @@ def matrix_cases():
         "PASS"))
     A(Case("s2c-catch", "east const: catch (std::exception const &) without the rethrow", plant(
         tryfn("zzplant_catch", "catch (std::exception const & e) { (void) e; }")), "FAIL", "G-CATCH", "zzplant_catch"))
+    A(Case("s2c-catch", "a global-scope qualified handler: catch (const ::std::exception &) without the rethrow", plant(
+        tryfn("zzplant_catch", "catch (const ::std::exception & e) { (void) e; }")), "FAIL", "G-CATCH", "zzplant_catch"))
+    A(Case("s2c-catch", "a global-scope qualified by-value handler without the rethrow", plant(
+        tryfn("zzplant_catch", "catch (::std::exception e) { }")), "FAIL", "G-CATCH", "zzplant_catch"))
+    A(Case("s2c-catch", "a global-scope qualified rethrow clause keeps the handler legal (control)", plant(
+        tryfn("zzplant_catch", "catch (const ::ggml_sycl_fallback_error &) { throw; } catch (const ::std::exception & e) { (void) e; }")),
+        "PASS"))
     A(Case("s2c-catch", "east const with the rethrow kept (control)", plant(
         tryfn("zzplant_catch", G + "catch (std::exception const & e) { (void) e; }")), "PASS"))
     A(Case("s2c-catch", "a by-value handler slices the fallback error too", plant(
@@ -3208,6 +3210,8 @@ def matrix_cases():
         "FAIL", "G-CATCH", "#define zz_try", planted=False))
     A(Case("34", "a by-value handler in a macro with the rethrow removed", plant(mac % ("", "catch (std::exception e) { }")),
         "FAIL", "G-CATCH", "#define zz_try", planted=False))
+    A(Case("34", "a global-scope qualified macro handler with the rethrow removed", plant(
+        mac % ("", "catch (const ::std::exception & e) { (void) e; }")), "FAIL", "G-CATCH", "#define zz_try", planted=False))
     A(Case("34", "a catch (...) in a macro with no rethrow", plant(mac % ("", "catch (...) { }")), "FAIL", "G-CATCH",
         "#define zz_try", planted=False))
     A(Case("34", "a macro whose rethrow clause guards only an earlier try", plant(
@@ -3497,6 +3501,11 @@ def m6_witnesses():
     out.append(("--write-debt --allow-growth seeds", ok and len(ents) == 1, msg[:40]))
     ok, msg, ents = plan_debt_write([], {"entries": []}, {"violations": [{"code": "D-ZONE", "key": "k"}]}, False)
     out.append(("--write-debt may shrink", ok and ents == [], msg[:40]))
+    for arg, why in (("4/4", "K not below N"), ("x", "not K/N"), ("0/0", "N of zero"), ("299/300", "a slice with no case")):
+        rc, text = subprocess_gate(["--mutation-matrix", "--shard", arg])
+        out.append(("--shard %s (%s) is refused before the gate runs" % (arg, why), rc == 2, "rc=%d" % rc))
+    rc, text = subprocess_gate(["--shard", "0/4"])
+    out.append(("--shard without --mutation-matrix is an error", rc == 2, "rc=%d" % rc))
     return out
 
 
@@ -3577,7 +3586,10 @@ def cmake_witness(root):
     loops = [m for m in re.finditer(r"foreach\((\w+)((?:\s+\d+)+)\s*\)(.*?)endforeach\(\)", text, flags=re.S)
              if "test-sycl-alloc-zone-contract-m" in m.group(3)]
     loop = loops[0] if len(loops) == 1 else None
-    ok = len(plain) == 1 and "--mutation-matrix" not in plain[0] and loop is not None
+    plain_props = re.findall(r"set_tests_properties\(test-sycl-alloc-zone-contract PROPERTIES[^)]*\)", text)
+    ok = len(plain) == 1 and "--mutation-matrix" not in plain[0] and loop is not None \
+        and len(plain_props) == 1 and 'LABELS "sycl;host-only;ast"' in plain_props[0] \
+        and re.search(r"\bTIMEOUT\s+120\b", plain_props[0]) is not None
     detail = "%d plain registration(s)" % len(plain)
     if loop is not None:
         var, idx, body = loop.group(1), [int(x) for x in loop.group(2).split()], loop.group(3)
@@ -3586,7 +3598,8 @@ def cmake_witness(root):
         props = re.findall(r"set_tests_properties\([^)]*\)", body)
         ok = ok and "--mutation-matrix" in body and n == len(idx) == SHARDS and idx == list(range(n)) \
             and "NAME test-sycl-alloc-zone-contract-m${%s}" % var in body \
-            and len(props) == 1 and re.search(r"\bTIMEOUT\s+\d+", props[0]) is not None
+            and len(props) == 1 and re.search(r"\bTIMEOUT\s+600\b", props[0]) is not None \
+            and 'LABELS "sycl;host-only;ast;mutation"' in props[0]
         detail += ", %d shard(s) of %d, timeout %s" % (len(idx), n, "set" if props and "TIMEOUT" in props[0] else "MISSING")
     region = "".join(plain) + (loop.group(0) if loop is not None else "")
     ok = ok and "--write-debt" not in region and "--allow-growth" not in region
@@ -3604,6 +3617,7 @@ def cmake_mutants(root):
         ("passes the wrong shard count", lambda t: t.replace("${zc_shard}/4", "${zc_shard}/5", 1)),
         ("passes --write-debt to a shard", lambda t: t.replace("--mutation-matrix --shard", "--write-debt --mutation-matrix --shard", 1)),
         ("loses the plain gate's test", lambda t: t.replace("add_test(NAME test-sycl-alloc-zone-contract\n", "add_test(NAME test-sycl-alloc-zone-contract-x\n", 1)),
+        ("drops the plain gate's TIMEOUT", lambda t: t.replace('PROPERTIES LABELS "sycl;host-only;ast" TIMEOUT 120)', 'PROPERTIES LABELS "sycl;host-only;ast")', 1)),
         ("loses a shard's TIMEOUT", lambda t: t.replace('"sycl;host-only;ast;mutation" TIMEOUT 600', '"sycl;host-only;ast;mutation"', 1)),
         ("runs the matrix in the plain test", lambda t: t.replace("../../..)\n    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES",
                                                                     "../../.. --mutation-matrix)\n    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES", 1)),
@@ -3642,19 +3656,21 @@ def m14_witness(files, allowlist, debt):
     return res
 
 
-SHARDS = 4   # the ctest registers this many shards; cmake_witness pins the registration to it
-
-
 def shard_slice(cases, k, n):
     """Shard k of n: every n-th case from k. Deterministic, so the union over k is the case list and no case repeats."""
     return cases[k::n]
 
 
 def parse_shard(text):
+    """(k, n) of a `K/N` argument. A malformed one, or a slice with no case in it, is a ValueError naming it: an empty
+    shard would report "0 wrong" having checked nothing."""
     m = re.fullmatch(r"(\d+)/(\d+)", text or "")
     if not m or not (0 <= int(m.group(1)) < int(m.group(2))):
-        raise SystemExit("--shard takes K/N with 0 <= K < N, got %r" % text)
-    return int(m.group(1)), int(m.group(2))
+        raise ValueError("--shard takes K/N with 0 <= K < N, got %r" % text)
+    k, n = int(m.group(1)), int(m.group(2))
+    if not shard_slice(matrix_cases(), k, n):
+        raise ValueError("--shard %s selects no case (the matrix has %d); an empty shard checks nothing" % (text, len(matrix_cases())))
+    return k, n
 
 
 def run_matrix(files, allowlist, debt, root, shard=None):
@@ -3672,6 +3688,9 @@ def run_matrix(files, allowlist, debt, root, shard=None):
     bad = 0
     all_cases = matrix_cases()
     cases = shard_slice(all_cases, k, n)
+    if not cases:
+        print("FAIL: shard %d/%d selects no case; an empty shard checks nothing" % (k, n))
+        return 1
     print("shard %d/%d: %d of %d case(s)" % (k, n, len(cases), len(all_cases)))
     if k == 0:
         for w in sorted(set(c.wid for c in all_cases) - set(WITNESSES)):
@@ -3699,8 +3718,7 @@ def run_matrix(files, allowlist, debt, root, shard=None):
     extra = []
     if k == 0:
         extra = [("f", "missing tree_sitter_language_pack exits 1 and names it") + f_witness_missing_pack(),
-                 ("m9", "an unscanned .inl file fails the gate") + m9_witness(),
-                 ]
+                 ("m9", "an unscanned .inl file fails the gate") + m9_witness()]
         extra += [("cmake", label, ok, d) for label, ok, d in cmake_mutants(root)]
         extra += [("m6", label, ok, d) for label, ok, d in m6_witnesses()]
         extra += [("r2m4", label, ok, d) for label, ok, d in r2m4_witnesses(allowlist)]
@@ -3733,6 +3751,12 @@ def main():
         ap.error("--mutation-matrix cannot be combined with --list or --write-debt")
     if a.shard is not None and not a.mutation_matrix:
         ap.error("--shard only means something with --mutation-matrix")
+    shard = None
+    if a.shard is not None:
+        try:
+            shard = parse_shard(a.shard)
+        except ValueError as exc:
+            ap.error(str(exc))
     data = Path(a.data) if a.data else Path(a.root) / "scripts" / "sycl-alloc-zone-contract"
     try:
         allowlist = load_json(data / "allowlist.json", {"entries": []}, "entries")
@@ -3780,7 +3804,7 @@ def main():
         return 1
     print("PASS: no new violation, no stale debt, no stale allowlist entry")
     if a.mutation_matrix:
-        return run_matrix(files, allowlist, debt, a.root, parse_shard(a.shard) if a.shard else None)
+        return run_matrix(files, allowlist, debt, a.root, shard)
     return 0
 
 
