@@ -98849,13 +98849,6 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
         switch (node_op) {
             default:
                 break;
-            case GGML_OP_CONCAT:
-                // ggml_sycl_op_concat() does a blocking host wait after memcpy operations,
-                // but wait() can't be called on the events returned by a queue recording
-                // to a graph.
-                GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
-                              ggml_op_name(node_op));
-                return false;
             case GGML_OP_MUL_MAT_ID:
                 {
                     // MoE MUL_MAT_ID graph compatibility:
