@@ -89,7 +89,12 @@ inline void kv_region_abort(const std::string & message) {
 // Two L5 peers are ordered by the L5 tie-break: the subsystem ordinal first
 // (kv_l5_ordinal), then the instance key within one subsystem, both strictly
 // ascending.  Equal is a violation too: two locks of one subsystem and instance
-// are one lock taken twice.  The ordinal order below is the model's reading of
+// are one lock taken twice.  The total order holds only while instances are unique
+// within an ordinal: the table's pin is instance 0 and each table numbers its slot
+// serials from 1, so two tables' slots, or two default-constructed mutexes (instance
+// 0), collide and read as one lock taken twice.  The production instance must be
+// process-unique (the zone id for a group mutex, a mem_handle serial for a slot).
+// The ordinal order below is the model's reading of
 // §2.10: the spec fixes group mutex < arena authority < g_runtime_alloc_mutex (the
 // existing nesting of every registered zone_alloc), the slot-state lock before the
 // ledger's writer lock, and the retained-store mutex last; it does not place the
@@ -682,7 +687,14 @@ class kv_tenant_slots {
         std::atomic<bool> claimed{ false };  // written under `spin`, read without it
         kv_slot_spin_lock spin;              // guards the three fields below
         uint64_t          generation = 0;    // the live claim's token
-        uint64_t          last_event = 0;    // the last release's event
+        // TWO events, because they are two facts that coincide only AFTER a release.
+        // `last_event` is the event of the last RELEASED claim: what the next claimant
+        // chains on (claim() returns it as wait_event).  `retention.done_event` is the
+        // event of the last RECORDED generation's work, written when that generation
+        // records and fencing the drop of its retained owner.  While a generation holds
+        // the slot the two differ: last_event is still the previous generation's, and
+        // retention.done_event is this one's.  The claimant chains on last_event.
+        uint64_t          last_event = 0;
         kv_slot_retention retention;
     };
 

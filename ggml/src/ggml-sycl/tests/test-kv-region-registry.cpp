@@ -1311,11 +1311,11 @@ int case_claim_exclusion() {
     add_fresh(slots, "rows", 0, make_handle(log), 100);
     add_fresh(slots, "rows", 1, make_handle(log), 100);
 
-    // Many threads race for slot 0: at no instant do two hold it, and every successful claim
-    // is released by its own token.  A second slot is claimed and released alongside.
-    constexpr int            n_threads = 8;
-    constexpr int            rounds    = 4000;
-    std::atomic<int>         holders{ 0 };
+    // Many threads race for each of two slots: at no instant do two hold the same one, and
+    // every successful claim is released by its own token.
+    constexpr int            n_threads  = 8;
+    constexpr int            rounds     = 4000;
+    std::atomic<int>         holders[2] = { { 0 }, { 0 } };
     std::atomic<int>         overlap{ 0 };
     std::atomic<int>         wins{ 0 };
     std::atomic<int>         bad_release{ 0 };
@@ -1332,14 +1332,12 @@ int case_claim_exclusion() {
                 if (c.result != kv_claim_result::OK) {
                     continue;
                 }
-                if (slot == 0 && holders.fetch_add(1) != 0) {
+                if (holders[slot].fetch_add(1) != 0) {
                     overlap.fetch_add(1);
                 }
                 wins.fetch_add(1);
                 std::this_thread::yield();  // widen the window a second claimant would land in
-                if (slot == 0) {
-                    holders.fetch_sub(1);
-                }
+                holders[slot].fetch_sub(1);
                 if (!slots.release_claim("rows", slot, c.generation)) {
                     bad_release.fetch_add(1);
                 }
@@ -1350,11 +1348,181 @@ int case_claim_exclusion() {
     for (std::thread & th : threads) {
         th.join();
     }
-    CHECK_EQ(overlap.load(), 0, "two threads never hold the same slot at once");
+    CHECK_EQ(overlap.load(), 0, "two threads never hold the same slot at once, on either slot");
     CHECK_EQ(bad_release.load(), 0, "every winner's own token releases its claim");
     CHECK(wins.load() > 100, "the arm made progress: claims succeeded");
     CHECK(!slots.any_claimed(), "nothing is left claimed");
     CHECK_EQ(kv_lock_witness::violations(), 0, "no lock violation under contention");
+    return 0;
+}
+
+// ---- the slot table under contention ------------------------------------------------
+// The retention fields and the slot map are touched from several threads at once on the
+// dispatch path; these two cases are the ones a missing pin or a weakened spin lock
+// shows up in under TSan (and, for the accounting checks, in a plain build).  Every handle
+// made is dropped exactly once, so a lost or doubled retention moves the count.
+
+// Retention exchange from three threads and take_retentions from a fourth, on one slot.
+int case_retention_race() {
+    drop_log         log;
+    std::atomic<int> made{ 0 };
+    {
+        kv_tenant_slots slots;
+        add_fresh(slots, "r", 0, make_handle(log), 100);
+        made.fetch_add(1);
+        constexpr int            rounds = 3000;
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 3; ++t) {
+            threads.emplace_back([&] {
+                for (int i = 0; i < rounds; ++i) {
+                    kv_slot_retention next;
+                    next.owner      = make_handle(log);
+                    next.done_event = (uint64_t) i + 1;
+                    made.fetch_add(1);
+                    const kv_slot_retention previous = slots.exchange_retention("r", 0, std::move(next));
+                    (void) previous;  // dropped here, with no lock held
+                }
+            });
+        }
+        threads.emplace_back([&] {
+            for (int i = 0; i < rounds; ++i) {
+                std::vector<kv_slot_retention> out;
+                slots.take_retentions(out);
+            }
+        });
+        for (std::thread & th : threads) {
+            th.join();
+        }
+        std::vector<kv_slot_retention> last;
+        slots.take_retentions(last);
+    }
+    CHECK_EQ(log.drops.load(), made.load(), "every handle made is dropped exactly once");
+    CHECK_EQ(log.drops_with_lock.load(), 0, "and none is dropped under a lock");
+    CHECK_EQ(kv_lock_witness::violations(), 0, "no lock violation under the retention race");
+    return 0;
+}
+
+// Claim, handle and release from three threads against a replace (add over the live key)
+// and take_unclaimed + re-add from two more.
+int case_claim_vs_table_race() {
+    drop_log         log;
+    std::atomic<int> made{ 0 };
+    {
+        kv_tenant_slots slots;
+        add_fresh(slots, "r", 0, make_handle(log), 100);
+        made.fetch_add(1);
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 3; ++t) {
+            threads.emplace_back([&] {
+                for (int i = 0; i < 6000; ++i) {
+                    const kv_claim c = slots.claim("r", 0, 10);
+                    if (c.result == kv_claim_result::OK) {
+                        const kv_region_handle h = slots.handle("r", 0);
+                        (void) slots.release_claim("r", 0, c.generation);
+                    }
+                }
+            });
+        }
+        threads.emplace_back([&] {
+            for (int i = 0; i < 1500; ++i) {
+                made.fetch_add(1);
+                kv_slot_retention previous = slots.add("r", 0, make_handle(log), 100);
+                (void) previous;
+            }
+        });
+        threads.emplace_back([&] {
+            for (int i = 0; i < 1500; ++i) {
+                std::vector<kv_region_handle> out;
+                if (slots.take_unclaimed(out)) {
+                    made.fetch_add(1);
+                    kv_slot_retention previous = slots.add("r", 0, make_handle(log), 100);
+                    (void) previous;
+                }
+            }
+        });
+        for (std::thread & th : threads) {
+            th.join();
+        }
+        CHECK(!slots.any_claimed() || slots.size() > 0, "the table is coherent after the race");
+    }
+    CHECK_EQ(log.drops.load(), made.load(), "every slot handle made is dropped exactly once");
+    CHECK_EQ(kv_lock_witness::violations(), 0, "no lock violation under the table race");
+    return 0;
+}
+
+// A holder with a token that is not live (token 0, a made-up one) releasing in a loop while
+// four threads claim and release the same slot: the stale release reads the slot's claim
+// state, and must do it under the spin lock like every other reader.
+int case_stale_release_race() {
+    drop_log        log;
+    kv_tenant_slots slots;
+    add_fresh(slots, "r", 0, make_handle(log), 100);
+    std::atomic<int>         overlap{ 0 };
+    std::atomic<int>         bad_release{ 0 };
+    std::atomic<int>         stale_won{ 0 };
+    std::atomic<int>         holders{ 0 };
+    std::atomic<bool>        stop{ false };
+    std::vector<std::thread> threads;
+    std::vector<std::thread> claimers;
+    for (int t = 0; t < 4; ++t) {
+        claimers.emplace_back([&] {
+            for (int i = 0; i < 8000; ++i) {
+                const kv_claim c = slots.claim("r", 0, 10);
+                if (c.result != kv_claim_result::OK) {
+                    continue;
+                }
+                if (holders.fetch_add(1) != 0) {
+                    overlap.fetch_add(1);
+                }
+                holders.fetch_sub(1);
+                if (!slots.release_claim("r", 0, c.generation)) {
+                    bad_release.fetch_add(1);
+                }
+            }
+        });
+    }
+    threads.emplace_back([&] {
+        while (!stop.load()) {
+            if (slots.release_claim("r", 0, 0) || slots.release_claim("r", 0, (uint64_t) 1 << 60)) {
+                stale_won.fetch_add(1);
+            }
+        }
+    });
+    for (std::thread & th : claimers) {
+        th.join();
+    }
+    stop.store(true);
+    for (std::thread & th : threads) {
+        th.join();
+    }
+    CHECK_EQ(stale_won.load(), 0, "a token that was never live releases nothing, under contention");
+    CHECK_EQ(overlap.load(), 0, "the stale releaser never lets two claimants hold the slot");
+    CHECK_EQ(bad_release.load(), 0, "every winner's own token still releases its claim");
+    CHECK(!slots.any_claimed(), "nothing is left claimed");
+    return 0;
+}
+
+// The two events a slot holds are two facts (kv_tenant_slots::slot): the claimant chains on
+// the last RELEASED claim's event, and the retention fences the last RECORDED generation.
+int case_slot_events_are_two_facts() {
+    drop_log        log;
+    kv_tenant_slots slots;
+    add_fresh(slots, "ring", 0, make_handle(log), 100);
+
+    const kv_claim g1 = slots.claim("ring", 0, 10);
+    (void) slots.exchange_retention("ring", 0, { make_handle(log), 7 });
+    CHECK(slots.release_claim("ring", 0, g1.generation, 7), "generation 1 releases with its event");
+
+    const kv_claim g2 = slots.claim("ring", 0, 10);
+    CHECK_EQ(g2.wait_event, 7, "the claimant chains on the last released claim's event");
+    // Generation 2 records its own work (event 9) while it still holds the slot.
+    const kv_slot_retention prev = slots.exchange_retention("ring", 0, { make_handle(log), 9 });
+    CHECK(prev.owner && prev.done_event == 7, "the retention handed back carries the previous generation's event");
+    // Mid-generation the chain target is still generation 1's: a claimant is refused, and after the
+    // release it chains on generation 2's event, not on anything the retention says.
+    CHECK(slots.claim("ring", 0, 10).result == kv_claim_result::ALREADY_CLAIMED, "the slot is held");
+    CHECK(slots.release_claim("ring", 0, g2.generation, 9), "generation 2 releases with its event");
+    CHECK_EQ(slots.claim("ring", 0, 10).wait_event, 9, "the next claimant chains on generation 2's release");
     return 0;
 }
 
@@ -1383,6 +1551,10 @@ int main() {
         { "claim_generation_token",          case_claim_generation_token          },
         { "claim_exclusion",                 case_claim_exclusion                 },
         { "claim_path_does_not_allocate",    case_claim_path_does_not_allocate    },
+        { "retention_race",                  case_retention_race                  },
+        { "claim_vs_table_race",             case_claim_vs_table_race             },
+        { "stale_release_race",              case_stale_release_race              },
+        { "slot_events_are_two_facts",       case_slot_events_are_two_facts       },
     };
     for (const test_case & c : cases) {
         if (c.fn() != 0) {
