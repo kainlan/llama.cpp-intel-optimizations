@@ -51,6 +51,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <string>
 #include <thread>
 
 namespace {
@@ -194,32 +196,62 @@ int main(int, char ** argv) {
                 *release = 1;
             });
 
-            // Leg 2 depends on leg 1; the thing under test is how long this submit takes to return.
-            const auto  t0                = std::chrono::steady_clock::now();
-            sycl::event leg2              = q_owner.submit([&](sycl::handler & h) {
-                h.depends_on(leg1);
-                h.memcpy(dst_ptr, bounce_ptr, k_bytes);
-            });
-            const auto  t1                = std::chrono::steady_clock::now();
-            const int   marker_at_return  = *marker;
-            const bool  release_at_return = release_sent.load(std::memory_order_acquire);
+            // Leg 2 depends on leg 1; the thing under test is how long this submit takes to return. A throw
+            // out of the submit must not unwind past the joinable watchdog thread (std::terminate): it is
+            // caught, the watchdog is released and joined, and the run is reported as a probe failure.
+            const auto  t0 = std::chrono::steady_clock::now();
+            sycl::event leg2;
+            bool        submit_threw = false;
+            std::string submit_error;
+            try {
+                leg2 = q_owner.submit([&](sycl::handler & h) {
+                    h.depends_on(leg1);
+                    h.memcpy(dst_ptr, bounce_ptr, k_bytes);
+                });
+            } catch (const std::exception & ex) {
+                submit_threw = true;
+                submit_error = ex.what();
+            } catch (...) {
+                submit_threw = true;
+                submit_error = "non-standard exception";
+            }
+            const auto t1                = std::chrono::steady_clock::now();
+            const int  marker_at_return  = *marker;
+            const bool release_at_return = release_sent.load(std::memory_order_acquire);
             leg2_returned.store(true, std::memory_order_release);
             watchdog.join();
 
-            const double                submit_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            const staging_probe_verdict v = staging_probe_classify(marker_at_return != 0, release_at_return, true);
-            std::snprintf(verdict, sizeof(verdict), "%s", staging_probe_verdict_name(v));
+            // Everything drains before the buffers go: leg 2 last, then the marker. A drain that throws
+            // is a probe failure too, not a crash.
+            bool drained = true;
+            try {
+                if (!submit_threw) {
+                    leg2.wait();
+                }
+                marked.wait();
+                q_source.wait();
+                q_owner.wait();
+            } catch (const std::exception & ex) {
+                drained      = false;
+                submit_error = ex.what();
+            } catch (...) {
+                drained      = false;
+                submit_error = "non-standard exception";
+            }
 
-            // Everything drains before the buffers go: leg 2 last, then the marker.
-            leg2.wait();
-            marked.wait();
-            q_source.wait();
-            q_owner.wait();
-
-            std::printf(
-                "[SYCL-STAGING-PROBE] leg2_submit=%s submit_ms=%.3f marker_at_return=%d release_sent_at_return=%d\n",
-                verdict, submit_ms, marker_at_return, release_at_return ? 1 : 0);
-            rc = v == staging_probe_verdict::VOID ? 1 : 0;
+            if (submit_threw || !drained) {
+                std::printf("FAIL: the probe's %s threw: %s\n", submit_threw ? "leg 2 submit" : "drain",
+                            submit_error.c_str());
+            } else {
+                const double                submit_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                const staging_probe_verdict v = staging_probe_classify(marker_at_return != 0, release_at_return, true);
+                std::snprintf(verdict, sizeof(verdict), "%s", staging_probe_verdict_name(v));
+                std::printf(
+                    "[SYCL-STAGING-PROBE] leg2_submit=%s submit_ms=%.3f marker_at_return=%d "
+                    "release_sent_at_return=%d\n",
+                    verdict, submit_ms, marker_at_return, release_at_return ? 1 : 0);
+                rc = v == staging_probe_verdict::VOID ? 1 : 0;
+            }
         }
     }
 
