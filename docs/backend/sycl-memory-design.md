@@ -2489,6 +2489,22 @@ or the driver's reserve, so on a shared card a spill it admits can fail late as 
 instead of being refused by name. The non-FA 928 MB reserve is deliberately not added there: it is the empirical
 outside-arena consumer of the non-FA path and has no bearing on the hold's spill.
 
+*A rung's own spill is counted in its fit.* The bound above is a transaction-time estimate; the exact figure exists
+only after the rung's compute buffers do. The narrow recheck that `sched_reserve()` runs after its probe
+`graph_reserve()` (and whose refusal makes an auto-ubatch candidate lose) therefore also asks
+`ggml_sycl_check_hold_spill_realized`: if this plan's own reserve spilled hold-held requests outside the arena
+(`unified_cache_get_recent_planned_hold_spills`), the card must still have the driver headroom the arena expects
+outside itself (`kSyclArenaMinExternalHeadroomBytes`, 256 MB, the graph-entry check's constant;
+`zone_hold_spill_realized_fits`, tested on the host), otherwise the rung does not fit and the ladder lands lower.
+Measured on the B50 (Qwen PPL, auto-ub1024): a 461 MB compute buffer was held back (zone free 512 MB, hold 75.6 MB),
+spilled, left 107.8 MB against 256 MB, and flash attention then ran out of resources at the first graph; the
+ladder had accepted the rung because nothing in its fit saw the spill. A run the hold never touches asks nothing.
+A publish starts a new epoch (`unified_cache_begin_planned_hold_epoch`), so a losing rung's spills and largest-request
+mark do not decide the next rung. The persisted auto-ubatch cache is not a hole here: a cached rung is re-validated
+by the same per-candidate trial on every start (`try_candidate`), and one that now fails is reported as
+"cached N refused" and the ladder runs from the bottom; only the rungs ABOVE a non-terminal cached value are
+re-attempted ("resuming"), never trusted.
+
 *The idle hold, precisely.* The hold persists while a buffer is short of its plan, including across a graph that counts
 no node for it (the Q8 walk now refreshes the hold on that exit too, so it falls the moment the buffers reach their
 plan by any route). A graph that counts no node proves nothing about the next graph, since a PP graph can draw what a
