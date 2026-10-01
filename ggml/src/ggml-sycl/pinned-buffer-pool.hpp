@@ -69,7 +69,10 @@ class PinnedBufferPool {
     //   (2) the caller does not write the region (zero it, or let the CPU kernels fill it)
     //       until that activation D2H has completed.  Completing an event on an in-order queue
     //       completes every earlier command on it, the H2D included.
-    // A scatter left pending (not flushed) across ops is outside this argument; see llama.cpp-3bww.
+    // (1) covers a scatter left pending by an op that nothing consumed (up's, with gate next): the
+    // op-entry flush is unconditional, so no scatter is still pending when the next op reserves
+    // (llama.cpp-3bww).  A caller that kept a scatter pending ACROSS a following reserve() would be
+    // outside this argument, and would have to retain its slice until the scatter event instead.
     //
     // Threading: one MUL_MAT_ID at a time, joined before the next.  It is not main-thread-only:
     // the cpu_async_safe path calls it from the async CPU thread, which the main thread joins
