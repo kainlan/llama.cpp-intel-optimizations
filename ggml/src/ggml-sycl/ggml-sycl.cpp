@@ -99035,7 +99035,9 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
         std::min<int>(std::max(ggml_sycl_info().device_count, ctx.device + 1), GGML_SYCL_MAX_DEVICES);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (node->op != GGML_OP_MUL_MAT) {
+        // The dispatch's own no-op predicate: a ubatch with no outputs trims the last layer to zero rows, and the
+        // dispatch skips that node, so it draws nothing and has no demand.
+        if (node->op != GGML_OP_MUL_MAT || ggml_sycl_is_noop(node)) {
             continue;
         }
         const ggml_tensor * src0 = node->src[0];
@@ -99148,8 +99150,8 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         std::min<int>(std::max(ggml_sycl_info().device_count, ctx.device + 1), GGML_SYCL_MAX_DEVICES);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (node->op != GGML_OP_MUL_MAT) {
-            continue;
+        if (node->op != GGML_OP_MUL_MAT || ggml_sycl_is_noop(node)) {
+            continue;  // a zero-row node is a dispatch no-op: no copy is made, no demand
         }
         const ggml_tensor * src0 = node->src[0];
         const ggml_tensor * src1 = node->src[1];
