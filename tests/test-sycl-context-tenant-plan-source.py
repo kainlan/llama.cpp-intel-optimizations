@@ -43,15 +43,32 @@ constructor asserts 1 <= n_streams <= n_stream and spans exactly n_streams strea
 dsv4_build_full_sinfo builds s1 = n_stream - 1 and strm[s] = s; the full kv and dsv4
 raw contexts delegate to the s-stream constructors.
 
+Gate 22 (one strict switch; five clauses over every tracked file, read with git ls-files so it
+covers ggml-sycl.cpp): (1) names: every GGML_SYCL_*STRICT* name in ggml/, src/, common/, tools/,
+tests/, scripts/ and the three user-facing SYCL docs is the one switch, GGML_SYCL_STRICT_LEASES, or
+the single exception GGML_SYCL_UNIFIED_ALLOC_STRICT (until llama.cpp-1obo), or the named non-member
+GGML_SYCL_HANDLE_STRICT; (2) exactly one getenv of the switch, inside the function
+ggml_sycl_strict_enabled() resolves to (followed one call deep); (3) the non-member stays
+report-only: every read of its variable is part of an if condition whose branches hold only
+GGML_LOG_* calls, and its occurrence set (definition, extern, env-table entry, three reads) is
+closed, which refuses an alias, a reference and a by-reference argument; (4) every
+[<FAMILY>-PLAN-BUG] GGML_ABORT is a direct statement of an if whose whole condition is one call of
+ggml_sycl_strict_enabled(), no function is a second name for that call, and the census of such
+aborts is not empty and holds uwlx's three; (5) the census of where each allowed name occurs on
+the post-uwlx base, so a scan that reads nothing cannot pass. The names in this file are
+assembled where a retired or second switch is planted, so the names clause passes on this file.
+argv[4], when given, is another checkout to scan for gate 22.
+
 All gates prove themselves on mutants of the real source (the gate must fail
 on each) and refuse to pass vacuously. Limits, deliberately: the walk is
 textual, so a reserve reached through a wrapper is not seen, and the
 invalidation is checked as the statements between the vbuffer allocation
 call and the return.
-argv: [ggml-backend.cpp [ggml-alloc.c [llama-context.cpp]]]
+argv: [ggml-backend.cpp [ggml-alloc.c [llama-context.cpp [checkout-root]]]]
 """
 import os
 import re
+import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -328,13 +345,15 @@ def update_clause_violations(files):
             if blk is None:
                 out.append(("llama-context.cpp", first + 1, "memory_update has no failure branch matching `%s`" % anchor))
                 continue
+            # a violation names the failing branch, not memory_update's signature
+            at = first + next(i for i, l in enumerate(lines) if re.search(anchor, l)) + 1
             if "return LLAMA_MEMORY_UPDATE_FAILED;" not in blk:
-                out.append(("llama-context.cpp", first + 1, "the memory_update branch `%s` does not return FAILED" % anchor))
+                out.append(("llama-context.cpp", at, "the memory_update branch `%s` does not return FAILED" % anchor))
             if needs_flag and "sched_need_reserve = true;" not in blk:
-                out.append(("llama-context.cpp", first + 1, "the memory_update branch `%s` does not set sched_need_reserve" % anchor))
+                out.append(("llama-context.cpp", at, "the memory_update branch `%s` does not set sched_need_reserve" % anchor))
             elif needs_flag and "return LLAMA_MEMORY_UPDATE_FAILED;" in blk and \
                     blk.index("sched_need_reserve = true;") > blk.index("return LLAMA_MEMORY_UPDATE_FAILED;"):
-                out.append(("llama-context.cpp", first + 1, "the memory_update branch `%s` sets sched_need_reserve after it returns" % anchor))
+                out.append(("llama-context.cpp", at, "the memory_update branch `%s` sets sched_need_reserve after it returns" % anchor))
         body_stmts = [l.strip() for l in lines if l.strip()]
         if len(body_stmts) < 2 or body_stmts[-2] != "return LLAMA_MEMORY_UPDATE_DONE;":
             out.append(("llama-context.cpp", first + 1, "memory_update does not end by returning DONE"))
@@ -594,6 +613,569 @@ def reserve_clause_mutants(files):
         "llama-memory-recurrent.cpp", rec.replace("llama_memory_context_ptr llama_memory_recurrent::init_reserve(uint32_t n_streams) {", "static void unused_reserve(uint32_t n_streams) {", 1))
 
 
+# ---------------------------------------------------------------------------
+# Gate 22: one strict switch. GGML_SYCL_STRICT_LEASES is the only abort switch
+# for ownership, lifetime and plan defects; it is read once, by the function
+# ggml_sycl_strict_enabled() resolves to, and every [<FAMILY>-PLAN-BUG] abort
+# asks that accessor directly. The scan is a plain file read of every tracked
+# file (git ls-files), so it covers ggml-sycl.cpp, which codescout skips as
+# oversize.
+# ---------------------------------------------------------------------------
+# The names below are assembled so this file, which the names clause scans like
+# any other tests/ file, does not itself carry a retired or second switch name.
+STRICT_NAME_RX = re.compile(r"GGML_SYCL_[A-Z0-9_]*STRICT[A-Z0-9_]*")
+STRICT_NAME_DIRS = ("ggml/", "src/", "common/", "tools/", "tests/", "scripts/")
+STRICT_NAME_DOCS = (
+    "docs/backend/sycl-env-vars.md",
+    "docs/backend/sycl-memory-design.md",
+    "docs/design/sycl-canonical-memory-architecture.md",
+)
+STRICT_CODE_DIRS = ("ggml/", "src/", "common/", "tools/", "tests/")
+STRICT_CODE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".cu", ".cuh", ".m", ".mm")
+STRICT_LEASES = "GGML_SYCL_" + "STRICT_LEASES"
+STRICT_ALLOC = "GGML_SYCL_" + "UNIFIED_ALLOC_STRICT"
+STRICT_HANDLE = "GGML_SYCL_" + "HANDLE_STRICT"
+STRICT_HANDLE_VAR = "g_ggml_sycl_" + "handle_strict"
+# name -> why it is allowed. The UNIFIED_ALLOC entry carries its retirement ticket.
+STRICT_NAMES_ALLOWED = {
+    STRICT_LEASES: "the one abort switch",
+    STRICT_ALLOC: "the single exception, until llama.cpp-1obo retires it",
+}
+# Excluded by name and not by the allowlist: a diagnostic report switch, not an
+# abort switch (rulings section M41 m-4). Clause 3 holds it to that.
+STRICT_NAMES_NONMEMBER = {
+    STRICT_HANDLE: "diagnostic report switch; every read only widens GGML_LOG_* output, it never aborts",
+}
+# Census on the post-uwlx base, by file (line numbers drift): each name must still
+# occur where the base has it, so a scan that reads nothing cannot pass.
+STRICT_CENSUS = {
+    STRICT_LEASES: ("ggml/src/ggml-sycl/unified-cache.cpp", "ggml/src/ggml-sycl/mem-handle.cpp",
+                    "docs/backend/sycl-env-vars.md", "docs/backend/sycl-memory-design.md",
+                    "docs/design/sycl-canonical-memory-architecture.md"),
+    STRICT_ALLOC: ("ggml/src/ggml-sycl/unified-cache.cpp", "ggml/src/ggml-sycl/tests/test-unified-runtime-alloc.cpp"),
+    STRICT_HANDLE: ("ggml/src/ggml-sycl/ggml-sycl.cpp", "tests/test-sycl-env-report.cpp",
+                    "docs/backend/sycl-env-vars.md"),
+}
+STRICT_ACCESSOR_NAME = "ggml_sycl_strict_enabled"
+STRICT_ACCESSOR_COND = re.compile(r"^(?:::)?(?:ggml_sycl::)?ggml_sycl_strict_enabled\(\s*\)$")
+STRICT_PLAN_BUG = re.compile(r"GGML_ABORT\s*\(\s*\"(\[[A-Z0-9]+(?:-[A-Z0-9]+)*-PLAN-BUG\])")
+# the aborts of the post-uwlx base; zhcn's own add theirs as they land
+STRICT_ABORT_CENSUS = (
+    ("ggml/src/ggml-sycl/mem-handle.cpp", "[CONTEXT-PLAN-BUG] retained-reap backstop", 1),
+    ("ggml/src/ggml-sycl/mem-handle.cpp", "[CONTEXT-PLAN-BUG] retained-reap %s: owner", 1),
+    ("ggml/src/ggml-sycl/unified-cache.cpp", "[CONTEXT-PLAN-BUG] optional-layout yield", 1),
+)
+# where the one non-member variable is allowed to occur, by (file, kind)
+STRICT_HANDLE_SITES = {
+    ("ggml/src/ggml-sycl/ggml-sycl.cpp", "definition"): 1,
+    ("ggml/src/ggml-sycl/ggml-sycl.cpp", "env table"): 1,
+    ("ggml/src/ggml-sycl/ggml-sycl.cpp", "read"): 1,
+    ("ggml/src/ggml-sycl/common.hpp", "extern"): 1,
+    ("ggml/src/ggml-sycl/common.hpp", "read"): 2,
+}
+
+_C_LITERAL = re.compile(
+    r"//[^\n]*"
+    r"|/\*.*?\*/"
+    r"|R\"([^(\s]{0,16})\(.*?\)\1\""
+    r"|\"(?:\\.|[^\"\\\n])*\""
+    r"|'(?:\\.|[^'\\\n])*'",
+    re.S)
+
+
+def scrub_c(text, keep_strings):
+    """Blank comments with spaces (newlines kept), and string and char contents too unless keep_strings.
+    Offsets and line numbers match the input."""
+    def blank(s):
+        return re.sub(r"[^\n]", " ", s)
+
+    def one(m):
+        s = m.group(0)
+        if s.startswith("/"):
+            return blank(s)
+        return s if keep_strings else s[0] + blank(s[1:-1]) + s[-1]
+    return _C_LITERAL.sub(one, text)
+
+
+_SCRUB_CACHE = {}
+
+
+def scrubbed(text, keep_strings):
+    key = (hash(text), len(text), keep_strings)
+    hit = _SCRUB_CACHE.get(key)
+    if hit is None or hit[0] != text:
+        if len(_SCRUB_CACHE) > 24:
+            _SCRUB_CACHE.clear()
+        hit = (text, scrub_c(text, keep_strings))
+        _SCRUB_CACHE[key] = hit
+    return hit[1]
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+
+def close_of(s, i):
+    """Index of the bracket closing the one opened at s[i] (strings blanked), or -1."""
+    pair = {"(": ")", "{": "}", "[": "]"}
+    open_ch, close_ch = s[i], pair[s[i]]
+    depth = 0
+    for j in range(i, len(s)):
+        if s[j] == open_ch:
+            depth += 1
+        elif s[j] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def enclosing_brace(s, pos):
+    depth = 0
+    for j in range(pos - 1, -1, -1):
+        if s[j] == "}":
+            depth += 1
+        elif s[j] == "{":
+            if depth == 0:
+                return j
+            depth -= 1
+    return -1
+
+
+def open_of(s, i):
+    """Index of the '(' matching the ')' at s[i], or -1."""
+    depth = 0
+    for j in range(i, -1, -1):
+        if s[j] == ")":
+            depth += 1
+        elif s[j] == "(":
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def if_condition_around(s, pos):
+    """(open, close) of the `if (...)` condition that holds s[pos], or None when pos is not inside one: a call
+    argument, an initializer, a while, a return and every other use gives None."""
+    j = pos - 1
+    depth = 0
+    while j >= 0:
+        c = s[j]
+        if c == ")":
+            depth += 1
+        elif c == "(":
+            if depth:
+                depth -= 1
+            else:
+                head = s[:j].rstrip()
+                word = re.search(r"([A-Za-z_]\w*)$", head)
+                if word and word.group(1) == "if":
+                    end = close_of(s, j)
+                    return (j, end) if end > pos else None
+                if word or head.endswith(("]", ")")):
+                    return None
+        elif c in ";{}" and not depth:
+            return None
+        j -= 1
+    return None
+
+
+def controlled_region(s, cond_close):
+    """The statements an if controls, its else branches included, as text; the first is the then-branch."""
+    parts = []
+    i = cond_close + 1
+    while True:
+        while i < len(s) and s[i].isspace():
+            i += 1
+        if i >= len(s):
+            break
+        if s[i] == "{":
+            end = close_of(s, i)
+            if end < 0:
+                break
+            parts.append(s[i + 1:end])
+            i = end + 1
+        else:
+            end = s.find(";", i)
+            if end < 0:
+                break
+            parts.append(s[i:end + 1])
+            i = end + 1
+        m = re.match(r"\s*else\b\s*", s[i:])
+        if not m:
+            break
+        i += m.end()
+        if s.startswith("if", i) and re.match(r"if\b\s*\(", s[i:]):
+            i = s.index("(", i)
+            i = close_of(s, i) + 1
+            continue
+        while i < len(s) and s[i].isspace():
+            i += 1
+        if i < len(s) and s[i] == "{":
+            end = close_of(s, i)
+            parts.append(s[i + 1:end])
+            i = end + 1
+        else:
+            end = s.find(";", i)
+            parts.append(s[i:end + 1])
+        break
+    return parts
+
+
+def only_log_calls(region):
+    """True when region, with its GGML_LOG_* calls removed, holds no call, jump or throw."""
+    rest = region
+    while True:
+        m = re.search(r"\bGGML_LOG_[A-Z]+\s*\(", rest)
+        if not m:
+            break
+        end = close_of(rest, m.end() - 1)
+        if end < 0:
+            return False
+        rest = rest[:m.start()] + rest[end + 1:]
+    return not re.search(r"[A-Za-z_]\w*\s*\(|\b(?:return|throw|goto|break|continue)\b", rest)
+
+
+def strict_scope(files):
+    """The tracked files each clause reads: (name_files, code_files)."""
+    name_files = {n: t for n, t in files.items() if n.startswith(STRICT_NAME_DIRS) or n in STRICT_NAME_DOCS}
+    code_files = {n: t for n, t in files.items()
+                  if n.startswith(STRICT_CODE_DIRS) and n.endswith(STRICT_CODE_SUFFIXES)}
+    return name_files, code_files
+
+
+def function_bodies(code, name):
+    """Spans (start, end) of the bodies of every definition of `bool name()` in comment- and string-blanked code."""
+    out = []
+    for m in re.finditer(r"\bbool\s+(?:\w+::)?" + re.escape(name) + r"\s*\(\s*\)\s*\{", code):
+        end = close_of(code, m.end() - 1)
+        if end > 0:
+            out.append((m.end() - 1, end))
+    return out
+
+
+def strict_names_violations(name_files):
+    out = []
+    for name, text in sorted(name_files.items()):
+        if "STRICT" not in text:
+            continue
+        for m in STRICT_NAME_RX.finditer(text):
+            found = m.group(0)
+            if found in STRICT_NAMES_ALLOWED or found in STRICT_NAMES_NONMEMBER:
+                continue
+            out.append((name, line_of(text, m.start()),
+                        "%s is not the strict switch or one of its two named exceptions" % found))
+    for required in STRICT_NAME_DOCS + ("ggml/src/ggml-sycl/ggml-sycl.cpp", "ggml/src/ggml-sycl/unified-cache.cpp"):
+        if required not in name_files:
+            out.append((required, 0, "the scan did not read this tracked file; the names clause would pass vacuously"))
+    return out
+
+
+def strict_census_violations(name_files):
+    out = []
+    for name, where in STRICT_CENSUS.items():
+        for path in where:
+            if path in name_files and name not in name_files[path]:
+                out.append((path, 0, "%s no longer occurs here; the census was taken on the post-uwlx base" % name))
+    for name, why in list(STRICT_NAMES_ALLOWED.items()) + list(STRICT_NAMES_NONMEMBER.items()):
+        if not why:
+            out.append(("gate 22", 0, "%s carries no reason" % name))
+    if "llama.cpp-1obo" not in STRICT_NAMES_ALLOWED[STRICT_ALLOC]:
+        out.append(("gate 22", 0, "the UNIFIED_ALLOC exception does not name its retirement ticket"))
+    return out
+
+
+def strict_getenv_violations(code_files):
+    """Exactly one getenv of the switch, inside the function ggml_sycl_strict_enabled() resolves to."""
+    out = []
+    calls = []
+    literal_starts = set()
+    for name, text in sorted(code_files.items()):
+        if STRICT_LEASES not in text:
+            continue
+        code = scrubbed(text, True)
+        for m in re.finditer(r"getenv\s*\(\s*(\"" + STRICT_LEASES + r"\")", code):
+            calls.append((name, m.start()))
+            literal_starts.add((name, m.start(1)))
+    if len(calls) != 1:
+        out.append(("tree", 0, "found %d getenv of the strict switch, expected exactly 1: %s" %
+                    (len(calls), ["%s:%d" % (n, line_of(code_files[n], p)) for n, p in calls])))
+    # a second reader that does not spell getenv: the quoted name held in a variable. Tests may set and unset it.
+    for name, text in sorted(code_files.items()):
+        if "/tests/" in name or name.startswith("tests/") or STRICT_LEASES not in text:
+            continue
+        for m in re.finditer(r"\"" + STRICT_LEASES + r"\"", scrubbed(text, True)):
+            if (name, m.start()) not in literal_starts:
+                out.append((name, line_of(text, m.start()), "the quoted strict switch name appears outside its one reader"))
+    exports = []
+    for name, text in sorted(code_files.items()):
+        if STRICT_ACCESSOR_NAME not in text:
+            continue
+        for span in function_bodies(scrubbed(text, False), STRICT_ACCESSOR_NAME):
+            exports.append((name, span))
+    if len(exports) != 1:
+        out.append(("tree", 0, "found %d definitions of the accessor, expected 1" % len(exports)))
+        return out
+    name, (start, end) = exports[0]
+    code = scrubbed(code_files[name], False)
+    reader = (start, end)
+    fwd = re.fullmatch(r"\{\s*return\s+(\w+)\s*\(\s*\)\s*;\s*\}", code[start:end + 1])
+    if fwd and fwd.group(1) != STRICT_ACCESSOR_NAME:
+        spans = function_bodies(code, fwd.group(1))
+        if len(spans) != 1:
+            out.append((name, line_of(code, start), "the accessor forwards to %s, which has %d definitions here, "
+                        "expected 1" % (fwd.group(1), len(spans))))
+            return out
+        reader = spans[0]
+    if len(calls) == 1 and not (calls[0][0] == name and reader[0] < calls[0][1] < reader[1]):
+        out.append((calls[0][0], line_of(code_files[calls[0][0]], calls[0][1]),
+                    "the one getenv of the switch is not inside the function the accessor resolves to"))
+    return out
+
+
+def strict_handle_violations(code_files):
+    """The non-member stays report-only and its occurrence set is closed."""
+    out = []
+    seen = {}
+    reads = 0
+    for name, text in sorted(code_files.items()):
+        if STRICT_HANDLE_VAR not in text:
+            continue
+        keep = scrubbed(text, True)
+        code = scrubbed(text, False)
+        for m in re.finditer(r"\b" + STRICT_HANDLE_VAR + r"\b", code):
+            pos = m.start()
+            line = line_of(text, pos)
+            sol = code.rfind("\n", 0, pos) + 1
+            eol = code.find("\n", pos)
+            row = keep[sol:eol if eol >= 0 else len(keep)]
+            if re.match(r"\s*int\s+" + STRICT_HANDLE_VAR + r"\s*=\s*0\s*;", row):
+                kind = "definition"
+            elif re.match(r"\s*extern\s+int\s+" + STRICT_HANDLE_VAR + r"\s*;", row):
+                kind = "extern"
+            elif re.match(r"\s*\{\s*\"" + STRICT_HANDLE + r"\"\s*,\s*&" + STRICT_HANDLE_VAR + r"\s*,\s*0\s*\}", row):
+                kind = "env table"
+            else:
+                cond = if_condition_around(code, pos)
+                if cond is None:
+                    out.append((name, line, "%s is used other than as part of an if condition (an alias, a reference, "
+                                "an argument or an initializer)" % STRICT_HANDLE_VAR))
+                    continue
+                region = controlled_region(code, cond[1])
+                if not region or not only_log_calls("\n".join(region)) or "GGML_LOG_" not in region[0]:
+                    out.append((name, line, "a read of %s gates something other than GGML_LOG_* output" % STRICT_HANDLE_VAR))
+                    continue
+                kind = "read"
+                reads += 1
+            seen[(name, kind)] = seen.get((name, kind), 0) + 1
+    for key in sorted(set(seen) | set(STRICT_HANDLE_SITES)):
+        if seen.get(key, 0) != STRICT_HANDLE_SITES.get(key, 0):
+            out.append((key[0], 0, "%s: %d %s site(s), the closed set has %d" %
+                        (STRICT_HANDLE_VAR, seen.get(key, 0), key[1], STRICT_HANDLE_SITES.get(key, 0))))
+    if reads < 1:
+        out.append(("tree", 0, "no read of %s found; the clause would pass vacuously" % STRICT_HANDLE_VAR))
+    return out
+
+
+def strict_accessor_violations(code_files):
+    """Every [<FAMILY>-PLAN-BUG] GGML_ABORT is a direct statement of an if whose whole condition is one call of
+    ggml_sycl_strict_enabled(); no function is a second name for that call."""
+    out = []
+    found = {}
+    total = 0
+    for name, text in sorted(code_files.items()):
+        if "PLAN-BUG" not in text and STRICT_ACCESSOR_NAME not in text:
+            continue
+        keep = scrubbed(text, True)
+        code = scrubbed(text, False)
+        for m in re.finditer(r"(\w+)\s*\(\s*\)\s*\{\s*return\s+(?:::)?(?:ggml_sycl::)?"
+                             + STRICT_ACCESSOR_NAME + r"\s*\(\s*\)\s*;\s*\}", code):
+            out.append((name, line_of(text, m.start()), "%s only returns %s(): a second name for one fact"
+                        % (m.group(1), STRICT_ACCESSOR_NAME)))
+        for m in STRICT_PLAN_BUG.finditer(keep):
+            total += 1
+            pos = m.start()
+            line = line_of(text, pos)
+            literal = re.match(r"GGML_ABORT\s*\(\s*((?:\"(?:\\.|[^\"\\])*\"\s*)+)", keep[pos:pos + 600])
+            message = "".join(re.findall(r"\"((?:\\.|[^\"\\])*)\"", literal.group(1))) if literal else m.group(1)
+            for want_file, want_text, _ in STRICT_ABORT_CENSUS:
+                if want_file == name and message.startswith(want_text):
+                    found[(want_file, want_text)] = found.get((want_file, want_text), 0) + 1
+            cond = None
+            # unbraced: `if (cond) GGML_ABORT(...)`; braced: the abort sits directly in the block of `if (cond) {`
+            prev = code[:pos].rstrip()
+            if prev.endswith(")"):
+                op = open_of(code, len(prev) - 1)
+                if re.search(r"(?<![\w])if$", code[:op].rstrip()):
+                    cond = re.sub(r"\s+", "", code[op + 1:len(prev) - 1])
+            else:
+                brace = enclosing_brace(code, pos)
+                head = code[:brace].rstrip() if brace >= 0 else ""
+                if head.endswith(")"):
+                    op = open_of(code, len(head) - 1)
+                    before = code[:op].rstrip()
+                    if re.search(r"(?<![\w])if$", before) and not re.search(r"\belse\s+if$", before):
+                        cond = re.sub(r"\s+", "", code[op + 1:len(head) - 1])
+            if cond is None or not STRICT_ACCESSOR_COND.match(cond):
+                out.append((name, line, "%s abort is not a direct statement of `if (%s())` (condition: %s)"
+                            % (m.group(1), STRICT_ACCESSOR_NAME, cond if cond is not None else "none")))
+    if total < 1:
+        out.append(("tree", 0, "no [<FAMILY>-PLAN-BUG] abort found; the clause would pass vacuously"))
+    for want_file, want_text, count in STRICT_ABORT_CENSUS:
+        if want_file in code_files and found.get((want_file, want_text), 0) != count:
+            out.append((want_file, 0, "expected %d abort(s) tagged `%s`, found %d"
+                        % (count, want_text, found.get((want_file, want_text), 0))))
+    return out
+
+
+def strict_violations(files):
+    """Gate 22's five clauses (names, one getenv, non-member report-only, accessor, census) over tracked files."""
+    name_files, code_files = strict_scope(files)
+    return (strict_names_violations(name_files) + strict_getenv_violations(code_files)
+            + strict_handle_violations(code_files) + strict_accessor_violations(code_files)
+            + strict_census_violations(name_files))
+
+
+def tracked_files(root):
+    """{path: text} of every tracked file in gate 22's scope, via git ls-files; None when git cannot list them."""
+    try:
+        listing = subprocess.run(["git", "-C", root, "ls-files", "-z"], check=True, capture_output=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    out = {}
+    for rel in listing.decode("utf-8", "replace").split("\0"):
+        if not rel or not (rel.startswith(STRICT_NAME_DIRS) or rel in STRICT_NAME_DOCS):
+            continue
+        path = os.path.join(root, rel)
+        if os.path.isfile(path) and not os.path.islink(path):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                out[rel] = f.read()
+    return out
+
+
+STRICT_RETIRED = "GGML_SYCL_" + "STRICT_PLAN"
+STRICT_SECOND = "GGML_SYCL_" + "PLAN_STRICT"
+_GS = "ggml/src/ggml-sycl/ggml-sycl.cpp"
+_UC = "ggml/src/ggml-sycl/unified-cache.cpp"
+_MH = "ggml/src/ggml-sycl/mem-handle.cpp"
+_CH = "ggml/src/ggml-sycl/common.hpp"
+_BACKSTOP = ('    if (ggml_sycl_strict_enabled()) {\n        GGML_ABORT(\n'
+             '            "[CONTEXT-PLAN-BUG] retained-reap backstop')
+
+
+def strict_mutants(files):
+    """(name, mutated files, fragment the violations must carry), plus (name, files, None) positive controls that
+    must stay clean. Every mutant is a small edit of the real tracked source."""
+    def edit(path, old, new, label):
+        if old not in files[path]:
+            raise AssertionError("gate 22 mutant `%s`: anchor missing in %s" % (label, path))
+        return {**files, path: files[path].replace(old, new, 1)}
+
+    def append(path, text):
+        return {**files, path: files[path] + "\n" + text + "\n"}
+
+    wrapper = "static bool strict_plan_checks_enabled() { return ggml_sycl_strict_enabled(); }\n\n"
+    handle_if = "        if (!installed_source_handle) {"
+    yield ("planted retired switch in ggml-sycl.cpp", append(_GS, 'static const char * g_retired = "%s";' % STRICT_RETIRED),
+           "is not the strict switch")
+    yield ("planted second switch in a test", append("tests/test-sycl-env-report.cpp", "// reads %s" % STRICT_SECOND),
+           "is not the strict switch")
+    yield ("planted second switch in a script", append("scripts/sycl-build.sh", "# export %s=1" % STRICT_SECOND),
+           "is not the strict switch")
+    yield ("planted second switch in a user-facing doc", append("docs/backend/sycl-env-vars.md", "| `%s=1` | x |" % STRICT_SECOND),
+           "is not the strict switch")
+    yield ("suffixed spelling of the one switch", append(_MH, "// %sS" % STRICT_LEASES), "is not the strict switch")
+    yield ("scan that never read ggml-sycl.cpp", {k: v for k, v in files.items() if k != _GS}, "did not read this tracked file")
+    yield ("second getenv of the switch", append(_MH, 'static bool second() { return std::getenv("%s") != nullptr; }' % STRICT_LEASES),
+           "found 2 getenv")
+    yield ("second getenv, bare and spaced, in src/", append("src/llama.cpp", 'static const char * e = getenv( "%s" );' % STRICT_LEASES),
+           "found 2 getenv")
+    yield ("the getenv removed", edit(_UC, 'std::getenv("%s")' % STRICT_LEASES, "nullptr", "getenv removed"), "found 0 getenv")
+    yield ("the switch name held in a variable", append(_MH, 'static const char * k = "%s";' % STRICT_LEASES),
+           "outside its one reader")
+    reader = edit(_UC, "bool ggml_sycl_strict_enabled() {\n    return strict_lease_checks_enabled();\n}",
+                  "static bool strict_other_reader() {\n    return false;\n}\n\nbool ggml_sycl_strict_enabled() {\n"
+                  "    return strict_other_reader();\n}", "accessor repointed")
+    yield ("the accessor resolves to a function without the getenv", reader, "not inside the function the accessor resolves to")
+    yield ("a block conditioned on a read-only abort beside a report",
+           edit(_CH, handle_if, '        if (%s) { GGML_ABORT("x"); }\n' % STRICT_HANDLE_VAR + handle_if, "abort beside report"),
+           "gates something other than GGML_LOG_*")
+    yield ("an address alias of the non-member",
+           append(_GS, "static void alias() { const int * p = &%s; if (*p) { GGML_ABORT(\"x\"); } }" % STRICT_HANDLE_VAR),
+           "other than as part of an if condition")
+    yield ("a reference alias of the non-member",
+           append(_GS, "static void alias() { const int & r = %s; if (r) { GGML_ABORT(\"x\"); } }" % STRICT_HANDLE_VAR),
+           "other than as part of an if condition")
+    yield ("a by-reference argument of the non-member",
+           append(_GS, "static void sink(const int & v); static void pass() { sink(%s); }" % STRICT_HANDLE_VAR),
+           "other than as part of an if condition")
+    yield ("an unbraced abort under the non-member",
+           append(_GS, "static void f() { if (%s) GGML_ABORT(\"x\"); }" % STRICT_HANDLE_VAR),
+           "gates something other than GGML_LOG_*")
+    yield ("an abort in the else of a non-member read",
+           append(_GS, "static void f() { if (%s) { GGML_LOG_INFO(\"a\"); } else { GGML_ABORT(\"x\"); } }" % STRICT_HANDLE_VAR),
+           "gates something other than GGML_LOG_*")
+    yield ("a call beside the log under the non-member",
+           append(_GS, "static void f() { if (%s) { GGML_LOG_INFO(\"a\"); die(); } }" % STRICT_HANDLE_VAR),
+           "gates something other than GGML_LOG_*")
+    yield ("an assert under the non-member",
+           append(_GS, "static void f() { if (%s) { GGML_ASSERT(false); } }" % STRICT_HANDLE_VAR),
+           "gates something other than GGML_LOG_*")
+    yield ("a fourth, log-only read of the non-member (the set is closed)",
+           append(_GS, "static void f() { if (%s) { GGML_LOG_INFO(\"a\"); } }" % STRICT_HANDLE_VAR),
+           "the closed set has")
+    yield ("a zhcn plan-bug abort gated on the other strict mode",
+           append("src/llama-context.cpp",
+                  "static void bug() { if (ggml_sycl::unified_alloc_strict_mode()) { GGML_ABORT(\"[CONTEXT-PLAN-BUG] z\"); } }"),
+           "not a direct statement")
+    yield ("a wrapper reintroduced and gating a uwlx abort",
+           edit(_MH, _BACKSTOP, _BACKSTOP.replace("ggml_sycl_strict_enabled()", "strict_plan_checks_enabled()"), "wrapper use"),
+           "not a direct statement")
+    yield ("a wrapper reintroduced",
+           edit(_MH, "namespace {\n", "namespace {\n\n" + wrapper, "wrapper definition"), "second name for one fact")
+    yield ("a plan-bug abort with no condition",
+           edit(_MH, _BACKSTOP, '    {\n        GGML_ABORT(\n            "[CONTEXT-PLAN-BUG] retained-reap backstop', "unconditioned"),
+           "not a direct statement")
+    yield ("a plan-bug abort under an extra condition",
+           edit(_MH, _BACKSTOP, _BACKSTOP.replace("if (ggml_sycl_strict_enabled())", "if (ggml_sycl_strict_enabled() && count > 1)"),
+                "extra condition"), "not a direct statement")
+    tail = ': %s %s event incomplete after the caller\'s "\n            "synchronize (GGML_SYCL_STRICT_LEASES=1)",\n            reason, entry);\n    }'
+    yield ("a plan-bug abort nested one block deeper",
+           edit(_MH, _BACKSTOP + tail,
+                '    if (ggml_sycl_strict_enabled()) {\n        if (count > 1) {\n            GGML_ABORT(\n'
+                '                "[CONTEXT-PLAN-BUG] retained-reap backstop' + tail.replace("    }", "    }\n    }", 1), "nested"),
+           "not a direct statement")
+    yield ("an unbraced plan-bug abort under the wrong condition",
+           append("src/llama-context.cpp", "static void bug() { if (ggml_sycl::unified_alloc_strict_mode()) GGML_ABORT(\"[CONTEXT-PLAN-BUG] z\"); }"),
+           "not a direct statement")
+    yield ("a VM-family plan-bug abort left unconditioned",
+           edit(_UC, '        if (ggml_sycl_strict_enabled()) {\n            GGML_ABORT("[VM-PLAN-BUG] ggml_sycl_arena_backing read',
+                '        if (true) {\n            GGML_ABORT("[VM-PLAN-BUG] ggml_sycl_arena_backing read', "vm abort"),
+           "not a direct statement")
+    yield ("a uwlx abort retagged out of the census",
+           edit(_MH, "[CONTEXT-PLAN-BUG] retained-reap backstop: %s %s event incomplete after the caller's \"\n            \"synchronize (",
+                "[CONTEXT-PLAN-BUG] reap backstop: %s %s event incomplete after the caller's \"\n            \"synchronize (", "retag"),
+           "expected 1 abort(s) tagged")
+    yield ("the switch dropped from a user-facing doc",
+           {**files, "docs/backend/sycl-memory-design.md": files["docs/backend/sycl-memory-design.md"].replace(STRICT_LEASES, "X")},
+           "no longer occurs here")
+    # positive controls: legitimate shapes the clauses must not refuse
+    folded = edit(_UC, "static bool strict_lease_checks_enabled() {\n    static const bool enabled = [] {\n"
+                       "        const char * env = std::getenv(\"%s\");\n        return env != nullptr && std::atoi(env) != 0;\n"
+                       "    }();\n    return enabled;\n}\n\nbool ggml_sycl_strict_enabled() {\n    return strict_lease_checks_enabled();\n}" % STRICT_LEASES,
+                  "bool ggml_sycl_strict_enabled() {\n    static const bool enabled = [] {\n"
+                  "        const char * env = std::getenv(\"%s\");\n        return env != nullptr && std::atoi(env) != 0;\n"
+                  "    }();\n    return enabled;\n}" % STRICT_LEASES, "folded accessor")
+    yield ("positive control: the two functions folded into the accessor", folded, None)
+    yield ("positive control: an unbraced plan-bug abort on the accessor",
+           append("src/llama-context.cpp", "static void ok() { if (ggml_sycl_strict_enabled()) GGML_ABORT(\"[CONTEXT-PLAN-BUG] z\"); }"),
+           None)
+    yield ("positive control: a qualified accessor call",
+           append("src/llama-context.cpp", "static void ok() { if (::ggml_sycl_strict_enabled()) { GGML_ABORT(\"[CONTEXT-PLAN-BUG] z\"); } }"),
+           None)
+
+
 def main():
     backend_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BACKEND
     alloc_path = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_ALLOC
@@ -672,12 +1254,42 @@ def main():
                 status = 1
         mutant_counts[tag] = len(built)
 
+    strict_root = sys.argv[4] if len(sys.argv) > 4 else REPO
+    tracked = tracked_files(strict_root)
+    strict_counts = None
+    if tracked is None:
+        print("SKIP: gate 22: git cannot list the tracked files under %s; this run proves nothing about the strict "
+              "switch" % strict_root)
+    else:
+        bad = strict_violations(tracked)
+        for name, line_no, why in bad:
+            print("FAIL: gate 22: %s:%d: %s" % (name, line_no, why))
+            status = 1
+        if not bad:
+            built = list(strict_mutants(tracked))
+            if sum(1 for _, _, frag in built if frag is not None) < 25:
+                print("FAIL: gate 22: only %d mutants could be built" % len(built))
+                status = 1
+            for name, m, frag in built:
+                found = strict_violations(m)
+                if frag is None and found:
+                    print("FAIL: gate 22: control refused: %s: %s" % (name, found[0]))
+                    status = 1
+                elif frag is not None and not any(frag in why for _, _, why in found):
+                    print("FAIL: gate 22: mutant went undetected: %s" % name)
+                    status = 1
+            strict_counts = (sum(1 for _, _, f in built if f is not None), sum(1 for _, _, f in built if f is None))
+
+    if status == 0 and tracked is None:
+        return 77
     if status == 0:
         print("PASS: %d scheduler reserve calls are tested and return false (%d mutants caught); "
               "%d reserve_n_impl failure return(s) invalidate the layout first (%d mutants caught); "
               "the constructor enumerates backends and decides pipeline_parallel before create_memory "
-              "(%d mutants caught); update clauses of gate 15 (%d mutants caught) and gate 24 (%d mutants caught)" %
-              (calls, n13, returns, n15, len(muts28), mutant_counts["15"], mutant_counts["24"]))
+              "(%d mutants caught); update clauses of gate 15 (%d mutants caught) and gate 24 (%d mutants caught); "
+              "gate 22's five strict clauses (%d mutants caught, %d controls kept clean)" %
+              (calls, n13, returns, n15, len(muts28), mutant_counts["15"], mutant_counts["24"],
+               strict_counts[0], strict_counts[1]))
     return status
 
 

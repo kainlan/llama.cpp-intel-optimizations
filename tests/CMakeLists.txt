@@ -1628,9 +1628,10 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-context-tenant-plan-source.py
     )
+    # The mutant sweep of gate 22 reads every tracked file; ~20 s idle, and this host is never idle.
     set_tests_properties(test-sycl-context-tenant-plan-source PROPERTIES
         LABELS "sycl;tdd"
-        TIMEOUT 60
+        TIMEOUT 180
     )
 
     # Regression + arithmetic gate for parse-sycl-gap-device-split.py, the
