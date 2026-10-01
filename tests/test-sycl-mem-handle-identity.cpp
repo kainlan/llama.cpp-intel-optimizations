@@ -14,7 +14,9 @@
 //    SAME address misses, because the id differs;
 //  * holding an identity does not keep the allocation alive;
 //  * the tenant cohort tag lives on the shared control and reads the same through
-//    every copy and slice, and is null for an untagged or ownerless handle.
+//    every copy and slice, and is null for an untagged or ownerless handle;
+//  * the tag is set once: a second set aborts (a forked child), and a null cohort
+//    is ignored.
 //
 // Nothing here touches a GPU: owners come from the private fixture factory, with an
 // injected release backend, and the registration pins the selector to the CPU.
@@ -30,9 +32,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <sycl/sycl.hpp>
 #include <unordered_set>
 #include <vector>
+
+#if !defined(_WIN32)
+#    include <sys/wait.h>
+#    include <unistd.h>
+#endif
 
 using namespace ggml_sycl;
 
@@ -231,9 +239,87 @@ void test_tenant_cohort() {
     CHECK(other.tenant_cohort() == nullptr, "a later untagged owner is not a tenant");
 }
 
+// A fresh owner for the set-once arms, left untagged and not yet shared.
+alloc_owner make_untagged_owner() {
+    const uint64_t id = g_next_id.fetch_add(1);
+    alloc_metadata metadata{};
+    metadata.ptr      = g_block + 2048;
+    metadata.size     = 128;
+    metadata.device   = 0;
+    metadata.id       = id;
+    metadata.alloc_id = id;
+    metadata.epoch_id = 1;
+    metadata.tier     = alloc_tier::HOST_PINNED;
+    auto fixture      = allocation_owner_test_create(metadata, count_release, nullptr);
+    if (!fixture.result) {
+        std::fprintf(stderr, "FAIL: allocation_owner_test_create failed\n");
+        std::exit(1);
+    }
+    return std::move(fixture.result.owner);
+}
+
+void test_tenant_cohort_is_set_once() {
+    static const char kFirst[]  = "context-first";
+    static const char kSecond[] = "context-second";
+    {
+        alloc_owner owner = make_untagged_owner();
+        owner.set_tenant_cohort(nullptr);
+        mem_handle untagged = mem_handle::from_owned_alloc(std::move(owner));
+        CHECK(untagged.tenant_cohort() == nullptr, "a null cohort leaves the owner untagged");
+    }
+    {
+        alloc_owner owner = make_untagged_owner();
+        owner.set_tenant_cohort(kFirst);
+        owner.set_tenant_cohort(nullptr);
+        mem_handle tagged = mem_handle::from_owned_alloc(std::move(owner));
+        CHECK(tagged.tenant_cohort() == kFirst, "a null cohort does not clear a tag");
+    }
+#if !defined(_WIN32)
+    // The second set aborts, so it runs in a child; a positive control (one set
+    // exits 0) keeps a child that dies for another reason from passing the arm.
+    for (const bool twice : { false, true }) {
+        int fds[2] = { -1, -1 };
+        CHECK(pipe(fds) == 0, "pipe failed");
+        const pid_t pid = fork();
+        CHECK(pid >= 0, "fork failed");
+        if (pid == 0) {
+            setenv("GGML_NO_BACKTRACE", "1", 1);
+            dup2(fds[1], STDERR_FILENO);
+            close(fds[0]);
+            close(fds[1]);
+            alloc_owner owner = make_untagged_owner();
+            owner.set_tenant_cohort(kFirst);
+            if (twice) {
+                owner.set_tenant_cohort(kSecond);
+            }
+            _exit(0);
+        }
+        close(fds[1]);
+        std::string out;
+        char        buf[512];
+        ssize_t     n;
+        while ((n = read(fds[0], buf, sizeof(buf))) > 0) {
+            out.append(buf, static_cast<size_t>(n));
+        }
+        close(fds[0]);
+        int status = 0;
+        CHECK(waitpid(pid, &status, 0) == pid, "waitpid failed");
+        if (twice) {
+            CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT, "a second set of the cohort aborts");
+            CHECK(out.find("[TENANT] allocation already tagged") != std::string::npos,
+                  "the abort is the set-once message, not another death");
+        } else {
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "one set of the cohort exits cleanly (the control)");
+            CHECK(out.find("already tagged") == std::string::npos, "the control prints no tag complaint");
+        }
+    }
+#endif
+}
+
 }  // namespace
 
 int main() {
+    test_tenant_cohort_is_set_once();
     test_identity_of_an_owner();
     test_slices();
     test_no_identity();

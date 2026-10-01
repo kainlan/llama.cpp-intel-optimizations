@@ -3,9 +3,9 @@
 
 Lead ruling §B.2: there is no fourth holder class.  A cache that only COMPARES a
 source holds a `mem_handle_identity` (a value built from the allocator's monotonic
-retention id), never a `mem_handle`.  This gate pins the producer fixes C6d made:
+retention id), never a `mem_handle`.  This gate pins the producer fixes that keep a compare-only cache from holding a handle:
 
-  * the C5a caches (`moe_ids_cache_key`, `moe_down_shadow_key`, the mmvq activation
+  * the activation-keyed MoE caches (`moe_ids_cache_key`, `moe_down_shadow_key`, the mmvq activation
     cache and `moe_quant_cache`) hold no `mem_handle`;
   * `g_data_ptr_cache`'s value type carries no `mem_handle` and carries `tenant_gen`;
     every access to it goes through store / lookup / new_graph; the lookup compares
@@ -18,9 +18,10 @@ retention id), never a `mem_handle`.  This gate pins the producer fixes C6d made
   * W4 (`ggml_sycl_publish_moe_artifact_handle`) and any `release_buffer_refs` do not exist;
   * `mem_handle_identity` is built only from `canonical_allocation_id_` and
     `canonical_generation_`;
-  * the C5b belt is called from the W2/W3 and W6/W7 persistent writers;
-  * every return path of `ggml_backend_sycl_graph_compute` runs the exit hooks (flush,
-    C5a drop, C6 drop and staged-owner publish, C13 release);
+  * the runtime_minted belt is called from the W2/W3 and W6/W7 persistent writers;
+  * every return path of `ggml_backend_sycl_graph_compute` runs the exit hooks (the scatter
+    flush, the activation-map drop, the data-pointer-cache drop, the staged-owner publish and the
+    staging-tenant release);
   * the oneDNN scratch ring's retained-owner clear carries its empty assert.
 
 The walk is textual, comment- and string-stripped, so a call reached through a
@@ -47,20 +48,38 @@ line_of = _base.line_of
 
 SYCL = "ggml/src/ggml-sycl/"
 SCOPE = (SYCL + "ggml-sycl.cpp", SYCL + "common.hpp", SYCL + "mem-handle.cpp", SYCL + "mem-handle.hpp",
-         SYCL + "unified-cache.cpp", SYCL + "unified-cache.hpp")
+         SYCL + "unified-cache.cpp", SYCL + "unified-cache.hpp", SYCL + "graph-recorder-scope.hpp")
 MAIN = SYCL + "ggml-sycl.cpp"
 COMMON = SYCL + "common.hpp"
 MEMH = SYCL + "mem-handle.cpp"
+RECS = SYCL + "graph-recorder-scope.hpp"
 
 RAW_HANDLE = r"\bmem_handle\b(?!_identity)"
 
 
+# A mutant changes one file, so the other files' scrubbed text is the same string object on every sweep step.
+# Memoising on the text (a str caches its own hash) turns the per-mutant cost from "scrub every source" into
+# "scrub the one that changed".
+_SCRUB_CACHE = {}
+
+
+def _scrub_once(text, keep_strings):
+    key = (text, keep_strings)
+    hit = _SCRUB_CACHE.get(key)
+    if hit is None:
+        if len(_SCRUB_CACHE) > 96:
+            _SCRUB_CACHE.clear()
+        hit = scrubbed(text, keep_strings)
+        _SCRUB_CACHE[key] = hit
+    return hit
+
+
 def code(files, name):
-    return scrubbed(files[name], False)
+    return _scrub_once(files[name], False)
 
 
 def keep(files, name):
-    return scrubbed(files[name], True)
+    return _scrub_once(files[name], True)
 
 
 _BRACE = re.compile(r"[{}]")
@@ -169,7 +188,7 @@ def violations(files):
     common = code(files, COMMON)
     memh = code(files, MEMH)
 
-    # (A) the C5a caches hold no mem_handle as their source
+    # (A) the activation-keyed MoE caches hold no mem_handle as their source
     for path, c, nested, names in (
             (COMMON, common, True, ("moe_ids_cache_key",)),
             (MAIN, main, False, ("moe_down_shadow_key",))):
@@ -337,7 +356,7 @@ def violations(files):
                 continue  # an empty value is the invalid identity, not a built one
             bad(path, c, m.start(), "a mem_handle_identity is constructed outside mem_handle::identity")
 
-    # (G) the C5b belt at the persistent writers W2/W3 and W6/W7
+    # (G) the runtime_minted belt at the persistent writers W2/W3 and W6/W7
     for name in ("ggml_sycl_publish_existing_storage_handle_for_device", "ggml_sycl_publish_f16_attention_dst_handle"):
         spans = func_bodies(main, name)
         if not spans:
@@ -388,6 +407,47 @@ def violations(files):
                 bad(MAIN, main, exc_fn[0][0], "the exceptional exit does not handle %s" % call)
         if not any("ggml_sycl_graph_compute_exception_exit(" in text_of(main, s) for s in boundary):
             bad(MAIN, main, boundary[0][0], "the boundary exception cleanup does not run the exceptional exit")
+        # the exit's branch on a recording call: the flush waits only on an eager call or on pending state at a
+        # recording exit, and the staging-tenant release is an eager-exit step
+        flush_at = eb.find("ggml_sycl_cpu_tg_flush_pending(")
+        flush_if = eb.rfind("if (", 0, flush_at) if flush_at >= 0 else -1
+        flush_cond = eb[flush_if:flush_at] if flush_if >= 0 else ""
+        if "recorded_call" not in flush_cond:
+            bad(MAIN, main, exit_fn[0][0], "the exit's flush does not branch on recorded_call (a recording call must not wait)")
+        if not re.search(r"if\s*\(\s*!\s*recorded_call\s*&&\s*ctx\s*\)\s*\{[^}]*graph_input_staging_release_tenants\(", eb):
+            bad(MAIN, main, exit_fn[0][0], "the staging-tenant release is not an eager-exit step (!recorded_call)")
+        if "ggml_sycl_cpu_tg_pending_any(" not in eb:
+            bad(MAIN, main, exit_fn[0][0], "the exit does not read the pending MoE scatter state of a recording call")
+        # recorded_call has one source: the recorder's begin counter, read before and after the call
+        if "ggml_sycl::graph_record_begins()" not in text_of(main, gc[0]):
+            bad(MAIN, main, gc[0][0], "graph_compute does not read ggml_sycl::graph_record_begins() before the call")
+        st = func_bodies(main, "ggml_sycl_graph_compute_exit_status")
+        if len(st) != 1 or not re.search(r"graph_record_begins\(\)\s*!=\s*record_begins_before", text_of(main, st[0])):
+            out.append("%s: graph_compute_exit_status does not derive recorded_call from graph_record_begins()" % MAIN)
+    # (H2) every recorder counts itself: the scope's constructor, and each hand-ordered recorder, note a begin
+    rec = code(files, RECS)
+    ctor = re.search(r"graph_recorder_scope\s*\(\s*const\s+slots\s*&\s*s\b[^{]*\{", rec)
+    if not ctor or "graph_record_begin_note(" not in rec[ctor.end():close_of(rec, ctor.end() - 1)]:
+        out.append("%s: the recorder scope's constructor does not call graph_record_begin_note()" % RECS)
+    if len(re.findall(r"\bgraph_record_begin_slot\s*\(\)", rec)) < 3 or "static thread_local" not in rec:
+        out.append("%s: the begin counter is not a thread_local read by graph_record_begins/begin_note" % RECS)
+    sites = 0
+    for m in re.finditer(r"\bbegin_recording\s*\(", main):
+        top = [t for t in top_spans(main) if t[1] <= m.start() <= t[2]]
+        if not top:
+            continue
+        func = main[top[0][0]:top[0][2] + 1]
+        before = main[top[0][0]:m.start()]
+        sites += 1
+        if "graph_record_begin_note(" in func or re.search(r"\bggml_sycl_graph_recorder\s+\w+\s*\(", func) or \
+                "recorder_.emplace(" in func:
+            continue
+        # the pause/resume pair re-opens a recording its scope already counted
+        if re.search(r"recorder\s*->\s*resume\s*\(\s*\)\s*;\s*g_recording_graph_ptr\s*->\s*$", before.rstrip()[-120:]):
+            continue
+        bad(MAIN, main, m.start(), "a command graph begins recording with no recorder scope and no graph_record_begin_note()")
+    if sites < 6:
+        out.append("%s: only %d begin_recording sites found; the gate would pass vacuously" % (MAIN, sites))
     pushes = 0
     for m in re.finditer(r"\bg_graph_staged_owners\s*\.\s*push_back\b", main):
         pushes += 1
@@ -490,10 +550,10 @@ def mutants(files):
     yield ("an exit without the staged-owner publish",
            edit(files, M, "        ggml_sycl_graph_staged_owners_publish(ctx);\n        if (!recorded_call && ctx) {",
                 "        if (!recorded_call && ctx) {", "k20"), "does not call ggml_sycl_graph_staged_owners_publish(")
-    yield ("an exit without the C13 release",
+    yield ("an exit without the staging-tenant release",
            edit(files, M, "(void) ctx->graph_input_staging_release_tenants();", "(void) 0;", "k21"),
            "does not call graph_input_staging_release_tenants(")
-    yield ("an exit without the C5a drop",
+    yield ("an exit without the activation-map drop",
            edit(files, M, "        ggml_sycl_moe_ids_cache_new_graph();\n        ggml_sycl_data_ptr_cache_new_graph();\n        ggml_sycl_graph_staged_owners_publish(ctx);",
                 "        ggml_sycl_data_ptr_cache_new_graph();\n        ggml_sycl_graph_staged_owners_publish(ctx);", "k22"),
            "does not call ggml_sycl_moe_ids_cache_new_graph(")
@@ -501,6 +561,37 @@ def mutants(files):
            edit(files, M, "static void ggml_sycl_moe_ids_cache_new_graph() {",
                 "static void ggml_sycl_stray_fill(ggml_sycl::mem_handle h) { g_graph_staged_owners.push_back(std::move(h)); }\n"
                 "static void ggml_sycl_moe_ids_cache_new_graph() {", "k23"), "filled outside ggml_sycl_graph_staged_owner_add")
+    yield ("the descriptor MoE recorder not counted",
+           edit(files, M, "ggml_sycl::graph_record_begin_note();\n        g_recording_graph_ptr       = &moe_graph;",
+                "g_recording_graph_ptr       = &moe_graph;", "k25"), "begins recording with no recorder scope")
+    yield ("the MoE segment recorder not counted",
+           edit(files, M, "ggml_sycl::graph_record_begin_note();\n            g_recording_graph_ptr       = &seg_graph;",
+                "g_recording_graph_ptr       = &seg_graph;", "k26"), "begins recording with no recorder scope")
+    yield ("the MoE block recorder not counted",
+           edit(files, M, "ggml_sycl::graph_record_begin_note();\n            g_recording_graph_ptr       = &block_graph;",
+                "g_recording_graph_ptr       = &block_graph;", "k27"), "begins recording with no recorder scope")
+    yield ("the recorder scope's constructor not counting",
+           edit(files, RECS, "active_      = this;\n        graph_record_begin_note();", "active_      = this;", "k28"),
+           "constructor does not call graph_record_begin_note")
+    yield ("a new recorder that begins uncounted",
+           edit(files, M, "static void ggml_sycl_moe_ids_cache_new_graph() {",
+                "static void ggml_sycl_stray_recorder(sycl_ex::command_graph<sycl_ex::graph_state::modifiable> & g, sycl::queue & q) {"
+                " g.begin_recording(q); }\nstatic void ggml_sycl_moe_ids_cache_new_graph() {", "k29"),
+           "begins recording with no recorder scope")
+    yield ("recorded_call not derived from the counter",
+           edit(files, M, "ggml_sycl::graph_record_begins() != record_begins_before", "false", "k30"),
+           "does not derive recorded_call from graph_record_begins()")
+    yield ("the before-read dropped",
+           edit(files, M, "const uint64_t record_begins_before = ggml_sycl::graph_record_begins();",
+                "const uint64_t record_begins_before = 0;", "k31"), "does not read ggml_sycl::graph_record_begins() before")
+    yield ("a recording exit that always flushes",
+           edit(files, M, "(!recorded_call || scatter_pending) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()",
+                "!ggml_sycl_cpu_tg_exit_flush_skipped_for_test()", "k32"), "flush does not branch on recorded_call")
+    yield ("a staging-tenant release on a recording exit",
+           edit(files, M, "if (!recorded_call && ctx) {", "if (ctx) {", "k33"), "not an eager-exit step")
+    yield ("the pending read dropped from the exit",
+           edit(files, M, "const bool scatter_pending = recorded_call && ggml_sycl_cpu_tg_pending_any();",
+                "const bool scatter_pending = recorded_call;", "k34"), "does not read the pending MoE scatter state")
     yield ("the ring clear without its empty assert",
            edit(files, M, "GGML_ABORT(\"[CONTEXT-PLAN-BUG] oneDNN scratch ring slot", "GGML_ABORT(\"oneDNN scratch ring slot", "k24"),
            "lacks its empty assert")

@@ -24,7 +24,7 @@ keep being true, source-side.  What it checks, by gate:
   30  every namespace-scope, static, thread_local or ggml_backend_sycl_context queue is
       censused, with either the token `ggml_backend_sycl_synchronize_for_replan` waits it
       through or the reason it cannot reach a tenant slice; `ggml_backend_sycl_synchronize`
-      flushes the C2t lists before its first wait; the flush-disabling hook compiles only
+      flushes the MoE scatter lists before its first wait; the flush-disabling hook compiles only
       under GGML_SYCL_PRIVATE_TESTING.
   31  L0 is one token type over one mutex with a thread-local depth; no token is a class
       member; the fourteen publish and prepare entries construct it first, with the
@@ -429,7 +429,7 @@ def gate30(files, bad):
             bad("gate 30: ggml_backend_sycl_synchronize_for_replan does not wait %s (looked for %s)" % (name, what))
     if sync and not re.search(r"->\s*wait\s*\(\s*\)|\.wait\s*\(\s*\)", sync):
         bad("gate 30: ggml_backend_sycl_synchronize_for_replan waits nothing")
-    # C2t: the flush precedes the first wait in ggml_backend_sycl_synchronize.
+    # The MoE scatter flush precedes the first wait in ggml_backend_sycl_synchronize.
     s = body_text(c, "ggml_backend_sycl_synchronize", bad, "gate 30")
     if s:
         f = s.find("ggml_sycl_cpu_tg_flush_pending(")
@@ -489,6 +489,32 @@ def gate31(files, bad):
         bad("gate 31: the re-plan mutexes are %s (wanted exactly g_replan_txn_mutex)" % sorted(mutexes))
     if not re.search(r"static\s+thread_local\s+int\s+g_replan_token_depth\b", ucc):
         bad("gate 31: the held depth is not a thread_local")
+    # A blocked acquire is never silent and never abandoned (review r1 M13): it waits in timed slices, logs the holder
+    # at each, keeps waiting, and aborts only under STRICT.
+    acq = func_bodies(ucc, "ggml_sycl_replan_token::acquire")
+    ackeep = keep(files, UC_C)
+    ak = ""
+    for o, e in func_bodies(ackeep, "ggml_sycl_replan_token::acquire"):
+        ak = text_of(ackeep, (o, e))
+    if len(acq) != 1 or "g_replan_txn_mutex.lock()" in text_of(ucc, acq[0]) or \
+            "g_replan_txn_mutex.try_lock_for(" not in text_of(ucc, acq[0]):
+        bad("gate 31: the blocking acquire of L0 is not a timed wait (try_lock_for, never lock())")
+    elif "[REPLAN-WAIT]" not in ak or "GGML_LOG_WARN" not in text_of(ucc, acq[0]) or \
+            not re.search(r"ggml_sycl_strict_enabled\s*\(\s*\)\s*\)\s*\{\s*GGML_ABORT\s*\(", text_of(ucc, acq[0])):
+        bad("gate 31: a blocked L0 acquire does not log the holder at each interval and abort under STRICT")
+    wd = func_bodies(ucc, "ggml_sycl_wait_watch::ggml_sycl_wait_watch")
+    if len(wd) != 1 or "[REPLAN-WAIT]" not in text_of(ackeep, wd[0]) or "GGML_ABORT" not in text_of(ucc, wd[0]) or \
+            "ggml_sycl_strict_enabled" not in text_of(ucc, wd[0]):
+        bad("gate 31: the wait watch does not log at each interval and abort under STRICT")
+    sw = func_bodies(c, "ggml_backend_sycl_synchronize_for_replan")
+    if len(sw) != 1:
+        bad("gate 31: ggml_backend_sycl_synchronize_for_replan has %d definitions" % len(sw))
+    else:
+        swt = text_of(c, sw[0])
+        first_wait = swt.find("->wait()")
+        w_at = swt.find("ggml_sycl_wait_watch")
+        if w_at < 0 or first_wait < 0 or w_at > first_wait or swt.count("watch.site(") < 6:
+            bad("gate 31: synchronize_for_replan's queue waits are not under a wait watch that names each wait")
     # No token is a class member.
     for path in all_sycl_sources_in(files):
         cc = code(files, path)
@@ -566,7 +592,7 @@ def gate31(files, bad):
 
 
 # --------------------------------------------------------------------------------------
-# gate 31, owner threading (C6e, rulings M246): the dispatch owner
+# gate 31, owner threading (rulings M246, option A): the dispatch owner
 # --------------------------------------------------------------------------------------
 OWNER_READERS = ("ggml_sycl_resolve_moe_expert_route_core", "ggml_sycl_collect_decode_secondary_candidates")
 ENSURE = "ggml_sycl_ensure_moe_secondary_queues_for_plan"
@@ -658,6 +684,35 @@ def gate31_owner(files, bad):
         if min(order) < 0 or order != sorted(order):
             bad("gate 31 (owner): into_empty does not lock, select the owner's snapshot, re-check emptiness, install, "
                 "then compare identity, in that order")
+        # What each cache state gets (review r1 M8-M10): an empty cache gets the owner's snapshot, a cache that
+        # already holds a plan is left untouched (and a foreign load's plan is witnessed), and a cache that is not
+        # one of the plan's devices gets nullptr.  The hint in front of the lock is keyed by owner and set only for
+        # a non-participant.
+        if "set_placement_plan_snapshot(participates ? selected : nullptr)" not in t.replace("\n", " "):
+            bad("gate 31 (owner): into_empty does not install `participates ? selected : nullptr`")
+        non_empty = re.search(r"if\s*\(\s*current\s*&&\s*current->plan\s*&&\s*!current->plan->entries\.empty\(\)\s*\)\s*\{", t)
+        if not non_empty:
+            bad("gate 31 (owner): into_empty does not test for an already-filled cache")
+        else:
+            nb = t[non_empty.end() - 1:close_of(t, non_empty.end() - 1) + 1]
+            if "set_placement_plan_snapshot(" in nb or "return ggml_sycl_into_empty_result::NOOP" not in nb:
+                bad("gate 31 (owner): into_empty does not leave a filled cache untouched (NOOP, no install)")
+            if "set_into_empty_foreign_key(" not in nb or "into_empty_foreign_key()" not in nb or \
+                    "into_empty: this device's cache holds" not in tk:
+                bad("gate 31 (owner): into_empty does not witness a foreign load's plan in a filled cache")
+            if non_empty.start() > t.find("set_placement_plan_snapshot("):
+                bad("gate 31 (owner): the filled-cache test comes after the install")
+        np_ = re.search(r"if\s*\(\s*!participates\s*\)\s*\{(.*?)\n    \}", t, re.S)
+        if not np_ or "return ggml_sycl_into_empty_result::NOOP" not in np_.group(1) or \
+                "set_into_empty_skip_key(skip_key)" not in np_.group(1):
+            bad("gate 31 (owner): a non-participant does not get NOOP with its skip key set")
+        if len(re.findall(r"set_into_empty_skip_key\s*\(", t)) != 1:
+            bad("gate 31 (owner): the skip key is set somewhere other than the non-participant branch")
+        hint = t.find("into_empty_skip_key() == skip_key")
+        if hint < 0 or hint > t.find("std::lock_guard") or "return ggml_sycl_into_empty_result::NOOP" not in t[hint:hint + 120]:
+            bad("gate 31 (owner): the owner-keyed hint is not read, with a NOOP, before the lock")
+        if not re.search(r"skip_key\s*=\s*\(\s*owner\.model\.value[^;]*owner\.load\.value\s*\)\s*\|\s*1ULL", t):
+            bad("gate 31 (owner): the hint key is not built from the owner's model and load")
         if not all(x in t for x in ("installed->version != selected->version", "installed->model_id != selected->model_id",
                                     "installed->load_txn_id != selected->load_txn_id")):
             bad("gate 31 (owner): into_empty does not compare version, model_id and load_txn_id of the installed snapshot")
@@ -891,6 +946,20 @@ def gate36(files, bad):
     m = re.search(r"case\s+ggml_sycl_chunk_cap_set::PROBE_MIN\s*:(.*?)break\s*;", cw, re.S)
     if not m or "ggml_sycl_compute_arena_bytes(device)" not in m.group(1) or re.search(r"\b(runtime|kv)\s*=", m.group(1)):
         bad("gate 36: the PROBE_MIN set is not {RUNTIME 0, SCRATCH ggml_sycl_compute_arena_bytes(dev)}")
+    # One fact, one source: the compute arena's size has a single reader of its variable, the function the
+    # model-load reservation and the probe set both call.
+    readers = []
+    for path in all_sycl_sources_in(files):
+        for m in re.finditer(r'getenv\s*\(\s*"GGML_SYCL_COMPUTE_ARENA_MB"\s*\)', keep(files, path)):
+            readers.append((path, m.start()))
+    ucc_keep = keep(files, UC_C)
+    sizing = func_bodies(code(files, UC_C), "ggml_sycl_compute_arena_bytes")
+    if len(readers) != 1 or readers[0][0] != UC_C or len(sizing) != 1 or \
+            not any(o <= readers[0][1] <= e for o, e in sizing):
+        bad("gate 36: GGML_SYCL_COMPUTE_ARENA_MB is read %d time(s); the only reader is ggml_sycl_compute_arena_bytes" %
+            len(readers))
+    if c.count("ggml_sycl_compute_arena_bytes(") < 2:
+        bad("gate 36: the model-load reservation does not size itself with ggml_sycl_compute_arena_bytes")
     lm = body_text(c, "ggml_sycl_plan_scope_load_measure_cap", bad, "gate 36")
     if lm and re.search(r"\b2\s*\*\s*1024|\bmin\s*\(\s*2|GiB", lm):
         bad("gate 36: the load-time cap carries a literal floor")
@@ -1026,9 +1095,45 @@ def mutants(files):
                 "#endif\nvoid ggml_sycl_test_set_cpu_tg_flush_disabled(bool exit_flush, bool synchronize_flush) {\n#if defined(GGML_SYCL_PRIVATE_TESTING)", "g30d"),
            "outside GGML_SYCL_PRIVATE_TESTING")
 
+    yield ("into_empty installing for a non-participant",
+           edit(files, M, "cache->set_placement_plan_snapshot(participates ? selected : nullptr);",
+                "cache->set_placement_plan_snapshot(selected);", "g31o28"), "does not install `participates")
+    yield ("into_empty without its hint",
+           edit(files, M, "if (cache->into_empty_skip_key() == skip_key) {\n        return ggml_sycl_into_empty_result::NOOP;\n    }",
+                "", "g31o29"), "hint is not read")
+    yield ("into_empty setting its hint for a participant",
+           edit(files, M, "cache->set_placement_plan_snapshot(participates ? selected : nullptr);",
+                "cache->set_placement_plan_snapshot(participates ? selected : nullptr);\n    cache->set_into_empty_skip_key(skip_key);",
+                "g31o30"), "skip key is set somewhere other")
+    yield ("into_empty overwriting a foreign load's plan",
+           edit(files, M, "g_into_empty_foreign.fetch_add(1, std::memory_order_acq_rel);",
+                "g_into_empty_foreign.fetch_add(1, std::memory_order_acq_rel);\n            cache->set_placement_plan_snapshot(selected);",
+                "g31o31"), "does not leave a filled cache untouched")
+    yield ("into_empty not witnessing a foreign plan",
+           edit(files, M, "cache->set_into_empty_foreign_key(skip_key);", "", "g31o32"), "does not witness a foreign load")
+    yield ("a non-participant that reports an install",
+           edit(files, M, "cache->set_into_empty_skip_key(skip_key);\n        return ggml_sycl_into_empty_result::NOOP;",
+                "cache->set_into_empty_skip_key(skip_key);\n        return ggml_sycl_into_empty_result::INSTALLED;", "g31o33"),
+           "non-participant does not get NOOP")
+
+    yield ("an L0 acquire that blocks without a timeout",
+           edit(files, UC_C, "while (!g_replan_txn_mutex.try_lock_for(interval)) {", "g_replan_txn_mutex.lock();\n        while (false) {", "g31w1"),
+           "blocking acquire of L0 is not a timed wait")
+    yield ("a blocked L0 acquire that never aborts under STRICT",
+           edit(files, UC_C, "if (ggml_sycl_strict_enabled()) {\n                GGML_ABORT(\"[REPLAN-WAIT] a %s acquire",
+                "if (false) {\n                GGML_ABORT(\"[REPLAN-WAIT] a %s acquire", "g31w2"),
+           "does not log the holder at each interval and abort under STRICT")
+    yield ("a watch that cannot abort under STRICT",
+           edit(files, UC_C, "if (ggml_sycl_strict_enabled()) {\n                GGML_ABORT(\"[REPLAN-WAIT] %s exceeded",
+                "if (false) {\n                GGML_ABORT(\"[REPLAN-WAIT] %s exceeded", "g31w3"),
+           "wait watch does not log at each interval and abort under STRICT")
+    yield ("synchronize_for_replan without its watch",
+           edit(files, M, 'ggml_sycl_wait_watch watch("synchronize_for_replan");', "int watch_unused = 0;", "g31w4"),
+           "not under a wait watch")
+
     yield ("a second re-plan mutex",
-           edit(files, UC_C, "static std::mutex g_replan_txn_mutex;",
-                "static std::mutex g_replan_txn_mutex;\nstatic std::mutex g_replan_extra_mutex;", "g31a"),
+           edit(files, UC_C, "static std::timed_mutex g_replan_txn_mutex;",
+                "static std::timed_mutex g_replan_txn_mutex;\nstatic std::mutex g_replan_extra_mutex;", "g31a"),
            "the re-plan mutexes are")
     yield ("a token member in a class",
            edit(files, M, "struct ggml_sycl_prepared_plan_publication {",
@@ -1102,8 +1207,8 @@ def mutants(files):
                 "static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {\n    g_dispatch_owner_bound = true;\n    return g_dispatch_owner_bound ? &g_dispatch_owner : nullptr;\n}", "o9"),
            "writes the dispatch owner outside its scope class")
     yield ("into_empty reading the process-global publication",
-           edit(files, M, "    const auto current = cache->get_placement_plan_snapshot();\n    if (current && current->plan && !current->plan->entries.empty()) {\n        return ggml_sycl_into_empty_result::NOOP;",
-                "    const auto current = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);\n    if (current && current->plan && !current->plan->entries.empty()) {\n        return ggml_sycl_into_empty_result::NOOP;", "o10"),
+           edit(files, M, "    const auto current = cache->get_placement_plan_snapshot();\n    if (current && current->plan && !current->plan->entries.empty()) {",
+                "    const auto current = std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);\n    if (current && current->plan && !current->plan->entries.empty()) {", "o10"),
            "into_empty reaches g_placement_publication")
     yield ("into_empty writing a device-global",
            edit(files, M, "    cache->set_placement_plan_snapshot(participates ? selected : nullptr);",
@@ -1220,12 +1325,36 @@ def mutants(files):
                 "scratch = 2ULL * 1024 * 1024 * 1024;\n                    break;", "g36k"),
            "PROBE_MIN set is not")
 
+    yield ("a second default for the compute arena in the reservation",
+           edit(files, M, "const size_t arena_bytes = ggml_sycl::ggml_sycl_compute_arena_bytes(0);",
+                'size_t arena_bytes = 512ULL << 20;\n        if (const char * e = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB")) { arena_bytes = static_cast<size_t>(std::atoi(e)) << 20; }',
+                "g36l"), "is read 2 time(s)")
+    yield ("the reservation without the sizing function",
+           edit(files, M, "const size_t arena_bytes = ggml_sycl::ggml_sycl_compute_arena_bytes(0);",
+                "const size_t arena_bytes = 512ULL << 20;", "g36m"), "does not size itself with")
+    yield ("a second default in the sizing function's neighbour",
+           edit(files, UC_C, "bool ggml_sycl_device_has_zones(int device) {",
+                'size_t ggml_sycl_stray_arena_bytes() { const char * e = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB"); return e ? 1 : 512; }\n'
+                "bool ggml_sycl_device_has_zones(int device) {", "g36n"), "is read 2 time(s)")
+
     yield ("a pool gate without the token kind",
            edit(files, POOL, "!ggml_sycl::ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION)",
                 "!ggml_sycl::ggml_sycl_replan_token_held()", "g37a", count=1),
            "tests the token with the default kind")
     yield ("a pool gate that drops its site",
            edit(files, POOL, "site=", "where=", "g37b", count=1), "does not name its site")
+
+
+_SWEEP = []
+
+
+def _sweep_one(i):
+    """One mutant: None when its wanted finding was reported, otherwise the failure line."""
+    name, m, frag = _SWEEP[i]
+    res = violations(m)
+    if any(frag in why for why in res):
+        return None
+    return "FAIL: mutant went undetected: %s (wanted %r, got %d other finding(s))" % (name, frag, len(res))
 
 
 def main():
@@ -1242,10 +1371,23 @@ def main():
     if len(built) < 40:
         print("FAIL: only %d mutants could be built" % len(built))
         return 1
-    for name, m, frag in built:
-        res = violations(m)
-        if not any(frag in why for why in res):
-            print("FAIL: mutant went undetected: %s (wanted %r, got %d other finding(s))" % (name, frag, len(res)))
+    # Each mutant is a whole gate evaluation (about 3 s), and they are independent, so they run in forked workers
+    # that share the parent's source texts.  A host that cannot fork runs them one by one.
+    global _SWEEP
+    _SWEEP = built
+    verdicts = None
+    try:
+        import multiprocessing
+        workers = max(1, min(4, os.cpu_count() or 1))
+        with multiprocessing.get_context("fork").Pool(workers) as pool:
+            verdicts = pool.map(_sweep_one, range(len(built)), chunksize=1)
+    except (ImportError, OSError, ValueError):
+        verdicts = None
+    if verdicts is None:
+        verdicts = [_sweep_one(i) for i in range(len(built))]
+    for failure in verdicts:
+        if failure:
+            print(failure)
             status = 1
     if status == 0:
         print("PASS: gates 3, 23, 29, 30, 31, 36 and 37 hold on the real source; %d mutants caught" % len(built))

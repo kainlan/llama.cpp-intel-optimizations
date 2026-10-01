@@ -3173,7 +3173,7 @@ target_link_libraries(test-sycl-measure-plan-override PRIVATE ggml-sycl-private-
 add_test(NAME test-sycl-measure-plan-override COMMAND test-sycl-measure-plan-override)
 set_tests_properties(test-sycl-measure-plan-override PROPERTIES
     LABELS "sycl;moe;tensor-placement;tdd"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 
@@ -3199,7 +3199,7 @@ target_link_libraries(test-sycl-plan-caps PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-plan-caps COMMAND test-sycl-plan-caps)
 set_tests_properties(test-sycl-plan-caps PROPERTIES
     LABELS "sycl;h6a;tdd"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 
@@ -3227,7 +3227,7 @@ target_link_libraries(test-sycl-replan-hooks PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-replan-hooks COMMAND test-sycl-replan-hooks)
 set_tests_properties(test-sycl-replan-hooks PROPERTIES
     LABELS "sycl;h6a;tdd"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
@@ -6508,3 +6508,15 @@ endif()
 
 endif() # BUILD_TESTING (llama.cpp-9goq, opened right after the production
         # GGML_SYCL_DEVICE_ARCH block near the top of this file)
+
+# The runtime witnesses (GGML_SYCL_WITNESS) enforce the L0 lock order and the nesting
+# rules (unified-cache.cpp, the audit above g_replan_txn_mutex).  A PRIVATE_TESTING
+# build turns them on by itself; a test that links the production backend does not,
+# so every lifecycle, replan and plan test sets GGML_SYCL_WITNESS_CHECKS=1 and the
+# order is enforced on every test run.
+get_property(_witness_candidate_tests DIRECTORY PROPERTY TESTS)
+foreach (_witness_test IN LISTS _witness_candidate_tests)
+    if (_witness_test MATCHES "lifecycle|replan|plan")
+        set_property(TEST ${_witness_test} APPEND PROPERTY ENVIRONMENT "GGML_SYCL_WITNESS_CHECKS=1")
+    endif()
+endforeach()

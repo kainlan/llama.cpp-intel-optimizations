@@ -410,6 +410,29 @@ void test_active_scope() {
     check(scope::active() == nullptr, "and cleared again");
 }
 
+// graph_compute tells a recording call from an eager one by this counter, so a
+// scope must count itself once when it is built, and pause, resume and leave
+// must not count (they re-open or close a recording that was already counted).
+void test_begin_counter() {
+    fixture        f;
+    const uint64_t before = ggml_sycl::graph_record_begins();
+    {
+        scope rec(slots_of(f.state), &f.graph, &f.queue, &f.sink, true);
+        check(ggml_sycl::graph_record_begins() == before + 1, "a built scope counts one begin");
+        rec.pause();
+        rec.resume();
+        rec.leave();
+        check(ggml_sycl::graph_record_begins() == before + 1, "pause, resume and leave do not count");
+    }
+    check(ggml_sycl::graph_record_begins() == before + 1, "destroying the scope does not count");
+    {
+        scope second(slots_of(f.state), &f.graph, &f.queue, &f.sink, false);
+    }
+    check(ggml_sycl::graph_record_begins() == before + 2, "a second scope counts again");
+    ggml_sycl::graph_record_begin_note();
+    check(ggml_sycl::graph_record_begins() == before + 3, "a hand-ordered recorder counts through the note");
+}
+
 }  // namespace
 
 int main() {
@@ -433,6 +456,7 @@ int main() {
         { "pause-resume-idempotent",      test_pause_resume_idempotent      },
         { "exception-after-resume",       test_exception_after_resume       },
         { "active-scope",                 test_active_scope                 },
+        { "begin-counter",                test_begin_counter                },
     };
 
     int failed = 0;

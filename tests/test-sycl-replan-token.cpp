@@ -13,7 +13,10 @@
 //     failures, each scored by its message in a re-exec'd child (the test builds
 //     Release with -DNDEBUG, so a death arm that passes here is not an assert);
 //   * with GGML_SYCL_WITNESS_CHECKS=0 the same illegal nesting runs unchecked and
-//     the witness does not evaluate its condition.
+//     the witness does not evaluate its condition;
+//   * a blocked acquire logs a WARN naming the holder at each interval and still
+//     enters once L0 is released, and aborts at the first interval under
+//     GGML_SYCL_STRICT_LEASES=1; the wait watch logs the site it is told about.
 //
 // Nothing here touches a device: the registration pins the selector to the
 // OpenCL CPU device and no queue is created.
@@ -28,10 +31,12 @@
 #include <sys/wait.h>
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -202,6 +207,32 @@ void test_death(const char * self, const char * child, const char * message) {
     }
 }
 
+// A child that must print `needles` (and, unless `aborts`, run to its marker).
+void test_waits(const char *                        self,
+                const char *                        env,
+                const char *                        child,
+                bool                                aborts,
+                std::initializer_list<const char *> needles) {
+    std::string out;
+    int         status = 0;
+    CHECK(run_child(self, env, child, out, status), "wait child started");
+    const bool aborted = (WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT) ||
+                         (WIFEXITED(status) && WEXITSTATUS(status) == 128 + SIGABRT);
+    CHECK(aborted == aborts, (std::string(child) + (aborts ? ": the child aborted" : ": the child ran on")).c_str());
+    if (!aborts) {
+        CHECK(status == 0, (std::string(child) + ": exited 0").c_str());
+        CHECK(out.find("returned without aborting") != std::string::npos,
+              (std::string(child) + ": reached its marker").c_str());
+    }
+    for (const char * needle : needles) {
+        const bool seen = out.find(needle) != std::string::npos;
+        CHECK(seen, (std::string(child) + ": printed '" + needle + "'").c_str());
+        if (!seen) {
+            std::fprintf(stderr, "%s printed:\n%s", child, out.c_str());
+        }
+    }
+}
+
 void test_unchecked(const char * self, const char * child) {
     std::string out;
     int         status = 0;
@@ -249,6 +280,35 @@ int outermost_only_free() {
     return g_failures == 0 ? child_marker() : 1;
 }
 
+// Another thread blocks on L0 for longer than three warning intervals (300 ms
+// each, set by the registration of this child); it must still enter afterwards.
+int blocked_acquire() {
+    std::atomic<bool> entered{ false };
+    std::thread       waiter;
+    {
+        ggml_sycl_replan_token holder(LIFE);
+        waiter = std::thread([&] {
+            ggml_sycl_replan_token w(TXN);
+            entered.store(true);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        CHECK(!entered.load(), "the waiter has not entered while L0 is held");
+    }
+    waiter.join();
+    CHECK(entered.load(), "the waiter entered once L0 was released");
+    return g_failures == 0 ? child_marker() : 1;
+}
+
+int watch_names_site() {
+    {
+        ggml_sycl_wait_watch watch("probe wait");
+        watch.site("the probe's second queue");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        CHECK(watch.warnings() >= 2, "the watch warned at each interval while the wait ran");
+    }
+    return g_failures == 0 ? child_marker() : 1;
+}
+
 int witness_false() {
     GGML_SYCL_WITNESS(1 + 1 == 3, "[REPLAN-TOKEN] test witness fired");
     return child_marker();
@@ -284,6 +344,12 @@ int main(int argc, char ** argv) {
         if (std::strcmp(c, "outermost-only-free") == 0) {
             return outermost_only_free();
         }
+        if (std::strcmp(c, "blocked-acquire") == 0) {
+            return blocked_acquire();
+        }
+        if (std::strcmp(c, "watch-names-site") == 0) {
+            return watch_names_site();
+        }
         if (std::strcmp(c, "witness-false") == 0) {
             return witness_false();
         }
@@ -301,6 +367,15 @@ int main(int argc, char ** argv) {
     test_death(argv[0], "nest-load-under-txn", "[REPLAN-TOKEN] illegal nesting: LOAD under TRANSACTION");
     test_death(argv[0], "outermost-only-held", "[REPLAN-TOKEN] release proc entered with L0 held");
     test_death(argv[0], "witness-false", "[REPLAN-TOKEN] test witness fired");
+    // A blocked acquire warns with the holder's kind at each interval and still enters; under STRICT it aborts at
+    // the first interval; the watch names the wait it is told about.
+    test_waits(argv[0], "GGML_SYCL_WITNESS_CHECKS=1 GGML_SYCL_REPLAN_WAIT_WARN_MS=300", "blocked-acquire", false,
+               { "[REPLAN-WAIT] a TRANSACTION acquire of L0 has waited", "held by a LIFECYCLE token",
+                 "(the wait continues)" });
+    test_waits(argv[0], "GGML_SYCL_WITNESS_CHECKS=1 GGML_SYCL_REPLAN_WAIT_WARN_MS=300 GGML_SYCL_STRICT_LEASES=1",
+               "blocked-acquire", true, { "[REPLAN-WAIT] a TRANSACTION acquire of L0 exceeded 300 ms" });
+    test_waits(argv[0], "GGML_SYCL_REPLAN_WAIT_WARN_MS=300", "watch-names-site", false,
+               { "[REPLAN-WAIT] probe wait has waited", "now at: the probe's second queue" });
     // The same arms with the switch off reach the unchecked path.
     test_unchecked(argv[0], "nest-txn-under-load");
     test_unchecked(argv[0], "nest-load-under-txn");

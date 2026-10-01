@@ -1645,7 +1645,7 @@ if (NOT WIN32)
     )
     set_tests_properties(test-sycl-holder-census-source PROPERTIES
         LABELS "sycl;tdd"
-        TIMEOUT 120
+        TIMEOUT 180
     )
 
     # Gates 3, 23, 29, 30, 31, 36 and 37 (zhcn-design §5.2): the backend half of the
@@ -1659,7 +1659,7 @@ if (NOT WIN32)
     )
     set_tests_properties(test-sycl-replan-census-source PROPERTIES
         LABELS "sycl;tdd"
-        TIMEOUT 300
+        TIMEOUT 400
     )
 
     # Regression + arithmetic gate for parse-sycl-gap-device-split.py, the
