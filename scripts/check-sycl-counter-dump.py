@@ -781,6 +781,14 @@ def check(files, cmake):
     # and the planned device bytes are the one per-entry sum (never the single-device recorded figure).
     le = function_text(cache_text, "unified_cache_dump_capture_load_end")
     if le is not None:
+        # D2: weight_live_bytes reads cache->weight_bytes() only without an arena (an arena weight is not
+        # in that figure), and prints not_captured, never a zero that means "not counted", with one.
+        m = re.search(r"if\s*\(\s*cache->arena_active\(\)\s*\)\s*\{([^{}]*)\}\s*else\s*\{([^{}]*)\}", le)
+        if m is None or "snapshot_clear(dump_snapshot::weight_live_bytes_last_load_end" not in m.group(1) or \
+                "snapshot_set(dump_snapshot::weight_live_bytes_last_load_end" not in m.group(2) or \
+                "weight_bytes()" not in m.group(2):
+            fails.append("H13 D2: weight_live_bytes@last_load_end is not not_captured under an active arena "
+                         "(cache->weight_bytes() does not count arena-placed weights)")
         if "expert_on_device(" not in le:
             fails.append("H13 M-5: unified_cache_dump_capture_load_end does not use expert_on_device, the "
                          "predicate the reach counter uses")
@@ -1156,8 +1164,15 @@ def mutation_matrix(files, cmake):
     f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
         "dump_snapshot::weight_live_bytes_last_load_end, dev, cache->weight_bytes()",
         "dump_snapshot::COUNT, dev, cache->weight_bytes()", 1)
+    # The clear call under an arena also names the snapshot, so the generic producer check cannot see the set
+    # call go; the D2 pin does (its else arm must set it from cache->weight_bytes()).
     muts.append(("load-end live-bytes snapshot producer dropped",
-                 "H13 G0: snapshot weight_live_bytes@last_load_end has no producer", f, cmake))
+                 "H13 D2: weight_live_bytes@last_load_end is not not_captured under an active arena", f, cmake))
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace("if (cache->arena_active()) {\n        unified_cache_dump_snapshot_clear(dump_snapshot::weight_live_bytes_last_load_end",
+                                                                "if (false) {\n        unified_cache_dump_snapshot_clear(dump_snapshot::weight_live_bytes_last_load_end", 1)
+    muts.append(("live-bytes snapshot reads a zero-valued figure under an arena",
+                 "H13 D2: weight_live_bytes@last_load_end is not not_captured under an active arena", f, cmake))
     f = clone()
     f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
         "dump_snapshot::zone_capacity_onednn_context_txn, dev,", "dump_snapshot::COUNT, dev,", 1)

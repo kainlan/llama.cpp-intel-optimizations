@@ -22804,7 +22804,8 @@ static void dump_report_zone_figures_for(unified_cache * cache, int dev, const c
 // The load-end snapshot entries of `dev`: this model's planned bytes from its candidate plan, recorded
 // against its ownership slot with a load order; then the first two live models by load order publish as
 // load_1 and load_2 (load_2 reads not_captured while one model is live), beside the device's live WEIGHT
-// bytes. A model with no plan leaves its entries not_captured, never zero. The load-end call runs before
+// bytes (not_captured when an arena holds the weights, see below). A model with no plan leaves its
+// entries not_captured, never zero. The load-end call runs before
 // the plan publishes, so the plan is still the candidate. A third live model is recorded but not printed.
 //
 // weight_planned_device_bytes means one thing for every plan: the sum, over the plan's primary weight
@@ -22933,7 +22934,17 @@ static void unified_cache_dump_capture_load_end(int             dev,
         unified_cache_dump_snapshot_clear(dump_snapshot::weight_host_tiered_bytes_load_2, dev);
         unified_cache_dump_snapshot_clear(dump_snapshot::weight_planned_device_bytes_load_2, dev);
     }
-    unified_cache_dump_snapshot_set(dump_snapshot::weight_live_bytes_last_load_end, dev, cache->weight_bytes());
+    // weight_live_bytes counts what cache->weight_bytes() counts: the budget-charged cache entries. A
+    // weight placed in the VRAM arena is a zone allocation and is NOT in that figure (G0 read 0 against
+    // 4.1, 12.1 and 7.2 GB planned on every arena run), so with an arena active this reads not_captured
+    // rather than a zero that means "not counted". The arena's live weight bytes are the WEIGHT zone's
+    // used figure; no snapshot takes it, because in single-chunk mode WEIGHT shares the KV allocator and
+    // that counter is not verified to be weight-only.
+    if (cache->arena_active()) {
+        unified_cache_dump_snapshot_clear(dump_snapshot::weight_live_bytes_last_load_end, dev);
+    } else {
+        unified_cache_dump_snapshot_set(dump_snapshot::weight_live_bytes_last_load_end, dev, cache->weight_bytes());
+    }
     // G0 prints the ONEDNN room after each load, beside the model's W; this tree has no W term yet.
     try {
         dump_report_zone_figures_for(cache, dev, "load_end", vram_zone_id::ONEDNN);
