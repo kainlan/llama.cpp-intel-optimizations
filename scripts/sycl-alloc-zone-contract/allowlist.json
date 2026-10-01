@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "entries": [
+    {
+      "id": "E-TEST",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache::ensure_cached_alloc",
+      "count": 2,
+      "reason": "design 6.14 E-TEST: the PRIVATE_TESTING allocation entry, a test seam; its two raw calls are exempt, a third is not"
+    },
+    {
+      "id": "E-ARENA-BACKING",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache::arena_reserve",
+      "count": 2,
+      "reason": "design 6.14 E-ARENA-BACKING: arena_reserve is the arena; its two backing allocations are what every zone is carved from"
+    }
+  ]
+}

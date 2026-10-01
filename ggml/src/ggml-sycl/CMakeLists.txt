@@ -132,6 +132,17 @@ if (BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-counter-dump.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
     set_tests_properties(test-sycl-counter-dump-gate PROPERTIES LABELS "sycl;source-contract;host")
+    # llama.cpp-23mk S2: the allocation-zone contract. A tree-sitter parse of every non-test
+    # ggml-sycl source; each request construction names its tier by literal, a device request names
+    # its zone and forbids the spill, and raw allocator names stay inside the allowlisted functions.
+    # --mutation-matrix runs the gate and then its witnesses on in-memory mutants of the tree, so a
+    # check that can no longer fail is itself a failure. Needs tree_sitter_language_pack: a missing
+    # pack FAILS (exit 1), it never skips. Allocates nothing; safe at any parallelism.
+    add_test(NAME test-sycl-alloc-zone-contract
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-alloc-zone-contract.py
+                --root ${CMAKE_CURRENT_SOURCE_DIR}/../../.. --mutation-matrix)
+    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES LABELS "sycl;host-only;ast;mutation")
 endif()
 
 # P1 lifecycle registry tests are deliberately host-only: model-lifecycle.cpp
