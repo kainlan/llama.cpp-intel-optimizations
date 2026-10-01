@@ -73,6 +73,9 @@ FIELDS = [
     ("onednn_sdpa_admitted", "step0", None),
     ("onednn_sdpa_executed", "step0", None),
     ("onednn_sdpa_fallback_after_admit", "step0", None),
+    ("moe_table_reach_zero_gpu_expert", "step0", None),
+    ("onednn_graph_compile_live_draws", "step0", None),
+    ("onednn_graph_callback_unmarked_mallocs", "step3", None),
     ("onednn_fa_plan_calls", "b1", None),
     ("onednn_graph_mask_declined", "b1", None),
     ("onednn_graph_route_declined", "b1", None),
@@ -104,7 +107,8 @@ ROUTE_INTERIM_KEYS = ["interim_tp", "interim_capped", "interim_capacity"]
 REQUIRED_PRODUCERS = ["ext_alloc_count", "ext_alloc_arena", "zone_cascade_miss", "zone_unconverted_miss",
                       "zone_plan_refusal", "stream_dma_non_device_arrivals", "onednn_pp_record_mode_acquires",
                       "set_rows_stage_arrivals", "set_rows_stage_record_mode_acquires", "onednn_sdpa_admitted",
-                      "onednn_sdpa_executed", "onednn_sdpa_fallback_after_admit"]
+                      "onednn_sdpa_executed", "onednn_sdpa_fallback_after_admit", "moe_table_reach_zero_gpu_expert",
+                      "onednn_graph_compile_live_draws"]
 
 # The G0 counters whose increment must sit in a named function, so a producer that drifted into an
 # unrelated function (or a second copy of the site) fails the gate rather than reading as live:
@@ -117,6 +121,48 @@ PRODUCER_SITES = [
     ("onednn_sdpa_admitted", "fattn-onednn.cpp", "ggml_sycl_flash_attn_ext_onednn"),
     ("onednn_sdpa_executed", "fattn-onednn.cpp", "ggml_sycl_flash_attn_ext_onednn"),
     ("onednn_sdpa_fallback_after_admit", "fattn-onednn.cpp", "ggml_sycl_flash_attn_ext_onednn"),
+    ("moe_table_reach_zero_gpu_expert", "ggml-sycl.cpp", "ggml_sycl_note_moe_table_reach"),
+    ("onednn_graph_compile_live_draws", "fattn-onednn.cpp", "build_and_compile_sdpa"),
+]
+
+# The one counter whose evaluation is armed-only: its zero test walks the placement plan once per expert,
+# per MoE table call, so it runs only in a run that arms the dump (the one place the counter is read).
+# Every other producer counts unconditionally (§M179: a counter behind the environment made S0a's raw-exit
+# count read 0 on a run that set neither variable).
+ARMED_ONLY_COUNTERS = ["moe_table_reach_zero_gpu_expert"]
+
+# What makes an `if` an environment or build test, for the unconditional-counting rule.
+ENV_TEST = re.compile(r"getenv|counter_dump_requested|dump_report_enabled|dump_report_armed|PRIVATE_TESTING"
+                      r"|g_ggml_sycl_debug|trace_enabled")
+
+# G0's row-134 reach counts: every production call of ggml_sycl_ensure_moe_ptr_table, and every caller of
+# ggml_sycl_update_moe_ptr_table / ggml_sycl_upload_moe_ptr_table_from_batch, notes its site before the
+# call: (function that holds it, the site label it passes). A label with a `/role` suffix names a call
+# inside that function; the function is what precedes the slash.
+REACH_SITES = [
+    ("ggml_sycl_upload_moe_transient_ptr_table", "ensure:ggml_sycl_upload_moe_transient_ptr_table"),
+    ("ggml_sycl_update_moe_ptr_table", "ensure:ggml_sycl_update_moe_ptr_table"),
+    ("graph_preload_moe_experts", "ensure:graph_preload_moe_experts"),
+    ("graph_preload_moe_experts", "update:graph_preload_moe_experts"),
+    ("ggml_sycl_upload_moe_retained_ptr_table_from_batch", "upload:ggml_sycl_upload_moe_retained_ptr_table_from_batch"),
+    ("try_xmx_sorted_moe", "upload:try_xmx_sorted_moe"),
+    ("ggml_sycl_mul_mat_id", "upload:ggml_sycl_mul_mat_id/prompt"),
+    ("ggml_sycl_mul_mat_id", "upload:ggml_sycl_mul_mat_id/retained"),
+    ("ggml_sycl_mul_mat_id", "upload:ggml_sycl_mul_mat_id/retained_local"),
+    ("ggml_sycl_mul_mat_id", "upload:ggml_sycl_mul_mat_id/retained_tail"),
+    ("ggml_sycl_mul_mat_id", "update:ggml_sycl_mul_mat_id/pair_gate"),
+    ("ggml_sycl_mul_mat_id", "update:ggml_sycl_mul_mat_id/pair_up"),
+    ("ggml_sycl_mul_mat_id", "update:ggml_sycl_mul_mat_id/pair_down"),
+]
+
+# The functions that emit a G0 report or the dump: each writes with std::fprintf(stderr, ...) and calls no
+# GGML_LOG_* macro. The log drops GGML_LOG_INFO at default verbosity in every tool, so a report that went
+# through it would vanish from a plain llama-completion run and G0 would read as vacuous.
+REPORT_EMITTERS = [
+    ("unified-cache.cpp", "unified_cache_dump_report"),
+    ("unified-cache.cpp", "unified_cache_dump_report_once"),
+    ("unified-cache.cpp", "dump_report_zone_figures_for"),
+    ("unified-cache.cpp", "unified_cache_test_counter_dump"),
 ]
 
 # The snapshot entries' producers: id -> (file, function that holds the capture). The two zone-figure
@@ -151,6 +197,11 @@ REPORT_SITES = [
     ("landing", "ggml-sycl.cpp", "ggml_backend_sycl_buffer_publish", "vram_zone_id::SCRATCH"),
     ("zone_figures", "unified-cache.cpp", "dump_report_zone_figures_for", "[SYCL-REPORT] zone_figures dev="),
     ("zone_figures", "unified-cache.cpp", "unified_cache_dump_capture_load_end", "vram_zone_id::ONEDNN"),
+    ("planned_host", "unified-cache.cpp", "unified_cache_dump_capture_load_end", '"planned_host load_txn='),
+    ("moe_zero_gpu_expert_tensors", "unified-cache.cpp", "unified_cache_dump_capture_load_end",
+     "[SYCL-REPORT] moe_zero_gpu_expert_tensors dev="),
+    ("arm_a_kernel", "ggml-sycl.cpp", "bool ggml_sycl_dispatch_mul_mat_kernel", "layout_mismatch="),
+    ("arm_a_kernel", "ggml-sycl.cpp", "bool ggml_sycl_dispatch_mul_mat_kernel", "src0_layout="),
     ("row73_own_alloc", "ggml-sycl.cpp", "bool ggml_sycl_ensure_moe_ptr_table", '"row73_own_alloc dev='),
     ("arm_a_kernel", "ggml-sycl.cpp", "bool ggml_sycl_dispatch_mul_mat_kernel", '"arm_a_kernel dev='),
 ]
@@ -158,7 +209,7 @@ REPORT_SITES = [
 # A field whose producer cannot land yet prints value=not_captured, never a zero: its definition
 # needs the request's pending_owner (a load's request always carries its hold's owner), which lands
 # with moua L4L6 / 23mk S4a. The printer reads one predicate for the set, and the gate pins both.
-NOT_CAPTURED_FIELDS = ["load_row_op_time_arrivals"]
+NOT_CAPTURED_FIELDS = ["load_row_op_time_arrivals", "onednn_graph_callback_unmarked_mallocs"]
 
 # The tree's own facts: which landing steps are on it.
 B2_SENTINEL = re.compile(r"\bggml_sycl_onednn_graph_scratch_range_miss\s*\([^;{]*\)\s*(?:noexcept\s*)?\{")
@@ -384,6 +435,66 @@ def cmake_targets_with_macro(cmake):
     return targets, other_forms
 
 
+def enclosing_blocks(text, pos):
+    """[(open_brace, close_brace)] of every `{...}` pair in `text` that contains `pos`, innermost first.
+    String and char literals are skipped (comments are already stripped)."""
+    stack = []
+    pairs = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            quote = c
+            i += 1
+            while i < n and text[i] != quote:
+                i += 2 if text[i] == "\\" else 1
+        elif c == "{":
+            stack.append(i)
+        elif c == "}" and stack:
+            start = stack.pop()
+            if start < pos < i:
+                pairs.append((start, i))
+        i += 1
+    pairs.sort(key=lambda se: se[1] - se[0])
+    return pairs
+
+
+def block_condition(text, brace):
+    """The parenthesised condition of the `if (...)`/`while (...)` whose `{` is at `brace`, or ''."""
+    j = brace - 1
+    while j >= 0 and text[j] in " \t\n":
+        j -= 1
+    if j < 0 or text[j] != ")":
+        return ""
+    depth = 0
+    k = j
+    while k >= 0:
+        if text[k] == ")":
+            depth += 1
+        elif text[k] == "(":
+            depth -= 1
+            if depth == 0:
+                break
+        k -= 1
+    head = text[max(0, k - 12):k].rstrip()
+    if not re.search(r"\b(?:if|while)$", head):
+        return ""
+    return text[k + 1:j]
+
+
+def env_gated_before(body, pos):
+    """The environment/build test that gates `body[pos]`, or None: an enclosing `if (...)` whose condition
+    names one, or an earlier `if (<test>) return` in the same function (an early exit)."""
+    for start, _end in enclosing_blocks(body, pos):
+        cond = block_condition(body, start)
+        if cond and ENV_TEST.search(cond):
+            return cond.strip()
+    for m in re.finditer(r"\bif\s*\(([^;{}]*)\)\s*\{?\s*return\b", body[:pos]):
+        if ENV_TEST.search(m.group(1)):
+            return m.group(1).strip()
+    return None
+
+
 def check(files, cmake):
     """Return the list of failures for one tree."""
     fails = []
@@ -570,6 +681,53 @@ def check(files, cmake):
             fails.append(f"H13 G0: {fn} not found in {rel}, the producer of the {kind} report")
         elif needle not in body:
             fails.append(f"H13 G0: {fn} ({rel}) lost the {kind} report (`{needle}`)")
+
+    # A report is written with std::fprintf(stderr, ...) and never through the ggml log: the log drops INFO
+    # at default verbosity. The emitters' whole bodies, and the block of each report in ggml-sycl.cpp.
+    for rel, fn in REPORT_EMITTERS:
+        body = function_text(stripped.get(rel, ""), fn)
+        if body is None:
+            fails.append(f"H13 G0: {fn} not found in {rel}, a report emitter")
+            continue
+        if "GGML_LOG_" in body:
+            fails.append(f"H13 G0: report emitter {fn} ({rel}) calls GGML_LOG_*, which default verbosity drops")
+        if not re.search(r"\bfprintf\s*\(\s*stderr\b", body):
+            fails.append(f"H13 G0: report emitter {fn} ({rel}) does not write with fprintf(stderr, ...)")
+    for kind, rel, fn, needle in REPORT_SITES:
+        if rel != "ggml-sycl.cpp":
+            continue
+        body = function_text(stripped.get(rel, ""), fn)
+        at = body.find(needle) if body else -1
+        if at < 0:
+            continue
+        blocks = enclosing_blocks(body, at)
+        scope = body[blocks[0][0]:blocks[0][1]] if blocks else body
+        if "GGML_LOG_" in scope:
+            fails.append(f"H13 G0: the {kind} report block in {fn} ({rel}) calls GGML_LOG_*, which default "
+                         f"verbosity drops")
+        if not re.search(r"unified_cache_dump_report(?:_once|_zone_figures)?\s*\(", scope):
+            fails.append(f"H13 G0: the {kind} report block in {fn} ({rel}) does not emit through the dump report API")
+
+    # Each row-134 reach site notes itself, in the function that holds the call.
+    for fn, label in REACH_SITES:
+        body = function_text(stripped.get("ggml-sycl.cpp", ""), fn)
+        if body is None:
+            fails.append(f"H13 G0: {fn} not found in ggml-sycl.cpp, the holder of reach site {label}")
+        elif f'ggml_sycl_note_moe_table_reach("{label}"' not in body:
+            fails.append(f"H13 G0: {fn} (ggml-sycl.cpp) lost its row-134 reach note `{label}`")
+
+    # Counted unconditionally (§M179): no producer increment sits under an environment or build test,
+    # inside an enclosing `if` or after an early exit on one. ARMED_ONLY_COUNTERS name the exception.
+    for name, rel, fn in PRODUCER_SITES:
+        if name in ARMED_ONLY_COUNTERS:
+            continue
+        body = function_text(stripped.get(rel, ""), fn)
+        if body is None:
+            continue
+        for m in re.finditer(r"dump_counter_add(?:_key)?\s*\(\s*(?:ggml_sycl::)?dump_counter::" + name + r"\b", body):
+            cond = env_gated_before(body, m.start())
+            if cond is not None:
+                fails.append(f"H13 M179: counter {name} is counted conditionally in {fn} ({rel}), under `{cond}`")
 
     for rel, fn, needle in CAPTURE_CALLERS:
         body = function_text(stripped.get(rel, ""), fn)
@@ -944,7 +1102,7 @@ def mutation_matrix(files, cmake):
                  "H13 G0: load_row_op_time_arrivals has an increment", f, cmake))
     f = clone()
     f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
-        "return c != static_cast<size_t>(dump_counter::load_row_op_time_arrivals);", "return true;", 1)
+        "c != static_cast<size_t>(dump_counter::load_row_op_time_arrivals) &&", "true &&", 1)
     muts.append(("predicate no longer names the not-captured field",
                  "H13 G0: load_row_op_time_arrivals is not named by dump_counter_captured", f, cmake))
 
@@ -989,6 +1147,76 @@ def mutation_matrix(files, cmake):
         'ggml_sycl::unified_cache_dump_report_zone_figures(ctx->device, "after_backend_buffer",\n'
         '                                                          ggml_sycl::vram_zone_id::SCRATCH);', "", 1)
     muts.append(("landing no longer reports SCRATCH", "H13 G0: ggml_backend_sycl_buffer_publish", f, cmake))
+
+    # The fold's rules: reports never go through the ggml log, producers count unconditionally, the
+    # row-134 reach sites note themselves, and the new not-captured field stays not captured.
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
+        'std::fprintf(stderr, "[SYCL-REPORT] %s\\n", text);', 'GGML_LOG_INFO("[SYCL-REPORT] %s\\n", text);', 1)
+    muts.append(("report emitter swapped to GGML_LOG_INFO",
+                 "H13 G0: report emitter unified_cache_dump_report (unified-cache.cpp) calls GGML_LOG_*", f, cmake))
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
+        '    std::fprintf(stderr,\n                 "[SYCL-REPORT] zone_figures dev=%d',
+        '    GGML_LOG_INFO(\n                 "[SYCL-REPORT] zone_figures dev=%d', 1)
+    muts.append(("zone_figures emitter swapped to GGML_LOG_INFO",
+                 "H13 G0: report emitter dump_report_zone_figures_for (unified-cache.cpp) calls GGML_LOG_*", f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"].replace(
+        "        ggml_sycl::unified_cache_dump_report(line);\n        ggml_sycl::unified_cache_dump_report_zone_figures(",
+        "        GGML_LOG_INFO(\"%s\\n\", line);\n        ggml_sycl::unified_cache_dump_report_zone_figures(", 1)
+    muts.append(("landing report swapped to GGML_LOG_INFO",
+                 "H13 G0: the landing report block in ggml_backend_sycl_buffer_publish (ggml-sycl.cpp) calls GGML_LOG_*",
+                 f, cmake))
+    f = clone()
+    f["set_rows.cpp"] = files["set_rows.cpp"].replace(
+        '    {\n        char key[32];\n        std::snprintf(key, sizeof(key), "bytes=%zu", bytes);',
+        '    if (ggml_sycl::unified_cache_dump_report_enabled()) {\n        char key[32];\n'
+        '        std::snprintf(key, sizeof(key), "bytes=%zu", bytes);', 1)
+    muts.append(("set_rows stage arrival counted only while armed",
+                 "H13 M179: counter set_rows_stage_arrivals is counted conditionally in ggml_sycl_set_rows_stage_ptr", f,
+                 cmake))
+    f = clone()
+    f["set_rows.cpp"] = files["set_rows.cpp"].replace(
+        "    // The stage is predicted never reached on a single card",
+        "    if (!ggml_sycl::unified_cache_dump_report_enabled()) {\n        return ptr;\n    }\n"
+        "    // The stage is predicted never reached on a single card", 1)
+    muts.append(("set_rows stage returns early unless armed",
+                 "H13 M179: counter set_rows_stage_arrivals is counted conditionally in ggml_sycl_set_rows_stage_ptr", f,
+                 cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = re.sub(r'ggml_sycl_note_moe_table_reach\("update:ggml_sycl_mul_mat_id/pair_up",[^;]*;', "",
+                                files["ggml-sycl.cpp"], count=1)
+    muts.append(("a row-134 reach note dropped",
+                 "H13 G0: ggml_sycl_mul_mat_id (ggml-sycl.cpp) lost its row-134 reach note `update:ggml_sycl_mul_mat_id/pair_up`",
+                 f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = re.sub(r'ggml_sycl_note_moe_table_reach\("ensure:graph_preload_moe_experts",[^;]*;', "",
+                                files["ggml-sycl.cpp"], count=1)
+    muts.append(("the preload's reach note dropped",
+                 "H13 G0: graph_preload_moe_experts (ggml-sycl.cpp) lost its row-134 reach note `ensure:graph_preload_moe_experts`",
+                 f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"] + (
+        "\nstatic void h13_extra2(int d) { ggml_sycl::unified_cache_dump_counter_add("
+        "ggml_sycl::dump_counter::onednn_graph_callback_unmarked_mallocs, d); }\n")
+    muts.append(("callback unmarked-malloc field given an increment",
+                 "H13 G0: onednn_graph_callback_unmarked_mallocs has an increment", f, cmake))
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
+        "           c != static_cast<size_t>(dump_counter::onednn_graph_callback_unmarked_mallocs);", "           true;", 1)
+    muts.append(("predicate no longer names the callback field",
+                 "H13 G0: onednn_graph_callback_unmarked_mallocs is not named by dump_counter_captured", f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"].replace("layout_mismatch=%d ne11", "ne11", 1)
+    muts.append(("arm A report drops the mismatch flag", "H13 G0: bool ggml_sycl_dispatch_mul_mat_kernel", f, cmake))
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace('"planned_host load_txn=', '"planned load_txn=', 1)
+    muts.append(("planned_host report dropped", "H13 G0: unified_cache_dump_capture_load_end", f, cmake))
+    f = clone()
+    f["unified-cache.cpp"] = files["unified-cache.cpp"].replace(
+        "[SYCL-REPORT] moe_zero_gpu_expert_tensors dev=", "[SYCL-REPORT] moe_zero dev=", 1)
+    muts.append(("zero-GPU-expert report dropped", "H13 G0: unified_cache_dump_capture_load_end", f, cmake))
 
     # The ggml-sycl target given the macro.
     muts.append(("ggml-sycl defines the macro", "H13 M74: the ggml-sycl target defines GGML_SYCL_PRIVATE_TESTING",

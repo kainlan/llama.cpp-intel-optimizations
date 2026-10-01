@@ -3506,9 +3506,14 @@ class unified_cache {
     size_t zone_largest_free(vram_zone_id zone) const;
     // Both free-space figures of one zone, read together under its allocator group's mutex: the
     // allocators' figures are only coherent under it (zone_available and zone_largest_free read
-    // them bare). Takes the group mutex, so a caller already inside the group (an allocation, a
-    // refusal) must not call it. False when no arena is active.
-    bool   zone_free_figures(vram_zone_id zone, size_t & available, size_t & largest_free);
+    // them bare), with the zone's capacity and used bytes read at the same instant so a line's four
+    // figures satisfy used + available == capacity. Takes the group mutex, so a caller already inside
+    // the group (an allocation, a refusal) must not call it. False when no arena is active.
+    bool   zone_free_figures(vram_zone_id zone,
+                             size_t &     capacity,
+                             size_t &     used,
+                             size_t &     available,
+                             size_t &     largest_free);
     void   dump_live_zone_allocations(vram_zone_id zone, const char * where, size_t max_entries = 32) const;
 
     const vram_zone & get_zone(vram_zone_id zone) const { return arena_zones_[static_cast<int>(zone)]; }
@@ -3700,9 +3705,12 @@ class unified_cache {
                                  const void *                     ctx,
                                  const std::vector<sycl::event> & deps,
                                  dma_stream_copy_fn               copy_fn     = nullptr,
-                                 // The caller's own file, defaulted at the call site, names the caller in
-                                 // the stream_dma_non_device_arrivals dump key. Pass nothing.
-                                 const char *                     caller_file = __builtin_FILE());
+                                 // The caller's own file and function, defaulted at the call site, name the
+                                 // caller in the stream_dma_non_device_arrivals dump key (two callers in
+                                 // one file, the mul_mat stream and the MoE expert stream, stay apart).
+                                 // Pass nothing.
+                                 const char *                     caller_file = __builtin_FILE(),
+                                 const char *                     caller_func = __builtin_FUNCTION());
 
     // Defer freeing host allocations until the associated event completes.
     void defer_host_free(void * ptr, size_t size, const sycl::event & event);
@@ -7273,29 +7281,32 @@ bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
 //
 // A keyed counter (a cohort, a site, a ticket) prints its unlabelled total in
 // the fixed list and one `name=<counter>{<key>}` line per key that has counted.
-#define GGML_SYCL_DUMP_COUNTERS(X)          \
-    X(ext_alloc_count)                      \
-    X(ext_alloc_arena)                      \
-    X(zone_cascade_miss)                    \
-    X(zone_unconverted_miss)                \
-    X(zone_plan_refusal)                    \
-    X(refusal_unattributed)                 \
-    X(refusal_late)                         \
-    X(onednn_scratchpad_over_plan_declined) \
-    X(late_term_shrink_admitted)            \
-    X(arena_policy_refusal)                 \
-    X(stream_dma_non_device_arrivals)       \
-    X(onednn_pp_record_mode_acquires)       \
-    X(set_rows_stage_arrivals)              \
-    X(set_rows_stage_record_mode_acquires)  \
-    X(load_row_op_time_arrivals)            \
-    X(onednn_sdpa_admitted)                 \
-    X(onednn_sdpa_executed)                 \
-    X(onednn_sdpa_fallback_after_admit)     \
-    X(onednn_fa_plan_calls)                 \
-    X(onednn_graph_mask_declined)           \
-    X(onednn_graph_route_declined)          \
-    X(onednn_graph_decline_at_entry)        \
+#define GGML_SYCL_DUMP_COUNTERS(X)            \
+    X(ext_alloc_count)                        \
+    X(ext_alloc_arena)                        \
+    X(zone_cascade_miss)                      \
+    X(zone_unconverted_miss)                  \
+    X(zone_plan_refusal)                      \
+    X(refusal_unattributed)                   \
+    X(refusal_late)                           \
+    X(onednn_scratchpad_over_plan_declined)   \
+    X(late_term_shrink_admitted)              \
+    X(arena_policy_refusal)                   \
+    X(stream_dma_non_device_arrivals)         \
+    X(onednn_pp_record_mode_acquires)         \
+    X(set_rows_stage_arrivals)                \
+    X(set_rows_stage_record_mode_acquires)    \
+    X(load_row_op_time_arrivals)              \
+    X(onednn_sdpa_admitted)                   \
+    X(onednn_sdpa_executed)                   \
+    X(onednn_sdpa_fallback_after_admit)       \
+    X(moe_table_reach_zero_gpu_expert)        \
+    X(onednn_graph_compile_live_draws)        \
+    X(onednn_graph_callback_unmarked_mallocs) \
+    X(onednn_fa_plan_calls)                   \
+    X(onednn_graph_mask_declined)             \
+    X(onednn_graph_route_declined)            \
+    X(onednn_graph_decline_at_entry)          \
     X(onednn_graph_scratch_barrier_failed)
 
 // A byte figure an arm scores that is not a counter: captured at a named point
@@ -7353,6 +7364,10 @@ bool unified_cache_dump_snapshot_pending(dump_snapshot snapshot, int dev) noexce
 enum class dump_point : uint8_t { FIRST_DECODE, CONTEXT_TXN };
 void unified_cache_dump_capture_zone_figures(int dev, dump_point point) noexcept;
 
+// Draws the oneDNN Graph allocator callback has made and not yet freed, process-wide. The SDPA compile
+// brackets it so a draw that outlives compile() is counted (onednn_graph_compile_live_draws).
+int64_t unified_cache_onednn_graph_live_draws() noexcept;
+
 // === G0 report lines (GGML_SYCL_COUNTER_DUMP=1) ===
 //
 // A figure G0 reads that is a line at its instant rather than a counter or a snapshot entry. Each
@@ -7362,12 +7377,21 @@ void unified_cache_dump_capture_zone_figures(int dev, dump_point point) noexcept
 //   zone_figures    capacity, used, free and largest-free of one zone, read under its group mutex: the
 //                   RUNTIME and SCRATCH rooms after each backend buffer, the ONEDNN room after each load
 //   row73_own_alloc ggml_sycl_ensure_moe_ptr_table's own-allocation fallback, with the table_index
-//   arm_a_kernel    ggml_sycl_dispatch_mul_mat_kernel: the kernel and layout the selector chose for the
-//                   LM head (output.weight), with its type and ne11; once per distinct reading
+//   arm_a_kernel    ggml_sycl_dispatch_mul_mat_kernel: the kernel the selector chose for the LM head
+//                   (output.weight), with its type and ne11, the layout the operand was MATERIALIZED in
+//                   (src0_layout, from its handle) beside the layout the kernel consumes
+//                   (kernel_layout), and layout_mismatch=1 when the two differ (the l9i1 shape); once
+//                   per distinct reading
+//   planned_host    unified_cache_dump_capture_load_end: the plan's own weight_host_bytes, once per load
+//                   (host-tiered bytes are plan-wide, never credited to each device)
+//   moe_zero_gpu_expert_tensors
+//                   unified_cache_dump_capture_load_end: per device, the plan's MoE tensors and how many
+//                   of them have zero GPU-executed experts there (G0's VOID test for the preload arm)
 bool unified_cache_dump_report_enabled() noexcept;
 void unified_cache_dump_report(const char * text) noexcept;
 // Prints `text` the first time `key` is seen on this process, nothing after; false once the table of
-// 64 keys is full, so a flood of distinct readings is bounded rather than silent.
+// 64 keys is full, so a flood of distinct readings is bounded rather than silent: the first key refused
+// prints one `[SYCL-REPORT] (report-once-full)` line while the dump is armed.
 bool unified_cache_dump_report_once(const char * key, const char * text) noexcept;
 void unified_cache_dump_report_zone_figures(int dev, const char * point, vram_zone_id zone) noexcept;
 // Recorded once by ggml_sycl_init, the post-selector count; the printer's loop

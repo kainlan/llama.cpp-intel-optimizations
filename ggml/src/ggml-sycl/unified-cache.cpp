@@ -4124,8 +4124,13 @@ const char * dump_site_basename(const char * file) {
 // pending_owner, and the request has no such field until moua L4L6 / 23mk S4a. A zero printed here
 // would read as "predicted 0, observed 0" on a dump that never counted. scripts/check-sycl-counter-dump.py
 // pins the set against any increment, so landing the producer means flipping this predicate.
+//
+// onednn_graph_callback_unmarked_mallocs is the same case: it counts a Graph-callback malloc with no
+// compute marker set, and the marker (design §5.4(b), g_sycl_compute_marker) lands at step 3 with the
+// late-refusal channel, so nothing on this tree can say whether a marker is set. Step 3 flips it.
 bool dump_counter_captured(size_t c) {
-    return c != static_cast<size_t>(dump_counter::load_row_op_time_arrivals);
+    return c != static_cast<size_t>(dump_counter::load_row_op_time_arrivals) &&
+           c != static_cast<size_t>(dump_counter::onednn_graph_callback_unmarked_mallocs);
 }
 
 // How a request is named in a line or a key: `site` is its construction site, `cohort` its cohort,
@@ -4150,6 +4155,10 @@ struct dump_load_model {
     uint64_t order;
     uint64_t host_tiered_bytes;
     uint64_t planned_device_bytes;
+    // The plan spans devices, so its host-tiered bytes belong to no single device: the entry reads
+    // not_captured and the figure is the one planned_host report line. Also set for a device the
+    // single-device plan does not name.
+    bool     host_plan_wide;
 };
 
 struct dump_load_models {
@@ -4239,6 +4248,7 @@ constexpr size_t k_report_once_key_len  = 96;
 struct report_once_table {
     dump_leaf_lock lock;
     size_t         count;
+    bool           full_announced;
     char           keys[k_report_once_capacity][k_report_once_key_len];
 };
 
@@ -4252,6 +4262,8 @@ bool unified_cache_dump_report_once(const char * key, const char * text) noexcep
     if (key == nullptr || text == nullptr || !counter_dump_requested()) {
         return false;
     }
+    bool refused  = false;
+    bool announce = false;
     {
         report_once_table & t = report_once_tbl();
         dump_leaf_guard     guard(t.lock);
@@ -4261,9 +4273,20 @@ bool unified_cache_dump_report_once(const char * key, const char * text) noexcep
             }
         }
         if (t.count >= k_report_once_capacity) {
-            return false;
+            refused          = true;
+            announce         = !t.full_announced;
+            t.full_announced = true;
+        } else {
+            std::snprintf(t.keys[t.count++], k_report_once_key_len, "%s", key);
         }
-        std::snprintf(t.keys[t.count++], k_report_once_key_len, "%s", key);
+    }
+    if (refused) {
+        // Said once, by the raw path every report uses, so a flood past the bound is never silent.
+        if (announce) {
+            std::fprintf(stderr, "[SYCL-REPORT] (report-once-full) capacity=%zu first_refused_key=%s\n",
+                         k_report_once_capacity, key);
+        }
+        return false;
     }
     std::fprintf(stderr, "[SYCL-REPORT] %s\n", text);
     return true;
@@ -11461,6 +11484,14 @@ bool unified_cache::event_complete(const sycl::event & evt) {
     }
 }
 
+// Draws the oneDNN Graph allocator callback has made and not yet freed, process-wide. Counted in the
+// callbacks themselves (below, GGML_SYCL_DNNL only), read by the SDPA compile's bracket.
+static std::atomic<int64_t> g_onednn_graph_live_draws{ 0 };
+
+int64_t unified_cache_onednn_graph_live_draws() noexcept {
+    return g_onednn_graph_live_draws.load(std::memory_order_relaxed);
+}
+
 #if GGML_SYCL_DNNL
 // llama.cpp-0oxf: default cap on outstanding DIRECT (non-arena) Graph-scratch
 // bytes, and the timeouts around it. See onednn_graph_scratch_wait_for_direct_headroom_locked()
@@ -12835,7 +12866,11 @@ void * onednn_graph_sycl_malloc(size_t size, size_t alignment, const void * dev,
             }
             return nullptr;
         }
-        return cache->onednn_graph_scratch_alloc(size, alignment, &cache->get_queue());
+        void * drawn = cache->onednn_graph_scratch_alloc(size, alignment, &cache->get_queue());
+        if (drawn != nullptr) {
+            g_onednn_graph_live_draws.fetch_add(1, std::memory_order_relaxed);
+        }
+        return drawn;
     } catch (...) {
         return nullptr;
     }
@@ -12879,6 +12914,7 @@ void onednn_graph_sycl_free(void * buf, const void * dev, const void * ctx, void
             return;
         }
         cache->onednn_graph_scratch_free(buf, ev);
+        g_onednn_graph_live_draws.fetch_sub(1, std::memory_order_relaxed);
     } catch (...) {
     }
 }
@@ -14570,7 +14606,8 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
                                                            const void *                     ctx,
                                                            const std::vector<sycl::event> & deps,
                                                            dma_stream_copy_fn               copy_fn,
-                                                           const char *                     caller_file) {
+                                                           const char *                     caller_file,
+                                                           const char *                     caller_func) {
     dma_stream_result result{};
     result.queue = &queue_;
     if (!src.ptr || !slice_fn) {
@@ -14612,8 +14649,13 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
     // none, and the arena must exist for the count to mean that (before its first publish a zero is
     // zero by construction). G0 reads this total, and its voiding rule voids G1-G5 when it is not 0.
     if (arena_active()) {
+        // The key is `<file>:<function>`: two callers in one file (the mul_mat stream and the MoE expert
+        // stream are both in ggml-sycl.cpp) stay apart. A name that overflows the key is truncated.
+        char caller_key[k_dump_key_len];
+        std::snprintf(caller_key, sizeof(caller_key), "%s:%s", dump_site_basename(caller_file),
+                      caller_func != nullptr ? caller_func : "-");
         unified_cache_dump_counter_add_key(dump_counter::stream_dma_non_device_arrivals,
-                                           ggml_sycl_get_device_id_from_queue(queue_), dump_site_basename(caller_file));
+                                           ggml_sycl_get_device_id_from_queue(queue_), caller_key);
     }
 
     if (src.location == cache_location::HOST_MMAP) {
@@ -22726,24 +22768,34 @@ bool unified_cache_note_model_load_abort(uint64_t load_txn_id) noexcept {
 // The zone_figures report line for a cache the caller already holds, so a caller inside the cache
 // registry's shared lock (the load-end path) does not take it a second time.
 static void dump_report_zone_figures_for(unified_cache * cache, int dev, const char * point, vram_zone_id zone) {
+    size_t capacity  = 0;
+    size_t used      = 0;
     size_t available = 0;
     size_t largest   = 0;
-    if (cache == nullptr || !counter_dump_requested() || !cache->zone_free_figures(zone, available, largest)) {
+    if (cache == nullptr || !counter_dump_requested() ||
+        !cache->zone_free_figures(zone, capacity, used, available, largest)) {
         return;
     }
     std::fprintf(stderr,
                  "[SYCL-REPORT] zone_figures dev=%d point=%s zone=%s capacity=%zu used=%zu available=%zu "
                  "largest_free=%zu\n",
-                 dev, point != nullptr ? point : "-", vram_zone_name(zone), cache->zone_capacity(zone),
-                 cache->zone_used(zone), available, largest);
+                 dev, point != nullptr ? point : "-", vram_zone_name(zone), capacity, used, available, largest);
 }
 
-// The load-end snapshot entries of `dev`: this model's planned bytes from its candidate plan (device
-// bytes charged on `dev`, host-tiered bytes), recorded against its ownership slot with a load order;
-// then the first two live models by load order publish as load_1 and load_2 (load_2 reads
-// not_captured while one model is live), beside the device's live WEIGHT bytes. A model with no plan
-// leaves its entries not_captured, never zero. The load-end call runs before the plan publishes, so
-// the plan is still the candidate. A third live model is recorded but not printed.
+// The load-end snapshot entries of `dev`: this model's planned bytes from its candidate plan, recorded
+// against its ownership slot with a load order; then the first two live models by load order publish as
+// load_1 and load_2 (load_2 reads not_captured while one model is live), beside the device's live WEIGHT
+// bytes. A model with no plan leaves its entries not_captured, never zero. The load-end call runs before
+// the plan publishes, so the plan is still the candidate. A third live model is recorded but not printed.
+//
+// The figures are the plan's own, not a second derivation of them. A single-device plan records its
+// weight_vram_bytes and weight_host_bytes, and those are the entries. A multi-device plan records no
+// per-device weight figure, so the device's bytes are the sum of its entries under the plan's own charge
+// (vram_charge_size, else placement_vram_charge_bytes(dst_size), the rule every plan edit uses); its
+// host-tiered bytes are plan-wide and are reported once as `planned_host`, not credited to each device.
+//
+// It also prints, per device, the plan's MoE tensors and how many have zero GPU-executed experts on it:
+// G0's VOID test for the preload arm of the row-134 reach counts.
 static void unified_cache_dump_capture_load_end(int             dev,
                                                 unified_cache * cache,
                                                 uint32_t        slot,
@@ -22751,22 +22803,60 @@ static void unified_cache_dump_capture_load_end(int             dev,
     if (!dump_dev_valid(dev) || cache == nullptr || slot >= MODEL_SLOT_COUNT) {
         return;
     }
-    bool     have_plan = false;
-    uint64_t host      = 0;
-    uint64_t planned   = 0;
+    bool     have_plan      = false;
+    bool     host_plan_wide = false;
+    uint64_t host           = 0;
+    uint64_t planned        = 0;
     try {
         const auto snap = lifecycle_find_candidate_placement_plan(load_txn_id);
         if (snap && snap->plan) {
-            have_plan = true;
-            for (const placement_entry & e : snap->plan->entries) {
-                if (e.on_device) {
-                    const int target = e.target_device >= 0 ? e.target_device : snap->plan->device_id;
-                    if (target == dev) {
-                        planned += e.vram_charge_size != 0 ? e.vram_charge_size : e.dst_size;
-                    }
-                } else if (snap->plan->multi_device || snap->plan->device_id == dev) {
-                    host += e.src_size;
+            const placement_plan & plan = *snap->plan;
+            have_plan                   = true;
+            // Host bytes are plan-wide: a device the plan does not name has no host figure of its own.
+            host_plan_wide              = plan.multi_device || plan.device_id != dev;
+            if (!plan.multi_device) {
+                if (plan.device_id == dev) {
+                    planned = plan.weight_vram_bytes;
+                    host    = plan.weight_host_bytes;
                 }
+            } else {
+                for (const placement_entry & e : plan.entries) {
+                    if (e.on_device && (e.target_device >= 0 ? e.target_device : plan.device_id) == dev) {
+                        planned +=
+                            e.vram_charge_size != 0 ? e.vram_charge_size : placement_vram_charge_bytes(e.dst_size);
+                    }
+                }
+            }
+            if (counter_dump_requested()) {
+                // Once per load (the first device to reach it), not once per device.
+                char key[64];
+                char text[160];
+                std::snprintf(key, sizeof(key), "planned_host:%llu", static_cast<unsigned long long>(load_txn_id));
+                std::snprintf(text, sizeof(text), "planned_host load_txn=%llu weight_host_bytes=%zu multi_device=%d",
+                              static_cast<unsigned long long>(load_txn_id), plan.weight_host_bytes,
+                              plan.multi_device ? 1 : 0);
+                (void) unified_cache_dump_report_once(key, text);
+
+                // MoE tensors are the (layer, role) groups of expert entries; one has zero GPU-executed
+                // experts on `dev` when none of its experts is planned on that device.
+                std::map<std::pair<int, int>, size_t> on_dev;
+                for (const placement_entry & e : plan.entries) {
+                    if (e.expert_id < 0) {
+                        continue;
+                    }
+                    size_t & n = on_dev[{ e.layer_id, static_cast<int>(e.expert_role) }];
+                    if (e.on_device && (e.target_device >= 0 ? e.target_device : plan.device_id) == dev) {
+                        ++n;
+                    }
+                }
+                size_t zero = 0;
+                for (const auto & kv : on_dev) {
+                    zero += kv.second == 0 ? 1 : 0;
+                }
+                std::fprintf(stderr,
+                             "[SYCL-REPORT] moe_zero_gpu_expert_tensors dev=%d load_txn=%llu moe_tensors=%zu "
+                             "zero_gpu_expert_tensors=%zu\n",
+                             dev, static_cast<unsigned long long>(load_txn_id), on_dev.size(), zero);
             }
         }
     } catch (...) {
@@ -22779,7 +22869,7 @@ static void unified_cache_dump_capture_load_end(int             dev,
     int                live_with_plan = 0;  // 0, 1 or 2: how many of load_1 / load_2 hold a model
     {
         dump_leaf_guard guard(t.lock);
-        t.models[dev][slot] = { have_plan, ++t.next_order, host, planned };
+        t.models[dev][slot] = { have_plan, ++t.next_order, host, planned, host_plan_wide };
         // The two live models with the smallest load orders: `first`, then the smallest order above it.
         for (uint32_t i = 0; i < MODEL_SLOT_COUNT; ++i) {
             const dump_load_model & m = t.models[dev][i];
@@ -22799,7 +22889,12 @@ static void unified_cache_dump_capture_load_end(int             dev,
         live_with_plan = have_second ? 2 : live_with_plan;
     }
     if (live_with_plan >= 1) {
-        unified_cache_dump_snapshot_set(dump_snapshot::weight_host_tiered_bytes_load_1, dev, first.host_tiered_bytes);
+        if (first.host_plan_wide) {
+            unified_cache_dump_snapshot_clear(dump_snapshot::weight_host_tiered_bytes_load_1, dev);
+        } else {
+            unified_cache_dump_snapshot_set(dump_snapshot::weight_host_tiered_bytes_load_1, dev,
+                                            first.host_tiered_bytes);
+        }
         unified_cache_dump_snapshot_set(dump_snapshot::weight_planned_device_bytes_load_1, dev,
                                         first.planned_device_bytes);
     } else {
@@ -22807,7 +22902,12 @@ static void unified_cache_dump_capture_load_end(int             dev,
         unified_cache_dump_snapshot_clear(dump_snapshot::weight_planned_device_bytes_load_1, dev);
     }
     if (live_with_plan >= 2) {
-        unified_cache_dump_snapshot_set(dump_snapshot::weight_host_tiered_bytes_load_2, dev, second.host_tiered_bytes);
+        if (second.host_plan_wide) {
+            unified_cache_dump_snapshot_clear(dump_snapshot::weight_host_tiered_bytes_load_2, dev);
+        } else {
+            unified_cache_dump_snapshot_set(dump_snapshot::weight_host_tiered_bytes_load_2, dev,
+                                            second.host_tiered_bytes);
+        }
         unified_cache_dump_snapshot_set(dump_snapshot::weight_planned_device_bytes_load_2, dev,
                                         second.planned_device_bytes);
     } else {
@@ -24538,11 +24638,17 @@ size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
     return zone_available(zone);
 }
 
-bool unified_cache::zone_free_figures(vram_zone_id zone, size_t & available, size_t & largest_free) {
+bool unified_cache::zone_free_figures(vram_zone_id zone,
+                                      size_t &     capacity,
+                                      size_t &     used,
+                                      size_t &     available,
+                                      size_t &     largest_free) {
     if (!arena_active()) {
         return false;
     }
     std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+    capacity     = zone_capacity(zone);
+    used         = zone_used(zone);
     available    = zone_available(zone);
     largest_free = zone_largest_free(zone);
     return true;
@@ -24553,7 +24659,7 @@ void unified_cache_dump_report_zone_figures(int dev, const char * point, vram_zo
         return;
     }
     try {
-        dump_report_zone_figures_for(get_cache_shared(dev), dev, point, zone);
+        dump_report_zone_figures_for(get_existing_cache_for_device(dev), dev, point, zone);
     } catch (...) {
     }
 }
@@ -24570,21 +24676,24 @@ void unified_cache_dump_capture_zone_figures(int dev, dump_point point) noexcept
         return;
     }
     try {
-        unified_cache * cache = get_cache_shared(dev);
+        // Through the device resolution every other cache lookup uses: GLOBAL mode keys the map by 0.
+        unified_cache * cache = get_existing_cache_for_device(dev);
         if (cache == nullptr) {
             return;
         }
+        size_t capacity  = 0;
+        size_t used      = 0;
         size_t available = 0;
         size_t largest   = 0;
         if (point == dump_point::FIRST_DECODE) {
-            if (cache->zone_free_figures(vram_zone_id::WEIGHT, available, largest)) {
+            if (cache->zone_free_figures(vram_zone_id::WEIGHT, capacity, used, available, largest)) {
                 unified_cache_dump_snapshot_set_once(dump_snapshot::zone_available_weight_first_decode, dev, available);
                 unified_cache_dump_snapshot_set_once(dump_snapshot::zone_largest_free_weight_first_decode, dev,
                                                      largest);
             }
             return;
         }
-        if (cache->zone_free_figures(vram_zone_id::RUNTIME, available, largest)) {
+        if (cache->zone_free_figures(vram_zone_id::RUNTIME, capacity, used, available, largest)) {
             unified_cache_dump_snapshot_set(dump_snapshot::zone_available_runtime_context_txn, dev, available);
             unified_cache_dump_snapshot_set(dump_snapshot::zone_largest_free_runtime_context_txn, dev, largest);
             unified_cache_dump_snapshot_set(dump_snapshot::zone_capacity_onednn_context_txn, dev,

@@ -904,7 +904,17 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
     in_ports.push_back(lt_v);
     out_ports.push_back(lt_out);
 
-    auto cp = parts[0].compile(in_ports, out_ports, eng);
+    // G0's second Graph-callback count: draws made during compile() that are still live when it returns
+    // (predicted 0: the partition declares no constant tensor, so every draw is an execute's scratch).
+    // Process-wide live count before and after; the compile runs under the cache mutex, so no other
+    // SDPA compile interleaves, and a draw an execute makes on another thread is the only noise.
+    const int64_t draws_before = ggml_sycl::unified_cache_onednn_graph_live_draws();
+    auto          cp           = parts[0].compile(in_ports, out_ports, eng);
+    const int64_t draws_after  = ggml_sycl::unified_cache_onednn_graph_live_draws();
+    if (draws_after > draws_before) {
+        ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::onednn_graph_compile_live_draws,
+                                                  key.device_id, static_cast<uint64_t>(draws_after - draws_before));
+    }
 
     // Allocate + populate the per-shape scalar divisor. Allocating here
     // (inside build_and_compile_sdpa, which the caller invokes under the

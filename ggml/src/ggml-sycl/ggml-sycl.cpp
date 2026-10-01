@@ -26047,6 +26047,62 @@ static bool ggml_sycl_moe_plan_has_host_experts(const ggml_tensor * src0, int de
     return false;
 }
 
+// The dump-armed flag, read from the environment once per process (the g_ggml_sycl_debug precedent): the
+// G0 report sites sit on per-op paths (mul_mat dispatch, the MoE pointer-table entries), where a getenv
+// per call is a libc scan per op. A host test that needs both arms runs each in its own process.
+static bool ggml_sycl_dump_report_armed() {
+    static const bool armed = ggml_sycl::unified_cache_dump_report_enabled();
+    return armed;
+}
+
+// How many of the tensor's experts the admitted placement plan executes on `device`'s GPU, from the same
+// plan source ggml_sycl_moe_plan_has_host_experts reads. False when no plan is known (the count is then
+// not a zero).
+static bool ggml_sycl_moe_plan_gpu_expert_count(const ggml_tensor * src0, int device, int64_t * count) {
+    if (!src0 || !count || device < 0 || ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT) {
+        return false;
+    }
+    const int64_t                                    n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+    const char *                                     name      = src0->name ? src0->name : "";
+    // The owners are shared_ptrs returned by value: hold one for the walk.
+    std::shared_ptr<const ggml_sycl::placement_plan> plan;
+    auto *                                           cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
+        plan = ggml_sycl_cache_plan_owner(cache);
+    } else if (ggml_sycl_has_global_plan()) {
+        plan = ggml_sycl_global_plan_owner();
+    }
+    if (!plan) {
+        return false;
+    }
+    int64_t n = 0;
+    for (int64_t e = 0; e < n_experts; ++e) {
+        n += plan->expert_on_device(name, static_cast<int>(e), device) ? 1 : 0;
+    }
+    *count = n;
+    return true;
+}
+
+// G0's row-134 reach count: a call of ggml_sycl_ensure_moe_ptr_table, or of a caller of
+// ggml_sycl_update_moe_ptr_table / ggml_sycl_upload_moe_ptr_table_from_batch, on a tensor the plan
+// executes ZERO experts of on `device` is that site's P3 violation. `site` names the call site as
+// `<callee kind>:<function>[/<role>]`. The count is predicted 0 everywhere but the preload; it is
+// moe_table_reach_zero_gpu_expert in the dump.
+//
+// The zero test walks the plan once per expert, so it runs only in a run that arms the dump (the
+// counter is read only from that dump). That is the one counter here whose evaluation is armed-only,
+// and it is named as such in scripts/check-sycl-counter-dump.py (ARMED_ONLY_COUNTERS).
+static void ggml_sycl_note_moe_table_reach(const char * site, const ggml_tensor * src0, int device) {
+    if (!ggml_sycl_dump_report_armed()) {
+        return;
+    }
+    int64_t gpu_experts = 0;
+    if (ggml_sycl_moe_plan_gpu_expert_count(src0, device, &gpu_experts) && gpu_experts == 0) {
+        ggml_sycl::unified_cache_dump_counter_add_key(ggml_sycl::dump_counter::moe_table_reach_zero_gpu_expert, device,
+                                                      site);
+    }
+}
+
 // Returns true if the tensor's weights are host-resident (not in device VRAM).
 // Uses managed metadata tier as primary detection (ground truth from allocator,
 // immune to Level Zero get_pointer_type bugs in multi-device contexts).
@@ -37562,6 +37618,18 @@ static constexpr size_t GGML_SYCL_BUFFER_BASE_ALIGNMENT = 128;
 // places the tensors elsewhere — whereas publishing a misaligned base is not: it
 // under-reserves silently and aborts later somewhere unrelated.  Deleting the
 // context releases the allocation through its managed mem_handle owner.
+static const char * ggml_sycl_alloc_tier_name(ggml_sycl::alloc_tier tier) {
+    switch (tier) {
+        case ggml_sycl::alloc_tier::DEVICE_VRAM:
+            return "device-vram";
+        case ggml_sycl::alloc_tier::HOST_PINNED:
+            return "host-pinned";
+        case ggml_sycl::alloc_tier::MMAP_TRACKED:
+            return "mmap-tracked";
+    }
+    return "invalid";
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish(ggml_backend_buffer_type_t         buft,
                                                               ggml_backend_sycl_buffer_context * ctx,
                                                               size_t                             size,
@@ -37581,13 +37649,13 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish(ggml_backend_buffe
     // never leaves an owner behind.  A buffer whose backing allocation carries
     // no id simply gets no owner and behaves exactly as it did before.
     ctx->buffer_owner = ggml_sycl_mint_buffer_owner(ctx->managed_meta.id);
-    if (ggml_sycl::unified_cache_dump_report_enabled()) {
+    if (ggml_sycl_dump_report_armed()) {
         // Where this backend buffer landed, and what the zones it competes for hold afterwards: the
         // RUNTIME and SCRATCH rooms G0 prints next to the planned terms.
         char line[256];
-        std::snprintf(line, sizeof(line), "landing dev=%d buft=%s size=%zu origin=\"%s\" tier=%d", ctx->device,
+        std::snprintf(line, sizeof(line), "landing dev=%d buft=%s size=%zu origin=\"%s\" tier=%s", ctx->device,
                       ggml_backend_sycl_buffer_type_get_name(buft), size, origin,
-                      static_cast<int>(ctx->managed_meta.tier));
+                      ggml_sycl_alloc_tier_name(ctx->managed_meta.tier));
         ggml_sycl::unified_cache_dump_report(line);
         ggml_sycl::unified_cache_dump_report_zone_figures(ctx->device, "after_backend_buffer",
                                                           ggml_sycl::vram_zone_id::RUNTIME);
@@ -56084,6 +56152,7 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
         extra->weight().moe_device_table_valid[device] && extra->moe_ptrs_ptr_raw(device) != nullptr &&
         extra->weight().moe_expert_ptrs_size[device] == static_cast<size_t>(n_experts) * sizeof(void *);
 
+    ggml_sycl_note_moe_table_reach("ensure:ggml_sycl_upload_moe_transient_ptr_table", src0, device);
     if (!ggml_sycl_ensure_moe_ptr_table(extra, device, n_experts, q, table_index) ||
         extra->weight().moe_expert_ptrs_size[device] < static_cast<size_t>(n_experts) * sizeof(void *)) {
         return nullptr;
@@ -56240,6 +56309,7 @@ static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_retained_ptr_t
     layout_mode                           layout) {
     ggml_sycl::moe_retained_pointer_table result;
     bool                                  event_set = false;
+    ggml_sycl_note_moe_table_reach("upload:ggml_sycl_upload_moe_retained_ptr_table_from_batch", src0, ctx.device);
     const void * const * transient = ggml_sycl_upload_moe_ptr_table_from_batch(ctx, src0, batch, layer_hash, layout,
                                                                                &result.ready_event, &event_set);
     if (!transient) {
@@ -56613,7 +56683,7 @@ static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
     }
 
     // Fallback: runtime allocation via unified_alloc.
-    if (ggml_sycl::unified_cache_dump_report_enabled()) {
+    if (ggml_sycl_dump_report_armed()) {
         // Row 73's own-allocation fallback, as master takes it: the bytes it asks for and the
         // table_index that sent it here (-1, or out of the preallocated range), beside the
         // preallocated block's own table size and count. A baseline for a path the conversion deletes.
@@ -58040,6 +58110,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         }
     }
     if (!skip_device_copy) {
+        ggml_sycl_note_moe_table_reach("ensure:ggml_sycl_update_moe_ptr_table", src0, device);
         const bool table_ready = ggml_sycl_ensure_moe_ptr_table(extra, device, n_experts, *stream, tbl_idx);
         GGML_SYCL_DEBUG("[MOE-PTR] ensure_moe_ptr_table done\n");
         if (!table_ready || !extra->moe_ptrs_ptr(device) ||
@@ -60673,6 +60744,7 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
                     preload_tbl_idx = it->second;
                 }
             }
+            ggml_sycl_note_moe_table_reach("ensure:graph_preload_moe_experts", src0, ctx.device);
             ggml_sycl_ensure_moe_ptr_table(extra, ctx.device, src0->ne[2] > 0 ? src0->ne[2] : 1, *ctx.stream(),
                                            preload_tbl_idx);
         }
@@ -60799,6 +60871,7 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
         const bool  expect_table_event =
             extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES && extra->moe_ptrs_ptr(ctx.device);
 
+        ggml_sycl_note_moe_table_reach("update:graph_preload_moe_experts", src0, ctx.device);
         if (!ggml_sycl_update_moe_ptr_table(ctx, src0, ids, layout, &table_event, coverage, ids_override,
                                             /*skip_device_copy=*/false,
                                             /*force_cache_aos=*/host_weights,
@@ -61964,6 +62037,13 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
     return std::nullopt;
 }
 
+// The LM head: `output.weight`, not an `attn_output` weight whose name contains it. The one predicate the
+// dispatch debug line and the arm-A report share.
+static bool ggml_sycl_is_lm_head_weight(const ggml_tensor * src0) {
+    return src0 && src0->name && std::strstr(src0->name, "output.weight") != nullptr &&
+           std::strstr(src0->name, "attn_output") == nullptr;
+}
+
 // Dispatch helper - calls the appropriate kernel without re-checking eligibility
 // Assumes kernel has already been validated by ggml_sycl_select_preferred_kernel()
 static bool ggml_sycl_dispatch_mul_mat_kernel(ggml_backend_sycl_context & ctx,
@@ -61972,23 +62052,32 @@ static bool ggml_sycl_dispatch_mul_mat_kernel(ggml_backend_sycl_context & ctx,
                                               ggml_tensor *               dst,
                                               ggml_sycl_mul_mat_kernel    kernel) {
     const layout_mode layout = ggml_sycl_mul_mat_kernel_layout(kernel);
-    if (g_ggml_sycl_debug && src0 && src0->name && std::strstr(src0->name, "output.weight") != nullptr &&
-        std::strstr(src0->name, "attn_output") == nullptr) {
+    // The name test is first and the report flag is a once-per-process static, so a run that does not arm
+    // the dump pays two strstr calls at most, and only on a debug run.
+    const bool        is_lm_head = ggml_sycl_is_lm_head_weight(src0);
+    if (g_ggml_sycl_debug && is_lm_head) {
         GGML_SYCL_DEBUG("[SYCL] output.weight dispatch kernel=%s layout=%d batch=%lld\n",
                         ggml_sycl_mul_mat_kernel_name(kernel), (int) layout, (long long) src1->ne[1]);
     }
-    if (ggml_sycl::unified_cache_dump_report_enabled() && src0 && src0->name &&
-        std::strstr(src0->name, "output.weight") != nullptr && std::strstr(src0->name, "attn_output") == nullptr) {
-        // The LM head's (type, layout, kernel) pairing as the selector resolved it, once per distinct
-        // reading: arm A's kernel at the batch G1h and rivk read (ne11 = 512 and 16), and the pairing
-        // check's input. The step-0 build still routes this weight by the selector, whatever it holds.
-        char key[128];
-        char line[256];
-        std::snprintf(key, sizeof(key), "arm_a_kernel:%d:%s:%d:%d:%lld", ctx.device, ggml_type_name(src0->type),
-                      (int) layout, (int) kernel, (long long) src1->ne[1]);
-        std::snprintf(line, sizeof(line), "arm_a_kernel dev=%d weight=%s type=%s kernel=%s kernel_layout=%d ne11=%lld",
+    if (is_lm_head && ggml_sycl_dump_report_armed()) {
+        // The LM head's (type, layout, kernel) pairing, once per distinct reading: arm A's kernel at the
+        // batch G1h and rivk read (ne11 = 512 and 16), and the layout-pairing check's input. src0_layout is
+        // the layout the operand was MATERIALIZED in (its handle's), kernel_layout the one the selected
+        // kernel consumes; the two are separate sources, so a disagreement (llama.cpp-l9i1: route
+        // soa, operand aos) shows as layout_mismatch=1. An operand that does not resolve prints
+        // src0_layout=-1 and layout_mismatch=-1, never a guess.
+        const auto resolved    = ggml_sycl_resolve(src0, ctx.device);
+        const int  src0_layout = resolved ? (int) resolved.layout : -1;
+        const int  mismatch    = resolved ? (resolved.layout != layout ? 1 : 0) : -1;
+        char       key[160];
+        char       line[320];
+        std::snprintf(key, sizeof(key), "arm_a_kernel:%d:%s:%d:%d:%d:%lld", ctx.device, ggml_type_name(src0->type),
+                      src0_layout, (int) layout, (int) kernel, (long long) src1->ne[1]);
+        std::snprintf(line, sizeof(line),
+                      "arm_a_kernel dev=%d weight=%s type=%s kernel=%s src0_layout=%d kernel_layout=%d "
+                      "layout_mismatch=%d ne11=%lld",
                       ctx.device, src0->name, ggml_type_name(src0->type), ggml_sycl_mul_mat_kernel_name(kernel),
-                      (int) layout, (long long) src1->ne[1]);
+                      src0_layout, (int) layout, mismatch, (long long) src1->ne[1]);
         (void) ggml_sycl::unified_cache_dump_report_once(key, line);
     }
 
@@ -67123,6 +67212,7 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context &           ctx,
             // This is critical for mmap'd weights which cannot be accessed directly by GPU kernels.
             // XMX kernels cannot consume host-routed experts, so selected experts must be staged instead of skipped.
             bool table_event_set = false;
+            ggml_sycl_note_moe_table_reach("upload:try_xmx_sorted_moe", src0, ctx.device);
             if (!ggml_sycl_upload_moe_ptr_table_from_batch(ctx, src0, batch, moe_cache_layer_id(src0->name), layout,
                                                            &table_event, &table_event_set)) {
                 GGML_SYCL_DEBUG("[XMX MoE] Failed to upload retained expert pointer table for %s\n", src0->name);
@@ -73515,6 +73605,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
         sycl::event          table_event;
         bool                 table_event_set = false;
+        ggml_sycl_note_moe_table_reach("upload:ggml_sycl_mul_mat_id/prompt", src0, ctx.device);
         const void * const * expert_ptrs_dev = ggml_sycl_upload_moe_ptr_table_from_batch(
             ctx, src0, prompt_batch, layer_hash, route_layout, &table_event, &table_event_set);
         if (!expert_ptrs_dev) {
@@ -73852,6 +73943,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             sycl::event          retained_table_event;
             bool                 retained_table_event_set = false;
+            ggml_sycl_note_moe_table_reach("upload:ggml_sycl_mul_mat_id/retained", src0, ctx.device);
             const void * const * retained_ptrs            = ggml_sycl_upload_moe_ptr_table_from_batch(
                 ctx, src0, retained_prompt_batch_result.batch, moe_cache_layer_id(src0->name), layout,
                 &retained_table_event, &retained_table_event_set);
@@ -74321,6 +74413,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // llama.cpp-1tjn (B3 rework census v2, temporary).
                             g_moe_decode_route_census.pair_glu_ptr_table_rebuild_attempts.fetch_add(
                                 1, std::memory_order_relaxed);
+                            ggml_sycl_note_moe_table_reach("update:ggml_sycl_mul_mat_id/pair_gate", pair.gate_weight,
+                                                           ctx.device);
                             if (ggml_sycl_update_moe_ptr_table(ctx, pair.gate_weight, ids, pair_layout,
                                                                &gate_table_event, moe_ptr_table_coverage::FULL_TABLE,
                                                                /*ids_host_override=*/nullptr,
@@ -74353,6 +74447,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // llama.cpp-1tjn (B3 rework census v2, temporary).
                             g_moe_decode_route_census.pair_glu_ptr_table_rebuild_attempts.fetch_add(
                                 1, std::memory_order_relaxed);
+                            ggml_sycl_note_moe_table_reach("update:ggml_sycl_mul_mat_id/pair_up", pair.up_weight,
+                                                           ctx.device);
                             if (ggml_sycl_update_moe_ptr_table(ctx, pair.up_weight, ids, pair_layout, &up_table_event,
                                                                moe_ptr_table_coverage::FULL_TABLE,
                                                                /*ids_host_override=*/nullptr,
@@ -74795,6 +74891,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 // llama.cpp-1tjn (B3 rework census v2, temporary).
                                 g_moe_decode_route_census.pair_glu_ptr_table_rebuild_attempts.fetch_add(
                                     1, std::memory_order_relaxed);
+                                ggml_sycl_note_moe_table_reach("update:ggml_sycl_mul_mat_id/pair_down",
+                                                               pair.down_weight, ctx.device);
                                 if (ggml_sycl_update_moe_ptr_table(ctx, pair.down_weight, ids, down_layout,
                                                                    &down_table_event,
                                                                    moe_ptr_table_coverage::FULL_TABLE,
@@ -77592,6 +77690,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
 
                     if (all_local_device && !gpu_expert_ids.empty()) {
+                        ggml_sycl_note_moe_table_reach("upload:ggml_sycl_mul_mat_id/retained_local", src0, ctx.device);
                         expert_ptrs_dev = ggml_sycl_upload_moe_ptr_table_from_batch(
                             ctx, src0, retained_prompt_batch_result.batch, layer_id, route_layout, &expert_ptrs_event,
                             &expert_ptrs_event_set);
@@ -78067,6 +78166,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
             sycl::event          expert_ptrs_event;
             bool                 expert_ptrs_event_set = false;
+            ggml_sycl_note_moe_table_reach("upload:ggml_sycl_mul_mat_id/retained_tail", src0, ctx.device);
             const void * const * expert_ptrs_dev =
                 ggml_sycl_upload_moe_ptr_table_from_batch(ctx, src0, retained_prompt_batch_result.batch, layer_id,
                                                           route_layout, &expert_ptrs_event, &expert_ptrs_event_set);
@@ -81321,18 +81421,6 @@ static const char * ggml_sycl_planned_weight_residency_name(ggml_sycl_planned_we
             return "device";
         case ggml_sycl_planned_weight_residency::HOST:
             return "host";
-    }
-    return "invalid";
-}
-
-static const char * ggml_sycl_alloc_tier_name(ggml_sycl::alloc_tier tier) {
-    switch (tier) {
-        case ggml_sycl::alloc_tier::DEVICE_VRAM:
-            return "device-vram";
-        case ggml_sycl::alloc_tier::HOST_PINNED:
-            return "host-pinned";
-        case ggml_sycl::alloc_tier::MMAP_TRACKED:
-            return "mmap-tracked";
     }
     return "invalid";
 }

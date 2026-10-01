@@ -186,6 +186,7 @@ int main(int argc, char ** argv) {
     // A field with no producer on this tree is counted by nothing and prints the sentinel, so the
     // increment below (which a test can make, a shipped path cannot) must not surface as a value.
     unified_cache_dump_counter_add_key(dump_counter::load_row_op_time_arrivals, 0, "convert.cpp:48");
+    unified_cache_dump_counter_add(dump_counter::onednn_graph_callback_unmarked_mallocs, 0, 2);
     unified_cache_dump_snapshot_set(dump_snapshot::zone_capacity_onednn_context_txn, 1, 4096);
     unified_cache_dump_snapshot_set_once(dump_snapshot::zone_available_weight_first_decode, 0, 111);
     unified_cache_dump_snapshot_set_once(dump_snapshot::zone_available_weight_first_decode, 0, 222);
@@ -223,6 +224,8 @@ int main(int argc, char ** argv) {
           "a field whose producer has not landed prints not_captured on every device, never a zero");
     check(!has_line(lines, "[SYCL-COUNTER] dev=0 name=load_row_op_time_arrivals{convert.cpp:48} value=1"),
           "a not-captured field prints no key lines");
+    check(has_line(lines, "[SYCL-COUNTER] dev=0 name=onednn_graph_callback_unmarked_mallocs value=not_captured"),
+          "the Graph callback's unmarked-malloc count (its marker lands at step 3) prints not_captured");
 
     // Order on dev 0: the fixed list in the table's order, then key lines, then the snapshots.
     bool in_order = true;
@@ -489,13 +492,20 @@ int main(int argc, char ** argv) {
             capture_stderr([] { (void) unified_cache_dump_report_once("arm_a:0:Q6_K:16", "arm_a_kernel ne11=16"); }));
         check(o1.size() == 1 && o2.empty() && o3.size() == 1,
               "report_once prints a key's first reading only, and a distinct key prints again");
-        bool full_reported = true;
-        for (int i = 0; i < 80; ++i) {
-            char key[32];
-            std::snprintf(key, sizeof(key), "flood-%d", i);
-            full_reported = unified_cache_dump_report_once(key, "flood") && full_reported;
+        bool       full_reported = true;
+        const auto flood         = split_lines(capture_stderr([&] {
+            for (int i = 0; i < 80; ++i) {
+                char key[32];
+                std::snprintf(key, sizeof(key), "flood-%d", i);
+                full_reported = unified_cache_dump_report_once(key, "flood") && full_reported;
+            }
+        }));
+        size_t     announced     = 0;
+        for (const auto & l : flood) {
+            announced += l.rfind("[SYCL-REPORT] (report-once-full)", 0) == 0 ? 1 : 0;
         }
         check(!full_reported, "a full report_once table says so (returns false), never drops silently");
+        check(announced == 1, "a full report_once table announces itself once, on the report path");
 
         // set / pending / clear: the load-end entries overwrite, and load_2 returns to not_captured.
         check(unified_cache_dump_snapshot_pending(dump_snapshot::weight_planned_device_bytes_load_2, 0),
