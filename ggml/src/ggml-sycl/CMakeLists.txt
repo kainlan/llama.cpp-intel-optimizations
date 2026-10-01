@@ -1844,6 +1844,94 @@ set_tests_properties(sycl-kv-region-registry PROPERTIES
     TIMEOUT 60
 )
 
+# The same suite under ThreadSanitizer (llama.cpp-moua L4 1a fold). Three of the
+# registry's guarantees -- the slot table's shared_lock pin in claim(), the slot
+# spin lock's acquire/release ordering and the generation read under that lock --
+# are visible only as data races, so a plain build passes a regression of any of
+# them. The closure is the one header (kv-region-registry.hpp) and the test, both
+# compiled into this target with -fsanitize=thread; nothing prebuilt (ggml-sycl,
+# the SYCL runtime) is linked, so no un-instrumented object can hide a race.
+# detect_deadlocks=0: the suite's descending-order lock controls are deliberate
+# lock-order inversions, which TSan's deadlock detector would report on a clean
+# tree. Data races stay fatal (halt_on_error, exitcode 66).
+# Registered only when the compiler can build and link a threaded TSan program;
+# otherwise nothing is registered (a vacuous pass would read as coverage).
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "-fsanitize=thread")
+set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=thread")
+set(CMAKE_REQUIRED_LIBRARIES Threads::Threads)
+check_cxx_source_compiles("
+#include <thread>
+int main() { int x = 0; std::thread t([&] { x = 1; }); t.join(); return x - 1; }
+" GGML_SYCL_HAVE_TSAN)
+unset(CMAKE_REQUIRED_FLAGS)
+unset(CMAKE_REQUIRED_LINK_OPTIONS)
+unset(CMAKE_REQUIRED_LIBRARIES)
+# GGML_SANITIZE_ADDRESS / GGML_SANITIZE_THREAD add their sanitizer at directory scope
+# (ggml/src/CMakeLists.txt), which the check above does not see: with either set this target
+# would carry two sanitizers (or the same one twice), and ASan and TSan do not combine.
+if (GGML_SYCL_HAVE_TSAN AND NOT GGML_SANITIZE_ADDRESS AND NOT GGML_SANITIZE_THREAD)
+    add_executable(test-sycl-kv-region-registry-tsan
+        tests/test-kv-region-registry.cpp
+    )
+    target_include_directories(test-sycl-kv-region-registry-tsan PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    # The sanitizer runtime owns operator new here; the suite's allocation-counting case runs in the plain target.
+    target_compile_definitions(test-sycl-kv-region-registry-tsan PRIVATE KV_REGISTRY_TEST_NO_ALLOC_DETECTOR)
+    target_compile_options(test-sycl-kv-region-registry-tsan PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(test-sycl-kv-region-registry-tsan PRIVATE -fsanitize=thread)
+    target_link_libraries(test-sycl-kv-region-registry-tsan PRIVATE Threads::Threads)
+    add_test(NAME sycl-kv-region-registry-tsan COMMAND test-sycl-kv-region-registry-tsan)
+    set_tests_properties(sycl-kv-region-registry-tsan PROPERTIES
+        LABELS "sycl;kv;hostonly;tsan"
+        TIMEOUT 300
+        ENVIRONMENT "TSAN_OPTIONS=detect_deadlocks=0:halt_on_error=1:exitcode=66"
+    )
+elseif (NOT GGML_SYCL_HAVE_TSAN)
+    message(STATUS "ggml-sycl: no ThreadSanitizer support in this compiler; "
+                   "sycl-kv-region-registry-tsan is not registered")
+else()
+    message(STATUS "ggml-sycl: GGML_SANITIZE_ADDRESS or GGML_SANITIZE_THREAD is set, which already "
+                   "instruments this build; sycl-kv-region-registry-tsan is not registered")
+endif()
+
+# Production geometry census (llama.cpp-moua L4 1b): kv-geometry-census.hpp reads
+# one shared-zone TLSF (frontier_walk + block_census) into the geometry
+# kv_region_fit consumes. Header-only and SYCL-free like the targets above; the
+# test also drives tests/kv-region-test-model.hpp and pins the two readings equal.
+add_executable(test-kv-geometry-census
+    tests/test-kv-geometry-census.cpp
+    kv-runtime-demotion.cpp
+)
+target_include_directories(test-kv-geometry-census PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME sycl-kv-geometry-census COMMAND test-kv-geometry-census)
+set_tests_properties(sycl-kv-geometry-census PROPERTIES
+    LABELS "sycl;kv;hostonly"
+    TIMEOUT 60
+)
+
+# Host-weight create-set record (llama.cpp-moua L4 1c; th32pre test 1r):
+# host-create-record.hpp is the one wire converter, the thread-local pending slot
+# and the stage-scoped holder. Header-only; it includes ggml-sycl.h for the wire
+# struct and nothing else, so the test needs no -fsycl and links nothing but
+# threads (the slot is per thread, and one arm checks that on a second thread).
+add_executable(test-host-create-record
+    tests/test-host-create-record.cpp
+)
+target_include_directories(test-host-create-record PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-host-create-record PRIVATE Threads::Threads)
+add_test(NAME sycl-host-create-record COMMAND test-host-create-record)
+set_tests_properties(sycl-host-create-record PROPERTIES
+    LABELS "sycl;memory;planner;tdd;hostonly"
+    TIMEOUT 60
+)
+
 # oneDNN PP placement answers (llama.cpp-1d0n): which devices may run oneDNN PP
 # on a multi-device plan, and whether the plan may add WOQ second copies; and
 # the admission predicate plus per-route batch floor (llama.cpp-je3b).

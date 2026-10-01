@@ -923,6 +923,235 @@ static void test_segregated_layout_a2_shape() {
 }
 
 // ---------------------------------------------------------------------------
+// block_census() (llama.cpp-moua L4 1b): the whole-TLSF read primitive beside
+// frontier_walk(), for the buried-optional / weight-hole census of
+// kv_region_fit's geometry.  Read-only, group-mutex-only like frontier_walk().
+// ---------------------------------------------------------------------------
+
+// The census is the physical block list low to high: it tiles [0, size) with
+// no gap or overlap, no two free blocks touch, free blocks carry tag 0, the
+// allocated sum is used() and the free sum is available().
+static void require_census_exact(const tlsf_allocator & a, size_t region_size) {
+    const std::vector<tlsf_allocator::extent> census = a.block_census();
+    REQUIRE(a.check_invariants());
+    size_t at        = 0;
+    size_t sum_used  = 0;
+    size_t sum_free  = 0;
+    bool   prev_free = false;
+    for (const tlsf_allocator::extent & e : census) {
+        REQUIRE(e.offset == at && "the census tiles the region low to high");
+        REQUIRE(e.size > 0);
+        REQUIRE(!(e.free && prev_free) && "no two free blocks are adjacent");
+        REQUIRE(!e.free || e.tag == 0);
+        if (e.free) {
+            sum_free += e.size;
+        } else {
+            sum_used += e.size;
+            REQUIRE(a.tag_at(e.offset) == e.tag && "an allocated block carries the tag the allocator holds");
+        }
+        prev_free = e.free;
+        at        = e.offset + e.size;
+    }
+    REQUIRE(at == region_size && "the census ends at the region end");
+    REQUIRE(sum_used == a.used());
+    REQUIRE(sum_free == a.available());
+}
+
+static void test_block_census_tiles() {
+    test_arena arena;
+
+    {
+        const auto c = arena.alloc->block_census();
+        REQUIRE(c.size() == 1 && c[0].offset == 0 && c[0].size == arena.size && c[0].free && c[0].tag == 0 &&
+                "a fresh allocator is one free block");
+    }
+
+    const size_t w  = arena.alloc->allocate(64 * 1024, 256, TAG_WEIGHT);
+    const size_t kv = arena.alloc->allocate_top(128 * 1024, 256, TAG_CONTEXT);
+    const size_t o1 = arena.alloc->allocate_gap_front(kv, 4096, 256, TAG_OPTIONAL);
+    const size_t w2 = arena.alloc->allocate_gap_front(kv, 8192, 256, TAG_WEIGHT);
+    const size_t o2 = arena.alloc->allocate_gap_front(kv, 16384, 256, TAG_OPTIONAL);
+    REQUIRE(w == 0 && o1 != SIZE_MAX && w2 != SIZE_MAX && o2 != SIZE_MAX);
+    require_census_exact(*arena.alloc, arena.size);
+
+    // Interior releases: a buried optional (o1, under the weight w2) and a free
+    // hole next to it, which the frontier walk cannot see past w2.
+    arena.alloc->free(o1);
+    require_census_exact(*arena.alloc, arena.size);
+    {
+        const auto c        = arena.alloc->block_census();
+        bool       saw_hole = false;
+        for (const auto & e : c) {
+            if (e.offset == o1) {
+                saw_hole = e.free && e.size == 4096;
+            }
+        }
+        REQUIRE(saw_hole && "a released block below the frontier shows up as a free block");
+        REQUIRE(c.front().offset == 0 && !c.front().free && c.front().tag == TAG_WEIGHT);
+        REQUIRE(c.back().offset + c.back().size == arena.size && !c.back().free && c.back().tag == TAG_CONTEXT);
+    }
+
+    // The census contains the frontier walk as its high end, in reverse.
+    {
+        const auto c    = arena.alloc->block_census();
+        const auto walk = arena.alloc->frontier_walk(kv, TAG_OPTIONAL);
+        REQUIRE(!walk.empty());
+        size_t pos = 0;
+        while (pos < c.size() && c[pos].offset != walk.back().offset) {
+            pos++;
+        }
+        REQUIRE(pos + walk.size() <= c.size());
+        for (size_t i = 0; i < walk.size(); ++i) {
+            const auto & e = c[pos + i];
+            const auto & f = walk[walk.size() - 1 - i];
+            REQUIRE(e.offset == f.offset && e.size == f.size && e.free == f.free && e.tag == f.tag);
+        }
+    }
+
+    arena.alloc->free(w2);
+    arena.alloc->free(kv);
+    arena.alloc->free(o2);
+    arena.alloc->free(w);
+    require_census_exact(*arena.alloc, arena.size);
+    {
+        const auto c = arena.alloc->block_census();
+        REQUIRE(c.size() == 1 && c[0].free && c[0].size == arena.size && "everything freed coalesces to one block");
+    }
+
+    std::cout << "test_block_census_tiles: PASSED\n";
+}
+
+// A random mix of every placement call against a shadow of what each call
+// returned: the census's allocated blocks are exactly the shadow's (offset and
+// tag; size is the used() delta, which includes whole-gap absorption), and its
+// free blocks are exactly the stretches between them.
+static void test_block_census_random_mix() {
+    test_arena                arena;
+    std::map<size_t, size_t>  sizes;  // allocated offset -> block size
+    std::map<size_t, uint8_t> tags;
+    std::vector<size_t>       live;
+    uint32_t                  seed = 12345u;
+    auto                      rnd  = [&]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed >> 8;
+    };
+    size_t anchor = tlsf_allocator::no_anchor;
+
+    for (int step = 0; step < 3000; ++step) {
+        const uint32_t op = rnd() % 8;
+        if (op < 5 || live.empty()) {
+            const size_t  size = 256 + (rnd() % 24) * 256;
+            const uint8_t tag  = (uint8_t) (1 + rnd() % 3);
+            const size_t  used = arena.alloc->used();
+            size_t        off  = SIZE_MAX;
+            switch (op % 4) {
+                case 0:
+                    off = arena.alloc->allocate(size, 256, tag);
+                    break;
+                case 1:
+                    off = arena.alloc->allocate_below(anchor, size, 256, tag);
+                    if (off != SIZE_MAX) {
+                        anchor = off;
+                    }
+                    break;
+                case 2:
+                    off = arena.alloc->allocate_gap_front(anchor, size, 256, tag);
+                    break;
+                default:
+                    off = arena.alloc->allocate_top(size, 256, tag);
+                    break;
+            }
+            if (off != SIZE_MAX) {
+                sizes[off] = arena.alloc->used() - used;
+                tags[off]  = tag;
+                live.push_back(off);
+            }
+        } else {
+            const size_t i   = rnd() % live.size();
+            const size_t off = live[i];
+            live[i]          = live.back();
+            live.pop_back();
+            if (off == anchor) {
+                anchor = tlsf_allocator::no_anchor;
+            }
+            arena.alloc->free(off);
+            sizes.erase(off);
+            tags.erase(off);
+        }
+
+        if (step % 25 == 0) {
+            require_census_exact(*arena.alloc, arena.size);
+            const auto c = arena.alloc->block_census();
+            size_t     n = 0;
+            for (const auto & e : c) {
+                if (e.free) {
+                    continue;
+                }
+                n++;
+                REQUIRE(sizes.count(e.offset) == 1 && sizes[e.offset] == e.size && tags[e.offset] == e.tag);
+            }
+            REQUIRE(n == sizes.size() && "the census holds every allocated block and no other");
+        }
+    }
+
+    std::cout << "test_block_census_random_mix: PASSED\n";
+}
+
+// The census reads and changes nothing: an allocator interrogated after every
+// operation places every later block exactly where its untouched twin does.
+static void test_block_census_is_read_only() {
+    test_arena watched;
+    test_arena twin;
+    uint32_t   seed = 777u;
+    auto       rnd  = [&]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed >> 8;
+    };
+    std::vector<size_t> live;
+    for (int step = 0; step < 800; ++step) {
+        const bool do_free = !live.empty() && rnd() % 3 == 0;
+        if (do_free) {
+            const size_t i   = rnd() % live.size();
+            const size_t off = live[i];
+            live[i]          = live.back();
+            live.pop_back();
+            watched.alloc->free(off);
+            twin.alloc->free(off);
+        } else {
+            const size_t  size = 256 + (rnd() % 16) * 256;
+            const uint8_t tag  = (uint8_t) (1 + rnd() % 3);
+            const size_t  a    = watched.alloc->allocate(size, 256, tag);
+            const size_t  b    = twin.alloc->allocate(size, 256, tag);
+            REQUIRE(a == b && "an interrogated allocator places blocks where its twin does");
+            if (a != SIZE_MAX) {
+                live.push_back(a);
+            }
+        }
+        (void) watched.alloc->block_census();
+        REQUIRE(watched.alloc->used() == twin.alloc->used());
+        REQUIRE(watched.alloc->largest_free_block() == twin.alloc->largest_free_block());
+    }
+
+    std::cout << "test_block_census_is_read_only: PASSED\n";
+}
+
+// A region too small to hold a block, and a reset region, are the empty and the
+// single-free-block census.
+static void test_block_census_degenerate() {
+    tlsf_allocator tiny(100);
+    REQUIRE(tiny.block_census().empty() && "a region under MIN_BLOCK_SIZE has no blocks");
+
+    test_arena arena;
+    (void) arena.alloc->allocate(4096, 256, TAG_WEIGHT);
+    (void) arena.alloc->allocate_top(4096, 256, TAG_CONTEXT);
+    arena.alloc->reset();
+    const auto c = arena.alloc->block_census();
+    REQUIRE(c.size() == 1 && c[0].free && c[0].offset == 0 && c[0].size == arena.size);
+
+    std::cout << "test_block_census_degenerate: PASSED\n";
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main() {
@@ -950,6 +1179,10 @@ int main() {
     test_carve_after_reset();
     test_carve_refusals();
     test_segregated_layout_a2_shape();
+    test_block_census_tiles();
+    test_block_census_random_mix();
+    test_block_census_is_read_only();
+    test_block_census_degenerate();
 
     std::cout << "\nAll tlsf_allocator tests PASSED!\n";
     return 0;

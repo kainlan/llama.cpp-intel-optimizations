@@ -158,6 +158,10 @@ class zone_model {
 
     size_t anchor() const { return anchor_; }
 
+    // The yieldability the model assigns an optional tenant: the predicate the
+    // production census is handed in place of jehw's.
+    bool optional_yieldable(size_t offset) const { return !is_leased(offset); }
+
     tlsf_allocator & allocator() { return tlsf_; }
 
     const tlsf_allocator & allocator() const { return tlsf_; }

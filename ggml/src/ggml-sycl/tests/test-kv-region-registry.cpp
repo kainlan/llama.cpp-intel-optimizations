@@ -50,6 +50,7 @@
 #include <cstdio>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -74,6 +75,39 @@
     } while (0)
 
 using namespace ggml_sycl;
+
+// GCC cannot see that the replaced operator new above is malloc, and flags the free in the matching delete.
+#if defined(__GNUC__) && !defined(__clang__)
+#    pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+
+// The allocation detector: a replaced global operator new that counts on a thread that armed it.
+// The TSan target defines KV_REGISTRY_TEST_NO_ALLOC_DETECTOR: the sanitizer runtime interposes
+// operator new itself (a second definition is a link error) and must see every allocation, so
+// the allocation case is skipped there and runs, unchanged, in the plain target.
+#ifndef KV_REGISTRY_TEST_NO_ALLOC_DETECTOR
+thread_local bool   g_count_allocations = false;
+thread_local size_t g_allocations       = 0;
+
+void * operator new(std::size_t n) {
+    if (g_count_allocations) {
+        ++g_allocations;
+    }
+    void * p = std::malloc(n != 0 ? n : 1);
+    if (p == nullptr) {
+        throw std::bad_alloc();
+    }
+    return p;
+}
+
+void operator delete(void * p) noexcept {
+    std::free(p);
+}
+
+void operator delete(void * p, std::size_t) noexcept {
+    std::free(p);
+}
+#endif  // KV_REGISTRY_TEST_NO_ALLOC_DETECTOR
 
 namespace {
 
@@ -526,7 +560,7 @@ int case_witness_positive_controls() {
     abort_capture      cap;
     kv_witnessed_mutex l1{ KV_LOCK_L1_INVENTORY, "L1" };
     kv_witnessed_mutex l3{ KV_LOCK_L3_REGISTRY, "kv_region_mutex_" };
-    kv_witnessed_mutex slot{ KV_LOCK_L5_SLOT_STATE, "slot-state lock" };
+    kv_witnessed_mutex slot{ KV_LOCK_L5_SLOT_STATE, "slot-state lock", KV_L5_SLOT_STATE };
     kv_witnessed_mutex l5{ KV_LOCK_L5_GROUP, "L5" };
 
     {
@@ -539,13 +573,18 @@ int case_witness_positive_controls() {
     }
     CHECK_EQ(kv_lock_witness::violations(), 0, "L1 then the slot-state lock, and L1 then a group mutex, are clean");
 
-    // Same rank, different instance: the slot-state lock and a group mutex are both
-    // L5, and the model has no tie-break between L5 peers, so holding both is flagged.
+    // Two L5 peers are ordered by the tie-break: a group mutex before the slot-state lock is
+    // clean, the other way round is an order violation.
     {
         std::lock_guard<kv_witnessed_mutex> a(l5);
         std::lock_guard<kv_witnessed_mutex> b(slot);
     }
-    CHECK_EQ(kv_lock_witness::violations(), 1, "control: two L5 peers held together are flagged");
+    CHECK_EQ(kv_lock_witness::violations(), 0, "a group mutex then the slot-state lock ascends the L5 tie-break");
+    {
+        std::lock_guard<kv_witnessed_mutex> a(slot);
+        std::lock_guard<kv_witnessed_mutex> b(l5);
+    }
+    CHECK_EQ(kv_lock_witness::violations(), 1, "control: the slot-state lock then a group mutex is flagged");
     CHECK(kv_lock_witness::last().find("order") != std::string::npos, "as an order violation");
     kv_lock_witness::reset();
 
@@ -981,18 +1020,21 @@ int case_tenant_slots_and_retentions() {
     add_fresh(slots, "rows", 1, make_handle(log), 500);
     add_fresh(slots, "per-op", 0, make_handle(log), 64);  // a DEVICE-scope slot: its own key
 
-    CHECK(slots.claim("rows", 0, 1000) == kv_claim_result::OK, "claim at the cap is OK");
-    CHECK(slots.claim("rows", 0, 10) == kv_claim_result::ALREADY_CLAIMED, "a second claim of the slot is refused");
-    CHECK(slots.claim("rows", 1, 501) == kv_claim_result::OVER_PLAN, "a claim above the cap is OVER_PLAN");
-    CHECK(slots.claim("rows", 9, 1) == kv_claim_result::NO_SLOT, "a claim with no slot is NO_SLOT");
-    CHECK(slots.claim("per-op", 0, 64) == kv_claim_result::OK, "the per-op slot is independent of rows/0");
+    const kv_claim rows0 = slots.claim("rows", 0, 1000);
+    CHECK(rows0.result == kv_claim_result::OK, "claim at the cap is OK");
+    CHECK(slots.claim("rows", 0, 10).result == kv_claim_result::ALREADY_CLAIMED,
+          "a second claim of the slot is refused");
+    CHECK(slots.claim("rows", 1, 501).result == kv_claim_result::OVER_PLAN, "a claim above the cap is OVER_PLAN");
+    CHECK(slots.claim("rows", 9, 1).result == kv_claim_result::NO_SLOT, "a claim with no slot is NO_SLOT");
+    const kv_claim perop = slots.claim("per-op", 0, 64);
+    CHECK(perop.result == kv_claim_result::OK, "the per-op slot is independent of rows/0");
     CHECK(slots.claimed("per-op", 0) && !slots.claimed("rows", 1), "claim state is per (cohort, index)");
 
     std::vector<kv_region_handle> out;
     CHECK(!slots.take_unclaimed(out) && out.empty(), "slots with a live claim are not taken, and nothing moves");
     CHECK_EQ(slots.size(), 3, "all three slots remain");
-    slots.release_claim("rows", 0);
-    slots.release_claim("per-op", 0);
+    CHECK(slots.release_claim("rows", 0, rows0.generation), "the claim's own token releases it");
+    CHECK(slots.release_claim("per-op", 0, perop.generation), "and so does the other");
     CHECK(!slots.any_claimed(), "no claim is live");
     CHECK(slots.take_unclaimed(out) && out.size() == 3, "the unclaimed slots move out");
     CHECK_EQ(log.drops.load(), 0, "moved out, not dropped: the caller drops with no lock held");
@@ -1014,14 +1056,14 @@ int case_tenant_slots_and_retentions() {
     // does not carry over, and nothing is freed unfenced.
     kv_tenant_slots over;
     add_fresh(over, "ring", 0, make_handle(log), 64);
-    CHECK(over.claim("ring", 0, 10) == kv_claim_result::OK, "claim the row");
+    CHECK(over.claim("ring", 0, 10).result == kv_claim_result::OK, "claim the row");
     CHECK(!over.exchange_retention("ring", 0, { make_handle(log), 5 }).owner, "record its retention");
     const int         drops_over = log.drops.load();
     kv_slot_retention back       = over.add("ring", 0, make_handle(log), 128);
     CHECK(back.owner && back.done_event == 5, "the replaced row's retention comes back with its event");
     CHECK_EQ(log.drops.load(), drops_over + 1, "only the replaced slot's own handle dropped; the retention did not");
     CHECK(!over.claimed("ring", 0), "the new slot does not inherit the old claim");
-    CHECK(over.claim("ring", 0, 100) == kv_claim_result::OK, "and can be claimed");
+    CHECK(over.claim("ring", 0, 100).result == kv_claim_result::OK, "and can be claimed");
     std::vector<kv_slot_retention> left;
     over.take_retentions(left);
     CHECK(left.empty(), "the old retention is not left in the table for the release proc to fence twice");
@@ -1055,6 +1097,465 @@ int case_tenant_slots_and_retentions() {
     return 0;
 }
 
+// ---- the L5 tie-break --------------------------------------------------------
+int case_l5_tie_break() {
+    abort_capture cap;
+
+    const struct {
+        int          ordinal;
+        const char * name;
+    } order[] = {
+        { KV_L5_GROUP,           "group"           },
+        { KV_L5_ARENA_AUTHORITY, "arena authority" },
+        { KV_L5_RUNTIME_ALLOC,   "runtime alloc"   },
+        { KV_L5_SLOT_STATE,      "slot state"      },
+        { KV_L5_LEDGER_WRITER,   "ledger writer"   },
+        { KV_L5_RETAINED_STORE,  "retained store"  },
+    };
+
+    const size_t n = sizeof(order) / sizeof(order[0]);
+    // Every ascending pair is clean and every descending pair is flagged, each with its
+    // own mutex object so the check reads the ordinal and not the instance.
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j) {
+                continue;
+            }
+            kv_lock_witness::reset();
+            kv_witnessed_mutex first{ KV_LOCK_L5_GROUP, order[i].name, order[i].ordinal };
+            kv_witnessed_mutex second{ KV_LOCK_L5_GROUP, order[j].name, order[j].ordinal };
+            {
+                std::lock_guard<kv_witnessed_mutex> a(first);
+                std::lock_guard<kv_witnessed_mutex> b(second);
+            }
+            if (i < j) {
+                CHECK_EQ(kv_lock_witness::violations(), 0, "an ascending ordinal pair is clean");
+            } else {
+                CHECK_EQ(kv_lock_witness::violations(), 1, "control: a descending ordinal pair is flagged");
+            }
+        }
+    }
+
+    // One ordinal: the instance key orders, and equal is flagged too.
+    kv_lock_witness::reset();
+    kv_witnessed_mutex g1{ KV_LOCK_L5_GROUP, "zone 1", KV_L5_GROUP, 1 };
+    kv_witnessed_mutex g2{ KV_LOCK_L5_GROUP, "zone 2", KV_L5_GROUP, 2 };
+    kv_witnessed_mutex g2b{ KV_LOCK_L5_GROUP, "zone 2 again", KV_L5_GROUP, 2 };
+    {
+        std::lock_guard<kv_witnessed_mutex> a(g1);
+        std::lock_guard<kv_witnessed_mutex> b(g2);
+    }
+    CHECK_EQ(kv_lock_witness::violations(), 0, "two group mutexes in ascending instance order are clean");
+    {
+        std::lock_guard<kv_witnessed_mutex> a(g2);
+        std::lock_guard<kv_witnessed_mutex> b(g1);
+    }
+    CHECK_EQ(kv_lock_witness::violations(), 1, "control: descending instances are flagged");
+    kv_lock_witness::reset();
+    {
+        std::lock_guard<kv_witnessed_mutex> a(g2);
+        std::lock_guard<kv_witnessed_mutex> b(g2b);
+    }
+    CHECK_EQ(kv_lock_witness::violations(), 1, "control: equal ordinal and instance is flagged");
+    CHECK(kv_lock_witness::last().find("instance collision") != std::string::npos &&
+              kv_lock_witness::last().find("witness instance 2") != std::string::npos,
+          "the equal-instance report names the possible collision and the instance");
+    kv_lock_witness::reset();
+    {
+        std::lock_guard<kv_witnessed_mutex> a(g2);
+        std::lock_guard<kv_witnessed_mutex> b(g1);
+    }
+    CHECK(kv_lock_witness::last().find("collision") == std::string::npos,
+          "control: a plain descending pair is reported as an order violation, not a collision");
+    kv_lock_witness::reset();
+
+    // Two slots' spin locks are the same subsystem with their serials as instances.
+    kv_lock_witness::reset();
+    kv_slot_spin_lock s1(1), s2(2);
+    {
+        std::lock_guard<kv_slot_spin_lock> a(s1);
+        std::lock_guard<kv_slot_spin_lock> b(s2);
+    }
+    CHECK_EQ(kv_lock_witness::violations(), 0, "two slot spin locks in serial order are clean");
+    {
+        std::lock_guard<kv_slot_spin_lock> a(s2);
+        std::lock_guard<kv_slot_spin_lock> b(s1);
+    }
+    CHECK_EQ(kv_lock_witness::violations(), 1, "control: slot spin locks out of serial order are flagged");
+
+    // A release in any order removes the lock it names, not the newest of its rank.
+    kv_lock_witness::reset();
+    kv_witnessed_mutex early{ KV_LOCK_L5_GROUP, "early", KV_L5_GROUP };
+    kv_witnessed_mutex late{ KV_LOCK_L5_GROUP, "late", KV_L5_LEDGER_WRITER };
+    early.lock();
+    late.lock();
+    early.unlock();  // the lower one first
+    CHECK_EQ(kv_lock_witness::held_count(), 1, "one lock is still held");
+    {
+        kv_witnessed_mutex                  under{ KV_LOCK_L5_GROUP, "under", KV_L5_RETAINED_STORE };
+        std::lock_guard<kv_witnessed_mutex> u(under);  // above the ledger writer: still clean
+    }
+    CHECK_EQ(kv_lock_witness::violations(), 0, "the lock still held is the later one");
+    {
+        kv_witnessed_mutex                  below{ KV_LOCK_L5_GROUP, "below", KV_L5_ARENA_AUTHORITY };
+        std::lock_guard<kv_witnessed_mutex> u(
+            below);  // below the ledger writer: flagged, so the writer is the one held
+    }
+    CHECK_EQ(kv_lock_witness::violations(), 1, "control: and a lock below it is flagged");
+    late.unlock();
+    CHECK_EQ(kv_lock_witness::held_count(), 0, "everything released");
+
+    // The leaf rule is unchanged: nothing is taken under the registry lock, a claim included.
+    kv_lock_witness::reset();
+    drop_log        log;
+    kv_tenant_slots slots;
+    add_fresh(slots, "rows", 0, make_handle(log), 100);
+    kv_witnessed_mutex registry{ KV_LOCK_L3_REGISTRY, "kv_region_mutex_" };
+    {
+        std::lock_guard<kv_witnessed_mutex> a(registry);
+        (void) slots.claim("rows", 0, 10);
+    }
+    CHECK(kv_lock_witness::violations() >= 1, "control: a claim under the registry lock is flagged");
+    CHECK(kv_lock_witness::last().find("leaf") != std::string::npos, "as a leaf violation");
+    return 0;
+}
+
+// ---- claims: the generation token ---------------------------------------------
+int case_claim_generation_token() {
+    abort_capture   cap;
+    drop_log        log;
+    kv_tenant_slots slots;
+    add_fresh(slots, "rows", 0, make_handle(log), 100);
+    add_fresh(slots, "rows", 1, make_handle(log), 100);
+
+    const kv_claim a = slots.claim("rows", 0, 10);
+    CHECK(a.result == kv_claim_result::OK && a.generation != 0, "a claim returns a live token");
+    CHECK_EQ(a.wait_event, 0, "a slot never released has no event to chain on");
+    const kv_claim refused = slots.claim("rows", 0, 10);
+    CHECK(refused.result == kv_claim_result::ALREADY_CLAIMED && refused.generation == 0,
+          "a refused claim has no token");
+    CHECK(slots.claim("rows", 0, 1000).result == kv_claim_result::OVER_PLAN,
+          "the cap is checked before the claim state");
+    CHECK(slots.claim("rows", 7, 1).generation == 0, "no slot, no token");
+
+    // A token that is not the live claim's releases nothing.
+    CHECK(!slots.release_claim("rows", 0, a.generation + 1000), "a made-up token releases nothing");
+    CHECK(!slots.release_claim("rows", 0, 0), "token 0 releases nothing");
+    CHECK(!slots.release_claim("rows", 1, a.generation), "another slot's key with this token releases nothing");
+    CHECK(!slots.release_claim("nope", 0, a.generation), "no such slot, nothing released");
+    CHECK(slots.claimed("rows", 0), "the claim is still live after every wrong release");
+
+    // The stale holder: A releases, B claims, A's late release must not free B's claim.
+    CHECK(slots.release_claim("rows", 0, a.generation, 77), "the live token releases, with an event");
+    CHECK(!slots.release_claim("rows", 0, a.generation), "a second release of the same token is a no-op");
+    const kv_claim b = slots.claim("rows", 0, 10);
+    CHECK(b.result == kv_claim_result::OK && b.generation != a.generation, "the next claim has a new token");
+    CHECK_EQ(b.wait_event, 77, "and receives the previous release's event to chain on");
+    CHECK(!slots.release_claim("rows", 0, a.generation), "the stale holder's late release is refused");
+    CHECK(slots.claimed("rows", 0), "so B's claim survives it");
+    CHECK(slots.release_claim("rows", 0, b.generation), "B's own token releases");
+    CHECK(!slots.claimed("rows", 0), "and the slot is free");
+    CHECK_EQ(slots.claim("rows", 0, 10).wait_event, 0,
+             "a release with no event leaves the next claim nothing to wait for");
+
+    // A replaced slot: the old claimant's token never matches the new slot, even as its
+    // first claim (tokens are unique across the table, not per slot).
+    kv_tenant_slots over;
+    add_fresh(over, "ring", 0, make_handle(log), 100);
+    const kv_claim old_claim = over.claim("ring", 0, 10);
+    CHECK(old_claim.result == kv_claim_result::OK, "claim the old slot");
+    (void) over.add("ring", 0, make_handle(log), 100);
+    const kv_claim new_claim = over.claim("ring", 0, 10);
+    CHECK(new_claim.result == kv_claim_result::OK && new_claim.generation != old_claim.generation,
+          "the replacement's first claim has a token the old claimant does not hold");
+    CHECK(!over.release_claim("ring", 0, old_claim.generation), "the old claimant cannot release the new slot's claim");
+    CHECK(over.claimed("ring", 0), "which is still live");
+    CHECK(over.release_claim("ring", 0, new_claim.generation), "its own token releases it");
+    CHECK_EQ(kv_lock_witness::violations(), 0, "no lock violation");
+    return 0;
+}
+
+// ---- claims: nothing allocates on the path ------------------------------------
+// The claim path holds the slot's spin lock and the witness is reading the lock stack: neither
+// may allocate (and a lookup must not copy the cohort string).  The detector is the replaced
+// global operator new above, armed per thread; a control proves it counts.
+#ifdef KV_REGISTRY_TEST_NO_ALLOC_DETECTOR
+int case_claim_path_does_not_allocate() {
+    std::printf("skip claim_path_does_not_allocate: the sanitizer runtime owns operator new in this target\n");
+    return 0;
+}
+#else
+int case_claim_path_does_not_allocate() {
+    abort_capture     cap;
+    drop_log          log;
+    kv_tenant_slots   slots;
+    const std::string cohort = "a-cohort-name-longer-than-the-small-string-buffer";
+    add_fresh(slots, cohort, 0, make_handle(log), 100);
+    add_fresh(slots, cohort, 1, make_handle(log), 100);
+    const std::string missing = cohort + "-missing";
+
+    g_allocations                       = 0;
+    g_count_allocations                 = true;
+    const kv_claim ok                   = slots.claim(cohort, 0, 10);
+    const kv_claim again                = slots.claim(cohort, 0, 10);
+    const kv_claim over                 = slots.claim(cohort, 1, 1000);
+    const kv_claim none                 = slots.claim(missing, 0, 10);
+    const bool     stale                = slots.release_claim(cohort, 0, ok.generation + 1000);
+    const bool     held                 = slots.claimed(cohort, 0);
+    const bool     any                  = slots.any_claimed();
+    const bool     freed                = slots.release_claim(cohort, 0, ok.generation, 5);
+    g_count_allocations                 = false;
+    const size_t claim_path_allocations = g_allocations;
+
+    CHECK(ok.result == kv_claim_result::OK && again.result == kv_claim_result::ALREADY_CLAIMED &&
+              over.result == kv_claim_result::OVER_PLAN && none.result == kv_claim_result::NO_SLOT && !stale && held &&
+              any && freed,
+          "the armed region ran every claim-path outcome");
+    CHECK_EQ(claim_path_allocations, 0, "the claim path allocates nothing");
+
+    // Controls: the detector counts a plain allocation and a copied cohort string.
+    g_allocations       = 0;
+    g_count_allocations = true;
+    int *             p = new int(1);
+    const std::string copy(cohort.c_str());
+    g_count_allocations = false;
+    delete p;
+    CHECK(g_allocations >= 2, "control: the detector counts an allocation and a copied long string");
+    CHECK_EQ(kv_lock_witness::violations(), 0, "no lock violation");
+    return 0;
+}
+#endif  // KV_REGISTRY_TEST_NO_ALLOC_DETECTOR
+
+// ---- claims: exclusion and concurrency ------------------------------------------
+int case_claim_exclusion() {
+    abort_capture   cap;
+    drop_log        log;
+    kv_tenant_slots slots;
+    add_fresh(slots, "rows", 0, make_handle(log), 100);
+    add_fresh(slots, "rows", 1, make_handle(log), 100);
+
+    // Many threads race for each of two slots: at no instant do two hold the same one, and
+    // every successful claim is released by its own token.
+    constexpr int            n_threads  = 8;
+    constexpr int            rounds     = 4000;
+    std::atomic<int>         holders[2] = { { 0 }, { 0 } };
+    std::atomic<int>         overlap{ 0 };
+    std::atomic<int>         wins{ 0 };
+    std::atomic<int>         bad_release{ 0 };
+    std::atomic<int>         go{ 0 };
+    std::vector<std::thread> threads;
+    for (int t = 0; t < n_threads; ++t) {
+        threads.emplace_back([&, t] {
+            while (go.load() == 0) {
+                std::this_thread::yield();
+            }
+            const uint32_t slot = t % 2;  // four threads race for each of the two slots
+            for (int r = 0; r < rounds; ++r) {
+                const kv_claim c = slots.claim("rows", slot, 10);
+                if (c.result != kv_claim_result::OK) {
+                    continue;
+                }
+                if (holders[slot].fetch_add(1) != 0) {
+                    overlap.fetch_add(1);
+                }
+                wins.fetch_add(1);
+                std::this_thread::yield();  // widen the window a second claimant would land in
+                holders[slot].fetch_sub(1);
+                if (!slots.release_claim("rows", slot, c.generation)) {
+                    bad_release.fetch_add(1);
+                }
+            }
+        });
+    }
+    go.store(1);
+    for (std::thread & th : threads) {
+        th.join();
+    }
+    CHECK_EQ(overlap.load(), 0, "two threads never hold the same slot at once, on either slot");
+    CHECK_EQ(bad_release.load(), 0, "every winner's own token releases its claim");
+    CHECK(wins.load() > 100, "the arm made progress: claims succeeded");
+    CHECK(!slots.any_claimed(), "nothing is left claimed");
+    CHECK_EQ(kv_lock_witness::violations(), 0, "no lock violation under contention");
+    return 0;
+}
+
+// ---- the slot table under contention ------------------------------------------------
+// The retention fields and the slot map are touched from several threads at once on the
+// dispatch path; these two cases are the ones a missing pin or a weakened spin lock
+// shows up in under TSan (and, for the accounting checks, in a plain build).  Every handle
+// made is dropped exactly once, so a lost or doubled retention moves the count.
+
+// Retention exchange from three threads and take_retentions from a fourth, on one slot.
+int case_retention_race() {
+    drop_log         log;
+    std::atomic<int> made{ 0 };
+    {
+        kv_tenant_slots slots;
+        add_fresh(slots, "r", 0, make_handle(log), 100);
+        made.fetch_add(1);
+        constexpr int            rounds = 3000;
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 3; ++t) {
+            threads.emplace_back([&] {
+                for (int i = 0; i < rounds; ++i) {
+                    kv_slot_retention next;
+                    next.owner      = make_handle(log);
+                    next.done_event = (uint64_t) i + 1;
+                    made.fetch_add(1);
+                    const kv_slot_retention previous = slots.exchange_retention("r", 0, std::move(next));
+                    (void) previous;  // dropped here, with no lock held
+                }
+            });
+        }
+        threads.emplace_back([&] {
+            for (int i = 0; i < rounds; ++i) {
+                std::vector<kv_slot_retention> out;
+                slots.take_retentions(out);
+            }
+        });
+        for (std::thread & th : threads) {
+            th.join();
+        }
+        std::vector<kv_slot_retention> last;
+        slots.take_retentions(last);
+    }
+    CHECK_EQ(log.drops.load(), made.load(), "every handle made is dropped exactly once");
+    CHECK_EQ(log.drops_with_lock.load(), 0, "and none is dropped under a lock");
+    CHECK_EQ(kv_lock_witness::violations(), 0, "no lock violation under the retention race");
+    return 0;
+}
+
+// Claim, handle and release from three threads against a replace (add over the live key)
+// and take_unclaimed + re-add from two more.
+int case_claim_vs_table_race() {
+    drop_log         log;
+    std::atomic<int> made{ 0 };
+    {
+        kv_tenant_slots slots;
+        add_fresh(slots, "r", 0, make_handle(log), 100);
+        made.fetch_add(1);
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 3; ++t) {
+            threads.emplace_back([&] {
+                for (int i = 0; i < 6000; ++i) {
+                    const kv_claim c = slots.claim("r", 0, 10);
+                    if (c.result == kv_claim_result::OK) {
+                        const kv_region_handle h = slots.handle("r", 0);
+                        (void) slots.release_claim("r", 0, c.generation);
+                    }
+                }
+            });
+        }
+        threads.emplace_back([&] {
+            for (int i = 0; i < 1500; ++i) {
+                made.fetch_add(1);
+                kv_slot_retention previous = slots.add("r", 0, make_handle(log), 100);
+                (void) previous;
+            }
+        });
+        threads.emplace_back([&] {
+            for (int i = 0; i < 1500; ++i) {
+                std::vector<kv_region_handle> out;
+                if (slots.take_unclaimed(out)) {
+                    made.fetch_add(1);
+                    kv_slot_retention previous = slots.add("r", 0, make_handle(log), 100);
+                    (void) previous;
+                }
+            }
+        });
+        for (std::thread & th : threads) {
+            th.join();
+        }
+        CHECK(!slots.any_claimed() || slots.size() > 0, "the table is coherent after the race");
+    }
+    CHECK_EQ(log.drops.load(), made.load(), "every slot handle made is dropped exactly once");
+    CHECK_EQ(kv_lock_witness::violations(), 0, "no lock violation under the table race");
+    return 0;
+}
+
+// A holder with a token that is not live (token 0, a made-up one) releasing in a loop while
+// four threads claim and release the same slot: the stale release reads the slot's claim
+// state, and must do it under the spin lock like every other reader.
+int case_stale_release_race() {
+    drop_log        log;
+    kv_tenant_slots slots;
+    add_fresh(slots, "r", 0, make_handle(log), 100);
+    std::atomic<int>         overlap{ 0 };
+    std::atomic<int>         bad_release{ 0 };
+    std::atomic<int>         stale_won{ 0 };
+    std::atomic<int>         holders{ 0 };
+    std::atomic<bool>        stop{ false };
+    std::vector<std::thread> threads;
+    std::vector<std::thread> claimers;
+    for (int t = 0; t < 4; ++t) {
+        claimers.emplace_back([&] {
+            for (int i = 0; i < 8000; ++i) {
+                const kv_claim c = slots.claim("r", 0, 10);
+                if (c.result != kv_claim_result::OK) {
+                    continue;
+                }
+                if (holders.fetch_add(1) != 0) {
+                    overlap.fetch_add(1);
+                }
+                holders.fetch_sub(1);
+                if (!slots.release_claim("r", 0, c.generation)) {
+                    bad_release.fetch_add(1);
+                }
+            }
+        });
+    }
+    threads.emplace_back([&] {
+        while (!stop.load()) {
+            if (slots.release_claim("r", 0, 0) || slots.release_claim("r", 0, (uint64_t) 1 << 60)) {
+                stale_won.fetch_add(1);
+            }
+        }
+    });
+    for (std::thread & th : claimers) {
+        th.join();
+    }
+    stop.store(true);
+    for (std::thread & th : threads) {
+        th.join();
+    }
+    CHECK_EQ(stale_won.load(), 0, "a token that was never live releases nothing, under contention");
+    CHECK_EQ(overlap.load(), 0, "the stale releaser never lets two claimants hold the slot");
+    CHECK_EQ(bad_release.load(), 0, "every winner's own token still releases its claim");
+    CHECK(!slots.any_claimed(), "nothing is left claimed");
+    return 0;
+}
+
+// The two events a slot holds come from two different calls (kv_tenant_slots::slot): the
+// claimant chains on what the RELEASING caller passed, the retained owner's drop is fenced
+// on what the RECORDING caller passed.  The case gives them different values, so a registry
+// that read one for the other fails.
+int case_slot_events_are_two_facts() {
+    drop_log        log;
+    kv_tenant_slots slots;
+    add_fresh(slots, "ring", 0, make_handle(log), 100);
+
+    const kv_claim g1 = slots.claim("ring", 0, 10);
+    (void) slots.exchange_retention("ring", 0, { make_handle(log), 5 });
+    CHECK(slots.release_claim("ring", 0, g1.generation, 4), "generation 1 releases with event 4");
+
+    const kv_claim g2 = slots.claim("ring", 0, 10);
+    CHECK_EQ(g2.wait_event, 4,
+             "the claimant chains on the event the releasing caller passed (4, not the retention's 5)");
+    // Generation 2 records its retention with event 9 and then releases with event 8.
+    const kv_slot_retention prev = slots.exchange_retention("ring", 0, { make_handle(log), 9 });
+    CHECK(prev.owner && prev.done_event == 5,
+          "the owner handed back carries the event its recorder passed (5), not the release's 4");
+    CHECK(slots.claim("ring", 0, 10).result == kv_claim_result::ALREADY_CLAIMED, "the slot is held");
+    CHECK(slots.release_claim("ring", 0, g2.generation, 8), "generation 2 releases with event 8");
+    const kv_claim g3 = slots.claim("ring", 0, 10);
+    CHECK_EQ(g3.wait_event, 8, "the next claimant chains on the release's event (8), not the retention's 9");
+    std::vector<kv_slot_retention> kept;
+    slots.take_retentions(kept);
+    CHECK(kept.size() == 1 && kept[0].done_event == 9,
+          "and the retained owner is fenced on the event its recorder passed (9), not the release's 8");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -1076,6 +1577,14 @@ int main() {
         { "release_proc",                    case_release_proc                    },
         { "txn_guard_two_phases",            case_txn_guard_two_phases            },
         { "tenant_slots_and_retentions",     case_tenant_slots_and_retentions     },
+        { "l5_tie_break",                    case_l5_tie_break                    },
+        { "claim_generation_token",          case_claim_generation_token          },
+        { "claim_exclusion",                 case_claim_exclusion                 },
+        { "claim_path_does_not_allocate",    case_claim_path_does_not_allocate    },
+        { "retention_race",                  case_retention_race                  },
+        { "claim_vs_table_race",             case_claim_vs_table_race             },
+        { "stale_release_race",              case_stale_release_race              },
+        { "slot_events_are_two_facts",       case_slot_events_are_two_facts       },
     };
     for (const test_case & c : cases) {
         if (c.fn() != 0) {
