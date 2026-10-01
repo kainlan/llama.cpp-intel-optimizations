@@ -411,13 +411,21 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mmq-src1-plan-source.py
             --self-test)
     set_tests_properties(sycl-mmq-src1-plan-source PROPERTIES LABELS "sycl;memory;planner;host;source-contract")
-    # llama.cpp-qhfp: CONCAT is graph-recordable. --self-test: six of its checks are absence-based (no host
-    # wait, no recording-flag branch, no allocation, no CONCAT rejection) and pass on any tree that never had
-    # the thing they forbid.
-    add_test(NAME sycl-concat-graph-recordable-source
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-concat-graph-recordable-source.py
+    # llama.cpp-qhfp: no CONCAT rejection in check_graph_compatibility and no host wait in concat.cpp, plus the
+    # graph-safe memcpy helper's alignment. Source facts only: whether a graph replays is the GPU witness's job.
+    # --self-test: most of its checks are absence-based (no host wait, no recording-guarded wait, no allocation,
+    # no CONCAT rejection) and pass on any tree that never had the thing they forbid.
+    add_test(NAME sycl-concat-no-host-wait-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-concat-no-host-wait-source.py
             --self-test)
-    set_tests_properties(sycl-concat-graph-recordable-source PROPERTIES LABELS "sycl;graph;host;source-contract")
+    set_tests_properties(sycl-concat-no-host-wait-source PROPERTIES LABELS "sycl;graph;host;source-contract")
+    # llama.cpp-qhfp review fold: the graph input pre-stage fails closed (a pre-stage failure declines the
+    # recording before it starts) and treats a view of an INPUT as that input. --self-test: the flag-only and
+    # swallowed-failure checks are absence-based.
+    add_test(NAME sycl-graph-prestage-fail-closed-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-prestage-fail-closed-source.py
+            --self-test)
+    set_tests_properties(sycl-graph-prestage-fail-closed-source PROPERTIES LABELS "sycl;graph;host;source-contract")
     # --self-test likewise: eight of this gate's checks are absence-based, and
     # the construct they forbid -- max(planned, required), the general temporary
     # fallback, admission after the lock, a debug-gated refusal warning -- is
