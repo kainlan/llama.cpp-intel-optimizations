@@ -38661,6 +38661,12 @@ struct ggml_sycl_plan_scope {
 
 static thread_local ggml_sycl_plan_scope * g_plan_scope = nullptr;
 
+// The scope open on this thread, or null. L4's claim hook in alloc_buffer reads
+// this and never mints a scope of its own.
+[[maybe_unused]] static ggml_sycl_plan_scope * ggml_sycl_plan_scope_current() {
+    return g_plan_scope;
+}
+
 static void ggml_sycl_plan_scope_fail(ggml_sycl_plan_scope * scope, const std::string & text) {
     if (scope->failure.empty()) {
         scope->failure = text;

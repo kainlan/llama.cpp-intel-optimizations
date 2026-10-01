@@ -585,6 +585,9 @@ TLS_REACHERS = ("ggml_sycl_dispatch_owner", "ggml_sycl_resolve_moe_expert_route"
 def gate31_owner(files, bad):
     c = code(files, MAIN)
     k = keep(files, MAIN)
+    # --- the plan scope accessor L4's claim hook consumes: a one-line read of the thread's scope
+    if not re.search(r"static\s+ggml_sycl_plan_scope\s*\*\s*ggml_sycl_plan_scope_current\s*\(\s*\)\s*\{\s*return\s+g_plan_scope\s*;\s*\}", c):
+        bad("gate 31 (owner): ggml_sycl_plan_scope_current() is not a one-line read of g_plan_scope")
     # --- the scope class: one constructor input, execution_current_owner, abort on a different nested owner
     sc = struct_body(c, "ggml_sycl_dispatch_owner_scope")
     if sc is None:
@@ -1060,6 +1063,9 @@ def mutants(files):
            edit(files, M, "    ggml_sycl_load_end_body_witness load_end_body_witness;\n", "", "g31l"),
            "does not construct its overlap witness")
     # ---- gate 31, owner threading
+    yield ("the plan scope accessor reading something else",
+           edit(files, M, "static ggml_sycl_plan_scope * ggml_sycl_plan_scope_current() {\n    return g_plan_scope;", "static ggml_sycl_plan_scope * ggml_sycl_plan_scope_current() {\n    return nullptr;", "o27"),
+           "ggml_sycl_plan_scope_current() is not a one-line read")
     yield ("a thread-local owner read outside any scope's chains",
            edit(files, M, "static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {\n    return g_dispatch_owner_bound ? &g_dispatch_owner : nullptr;\n}",
                 "static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {\n    return g_dispatch_owner_bound ? &g_dispatch_owner : nullptr;\n}\n"
