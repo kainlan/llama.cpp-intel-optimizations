@@ -1517,6 +1517,9 @@ std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unifie
 std::shared_ptr<const placement_plan> coherent_cache_placement_plan_owner(const unified_cache * cache) noexcept;
 placement_cache_read                  cache_placement_coherence(const unified_cache * cache) noexcept;
 uint64_t                              lifecycle_next_plan_publication_id() noexcept;
+// How many plan publication ids have been handed out.  It changes whenever a plan is
+// published or re-published, so a hint that must not outlive a re-plan binds to it.
+uint64_t                              lifecycle_plan_publication_epoch() noexcept;
 
 // The one builder of a candidate-shaped snapshot (model_id 0, the load's transaction,
 // version 0).  Staging calls it and stores the result; the load-time measure's plan
@@ -3444,10 +3447,12 @@ class unified_cache {
     }
 
     // A hint in front of the locked republish-into-empty: the key of the owning
-    // load for which a locked pass found this cache is not one of the plan's
-    // devices (0: none).  It only lets a later call for the same owner skip the
-    // inventory lock; the locked pass stays the authority, and a different owner
-    // never matches.  Written under g_tensor_inventory_mutex.
+    // load, bound to the plan publication epoch, for which a locked pass found this
+    // cache is not one of the plan's devices (0: none).  It only lets a later call for
+    // the same owner skip the inventory lock; the locked pass stays the authority, a
+    // different owner never matches, and any later publication changes the epoch, so a
+    // re-plan that adds this device cannot be hidden by it.  Written under
+    // g_tensor_inventory_mutex.
     uint64_t into_empty_skip_key() const { return into_empty_skip_key_.load(std::memory_order_acquire); }
 
     void set_into_empty_skip_key(uint64_t key) { into_empty_skip_key_.store(key, std::memory_order_release); }

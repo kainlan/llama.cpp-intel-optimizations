@@ -4003,8 +4003,8 @@ struct ggml_tensor_extra_gpu {
     // Set when the backend minted this extra for a root that had none
     // (ensure_root_extra), so the root lies outside every SYCL device buffer and
     // the extra is released only with its backend context.  The persistent
-    // publishers (W2, W3, W6, W7) must never leave a tenant-tagged handle in one
-    // (zhcn-design §3.1.1, the C5b belt).
+    // publishers must never leave a tenant-tagged handle in one, which would
+    // outlive its graph (zhcn-design §3.1.1).
     bool runtime_minted = false;
 
     // llama.cpp-asdt (plan task L2b, jemalloc-profile bug fix): set once, at
@@ -5781,7 +5781,7 @@ struct ggml_backend_sycl_context {
     // The key names its source by a non-owning mem_handle_identity, never by a
     // mem_handle: the cache compares a source and never dereferences it, so it
     // must not keep the activation's slice alive past its graph (zhcn-design
-    // §3.1.1 C5a, lead ruling §B.2).  The context member and both thread_local
+    // §3.1.1).  The context member and both thread_local
     // maps keyed by this type convert with this one change.
     struct moe_ids_cache_key {
         ggml_sycl_cache_id             id{};
@@ -6542,7 +6542,7 @@ struct ggml_backend_sycl_context {
         graph_input_staging_generation++;
     }
 
-    // C13 (zhcn-design §3.1.1): once an entry's storage is a slice of a tenant
+    // Once an entry's storage is a slice of a tenant
     // cohort's slot, an owning handle parked here past the graph is a holder
     // the re-plan reap would have to name.  An EAGER graph_compute drops those
     // entries on every return path, so no owning tenant handle survives the
@@ -6694,7 +6694,7 @@ struct ggml_backend_sycl_context {
 
             // The source is named by a non-owning identity, never held: this cache
             // only compares it, so it must not keep an activation slice alive
-            // past its graph (zhcn-design §3.1.1 C5a, §B.2).
+            // past its graph (zhcn-design §3.1.1).
             void *                         cached_q8_1       = nullptr;
             const ggml_tensor *            cached_tensor     = nullptr;
             ggml_sycl::mem_handle_identity cached_src        = {};

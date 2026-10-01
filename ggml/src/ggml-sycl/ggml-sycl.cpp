@@ -3142,6 +3142,20 @@ static uint64_t ggml_sycl_into_empty_install_count() {
 }
 #endif
 
+// The key of the into_empty hint: the owning load, bound to the plan publication
+// epoch.  A publication (a re-plan that may add this device) changes the epoch, so a
+// non-participant hint recorded before it never matches after it.  A re-publish that
+// reuses the current version (stable MMID) hands out no id and keeps the plan's devices.
+static uint64_t ggml_sycl_into_empty_skip_key(const ggml_sycl::lifecycle::ModelToken & owner, uint64_t epoch) {
+    return (owner.model.value * 0x9E3779B97F4A7C15ULL ^ owner.load.value ^ (epoch * 0xC2B2AE3D27D4EB4FULL)) | 1ULL;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+uint64_t ggml_sycl_into_empty_skip_key_for_test(const ggml_sycl::lifecycle::ModelToken & owner, uint64_t epoch) {
+    return ggml_sycl_into_empty_skip_key(owner, epoch);
+}
+#endif
+
 static bool ggml_sycl_cache_snapshot_empty(const ggml_sycl::unified_cache * cache) {
     const auto current = cache->get_placement_plan_snapshot();
     return !current || !current->plan || current->plan->entries.empty();
@@ -3162,8 +3176,10 @@ static ggml_sycl_into_empty_result ggml_sycl_republish_current_plan_into_empty(
     // The hint: an earlier locked pass found this cache is not a device of this
     // owner's plan, so a participant-less cache does not take the inventory lock
     // on every MUL_MAT_ID.  The key names the owning load, so another owner never
-    // matches, and the locked pass below remains the authority.
-    const uint64_t skip_key = (owner.model.value * 0x9E3779B97F4A7C15ULL ^ owner.load.value) | 1ULL;
+    // matches, and the locked pass below remains the authority.  The key also names
+    // the publication epoch read before the lock: a publication that lands later
+    // changes the epoch, so a stale "not a participant" is never trusted past a re-plan.
+    const uint64_t skip_key = ggml_sycl_into_empty_skip_key(owner, ggml_sycl::lifecycle_plan_publication_epoch());
     if (cache->into_empty_skip_key() == skip_key) {
         return ggml_sycl_into_empty_result::NOOP;
     }
@@ -19731,7 +19747,7 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
 // resolution for the same tensor/device pair within a single graph compute.
 // Cleared at the start and at the exit of each graph compute, and at each publish.
 //
-// An entry holds NO mem_handle (zhcn-design §3.1.1 C6, lead ruling §B.2): a
+// An entry holds NO mem_handle (zhcn-design §3.1.1): a
 // pointer cache that owned a handle would be a holder of whatever slice it
 // names.  It stores the pointer, where it lives, the non-owning identity of the
 // tensor's storage slice at fill time, and the process tenant-publish generation
@@ -19790,7 +19806,7 @@ uint64_t ggml_sycl_graph_ptr_cache_uncached_fill() {
     return g_graph_ptr_cache_uncached_fill.load(std::memory_order_relaxed);
 }
 
-// The one identity function for C6, used at fill and at lookup.  Defined beside
+// The one identity function of the data-pointer cache, used at fill and at lookup.  Defined beside
 // ggml_sycl_find_tensor_storage_handle().
 static bool ggml_sycl_tensor_slice_identity(const ggml_tensor *              tensor,
                                             int                              device,
@@ -19885,11 +19901,11 @@ static bool ggml_sycl_ptr_is_invalid_sentinel(const void * ptr) {
     return ptr == nullptr || reinterpret_cast<uintptr_t>(ptr) == UINTPTR_MAX;
 }
 
-// The C5b belt (zhcn-design §3.1.1 W2/W3/W6/W7): a persistent publisher must not
+// The tenant belt: a persistent publisher must not
 // leave a tenant-tagged handle in an extra the backend minted for itself
 // (`runtime_minted`).  Such an extra is released only with its backend context,
 // so a tenant slice parked there would outlive its graph and block the reap.
-// W12, the scoped stage publication, is the one writer allowed to store a
+// The scoped stage publication is the one writer allowed to store a
 // tenant-tagged handle there, and it does not go through these writers.
 // A WARN normally; an abort under GGML_SYCL_STRICT_LEASES=1.  Returns whether the
 // store is allowed.
@@ -21681,7 +21697,7 @@ struct moe_down_shadow_entry {
 
 // The key names its source by a non-owning mem_handle_identity: the shadow only
 // compares it (its entries' bytes are a host copy, never a slice), so it must
-// not keep an activation slice alive past its graph (zhcn-design §3.1.1 C5a).
+// not keep an activation slice alive past its graph (zhcn-design §3.1.1).
 struct moe_down_shadow_key {
     ggml_sycl_cache_id             id{};
     ggml_sycl::mem_handle_identity handle{};
@@ -24494,7 +24510,7 @@ void ggml_sycl_cpu_tg_flush_pending() {
     moe_fusion_clear_all();
 }
 
-// True when any of the thread-local MoE scatter and CPU-expert lists (C2t) holds
+// True when any of the thread-local MoE scatter and CPU-expert lists holds
 // state: the four lists whose entries carry compute-buffer slices between graphs,
 // plus the direct-scatter event list.  A recording call must never reach its exit
 // with one non-empty (recorded scatter state is the recording sink's, or the
@@ -24517,7 +24533,7 @@ bool ggml_sycl_cpu_tg_pending_any() {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // H4h's RED arms drop one release step at a time.  The exit flush (the
 // graph_compute return hook) and the synchronize flush are the two steps that
-// release C2t state before a re-plan; a test can disable either.
+// release pending scatter state before a re-plan; a test can disable either.
 static std::atomic<bool> g_test_cpu_tg_skip_exit_flush{ false };
 static std::atomic<bool> g_test_cpu_tg_skip_synchronize_flush{ false };
 
@@ -53228,7 +53244,7 @@ static bool ggml_sycl_narrow_storage_identity(const ggml_sycl::mem_handle_identi
     return true;
 }
 
-// C6's one identity function (zhcn-design §3.1.1 C6, §Z6 I-B): the non-owning
+// The data-pointer cache's one identity function (zhcn-design §3.1.1): the non-owning
 // identity of the slice of storage a tensor occupies, used at fill and at lookup
 // of g_data_ptr_cache so the two sides can never compare a whole allocation
 // against a slice.
@@ -100795,7 +100811,7 @@ void ggml_backend_sycl_graph_invalidate(ggml_backend_t backend, const char * rea
 
 // Waits every queue that can reach a slice of this context, after llama's synchronize()
 // (zhcn-design §3.1 step 3).  llama's synchronize() waits only the device execution
-// queue (or the deferred-decode event) and flushes the thread-local C2t lists; the
+// queue (or the deferred-decode event) and flushes the thread-local pending-scatter lists; the
 // queues below carry other work too, which is allowed only here, on the rare re-plan
 // path under L0.  Gate 30 censuses every queue and names the line that waits it.
 bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
@@ -108928,12 +108944,12 @@ normal_dispatch:
 }
 
 // Publishes the per-graph staged owners (the llama.cpp-1df8 keep-alive, kept out
-// of g_data_ptr_cache; zhcn-design §3.1.1 C6).  An eager call retained them in
+// of g_data_ptr_cache; zhcn-design §3.1.1).  An eager call retained them in
 // g_graph_staged_owners; they leave through the retained store bound to the
 // graph's completion, never parked in a cache.  A recording call handed its
 // owners to the recording sink when it staged them.
 //
-// Why this is safe after the C6 drop and with no L0 token held: the list is
+// Why this is safe after the data-pointer cache drop and with no L0 token held: the list is
 // thread_local, filled only by ggml_sycl_graph_staged_owner_add on the thread
 // that runs this graph_compute and emptied only here and in the exceptional
 // exit on that same thread, so nothing else can observe it half-moved.  The one
@@ -108960,10 +108976,10 @@ static void ggml_sycl_graph_staged_owners_publish(ggml_backend_sycl_context * ct
 // The exit of every graph_compute call, on every return path.  It runs the
 // steps that keep a graph's transient holders from outliving it, so no tenant
 // slice stays parked in a thread-local or per-context structure past the call
-// (zhcn-design §3.1.1: C2t, C5a, C6, C13).
+// (zhcn-design §3.1.1).
 //
-//  * C2t: an EAGER call flushes every thread-local MoE scatter and CPU-expert
-//    list (zhcn-design 3.1.1 C2t).  A RECORDING call is exempt: CPU-expert
+//  * Pending scatter work: an EAGER call flushes every thread-local MoE scatter
+//    and CPU-expert list.  A RECORDING call is exempt: CPU-expert
 //    dispatch is off while a graph records (ggml_sycl_cpu_offload_active_for_compute
 //    reads the recording state), so its four lists are empty at the exit and it
 //    waits for nothing.  Non-empty lists at a recording exit mean a producer ran
@@ -108971,15 +108987,16 @@ static void ggml_sycl_graph_staged_owners_publish(ggml_backend_sycl_context * ct
 //    so a scatter is never skipped, and that drain is the only wait a recording
 //    call can reach.  (The three MoE segment recorders turn the flag off between
 //    their segments, so CPU work they run there is eager work: it is drained
-//    here, and its WARN is what a producer inside a recording looks like too.)
-//    The eager flush is itself a host wait, which principle P4 forbids; the spec
-//    keeps it for now (it is the base's own end-of-graph fence), and
-//    llama.cpp-flv8 tracks replacing it by an event chain.
-//  * C5a: the activation-keyed MoE maps are dropped now, not at the next graph's
-//    start (they hold only identities, so this is the extra measure 3.1.1 allows).
-//  * C6: the data-pointer cache is dropped likewise, and the staged owners go to
+//    here, and its WARN is what a producer inside a recording looks like too.
+//    That false WARN, a known hazard rather than intended behaviour, is
+//    llama.cpp-b7l2.)  The eager flush is itself a host wait, which principle P4
+//    forbids; the spec keeps it for now (it is the base's own end-of-graph fence),
+//    and llama.cpp-flv8 tracks replacing it by an event chain.
+//  * The activation-keyed MoE maps are dropped now, not at the next graph's
+//    start (they hold only identities, so this is the extra measure the design allows).
+//  * The data-pointer cache is dropped likewise, and the staged owners go to
 //    the retained store.
-//  * C13: staging entries that are tenant slices are released on an eager exit.
+//  * Staging entries that are tenant slices are released on an eager exit.
 //    A recording call keeps them: the graph it recorded has their addresses baked in.
 //
 // `recorded_call` is true when a command graph began recording on this thread
