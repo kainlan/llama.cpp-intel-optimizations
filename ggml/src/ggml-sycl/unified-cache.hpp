@@ -6442,7 +6442,7 @@ class ggml_sycl_replan_token {
 // A watchdog for a wait that has no timeout of its own (a queue wait, the L0
 // acquire).  It never abandons or forces anything: after the interval it logs a
 // WARN naming the wait now in progress, and again each further interval, while
-// the wait itself carries on; under GGML_SYCL_STRICT it aborts at the first
+// the wait itself carries on; under GGML_SYCL_STRICT_LEASES=1 it aborts at the first
 // interval instead.  The interval is 60 s, or GGML_SYCL_REPLAN_WAIT_WARN_MS.
 // site() names the wait that follows (a string literal, or storage that outlives
 // the watch).  One watch covers a whole sequence of waits, so a rare path pays

@@ -2724,7 +2724,7 @@ ggml_sycl_wait_watch::ggml_sycl_wait_watch(const char * what) : what_(what) {
             GGML_LOG_WARN("[REPLAN-WAIT] %s has waited %u x %u ms, now at: %s (the wait continues)\n", what_, n,
                           static_cast<unsigned>(interval.count()), site_.load(std::memory_order_acquire));
             if (ggml_sycl_strict_enabled()) {
-                GGML_ABORT("[REPLAN-WAIT] %s exceeded %u ms under GGML_SYCL_STRICT, now at: %s", what_,
+                GGML_ABORT("[REPLAN-WAIT] %s exceeded %u ms under GGML_SYCL_STRICT_LEASES=1, now at: %s", what_,
                            static_cast<unsigned>(interval.count()), site_.load(std::memory_order_acquire));
             }
         }
@@ -2826,7 +2826,7 @@ void ggml_sycl_replan_token::acquire(ggml_sycl_replan_kind kind, bool try_only) 
                 static_cast<unsigned long long>(g_replan_holder_thread.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(ggml_sycl_this_thread_tag()));
             if (ggml_sycl_strict_enabled()) {
-                GGML_ABORT("[REPLAN-WAIT] a %s acquire of L0 exceeded %u ms under GGML_SYCL_STRICT",
+                GGML_ABORT("[REPLAN-WAIT] a %s acquire of L0 exceeded %u ms under GGML_SYCL_STRICT_LEASES=1",
                            ggml_sycl_replan_kind_name(kind), static_cast<unsigned>(interval.count()));
             }
         }
