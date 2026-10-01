@@ -90756,7 +90756,8 @@ class ggml_sycl_block_exec_dense_run {
         // range reads its staged copy.
         // A staging failure declines recording (the ranges would read a host-resident input inside a recording)
         // and the step runs on the per-op path.
-        if (any_missing && !graph_prestage_or_decline(&ctx_, cgraph_, key)) {
+        if (any_missing &&
+            !graph_prestage_or_decline(&ctx_, cgraph_, graph_prestage_decline_memo::dense_split_key(key))) {
             graphs_off_ = ggml_sycl::DENSE_GRAPH_OFF_STAGE_FAILED;
             return;
         }
@@ -99774,12 +99775,14 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
 // afresh, and the memo forgets a signature after a bounded number of skipped tokens so a transient failure
 // recovers (graph-prestage-decline-memo.hpp). Every recorder must come through here: calling the pre-stage as a
 // statement ignores its failure.
-static bool graph_prestage_declined(ggml_backend_sycl_context * ctx, uint64_t graph_hash) {
+// Counts this token against a held decline (it MUTATES the memo): true means skip the pre-stage and run direct,
+// and the retry_after-th ask forgets the decline and answers false so the pass is re-decided.
+static bool graph_prestage_skip_declined(ggml_backend_sycl_context * ctx, uint64_t graph_hash) {
     return ctx != nullptr && ctx->prestage_decline_memo.skip(graph_hash);
 }
 
 static bool graph_prestage_or_decline(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, uint64_t graph_hash) {
-    if (graph_prestage_declined(ctx, graph_hash)) {
+    if (graph_prestage_skip_declined(ctx, graph_hash)) {
         return false;
     }
     if (graph_prestage_leaf_tensors(ctx, cgraph)) {
@@ -107769,7 +107772,8 @@ normal_dispatch:
 
         // A graph whose inputs could not be staged onto the device was declined for recording
         // (graph_prestage_or_decline): keep running it directly without rebuilding the recording state first.
-        if (!sycl_ctx->exec_graph && graph_prestage_declined(sycl_ctx, graph_hash)) {
+        // The ask counts this token against the decline (the memo forgets it after retry_after of them).
+        if (!sycl_ctx->exec_graph && graph_prestage_skip_declined(sycl_ctx, graph_hash)) {
             compute_impl_unlocked();
             record_completion(false);
             return GGML_STATUS_SUCCESS;
@@ -108005,6 +108009,14 @@ normal_dispatch:
             GGML_SYCL_DEBUG("[SYCL-GRAPH] re-record + update (%s)...\n",
                             sycl_ctx->moe_graph_rerecord ? "MoE selective" : "rerecord_mode");
             g_graph_diag_counters.rerecord_attempts.fetch_add(1, std::memory_order_relaxed);
+            // Decide whether the inputs can be staged BEFORE tearing anything down: a transient staging failure
+            // must not destroy the live exec graph (the last replay may still have it in flight) or leave its pins
+            // and hash stale. A declined graph runs on the direct path and the graph stays as it was.
+            if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
+                compute_impl_unlocked();
+                record_completion(false);
+                return GGML_STATUS_SUCCESS;
+            }
             sycl_ctx->exec_graph.reset();
             sycl_exec_graph_release_pool_retained(sycl_ctx);
             sycl_ctx->active_exec_graph.valid = false;
@@ -108029,13 +108041,7 @@ normal_dispatch:
                 sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()),
                                                         { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
 
-                // Pre-stage leaf tensors (ensures input data is on device before recording). A graph whose
-                // inputs cannot be staged is not recorded: the direct path runs it instead.
-                if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
-                    compute_impl_unlocked();
-                    record_completion(false);
-                    return GGML_STATUS_SUCCESS;
-                }
+                // Input data is already on device (pre-staged above, before the teardown).
                 // Refresh input tensor data (token IDs etc.) on stable device staging
                 graph_refresh_input_tensors(sycl_ctx, cgraph);
 

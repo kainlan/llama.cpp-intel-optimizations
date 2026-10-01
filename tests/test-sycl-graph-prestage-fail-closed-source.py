@@ -221,7 +221,9 @@ def evaluate(backend, common, memo_hdr):
         r"sycl_ctx->invalidate_moe_segments\(\);", compute) is not None
     exit_direct = r"compute_impl_unlocked\(\);\s*record_completion\(false\);\s*return GGML_STATUS_SUCCESS;\s*\}"
     rerecord_at = compute.find("re-record + update (%s)")
-    rr_decline = re.search(site + exit_direct, compute[rerecord_at:]) if rerecord_at >= 0 else None
+    # the FIRST pre-stage after the re-record anchor, matched from its own `if` (a later site must not satisfy it)
+    rr_call = compute.find("graph_prestage_or_decline(", rerecord_at) if rerecord_at >= 0 else -1
+    rr_decline = re.match(site + exit_direct, compute[compute.rfind("if", 0, rr_call):]) if rr_call >= 0 else None
     results["site 5, full re-record: declines and leaves for the direct path"] = rr_decline is not None
     first_at = compute.find("Pre-staging leaf tensors before recording")
     results["site 6, full first record: declines and leaves for the direct path"] = \
@@ -232,7 +234,7 @@ def evaluate(backend, common, memo_hdr):
     # flight, nor leave its pins and hash stale.
     teardown = compute.find("exec_graph.reset()", rerecord_at) if rerecord_at >= 0 else -1
     results["re-record decides the decline before tearing the live graph down"] = \
-        rr_decline is not None and teardown >= 0 and rerecord_at + rr_decline.start() < teardown
+        rr_decline is not None and teardown >= 0 and rr_call < teardown
     return results
 
 

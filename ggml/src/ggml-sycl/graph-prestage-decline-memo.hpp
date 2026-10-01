@@ -12,7 +12,13 @@
 //
 // A decline is not permanent. A structural one (an input that is host-resident for this placement) will decline
 // again, at the cost of one pass; a transient one (a staging allocation that failed under memory pressure)
-// recovers. After retry_after skipped tokens the memo forgets the signature, so the next token re-decides.
+// recovers. Asking skip() about a held signature answers "skip" retry_after - 1 times; the retry_after-th ask
+// forgets the signature and answers "decide", so one token in retry_after re-runs the pass.
+//
+// Two key spaces feed the memo. Every recorder but one keys by ggml_sycl_graph_signature(cgraph); the dense
+// split recorder keys by its own plan hash (graphs_key()). They are different hash functions over different
+// inputs, so the dense one goes through dense_split_key(): a collision between the spaces is then a 2^-64 event
+// rather than a structural overlap.
 //
 // Pure C++, so a host test can pin the retry and capacity behaviour.
 //
@@ -37,6 +43,9 @@ struct graph_prestage_decline_memo {
         uint64_t hash  = 0;
         uint32_t skips = 0;
     };
+
+    // Tag for the dense split recorder's plan hash, so it cannot be mistaken for a graph signature.
+    static uint64_t dense_split_key(uint64_t graphs_key) { return graphs_key ^ 0xD5E5B11700DECA11ULL; }
 
     std::vector<entry> entries;
 
@@ -64,7 +73,8 @@ struct graph_prestage_decline_memo {
     }
 
     // One token asks whether `hash` is still declined. True means skip the pass. The retry_after-th ask forgets
-    // the signature and answers false, so the caller re-decides on this token.
+    // the signature and answers false, so the caller re-decides on this token. This MUTATES the memo (it counts
+    // the ask), which is why the backend wrapper is called graph_prestage_skip_declined.
     bool skip(uint64_t hash) {
         for (size_t i = 0; i < entries.size(); ++i) {
             if (entries[i].hash != hash) {

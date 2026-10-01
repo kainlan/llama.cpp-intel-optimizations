@@ -2227,6 +2227,18 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx,
     GGML_UNUSED(ctx);
 }
 
+// A host-resident weight reached device GET_ROWS, which does not stream host weights: placement decides the executor
+// (a host-resident weight runs on the CPU) and supports_op declines weights planned on host. What gets here is a
+// weight the cache tiered to host AFTER placement (weights-evictable mode, under pressure). The refusal is the
+// right shape -- a missing executor path is a support gap, not a reason to stream -- but it has to say so.
+[[noreturn]] static void get_rows_host_weight_unsupported(const ggml_tensor * src0) {
+    GGML_LOG_ERROR(
+        "%s: %s (%s) was tiered to host after placement; device GET_ROWS cannot stream host weights "
+        "(placement decides the executor); see llama.cpp-iqzl\n",
+        __func__, src0->name[0] != '\0' ? src0->name : "(unnamed)", ggml_type_name(src0->type));
+    GGML_ABORT("GET_ROWS: weight tiered to host after placement");
+}
+
 static void ggml_sycl_get_rows_dispatch_slice(ggml_backend_sycl_context & ctx,
                                               const ggml_tensor *         src0,
                                               const ggml_tensor *         src1,
@@ -2303,8 +2315,7 @@ static void ggml_sycl_get_rows_dispatch_slice(ggml_backend_sycl_context & ctx,
         // No Q4_K arm: this dispatcher serves the host-resident DMA path, and supports_op declines host-planned
         // weights (placement decides the executor), so Q4_K never streams. The abort below is the backstop.
         default:
-            GGML_LOG_ERROR("%s: unsupported type for streaming: %s\n", __func__, ggml_type_name(src0->type));
-            GGML_ABORT("fatal error");
+            get_rows_host_weight_unsupported(src0);
     }
 }
 
@@ -2595,6 +2606,13 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
         } else {
             layout_base = cache_view.ptr;
         }
+    }
+
+    // Q4_K has no streaming path (the kernel reads AoS blocks from the device). A Q4_K weight the cache has tiered
+    // to host since placement is refused here, with the reason, before any stream segment is built and before the
+    // kernel could read host memory through a stale pointer.
+    if (src0->type == GGML_TYPE_Q4_K && cache_view_valid && cache_view.location != ggml_sycl::cache_location::DEVICE) {
+        get_rows_host_weight_unsupported(src0);
     }
 
     src1_i32 = (const int32_t *) ggml_sycl_resolve_tensor_ptr(dst->src[1], device);

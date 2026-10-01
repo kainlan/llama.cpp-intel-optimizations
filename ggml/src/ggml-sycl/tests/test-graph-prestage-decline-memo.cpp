@@ -89,6 +89,15 @@ int main() {
         CHECK(memo.contains(graph_prestage_decline_memo::max_entries + 1), "the newest signature is held");
     }
 
+    // The dense split recorder's plan hash is tagged so it cannot collide with a graph signature of the same value.
+    {
+        graph_prestage_decline_memo memo;
+        memo.remember(graph_prestage_decline_memo::dense_split_key(42));
+        CHECK(graph_prestage_decline_memo::dense_split_key(42) != 42, "the dense key differs from the raw value");
+        CHECK(!memo.contains(42), "a graph signature equal to a dense plan hash is not declined by it");
+        CHECK(memo.contains(graph_prestage_decline_memo::dense_split_key(42)), "the dense key itself is held");
+    }
+
     std::printf("ok\n");
     return 0;
 }
