@@ -676,6 +676,34 @@ def evaluate(backend, common, cache, zone):
             re.findall(r"#\s*if[^\n]*", op_body[:at])[-1:] == ["#if GGML_SYCL_DEQUANT_F16_ARM"] or
             re.findall(r"#\s*if[^\n]*", op_body[:at])[-1:] == ["#    if GGML_SYCL_DEQUANT_F16_ARM"]
             for at in dq_calls)
+
+    # r3 design change (hardware: a 460-512 MB compute buffer spilled to RAW device memory, outside the arena, ate the
+    # driver headroom): a compute buffer the RUNTIME zone will not serve (held back by the hold, or the zone is full)
+    # is placed in the arena's KV zone first; raw device memory is the last resort. The decision is made in the
+    # allocator, ahead of the overcommit guard (an in-arena placement cannot overcommit the device), so the hold's
+    # spill is attributed to where it actually landed.
+    ua = unified_alloc_fn
+    pred_at = ua.find("zone_runtime_spill_prefers_kv_zone(")
+    kv_at = ua.find("zone_alloc(vram_zone_id::KV")
+    guard_at = ua.find("unified_alloc_total_vram(")
+    raw_at = ua.find("unified_cache_malloc_device_tracked(")
+    results["a compute buffer the RUNTIME zone will not serve tries the KV zone before the overcommit guard and raw memory"] = \
+        0 <= pred_at < kv_at < guard_at < raw_at and "spill_to_kv_zone_before_raw" in ua and \
+        re.search(r"zone_runtime_spill_prefers_kv_zone\([^;]*zone_available\(\s*vram_zone_id::KV\s*\)", ua) is not None
+    results["a placement in the KV zone is skipped by the guard and the zone routing, and counts as an in-arena hold spill"] = \
+        re.search(r"unified_cache_note_planned_hold_spill\([^;]*/\*in_arena=\*/\s*true", ua) is not None and \
+        re.search(r"unified_cache_note_planned_hold_spill\([^;]*/\*in_arena=\*/\s*false", ua) is not None and \
+        len(re.findall(r"!\s*kv_placed", ua)) >= 2 and "kv_placed" in ua
+    kv_flag_site = backend.find('"backend-buffer-runtime-zone"')
+    results["the runtime buffer allocator asks for the KV-zone-first placement"] = \
+        kv_flag_site > 0 and "spill_to_kv_zone_before_raw = true" in backend[kv_flag_site:kv_flag_site + 900]
+    results["the hold-spill counters are split by where the buffer landed (raw outside the arena, KV zone)"] = \
+        "in_arena" in note_spill_fn and "spill_arena_bytes" in cache and "recent_arena_bytes" in cache and \
+        "hold_spills_raw=" in stats_fn and "hold_spills_kv_zone=" in stats_fn
+    results["the realized check counts only the raw outside-arena portion"] = \
+        "raw_bytes" in realized_fn and "arena_bytes" not in realized_fn
+    results["the transaction-time bound is the part of the worst-case spill the KV zone cannot take"] = \
+        "zone_hold_spill_raw_demand(" in bound_fn and "zone_available(ggml_sycl::vram_zone_id::KV)" in bound_fn
     return results
 
 

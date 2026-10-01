@@ -927,6 +927,45 @@ int main() {
               "an unknown candidate n_ubatch is not scaled");
     }
 
+    // ---- Case 18: only the part of the worst-case spill that the arena's KV zone cannot take is OUTSIDE-arena
+    // demand (kpjw r3 design change). A compute buffer the RUNTIME zone will not serve is placed in the KV zone
+    // first; raw device memory is the last resort. -------------------------------------------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(536 * MiB, 600 * MiB) == 0,
+              "a bound the KV zone can hold entirely is no outside-arena demand");
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(536 * MiB, 300 * MiB) == 236 * MiB,
+              "the KV zone takes what it can, the rest is raw");
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(536 * MiB, 0) == 536 * MiB,
+              "a full KV zone leaves the whole bound outside the arena");
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(536 * MiB, 536 * MiB) == 0,
+              "an exact fit is not a spill");
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(0, 100 * MiB) == 0, "no bound, no demand");
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(SIZE_MAX, 1) == SIZE_MAX - 1,
+              "a saturated bound minus the KV room stays huge, never wraps small");
+    }
+
+    // ---- Case 19: which RUNTIME-zone requests go to the KV zone before raw memory. Only a compute-buffer
+    // request (the caller's flag), spill-capable, that the RUNTIME zone will not serve, and only when the KV zone
+    // can hold it whole. Every other request class keeps today's path. -------------------------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, true, false, true, 600 * MiB, 460 * MiB),
+              "a held-back or zone-full compute buffer that the KV zone can hold goes there");
+        CHECK(!ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, true, false, true, 400 * MiB, 460 * MiB),
+              "a KV zone too small for it is no placement: the raw path decides");
+        CHECK(!ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, true, false, false, 600 * MiB, 460 * MiB),
+              "a request the RUNTIME zone serves stays in the RUNTIME zone");
+        CHECK(!ggml_sycl::zone_runtime_spill_prefers_kv_zone(false, true, false, true, 600 * MiB, 460 * MiB),
+              "a request that is not a compute buffer keeps the pre-existing spill path");
+        CHECK(!ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, false, false, true, 600 * MiB, 460 * MiB),
+              "only the RUNTIME zone's misses are redirected");
+        CHECK(!ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, true, true, true, 600 * MiB, 460 * MiB),
+              "a forbid-spill claimant is refused, never placed elsewhere");
+        CHECK(ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, true, false, true, 460 * MiB, 460 * MiB),
+              "an exact fit in the KV zone is a fit");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
