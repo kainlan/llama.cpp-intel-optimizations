@@ -1419,17 +1419,32 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_c
     bool                                   flash_attn_enabled,
     const ggml_sycl_runtime_context_desc * desc);
 
-// Would publishing candidate need a transaction?  Read-only: it publishes
-// nothing, prepares no live update and takes no replan lock.  It reads, in one
-// section under the registry's leaf mutex, this context's own entry: its tenant
-// key, its slots and whether the table is installed.  Fail-closed: a null or
-// non-SYCL backend, a null candidate, an unknown version, a context with no
-// published entry, and any malformed element all answer GROWTH.  COVERED is
-// answered only when every candidate slot has a published slot at the same
-// (device, cohort, slot_index) with at least its bytes.
+// Would publishing this geometry and candidate need a transaction?  Read-only:
+// it publishes nothing, prepares no live update and takes no replan lock.  It
+// reads, in one section under the registry's leaf mutex, this context's own
+// entry: its published geometry, its tenant key, its slots and whether the
+// table is installed.  The geometry arguments are the publish's own and mean
+// the same: KV coverage depends on n_ctx, n_seq_max, kv_unified and swa_full,
+// and the compute and tenant demand on n_ubatch and flash_attn_enabled, so an
+// answer that could not see them would be about a different shape.  There is
+// no model token: the entry already names its model, and a read has nothing
+// to bind.  Fail-closed: a null or non-SYCL backend, a null candidate, an
+// unknown version, a context with no published entry, a geometry that
+// differs from the published one in any way that raises a demand, and any
+// malformed element all answer GROWTH.  COVERED is answered only when the
+// geometry demands no more than the published one and every candidate slot
+// has a published slot at the same (device, cohort, slot_index) with at
+// least its bytes.  EQUAL is answered only when geometry and every slot are
+// byte-equal.
 // Proc name: "ggml_backend_sycl_tenant_coverage".
 GGML_BACKEND_API enum ggml_sycl_tenant_coverage ggml_backend_sycl_tenant_coverage(
     ggml_backend_t                         backend,
+    uint32_t                               n_ctx,
+    uint32_t                               n_ubatch,
+    uint32_t                               n_seq_max,
+    bool                                   kv_unified,
+    bool                                   swa_full,
+    bool                                   flash_attn_enabled,
     const ggml_sycl_runtime_context_desc * candidate);
 
 // The late measure of a load, handed to the backend after the dev_layer sync
