@@ -9,12 +9,13 @@
 //       a longer caller struct read to the v1 size only;
 //   (b) malformed records are absent with a reason: a null array under count > 0, a
 //       count above the cap;
+//   (b2) a present value other than 0 or 1 is malformed;
 //   (c) device out of range, with the boundary accepted;
 //   (d) the arrays are copied, not pointed at;
 //   (e) consume once; a stale record under another tag; tag 0 and a null record are
 //       no-ops that leave a pending record alone; the slot is per thread;
 //   (f) the holder serves one record to every read in its scope, is empty after, and
-//       restores the enclosing holder.
+//       restores the enclosing holder, and an exception unwinds through it cleanly.
 // Arm (g), that the export body and the dry-run are each one call of the converter,
 // is a source-token check and lives in the F8 gate with the export (L4 step 3).
 //
@@ -133,6 +134,21 @@ void arm_b_malformed() {
         CHECK(host_create_record_from_wire(&f.wire, &out, &why) == host_create_wire_status::PRESENT,
               "b: control: the same struct at count 2 is fine");
     }
+}
+
+void arm_b2_present_values() {
+    host_create_record out;
+    std::string        why;
+    wire_fixture       f;
+    for (uint32_t v : { 2u, 3u, 0x100u, 0xFFFFFFFFu }) {
+        f.wire.present = v;
+        CHECK(host_create_record_from_wire(&f.wire, &out, &why) == host_create_wire_status::MALFORMED && !out.present &&
+                  why.find("present") != std::string::npos,
+              "b2: a present value other than 0 or 1 is malformed, never read as present");
+    }
+    f.wire.present = 1;
+    CHECK(host_create_record_from_wire(&f.wire, &out, &why) == host_create_wire_status::PRESENT,
+          "b2: control: present = 1 is fine");
 }
 
 void arm_c_device_range() {
@@ -261,6 +277,27 @@ void arm_f_holder() {
     }
     CHECK(host_create_stage_holder::current() == nullptr, "f: the holder is gone after the stage");
 
+    // An exception unwinding through nested stages leaves no holder behind: the outer is
+    // restored by the inner's destructor and then removed by its own.
+    {
+        wire_fixture outer;
+        CHECK(host_create_pending_set(&outer.wire, 71, &why), "f: publish for the outer stage");
+        bool caught = false;
+        try {
+            host_create_stage_holder outer_stage(71);
+            wire_fixture             inner;
+            inner.device[0] = 3;
+            CHECK(host_create_pending_set(&inner.wire, 72, &why), "f: publish for the inner stage");
+            host_create_stage_holder inner_stage(72);
+            CHECK(host_create_stage_holder::current() == &inner_stage, "f: the inner stage is current");
+            throw 42;
+        } catch (int) {
+            caught = true;
+        }
+        CHECK(caught, "f: the exception reached the catch");
+        CHECK(host_create_stage_holder::current() == nullptr, "f: an unwound stage leaves no holder behind");
+    }
+
     // A stage with nothing published holds absent, with the reason.
     {
         host_create_stage_holder stage(63);
@@ -274,6 +311,7 @@ int main() {
     arm_a_short_struct_size();
     arm_a2_other_absents();
     arm_b_malformed();
+    arm_b2_present_values();
     arm_c_device_range();
     arm_d_arrays_are_copied();
     arm_e_consume_once();

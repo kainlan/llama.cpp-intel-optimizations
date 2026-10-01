@@ -45,11 +45,12 @@ struct host_create_record {
 };
 
 // An opaque candidate identity (the bound candidate's token); 0 = none.
-typedef uintptr_t host_create_tag;
+using host_create_tag = uintptr_t;
 
-// v1 is the only version: the struct as this tree declares it.
-static constexpr uint32_t HOST_CREATE_RECORD_V1_SIZE = (uint32_t) sizeof(ggml_sycl_host_create_record);
-static_assert(sizeof(void *) != 8 || HOST_CREATE_RECORD_V1_SIZE == 32, "the v1 wire layout is 32 bytes on LP64");
+// v1 is the only version: 32 bytes, as ggml_sycl_host_create_record declares it on LP64.
+static constexpr uint32_t HOST_CREATE_RECORD_V1_SIZE = 32;
+static_assert(sizeof(ggml_sycl_host_create_record) == HOST_CREATE_RECORD_V1_SIZE,
+              "the v1 wire layout is 32 bytes; a layout change is a new version, not an edit of v1");
 
 // More entries than any real load creates; a larger count is a garbage struct.
 static constexpr uint64_t HOST_CREATE_RECORD_MAX_COUNT = 1ull << 22;
@@ -57,7 +58,7 @@ static constexpr uint64_t HOST_CREATE_RECORD_MAX_COUNT = 1ull << 22;
 enum class host_create_wire_status {
     PRESENT,    // a well-formed present record
     ABSENT,     // null, a short struct, or present == 0
-    MALFORMED,  // present but unusable; `why` names it
+    MALFORMED,  // present but unusable (present not 0 or 1, a bad count or device); `why` names it
 };
 
 // The only parser of the wire struct: the export body and the 7v5c-2 dry-run both
@@ -86,6 +87,11 @@ inline host_create_wire_status host_create_record_from_wire(const ggml_sycl_host
     }
     if (wire->present == 0) {
         return refuse(host_create_wire_status::ABSENT, "record not present");
+    }
+    // present is 0 or 1; any other value is a garbage struct, not a record.
+    if (wire->present != 1) {
+        return refuse(host_create_wire_status::MALFORMED,
+                      "present is " + std::to_string(wire->present) + ", expected 0 or 1");
     }
     if (wire->count > HOST_CREATE_RECORD_MAX_COUNT) {
         return refuse(host_create_wire_status::MALFORMED, "count " + std::to_string(wire->count) +
@@ -195,6 +201,12 @@ inline host_create_record host_create_pending_take(host_create_tag tag, std::str
 // The stage-scoped holder: takes the pending record once at construction, serves
 // it to every read inside the scope, restores the enclosing holder on exit.  The
 // per-device populates call current() and share one record.
+//
+// Holders are strictly LIFO and must be destroyed on the thread that constructed
+// them: the current-holder pointer is thread_local and a holder restores its
+// predecessor, so destroying out of order, or on another thread, leaves a dangling
+// pointer behind.  Scope them as automatic variables; the destructor also runs when
+// an exception unwinds the stage, so a thrown stage leaves no holder behind.
 class host_create_stage_holder {
   public:
     explicit host_create_stage_holder(host_create_tag tag) : previous_(current_slot()) {
