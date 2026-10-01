@@ -23,7 +23,8 @@
 // The queues are the backend's own, not queues this test constructs: the owner's is the exposed device 0's
 // ggml_backend_sycl_context::stream(), the call the SET_ROWS stage makes, and the source's is
 // ggml_sycl::get_shared_context_queue(1), the per-device single-device-context queue the MoE and split paths
-// use for a secondary card. Neither path builds a multi-device Level Zero context, which is the DEVICE_LOST
+// use for a secondary card, created in this process by ggml_sycl::init_shared_context_queues() (the call
+// those paths make; nothing else creates them, so a bare get returns null). Neither path builds a multi-device Level Zero context, which is the DEVICE_LOST
 // risk on compute-runtime 26.x. The scheduler exposes only device 0 by default ("Multi-GPU: exposing only
 // device 0 to scheduler"), so ggml_backend_sycl_get_device_count() is 1 on a two-card host and
 // ggml_backend_sycl_init(1) is not available: the probe counts PHYSICAL devices through
@@ -122,6 +123,9 @@ int main(int, char ** argv) {
         std::printf("FAIL: ggml_backend_sycl_init(0) failed on a host that reports two physical devices\n");
         return 1;
     }
+    // The queues are created lazily by the MoE and split paths, so a standalone process creates them the way
+    // those paths do: init_shared_context_queues(total_gpu_count), one single-device context per card.
+    ggml_sycl::init_shared_context_queues(physical_devices);
     sycl::queue * q_source_ptr = ggml_sycl::get_shared_context_queue(1);
     if (q_source_ptr == nullptr) {
         std::printf("FAIL: no shared-context queue for physical device 1\n");

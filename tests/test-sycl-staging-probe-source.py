@@ -36,6 +36,14 @@ def violations(text: str) -> list:
         out.append("device 1 is initialised as a scheduler backend, which is absent in the default mode")
     if "ggml_sycl::get_shared_context_queue(1)" not in code:
         out.append("the source queue is not the per-device shared-context queue of device 1")
+    # The shared-context queues exist only once init_shared_context_queues() has run (the MoE and split
+    # paths' lazy creator), so the probe calls it with the physical count BEFORE fetching device 1's queue.
+    init = re.search(r"ggml_sycl::init_shared_context_queues\s*\(\s*physical_devices\s*\)", code)
+    get = re.search(r"ggml_sycl::get_shared_context_queue\s*\(\s*1\s*\)", code)
+    if init is None:
+        out.append("the shared-context queues are fetched without init_shared_context_queues(physical_devices)")
+    elif get is not None and init.start() > get.start():
+        out.append("init_shared_context_queues() runs after the queue fetch")
     if re.search(r"physical_devices\s*<\s*2", code) is None:
         out.append("the skip does not compare the physical count against two")
     return out
@@ -45,6 +53,13 @@ def mutants_of(text: str) -> dict:
     return {
         "skip on the scheduler count": replace_last(text, "physical_devices < 2 ||", "ggml_backend_sycl_get_device_count() < 2 ||"),
         "device 1 as a backend": replace_last(text, "ggml_sycl::get_shared_context_queue(1)", "ggml_backend_sycl_init(1)"),
+        "queue fetched without being created": replace_last(
+            text, "ggml_sycl::init_shared_context_queues(physical_devices);", ""),
+        "queue created after the fetch": replace_last(
+            replace_last(text, "ggml_sycl::init_shared_context_queues(physical_devices);", ""),
+            "sycl::queue * q_source_ptr = ggml_sycl::get_shared_context_queue(1);",
+            "sycl::queue * q_source_ptr = ggml_sycl::get_shared_context_queue(1);\n"
+            "    ggml_sycl::init_shared_context_queues(physical_devices);"),
         "no physical count": replace_last(text, "ggml_sycl::test_physical_device_count()", "2"),
     }
 
