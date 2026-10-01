@@ -411,6 +411,13 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mmq-src1-plan-source.py
             --self-test)
     set_tests_properties(sycl-mmq-src1-plan-source PROPERTIES LABELS "sycl;memory;planner;host;source-contract")
+    # llama.cpp-qhfp: CONCAT is graph-recordable. --self-test: six of its checks are absence-based (no host
+    # wait, no recording-flag branch, no allocation, no CONCAT rejection) and pass on any tree that never had
+    # the thing they forbid.
+    add_test(NAME sycl-concat-graph-recordable-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-concat-graph-recordable-source.py
+            --self-test)
+    set_tests_properties(sycl-concat-graph-recordable-source PROPERTIES LABELS "sycl;graph;host;source-contract")
     # --self-test likewise: eight of this gate's checks are absence-based, and
     # the construct they forbid -- max(planned, required), the general temporary
     # fallback, admission after the lock, a debug-gated refusal warning -- is
