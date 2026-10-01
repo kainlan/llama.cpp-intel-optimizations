@@ -5356,7 +5356,7 @@ set_tests_properties(graph-safe-memcpy-width PROPERTIES
 )
 
 # Test: SYCL GET_ROWS Q4_K element decode against ggml's reference, plus the support predicate
-# (llama.cpp-qhfp). Host-only: get-rows-q4-k.hpp and get-rows-support.hpp include no SYCL header, so the
+# (llama.cpp-qhfp). Host-only: get-rows-kquant.hpp and get-rows-support.hpp include no SYCL header, so the
 # device kernel's decode function runs here unchanged. ggml-base supplies the reference quantiser.
 add_executable(test-get-rows-q4-k
     tests/test-get-rows-q4-k.cpp

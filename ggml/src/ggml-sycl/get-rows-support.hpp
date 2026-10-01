@@ -34,3 +34,19 @@ inline bool ggml_sycl_get_rows_type_supported(ggml_type type) {
             return false;
     }
 }
+
+// The (type, layout) pairs a GET_ROWS kernel covers: the layouts the type's kernels can read. supports_op asks it
+// with the layout the placement plan materialises the weight in, so a pair no kernel covers is declined before
+// placement routes the op, rather than aborting at dispatch.
+//
+// Q4_K has an AoS kernel only. layout_policy::get_optimal returns AoS for Q4_K for every usage (its MMQ kernels
+// are AoS-only), so AoS is the one layout the planner materialises; a Q4_K table in any other layout is a pair
+// this function declines. Every other type keeps the arms it already had.
+inline bool ggml_sycl_get_rows_layout_supported(ggml_type type, ggml_layout_mode layout) {
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+            return layout == GGML_LAYOUT_AOS;
+        default:
+            return true;
+    }
+}

@@ -109449,7 +109449,16 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             // One predicate (get-rows-support.hpp) for the types ggml_sycl_op_get_rows computes. A type declined
             // here runs in a CPU split whose output a SYCL op reads out of pinned host memory, and a graph with
             // that read cannot be recorded (llama.cpp-qhfp: qwen35's q4_K token_embd.weight).
-            return ggml_sycl_get_rows_type_supported(op->src[0]->type);
+            if (!ggml_sycl_get_rows_type_supported(op->src[0]->type)) {
+                return false;
+            }
+            {
+                // (type, layout): the kernels read the layout the plan materialised the table in. A pair none
+                // covers is declined here, before placement routes it; the dispatch arm's abort is a backstop.
+                ggml_layout_mode planned_layout = GGML_LAYOUT_AOS;
+                (void) ggml_sycl_get_planned_weight_layout(op->src[0], device, &planned_layout);
+                return ggml_sycl_get_rows_layout_supported(op->src[0]->type, planned_layout);
+            }
         case GGML_OP_SET:
             return (op->type == GGML_TYPE_F32) && (op->src[0] && op->src[1]) && (op->src[0]->type == GGML_TYPE_F32) &&
                    (op->src[1]->type == GGML_TYPE_F32);

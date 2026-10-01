@@ -14,7 +14,7 @@
 
 #include "common.hpp"
 #include "dequantize.hpp"
-#include "get-rows-q4-k.hpp"
+#include "get-rows-kquant.hpp"
 #include "ggml-backend.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu/ops.h"
@@ -1112,7 +1112,7 @@ static void get_rows_q6_k_aos_sycl(ggml_backend_sycl_context & ctx,
 }
 
 // Q4_K AoS kernel for GET_ROWS (llama.cpp-qhfp). One work-item per output element along dim 0, decoded through
-// ggml_sycl_get_rows_q4_k_elem (get-rows-q4-k.hpp), the function tests/test-get-rows-q4-k.cpp checks against
+// ggml_sycl_get_rows_q4_k_elem (get-rows-kquant.hpp), the function tests/test-get-rows-q4-k.cpp checks against
 // ggml's own dequantize_row_q4_K. Embedding tables are materialised AoS (the layout policy's EMBEDDING rule), so
 // this is the only layout the kernel reads; the op refuses any other before launching.
 template <typename dst_t>
@@ -2301,7 +2301,7 @@ static void ggml_sycl_get_rows_dispatch_slice(ggml_backend_sycl_context & ctx,
             }
             break;
         case GGML_TYPE_Q4_K:
-            if (layout != GGML_LAYOUT_AOS) {
+            if (!ggml_sycl_get_rows_layout_supported(GGML_TYPE_Q4_K, layout)) {
                 GGML_LOG_ERROR("%s: Q4_K GET_ROWS reads the AoS layout only, got layout %d\n", __func__, (int) layout);
                 GGML_ABORT("fatal error");
             }
@@ -3168,10 +3168,10 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
             break;
         case GGML_TYPE_Q4_K:
             {
-                // The kernel reads AoS blocks. Embedding tables are materialised AoS, and a table in any other
-                // layout is a loaded-layout fact this kernel does not cover: refuse it rather than decode
-                // reordered bytes as AoS blocks.
-                if (layout != GGML_LAYOUT_AOS) {
+                // The kernel reads AoS blocks, the one layout the planner materialises for Q4_K. supports_op
+                // declines any other (type, layout) pair before placement routes it, so this is a backstop that
+                // should never run; it refuses rather than decode reordered bytes as AoS blocks.
+                if (!ggml_sycl_get_rows_layout_supported(GGML_TYPE_Q4_K, layout)) {
                     GGML_LOG_ERROR("%s: Q4_K GET_ROWS has no kernel for layout %d (tensor %s)\n", __func__,
                                    (int) layout, src0->name ? src0->name : "?");
                     GGML_ABORT("fatal error");

@@ -5574,6 +5574,32 @@ inline bool ggml_sycl_weight_is_planned_on_device(const ggml_tensor * tensor, in
     return ggml_sycl_get_planned_weight_residency(tensor, device) == ggml_sycl_planned_weight_residency::DEVICE;
 }
 
+// The layout the placement plan materialises a dense weight in. False when the tensor is not a planned dense
+// weight (no plan, no entry), in which case it is read as stored. Layout follows residency: an op's supports_op
+// asks this before it admits a (type, layout) pair, so a pair no kernel covers is declined before placement
+// routes it.
+inline bool ggml_sycl_get_planned_weight_layout(const ggml_tensor * tensor, int device, ggml_layout_mode * layout) {
+    if (tensor && tensor->view_src) {
+        tensor = tensor->view_src;
+    }
+    if (!tensor || !layout || !ggml_sycl_tensor_is_weight(tensor) || tensor->name[0] == '\0' ||
+        !ggml_sycl_valid_device_index(device)) {
+        return false;
+    }
+    auto *     cache      = ggml_sycl::get_unified_cache_for_device(device);
+    const auto plan_owner = ggml_sycl::coherent_placement_plan_owner(cache);
+    if (!plan_owner || plan_owner->entries.empty()) {
+        return false;
+    }
+    for (const auto & entry : plan_owner->entries) {
+        if (entry.expert_id < 0 && entry.name == tensor->name) {
+            *layout = entry.layout;
+            return true;
+        }
+    }
+    return false;
+}
+
 // True when a multi-device plan places this dense weight on a DIFFERENT device.
 // Placement decides the executor: `device` never executes that weight (the
 // dense weight-owner route runs the op on the owner), so no path may stream,
