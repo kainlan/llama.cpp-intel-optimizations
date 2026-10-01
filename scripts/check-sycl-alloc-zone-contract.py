@@ -2342,6 +2342,7 @@ P_FLAGS = ("g_sycl_fa_onednn_enabled", "g_sycl_paged_v2_enabled", "ggml_sycl_fa_
 P_BODY_BANNED = (P_VEC, P_ENABLED, P_KV_PAIR_OF, P_TILE)               # support clauses the supported/route bodies may not hold
 P_FP8_CALL_RE = re.compile(r"(?<![\w.>])(\w*fp8\w*)\s*\(")               # ... nor any fp8 type helper (ggml_sycl_type_is_fp8_e4m3)
 P_SUPPORT_HELPERS = (P_VEC, P_ENABLED, P_SHAPE_SUPPORTED, P_TILE)      # support helpers the charge side may not name
+# The parameter and local names are pinned too, as 4.8 spells them: a rename in b1 fails loudly, so b1 updates this pin with the code.
 P_DISPATCH_BODY = (
     "out = {}; if (!ggml_sycl_fattn_onednn_route_enabled(p)) { return false; } "
     "if (ggml_sycl_onednn_graph_dispatch_declined(ctx, p)) { out.stage = GGML_SYCL_FATTN_ONEDNN_ROUTE_STAGE_DECLINED; "
@@ -2859,6 +2860,11 @@ def n_listed(ix, src, o):
     return None
 
 
+# a functional cast `bool(f())` is a call whose callee is a type name: the builtin types and the fixed-width integer aliases
+V_FUNCTIONAL_CAST_RE = re.compile(r"(?:unsigned|signed)(?:char|int|long|short)?|(?:long|short)+(?:int|double)?|char|int|bool|float|double|"
+                                  r"u?int(?:8|16|32|64)_t|u?intptr_t|size_t|ssize_t|ptrdiff_t")
+
+
 def value_use(src, call):
     """'void-cast' for `(void) f()` and `static_cast<void>(f())`, 'discard' for a call whose value nothing reads, else
     'used'. The value of `ok && f()`, `ok || f()`, `c ? f() : x` and the right operand of a comma is the value of the whole
@@ -2877,9 +2883,9 @@ def value_use(src, call):
         if k == "argument_list" and parent(p) is not None and kind(parent(p)) == "call_expression":
             f = fld(parent(p), "function")
             ft = re.sub(r"\s+", "", txt(src, f)) if f is not None else ""
-            if ft.startswith("static_cast<void>"):
+            if ft == "void" or re.match(r"(?:static|reinterpret|const|dynamic)_cast<void>", ft):
                 return "void-cast"
-            if ft.startswith("static_cast<"):
+            if re.match(r"(?:static|reinterpret|const|dynamic)_cast<", ft) or V_FUNCTIONAL_CAST_RE.fullmatch(ft):
                 n, p = parent(p), parent(parent(p))
                 continue
         if k in ("parenthesized_expression", "unary_expression") or \
@@ -3141,7 +3147,7 @@ def p_route(ix, out):
     out.dormant.append("TODO p-route: the charge side's walk helpers are unnamed in the design, so they are not pinned")
     out.latch("p-route", ix, P_ADMITS, "a call or a function definition", "an alias, a macro or a lambda hides it")
     out.latch("p-route", ix, P_DECLINED, "a call or a function definition", "an alias, a macro or a lambda hides it")
-    for nm in (P_ROUTE_ENABLED, P_DISPATCH, P_ROUTED):
+    for nm in (P_ROUTE_ENABLED, P_DISPATCH, P_ROUTED, P_ONEDNN, P_PLAN):
         out.latch("p-route", ix, nm, "a call or a function definition", "an alias, a macro or a lambda hides it")
     if not has_name(ix, P_ADMITS, "def"):
         p_dormant(out, "route", P_ADMITS)
@@ -3342,7 +3348,8 @@ def p_home(ix, files, out):
 
 
 def p_fill(ix, out):
-    out.latch("p-fill", ix, P_KV_PAIR_OF, "a call or a function definition", "an alias, a macro or a lambda hides it")
+    for nm in (P_KV_PAIR_OF, P_SHAPE_OF):
+        out.latch("p-fill", ix, nm, "a call or a function definition", "an alias, a macro or a lambda hides it")
     if not has_name(ix, P_KV_PAIR_OF, "def"):
         p_dormant(out, "fill", P_KV_PAIR_OF)
         return
@@ -4726,6 +4733,7 @@ def matrix_cases():
     c.extend(matrix_cases_s2d2())
     c.extend(matrix_cases_s2d3())
     c.extend(matrix_cases_s2d4())
+    c.extend(matrix_cases_s2d5())
     return c
 
 
@@ -5450,6 +5458,37 @@ def matrix_cases_s2d4():
     A(Case("35", "row_gemm's result under !, a cast and static_cast<bool>, consumed by a condition and a return (control)", plant(
         "bool zzplant_n(ggml_backend_sycl_context & ctx) {\n    if (!" + CALL + ") {\n        return false;\n    }\n"
         "    const bool b = !" + CALL + ";\n    return static_cast<bool>(" + CALL + ") && b && (bool) " + CALL + ";\n}\n"), "PASS"))
+    return c
+
+
+def matrix_cases_s2d5():
+    """The S2d r3 fold: the remaining clause (p) subjects latch, and the value walk follows functional and named casts."""
+    c = []
+    A = c.append
+    CALL = "DnnlGemmWrapper::row_gemm(ctx, 1, 2, 3, a, t, b, t, d, t, q, 4)"
+
+    def body(stmt, name="zzplant_n"):
+        return "void %s(ggml_backend_sycl_context & ctx) {\n    %s\n}\n" % (name, stmt)
+
+    for blk, nm, mac, lam in (
+            ("p-route", "ggml_sycl_flash_attn_ext_onednn", "#define ggml_sycl_flash_attn_ext_onednn(c, p) 0\n",
+             "static auto ggml_sycl_flash_attn_ext_onednn = [](int c, int p) { return 0; };\n"),
+            ("p-route", "ggml_sycl_flash_attn_ext_onednn_plan", "#define ggml_sycl_flash_attn_ext_onednn_plan(p, a, b, f, m) 0\n",
+             "static auto ggml_sycl_flash_attn_ext_onednn_plan = [](int p) { return 0; };\n"),
+            ("p-fill", "ggml_sycl_fattn_shape_of", "#define ggml_sycl_fattn_shape_of(d) fattn_params{}\n",
+             "static auto ggml_sycl_fattn_shape_of = [](int d) { return 0; };\n")):
+        for what, text in (("a macro", mac), ("a lambda variable", lam)):
+            A(Case("38", "%s spelled as %s: the latch fails" % (nm, what), chain(b1_tree, append_to("fattn.cpp", text)),
+                   "FAIL", "X-LATCH", "latch:%s:%s" % (blk, nm), planted=False))
+    for label, stmt in (("under a bool() functional cast", "bool(" + CALL + ");"), ("under an int() functional cast", "int(" + CALL + ");"),
+                        ("under a size_t() functional cast", "size_t(" + CALL + ");"),
+                        ("under a reinterpret_cast", "reinterpret_cast<long>(" + CALL + ");"),
+                        ("under a const_cast", "const_cast<bool &>(" + CALL + ");"),
+                        ("under a dynamic_cast", "dynamic_cast<bool>(" + CALL + ");")):
+        A(Case("35", "row_gemm's result %s as a statement" % label, plant(body(stmt)), "FAIL", "N-VOID", "DnnlGemmWrapper::row_gemm"))
+    A(Case("35", "row_gemm's result under a void() functional cast", plant(body("void(" + CALL + ");")), "FAIL", "N-VOID", "cast to void"))
+    A(Case("35", "row_gemm's result under functional casts, returned and compared (control)", plant(
+        "bool zzplant_n(ggml_backend_sycl_context & ctx) {\n    const bool b = int(" + CALL + ") != 0;\n    return b && bool(" + CALL + ");\n}\n"), "PASS"))
     return c
 
 

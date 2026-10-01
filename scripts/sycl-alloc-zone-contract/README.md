@@ -130,12 +130,14 @@ When beni b1 lands, the dormant lines turn into active checks of the real tree a
 to delete.
 
 The route's D=512 hatch is exempt from the head-dim literal rule only in its exact text: the latch
-`static const bool V = ggml_sycl_fa_onednn_d512_enabled();` and either `if (HD == 512 && !V) { return false; }` (operands in
-either order) or `if (HD == 512) { if (!V) { return false; } }`; any other head-dim literal beside it is a finding. Spellings the exemption does not recognise fail
-loudly as `P-HOME` head-dim-literal rather than pass: `512 == p.ne00 && !V` (the literal on the left), a latch written
-`static const bool V{...}` or `const static bool V = ...`, and a latch that is not the one function-local `static const bool`.
-Respell the hatch as the pinned text, or extend `P_LATCH_RE` and `p_blank_hatch`. The routing
-function must read `ggml_sycl_onednn_graph_dispatch_declined` before its first call of the routed predicate, and its whole body is pinned to the design's text (whitespace and comments aside), and every call of
+`static const bool V = ggml_sycl_fa_onednn_d512_enabled();` and either `if (HD == 512 && !V) { return false; }` (the two `&&`
+operands in either order, the head dim on the left of `==`) or `if (HD == 512) { if (!V) { return false; } }`; any other
+head-dim literal beside it is a finding. Spellings the exemption does not recognise fail loudly as `P-HOME` head-dim-literal
+rather than pass: `512 == p.ne00 && !V` (the literal on the left), a latch written `static const bool V{...}` or
+`const static bool V = ...`, and a latch that is not the one function-local `static const bool`. Respell the hatch as the
+pinned text, or extend `P_LATCH_RE` and `p_blank_hatch`. The routing function must read
+`ggml_sycl_onednn_graph_dispatch_declined` before its first call of the routed predicate, and its whole body is pinned to
+the design's text, parameter and local names included (whitespace and comments aside), and every call of
 the predicate in the value function ends `..., nullptr, nullptr`.
 
 Stated gaps: the charge side's walk helpers are unnamed, so the head-dim and helper rules cover the bodies of the two named
