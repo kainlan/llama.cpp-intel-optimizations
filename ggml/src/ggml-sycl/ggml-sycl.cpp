@@ -17833,6 +17833,72 @@ static void ggml_sycl_optional_layouts_retired() {
     g_ggml_sycl_optional_layout_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
+// llama.cpp-kpjw: publish the RUNTIME-zone bytes a spill-capable allocation must leave free for this context's
+// planned dense scratch (the Q8_1 src1 buffer and the two f16 dequant buffers). Without it the plan is only COUNTED
+// in the zone requirement: the compute buffers of the same context ask the same zone, may spill, and filled it before
+// the first graph materialized the planned buffer (B70, Qwen3.6-27B, "zone has 0.3 MB free"). The figure is the whole
+// plan of every buffer still short of it (zone_planned_scratch_hold_bytes), so it falls to zero as the walks bring
+// each buffer up to its plan, and the transaction recomputes it when a new n_ubatch moves the plan.
+//
+// The Q8 buffer is held from the first plan: a decode graph of any quantized dense model draws from it. The f16
+// dequant buffers are held only once they have a backing (so only to GROW it): their plan exists for every dense
+// Q8_0 weight, but the default oneDNN PP route serves those from the ONEDNN zone, so holding ~100 MB for a buffer
+// that route never touches would be an idle reservation. A first f16 demand is still served by the walk, and
+// refused cleanly by name if the zone cannot hold it.
+//
+// The hold is per device and this context publishes it for its own device. A second live context on the same
+// device overwrites it: concurrent same-device contexts are not supported (canonical contract section 5).
+static void ggml_sycl_planned_scratch_hold_refresh(ggml_backend_sycl_context & ctx) {
+    const int                            d         = ctx.device;
+    const size_t                         f16_cap0  = ctx.dequant_f16_src0_scratch.capacity(d);
+    const size_t                         f16_cap1  = ctx.dequant_f16_src1_scratch.capacity(d);
+    const ggml_sycl::zone_planned_buffer buffers[] = {
+        { ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(d), ctx.mmvq_q8_activation_cache.capacity(d) },
+        { f16_cap0 != 0 ? ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(d, false) : 0, f16_cap0 },
+        { f16_cap1 != 0 ? ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(d, true) : 0, f16_cap1 },
+    };
+    size_t hold = 0;
+    if (!ggml_sycl::zone_planned_scratch_hold_bytes(buffers, 3, &hold)) {
+        hold = 0;  // an overflowing plan was published as zero; there is nothing coherent to hold
+    }
+    ggml_sycl::unified_cache_set_planned_scratch_hold(d, hold);
+}
+
+// llama.cpp-kpjw: the runtime-context transaction re-plans the dense scratch at the runtime n_ubatch and drops the
+// hold while it materializes its own pools; this restores both on every exit that is not the success tail. A probe
+// changes nothing, so its guard is inert.
+struct ggml_sycl_dense_scratch_txn_guard {
+    int      device;
+    bool     active;
+    bool     committed     = false;
+    uint32_t prev_n_ubatch = 0;
+    size_t   prev_hold     = 0;
+
+    ggml_sycl_dense_scratch_txn_guard(int device_, bool publish) : device(device_), active(publish) {
+        if (active) {
+            prev_n_ubatch = ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(device);
+            prev_hold     = ggml_sycl::unified_cache_get_planned_scratch_hold(device);
+            // The transaction places the MoE MMID pools in this zone; they are not the compute buffers the hold
+            // exists to keep out, and the ring admission already counts the plan against the zone.
+            ggml_sycl::unified_cache_set_planned_scratch_hold(device, 0);
+        }
+    }
+
+    void commit() { committed = true; }
+
+    ~ggml_sycl_dense_scratch_txn_guard() {
+        if (active && !committed) {
+            if (prev_n_ubatch != 0) {
+                (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(device, prev_n_ubatch);
+            }
+            ggml_sycl::unified_cache_set_planned_scratch_hold(device, prev_hold);
+        }
+    }
+
+    ggml_sycl_dense_scratch_txn_guard(const ggml_sycl_dense_scratch_txn_guard &)             = delete;
+    ggml_sycl_dense_scratch_txn_guard & operator=(const ggml_sycl_dense_scratch_txn_guard &) = delete;
+};
+
 // llama.cpp-3aos: kv_unified -- see placement_kv_info::kv_unified
 // / kv_layer_bytes_for_kind() (unified-cache.hpp) for the rationale.
 // Threaded the same way n_seq_max already is: onto next_kv_info and
@@ -18492,6 +18558,40 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         return refuse("non-FA attention scratch exceeds the device's outside-arena headroom");
     }
 
+    // llama.cpp-kpjw: the dense MMQ/MMVQ Q8_1 src1 buffer and the dense f16 dequant buffers are planned per
+    // n_ubatch, and the load-time plan used the loader's n_ubatch (512). Auto-ubatch picks the real one after load
+    // (this transaction is what its probe runs), so the plan is re-derived here, in the transaction that already
+    // re-plans KV, the non-FA attention scratch and the PP MoE ring, before any graph records: a growth at this
+    // point is not growth while recording. A rung whose plan the RUNTIME zone cannot hold even when empty is refused
+    // HERE, so the ladder keeps the last rung that fits instead of publishing a plan the first graph cannot meet,
+    // and the refusal names the largest -ub that does. The compute-buffer reserve that comes after this is what
+    // the hold (ggml_sycl_planned_scratch_hold_refresh) keeps off the planned bytes.
+    size_t dense_scratch_runtime_bytes = 0;
+    {
+        size_t   needed        = 0;
+        size_t   zone_capacity = 0;
+        uint32_t largest_ub    = 0;
+        if (next_kv_info.n_ubatch != 0 &&
+            !ggml_sycl::unified_cache_dense_scratch_runtime_fit(ctx->device, next_kv_info.n_ubatch, &needed,
+                                                                &zone_capacity, &largest_ub)) {
+            const char * fmt =
+                "[SYCL-PLAN] runtime KV update rejected: the dense MMQ/MMVQ scratch for n_ubatch=%u (%.1f MB: Q8_1 "
+                "src1 and f16 dequant buffers) does not fit the RUNTIME zone (%.1f MB) on device %d; the largest -ub "
+                "that fits is about %u\n";
+            if (probe_mode) {
+                GGML_LOG_INFO(fmt, next_kv_info.n_ubatch, needed / mb, zone_capacity / mb, ctx->device, largest_ub);
+            } else {
+                GGML_LOG_ERROR(fmt, next_kv_info.n_ubatch, needed / mb, zone_capacity / mb, ctx->device, largest_ub);
+            }
+            return refuse("dense MMQ/MMVQ scratch does not fit the RUNTIME zone");
+        }
+        dense_scratch_runtime_bytes = needed;
+    }
+    ggml_sycl_dense_scratch_txn_guard dense_guard(ctx->device, !probe_mode);
+    if (!probe_mode && next_kv_info.n_ubatch != 0) {
+        (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(ctx->device, next_kv_info.n_ubatch);
+    }
+
     // llama.cpp-ibj0: the PP MoE oneDNN scratch ring was sized at model load
     // for the loader's own inventory.n_ubatch (512, src/llama-model.cpp); a
     // runtime n_ubatch that differs must re-plan it here, in the same
@@ -18529,6 +18629,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // below, so the ring's KV-zone part is admitted against the budget it is
     // charged to.
     ring_kv_zone.budget_room_bytes = ggml_sycl_device_vram_budget_room(next_plan, ctx->device);
+    // The dense scratch planned above lives in the RUNTIME zone too (counted twice when this context already
+    // materialized it, like the pools below: conservative), so the ring leaves it that room.
+    ring_kv_zone.runtime_pending_bytes += dense_scratch_runtime_bytes;
     // The current plan's pools, still allocated, are already missing from the
     // RUNTIME zone's free space, so they are counted twice here: conservative,
     // and only in a build where the route is reachable.
@@ -18688,6 +18791,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             { current->model_id, current->load_txn_id, current->slot_generation }, current->version);
     }
     g_runtime_update_succeeded = true;
+    // Published: the plan stands, so the hold is recomputed from it (and from what this context already holds).
+    dense_guard.commit();
+    ggml_sycl_planned_scratch_hold_refresh(*ctx);
     announce_kv_host_demotions(*immutable->plan);
 
 #if GGML_SYCL_DNNL
@@ -44077,6 +44183,8 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     mmvq_q8_activation_cache.release();
     dequant_f16_src0_scratch.release();
     dequant_f16_src1_scratch.release();
+    // The buffers this context was owed are gone with it; nothing is left to hold the zone for.
+    ggml_sycl::unified_cache_set_planned_scratch_hold(device, 0);
     for (auto & [tensor, extra] : runtime_tensor_extras) {
         (void) tensor;
         release_extra_gpu(extra);
@@ -64078,6 +64186,19 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
     return true;
 }
 
+// llama.cpp-kpjw: the route the dispatch takes when the unified kernel declines an op at run time (an operand
+// pointer that does not resolve, GGML_SYCL_UNIFIED_FORCE_LEGACY, ...). select() cannot see that decline, so the
+// dispatch re-asks it with the unified kernel switched off. This helper is the ONE place that question is
+// written: the graph-entry walk of the planned Q8_1 src1 buffer asks it too, through
+// ggml_sycl_mul_mat_src1_quantizing_route(), so the walk cannot count a different route than the dispatch takes.
+static ggml_sycl::MatmulDecision ggml_sycl_mul_mat_legacy_fallback_decision(ggml_backend_sycl_context & ctx,
+                                                                            const ggml_tensor *         src0,
+                                                                            const ggml_tensor *         src1,
+                                                                            ggml_tensor *               dst,
+                                                                            const layout_mode *         forced_layout) {
+    return ctx.matmul_orchestrator.select(src0, src1, dst, forced_layout, std::nullopt, false);
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                               const ggml_tensor *         src0,
                               const ggml_tensor *         src1,
@@ -66410,7 +66531,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 trace_decision("dispatched-unified", decision);
                 return;
             }
-            decision = ctx.matmul_orchestrator.select(src0, src1, dst, forced_layout, std::nullopt, false);
+            decision = ggml_sycl_mul_mat_legacy_fallback_decision(ctx, src0, src1, dst, forced_layout);
             trace_decision("selected-no-unified", decision);
         }
 
@@ -66495,7 +66616,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 GGML_SYCL_DEBUG("[MUL_MAT] retrying dispatch with forced AoS for %s\n", src0->name ? src0->name : "?");
             }
             layout_mode retry_layout = GGML_LAYOUT_AOS;
-            auto retry_decision = ctx.matmul_orchestrator.select(src0, src1, dst, &retry_layout, std::nullopt, false);
+            auto retry_decision      = ggml_sycl_mul_mat_legacy_fallback_decision(ctx, src0, src1, dst, &retry_layout);
             trace_decision("selected-retry-aos", retry_decision);
             if (retry_decision.valid && retry_decision.backend == ggml_sycl::MatmulBackend::LegacyKernel) {
                 trace_decision("dispatch-retry-aos", retry_decision);
@@ -98984,6 +99105,34 @@ static bool ggml_sycl_mul_mat_kernel_quantizes_src1(ggml_sycl_mul_mat_kernel ker
     return false;
 }
 
+// llama.cpp-kpjw: whether the route the dispatch can take for this multi-row node quantizes src1 into the planned
+// Q8_1 buffer. The router's first answer is not the whole route: when it picks the unified kernel, the dispatch can
+// still decline at run time (an operand pointer that does not resolve, which is what a host-demoted KV vehicle
+// produces, or GGML_SYCL_UNIFIED_FORCE_LEGACY) and re-select a legacy kernel that DOES quantize src1. Both answers
+// come from the same two calls the dispatch makes, the second through ggml_sycl_mul_mat_legacy_fallback_decision().
+// A node the unified kernel then serves is counted too, and that is the cheap side of the error: the demand it adds
+// is bounded by the plan (it is a dense quantized operand the plan already sized), so counting it reserves nothing
+// the plan did not. Missing it leaves a buffer the dispatch then has to grow in-op.
+static bool ggml_sycl_mul_mat_src1_quantizing_route(ggml_backend_sycl_context & ctx,
+                                                    const ggml_tensor *         src0,
+                                                    const ggml_tensor *         src1,
+                                                    ggml_tensor *               node) {
+    const ggml_sycl::MatmulDecision primary = ctx.matmul_orchestrator.select(src0, src1, node);
+    if (!primary.valid) {
+        return false;
+    }
+    if (primary.backend == ggml_sycl::MatmulBackend::LegacyKernel) {
+        return ggml_sycl_mul_mat_kernel_quantizes_src1(primary.kernel);
+    }
+    if (primary.backend != ggml_sycl::MatmulBackend::UnifiedKernel) {
+        return false;
+    }
+    const ggml_sycl::MatmulDecision fallback =
+        ggml_sycl_mul_mat_legacy_fallback_decision(ctx, src0, src1, node, nullptr);
+    return fallback.valid && fallback.backend == ggml_sycl::MatmulBackend::LegacyKernel &&
+           ggml_sycl_mul_mat_kernel_quantizes_src1(fallback.kernel);
+}
+
 // llama.cpp-479i: ensure the planned dense MMQ/MMVQ Q8_1 src1 buffer holds the demand of this graph, before
 // anything is submitted. Which nodes draw from the buffer is the dispatch's own router decision, asked the same
 // question with the same arguments inside a quiet scope (it would otherwise repeat the "kernel not eligible"
@@ -99056,9 +99205,7 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
                 continue;
             }
 #    endif
-            const ggml_sycl::MatmulDecision decision = ctx.matmul_orchestrator.select(src0, src1, node);
-            if (!decision.valid || decision.backend != ggml_sycl::MatmulBackend::LegacyKernel ||
-                !ggml_sycl_mul_mat_kernel_quantizes_src1(decision.kernel)) {
+            if (!ggml_sycl_mul_mat_src1_quantizing_route(ctx, src0, src1, node)) {
                 continue;
             }
         }
@@ -99117,6 +99264,8 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
             (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
         return false;
     }
+    // A buffer that reached its plan no longer needs its bytes held back from the compute buffers.
+    ggml_sycl_planned_scratch_hold_refresh(ctx);
     return true;
 }
 
@@ -99243,6 +99392,7 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
             return false;
         }
     }
+    ggml_sycl_planned_scratch_hold_refresh(ctx);
 #    else
     GGML_UNUSED(ctx);
     GGML_UNUSED(cgraph);

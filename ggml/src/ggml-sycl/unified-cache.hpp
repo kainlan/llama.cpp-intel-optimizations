@@ -1655,6 +1655,27 @@ bool   unified_cache_set_planned_dequant_f16_scratch(int      device_id,
 // ensures each buffer at max(its own plan, the graph's demand).
 size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id);
 size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool src1);
+// llama.cpp-kpjw: re-derive both dense scratch plans at `n_ubatch` from the inputs the load-time setters were last
+// given. The runtime-context transaction calls it with the runtime n_ubatch (auto-ubatch picks it after load).
+// False when nothing was planned for the device or a figure overflowed.
+bool     unified_cache_replan_planned_dense_scratch(int device_id, uint32_t n_ubatch);
+uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id);
+// The plan's total bytes at `n_ubatch` without changing the published plan (a probe asks this).
+bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out);
+// Whether the dense scratch at `n_ubatch` fits the RUNTIME zone's CAPACITY beside the other n_ubatch-independent
+// planned consumers. Capacity, not free space: free space depends on which compute buffers are live, capacity is
+// the fact the plan can be held to. `largest_ubatch` (optional) receives n_ubatch when it fits, else the largest
+// multiple of 32 below it that does (0 when none). `needed` / `capacity` are optional diagnostics.
+bool     unified_cache_dense_scratch_runtime_fit(int        device_id,
+                                                 uint32_t   n_ubatch,
+                                                 size_t *   needed,
+                                                 size_t *   capacity,
+                                                 uint32_t * largest_ubatch);
+// RUNTIME-zone bytes a spill-capable allocation must leave free for the planned dense scratch
+// (zone_planned_scratch_hold_bytes). Published by the backend context that owns the buffers; zero when every
+// planned buffer holds its plan. Forbid-spill requests are the claimants and are never held back.
+void     unified_cache_set_planned_scratch_hold(int device_id, size_t bytes);
+size_t   unified_cache_get_planned_scratch_hold(int device_id);
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno

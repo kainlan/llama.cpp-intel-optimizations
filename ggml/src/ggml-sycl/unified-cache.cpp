@@ -718,6 +718,16 @@ static std::atomic<size_t>   g_planned_mmq_src1_scratch_bytes[GGML_SYCL_MAX_DEVI
 // plus the src1 copy, see zone_dequant_f16_*), folded into the same RUNTIME zone requirement.
 static std::atomic<size_t>   g_planned_dequant_f16_src0_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-kpjw: the INPUTS the two plan setters were last given (per-token and weight maxima, n_ubatch),
+// kept so the runtime-context transaction can re-derive the plan at the runtime n_ubatch (auto-ubatch picks it
+// after load) without the load-time inventory.
+static std::atomic<size_t>   g_planned_mmq_src1_bytes_per_token[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_dequant_f16_weight_bytes_max[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes_per_token[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_dense_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-kpjw: RUNTIME-zone bytes a spill-capable allocation must leave free so the planned dense scratch
+// buffers can still be materialized (zone_planned_scratch_hold_bytes). Zero when every planned buffer holds its plan.
+static std::atomic<size_t>   g_planned_scratch_hold_bytes[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
 // window class, the SWA window itself, ubatch size, context length) known at
 // the time the oneDNN scratchpad was last planned for this device
@@ -1659,6 +1669,8 @@ bool unified_cache_set_planned_mmq_src1_scratch(int device_id, size_t bytes_per_
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return false;
     }
+    g_planned_mmq_src1_bytes_per_token[device_id].store(bytes_per_token, std::memory_order_release);
+    g_planned_dense_scratch_n_ubatch[device_id].store(n_ubatch, std::memory_order_release);
     size_t bytes = 0;
     if (!zone_mmq_src1_scratch_bytes(bytes_per_token, n_ubatch, &bytes)) {
         // An overflowing figure must not become a SMALL plan. Publish nothing; the graph-entry
@@ -1684,6 +1696,9 @@ bool unified_cache_set_planned_dequant_f16_scratch(int      device_id,
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return false;
     }
+    g_planned_dequant_f16_weight_bytes_max[device_id].store(max_weight_bytes, std::memory_order_release);
+    g_planned_dequant_f16_src1_bytes_per_token[device_id].store(src1_bytes_per_token, std::memory_order_release);
+    g_planned_dense_scratch_n_ubatch[device_id].store(n_ubatch, std::memory_order_release);
     size_t src0_bytes = 0;
     size_t src1_bytes = 0;
     if (!zone_dequant_f16_plan_bytes(max_weight_bytes, src1_bytes_per_token, n_ubatch, &src0_bytes, &src1_bytes)) {
@@ -1710,6 +1725,106 @@ size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id) {
     const size_t src0 = unified_cache_get_planned_dequant_f16_buffer_bytes(device_id, false);
     const size_t src1 = unified_cache_get_planned_dequant_f16_buffer_bytes(device_id, true);
     return src0 > SIZE_MAX - src1 ? SIZE_MAX : src0 + src1;
+}
+
+bool unified_cache_replan_planned_dense_scratch(int device_id, uint32_t n_ubatch) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || n_ubatch == 0) {
+        return false;
+    }
+    // The same two setters as the load-time plan, fed the inputs they were last given: one formula, two callers.
+    const bool q8 = unified_cache_set_planned_mmq_src1_scratch(
+        device_id, g_planned_mmq_src1_bytes_per_token[device_id].load(std::memory_order_acquire), n_ubatch);
+    const bool f16 = unified_cache_set_planned_dequant_f16_scratch(
+        device_id, g_planned_dequant_f16_weight_bytes_max[device_id].load(std::memory_order_acquire),
+        g_planned_dequant_f16_src1_bytes_per_token[device_id].load(std::memory_order_acquire), n_ubatch);
+    return q8 && f16;
+}
+
+uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_dense_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
+}
+
+bool unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || !out) {
+        return false;
+    }
+    return zone_dense_scratch_total_bytes(
+        g_planned_mmq_src1_bytes_per_token[device_id].load(std::memory_order_acquire),
+        g_planned_dequant_f16_weight_bytes_max[device_id].load(std::memory_order_acquire),
+        g_planned_dequant_f16_src1_bytes_per_token[device_id].load(std::memory_order_acquire), n_ubatch, out);
+}
+
+bool unified_cache_dense_scratch_runtime_fit(int        device_id,
+                                             uint32_t   n_ubatch,
+                                             size_t *   needed,
+                                             size_t *   capacity,
+                                             uint32_t * largest_ubatch) {
+    if (needed) {
+        *needed = 0;
+    }
+    if (capacity) {
+        *capacity = 0;
+    }
+    if (largest_ubatch) {
+        *largest_ubatch = n_ubatch;
+    }
+    size_t need = 0;
+    if (!unified_cache_planned_dense_scratch_bytes_at(device_id, n_ubatch, &need)) {
+        // An overflowing figure cannot be held by any zone.
+        if (largest_ubatch) {
+            *largest_ubatch = 0;
+        }
+        return false;
+    }
+    if (needed) {
+        *needed = need;
+    }
+    if (need == 0) {
+        return true;  // nothing planned (no dense quantized operand): nothing to hold
+    }
+    unified_cache * cache = get_unified_cache_for_device(device_id);
+    if (!cache || !cache->arena_active()) {
+        return true;  // no arena, no RUNTIME zone: the buffers are not zone-bound
+    }
+    const size_t zone_bytes = cache->zone_capacity(vram_zone_id::RUNTIME);
+    // The other planned RUNTIME consumers whose size does not follow n_ubatch. The PP MoE ring is NOT here: its
+    // admission runs after this check and is told this figure as pending RUNTIME demand.
+    size_t       other      = 0;
+    if (!moe_checked_runtime_zone_requirement(unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id), 0,
+                                              unified_cache_get_planned_moe_control_requirement(device_id), &other)) {
+        other = 0;  // unanswerable: the zone sizing keeps its default and so does this check
+    }
+    if (capacity) {
+        *capacity = zone_bytes;
+    }
+    const bool fits = other <= zone_bytes && need <= zone_bytes - other;
+    if (largest_ubatch) {
+        *largest_ubatch = fits ?
+                              n_ubatch :
+                              zone_dense_scratch_largest_ubatch(
+                                  g_planned_mmq_src1_bytes_per_token[device_id].load(std::memory_order_acquire),
+                                  g_planned_dequant_f16_weight_bytes_max[device_id].load(std::memory_order_acquire),
+                                  g_planned_dequant_f16_src1_bytes_per_token[device_id].load(std::memory_order_acquire),
+                                  other, zone_bytes, n_ubatch);
+    }
+    return fits;
+}
+
+void unified_cache_set_planned_scratch_hold(int device_id, size_t bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_scratch_hold_bytes[device_id].store(bytes, std::memory_order_release);
+}
+
+size_t unified_cache_get_planned_scratch_hold(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_scratch_hold_bytes[device_id].load(std::memory_order_acquire);
 }
 
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out) {
@@ -15446,9 +15561,18 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             if (cache && cache->arena_active()) {
                 const vram_zone_id zid = req.intent.constraints.prefer_vram_zone;
                 if (!prepare_arena_publication(zid)) return false;
-                ptr = cache->zone_alloc(zid, alloc_size, req.alignment != 0 ? req.alignment : 64,
-                                        reserved_alloc_id, &exact_arena,
-                                        arena_runtime_registry_commit, &arena_publication);
+                // llama.cpp-kpjw: a spill-capable RUNTIME request (a compute buffer) leaves alone the bytes the
+                // planned dense scratch buffers still need, and spills exactly as it would if the zone were full.
+                // A forbid-spill request is a planned consumer itself (the ring, the planned scratch) and is the
+                // claimant the hold exists for, so it is never held back.
+                const bool held_back =
+                    zid == vram_zone_id::RUNTIME && !req.intent.constraints.forbid_vram_zone_spill &&
+                    !zone_runtime_alloc_respects_hold(cache->zone_available(zid),
+                                                      unified_cache_get_planned_scratch_hold(req.device), alloc_size);
+                if (!held_back) {
+                    ptr = cache->zone_alloc(zid, alloc_size, req.alignment != 0 ? req.alignment : 64, reserved_alloc_id,
+                                            &exact_arena, arena_runtime_registry_commit, &arena_publication);
+                }
                 if (!ptr && arena_publication.attempted) return false;
                 if (ptr) {
                     from_arena                 = true;

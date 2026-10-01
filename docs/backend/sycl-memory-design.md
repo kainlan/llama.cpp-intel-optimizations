@@ -2421,6 +2421,64 @@ Host tests: `ggml/src/ggml-sycl/tests/test-pp-moe-ring-admission.cpp` pins the
 arithmetic. `tests/test-sycl-pp-moe-ring-kv-zone-source.py` pins the wiring, with
 a mutation witness per check.
 
+### A context-time consumer: the planned dense scratch, reserved and re-planned (`llama.cpp-kpjw`)
+
+The dense quantized `MUL_MAT` quantizes its F32 activations into one persistent Q8_1 src1 buffer per backend context
+and device, and the dense f16 dequant arm uses two more (`llama.cpp-479i`). All three live in the RUNTIME zone with
+the spill forbidden, sized by the planner. Three defects in how the plan met the runtime, found on a full B70
+(Qwen3.6-27B, `llama-perplexity -c 512`, which is `n_ctx` 2048 with 4 sequences and `n_batch` 2048):
+
+```
+[SYCL-PLAN] auto n_ubatch=2048 for n_ctx=2048 n_batch=2048 (tried 512,1024,2048; ladder exhausted)
+[MMQ-SRC1] graph refused before submission ... (planned 9.6 MB at the load-time n_ubatch, buffer holds 0.0 MB,
+           zone has 0.3 MB free)
+```
+
+**D1: counted, not reserved.** The plan was folded into `unified_cache_get_planned_runtime_zone_requirement()`, so the
+zone was sized for it, but nothing stopped another consumer taking the bytes first. The context's compute buffers ask
+the same zone for room (`prefer_vram_zone = RUNTIME`, spill allowed), and at `n_ubatch` 2048 they filled it before the
+first graph materialized the planned buffer. The rule now: **a spill-capable RUNTIME request leaves alone the bytes
+the planned scratch still needs, and spills exactly as if the zone were full.** The held figure is
+`zone_planned_scratch_hold_bytes()`: the whole plan of every buffer still short of it (the whole plan, not the
+shortfall, because growth allocates the replacement while the old backing is live). A forbid-spill request is a planned
+consumer itself (the ring, the planned scratch) and is the claimant the hold exists for, so it is never held back.
+The hold is per device, published by the context that owns the buffers
+(`ggml_sycl_planned_scratch_hold_refresh()`), falls as the graph-entry walks bring each buffer to its plan, and drops
+with the context. The Q8 buffer is held from the first plan because a decode graph of any quantized dense model draws
+from it; the two f16 buffers are held only once they have a backing (to grow it), because their plan exists for every
+dense Q8_0 weight while the default oneDNN PP route serves those from the ONEDNN zone, and holding ~100 MB for a buffer
+that route never touches would be an idle reservation.
+
+**D2: the plan followed the load-time `n_ubatch`.** Auto-ubatch chooses the real one at context creation, after load.
+The plan is a function of `n_ubatch` (`zone_dense_scratch_total_bytes()`), so the runtime-context transaction, the
+same transaction that re-plans KV, the non-FA attention scratch and the PP MoE ring and that the auto-ubatch probe
+runs, re-derives it from the inputs the load-time setters were given
+(`unified_cache_replan_planned_dense_scratch()`). That is before any graph records, so it is not growth while
+recording. The transaction refuses a rung whose plan the RUNTIME zone cannot hold *even when empty*
+(`unified_cache_dense_scratch_runtime_fit()`, against zone capacity, not free space, because free space depends on which
+compute buffers happen to be live) and names the largest `-ub` that fits, so the ladder keeps the last rung that fits
+and an explicit `-ub` fails context creation with the arithmetic. The ring admission is told the figure as pending
+RUNTIME demand and leaves it room. A probe changes nothing; a refused or rolled-back publish restores the plan and the
+hold (`ggml_sycl_dense_scratch_txn_guard`).
+
+Why not make rung selection consult the plan separately: the probe *is* the transaction, so the ladder already asks
+the one source. No edit to `src/llama-auto-ubatch.h` or the ladder is needed, and none was made.
+
+**D3: the walk asked a different question than the dispatch.** The graph-entry walk asked `select()` which kernel
+serves a node. `select()` cannot see the unified kernel's runtime decline (an operand pointer that does not resolve,
+which a host-demoted KV vehicle produces, or `GGML_SYCL_UNIFIED_FORCE_LEGACY`); the dispatch answers that decline with
+`select(allow_unified=false)` and lands on a legacy kernel that quantizes src1. So the walk counted no demand and the
+buffer was grown in-op. Now the question is written once, `ggml_sycl_mul_mat_legacy_fallback_decision()`, and both the
+dispatch and the walk (`ggml_sycl_mul_mat_src1_quantizing_route()`) ask it. A node the unified kernel then serves is
+counted too, which costs nothing: its demand is bounded by the plan.
+
+Known gap: the f16 dequant walk (`ggml_sycl_dequant_f16_ensure_for_graph`) still asks `select()` alone. It is loud
+(the in-op growth WARN fires and an under-estimate is recorded), and extending it the same way would allocate a
+~100 MB f16 weight copy for Q8_0 models where the unified kernel always serves the op.
+
+Host tests: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` Case 14 pins the arithmetic;
+`tests/test-sycl-mmq-src1-plan-source.py` pins the wiring, with a mutation witness per check.
+
 ### Known limits (load-bearing — read before changing any of this)
 
 1. **The ONEDNN scratchpad's two halves are in different units, deliberately.**
