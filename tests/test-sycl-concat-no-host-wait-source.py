@@ -141,6 +141,16 @@ def evaluate(backend, concat, common):
     results["the op asserts an in-order queue"] = \
         re.search(r"GGML_ASSERT\([^;]*has_property<sycl::property::queue::in_order>", impl) is not None
 
+    # --- the dim-0 / non-contiguous kernel qwen35 actually runs ------------------
+    # It strides i0 by the local range, so a (1,1,1) work-group runs the whole row on one lane. The launch
+    # must give each (i3,i2,i1) row a full work-group.
+    non_cont = function_body(concat, r"static void concat_T_sycl_non_cont\([^)]*\)\s*\{")
+    results["anchor: concat_T_sycl_non_cont exists"] = non_cont is not None
+    if non_cont is not None:
+        results["non-contiguous concat launches a full work-group per row"] = \
+            "SYCL_CONCAT_BLOCK_SIZE" in non_cont and \
+            re.search(r"range<3>\(\s*1\s*,\s*1\s*,\s*1\s*\)", non_cont) is None
+
     # --- the helper the op copies through is alignment-correct ------------------
     safe = function_body(common, r"inline sycl::event ggml_sycl_graph_safe_memcpy\([^)]*\)\s*\{")
     results["anchor: ggml_sycl_graph_safe_memcpy exists"] = safe is not None
@@ -246,6 +256,9 @@ if args.self_test:
         ("in-order assert detached", "the op asserts an in-order queue",
          with_concat(mutate_in_func(concat, impl_sig, "GGML_ASSERT(stream->has_property<sycl::property::queue::in_order>());",
                                     "bool ok = stream->has_property<sycl::property::queue::in_order>(); GGML_ASSERT(true);"))),
+        ("single-lane work-group restored", "non-contiguous concat launches a full work-group per row",
+         with_concat(mutate_in_func(concat, r"static void concat_T_sycl_non_cont\([^)]*\)\s*\{",
+                                    "sycl::range<3>(1, 1, SYCL_CONCAT_BLOCK_SIZE))", "sycl::range<3>(1, 1, 1))"))),
         ("int32 split restored", "recording copy never splits an int32 body from a byte tail",
          (backend, concat, mutate_in_func(common, safe_sig, "if (g_ggml_sycl_graph_recording) {",
                                           "if (g_ggml_sycl_graph_recording) { const size_t n_i32 = nbytes / sizeof(int32_t);"
