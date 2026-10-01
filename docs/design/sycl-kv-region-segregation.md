@@ -1,6 +1,6 @@
 # llama.cpp-moua: planned, lifetime-segregated layout for the shared KV+WEIGHT zone
 
-Design, revision 7.14ag, by impl-moua-s, 2026-09-30. The revisions answer thirty-nine reviews:
+Design, revision 7.14ah, by impl-moua-s, 2026-09-30. The revisions answer forty reviews:
 - design review r1 (design-moua-r1: 3 Critical, 7 Important, 9 Minor), recorded in §6.1;
 - the principles audit's moua section (audit-mem-b: 5 Important, 4 Minor), recorded in §6.2;
 - design review r2 (design-moua-r2: 1 Critical, 11 Important, 10 Minor), recorded in §6.3;
@@ -221,7 +221,8 @@ Design, revision 7.14ag, by impl-moua-s, 2026-09-30. The revisions answer thirty
 - the 23mk re-pin to `87da879f1` (rev 4.19l, provisional while design-23mk-r25 runs), recorded in
   §6.48. Revision 7.14af is one commit on top of `152cbc5bb` and answers no new review: 23mk's
   per-step figures confirm the §M84 re-derivation, `onednn_pp_declined` joins L4's census with a
-  gate clause, and a decline withdraws the declined model's W publication.
+  gate clause, and a decline withdraws the declined model's W publication (withdrawn in 7.14ag,
+  §6.49 m-5).
 - design review r38 (design-moua-r38 on `eece79b83..152cbc5bb`: 0 Critical, 1 Important, 7
   Minor, 4 nits), recorded in §6.49. Revision 7.14ag is one commit on top of `37cec63f2`: step 4
   at L4+L6 is 23mk's two-step (b1) rule, with no clamp (a capped model gets G = P = 0 and
@@ -229,6 +230,12 @@ Design, revision 7.14ag, by impl-moua-s, 2026-09-30. The revisions answer thirty
   cell's vehicle and commit, and the `onednn_pp_declined` census and clause (at) of 7.14af are
   withdrawn under rulings §M86. A follow-up commit on the same revision names the reactivation
   L0 holders, `commit_reactivate` and `rollback_reactivate` (the lead's relay).
+- design review r39 (design-moua-r39 on `152cbc5bb..79fa71b00`: 0 Critical, 1 Important, 4
+  Minor, 4 nits), recorded in §6.50. Revision 7.14ah is one commit on top of `79fa71b00`: five L0
+  holders (`complete_unload` joins) under one derived rule with named exclusions, the H9
+  reactivation arm rebuilt on observable state and a timing-free handshake, the capped cell
+  pre-registered with a second VOID condition, the cap's base pinned to `stored`, and G2's marker
+  arms stated under rulings §M86.
 
 
 **The lead's rulings file.** The rulings shared by zhcn, moua, 1oxa, 23mk and jehw/uwlx are in
@@ -1896,9 +1903,9 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     preload runs inside `load_end`);
   - `LIFECYCLE`: every other entry of the list below: the probe, the FA recheck, activate,
     unload and the quarantine reaper, `can_unload`, shutdown, `commit_reactivate`,
-    `rollback_reactivate` and the teardown release proc. None of them grows a pool for planned work.
-    §M9a names the two kinds that
-    decide the gate; the third only keeps the other holders from being labelled as either.
+    `rollback_reactivate`, `complete_unload` and the teardown release proc. None of them grows a
+    pool for planned work. §M9a names the two kinds that decide the gate; the third only keeps the
+    other holders from being labelled as either.
 
   The accessor is `bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind =
   GGML_SYCL_REPLAN_KIND_ANY)`: true when this thread holds L0 and, unless `kind` is `ANY`, the
@@ -2006,32 +2013,43 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     `load_begin`'s or the stage's hold those are nested holds; a free on a thread holding no
     token takes L0 in `unloaded_token`. None of them runs under an L1-L5 lock;
   - the model-load entries (below);
-  - **module shutdown and reactivation (rulings §M76.5).** `ggml_backend_sycl_shutdown` (`:109666`;
-    `ggml-sycl.h:71`) drains the quarantine, reaps it and publishes the restored or torn-down plan,
-    so it is an L0 holder like unload. **Module reactivation is four exported phases at `d8a67422d`,
-    `ggml_backend_sycl_prepare_reactivate` (`gs:109657`), `ggml_backend_sycl_commit_reactivate`
-    (`gs:109670`), `ggml_backend_sycl_finalize_reactivate` (`gs:109678`) and
-    `ggml_backend_sycl_rollback_reactivate` (`gs:109696`); the L0 holders are `commit_reactivate`
-    and `rollback_reactivate`.** `commit_reactivate` is the only phase that touches the registry and
-    the cache (`global_registry().reactivate()` and `prepare_unified_cache_for_module_use()`,
-    `gs:109671-109672`). `rollback_reactivate`, when it rolls back a completed commit, runs
+  - **module shutdown, reactivation and complete unload (rulings §M76.5).** `gs:` is `ggml-sycl.cpp`
+    at `d8a67422d`. **The rule: every exported entry that tears down or reactivates the registry or
+    the cache holds L0.** That is five holders: `ggml_backend_sycl_can_unload` (`gs:109575`; a
+    try-lock, below), `ggml_backend_sycl_shutdown` (`gs:109883`; `ggml-sycl.h:71`), which drains the
+    quarantine, reaps it and publishes the restored or torn-down plan,
+    `ggml_backend_sycl_commit_reactivate` (`gs:109670`), `ggml_backend_sycl_rollback_reactivate`
+    (`gs:109696`) and `ggml_backend_sycl_complete_unload` (`gs:109640-109644`), which sets
+    `COMPLETE_CLOSED` and calls `global_registry().complete_shutdown()`. `can_unload`'s token is
+    gone by the time `complete_unload` runs, so that ordering is not coverage. Module reactivation
+    is four exported phases: `prepare_reactivate` (`gs:109657`), `commit_reactivate`,
+    `finalize_reactivate` (`gs:109678`) and `rollback_reactivate`. `commit_reactivate` is the only
+    phase that makes the registry and the cache live (`global_registry().reactivate()` and
+    `prepare_unified_cache_for_module_use()`, `gs:109671-109672`); `rollback_reactivate` undoes that
+    when it rolls back a completed commit: it restores the admission state (`gs:109702`), then runs
     `global_registry().complete_shutdown()` and `rollback_unified_cache_module_use()`
-    (`gs:109708-109711`), which is shutdown-equivalent teardown. Each takes the token at the top of
-    its entry, before the admission mutex (a rollback with nothing pending takes and releases it
-    with no effect), so the census (§3.1 H7ai) reads one rule for every exported entry;
-    `prepare_reactivate` and `finalize_reactivate` only flip admission under the admission mutex and
-    take no L0. So no publishing entry can overlap shutdown, `commit_reactivate` or
-    `rollback_reactivate`; zhcn's gate 22b expiry condition keys on `can_unload`, `shutdown`,
-    `commit_reactivate` and `rollback_reactivate`. A publishing entry that finds the module not
-    ACTIVE while it holds L0 is a caller lifecycle violation: `[CONTEXT-PLAN-BUG]`, with no retry
-    and no `BUSY` (below). **`ggml_backend_sycl_can_unload` (`:109358`) holds L0, taken by a
-    TRY-lock (zhcn 5.5 row 32, r6 m-6; rulings §M11 I-F).** It is what closes module admission: it
-    moves `ACTIVE` to `RETRY_CLOSED`, reserves the Registry's shutdown, and waits up to 5 s for the
-    module's in-flight mutations to drain (`wait_for`, `:109390-109392`), reopening on a
-    timeout. It is distinct from shutdown (`:109666`). Without L0, a publishing entry that
-    already holds L0 could see admission close under it, and the `[CONTEXT-PLAN-BUG]` below
-    would fire on a legal `can_unload`. **It never blocks on L0:** it takes a `LIFECYCLE` token
-    with `try_lock`, and when another thread holds L0 it returns `false` at once, which
+    (`gs:109708-109711`), which is shutdown-equivalent teardown. The four holders other than
+    `can_unload` take the token at the top of the entry, before the admission mutex (a rollback with
+    nothing pending takes and releases it with no effect), so the census (§3.1 H7ai) reads one rule
+    for every exported entry. **Excluded, with reasons:** `prepare_reactivate` and
+    `finalize_reactivate`, which only flip admission under the admission mutex;
+    `ggml_backend_sycl_cancel_unload` (`gs:109629-109638`), which reopens `RETRY_CLOSED` to `ACTIVE`
+    and cancels the Registry reservation only; and `ggml_backend_sycl_reg` (`gs:110392-110394`),
+    whose `prepare_unified_cache_for_module_use()` is the single `g_sycl_shutting_down.store(false)`
+    (`unified-cache.cpp:19360-19362`), idempotent on an ACTIVE module, publishing no registry,
+    admission or cache entry. **Caveat:** on a non-ACTIVE module `reg` clears that flag before
+    `commit_reactivate` runs, by design for `RTLD_NODELETE` reload (`gs:110392-110393`). So no
+    publishing entry can overlap any of the five; zhcn's rev 5.42 applies the same classification,
+    and its gate 22b expiry condition keys on the same holders. A publishing entry that finds the
+    module not ACTIVE while it holds L0 is a caller lifecycle violation: `[CONTEXT-PLAN-BUG]`, with
+    no retry and no `BUSY` (below). **`ggml_backend_sycl_can_unload` holds L0, taken by a TRY-lock
+    (zhcn 5.5 row 32, r6 m-6; rulings §M11 I-F).** It is what closes module admission: it moves
+    `ACTIVE` to `RETRY_CLOSED`, reserves the Registry's shutdown, and waits up to 5 s for the
+    module's in-flight mutations to drain (`wait_for`, `gs:109606-109610`), reopening on a timeout.
+    It is distinct from shutdown. Without L0, a publishing entry that already holds L0 could see
+    admission close under it, and the `[CONTEXT-PLAN-BUG]` below would fire on a legal `can_unload`.
+    **It never blocks on L0:** it takes a `LIFECYCLE` token with `try_lock`, and when another thread
+    holds L0 it returns `false` at once, which
     `ggml_backend_unload_checked` reports as `BUSY` (`ggml-backend-reg.cpp:745-749`); a nested
     acquire on a thread that already holds L0 succeeds as usual. 7.10 took L0 with a blocking
     acquire, which hangs `test-sycl-lifecycle-runtime-wrapper.cpp:1476-1492` (r10 I-F): the test
@@ -3314,8 +3332,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
            §M26a I-4, §M44 C-1), the load-stage ONEDNN sizing (`ensure_planned_arena_zones`,
            `:4464`, and the plan's twin at `:27658`) reads the no-floor getter, which carries W:
            `unified_cache_get_planned_onednn_pp_w_bytes` (today
-           `unified_cache_get_planned_onednn_scratchpad_bytes_stored`, `:2141`; renamed by 23mk's §4
-           commit; rulings §M32 I-4, §M33 I-G), and the with-floor one (`:2148-2160`) is deleted,
+           `unified_cache_get_planned_onednn_scratchpad_bytes_stored`, `:2148`; renamed by 23mk's §4
+           commit; rulings §M32 I-4, §M33 I-G), and the with-floor one (`:2155-2169`) is deleted,
            its floor branch gone with the term to 23mk's context transaction (rulings §M21.3). Until
            (b2) both sides keep master's ONEDNN sizing less the constant, W plus the sinks-aware G
            plus P (below, rulings §M84), so the witness compares like with like.
@@ -4090,8 +4108,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       which supersedes §M42 (3)).** 23mk's move of the Graph scratch is two commits, both
       landing in beni (23mk §4.8). This design cites both and lands no part of either in C-1:
       - **(b1), before moua L4:** a sinks-aware input to master's floor function,
-        `onednn_graph_scratch_zone_floor_bytes_swa` (`:2027`, which the with-floor getter adds
-        at `:2148-2160`). Its count of SDPA-routed heads calls the reject predicate of
+        `onednn_graph_scratch_zone_floor_bytes_swa` (`:2034`, which the with-floor getter adds at
+        `:2160-2167`). Its count of SDPA-routed heads calls the reject predicate of
         `fattn-onednn.cpp:115-116`, so a model whose attention has sinks gets G = 0. It charges
         only in master's floor path and needs none of L4-L7. At `-c 4096` it takes GPT-OSS
         120B's G from 805306368 B to 0 B, and Qwen's stays 201326592 B. It is interim, and it
@@ -4244,8 +4262,8 @@ L0, and a failed revalidation under L0 is a bug, not a race.
           `:11721`), uncalled since (b1), deleted by 23mk `8547a22f0` (b2) item 8 (rulings §M68
           (b));
         - the load getter switch, `:4464` and `:27658` from the with-floor getter to the W
-          getter, `unified_cache_get_planned_onednn_pp_w_bytes` (today `:2141`'s `_stored`
-          getter), and the with-floor getter itself deleted (`:2148-2160`; no dead alias), and
+          getter, `unified_cache_get_planned_onednn_pp_w_bytes` (today `:2148`'s `_stored` getter),
+          and the with-floor getter itself deleted (`:2155-2169`; no dead alias), and
           (b1)'s input with it;
         - **the 0oxf clamp deleted (r14 m-13).** Master bounds the ONEDNN zone by `max(available
           / 4, W)` (`:4476-4500`, where master reads the getter 23mk renames); its comment says
@@ -4275,25 +4293,32 @@ L0, and a failed revalidation under L0 is a bug, not a race.
       (b1)'s sinks-aware floor over the published shape
       (`onednn_graph_scratch_zone_floor_bytes_swa`, `unified-cache.cpp:2034-2111` at `d8a67422d`; 0
       with the allocator off) and P_raw is the ONEDNN zone's stored value when G_raw > 0 (§2.4.2,
-      rulings §M84; 0 otherwise). **If `charged_ONEDNN + G_raw + P_raw > max(available / 4,
-      charged_ONEDNN)`, then G = P = 0, the model's oneDNN SDPA declines on that device
-      (`interim_capped`) and ONEDNN = `charged_ONEDNN`; otherwise ONEDNN = `charged_ONEDNN + G_raw +
-      P_raw`.** The sum is replaced, never cut to the cap: master's `min(charged + G + P, cap)`
-      clamp does not survive, because it would reserve up to a quarter of the device budget for a
-      model that declined, an idle reservation that breaks plan == reality (P4). The cap test reads
-      the pre-cap G_raw and P_raw; every later reader (the replay, the per-step P) reads the
-      post-cap G. G and P are capacity for the interim, like a floor (§2.4.5, "A floor is not a
-      term"), never ledger entries, and witness 1's ONEDNN check reads that same two-step rule. The
-      dry run computes the same rule from the getters, so it grows nothing exactly when the
-      published W bytes are at most the ledger's ONEDNN terms, which is what it tests. The cap test
-      is on `stored + G_raw + P_raw`, as 23mk:4795-4796 tests it at (b1), so one model is capped by
-      one rule at (b1) and at L4+L6. The cap cannot bind on the merge-gate shapes, so no gate figure
-      moves: ONEDNN is 23592960 B on GPT-OSS 120B and 268435456 B on Qwen there. **The capped cell
-      (r38 I-1), an arm of the L4+L6 commit:** a pure-host fixture whose `charged_ONEDNN + G_raw +
-      P_raw` exceeds the cap pins ONEDNN = `charged_ONEDNN`, G = P = 0 and the `interim_capped`
-      decline; its RED is a tree that keeps `min(...)`, which reads the cap, and the cell is VOID if
-      its sum does not exceed the cap. 23mk H3's "(b1)'s interim G" capped fixture is the same cell
-      at (b1). Where it binds, the Graph draw that no longer fits is not sent to the direct
+      rulings §M84; 0 otherwise). **If `stored + G_raw + P_raw > max(available / 4, stored)`, then G
+      = P = 0, the model's oneDNN SDPA declines on that device (`interim_capped`) and ONEDNN =
+      `charged_ONEDNN`; otherwise ONEDNN = `charged_ONEDNN + G_raw + P_raw`.** The cap's base is
+      `stored`, the ONEDNN zone's stored value, as in 23mk (b1) (23mk:4795) and master
+      (`unified-cache.cpp:4495-4496`); `stored` and `charged_ONEDNN` are the same fact at this step
+      only when the dry run below passes, and the cap reads `stored`. The sum is replaced, never cut
+      to the cap: master's `min(charged + G + P, cap)` clamp does not survive, because it would
+      reserve up to a quarter of the device budget for a model that declined, an idle reservation
+      that breaks plan == reality (P4). The cap test reads the pre-cap G_raw and P_raw; every later
+      reader (the replay, the per-step P) reads the post-cap G. G and P are capacity for the
+      interim, like a floor (§2.4.5, "A floor is not a term"), never ledger entries, and witness 1's
+      ONEDNN check reads that same two-step rule. The dry run computes the same rule from the
+      getters, so it grows nothing exactly when the published W bytes are at most the ledger's
+      ONEDNN terms, which is what it tests. The cap test is on `stored + G_raw + P_raw`, as
+      23mk:4795-4796 tests it at (b1), so one model is capped by one rule at (b1) and at L4+L6. The
+      cap cannot bind on the merge-gate shapes, so no gate figure moves: ONEDNN is 23592960 B on
+      GPT-OSS 120B and 268435456 B on Qwen there. **The capped cell (r38 I-1; r39 M-3), an arm of
+      the L4+L6 commit, listed in §3.3:** a pure-host section of `test-sycl-kv-region` (G1's target)
+      with `available_budget` injected through a seam added with the cell, at Qwen's `-c 4096`
+      shape: stored = charged = W = 33554432, G_raw = 201326592, P_raw = 33554432 and available =
+      536870912, so the cap is `max(134217728, 33554432)` = 134217728 and the sum, 268435456,
+      exceeds it. Correct: ONEDNN = 33554432, G = P = 0, `interim_capped`. RED: a tree that keeps
+      `min(...)` reads 134217728. The cell is VOID unless the sum exceeds the cap AND `available / 4
+      > stored` (otherwise the cap is `stored` itself and `min(...)` equals the correct value, so
+      the cell would pass a clamping tree). 23mk H3's "(b1)'s interim G" capped fixture is the same
+      cell at (b1). Where it binds, the Graph draw that no longer fits is not sent to the direct
       overflow: (b1) declines oneDNN SDPA on that device as `interim_capped`, with one `oneDNN SDPA
       declined` WARN per (context, device, layer) carrying the running count (rulings §M71 (a)), and
       a runtime miss is the TERMINAL `[ZONE-PLAN-BUG]` channel, which aborts (rulings §M64 (a),
@@ -4773,11 +4798,11 @@ L0, and a failed revalidation under L0 is a bug, not a race.
     module guard (`:18744-18747`) and its mapping of a transaction `busy` to `BUSY`
     (`:18817-18818`), the FA recheck's module guard (`:19036-19039`), unload's (`:12285`),
     activate's module guard (`:15230`) and live-update ticket (`:15238` onward), and the module
-    guards of `stage_inventory_plan` (`:16779`) and `load_end` (`:13100`). A module guard that
-    fails under L0 is the §M76.5 case: shutdown, `commit_reactivate` and `rollback_reactivate` hold
-    L0, so the module can be found non-ACTIVE by another L0 holder only if a caller used it outside
-    its lifecycle. A
-    ticket or a transaction `busy` can fire only if a mutator skipped L0.
+    guards of `stage_inventory_plan` (`:16779`) and `load_end` (`:13100`). A module guard that fails
+    under L0 is the §M76.5 case: shutdown, `commit_reactivate`, `rollback_reactivate` and
+    `complete_unload` hold L0, so the module can be found non-ACTIVE by another L0 holder only if a
+    caller used it outside its lifecycle. A ticket or a transaction `busy` can fire only if a
+    mutator skipped L0.
 
   `load_begin`'s `LOAD_BUSY` is not in this list. It refuses a concurrent load, or a load into a
   closed module (`:12729-12732`), by name, as on master, and this design keeps it (above).
@@ -8237,11 +8262,16 @@ means that.
     I-1); `ggml_backend_sycl_set_runtime_context` is not exported; the three orphaned publishers
     are gone, `compute_placement_plan_early`'s body is a static impl behind its public entry,
     and the dead `nullptr` publish at `:14773` is gone (r9 m-2, m-3); and no per-device re-plan
-    mutex exists. **The walk's roots include the four reactivation phases (§2.4.2):**
-    `ggml_backend_sycl_commit_reactivate` and `ggml_backend_sycl_rollback_reactivate` must take the
-    token at the top of the entry, and `prepare_reactivate` and `finalize_reactivate` take none and
-    reach no publish or live-update callee; the gate asserts this by name, so either token deleted
-    fails it. Mutation witnesses:
+    mutex exists. **The by-name roots (§2.4.2):** the set is derived as every exported entry that
+    calls `reactivate`, `complete_shutdown`, `prepare_unified_cache_for_module_use` or
+    `rollback_unified_cache_module_use`, so a new entry is classified by derivation, never by a
+    list. The derived set minus the named exclusions, `prepare_reactivate`, `finalize_reactivate`,
+    `cancel_unload` and `reg` (each with its reason, §2.4.2), must equal the five L0 holders
+    `can_unload` (a try-lock), `shutdown`, `commit_reactivate`, `rollback_reactivate` and
+    `complete_unload`; the gate asserts by name that each of the four blocking holders takes the
+    token at the top of its entry, and that an excluded entry takes none and reaches no publish or
+    live-update callee. Any token deleted, or a derived entry in neither set, fails it. Mutation
+    witnesses:
     **an unlisted exported entry that reaches the CAS** (a new exported function calling the
     transaction body, which the reachability walk must find although no list names it), a
     publisher call site without a token, `ggml_backend_sycl_set_runtime_context` restored as an
@@ -8552,7 +8582,7 @@ means that.
       | L4+L6 (W + G + P, P = W; `-c 4096 -ub 512`, fkpg (a) landed) | 23592960 B (G = 0, no block, P = 0) | −244842496 B | 268435456 B | −35651584 B |
       | (b2) (W; `-c 4096 -ub 512`, fkpg (a) landed) | 23592960 B | 0 B | 33554432 B | −234881024 B |
       | RED: fkpg (a) without (b1) | 841433088 B (36126720 + 805306368) | +572997632 B | 268435456 B (252706816 B, below the constant) | 0 B |
-      | RED: L4+L6 without fkpg (a) (`n_ctx=512`) | 23592960 B (G = 0) | −244842496 B | 134217728 B (33554432 + 67108864 + 33554432) | −134217728 B |
+      | RED: L4+L6 at `-c 512` (fkpg (a) landed; the kept tree reads 268435456 B, the correct tree 134217728 B) | 23592960 B (G = 0) | −244842496 B | 134217728 B (33554432 + 67108864 + 33554432) | −134217728 B |
 
       So all of GPT-OSS 120B's 244842496 B gain lands at L6, and (b2) moves it by 0; Qwen's zone
       falls 35651584 B at L6 and 234881024 B at (b2), 270532608 B in all from (b1)'s 304087040 B
@@ -8560,12 +8590,11 @@ means that.
       separate steps (23mk:6032-6047): L4 keeps `max(268435456, stored + G + P)` with stored = W, so
       Qwen at `-c 4096` is 268435456 B at both, at 512 it is 268435456 B at L4 and 134217728 B at
       L6, and GPT-OSS 120B is 268435456 B at L4 and 23592960 B at L6. L4 and L6 are one commit here,
-      with no merge point between them, so only the L4+L6 row is a state an arm scores. Mistral Q4_0 at
-      512 (stored 150470656 B, W 117440512 B, G 67108864 B) reads 368050176 B at (b1), 301989888 B
-      at L4 and L6 and 117440512 B at (b2) (23mk:6042-6044); no moua arm scores it. The weight zone
-      moves by
-      the same bytes each
-      step, and the end states do not change. **The arm is scored at the gates' shape, `-c
+      with no merge point between them, so only the L4+L6 row is a state an arm scores. Mistral Q4_0
+      at 512 (stored 150470656 B, W 117440512 B, G 67108864 B) reads 368050176 B at (b1), 301989888
+      B at L4 and L6 and 117440512 B at (b2) (23mk:6042-6044); no moua arm scores it. The weight
+      zone moves by the same bytes each step, and the end states do not change. **The arm is scored
+      at the gates' shape, `-c
       4096 -ub 512`, which fkpg (a) carries (r20 m-13; 23mk 4.14).** G follows the caller's
       `-c`: at `n_ctx` 512 Qwen's G is the 64 MiB minimum, 67108864 B, so a tree without fkpg
       (a) reads 134217728 B at L4+L6 and (b2) moves 100663296 B, the last RED row, which the
@@ -8604,6 +8633,9 @@ means that.
       the arm is VOID: the census gate finds no SCRATCH draw without a term. RED: the floor
       kept, which ensures 536870912 B less the terms that no term charged. Both arms also run
       the dry-run witness, which must grow nothing;
+    - **the interim cap's cell (r39 M-3):** the capped fixture of §2.4.2 step 4, Qwen's `-c 4096`
+      shape with available = 536870912, pre-registered there; it is an arm of the L4+L6 commit and
+      VOID unless its sum exceeds the cap and `available / 4 > stored`;
     - **the model's first context places its C head slots (rulings §M32 C-1; pre-registered
       before the lead's run):** vehicles `gptoss120b-b1` and `glkg-qwen35b-a3b-b1`, the B50
       merge-gate shapes. **Scored by the pure-fit run**, not by a load: H2's `kv_region_fit` on
@@ -8735,13 +8767,13 @@ means that.
       supersede §M43's L4+L6 scoring). **Its precondition, asserted first or the arm is VOID:**
       the tree is post-(b2), by an anchored search of the tracked tree for
       `\bunified_cache_get_planned_onednn_scratchpad_bytes\s*\(`, which must find no definition
-      and no call; the anchor keeps the `_stored` twin (`:2141`) and 23mk's renamed W getter
-      from matching (r18 m-4). The mutant restores the with-floor getter (`:2148-2160` at
-      master, with (b1)'s sinks input) and points the load-stage reads at
+      and no call; the anchor keeps the `_stored` twin (`:2148`) and 23mk's renamed W getter from
+      matching (r18 m-4). The mutant restores the with-floor getter (`:2155-2169` at master, with
+      (b1)'s sinks input) and points the load-stage reads at
       `unified-cache.cpp:4464` and `:27658` at it (r14 m-15 (a)). Step 4 is sized from the
       ledger, which charges no C term, so only the dry run reads the restored getter. That
-      getter is the W getter's value plus the Graph-scratch floor G (`:2152-2160`, added only
-      under `onednn_graph_allocator_enabled()`), and **that value is W** from 23mk's re-point
+      getter is the W getter's value plus the Graph-scratch floor G (`:2160-2167`, added only under
+      `onednn_graph_allocator_enabled()`), and **that value is W** from 23mk's re-point
       (rulings §M32 I-4), so the dry run sizes ONEDNN at W + G against the ledger's `max(256
       MiB, W)` = W, and the witness fires exactly when G > 0. **Two preconditions, asserted
       before scoring, or the arm is VOID (r15 I-4):**
@@ -9292,19 +9324,33 @@ means that.
     waits for the unload's L0 and the watchdog fires; with the handshake, the RED cannot pass
     by timing. The wrapper test itself keeps its form; the handshake is used by this arm. A
     second arm, with L0 free, takes the `try_lock` and closes admission as before.
-  - **Reactivation holds L0 in `commit_reactivate` and `rollback_reactivate` (rulings §M76.5; the
-    lead's relay).** In a `GGML_SYCL_PRIVATE_TESTING` build, a publisher parks inside a real entry
-    holding L0 (the park point above), and a positive control at that moment fails a `try_lock` of
-    L0 from the calling thread. Then `commit_reactivate` is called on another thread: it blocks
-    until the holder releases and only then runs, and the admission state reads `COMMITTED_CLOSED`
-    only after the registry and cache hooks ran. The same is run for `rollback_reactivate` after a
-    completed commit (`rollback_committed` true): `complete_shutdown()` and
-    `rollback_unified_cache_module_use()` run only once L0 is free. `prepare_reactivate` and
-    `finalize_reactivate` return at once against the parked holder, since they take no L0. RED: a
-    `commit_reactivate` or `rollback_reactivate` without the token, under which a publisher's
-    publish interleaves between `reactivate()` and the admission flip, or between the rollback's
-    teardown and the previous-state restore, and the arm finds the interleave. A 5 s watchdog fails
-    the arm instead of hanging it.
+  - **Reactivation and complete unload hold L0 (rulings §M76.5; the lead's relay).** In a
+    `GGML_SYCL_PRIVATE_TESTING` build, on a model-less module, for `commit_reactivate`,
+    `rollback_reactivate` and `complete_unload`. **Module state:** the arm drives the real sequence.
+    `can_unload` moves `ACTIVE` to `RETRY_CLOSED` (or `complete_unload` to `COMPLETE_CLOSED`), and
+    only then `prepare_reactivate`, which needs one of those two states (`gs:109659-109662`); the
+    rollback case runs a completed `commit_reactivate` first. The holder parks inside a real entry
+    holding L0 **before** its module guard, as the token is taken before it, so the park is not a
+    counted mutation and `can_unload`'s 5 s drain (`gs:109606-109610`) has nothing to wait for; a
+    `try_lock` of L0 from the calling thread fails at that moment (positive control).
+    **Observable:** `ggml_backend_sycl_test_admission_snapshot` (`gs:110009-110022`) slots [0]
+    (admission), [6] (shutdown_reserved) and [7] (shutdown_completed). **Handshake, with no
+    timing:** a `GGML_SYCL_PRIVATE_TESTING` counter of threads blocked in the token's acquire; the
+    arm releases the holder only when it reads 1, since a thread that has not yet run looks the same
+    as a blocked one (the reason the `can_unload` arm above has a handshake). While the holder is
+    parked, `commit_reactivate` runs on another thread and the arm asserts that it has not returned
+    and that slot [0] still reads `PREPARING`; after the release it returns and slot [0] reads
+    `COMMITTED_CLOSED`. `rollback_reactivate`, after the completed commit, has not returned while
+    the holder is parked; after the release slot [0] reads the previous state (the source order is
+    restore, `gs:109702`, then teardown, `gs:109709-109710`), with slots [6] and [7] as
+    `complete_shutdown()` leaves them. `complete_unload` has not returned while parked, and slots
+    [0] and [7] show `COMPLETE_CLOSED` and 1 only after the release. `prepare_reactivate` and
+    `finalize_reactivate` return at once against the parked holder, since they take no L0. **RED,
+    scored on "the call returned while the holder was parked":** the token deleted from any of the
+    three; the call returns with the holder still parked and the blocked-in-acquire counter stays 0.
+    No publish interleave is scored: a non-ACTIVE module refuses every publishing entry at its
+    module guard, so the blocking is the observable. A 5 s watchdog fails the arm instead of hanging
+    it.
   - **Load B while A's context holds its rows (llama.cpp-r7fz; rulings §M7 I-4, §M32 I-1,
     §M38 I-2).** Model A's context holds claimed-then-vacated ring rows on device 0; model B
     loads on device 0. After B's load, A's rows (handles, sizes, depth) and A's model's weight
@@ -9774,8 +9820,11 @@ is reachable from a host model. So those arms are G2's, and H9 (4) keeps the led
     kernel on the context's own in-order queue: a **W writer**, which writes the use's id into
     the view's first word, then a **W reader**, which reads that word and appends the use's id
     and the word it read to the log. The writer stands for the reorder and the reader for the
-    matmul, so the function anchors the use on the reader's event. A marker use of a pool term
-    is a pool draw of the term followed by the same two steps;
+    matmul, so the function anchors the use on the reader's event. A marker use of a pool term is a
+    pool draw of the term followed by the same two steps. **Under rulings §M86:**
+    `acquire_onednn_pp_scratch` refuses a tensor whose W exceeds the zone's realized window while a
+    Graph block is live, so every fixture that drives it, marker or production, states that no block
+    is live or that W <= the window, and a use whose acquire returned false is VOID, never a pass;
   - a **production use**: a fixture ggml graph of one `MUL_MAT`, with a Q4_0 `src0` whose pair
     demand is the fixture model's `onednn_pp_w` term and an F32 `src1` of 32 columns, above
     `ggml_sycl_onednn_pp_min_batch()`'s default of 16 (`:27563-27573`), computed by
@@ -12304,7 +12353,7 @@ design-moua-r7 found 0 Critical, 7 Important and 11 Minor. The lead ruled in rul
 - The wrapper's module-admission `BUSY` (`:18848-18849`) is reachable only when the module is
   not ACTIVE (reactivation or shutdown). Under L0 it becomes `[CONTEXT-PLAN-BUG]` with the
   wrapper's other returns. Revision 7.6 left a shutdown race open here; rulings §M76.5 closes it in
-  7.7: shutdown, `commit_reactivate` and `rollback_reactivate` take L0 (§2.4.2).
+  7.7: shutdown, `commit_reactivate`, `rollback_reactivate` and `complete_unload` take L0 (§2.4.2).
 - The load's L0 span is a choice (per entry, not load_begin..load_end). The alternative covers
   the whole load and needs a callback clause in the deadlock rule.
 - The MMID host pool is held by the model's MMID entry, not a context's reservation, because
@@ -12356,7 +12405,7 @@ master `76c7f6548` at `db609bd15`, and every new line was checked with `git show
 |------|-------------|
 | §M76.1 condition (covered read vs a concurrent L0 holder) | §2.4.2 "Why COVERED is safe without L0" shows condition (a): everything COVERED depends on is owned, not free room. H9 arm with a parked holder running an unload, a quarantine restore and a load. |
 | §M76.2 condition (what an interleave observes) | I-3 above. |
-| §M76.5 (shutdown and reactivation take L0) | In the L0 list, where reactivation's holders are `commit_reactivate` and `rollback_reactivate` (`gs:109670`, `gs:109696`); a non-ACTIVE module under L0 is `[CONTEXT-PLAN-BUG]`; H9 arm. |
+| §M76.5 (shutdown and reactivation take L0) | In the L0 list, where reactivation's holders are `commit_reactivate` and `rollback_reactivate` (`gs:109670`, `gs:109696`) and `complete_unload` (`gs:109640-109644`) is a fifth holder; a non-ACTIVE module under L0 is `[CONTEXT-PLAN-BUG]`; H9 arm. |
 | §M76a (inventory globals) | §2.4.2 "Per-model plan state"; H7ao with the `:18245` witness, scoped by path set. |
 | llama.cpp-fsgi pointer | One line in §2.4.2: `get_cached_tensor_ptr` (`:19236`) is fsgi's, reuses the snapshot, lands after moua. |
 | §Z42.3 (no per-record zone) | The zone line and the record's zone field are deleted (§2.4.3 "Zone"). |
@@ -12521,8 +12570,8 @@ I-4 and the 85635feee Minors are the ones 7.9 answered (table above); the new it
 - The token has **three** kinds where §M9a names two. `TRANSACTION` versus `LOAD` is the
   ruling's discrimination and the gates use only `TRANSACTION`; `LIFECYCLE` exists so that the
   probe, the FA recheck, activate, unload, `can_unload`, shutdown, `commit_reactivate`,
-  `rollback_reactivate` and the release proc are not labelled as a transaction or a load. It is
-  still one state and one accessor. If
+  `rollback_reactivate`, `complete_unload` and the release proc are not labelled as a transaction or
+  a load. It is still one state and one accessor. If
   the lead prefers two values, those holders take `LOAD` and nothing else changes.
 - The dead `materialize_moe_tensor_planned_layout` deletion reaches zhcn's row 35 list
   (`:60125`, `:60115`); I am telling zhcn.
@@ -13462,7 +13511,7 @@ its RED and its edge; the For-the-lead paragraph) are left as the record of 7.14
 
 | item | finding / ruling | disposition |
 |---|---|---|
-| r18 C-1; §M44 C-1 | §M42 (3)'s hard edge was cyclic: the whole Graph-scratch commit before L4+L6, while its conversion needs L4's pending ranges and claims and L6's transaction steps | **Changed (option (b)).** The commit splits. **(b1), before L4:** a sinks-aware G input to master's floor function (`onednn_graph_scratch_zone_floor_bytes_swa`, `unified-cache.cpp:2027`, summed by the with-floor getter at `:2148-2160`), whose SDPA head count calls `fattn-onednn.cpp:115-116`'s reject predicate. It charges only in master's floor path, and it is deleted with the floor function in (b2). **(b2), after L6:** the `REGION` conversion, an ordinary conversion under §2.4.3's transition rule. Edges: (b1) → moua L4 and moua L6 → (b2) (§4's L4 row, landing steps 3 and 5, the edge list). Between L4+L6 and (b2) step 4 sizes ONEDNN as `min(charged_ONEDNN + G, max(available / 4, charged_ONEDNN))`, G interim capacity, never a ledger entry; the 268435456 B constant goes at L4+L6 (§M37 Q3). **Pre-registered at L4+L6:** the pre-plan split 14791213056 B; GPT-OSS 120B ONEDNN 23592960 + 0 B, weight zone 14203584512 − k × 1024 B (13545.6 MiB); Qwen ONEDNN 234881024 B, weight zone 14413725696 − k × 2048 B (13746.0 MiB). **From (b2):** Qwen ONEDNN 33554432 B, weight zone 14615052288 − k × 2048 B (13938.0 MiB); GPT-OSS unchanged. **RED, the pre-(b1) tree:** GPT-OSS G 805306368 B, ONEDNN 828899328 B, weight zone 13398278144 − k × 1024 B. First-context known sets: 1560297728 / 2197651712 B at L4+L6 (server 2395242752 B), 1560297728 / 2398978304 B from (b2) (server 2596569344 B). The Graph scratch stays on H7p's unconverted list from L4 until (b2), and the double-charge RED is on the gate at L4+L6 (2398978304 against 2197651712 B, ONEDNN holding 201326592 B). Pack-before-ensure overshoot on Qwen: 377487360 + k × 2048 B at L4+L6, 176160768 + k × 2048 B from (b2). C10 does not move across (b2) (527.8 MiB, ~256 groups on Qwen; 174.5 MiB, ~14 on GPT-OSS). 7.14j's order check (L4+L6 without 23mk's commit fails by name) is withdrawn with the edge. Every hard-edge text is rewritten: step 2, the dry run, the ONEDNN load stage, the Graph-scratch commit, the end states, beni's text, the member table, the transition rule, the term table, the zones, floors, first-context and C-rule arms, and §4. |
+| r18 C-1; §M44 C-1 | §M42 (3)'s hard edge was cyclic: the whole Graph-scratch commit before L4+L6, while its conversion needs L4's pending ranges and claims and L6's transaction steps | **Superseded for the step-4 clamp form and the Qwen 234881024 B figure by §6.47 and §6.49 I-1.** **Changed (option (b)).** The commit splits. **(b1), before L4:** a sinks-aware G input to master's floor function (`onednn_graph_scratch_zone_floor_bytes_swa`, `unified-cache.cpp:2027`, summed by the with-floor getter at `:2148-2160`), whose SDPA head count calls `fattn-onednn.cpp:115-116`'s reject predicate. It charges only in master's floor path, and it is deleted with the floor function in (b2). **(b2), after L6:** the `REGION` conversion, an ordinary conversion under §2.4.3's transition rule. Edges: (b1) → moua L4 and moua L6 → (b2) (§4's L4 row, landing steps 3 and 5, the edge list). Between L4+L6 and (b2) step 4 sizes ONEDNN as `min(charged_ONEDNN + G, max(available / 4, charged_ONEDNN))`, G interim capacity, never a ledger entry; the 268435456 B constant goes at L4+L6 (§M37 Q3). **Pre-registered at L4+L6:** the pre-plan split 14791213056 B; GPT-OSS 120B ONEDNN 23592960 + 0 B, weight zone 14203584512 − k × 1024 B (13545.6 MiB); Qwen ONEDNN 234881024 B, weight zone 14413725696 − k × 2048 B (13746.0 MiB). **From (b2):** Qwen ONEDNN 33554432 B, weight zone 14615052288 − k × 2048 B (13938.0 MiB); GPT-OSS unchanged. **RED, the pre-(b1) tree:** GPT-OSS G 805306368 B, ONEDNN 828899328 B, weight zone 13398278144 − k × 1024 B. First-context known sets: 1560297728 / 2197651712 B at L4+L6 (server 2395242752 B), 1560297728 / 2398978304 B from (b2) (server 2596569344 B). The Graph scratch stays on H7p's unconverted list from L4 until (b2), and the double-charge RED is on the gate at L4+L6 (2398978304 against 2197651712 B, ONEDNN holding 201326592 B). Pack-before-ensure overshoot on Qwen: 377487360 + k × 2048 B at L4+L6, 176160768 + k × 2048 B from (b2). C10 does not move across (b2) (527.8 MiB, ~256 groups on Qwen; 174.5 MiB, ~14 on GPT-OSS). 7.14j's order check (L4+L6 without 23mk's commit fails by name) is withdrawn with the edge. Every hard-edge text is rewritten: step 2, the dry run, the ONEDNN load stage, the Graph-scratch commit, the end states, beni's text, the member table, the transition rule, the term table, the zones, floors, first-context and C-rule arms, and §4. |
 | §M44 addendum; §M43 | the C-rule arm's tree | **Changed.** The arm is an arm of (b2) again, scored on the post-(b2) tree, which carries step 4's ledger. The fixture's attention is a non-sinks shape the SDPA route accepts, so G > 0; a sinks shape gives G = 0 and the arm is VOID. The arm re-pre-registers its witness values on that shape. §M43's L4+L6 scoring belonged to the hard edge and is superseded. |
 | r18 I-1; §M44 I-1 | the leg kept its `should_use_runtime` chain, so the claim scope was not its only discriminator | **Changed.** The claim scope is the leg's only discriminator: a bound load's weight buffer to its `WEIGHT` ranges, zhcn's compute scope, the context's API-call scope, else the `unplanned SYCL%d buffer` refusal. On arena devices the leg's `should_use_runtime` block (`ggml-sycl.cpp:37640-37743`: the KV-zone draw `:37681-37704`, SCRATCH `:37711-37736`, the legacy fallback `:37741`) is deleted. A weight buffer outside the pack's ranges is refused by name, never routed to `WEIGHT`. C9's unplanned arm GREEN adds "no zone's live bytes grown"; its REDs include 7.14j's leg (the forbid flag set, the chain kept). (Superseded in place, §6.29 I-1 and §6.30 I-1: "on arena devices" here is now "on planned devices", §2.) |
 | r18 I-2 (a); §M44 I-2 (a) | "free room" in a non-RUNTIME zone was undefined, and a live reading of the idle compute arena hands A's transient capacity to B | **Changed.** Step 3: a zone's free room is its capacity minus the live models' charged terms in it, from the ledger, never from live bytes or the TLSF (P4). A floor counts as charged. No pending range is placed inside SCRATCH, because the compute arena aliases the whole zone from its start (`unified-cache.cpp:4537`, `:20695-20732`) and bumps over it (`:20817`); a later load's SCRATCH term that fits the ledger free room is charged as capacity with no range, else it is a shared-zone `{MODEL, id}` range or the named refusal. H9 gains (5b): B's SCRATCH terms (33554432 B) below A's (67108864 B), A idle. GREEN: B is not placed in SCRATCH. RED: placement from live free bytes, after which A's next op is short by 33554432 B. |
@@ -14371,3 +14420,23 @@ lead relays 23mk's final head and the reviewer's old-to-new line map for the fin
 | n-4 | the (b1)-to-L4 interval covered only the pre-§4 half | **Changed.** After §4 and before L4 it is `max(268435456, W + G + P)`, 268435456 B on Qwen at both shapes (23mk:6032-6047). |
 | P's existence at L4+L6 | not flagged; ruled by §M84 | **Unchanged.** llama.cpp-z8fr tracks revisiting P. |
 | reactivation (lead's relay, after the report) | moua said "module reactivation takes L0" with no function | **Changed.** At `d8a67422d` reactivation is `prepare_reactivate` (`gs:109657`), `commit_reactivate` (`gs:109670`), `finalize_reactivate` (`gs:109678`) and `rollback_reactivate` (`gs:109696`). L0 is held in `commit_reactivate` (the only phase that touches the registry and cache) and in `rollback_reactivate` (a committed rollback runs `complete_shutdown()` and `rollback_unified_cache_module_use()`, `gs:109708-109711`); `prepare` and `finalize` only flip admission. Named in §2.4.2's L0 list, the LIFECYCLE kind list, the module-guard note, the census (H7ai: both take the token at the top, the other two none, asserted by name), the H9 arm (a new bullet) and the §M76.5 table row. zhcn's gate 22b expiry keys on `can_unload`, `shutdown`, `commit_reactivate` and `rollback_reactivate`. One design choice for the lead: the token is taken at the top of `rollback_reactivate`, before the admission mutex, so the census rule is uniform; a no-op rollback takes and releases it. |
+
+### 6.50 Revision 7.14ah: design-moua-r39
+
+Revision 7.14ah is one commit on top of `79fa71b00`, by impl-moua-s. It answers design review r39
+(design-moua-r39 on `152cbc5bb..79fa71b00`: 0 Critical, 1 Important, 4 Minor, 4 nits; P1-P4 pass)
+and the lead's rulings. The 23mk cites stay at `87da879f1`; the final re-pin follows 23mk's review.
+
+| item | finding / ruling | disposition |
+|---|---|---|
+| I-1 | two more exported entries (`complete_unload`, `reg`) call the census's functions and were in neither the L0 list nor an exclusion | **Changed.** The rule is "every exported entry that tears down or reactivates the registry or the cache holds L0", with five holders: `can_unload`, `shutdown`, `commit_reactivate`, `rollback_reactivate` and `complete_unload` (`gs:109640-109644`; `can_unload`'s token is gone by then). Excluded with reasons: `prepare_reactivate` and `finalize_reactivate` (admission flips), `cancel_unload` (`gs:109629-109638`, reopens only) and `reg` (`gs:110392-110394`: one idempotent atomic store, `unified-cache.cpp:19360-19362`). Caveat recorded: on a non-ACTIVE module `reg` clears that flag before `commit_reactivate`, by design for NODELETE reload. §2.4.2's list, the LIFECYCLE kind list, the guard note, the H7ai by-name roots (the set is derived from the four callees, minus the named exclusions) and H9 all carry it. |
+| M-1 | "commit is the only phase that touches the registry and cache" contradicted the next sentence | **Changed.** "the only phase that makes the registry and the cache live"; rollback undoes it. Also the §6.49 reactivation row. |
+| M-2 | the H9 reactivation arm named an impossible interleave, hooks that do not exist, no timing-free handshake and no module state | **Changed.** Source order is restore (`gs:109702`) then teardown (`gs:109709-109710`). The observable is `test_admission_snapshot` slots [0], [6], [7] and "the call returned while the holder was parked". A blocked-in-acquire counter is the handshake. The holder parks before the module guard. The sequence is stated (`can_unload` or `complete_unload`, `prepare_reactivate`, park, commit, rollback). `prepare` and `finalize` return at once. |
+| M-3 | the capped cell was underspecified and could be vacuous | **Changed.** Qwen `-c 4096`, available = 536870912, cap = 134217728; correct ONEDNN = 33554432, G = P = 0, `interim_capped`; the `min(...)` tree reads 134217728. VOID unless sum > cap AND `available / 4 > stored`. Target `test-sycl-kv-region`; listed in §3.3. |
+| M-4 | the cap's base was `charged_ONEDNN` in the formula and `stored` in the prose | **Changed.** The cap reads `stored`, as 23mk:4795 and master (`unified-cache.cpp:4495-4496`) do; `stored` and `charged_ONEDNN` are the same fact only when the dry run passes. |
+| N-1 | mixed bases and an undefined `gs:` | **Changed.** `gs:` is defined once at `d8a67422d`; shutdown is `gs:109883`, `can_unload` `gs:109575`, its drain `gs:109606-109610`; the getter is `:2148` and the with-floor getter `:2155-2169` throughout. |
+| N-2 | ragged lines at the edit boundaries | **Changed.** Reflowed. |
+| N-3 | the 7.14af header bullet still stated the withdrawn flag | **Changed.** Marked "withdrawn in 7.14ag, §6.49 m-5". |
+| N-4 | the `n_ctx=512` RED row label | **Changed.** "L4+L6 at `-c 512` (fkpg (a) landed; the kept tree reads 268435456 B, the correct tree 134217728 B)". |
+| uncounted | G2's marker arms under §M86 | **Changed.** Every fixture that drives `acquire_onednn_pp_scratch` states that no block is live or W <= the window; a false acquire is VOID. |
+| history | rows :13465 and :13894 carried the clamp form unmarked | **Changed.** The r18 C-1 row is marked superseded. |
