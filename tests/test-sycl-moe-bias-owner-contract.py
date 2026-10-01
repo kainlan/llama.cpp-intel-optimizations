@@ -166,9 +166,12 @@ def evaluate(backend, header):
         ("bias publish installs via adopt_biases, so it cannot roll back the activation half",
          "adopt_biases(std::move(scanned))" in publish_bias),
 
-        # The consumer reads a copy through the helper, never the map directly.
-        ("the fusion path looks biases up through the helper",
-         "ggml_sycl_moe_bias_lookup(cur_layer_fast, &layer_bias)" in backend),
+        # No consumer reads the map directly. The one caller this used to pin
+        # (the retained prompt-fusion route, `ggml_sycl_moe_bias_lookup(cur_layer_fast,
+        # &layer_bias)`) was removed by abecb785d, leaving the copying helper with no
+        # caller; the property that survives is that the helper is the only reader.
+        ("the layer-bias map is read only through the copying helper",
+         backend.count("g_moe_bias_state.find_layer(") == 1 and "g_moe_bias_state.find_layer(layer)" in lookup),
         ("the lookup helper copies the entry out rather than returning a pointer into the map",
          "*out = *entry;" in lookup),
 
