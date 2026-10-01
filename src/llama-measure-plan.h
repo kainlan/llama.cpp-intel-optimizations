@@ -27,25 +27,25 @@ enum llama_measure_kind : uint32_t {
 // context (llama_memory_i::init_reserve); 0 means every stream of the memory,
 // which is what init_full() builds.
 struct llama_measure_graph {
-    llama_measure_kind kind          = LLAMA_MEASURE_KIND_PP;
-    uint32_t           n_tokens      = 0;
-    uint32_t           n_seqs        = 0;
-    uint32_t           n_streams     = 0;
-    uint32_t           n_outputs     = 0;
-    bool               embeddings    = false;
-    bool               nextn         = false;
-    bool               nextn_masked  = false;
-    int32_t            nextn_offset  = 0;
-    bool               warmup        = false;
+    llama_measure_kind kind         = LLAMA_MEASURE_KIND_PP;
+    uint32_t           n_tokens     = 0;
+    uint32_t           n_seqs       = 0;
+    uint32_t           n_streams    = 0;
+    uint32_t           n_outputs    = 0;
+    bool               embeddings   = false;
+    bool               nextn        = false;
+    bool               nextn_masked = false;
+    int32_t            nextn_offset = 0;
+    bool               warmup       = false;
 };
 
 struct llama_measure_set_params {
-    uint32_t n_tokens      = 0;      // min(n_ctx, n_ubatch): the pp graph's token count
-    uint32_t n_seq_max     = 1;
-    uint32_t n_outputs_max = 0;
-    bool     kv_unified    = true;
-    uint32_t n_layer_nextn = 0;      // hparams.n_layer_nextn
-    bool     warmup        = false;  // the context's warmup flag now: while on, every graph is a warmup graph
+    uint32_t n_tokens            = 0;  // min(n_ctx, n_ubatch): the pp graph's token count
+    uint32_t n_seq_max           = 1;
+    uint32_t n_outputs_max       = 0;
+    bool     kv_unified          = true;
+    uint32_t n_layer_nextn       = 0;      // hparams.n_layer_nextn
+    bool     warmup              = false;  // the context's warmup flag now: while on, every graph is a warmup graph
     // The reserve's closing pp graph is built with one sequence for the archs
     // whose pp compute grows with n_seq_tokens^2 (KIMI_LINEAR, MINIMAX_01).
     bool     pp_again_single_seq = false;
@@ -77,8 +77,8 @@ inline std::vector<llama_measure_graph> llama_measure_graph_set(const llama_meas
     for (int emb = 0; emb < 2; ++emb) {
         for (uint32_t v = 0; v < llama_measure_nextn_variants(p.n_layer_nextn); ++v) {
             llama_measure_graph base;
-            base.embeddings   = emb != 0;
-            base.warmup       = p.warmup;
+            base.embeddings = emb != 0;
+            base.warmup     = p.warmup;
             if (v > 0) {
                 base.nextn        = true;
                 base.nextn_masked = ((v - 1) % 2) == 1;
@@ -86,21 +86,21 @@ inline std::vector<llama_measure_graph> llama_measure_graph_set(const llama_meas
             }
 
             llama_measure_graph pp = base;
-            pp.kind      = LLAMA_MEASURE_KIND_PP;
-            pp.n_tokens  = p.n_tokens;
-            pp.n_seqs    = p.n_seq_max;
-            pp.n_outputs = n_outputs_pp;
+            pp.kind                = LLAMA_MEASURE_KIND_PP;
+            pp.n_tokens            = p.n_tokens;
+            pp.n_seqs              = p.n_seq_max;
+            pp.n_outputs           = n_outputs_pp;
             out.push_back(pp);
 
             llama_measure_graph tg = base;
-            tg.kind      = LLAMA_MEASURE_KIND_TG;
-            tg.n_tokens  = p.n_seq_max;
-            tg.n_seqs    = p.n_seq_max;
-            tg.n_outputs = p.n_seq_max;
+            tg.kind                = LLAMA_MEASURE_KIND_TG;
+            tg.n_tokens            = p.n_seq_max;
+            tg.n_seqs              = p.n_seq_max;
+            tg.n_outputs           = p.n_seq_max;
             out.push_back(tg);
 
             llama_measure_graph again = pp;
-            again.kind = LLAMA_MEASURE_KIND_PP_AGAIN;
+            again.kind                = LLAMA_MEASURE_KIND_PP_AGAIN;
             if (p.pp_again_single_seq) {
                 again.n_seqs = 1;
             }
@@ -108,11 +108,11 @@ inline std::vector<llama_measure_graph> llama_measure_graph_set(const llama_meas
 
             for (uint32_t s = 1; s <= n_streams; ++s) {
                 llama_measure_graph st = base;
-                st.kind      = LLAMA_MEASURE_KIND_STREAM;
-                st.n_tokens  = s * (p.n_tokens / s);
-                st.n_seqs    = s;
-                st.n_streams = s;
-                st.n_outputs = std::min(st.n_tokens, p.n_outputs_max);
+                st.kind                = LLAMA_MEASURE_KIND_STREAM;
+                st.n_tokens            = s * (p.n_tokens / s);
+                st.n_seqs              = s;
+                st.n_streams           = s;
+                st.n_outputs           = std::min(st.n_tokens, p.n_outputs_max);
                 out.push_back(st);
             }
         }

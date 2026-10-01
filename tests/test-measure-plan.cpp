@@ -34,7 +34,10 @@ static void expect(bool ok, const char * what) {
     }
 }
 
-static llama_measure_set_params params(uint32_t n_tokens, uint32_t n_seq_max, uint32_t n_outputs_max, bool kv_unified,
+static llama_measure_set_params params(uint32_t n_tokens,
+                                       uint32_t n_seq_max,
+                                       uint32_t n_outputs_max,
+                                       bool     kv_unified,
                                        uint32_t n_layer_nextn = 0) {
     llama_measure_set_params p;
     p.n_tokens      = n_tokens;
@@ -81,9 +84,9 @@ static void test_counts() {
 
 static void test_shapes() {
     // pp and tg are the reserve's own graphs: n_outputs_pp = min(tokens, outputs_max).
-    auto g = llama_measure_graph_set(params(512, 2, 100, true));
-    const auto & pp = g[0];
-    const auto & tg = g[1];
+    auto         g     = llama_measure_graph_set(params(512, 2, 100, true));
+    const auto & pp    = g[0];
+    const auto & tg    = g[1];
     const auto & again = g[2];
     expect(pp.kind == LLAMA_MEASURE_KIND_PP && pp.n_tokens == 512 && pp.n_seqs == 2 && pp.n_outputs == 100,
            "pp: n_tokens, n_seq_max sequences, min(tokens, n_outputs_max) outputs");
@@ -95,20 +98,22 @@ static void test_shapes() {
     expect(pp.n_streams == 0 && tg.n_streams == 0 && again.n_streams == 0, "the reserve graphs span every stream");
 
     // The archs whose pp compute grows with n_seq_tokens^2 close on one sequence.
-    auto p = params(512, 4, 2048, true);
+    auto p                = params(512, 4, 2048, true);
     p.pp_again_single_seq = true;
-    g = llama_measure_graph_set(p);
-    expect(g[0].n_seqs == 4 && g[2].n_seqs == 1 && g[2].n_tokens == 512, "pp again on one sequence for the quadratic-mask archs");
+    g                     = llama_measure_graph_set(p);
+    expect(g[0].n_seqs == 4 && g[2].n_seqs == 1 && g[2].n_tokens == 512,
+           "pp again on one sequence for the quadratic-mask archs");
 
     // The embeddings value splits the set in two halves of equal size.
     g = llama_measure_graph_set(params(512, 1, 2048, true));
-    expect(!g[0].embeddings && !g[1].embeddings && !g[2].embeddings && g[3].embeddings && g[4].embeddings && g[5].embeddings,
+    expect(!g[0].embeddings && !g[1].embeddings && !g[2].embeddings && g[3].embeddings && g[4].embeddings &&
+               g[5].embeddings,
            "embeddings off first, then on");
 
     // Warmup marks every graph while it is on.
-    p = params(512, 1, 2048, true);
+    p        = params(512, 1, 2048, true);
     p.warmup = true;
-    g = llama_measure_graph_set(p);
+    g        = llama_measure_graph_set(p);
     bool all = true;
     for (const auto & x : g) {
         all = all && x.warmup;
@@ -118,7 +123,7 @@ static void test_shapes() {
 
 static void test_streams() {
     // 512 tokens over s streams: s * floor(512 / s), n_seqs = n_streams = s.
-    auto g = llama_measure_graph_set(params(512, 5, 2048, false));
+    auto                             g = llama_measure_graph_set(params(512, 5, 2048, false));
     std::vector<llama_measure_graph> st;
     for (const auto & x : g) {
         if (x.kind == LLAMA_MEASURE_KIND_STREAM && !x.embeddings) {
@@ -129,14 +134,15 @@ static void test_streams() {
     bool ok = true;
     for (size_t i = 0; i < st.size(); ++i) {
         const uint32_t s = (uint32_t) i + 1;
-        ok = ok && st[i].n_streams == s && st[i].n_seqs == s && st[i].n_tokens == s * (512 / s) &&
+        ok               = ok && st[i].n_streams == s && st[i].n_seqs == s && st[i].n_tokens == s * (512 / s) &&
              st[i].n_outputs == st[i].n_tokens;
     }
     expect(ok, "s-stream shape: tokens s * floor(512 / s), n_seqs = n_streams = s, outputs = tokens");
-    expect(st[2].n_tokens == 510 && st[4].n_tokens == 510, "s = 3 and s = 5 measure 510 tokens, never the rounded-up 513 or 515");
+    expect(st[2].n_tokens == 510 && st[4].n_tokens == 510,
+           "s = 3 and s = 5 measure 510 tokens, never the rounded-up 513 or 515");
 
     // The output count is capped like the pp graph's.
-    g = llama_measure_graph_set(params(512, 4, 100, false));
+    g  = llama_measure_graph_set(params(512, 4, 100, false));
     ok = true;
     for (const auto & x : g) {
         if (x.kind == LLAMA_MEASURE_KIND_STREAM) {
@@ -147,7 +153,7 @@ static void test_streams() {
 }
 
 static void test_nextn() {
-    auto g = llama_measure_graph_set(params(512, 1, 2048, true, 2));
+    auto                             g = llama_measure_graph_set(params(512, 1, 2048, true, 2));
     // embeddings off: variants 0..4, three graphs each.
     std::vector<llama_measure_graph> pp;
     for (const auto & x : g) {
@@ -163,7 +169,7 @@ static void test_nextn() {
     expect(pp[4].nextn && pp[4].nextn_masked && pp[4].nextn_offset == 1, "variant 4: on-masked, offset 1");
 
     // Without nextn layers the fields are inert and never enumerated.
-    g = llama_measure_graph_set(params(512, 1, 2048, true, 0));
+    g        = llama_measure_graph_set(params(512, 1, 2048, true, 0));
     bool any = false;
     for (const auto & x : g) {
         any = any || x.nextn;
@@ -184,31 +190,57 @@ static void test_chunk_plan() {
     expect(ok && cap.size() == 1 && cap[0] == 900, "single chunk: the high-water mark, not the chunk size");
 
     // Several chunks: below the last, MAX(chunk size, largest peak); the last is the high-water mark.
-    ok = llama_measure_chunk_plan(peaks({ { 1000, 1000, 400 }, { 1000, 600, 0 } }), 1000, 16, cap, reason);
+    ok = llama_measure_chunk_plan(peaks({
+                                      { 1000, 1000, 400 },
+                                      { 1000, 600,  0   }
+    }),
+                                  1000, 16, cap, reason);
     expect(ok && cap.size() == 3 && cap[0] == 1000 && cap[1] == 1000 && cap[2] == 400,
            "three chunks: full chunk size below the last, the peak in the last");
 
     // An under-filled chunk below the last: a smaller decode ubatch can fill it to its capacity.
-    ok = llama_measure_chunk_plan(peaks({ { 700, 300 }, { 650, 100 } }), 1000, 16, cap, reason);
+    ok = llama_measure_chunk_plan(peaks({
+                                      { 700, 300 },
+                                      { 650, 100 }
+    }),
+                                  1000, 16, cap, reason);
     expect(ok && cap.size() == 2 && cap[0] == 1000 && cap[1] == 300, "an under-filled chunk 0 plans its full capacity");
 
     // An oversize chunk below the last keeps its own peak as its capacity.
-    ok = llama_measure_chunk_plan(peaks({ { 3000, 500 }, { 800, 100 } }), 1000, 16, cap, reason);
+    ok = llama_measure_chunk_plan(peaks({
+                                      { 3000, 500 },
+                                      { 800,  100 }
+    }),
+                                  1000, 16, cap, reason);
     expect(ok && cap.size() == 2 && cap[0] == 3000 && cap[1] == 500, "an oversize chunk 0 is its own peak");
 
     // A graph with fewer chunks contributes only to the indices it has.
-    ok = llama_measure_chunk_plan(peaks({ { 100 }, { 1000, 250 } }), 1000, 16, cap, reason);
-    expect(ok && cap.size() == 2 && cap[0] == 1000 && cap[1] == 250, "a shorter layout leaves the later chunks to the longer one");
+    ok = llama_measure_chunk_plan(peaks({
+                                      { 100 },
+                                      { 1000, 250 }
+    }),
+                                  1000, 16, cap, reason);
+    expect(ok && cap.size() == 2 && cap[0] == 1000 && cap[1] == 250,
+           "a shorter layout leaves the later chunks to the longer one");
 
     // The unbounded final gallocr chunk is a named refusal.
-    ok = llama_measure_chunk_plan(peaks({ { 1, 2, 3, 4 } }), 1000, 4, cap, reason);
+    ok = llama_measure_chunk_plan(peaks({
+                                      { 1, 2, 3, 4 }
+    }),
+                                  1000, 4, cap, reason);
     expect(!ok && cap.empty() && reason == "graph needs the unbounded final gallocr chunk",
            "reaching chunk index max_chunks - 1 refuses");
-    ok = llama_measure_chunk_plan(peaks({ { 1, 2, 3 } }), 1000, 4, cap, reason);
+    ok = llama_measure_chunk_plan(peaks({
+                                      { 1, 2, 3 }
+    }),
+                                  1000, 4, cap, reason);
     expect(ok && cap.size() == 3, "one chunk below the unbounded index is fine");
 
     // Several chunks with no chunk size cannot be planned.
-    ok = llama_measure_chunk_plan(peaks({ { 1, 2 } }), SIZE_MAX, 16, cap, reason);
+    ok = llama_measure_chunk_plan(peaks({
+                                      { 1, 2 }
+    }),
+                                  SIZE_MAX, 16, cap, reason);
     expect(!ok && !reason.empty(), "several chunks with an unbounded chunk size refuse");
     ok = llama_measure_chunk_plan(peaks({ { 5 } }), SIZE_MAX, 16, cap, reason);
     expect(ok && cap.size() == 1 && cap[0] == 5, "one chunk with an unbounded chunk size is its peak");
