@@ -657,6 +657,21 @@ ESCAPES = (
     ("reserve-token-pasted-in-a-helper", [(_ELSEWHERE, "static bool third(ggml_sycl::unified_cache * c, size_t a, size_t b, size_t d, uint32_t r) { return c->reserve_pp_moe_onednn_ ## scratch(a, b, d, r); }\n" + _ELSEWHERE)]),
     ("reserve-token-pasted-in-a-macro", [(_ELSEWHERE, "#define RSV(c, ...) (c)->reserve_pp_moe_onednn_##scratch(__VA_ARGS__)\n" + _ELSEWHERE)]),
     ("reserve-with-a-line-break-before-the-paren", [(_ELSEWHERE, "static bool third(ggml_sycl::unified_cache * c, size_t a, size_t b, size_t d, uint32_t r) { return c->reserve_pp_moe_onednn_scratch\n(a, b, d, r); }\n" + _ELSEWHERE)]),
+    # Only the plan comparison (reservation_passes_the_plan) can see these: the count and token pins are preserved, the
+    # whitelist allows every name that is still there, and the ordered() needles cover only the leading arguments.
+    ("staging-output-slot-replaced-by-the-raw-request", [(_CALL_STAGING, _CALL_STAGING.replace("planned_output_slot, planned_ring_depth);", "dst_contiguous_bytes, planned_ring_depth);"))]),
+    ("staging-ring-depth-replaced-by-a-literal", [(_CALL_STAGING, _CALL_STAGING.replace("planned_output_slot, planned_ring_depth);", "planned_output_slot, 8u);"))]),
+    ("batched-ring-depth-replaced-by-a-literal", [(_CALL_BATCHED, _CALL_BATCHED.replace("planned_out, ring_depth)", "planned_out, 8u)"))]),
+    ("second-reserve-after-the-planned-one-with-the-file-count-preserved", [
+        ("if (cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, new_activation_slot_bytes",
+         "if (cache->reserve_pp_moe_onednn_scratch_(weight_slot_bytes, new_activation_slot_bytes"),
+        (_CALL_BATCHED, _CALL_BATCHED + "\n            (void) cache->reserve_pp_moe_onednn_scratch(weight_bytes, act_bytes, out_bytes, "
+         "ring_depth);")]),
+    ("second-reserve-before-the-planned-one-with-the-file-count-preserved", [
+        ("if (cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, new_activation_slot_bytes",
+         "if (cache->reserve_pp_moe_onednn_scratch_(weight_slot_bytes, new_activation_slot_bytes"),
+        (_CALL_BATCHED, "            (void) cache->reserve_pp_moe_onednn_scratch(weight_bytes, act_bytes, out_bytes, "
+         "ring_depth);\n" + _CALL_BATCHED)]),
     ("helper-lambda-around-the-reserve", [(_CALL_BATCHED, "            auto do_reserve = [&](size_t w, size_t a, size_t o, uint32_t d) { return cache->reserve_pp_moe_onednn_"
       "scratch(w, a, o, d); };\n            if (!do_reserve(std::max(planned_weight, weight_bytes), planned_act, planned_out, ring_depth)) {")]),
 )
