@@ -267,8 +267,8 @@ inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n
 // buft's when the peaks need more chunks than allowed, and that comes back as the measure's own failure
 // naming the stage. (SYCL_CpuOffloadCompute does refuse under a plan scope, by design.) The refusal text's
 // device field is the first SYCL device's, so a host-tier refusal reads "on device N" while its reason names
-// SYCL_Host. (llama has no probe or admitted call site yet; the backend planner's stages will read the host
-// term from the same result.)
+// SYCL_Host or SYCL_CpuActivation, whichever is the compute buft. (llama has no probe or admitted call site
+// yet; the backend planner's stages will read the host term from the same result.)
 inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &                    procs,
                                                      struct ggml_sycl_load_txn                      txn,
                                                      const std::vector<llama_load_measure_device> & devices,
