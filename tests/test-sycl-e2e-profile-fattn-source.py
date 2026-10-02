@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,7 +54,25 @@ def test_packed_k_sidecar_records_kv_bytes_without_ownership_change() -> None:
     begin = src.index("ggml_sycl_fattn_xmx_packed_k_sidecar_entry * entry = nullptr")
     end = src.index("void ggml_sycl_fattn_xmx_unregister_packed_k_range", begin)
     body = src[begin:end]
-    handle = body.index("packed.handle = ggml_sycl::mem_handle::from_owned_alloc")
+    # 3bbf55198 (owner migration) mints the handle into a local first
+    # (`mem_handle handle = mem_handle::from_owned_alloc(...)`) and only then
+    # moves it into `packed.handle`. Both steps are scored: the owner-first
+    # mint, then the install, and the ordering below runs from the install.
+    # Tie the mint to THAT install: the local the install moves from must be the one the owner-first mint
+    # initialises, and the install must be the only assignment to packed.handle. Matching the first mint text
+    # anywhere in the body would accept a decoy mint with a different local feeding the install.
+    installs = list(re.finditer(r"packed\.handle\s*=\s*std::move\(\s*(\w+)\s*\)", body))
+    assert len(installs) == 1
+    assert len(re.findall(r"packed\.handle\s*=[^=]", body)) == 1
+    local = installs[0].group(1)
+    handle = installs[0].start()
+    mints = [m for m in re.finditer(
+        r"mem_handle\s+" + re.escape(local) +
+        r"\s*=\s*(?:ggml_sycl::)?mem_handle::from_owned_alloc\(\s*std::move\(allocation\.owner\)", body)
+        if m.start() < handle]
+    assert mints, "the installed handle is not minted owner-first"
+    mint = mints[-1].start()
+    assert mint < handle
     # The ready event is published by the submit helper through its accepted-event
     # out-parameter, not by an assignment after the call: e07bfa26c ("sycl: publish
     # packed-K accepted events before profiling") moved the publication inside the
@@ -70,3 +89,11 @@ def test_packed_k_sidecar_records_kv_bytes_without_ownership_change() -> None:
     assert "total_bytes" in body[record:record_gate_close]
     assert ".wait(" not in body
     assert ".wait_and_throw(" not in body
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -454,3 +454,11 @@ def test_parser_summarizes_wall_categories_and_callsites() -> None:
         in result.stdout
     )
     assert "category.sycl.event" not in result.stdout
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -29,7 +29,11 @@ SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 
 PUBLISH = "ggml_sycl_publish_mmid_canonical_aos_experts("
 
-PROMPT_START = "if (!ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)) {"
+# The prompt admission opens at the declaration of its result slot, which precedes the IDs snapshot, the
+# publication and (since llama.cpp-iikr deferred the build past the fused dispatch) the resolver call.
+# The old anchor, the `copy_ids_to_host(..., prompt_ids_snapshot)` branch, went away when 69faeac92 made the
+# snapshot a per-layer reused entry. Matched with \s+ because clang-format aligns the declaration's columns.
+PROMPT_START = re.compile(r"moe_resolved_batch_result\s+retained_prompt_batch_result;")
 PROMPT_END = "retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch("
 DECODE_START = "ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;"
 DECODE_END = "retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch("
@@ -50,9 +54,12 @@ def admission(source: str, start: str, end: str) -> str | None:
     allow_materialize is an ARGUMENT, so a region ending at the call name
     excludes it and the check that pins it would pass on any tree at all.
     """
-    if start not in source:
+    match = start.search(source) if isinstance(start, re.Pattern) else None
+    if match is None and not isinstance(start, re.Pattern) and start in source:
+        match = re.compile(re.escape(start)).search(source)
+    if match is None:
         return None
-    begin = source.index(start)
+    begin = match.start()
     if end not in source[begin:]:
         return None
     stop = source.index(end, begin)
@@ -60,6 +67,11 @@ def admission(source: str, start: str, end: str) -> str | None:
     if close < 0:
         return None
     return source[begin:close + 2]
+
+
+def resolver_call(region: str, end: str) -> str:
+    """The admission's own resolver call: from the last `end` anchor to the region's closing `);`."""
+    return region[region.rindex(end):]
 
 
 def regions(source: str) -> tuple[str | None, str | None]:
@@ -82,10 +94,13 @@ def violations(source: str) -> list[str]:
     if PUBLISH not in decode:
         found.append("the decode admission resolves without publishing allocation-owned experts")
 
-    # Publishing is only safe while it stays non-materializing at the seam.
-    if "/*allow_materialize=*/false" not in prompt:
+    # Publishing is only safe while it stays non-materializing at the seam. Scored on the admission's OWN
+    # resolver call (the last call in the region), not anywhere in it: the prompt region also holds the
+    # per-role pair resolver calls, which carry their own allow_materialize=false and would satisfy a
+    # region-wide search even after the admission itself started materializing.
+    if "/*allow_materialize=*/false" not in resolver_call(prompt, PROMPT_END):
         found.append("the prompt admission no longer resolves with allow_materialize=false")
-    if "/*allow_materialize=*/false" not in decode:
+    if "/*allow_materialize=*/false" not in resolver_call(decode, DECODE_END):
         found.append("the decode admission no longer resolves with allow_materialize=false")
 
     # The helper's own gate.  Checked against the whole file: it lives outside
@@ -133,8 +148,10 @@ def test_mutations_are_witnessed() -> None:
     decode_unpublished = decode.replace(PUBLISH, "false && ggml_sycl_never_published(", 1)
     assert decode_unpublished != decode, "the publish call was not found in the decode region"
 
-    prompt_materializing = prompt.replace("/*allow_materialize=*/false", "/*allow_materialize=*/true", 1)
-    assert prompt_materializing != prompt, "allow_materialize=false was not found in the prompt region"
+    prompt_call = resolver_call(prompt, PROMPT_END)
+    prompt_materializing = prompt.replace(
+        prompt_call, prompt_call.replace("/*allow_materialize=*/false", "/*allow_materialize=*/true", 1), 1)
+    assert prompt_materializing != prompt, "allow_materialize=false was not found in the prompt admission's call"
 
     mutations = [
         # The regression this gate exists for: decode publishes, prompt does not.
@@ -151,3 +168,11 @@ def test_mutations_are_witnessed() -> None:
     for index, mutated in enumerate(mutations):
         assert mutated != source, f"mutation {index} did not change the source"
         assert violations(mutated), f"mutation {index} was not witnessed"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

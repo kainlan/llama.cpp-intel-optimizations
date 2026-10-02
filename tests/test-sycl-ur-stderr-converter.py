@@ -64,3 +64,11 @@ def test_converter_rejects_files_without_ur_rows_without_traceback() -> None:
         assert "failed to convert UR stderr" in result.stdout
         assert "no UR API rows found" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

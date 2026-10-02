@@ -18,3 +18,11 @@ def test_kernel_bench_honors_sycl_profiling_debug_flag() -> None:
     assert '"-fdebug-info-for-profiling"' in debug_block
     assert '"-fsycl-instrument-device-code"' in debug_block
     assert 'target_link_options(${TARGET} PRIVATE "-fsycl-instrument-device-code")' in debug_block
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

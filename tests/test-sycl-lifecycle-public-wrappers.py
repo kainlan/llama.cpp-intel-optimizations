@@ -2,11 +2,17 @@
 """Compile the public lifecycle ABI contract instead of matching source text."""
 from pathlib import Path
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
 compiler = os.environ.get("CXX", "c++")
+if shutil.which(compiler) is None:
+    # ctest's SKIP_RETURN_CODE: a host without a C++ compiler skips visibly instead of erroring.
+    print(f"SKIP: no C++ compiler ({compiler!r} not found); this gate compiles tests/test-sycl-lifecycle-public-api.cpp")
+    sys.exit(77)
 with tempfile.TemporaryDirectory(prefix="sycl-lifecycle-api-") as tmp:
     output = Path(tmp) / "public-api"
     subprocess.run(

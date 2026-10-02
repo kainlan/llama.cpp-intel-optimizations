@@ -64,3 +64,11 @@ def test_vtune_task_parser_reports_missing_match_without_traceback() -> None:
         assert "failed to parse VTune tasks" in result.stdout
         assert "no task matched missing" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -16,13 +16,15 @@ Checks are split into two kinds and both are scored:
                under --self-test against a deliberately poisoned copy. Without
                that control an absence check's green is not evidence.
 
-Exit: 0 pass, 1 fail, 77 skip (sources not found).
+Exit: 0 pass, 1 fail (a source that is not found fails; it is never a skip).
 """
 
 import argparse
 import os
 import re
 import sys
+
+from sycl_gate import run_without_source
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SYCL = os.path.join(HERE, "..", "ggml", "src", "ggml-sycl")
@@ -288,8 +290,9 @@ def main():
 
     for path in (CPP, HPP, OWNER_HPP):
         if not os.path.exists(path):
-            print("SKIP: %s not found; this run proves NOTHING" % path)
-            return 77
+            # Not 77: ctest reports that as a skip, which reads as green, and a moved source is what this gate is for.
+            print("FAIL: %s not found; this run proves NOTHING" % path)
+            return 1
 
     cpp = open(CPP, encoding="utf-8").read()
     hpp = open(HPP, encoding="utf-8").read()
@@ -323,6 +326,13 @@ def main():
         if len(survivors) != expected_survivors:
             print("FAIL: self-test expected %d absence checks to survive the poison, %d did: %s"
                   % (expected_survivors, len(survivors), survivors))
+            failed += 1
+        # A missing source must FAIL and say so (sycl_gate.run_without_source): 77 is ctest's skip, which reads as green.
+        status, output = run_without_source(__file__)
+        absent_ok = status not in (0, 77) and "not found" in output
+        print("missing source: exit status %d with the source absent (%s)"
+              % (status, "fails as required" if absent_ok else "VOID, passes, skips or dies elsewhere"))
+        if not absent_ok:
             failed += 1
 
     total = len(presence) + len(absence)

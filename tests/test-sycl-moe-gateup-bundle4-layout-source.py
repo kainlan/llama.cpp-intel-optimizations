@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 REFERENCE = ROOT / "tools" / "sycl-kernel-bench" / "kernels" / "reference" / "mxfp4_inline_dot.cpp"
@@ -237,17 +238,21 @@ def test_runtime_bundle4_pp_safe_tg_only_routing() -> None:
     runtime_phase = slice_between(sycl, "static bool ggml_sycl_moe_runtime_phase_materialization_enabled", "static bool ggml_sycl_moe_phase_materialization_needed")
     assert "ggml_sycl_moe_gateup_bundle4_enabled()" in runtime_phase
 
-    pair_coordinator = slice_between(
-        sycl,
-        "if ((pair_layout != GGML_LAYOUT_SOA && pair_layout != GGML_LAYOUT_MXFP4_I8 &&",
-        "return reject_pair(\"layout\")",
-    )
-    assert "pair_layout != GGML_LAYOUT_XMX_TILED_BUNDLE4" in pair_coordinator
+    # The pair coordinator with its `reject_pair("layout")` ladder went with the prompt-fusion routes
+    # (abecb785d). What remains is the decode pair's admission predicate, written positively: the pair is
+    # admitted only for a layout in the allowed set, and BUNDLE4 must be a member. Located by regex because
+    # clang-format aligns the declaration's columns.
+    admission_at = re.search(r"const bool\s+pair_layout_ok\s*=", sycl)
+    assert admission_at is not None, "decode pair layout admission predicate not found"
+    pair_coordinator = sycl[admission_at.start():sycl.index("moe_fusion_full_local_ptr_table(", admission_at.end())]
+    assert "pair_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4" in pair_coordinator
 
     pair_ids_bridge = slice_between(
         sycl,
         "const bool use_device_grouped_moe_decode =",
-        "trace_pair_stage(\"pair-glu-submit-begin\")",
+        # The ids bridge ends at the pair GLU submission. The trace_pair_stage("pair-glu-submit-begin")
+        # marker it used to end at left with the prompt-fusion routes (abecb785d).
+        "const bool ok_glu = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(",
     )
     assert "pair_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4" in pair_ids_bridge
     assert "const int32_t * pair_ids_host_arg = use_device_ids_for_pair_glu ? nullptr : ids_data" in pair_ids_bridge
@@ -264,3 +269,11 @@ def test_runtime_bundle4_pp_safe_tg_only_routing() -> None:
     assert "!ids_host" in dispatch
     assert "GGML_LAYOUT_XMX_TILED_BUNDLE4" in dispatch
     assert "mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_submit" in dispatch
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

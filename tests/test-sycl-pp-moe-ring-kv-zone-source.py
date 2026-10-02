@@ -542,3 +542,11 @@ def test_mutation_is_witnessed(label: str, which: str, old: str, new: str, expec
         mutated = mutated.replace(before, after, 1)
     violations = all_violations(mutated, cache_cpp) if which == "sycl" else all_violations(sycl_cpp, mutated)
     assert any(expected in v for v in violations), f"{label}: expected {expected!r}, got {violations!r}"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

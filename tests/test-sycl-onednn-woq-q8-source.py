@@ -332,7 +332,24 @@ def test_every_onednn_soa_selection_site_consults_the_env_gate():
     # (ggml_sycl_q8_0_onednn_soa_enabled, default ON) -- NOT the WoQ-execute
     # gate, which they must no longer reference at all; the name table and the
     # dispatch arm (which executes an already-selected kernel) consult neither.
-    case_sites = [m.start() for m in re.finditer(r"case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:", backend)]
+    # llama.cpp-479i added a fifth label, in ggml_sycl_mul_mat_kernel_quantizes_src1(): a classifier of which
+    # kernels draw from the planned Q8_1 src1 buffer, where every oneDNN kernel falls through to `return false`.
+    # It neither selects nor executes ONEDNN_SOA, so it is pinned as its own group rather than counted as a
+    # selection site -- and the selection census below stays exactly the four it always was.
+    classifier_sig = "static bool ggml_sycl_mul_mat_kernel_quantizes_src1(ggml_sycl_mul_mat_kernel kernel) {"
+    classifier_start = ws_find(backend, classifier_sig)
+    assert classifier_start >= 0, f"missing definition: {classifier_sig}"
+    classifier_end = matching_brace(backend, backend.find("{", classifier_start)) + 1
+    classifier = backend[classifier_start:classifier_end]
+    assert re.search(
+        r"case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:\s*case ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL:\s*return false;",
+        classifier,
+    ), "ONEDNN_SOA must not be a src1-quantizing kernel"
+    case_sites = [
+        m.start()
+        for m in re.finditer(r"case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:", backend)
+        if not classifier_start <= m.start() < classifier_end
+    ]
     assert len(case_sites) == 4, (
         f"expected 4 `case ONEDNN_SOA:` sites (name table, override check, preferred selection, dispatch), "
         f"found {len(case_sites)}"

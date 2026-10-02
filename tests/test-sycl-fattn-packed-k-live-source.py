@@ -35,9 +35,9 @@ GUARD = 'if (GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT GGML_BACKEND_DL)'
 def production_contract(
         fattn: str, xmx: str, fattn_hpp: str = FATTN_HPP, mem_ops: str = MEM_OPS) -> bool:
     fattn_needles = (
-        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-before-initial-fill")',
-        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
-        'ggml_sycl_fattn_xmx_test_failpoint("materializer-zero-to-pack")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-before-initial-fill")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-zero-to-update")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("materializer-zero-to-pack")',
         "zero_deps.push_back(previous_use)",
         "out->ready_event = zero_event",
         "out->ready_event = pack_event",
@@ -45,8 +45,8 @@ def production_contract(
         "            });\n    });\n    // Publish accepted work",
         "            });\n        });\n        const uint64_t host_submit_end_us",
         "*accepted_event = event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("sidecar-update")',
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("materializer-pack")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("sidecar-update")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("materializer-pack")',
         "host_submit_begin_us",
         "host_submit_end_us",
         "ggml_sycl_kernel_profile_record_event(",
@@ -65,15 +65,15 @@ def production_contract(
         "const int64_t packed_batch_stride = static_cast<int64_t>(head_count) * packed_head_stride",
     )
     xmx_needles = (
-        'ggml_sycl_fattn_xmx_test_failpoint("packed-first-to-merge")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("packed-first-to-merge")',
         "cgh.depends_on(packed_ready_event)",
         "sycl::event first_event = stream->submit",
         "*packed_k_ready_event = first_event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-first")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("packed-first")',
         "cgh.depends_on(first_event)",
         "sycl::event merge_event = stream->submit",
         "*packed_k_ready_event = merge_event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-merge")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("packed-merge")',
         "static bool launch_fattn_xmx_v2_decode_gqa_split_packed_impl",
         "packed_k == nullptr || packed_k->device != ctx.device",
         "const ggml_sycl::resolved_ptr resolved = packed_k->handle.resolve(ctx.device)",
@@ -124,7 +124,7 @@ def mem_fill_attribution_contract(mem_ops: str) -> bool:
     try:
         return (
             direct.index("sycl::event event = queue.submit") <
-            direct.index("mem_fill_test_profile_error_after_submit();") <
+            direct.index("GGML_SYCL_MEM_FILL_TEST_CHECK();") <
             direct.index("return event;") and
             submit.index("mem_fill_direct_submit") <
             submit.index("retain_handles_until_event({ h }, event, std::move(publish_ticket))") <
@@ -418,7 +418,10 @@ def overlap_v_write_contract(source: str) -> bool:
 
 def live_contract(source: str) -> bool:
     required = (
-        "SKIP_UNSUPPORTED = 77",
+        # fbcb86b94 (llama.cpp-g290) replaced the file-local `SKIP_UNSUPPORTED = 77` with the single shared
+        # definition; score the include and the use. The 77 itself is pinned by the CMake SKIP_RETURN_CODE check.
+        '#include "../../../../tests/test-skip.h"',
+        "return LLAMA_TEST_EXIT_SKIP;",
         "sycl::device::get_devices(sycl::info::device_type::gpu)",
         "dev.get_backend() != sycl::backend::ext_oneapi_level_zero",
         "dev.has(sycl::aspect::fp16)",
@@ -527,21 +530,45 @@ def guarded_cmake_block(source: str) -> str | None:
     return None
 
 
+def strip_cmake_comments(source: str) -> str:
+    """Drop `#` line comments (not a `#` inside a quoted argument); the line structure is kept."""
+    return "\n".join(re.sub(r'^((?:[^"#]|"[^"]*")*)#.*$', r"\1", line) for line in source.splitlines())
+
+
+def private_testing_defined(block: str) -> bool:
+    """GGML_SYCL_PRIVATE_TESTING=1 is its own argument of the target's PRIVATE compile definitions: not a
+    comment, not wrapped in a generator expression (`$<0:...>` is a single token that is not the definition)."""
+    call = re.search(r"target_compile_definitions\(\s*test-fattn-packed-k-lifecycle\s+PRIVATE\s+([^)]*)\)", block)
+    return call is not None and "GGML_SYCL_PRIVATE_TESTING=1" in call.group(1).split()
+
+
 def cmake_contract(source: str) -> bool:
-    block = guarded_cmake_block(source)
+    block = guarded_cmake_block(strip_cmake_comments(source))
     if block is None:
         return False
+    # Whitespace-normalised: the link line is wrapped across lines now, and a literal needle for it is a
+    # formatting hostage. It links the private-fixtures target (dd880f9ee, "isolate core mutable test
+    # seams") rather than ggml-base/ggml/ggml-sycl directly, plus the Level Zero loader the test needs.
+    block = " ".join(block.split())
     required = (
         "add_executable(test-fattn-packed-k-lifecycle",
         "tests/test-fattn-packed-k-lifecycle.cpp",
-        "target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE ggml-base ggml ggml-sycl ${LEVEL_ZERO_LOADER})",
+        "target_link_libraries(test-fattn-packed-k-lifecycle PRIVATE ggml-sycl-private-fixtures ${LEVEL_ZERO_LOADER})",
         "foreach(_packed_k_checkpoint IN ITEMS",
         "COMMAND test-fattn-packed-k-lifecycle --checkpoint ${_packed_k_checkpoint}",
         "ONEAPI_DEVICE_SELECTOR=level_zero:1",
         "SKIP_RETURN_CODE 77",
     )
+    # The guard must close right after the registration loop. Without this, deleting that `endif()` leaves
+    # the guard open and guarded_cmake_block() runs on to whichever later `endif()` balances the count, so
+    # every needle above is still found in an over-long block and the mutation survives.
+    # The private seams the test drives (failpoints, fill/profile error injection) compile in only under
+    # GGML_SYCL_PRIVATE_TESTING, so the live target must carry it in its own compile definitions: without it
+    # the checkpoints are silently inert and the test skips or passes without reaching them.
     return (all(needle in block for needle in required) and
+            private_testing_defined(block) and
             all(cp in block for cp in CHECKPOINTS) and
+            block.endswith("endforeach() endif()") and
             source.count("find_library(LEVEL_ZERO_LOADER") == 1)
 
 
@@ -551,6 +578,26 @@ def test_production_live_driver_and_structural_registration_contracts() -> None:
     assert cmake_contract(CMAKE)
     assert CMAKE.index(GUARD) > CMAKE.index("# Un-guarded SYCL tests")
     assert LIVE.index("verify_host_boundaries();") < LIVE.index("if (!preflight_device())")
+
+
+def test_private_testing_definition_must_be_a_live_standalone_argument() -> None:
+    """Each mutant removes the live definition in a way a substring match would accept; the rest of the contract
+    still holds for it, so the refusal is for the right reason: private_testing_defined() is what fails."""
+    definition = "GGML_SYCL_PRIVATE_TESTING=1"
+    assert CMAKE.count(definition) >= 1
+    start = CMAKE.index("target_compile_definitions(test-fattn-packed-k-lifecycle PRIVATE")
+    site = CMAKE.index(definition, start)
+    live_block = " ".join(guarded_cmake_block(strip_cmake_comments(CMAKE)).split())
+    assert private_testing_defined(live_block)
+    for label, spelling in (("commented out", "# " + definition),
+                            ("behind a false generator expression", "$<0:" + definition + ">"),
+                            ("defined to 0", "GGML_SYCL_PRIVATE_TESTING=0")):
+        mutant = CMAKE[:site] + spelling + CMAKE[site + len(definition):]
+        block = " ".join(guarded_cmake_block(strip_cmake_comments(mutant)).split())
+        assert not private_testing_defined(block), label
+        assert not cmake_contract(mutant), label
+        # the only thing that changed is the definition: every other requirement of the contract still holds
+        assert "COMMAND test-fattn-packed-k-lifecycle --checkpoint ${_packed_k_checkpoint}" in block, label
 
 
 def test_checkpoint_mutations_are_killed() -> None:
@@ -619,8 +666,8 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         "            });\n    });\n    // Publish accepted work",
         "            });\n        });\n        const uint64_t host_submit_end_us",
         "*accepted_event = event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("sidecar-update")',
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("materializer-pack")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("sidecar-update")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("materializer-pack")',
         "const int n_partitions = ggml_sycl_fattn_xmx_packed_k_n_blocks(params.ne11);\n"
         "                            const int selected_tk",
         "host_submit_begin_us",
@@ -693,11 +740,11 @@ def test_event_profile_range_and_overflow_mutations_are_killed() -> None:
         "cgh.depends_on(packed_ready_event)",
         "sycl::event first_event = stream->submit",
         "*packed_k_ready_event = first_event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-first")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("packed-first")',
         "cgh.depends_on(first_event)",
         "sycl::event merge_event = stream->submit",
         "*packed_k_ready_event = merge_event",
-        'ggml_sycl_fattn_xmx_test_profile_error_after_submit("packed-merge")',
+        'GGML_SYCL_FATTN_PRIVATE_PROFILE_ERROR("packed-merge")',
         "packed_k->ready_event = merge_event",
         "first_submit_begin_us",
         "first_submit_end_us",
@@ -783,3 +830,15 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
     assert not cmake_contract(
         replace_unique(CMAKE, "find_library(LEVEL_ZERO_LOADER", "find_library(MUTATED_LOADER"))
     assert not cmake_contract(replace_in_packed_k_block(CMAKE, " ${LEVEL_ZERO_LOADER})", ")"))
+    # L4: the live target no longer compiles the private seams in.
+    assert not cmake_contract(
+        replace_in_packed_k_block(CMAKE, "GGML_SYCL_PRIVATE_TESTING=1", "GGML_SYCL_PRIVATE_TESTING=0"))
+    assert not cmake_contract(replace_in_packed_k_block(CMAKE, "    GGML_SYCL_PRIVATE_TESTING=1\n", ""))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

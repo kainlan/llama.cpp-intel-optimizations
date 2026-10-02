@@ -22,6 +22,8 @@ import argparse
 import pathlib
 import sys
 
+from sycl_gate import run_without_source
+
 SOURCE = pathlib.Path(__file__).resolve().parent.parent / "ggml" / "src" / "ggml-sycl" / "ggml-sycl.cpp"
 
 ADMISSION_INIT = "constexpr bool q1_nvfp4_direct_b70_validated ="
@@ -101,8 +103,9 @@ def main():
     args = parser.parse_args()
 
     if not SOURCE.exists():
-        print("SKIP: %s not found" % SOURCE)
-        return 77
+        # Not 77: ctest reports that as a skip, which reads as green, and a moved source is what this gate is for.
+        print("FAIL: %s not found" % SOURCE)
+        return 1
     text = SOURCE.read_text(encoding="utf-8", errors="replace")
 
     failures = 0
@@ -124,6 +127,14 @@ def main():
             print("%-20s %s  poisoned source" % (name, "VOID (still passed!)" if ok else "red as required"))
             if ok:
                 failures += 1
+
+        # A missing source must FAIL and say so (sycl_gate.run_without_source): 77 is ctest's skip, which reads as green.
+        status, output = run_without_source(__file__)
+        absent_ok = status not in (0, 77) and "not found" in output
+        print("%-20s %s  exit status %d with the source absent"
+              % ("missing source", "fails as required" if absent_ok else "VOID (passes, skips or dies elsewhere)", status))
+        if not absent_ok:
+            failures += 1
 
     return 1 if failures else 0
 

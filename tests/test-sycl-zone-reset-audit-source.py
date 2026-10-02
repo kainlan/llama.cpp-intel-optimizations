@@ -182,7 +182,7 @@ def evaluate(cache, backend, common, header):
     scratch = body_of(cache, "void unified_cache::scratch_pool_epoch_boundary(")
     reclaim = body_of(cache, "size_t unified_cache::reclaim_weight_entries(")
     zone_alloc = body_of(cache, "void * unified_cache::zone_alloc(")
-    zone_free = body_of(cache, "void unified_cache::zone_free(")
+    zone_free = body_of(cache, "bool unified_cache::zone_free(")
     host_alloc = body_of(cache, "void * unified_cache::host_zone_alloc(")
     host_free = body_of(cache, "void unified_cache::host_zone_free(")
     emit = body_of(cache, "void zone_audit_emit(")
@@ -629,8 +629,8 @@ MUTANTS = {
     # would silently miss -- see the check's own comment).
     "the three old reset/boundary dispatcher names have zero production call sites": (
         "cache",
-        [("void unified_cache::zone_free(vram_zone_id zone, void * ptr) {",
-          "void unified_cache::zone_free(vram_zone_id zone, void * ptr) {\n"
+        [("bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {",
+          "bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {\n"
           "    unified_cache_zone_reset(0, zone);")]),
 }
 

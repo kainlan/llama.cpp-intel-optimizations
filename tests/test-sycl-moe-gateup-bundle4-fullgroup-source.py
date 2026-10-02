@@ -77,3 +77,11 @@ def test_bundle4_kernel_vectorizes_full_tile_bias_loads_and_output_stores() -> N
     assert "block_store<float, 1>(dst_out + row, simd<float, 1>(values[r]))" in helper
     assert "mxfp4_bundle4_store_glu_tile<Repeat, GLU_OP>(" in kernel
     assert kernel.count("mxfp4_bundle4_store_glu_tile<Repeat, GLU_OP>(") == 2
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

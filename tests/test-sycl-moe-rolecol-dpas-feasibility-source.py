@@ -103,3 +103,11 @@ def test_role_column_route_is_not_implemented() -> None:
     mmvq = strip_cpp_comments(MMVQ.read_text(encoding="utf-8"))
     assert "GGML_SYCL_MOE_GATEUP_ROLECOL" not in mmvq
     assert "rolecol-gateup" not in mmvq
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -51,3 +51,11 @@ def test_multirhs_dry_run_omits_forbidden_probe_text() -> None:
     forbidden = ["sycl-ls", "/dev/dri", "fdinfo", "lsof", "P2P", "peer-to-peer"]
     for needle in forbidden:
         assert needle not in result.stdout
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

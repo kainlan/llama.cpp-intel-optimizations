@@ -149,3 +149,11 @@ def test_capability_checker_scans_sibling_common_header_for_e2m1() -> None:
         assert values["dpas.common_header"] == str(common.resolve())
         assert values["dpas.bdpas.present"] == "0"
         assert values["dpas.fp4_e2m1.present"] == "1"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

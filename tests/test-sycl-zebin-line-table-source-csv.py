@@ -106,3 +106,11 @@ Address            Line   Column File   ISA Discriminator Flags
     assert "source_line.dwarf_source_line_rows 1" in check_result.stdout
     assert "source_line.source_attribution_mode dwarf-line-table" in check_result.stdout
     assert "source_line.status dwarf-line-table-only" in check_result.stdout
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
