@@ -113,6 +113,7 @@
 #include "ggml-sycl/pool-legacy-release.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/quantize.hpp"
+#include "ggml-sycl/rb2h-diag.hpp"
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/set.hpp"
 #include "ggml-sycl/set_rows.hpp"
@@ -110388,6 +110389,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             // here runs in a CPU split whose output a SYCL op reads out of pinned host memory, and a graph with
             // that read cannot be recorded (llama.cpp-qhfp: qwen35's q4_K token_embd.weight).
             if (!ggml_sycl_get_rows_type_supported(op->src[0]->type)) {
+                return false;
+            }
+            // llama.cpp-rb2h diagnostic arm: put the Q4_K embedding back on the CPU executor it had before qhfp.
+            if (op->src[0]->type == GGML_TYPE_Q4_K && ggml_sycl_rb2h_arm("GGML_SYCL_RB2H_GET_ROWS_Q4K_CPU")) {
                 return false;
             }
             {

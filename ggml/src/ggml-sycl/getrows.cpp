@@ -15,6 +15,7 @@
 #include "common.hpp"
 #include "dequantize.hpp"
 #include "get-rows-kquant.hpp"
+#include "rb2h-diag.hpp"
 #include "ggml-backend.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu/ops.h"
@@ -3189,7 +3190,15 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                                    (int) layout, src0->name ? src0->name : "?");
                     GGML_ABORT("fatal error");
                 }
+                // llama.cpp-rb2h diagnostic arm: drain the stream on both sides of the op.
+                const bool rb2h_sync = ggml_sycl_rb2h_arm("GGML_SYCL_RB2H_GET_ROWS_Q4K_SYNC");
+                if (rb2h_sync) {
+                    ctx.stream()->wait_and_throw();
+                }
                 get_rows_q4_k_aos_sycl(ctx, src0, dst->src[1], dst, src0_d, src1_i32, dst_d, ctx.stream());
+                if (rb2h_sync) {
+                    ctx.stream()->wait_and_throw();
+                }
             }
             break;
         default:
