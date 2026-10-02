@@ -3211,6 +3211,11 @@ set_tests_properties(test-sycl-compute-buffer-extra-reuse PROPERTIES
 # one backend context and checks the counters (the positive control) and the output against a host reference.
 # The softmax and MUL oneDNN paths are opt-in and skip graph recording, hence the three variables below.
 # Touches the GPU with tiny graphs and loads no model; labelled mem-handle so a sweep leaves it to the lead.
+# Unlike the direct-source fixtures (test-fattn-packed-k-lifecycle and the like) this test compiles no device code of its own
+# and calls no Level Zero API, so it does not repeat -fsycl-targets, the split-barrier -Xspirv-translator options or
+# ${LEVEL_ZERO_LOADER}: ggml-sycl-private-fixtures hands it the backend's own COMPILE/LINK options (its link line carries
+# -fsycl-targets=intel_gpu_bmg_g21,intel_gpu_bmg_g31,spir64 and the three split-barrier options, verified with
+# `ninja -t commands test-sycl-dnnl-decline-fallthrough`), the same arrangement as test-sycl-compute-buffer-extra-reuse.
 if (NOT GGML_BACKEND_DL AND GGML_SYCL_DNNL)
 add_executable(test-sycl-dnnl-decline-fallthrough
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-dnnl-decline-fallthrough.cpp

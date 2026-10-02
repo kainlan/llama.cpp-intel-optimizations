@@ -25,6 +25,10 @@ Their six hits in `unified-cache.cpp` are allowlisted (`E-CHAIN-HOST-RAW`, `E-CH
 CACHE_BACKING bootstrap sites `E-BACKING-STAGING`, `E-BACKING-FLAG-SLAB`; canonical contract sections 3, 3.1 and 9.1); the
 seventh, `unified_cache::allocate`'s last-resort fallback, is E-RAW debt with fate `deleted-by-D-disposition`.
 
+Debt that came in from master: `unified-cache.cpp::runtime_registry_claim_ptr_locked`'s G-CATCH entry (master's 93tw) is a
+trace-only `try { report.cohort = it->second.cohort_id; } catch (...) {}` that wraps a `std::string` copy, so it can only swallow a
+`bad_alloc` of a diagnostic string. It is not 23mk's to fix; it stays debt until that code is converted.
+
 Clause (q), libc allocation primitives (S3-0): `mmap`, `mmap64`, `mremap`, `posix_memalign`, `memalign`, `aligned_alloc`, `valloc`,
 `pvalloc`, `malloc`, `calloc`, `realloc`, `reallocarray`, `strdup`, `strndup` and `VirtualAlloc`, called bare or through `std::` / `::` (or taken as a value, or spelled in a `#define` body), are E-LIBC findings. A member
 (`pool.realloc`), a name qualified by another scope (`sycl::malloc` stays clause (e)'s) and a declaration are not. Five allowlist entries

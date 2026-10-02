@@ -2958,7 +2958,7 @@ bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site site) {
 
 GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline(const char * site, int32_t after_n) {
     scratchpad_site_state * s = scratchpad_site_find(site);
-    if (!s) {
+    if (!s || after_n < 0) {
         return false;
     }
     s->calls.store(0, std::memory_order_relaxed);

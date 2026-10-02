@@ -24,6 +24,16 @@ checks = {
         "GGML_SYCL_MEM_FILL_TEST_CHECK",
         "mem_fill_set_profile_error_after_submit_for_test",
     ),
+    # llama.cpp-23mk S3-3: the scratchpad decline seam. The hook and the three test accessors are defined behind the guard
+    # and the hook compiles to a constexpr false without it; the guard is what keeps them out of the ordinary artifact.
+    "common.cpp": (
+        "#if defined(GGML_SYCL_PRIVATE_TESTING)\nbool ggml_sycl_scratchpad_site_hook(",
+        "ggml_sycl_test_inject_scratchpad_decline",
+    ),
+    "common.hpp": (
+        "#if defined(GGML_SYCL_PRIVATE_TESTING)\nbool ggml_sycl_scratchpad_site_hook(",
+        "constexpr bool ggml_sycl_scratchpad_site_hook(",
+    ),
 }
 for name, needles in checks.items():
     text = (SYCL / name).read_text(encoding="utf-8")
@@ -47,6 +57,10 @@ if len(sys.argv) > 1:
         "unified_cache_fail_expert_allocation_after_for_test",
         "mem_fill_set_profile_error_after_submit_for_test",
         "ggml_backend_sycl_test_allocate_predictor_scores",
+        "ggml_sycl_test_inject_scratchpad_decline",
+        "ggml_sycl_test_scratchpad_sites_reset",
+        "ggml_sycl_test_scratchpad_site_counts",
+        "ggml_sycl_scratchpad_site_hook",
     )
     leaked = [name for name in forbidden_symbols if name in nm]
     if leaked:

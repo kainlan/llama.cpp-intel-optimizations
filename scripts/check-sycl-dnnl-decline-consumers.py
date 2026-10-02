@@ -13,10 +13,12 @@ wrappers (comments blanked first):
     it is the only `return false`, the scratchpad request precedes it, and the wrapper ends by executing the primitive and
     returning true. The helper's body is pinned to the hook-first form below, so the test seam reaches every wrapper and the
     old condition (nullptr and a nonzero size) is the only other way to decline;
-  - `ggml_sycl_dnnl_note_engaged(SITE)` is called once, after the decision and before the primitive is executed, so a run that
-    reached the wrapper can say so;
-  - nothing before that decision writes: no parallel_for, memcpy, memset, fill, submit or `.execute(`, no statement that names
-    dst or dst_f and assigns, and no dnnl::memory object bound to the output (a decline after a write would hand the fallback
+  - `ggml_sycl_dnnl_note_engaged(SITE)` is called once, unconditionally (the statement before it ends in `;` or `}`), after the
+    decision and before the primitive is executed, so a run that reached the wrapper can say so; the decision's arguments are
+    the literal `scratchpad_mem, scratchpad_md`;
+  - nothing before that decision writes: no parallel_for, single_task, memcpy, memset, fill, copy, submit or `.execute(`, no
+    mention of dst or dst_f at all (an alias would be a write the token list cannot see), and no dnnl::memory object bound to
+    the output (a decline after a write would hand the fallback
     modified inputs; softmax's pre-scale pass runs in place, so a late decision would apply the scale twice);
   - no `throw` and no `catch` anywhere in the class: a decline is a return value, and a catch-all would swallow one.
 
@@ -28,8 +30,9 @@ Outside the wrappers:
     fallback that follows and a success skips it. A caller count that differs from CALLERS fails; when a legitimate caller is
     added, add it there.
 
-Limit: the caller check sees the if and its body, not what follows the if. An unconditional `return;` after it would swallow the
-fallback and this gate cannot tell.
+The if must also be the last statement of its block, and no `return` may follow once its enclosing blocks close, so an
+unconditional `return;` right after it cannot swallow the fallback. Limit: a `return` placed deeper in the fallback code, or
+reached through another construct, is not seen; the device test is the only catch for that.
 
 Every check is also run against mutants of the same text and each must fail there, so a regex that stopped matching fails the
 gate instead of passing it. A mutant whose anchor text has moved is an assertion error, not a skip. Exit 0 on success, 1 on a
@@ -54,11 +57,11 @@ HELPER_BODY = ("if (ggml_sycl_scratchpad_site_hook(site)) { return true; } "
 CALLERS = {"softmax.cpp": ("DnnlSoftmaxWrapper::softmax", 1), "element_wise.cpp": ("DnnlEltwiseWrapper::eltwise", 3),
            "binbcast.cpp": ("DnnlBinaryWrapper::binary_broadcast_row", 1)}
 
-DECISION = re.compile(r"if\s*\(\s*" + HELPER + r"\s*\(\s*GGML_SYCL_SCRATCHPAD_SITE_(\w+)\s*,\s*\w+\s*,\s*\w+\s*\)\s*\)"
+DECISION = re.compile(r"if\s*\(\s*" + HELPER + r"\s*\(\s*GGML_SYCL_SCRATCHPAD_SITE_(\w+)\s*,\s*scratchpad_mem\s*,\s*scratchpad_md\s*\)\s*\)"
                       r"\s*\{\s*return\s+false\s*;\s*\}")
 NOTE = re.compile(r"\bggml_sycl_dnnl_note_engaged\s*\(\s*GGML_SYCL_SCRATCHPAD_SITE_(\w+)\s*\)\s*;")
-WRITE = re.compile(r"\bparallel_for\b|\bmemcpy\b|\bmemset\b|\bfill\b|\bsubmit\b|\.\s*execute\s*\(|\bdst(?:_f)?\b[^;{}]*?(?<![=!<>])=(?!=)"
-                   r"|\bdnnl::memory\s*\(")
+WRITE = re.compile(r"\bparallel_for\b|\bsingle_task\b|\bmemcpy\b|\bmemset\b|\bfill\b|\bcopy\b|\bsubmit\b|\.\s*execute\s*\("
+                   r"|\bdst(?:_f)?\b|\bdnnl::memory\s*\(")
 DEAD = (
     (re.compile(r"\beltwise_in_?place\b"), "eltwise_inplace (a forwarder with no caller)"),
     (re.compile(r"\bDnnlReductionWrapper\b"), "DnnlReductionWrapper (an emptied class, deleted by design 4.8)"),
@@ -136,6 +139,8 @@ def check_wrapper(cls, name, site, body_cls):
                         % (where, site, len(notes)))
         elif not decisions[0].end() <= notes[0].start() < (execute.start() if execute else len(body)):
             errs.append("%s calls ggml_sycl_dnnl_note_engaged outside the span between the decision and the execute" % where)
+        elif not re.search(r"[;}]\s*$", body[:notes[0].start()]):
+            errs.append("%s must call ggml_sycl_dnnl_note_engaged unconditionally, as a statement of its own" % where)
     return errs
 
 
@@ -181,10 +186,16 @@ def check_caller(rel, text):
         if branch is None:
             errs.append("%s: the if condition around a call of %s is more than the call itself" % (rel, sym))
             continue
-        body = after[branch.end():balanced(after, branch.end(), "{", "}") - 1]
+        end = balanced(after, branch.end(), "{", "}")
+        body = after[branch.end():end - 1]
         if body.strip() != "return;":
             errs.append("%s: a tested %s call's branch is not exactly `return;`, so the fallback could run after a success"
                         % (rel, sym))
+        tail = after[end:]
+        if not re.match(r"\s*\}", tail):
+            errs.append("%s: the if around %s is not the last statement of its block" % (rel, sym))
+        elif re.match(r"(?:\s|\}|#[^\n]*\n)*return\b", tail):
+            errs.append("%s: a `return` follows the if around %s once its blocks close, so the fallback would never run" % (rel, sym))
     return errs
 
 
