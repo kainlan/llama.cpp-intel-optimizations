@@ -2276,6 +2276,17 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     set_tests_properties(test-sycl-gate-registration-audit PROPERTIES
         LABELS "sycl;python;source-assert" TIMEOUT 120)
+    # The static audit cannot tell whether CMake reaches a registration (one behind a configuration guard or in an uncalled
+    # function counts as registered); this compares it with this very build's ctest files. Only the default SYCL
+    # configuration is censused: CENSUS_ABSENT_ALLOWLIST names what that configuration legitimately lacks.
+    if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+        add_test(NAME test-sycl-gate-registration-census
+            COMMAND ${LLAMA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-gate-registration-audit.py
+                    --census ${CMAKE_BINARY_DIR}
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+        set_tests_properties(test-sycl-gate-registration-census PROPERTIES
+            LABELS "sycl;python;source-assert" TIMEOUT 120)
+    endif()
     # The generator that appends the pytest footer: planted inputs prove which files it footers, leaves alone and
     # normalises, and that its output satisfies the audit's R3.
     add_test(NAME test-sycl-pytest-footer-generator
