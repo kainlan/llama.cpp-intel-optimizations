@@ -276,11 +276,14 @@ if (BUILD_TESTING)
                     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-dependencies.py
                     $<TARGET_FILE:ggml-sycl>)
         set_tests_properties(sycl-module-no-cpu-dependency PROPERTIES LABELS "sycl;module;host")
-        add_test(NAME sycl-module-nodelete-source
-            COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-nodelete-source.py)
-        set_tests_properties(sycl-module-nodelete-source PROPERTIES LABELS "sycl;module;host")
     endif()
+    # Pure text over the loader, registry, probe and backend sources, so it needs no module and no DL build: it was
+    # registered inside the GGML_BACKEND_DL guard and never ran in the default configuration.
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME sycl-module-nodelete-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-nodelete-source.py)
+    set_tests_properties(sycl-module-nodelete-source PROPERTIES LABELS "sycl;module;host")
 
     add_executable(test-sycl-lifecycle-runtime-wrapper
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-runtime-wrapper.cpp)
@@ -5866,7 +5869,6 @@ if (Python3_Interpreter_FOUND)
             --self-test)
     set_tests_properties(sycl-layer-stream-owner-contract PROPERTIES
         LABELS "sycl;lifecycle;cross-model;host-only;source-contract"
-        SKIP_RETURN_CODE 77
         TIMEOUT 120
     )
 else()
@@ -5885,7 +5887,6 @@ if (Python3_Interpreter_FOUND)
             --self-test)
     set_tests_properties(sycl-mmid-deferral-contract PROPERTIES
         LABELS "sycl;moe;lifecycle;host-only;source-contract"
-        SKIP_RETURN_CODE 77
         TIMEOUT 120
     )
 else()

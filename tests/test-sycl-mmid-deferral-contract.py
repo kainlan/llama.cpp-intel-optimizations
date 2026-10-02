@@ -114,8 +114,9 @@ def main():
     args = parser.parse_args()
 
     if not SOURCE.exists():
-        print("SKIP: %s not found" % SOURCE)
-        return 77
+        # Not 77: ctest reports that as a skip, which reads as green, and a moved source is what this gate is for.
+        print("FAIL: %s not found" % SOURCE)
+        return 1
     text = SOURCE.read_text(encoding="utf-8", errors="replace")
 
     failures = 0

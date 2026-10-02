@@ -16,7 +16,7 @@ Checks are split into two kinds and both are scored:
                under --self-test against a deliberately poisoned copy. Without
                that control an absence check's green is not evidence.
 
-Exit: 0 pass, 1 fail, 77 skip (sources not found).
+Exit: 0 pass, 1 fail (a source that is not found fails; it is never a skip).
 """
 
 import argparse
@@ -300,8 +300,9 @@ def main():
 
     for path in (CPP, HPP, OWNER_HPP):
         if not os.path.exists(path):
-            print("SKIP: %s not found; this run proves NOTHING" % path)
-            return 77
+            # Not 77: ctest reports that as a skip, which reads as green, and a moved source is what this gate is for.
+            print("FAIL: %s not found; this run proves NOTHING" % path)
+            return 1
 
     cpp = open(CPP, encoding="utf-8").read()
     hpp = open(HPP, encoding="utf-8").read()
