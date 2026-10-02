@@ -37,14 +37,18 @@ def test_current_packed_m2_route_uses_272_byte_groups_for_tile_n_16() -> None:
     body = slice_between(
         mmvq,
         "static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl",
-        "template <int Repeat, int GLU_OP>\nstatic sycl::event mxfp4_pair_glu_gateup_prepack_dpas_sycl",
+        # End at the K-split kernel, which also calls the shared helper: slicing on to the next unrelated
+        # function lets that second call satisfy the check when the S=1 kernel runs a private copy of the loop.
+        "static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl(",
     )
     assert "const int64_t group_bytes     = tile_n_total * (1 + k_per / 2)" in body
     assert "const int64_t kt_group_stride = n_tile_groups_n * group_bytes" in body
     # e8484d7a7 (llama.cpp-lis9) hoisted the K-tile loop out of this kernel into a helper shared with the
     # K-split variant, so the 272-byte-group A loads now live in the helper. Require the kernel to still drive
     # that helper (not a private copy of the loop) and score the loads where they are.
-    assert "mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce<Repeat" in body
+    # Comment-blind: the kernel's own comments name the helper, which is not a call to it.
+    code = re.sub(r"//[^\n]*|/\*.*?\*/", "", body, flags=re.DOTALL)
+    assert re.search(r"mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce<\s*Repeat\s*,\s*Prefetch\s*>\s*\(", code)
     k_reduce = slice_between(
         mmvq,
         "SYCL_ESIMD_FUNCTION inline void mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce(",
