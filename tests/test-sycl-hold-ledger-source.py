@@ -723,3 +723,11 @@ def test_a_rewrapped_credit_filter_still_satisfies_its_claim():
         "if (\n                row.scheduler_compute && row.state == runtime_alloc_state::LIVE ) {",
     )
     assert claim_raw_rows_are_credited_by_origin(rewrapped)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
