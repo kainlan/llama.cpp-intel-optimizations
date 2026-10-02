@@ -2228,6 +2228,30 @@ set_tests_properties(sycl-runtime-context-section PROPERTIES
     TIMEOUT 30
 )
 
+# The residency probe's pure core (llama.cpp-moua L4 step 3d, llama.cpp-5cim): residency-probe.hpp answers, from
+# one input value, which layers a context's plan leaves in host memory, by fitting the KV slots behind the tenant
+# head slots on each device's shared zone.  SYCL-free like test-kv-runtime-demotion above, so it needs no device;
+# the backend proc that will fill its geometry is step 1d's.
+add_executable(test-residency-probe-core
+    tests/test-residency-probe-core.cpp
+    kv-runtime-demotion.cpp
+    context-tenant-measure.cpp
+)
+target_include_directories(test-residency-probe-core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src
+)
+target_link_libraries(test-residency-probe-core PRIVATE ggml-base)
+set_target_properties(test-residency-probe-core PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-residency-probe-core COMMAND test-residency-probe-core)
+set_tests_properties(sycl-residency-probe-core PROPERTIES
+    LABELS "sycl;tenant;probe;hostonly"
+    TIMEOUT 60
+)
+
 # The tenant claim scope and the registry entry that holds a context's slot table (llama.cpp-moua L4 step 3c).
 # Host only: the scope and the table name no device.
 add_executable(test-tenant-claim-scope

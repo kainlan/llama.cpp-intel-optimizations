@@ -69,6 +69,13 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
     sequence, so a statement under an `if`, behind a ternary arm or in another branch no longer matches.
     The contract text itself is the comment above ggml_backend_sycl_host_buffer_free_buffer.
 
+  * (step 3d) the residency probe `ggml_backend_sycl_probe_residency` is registered like the other procs, and until
+    step 1d wires the geometry its body answers only GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED (or
+    N_LAYER_CAP_TOO_SMALL), through named enumerators, writes `n_layer` and never `host_resident`, and says why at
+    WARN.  The llama side resolves it by GGML_SYCL_PROC_PROBE_RESIDENCY into the one table, and calls it through one
+    door, llama_sycl_l4_probe_residency in src/llama-context-tenant.h: no other file in src/ calls the pointer or the
+    symbol.
+
 Known limits (text-level pins; each is what the named test or review covers instead):
   * a lambda or macro that hides a release, a synchronize or a clear behind another name: the pins read
     the shapes named above, not the call graph (covered by the host-tenant-claim device test and review);
@@ -103,6 +110,7 @@ SIG_CLEAR = r"\bsize_t\s+ggml_sycl_load_clear_compute_terms\s*\("
 SIG_LATE = r"\benum\s+ggml_sycl_late_check_result\s+ggml_backend_sycl_load_late_check\s*\("
 SIG_COUNT = r'\bextern\s+"C"\s+size_t\s+ggml_backend_sycl_test_compute_term_count\s*\('
 SIG_COVERAGE = r"\benum\s+ggml_sycl_tenant_coverage\s+ggml_backend_sycl_tenant_coverage\s*\("
+SIG_PROBE = r"\benum\s+ggml_sycl_residency_probe_status\s+ggml_backend_sycl_probe_residency\s*\("
 
 HEADER = "ggml/include/ggml-sycl.h"
 SOURCE = "ggml/src/ggml-sycl/ggml-sycl.cpp"
@@ -111,8 +119,9 @@ LLAMA = "src/llama-context.cpp"  # the scheduler's owner: read with SOURCE, as o
 COMMON_HPP = "ggml/src/ggml-sycl/common.hpp"  # stream(device, idx): the one execution queue per device
 BACKEND_CPP = "ggml/src/ggml-backend.cpp"  # the scheduler's synchronize-before-free premises (vendored upstream)
 ALLOC_C = "ggml/src/ggml-alloc.c"  # the allocator's automatic reserve (single-buffer only)
+DOOR_H = "src/llama-context-tenant.h"  # the residency probe's one door (step 3d)
 # One text: the free-path contract names all of them, and a mutation is one edit of it.
-SOURCE_FILES = (SOURCE, LLAMA, CLAIM_HPP, COMMON_HPP, BACKEND_CPP, ALLOC_C)
+SOURCE_FILES = (SOURCE, LLAMA, CLAIM_HPP, COMMON_HPP, BACKEND_CPP, ALLOC_C, DOOR_H)
 REG_FN = "ggml_backend_sycl_reg_get_proc_address"
 IMPL_SIG = r"\bggml_sycl_set_runtime_context_for_model_impl\s*\("
 CARRY_SIG = r"\bstatic\s+bool\s+ggml_sycl_host_tenants_carry\s*\("
@@ -587,6 +596,81 @@ def free_path_pins(source, freeb, fails):
         fails.append("L4 free path: cpy_tensor_async is referenced beyond its definition (the backend's interface wires it)")
 
 
+PROBE_STATUS_RETURN = re.compile(r"\breturn\s+([^;]*);")
+
+
+def probe_pins(source, fails):
+    """The residency probe (step 3d).  Until step 1d fills the zone geometry the proc cannot answer, and the one
+    thing it must never do is look like it did: its body returns a named GEOMETRY_NOT_WIRED (or the cap refusal),
+    writes the layer count and no host_resident byte, says why at WARN, and the llama side reaches it through one
+    table entry and one door."""
+    body = function_body(source, SIG_PROBE)
+    if body is None:
+        fails.append("L4 probe: ggml_backend_sycl_probe_residency not found")
+        return
+    if "host_resident" in body:
+        fails.append("L4 probe: the proc touches host_resident before step 1d wires the geometry")
+    allowed = {"GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED", "GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL",
+               "GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND", "GGML_SYCL_RESIDENCY_PROBE_INVALID",
+               "GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED"}
+    returns = [m.group(1).strip() for m in PROBE_STATUS_RETURN.finditer(body)]
+    if not returns or any(r not in allowed for r in returns):
+        fails.append("L4 probe: the proc returns something other than a named refusal enumerator (found %s)" % returns)
+    if "GGML_SYCL_RESIDENCY_PROBE_OK" in body or "GGML_SYCL_LIFECYCLE_" in body:
+        fails.append("L4 probe: the proc names OK or a lifecycle result before step 1d wires the geometry")
+    if returns.count("GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED") != 1 or not re.search(
+            r"return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;\s*\}$", body):
+        fails.append("L4 probe: the proc does not end by answering GEOMETRY_NOT_WIRED")
+    if "out->n_layer =" not in body:
+        fails.append("L4 probe: the proc does not write the layer count it was asked about")
+    if body.count('GGML_LOG_WARN("[RESIDENCY-PROBE]') < 1:
+        fails.append("L4 probe: the proc does not say why it did not answer, at WARN")
+    # the llama side: one table entry through the reg, one door
+    fill = ("procs.probe_residency = reinterpret_cast<decltype(procs.probe_residency)>("
+            "llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_PROBE_RESIDENCY));")
+    if source.count(fill) != 1:
+        fails.append("L4 probe: the llama table does not resolve the probe through the reg by its macro, once")
+    calls = re.findall(r"(?:\.|->)\s*probe_residency\s*\)?\s*\(", source)
+    if len(calls) != 1:
+        fails.append("L4 probe: the proc pointer is called %d times in the sources the gate reads (the door has one call)"
+                     % len(calls))
+    door = function_body(source, r"\binline\s+ggml_sycl_residency_probe_status\s+llama_sycl_l4_probe_residency\s*\(")
+    if door is None or "procs.probe_residency(" not in door:
+        fails.append("L4 probe: the one call is not inside llama_sycl_l4_probe_residency")
+
+
+DOOR_SCAN_DIR = "src"
+DOOR_SYMBOL = re.compile(r"(?<!decltype\(&)\bggml_backend_sycl_probe_residency\b")
+DOOR_CALL = re.compile(r"(?:\.|->)\s*probe_residency\s*\)?\s*\(")
+
+
+def door_texts(root):
+    """Every source file under src/ except the door's own, comment-stripped: the files that must never reach the probe."""
+    out = {}
+    base = os.path.join(root, DOOR_SCAN_DIR)
+    for name in sorted(os.listdir(base)):
+        rel = os.path.join(DOOR_SCAN_DIR, name)
+        if rel == DOOR_H or not name.endswith((".cpp", ".h", ".hpp")):
+            continue
+        with open(os.path.join(root, rel), encoding="utf-8") as f:
+            out[rel] = strip_comments(f.read())
+    return out
+
+
+def door_check(texts):
+    """The residency probe has one door (src/llama-context-tenant.h): no other file under src/ calls the proc pointer or
+    names the symbol except as the table field's type."""
+    fails = []
+    for rel, text in texts.items():
+        if DOOR_CALL.search(text):
+            fails.append("L4 probe door: %s calls the probe proc pointer; only llama_sycl_l4_probe_residency may" % rel)
+        if DOOR_SYMBOL.search(text):
+            fails.append("L4 probe door: %s names ggml_backend_sycl_probe_residency; the table resolves it by its macro" % rel)
+    if not texts:
+        fails.append("L4 probe door: no source file under %s was read (the scan is void)" % DOOR_SCAN_DIR)
+    return fails
+
+
 def check(header_raw, source):
     """`source` is the comment-stripped, normalized text: a mutation is one edit of it, so the (slow) strip is
     done once, not once per mutant."""
@@ -595,7 +679,7 @@ def check(header_raw, source):
     if len(names) < 3:
         fails.append("L4 proc: fewer than 3 `Proc name:` entries in %s (the scan found %d): the gate is void" % (HEADER, len(names)))
     for required in ("ggml_backend_sycl_set_runtime_context_desc", "ggml_backend_sycl_tenant_coverage",
-                     "ggml_backend_sycl_load_late_check"):
+                     "ggml_backend_sycl_load_late_check", "ggml_backend_sycl_probe_residency"):
         if required not in names:
             fails.append("L4 proc: %s lost its `Proc name:` line in %s" % (required, HEADER))
 
@@ -964,6 +1048,7 @@ def check(header_raw, source):
             fails.append("L4 late: the late check does not count an admitted shrink")
     if len(re.findall(r"dump_counter::late_term_shrink_admitted", source)) != 1:
         fails.append("L4 late: late_term_shrink_admitted has more or fewer than one producer")
+    probe_pins(source, fails)
     return fails
 
 
@@ -1572,7 +1657,7 @@ def main():
     source_raw = load_source(args.root)
     status = 0
     if not args.mutations_only:
-        fails = check(header_raw, source_raw)
+        fails = check(header_raw, source_raw) + door_check(door_texts(args.root))
         for f in fails:
             print("FAIL: " + f)
         if fails:

@@ -19,6 +19,9 @@
 //   (7) the tenant key is a digest of (device, cohort, slot_index, slot_bytes) in section
 //       order: equal sections give equal keys and any one field changes it;
 //   (8) the plan line's text begins with the fields the scorer matches.
+//   (9) the residency probe's one door (llama.cpp-moua L4 step 3d): a null proc and an answer outside the enum
+//       read NOT_ANSWERED, only OK is OK, GEOMETRY_NOT_WIRED is not OK and is passed on as itself, the door
+//       never touches the caller's host_resident bytes, and a table without the probe proc is not L4.
 
 #include "../src/llama-context-tenant.h"
 
@@ -44,6 +47,8 @@ struct call_record {
     int                                    n_publish  = 0;
     int                                    n_coverage = 0;
     int                                    n_late     = 0;
+    int                                    n_probe    = 0;
+    uint32_t                               probe_n_ctx = 0;
     uint32_t                               n_ubatch   = 0;
     uint64_t                               late_bytes = 0;
     int32_t                                late_dev   = -2;
@@ -98,6 +103,40 @@ static ggml_sycl_late_check_result wild_late(struct ggml_sycl_load_txn, int32_t,
     return (ggml_sycl_late_check_result) 99;
 }
 
+// The probe procs: one that answers a status the test picks and writes n_layer the way the backend's proc does
+// (never host_resident), and one that answers a value outside the enum.
+static ggml_sycl_residency_probe_status g_probe_answer = GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
+
+static ggml_sycl_residency_probe_status fake_probe(ggml_backend_t,
+                                                   struct ggml_sycl_model_token,
+                                                   uint32_t n_ctx,
+                                                   uint32_t,
+                                                   uint32_t,
+                                                   bool,
+                                                   bool,
+                                                   bool,
+                                                   const ggml_sycl_runtime_context_desc *,
+                                                   struct ggml_sycl_residency_probe * out) {
+    g_calls.n_probe++;
+    g_calls.probe_n_ctx = n_ctx;
+    out->n_layer        = 12;
+    return g_probe_answer;
+}
+
+static ggml_sycl_residency_probe_status wild_probe(ggml_backend_t,
+                                                   struct ggml_sycl_model_token,
+                                                   uint32_t,
+                                                   uint32_t,
+                                                   uint32_t,
+                                                   bool,
+                                                   bool,
+                                                   bool,
+                                                   const ggml_sycl_runtime_context_desc *,
+                                                   struct ggml_sycl_residency_probe * out) {
+    out->n_layer = 12;
+    return (ggml_sycl_residency_probe_status) 99;
+}
+
 static ggml_sycl_context_tenant_desc make_element(int32_t device, uint32_t cohort, uint32_t index, uint64_t bytes) {
     ggml_sycl_context_tenant_desc e = {};
     e.struct_size                   = sizeof(e);
@@ -146,6 +185,8 @@ int main() {
         procs.publish    = &fake_publish;
         procs.coverage   = &fake_coverage;
         procs.late_check = &fake_late;
+        CHECK(!procs.available(), "a table without the residency probe is not L4");
+        procs.probe_residency = &fake_probe;
         CHECK(procs.available(), "a full table reports L4");
         ggml_sycl_model_token          model = {};
         ggml_sycl_runtime_context_desc desc  = {};
@@ -168,6 +209,84 @@ int main() {
         llama_sycl_l4_procs half;
         half.publish = &fake_publish;
         CHECK(!half.available(), "a half table is not L4");
+    }
+
+    // (9) the residency probe's door
+    {
+        using status = ggml_sycl_residency_probe_status;
+        CHECK(GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED == 0, "the zero value is the unanswered one");
+        CHECK(GGML_SYCL_RESIDENCY_PROBE_OK == 1 && GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED == 2 &&
+                  GGML_SYCL_RESIDENCY_PROBE_INVALID == 3 && GGML_SYCL_RESIDENCY_PROBE_HEAD_SLOT_REFUSED == 4 &&
+                  GGML_SYCL_RESIDENCY_PROBE_NO_PROMOTION_VIOLATED == 5 &&
+                  GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL == 6 && GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND == 7,
+              "the status values are the published ones");
+        CHECK((int) GGML_SYCL_RESIDENCY_PROBE_OK != (int) GGML_SYCL_LIFECYCLE_OK,
+              "the probe's own enum: its OK is not the lifecycle's OK, which is 0");
+        if (sizeof(void *) == 8) {
+            CHECK(sizeof(ggml_sycl_residency_probe) == 24, "the probe out struct is %zu bytes",
+                  sizeof(ggml_sycl_residency_probe));
+        }
+
+        ggml_sycl_model_token          model = {};
+        ggml_sycl_runtime_context_desc desc  = {};
+        uint8_t                        bytes[12];
+        std::memset(bytes, 0xAB, sizeof(bytes));
+        ggml_sycl_residency_probe out = {};
+        out.struct_size               = sizeof(out);
+        out.version                   = GGML_SYCL_RESIDENCY_PROBE_VERSION;
+        out.n_layer_cap               = 12;
+        out.host_resident             = bytes;
+        auto untouched                = [&]() {
+            for (uint8_t b : bytes) {
+                if (b != 0xAB) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        // a null proc reads NOT_ANSWERED, and leaves no stale n_layer to be read as an answer
+        llama_sycl_l4_procs none;
+        out.n_layer = 7;
+        CHECK(llama_sycl_l4_probe_residency(none, nullptr, model, 4096, 512, 1, true, false, false, &desc, &out) ==
+                  GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED,
+              "a null probe proc must read NOT_ANSWERED");
+        CHECK(out.n_layer == 0 && untouched(), "a null proc leaves n_layer 0 and the bytes alone");
+
+        // an answer outside the enum reads NOT_ANSWERED too
+        llama_sycl_l4_procs wild;
+        wild.probe_residency = &wild_probe;
+        out.n_layer          = 7;
+        CHECK(llama_sycl_l4_probe_residency(wild, nullptr, model, 4096, 512, 1, true, false, false, &desc, &out) ==
+                  GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED,
+              "an out-of-range probe answer must read NOT_ANSWERED");
+        CHECK(out.n_layer == 0 && untouched(), "an unknown answer is no answer: n_layer is cleared");
+
+        // every published status is passed on as itself, with the caller's arguments; only OK is OK
+        llama_sycl_l4_procs procs;
+        procs.probe_residency = &fake_probe;
+        for (int v = 0; v <= 7; ++v) {
+            g_probe_answer = (status) v;
+            g_calls        = {};
+            out.n_layer    = 0;
+            const status got =
+                llama_sycl_l4_probe_residency(procs, nullptr, model, 4096, 512, 1, true, false, false, &desc, &out);
+            CHECK((int) got == v, "status %d is passed on as itself, got %d", v, (int) got);
+            CHECK(g_calls.n_probe == 1 && g_calls.probe_n_ctx == 4096, "the probe arguments are forwarded");
+            CHECK((got == GGML_SYCL_RESIDENCY_PROBE_OK) == (v == 1), "only OK is OK (status %d)", v);
+            CHECK(out.n_layer == 12, "the proc's n_layer is passed on");
+        }
+        CHECK(untouched(), "the door never writes the caller's host_resident bytes");
+
+        // the table is L4 only with the probe: each of the four procs alone is not enough
+        llama_sycl_l4_procs just_probe;
+        just_probe.probe_residency = &fake_probe;
+        CHECK(!just_probe.available(), "the probe alone is not L4");
+        llama_sycl_l4_procs three;
+        three.publish    = &fake_publish;
+        three.coverage   = &fake_coverage;
+        three.late_check = &fake_late;
+        CHECK(!three.available(), "the three older procs without the probe are not L4");
     }
 
     // (4) the section builder

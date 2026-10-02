@@ -158,6 +158,7 @@ _L4_NAMES = {
     "publish": "GGML_SYCL_PROC_SET_RUNTIME_CONTEXT_DESC",
     "coverage": "GGML_SYCL_PROC_TENANT_COVERAGE",
     "late_check": "GGML_SYCL_PROC_LOAD_LATE_CHECK",
+    "probe_residency": "GGML_SYCL_PROC_PROBE_RESIDENCY",
 }
 
 

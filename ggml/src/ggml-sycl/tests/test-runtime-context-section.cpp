@@ -324,6 +324,108 @@ void case_refusals() {
     }
 }
 
+// ---- (2b) descriptor version 2: the forced-host set and no_promotion (llama.cpp-moua L4 step 3d) ----
+
+// A descriptor of two KV layers and the base tenants whose v2 fields name `forced`.
+struct forced_desc {
+    std::vector<uint32_t> forced;
+    built_desc            b;
+
+    forced_desc(const std::vector<uint32_t> & f, uint8_t no_promotion = 0, uint32_t n_layers = 6) :
+        forced(f),
+        b(base_tenants(), std::vector<ggml_sycl_kv_layer_desc>(n_layers, layer(1024, 1024)), {}) {
+        b.desc.n_forced_host = (uint32_t) forced.size();
+        b.desc.no_promotion  = no_promotion;
+        b.desc.forced_host   = forced.empty() ? nullptr : forced.data();
+    }
+};
+
+void case_desc_v2_layout_and_parse() {
+    CHECK(GGML_SYCL_RUNTIME_CONTEXT_DESC_VERSION == 2, "the descriptor is at version 2");
+    CHECK(offsetof(ggml_sycl_runtime_context_desc, n_forced_host) == GGML_SYCL_RUNTIME_CONTEXT_DESC_V1_SIZE,
+          "the v2 fields start where version 1 ended");
+    if (sizeof(void *) == 8) {
+        CHECK(sizeof(ggml_sycl_runtime_context_desc) == 88, "the v2 descriptor is 88 bytes");
+        CHECK(GGML_SYCL_RUNTIME_CONTEXT_DESC_V1_SIZE == 72, "the v1 descriptor was 72 bytes");
+    }
+
+    // v2 fields are read, and the stored set is sorted.
+    forced_desc                   f({ 5, 1 }, 1);
+    const runtime_context_section s = parse_ok(&f.b.desc, geometry());
+    CHECK(s.forced_host == std::vector<uint32_t>({ 1, 5 }), "the forced set is stored sorted");
+    CHECK(s.no_promotion, "no_promotion is read");
+    CHECK(s.tenants.size() == 4 && s.kv.layers.size() == 6, "the older sections are read as before");
+
+    // The forced set and the flag are not in the tenant key: zhcn owns the digest, and the key is the tenants'.
+    forced_desc none({}, 0);
+    CHECK(parse_ok(&none.b.desc, geometry()).tenant_key == s.tenant_key, "the forced set is not part of the tenant key");
+
+    // Version 1 reads as no forced layers, even over a v2-shaped buffer whose tail holds garbage: the v2 fields
+    // are beyond the publisher's struct_size and so absent.
+    forced_desc old({ 2 }, 1);
+    old.b.desc.version     = 1;
+    old.b.desc.struct_size = GGML_SYCL_RUNTIME_CONTEXT_DESC_V1_SIZE;
+    const runtime_context_section v1 = parse_ok(&old.b.desc, geometry());
+    CHECK(v1.forced_host.empty() && !v1.no_promotion, "a v1 publisher has no forced layers and no flag");
+    CHECK(v1.tenants.size() == 4 && v1.kv.layers.size() == 6, "and its older sections are read");
+
+    // A version-1 publisher's struct_size is the old 72 bytes; version 2 needs the whole 88.
+    {
+        using st = runtime_context_desc_status;
+        forced_desc a({}, 0);
+        a.b.desc.version     = 1;
+        a.b.desc.struct_size = GGML_SYCL_RUNTIME_CONTEXT_DESC_V1_SIZE - 1;
+        expect_refused(a.b, st::SHORT_STRUCT, "a v1 struct_size below the v1 layout");
+        forced_desc c({}, 0);
+        c.b.desc.struct_size = sizeof(c.b.desc) - 1;
+        expect_refused(c.b, st::SHORT_STRUCT, "a v2 struct_size below the v2 layout");
+        forced_desc d({}, 0);
+        d.b.desc.struct_size = GGML_SYCL_RUNTIME_CONTEXT_DESC_V1_SIZE;
+        expect_refused(d.b, st::SHORT_STRUCT, "version 2 over a v1-sized struct");
+        forced_desc e({}, 0);
+        e.b.desc.version = 3;
+        expect_refused(e.b, st::UNKNOWN_VERSION, "version 3 is unknown");
+    }
+}
+
+void case_desc_v2_refusals() {
+    using st = runtime_context_desc_status;
+    {
+        forced_desc f({ 1 }, 0);
+        f.b.desc.pad1[1] = 1;
+        expect_refused(f.b, st::BAD_PAD, "pad1 is not 0");
+    }
+    {
+        forced_desc f({ 1 }, 2);
+        expect_refused(f.b, st::BAD_FLAG, "no_promotion is not 0 or 1");
+    }
+    {
+        forced_desc f({ 1 }, 0);
+        f.b.desc.forced_host = nullptr;
+        expect_refused(f.b, st::BAD_ARRAY, "a forced count with no array");
+    }
+    {
+        std::vector<uint32_t> big(RUNTIME_CONTEXT_DESC_MAX_ELEMENTS + 1, 0);
+        forced_desc           f({}, 0, 8);
+        f.b.desc.n_forced_host = (uint32_t) big.size();
+        f.b.desc.forced_host   = big.data();
+        expect_refused(f.b, st::BAD_ARRAY, "a forced count over the cap");
+    }
+    {
+        forced_desc f({ 6 }, 0, 6);
+        expect_refused(f.b, st::FORCED_INDEX_RANGE, "a forced index equal to n_layer");
+        forced_desc g({ 0, 99 }, 0, 6);
+        expect_refused(g.b, st::FORCED_INDEX_RANGE, "a forced index far past n_layer");
+    }
+    {
+        forced_desc f({ 4, 2, 4 }, 0, 6);
+        expect_refused(f.b, st::DUPLICATE_FORCED, "the same layer forced twice");
+    }
+    CHECK(std::string(runtime_context_desc_status_text(st::FORCED_INDEX_RANGE)) != "unknown" &&
+              std::string(runtime_context_desc_status_text(st::DUPLICATE_FORCED)) != "unknown",
+          "every new status has its text");
+}
+
 // ---- (3) coverage ----------------------------------------------------------------------------
 
 ggml_sycl_tenant_coverage cover(const runtime_context_section & published, const runtime_context_section & candidate) {
@@ -373,6 +475,45 @@ void case_coverage_geometry() {
                     g.n_ubatch = 1024;
                 })) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
           "a smaller n_ctx does not cover a larger n_ubatch");
+}
+
+// The forced-host set and no_promotion change the residency the committed plan must keep, so a candidate that
+// differs in either is GROWTH, and one that agrees is as covered as before.
+void case_coverage_forced_host() {
+    forced_desc                   pub_d({ 1, 3 }, 0);
+    const runtime_context_section pub = parse_ok(&pub_d.b.desc, geometry());
+    {
+        forced_desc same_d({ 3, 1 }, 0);
+        CHECK(cover(pub, parse_ok(&same_d.b.desc, geometry())) == GGML_SYCL_TENANT_COVERAGE_EQUAL,
+              "the same forced set in another order is EQUAL");
+        runtime_context_geometry smaller = geometry();
+        smaller.n_ctx                    = 4096;
+        CHECK(cover(pub, parse_ok(&same_d.b.desc, smaller)) == GGML_SYCL_TENANT_COVERAGE_COVERED,
+              "and a smaller geometry over it is still COVERED");
+    }
+    {
+        forced_desc more_d({ 1, 3, 4 }, 0);
+        CHECK(cover(pub, parse_ok(&more_d.b.desc, geometry())) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+              "a larger forced set grows");
+        forced_desc less_d({ 1 }, 0);
+        CHECK(cover(pub, parse_ok(&less_d.b.desc, geometry())) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+              "a smaller forced set grows: it changes the residency the plan must keep");
+        forced_desc other_d({ 1, 4 }, 0);
+        CHECK(cover(pub, parse_ok(&other_d.b.desc, geometry())) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+              "a different forced set of the same size grows");
+        forced_desc none_d({}, 0);
+        CHECK(cover(pub, parse_ok(&none_d.b.desc, geometry())) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+              "no forced set against a published one grows");
+    }
+    {
+        forced_desc flag_d({ 1, 3 }, 1);
+        CHECK(cover(pub, parse_ok(&flag_d.b.desc, geometry())) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+              "a no_promotion flip grows");
+        const runtime_context_section flagged = parse_ok(&flag_d.b.desc, geometry());
+        forced_desc                   unflagged_d({ 1, 3 }, 0);
+        CHECK(cover(flagged, parse_ok(&unflagged_d.b.desc, geometry())) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+              "and back: a no_promotion flip is growth either way");
+    }
 }
 
 void case_coverage_shape_and_plan_state() {
@@ -770,8 +911,11 @@ int main() {
     case_planned_follows_the_tenant_section();
     case_key_is_llamas_digest();
     case_refusals();
+    case_desc_v2_layout_and_parse();
+    case_desc_v2_refusals();
     case_coverage_geometry();
     case_coverage_shape_and_plan_state();
+    case_coverage_forced_host();
     case_coverage_ignores_element_padding();
     case_coverage_refuses_zero_geometry();
     case_coverage_slots();
