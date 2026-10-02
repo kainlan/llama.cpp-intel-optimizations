@@ -249,7 +249,12 @@ struct llama_late_check_result {
 // Folds the measured devices through the backend's late check. A device the backend recorded nothing for
 // stays in `not_recorded`; it is never read as EQUAL. The first REFUSED ends the fold with the named refusal
 // (the backend has logged its own canonical line). The host tier is skipped: the backend's entry point takes a
-// SYCL device index, and no host term is recorded at the early stage today.
+// SYCL device index, and no host term is recorded at the early stage today. That skip is of the late
+// COMPARISON only. A host-tier refusal can still occur at every stage, probe and admitted included, but
+// inside the measure, not in a comparison: the host compute buft's chunk cap is the per-process constant (it
+// has no refusal source), while its chunk plan is refused like any buft's when the peaks need more chunks than
+// allowed, and that comes back as the measure's own failure naming the stage. (llama has no probe or admitted
+// call site yet; those stages are the backend planner's, and they read the host term from the same result.)
 inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &                    procs,
                                                      struct ggml_sycl_load_txn                      txn,
                                                      const std::vector<llama_load_measure_device> & devices) {
