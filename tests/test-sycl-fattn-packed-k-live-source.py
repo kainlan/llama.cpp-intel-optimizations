@@ -530,8 +530,20 @@ def guarded_cmake_block(source: str) -> str | None:
     return None
 
 
+def strip_cmake_comments(source: str) -> str:
+    """Drop `#` line comments (not a `#` inside a quoted argument); the line structure is kept."""
+    return "\n".join(re.sub(r'^((?:[^"#]|"[^"]*")*)#.*$', r"\1", line) for line in source.splitlines())
+
+
+def private_testing_defined(block: str) -> bool:
+    """GGML_SYCL_PRIVATE_TESTING=1 is its own argument of the target's PRIVATE compile definitions: not a
+    comment, not wrapped in a generator expression (`$<0:...>` is a single token that is not the definition)."""
+    call = re.search(r"target_compile_definitions\(\s*test-fattn-packed-k-lifecycle\s+PRIVATE\s+([^)]*)\)", block)
+    return call is not None and "GGML_SYCL_PRIVATE_TESTING=1" in call.group(1).split()
+
+
 def cmake_contract(source: str) -> bool:
-    block = guarded_cmake_block(source)
+    block = guarded_cmake_block(strip_cmake_comments(source))
     if block is None:
         return False
     # Whitespace-normalised: the link line is wrapped across lines now, and a literal needle for it is a
@@ -553,11 +565,8 @@ def cmake_contract(source: str) -> bool:
     # The private seams the test drives (failpoints, fill/profile error injection) compile in only under
     # GGML_SYCL_PRIVATE_TESTING, so the live target must carry it in its own compile definitions: without it
     # the checkpoints are silently inert and the test skips or passes without reaching them.
-    private_testing = re.search(
-        r"target_compile_definitions\(test-fattn-packed-k-lifecycle PRIVATE [^)]*\bGGML_SYCL_PRIVATE_TESTING=1\b",
-        block)
     return (all(needle in block for needle in required) and
-            private_testing is not None and
+            private_testing_defined(block) and
             all(cp in block for cp in CHECKPOINTS) and
             block.endswith("endforeach() endif()") and
             source.count("find_library(LEVEL_ZERO_LOADER") == 1)
@@ -569,6 +578,26 @@ def test_production_live_driver_and_structural_registration_contracts() -> None:
     assert cmake_contract(CMAKE)
     assert CMAKE.index(GUARD) > CMAKE.index("# Un-guarded SYCL tests")
     assert LIVE.index("verify_host_boundaries();") < LIVE.index("if (!preflight_device())")
+
+
+def test_private_testing_definition_must_be_a_live_standalone_argument() -> None:
+    """Each mutant removes the live definition in a way a substring match would accept; the rest of the contract
+    still holds for it, so the refusal is for the right reason: private_testing_defined() is what fails."""
+    definition = "GGML_SYCL_PRIVATE_TESTING=1"
+    assert CMAKE.count(definition) >= 1
+    start = CMAKE.index("target_compile_definitions(test-fattn-packed-k-lifecycle PRIVATE")
+    site = CMAKE.index(definition, start)
+    live_block = " ".join(guarded_cmake_block(strip_cmake_comments(CMAKE)).split())
+    assert private_testing_defined(live_block)
+    for label, spelling in (("commented out", "# " + definition),
+                            ("behind a false generator expression", "$<0:" + definition + ">"),
+                            ("defined to 0", "GGML_SYCL_PRIVATE_TESTING=0")):
+        mutant = CMAKE[:site] + spelling + CMAKE[site + len(definition):]
+        block = " ".join(guarded_cmake_block(strip_cmake_comments(mutant)).split())
+        assert not private_testing_defined(block), label
+        assert not cmake_contract(mutant), label
+        # the only thing that changed is the definition: every other requirement of the contract still holds
+        assert "COMMAND test-fattn-packed-k-lifecycle --checkpoint ${_packed_k_checkpoint}" in block, label
 
 
 def test_checkpoint_mutations_are_killed() -> None:
