@@ -41,10 +41,20 @@ Rules, per tests/test-sycl-*.py:
       stale;
   R6  at least MIN_GATES gates exist (a tests/ that moved would otherwise be audited as empty and pass).
 
-Known limit: this reads every CMakeLists.txt under the tree statically, so it does not know whether CMake reaches a
-registration. A registration in an uncalled function()/macro(), behind a non-constant if(), or in a directory no
-add_subdirectory() visits still counts as registered, and a test property reaching the test through a CMake
-variable (`set_tests_properties(${NAME} ...)`) is not resolved. `ctest -N` in a configured tree is the reachability check.
+  R7  (only with --census BUILD_DIR) every registered gate is in the ctest files of that configured build, so a
+      registration behind a configuration guard, in an uncalled function()/macro(), in an empty foreach() or in an
+      unvisited directory cannot hide. Gates a default configuration legitimately lacks are in
+      CENSUS_ABSENT_ALLOWLIST with a reason.
+
+Known limit: without --census this reads every CMakeLists.txt under the tree statically, so it does not know whether
+CMake reaches a registration. A registration in an uncalled function()/macro(), in a foreach() over an empty list,
+behind a non-constant if(), or in a directory no add_subdirectory() visits still counts as registered, and a
+test property reaching the test through a CMake variable (`set_tests_properties(${NAME} ...)`) is not resolved. That is
+exactly how test-sycl-module-nodelete-source.py went unrun in a default build (registered inside the
+GGML_BACKEND_DL block): only the census, run against a configured build, catches that class. The ctest registration of
+the census covers GGML_SYCL=ON with GGML_BACKEND_DL=OFF only; other configurations are not censused. R3's reading of a
+guard is also bounded: a loop narrowed by something other than a comparison or a constant (a helper call that always
+returns False) still counts as running every test.
 
 `--self-test` also proves the audit can fail: it plants each escape above (and the shapes that must stay clean) into
 temp trees, synthetic and a copy of the real tree (every CMakeLists.txt this audit scans), and requires each to be
@@ -70,13 +80,25 @@ UNREGISTERED_ALLOWLIST = {}
 # An entry goes stale (and is reported) the moment its file appears.
 MISSING_FILE_ALLOWLIST = {}
 REQUIRE_PYTEST_FOOTER = True
+# --census: gates the CMakeLists.txt files register that a configured build (GGML_SYCL=ON, GGML_BACKEND_DL=OFF, the default
+# configuration) still does not contain, name -> reason. Each is a registration behind a configuration guard; an entry
+# goes stale (and is reported) the moment the build does contain the gate.
+CENSUS_ABSENT_ALLOWLIST = {
+    "test-sycl-module-dependencies.py": "needs the GGML_BACKEND_DL module (registered inside the DL-only block of ggml-sycl)",
+}
 # The audit refuses a tests/ that has lost most of its gates (a moved directory would otherwise audit nothing and PASS).
-MIN_GATES = 100
+MIN_GATES = 160
 # The programs a registration may run a gate with: python itself, or a CMake variable that names it.
 INTERPRETER = re.compile(r"(?:.*/)?python[0-9.]*|\$\{\w*python\w*\}", re.I)
 # Test properties that make a registered gate not count: it never runs, its exit status is inverted, or its output
 # decides the verdict instead of the exit code. SKIP_RETURN_CODE, LABELS, TIMEOUT, FAIL_REGULAR_EXPRESSION are fine.
 DEFECT_PROPERTIES = {"DISABLED", "WILL_FAIL", "PASS_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION"}
+# SKIP_RETURN_CODE is allowed only as 77, the status the gates use for "could not run": 0 would report a pass as a skip
+# and 1 a failure as one.
+SKIP_RETURN_CODE_OK = "77"
+# Interpreter flags that leave "python runs this file" intact. Anything else in front of the gate (-m py_compile,
+# -c pass, -h, -V, ...) makes python do something other than run it.
+SAFE_INTERPRETER_FLAGS = {"-B", "-u", "-s", "-E", "-I", "-O", "-OO", "-P"}
 # What scripts/sycl-add-pytest-footer.py appends (two blank lines before the guard: flake8 E305).
 FOOTER = '\n\nif __name__ == "__main__":\n    import sys\n\n    import pytest\n\n    sys.exit(pytest.main([__file__, "-q"]))\n'
 EXIT_CALLS = {"sys.exit", "exit", "quit", "SystemExit", "os._exit"}
@@ -216,6 +238,15 @@ def registration_target(command, args):
     m = re.fullmatch(r"(?:.*/)?(test-sycl-[A-Za-z0-9_.-]+\.py)", candidate)
     if not m or not INTERPRETER.fullmatch(program):
         return None, None
+    if command == "add_test" and "CONFIGURATIONS" in whole:
+        return None, None  # only runs in the named build configurations
+    if command != "llama_test_pytest":
+        # what sits between the interpreter and the gate must be flags that still run the file
+        ahead = tokens[:tokens.index(candidate)]
+        if command == "add_test":
+            ahead = ahead[1:]
+        if any(tok not in SAFE_INTERPRETER_FLAGS for tok in ahead):
+            return None, None
     gate = m.group(1)
     name = None
     if command == "add_test":
@@ -319,6 +350,10 @@ def scan_registrations(root):
                     if key in DEFECT_PROPERTIES and value.lower() not in STATIC_FALSE:
                         defects.append("R1 %s is registered (as test %s) but not run as a test: %s is set on it"
                                        % (gate, test, key))
+                    if key == "SKIP_RETURN_CODE" and value != SKIP_RETURN_CODE_OK:
+                        defects.append("R1 %s is registered (as test %s) but not run as a test: SKIP_RETURN_CODE %s "
+                                       "reports exit status %s as a skip (only %s is allowed)"
+                                       % (gate, test, value, value, SKIP_RETURN_CODE_OK))
     return {gate: sorted(forms) for gate, forms in found.items()}, defects
 
 
@@ -453,14 +488,55 @@ def _loop_reports_failure(body, loop_at, recorded):
 
 
 def _unittest_main_selects_nothing_out(call):
-    if len(call.args) > 1 or any(kw.arg in ("exit", "defaultTest") or kw.arg is None for kw in call.keywords):
+    """unittest.main() over this module: no defaultTest, exit=, module=, another module's name or an argv selector."""
+    if any(kw.arg in ("exit", "defaultTest", "module") or kw.arg is None for kw in call.keywords):
         return False
+    if len(call.args) > 1:
+        return False
+    if call.args:
+        module = call.args[0]
+        if not ((isinstance(module, ast.Name) and module.id == "__name__")
+                or (isinstance(module, ast.Constant) and module.value in ("__main__", None))):
+            return False
     for kw in call.keywords:
         if kw.arg == "argv":
             argv = kw.value
             ok = isinstance(argv, ast.List) and argv.elts and ast.unparse(argv.elts[0]) == "sys.argv[0]" and all(
                 isinstance(e, ast.Starred) for e in argv.elts[1:])
             if not ok and ast.unparse(argv) not in ("sys.argv", "sys.argv[:]"):
+                return False
+    return True
+
+
+def _selector_is_plain(loop):
+    """The test selection in a globals() loop is `name.startswith("test...")` plus at most callable()/isinstance()
+    conjuncts: a comparison (`name == "test_x"`, `name in (...)`) or a constant False narrows the loop to a subset."""
+    for node in ast.walk(loop):
+        if isinstance(node, ast.If) and any(
+                isinstance(sub, ast.Call) and _call_name(sub).endswith(".startswith") for sub in ast.walk(node.test)):
+            for sub in ast.walk(node.test):
+                if isinstance(sub, ast.Compare):
+                    return False
+                if isinstance(sub, ast.Constant) and not isinstance(sub.value, str) and not sub.value:
+                    return False
+    return True
+
+
+def _handlers_record_or_stop(loop, recorded):
+    """Every `except` in the loop either records the failure (writes a name the exit reads), re-raises, or exits:
+    one that just passes swallows whatever it catches. (`except unittest.SkipTest` is a skip, not a failure.)"""
+    for node in ast.walk(loop):
+        if isinstance(node, ast.ExceptHandler):
+            if node.type is not None and ast.unparse(node.type).endswith("SkipTest"):
+                continue  # a deliberate skip is not a swallowed failure
+            writes, stops = set(), False
+            for sub in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+                if isinstance(sub, ast.Raise):
+                    stops = True
+                if isinstance(sub, ast.Call) and _call_name(sub) in EXIT_CALLS:
+                    stops = True
+            writes = _recorded_names(ast.Module(body=node.body, type_ignores=[]))
+            if not (stops or writes & recorded):
                 return False
     return True
 
@@ -488,9 +564,51 @@ def _guard_runs_every_test(guard, kinds):
                 for node in ast.walk(stmt))
             by_hand = any(isinstance(call.func, ast.Name) and call.func.id.startswith("test")
                           for call in calls if id(call) not in inside)
-            if selects_tests and not by_hand and _loop_reports_failure(body, at, _recorded_names(stmt)):
+            recorded = _recorded_names(stmt)
+            read_after = set().union(*(_names(later) for later in body[at + 1:])) if body[at + 1:] else set()
+            if (selects_tests and not by_hand and _selector_is_plain(stmt) and _loop_reports_failure(body, at, recorded)
+                    and _handlers_record_or_stop(stmt, recorded & read_after)):
                 return True
     return False
+
+
+def _returns_a_status(func):
+    """True when the function body (not nested defs) returns something other than None / a constant 0."""
+    stack = list(func.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Return) and node.value is not None and not (
+                isinstance(node.value, ast.Constant) and node.value.value in (0, None)):
+            return True
+        stack.extend(ast.iter_child_nodes(node))
+    return False
+
+
+def dropped_status_calls(text):
+    """Names f such that a top-level `__main__` guard calls `f()` as a bare statement (or assigns the result to a name
+    it never reads again) although f returns a status: `main()` instead of `sys.exit(main())` turns every failure
+    the function reports into exit 0. Applies to any gate, script-style included."""
+    tree = parse(text)
+    if tree is None:
+        return []
+    returning = {node.name for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _returns_a_status(node)}
+    dropped = []
+    for guard in (node for node in tree.body if is_main_guard(node)):
+        for at, stmt in enumerate(guard.body):
+            call, name = None, None
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                call = stmt.value
+            elif (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)
+                  and isinstance(stmt.value, ast.Call)):
+                call, name = stmt.value, stmt.targets[0].id
+            if call is None or not isinstance(call.func, ast.Name) or call.func.id not in returning:
+                continue
+            if name is None or not any(name in _names(later) for later in guard.body[at + 1:]):
+                dropped.append(call.func.id)
+    return dropped
 
 
 def runs_itself(text):
@@ -528,6 +646,10 @@ def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None, missing_al
         if gate.name in allowlist:
             problems.append("R4 %s is allowlisted as unregistered but is registered" % gate.name)
         kinds = collect_kinds(text)
+        if require_footer:
+            for func in dropped_status_calls(text):
+                problems.append("R3 %s calls %s() from its __main__ guard and drops the status it returns; every failure "
+                                "it reports would exit 0 (use sys.exit(%s()))" % (gate.name, func, func))
         if kinds:
             self_running = runs_itself(text)
             if set(forms) != {"llama_test_pytest"} and not (kinds <= {"unittest"} and self_running):
@@ -642,6 +764,10 @@ R3_CASES = [
      REG_P_ADD, None),
     ("r3-ok-script-main-returns-nothing", "def main():\n    print('ok')\n    return\n\n\nif __name__ == \"__main__\":\n    main()\n",
      REG_P_ADD, None),
+    ("r3-ok-loop-skiptest-handler", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n    import unittest\n\n    failures = 0\n'
+     '    for name, fn in list(globals().items()):\n        if name.startswith("test_") and callable(fn):\n'
+     '            try:\n                fn()\n            except unittest.SkipTest:\n                print("skip")\n'
+     '            except AssertionError:\n                failures += 1\n    sys.exit(1 if failures else 0)\n', REG_P_PYTEST, None),
     ("r3-ok-loop-exits-only-on-failure", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n'
      '    for name, fn in list(globals().items()):\n        if name.startswith("test_") and callable(fn):\n'
      '            try:\n                fn()\n            except AssertionError:\n                failures += 1\n'
@@ -853,23 +979,98 @@ llama_test_pytest(${Python3_EXECUTABLE}
     return failures
 
 
+def configured_test_text(build_dir):
+    """The text of every CTestTestfile.cmake under a configured build (what ctest would actually run)."""
+    chunks = []
+    for dirpath, dirnames, filenames in os.walk(build_dir):
+        dirnames[:] = [d for d in dirnames if d != "CMakeFiles"]
+        if "CTestTestfile.cmake" in filenames:
+            chunks.append((Path(dirpath) / "CTestTestfile.cmake").read_text(errors="replace"))
+    return "\n".join(chunks)
+
+
+def census(root, build_dir, absent_allowlist=None):
+    """R7: every gate the CMakeLists.txt files register (R1's static view) is in the configured build's ctest files.
+
+    The static audit cannot tell whether CMake reaches a registration: one behind a configuration guard, in an uncalled
+    function() or in an unvisited directory counts as registered there and never runs (llama.cpp-qeld found
+    test-sycl-module-nodelete-source.py registered inside the GGML_BACKEND_DL block, so a default build never ran it).
+    This compares against what the build actually configured, with no GPU and no ctest run."""
+    root = Path(root)
+    absent_allowlist = CENSUS_ABSENT_ALLOWLIST if absent_allowlist is None else absent_allowlist
+    text = configured_test_text(build_dir)
+    if not text:
+        return ["R7 no CTestTestfile.cmake under %s: not a configured build, so the census proves nothing" % build_dir]
+    problems = []
+    registered, _ = scan_registrations(root)
+    for gate in sorted(registered):
+        present = ("/" + gate) in text
+        if not present and gate not in absent_allowlist:
+            problems.append("R7 %s is registered in a CMakeLists.txt but is not in the configured build %s: behind a "
+                            "configuration guard or in an uncalled function, so it never runs here (add it to "
+                            "CENSUS_ABSENT_ALLOWLIST with the reason if that is intended)" % (gate, build_dir))
+        if present and gate in absent_allowlist:
+            problems.append("R7 %s is allowlisted as absent from the configured build but is there; drop the entry" % gate)
+    for gate in sorted(absent_allowlist):
+        if gate not in registered:
+            problems.append("R7 %s is in CENSUS_ABSENT_ALLOWLIST but nothing registers it" % gate)
+    return problems
+
+
+def census_self_test(base):
+    """The census reports an unconfigured registration, a stale allowlist entry and an empty build dir."""
+    failures = []
+    tree = base / "census-tree"
+    write_tree(tree, {"test-sycl-a.py": SCRIPT_GATE, "test-sycl-b.py": SCRIPT_GATE},
+               "add_test(NAME a COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-a.py)\n"
+               "if(SOME_GUARD)\nadd_test(NAME b COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-b.py)\nendif()\n")
+    build = base / "census-build"
+    (build / "tests").mkdir(parents=True)
+    (build / "tests" / "CTestTestfile.cmake").write_text('add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n')
+    problems = census(tree, build, {})
+    if not any("R7 test-sycl-b.py" in p for p in problems) or any("R7 test-sycl-a.py" in p for p in problems):
+        failures.append("census: a registration the build did not configure was not (only) reported: %s" % problems)
+    if census(tree, build, {"test-sycl-b.py": "guarded"}):
+        failures.append("census: an allowlisted absent gate was still reported")
+    if not any("drop the entry" in p for p in census(tree, build, {"test-sycl-a.py": "reason", "test-sycl-b.py": "r"})):
+        failures.append("census: a stale absent-allowlist entry was not reported")
+    if not any("nothing registers it" in p for p in census(tree, build, {"test-sycl-b.py": "r", "test-sycl-ghost.py": "r"})):
+        failures.append("census: an allowlist entry nothing registers was not reported")
+    empty = base / "census-empty"
+    empty.mkdir()
+    if not any("not a configured build" in p for p in census(tree, empty, {})):
+        failures.append("census: an empty build directory passed")
+    # a longer file name that merely ends in the gate's must not count as the gate being configured
+    (build / "tests" / "CTestTestfile.cmake").write_text('add_test([=[a]=] "/usr/bin/python3" "/x/tests/old-test-sycl-a.py")\n')
+    if not any("R7 test-sycl-a.py" in p for p in census(tree, build, {"test-sycl-b.py": "r"})):
+        failures.append("census: old-test-sycl-a.py counted as test-sycl-a.py")
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true", help="also prove the audit fails on planted violations")
+    parser.add_argument("--census", metavar="BUILD_DIR",
+                        help="also require every registered gate to be in this configured build's CTestTestfile.cmake files")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     problems = audit(root, min_gates=MIN_GATES)
+    if args.census:
+        problems = problems + census(root, args.census)
     for problem in problems:
         print("FAIL " + problem)
     if args.self_test:
         failures = self_test()
+        with tempfile.TemporaryDirectory(prefix="gate-census-") as raw:
+            failures += census_self_test(Path(raw))
         for failure in failures:
             print("SELF-TEST FAIL " + failure)
         problems = problems + failures
     if problems:
         sys.exit(1)
     gates = len(list((root / "tests").glob("test-sycl-*.py")))
-    print("sycl gate registration audit: PASS (%d gates%s)" % (gates, ", self-test PASS" if args.self_test else ""))
+    print("sycl gate registration audit: PASS (%d gates%s%s)" % (
+        gates, ", self-test PASS" if args.self_test else "", ", census PASS" if args.census else ""))
 
 
 if __name__ == "__main__":
