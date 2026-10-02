@@ -178,12 +178,21 @@ def function_body(source, signature_regex):
 def entry_blocks_graphs(compute):
     """Returns "" when the compute entry turns graphs off after a failed retire, else the reason it does not.
 
-    Some `if (... moe_graphs_disabled ...) { use_sycl_graph = false; }` block must (a) be a top-level statement of the
-    compute body (not under another `if`, not dead, no `&&` and no negation in its condition, no preprocessor
-    conditional ahead of it), (b) consist of the assignment as a direct statement (plus an optional debug line either
-    side), (c) precede every consumer of use_sycl_graph, and (d) be followed, up to the LAST recording, by no
-    assignment to use_sycl_graph other than `= false` (or `&=`): a later `= true`, `|= true` or `= x || y` would
-    re-enable what the block turned off. Strings are masked: an assignment in a message is text, not code."""
+    Some `if (<cond>) { use_sycl_graph = false; }` block must satisfy ALL of:
+      (a) its condition is exactly an `||` chain of `sycl_ctx->` members that includes `sycl_ctx->moe_graphs_disabled`
+          (no `&&`, negation, comparison, bit-operator or ternary can change what the flag means);
+      (b) it is an unguarded top-level statement of the compute body: brace depth 1, and the previous significant
+          character (skipping blanks and preprocessor lines) is `;`, `{` or `}`, so no braceless `if`, no `else`
+          and no `else if` governs it;
+      (c) the only preprocessor conditional open ahead of it is the function's `#ifdef GGML_SYCL_GRAPH`, and no
+          `#endif`/`#else`/`#elif` precedes it (conservative: a block hoisted ahead of that `#ifdef` also fails, which
+          is the intended pin, not an accident);
+      (d) its body is the assignment as a direct statement, plus an optional debug line either side;
+      (e) it precedes every consumer of use_sycl_graph;
+      (f) from it to the LAST recording nothing assigns use_sycl_graph except `= false` and `&=` (a later `= true`,
+          `|= true`, `^=`, `%=`, `<<=`, `++`, `= x || y` or a reference/pointer alias would re-enable it).
+    Strings are masked: an assignment in a message is text, not code. Dead code (`if (0)`, a dead wrapper) is rejected
+    by (a), (b) and (d); only the shapes above are accepted."""
     masked = mask_strings(compute or "")
     if not masked:
         return "the compute function body was not found"
@@ -198,14 +207,18 @@ def entry_blocks_graphs(compute):
     shape = r"\{\s*(GGML_SYCL_DEBUG\([^;{}]*\);\s*)?use_sycl_graph\s*=\s*false\s*;\s*(GGML_SYCL_DEBUG\([^;{}]*\);\s*)?\}"
     reason = "no `if (... moe_graphs_disabled ...)` block in the compute body"
     for m in re.finditer(r"\bif\s*\(([^(){};]*)\)\s*\{", masked):
-        cond = m.group(1)
-        if re.search(r"(?<![!\w>.])\s*sycl_ctx->moe_graphs_disabled\b", " " + cond) is None or "&&" in cond or "?" in cond \
-                or re.search(r"!\s*sycl_ctx->moe_graphs_disabled", cond):
+        if re.fullmatch(r"\s*(?:sycl_ctx->\w+\s*\|\|\s*)*sycl_ctx->moe_graphs_disabled(?:\s*\|\|\s*sycl_ctx->\w+)*\s*", m.group(1)) is None:
+            continue
+        # Previous significant character: skip blanks and preprocessor lines.
+        prior = [ln for ln in masked[: m.start()].splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+        prev_char = prior[-1].rstrip()[-1:] if prior else ""
+        if prev_char not in (";", "{", "}"):
+            reason = "the moe_graphs_disabled block is guarded (a braceless if, else or else-if precedes it)"
             continue
         # The graph section of the function lives under the one `#ifdef GGML_SYCL_GRAPH`; any other conditional ahead of
         # the block (an `#if 0` around it, an `#else` arm) could compile it away.
         conditionals = [re.sub(r"#\s*", "#", re.sub(r"\s+", " ", x.strip()))
-                        for x in re.findall(r"^\s*#\s*(?:if|ifdef|ifndef|else|elif)\b.*$", masked[: m.start()], re.M)]
+                        for x in re.findall(r"^\s*#\s*(?:if|ifdef|ifndef|else|elif|endif)\b.*$", masked[: m.start()], re.M)]
         if conditionals != ["#ifdef GGML_SYCL_GRAPH"]:
             reason = "a preprocessor conditional other than `#ifdef GGML_SYCL_GRAPH` sits ahead of the block: " + repr(conditionals)
             continue
@@ -224,7 +237,7 @@ def entry_blocks_graphs(compute):
         if re.search(r"(?<!&)&\s*(\w+\s*=\s*)?use_sycl_graph\b", window):
             reason = "use_sycl_graph is aliased by reference after the moe_graphs_disabled block"
             continue
-        bad = [x for x in re.finditer(r"\buse_sycl_graph\s*([|^+\-*/&]?)=(?!=)", window)
+        bad = [x for x in re.finditer(r"\buse_sycl_graph\s*(<<|>>|[|^+\-*/&%]?)=(?!=)|\+\+\s*use_sycl_graph|\buse_sycl_graph\s*\+\+|--\s*use_sycl_graph|\buse_sycl_graph\s*--|\buse_sycl_graph\s*\)\s*=(?!=)", window)
                if not (x.group(1) == "&" or (x.group(1) == "" and re.match(r"\s*false\s*;", window[x.end():])))]
         if bad:
             reason = "use_sycl_graph is re-enabled after the moe_graphs_disabled block"
@@ -636,6 +649,21 @@ if args.self_test:
 
     mem_ = memo_hdr
     mutants = [
+        # review r13
+        ("the entry condition compares the flag to false", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"if \(sycl_ctx->moe_graphs_disabled\) \{(\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;)", r"if (sycl_ctx->moe_graphs_disabled == false) {\1"), common, mem_)),
+        ("the entry condition is a less-than", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"if \(sycl_ctx->moe_graphs_disabled\) \{(\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;)", r"if (sycl_ctx->moe_graphs_disabled < 0) {\1"), common, mem_)),
+        ("the entry block is the else arm of another if", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"(\n    )(if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG)", r'\1if (sycl_ctx->graphs_disabled) { GGML_SYCL_DEBUG("x\\n"); } else \2'), common, mem_)),
+        ("the entry block is guarded by a braceless if", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"(\n    )(if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG)", r"\1if (cached_is_decode)\n    \2"), common, mem_)),
+        ("the entry block is guarded by a braceless if (false)", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"(\n    )(if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG)", r"\1if (false)\n    \2"), common, mem_)),
+        ("an #endif closes the graph section before the block", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"((if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;\s*\}))", r"#endif\n\1\n#ifdef GGML_SYCL_GRAPH"), common, mem_)),
+        ("use_sycl_graph is assigned through std::tie", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"((if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;\s*\}))", r"\1\n    std::tie(use_sycl_graph) = std::make_tuple(true);"), common, mem_)),
         # review r12
         ("use_sycl_graph is re-enabled just before the descriptor candidates", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
          (mutate_re(backend, cmp_sig, r"(\n\s*const int descriptor_moe_graph_candidates =)", r"\n    use_sycl_graph = true;\1"), common, mem_)),
