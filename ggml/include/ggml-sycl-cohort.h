@@ -6,7 +6,9 @@
 // the other's private headers. The tenant element itself is ggml_sycl_context_tenant_desc,
 // defined once in ggml-sycl.h.
 //
-// The value is the id carried in the element, so it is append-only. The cohort's name (the
+// The value is the id carried in the element. APPEND-ONLY: an id is ABI from the first publish that
+// carries it, so a row is never renumbered, reordered or reused; a new cohort takes the next value
+// before GGML_SYCL_CONTEXT_COHORT_COUNT (tests/test-sycl-tenant-section-source.py pins the list). The cohort's name (the
 // `cohort=` text of an allocation line), tier, scope and lifetime are in the backend's table,
 // which is their only source; an id is never retyped as a literal.
 

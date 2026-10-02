@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-sycl-cohort.h"
+#include "ggml-sycl-l4-procs.h"
 #include "ggml-sycl.h"
 
 #include <algorithm>
@@ -23,8 +24,8 @@
 // (ggml-sycl.h, "The measured-tenant publish"). A backend that predates them leaves a proc
 // null, and each reader below then answers the value that makes the caller do the safe thing:
 // no publish happened (UNSUPPORTED), the section needs a transaction (GROWTH), and nothing was
-// compared (NOT_RECORDED). The table is filled by llama-context.cpp, by direct reference in a
-// GGML_USE_SYCL build and by proc address under GGML_BACKEND_DL.
+// compared (NOT_RECORDED). The table is filled by llama-context.cpp through the SYCL reg's proc
+// address in every link mode, by the names ggml-sycl-l4-procs.h pins.
 struct llama_sycl_l4_procs {
     decltype(&ggml_backend_sycl_set_runtime_context_desc) publish    = nullptr;
     decltype(&ggml_backend_sycl_tenant_coverage)          coverage   = nullptr;

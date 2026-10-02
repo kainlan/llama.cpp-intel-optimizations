@@ -87,6 +87,23 @@ static bool llama_context_dev_is_sycl(ggml_backend_dev_t dev) {
     return llama_context_sycl_reg_from_dev(dev) != nullptr;
 }
 
+// llama.cpp-xojq (quality round 1 Q4): the null-dev and null-reg checks
+// below were duplicated verbatim across six proc-address lookups (the two
+// pre-existing ones, runtime_proc/recheck_proc, folded into this helper in
+// the same edit that added the four new ones for Task 4b). Every lookup is
+// now one reinterpret_cast wrapping this call with its own symbol name and
+// return type -- no template, since each caller's decltype differs.
+static void * llama_context_sycl_proc_addr(ggml_backend_dev_t dev, const char * name) {
+    if (!dev) {
+        return nullptr;
+    }
+    auto * reg = llama_context_sycl_reg_from_dev(dev);
+    if (!reg) {
+        return nullptr;
+    }
+    return ggml_backend_reg_get_proc_address(reg, name);
+}
+
 static bool llama_context_backend_is_sycl(ggml_backend_t backend) {
     return backend != nullptr && llama_context_dev_is_sycl(ggml_backend_get_device(backend));
 }
@@ -305,23 +322,6 @@ static llama_context_sycl_exec_hooks llama_context_sycl_exec_procs(ggml_backend_
     return hooks;
 }
 
-// llama.cpp-xojq (quality round 1 Q4): the null-dev and null-reg checks
-// below were duplicated verbatim across six proc-address lookups (the two
-// pre-existing ones, runtime_proc/recheck_proc, folded into this helper in
-// the same edit that added the four new ones for Task 4b). Every lookup is
-// now one reinterpret_cast wrapping this call with its own symbol name and
-// return type -- no template, since each caller's decltype differs.
-static void * llama_context_sycl_proc_addr(ggml_backend_dev_t dev, const char * name) {
-    if (!dev) {
-        return nullptr;
-    }
-    auto * reg = llama_context_sycl_reg_from_dev(dev);
-    if (!reg) {
-        return nullptr;
-    }
-    return ggml_backend_reg_get_proc_address(reg, name);
-}
-
 static decltype(&ggml_backend_sycl_set_runtime_context_for_model) llama_context_sycl_runtime_proc(
     ggml_backend_dev_t dev) {
     return reinterpret_cast<decltype(&ggml_backend_sycl_set_runtime_context_for_model)>(
@@ -504,16 +504,10 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
 }
 
 // The L4 entry points (the tenant publish, coverage query and load-time late check). The backend
-// declares them in ggml-sycl.h; a backend that does not define them leaves each proc null and the
-// readers in llama-context-tenant.h then fail closed. A direct GGML_USE_SYCL build names them as
-// weak references so it links against a backend without them; a GGML_BACKEND_DL build looks each
-// up by its own function name. Every proc comes from the first SYCL backend of the context.
-#if defined(GGML_USE_SYCL) && defined(__GNUC__)
-#    pragma weak ggml_backend_sycl_set_runtime_context_desc
-#    pragma weak ggml_backend_sycl_tenant_coverage
-#    pragma weak ggml_backend_sycl_load_late_check
-#endif
-
+// declares them in ggml-sycl.h; a backend that does not define them answers a null proc address
+// and the readers in llama-context-tenant.h then fail closed. Every link mode resolves them the
+// same way, through the SYCL reg's proc address by the names ggml-sycl-l4-procs.h pins, from the
+// first SYCL backend of the context. No weak reference, no direct reference: one path.
 [[maybe_unused]] static llama_sycl_l4_procs llama_context_sycl_l4_procs_for(
     const std::vector<ggml_backend_ptr> & backends) {
     llama_sycl_l4_procs procs;
@@ -522,18 +516,12 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
         if (!llama_context_dev_is_sycl(dev)) {
             continue;
         }
-#if defined(GGML_USE_SYCL) && defined(__GNUC__)
-        procs.publish    = &ggml_backend_sycl_set_runtime_context_desc;
-        procs.coverage   = &ggml_backend_sycl_tenant_coverage;
-        procs.late_check = &ggml_backend_sycl_load_late_check;
-#elif defined(GGML_BACKEND_DL)
         procs.publish = reinterpret_cast<decltype(procs.publish)>(
-            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_set_runtime_context_desc"));
+            llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_SET_RUNTIME_CONTEXT_DESC));
         procs.coverage = reinterpret_cast<decltype(procs.coverage)>(
-            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_tenant_coverage"));
+            llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_TENANT_COVERAGE));
         procs.late_check = reinterpret_cast<decltype(procs.late_check)>(
-            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_load_late_check"));
-#endif
+            llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_LATE_CHECK));
         break;
     }
     return procs;

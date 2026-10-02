@@ -149,3 +149,84 @@ def test_the_context_holds_the_section_and_its_counters():
         "void tenant_plan_report(const sched_measure_plan & plan, uint32_t n_ubatch);",
     ]:
         assert z(decl) in h, decl
+
+
+# --- the L4 procs table: one resolution path, no weak symbols ----------------
+
+_L4 = "static llama_sycl_l4_procs llama_context_sycl_l4_procs_for(const std::vector<ggml_backend_ptr> & backends)"
+_L4_NAMES = {
+    "publish": "GGML_SYCL_PROC_SET_RUNTIME_CONTEXT_DESC",
+    "coverage": "GGML_SYCL_PROC_TENANT_COVERAGE",
+    "late_check": "GGML_SYCL_PROC_LOAD_LATE_CHECK",
+}
+
+
+def no_weak(code: str) -> bool:
+    # a weak reference is a second resolution path, and MSVC has no weak symbols
+    return z("__attribute__((weak))") not in code and z("#pragma weak") not in code
+
+
+def l4_ok(code: str) -> bool:
+    if not no_weak(code):
+        return False
+    start = code.find(z(_L4))
+    if start == -1:
+        return False
+    b = function_body(code, _L4)
+    # every proc comes through the reg's proc address, by the header's name constant, in both link modes
+    for field, name in _L4_NAMES.items():
+        if z(f"procs.{field} = reinterpret_cast<decltype(procs.{field})>(llama_context_sycl_proc_addr(dev, {name}));") not in b:
+            return False
+    return "#if" not in b and "&ggml_backend_sycl_" not in b and '"ggml_backend_sycl_' not in b
+
+
+def test_the_l4_table_is_filled_through_the_reg_in_both_link_modes():
+    assert l4_ok(code_of(CONTEXT_CPP))
+
+
+def test_l4_table_mutants():
+    code = code_of(CONTEXT_CPP)
+    assert not l4_ok(code + z("#pragma weak ggml_backend_sycl_tenant_coverage\n"))
+    assert not l4_ok(code + z("__attribute__((weak)) void f();"))
+    b = function_body(code, _L4)
+    for name, old, new in [
+        ("a direct reference", "llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_TENANT_COVERAGE)", "&ggml_backend_sycl_tenant_coverage"),
+        ("a string literal name", "GGML_SYCL_PROC_LOAD_LATE_CHECK", '"ggml_backend_sycl_load_late_check"'),
+        ("a link-mode split", "procs.publish = reinterpret_cast", "\n#ifdef GGML_USE_SYCL\n procs.publish = reinterpret_cast"),
+    ]:
+        assert not l4_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
+    # the header owns the names
+    hdr = (ROOT / "ggml/include/ggml-sycl-l4-procs.h").read_text()
+    for name in _L4_NAMES.values():
+        assert name in hdr, name
+
+
+# --- the cohort ids are ABI -------------------------------------------------
+
+_COHORTS = [
+    ("COMPUTE", 0),
+    ("COMPUTE_HOST", 1),
+    ("FATTN_MATERIALIZE", 2),
+    ("NONFA_STAGE", 3),
+    ("GRAPH_STAGE", 4),
+]
+
+
+def cohorts_ok(text: str) -> bool:
+    code = code_of(text)
+    if "APPEND-ONLY" not in text:
+        return False
+    for name, value in _COHORTS:
+        if z(f"GGML_SYCL_CONTEXT_COHORT_{name} = {value},") not in code:
+            return False
+    # the count is last, so a new id goes before it and takes the next value
+    return code.rstrip().endswith(z("GGML_SYCL_CONTEXT_COHORT_COUNT };"))
+
+
+def test_the_cohort_ids_are_pinned_and_append_only():
+    text = (ROOT / "ggml/include/ggml-sycl-cohort.h").read_text()
+    assert cohorts_ok(text)
+    assert not cohorts_ok(text.replace("APPEND-ONLY", "append-only"))
+    assert not cohorts_ok(text.replace("COHORT_COMPUTE_HOST      = 1", "COHORT_COMPUTE_HOST      = 5"))
+    assert not cohorts_ok(text.replace("    GGML_SYCL_CONTEXT_COHORT_NONFA_STAGE       = 3,", ""))
+    assert not cohorts_ok(text.replace("    GGML_SYCL_CONTEXT_COHORT_COUNT\n};", "    GGML_SYCL_CONTEXT_COHORT_COUNT,\n    GGML_SYCL_CONTEXT_COHORT_LATE = 9\n};"))
