@@ -3811,6 +3811,16 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-txho: llama-context.cpp must compile with neither GGML_USE_SYCL nor GGML_BACKEND_DL (syntax-only, no build
+# directory needed), and the SYCL-only helper the shared code calls keeps a non-SYCL definition.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-llama-context-cpu-only-compile
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-llama-context-cpu-only-compile.py
+        LABEL "python;source-assert"
+        TIMEOUT 300)
+endif()
+
 # llama.cpp-7gno (RED): source gate for the constructor's planned-reserve wiring (hoisted ladder block, the
 # plan_caps decision and acquisition, the fixpoint before create_memory). Production-unreachable until 7gno.
 if (Python3_Interpreter_FOUND)
