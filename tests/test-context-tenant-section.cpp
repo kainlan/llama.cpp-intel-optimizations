@@ -283,6 +283,34 @@ int main() {
         CHECK(line == want, "plan line was '%s'", line.c_str());
     }
 
+    // (9) the compute term over several chunks: the peak of each chunk over the measured graphs, summed. The
+    // two graphs peak in different chunks, so the sum of the worst single graph (11) and the per-chunk sum (20)
+    // differ, and only the second bounds both graphs run one after the other.
+    {
+        const std::vector<std::vector<size_t>> peaks = {
+            { 10, 1  },
+            { 1,  10 }
+        };
+        llama_tenant_buft_caps c;
+        llama_tenant_caps_set_peaks(c, peaks);
+        CHECK(c.chunk_bytes == std::vector<size_t>({ 10, 10 }), "per-chunk peaks hold %zu entries, first %zu",
+              c.chunk_bytes.size(), c.chunk_bytes.empty() ? (size_t) 0 : c.chunk_bytes[0]);
+        CHECK(c.total == 20, "the compute term is %zu, not the per-chunk sum 20", c.total);
+
+        // a graph that touches fewer chunks leaves the others to the graphs that do
+        const std::vector<std::vector<size_t>> ragged = {
+            { 4 },
+            { 1, 9, 2 }
+        };
+        llama_tenant_caps_set_peaks(c, ragged);
+        CHECK(c.chunk_bytes == std::vector<size_t>({ 4, 9, 2 }) && c.total == 15, "ragged peaks give total %zu",
+              c.total);
+
+        // no measured graph, no term
+        llama_tenant_caps_set_peaks(c, {});
+        CHECK(c.chunk_bytes.empty() && c.total == 0, "no graphs gave total %zu", c.total);
+    }
+
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;

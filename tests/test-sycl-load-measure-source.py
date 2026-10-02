@@ -18,13 +18,19 @@ one measure-only context over a load's placement. This gate pins, on comment-str
   stand-ins up before the measure, measures at stage (c), and hands the devices to the one fold, in which
   NOT_RECORDED is its own list and never an EQUAL, and the first REFUSED is the load's refusal;
 - the loader calls the late check exactly once, after the dev_layer sync and before the mappings are
-  initialised; it WARNs for an unsupported model and for every device nothing was compared on, and throws
-  a refusal.
+  initialised; it WARNs for an unsupported model (the WARN pinned inside its own block) and, through one
+  text helper that carries the ubatch, for every device nothing was compared on, and throws a refusal;
+- "this model needs ctx_other" is one predicate, `llama_model_needs_ctx_other`, used by the context
+  constructor and by the unsupported reason alike;
+- llama_load_measure asks the unsupported question before it creates any backend;
+- `llama_late_check_result` carries only what production reads (no `checked`, no `shrunk`), and the
+  ubatch reaches it through the fold, where a host test can see it.
 
 Every clause has a mutant that must fail it. Host-only; collected by pytest.
 """
 
 import importlib.util
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,15 +68,19 @@ _REFUSAL = (
 _PARAMS = "inline llama_context_params llama_load_measure_context_params(uint32_t n_ctx, uint32_t n_ctx_train)"
 _FOLD = (
     "inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs & procs, "
-    "struct ggml_sycl_load_txn txn, const std::vector<llama_load_measure_device> & devices)"
+    "struct ggml_sycl_load_txn txn, const std::vector<llama_load_measure_device> & devices, uint32_t n_ubatch)"
 )
-_PEAK = "static void llama_context_peak_chunks(const sched_measure_buft & entry, llama_tenant_buft_caps & c)"
+_PEAK = (
+    "inline void llama_tenant_caps_set_peaks(llama_tenant_buft_caps & c, "
+    "const std::vector<std::vector<size_t>> & peaks)"
+)
 
 
 def measure_ok(code: str) -> bool:
     """The outer function: the backends go into `args`, the CPU last, then the one run."""
     b = function_body(code, _MEASURE)
     order = [
+        "llama_measure_unsupported_reason(model)",
         "llama_measure_context_args args;",
         "llama_context_sycl_measure_backend_init(",
         "ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr)",
@@ -142,14 +152,18 @@ def params_ok(code: str) -> bool:
     )
 
 
-def peak_ok(code: str) -> bool:
-    """One per-chunk peak: the tenant caps read the helper, and no second reduction over `peaks` is written."""
-    b = function_body(code, _PEAK)
+def peak_ok(tenant_code: str, ctx_code: str) -> bool:
+    """One per-chunk peak: the tenant caps read the helper (defined once, in llama-context-tenant.h, from the
+    two llama-measure-plan.h functions), the context calls it for both tiers, and no second reduction over
+    `peaks` is written."""
+    b = function_body(tenant_code, _PEAK)
     return (
-        z("c.chunk_bytes = llama_measure_peak_per_chunk(entry.peaks);") in b
+        z("c.chunk_bytes = llama_measure_peak_per_chunk(peaks);") in b
         and z("c.total = llama_measure_peak_total(c.chunk_bytes);") in b
-        and "llama_context_worst_chunks" not in code
-        and "for(constauto&graph:entry.peaks)" not in code
+        and ctx_code.count(z("llama_tenant_caps_set_peaks(c, entry.peaks);")) == 2
+        and "llama_context_worst_chunks" not in ctx_code
+        and "llama_context_peak_chunks" not in ctx_code
+        and "for(constauto&graph:entry.peaks)" not in ctx_code
     )
 
 
@@ -161,24 +175,43 @@ def late_ok(code: str) -> bool:
         "if (dummies.failed())",
         "llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C)",
         "if (!measured.ok) { (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal; return out; }",
-        "llama_late_check_fold(procs, txn, measured.devices)",
+        "llama_late_check_fold(procs, txn, measured.devices, n_ubatch)",
     ]
     pos = [b.find(z(t)) for t in order]
-    return -1 not in pos and pos == sorted(pos)
+    return (
+        -1 not in pos
+        and pos == sorted(pos)
+        and z("const uint32_t n_ubatch = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;")
+        in b
+    )
 
 
 def fold_ok(code: str) -> bool:
     b = function_body(code, _FOLD)
     return (
         z("case GGML_SYCL_LATE_CHECK_NOT_RECORDED: out.not_recorded.push_back(d.device); break;") in b
-        and z("case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED: out.shrunk.push_back(d.device); break;") in b
-        and z("case GGML_SYCL_LATE_CHECK_EQUAL: break;") in b
+        and z("case GGML_SYCL_LATE_CHECK_EQUAL: case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED: break;") in b
         and z("case GGML_SYCL_LATE_CHECK_REFUSED:") in b
         and "default:" not in b
         and z("if (d.host) { continue; }") in b
+        and z("out.n_ubatch = n_ubatch;") in b
         and b.count("return") == 2
         and z("llama_load_measure_refusal_text( GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, d.device,") in b
     )
+
+
+def block_after(code: str, opener: str) -> str:
+    """The brace block that follows `opener` (z-spelled), or ''."""
+    i = code.find(z(opener))
+    if i == -1:
+        return ""
+    j = code.index("{", i)
+    depth = 0
+    for k in range(j, len(code)):
+        depth += (code[k] == "{") - (code[k] == "}")
+        if depth == 0:
+            return code[j : k + 1]
+    return ""
 
 
 def site_ok(code: str) -> bool:
@@ -192,17 +225,67 @@ def site_ok(code: str) -> bool:
     if c.count(z("llama_load_late_check(")) != 1:
         return False
     seg = c[call:prec]
-    # an unsupported model is a WARN and the load goes on; a device nothing was compared on is a WARN; a
-    # refusal is thrown. None of the three is a pass in disguise: the refusal is the only throw.
+    # an unsupported model is a WARN and the load goes on, the WARN inside its own block; a device nothing was
+    # compared on is a WARN through the one text helper; a refusal is thrown. The refusal is the only throw.
+    unsupported = block_after(seg, "if (!late.unsupported.empty())")
+    not_recorded = block_after(seg, "for (const int32_t device : late.not_recorded)")
     return (
         "sycl_model_loading_guard.txn" in c[call : call + 400]
-        and z("if (!late.unsupported.empty()) {") in seg
-        and z("for (const int32_t device : late.not_recorded) {") in seg
-        and "nothing was compared" in seg
+        and "LLAMA_LOG_WARN(" in unsupported
+        and "unplanned path" in unsupported
+        and "late.unsupported.c_str()" in unsupported
+        and "throw" not in unsupported
+        and "LLAMA_LOG_WARN(" in not_recorded
+        and z("llama_late_check_not_recorded_text(device, late.n_ubatch)") in not_recorded
         and z("if (!late.refusal.empty()) { throw std::runtime_error(late.refusal); }") in seg
         and seg.count("throw") == 1
-        and "LLAMA_LOG_WARN" in seg
     )
+
+
+def not_recorded_text_ok(code: str) -> bool:
+    b = function_body(code, "inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n_ubatch)")
+    return "nothing was compared" in b and "std::to_string(n_ubatch)" in b and "std::to_string(device)" in b
+
+
+def result_fields_ok(raw: str) -> bool:
+    """llama_late_check_result carries what production reads and nothing it does not."""
+    code = _gate.strip_comments(raw)
+    i = code.index("struct llama_late_check_result {")
+    body = code[i : code.index("};", i)]
+    names = set(re.findall(r"(?:std::string|uint32_t|std::vector<int32_t>|bool)\s+(\w+)", body))
+    return names == {"refusal", "unsupported", "n_ubatch", "not_recorded"}
+
+
+_NEEDS_OTHER = "bool llama_model_needs_ctx_other(const llama_model & model)"
+_REASON = "std::string llama_measure_unsupported_reason(const llama_model & model)"
+
+
+_CTOR_SIG = (
+    "llama_context::llama_context(const llama_model & model, llama_context_params params, "
+    "llama_measure_context_args * measure)"
+)
+
+
+def ctor_body(code: str) -> str:
+    at = code.find(z(_CTOR_SIG))
+    return block_after(code[at:], _CTOR_SIG) if at != -1 else ""
+
+
+def needs_other_ok(code: str) -> bool:
+    b = function_body(code, _NEEDS_OTHER)
+    if not all(t in b for t in ("LLM_ARCH_GEMMA4_ASSISTANT", "LLM_ARCH_EAGLE3", "LLM_ARCH_DFLASH", "tok_embd", "output")):
+        return False
+    # the predicate is stated once: its arch names appear in neither user
+    reason = function_body(code, _REASON)
+    ctor = ctor_body(code)
+    if not ctor:
+        return False
+    for user in (reason, ctor):
+        if "LLM_ARCH_GEMMA4_ASSISTANT" in user or "LLM_ARCH_EAGLE3" in user:
+            return False
+        if z("llama_model_needs_ctx_other(model)") not in user:
+            return False
+    return True
 
 
 def test_the_measure_builds_backends_and_hands_them_to_the_run():
@@ -256,11 +339,13 @@ def test_the_measure_shape_comes_from_the_ladder():
 
 
 def test_one_per_chunk_peak():
-    assert peak_ok(code_of(CONTEXT_CPP))
-    code = code_of(CONTEXT_CPP)
-    b = function_body(code, _PEAK)
-    assert not peak_ok(code.replace(b, mutate(b, "llama_measure_peak_total(c.chunk_bytes)", "0"), 1))
-    assert not peak_ok(code + z("static void llama_context_worst_chunks();"))
+    tenant = code_of((SRC / "llama-context-tenant.h").read_text())
+    ctx = code_of(CONTEXT_CPP)
+    assert peak_ok(tenant, ctx)
+    b = function_body(tenant, _PEAK)
+    assert not peak_ok(tenant.replace(b, mutate(b, "llama_measure_peak_total(c.chunk_bytes)", "0"), 1), ctx)
+    assert not peak_ok(tenant, ctx + z("static void llama_context_worst_chunks();"))
+    assert not peak_ok(tenant, ctx.replace(z("llama_tenant_caps_set_peaks(c, entry.peaks);"), "", 1))
 
 
 def test_the_late_check_measures_only_with_l4_and_at_stage_c():
@@ -274,7 +359,7 @@ def test_late_mutants():
         ("no L4 gate", "if (!procs.available())", "if (false)"),
         ("measured at stage b", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_C)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)"),
         ("a failed measure ignored", "if (!measured.ok) {\n        (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal;\n        return out;\n    }", ""),
-        ("the fold bypassed", "out = llama_late_check_fold(procs, txn, measured.devices);", ""),
+        ("the fold bypassed", "return llama_late_check_fold(procs, txn, measured.devices, n_ubatch);", "return out;"),
         ("stand-ins after the measure", "llama_measure_dummy_scope dummies(weights);", ""),
     ]:
         assert not late_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
@@ -289,8 +374,8 @@ def test_fold_mutants():
     b = function_body(code, _FOLD)
     for name, old, new in [
         ("not recorded read as equal", "case GGML_SYCL_LATE_CHECK_NOT_RECORDED:\n                out.not_recorded.push_back(d.device);\n                break;", "case GGML_SYCL_LATE_CHECK_NOT_RECORDED:\n                break;"),
-        ("shrink lost", "out.shrunk.push_back(d.device);", ""),
-        ("a default arm", "case GGML_SYCL_LATE_CHECK_EQUAL:\n                break;", "case GGML_SYCL_LATE_CHECK_EQUAL:\n                break;\n            default:\n                break;"),
+        ("shrink unhandled", "case GGML_SYCL_LATE_CHECK_EQUAL:\n            case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED:", "case GGML_SYCL_LATE_CHECK_EQUAL:"),
+        ("a default arm", "case GGML_SYCL_LATE_CHECK_REFUSED:", "default:\n                break;\n            case GGML_SYCL_LATE_CHECK_REFUSED:"),
         ("the host tier compared", "if (d.host) {\n            continue;\n        }", ""),
     ]:
         assert not fold_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
@@ -308,3 +393,58 @@ def test_site_mutants():
     assert not site_ok(code + z("llama_load_late_check(*this, 0, sycl_model_loading_guard.txn, {});"))
     moved = code.replace(z("ml.init_mappings(true,"), z("llama_load_late_check(") + z("ml.init_mappings(true,"), 1)
     assert not site_ok(moved)
+
+
+def test_the_unsupported_warn_is_pinned_in_its_block():
+    assert site_ok(code_of(MODEL_CPP))
+    code = code_of(MODEL_CPP)
+    # the WARN replaced by nothing, with the sibling WARN still there
+    old = z("if (!late.unsupported.empty()) {")
+    blk = block_after(code, "if (!late.unsupported.empty())")
+    assert "LLAMA_LOG_WARN(" in blk
+    quiet = blk.replace("LLAMA_LOG_WARN(", "(void)sizeof(", 1)
+    assert not site_ok(code.replace(blk, quiet, 1))
+    # the not-recorded WARN with a hand-written text, losing the ubatch
+    nr = block_after(code, "for (const int32_t device : late.not_recorded)")
+    assert not site_ok(code.replace(nr, nr.replace(z("llama_late_check_not_recorded_text(device, late.n_ubatch)"), '"x"', 1), 1))
+
+
+def test_the_not_recorded_text_carries_the_ubatch():
+    assert not_recorded_text_ok(code_of(MEASURE_H))
+    code = code_of(MEASURE_H)
+    b = function_body(code, "inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n_ubatch)")
+    assert not not_recorded_text_ok(code.replace(b, mutate(b, "std::to_string(n_ubatch)", '"0"'), 1))
+
+
+def test_the_result_carries_only_what_production_reads():
+    assert result_fields_ok(MEASURE_H)
+    assert not result_fields_ok(MEASURE_H.replace("std::vector<int32_t> not_recorded;", "std::vector<int32_t> not_recorded;\n    bool checked = false;", 1))
+
+
+def test_the_fold_sets_the_ubatch_and_the_caller_passes_it():
+    assert fold_ok(code_of(MEASURE_H))
+    code = code_of(MEASURE_H)
+    b = function_body(code, _FOLD)
+    assert not fold_ok(code.replace(b, mutate(b, "out.n_ubatch = n_ubatch;", ""), 1))
+    ctx = code_of(CONTEXT_CPP)
+    lb = function_body(ctx, _LATE)
+    assert not late_ok(ctx.replace(lb, mutate(lb, "llama_late_check_fold(procs, txn, measured.devices, n_ubatch)", "llama_late_check_fold(procs, txn, measured.devices, 0)"), 1))
+
+
+def test_needs_ctx_other_is_one_predicate():
+    assert needs_other_ok(code_of(CONTEXT_CPP))
+    code = code_of(CONTEXT_CPP)
+    reason = function_body(code, _REASON)
+    assert not needs_other_ok(code.replace(reason, mutate(reason, "llama_model_needs_ctx_other(model)", "false"), 1))
+    ctor = ctor_body(code)
+    assert not needs_other_ok(code.replace(ctor, mutate(ctor, "llama_model_needs_ctx_other(model)", "(model.arch == LLM_ARCH_EAGLE3)"), 1))
+    pred = function_body(code, _NEEDS_OTHER)
+    assert not needs_other_ok(code.replace(pred, mutate(pred, "LLM_ARCH_GEMMA4_ASSISTANT", "LLM_ARCH_GEMMA4"), 1))
+
+
+def test_the_measure_asks_the_unsupported_question_before_any_backend():
+    code = code_of(CONTEXT_CPP)
+    assert measure_ok(code)
+    b = function_body(code, _MEASURE)
+    moved = mutate(b, "if (const std::string why = llama_measure_unsupported_reason(model); !why.empty()) {", "if (false) {")
+    assert not measure_ok(code.replace(b, moved, 1))

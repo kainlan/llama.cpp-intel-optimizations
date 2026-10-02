@@ -314,8 +314,9 @@ static void check_arch(llm_arch arch, bool flash_attn, uint32_t n_outputs_max) {
 
 // --- a model the measure cannot walk (I5, I6) -------------------------------------------------------------
 
-static int g_run_installs = 0;
-static int g_run_clears   = 0;
+static int    g_run_installs  = 0;
+static int    g_run_clears    = 0;
+static size_t g_live_at_clear = 0;  // ggml-backend's live buffers at the moment of the last clear
 
 static bool fake_install_ok(uint64_t, enum ggml_sycl_measure_stage) {
     g_run_installs++;
@@ -324,6 +325,7 @@ static bool fake_install_ok(uint64_t, enum ggml_sycl_measure_stage) {
 
 static void fake_clear_counted() {
     g_run_clears++;
+    g_live_at_clear = ggml_backend_test_live_buffer_count();
 }
 
 // the memory kinds (llama_memory_kind_unsupported names) the fixtures' refusals named
@@ -427,6 +429,8 @@ static void check_run_paths() {
     {
         g_run_installs                           = 0;
         g_run_clears                             = 0;
+        g_live_at_clear                                = 0;
+        const size_t                       live_before = ggml_backend_test_live_buffer_count();
         llama_measure_context_args         args  = cpu_args();
         const llama_measure_override_procs procs = { &fake_install_ok, &fake_clear_counted };
         const llama_load_measure_result    r =
@@ -434,6 +438,14 @@ static void check_run_paths() {
         CHECK(r.ok && !r.unsupported && r.refusal.empty(), "a good measure refused: %s", r.refusal.c_str());
         CHECK(g_run_installs == 1 && g_run_clears == 1, "a good run: %d installs, %d clears", g_run_installs,
               g_run_clears);
+        // the override is cleared while the measure context is still alive (its scheduler's buffers exist),
+        // and the context is gone after: a clear that ran after the destruct would see the buffers released
+        CHECK(g_live_at_clear > live_before,
+              "the override was cleared with %zu live buffers (%zu before the run): "
+              "after the context was destroyed",
+              g_live_at_clear, live_before);
+        CHECK(ggml_backend_test_live_buffer_count() == live_before, "the run left %zu buffers (%zu before)",
+              ggml_backend_test_live_buffer_count(), live_before);
         // (a CPU-only measure has no SYCL device or host-tier term to return; the terms it does return add up)
         for (const auto & d : r.devices) {
             size_t sum = 0;
@@ -518,10 +530,31 @@ int main() {
 
     // an encoder graph and a ctx_other arch are refused by name before anything is built
     int n_shape_refused = 0;
-    for (llm_arch arch : { LLM_ARCH_T5, LLM_ARCH_GEMMA4_ASSISTANT }) {
+    for (llm_arch arch : { LLM_ARCH_T5 }) {
         n_shape_refused += check_unsupported_arch(arch, false) ? 1 : 0;
     }
-    CHECK(n_shape_refused >= 1, "VOID: no encoder or ctx_other architecture was refused by shape");
+    CHECK(n_shape_refused >= 1, "VOID: no encoder architecture was refused by shape");
+
+    // the ctx_other archs go through llama_model_needs_ctx_other, the one predicate the constructor and the
+    // measure's refusal share: a fixture whose tensors make it true must be refused, and a model that is not
+    // such an arch must not (a mutant that reads the predicate as false refuses nothing and dies on the count)
+    int n_ctx_other_refused = 0;
+    for (llm_arch arch : { LLM_ARCH_GEMMA4_ASSISTANT }) {
+        fixture fx;
+        if (!build_model(fx, arch)) {
+            CHECK(false, "%s: the ctx_other fixture did not build", llm_arch_name(arch));
+            continue;
+        }
+        CHECK(llama_model_needs_ctx_other(*fx.model), "%s: the predicate does not name it", llm_arch_name(arch));
+        n_ctx_other_refused += check_unsupported_arch(arch, false) ? 1 : 0;
+    }
+    CHECK(n_ctx_other_refused >= 1, "VOID: no ctx_other architecture was refused by shape");
+    {
+        fixture fx;
+        if (build_model(fx, LLM_ARCH_LLAMA)) {
+            CHECK(!llama_model_needs_ctx_other(*fx.model), "a plain llama model is not a ctx_other arch");
+        }
+    }
 
     // a run that compared no plan with a real context proved nothing about the plan
     CHECK(n_shift_checked >= 1, "no plan was compared with a memory that has a K-shift sub-cache");

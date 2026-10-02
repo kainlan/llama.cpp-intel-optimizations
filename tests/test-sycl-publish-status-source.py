@@ -417,3 +417,19 @@ def test_header_mutants():
     assert not header_busy_text_ok(SYCL_H.replace("never by\n// waiting", "by\n// waiting", 1))
     assert not header_busy_text_ok(SYCL_H.replace("NEXT boundary", "next call", 1))
     assert not header_busy_text_ok(SYCL_H + "\n// BUSY backoff\n")
+
+
+def comments_say_no_backoff(context_src: str) -> bool:
+    """No comment in llama-context.cpp still describes a BUSY backoff: the code does not retry, and a comment
+    that says it does sends the next reader looking for a loop that is gone."""
+    comments = re.findall(r"//[^\n]*", context_src) + re.findall(r"/\*.*?\*/", context_src, flags=re.DOTALL)
+    return not any(re.search(r"backoff|exponential", c, flags=re.IGNORECASE) for c in comments)
+
+
+def test_comments_in_llama_context_say_no_backoff():
+    assert comments_say_no_backoff(CONTEXT_CPP)
+
+
+def test_comment_backoff_mutants():
+    assert not comments_say_no_backoff(CONTEXT_CPP + "\n// the probe retries with a bounded exponential BUSY backoff\n")
+    assert not comments_say_no_backoff(CONTEXT_CPP + "\n/* the full transaction's own Backoff */\n")

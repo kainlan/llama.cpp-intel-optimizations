@@ -73,7 +73,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_layer = 2;
     if (arch == LLM_ARCH_LLAMA4) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
-    } else if (arch == LLM_ARCH_GEMMA4) {
+    } else if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         n_embd = 128;
         n_head = 2;
         n_ff   = 192;
@@ -214,14 +214,32 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,         n_ctx/8);
 
-    if (arch == LLM_ARCH_GEMMA4) {
-        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,      n_embd/2);
+    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        if (arch == LLM_ARCH_GEMMA4) {
+            ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  n_embd/2);
+        } else {
+            // the assistant's layers are next-n layers, and its input is the target's hidden state,
+            // whose width (embedding_length_out) must differ from its own. One layer stays outside the
+            // next-n set: the loader sizes a user-supplied model's tensor context from n_layer() * 256, so a
+            // model that is all next-n layers gets a context with room for nothing.
+            ms.add_kv(LLM_KV_EMBEDDING_LENGTH_OUT,        n_embd*2);
+            ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,        n_layer - 1);
+        }
         ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      uint32_t(0));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,      n_embd_head);
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
-        // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
-        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
+        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            // the assistant's hparams loader requires the per-layer array form of the pattern
+            std::vector<uint32_t> pattern;
+            for (uint32_t il = 0; il < n_layer; il++) {
+                pattern.push_back(il % 2);
+            }
+            ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
+        } else {
+            // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
+            ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
+        }
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
             arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
             arch == LLM_ARCH_MAPLE) {

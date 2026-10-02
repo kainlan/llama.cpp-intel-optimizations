@@ -9,9 +9,11 @@
 //
 // It also runs the late-check fold (every answer of the backend lands in its own list: NOT_RECORDED is
 // never a pass), the one refusal text, and the measure's context shape, which is tied to the auto-ubatch
-// ladder's bottom rung.
+// ladder's bottom rung. And the quiet log scope a measure-only context holds: it drops every line below
+// ERROR on its own thread, nests, ends with its owner, and leaves other threads alone.
 
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../src/llama-impl.h"
 #include "../src/llama-load-measure.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -21,6 +23,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 static int n_failed = 0;
@@ -244,7 +247,7 @@ static void test_late_check_fold() {
     llama_sycl_l4_procs procs;
     procs.late_check = &fake_late_check;
 
-    // every answer is its own list, the host tier is skipped, and nothing refuses
+    // NOT_RECORDED is its own list (a SHRINK_ADMITTED is admitted, not a miss), the host tier is skipped, nothing refuses
     g_late_seen.clear();
     g_late_answers = { GGML_SYCL_LATE_CHECK_EQUAL, GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED,
                        GGML_SYCL_LATE_CHECK_NOT_RECORDED, GGML_SYCL_LATE_CHECK_EQUAL };
@@ -252,10 +255,9 @@ static void test_late_check_fold() {
         const std::vector<llama_load_measure_device> devs = { measured(0, false, 10), measured(1, false, 20),
                                                               measured(2, false, 30), measured(-1, true, 40),
                                                               measured(3, false, 50) };
-        const llama_late_check_result                r    = llama_late_check_fold(procs, ggml_sycl_load_txn{ 9 }, devs);
-        CHECK(r.checked, "a fold that ran reads as unchecked");
+        const llama_late_check_result r = llama_late_check_fold(procs, ggml_sycl_load_txn{ 9 }, devs, 512);
+        CHECK(r.n_ubatch == 512, "the fold dropped the ubatch: %u", r.n_ubatch);
         CHECK(r.refusal.empty(), "refused: %s", r.refusal.c_str());
-        CHECK(r.shrunk == std::vector<int32_t>({ 1 }), "shrunk list has %zu entries", r.shrunk.size());
         CHECK(r.not_recorded == std::vector<int32_t>({ 2 }), "not_recorded has %zu entries", r.not_recorded.size());
         CHECK(g_late_seen == std::vector<int32_t>({ 0, 1, 2, 3 }), "the host tier reached the backend");
     }
@@ -266,7 +268,7 @@ static void test_late_check_fold() {
     {
         const std::vector<llama_load_measure_device> devs = { measured(0, false, 1), measured(1, false, 2),
                                                               measured(2, false, 3) };
-        const llama_late_check_result                r    = llama_late_check_fold(procs, ggml_sycl_load_txn{ 9 }, devs);
+        const llama_late_check_result r = llama_late_check_fold(procs, ggml_sycl_load_txn{ 9 }, devs, 512);
         CHECK(r.refusal.rfind("[LOAD-PLAN] compute-slot measure failed at late on device 1: ", 0) == 0,
               "refusal text: %s", r.refusal.c_str());
         CHECK(r.refusal.size() > 10 && r.refusal.compare(r.refusal.size() - 10, 10, " (refused)") == 0,
@@ -278,8 +280,8 @@ static void test_late_check_fold() {
     {
         llama_sycl_l4_procs                          none;
         const std::vector<llama_load_measure_device> devs = { measured(0, false, 1), measured(1, false, 2) };
-        const llama_late_check_result                r    = llama_late_check_fold(none, ggml_sycl_load_txn{ 9 }, devs);
-        CHECK(r.refusal.empty() && r.shrunk.empty() && r.not_recorded == std::vector<int32_t>({ 0, 1 }),
+        const llama_late_check_result r = llama_late_check_fold(none, ggml_sycl_load_txn{ 9 }, devs, 512);
+        CHECK(r.refusal.empty() && r.not_recorded == std::vector<int32_t>({ 0, 1 }),
               "a missing proc was read as a pass");
     }
 
@@ -287,7 +289,7 @@ static void test_late_check_fold() {
     g_late_answers = { 77 };
     {
         const std::vector<llama_load_measure_device> devs = { measured(0, false, 1) };
-        const llama_late_check_result                r    = llama_late_check_fold(procs, ggml_sycl_load_txn{ 9 }, devs);
+        const llama_late_check_result r = llama_late_check_fold(procs, ggml_sycl_load_txn{ 9 }, devs, 512);
         CHECK(r.not_recorded == std::vector<int32_t>({ 0 }), "an unknown answer was read as a pass");
     }
 }
@@ -318,11 +320,94 @@ static void test_measure_params_tie_to_the_ladder() {
     }
 }
 
+static void test_not_recorded_text() {
+    const std::string t = llama_late_check_not_recorded_text(2, 512);
+    CHECK(t.find("device 2") != std::string::npos, "the text does not name the device: %s", t.c_str());
+    CHECK(t.find("ubatch 512") != std::string::npos, "the text does not carry the ubatch: %s", t.c_str());
+    CHECK(t.find("nothing was compared") != std::string::npos, "the text does not say nothing was compared: %s",
+          t.c_str());
+    CHECK(llama_late_check_not_recorded_text(2, 1024).find("ubatch 1024") != std::string::npos, "the ubatch is fixed");
+}
+
+// --- the quiet log scope -------------------------------------------------------------------------
+
+struct log_lines {
+    std::vector<std::pair<int, std::string>> seen;
+
+    static void callback(ggml_log_level level, const char * text, void * user_data) {
+        static_cast<log_lines *>(user_data)->seen.emplace_back((int) level, text);
+    }
+};
+
+static void emit_all_levels() {
+    LLAMA_LOG_DEBUG("d\n");
+    LLAMA_LOG_INFO("i\n");
+    LLAMA_LOG_WARN("w\n");
+    LLAMA_LOG_ERROR("e\n");
+    LLAMA_LOG_CONT("c\n");
+    LLAMA_LOG("n\n");
+}
+
+static void test_quiet_scope() {
+    log_lines         lines;
+    ggml_log_callback old_cb   = nullptr;
+    void *            old_data = nullptr;
+    llama_log_get(&old_cb, &old_data);
+    llama_log_set(&log_lines::callback, &lines);
+
+    // control: with no scope every level reaches the callback
+    emit_all_levels();
+    CHECK(lines.seen.size() == 6, "without a scope %zu of 6 lines arrived", lines.seen.size());
+
+    // in a scope only the ERROR line does
+    lines.seen.clear();
+    {
+        llama_log_quiet_scope scope;
+        emit_all_levels();
+        CHECK(lines.seen.size() == 1 && lines.seen[0].first == (int) GGML_LOG_LEVEL_ERROR &&
+                  lines.seen[0].second == "e\n",
+              "in a scope %zu lines arrived", lines.seen.size());
+
+        // a nested scope does not end the outer one when it closes
+        {
+            llama_log_quiet_scope inner;
+        }
+        lines.seen.clear();
+        LLAMA_LOG_INFO("still quiet\n");
+        CHECK(lines.seen.empty(), "the outer scope ended with the inner one");
+
+        // another thread is not silenced
+        lines.seen.clear();
+        std::thread other([]() { LLAMA_LOG_WARN("other thread\n"); });
+        other.join();
+        CHECK(lines.seen.size() == 1 && lines.seen[0].second == "other thread\n", "another thread was silenced");
+    }
+
+    // the scope ends with its owner
+    lines.seen.clear();
+    emit_all_levels();
+    CHECK(lines.seen.size() == 6, "after the scope %zu of 6 lines arrived", lines.seen.size());
+
+    // a throw through the scope closes it
+    lines.seen.clear();
+    try {
+        llama_log_quiet_scope scope;
+        throw std::runtime_error("unwind");
+    } catch (const std::runtime_error &) {
+    }
+    LLAMA_LOG_INFO("after the throw\n");
+    CHECK(lines.seen.size() == 1, "a throw left the scope open");
+
+    llama_log_set(old_cb, old_data);
+}
+
 int main() {
     test_guard();
     test_dummies();
     test_dummies_multi_buft();
     test_late_check_fold();
+    test_not_recorded_text();
+    test_quiet_scope();
     test_refusal_text();
     test_measure_params_tie_to_the_ladder();
     if (n_failed != 0) {

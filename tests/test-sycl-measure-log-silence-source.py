@@ -23,11 +23,18 @@ in the constructor body sits in a guarded block; the destructor's buffer-size
 comparison and SYCL drain block carry `!measure_only` in their own `if`; the one
 caller of `llama_graph_n_input_tensors` passes `!measure_only`.
 
-The same rule holds for the memory modules a measure-only context builds. Their constructors
-(llama_kv_cache, llama_kv_cache_iswa, llama_memory_recurrent) print, at INFO, the buffer sizes and the
-cache sizes of every cache; a measure-only context builds the same caches on size-0 dummies and must not
-repeat those lines. Every non-ERROR log statement in a constructor of those three files sits in a block
-whose `if` tests `!no_alloc` (the flag the measure sets, and the model's own no_alloc too).
+The memory modules a measure-only context builds (llama_kv_cache, llama_kv_cache_iswa,
+llama_memory_recurrent) print, at INFO and WARN, the buffer sizes and cache sizes of every cache in their
+constructors, and the measure must not repeat those lines. They are silenced by ONE mechanism, not by a guard
+at each of their ~25 log sites (which are upstream's lines and rebase conflicts, and which would also silence
+the callers that build no_alloc memory for model fitting): a measure-only llama_context holds a
+`llama_log_quiet_scope` for its whole life, and llama_log_internal drops every line below ERROR on a thread
+that has one open. The gate pins the scope's declaration, where the constructor opens it, the one drop rule,
+and that the three memory files carry no copy of the mechanism; test-measure-context proves the silence at
+run time, with a real context's output as the positive control.
+
+The same holds for the SYCL backend's own lines a measure reaches: ggml_backend_sycl_plan_has_cpu_work
+prints its `[SYCL-CPU-ACT]` plan-clause line only when no measure plan override is installed.
 
 The walk is textual, so a call reached through a function pointer is seen only as a
 reference to the name, and a log that a callee prints on behalf of a guarded call site
@@ -374,79 +381,137 @@ def structural(raw: str):
     return bad
 
 
-# --- the memory modules' constructors -------------------------------------------------------
+# --- the memory modules' constructors: one scope, not a guard at every site -----------------
 
 MEMORY_FILES = ("llama-kv-cache.cpp", "llama-kv-cache-iswa.cpp", "llama-memory-recurrent.cpp")
 
 
-def memory_findings(raw: str, label: str):
-    """Every non-ERROR log in a constructor body is inside an `if (!no_alloc ...)` block."""
-    m = mask(raw)
+def _src(name: str) -> str:
+    return (ROOT / "src" / name).read_text()
+
+
+def quiet_scope_findings(ctx_cpp: str, ctx_h: str, impl_cpp: str, impl_h: str, mem: dict) -> list:
+    """What must hold of the one silence mechanism, as a list of what does not."""
     out = []
-    n_logs = 0
+    code = lambda t: " ".join(mask(t).split())  # noqa: E731
+
+    impl = code(impl_cpp)
+    if "static thread_local int g_log_quiet_depth" not in impl:
+        out.append("the quiet depth must be a thread_local counter in llama-impl.cpp")
+    drop = "if (g_log_quiet_depth > 0 && level != GGML_LOG_LEVEL_ERROR) { return; }"
+    i = impl.find("void llama_log_internal_v(")
+    if i == -1 or drop not in impl[i:]:
+        out.append("llama_log_internal_v must drop every non-ERROR line while a quiet scope is open")
+    elif impl.index(drop, i) > impl.index("g_logger_state.log_callback(level", i):
+        out.append("the drop rule must come before the callback is called")
+    if "struct llama_log_quiet_scope" not in code(impl_h):
+        out.append("llama-impl.h must declare llama_log_quiet_scope")
+
+    if "std::optional<llama_log_quiet_scope> measure_log_quiet;" not in " ".join(mask(ctx_h).split()):
+        out.append("llama_context must hold the scope as a member")
+
+    m = mask(ctx_cpp)
+    ctor = None
     for f in parse_functions(m):
-        parts = f.name.split("::")
-        if len(parts) < 2 or parts[-1] != parts[-2]:
-            continue
-        parse_blocks(m, f)
-        ranges = []
-        for o, c, hdr in f.blocks:
-            h = _IF_RE.match(hdr)
-            if h and not h.group("else"):
-                cond = " ".join(h.group("cond").split())
-                if "||" not in cond and "!no_alloc" in [t.strip() for t in cond.split("&&")]:
-                    ranges.append((o, c))
-        body = m[f.body_start:f.end + 1]
-        for mt in _LOG_RE.finditer(body):
-            pos = f.body_start + mt.start()
-            stmt = " ".join(raw[pos:raw.index(";", pos)].split())
-            n_logs += 1
-            if "_LOG_ERROR" in stmt[:24]:
-                continue
-            if not in_any(ranges, pos):
-                out.append("%s %s: a log a measure-only context repeats: %s" % (label, f.name, stmt[:90]))
-    return out, n_logs
+        if f.name == "llama_context::llama_context#3":
+            ctor = f
+    if ctor is None:
+        out.append("the measure-only constructor was not found")
+    else:
+        body = " ".join(m[ctor.body_start : ctor.end + 1].split())
+        opened = "measure_only = measure != nullptr; if (measure_only) { measure_log_quiet.emplace(); }"
+        if opened not in body:
+            out.append("the constructor must open the scope right after setting measure_only")
+        elif "create_memory(" in body and body.index(opened) > body.index("create_memory("):
+            out.append("the scope must be open before the memory is created")
+    if len(re.findall(r"measure_log_quiet\.emplace\(", m)) != 1:
+        out.append("the scope must be opened in exactly one place")
+
+    # nothing else opens a scope, and the memory modules carry no copy of the mechanism
+    for name, text in mem.items():
+        if "llama_log_quiet_scope" in text or "measure_only" in mask(text):
+            out.append("%s must stay free of the measure's mechanism" % name)
+    return out
 
 
-def _memory_sources():
-    return {f: (ROOT / "src" / f).read_text() for f in MEMORY_FILES}
+def _quiet_inputs():
+    return (
+        CONTEXT_CPP,
+        _src("llama-context.h"),
+        _src("llama-impl.cpp"),
+        _src("llama-impl.h"),
+        {f: _src(f) for f in MEMORY_FILES},
+    )
 
 
-def test_memory_constructors_are_silent_under_no_alloc():
-    total = 0
-    findings = []
-    for f, raw in _memory_sources().items():
-        got, n = memory_findings(raw, f)
-        findings += got
-        total += n
-    assert total >= 20, "the census of memory-constructor logs is implausibly small: %d" % total
-    assert not findings, "\n".join(findings)
+def test_memory_modules_are_silenced_by_one_scope():
+    found = quiet_scope_findings(*_quiet_inputs())
+    assert not found, "\n".join(found)
 
 
-def test_memory_gate_mutants():
-    srcs = _memory_sources()
-    kv = srcs["llama-kv-cache.cpp"]
-    anchor = "    const bool is_mla = hparams.is_mla();\n"
-    assert kv.count(anchor) == 1, "mutant anchor not found"
-    muts = {
-        "an unguarded INFO added to the kv constructor": 'LLAMA_LOG_INFO("x\\n");\n',
-        "an unguarded WARN added to the kv constructor": 'LLAMA_LOG_WARN("x\\n");\n',
-        "a std::cerr write": 'std::cerr << "x";\n',
-        "an fputs write": 'fputs("x", stderr);\n',
-        "a GGML_LOG_INFO write": 'GGML_LOG_INFO("x\\n");\n',
-    }
-    for name, line in muts.items():
-        got, _ = memory_findings(kv.replace(anchor, "    " + line + anchor, 1), "mutant")
-        assert got, "mutant %r slipped through" % name
-    # an ERROR-level line is exempt by rule: it accompanies a failure, not a successful build
-    got, _ = memory_findings(kv.replace(anchor, '    LLAMA_LOG_ERROR("x\\n");\n' + anchor, 1), "mutant")
-    assert not got
-    # a guard on the wrong flag does not count
-    guarded = 'if (!no_alloc) {\n        LLAMA_LOG_INFO("x\\n");\n    }\n'
-    got, _ = memory_findings(kv.replace(anchor, "    " + guarded.replace("!no_alloc", "no_alloc") + anchor, 1), "mutant")
-    assert got
-    got, _ = memory_findings(kv.replace(anchor, "    " + guarded + anchor, 1), "mutant")
-    assert not got
+def test_quiet_scope_mutants():
+    ctx_cpp, ctx_h, impl_cpp, impl_h, mem = _quiet_inputs()
+
+    def mut(which, old, new):
+        texts = {"ctx_cpp": ctx_cpp, "ctx_h": ctx_h, "impl_cpp": impl_cpp, "impl_h": impl_h}
+        assert texts[which].count(old) == 1, "mutant anchor %r x%d" % (old, texts[which].count(old))
+        texts[which] = texts[which].replace(old, new, 1)
+        return quiet_scope_findings(texts["ctx_cpp"], texts["ctx_h"], texts["impl_cpp"], texts["impl_h"], mem)
+
+    assert mut("impl_cpp", "level != GGML_LOG_LEVEL_ERROR", "level != GGML_LOG_LEVEL_WARN")
+    assert mut("impl_cpp", "static thread_local int g_log_quiet_depth", "static int g_log_quiet_depth")
+    assert mut("ctx_cpp", "if (measure_only) {\n        measure_log_quiet.emplace();\n    }\n", "")
+    assert mut("ctx_h", "std::optional<llama_log_quiet_scope> measure_log_quiet;", "")
+    assert mut("impl_h", "struct llama_log_quiet_scope", "struct llama_log_other_scope")
+    # a copy of the mechanism in an upstream memory file, or a measure_only test there
+    bad = dict(mem)
+    bad["llama-kv-cache.cpp"] = mem["llama-kv-cache.cpp"] + "\nstatic void f(bool measure_only) { if (!measure_only) {} }\n"
+    assert quiet_scope_findings(ctx_cpp, ctx_h, impl_cpp, impl_h, bad)
+
+
+# the backend's own line a measure reaches
+SYCL_CPP = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
+
+
+def backend_cpu_act_findings(text: str) -> list:
+    m = mask(text)
+    i = m.find("bool ggml_backend_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {")
+    if i == -1:
+        return ["ggml_backend_sycl_plan_has_cpu_work not found"]
+    depth = 0
+    for j in range(m.index("{", i), len(m)):
+        depth += (m[j] == "{") - (m[j] == "}")
+        if depth == 0:
+            break
+    body = text[i : j + 1]
+    mb = m[i : j + 1]
+    out = []
+    n = 0
+    for mt in re.finditer(r"GGML_LOG_\w+\s*\(", mb):
+        n += 1
+        before = " ".join(mb[: mt.start()].split())
+        if not before.endswith("if (!ggml_sycl_measure_plan_override_active()) {"):
+            out.append("an unguarded log in the CPU-work probe: %s" % " ".join(body[mt.start() :].split())[:70])
+    if n < 2:
+        out.append("the census of logs in the CPU-work probe is %d" % n)
+    return out
+
+
+def test_backend_cpu_work_probe_is_silent_under_a_measure():
+    text = SYCL_CPP.read_text()
+    assert not backend_cpu_act_findings(text)
+
+
+def test_backend_cpu_work_probe_mutants():
+    text = SYCL_CPP.read_text()
+    guard = "if (!ggml_sycl_measure_plan_override_active()) {"
+    i = text.index("bool ggml_backend_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {")
+    j = text.index(guard, i)
+    # the guard lost on the first log
+    assert backend_cpu_act_findings(text[:j] + "{" + text[j + len(guard) :])
+    # a third, unguarded log
+    k = text.index("GGML_UNUSED(dev);", i)
+    assert backend_cpu_act_findings(text[:k] + 'GGML_LOG_INFO("x\\n");\n    ' + text[k:])
 
 
 # --- the tree as it is --------------------------------------------------------------------
