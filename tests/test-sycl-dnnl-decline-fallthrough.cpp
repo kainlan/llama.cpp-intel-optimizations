@@ -87,6 +87,9 @@ struct arm {
     // the primitives it went on to submit. Derived from the arm's shape, not assumed to be 1.
     uint64_t expect_calls   = 1;
     uint64_t expect_engaged = 1;
+
+    // The status graph_compute must return. Every arm but the post-write decline one expects SUCCESS.
+    ggml_status expect_status = GGML_STATUS_SUCCESS;
 };
 
 constexpr int64_t SOFTMAX_COLS = 96;
@@ -263,7 +266,8 @@ std::vector<arm> make_arms() {
 }
 
 struct run_result {
-    bool               ok = false;
+    bool               ok     = false;
+    ggml_status        status = GGML_STATUS_FAILED;  // what graph_compute returned (set once it has returned)
     std::vector<float> out;
     uint64_t           calls = 0, declined = 0, engaged = 0;
 };
@@ -497,6 +501,41 @@ int main(int, char ** argv) {
             arm_ok = false;
         }
         ok = ok && arm_ok;
+    }
+
+    {
+        // A decline AFTER a write (llama.cpp-23mk S3-4, design 4.8): the GQA arm's first slice launches the hoisted
+        // pre-query (call 1) and then one gemm per (K head, query head per K head) pair. Declining call 3 refuses the
+        // second pair's gemm after the first pair wrote dst, which is not a next path: the decline throws
+        // dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error that the caller, ggml_sycl_mul_mat and
+        // compute_forward all pass through, and graph_compute returns GGML_STATUS_FAILED. It must not be SUCCESS (the
+        // KQ product would be half-written and nobody told) and must not crash.
+        //
+        // The counters are the positive control: calls == 3 (pre-query, first gemm, declined gemm), declined == 1 and
+        // engaged == 1 (the one gemm that wrote). The output buffer is NOT compared: after a failed graph it is
+        // undefined. This arm runs last because a failed graph quarantines the backend's execution state.
+        arm post = make_arms().back();
+        for (const arm & candidate : make_arms()) {
+            if (strcmp(candidate.name, "batched f16 KQ mul_mat GQA") == 0) {
+                post = candidate;
+            }
+        }
+        post.name                = "batched f16 KQ mul_mat GQA, post-write decline";
+        post.expect_status       = GGML_STATUS_FAILED;
+        const int        after_n = 3;
+        const run_result r       = run_arm(backend, post, after_n);
+        printf("%-30s site=%-16s inject=%d: status=%d calls=%llu declined=%llu engaged=%llu (output not compared)\n",
+               post.name, post.site, after_n, (int) r.status, (unsigned long long) r.calls,
+               (unsigned long long) r.declined, (unsigned long long) r.engaged);
+        if (!r.ok || r.status != GGML_STATUS_FAILED || r.calls != 3 || r.declined != 1 || r.engaged != 1) {
+            fprintf(
+                stderr,
+                "FAIL: %s: expected status FAILED with calls=3 declined=1 engaged=1 (got ok=%d status=%d calls=%llu "
+                "declined=%llu engaged=%llu)\n",
+                post.name, r.ok ? 1 : 0, (int) r.status, (unsigned long long) r.calls, (unsigned long long) r.declined,
+                (unsigned long long) r.engaged);
+            ok = false;
+        }
     }
 
     ggml_backend_free(backend);
