@@ -401,6 +401,7 @@ def test_staged_merger_rejects_non_integer_ablation_delta_for_plus_ablation_stat
         assert "missing integer metric source_attribution.ablation_delta_ms_x1000" in result.stdout
         assert "Traceback" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

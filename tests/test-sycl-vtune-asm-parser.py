@@ -114,6 +114,7 @@ def test_asm_parser_emits_addressed_instruction_rows() -> None:
         assert data["instructions"][2]["send_comment"] == "wr:1+0, rd:4; load.ugm.d32x64t.a64"
         assert data["asm"]["opcodes"]["send.ugm"] == 2
 
+
 if __name__ == "__main__":
     import sys
 

@@ -186,6 +186,7 @@ def test_gateup_loadv2_bench_path_reuses_xmx_tiled_layout_without_bundle4() -> N
     assert "make_xmx_tiled_bundle4_payload_layout" not in loadv2_validation
     assert "make_xmx_tiled_loadv2" not in reference
 
+
 if __name__ == "__main__":
     import sys
 

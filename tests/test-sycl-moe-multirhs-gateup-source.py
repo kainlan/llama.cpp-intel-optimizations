@@ -101,6 +101,7 @@ def test_multirhs_benchmark_kernel_uses_rhs_columns_not_role_columns() -> None:
     assert "gate_part" in body and "up_part" in body
     assert "GGML_SYCL_MOE_GATEUP_ROLECOL" not in body
 
+
 if __name__ == "__main__":
     import sys
 

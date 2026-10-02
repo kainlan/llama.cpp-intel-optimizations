@@ -150,6 +150,7 @@ def test_mutation_is_witnessed() -> None:
         f"route-decline-removal mutation was not witnessed: {violations}"
     )
 
+
 if __name__ == "__main__":
     import sys
 

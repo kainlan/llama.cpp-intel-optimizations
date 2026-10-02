@@ -1559,6 +1559,7 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
         "what requires the continue to FOLLOW the store, and it is what actually catches this mutant"
     )
 
+
 if __name__ == "__main__":
     import sys
 

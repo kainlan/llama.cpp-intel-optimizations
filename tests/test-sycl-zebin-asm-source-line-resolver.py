@@ -545,6 +545,7 @@ def test_resolver_rejects_both_asm_and_iga_instruction_inputs() -> None:
         assert "pass exactly one of --asm or --iga-instructions-csv" in result.stdout
         assert "Traceback" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

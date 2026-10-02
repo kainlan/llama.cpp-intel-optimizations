@@ -79,6 +79,7 @@ def test_parser_rejects_non_finite_wall_ms_without_traceback() -> None:
     assert "argument --wall-ms: --wall-ms must be finite and greater than zero" in result.stdout
     assert "Traceback" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

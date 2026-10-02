@@ -231,6 +231,7 @@ def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> N
     assert "MXFP4 source-line matrix gate failed" in text
     assert "source_line.status pass (VTune sampled exact), source_line.status asm-line-static-cost" in text
 
+
 if __name__ == "__main__":
     import sys
 

@@ -195,6 +195,7 @@ def test_mutations_are_witnessed() -> None:
         f"open-allowlist mutation was not witnessed: {opened_violations}"
     )
 
+
 if __name__ == "__main__":
     import sys
 

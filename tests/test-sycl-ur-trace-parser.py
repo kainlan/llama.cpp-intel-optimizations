@@ -43,6 +43,7 @@ def test_ur_parser_rejects_bad_duration_without_traceback() -> None:
         assert "failed to parse UR trace" in result.stdout
         assert "Traceback" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

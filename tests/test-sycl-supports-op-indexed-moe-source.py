@@ -517,6 +517,7 @@ def test_reinserting_later_mul_mat_id_case_is_rejected() -> None:
     )
     assert not contract(mutated)
 
+
 if __name__ == "__main__":
     import sys
 

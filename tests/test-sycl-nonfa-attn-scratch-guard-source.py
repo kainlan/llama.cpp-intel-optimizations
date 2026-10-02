@@ -817,6 +817,7 @@ def test_explicit_zero_warn_has_a_mutation_witness() -> None:
         "assertion (that the WARN names GGML_SYCL_NONFA_ATTN_SCRATCH_MB specifically)"
     )
 
+
 if __name__ == "__main__":
     import sys
 

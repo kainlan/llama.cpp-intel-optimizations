@@ -840,6 +840,7 @@ def test_contract_and_mutation_witnesses() -> None:
             f"semantic mutation changed nothing: {name}")
         assert violations(mutant_header, mutant_source, mutant_test, mutant_mem), f"semantic mutation survived: {name}"
 
+
 if __name__ == "__main__":
     import sys
 

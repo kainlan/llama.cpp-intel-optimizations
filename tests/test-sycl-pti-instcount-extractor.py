@@ -139,6 +139,7 @@ def test_reports_no_matching_kernel_without_synthesizing_rows() -> None:
         assert "pti_instcount.status no_matching_kernel" in text
         assert "pti_instcount.blocker no_matching_kernel" in text
 
+
 if __name__ == "__main__":
     import sys
 

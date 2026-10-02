@@ -176,6 +176,7 @@ def test_pending_entries_retire_themselves() -> None:
             f"{entry} now sets {SETTING} -- remove it from PENDING in this file."
         )
 
+
 if __name__ == "__main__":
     import sys
 

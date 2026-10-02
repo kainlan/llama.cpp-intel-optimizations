@@ -460,6 +460,7 @@ def test_review_mutations_are_detected() -> None:
     helper_cases, dispatch_cases = _concat_case_sets(mutated_concat)
     assert helper_cases != dispatch_cases
 
+
 if __name__ == "__main__":
     import sys
 

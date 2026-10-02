@@ -285,6 +285,7 @@ def test_changing_the_tolerance_constant_is_caught_on_either_side() -> None:
         r"1\.0f\s*/\s*params\.scale\s*-\s*sqrtf\(.*?\)\)\s*>=\s*1e-3f", mutated_fattn
     ), "the fattn-onednn.cpp tolerance check still passes after changing 1e-3f to 1e-4f"
 
+
 if __name__ == "__main__":
     import sys
 

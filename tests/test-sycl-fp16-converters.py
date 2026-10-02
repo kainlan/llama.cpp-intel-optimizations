@@ -214,6 +214,7 @@ def test_source_contract_mutations_fail_closed() -> None:
     )
     assert not _contract(SOURCE, mmid_closed)
 
+
 if __name__ == "__main__":
     import sys
 

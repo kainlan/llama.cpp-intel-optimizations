@@ -221,6 +221,7 @@ def test_decode_timeline_profiler_documents_supported_parser_callsite_option() -
     assert "--top-callsites" in text
     assert "--top " not in text
 
+
 if __name__ == "__main__":
     import sys
 

@@ -51,6 +51,7 @@ def test_converter_rejects_missing_ze_rows_without_traceback() -> None:
         assert "no Level Zero host task rows found" in result.stdout
         assert "Traceback" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

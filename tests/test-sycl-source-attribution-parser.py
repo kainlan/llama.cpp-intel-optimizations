@@ -493,6 +493,7 @@ def test_source_attribution_rejects_non_integer_region_and_ablation_numbers() ->
         assert "must be an integer" in result.stdout
         assert "Traceback" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

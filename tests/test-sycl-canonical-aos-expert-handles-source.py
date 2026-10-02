@@ -464,6 +464,7 @@ def test_mutations_are_witnessed() -> None:
     # would leave violations() empty and fail here rather than pass vacuously.
     assert all(violations(mutated) for mutated in mutations)
 
+
 if __name__ == "__main__":
     import sys
 

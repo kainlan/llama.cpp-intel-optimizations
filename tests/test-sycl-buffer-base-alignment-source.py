@@ -387,6 +387,7 @@ def test_moe_bias_extent_mutations_are_witnessed() -> None:
         assert mutated != source, f"moe-bias mutation {index} did not change the source"
         assert moe_bias_extent_violations(mutated), f"moe-bias mutation {index} was not witnessed"
 
+
 if __name__ == "__main__":
     import sys
 

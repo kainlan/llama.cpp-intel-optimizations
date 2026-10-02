@@ -41,6 +41,7 @@ def test_vtune_parser_reports_malformed_csv_without_traceback() -> None:
         assert "failed to parse VTune exports" in result.stdout
         assert "Traceback" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

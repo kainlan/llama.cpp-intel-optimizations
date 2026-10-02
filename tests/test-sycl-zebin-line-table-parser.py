@@ -108,6 +108,7 @@ Address            Line   Column File   ISA Discriminator Flags
     assert "no source rows found" in result.stdout
     assert "Traceback" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

@@ -257,6 +257,7 @@ def test_execute_branch_runs_bench_command_once_and_fails_for_missing_external_t
     ]:
         assert f'require_file "{path}"' in text
 
+
 if __name__ == "__main__":
     import sys
 

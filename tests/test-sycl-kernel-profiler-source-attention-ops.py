@@ -55,6 +55,7 @@ def test_softmax_profile_helpers_forward_callsite() -> None:
     assert "__builtin_FUNCTION()" in helper_body
     assert "file, line, function" in helper_body
 
+
 if __name__ == "__main__":
     import sys
 

@@ -52,6 +52,7 @@ def test_multirhs_dry_run_omits_forbidden_probe_text() -> None:
     for needle in forbidden:
         assert needle not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

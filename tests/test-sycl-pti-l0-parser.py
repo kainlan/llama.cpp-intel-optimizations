@@ -80,6 +80,7 @@ def test_l0_parser_rejects_bad_json_and_non_object_rows_without_traceback() -> N
         assert "failed to parse Level Zero trace" in result.stdout
         assert "Traceback" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

@@ -64,6 +64,7 @@ def test_dry_run_forbids_probe_commands(tmp_path: pathlib.Path) -> None:
     for needle in forbidden:
         assert needle not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

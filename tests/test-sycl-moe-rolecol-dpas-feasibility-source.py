@@ -104,6 +104,7 @@ def test_role_column_route_is_not_implemented() -> None:
     assert "GGML_SYCL_MOE_GATEUP_ROLECOL" not in mmvq
     assert "rolecol-gateup" not in mmvq
 
+
 if __name__ == "__main__":
     import sys
 

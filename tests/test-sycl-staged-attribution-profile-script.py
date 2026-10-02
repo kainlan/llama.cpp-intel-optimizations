@@ -203,6 +203,7 @@ def test_vtune_source_execute_branch_consumes_matrix_artifacts() -> None:
     ):
         assert invented not in text
 
+
 if __name__ == "__main__":
     import sys
 

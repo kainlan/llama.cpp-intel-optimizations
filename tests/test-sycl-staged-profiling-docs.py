@@ -115,6 +115,7 @@ def test_staged_profiling_docs_list_stage_artifacts() -> None:
     ):
         assert required in section
 
+
 if __name__ == "__main__":
     import sys
 

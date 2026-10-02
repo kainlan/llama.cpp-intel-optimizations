@@ -172,6 +172,7 @@ def test_node_loop_compute_forward_has_timeline_scope_metadata() -> None:
         assert "ggml_op_name(node->op)" in preceding_window
         assert_no_waits(preceding_window)
 
+
 if __name__ == "__main__":
     import sys
 

@@ -70,6 +70,7 @@ def test_unified_matmul_profile_labels_remain_unchanged() -> None:
     ]:
         assert label in src
 
+
 if __name__ == "__main__":
     import sys
 

@@ -157,6 +157,7 @@ def test_gtpin_bbl_extractor_fails_closed_on_bad_trace() -> None:
         assert "failed to extract GTPin BBL PC counts" in result.stdout
         assert "Traceback" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

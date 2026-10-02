@@ -189,6 +189,7 @@ def test_expert_histogram_instrumentation_is_default_off_when_implemented() -> N
     assert "std::getenv(\"GGML_SYCL_MOE_EXPERT_HIST\")" in mmvq
     assert "[MOE-EXPERT-HIST]" in mmvq
 
+
 if __name__ == "__main__":
     import sys
 

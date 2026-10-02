@@ -550,6 +550,7 @@ def test_observability_mutations_are_witnessed() -> None:
         assert mutated != cache, f"shutdown mutation {index} did not change the source"
         assert observability_violations(source, mutated), f"shutdown mutation {index} was not witnessed"
 
+
 if __name__ == "__main__":
     import sys
 

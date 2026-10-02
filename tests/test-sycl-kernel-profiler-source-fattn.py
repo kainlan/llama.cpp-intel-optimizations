@@ -90,6 +90,7 @@ def test_unified_matmul_dispatches_have_named_profile_labels() -> None:
     launch_body = slice_between(unified, "void launch_unified_matmul", "}  // namespace ggml_sycl_unified")
     assert "ggml_sycl_profile_submit(q" in launch_body
 
+
 if __name__ == "__main__":
     import sys
 

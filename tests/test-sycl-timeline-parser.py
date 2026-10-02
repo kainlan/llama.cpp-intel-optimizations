@@ -455,6 +455,7 @@ def test_parser_summarizes_wall_categories_and_callsites() -> None:
     )
     assert "category.sycl.event" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

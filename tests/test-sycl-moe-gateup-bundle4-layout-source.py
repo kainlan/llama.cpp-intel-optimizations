@@ -270,6 +270,7 @@ def test_runtime_bundle4_pp_safe_tg_only_routing() -> None:
     assert "GGML_LAYOUT_XMX_TILED_BUNDLE4" in dispatch
     assert "mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_submit" in dispatch
 
+
 if __name__ == "__main__":
     import sys
 

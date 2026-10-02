@@ -109,6 +109,7 @@ def test_prepare_fails_closed_on_ambiguous_sections() -> None:
         assert "extract.status ambiguous_kernel_text_section" in result.stdout
         assert "Traceback" not in result.stdout
 
+
 if __name__ == "__main__":
     import sys
 

@@ -90,6 +90,7 @@ def test_mutations_are_rejected() -> None:
         "false",
     ))
 
+
 if __name__ == "__main__":
     import sys
 

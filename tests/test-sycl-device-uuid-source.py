@@ -51,6 +51,7 @@ def test_proc_address_and_g1_dynamic_path_are_wired() -> None:
     assert "test-sycl-device-uuid-api" in CMAKE
     assert "GGML_BACKEND_DL" in CMAKE
 
+
 if __name__ == "__main__":
     import sys
 

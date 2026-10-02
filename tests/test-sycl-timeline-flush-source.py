@@ -151,6 +151,7 @@ def test_one_shot_timeline_flush_is_reachable_only_from_backend_teardown() -> No
     for call in calls:
         assert free_begin < call < free_end
 
+
 if __name__ == "__main__":
     import sys
 

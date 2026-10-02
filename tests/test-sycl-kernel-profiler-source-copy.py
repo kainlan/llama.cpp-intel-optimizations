@@ -37,6 +37,7 @@ def test_profile_flush_points_are_explicit_not_atexit() -> None:
     bench = (ROOT / "tools" / "sycl-kernel-bench" / "main.cpp").read_text(encoding="utf-8")
     assert "ggml_sycl_kernel_profile_flush(true, \"sycl-kernel-bench\")" in bench
 
+
 if __name__ == "__main__":
     import sys
 

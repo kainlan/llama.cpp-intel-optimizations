@@ -106,6 +106,7 @@ def test_mutations_are_witnessed() -> None:
         assert mutated != sycl, f"log mutation {index} did not change the source"
         assert violations(batch, mutated), f"log mutation {index} was not witnessed"
 
+
 if __name__ == "__main__":
     import sys
 

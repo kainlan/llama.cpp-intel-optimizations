@@ -1162,6 +1162,7 @@ def test_new_functions_are_not_file_static_in_the_shared_header():
         assert not _has_static_before(cpp_norm, name), f"{name}() must not be file-static (.cpp)"
         assert not _has_static_before(hpp_norm, name), f"{name}() must not be declared static (.hpp)"
 
+
 if __name__ == "__main__":
     import sys
 

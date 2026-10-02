@@ -50,6 +50,7 @@ def test_graph_loop_wraps_compute_forward_in_profiler_node_scope() -> None:
             "ggml_sycl_compute_forward(*sycl_ctx, node)"
         )
 
+
 if __name__ == "__main__":
     import sys
 

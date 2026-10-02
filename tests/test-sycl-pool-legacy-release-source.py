@@ -334,6 +334,7 @@ def test_second_call_with_template_arguments_is_witnessed() -> None:
         f"mutation was not witnessed: {violations}"
     )
 
+
 if __name__ == "__main__":
     import sys
 

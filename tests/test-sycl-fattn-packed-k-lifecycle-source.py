@@ -343,6 +343,7 @@ def test_cache_clear_paths_cannot_erase_sidecars_and_teardown_is_range_scoped() 
     assert "unified_cache_scratch_pool_epoch_boundary" in graph_clear
     assert "ggml_sycl_fattn_xmx_unregister_packed_k_range" not in graph_clear
 
+
 if __name__ == "__main__":
     import sys
 

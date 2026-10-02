@@ -68,6 +68,7 @@ def test_plain_frame_failure_still_names_its_operands() -> None:
     assert result.returncode == 1
     assert "token='missing'" in result.stderr
 
+
 if __name__ == "__main__":
     import sys
 

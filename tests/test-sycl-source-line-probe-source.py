@@ -41,6 +41,7 @@ def test_source_line_probe_rejects_signed_or_whitespace_numeric_args_in_source()
     assert "if (!is_ascii_digit_string(text))" in main
     assert "std::stoull" in main
 
+
 if __name__ == "__main__":
     import sys
 

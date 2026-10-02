@@ -154,6 +154,7 @@ def test_mutation_is_witnessed() -> None:
         f"revert mutation was not witnessed: {violations}"
     )
 
+
 if __name__ == "__main__":
     import sys
 
