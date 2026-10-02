@@ -3,6 +3,7 @@
 #include "ggml-sycl-cohort.h"
 #include "ggml-sycl-l4-procs.h"
 #include "ggml-sycl.h"
+#include "llama-measure-plan.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -105,9 +106,17 @@ struct llama_tenant_buft_caps {
     bool                host   = false;
     std::vector<size_t> cap;
     size_t              max_chunk_size = 0;  // the largest chunk the buft's allocator allowed
-    std::vector<size_t> chunk_bytes;         // the worst measured graph's planned size of each chunk
+    std::vector<size_t> chunk_bytes;         // the peak of each chunk over the measured graphs
     size_t              total = 0;           // their sum
 };
+
+// A buft's compute term from the peaks each measured graph left in each chunk (`peaks[g][c]`): the peak of
+// every chunk over the graphs, and their sum. Both come from llama-measure-plan.h's one definition, so the
+// caps the context hands the backend, the chunk plan and the late check read the same quantity.
+inline void llama_tenant_caps_set_peaks(llama_tenant_buft_caps & c, const std::vector<std::vector<size_t>> & peaks) {
+    c.chunk_bytes = llama_measure_peak_per_chunk(peaks);
+    c.total       = llama_measure_peak_total(c.chunk_bytes);
+}
 
 inline bool llama_tenant_element_less(const ggml_sycl_context_tenant_desc & a,
                                       const ggml_sycl_context_tenant_desc & b) {

@@ -110395,13 +110395,19 @@ bool ggml_backend_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
         return false;  // neutral: keep today's host buft
     }
     GGML_UNUSED(dev);  // the placement plan is process-global, not per-device
+    // A measure-only context asks this on every scheduler it builds; its lines would
+    // read as a real load's, so they stay quiet while the measure plan override is active.
     const auto snapshot = ggml_sycl_global_plan_snapshot();
     if (!snapshot || !snapshot->plan) {
-        GGML_LOG_INFO("[SYCL-CPU-ACT] plan CPU work: none (no active plan)\n");
+        if (!ggml_sycl_measure_plan_override_active()) {
+            GGML_LOG_INFO("[SYCL-CPU-ACT] plan CPU work: none (no active plan)\n");
+        }
         return false;
     }
     const char * reason = ggml_sycl_plan_cpu_work_reason(*snapshot->plan);
-    GGML_LOG_INFO("[SYCL-CPU-ACT] plan CPU work: %s\n", reason ? reason : "none");
+    if (!ggml_sycl_measure_plan_override_active()) {
+        GGML_LOG_INFO("[SYCL-CPU-ACT] plan CPU work: %s\n", reason ? reason : "none");
+    }
     return reason != nullptr;
 }
 

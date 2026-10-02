@@ -2708,10 +2708,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         for (const int32_t device : late.not_recorded) {
             // nothing was compared for this device, which is not a pass
-            LLAMA_LOG_WARN(
-                "%s: [LOAD-PLAN] late check on device %d: no early compute term was recorded for this load, "
-                "nothing was compared (ubatch %u)\n",
-                __func__, (int) device, late.n_ubatch);
+            LLAMA_LOG_WARN("%s: %s\n", __func__, llama_late_check_not_recorded_text(device, late.n_ubatch).c_str());
         }
         if (!late.refusal.empty()) {
             throw std::runtime_error(late.refusal);

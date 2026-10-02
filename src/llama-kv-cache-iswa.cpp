@@ -76,17 +76,13 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
-        if (!no_alloc) {
-            LLAMA_LOG_WARN("%s: using full-size SWA cache (ref: %s)\n",
-                    __func__, "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-        }
+        LLAMA_LOG_WARN("%s: using full-size SWA cache (ref: %s)\n",
+                __func__, "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
 
         size_swa = size_base;
     }
 
-    if (!no_alloc) {
-        LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
-    }
+    LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
 
     llama_memory_t mem_other_base = nullptr;
     if (mem_other) {
@@ -103,9 +99,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share, "", no_alloc);
 
-    if (!no_alloc) {
-        LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
-    }
+    LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     kv_swa = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,

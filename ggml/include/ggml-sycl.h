@@ -1398,9 +1398,9 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime
 // above already ran with an unresolved, optimistic `true`): re-running the
 // full transaction would touch KV/MMID state that has no reason to change
 // and would re-run the same deterministic decision for no benefit.
-// GGML_SYCL_LIFECYCLE_STALE_IDENTITY if the model token does not match the currently published plan; GGML_SYCL_LIFECYCLE_PLAN_REJECTED
-// if the guard refuses (same message and arithmetic as the full
-// transaction's own check).
+// GGML_SYCL_LIFECYCLE_STALE_IDENTITY if the model token does not match the
+// currently published plan; GGML_SYCL_LIFECYCLE_PLAN_REJECTED if the guard
+// refuses (same message and arithmetic as the full transaction's own check).
 //
 // llama.cpp-rqak: an asymmetry worth knowing before touching either path.
 // An explicit -fa 0 context goes through the FULL transaction above, which

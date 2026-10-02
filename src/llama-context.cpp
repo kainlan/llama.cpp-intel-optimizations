@@ -736,6 +736,9 @@ llama_context::llama_context(
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     measure_only = measure != nullptr;
+    if (measure_only) {
+        measure_log_quiet.emplace();
+    }
 
     // A model the measure cannot walk is refused by name, before anything is built. llama_load_measure
     // asks the same question first and returns it as `unsupported`; this is the constructor's own guard.
@@ -805,23 +808,13 @@ llama_context::llama_context(
 
     cparams.ctx_other = nullptr;
 
-    // TODO: more generic
-    if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+    if (llama_model_needs_ctx_other(model)) {
         if (params.ctx_other == nullptr) {
             // TODO: change from runtime_error to llama_exception to avoid printing error message
-            throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
+            throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
         }
 
         cparams.ctx_other = params.ctx_other;
-    }
-
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
-        if (model.tok_embd == nullptr || model.output == nullptr) {
-            if (params.ctx_other == nullptr) {
-                throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
-            }
-            cparams.ctx_other = params.ctx_other;
-        }
     }
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -1573,8 +1566,7 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
 // read-only: it takes the same module-admission guard and tensor-inventory
 // lock the full transaction does) -- no BUSY retry here: BUSY from this
 // call means the module admission guard refused because a shutdown is in
-// progress, not the lock contention the full transaction's own backoff
-// exists for, so retrying would not help.
+// progress, which a second try would not change.
 void llama_context::sycl_recheck_runtime_context_flash_attn() {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     for (auto & backend : backends) {
@@ -1736,9 +1728,8 @@ void llama_context::resolve_fused_ops(sched_reserve_state &          state,
 // silently falls off the GPU path is not a win. Per candidate, on every
 // SYCL backend this context has: Task 2's non-publishing probe
 // (ggml_backend_sycl_probe_runtime_context_for_model) must accept it without
-// demoting KV, with the same bounded exponential BUSY backoff
-// sycl_resync_runtime_context_flash_attn() uses just above (transient
-// lease/lock contention, not a candidate-shape refusal); only then is it
+// demoting KV (a BUSY answer is not retried: the candidate loses with
+// "transaction busy"); only then is it
 // published (sycl_resync_runtime_context_flash_attn(), which every SYCL
 // backend's probe already accepted) and given a full sched_reserve() cycle
 // -- a fresh sched+galloc every call (sched_reserve()'s own
@@ -1768,7 +1759,7 @@ void llama_context::resolve_fused_ops(sched_reserve_state &          state,
 // "ladder exhausted" (no candidate lost -- either the cap stopped the ladder or
 // all four rungs were accepted), "MoE GPU routing ceiling" (the MoE cap bound,
 // whether it narrowed a larger batch/ctx cap or merely matched it),
-// "transaction refused", "transaction busy" (BUSY persisted past the backoff),
+// "transaction refused", "transaction busy" (BUSY: the probe is not retried),
 // "not the published model" (GGML_SYCL_LIFECYCLE_STALE_IDENTITY -- a second
 // model published after this one loaded), "KV would be demoted", "compute
 // buffer fell back to host", "compute buffers did not fit" (the in-loop
@@ -1884,7 +1875,7 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // llama.cpp-7n6n: ONE per-candidate validator,
     // shared by the cache-hit revalidation below and the ladder loop -- the
     // two call sites used to carry independently-maintained copies of this
-    // exact sequence (probe with busy backoff -> publish in a try/catch ->
+    // exact sequence (probe, a BUSY losing the candidate -> publish in a try/catch ->
     // sched_reserve -> host-fallback check), which is also where a bug used
     // to live: the cache copy wrote a losing reason into the SAME `stop`
     // variable the ladder's own vocabulary owns, so a cache miss could leave
@@ -2498,13 +2489,6 @@ sched_reserve_result llama_context::sched_reserve_transaction() {
     return sched_reserve_impl(sched_reserve_mode::ALLOC, state);
 }
 
-// The compute term of one buft: the peak of each chunk over the measured graphs, from the one helper
-// every consumer reads (llama-measure-plan.h), and their sum.
-static void llama_context_peak_chunks(const sched_measure_buft & entry, llama_tenant_buft_caps & c) {
-    c.chunk_bytes = llama_measure_peak_per_chunk(entry.peaks);
-    c.total       = llama_measure_peak_total(c.chunk_bytes);
-}
-
 std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sched_measure_plan & plan) const {
     std::vector<llama_tenant_buft_caps> out;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
@@ -2519,7 +2503,7 @@ std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sch
                     c.host   = false;
                     c.cap    = entry.cap;
                     c.max_chunk_size = entry.max_chunk_size;
-                    llama_context_peak_chunks(entry, c);
+                    llama_tenant_caps_set_peaks(c, entry.peaks);
                     out.push_back(c);
                     break;
                 }
@@ -2538,7 +2522,7 @@ std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sch
                 c.host   = true;
                 c.cap    = entry.cap;
                 c.max_chunk_size = entry.max_chunk_size;
-                llama_context_peak_chunks(entry, c);
+                llama_tenant_caps_set_peaks(c, entry.peaks);
                 out.push_back(c);
                 break;
             }
@@ -3073,14 +3057,17 @@ static ggml_backend_t llama_context_sycl_measure_backend_init(ggml_backend_dev_t
 }
 #endif
 
+bool llama_model_needs_ctx_other(const llama_model & model) {
+    return model.arch == LLM_ARCH_GEMMA4_ASSISTANT ||
+           ((model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) &&
+            (model.tok_embd == nullptr || model.output == nullptr));
+}
+
 std::string llama_measure_unsupported_reason(const llama_model & model) {
     if (llama_model_has_encoder(&model)) {
         return format("%s has an encoder graph the load-time measure does not walk", model.arch_name().c_str());
     }
-    const bool needs_other =
-        model.arch == LLM_ARCH_GEMMA4_ASSISTANT || ((model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) &&
-                                                    (model.tok_embd == nullptr || model.output == nullptr));
-    if (needs_other) {
+    if (llama_model_needs_ctx_other(model)) {
         return format("%s needs ctx_other, which a load-time measure has none of", model.arch_name().c_str());
     }
     return "";
@@ -3164,6 +3151,13 @@ llama_load_measure_result llama_load_measure(const llama_model &          model,
     }
     const int first_device = llama_context_sycl_device_index(sycl_devs[0], 0);
 
+    // a model the measure cannot walk is told so before any backend is created for it
+    if (const std::string why = llama_measure_unsupported_reason(model); !why.empty()) {
+        out.unsupported = true;
+        out.refusal     = llama_load_measure_refusal_text(stage, first_device, why);
+        return out;
+    }
+
     llama_measure_context_args args;
     for (size_t i = 0; i < sycl_devs.size(); ++i) {
         const int      device  = llama_context_sycl_device_index(sycl_devs[i], (int) i);
@@ -3223,9 +3217,8 @@ llama_late_check_result llama_load_late_check(const llama_model &               
         return out;
     }
 
-    out          = llama_late_check_fold(procs, txn, measured.devices);
-    out.n_ubatch = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
-    return out;
+    const uint32_t n_ubatch = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
+    return llama_late_check_fold(procs, txn, measured.devices, n_ubatch);
 #else
     GGML_UNUSED(model);
     GGML_UNUSED(n_ctx);

@@ -208,6 +208,11 @@ struct llama_load_measure_result {
     int                                    n_splits = 0;         // the most splits any measured graph took
 };
 
+// Whether a context of this model cannot be built without a second context to read from: the gemma4 assistant
+// shares its target's KV cache, and an EAGLE3 or DFLASH draft without its own embedding or output tensors
+// borrows the target's. The context constructor and the measure's unsupported reason both ask this.
+bool llama_model_needs_ctx_other(const llama_model & model);
+
 // Why this model cannot be measured by a measure-only context, or "": an encoder graph is not walked, and
 // an architecture that needs ctx_other has none to read. (A memory kind with no no_alloc form is named by
 // create_memory, which throws llama_measure_unsupported for it.)
@@ -238,13 +243,19 @@ llama_load_measure_result llama_load_measure(const llama_model &          model,
 
 // What the backend said of each device's term at the late stage, and what the load does with it.
 struct llama_late_check_result {
-    std::string          refusal;           // non-empty: the load is refused, by this named text
-    std::string          unsupported;       // non-empty: the model cannot be measured; the load goes on, with a WARN
-    bool                 checked  = false;  // the L4 entry points exist and a measure ran
-    uint32_t             n_ubatch = 0;      // the measure's ubatch
-    std::vector<int32_t> not_recorded;      // devices with no early term to compare: NOT a pass
-    std::vector<int32_t> shrunk;            // devices admitted at a smaller term than the early stage's
+    std::string          refusal;       // non-empty: the load is refused, by this named text
+    std::string          unsupported;   // non-empty: the model cannot be measured; the load goes on, with a WARN
+    uint32_t             n_ubatch = 0;  // the measure's ubatch, for the text of a miss
+    std::vector<int32_t> not_recorded;  // devices with no early term to compare: NOT a pass
 };
+
+// The WARN the loader prints for a device the backend recorded nothing for: nothing was compared, which is
+// not a pass.
+inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n_ubatch) {
+    return "[LOAD-PLAN] late check on device " + std::to_string(device) +
+           ": no early compute term was recorded for this load, nothing was compared (ubatch " +
+           std::to_string(n_ubatch) + ")";
+}
 
 // Folds the measured devices through the backend's late check. A device the backend recorded nothing for
 // stays in `not_recorded`; it is never read as EQUAL. The first REFUSED ends the fold with the named refusal
@@ -257,18 +268,17 @@ struct llama_late_check_result {
 // call site yet; those stages are the backend planner's, and they read the host term from the same result.)
 inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &                    procs,
                                                      struct ggml_sycl_load_txn                      txn,
-                                                     const std::vector<llama_load_measure_device> & devices) {
+                                                     const std::vector<llama_load_measure_device> & devices,
+                                                     uint32_t                                       n_ubatch) {
     llama_late_check_result out;
-    out.checked = true;
+    out.n_ubatch = n_ubatch;
     for (const auto & d : devices) {
         if (d.host) {
             continue;
         }
         switch (llama_sycl_l4_late_check(procs, txn, d.device, d.total)) {
             case GGML_SYCL_LATE_CHECK_EQUAL:
-                break;
             case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED:
-                out.shrunk.push_back(d.device);
                 break;
             case GGML_SYCL_LATE_CHECK_REFUSED:
                 out.refusal =
@@ -286,7 +296,7 @@ inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &
 // The late check (stage (c)): after the dev_layer sync and before the mappings are initialised, measure
 // the load's final placement over the real weights' dummies and hand each device's term to the backend.
 // It measures only when the backend exports all three L4 entry points: without them no c(P) was recorded
-// and there is nothing to compare, so the call is inert (checked == false).
+// and there is nothing to compare, so the call is inert (an empty result).
 llama_late_check_result llama_load_late_check(const llama_model &                            model,
                                               uint32_t                                       n_ctx,
                                               struct ggml_sycl_load_txn                      txn,
