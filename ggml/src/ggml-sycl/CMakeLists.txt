@@ -283,7 +283,7 @@ if (BUILD_TESTING)
     add_test(NAME sycl-module-nodelete-source
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-nodelete-source.py)
-    set_tests_properties(sycl-module-nodelete-source PROPERTIES LABELS "sycl;module;host")
+    set_tests_properties(sycl-module-nodelete-source PROPERTIES LABELS "sycl;module;host;python")
 
     add_executable(test-sycl-lifecycle-runtime-wrapper
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-runtime-wrapper.cpp)
@@ -426,7 +426,7 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pp-moe-scratch-admission-contract.py
             --self-test)
-    set_tests_properties(sycl-pp-moe-scratch-admission-contract PROPERTIES LABELS "sycl;moe;host;source-contract")
+    set_tests_properties(sycl-pp-moe-scratch-admission-contract PROPERTIES LABELS "sycl;moe;host;source-contract;python")
     # The MMVQ launch geometry contract (llama.cpp-99ke). --self-test for the
     # same reason: the check that matters most is absence-based -- no launch
     # site still submits the raw row count -- and it passes on every tree
@@ -5868,7 +5868,7 @@ if (Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-layer-stream-owner-contract.py
             --self-test)
     set_tests_properties(sycl-layer-stream-owner-contract PROPERTIES
-        LABELS "sycl;lifecycle;cross-model;host-only;source-contract"
+        LABELS "sycl;lifecycle;cross-model;host-only;source-contract;python"
         TIMEOUT 120
     )
 else()
@@ -5886,7 +5886,7 @@ if (Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mmid-deferral-contract.py
             --self-test)
     set_tests_properties(sycl-mmid-deferral-contract PROPERTIES
-        LABELS "sycl;moe;lifecycle;host-only;source-contract"
+        LABELS "sycl;moe;lifecycle;host-only;source-contract;python"
         TIMEOUT 120
     )
 else()
