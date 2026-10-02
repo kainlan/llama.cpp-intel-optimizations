@@ -109449,7 +109449,11 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             }
         }
 #endif
-        return ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);
+        const ggml_status rb2h_status = ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);
+        if (backend && backend->context) {
+            ggml_sycl_rb2h_getrows_recheck(*static_cast<ggml_backend_sycl_context *>(backend->context));
+        }
+        return rb2h_status;
     } catch (const ggml_sycl_fallback_error & error) {
         auto * cleanup_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
         try { ggml_sycl_cpu_tg_flush_pending(); } catch (...) {}

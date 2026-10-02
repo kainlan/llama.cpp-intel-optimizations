@@ -17,6 +17,11 @@
 #include <set>
 #include <string>
 
+struct ggml_backend_sycl_context;
+
+// Defined in getrows.cpp: re-checks the output of the last verified Q4_K GET_ROWS once the compute call returns.
+void ggml_sycl_rb2h_getrows_recheck(ggml_backend_sycl_context & ctx);
+
 inline bool ggml_sycl_rb2h_arm(const char * name) {
     const char * env = std::getenv(name);
     if (env == nullptr || std::atoi(env) == 0) {
