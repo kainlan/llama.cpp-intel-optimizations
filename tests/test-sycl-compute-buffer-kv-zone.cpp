@@ -52,6 +52,7 @@ using ggml_sycl::unified_alloc;
 using ggml_sycl::unified_cache;
 using ggml_sycl::unified_free;
 using ggml_sycl::vram_zone_id;
+using ggml_sycl::zone_hold_rung_request;
 
 namespace {
 
