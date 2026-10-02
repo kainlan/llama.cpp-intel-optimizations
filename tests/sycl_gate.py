@@ -18,8 +18,12 @@ already independent, one result per function.
 """
 import contextlib
 import linecache
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import traceback
 
 _RESULTS = []
@@ -104,3 +108,21 @@ def finish(pass_message: str = "", min_checks: int = 1) -> None:
         sys.exit(1)
     if pass_message:
         print(pass_message)
+
+
+def run_without_source(script: str):
+    """Run a copy of the gate `script` in a tree that lacks the sources it pins: (exit status, stdout + stderr).
+
+    The copy sits in tmp/tests/ with this module beside it, so `../ggml/...` does not exist for it. A gate that pins a
+    source file must FAIL there (and say the file was not found); exiting 77 is ctest's skip, which reads as green,
+    and a moved or renamed source is exactly what such a gate exists to notice. Callers check both the status and
+    the text, so a gate that dies on something else (an ImportError) does not pass for a missing-source failure.
+    """
+    with tempfile.TemporaryDirectory(prefix="gate-missing-source-") as tmp:
+        tests = os.path.join(tmp, "tests")
+        os.makedirs(tests)
+        copy = os.path.join(tests, os.path.basename(script))
+        shutil.copy(script, copy)
+        shutil.copy(os.path.abspath(__file__), os.path.join(tests, "sycl_gate.py"))
+        done = subprocess.run([sys.executable, copy], capture_output=True, text=True, timeout=60)
+        return done.returncode, done.stdout + done.stderr

@@ -19,12 +19,10 @@ green means nothing without a demonstrated red.
 """
 
 import argparse
-import os
 import pathlib
-import shutil
-import subprocess
 import sys
-import tempfile
+
+from sycl_gate import run_without_source
 
 SOURCE = pathlib.Path(__file__).resolve().parent.parent / "ggml" / "src" / "ggml-sycl" / "ggml-sycl.cpp"
 
@@ -98,15 +96,6 @@ POISONS = {
 }
 
 
-def missing_source_exit_status():
-    """Exit status of this gate run from a tree that lacks the source it pins (the copy sits in tmp/tests/)."""
-    with tempfile.TemporaryDirectory(prefix="gate-missing-source-") as tmp:
-        os.makedirs(os.path.join(tmp, "tests"))
-        copy = os.path.join(tmp, "tests", os.path.basename(__file__))
-        shutil.copy(__file__, copy)
-        return subprocess.run([sys.executable, copy], capture_output=True, text=True, timeout=60).returncode
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true",
@@ -139,12 +128,12 @@ def main():
             if ok:
                 failures += 1
 
-        # A missing source must FAIL. 77 is ctest's skip, which reads as green, and a moved source is exactly what
-        # this gate exists to notice.
-        status = missing_source_exit_status()
+        # A missing source must FAIL and say so (sycl_gate.run_without_source): 77 is ctest's skip, which reads as green.
+        status, output = run_without_source(__file__)
+        absent_ok = status not in (0, 77) and "not found" in output
         print("%-20s %s  exit status %d with the source absent"
-              % ("missing source", "fails as required" if status not in (0, 77) else "VOID (passes or skips)", status))
-        if status in (0, 77):
+              % ("missing source", "fails as required" if absent_ok else "VOID (passes, skips or dies elsewhere)", status))
+        if not absent_ok:
             failures += 1
 
     return 1 if failures else 0

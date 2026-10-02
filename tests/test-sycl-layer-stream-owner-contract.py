@@ -22,10 +22,9 @@ Exit: 0 pass, 1 fail (a source that is not found fails; it is never a skip).
 import argparse
 import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
+
+from sycl_gate import run_without_source
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SYCL = os.path.join(HERE, "..", "ggml", "src", "ggml-sycl")
@@ -283,15 +282,6 @@ def report(title, results):
     return failed
 
 
-def missing_source_exit_status():
-    """Exit status of this gate run from a tree that lacks the source it pins (the copy sits in tmp/tests/)."""
-    with tempfile.TemporaryDirectory(prefix="gate-missing-source-") as tmp:
-        os.makedirs(os.path.join(tmp, "tests"))
-        copy = os.path.join(tmp, "tests", os.path.basename(__file__))
-        shutil.copy(__file__, copy)
-        return subprocess.run([sys.executable, copy], capture_output=True, text=True, timeout=60).returncode
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true",
@@ -337,12 +327,12 @@ def main():
             print("FAIL: self-test expected %d absence checks to survive the poison, %d did: %s"
                   % (expected_survivors, len(survivors), survivors))
             failed += 1
-        # A missing source must FAIL. 77 is ctest's skip, which reads as green, and a moved source is exactly what
-        # this gate exists to notice.
-        status = missing_source_exit_status()
+        # A missing source must FAIL and say so (sycl_gate.run_without_source): 77 is ctest's skip, which reads as green.
+        status, output = run_without_source(__file__)
+        absent_ok = status not in (0, 77) and "not found" in output
         print("missing source: exit status %d with the source absent (%s)"
-              % (status, "fails as required" if status not in (0, 77) else "VOID, passes or skips"))
-        if status in (0, 77):
+              % (status, "fails as required" if absent_ok else "VOID, passes, skips or dies elsewhere"))
+        if not absent_ok:
             failed += 1
 
     total = len(presence) + len(absence)
