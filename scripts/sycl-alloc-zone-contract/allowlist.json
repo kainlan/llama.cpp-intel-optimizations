@@ -250,7 +250,7 @@
       "file": "unified-cache.cpp",
       "function": "unified_cache_raw_device_held_bytes",
       "count": 1,
-      "reason": "unified_cache_raw_device_held_bytes is the hold-fit ledger's read-only query (llama.cpp-kpjw): its try body is a mutex lock and a walk of the registry with saturating arithmetic, with no allocation and no source of a planned refusal. The catch-all turns a lock failure into the figure summed so far instead of throwing out of the planner's fit arithmetic; a rethrow of ggml_sycl_fallback_error there would have nothing to carry. Permanent while the function stays a pure registry read; a body that allocates or refuses needs its own handler."
+      "reason": "unified_cache_raw_device_held_bytes is the hold-fit ledger's read-only query (llama.cpp-kpjw): its try body is a mutex lock and a walk of the registry with saturating arithmetic, with no allocation and no source of a planned refusal. The catch-all turns a lock failure into the figure summed so far instead of throwing out of the planner's fit arithmetic; a rethrow of ggml_sycl_fallback_error there would have nothing to carry. TEMPORARY, pending llama.cpp-5jai: that same catch-all is a fail-OPEN under-count -- a lock failure yields 0 or a partial held-bytes figure, and the hold fit then over-admits against an understated ledger. The entry exempts the catch from the no-swallow rule until 5jai makes a failed read fail closed (an unknown held figure refuses the admission); delete the entry with that fix. A body that allocates or refuses needs its own handler regardless."
     },
     {
       "id": "E-REGISTRY-TEST-PUBLISH-CATCH",
