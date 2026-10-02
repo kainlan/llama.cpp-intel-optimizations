@@ -63,27 +63,82 @@ FUNCTION_PINS = {
 }
 
 
-# The three helpers every gate call goes through, whitespace-insensitive. The host test exercises the header's
-# predicate; these live in ggml-sycl.cpp next to the process-global counters, so a wrapper that answered `true`
-# after counting would pass the host test and every call-site pin above. Each must return the account's answer,
-# and the account must answer `true` only for a SAFE verdict.
-WRAPPER_PINS = [
+# The three helpers every gate call goes through, pinned whole: the function text with comments stripped,
+# whitespace squashed and the log message's arguments elided must EQUAL the text below. The host test exercises
+# the header's predicate; these live in ggml-sycl.cpp next to the process-global counters, so a helper that
+# counted and then answered `true` (an early return, a changed comparison, a resolver lambda that hands the
+# predicate no pointer) would pass the host test and every call-site pin above. Equality, not a substring: any
+# statement added anywhere in a helper changes the text.
+WRAPPER_BODIES = [
+    (
+        "static bool ggml_sycl_fusion_alias_account(",
+        """
+static bool ggml_sycl_fusion_alias_account(ggml_sycl_fusion_alias_site site, const char * start_name,
+                                           const ggml_sycl_fusion_alias_result & r) {
+    ggml_sycl_fusion_alias_stats & st = ggml_sycl_fusion_alias_stats_get();
+    st.checked[site].fetch_add(1, std::memory_order_relaxed);
+    if (r.verdict == GGML_SYCL_FUSION_ALIAS_SAFE) {
+        return true;
+    }
+    st.declined[site][r.verdict].fetch_add(1, std::memory_order_relaxed);
+    const uint64_t n = st.declined_total.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 4 || (n & (n - 1)) == 0) {
+        GGML_LOG_WARN(...);
+    }
+    return false;
+}
+""",
+    ),
     (
         "static bool ggml_sycl_fusion_alias_admit(",
-        ["returnggml_sycl_fusion_alias_account(site,start_name,ggml_sycl_fusion_alias_check(writes,n_writes,reads,n_reads));"],
+        """
+static bool ggml_sycl_fusion_alias_admit(ggml_sycl_fusion_alias_site site, const char * start_name,
+                                         const ggml_sycl_fusion_operand * writes, int n_writes,
+                                         const ggml_sycl_fusion_operand * reads, int n_reads) {
+    return ggml_sycl_fusion_alias_account(site, start_name,
+                                          ggml_sycl_fusion_alias_check(writes, n_writes, reads, n_reads));
+}
+""",
     ),
     (
         "static bool ggml_sycl_fusion_alias_admit_chain(",
-        [
-            "ggml_sycl_fusion_chain_alias_check(cgraph,node_idx,site,",
-            "returnggml_sycl_fusion_alias_account(site,cgraph&&node_idx>=0&&node_idx<cgraph->n_nodes?cgraph->nodes[node_idx]->name:nullptr,r);",
-        ],
-    ),
-    (
-        "static bool ggml_sycl_fusion_alias_account(",
-        ["if(r.verdict==GGML_SYCL_FUSION_ALIAS_SAFE){returntrue;}", "returnfalse;}"],
+        """
+static bool ggml_sycl_fusion_alias_admit_chain(ggml_sycl_fusion_alias_site site, const ggml_cgraph * cgraph,
+                                               int node_idx, int device) {
+    const bool norm_chain =
+        site == GGML_SYCL_FUSION_SITE_RMS_NORM_MUL_ADD || site == GGML_SYCL_FUSION_SITE_RMS_NORM_MUL;
+    const ggml_tensor * norm_src =
+        norm_chain && cgraph && node_idx >= 0 && node_idx < cgraph->n_nodes ? cgraph->nodes[node_idx]->src[0] : nullptr;
+    const ggml_sycl_fusion_alias_result r = ggml_sycl_fusion_chain_alias_check(
+        cgraph, node_idx, site, [&](const ggml_tensor * t, bool is_write) -> const void * {
+            if (is_write || !norm_chain || t == norm_src) {
+                return ggml_sycl_get_data_ptr(t, device);
+            }
+            return ggml_sycl_resolve_tensor_ptr(t, device);
+        });
+    return ggml_sycl_fusion_alias_account(
+        site, cgraph && node_idx >= 0 && node_idx < cgraph->n_nodes ? cgraph->nodes[node_idx]->name : nullptr, r);
+}
+""",
     ),
 ]
+
+
+def squash(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+def elide_log_arguments(body: str) -> str:
+    """GGML_LOG_WARN(...) arguments are message wording, not behaviour: replace them so rewording the log does
+    not break the pin. Anything else added next to the call still changes the text."""
+    out = body
+    at = out.find("GGML_LOG_WARN(")
+    while at >= 0:
+        open_idx = at + len("GGML_LOG_WARN")
+        close = matching_paren(out, open_idx)
+        out = out[:open_idx + 1] + "..." + out[close:]
+        at = out.find("GGML_LOG_WARN(", open_idx)
+    return out
 
 
 def matching_brace(text: str, open_idx: int) -> int:
@@ -304,15 +359,20 @@ def gate_violations(source: str) -> list[str]:
         if "return false;" not in tail and "return reject(" not in tail:
             found.append(f"{site}: no `return false;` follows the gate call, so a decline would still launch")
 
-    for signature, pins in WRAPPER_PINS:
+    for signature, expected in WRAPPER_BODIES:
         body = function(code, signature)
         if body is None:
             found.append(f"gate helper: {signature} is missing")
             continue
-        squashed = re.sub(r"\s+", "", body)
-        for pin in pins:
-            if pin not in squashed:
-                found.append(f"gate helper: {signature} must return the account's answer; expected `{pin}`")
+        if code.count(signature) != 1:
+            found.append(f"gate helper: {signature} must be defined exactly once, found {code.count(signature)} (an overload could take the calls)")
+            continue
+        actual = squash(elide_log_arguments(body))
+        if actual != squash(expected):
+            found.append(
+                f"gate helper: {signature} changed; it must read exactly the pinned text, so every verdict still "
+                f"reaches the account and only SAFE admits.\n  expected: {squash(expected)}\n  actual:   {actual}"
+            )
 
     return found
 
@@ -470,23 +530,60 @@ def test_dead_bit0_decline_is_witnessed() -> None:
 
 
 def test_gate_helpers_that_always_admit_are_witnessed() -> None:
-    """A helper that counts the check and then answers `true` hides every decline behind a green host test."""
+    """A helper that counts the check and then answers `true` hides every decline behind a green host test.
+    The ways to do it that a reviewer reaches for: replace the final return, return early, return before the
+    accounting, change the verdict comparison, hand the predicate no pointer, or leave the pinned text behind
+    as dead code or inside a string literal."""
     source = SOURCE.read_text()
-    for signature, _ in WRAPPER_PINS:
+    account, admit, chain = (sig for sig, _ in WRAPPER_BODIES)
+
+    def after_open_brace(body: str) -> int:
+        return body.index("{", body.index(")")) + 1
+
+    def last_return(body: str, word: str) -> tuple[int, int]:
+        at = body.rindex(word)
+        return at, at + len(word)
+
+    def final_return_true(body: str) -> str:
+        if body.rstrip("}\n ").endswith("return false;"):
+            at, end = last_return(body, "return false;")
+            return body[:at] + "return true;" + body[end:]
+        at, end = last_return(body, "return")
+        return body[:at] + "(void) 0; return true; (void)" + body[end:]
+
+    cases = {
+        account: {
+            "final return true": final_return_true,
+            "early return true": lambda b: b[:after_open_brace(b)] + "\n    if (true) { return true; }" + b[after_open_brace(b):],
+            "return true before the decline accounting": lambda b: b.replace(
+                "    st.declined[site]", "    if (r.verdict != GGML_SYCL_FUSION_ALIAS_SAFE) { return true; }\n    st.declined[site]", 1),
+            "verdict compared against INPLACE": lambda b: b.replace(
+                "r.verdict == GGML_SYCL_FUSION_ALIAS_SAFE", "r.verdict != GGML_SYCL_FUSION_ALIAS_INPLACE", 1),
+            "pinned text in a string literal": lambda b: b[:after_open_brace(b)]
+            + '\n    if (true) { return true; }\n    (void) "if(r.verdict==GGML_SYCL_FUSION_ALIAS_SAFE){returntrue;}";' + b[after_open_brace(b):],
+        },
+        admit: {
+            "final return true": final_return_true,
+            "early return true": lambda b: b[:after_open_brace(b)] + "\n    if (n_writes >= 0) { return true; }" + b[after_open_brace(b):],
+            "dead pinned return": lambda b: b[:after_open_brace(b)] + "\n    return true;" + b[after_open_brace(b):],
+        },
+        chain: {
+            "final return true": final_return_true,
+            "early return true": lambda b: b[:after_open_brace(b)] + "\n    if (node_idx >= 0) { return true; }" + b[after_open_brace(b):],
+            "resolver hands reads no pointer": lambda b: b.replace(
+                "            if (is_write || !norm_chain", "            if (!is_write) { return nullptr; }\n            if (is_write || !norm_chain", 1),
+        },
+    }
+    for signature, mutants in cases.items():
         body = function(source, signature)
         assert body is not None
-        # Answer `true` at the helper's own final return (the lambda inside the chain helper returns a pointer).
-        if signature.endswith("_account("):
-            at = body.rindex("return false;")
-            mutated_body = body[:at] + "return true;" + body[at + len("return false;"):]
-        else:
-            at = body.rindex("return")
-            mutated_body = body[:at] + "(void) 0; return true; (void)" + body[at + len("return"):]
-        assert mutated_body != body
-        violations = gate_violations(source.replace(body, mutated_body, 1))
-        assert any(v.startswith("gate helper:") and signature in v for v in violations), (
-            f"{signature}: a helper that always admits survived: {violations}"
-        )
+        for name, mutate in mutants.items():
+            mutated_body = mutate(body)
+            assert mutated_body != body, f"{signature}: the `{name}` mutant did not change the helper"
+            violations = gate_violations(source.replace(body, mutated_body, 1))
+            assert any(v.startswith("gate helper:") and signature in v for v in violations), (
+                f"{signature}: the `{name}` mutant survived: {violations}"
+            )
 
 
 def test_miswired_bit0_operands_are_witnessed() -> None:
