@@ -256,6 +256,12 @@ static void llama_context_sycl_exec_drain_and_close(const char *                
         LLAMA_LOG_ERROR("%s: failed to finish SYCL execution drain: result=%d\n", func, (int) finish_rc);
     }
 }
+#else
+// No SYCL backend can be present in a build with neither macro, so the shared callers (the measure-scope
+// requirement in sched_reserve_impl) stay unguarded and compile everywhere (llama.cpp-txho).
+static bool llama_context_has_sycl_backend(const std::vector<ggml_backend_ptr> &) {
+    return false;
+}
 #endif
 
 #if defined(GGML_BACKEND_DL) && !defined(GGML_USE_SYCL)
