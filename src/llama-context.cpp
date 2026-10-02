@@ -3095,7 +3095,10 @@ std::string llama_load_late_check(const llama_model &                           
     }
     for (const auto & d : measured.devices) {
         if (d.host) {
-            continue;  // the late check compares a SYCL device's term
+            // Assumption: no host-tier term is recorded at the early stage today, and the backend's
+            // late check takes a SYCL device index, so only SYCL devices are compared. A host term
+            // recorded later needs its own entry point, not a guessed device index.
+            continue;
         }
         if (llama_sycl_l4_late_check(procs, txn, d.device, d.total) == GGML_SYCL_LATE_CHECK_REFUSED) {
             // the backend has logged its canonical line; this is the load's refusal
