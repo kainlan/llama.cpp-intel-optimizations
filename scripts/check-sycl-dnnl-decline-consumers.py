@@ -74,6 +74,35 @@ WRITE = re.compile(r"\bparallel_for\b|\bsingle_task\b|\bmemcpy\b|\bmemmove\b|\bm
 # What may not appear in the #else arm of a caller's `#if GGML_SYCL_DNNL` section: any way to leave before the fallback runs.
 LEAVE = re.compile(r"\breturn\b|\bgoto\b|\bthrow\b|\bGGML_ABORT\b|\bGGML_ASSERT\b|\babort\b|\bexit\b|\b_Exit\b|\bquick_exit\b"
                    r"|\bterminate\b|\blongjmp\b")
+GEMM = SYCL + "/gemm.hpp"
+COMMON = SYCL + "/common.hpp"
+MAIN = SYCL + "/ggml-sycl.cpp"
+OUTPROD = SYCL + "/outprod.cpp"
+# DnnlGemmWrapper's consumers of get_scratchpad_mem (llama.cpp-23mk S3-4): function -> (site, declined result, the type it
+# returns, how many scratchpad requests it makes). Every request is unconditional, decided by the helper before anything is
+# submitted, and a decline is a return value.
+GEMM_CONSUMERS = (
+    ("gemm", "DNNL_GEMM", "std::nullopt", "std::optional<sycl::event>", 2),
+    ("woq_gemm_q8_0", "DNNL_WOQ_Q8_0", "false", "bool", 1),
+    ("woq_gemm_q4_0_impl", "DNNL_WOQ_Q4_0", "false", "bool", 1),
+    ("gemm_batch_strided", "DNNL_GEMM_BATCH", "std::nullopt", "std::optional<sycl::event>", 2),
+    ("woq_gemm_batch_mxfp4", "DNNL_WOQ_MXFP4_BATCH", "std::nullopt", "std::optional<sycl::event>", 2),
+)
+GEMM_FORWARDERS = (("row_gemm", "std::optional<sycl::event>"), ("woq_gemm_q4_0", "bool"))
+GEMM_DEAD = ("woq_gemm_q4_0_packed", "gemm_batch_array", "row_gemm_batch")
+GEMM_DECISION = re.compile(r"if\s*\(\s*" + HELPER + r"\s*\(\s*GGML_SYCL_SCRATCHPAD_SITE_(\w+)\s*,\s*scratchpad_mem\s*,\s*"
+                           r"(?:scratchpad_md|cached\w*\s*->\s*scratchpad_md)\s*\)\s*\)\s*\{\s*return\s+([\w:]+)\s*;\s*\}")
+# Statements in ggml-sycl.cpp and outprod.cpp that carry a declined gemm to its declared next path: text -> how many.
+MAIN_PINS = (
+    ('throw ggml_sycl_fallback_error("dnnl_gemm declined in mul_mat\'s f16 dense arm', 1),
+    ('throw ggml_sycl_fallback_error("dnnl_gemm declined in mul_mat\'s f32 dense arm', 1),
+    ('throw ggml_sycl_fallback_error("dnnl_decline_after_write:dnnl_gemm");', 3),
+    ('throw ggml_sycl_fallback_error("dnnl_gemm declined and batched_f16_fallback failed");', 2),
+    ("batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback(", 2),
+    ("[[nodiscard]] static bool ggml_sycl_mul_mat_batched_sycl(", 1),
+)
+OUTPROD_PIN = 'throw ggml_sycl_fallback_error("dnnl_gemm declined in out_prod'
+OLD_THROW = 'std::runtime_error("oneDNN scratchpad allocation failed")'
 DEAD = (
     (re.compile(r"\beltwise_in_?place\b"), "eltwise_inplace (a forwarder with no caller)"),
     (re.compile(r"\bDnnlReductionWrapper\b"), "DnnlReductionWrapper (an emptied class, deleted by design 4.8)"),
@@ -196,6 +225,116 @@ def check_header(text):
     return errs
 
 
+def member_body(text, name):
+    """(declaration text before the name, body) of the static member `name` of DnnlGemmWrapper, or (None, None)."""
+    m = re.search(r"((?:\[\[nodiscard\]\]\s*)?static\s+[\w:<>]+\s+)%s\s*\(" % re.escape(name), text)
+    if m is None:
+        return None, None
+    params_end = balanced(text, m.end(), "(", ")")
+    open_brace = text.index("{", params_end)
+    return m.group(1), text[open_brace + 1:balanced(text, open_brace + 1, "{", "}") - 1]
+
+
+def check_gemm(text):
+    errs = []
+    text = strip_comments(text)
+    if OLD_THROW in text:
+        errs.append("%s: a consumer throws the old oneDNN scratchpad runtime_error again; a decline is a return value" % GEMM)
+    for name in GEMM_DEAD:
+        if re.search(r"\b%s\b" % name, text):
+            errs.append("%s: %s is back (a forwarder with no caller)" % (GEMM, name))
+    total = 0
+    for name, site, result, rtype, want in GEMM_CONSUMERS:
+        decl, body = member_body(text, name)
+        where = "%s: DnnlGemmWrapper::%s" % (GEMM, name)
+        if body is None:
+            errs.append("%s not found" % where)
+            continue
+        if not decl.startswith("[[nodiscard]]") or not re.search(r"static\s+%s\s*$" % re.escape(rtype), decl):
+            errs.append("%s must be `[[nodiscard]] static %s`: a declined result may not be dropped" % (where, rtype))
+        calls = list(re.finditer(r"\bget_scratchpad_mem\s*\(", body))
+        total += len(calls)
+        if len(calls) != want:
+            errs.append("%s makes %d scratchpad request(s), expected %d" % (where, len(calls), want))
+        decisions = list(GEMM_DECISION.finditer(body))
+        if len(decisions) != want:
+            errs.append("%s must decide each request with `if (%s(SITE, scratchpad_mem, <descriptor>)) { return %s; }`, found %d"
+                        % (where, HELPER, result, len(decisions)))
+        for d in decisions:
+            if d.group(1) != site:
+                errs.append("%s decides under site %s, not its own %s" % (where, d.group(1), site))
+            if d.group(2) != result:
+                errs.append("%s declines with `return %s`, expected `return %s`" % (where, d.group(2), result))
+        for c in calls:
+            stmt_start = max(body.rfind(";", 0, c.start()), body.rfind("{", 0, c.start()), body.rfind("}", 0, c.start()))
+            if not re.fullmatch(r"\s*auto\s+scratchpad_mem\s*=\s*ctx\s*\.\s*", body[stmt_start + 1:c.start()]):
+                errs.append("%s asks for the scratchpad other than as a plain `auto scratchpad_mem = ctx.get_scratchpad_mem(...)` "
+                            "statement: the request must be unconditional, with the guard on the argument insert alone" % where)
+            nxt = re.match(r"[^;]*;\s*", body[c.start():])
+            after = body[c.start() + nxt.end():] if nxt else ""
+            if not GEMM_DECISION.match(after):
+                errs.append("%s: a scratchpad request is not followed directly by its decision" % where)
+        notes = list(NOTE.finditer(body))
+        if len(notes) != want or any(n.group(1) != site for n in notes):
+            errs.append("%s must call ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_%s) once per request, found %d"
+                        % (where, site, len(notes)))
+        for d, n in zip(decisions, notes):
+            between = r"\s*if\s*\(\s*query_only\s*\)\s*\{\s*return\s+sycl::event\s*\{\s*\}\s*;\s*\}\s*" if name == "gemm" else r"\s*"
+            if n.start() < d.end() or not re.fullmatch(between, body[d.end():n.start()]):
+                errs.append("%s must note the engaged call right after its decision%s" % (
+                    where, ", after query_only's exit (a pre-query is not an engaged call)" if name == "gemm" else ""))
+        for m in re.finditer(r"\bthrow\b", body):
+            if name in ("woq_gemm_q8_0", "woq_gemm_q4_0_impl", "gemm", "gemm_batch_strided") and \
+                    re.match(r"\s+std::runtime_error\(\"oneDNN scratchpad", body[m.end() - 1:]):
+                errs.append("%s throws on a declined scratchpad" % where)
+    if total != sum(w for *_, w in GEMM_CONSUMERS) or len(re.findall(r"\bget_scratchpad_mem\s*\(", text)) != total:
+        errs.append("%s: a get_scratchpad_mem request sits outside the listed consumers (found %d, listed %d)"
+                    % (GEMM, len(re.findall(r"\bget_scratchpad_mem\s*\(", text)), total))
+    # the 2-D fallback asks once, before its batch loop
+    _, mx = member_body(text, "woq_gemm_batch_mxfp4")
+    if mx is not None:
+        loop = mx.find("for (int b = 0; b < batch_size; ++b)")
+        late = [m.start() for m in re.finditer(r"\bget_scratchpad_mem\s*\(", mx) if loop >= 0 and m.start() > loop]
+        if loop < 0 or late:
+            errs.append("%s: woq_gemm_batch_mxfp4's 2-D fallback must ask for the scratchpad once before its batch loop" % GEMM)
+    for name, rtype in GEMM_FORWARDERS:
+        decl, body = member_body(text, name)
+        if body is None:
+            errs.append("%s: DnnlGemmWrapper::%s not found" % (GEMM, name))
+        elif not decl.startswith("[[nodiscard]]") or not re.search(r"static\s+%s\s*$" % re.escape(rtype), decl):
+            errs.append("%s: DnnlGemmWrapper::%s must be `[[nodiscard]] static %s`" % (GEMM, name, rtype))
+    return errs
+
+
+def check_common(text):
+    errs = []
+    text = strip_comments(text)
+    m = re.search(r"(\[\[nodiscard\]\]\s*)?dnnl::memory\s+get_scratchpad_mem\s*\(", text)
+    if m is None:
+        return ["%s: get_scratchpad_mem not found" % COMMON]
+    if not m.group(1):
+        errs.append("%s: get_scratchpad_mem must be [[nodiscard]]" % COMMON)
+    open_brace = text.index("{", balanced(text, m.end(), "(", ")"))
+    body = text[open_brace + 1:balanced(text, open_brace + 1, "{", "}") - 1]
+    zero, lock = body.find("scratchpad_size == 0"), body.find("dnnl_mutex")
+    if zero < 0 or lock < 0 or zero > lock:
+        errs.append("%s: get_scratchpad_mem must return for a 0 B descriptor before it takes dnnl_mutex, so an unconditional "
+                    "request adds no lock to the cached path" % COMMON)
+    return errs
+
+
+def check_main(main_text, outprod_text):
+    errs = []
+    if OLD_THROW in main_text:
+        errs.append("%s: the old oneDNN scratchpad runtime_error is back" % MAIN)
+    for text, want in MAIN_PINS:
+        if main_text.count(text) != want:
+            errs.append("%s: expected %d of `%s`, found %d" % (MAIN, want, text, main_text.count(text)))
+    if outprod_text.count(OUTPROD_PIN) != 1:
+        errs.append("%s: a declined gemm in out_prod must fail by name (`%s`), found %d" % (OUTPROD, OUTPROD_PIN, outprod_text.count(OUTPROD_PIN)))
+    return errs
+
+
 def else_arm_of(text):
     """The text of the #else arm that begins `text` (after the closing braces), up to its matching #endif; None if there is none.
     Nested #if blocks inside the arm are counted so the scan stops at the right #endif."""
@@ -257,7 +396,8 @@ def check_caller(rel, text):
 
 
 def run(files):
-    errs = check_header(files[HDR])
+    errs = check_header(files[HDR]) + check_gemm(files[GEMM]) + check_common(files[COMMON]) + \
+        check_main(files[MAIN], files[OUTPROD])
     for rel in CALLERS:
         errs += check_caller(SYCL + "/" + rel, files[SYCL + "/" + rel])
     return errs
@@ -277,6 +417,64 @@ HELPER_HOOK = "if (ggml_sycl_scratchpad_site_hook(site)) {\n        return true;
 
 
 SM_ANCHOR = "        auto scratchpad_md = softmax_pd.scratchpad_desc();"
+
+
+def gemm_mutants(files, edit):
+    """Mutants of the DnnlGemmWrapper consumers (llama.cpp-23mk S3-4), the ggml-sycl.cpp pins and the common.hpp getter."""
+    g, c, m, o = GEMM, COMMON, MAIN, OUTPROD
+    gt = files[g]
+    out = []
+    # decisions: each consumer's, with a wrong result, a wrong site, a negation, and a lost note
+    for name, site, result, rtype, want in GEMM_CONSUMERS:
+        decl, body = member_body(strip_comments(gt), name)
+        first = GEMM_DECISION.search(body)
+        assert first is not None, "mutant anchor: %s's decision" % name
+        text = first.group(0)
+        assert gt.count(text) >= 1, "mutant anchor: %s's decision text not in gemm.hpp as written" % name
+        out.append(("%s's decision returns the other result" % name,
+                    edit(g, text, text.replace("return " + result, "return " + ("true" if result == "false" else "false")))))
+        out.append(("%s's decision names another site" % name,
+                    edit(g, text, text.replace("SITE_" + site, "SITE_DNNL_SOFTMAX"))))
+        out.append(("%s's decision is negated" % name, edit(g, text, text.replace("if (ggml_", "if (!ggml_"))))
+        out.append(("%s's decision is gone" % name, edit(g, text, "")))
+        out.append(("%s loses [[nodiscard]]" % name,
+                    edit(g, "[[nodiscard]] static %s %s(" % (rtype, name), "static %s %s(" % (rtype, name))))
+        out.append(("%s throws on a decline again" % name,
+                    edit(g, text, text.replace("return " + result, 'throw std::runtime_error("oneDNN scratchpad allocation failed")'))))
+    for name, rtype in GEMM_FORWARDERS:
+        out.append(("%s loses [[nodiscard]]" % name, edit(g, "[[nodiscard]] static %s %s(" % (rtype, name), "static %s %s(" % (rtype, name))))
+    note_gemm = "ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_GEMM);"
+    out.append(("gemm loses an engaged note", edit(g, "            " + note_gemm + "\n", "")))
+    out.append(("gemm's note moves before query_only's exit",
+                edit(g, "            if (query_only) {\n                return sycl::event{};\n            }\n            " + note_gemm,
+                     "            " + note_gemm + "\n            if (query_only) {\n                return sycl::event{};\n            }")))
+    out.append(("a get_scratchpad_mem request sits under an if",
+                edit(g, "        auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);\n        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q8_0",
+                     "        dnnl::memory scratchpad_mem;\n        if (cached->scratchpad_md.get_size() > 0) scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);\n        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q8_0")))
+    out.append(("a ninth scratchpad request appears",
+                edit(g, "    [[nodiscard]] static bool woq_gemm_q4_0(", "    static void extra(ggml_backend_sycl_context & ctx, dnnl::memory::desc d, dnnl::engine e, sycl::queue q) {\n        auto x = ctx.get_scratchpad_mem(d, e, q);\n    }\n    [[nodiscard]] static bool woq_gemm_q4_0(")))
+    out.append(("the mxfp4 2-D fallback asks inside its batch loop",
+                edit(g, "        for (int b = 0; b < batch_size; ++b) {",
+                     "        for (int b = 0; b < batch_size; ++b) {\n            auto again = ctx.get_scratchpad_mem(cached2d->scratchpad_md, eng, q);", 1)))
+    for dead in GEMM_DEAD:
+        out.append(("%s comes back" % dead, edit(g, "    [[nodiscard]] static bool woq_gemm_q4_0(", "    static void %s() {}\n    [[nodiscard]] static bool woq_gemm_q4_0(" % dead)))
+    out.append(("gemm.hpp throws the old scratchpad error", edit(g, "    [[nodiscard]] static bool woq_gemm_q4_0(", "    static void bad() { throw std::runtime_error(\"oneDNN scratchpad allocation failed\"); }\n    [[nodiscard]] static bool woq_gemm_q4_0(")))
+    # common.hpp: the getter
+    out.append(("get_scratchpad_mem loses [[nodiscard]]", edit(c, "[[nodiscard]] dnnl::memory get_scratchpad_mem(", "dnnl::memory get_scratchpad_mem(")))
+    ct = files[c]
+    zero = "        if (scratchpad_size == 0) {\n            return dnnl::memory();\n        }\n"
+    lock = "        std::lock_guard<std::mutex> lock(dnnl_mutex);\n"
+    assert ct.count(zero + lock) == 1, "mutant anchor: the getter's zero-size return and lock in " + c
+    out.append(("the getter's zero-size return is gone", edit(c, zero, "")))
+    out.append(("the getter locks before its zero-size return", edit(c, zero + lock, lock + zero)))
+    # ggml-sycl.cpp / outprod.cpp: the declared next paths
+    for text, want in MAIN_PINS:
+        out.append(("ggml-sycl.cpp loses `%s`" % text[:48], edit(m, text, "/* gone */", want)))
+    out.append(("the dense f16 arm swallows the decline", edit(m, MAIN_PINS[0][0], "return; (void) std::runtime_error(")))
+    out.append(("the old scratchpad error is back in ggml-sycl.cpp",
+                edit(m, MAIN_PINS[0][0], 'throw std::runtime_error("oneDNN scratchpad allocation failed"); (void) std::runtime_error(')))
+    out.append(("out_prod loses its named throw", edit(o, OUTPROD_PIN, "throw 1; // ")))
+    return out
 
 
 def mutants(files):
@@ -377,6 +575,7 @@ def mutants(files):
         "        auto scratchpad_md = softmax_pd.scratchpad_desc();",
         "        ((float *) out)[0] = 0.0f;\n        auto scratchpad_md = softmax_pd.scratchpad_desc();", 1)
     assert "((float *) out)[0]" in seg, "mutant anchor missing: softmax scratchpad_md in " + h
+    out += gemm_mutants(files, edit)
     out.append(("softmax renames dst and writes through the new name", dict(files, **{h: files[h][:i] + seg + files[h][j:]})))
     # the decision moved after the pre-scale: ask first, decide later (the double-application hazard)
     moved = files[h].replace(sd + note("DNNL_SOFTMAX"), "", 1)
@@ -389,7 +588,7 @@ def mutants(files):
 
 def load(root):
     files = {}
-    for rel in (HDR,) + tuple(SYCL + "/" + r for r in CALLERS):
+    for rel in (HDR, GEMM, COMMON, MAIN, OUTPROD) + tuple(SYCL + "/" + r for r in CALLERS):
         try:
             files[rel] = (Path(root) / rel).read_text()
         except OSError as exc:

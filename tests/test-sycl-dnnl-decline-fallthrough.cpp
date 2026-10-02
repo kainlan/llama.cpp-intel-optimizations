@@ -62,6 +62,7 @@ struct arm {
     const char *                                            site;
     double                                                  tol;         // abs + rel tolerance against the host reference
     bool                                                    exact;       // off and on runs must be bit-identical
+    ggml_type                                               w_type = GGML_TYPE_F32;  // the second input's storage type
     std::function<arm_graph(ggml_context *)>                build;
     std::function<void(std::vector<float> &, std::vector<float> &)> fill;  // x, w
     std::function<void(const std::vector<float> &, const std::vector<float> &, std::vector<float> &)> reference;
@@ -73,6 +74,12 @@ constexpr int64_t MUL_COLS     = 256;
 constexpr int64_t MUL_ROWS     = 160;  // row-broadcast MUL needs a batch >= 128 (binbcast.cpp)
 constexpr int64_t ELT_N        = 8192;  // the eltwise paths need >= 4096 elements (element_wise.cpp)
 constexpr float   SOFTMAX_SCALE = 0.5f;
+// The batched f16 mul_mat (a KQ-shaped graph: both operands permuted, one query column, more than one batch) asks oneDNN
+// for a batched gemm; a decline falls to ggml_sycl_mul_mat_batched_f16_fallback, a native GPU kernel.
+constexpr int64_t KQ_D = 64;
+constexpr int64_t KQ_T = 48;
+constexpr int64_t KQ_H = 4;
+constexpr int64_t KQ_B = 2;
 
 float input_value(int64_t i, int64_t n) {
     // a deterministic spread over [-6, 6) that is not a multiple pattern of any row width above
@@ -82,7 +89,7 @@ float input_value(int64_t i, int64_t n) {
 std::vector<arm> make_arms() {
     std::vector<arm> arms;
 
-    arms.push_back({ "SOFT_MAX scale 0.5, in place", "dnnl_softmax", 2e-5, false,
+    arms.push_back({ "SOFT_MAX scale 0.5, in place", "dnnl_softmax", 2e-5, false, GGML_TYPE_F32,
         [](ggml_context * ctx) {
             arm_graph g;
             g.x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, SOFTMAX_COLS, SOFTMAX_ROWS);
@@ -118,7 +125,7 @@ std::vector<arm> make_arms() {
             }
         } });
 
-    arms.push_back({ "MUL row broadcast", "dnnl_binary_row", 0.0, true,
+    arms.push_back({ "MUL row broadcast", "dnnl_binary_row", 0.0, true, GGML_TYPE_F32,
         [](ggml_context * ctx) {
             arm_graph g;
             g.x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, MUL_COLS, MUL_ROWS);
@@ -148,9 +155,48 @@ std::vector<arm> make_arms() {
             }
         } });
 
+    arms.push_back({ "batched f16 KQ mul_mat", "dnnl_gemm_batch", 3e-2, false, GGML_TYPE_F16,
+        [](ggml_context * ctx) {
+            arm_graph g;
+            // k and q are stored as [D, H, T|1, B] and permuted to [D, T|1, H, B], as llama's KQ is
+            g.x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, KQ_D, KQ_H, 1, KQ_B);
+            g.w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, KQ_D, KQ_H, KQ_T, KQ_B);
+            ggml_set_input(g.x);
+            ggml_set_input(g.w);
+            g.out = ggml_mul_mat(ctx, ggml_permute(ctx, g.w, 0, 2, 1, 3), ggml_permute(ctx, g.x, 0, 2, 1, 3));
+            ggml_set_output(g.out);
+            return g;
+        },
+        [](std::vector<float> & q, std::vector<float> & k) {
+            q.resize((size_t) (KQ_D * KQ_H * KQ_B));
+            k.resize((size_t) (KQ_D * KQ_H * KQ_T * KQ_B));
+            for (size_t i = 0; i < q.size(); ++i) {
+                q[i] = 0.2f * input_value((int64_t) i, (int64_t) q.size());
+            }
+            for (size_t i = 0; i < k.size(); ++i) {
+                k[i] = 0.2f * input_value((int64_t) i, (int64_t) k.size());
+            }
+        },
+        [](const std::vector<float> & q, const std::vector<float> & k, std::vector<float> & ref) {
+            ref.assign((size_t) (KQ_T * KQ_H * KQ_B), 0.0f);
+            for (int64_t b = 0; b < KQ_B; ++b) {
+                for (int64_t h = 0; h < KQ_H; ++h) {
+                    for (int64_t tt = 0; tt < KQ_T; ++tt) {
+                        double s = 0.0;
+                        for (int64_t d = 0; d < KQ_D; ++d) {
+                            const double kv = ggml_fp16_to_fp32(ggml_fp32_to_fp16(k[(size_t) (d + KQ_D * (h + KQ_H * (tt + KQ_T * b)))]));
+                            const double qv = ggml_fp16_to_fp32(ggml_fp32_to_fp16(q[(size_t) (d + KQ_D * (h + KQ_H * b))]));
+                            s += kv * qv;
+                        }
+                        ref[(size_t) (tt + KQ_T * (h + KQ_H * b))] = (float) s;
+                    }
+                }
+            }
+        } });
+
     const auto eltwise = [&arms](const char * name, ggml_tensor * (*op)(ggml_context *, ggml_tensor *),
                                  double (*f)(double)) {
-        arms.push_back({ name, "dnnl_eltwise", 5e-4, false,
+        arms.push_back({ name, "dnnl_eltwise", 5e-4, false, GGML_TYPE_F32,
             [op](ggml_context * ctx) {
                 arm_graph g;
                 g.x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ELT_N);
@@ -223,7 +269,11 @@ run_result run_arm(ggml_backend_t backend, const arm & a, int inject, bool keep_
     std::vector<float> x, w;
     a.fill(x, w);
     ggml_backend_tensor_set(g.x, x.data(), 0, x.size() * sizeof(float));
-    if (g.w) {
+    if (g.w && a.w_type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> w16(w.size());
+        ggml_fp32_to_fp16_row(w.data(), w16.data(), (int64_t) w.size());
+        ggml_backend_tensor_set(g.w, w16.data(), 0, w16.size() * sizeof(ggml_fp16_t));
+    } else if (g.w) {
         ggml_backend_tensor_set(g.w, w.data(), 0, w.size() * sizeof(float));
     }
 
