@@ -313,7 +313,7 @@ def evaluate(backend, common, memo_hdr):
     # --- staging handle swap (review r6, r7) ----------------------------------------------------------------------
     stage_fn = function_body(common, r"void \* graph_input_stage\(const ggml_tensor \* owner,[^)]*\)\s*\{") or ""
     clear_fn = function_body(common, r"void graph_input_staging_clear\(sycl::queue & q\)\s*\{") or ""
-    swap_fn = function_body(backend, r"static void graph_staging_swap_retire\(ggml_backend_sycl_context \* ctx\)\s*\{") or ""
+    swap_fn = function_body(backend, r"static bool graph_staging_swap_retire\(ggml_backend_sycl_context \* ctx\)\s*\{") or ""
 
     def stmt_at(body, token):
         """Position of `token` where it STARTS a statement (after `;`, `{` or `}`), else -1: a token under an `if`
@@ -332,12 +332,21 @@ def evaluate(backend, common, memo_hdr):
     results["graph_input_stage publishes into the map only after its last failure return"] = \
         last_fail >= 0 and len(re.findall(r"graph_input_staging\[owner\]", stage_fn)) == 1 and \
         stage_fn.find("graph_input_staging[owner]") > last_fail
-    results["the displaced staging handle is retained until a barrier event, flagged, and the generation bumped"] = \
+    results["the displaced staging handle is retained until a marker event, flagged, and the generation bumped"] = \
         re.search(r"if\s*\(\s*slot\.handle\.valid\(\)\s*\)\s*\{\s*"
-                  r"ggml_sycl::retain_handles_until_event\(\s*\{\s*std::move\(slot\.handle\)\s*\}\s*,\s*q\.ext_oneapi_submit_barrier\(\)\s*\);\s*"
-                  r"graph_input_staging_swapped\s*=\s*true;\s*\}\s*"
+                  r"sycl::event\s+retire\s*=\s*ggml_sycl_submit_marker<graph_input_staging_retire_marker>\(q\);\s*"
+                  r"graph_input_staging_swapped\s*=\s*true;\s*"
+                  r"ggml_sycl::retain_handles_until_event\(\s*\{\s*std::move\(slot\.handle\)\s*\}\s*,\s*retire\s*\);\s*\}\s*"
                   r"slot\.handle\s*=\s*std::move\(handle\);\s*slot\.capacity\s*=\s*nbytes;\s*graph_input_staging_generation\+\+;",
                   stage_fn) is not None
+    # Review r8 M1/M2: the event is taken FIRST, before the slot is touched (an argument-evaluation order that moved the
+    # handle and then threw from the barrier would free the buffer with no event gate), and it comes from the
+    # documented marker helper, not a bare ext_oneapi_submit_barrier (the L0 barrier-event corruption it avoids).
+    results["the staging swap takes its event from the marker helper before it moves the handle, never a bare barrier"] = \
+        re.search(r"struct\s+graph_input_staging_retire_marker\s*\{\s*\}\s*;", common) is not None and \
+        "ext_oneapi_submit_barrier" not in stage_fn and \
+        stage_fn.find("ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q)") >= 0 and \
+        stage_fn.find("ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q)") < stage_fn.find("std::move(slot.handle)")
     # One fact, one source, and the only mutation sites: the swap itself publishes and retains; nothing else resets,
     # erases or releases an entry, and the swap waits on nothing (retention is by event, not by host wait).
     results["the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing"] = \
@@ -358,8 +367,9 @@ def evaluate(backend, common, memo_hdr):
                   r"graph_input_stage\([^;]*;\s*if\s*\(\s*!dev_ptr\s*\)\s*\{[^{}]*\}\s*staged_count\+\+;\s*mark_staged\(tensor\);\s*"
                   r"GGML_SYCL_DEBUG\([^;]*;\s*return;\s*\}", prestage) is not None
     results["the gateway consumes the swapped flag and retires the recorders, with no second pass"] = \
-        re.search(r"bool staged = graph_prestage_leaf_tensors\(ctx, cgraph\);\s*if\s*\(ctx->graph_input_staging_swapped\)\s*\{\s*"
-                  r"graph_staging_swap_retire\(ctx\);\s*\}\s*if\s*\(staged\)\s*\{", decline) is not None and \
+        re.search(r"const bool staged = graph_prestage_leaf_tensors\(ctx, cgraph\);\s*bool retired = true;\s*"
+                  r"if\s*\(ctx->graph_input_staging_swapped\)\s*\{\s*retired = graph_staging_swap_retire\(ctx\);\s*\}\s*"
+                  r"if\s*\(staged && retired\)\s*\{", decline) is not None and \
         len(re.findall(r"graph_prestage_leaf_tensors\(", decline)) == 1
     # I1 (r7): the gateway and the swap retire run INSIDE a graph_compute that has already pinned weights and experts,
     # so they must not call the whole clear_active (it unpins leases, clears the CPU staging cache and the MoE layout
@@ -378,6 +388,49 @@ def evaluate(backend, common, memo_hdr):
     at = [stmt_at(swap_fn, t) for t in order] + [exec_block.start() if exec_block else -1]
     results["the swap retire clears the flag, drops dense, retires every MoE epoch, then resets a live exec graph"] = \
         bool(swap_fn) and all(x >= 0 for x in at) and at == sorted(at)
+    # Review r8 M3: statement ORDER is not enough (a brace-wrapped dead call, a host wait, a stray release or a stray
+    # signature-cache reset all keep every anchored statement in order). The retire is pinned as its exact token
+    # sequence, so nothing may be added, wrapped, reordered or dropped; the only conditional is the live exec block.
+    swap_expected = " ".join([
+        "{ ctx->graph_input_staging_swapped = false;",
+        'if (ggml_sycl_graph_diag_enabled()) { GGML_LOG_WARN("[GRAPH-DIAG] staging swap at graph compute %llu\\n", '
+        "(unsigned long long) ctx->graph_compute_seq); }",
+        "ggml_sycl_block_exec_dense_drop_graphs(ctx);",
+        "const bool segments_retired = ctx->invalidate_moe_segments();",
+        "const bool block_graphs_retired = ctx->invalidate_moe_block_graphs();",
+        "const bool direct_dispatch_retired = ctx->invalidate_moe_direct_dispatch_graphs();",
+        "const bool sequence_graphs_retired = ctx->invalidate_moe_sequence_graphs();",
+        'if (ctx->exec_graph) { ggml_sycl_trace_queue_wait(ctx->stream(), "staging-swapped", ctx->device, -1, nullptr); '
+        "ctx->exec_graph.reset(); sycl_exec_graph_release_pool_retained(ctx); ctx->active_exec_graph.valid = false; "
+        "ctx->exec_graph_n_nodes = 0; ctx->exec_graph_hash = 0; }",
+        "return segments_retired && block_graphs_retired && direct_dispatch_retired && sequence_graphs_retired; }",
+    ])
+    results["the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction"] = \
+        bool(swap_fn) and re.sub(r"\s+", " ", swap_fn).strip() == swap_expected
+    # Review r8 M4: a failed retire must fail the gateway closed. Each invalidator reports whether it retired (a
+    # failure leaves the recorded graphs valid, and sets only its own disabled flag), the retire ANDs all four without
+    # short-circuiting, and the callers that match a recorded graph after the gateway also honor the disabled flag.
+    invalidators = {"invalidate_moe_segments": "moe_graphs_disabled", "invalidate_moe_direct_dispatch_graphs": "moe_direct_dispatch_graphs_disabled",
+                    "invalidate_moe_block_graphs": "moe_block_graphs_disabled", "invalidate_moe_sequence_graphs": "moe_sequence_graphs_disabled"}
+    inv_ok = True
+    for name, flag in invalidators.items():
+        body = function_body(common, r"\bbool\s+" + name + r"\(\)\s*\{") or ""
+        inv_ok = inv_ok and bool(re.match(r"\{\s*if\s*\(!ggml_sycl_retire_moe_graph_epoch\(this\)\)\s*\{\s*" +
+                                          flag + r"\s*=\s*true;\s*return false;\s*\}", body)) and \
+            re.search(r"return true;\s*\}\s*$", body) is not None
+    results["each MoE invalidator reports whether it retired the epoch (false on failure)"] = inv_ok
+    results["the gateway declines when the staging swap could not retire every recorder"] = \
+        re.search(r"if\s*\(staged && retired\)\s*\{\s*ctx->prestage_decline_memo\.forget\(graph_hash\);\s*return true;\s*\}\s*"
+                  r"ctx->prestage_decline_memo\.remember\(graph_hash, ctx->graph_compute_seq\);", decline) is not None
+    results["site 3 runs direct when MoE graphs were disabled by a failed retire"] = \
+        re.search(r"else if\s*\(!sycl_ctx->moe_segments_valid \|\| sycl_ctx->moe_graphs_disabled\)\s*\{\s*compute_impl_unlocked\(\);", compute) is not None
+    results["the block graphlet site rejects when the gateway left MoE graphs disabled"] = \
+        re.search(r"if\s*\(!" + (r"graph_prestage_or_decline\(" ) + r"sycl_ctx,\s*cgraph,\s*graph_hash\)\)\s*\{[^{}]*\}\s*"
+                  r"if\s*\(sycl_ctx->moe_graphs_disabled \|\| sycl_ctx->moe_block_graphs_disabled\)\s*\{[^{}]*return false;\s*\}", graphlets) is not None
+    results["the INPUT arm stages on the backend's own queue"] = \
+        re.search(r"if\s*\(graph_tensor_is_input\(tensor\)\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{\s*"
+                  r"sycl::queue\s*&\s*q\s*=\s*\*ctx->stream\(\);\s*void \* dev_ptr\s*=\s*ctx->graph_input_stage\(tensor, tensor->data, nbytes, q\);",
+                  prestage) is not None
     dense_drop = function_body(backend, r"static void ggml_sycl_block_exec_dense_drop_graphs\(ggml_backend_sycl_context \* ctx\)\s*\{") or ""
     results["the dense drop helper drops a state that exists and does not create one"] = \
         "drop_graphs(*ctx)" in dense_drop and "find(ctx)" in dense_drop and "state_for(" not in dense_drop
@@ -452,7 +505,7 @@ if args.self_test:
     # the first full-graph recording site (the debug line just above it is the anchor)
     full_sig = r"Pre-staging leaf tensors before recording[^;]*;"
     stage_sig = r"void \* graph_input_stage\(const ggml_tensor \* owner,[^)]*\)\s*\{"
-    swap_sig = r"static void graph_staging_swap_retire\(ggml_backend_sycl_context \* ctx\)\s*\{"
+    swap_sig = r"static bool graph_staging_swap_retire\(ggml_backend_sycl_context \* ctx\)\s*\{"
     dense_drop_sig = r"static void ggml_sycl_block_exec_dense_drop_graphs\(ggml_backend_sycl_context \* ctx\)\s*\{"
     clear_sig = r"static void sycl_exec_graph_clear_active\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{"
     drop_sig = r"void ggml_sycl_block_exec_dense_state::drop_graphs\(ggml_backend_sycl_context & ctx\)\s*\{"
@@ -472,6 +525,60 @@ if args.self_test:
 
     mem_ = memo_hdr
     mutants = [
+        # review r8
+        ("the handle is moved before the event is taken", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
+         (backend, mutate_in_func(common, stage_sig,
+                                  "sycl::event retire = ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q);\n"
+                                  "            graph_input_staging_swapped = true;\n"
+                                  "            ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, retire);",
+                                  "graph_input_staging_swapped = true;\n"
+                                  "            ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q));"), mem_)),
+        ("the swap uses a bare barrier", "the staging swap takes its event from the marker helper before it moves the handle, never a bare barrier",
+         (backend, mutate_in_func(common, stage_sig, "ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q)", "q.ext_oneapi_submit_barrier()"), mem_)),
+        ("the swap flags after it retains", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
+         (backend, mutate_in_func(common, stage_sig,
+                                  "graph_input_staging_swapped = true;\n"
+                                  "            ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, retire);",
+                                  "ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, retire);\n"
+                                  "            graph_input_staging_swapped = true;"), mem_)),
+        ("the dense drop hides in a dead brace", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
+         (mutate_in_func(backend, swap_sig, "ggml_sycl_block_exec_dense_drop_graphs(ctx);",
+                         "if (false) { ggml_sycl_block_exec_dense_drop_graphs(ctx); }"), common, mem_)),
+        ("the sequence retire hides in a conditional brace", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
+         (mutate_in_func(backend, swap_sig, "ctx->invalidate_moe_sequence_graphs();",
+                         "false; if (ctx->exec_graph) { ctx->invalidate_moe_sequence_graphs(); }"), common, mem_)),
+        ("the swap retire waits on the host", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
+         (mutate_in_func(backend, swap_sig, "ggml_sycl_block_exec_dense_drop_graphs(ctx);",
+                         "ggml_sycl_block_exec_dense_drop_graphs(ctx);\n    ctx->stream()->wait_and_throw();"), common, mem_)),
+        ("the swap retire drains unconditionally", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
+         (mutate_in_func(backend, swap_sig, "if (ctx->exec_graph) {",
+                         "ggml_sycl_trace_queue_wait(ctx->stream(), \"staging-swapped\", ctx->device, -1, nullptr);\n    if (ctx->exec_graph) {"), common, mem_)),
+        ("the swap retire releases the pool unconditionally", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
+         (mutate_in_func(backend, swap_sig, "if (ctx->exec_graph) {", "sycl_exec_graph_release_pool_retained(ctx);\n    if (ctx->exec_graph) {"), common, mem_)),
+        ("the swap retire resets the signature cache", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
+         (mutate_in_func(backend, swap_sig, "if (ctx->exec_graph) {", "ctx->cached_graph_sig_n_nodes = -1;\n    if (ctx->exec_graph) {"), common, mem_)),
+        ("the swap retire short-circuits its retires", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
+         (mutate_in_func(backend, swap_sig, "const bool block_graphs_retired = ctx->invalidate_moe_block_graphs();",
+                         "const bool block_graphs_retired = segments_retired && ctx->invalidate_moe_block_graphs();"), common, mem_)),
+        ("the swap retire returns true unconditionally", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
+         (mutate_in_func(backend, swap_sig, "return segments_retired", "return true || segments_retired"), common, mem_)),
+        ("the INPUT arm stages on another queue", "the INPUT arm stages on the backend's own queue",
+         (mutate_re(backend, pre_sig, r"sycl::queue & q\s*= \*ctx->stream\(\);", "sycl::queue & q = *ctx->stream(ctx->device, 1);"), common, mem_)),
+        ("the gateway ignores a failed retire", "the gateway declines when the staging swap could not retire every recorder",
+         (mutate_in_func(backend, dec_sig, "if (staged && retired) {", "if (staged) {"), common, mem_)),
+        ("the gateway drops the retire result", "the gateway consumes the swapped flag and retires the recorders, with no second pass",
+         (mutate_in_func(backend, dec_sig, "retired = graph_staging_swap_retire(ctx);", "graph_staging_swap_retire(ctx);"), common, mem_)),
+        ("an invalidator stops reporting failure", "each MoE invalidator reports whether it retired the epoch (false on failure)",
+         (backend, mutate_in_func(common, r"bool invalidate_moe_segments\(\)\s*\{", "return false;\n        }", "return true;\n        }"), mem_)),
+        ("an invalidator stops reporting success", "each MoE invalidator reports whether it retired the epoch (false on failure)",
+         (backend, mutate_in_func(common, r"bool invalidate_moe_sequence_graphs\(\)\s*\{", "return true;\n    }", "return false;\n    }"), mem_)),
+        ("site 3 ignores the disabled flag", "site 3 runs direct when MoE graphs were disabled by a failed retire",
+         (mutate_in_func(backend, cmp_sig, "else if (!sycl_ctx->moe_segments_valid || sycl_ctx->moe_graphs_disabled) {",
+                         "else if (!sycl_ctx->moe_segments_valid) {"), common, mem_)),
+        ("the graphlet site ignores a disabled flag after the gateway", "the block graphlet site rejects when the gateway left MoE graphs disabled",
+         (mutate_re(backend, r"static bool moe_graph_try_block_graphlets\([^)]*\)\s*\{",
+                    r"if \(sycl_ctx->moe_graphs_disabled \|\| sycl_ctx->moe_block_graphs_disabled\) \{\s*ggml_sycl_moe_aggregation_diag\([^;]*;\s*return false;\s*\}\s*graph_refresh_input_tensors",
+                    "graph_refresh_input_tensors"), common, mem_)),
         ("dense post-gateway resize forgets the cached-input reset", "the dense recorder re-sizes its range graphs after the gateway may have retired them",
          (mutate_in_func(backend, r"graph_prestage_decline_memo::dense_split_key\(key\)\)\)\s*\{[^}]*\}\s*if \(st\.graphs\.size\(\) != ranges_\.size\(\)\) \{",
                          "ctx_.input_tensors_cached = false;", "(void) 0;"), common, mem_)),
@@ -615,18 +722,18 @@ if args.self_test:
         ("dense does not re-size after the gateway", "the dense recorder re-sizes its range graphs after the gateway may have retired them",
          (mutate(backend, "if (st.graphs.size() != ranges_.size()) {", "if (false) {"), common, mem_)),
         # staging swap (review r6, r7)
-        ("the displaced handle is freed at the swap", "the displaced staging handle is retained until a barrier event, flagged, and the generation bumped",
-         (backend, mutate_in_func(common, stage_sig, "ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, q.ext_oneapi_submit_barrier());",
+        ("the displaced handle is freed at the swap", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
+         (backend, mutate_in_func(common, stage_sig, "ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, retire);",
                                   "slot.handle = ggml_sycl::mem_handle{};"), mem_)),
-        ("the displaced handle is retained on an empty event", "the displaced staging handle is retained until a barrier event, flagged, and the generation bumped",
-         (backend, mutate_in_func(common, stage_sig, "q.ext_oneapi_submit_barrier()", "sycl::event{}"), mem_)),
-        ("the swap is not flagged", "the displaced staging handle is retained until a barrier event, flagged, and the generation bumped",
+        ("the displaced handle is retained on an empty event", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
+         (backend, mutate_in_func(common, stage_sig, "ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q)", "sycl::event{}"), mem_)),
+        ("the swap is not flagged", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
          (backend, mutate_in_func(common, stage_sig, "graph_input_staging_swapped = true;", "(void) slot;"), mem_)),
-        ("the swap is flagged for a new entry too", "the displaced staging handle is retained until a barrier event, flagged, and the generation bumped",
+        ("the swap is flagged for a new entry too", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
          (backend, mutate_in_func(common, stage_sig, "if (slot.handle.valid()) {", "if (true) {"), mem_)),
         ("the swap flags a first publication", "the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing",
          (backend, mutate_in_func(common, stage_sig, "slot.capacity = nbytes;", "slot.capacity = nbytes;\n        graph_input_staging_swapped = true;"), mem_)),
-        ("the generation is not bumped at the swap", "the displaced staging handle is retained until a barrier event, flagged, and the generation bumped",
+        ("the generation is not bumped at the swap", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
          (backend, mutate_in_func(common, stage_sig, "slot.capacity = nbytes;\n        graph_input_staging_generation++;", "slot.capacity = nbytes;"), mem_)),
         ("the swap waits on the host", "the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing",
          (backend, mutate_in_func(common, stage_sig, "slot.capacity = nbytes;", "slot.capacity = nbytes;\n        q.wait();"), mem_)),
