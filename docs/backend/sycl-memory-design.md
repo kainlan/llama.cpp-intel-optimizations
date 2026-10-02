@@ -2615,8 +2615,7 @@ reserve.
 
 *The settle releases first, too.* The settle's republish of the winner runs after `release_rung_buffers()`, the same
 lambda every rung's transaction runs after, so its F3 judges the card the realized check judged (the winner's own
-buffers, not a loser's still alive). The per-rung record list is bounded (`kMaxHoldRungRecords`); a rung beyond the cap
-is counted (`unified_cache_hold_rung_records_dropped`) and logged once, never silently truncated.
+buffers, not a loser's still alive). The per-rung record list is bounded (`kHoldRungRecordLimit`, a header constant the fit's buffer is `static_assert`ed against); a call that would record a rung beyond it is counted (`unified_cache_hold_rung_record_refusals`, a call count that only the host test reads) and the first one is logged, after the state mutex is released, never silently truncated.
 
 *A rung does not pay for the buffers of the rung before it.* `try_candidate` releases the previous rung's compute
 buffers (the scheduler, the reserve graph) before this rung's transaction. A rung that placed its buffers in the KV

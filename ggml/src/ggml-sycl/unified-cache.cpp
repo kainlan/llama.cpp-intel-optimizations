@@ -732,9 +732,6 @@ static std::atomic<uint32_t> g_planned_dense_scratch_n_ubatch[GGML_SYCL_MAX_DEVI
 // (what the worst-case outside-arena bound adds to the hold). A set / release / take interleave across threads
 // cannot tear the (bytes, owner) pair, and one context's take cannot reset another context's count. The mutex is a
 // leaf: nothing is called while holding it.
-// The most per-rung compute-request records the hold keeps for one owner (a ladder plus a descent is a handful).
-static constexpr size_t kMaxHoldRungRecords = 32;
-
 struct planned_scratch_hold_state {
     std::mutex mutex;
     size_t     hold                 = 0;
@@ -771,8 +768,10 @@ struct planned_scratch_hold_state {
     // fit of a window takes it, each later one can only raise it (zone_hold_cold_update), and a publish forgets it.
     uint64_t                            baseline_owner       = 0;
     size_t                              baseline_cold        = 0;
-    // Records the cap refused (a rung beyond kMaxHoldRungRecords), so a truncation is never silent.
-    size_t                              rung_records_dropped = 0;
+    // Calls to note_runtime_request the cap refused (a new rung beyond kHoldRungRecordLimit; a call, not a rung: one
+    // refused rung asked again counts again), so a truncation is never silent. Only the host test reads it; the
+    // production signal is the one-time WARN.
+    size_t                              rung_record_refusals = 0;
 };
 
 static planned_scratch_hold_state g_planned_scratch_hold_state[GGML_SYCL_MAX_DEVICES];
@@ -1947,7 +1946,7 @@ void unified_cache_set_planned_scratch_hold(int device_id, size_t bytes, uint64_
         state.epoch_kv_room        = 0;
         state.baseline_owner       = 0;
         state.baseline_cold        = 0;
-        state.rung_records_dropped = 0;
+        state.rung_record_refusals = 0;
     }
     state.hold  = bytes;
     state.owner = owner;
@@ -1999,7 +1998,7 @@ bool unified_cache_release_planned_scratch_hold(int device_id, uint64_t owner) {
     state.epoch_kv_room        = 0;
     state.baseline_owner  = 0;
     state.baseline_cold   = 0;
-    state.rung_records_dropped = 0;
+    state.rung_record_refusals = 0;
     // The spill counters are not touched here: the owner's teardown take (log_planned_scratch_stats)
     // runs BEFORE this release, already reported them, and cleared them with its latches.
     return true;
@@ -2010,37 +2009,46 @@ size_t unified_cache_note_runtime_request(int device_id, size_t bytes, bool reco
         return 0;
     }
     planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
-    std::lock_guard<std::mutex>  lock(state.mutex);
-    // Only a rung's own scheduler compute requests (from the first publish on) are recorded, under the n_ubatch of
-    // the epoch they were made in; a larger request replaces that rung's mark, nothing replaces another rung's.
-    if (record && state.epoch_n_ubatch != 0) {
-        bool found = false;
-        for (zone_hold_rung_request & r : state.rung_requests) {
-            if (r.n_ubatch == state.epoch_n_ubatch) {
-                r.bytes = std::max(r.bytes, bytes);
-                found   = true;
-                break;
-            }
-        }
-        if (!found) {
-            if (state.rung_requests.size() >= kMaxHoldRungRecords) {
-                // A ladder plus a descent is a handful of rungs, never this many; a refused record is counted and
-                // said once, never a silent truncation of the set a verdict is judged from.
-                if (state.rung_records_dropped++ == 0) {
-                    GGML_LOG_WARN(
-                        "[SCRATCH] device %d: more than %zu distinct n_ubatch rungs recorded compute-buffer requests; "
-                        "further rungs are not recorded and are judged from the records kept (scaled)\n",
-                        device_id, kMaxHoldRungRecords);
+    size_t                       hold         = 0;
+    // The state mutex is a leaf (nothing is called under it, the logger included): the one-time WARN is decided under
+    // the lock and said after it is released.
+    bool                         warn_refused = false;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        // Only a rung's own scheduler compute requests (from the first publish on) are recorded, under the n_ubatch
+        // of the epoch they were made in; a larger request replaces that rung's mark, nothing replaces another's.
+        if (record && state.epoch_n_ubatch != 0) {
+            bool found = false;
+            for (zone_hold_rung_request & r : state.rung_requests) {
+                if (r.n_ubatch == state.epoch_n_ubatch) {
+                    r.bytes = std::max(r.bytes, bytes);
+                    found   = true;
+                    break;
                 }
-            } else {
-                zone_hold_rung_request r;
-                r.n_ubatch = state.epoch_n_ubatch;
-                r.bytes    = bytes;
-                state.rung_requests.push_back(r);
+            }
+            if (!found) {
+                if (state.rung_requests.size() >= kHoldRungRecordLimit) {
+                    // A ladder plus a descent is a handful of rungs, never this many; a refused record is counted and
+                    // said once, never a silent truncation of the set a verdict is judged from.
+                    warn_refused = state.rung_record_refusals++ == 0;
+                } else {
+                    zone_hold_rung_request r;
+                    r.n_ubatch = state.epoch_n_ubatch;
+                    r.bytes    = bytes;
+                    state.rung_requests.push_back(r);
+                }
             }
         }
+        hold = state.hold;
     }
-    return state.hold;
+    if (warn_refused) {
+        GGML_LOG_WARN(
+            "[SCRATCH] device %d: more than %zu distinct n_ubatch rungs recorded compute-buffer requests; further "
+            "rungs "
+            "are not recorded and are judged from the records kept (scaled)\n",
+            device_id, kHoldRungRecordLimit);
+    }
+    return hold;
 }
 
 size_t unified_cache_get_hold_rung_requests(int device_id, uint64_t owner, zone_hold_rung_request * out, size_t cap) {
@@ -2073,7 +2081,11 @@ size_t unified_cache_hold_free_before(int device_id, uint64_t owner, size_t driv
     // MAXIMUM reading taken, and a publish opens a new one (zone_hold_cold_update). Everything the registry does not
     // hold is invisible to it, and each such consumer errs the same way for the check: another tenant arriving
     // mid-window, the driver's own allocations (graph, JIT, oneDNN) are not subtracted, so the check ADMITS what
-    // the card may no longer have; a stale-low first reading REFUSES until a later one repairs it. The cache's own
+    // the card may no longer have; a stale-low first reading REFUSES until a later one repairs it. A window has no
+    // time bound: in a long-lived server it runs from the owner's last publish to its next, and the maximum only ever
+    // rises, so a tenant that arrived and is still there is read as free memory (it errs toward ADMITTING too). No
+    // cheap bound exists, because the baseline cannot tell a driver credit that is merely late from a new tenant. The
+    // cache's own
     // raw allocations are all in the registry, the cache-entry mallocs ("unified_cache:alloc", through
     // unified_cache_adopt_raw_device_allocation) included.
     const size_t                 cand = zone_hold_free_cold(driver_free_now, raw_held);
@@ -2210,17 +2222,13 @@ void unified_cache_refresh_hold_epoch_kv_room(int device_id, uint64_t owner, siz
     state.epoch_kv_room = kv_room;
 }
 
-size_t unified_cache_hold_rung_record_limit() {
-    return kMaxHoldRungRecords;
-}
-
-size_t unified_cache_hold_rung_records_dropped(int device_id, uint64_t owner) {
+size_t unified_cache_hold_rung_record_refusals(int device_id, uint64_t owner) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
         return 0;
     }
     planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
     std::lock_guard<std::mutex>  lock(state.mutex);
-    return state.owner == owner ? state.rung_records_dropped : 0;
+    return state.owner == owner ? state.rung_record_refusals : 0;
 }
 
 void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out) {
@@ -17362,26 +17370,6 @@ static size_t process_pending_legacy_promotion_cleanup(int device) noexcept {
     return released;
 }
 
-size_t unified_cache_raw_device_live_bytes(int device_id) {
-    size_t total = 0;
-    try {
-        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        for (const auto & item : g_runtime_alloc_registry) {
-            const runtime_alloc_record & row = item.second;
-            const alloc_metadata &       h   = row.handle;
-            // Raw device memory the cache holds: a LIVE registry row on this device's VRAM tier that is not a
-            // sub-allocation of an arena zone. A RELEASING row is already on its way out and is not live.
-            if (row.state != runtime_alloc_state::LIVE || h.device != device_id || h.tier != alloc_tier::DEVICE_VRAM ||
-                h.zone_managed || row.from_arena) {
-                continue;
-            }
-            total = h.size > SIZE_MAX - total ? SIZE_MAX : total + h.size;
-        }
-    } catch (...) {
-    }
-    return total;
-}
-
 size_t unified_cache_raw_device_held_bytes(int device_id, size_t * compute_live) {
     size_t held = 0;
     size_t comp = 0;
@@ -17390,8 +17378,9 @@ size_t unified_cache_raw_device_held_bytes(int device_id, size_t * compute_live)
         for (const auto & item : g_runtime_alloc_registry) {
             const runtime_alloc_record & row = item.second;
             const alloc_metadata &       h   = row.handle;
-            // The same rows as unified_cache_raw_device_live_bytes, but a RELEASING row is still held (its physical
-            // free has not happened), so it is counted: a free the driver has not credited is not free memory.
+            // Raw device memory the cache holds: a registry row on this device's VRAM tier that is not a sub-allocation
+            // of an arena zone. A RELEASING row is still held (its physical free has not happened), so it is counted: a
+            // free the driver has not credited is not free memory.
             if (h.device != device_id || h.tier != alloc_tier::DEVICE_VRAM || h.zone_managed || row.from_arena) {
                 continue;
             }

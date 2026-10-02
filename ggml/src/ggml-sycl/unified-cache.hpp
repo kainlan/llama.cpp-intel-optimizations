@@ -1709,11 +1709,11 @@ bool     unified_cache_release_planned_scratch_hold(int device_id, uint64_t owne
 // (a SCHEDULER COMPUTE request, spill-capable: never a state-class buffer such as the recurrent state, which goes
 // through the same buffer type) and returns the hold the caller decides with.
 size_t       unified_cache_note_runtime_request(int device_id, size_t bytes, bool record);
+// The most per-rung compute-request records the hold keeps for one owner (a ladder plus a descent is a handful). A
+// constant of the header so a caller that sizes a buffer for them can static_assert against it.
+constexpr size_t kHoldRungRecordLimit = 32;
 // The owner's per-rung records, at most `cap` of them; returns how many were written.
 size_t unified_cache_get_hold_rung_requests(int device_id, uint64_t owner, zone_hold_rung_request * out, size_t cap);
-// The cache's ledger of outside-arena bytes: what the cache holds LIVE in raw device memory (not in an arena zone) on
-// the device, from the allocation registry. Synchronous with a release (the driver's credit for a freed buffer is not).
-size_t unified_cache_raw_device_live_bytes(int device_id);
 // The same ledger as the hold-fit sees it: every raw device row held on the device, a row still RELEASING included
 // (its physical free has not happened, so it is not free memory), and in `*compute_live` the LIVE ones that are
 // scheduler compute buffers (rows made by a request flagged as one, by origin: the rung's own bytes, which the
@@ -1737,9 +1737,9 @@ bool   unified_cache_get_hold_epoch(int device_id, uint64_t owner, uint32_t * n_
 // the recurrent state) exists, so the room its epoch began with predates both; the context re-reads it once they exist
 // and before the compute buffers are reserved. A no-op for another owner or before the first publish.
 void         unified_cache_refresh_hold_epoch_kv_room(int device_id, uint64_t owner, size_t kv_room);
-// The cap on the per-rung request records of one owner, and how many records it refused (a truncation is never silent).
-size_t       unified_cache_hold_rung_record_limit();
-size_t       unified_cache_hold_rung_records_dropped(int device_id, uint64_t owner);
+// How many calls of unified_cache_note_runtime_request the per-rung record cap (kHoldRungRecordLimit) refused for this
+// owner: a call count, not a rung count, read by the host test only (production reports the first refusal as a WARN).
+size_t       unified_cache_hold_rung_record_refusals(int device_id, uint64_t owner);
 // A spill-capable RUNTIME request that the hold kept out of the zone, counted per device by where the buffer landed:
 // `in_arena` is a placement in the arena's KV zone (the compute-buffer path tries it first), otherwise raw device
 // memory outside the arena, which is what eats the driver headroom. The first one of each kind since the last take

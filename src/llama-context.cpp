@@ -415,11 +415,6 @@ static decltype(&ggml_backend_sycl_ubatch_cache_store_layout1) llama_context_syc
 #endif
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-// llama.cpp-kpjw: the realized hold-spill check over every SYCL backend of a context, for a reserve that ran at
-// `n_ubatch` (see ggml_backend_sycl_planned_hold_spill_fits in ggml-sycl.h). False when ANY backend's compute buffers
-// the planned dense scratch kept out of the RUNTIME zone spilled outside the arena and left its card under the driver
-// headroom; `*largest_ub` is then the smallest -ub the refusing backends say still fits (0: none known to). A SYCL
-// DSO that predates the entry exports nothing and is skipped, never dereferenced.
 // llama.cpp-kpjw (r7 I3): a pinned -ub publishes its plan ONCE, before the memory module (the KV cache, the recurrent
 // state) exists, so the KV room its hold epoch began with predates both. This re-reads it once they exist, before the
 // compute buffers are reserved, so the context-init check judges with the room the rung actually had. (What the rung
@@ -442,6 +437,11 @@ static void llama_context_sycl_hold_epoch_refresh(const std::vector<ggml_backend
     }
 }
 
+// llama.cpp-kpjw: the realized hold-spill check over every SYCL backend of a context, for a reserve that ran at
+// `n_ubatch` (see ggml_backend_sycl_planned_hold_spill_fits in ggml-sycl.h). False when ANY backend's compute buffers
+// the planned dense scratch kept out of the RUNTIME zone spilled outside the arena and left its card under the driver
+// headroom; `*largest_ub` is then the smallest -ub the refusing backends say still fits (0: none known to). A SYCL
+// DSO that predates the entry exports nothing and is skipped, never dereferenced.
 static bool llama_context_sycl_hold_spill_fits(const std::vector<ggml_backend_ptr> & backends,
                                                uint32_t                              n_ubatch,
                                                uint32_t *                            largest_ub) {
