@@ -1079,7 +1079,7 @@ static int test_sequence_graphlet_segmented_replay_uses_sequence_graphlets() {
     const std::string sycl = read_required_file("ggml/src/ggml-sycl/ggml-sycl.cpp");
 
     const std::string replay_segments = required_region(sycl, "static void moe_graph_replay_segments",
-                                                        "static void graph_prestage_leaf_tensors",
+                                                        "graph_prestage_leaf_tensors(ggml_backend_sycl_context",
                                                         "segmented replay sequence graphlet bridge");
     CHECK(contains(replay_segments, "try_sequence_graphlet_for_segmented_moe"),
           "segmented replay must try sequence graphlets for MoE dispatch gaps");
@@ -1976,7 +1976,7 @@ static int test_default_ready_block_graphlet_safety_contract() {
     CHECK(!contains(before_profile_matrix, "GGML_SYCL_MOE_AGGREGATION_DECISION"),
           "promotion-suite/default-candidate harness must not set the aggregation override outside profile-matrix comparisons");
     const size_t decision_pos = try_fn.find("moe_aggregation_selected_decision");
-    const size_t prestage_pos = try_fn.find("graph_prestage_leaf_tensors");
+    const size_t prestage_pos = try_fn.find("graph_prestage_or_decline(");
     CHECK(decision_pos != std::string::npos && prestage_pos != std::string::npos && decision_pos < prestage_pos,
           "decision-none gate must run before graph prestage/recording can mutate runtime state");
     CHECK(contains(descriptor_capture, "moe_aggregation_decision_allows_block_graphlets"),
