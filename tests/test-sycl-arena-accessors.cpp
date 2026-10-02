@@ -30,6 +30,7 @@
 //   ./build/bin/test-sycl-arena-accessors strict-to-commit-child
 
 #include "ggml.h"
+#include "sycl-selector-fallback.hpp"
 #include "unified-cache.hpp"
 
 #include <atomic>
@@ -289,8 +290,10 @@ void test_none_process(const char * self) {
 
 int main(int argc, char ** argv) {
     // A bare run must not reach a GPU: no code here enumerates one, and the
-    // selector keeps the backend from doing it on this process's behalf.
-    setenv("ONEAPI_DEVICE_SELECTOR", "opencl:cpu", 0);
+    // selector keeps the backend from doing it on this process's behalf. A plain
+    // setenv() here is too late (oneCCL makes libsycl memoize the selector before
+    // main()), so this re-execs; under ctest the registration already sets it.
+    sycl_test_selector_fallback(argv, "opencl:cpu");
     sycl::queue q{ sycl::cpu_selector_v };
 
     const char * mode = argc > 1 ? argv[1] : "";
