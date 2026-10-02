@@ -167,9 +167,79 @@ def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None, missing_al
 # --- positive controls --------------------------------------------------------------------------------------------
 
 FOOTER = '\nif __name__ == "__main__":\n    import sys\n\n    import pytest\n\n    sys.exit(pytest.main([__file__, "-q"]))\n'
-OWN_MAIN = '\nif __name__ == "__main__":\n    test_x()\n'
 SCRIPT_GATE = "print('ok')\n"
 PYTEST_GATE = "def test_x():\n    assert True\n"
+OWN_MAIN = (
+    '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n'
+    "    for name, fn in list(globals().items()):\n"
+    '        if name.startswith("test_") and callable(fn):\n'
+    "            try:\n                fn()\n            except AssertionError:\n                failures += 1\n"
+    "    sys.exit(1 if failures else 0)\n"
+)
+HAND_LISTED = '\nif __name__ == "__main__":\n    test_x()\n    print("ok")\n'
+UNITTEST_GATE = "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.assertTrue(True)\n"
+UNITTEST_MAIN = '\n\nif __name__ == "__main__":\n    unittest.main()\n'
+REG_P_PYTEST = "llama_test_pytest(${Python3_EXECUTABLE} SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-p.py)\n"
+REG_P_ADD = "add_test(NAME p COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-p.py)\n"
+# (label, text of test-sycl-p.py, registration, expected problem or None). Each is one way a gate could look runnable
+# without being so, or a way a runnable one could be wrongly refused.
+R3_CASES = [
+    ("r3-main-in-comment", "# never run as __main__\n" + PYTEST_GATE, REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-main-in-docstring", '"""never run as __main__"""\n' + PYTEST_GATE, REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-guard-pass", PYTEST_GATE + '\nif __name__ == "__main__":\n    pass\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-guard-print-only", PYTEST_GATE + '\nif __name__ == "__main__":\n    print("ok")\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-hand-listed-calls", PYTEST_GATE + HAND_LISTED, REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-pytest-main-status-dropped", PYTEST_GATE + FOOTER.replace('sys.exit(pytest.main([__file__, "-q"]))', 'pytest.main([__file__, "-q"])'),
+     REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-pytest-main-k-nomatch", PYTEST_GATE + FOOTER.replace('"-q"', '"-q", "-k", "nomatch"'), REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-pytest-main-without-file", PYTEST_GATE + FOOTER.replace("[__file__, \"-q\"]", '["-q"]'), REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-guard-inside-string",
+     PYTEST_GATE + 'x = """\nif __name__ == "__main__":\n    sys.exit(pytest.main([__file__, "-q"]))\n"""\n',
+     REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-guard-inside-function",
+     PYTEST_GATE + '\n\ndef f():\n    if __name__ == "__main__":\n        sys.exit(pytest.main([__file__, "-q"]))\n',
+     REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-unittest-main-runs-no-module-level-test", PYTEST_GATE + UNITTEST_MAIN, REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-ok-footer", PYTEST_GATE + FOOTER, REG_P_PYTEST, None),
+    ("r3-ok-footer-trailing-comment", PYTEST_GATE + FOOTER + "# end\n", REG_P_PYTEST, None),
+    ("r3-ok-single-quoted-guard", PYTEST_GATE + FOOTER.replace('"__main__"', "'__main__'"), REG_P_PYTEST, None),
+    ("r3-ok-raise-systemexit", PYTEST_GATE + FOOTER.replace("sys.exit(", "raise SystemExit("), REG_P_PYTEST, None),
+    ("r3-ok-globals-loop", PYTEST_GATE + OWN_MAIN, REG_P_PYTEST, None),
+]
+# Shapes pytest or unittest collect that a `^def test_` match misses: all must count as pytest-style, so registering
+# one with plain python3 (which collects nothing) is reported.
+CLASSIFIER_CASES = [
+    ("cls-test-class", "class TestX:\n    def test_x(self):\n        assert True\n", REG_P_ADD, "R2 test-sycl-p.py"),
+    ("cls-unittest-subclass", UNITTEST_GATE, REG_P_ADD, "R2 test-sycl-p.py"),
+    ("cls-def-test", "def test():\n    assert True\n", REG_P_ADD, "R2 test-sycl-p.py"),
+    ("cls-def-testFoo", "def testFoo():\n    assert True\n", REG_P_ADD, "R2 test-sycl-p.py"),
+    ("cls-double-space", "def  test_x():\n    assert True\n", REG_P_ADD, "R2 test-sycl-p.py"),
+    ("cls-nested-under-if", "if True:\n    def test_x():\n        assert True\n", REG_P_ADD, "R2 test-sycl-p.py"),
+    ("cls-lambda-assignment", "test_x = lambda: None\n", REG_P_ADD, "R2 test-sycl-p.py"),
+    ("cls-async-def", "async def test_x():\n    assert True\n", REG_P_ADD, "R2 test-sycl-p.py"),
+    ("cls-crlf", "def test_x():\r\n    assert True\r\n", REG_P_ADD, "R2 test-sycl-p.py"),
+    # and the shapes that must NOT count: data named test_*, a def only inside a docstring, a helper called by __main__
+    ("cls-ok-test-data-variable", "test_cases = [1, 2]\nprint(test_cases)\n", REG_P_ADD, None),
+    ("cls-ok-def-inside-docstring", '"""\ndef test_x():\n    pass\n"""\nprint(1)\n', REG_P_ADD, None),
+    ("cls-ok-unittest-with-main", UNITTEST_GATE + UNITTEST_MAIN, REG_P_ADD, None),
+    ("cls-unittest-without-main-under-pytest", UNITTEST_GATE, REG_P_PYTEST, "R3 test-sycl-p.py"),
+]
+# Registration matching is by command position and whole file name: a gate named as an ARGUMENT of another script,
+# a longer file name that merely ends in a gate's name, a .pyc, or a block that is never configured does not register it.
+MATCH_CASES = [
+    ("reg-argument-of-other-script", "add_test(NAME o COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-n.py test-sycl-m.py)\n"),
+    ("reg-longer-file-name", "add_test(NAME o COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/old-test-sycl-m.py)\n"),
+    ("reg-pyc", "add_test(NAME o COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-m.pyc)\n"),
+    ("reg-cmd-argument-of-other-script", "llama_test_cmd(python3 NAME o ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-n.py test-sycl-m.py)\n"),
+    ("reg-in-if-false", "if(FALSE)\nadd_test(NAME o COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-m.py)\nendif()\n"),
+    ("reg-in-if-0", "if(0)\nadd_test(NAME o COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-m.py)\nendif()\n"),
+    ("reg-in-else-of-if-true", "if(TRUE)\nelse()\nadd_test(NAME o COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-m.py)\nendif()\n"),
+]
+MATCH_OK_CASES = [
+    ("reg-ok-else-of-if-false", "if(FALSE)\nelse()\nadd_test(NAME o COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-m.py)\nendif()\n"),
+    ("reg-ok-if-variable", "if(SOME_OPTION)\nadd_test(NAME o COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-m.py)\nendif()\n"),
+    ("reg-ok-command-then-args", "add_test(NAME o COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-m.py --self-test)\n"),
+]
 
 
 def write_tree(tmp, gates, cmake):
@@ -218,6 +288,15 @@ llama_test_pytest(${Python3_EXECUTABLE}
         case("pytest-without-footer-not-required", dict(clean_gates, **{"test-sycl-e.py": PYTEST_GATE}),
              clean_cmake + "llama_test_pytest(${Python3_EXECUTABLE} SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-e.py)\n",
              None, require_footer=False)
+        for label, text, registration, expect in R3_CASES + CLASSIFIER_CASES:
+            case(label, dict(clean_gates, **{"test-sycl-p.py": text}), clean_cmake + registration, expect)
+        for label, registration in MATCH_CASES:
+            case(label, dict(clean_gates, **{"test-sycl-m.py": SCRIPT_GATE, "test-sycl-n.py": SCRIPT_GATE}),
+                 clean_cmake + "add_test(NAME n COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-n.py)\n" + registration
+                 if "test-sycl-n.py" not in registration else clean_cmake + registration,
+                 "R1 test-sycl-m.py")
+        for label, registration in MATCH_OK_CASES:
+            case(label, dict(clean_gates, **{"test-sycl-m.py": SCRIPT_GATE}), clean_cmake + registration, None)
         # A registration naming a file that is not in tests/ (R5), and the matching allowlist rules.
         tree = base / "missing-file"
         write_tree(tree, clean_gates, clean_cmake + "add_test(NAME g COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-ghost.py)\n")
