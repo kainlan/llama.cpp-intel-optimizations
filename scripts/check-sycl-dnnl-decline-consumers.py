@@ -48,15 +48,16 @@ Since S3-4 the gate also reads gemm.hpp, common.hpp, ggml-sycl.cpp and outprod.c
     woq_gemm_batch_mxfp4) are `[[nodiscard]] static` returning std::optional<sycl::event> or bool, ask for the scratchpad
     unconditionally as `auto scratchpad_mem = ctx.get_scratchpad_mem(...)`, decide it with the helper under their own site and
     `return std::nullopt` / `return false`, and note the engaged call once per request, after the decision (after gemm's
-    query_only exit) and with no `return false` / `return std::nullopt` left after it, so "engaged" means the primitive is
-    about to be submitted. The 2-D MXFP4 arm asks once before its batch loop. The old runtime_error and the deleted forwarders
+    query_only exit) and with no `return false` / `return std::nullopt` left after any of its notes (each note is checked,
+    with the consumer's own decisions blanked), so "engaged" means the primitive is about to be submitted. The 2-D MXFP4 arm asks once before its batch loop. The old runtime_error and the deleted forwarders
     (woq_gemm_q4_0_packed, gemm_batch_array, row_gemm_batch) and woq_gemm_q4_0_impl's dead packed-weights arm (b_is_packed,
     b_bytes) stay gone;
   - common.hpp: get_scratchpad_mem is [[nodiscard]] and opens with the size read and the 0 B early return of the empty memory
     before it takes dnnl_mutex, exactly once;
   - ggml-sycl.cpp and outprod.cpp (comment-stripped, whitespace-insensitive): the statements that carry a decline to its
     declared next path (MAIN_PINS), among them the named throws of the dense arms and out_prod, the batched f16 fallback and
-    the rethrow of a named error ahead of the resource-exhaustion ladder, the hoisted pre-query's `return false` and the first
+    the rethrow of a named error ahead of the resource-exhaustion ladder, the polarity of every `if (!consumer(...))` guard
+    (counted heads), the woq q4_0/q8_0 callers and the dequant arms that follow them, the hoisted pre-query's `return false` and the first
     slice's `b_a == 0` distinction, the MXFP4 PP and unified PP fall-through, the MoE group break and stage failure, and the
     mul_mat_id `return false`.
 
@@ -65,6 +66,7 @@ gate instead of passing it. A mutant whose anchor text has moved is an assertion
 violation, 2 when a file cannot be read.
 """
 import argparse
+import functools
 import re
 import sys
 from pathlib import Path
@@ -131,6 +133,20 @@ MAIN_PINS = (
     ("if (!group_event) { gemm_declined = true; break; }", 1),
     ('if (gemm_declined) { return gemm_stage_failed("oneDNN scratchpad declined"); }', 1),
     ("catch (const std::exception & e) { return gemm_stage_failed(e.what()); }", 1),
+    ("bool gemm_declined = false;", 1),
+    # a decline is read before the event is dereferenced
+    ("if (!group_event) { gemm_declined = true; break; } gemm_events.push_back(*group_event);", 1),
+    # the polarity of every guard: a decline is the falsy result of a consumer, so each reads `if (!consumer(...))`
+    ("if (!DnnlGemmWrapper::row_gemm(", 5),
+    ("if (!DnnlGemmWrapper::gemm(", 3),
+    ("DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb) .has_value();", 1),
+    ("if (batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback(", 2),
+    # the woq consumers: q4_0 and q8_0 results feed the dequant arms that follow
+    ("used_woq = DnnlGemmWrapper::woq_gemm_q4_0(", 2),
+    ("used_woq = DnnlGemmWrapper::woq_gemm_q8_0(", 1),
+    ("if (!used_woq && ggml_backend_buffer_is_host(src0->buffer)) {", 1),
+    ("if (!used_woq) { ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());", 1),
+    ('if (!used_woq) { decline = "primitive_declined"; }', 1),
     # mul_mat_id's f16-input PP helper reports a decline as "not done"
     ("DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { return false; }", 1),
 )
@@ -145,6 +161,14 @@ DEAD = (
 TOKENS = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*', re.S)
 
 
+def memo(fn):
+    """Cache a check by its text arguments: a mutant changes one file, so the checks of the others repeat verbatim. The cached
+    list is copied out so a caller may extend it."""
+    cached = functools.lru_cache(maxsize=16)(fn)
+    return lambda *a: list(cached(*a))
+
+
+@functools.lru_cache(maxsize=32)
 def strip_comments(text):
     """Blank every // and /* */ comment, keeping length and newlines; string and character literals are skipped over so a
     comment marker inside one is not taken for a comment."""
@@ -268,6 +292,7 @@ def member_body(text, name):
     return m.group(1), text[open_brace + 1:balanced(text, open_brace + 1, "{", "}") - 1]
 
 
+@memo
 def check_gemm(text):
     errs = []
     text = strip_comments(text)
@@ -314,11 +339,16 @@ def check_gemm(text):
         if len(notes) != want or any(n.group(1) != site for n in notes):
             errs.append("%s must call ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_%s) once per request, found %d"
                         % (where, site, len(notes)))
-        if notes:
-            tail = body[notes[-1].end():]
-            if re.search(r"\breturn\s+(?:false\b|std::nullopt\b)", tail):
-                errs.append("%s leaves with `return false` / `return std::nullopt` after its engaged note: the note must sit just "
-                            "before the primitive is submitted" % where)
+        # After each note (not only the last) nothing may leave with a decline: every `return false` / `return std::nullopt`
+        # that follows is one of the consumer's own decisions, which sit before their own notes.
+        blanked = body
+        for d in decisions:
+            blanked = blanked[:d.start()] + " " * (d.end() - d.start()) + blanked[d.end():]
+        for n in notes:
+            if re.search(r"\breturn\s+(?:false\b|std::nullopt\b)", blanked[n.end():]):
+                errs.append("%s leaves with `return false` / `return std::nullopt` after an engaged note: each note must sit just "
+                            "before the primitive it counts is submitted" % where)
+                break
         for d, n in zip(decisions, notes):
             if name == "woq_gemm_q4_0_impl":
                 # The packed-weights staging (an allocation and a reorder that can still fail) sits between the decision and
@@ -354,6 +384,7 @@ def check_gemm(text):
     return errs
 
 
+@memo
 def check_common(text):
     errs = []
     text = strip_comments(text)
@@ -384,6 +415,7 @@ def ws_pattern(text):
     return r"\s*".join(re.escape(c) for c in re.sub(r"\s+", "", text))
 
 
+@memo
 def check_main(main_text, outprod_text):
     errs = []
     main_text, outprod_text = strip_comments(main_text), strip_comments(outprod_text)
@@ -550,6 +582,36 @@ def gemm_mutants(files, edit):
     out.append(("the old scratchpad error is back in ggml-sycl.cpp",
                 edit_pin(m, MAIN_PINS[0][0], 'throw std::runtime_error("oneDNN scratchpad allocation failed"); (void) std::runtime_error(')))
     # the decline-only next paths, each altered the way a careless edit would (the pin simply gone is covered above)
+    # guard polarity and neighbours (review r2 Minor-1): each altered the way a careless edit would
+    for label, pin, new in (
+            ("the pre-query guard loses its `!`", "if (!DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0,", "if (DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0,"),
+            ("the first MXFP4 PP guard loses its `!`", "if (!DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(N),",
+             "if (DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(N),"),
+            ("the second MXFP4 PP guard loses its `!`", "if (!DnnlGemmWrapper::row_gemm( ctx, static_cast<int>(N), static_cast<int>(M), static_cast<int>(K), src0_f16_ptr,",
+             "if (DnnlGemmWrapper::row_gemm( ctx, static_cast<int>(N), static_cast<int>(M), static_cast<int>(K), src0_f16_ptr,"),
+            ("mul_mat_id's guard loses its `!`", "if (!DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(ne01),",
+             "if (DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(ne01),"),
+            ("the batched fallback is never taken", "if (batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback(",
+             "if (false && batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback("),
+            ("the MoE decline flag starts true", "bool gemm_declined = false;", "bool gemm_declined = true;"),
+            ("the MoE event is dereferenced before the decline check",
+             "if (!group_event) { gemm_declined = true; break; } gemm_events.push_back(*group_event);",
+             "gemm_events.push_back(*group_event); if (!group_event) { gemm_declined = true; break; }"),
+            ("the broadcast launch returns success whatever gemm said", "DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb) .has_value();",
+             "DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb) .has_value() || true;"),
+            ("a q4_0 decline no longer reaches the dequant arm", "if (!used_woq && ggml_backend_buffer_is_host(src0->buffer)) {",
+             "if (used_woq && ggml_backend_buffer_is_host(src0->buffer)) {"),
+            ("a q8_0 decline no longer reaches the dequant arm", "if (!used_woq) { ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());",
+             "if (used_woq) { ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());"),
+            ("the q8_0 caller ignores the result", "used_woq = DnnlGemmWrapper::woq_gemm_q8_0(", "(void) DnnlGemmWrapper::woq_gemm_q8_0(")):
+        out.append((label, edit_pin(m, pin, new)))
+    # a return after the FIRST arm's note, in each two-note consumer (review r2 Minor-2)
+    for name, site in (("gemm", "DNNL_GEMM"), ("gemm_batch_strided", "DNNL_GEMM_BATCH"), ("woq_gemm_batch_mxfp4", "DNNL_WOQ_MXFP4_BATCH")):
+        first = "ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_%s);\n" % site
+        assert gt.count(first) == 2, "mutant anchor: %s's two notes" % name
+        result = "std::nullopt"
+        out.append(("a return follows %s's first-arm note" % name,
+                    edit(g, first, first + "            if (m < 0) {\n                return %s;\n            }\n" % result)))
     for label, pin, new in (
             ("the hoisted pre-query no longer returns false on a decline", "{}, nullptr, true)) { return false; }",
              "{}, nullptr, true)) { }"),
