@@ -151,6 +151,17 @@ if (BUILD_TESTING)
         set_tests_properties(sycl-cpu-traits-parity PROPERTIES LABELS "sycl;cpu;host")
     endif()
 
+    # The fused-chain aliasing gate (llama.cpp-rb2h) is a header over ggml.h only: host-only, no SYCL device.
+    add_executable(test-sycl-fusion-alias
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fusion-alias.cpp)
+    target_include_directories(test-sycl-fusion-alias PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_link_libraries(test-sycl-fusion-alias PRIVATE ggml-base)
+    set_target_properties(test-sycl-fusion-alias PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-fusion-alias COMMAND test-sycl-fusion-alias)
+    set_tests_properties(sycl-fusion-alias PROPERTIES LABELS "sycl;fusion;host")
+
     add_executable(test-sycl-lifecycle-load-txn
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-load-txn.cpp
         model-lifecycle.cpp)
