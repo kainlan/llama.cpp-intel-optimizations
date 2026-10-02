@@ -741,9 +741,10 @@ struct kv_region_entry {
     // What the context last published through ggml_backend_sycl_set_runtime_context_desc: the
     // geometry, the KV and recurrent-state shape, the sorted tenant slots and whether the tenant
     // section is planned.  Null until a descriptor publish succeeds.  The registry does not clear it
-    // on any other publish (publish() below stores whatever entry it is given): the backend's publish
-    // tail clears it with set_published_section(ctx, nullptr) on every publish that goes live and the
-    // descriptor path then stores its own, so a coverage query against a stale shape answers GROWTH.
+    // on any other publish (publish() below stores whatever entry it is given), so a publisher must clear
+    // it with drop_published_section(ctx) whenever it publishes a shape without storing a new section, or
+    // a coverage query against the stale shape would not answer GROWTH.  (The backend's publish tail does
+    // that, and the descriptor path then stores its own; both are step 3b.)
     std::shared_ptr<const runtime_context_section> published;
 
     bool empty() const { return extents.empty() && layout.empty() && !tenants && !published; }
@@ -799,10 +800,12 @@ class kv_region_registry {
         return it == entries_.end() ? nullptr : it->second.published;
     }
 
-    // Replace the section of `ctx` (creating an otherwise empty entry when there is none).  A null
-    // `section` drops it (see drop_published_section, which needs no section type); a null section on a
-    // context with no entry creates nothing, and an entry left empty by the drop is erased.  Returns the
-    // previous pointer, moved out: a section's last drop is the caller's, with no lock held.
+    // Replace the section of `ctx` (creating an otherwise empty entry when there is none).  It takes a
+    // typed `shared_ptr<const runtime_context_section>`: a bare nullptr or a non-const section pointer
+    // does not deduce and fails to compile, and drop_published_section is the null path.  A typed null
+    // here is the same drop: it creates nothing for a context with no entry, and an entry left empty by
+    // it is erased.  Returns the previous pointer, moved out: a section's last drop is the caller's, with
+    // no lock held.
     //
     // The entry's tenant key is the section's own (section->tenant_key), read here and nowhere else, so
     // the two cannot disagree.  A slot table owns the key once one is installed (it is the digest the
