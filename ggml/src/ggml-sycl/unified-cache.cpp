@@ -18743,6 +18743,17 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
     return cache->reserve_onednn_scratch(weights_size, activations_size);
 }
 
+bool unified_cache_get_onednn_zone_capacity(int device_id, size_t * capacity) {
+    unified_cache * cache = get_existing_unified_cache_for_device(device_id);
+    if (!cache || !cache->arena_active()) {
+        return false;
+    }
+    if (capacity) {
+        *capacity = cache->zone_capacity(vram_zone_id::ONEDNN);
+    }
+    return true;
+}
+
 bool unified_cache_reserve_pp_moe_onednn_scratch(int      device_id,
                                                  size_t   weight_slot_bytes,
                                                  size_t   activation_slot_bytes,

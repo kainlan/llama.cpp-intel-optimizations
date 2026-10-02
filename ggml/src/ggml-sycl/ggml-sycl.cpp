@@ -1504,6 +1504,27 @@ static bool acquire_onednn_pp_scratch(int                       device_id,
     return true;
 }
 
+// llama.cpp-8ony: whether the f16 weight + activation copies of one dense op are PLANNED into the ONEDNN zone. The
+// planner keeps tensors it does not size that zone for (the LM head) out of it and puts their f16 dequant in the
+// RUNTIME-zone dense buffers instead, so "the op passes the oneDNN PP admission" is not enough to send it to the
+// oneDNN scratch: the arena refuses to grow that zone once weights are resident. The op arm and the graph-entry
+// walk both ask this, with element counts, so the scratch decision and the buffer sizing cannot disagree.
+static bool ggml_sycl_onednn_pp_scratch_planned(int device, int64_t weight_elems, int64_t activation_elems) {
+    if (weight_elems < 0 || activation_elems < 0) {
+        return false;
+    }
+    constexpr size_t elem_bytes = sizeof(sycl::half);
+    if (static_cast<size_t>(weight_elems) > SIZE_MAX / elem_bytes ||
+        static_cast<size_t>(activation_elems) > SIZE_MAX / elem_bytes) {
+        return false;
+    }
+    size_t     zone_capacity = 0;
+    const bool arena_active  = ggml_sycl::unified_cache_get_onednn_zone_capacity(device, &zone_capacity);
+    return ggml_sycl::zone_onednn_pp_scratch_planned(arena_active, zone_capacity,
+                                                     static_cast<size_t>(weight_elems) * elem_bytes,
+                                                     static_cast<size_t>(activation_elems) * elem_bytes);
+}
+
 struct pp_moe_onednn_scratch_release_marker;
 struct pp_moe_prompt_down_dispatch_done_marker;
 
@@ -45769,8 +45790,12 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
         sycl::half * src1_pp_scratch = nullptr;
 #if GGML_SYCL_DNNL
         onednn_pp_scratch_guard legacy_pp_scratch_guard;
-        const bool legacy_pp_scratch_candidate = src0->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_F16 &&
-                                                 ggml_sycl_onednn_pp_candidate(src0, src1, dst, ctx.device);
+        // Admission AND plan: an op the planner keeps out of the ONEDNN zone (the LM head) takes the planned
+        // RUNTIME dequant buffers below, which the graph-entry walk sizes under the same question.
+        const bool legacy_pp_scratch_candidate =
+            src0->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_F16 &&
+            ggml_sycl_onednn_pp_candidate(src0, src1, dst, ctx.device) &&
+            ggml_sycl_onednn_pp_scratch_planned(ctx.device, row_diff * ne00, src1_ncols * ne10);
         if (legacy_pp_scratch_candidate) {
             const size_t weights_bytes = static_cast<size_t>(row_diff) * static_cast<size_t>(ne00) * sizeof(sycl::half);
             const size_t activations_bytes =
@@ -99164,8 +99189,13 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         if (!need_src0_f16 && !need_src1_f16) {
             continue;
         }
-        // oneDNN PP scratch (the legacy_pp_scratch_candidate arm) supplies both copies itself.
-        if (need_src0_f16 && need_src1_f16 && ggml_sycl_onednn_pp_candidate(src0, src1, node, ctx.device)) {
+        // oneDNN PP scratch (the legacy_pp_scratch_candidate arm) supplies both copies itself, but only for an op
+        // whose pair is planned into the ONEDNN zone (the same question the op arm asks). The LM head is not: the
+        // planner sizes that zone without it, so it draws these buffers and they must be sized here, at the first
+        // graph, not left empty for the op to find the RUNTIME zone full (llama.cpp-8ony).
+        if (need_src0_f16 && need_src1_f16 && ggml_sycl_onednn_pp_candidate(src0, src1, node, ctx.device) &&
+            ggml_sycl_onednn_pp_scratch_planned(ctx.device, ggml_nrows(src0) * src0->ne[0],
+                                                ggml_nrows(src1) * src1->ne[0])) {
             continue;
         }
         const ggml_sycl::MatmulDecision decision = ctx.matmul_orchestrator.select(src0, src1, node);

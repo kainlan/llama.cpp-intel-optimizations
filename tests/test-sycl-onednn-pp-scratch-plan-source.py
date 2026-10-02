@@ -203,8 +203,8 @@ if args.self_test and not failed:
          (mutate_in_func(backend, helper_sig, "unified_cache_get_onednn_zone_capacity(", "XXXX("),
           cache, cache_hpp)),
         ("accessor reports another zone", "the accessor reports the ONEDNN zone",
-         (backend, mutate(cache, "zone_capacity(vram_zone_id::ONEDNN)", "zone_capacity(vram_zone_id::RUNTIME)"),
-          cache_hpp)),
+         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_zone_capacity\(",
+                                  "vram_zone_id::ONEDNN", "vram_zone_id::RUNTIME"), cache_hpp)),
         ("accessor undeclared", "the zone-capacity accessor is declared",
          (backend, cache, mutate(cache_hpp, "unified_cache_get_onednn_zone_capacity(", "unified_cache_get_XXXX("))),
     ]

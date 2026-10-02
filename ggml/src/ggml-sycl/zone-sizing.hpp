@@ -260,7 +260,10 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
 // `arena_active` is false when there is no ONEDNN zone at all (no arena): nothing was planned, nothing can
 // disagree, and the scratch comes from the unified-cache allocation path as it always did. With an arena the
 // pair must fit the zone (sum <= capacity, overflow-checked: a wrapped sum compares as small). Pure.
-bool zone_onednn_pp_scratch_planned(bool arena_active, size_t zone_capacity_bytes, size_t weights_bytes, size_t activations_bytes);
+bool zone_onednn_pp_scratch_planned(bool   arena_active,
+                                    size_t zone_capacity_bytes,
+                                    size_t weights_bytes,
+                                    size_t activations_bytes);
 
 // ---------------------------------------------------------------------------
 // Mispredict accounting
