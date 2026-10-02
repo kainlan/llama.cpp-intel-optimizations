@@ -2391,15 +2391,13 @@ accepted size; an explicit one fails context creation.
 
 **The compute-buffer reserve is a known gap, not a solved term.** Neither the
 compute buffers nor the flash-attention K/V conversion buffers are in the
-placement plan (`llama.cpp-zhcn`). A compute buffer that misses the RUNTIME
-zone is placed in the KV zone first (`alloc_constraints::spill_to_kv_zone_before_raw`, set by the buffer allocator;
-`llama.cpp-kpjw`). Before that it did not: its RUNTIME request does not forbid a spill, so it fell through to raw device
-memory outside the arena, when the physical-VRAM overcommit guard allowed that, and reached the KV zone ("Arena RUNTIME
-zone full, runtime buffer ... allocated from KV zone") only when the guard refused (`llama.cpp-23mk`). Raw memory is now
-the last resort, after the KV zone cannot hold the buffer whole.
-When
-the ring fills RUNTIME, GPT-OSS's compute buffer (about 404 MiB at `-ub 512`)
-misses it and goes down that chain. `ggml-alloc` sizes
+placement plan (`llama.cpp-zhcn`). When the ring fills RUNTIME, GPT-OSS's compute buffer (about 404 MiB at `-ub 512`)
+misses it. A compute buffer that misses the RUNTIME zone is placed in the KV zone first
+(`alloc_constraints::spill_to_kv_zone_before_raw`, set by the buffer allocator for scheduler compute buffers only;
+`llama.cpp-kpjw`), and goes to raw device memory only when the KV zone cannot hold it whole. Before that change its RUNTIME
+request, which does not forbid a spill, fell through to raw device memory outside the arena whenever the
+physical-VRAM overcommit guard allowed that, and reached the KV zone ("Arena RUNTIME zone full, runtime buffer ...
+allocated from KV zone") only when the guard refused (`llama.cpp-23mk`). `ggml-alloc` sizes
 compute buffers from the graph at `graph_reserve`, which runs after the
 transaction, and they are not in the plan's `vram_bytes`. So the transaction
 cannot know their size. It holds back `k_pp_moe_ring_compute_reserve_bytes_per_row`
@@ -2482,23 +2480,37 @@ is memory the arena already reserved, so it cannot overcommit the device and mus
 request class takes the path; a forbid-spill claimant is still refused, and any other RUNTIME request keeps the previous
 spill path unchanged. Raw device memory is the last resort, taken only when the KV zone cannot hold the buffer whole.
 
-A hold-induced spill is not silent, and is counted by where it landed (`unified_cache_note_planned_hold_spill`): in the
-KV zone (inside the arena, free for the driver headroom) or RAW (outside the arena, which is what eats it). The first
-one of each kind since the last teardown is a WARN naming the requester tag and the bytes; the counts are taken at
-teardown and printed as `hold_spills_raw` / `hold_spills_kv_zone` (with bytes) in the `[SCRATCH-STATS]` lines. A raw
+Only a scheduler compute buffer is marked. The same buffer type backs the model's WEIGHT tensors, which are allocated
+during the model load, before any KV cache exists; one of them sent to the KV zone would take room this context's KV is
+about to be placed in. The flag is therefore `!g_sycl_in_model_load` at the allocation, and the buffer allocator's own
+KV-zone and SCRATCH-zone fallback steps are skipped for a flagged request (`unified_alloc` already tried the KV zone for
+it, counted; and a compute buffer in the SCRATCH zone is exactly what the graph-entry headroom check aborts on, so that
+step must stay unreachable for this class). Only the unflagged class (a model load) takes those two steps, as before.
+
+A compute buffer the RUNTIME zone did not serve is not silent, and is counted by where it landed: in the KV zone because
+the hold kept it out (`unified_cache_note_planned_hold_spill`, in-arena), in the KV zone because the zone was simply full
+(`unified_cache_note_zone_full_kv_placement`), or RAW (outside the arena, which is what eats the headroom). The first
+one of each kind per context is a WARN naming the requester tag and the bytes; the counts are taken at teardown and
+printed as `hold_spills_raw` / `hold_spills_kv_zone` / `hold_spills_kv_zone_full` (with bytes) in the `[SCRATCH-STATS]`
+line, whichever of the three is non-zero. The counters restart at every publish, so the figures a finished context
+prints are its own and not the auto-ubatch ladder's (the once-only WARN latches do not restart). A raw
 spill cannot evict weights: the overcommit guard in `unified_alloc` runs for every raw device request, and for a
 hold-induced one it refuses loudly instead of calling `evict_and_flush` (trading a planned buffer's reservation for the
 model's own weights is not a trade the hold may make).
 *The worst case, and why it is a heuristic.* A request the hold keeps out spills whole, so what the hold can push
 out of the zone is not "the hold" but at most **the hold plus the largest spill-capable RUNTIME request**, and of that
-only the part the KV zone cannot take is outside-arena demand (`zone_hold_spill_raw_demand`, with the KV zone's free
-bytes at the transaction; they are an estimate, and the realized check below is the backstop). The bound: a request r
+only the part the KV zone cannot take is outside-arena demand (`zone_hold_spill_raw_demand`, an ESTIMATE: the KV zone's
+largest free block net of the KV this transaction is about to place, `zone_kv_room_for_compute`; the transaction
+publishes before a first context's KV exists, so the zone still shows those bytes free, and a buffer is indivisible, so
+the sum of the zone's free bytes is not room. The realized check below is the backstop). The bound: a request r
 is held back only when the zone has less than hold + r free, free only falls while the hold stands, and a run with no
 hold serves at most the zone's free bytes. The hold is at most the plan at the n_ubatch asked about. The transaction does
 not know the compute-buffer sizes (the scheduler reserves them after the plan is published), so the largest request is
 the allocator's own high-water mark of such requests (`unified_cache_note_runtime_request`): exact once the context has
 reserved its compute buffers (the recheck that follows the probe reserve) and only a lower bound before that. Both
-callers ask one function, `ggml_sycl_planned_scratch_hold_spill_bound(device, n_ubatch)`. The bound is checked against
+callers ask one function, `ggml_sycl_planned_scratch_hold_spill_bound(device, n_ubatch, kv_pending_bytes)`: the
+transaction passes the KV its plan adds (zero of it is live for a first context), the recheck, which runs inside the
+reserve with KV live, passes none. The bound is checked against
 the live outside-arena headroom whatever the attention mode. A non-FA context counts it together with the non-FA scratch
 in `ggml_sycl_check_nonfa_attn_scratch`. A flash-attention context, the default, asks the same live free-memory question
 without the non-FA reserve (`ggml_sycl_check_hold_spill_headroom`), because the overcommit guard in `unified_alloc` compares
@@ -2521,6 +2533,24 @@ outside itself (`kSyclArenaMinExternalHeadroomBytes`, 256 MB, the graph-entry ch
 `free < headroom && free + spill >= headroom`. A card that was already short without the spill (a full B70 with
 KB-scale spills) is not blamed, and a rung with no hold-induced spill is never refused. A refusal makes the candidate
 lose with the stop reason "hold spill left no headroom" and the ladder lands lower.
+
+*The same check runs after a reserve the ladder did not make.* A pinned `-ub` reserves once, in the context
+constructor, with nobody asking, and the transaction before it ran with this context's KV not yet created. The
+constructor therefore calls the same entry after its reserve, whichever way it was made
+(`llama_context_sycl_hold_spill_fits`), and a refusal is a context-init refusal by name: `the largest -ub that fits is
+about N`, N from `zone_hold_spill_largest_ub` (the rung's raw spill scales about linearly with `n_ubatch`; the entry
+takes the rung's `n_ubatch` and returns the largest that fits, the smallest over the context's devices). A pinned
+`-ub 1024` on the B50 with Qwen is refused there, instead of reaching flash attention with 107.8 MB of headroom and
+hanging.
+
+*A rung does not pay for the buffers of the rung before it.* `try_candidate` releases the previous rung's compute
+buffers (the scheduler, the reserve graph) before this rung's transaction. A rung that placed its buffers in the KV
+zone leaves them there until the next `sched_reserve()` replaces them, and the transaction measures its KV capacity
+against that zone's free bytes (`ggml_sycl_kv_capacity_live`), so without the release a smaller rung's buffers
+depress the next, larger rung's KV capacity for room it is about to be given back. The live compute buffers are not
+added back into the capacity: that would make every ordinary reserve look bigger than it is. The settle step already
+re-reserves the winner whenever the last rung did not win, so the release costs one extra reserve only when a rung
+loses at its probe.
 Measured on the B50 (Qwen PPL, auto-ub1024): a 461 MB compute buffer was held back (zone free 512 MB, hold 75.6 MB),
 spilled, left 107.8 MB against 256 MB, and flash attention then ran out of resources at the first graph; the
 ladder had accepted the rung because nothing in its fit saw the spill.
