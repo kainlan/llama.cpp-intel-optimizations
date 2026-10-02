@@ -15,7 +15,9 @@ unconditionally and once per process rather than only under a debug flag, and
 that the generation/rollback protocol the 32dg lifecycle work established
 survives at both sites.
 
-Every check below fails against the pre-ijla tree. Run it that way to confirm:
+The checks that read ggml-sycl.cpp and unified-cache.cpp fail against the pre-ijla tree, and 18 of them do when run that
+way (the others read the admission module, its header and the canonical contract, which that tree never had, so they
+pass there by construction and are covered by --self-test's mutants instead):
 
     ./tests/test-sycl-pp-moe-scratch-admission-contract.py \\
         --sycl <(git show 745062d4e:ggml/src/ggml-sycl/ggml-sycl.cpp) \\
@@ -58,14 +60,28 @@ def reserve_call_arguments(source):
 # The planned slot sizes are pinned POSITIVELY, not by a blacklist of the spellings of max(planned, required): a
 # blacklist (std::max, ternary, GGML_MAX, sycl::max, `using std::max`, an alias) is always one spelling behind, and it
 # collides with the legitimate maxima elsewhere in the file (479i's dense dequant buffers are sized to their own
-# graph-entry demand). The property is that the ring the planner sized is what gets reserved, so:
-#   * each call site reads its three slot sizes ONCE, as `const size_t NAME = <planner getter>(ctx.device);`;
-#   * nothing assigns to, increments or takes the address of those names afterwards;
-#   * the reservation's first three arguments ARE those names, nothing computed from them.
+# graph-entry demand). The property is that the ring the planner sized is what gets reserved, so, per executor body:
+#   * the three slot sizes and the raw ring depth are each read ONCE, as `const T NAME = <planner getter>(ctx.device);`,
+#     and the runtime ring depth is derived once from the raw one;
+#   * nothing assigns to, increments, address-takes, casts around or redeclares those names afterwards, and no
+#     preprocessor directive can redefine them;
+#   * the admission shape is exactly `{slots..., raw ring depth}` and the executor's only reserve call passes exactly
+#     `slots..., ring depth`, nothing computed from them;
+# and file-wide: the number of reserve_pp_moe_onednn_scratch( and unified_cache_set_planned_pp_moe_onednn_scratch(
+# calls is fixed, and the free unified_cache_reserve_ wrapper is not used, so a new reservation site (or one that
+# raises the ceiling and reads it back) cannot appear without editing this gate.
+RESERVE_CALLS_IN_FILE = 5   # plan, replan x2, the two executors
+SET_PLANNED_CALLS_IN_FILE = 3   # plan, replan x2
 PLANNED_SITES = (
-    (("planned_weight", "weight"), ("planned_act", "activation"), ("planned_out", "output")),
-    (("planned_weight_slot", "weight"), ("planned_activation_slot", "activation"), ("planned_output_slot", "output")),
+    dict(slots=(("planned_weight", "weight"), ("planned_act", "activation"), ("planned_out", "output")),
+         shape="planned_shape", raw="planned_ring_depth", ring="ring_depth"),
+    dict(slots=(("planned_weight_slot", "weight"), ("planned_activation_slot", "activation"),
+                ("planned_output_slot", "output")),
+         shape="planned_shape", raw="planned_ring_depth_raw", ring="planned_ring_depth"),
 )
+_WRITES = (r"\b%(n)s\b\s*(?:[-+*/%%&|^]|<<|>>)?=(?!=)", r"(?:\+\+|--)\s*\b%(n)s\b", r"\b%(n)s\b\s*(?:\+\+|--)",
+           r"&\s*%(n)s\b", r"\b%(n)s\b\s*\.\s*\w+\s*(?:[-+*/%%&|^]|<<|>>)?=(?!=)")
+_UNSAFE_IN_REGION = (r"\bconst_cast\b", r"^\s*#\s*define\b")
 
 
 def blank_strings(source):
@@ -78,18 +94,54 @@ def planned_slot_declaration(name, kind):
                       r"\s*\(\s*ctx\s*\.\s*device\s*\)\s*;" % (name, kind))
 
 
-def planned_slot_pinned(region, name, kind):
-    """In this executor's body `name` is declared exactly once, as the const planner read, and never written."""
+def ring_raw_declaration(name):
+    return re.compile(r"\bconst\s+uint32_t\s+%s\s*=\s*ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth"
+                      r"\s*\(\s*ctx\s*\.\s*device\s*\)\s*;" % name)
+
+
+def ring_declaration(name, raw):
+    return re.compile(r"\bconst\s+uint32_t\s+%s\s*=\s*pp_moe_onednn_runtime_ring_depth\s*\(\s*%s\s*\)\s*;" % (name, raw))
+
+
+def shape_declaration(name, site):
+    names = [slot for slot, _ in site["slots"]] + [site["raw"]]
+    return re.compile(r"\bconst\s+ggml_sycl::pp_moe_onednn_scratch_shape\s+%s\s*=\s*\{\s*%s\s*,?\s*\}\s*;"
+                      % (name, r"\s*,\s*".join(names)))
+
+
+def pinned_once_and_never_written(region, name, declaration):
+    """`name` is declared exactly once, by `declaration`, in this region, and never written after it."""
     region = blank_strings(region)
-    declaration = planned_slot_declaration(name, kind)
     if len(declaration.findall(region)) != 1:
         return False
     rest = declaration.sub("", region)
     if re.search(r"\b[\w:<>]+\s+%s\b" % name, rest):
         return False  # a second (shadowing) declaration of the same name
-    writes = (r"\b%(n)s\b\s*(?:[-+*/%%&|^]|<<|>>)?=(?!=)", r"(?:\+\+|--)\s*\b%(n)s\b", r"\b%(n)s\b\s*(?:\+\+|--)",
-              r"&\s*%(n)s\b")
-    return not any(re.search(pattern % {"n": name}, rest) for pattern in writes)
+    return not any(re.search(pattern % {"n": name}, rest) for pattern in _WRITES)
+
+
+def planned_slot_pinned(region, name, kind):
+    return pinned_once_and_never_written(region, name, planned_slot_declaration(name, kind))
+
+
+def region_is_free_of_escapes(region, pinned_names):
+    """No const_cast (it writes a const name), no reinterpret_cast of a pinned name (the same through a type pun) and no
+    #define (it redefines one) inside the executor body. reinterpret_cast of pointers is ordinary kernel code here."""
+    region = blank_strings(region)
+    if any(re.search(pattern, region, re.M) for pattern in _UNSAFE_IN_REGION):
+        return False
+    return not re.search(r"\breinterpret_cast\s*<[^>]*>\s*\(\s*[*&]?\s*(?:%s)\b" % "|".join(pinned_names), region)
+
+
+def site_is_pinned(region, site):
+    names = [slot for slot, _ in site["slots"]]
+    pinned = names + [site["raw"], site["ring"], site["shape"]]
+    return (region_is_free_of_escapes(region, pinned)
+            and all(planned_slot_pinned(region, name, kind) for name, kind in site["slots"])
+            and pinned_once_and_never_written(region, site["raw"], ring_raw_declaration(site["raw"]))
+            and pinned_once_and_never_written(region, site["ring"], ring_declaration(site["ring"], site["raw"]))
+            and pinned_once_and_never_written(region, site["shape"], shape_declaration(site["shape"], site))
+            and len(names) == 3)
 
 
 def top_level_arguments(text):
@@ -109,9 +161,35 @@ def top_level_arguments(text):
 
 
 def reservation_passes_the_plan(region, site):
-    """The executor's only reserve call passes the site's three planned names, verbatim and in order."""
-    calls = [top_level_arguments(call)[:3] for call in reserve_call_arguments(region)]
-    return calls == [[name for name, _ in site]]
+    """The executor's only reserve call passes the site's three planned names and its ring depth, verbatim, in order."""
+    calls = [top_level_arguments(call) for call in reserve_call_arguments(region)]
+    return calls == [[name for name, _ in site["slots"]] + [site["ring"]]]
+
+
+def file_wide_call_counts_are_fixed(source):
+    """The reserve / set-planned call counts of the whole file, and no use of the free reserve wrapper."""
+    source = blank_strings(source)
+    return (len(re.findall(r"(?<!unified_cache_)reserve_pp_moe_onednn_scratch\s*\(", source)) == RESERVE_CALLS_IN_FILE
+            and len(re.findall(r"unified_cache_reserve_pp_moe_onednn_scratch\s*\(", source)) == 0
+            and len(re.findall(r"unified_cache_set_planned_pp_moe_onednn_scratch\s*\(", source)) == SET_PLANNED_CALLS_IN_FILE)
+
+
+def region_until_matching_endif(source, start):
+    """From `start` to the #endif that closes the first #if after it, counting nested #if/#endif pairs. Ending at
+    the first `#endif` after `start` would stop early at a nested one and hide everything after it."""
+    at, depth = start, 0
+    for line in source[start:].splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            directive = stripped[1:].lstrip()
+            if directive.startswith("if"):
+                depth += 1
+            elif directive.startswith("endif"):
+                depth -= 1
+                if depth <= 0:
+                    return source[start:at]
+        at += len(line)
+    return source[start:]
 
 
 def strip_comments(source):
@@ -226,7 +304,8 @@ def evaluate(sycl, cache, module, header, doc=""):
                       "if (try_pp_mxfp4_soa_onednn_f16_batched())")
     # The non-batched PP MXFP4 SoA f16 staging: the terminal MoE PP route, which
     # keeps its transient staging but must not enlarge the planned ring.
-    staging = between(sycl, "scoped_unified_queue_temp<sycl::half> pp_mxfp4_src0_f16;", "\n#endif\n")
+    staging_start = sycl.find("scoped_unified_queue_temp<sycl::half> pp_mxfp4_src0_f16;")
+    staging = region_until_matching_endif(sycl, staging_start) if staging_start >= 0 else ""
     reserve = between(cache, "bool unified_cache::reserve_pp_moe_onednn_scratch(",
                       "bool unified_cache::claim_pp_moe_onednn_scratch_slot(")
 
@@ -281,11 +360,11 @@ def evaluate(sycl, cache, module, header, doc=""):
         # budgeted zone into a high-water mark of every shape ever seen.
         # The reservation's own arguments may not carry a max ...
         "no PP MoE scratch reservation upsizes past the plan":
-            reservation_passes_the_plan(batched, PLANNED_SITES[0]) and reservation_passes_the_plan(staging, PLANNED_SITES[1]),
-        # ... and the names it passes are the planner's own values, read once and never written (see PLANNED_SITES).
+            reservation_passes_the_plan(batched, PLANNED_SITES[0]) and reservation_passes_the_plan(staging, PLANNED_SITES[1])
+            and file_wide_call_counts_are_fixed(sycl),
+        # ... and what it passes is the planner's own values, read once and never written (see PLANNED_SITES).
         "the planned slot sizes are read once, const, and never reassigned":
-            all(planned_slot_pinned(region, name, kind)
-                for region, site in ((batched, PLANNED_SITES[0]), (staging, PLANNED_SITES[1])) for name, kind in site),
+            site_is_pinned(batched, PLANNED_SITES[0]) and site_is_pinned(staging, PLANNED_SITES[1]),
         # ABSENCE: with a general fallback present, refusing costs nothing and
         # the cap is decorative -- the batch simply allocates its own scratch.
         "the batched executor keeps no general temporary fallback":
@@ -468,8 +547,13 @@ ESCAPES = (
     ("staging-nested-endif-truncates-the-region", [(_CALL_STAGING, _CALL_STAGING + "\n#if 1\n#endif\n                (void) cache->"
       "reserve_pp_moe_onednn_scratch(std::max(planned_weight_slot, pp_mxfp4_src0_f16_bytes), planned_activation_slot, "
       "planned_output_slot, planned_ring_depth);")]),
-    ("staging-nested-endif-then-a-write", [(_CALL_STAGING, "\n#if 1\n#endif\n                const_cast<size_t &>(planned_weight_slot) += pp_mxfp4_src0_f16_bytes;\n"
-      + _CALL_STAGING)]),
+    ("staging-nested-endif-then-a-write", [(_CALL_STAGING, _CALL_STAGING + "\n#if 1\n#endif\n                "
+      "const_cast<size_t &>(planned_weight_slot) += pp_mxfp4_src0_f16_bytes;")]),
+    ("macro-alias-then-write", [(_CALL_BATCHED, "#define GROW(a) ((a) += weight_bytes)\n            GROW(planned_weight);\n" + _CALL_BATCHED)]),
+    ("raw-ring-depth-written", [("            const uint32_t planned_ring_depth =\n                ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx.device);",
+      "            uint32_t planned_ring_depth =\n                ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx.device);"),
+      (_CALL_BATCHED, "            planned_ring_depth = 8;\n" + _CALL_BATCHED)]),
+    ("admission-shape-member-written", [(_CALL_BATCHED, "            planned_shape.weight_slot_bytes = std::max(planned_shape.weight_slot_bytes, weight_bytes);\n" + _CALL_BATCHED)]),
     ("const-cast-write", [(_CALL_BATCHED, "            const_cast<size_t &>(planned_weight) = std::max(planned_weight, weight_bytes);\n" + _CALL_BATCHED)]),
     ("const-cast-pointer-write", [(_CALL_BATCHED, "            *const_cast<size_t *>(&planned_weight) = std::max(planned_weight, weight_bytes);\n" + _CALL_BATCHED)]),
     ("const-cast-reference-bind", [(_CALL_BATCHED, "            size_t & grow_w = const_cast<size_t &>(planned_weight);\n            grow_w = "
@@ -519,6 +603,9 @@ def self_test(sycl, cache, module, header, doc):
         _, failed, _ = evaluate(mutated, cache, module, header, doc)
         if "no PP MoE scratch reservation upsizes past the plan" not in failed:
             problems.append("reservation pin did not fire on: " + label)
+    nested = "a\n#if X\nb\n#if 1\n#endif\nc\n#endif\nd\n"
+    if region_until_matching_endif(nested, 0) != "a\n#if X\nb\n#if 1\n#endif\nc\n":
+        problems.append("region_until_matching_endif stops at a nested #endif")
     for label, edits in ESCAPES:
         mutated = squeeze(sycl)
         if not all(squeeze(anchor) in mutated for anchor, _ in edits):
