@@ -49,16 +49,18 @@ class tlsf_allocator {
 
     // The size a request of `size` bytes at `alignment` actually occupies: rounded up to the larger of
     // the alignment and the grain, so every block offset stays on the grain (llama.cpp-f8ws).  Returns 0
-    // for a zero size and for a size the rounding would wrap.  Aborts on an alignment over the grain:
-    // offsets carry the grain's alignment and no more, so a caller that needs more aligns above this
-    // allocator.  The one definition of the rule; allocate(), carve_gap(), allocate_excluding() and the
+    // for a zero size and for a size the rounding would wrap (the guard is conservative by one grain: a size
+    // within one grain of the top is refused although it would not wrap).  Aborts on an alignment over the
+    // grain, but only for a request that gets past those two refusals, as allocate() always has: offsets
+    // carry the grain's alignment and no more, so a caller that needs more aligns above this allocator.  The
+    // one definition of the rule; allocate(), carve_gap(), allocate_excluding(), allocate_at() and the
     // pending-range draws all read it from here.
     static size_t round_request(size_t size, size_t alignment) {
-        TLSF_ASSERT(alignment <= block_grain && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
         const size_t granularity = alignment > block_grain ? alignment : block_grain;
         if (size == 0 || size > SIZE_MAX - granularity) {
             return 0;
         }
+        TLSF_ASSERT(alignment <= block_grain && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
         return (size + granularity - 1) & ~(granularity - 1);
     }
 
@@ -228,7 +230,11 @@ class tlsf_allocator {
     // whose recorded extent already includes an absorbed tail (a size that is
     // not a multiple of the grain): allocate_at() would round such a size up
     // past the region end and refuse it.  offset must be on the grain; the extent
-    // must lie wholly inside one free block.
+    // must lie wholly inside one free block.  The grid rule: an extent off the
+    // grain would leave the block after it off the grain (check_invariants()
+    // fails and the next allocate() aborts, llama.cpp-f8ws), so it is refused
+    // unless it ends exactly at the free block's end, where the block simply ends
+    // off the grain as the region does.
     // ------------------------------------------------------------------
     struct excluded_range {
         size_t offset;
@@ -252,6 +258,9 @@ class tlsf_allocator {
             id = blocks_[id].prev_block;
         }
         if (id < 0 || !blocks_[id].free || offset + size > blocks_[id].offset + blocks_[id].size) {
+            return SIZE_MAX;
+        }
+        if ((size % MIN_BLOCK_SIZE) != 0 && offset + size != blocks_[id].offset + blocks_[id].size) {
             return SIZE_MAX;
         }
         remove_free(id);
@@ -294,12 +303,12 @@ class tlsf_allocator {
                               size_t                              size,
                               size_t                              alignment = 256,
                               uint8_t                             tag       = 0) {
+        for (const excluded_range & r : excluded) {
+            TLSF_ASSERT(r.offset <= SIZE_MAX - r.size && "an excluded range wraps the address space");
+        }
         size = round_request(size, alignment);
         if (size == 0) {
             return SIZE_MAX;
-        }
-        for (const excluded_range & r : excluded) {
-            TLSF_ASSERT(r.offset <= SIZE_MAX - r.size && "an excluded range wraps the address space");
         }
         std::vector<int> free_ids;
         for (int id = last_block_; id >= 0; id = blocks_[id].prev_block) {

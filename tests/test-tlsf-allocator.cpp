@@ -1259,6 +1259,18 @@ static void test_allocate_extent_at() {
     tlsf_allocator u(4096);
     REQUIRE(u.allocate_extent_at(256, 512, 2) == 256 && u.block_size_at(256) == 512 && "an on-grain extent is kept");
     REQUIRE(u.check_invariants());
+    // The grid rule (r2 I2): an extent off the grain would leave the block after it off the grain, so it is
+    // refused unless it ends exactly at the free block's end (a tail that absorbed a sub-grain remainder).
+    tlsf_allocator v(4096);
+    REQUIRE(v.allocate_extent_at(0, 300, 1) == SIZE_MAX && "an off-grain extent inside a larger free block");
+    REQUIRE(v.check_invariants() && v.used() == 0 && v.allocate(256, 256, 2) == 0 && "and nothing was carved");
+    tlsf_allocator w(1000);
+    REQUIRE(w.allocate_extent_at(0, 300, 1) == SIZE_MAX && "an off-grain extent short of the free block's end");
+    REQUIRE(w.allocate_extent_at(0, 800, 1) == SIZE_MAX &&
+            "an off-grain extent is refused even when the 200-byte remainder would be absorbed: the extent is exact");
+    REQUIRE(w.allocate_extent_at(256, 744, 1) == 256 && w.block_size_at(256) == 744 &&
+            "an off-grain extent that ends exactly at the free block's end");
+    REQUIRE(w.check_invariants());
     std::cout << "test_allocate_extent_at: PASSED\n";
 }
 
@@ -1270,7 +1282,18 @@ static void test_round_request() {
     REQUIRE(tlsf_allocator::round_request(256, 256) == 256);
     REQUIRE(tlsf_allocator::round_request(257, 256) == 512);
     REQUIRE(tlsf_allocator::round_request(SIZE_MAX, 256) == 0);
-    REQUIRE(tlsf_allocator::round_request(SIZE_MAX - 255, 256) == 0 && "a size one grain short of the top wraps");
+    // An alignment over the grain asserts only for a request that gets as far as the rounding; a zero size or
+    // one the guard refuses answers 0 first, as allocate() always has (r2 m1).
+    REQUIRE(tlsf_allocator::round_request(0, 4096) == 0);
+    REQUIRE(tlsf_allocator::round_request(SIZE_MAX, 4096) == 0);
+    {
+        tlsf_allocator t(4096);
+        REQUIRE(t.allocate(0, 4096) == SIZE_MAX && "a zero size at an over-grain alignment is refused, not an abort");
+    }
+    // SIZE_MAX - 255 is on the grain and would round to itself; the guard `size > SIZE_MAX - granularity` is
+    // conservative by one grain, so it is refused although it does not wrap.
+    REQUIRE(tlsf_allocator::round_request(SIZE_MAX - 255, 256) == 0 &&
+            "refused one grain early, though it does not wrap");
     REQUIRE(tlsf_allocator::round_request(SIZE_MAX - 256, 256) == ((SIZE_MAX - 256 + 255) & ~size_t(255)) &&
             "the largest representable round-up is kept");
     std::cout << "test_round_request: PASSED\n";

@@ -163,6 +163,8 @@ struct pending_key {
 enum class pending_replace_status : uint8_t {
     OK = 0,
     OLD_NOT_FOUND,  // `old` is not an allocated block of this TLSF
+    ZERO_SIZE,      // a replacement of no bytes: a caller bug, not a range miss
+    SIZE_OVERFLOW,  // a size (or offset) whose grain rounding or end wraps the address space
     OUTSIDE_RANGE,  // the new range is not inside `old`'s block plus the owner's ranges of the term
     REST_NOT_ONE,   // a term other than WEIGHT left a rest in two pieces: it has one remainder handle
     CARVE_FAILED,   // the new range is not free once `old` is released; `old` is restored whole
@@ -395,7 +397,7 @@ class pending_range_set {
     // returns CARVE_FAILED; every refusal before the release changes nothing.
     // The handle half (classifying `old`'s other references, retiring its
     // registration, the HOST_TIER refusal) is the caller's.
-    // A requirement on that handle half (23mk S4a): this core frees `old`
+    // A requirement on that handle half (llama.cpp-23mk, acceptance criterion S4a): this core frees `old`
     // unconditionally and nothing in it counts `old`'s references, so when the
     // handle-level replace_within lands it must carry an L-CALLER-style latch
     // that limits the callers of replace_within_block to replace_within and
@@ -415,9 +417,13 @@ class pending_range_set {
             out.status = pending_replace_status::OLD_NOT_FOUND;
             return out;
         }
+        if (new_size == 0) {
+            out.status = pending_replace_status::ZERO_SIZE;
+            return out;
+        }
         const size_t rounded_new = tlsf_allocator::round_request(new_size, tlsf_allocator::block_grain);
         if (rounded_new == 0 || new_offset > SIZE_MAX - rounded_new) {
-            out.status = pending_replace_status::OUTSIDE_RANGE;
+            out.status = pending_replace_status::SIZE_OVERFLOW;
             return out;
         }
         const uint8_t old_tag                    = tlsf.tag_at(old_offset);
@@ -430,14 +436,18 @@ class pending_range_set {
             out.status = pending_replace_status::OUTSIDE_RANGE;
             return out;
         }
-        // The rest of old's block, as the pieces outside the new range.
+        // The rest of old's block, as the pieces outside the new range.  The piece after is judged here as the
+        // carve will leave it: a tail under one grain is absorbed into the new block (split_block takes a
+        // remainder below the grain whole), and it is only ever an off-grain region end, since new_end and every
+        // other offset are on the grain.  The carve below recomputes it from the block it actually made.
         const size_t before_lo = old_offset;
         const size_t before_hi = std::min(new_offset, old_end);
-        const size_t after_lo  = std::max(new_end, old_offset);
-        const size_t after_hi  = old_end;
         const size_t before    = before_hi > before_lo ? before_hi - before_lo : 0;
-        const size_t after     = after_hi > after_lo ? after_hi - after_lo : 0;
-        if (term != pending_term::WEIGHT && before != 0 && after != 0) {
+        const size_t after_hi  = old_end;
+        const size_t after_lo0 = std::max(new_end, old_offset);
+        const size_t after_pre = after_hi > after_lo0 ? after_hi - after_lo0 : 0;
+        const size_t after_exp = after_pre < tlsf_allocator::block_grain ? 0 : after_pre;
+        if (term != pending_term::WEIGHT && before != 0 && after_exp != 0) {
             out.status = pending_replace_status::REST_NOT_ONE;
             return out;
         }
@@ -452,6 +462,13 @@ class pending_range_set {
             out.status = pending_replace_status::CARVE_FAILED;
             return out;
         }
+        // The piece after the new block, from the block the carve actually made: a tail it absorbed is part of
+        // the new block, not of the rest.
+        const size_t got_end  = got + tlsf.block_size_at(got);
+        const size_t after_lo = std::max(got_end, old_offset);
+        const size_t after    = after_hi > after_lo ? after_hi - after_lo : 0;
+        TLSF_ASSERT(!(term != pending_term::WEIGHT && before != 0 && after != 0) &&
+                    "replace_within_block left a rest in two pieces after the carve");
         size_t       rest_offset = SIZE_MAX;
         const size_t rest_size   = before != 0 ? before : after;
         if (term != pending_term::WEIGHT && rest_size != 0) {

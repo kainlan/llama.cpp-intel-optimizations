@@ -495,6 +495,23 @@ void case_excluding_caller_contract() {
           }),
           "an excluded range whose end wraps asserts");
     CHECK(t.used() == 0, "and allocated nothing");
+    // The wrap is diagnosed before the request is looked at (r2 m3): a zero or overflowing size still asserts.
+    CHECK(asserts([&] {
+              t.allocate_excluding(
+                  {
+                      R{ 4096, SIZE_MAX }
+              },
+                  0, 256, 1);
+          }),
+          "a wrapping excluded range asserts for a zero-size request too");
+    CHECK(asserts([&] {
+              t.allocate_excluding(
+                  {
+                      R{ 4096, SIZE_MAX }
+              },
+                  SIZE_MAX, 256, 1);
+          }),
+          "and for a request whose rounding wraps");
     CHECK(t.allocate_excluding(
               {
                   R{ 256, 0 }
@@ -536,8 +553,8 @@ void case_replace_off_grain_tail() {
         s.record(o, pending_term::ONEDNN_PP_A, 4 * MB, MB);
         const size_t top = SIZE_MAX - 255;  // on the grain
         CHECK(s.replace_within_block(t, o, pending_term::ONEDNN_PP_A, old, top, 512, 4, 6).status ==
-                  pending_replace_status::OUTSIDE_RANGE,
-              "a new range that wraps is outside every range");
+                  pending_replace_status::SIZE_OVERFLOW,
+              "a new range whose end wraps the address space is named, not a range miss");
         CHECK(t.block_size_at(4 * MB) == MB && t.tag_at(4 * MB) == 3, "and old was never released");
     }
     {
@@ -552,6 +569,74 @@ void case_replace_off_grain_tail() {
         CHECK(r.remainder_offset == 512 && r.remainder_size == 488 && t.block_size_at(512) == 488 && t.tag_at(512) == 6,
               "the rest is one remainder block of the tail's exact extent");
         check_ok(t, "off-grain rest");
+    }
+    {
+        // The new carve absorbs the 232-byte tail (r2 I1): the rest is empty, not a carve into the allocated
+        // block.  Another term: no remainder, and the block is the whole 1000 bytes.
+        pending_range_set   s;
+        tlsf_allocator      t(1000);
+        const pending_owner o   = ctx_of(1);
+        const size_t        old = t.allocate_at(0, 768, 3);
+        s.record(o, pending_term::ONEDNN_PP_A, 0, 1000);
+        pending_replace_result r;
+        CHECK(!asserts([&] { r = s.replace_within_block(t, o, pending_term::ONEDNN_PP_A, old, 0, 768, 4, 6); }),
+              "a new range that absorbs the old tail does not abort");
+        CHECK(r.ok() && r.new_offset == 0 && t.block_size_at(0) == 1000 && t.tag_at(0) == 4,
+              "the new block is the whole 1000 bytes");
+        CHECK(r.remainder_offset == SIZE_MAX && r.remainder_size == 0, "and there is no remainder block");
+        CHECK(s.all().empty(), "and no range of the term is left");
+        check_ok(t, "absorbed tail");
+    }
+    {
+        // The same input under WEIGHT: no stale fragment is recorded over the allocated block.
+        pending_range_set   s;
+        tlsf_allocator      t(1000);
+        const pending_owner o   = model_of(1);
+        const size_t        old = t.allocate_at(0, 768, 3);
+        s.record(o, pending_term::WEIGHT, 0, 1000);
+        const pending_replace_result r = s.replace_within_block(t, o, pending_term::WEIGHT, old, 0, 768, 4, 6);
+        CHECK(r.ok() && t.block_size_at(0) == 1000, "the new block is the whole 1000 bytes");
+        CHECK(s.all().empty(), "no fragment is recorded over the allocated block");
+        check_ok(t, "absorbed tail, WEIGHT");
+    }
+    {
+        // The front remainder case: new {256,512} absorbs the tail, the rest is the 256 bytes before it.
+        pending_range_set   s;
+        tlsf_allocator      t(1000);
+        const pending_owner o   = ctx_of(1);
+        const size_t        old = t.allocate_at(0, 768, 3);
+        s.record(o, pending_term::ONEDNN_PP_A, 0, 1000);
+        const pending_replace_result r = s.replace_within_block(t, o, pending_term::ONEDNN_PP_A, old, 256, 512, 4, 6);
+        CHECK(r.ok() && r.new_offset == 256 && t.block_size_at(256) == 744,
+              "a one-piece rest is not refused for a tail the new block absorbs");
+        CHECK(r.remainder_offset == 0 && r.remainder_size == 256 && t.block_size_at(0) == 256 && t.tag_at(0) == 6,
+              "the rest is the front 256 bytes");
+        check_ok(t, "absorbed tail, front rest");
+
+        pending_range_set   w;
+        tlsf_allocator      u(1000);
+        const pending_owner m    = model_of(1);
+        const size_t        old2 = u.allocate_at(0, 768, 3);
+        w.record(m, pending_term::WEIGHT, 0, 1000);
+        const pending_replace_result rw = w.replace_within_block(u, m, pending_term::WEIGHT, old2, 256, 512, 4, 6);
+        CHECK(rw.ok() && w.all().size() == 1 && w.all()[0].offset == 0 && w.all()[0].size == 256,
+              "WEIGHT records only the front fragment");
+        check_ok(u, "absorbed tail, front rest, WEIGHT");
+    }
+    {
+        // A zero size and a size whose rounding wraps are named, apart from a range miss (r2 m2).
+        pending_range_set   s;
+        tlsf_allocator      t(16 * MB);
+        const pending_owner o   = ctx_of(1);
+        const size_t        old = t.allocate_at(4 * MB, MB, 3);
+        s.record(o, pending_term::ONEDNN_PP_A, 4 * MB, MB);
+        CHECK(s.replace_within_block(t, o, pending_term::ONEDNN_PP_A, old, 4 * MB, 0, 4, 6).status ==
+                  pending_replace_status::ZERO_SIZE,
+              "a zero size is named");
+        CHECK(s.replace_within_block(t, o, pending_term::ONEDNN_PP_A, old, 4 * MB, SIZE_MAX, 4, 6).status ==
+                  pending_replace_status::SIZE_OVERFLOW,
+              "a size whose rounding wraps is named");
+        CHECK(t.block_size_at(4 * MB) == MB && t.tag_at(4 * MB) == 3, "and old was never released");
     }
 }
 
