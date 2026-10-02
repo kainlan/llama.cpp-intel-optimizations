@@ -411,6 +411,14 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mmq-src1-plan-source.py
             --self-test)
     set_tests_properties(sycl-mmq-src1-plan-source PROPERTIES LABELS "sycl;memory;planner;host;source-contract")
+    # llama.cpp-8ony: the op arm and the graph-entry walk must ask ONE question -- does the pair fit the ONEDNN zone
+    # the arena was built with -- before sending an op to the oneDNN PP scratch. test-zone-sizing Case 14 proves the
+    # arithmetic. --self-test: three of this gate's checks are absence- or both-sites checks that a tree with only one
+    # consumer wired would still satisfy.
+    add_test(NAME sycl-onednn-pp-scratch-plan-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-onednn-pp-scratch-plan-source.py
+            --self-test)
+    set_tests_properties(sycl-onednn-pp-scratch-plan-source PROPERTIES LABELS "sycl;memory;planner;host;source-contract")
     # --self-test likewise: eight of this gate's checks are absence-based, and
     # the construct they forbid -- max(planned, required), the general temporary
     # fallback, admission after the lock, a debug-gated refusal warning -- is

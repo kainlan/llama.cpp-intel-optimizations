@@ -704,6 +704,31 @@ int main() {
               "an empty inventory plans no dequant scratch");
     }
 
+    // ---- Case 14: oneDNN PP scratch admission (llama.cpp-8ony) ---------------
+    // GPT-OSS 20B on the B50, perplexity -c 512 -ub 512: the ONEDNN zone is 256 MiB and the LM head
+    // (output.weight, Q8_0 2880 x 201088) wants a 1104.6 MiB f16 weight copy plus 256 x 2880 f16 activations.
+    // The head is outside the ONEDNN zone's sizing and inside the RUNTIME dequant plan, so it must not be
+    // sent to the oneDNN scratch: the arena refuses to grow the zone once weights are resident.
+    {
+        const size_t zone_256mib = 256u * 1024u * 1024u;
+        const size_t head_w      = 1158266880;  // 2880 x 201088 x 2
+        const size_t head_a      = 1474560;     // 256 x 2880 x 2
+        const size_t attn_w      = 23592960;    // 2880 x 4096 x 2
+        const size_t attn_a      = 2949120;     // 512 x 2880 x 2
+
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, zone_256mib, attn_w, attn_a),
+              "a per-layer attention weight fits the 256 MiB ONEDNN zone");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, zone_256mib, head_w, head_a),
+              "the LM head does not fit the ONEDNN zone, so it is not planned there");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(false, 0, head_w, head_a),
+              "with no arena there is no zone to disagree with: the unified-cache path serves it");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, 100, 60, 40), "a pair that exactly fills the zone fits");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 100, 60, 41), "one byte over the zone does not fit");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 0, 1, 1), "an empty zone holds nothing");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, SIZE_MAX, SIZE_MAX, 2),
+              "an overflowing pair is refused, not wrapped into a small sum");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

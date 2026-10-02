@@ -247,6 +247,22 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
                                  size_t * src1_bytes);
 
 // ---------------------------------------------------------------------------
+// oneDNN PP scratch admission (llama.cpp-8ony)
+// ---------------------------------------------------------------------------
+//
+// Whether an op's f16 weight + activation copies are PLANNED to live in the ONEDNN zone (the oneDNN PP reorder
+// scratch), as opposed to the planned RUNTIME-zone dense f16 dequant buffers above. One fact with one source:
+// the zone the arena was actually built with. The LM head is deliberately outside the ONEDNN zone's sizing
+// (zone_is_onednn_reorder_eligible) and inside the dequant plan, so asking "is this op a oneDNN PP candidate?"
+// alone sends it to a scratch the plan never provisioned, and the arena then refuses to grow once weights are
+// resident. Both the op arm and the graph-entry walk must ask THIS question, with the same numbers.
+//
+// `arena_active` is false when there is no ONEDNN zone at all (no arena): nothing was planned, nothing can
+// disagree, and the scratch comes from the unified-cache allocation path as it always did. With an arena the
+// pair must fit the zone (sum <= capacity, overflow-checked: a wrapped sum compares as small). Pure.
+bool zone_onednn_pp_scratch_planned(bool arena_active, size_t zone_capacity_bytes, size_t weights_bytes, size_t activations_bytes);
+
+// ---------------------------------------------------------------------------
 // Mispredict accounting
 // ---------------------------------------------------------------------------
 //

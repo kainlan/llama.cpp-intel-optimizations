@@ -309,6 +309,14 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
     return true;
 }
 
+bool zone_onednn_pp_scratch_planned(bool arena_active, size_t zone_capacity_bytes, size_t weights_bytes, size_t activations_bytes) {
+    (void) arena_active;
+    (void) zone_capacity_bytes;
+    (void) weights_bytes;
+    (void) activations_bytes;
+    return true;  // RED stub: admits everything, which is the defect
+}
+
 namespace {
 
 struct underestimate_record {
