@@ -12,22 +12,28 @@
 // The build is -DNDEBUG, so CHECK is explicit and always runs.
 
 // A TLSF_ASSERT that throws, so the assertion arms of the primitive can be tested.
-struct tlsf_assert_error {};
+struct tlsf_assert_error {
+    const char * cond;
+};
 
-#define TLSF_ASSERT(cond)              \
-    do {                               \
-        if (!(cond)) {                 \
-            throw tlsf_assert_error{}; \
-        }                              \
+#define TLSF_ASSERT(cond)                     \
+    do {                                      \
+        if (!(cond)) {                        \
+            throw tlsf_assert_error{ #cond }; \
+        }                                     \
     } while (0)
 
 #include "../pending-range.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// The last CHECK that passed, so an assertion that escapes a case names where the case was.
+static const char * g_last_check = "(none)";
 
 #define CHECK(cond, msg)                                                         \
     do {                                                                         \
@@ -35,6 +41,7 @@ struct tlsf_assert_error {};
             std::fprintf(stderr, "FAIL: %s (%s:%d)\n", msg, __FILE__, __LINE__); \
             std::exit(1);                                                        \
         }                                                                        \
+        g_last_check = msg;                                                      \
     } while (0)
 
 using namespace ggml_sycl;
@@ -495,7 +502,7 @@ void case_excluding_caller_contract() {
           }),
           "an excluded range whose end wraps asserts");
     CHECK(t.used() == 0, "and allocated nothing");
-    // The wrap is diagnosed before the request is looked at (r2 m3): a zero or overflowing size still asserts.
+    // The wrap is diagnosed before the request is looked at: a zero or overflowing size still asserts.
     CHECK(asserts([&] {
               t.allocate_excluding(
                   {
@@ -571,7 +578,7 @@ void case_replace_off_grain_tail() {
         check_ok(t, "off-grain rest");
     }
     {
-        // The new carve absorbs the 232-byte tail (r2 I1): the rest is empty, not a carve into the allocated
+        // The new carve absorbs the 232-byte tail: the rest is empty, not a carve into the allocated
         // block.  Another term: no remainder, and the block is the whole 1000 bytes.
         pending_range_set   s;
         tlsf_allocator      t(1000);
@@ -624,7 +631,7 @@ void case_replace_off_grain_tail() {
         check_ok(u, "absorbed tail, front rest, WEIGHT");
     }
     {
-        // A zero size and a size whose rounding wraps are named, apart from a range miss (r2 m2).
+        // A zero size and a size whose rounding wraps are named, apart from a range miss.
         pending_range_set   s;
         tlsf_allocator      t(16 * MB);
         const pending_owner o   = ctx_of(1);
@@ -845,6 +852,16 @@ void case_replace_other_term_rest() {
 }  // namespace
 
 int main() {
+    std::set_terminate([] {
+        try {
+            throw;
+        } catch (const tlsf_assert_error & e) {
+            std::fprintf(stderr, "FAIL: an uncaught TLSF_ASSERT (%s) after the check \"%s\"\n", e.cond, g_last_check);
+        } catch (...) {
+            std::fprintf(stderr, "FAIL: an uncaught exception after the check \"%s\"\n", g_last_check);
+        }
+        std::abort();
+    });
     case_record_replace_or_append();
     case_filtered_clear();
     case_filter_misuse();

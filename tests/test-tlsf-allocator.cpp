@@ -1259,7 +1259,7 @@ static void test_allocate_extent_at() {
     tlsf_allocator u(4096);
     REQUIRE(u.allocate_extent_at(256, 512, 2) == 256 && u.block_size_at(256) == 512 && "an on-grain extent is kept");
     REQUIRE(u.check_invariants());
-    // The grid rule (r2 I2): an extent off the grain would leave the block after it off the grain, so it is
+    // The grid rule: an extent off the grain would leave the block after it off the grain, so it is
     // refused unless it ends exactly at the free block's end (a tail that absorbed a sub-grain remainder).
     tlsf_allocator v(4096);
     REQUIRE(v.allocate_extent_at(0, 300, 1) == SIZE_MAX && "an off-grain extent inside a larger free block");
@@ -1283,7 +1283,7 @@ static void test_round_request() {
     REQUIRE(tlsf_allocator::round_request(257, 256) == 512);
     REQUIRE(tlsf_allocator::round_request(SIZE_MAX, 256) == 0);
     // An alignment over the grain asserts only for a request that gets as far as the rounding; a zero size or
-    // one the guard refuses answers 0 first, as allocate() always has (r2 m1).
+    // one the guard refuses answers 0 first, as allocate() always has.
     REQUIRE(tlsf_allocator::round_request(0, 4096) == 0);
     REQUIRE(tlsf_allocator::round_request(SIZE_MAX, 4096) == 0);
     {

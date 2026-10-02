@@ -395,6 +395,8 @@ class pending_range_set {
     //     owns.  An empty rest returns no remainder and carves nothing.
     // A failed carve restores `old`'s block whole (offset, size and tag) and
     // returns CARVE_FAILED; every refusal before the release changes nothing.
+    // The refusals are OLD_NOT_FOUND, ZERO_SIZE, SIZE_OVERFLOW, OUTSIDE_RANGE and REST_NOT_ONE, plus CARVE_FAILED
+    // above.
     // The handle half (classifying `old`'s other references, retiring its
     // registration, the HOST_TIER refusal) is the caller's.
     // A requirement on that handle half (llama.cpp-23mk, acceptance criterion S4a): this core frees `old`
@@ -444,10 +446,11 @@ class pending_range_set {
         const size_t before_hi = std::min(new_offset, old_end);
         const size_t before    = before_hi > before_lo ? before_hi - before_lo : 0;
         const size_t after_hi  = old_end;
-        const size_t after_lo0 = std::max(new_end, old_offset);
-        const size_t after_pre = after_hi > after_lo0 ? after_hi - after_lo0 : 0;
-        const size_t after_exp = after_pre < tlsf_allocator::block_grain ? 0 : after_pre;
-        if (term != pending_term::WEIGHT && before != 0 && after_exp != 0) {
+        size_t after_expected = after_hi > std::max(new_end, old_offset) ? after_hi - std::max(new_end, old_offset) : 0;
+        if (after_expected < tlsf_allocator::block_grain) {
+            after_expected = 0;
+        }
+        if (term != pending_term::WEIGHT && before != 0 && after_expected != 0) {
             out.status = pending_replace_status::REST_NOT_ONE;
             return out;
         }
