@@ -4,6 +4,7 @@
 #include "ggml-opt.h"
 #include "ggml-sycl.h"
 #include "llama-adapter.h"
+#include "llama-context-tenant.h"
 #include "llama-cparams.h"
 #include "llama-ext.h"
 #include "llama-fused-resolution.h"
@@ -550,6 +551,24 @@ private:
 
     // The chunk-cap copy of a planned context. Plan scopes open only where it exists.
     llama_plan_caps_ptr plan_caps;
+
+    // The tenant section of the last planned transaction (device compute slots from the measured
+    // chunk caps, host slots on device -1), its key, each device's compute load as that transaction
+    // printed it, and how often the transactions republished or were covered. Written only by a
+    // planned context's transaction.
+    std::vector<ggml_sycl_context_tenant_desc> tenant_section;
+    uint64_t                                   tenant_key = 0;
+    std::map<int32_t, uint64_t>                tenant_compute_load;
+    uint32_t                                   tenant_republish = 0;
+    uint32_t                                   tenant_covered   = 0;
+
+    // The measured compute caps of the SYCL tiers: each measured buft that is a SYCL device's own
+    // buft, or the host buft the CPU backend computes in, with the device index it belongs to.
+    // Any other buft owns no SYCL slot and is left out.
+    std::vector<llama_tenant_buft_caps> measure_tenant_caps(const sched_measure_plan & plan) const;
+
+    // The plan line, one per device the section names, at INFO.
+    void tenant_plan_report(const sched_measure_plan & plan, uint32_t n_ubatch);
 
     bool sched_need_reserve = true;
 

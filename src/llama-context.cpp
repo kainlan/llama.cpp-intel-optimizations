@@ -22,6 +22,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -2249,6 +2250,15 @@ sched_reserve_result llama_context::sched_reserve_transaction() {
             return measured;
         }
 
+        // the tenant section: the measured compute caps, per tier
+        const std::vector<llama_tenant_buft_caps> tenant_caps = measure_tenant_caps(storage.plan);
+        std::string                               tenant_reason;
+        if (!llama_tenant_section_from_caps(tenant_caps, tenant_section, tenant_reason)) {
+            return { sched_reserve_status::REFUSED, tenant_reason };
+        }
+        tenant_key = llama_tenant_key_digest(tenant_section);
+        tenant_plan_report(storage.plan, storage.cparams.n_ubatch);
+
         // the resolution is printed at the publish attempt, whether it commits or is refused
         fused_resolution_report(storage.resolution);
 
@@ -2274,6 +2284,76 @@ sched_reserve_result llama_context::sched_reserve_transaction() {
     fused_resolution    resolution;
     state.resolution = &resolution;
     return sched_reserve_impl(sched_reserve_mode::ALLOC, state);
+}
+
+std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sched_measure_plan & plan) const {
+    std::vector<llama_tenant_buft_caps> out;
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    for (const auto & entry : plan.bufts) {
+        for (size_t i = 0, sycl_ordinal = 0; i < backend_ptrs.size(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+            if (llama_context_dev_is_sycl(dev)) {
+                // the device index its name carries; the position among SYCL backends is the fallback
+                if (entry.buft == backend_buft[i]) {
+                    llama_tenant_buft_caps c;
+                    c.device = llama_context_sycl_device_index(dev, (int) sycl_ordinal);
+                    c.host   = false;
+                    c.cap    = entry.cap;
+                    out.push_back(c);
+                    break;
+                }
+                sycl_ordinal++;
+                continue;
+            }
+            // the CPU backend computes in the host buffer type of the first model device
+            if (entry.buft == backend_buft[i] && !model.devices.empty() &&
+                llama_context_dev_is_sycl(model.devices[0].dev) &&
+                entry.buft == ggml_backend_dev_host_buffer_type(model.devices[0].dev)) {
+                llama_tenant_buft_caps c;
+                c.device = -1;
+                c.host   = true;
+                c.cap    = entry.cap;
+                out.push_back(c);
+                break;
+            }
+        }
+    }
+#else
+    GGML_UNUSED(plan);
+#endif
+    return out;
+}
+
+void llama_context::tenant_plan_report(const sched_measure_plan & plan, uint32_t n_ubatch) {
+    // the devices the section names a compute slot on, in section order
+    std::vector<int32_t> devices;
+    for (const auto & e : tenant_section) {
+        if (e.cohort == GGML_SYCL_CONTEXT_COHORT_COMPUTE &&
+            std::find(devices.begin(), devices.end(), e.device) == devices.end()) {
+            devices.push_back(e.device);
+        }
+    }
+    for (const int32_t dev : devices) {
+        llama_tenant_plan_line_fields f;
+        f.ctx_id     = (uint32_t) sycl_exec_context.value;
+        f.device     = dev;
+        f.n_ubatch   = n_ubatch;
+        f.n_measured = plan.n_measured;
+        f.measure_ms = plan.measure_ms;
+        f.republish  = tenant_republish;
+        f.covered    = tenant_covered;
+        for (const auto & e : tenant_section) {
+            if (e.cohort == GGML_SYCL_CONTEXT_COHORT_COMPUTE && e.device == dev) {
+                f.compute_load += e.slot_bytes;
+                if (e.slot_index == 0) {
+                    f.cap0 = e.slot_bytes;
+                }
+            }
+        }
+        f.compute_delta          = (int64_t) f.compute_load - (int64_t) tenant_compute_load[dev];
+        tenant_compute_load[dev] = f.compute_load;
+        LLAMA_LOG_INFO("%s\n", llama_tenant_plan_line(f).c_str());
+    }
 }
 
 sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state) {

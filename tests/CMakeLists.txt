@@ -3721,6 +3721,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# zhcn C7g: the tenant section of a planned reserve (design 2.2, 2.5, 3.3). The
+# transaction builds it from the measured compute caps between the MEASURE and the
+# publish, refuses by name when the builder does, and prints one plan line per device.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-tenant-section-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-tenant-section-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # zhcn C7f: setter classification (design gate 16, section 2.3). Every
 # llama_context::set_* definition is classified as reserving, measured or none,
 # and the row's contract is pinned on its body; set_warmup reserves on change.
