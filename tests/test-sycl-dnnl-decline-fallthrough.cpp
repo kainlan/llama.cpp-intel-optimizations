@@ -25,10 +25,11 @@
 // consumer.
 //
 // A decline after a write (a later call of the same launch, an inject with after_n > 1) throws
-// dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error. The batched f16 caller in ggml_sycl_mul_mat_f16
-// rethrows it (its `catch (const ggml_sycl_fallback_error &) { throw; }`), ggml_sycl_mul_mat rethrows it (its
-// function-level catch of the same type) and ggml_backend_sycl_graph_compute turns it into GGML_STATUS_FAILED (its
-// `catch (const ggml_sycl_fallback_error & error)`, which returns GGML_STATUS_FAILED). The last arm of main drives it
+// dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error. ggml_sycl_mul_mat's batched f16 branch rethrows it
+// (its `catch (const ggml_sycl_fallback_error &) { throw; }` around ggml_sycl_mul_mat_batched_sycl),
+// ggml_sycl_compute_forward_impl rethrows it (its function-level `catch (const ggml_sycl_fallback_error &) { throw; }`)
+// and ggml_backend_sycl_graph_compute turns it into GGML_STATUS_FAILED (its `catch (const ggml_sycl_fallback_error &
+// error)`, which returns GGML_STATUS_FAILED). The last arm of main drives it
 // on the grouped-query graph with after_n = 3 (call 1 the pre-query, call 2 the first gemm, which wrote dst, call 3
 // the declined second gemm): graph_compute must return GGML_STATUS_FAILED, never SUCCESS and never a crash, with
 // calls = 3, declined = 1, engaged = 1. Its output is undefined after the failed graph and is not compared; run_arm
@@ -519,8 +520,9 @@ int main(int, char ** argv) {
         // A decline AFTER a write (llama.cpp-23mk S3-4, design 4.8): the GQA arm's first slice launches the hoisted
         // pre-query (call 1) and then one gemm per (K head, query head per K head) pair. Declining call 3 refuses the
         // second pair's gemm after the first pair wrote dst, which is not a next path: the decline throws
-        // dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error that the caller, ggml_sycl_mul_mat and
-        // compute_forward all pass through, and graph_compute returns GGML_STATUS_FAILED. It must not be SUCCESS (the
+        // dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error that ggml_sycl_mul_mat's
+        // batched f16 branch and ggml_sycl_compute_forward_impl both rethrow, and graph_compute returns
+        // GGML_STATUS_FAILED. It must not be SUCCESS (the
         // KQ product would be half-written and nobody told) and must not crash.
         //
         // The counters are the positive control: calls == 3 (pre-query, first gemm, declined gemm), declined == 1 and
