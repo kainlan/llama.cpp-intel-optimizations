@@ -64,7 +64,8 @@ itself. R3's reading of an exit is what stays bounded. dropped_status_calls foll
 direct statements, `if`/`with`/`try` nesting, assignments, `rc = main(); print(rc)`, `main() and 0` and `if rc:` (which
 counts only when a branch exits with a failure status). It does not follow it through a helper (`report(main())`), a
 conditional expression with a constant on both sides (`0 if main() else 0`), arithmetic that zeroes it
-(`main() * 0`), a walrus, asyncio.run, or a method call (`G().main()`); a gate like that needs a reviewer.
+(`main() * 0`), a walrus, asyncio.run, a method call (`G().main()`), or a name reassigned before the exit
+(`rc = main(); rc = 0; sys.exit(rc)`); a gate like that needs a reviewer.
 
 `--self-test` also proves the audit can fail: it plants each escape above (and the shapes that must stay clean) into
 temp trees, synthetic and a copy of the real tree (every CMakeLists.txt this audit scans), and requires each to be
@@ -923,6 +924,8 @@ R3_CASES = [
     ("r3-script-main-if-rc-only-prints", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        print("failed")\n', REG_P_ADD, "R3 test-sycl-p.py"),
     ("r3-script-main-if-rc-raises-system-exit-0", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        raise SystemExit(0)\n', REG_P_ADD, "R3 test-sycl-p.py"),
     ("r3-script-main-if-rc-raises-bare-system-exit", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        raise SystemExit\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-script-other-name-dropped", "import sys\n\n\ndef run():\n    return 1\n\n\nif __name__ == \"__main__\":\n    run()\n", REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-ok-script-main-if-not-rc-else-raises", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if not rc:\n        print("ok")\n    else:\n        raise SystemExit(77)\n', REG_P_ADD, None),
     ("r3-ok-script-main-if-not-rc-else-exit", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if not rc:\n        print("ok")\n    else:\n        sys.exit(rc)\n', REG_P_ADD, None),
     ("r3-ok-script-main-if-rc-raises-failure", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        raise SystemExit(77)\n', REG_P_ADD, None),
     ("r3-ok-script-main-if-rc-exits-nonzero-else-exits-0", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        sys.exit(rc)\n    else:\n        sys.exit(0)\n', REG_P_ADD, None),
@@ -988,6 +991,9 @@ MATCH_CASES += [
     ("reg-will-fail", "add_test(NAME o COMMAND python3 " + _M + ")\nset_tests_properties(o PROPERTIES WILL_FAIL TRUE)\n"),
     ("reg-pass-regex", "add_test(NAME o COMMAND python3 " + _M + ")\nset_tests_properties(o PROPERTIES PASS_REGULAR_EXPRESSION \"ok|FAIL\")\n"),
     ("reg-skip-regex", "add_test(NAME o COMMAND python3 " + _M + ")\nset_tests_properties(o PROPERTIES SKIP_REGULAR_EXPRESSION \".\")\n"),
+    # CMake property names are case-sensitive, but a lowercase spelling is not worth betting a gate on: fail closed.
+    ("reg-disabled-lowercase-key", "add_test(NAME o COMMAND python3 " + _M + ")\nset_tests_properties(o PROPERTIES disabled TRUE)\n"),
+    ("reg-skip-return-code-lowercase-key", "add_test(NAME o COMMAND python3 " + _M + ")\nset_tests_properties(o PROPERTIES skip_return_code 1)\n"),
     ("reg-disabled-via-set-property", "add_test(NAME o COMMAND python3 " + _M + ")\nset_property(TEST o PROPERTY DISABLED ON)\n"),
     ("reg-pytest-disabled-by-name", "llama_test_pytest(python3 NAME o SCRIPT " + _M + ")\nset_tests_properties(o PROPERTIES DISABLED 1)\n"),
     ("reg-pytest-disabled-by-default-name", "llama_test_pytest(python3 SCRIPT " + _M + ")\nset_tests_properties(test-sycl-m PROPERTIES DISABLED TRUE)\n"),
@@ -1116,7 +1122,7 @@ llama_test_pytest(${Python3_EXECUTABLE}
         message = min_gates_band_problem(100, 168) or ""
         if "168" not in message or "100" not in message or "suggested floor 165" not in message:
             failures.append("the MIN_GATES message does not name the count and the suggested floor: %r" % message)
-        for floor, count, wants_problem in ((100, 168, True), (168, 168, False), (152, 168, False), (151, 168, True), (170, 168, True)):
+        for floor, count, wants_problem in ((100, 168, True), (168, 168, False), (152, 168, False), (151, 168, True), (135, 150, False), (134, 150, True), (170, 168, True)):
             if bool(min_gates_band_problem(floor, count)) != wants_problem:
                 failures.append("min_gates_band_problem(%d, %d) %s a problem" % (floor, count, "missed" if wants_problem else "invented"))
         # A registration naming a file that is not in tests/ (R5), and the matching allowlist rules.
@@ -1242,6 +1248,7 @@ CENSUS_BAD_ENTRIES = (
     ("python -c", _b('"/usr/bin/python3" "-c" "pass" "/x/tests/test-sycl-b.py"')),
     ("a DISABLED test", _b('"/usr/bin/python3" "/x/tests/test-sycl-b.py"') + 'set_tests_properties([=[b]=] PROPERTIES  DISABLED "TRUE")\n'),
     ("a WILL_FAIL test", _b('"/usr/bin/python3" "/x/tests/test-sycl-b.py"') + 'set_tests_properties([=[b]=] PROPERTIES  WILL_FAIL "TRUE")\n'),
+    ("DISABLED set through a plain name for a bracketed test name", _b('"/usr/bin/python3" "/x/tests/test-sycl-b.py"') + 'set_tests_properties(b PROPERTIES  DISABLED "TRUE")\n'),
     ("SKIP_RETURN_CODE 1", _b('"/usr/bin/python3" "/x/tests/test-sycl-b.py"') + 'set_tests_properties([=[b]=] PROPERTIES  SKIP_RETURN_CODE "1")\n'),
 )
 
