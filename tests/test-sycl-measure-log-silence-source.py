@@ -398,7 +398,7 @@ def quiet_scope_findings(ctx_cpp: str, ctx_h: str, impl_cpp: str, impl_h: str, m
     impl = code(impl_cpp)
     if "static thread_local int g_log_quiet_depth" not in impl:
         out.append("the quiet depth must be a thread_local counter in llama-impl.cpp")
-    drop = "if (g_log_quiet_depth > 0 && level != GGML_LOG_LEVEL_ERROR) { return; }"
+    drop = "if (g_log_quiet_depth > 0 && !llama_log_quiet_passes(level)) { return; }"
     i = impl.find("void llama_log_internal_v(")
     if i == -1 or drop not in impl[i:]:
         out.append("llama_log_internal_v must drop every non-ERROR line while a quiet scope is open")
@@ -406,9 +406,33 @@ def quiet_scope_findings(ctx_cpp: str, ctx_h: str, impl_cpp: str, impl_h: str, m
         out.append("the drop rule must come before the callback is called")
     if "struct llama_log_quiet_scope" not in code(impl_h):
         out.append("llama-impl.h must declare llama_log_quiet_scope")
+    # what the scope lets through, exactly: an ERROR, and a continuation only after an ERROR
+    passes = (
+        "static bool llama_log_quiet_passes(ggml_log_level level) { "
+        "if (level == GGML_LOG_LEVEL_ERROR) { g_log_quiet_after_error = true; return true; } "
+        "if (level == GGML_LOG_LEVEL_CONT) { return g_log_quiet_after_error; } "
+        "g_log_quiet_after_error = false; return false; }"
+    )
+    if passes not in impl:
+        out.append("llama_log_quiet_passes must pass an ERROR and a continuation only after an ERROR")
+    if "static thread_local bool g_log_quiet_after_error" not in impl:
+        out.append("the after-error flag must be thread_local")
+    # the scope is thread-affine and says so: its destructor refuses to end on a thread that did not open it
+    dtor = "llama_log_quiet_scope::~llama_log_quiet_scope() {"
+    if dtor not in impl or "GGML_ASSERT(g_log_quiet_depth > 0" not in impl[impl.index(dtor) :].split("}")[0]:
+        out.append("the scope's destructor must assert the depth is positive")
+    if "--g_log_quiet_depth" not in impl or "g_log_quiet_depth++" not in impl:
+        out.append("the scope must count up on open and down on close")
 
     if "std::optional<llama_log_quiet_scope> measure_log_quiet;" not in " ".join(mask(ctx_h).split()):
         out.append("llama_context must hold the scope as a member")
+    else:
+        # the first data member, so it is destroyed last and nothing the context owns unwinds loudly: the
+        # text after the members banner starts with it
+        banner = "    //\n    // members\n    //\n"
+        after = ctx_h.split(banner, 1)[1] if banner in ctx_h else ""
+        if not " ".join(mask(after).split()).startswith("std::optional<llama_log_quiet_scope> measure_log_quiet;"):
+            out.append("measure_log_quiet must be the first data member of llama_context")
 
     m = mask(ctx_cpp)
     ctor = None
@@ -458,10 +482,26 @@ def test_quiet_scope_mutants():
         texts[which] = texts[which].replace(old, new, 1)
         return quiet_scope_findings(texts["ctx_cpp"], texts["ctx_h"], texts["impl_cpp"], texts["impl_h"], mem)
 
-    assert mut("impl_cpp", "level != GGML_LOG_LEVEL_ERROR", "level != GGML_LOG_LEVEL_WARN")
-    assert mut("impl_cpp", "static thread_local int g_log_quiet_depth", "static int g_log_quiet_depth")
+    assert mut("impl_cpp", "if (level == GGML_LOG_LEVEL_ERROR) {", "if (level == GGML_LOG_LEVEL_WARN) {")
+    assert mut("impl_cpp", "static thread_local int  g_log_quiet_depth", "static int g_log_quiet_depth")
     assert mut("ctx_cpp", "if (measure_only) {\n        measure_log_quiet.emplace();\n    }\n", "")
     assert mut("ctx_h", "std::optional<llama_log_quiet_scope> measure_log_quiet;", "")
+    # the member moved behind the model reference, so it would be destroyed before the members after it
+    assert mut(
+        "ctx_h",
+        "    std::optional<llama_log_quiet_scope> measure_log_quiet;\n\n    const llama_model & model;",
+        "    const llama_model & model;\n\n    std::optional<llama_log_quiet_scope> measure_log_quiet;",
+    )
+    # what the scope passes: a continuation with no ERROR before it, an ERROR dropped, the flag shared by threads
+    assert mut("impl_cpp", "return g_log_quiet_after_error;", "return true;")
+    assert mut("impl_cpp", "g_log_quiet_after_error = true;\n        return true;", "return true;")
+    assert mut("impl_cpp", "    g_log_quiet_after_error = false;\n    return false;", "    return false;")
+    assert mut("impl_cpp", "static thread_local bool g_log_quiet_after_error", "static bool g_log_quiet_after_error")
+    # the depth must count both ways, assert before it goes negative, and the drop must use the helper
+    assert mut("impl_cpp", "--g_log_quiet_depth", "g_log_quiet_depth")
+    assert mut("impl_cpp", "g_log_quiet_depth++", "g_log_quiet_depth")
+    assert mut("impl_cpp", "GGML_ASSERT(g_log_quiet_depth > 0", "GGML_ASSERT(true")
+    assert mut("impl_cpp", "!llama_log_quiet_passes(level)", "level != GGML_LOG_LEVEL_ERROR")
     assert mut("impl_h", "struct llama_log_quiet_scope", "struct llama_log_other_scope")
     # a copy of the mechanism in an upstream memory file, or a measure_only test there
     bad = dict(mem)

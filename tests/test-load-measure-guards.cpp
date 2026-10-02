@@ -359,14 +359,32 @@ static void test_quiet_scope() {
     emit_all_levels();
     CHECK(lines.seen.size() == 6, "without a scope %zu of 6 lines arrived", lines.seen.size());
 
-    // in a scope only the ERROR line does
+    // in a scope the ERROR line does, and the continuation that follows it (it belongs to that line); the
+    // continuation after the INFO line and everything else is dropped
     lines.seen.clear();
     {
         llama_log_quiet_scope scope;
         emit_all_levels();
-        CHECK(lines.seen.size() == 1 && lines.seen[0].first == (int) GGML_LOG_LEVEL_ERROR &&
-                  lines.seen[0].second == "e\n",
+        CHECK(lines.seen.size() == 2 && lines.seen[0].first == (int) GGML_LOG_LEVEL_ERROR &&
+                  lines.seen[0].second == "e\n" && lines.seen[1].first == (int) GGML_LOG_LEVEL_CONT &&
+                  lines.seen[1].second == "c\n",
               "in a scope %zu lines arrived", lines.seen.size());
+
+        // a continuation passes only straight after an ERROR: not after a dropped line, and not once another
+        // level has intervened
+        lines.seen.clear();
+        LLAMA_LOG_INFO("i\n");
+        LLAMA_LOG_CONT("c1\n");
+        CHECK(lines.seen.empty(), "a continuation of a dropped INFO line passed");
+        LLAMA_LOG_ERROR("e\n");
+        LLAMA_LOG_CONT("c2\n");
+        LLAMA_LOG_CONT("c3\n");
+        CHECK(lines.seen.size() == 3 && lines.seen[1].second == "c2\n" && lines.seen[2].second == "c3\n",
+              "an ERROR's continuations: %zu lines arrived", lines.seen.size());
+        lines.seen.clear();
+        LLAMA_LOG_WARN("w\n");
+        LLAMA_LOG_CONT("c4\n");
+        CHECK(lines.seen.empty(), "a continuation after an intervening WARN passed");
 
         // a nested scope does not end the outer one when it closes
         {
@@ -383,10 +401,21 @@ static void test_quiet_scope() {
         CHECK(lines.seen.size() == 1 && lines.seen[0].second == "other thread\n", "another thread was silenced");
     }
 
-    // the scope ends with its owner
+    // the scope ends with its owner, and a continuation that was riding on an ERROR does not outlive it
+    // as a pass in the next one
     lines.seen.clear();
     emit_all_levels();
     CHECK(lines.seen.size() == 6, "after the scope %zu of 6 lines arrived", lines.seen.size());
+    {
+        llama_log_quiet_scope first;
+        LLAMA_LOG_ERROR("e\n");
+    }
+    lines.seen.clear();
+    {
+        llama_log_quiet_scope second;
+        LLAMA_LOG_CONT("stale\n");
+        CHECK(lines.seen.empty(), "a continuation passed on an ERROR from an earlier scope");
+    }
 
     // a throw through the scope closes it
     lines.seen.clear();

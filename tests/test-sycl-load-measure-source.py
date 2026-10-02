@@ -273,7 +273,12 @@ def ctor_body(code: str) -> str:
 
 def needs_other_ok(code: str) -> bool:
     b = function_body(code, _NEEDS_OTHER)
-    if not all(t in b for t in ("LLM_ARCH_GEMMA4_ASSISTANT", "LLM_ARCH_EAGLE3", "LLM_ARCH_DFLASH", "tok_embd", "output")):
+    # the predicate's exact form: the assistant always, a draft arch only when it carries no token embedding
+    # or no output of its own (test-measure-context checks the EAGLE3 and assistant answers behaviourally)
+    if z(
+        "return model.arch == LLM_ARCH_GEMMA4_ASSISTANT || ((model.arch == LLM_ARCH_EAGLE3 || "
+        "model.arch == LLM_ARCH_DFLASH) && (model.tok_embd == nullptr || model.output == nullptr));"
+    ) not in z(b):
         return False
     # the predicate is stated once: its arch names appear in neither user
     reason = function_body(code, _REASON)
@@ -285,6 +290,14 @@ def needs_other_ok(code: str) -> bool:
             return False
         if z("llama_model_needs_ctx_other(model)") not in user:
             return False
+    # the constructor's use of it: a missing ctx_other throws, and a given one is what the graph reads
+    if z(
+        "if (llama_model_needs_ctx_other(model)) { if (params.ctx_other == nullptr) { throw std::runtime_error("
+    ) not in z(ctor):
+        return False
+    after = z(ctor).split(z("if (llama_model_needs_ctx_other(model)) {"), 1)[1]
+    if z("cparams.ctx_other = params.ctx_other; }") not in after.split(z("if (params.ctx_other == nullptr) {"), 1)[1]:
+        return False
     return True
 
 
@@ -440,6 +453,13 @@ def test_needs_ctx_other_is_one_predicate():
     assert not needs_other_ok(code.replace(ctor, mutate(ctor, "llama_model_needs_ctx_other(model)", "(model.arch == LLM_ARCH_EAGLE3)"), 1))
     pred = function_body(code, _NEEDS_OTHER)
     assert not needs_other_ok(code.replace(pred, mutate(pred, "LLM_ARCH_GEMMA4_ASSISTANT", "LLM_ARCH_GEMMA4"), 1))
+    # the inner or, the arch list and the outer or are each pinned
+    assert not needs_other_ok(code.replace(pred, mutate(pred, "model.tok_embd == nullptr ||", "model.tok_embd == nullptr &&"), 1))
+    assert not needs_other_ok(code.replace(pred, mutate(pred, "LLM_ARCH_EAGLE3 ||", "LLM_ARCH_EAGLE3 &&"), 1))
+    assert not needs_other_ok(code.replace(pred, mutate(pred, "LLM_ARCH_GEMMA4_ASSISTANT ||", "LLM_ARCH_GEMMA4_ASSISTANT &&"), 1))
+    # the constructor's throw and the ctx_other it hands the graph
+    assert not needs_other_ok(code.replace(ctor, mutate(ctor, "if (params.ctx_other == nullptr) {", "if (false) {"), 1))
+    assert not needs_other_ok(code.replace(ctor, mutate(ctor, "cparams.ctx_other = params.ctx_other;", "cparams.ctx_other = nullptr;"), 1))
 
 
 def test_the_measure_asks_the_unsupported_question_before_any_backend():

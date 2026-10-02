@@ -430,6 +430,15 @@ def test_comments_in_llama_context_say_no_backoff():
     assert comments_say_no_backoff(CONTEXT_CPP)
 
 
+def test_comments_in_the_backend_say_no_backoff():
+    """The backend's comments about the context's reserve (the plan-rejected return, the oyfl re-evaluation)
+    described the retry loop this fork removed; none may speak of a backoff or of seven retries."""
+    assert comments_say_no_backoff(SYCL_CPP)
+    comments = re.findall(r"//[^\n]*", SYCL_CPP)
+    assert not any(re.search(r"retries BUSY|retry loop", c) for c in comments)
+
+
 def test_comment_backoff_mutants():
+    assert not comments_say_no_backoff(SYCL_CPP + "\n// via the caller's own retry loop a BUSY backoff\n")
     assert not comments_say_no_backoff(CONTEXT_CPP + "\n// the probe retries with a bounded exponential BUSY backoff\n")
     assert not comments_say_no_backoff(CONTEXT_CPP + "\n/* the full transaction's own Backoff */\n")

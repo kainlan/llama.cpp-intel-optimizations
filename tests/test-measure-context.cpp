@@ -539,16 +539,58 @@ int main() {
     // measure's refusal share: a fixture whose tensors make it true must be refused, and a model that is not
     // such an arch must not (a mutant that reads the predicate as false refuses nothing and dies on the count)
     int n_ctx_other_refused = 0;
-    for (llm_arch arch : { LLM_ARCH_GEMMA4_ASSISTANT }) {
-        fixture fx;
-        if (!build_model(fx, arch)) {
-            CHECK(false, "%s: the ctx_other fixture did not build", llm_arch_name(arch));
-            continue;
+    {
+        // The predicate reads the loaded tensors: EAGLE3's loader never finds a token embedding in a fixture
+        // (it creates one only if the file carries it), so it shares the target's and needs ctx_other, and the
+        // assistant always does; DFlash creates both optional tensors in a fixture, so it needs none.
+        // `by_reason`: the measure's refusal names ctx_other. EAGLE3 also has an encoder graph, and that is the
+        // reason the measure reports first; the constructor's own refusal below is where its ctx_other shows.
+        struct ctx_other_case {
+            llm_arch arch;
+            bool     needs;
+            bool     by_reason;
+        };
+
+        static const ctx_other_case cases[] = {
+            { LLM_ARCH_GEMMA4_ASSISTANT, true,  true  },
+            { LLM_ARCH_EAGLE3,           true,  false },
+            { LLM_ARCH_DFLASH,           false, false }
+        };
+        for (const ctx_other_case & c : cases) {
+            fixture fx;
+            if (!build_model(fx, c.arch)) {
+                CHECK(false, "%s: the ctx_other fixture did not build", llm_arch_name(c.arch));
+                continue;
+            }
+            CHECK(llama_model_needs_ctx_other(*fx.model) == c.needs, "%s: the predicate answers %d, want %d",
+                  llm_arch_name(c.arch), (int) llama_model_needs_ctx_other(*fx.model), (int) c.needs);
+            const std::string reason = llama_measure_unsupported_reason(*fx.model);
+            CHECK((reason.find("needs ctx_other") != std::string::npos) == c.by_reason,
+                  "%s: the measure's reason is '%s'", llm_arch_name(c.arch), reason.c_str());
+            if (c.needs) {
+                const bool refused = check_unsupported_arch(c.arch, false);
+                n_ctx_other_refused += (refused && c.by_reason) ? 1 : 0;
+            }
         }
-        CHECK(llama_model_needs_ctx_other(*fx.model), "%s: the predicate does not name it", llm_arch_name(arch));
-        n_ctx_other_refused += check_unsupported_arch(arch, false) ? 1 : 0;
     }
-    CHECK(n_ctx_other_refused >= 1, "VOID: no ctx_other architecture was refused by shape");
+    // a real context over a draft model with no ctx_other to share from is refused by name at construction (the
+    // constructor's own use of the predicate; the unsupported reason above is the measure's)
+    {
+        fixture fx;
+        if (build_model(fx, LLM_ARCH_EAGLE3)) {
+            std::string what;
+            bool        threw = false;
+            try {
+                llama_context real(*fx.model, make_params(true));
+            } catch (const std::runtime_error & e) {
+                threw = true;
+                what  = e.what();
+            }
+            CHECK(threw && what.find("requires ctx_other") != std::string::npos,
+                  "eagle3 without ctx_other built a context (threw=%d: %s)", (int) threw, what.c_str());
+        }
+    }
+    CHECK(n_ctx_other_refused >= 1, "VOID: no architecture was refused by the measure for its ctx_other");
     {
         fixture fx;
         if (build_model(fx, LLM_ARCH_LLAMA)) {
