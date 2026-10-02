@@ -448,7 +448,8 @@ def gate30(files, bad):
 # gate 31: L0
 # --------------------------------------------------------------------------------------
 TOKEN_ENTRIES = {
-    "ggml_backend_sycl_set_runtime_context_for_model": "TRANSACTION",
+    # Both public set-runtime-context entries are one-line wrappers; the body, and so the token, is the impl's.
+    "ggml_sycl_set_runtime_context_for_model_impl":    "TRANSACTION",
     "ggml_backend_sycl_set_runtime_context":           "TRANSACTION",
     "ggml_backend_sycl_model_load_begin":              "LOAD",
     "ggml_backend_sycl_stage_inventory_plan":          "LOAD",
@@ -570,6 +571,14 @@ def gate31(files, bad):
         before = b[1:m.start()]
         if re.search(r"[;)]\s*$", before.strip()) and re.search(r"\w+\s*\([^)]*\)\s*;", before):
             bad("gate 31: %s runs a statement before it constructs its token" % fn)
+    # The wrappers of that impl hold no token of their own, so each must reach the impl, or the entry would be a
+    # public door with no token at all.
+    for fn in ("ggml_backend_sycl_set_runtime_context_for_model", "ggml_backend_sycl_set_runtime_context_desc"):
+        bodies = func_bodies(c, fn)
+        if len(bodies) != 1:
+            bad("gate 31: %s has %d definitions" % (fn, len(bodies)))
+        elif "ggml_sycl_set_runtime_context_for_model_impl(" not in text_of(c, bodies[0]):
+            bad("gate 31: %s does not delegate to ggml_sycl_set_runtime_context_for_model_impl" % fn)
     # The witness macro and its sites are always compiled.
     mm = re.search(r"#define\s+GGML_SYCL_WITNESS\s*\(.*?(?:\n(?!\s*#)[^\n]*\\)*\n[^\n]*\n", files[UC_H])
     macro = files[UC_H][files[UC_H].find("#define GGML_SYCL_WITNESS"):files[UC_H].find("#define GGML_SYCL_WITNESS") + 400]

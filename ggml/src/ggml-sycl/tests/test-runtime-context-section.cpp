@@ -546,7 +546,7 @@ void case_coverage_slots() {
 
 void case_ledger_records_only_with_an_n_ctx() {
     load_compute_ledger l;
-    CHECK(!l.record(7, 0, 1000, 0), "an envelope with n_ctx 0 records nothing");
+    CHECK(!l.record(7, 0, 1000, 0, true), "an envelope with n_ctx 0 records nothing");
     CHECK(l.size() == 0, "and the ledger is empty");
     const load_compute_ledger::check_result miss = l.check(7, 0, 1000, true);
     CHECK(miss.result == GGML_SYCL_LATE_CHECK_NOT_RECORDED,
@@ -563,16 +563,16 @@ void case_ledger_records_only_with_an_n_ctx() {
     CHECK(l.check(7, 0, 1000, true).line.empty(), "and only its own: another load's once-only line stays given");
     CHECK(!l.check(7, 0, 1000, false).line.empty() && !l.check(7, 0, 1000, false).line.empty(),
           "a transaction that is not open logs on every call");
-    CHECK(l.record(7, 0, 1000, 8192), "an envelope with an n_ctx records");
+    CHECK(l.record(7, 0, 1000, 8192, true), "an envelope with an n_ctx records");
     CHECK(l.check(7, 0, 1000, true).result == GGML_SYCL_LATE_CHECK_EQUAL, "and the late check compares");
-    CHECK(!l.record(0, 0, 1000, 8192), "transaction 0 records nothing");
-    CHECK(!l.record(7, -1, 1000, 8192), "a host-tier device records nothing");
+    CHECK(!l.record(0, 0, 1000, 8192, true), "transaction 0 records nothing");
+    CHECK(!l.record(7, -1, 1000, 8192, true), "a host-tier device records nothing");
     CHECK(l.size() == 1, "refused records leave the ledger as it was");
 }
 
 void case_ledger_rule() {
     load_compute_ledger l;
-    CHECK(l.record(7, 0, 1000, 8192) && l.record(7, 1, 2000, 8192), "two devices recorded");
+    CHECK(l.record(7, 0, 1000, 8192, true) && l.record(7, 1, 2000, 8192, true), "two devices recorded");
     const load_compute_ledger::check_result eq = l.check(7, 0, 1000, true);
     CHECK(eq.result == GGML_SYCL_LATE_CHECK_EQUAL && eq.line.empty() && !eq.shrink_counted, "equal: EQUAL, no line");
 
@@ -606,7 +606,7 @@ void case_ledger_rule() {
 
 void case_ledger_fails_closed() {
     load_compute_ledger l;
-    CHECK(l.record(7, 0, 1000, 8192), "recorded");
+    CHECK(l.record(7, 0, 1000, 8192, true), "recorded");
     const load_compute_ledger::check_result closed = l.check(7, 0, 1000, false);
     CHECK(closed.result == GGML_SYCL_LATE_CHECK_NOT_RECORDED,
           "a transaction that is not open answers NOT_RECORDED, never EQUAL");
@@ -617,15 +617,45 @@ void case_ledger_fails_closed() {
     CHECK(l.check(8, 0, 1000, true).result == GGML_SYCL_LATE_CHECK_NOT_RECORDED,
           "another load's transaction answers NOT_RECORDED");
     // a later record of the same key replaces the admitted term
-    CHECK(l.record(7, 0, 400, 8192), "re-recorded, smaller");
+    CHECK(l.record(7, 0, 400, 8192, true), "re-recorded, smaller");
     CHECK(l.check(7, 0, 400, true).result == GGML_SYCL_LATE_CHECK_EQUAL, "the replacing record is the admitted term");
-    CHECK(l.record(7, 0, 4000, 8192), "re-recorded, larger");
+    CHECK(l.record(7, 0, 4000, 8192, true), "re-recorded, larger");
     CHECK(l.check(7, 0, 4000, true).result == GGML_SYCL_LATE_CHECK_EQUAL, "and the larger one replaces too");
+}
+
+// A term is recorded only for the load that is open at that instant, which the caller reads under the
+// ledger's lock: a record after the load's end, or for a transaction that never began, would outlive
+// the clear that already ran.
+void case_ledger_record_needs_an_open_txn() {
+    load_compute_ledger l;
+    CHECK(!l.record(7, 0, 1000, 8192, false), "a record for a transaction that is not open records nothing");
+    CHECK(l.size() == 0, "and the ledger is empty");
+    CHECK(l.check(7, 0, 1000, true).result == GGML_SYCL_LATE_CHECK_NOT_RECORDED,
+          "so the late check has nothing to compare");
+    CHECK(l.record(7, 0, 1000, 8192, true), "the same record for the open transaction is kept");
+    CHECK(!l.record(7, 0, 5, 8192, false) && l.check(7, 0, 1000, true).result == GGML_SYCL_LATE_CHECK_EQUAL,
+          "a refused record does not replace the admitted term");
+}
+
+// INFO is dropped at default verbosity in every tool, so a line a caller must see is WARN or ERROR.  The
+// level is the ledger's decision, not the proc's, so that a host test can pin it.
+void case_ledger_log_levels() {
+    load_compute_ledger l;
+    CHECK(l.check(7, 0, 1000, false).level == load_log_level::WARN,
+          "a transaction that is not the open load is a caller defect: WARN");
+    CHECK(l.check(7, 0, 1000, true).level == load_log_level::INFO,
+          "no early term recorded is the expected answer until L6: INFO, once");
+    CHECK(l.check(7, 0, 1000, true).level == load_log_level::NONE, "and silent the second time");
+    CHECK(l.record(7, 0, 1000, 8192, true), "recorded");
+    CHECK(l.check(7, 0, 1000, true).level == load_log_level::NONE, "equal: no line");
+    CHECK(l.check(7, 0, 1001, true).level == load_log_level::ERROR, "a refusal is ERROR");
+    CHECK(l.check(7, 0, 999, true).level == load_log_level::WARN, "the first shrink is WARN");
+    CHECK(l.check(7, 0, 998, true).level == load_log_level::NONE, "and the second is silent");
 }
 
 void case_ledger_clear() {
     load_compute_ledger l;
-    CHECK(l.record(7, 0, 1, 1) && l.record(7, 1, 2, 1) && l.record(8, 0, 3, 1), "three records");
+    CHECK(l.record(7, 0, 1, 1, true) && l.record(7, 1, 2, 1, true) && l.record(8, 0, 3, 1, true), "three records");
     CHECK(l.clear(7) == 2, "a load's clear drops its own terms");
     CHECK(l.size() == 1, "and not another load's");
     CHECK(l.check(7, 0, 1, true).result == GGML_SYCL_LATE_CHECK_NOT_RECORDED, "a cleared load answers NOT_RECORDED");
@@ -748,6 +778,8 @@ int main() {
     case_ledger_records_only_with_an_n_ctx();
     case_ledger_rule();
     case_ledger_fails_closed();
+    case_ledger_record_needs_an_open_txn();
+    case_ledger_log_levels();
     case_ledger_clear();
     case_registry_published_section();
     std::printf("test-runtime-context-section: all cases passed\n");

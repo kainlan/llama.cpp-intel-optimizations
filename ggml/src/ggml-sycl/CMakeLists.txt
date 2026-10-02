@@ -139,9 +139,9 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-l4-proc-registration.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
-    set_tests_properties(test-sycl-l4-proc-registration-gate PROPERTIES LABELS "sycl;source-contract;host" TIMEOUT 1200)
-    # 1200 s: the gate takes ~23 s alone, but its mutation matrix compiles nothing and still ran ~10 min under this host's
-    # permanent load (60+), where the previous 60 s limit timed out a passing run.
+    set_tests_properties(test-sycl-l4-proc-registration-gate PROPERTIES LABELS "sycl;source-contract;host" TIMEOUT 300)
+    # 300 s: the gate strips the 6 MB source once and applies each mutant to that text, ~7 s idle.  It runs ~40 s under this
+    # host's permanent load (60+), where the default 60 s limit leaves too little margin for a passing run.
     # llama.cpp-23mk S3-3: the three oneDNN wrappers that ask get_scratchpad_mem (softmax, eltwise,
     # binary_broadcast_row) return a [[nodiscard]] bool, make the `return false` decision on a declined scratchpad
     # before anything writes to or binds the output, and never throw or catch. The deleted wrappers (binary,

@@ -366,6 +366,10 @@ inline ggml_sycl_tenant_coverage classify_tenant_coverage(const runtime_context_
 //
 // The strings are canonical (moua design 2.4.2 (b), step 3; ruling Z13.1); zhcn and
 // 23mk mirror them by citation.
+// The level a ledger line is for.  INFO is dropped at default verbosity in every tool, so a line a caller
+// must see in a normal run is WARN or ERROR, and the ledger picks the level so a host test can pin it.
+enum class load_log_level : uint8_t { NONE, INFO, WARN, ERROR };
+
 class load_compute_ledger {
   public:
     static constexpr const char * TERM = "compute";
@@ -380,14 +384,17 @@ class load_compute_ledger {
     struct check_result {
         ggml_sycl_late_check_result result = GGML_SYCL_LATE_CHECK_NOT_RECORDED;
         std::string                 line;  // the line to log, empty for none
+        load_log_level              level = load_log_level::NONE;  // the level of `line`; NONE exactly when it is empty
         bool shrink_counted = false;       // an admitted shrink: the line is the WARN and the counter takes +1
     };
 
-    // Records c(P) = `bytes` for (txn, device).  False, recording nothing, when `n_ctx` is 0 or
-    // `txn` is 0.  A second record of the same key replaces the first: the early stage can stage
-    // a candidate again, and the late check reads the admitted one.
-    bool record(uint64_t txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
-        if (n_ctx == 0 || txn == 0 || device < 0) {
+    // Records c(P) = `bytes` for (txn, device).  False, recording nothing, when `n_ctx` is 0, `txn` is 0, or
+    // `txn_is_open` is false: `txn_is_open` is whether `txn` is the open load transaction, which the caller reads
+    // under the lock that guards this ledger, so a record cannot land after the clear of a load that ended.  A
+    // second record of the same key replaces the first: the early stage can stage a candidate again, and the late
+    // check reads the admitted one.
+    bool record(uint64_t txn, int32_t device, uint64_t bytes, uint32_t n_ctx, bool txn_is_open) {
+        if (n_ctx == 0 || txn == 0 || device < 0 || !txn_is_open) {
             return false;
         }
         terms_[key{ txn, device }].admitted = bytes;
@@ -395,14 +402,16 @@ class load_compute_ledger {
     }
 
     // The late check of (txn, device) against `late_bytes`.  `txn_is_open` is whether `txn` is the
-    // open load transaction, which the caller reads from the lifecycle registry.
-    //   not open                                    NOT_RECORDED, logged on every call (a transaction
+    // open load transaction, which the caller reads from the lifecycle registry under the lock that guards
+    // this ledger.
+    //   not open                                    NOT_RECORDED, WARN on every call (a transaction
     //                                               that is no load is a caller defect)
-    //   open, nothing recorded for the key          NOT_RECORDED, logged ONCE per (load, device): a
-    //                                               load that records nothing asks every device once
-    //                                               and the line would repeat per call
+    //   open, nothing recorded for the key          NOT_RECORDED, INFO ONCE per (load, device): this is the
+    //                                               expected answer until L6 records anything, a load that
+    //                                               records nothing asks every device once, and the line
+    //                                               would repeat per call
     //   late == admitted                            EQUAL, no line
-    //   late  > admitted                            REFUSED, the late string
+    //   late  > admitted                            REFUSED, the late string, ERROR
     //   late  < admitted                            SHRINK_ADMITTED, the shrink WARN once per
     //                                               (load, device, term); the admitted term stands
     check_result check(uint64_t txn, int32_t device, uint64_t late_bytes, bool txn_is_open) {
@@ -414,7 +423,8 @@ class load_compute_ledger {
                 "[LOAD-PLAN] late check on device %d: transaction %llu is not the open load transaction, nothing was "
                 "compared",
                 (int) device, (unsigned long long) txn);
-            r.line = line;
+            r.line  = line;
+            r.level = load_log_level::WARN;
             return r;
         }
         auto it = terms_.find(key{ txn, device });
@@ -427,7 +437,8 @@ class load_compute_ledger {
                 "[LOAD-PLAN] late check on device %d: no early term was recorded for transaction %llu, nothing was "
                 "compared",
                 (int) device, (unsigned long long) txn);
-            r.line = line;
+            r.line  = line;
+            r.level = load_log_level::INFO;
             return r;
         }
         entry & e = it->second;
@@ -439,6 +450,7 @@ class load_compute_ledger {
                 TERM, zone(), (int) device, (size_t) e.admitted, (size_t) late_bytes);
             r.result = GGML_SYCL_LATE_CHECK_REFUSED;
             r.line   = line;
+            r.level  = load_log_level::ERROR;
             return r;
         }
         if (late_bytes < e.admitted) {
@@ -451,6 +463,7 @@ class load_compute_ledger {
                     "(admitted; the early reservation stands)",
                     TERM, (int) device, (size_t) e.admitted, (size_t) late_bytes);
                 r.line           = line;
+                r.level          = load_log_level::WARN;
                 r.shrink_counted = true;
             }
             return r;

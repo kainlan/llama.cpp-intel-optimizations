@@ -13078,7 +13078,10 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
 //
 // Both are leaf state.  A context's section lives in its entry of the device's KV region
 // registry, under the registry's own leaf mutex (L3); the ledger lives under its own leaf
-// mutex.  Neither lock is held across a call out, a log line, or the last drop of a section.
+// mutex.  Neither lock is held across a log line or the last drop of a section.  The one
+// nesting is the ledger's mutex over the lifecycle registry's mutex, for the open-transaction
+// read (ggml_sycl_load_txn_is_open): the order is fixed, because no lifecycle registry method
+// calls into the ledger, so nothing takes them the other way round.
 // Both are allocated once and never destroyed, so a backend freed during static destruction
 // still finds them; they hold no device memory.
 // ---------------------------------------------------------------------------
@@ -13087,6 +13090,8 @@ static ggml_sycl::kv_region_registry & ggml_sycl_kv_region_registry(int device) 
     return registries[device];
 }
 
+// `mutex` guards `ledger`, the process-wide load_compute_ledger, which is an unlocked value type: every
+// access to `ledger` is made with `mutex` held, by the functions that name ggml_sycl_load_ledger().
 struct ggml_sycl_load_ledger_state {
     std::mutex                     mutex;
     ggml_sycl::load_compute_ledger ledger;
@@ -13105,7 +13110,9 @@ static uint64_t ggml_sycl_context_execution_id(const ggml_backend_sycl_context *
 
 // Replace this context's published section; null drops it.  A context that was never bound to an
 // execution context has no registry key, so it publishes nothing and a coverage query about it
-// answers GROWTH.  The replaced section is released after the registry lock.
+// answers GROWTH: fail-closed, but a publish that stores nothing is said so at WARN, because the
+// caller is then waiting on a section that will never exist.  The replaced section is released
+// after the registry lock.
 static void ggml_sycl_published_section_set(const ggml_backend_sycl_context *                         ctx,
                                             std::shared_ptr<const ggml_sycl::runtime_context_section> section) {
     if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
@@ -13113,6 +13120,11 @@ static void ggml_sycl_published_section_set(const ggml_backend_sycl_context *   
     }
     const uint64_t id = ggml_sycl_context_execution_id(ctx);
     if (id == 0) {
+        if (section) {
+            GGML_LOG_WARN(
+                "[CONTEXT-PLAN] a runtime-context descriptor was published for a backend context that is not bound "
+                "to an execution context: no section is stored, and a coverage query answers GROWTH\n");
+        }
         return;
     }
     auto & registry = ggml_sycl_kv_region_registry(ctx->device);
@@ -13122,28 +13134,63 @@ static void ggml_sycl_published_section_set(const ggml_backend_sycl_context *   
 }
 
 // The backend context is going away: its entry's section goes with it.  Runs before the execution
-// binding is reset, which is what clears the context id.  Never throws.
+// binding is reset, which is what clears the context id.  Never throws, because a destructor cannot
+// let one out; the registry's lock failing is the only way the drop can, and it is said at WARN.  The
+// publish tail does NOT use this: it calls ggml_sycl_published_section_set directly and lets such a
+// failure out, so a section describing the replaced shape is never kept silently.
 static void ggml_sycl_published_section_erase(const ggml_backend_sycl_context * ctx) noexcept {
     try {
         ggml_sycl_published_section_set(ctx, nullptr);
     } catch (...) {
+        GGML_LOG_WARN("[CONTEXT-PLAN] the published section of a backend context could not be dropped\n");
     }
+}
+
+// Whether `txn` is the open load transaction.  The caller holds the ledger's mutex, so that a clear
+// cannot run between this read and the use of its answer (the lifecycle registry's mutex is taken and
+// released inside, which is the one nesting the block comment above names).
+static bool ggml_sycl_load_txn_is_open(uint64_t txn) {
+    return txn != 0 && ggml_sycl::lifecycle::global_registry().admission_diagnostics().active_txn == txn;
 }
 
 // The one writer of the compute-term ledger's terms: c(P) for (load transaction, device), the term
 // the early inventory stage admitted (zhcn measure call site (b)).  False, recording nothing, when
-// the load carries no n_ctx: an envelope with no shape has no c(P) to measure, and the late check
-// then answers NOT_RECORDED.
+// the load carries no n_ctx (an envelope with no shape has no c(P) to measure, and the late check
+// then answers NOT_RECORDED) or when `txn` is not the open load, which the same lock that guards the
+// ledger decides, so no term lands after the clear of a load that ended.
 //
 // NO PRODUCTION CALLER UNTIL L6.  llama.cpp-moua L6 (moua design 2.4.2 (b)) adds the llama-side
 // early measure call site that reaches this; until fkpg(a) puts a non-zero n_ctx in the envelope the
 // only caller is the private test hook below.  It is the single entry on purpose and is not dead
 // code to delete: scripts/check-sycl-l4-proc-registration.py pins that no other function writes the
 // ledger.
-bool ggml_sycl_load_record_compute_term(uint64_t txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+[[maybe_unused]] static bool ggml_sycl_load_record_compute_term(uint64_t txn,
+                                                                int32_t  device,
+                                                                uint64_t bytes,
+                                                                uint32_t n_ctx) {
     ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
     std::lock_guard<std::mutex>   lock(state.mutex);
-    return state.ledger.record(txn, device, bytes, n_ctx);
+    return state.ledger.record(txn, device, bytes, n_ctx, ggml_sycl_load_txn_is_open(txn));
+}
+
+// One ledger line, at the level the ledger chose for it.
+static void ggml_sycl_load_ledger_log(const ggml_sycl::load_compute_ledger::check_result & r) {
+    if (r.line.empty()) {
+        return;
+    }
+    switch (r.level) {
+        case ggml_sycl::load_log_level::ERROR:
+            GGML_LOG_ERROR("%s\n", r.line.c_str());
+            break;
+        case ggml_sycl::load_log_level::WARN:
+            GGML_LOG_WARN("%s\n", r.line.c_str());
+            break;
+        case ggml_sycl::load_log_level::INFO:
+            GGML_LOG_INFO("%s\n", r.line.c_str());
+            break;
+        case ggml_sycl::load_log_level::NONE:
+            break;
+    }
 }
 
 // A load's commit or rollback drops its terms.  Returns how many.
@@ -13591,7 +13638,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             return ggml_sycl_load_end_replay_result(ticket, model);
         }
 
-        // This call finishes the load: whatever way it ends, the load's early terms are done.
+        // This call finishes the load: whatever way it ends from here, the load's early terms are done.  The
+        // recovery path below, which ends a load whose finisher was not reserved here, clears them itself.
         ggml_sycl_load_ledger_clear_guard           ledger_clear{ txn.id };
         ggml_sycl::lifecycle::finisher_effect_scope finisher_effect;
         if (ticket.commit) {
@@ -13744,6 +13792,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             if (!recovery.finisher) {
                 return ggml_sycl_load_end_replay_result(recovery, model);
             }
+            (void) ggml_sycl_load_clear_compute_terms(txn.id);
             ggml_sycl_finalize_binding_failure_abort(*registry, recovery);
         }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
@@ -19718,7 +19767,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     ctx->runtime_kv_admitted = true;
     // Any publish changes the context's shape, so a section published earlier no longer describes it.
     // The descriptor path publishes its own section after this returns.
-    ggml_sycl_published_section_erase(ctx);
+    // Not the swallowing helper: a drop that fails must reach the caller, not leave this section behind.
+    ggml_sycl_published_section_set(ctx, nullptr);
     return ggml_sycl_txn_result::ACCEPTED;
 }
 
@@ -20163,23 +20213,13 @@ enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check(ggml_sycl_loa
         return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
     }
     try {
-        const bool open =
-            txn.id != 0 && ggml_sycl::lifecycle::global_registry().admission_diagnostics().active_txn == txn.id;
         ggml_sycl::load_compute_ledger::check_result r;
         {
             ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
             std::lock_guard<std::mutex>   lock(state.mutex);
-            r = state.ledger.check(txn.id, device, compute_bytes, open);
+            r = state.ledger.check(txn.id, device, compute_bytes, ggml_sycl_load_txn_is_open(txn.id));
         }
-        if (!r.line.empty()) {
-            if (r.result == GGML_SYCL_LATE_CHECK_REFUSED) {
-                GGML_LOG_ERROR("%s\n", r.line.c_str());
-            } else if (r.shrink_counted) {
-                GGML_LOG_WARN("%s\n", r.line.c_str());
-            } else {
-                GGML_LOG_INFO("%s\n", r.line.c_str());
-            }
-        }
+        ggml_sycl_load_ledger_log(r);
         if (r.shrink_counted) {
             ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::late_term_shrink_admitted, device);
         }

@@ -1525,6 +1525,14 @@ int main() {
             std::fprintf(stderr, "L4 ledger: a late check after the commit still compared\n");
             return 1;
         }
+        // Nor does a term land after the end: the clear already ran, so a record for the ended load, or for a
+        // transaction that never began, would outlive it.
+        if (CALL_SYCL(ggml_backend_sycl_test_record_compute_term)(l4_commit, 0, 1000, 8192) ||
+            CALL_SYCL(ggml_backend_sycl_test_record_compute_term)(other_txn, 0, 1000, 8192) ||
+            CALL_SYCL(ggml_backend_sycl_test_compute_term_count)() != terms_before) {
+            std::fprintf(stderr, "L4 ledger: a term was recorded for a transaction that is not the open load\n");
+            return 1;
+        }
         if (CALL_SYCL(ggml_backend_sycl_model_unloaded_token)(l4_token) != GGML_SYCL_LIFECYCLE_OK) {
             std::fprintf(stderr, "L4 ledger: teardown of the committed load failed\n");
             return 1;

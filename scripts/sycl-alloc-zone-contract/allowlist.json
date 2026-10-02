@@ -266,7 +266,7 @@
       "file": "ggml-sycl.cpp",
       "function": "ggml_sycl_published_section_erase",
       "count": 1,
-      "reason": "ggml_sycl_published_section_erase is noexcept and runs from ~ggml_backend_sycl_context: its try body is one registry set_published_section with a null section (a map find and an erase, no allocation of device memory and no planned-refusal path), and a rethrow of ggml_sycl_fallback_error out of a destructor would std::terminate. Permanent; llama.cpp-moua L4 step 3."
+      "reason": "ggml_sycl_published_section_erase is noexcept and runs from ~ggml_backend_sycl_context: its try body is ggml_sycl_published_section_set with a null section (the execution_state_mutex read of the context id and one registry drop_published_section: a map find and an erase, no allocation of device memory and no planned-refusal path), and a rethrow of ggml_sycl_fallback_error out of a destructor would std::terminate. Permanent; llama.cpp-moua L4 step 3."
     },
     {
       "id": "E-L4-LEDGER-CLEAR",
@@ -290,7 +290,7 @@
       "file": "ggml-sycl.cpp",
       "function": "ggml_backend_sycl_load_late_check",
       "count": 1,
-      "reason": "ggml_backend_sycl_load_late_check is a C-ABI comparison of two byte counts through the ledger: its try body takes a mutex and formats a log line, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and answers NOT_RECORDED, the fail-closed value. Permanent; llama.cpp-moua L4 step 3."
+      "reason": "ggml_backend_sycl_load_late_check is a C-ABI comparison of two byte counts through the ledger: its try body reads the open load transaction from the lifecycle registry (admission_diagnostics), takes the ledger mutex and formats a log line, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and answers NOT_RECORDED, the fail-closed value. Permanent; llama.cpp-moua L4 step 3."
     }
   ]
 }

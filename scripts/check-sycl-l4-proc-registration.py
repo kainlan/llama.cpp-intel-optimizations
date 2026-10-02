@@ -19,13 +19,21 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
     binding (which zeroes the registry key);
   * the runtime-context transaction drops the published section on its success tail, and the
     descriptor publish stores a section only after the inner transaction succeeded;
-  * the late check reads the open transaction from the lifecycle registry, and
-    late_term_shrink_admitted has that one producer;
+  * the late check and the record read the open transaction (ggml_sycl_load_txn_is_open) only after the
+    ledger's mutex is taken, and every function that names the ledger takes that mutex before its first
+    use of it; late_term_shrink_admitted has one producer;
+  * the fail-closed values: the late check answers NOT_RECORDED, the coverage query GROWTH and the clear 0
+    on a closed module or an exception, a coverage query of an unbound context answers GROWTH, and a
+    refusal logs at ERROR, a shrink and a not-open transaction at WARN (through ggml_sycl_load_ledger_log);
+  * a publish for an unbound context is said at WARN, and the destructor's erase says a failed drop at
+    WARN; the publish tail drops through the throwing set, not the erase;
+  * the recovery path that ends a load without the clear guard clears the load's terms itself;
 
 Usage:
   check-sycl-l4-proc-registration.py [--root DIR]     check the tree, then run the mutation matrix
   check-sycl-l4-proc-registration.py --no-mutations   check the tree only
   check-sycl-l4-proc-registration.py --mutations-only run the mutation matrix only
+  check-sycl-l4-proc-registration.py --verbose        also name each mutant and the failure that caught it
 
 The mutation matrix applies each RED to the source text in memory and requires the gate to fail with
 that RED's message, so a check that can no longer fail is caught.
@@ -35,6 +43,12 @@ import argparse
 import os
 import re
 import sys
+
+SIG_RECORD = r"\bbool\s+ggml_sycl_load_record_compute_term\s*\("
+SIG_CLEAR = r"\bsize_t\s+ggml_sycl_load_clear_compute_terms\s*\("
+SIG_LATE = r"\benum\s+ggml_sycl_late_check_result\s+ggml_backend_sycl_load_late_check\s*\("
+SIG_COUNT = r'\bextern\s+"C"\s+size_t\s+ggml_backend_sycl_test_compute_term_count\s*\('
+SIG_COVERAGE = r"\benum\s+ggml_sycl_tenant_coverage\s+ggml_backend_sycl_tenant_coverage\s*\("
 
 HEADER = "ggml/include/ggml-sycl.h"
 SOURCE = "ggml/src/ggml-sycl/ggml-sycl.cpp"
@@ -110,9 +124,19 @@ def header_proc_names(header_raw):
     return re.findall(r'Proc name:\s*"([A-Za-z0-9_]+)"', header_raw)
 
 
-def check(header_raw, source_raw):
+def function_span(text, signature_re):
+    """(start, end) of the first definition whose header matches signature_re, or None."""
+    body = function_body(text, signature_re)
+    if body is None:
+        return None
+    start = text.find(body)
+    return (start, start + len(body))
+
+
+def check(header_raw, source):
+    """`source` is the comment-stripped, normalized text: a mutation is one edit of it, so the (slow) strip is
+    done once, not once per mutant."""
     fails = []
-    source = strip_comments(source_raw)
     names = header_proc_names(header_raw)
     if len(names) < 3:
         fails.append("L4 proc: fewer than 3 `Proc name:` entries in %s (the scan found %d): the gate is void" % (HEADER, len(names)))
@@ -151,22 +175,95 @@ def check(header_raw, source_raw):
         fails.append("L4 ledger: the ledger is written (record) outside ggml_sycl_load_record_compute_term")
     if source.count(".ledger.clear(") != 1 or clr_fn.count(".ledger.clear(") != 1:
         fails.append("L4 ledger: the ledger is cleared outside ggml_sycl_load_clear_compute_terms")
-    allowed = {"ggml_sycl_load_record_compute_term", "ggml_sycl_load_clear_compute_terms",
-               "ggml_backend_sycl_load_late_check", "ggml_backend_sycl_test_compute_term_count"}
-    users = set()
+    ledger_fns = (
+        ("ggml_sycl_load_record_compute_term", r"\bbool\s+ggml_sycl_load_record_compute_term\s*\("),
+        ("ggml_sycl_load_clear_compute_terms", r"\bsize_t\s+ggml_sycl_load_clear_compute_terms\s*\("),
+        ("ggml_backend_sycl_load_late_check",
+         r"\benum\s+ggml_sycl_late_check_result\s+ggml_backend_sycl_load_late_check\s*\("),
+        ("ggml_backend_sycl_test_compute_term_count",
+         r'\bextern\s+"C"\s+size_t\s+ggml_backend_sycl_test_compute_term_count\s*\('),
+    )
+    spans = {}
+    for name, sig in ledger_fns:
+        span = function_span(source, sig)
+        if span is None:
+            if name != "ggml_backend_sycl_test_compute_term_count":  # the hook is a test build's
+                fails.append("L4 ledger: %s not found" % name)
+            continue
+        spans[name] = span
+    stray = set()
     for m in re.finditer(r"\bggml_sycl_load_ledger\s*\(\s*\)", source):
         if re.match(r"\s*\{", source[m.end():]):
             continue  # the accessor's own definition
-        head = source[:m.start()]
-        fn = [x for x in re.findall(r'\n(?:extern\s+"C"\s+)?(?:[A-Za-z_][\w:<>\*&, ]*\s+)?\*?&?\s*([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:noexcept\s*)?\{', head)
-              if x not in ("if", "for", "while", "switch", "catch")]
-        users.add(fn[-1] if fn else "?")
-    extra = users - allowed
-    if extra:
-        fails.append("L4 ledger: the ledger accessor is named outside the four sanctioned functions: %s" % sorted(extra))
-    for a in sorted(allowed):
-        if a not in users and a != "ggml_backend_sycl_test_compute_term_count":  # the hook is a test build's
-            fails.append("L4 ledger: %s no longer reaches the ledger through its accessor" % a)
+        if not any(a <= m.start() < b for a, b in spans.values()):
+            stray.add(m.start())
+    if stray:
+        fails.append("L4 ledger: the ledger accessor is named outside the four sanctioned functions (%d use(s))" % len(stray))
+    for name, (a, b) in spans.items():
+        if "ggml_sycl_load_ledger()" not in source[a:b]:
+            fails.append("L4 ledger: %s no longer reaches the ledger through its accessor" % name)
+
+    # the mutex: every function that uses the ledger takes state.mutex before its first `.ledger.` use, and the
+    # two that decide on the open transaction read it only after the lock
+    lock_re = r"std::lock_guard<std::mutex> lock\(state\.mutex\);"
+    for name, (a, b) in spans.items():
+        body = source[a:b]
+        use = body.find(".ledger.")
+        lk = re.search(lock_re, body)
+        if use < 0 or lk is None or lk.start() > use:
+            fails.append("L4 ledger lock: %s uses the ledger without state.mutex held first" % name)
+    for name in ("ggml_sycl_load_record_compute_term", "ggml_backend_sycl_load_late_check"):
+        if name in spans:
+            body = source[spans[name][0]:spans[name][1]]
+            lk = re.search(lock_re, body)
+            op = body.find("ggml_sycl_load_txn_is_open(")
+            if lk is None or op < 0 or op < lk.start():
+                fails.append("L4 ledger lock: %s reads the open transaction outside the ledger's lock" % name)
+    is_open = function_body(source, r"\bstatic\s+bool\s+ggml_sycl_load_txn_is_open\s*\(")
+    if is_open is None or not re.search(
+            r"return txn != 0 && ggml_sycl::lifecycle::global_registry\(\)\.admission_diagnostics\(\)\.active_txn == txn;",
+            is_open):
+        fails.append("L4 ledger open: ggml_sycl_load_txn_is_open is not `txn != 0 && active_txn == txn`")
+    if "record(txn, device, bytes, n_ctx, ggml_sycl_load_txn_is_open(txn))" not in source:
+        fails.append("L4 ledger open: the record is not gated by the open transaction")
+    if "check(txn.id, device, compute_bytes, ggml_sycl_load_txn_is_open(txn.id))" not in source:
+        fails.append("L4 ledger open: the late check is not gated by the open transaction")
+
+    # fail-closed values and levels
+    late_body = function_body(source, r"\benum\s+ggml_sycl_late_check_result\s+ggml_backend_sycl_load_late_check\s*\(") or ""
+    if len(re.findall(r"catch\s*\(\.\.\.\)", late_body)) != 1 or not re.search(
+            r"catch\s*\(\.\.\.\)\s*\{\s*return GGML_SYCL_LATE_CHECK_NOT_RECORDED;\s*\}", late_body):
+        fails.append("L4 fail-closed: the late check's catch does not answer NOT_RECORDED")
+    if not re.search(r"sycl_module_mutation_guard module_guard;\s*if \(!module_guard\) \{\s*return GGML_SYCL_LATE_CHECK_NOT_RECORDED;",
+                     late_body):
+        fails.append("L4 fail-closed: the late check lost its module guard (a closed module answers NOT_RECORDED)")
+    if "ggml_sycl_load_ledger_log(r);" not in late_body:
+        fails.append("L4 log level: the late check does not log through the ledger's level")
+    cov_body = function_body(source, r"\benum\s+ggml_sycl_tenant_coverage\s+ggml_backend_sycl_tenant_coverage\s*\(") or ""
+    if len(re.findall(r"catch\s*\(\.\.\.\)", cov_body)) != 1 or not re.search(
+            r"catch\s*\(\.\.\.\)\s*\{\s*return GGML_SYCL_TENANT_COVERAGE_GROWTH;\s*\}", cov_body):
+        fails.append("L4 fail-closed: the coverage query's catch does not answer GROWTH")
+    if not re.search(r"sycl_module_mutation_guard module_guard;\s*if \(!module_guard \|\|[^{]*\) \{\s*return GGML_SYCL_TENANT_COVERAGE_GROWTH;",
+                     cov_body):
+        fails.append("L4 fail-closed: the coverage query lost its module guard (a closed module answers GROWTH)")
+    if not re.search(r"const uint64_t id = ggml_sycl_context_execution_id\(ctx\);\s*if \(id == 0\) \{\s*return GGML_SYCL_TENANT_COVERAGE_GROWTH;",
+                     cov_body):
+        fails.append("L4 fail-closed: the coverage query of an unbound context does not answer GROWTH")
+    clr_fn2 = function_body(source, r"\bsize_t\s+ggml_sycl_load_clear_compute_terms\s*\(") or ""
+    if not re.search(r"catch\s*\(\.\.\.\)\s*\{\s*return 0;\s*\}", clr_fn2):
+        fails.append("L4 fail-closed: the ledger clear's catch does not answer 0")
+    log_fn = function_body(source, r"\bstatic\s+void\s+ggml_sycl_load_ledger_log\s*\(") or ""
+    for lvl, macro in (("ERROR", "GGML_LOG_ERROR"), ("WARN", "GGML_LOG_WARN"), ("INFO", "GGML_LOG_INFO")):
+        if not re.search(r"case ggml_sycl::load_log_level::" + lvl + r":\s*" + macro + r"\(", log_fn):
+            fails.append("L4 log level: a ledger line of level %s is not logged through %s" % (lvl, macro))
+    set_fn = function_body(source, r"\bstatic\s+void\s+ggml_sycl_published_section_set\s*\(") or ""
+    if not re.search(r"if \(id == 0\) \{\s*if \(section\) \{\s*GGML_LOG_WARN\(", set_fn):
+        fails.append("L4 section: a publish for an unbound context is silent (no WARN)")
+    if not re.search(r"if \(id == 0\) \{\s*if \(section\) \{\s*GGML_LOG_WARN\([^;]*;\s*\}\s*return;\s*\}", set_fn):
+        fails.append("L4 section: a publish for an unbound context goes on to the registry with key 0")
+    erase_fn = function_body(source, r"\bstatic\s+void\s+ggml_sycl_published_section_erase\s*\(") or ""
+    if not re.search(r"catch\s*\(\.\.\.\)\s*\{\s*GGML_LOG_WARN\(", erase_fn):
+        fails.append("L4 section: the destructor's erase swallows a failed drop silently (no WARN)")
 
     # load_end: guard after the finisher check
     end = function_body(source, r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_model_load_end\s*\(")
@@ -180,6 +277,10 @@ def check(header_raw, source_raw):
             fails.append("L4 ledger: model_load_end does not clear the load's compute terms (no guard)")
         elif not (f >= 0 and f < g and (eff < 0 or g < eff)):
             fails.append("L4 ledger: the clear guard must come after the finisher check and before the effects")
+        rc = end.find("(void) ggml_sycl_load_clear_compute_terms(txn.id);")
+        fa = end.find("ggml_sycl_finalize_binding_failure_abort(*registry, recovery);")
+        if fa < 0 or rc < 0 or rc > fa:
+            fails.append("L4 ledger: the recovery path that ends a load without the clear guard does not clear its terms")
 
     # destructor order
     dtor = function_body(source, r"ggml_backend_sycl_context::~ggml_backend_sycl_context\s*\(")
@@ -199,7 +300,7 @@ def check(header_raw, source_raw):
         fails.append("L4 section: ggml_sycl_run_runtime_context_transaction not found")
     else:
         a = txn.find("ctx->runtime_kv_admitted = true;")
-        b = txn.find("ggml_sycl_published_section_erase(ctx);")
+        b = txn.find("ggml_sycl_published_section_set(ctx, nullptr);")
         if a < 0 or b < 0 or b < a:
             fails.append("L4 section: a successful publish does not drop the context's earlier section")
 
@@ -218,8 +319,6 @@ def check(header_raw, source_raw):
     if late is None:
         fails.append("L4 late: ggml_backend_sycl_load_late_check not found")
     else:
-        if "admission_diagnostics().active_txn" not in late:
-            fails.append("L4 late: the late check does not read the open load transaction from the lifecycle registry")
         if "late_term_shrink_admitted" not in late or "r.shrink_counted" not in late:
             fails.append("L4 late: the late check does not count an admitted shrink")
     if len(re.findall(r"dump_counter::late_term_shrink_admitted", source)) != 1:
@@ -227,10 +326,10 @@ def check(header_raw, source_raw):
     return fails
 
 
-def mutations(header_raw, source_raw):
+def mutations(header_raw, source):
     """Each entry: (label, expected message fragment, header text, source text)."""
     muts = []
-    src = source_raw
+    src = source
     for name in header_proc_names(header_raw):
         pat = re.compile(r'    if \(strcmp\(name, "' + re.escape(name) + r'"\) == 0\) \{\n        return \(void \*\) ' + re.escape(name) + r';\n    \}\n')
         if pat.search(src):
@@ -257,15 +356,76 @@ def mutations(header_raw, source_raw):
          "    ggml_sycl_published_section_erase(this);\n    ggml_sycl_execution_unbind_backend(this);",
          "    ggml_sycl_execution_unbind_backend(this);\n    ggml_sycl_published_section_erase(this);"),
         ("the transaction tail's drop removed", "does not drop the context's earlier section",
-         "    ggml_sycl_published_section_erase(ctx);\n    return ggml_sycl_txn_result::ACCEPTED;",
+         "    ggml_sycl_published_section_set(ctx, nullptr);\n    return ggml_sycl_txn_result::ACCEPTED;",
          "    return ggml_sycl_txn_result::ACCEPTED;"),
+        ("the transaction tail through the swallowing erase", "does not drop the context's earlier section",
+         "    ggml_sycl_published_section_set(ctx, nullptr);\n    return ggml_sycl_txn_result::ACCEPTED;",
+         "    ggml_sycl_published_section_erase(ctx);\n    return ggml_sycl_txn_result::ACCEPTED;"),
         ("the section stored on any outcome", "without a successful inner transaction",
          "    if (inner_ok && section) {", "    if (section) {"),
-        ("the late check without the open read", "open load transaction from the lifecycle registry",
-         "admission_diagnostics().active_txn == txn.id", "true"),
         ("the shrink counter dropped", "does not count an admitted shrink",
          "        if (r.shrink_counted) {\n            ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::late_term_shrink_admitted, device);\n        }\n", ""),
     ]
+    # One edit inside one named function: (label, expected message, signature, old, new).  Several of the
+    # lines these touch recur in the other ledger functions, so the edit is scoped to the function it names.
+    scoped = [
+        ("the lock dropped from the record", "ggml_sycl_load_record_compute_term uses the ledger without state.mutex",
+         SIG_RECORD, "    std::lock_guard<std::mutex> lock(state.mutex);\n", ""),
+        ("the lock dropped from the clear", "ggml_sycl_load_clear_compute_terms uses the ledger without state.mutex",
+         SIG_CLEAR, "        std::lock_guard<std::mutex> lock(state.mutex);\n", ""),
+        ("the lock dropped from the late check", "ggml_backend_sycl_load_late_check uses the ledger without state.mutex",
+         SIG_LATE, "            std::lock_guard<std::mutex> lock(state.mutex);\n", ""),
+        ("the lock dropped from the count hook", "ggml_backend_sycl_test_compute_term_count uses the ledger without state.mutex",
+         SIG_COUNT, "    std::lock_guard<std::mutex> lock(state.mutex);\n", ""),
+        ("the open read moved before the lock in the late check", "ggml_backend_sycl_load_late_check reads the open transaction outside",
+         SIG_LATE,
+         "            std::lock_guard<std::mutex> lock(state.mutex);\n            r = state.ledger.check(txn.id, device, compute_bytes, ggml_sycl_load_txn_is_open(txn.id));",
+         "            const bool open_early = ggml_sycl_load_txn_is_open(txn.id);\n            std::lock_guard<std::mutex> lock(state.mutex);\n            r = state.ledger.check(txn.id, device, compute_bytes, open_early);"),
+        ("the record not gated by the open transaction", "the record is not gated by the open transaction",
+         SIG_RECORD, "ggml_sycl_load_txn_is_open(txn)", "true"),
+        ("the late check not gated by the open transaction", "the late check is not gated by the open transaction",
+         SIG_LATE, "ggml_sycl_load_txn_is_open(txn.id)", "true"),
+        ("the open test flipped to a mismatch", "is not `txn != 0 && active_txn == txn`",
+         r"\bstatic\s+bool\s+ggml_sycl_load_txn_is_open\s*\(", "active_txn == txn", "active_txn != txn"),
+        ("the open test accepts transaction 0", "is not `txn != 0 && active_txn == txn`",
+         r"\bstatic\s+bool\s+ggml_sycl_load_txn_is_open\s*\(", "txn != 0 &&", "txn != 0 ||"),
+        ("the late check's catch answers EQUAL", "the late check's catch does not answer NOT_RECORDED",
+         SIG_LATE, "catch (...) {\n        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;", "catch (...) {\n        return GGML_SYCL_LATE_CHECK_EQUAL;"),
+        ("the late check's closed module answers EQUAL", "the late check lost its module guard",
+         SIG_LATE, "    if (!module_guard) {\n        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;", "    if (!module_guard) {\n        return GGML_SYCL_LATE_CHECK_EQUAL;"),
+        ("the coverage catch answers COVERED", "the coverage query's catch does not answer GROWTH",
+         SIG_COVERAGE, "catch (...) {\n        return GGML_SYCL_TENANT_COVERAGE_GROWTH;", "catch (...) {\n        return GGML_SYCL_TENANT_COVERAGE_COVERED;"),
+        ("the coverage unbound-context guard dropped", "of an unbound context does not answer GROWTH",
+         SIG_COVERAGE, "        if (id == 0) {\n            return GGML_SYCL_TENANT_COVERAGE_GROWTH;\n        }\n", ""),
+        ("the coverage module guard dropped", "the coverage query lost its module guard",
+         SIG_COVERAGE, "    if (!module_guard || ", "    if ("),
+        ("the ledger clear's catch answers 1", "the ledger clear's catch does not answer 0",
+         SIG_CLEAR, "    } catch (...) {\n        return 0;", "    } catch (...) {\n        return 1;"),
+        ("the refusal logged at INFO", "a ledger line of level ERROR is not logged through GGML_LOG_ERROR",
+         r"\bstatic\s+void\s+ggml_sycl_load_ledger_log\s*\(",
+         "case ggml_sycl::load_log_level::ERROR:\n            GGML_LOG_ERROR(", "case ggml_sycl::load_log_level::ERROR:\n            GGML_LOG_INFO("),
+        ("the not-open line logged at INFO", "a ledger line of level WARN is not logged through GGML_LOG_WARN",
+         r"\bstatic\s+void\s+ggml_sycl_load_ledger_log\s*\(",
+         "case ggml_sycl::load_log_level::WARN:\n            GGML_LOG_WARN(", "case ggml_sycl::load_log_level::WARN:\n            GGML_LOG_INFO("),
+        ("the late check bypasses the ledger's level", "does not log through the ledger's level",
+         SIG_LATE, "ggml_sycl_load_ledger_log(r);", "GGML_LOG_INFO(\"%s\\n\", r.line.c_str());"),
+        ("a publish for an unbound context is silent", "a publish for an unbound context is silent",
+         r"\bstatic\s+void\s+ggml_sycl_published_section_set\s*\(", "        if (section) {\n            GGML_LOG_WARN(", "        if (false) {\n            GGML_LOG_WARN("),
+        ("the unbound-context return dropped from the section set", "goes on to the registry with key 0",
+         r"\bstatic\s+void\s+ggml_sycl_published_section_set\s*\(", "        }\n        return;\n    }\n", "        }\n    }\n"),
+        ("the destructor's erase swallows silently", "swallows a failed drop silently",
+         r"\bstatic\s+void\s+ggml_sycl_published_section_erase\s*\(", "    } catch (...) {\n        GGML_LOG_WARN(", "    } catch (...) {\n        (void) ("),
+        ("the recovery path no longer clears", "does not clear its terms",
+         r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_model_load_end\s*\(",
+         "            (void) ggml_sycl_load_clear_compute_terms(txn.id);\n", ""),
+    ]
+    for label, msg, sig, old, new in scoped:
+        span = function_span(src, sig)
+        if span is None or src[span[0]:span[1]].count(old) != 1:
+            muts.append(("PATTERN NOT FOUND: " + label, "PATTERN", header_raw, src))
+        else:
+            a, b = span
+            muts.append((label, msg, header_raw, src[:a] + src[a:b].replace(old, new, 1) + src[b:]))
     for label, msg, old, new in pairs:
         if label == "the clear guard before the finisher check":
             moved = src.replace(old, "", 1).replace("        ticket = registry->prepare_end(", "        ggml_sycl_load_ledger_clear_guard ledger_clear{ txn.id };\n        ticket = registry->prepare_end(", 1)
@@ -299,9 +459,10 @@ def main():
     ap.add_argument("--root", default=".")
     ap.add_argument("--no-mutations", action="store_true")
     ap.add_argument("--mutations-only", action="store_true")
+    ap.add_argument("--verbose", action="store_true", help="name each mutant and the failure that caught it")
     args = ap.parse_args()
     header_raw = read(args.root, HEADER)
-    source_raw = read(args.root, SOURCE)
+    source_raw = strip_comments(read(args.root, SOURCE))  # once: a mutation edits this text
     status = 0
     if not args.mutations_only:
         fails = check(header_raw, source_raw)
@@ -326,6 +487,8 @@ def main():
             if not any(msg in g for g in got):
                 print("FAIL: mutation survived: %s (wanted a failure containing %r, got %s)" % (label, msg, got[:2]))
                 status = 1
+            elif args.verbose:
+                print("DIED: %s -> %s" % (label, next(g for g in got if msg in g)))
         if status == 0:
             print("PASS: every mutation is caught")
     return status
