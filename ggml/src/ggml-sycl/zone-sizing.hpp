@@ -71,6 +71,23 @@ struct zone_tensor_desc {
     // populating it degrades the same way a dropped `type` does — see the
     // classifier-collapse section below.
     size_t reorder_size = 0;
+
+    // Q8_1 bytes a dense quantized MUL_MAT quantizes its activations into, PER
+    // TOKEN (llama.cpp-479i): zone_mmq_src1_bytes_per_token(ne[0], ne[2], ne[3]).
+    // Supplied by the adapter, never derived here: whether a tensor is a dense
+    // MUL_MAT operand is the caller's knowledge. Zero means "not one" -- an expert
+    // stack (MUL_MAT_ID, its own moe_q8 workspace), a non-quantized weight, or a
+    // tensor with no shape. The classifier deliberately does NOT decide this from
+    // ne[2] > 1: that is the expert predicate and it misclassifies dense 3-D
+    // operands such as the MLA wk_b / wv_b (llama.cpp-8xbt).
+    size_t mmq_src1_bytes_per_token = 0;
+
+    // dense f16 dequant scratch (llama.cpp-479i): f16 bytes of the WHOLE dequantized weight a
+    // dense MUL_MAT's oneDNN arm materializes (zone_dequant_f16_weight_bytes(ne[0], ne[1])), and the
+    // f16 activation bytes per token it converts alongside (zone_dequant_f16_src1_bytes_per_token).
+    // Supplied by the adapter, which knows the type and the expert role; zero means "not a candidate".
+    size_t dequant_f16_weight_bytes         = 0;
+    size_t dequant_f16_src1_bytes_per_token = 0;
 };
 
 struct path_scoped_maxima {
@@ -98,6 +115,16 @@ struct path_scoped_maxima {
     //    maximum has to be taken over the expanded sizes, which is why this is
     //    its own accumulator rather than a multiplier at the call site.
     size_t onednn_reorder = 0;
+
+    // Largest Q8_1 src1 bytes-per-token over every dense MUL_MAT operand. Not a
+    // per-layer-family maximum: a singleton such as the LM head is a MUL_MAT src0
+    // and counts. See zone_tensor_desc::mmq_src1_bytes_per_token.
+    size_t mmq_src1_bytes_per_token = 0;
+
+    // Largest f16 dequant weight and widest f16 activation row over the adapter's marked
+    // candidates. Both are plain maxima over marked tensors, like mmq_src1_bytes_per_token.
+    size_t dequant_f16_weight_bytes         = 0;
+    size_t dequant_f16_src1_bytes_per_token = 0;
 };
 
 // A (type, ne) group must have at least this many members to be a per-layer
@@ -160,6 +187,66 @@ bool zone_is_dma_streamed(const zone_tensor_desc & tensor, size_t group_cardinal
 path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inventory);
 
 // ---------------------------------------------------------------------------
+// Dense MMQ/MMVQ Q8_1 src1 scratch (llama.cpp-479i)
+// ---------------------------------------------------------------------------
+//
+// A dense quantized MUL_MAT quantizes its F32 activations to Q8_1 before the
+// MMQ/MMVQ kernel runs. These mirror ggml_sycl_op_mul_mat's own arithmetic
+// (`required_size`) so the planner, the graph-entry check and the dispatch agree on
+// one number; the backend static_asserts each constant against its source of truth
+// (MATRIX_ROW_PADDING, QK8_1, sizeof(block_q8_1)). Pure: no state, no log.
+constexpr int64_t k_zone_mmq_src1_row_padding  = 512;  // MATRIX_ROW_PADDING: K is padded to this
+constexpr int64_t k_zone_mmq_src1_block_elems  = 32;   // QK8_1
+constexpr size_t  k_zone_mmq_src1_block_bytes  = 36;   // sizeof(block_q8_1): half2 ds + 32 int8
+constexpr size_t  k_zone_mmq_src1_overflow_pad = 32;   // Q6K_DS_OVERFLOW_PAD: SOA Q6_K reads 8 half2 past the ds region
+constexpr size_t  k_zone_mmq_src1_align        = 256;  // plan figures are 256-aligned like the other scratch pools
+
+// Bytes of one quantized row of `ne10` columns. False on a non-positive K or overflow.
+bool zone_mmq_src1_row_bytes(int64_t ne10, size_t * out);
+
+// Exact bytes of the buffer for `nrows` rows of `ne10` columns, exactly the dispatch's
+// `required_size` (the overflow pad only when the weight layout is SOA/COALESCED).
+bool zone_mmq_src1_required_bytes(int64_t nrows, int64_t ne10, bool with_overflow_pad, size_t * out);
+
+// Bytes per TOKEN for a weight whose K is `ne0`: one quantized row per token, times
+// ne2 * ne3 for a dense batched weight (src1 then has n_tokens * ne2 * ne3 rows).
+bool zone_mmq_src1_bytes_per_token(int64_t ne0, int64_t ne2, int64_t ne3, size_t * out);
+
+// The plan figure: n_ubatch tokens of `bytes_per_token`, plus the overflow pad,
+// aligned up to 256. Zero when bytes_per_token is zero (no dense quantized operand).
+bool zone_mmq_src1_scratch_bytes(size_t bytes_per_token, uint32_t n_ubatch, size_t * out);
+
+// ---------------------------------------------------------------------------
+// dense f16 dequant scratch (llama.cpp-479i)
+// ---------------------------------------------------------------------------
+//
+// ggml_sycl_op_mul_mat_sycl's f16 arm converts the WHOLE src0 weight and the src1 activations to f16
+// before the oneDNN GEMM, each into its own planned buffer. These mirror the dispatch's own arithmetic; the
+// backend static_asserts the element size against sizeof(sycl::half). Pure: no state, no log.
+constexpr size_t k_zone_dequant_f16_elem_bytes = 2;    // sizeof(sycl::half)
+constexpr size_t k_zone_dequant_f16_align      = 256;  // buffer and plan figures are 256-aligned
+
+// f16 bytes of a dequantized 2-D weight slice of ne0 x ne1. False on a non-positive extent or overflow.
+bool zone_dequant_f16_weight_bytes(int64_t ne0, int64_t ne1, size_t * out);
+
+// f16 activation bytes per token for a weight whose K is `ne0`, times ne2 * ne3 for a batched operand.
+bool zone_dequant_f16_src1_bytes_per_token(int64_t ne0, int64_t ne2, int64_t ne3, size_t * out);
+
+// Bytes of one buffer holding `elems` f16 elements (the src0 copy or the src1 copy of one op), rounded up
+// to the region alignment. `elems` is 0 for an operand that needs no copy. False on a negative count or overflow.
+bool zone_dequant_f16_region_bytes(int64_t elems, size_t * out);
+
+// The plan figure, one number PER BUFFER (they are separate buffers): the largest weight copy, and n_ubatch
+// activation rows at the widest K, each aligned to 256. Zero when there is no candidate. Separate numbers
+// because the graph walk ensures each buffer at max(plan, demand), so a later graph never regrows (and
+// retires) a buffer that a recorded graph baked.
+bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
+                                 size_t   src1_bytes_per_token,
+                                 uint32_t n_ubatch,
+                                 size_t * src0_bytes,
+                                 size_t * src1_bytes);
+
+// ---------------------------------------------------------------------------
 // Mispredict accounting
 // ---------------------------------------------------------------------------
 //
@@ -201,6 +288,8 @@ size_t zone_sizing_max_underestimate_bytes(const char * path);
 // nothing tested it. Observations alone are not a defect and never break the
 // summary's silence.
 void   zone_sizing_record_observation(const char * path);
+// The batched form, for a caller that already counts its own uses: one mutex take for `count` observations.
+void   zone_sizing_record_observations(const char * path, size_t count);
 size_t zone_sizing_observation_count(const char * path);
 
 void zone_sizing_reset_underestimates();

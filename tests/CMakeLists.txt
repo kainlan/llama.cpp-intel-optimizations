@@ -734,6 +734,36 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-capacity-source.py --self-test)
     set_tests_properties(test-sycl-cpu-expert-pool-capacity-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+    # Host MoE experts must read the activation row of their own slot, not row 0
+    # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
+    # experts). Run WITH --self-test so each anchor is proven load-bearing.
+    add_test(NAME test-sycl-moe-cpu-activation-row-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-activation-row-source.py --self-test)
+    set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+    # A hybrid MoE CPU-expert dispatch must never drop host-expert rows when its
+    # staging allocation fails, and the registry must not fail an allocation on a
+    # stale RELEASING row at a recycled address (llama.cpp-93tw). WITH --self-test.
+    add_test(NAME test-sycl-moe-cpu-dispatch-fail-closed-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-dispatch-fail-closed-source.py --self-test)
+    set_tests_properties(test-sycl-moe-cpu-dispatch-fail-closed-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+    # A hybrid MXFP4 xmx_tiled expert must be decoded by a kernel that reads
+    # xmx_tiled: the grouped executor accepts partial cover, and the per-expert
+    # direct path refuses layouts it cannot decode (llama.cpp-4hg7). WITH --self-test.
+    add_test(NAME test-sycl-xmx-tiled-partial-cover-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-xmx-tiled-partial-cover-source.py --self-test)
+    set_tests_properties(test-sycl-xmx-tiled-partial-cover-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+    # A prompt-phase MoE layout over a MIXED tensor (a few experts in VRAM, the
+    # rest host-planned) is admitted by the loaded layout plus the host entries
+    # the CPU runs, at every prompt admission site (llama.cpp-f6zo: the
+    # [GRAPH-MOE-LAYOUT] "incomplete executable layout" abort at PCT<100).
+    # WITH --self-test so each pin is proven load-bearing.
+    add_test(NAME test-sycl-moe-prompt-hybrid-layout-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-prompt-hybrid-layout-source.py --self-test)
+    set_tests_properties(test-sycl-moe-prompt-hybrid-layout-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
     # A MoE host-expert dispatch must bridge a storage-handle miss, not kill the
     # graph (llama.cpp-srti). Also runs WITH --self-test: the per-site checks are
     # anchored on refusal-message text, so a renamed site would silently stop

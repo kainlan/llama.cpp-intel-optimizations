@@ -1,10 +1,13 @@
+#include "ggml.h"
 #include "unified-cache.hpp"
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -414,6 +417,123 @@ void in_flight_promotion_cleanup_pending_survives_rollback() {
                  "PASS in-flight-pending-or-merge-on-rollback\n";
 }
 
+// llama.cpp-93tw: an allocation handed a recycled address while the previous owner's row is still
+// RELEASING (its block already freed, its row not yet erased) must claim the address instead of
+// failing; a LIVE row must still refuse; and the releaser's later erase / rollback must leave the
+// replacement row alone.
+// Captures the library's log so a stale-row claim's trace line can be asserted on.  The trace is
+// switched on in main() before the registry is first used (the switch is read once and cached).
+std::mutex  g_captured_log_mutex;
+std::string g_captured_log;
+
+void capture_log(ggml_log_level, const char * text, void *) {
+    std::lock_guard<std::mutex> lock(g_captured_log_mutex);
+    g_captured_log += text;
+}
+
+std::string captured_log_take() {
+    std::lock_guard<std::mutex> lock(g_captured_log_mutex);
+    std::string                 out;
+    out.swap(g_captured_log);
+    return out;
+}
+
+alloc_metadata replacement_of(const alloc_metadata & stale, uint64_t id) {
+    alloc_metadata value = stale;
+    value.id             = id;
+    return value;
+}
+
+void stale_releasing_row_is_claimed_and_replacement_survives_release() {
+    const size_t         baseline_rows = allocation_registry_test_size();
+    const alloc_metadata stale         = metadata(91);
+    const alloc_metadata fresh         = replacement_of(stale, 9100);
+    check(allocation_registry_test_publish(stale, true), "stale-claim row publication failed");
+
+    allocation_registry_test_pause_claim(true);
+    registered_release_status releaser = registered_release_status::NOT_FOUND;
+    std::thread               t1(
+        [&] { releaser = allocation_registry_test_release_exact(stale, registered_release_mode::INTRUSIVE); });
+    while (!allocation_registry_test_claim_reached()) {
+        std::this_thread::yield();
+    }
+
+    (void) captured_log_take();
+    check(allocation_registry_test_claim_ptr(stale.ptr), "a RELEASING row at the address was not claimed");
+    check(!allocation_registry_test_contains(stale.ptr), "claiming did not erase the stale RELEASING row");
+    {
+        // The trace names the claim and both threads: the releaser is t1, the claimer this thread.
+        const std::string log = captured_log_take();
+        const size_t      at  = log.find("[UNIFIED-ALLOC-STALE-CLAIM]");
+        check(at != std::string::npos, "a stale-row claim emitted no [UNIFIED-ALLOC-STALE-CLAIM] trace line");
+        unsigned long long releaser_tid = 0;
+        unsigned long long claimer_tid  = 0;
+        const size_t       tids         = log.find("releaser_tid=", at);
+        check(tids != std::string::npos && std::sscanf(log.c_str() + tids, "releaser_tid=%llu claimer_tid=%llu",
+                                                       &releaser_tid, &claimer_tid) == 2,
+              "the stale-claim trace line carries no releaser/claimer thread ids");
+        check(releaser_tid != 0 && claimer_tid != 0 && releaser_tid != claimer_tid,
+              "the stale-claim trace did not name two different threads");
+        check(log.find("id=91") != std::string::npos, "the stale-claim trace did not name the stale row's id");
+    }
+    check(allocation_registry_test_publish(fresh, true), "replacement row could not be inserted after the claim");
+
+    allocation_registry_test_pause_claim(false);
+    t1.join();
+    check(releaser == registered_release_status::RELEASED, "the stale row's releaser did not complete");
+    check(allocation_registry_test_contains(fresh.ptr),
+          "the releaser's final erase removed the replacement row at the recycled address");
+    check(allocation_registry_test_release_exact(fresh, registered_release_mode::INTRUSIVE) ==
+              registered_release_status::RELEASED,
+          "the replacement row was not LIVE and releasable after the stale release finished");
+    check(!allocation_registry_test_contains(fresh.ptr) && allocation_registry_test_size() == baseline_rows,
+          "registry did not return to baseline");
+    std::cout << "PASS stale-releasing-row-claimed\n"
+                 "PASS releaser-erase-leaves-replacement-row\n";
+}
+
+void stale_releasing_row_claim_survives_releaser_rollback() {
+    const size_t         baseline_rows = allocation_registry_test_size();
+    const alloc_metadata stale         = metadata(92);
+    const alloc_metadata fresh         = replacement_of(stale, 9200);
+    check(allocation_registry_test_publish(stale, true), "rollback-claim row publication failed");
+    check(allocation_registry_test_acquire_exact_lease(stale), "rollback-claim lease acquisition failed");
+
+    allocation_registry_test_pause_claim(true);
+    registered_release_status releaser = registered_release_status::NOT_FOUND;
+    std::thread               t1(
+        [&] { releaser = allocation_registry_test_release_exact(stale, registered_release_mode::INTRUSIVE); });
+    while (!allocation_registry_test_claim_reached()) {
+        std::this_thread::yield();
+    }
+
+    check(allocation_registry_test_claim_ptr(stale.ptr), "a RELEASING row was not claimed before a refused release");
+    check(allocation_registry_test_publish(fresh, true), "replacement row could not be inserted after the claim");
+
+    allocation_registry_test_pause_claim(false);
+    t1.join();
+    check(releaser == registered_release_status::LEASE_REFUSED, "paused releaser did not take the refusal rollback");
+    check(allocation_registry_test_contains(fresh.ptr),
+          "the releaser's rollback removed or overwrote the replacement row");
+    check(allocation_registry_test_release_exact(fresh, registered_release_mode::INTRUSIVE) ==
+              registered_release_status::RELEASED,
+          "the replacement row was not LIVE after the stale rollback");
+    check(allocation_registry_test_size() == baseline_rows, "registry did not return to baseline");
+    std::cout << "PASS releaser-rollback-leaves-replacement-row\n";
+}
+
+void live_row_at_the_address_is_still_refused() {
+    const size_t         baseline_rows = allocation_registry_test_size();
+    const alloc_metadata live          = metadata(93);
+    check(allocation_registry_test_claim_ptr(live.ptr), "an address with no row was not claimable");
+    check(allocation_registry_test_publish(live, true), "live-row publication failed");
+    check(!allocation_registry_test_claim_ptr(live.ptr), "a LIVE row at the address was displaced");
+    check(allocation_registry_test_contains(live.ptr), "refusing a LIVE row damaged it");
+    allocation_registry_test_erase(live.ptr);
+    check(allocation_registry_test_size() == baseline_rows, "registry did not return to baseline");
+    std::cout << "PASS live-row-claim-refused\n";
+}
+
 void promotion_cleanup_retry_visits_all_snapshot_rows() {
     fake_release_backend backend;
     const size_t baseline_rows = allocation_registry_test_size();
@@ -619,6 +739,9 @@ static_assert(!std::is_invocable_v<decltype(&detail::promote_legacy_alloc_owner)
               "legacy promotion must reject lvalues; callers snapshot metadata then explicitly move ownership");
 
 int main() {
+    // Read once and cached by the library, so it must precede any registry use.
+    setenv("GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE", "1", 1);
+    ggml_log_set(capture_log, nullptr);
     unique_to_shared_preserves_identity();
     mem_handle_shares_intrusive_control_and_retries();
     concurrent_final_release_exactly_once();
@@ -633,6 +756,9 @@ int main() {
     legacy_promotion_failures_clean_exact_row();
     refused_legacy_promotion_uses_registry_retry_state();
     in_flight_promotion_cleanup_pending_survives_rollback();
+    stale_releasing_row_is_claimed_and_replacement_survives_release();
+    stale_releasing_row_claim_survives_releaser_rollback();
+    live_row_at_the_address_is_still_refused();
     promotion_cleanup_retry_visits_all_snapshot_rows();
     invalid_request_has_zero_coordinator_census();
     owner_use_count_has_no_owner_zero();

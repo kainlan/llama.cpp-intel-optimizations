@@ -847,6 +847,12 @@ void fail_next_retained_handle_publication_for_test();
 // detaching invalidates it. Tickets commit only when both sink and epoch match.
 void set_graph_retained_handle_sink(std::vector<mem_handle> * sink);
 
+// Identity of THIS thread's current sink attachment: unique across threads and attachments, and 0 while no sink is
+// attached. A holder that must pin a handle into a recording once, rather than once per use, remembers the token it
+// pinned under and pins again only when the token (a new recording) or the handle (a new backing) differs. A vector
+// address is not an identity (it can be reused by the next recording), which is why this is a counter.
+uint64_t graph_retention_token();
+
 // Drain event-bound handle retainers. When wait_all is true, wait for every
 // retained event before dropping the retained mem_handle copies. This only runs
 // normal mem_handle destructors; backing memory is freed only when the last
