@@ -119,8 +119,12 @@ with gate("each recording attempt snapshots the retained-handle baseline"):
 with gate("a segment is marked submitted only before its executable graph is submitted"):
     assert "bool segment_submitted = false" in sycl
     assert "segment_submitted = true" in sycl
-    assert (sycl.index("segment_submitted = true")
-            < sycl.index("stream->ext_oneapi_graph(*recorded_segments.back().exec_graph)"))
+    # The submit goes through graph_exec_submit since zhcn C7a (cec4a5f10): it counts, then calls
+    # stream.ext_oneapi_graph(exec). The flag must still be set before that submit, and no bare call may remain.
+    submit = "ggml_sycl::graph_exec_submit(*stream, *recorded_segments.back().exec_graph)"
+    assert sycl.count(submit) == 1
+    assert "stream->ext_oneapi_graph(*recorded_segments.back().exec_graph)" not in sycl
+    assert sycl.index("segment_submitted = true") < sycl.index(submit)
 with gate("an unsubmitted segment rolls back to the baseline at both failure sites"):
     assert sycl.count("if (!segment_submitted)") >= 2
     assert sycl.count("graph_retained_handles.resize(retained_baseline)") >= 2
