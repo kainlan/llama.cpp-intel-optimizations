@@ -1260,6 +1260,12 @@ struct placement_plan {
 
     bool has_dense_entry(const std::string & name) const { return name_index_.find(name) != name_index_.end(); }
 
+    // The dense-weight entry for `name`, or nullptr. Same name index as has_dense_entry.
+    const placement_entry * find_dense_entry(const std::string & name) const {
+        auto it = name_index_.find(name);
+        return it != name_index_.end() ? &entries[it->second] : nullptr;
+    }
+
     // Multi-device query: is this tensor on a specific device?
     // Returns true if the tensor is assigned to device_id.
     bool is_on_device(const std::string & name, int dev_id) const {
