@@ -40,6 +40,7 @@
     } while (0)
 
 using ggml_sycl::path_scoped_maxima;
+using ggml_sycl::zone_onednn_plan;
 using ggml_sycl::zone_scoped_maxima;
 using ggml_sycl::zone_tensor_desc;
 
@@ -922,6 +923,47 @@ int main() {
         std::vector<zone_tensor_desc> unmarked = layers;
         unmarked.push_back(desc("output.weight", 1000, TYPE_Q4_0, 4096, 32000, 1, 1));
         CHECK(zone_scoped_maxima(unmarked).dequant_f16_weight_bytes == 0, "no mark, no plan");
+    }
+
+    // ---- Case 14h: the figures a zone is described by outlive a later plan (llama.cpp-8ony) -----------------------
+    // A draft model loaded beside the target overwrites the planner's live (bare plan, Graph floor) with its own
+    // smaller figures. The arena's zones are found sufficient and kept, so the zone is still the target's: the
+    // snapshot it is described by must keep the larger of each figure, or the bound it yields would describe the
+    // draft's zone (a head pair then eats the target's Graph SDPA floor, or a clamped zone's bound drops below the
+    // target's own planned pair).
+    {
+        const size_t           mib    = 1024u * 1024u;
+        const zone_onednn_plan target = { 144 * mib, 64 * mib };
+        const zone_onednn_plan draft  = { 30 * mib, 10 * mib };
+        const zone_onednn_plan kept   = ggml_sycl::zone_onednn_plan_keep(target, draft);
+        CHECK(kept.bare_bytes == 144 * mib && kept.graph_floor_bytes == 64 * mib,
+              "a smaller later plan does not shrink what the kept zone is described by");
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(256 * mib, kept.bare_bytes, kept.graph_floor_bytes) == 192 * mib,
+              "the bound stays the target's: capacity minus the target's floor");
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(256 * mib, draft.bare_bytes, draft.graph_floor_bytes) == 246 * mib,
+              "the draft's live figures alone would have admitted a pair that eats the target's Graph floor");
+        const zone_onednn_plan grown = ggml_sycl::zone_onednn_plan_keep(draft, target);
+        CHECK(grown.bare_bytes == 144 * mib && grown.graph_floor_bytes == 64 * mib,
+              "a larger later plan the zone was found sufficient for is described by its own figures");
+        const zone_onednn_plan wide_plan  = { 144 * mib, 10 * mib };
+        const zone_onednn_plan wide_floor = { 30 * mib, 64 * mib };
+        const zone_onednn_plan mixed      = ggml_sycl::zone_onednn_plan_keep(wide_plan, wide_floor);
+        CHECK(mixed.bare_bytes == 144 * mib && mixed.graph_floor_bytes == 64 * mib,
+              "each figure keeps its own larger value");
+        const zone_onednn_plan none = ggml_sycl::zone_onednn_plan_keep(zone_onednn_plan(), draft);
+        CHECK(none.bare_bytes == draft.bare_bytes && none.graph_floor_bytes == draft.graph_floor_bytes,
+              "with nothing held, the live plan is what the zone is described by");
+
+        // The reserve merges per-component maxima, so two ops that each fit the bound can hold a pair above it. The
+        // merge is bounded by the PAIR BOUND, not the capacity: the held pair would otherwise eat the Graph floor.
+        const size_t bound = 235 * mib;
+        size_t       w = 0, a = 0;
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, bound, 200 * mib, 4 * mib, 40 * mib, 40 * mib, &w, &a);
+        CHECK(w == 40 * mib && a == 40 * mib,
+              "a merge above the bound is not held: the request is used as asked");
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 4 * mib, 40 * mib, 40 * mib, &w, &a);
+        CHECK(w == 200 * mib && a == 40 * mib,
+              "the same two ops against the raw capacity merge to 240 MiB, past the 235 MiB bound");
     }
 
     // ---- Case 14: the planned dense scratch is ONE reservation that follows the runtime n_ubatch (llama.cpp-kpjw) --

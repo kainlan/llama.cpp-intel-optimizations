@@ -315,6 +315,20 @@ void zone_onednn_scratch_reserve_target(bool    arena_active,
 // by the caller. A floor larger than the capacity leaves only the plan. Pure.
 size_t zone_onednn_pp_pair_bound(size_t capacity_bytes, size_t bare_plan_bytes, size_t graph_floor_bytes);
 
+// The two figures the ONEDNN zone was sized from, kept together as ONE snapshot (llama.cpp-8ony): the pair's own
+// plan and the Graph SDPA floor that shares the zone. Each is a plain number the planner can overwrite for the next
+// model; the zone is built once, so a bound derived from the live figures of a later plan (a draft model loaded beside
+// the target) would describe a zone that does not exist.
+struct zone_onednn_plan {
+    size_t bare_bytes        = 0;
+    size_t graph_floor_bytes = 0;
+};
+
+// The snapshot to keep when the arena's zones were found sufficient for `live` and the zone is NOT rebuilt: the zone
+// stays the size an earlier plan built it to, so it must still be described by the larger of each figure, never by
+// a later, smaller plan's. A rebuilt zone is described by the live plan outright (the caller stores it directly). Pure.
+zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live);
+
 // Whether the oneDNN PP scratch is allowed to supply a dense op's f16 copies at all, as a function of the
 // GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH setting and the weight's type (llama.cpp-8ony). `env_mode` is the parsed
 // variable: negative when unset, 0 when it turns the scratch off, positive when it turns it on for every type.

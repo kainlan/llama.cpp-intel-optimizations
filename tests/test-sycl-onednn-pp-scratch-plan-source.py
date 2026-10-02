@@ -184,7 +184,7 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
     results["anchor: the op arm's scratch candidate statement exists"] = op_candidate is not None
     walk_skips = statements_calling(dq_walk, "ggml_sycl_onednn_pp_candidate(")
 
-    # ---- review r1 I1/M4: ONE helper answers "the scratch supplies this op", for both consumers ----
+    # ---- ONE helper answers "the scratch supplies this op", for both consumers ----
     supplies_helper = function_body(
         backend, r"static bool ggml_sycl_onednn_pp_scratch_supplies\([^)]*\)\s*\{")
     enabled_fn = function_body(cache, r"bool onednn_pp_unified_scratch_enabled\(ggml_type type\)\s*\{")
@@ -229,7 +229,7 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
     results["the walk no longer skips on admission and plan separately"] = \
         len(walk_skips) == 0 and HELPER not in dq_walk
 
-    # ---- review r1 I2: Route A draws the planned dequant buffers, and the walk counts such a node ----
+    # ---- Route A draws the planned dequant buffers, and the walk counts such a node ----
     route_a = function_body(
         backend, r"static bool ggml_sycl_mul_mat_unified_pp_dequant_route\([^)]*\)\s*\{")
     results["anchor: the walk's Route A predicate exists"] = route_a is not None
@@ -281,16 +281,19 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
             "weights_bytes = src0_elems * sizeof(sycl::half);" in before and \
             "activations_bytes = src1_elems * sizeof(sycl::half);" in before
 
-    # ---- m1: Route A has no precision check, so the walk asks it before filtering on precision ----
+    # ---- Route A has no precision check, so the walk must not drop a node on precision before asking it ----
     pre = dq_walk.find("const ggml_tensor * src1 = node->src[1];")
     post = dq_walk.find("const bool need_src0_f16")
     results["anchor: the walk's node pre-filter exists"] = 0 <= pre < post
     if 0 <= pre < post:
+        # The only precision read in the whole walk is the one that decides the legacy arm's own draw; a drop
+        # anywhere else in the loop body (pre-filter or after the arms are combined) would skip Route A's nodes.
         results["the walk's pre-filter does not drop a node on precision"] = \
-            "op_params[0]" not in dq_walk[pre:post]
+            dq_walk.count("op_params[0]") == 1 and \
+            re.search(r"const bool\s+prec_default\s*=\s*node->op_params\[0\]\s*==\s*GGML_PREC_DEFAULT;", dq_walk) is not None
     results["the walk combines the two arms through the pure verdict"] = "zone_walk_f16_node_draws(" in dq_walk
 
-    # ---- m6: the walk asks the router, the admission and the supplies question once per node ----
+    # ---- the walk asks the router, the admission and the supplies question once per node ----
     results["the walk asks the PP admission only through the supplies helper"] = \
         "ggml_sycl_onednn_pp_candidate(" not in dq_walk
     results["the walk asks the router once per node"] = dq_walk.count(".select(") == 1
@@ -300,13 +303,16 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
             ".select(" not in route_a and "ggml_sycl_onednn_pp_candidate(" not in route_a and \
             "ggml_sycl_onednn_pp_scratch_supplies(" not in route_a
 
-    # ---- the bound: max(stored plan, capacity - stored Graph floor), capped at the capacity; one stored source ----
+    # ---- the bound: max(stored plan, capacity - stored Graph floor), capped at the capacity; one stored snapshot ----
     pure = function_body(
         zone_sizing, r"size_t zone_onednn_pp_pair_bound\([^)]*\)\s*\{")
     pair_bound = function_body(
         cache, r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\)\s*\{")
+    bound_for = function_body(
+        cache, r"static size_t onednn_pp_pair_bound_for\(int device_id, size_t capacity_bytes\)\s*\{")
     results["anchor: the pure pair bound exists"] = pure is not None
     results["anchor: the pair-bound accessor is defined"] = pair_bound is not None
+    results["anchor: the shared bound helper is defined"] = bound_for is not None
     results["the pair-bound accessor is declared"] = \
         re.search(r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\);", cache_hpp) is not None
     if pure is not None:
@@ -318,22 +324,36 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
         results["the pure bound never exceeds the capacity (min with the capacity)"] = \
             "std::min(capacity_bytes," in pure_norm
     if pair_bound is not None:
-        results["the accessor reads the STORED Graph floor"] = \
-            "onednn_zone_graph_floor_load(" in pair_bound
-        results["the accessor reads the STORED pair plan"] = \
-            "unified_cache_get_planned_onednn_scratchpad_bytes_stored(" in pair_bound
         results["the accessor reads the arena's real ONEDNN zone capacity"] = \
             "vram_zone_id::ONEDNN" in pair_bound and "arena_active()" in pair_bound
-        results["the accessor answers through the pure bound"] = "zone_onednn_pp_pair_bound(" in pair_bound
-        results["the accessor does not recompute the floor or read the with-floor plan"] = \
-            "onednn_graph_scratch_zone_floor_bytes" not in pair_bound and \
-            "unified_cache_get_planned_onednn_scratchpad_bytes(" not in pair_bound and \
-            "get_planned_onednn_graph_scratch_shape" not in pair_bound
+        results["the accessor answers through the shared bound helper"] = "onednn_pp_pair_bound_for(" in pair_bound
+    if bound_for is not None:
+        results["the helper reads the stored zone-plan snapshot, bare plan and floor together"] = \
+            "onednn_zone_plan_load(" in bound_for and "plan.bare_bytes" in bound_for and \
+            "plan.graph_floor_bytes" in bound_for
+        results["the helper answers through the pure bound"] = "zone_onednn_pp_pair_bound(" in bound_for
+        results["the helper does not read a live planner figure or recompute the floor"] = \
+            "onednn_graph_scratch_zone_floor_bytes" not in bound_for and \
+            "unified_cache_get_planned_onednn_scratchpad_bytes" not in bound_for and \
+            "get_planned_onednn_graph_scratch_shape" not in bound_for
     ensure_zones = function_body(cache, r"bool unified_cache::ensure_planned_arena_zones\([^)]*\)\s*\{")
     results["anchor: ensure_planned_arena_zones exists"] = ensure_zones is not None
     if ensure_zones is not None:
-        results["both successful zone-sizing exits store the Graph floor they sized the zone with"] = \
-            ensure_zones.count("onednn_zone_graph_floor_store(") >= 2
+        results["the kept-zone exit stores the larger of the held and live plan"] = \
+            re.search(r"onednn_zone_plan_store\(dev_id,\s*zone_onednn_plan_keep\(onednn_zone_plan_load\(dev_id\),\s*"
+                      r"live_plan\)\);\s*return true;", ensure_zones) is not None
+        results["the rebuilt-zone exit stores the live plan the zone was built from"] = \
+            re.search(r"onednn_zone_plan_store\(dev_id,\s*live_plan\);\s*return true;", ensure_zones) is not None
+        results["zone sizing reads the planned pair and floor once, as one pair"] = \
+            ensure_zones.count("onednn_planned_pair_and_floor(") == 1 and \
+            "unified_cache_get_planned_onednn_scratchpad_bytes" not in ensure_zones
+    reserve = function_body(cache, r"bool unified_cache::reserve_onednn_scratch\([^)]*\)\s*\{")
+    results["anchor: reserve_onednn_scratch exists"] = reserve is not None
+    if reserve is not None:
+        results["reserve bounds the never-shrink merge by the pair bound, not the raw capacity"] = \
+            "onednn_pp_pair_bound_for(" in reserve and \
+            re.search(r"zone_onednn_scratch_reserve_target\(arena_on,\s*pair_bound,", reserve) is not None
+        results["reserve refuses a pair above the bound"] = "total_needed > pair_bound_now" in reserve
     for name, body in (("by-bytes core", bytes_helper),):
         results["the %s reads the pair bound, not the raw capacity" % name] = \
             "unified_cache_get_onednn_pp_pair_bound(" in body and "unified_cache_get_onednn_zone_capacity(" not in body
@@ -398,6 +418,9 @@ if args.self_test and not failed:
     supplies_sig = r"static bool ggml_sycl_onednn_pp_scratch_supplies\("
     enabled_sig = r"bool onednn_pp_unified_scratch_enabled\(ggml_type type\)"
     adapter_sig = r"std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory\("
+    bound_sig = r"static size_t onednn_pp_pair_bound_for\("
+    ensure_sig = r"bool unified_cache::ensure_planned_arena_zones\("
+    reserve_sig = r"bool unified_cache::reserve_onednn_scratch\("
     route_a_sig = r"static bool ggml_sycl_mul_mat_unified_pp_dequant_route\("
     SUPPLIES_NAME = "ggml_sycl_onednn_pp_scratch_supplies("
     mutants = [
@@ -456,6 +479,10 @@ if args.self_test and not failed:
         ("walk filters on precision again", "the walk's pre-filter does not drop a node on precision",
          (mutate_in_func(backend, walk_sig, "!ggml_is_contiguous(src0) || ggml_nrows(src1) <= 1",
                          "!ggml_is_contiguous(src0) || node->op_params[0] != GGML_PREC_DEFAULT || ggml_nrows(src1) <= 1"),
+          cache, cache_hpp)),
+        ("walk filters on precision late", "the walk's pre-filter does not drop a node on precision",
+         (mutate_in_func(backend, walk_sig, "if (!ggml_sycl::zone_walk_f16_node_draws(prec_default, legacy_draws, unified_draws)) {",
+                         "if (node->op_params[0] != GGML_PREC_DEFAULT || !ggml_sycl::zone_walk_f16_node_draws(prec_default, legacy_draws, unified_draws)) {"),
           cache, cache_hpp)),
         ("walk ignores the pure arm combination", "the walk combines the two arms through the pure verdict",
          (mutate_in_func(backend, walk_sig, "zone_walk_f16_node_draws(", "zone_XXXX("), cache, cache_hpp)),
@@ -524,22 +551,35 @@ if args.self_test and not failed:
          (backend, cache, cache_hpp,
           mutate_in_func(zone_sizing, r"size_t zone_onednn_pp_pair_bound\(", "std::min(capacity_bytes,",
                          "std::max(capacity_bytes,"))),
-        ("accessor recomputes the floor at the site", "the accessor reads the STORED Graph floor",
+        ("accessor skips the shared helper", "the accessor answers through the shared bound helper",
          (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
-                                  "onednn_zone_graph_floor_load(device_id)",
+                                  "onednn_pp_pair_bound_for(", "XXXX("), cache_hpp)),
+        ("helper recomputes the floor at the site", "the helper does not read a live planner figure or recompute the floor",
+         (backend, mutate_in_func(cache, bound_sig, "plan.graph_floor_bytes",
                                   "onednn_graph_scratch_zone_floor_bytes(0, 0, 0, 0, 0)"), cache_hpp)),
-        ("accessor reads the with-floor plan as the floor's source", "the accessor does not recompute the floor or read the with-floor plan",
-         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
-                                  "onednn_zone_graph_floor_load(device_id)",
+        ("helper reads the live plan as the floor", "the helper does not read a live planner figure or recompute the floor",
+         (backend, mutate_in_func(cache, bound_sig, "plan.graph_floor_bytes",
                                   "unified_cache_get_planned_onednn_scratchpad_bytes(device_id)"), cache_hpp)),
-        ("accessor reads the with-floor plan as the pair plan", "the accessor does not recompute the floor or read the with-floor plan",
-         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
-                                  "unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id)",
-                                  "unified_cache_get_planned_onednn_scratchpad_bytes(device_id)"), cache_hpp)),
-        ("zone sizing stops storing the floor", "both successful zone-sizing exits store the Graph floor they sized the zone with",
-         (backend, mutate_in_func(cache, r"bool unified_cache::ensure_planned_arena_zones\(",
-                                  "onednn_zone_graph_floor_store(dev_id, planned_onednn_floor);\n    return true;\n}",
+        ("helper reads the live bare plan", "the helper does not read a live planner figure or recompute the floor",
+         (backend, mutate_in_func(cache, bound_sig, "plan.bare_bytes",
+                                  "unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id)"), cache_hpp)),
+        ("helper ignores the snapshot's bare plan", "the helper reads the stored zone-plan snapshot, bare plan and floor together",
+         (backend, mutate_in_func(cache, bound_sig, "plan.bare_bytes", "0"), cache_hpp)),
+        ("kept-zone exit describes the zone by the live plan", "the kept-zone exit stores the larger of the held and live plan",
+         (backend, mutate_in_func(cache, ensure_sig, "zone_onednn_plan_keep(onednn_zone_plan_load(dev_id), live_plan)",
+                                  "live_plan"), cache_hpp)),
+        ("rebuilt-zone exit stops storing", "the rebuilt-zone exit stores the live plan the zone was built from",
+         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_store(dev_id, live_plan);\n    return true;\n}",
                                   "return true;\n}"), cache_hpp)),
+        ("zone sizing reads the live bare plan again", "zone sizing reads the planned pair and floor once, as one pair",
+         (backend, mutate_in_func(cache, ensure_sig, "planned_onednn_bare)",
+                                  "unified_cache_get_planned_onednn_scratchpad_bytes_stored(dev_id))"), cache_hpp)),
+        ("reserve merges against the raw capacity", "reserve bounds the never-shrink merge by the pair bound, not the raw capacity",
+         (backend, mutate_in_func(cache, reserve_sig, "zone_onednn_scratch_reserve_target(arena_on, pair_bound,",
+                                  "zone_onednn_scratch_reserve_target(arena_on, arena_on ? zone_capacity(vram_zone_id::ONEDNN) : 0,"),
+          cache_hpp)),
+        ("reserve serves a pair above the bound", "reserve refuses a pair above the bound",
+         (backend, mutate_in_func(cache, reserve_sig, "total_needed > pair_bound_now", "false"), cache_hpp)),
         ("acquire without the plan", "acquire asks the plan before it asks for a reserve",
          (mutate_in_func(backend, r"static bool acquire_onednn_pp_scratch\(",
                          "ggml_sycl_onednn_pp_scratch_planned_bytes(", "ggml_sycl_XXXX("), cache, cache_hpp)),

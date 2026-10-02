@@ -197,6 +197,11 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
     return maxima;
 }
 
+zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live) {
+    (void) held;
+    return live;  // RED stub (llama.cpp-8ony)
+}
+
 bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool pair_eligible) {
     return !(pp_scratch_type_enabled && pair_eligible);
 }
