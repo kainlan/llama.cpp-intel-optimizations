@@ -10,10 +10,10 @@ wrappers (comments blanked first):
 
   - the signature is `[[nodiscard]] static bool NAME(`;
   - the decision is exactly `if (X.get(true) == nullptr && Y.get_size() > 0) { return false; }`, it is the only `return false`,
-    the scratchpad request precedes it, and the wrapper ends by returning true on the executed path;
-  - nothing before that decision writes: no parallel_for, memcpy, memset, fill, submit or `.execute(`, no assignment to dst or
-    dst_f, and no dnnl::memory object bound to the output (a decline after a write would hand the fallback modified inputs;
-    softmax's pre-scale pass runs in place, so a late decision would apply the scale twice);
+    the scratchpad request precedes it, and the wrapper ends by executing the primitive and returning true;
+  - nothing before that decision writes: no parallel_for, memcpy, memset, fill, submit or `.execute(`, no statement that names
+    dst or dst_f and assigns, and no dnnl::memory object bound to the output (a decline after a write would hand the fallback
+    modified inputs; softmax's pre-scale pass runs in place, so a late decision would apply the scale twice);
   - no `throw` and no `catch` anywhere in the class: a decline is a return value, and a catch-all would swallow one.
 
 Outside the wrappers:
@@ -48,7 +48,7 @@ CALLERS = {"softmax.cpp": ("DnnlSoftmaxWrapper::softmax", 1), "element_wise.cpp"
            "binbcast.cpp": ("DnnlBinaryWrapper::binary_broadcast_row", 1)}
 
 DECISION = re.compile(r"if\s*\(\s*\w+\.get\(true\)\s*==\s*nullptr\s*&&\s*\w+\.get_size\(\)\s*>\s*0\s*\)\s*\{\s*return\s+false\s*;\s*\}")
-WRITE = re.compile(r"\bparallel_for\b|\bmemcpy\b|\bmemset\b|\bfill\b|\bsubmit\b|\.\s*execute\s*\(|\bdst(?:_f)?\s*(?:\[[^\]]*\]\s*)?=(?!=)"
+WRITE = re.compile(r"\bparallel_for\b|\bmemcpy\b|\bmemset\b|\bfill\b|\bsubmit\b|\.\s*execute\s*\(|\bdst(?:_f)?\b[^;{}]*?(?<![=!<>])=(?!=)"
                    r"|\bdnnl::memory\s*\(")
 DEAD = (
     (re.compile(r"\beltwise_in_?place\b"), "eltwise_inplace (a forwarder with no caller)"),
@@ -110,8 +110,8 @@ def check_wrapper(cls, name, body_cls):
                     % (where, len(decisions)))
     if len(re.findall(r"\breturn\s+false\b", body)) != 1:
         errs.append("%s must have exactly one `return false`, the scratchpad decision" % where)
-    if not re.search(r"\breturn\s+true\s*;\s*$", body.rstrip()):
-        errs.append("%s does not end by returning true on the executed path" % where)
+    if not re.search(r"\.\s*execute\s*\([^;]*\)\s*;\s*return\s+true\s*;\s*$", body.rstrip()):
+        errs.append("%s does not end by submitting the primitive and returning true on the executed path" % where)
     if decisions:
         before = body[:decisions[0].start()]
         if "get_scratchpad_mem" not in before:
