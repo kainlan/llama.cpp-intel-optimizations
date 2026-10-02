@@ -161,7 +161,9 @@ llama_kv_cache::llama_kv_cache(
     if (other) {
         const uint32_t size_other = other->get_size();
         if (kv_size != size_other) {
-            LLAMA_LOG_WARN("%s: kv_size = %u overridden to %u to match the shared source cache\n", __func__, kv_size, size_other);
+            if (!no_alloc) {
+                LLAMA_LOG_WARN("%s: kv_size = %u overridden to %u to match the shared source cache\n", __func__, kv_size, size_other);
+            }
             kv_size = size_other;
         }
     }
@@ -228,8 +230,10 @@ llama_kv_cache::llama_kv_cache(
 
     // [TAG_V_CACHE_VARIABLE]
     if (v_trans && hparams.is_n_embd_v_gqa_variable()) {
-        LLAMA_LOG_WARN("%s: the V embeddings have different sizes across layers and FA is not enabled - padding V cache to %d\n",
-                __func__, hparams.n_embd_v_gqa_max());
+        if (!no_alloc) {
+            LLAMA_LOG_WARN("%s: the V embeddings have different sizes across layers and FA is not enabled - padding V cache to %d\n",
+                    __func__, hparams.n_embd_v_gqa_max());
+        }
     }
 
     const bool is_mla = hparams.is_mla();
@@ -240,12 +244,16 @@ llama_kv_cache::llama_kv_cache(
             llama_kv_layer_decide(hparams, il, v_trans, filter, share, other != nullptr);
 
         if (dec.role == LLAMA_KV_LAYER_NO_KV) {
-            LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
+            if (!no_alloc) {
+                LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
+            }
             continue;
         }
 
         if (dec.role == LLAMA_KV_LAYER_FILTERED) {
-            LLAMA_LOG_DEBUG("%s: layer %3d: filtered\n", __func__, il);
+            if (!no_alloc) {
+                LLAMA_LOG_DEBUG("%s: layer %3d: filtered\n", __func__, il);
+            }
             continue;
         }
 
@@ -254,8 +262,10 @@ llama_kv_cache::llama_kv_cache(
 
             const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
 
-            LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
-                           layer_share.k->data, layer_share.v->data);
+            if (!no_alloc) {
+                LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
+                               layer_share.k->data, layer_share.v->data);
+            }
 
             map_layer_ids[il] = layers.size();
 
@@ -321,7 +331,9 @@ llama_kv_cache::llama_kv_cache(
             dev_name = kv_host_layer ? ggml_backend_buft_name(buft) : ggml_backend_dev_name(dev);
         }
 
-        LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+        if (!no_alloc) {
+            LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+        }
 
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -370,18 +382,24 @@ llama_kv_cache::llama_kv_cache(
     }
 
     if (reuse) {
-        LLAMA_LOG_DEBUG("%s: reusing layers:\n", __func__);
+        if (!no_alloc) {
+            LLAMA_LOG_DEBUG("%s: reusing layers:\n", __func__);
+        }
 
         for (uint32_t il = 0; il < n_layer; il++) {
             const int32_t il_reuse = reuse(il);
 
             if (il_reuse < 0) {
-                LLAMA_LOG_DEBUG("%s: - layer %3d: no reuse\n", __func__, il);
+                if (!no_alloc) {
+                    LLAMA_LOG_DEBUG("%s: - layer %3d: no reuse\n", __func__, il);
+                }
                 continue;
             }
 
             if (filter && !filter(il)) {
-                LLAMA_LOG_DEBUG("%s: - layer %3d: filtered\n", __func__, il);
+                if (!no_alloc) {
+                    LLAMA_LOG_DEBUG("%s: - layer %3d: filtered\n", __func__, il);
+                }
                 continue;
             }
 
@@ -389,7 +407,9 @@ llama_kv_cache::llama_kv_cache(
 
             map_layer_ids[il] = map_layer_ids[il_reuse];
 
-            LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
+            if (!no_alloc) {
+                LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
+            }
         }
     }
 
@@ -423,7 +443,9 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }
 
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        if (!no_alloc) {
+            LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        }
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
@@ -433,10 +455,12 @@ llama_kv_cache::llama_kv_cache(
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
-                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
-                ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+        if (!no_alloc) {
+            LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
+                    (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
+                    ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
+                    ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+        }
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
@@ -450,7 +474,9 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
         const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
         if (attn_rot_disable) {
-            LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+            if (!no_alloc) {
+                LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+            }
         }
 
         attn_rot_k =
@@ -473,8 +499,12 @@ llama_kv_cache::llama_kv_cache(
             hparams.n_embd_head_v() % 64 == 0;
     }
 
-    LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
-    LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
+    if (!no_alloc) {
+        LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
+    }
+    if (!no_alloc) {
+        LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
+    }
 
     // pre-compute the haramard matrices and keep them in host memory
     // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers

@@ -89,7 +89,9 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
-            LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, i);
+            if (!no_alloc) {
+                LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, i);
+            }
             continue;
         }
 
@@ -111,7 +113,9 @@ llama_memory_recurrent::llama_memory_recurrent(
             dev_name = ggml_backend_dev_name(dev);
         }
 
-        LLAMA_LOG_DEBUG("%s, layer %3d: dev = %s\n", __func__, i, dev_name);
+        if (!no_alloc) {
+            LLAMA_LOG_DEBUG("%s, layer %3d: dev = %s\n", __func__, i, dev_name);
+        }
 
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -153,7 +157,9 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (!this->no_alloc) {
             ggml_backend_buffer_clear(buf, 0);
         }
-        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        if (!no_alloc) {
+            LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -162,11 +168,13 @@ llama_memory_recurrent::llama_memory_recurrent(
         const size_t memory_size_s = size_s_bytes();
         const size_t memory_size_p = size_p_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
-                ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
-                ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
-                ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
+        if (!no_alloc) {
+            LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
+                    (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+                    ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
+                    ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
+                    ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
+        }
     }
 }
 
