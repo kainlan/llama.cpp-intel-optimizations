@@ -21,16 +21,19 @@
 //   (10) the verify: a raw probe over T* that holds fewer host layers than R* re-measures over that
 //        smaller set and the pair replaces (R*, T*) only when the probe over the new tenants keeps it;
 //        when the probe does not keep it, (R*, T*) stands;
-//   (11) a verify answer that holds a host layer R* does not is BUG: R* was not a fixpoint;
+//   (11) the verify cannot hold a host layer R* lacks: it is the last round's answer, and the loop stops on
+//        the round whose union added nothing, so there is no case for it;
 //   (12) a context with no SYCL backend is UNPLANNED even with a plan active, L4 ready and the cap procs
 //        missing: the backend test comes before the proc test, so a CPU-only context in a SYCL build is
 //        never refused for procs it has no use for;
-//   (13) each wrong-length answer is BUG on its own: R0 alone, a verify answer alone;
+//   (13) a wrong-length answer is BUG on R0 alone (a later round's answer is case 9);
 //   (14) a MEASURE that fails in the verify (the re-measure over R_v) is MEASURE_FAILED and publishes nothing;
 //   (15) a layerless model (n_layer = 0) is one MEASURE and an empty residency;
 //   (16) a probe byte other than 0/1 is read as host-resident (non-zero) and normalised before anything compares
 //        or measures it: R0 = {2,0,0} is measured over {1,0,0} and converges in one MEASURE, not two;
-//   (17) the verify asks the probe nothing more: the last round's answer is the raw probe over T*.
+//   (17) the verify asks the probe nothing more: the last round's answer is the raw probe over T*;
+//   (18) the same normalisation holds for a verify answer: a probe that marks a layer with a 2 is accepted
+//        at the same residency as one that marks it with a 1, and the result carries 0/1 bytes.
 
 #include "../src/llama-residency-fixpoint.h"
 #include "ggml-sycl-cohort.h"  // GGML_SYCL_CONTEXT_COHORT_COMPUTE, named here, not reached transitively
@@ -315,44 +318,14 @@ static void test_verify() {
     }
 }
 
-static void test_verify_bug() {
-    // (11): R* = {0,0,0}; the raw probe over T* holds layer 2, which R* does not: R* was no fixpoint.
-    // Only the verify can reach this (the iteration unions, so it cannot), so the stub tells the
-    // verify from the iteration by the call count.
-    stub s;
-    s.n_layer  = 3;
-    int calls  = 0;
-    s.probe_fn = [&calls](const llama_tenants * t) {
-        calls++;
-        if (t == nullptr) {
-            return llama_residency(3, 0);
-        }
-        // the iteration's probe over T0 (call 2) is clean; the verify's raw probe (call 3) is not
-        return calls == 2 ? llama_residency(3, 0) : llama_residency{ 0, 0, 1 };
-    };
-    CHECK(run(s).status == LLAMA_RESIDENCY_FIXPOINT_BUG);
-}
-
 static void test_wrong_length_alone() {
-    // (13a): only R0 (the probe over no tenants) is the wrong length
+    // (13): only R0 (the probe over no tenants) is the wrong length
     stub s;
     s.n_layer  = 3;
     s.probe_fn = [](const llama_tenants * t) {
         return t == nullptr ? llama_residency(2, 0) : llama_residency(3, 0);
     };
     CHECK(run(s).status == LLAMA_RESIDENCY_FIXPOINT_BUG);
-
-    // (13b): only the verify's answer is the wrong length (the iteration's probes, calls 1 and 2, are right)
-    stub s2;
-    s2.n_layer = 3;
-    int calls  = 0;
-    s2.probe_fn = [&calls](const llama_tenants *) {
-        calls++;
-        return calls <= 2 ? llama_residency(3, 0) : llama_residency(4, 0);
-    };
-    const auto r = run(s2);
-    CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_BUG);
-    CHECK(calls == 3);
 }
 
 static void test_verify_measure_failed() {
@@ -404,6 +377,22 @@ static void test_non_binary_probe_byte() {
     CHECK((r.residency == llama_residency{ 1, 0, 0 }));
 }
 
+static void test_non_binary_verify_answer() {
+    // (18): the setup of (10a), but every answer over tenants marks layer 1 with a 2: {0,2,0}
+    stub s;
+    s.n_layer  = 3;
+    s.probe_fn = [](const llama_tenants * t) {
+        if (t == nullptr) {
+            return llama_residency{ 0, 1, 1 };
+        }
+        return llama_residency{ 0, 2, 0 };  // over T* and over T_v alike
+    };
+    const auto r = run(s);
+    CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_OK);
+    CHECK(r.verify_shrunk);
+    CHECK((r.residency == llama_residency{ 0, 1, 0 }));
+}
+
 int main() {
     test_decision();
     test_no_demotion();
@@ -413,11 +402,11 @@ int main() {
     test_measure_failed();
     test_wrong_length();
     test_verify();
-    test_verify_bug();
     test_wrong_length_alone();
     test_verify_measure_failed();
     test_no_layers();
     test_non_binary_probe_byte();
+    test_non_binary_verify_answer();
     if (n_failed != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;

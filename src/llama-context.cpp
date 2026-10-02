@@ -2183,22 +2183,21 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     // The set is the host hold's: R_h is folded over every rung the trial may try, at its first transaction.
     tenant_rung_set.assign(rung_set, rung_set + n_rung_set);
 
-
-    prep->probe_fn            = probe_fn;
-    prep->fallback_fn         = fallback_fn;
-    prep->hold_spill_fn       = hold_spill_fn;
-    prep->cache_enabled_fn    = cache_enabled_fn;
-    prep->cache_store_fn      = cache_store_fn;
+    prep->probe_fn             = probe_fn;
+    prep->fallback_fn          = fallback_fn;
+    prep->hold_spill_fn        = hold_spill_fn;
+    prep->cache_enabled_fn     = cache_enabled_fn;
+    prep->cache_store_fn       = cache_store_fn;
     prep->have_cache_accessors = have_cache_accessors;
-    prep->cache_available     = cache_available;
-    prep->cap                 = cap;
+    prep->cache_available      = cache_available;
+    prep->cap                  = cap;
     prep->fallback_ubatch      = fallback_ubatch;
-    prep->moe_bound           = moe_bound;
-    prep->cached_ubatch       = cached_ubatch;
+    prep->moe_bound            = moe_bound;
+    prep->cached_ubatch        = cached_ubatch;
     std::memcpy(prep->cached_reason_buf, cached_reason_buf, sizeof(prep->cached_reason_buf));
-    prep->cache_usable        = cache_usable;
-    prep->rung_ladder         = rung_ladder;
-    auto_ubatch_prep          = std::move(prep);
+    prep->cache_usable = cache_usable;
+    prep->rung_ladder  = rung_ladder;
+    auto_ubatch_prep   = std::move(prep);
 #else
     GGML_UNUSED(type_k);
     GGML_UNUSED(type_v);

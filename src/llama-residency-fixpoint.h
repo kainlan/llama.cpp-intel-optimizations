@@ -65,8 +65,8 @@ using llama_tenants   = std::vector<ggml_sycl_context_tenant_desc>;
 enum llama_residency_fixpoint_status {
     LLAMA_RESIDENCY_FIXPOINT_OK,
     LLAMA_RESIDENCY_FIXPOINT_MEASURE_FAILED,
-    // the probe contradicted the iteration: a residency of the wrong length, or a verify answer
-    // that holds a host layer the fixpoint did not. A plan bug, never a fit verdict.
+    // the probe contradicted the iteration: a residency of the wrong length, or a loop that did not
+    // stop. A plan bug, never a fit verdict.
     LLAMA_RESIDENCY_FIXPOINT_BUG,
 };
 
@@ -86,10 +86,12 @@ struct llama_residency_fixpoint_result {
 //   verify: R_v := probe(T*) without the union; when R_v is strictly smaller than R*, measure over R_v
 //           and take (R_v, T_v) iff the probe over T_v keeps R_v
 //
-// The verify asks the probe the question the last round already answered (the same T*), on purpose: it
-// is the design's independent check, and its BUG arm (a verify answer holding a host layer R* does not)
-// can fire only when the probe is not deterministic over equal tenants -- the one contract the whole
-// iteration rests on. It costs one more probe per planned context construction.
+// Design 2.7 writes the verify as `R_v := probe(tenants=T*).residency without the union`. That is the
+// answer the last round already got (the iteration stops on the round whose tenants are T*), so it is
+// reused, not asked again: a second probe over the same tenants costs one more L0 transaction per
+// planned context construction and can differ only if the probe is not deterministic, the contract the
+// whole iteration rests on. A byte of a probe's answer other than 0 is host-resident and is normalised
+// to 1, so that the comparisons below are about layers.
 //
 //   probe(tenants)         the residency the backend would give with those tenants (nullptr: none)
 //   measure(R, tenants)    the tenant section measured over memory created with residency R;
@@ -97,9 +99,9 @@ struct llama_residency_fixpoint_result {
 //
 // The union makes R grow by at least one layer per round or stop, so n_layer + 1 rounds always
 // suffice: R0 may be empty, n_layer rounds then grow it to every layer, and one more sees it stop. A loop
-// that ends without stopping contradicts that, as does a verify answer holding a host layer R* does not;
-// both are a BUG, never a fit verdict. (The first cannot happen with a probe that answers a residency of
-// n_layer bytes, which is checked, so the BUG arm is a guard on the loop's own invariant.)
+// that ends without stopping contradicts that and is a BUG, never a fit verdict. (It cannot happen with
+// a probe that answers a residency of n_layer bytes, which is checked, so that arm guards the loop's own
+// invariant.)
 template <typename Probe, typename Measure>
 llama_residency_fixpoint_result llama_residency_fixpoint(size_t n_layer, Probe probe, Measure measure) {
     llama_residency_fixpoint_result out;
@@ -115,23 +117,33 @@ llama_residency_fixpoint_result llama_residency_fixpoint(size_t n_layer, Probe p
         return out;
     };
 
+    const auto normalise = [](llama_residency r) {
+        for (auto & b : r) {
+            b = b != 0 ? 1 : 0;
+        }
+        return r;
+    };
+
     llama_residency residency = probe(nullptr);
     if (residency.size() != n_layer) {
         return bug("the residency probe answered a residency of the wrong length");
     }
+    residency = normalise(residency);
 
-    llama_tenants tenants;
-    bool          converged = false;
+    llama_tenants   tenants;
+    llama_residency answer;  // the last round's answer: over T*, the verify's raw probe
+    bool            converged = false;
     for (size_t round = 0; round < n_layer + 1; round++) {
         if (!measure(residency, tenants)) {
             return measure_failed();
         }
         out.iterations++;
 
-        const llama_residency answer = probe(&tenants);
+        answer = probe(&tenants);
         if (answer.size() != n_layer) {
             return bug("the residency probe answered a residency of the wrong length");
         }
+        answer               = normalise(answer);
         llama_residency next = residency;
         for (size_t i = 0; i < n_layer; i++) {
             next[i] = next[i] || answer[i];
@@ -146,16 +158,11 @@ llama_residency_fixpoint_result llama_residency_fixpoint(size_t n_layer, Probe p
         return bug("the residency iteration did not stop within n_layer + 1 rounds");
     }
 
-    // the verify: the probe over T* without the union
-    const llama_residency raw = probe(&tenants);
-    if (raw.size() != n_layer) {
-        return bug("the residency probe answered a residency of the wrong length");
-    }
-    bool shrinks = false;
+    // the verify: the probe over T* without the union, which the last round answered (the loop stopped on
+    // it, so it holds no layer R* lacks)
+    const llama_residency & raw     = answer;
+    bool                    shrinks = false;
     for (size_t i = 0; i < n_layer; i++) {
-        if (raw[i] && !residency[i]) {
-            return bug("the verify holds a host layer the fixpoint does not");
-        }
         shrinks = shrinks || (!raw[i] && residency[i]);
     }
     if (shrinks) {
@@ -163,7 +170,7 @@ llama_residency_fixpoint_result llama_residency_fixpoint(size_t n_layer, Probe p
         if (!measure(raw, shrunk)) {
             return measure_failed();
         }
-        if (probe(&shrunk) == raw) {
+        if (normalise(probe(&shrunk)) == raw) {
             residency         = raw;
             tenants           = shrunk;
             out.verify_shrunk = true;
