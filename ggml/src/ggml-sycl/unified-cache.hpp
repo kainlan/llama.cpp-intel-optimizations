@@ -7496,7 +7496,7 @@ bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
 // The enumerator lists are one object-like macro each, defined and undefined OUTSIDE the braces, so the enum body is a
 // single identifier: the static-storage audit's parser proves that shape, and fails closed on a macro call (or a
 // directive) between the braces (llama.cpp-y8w5).
-#define GGML_SYCL_DUMP_COUNTER_ENUM(name) name,
+#define GGML_SYCL_DUMP_COUNTER_ENUM(name)  name,
 #define GGML_SYCL_DUMP_COUNTER_ENUMERATORS GGML_SYCL_DUMP_COUNTERS(GGML_SYCL_DUMP_COUNTER_ENUM) COUNT
 enum class dump_counter : uint8_t { GGML_SYCL_DUMP_COUNTER_ENUMERATORS };
 #undef GGML_SYCL_DUMP_COUNTER_ENUMERATORS
