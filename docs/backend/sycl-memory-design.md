@@ -2598,24 +2598,34 @@ re-attempted ("resuming"), never trusted.
 default, so a default that itself lost left nothing to settle on but the default, and the settle's transaction then
 refused it (B50, Qwen3.6-27B, `-c 512`, auto: 512 spills a 495 MB compute buffer outside the arena, leaves 107.7 MB
 against the 256 MB headroom, and the context died with `result=19` and no guidance). A smaller `-ub` is not a smaller
-context: `n_ctx` and the KV placement are unchanged. When nothing at or above the default won (the default was itself a
-rung the ladder asked about, and the stop was not a race), the trial continues DOWNWARD (`llama_auto_ubatch_descend`,
-`src/llama-auto-ubatch.h`: halve to a multiple of 32, skip rungs above the cap, floor 64), settles on the first rung that
-fits and says so (`auto n_ubatch lowered from %u to %u`). A lowered result is not written to the tuning cache: the
-lookup refuses any value under the ladder's first rung, so it could only be a miss. A pinned `-ub` never reaches the
-trial and still refuses by name. When no rung down to the floor fits, the settle's own refusal is rethrown as a named
-error (`no -ub from %u down to %u fits this context`) carrying the `largest -ub that fits is about N` the last spill
-refusal computed (or saying none is known), not a bare result code.
-The continuation is not only for a default that lost the ladder. The settle republishes the rung that won, and that
-publish is a fit check of its own: the transaction-time spill bound, read against a card the winner's own reserve has
-since been released from (the next rung's `try_candidate` releases it). It can refuse a rung the ladder accepted, because
-the ladder's realized check reads the card before the buffers are touched. B50, Qwen, `-c 512`, auto: 512 won, 1024 was
-refused at its probe, the settle at 512 was refused (470.0 MB worst-case spill, 132.7 MB left of 602.7 MB, under the
-256 MB headroom), and `last_good` was 512, not 0, so the first version of the continuation never ran. The settle now
-records its refusal instead of throwing it, and tries what lies below the refused rung through the same
-`try_candidate` (`llama_auto_ubatch_settle_refusal_descend`; not repeated when the continuation already ran). A race
-(busy, not the published model) leaves as it came. The tuning-cache store runs after the settle, so a rung the settle
-refused is never persisted.
+context: `n_ctx` and the KV placement are unchanged. When nothing at or above the default won, the default was itself a
+rung the ladder asked about (as a ladder rung or as the cached value), and the loss that ended the ladder was a REAL FIT
+REFUSAL, the trial continues DOWNWARD (`llama_auto_ubatch_descend`, `src/llama-auto-ubatch.h`: halve to a multiple of 64,
+skip rungs above the cap, floor 64), settles on the first rung that fits and says so (`auto n_ubatch lowered from %u to
+%u`). A real fit refusal is exactly one of: the probe ran and refused the candidate, the rung's compute buffers did not
+fit, or its hold spill left no headroom (`rung_fit_refused`, set only at those three returns of `try_candidate`). A
+lifecycle failure, a publish that threw or raced, a KV that would be demoted and a compute buffer that fell back to host
+are not fit refusals: they never lower `-ub`, and the walk ends at the first such loss at any of its rungs. The
+continuation publishes below the default, so it marks the ring dirty and the settle republishes the rung it keeps. A
+lowered result is not stored for itself (the lookup refuses any value under the ladder's first rung, so it could only be a
+miss), except when a cached rung was just refused: the lowered value then overwrites that entry, so the refused value is
+not paid for on every start; and a walk that found nothing stores nothing. A pinned `-ub` never reaches the trial and
+still refuses by name.
+A cached rung that fails its revalidation by a fit refusal is a loss this start already knows: the ascending ladder, which
+ends at the first loss, stops AT that rung instead of asking it again.
+*A refused settle is a named error, with no second walk.* The settle republishes the rung that won (or the default when
+none did), and that publish is a fit check of its own. When it is refused the context fails by name: the refusal is
+handed to the one hold-spill fit function (`ggml_backend_sycl_planned_hold_spill_fits`, the realized check's own entry).
+If that function accepts the rung the settle was refused for another reason (a race, a model that went away) and the
+refusal leaves as it came. If it refuses, the error carries the stop reason of the LAST rung asked, and the `-ub` that
+function accepts, capped under every rung this start already lost (`llama_auto_ubatch_advice`: the answer stands under
+the smallest refused rung, otherwise it is the largest power of two under it, and none under the floor), so the advice
+never names a rung that was asked and refused (`no -ub from %u down to %u fits this context` when the continuation
+ran, `%u does not fit this context` otherwise). B50, Qwen, `-c 512`, auto: with the compute-buffer scope and the one fit
+function the settle no longer disagrees with the ladder's verdict, which is why the earlier settle descent
+is gone: it papered over two predicates over one fact. The settle may skip its
+re-prediction only when that agreement is guaranteed; today it still republishes, and that is where a disagreement would
+show.
 
 Two defects found on the way are tickets, not part of this change: the process hang after a graph fails with
 "CPU fallback also failed" (`llama.cpp-8dd9`, inside the cleanup block of the `ggml_sycl_fallback_error` handler in

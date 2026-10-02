@@ -16,14 +16,14 @@ static const size_t   llama_auto_ubatch_ladder_size =
 // The smallest n_ubatch the trial lowers itself to (llama.cpp-kpjw).
 static const uint32_t llama_auto_ubatch_descent_floor = 64;
 
-// The next rung of the trial's downward continuation: half of `from`, rounded down to a multiple of 32, or 0 when
+// The next rung of the trial's downward continuation: half of `from`, rounded down to a multiple of 64, or 0 when
 // that is under llama_auto_ubatch_descent_floor (nothing below it) or `from` is 0. When the default rung, and so
 // every rung above it, is refused, the trial lowers n_ubatch rather than refusing the context: a smaller -ub is not
 // a smaller context (B50, Qwen3.6-27B auto: 512 spilled a 495 MB compute buffer outside the arena and left 107.7 MB
 // against the 256 MB driver headroom; 256 spills half of that and fits).
 inline uint32_t llama_auto_ubatch_next_lower(uint32_t from) {
     const uint32_t half = from / 2;
-    return half >= llama_auto_ubatch_descent_floor ? half - half % 32 : 0;
+    return half >= llama_auto_ubatch_descent_floor ? half - half % 64 : 0;
 }
 
 // The downward continuation itself: `try_rung(c)` is asked about each rung below `fallback` in turn (largest
@@ -42,15 +42,23 @@ template <typename F> inline uint32_t llama_auto_ubatch_descend(uint32_t fallbac
     return 0;
 }
 
-// llama.cpp-kpjw (kpjw-g7): the settle republishes the rung that won the ladder, and that publish is a fit check of its
-// own (the transaction-time spill bound, read against a card the winner's own reserve has since been released from),
-// so it can refuse a winner the ladder accepted. A refused winner is a refused rung: what lies below it is tried, with
-// the same walk and the same per-rung validation the continuation uses. The continuation having already run means
-// every rung under the default has been asked and lost, so nothing is asked twice. Returns the rung that fits, 0 when
-// none does.
-template <typename F>
-inline uint32_t llama_auto_ubatch_settle_refusal_descend(uint32_t refused, bool descent_ran, uint32_t cap, F try_rung) {
-    return descent_ran ? 0 : llama_auto_ubatch_descend(refused, cap, try_rung);
+// The -ub a refusal names (llama.cpp-kpjw, kpjw-g7). `largest_fit` is the answer of the one hold-spill fit function (the
+// largest -ub it accepts, 0 when none is known to fit); `lowest_refused` is the smallest rung this start already asked
+// and lost (0: none yet). The advice is never a rung that was refused: an answer under `lowest_refused` stands, and
+// one at or above it (the fit function accepts a rung that lost for another reason) is capped to the largest power of
+// two strictly under it. Under the descent floor there is nothing to name, so the answer is 0.
+inline uint32_t llama_auto_ubatch_advice(uint32_t largest_fit, uint32_t lowest_refused) {
+    if (largest_fit == 0) {
+        return 0;
+    }
+    if (lowest_refused == 0 || largest_fit < lowest_refused) {
+        return largest_fit;
+    }
+    uint32_t p = 1;
+    while (p <= lowest_refused / 2 && p * 2 < lowest_refused) {
+        p *= 2;
+    }
+    return lowest_refused > 1 && p >= llama_auto_ubatch_descent_floor ? p : 0;
 }
 
 // True iff some rung of `ladder` lies in [ubatch_floor, ubatch_cap]. The

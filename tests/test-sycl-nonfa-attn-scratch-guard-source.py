@@ -174,12 +174,12 @@ def test_guard_consults_the_headroom_predicate():
     # (the non-FA scratch sized with FA on, the property this gate protects) and a call that passes `false` for
     # probe_mode (review r5 I-B, mutants G1 and G6).
     fa_on = re.search(
-        r"if \(flash_attn_enabled\) \{ return ggml_sycl_check_hold_spill_headroom\(device, hold_spill_bytes, probe_mode\); \}",
+        r"if \(flash_attn_enabled\) \{ return !hold_query \|\| ggml_sycl_check_hold_spill_headroom\(\*hold_query, probe_mode\); \}",
         body_norm,
     )
     assert fa_on is not None, (
         "ggml_sycl_check_nonfa_attn_scratch() must gate the non-FA scratch guard on flash_attn_enabled being false: "
-        "its FA-on branch may only `return ggml_sycl_check_hold_spill_headroom(device, hold_spill_bytes, probe_mode);`"
+        "its FA-on branch may only `return !hold_query || ggml_sycl_check_hold_spill_headroom(*hold_query, probe_mode);`"
     )
     demand_at = body_norm.find("unified_cache_nonfa_attn_scratch_demand_bytes(")
     assert demand_at != -1 and fa_on.end() <= demand_at, (

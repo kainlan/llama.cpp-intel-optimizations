@@ -326,6 +326,16 @@ private:
     // it never re-reads the live free memory at the margin to overturn a rung the ladder just accepted.
     uint32_t sycl_hold_spill_validated_ub = 0;
 
+    // llama.cpp-kpjw: the SYCL backend's scheduler-compute scope (ggml_backend_sycl_compute_alloc_scope), resolved once
+    // from the first SYCL backend of this context; null for a context without one or a SYCL library that predates it.
+    // A buffer the backend allocates while the scope is open is positively a scheduler compute buffer (the request
+    // record and the hold-spill counters are fed by those and by nothing else); it is opened around the reserve and
+    // around the graph allocation, never inferred from the absence of a model load.
+    typedef void (*sycl_compute_scope_fn_t)(bool);
+    sycl_compute_scope_fn_t sycl_compute_scope_fn();
+    bool                    sycl_compute_scope_resolved = false;
+    sycl_compute_scope_fn_t sycl_compute_scope_cached   = nullptr;
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);

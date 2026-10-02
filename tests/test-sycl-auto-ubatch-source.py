@@ -769,7 +769,7 @@ _IN_LOOP_RESERVE_WRAP_RE = (
     r"try\s*\{\s*sched_reserve\s*\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*&\s*e\s*\)\s*\{\s*"
     r"LLAMA_LOG_INFO\s*\([^;]*\be\.what\s*\(\s*\)\s*\)\s*;\s*"
     r"cparams\.pipeline_parallel\s*=\s*pipeline_parallel_before_reserve\s*;\s*sched_matches_last_good\s*=\s*"
-    r'false\s*;\s*return\s*"compute buffers did not fit"\s*;\s*\}'
+    r'false\s*;\s*rung_fit_refused\s*=\s*true\s*;\s*return\s*"compute buffers did not fit"\s*;\s*\}'
 )
 
 
@@ -1367,74 +1367,6 @@ def _balanced_braces(text: str, open_at: int) -> str:
     raise AssertionError("unbalanced braces")
 
 
-def _settle_refusal_is_never_swallowed(body_norm: str) -> bool:
-    """The settle publish's refusal must still leave the trial unless a smaller rung won. llama.cpp-kpjw (g7) records
-    it instead of throwing it (the catch holds exactly the recording, nothing that could swallow it), and the
-    `if (settle_error)` branch either adopts a rung that fit (`won != 0`) or ends in a throw: the race rethrow or the
-    named runtime_error. It holds no return, and nothing else lets control reach the reserve."""
-    settle_at = body_norm.find("if (!sched_matches_last_good")
-    if settle_at == -1:
-        return False
-    settle = body_norm[settle_at:]
-    catch_marker = "} catch (const std::exception & e) {"
-    catch_at = settle.find(catch_marker)
-    if catch_at == -1 or settle.count("catch") != 1:
-        return False
-    catch_body = _balanced_braces(settle, catch_at + len("} catch (const std::exception & e) "))
-    if catch_body[1:-1].strip() != "settle_error = std::current_exception(); settle_refusal = e.what();":
-        return False
-    refused_at = settle.find("if (settle_error) {")
-    if refused_at == -1:
-        return False
-    refused = _balanced_braces(settle, refused_at + len("if (settle_error) "))
-    won_at = refused.find("if (won != 0) {")
-    if won_at == -1:
-        return False
-    won_block = _balanced_braces(refused, won_at + len("if (won != 0) "))
-    tail = refused[won_at + len("if (won != 0) ") + len(won_block):].strip()
-    if not tail.startswith("else {"):
-        return False
-    else_block = _balanced_braces(tail, len("else "))
-    return (
-        "std::rethrow_exception(settle_error);" in else_block
-        and else_block.count("throw std::runtime_error(") == 1
-        and else_block.rstrip().endswith("));" + " }")
-        and "return" not in refused.replace("return rung_stop == nullptr;", "")
-    )
-
-
-def test_settle_refusal_is_never_swallowed():
-    """A refusal of the settle publish is recorded, and the branch that holds it ends in a rung that fit or a throw;
-    any swallow would turn a context that does not fit into a silent success."""
-    assert _settle_refusal_is_never_swallowed(_normalize_ws(_trial_body())), (
-        "the settle publish's catch must only record the refusal, and the refusal branch must adopt a winner or "
-        "rethrow/throw, with no return"
-    )
-
-
-@pytest.mark.parametrize("mutation", ["catch-records-nothing", "named-throw-deleted", "return-in-refusal"])
-def test_settle_refusal_has_a_mutation_witness(mutation):
-    """Mutation witness for the check above: a catch that records nothing (the refusal vanishes), a refusal branch whose
-    named throw is gone, and one that returns, must each make it fail."""
-    raw = LLAMA_CONTEXT_CPP
-    record = "                settle_error   = std::current_exception();\n"
-    assert raw.count(record) == 1, "mutation target not found -- update this witness to match the real source"
-    named = '                throw std::runtime_error(format(\n                    "auto n_ubatch: no -ub from'
-    assert raw.count(named) == 1, "mutation target not found -- update this witness to match the real source"
-    if mutation == "catch-records-nothing":
-        mutated_raw = raw.replace(record, "", 1)
-    elif mutation == "named-throw-deleted":
-        mutated_raw = raw.replace(named, named.replace("throw std::runtime_error(format(", "(void) (format("), 1)
-    else:
-        marker = "                // A race (the model went away"
-        assert raw.count(marker) == 1, "mutation target not found -- update this witness to match the real source"
-        mutated_raw = raw.replace(marker, "                return;\n" + marker, 1)
-    assert mutated_raw != raw
-    assert not _settle_refusal_is_never_swallowed(_body_of(mutated_raw, _TRIAL_START, _TRIAL_END)), (
-        "mutation witness is broken: the mutant should make the settle refusal check fail"
-    )
-
-
 def test_settle_republishes_only_when_needed():
     """The settle step must re-publish and re-reserve only when the
     published plan/sched do not already describe last_good -- not
@@ -1879,8 +1811,8 @@ def test_ubatch_cache_store_follows_the_ladder_has_a_mutation_witness():
     # resumed_outcome_unchanged declarations are not part of what this
     # witness is testing (this mutation is not meant to compile).
     store_block = (
-        "    if (ladder_needed && !stop_is_pure_race && lowered_from == 0 && !resumed_outcome_unchanged &&\n"
-        "        have_cache_accessors && cache_enabled_fn()) {\n"
+        "    if (ladder_needed && !stop_is_pure_race && store_outcome && !resumed_outcome_unchanged && have_cache_accessors &&\n"
+        "        cache_enabled_fn()) {\n"
         "        if (!cache_store_fn(&cache_key, last_good, stop)) {\n"
         '            LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache store failed: %s\\n", cache_path_buf);\n'
         "        }\n"
@@ -1914,12 +1846,12 @@ def test_ubatch_cache_store_is_gated_on_ladder_needed():
     the pre-existing have_cache_accessors/cache_enabled_fn() gate."""
     body_norm = _normalize_ws(_trial_body())
     assert re.search(
-        r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*lowered_from\s*==\s*0\s*&&\s*"
+        r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*store_outcome\s*&&\s*"
         r"!resumed_outcome_unchanged\s*&&\s*"
         r"have_cache_accessors\s*&&\s*cache_enabled_fn\s*\(\s*\)\s*\)\s*\{",
         body_norm,
     ), (
-        "the store must be gated on ladder_needed && !stop_is_pure_race && lowered_from == 0 && "
+        "the store must be gated on ladder_needed && !stop_is_pure_race && store_outcome && "
         "!resumed_outcome_unchanged && "
         "have_cache_accessors && cache_enabled_fn()"
     )
@@ -1931,15 +1863,19 @@ def test_ubatch_cache_store_ladder_needed_gate_has_a_mutation_witness():
     gate (which would re-store an identical entry after every TERMINAL
     cache hit, not just after a real ladder run)."""
     raw = LLAMA_CONTEXT_CPP
-    guard_line = "    if (ladder_needed && !stop_is_pure_race && lowered_from == 0 && !resumed_outcome_unchanged &&\n"
+    guard_line = (
+        "    if (ladder_needed && !stop_is_pure_race && store_outcome && !resumed_outcome_unchanged && have_cache_accessors &&\n"
+    )
     assert guard_line in raw, "mutation target not found -- update this witness to match the real source"
-    mutated_guard_line = "    if (!stop_is_pure_race && lowered_from == 0 && !resumed_outcome_unchanged &&\n"
+    mutated_guard_line = (
+        "    if (!stop_is_pure_race && store_outcome && !resumed_outcome_unchanged && have_cache_accessors &&\n"
+    )
     mutated_raw = raw.replace(guard_line, mutated_guard_line, 1)
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
     assert not re.search(
-        r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*lowered_from\s*==\s*0\s*&&\s*"
+        r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*store_outcome\s*&&\s*"
         r"!resumed_outcome_unchanged\s*&&\s*"
         r"have_cache_accessors\s*&&\s*cache_enabled_fn\s*\(\s*\)\s*\)\s*\{",
         mutated_body_norm,
@@ -2401,7 +2337,7 @@ def test_store_skips_an_unchanged_resumed_outcome():
         body_norm,
     ), "resumed_outcome_unchanged must compare last_good and the reason against the resumed-from hit"
     store_gate_idx = body_norm.find(
-        "if (ladder_needed && !stop_is_pure_race && lowered_from == 0 && !resumed_outcome_unchanged"
+        "if (ladder_needed && !stop_is_pure_race && store_outcome && !resumed_outcome_unchanged"
     )
     assert store_gate_idx != -1, "the store gate must check !resumed_outcome_unchanged"
 
@@ -2586,8 +2522,8 @@ def test_a_refused_settle_is_a_named_error_with_the_fit_functions_n():
         ("            if (llama_context_sycl_hold_spill_fits(backends, last_good, &largest_ub)) {\n",
          "            if (false) {\n"),
         ("llama_auto_ubatch_advice(largest_ub, lowest_refused)", "largest_ub"),
-        ("                throw std::runtime_error(format(\n                    \"auto n_ubatch: no -ub from",
-         "                (void) (format(\n                    \"auto n_ubatch: no -ub from"),
+        ("            throw std::runtime_error(\n                format(\"auto n_ubatch: %s (tried",
+         "            (void) (\n                format(\"auto n_ubatch: %s (tried"),
     ],
 )
 def test_settle_named_error_has_a_mutation_witness(old, new):
@@ -2628,7 +2564,7 @@ def test_the_descent_stops_at_a_loss_that_is_no_fit_refusal():
     assert "descent_ran = true;" in block
     assert "publish_dirty = true;" in block, "a below-default rung ran: the ring must be republished by the settle"
     assert re.search(r"descent_aborted\s*=\s*!rung_fit_refused", block), "the walk must stop at a non-fit loss"
-    assert "lowest_refused = std::min(lowest_refused, c);" in block
+    assert "note_loss(c, rung_reason);" in block
     assert re.search(r"if \(ended != 0 && !descent_aborted\)", block)
 
 
@@ -2717,8 +2653,13 @@ def test_a_refused_cached_value_is_not_paid_for_twice_and_is_evicted():
     """A cached rung that fails its revalidation is a loss this start already knows: the ladder stops AT it instead of
     asking again, and a result that ends up lowered (which is never cached) still overwrites the refused entry."""
     body = _trial_norm()
-    assert re.search(r"if \(rung_fit_refused\) \{ cache_refused_ub = cached_ubatch; cache_refused_reason = cache_reason; \}", body)
-    assert re.search(r"if \(cache_refused_ub != 0 && c >= cache_refused_ub\) \{ stop = cache_refused_reason; break; \}", body)
+    assert re.search(
+        r"if \(rung_fit_refused\) \{ cache_refused_ub = cached_ubatch; cache_refused_reason = cache_reason; "
+        r"fallback_tried = fallback_tried \|\| cached_ubatch == fallback_ubatch; \}",
+        body,
+    )
+    assert re.search(r"if \(cache_refused_ub != 0 && c >= cache_refused_ub\) \{ stop = cache_refused_reason; "
+        r"last_stop = cache_refused_reason; break; \}", body)
     assert "const bool store_outcome = lowered_from == 0 ? !descent_ran : cache_refused_ub != 0;" in body
     assert re.search(r"if \(ladder_needed && !stop_is_pure_race && store_outcome && !resumed_outcome_unchanged &&", body)
 
@@ -2747,3 +2688,27 @@ def test_the_design_doc_describes_the_named_settle_error_not_a_descent():
     doc = (ROOT / "docs/backend/sycl-memory-design.md").read_text()
     assert "settle_refusal_descend" not in doc
     assert "llama_auto_ubatch_advice" in doc
+
+
+def _settle_catch_only_records(body_norm: str) -> bool:
+    settle = body_norm[body_norm.find("if (!sched_matches_last_good") :]
+    catch_at = settle.find("} catch (const std::exception & e) {")
+    if catch_at == -1 or settle.count("catch") != 1:
+        return False
+    catch_body = _balanced_braces(settle, catch_at + len("} catch (const std::exception & e) "))
+    return (
+        catch_body[1:-1].strip() == "settle_error = std::current_exception(); settle_refusal = e.what();"
+        and "return" not in _settle_refused_branch(body_norm)
+    )
+
+
+@pytest.mark.parametrize("mutation", ["catch-records-nothing", "return-in-refusal"])
+def test_the_settle_refusal_record_has_a_mutation_witness(mutation):
+    assert _settle_catch_only_records(_trial_norm())
+    if mutation == "catch-records-nothing":
+        old = "                settle_error   = std::current_exception();\n"
+        new = ""
+    else:
+        old = "            uint32_t largest_ub = 0;\n            if (llama_context_sycl_hold_spill_fits(backends, last_good, &largest_ub)) {"
+        new = "            return;\n" + old
+    assert not _settle_catch_only_records(_trial_mutant(old, new))

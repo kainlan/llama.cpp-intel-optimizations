@@ -1022,74 +1022,117 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
         re.search(r"hold_spill_validated_ub\s*=\s*hold_spill_fn\s*\?\s*c\s*:\s*0\s*;\s*return nullptr;", try_fn) is not None and \
         re.search(r"sched_matches_last_good\s*=\s*false\s*;\s*hold_spill_validated_ub\s*=\s*0\s*;", try_fn[:probe_at]) is not None
 
-    # kpjw-g6 (item 0): the default rung refused must not turn a loadable model into an init failure. B50, Qwen3.6-27B,
-    # auto n_ubatch: 512 spills 495 MB outside the arena and leaves 107.7 MB against the 256 MB headroom, the settle's
-    # transaction refused it, and the context died with "result=19" and no guidance. A smaller -ub is not a smaller
-    # context: when nothing at or above the default wins, the trial continues DOWNWARD (256, 128, 64) and settles on
-    # the first rung that fits. A pinned -ub never reaches the trial and still refuses by name; when no rung fits,
-    # the refusal names the largest -ub that does.
-    results["the pure downward walk exists: halves to a multiple of 32, floor 64, rungs above the cap skipped"] = \
+    # kpjw-g6 (item 0) and g7: the default rung refused must not turn a loadable model into an init failure. B50,
+    # Qwen3.6-27B, auto n_ubatch: 512 spills 495 MB outside the arena and leaves 107.7 MB against the 256 MB headroom.
+    # A smaller -ub is not a smaller context: when nothing at or above the default wins AND the loss was a real fit
+    # refusal, the trial continues DOWNWARD (256, 128, 64) and settles on the first rung that fits. A pinned -ub never
+    # reaches the trial and still refuses by name. A refused settle is a named error whose -ub comes from the one
+    # hold-spill fit function (there is no settle descent: two predicates over one fact).
+    results["the pure downward walk exists: halves to a multiple of 64, floor 64, rungs above the cap skipped"] = \
         re.search(r"llama_auto_ubatch_descent_floor\s*=\s*64\s*;", auto_header) is not None and \
         re.search(r"uint32_t\s+llama_auto_ubatch_next_lower\(\s*uint32_t\s+from\s*\)", auto_header) is not None and \
-        re.search(r"const uint32_t\s+half\s*=\s*from\s*/\s*2\s*;\s*return\s+half\s*>=\s*llama_auto_ubatch_descent_floor\s*\?\s*half\s*-\s*half\s*%\s*32\s*:\s*0\s*;", auto_header) is not None and \
+        re.search(r"const uint32_t\s+half\s*=\s*from\s*/\s*2\s*;\s*return\s+half\s*>=\s*llama_auto_ubatch_descent_floor\s*\?\s*half\s*-\s*half\s*%\s*64\s*:\s*0\s*;", auto_header) is not None and \
         re.search(r"uint32_t\s+llama_auto_ubatch_descend\(\s*uint32_t\s+fallback\s*,\s*uint32_t\s+cap\s*,\s*F\s+try_rung\s*\)", auto_header) is not None and \
         re.search(r"if\s*\(\s*c\s*>\s*cap\s*\)\s*\{\s*continue\s*;", auto_header) is not None and \
         re.search(r"if\s*\(\s*try_rung\(\s*c\s*\)\s*\)\s*\{\s*return c\s*;", auto_header) is not None
+    advice_norm = re.sub(r"\s+", " ", auto_header)
+    results["the advice caps the fit function's answer under the lowest refused rung and names nothing under the floor"] = \
+        re.search(r"inline uint32_t llama_auto_ubatch_advice\(uint32_t largest_fit, uint32_t lowest_refused\) \{", advice_norm) is not None and \
+        "if (largest_fit == 0) { return 0; }" in advice_norm and \
+        "if (lowest_refused == 0 || largest_fit < lowest_refused) { return largest_fit; }" in advice_norm and \
+        re.search(r"while \(p <= lowest_refused / 2 && p \* 2 < lowest_refused\) \{ p \*= 2; \}", advice_norm) is not None and \
+        "return lowest_refused > 1 && p >= llama_auto_ubatch_descent_floor ? p : 0;" in advice_norm
+    results["there is no settle refusal descent"] = \
+        "settle_refusal_descend" not in auto_header and "settle_refusal_descend" not in context and \
+        "refusal_largest_ub" not in context
     loop_at = select_fn.find("for (uint32_t c : ladder) {")
     fallback_assign_at = select_fn.find("if (last_good == 0) {")
-    descent_m = re.search(r"if\s*\(\s*last_good\s*==\s*0\s*&&\s*ladder_needed\s*&&\s*fallback_tried\s*&&\s*!stop_is_pure_race\s*\)\s*\{", select_fn)
+    descent_m = re.search(r"if\s*\(\s*last_good\s*==\s*0\s*&&\s*ladder_needed\s*&&\s*fallback_tried\s*&&\s*rung_fit_refused\s*\)\s*\{", select_fn)
     descent_block = balanced_block(select_fn, descent_m.end() - 1) if descent_m else ""
-    results["the trial continues downward when the default rung and everything above it lost, and not for a race"] = \
+    results["the trial continues downward when the default rung and everything above it lost to a real fit refusal, and only then"] = \
         descent_m is not None and 0 < loop_at < descent_m.start() < fallback_assign_at and \
         re.search(r"llama_auto_ubatch_descend\(\s*fallback_ubatch\s*,\s*cap\s*,", descent_block) is not None and \
-        re.search(r"return try_candidate\(c\)\s*==\s*nullptr\s*;", descent_block) is not None and \
-        re.search(r"last_good\s*=\s*won\s*;", descent_block) is not None and \
+        re.search(r"const char \*\s*rung_reason\s*=\s*try_candidate\(c\)\s*;\s*if\s*\(\s*rung_reason\s*==\s*nullptr\s*\)\s*\{\s*return true\s*;\s*\}", descent_block) is not None and \
+        re.search(r"note_loss\(\s*c\s*,\s*rung_reason\s*\)\s*;\s*descent_aborted\s*=\s*!rung_fit_refused\s*;\s*return descent_aborted\s*;", descent_block) is not None and \
+        re.search(r"if\s*\(\s*ended\s*!=\s*0\s*&&\s*!descent_aborted\s*\)\s*\{", descent_block) is not None and \
+        re.search(r"last_good\s*=\s*ended\s*;", descent_block) is not None and \
         re.search(r"lowered_from\s*=\s*fallback_ubatch\s*;", descent_block) is not None and \
-        re.search(r"descent_ran\s*=\s*true\s*;", descent_block) is not None
+        re.search(r"descent_ran\s*=\s*true\s*;", descent_block) is not None and \
+        re.search(r"publish_dirty\s*=\s*true\s*;", descent_block) is not None
     stop_race_at = select_fn.find("const bool stop_is_pure_race")
     results["a rung that lost is only lowered from when the default itself was tried (a non-rung default is not skipped)"] = \
         0 < stop_race_at < (descent_m.start() if descent_m else 0) and \
-        re.search(r"if\s*\(\s*c\s*==\s*fallback_ubatch\s*\)\s*\{\s*fallback_tried\s*=\s*true\s*;\s*\}\s*tried\s*\+=", select_fn) is not None
-    results["a lowered result is announced once, after the settle, and is not persisted as a tuning-cache entry"] = \
+        re.search(r"if\s*\(\s*c\s*==\s*fallback_ubatch\s*\)\s*\{\s*fallback_tried\s*=\s*true\s*;\s*\}\s*tried\s*\+=", select_fn) is not None and \
+        re.search(r"fallback_tried\s*=\s*fallback_tried\s*\|\|\s*cached_ubatch\s*==\s*fallback_ubatch\s*;", select_fn) is not None
+    results["rung_fit_refused is cleared at the start of every rung and set by exactly the three real fit refusals"] = \
+        re.search(r"^\{\s*rung_fit_refused\s*=\s*false\s*;", try_fn) is not None and \
+        len(re.findall(r"rung_fit_refused\s*=\s*true\s*;", try_fn)) == 3 and \
+        re.search(r"if\s*\(\s*!probe\.accepted\s*\)\s*\{\s*rung_fit_refused\s*=\s*true\s*;\s*return \"transaction refused\"\s*;", try_fn) is not None and \
+        re.search(r"rung_fit_refused\s*=\s*true\s*;\s*return \"compute buffers did not fit\"\s*;", try_fn) is not None and \
+        re.search(r"rung_fit_refused\s*=\s*true\s*;\s*return \"hold spill left no headroom\"\s*;", try_fn) is not None
+    results["the trial state starts at nothing-happened and every rung asked is named in tried"] = \
+        all(re.search(pat, select_fn) is not None for pat in (
+            r"bool\s+descent_ran\s*=\s*false\s*;", r"bool\s+fallback_tried\s*=\s*false\s*;", r"uint32_t\s+lowered_from\s*=\s*0\s*;",
+            r"bool\s+rung_fit_refused\s*=\s*false\s*;", r"uint32_t\s+lowest_refused\s*=\s*0\s*;",
+            r"uint32_t\s+cache_refused_ub\s*=\s*0\s*;")) and \
+        re.search(r"tried\s*\+=\s*\(tried\.empty\(\)\s*\?\s*\"\"\s*:\s*\",\"\)\s*\+\s*std::to_string\(cached_ubatch\)\s*;", select_fn) is not None and \
+        re.search(r"tried\s*\+=\s*\(tried\.empty\(\)\s*\?\s*\"\"\s*:\s*\",\"\)\s*\+\s*std::to_string\(c\)\s*;", select_fn) is not None and \
+        re.search(r"tried\.append\(tried\.empty\(\)\s*\?\s*\"\"\s*:\s*\",\"\)\.append\(std::to_string\(c\)\)\s*;", descent_block) is not None
+    results["the trial never writes the context size: a smaller -ub is not a smaller context"] = \
+        re.search(r"cparams\.n_ctx\s*(?:[-+*/]?=(?!=)|\+\+|--)", select_fn) is None
+    results["a refused cached rung is known to this start and its entry is overwritten, not re-paid"] = \
+        re.search(r"if\s*\(\s*rung_fit_refused\s*\)\s*\{\s*cache_refused_ub\s*=\s*cached_ubatch\s*;\s*cache_refused_reason\s*=\s*cache_reason\s*;", select_fn) is not None and \
+        re.search(r"if\s*\(\s*cache_refused_ub\s*!=\s*0\s*&&\s*c\s*>=\s*cache_refused_ub\s*\)\s*\{\s*stop\s*=\s*cache_refused_reason\s*;\s*last_stop\s*=\s*cache_refused_reason\s*;\s*break\s*;\s*\}", select_fn) is not None and \
+        re.search(r"const bool\s+store_outcome\s*=\s*lowered_from\s*==\s*0\s*\?\s*!descent_ran\s*:\s*cache_refused_ub\s*!=\s*0\s*;", select_fn) is not None
+    results["a lowered result is announced once, after the settle, and is stored only to overwrite a refused cached rung"] = \
         re.search(r"lowered_cause\s*=\s*format\(\s*\"the default did not fit \(%s\)\"\s*,\s*stop\s*\)", descent_block) is not None and \
         re.search(r"if\s*\(\s*lowered_from\s*!=\s*0\s*\)\s*\{\s*LLAMA_LOG_WARN\(\s*\"\[SYCL-PLAN\] auto n_ubatch lowered from %u to %u: %s;", select_fn) is not None and \
         select_fn.count("auto n_ubatch lowered from %u to %u") == 1 and \
-        re.search(r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*lowered_from\s*==\s*0\s*&&", select_fn) is not None
+        re.search(r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*store_outcome\s*&&\s*!resumed_outcome_unchanged\s*&&", select_fn) is not None
     # kpjw-g7: the descent above only runs when NOTHING at or above the default won. The B50 run never got there: the
-    # default 512 won the ladder (the realized check reads the card before the buffers are touched), 1024 was refused
-    # at its probe, and the SETTLE then republished the winner, where the transaction-time bound (plan + the 495 MB
-    # request 512's own reserve recorded) refused it. last_good was 512, so nothing lowered it: a bare result=19.
-    # A refusal of the settle's publish is a refusal of that rung: it is recorded, and what lies below the refused
-    # rung is tried through the same try_candidate; only when nothing fits does the named error leave.
+    # default 512 won the ladder, 1024 was refused at its probe, and the SETTLE then republished the winner and was
+    # refused. The settle's refusal is handed to the one fit function: it accepts the rung -> the refusal was some
+    # other reason and leaves as it came; it refuses -> a named error carrying the -ub that function accepts.
     settle_gate = "if (!sched_matches_last_good || cparams.n_ubatch != last_good) {"
     settle_at = select_fn.find(settle_gate)
     settle_blk = balanced_block(select_fn, settle_at + len(settle_gate) - 1) if settle_at >= 0 else ""
     refused_m = re.search(r"if\s*\(\s*settle_error\s*\)\s*\{", settle_blk)
     refused_blk = balanced_block(settle_blk, refused_m.end() - 1) if refused_m else ""
     store_at = select_fn.find("cache_store_fn(&cache_key")
-    results["a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial"] = \
+    fits_at = refused_blk.find("llama_context_sycl_hold_spill_fits(backends, last_good, &largest_ub)")
+    rethrow_at = refused_blk.find("std::rethrow_exception(settle_error);")
+    advice_at = refused_blk.find("llama_auto_ubatch_advice(largest_ub, lowest_refused)")
+    throw_at = refused_blk.find("throw std::runtime_error(")
+    results["a refused settle publish is recorded and is a named error from the one fit function, with no second descent"] = \
         settle_at > 0 and refused_m is not None and \
         re.search(r"std::exception_ptr\s+settle_error\s*;", settle_blk) is not None and \
         re.search(r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\)\s*;\s*\}\s*catch\s*\(\s*const std::exception\s*&\s*e\s*\)\s*\{\s*"
                   r"settle_error\s*=\s*std::current_exception\(\)\s*;\s*settle_refusal\s*=\s*e\.what\(\)\s*;\s*\}", settle_blk) is not None and \
-        re.search(r"const uint32_t\s+refused_ub\s*=\s*last_good\s*;", refused_blk) is not None and \
-        re.search(r"llama_auto_ubatch_settle_refusal_descend\(\s*refused_ub\s*,\s*descent_ran\s*,\s*cap\s*,", refused_blk) is not None and \
-        re.search(r"rung_stop\s*=\s*try_candidate\(c\)\s*;\s*return rung_stop\s*==\s*nullptr\s*;", refused_blk) is not None and \
-        re.search(r"last_good\s*=\s*won\s*;", refused_blk) is not None and \
-        re.search(r"lowered_from\s*=\s*refused_ub\s*;", refused_blk) is not None and \
-        re.search(r"lowered_cause\s*=\s*format\(\s*\"the settle at %u was refused \(%s\)\"", refused_blk) is not None and \
-        re.search(r"sycl_hold_spill_validated_ub\s*=\s*hold_spill_validated_ub\s*;", refused_blk) is not None and \
-        re.search(r"std::rethrow_exception\(\s*settle_error\s*\)", refused_blk) is not None and \
-        "throw std::runtime_error(" in refused_blk and "no -ub from %u down to %u fits this context" in refused_blk and \
-        "largest -ub that fits is about" in refused_blk and \
+        -1 not in (fits_at, rethrow_at, advice_at, throw_at) and fits_at < rethrow_at < advice_at < throw_at and \
+        "try_candidate(" not in refused_blk and "return" not in refused_blk and refused_blk.count("throw std::runtime_error(") == 1 and \
         re.search(r"\}\s*else\s*\{\s*sched_need_reserve\s*=\s*true\s*;\s*sched_reserve\(\)\s*;\s*\}", settle_blk) is not None
     results["the tuning-cache store runs after the settle, so a rung the settle refused is never persisted"] = \
         settle_at > 0 and store_at > settle_at
-    results["when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code"] = \
+    results["the named settle error names the scope, the rungs tried, the LAST rung's stop reason and the fit function's -ub"] = \
         refused_m is not None and \
-        "throw std::runtime_error(" in refused_blk and "no -ub from %u down to %u fits this context" in refused_blk and \
-        "largest -ub that fits is about" in refused_blk and "llama_auto_ubatch_descent_floor" in refused_blk and \
-        re.search(r"refusal_largest_ub\s*=\s*rung_largest_ub\s*;", try_fn) is not None
+        "no -ub from %u down to %u fits this context" in refused_blk and "%u does not fit this context" in refused_blk and \
+        "tried %s; last stop: %s" in refused_blk and "largest -ub that fits is about" in refused_blk and \
+        re.search(r"last_stop\s*!=\s*nullptr\s*\?\s*last_stop\s*:\s*stop", refused_blk) is not None and \
+        "llama_auto_ubatch_descent_floor" in refused_blk and \
+        re.search(r"auto note_loss\s*=\s*\[&\]\(uint32_t c, const char \* reason\)\s*\{\s*last_stop\s*=\s*reason\s*;\s*lowest_refused\s*=\s*lowest_refused\s*==\s*0\s*\?\s*c\s*:\s*std::min\(lowest_refused, c\)\s*;\s*\}", select_fn) is not None and \
+        select_fn.count("note_loss(") == 3
+    # kpjw-g7 A: a buffer is a scheduler compute buffer by an explicit scope opened around the reserve and the graph
+    # allocation (llama-context), resolved once per context, never by the absence of a model load.
+    ctx_flat = re.sub(r"\s+", " ", context)
+    results["the scheduler compute scope is opened around the reserve and the graph allocation, resolved once per context"] = \
+        re.search(r"struct sycl_compute_scope_guard \{ void \(\*fn\)\(bool\); explicit sycl_compute_scope_guard\(void \(\*f\)\(bool\)\) : fn\(f\) \{ if \(fn\) \{ fn\(true\); \} \} ~sycl_compute_scope_guard\(\) \{ if \(fn\) \{ fn\(false\); \} \}", ctx_flat) is not None and \
+        re.search(r"sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); if \(!ggml_backend_sched_alloc_graph\(", ctx_flat) is not None and \
+        re.search(r"\} else \{ sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); if \(!ggml_backend_sched_reserve\(sched\.get\(\), gf\)\)", ctx_flat) is not None and \
+        "if (!sycl_compute_scope_resolved) { sycl_compute_scope_resolved = true;" in ctx_flat and \
+        "sycl_compute_scope_cached = &ggml_backend_sycl_compute_alloc_scope;" in ctx_flat and \
+        '"ggml_backend_sycl_compute_alloc_scope"' in ctx_flat and \
+        re.search(r"sycl_compute_scope_fn_t\s+sycl_compute_scope_fn\(\)\s*;", ctx_header) is not None and \
+        re.search(r"bool\s+sycl_compute_scope_resolved\s*=\s*false\s*;", ctx_header) is not None
     # r5 R7/R8: releasing the previous rung's buffers means the cached graph results too, not only the sched.
     results["the release drops every cached graph result and the active pointer, not only the sched"] = \
         re.search(r"for\s*\(\s*auto\s*&\s*res\s*:\s*gf_res_prev\s*\)\s*\{\s*res\.reset\(\)\s*;\s*\}", try_fn[:probe_at]) is not None and \
@@ -1880,57 +1923,150 @@ if args.self_test:
         return (label, expect, (new_ctx if new_ctx is not None else context_src, header_src, ctx_header_src,
                                 new_auto if new_auto is not None else auto_header_src))
 
-    descent_cond = r"if\s*\(\s*last_good\s*==\s*0\s*&&\s*ladder_needed\s*&&\s*fallback_tried\s*&&\s*!stop_is_pure_race\s*\)"
+    descent_cond = r"if\s*\(\s*last_good\s*==\s*0\s*&&\s*ladder_needed\s*&&\s*fallback_tried\s*&&\s*rung_fit_refused\s*\)"
+    WALK = "the pure downward walk exists: halves to a multiple of 64, floor 64, rungs above the cap skipped"
+    DESC = "the trial continues downward when the default rung and everything above it lost to a real fit refusal, and only then"
+    TRIED = "a rung that lost is only lowered from when the default itself was tried (a non-rung default is not skipped)"
+    FLAG = "rung_fit_refused is cleared at the start of every rung and set by exactly the three real fit refusals"
+    INIT = "the trial state starts at nothing-happened and every rung asked is named in tried"
+    NCTX = "the trial never writes the context size: a smaller -ub is not a smaller context"
+    CREF = "a refused cached rung is known to this start and its entry is overwritten, not re-paid"
+    LOW = "a lowered result is announced once, after the settle, and is stored only to overwrite a refused cached rung"
+    SETTLE = "a refused settle publish is recorded and is a named error from the one fit function, with no second descent"
+    NAMED = "the named settle error names the scope, the rungs tried, the LAST rung's stop reason and the fit function's -ub"
+    SCOPE = "the scheduler compute scope is opened around the reserve and the graph allocation, resolved once per context"
+    ADV = "the advice caps the fit function's answer under the lowest refused rung and names nothing under the floor"
+    GONE = "there is no settle refusal descent"
+    def ctx_mut_h(label, expect, new_ctx=None, new_hdr=None):
+        return (label, expect, (new_ctx if new_ctx is not None else context_src, header_src,
+                                new_hdr if new_hdr is not None else ctx_header_src, auto_header_src))
     ctx_mutants += [
-        ctx_mut("descent floor lowered below 64", "the pure downward walk exists: halves to a multiple of 32, floor 64, rungs above the cap skipped", new_auto=re.sub(r"descent_floor\s*=\s*64", "descent_floor = 16", auto_header_src, count=1)),
-        ctx_mut("descent rungs not snapped to 32", "the pure downward walk exists: halves to a multiple of 32, floor 64, rungs above the cap skipped", new_auto=re.sub(r"half\s*-\s*half\s*%\s*32", "half", auto_header_src, count=1)),
-        ctx_mut("descent ignores the cap", "the pure downward walk exists: halves to a multiple of 32, floor 64, rungs above the cap skipped", new_auto=re.sub(r"if\s*\(\s*c\s*>\s*cap\s*\)\s*\{\s*continue\s*;\s*\}", "", auto_header_src, count=1)),
-        ctx_mut("descent accepts a refused rung", "the pure downward walk exists: halves to a multiple of 32, floor 64, rungs above the cap skipped", new_auto=re.sub(r"if\s*\(\s*try_rung\(\s*c\s*\)\s*\)", "if (!try_rung(c))", auto_header_src, count=1)),
-        ctx_mut("descent never runs", "the trial continues downward when the default rung and everything above it lost, and not for a race", new_ctx=re.sub(descent_cond, "if (false)", context_src, count=1)),
-        ctx_mut("descent runs after a pure race", "the trial continues downward when the default rung and everything above it lost, and not for a race",
+        ctx_mut("descent floor lowered below 64", WALK, new_auto=re.sub(r"descent_floor\s*=\s*64", "descent_floor = 16", auto_header_src, count=1)),
+        ctx_mut("descent rungs not snapped to 64", WALK, new_auto=re.sub(r"half\s*-\s*half\s*%\s*64", "half", auto_header_src, count=1)),
+        ctx_mut("descent rungs snapped to 32 again", WALK, new_auto=re.sub(r"half\s*%\s*64", "half % 32", auto_header_src, count=1)),
+        ctx_mut("descent ignores the cap", WALK, new_auto=re.sub(r"if\s*\(\s*c\s*>\s*cap\s*\)\s*\{\s*continue\s*;\s*\}", "", auto_header_src, count=1)),
+        ctx_mut("descent accepts a refused rung", WALK, new_auto=re.sub(r"if\s*\(\s*try_rung\(\s*c\s*\)\s*\)", "if (!try_rung(c))", auto_header_src, count=1)),
+        ctx_mut("advice returns the answer uncapped", ADV, new_auto=re.sub(r"if\s*\(\s*lowest_refused\s*==\s*0\s*\|\|\s*largest_fit\s*<\s*lowest_refused\s*\)\s*\{\s*return largest_fit;\s*\}", "return largest_fit;", auto_header_src, count=1)),
+        ctx_mut("advice names a rung under the floor", ADV, new_auto=auto_header_src.replace("p >= llama_auto_ubatch_descent_floor ? p : 0", "p", 1)),
+        ctx_mut("advice names the refused rung itself", ADV, new_auto=auto_header_src.replace("p * 2 < lowest_refused", "p * 2 <= lowest_refused", 1)),
+        ctx_mut("advice invents an answer when none is known", ADV, new_auto=re.sub(r"if\s*\(\s*largest_fit\s*==\s*0\s*\)\s*\{\s*return 0;\s*\}", "", auto_header_src, count=1)),
+        ctx_mut("settle refusal descent comes back (header)", GONE, new_auto=auto_header_src + "\ntemplate <typename F> inline uint32_t llama_auto_ubatch_settle_refusal_descend(uint32_t r, bool d, uint32_t c, F f) { return d ? 0 : llama_auto_ubatch_descend(r, c, f); }\n"),
+        ctx_mut("settle refusal descent comes back (trial)", GONE, new_ctx=context_src.replace("const uint32_t advice =", "(void) llama_auto_ubatch_settle_refusal_descend; const uint32_t advice =", 1)),
+        ctx_mut("refusal_largest_ub is back", GONE, new_ctx=context_src.replace("uint32_t       lowest_refused", "uint32_t refusal_largest_ub = 0; uint32_t       lowest_refused", 1)),
+        ctx_mut("descent never runs", DESC, new_ctx=re.sub(descent_cond, "if (false)", context_src, count=1)),
+        ctx_mut("descent runs after any loss, race included", DESC,
                 new_ctx=re.sub(descent_cond, "if (last_good == 0 && ladder_needed && fallback_tried)", context_src, count=1)),
-        ctx_mut("descent runs without a ladder", "the trial continues downward when the default rung and everything above it lost, and not for a race",
-                new_ctx=re.sub(descent_cond, "if (last_good == 0 && fallback_tried && !stop_is_pure_race)", context_src, count=1)),
-        ctx_mut("descent ignores whether the default was tried", "a rung that lost is only lowered from when the default itself was tried (a non-rung default is not skipped)",
-                new_ctx=re.sub(r"fallback_tried\s*&&\s*!stop_is_pure_race", "!stop_is_pure_race", context_src, count=1)),
-        ctx_mut("fallback_tried never set", "a rung that lost is only lowered from when the default itself was tried (a non-rung default is not skipped)",
-                new_ctx=re.sub(r"fallback_tried\s*=\s*true\s*;", "(void) 0;", context_src, count=1)),
-        ctx_mut("descent starts from the wrong rung", "the trial continues downward when the default rung and everything above it lost, and not for a race",
+        ctx_mut("descent runs without a ladder", DESC,
+                new_ctx=re.sub(descent_cond, "if (last_good == 0 && fallback_tried && rung_fit_refused)", context_src, count=1)),
+        ctx_mut("descent gated on the old race test", DESC,
+                new_ctx=re.sub(descent_cond, "if (last_good == 0 && ladder_needed && fallback_tried && !stop_is_pure_race)", context_src, count=1)),
+        ctx_mut("descent ignores whether the default was tried", TRIED,
+                new_ctx=re.sub(r"fallback_tried\s*&&\s*rung_fit_refused", "rung_fit_refused", context_src, count=1)),
+        ctx_mut("fallback_tried never set by the ladder", TRIED,
+                new_ctx=re.sub(r"if\s*\(\s*c\s*==\s*fallback_ubatch\s*\)\s*\{\s*fallback_tried\s*=\s*true\s*;\s*\}", "", context_src, count=1)),
+        ctx_mut("fallback_tried never set by a refused cached default", TRIED,
+                new_ctx=re.sub(r"fallback_tried\s*=\s*fallback_tried\s*\|\|\s*cached_ubatch\s*==\s*fallback_ubatch\s*;", "(void) 0;", context_src, count=1)),
+        ctx_mut("descent starts from the wrong rung", DESC,
                 new_ctx=re.sub(r"llama_auto_ubatch_descend\(\s*fallback_ubatch\s*,", "llama_auto_ubatch_descend(cparams.n_ubatch,", context_src, count=1)),
-        ctx_mut("descent winner not adopted", "the trial continues downward when the default rung and everything above it lost, and not for a race",
-                new_ctx=re.sub(r"last_good\s*=\s*won\s*;", "(void) won;", context_src, count=1)),
-        ctx_mut("descent loser counted as a winner", "the trial continues downward when the default rung and everything above it lost, and not for a race",
-                new_ctx=re.sub(r"return try_candidate\(c\)\s*==\s*nullptr\s*;", "return try_candidate(c) != nullptr;", context_src, count=1)),
-        ctx_mut("lowered result stored in the tuning cache", "a lowered result is announced once, after the settle, and is not persisted as a tuning-cache entry",
-                new_ctx=re.sub(r"lowered_from\s*==\s*0\s*&&\s*", "", context_src, count=1)),
-        ctx_mut("lowered result not announced", "a lowered result is announced once, after the settle, and is not persisted as a tuning-cache entry",
+        ctx_mut("descent winner not adopted", DESC,
+                new_ctx=re.sub(r"last_good\s*=\s*ended\s*;", "(void) ended;", context_src, count=1)),
+        ctx_mut("descent loser counted as a winner", DESC,
+                new_ctx=mutate_re_in_func(context_src, r"void llama_context::sycl_select_auto_ubatch\(", r"if\s*\(\s*rung_reason\s*==\s*nullptr\s*\)\s*\{\s*return true\s*;\s*\}", "if (rung_reason != nullptr) { return true; }")),
+        ctx_mut("descent walks on past a non-fit loss", DESC,
+                new_ctx=re.sub(r"descent_aborted\s*=\s*!rung_fit_refused\s*;", "descent_aborted = false;", context_src, count=1)),
+        ctx_mut("descent adopts the rung it aborted at", DESC,
+                new_ctx=re.sub(r"if\s*\(\s*ended\s*!=\s*0\s*&&\s*!descent_aborted\s*\)", "if (ended != 0)", context_src, count=1)),
+        ctx_mut("descent does not mark the ring dirty", DESC,
+                new_ctx=mutate_re_in_func(context_src, r"if \(last_good == 0 && ladder_needed && fallback_tried && rung_fit_refused\)", r"publish_dirty\s*=\s*true\s*;", "(void) 0;")),
+        ctx_mut("descent forgets that it ran", DESC,
+                new_ctx=mutate_re_in_func(context_src, r"if \(last_good == 0 && ladder_needed && fallback_tried && rung_fit_refused\)", r"descent_ran\s*=\s*true\s*;", "(void) 0;")),
+        ctx_mut("descent loses never noted", DESC,
+                new_ctx=mutate_re_in_func(context_src, r"if \(last_good == 0 && ladder_needed && fallback_tried && rung_fit_refused\)", r"note_loss\(\s*c\s*,\s*rung_reason\s*\)\s*;", "(void) 0;")),
+        ctx_mut("fit flag never cleared per rung", FLAG, new_ctx=re.sub(r"(auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{\s*)rung_fit_refused\s*=\s*false\s*;", r"\1", context_src, count=1)),
+        ctx_mut("a lifecycle failure is a fit refusal", FLAG,
+                new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"if\s*\(\s*rc\s*!=\s*GGML_SYCL_LIFECYCLE_OK\s*\)\s*\{", "if (rc != GGML_SYCL_LIFECYCLE_OK) { rung_fit_refused = true;")),
+        ctx_mut("a demoted KV is a fit refusal", FLAG,
+                new_ctx=context_src.replace('return "KV would be demoted";', 'rung_fit_refused = true; return "KV would be demoted";', 1)),
+        ctx_mut("a host fallback is a fit refusal", FLAG,
+                new_ctx=context_src.replace('return "compute buffer fell back to host";', 'rung_fit_refused = true; return "compute buffer fell back to host";', 1)),
+        ctx_mut("a publish that threw is a fit refusal", FLAG,
+                new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"publish_dirty\s*=\s*true\s*;\s*return \"transaction refused\"\s*;", 'publish_dirty = true; rung_fit_refused = true; return "transaction refused";')),
+        ctx_mut("a probe refusal is not a fit refusal", FLAG,
+                new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"if\s*\(\s*!probe\.accepted\s*\)\s*\{\s*rung_fit_refused\s*=\s*true\s*;", "if (!probe.accepted) {")),
+        ctx_mut("a compute buffer that did not fit is not a fit refusal", FLAG,
+                new_ctx=re.sub(r"rung_fit_refused\s*=\s*true\s*;\s*return \"compute buffers did not fit\"", 'return "compute buffers did not fit"', context_src, count=1)),
+        ctx_mut("a hold spill is not a fit refusal", FLAG,
+                new_ctx=re.sub(r"rung_fit_refused\s*=\s*true\s*;\s*return \"hold spill left no headroom\"", 'return "hold spill left no headroom"', context_src, count=1)),
+        ctx_mut("descent_ran starts true (B1)", INIT, new_ctx=re.sub(r"bool(\s+)descent_ran(\s+)=\s*false\s*;", r"bool\1descent_ran\2= true;", context_src, count=1)),
+        ctx_mut("fallback_tried starts true (B2)", INIT, new_ctx=re.sub(r"bool(\s+)fallback_tried(\s+)=\s*false\s*;", r"bool\1fallback_tried\2= true;", context_src, count=1)),
+        ctx_mut("lowered_from starts set (B3)", INIT, new_ctx=re.sub(r"uint32_t(\s+)lowered_from(\s+)=\s*0\s*;", r"uint32_t\1lowered_from\2= 1;", context_src, count=1)),
+        ctx_mut("rung_fit_refused starts true", INIT, new_ctx=re.sub(r"bool(\s+)rung_fit_refused(\s+)=\s*false\s*;", r"bool\1rung_fit_refused\2= true;", context_src, count=1)),
+        ctx_mut("lowest_refused starts set", INIT, new_ctx=re.sub(r"uint32_t(\s+)lowest_refused(\s+)=\s*0\s*;", r"uint32_t\1lowest_refused\2= 1;", context_src, count=1)),
+        ctx_mut("cache_refused_ub starts set", INIT, new_ctx=re.sub(r"uint32_t(\s+)cache_refused_ub(\s+)=\s*0\s*;", r"uint32_t\1cache_refused_ub\2= 1;", context_src, count=1)),
+        ctx_mut("the cached rung is not named in tried", INIT, new_ctx=context_src.replace("std::to_string(cached_ubatch);", "std::string();", 1)),
+        ctx_mut("the ladder rung is not named in tried", INIT, new_ctx=re.sub(r"tried\s*\+=\s*\(tried\.empty\(\)\s*\?\s*\"\"\s*:\s*\",\"\)\s*\+\s*std::to_string\(c\)\s*;", "", context_src, count=1)),
+        ctx_mut("the descent rung is not named in tried", INIT, new_ctx=re.sub(r"tried\.append\(tried\.empty\(\)\s*\?\s*\"\"\s*:\s*\",\"\)\.append\(std::to_string\(c\)\)\s*;", "", context_src, count=1)),
+        ctx_mut("the settle shrinks the context", NCTX, new_ctx=re.sub(r"cparams\.n_ubatch\s*=\s*last_good\s*;", "cparams.n_ubatch = last_good; cparams.n_ctx = last_good;", context_src, count=1)),
+        ctx_mut("the descent shrinks the context", NCTX, new_ctx=mutate_re_in_func(context_src, r"if \(last_good == 0 && ladder_needed && fallback_tried && rung_fit_refused\)", r"descent_ran\s*=\s*true\s*;", "descent_ran = true; cparams.n_ctx /= 2;")),
+        ctx_mut("the trial settles on a smaller context after a refusal", NCTX, new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"cparams\.n_ubatch\s*=\s*c\s*;", "cparams.n_ubatch = c; cparams.n_ctx -= 0;")),
+        ctx_mut("a refused cached rung is forgotten", CREF, new_ctx=re.sub(r"cache_refused_ub\s*=\s*cached_ubatch\s*;", "(void) 0;", context_src, count=1)),
+        ctx_mut("a refused cached rung is remembered after a race too", CREF,
+                new_ctx=re.sub(r"if\s*\(\s*rung_fit_refused\s*\)\s*\{\s*cache_refused_ub", "if (true) { cache_refused_ub", context_src, count=1)),
+        ctx_mut("the ladder asks the refused cached rung again", CREF,
+                new_ctx=re.sub(r"if\s*\(\s*cache_refused_ub\s*!=\s*0\s*&&\s*c\s*>=\s*cache_refused_ub\s*\)", "if (false)", context_src, count=1)),
+        ctx_mut("the ladder skips the refused rung and climbs on", CREF,
+                new_ctx=re.sub(r"(c\s*>=\s*cache_refused_ub\s*\)\s*\{\s*stop\s*=\s*cache_refused_reason\s*;\s*last_stop\s*=\s*cache_refused_reason\s*;\s*)break\s*;", r"\1continue;", context_src, count=1)),
+        ctx_mut("a refused cached rung's entry is never overwritten", CREF,
+                new_ctx=re.sub(r"lowered_from\s*==\s*0\s*\?\s*!descent_ran\s*:\s*cache_refused_ub\s*!=\s*0", "lowered_from == 0 ? !descent_ran : false", context_src, count=1)),
+        ctx_mut("a walk that found nothing stores the default", CREF,
+                new_ctx=re.sub(r"lowered_from\s*==\s*0\s*\?\s*!descent_ran\s*:", "lowered_from == 0 ? true :", context_src, count=1)),
+        ctx_mut("lowered result stored without a refused cache", CREF,
+                new_ctx=re.sub(r"store_outcome\s*=\s*lowered_from\s*==\s*0\s*\?\s*!descent_ran\s*:\s*cache_refused_ub\s*!=\s*0", "store_outcome = true", context_src, count=1)),
+        ctx_mut("lowered result not announced", LOW,
                 new_ctx=context_src.replace("auto n_ubatch lowered from %u to %u", "auto n_ubatch XXXX", 1)),
-        ctx_mut("settle refusal thrown instead of recorded (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+        ctx_mut("store gate lost its store_outcome term", LOW,
+                new_ctx=re.sub(r"!stop_is_pure_race\s*&&\s*store_outcome\s*&&", "!stop_is_pure_race &&", context_src, count=1)),
+        ctx_mut("settle refusal thrown instead of recorded", SETTLE,
                 new_ctx=re.sub(r"settle_error\s*=\s*std::current_exception\(\)\s*;", "throw;", context_src, count=1)),
-        ctx_mut("settle refusal never descends (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
-                new_ctx=re.sub(r"llama_auto_ubatch_settle_refusal_descend\(\s*refused_ub\s*,", "llama_auto_ubatch_XXXX(refused_ub,", context_src, count=1)),
-        ctx_mut("settle descent starts from the default, not the refused rung (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
-                new_ctx=re.sub(r"llama_auto_ubatch_settle_refusal_descend\(\s*refused_ub\s*,", "llama_auto_ubatch_settle_refusal_descend(fallback_ubatch,", context_src, count=1)),
-        ctx_mut("settle descent forgets that the continuation ran (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
-                new_ctx=re.sub(r"refused_ub\s*,\s*descent_ran\s*,\s*cap", "refused_ub, false, cap", context_src, count=1)),
-        ctx_mut("settle descent winner not adopted (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
-                new_ctx=mutate_re_in_func(context_src, r"if \(settle_error\) \{", r"last_good\s*=\s*won\s*;", "(void) won;")),
-        ctx_mut("settle descent winner not marked lowered (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
-                new_ctx=re.sub(r"lowered_from\s*=\s*refused_ub\s*;", "(void) 0;", context_src, count=1)),
-        ctx_mut("settle descent loses the validated -ub (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
-                new_ctx=mutate_after(context_src, "if (settle_error) {", "sycl_hold_spill_validated_ub = hold_spill_validated_ub;", "(void) 0;")),
-        ctx_mut("settle race is swallowed into the named error (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+        ctx_mut("settle refusal tries rungs again", SETTLE,
+                new_ctx=mutate_re_in_func(context_src, r"if \(settle_error\) \{", r"uint32_t\s+largest_ub\s*=\s*0\s*;", "uint32_t largest_ub = 0; (void) try_candidate(last_good / 2);")),
+        ctx_mut("settle refusal never asks the fit function", SETTLE,
+                new_ctx=re.sub(r"if\s*\(\s*llama_context_sycl_hold_spill_fits\(\s*backends\s*,\s*last_good\s*,\s*&largest_ub\s*\)\s*\)", "if (false)", context_src, count=1)),
+        ctx_mut("settle refusal asks the fit function about another rung", SETTLE,
+                new_ctx=re.sub(r"llama_context_sycl_hold_spill_fits\(\s*backends\s*,\s*last_good\s*,\s*&largest_ub\s*\)", "llama_context_sycl_hold_spill_fits(backends, fallback_ubatch, &largest_ub)", context_src, count=1)),
+        ctx_mut("settle race is swallowed into the named error", SETTLE,
                 new_ctx=re.sub(r"std::rethrow_exception\(\s*settle_error\s*\)", "(void) 0", context_src, count=1)),
-        ctx_mut("settle reserve skipped when the publish was fine (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+        ctx_mut("settle named error never thrown", SETTLE,
+                new_ctx=mutate_re_in_func(context_src, r"if \(settle_error\) \{", r"throw std::runtime_error\(", "(void) std::runtime_error(")),
+        ctx_mut("settle refusal returns", SETTLE,
+                new_ctx=mutate_re_in_func(context_src, r"if \(settle_error\) \{", r"const uint32_t\s+advice\s*=", "return; const uint32_t advice =")),
+        ctx_mut("settle reserve skipped when the publish was fine", SETTLE,
                 new_ctx=re.sub(r"\}\s*else\s*\{\s*sched_need_reserve\s*=\s*true\s*;\s*sched_reserve\(\)\s*;\s*\}", "} else { }", context_src, count=1)),
-        ctx_mut("cache store ahead of the settle (g7)", "the tuning-cache store runs after the settle, so a rung the settle refused is never persisted",
+        ctx_mut("settle advice not from the advice helper", SETTLE,
+                new_ctx=re.sub(r"llama_auto_ubatch_advice\(\s*largest_ub\s*,\s*lowest_refused\s*\)", "largest_ub", context_src, count=1)),
+        ctx_mut("cache store ahead of the settle", "the tuning-cache store runs after the settle, so a rung the settle refused is never persisted",
                 new_ctx=context_src.replace("if (!sched_matches_last_good || cparams.n_ubatch != last_good) {", "cache_store_fn(&cache_key, 0, stop); if (!sched_matches_last_good || cparams.n_ubatch != last_good) {", 1)),
-        ctx_mut("settle refusal unnamed", "when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code",
-                new_ctx=context_src.replace("no -ub from %u down to %u fits this context", "XXXX", 1)),
-        ctx_mut("settle refusal names no -ub", "when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code",
-                new_ctx=mutate_after(context_src, "no -ub from %u down to", "the largest -ub that fits is about", "XXXX")),
-        ctx_mut("refusal's -ub never recorded", "when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code",
-                new_ctx=re.sub(r"refusal_largest_ub\s*=\s*rung_largest_ub\s*;", "(void) 0;", context_src, count=1)),
+        ctx_mut("named error unnamed", NAMED, new_ctx=context_src.replace("no -ub from %u down to %u fits this context", "XXXX", 1)),
+        ctx_mut("named error forgets a non-descent scope", NAMED, new_ctx=context_src.replace("%u does not fit this context", "XXXX", 1)),
+        ctx_mut("named error names no -ub", NAMED, new_ctx=mutate_in_func(context_src, r"if \(settle_error\) \{", "the largest -ub that fits is about", "XXXX")),
+        ctx_mut("named error omits the last stop", NAMED, new_ctx=context_src.replace("tried %s; last stop: %s", "tried %s; stop: %s", 1)),
+        ctx_mut("named error reports the first stop, not the last", NAMED,
+                new_ctx=re.sub(r"last_stop\s*!=\s*nullptr\s*\?\s*last_stop\s*:\s*stop", "stop", context_src, count=1)),
+        ctx_mut("a loss records no stop reason", NAMED, new_ctx=re.sub(r"last_stop\s*=\s*reason\s*;", "(void) reason;", context_src, count=1)),
+        ctx_mut("a loss lowers no bound", NAMED, new_ctx=re.sub(r"lowest_refused\s*=\s*lowest_refused\s*==\s*0\s*\?\s*c\s*:\s*std::min\(lowest_refused, c\)\s*;", "(void) c;", context_src, count=1)),
+        ctx_mut("the cached loss is not noted", NAMED, new_ctx=re.sub(r"note_loss\(\s*cached_ubatch\s*,\s*cache_reason\s*\)\s*;", "(void) 0;", context_src, count=1)),
+        ctx_mut("the ladder loss is not noted", NAMED, new_ctx=re.sub(r"note_loss\(\s*c\s*,\s*reason\s*\)\s*;", "(void) 0;", context_src, count=1)),
+        ctx_mut_h("the guard never opens the scope", SCOPE, new_ctx=context_src.replace("fn(true);", "(void) 0;", 1)),
+        ctx_mut_h("the guard never closes the scope", SCOPE, new_ctx=context_src.replace("fn(false);", "(void) 0;", 1)),
+        ctx_mut_h("the graph allocation runs outside the scope", SCOPE,
+                  new_ctx=re.sub(r"sycl_compute_scope_guard\s+sycl_scope\(sycl_compute_scope_fn\(\)\)\s*;\s*(if\s*\(\s*!ggml_backend_sched_alloc_graph)", r"\1", context_src, count=1)),
+        ctx_mut_h("the reserve runs outside the scope", SCOPE,
+                  new_ctx=re.sub(r"\}\s*else\s*\{\s*sycl_compute_scope_guard\s+sycl_scope\(sycl_compute_scope_fn\(\)\)\s*;\s*(if\s*\(\s*!ggml_backend_sched_reserve)", r"} else { \1", context_src, count=1)),
+        ctx_mut_h("the scope is resolved on every call", SCOPE, new_ctx=context_src.replace("sycl_compute_scope_resolved = true;", "(void) 0;", 1)),
+        ctx_mut_h("the direct-build scope function is not bound", SCOPE, new_ctx=context_src.replace("sycl_compute_scope_cached = &ggml_backend_sycl_compute_alloc_scope;", "(void) 0;", 1)),
+        ctx_mut_h("the backend-DL scope function is not looked up", SCOPE, new_ctx=context_src.replace('"ggml_backend_sycl_compute_alloc_scope"', '"ggml_backend_sycl_XXXX"', 1)),
+        ctx_mut_h("the context header lacks the scope resolver", SCOPE, new_hdr=ctx_header_src.replace("sycl_compute_scope_fn_t sycl_compute_scope_fn();", "")),
+        ctx_mut_h("the context header lacks the resolved flag", SCOPE, new_hdr=ctx_header_src.replace("bool                    sycl_compute_scope_resolved = false;", "")),
     ]
     for label, expect, sources in ctx_mutants:
         failed += run_context(label, sources, expect)
