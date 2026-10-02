@@ -243,6 +243,22 @@
       "function": "lifecycle_abort_probe_placement_plan",
       "count": 1,
       "reason": "lifecycle_abort_probe_placement_plan is noexcept and its try body is a mutex lock plus a map erase on the abort path: the catch-all swallows a lock failure so an abort cannot throw out of a cleanup, as its sibling lifecycle_abort_placement_plan does. It raises no planned refusal. Permanent."
+    },
+    {
+      "id": "E-HOLD-LEDGER-HELD-CATCH",
+      "code": "G-CATCH",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache_raw_device_held_bytes",
+      "count": 1,
+      "reason": "unified_cache_raw_device_held_bytes is the hold-fit ledger's read-only query (llama.cpp-kpjw): its try body is a mutex lock and a walk of the registry with saturating arithmetic, with no allocation and no source of a planned refusal. The catch-all turns a lock failure into the figure summed so far instead of throwing out of the planner's fit arithmetic; a rethrow of ggml_sycl_fallback_error there would have nothing to carry. Permanent while the function stays a pure registry read; a body that allocates or refuses needs its own handler."
+    },
+    {
+      "id": "E-REGISTRY-TEST-PUBLISH-CATCH",
+      "code": "G-CATCH",
+      "file": "unified-cache.cpp",
+      "function": "allocation_registry_test_publish_raw",
+      "count": 1,
+      "reason": "allocation_registry_test_publish_raw is a noexcept test hook (llama.cpp-kpjw hold-ledger tests, under GGML_SYCL_PRIVATE_TESTING): its try body builds a registry record and emplaces it under the registry mutex, with no physical allocation, and the catch-all returns false (the row was not published). A rethrow would std::terminate a test process through the noexcept boundary, and nothing in the body raises a planned refusal. Permanent; test-only."
     }
   ]
 }

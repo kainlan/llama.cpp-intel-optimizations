@@ -59,7 +59,7 @@
     {"code": "D-FORBID", "key": "ggml-sycl.cpp::ensure_split_persistent_resources::declaration:req:162a1a66#0"},
     {"code": "D-FORBID", "key": "ggml-sycl.cpp::fp16_weight_cache::ensure_slab::declaration:req:91174c34#0"},
     {"code": "D-FORBID", "key": "ggml-sycl.cpp::ggml_backend_sycl_buffer_type_alloc_buffer::declaration:kv_req:745b2797#0"},
-    {"code": "D-FORBID", "key": "ggml-sycl.cpp::ggml_backend_sycl_buffer_type_alloc_buffer::declaration:runtime_req:044faf53#0"},
+    {"code": "D-FORBID", "key": "ggml-sycl.cpp::ggml_backend_sycl_buffer_type_alloc_buffer::declaration:runtime_req:3e861a27#0"},
     {"code": "D-FORBID", "key": "ggml-sycl.cpp::ggml_backend_sycl_buffer_type_alloc_buffer::declaration:scratch_req:b6ced390#0"},
     {"code": "D-FORBID", "key": "ggml-sycl.cpp::ggml_backend_sycl_buffer_type_alloc_buffer::declaration:tp_req:dbd7b739#0"},
     {"code": "D-FORBID", "key": "ggml-sycl.cpp::ggml_backend_sycl_context::get_staging_buffer::declaration:req:eee81ee7#0"},
