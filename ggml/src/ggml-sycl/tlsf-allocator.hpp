@@ -47,6 +47,21 @@ class tlsf_allocator {
     // reads the rule it must mirror instead of restating the number.
     static constexpr size_t block_grain = 256;
 
+    // The size a request of `size` bytes at `alignment` actually occupies: rounded up to the larger of
+    // the alignment and the grain, so every block offset stays on the grain (llama.cpp-f8ws).  Returns 0
+    // for a zero size and for a size the rounding would wrap.  Aborts on an alignment over the grain:
+    // offsets carry the grain's alignment and no more, so a caller that needs more aligns above this
+    // allocator.  The one definition of the rule; allocate(), carve_gap(), allocate_excluding() and the
+    // pending-range draws all read it from here.
+    static size_t round_request(size_t size, size_t alignment) {
+        TLSF_ASSERT(alignment <= block_grain && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
+        const size_t granularity = alignment > block_grain ? alignment : block_grain;
+        if (size == 0 || size > SIZE_MAX - granularity) {
+            return 0;
+        }
+        return (size + granularity - 1) & ~(granularity - 1);
+    }
+
     // Initialize with the SIZE of the managed region [0, size).
     // No pointer to the managed region is needed — all bookkeeping is
     // in host memory.  min_alloc_size: minimum block granularity
@@ -199,7 +214,21 @@ class tlsf_allocator {
     // may straddle a range (the exclusion is enforced at allocation time, and
     // splitting a free block at the boundary would leave two adjacent free
     // blocks, which check_invariants() rejects).  Excluded ranges may overlap
-    // each other and need not be sorted or on the grain.
+    // each other and need not be sorted or on the grain; one whose offset + size
+    // wraps is a caller defect and aborts.
+    //
+    // One case hands out bytes of an excluded range: the sub-MIN_BLOCK_SIZE tail
+    // of an off-grain region is absorbed into the block carved before it, so
+    // TLSF(1000) with [768, 1000) excluded and a request of 768 returns the block
+    // [0, 1000).  Only a range lying wholly in that unallocatable tail is
+    // affected.
+    //
+    // allocate_extent_at(offset, size, tag): the block [offset, offset + size)
+    // with `size` taken as the extent, NOT rounded.  It exists to restore a block
+    // whose recorded extent already includes an absorbed tail (a size that is
+    // not a multiple of the grain): allocate_at() would round such a size up
+    // past the region end and refuse it.  offset must be on the grain; the extent
+    // must lie wholly inside one free block.
     // ------------------------------------------------------------------
     struct excluded_range {
         size_t offset;
@@ -207,11 +236,15 @@ class tlsf_allocator {
     };
 
     size_t allocate_at(size_t offset, size_t size, uint8_t tag = 0) {
-        if (size == 0 || (offset % MIN_BLOCK_SIZE) != 0 || size > SIZE_MAX - MIN_BLOCK_SIZE) {
+        size = round_request(size, block_grain);
+        if (size == 0) {
             return SIZE_MAX;
         }
-        size = (size + MIN_BLOCK_SIZE - 1) & ~(MIN_BLOCK_SIZE - 1);
-        if (offset > SIZE_MAX - size) {
+        return allocate_extent_at(offset, size, tag);
+    }
+
+    size_t allocate_extent_at(size_t offset, size_t size, uint8_t tag = 0) {
+        if (size == 0 || (offset % MIN_BLOCK_SIZE) != 0 || offset > SIZE_MAX - size) {
             return SIZE_MAX;
         }
         int id = last_block_;
@@ -261,15 +294,13 @@ class tlsf_allocator {
                               size_t                              size,
                               size_t                              alignment = 256,
                               uint8_t                             tag       = 0) {
+        size = round_request(size, alignment);
         if (size == 0) {
             return SIZE_MAX;
         }
-        const size_t granularity = alignment > MIN_BLOCK_SIZE ? alignment : MIN_BLOCK_SIZE;
-        if (size > SIZE_MAX - granularity) {
-            return SIZE_MAX;
+        for (const excluded_range & r : excluded) {
+            TLSF_ASSERT(r.offset <= SIZE_MAX - r.size && "an excluded range wraps the address space");
         }
-        size = (size + granularity - 1) & ~(granularity - 1);
-        TLSF_ASSERT(alignment <= MIN_BLOCK_SIZE && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
         std::vector<int> free_ids;
         for (int id = last_block_; id >= 0; id = blocks_[id].prev_block) {
             if (blocks_[id].free) {
@@ -285,7 +316,7 @@ class tlsf_allocator {
             std::vector<size_t> starts;
             starts.push_back(begin);
             for (const excluded_range & r : excluded) {
-                if (r.size == 0 || r.offset > SIZE_MAX - r.size) {
+                if (r.size == 0) {
                     continue;
                 }
                 const size_t r_end = r.offset + r.size;
@@ -625,10 +656,6 @@ inline int tlsf_allocator::alloc_block_id() {
 // allocate: O(1) via bitmap search, returns offset (SIZE_MAX on failure)
 // ------------------------------------------------------------------
 inline size_t tlsf_allocator::allocate(size_t size, size_t alignment, uint8_t tag) {
-    if (size == 0) {
-        return SIZE_MAX;
-    }
-
     // Every block offset must stay a multiple of MIN_BLOCK_SIZE.  The pool's
     // first block starts at offset 0 and split_block() places the remainder at
     // (offset + size), so that holds only while every allocated size is itself a
@@ -636,17 +663,12 @@ inline size_t tlsf_allocator::allocate(size_t size, size_t alignment, uint8_t ta
     // breaks it: most callers leave alignment at the allocator default of 64, and
     // the resulting remainders are 64- but not 128/256-aligned, so later
     // allocations hand back offsets that violate the alignment this allocator
-    // promises (llama.cpp-f8ws).  Rounding by the larger of the two also
-    // satisfies any alignment <= MIN_BLOCK_SIZE for free.
-    const size_t granularity = alignment > MIN_BLOCK_SIZE ? alignment : MIN_BLOCK_SIZE;
-    if (size > SIZE_MAX - granularity) {
-        return SIZE_MAX;  // the rounding below would wrap to a zero-size block
+    // promises (llama.cpp-f8ws).  round_request() rounds by the larger of the
+    // two, which also satisfies any alignment <= MIN_BLOCK_SIZE for free.
+    size = round_request(size, alignment);
+    if (size == 0) {
+        return SIZE_MAX;  // a zero size, or one the rounding would wrap to a zero-size block
     }
-    size = (size + granularity - 1) & ~(granularity - 1);
-
-    // Offsets carry MIN_BLOCK_SIZE alignment and no more, so a larger request
-    // cannot be honoured here; such callers must align above this allocator.
-    TLSF_ASSERT(alignment <= MIN_BLOCK_SIZE && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
     size_t adjusted = size;
 
     int fl, sl;
@@ -802,18 +824,13 @@ inline size_t tlsf_allocator::gap_below(size_t anchor) const {
 }
 
 inline size_t tlsf_allocator::carve_gap(size_t anchor, size_t size, size_t alignment, uint8_t tag, bool from_top) {
-    if (size == 0) {
-        return SIZE_MAX;
-    }
     // Same rounding and the same alignment limit as allocate(), for the same
     // reason: every block offset must stay a multiple of MIN_BLOCK_SIZE, and a
     // top carve places its block at (end - size), so size must be a multiple too.
-    const size_t granularity = alignment > MIN_BLOCK_SIZE ? alignment : MIN_BLOCK_SIZE;
-    if (size > SIZE_MAX - granularity) {
-        return SIZE_MAX;  // the rounding below would wrap to a zero-size block
+    size = round_request(size, alignment);
+    if (size == 0) {
+        return SIZE_MAX;
     }
-    size = (size + granularity - 1) & ~(granularity - 1);
-    TLSF_ASSERT(alignment <= MIN_BLOCK_SIZE && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
 
     int gap_id = gap_block(anchor);
     if (gap_id < 0 || blocks_[gap_id].size < size) {

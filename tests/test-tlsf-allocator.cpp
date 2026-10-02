@@ -1238,6 +1238,44 @@ static void test_allocate_at_absorbs_sub_min_remainder() {
     std::cout << "test_allocate_at_absorbs_sub_min_remainder: PASSED\n";
 }
 
+// allocate_extent_at takes its size as the extent: a tail block that absorbed a
+// sub-grain remainder goes back at its recorded size, which allocate_at() would
+// round past the region end.
+static void test_allocate_extent_at() {
+    tlsf_allocator t(1000);
+    REQUIRE(t.allocate_at(0, 768, 4) == 0 && t.block_size_at(0) == 1000);
+    t.free(0);
+    REQUIRE(t.allocate_at(0, 1000, 4) == SIZE_MAX && "allocate_at rounds 1000 to 1024, past the region end");
+    REQUIRE(t.allocate_extent_at(0, 1000, 4) == 0 && t.block_size_at(0) == 1000 && t.tag_at(0) == 4);
+    REQUIRE(t.check_invariants() && t.used() == 1000);
+    t.free(0);
+    REQUIRE(t.allocate_extent_at(100, 256, 1) == SIZE_MAX && "an off-grain offset");
+    REQUIRE(t.allocate_extent_at(0, 0, 1) == SIZE_MAX && "a zero extent");
+    REQUIRE(t.allocate_extent_at(0, 1001, 1) == SIZE_MAX && "an extent past the free block");
+    REQUIRE(t.allocate_extent_at(256, SIZE_MAX - 100, 1) == SIZE_MAX && "an extent that wraps");
+    REQUIRE(t.allocate_extent_at(256, 512, 2) == 256 && t.block_size_at(256) == 744 &&
+            "a sub-grain remainder is still absorbed, as in allocate_at");
+    REQUIRE(t.check_invariants());
+    tlsf_allocator u(4096);
+    REQUIRE(u.allocate_extent_at(256, 512, 2) == 256 && u.block_size_at(256) == 512 && "an on-grain extent is kept");
+    REQUIRE(u.check_invariants());
+    std::cout << "test_allocate_extent_at: PASSED\n";
+}
+
+// round_request is the one rounding rule: the larger of alignment and grain, 0 for
+// a zero size and for a wrap.
+static void test_round_request() {
+    REQUIRE(tlsf_allocator::round_request(0, 256) == 0);
+    REQUIRE(tlsf_allocator::round_request(1, 64) == 256);
+    REQUIRE(tlsf_allocator::round_request(256, 256) == 256);
+    REQUIRE(tlsf_allocator::round_request(257, 256) == 512);
+    REQUIRE(tlsf_allocator::round_request(SIZE_MAX, 256) == 0);
+    REQUIRE(tlsf_allocator::round_request(SIZE_MAX - 255, 256) == 0 && "a size one grain short of the top wraps");
+    REQUIRE(tlsf_allocator::round_request(SIZE_MAX - 256, 256) == ((SIZE_MAX - 256 + 255) & ~size_t(255)) &&
+            "the largest representable round-up is kept");
+    std::cout << "test_round_request: PASSED\n";
+}
+
 // allocate_excluding is first fit by offset over the parts of free blocks that
 // lie outside every excluded range.
 static void test_allocate_excluding_geometry() {
@@ -1407,6 +1445,8 @@ int main() {
     test_allocate_at_carves_exact();
     test_allocate_at_refusals();
     test_allocate_at_absorbs_sub_min_remainder();
+    test_allocate_extent_at();
+    test_round_request();
     test_allocate_excluding_geometry();
     test_allocate_excluding_interval_model();
 
