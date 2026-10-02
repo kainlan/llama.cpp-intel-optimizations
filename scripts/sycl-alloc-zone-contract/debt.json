@@ -453,7 +453,6 @@
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat::catch_clause:exception#2"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat::catch_clause:exception#3"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat::catch_clause:exception#4"},
-    {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat::catch_clause:exception#5"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat_batched_f16_fallback::catch_clause:exception#0"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat_batched_sycl::catch_clause:exception#0"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat_id::catch_clause:all#0"},

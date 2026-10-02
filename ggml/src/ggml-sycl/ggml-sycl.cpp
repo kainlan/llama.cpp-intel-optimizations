@@ -66391,6 +66391,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             bool batched_declined = false;
             try {
                 batched_declined = !ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+            } catch (const ggml_sycl_fallback_error &) {
+                // A named failure (a decline after a write) is not resource exhaustion: it must reach the caller's
+                // handler by name, not become the ladder's "likely VRAM exhaustion" abort.
+                throw;
             } catch (const std::exception & e) {
                 // ggml_sycl_mul_mat_batched_sycl deliberately re-throws
                 // sycl::exception "for callers that have eviction-retry

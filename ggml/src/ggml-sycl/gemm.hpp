@@ -519,8 +519,8 @@ class DnnlGemmWrapper {
                                             const queue_ptr &           q,
                                             int64_t                     c_stride0,
                                             int64_t                     c_stride1) {
-        return woq_gemm_q4_0_impl(ctx, m, n, k, a, at, b_s4, /* b_bytes = */ 0, /* b_is_packed = */ false, group_size,
-                                  scales, zero_points, c, ct, q, c_stride0, c_stride1);
+        return woq_gemm_q4_0_impl(ctx, m, n, k, a, at, b_s4, group_size, scales, zero_points, c, ct, q, c_stride0,
+                                  c_stride1);
     }
 
     // llama.cpp-nz1k (prefill L2b phase 1): WoQ-int8 GEMM for Q8_0 SOA weights
@@ -737,8 +737,6 @@ class DnnlGemmWrapper {
                                                  const void *                a,
                                                  dt                          at,
                                                  const void *                b_data,
-                                                 size_t                      b_bytes,
-                                                 bool                        b_is_packed,
                                                  int64_t                     group_size,
                                                  const float *               scales,
                                                  const int8_t *              zero_points,
@@ -850,54 +848,42 @@ class DnnlGemmWrapper {
                                           cached->scratchpad_md)) {
             return false;
         }
-        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q4_0);
 
         dnnl::memory          b_mem        = {};
         void *                b_packed_dev = nullptr;
         ggml_sycl::mem_handle b_packed_owner;
-        if (b_is_packed) {
-            const size_t packed_bytes = cached->b_md.get_size();
-            if (b_bytes > 0 && b_bytes < packed_bytes) {
+        dnnl::memory          b_user_mem(b_user_md, eng, const_cast<void *>(b_data));
+        b_mem = b_user_mem;
+        if (cached->b_md != b_user_mem.get_desc()) {
+            const size_t             packed_bytes = cached->b_md.get_size();
+            ggml_sycl::alloc_request req{};
+            req.queue                          = q;
+            req.device                         = ggml_sycl_get_device_id_from_queue(*q);
+            req.size                           = packed_bytes;
+            req.intent.role                    = ggml_sycl::alloc_role::STAGING;
+            req.intent.category                = ggml_sycl::runtime_category::STAGING;
+            req.intent.cohort_id               = "onednn_woq_packed";
+            req.intent.constraints.must_device = true;
+
+            ggml_sycl::alloc_handle b_packed_alloc_owner{};
+            if (ggml_sycl::unified_alloc(req, &b_packed_alloc_owner) && b_packed_alloc_owner.ptr) {
+                b_packed_owner =
+                    ggml_sycl::detail::from_legacy_owned_alloc(std::move(b_packed_alloc_owner), GGML_LAYOUT_AOS);
+                auto resolved = b_packed_owner.resolve(req.device);
+                b_packed_dev  = resolved && resolved.on_device ? resolved.ptr : nullptr;
+                if (!b_packed_dev) {
+                    b_packed_owner = {};
+                }
+            }
+            if (!b_packed_dev) {
                 if (g_ggml_sycl_debug) {
-                    std::fprintf(stderr, "[ONEDNN][WOQ] packed weights too small (%zu < %zu)\n", b_bytes, packed_bytes);
+                    std::fprintf(stderr, "[ONEDNN][WOQ] packed weights alloc failed (%zu bytes)\n", packed_bytes);
                 }
                 return false;
             }
-            b_mem = dnnl::memory(cached->b_md, eng, const_cast<void *>(b_data));
-        } else {
-            dnnl::memory b_user_mem(b_user_md, eng, const_cast<void *>(b_data));
-            b_mem = b_user_mem;
-            if (cached->b_md != b_user_mem.get_desc()) {
-                const size_t             packed_bytes = cached->b_md.get_size();
-                ggml_sycl::alloc_request req{};
-                req.queue                          = q;
-                req.device                         = ggml_sycl_get_device_id_from_queue(*q);
-                req.size                           = packed_bytes;
-                req.intent.role                    = ggml_sycl::alloc_role::STAGING;
-                req.intent.category                = ggml_sycl::runtime_category::STAGING;
-                req.intent.cohort_id               = "onednn_woq_packed";
-                req.intent.constraints.must_device = true;
-
-                ggml_sycl::alloc_handle b_packed_alloc_owner{};
-                if (ggml_sycl::unified_alloc(req, &b_packed_alloc_owner) && b_packed_alloc_owner.ptr) {
-                    b_packed_owner =
-                        ggml_sycl::detail::from_legacy_owned_alloc(std::move(b_packed_alloc_owner), GGML_LAYOUT_AOS);
-                    auto resolved = b_packed_owner.resolve(req.device);
-                    b_packed_dev  = resolved && resolved.on_device ? resolved.ptr : nullptr;
-                    if (!b_packed_dev) {
-                        b_packed_owner = {};
-                    }
-                }
-                if (!b_packed_dev) {
-                    if (g_ggml_sycl_debug) {
-                        std::fprintf(stderr, "[ONEDNN][WOQ] packed weights alloc failed (%zu bytes)\n", packed_bytes);
-                    }
-                    return false;
-                }
-                b_mem = dnnl::memory(cached->b_md, eng, b_packed_dev);
-                dnnl::reorder(b_user_mem, b_mem).execute(stream, b_user_mem, b_mem);
-                stream.wait();
-            }
+            b_mem = dnnl::memory(cached->b_md, eng, b_packed_dev);
+            dnnl::reorder(b_user_mem, b_mem).execute(stream, b_user_mem, b_mem);
+            stream.wait();
         }
 
         dnnl::memory scales_mem(
@@ -923,6 +909,8 @@ class DnnlGemmWrapper {
             args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
         }
 
+        // Every later `return false` is behind us: "engaged" means the primitive is about to be submitted.
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q4_0);
         cached->primitive.execute(stream, args);
 
         if (b_packed_dev) {
