@@ -460,9 +460,22 @@ static const void * ggml_sycl_set_rows_stage_ptr(ggml_backend_sycl_context &    
         return ptr;
     }
 
+    // The stage is predicted never reached on a single card (set_rows_stage_bytes is 0 there); G0
+    // reads how often it is, with the bytes each arrival asked for, and how often while recording.
+    {
+        char key[32];
+        std::snprintf(key, sizeof(key), "bytes=%zu", bytes);
+        ggml_sycl::unified_cache_dump_counter_add_key(ggml_sycl::dump_counter::set_rows_stage_arrivals, owner_device,
+                                                      key);
+        if (g_ggml_sycl_graph_recording) {
+            ggml_sycl::unified_cache_dump_counter_add_key(ggml_sycl::dump_counter::set_rows_stage_record_mode_acquires,
+                                                          owner_device, key);
+        }
+    }
+
     queue_ptr stream = ctx.stream(owner_device, 0);
 
-    ggml_sycl::alloc_request req;
+    ggml_sycl::alloc_request req{};
     req.queue                          = stream;
     req.device                         = owner_device;
     req.size                           = bytes;

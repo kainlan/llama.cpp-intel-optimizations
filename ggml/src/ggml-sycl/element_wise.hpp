@@ -53,6 +53,8 @@ void ggml_sycl_relu(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst)
 
 void ggml_sycl_sigmoid(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst);
 
+void ggml_sycl_softplus(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst);
+
 void ggml_sycl_hardsigmoid(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst);
 
 void ggml_sycl_hardswish(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst);

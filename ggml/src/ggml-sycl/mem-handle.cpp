@@ -136,7 +136,10 @@ struct retained_store_lock {
 struct graph_recording_sink_state {
     std::vector<mem_handle> * sink     = nullptr;
     uint64_t                  epoch_id = 0;
+    uint64_t                  token    = 0;  // process-unique per attachment; 0 while detached
 };
+
+std::atomic<uint64_t>                   g_graph_retention_token_counter{ 0 };
 thread_local graph_recording_sink_state g_graph_recording_sink;
 // Compatibility alias used only inside this translation unit; epoch identity is
 // always checked by terminal_retention_ticket before publication.
@@ -859,6 +862,13 @@ mem_handle mem_handle::from_owned_alloc(alloc_owner && owner, ggml_layout_mode l
 mem_handle detail::from_legacy_owned_alloc(alloc_handle && handle, ggml_layout_mode layout) {
     allocation_result promotion = promote_legacy_alloc_owner(std::move(handle));
     return promotion ? mem_handle::from_owned_alloc(std::move(promotion.owner), layout) : mem_handle{};
+}
+
+uint32_t mem_handle::owner_use_count() const noexcept {
+    // Taken for the reason owns_allocation() takes it: copy- and move-assignment replace
+    // owned_alloc_ under lock_, so an unlocked read would race an assignment into this object.
+    mem_handle_lock_guard g(lock_);
+    return owned_alloc_.use_count();
 }
 
 mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
@@ -2593,7 +2603,13 @@ void set_graph_retained_handle_sink(std::vector<mem_handle> * sink) {
     // ticket into that new graph lifetime.
     ++g_graph_recording_sink.epoch_id;
     if (g_graph_recording_sink.epoch_id == 0) ++g_graph_recording_sink.epoch_id;
+    g_graph_recording_sink.token =
+        sink ? g_graph_retention_token_counter.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
     g_graph_retained_handle_sink = sink;
+}
+
+uint64_t graph_retention_token() {
+    return g_graph_recording_sink.token;
 }
 
 }  // namespace ggml_sycl

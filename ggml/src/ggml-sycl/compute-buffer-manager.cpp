@@ -243,7 +243,7 @@ ComputeBuffer * ComputeBufferManager::find_free_buffer(size_t size) {
 }
 
 mem_handle ComputeBufferManager::allocate_new_buffer(size_t size) {
-    ggml_sycl::alloc_request req;
+    ggml_sycl::alloc_request req{};
     req.queue                          = &queue_;
     req.device                         = device_id_;
     req.size                           = size;
@@ -277,7 +277,7 @@ void ComputeBufferManager::grow_scratch(size_t new_size) {
     }
 
     // Allocate new scratch
-    ggml_sycl::alloc_request req;
+    ggml_sycl::alloc_request req{};
     req.queue                          = &queue_;
     req.device                         = device_id_;
     req.size                           = new_size;

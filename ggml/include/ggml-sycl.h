@@ -77,6 +77,16 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_kv_buffer_type_fro
 // plan. Returns true (today's tiered-device behavior) when no plan is active.
 GGML_BACKEND_API bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32_t il);
 
+// Whether the active placement plan leaves any part of the graph for the CPU to
+// execute: a host-planned dense layer, host-planned KV, a dense weight host-planned
+// by supports_op's own residency rule (including weights outside any layer, such
+// as token_embd or output), or an expert tensor with no expert on a device. False
+// when no plan is active. llama-context reads it to decide whether the CPU
+// backend's compute buffer needs the dedicated activation buffer type above; it
+// must be read AFTER the last placement re-plan, and the plan is process-global
+// (a later model's publish is visible to an earlier context's re-reserve).
+GGML_BACKEND_API bool ggml_backend_sycl_plan_has_cpu_work(ggml_backend_dev_t dev);
+
 // Get the byte offset for reading this rank's shard from GGUF file
 // For column-parallel tensors, this is the offset into the tensor data
 // For row-parallel tensors, returns 0 (requires special handling due to interleaved data)
@@ -98,6 +108,13 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_f
 // structural residency decline and diagnostics key on exactly this buft
 // without perturbing other pinned-host consumers).
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type(void);
+
+// Compute-buffer type for the CPU backend: the same pinned host memory as the
+// generic host buft, with its own identity ("SYCL_CpuActivation") that SYCL
+// never reports as supported. The scheduler therefore copies every CPU-produced
+// activation into the SYCL backend's device compute buffer before a SYCL split
+// consumes it, instead of the SYCL op reading pinned host memory in place.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_cpu_activation_buffer_type(void);
 
 // Host compute buffer type - uses SYCL host memory (malloc_host) with SYCL buffer interface
 // This is used for TP compute buffers to allow cross-device data sharing.
@@ -1492,6 +1509,19 @@ GGML_BACKEND_API size_t ggml_backend_sycl_debug_last_kv_view_extra_count(void);
 // unlike the container-membership accessor above -- see its own comment in
 // ggml-sycl.cpp for why that distinction matters.
 GGML_BACKEND_API size_t ggml_backend_sycl_debug_live_kv_view_extra_count(void);
+
+// llama.cpp-23mk S3-3 (G6): the scratchpad decline seam. Every get_scratchpad_mem family measured so far asks for 0
+// bytes, so a decline cannot be provoked from outside. After inject(site, n) the n-th call that carries the named
+// site tag is declined (n == 0 disarms) and the site's call counter restarts. Sites: "dnnl_softmax", "dnnl_eltwise",
+// "dnnl_binary_row". Returns false, and changes nothing, for an unknown site or a negative n. Process-global,
+// single-threaded test use only.
+GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline(const char * site, int32_t after_n);
+// Zeroes every site's counters and disarms every site.
+GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset(void);
+// calls: times the wrapper consulted the site; declined: declines the seam injected; engaged: times the wrapper went on to
+// submit its primitive. Returns false for an unknown site.
+GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts(const char * site, uint64_t * calls, uint64_t * declined,
+                                                            uint64_t * engaged);
 #endif
 
 #ifdef __cplusplus

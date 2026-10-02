@@ -447,6 +447,13 @@ class mem_handle {
         return static_cast<bool>(owned_alloc_);
     }
 
+    // Read-only snapshot of how many references share this handle's intrusive
+    // allocation owner: every mem_handle copy, assignment and slice of it (all
+    // three copy owned_alloc_). 0 means the handle carries no intrusive owner,
+    // which says nothing about whether anyone else holds the storage.
+    // Never a release decision: release happens only through a handle.
+    uint32_t owner_use_count() const noexcept;
+
     // Identity of the allocation owner control this handle retains: the one
     // from_owned_alloc() adopted, shared by every copy and slice of it. It is
     // minted once per control and never reused, so it cannot name a later
@@ -839,6 +846,12 @@ void fail_next_retained_handle_publication_for_test();
 // not waitable. Attaching a sink starts a new monotonically numbered TLS epoch;
 // detaching invalidates it. Tickets commit only when both sink and epoch match.
 void set_graph_retained_handle_sink(std::vector<mem_handle> * sink);
+
+// Identity of THIS thread's current sink attachment: unique across threads and attachments, and 0 while no sink is
+// attached. A holder that must pin a handle into a recording once, rather than once per use, remembers the token it
+// pinned under and pins again only when the token (a new recording) or the handle (a new backing) differs. A vector
+// address is not an identity (it can be reused by the next recording), which is why this is a counter.
+uint64_t graph_retention_token();
 
 // Drain event-bound handle retainers. When wait_all is true, wait for every
 // retained event before dropping the retained mem_handle copies. This only runs

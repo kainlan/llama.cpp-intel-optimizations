@@ -131,6 +131,14 @@ static __dpct_inline__ T op_sigmoid(T x) {
 }
 
 template<typename T>
+static __dpct_inline__ T op_softplus(T x) {
+    // Same formula and large-x passthrough as the CPU backend's op_softplus
+    // (ggml-cpu/unary-ops.cpp); computed in f32 so f16 inputs cannot overflow exp().
+    const float xf = static_cast<float>(x);
+    return static_cast<T>(xf > 20.0f ? xf : sycl::log(1.0f + sycl::exp(xf)));
+}
+
+template<typename T>
 static __dpct_inline__ T op_sqrt(T x) {
     return sycl::sqrt(x);
 }
@@ -688,15 +696,17 @@ static inline void ggml_sycl_op_silu(ggml_backend_sycl_context & ctx, ggml_sycl:
         dpct::queue_ptr stream = ctx.stream();
         SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
-        DnnlEltwiseWrapper::eltwise(
-            ctx,
-            DnnlEltwiseWrapper::op::SILU,
-            src0.resolve_ptr(),
-            dst.resolve_ptr(),
-            nelements,
-            DnnlEltwiseWrapper::to_dt<float>(),
-            stream);
-        return;
+        // A declined scratchpad wrote nothing to dst: fall through to the SYCL kernel below.
+        if (DnnlEltwiseWrapper::eltwise(
+                ctx,
+                DnnlEltwiseWrapper::op::SILU,
+                src0.resolve_ptr(),
+                dst.resolve_ptr(),
+                nelements,
+                DnnlEltwiseWrapper::to_dt<float>(),
+                stream)) {
+            return;
+        }
     }
 #endif
     // Fallback to SYCL kernel for non-contiguous or small tensors
@@ -717,15 +727,17 @@ static inline void ggml_sycl_op_gelu(ggml_backend_sycl_context & ctx, ggml_sycl:
         dpct::queue_ptr stream = ctx.stream();
         SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
-        DnnlEltwiseWrapper::eltwise(
-            ctx,
-            DnnlEltwiseWrapper::op::GELU,
-            src0.resolve_ptr(),
-            dst.resolve_ptr(),
-            nelements,
-            DnnlEltwiseWrapper::to_dt<float>(),
-            stream);
-        return;
+        // A declined scratchpad wrote nothing to dst: fall through to the SYCL kernel below.
+        if (DnnlEltwiseWrapper::eltwise(
+                ctx,
+                DnnlEltwiseWrapper::op::GELU,
+                src0.resolve_ptr(),
+                dst.resolve_ptr(),
+                nelements,
+                DnnlEltwiseWrapper::to_dt<float>(),
+                stream)) {
+            return;
+        }
     }
 #endif
     ggml_sycl_detail::ggml_sycl_op_unary(ctx, dst, [](auto x) {
@@ -751,15 +763,17 @@ static inline void ggml_sycl_op_gelu_erf(ggml_backend_sycl_context & ctx, ggml_s
         dpct::queue_ptr stream = ctx.stream();
         SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
-        DnnlEltwiseWrapper::eltwise(
-            ctx,
-            DnnlEltwiseWrapper::op::GELU_ERF,
-            src0.resolve_ptr(),
-            dst.resolve_ptr(),
-            nelements,
-            DnnlEltwiseWrapper::to_dt<float>(),
-            stream);
-        return;
+        // A declined scratchpad wrote nothing to dst: fall through to the SYCL kernel below.
+        if (DnnlEltwiseWrapper::eltwise(
+                ctx,
+                DnnlEltwiseWrapper::op::GELU_ERF,
+                src0.resolve_ptr(),
+                dst.resolve_ptr(),
+                nelements,
+                DnnlEltwiseWrapper::to_dt<float>(),
+                stream)) {
+            return;
+        }
     }
 #endif
     ggml_sycl_detail::ggml_sycl_op_unary(ctx, dst, [](auto x) {
@@ -826,6 +840,12 @@ static inline void ggml_sycl_op_step(ggml_backend_sycl_context & ctx, ggml_sycl:
 static inline void ggml_sycl_op_sigmoid(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     ggml_sycl_detail::ggml_sycl_op_unary(ctx, dst, [](auto x) {
         return op_sigmoid(x);
+    });
+}
+
+static inline void ggml_sycl_op_softplus(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
+    ggml_sycl_detail::ggml_sycl_op_unary(ctx, dst, [](auto x) {
+        return op_softplus(x);
     });
 }
 
@@ -1195,6 +1215,11 @@ void ggml_sycl_relu(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst)
 void ggml_sycl_sigmoid(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);
     ggml_sycl_op_sigmoid(ctx, dst);
+}
+
+void ggml_sycl_softplus(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);
+    ggml_sycl_op_softplus(ctx, dst);
 }
 
 void ggml_sycl_hardsigmoid(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {

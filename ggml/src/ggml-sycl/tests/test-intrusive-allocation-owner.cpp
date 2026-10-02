@@ -1,10 +1,13 @@
+#include "ggml.h"
 #include "unified-cache.hpp"
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -414,6 +417,123 @@ void in_flight_promotion_cleanup_pending_survives_rollback() {
                  "PASS in-flight-pending-or-merge-on-rollback\n";
 }
 
+// llama.cpp-93tw: an allocation handed a recycled address while the previous owner's row is still
+// RELEASING (its block already freed, its row not yet erased) must claim the address instead of
+// failing; a LIVE row must still refuse; and the releaser's later erase / rollback must leave the
+// replacement row alone.
+// Captures the library's log so a stale-row claim's trace line can be asserted on.  The trace is
+// switched on in main() before the registry is first used (the switch is read once and cached).
+std::mutex  g_captured_log_mutex;
+std::string g_captured_log;
+
+void capture_log(ggml_log_level, const char * text, void *) {
+    std::lock_guard<std::mutex> lock(g_captured_log_mutex);
+    g_captured_log += text;
+}
+
+std::string captured_log_take() {
+    std::lock_guard<std::mutex> lock(g_captured_log_mutex);
+    std::string                 out;
+    out.swap(g_captured_log);
+    return out;
+}
+
+alloc_metadata replacement_of(const alloc_metadata & stale, uint64_t id) {
+    alloc_metadata value = stale;
+    value.id             = id;
+    return value;
+}
+
+void stale_releasing_row_is_claimed_and_replacement_survives_release() {
+    const size_t         baseline_rows = allocation_registry_test_size();
+    const alloc_metadata stale         = metadata(91);
+    const alloc_metadata fresh         = replacement_of(stale, 9100);
+    check(allocation_registry_test_publish(stale, true), "stale-claim row publication failed");
+
+    allocation_registry_test_pause_claim(true);
+    registered_release_status releaser = registered_release_status::NOT_FOUND;
+    std::thread               t1(
+        [&] { releaser = allocation_registry_test_release_exact(stale, registered_release_mode::INTRUSIVE); });
+    while (!allocation_registry_test_claim_reached()) {
+        std::this_thread::yield();
+    }
+
+    (void) captured_log_take();
+    check(allocation_registry_test_claim_ptr(stale.ptr), "a RELEASING row at the address was not claimed");
+    check(!allocation_registry_test_contains(stale.ptr), "claiming did not erase the stale RELEASING row");
+    {
+        // The trace names the claim and both threads: the releaser is t1, the claimer this thread.
+        const std::string log = captured_log_take();
+        const size_t      at  = log.find("[UNIFIED-ALLOC-STALE-CLAIM]");
+        check(at != std::string::npos, "a stale-row claim emitted no [UNIFIED-ALLOC-STALE-CLAIM] trace line");
+        unsigned long long releaser_tid = 0;
+        unsigned long long claimer_tid  = 0;
+        const size_t       tids         = log.find("releaser_tid=", at);
+        check(tids != std::string::npos && std::sscanf(log.c_str() + tids, "releaser_tid=%llu claimer_tid=%llu",
+                                                       &releaser_tid, &claimer_tid) == 2,
+              "the stale-claim trace line carries no releaser/claimer thread ids");
+        check(releaser_tid != 0 && claimer_tid != 0 && releaser_tid != claimer_tid,
+              "the stale-claim trace did not name two different threads");
+        check(log.find("id=91") != std::string::npos, "the stale-claim trace did not name the stale row's id");
+    }
+    check(allocation_registry_test_publish(fresh, true), "replacement row could not be inserted after the claim");
+
+    allocation_registry_test_pause_claim(false);
+    t1.join();
+    check(releaser == registered_release_status::RELEASED, "the stale row's releaser did not complete");
+    check(allocation_registry_test_contains(fresh.ptr),
+          "the releaser's final erase removed the replacement row at the recycled address");
+    check(allocation_registry_test_release_exact(fresh, registered_release_mode::INTRUSIVE) ==
+              registered_release_status::RELEASED,
+          "the replacement row was not LIVE and releasable after the stale release finished");
+    check(!allocation_registry_test_contains(fresh.ptr) && allocation_registry_test_size() == baseline_rows,
+          "registry did not return to baseline");
+    std::cout << "PASS stale-releasing-row-claimed\n"
+                 "PASS releaser-erase-leaves-replacement-row\n";
+}
+
+void stale_releasing_row_claim_survives_releaser_rollback() {
+    const size_t         baseline_rows = allocation_registry_test_size();
+    const alloc_metadata stale         = metadata(92);
+    const alloc_metadata fresh         = replacement_of(stale, 9200);
+    check(allocation_registry_test_publish(stale, true), "rollback-claim row publication failed");
+    check(allocation_registry_test_acquire_exact_lease(stale), "rollback-claim lease acquisition failed");
+
+    allocation_registry_test_pause_claim(true);
+    registered_release_status releaser = registered_release_status::NOT_FOUND;
+    std::thread               t1(
+        [&] { releaser = allocation_registry_test_release_exact(stale, registered_release_mode::INTRUSIVE); });
+    while (!allocation_registry_test_claim_reached()) {
+        std::this_thread::yield();
+    }
+
+    check(allocation_registry_test_claim_ptr(stale.ptr), "a RELEASING row was not claimed before a refused release");
+    check(allocation_registry_test_publish(fresh, true), "replacement row could not be inserted after the claim");
+
+    allocation_registry_test_pause_claim(false);
+    t1.join();
+    check(releaser == registered_release_status::LEASE_REFUSED, "paused releaser did not take the refusal rollback");
+    check(allocation_registry_test_contains(fresh.ptr),
+          "the releaser's rollback removed or overwrote the replacement row");
+    check(allocation_registry_test_release_exact(fresh, registered_release_mode::INTRUSIVE) ==
+              registered_release_status::RELEASED,
+          "the replacement row was not LIVE after the stale rollback");
+    check(allocation_registry_test_size() == baseline_rows, "registry did not return to baseline");
+    std::cout << "PASS releaser-rollback-leaves-replacement-row\n";
+}
+
+void live_row_at_the_address_is_still_refused() {
+    const size_t         baseline_rows = allocation_registry_test_size();
+    const alloc_metadata live          = metadata(93);
+    check(allocation_registry_test_claim_ptr(live.ptr), "an address with no row was not claimable");
+    check(allocation_registry_test_publish(live, true), "live-row publication failed");
+    check(!allocation_registry_test_claim_ptr(live.ptr), "a LIVE row at the address was displaced");
+    check(allocation_registry_test_contains(live.ptr), "refusing a LIVE row damaged it");
+    allocation_registry_test_erase(live.ptr);
+    check(allocation_registry_test_size() == baseline_rows, "registry did not return to baseline");
+    std::cout << "PASS live-row-claim-refused\n";
+}
+
 void promotion_cleanup_retry_visits_all_snapshot_rows() {
     fake_release_backend backend;
     const size_t baseline_rows = allocation_registry_test_size();
@@ -489,9 +609,129 @@ void failure_accounting_and_metadata_nonownership() {
     std::cout << "PASS allocation-failure-live-count-zero\n"
                  "PASS metadata-cannot-own\n";
 }
+// H12 (design 4.5a): mem_handle::owner_use_count() is an exact, non-destructive snapshot of the references that share one
+// handle's intrusive owner. A copy, a copy-assignment and a slice each count; a moved-from handle reports 0, and so does a
+// handle with no intrusive owner. Reading it releases nothing.
+void owner_use_count_has_no_owner_zero() {
+    mem_handle empty{};
+    check(empty.owner_use_count() == 0, "a default mem_handle reported a nonzero owner count");
+    char storage[256];
+    mem_handle direct = mem_handle::from_direct(storage, GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE, sizeof(storage));
+    check(direct.valid() && !direct.owns_allocation(), "bounded from_direct fixture is not ownerless");
+    check(direct.owner_use_count() == 0, "an ownerless bounded from_direct handle reported a nonzero owner count");
+    std::cout << "PASS owner-use-count-no-owner-is-zero\n";
+}
+
+void owner_use_count_counts_every_reference_exactly() {
+    fake_release_backend backend;
+    auto fixture = make_owner(backend, 30);
+    mem_handle root = mem_handle::from_owned_alloc(std::move(fixture.result.owner));
+    auto stable = [&](const mem_handle & h, uint32_t want, const char * what) {
+        for (int i = 0; i < 1000; ++i) {
+            if (h.owner_use_count() != want) fail(what);
+        }
+        check(backend.attempts == 0, "reading owner_use_count released the allocation");
+    };
+    stable(root, 1, "root from_owned_alloc is not 1");
+    mem_handle copy(root);
+    stable(root, 2, "a copy did not raise the root to 2");
+    stable(copy, 2, "a copy did not report 2");
+    mem_handle assigned;
+    assigned = root;
+    stable(root, 3, "a copy-assignment did not raise the root to 3");
+    mem_handle slice = copy.slice(32, 64);
+    check(slice.valid(), "slice fixture is invalid");
+    stable(root, 4, "a slice is a counted reference, not a free view");
+    stable(slice, 4, "a slice did not report the shared count");
+    mem_handle moved(std::move(slice));
+    stable(root, 4, "a move-construct changed the count");
+    stable(moved, 4, "a move-construct target did not report 4");
+    check(slice.owner_use_count() == 0, "a moved-from handle did not report 0");
+    root = mem_handle{};
+    stable(copy, 3, "resetting the root did not drop the count to 3");
+    check(root.owner_use_count() == 0, "a reset handle did not report 0");
+    moved = mem_handle{};
+    assigned = mem_handle{};
+    stable(copy, 1, "dropping to the last reference did not leave 1");
+    check(backend.attempts == 0, "dropping to one reference released early");
+    copy = mem_handle{};
+    check(backend.attempts == 1 && backend.releases == 1, "the last drop was not the one release");
+    std::cout << "PASS owner-use-count-counts-copies-slices-moves\n"
+                 "PASS owner-use-count-read-is-non-destructive\n"
+                 "PASS owner-use-count-last-drop-is-the-only-release\n";
+}
+
+void owner_use_count_acquire_orders_a_dropped_copy() {
+    fake_release_backend backend;
+    auto fixture = make_owner(backend, 31);
+    mem_handle root = mem_handle::from_owned_alloc(std::move(fixture.result.owner));
+    int plain = 0;
+    std::atomic<bool> go{false};
+    std::thread worker([copy = root, &plain, &go]() mutable {
+        while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+        plain = 42;
+        copy = mem_handle{};
+    });
+    while (root.owner_use_count() != 2) std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    while (root.owner_use_count() != 1) std::this_thread::yield();
+    check(plain == 42, "a reader that saw the count drop did not see the dropped copy's writes");
+    worker.join();
+    root = mem_handle{};
+    check(backend.attempts == 1 && backend.releases == 1, "ordering fixture released other than exactly once");
+    std::cout << "PASS owner-use-count-acquire-ordering\n";
+}
+
+void owner_use_count_concurrent_readers_and_copiers() {
+    fake_release_backend backend;
+    auto fixture = make_owner(backend, 32);
+    mem_handle root = mem_handle::from_owned_alloc(std::move(fixture.result.owner));
+    constexpr int thread_count = 16;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<bool> bad{false};
+    std::atomic<bool> over{false};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < thread_count; ++i) {
+        threads.emplace_back([own = root, &ready, &go, &bad]() mutable {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int k = 0; k < 2000; ++k) {
+                mem_handle again(own);
+                if (own.owner_use_count() < 1 || again.owner_use_count() < 1) bad.store(true);
+            }
+        });
+    }
+    mem_handle shared_object;
+    std::atomic<bool> stop{false};
+    std::thread assigner([&] {
+        while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+        for (int k = 0; k < 2000; ++k) {
+            mem_handle fresh(root);
+            shared_object = fresh;
+        }
+        stop.store(true, std::memory_order_release);
+    });
+    while (ready.load(std::memory_order_acquire) != thread_count) std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    while (!stop.load(std::memory_order_acquire)) {
+        // root + 16 workers' copies + 16 transient copies + the assigner's fresh + the shared object is the most that can be live
+        if (shared_object.owner_use_count() > 1 + 2 * thread_count + 2) over.store(true);
+    }
+    assigner.join();
+    for (auto & t : threads) t.join();
+    check(!bad.load(), "a reader that holds a reference saw a count below 1");
+    check(!over.load(), "a snapshot exceeded the references that can be live at once (root, workers' copies and transients, assigner, shared object)");
+    shared_object = mem_handle{};
+    check(root.owner_use_count() == 1 && backend.attempts == 0, "concurrent copiers left the count off 1 or released early");
+    root = mem_handle{};
+    check(backend.attempts == 1 && backend.releases == 1, "concurrent copiers broke exactly-once release");
+    std::cout << "PASS owner-use-count-concurrent-readers-and-copiers\n";
+}
 } // namespace
 
 static_assert(std::is_copy_constructible_v<alloc_metadata>);
+
 static_assert(std::is_trivially_destructible_v<alloc_metadata>);
 static_assert(!std::is_constructible_v<alloc_owner, alloc_metadata>);
 static_assert(!std::is_constructible_v<shared_alloc_owner, alloc_metadata>);
@@ -499,6 +739,9 @@ static_assert(!std::is_invocable_v<decltype(&detail::promote_legacy_alloc_owner)
               "legacy promotion must reject lvalues; callers snapshot metadata then explicitly move ownership");
 
 int main() {
+    // Read once and cached by the library, so it must precede any registry use.
+    setenv("GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE", "1", 1);
+    ggml_log_set(capture_log, nullptr);
     unique_to_shared_preserves_identity();
     mem_handle_shares_intrusive_control_and_retries();
     concurrent_final_release_exactly_once();
@@ -513,8 +756,15 @@ int main() {
     legacy_promotion_failures_clean_exact_row();
     refused_legacy_promotion_uses_registry_retry_state();
     in_flight_promotion_cleanup_pending_survives_rollback();
+    stale_releasing_row_is_claimed_and_replacement_survives_release();
+    stale_releasing_row_claim_survives_releaser_rollback();
+    live_row_at_the_address_is_still_refused();
     promotion_cleanup_retry_visits_all_snapshot_rows();
     invalid_request_has_zero_coordinator_census();
+    owner_use_count_has_no_owner_zero();
+    owner_use_count_counts_every_reference_exactly();
+    owner_use_count_acquire_orders_a_dropped_copy();
+    owner_use_count_concurrent_readers_and_copiers();
     std::cout << "intrusive allocation owner deterministic runtime tests: PASS\n";
     return 0;
 }

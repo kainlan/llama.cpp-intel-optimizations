@@ -61,7 +61,7 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, 
     // branch, which is never swept by host_zone_settle(), while leaving the
     // EXPERT_STAGING-role-first SCRATCH routing that 0igs/7f2e protect
     // untouched for every other (genuinely ephemeral) EXPERT_STAGING caller.
-    alloc_request req_act;
+    alloc_request req_act{};
     req_act.queue                               = &q;
     req_act.device                              = device_id;
     req_act.size                                = act_bytes;
@@ -116,12 +116,23 @@ void PinnedBufferPool::shutdown() {
     out_handle_ = {};
     act_pool_   = nullptr;
     out_pool_   = nullptr;
+    next_entry_ = 0;
 }
 
 PinnedBufferPool::BufferPair PinnedBufferPool::acquire(size_t n_experts) {
     GGML_ASSERT(n_experts <= max_experts_ && "Expert count exceeds pool capacity");
     GGML_ASSERT(act_pool_ && out_pool_ && "Pool not initialized");
     return { act_pool_, out_pool_ };
+}
+
+size_t PinnedBufferPool::reserve(size_t n_experts) {
+    GGML_ASSERT(n_experts <= max_experts_ && "Expert count exceeds pool capacity");
+    if (next_entry_ + n_experts > max_experts_) {
+        next_entry_ = 0;
+    }
+    const size_t first = next_entry_;
+    next_entry_        = (first + n_experts) % max_experts_;
+    return first;
 }
 
 void PinnedBufferPool::release(BufferPair) {

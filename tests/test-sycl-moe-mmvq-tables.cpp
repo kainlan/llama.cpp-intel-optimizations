@@ -286,6 +286,89 @@ int main() {
         }
     }
 
+    // 7. The grouped XMX_TILED executor must accept PARTIAL cover (llama.cpp-4hg7).
+    //    A hybrid decode routes some slots to the device and the rest to the host. The
+    //    kernel is driven by per-slot route arrays, so a partial cover is as valid as a
+    //    full one provided those arrays exist. Declining it dropped the op onto a
+    //    per-expert fallback that read xmx_tiled bytes as AOS.
+    const struct {
+        bool         full;
+        int          n_gpu;
+        bool         arrays;
+        bool         want;
+        const char * name;
+    } cover_cases[] = {
+        { true,  4, true,  true,  "full cover with arrays"                           },
+        { true,  4, false, true,  "full cover, device-built groups (no host arrays)" },
+        { false, 1, true,  true,  "partial cover, one device slot of four (4hg7)"    },
+        { false, 3, true,  true,  "partial cover, three device slots of four"        },
+        { false, 1, false, false, "partial cover without route arrays is refused"    },
+        { false, 0, true,  false, "no device entries at all"                         },
+        { true,  0, true,  false, "full cover claimed over zero entries"             },
+    };
+
+    for (const auto & c : cover_cases) {
+        if (moe_mmvq_xmx_tiled_grouped_accepts_cover(c.full, c.n_gpu, c.arrays) != c.want) {
+            std::printf("FAIL: xmx_tiled grouped cover policy wrong for: %s (want %d)\n", c.name, c.want ? 1 : 0);
+            ++failures;
+        }
+    }
+
+    // 8. The per-expert MXFP4 direct path reads exactly AOS/SOA/COALESCED. Every other
+    //    layout in the enum is a different byte format and must be refused there, never
+    //    mapped onto AOS (llama.cpp-4hg7). Pinned over the whole layout list so a layout
+    //    added to the direct path without a decoder turns this red.
+    for (const ggml_layout_mode layout : all_layouts()) {
+        const bool expect = layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED;
+        if (moe_mmvq_mxfp4_direct_reads_layout(layout) != expect) {
+            std::printf("FAIL: mxfp4 direct path layout readability wrong for layout=%d (want %d)\n",
+                        static_cast<int>(layout), expect ? 1 : 0);
+            ++failures;
+        }
+    }
+    //    The layout this ticket was about must be among the refused ones, and the batched
+    //    executor must still be the thing that reads it.
+    if (moe_mmvq_mxfp4_direct_reads_layout(GGML_LAYOUT_XMX_TILED) ||
+        !moe_mmvq_batched_dispatch_supports_layout(GGML_TYPE_MXFP4, GGML_LAYOUT_XMX_TILED)) {
+        std::printf("FAIL: XMX_TILED must be batched-executable and not readable by the direct path\n");
+        ++failures;
+    }
+
+    // 9. A prompt-phase layout over a MIXED tensor is executable (llama.cpp-f6zo).
+    //    GPT-OSS at PCT=60 keeps blk.12 as 12 device experts (xmx_tiled) and 20 host
+    //    experts (host AOS, executed on the CPU). The prompt probe found local=12 host=20
+    //    missing=0 for xmx_tiled and still aborted, because admission demanded
+    //    local == n_experts && host == 0 -- "all experts on the device" -- and so asked for
+    //    a SOA copy the planner never builds. Placement decides the executor: device entries
+    //    at their loaded layout plus host entries on the CPU cover every expert.
+    //    Host-only (local == 0) stays with the SOA/host path; a missing or secondary expert,
+    //    or a cover that does not add up to the tensor, is not executable.
+    const struct {
+        size_t       local, secondary, host, missing, n_experts;
+        bool         want;
+        const char * name;
+    } prompt_cover_cases[] = {
+        { 12, 0, 20, 0, 32, true,  "mixed tensor, 12 device + 20 host (f6zo)"                 },
+        { 1,  0, 31, 0, 32, true,  "mixed tensor, one device expert"                          },
+        { 31, 0, 1,  0, 32, true,  "mixed tensor, one host expert"                            },
+        { 32, 0, 0,  0, 32, true,  "all device (the case the strict check always accepted)"   },
+        { 0,  0, 32, 0, 32, false, "all host is not a device-layout cover"                    },
+        { 0,  0, 0,  1, 32, false, "SOA asked of xmx_tiled entries: local=0 host=0 missing=1" },
+        { 12, 0, 19, 1, 32, false, "one expert missing"                                       },
+        { 12, 0, 20, 1, 32, false, "an expert counted missing on top of a full cover"         },
+        { 12, 1, 20, 0, 32, false, "a secondary expert counted on top of a full cover"        },
+        { 12, 0, 18, 0, 32, false, "cover does not add up to the tensor"                      },
+        { 11, 1, 20, 0, 32, false, "a secondary-device expert (PP is unvalidated there)"      },
+        { 12, 0, 20, 0, 0,  false, "empty tensor"                                             },
+    };
+
+    for (const auto & c : prompt_cover_cases) {
+        if (moe_mmvq_prompt_layout_cover_executable(c.local, c.secondary, c.host, c.missing, c.n_experts) != c.want) {
+            std::printf("FAIL: prompt layout cover policy wrong for: %s (want %d)\n", c.name, c.want ? 1 : 0);
+            ++failures;
+        }
+    }
+
     if (failures != 0) {
         std::printf("test-sycl-moe-mmvq-tables: FAILED (%d)\n", failures);
         return 1;

@@ -1,0 +1,176 @@
+{
+  "schema": 1,
+  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clauses e, j and q; later clauses add entries). Permanent exemptions only, each with a reason. An entry names its subject (file and function, or a node key), the raw `name` where the code is E-RAW or E-LIBC, and an exact `count`; it fails if it matches nothing or covers a different number, and `name` pins the allocator so a swapped-in different call does not ride the exemption. Hand-edited; see README.md.",
+  "entries": [
+    {
+      "id": "E-TEST",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache::ensure_cached_alloc",
+      "name": "unified_cache_malloc_device_tracked",
+      "count": 2,
+      "reason": "design 6.14 E-TEST: the PRIVATE_TESTING allocation entry, a test seam; its two raw calls are exempt, a third is not"
+    },
+    {
+      "id": "E-ARENA-BACKING",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache::arena_reserve",
+      "name": "sycl_aligned_malloc_device",
+      "count": 2,
+      "reason": "design 6.14 E-ARENA-BACKING: arena_reserve is the arena; its two backing allocations are what every zone is carved from"
+    },
+    {
+      "id": "E-CHAIN-ALIGNED",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "sycl_aligned_malloc_device",
+      "name": "aligned_alloc_device",
+      "count": 1,
+      "reason": "the aligned-allocation link of the raw chain: canonical contract section 3 (Allocator Entry Points, allowlist: unified_cache_raw_malloc_device is an allowed raw-malloc wrapper, internal to unified_cache) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway); 23mk census row :18789/:18830/:1433: the chain's own links, the raw layer, allowlisted by name with an exact count"
+    },
+    {
+      "id": "E-CHAIN-TRACKED",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache_malloc_device_tracked",
+      "name": "unified_cache_raw_malloc_device",
+      "count": 1,
+      "reason": "the tracked-allocation link of the raw chain: canonical contract section 3 (Allocator Entry Points, allowlist: unified_cache_raw_malloc_device is an allowed raw-malloc wrapper, internal to unified_cache) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway); 23mk census row :18789/:18830/:1433: the chain's own links, the raw layer, allowlisted by name with an exact count"
+    },
+    {
+      "id": "E-CHAIN-RAW",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache_raw_malloc_device",
+      "name": "sycl_aligned_malloc_device",
+      "count": 1,
+      "reason": "the raw-wrapper link of the raw chain: canonical contract section 3 (Allocator Entry Points, allowlist: unified_cache_raw_malloc_device is an allowed raw-malloc wrapper, internal to unified_cache) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway); 23mk census row :18789/:18830/:1433: the chain's own links, the raw layer, allowlisted by name with an exact count"
+    },
+    {
+      "id": "E-DPCT-MALLOC",
+      "code": "E-RAW",
+      "file": "dpct/helper.hpp",
+      "function": "dpct_malloc",
+      "name": "malloc_device",
+      "count": 1,
+      "reason": "dpct_malloc's one sycl::malloc_device call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Vendored upstream, not edited, dead in-tree"
+    },
+    {
+      "id": "E-DPCT-DEVMEM-DEVICE",
+      "code": "E-RAW",
+      "file": "dpct/helper.hpp",
+      "function": "device_memory::allocate_device",
+      "name": "malloc_device",
+      "count": 1,
+      "reason": "device_memory::allocate_device's device-read-only malloc_device call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Vendored upstream, not edited, dead in-tree"
+    },
+    {
+      "id": "E-DPCT-DEVMEM-SHARED",
+      "code": "E-RAW",
+      "file": "dpct/helper.hpp",
+      "function": "device_memory::allocate_device",
+      "name": "malloc_shared",
+      "count": 1,
+      "reason": "device_memory::allocate_device's malloc_shared call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Vendored upstream, not edited, dead in-tree"
+    },
+    {
+      "id": "E-CHAIN-HOST-RAW",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache_raw_malloc_host",
+      "name": "malloc_host",
+      "count": 2,
+      "reason": "the host raw wrapper's two overloads (queue and context) each call sycl::malloc_host once: canonical contract section 3 (Allocator Entry Points: unified_cache_raw_malloc_host is a raw sycl::malloc_host wrapper, callable only from unified_cache internals) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway)"
+    },
+    {
+      "id": "E-CHAIN-HOST-TRACKED",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache_malloc_host_tracked",
+      "name": "unified_cache_raw_malloc_host",
+      "count": 1,
+      "reason": "the tracked host allocation's link to the raw wrapper: canonical contract section 3 (Allocator Entry Points: unified_cache_raw_malloc_host is a raw sycl::malloc_host wrapper, callable only from unified_cache internals) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway)"
+    },
+    {
+      "id": "E-HOST-USM-BASE",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_alloc",
+      "name": "unified_cache_raw_malloc_host",
+      "count": 1,
+      "reason": "unified_alloc's require_host_usm_base path, a standalone host USM base owned through the handle it returns: canonical contract section 3 (Allocator Entry Points: unified_cache_raw_malloc_host is a raw sycl::malloc_host wrapper, callable only from unified_cache internals) and section 9.1 (unified-cache.cpp internals, allowed permanently as the raw-malloc gateway)"
+    },
+    {
+      "id": "E-BACKING-STAGING",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache::unified_cache",
+      "name": "unified_cache_malloc_host_tracked",
+      "count": 1,
+      "reason": "the cache's own staging buffer, tag unified_cache:staging, one of the two CACHE_BACKING bootstrap sites: canonical contract section 3.1 (mechanism 2, the two-site allowlist) and section 9.1"
+    },
+    {
+      "id": "E-BACKING-FLAG-SLAB",
+      "code": "E-RAW",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache::onednn_graph_scratch_ensure_flag_slab_locked",
+      "name": "unified_cache_malloc_host_tracked",
+      "count": 1,
+      "reason": "the oneDNN Graph-scratch completion-flag slab, tag unified_cache:onednn_graph_scratch_flag_slab, the second CACHE_BACKING bootstrap site: canonical contract section 3.1 (mechanism 2, the two-site allowlist) and section 9.1"
+    },
+    {
+      "id": "E-J-CLASSIFIER",
+      "code": "J-DISPATCH",
+      "file": "zone-sizing.cpp",
+      "function": "zone_scoped_maxima",
+      "count": 1,
+      "reason": "design 7(j): the late stage's classifier. zone_scoped_maxima classifies each tensor once, at the plan, with zone_is_onednn_reorder_eligible; no dispatch path may call it (the plan stores the structural bits a dispatch reads)"
+    },
+    {
+      "id": "E-LIBC-DPCT-MMGR-MMAP",
+      "code": "E-LIBC",
+      "file": "dpct/helper.hpp",
+      "function": "mem_mgr::mem_mgr",
+      "name": "mmap",
+      "count": 1,
+      "reason": "vendored dpct, unreachable from the backend: mem_mgr's constructor reserves PROT_NONE address space on Linux; canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; the row lists this libc site)"
+    },
+    {
+      "id": "E-LIBC-DPCT-MMGR-VIRTUALALLOC",
+      "code": "E-LIBC",
+      "file": "dpct/helper.hpp",
+      "function": "mem_mgr::mem_mgr",
+      "name": "VirtualAlloc",
+      "count": 1,
+      "reason": "vendored dpct, unreachable from the backend: the _WIN64 arm of mem_mgr's constructor, the Windows twin of the mmap above; canonical contract section 9.1 (the dpct/helper.hpp row lists this libc site)"
+    },
+    {
+      "id": "E-LIBC-DPCT-HOSTBUF-MALLOC",
+      "code": "E-LIBC",
+      "file": "dpct/helper.hpp",
+      "function": "host_buffer::host_buffer",
+      "name": "malloc",
+      "count": 2,
+      "reason": "vendored dpct, unreachable from the backend: the two host_buffer constructors' std::malloc, the buffer behind dpct's 3-D memcpy paths, which clause (e) forbids outside helper.hpp through dpct_memcpy and async_dpct_memcpy; canonical contract section 9.1 (the dpct/helper.hpp row lists this libc site)"
+    },
+    {
+      "id": "E-LIBC-DPCT-DEVMEM-MALLOC",
+      "code": "E-LIBC",
+      "file": "dpct/helper.hpp",
+      "function": "device_memory::device_memory",
+      "name": "malloc",
+      "count": 2,
+      "reason": "vendored dpct, unreachable from the backend: the two device_memory initializer-list constructors' host staging std::malloc, a class clause (e) forbids outside helper.hpp; canonical contract section 9.1 (the dpct/helper.hpp row lists this libc site)"
+    },
+    {
+      "id": "E-LIBC-CACHE-GUARD",
+      "code": "E-LIBC",
+      "file": "unified-cache.hpp",
+      "function": "cache_guard_allocator::allocate",
+      "name": "mmap",
+      "count": 1,
+      "reason": "cache bookkeeping, guard-page debug mode, no tensor/KV/scratch/pinned/USM bytes: cache_guard_allocator backs the cache's own hash maps when the guard env is set and falls back to std::allocator; the cache cannot allocate its own map nodes through itself. Permanent; canonical contract section 9.1 (the cache_guard_allocator row)"
+    }
+  ]
+}

@@ -1621,6 +1621,22 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 
 void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
 size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
+// llama.cpp-479i: plan the per-context dense MMQ/MMVQ Q8_1 src1 buffer from the inventory's
+// bytes-per-token (zone_scoped_maxima().mmq_src1_bytes_per_token) at n_ubatch. Folded into
+// unified_cache_get_planned_runtime_zone_requirement(). False on overflow (nothing published).
+bool   unified_cache_set_planned_mmq_src1_scratch(int device_id, size_t bytes_per_token, uint32_t n_ubatch);
+size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id);
+// llama.cpp-479i: plan the per-context dense f16 dequant buffers (src0 copy + src1 copy) from
+// the inventory maxima (zone_scoped_maxima().dequant_f16_weight_bytes / _src1_bytes_per_token) at
+// n_ubatch. Folded into unified_cache_get_planned_runtime_zone_requirement(). False on overflow.
+bool   unified_cache_set_planned_dequant_f16_scratch(int      device_id,
+                                                     size_t   max_weight_bytes,
+                                                     size_t   src1_bytes_per_token,
+                                                     uint32_t n_ubatch);
+// Both buffers' bytes together (what the RUNTIME zone requirement folds in), and each alone: the graph walk
+// ensures each buffer at max(its own plan, the graph's demand).
+size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id);
+size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool src1);
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno
@@ -3498,6 +3514,18 @@ class unified_cache {
     size_t zone_used(vram_zone_id zone) const;
     size_t zone_available(vram_zone_id zone) const;
     size_t zone_largest_free(vram_zone_id zone) const;
+    // Both free-space figures of one zone, read together under its allocator group's mutex: the
+    // allocators' figures are only coherent under it (zone_available and zone_largest_free read
+    // them bare), with the zone's capacity and used bytes read at the same instant. For a zone with its
+    // own allocator (RUNTIME, SCRATCH, ONEDNN: the zones the reports print) the four figures satisfy
+    // used + available == capacity; WEIGHT in single-chunk mode takes its availability from the KV
+    // allocator, so that identity is not promised for it. Takes the group mutex, so a caller already
+    // inside the group (an allocation, a refusal) must not call it. False when no arena is active.
+    bool   zone_free_figures(vram_zone_id zone,
+                             size_t &     capacity,
+                             size_t &     used,
+                             size_t &     available,
+                             size_t &     largest_free);
     void   dump_live_zone_allocations(vram_zone_id zone, const char * where, size_t max_entries = 32) const;
 
     const vram_zone & get_zone(vram_zone_id zone) const { return arena_zones_[static_cast<int>(zone)]; }
@@ -3688,7 +3716,13 @@ class unified_cache {
                                  dma_stream_slice_fn              slice_fn,
                                  const void *                     ctx,
                                  const std::vector<sycl::event> & deps,
-                                 dma_stream_copy_fn               copy_fn = nullptr);
+                                 dma_stream_copy_fn               copy_fn     = nullptr,
+                                 // The caller's own file and function, defaulted at the call site, name the
+                                 // caller in the stream_dma_non_device_arrivals dump key (two callers in
+                                 // one file, the mul_mat stream and the MoE expert stream, stay apart).
+                                 // Pass nothing.
+                                 const char *                     caller_file = __builtin_FILE(),
+                                 const char *                     caller_func = __builtin_FUNCTION());
 
     // Defer freeing host allocations until the associated event completes.
     void defer_host_free(void * ptr, size_t size, const sycl::event & event);
@@ -4484,7 +4518,7 @@ class unified_cache {
     int32_t *                    onednn_graph_scratch_flag_slab_ = nullptr;
     std::vector<uint32_t>        onednn_graph_scratch_flag_slot_free_list_;
     uint32_t                     onednn_graph_scratch_flag_generation_counter_     = 0;
-    bool                         onednn_graph_scratch_flag_slab_alloc_warned_      = false;
+    bool                         onednn_graph_scratch_flag_slab_warned_            = false;
     bool                         onednn_graph_scratch_flag_slots_exhausted_warned_ = false;
     // llama.cpp-c6ah: see the public accessor's own comment above.
     // Incremented only in onednn_graph_scratch_clear_pool_locked(), the one
@@ -5732,13 +5766,35 @@ struct alloc_constraints {
     // crashed mid-prefill with UR_RESULT_ERROR_OUT_OF_RESOURCES instead of
     // refusing at context init.
     bool         forbid_vram_zone_spill     = false;
+    // Miss classes of the zone chokepoint (unified_cache_zone_refusal). Both are
+    // request parameters, never inferred from the calling function: the request
+    // says whether its refusal has a declared next path in the caller.
+    //   cascade_step        the request's next path is planned (a later step of
+    //                       the same chain, or the caller's own fallback), so a
+    //                       refusal is a counted cascade miss, not a plan bug.
+    //   unconverted_ticket  a literal naming the ticket whose exact term still
+    //                       owns this row's capacity; a refusal is an
+    //                       interim-floor miss reported against that ticket.
+    bool         cascade_step               = false;
+    const char * unconverted_ticket         = nullptr;
 };
 
+// Construction-site label. Each type a site builds and hands to an allocator
+// carries the file and line of that construction as default member
+// initialisers, so the raw-exit trace and the chokepoint name the row that asked.
+// The initialisers evaluate where the object is brace-initialised (`T x{}`, a
+// designated initialiser, a helper's default arguments); a braceless `T x;`
+// reports the class definition, so every such declaration is written `T x{}`.
+// An allocator reads the site of the object it receives, never the nested
+// `intent`'s, and a wrapper that builds one request type from another copies
+// the site explicitly.
 struct alloc_intent {
     alloc_role        role      = alloc_role::OTHER;
     runtime_category  category  = runtime_category::OTHER;
     const char *      cohort_id = nullptr;
     alloc_constraints constraints;
+    const char *      site_file = __builtin_FILE();
+    int               site_line = __builtin_LINE();
 };
 
 struct alloc_request {
@@ -5748,6 +5804,8 @@ struct alloc_request {
     size_t        alignment            = 0;  // 0 = allocator default; otherwise power-of-two
     bool          suppress_failure_log = false;  // Caller handles nullptr locally (e.g. back-pressure/reuse).
     alloc_intent  intent;
+    const char *  site_file            = __builtin_FILE();
+    int           site_line            = __builtin_LINE();
 };
 
 // Copyable, non-owning exact allocation identity and geometry. Registry rows,
@@ -6031,6 +6089,8 @@ struct offload_buffer_request {
     size_t              alignment = 64;
     offload_buffer_role role      = offload_buffer_role::OTHER;
     alloc_intent        intent{};
+    const char *        site_file = __builtin_FILE();
+    int                 site_line = __builtin_LINE();
 };
 
 struct offload_buffer_lease {
@@ -6120,6 +6180,9 @@ registered_release_status allocation_registry_test_release_exact(
 registered_release_status allocation_registry_test_claim(const alloc_metadata & metadata, bool intrusive) noexcept;
 void allocation_registry_test_pause_claim(bool pause) noexcept;
 bool allocation_registry_test_claim_reached() noexcept;
+// Claim `ptr` for a new registry row: true when no row is there or the row is a stale RELEASING one
+// (erased); false for a LIVE row (llama.cpp-93tw).
+bool                      allocation_registry_test_claim_ptr(void * ptr) noexcept;
 void allocation_registry_test_erase(void * ptr) noexcept;
 #endif
 
@@ -7220,6 +7283,182 @@ void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue);
 void * unified_cache_raw_malloc_host(size_t size, const sycl::queue & queue);
 void * unified_cache_raw_malloc_host(size_t size, const sycl::context & ctx);
 bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
+
+// === Counter dump (GGML_SYCL_COUNTER_DUMP=1) ===
+//
+// Every counter below counts whether or not the dump is armed, and the table,
+// the printer and every registration compile into the ggml-sycl library with
+// no GGML_SYCL_PRIVATE_TESTING gate: that macro is defined only on test
+// targets, so a counter behind it would never print in llama-cli,
+// llama-completion, llama-server or llama-bench. An increment may sit under a
+// build switch (the onednn_* counters' under GGML_SYCL_DNNL); a registration
+// never does. scripts/check-sycl-counter-dump.py gates both facts.
+//
+// The two lists are the dump's fixed field list and snapshot list, in print
+// order. A field prints on every tree from the step that registered it, zeros
+// included, until its retiring step; the gate carries each entry's lands and
+// retired step. Add a new entry here and in the gate together.
+//
+// A keyed counter (a cohort, a site, a ticket) prints its unlabelled total in
+// the fixed list and one `name=<counter>{<key>}` line per key that has counted.
+//
+// moe_table_reach_zero_gpu_expert is the one counter whose total is a SUM OF NOTES: a reach is noted at
+// the callee's ensure site and again at each caller above it, so the total double-counts a reach that
+// came through a caller. Its reach count is the `ensure:` keys (one per ensure_moe_ptr_table call site);
+// the `update:` and `upload:` keys say which caller it came through. It also evaluates only in an armed
+// run, so it prints not_captured unless the report flag read armed.
+#define GGML_SYCL_DUMP_COUNTERS(X)            \
+    X(ext_alloc_count)                        \
+    X(ext_alloc_arena)                        \
+    X(zone_cascade_miss)                      \
+    X(zone_unconverted_miss)                  \
+    X(zone_plan_refusal)                      \
+    X(refusal_unattributed)                   \
+    X(refusal_late)                           \
+    X(onednn_scratchpad_over_plan_declined)   \
+    X(late_term_shrink_admitted)              \
+    X(arena_policy_refusal)                   \
+    X(stream_dma_non_device_arrivals)         \
+    X(onednn_pp_record_mode_acquires)         \
+    X(set_rows_stage_arrivals)                \
+    X(set_rows_stage_record_mode_acquires)    \
+    X(load_row_op_time_arrivals)              \
+    X(onednn_sdpa_admitted)                   \
+    X(onednn_sdpa_executed)                   \
+    X(onednn_sdpa_fallback_after_admit)       \
+    X(moe_table_reach_zero_gpu_expert)        \
+    X(onednn_graph_compile_live_draws)        \
+    X(onednn_graph_callback_unmarked_mallocs) \
+    X(onednn_fa_plan_calls)                   \
+    X(onednn_graph_mask_declined)             \
+    X(onednn_graph_route_declined)            \
+    X(onednn_graph_decline_at_entry)          \
+    X(onednn_graph_scratch_barrier_failed)
+
+// A byte figure an arm scores that is not a counter: captured at a named point
+// and printed at exit after the key lines as `name=<figure>@<point>`. An entry
+// whose point was never reached prints the value `not_captured`.
+//   first_decode  the entry of the device's first graph_compute whose batch is
+//                 one token, captured once
+//   context_txn   the commit of the device's last context transaction
+//   last_load_end the end of the device's last model load, one entry per live
+//                 model keyed load_1 and load_2 by load order
+#define GGML_SYCL_DUMP_SNAPSHOTS(X)                                                            \
+    X(zone_available_weight_first_decode, "zone_available{WEIGHT}@first_decode")               \
+    X(zone_largest_free_weight_first_decode, "zone_largest_free{WEIGHT}@first_decode")         \
+    X(zone_available_runtime_context_txn, "zone_available{RUNTIME}@context_txn")               \
+    X(zone_largest_free_runtime_context_txn, "zone_largest_free{RUNTIME}@context_txn")         \
+    X(zone_capacity_onednn_context_txn, "zone_capacity{ONEDNN}@context_txn")                   \
+    X(onednn_pp_a_bytes_context_txn, "onednn_pp_a_bytes@context_txn")                          \
+    X(weight_host_tiered_bytes_load_1, "weight_host_tiered_bytes{load_1}@last_load_end")       \
+    X(weight_host_tiered_bytes_load_2, "weight_host_tiered_bytes{load_2}@last_load_end")       \
+    X(weight_planned_device_bytes_load_1, "weight_planned_device_bytes{load_1}@last_load_end") \
+    X(weight_planned_device_bytes_load_2, "weight_planned_device_bytes{load_2}@last_load_end") \
+    X(weight_live_bytes_last_load_end, "weight_live_bytes@last_load_end")
+
+enum class dump_counter : uint8_t {
+#define GGML_SYCL_DUMP_COUNTER_ENUM(name) name,
+    GGML_SYCL_DUMP_COUNTERS(GGML_SYCL_DUMP_COUNTER_ENUM)
+#undef GGML_SYCL_DUMP_COUNTER_ENUM
+        COUNT
+};
+
+enum class dump_snapshot : uint8_t {
+#define GGML_SYCL_DUMP_SNAPSHOT_ENUM(id, printed) id,
+    GGML_SYCL_DUMP_SNAPSHOTS(GGML_SYCL_DUMP_SNAPSHOT_ENUM)
+#undef GGML_SYCL_DUMP_SNAPSHOT_ENUM
+        COUNT
+};
+
+// Lock-free, relaxed; safe under any caller's lock. `dev` is the in-process
+// index after ONEAPI_DEVICE_SELECTOR filtering; an index outside the table is
+// ignored. add_key also adds to the total, so the two cannot drift.
+void unified_cache_dump_counter_add(dump_counter counter, int dev, uint64_t n = 1) noexcept;
+void unified_cache_dump_counter_add_key(dump_counter counter, int dev, const char * key, uint64_t n = 1) noexcept;
+void unified_cache_dump_snapshot_set(dump_snapshot snapshot, int dev, uint64_t value) noexcept;
+// Captures only the first time per device (the first_decode point).
+void unified_cache_dump_snapshot_set_once(dump_snapshot snapshot, int dev, uint64_t value) noexcept;
+// Back to not_captured: a point that no longer holds (load_2 once only one model is live).
+void unified_cache_dump_snapshot_clear(dump_snapshot snapshot, int dev) noexcept;
+// True until set_once has claimed the entry on `dev`, so a once-only capture can skip its reads.
+bool unified_cache_dump_snapshot_pending(dump_snapshot snapshot, int dev) noexcept;
+
+// The points a zone figure is captured at. FIRST_DECODE: the entry of the device's first graph_compute
+// whose batch is one token (WEIGHT free and largest-free, captured once). CONTEXT_TXN: the commit of a
+// context transaction (RUNTIME free and largest-free, ONEDNN capacity, overwritten at each commit).
+// Nothing is captured while the device has no arena, so the entry stays not_captured rather than 0.
+enum class dump_point : uint8_t { FIRST_DECODE, CONTEXT_TXN };
+void unified_cache_dump_capture_zone_figures(int dev, dump_point point) noexcept;
+
+// Recorded once by the report sites' per-process armed flag (ggml_sycl_dump_report_armed) when it first
+// reads the environment. A counter evaluated only in an armed run (moe_table_reach_zero_gpu_expert, whose
+// zero test walks the plan per call) prints value=not_captured unless that flag read armed, so a 0 from a
+// process that never evaluated it cannot read as a measured 0.
+void unified_cache_dump_note_armed(bool armed) noexcept;
+
+// Draws the oneDNN Graph allocator callback has made and not yet freed, process-wide. The SDPA compile
+// brackets it so a draw that outlives compile() is counted (onednn_graph_compile_live_draws).
+int64_t unified_cache_onednn_graph_live_draws() noexcept;
+
+// === G0 report lines (GGML_SYCL_COUNTER_DUMP=1) ===
+//
+// A figure G0 reads that is a line at its instant rather than a counter or a snapshot entry. Each
+// prints as `[SYCL-REPORT] <kind> key=value ...` on stderr, only while the dump is armed, and never
+// takes part in the counter table or its gate. The kinds, and where each is produced:
+//   landing         ggml_backend_sycl_buffer_publish: one per backend buffer, with the path that took it
+//   zone_figures    capacity, used, free and largest-free of one zone, read under its group mutex: the
+//                   RUNTIME and SCRATCH rooms after each backend buffer, the ONEDNN room after each load
+//   row73_own_alloc ggml_sycl_ensure_moe_ptr_table's own-allocation fallback, with the table_index
+//   arm_a_kernel    ggml_sycl_dispatch_mul_mat_kernel: the kernel the selector chose for the LM head
+//                   (output.weight), with its type and ne11, the layout the operand was MATERIALIZED in
+//                   (src0_layout, from its handle) beside the layout the kernel consumes
+//                   (kernel_layout), and layout_mismatch=1 when the two differ (the l9i1 shape); once
+//                   per distinct reading
+//   planned_host    unified_cache_dump_capture_load_end: the plan's own weight_host_bytes, once per load
+//                   (host-tiered bytes are plan-wide, never credited to each device)
+//   moe_zero_gpu_expert_tensors
+//                   unified_cache_dump_capture_load_end: per device, the plan's MoE tensors and how many
+//                   of them have zero GPU-executed experts there (G0's VOID test for the preload arm)
+bool unified_cache_dump_report_enabled() noexcept;
+void unified_cache_dump_report(const char * text) noexcept;
+// Prints `text` the first time `key` is seen on this process, nothing after; false once the table of
+// 64 keys is full, so a flood of distinct readings is bounded rather than silent: the first key refused
+// prints one `[SYCL-REPORT] (report-once-full)` line while the dump is armed.
+bool unified_cache_dump_report_once(const char * key, const char * text) noexcept;
+void unified_cache_dump_report_zone_figures(int dev, const char * point, vram_zone_id zone) noexcept;
+// Recorded once by ggml_sycl_init, the post-selector count; the printer's loop
+// and its `end` line read it, never a query at exit.
+void unified_cache_dump_set_device_count(int device_count) noexcept;
+// Registered with std::atexit; prints only when GGML_SYCL_COUNTER_DUMP=1.
+void unified_cache_test_counter_dump();
+
+// The raw exit's accounting, split out of unified_cache_raw_malloc_device so a host test can run it
+// without a device. Counts ext_alloc_count, and ext_alloc_arena while the device's arena is active;
+// under GGML_SYCL_EXT_ALLOC_TRACE=1 also prints the [EXT-ALLOC] line.
+void unified_cache_note_raw_exit(int dev, size_t size) noexcept;
+// Sets the arena-active mirror the raw exit reads, without an arena, for a host test.
+void unified_cache_dump_arena_active_for_testing(int dev, bool active) noexcept;
+
+uint64_t unified_cache_dump_counter_for_testing(dump_counter counter, int dev) noexcept;
+uint64_t unified_cache_ext_alloc_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_ext_alloc_arena_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_zone_cascade_miss_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_zone_unconverted_miss_count_for_testing(int dev) noexcept;
+uint64_t unified_cache_zone_plan_refusal_count_for_testing(int dev) noexcept;
+
+// The one chokepoint for a forbid refusal: called where unified_alloc refuses a
+// request whose preferred zone could not hold it. It classifies the miss by the
+// request alone (cascade_step, unconverted_ticket, else terminal), counts it,
+// and prints its line under GGML_SYCL_EXT_ALLOC_TRACE=1 only; it changes no
+// outcome -- the caller still returns its own refusal. It takes only a counter
+// table's leaf spin lock, and under the trace the dedupe table's; it reads the
+// zone's atomic `used` and fixed capacity through `cache` (null prints no
+// figures), never the allocator's free-space figures, which need the zone's
+// group mutex that a refusal does not hold.
+void unified_cache_zone_refusal(const alloc_request & req,
+                                vram_zone_id          zone,
+                                size_t                bytes,
+                                const unified_cache * cache) noexcept;
 
 // === Shutdown API ===
 

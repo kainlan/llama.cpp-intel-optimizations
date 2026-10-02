@@ -24,6 +24,10 @@ mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id & key,
                                          std::shared_ptr<void>      storage_owner);
 bool       test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease);
 
+// ggml_sycl_plan_has_cpu_work() on a synthetic plan: true when the CPU would
+// execute any part of the graph (llama.cpp-38af).
+bool test_plan_has_cpu_work(const placement_plan & plan);
+
 // Mutable controls are declared only for private direct-source fixtures.
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void test_set_layout_override(ggml_layout_mode layout);

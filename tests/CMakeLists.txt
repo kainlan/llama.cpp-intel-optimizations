@@ -552,6 +552,37 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 endif()
 
+# The staging probe's verdict table, host-only: the classification is a pure function in
+# tests/sycl-staging-probe-verdict.h of three host clocks (busy, return, done), driven here over the
+# readings that separate its outcomes and every threshold edge, so a change to the verdict's reading
+# fails on a host with no device.
+llama_build_and_test(test-sycl-staging-probe-verdict.cpp)
+set_tests_properties(test-sycl-staging-probe-verdict PROPERTIES LABELS "sycl;host-only")
+
+# Cross-device staging probe (llama.cpp-23mk, design row 113 / G0): does the submit of a leg that
+# depends on another queue's event return before that event completes? Needs two devices and the
+# backend's own queues, so it links the real ggml-sycl library like test-sycl-profiling-queue-property
+# above. Lead-run only (two-device GPU work, one at a time); it exits 77 with fewer than two devices.
+# `mem-handle` keeps it out of the full-sweep form of "Running Tests", and the default selector pins the
+# two discrete cards. It carries no ONEAPI_DEVICE_SELECTOR of its own beyond that pin.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-staging-probe.cpp)
+    set_tests_properties(test-sycl-staging-probe PROPERTIES LABELS "sycl;gpu-serial;mem-handle")
+    target_include_directories(test-sycl-staging-probe PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-staging-probe PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-staging-probe PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-staging-probe PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-staging-probe PRIVATE "-fsycl")
+        target_link_options(test-sycl-staging-probe PRIVATE "-fsycl")
+    endif()
+    set_tests_properties(test-sycl-staging-probe PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 120
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+endif()
+
 # WOQ repack kernel microbench (perf-recovery epic, track D, llama.cpp-0vqt):
 # NOT a ctest -- it is a device-event throughput measurement, not a
 # correctness gate (that's test-sycl-mxfp4-woq-{,tiled-}repack above), so it
@@ -702,6 +733,36 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-cpu-expert-pool-capacity-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-capacity-source.py --self-test)
     set_tests_properties(test-sycl-cpu-expert-pool-capacity-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+    # Host MoE experts must read the activation row of their own slot, not row 0
+    # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
+    # experts). Run WITH --self-test so each anchor is proven load-bearing.
+    add_test(NAME test-sycl-moe-cpu-activation-row-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-activation-row-source.py --self-test)
+    set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+    # A hybrid MoE CPU-expert dispatch must never drop host-expert rows when its
+    # staging allocation fails, and the registry must not fail an allocation on a
+    # stale RELEASING row at a recycled address (llama.cpp-93tw). WITH --self-test.
+    add_test(NAME test-sycl-moe-cpu-dispatch-fail-closed-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-dispatch-fail-closed-source.py --self-test)
+    set_tests_properties(test-sycl-moe-cpu-dispatch-fail-closed-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+    # A hybrid MXFP4 xmx_tiled expert must be decoded by a kernel that reads
+    # xmx_tiled: the grouped executor accepts partial cover, and the per-expert
+    # direct path refuses layouts it cannot decode (llama.cpp-4hg7). WITH --self-test.
+    add_test(NAME test-sycl-xmx-tiled-partial-cover-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-xmx-tiled-partial-cover-source.py --self-test)
+    set_tests_properties(test-sycl-xmx-tiled-partial-cover-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+    # A prompt-phase MoE layout over a MIXED tensor (a few experts in VRAM, the
+    # rest host-planned) is admitted by the loaded layout plus the host entries
+    # the CPU runs, at every prompt admission site (llama.cpp-f6zo: the
+    # [GRAPH-MOE-LAYOUT] "incomplete executable layout" abort at PCT<100).
+    # WITH --self-test so each pin is proven load-bearing.
+    add_test(NAME test-sycl-moe-prompt-hybrid-layout-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-prompt-hybrid-layout-source.py --self-test)
+    set_tests_properties(test-sycl-moe-prompt-hybrid-layout-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
     # A MoE host-expert dispatch must bridge a storage-handle miss, not kill the
     # graph (llama.cpp-srti). Also runs WITH --self-test: the per-site checks are
@@ -2359,6 +2420,14 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
+    )
+    # The staging probe's skip counts PHYSICAL devices (the scheduler exposes one); pinned from its source.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-staging-probe-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 60
     )
 
     # DECLINED, with reasons (llama.cpp-0igs).  Sibling .py gates in this

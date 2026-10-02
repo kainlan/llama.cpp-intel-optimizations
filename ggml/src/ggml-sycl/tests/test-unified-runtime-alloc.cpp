@@ -78,7 +78,7 @@ static void set_env_var(const char * name, const char * value) {
 
 static bool reserve_allocate_success_registers_pointer(sycl::queue & q) {
     TEST_BEGIN("reserve_allocate_success_registers_pointer");
-    alloc_request req;
+    alloc_request req{};
     req.queue                          = &q;
     req.size                           = 4096;
     req.intent.role                    = alloc_role::COMPUTE;
@@ -137,7 +137,7 @@ static bool allocate_failure_rolls_back_budget(sycl::queue & q) {
     const int    device = 0;
     const size_t before = unified_cache_arena_non_weight_used(device);
 
-    alloc_request req;
+    alloc_request req{};
     req.queue                          = &q;
     req.size                           = (size_t) 1 << 50;  // 1 PB-ish for deterministic fail on device alloc
     req.intent.role                    = alloc_role::GRAPH_TMP;
@@ -176,7 +176,7 @@ static bool strict_unknown_free_fails() {
 
 static bool double_free_fails(sycl::queue & q) {
     TEST_BEGIN("double_free_fails");
-    alloc_request req;
+    alloc_request req{};
     req.queue                          = &q;
     req.size                           = 1024;
     req.intent.role                    = alloc_role::STAGING;
@@ -193,7 +193,7 @@ static bool double_free_fails(sycl::queue & q) {
 
 static bool lookup_returns_correct_metadata(sycl::queue & q) {
     TEST_BEGIN("lookup_returns_correct_metadata");
-    alloc_request req;
+    alloc_request req{};
     req.queue                               = &q;
     req.size                                = 8192;
     req.intent.role                         = alloc_role::COMPUTE;
@@ -214,7 +214,7 @@ static bool lookup_returns_correct_metadata(sycl::queue & q) {
 
 static bool cohort_prefers_weight_tier_for_compute(sycl::queue & q) {
     TEST_BEGIN("cohort_prefers_weight_tier_for_compute");
-    alloc_request seed;
+    alloc_request seed{};
     seed.queue                               = &q;
     seed.size                                = 4096;
     seed.intent.role                         = alloc_role::WEIGHT;
@@ -225,7 +225,7 @@ static bool cohort_prefers_weight_tier_for_compute(sycl::queue & q) {
     alloc_handle seed_h{};
     TEST_ASSERT(unified_alloc(seed, &seed_h), "seed alloc failed");
 
-    alloc_request req;
+    alloc_request req{};
     req.queue                                         = &q;
     req.size                                          = 2048;
     req.intent.role                                   = alloc_role::COMPUTE;
@@ -242,7 +242,7 @@ static bool cohort_prefers_weight_tier_for_compute(sycl::queue & q) {
 
 static bool hard_constraint_overrides_cohort(sycl::queue & q) {
     TEST_BEGIN("hard_constraint_overrides_cohort");
-    alloc_request req;
+    alloc_request req{};
     req.queue                                         = &q;
     req.size                                          = 2048;
     req.intent.role                                   = alloc_role::COMPUTE;
@@ -258,7 +258,7 @@ static bool hard_constraint_overrides_cohort(sycl::queue & q) {
 
 static bool policy_never_selects_shared_usm(sycl::queue & q) {
     TEST_BEGIN("policy_never_selects_shared_usm");
-    alloc_request req;
+    alloc_request req{};
     req.queue             = &q;
     req.size              = 1024;
     req.intent.role       = alloc_role::OTHER;
@@ -271,7 +271,7 @@ static bool policy_never_selects_shared_usm(sycl::queue & q) {
 
 static bool strict_stale_handle_fails(sycl::queue & q) {
     TEST_BEGIN("strict_stale_handle_fails");
-    alloc_request req;
+    alloc_request req{};
     req.queue                          = &q;
     req.size                           = 1024;
     req.intent.role                    = alloc_role::COMPUTE;
@@ -289,7 +289,7 @@ static bool strict_stale_handle_fails(sycl::queue & q) {
 
 static bool strict_device_mismatch_fails(sycl::queue & q) {
     TEST_BEGIN("strict_device_mismatch_fails");
-    alloc_request req;
+    alloc_request req{};
     req.queue                          = &q;
     req.size                           = 1024;
     req.intent.role                    = alloc_role::COMPUTE;
@@ -308,7 +308,7 @@ static bool strict_device_mismatch_fails(sycl::queue & q) {
 
 static bool scoped_unified_alloc_frees_on_scope_exit(sycl::queue & q) {
     TEST_BEGIN("scoped_unified_alloc_frees_on_scope_exit");
-    alloc_request req;
+    alloc_request req{};
     req.queue                               = &q;
     req.size                                = 4096;
     req.intent.role                         = alloc_role::STAGING;
