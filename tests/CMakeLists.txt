@@ -2259,6 +2259,15 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert;moe;retained-route"
         TIMEOUT 60
     )
+    # Behaviour of tests/sycl_gate.py itself: finish() must not pass with zero checks, and a failing generator
+    # expression must not blame a stale module global. Spawns only python subprocesses.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-gate-helper.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 60
+    )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-canonical-aos-expert-handles-source.py
