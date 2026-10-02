@@ -103,4 +103,4 @@ for needle in (
     with gate("L79 assert needle in live_test [%r]" % (needle,)):
         assert needle in live_test
 
-finish('moe ptr-table retention source contract: PASS')
+finish('moe ptr-table retention source contract: PASS', min_checks=21)

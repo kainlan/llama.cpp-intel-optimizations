@@ -679,4 +679,4 @@ with gate('internal-backing-mint-stays-private'):
     problems = check_internal_backing_mint_stays_private(CACHE)
     assert not problems, "\n".join(problems)
 
-finish()
+finish(min_checks=61)
