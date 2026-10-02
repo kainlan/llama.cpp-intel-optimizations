@@ -2248,8 +2248,9 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert;moe;retained-route;mutation"
         # ~150 s on this host under its ambient load (measured 153 s, 2026-10-01): the mutation witnesses re-tokenise the
-        # ~570k-character ggml_sycl_mul_mat_id body once per mutant. 120 s made a green run a timeout failure.
-        TIMEOUT 600
+        # ~570k-character ggml_sycl_mul_mat_id body once per mutant. 120 s made a green run a timeout failure, and 600 s
+        # was only 4x that: ambient load here swings several-fold, so give it 8x.
+        TIMEOUT 1200
     )
     # Registered by llama.cpp-qeld: it sat unregistered while its pins went stale. Host-only source scan.
     llama_test_pytest(
