@@ -2275,6 +2275,13 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     set_tests_properties(test-sycl-gate-registration-audit PROPERTIES
         LABELS "sycl;python;source-assert" TIMEOUT 120)
+    # The generator that appends the pytest footer: planted inputs prove which files it footers, leaves alone and
+    # normalises, and that its output satisfies the audit's R3.
+    add_test(NAME test-sycl-pytest-footer-generator
+        COMMAND ${LLAMA_PYTHON3} ${PROJECT_SOURCE_DIR}/scripts/sycl-add-pytest-footer.py --self-test
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-sycl-pytest-footer-generator PROPERTIES
+        LABELS "sycl;python;source-assert" TIMEOUT 60)
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-canonical-aos-expert-handles-source.py
