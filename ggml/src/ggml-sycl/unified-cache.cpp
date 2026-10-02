@@ -18775,8 +18775,15 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             // including its refusal to rebuild while any allocation is still live — the
             // refusal is deliberately preserved, nothing here force-evicts or resets a
             // zone to make room. Once weights are resident the rebuild is (correctly)
-            // refused, and the request is instead satisfied below through
-            // allocate_direct_scratch(), i.e. unified_alloc() with mem_handle ownership.
+            // refused, and the over-zone request is then refused below (an unplanned
+            // direct allocation is not the answer to a plan that did not provision it).
+            //
+            // llama.cpp-8ony: acquire_onednn_pp_scratch turns away a request larger than
+            // the zone before it asks for a reserve, so this branch is reached only when
+            // the zone was rebuilt smaller between acquire's read of its capacity and this
+            // one (defence in depth). It is no longer the way an LM-head-sized request
+            // reports an under-estimated predicate: that op is not routed here at all, so
+            // the under-estimate record above does not fire for it.
             const int dev_id = ggml_sycl_get_device_id_from_queue(queue_);
             // STORED (bare) getter, deliberately: total_needed is the
             // primitive-API pair's own requirement and never includes the
@@ -19476,6 +19483,11 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
     return cache->reserve_onednn_scratch(weights_size, activations_size);
 }
 
+// llama.cpp-8ony: the ONEDNN zone's physical capacity, which is the with-floor figure (the primitive-API pair plus the
+// Graph-scratch floor, see unified_cache_get_planned_onednn_scratchpad_bytes). The question asked here is "does the
+// pair fit the zone the arena was built with", and the whole capacity is the right bound: the pair has no fallback
+// of its own, while a Graph SDPA scratch the zone cannot hold takes the bounded DIRECT path
+// (onednn_graph_scratch_alloc), so a pair that fills the zone costs SDPA speed and never an unplanned allocation.
 bool unified_cache_get_onednn_zone_capacity(int device_id, size_t * capacity) {
     unified_cache * cache = get_existing_unified_cache_for_device(device_id);
     if (!cache || !cache->arena_active()) {

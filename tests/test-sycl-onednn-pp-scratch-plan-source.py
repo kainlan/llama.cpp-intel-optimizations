@@ -124,22 +124,19 @@ def statements_calling(body, callee):
     return found
 
 
-HELPER = "ggml_sycl_onednn_pp_scratch_planned("
+HELPER = "ggml_sycl_onednn_pp_scratch_planned_bytes("
 # The already-reserved reuse test in reserve_onednn_scratch (its first code line).
 REUSE_TEST = "if (onednn_weights_scratch_ && onednn_activations_scratch_ && onednn_weights_scratch_size_ >= weights_size"
 
 
 def evaluate(backend, cache, cache_hpp):
     results = {}
-    helper = function_body(
-        backend, r"static bool ggml_sycl_onednn_pp_scratch_planned\([^)]*\)\s*\{")
     bytes_helper = function_body(
         backend, r"static bool ggml_sycl_onednn_pp_scratch_planned_bytes\([^)]*\)\s*\{")
     op_sycl = function_body(backend, r"inline void ggml_sycl_op_mul_mat_sycl\([^)]*\)\s*try\s*\{")
     dq_walk = function_body(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\([^)]*\)\s*\{")
     accessor = function_body(
         cache, r"bool unified_cache_get_onednn_zone_capacity\(int device_id, size_t \* capacity\)\s*\{")
-    results["anchor: the shared admission helper exists"] = helper is not None
     results["anchor: the by-bytes admission core exists"] = bytes_helper is not None
     results["anchor: op_mul_mat_sycl exists"] = op_sycl is not None
     results["anchor: the dequant graph walk exists"] = dq_walk is not None
@@ -147,12 +144,10 @@ def evaluate(backend, cache, cache_hpp):
     results["the zone-capacity accessor is declared"] = \
         re.search(r"bool unified_cache_get_onednn_zone_capacity\(int device_id, size_t \* capacity\);",
                   cache_hpp) is not None
-    if None in (helper, bytes_helper, op_sycl, dq_walk, accessor):
+    if None in (bytes_helper, op_sycl, dq_walk, accessor):
         return results
 
     # One source: the helper answers from the zone the arena was built with, through the pure predicate.
-    results["the element-count helper delegates to the by-bytes core"] = \
-        "ggml_sycl_onednn_pp_scratch_planned_bytes(" in helper
     results["the helper asks the pure predicate"] = "zone_onednn_pp_scratch_planned(" in bytes_helper
     results["the helper reads the arena's real ONEDNN zone capacity"] = \
         "unified_cache_get_onednn_zone_capacity(" in bytes_helper
@@ -196,13 +191,7 @@ def evaluate(backend, cache, cache_hpp):
     # Both consumers ask it, every time they ask whether oneDNN PP supplies the f16 copies.
     op_candidate = re.search(r"const bool legacy_pp_scratch_candidate\s*=([^;]*);", op_sycl)
     results["anchor: the op arm's scratch candidate statement exists"] = op_candidate is not None
-    results["the op arm's candidate asks the helper"] = bool(op_candidate) and HELPER in op_candidate.group(1)
-    results["the op arm still asks the PP admission"] = \
-        bool(op_candidate) and "ggml_sycl_onednn_pp_candidate(" in op_candidate.group(1)
     walk_skips = statements_calling(dq_walk, "ggml_sycl_onednn_pp_candidate(")
-    results["anchor: the walk asks the PP admission"] = len(walk_skips) >= 1
-    results["every PP skip in the walk also asks the helper"] = \
-        len(walk_skips) >= 1 and all(HELPER in s for s in walk_skips)
 
     # ---- review r1 I1/M4: ONE helper answers "the scratch supplies this op", for both consumers ----
     supplies_helper = function_body(
@@ -214,8 +203,9 @@ def evaluate(backend, cache, cache_hpp):
         results["the supplies helper asks the PP admission"] = "ggml_sycl_onednn_pp_candidate(" in supplies_helper
         results["the supplies helper asks the type/env enablement"] = \
             "onednn_pp_unified_scratch_enabled(" in supplies_helper
-        results["the supplies helper asks the zone plan"] = \
-            "ggml_sycl_onednn_pp_scratch_planned_bytes(" in supplies_helper
+        results["the supplies helper asks the pure verdict"] = "zone_onednn_pp_scratch_supplies(" in supplies_helper
+        results["the supplies helper reads the arena's real ONEDNN zone capacity"] = \
+            "unified_cache_get_onednn_zone_capacity(" in supplies_helper
         results["the supplies helper derives the pair from src0 and the column count"] = \
             "ne[1]" in supplies_helper and "ne[0]" in supplies_helper
     if enabled_fn is not None:
@@ -232,7 +222,7 @@ def evaluate(backend, cache, cache_hpp):
     results["the walk skips an op only through the shared supplies helper, with src1->ne[1]"] = \
         len(walk_supplies) >= 1 and all("src1->ne[1]" in x and "ctx.device" in x for x in walk_supplies)
     results["the walk no longer skips on admission and plan separately"] = \
-        len(walk_skips) == 0 or all(SUPPLIES in x for x in walk_skips)
+        len(walk_skips) == 0 and HELPER not in dq_walk
 
     # ---- review r1 I2: Route A draws the planned dequant buffers, and the walk counts such a node ----
     route_a = function_body(
@@ -251,9 +241,9 @@ def evaluate(backend, cache, cache_hpp):
     if 0 <= acq_at < pool_at:
         seg = backend[acq_at:pool_at]
         results["Route A draws the planned src0 dequant buffer before any pool copy"] = \
-            "ggml_sycl_dequant_f16_scratch(ctx.dequant_f16_src0_scratch" in seg
+            re.search(r"ggml_sycl_dequant_f16_scratch\(\s*ctx\.dequant_f16_src0_scratch", seg) is not None
         results["Route A draws the planned src1 dequant buffer before any pool copy"] = \
-            "ggml_sycl_dequant_f16_scratch(ctx.dequant_f16_src1_scratch" in seg
+            re.search(r"ggml_sycl_dequant_f16_scratch\(\s*ctx\.dequant_f16_src1_scratch", seg) is not None
     return results
 
 
@@ -298,17 +288,45 @@ if args.self_test and not failed:
     op_sig = r"inline void ggml_sycl_op_mul_mat_sycl\("
     walk_sig = r"static bool ggml_sycl_dequant_f16_ensure_for_graph\("
     helper_sig = r"static bool ggml_sycl_onednn_pp_scratch_planned_bytes\("
-    elems_sig = r"static bool ggml_sycl_onednn_pp_scratch_planned\("
+    supplies_sig = r"static bool ggml_sycl_onednn_pp_scratch_supplies\("
+    enabled_sig = r"static bool onednn_pp_unified_scratch_enabled\("
+    route_a_sig = r"static bool ggml_sycl_mul_mat_unified_pp_dequant_route\("
+    SUPPLIES_NAME = "ggml_sycl_onednn_pp_scratch_supplies("
     mutants = [
-        ("op arm ignores the plan", "the op arm's candidate asks the helper",
-         (mutate_in_func(backend, op_sig, HELPER, "ggml_sycl_XXXX("), cache, cache_hpp)),
-        ("op arm drops the admission", "the op arm still asks the PP admission",
-         (mutate_in_func(backend, op_sig, "ggml_sycl_onednn_pp_candidate(", "ggml_sycl_XXXX("), cache, cache_hpp)),
-        ("walk skips on admission alone", "every PP skip in the walk also asks the helper",
-         (mutate_in_func(backend, walk_sig, HELPER, "ggml_sycl_XXXX("), cache, cache_hpp)),
-        ("elems helper stops delegating", "the element-count helper delegates to the by-bytes core",
-         (mutate_in_func(backend, elems_sig, "ggml_sycl_onednn_pp_scratch_planned_bytes(", "ggml_sycl_XXXX("),
+        ("op arm ignores the shared question", "the op arm's candidate asks the shared supplies helper with its column tile",
+         (mutate_in_func(backend, op_sig, SUPPLIES_NAME, "ggml_sycl_XXXX("), cache, cache_hpp)),
+        ("op arm asks the admission alone", "the op arm no longer asks admission and plan separately",
+         (mutate_in_func(backend, op_sig, SUPPLIES_NAME, "ggml_sycl_onednn_pp_candidate("), cache, cache_hpp)),
+        ("op arm passes another column count", "the op arm's candidate asks the shared supplies helper with its column tile",
+         (mutate_in_func(backend, op_sig, "ctx.device, src0, src1, dst, src1_ncols)",
+                         "ctx.device, src0, src1, dst, ne11)"), cache, cache_hpp)),
+        ("walk skips on admission alone", "the walk skips an op only through the shared supplies helper, with src1->ne[1]",
+         (mutate_in_func(backend, walk_sig, SUPPLIES_NAME, "ggml_sycl_onednn_pp_candidate("), cache, cache_hpp)),
+        ("walk passes the whole batch", "the walk skips an op only through the shared supplies helper, with src1->ne[1]",
+         (mutate_in_func(backend, walk_sig, "node, src1->ne[1])", "node, ggml_nrows(src1))"), cache, cache_hpp)),
+        ("supplies drops the type enablement", "the supplies helper asks the type/env enablement",
+         (mutate_in_func(backend, supplies_sig, "onednn_pp_unified_scratch_enabled(", "XXXX("), cache, cache_hpp)),
+        ("supplies drops the admission", "the supplies helper asks the PP admission",
+         (mutate_in_func(backend, supplies_sig, "ggml_sycl_onednn_pp_candidate(", "XXXX("), cache, cache_hpp)),
+        ("supplies drops the zone", "the supplies helper asks the pure verdict",
+         (mutate_in_func(backend, supplies_sig, "zone_onednn_pp_scratch_supplies(", "zone_XXXX("), cache, cache_hpp)),
+        ("enablement bypasses the pure predicate", "the enablement function asks the pure predicate",
+         (mutate_in_func(backend, enabled_sig, "zone_onednn_pp_scratch_type_enabled(", "zone_XXXX("), cache, cache_hpp)),
+        ("walk forgets Route A", "the walk counts a Route A node",
+         (mutate_in_func(backend, walk_sig, "ggml_sycl_mul_mat_unified_pp_dequant_route(", "ggml_sycl_XXXX("),
           cache, cache_hpp)),
+        ("Route A predicate ignores the router", "the Route A predicate asks the router",
+         (mutate_in_func(backend, route_a_sig, ".select(", ".XXXX("), cache, cache_hpp)),
+        ("Route A predicate skips the supplies question", "the Route A predicate asks the shared supplies helper",
+         (mutate_in_func(backend, route_a_sig, SUPPLIES_NAME, "ggml_sycl_XXXX("), cache, cache_hpp)),
+        ("Route A predicate loses the pure verdict", "the Route A predicate asks the pure verdict",
+         (mutate_in_func(backend, route_a_sig, "zone_unified_pp_draws_dequant(", "zone_XXXX("), cache, cache_hpp)),
+        ("Route A falls back to the pool again", "Route A draws the planned src0 dequant buffer before any pool copy",
+         (mutate(backend, "ggml_sycl_dequant_f16_scratch(\n                                            ctx.dequant_f16_src0_scratch",
+                 "ggml_sycl_XXXX(\n                                            ctx.dequant_f16_src0_scratch"), cache, cache_hpp)),
+        ("Route A src1 left to the pool", "Route A draws the planned src1 dequant buffer before any pool copy",
+         (mutate(backend, "ggml_sycl_dequant_f16_scratch(\n                                            ctx.dequant_f16_src1_scratch",
+                 "ggml_sycl_XXXX(\n                                            ctx.dequant_f16_src1_scratch"), cache, cache_hpp)),
         ("helper bypasses the pure predicate", "the helper asks the pure predicate",
          (mutate_in_func(backend, helper_sig, "zone_onednn_pp_scratch_planned(", "zone_XXXX("), cache, cache_hpp)),
         ("helper reads the mutable plan", "the helper does not read the (mutable) planned scratchpad figure",
