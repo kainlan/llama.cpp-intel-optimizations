@@ -1118,11 +1118,11 @@ def mutants(files):
            edit(files, M, "    graph_unpin_moe_experts(ctx);\n    graph_unpin_weights(ctx);\n}\n\n// Owner-targeted",
                 "    graph_unpin_weights(ctx);\n}\n\n// Owner-targeted", "g23d"),
            "does not call graph_unpin_moe_experts exactly once")
-    yield ("a twelfth clear_active caller",
+    yield ("a fourteenth clear_active caller (one past the thirteen listed)",
            edit(files, M, "static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::ModelToken owner) noexcept {",
                 "static void ggml_sycl_stray_clear(ggml_backend_sycl_context * c) { sycl_exec_graph_clear_active(c, \"stray\"); }\n"
                 "static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::ModelToken owner) noexcept {", "g23e"),
-           "has 13 callers")
+           "has 14 callers")
 
     yield ("an unlisted host_task",
            edit(files, M, "static size_t ggml_sycl_host_chunk_cap_constant() {",
