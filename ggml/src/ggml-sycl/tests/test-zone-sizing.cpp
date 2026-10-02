@@ -966,6 +966,45 @@ int main() {
               "an exact fit in the KV zone is a fit");
     }
 
+    // ---- Case 20: the KV room a compute buffer can count on (review r4 I1). The runtime transaction publishes
+    // BEFORE the context's KV exists, so the zone still shows free the bytes this context's own KV is about to
+    // take; and a buffer is indivisible, so only the largest free block counts. -----------------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_kv_room_for_compute(600 * MiB, 0) == 600 * MiB,
+              "KV already live (the recheck, a settle): the whole largest block is room");
+        CHECK(ggml_sycl::zone_kv_room_for_compute(600 * MiB, 400 * MiB) == 200 * MiB,
+              "the KV this transaction will place is not room for a compute buffer");
+        CHECK(ggml_sycl::zone_kv_room_for_compute(300 * MiB, 400 * MiB) == 0,
+              "a KV that takes more than the largest block leaves nothing, never a wrapped huge figure");
+        CHECK(ggml_sycl::zone_kv_room_for_compute(0, 0) == 0, "an empty zone is no room");
+        CHECK(ggml_sycl::zone_kv_room_for_compute(SIZE_MAX, SIZE_MAX) == 0, "an exact consumption is no room");
+        // The F3 estimate with the netting: B50 shape, a 536 MB worst-case spill, KV zone showing 900 MB of which
+        // this context's KV will take 600 MB.
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(536 * MiB, ggml_sycl::zone_kv_room_for_compute(900 * MiB, 600 * MiB)) ==
+                  236 * MiB,
+              "un-netted the same bound reads as 0 raw demand and F3 checks nothing");
+    }
+
+    // ---- Case 21: the largest -ub that keeps a rung's raw spill from crossing the driver headroom (review r4
+    // I1, the pinned -ub refusal names it). The raw spill scales about linearly with n_ubatch. ---------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 461 * MiB, 108 * MiB, 256 * MiB) == 672,
+              "B50 Qwen ub1024: 461 MB spilled, 108 MB left of the 256 MB headroom: about 695, rounded down to 32");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 1000 * MiB, 0, 256 * MiB) == 736,
+              "a spill that left nothing: the share of it the headroom allows");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 461 * MiB, 300 * MiB, 256 * MiB) == 1024,
+              "a rung that already fits needs no reduction");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 0, 0, 256 * MiB) == 1024, "no spill, no reduction");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 100 * MiB, 100 * MiB, 256 * MiB) == 1024,
+              "a card already short without the spill is not the hold's doing: not refused, so not reduced");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 156 * MiB, 100 * MiB, 256 * MiB) == 0,
+              "free before the spill exactly the headroom: no spill at all is allowed, nothing is known to fit");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(0, 461 * MiB, 108 * MiB, 256 * MiB) == 0,
+              "an unknown n_ubatch names nothing");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

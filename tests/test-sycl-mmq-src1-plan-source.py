@@ -41,6 +41,8 @@ parser.add_argument("--cache", default=str(sycl / "unified-cache.cpp"))
 parser.add_argument("--zone", default=str(sycl / "zone-sizing.hpp"))
 parser.add_argument("--context", default=str(root / "src/llama-context.cpp"))
 parser.add_argument("--header", default=str(root / "ggml/include/ggml-sycl.h"))
+parser.add_argument("--cmake", default=str(root / "tests/CMakeLists.txt"))
+parser.add_argument("--gpu-test", default=str(root / "tests/test-sycl-compute-buffer-kv-zone.cpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -647,8 +649,10 @@ def evaluate(backend, common, cache, zone):
     results["a publish starts a new spill epoch (a losing rung's spills and mark do not carry to the next rung)"] = \
         "unified_cache_begin_planned_hold_epoch(" in txn and \
         re.search(r"request_hwm\s*=\s*0\s*;", epoch_fn) is not None and \
-        re.search(r"recent_bytes\s*=\s*0\s*;", epoch_fn) is not None and \
-        re.search(r"recent_count\s*=\s*0\s*;", epoch_fn) is not None and "state.owner != owner" in epoch_fn
+        re.search(r"spill_bytes\s*=\s*0\s*;", epoch_fn) is not None and \
+        re.search(r"spill_count\s*=\s*0\s*;", epoch_fn) is not None and \
+        re.search(r"spill_arena_bytes\s*=\s*0\s*;", epoch_fn) is not None and \
+        re.search(r"spill_arena_count\s*=\s*0\s*;", epoch_fn) is not None and "state.owner != owner" in epoch_fn
     results["the driver headroom the realized check uses is the graph-entry check's constant (one source)"] = \
         "kSyclArenaMinExternalHeadroomBytes" in realized_fn and "kSyclArenaMinExternalHeadroomBytes" in graph_headroom_fn and \
         re.search(r"arena_min_external_headroom\s*=\s*256", graph_headroom_fn) is None
@@ -698,12 +702,92 @@ def evaluate(backend, common, cache, zone):
     results["the runtime buffer allocator asks for the KV-zone-first placement"] = \
         kv_flag_site > 0 and "spill_to_kv_zone_before_raw = true" in backend[kv_flag_site:kv_flag_site + 900]
     results["the hold-spill counters are split by where the buffer landed (raw outside the arena, KV zone)"] = \
-        "in_arena" in note_spill_fn and "spill_arena_bytes" in cache and "recent_arena_bytes" in cache and \
+        "in_arena" in note_spill_fn and "spill_arena_bytes" in cache and \
         "hold_spills_raw=" in stats_fn and "hold_spills_kv_zone=" in stats_fn
     results["the realized check counts only the raw outside-arena portion"] = \
         "raw_bytes" in realized_fn and "arena_bytes" not in realized_fn
     results["the transaction-time bound is the part of the worst-case spill the KV zone cannot take"] = \
         "zone_hold_spill_raw_demand(" in bound_fn and "zone_available(ggml_sycl::vram_zone_id::KV)" in bound_fn
+
+    # ---- review r4 ---------------------------------------------------------------------------------------------
+    # I3: the KV pre-placement block, window by window. A block-wide "contains" check is how mutants that change what
+    # the block PUBLISHES (zone id, publication record, from_arena) or COUNTS survived r3.
+    kv_start = ua.find("bool kv_placed")
+    kv_end = ua.find("if (tier == alloc_tier::DEVICE_VRAM) {", kv_start) if kv_start >= 0 else -1
+    kvb = ua[kv_start:kv_end] if 0 <= kv_start < kv_end else ""
+    results["anchor: the KV pre-placement block exists"] = kvb != ""
+    results["the KV pre-placement runs only for the flagged RUNTIME class, in an active arena"] = \
+        "spill_to_kv_zone_before_raw" in kvb and \
+        re.search(r"prefer_vram_zone\s*==\s*vram_zone_id::RUNTIME", kvb) is not None and \
+        re.search(r"kv_cache\s*&&\s*kv_cache->arena_active\(\)", kvb) is not None
+    results["the KV pre-placement reads the zone-full arm as well as the hold"] = \
+        re.search(r"hold_spill\s*\|\|\s*kv_cache->zone_available\(\s*vram_zone_id::RUNTIME\s*\)\s*<\s*alloc_size", kvb) is not None
+    results["the KV pre-placement publishes through the KV zone (record, allocation, metadata)"] = \
+        re.search(r"prepare_arena_publication\(\s*vram_zone_id::KV\s*\)", kvb) is not None and \
+        re.search(r"zone_alloc\(\s*vram_zone_id::KV\s*,\s*alloc_size\s*,\s*req\.alignment\s*!=\s*0\s*\?\s*req\.alignment\s*:\s*64", kvb) is not None and \
+        re.search(r"output_metadata\.vram_zone\s*=\s*vram_zone_id::KV\s*;", kvb) is not None and \
+        re.search(r"output_metadata\.zone_managed\s*=\s*true\s*;", kvb) is not None and \
+        re.search(r"\bfrom_arena\s*=\s*true\s*;", kvb) is not None
+    results["a publication that was attempted and failed is not retried raw"] = \
+        re.search(r"if\s*\(\s*!ptr\s*&&\s*arena_publication\.attempted\s*\)\s*\{\s*return false;\s*\}", kvb) is not None and \
+        re.search(r"if\s*\(\s*!prepare_arena_publication\(\s*vram_zone_id::KV\s*\)\s*\)\s*\{\s*return false;\s*\}", kvb) is not None
+    results["a hold-induced KV placement counts as an in-arena hold spill, a zone-full one is counted and warned separately"] = \
+        re.search(r"if\s*\(\s*hold_spill\s*\)\s*\{\s*unified_cache_note_planned_hold_spill\([^;]*true\s*\)\s*;\s*\}\s*else\s*\{\s*"
+                  r"unified_cache_note_zone_full_kv_placement\(", kvb) is not None
+    take_fn = function_body(cache, r"void unified_cache_take_planned_hold_spills\([^)]*\)\s*\{") or ""
+    zone_full_fn = function_body(cache, r"void unified_cache_note_zone_full_kv_placement\([^)]*\)\s*\{") or ""
+    results["anchor: the zone-full KV placement note exists"] = zone_full_fn != ""
+    results["the zone-full KV placement has its own counter and a once-only WARN, separate from the hold spills"] = \
+        "zone_full_count++" in zone_full_fn and "GGML_LOG_WARN" in zone_full_fn and "warned_zone_full" in zone_full_fn and \
+        "spill_count" not in zone_full_fn and "spill_arena_count" not in zone_full_fn
+    results["the landing-site counters stay separate (the KV-zone counter is not the raw one)"] = \
+        re.search(r"if\s*\(\s*in_arena\s*\)\s*\{[^{}]*spill_arena_count\+\+\s*;[^{}]*\}\s*else\s*\{[^{}]*spill_count\+\+\s*;", note_spill_fn) is not None
+    results["a take hands every counter to the owner and clears every one"] = all(
+        re.search(rf"{f}\s*=\s*0\s*;", take_fn) is not None
+        for f in ("spill_count", "spill_bytes", "spill_arena_count", "spill_arena_bytes", "zone_full_count", "zone_full_bytes",
+                  "spill_owner", "warned_raw", "warned_arena", "warned_zone_full"))
+    results["the stats line is printed whatever landed, not only for raw spills"] = \
+        re.search(r"if\s*\(\s*hold_spills\.raw_count\s*!=\s*0\s*\|\|\s*hold_spills\.arena_count\s*!=\s*0\s*\|\|\s*"
+                  r"hold_spills\.zone_full_count\s*!=\s*0\s*\)", stats_fn) is not None and \
+        "hold_spills_kv_zone_full=" in stats_fn
+    # m5: the counters the final context reports are its own: a publish restarts them, so a losing rung's spills do
+    # not appear in what the finished context prints, and the once-only WARN latches survive the restart.
+    results["a publish restarts the counters the teardown stats report, and not the WARN latches"] = \
+        re.search(r"zone_full_count\s*=\s*0\s*;", epoch_fn) is not None and \
+        re.search(r"spill_owner\s*=\s*0\s*;", epoch_fn) is not None and "warned_" not in epoch_fn and \
+        "recent_count" not in cache and "recent_arena_count" not in cache
+
+    # m4: the flag reaches ONLY scheduler compute buffers. Model-weight backing buffers come from the same buffer type
+    # during a model load, before the KV cache exists; one sent to the KV zone would take this context's KV room.
+    flag_site = backend.find('"backend-buffer-runtime-zone"')
+    flag_win = backend[flag_site:flag_site + 1400] if flag_site > 0 else ""
+    results["the KV-zone-first flag is set only outside a model load (weight backing buffers never get it)"] = \
+        re.search(r"spill_to_kv_zone_before_raw\s*=\s*kv_zone_first\s*;", flag_win) is not None and \
+        re.search(r"const bool\s+kv_zone_first\s*=\s*!\s*g_sycl_in_model_load\.load\(", backend[max(0, flag_site - 2500):flag_site + 1400]) is not None
+    # m3: for the flagged class unified_alloc already tried the KV zone, so the caller's own KV step is a repeat and its
+    # SCRATCH step is a placement the graph-entry headroom check aborts on; both are skipped for it.
+    guard_re = re.search(r"if\s*\(\s*!kv_zone_first\s*&&\s*\(\s*alloc_role\s*==\s*ggml_sycl::alloc_role::COMPUTE\s*\|\|\s*should_use_runtime\s*\)\s*\)\s*\{",
+                         backend[flag_site:flag_site + 6000]) if flag_site > 0 else None
+    scratch_at = backend.find("scratch_req.queue", flag_site) if flag_site > 0 else -1
+    kvreq_at = backend.find("kv_req.queue", flag_site) if flag_site > 0 else -1
+    results["the caller's KV and SCRATCH fallbacks are unreachable for the flagged class"] = \
+        guard_re is not None and kvreq_at > 0 and scratch_at > kvreq_at and \
+        flag_site + guard_re.start() < kvreq_at < scratch_at
+
+    # I1: the transaction's bound is net of the KV the same transaction is about to place, and works with the
+    # largest free block (a buffer is indivisible), not the sum of the zone's free bytes.
+    results["the spill bound nets out the KV this transaction will place, against the KV zone's largest free block"] = \
+        re.search(r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\([^)]*kv_pending_bytes", backend) is not None and \
+        "zone_kv_room_for_compute(" in bound_fn and "zone_largest_free(ggml_sycl::vram_zone_id::KV)" in bound_fn and \
+        "zone_available(ggml_sycl::vram_zone_id::KV)" not in bound_fn and "cache->arena_active()" in bound_fn
+    results["the transaction passes the KV bytes its plan adds; the recheck, which runs with KV live, passes none"] = \
+        re.search(r"const size_t\s+kv_pending\s*=[^;]*ggml_sycl_device_kv_bytes_with_slack\(\s*next_plan", txn) is not None and \
+        re.search(r"ggml_sycl_planned_scratch_hold_spill_bound\([^;]*kv_pending\s*\)", txn) is not None and \
+        re.search(r"ggml_sycl_planned_scratch_hold_spill_bound\([^;]*,\s*0\s*\)", recheck_fn) is not None
+    results["the realized check names the largest -ub that fits, through the exported entry"] = \
+        "zone_hold_spill_largest_ub(" in realized_fn and "largest_ub" in entry_fn and \
+        re.search(r"bool ggml_backend_sycl_planned_hold_spill_fits\(\s*ggml_backend_t\s+backend\s*,\s*uint32_t\s+n_ubatch\s*,\s*uint32_t\s*\*\s*largest_ub", backend) is not None
+    results["the F3 refusal says its figure is net of the KV-zone room"] = "net of the KV" in hold_headroom_fn
     return results
 
 
@@ -726,7 +810,52 @@ def evaluate_context(context, header):
         "&ggml_backend_sycl_planned_hold_spill_fits" in context and \
         re.search(r'llama_context_sycl_proc_addr\([^;]*"ggml_backend_sycl_planned_hold_spill_fits"', context) is not None
     results["the header declares the exported entry"] = \
-        re.search(r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_planned_hold_spill_fits\(\s*ggml_backend_t", header) is not None
+        re.search(r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_planned_hold_spill_fits\(\s*ggml_backend_t\s+backend\s*,\s*uint32_t\s+n_ubatch\s*,\s*uint32_t\s*\*\s*largest_ub", header) is not None
+    results["the trial asks the entry with the rung's n_ubatch"] = \
+        re.search(r"hold_spill_fn\(\s*sb\.backend\s*,\s*c\s*,", try_fn) is not None
+
+    # r4 I2: the previous rung's compute buffers are released BEFORE this rung's transaction, so the KV headroom the
+    # transaction (and the probe) measures is not depressed by buffers a rung that already lost left in the KV zone.
+    probe_at = try_fn.find("probe_fn(")
+    release_at = try_fn.find("sched.reset();")
+    results["the previous rung's compute buffers are released before the next rung's transaction"] = \
+        0 <= release_at < probe_at and "synchronize();" in try_fn[:release_at] and \
+        re.search(r"sched_need_reserve\s*=\s*true\s*;", try_fn[release_at:probe_at]) is not None and \
+        re.search(r"sched_matches_last_good\s*=\s*false\s*;", try_fn[release_at:probe_at]) is not None and \
+        re.search(r"gf_res_reserve\.reset\(\)", try_fn[:release_at]) is not None
+    # r4 I1: the realized check also runs after a reserve the ladder did not make (a pinned -ub, a ladder that never
+    # ran), by name, with the largest -ub that fits; and it runs after the WHOLE trial/else block.
+    trial_at = context.find("sycl_select_auto_ubatch(params.type_k, params.type_v);")
+    else_reserve_at = context.find("sched_reserve();", trial_at)
+    call_at = context.find("llama_context_sycl_hold_spill_fits(backends", trial_at)
+    guard_at = context.find("quantized V cache was requested", trial_at)
+    results["the realized hold-spill check also runs after a reserve the ladder did not make"] = \
+        0 <= trial_at < else_reserve_at < call_at < guard_at
+    results["a refusal there is a context-init refusal naming the largest -ub that fits"] = \
+        call_at > 0 and "largest -ub that fits is about" in context[call_at:call_at + 1600] and \
+        "throw std::runtime_error(" in context[call_at:call_at + 1600]
+    return results
+
+
+def evaluate_raw(backend_raw, zone_hpp_raw, cmake_text, gpu_test_text):
+    """Claims that live in comments, strings the stripper keeps out, and the build registration."""
+    results = {}
+    flat = re.sub(r"\s*\n\s*//\s*", " ", backend_raw)
+    at = flat.find("static size_t ggml_sycl_planned_scratch_hold_spill_bound(")
+    results["the spill bound's comment says the KV-room netting is an estimate"] = \
+        at > 0 and "ESTIMATE" in flat[max(0, at - 2600):at]
+    zflat = re.sub(r"\s*\n\s*//\s*", " ", zone_hpp_raw)
+    zat = zflat.find("zone_hold_spill_raw_demand(")
+    results["the zone-sizing contract says the raw demand is an estimate"] = \
+        zat > 0 and "ESTIMATE" in zflat[max(0, zat - 1800):zat]
+    results["the zone-sizing header declares the two r4 helpers"] = \
+        "zone_kv_room_for_compute(" in zone_hpp_raw and "zone_hold_spill_largest_ub(" in zone_hpp_raw
+    results["the GPU test is registered under the mem-handle label"] = \
+        re.search(r"llama_build\(test-sycl-compute-buffer-kv-zone\.cpp\)", cmake_text) is not None and \
+        re.search(r"set_tests_properties\(test-sycl-compute-buffer-kv-zone PROPERTIES\s+LABELS\s+\"[^\"]*mem-handle[^\"]*\"", cmake_text) is not None
+    results["the GPU test asserts the landing zone, the zone-used delta and the return to the baseline"] = \
+        "handle.vram_zone == vram_zone_id::KV" in gpu_test_text and "zone_used(vram_zone_id::KV) >= kv_before + big" in gpu_test_text and \
+        "zone_used(vram_zone_id::KV) == kv_before" in gpu_test_text and "kv_first=*/false" in gpu_test_text
     return results
 
 
@@ -763,6 +892,12 @@ context_src = read(args.context)
 header_src = read(args.header)
 failed = run("tree", (backend, common, cache, zone))
 failed += run_context("tree", (context_src, header_src))
+raw_inputs = (Path(args.backend).read_text(), Path(args.zone).read_text(), Path(args.cmake).read_text(),
+              Path(args.gpu_test).read_text() if Path(args.gpu_test).exists() else "")
+for k, v in sorted(evaluate_raw(*raw_inputs).items()):
+    print(("PASS: " if v else "FAIL: ") + k)
+    if not v:
+        failed.append(k)
 # A comment is not code, so the stripped sources cannot see it. This one was a false claim a reader acted on
 # : the whole-graph recording path does NOT keep the Q8 buffer's handle alive.
 raw_backend = re.sub(r"\s*\n\s*//\s*", " ", Path(args.backend).read_text())  # un-wrap line comments
@@ -814,6 +949,17 @@ if args.self_test:
         for _ in range(times):
             src = mutate_in_func(src, sig_regex, old, new)
         return src
+
+    def mutate_re_in_func(src, sig_regex, pattern, repl):
+        """Regex replace of the first `pattern` after the function's signature (formatting-independent)."""
+        m = re.search(sig_regex, src)
+        r = re.compile(pattern)
+        mm = r.search(src, m.end()) if m else None
+        if not mm:
+            print(f"FAIL: self-test anchor missing: {sig_regex!r} .. {pattern!r}")
+            failed.append("self-test anchor " + pattern)
+            return src
+        return src[:mm.start()] + repl + src[mm.end():]
 
     mutants = [
         ("Q8 walk counts no-op nodes", "both walks skip the nodes the dispatch treats as no-ops",
@@ -1140,7 +1286,7 @@ if args.self_test:
                                           "state.request_hwm          = 0;", "state.request_hwm          += 0;"), zone)),
         ("epoch keeps the spilled bytes", "a publish starts a new spill epoch (a losing rung's spills and mark do not carry to the next rung)",
          (backend, common, mutate_in_func(cache, r"void unified_cache_begin_planned_hold_epoch\(",
-                                          "state.recent_bytes         = 0;", "state.recent_bytes         += 0;"), zone)),
+                                          "state.spill_bytes          = 0;", "state.spill_bytes          += 0;"), zone)),
         ("graph-entry check keeps its own 256", "the driver headroom the realized check uses is the graph-entry check's constant (one source)",
          (mutate_in_func(backend, r"static void ggml_sycl_check_graph_scratch_headroom\(",
                          "= kSyclArenaMinExternalHeadroomBytes;", "= 256ull * 1024ull * 1024ull;"), common, cache, zone)),
@@ -1203,7 +1349,60 @@ if args.self_test:
          (backend, common, mutate_in_func(cache, r"void unified_cache_set_planned_scratch_hold\(", "spill_count", "spill_XXXX"),
           zone)),
         ("f16 dispatch arm outside the macro", "both f16 buffer acquisitions in the dispatch arm sit under the one macro",
-         (mutate(backend, "#if GGML_SYCL_DEQUANT_F16_ARM", "#if 1", 1), common, cache, zone)),
+         (mutate(backend, "#if GGML_SYCL_DEQUANT_F16_ARM", "#if 1", 1), common, cache, zone)),        # review r4
+        ("KV placement published as RUNTIME", "the KV pre-placement publishes through the KV zone (record, allocation, metadata)",
+         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "output_metadata.vram_zone    = vram_zone_id::KV;",
+                                          "output_metadata.vram_zone    = vram_zone_id::RUNTIME;"), zone)),
+        ("publication prepared for RUNTIME", "the KV pre-placement publishes through the KV zone (record, allocation, metadata)",
+         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "prepare_arena_publication(vram_zone_id::KV)",
+                                          "prepare_arena_publication(vram_zone_id::RUNTIME)"), zone)),
+        ("failed publication retried raw", "a publication that was attempted and failed is not retried raw",
+         (backend, common, mutate_re_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", r"if \(!ptr && arena_publication\.attempted\) \{\s*return false;\s*\}(?=\s*if \(ptr\) \{\s*kv_placed)", ""), zone)),
+        ("KV placement not from_arena", "the KV pre-placement publishes through the KV zone (record, allocation, metadata)",
+         (backend, common, mutate_re_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", r"(?<=kv_placed)(\s*)= true;\s*from_arena\s*= true;", " = true;"), zone)),
+        ("KV placement counted for every request", "a hold-induced KV placement counts as an in-arena hold spill, a zone-full one is counted and warned separately",
+         (backend, common, mutate_after(cache, "bool kv_placed = false;", "if (hold_spill) {", "if (true) {"), zone)),
+        ("zone-full arm dropped", "the KV pre-placement reads the zone-full arm as well as the hold",
+         (backend, common, mutate_after(cache, "bool kv_placed = false;",
+                                        "hold_spill || kv_cache->zone_available(vram_zone_id::RUNTIME) < alloc_size", "hold_spill"), zone)),
+        ("KV-zone counter folded into raw", "the landing-site counters stay separate (the KV-zone counter is not the raw one)",
+         (backend, common, mutate_in_func(cache, r"void unified_cache_note_planned_hold_spill\(", "spill_arena_count++;", "spill_count++;"), zone)),
+        ("take leaves the arena counters", "a take hands every counter to the owner and clears every one",
+         (backend, common, mutate_re_in_func(cache, r"void unified_cache_take_planned_hold_spills\(", r"state\.spill_arena_count\s*= 0;", ""), zone)),
+        ("take keeps the WARN latch", "a take hands every counter to the owner and clears every one",
+         (backend, common, mutate_re_in_func(cache, r"void unified_cache_take_planned_hold_spills\(", r"state\.warned_raw\s*= false;", ""), zone)),
+        ("zone-full note shares the hold counters", "the zone-full KV placement has its own counter and a once-only WARN, separate from the hold spills",
+         (backend, common, mutate_in_func(cache, r"void unified_cache_note_zone_full_kv_placement\(", "zone_full_count++", "spill_count++"), zone)),
+        ("epoch keeps the KV-zone counters", "a publish starts a new spill epoch (a losing rung's spills and mark do not carry to the next rung)",
+         (backend, common, mutate_re_in_func(cache, r"void unified_cache_begin_planned_hold_epoch\(", r"state\.spill_arena_count\s*= 0;", ""), zone)),
+        ("epoch resets the WARN latches", "a publish restarts the counters the teardown stats report, and not the WARN latches",
+         (backend, common, mutate_re_in_func(cache, r"void unified_cache_begin_planned_hold_epoch\(", r"state\.zone_full_count\s*= 0;",
+                                             "state.zone_full_count = 0; state.warned_raw = false;"), zone)),
+        ("stats gate fires on raw only", "the stats line is printed whatever landed, not only for raw spills",
+         (mutate_re_in_func(backend, r"void ggml_backend_sycl_context::log_planned_scratch_stats\(\)",
+                            r"hold_spills\.raw_count != 0 \|\| hold_spills\.arena_count != 0 \|\| hold_spills\.zone_full_count != 0",
+                            "hold_spills.raw_count != 0"), common, cache, zone)),
+        ("flag set during a model load", "the KV-zone-first flag is set only outside a model load (weight backing buffers never get it)",
+         (mutate(backend, "spill_to_kv_zone_before_raw = kv_zone_first;", "spill_to_kv_zone_before_raw = true;"), common, cache, zone)),
+        ("caller SCRATCH step reachable", "the caller's KV and SCRATCH fallbacks are unreachable for the flagged class",
+         (mutate(backend, "if (!kv_zone_first && (alloc_role ==", "if ((alloc_role =="), common, cache, zone)),
+        ("bound sums the KV zone", "the spill bound nets out the KV this transaction will place, against the KV zone's largest free block",
+         (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(", "zone_largest_free(ggml_sycl::vram_zone_id::KV)", "zone_available(ggml_sycl::vram_zone_id::KV)"),
+          common, cache, zone)),
+        ("bound ignores the pending KV", "the spill bound nets out the KV this transaction will place, against the KV zone's largest free block",
+         (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(", "zone_kv_room_for_compute(", "zone_XXXX("), common, cache, zone)),
+        ("transaction passes no pending KV", "the transaction passes the KV bytes its plan adds; the recheck, which runs with KV live, passes none",
+         (mutate_re_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
+                            r"hold_spill_bound\(ctx->device, next_kv_info\.n_ubatch, kv_pending\)",
+                            "hold_spill_bound(ctx->device, next_kv_info.n_ubatch, 0)"), common, cache, zone)),
+        ("recheck passes pending KV", "the transaction passes the KV bytes its plan adds; the recheck, which runs with KV live, passes none",
+         (mutate_re_in_func(backend, r"ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn\(",
+                            r"planner_n_ubatch,\s*0\)", "planner_n_ubatch, 1)"), common, cache, zone)),
+        ("realized check names no -ub", "the realized check names the largest -ub that fits, through the exported entry",
+         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_realized\(", "zone_hold_spill_largest_ub(", "zone_XXXX("),
+          common, cache, zone)),
+        ("F3 text not net of KV", "the F3 refusal says its figure is net of the KV-zone room",
+         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(", "net of the KV", "net of the XX"), common, cache, zone)),
     ]
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)
@@ -1219,9 +1418,32 @@ if args.self_test:
          (context_src.replace("\"ggml_backend_sycl_planned_hold_spill_fits\"", "\"ggml_backend_sycl_XXXX\"", 1), header_src)),
         ("header lacks the entry", "the header declares the exported entry",
          (context_src, header_src.replace("ggml_backend_sycl_planned_hold_spill_fits", "ggml_backend_sycl_XXXX"))),
+        ("rung buffers kept across rungs", "the previous rung's compute buffers are released before the next rung's transaction",
+         (mutate_after(context_src, "auto try_candidate = [&](uint32_t c) -> const char * {", "sched.reset();", "(void) 0;"), header_src)),
+        ("pinned path unchecked", "the realized hold-spill check also runs after a reserve the ladder did not make",
+         (context_src.replace("llama_context_sycl_hold_spill_fits(backends", "llama_context_sycl_XXXX(backends", 1), header_src)),
+        ("pinned refusal unnamed", "a refusal there is a context-init refusal naming the largest -ub that fits",
+         (context_src.replace("largest -ub that fits is about", "largest -ub XXXX", 1), header_src)),
+        ("hook asked without the rung", "the trial asks the entry with the rung's n_ubatch",
+         (re.sub(r"hold_spill_fn\(\s*sb\.backend\s*,\s*c\s*,", "hold_spill_fn(sb.backend, 0,", context_src, count=1), header_src)),
     ]
     for label, expect, sources in ctx_mutants:
         failed += run_context(label, sources, expect)
+
+    raw_mutants = [
+        ("GPU test not registered with mem-handle", "the GPU test is registered under the mem-handle label",
+         (raw_inputs[0], raw_inputs[1], raw_inputs[2].replace("sycl;mem-handle;bugfix", "sycl;bugfix"), raw_inputs[3])),
+        ("GPU test does not return to the baseline", "the GPU test asserts the landing zone, the zone-used delta and the return to the baseline",
+         (raw_inputs[0], raw_inputs[1], raw_inputs[2], raw_inputs[3].replace("zone_used(vram_zone_id::KV) == kv_before", "true"))),
+        ("estimate comment reverted", "the spill bound's comment says the KV-room netting is an estimate",
+         (raw_inputs[0].replace("ESTIMATE", "figure"), raw_inputs[1], raw_inputs[2], raw_inputs[3])),
+    ]
+    for label, expect, inputs in raw_mutants:
+        results_raw = evaluate_raw(*inputs)
+        fired = not results_raw[expect]
+        print(("PASS" if fired else "FAIL") + f": mutant '{label}' fires '{expect}'")
+        if not fired:
+            failed.append(label)
 
 if failed:
     print("\nFAILED: " + ", ".join(failed))
