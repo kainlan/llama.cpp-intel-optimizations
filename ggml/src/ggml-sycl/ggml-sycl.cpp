@@ -28148,7 +28148,7 @@ static bool ggml_sycl_onednn_pp_skip_type(ggml_type type) {
 // adapter asks it at plan time, where there is no graph node for the router, so that a type no PP route can draw is
 // not reserved a dequant copy; non-static and declared in common.hpp because the planner cannot see this TU's statics.
 bool ggml_sycl_onednn_pp_type_admitted(ggml_type type) {
-    return ggml_sycl_onednn_pp_enabled() && !ggml_sycl_onednn_pp_skip_type(type);
+    return !ggml_sycl::onednn_pp_type_term_refused(ggml_sycl_onednn_pp_enabled(), ggml_sycl_onednn_pp_skip_type(type));
 }
 
 // llama.cpp-21jd: the single predicate for "does this dense tensor get an

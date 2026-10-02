@@ -322,11 +322,14 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
         zone_sizing, r"size_t zone_onednn_pp_pair_bound\([^)]*\)\s*\{")
     pair_bound = function_body(
         cache, r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\)\s*\{")
-    bound_for = function_body(
+    bound_plan = function_body(
+        cache, r"static size_t onednn_pp_pair_bound_for\(const zone_onednn_plan & plan, size_t capacity_bytes\)\s*\{")
+    bound_dev = function_body(
         cache, r"static size_t onednn_pp_pair_bound_for\(int device_id, size_t capacity_bytes\)\s*\{")
+    bound_for = bound_plan
     results["anchor: the pure pair bound exists"] = pure is not None
     results["anchor: the pair-bound accessor is defined"] = pair_bound is not None
-    results["anchor: the shared bound helper is defined"] = bound_for is not None
+    results["anchor: the shared bound helper is defined"] = bound_plan is not None and bound_dev is not None
     results["the pair-bound accessor is declared"] = \
         re.search(r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\);", cache_hpp) is not None
     if pure is not None:
@@ -343,8 +346,8 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
         results["the accessor answers through the shared bound helper"] = "onednn_pp_pair_bound_for(" in pair_bound
     if bound_for is not None:
         results["the helper reads the stored zone-plan snapshot, bare plan and floor together"] = \
-            "onednn_zone_plan_load(" in bound_for and "plan.bare_bytes" in bound_for and \
-            "plan.graph_floor_bytes" in bound_for
+            bound_dev is not None and "onednn_zone_plan_load(" in bound_dev and \
+            "plan.bare_bytes" in bound_for and "plan.graph_floor_bytes" in bound_for
         results["the helper answers through the pure bound"] = "zone_onednn_pp_pair_bound(" in bound_for
         results["the helper does not read a live planner figure or recompute the floor"] = \
             "onednn_graph_scratch_zone_floor_bytes" not in bound_for and \
@@ -576,7 +579,7 @@ if args.self_test and not failed:
     supplies_sig = r"static bool ggml_sycl_onednn_pp_scratch_supplies\("
     enabled_sig = r"bool onednn_pp_unified_scratch_enabled\(ggml_type type\)"
     adapter_sig = r"std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory\("
-    bound_sig = r"static size_t onednn_pp_pair_bound_for\("
+    bound_sig = r"static size_t onednn_pp_pair_bound_for\(const zone_onednn_plan"
     ensure_sig = r"bool unified_cache::ensure_planned_arena_zones\("
     reserve_sig = r"bool unified_cache::reserve_onednn_scratch\("
     route_a_sig = r"static bool ggml_sycl_mul_mat_unified_pp_dequant_route\("

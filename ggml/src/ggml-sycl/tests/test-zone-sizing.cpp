@@ -748,10 +748,12 @@ int main() {
         CHECK(w == 1105 * mib, "a smaller weights request never shrinks the held weights block");
         CHECK(a == 3 * mib, "a larger activations request still grows the activations half on its own");
 
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 100 * mib, 2 * mib, 0, 0, 50 * mib, 3 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 100 * mib, 2 * mib, 0, 0, 50 * mib, 3 * mib, &w,
+                                                      &a);
         CHECK(w == 100 * mib && a == 3 * mib, "inside the zone the merged pair is the target");
 
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 2 * mib, 0, 0, 50 * mib, 100 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 2 * mib, 0, 0, 50 * mib, 100 * mib,
+                                                      &w, &a);
         CHECK(w == 50 * mib && a == 100 * mib,
               "a merge that would overflow the zone falls back to the request instead of wedging every op");
 
@@ -983,7 +985,8 @@ int main() {
         q8_embd.get_rows_only                    = true;
         zone_tensor_desc q8_head                 = q8_embd;
         q8_head.get_rows_only                    = false;
-        CHECK(zone_scoped_maxima({ q8_embd }).dequant_f16_weight_bytes == 0, "a gather-only Q8_0 embedding is not planned");
+        CHECK(zone_scoped_maxima({ q8_embd }).dequant_f16_weight_bytes == 0,
+              "a gather-only Q8_0 embedding is not planned");
         CHECK(zone_scoped_maxima({ q8_embd, q8_head }).dequant_f16_weight_bytes == 1159372800,
               "a Q8_0 head beside it still is");
     }
@@ -1027,9 +1030,9 @@ int main() {
             held_plan.weights_bytes     = 100 * mib;
             held_plan.activations_bytes = 10 * mib;
             zone_onednn_plan live_plan;
-            live_plan.bare_bytes        = 110 * mib;
-            live_plan.weights_bytes     = 10 * mib;
-            live_plan.activations_bytes = 100 * mib;
+            live_plan.bare_bytes           = 110 * mib;
+            live_plan.weights_bytes        = 10 * mib;
+            live_plan.activations_bytes    = 100 * mib;
             const zone_onednn_plan crossed = ggml_sycl::zone_onednn_plan_keep(held_plan, live_plan);
             CHECK(crossed.weights_bytes + crossed.activations_bytes <= crossed.bare_bytes,
                   "the kept halves never sum above the kept bare plan");
@@ -1044,9 +1047,9 @@ int main() {
             big_plan.weights_bytes     = 120 * mib;
             big_plan.activations_bytes = 80 * mib;
             zone_onednn_plan small_plan;
-            small_plan.bare_bytes        = 150 * mib;
-            small_plan.weights_bytes     = 140 * mib;
-            small_plan.activations_bytes = 10 * mib;
+            small_plan.bare_bytes         = 150 * mib;
+            small_plan.weights_bytes      = 140 * mib;
+            small_plan.activations_bytes  = 10 * mib;
             const zone_onednn_plan larger = ggml_sycl::zone_onednn_plan_keep(small_plan, big_plan);
             CHECK(larger.bare_bytes == 200 * mib && larger.weights_bytes == 120 * mib &&
                       larger.activations_bytes == 80 * mib,
@@ -1060,9 +1063,11 @@ int main() {
         // merge is bounded by the PAIR BOUND, not the capacity: the held pair would otherwise eat the Graph floor.
         const size_t bound = 235 * mib;
         size_t       w = 0, a = 0;
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, bound, 200 * mib, 4 * mib, 0, 0, 40 * mib, 40 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, bound, 200 * mib, 4 * mib, 0, 0, 40 * mib, 40 * mib, &w,
+                                                      &a);
         CHECK(w == 40 * mib && a == 40 * mib, "a merge above the bound is not held: the request is used as asked");
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 4 * mib, 0, 0, 40 * mib, 40 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 4 * mib, 0, 0, 40 * mib, 40 * mib, &w,
+                                                      &a);
         CHECK(w == 200 * mib && a == 40 * mib,
               "the same two ops against the raw capacity merge to 240 MiB, past the 235 MiB bound");
     }

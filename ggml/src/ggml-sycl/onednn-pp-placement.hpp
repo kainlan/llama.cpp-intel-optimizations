@@ -121,8 +121,16 @@ struct onednn_pp_admission_inputs {
     bool    contiguous_quantized_weight = false;
 };
 
+// The type-level refusal: oneDNN PP is off, or skipped for this weight's type. The ONE statement of it: the pure
+// admission below and the zone planner's admission (ggml_sycl_onednn_pp_type_admitted, which decides at plan time
+// whether a type can draw the planned f16 buffers at all) both call it, so a term added here reaches both
+// (llama.cpp-8ony).
+inline bool onednn_pp_type_term_refused(bool enabled, bool skip_type) {
+    return !enabled || skip_type;
+}
+
 inline onednn_pp_refusal onednn_pp_admission_decide(const onednn_pp_admission_inputs & in) {
-    if (!in.enabled || in.skip_type) {
+    if (onednn_pp_type_term_refused(in.enabled, in.skip_type)) {
         return onednn_pp_refusal::DISABLED_OR_SKIP_TYPE;
     }
     if (in.batch < in.min_batch) {

@@ -203,11 +203,11 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
 }
 
 zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live) {
-    zone_onednn_plan kept;
-    kept.bare_bytes        = std::max(held.bare_bytes, live.bare_bytes);
+    // The pair plan is one thing: its halves sum into its bare plan. Take the whole pair of the plan with the larger
+    // bare plan (the held one on a tie), never the maximum of each half, which would build a pair no plan had. The
+    // Graph floor is a separate figure the zone also has to hold, so it keeps its own maximum.
+    zone_onednn_plan kept  = live.bare_bytes > held.bare_bytes ? live : held;
     kept.graph_floor_bytes = std::max(held.graph_floor_bytes, live.graph_floor_bytes);
-    kept.weights_bytes     = std::max(held.weights_bytes, live.weights_bytes);
-    kept.activations_bytes = std::max(held.activations_bytes, live.activations_bytes);
     return kept;
 }
 
@@ -383,19 +383,6 @@ void zone_onednn_scratch_reserve_target(bool     arena_active,
     if (activations_bytes) {
         *activations_bytes = target_a;
     }
-}
-
-void zone_onednn_scratch_reserve_target(bool     arena_active,
-                                        size_t   pair_bound_bytes,
-                                        size_t   held_weights_bytes,
-                                        size_t   held_activations_bytes,
-                                        size_t   requested_weights_bytes,
-                                        size_t   requested_activations_bytes,
-                                        size_t * weights_bytes,
-                                        size_t * activations_bytes) {
-    zone_onednn_scratch_reserve_target(arena_active, pair_bound_bytes, held_weights_bytes, held_activations_bytes, 0, 0,
-                                       requested_weights_bytes, requested_activations_bytes, weights_bytes,
-                                       activations_bytes);
 }
 
 size_t zone_onednn_pp_pair_bound(size_t capacity_bytes, size_t bare_plan_bytes, size_t graph_floor_bytes) {

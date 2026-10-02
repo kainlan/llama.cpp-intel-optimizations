@@ -310,22 +310,14 @@ bool zone_onednn_pp_scratch_planned(bool   arena_active,
 // With an arena the merged pair is still bounded by `pair_bound_bytes` (zone_onednn_pp_pair_bound, not the raw
 // capacity): two ops that each fit the bound can merge, per component, into a pair above it. A held pair that
 // cannot be merged inside the bound (left over from a smaller or rebuilt arena) must not wedge every later
-// request, so the request is used as asked. Pure; a null out is ignored.
-void zone_onednn_scratch_reserve_target(bool     arena_active,
-                                        size_t   pair_bound_bytes,
-                                        size_t   held_weights_bytes,
-                                        size_t   held_activations_bytes,
-                                        size_t   requested_weights_bytes,
-                                        size_t   requested_activations_bytes,
-                                        size_t * weights_bytes,
-                                        size_t * activations_bytes);
-
-// The same target with the zone's PLANNED pair as a floor (llama.cpp-8ony): the first reservation is sized to
-// max(held, requested, planned) per component, so the pair the plan provisioned is reserved once and never regrows
-// (a regrow needs the superseded reservation and the new one in the zone at once, which a zone sized for one pair plus
-// the Graph floor cannot hold). Used only with an arena, where the planned pair exists; without one the planned halves
-// are ignored. When that pair does not fit `pair_bound_bytes` (a zone clamped below its plan) the target is the
-// held-and-requested merge of the overload above. Pure; a null out is ignored.
+// request, so the request is used as asked.
+//
+// The zone's PLANNED pair is a floor (llama.cpp-8ony): the first reservation is sized to max(held, requested, planned)
+// per component, so the pair the plan provisioned is reserved once and never regrows (a regrow needs the superseded
+// reservation and the new one in the zone at once, which a zone sized for one pair plus the Graph floor cannot hold).
+// Used only with an arena, where the planned pair exists; without one the planned halves are ignored. When that pair
+// does not fit `pair_bound_bytes` (a zone clamped below its plan) the target is the held-and-requested merge. Pass 0, 0
+// for no planned pair. Pure; a null out is ignored.
 void zone_onednn_scratch_reserve_target(bool     arena_active,
                                         size_t   pair_bound_bytes,
                                         size_t   held_weights_bytes,
@@ -363,8 +355,11 @@ struct zone_onednn_plan {
 };
 
 // The snapshot to keep when the arena's zones were found sufficient for `live` and the zone is NOT rebuilt: the zone
-// stays the size an earlier plan built it to, so it must still be described by the larger of each figure, never by
-// a later, smaller plan's. A rebuilt zone is described by the live plan outright (the caller stores it directly). Pure.
+// stays the size an earlier plan built it to, so it must still be described by the larger plan, never by a later,
+// smaller one's. The pair is kept whole (its halves sum into its bare plan): the pair of whichever plan has the larger
+// bare plan, the held one on a tie. Maxing each half on its own would build a pair no plan had, above what the zone
+// holds. The Graph floor is a separate requirement on the same zone and keeps its own maximum. A rebuilt zone is
+// described by the live plan outright (the caller stores it directly). Pure.
 zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live);
 
 // Whether the oneDNN PP scratch is allowed to supply a dense op's f16 copies at all, as a function of the

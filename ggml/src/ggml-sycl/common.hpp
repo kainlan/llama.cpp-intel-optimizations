@@ -5136,11 +5136,6 @@ inline bool ggml_sycl_unified_dispatch_env_enabled() {
     return enabled != 0;
 }
 
-inline bool ggml_sycl_should_use_unified_type(ggml_type type) {
-    // Mirror ggml_sycl::should_use_unified() without pulling in dispatch.hpp
-    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_MXFP4;
-}
-
 // Forward declaration of unified resolve (defined below).
 inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int device);
 

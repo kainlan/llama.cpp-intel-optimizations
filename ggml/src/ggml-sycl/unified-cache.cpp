@@ -22,6 +22,7 @@
 #include "model-lifecycle.hpp"
 #include "moe-resolved-batch.hpp"
 #include "sycl-timeline.hpp"
+#include "unified-types.hpp"
 #include "vram-headroom.hpp"
 #include "zone-sizing.hpp"
 
@@ -751,9 +752,12 @@ static void onednn_zone_plan_keep_and_store(int device_id, const zone_onednn_pla
 // The most an op's f16 pair may be for the ONEDNN zone of capacity `capacity_bytes` on `device_id` to count it as
 // planned (zone_onednn_pp_pair_bound over the snapshot above). The one source for the admission accessor and for the
 // reserve's own merge and refusal, so the two cannot disagree about what the zone was planned to hold.
-static size_t onednn_pp_pair_bound_for(int device_id, size_t capacity_bytes) {
-    const zone_onednn_plan plan = onednn_zone_plan_load(device_id);
+static size_t onednn_pp_pair_bound_for(const zone_onednn_plan & plan, size_t capacity_bytes) {
     return zone_onednn_pp_pair_bound(capacity_bytes, plan.bare_bytes, plan.graph_floor_bytes);
+}
+
+static size_t onednn_pp_pair_bound_for(int device_id, size_t capacity_bytes) {
+    return onednn_pp_pair_bound_for(onednn_zone_plan_load(device_id), capacity_bytes);
 }
 // llama.cpp-479i: planned bytes of the per-context dense MMQ/MMVQ Q8_1 src1 buffer
 // (n_ubatch * bytes-per-token from the inventory, 256-aligned), folded into the
@@ -18722,7 +18726,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         const int              bound_dev = ggml_sycl_get_device_id_from_queue(queue_);
         const zone_onednn_plan zone_plan = arena_on ? onednn_zone_plan_load(bound_dev) : zone_onednn_plan();
         const size_t           pair_bound =
-            arena_on ? onednn_pp_pair_bound_for(bound_dev, zone_capacity(vram_zone_id::ONEDNN)) : 0;
+            arena_on ? onednn_pp_pair_bound_for(zone_plan, zone_capacity(vram_zone_id::ONEDNN)) : 0;
         zone_onednn_scratch_reserve_target(arena_on, pair_bound, held_w, held_a, zone_plan.weights_bytes,
                                            zone_plan.activations_bytes, weights_size, activations_size, &weights_size,
                                            &activations_size);
@@ -27953,8 +27957,7 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // The head's copy is reserved UNCONDITIONALLY otherwise (owner decision) until llama.cpp-fkpg delivers
         // n_outputs to the planner: whether the head runs on many rows (perplexity, embeddings) or on the last row
         // only (chat, llama-bench) is not known here, and an unused plan is bounded by that one weight's f16 copy.
-        if (item.has_shape() && ggml_sycl_should_use_unified_type(item.type) &&
-            ggml_sycl_onednn_pp_type_admitted(item.type) &&
+        if (item.has_shape() && unified_kernel_serves_type(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type) &&
             expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
             size_t weight_bytes = 0;
             size_t src1_bytes   = 0;
