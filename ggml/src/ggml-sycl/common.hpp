@@ -1679,6 +1679,10 @@ struct layout_policy {
         // unified kernel dispatch guard at ggml-sycl.cpp:31236 does not skip them.
         // TG path still works via MMVQ/DMMV SOA kernels (~77 t/s, slightly under
         // COALESCED's 81 t/s — acceptable cost for unlocking unified XMX PP).
+        // This reads GGML_SYCL_SKIP_ONEDNN_Q4_0 for a LAYOUT question and is not the PP admission's term: the
+        // admission (ggml_sycl_onednn_pp_type_admitted, ggml-sycl.cpp) is "enabled && !skip", this is the knob alone,
+        // so with GGML_SYCL_ONEDNN_PP=0 and no skip the admission refuses and the layout is untouched. The opt-in
+        // stays one variable parsed the same way at both sites (non-zero integer).
         static int skip_onednn_q4_0_cached = -1;
         if (skip_onednn_q4_0_cached < 0) {
             const char * env        = std::getenv("GGML_SYCL_SKIP_ONEDNN_Q4_0");
@@ -2416,6 +2420,11 @@ sycl::event ggml_sycl_pp_stage_transfer(int          src_device,
 // drift apart. Definitions live in ggml-sycl.cpp; see
 // ggml_sycl_dense_woq_alternate_eligible's own comment for the history.
 bool   ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous);
+
+// llama.cpp-8ony: the environment-level terms of the oneDNN PP admission for a weight of `type` (GGML_SYCL_ONEDNN_PP
+// and GGML_SYCL_SKIP_ONEDNN_Q4_0). Defined next to ggml_sycl_onednn_pp_candidate, which asks the same two gates; the
+// planner calls it because it cannot see that TU's statics.
+bool   ggml_sycl_onednn_pp_type_admitted(ggml_type type);
 // Same predicate, with placement safety judged for `plan` rather than the current global
 // plan -- the planner's form, since the plan it is building is not global yet.
 bool   ggml_sycl_dense_woq_alternate_eligible_for_plan(ggml_type                         type,
@@ -5129,11 +5138,6 @@ inline bool ggml_sycl_unified_dispatch_env_enabled() {
         enabled          = (env == nullptr || std::atoi(env) != 0) ? 1 : 0;
     }
     return enabled != 0;
-}
-
-inline bool ggml_sycl_should_use_unified_type(ggml_type type) {
-    // Mirror ggml_sycl::should_use_unified() without pulling in dispatch.hpp
-    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_MXFP4;
 }
 
 // Forward declaration of unified resolve (defined below).

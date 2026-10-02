@@ -165,7 +165,8 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
 
         const size_t cardinality = group_cardinality_of(freq, tensor);
 
-        if (zone_is_onednn_reorder_eligible(tensor, cardinality)) {
+        const bool onednn_eligible = zone_is_onednn_reorder_eligible(tensor, cardinality);
+        if (onednn_eligible) {
             maxima.onednn_eligible = std::max(maxima.onednn_eligible, tensor.size);
             // Maxed independently of onednn_eligible, over the SAME eligible
             // set. The two winners need not be the same tensor: expansion is
@@ -179,14 +180,39 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
         if (zone_is_dma_streamed(tensor, cardinality)) {
             maxima.dma_streamed = std::max(maxima.dma_streamed, tensor.size);
         }
+        // A tensor the loader says is only ever gathered (GET_ROWS) is no MUL_MAT operand whatever marks the adapter
+        // set on it; the three marks below are the MUL_MAT-side plans (llama.cpp-8ony).
+        if (tensor.get_rows_only) {
+            continue;
+        }
         // Not gated on a per-layer family or on the expert predicate: the adapter
         // already said whether this is a dense MUL_MAT operand (non-zero).
         maxima.mmq_src1_bytes_per_token = std::max(maxima.mmq_src1_bytes_per_token, tensor.mmq_src1_bytes_per_token);
         maxima.dequant_f16_weight_bytes = std::max(maxima.dequant_f16_weight_bytes, tensor.dequant_f16_weight_bytes);
         maxima.dequant_f16_src1_bytes_per_token =
             std::max(maxima.dequant_f16_src1_bytes_per_token, tensor.dequant_f16_src1_bytes_per_token);
+        if (tensor.dequant_f16_if_unsupplied_weight_bytes != 0 &&
+            zone_dequant_f16_planned_when_unsupplied(tensor.pp_scratch_type_enabled, onednn_eligible)) {
+            maxima.dequant_f16_weight_bytes =
+                std::max(maxima.dequant_f16_weight_bytes, tensor.dequant_f16_if_unsupplied_weight_bytes);
+            maxima.dequant_f16_src1_bytes_per_token = std::max(maxima.dequant_f16_src1_bytes_per_token,
+                                                               tensor.dequant_f16_if_unsupplied_src1_bytes_per_token);
+        }
     }
     return maxima;
+}
+
+zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live) {
+    // The pair plan is one thing: its halves sum into its bare plan. Take the whole pair of the plan with the larger
+    // bare plan (the held one on a tie), never the maximum of each half, which would build a pair no plan had. The
+    // Graph floor is a separate figure the zone also has to hold, so it keeps its own maximum.
+    zone_onednn_plan kept  = live.bare_bytes > held.bare_bytes ? live : held;
+    kept.graph_floor_bytes = std::max(held.graph_floor_bytes, live.graph_floor_bytes);
+    return kept;
+}
+
+bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool pair_eligible) {
+    return !(pp_scratch_type_enabled && pair_eligible);
 }
 
 bool zone_mmq_src1_row_bytes(int64_t ne10, size_t * out) {
@@ -307,6 +333,87 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
     *src0_bytes           = (max_weight_bytes + align - 1) / align * align;
     *src1_bytes           = (acts_raw + align - 1) / align * align;
     return true;
+}
+
+bool zone_onednn_pp_scratch_planned(bool   arena_active,
+                                    size_t pair_bound_bytes,
+                                    size_t weights_bytes,
+                                    size_t activations_bytes) {
+    if (!arena_active) {
+        return true;
+    }
+    if (weights_bytes > SIZE_MAX - activations_bytes) {
+        return false;
+    }
+    return weights_bytes + activations_bytes <= pair_bound_bytes;
+}
+
+void zone_onednn_scratch_reserve_target(bool     arena_active,
+                                        size_t   pair_bound_bytes,
+                                        size_t   held_weights_bytes,
+                                        size_t   held_activations_bytes,
+                                        size_t   planned_weights_bytes,
+                                        size_t   planned_activations_bytes,
+                                        size_t   requested_weights_bytes,
+                                        size_t   requested_activations_bytes,
+                                        size_t * weights_bytes,
+                                        size_t * activations_bytes) {
+    // A pair that cannot exist inside the bound (or whose sum is unrepresentable) is not a target.
+    const auto fits = [&](size_t w, size_t a) {
+        return !arena_active || (w <= SIZE_MAX - a && w + a <= pair_bound_bytes);
+    };
+    const size_t merged_weights     = std::max(held_weights_bytes, requested_weights_bytes);
+    const size_t merged_activations = std::max(held_activations_bytes, requested_activations_bytes);
+    // With an arena the planned pair is a floor: reserving it up front is what keeps the pair from ever regrowing.
+    const size_t planned_w          = arena_active ? std::max(merged_weights, planned_weights_bytes) : merged_weights;
+    const size_t planned_a =
+        arena_active ? std::max(merged_activations, planned_activations_bytes) : merged_activations;
+    size_t target_w = requested_weights_bytes;  // used as asked when nothing merged fits
+    size_t target_a = requested_activations_bytes;
+    if (fits(planned_w, planned_a)) {
+        target_w = planned_w;
+        target_a = planned_a;
+    } else if (fits(merged_weights, merged_activations)) {
+        target_w = merged_weights;
+        target_a = merged_activations;
+    }
+    if (weights_bytes) {
+        *weights_bytes = target_w;
+    }
+    if (activations_bytes) {
+        *activations_bytes = target_a;
+    }
+}
+
+size_t zone_onednn_pp_pair_bound(size_t capacity_bytes, size_t bare_plan_bytes, size_t graph_floor_bytes) {
+    const size_t slack_bound = capacity_bytes > graph_floor_bytes ? capacity_bytes - graph_floor_bytes : 0;
+    return std::min(capacity_bytes, std::max(bare_plan_bytes, slack_bound));
+}
+
+bool zone_onednn_pp_scratch_type_enabled(int env_mode, bool default_type) {
+    return env_mode > 0 || (env_mode < 0 && default_type);
+}
+
+bool zone_onednn_pp_scratch_supplies(bool   pp_candidate,
+                                     bool   type_enabled,
+                                     bool   arena_active,
+                                     size_t pair_bound_bytes,
+                                     size_t weights_bytes,
+                                     size_t activations_bytes) {
+    return pp_candidate && type_enabled &&
+           zone_onednn_pp_scratch_planned(arena_active, pair_bound_bytes, weights_bytes, activations_bytes);
+}
+
+bool zone_unified_pp_draws_dequant(bool primary_unified,
+                                   bool unified_type,
+                                   bool src1_plain,
+                                   bool pp_candidate,
+                                   bool scratch_supplies) {
+    return primary_unified && unified_type && src1_plain && pp_candidate && !scratch_supplies;
+}
+
+bool zone_walk_f16_node_draws(bool prec_default, bool legacy_route_draws, bool unified_route_draws) {
+    return (prec_default && legacy_route_draws) || unified_route_draws;
 }
 
 bool zone_dense_scratch_total_bytes(size_t   mmq_bytes_per_token,

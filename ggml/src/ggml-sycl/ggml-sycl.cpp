@@ -1450,17 +1450,6 @@ struct fp16_weight_cache {
 
 static fp16_weight_cache g_fp16_cache;
 
-static bool onednn_pp_unified_scratch_enabled(ggml_type type) {
-    static const int mode = []() {
-        const char * env = std::getenv("GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH");
-        if (env) {
-            return std::atoi(env) != 0 ? 1 : 0;
-        }
-        return -1;
-    }();
-    return mode > 0 || (mode < 0 && (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_MXFP4));
-}
-
 struct onednn_pp_scratch_guard {
     int                            device = -1;
     ggml_sycl::onednn_scratch_token token{};
@@ -1481,6 +1470,25 @@ struct onednn_pp_scratch_guard {
     onednn_pp_scratch_guard & operator=(const onednn_pp_scratch_guard &) = delete;
 };
 
+// llama.cpp-8ony: whether the f16 weight + activation copies of one dense op are PLANNED into the ONEDNN zone. The
+// planner keeps tensors it does not size that zone for (the LM head) out of it and puts their f16 dequant in the
+// RUNTIME-zone dense buffers instead, so "the op passes the oneDNN PP admission" is not enough to send it to the
+// oneDNN scratch: the arena refuses to grow that zone once weights are resident. acquire_onednn_pp_scratch, by
+// bytes, is the choke point every route to the scratch passes; ggml_sycl_onednn_pp_scratch_supplies (below the PP
+// admission) is the same question, with the type enablement, for the op arm and the graph-entry walk.
+//
+// The bound is not the zone's whole capacity and not the pair's own plan: it is max(plan, capacity - Graph floor),
+// capped at the capacity, from the stored figures (unified_cache_get_onednn_pp_pair_bound). The zone is
+// max(256 MiB, plan + floor), so its capacity can sit far above plan + floor. A pair up to capacity - floor uses slack
+// nobody else planned for; a pair above it would grow into the bytes reserved for the oneDNN Graph SDPA scratch, whose
+// DIRECT path is itself an unplanned device allocation. A pair is never refused below the plan (a clamped zone still
+// holds it), so a small model whose head is larger than its largest layer pair keeps its route.
+static bool ggml_sycl_onednn_pp_scratch_planned_bytes(int device, size_t weights_bytes, size_t activations_bytes) {
+    size_t     pair_bound   = 0;
+    const bool arena_active = ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound);
+    return ggml_sycl::zone_onednn_pp_scratch_planned(arena_active, pair_bound, weights_bytes, activations_bytes);
+}
+
 static bool acquire_onednn_pp_scratch(int                       device_id,
                                       ggml_type                 type,
                                       size_t                    weights_bytes,
@@ -1488,7 +1496,13 @@ static bool acquire_onednn_pp_scratch(int                       device_id,
                                       sycl::half **             weights_scratch,
                                       sycl::half **             activations_scratch,
                                       onednn_pp_scratch_guard & scratch_guard) {
-    if (!weights_scratch || !activations_scratch || !onednn_pp_unified_scratch_enabled(type)) {
+    if (!weights_scratch || !activations_scratch || !ggml_sycl::onednn_pp_unified_scratch_enabled(type)) {
+        return false;
+    }
+    // An op the plan did not put in the ONEDNN zone is turned away HERE, before the reserve (llama.cpp-8ony): the
+    // reserve's replan attempt rewrites the stored plan upward and, refused, used to allocate the pair directly,
+    // which is an unplanned allocation. The caller falls back to the planned dequant buffers (or its pool copy).
+    if (!ggml_sycl_onednn_pp_scratch_planned_bytes(device_id, weights_bytes, activations_bytes)) {
         return false;
     }
     ggml_sycl::onednn_scratch_result scratch =
@@ -15896,7 +15910,8 @@ static size_t get_system_memory_bytes() {
 // llama.cpp-kpjw: whether this build can reach the f16 dequant arm of ggml_sycl_op_mul_mat_sycl at all. Its walk and
 // its dispatch arm are compiled only with oneDNN and GGML_SYCL_F16; without them nothing ever draws the planned f16
 // buffers, so planning them would reserve RUNTIME bytes for nothing. Where it is true, whether a given model draws
-// them is the zone adapter's candidate set (dense Q8_0 weights) and the route at run time.
+// them is the zone adapter's candidate set (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch
+// will not supply) and the route at run time.
 // ONE source for that condition: the planning site reads the constexpr below, and the f16 walk and both acquisitions
 // of the planned f16 buffers in the dispatch arm (ggml_sycl_op_mul_mat_sycl) are compiled under the same macro, so
 // they cannot drift apart. (The arm itself is also gated at run time by use_fp16, which is GGML_SYCL_F16.)
@@ -15949,6 +15964,7 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
                     info.ne[d] = inventory->tensors[i].ne[d];
                 }
             }
+            info.get_rows_only = inventory->tensors[i].get_rows_only;
             g_tensor_inventory_detail.push_back(std::move(info));
             g_tensor_inventory_index[name] = idx;
             g_tensor_inventory_total_size += inventory->tensors[i].size;
@@ -15981,8 +15997,8 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         g_tensor_inventory_onednn_scratchpad_bytes / (1024.0 * 1024.0),
         inventory_maxima.onednn_reorder / (1024.0 * 1024.0), inventory_maxima.onednn_eligible / (1024.0 * 1024.0),
         max_tensor_bytes / (1024.0 * 1024.0));
-    ggml_sycl::unified_cache_set_planned_onednn_scratchpad_bytes(ctx->device,
-                                                                 g_tensor_inventory_onednn_scratchpad_bytes);
+    ggml_sycl::unified_cache_set_planned_onednn_scratchpad_pair(ctx->device, inventory_maxima.onednn_reorder,
+                                                                inventory_maxima.onednn_eligible);
     // llama.cpp-479i: the dense MMQ/MMVQ Q8_1 src1 buffer is a planned byte. Sized here from the
     // same inventory maxima, at the load-time n_ubatch (512 when the loader says 0); the graph-entry
     // check ggml_sycl_mmq_src1_ensure_for_graph() sizes the exact demand at the real n_ubatch.
@@ -16000,7 +16016,8 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
                       mmq_src1_planned ? "" : " -- sizing overflowed, nothing planned");
     }
     // llama.cpp-479i: the dense f16 dequant buffers (src0 and src1 copies) are planned the same way, from
-    // the inventory maxima the adapter marked (dense Q8_0 weights), in the same RUNTIME zone.
+    // the inventory maxima the adapter marked (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch
+    // will not supply), in the same RUNTIME zone.
     // A build that cannot reach the f16 arm plans nothing for it: the buffers would be a reservation nothing draws,
     // and the hold, the fit check and the ring would each count it.
     {
@@ -28126,6 +28143,17 @@ static bool ggml_sycl_onednn_pp_skip_type(ggml_type type) {
     return skip_q4_0 && type == GGML_TYPE_Q4_0;
 }
 
+// llama.cpp-8ony: the environment-level terms of the oneDNN PP admission, for a weight of `type`
+// (GGML_SYCL_ONEDNN_PP, GGML_SYCL_SKIP_ONEDNN_Q4_0). The ONE reader of both within the admission:
+// ggml_sycl_onednn_pp_candidate hands its answer to the pure admission, the dense WOQ second-copy predicate asks it,
+// and the zone adapter asks it at plan time, where there is no graph node for the router, so that a type no PP route
+// can draw is not reserved a dequant copy. layout_policy (common.hpp) also reads GGML_SYCL_SKIP_ONEDNN_Q4_0, for a
+// different question (which layout a Q4_0 weight is loaded in; see there). Non-static and declared in common.hpp
+// because the planner cannot see this TU's statics.
+bool ggml_sycl_onednn_pp_type_admitted(ggml_type type) {
+    return !ggml_sycl::onednn_pp_type_term_refused(ggml_sycl_onednn_pp_enabled(), ggml_sycl_onednn_pp_skip_type(type));
+}
+
 // llama.cpp-21jd: the single predicate for "does this dense tensor get an
 // unbudgeted oneDNN WOQ second copy", shared by S1-PRELOAD staging below and
 // by the planner in unified-cache.cpp (which cannot see this TU's static
@@ -28156,8 +28184,8 @@ static bool ggml_sycl_dense_woq_alternates_enabled() {
 }
 
 static bool ggml_sycl_dense_woq_alternate_eligible_impl(ggml_type type, bool is_contiguous, bool placement_safe) {
-    return ggml_sycl_dense_woq_alternates_enabled() && is_contiguous && ggml_sycl_onednn_pp_enabled() &&
-           !ggml_sycl_onednn_pp_skip_type(type) && placement_safe && ggml_sycl_onednn_woq_supported_type(type);
+    return ggml_sycl_dense_woq_alternates_enabled() && is_contiguous && ggml_sycl_onednn_pp_type_admitted(type) &&
+           placement_safe && ggml_sycl_onednn_woq_supported_type(type);
 }
 
 bool ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous) {
@@ -28208,8 +28236,7 @@ static bool ggml_sycl_onednn_pp_candidate(
         return false;
     }
     ggml_sycl::onednn_pp_admission_inputs admission;
-    admission.enabled                     = ggml_sycl_onednn_pp_enabled();
-    admission.skip_type                   = ggml_sycl_onednn_pp_skip_type(src0->type);
+    admission.type_admitted               = ggml_sycl_onednn_pp_type_admitted(src0->type);
     admission.batch                       = src1->ne[1];
     admission.min_batch                   = ggml_sycl::onednn_pp_min_batch_for(route, ggml_sycl_onednn_pp_min_batch());
     admission.f32_operands                = src1->type == GGML_TYPE_F32 && (!dst || dst->type == GGML_TYPE_F32);
@@ -28241,6 +28268,44 @@ static bool ggml_sycl_onednn_pp_candidate(
     GGML_UNUSED(route);
     return false;
 #endif
+}
+
+// llama.cpp-8ony: "the oneDNN PP scratch supplies this op's f16 copies" -- the PP admission, the type/env enablement
+// of acquire_onednn_pp_scratch, and the zone plan -- as ONE function of (src0, src1, column count). The op arm
+// asks it with its column tile (src1_ncols) and the graph-entry walk with src1->ne[1]; both pairs are derived here,
+// from src0's rows x ne[0] and the columns x src1->ne[0], so the two consumers cannot pass different numbers for
+// the same op. An op it does not supply draws the planned dequant buffers, and the walk sizes exactly those.
+//
+// `pp_candidate_out` (may be null) receives the PP admission this asked, so a caller that also needs it (the walk's
+// unified-route predicate) does not ask it a second time: the admission traces into a shared budget and the walk
+// runs it for every multi-row node.
+static bool ggml_sycl_onednn_pp_scratch_supplies(int                 device,
+                                                 const ggml_tensor * src0,
+                                                 const ggml_tensor * src1,
+                                                 const ggml_tensor * dst,
+                                                 int64_t             src1_cols,
+                                                 bool *              pp_candidate_out = nullptr) {
+    if (pp_candidate_out) {
+        *pp_candidate_out = false;
+    }
+    if (!src0 || !src1 || src1_cols < 0 || src0->ne[0] < 0 || src0->ne[1] < 0 || src1->ne[0] < 0) {
+        return false;
+    }
+    constexpr size_t elem_bytes = sizeof(sycl::half);
+    const size_t     w_elems    = static_cast<size_t>(src0->ne[1]) * static_cast<size_t>(src0->ne[0]);
+    const size_t     a_elems    = static_cast<size_t>(src1_cols) * static_cast<size_t>(src1->ne[0]);
+    if (w_elems > SIZE_MAX / elem_bytes || a_elems > SIZE_MAX / elem_bytes) {
+        return false;
+    }
+    const bool pp_candidate = ggml_sycl_onednn_pp_candidate(src0, src1, dst, device);
+    if (pp_candidate_out) {
+        *pp_candidate_out = pp_candidate;
+    }
+    size_t     pair_bound   = 0;
+    const bool arena_active = ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound);
+    return ggml_sycl::zone_onednn_pp_scratch_supplies(
+        pp_candidate, ggml_sycl::onednn_pp_unified_scratch_enabled(src0->type), arena_active, pair_bound,
+        w_elems * elem_bytes, a_elems * elem_bytes);
 }
 
 static moe_route_capability ggml_sycl_moe_query_route_capability(
@@ -46337,8 +46402,12 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
         sycl::half * src1_pp_scratch = nullptr;
 #if GGML_SYCL_DNNL
         onednn_pp_scratch_guard legacy_pp_scratch_guard;
-        const bool legacy_pp_scratch_candidate = src0->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_F16 &&
-                                                 ggml_sycl_onednn_pp_candidate(src0, src1, dst, ctx.device);
+        // Admission, type enablement AND plan: an op the planner keeps out of the ONEDNN zone (the LM head), or whose
+        // type the scratch is not enabled for (a K-quant), takes the planned RUNTIME dequant buffers below, which the
+        // graph-entry walk sizes under the same question (ggml_sycl_onednn_pp_scratch_supplies).
+        const bool legacy_pp_scratch_candidate =
+            src0->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_F16 &&
+            ggml_sycl_onednn_pp_scratch_supplies(ctx.device, src0, src1, dst, src1_ncols);
         if (legacy_pp_scratch_candidate) {
             const size_t weights_bytes = static_cast<size_t>(row_diff) * static_cast<size_t>(ne00) * sizeof(sycl::half);
             const size_t activations_bytes =
@@ -66442,12 +66511,50 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                     bool                    using_scratch       = false;
                                     onednn_pp_scratch_guard pp_scratch_guard;
 
+#    if !GGML_SYCL_DEQUANT_F16_ARM
                                     ggml_sycl_pool_alloc<sycl::half> src0_f16_alloc(ctx.pool());
                                     ggml_sycl_pool_alloc<sycl::half> src1_f16_alloc(ctx.pool());
+#    endif
                                     using_scratch = acquire_onednn_pp_scratch(ctx.device, src0->type, weights_bytes,
                                                                               activations_bytes, &weights_scratch,
                                                                               &activations_scratch, pp_scratch_guard);
                                     if (!weights_scratch || !activations_scratch) {
+#    if GGML_SYCL_DEQUANT_F16_ARM
+                                        // llama.cpp-8ony: the oneDNN scratch did not supply this op (an over-zone head,
+                                        // or a type it is not enabled for), so it draws the planned f16 dequant
+                                        // buffers like the legacy arm, sized at graph entry by the walk
+                                        // (ggml_sycl_mul_mat_unified_pp_dequant_route). Route A runs on the context's
+                                        // own in-order queue, the one queue a shared planned buffer is race-free on.
+                                        //
+                                        // Two consequences are deliberate. First, an op the walk counted as SUPPLIED
+                                        // can still reach this draw when acquire refuses it at run time (another
+                                        // context holds the scratch token, or the zone is fragmented and direct
+                                        // growth also fails): the buffers were not sized for it, so the draw grows
+                                        // them inside the RUNTIME zone or, while recording or with the zone full,
+                                        // aborts naming the plan (ggml_sycl_dequant_f16_plan_breach). Second, there
+                                        // is no catch-and-fall back to the unified kernel proper here any more: a
+                                        // capacity failure of a planned buffer is reported, not hidden behind a
+                                        // per-op pool copy.
+                                        size_t src0_region_bytes = 0;
+                                        size_t src1_region_bytes = 0;
+                                        if (!ggml_sycl::zone_dequant_f16_region_bytes(static_cast<int64_t>(src0_elems),
+                                                                                      &src0_region_bytes) ||
+                                            !ggml_sycl::zone_dequant_f16_region_bytes(static_cast<int64_t>(src1_elems),
+                                                                                      &src1_region_bytes)) {
+                                            ggml_sycl_dequant_f16_plan_breach(ctx.device, src0, 0,
+                                                                              "unified route demand overflowed");
+                                        }
+                                        weights_scratch = static_cast<sycl::half *>(ggml_sycl_dequant_f16_scratch(
+                                            ctx.dequant_f16_src0_scratch, ctx.device, *ctx.stream(), src0,
+                                            src0_region_bytes, false));
+                                        activations_scratch = static_cast<sycl::half *>(ggml_sycl_dequant_f16_scratch(
+                                            ctx.dequant_f16_src1_scratch, ctx.device, *ctx.stream(), src0,
+                                            src1_region_bytes, true));
+                                        using_scratch = true;
+#    else
+                                        // The one remaining unplanned per-op pool copy of a whole weight. It exists
+                                        // only for a build without GGML_SYCL_DEQUANT_F16_ARM (oneDNN without
+                                        // GGML_SYCL_F16), a compile-time choice, not an environment variable.
                                         try {
                                             src0_f16_alloc.alloc(src0_elems);
                                             src1_f16_alloc.alloc(src1_elems);
@@ -66459,6 +66566,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                             activations_scratch = nullptr;
                                             using_scratch       = false;
                                         }
+#    endif
                                     }
 
                                     if (weights_scratch && activations_scratch) {
@@ -99642,12 +99750,12 @@ static bool ggml_sycl_mul_mat_kernel_draws_dequant_f16(ggml_sycl_mul_mat_kernel 
 // sized per graph on this path, and nothing here shows the repeated calls are the larger cost.
 using ggml_sycl_kernel_draws_fn = bool (*)(ggml_sycl_mul_mat_kernel);
 
-static bool ggml_sycl_mul_mat_scratch_route(ggml_backend_sycl_context & ctx,
-                                            const ggml_tensor *         src0,
-                                            const ggml_tensor *         src1,
-                                            ggml_tensor *               node,
-                                            ggml_sycl_kernel_draws_fn   draws) {
-    const ggml_sycl::MatmulDecision primary = ctx.matmul_orchestrator.select(src0, src1, node);
+static bool ggml_sycl_mul_mat_scratch_route_decided(ggml_backend_sycl_context &       ctx,
+                                                    const ggml_tensor *               src0,
+                                                    const ggml_tensor *               src1,
+                                                    ggml_tensor *                     node,
+                                                    const ggml_sycl::MatmulDecision & primary,
+                                                    ggml_sycl_kernel_draws_fn         draws) {
     const bool primary_legacy  = primary.valid && primary.backend == ggml_sycl::MatmulBackend::LegacyKernel;
     const bool primary_unified = primary.valid && primary.backend == ggml_sycl::MatmulBackend::UnifiedKernel;
     ggml_sycl::MatmulDecision fallback{};
@@ -99660,6 +99768,15 @@ static bool ggml_sycl_mul_mat_scratch_route(ggml_backend_sycl_context & ctx,
                                                fallback_legacy && draws(fallback.kernel));
 }
 
+static bool ggml_sycl_mul_mat_scratch_route(ggml_backend_sycl_context & ctx,
+                                            const ggml_tensor *         src0,
+                                            const ggml_tensor *         src1,
+                                            ggml_tensor *               node,
+                                            ggml_sycl_kernel_draws_fn   draws) {
+    return ggml_sycl_mul_mat_scratch_route_decided(ctx, src0, src1, node,
+                                                   ctx.matmul_orchestrator.select(src0, src1, node), draws);
+}
+
 static bool ggml_sycl_mul_mat_src1_quantizing_route(ggml_backend_sycl_context & ctx,
                                                     const ggml_tensor *         src0,
                                                     const ggml_tensor *         src1,
@@ -99668,12 +99785,36 @@ static bool ggml_sycl_mul_mat_src1_quantizing_route(ggml_backend_sycl_context & 
 }
 
 // The f16 dequant arm's own route: a node the oneDNN legacy kernels serve, after the same decline the dispatch
-// takes. (The caller has already exempted the oneDNN PP route, which supplies its own copies.)
-static bool ggml_sycl_mul_mat_f16_dequant_route(ggml_backend_sycl_context & ctx,
-                                                const ggml_tensor *         src0,
-                                                const ggml_tensor *         src1,
-                                                ggml_tensor *               node) {
-    return ggml_sycl_mul_mat_scratch_route(ctx, src0, src1, node, ggml_sycl_mul_mat_kernel_draws_dequant_f16);
+// takes. (The caller has already exempted the oneDNN PP route, which supplies its own copies.) `primary` is the
+// router's answer the walk already has for this node.
+static bool ggml_sycl_mul_mat_f16_dequant_route(ggml_backend_sycl_context &       ctx,
+                                                const ggml_tensor *               src0,
+                                                const ggml_tensor *               src1,
+                                                ggml_tensor *                     node,
+                                                const ggml_sycl::MatmulDecision & primary) {
+    return ggml_sycl_mul_mat_scratch_route_decided(ctx, src0, src1, node, primary,
+                                                   ggml_sycl_mul_mat_kernel_draws_dequant_f16);
+}
+
+// llama.cpp-8ony: the unified kernel's own oneDNN f16 route (Route A: the dequant + oneDNN GEMM branch of the unified
+// dispatch) draws the planned f16 dequant buffers when the oneDNN scratch does not supply the op (an over-zone
+// Q4_0 / MXFP4 head or tied embedding), as the legacy arm does. ggml_sycl_mul_mat_scratch_route counts a node the
+// unified kernel serves as not drawing, which is true of the unified kernel proper and false of this branch, so the
+// walk asks this as well, with the answers it already has for the node (the router's `primary`, the PP admission and
+// the supplies verdict from one ggml_sycl_onednn_pp_scratch_supplies call): the same router decision and the same
+// gates as the dispatch (unified dispatch enabled, a type it serves, a plain src1). The dispatch has no precision
+// check on this branch, so the walk must not filter on precision before asking it. A node it over-counts (the
+// branch's own later declines, such as a missing dequant function) reserves bytes bounded by the plan.
+static bool ggml_sycl_mul_mat_unified_pp_dequant_route(const ggml_tensor *               src0,
+                                                       const ggml_tensor *               src1,
+                                                       const ggml_sycl::MatmulDecision & primary,
+                                                       bool                              pp_candidate,
+                                                       bool                              scratch_supplies) {
+    const bool primary_unified = primary.valid && primary.backend == ggml_sycl::MatmulBackend::UnifiedKernel;
+    const bool unified_type    = ggml_sycl_unified_dispatch_enabled() && ggml_sycl::should_use_unified(src0->type);
+    const bool src1_plain      = ggml_is_contiguous(src1) && !ggml_is_transposed(src1) && !ggml_is_permuted(src1);
+    return ggml_sycl::zone_unified_pp_draws_dequant(primary_unified, unified_type, src1_plain, pp_candidate,
+                                                    scratch_supplies);
 }
 
 // llama.cpp-479i: ensure the planned dense MMQ/MMVQ Q8_1 src1 buffer holds the demand of this graph, before
@@ -99854,8 +99995,10 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         }
         const ggml_tensor * src0 = node->src[0];
         const ggml_tensor * src1 = node->src[1];
+        // Precision is NOT filtered here: only the legacy f16 arm requires GGML_PREC_DEFAULT, the unified kernel's
+        // oneDNN f16 route has none, so each arm's own condition is applied below.
         if (!src0 || !src1 || !(src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) ||
-            !ggml_is_contiguous(src0) || node->op_params[0] != GGML_PREC_DEFAULT || ggml_nrows(src1) <= 1) {
+            !ggml_is_contiguous(src0) || ggml_nrows(src1) <= 1) {
             continue;
         }
         const bool need_src0_f16 = src0->type != GGML_TYPE_F16;
@@ -99863,13 +100006,28 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         if (!need_src0_f16 && !need_src1_f16) {
             continue;
         }
-        // oneDNN PP scratch (the legacy_pp_scratch_candidate arm) supplies both copies itself.
-        if (need_src0_f16 && need_src1_f16 && ggml_sycl_onednn_pp_candidate(src0, src1, node, ctx.device)) {
+        // oneDNN PP scratch (the legacy_pp_scratch_candidate arm) supplies both copies itself, but only for an op
+        // that passes the admission, whose type the scratch is enabled for, and whose pair is planned into the
+        // ONEDNN zone (the one question the op arm asks too). The LM head is not planned there, and a K-quant op is
+        // not enabled for it, so those draw these buffers and they must be sized here, at the first graph, not left
+        // empty for the op to find the RUNTIME zone full (llama.cpp-8ony).
+        bool       pp_candidate = false;
+        const bool supplied =
+            need_src0_f16 && need_src1_f16 &&
+            ggml_sycl_onednn_pp_scratch_supplies(ctx.device, src0, src1, node, src1->ne[1], &pp_candidate);
+        if (supplied) {
             continue;
         }
         // The route the dispatch ends up taking, after the same runtime decline of the unified kernel as the Q8
         // walk (a node the unified kernel declines and a oneDNN legacy kernel then serves draws these buffers).
-        if (!ggml_sycl_mul_mat_f16_dequant_route(ctx, src0, src1, node)) {
+        // The unified kernel's own oneDNN f16 route (Route A) draws them too for an op the scratch does not supply,
+        // whatever its precision. The router is asked once per node and its answer shared by both arms.
+        const ggml_sycl::MatmulDecision primary      = ctx.matmul_orchestrator.select(src0, src1, node);
+        const bool                      prec_default = node->op_params[0] == GGML_PREC_DEFAULT;
+        const bool legacy_draws = prec_default && ggml_sycl_mul_mat_f16_dequant_route(ctx, src0, src1, node, primary);
+        const bool unified_draws =
+            ggml_sycl_mul_mat_unified_pp_dequant_route(src0, src1, primary, pp_candidate, supplied);
+        if (!ggml_sycl::zone_walk_f16_node_draws(prec_default, legacy_draws, unified_draws)) {
             continue;
         }
         size_t src0_bytes = 0;

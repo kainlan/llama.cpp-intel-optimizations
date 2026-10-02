@@ -414,6 +414,15 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mmq-src1-plan-source.py
             --self-test)
     set_tests_properties(sycl-mmq-src1-plan-source PROPERTIES LABELS "sycl;memory;planner;host;source-contract")
+    # llama.cpp-8ony: the op arm and the graph-entry walk must ask ONE question -- is the op admitted, enabled for its
+    # type, and planned into the ONEDNN zone the arena was built with -- before sending it to the oneDNN PP scratch,
+    # and the unified kernel's oneDNN f16 route must draw the planned dequant buffers for an op the scratch does not
+    # supply. test-zone-sizing Cases 14a-14d prove the arithmetic. --self-test: most of this gate's checks are
+    # absence- or both-sites checks that a tree with only one consumer wired would still satisfy.
+    add_test(NAME sycl-onednn-pp-scratch-plan-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-onednn-pp-scratch-plan-source.py
+            --self-test)
+    set_tests_properties(sycl-onednn-pp-scratch-plan-source PROPERTIES LABELS "sycl;memory;planner;host;source-contract")
     # llama.cpp-qhfp: no CONCAT rejection in check_graph_compatibility and no host wait in concat.cpp, plus the
     # graph-safe memcpy helper's alignment. Source facts only: whether a graph replays is the GPU witness's job.
     # --self-test: most of its checks are absence-based (no host wait, no recording-guarded wait, no allocation,

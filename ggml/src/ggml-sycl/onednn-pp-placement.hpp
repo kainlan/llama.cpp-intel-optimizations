@@ -113,16 +113,23 @@ enum class onednn_pp_refusal {
 };
 
 struct onednn_pp_admission_inputs {
-    bool    enabled                     = false;
-    bool    skip_type                   = false;
-    int64_t batch                       = 0;  // src1->ne[1]
-    int64_t min_batch                   = 0;  // onednn_pp_min_batch_for(route, ...)
+    bool    type_admitted               = false;  // ggml_sycl_onednn_pp_type_admitted(src0->type)
+    int64_t batch                       = 0;      // src1->ne[1]
+    int64_t min_batch                   = 0;      // onednn_pp_min_batch_for(route, ...)
     bool    f32_operands                = false;
     bool    contiguous_quantized_weight = false;
 };
 
+// The type-level refusal: oneDNN PP is off, or skipped for this weight's type. The ONE statement of it, called by
+// ggml_sycl_onednn_pp_type_admitted alone; that function is the one reader of the two environment terms, and the pure
+// admission below, the dense WOQ second-copy predicate and the zone planner all take their answer from it, so a term
+// added here reaches all three (llama.cpp-8ony).
+inline bool onednn_pp_type_term_refused(bool enabled, bool skip_type) {
+    return !enabled || skip_type;
+}
+
 inline onednn_pp_refusal onednn_pp_admission_decide(const onednn_pp_admission_inputs & in) {
-    if (!in.enabled || in.skip_type) {
+    if (!in.type_admitted) {
         return onednn_pp_refusal::DISABLED_OR_SKIP_TYPE;
     }
     if (in.batch < in.min_batch) {

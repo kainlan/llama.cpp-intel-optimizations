@@ -440,6 +440,9 @@ struct placement_tensor_info {
     // Declared capacities copied into the immutable inventory; never live values.
     uint32_t    planner_n_ubatch  = 0;
     uint32_t    planner_n_seq_max = 0;
+    // The model loader's role for the tensor: consumed only by a row gather (GET_ROWS), so no MUL_MAT scratch is
+    // planned for it (ggml_sycl_tensor_info::get_rows_only).
+    bool        get_rows_only     = false;
 
     placement_tensor_info() = default;
 
@@ -1776,6 +1779,10 @@ void unified_cache_note_zone_full_kv_placement(int device_id, const char * tag, 
 void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out);
 
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
+// The same plan stated as its two halves (the largest dequantized per-layer weight, and the activations half), which
+// also sets the stored sum to their total. The halves are what the first reservation is sized to (llama.cpp-8ony);
+// the reserve's own upward rewrite of the sum leaves them alone.
+void   unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t weights_bytes, size_t activations_bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno
 // round 3, spec-review finding 3). Two getters exist because they answer
@@ -6668,6 +6675,19 @@ size_t compute_moe_effective_weight_bytes(size_t total_weight_bytes,
 //
 // The buffers are reserved from the unified cache budget and reused across all matmuls.
 bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, size_t activations_size);
+
+// llama.cpp-8ony: the most an op's oneDNN PP scratch pair may be for the ONEDNN zone on `device_id` to count it as
+// planned (zone_onednn_pp_pair_bound over the zone's capacity and the zone-plan snapshot ensure_planned_arena_zones
+// stores: the pair's plan and the Graph SDPA floor the zone was sized from, as one figure). False (and *bound
+// untouched) when there is no cache or no active arena, i.e. no zone exists to plan against. This is the one source
+// for "does an op's pair fit what was planned" (zone_onednn_pp_scratch_planned).
+bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound);
+
+// llama.cpp-8ony: whether the oneDNN PP scratch may supply a dense op's f16 copies for a weight of `type`
+// (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH, and the default type set when it is unset). ONE answer for the op arm,
+// the graph-entry walk and the zone-inventory adapter that sizes the dequant plan for the ops the scratch does not
+// supply; the backend must not keep a copy.
+bool onednn_pp_unified_scratch_enabled(ggml_type type);
 
 struct pp_moe_onednn_scratch_result {
     uint32_t   slot            = std::numeric_limits<uint32_t>::max();

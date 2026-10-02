@@ -238,6 +238,12 @@ struct ggml_sycl_tensor_info {
     const char *   name;
     size_t         size;
     enum ggml_type type;
+    // llama.cpp-8ony: true when the model loader's role for this tensor is a row gather (GET_ROWS: the token /
+    // position embedding lookup) and nothing else, so no MUL_MAT scratch is planned for it. False is the default
+    // and means "a MUL_MAT operand or unknown", which is what a producer that never writes the byte has always
+    // implied. Kept in the 4 bytes of padding after `type` so the array stride libllama and libggml-sycl both
+    // index by does not move; rebuild both together all the same.
+    bool           get_rows_only;
     int64_t        ne[GGML_MAX_DIMS];
 };
 
