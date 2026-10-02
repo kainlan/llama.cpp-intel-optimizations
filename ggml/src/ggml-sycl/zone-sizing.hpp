@@ -283,6 +283,17 @@ void zone_onednn_scratch_reserve_target(bool    arena_active,
                                         size_t * weights_bytes,
                                         size_t * activations_bytes);
 
+// The most an op's f16 pair may be for the ONEDNN zone to count it as planned there (the `zone_capacity_bytes` that
+// zone_onednn_pp_scratch_planned compares against). The zone is sized as the primitive-API pair's own plan plus a
+// floor for the oneDNN Graph SDPA scratch that shares it, and the zone is never smaller than a fixed minimum, so
+// its capacity can sit well above both. A pair is admitted up to capacity - floor: that is slack nobody planned
+// for, so admitting it cannot push the Graph SDPA scratch onto its DIRECT path (an unplanned device allocation).
+// It is never admitted below the pair plan itself (a zone clamped so that capacity - floor falls under the plan
+// still holds the plan, which is what the planner's own ops are sized from), and never above the capacity.
+// `bare_plan_bytes` and `graph_floor_bytes` are the stored figures the zone was sized from; neither is recomputed
+// by the caller. A floor larger than the capacity leaves only the plan. Pure.
+size_t zone_onednn_pp_pair_bound(size_t capacity_bytes, size_t bare_plan_bytes, size_t graph_floor_bytes);
+
 // Whether the oneDNN PP scratch is allowed to supply a dense op's f16 copies at all, as a function of the
 // GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH setting and the weight's type (llama.cpp-8ony). `env_mode` is the parsed
 // variable: negative when unset, 0 when it turns the scratch off, positive when it turns it on for every type.

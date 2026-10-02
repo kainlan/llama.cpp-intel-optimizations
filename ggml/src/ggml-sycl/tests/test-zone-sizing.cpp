@@ -825,6 +825,45 @@ int main() {
         CHECK(ggml_sycl::zone_walk_f16_node_draws(false, true, true), "either arm that draws counts the node");
     }
 
+    // ---- Case 14f: the pair bound leaves the Graph SDPA floor free, and never drops below the plan (llama.cpp-8ony) --
+    // The ONEDNN zone is max(256 MiB, plan + floor), so capacity can sit far above plan + floor. A pair is
+    // planned up to capacity - floor (slack nobody else reserved), never below the plan, never above the capacity.
+    {
+        const size_t mib = 1024u * 1024u;
+        // (a) a small-model head (stories15M class): plan ~2 MB, head pair ~19 MB, floor ~10 MB, the 256 MiB zone.
+        {
+            const size_t bound = ggml_sycl::zone_onednn_pp_pair_bound(256 * mib, 2 * mib, 10 * mib);
+            CHECK(bound == 246 * mib, "small model: the bound is capacity minus the floor, well above the plan");
+            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 18 * mib, 1 * mib),
+                  "small model: a 19 MB head pair fits the slack, so it stays supplied by the scratch");
+        }
+        // (b) the Mistral head window: plan 143.5 MB, floor ~33 MB, capacity 256 MiB, head pair 266 MB.
+        {
+            const size_t plan  = 150470656;  // 143.5 MiB
+            const size_t floor = 34603008;   // 33 MiB
+            const size_t bound = ggml_sycl::zone_onednn_pp_pair_bound(256 * mib, plan, floor);
+            CHECK(bound == 256 * mib - floor, "Mistral: the bound is capacity minus the floor");
+            CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 262144000, 4194304),
+                  "Mistral: a 266 MB head pair would eat the Graph SDPA floor, so it is not supplied");
+            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 117440512, 4194304),
+                  "Mistral: a per-layer pair (the plan's own op) is still supplied");
+        }
+        // (c) a clamped zone: capacity - floor falls under the plan, so the bound is exactly the plan.
+        {
+            CHECK(ggml_sycl::zone_onednn_pp_pair_bound(100 * mib, 80 * mib, 50 * mib) == 80 * mib,
+                  "clamped zone: the bound is the plan itself, not capacity minus the floor");
+            CHECK(ggml_sycl::zone_onednn_pp_pair_bound(100 * mib, 80 * mib, 20 * mib) == 80 * mib,
+                  "equal reading: capacity minus the floor equals the plan");
+        }
+        // edges
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(100 * mib, 20 * mib, 0) == 100 * mib, "no floor: the whole capacity");
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(10 * mib, 80 * mib, 50 * mib) == 10 * mib,
+              "never above the capacity, even when the plan is");
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(100 * mib, 20 * mib, 500 * mib) == 20 * mib,
+              "a floor larger than the capacity leaves the plan, with no wrapped subtraction");
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(SIZE_MAX, 0, SIZE_MAX) == 0, "a saturated floor leaves nothing");
+    }
+
     // ---- Case 14: the planned dense scratch is ONE reservation that follows the runtime n_ubatch (llama.cpp-kpjw) --
     // B70, full card, Qwen3.6-27B perplexity (-c 512 gives n_ctx 2048 with 4 sequences, n_batch 2048): the plan was
     // sized at the load-time n_ubatch (512, 10027264 B), auto-ubatch then chose 2048 (40108288 B), and the compute

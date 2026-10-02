@@ -52,6 +52,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--cache", default=str(sycl / "unified-cache.cpp"))
 parser.add_argument("--cache-hpp", default=str(sycl / "unified-cache.hpp"))
+parser.add_argument("--zone-sizing", default=str(sycl / "zone-sizing.cpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -129,7 +130,7 @@ HELPER = "ggml_sycl_onednn_pp_scratch_planned_bytes("
 REUSE_TEST = "if (onednn_weights_scratch_ && onednn_activations_scratch_ && onednn_weights_scratch_size_ >= weights_size"
 
 
-def evaluate(backend, cache, cache_hpp):
+def evaluate(backend, cache, cache_hpp, zone_sizing):
     results = {}
     bytes_helper = function_body(
         backend, r"static bool ggml_sycl_onednn_pp_scratch_planned_bytes\([^)]*\)\s*\{")
@@ -294,11 +295,53 @@ def evaluate(backend, cache, cache_hpp):
         results["the Route A predicate reuses the walk's answers instead of asking again"] = \
             ".select(" not in route_a and "ggml_sycl_onednn_pp_candidate(" not in route_a and \
             "ggml_sycl_onednn_pp_scratch_supplies(" not in route_a
+
+    # ---- the bound: max(stored plan, capacity - stored Graph floor), capped at the capacity; one stored source ----
+    pure = function_body(
+        zone_sizing, r"size_t zone_onednn_pp_pair_bound\([^)]*\)\s*\{")
+    pair_bound = function_body(
+        cache, r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\)\s*\{")
+    results["anchor: the pure pair bound exists"] = pure is not None
+    results["anchor: the pair-bound accessor is defined"] = pair_bound is not None
+    results["the pair-bound accessor is declared"] = \
+        re.search(r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\);", cache_hpp) is not None
+    if pure is not None:
+        pure_norm = re.sub(r"\s+", " ", pure)
+        results["the pure bound subtracts the floor from the capacity"] = \
+            "capacity_bytes - graph_floor_bytes" in pure_norm and "capacity_bytes > graph_floor_bytes" in pure_norm
+        results["the pure bound never drops below the plan (max with the plan)"] = \
+            "std::max(bare_plan_bytes," in pure_norm
+        results["the pure bound never exceeds the capacity (min with the capacity)"] = \
+            "std::min(capacity_bytes," in pure_norm
+    if pair_bound is not None:
+        results["the accessor reads the STORED Graph floor"] = \
+            "onednn_zone_graph_floor_load(" in pair_bound
+        results["the accessor reads the STORED pair plan"] = \
+            "unified_cache_get_planned_onednn_scratchpad_bytes_stored(" in pair_bound
+        results["the accessor reads the arena's real ONEDNN zone capacity"] = \
+            "vram_zone_id::ONEDNN" in pair_bound and "arena_active()" in pair_bound
+        results["the accessor answers through the pure bound"] = "zone_onednn_pp_pair_bound(" in pair_bound
+        results["the accessor does not recompute the floor or read the with-floor plan"] = \
+            "onednn_graph_scratch_zone_floor_bytes" not in pair_bound and \
+            "unified_cache_get_planned_onednn_scratchpad_bytes(" not in pair_bound and \
+            "get_planned_onednn_graph_scratch_shape" not in pair_bound
+    ensure_zones = function_body(cache, r"bool unified_cache::ensure_planned_arena_zones\([^)]*\)\s*\{")
+    results["anchor: ensure_planned_arena_zones exists"] = ensure_zones is not None
+    if ensure_zones is not None:
+        results["both successful zone-sizing exits store the Graph floor they sized the zone with"] = \
+            ensure_zones.count("onednn_zone_graph_floor_store(") >= 2
+    for name, body in (("by-bytes core", bytes_helper),):
+        results["the %s reads the pair bound, not the raw capacity" % name] = \
+            "unified_cache_get_onednn_pp_pair_bound(" in body and "unified_cache_get_onednn_zone_capacity(" not in body
+    sup = function_body(backend, r"static bool ggml_sycl_onednn_pp_scratch_supplies\([^)]*\)\s*\{")
+    if sup is not None:
+        results["the supplies helper reads the pair bound, not the raw capacity"] = \
+            "unified_cache_get_onednn_pp_pair_bound(" in sup and "unified_cache_get_onednn_zone_capacity(" not in sup
     return results
 
 
 def run(label, sources, expect_fail=None):
-    results = evaluate(*sources)
+    results = evaluate(*sources) if len(sources) == 4 else evaluate(*sources, zone_sizing)
     bad = [k for k, v in results.items() if not v]
     if expect_fail is None:
         for k, v in results.items():
@@ -336,11 +379,12 @@ def mutate_in_func(text, signature_regex, old, new):
     return text.replace(body, body.replace(old, new, 1), 1)
 
 
+zone_sizing = strip_comments(Path(args.zone_sizing).read_text())
 backend = strip_comments(Path(args.backend).read_text())
 cache = strip_comments(Path(args.cache).read_text())
 cache_hpp = strip_comments(Path(args.cache_hpp).read_text())
 
-failed = run("tree", (backend, cache, cache_hpp))
+failed = run("tree", (backend, cache, cache_hpp, zone_sizing))
 
 if args.self_test and not failed:
     print("\n--- mutants ---")
