@@ -32,11 +32,15 @@ Outside the wrappers:
     fallback that follows and a success skips it. A caller count that differs from CALLERS fails; when a legitimate caller is
     added, add it there.
 
+Before the if, between the caller's `#if GGML_SYCL_DNNL` line and the if, nothing may leave (return, goto, throw, GGML_ABORT,
+GGML_ASSERT, abort, exit, _Exit, quick_exit, terminate or longjmp): such a statement would skip the wrapper and the fallback
+alike.
+
 Between the if and the `#endif` / `#else` that ends the DNNL section only whitespace and the closing braces of its blocks may
 appear: no statement, goto, throw, abort or else can follow it. When that line is an `#else`, its arm (up to the matching
-`#endif`, nested #if blocks counted) may not contain return, goto, throw, GGML_ABORT, GGML_ASSERT, abort or exit, since the
-build without DNNL would leave before the fallback. That is the shape of all five real callers. Limit: a `return` placed after
-the `#endif`, in the fallback code itself, is not seen; the device test is the only catch for that.
+`#endif`, nested #if blocks counted) may not contain any of the same leaving words, since the build without DNNL would leave
+before the fallback. That is the shape of all five real callers. Limit: a `return` placed after the `#endif`, in the fallback
+code itself, is not seen; the device test is the only catch for that.
 
 Every check is also run against mutants of the same text and each must fail there, so a regex that stopped matching fails the
 gate instead of passing it. A mutant whose anchor text has moved is an assertion error, not a skip. Exit 0 on success, 1 on a
@@ -68,7 +72,8 @@ WRITE = re.compile(r"\bparallel_for\b|\bsingle_task\b|\bmemcpy\b|\bmemmove\b|\bm
                    r"|\btransform\b|\bsubmit\b|\.\s*execute\s*\(|\bdst(?:_f)?\b|\b(?:const|static|reinterpret)_cast\b"
                    r"|\(\s*[\w:\s]+\*\s*\)\s*(?:src\d?|dst)\b|\bdnnl::memory\s*\(")
 # What may not appear in the #else arm of a caller's `#if GGML_SYCL_DNNL` section: any way to leave before the fallback runs.
-LEAVE = re.compile(r"\breturn\b|\bgoto\b|\bthrow\b|\bGGML_ABORT\b|\bGGML_ASSERT\b|\babort\b|\bexit\b")
+LEAVE = re.compile(r"\breturn\b|\bgoto\b|\bthrow\b|\bGGML_ABORT\b|\bGGML_ASSERT\b|\babort\b|\bexit\b|\b_Exit\b|\bquick_exit\b"
+                   r"|\bterminate\b|\blongjmp\b")
 DEAD = (
     (re.compile(r"\beltwise_in_?place\b"), "eltwise_inplace (a forwarder with no caller)"),
     (re.compile(r"\bDnnlReductionWrapper\b"), "DnnlReductionWrapper (an emptied class, deleted by design 4.8)"),
@@ -220,6 +225,12 @@ def check_caller(rel, text):
         errs.append("%s: expected %d call(s) of %s, found %d; a legitimate new caller must be added to CALLERS in this gate"
                     % (rel, want, sym, len(calls)))
     for m in calls:
+        section = [s for s in re.finditer(r"^[ \t]*#[ \t]*if[ \t]+GGML_SYCL_DNNL\b[^\n]*\n", text[:m.start()], re.M)]
+        if not section:
+            errs.append("%s: a call of %s is not inside an `#if GGML_SYCL_DNNL` section" % (rel, sym))
+        elif LEAVE.search(text[section[-1].end():m.start()]):
+            errs.append("%s: code between the `#if GGML_SYCL_DNNL` line and the if around %s can leave (return, goto, throw or "
+                        "abort), skipping both the wrapper and its fallback" % (rel, sym))
         if not re.search(r"\bif\s*\(\s*$", text[:m.start()]):
             errs.append("%s: a call of %s is not directly the condition of an if (a decline must reach the fallback)" % (rel, sym))
             continue
