@@ -106,6 +106,8 @@ SAFE_INTERPRETER_FLAGS = {"-B", "-u", "-s", "-E", "-I", "-O", "-OO", "-P"}
 # pytest and returning its status (tests/CMakeLists.txt). It is the one `-c` that still runs the gate; compare
 # `python -c pass gate.py`.
 PYTEST_STUB = "sys.exit(pytest.main(['-q', sys.argv[1]]))"
+PYTEST_STUB_TEXT = ("import importlib.util\nimport sys\nif importlib.util.find_spec('pytest') is None:\n    sys.exit(77)\n"
+                    "import pytest\n" + PYTEST_STUB + "\n")
 # What scripts/sycl-add-pytest-footer.py appends (two blank lines before the guard: flake8 E305).
 FOOTER = '\n\nif __name__ == "__main__":\n    import sys\n\n    import pytest\n\n    sys.exit(pytest.main([__file__, "-q"]))\n'
 EXIT_CALLS = {"sys.exit", "exit", "quit", "SystemExit", "os._exit"}
@@ -867,6 +869,8 @@ R3_CASES = [
         'if name.startswith("test_") and ENABLED:', *RUN_AND_RECORD_IN_IF]), REG_P_PYTEST, "R3 test-sycl-p.py"),
     ("r3-unittest-main-test-loader", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(testLoader=object())\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
     ("r3-unittest-main-test-runner", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(testRunner=object())\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-unittest-main-kwargs-splat", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(**{"defaultTest": "T.test_nothing"})\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-unittest-main-second-positional", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(__name__, "T.test_nothing")\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
     ("r3-ok-unittest-main-verbosity", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(verbosity=2, failfast=True)\n', REG_P_ADD, None),
     ("r3-ok-loop-callable-and-isinstance", PYTEST_GATE + loop_main("sorted(globals().items())", [
         'if name.startswith("test_") and callable(fn) and not isinstance(fn, type):', *RUN_AND_RECORD_IN_IF]), REG_P_PYTEST, None),
@@ -879,6 +883,14 @@ R3_CASES = [
     ("r3-script-main-assigned-and-printed", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    print(rc)\n', REG_P_ADD, "R3 test-sycl-p.py"),
     ("r3-script-main-and-zero", MAIN_FN + '\nif __name__ == "__main__":\n    sys.exit(main() and 0)\n', REG_P_ADD, "R3 test-sycl-p.py"),
     ("r3-ok-script-main-nested-forwarded", MAIN_FN + '\nif __name__ == "__main__":\n    if len(sys.argv) > 0:\n        sys.exit(main())\n', REG_P_ADD, None),
+    # `if rc:` only vindicates the status when the branch really exits with a failure.
+    ("r3-script-main-if-rc-exits-0", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        sys.exit(0)\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-script-main-if-rc-prints-else-exits-0", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        print("failed")\n    else:\n        sys.exit(0)\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-script-main-if-rc-only-prints", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        print("failed")\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-script-main-if-rc-raises-system-exit-0", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        raise SystemExit(0)\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-ok-script-main-if-not-rc-else-exit", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if not rc:\n        print("ok")\n    else:\n        sys.exit(rc)\n', REG_P_ADD, None),
+    ("r3-ok-script-main-if-rc-raises-failure", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        raise SystemExit(77)\n', REG_P_ADD, None),
+    ("r3-ok-script-main-if-rc-exits-nonzero-else-exits-0", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        sys.exit(rc)\n    else:\n        sys.exit(0)\n', REG_P_ADD, None),
     ("r3-ok-script-main-if-rc-exit", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        sys.exit(rc)\n', REG_P_ADD, None),
     ("r3-ok-loop-exits-only-on-failure", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n'
      '    for name, fn in list(globals().items()):\n        if name.startswith("test_") and callable(fn):\n'
@@ -949,6 +961,9 @@ MATCH_CASES += [
     ("reg-skip-return-code-0", "add_test(NAME o COMMAND python3 " + _M + ")\nset_tests_properties(o PROPERTIES SKIP_RETURN_CODE 0)\n"),
     # An interpreter flag in front of the gate makes python do something other than run it.
     ("reg-interp-m-py-compile", "add_test(NAME o COMMAND python3 -m py_compile " + _M + ")\n"),
+    # A program whose name only STARTS like an interpreter is a wrapper, not python (INTERPRETER must fullmatch).
+    ("reg-interp-name-only-starts-like-python", "add_test(NAME o COMMAND python3-wrapper " + _M + ")\n"),
+    ("reg-interp-path-only-starts-like-python", "add_test(NAME o COMMAND /usr/bin/python3.sh " + _M + ")\n"),
     ("reg-interp-c-pass", "add_test(NAME o COMMAND python3 -c pass " + _M + ")\n"),
     ("reg-interp-help", "add_test(NAME o COMMAND python3 -h " + _M + ")\n"),
     ("reg-interp-version", "add_test(NAME o COMMAND python3 -V " + _M + ")\n"),
@@ -1055,6 +1070,9 @@ llama_test_pytest(${Python3_EXECUTABLE}
         real_count = len(list((Path(__file__).resolve().parents[1] / "tests").glob("test-sycl-*.py")))
         if min_gates_band_problem(MIN_GATES, real_count):
             failures.append(min_gates_band_problem(MIN_GATES, real_count))
+        message = min_gates_band_problem(100, 168) or ""
+        if "168" not in message or "100" not in message or "suggested floor 165" not in message:
+            failures.append("the MIN_GATES message does not name the count and the suggested floor: %r" % message)
         for floor, count, wants_problem in ((100, 168, True), (168, 168, False), (152, 168, False), (151, 168, True), (170, 168, True)):
             if bool(min_gates_band_problem(floor, count)) != wants_problem:
                 failures.append("min_gates_band_problem(%d, %d) %s a problem" % (floor, count, "missed" if wants_problem else "invented"))
@@ -1133,7 +1151,7 @@ def configured_gates(build_dir):
     return ran, property_defects(tests, properties, "R7")
 
 
-def census(root, build_dir, absent_allowlist=None):
+def census(root, build_dir, absent_allowlist=None, tests_dir=None):
     """R7: every gate the CMakeLists.txt files register (R1's static view) is in the configured build's ctest files.
 
     The static audit cannot tell whether CMake reaches a registration: one behind a configuration guard, in an uncalled
@@ -1181,8 +1199,15 @@ CENSUS_BAD_ENTRIES = (
 
 
 def census_self_test(base):
-    """The census reports an unconfigured registration, a stale allowlist entry and an empty build dir."""
+    """The census reports an unconfigured registration, a stale allowlist entry and an empty build dir.
+
+    The ctest files here name their gates under /x/tests, so that is the tests directory the census is told to expect
+    (census(..., tests_dir=)); the real run derives it from the source tree."""
     failures = []
+
+    def run(tree, build, allowlist):
+        return census(tree, build, allowlist, tests_dir="/x/tests")
+
     tree = base / "census-tree"
     write_tree(tree, {"test-sycl-a.py": SCRIPT_GATE, "test-sycl-b.py": SCRIPT_GATE},
                "add_test(NAME a COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-a.py)\n"
@@ -1190,45 +1215,78 @@ def census_self_test(base):
     build = base / "census-build"
     (build / "tests").mkdir(parents=True)
     (build / "tests" / "CTestTestfile.cmake").write_text('add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n')
-    problems = census(tree, build, {})
+    problems = run(tree, build, {})
     if not any("R7 test-sycl-b.py" in p for p in problems) or any("R7 test-sycl-a.py" in p for p in problems):
         failures.append("census: a registration the build did not configure was not (only) reported: %s" % problems)
-    if census(tree, build, {"test-sycl-b.py": "guarded"}):
+    if run(tree, build, {"test-sycl-b.py": "guarded"}):
         failures.append("census: an allowlisted absent gate was still reported")
-    if not any("drop the entry" in p for p in census(tree, build, {"test-sycl-a.py": "reason", "test-sycl-b.py": "r"})):
+    if not any("drop the entry" in p for p in run(tree, build, {"test-sycl-a.py": "reason", "test-sycl-b.py": "r"})):
         failures.append("census: a stale absent-allowlist entry was not reported")
-    if not any("nothing registers it" in p for p in census(tree, build, {"test-sycl-b.py": "r", "test-sycl-ghost.py": "r"})):
+    if not any("nothing registers it" in p for p in run(tree, build, {"test-sycl-b.py": "r", "test-sycl-ghost.py": "r"})):
         failures.append("census: an allowlist entry nothing registers was not reported")
     empty = base / "census-empty"
     empty.mkdir()
-    if not any("not a configured build" in p for p in census(tree, empty, {})):
+    if not any("not a configured build" in p for p in run(tree, empty, {})):
         failures.append("census: an empty build directory passed")
     # a gate that is only in a nested directory's ctest file is still configured
     (build / "tests" / "CTestTestfile.cmake").write_text('add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n')
     nested = build / "ggml" / "src" / "ggml-sycl"
     nested.mkdir(parents=True)
     (nested / "CTestTestfile.cmake").write_text('add_test([=[b]=] "/usr/bin/python3" "/x/tests/test-sycl-b.py")\n')
-    if census(tree, build, {}):
-        failures.append("census: a gate present only in a nested ctest file was reported: %s" % census(tree, build, {}))
+    if run(tree, build, {}):
+        failures.append("census: a gate present only in a nested ctest file was reported: %s" % run(tree, build, {}))
     (nested / "CTestTestfile.cmake").unlink()
     # What the build contains must RUN the gate: each of these names the file without running it, or runs it disabled.
     for label, text in CENSUS_BAD_ENTRIES:
         (build / "tests" / "CTestTestfile.cmake").write_text(
             'add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n' + text)
-        if not any("R7 test-sycl-b.py" in p for p in census(tree, build, {})):
+        if not any("R7 test-sycl-b.py" in p for p in run(tree, build, {})):
             failures.append("census: %s counted as the gate being configured" % label)
     (build / "tests" / "CTestTestfile.cmake").write_text(
         'add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n'
         'add_test([=[b]=] "/usr/bin/python3" "-B" "/x/tests/test-sycl-b.py" "--self-test")\n'
         'set_tests_properties([=[b]=] PROPERTIES  LABELS "x" SKIP_RETURN_CODE "77" TIMEOUT "30")\n')
-    if census(tree, build, {}):
+    if run(tree, build, {}):
         failures.append("census: a configured gate with flags, arguments and harmless properties was reported: %s"
-                        % census(tree, build, {}))
+                        % run(tree, build, {}))
     (build / "tests" / "CTestTestfile.cmake").write_text(
         'add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n'
-        'add_test([=[b]=] "/usr/bin/python3" "-c" "import pytest\\n' + PYTEST_STUB + '\\n" "/x/tests/test-sycl-b.py")\n')
-    if census(tree, build, {}):
-        failures.append("census: llama_test_pytest's `-c <pytest stub>` form was reported: %s" % census(tree, build, {}))
+        'add_test([=[b]=] "/usr/bin/python3" "-c" "' + PYTEST_STUB_TEXT + '" "/x/tests/test-sycl-b.py")\n')
+    if run(tree, build, {}):
+        failures.append("census: llama_test_pytest's `-c <pytest stub>` form was reported: %s" % run(tree, build, {}))
+    # A path is not a name: the gate must be the file in the tests directory, not a same-named file elsewhere.
+    for label, entry in (("a same-named file in another directory", '/x/stale/test-sycl-b.py'),
+                         ("a same-named file in a subdirectory of tests", '/x/tests/old/test-sycl-b.py'),
+                         ("a relative path that resolves elsewhere", '/x/tests/../stale/test-sycl-b.py')):
+        (build / "tests" / "CTestTestfile.cmake").write_text(
+            'add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n'
+            'add_test([=[b]=] "/usr/bin/python3" "%s")\n' % entry)
+        if not any("R7 test-sycl-b.py" in p for p in run(tree, build, {})):
+            failures.append("census: %s counted as the gate being configured" % label)
+    (build / "tests" / "CTestTestfile.cmake").write_text(
+        'add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n'
+        'add_test([=[b]=] "/usr/bin/python3" "/x/stale/../tests/test-sycl-b.py")\n')
+    if run(tree, build, {}):
+        failures.append("census: a path that normalises into the tests directory was reported: %s" % run(tree, build, {}))
+    # The pytest stub must be exactly what llama_test_pytest writes: a script that merely contains its last line is not it.
+    for label, stub in (("the stub preceded by a statement that exits 0", "import os\nos._exit(0)\n" + PYTEST_STUB_TEXT),
+                        ("only the stub's last line", PYTEST_STUB),
+                        ("the stub with its skip guard removed", PYTEST_STUB_TEXT.replace("    sys.exit(77)", "    pass"))):
+        (build / "tests" / "CTestTestfile.cmake").write_text(
+            'add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n'
+            'add_test([=[b]=] "/usr/bin/python3" "-c" "%s" "/x/tests/test-sycl-b.py")\n' % stub)
+        if not any("R7 test-sycl-b.py" in p for p in run(tree, build, {})):
+            failures.append("census: `-c` with %s counted as the pytest stub" % label)
+    # A gate in a directory below one that has its own CTestTestfile.cmake is still found (the walk must not stop at
+    # the first directory with a ctest file).
+    (build / "tests" / "CTestTestfile.cmake").write_text('add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n')
+    below = build / "tests" / "deeper" / "still"
+    below.mkdir(parents=True)
+    (build / "tests" / "deeper" / "CTestTestfile.cmake").write_text("# no tests of its own\n")
+    (below / "CTestTestfile.cmake").write_text('add_test([=[b]=] "/usr/bin/python3" "/x/tests/test-sycl-b.py")\n')
+    if run(tree, build, {}):
+        failures.append("census: a gate below a directory that has its own ctest file was reported: %s" % run(tree, build, {}))
+    shutil.rmtree(build / "tests" / "deeper")
     # main() must act on the census: run the script itself against a build dir that cannot pass.
     done = subprocess.run([sys.executable, os.path.abspath(__file__), "--census", str(empty)], capture_output=True, text=True,
                           timeout=120)
