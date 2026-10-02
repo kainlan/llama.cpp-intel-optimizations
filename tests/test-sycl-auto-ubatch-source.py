@@ -830,14 +830,10 @@ def _settle_block(body_norm: str) -> str:
 
 
 def _settle_reserve_is_unguarded(body_norm: str) -> bool:
-    # llama.cpp-kpjw: the settle PUBLISH now carries a catch (see _settle_publish_catch_never_swallows), so the
-    # reserve is judged on what follows its own `sched_need_reserve = true;`, which must hold no try/catch at all.
+    # llama.cpp-kpjw: the settle PUBLISH is recorded rather than thrown (see _settle_refusal_is_never_swallowed), so
+    # the reserve is the `else` of that refusal branch and must hold no try/catch of its own.
     settle = _settle_block(body_norm)
-    flag_at = settle.rfind("sched_need_reserve = true;")
-    if flag_at == -1:
-        return False
-    tail = settle[flag_at:]
-    return "sched_reserve();" in tail and "try" not in tail and "catch" not in tail
+    return re.search(r"\} else \{ sched_need_reserve = true; sched_reserve\(\); \}", settle) is not None
 
 
 def test_settle_reserve_is_not_wrapped_in_try_catch():
@@ -855,7 +851,7 @@ def test_settle_reserve_unguarded_check_has_a_mutation_witness():
     """Mutation witness for the check above: wrapping the settle's reserve
     in try/catch must make it fail."""
     raw = LLAMA_CONTEXT_CPP
-    settle_reserve = "        sched_need_reserve = true;\n        sched_reserve();\n    }\n"
+    settle_reserve = "        } else {\n            sched_need_reserve = true;\n            sched_reserve();\n        }\n    }\n"
     # opt_init() carries the same three lines, so count and mutate only
     # inside the trial.
     start = raw.find(_TRIAL_START)
@@ -866,10 +862,12 @@ def test_settle_reserve_unguarded_check_has_a_mutation_witness():
     )
     mutated_raw = raw[:start] + raw[start:end].replace(
         settle_reserve,
-        "        sched_need_reserve = true;\n"
-        "        try {\n"
-        "            sched_reserve();\n"
-        "        } catch (const std::exception &) {\n"
+        "        } else {\n"
+        "            sched_need_reserve = true;\n"
+        "            try {\n"
+        "                sched_reserve();\n"
+        "            } catch (const std::exception &) {\n"
+        "            }\n"
         "        }\n"
         "    }\n",
         1,
@@ -1369,60 +1367,71 @@ def _balanced_braces(text: str, open_at: int) -> str:
     raise AssertionError("unbalanced braces")
 
 
-def _settle_publish_catch_never_swallows(body_norm: str) -> bool:
-    """The settle publish's refusal must still propagate (today's behaviour for a context that does not fit at all).
-    llama.cpp-kpjw lets exactly one catch exist around it, and only to NAME the refusal when the downward
-    continuation already ran and found nothing: the catch rethrows unchanged unless descent_ran, and otherwise
-    throws a runtime_error. It must hold no return and no other way to swallow the exception."""
+def _settle_refusal_is_never_swallowed(body_norm: str) -> bool:
+    """The settle publish's refusal must still leave the trial unless a smaller rung won. llama.cpp-kpjw (g7) records
+    it instead of throwing it (the catch holds exactly the recording, nothing that could swallow it), and the
+    `if (settle_error)` branch either adopts a rung that fit (`won != 0`) or ends in a throw: the race rethrow or the
+    named runtime_error. It holds no return, and nothing else lets control reach the reserve."""
     settle_at = body_norm.find("if (!sched_matches_last_good")
     if settle_at == -1:
         return False
     settle = body_norm[settle_at:]
-    publish_at = settle.find("sycl_resync_runtime_context_flash_attn();")
-    if publish_at == -1 or "try {" not in settle[:publish_at + 1]:
-        return False
     catch_marker = "} catch (const std::exception & e) {"
-    catch_at = settle.find(catch_marker, publish_at)
+    catch_at = settle.find(catch_marker)
     if catch_at == -1 or settle.count("catch") != 1:
         return False
-    catch_body = _balanced_braces(settle, catch_at + len("} catch (const std::exception & e) ") )
-    inner = catch_body[1:-1].strip()
+    catch_body = _balanced_braces(settle, catch_at + len("} catch (const std::exception & e) "))
+    if catch_body[1:-1].strip() != "settle_error = std::current_exception(); settle_refusal = e.what();":
+        return False
+    refused_at = settle.find("if (settle_error) {")
+    if refused_at == -1:
+        return False
+    refused = _balanced_braces(settle, refused_at + len("if (settle_error) "))
+    won_at = refused.find("if (won != 0) {")
+    if won_at == -1:
+        return False
+    won_block = _balanced_braces(refused, won_at + len("if (won != 0) "))
+    tail = refused[won_at + len("if (won != 0) ") + len(won_block):].strip()
+    if not tail.startswith("else {"):
+        return False
+    else_block = _balanced_braces(tail, len("else "))
     return (
-        inner.startswith("if (!descent_ran) { throw; }")
-        and "throw std::runtime_error(" in inner
-        and inner.count("throw") == 2
-        and "return" not in inner
+        "std::rethrow_exception(settle_error);" in else_block
+        and else_block.count("throw std::runtime_error(") == 1
+        and else_block.rstrip().endswith("));" + " }")
+        and "return" not in refused.replace("return rung_stop == nullptr;", "")
     )
 
 
-def test_settle_publish_catch_never_swallows():
-    """The settle publish may carry one catch, and only to name the refusal (llama.cpp-kpjw); any swallow would turn
-    a context that does not fit into a silent success, so the catch must rethrow (unchanged unless the descent ran)
-    or throw, and hold no return."""
-    assert _settle_publish_catch_never_swallows(_normalize_ws(_trial_body())), (
-        "the settle publish's catch must rethrow unless descent_ran, otherwise throw a named runtime_error, "
-        "and hold no return -- its refusal must propagate"
+def test_settle_refusal_is_never_swallowed():
+    """A refusal of the settle publish is recorded, and the branch that holds it ends in a rung that fit or a throw;
+    any swallow would turn a context that does not fit into a silent success."""
+    assert _settle_refusal_is_never_swallowed(_normalize_ws(_trial_body())), (
+        "the settle publish's catch must only record the refusal, and the refusal branch must adopt a winner or "
+        "rethrow/throw, with no return"
     )
 
 
-@pytest.mark.parametrize("mutation", ["swallow-when-no-descent", "swallow-always", "return-instead-of-throw"])
-def test_settle_publish_catch_has_a_mutation_witness(mutation):
-    """Mutation witness for the check above: a catch that stops rethrowing when the descent did not run, a catch that
-    swallows, or one that returns, must each make it fail."""
+@pytest.mark.parametrize("mutation", ["catch-records-nothing", "named-throw-deleted", "return-in-refusal"])
+def test_settle_refusal_has_a_mutation_witness(mutation):
+    """Mutation witness for the check above: a catch that records nothing (the refusal vanishes), a refusal branch whose
+    named throw is gone, and one that returns, must each make it fail."""
     raw = LLAMA_CONTEXT_CPP
-    rethrow = "                if (!descent_ran) {\n                    throw;\n                }\n"
-    assert raw.count(rethrow) == 1, "mutation target not found -- update this witness to match the real source"
-    if mutation == "swallow-when-no-descent":
-        mutated_raw = raw.replace(rethrow, "", 1)
-    elif mutation == "swallow-always":
-        mutated_raw = raw.replace(rethrow, "                if (!descent_ran) {\n                    return;\n                }\n", 1)
+    record = "                settle_error   = std::current_exception();\n"
+    assert raw.count(record) == 1, "mutation target not found -- update this witness to match the real source"
+    named = '                throw std::runtime_error(format(\n                    "auto n_ubatch: no -ub from'
+    assert raw.count(named) == 1, "mutation target not found -- update this witness to match the real source"
+    if mutation == "catch-records-nothing":
+        mutated_raw = raw.replace(record, "", 1)
+    elif mutation == "named-throw-deleted":
+        mutated_raw = raw.replace(named, named.replace("throw std::runtime_error(format(", "(void) (format("), 1)
     else:
-        marker = "                throw std::runtime_error(format(\n                    \"auto n_ubatch: no -ub from"
+        marker = "                // A race (the model went away"
         assert raw.count(marker) == 1, "mutation target not found -- update this witness to match the real source"
-        mutated_raw = raw.replace(marker, marker.replace("throw std::runtime_error(format(", "return (void) (format("), 1)
+        mutated_raw = raw.replace(marker, "                return;\n" + marker, 1)
     assert mutated_raw != raw
-    assert not _settle_publish_catch_never_swallows(_body_of(mutated_raw, _TRIAL_START, _TRIAL_END)), (
-        "mutation witness is broken: the mutant should make the settle publish catch check fail"
+    assert not _settle_refusal_is_never_swallowed(_body_of(mutated_raw, _TRIAL_START, _TRIAL_END)), (
+        "mutation witness is broken: the mutant should make the settle refusal check fail"
     )
 
 
@@ -1541,7 +1550,7 @@ def test_settle_publish_gate_has_a_mutation_witness():
     # The settle block as it stands (its publish carries the kpjw catch, which is the part of the text this witness
     # does not care about), cut out of the source rather than copied so the witness follows the real shape.
     settle_open = "    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {\n"
-    settle_close = "        sched_need_reserve = true;\n        sched_reserve();\n    }\n"
+    settle_close = "        } else {\n            sched_need_reserve = true;\n            sched_reserve();\n        }\n    }\n"
     trial_at = raw.find(_TRIAL_START)
     open_at = raw.find(settle_open, trial_at)
     close_at = raw.find(settle_close, open_at)

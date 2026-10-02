@@ -993,17 +993,11 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
     results["a rung that lost is only lowered from when the default itself was tried (a non-rung default is not skipped)"] = \
         0 < stop_race_at < (descent_m.start() if descent_m else 0) and \
         re.search(r"if\s*\(\s*c\s*==\s*fallback_ubatch\s*\)\s*\{\s*fallback_tried\s*=\s*true\s*;\s*\}\s*tried\s*\+=", select_fn) is not None
-    results["a lowered result is announced and is not persisted as a tuning-cache entry"] = \
-        "auto n_ubatch lowered from %u to %u" in descent_block and \
+    results["a lowered result is announced once, after the settle, and is not persisted as a tuning-cache entry"] = \
+        re.search(r"lowered_cause\s*=\s*format\(\s*\"the default did not fit \(%s\)\"\s*,\s*stop\s*\)", descent_block) is not None and \
+        re.search(r"if\s*\(\s*lowered_from\s*!=\s*0\s*\)\s*\{\s*LLAMA_LOG_WARN\(\s*\"\[SYCL-PLAN\] auto n_ubatch lowered from %u to %u: %s;", select_fn) is not None and \
+        select_fn.count("auto n_ubatch lowered from %u to %u") == 1 and \
         re.search(r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*lowered_from\s*==\s*0\s*&&", select_fn) is not None
-    settle_try = re.search(r"if\s*\(\s*need_publish\s*\)\s*\{\s*try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\)\s*;\s*\}\s*catch\s*\(\s*const std::exception\s*&\s*e\s*\)\s*\{", select_fn)
-    settle_catch = balanced_block(select_fn, settle_try.end() - 1) if settle_try else ""
-    results["when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code"] = \
-        settle_try is not None and \
-        re.search(r"if\s*\(\s*!descent_ran\s*\)\s*\{\s*throw\s*;\s*\}", settle_catch) is not None and \
-        "throw std::runtime_error(" in settle_catch and "no -ub from %u down to %u fits this context" in settle_catch and \
-        "largest -ub that fits is about" in settle_catch and "llama_auto_ubatch_descent_floor" in settle_catch and \
-        re.search(r"refusal_largest_ub\s*=\s*rung_largest_ub\s*;", try_fn) is not None
     # kpjw-g7: the descent above only runs when NOTHING at or above the default won. The B50 run never got there: the
     # default 512 won the ladder (the realized check reads the card before the buffers are touched), 1024 was refused
     # at its probe, and the SETTLE then republished the winner, where the transaction-time bound (plan + the 495 MB
@@ -1019,13 +1013,14 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
     results["a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial"] = \
         settle_at > 0 and refused_m is not None and \
         re.search(r"std::exception_ptr\s+settle_error\s*;", settle_blk) is not None and \
-        re.search(r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\)\s*;\s*\}\s*catch\s*\(\s*const std::exception\s*&\s*\)\s*\{\s*"
-                  r"settle_error\s*=\s*std::current_exception\(\)\s*;\s*\}", settle_blk) is not None and \
+        re.search(r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\)\s*;\s*\}\s*catch\s*\(\s*const std::exception\s*&\s*e\s*\)\s*\{\s*"
+                  r"settle_error\s*=\s*std::current_exception\(\)\s*;\s*settle_refusal\s*=\s*e\.what\(\)\s*;\s*\}", settle_blk) is not None and \
         re.search(r"const uint32_t\s+refused_ub\s*=\s*last_good\s*;", refused_blk) is not None and \
         re.search(r"llama_auto_ubatch_settle_refusal_descend\(\s*refused_ub\s*,\s*descent_ran\s*,\s*cap\s*,", refused_blk) is not None and \
-        re.search(r"return try_candidate\(c\)\s*==\s*nullptr\s*;", refused_blk) is not None and \
+        re.search(r"rung_stop\s*=\s*try_candidate\(c\)\s*;\s*return rung_stop\s*==\s*nullptr\s*;", refused_blk) is not None and \
         re.search(r"last_good\s*=\s*won\s*;", refused_blk) is not None and \
         re.search(r"lowered_from\s*=\s*refused_ub\s*;", refused_blk) is not None and \
+        re.search(r"lowered_cause\s*=\s*format\(\s*\"the settle at %u was refused \(%s\)\"", refused_blk) is not None and \
         re.search(r"sycl_hold_spill_validated_ub\s*=\s*hold_spill_validated_ub\s*;", refused_blk) is not None and \
         re.search(r"std::rethrow_exception\(\s*settle_error\s*\)", refused_blk) is not None and \
         "throw std::runtime_error(" in refused_blk and "no -ub from %u down to %u fits this context" in refused_blk and \
@@ -1033,6 +1028,11 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
         re.search(r"\}\s*else\s*\{\s*sched_need_reserve\s*=\s*true\s*;\s*sched_reserve\(\)\s*;\s*\}", settle_blk) is not None
     results["the tuning-cache store runs after the settle, so a rung the settle refused is never persisted"] = \
         settle_at > 0 and store_at > settle_at
+    results["when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code"] = \
+        refused_m is not None and \
+        "throw std::runtime_error(" in refused_blk and "no -ub from %u down to %u fits this context" in refused_blk and \
+        "largest -ub that fits is about" in refused_blk and "llama_auto_ubatch_descent_floor" in refused_blk and \
+        re.search(r"refusal_largest_ub\s*=\s*rung_largest_ub\s*;", try_fn) is not None
     # r5 R7/R8: releasing the previous rung's buffers means the cached graph results too, not only the sched.
     results["the release drops every cached graph result and the active pointer, not only the sched"] = \
         re.search(r"for\s*\(\s*auto\s*&\s*res\s*:\s*gf_res_prev\s*\)\s*\{\s*res\.reset\(\)\s*;\s*\}", try_fn[:probe_at]) is not None and \
@@ -1785,12 +1785,30 @@ if args.self_test:
                 new_ctx=re.sub(r"last_good\s*=\s*won\s*;", "(void) won;", context_src, count=1)),
         ctx_mut("descent loser counted as a winner", "the trial continues downward when the default rung and everything above it lost, and not for a race",
                 new_ctx=re.sub(r"return try_candidate\(c\)\s*==\s*nullptr\s*;", "return try_candidate(c) != nullptr;", context_src, count=1)),
-        ctx_mut("lowered result stored in the tuning cache", "a lowered result is announced and is not persisted as a tuning-cache entry",
+        ctx_mut("lowered result stored in the tuning cache", "a lowered result is announced once, after the settle, and is not persisted as a tuning-cache entry",
                 new_ctx=re.sub(r"lowered_from\s*==\s*0\s*&&\s*", "", context_src, count=1)),
-        ctx_mut("lowered result not announced", "a lowered result is announced and is not persisted as a tuning-cache entry",
+        ctx_mut("lowered result not announced", "a lowered result is announced once, after the settle, and is not persisted as a tuning-cache entry",
                 new_ctx=context_src.replace("auto n_ubatch lowered from %u to %u", "auto n_ubatch XXXX", 1)),
-        ctx_mut("settle refusal swallowed when the descent did not run", "when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code",
-                new_ctx=re.sub(r"if\s*\(\s*!descent_ran\s*\)\s*\{\s*throw\s*;\s*\}", "", context_src, count=1)),
+        ctx_mut("settle refusal thrown instead of recorded (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+                new_ctx=re.sub(r"settle_error\s*=\s*std::current_exception\(\)\s*;", "throw;", context_src, count=1)),
+        ctx_mut("settle refusal never descends (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+                new_ctx=re.sub(r"llama_auto_ubatch_settle_refusal_descend\(\s*refused_ub\s*,", "llama_auto_ubatch_XXXX(refused_ub,", context_src, count=1)),
+        ctx_mut("settle descent starts from the default, not the refused rung (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+                new_ctx=re.sub(r"llama_auto_ubatch_settle_refusal_descend\(\s*refused_ub\s*,", "llama_auto_ubatch_settle_refusal_descend(fallback_ubatch,", context_src, count=1)),
+        ctx_mut("settle descent forgets that the continuation ran (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+                new_ctx=re.sub(r"refused_ub\s*,\s*descent_ran\s*,\s*cap", "refused_ub, false, cap", context_src, count=1)),
+        ctx_mut("settle descent winner not adopted (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+                new_ctx=mutate_re_in_func(context_src, r"if \(settle_error\) \{", r"last_good\s*=\s*won\s*;", "(void) won;")),
+        ctx_mut("settle descent winner not marked lowered (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+                new_ctx=re.sub(r"lowered_from\s*=\s*refused_ub\s*;", "(void) 0;", context_src, count=1)),
+        ctx_mut("settle descent loses the validated -ub (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+                new_ctx=mutate_after(context_src, "if (settle_error) {", "sycl_hold_spill_validated_ub = hold_spill_validated_ub;", "(void) 0;")),
+        ctx_mut("settle race is swallowed into the named error (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+                new_ctx=re.sub(r"std::rethrow_exception\(\s*settle_error\s*\)", "(void) 0", context_src, count=1)),
+        ctx_mut("settle reserve skipped when the publish was fine (g7)", "a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial",
+                new_ctx=re.sub(r"\}\s*else\s*\{\s*sched_need_reserve\s*=\s*true\s*;\s*sched_reserve\(\)\s*;\s*\}", "} else { }", context_src, count=1)),
+        ctx_mut("cache store ahead of the settle (g7)", "the tuning-cache store runs after the settle, so a rung the settle refused is never persisted",
+                new_ctx=context_src.replace("if (!sched_matches_last_good || cparams.n_ubatch != last_good) {", "cache_store_fn(&cache_key, 0, stop); if (!sched_matches_last_good || cparams.n_ubatch != last_good) {", 1)),
         ctx_mut("settle refusal unnamed", "when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code",
                 new_ctx=context_src.replace("no -ub from %u down to %u fits this context", "XXXX", 1)),
         ctx_mut("settle refusal names no -ub", "when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code",

@@ -42,6 +42,17 @@ template <typename F> inline uint32_t llama_auto_ubatch_descend(uint32_t fallbac
     return 0;
 }
 
+// llama.cpp-kpjw (kpjw-g7): the settle republishes the rung that won the ladder, and that publish is a fit check of its
+// own (the transaction-time spill bound, read against a card the winner's own reserve has since been released from),
+// so it can refuse a winner the ladder accepted. A refused winner is a refused rung: what lies below it is tried, with
+// the same walk and the same per-rung validation the continuation uses. The continuation having already run means
+// every rung under the default has been asked and lost, so nothing is asked twice. Returns the rung that fits, 0 when
+// none does.
+template <typename F>
+inline uint32_t llama_auto_ubatch_settle_refusal_descend(uint32_t refused, bool descent_ran, uint32_t cap, F try_rung) {
+    return descent_ran ? 0 : llama_auto_ubatch_descend(refused, cap, try_rung);
+}
+
 // True iff some rung of `ladder` lies in [ubatch_floor, ubatch_cap]. The
 // trial's ladder loop skips every rung below `ubatch_floor` (the caller's own
 // n_ubatch, which the trial never shrinks) and stops at the first rung above

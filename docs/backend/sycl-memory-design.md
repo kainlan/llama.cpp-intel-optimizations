@@ -2592,6 +2592,16 @@ lookup refuses any value under the ladder's first rung, so it could only be a mi
 trial and still refuses by name. When no rung down to the floor fits, the settle's own refusal is rethrown as a named
 error (`no -ub from %u down to %u fits this context`) carrying the `largest -ub that fits is about N` the last spill
 refusal computed (or saying none is known), not a bare result code.
+The continuation is not only for a default that lost the ladder. The settle republishes the rung that won, and that
+publish is a fit check of its own: the transaction-time spill bound, read against a card the winner's own reserve has
+since been released from (the next rung's `try_candidate` releases it). It can refuse a rung the ladder accepted, because
+the ladder's realized check reads the card before the buffers are touched. B50, Qwen, `-c 512`, auto: 512 won, 1024 was
+refused at its probe, the settle at 512 was refused (470.0 MB worst-case spill, 132.7 MB left of 602.7 MB, under the
+256 MB headroom), and `last_good` was 512, not 0, so the first version of the continuation never ran. The settle now
+records its refusal instead of throwing it, and tries what lies below the refused rung through the same
+`try_candidate` (`llama_auto_ubatch_settle_refusal_descend`; not repeated when the continuation already ran). A race
+(busy, not the published model) leaves as it came. The tuning-cache store runs after the settle, so a rung the settle
+refused is never persisted.
 
 Two defects found on the way are tickets, not part of this change: the process hang after a graph fails with
 "CPU fallback also failed" (`llama.cpp-8dd9`, inside the cleanup block of the `ggml_sycl_fallback_error` handler in
