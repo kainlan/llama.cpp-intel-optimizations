@@ -712,12 +712,12 @@ static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_D
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_pair_weights_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_pair_activations_bytes[GGML_SYCL_MAX_DEVICES]{};
-// llama.cpp-8ony: the two figures the current ONEDNN zone was sized from -- the pair's own plan and the Graph SDPA floor
-// that shares the zone -- kept together as ONE snapshot, written by unified_cache::ensure_planned_arena_zones when it
-// keeps or builds the zone. The planner's live figures are overwritten by every model's plan (and the pair's upward by
-// reserve), and the SDPA shape the floor derives from is rewritten by runtime plans the zone was not rebuilt for, so
-// neither can describe a zone that was built earlier: a draft model loaded beside the target would hand a bound
-// derived from the draft's figures to the target's zone.
+// llama.cpp-8ony: the two figures the current ONEDNN zone was sized from -- the pair's own plan and the Graph SDPA
+// floor that shares the zone -- kept together as ONE snapshot, written by unified_cache::ensure_planned_arena_zones
+// when it keeps or builds the zone. The planner's live figures are overwritten by every model's plan (and the pair's
+// upward by reserve), and the SDPA shape the floor derives from is rewritten by runtime plans the zone was not rebuilt
+// for, so neither can describe a zone that was built earlier: a draft model loaded beside the target would hand a
+// bound derived from the draft's figures to the target's zone.
 static std::mutex            g_onednn_zone_plan_mutex;
 static zone_onednn_plan      g_onednn_zone_plan[GGML_SYCL_MAX_DEVICES]{};
 
@@ -735,6 +735,17 @@ static zone_onednn_plan onednn_zone_plan_load(int device_id) {
     }
     std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
     return g_onednn_zone_plan[device_id];
+}
+
+// Raise the stored figures to the component-wise maximum with `plan`, in ONE critical section. A load, a keep and a
+// store taken separately would let two contexts planning on one device each read the same snapshot and the later store
+// drop the other's larger figure. Takes the mutex itself, so it must not call the accessors above.
+static void onednn_zone_plan_keep_and_store(int device_id, const zone_onednn_plan & plan) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
+    g_onednn_zone_plan[device_id] = zone_onednn_plan_keep(g_onednn_zone_plan[device_id], plan);
 }
 
 // The most an op's f16 pair may be for the ONEDNN zone of capacity `capacity_bytes` on `device_id` to count it as
@@ -5247,7 +5258,6 @@ bool unified_cache::ensure_planned_arena_zones() {
     // described by afterwards (the snapshot stored at both successful exits
     // below).
     const zone_onednn_plan live_plan           = onednn_planned_pair_and_floor(dev_id);
-    const size_t           planned_onednn_bare = live_plan.bare_bytes;
     const size_t           planned_onednn_zone = live_plan.bare_bytes + live_plan.graph_floor_bytes;
     if (planned_onednn_zone > onednn_zone) {
         onednn_zone = planned_onednn_zone;
@@ -5272,6 +5282,7 @@ bool unified_cache::ensure_planned_arena_zones() {
     // own, so clamping the shared zone below what IT alone needs would starve
     // the primitive-API GEMM path, not just the Graph-scratch floor this
     // clamp exists to bound.
+    const size_t planned_onednn_bare    = live_plan.bare_bytes;
     const size_t onednn_zone_budget_cap = std::max(available_budget() / 4, planned_onednn_bare);
     if (onednn_zone > onednn_zone_budget_cap) {
         const size_t shortfall = onednn_zone - onednn_zone_budget_cap;
@@ -5354,7 +5365,7 @@ bool unified_cache::ensure_planned_arena_zones() {
 #endif
             // The zone is kept as it was built, so it stays described by the larger of the figures it was built from
             // and this plan's: a later, smaller plan (a draft model beside the target) must not shrink them.
-            onednn_zone_plan_store(dev_id, zone_onednn_plan_keep(onednn_zone_plan_load(dev_id), live_plan));
+            onednn_zone_plan_keep_and_store(dev_id, live_plan);
             return true;
         }
 
@@ -27911,13 +27922,12 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
                 desc.mmq_src1_bytes_per_token = bytes_per_token;
             }
         }
-        // llama.cpp-479i: f16 bytes the f16 dequant arm materializes for a dense weight. The
-        // planned candidate set is Q8_0: ONEDNN_SOA / ONEDNN_COALESCED are the planned route for its
-        // materialized layouts and are selected whatever GGML_SYCL_ONEDNN_PP says, so they are the
-        // consumer that was observed minting per-op copies. Another type reaching the arm (an AOS-layout
-        // fallback) is not planned here: the graph-entry walk finds it from the graph's own nodes and
-        // grows the buffer inside the RUNTIME zone, or refuses by name. Experts are excluded by the same
-        // role function as above.
+        // llama.cpp-479i: f16 bytes the f16 dequant arm materializes for a dense weight. Q8_0 is planned
+        // UNCONDITIONALLY: ONEDNN_SOA / ONEDNN_COALESCED are the route for its materialized layouts and are selected
+        // whatever GGML_SYCL_ONEDNN_PP says, so they were the consumer observed minting per-op copies. Q4_0 and MXFP4
+        // are planned CONDITIONALLY, in the next block (llama.cpp-8ony). Any other type reaching the arm (an AOS-layout
+        // fallback) is not planned: the graph-entry walk finds it from the graph's own nodes and grows the buffer
+        // inside the RUNTIME zone, or refuses by name. Experts are excluded by the same role function as above.
         if (item.has_shape() && item.type == GGML_TYPE_Q8_0 &&
             expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
             size_t weight_bytes = 0;
@@ -27935,9 +27945,16 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // one of those is decided by the pure classifier, which alone sees the group cardinality the zone's own
         // eligibility rule needs; the adapter supplies the sizes and the type/env enablement. Experts are excluded
         // by the same role function as above.
-        // The reservation is unconditional until llama.cpp-fkpg delivers n_outputs to the planner: whether the head
-        // runs on many rows (perplexity, embeddings) or on the last row only (chat, llama-bench) is not known here.
+        // Only a type the oneDNN PP admission serves is marked at all (ggml_sycl_onednn_pp_type_admitted, the same two
+        // gates the op's candidate takes): with GGML_SYCL_ONEDNN_PP=0 or GGML_SYCL_SKIP_ONEDNN_Q4_0=1 no PP route draws
+        // the buffers, so reserving the head's copy would be a RUNTIME-zone reservation nothing uses. The plan cannot
+        // ask the router: it has no graph node, no batch and no resolved layout. GGML_SYCL_UNIFIED_DISPATCH is left
+        // out on purpose, because the legacy oneDNN arm draws the same buffers when the unified kernel is off.
+        // The head's copy is reserved UNCONDITIONALLY otherwise (owner decision) until llama.cpp-fkpg delivers
+        // n_outputs to the planner: whether the head runs on many rows (perplexity, embeddings) or on the last row
+        // only (chat, llama-bench) is not known here, and an unused plan is bounded by that one weight's f16 copy.
         if (item.has_shape() && ggml_sycl_should_use_unified_type(item.type) &&
+            ggml_sycl_onednn_pp_type_admitted(item.type) &&
             expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
             size_t weight_bytes = 0;
             size_t src1_bytes   = 0;

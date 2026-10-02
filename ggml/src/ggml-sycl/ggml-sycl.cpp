@@ -15910,7 +15910,8 @@ static size_t get_system_memory_bytes() {
 // llama.cpp-kpjw: whether this build can reach the f16 dequant arm of ggml_sycl_op_mul_mat_sycl at all. Its walk and
 // its dispatch arm are compiled only with oneDNN and GGML_SYCL_F16; without them nothing ever draws the planned f16
 // buffers, so planning them would reserve RUNTIME bytes for nothing. Where it is true, whether a given model draws
-// them is the zone adapter's candidate set (dense Q8_0 weights) and the route at run time.
+// them is the zone adapter's candidate set (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch
+// will not supply) and the route at run time.
 // ONE source for that condition: the planning site reads the constexpr below, and the f16 walk and both acquisitions
 // of the planned f16 buffers in the dispatch arm (ggml_sycl_op_mul_mat_sycl) are compiled under the same macro, so
 // they cannot drift apart. (The arm itself is also gated at run time by use_fp16, which is GGML_SYCL_F16.)
@@ -16015,7 +16016,8 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
                       mmq_src1_planned ? "" : " -- sizing overflowed, nothing planned");
     }
     // llama.cpp-479i: the dense f16 dequant buffers (src0 and src1 copies) are planned the same way, from
-    // the inventory maxima the adapter marked (dense Q8_0 weights), in the same RUNTIME zone.
+    // the inventory maxima the adapter marked (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch
+    // will not supply), in the same RUNTIME zone.
     // A build that cannot reach the f16 arm plans nothing for it: the buffers would be a reservation nothing draws,
     // and the hold, the fit check and the ring would each count it.
     {
@@ -28139,6 +28141,14 @@ static bool ggml_sycl_onednn_pp_skip_type(ggml_type type) {
         return env && std::atoi(env) != 0;
     }();
     return skip_q4_0 && type == GGML_TYPE_Q4_0;
+}
+
+// llama.cpp-8ony: the environment-level terms of the oneDNN PP admission, for a weight of `type`: the same two gates
+// ggml_sycl_onednn_pp_candidate hands the pure admission (GGML_SYCL_ONEDNN_PP, GGML_SYCL_SKIP_ONEDNN_Q4_0). The zone
+// adapter asks it at plan time, where there is no graph node for the router, so that a type no PP route can draw is
+// not reserved a dequant copy; non-static and declared in common.hpp because the planner cannot see this TU's statics.
+bool ggml_sycl_onednn_pp_type_admitted(ggml_type type) {
+    return ggml_sycl_onednn_pp_enabled() && !ggml_sycl_onednn_pp_skip_type(type);
 }
 
 // llama.cpp-21jd: the single predicate for "does this dense tensor get an
@@ -66514,14 +66524,15 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                         // (ggml_sycl_mul_mat_unified_pp_dequant_route). Route A runs on the context's
                                         // own in-order queue, the one queue a shared planned buffer is race-free on.
                                         //
-                                        // Two consequences are deliberate. First, an op the walk counted as SUPPLIED can
-                                        // still reach this draw when acquire refuses it at run time (another context
-                                        // holds the scratch token, or the zone is fragmented and direct growth also
-                                        // fails): the buffers were not sized for it, so the draw grows them inside the
-                                        // RUNTIME zone or, while recording or with the zone full, aborts naming the
-                                        // plan (ggml_sycl_dequant_f16_plan_breach). Second, there is no catch-and-fall
-                                        // back to the unified kernel proper here any more: a capacity failure of a
-                                        // planned buffer is reported, not hidden behind a per-op pool copy.
+                                        // Two consequences are deliberate. First, an op the walk counted as SUPPLIED
+                                        // can still reach this draw when acquire refuses it at run time (another
+                                        // context holds the scratch token, or the zone is fragmented and direct
+                                        // growth also fails): the buffers were not sized for it, so the draw grows
+                                        // them inside the RUNTIME zone or, while recording or with the zone full,
+                                        // aborts naming the plan (ggml_sycl_dequant_f16_plan_breach). Second, there
+                                        // is no catch-and-fall back to the unified kernel proper here any more: a
+                                        // capacity failure of a planned buffer is reported, not hidden behind a
+                                        // per-op pool copy.
                                         size_t src0_region_bytes = 0;
                                         size_t src1_region_bytes = 0;
                                         if (!ggml_sycl::zone_dequant_f16_region_bytes(static_cast<int64_t>(src0_elems),
@@ -66539,9 +66550,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                             src1_region_bytes, true));
                                         using_scratch = true;
 #    else
-                                        // The one remaining unplanned per-op pool copy of a whole weight. It exists only
-                                        // for a build without GGML_SYCL_DEQUANT_F16_ARM (oneDNN without GGML_SYCL_F16),
-                                        // a compile-time choice, not an environment variable.
+                                        // The one remaining unplanned per-op pool copy of a whole weight. It exists
+                                        // only for a build without GGML_SYCL_DEQUANT_F16_ARM (oneDNN without
+                                        // GGML_SYCL_F16), a compile-time choice, not an environment variable.
                                         try {
                                             src0_f16_alloc.alloc(src0_elems);
                                             src1_f16_alloc.alloc(src1_elems);

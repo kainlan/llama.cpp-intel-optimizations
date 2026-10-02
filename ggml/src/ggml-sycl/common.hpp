@@ -2416,6 +2416,11 @@ sycl::event ggml_sycl_pp_stage_transfer(int          src_device,
 // drift apart. Definitions live in ggml-sycl.cpp; see
 // ggml_sycl_dense_woq_alternate_eligible's own comment for the history.
 bool   ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous);
+
+// llama.cpp-8ony: the environment-level terms of the oneDNN PP admission for a weight of `type` (GGML_SYCL_ONEDNN_PP
+// and GGML_SYCL_SKIP_ONEDNN_Q4_0). Defined next to ggml_sycl_onednn_pp_candidate, which asks the same two gates; the
+// planner calls it because it cannot see that TU's statics.
+bool   ggml_sycl_onednn_pp_type_admitted(ggml_type type);
 // Same predicate, with placement safety judged for `plan` rather than the current global
 // plan -- the planner's form, since the plan it is building is not global yet.
 bool   ggml_sycl_dense_woq_alternate_eligible_for_plan(ggml_type                         type,

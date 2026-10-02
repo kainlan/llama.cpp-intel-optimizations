@@ -6677,9 +6677,10 @@ size_t compute_moe_effective_weight_bytes(size_t total_weight_bytes,
 bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, size_t activations_size);
 
 // llama.cpp-8ony: the most an op's oneDNN PP scratch pair may be for the ONEDNN zone on `device_id` to count it as
-// planned (zone_onednn_pp_pair_bound over the zone's capacity, the pair's stored plan and the Graph SDPA floor the zone
-// sizing stored). False (and *bound untouched) when there is no cache or no active arena, i.e. no zone exists to plan
-// against. This is the one source for "does an op's pair fit what was planned" (zone_onednn_pp_scratch_planned).
+// planned (zone_onednn_pp_pair_bound over the zone's capacity and the zone-plan snapshot ensure_planned_arena_zones
+// stores: the pair's plan and the Graph SDPA floor the zone was sized from, as one figure). False (and *bound
+// untouched) when there is no cache or no active arena, i.e. no zone exists to plan against. This is the one source
+// for "does an op's pair fit what was planned" (zone_onednn_pp_scratch_planned).
 bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound);
 
 // llama.cpp-8ony: whether the oneDNN PP scratch may supply a dense op's f16 copies for a weight of `type`

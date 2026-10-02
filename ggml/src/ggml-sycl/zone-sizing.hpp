@@ -267,11 +267,16 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
 
 // Whether a dense weight's f16 copies are planned into the dequant buffers because the oneDNN PP scratch will not
 // supply them (llama.cpp-8ony). The scratch supplies an op when it is enabled for the weight's type and the pair
-// fits the ONEDNN zone; the zone's own plan covers exactly the per-layer weights (zone_is_onednn_reorder_eligible),
-// so an eligible weight of an enabled type is supplied by construction and needs no dequant plan. A weight the zone
-// was not sized for (the LM head, a tied embedding) or a type the scratch is off for (GGML_SYCL_ONEDNN_PP_UNIFIED_
-// SCRATCH=0) draws the dequant buffers instead. A head that the zone's slack happens to supply is still planned:
-// the plan cannot know the slack, and an unused plan is bounded by that one weight's f16 copy. Pure.
+// fits the ONEDNN zone; the zone's own plan covers exactly the per-layer weights (zone_is_onednn_reorder_eligible).
+// An eligible weight of an enabled type is therefore supplied, and needs no dequant plan, on the condition that its
+// activations half is within the placeholder the zone is sized with (the largest eligible STORED weight) and the pair
+// is within the pair bound. That condition fails at a large -ub (Mistral ffn_down at -ub 4096 needs ~234 MB against a
+// ~223 MB bound): the op is then refused by the scratch, draws the dequant buffers, and nothing planned them. Closing
+// that gap needs the real n_ubatch at planning time, which is llama.cpp-fkpg; until then it is walk-grown.
+// A weight the zone was not sized for (the LM head, a tied embedding) or a type the scratch is off for
+// (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=0) draws the dequant buffers instead. A head that the zone's slack happens to
+// supply is still planned: whether the head runs on many rows or on the last row only is unknown until llama.cpp-fkpg
+// delivers n_outputs, and an unused plan is bounded by that one weight's f16 copy. Pure.
 bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool pair_eligible);
 
 // ---------------------------------------------------------------------------
@@ -333,10 +338,11 @@ void zone_onednn_scratch_reserve_target(bool     arena_active,
                                         size_t * activations_bytes);
 
 // The most an op's f16 pair may be for the ONEDNN zone to count it as planned there (the `pair_bound_bytes` that
-// zone_onednn_pp_scratch_planned and zone_onednn_scratch_reserve_target take). The zone is sized as the primitive-API pair's own plan plus a
-// floor for the oneDNN Graph SDPA scratch that shares it, and the zone is never smaller than a fixed minimum, so
-// its capacity can sit well above both. A pair is admitted up to capacity - floor: that is slack nobody planned
-// for, so admitting it cannot push the Graph SDPA scratch onto its DIRECT path (an unplanned device allocation).
+// zone_onednn_pp_scratch_planned and zone_onednn_scratch_reserve_target take). The zone is sized as the
+// primitive-API pair's own plan plus a floor for the oneDNN Graph SDPA scratch that shares it, and the zone is never
+// smaller than a fixed minimum, so its capacity can sit well above both. A pair is admitted up to capacity - floor:
+// that is slack nobody planned for, so admitting it cannot push the Graph SDPA scratch onto its DIRECT path (an
+// unplanned device allocation).
 // It is never admitted below the pair plan itself (a zone clamped so that capacity - floor falls under the plan
 // still holds the plan, which is what the planner's own ops are sized from), and never above the capacity.
 // `bare_plan_bytes` and `graph_floor_bytes` are the stored figures the zone was sized from; neither is recomputed
