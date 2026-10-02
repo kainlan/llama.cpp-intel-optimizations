@@ -2474,6 +2474,9 @@ J_FIT = ("onednn_pp_a_bytes", "onednn_pp_w_bytes")      # A's fit and W's term: 
 J_BANNED = re.compile(r"g_tensor_inventory_\w*|unified_cache_get_planned_(?:pp_moe_)?onednn_\w*")
 J_ELIGIBLE = "zone_is_onednn_reorder_eligible"
 M_FLOOR_FN, M_FLOOR_ENV = "ensure_planned_arena_zones", "GGML_SYCL_COMPUTE_ARENA_MB"
+# The floor's one reader. The zone-sizing function reaches the variable through this helper, which the model-load
+# reservation and the chunk cap's probe set call too, so the three cannot disagree.
+M_FLOOR_READER = "ggml_sycl_compute_arena_bytes"
 
 # Clause (n): the declined-result consumers. A class member is matched as `Class::name(` anywhere, or as a bare `name(`
 # only inside that class; the two unique names match anywhere.
@@ -2989,8 +2992,14 @@ def clause_m(ix, out):
             out.add("M-STALE", "appendix-rows.json", 0, "row %d" % r, str(r), "appendix::row:%d:stale-peak" % r,
                     "row %d is covered by row %d's peak, which is not on the floor list" % (r, peak))
     fn = [(rel, func, node) for rel, func, node in ix.fdefs(M_FLOOR_FN) if rel == "unified-cache.cpp"]
-    has_floor = any(M_FLOOR_ENV in txt(ix.files[rel], body_of(node)) and re.search(
-        r'getenv\s*\(\s*"%s"\s*\)' % M_FLOOR_ENV, txt(ix.files[rel], body_of(node))) for rel, _, node in fn)
+    reads_floor = re.compile(r'getenv\s*\(\s*"%s"\s*\)' % M_FLOOR_ENV)
+    # the floor is applied by a getenv in the zone-sizing function itself, or by a call of the one reader whose
+    # body carries it
+    reader_ok = any(reads_floor.search(txt(ix.files[rel], body_of(node)))
+                    for rel, _, node in ix.fdefs(M_FLOOR_READER) if rel == "unified-cache.cpp")
+    calls_reader = re.compile(r"(?<![A-Za-z0-9_])%s\s*\(" % M_FLOOR_READER)
+    has_floor = any(reads_floor.search(txt(ix.files[rel], body_of(node))) or
+                    (reader_ok and calls_reader.search(txt(ix.files[rel], body_of(node)))) for rel, _, node in fn)
     if floor and not has_floor:
         out.add("M-FLOOR", "unified-cache.cpp", 0, M_FLOOR_FN, M_FLOOR_FN, "appendix::floor-tie",
                 "%d SCRATCH consumers still draw without a term, but %s does not apply the %s floor" % (len(floor), M_FLOOR_FN, M_FLOOR_ENV))
@@ -4970,6 +4979,13 @@ def chain(*fns):
     return f
 
 
+def without_accessor(mutate):
+    """Rename L0's accessor out of every file, then apply `mutate`: a dormancy control needs a tree with no accessor, and
+    the tree the gate runs on defines it once the re-plan token has landed."""
+    pat = re.compile(rb"(?<![A-Za-z0-9_])ggml_sycl_replan_token_held(?![A-Za-z0-9_])")
+    return lambda files: mutate({rel: pat.sub(b"ggml_sycl_replan_token_absent", b) for rel, b in files.items()})
+
+
 def drop_debt(code, *needles):
     """edit_debt: drop the debt entries of `code` whose key holds every needle (a planted fix that retires them)."""
     return lambda debt: dict(debt, violations=[d for d in debt["violations"]
@@ -5225,19 +5241,19 @@ def matrix_cases_s2d1():
         "bool ggml_sycl::ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind) {\n    return true;\n}\n" + RET),
         "FAIL", "I-RETRY", "onednn_w_retry_lost_cas"))
     A(Case("28", "the same tree with the retry deleted (control)", plant(ACC), "PASS", active="i"))
-    A(Case("28", "the retry with no accessor: dormant (control)", plant(RET), "PASS", dormant="i"))
-    A(Case("28", "the accessor planted only as a call site, with the retry (control)", plant(
-        "void zzplant_i() {\n    (void) ggml_sycl_replan_token_held(ggml_sycl_replan_kind::ANY);\n}\n" + RET), "PASS", dormant="i"))
-    A(Case("28", "the accessor planted only as a ;-terminated declaration, with the retry (control)", plant(
-        "bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind = ggml_sycl_replan_kind::ANY);\n" + RET), "PASS", dormant="i"))
+    A(Case("28", "the retry with no accessor: dormant (control)", without_accessor(plant(RET)), "PASS", dormant="i"))
+    A(Case("28", "the accessor planted only as a call site, with the retry (control)", without_accessor(plant(
+        "void zzplant_i() {\n    (void) ggml_sycl_replan_token_held(ggml_sycl_replan_kind::ANY);\n}\n" + RET)), "PASS", dormant="i"))
+    A(Case("28", "the accessor planted only as a ;-terminated declaration, with the retry (control)", without_accessor(plant(
+        "bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind = ggml_sycl_replan_kind::ANY);\n" + RET)), "PASS", dormant="i"))
     A(Case("28", "the accessor spelled as a lambda variable, a shape the matcher misses: the latch fails", plant(
         "static auto ggml_sycl_replan_token_held = [](int kind) { return kind != 0; };\n" + RET), "FAIL", "X-LATCH", "latch:i"))
     A(Case("28", "the accessor spelled as a macro: the latch fails", plant(
         "#define ggml_sycl_replan_token_held(kind) true\n" + RET), "FAIL", "X-LATCH", "latch:i", planted=False))
     A(Case("31", "the accessor defined while A's pre-L0 busy return still exists", plant(
         ACC + "void onednn_pp_a_relock_busy_pre_l0() {\n}\n"), "FAIL", "I-RETRY", "onednn_pp_a_relock_busy_pre_l0"))
-    A(Case("31", "the busy branch with no accessor: dormant (control)", plant(
-        "void onednn_pp_a_relock_busy_pre_l0() {\n}\n"), "PASS", dormant="i"))
+    A(Case("31", "the busy branch with no accessor: dormant (control)", without_accessor(plant(
+        "void onednn_pp_a_relock_busy_pre_l0() {\n}\n")), "PASS", dormant="i"))
     A(Case("31", "the accessor with both retired functions deleted (control)", plant(ACC), "PASS", active="i"))
     # 30: §B's COMPLETE reap in the transaction retires the pre-§B interim
     REAP = ("void ggml_sycl_run_runtime_context_transaction() {\n    release_retained_referencing(h, "
@@ -5332,9 +5348,12 @@ def matrix_cases_s2d1():
            m_edit=m_set("floor", 999, "beni")))
     A(Case("32", "a covered row whose peak left the list", plant("void zzplant_m() {\n}\n"), "FAIL", "M-STALE", "row 62 is covered",
            m_edit=chain_m(m_set("covered", 62, 17), m_without("floor", 17))))
-    A(Case("32", "the SCRATCH floor deleted from ensure_planned_arena_zones while rows still draw", replace_once(
-        "unified-cache.cpp", 'const char * arena_mb_env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");',
-        "const char * arena_mb_env = nullptr;"), "FAIL", "M-FLOOR", "does not apply"))
+    A(Case("32", "the SCRATCH floor deleted from the one reader while rows still draw", replace_once(
+        "unified-cache.cpp", 'const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");',
+        "const char * env = nullptr;"), "FAIL", "M-FLOOR", "does not apply"))
+    A(Case("32", "ensure_planned_arena_zones stops calling the reader while rows still draw", replace_once(
+        "unified-cache.cpp", "size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);",
+        "size_t scratch_zone = 512ULL * 1024 * 1024;"), "FAIL", "M-FLOOR", "does not apply"))
     A(Case("32", "the unmutated tables and floor (control)", plant("void zzplant_m() {\n}\n"), "PASS", planted=False))
     return c
 

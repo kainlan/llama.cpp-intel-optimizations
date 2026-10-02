@@ -131,7 +131,7 @@ pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause
   `python3 scripts/sycl-alloc-zone-contract/gen-appendix-rows.py --design <design.md> --master 2c4f5e45d --rev 4.16`. A missing or
   malformed file, or a row without a key the clause reads, is `M-DATA`, never a traceback. The gate's own tables (`M_TABLES`: the floor list with each row's owner ticket, the
   covered-by-peak rows, the unreachable rows) are checked against it, and `ensure_planned_arena_zones` must apply the
-  `GGML_SYCL_COMPUTE_ARENA_MB` floor while the floor list is non-empty (and must not once it is empty).
+  `GGML_SYCL_COMPUTE_ARENA_MB` floor, by reading it itself or by calling `ggml_sycl_compute_arena_bytes` (the one reader the model-load reservation and the chunk cap's probe set also call; its body must carry the `getenv`), while the floor list is non-empty (and must not once it is empty).
 - (n) `N-VOID` and `N-NODISCARD`, the only S2d codes that may be debt. The names are the declined-result consumers
   (`DnnlGemmWrapper::gemm`, `row_gemm`, `woq_gemm_*`, the softmax / eltwise / binary wrappers, `get_scratchpad_mem`,
   `ggml_sycl_mul_mat_batched_sycl`); a class member matches as `Class::name(` anywhere or a bare `name(` inside that class.

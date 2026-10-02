@@ -179,6 +179,70 @@
       "function": "kv_region_release",
       "count": 2,
       "reason": "kv_region_release is noexcept and runs from the plan guard's destructor (the registry release proc): its two catch-all handlers release the replan token and report through kv_region_abort, a named abort, because a release that cannot finish must not propagate out of a destructor. A rethrow of ggml_sycl_fallback_error there would std::terminate without the named message, and the try bodies (registry take, slot-state take_retentions, the retain callback) never raise a planned refusal. Permanent; design docs/design/sycl-kv-region-segregation.md, the registry release proc and the noexcept destructor."
+    },
+    {
+      "id": "E-CABI-PLAN-CAPS-NEW",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_plan_caps_new",
+      "count": 1,
+      "reason": "ggml_backend_sycl_plan_caps_new is a C-ABI constructor for the plan-capability handle. Its try body is a bare allocation and counter bump with no planned-refusal path; the handler is the C-ABI boundary, which cannot let an exception cross into the caller and reports failure as a null return. Permanent."
+    },
+    {
+      "id": "E-CABI-PLAN-SCOPE-OPEN",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_plan_scope_open",
+      "count": 1,
+      "reason": "ggml_backend_sycl_plan_scope_open is a C-ABI constructor for the plan scope. Its try body is a bare allocation and counter bump with no planned-refusal path; the handler is the C-ABI boundary, which cannot let an exception cross into the caller and reports failure as a null return. Permanent."
+    },
+    {
+      "id": "E-CABI-REPLAN-SCOPE-OPEN",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_replan_scope_open",
+      "count": 1,
+      "reason": "ggml_backend_sycl_replan_scope_open is a C-ABI constructor for the re-plan scope. Its try body constructs the scope state, whose constructor takes the re-plan token (a mutex acquisition) and raises no planned refusal; the handler is the C-ABI boundary, which cannot let an exception cross into the caller and reports failure as a null return. Permanent."
+    },
+    {
+      "id": "E-SYNC-FOR-REPLAN",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_synchronize_for_replan",
+      "count": 2,
+      "reason": "ggml_backend_sycl_synchronize_for_replan is the public drain a re-plan runs before it publishes: its two handlers log the failed wait and return false, which the caller turns into a refused re-plan. The try body only waits on queues and takes queue-owner mutexes; it never allocates through the planner and raises no planned refusal, so a rethrow would add a second failure path to a boolean contract. Permanent."
+    },
+    {
+      "id": "E-GRAPH-COMPUTE-EXIT",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_graph_compute_exit",
+      "count": 2,
+      "reason": "ggml_sycl_graph_compute_exit is the graph_compute exit step: its two handlers log and return false, which ggml_sycl_graph_compute_exit_status maps to GGML_STATUS_FAILED. The try body flushes pending scatter state, advances the per-graph caches, publishes staged owners and releases tenant staging; none of it raises a planned refusal, and the exit runs after the compute has already succeeded or failed, so the status is the only channel left. Permanent."
+    },
+    {
+      "id": "E-GRAPH-COMPUTE-EXCEPTION-EXIT",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_graph_compute_exception_exit",
+      "count": 3,
+      "reason": "ggml_sycl_graph_compute_exception_exit is noexcept and runs from the cleanup of an exception already in flight: its three catch-all handlers each guard one best-effort drop (the two per-graph caches and the staged-owner retention), because a second exception out of a cleanup would std::terminate and mask the first. None of the three bodies raises a planned refusal. Permanent."
+    },
+    {
+      "id": "E-LIFECYCLE-PROBE-FIND",
+      "code": "G-CATCH",
+      "file": "unified-cache.cpp",
+      "function": "lifecycle_find_probe_placement_plan",
+      "count": 1,
+      "reason": "lifecycle_find_probe_placement_plan is noexcept and its try body is a mutex lock plus a map lookup: the catch-all turns a lock failure into a null result, as its sibling lifecycle_find_placement_plan does. It never builds a plan and raises no planned refusal. Permanent."
+    },
+    {
+      "id": "E-LIFECYCLE-PROBE-ABORT",
+      "code": "G-CATCH",
+      "file": "unified-cache.cpp",
+      "function": "lifecycle_abort_probe_placement_plan",
+      "count": 1,
+      "reason": "lifecycle_abort_probe_placement_plan is noexcept and its try body is a mutex lock plus a map erase on the abort path: the catch-all swallows a lock failure so an abort cannot throw out of a cleanup, as its sibling lifecycle_abort_placement_plan does. It raises no planned refusal. Permanent."
     }
   ]
 }
