@@ -15,6 +15,14 @@
 //   on   the wrapper must decline: calls == 1, declined == 1, engaged == 0 and the output still matches the host
 //        reference (a fallback that ran over a half-written dst, or scaled a softmax twice, would not).
 //
+// Two further arms cover DnnlGemmWrapper::gemm (site "dnnl_gemm") through the batched f16 KQ mul_mat, which falls to a
+// native GPU kernel on a decline: one with equal K and query head counts (one gemm per dim-3 slice) and one grouped-query
+// arm (K has fewer heads) that takes the non-broadcast launch, whose hoisted pre-query is call 1 of each slice and whose
+// per-pair gemm calls follow, so the counting statement "pre-query is call 1, batch b's own query is call b + 2" has a
+// consumer. A decline after a write (a later call of the same launch) throws dnnl_decline_after_write, which needs the
+// CHECK_TRY_ERROR rethrow of S3-5a before it can be driven here; the other sites (MXFP4 PP, unified PP, MoE batched, the
+// dense arms, out_prod) are pinned by scripts/check-sycl-dnnl-decline-consumers.py and have no device arm yet.
+//
 // The counters are the positive control. An arm whose off-run never reached its site (the env opt-in is missing, a
 // shape fell under a threshold, the graph was recorded) has calls == 0 and FAILS as void; "identical" outputs from a
 // run that never touched the wrapper would prove nothing. The oneDNN paths for SOFT_MAX and MUL are opt-in, so the
@@ -66,6 +74,11 @@ struct arm {
     std::function<arm_graph(ggml_context *)>                build;
     std::function<void(std::vector<float> &, std::vector<float> &)> fill;  // x, w
     std::function<void(const std::vector<float> &, const std::vector<float> &, std::vector<float> &)> reference;
+
+    // What the undeclined run must count at the site: calls the wrapper consulted it (a hoisted pre-query counts), engaged
+    // the primitives it went on to submit. Derived from the arm's shape, not assumed to be 1.
+    uint64_t expect_calls   = 1;
+    uint64_t expect_engaged = 1;
 };
 
 constexpr int64_t SOFTMAX_COLS = 96;
@@ -74,12 +87,19 @@ constexpr int64_t MUL_COLS     = 256;
 constexpr int64_t MUL_ROWS     = 160;  // row-broadcast MUL needs a batch >= 128 (binbcast.cpp)
 constexpr int64_t ELT_N        = 8192;  // the eltwise paths need >= 4096 elements (element_wise.cpp)
 constexpr float   SOFTMAX_SCALE = 0.5f;
-// The batched f16 mul_mat (a KQ-shaped graph: both operands permuted, one query column, more than one batch) asks oneDNN
-// for a batched gemm; a decline falls to ggml_sycl_mul_mat_batched_f16_fallback, a native GPU kernel.
-constexpr int64_t KQ_D = 64;
-constexpr int64_t KQ_T = 48;
-constexpr int64_t KQ_H = 4;
-constexpr int64_t KQ_B = 2;
+// The batched f16 mul_mat (a KQ-shaped graph: both operands permuted, one query column, more than one batch) reaches
+// ggml_sycl_mul_mat_batched_sycl, whose oneDNN arm asks DnnlGemmWrapper::gemm (site "dnnl_gemm") once per launch. A
+// decline falls to ggml_sycl_mul_mat_batched_f16_fallback, a native GPU kernel. K's batch dimension (dim 2) is strided, so
+// the launches are made once per dim-3 slice, with the batch counts below:
+//   KQ_HK == KQ_H  equal batch counts: one gemm per slice, so calls == engaged == KQ_B;
+//   KQ_HK <  KQ_H  a grouped-query broadcast, the non-broadcast launch: one hoisted pre-query (call 1 of the slice,
+//                  not engaged), then one gemm per (K head, query head per K head) pair, so per slice
+//                  1 + KQ_H calls and KQ_H engaged.
+constexpr int64_t KQ_D          = 64;
+constexpr int64_t KQ_T          = 48;
+constexpr int64_t KQ_H          = 4;  // query heads
+constexpr int64_t KQ_HK         = 2;  // K heads of the grouped-query arm
+constexpr int64_t KQ_B          = 2;
 
 float input_value(int64_t i, int64_t n) {
     // a deterministic spread over [-6, 6) that is not a multiple pattern of any row width above
@@ -155,44 +175,53 @@ std::vector<arm> make_arms() {
             }
         } });
 
-    arms.push_back({ "batched f16 KQ mul_mat", "dnnl_gemm_batch", 3e-2, false, GGML_TYPE_F16,
-        [](ggml_context * ctx) {
-            arm_graph g;
-            // k and q are stored as [D, H, T|1, B] and permuted to [D, T|1, H, B], as llama's KQ is
-            g.x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, KQ_D, KQ_H, 1, KQ_B);
-            g.w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, KQ_D, KQ_H, KQ_T, KQ_B);
-            ggml_set_input(g.x);
-            ggml_set_input(g.w);
-            g.out = ggml_mul_mat(ctx, ggml_permute(ctx, g.w, 0, 2, 1, 3), ggml_permute(ctx, g.x, 0, 2, 1, 3));
-            ggml_set_output(g.out);
-            return g;
-        },
-        [](std::vector<float> & q, std::vector<float> & k) {
-            q.resize((size_t) (KQ_D * KQ_H * KQ_B));
-            k.resize((size_t) (KQ_D * KQ_H * KQ_T * KQ_B));
-            for (size_t i = 0; i < q.size(); ++i) {
-                q[i] = 0.2f * input_value((int64_t) i, (int64_t) q.size());
-            }
-            for (size_t i = 0; i < k.size(); ++i) {
-                k[i] = 0.2f * input_value((int64_t) i, (int64_t) k.size());
-            }
-        },
-        [](const std::vector<float> & q, const std::vector<float> & k, std::vector<float> & ref) {
-            ref.assign((size_t) (KQ_T * KQ_H * KQ_B), 0.0f);
-            for (int64_t b = 0; b < KQ_B; ++b) {
-                for (int64_t h = 0; h < KQ_H; ++h) {
-                    for (int64_t tt = 0; tt < KQ_T; ++tt) {
-                        double s = 0.0;
-                        for (int64_t d = 0; d < KQ_D; ++d) {
-                            const double kv = ggml_fp16_to_fp32(ggml_fp32_to_fp16(k[(size_t) (d + KQ_D * (h + KQ_H * (tt + KQ_T * b)))]));
-                            const double qv = ggml_fp16_to_fp32(ggml_fp32_to_fp16(q[(size_t) (d + KQ_D * (h + KQ_H * b))]));
-                            s += kv * qv;
-                        }
-                        ref[(size_t) (tt + KQ_T * (h + KQ_H * b))] = (float) s;
-                    }
-                }
-            }
-        } });
+    const auto kq_arm = [&arms](const char * name, int64_t hk, uint64_t calls, uint64_t engaged) {
+        arms.push_back(
+            { name, "dnnl_gemm", 3e-2, false, GGML_TYPE_F16,
+              [hk](ggml_context * ctx) {
+                  arm_graph g;
+                  // k and q are stored as [D, H, T|1, B] and permuted to [D, T|1, H, B], as llama's KQ is
+                  g.x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, KQ_D, KQ_H, 1, KQ_B);
+                  g.w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, KQ_D, hk, KQ_T, KQ_B);
+                  ggml_set_input(g.x);
+                  ggml_set_input(g.w);
+                  g.out = ggml_mul_mat(ctx, ggml_permute(ctx, g.w, 0, 2, 1, 3), ggml_permute(ctx, g.x, 0, 2, 1, 3));
+                  ggml_set_output(g.out);
+                  return g;
+              },
+              [hk](std::vector<float> & q, std::vector<float> & k) {
+                  q.resize((size_t) (KQ_D * KQ_H * KQ_B));
+                  k.resize((size_t) (KQ_D * hk * KQ_T * KQ_B));
+                  for (size_t i = 0; i < q.size(); ++i) {
+                      q[i] = 0.2f * input_value((int64_t) i, (int64_t) q.size());
+                  }
+                  for (size_t i = 0; i < k.size(); ++i) {
+                      k[i] = 0.2f * input_value((int64_t) i, (int64_t) k.size());
+                  }
+              },
+              [hk](const std::vector<float> & q, const std::vector<float> & k, std::vector<float> & ref) {
+                  ref.assign((size_t) (KQ_T * KQ_H * KQ_B), 0.0f);
+                  for (int64_t b = 0; b < KQ_B; ++b) {
+                      for (int64_t h = 0; h < KQ_H; ++h) {
+                          const int64_t kh = h / (KQ_H / hk);  // query head h reads K head h / (heads per K head)
+                          for (int64_t tt = 0; tt < KQ_T; ++tt) {
+                              double s = 0.0;
+                              for (int64_t d = 0; d < KQ_D; ++d) {
+                                  const double kv = ggml_fp16_to_fp32(
+                                      ggml_fp32_to_fp16(k[(size_t) (d + KQ_D * (kh + hk * (tt + KQ_T * b)))]));
+                                  const double qv =
+                                      ggml_fp16_to_fp32(ggml_fp32_to_fp16(q[(size_t) (d + KQ_D * (h + KQ_H * b))]));
+                                  s += kv * qv;
+                              }
+                              ref[(size_t) (tt + KQ_T * (h + KQ_H * b))] = (float) s;
+                          }
+                      }
+                  }
+              },
+              calls, engaged });
+    };
+    kq_arm("batched f16 KQ mul_mat", KQ_H, (uint64_t) KQ_B, (uint64_t) KQ_B);
+    kq_arm("batched f16 KQ mul_mat GQA", KQ_HK, (uint64_t) KQ_B * (1 + KQ_H), (uint64_t) KQ_B * KQ_H);
 
     const auto eltwise = [&arms](const char * name, ggml_tensor * (*op)(ggml_context *, ggml_tensor *),
                                  double (*f)(double)) {
@@ -427,11 +456,15 @@ int main(int, char ** argv) {
                (unsigned long long) on.declined, (unsigned long long) on.engaged, worst_on, same ? 1 : 0);
 
         bool arm_ok = true;
-        if (off.calls != 1 || off.engaged != 1 || off.declined != 0) {
+        if (off.calls != a.expect_calls || off.engaged != a.expect_engaged || off.declined != 0) {
             fprintf(stderr,
-                    "FAIL: %s: the undeclined run did not engage the wrapper exactly once (calls=%llu engaged=%llu declined=%llu); "
-                    "the arm is VOID -- check GGML_SYCL_ONEDNN_SOFTMAX / GGML_SYCL_ONEDNN_MUL and the shape thresholds\n",
-                    a.name, (unsigned long long) off.calls, (unsigned long long) off.engaged,
+                    "FAIL: %s: the undeclined run did not consult the site %llu time(s) and engage %llu (calls=%llu "
+                    "engaged=%llu "
+                    "declined=%llu); the arm is VOID or the call-counting statement is wrong -- check "
+                    "GGML_SYCL_ONEDNN_SOFTMAX / "
+                    "GGML_SYCL_ONEDNN_MUL and the shape thresholds\n",
+                    a.name, (unsigned long long) a.expect_calls, (unsigned long long) a.expect_engaged,
+                    (unsigned long long) off.calls, (unsigned long long) off.engaged,
                     (unsigned long long) off.declined);
             arm_ok = false;
         }

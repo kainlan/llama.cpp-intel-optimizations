@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source gate for the oneDNN wrapper consumers of a declined scratchpad (llama.cpp-23mk S3-3, design 4.8).
+"""Source gate for the oneDNN consumers of a declined scratchpad (llama.cpp-23mk S3-3 and S3-4, design 4.8).
 
 `get_scratchpad_mem` can come back empty for a nonzero scratchpad: that is a decline, not an error. The three wrappers outside
 ggml-sycl.cpp that ask for one (softmax, eltwise, binary_broadcast_row) used to throw std::runtime_error on it, which a
@@ -41,6 +41,24 @@ appear: no statement, goto, throw, abort or else can follow it. When that line i
 `#endif`, nested #if blocks counted) may not contain any of the same leaving words, since the build without DNNL would leave
 before the fallback. That is the shape of all five real callers. Limit: a `return` placed after the `#endif`, in the fallback
 code itself, is not seen; the device test is the only catch for that.
+
+Since S3-4 the gate also reads gemm.hpp, common.hpp, ggml-sycl.cpp and outprod.cpp:
+
+  - gemm.hpp: the five DnnlGemmWrapper consumers (gemm, woq_gemm_q8_0, woq_gemm_q4_0_impl, gemm_batch_strided,
+    woq_gemm_batch_mxfp4) are `[[nodiscard]] static` returning std::optional<sycl::event> or bool, ask for the scratchpad
+    unconditionally as `auto scratchpad_mem = ctx.get_scratchpad_mem(...)`, decide it with the helper under their own site and
+    `return std::nullopt` / `return false`, and note the engaged call once per request, after the decision (after gemm's
+    query_only exit) and with no `return false` / `return std::nullopt` left after it, so "engaged" means the primitive is
+    about to be submitted. The 2-D MXFP4 arm asks once before its batch loop. The old runtime_error and the deleted forwarders
+    (woq_gemm_q4_0_packed, gemm_batch_array, row_gemm_batch) and woq_gemm_q4_0_impl's dead packed-weights arm (b_is_packed,
+    b_bytes) stay gone;
+  - common.hpp: get_scratchpad_mem is [[nodiscard]] and opens with the size read and the 0 B early return of the empty memory
+    before it takes dnnl_mutex, exactly once;
+  - ggml-sycl.cpp and outprod.cpp (comment-stripped, whitespace-insensitive): the statements that carry a decline to its
+    declared next path (MAIN_PINS), among them the named throws of the dense arms and out_prod, the batched f16 fallback and
+    the rethrow of a named error ahead of the resource-exhaustion ladder, the hoisted pre-query's `return false` and the first
+    slice's `b_a == 0` distinction, the MXFP4 PP and unified PP fall-through, the MoE group break and stage failure, and the
+    mul_mat_id `return false`.
 
 Every check is also run against mutants of the same text and each must fail there, so a regex that stopped matching fails the
 gate instead of passing it. A mutant whose anchor text has moved is an assertion error, not a skip. Exit 0 on success, 1 on a
@@ -100,6 +118,21 @@ MAIN_PINS = (
     ('throw ggml_sycl_fallback_error("dnnl_gemm declined and batched_f16_fallback failed");', 2),
     ("batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback(", 2),
     ("[[nodiscard]] static bool ggml_sycl_mul_mat_batched_sycl(", 1),
+    # M-1: caller 1 rethrows a named error ahead of the resource-exhaustion ladder (its abort would misname the failure)
+    ("batched_declined = !ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst); } catch (const ggml_sycl_fallback_error &) { throw; } "
+     "catch (const std::exception & e) {", 1),
+    # the hoisted pre-query declines before any write, and only the first slice may take the fallback
+    ("{}, nullptr, true)) { return false; }", 1),
+    ("if (b_a == 0) { return false; } throw ggml_sycl_fallback_error(\"dnnl_decline_after_write:dnnl_gemm\");", 1),
+    # the MXFP4 PP and the unified PP sites fall to their kernels
+    ("DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { used_onednn = false; break; }", 2),
+    ("DnnlGemmWrapper::to_dt<float>(), ctx.stream()) .has_value(); if (used_onednn_fp16) { unified_dispatched = true; }", 1),
+    # the MoE batched arm: a declined group stops the loop and takes the stage-failure path the catch takes
+    ("if (!group_event) { gemm_declined = true; break; }", 1),
+    ('if (gemm_declined) { return gemm_stage_failed("oneDNN scratchpad declined"); }', 1),
+    ("catch (const std::exception & e) { return gemm_stage_failed(e.what()); }", 1),
+    # mul_mat_id's f16-input PP helper reports a decline as "not done"
+    ("DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { return false; }", 1),
 )
 OUTPROD_PIN = 'throw ggml_sycl_fallback_error("dnnl_gemm declined in out_prod'
 OLD_THROW = 'std::runtime_error("oneDNN scratchpad allocation failed")'
@@ -243,6 +276,9 @@ def check_gemm(text):
     for name in GEMM_DEAD:
         if re.search(r"\b%s\b" % name, text):
             errs.append("%s: %s is back (a forwarder with no caller)" % (GEMM, name))
+    for name in ("b_is_packed", "b_bytes"):
+        if re.search(r"\b%s\b" % name, text):
+            errs.append("%s: %s is back: woq_gemm_q4_0_impl's packed-weights arm died with its forwarder" % (GEMM, name))
     total = 0
     for name, site, result, rtype, want in GEMM_CONSUMERS:
         decl, body = member_body(text, name)
@@ -278,7 +314,19 @@ def check_gemm(text):
         if len(notes) != want or any(n.group(1) != site for n in notes):
             errs.append("%s must call ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_%s) once per request, found %d"
                         % (where, site, len(notes)))
+        if notes:
+            tail = body[notes[-1].end():]
+            if re.search(r"\breturn\s+(?:false\b|std::nullopt\b)", tail):
+                errs.append("%s leaves with `return false` / `return std::nullopt` after its engaged note: the note must sit just "
+                            "before the primitive is submitted" % where)
         for d, n in zip(decisions, notes):
+            if name == "woq_gemm_q4_0_impl":
+                # The packed-weights staging (an allocation and a reorder that can still fail) sits between the decision and
+                # the submit, so the note moves down to just before the primitive: at the body's top level, after the decision.
+                top = body[:n.start()].count("{") == body[:n.start()].count("}")
+                if n.start() < d.end() or not top:
+                    errs.append("%s must note the engaged call unconditionally (at the body's top level) after its decision" % where)
+                continue
             between = r"\s*if\s*\(\s*query_only\s*\)\s*\{\s*return\s+sycl::event\s*\{\s*\}\s*;\s*\}\s*" if name == "gemm" else r"\s*"
             if n.start() < d.end() or not re.fullmatch(between, body[d.end():n.start()]):
                 errs.append("%s must note the engaged call right after its decision%s" % (
@@ -493,7 +541,7 @@ def gemm_mutants(files, edit):
     out.append(("the getter takes the lock twice", edit(c, zero + lock, zero + lock + lock.replace("lock(", "lock2("))))
     # ggml-sycl.cpp / outprod.cpp: the declared next paths
     def edit_pin(rel, pin, new, count=1):
-        text = files[rel]
+        text = strip_comments(files[rel])  # the pins are read comment-stripped, so a comment may sit inside one
         assert len(re.findall(ws_pattern(pin), text)) >= 1, "mutant anchor missing: %r in %s" % (pin, rel)
         return dict(files, **{rel: re.sub(ws_pattern(pin), lambda _: new, text, count=count)})
     for text, want in MAIN_PINS:
@@ -501,6 +549,39 @@ def gemm_mutants(files, edit):
     out.append(("the dense f16 arm swallows the decline", edit_pin(m, MAIN_PINS[0][0], "return; (void) std::runtime_error(")))
     out.append(("the old scratchpad error is back in ggml-sycl.cpp",
                 edit_pin(m, MAIN_PINS[0][0], 'throw std::runtime_error("oneDNN scratchpad allocation failed"); (void) std::runtime_error(')))
+    # the decline-only next paths, each altered the way a careless edit would (the pin simply gone is covered above)
+    for label, pin, new in (
+            ("the hoisted pre-query no longer returns false on a decline", "{}, nullptr, true)) { return false; }",
+             "{}, nullptr, true)) { }"),
+            ("the first slice's decline always throws", 'if (b_a == 0) { return false; } throw ggml_sycl_fallback_error("dnnl_decline_after_write:dnnl_gemm");',
+             'throw ggml_sycl_fallback_error("dnnl_decline_after_write:dnnl_gemm");'),
+            ("every slice's decline falls back", 'if (b_a == 0) { return false; } throw ggml_sycl_fallback_error("dnnl_decline_after_write:dnnl_gemm");',
+             "return false;"),
+            ("an MXFP4 PP decline keeps the oneDNN flag", "DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { used_onednn = false; break; }",
+             "DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { used_onednn = true; break; }"),
+            ("an MXFP4 PP decline does not leave the loop", "DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { used_onednn = false; break; }",
+             "DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { used_onednn = false; }"),
+            ("the unified PP marks the op dispatched after a decline",
+             "DnnlGemmWrapper::to_dt<float>(), ctx.stream()) .has_value(); if (used_onednn_fp16) { unified_dispatched = true; }",
+             "DnnlGemmWrapper::to_dt<float>(), ctx.stream()) .has_value(); unified_dispatched = true;"),
+            ("the MoE group loop goes on after a decline", "if (!group_event) { gemm_declined = true; break; }",
+             "if (!group_event) { gemm_declined = true; }"),
+            ("the MoE decline is not a failure", 'if (gemm_declined) { return gemm_stage_failed("oneDNN scratchpad declined"); }',
+             'if (gemm_declined) { return true; }'),
+            ("mul_mat_id reports a decline as done", "DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { return false; }",
+             "DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { return true; }"),
+            ("caller 1 rethrows the named error as std::exception", "catch (const ggml_sycl_fallback_error &) { throw; } catch (const std::exception & e) {",
+             "catch (const std::exception & e) {")):
+        out.append((label, edit_pin(m, pin, new)))
+    q4_note = "        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q4_0);\n"
+    q4_late = "        // Every later `return false` is behind us: \"engaged\" means the primitive is about to be submitted.\n" + q4_note
+    q4_decl = GEMM_DECISION.search(member_body(strip_comments(gt), "woq_gemm_q4_0_impl")[1]).group(0)
+    assert gt.count(q4_late) == 1 and gt.count(q4_decl) >= 1, "mutant anchor: woq_gemm_q4_0_impl's note and decision"
+    out.append(("woq_gemm_q4_0_impl notes before its packed staging (the old place)",
+                dict(files, **{g: gt.replace(q4_late, "", 1).replace(q4_decl, q4_decl + "\n" + q4_note, 1)})))
+    out.append(("woq_gemm_q4_0_impl's note sits under an if", edit(g, q4_late, "        if (b_packed_dev) {\n" + q4_note + "        }\n")))
+    out.append(("woq_gemm_q4_0_impl gets its packed-weights flag back",
+                edit(g, "    [[nodiscard]] static bool woq_gemm_q4_0(", "    static void zz(bool b_is_packed) {}\n    [[nodiscard]] static bool woq_gemm_q4_0(")))
     out.append(("the dense f16 throw survives only in a comment", edit_pin(m, MAIN_PINS[0][0], "// " + MAIN_PINS[0][0])))
     out.append(("out_prod loses its named throw", edit_pin(o, OUTPROD_PIN, "throw 1; // ")))
     return out
@@ -637,12 +718,15 @@ def main():
     if errs:
         print("FAIL: %d violation(s)" % len(errs))
         return 1
-    survived = [label for label, mutated in mutants(files) if not run(mutated)]
+    all_mutants = list(mutants(files))
+    n_mutants   = len(all_mutants)
+    survived    = [label for label, mutated in all_mutants if not run(mutated)]
     for label in survived:
         print("FAIL mutant survived: %s (the gate would not notice)" % label)
     if survived:
         return 1
-    print("PASS: the three wrappers return a [[nodiscard]] bool, decide the decline before any write, and every caller falls through")
+    print("PASS: the oneDNN decline consumers (dnnl-ops wrappers, DnnlGemmWrapper, the getter, the next paths) decide before any "
+          "write and fall through; %d mutants killed" % n_mutants)
     return 0
 
 
