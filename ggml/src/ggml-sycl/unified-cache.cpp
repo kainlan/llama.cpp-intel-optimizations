@@ -710,22 +710,37 @@ static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_c
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
-// llama.cpp-8ony: the Graph SDPA floor the current ONEDNN zone was sized to cover, stored by the zone sizing
-// (unified_cache::ensure_planned_arena_zones) at the moment it keeps or builds the zone, never recomputed from the
-// SDPA shape later (that shape is rewritten by runtime plans the zone may not have been rebuilt for).
-static std::atomic<size_t>   g_onednn_zone_graph_floor_bytes[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-8ony: the two figures the current ONEDNN zone was sized from -- the pair's own plan and the Graph SDPA floor
+// that shares the zone -- kept together as ONE snapshot, written by unified_cache::ensure_planned_arena_zones when it
+// keeps or builds the zone. The planner's live figures are overwritten by every model's plan (and the pair's upward by
+// reserve), and the SDPA shape the floor derives from is rewritten by runtime plans the zone was not rebuilt for, so
+// neither can describe a zone that was built earlier: a draft model loaded beside the target would hand a bound
+// derived from the draft's figures to the target's zone.
+static std::mutex            g_onednn_zone_plan_mutex;
+static zone_onednn_plan      g_onednn_zone_plan[GGML_SYCL_MAX_DEVICES]{};
 
-static void onednn_zone_graph_floor_store(int device_id, size_t bytes) {
-    if (device_id >= 0 && device_id < GGML_SYCL_MAX_DEVICES) {
-        g_onednn_zone_graph_floor_bytes[device_id].store(bytes, std::memory_order_release);
+static void onednn_zone_plan_store(int device_id, const zone_onednn_plan & plan) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
     }
+    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
+    g_onednn_zone_plan[device_id] = plan;
 }
 
-static size_t onednn_zone_graph_floor_load(int device_id) {
+static zone_onednn_plan onednn_zone_plan_load(int device_id) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return 0;
+        return zone_onednn_plan();
     }
-    return g_onednn_zone_graph_floor_bytes[device_id].load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
+    return g_onednn_zone_plan[device_id];
+}
+
+// The most an op's f16 pair may be for the ONEDNN zone of capacity `capacity_bytes` on `device_id` to count it as
+// planned (zone_onednn_pp_pair_bound over the snapshot above). The one source for the admission accessor and for the
+// reserve's own merge and refusal, so the two cannot disagree about what the zone was planned to hold.
+static size_t onednn_pp_pair_bound_for(int device_id, size_t capacity_bytes) {
+    const zone_onednn_plan plan = onednn_zone_plan_load(device_id);
+    return zone_onednn_pp_pair_bound(capacity_bytes, plan.bare_bytes, plan.graph_floor_bytes);
 }
 // llama.cpp-479i: planned bytes of the per-context dense MMQ/MMVQ Q8_1 src1 buffer
 // (n_ubatch * bytes-per-token from the inventory, 256-aligned), folded into the
@@ -2892,20 +2907,28 @@ size_t unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id) {
     return g_planned_onednn_scratchpad_bytes[device_id].load(std::memory_order_acquire);
 }
 
-size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {
+// The pair's own planned requirement and the Graph SDPA floor that shares its zone, read ONCE so the two describe
+// the same plan: the planner may overwrite the stored figure between two separate reads.
+static zone_onednn_plan onednn_planned_pair_and_floor(int device_id) {
+    zone_onednn_plan plan;
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return 0;
+        return plan;
     }
-    size_t bytes = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id);
+    plan.bare_bytes = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id);
 #if GGML_SYCL_DNNL
     if (ggml_sycl::onednn_graph_allocator_enabled()) {
         const onednn_graph_scratch_planned_shape shape =
             unified_cache_get_planned_onednn_graph_scratch_shape(device_id);
-        bytes += onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa,
-                                                           shape.n_ubatch, shape.n_ctx);
+        plan.graph_floor_bytes = onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max,
+                                                                           shape.n_swa, shape.n_ubatch, shape.n_ctx);
     }
 #endif
-    return bytes;
+    return plan;
+}
+
+size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {
+    const zone_onednn_plan plan = onednn_planned_pair_and_floor(device_id);
+    return plan.bare_bytes + plan.graph_floor_bytes;
 }
 
 void unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
@@ -5205,14 +5228,14 @@ bool unified_cache::ensure_planned_arena_zones() {
     }
 
     size_t       onednn_zone         = 256 * 1024 * 1024;
-    // WITH-FLOOR getter, deliberately: this sizes the REAL physical ONEDNN
-    // zone, which has to hold both the primitive-API pair and the
-    // Graph-scratch allocator's floor.
-    const size_t planned_onednn_zone = unified_cache_get_planned_onednn_scratchpad_bytes(dev_id);
-    // The Graph SDPA floor inside that figure (with-floor minus the pair's own stored plan): what this zone covers.
-    const size_t planned_onednn_pair = unified_cache_get_planned_onednn_scratchpad_bytes_stored(dev_id);
-    const size_t planned_onednn_floor =
-        planned_onednn_zone > planned_onednn_pair ? planned_onednn_zone - planned_onednn_pair : 0;
+    // This sizes the REAL physical ONEDNN zone, which has to hold both the
+    // primitive-API pair and the Graph-scratch allocator's floor. The pair's
+    // plan and the floor are read once, as one pair: they are what the zone is
+    // described by afterwards (the snapshot stored at both successful exits
+    // below).
+    const zone_onednn_plan live_plan           = onednn_planned_pair_and_floor(dev_id);
+    const size_t           planned_onednn_bare = live_plan.bare_bytes;
+    const size_t           planned_onednn_zone = live_plan.bare_bytes + live_plan.graph_floor_bytes;
     if (planned_onednn_zone > onednn_zone) {
         onednn_zone = planned_onednn_zone;
         GGML_LOG_INFO("[UNIFIED-CACHE] ONEDNN zone raised to %.1f MB from placement scratch estimate\n",
@@ -5236,8 +5259,7 @@ bool unified_cache::ensure_planned_arena_zones() {
     // own, so clamping the shared zone below what IT alone needs would starve
     // the primitive-API GEMM path, not just the Graph-scratch floor this
     // clamp exists to bound.
-    const size_t onednn_zone_budget_cap =
-        std::max(available_budget() / 4, unified_cache_get_planned_onednn_scratchpad_bytes_stored(dev_id));
+    const size_t onednn_zone_budget_cap = std::max(available_budget() / 4, planned_onednn_bare);
     if (onednn_zone > onednn_zone_budget_cap) {
         const size_t shortfall = onednn_zone - onednn_zone_budget_cap;
         // Per-instance member, not a function-local static -- see its
@@ -5317,7 +5339,9 @@ bool unified_cache::ensure_planned_arena_zones() {
             // which guards every read.
             onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
-            onednn_zone_graph_floor_store(dev_id, planned_onednn_floor);
+            // The zone is kept as it was built, so it stays described by the larger of the figures it was built from
+            // and this plan's: a later, smaller plan (a draft model beside the target) must not shrink them.
+            onednn_zone_plan_store(dev_id, zone_onednn_plan_keep(onednn_zone_plan_load(dev_id), live_plan));
             return true;
         }
 
@@ -5384,7 +5408,7 @@ bool unified_cache::ensure_planned_arena_zones() {
     // std::atomic store -- see that branch's comment.
     onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
-    onednn_zone_graph_floor_store(dev_id, planned_onednn_floor);
+    onednn_zone_plan_store(dev_id, live_plan);
     return true;
 }
 
@@ -18666,8 +18690,13 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         const bool   arena_on = arena_active();
         const size_t held_w   = onednn_weights_scratch_ ? onednn_weights_scratch_size_ : 0;
         const size_t held_a   = onednn_activations_scratch_ ? onednn_activations_scratch_size_ : 0;
-        zone_onednn_scratch_reserve_target(arena_on, arena_on ? zone_capacity(vram_zone_id::ONEDNN) : 0, held_w, held_a,
-                                           weights_size, activations_size, &weights_size, &activations_size);
+        // Bounded by the pair bound, not the raw capacity: two ops that each fit the bound can merge, per component,
+        // into a pair above it, and a held pair above it eats the bytes reserved for the Graph SDPA scratch.
+        const size_t pair_bound = arena_on ? onednn_pp_pair_bound_for(ggml_sycl_get_device_id_from_queue(queue_),
+                                                                      zone_capacity(vram_zone_id::ONEDNN)) :
+                                             0;
+        zone_onednn_scratch_reserve_target(arena_on, pair_bound, held_w, held_a, weights_size, activations_size,
+                                           &weights_size, &activations_size);
     }
 
     // Already reserved with sufficient size?
@@ -18820,6 +18849,20 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             }
             (void) ensure_planned_arena_zones();
             zone_cap = zone_capacity(vram_zone_id::ONEDNN);
+        }
+        // A pair above the bound fits the zone but is not planned into it: it would take the bytes reserved for the
+        // Graph SDPA scratch. acquire_onednn_pp_scratch asks the same bound before it asks for a reserve, so only a
+        // caller that skipped that question gets here.
+        const size_t pair_bound_now = onednn_pp_pair_bound_for(ggml_sycl_get_device_id_from_queue(queue_), zone_cap);
+        if (total_needed <= zone_cap && total_needed > pair_bound_now) {
+            GGML_LOG_ERROR(
+                "[UNIFIED-CACHE] refusing oneDNN scratch request %.1f MB (weights %.1f MB + activations %.1f MB): "
+                "it fits the %.1f MB ONEDNN zone but is above its pair bound %.1f MB, which leaves the Graph SDPA "
+                "scratch floor free; callers must ask the plan first (acquire_onednn_pp_scratch)\n",
+                total_needed / (1024.0f * 1024.0f), weights_size / (1024.0f * 1024.0f),
+                activations_size / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f),
+                pair_bound_now / (1024.0f * 1024.0f));
+            return finish(false);
         }
         if (total_needed <= zone_cap) {
             // The old arena-owned pair (if any) was already point-released
@@ -19507,21 +19550,21 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
 }
 
 // llama.cpp-8ony: the most an op's f16 pair may be for the ONEDNN zone to count it as planned, from the zone the arena
-// was built with and the two figures it was sized from: the pair's own plan (the bare stored getter) and the Graph SDPA
-// floor the zone sizing stored when it kept or built the zone. Capacity minus the floor is slack nobody else planned
-// for, so a pair inside it cannot push the Graph SDPA scratch onto its DIRECT path (an unplanned device allocation);
-// a pair above it would. The bound never falls below the plan (a clamped zone holds the plan), nor above the
-// capacity. Neither figure is recomputed here: the SDPA shape is rewritten by runtime plans the zone was not rebuilt
-// for, so a floor derived from it now could disagree with the zone that exists.
+// was built with and the snapshot of the two figures it was sized from (the pair's own plan and the Graph SDPA floor,
+// stored by the zone sizing when it kept or built the zone; see onednn_pp_pair_bound_for). Capacity minus the floor is
+// slack nobody else planned for, so a pair inside it cannot push the Graph SDPA scratch onto its DIRECT path (an
+// unplanned device allocation); a pair above it would. The bound never falls below the plan (a clamped zone holds the
+// plan), nor above the capacity. No figure is read live or recomputed here: both are overwritten by later plans the
+// zone was not rebuilt for. Not covered: a growth step still needs the superseded pair and the new one in the zone
+// at once (see the note in reserve_onednn_scratch), so a pair inside the bound can still fall through to the
+// unplanned direct allocation while its predecessor drains.
 bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound) {
     unified_cache * cache = get_existing_unified_cache_for_device(device_id);
     if (!cache || !cache->arena_active()) {
         return false;
     }
     if (bound) {
-        *bound = zone_onednn_pp_pair_bound(cache->zone_capacity(vram_zone_id::ONEDNN),
-                                           unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id),
-                                           onednn_zone_graph_floor_load(device_id));
+        *bound = onednn_pp_pair_bound_for(device_id, cache->zone_capacity(vram_zone_id::ONEDNN));
     }
     return true;
 }
@@ -27810,8 +27853,8 @@ bool onednn_pp_unified_scratch_enabled(ggml_type type) {
         }
         return -1;
     }();
-    return zone_onednn_pp_scratch_type_enabled(mode,
-                                               type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_MXFP4);
+    return zone_onednn_pp_scratch_type_enabled(
+        mode, type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_MXFP4);
 }
 
 std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vector<placement_tensor_info> & inventory) {

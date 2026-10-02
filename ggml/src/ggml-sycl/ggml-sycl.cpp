@@ -28290,9 +28290,9 @@ static bool ggml_sycl_onednn_pp_scratch_supplies(int                 device,
     }
     size_t     pair_bound   = 0;
     const bool arena_active = ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound);
-    return ggml_sycl::zone_onednn_pp_scratch_supplies(pp_candidate, ggml_sycl::onednn_pp_unified_scratch_enabled(src0->type),
-                                                      arena_active, pair_bound, w_elems * elem_bytes,
-                                                      a_elems * elem_bytes);
+    return ggml_sycl::zone_onednn_pp_scratch_supplies(
+        pp_candidate, ggml_sycl::onednn_pp_unified_scratch_enabled(src0->type), arena_active, pair_bound,
+        w_elems * elem_bytes, a_elems * elem_bytes);
 }
 
 static moe_route_capability ggml_sycl_moe_query_route_capability(
@@ -99759,8 +99759,8 @@ static bool ggml_sycl_mul_mat_scratch_route(ggml_backend_sycl_context & ctx,
                                             const ggml_tensor *         src1,
                                             ggml_tensor *               node,
                                             ggml_sycl_kernel_draws_fn   draws) {
-    return ggml_sycl_mul_mat_scratch_route_decided(ctx, src0, src1, node, ctx.matmul_orchestrator.select(src0, src1, node),
-                                                   draws);
+    return ggml_sycl_mul_mat_scratch_route_decided(ctx, src0, src1, node,
+                                                   ctx.matmul_orchestrator.select(src0, src1, node), draws);
 }
 
 static bool ggml_sycl_mul_mat_src1_quantizing_route(ggml_backend_sycl_context & ctx,
@@ -99998,8 +99998,9 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         // not enabled for it, so those draw these buffers and they must be sized here, at the first graph, not left
         // empty for the op to find the RUNTIME zone full (llama.cpp-8ony).
         bool       pp_candidate = false;
-        const bool supplied     = need_src0_f16 && need_src1_f16 &&
-                              ggml_sycl_onednn_pp_scratch_supplies(ctx.device, src0, src1, node, src1->ne[1], &pp_candidate);
+        const bool supplied =
+            need_src0_f16 && need_src1_f16 &&
+            ggml_sycl_onednn_pp_scratch_supplies(ctx.device, src0, src1, node, src1->ne[1], &pp_candidate);
         if (supplied) {
             continue;
         }
@@ -100009,8 +100010,7 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         // whatever its precision. The router is asked once per node and its answer shared by both arms.
         const ggml_sycl::MatmulDecision primary      = ctx.matmul_orchestrator.select(src0, src1, node);
         const bool                      prec_default = node->op_params[0] == GGML_PREC_DEFAULT;
-        const bool                      legacy_draws =
-            prec_default && ggml_sycl_mul_mat_f16_dequant_route(ctx, src0, src1, node, primary);
+        const bool legacy_draws = prec_default && ggml_sycl_mul_mat_f16_dequant_route(ctx, src0, src1, node, primary);
         const bool unified_draws =
             ggml_sycl_mul_mat_unified_pp_dequant_route(src0, src1, primary, pp_candidate, supplied);
         if (!ggml_sycl::zone_walk_f16_node_draws(prec_default, legacy_draws, unified_draws)) {

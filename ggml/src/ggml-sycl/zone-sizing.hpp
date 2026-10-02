@@ -99,7 +99,7 @@ struct zone_tensor_desc {
     size_t dequant_f16_if_unsupplied_src1_bytes_per_token = 0;
     // The adapter's answer to "is the oneDNN PP scratch enabled for this tensor's type" (environment and the
     // default type set). Only read together with the two fields above.
-    bool pp_scratch_type_enabled = false;
+    bool   pp_scratch_type_enabled                        = false;
 };
 
 struct path_scoped_maxima {
@@ -280,9 +280,12 @@ bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool
 //
 // `arena_active` is false when there is no ONEDNN zone at all (no arena): nothing was planned, nothing can
 // disagree, and the scratch comes from the unified-cache allocation path as it always did. With an arena the
-// pair must fit the zone (sum <= capacity, overflow-checked: a wrapped sum compares as small). Pure.
+// pair must fit the bound the zone was planned to hold (sum <= `pair_bound_bytes`, overflow-checked: a wrapped sum
+// compares as small). `pair_bound_bytes` is zone_onednn_pp_pair_bound over the zone's capacity, NOT the capacity
+// itself: a caller passing the raw capacity would admit a pair that takes the bytes reserved for the Graph SDPA
+// scratch. Pure.
 bool zone_onednn_pp_scratch_planned(bool   arena_active,
-                                    size_t zone_capacity_bytes,
+                                    size_t pair_bound_bytes,
                                     size_t weights_bytes,
                                     size_t activations_bytes);
 
@@ -292,20 +295,21 @@ bool zone_onednn_pp_scratch_planned(bool   arena_active,
 // the 256-row LM-head op, which needs the wider weights half), so replacing the held pair by the latest request
 // shrinks one half every time and forces the regrowth that the plan never provisioned (llama.cpp-8ony).
 //
-// With an arena the merged pair is still bounded by the ONEDNN zone. A held pair that cannot be merged inside the
-// zone (left over from a smaller or rebuilt arena) must not wedge every later request, so the request is used as
-// asked. Pure; a null out is ignored.
-void zone_onednn_scratch_reserve_target(bool    arena_active,
-                                        size_t  zone_capacity_bytes,
-                                        size_t  held_weights_bytes,
-                                        size_t  held_activations_bytes,
-                                        size_t  requested_weights_bytes,
-                                        size_t  requested_activations_bytes,
+// With an arena the merged pair is still bounded by `pair_bound_bytes` (zone_onednn_pp_pair_bound, not the raw
+// capacity): two ops that each fit the bound can merge, per component, into a pair above it. A held pair that
+// cannot be merged inside the bound (left over from a smaller or rebuilt arena) must not wedge every later
+// request, so the request is used as asked. Pure; a null out is ignored.
+void zone_onednn_scratch_reserve_target(bool     arena_active,
+                                        size_t   pair_bound_bytes,
+                                        size_t   held_weights_bytes,
+                                        size_t   held_activations_bytes,
+                                        size_t   requested_weights_bytes,
+                                        size_t   requested_activations_bytes,
                                         size_t * weights_bytes,
                                         size_t * activations_bytes);
 
-// The most an op's f16 pair may be for the ONEDNN zone to count it as planned there (the `zone_capacity_bytes` that
-// zone_onednn_pp_scratch_planned compares against). The zone is sized as the primitive-API pair's own plan plus a
+// The most an op's f16 pair may be for the ONEDNN zone to count it as planned there (the `pair_bound_bytes` that
+// zone_onednn_pp_scratch_planned and zone_onednn_scratch_reserve_target take). The zone is sized as the primitive-API pair's own plan plus a
 // floor for the oneDNN Graph SDPA scratch that shares it, and the zone is never smaller than a fixed minimum, so
 // its capacity can sit well above both. A pair is admitted up to capacity - floor: that is slack nobody planned
 // for, so admitting it cannot push the Graph SDPA scratch onto its DIRECT path (an unplanned device allocation).
@@ -345,7 +349,7 @@ bool zone_onednn_pp_scratch_type_enabled(int env_mode, bool default_type);
 bool zone_onednn_pp_scratch_supplies(bool   pp_candidate,
                                      bool   type_enabled,
                                      bool   arena_active,
-                                     size_t zone_capacity_bytes,
+                                     size_t pair_bound_bytes,
                                      size_t weights_bytes,
                                      size_t activations_bytes);
 

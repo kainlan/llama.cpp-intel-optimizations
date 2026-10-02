@@ -190,16 +190,18 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
             zone_dequant_f16_planned_when_unsupplied(tensor.pp_scratch_type_enabled, onednn_eligible)) {
             maxima.dequant_f16_weight_bytes =
                 std::max(maxima.dequant_f16_weight_bytes, tensor.dequant_f16_if_unsupplied_weight_bytes);
-            maxima.dequant_f16_src1_bytes_per_token = std::max(
-                maxima.dequant_f16_src1_bytes_per_token, tensor.dequant_f16_if_unsupplied_src1_bytes_per_token);
+            maxima.dequant_f16_src1_bytes_per_token = std::max(maxima.dequant_f16_src1_bytes_per_token,
+                                                               tensor.dequant_f16_if_unsupplied_src1_bytes_per_token);
         }
     }
     return maxima;
 }
 
 zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live) {
-    (void) held;
-    return live;  // RED stub (llama.cpp-8ony)
+    zone_onednn_plan kept;
+    kept.bare_bytes        = std::max(held.bare_bytes, live.bare_bytes);
+    kept.graph_floor_bytes = std::max(held.graph_floor_bytes, live.graph_floor_bytes);
+    return kept;
 }
 
 bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool pair_eligible) {
@@ -327,7 +329,7 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
 }
 
 bool zone_onednn_pp_scratch_planned(bool   arena_active,
-                                    size_t zone_capacity_bytes,
+                                    size_t pair_bound_bytes,
                                     size_t weights_bytes,
                                     size_t activations_bytes) {
     if (!arena_active) {
@@ -336,23 +338,23 @@ bool zone_onednn_pp_scratch_planned(bool   arena_active,
     if (weights_bytes > SIZE_MAX - activations_bytes) {
         return false;
     }
-    return weights_bytes + activations_bytes <= zone_capacity_bytes;
+    return weights_bytes + activations_bytes <= pair_bound_bytes;
 }
 
-void zone_onednn_scratch_reserve_target(bool    arena_active,
-                                        size_t  zone_capacity_bytes,
-                                        size_t  held_weights_bytes,
-                                        size_t  held_activations_bytes,
-                                        size_t  requested_weights_bytes,
-                                        size_t  requested_activations_bytes,
+void zone_onednn_scratch_reserve_target(bool     arena_active,
+                                        size_t   pair_bound_bytes,
+                                        size_t   held_weights_bytes,
+                                        size_t   held_activations_bytes,
+                                        size_t   requested_weights_bytes,
+                                        size_t   requested_activations_bytes,
                                         size_t * weights_bytes,
                                         size_t * activations_bytes) {
     const size_t merged_weights     = std::max(held_weights_bytes, requested_weights_bytes);
     const size_t merged_activations = std::max(held_activations_bytes, requested_activations_bytes);
     // A merged pair that cannot exist inside the zone (or whose sum is unrepresentable) is not a target: the
     // request is used as asked, so a stale oversized held pair never wedges every later request.
-    const bool merged_fits = !arena_active || (merged_weights <= SIZE_MAX - merged_activations &&
-                                               merged_weights + merged_activations <= zone_capacity_bytes);
+    const bool   merged_fits        = !arena_active || (merged_weights <= SIZE_MAX - merged_activations &&
+                                               merged_weights + merged_activations <= pair_bound_bytes);
     if (weights_bytes) {
         *weights_bytes = merged_fits ? merged_weights : requested_weights_bytes;
     }
@@ -373,11 +375,11 @@ bool zone_onednn_pp_scratch_type_enabled(int env_mode, bool default_type) {
 bool zone_onednn_pp_scratch_supplies(bool   pp_candidate,
                                      bool   type_enabled,
                                      bool   arena_active,
-                                     size_t zone_capacity_bytes,
+                                     size_t pair_bound_bytes,
                                      size_t weights_bytes,
                                      size_t activations_bytes) {
     return pp_candidate && type_enabled &&
-           zone_onednn_pp_scratch_planned(arena_active, zone_capacity_bytes, weights_bytes, activations_bytes);
+           zone_onednn_pp_scratch_planned(arena_active, pair_bound_bytes, weights_bytes, activations_bytes);
 }
 
 bool zone_unified_pp_draws_dequant(bool primary_unified,

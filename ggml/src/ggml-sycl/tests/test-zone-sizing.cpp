@@ -857,7 +857,8 @@ int main() {
                   "equal reading: capacity minus the floor equals the plan");
         }
         // edges
-        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(100 * mib, 20 * mib, 0) == 100 * mib, "no floor: the whole capacity");
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(100 * mib, 20 * mib, 0) == 100 * mib,
+              "no floor: the whole capacity");
         CHECK(ggml_sycl::zone_onednn_pp_pair_bound(10 * mib, 80 * mib, 50 * mib) == 10 * mib,
               "never above the capacity, even when the plan is");
         CHECK(ggml_sycl::zone_onednn_pp_pair_bound(100 * mib, 20 * mib, 500 * mib) == 20 * mib,
@@ -881,10 +882,10 @@ int main() {
         const size_t layer_w = 117440512;  // 4096 x 14336 f16
         const size_t head_w  = 262144000;  // 4096 x 32000 f16
         auto         marked  = [&](const char * name, int64_t ne0, int64_t ne1, size_t f16_w, bool enabled) {
-            zone_tensor_desc d                    = desc(name, 1000, TYPE_Q4_0, ne0, ne1, 1, 1);
+            zone_tensor_desc d                               = desc(name, 1000, TYPE_Q4_0, ne0, ne1, 1, 1);
             d.dequant_f16_if_unsupplied_weight_bytes         = f16_w;
             d.dequant_f16_if_unsupplied_src1_bytes_per_token = static_cast<size_t>(ne0) * F16_BYTES;
-            d.pp_scratch_type_enabled             = enabled;
+            d.pp_scratch_type_enabled                        = enabled;
             return d;
         };
         std::vector<zone_tensor_desc> layers;
@@ -959,8 +960,7 @@ int main() {
         const size_t bound = 235 * mib;
         size_t       w = 0, a = 0;
         ggml_sycl::zone_onednn_scratch_reserve_target(true, bound, 200 * mib, 4 * mib, 40 * mib, 40 * mib, &w, &a);
-        CHECK(w == 40 * mib && a == 40 * mib,
-              "a merge above the bound is not held: the request is used as asked");
+        CHECK(w == 40 * mib && a == 40 * mib, "a merge above the bound is not held: the request is used as asked");
         ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 4 * mib, 40 * mib, 40 * mib, &w, &a);
         CHECK(w == 200 * mib && a == 40 * mib,
               "the same two ops against the raw capacity merge to 240 MiB, past the 235 MiB bound");
