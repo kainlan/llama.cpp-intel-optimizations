@@ -63,12 +63,15 @@ guarded = {
 for path, targets in guarded.items():
     text = path.read_text(encoding="utf-8")
     for target in targets:
-        at = text.find(target)
-        if at < 0:
+        # Every occurrence, not the first: a second, unguarded definition appended to the file must fail too.
+        found = [m.start() for m in re.finditer(re.escape(target), text)]
+        if not found:
             raise SystemExit(f"{path.name}: seam `{target}` not found")
-        opened = text.rfind(GUARD, 0, at)
-        if opened < 0 or re.search(r"^\s*#\s*(?:if|ifdef|ifndef|elif|else|endif)\b", text[opened + len(GUARD):at], re.M):
-            raise SystemExit(f"{path.name}: seam `{target}` is not directly inside a `{GUARD}` region")
+        for at in found:
+            opened = text.rfind(GUARD, 0, at)
+            if opened < 0 or re.search(r"^\s*#\s*(?:if|ifdef|ifndef|elif|else|endif)\b", text[opened + len(GUARD):at], re.M):
+                line = text.count("\n", 0, at) + 1
+                raise SystemExit(f"{path.name}:{line}: seam `{target}` is not directly inside a `{GUARD}` region")
 
 if len(sys.argv) > 1:
     artifact = Path(sys.argv[1])

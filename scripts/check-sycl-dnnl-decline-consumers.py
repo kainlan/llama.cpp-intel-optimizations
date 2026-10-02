@@ -16,10 +16,12 @@ wrappers (comments blanked first):
   - `ggml_sycl_dnnl_note_engaged(SITE)` is called once, unconditionally (the statement before it ends in `;` or `}`), after the
     decision and before the primitive is executed, so a run that reached the wrapper can say so; the decision's arguments are
     the literal `scratchpad_mem, scratchpad_md`;
-  - nothing before that decision writes: no parallel_for, single_task, memcpy, memset, fill, copy, submit or `.execute(`, no
-    mention of dst or dst_f at all (an alias would be a write the token list cannot see), no const_cast, static_cast or
-    reinterpret_cast, and no dnnl::memory object bound to the output; the signature keeps the parameters those names stand for (a decline after a write would hand the fallback
-    modified inputs; softmax's pre-scale pass runs in place, so a late decision would apply the scale twice);
+  - nothing before that decision writes (a decline after a write would hand the fallback modified inputs; softmax's pre-scale
+    pass runs in place, so a late decision would apply the scale twice): no parallel_for, single_task, memcpy, memmove, memset,
+    fill, fill_n, copy, copy_n, transform, submit or `.execute(`, no mention of dst or dst_f at all (an alias would be a write
+    the token list cannot see), no const_cast, static_cast or reinterpret_cast, no C-style cast of src, src0, src1 or dst (the
+    input pointers are const only by declaration), and no dnnl::memory object bound to the output. The signature check pins
+    the parameters those names stand for;
   - no `throw` and no `catch` anywhere in the class: a decline is a return value, and a catch-all would swallow one.
 
 Outside the wrappers:
@@ -31,8 +33,10 @@ Outside the wrappers:
     added, add it there.
 
 Between the if and the `#endif` / `#else` that ends the DNNL section only whitespace and the closing braces of its blocks may
-appear: no statement, goto, throw, abort or else can follow it. That is the shape of all five real callers. Limit: a `return`
-placed deeper in the fallback code, after that preprocessor line, is not seen; the device test is the only catch for that.
+appear: no statement, goto, throw, abort or else can follow it. When that line is an `#else`, its arm (up to the matching
+`#endif`, nested #if blocks counted) may not contain return, goto, throw, GGML_ABORT, GGML_ASSERT, abort or exit, since the
+build without DNNL would leave before the fallback. That is the shape of all five real callers. Limit: a `return` placed after
+the `#endif`, in the fallback code itself, is not seen; the device test is the only catch for that.
 
 Every check is also run against mutants of the same text and each must fail there, so a regex that stopped matching fails the
 gate instead of passing it. A mutant whose anchor text has moved is an assertion error, not a skip. Exit 0 on success, 1 on a
@@ -60,8 +64,11 @@ CALLERS = {"softmax.cpp": ("DnnlSoftmaxWrapper::softmax", 1), "element_wise.cpp"
 DECISION = re.compile(r"if\s*\(\s*" + HELPER + r"\s*\(\s*GGML_SYCL_SCRATCHPAD_SITE_(\w+)\s*,\s*scratchpad_mem\s*,\s*scratchpad_md\s*\)\s*\)"
                       r"\s*\{\s*return\s+false\s*;\s*\}")
 NOTE = re.compile(r"\bggml_sycl_dnnl_note_engaged\s*\(\s*GGML_SYCL_SCRATCHPAD_SITE_(\w+)\s*\)\s*;")
-WRITE = re.compile(r"\bparallel_for\b|\bsingle_task\b|\bmemcpy\b|\bmemset\b|\bfill\b|\bcopy\b|\bsubmit\b|\.\s*execute\s*\("
-                   r"|\bdst(?:_f)?\b|\b(?:const|static|reinterpret)_cast\b|\bdnnl::memory\s*\(")
+WRITE = re.compile(r"\bparallel_for\b|\bsingle_task\b|\bmemcpy\b|\bmemmove\b|\bmemset\b|\bfill\b|\bfill_n\b|\bcopy\b|\bcopy_n\b"
+                   r"|\btransform\b|\bsubmit\b|\.\s*execute\s*\(|\bdst(?:_f)?\b|\b(?:const|static|reinterpret)_cast\b"
+                   r"|\(\s*[\w:\s]+\*\s*\)\s*(?:src\d?|dst)\b|\bdnnl::memory\s*\(")
+# What may not appear in the #else arm of a caller's `#if GGML_SYCL_DNNL` section: any way to leave before the fallback runs.
+LEAVE = re.compile(r"\breturn\b|\bgoto\b|\bthrow\b|\bGGML_ABORT\b|\bGGML_ASSERT\b|\babort\b|\bexit\b")
 DEAD = (
     (re.compile(r"\beltwise_in_?place\b"), "eltwise_inplace (a forwarder with no caller)"),
     (re.compile(r"\bDnnlReductionWrapper\b"), "DnnlReductionWrapper (an emptied class, deleted by design 4.8)"),
@@ -184,6 +191,26 @@ def check_header(text):
     return errs
 
 
+def else_arm_of(text):
+    """The text of the #else arm that begins `text` (after the closing braces), up to its matching #endif; None if there is none.
+    Nested #if blocks inside the arm are counted so the scan stops at the right #endif."""
+    m = re.match(r"[\s}]*#\s*(\w+)[^\n]*\n", text)
+    if m is None or m.group(1) != "else":
+        return None
+    depth = 0
+    pos = m.end()
+    for line in re.finditer(r"[^\n]*\n|[^\n]+$", text[pos:]):
+        d = re.match(r"\s*#\s*(\w+)", line.group(0))
+        if d is not None:
+            if d.group(1) in ("if", "ifdef", "ifndef"):
+                depth += 1
+            elif d.group(1) == "endif":
+                if depth == 0:
+                    return text[pos:pos + line.start()]
+                depth -= 1
+    return text[pos:]
+
+
 def check_caller(rel, text):
     errs = []
     text = strip_comments(text)
@@ -211,6 +238,10 @@ def check_caller(rel, text):
         if not re.match(r"[\s}]*#\s*(?:endif|else)\b", after[end:]):
             errs.append("%s: something other than the closing braces of its blocks follows the if around %s before the end of "
                         "the DNNL section, so the fallback may never run" % (rel, sym))
+        else_arm = else_arm_of(after[end:])
+        if else_arm is not None and LEAVE.search(else_arm):
+            errs.append("%s: the #else arm of the DNNL section around %s leaves (return, goto, throw or abort), so the fallback "
+                        "would not run in the build without DNNL" % (rel, sym))
     return errs
 
 
