@@ -157,22 +157,15 @@ def test_anchors_are_identity_not_position() -> None:
 
 
 if __name__ == "__main__":
-    if "--self-test" in sys.argv:
-        failures = 0
-        for name, fn in sorted(globals().items()):
-            if name.startswith("test_") and callable(fn):
-                try:
-                    fn()
-                    print(f"ok   {name}")
-                except AssertionError as exc:
-                    failures += 1
-                    print(f"FAIL {name}: {exc}")
-        print(
-            "test-sycl-mmid-admission-source: "
-            + ("OK" if failures == 0 else f"FAILED ({failures})")
-        )
-        sys.exit(1 if failures else 0)
-    test_mmid_admission_is_wired_to_the_mmid_tables()
-    test_mutations_are_rejected()
-    test_anchors_are_identity_not_position()
-    print("test-sycl-mmid-admission-source: OK")
+    # Every module-level test_ function runs, so a test added later cannot be skipped on a direct run.
+    failures = 0
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"ok   {name}")
+            except AssertionError as exc:
+                failures += 1
+                print(f"FAIL {name}: {exc}")
+    print("test-sycl-mmid-admission-source: " + ("OK" if failures == 0 else f"FAILED ({failures})"))
+    sys.exit(1 if failures else 0)
