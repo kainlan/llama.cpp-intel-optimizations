@@ -166,6 +166,11 @@ bool dummy_split_buffer(ggml_backend_buffer_t) {
     return false;
 }
 
+bool split_always_buffer(ggml_backend_buffer_t) {
+    g_split_calls++;
+    return true;
+}
+
 bool counting_weight_tensor(const ggml_tensor *) {
     g_weight_calls++;
     return true;
@@ -333,6 +338,20 @@ int main() {
               "a placed src0 asks the weight predicate once; the unplaced src1 never");
         CHECK(!ggml_sycl_mul_mat_routes_batched_f16(w, x, out, e1), "a placed weight never routes batched");
         w->buffer = nullptr;
+    }
+
+    // ---- the split helper: the one read of "src0 is row-split" ----
+    {
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 4);
+        g_split_calls   = 0;
+        CHECK(!ggml_sycl_mul_mat_src0_is_split(t, split_always_buffer) && g_split_calls == 0,
+              "a tensor with no buffer is not split, and the predicate is not asked, whatever it would answer");
+        t->buffer = reinterpret_cast<ggml_backend_buffer_t>(&g_split_calls);
+        CHECK(ggml_sycl_mul_mat_src0_is_split(t, split_always_buffer) && g_split_calls == 1,
+              "a placed tensor is split when the predicate says so");
+        CHECK(!ggml_sycl_mul_mat_src0_is_split(t, dummy_split_buffer) && g_split_calls == 2,
+              "and not split when it says not");
+        t->buffer = nullptr;
     }
 
     // ---- the staging size: what alloc() receives at the site ----

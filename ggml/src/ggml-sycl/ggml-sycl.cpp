@@ -66722,7 +66722,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     // Set GGML_SYCL_TG_FAST=0 to disable and fall through to unified kernel.
     // =====================================================================
     {
-        const bool        fast_split       = ggml_backend_buffer_is_sycl_split(src0->buffer);
+        const bool        fast_split       = ggml_sycl_mul_mat_src0_is_split(src0, ggml_backend_buffer_is_sycl_split);
         static const bool tg_fast_disabled = []() {
             const char * env = std::getenv("GGML_SYCL_TG_FAST");
             return env && std::atoi(env) == 0;

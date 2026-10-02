@@ -34,6 +34,13 @@ struct ggml_sycl_mul_mat_route_env {
     bool stage_strided    = false;  // the oneDNN-strided staging path, not the oneMath element-count one
 };
 
+// Whether src0 is in a row-split buffer. A tensor with no buffer is in none, and `is_split_buffer`, the backend's
+// own predicate (it reads the buffer's type), is never asked about it. Every read of this fact in the mul_mat
+// dispatch goes through here.
+inline bool ggml_sycl_mul_mat_src0_is_split(const ggml_tensor * src0, bool (*is_split_buffer)(ggml_backend_buffer_t)) {
+    return src0->buffer != nullptr && is_split_buffer(src0->buffer);
+}
+
 // The environment of `mul_mat(src0, src1)`. A tensor with no buffer is in no row-split buffer and is no weight:
 // the buffer predicates are never asked about it. That is the answer for an operand the scheduler has not placed
 // yet, which includes a weight at a load-time MEASURE; the route then reads such a weight as an activation, so a
@@ -46,7 +53,7 @@ inline ggml_sycl_mul_mat_route_env ggml_sycl_mul_mat_route_env_from(const ggml_t
                                                                     bool kqv_force_simple,
                                                                     bool stage_strided) {
     ggml_sycl_mul_mat_route_env env;
-    env.split = src0->buffer != nullptr && is_split_buffer(src0->buffer);
+    env.split = ggml_sycl_mul_mat_src0_is_split(src0, is_split_buffer);
     env.has_weight =
         (src0->buffer != nullptr && is_weight_tensor(src0)) || (src1->buffer != nullptr && is_weight_tensor(src1));
     env.kqv_force_simple = kqv_force_simple;

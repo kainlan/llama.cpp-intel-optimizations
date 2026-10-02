@@ -78,6 +78,7 @@ def dispatch_ok(code: str) -> bool:
         "const ggml_sycl_mul_mat_route_env route_env = ggml_sycl_mul_mat_route_env_of(src0, src1);",
         "const bool force_simple_kqv = route_env.kqv_force_simple && ggml_sycl_mul_mat_is_kqv(src0, src1, dst);",
         "const bool split = route_env.split;",
+        "const bool fast_split = ggml_sycl_mul_mat_src0_is_split(src0, ggml_backend_buffer_is_sycl_split);",
         "const bool batched_has_weight = route_env.has_weight;",
         "const ggml_sycl_mul_mat_f16_route f16_route = ggml_sycl_mul_mat_f16_route_of(src0, src1, dst, route_env);",
         f"if (f16_route == {_R}KQ_P021 || f16_route == {_R}KQ_BATCHED) {{",
@@ -93,6 +94,9 @@ def dispatch_ok(code: str) -> bool:
     if b.count(z("ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);")) != 2:
         return False
     # the old chain's predicates on src0 and the inline kqv lambda are gone
+    # and no read of the row-split predicate in the dispatch but through the helper, so no unchecked buffer read
+    if z("ggml_backend_buffer_is_sycl_split(") in b or b.count(z("ggml_sycl_mul_mat_src0_is_split(")) != 1:
+        return False
     for gone in ("ggml_is_permuted(src0)", "ggml_is_transposed(src0)", "is_kqv_matmul", "kqv_matmul"):
         if z(gone) in b:
             return False
@@ -112,6 +116,8 @@ def test_dispatch_mutants():
         ("split derived inline", "const bool split = route_env.split;", "const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);"),
         ("has_weight derived inline", "const bool batched_has_weight = route_env.has_weight;",
          "const bool batched_has_weight = ggml_sycl_tensor_is_weight(src0) || ggml_sycl_tensor_is_weight(src1);"),
+        ("fast_split read unchecked again", "ggml_sycl_mul_mat_src0_is_split(src0, ggml_backend_buffer_is_sycl_split)",
+         "ggml_backend_buffer_is_sycl_split(src0->buffer)"),
         ("the kqv branch not the classifier's", f"}} else if (f16_route == {_R}VEC_NC) {{",
          "} else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0)) {"),
         ("the scalar branch lost", f"f16_route == {_R}KQKV_BATCHED || f16_route == {_R}KQKV_SCALAR", f"f16_route == {_R}KQKV_BATCHED"),
@@ -223,12 +229,42 @@ def env_from_ok(hpp: str) -> bool:
         return False
     b = function_body(h, _ENV_FROM)
     pins = [
-        "env.split = src0->buffer != nullptr && is_split_buffer(src0->buffer);",
+        "env.split = ggml_sycl_mul_mat_src0_is_split(src0, is_split_buffer);",
         "env.has_weight = (src0->buffer != nullptr && is_weight_tensor(src0)) || (src1->buffer != nullptr && is_weight_tensor(src1));",
         "env.kqv_force_simple = kqv_force_simple;",
         "env.stage_strided = stage_strided;",
     ]
     return all(b.count(z(p)) == 1 for p in pins)
+
+
+_SPLIT_HELPER = (
+    "inline bool ggml_sycl_mul_mat_src0_is_split(const ggml_tensor * src0, bool (*is_split_buffer)(ggml_backend_buffer_t))"
+)
+
+
+def split_helper_ok(hpp: str) -> bool:
+    h = code_of(hpp)
+    if z(_SPLIT_HELPER) not in h:
+        return False
+    return function_body(h, _SPLIT_HELPER).count(z("return src0->buffer != nullptr && is_split_buffer(src0->buffer);")) == 1
+
+
+def test_the_split_helper_is_null_safe_and_defined_once():
+    assert split_helper_ok(STAGE_HPP)
+    # a helper that asks the predicate about a null buffer, or that never asks it, is caught
+    for old, new in [
+        ("return src0->buffer != nullptr && is_split_buffer(src0->buffer);", "return is_split_buffer(src0->buffer);"),
+        ("return src0->buffer != nullptr && is_split_buffer(src0->buffer);", "return src0->buffer != nullptr;"),
+    ]:
+        assert z(old) in code_of(STAGE_HPP)
+        mutated = STAGE_HPP.replace(
+            "return src0->buffer != nullptr && is_split_buffer(src0->buffer);", new, 1)
+        assert mutated != STAGE_HPP and not split_helper_ok(mutated), f"mutant {new!r} slipped through"
+    # nothing else in the SYCL sources defines it
+    n = 0
+    for path in list(SYCL.glob("*.cpp")) + list(SYCL.glob("*.hpp")):
+        n += code_of(path.read_text()).count(z("bool ggml_sycl_mul_mat_src0_is_split("))
+    assert n == 1
 
 
 def test_the_environment_builder_treats_an_unplaced_operand_as_neither_split_nor_weight():
@@ -239,7 +275,7 @@ def test_environment_builder_mutants():
     h = code_of(STAGE_HPP)
     b = function_body(h, _ENV_FROM)
     for name, old, new in [
-        ("split asked of a null buffer", "src0->buffer != nullptr && is_split_buffer(src0->buffer)", "is_split_buffer(src0->buffer)"),
+        ("split read inline in the environment builder", "ggml_sycl_mul_mat_src0_is_split(src0, is_split_buffer)", "is_split_buffer(src0->buffer)"),
         ("src0's weight asked of a null buffer", "(src0->buffer != nullptr && is_weight_tensor(src0))", "is_weight_tensor(src0)"),
         ("src1's weight asked of a null buffer", "(src1->buffer != nullptr && is_weight_tensor(src1))", "is_weight_tensor(src1)"),
         ("only src0's weight", " || (src1->buffer != nullptr && is_weight_tensor(src1))", ""),
