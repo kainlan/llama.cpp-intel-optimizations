@@ -283,6 +283,13 @@ int main(int, char ** argv) {
         return LLAMA_TEST_EXIT_SKIP;
     }
     bool ok = true;
+    // A negative after_n is not "never" and not "the first call": the seam refuses it, and an unknown site too.
+    if (ggml_sycl_test_inject_scratchpad_decline("dnnl_softmax", -1) ||
+        ggml_sycl_test_inject_scratchpad_decline("no_such_site", 1)) {
+        fprintf(stderr, "FAIL: the seam accepted a negative after_n or an unknown site\n");
+        ok = false;
+    }
+    ggml_sycl_test_scratchpad_sites_reset();
     for (const arm & a : make_arms()) {
         const run_result off = run_arm(backend, a, 0);
         const run_result on  = run_arm(backend, a, 1);
