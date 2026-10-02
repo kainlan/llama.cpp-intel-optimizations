@@ -564,6 +564,7 @@ OWN_MAIN = (
 )
 HAND_LISTED = '\nif __name__ == "__main__":\n    test_x()\n    print("ok")\n'
 UNITTEST_GATE = "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.assertTrue(True)\n"
+MAIN_FN = "import sys\n\n\ndef main():\n    return 1 if len(sys.argv) > 99 else 0\n\n"
 UNITTEST_MAIN = '\n\nif __name__ == "__main__":\n    unittest.main()\n'
 REG_P_PYTEST = "llama_test_pytest(${Python3_EXECUTABLE} SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-p.py)\n"
 REG_P_ADD = "add_test(NAME p COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-p.py)\n"
@@ -618,6 +619,29 @@ R3_CASES = [
      '    for name, fn in list(globals().items()):\n        if name.startswith("test_") and callable(fn):\n'
      '            try:\n                fn()\n            except AssertionError:\n                failures += 1\n'
      '    if failures:\n        sys.exit()\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    # unittest.main(module=...) / unittest.main("othermod") runs another module's tests, not this file's.
+    ("r3-unittest-main-module-keyword", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(module="othermod")\n',
+     REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-unittest-main-positional-module", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main("othermod")\n',
+     REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-ok-unittest-main-name-module", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(__name__)\n',
+     REG_P_ADD, None),
+    # A handler in the loop that swallows what the recording handler does not catch, and a loop narrowed to nothing.
+    ("r3-loop-extra-swallow-except", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n    for name, fn in list(globals().items()):\n        if name.startswith("test_") and callable(fn):\n            try:\n                fn()\n            except AssertionError:\n                failures += 1\n            except Exception:\n                pass\n    sys.exit(1 if failures else 0)\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-name-narrowed", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n    for name, fn in list(globals().items()):\n        if name.startswith("test_") and name == "test_nothing" and callable(fn):\n            try:\n                fn()\n            except AssertionError:\n                failures += 1\n    sys.exit(1 if failures else 0)\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-narrowed-by-and-false", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n    for name, fn in list(globals().items()):\n        if name.startswith("test_") and False:\n            try:\n                fn()\n            except AssertionError:\n                failures += 1\n    sys.exit(1 if failures else 0)\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-narrowed-by-membership", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n    for name, fn in list(globals().items()):\n        if name.startswith("test_") and name in ("test_nothing",):\n            try:\n                fn()\n            except AssertionError:\n                failures += 1\n    sys.exit(1 if failures else 0)\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    # A script-style gate whose main() returns a status that the guard drops: `main()` instead of `sys.exit(main())`.
+    ("r3-script-main-status-dropped", MAIN_FN + '\nif __name__ == "__main__":\n    main()\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-script-main-status-assigned-and-dropped", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    print("done")\n',
+     REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-ok-script-main-exit", MAIN_FN + '\nif __name__ == "__main__":\n    sys.exit(main())\n', REG_P_ADD, None),
+    ("r3-ok-script-main-raise-systemexit", MAIN_FN + '\nif __name__ == "__main__":\n    raise SystemExit(main())\n', REG_P_ADD, None),
+    ("r3-ok-script-main-status-forwarded", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    sys.exit(rc)\n', REG_P_ADD, None),
+    ("r3-ok-script-main-exits-itself", "import sys\n\n\ndef main():\n    sys.exit(1)\n\n\nif __name__ == \"__main__\":\n    main()\n",
+     REG_P_ADD, None),
+    ("r3-ok-script-main-returns-nothing", "def main():\n    print('ok')\n    return\n\n\nif __name__ == \"__main__\":\n    main()\n",
+     REG_P_ADD, None),
     ("r3-ok-loop-exits-only-on-failure", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n'
      '    for name, fn in list(globals().items()):\n        if name.startswith("test_") and callable(fn):\n'
      '            try:\n                fn()\n            except AssertionError:\n                failures += 1\n'
@@ -682,6 +706,17 @@ MATCH_CASES += [
     ("reg-disabled-via-set-property", "add_test(NAME o COMMAND python3 " + _M + ")\nset_property(TEST o PROPERTY DISABLED ON)\n"),
     ("reg-pytest-disabled-by-name", "llama_test_pytest(python3 NAME o SCRIPT " + _M + ")\nset_tests_properties(o PROPERTIES DISABLED 1)\n"),
     ("reg-pytest-disabled-by-default-name", "llama_test_pytest(python3 SCRIPT " + _M + ")\nset_tests_properties(test-sycl-m PROPERTIES DISABLED TRUE)\n"),
+    # A SKIP_RETURN_CODE other than 77 turns a failing (1) or passing (0) exit into a skip.
+    ("reg-skip-return-code-1", "add_test(NAME o COMMAND python3 " + _M + ")\nset_tests_properties(o PROPERTIES SKIP_RETURN_CODE 1)\n"),
+    ("reg-skip-return-code-0", "add_test(NAME o COMMAND python3 " + _M + ")\nset_tests_properties(o PROPERTIES SKIP_RETURN_CODE 0)\n"),
+    # An interpreter flag in front of the gate makes python do something other than run it.
+    ("reg-interp-m-py-compile", "add_test(NAME o COMMAND python3 -m py_compile " + _M + ")\n"),
+    ("reg-interp-c-pass", "add_test(NAME o COMMAND python3 -c pass " + _M + ")\n"),
+    ("reg-interp-help", "add_test(NAME o COMMAND python3 -h " + _M + ")\n"),
+    ("reg-interp-version", "add_test(NAME o COMMAND python3 -V " + _M + ")\n"),
+    ("reg-cmd-interp-m", "llama_test_cmd(python3 NAME o ARGS -m py_compile " + _M + ")\n"),
+    # The test only exists in one build configuration.
+    ("reg-configurations", "add_test(NAME o COMMAND python3 " + _M + " CONFIGURATIONS NeverBuilt)\n"),
     ("reg-in-if-not-true", "if(NOT TRUE)\nadd_test(NAME o COMMAND python3 " + _M + ")\nendif()\n"),
     ("reg-in-if-not-1", "if(NOT 1)\nadd_test(NAME o COMMAND python3 " + _M + ")\nendif()\n"),
 ]
@@ -694,6 +729,9 @@ MATCH_OK_CASES = [
     ("reg-ok-if-not-false", "if(NOT FALSE)\nadd_test(NAME o COMMAND python3 " + _M + ")\nendif()\n"),
     ("reg-ok-python-variable", "add_test(NAME o COMMAND ${LLAMA_PYTHON3} " + _M + ")\n"),
     ("reg-ok-interpreter-flag", "add_test(NAME o COMMAND python3 -B " + _M + ")\n"),
+    ("reg-ok-skip-return-code-77-string", "add_test(NAME o COMMAND python3 " + _M + ")\nset_tests_properties(o PROPERTIES SKIP_RETURN_CODE \"77\")\n"),
+    ("reg-ok-interpreter-flags-b-u", "add_test(NAME o COMMAND python3 -B -u " + _M + ")\n"),
+    ("reg-ok-cmd-interpreter-flag", "llama_test_cmd(python3 NAME o ARGS -B " + _M + ")\n"),
     ("reg-ok-command-then-args", "add_test(NAME o COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-m.py --self-test)\n"),
 ]
 
