@@ -2845,7 +2845,10 @@ sched_reserve_result llama_context::sched_reserve_transaction() {
         const std::vector<llama_tenant_buft_caps> tenant_caps = measure_tenant_caps(storage.plan);
         std::string                               tenant_reason;
         if (!llama_tenant_section_from_caps(tenant_caps, tenant_section, tenant_reason)) {
-            return { sched_reserve_status::REFUSED, tenant_reason, true };
+            // Not a fit verdict: the builder refuses only a plan inconsistency (a device compute buft with no device
+            // index), never a capacity shortfall, so lowering -ub must not hide it. A capacity refusal arrives from the
+            // publish below (PLAN_REJECTED) and carries the fit flag there.
+            return { sched_reserve_status::REFUSED, tenant_reason };
         }
         tenant_key = llama_tenant_key_digest(tenant_section);
         tenant_plan_report(storage.plan, storage.cparams.n_ubatch);
