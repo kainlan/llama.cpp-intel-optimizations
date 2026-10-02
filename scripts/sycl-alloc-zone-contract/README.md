@@ -14,7 +14,7 @@ llama.cpp-23mk S2). JSON has no comments, so each file also carries a `_doc` fie
 Allowlist entries added in S2b (clause e): the raw allocator chain's three links in `unified-cache.cpp`
 (`E-CHAIN-ALIGNED`, `E-CHAIN-TRACKED`, `E-CHAIN-RAW`; canonical contract sections 3 and 9.1, 23mk census row
 `:18789/:18830/:1433`) and the three raw calls in vendored `dpct/helper.hpp` (`E-DPCT-MALLOC`,
-`E-DPCT-DEVMEM-DEVICE`, `E-DPCT-DEVMEM-SHARED`; canonical contract section 9.1, the dpct row, with rulings M247 second). Each pins its function and count, so a second call, a
+`E-DPCT-DEVMEM-DEVICE`, `E-DPCT-DEVMEM-SHARED`; canonical contract section 9.1, the dpct row). Each pins its function and count, so a second call, a
 renamed function or a swapped allocator fails. Outside `dpct/helper.hpp`
 the names `dpct_malloc` (identifier) and `device_memory`, `global_memory`, `constant_memory`, `shared_memory` (type
 names) are clause (e) hits; a variable or parameter that is merely spelled `device_memory` is not.
@@ -36,12 +36,20 @@ step 7's "dead weight_cache_allocator, whole" bullet in the 23mk design). The S2
 to a FAIL on purpose when this clause landed.
 
 "Unreachable from the backend" is a gated claim, not a hope: clause (e) forbids `dpct_malloc`, the dpct memory classes and the two
-`dpct_memcpy` entry points (`dpct_memcpy`, `async_dpct_memcpy`, whose 3-D host-staged paths are the only users of `host_buffer`) outside
-`dpct/helper.hpp`, so a backend caller of any path that reaches an allowlisted dpct libc site is itself a finding.
+`dpct_memcpy` entry points (`dpct_memcpy`, `async_dpct_memcpy`) outside `dpct/helper.hpp`. The ban is on the whole name, so it also bars
+the 1-D overload (which never touches `host_buffer`) along with the 3-D host-staged paths that are `host_buffer`'s only users; failing
+closed on the 1-D overload is deliberate. A backend caller of any path that reaches an allowlisted dpct libc site is itself a finding.
 
 In a `#define` body and in the lexical pass of an ERROR-root file there is no tree, so the qualifier is read backwards across spaces,
-newlines and `\`-continuations: `sycl :: malloc` is clause (e)'s only, `pool :: realloc`, `p . malloc` and `p->malloc` are not hits, and
-`std :: malloc` and a bare `:: malloc` are.
+newlines and `\`-continuations. The whole scope is judged, as the tree path does: `sycl :: malloc`, `pool :: realloc`, `xstd::malloc`,
+`ns::std::malloc` and `T<x>::malloc` are scoped (`sycl::malloc` is clause (e)'s), `p . malloc` and `p->malloc` are members, and
+`std :: malloc`, `::std::malloc` and a bare `:: malloc` are hits. A C++ keyword before `::` (`return ::malloc(n)`, `else ::malloc(n)`,
+`throw`, `sizeof`, `co_return`) is not a scope, and neither is a comparison (`a > ::malloc(n)`); a template-id counts as a scope only when
+its `<` follows an identifier, so a contrived `x < y > ::malloc(n)` reads as a template (fails open; nothing like it is in the tree).
+
+The lexical pass (an ERROR-root file, today `cpu-dispatch.cpp`) is call-shaped: it flags a `name(` and so also a declaration-shaped
+`malloc(`, which fails closed. A name taken as a value (`auto f = ::malloc;`) is not seen by the lexical pass; the tree pass still finds
+it wherever the parser yields an identifier node, which it does today. If a future ERROR-root file loses that, a value use would pass.
 
 Fail-closed false positives, cleared by a rename: a local variable, a parameter or a lambda named `mmap`, `malloc`, `realloc`, `strdup`
 and so on that is *called* or *taken as a value* is an E-LIBC finding, because the clause matches the identifier and does not resolve
@@ -84,14 +92,17 @@ carry it, and no other entry outside E-RAW/E-LIBC may carry any fate). `fate` is
 `sanctioned-internal`, `sanctioned-vendored` (upstream code we do not edit) or `pending-disposition`. A `sanctioned-internal` entry is one no step will ever shrink:
 it is a candidate for the allowlist, and moving it there is the lead's decision, not the implementer's.
 `pending-disposition` marks an entry whose fate nobody has ruled on yet; its `cite` says what is known. Every E-RAW and E-LIBC entry, and the CHECK_TRY_ERROR entry, needs a `cite`, a ticket id or a design/census row of at
-least 12 characters. A cite or an allowlist reason names no source line (`file.cpp:1234`, which rots with the next edit) and no ruling-ledger
-id with a round (`ruling M265 R2`, a ledger that is not in the repo); `validate_data` refuses both. A second `G-CATCH` debt key that names the
+least 12 characters. An allowlist reason names no source line (`file.ext:1234`, `file.ext :12`, `file.ext#L12`, which rot with the next edit: name the
+function), and neither a reason nor a cite names a ruling-ledger id (`ruling M265 R2`, `ruling M265, R2`, `rulings M247`, `§M243`, a bare
+`M265`, `(R2)`: a ledger that is not in the repo); `validate_data` refuses both. A debt cite is allowed a census row id such as
+`ggml-sycl.cpp:24338->:43022`, because it keys a row of the design's census table at its stated base, and a reason may carry a bare
+`:18789` row id for the same reason; the source-line refusal is for a reason that points at code. A second `G-CATCH` debt key that names the
 CHECK_TRY_ERROR macro (a re-key of the pinned one) is refused too, so the fate pin cannot lapse by renumbering.
 
 ## Clauses (i)-(o) and witness 9 (S2d)
 
 Each is keyed on a subject that may not exist yet. Today's tree has no `ggml_sycl_replan_token_held` definition, no COMPLETE
-reap in `ggml_sycl_run_runtime_context_transaction`, no `owner_use_count` or `replace_within`, no `onednn_pp_a_bytes` /
+reap in `ggml_sycl_run_runtime_context_transaction`, no `replace_within` (`owner_use_count` exists since S3-1, so clause (l) enforces its callers; L-FREE has no `replace_within` yet and is vacuous), no `onednn_pp_a_bytes` /
 `onednn_pp_w_bytes`, and none of the four model-shaped `*_bytes()` functions, so those clauses print
 `DORMANT <clause>: subject <symbol> absent` after the report: a visible state, not a pass. They wake the moment the subject is
 defined. A subject name that appears in a shape the matcher does not read (a `#define` body, a lambda or variable, an alias, a

@@ -54,7 +54,7 @@
       "function": "dpct_malloc",
       "name": "malloc_device",
       "count": 1,
-      "reason": "dpct_malloc's one sycl::malloc_device call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Secondary: rulings M247 (vendored, not edited, dead in-tree)"
+      "reason": "dpct_malloc's one sycl::malloc_device call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Vendored upstream, not edited, dead in-tree"
     },
     {
       "id": "E-DPCT-DEVMEM-DEVICE",
@@ -63,7 +63,7 @@
       "function": "device_memory::allocate_device",
       "name": "malloc_device",
       "count": 1,
-      "reason": "device_memory::allocate_device's device-read-only malloc_device call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Secondary: rulings M247 (vendored, not edited, dead in-tree)"
+      "reason": "device_memory::allocate_device's device-read-only malloc_device call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Vendored upstream, not edited, dead in-tree"
     },
     {
       "id": "E-DPCT-DEVMEM-SHARED",
@@ -72,7 +72,7 @@
       "function": "device_memory::allocate_device",
       "name": "malloc_shared",
       "count": 1,
-      "reason": "device_memory::allocate_device's malloc_shared call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Secondary: rulings M247 (vendored, not edited, dead in-tree)"
+      "reason": "device_memory::allocate_device's malloc_shared call: canonical contract section 9.1 (the dpct/helper.hpp row, vendored upstream, allowed permanently, pinned by function, name and count; clause (e) forbids dpct_malloc and the dpct memory type names outside helper.hpp). Vendored upstream, not edited, dead in-tree"
     },
     {
       "id": "E-CHAIN-HOST-RAW",

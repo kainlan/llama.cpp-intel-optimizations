@@ -24,9 +24,10 @@ What this unit (S2a-S2d, S3-0 and its review fold) enforces
       #define body) outside the allowlist. dpct's allocating entry points, `dpct_malloc` (identifier) and
       the classes `device_memory`, `global_memory`, `constant_memory`, `shared_memory` (type names), are forbidden
       outside dpct/helper.hpp; helper.hpp's own three raw calls are allowlisted by function name and count
-      (canonical contract section 9.1, the dpct row; vendored upstream, not edited, dead in-tree; rulings M247 second).
-      `dpct_memcpy` and `async_dpct_memcpy` are forbidden there too: their 3-D host-staged paths build the host_buffer whose
-      std::malloc is allowlisted under clause (q), so a caller outside helper.hpp is what would make that allowlist reachable
+      (canonical contract section 9.1, the dpct row; vendored upstream, not edited, dead in-tree).
+      `dpct_memcpy` and `async_dpct_memcpy` are forbidden there too, by name, so the 1-D overloads are barred along with the 3-D
+      host-staged paths that build the host_buffer whose std::malloc is allowlisted under clause (q): a caller outside
+      helper.hpp is what would make that allowlist reachable (failing closed on the 1-D overload is deliberate).
       The host side is covered too: malloc_host, aligned_alloc_host, zeMemAllocHost, the generic `sycl::malloc` and
       `sycl::aligned_alloc` (qualified by sycl:: only, because the bare names are the C library's), and the host raw
       chain's wrappers unified_cache_raw_malloc_host and unified_cache_malloc_host_tracked.
@@ -49,9 +50,12 @@ What this unit (S2a-S2d, S3-0 and its review fold) enforces
       leading `::`, and in a #define body, outside the allowlist (code E-LIBC, keyed like E-RAW). A member (`pool.realloc`), a name
       qualified by anything else (`pool_alloc::realloc`; `sycl::malloc` is clause (e)'s) and the declaration of a function with the
       name are not hits. In a #define body and in the lexical pass the qualifier is read backwards across spaces, newlines and
-      backslash continuations, so `pool :: realloc` and `p . malloc` are not hits and `std :: malloc` is. `free`, `new`, `operator new` and
-      the STL containers' allocators are out of scope (see the README). A reason or a cite names no source line (file:NNN) and no
-      ruling-ledger id (ruling Mnnn Rn); the CHECK_TRY_ERROR debt entry carries a cite, and a re-key of it fails. The unified cache owns every byte the
+      backslash continuations, so `pool :: realloc` and `p . malloc` are not hits and `std :: malloc` is; the whole scope is judged
+      (`xstd::malloc`, `ns::std::malloc` are scoped), and a keyword before `::` (`return ::malloc`) or a comparison `a > ::malloc` leaves
+      the name bare. The lexical pass is call-shaped (a declaration `malloc(` fails closed). `free`, `new`, `operator new` and
+      the STL containers' allocators are out of scope (see the README). An allowlist reason names no source line (file.ext:NNN) and
+      neither a reason nor a cite names a ruling-ledger id (Mnnn, a round); a debt cite may carry a census row id. The CHECK_TRY_ERROR
+      debt entry carries a cite, and a re-key of it fails. The unified cache owns every byte the
       backend allocates, so a libc allocation is a violation unless the allowlist says why it holds no tensor, KV, scratch, pinned or
       USM bytes. A debt entry for it carries a fate and a cite, as E-RAW's does.
 and the brace rule the construction-site labels need: a braceless `T x;` reports the class
@@ -261,10 +265,13 @@ LIBC_CONT_RE = re.compile(r"\\(?=\r?\n)")
 # step 5.4a rewrites. It can carry no other fate, and no other handler carries one.
 CHECK_TRY_ERROR_KEY = "common.hpp::#define CHECK_TRY_ERROR::catch_macro:exception#0"
 CHECK_TRY_ERROR_FATE = "converted-by-5.4a"
-# A reason or a cite names something a reader can open in the repo. A source line rots with the next edit, and a ruling-ledger id
-# with a round ("ruling M265 R2") names a ledger that is not in the tree: cite the design step or the contract section instead.
-SRC_LINE_RE = re.compile(r"\.(?:hpp|cpp|h|c):\d+")
-LEDGER_RE = re.compile(r"\b[Rr]ulings? M\d+ R\d+\b")
+# A reason or a cite names something a reader can open in the repo. A ruling-ledger id ("ruling M265 R2", "rulings M247",
+# "§M243", a bare "M265", "(R2)") names a ledger that is not in the tree: cite the design step or the contract section instead.
+# A source line in an allowlist reason (`file.ext:NNN`, `file.ext :NNN`, `file.ext#LNNN`) rots with the next edit: name the
+# function. A debt cite may carry a census row id (`ggml-sycl.cpp:24338->:43022`), which keys a row of the design's census
+# table at its stated base, and a bare `:NNNN` row id is allowed in a reason for the same reason.
+SRC_LINE_RE = re.compile(r"\.(?:hpp|cpp|cc|cxx|hh|inl|cu|cuh|h|c|py|md|json|sh|txt)\s*(?::\s*\d+|#L\d+)")
+LEDGER_RE = re.compile(r"(?<![A-Za-z0-9_])M\d{2,}(?![A-Za-z0-9_])|\(\s*[Rr]\d+\s*\)|\b[Rr]ulings?\s+[Rr]\d+\b")
 
 SHARDS = 8   # the ctest registers this many shards; cmake_witness pins the registration to it
 
@@ -1971,11 +1978,77 @@ def sycl_qualified_raw(src, n):
     return sc is not None and txt(src, sc).split("::")[-1].strip() == "sycl"
 
 
+# A keyword before `::` is an expression boundary, not a scope: `return ::malloc(n)` calls the C library's malloc.
+LIBC_KEYWORDS = ("return", "else", "throw", "sizeof", "alignof", "decltype", "co_return", "co_yield", "co_await", "case", "new",
+                 "delete", "do", "typeof", "not", "and", "or")
+
+
+def libc_scope_before(text, i):
+    """What qualifies the name that starts at i, read backwards from a `::` that ends just before i (spaces allowed). Returns
+    None when there is no `::`, "" for a bare `::`, else the scope's full text as the tree prints it (`ns::std`, `T<x>`)."""
+    j = i
+    while j > 0 and text[j - 1].isspace():
+        j -= 1
+    if j < 2 or text[j - 2:j] != "::":
+        return None
+    parts = []
+    while True:
+        j -= 2
+        while j > 0 and text[j - 1].isspace():
+            j -= 1
+        if j > 0 and text[j - 1] == ">":
+            # a template-id is a scope only when a matching `<` follows an identifier; `a > ::malloc` is a comparison
+            depth, k = 0, j
+            while k > 0:
+                k -= 1
+                if text[k] == ">":
+                    depth += 1
+                elif text[k] == "<":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif text[k] in ";{}":
+                    k = -1
+                    break
+            else:
+                k = -1
+            t = k
+            while t > 0 and text[t - 1].isspace():
+                t -= 1
+            u = t
+            while u > 0 and (text[u - 1].isalnum() or text[u - 1] == "_"):
+                u -= 1
+            if u == t or text[u:t] in LIBC_KEYWORDS:   # no matching `<` leaves k = -1, so t = u and this holds
+                return "".join(reversed(parts)) if parts else ""
+            parts.append(re.sub(r"\s+", "", text[u:j]))
+            j = u
+        else:
+            k = j
+            while k > 0 and (text[k - 1].isalnum() or text[k - 1] == "_"):
+                k -= 1
+            if k == j or text[k:j] in LIBC_KEYWORDS:
+                break
+            parts.append(text[k:j])
+            j = k
+        m = j
+        while m > 0 and text[m - 1].isspace():
+            m -= 1
+        if m >= 2 and text[m - 2:m] == "::":
+            parts.append("::")
+            j = m
+            continue
+        break
+    return "".join(reversed(parts))
+
+
 def libc_text_hits(text, need_call):
     """(name, offset) of each libc allocation primitive in text with no tree: a #define body, or the blanked text of an
-    ERROR-root file (need_call: the name must be called). A member (`p . malloc`, `p->malloc`) and a name qualified by anything
-    but `std` or a bare `::` (`pool :: realloc`, `sycl :: malloc`, `T<x>::malloc`) are not hits; the qualifier is read across
-    spaces, newlines and line continuations."""
+    ERROR-root file (need_call: the name must be call-shaped, which a declaration `malloc(` also is, so it fails closed).
+    A member (`p . malloc`, `p->malloc`) is not a hit. A name qualified by anything but `std` or a bare `::` is not a hit,
+    judged on the whole scope as the tree path does (`ns::std`, `xstd`, `T<x>` are scopes; `::std` is not). The qualifier is
+    read across spaces, newlines and line continuations, and a keyword before `::` (`return ::malloc`) leaves it bare."""
+    # The continuation is stripped here for the lexical pass's whole text; scan_file strips it from a macro body too, because
+    # the E-RAW check there reads the same body with its own regex.
     text = LIBC_CONT_RE.sub(" ", text)
     out = []
     for m in LIBC_WORD_RE.finditer(text):
@@ -1988,18 +2061,9 @@ def libc_text_hits(text, need_call):
             continue
         if i >= 2 and text[i - 2:i] == "->":
             continue
-        if i >= 2 and text[i - 2:i] == "::":
-            j = i - 2
-            while j > 0 and text[j - 1].isspace():
-                j -= 1
-            k = j
-            while k > 0 and (text[k - 1].isalnum() or text[k - 1] == "_"):
-                k -= 1
-            if k < j:
-                if text[k:j] != "std":
-                    continue
-            elif j > 0 and text[j - 1] == ">":
-                continue
+        scope = libc_scope_before(text, m.start())
+        if scope and scope.lstrip(":") != "std":
+            continue
         out.append((m.group(1), m.start()))
     return out
 
@@ -2013,8 +2077,16 @@ def libc_use(src, n):
     if kind(p) == "qualified_identifier":
         if not same(fld(p, "name"), n):
             return None
-        sc = fld(p, "scope")
-        if sc is not None and txt(src, sc).strip().lstrip(":").strip() != "std":
+        # tree-sitter nests `a::b::name` as a::(b::name), so the whole scope is the chain of enclosing scopes
+        scopes, q = [], p
+        while q is not None and kind(q) == "qualified_identifier":
+            sc = fld(q, "scope")
+            if sc is not None:
+                scopes.insert(0, re.sub(r"\s+", "", txt(src, sc)))
+            up = parent(q)
+            q = up if up is not None and kind(up) == "qualified_identifier" and same(fld(up, "name"), q) else None
+        whole = "::".join(scopes).lstrip(":")
+        if whole and whole != "std":
             return None
     return callee_ident(src, n)
 
@@ -2110,6 +2182,7 @@ def scan_file(rel, src, ctx):
             nm = fld(n, "name")
             if body is not None and nm is not None:
                 catches.extend(macro_catch_records(src, n, txt(src, nm)))
+                # strip the continuations once for the E-RAW regexes below (libc_text_hits strips them again for its own text)
                 b = LIBC_CONT_RE.sub(" ", txt(src, body))
                 for r in RAW_NAMES + tuple("sycl::" + q for q in RAW_QUALIFIED):
                     if re.search(r"(?<![A-Za-z0-9_])" + re.escape(r).replace("sycl::", r"sycl\s*::\s*") + r"(?![A-Za-z0-9_])", b):
@@ -3654,7 +3727,7 @@ def validate_data(allowlist, debt):
             errs.append("FAIL allowlist entry %s reason names a source line (file:NNN), which rots with the next edit; name the function"
                         % e["id"])
         elif LEDGER_RE.search(e["reason"]):
-            errs.append("FAIL allowlist entry %s reason names a ruling-ledger id (ruling Mnnn Rn), a ledger outside the repo; cite the "
+            errs.append("FAIL allowlist entry %s reason names a ruling-ledger id (Mnnn, a round), a ledger outside the repo; cite the "
                         "design step or the contract section" % e["id"])
         ids[e["id"]] += 1
     errs += ["FAIL allowlist id %s is used %d times" % (k, v) for k, v in ids.items() if v > 1]
@@ -3679,7 +3752,7 @@ def validate_data(allowlist, debt):
             errs.append("FAIL debt entry %s %s has no cite (a ticket id or a design/census row, at least %d characters)"
                         % (d["code"], d["key"], CITE_MIN))
         elif isinstance(d.get("cite"), str) and LEDGER_RE.search(d["cite"]):
-            errs.append("FAIL debt entry %s %s cite names a ruling-ledger id (ruling Mnnn Rn), a ledger outside the repo; cite the "
+            errs.append("FAIL debt entry %s %s cite names a ruling-ledger id (Mnnn, a round), a ledger outside the repo; cite the "
                         "design step" % (d["code"], d["key"]))
         if pinned and d.get("fate") != CHECK_TRY_ERROR_FATE:
             errs.append("FAIL debt entry G-CATCH %s must carry fate %s (step 5.4a rewrites this handler) and no other"
@@ -4550,7 +4623,7 @@ def matrix_cases():
         "void zzplant_firstuse() {\n    %s req{};\n%s    req.intent.constraints.must_device = true;\n"
         "    bool & zz_ref = req.intent.constraints.must_device;\n    zz_ref = false;\n    ggml_sycl::unified_allocate(req);\n}\n"
         % (REQ, pre)), "PASS"))
-    # S2b: dpct is sanctioned-vendored (canonical contract section 9.1, then rulings M247). Its three sites are allowlisted by function name and count;
+    # S2b: dpct is sanctioned-vendored (canonical contract section 9.1). Its three sites are allowlisted by function name and count;
     # the entry points are forbidden names outside dpct/helper.hpp, matched as identifiers, never as substrings.
     for nm in ("dpct_malloc", "dpct::dpct_malloc", "dpct::detail::dpct_malloc"):
         A(Case("s2b-dpct", "a new caller of %s outside helper.hpp" % nm, plant(
@@ -5933,6 +6006,8 @@ def matrix_cases_s3g():
                    "count": 1, "reason": "mutation-matrix test entry"}, planted=False))
     A(Case("s3g-q", "a name taken as a value in an ERROR-root file is still E-LIBC, through the tree pass", lex(
         "void zzplant_q() {\n    auto f = ::malloc;\n    (void) f;\n}\n"), "FAIL", "E-LIBC", "malloc"))
+    A(Case("s3g-q", "the lexical pass flags a call-shaped name only: a data member named malloc in an ERROR-root file is not a hit (control)", lex(
+        "struct zz_s {\n    int malloc;\n};\nvoid zzplant_q() {\n}\n"), "PASS", planted=False))
     A(Case("s3g-q", "the lexical pass is call-shaped, so a declaration `malloc(` in an ERROR-root file fails closed (pinned)", lex(
         "extern void * malloc(unsigned long n);\nvoid zzplant_q() {\n}\n"), "FAIL", "E-LIBC", "malloc"))
 
