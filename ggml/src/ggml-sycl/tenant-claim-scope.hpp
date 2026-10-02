@@ -25,8 +25,12 @@
 //
 // That is a deliberate departure from moua design 2.3.2, which claims by the live-object index and
 // reports an order like 0,2 or 1,0 as a [CONTEXT-PLAN-BUG]: here an out-of-order sequence is served
-// at the lowest free slot and not reported, because it cannot hand out a held slot and the plan
-// that sized the slots does not depend on the order.  The slots a cohort holds need not be contiguous
+// at the lowest free slot and not reported, because it cannot hand out a held slot.  When the slots
+// are the same size the plan does not depend on the order at all; when they differ it still does: a
+// big buffer that arrives first takes the lowest free (small) slot and is refused as OVER_PLAN, named
+// and loud, rather than steered to a slot that fits.  An order that does not match the plan therefore
+// surfaces as OVER_PLAN when sizes differ and is served when they do not (the departure is recorded in
+// docs/design/sycl-kv-region-segregation.md, 2.3.2).  The slots a cohort holds need not be contiguous
 // (llama makes no element for a zero cap, so a set like {0, 2} is real): a claim walks the indices
 // that exist, lowest first, so no reserved slot is unreachable, and the k-th live buffer takes the
 // k-th slot.
@@ -36,7 +40,8 @@
 //
 // A scope is a thread_local and has to be closed.  One that is still open when its thread exits is a
 // leak (it pins the table and its carves until then): the destructor counts it in leaked_scopes()
-// and says so on stderr.  llama's guard at the C boundary (L6) is the sanctioned caller of
+// and says so on stderr, and the carves are released when the thread's scope state is destroyed at
+// thread exit (the last drop of its table), not before.  llama's guard at the C boundary (L6) is the sanctioned caller of
 // open/close, and does not leave one open.
 //
 // This header names no device and no SYCL type, so a host test builds it.
@@ -103,6 +108,10 @@ struct tenant_claim {
             try {
                 (void) slots->release_claim(cohort, index, generation, 0);
             } catch (...) {
+                // A destructor cannot let it out, and the only thing release_claim can throw is the
+                // registry lock's std::system_error: the slot stays marked claimed, and that is said.
+                std::fprintf(stderr, "WARN: [CLAIM-SCOPE] a claim's slot %u of cohort %s could not be released\n",
+                             (unsigned) index, cohort.c_str());
             }
         }
         generation = 0;
@@ -208,13 +217,18 @@ class tenant_claim_scope {
             return { tenant_claim_status::NO_SCOPE, 0, 0 };
         }
         uint32_t index = 0;
-        uint32_t last  = 0;  // the index the refusal names when no slot is left
+        uint32_t last  = 0;      // the index the refusal names when no slot is left
+        bool     seen  = false;  // some slot of the cohort exists (a one-slot cohort has last == 0 too)
         while (s.slots->next_index(cohort, index, index)) {
             last = index;
+            seen = true;
             // The table checks a size against the cap before it checks the claim state, so a held slot
             // that is too small for the request would answer OVER_PLAN for a slot that is not free to
             // be checked at all.  Only a free slot is asked.
             if (s.slots->claimed(cohort, index)) {
+                if (index == UINT32_MAX) {
+                    break;  // the walk would wrap to 0: refuse
+                }
                 ++index;
                 continue;
             }
@@ -234,6 +248,9 @@ class tenant_claim_scope {
                         return { tenant_claim_status::OK, index, 0 };
                     }
                 case kv_claim_result::ALREADY_CLAIMED:
+                    if (index == UINT32_MAX) {
+                        return { tenant_claim_status::NO_SLOT, index, 0 };
+                    }
                     ++index;
                     continue;
                 case kv_claim_result::OVER_PLAN:
@@ -242,7 +259,7 @@ class tenant_claim_scope {
                     return { tenant_claim_status::NO_SLOT, index, 0 };
             }
         }
-        return { tenant_claim_status::NO_SLOT, last == 0 ? 0 : last + 1, 0 };
+        return { tenant_claim_status::NO_SLOT, !seen ? 0 : (last == UINT32_MAX ? last : last + 1), 0 };
     }
 
     // Releases a live claim, recording `release_event` for the next claimant to chain on, and

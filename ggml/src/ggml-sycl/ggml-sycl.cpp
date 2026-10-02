@@ -13329,6 +13329,22 @@ static void ggml_sycl_host_tenants_erase(const ggml_backend_sycl_context * ctx) 
     }
 }
 
+// A table installed ahead of the inner transaction is taken back unless the section that describes it was stored: a
+// publish that fails after the install (the inner transaction refused or threw, the plan could not be bound, the
+// section's store threw) leaves the context holding no host reservation, as a refused first publish always did.
+// Only a table this publish installed arms it, so a republish never takes back the held one.
+struct ggml_sycl_host_tenants_install_guard {
+    const ggml_backend_sycl_context * ctx = nullptr;
+
+    ~ggml_sycl_host_tenants_install_guard() {
+        if (ctx) {
+            ggml_sycl_host_tenants_erase(ctx);
+        }
+    }
+
+    void keep() { ctx = nullptr; }
+};
+
 // The end of an execution context is the end of its id, and the registry entries it keyed (the host
 // reservation and the published section) go with it: the backend destructor drops them too, but only
 // while the backend still carries the id, and finish_drain / close_if_idle reset that first.  The drops
@@ -20256,6 +20272,7 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
     // refused allocation is likewise a refusal before anything was published, and the carves made so far drop
     // with `host_tenants` on every exit that does not install them, with no registry lock held.
     std::shared_ptr<ggml_sycl::kv_tenant_slots> host_tenants;
+    ggml_sycl_host_tenants_install_guard        host_tenants_installed;
     if (section && backend_ctx && backend_ctx->device >= 0 && backend_ctx->device < GGML_SYCL_MAX_DEVICES) {
         const uint64_t exec_id = ggml_sycl_context_execution_id(backend_ctx);
         if (exec_id != 0) {
@@ -20272,6 +20289,19 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
                     GGML_LOG_WARN("[CONTEXT-PLAN] host tenant republish refused: %s (n_ctx=%u n_ubatch=%u)\n",
                                   refusal.c_str(), n_ctx, n_ubatch);
                     return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
+                // The table is installed here, before anything is published, so that a refused install (the
+                // context ended since its id was read, or its entry already holds a table) is a refusal with
+                // nothing published, as PLAN_REJECTED says.  The guard takes the table back on any later failure.
+                if (host_tenants) {
+                    if (!ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key)) {
+                        GGML_LOG_ERROR(
+                            "[CONTEXT-PLAN-BUG] the host reservation could not be installed on its context; the "
+                            "descriptor publish is refused and nothing is published (n_ctx=%u n_ubatch=%u)\n",
+                            n_ctx, n_ubatch);
+                        return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                    }
+                    host_tenants_installed.ctx = backend_ctx;
                 }
             } catch (const ggml_sycl_fallback_error &) {
                 throw;
@@ -20378,18 +20408,11 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
     // shape that never went live.
     if (inner_ok && section) {
         try {
-            // The table first and the section last: the section is the cheap step and the one a reader trusts,
-            // so it is stored only once the table it describes is held.  An install that is refused (an
-            // unbound context, an entry that already holds a table) refuses the publish and keeps the earlier
-            // section; `host_tenants` is still ours and drops with no lock held.
-            if (host_tenants && !ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key)) {
-                GGML_LOG_ERROR(
-                    "[CONTEXT-PLAN-BUG] the host reservation could not be installed on its context; the descriptor "
-                    "publish is refused and the earlier section is kept (n_ctx=%u n_ubatch=%u)\n",
-                    n_ctx, n_ubatch);
-                return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
-            }
+            // The table was installed before anything was published (above), so the section, the cheap step and
+            // the one a reader trusts, is stored last and only once the table it describes is held.  Once it is
+            // stored the table stays; a throw before that leaves the guard to take the table back.
             ggml_sycl_published_section_set(backend_ctx, section);
+            host_tenants_installed.keep();
         } catch (const ggml_sycl_fallback_error &) {
             throw;
         } catch (...) {

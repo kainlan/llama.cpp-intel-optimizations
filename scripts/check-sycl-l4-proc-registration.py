@@ -36,13 +36,14 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
   * a publish for an unbound context is said at WARN, and the destructor's erase says a failed drop at
     WARN; the publish tail drops through the throwing set, not the erase;
   * (step 3c) a context's first publish reserves its host tier before L1 through
-    unified_allocate_owner with the carve's request fields, installs the table only after the inner
-    transaction succeeded, and the destructor drops it after the section and before the unbind; the
+    unified_allocate_owner with the carve's request fields, installs the table once before the inner
+    transaction (a rollback guard takes it back unless the section was stored), and the destructor drops
+    it after the section and before the unbind; an ended execution context drops its entries first; the
     SYCL_Host buffer type claims inside a claim scope before it reaches any allocation, and its free
     releases the claim without waiting on the host.  The pins also name each refusal the device test
     exercises: a refused or part-way reservation and a republish the held slots cannot carry are
-    PLAN_REJECTED before anything is published, the table is installed (and refused by name) before the
-    section is stored, a refused claim never falls through to the allocator, the claim in flight is owned
+    PLAN_REJECTED before anything is published, the table is installed (and refused by name) before anything
+    is published and the section is stored last, a refused claim never falls through to the allocator, the claim in flight is owned
     by an RAII record, a table handle is cast only after its deleter is checked, and the claim scope's
     open answers a status for each way it can not open.
 
@@ -86,6 +87,7 @@ SIG_COVERAGE = r"\benum\s+ggml_sycl_tenant_coverage\s+ggml_backend_sycl_tenant_c
 
 HEADER = "ggml/include/ggml-sycl.h"
 SOURCE = "ggml/src/ggml-sycl/ggml-sycl.cpp"
+CLAIM_HPP = "ggml/src/ggml-sycl/tenant-claim-scope.hpp"  # the claim record's destructor and the lowest-free walk
 LLAMA = "src/llama-context.cpp"  # the scheduler's owner: read with SOURCE, as one text, for the free-path contract
 REG_FN = "ggml_backend_sycl_reg_get_proc_address"
 IMPL_SIG = r"\bggml_sycl_set_runtime_context_for_model_impl\s*\("
@@ -101,15 +103,10 @@ FREE_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_host_buffer_free_buffer\s*\("
 OPEN_SIG = r"\benum\s+ggml_sycl_claim_scope_status\s+ggml_backend_sycl_claim_scope_open\s*\("
 CLAIMS_SIG = r"\bsize_t\s+ggml_backend_sycl_claim_scope_claims\s*\("
 CLOSE_SIG = r"\bvoid\s+ggml_backend_sycl_claim_scope_close\s*\("
-SECTION_SET = "            ggml_sycl_published_section_set(backend_ctx, section);\n"
-INSTALL_BLOCK = (
-    "            if (host_tenants && !ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key)) {\n"
-    "                GGML_LOG_ERROR(\n"
-    "                    \"[CONTEXT-PLAN-BUG] the host reservation could not be installed on its context; the descriptor \"\n"
-    "                    \"publish is refused and the earlier section is kept (n_ctx=%u n_ubatch=%u)\\n\",\n"
-    "                    n_ctx, n_ubatch);\n"
-    "                return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\n"
-    "            }\n" + SECTION_SET)
+INSTALL_REFUSAL_TAIL = (
+    "                        return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\n"
+    "                    }\n"
+    "                    host_tenants_installed.ctx = backend_ctx;\n")
 DTOR_SIG = r"\bllama_context::~llama_context\s*\("
 REIMPL_SIG = r"\bsched_reserve_result\s+llama_context::sched_reserve_impl\s*\("
 SYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_synchronize\s*\("
@@ -119,6 +116,9 @@ CPY_ASYNC_DEF = "static bool ggml_backend_sycl_cpy_tensor_async("
 GET_ASYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_get_tensor_async\s*\("
 LOAD_END_SIG = r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_model_load_end\s*\("
 TXN_SIG = r"\bggml_sycl_txn_result\s+ggml_sycl_run_runtime_context_transaction\s*\("
+DROP_SIG = r"\bvoid\s+drop\s*\(\s*\)\s*noexcept\s*\{"
+CLAIM_WALK_SIG = r"\bstatic\s+tenant_claim_outcome\s+claim\s*\(const std::string & cohort"
+CARRY_FN_SIG = r"\bstatic\s+bool\s+ggml_sycl_host_tenants_carry\s*\("
 CLEAR_BIND_SIG = r"\bstatic\s+void\s+ggml_sycl_execution_clear_bindings_for_context\s*\("
 DROP_ENTRIES_SIG = r"\bstatic\s+void\s+ggml_sycl_execution_drop_context_registry_entries\s*\(uint64_t context_id\)\s*noexcept\s*\{"
 CENTRY_SIG = r"\bvoid\s+ggml_backend_sycl_set_runtime_context\s*\("
@@ -241,14 +241,16 @@ def header_proc_names(header_raw):
 
 
 def impl_first_publish_wrong(source):
+    """The reservation is made before L1 and the table is installed once, after it and before the inner
+    transaction (so a refused install is a refusal with nothing published)."""
     impl = function_body(source, r"\bggml_sycl_set_runtime_context_for_model_impl\s*\(")
     if impl is None:
         return True
     r = impl.find("ggml_sycl_reserve_host_tenants(")
     l1 = impl.find("std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex)")
-    inner = impl.find("const bool inner_ok = g_runtime_update_succeeded;")
+    inner = impl.find("ggml_sycl_run_runtime_context_transaction(")
     inst = impl.find("ggml_sycl_host_tenants_install(")
-    return not (0 <= r < l1 and 0 <= inner < inst)
+    return not (0 <= r < inst < l1 and inst < inner and impl.count("ggml_sycl_host_tenants_install(") == 1)
 
 
 def function_span(text, signature_re):
@@ -297,11 +299,19 @@ def host_tier_pins(source, alloc, freeb, reserve, fails):
         "L4 host tier: the publish does not reserve only without a held table, or does not refuse a refused reservation or "
         "a republish the held slots cannot carry")
     pin(fails, impl,
-        r"if \(host_tenants && !ggml_sycl_host_tenants_install\(backend_ctx, host_tenants, section->tenant_key\)\) \{"
+        r"if \(host_tenants\) \{\s*if \(!ggml_sycl_host_tenants_install\(backend_ctx, host_tenants, section->tenant_key\)\) \{"
         r"\s*GGML_LOG_ERROR\([\s\S]*?\);\s*return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\s*\}\s*"
-        r"ggml_sycl_published_section_set\(backend_ctx, section\);",
-        "L4 host tier: the install result is not a refusal that keeps the earlier section, or the section is stored "
-        "before the table is installed")
+        r"host_tenants_installed\.ctx = backend_ctx;\s*\}",
+        "L4 host tier: the install result is not a refusal with nothing published, or the table it installed does not arm "
+        "the rollback guard")
+    pin(fails, impl, r"ggml_sycl_published_section_set\(backend_ctx, section\);\s*host_tenants_installed\.keep\(\);",
+        "L4 host tier: the section is stored without keeping the installed table (or the table is kept before the store)")
+    pin(fails, impl, r"std::shared_ptr<ggml_sycl::kv_tenant_slots> host_tenants;\s*ggml_sycl_host_tenants_install_guard host_tenants_installed;",
+        "L4 host tier: the publish holds no rollback guard for the table it installs")
+    guard_fn = function_body(source, r"\bstruct\s+ggml_sycl_host_tenants_install_guard\b")
+    pin(fails, guard_fn, r"~ggml_sycl_host_tenants_install_guard\(\) \{\s*if \(ctx\) \{\s*ggml_sycl_host_tenants_erase\(ctx\);\s*\}\s*\}"
+                         r"\s*void keep\(\) \{ ctx = nullptr; \}",
+        "L4 host tier: the install guard does not take the table back unless it was kept")
     install_fn = function_body(source, r"\bstatic\s+bool\s+ggml_sycl_host_tenants_install\s*\(")
     if install_fn is not None and install_fn.count("table.reset()") != 1:
         fails.append("L4 host tier: the table is dropped from the caller before the registry took it")
@@ -358,11 +368,33 @@ def host_tier_pins(source, alloc, freeb, reserve, fails):
             fails.append("L4 host tier: the SYCL_Host free_buffer waits on the host (a queue wait is not the slot's last event)")
         pin(fails, freeb, r"if \(ctx->claim\) \{\s*\(void\) ggml_sycl::tenant_claim_scope::release\(\*ctx->claim, 0\);\s*ctx->claim\.reset\(\);\s*\}",
             "L4 host tier: the SYCL_Host free_buffer does not release then drop its claim as the first step")
+    # a claim record's destructor says a failed release; the walk reports the real index and refuses at the top
+    pin(fails, function_body(source, DROP_SIG), r"catch \(\.\.\.\) \{\s*std::fprintf\(stderr, \"WARN: \[CLAIM-SCOPE\]",
+        "L4 claim scope: the claim record's destructor swallows a failed release silently (no WARN)")
+    walk = function_body(source, CLAIM_WALK_SIG)
+    pin(fails, walk, r"return \{ tenant_claim_status::NO_SLOT, !seen \? 0 : \(last == UINT32_MAX \? last : last \+ 1\), 0 \};",
+        "L4 claim scope: an exhausted cohort does not name the index past its last slot (0 only for a cohort with none)")
+    if walk is None or walk.count("index == UINT32_MAX") != 2:
+        fails.append("L4 claim scope: the claim walk can wrap its index past UINT32_MAX instead of refusing")
+    # the reservation and the carry look at the host tier only (device -1), the carve is a host-compute staging slot
+    for fn, what in ((function_body(source, RESERVE_SIG), "reservation"), (function_body(source, CARRY_FN_SIG), "carry check")):
+        pin(fails, fn, r"for \(const ggml_sycl::runtime_context_tenant & e : section\.tenants\) \{\s*if \(e\.device != -1\) \{\s*continue;\s*\}",
+            "L4 host tier: the %s does not skip every element that is not host-tier (device -1)" % what)
+    pin(fails, reserve, r"req\.intent\.role = ggml_sycl::alloc_role::STAGING;",
+        "L4 host tier: the host carve is not a STAGING-role request")
+    pin(fails, reserve, r"req\.device = ctx->device;",
+        "L4 host tier: the host carve is not requested for the context's device")
     # the claim scope's C entries: every refusal is a named status, and a nested refusal is the first answer
     open_fn = function_body(source, r"\benum\s+ggml_sycl_claim_scope_status\s+ggml_backend_sycl_claim_scope_open\s*\(")
     if open_fn is None:
         fails.append("L4 claim scope: ggml_backend_sycl_claim_scope_open not found")
     else:
+        pin(fails, open_fn, r"sycl_module_mutation_guard module_guard;\s*if \(!module_guard\) \{\s*return GGML_SYCL_CLAIM_SCOPE_FAILED;\s*\}",
+            "L4 claim scope: open does not answer FAILED on a closed module")
+        pin(fails, open_fn, r"if \(ctx->device < 0 \|\| ctx->device >= GGML_SYCL_MAX_DEVICES\) \{\s*return GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND;",
+            "L4 claim scope: open does not refuse a context with no valid device as INVALID_BACKEND")
+        pin(fails, open_fn, r"const uint64_t id = ggml_sycl_context_execution_id\(ctx\);\s*if \(id == 0\) \{\s*return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;",
+            "L4 claim scope: open does not answer NO_RESERVATION for a context not bound to an execution context")
         pin(fails, open_fn, r"^[^{]*\{\s*if \(scope == nullptr\) \{\s*return GGML_SYCL_CLAIM_SCOPE_FAILED;\s*\}\s*\*scope = nullptr;",
             "L4 claim scope: open does not refuse a null out pointer first and clear it before anything else")
         pin(fails, open_fn,
@@ -705,7 +737,7 @@ def check(header_raw, source):
     if source.count(".install_tenant_slots(") != 1 or source.count(".take_tenant_slots(") != 1:
         fails.append("L4 host tier: the registry's slot table has more or fewer than one installer or remover")
     if impl_first_publish_wrong(source):
-        fails.append("L4 host tier: the first publish does not reserve before L1, or installs before the inner transaction succeeded")
+        fails.append("L4 host tier: the first publish does not reserve before L1, or does not install once before the inner transaction")
 
     # the buffer type: claim before any allocation, release on free
     alloc = function_body(source, r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_type_alloc_buffer\s*\(")
@@ -860,17 +892,27 @@ def mutations(header_raw, source):
     # One edit inside one named function: (label, expected message, signature, old, new).  Several of the
     # lines these touch recur in the other ledger functions, so the edit is scoped to the function it names.
     scoped = [
-        ("the install moved before the inner transaction", "installs before the inner transaction",
+        ("a second install after the inner transaction", "does not install once before the inner transaction",
          IMPL_SIG, "    const bool inner_ok = g_runtime_update_succeeded;",
          "    (void) ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key);\n    const bool inner_ok = g_runtime_update_succeeded;"),
-        ("the install stored after the section", "the section is stored before the table is installed", IMPL_SIG,
-         INSTALL_BLOCK, SECTION_SET + INSTALL_BLOCK.replace(SECTION_SET, "")),
-        ("the install result discarded", "the install result is not a refusal", IMPL_SIG,
-         "if (host_tenants && !ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key)) {",
-         "if (host_tenants && (ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key), false)) {"),
-        ("the install refusal answers EFFECT_FAILED", "the install result is not a refusal", IMPL_SIG,
-         "                    n_ctx, n_ubatch);\n                return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\n            }\n            ggml_sycl_published_section_set",
-         "                    n_ctx, n_ubatch);\n                return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;\n            }\n            ggml_sycl_published_section_set"),
+        ("the install result discarded", "the install result is not a refusal with nothing published", IMPL_SIG,
+         "if (!ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key)) {",
+         "if ((ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key), false)) {"),
+        ("the install refusal answers EFFECT_FAILED", "the install result is not a refusal with nothing published", IMPL_SIG,
+         INSTALL_REFUSAL_TAIL, INSTALL_REFUSAL_TAIL.replace("PLAN_REJECTED", "EFFECT_FAILED")),
+        ("the installed table never arms the guard", "the install result is not a refusal with nothing published", IMPL_SIG,
+         "                    host_tenants_installed.ctx = backend_ctx;\n", ""),
+        ("the section stored without keeping the table", "is stored without keeping the installed table", IMPL_SIG,
+         "            host_tenants_installed.keep();\n", ""),
+        ("the table kept before the section store", "is stored without keeping the installed table", IMPL_SIG,
+         "            ggml_sycl_published_section_set(backend_ctx, section);\n            host_tenants_installed.keep();\n",
+         "            host_tenants_installed.keep();\n            ggml_sycl_published_section_set(backend_ctx, section);\n"),
+        ("the publish holds no rollback guard", "holds no rollback guard", IMPL_SIG,
+         "    ggml_sycl_host_tenants_install_guard host_tenants_installed;\n", ""),
+        ("the install guard never takes the table back", "the install guard does not take the table back", r"\bstruct\s+ggml_sycl_host_tenants_install_guard\b",
+         "            ggml_sycl_host_tenants_erase(ctx);\n", "            (void) ctx;\n"),
+        ("the install guard takes the table back even when kept", "the install guard does not take the table back", r"\bstruct\s+ggml_sycl_host_tenants_install_guard\b",
+         "    void keep() { ctx = nullptr; }", "    void keep() {}"),
         ("a refused reservation is ignored", "does not reserve only without a held table, or does not refuse", IMPL_SIG,
          "                        return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\n                    }\n                } else if",
          "                    }\n                } else if"),
@@ -1105,6 +1147,27 @@ def mutations(header_raw, source):
         ("the device supports the CpuActivation buffer type", "the device supports the CpuActivation buffer type", SUPPORTS_SIG,
          "(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {\n",
          "(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {\n    if (buft == ggml_backend_sycl_cpu_activation_buffer_type()) {\n        return true;\n    }\n"),
+        ("the claim record's destructor swallows silently", "swallows a failed release silently", DROP_SIG,
+         re.compile(r'std::fprintf\(stderr, "WARN: \[CLAIM-SCOPE\][^;]*;'), "(void) 0;"),
+        ("an exhausted one-slot cohort names no slot", "does not name the index past its last slot", CLAIM_WALK_SIG,
+         "!seen ? 0 : (last == UINT32_MAX ? last : last + 1)", "last == 0 ? 0 : last + 1"),
+        ("the walk wraps past the top index", "can wrap its index past UINT32_MAX", CLAIM_WALK_SIG,
+         re.compile(r"if \(index == UINT32_MAX\) \{\s*break;\s*\}\s*"), ""),
+        ("the carry check skips the host elements", "the carry check does not skip every element that is not host-tier", CARRY_FN_SIG,
+         "if (e.device != -1) {", "if (e.device == -1) {"),
+        ("the reservation skips the host elements", "the reservation does not skip every element that is not host-tier", RESERVE_SIG,
+         "if (e.device != -1) {", "if (e.device == -1) {"),
+        ("the carve is not a staging request", "is not a STAGING-role request", RESERVE_SIG,
+         "req.intent.role = ggml_sycl::alloc_role::STAGING;", "req.intent.role = ggml_sycl::alloc_role::KV;"),
+        ("the carve is for another device", "is not requested for the context's device", RESERVE_SIG,
+         "req.device = ctx->device;", "req.device = 0;"),
+        ("open answers INVALID_BACKEND on a closed module", "does not answer FAILED on a closed module", OPEN_SIG,
+         "if (!module_guard) {\n        return GGML_SYCL_CLAIM_SCOPE_FAILED;", "if (!module_guard) {\n        return GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND;"),
+        ("open answers NO_RESERVATION for an invalid device", "with no valid device as INVALID_BACKEND", OPEN_SIG,
+         "ctx->device >= GGML_SYCL_MAX_DEVICES) {\n            return GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND;",
+         "ctx->device >= GGML_SYCL_MAX_DEVICES) {\n            return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;"),
+        ("open answers FAILED for an unbound context", "not bound to an execution context", OPEN_SIG,
+         "if (id == 0) {\n            return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;", "if (id == 0) {\n            return GGML_SYCL_CLAIM_SCOPE_FAILED;"),
         ("the ended context's entries are never dropped", "does not first drop its registry entries", CLEAR_BIND_SIG,
          "    ggml_sycl_execution_drop_context_registry_entries(context_id);\n", ""),
         ("the ended context's entries are dropped after the id is zeroed", "does not first drop its registry entries", CLEAR_BIND_SIG,
@@ -1176,7 +1239,7 @@ def normalize(text):
 def read(root, rel):
     with open(os.path.join(root, rel), encoding="utf-8") as f:
         text = f.read()
-    return normalize(text) if rel in (SOURCE, LLAMA) else text
+    return normalize(text) if rel in (SOURCE, LLAMA, CLAIM_HPP) else text
 
 
 def main():
@@ -1188,7 +1251,8 @@ def main():
     args = ap.parse_args()
     header_raw = read(args.root, HEADER)
     # once: a mutation edits this text.  The scheduler's owner is appended: the free-path contract names both.
-    source_raw = strip_comments(read(args.root, SOURCE)) + "\n" + strip_comments(read(args.root, LLAMA))
+    source_raw = strip_comments(read(args.root, SOURCE)) + "\n" + strip_comments(read(args.root, LLAMA)) + \
+        "\n" + strip_comments(read(args.root, CLAIM_HPP))
     status = 0
     if not args.mutations_only:
         fails = check(header_raw, source_raw)

@@ -357,7 +357,12 @@ if (BUILD_TESTING)
             ggml-sycl-private-fixtures)
     endif()
     add_test(NAME sycl-lifecycle-runtime-wrapper COMMAND test-sycl-lifecycle-runtime-wrapper)
-    set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES RUN_SERIAL TRUE)
+    # The selector is a precondition, not a courtesy: unpinned, a backend enumerates the iGPU, whose "VRAM"
+    # is host RAM (CLAUDE.md, llama.cpp-403s).  level_zero:0 is the B70; the registration also supplies the
+    # LD_LIBRARY_PATH a direct invocation lacks (without it the binary prints SKIP and exits 0).
+    set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES
+        RUN_SERIAL TRUE
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
     add_executable(test-sycl-lifecycle-wrapper-overlap
         tests/test-lifecycle-wrapper-overlap.cpp)
     target_include_directories(test-sycl-lifecycle-wrapper-overlap PRIVATE
@@ -6654,7 +6659,9 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         LABELS "sycl;tenant;device;B70;B50"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
-        TIMEOUT 120)
+        TIMEOUT 120
+        # Pinned to the B70 (level_zero:1 selects the B50 for a second run); see the lifecycle wrapper's note.
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 
     add_executable(test-sycl-intrusive-allocation-owner
         tests/test-intrusive-allocation-owner.cpp)

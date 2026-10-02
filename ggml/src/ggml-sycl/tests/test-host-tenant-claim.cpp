@@ -304,6 +304,19 @@ void case_claims() {
                          "a null backend did not answer INVALID_BACKEND");
     require(ggml_backend_sycl_claim_scope_open(f.backend, nullptr) == GGML_SYCL_CLAIM_SCOPE_FAILED,
             "a null out pointer did not answer FAILED");
+    {
+        // a backend that was never bound to an execution context has no registry key: it has no reservation
+        ggml_backend_t unbound = ggml_backend_sycl_init(0);
+        require(unbound != nullptr, "an unbound backend could not be created");
+        try {
+            require_scope_status(unbound, GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION,
+                                 "an unbound context did not answer NO_RESERVATION");
+        } catch (...) {
+            ggml_backend_free(unbound);
+            throw;
+        }
+        ggml_backend_free(unbound);
+    }
 
     // (2) the first publish reserves, a covered republish does not, a larger one is growth
     const host_desc first(1 * MiB, 2 * MiB);

@@ -1041,6 +1041,20 @@ for every context-side tenant, zhcn's included. zhcn's design cites it and does 
        (§2.2), and `live_bytes` is on H7d's primitive list too.
      - L4 enumerates the `live_bytes` readers, and H4 asserts both numbers at every step.
 
+- **Implementation departure: a claim takes the lowest free slot, not the live-object index
+  (llama.cpp-moua L4 step 3c, 2026-10-02; recorded after rev-moua-c2 M2).** The claim above is
+  "by index", with an out-of-order sequence (0,2 or 1,0) reported as a `[CONTEXT-PLAN-BUG]`.
+  `tenant_claim_scope::claim` (`tenant-claim-scope.hpp`) instead walks the cohort's slots lowest
+  first and takes the first one no live claim holds, so an out-of-order free is served at its own
+  freed index and never hands out a held slot, and a sparse set such as {0, 2} (llama makes no
+  element for a zero cap) leaves no slot unreachable. This does **not** make the plan
+  order-independent: slots are sized per buffer, so when they differ a big buffer that arrives
+  before a small one takes the lowest free (small) slot and is refused as `OVER_PLAN`, named and
+  loud, rather than steered to a slot that fits; when they are equal any order is served. An
+  order that does not match the plan therefore surfaces as `OVER_PLAN` when sizes differ and is
+  served when they do not. A refusal is a named status (`NO_SLOT` / `OVER_PLAN`), never a
+  fall-through to the allocator.
+
 #### 2.3.3 Weight-side placement after the optional pass
 
 `zone_alloc(WEIGHT)` works as follows once an optional ladder is live on that TLSF:

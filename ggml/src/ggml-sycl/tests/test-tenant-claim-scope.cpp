@@ -325,10 +325,30 @@ void case_claim_refusals() {
     tenant_claim keep;
     CHECK(tenant_claim_scope::claim(HOST, 5, keep).status == tenant_claim_status::OK, "claim");
     const uint64_t gen = keep.generation;
-    CHECK(tenant_claim_scope::claim(HOST, 5, keep).status == tenant_claim_status::NO_SLOT,
-          "second claim finds no slot");
+    const auto     exhausted = tenant_claim_scope::claim(HOST, 5, keep);
+    CHECK(exhausted.status == tenant_claim_status::NO_SLOT, "second claim finds no slot");
+    CHECK(exhausted.index == 1,
+          "an exhausted one-slot cohort names the index past its slot, not 0 (0 means none planned)");
     CHECK(keep.live() && keep.generation == gen, "the refused claim left the record as it was");
     CHECK(tenant_claim_scope::release(keep) && tenant_claim_scope::close(s2), "release and close");
+}
+
+// A slot at the top of the index range: the walk past it must refuse, not wrap to 0 and spin.
+void case_the_walk_does_not_wrap() {
+    auto t = std::make_shared<kv_tenant_slots>();
+    (void) t->add(HOST, 0, plain_handle(), 10);
+    (void) t->add(HOST, UINT32_MAX, plain_handle(), 10);
+    CHECK(t->cap(HOST, 0) == 10 && t->cap(HOST, UINT32_MAX) == 10, "two slots, one at the top");
+    auto *       s = open_scope(t);
+    tenant_claim a, b, c;
+    CHECK(tenant_claim_scope::claim(HOST, 5, a).index == 0, "the lowest slot first");
+    CHECK(tenant_claim_scope::claim(HOST, 5, b).index == UINT32_MAX, "then the top one");
+    const auto none = tenant_claim_scope::claim(HOST, 5, c);
+    CHECK(none.status == tenant_claim_status::NO_SLOT && !c.live(),
+          "every slot claimed: refused, the walk did not wrap");
+    CHECK(none.index == UINT32_MAX, "and names the top index, not a wrapped one");
+    CHECK(tenant_claim_scope::release(a) && tenant_claim_scope::release(b) && tenant_claim_scope::close(s),
+          "release and close");
 }
 
 void case_release_is_exact() {
@@ -465,6 +485,7 @@ int main() {
     case_a_sparse_slot_set_is_fully_reachable();
     case_claim_takes_the_lowest_free_slot();
     case_claim_refusals();
+    case_the_walk_does_not_wrap();
     case_release_is_exact();
     case_claim_keeps_the_memory();
     case_registry_install_and_take();
