@@ -2,11 +2,20 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 // Pure helpers behind the SYCL auto micro-batch trial
 // (llama_context::sycl_select_auto_ubatch). They take plain integers and
 // touch no context or backend state, so tests/test-auto-ubatch-ladder.cpp
 // executes them on the host.
+
+// The one exception a compute-buffer reserve throws when the rung's compute buffers did not fit: a fit verdict, the
+// kind of loss that lets the auto-ubatch trial descend. Everything else a reserve throws (a lifecycle result such as
+// BUSY or STALE_IDENTITY, a memory module that would not initialize) is no verdict on the rung and never lowers -ub.
+struct llama_auto_ubatch_fit_refusal : public std::runtime_error {
+    explicit llama_auto_ubatch_fit_refusal(const std::string & what) : std::runtime_error(what) {}
+};
 
 // The trial's candidate micro-batch sizes, ascending.
 static const uint32_t llama_auto_ubatch_ladder[] = { 512, 1024, 2048, 4096 };

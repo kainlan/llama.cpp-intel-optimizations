@@ -481,6 +481,25 @@ size_t zone_hold_free_before(size_t cold, size_t persistent_raw) {
     return persistent_raw >= cold ? 0 : cold - persistent_raw;
 }
 
+size_t zone_hold_persistent_raw(size_t raw_held, size_t compute_live, bool rung_live) {
+    if (!rung_live) {
+        return raw_held;
+    }
+    return compute_live >= raw_held ? 0 : raw_held - compute_live;
+}
+
+size_t zone_hold_cold_update(bool have_baseline, size_t baseline, size_t candidate) {
+    return have_baseline && baseline > candidate ? baseline : candidate;
+}
+
+size_t zone_hold_pick_kv_room(bool rung_live, bool have_epoch, size_t epoch_kv_room, size_t live_kv_room) {
+    return rung_live && have_epoch ? epoch_kv_room : live_kv_room;
+}
+
+size_t zone_hold_nonfa_demand(size_t nonfa_scratch, size_t hold_spill) {
+    return hold_spill > SIZE_MAX - nonfa_scratch ? SIZE_MAX : nonfa_scratch + hold_spill;
+}
+
 bool zone_runtime_spill_prefers_kv_zone(bool   compute_spill_flag,
                                         bool   runtime_zone,
                                         bool   forbid_spill,

@@ -383,7 +383,9 @@ bool zone_hold_fit(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
 // The -ub a refusal names: `n_ubatch` itself when it fits, otherwise the largest power of two (at least 32) not above
 // it that zone_hold_fit accepts, over the same inputs. 0 when none does or n_ubatch is unknown. By construction the
-// number printed passes the fit that refused its neighbour, and twice it does not.
+// number printed passes the fit, and twice it does not whenever twice it is a rung that was asked (not above
+// `n_ubatch`; a non-power-of-two n_ubatch such as 600 names 512 or lower and never asks 1024). It can be under the
+// auto-ubatch descent's floor of 64: it is the largest the function accepts, not a rung the descent walks.
 uint32_t zone_hold_fit_largest_ub(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
 // The cache's ledger of free memory, in two steps so that no driver read after a release is ever needed (the
@@ -393,6 +395,29 @@ uint32_t zone_hold_fit_largest_ub(const zone_hold_fit_inputs & in, uint32_t n_ub
 // of those still live (everything but the rung's own buffers). Saturating; never below zero.
 size_t zone_hold_free_cold(size_t driver_free, size_t raw_live);
 size_t zone_hold_free_before(size_t cold, size_t persistent_raw);
+
+// llama.cpp-kpjw (r7 I3: identity by ORIGIN, not by timing): what stays live without the rung is every raw byte the
+// cache holds except the rung's OWN scheduler compute buffers (rows registered by a request flagged
+// scheduler_compute), and only when the rung's buffers are live (the realized check). A raw byte allocated after an
+// epoch began that is not one of those (the recurrent state, made after a pinned -ub's one publish) is persistent
+// however late it came; a transaction (no live rung) counts every held raw byte. `compute_live` is clamped to
+// `raw_held`.
+size_t zone_hold_persistent_raw(size_t raw_held, size_t compute_live, bool rung_live);
+
+// llama.cpp-kpjw (r7 I2): the baseline `cold` reading of a window (the span between two publishes). The first reading
+// of a window stands; each later one can only RAISE it: the driver's credit for a freed buffer lags, and a lag only
+// ever lowers a reading, so the maximum is the reading with the least lag. A new window (a publish, a quiescent
+// point) forgets the previous one: another tenant may have arrived since.
+size_t zone_hold_cold_update(bool have_baseline, size_t baseline, size_t candidate);
+
+// llama.cpp-kpjw (r7 I3): the KV room the fit judges with. A rung that is live is judged with the room its own epoch
+// began with (the rung's own KV-zone placements have used the zone since); any other asker, and a live rung with no
+// epoch yet, reads the zone as it is now.
+size_t zone_hold_pick_kv_room(bool rung_live, bool have_epoch, size_t epoch_kv_room, size_t live_kv_room);
+
+// llama.cpp-kpjw (r7 I1): the demand the non-FA headroom check compares with the card: the non-FA attention scratch
+// plus the hold's worst-case spill (zone_hold_fit_demand). Saturating, so a wrapped sum never reads as a small demand.
+size_t zone_hold_nonfa_demand(size_t nonfa_scratch, size_t hold_spill);
 
 // Whether a RUNTIME-zone request goes to the KV zone instead of the zone / raw device memory: only a request the
 // caller marked as a compute buffer (`compute_spill_flag`), spill-capable (not `forbid_spill`), that the RUNTIME zone

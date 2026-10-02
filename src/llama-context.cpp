@@ -362,6 +362,14 @@ static decltype(&ggml_backend_sycl_planned_hold_spill_fits) llama_context_sycl_h
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_planned_hold_spill_fits"));
 }
 
+// llama.cpp-kpjw: re-reads the KV room a pinned -ub's hold epoch is judged with (ggml_backend_sycl_planned_hold_epoch_refresh
+// in ggml-sycl.h). A SYCL DSO that predates it exports nothing and is skipped.
+static decltype(&ggml_backend_sycl_planned_hold_epoch_refresh) llama_context_sycl_hold_epoch_refresh_proc(
+    ggml_backend_dev_t dev) {
+    return reinterpret_cast<decltype(&ggml_backend_sycl_planned_hold_epoch_refresh)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_planned_hold_epoch_refresh"));
+}
+
 static decltype(&ggml_backend_sycl_auto_ubatch_enabled) llama_context_sycl_auto_ubatch_enabled_proc(
     ggml_backend_dev_t dev) {
     return reinterpret_cast<decltype(&ggml_backend_sycl_auto_ubatch_enabled)>(
@@ -412,6 +420,28 @@ static decltype(&ggml_backend_sycl_ubatch_cache_store_layout1) llama_context_syc
 // the planned dense scratch kept out of the RUNTIME zone spilled outside the arena and left its card under the driver
 // headroom; `*largest_ub` is then the smallest -ub the refusing backends say still fits (0: none known to). A SYCL
 // DSO that predates the entry exports nothing and is skipped, never dereferenced.
+// llama.cpp-kpjw (r7 I3): a pinned -ub publishes its plan ONCE, before the memory module (the KV cache, the recurrent
+// state) exists, so the KV room its hold epoch began with predates both. This re-reads it once they exist, before the
+// compute buffers are reserved, so the context-init check judges with the room the rung actually had. (What the rung
+// does not own is not snapshotted: it is every raw row but the rung's scheduler compute rows, read when asked.)
+static void llama_context_sycl_hold_epoch_refresh(const std::vector<ggml_backend_ptr> & backends) {
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (!llama_context_dev_is_sycl(dev)) {
+            continue;
+        }
+#    ifdef GGML_USE_SYCL
+        auto refresh_fn = &ggml_backend_sycl_planned_hold_epoch_refresh;
+#    else
+        auto refresh_fn = llama_context_sycl_hold_epoch_refresh_proc(dev);
+        if (!refresh_fn) {
+            continue;
+        }
+#    endif
+        refresh_fn(backend.get());
+    }
+}
+
 static bool llama_context_sycl_hold_spill_fits(const std::vector<ggml_backend_ptr> & backends,
                                                uint32_t                              n_ubatch,
                                                uint32_t *                            largest_ub) {
@@ -486,6 +516,22 @@ llama_context::sycl_compute_scope_fn_t llama_context::sycl_compute_scope_fn() {
 #endif
     }
     return sycl_compute_scope_cached;
+}
+
+// llama.cpp-kpjw: the ONLY two places a graph is allocated on this context's scheduler. A buffer the SYCL backend
+// places while the scope is open is positively a scheduler compute buffer (it asks for the KV-zone-first placement,
+// and feeds the per-rung request record the hold-spill fit judges from); one it places outside the scope is an ordinary
+// request of the RUNTIME zone that nothing plans for or counts. Every allocation on the scheduler is a compute
+// allocation, whoever asks (the decode graph, the reserve, the K-shift graph llama_kv_cache::update builds), so none
+// goes to ggml_backend_sched_alloc_graph / ggml_backend_sched_reserve bare: a source gate pins that.
+bool llama_context::sched_alloc_graph(ggml_cgraph * gf) {
+    sycl_compute_scope_guard sycl_scope(sycl_compute_scope_fn());
+    return ggml_backend_sched_alloc_graph(sched.get(), gf);
+}
+
+bool llama_context::sched_reserve_graph(ggml_cgraph * gf) {
+    sycl_compute_scope_guard sycl_scope(sycl_compute_scope_fn());
+    return ggml_backend_sched_reserve(sched.get(), gf);
 }
 
 // llama.cpp-38af: the compute-buffer buft for the CPU backend when the first
@@ -1196,6 +1242,14 @@ llama_context::llama_context(
 #    endif
         }
 #endif
+        // A pinned -ub publishes its plan once, before the memory module exists: re-read the KV room that epoch is
+        // judged with now that the KV cache and the recurrent state do. (The ladder publishes per rung, after them, and
+        // begins its own epochs; refreshing the construction-time one first changes nothing for it.)
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        if (llama_context_has_sycl_backend(backends)) {
+            llama_context_sycl_hold_epoch_refresh(backends);
+        }
+#endif
         if (sycl_auto_ubatch_trial) {
             sycl_select_auto_ubatch(params.type_k, params.type_v);
         } else {
@@ -1225,8 +1279,8 @@ llama_context::llama_context(
                     "the VRAM arena and left a card under the driver headroom the arena expects (n_ubatch=%u); %s",
                     cparams.n_ubatch,
                     largest_ub != 0 ?
-                        format("the largest -ub that fits is about %u, a power of two (or free VRAM on the card, or "
-                               "pass a smaller -c)",
+                        format("the largest -ub that fits is about %u, a power of two, estimated by scaling the "
+                               "measured compute buffers (or free VRAM on the card, or pass a smaller -c)",
                                largest_ub)
                             .c_str() :
                         "no -ub is known to fit: free VRAM on the card, or pass a smaller -c"));
@@ -1387,10 +1441,16 @@ void llama_context::sycl_recheck_runtime_context_flash_attn() {
                                                   owner.slot_generation };
             const auto                  rc    = recheck_fn(backend.get(), token, cparams.flash_attn);
             if (rc != GGML_SYCL_LIFECYCLE_OK) {
-                throw std::runtime_error(
-                    format("non-FA attention scratch guard re-check failed for the resolved flash-attention "
-                           "state: %s",
-                           sycl_recheck_lifecycle_result_name(rc)));
+                const std::string what = format(
+                    "non-FA attention scratch guard re-check failed for the resolved flash-attention "
+                    "state: %s",
+                    sycl_recheck_lifecycle_result_name(rc));
+                // A plan the transaction refused is a fit verdict on the rung; BUSY, a stale identity or any other
+                // lifecycle result is not, and the trial must not lower -ub for it.
+                if (rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED) {
+                    throw llama_auto_ubatch_fit_refusal(what);
+                }
+                throw std::runtime_error(what);
             }
         }
     }
@@ -1707,6 +1767,30 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         lowest_refused = lowest_refused == 0 ? c : std::min(lowest_refused, c);
     };
 
+    // llama.cpp-kpjw: release the previous rung's compute buffers. They are still alive after a rung (sched_reserve()
+    // only replaces them when the next one reserves), and the ones a rung placed in the arena's KV zone sit in exactly
+    // the room a runtime-context transaction measures its KV headroom against (ggml_sycl_kv_capacity_live reads the
+    // zone's free bytes), while the ones it placed outside the arena are raw bytes the ledger holds against the card.
+    // A rung that already lost, or a smaller winner, would depress the next transaction's capacity and refuse it for
+    // room it is about to be given back. So BOTH transactions run after this: every rung's (try_candidate) and the
+    // settle's republish of the winner, whose F3 must judge the card the realized check judged (the winner's own
+    // buffers, not a loser's) or the two verdicts differ on one rung. The sched is re-reserved afterwards whenever
+    // this rung does not end up the winner (sched_matches_last_good is false from here until a reserve succeeds), which
+    // costs one extra reserve when a rung loses at its probe and nothing otherwise: a rung that reserves replaces the
+    // sched anyway, and the settle re-reserves unconditionally.
+    auto release_rung_buffers = [&]() {
+        synchronize();
+        for (auto & res : gf_res_prev) {
+            res.reset();
+        }
+        gf_res_reserve.reset();
+        gf_res_prev_active = nullptr;
+        sched.reset();
+        sched_need_reserve      = true;
+        sched_matches_last_good = false;
+        hold_spill_validated_ub = 0;
+    };
+
     // llama.cpp-7n6n: ONE per-candidate validator,
     // shared by the cache-hit revalidation below and the ladder loop -- the
     // two call sites used to carry independently-maintained copies of this
@@ -1728,24 +1812,7 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // via the publish before the host-fallback stage fails.
     auto try_candidate = [&](uint32_t c) -> const char * {
         rung_fit_refused = false;
-        // llama.cpp-kpjw: release the previous rung's compute buffers BEFORE this rung's transaction. They are still
-        // alive here (sched_reserve() only replaces them when the next rung reserves), and the ones a rung placed in
-        // the arena's KV zone sit in exactly the room the transaction measures its KV headroom against
-        // (ggml_sycl_kv_capacity_live reads the zone's free bytes), so a rung that already lost, or a smaller winner,
-        // would depress the next, larger rung's KV capacity and refuse it for room it is about to be given back. The
-        // settle step re-reserves last_good whenever this rung does not end up the winner (sched_matches_last_good is
-        // false from here until this rung's own reserve succeeds), which costs one extra reserve when a rung loses at
-        // its probe and nothing otherwise: a rung that reserves replaces the sched anyway.
-        synchronize();
-        for (auto & res : gf_res_prev) {
-            res.reset();
-        }
-        gf_res_reserve.reset();
-        gf_res_prev_active = nullptr;
-        sched.reset();
-        sched_need_reserve      = true;
-        sched_matches_last_good = false;
-        hold_spill_validated_ub = 0;
+        release_rung_buffers();
 
         for (auto & sb : sycl_backends) {
             ggml_sycl_runtime_context_probe probe{};
@@ -1863,7 +1930,9 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
             LLAMA_LOG_INFO("[SYCL-PLAN] auto n_ubatch candidate %u: compute buffer reserve failed: %s\n", c, e.what());
             cparams.pipeline_parallel = pipeline_parallel_before_reserve;
             sched_matches_last_good   = false;
-            rung_fit_refused          = true;
+            // Only a fit verdict (the compute buffers, or the plan the recheck refused) starts or continues the
+            // descent; a lifecycle failure or a memory module that would not initialize is no verdict on the rung.
+            rung_fit_refused          = dynamic_cast<const llama_auto_ubatch_fit_refusal *>(&e) != nullptr;
             return "compute buffers did not fit";
         }
         sched_matches_last_good = true;
@@ -2238,6 +2307,11 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         const bool need_publish =
             llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty, cparams.n_ubatch, fallback_ubatch);
         cparams.n_ubatch = last_good;
+        // The previous rung's compute buffers are released BEFORE the settle's publish, exactly as before every rung's
+        // transaction (release_rung_buffers): a loser's buffers still alive here are raw bytes the ledger holds
+        // against the card and KV-zone room the transaction measures against, so the settle's F3 would judge a card
+        // the realized check, which accepted this rung with them credited back, did not.
+        release_rung_buffers();
         // The settle's publish is a fit check of its own (the transaction-time spill bound, against a card the winner's
         // reserve has since been released from). A refusal of it is a refusal of this rung, and the context fails by
         // name; there is no second walk down the ladder from here. The ONE hold-spill fit function (the entry the
@@ -2261,19 +2335,18 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
                 std::rethrow_exception(settle_error);
             }
             const uint32_t advice = llama_auto_ubatch_advice(largest_ub, lowest_refused);
-            throw std::runtime_error(
-                format("auto n_ubatch: %s (tried %s; last stop: %s), and the settle at %u was refused (%s); %s",
-                       descent_ran ? format("no -ub from %u down to %u fits this context", fallback_ubatch,
-                                            llama_auto_ubatch_descent_floor)
-                                         .c_str() :
-                                     format("%u does not fit this context", last_good).c_str(),
-                       tried.c_str(), last_stop != nullptr ? last_stop : stop, last_good, settle_refusal.c_str(),
-                       advice != 0 ?
-                           format("the largest -ub that fits is about %u, a power of two (or free VRAM on the card, or "
-                                  "pass a smaller -c)",
-                                  advice)
-                               .c_str() :
-                           "no -ub is known to fit: free VRAM on the card, or pass a smaller -c"));
+            throw std::runtime_error(format(
+                "auto n_ubatch: %s (tried %s; last stop: %s), and the settle at %u was refused (%s); %s",
+                descent_ran ? format("no -ub from %u down to %u fits this context", fallback_ubatch,
+                                     llama_auto_ubatch_descent_floor)
+                                  .c_str() :
+                              format("%u does not fit this context", last_good).c_str(),
+                tried.c_str(), last_stop != nullptr ? last_stop : stop, last_good, settle_refusal.c_str(),
+                advice != 0 ? format("the largest -ub that fits is about %u, a power of two, estimated by scaling the "
+                                     "measured compute buffers (or free VRAM on the card, or pass a smaller -c)",
+                                     advice)
+                                  .c_str() :
+                              "no -ub is known to fit: free VRAM on the card, or pass a smaller -c"));
         } else {
             sched_need_reserve = true;
             sched_reserve();
@@ -2458,7 +2531,7 @@ void llama_context::sched_reserve() {
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
-                throw std::runtime_error("failed to allocate compute pp buffers");
+                throw llama_auto_ubatch_fit_refusal("failed to allocate compute pp buffers");
             }
         }
 
@@ -2472,7 +2545,7 @@ void llama_context::sched_reserve() {
     {
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
-            throw std::runtime_error("failed to allocate compute tg buffers");
+            throw llama_auto_ubatch_fit_refusal("failed to allocate compute tg buffers");
         }
 
         n_splits_tg        = ggml_backend_sched_get_n_splits(sched.get());
@@ -2499,7 +2572,7 @@ void llama_context::sched_reserve() {
         };
 
         if (!gf) {
-            throw std::runtime_error("failed to allocate compute pp buffers");
+            throw llama_auto_ubatch_fit_refusal("failed to allocate compute pp buffers");
         }
     }
 
@@ -3207,9 +3280,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        // A buffer the allocator places while this scope is open is a scheduler compute buffer.
-        sycl_compute_scope_guard sycl_scope(sycl_compute_scope_fn());
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        if (!sched_alloc_graph(gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -4308,8 +4379,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     } else {
         // The compute buffers the reserve allocates are the ones the planned dense scratch's hold constrains.
-        sycl_compute_scope_guard sycl_scope(sycl_compute_scope_fn());
-        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+        if (!sched_reserve_graph(gf)) {
             GGML_ASSERT(!sizes);
             LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
             return nullptr;

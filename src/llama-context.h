@@ -64,6 +64,12 @@ struct llama_context {
 
     ggml_backend_sched_t get_sched() const;
 
+    // Allocate / reserve a graph on this context's scheduler, inside the SYCL backend's compute-allocation scope
+    // (see sycl_compute_scope_fn below). The only way anything allocates on the scheduler: llama_kv_cache::update's
+    // K-shift graph included.
+    bool sched_alloc_graph(ggml_cgraph * gf);
+    bool sched_reserve_graph(ggml_cgraph * gf);
+
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;

@@ -1714,14 +1714,32 @@ size_t unified_cache_get_hold_rung_requests(int device_id, uint64_t owner, zone_
 // The cache's ledger of outside-arena bytes: what the cache holds LIVE in raw device memory (not in an arena zone) on
 // the device, from the allocation registry. Synchronous with a release (the driver's credit for a freed buffer is not).
 size_t unified_cache_raw_device_live_bytes(int device_id);
+// The same ledger as the hold-fit sees it: every raw device row held on the device, a row still RELEASING included
+// (its physical free has not happened, so it is not free memory), and in `*compute_live` the LIVE ones that are
+// scheduler compute buffers (rows made by a request flagged as one, by origin: the rung's own bytes, which the
+// realized check credits back). One registry pass, so the two figures are consistent with each other.
+size_t       unified_cache_raw_device_held_bytes(int device_id, size_t * compute_live);
 // The card's free memory WITHOUT the rung's own compute buffers, from the ledger and never a driver read after a
-// release: the first call for an owner takes `driver_free_now` as the cold baseline (plus the raw bytes live then),
-// and every call returns that baseline less the raw bytes that stay live without the rung. `rung_live` is true when
-// the rung's own buffers exist (the realized check): what was live when the owner's epoch began is what stays.
+// release. A window's baseline (the free memory with no raw cache allocation held: `driver_free_now` plus the raw
+// bytes held) is the MAXIMUM reading taken since the owner's last publish (a driver's credit for a freed buffer lags,
+// and a lag only lowers a reading), and a publish opens a new window. The result is that baseline less the raw bytes
+// that stay held without the rung: every raw row, a RELEASING one included, except (when `rung_live`, the realized
+// check) the LIVE scheduler compute rows, which are the rung's own. Identity is by origin, so a raw row made after
+// the epoch began that is not a scheduler compute buffer (the recurrent state) is persistent.
+// Everything the registry does not hold is invisible to the ledger and each such consumer errs toward ADMITTING
+// (another tenant arriving mid-window, the driver's own graph/JIT/oneDNN allocations); a stale-low first reading errs
+// toward refusing until a later one repairs it.
 size_t unified_cache_hold_free_before(int device_id, uint64_t owner, size_t driver_free_now, bool rung_live);
 // The epoch's KV room snapshot (zone_kv_room_for_compute at the publish), and the n_ubatch of the epoch; 0 when the
 // owner has no epoch. The realized check asks the same function the publish did, over the same room.
 bool   unified_cache_get_hold_epoch(int device_id, uint64_t owner, uint32_t * n_ubatch, size_t * kv_room);
+// Replaces the epoch's KV room and nothing else. A pinned -ub publishes once, BEFORE the memory module (the KV cache,
+// the recurrent state) exists, so the room its epoch began with predates both; the context re-reads it once they exist
+// and before the compute buffers are reserved. A no-op for another owner or before the first publish.
+void         unified_cache_refresh_hold_epoch_kv_room(int device_id, uint64_t owner, size_t kv_room);
+// The cap on the per-rung request records of one owner, and how many records it refused (a truncation is never silent).
+size_t       unified_cache_hold_rung_record_limit();
+size_t       unified_cache_hold_rung_records_dropped(int device_id, uint64_t owner);
 // A spill-capable RUNTIME request that the hold kept out of the zone, counted per device by where the buffer landed:
 // `in_arena` is a placement in the arena's KV zone (the compute-buffer path tries it first), otherwise raw device
 // memory outside the arena, which is what eats the driver headroom. The first one of each kind since the last take
@@ -6250,6 +6268,15 @@ bool allocation_registry_test_claim_reached() noexcept;
 // (erased); false for a LIVE row (llama.cpp-93tw).
 bool                      allocation_registry_test_claim_ptr(void * ptr) noexcept;
 void allocation_registry_test_erase(void * ptr) noexcept;
+// llama.cpp-kpjw: a host-only registry row for the hold-fit ledger tests (tests/test-hold-ledger.cpp): a raw
+// device-VRAM row of `bytes` on `device`, LIVE or RELEASING, optionally flagged as a scheduler compute buffer or as an
+// arena sub-allocation. No physical allocation, no physical release. False if `ptr` already has a row.
+bool                      allocation_registry_test_publish_raw(void * ptr,
+                                                               int    device,
+                                                               size_t bytes,
+                                                               bool   scheduler_compute,
+                                                               bool   from_arena,
+                                                               bool   releasing) noexcept;
 #endif
 
 // Foundation owner path. The intrusive control is allocated before any physical

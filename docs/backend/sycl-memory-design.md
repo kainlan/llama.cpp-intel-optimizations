@@ -2524,11 +2524,21 @@ The inputs are four facts and nothing else:
   snapshots it (`unified_cache_begin_planned_hold_epoch`), and the realized check, which runs after the KV exists, asks
   over that same room.
 - *The free memory.* One model of it: the unified cache's own ledger (`unified_cache_hold_free_before`), not a driver
-  read. The ledger is a cold driver reading plus the bytes the cache itself holds outside the arena
-  (`zone_hold_free_cold`, taken once per owner at its first fit), less the outside-arena bytes that persist across rungs
-  (`zone_hold_free_before`). A rung's buffers released from the cache are credited the moment they are released, which
-  the driver's own reading is not (it lags a destroy: on the B50 it still read 602.7 MB with about 1097 MB truly
-  free). Asking the same rung twice, with any history in between, therefore gives the same verdict.
+  read, and the same figure for every asker: the realized check, the constructor's check, F3, and the non-FA check, which
+  used to compare its demand with a bare driver reading. A WINDOW is the span between two publishes (a publish, or an
+  epoch begin, opens one and forgets the last). Its baseline `cold` is what the card would show with nothing of the
+  cache's held outside the arena, `driver_free + raw_held` per reading (`zone_hold_free_cold`), and is the MAXIMUM
+  reading taken inside the window (`zone_hold_cold_update`): the driver's credit for a freed buffer lags, a lag only
+  lowers a reading, so a later reading can only repair an earlier stale-low one. What persists is `raw_held` less the
+  rung's own live scheduler compute buffers when the rung is live (`zone_hold_persistent_raw`), and
+  `free_before = cold - persistent` (`zone_hold_free_before`). Which rows are the rung's own is decided by ORIGIN, not
+  timing: a registry row carries `scheduler_compute`, set at registration from the request that made it (a spill-capable
+  scheduler compute request), so a recurrent-state buffer made while a rung is live is held but never credited, and a
+  compute buffer is credited only while LIVE. A RELEASING row is still held (it is in `raw_held`, in the baseline and in
+  what persists) until its physical free happened and the row is gone: crediting it earlier would be a free the driver
+  has not credited. The cache's own raw allocations are all registry rows, the cache-entry mallocs included
+  (`unified_cache_adopt_raw_device_allocation`). Asking the same rung twice, with any history in between inside a window,
+  therefore gives the same verdict.
 The verdict is `zone_hold_spill_bound_fits(free_before, headroom, demand)`: the hold is blamed only when the card had its
 headroom before the rung and the rung's demand takes it below, i.e. `free_before >= headroom && free_before - demand <
 headroom`. A card that was short already (a full B70 with KB-scale spills) is not blamed, and a rung with no demand is
@@ -2563,7 +2573,7 @@ refusal makes the candidate lose with the stop reason "hold spill left no headro
 A pinned `-ub` reserves once, in the context constructor, with nobody asking, and the transaction before it ran with this
 context's KV not yet created. The constructor therefore asks the same entry after its reserve, whichever way it was
 made (`llama_context_sycl_hold_spill_fits`), and a refusal is a context-init refusal by name: `the largest -ub that fits
-is about N, a power of two`. N is `zone_hold_fit_largest_ub` over the same inputs: the largest power of two the function
+is about N, a power of two, estimated by scaling` (the figure is an estimate for a rung nothing has measured). N is `zone_hold_fit_largest_ub` over the same inputs: the largest power of two the function
 accepts, the smallest over the context's devices, so N passes the F3 publish and the next rung up does not (tested on
 the B50 g7 numbers). A pinned `-ub 1024` on the B50 with Qwen is refused there, instead of reaching flash attention with
 107.8 MB of headroom and hanging; a pinned `-ub 512` there fits, and passes with an oracle-equal perplexity.
@@ -2574,9 +2584,39 @@ missing hook and a settle that re-reserved leave it 0 and the check runs. Not co
 adapter change, a toggled embeddings or causal mode) makes buffers nobody checks. The SYCL entry changed arity
 (`largest_ub`); libllama and the backend library ship from one build, so there is no version gate, and an older library
 called with the extra argument leaves `largest_ub` 0, which degrades the advice and not the verdict.
-The ledger has one honest limit: its cold reading is a driver read at the owner's first fit, so it is as stale-low as the
-driver was at that moment (load-time transients just freed read low), and a weight loaded after it is not in the ledger.
-Both err toward refusing a rung, never toward admitting one.
+The ledger's limits, and the direction each errs, are stated where the baseline is read (`unified_cache_hold_free_before`).
+Everything the registry does not hold is invisible to it: another tenant that arrives mid-window, the driver's own graph,
+JIT and oneDNN allocations. Each of those errs toward ADMITTING a rung the card may no longer have room for (nothing is
+subtracted), and the headroom the arena expects outside itself (256 MB) is the margin that absorbs them. A stale-low
+first reading (load-time transients just freed) errs toward REFUSING, until a later reading in the window repairs it.
+A weight loaded after the baseline is a registry row only if it is a raw cache allocation.
+
+*A pinned `-ub` has an epoch too.* A pinned `-ub` publishes once, before the memory module exists, so the KV room its
+epoch snapshotted predates the KV cache and the recurrent state. The constructor refreshes it
+(`ggml_backend_sycl_planned_hold_epoch_refresh`, an exported entry looked up through the registry like the scope) before
+`sched_reserve()`; the refresh moves only the KV room of the owner's own live epoch. The ladder publishes per rung, after
+the KV exists, and begins its own epochs, so refreshing the construction-time one first changes nothing for it. This is
+what makes a pinned `-ub 1024` on the B50 (Qwen) refuse at context init with the advised `N` instead of being admitted
+and hanging at the first graph.
+
+*Every allocation on the scheduler opens the compute scope.* `llama_context::sched_alloc_graph` and
+`sched_reserve_graph` are the only callers of `ggml_backend_sched_alloc_graph` / `ggml_backend_sched_reserve` in
+libllama; each opens `ggml_backend_sycl_compute_alloc_scope` around the call. The KV cache's K-shift graph goes through
+`lctx->sched_alloc_graph` (the K-shift's compute buffer is a scheduler compute buffer like any other), and the
+multimodal projector's scheduler, which allocates on the same buffer type, opens the same exported scope through the
+registry (`clip_sycl_compute_scope`). `tests/test-sycl-hold-ledger-source.py` pins that no bare call remains anywhere in
+`src/`, `tools/`, `common/` or `examples/`.
+
+*Only a fit verdict lowers `-ub`.* A reserve that threw is a loss of the rung, but it starts or continues the descent
+only when it threw `llama_auto_ubatch_fit_refusal`: the compute-buffer allocation failures and the non-FA recheck's
+`PLAN_REJECTED`. A lifecycle result (`BUSY`, `STALE_IDENTITY`) or a memory module that would not initialize is no verdict
+on the rung and never lowers `-ub`. `rung_fit_refused` is set from the exception's type, nowhere else for a throwing
+reserve.
+
+*The settle releases first, too.* The settle's republish of the winner runs after `release_rung_buffers()`, the same
+lambda every rung's transaction runs after, so its F3 judges the card the realized check judged (the winner's own
+buffers, not a loser's still alive). The per-rung record list is bounded (`kMaxHoldRungRecords`); a rung beyond the cap
+is counted (`unified_cache_hold_rung_records_dropped`) and logged once, never silently truncated.
 
 *A rung does not pay for the buffers of the rung before it.* `try_candidate` releases the previous rung's compute
 buffers (the scheduler, the reserve graph) before this rung's transaction. A rung that placed its buffers in the KV

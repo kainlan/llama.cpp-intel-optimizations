@@ -89,6 +89,7 @@
 #include "ggml-sycl/block-exec-dense.hpp"
 #include "ggml-sycl/block-exec-gate.hpp"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/compute-alloc-scope.hpp"
 #include "ggml-sycl/convert.hpp"
 #include "ggml-sycl/cpy.hpp"
 #include "ggml-sycl/dispatch-tuning.hpp"
@@ -10685,14 +10686,13 @@ static int64_t get_fused_moe_max_batch() {
 
 // Model load phase flag - when true, skip weight caching to avoid OOM during load
 static std::atomic<bool> g_sycl_in_model_load{ false };
-// llama.cpp-kpjw (kpjw-g7): depth of the scheduler compute scopes open on THIS thread. The llama context opens one
-// (ggml_backend_sycl_compute_alloc_scope) around ggml_backend_sched_reserve / ggml_backend_sched_alloc_graph, so a
-// buffer-type allocation made inside it is positively a scheduler compute buffer. Thread-local on purpose: the
-// scheduler allocates on the calling thread, and another thread's weight or state allocation must not inherit it.
-static thread_local int  g_sycl_compute_alloc_scope_depth = 0;
 
+// llama.cpp-kpjw (kpjw-g7): the scheduler compute scopes open on THIS thread (compute-alloc-scope.hpp, host-tested).
+// The llama context opens one (ggml_backend_sycl_compute_alloc_scope) around every allocation its scheduler makes, so
+// a buffer-type allocation made inside it is positively a scheduler compute buffer. Thread-local on purpose: the
+// scheduler allocates on the calling thread, and another thread's weight or state allocation must not inherit it.
 static bool ggml_sycl_compute_alloc_scope_active() {
-    return g_sycl_compute_alloc_scope_depth > 0;
+    return ggml_sycl::compute_alloc_scope_active();
 }
 
 // Track backend lifetime for shared host-weight extras cleanup.
@@ -17294,7 +17294,9 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
         return true;
     }
     int                               device    = q.device;
+    // The cache bounds one owner's records at its own limit (and counts what it refuses): never fewer slots than that.
     constexpr size_t                  kMaxRungs = 32;
+    GGML_ASSERT(ggml_sycl::unified_cache_hold_rung_record_limit() <= kMaxRungs);
     ggml_sycl::zone_hold_rung_request rungs[kMaxRungs];
     ggml_sycl::zone_hold_fit_inputs   in;
     in.headroom_target      = kSyclArenaMinExternalHeadroomBytes;
@@ -17303,10 +17305,10 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     // the zone since); a transaction asks the zone as it is now.
     uint32_t epoch_n_ubatch = 0;
     size_t   epoch_kv_room  = 0;
-    in.kv_room =
-        q.rung_live && ggml_sycl::unified_cache_get_hold_epoch(q.device, q.owner, &epoch_n_ubatch, &epoch_kv_room) ?
-            epoch_kv_room :
-            ggml_sycl_hold_kv_room(q.device, q.kv_pending);
+    const bool have_epoch =
+        q.rung_live && ggml_sycl::unified_cache_get_hold_epoch(q.device, q.owner, &epoch_n_ubatch, &epoch_kv_room);
+    in.kv_room      = ggml_sycl::zone_hold_pick_kv_room(q.rung_live, have_epoch, epoch_kv_room,
+                                                   have_epoch ? 0 : ggml_sycl_hold_kv_room(q.device, q.kv_pending));
     in.n_rungs      = ggml_sycl::unified_cache_get_hold_rung_requests(q.device, q.owner, rungs, kMaxRungs);
     in.rungs        = rungs;
     in.plan_of      = ggml_sycl_hold_plan_at;
@@ -17333,9 +17335,10 @@ static size_t ggml_sycl_planned_scratch_hold_spill_bound(const ggml_sycl_hold_fi
 
 // "the largest -ub that fits is about N" for a refusal, or the honest statement that none does.
 static std::string ggml_sycl_hold_fit_advice(uint32_t largest_ub) {
-    char buf[96];
+    char buf[128];
     if (largest_ub != 0) {
-        snprintf(buf, sizeof(buf), "the largest -ub that fits is about %u, a power of two", largest_ub);
+        snprintf(buf, sizeof(buf), "the largest -ub that fits is about %u, a power of two, estimated by scaling",
+                 largest_ub);
     } else {
         snprintf(buf, sizeof(buf), "no -ub is known to fit");
     }
@@ -17407,24 +17410,29 @@ static bool ggml_sycl_check_hold_spill_realized(int        device,
     return false;
 }
 
+// The scheduler compute scope (ggml-sycl.h): a buffer-type allocation made while it is open on the calling thread is a
+// scheduler compute buffer. Changes only a thread-local depth.
+void ggml_backend_sycl_compute_alloc_scope(bool enter) {
+    if (enter) {
+        ggml_sycl::compute_alloc_scope_enter();
+    } else {
+        ggml_sycl::compute_alloc_scope_leave();
+    }
+}
+
 // The auto-ubatch trial's per-rung check (see ggml_sycl_check_hold_spill_realized): true when this backend's
 // context fits the one hold-spill function at `n_ubatch` with the rung's compute buffers in place. The trial calls
 // it after the rung's sched_reserve() returned. A refusal is logged by name (at INFO: the loss is recoverable, the
-// ladder lands lower). Not a lifecycle transaction: it reads state and the live free memory and changes nothing.
+// ladder lands lower). Not a lifecycle transaction, and not a pure function of the configuration and the request: it
+// reads the live free memory and the cache's ledger, and the ledger's baseline is taken at the first fit of a window
+// (the first call after a publish), so the verdict also depends on when that call happened. It writes that baseline
+// and nothing else.
 //
 // ABI: this entry changed arity (r4 added the largest_ub out-parameter) and is reached from libllama through
 // ggml_backend_sycl_get_proc_address on a backend-DL build. libllama and the SYCL DSO ship from one build, so there
 // is no version gate. An older DSO that predates the entry exports nothing and the caller skips it; one that exports
 // the three-argument form is called with a fourth argument it ignores, so largest_ub stays 0 (the caller zeroes it
 // before the call and reads 0 as "no -ub is known to fit"), which degrades the refusal's advice, never its verdict.
-void ggml_backend_sycl_compute_alloc_scope(bool enter) {
-    if (enter) {
-        g_sycl_compute_alloc_scope_depth++;
-    } else if (g_sycl_compute_alloc_scope_depth > 0) {
-        g_sycl_compute_alloc_scope_depth--;
-    }
-}
-
 bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend, uint32_t n_ubatch, uint32_t * largest_ub) {
     if (largest_ub) {
         *largest_ub = 0;
@@ -17435,6 +17443,19 @@ bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend, uint32_t 
     auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     return ggml_sycl_check_hold_spill_realized(ctx->device, ctx->planned_scratch_owner, /*probe_mode=*/true, n_ubatch,
                                                largest_ub);
+}
+
+// Re-reads the KV room the owner's epoch is judged with, from the zone as it is now with the context's KV in place
+// (nothing pending). A pinned -ub publishes once, before the memory module exists, so the room its epoch began with
+// predates the KV cache and the recurrent state; the constructor calls this once they exist and before the compute
+// buffers are reserved. A no-op for a null or foreign backend and when the owner has no epoch.
+void ggml_backend_sycl_planned_hold_epoch_refresh(ggml_backend_t backend) {
+    if (!backend || !backend->context || !ggml_backend_is_sycl(backend)) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    ggml_sycl::unified_cache_refresh_hold_epoch_kv_room(ctx->device, ctx->planned_scratch_owner,
+                                                        ggml_sycl_hold_kv_room(ctx->device, 0));
 }
 
 static bool ggml_sycl_check_nonfa_attn_scratch(int                              device,
@@ -17555,10 +17576,16 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
     const size_t hold_spill_bytes = hold_query ? ggml_sycl_planned_scratch_hold_spill_bound(*hold_query) : 0;
     const size_t nonfa_scratch_demand =
         ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);
-    const size_t nonfa_demand =
-        hold_spill_bytes > SIZE_MAX - nonfa_scratch_demand ? SIZE_MAX : nonfa_scratch_demand + hold_spill_bytes;
+    const size_t nonfa_demand = ggml_sycl::zone_hold_nonfa_demand(nonfa_scratch_demand, hold_spill_bytes);
+    // One fact, one source (r7 I1): the card's free memory the demand is compared with is the SAME ledger figure the
+    // hold-spill fit judges its own spill with (the driver's reading taken above, less what the rung does not own),
+    // not a bare driver reading. Inside a reserve (rung_live) the driver reading already counts the rung's buffers
+    // that exist; the demand counts them again, so comparing the two double counts exactly as the hold term did.
+    const size_t free_cmp = hold_query ? ggml_sycl::unified_cache_hold_free_before(device, hold_query->owner, free_mem,
+                                                                                   hold_query->rung_live) :
+                                         free_mem;
 
-    if (ggml_sycl::unified_cache_nonfa_attn_scratch_fits_headroom(nonfa_demand, free_mem)) {
+    if (ggml_sycl::unified_cache_nonfa_attn_scratch_fits_headroom(nonfa_demand, free_cmp)) {
         return true;
     }
 
@@ -17572,7 +17599,7 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
     const double   demand_mb      = nonfa_demand / mb;
     const double   reserve_mb     = reserve / mb;
     const double   needs_mb       = demand_mb + reserve_mb;
-    const double   free_mb        = free_mem / mb;
+    const double   free_mb        = free_cmp / mb;
     // "headroom-limited": this figure is bounded by THIS device's current
     // live outside-arena headroom (free memory minus the empirical
     // reserve), not a whole-device or zone-only guarantee -- another tenant
@@ -17580,7 +17607,7 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
     // unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(), the
     // inverse of fits_headroom()'s own comparison above, rather than
     // re-subtracting the reserve by hand here -- the two must not drift.
-    const size_t   capacity_bytes = ggml_sycl::unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(free_mem);
+    const size_t   capacity_bytes = ggml_sycl::unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(free_cmp);
     const uint32_t fits_headroom_ctx =
         ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(capacity_bytes, n_head, n_ubatch);
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
@@ -111944,6 +111971,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_compute_alloc_scope") == 0) {
         return (void *) ggml_backend_sycl_compute_alloc_scope;
+    }
+    if (strcmp(name, "ggml_backend_sycl_planned_hold_epoch_refresh") == 0) {
+        return (void *) ggml_backend_sycl_planned_hold_epoch_refresh;
     }
     // llama.cpp-xojq (nphx Task 4b, comment c-1mwi): closes the gap the
     // comment above used to name for ggml_backend_sycl_auto_ubatch_enabled
