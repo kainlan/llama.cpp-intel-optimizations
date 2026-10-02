@@ -186,12 +186,16 @@ struct run_result {
 };
 
 // One compute of the arm's graph on the backend. inject != 0 forces a decline on that call of the site.
-run_result run_arm(ggml_backend_t backend, const arm & a, int inject, bool keep_state = false) {
+run_result run_arm(ggml_backend_t backend, const arm & a, int inject, bool keep_state = false, bool fresh = true) {
     run_result res;
-    ggml_sycl_test_scratchpad_sites_reset();
-    if (inject != 0 && !ggml_sycl_test_inject_scratchpad_decline(a.site, inject)) {
-        fprintf(stderr, "FAIL: %s: the seam does not know the site %s\n", a.name, a.site);
-        return res;
+    // fresh == false continues from the seam's current state: no reset and no new inject, so an armed after_n and the
+    // counters carry over from the previous run_arm (which must have kept its state).
+    if (fresh) {
+        ggml_sycl_test_scratchpad_sites_reset();
+        if (inject != 0 && !ggml_sycl_test_inject_scratchpad_decline(a.site, inject)) {
+            fprintf(stderr, "FAIL: %s: the seam does not know the site %s\n", a.name, a.site);
+            return res;
+        }
     }
 
     const size_t         max_nodes = 16;
@@ -300,7 +304,8 @@ int main(int, char ** argv) {
         const arm &            first = arms0.front();
         const run_result driven = run_arm(backend, first, 1, /*keep_state=*/true);
         uint64_t c = 0, d = 0, e = 0;
-        const bool refused = !ggml_sycl_test_inject_scratchpad_decline(first.site, -1);
+        const bool refused = !ggml_sycl_test_inject_scratchpad_decline(first.site, -1) &&
+                             !ggml_sycl_test_inject_scratchpad_decline("no_such_site", 1);
         const bool read    = ggml_sycl_test_scratchpad_site_counts(first.site, &c, &d, &e);
         if (!driven.ok || driven.calls != 1 || driven.declined != 1 || !refused || !read || c != 1 || d != 1 || e != 0) {
             fprintf(stderr,
@@ -308,6 +313,30 @@ int main(int, char ** argv) {
                     "calls=%llu declined=%llu engaged=%llu, refused=%d)\n",
                     (unsigned long long) driven.calls, (unsigned long long) driven.declined, (unsigned long long) c,
                     (unsigned long long) d, (unsigned long long) e, refused ? 1 : 0);
+            ok = false;
+        }
+        ggml_sycl_test_scratchpad_sites_reset();
+    }
+    {
+        // A refusal must not disarm the site either. Arm the softmax site for its 2nd call, drive one call (no decline yet),
+        // refuse two injects, drive a second call: it must be the declined one. A refusal that stored its after_n first
+        // (or cleared the site) would let the second call through.
+        const std::vector<arm> arms1 = make_arms();
+        const arm &            first = arms1.front();
+        ggml_sycl_test_scratchpad_sites_reset();
+        const bool       armed   = ggml_sycl_test_inject_scratchpad_decline(first.site, 2);
+        const run_result call1   = run_arm(backend, first, 0, /*keep_state=*/true, /*fresh=*/false);
+        const bool       refused = !ggml_sycl_test_inject_scratchpad_decline(first.site, -1) &&
+                                   !ggml_sycl_test_inject_scratchpad_decline("no_such_site", 1);
+        const run_result call2   = run_arm(backend, first, 0, /*keep_state=*/true, /*fresh=*/false);
+        if (!armed || !refused || !call1.ok || !call2.ok || call1.calls != 1 || call1.declined != 0 || call1.engaged != 1 ||
+            call2.calls != 2 || call2.declined != 1 || call2.engaged != 1) {
+            fprintf(stderr,
+                    "FAIL: a refused inject disarmed the site or changed its counters (armed=%d refused=%d; call 1 calls=%llu "
+                    "declined=%llu engaged=%llu; call 2 calls=%llu declined=%llu engaged=%llu)\n",
+                    armed ? 1 : 0, refused ? 1 : 0, (unsigned long long) call1.calls, (unsigned long long) call1.declined,
+                    (unsigned long long) call1.engaged, (unsigned long long) call2.calls, (unsigned long long) call2.declined,
+                    (unsigned long long) call2.engaged);
             ok = false;
         }
         ggml_sycl_test_scratchpad_sites_reset();

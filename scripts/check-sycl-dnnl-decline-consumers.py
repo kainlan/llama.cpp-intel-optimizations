@@ -234,6 +234,9 @@ HELPER_COND = "scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() >
 HELPER_HOOK = "if (ggml_sycl_scratchpad_site_hook(site)) {\n        return true;\n    }\n"
 
 
+SM_ANCHOR = "        auto scratchpad_md = softmax_pd.scratchpad_desc();"
+
+
 def mutants(files):
     """(label, mutated files) pairs, each of which a working gate must reject."""
     def edit(rel, old, new, count=1):
@@ -299,6 +302,14 @@ def mutants(files):
         ("the softmax block is followed by an abort", edit(sm, sm_tail, sm_tail.replace("    }\n#else", "    }\n    GGML_ABORT(\"x\");\n#else"))),
         ("the softmax block has an enclosing else that returns", edit(sm, sm_tail, sm_tail.replace("    }\n#else", "    } else {\n        return;\n    }\n#else"))),
         ("the softmax if has an else that returns", edit(sm, sm_tail, sm_tail.replace("        }\n    }\n#else", "        } else {\n            return;\n        }\n    }\n#else"))),
+        ("the softmax #else arm returns", edit(sm, "#else\n    (void) use_dnnl_softmax;", "#else\n    (void) use_dnnl_softmax;\n    return;")),
+        ("the softmax #else arm returns first", edit(sm, "#else\n    (void) use_dnnl_softmax;", "#else\n    return;\n    (void) use_dnnl_softmax;")),
+        ("the binary #else arm throws", edit(bb, "#else\n    (void) use_dnnl_mul;", "#else\n    (void) use_dnnl_mul;\n    throw 1;")),
+        ("softmax writes src through a C-style cast before the decision", edit(h, SM_ANCHOR, "        ((float *) src)[0] = 0.0f;\n" + SM_ANCHOR)),
+        ("softmax copies with std::copy_n before the decision", edit(h, SM_ANCHOR, "        std::copy_n((const float *) src, 1, (float *) src);\n" + SM_ANCHOR)),
+        ("softmax fills with std::fill_n before the decision", edit(h, SM_ANCHOR, "        std::fill_n((float *) src, 1, 0.0f);\n" + SM_ANCHOR)),
+        ("softmax moves with std::memmove before the decision", edit(h, SM_ANCHOR, "        std::memmove((void *) src, src, 4);\n" + SM_ANCHOR)),
+        ("softmax transforms in place before the decision", edit(h, SM_ANCHOR, "        std::transform((float *) src, (float *) src, (float *) src, [](float x) { return 0.0f; });\n" + SM_ANCHOR)),
         ("softmax writes src through a cast before the decision", edit(h, "        auto scratchpad_md = softmax_pd.scratchpad_desc();",
                                                                       "        const_cast<float *>((const float *) src)[0] = 0.0f;\n        auto scratchpad_md = softmax_pd.scratchpad_desc();")),
         ("eltwise binds the output before the decision", edit(h, "        auto scratchpad_md = eltwise_pd.scratchpad_desc();",
