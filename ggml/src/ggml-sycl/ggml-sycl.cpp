@@ -91,6 +91,7 @@
 #include "ggml-sycl/chunk-cap.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/compute-alloc-scope.hpp"
+#include "ggml-sycl/context-tenant-measure.hpp"
 #include "ggml-sycl/convert.hpp"
 #include "ggml-sycl/cpy.hpp"
 #include "ggml-sycl/dispatch-tuning.hpp"
@@ -108,6 +109,7 @@
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
+#include "ggml-sycl/nonfa-stage.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/onednn-woq.hpp"
 #include "ggml-sycl/orchestrator.hpp"
@@ -52641,6 +52643,35 @@ static bool ggml_sycl_batched_f16_use_onemath(const ggml_tensor * src0, const gg
     return false;
 }
 
+static_assert(GGML_SYCL_NONFA_STAGE_ELEM_BYTES == sizeof(sycl::half),
+              "the non-FA staging slot is sized in the element bytes the batched op stages");
+
+// The facts ggml_sycl_mul_mat's f16 attention chain routes on that are not a function of the tensors. The
+// dispatch and the measure pass's context-nonfa-stage visitor (ggml_sycl::context_measure_mul_mat_route_env)
+// both read them here, so the route and the staged size are derived once. A null src0 buffer is not row-split.
+static ggml_sycl_mul_mat_route_env ggml_sycl_mul_mat_route_env_of(const ggml_tensor * src0, const ggml_tensor * src1) {
+    ggml_sycl_mul_mat_route_env env;
+    env.split            = src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer);
+    env.has_weight       = ggml_sycl_tensor_is_weight(src0) || ggml_sycl_tensor_is_weight(src1);
+    env.kqv_force_simple = g_ggml_sycl_kqv_force_simple || g_ggml_sycl_kqv_disable_fp16;
+#if GGML_SYCL_DNNL
+    // oneDNN handles strided data; the oneMath path converts the elements.
+    env.stage_strided = !ggml_sycl_batched_f16_use_onemath(src0, src1);
+#endif
+    return env;
+}
+
+namespace ggml_sycl {
+// The view callback of the measure pass: the same environment the dispatch routes on.
+bool context_measure_mul_mat_route_env(void *, const ggml_tensor * node, ggml_sycl_mul_mat_route_env * env) {
+    if (node == nullptr || node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr || node->src[1] == nullptr) {
+        return false;
+    }
+    *env = ggml_sycl_mul_mat_route_env_of(node->src[0], node->src[1]);
+    return true;
+}
+}  // namespace ggml_sycl
+
 static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
                                            const ggml_tensor *         src0,
                                            const ggml_tensor *         src1,
@@ -52687,28 +52718,12 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
         scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_nc_sycl", dst, /*num_src=*/2,
                                              " : converting src1 to fp16");
 
-        // iterate tensor dims and find the slowest moving dim and stride
-        int    last_dim    = 0;
-        int    last_str    = 0;
-        size_t largest_str = 0;
-        for (int i = 0; i < 4; i++) {
-            // last stride is always the largest
-            if (src1->nb[i] == largest_str) {
-                if (src1->ne[last_dim] == 1) {
-                    last_str = i;
-                    last_dim = i;
-                }
-            }
-            if (src1->nb[i] > largest_str) {
-                largest_str = src1->nb[i];
-                last_str    = i;
-                last_dim    = i;
-            }
-        }
 #if GGML_SYCL_DNNL
         if (!use_onemath_batched) {
             // oneDNN handles strided data and does not need overhead of get_to_fp16_nc_sycl.
-            const int64_t ne_src1 = src1->nb[last_str] * src1->ne[last_dim] / type_size_src1;
+            // The staged size is the shared function's, which the measure visitor sizes the slot with.
+            const int64_t ne_src1 =
+                static_cast<int64_t>(ggml_sycl_batched_f16_src1_stage_elems(src1, /*strided=*/true));
             if (!src1_f16_alloc.alloc(*queue, ctx.device, static_cast<size_t>(ne_src1), "batched_f16_src1_stage")) {
                 // llama.cpp-oyfl: name the actual size that failed to allocate.
                 // This staging buffer's demand at long context is exactly what
@@ -52729,7 +52744,8 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
         } else
 #endif
         {
-            const int64_t ne_src1 = ggml_nelements(src1);
+            const int64_t ne_src1 =
+                static_cast<int64_t>(ggml_sycl_batched_f16_src1_stage_elems(src1, /*strided=*/false));
             if (!src1_f16_alloc.alloc(*queue, ctx.device, static_cast<size_t>(ne_src1), "batched_f16_src1_stage")) {
                 // llama.cpp-oyfl: see the sibling throw above -- same guard,
                 // same size-attribution reasoning, oneMath/non-contiguous path.
@@ -66795,20 +66811,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     // Unified kernel / full dispatch path: drain any pending merge
     split_merge_drain();
 
-    auto is_kqv_matmul = [](const ggml_tensor * a, const ggml_tensor * b, const ggml_tensor * c) -> bool {
-        if (c && c->name && std::strstr(c->name, "kqv") != nullptr) {
-            return true;
-        }
-        if (a && a->name && std::strstr(a->name, "cache_v") != nullptr) {
-            return true;
-        }
-        if (b && b->name && std::strstr(b->name, "kq_soft_max") != nullptr) {
-            return true;
-        }
-        return false;
-    };
-    const bool kqv_matmul       = is_kqv_matmul(src0, src1, dst);
-    const bool force_simple_kqv = (g_ggml_sycl_kqv_force_simple || g_ggml_sycl_kqv_disable_fp16) && kqv_matmul;
+    // The facts the f16 attention chain below routes on. The measure pass's non-FA staging visitor asks the
+    // same function (ggml_sycl_mul_mat_route_env_of), so the slot it sizes and the staging this chain does
+    // cannot be counted from two derivations.
+    const ggml_sycl_mul_mat_route_env route_env = ggml_sycl_mul_mat_route_env_of(src0, src1);
+    const bool force_simple_kqv = route_env.kqv_force_simple && ggml_sycl_mul_mat_is_kqv(src0, src1, dst);
 
     // Inter-layer weight prefetch for TG (batch=1) workloads
     // When we detect a layer transition, async prefetch next layer's first weight.
@@ -66959,7 +66966,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     // Check for TP-sharded weight tensor and log the operation
     ggml_sycl_mul_mat_tp_pre(src0);
 
-    const bool split                  = ggml_backend_buffer_is_sycl_split(src0->buffer);
+    const bool split                  = route_env.split;
     int64_t    min_compute_capability = INT_MAX;
     if (split) {
         ggml_backend_sycl_split_buffer_type_context * buft_ctx =
@@ -67113,7 +67120,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             }
         }
     }
-    const bool batched_has_weight = ggml_sycl_tensor_is_weight(src0) || ggml_sycl_tensor_is_weight(src1);
+    const bool batched_has_weight = route_env.has_weight;
     if (force_simple_kqv) {
         GGML_LOG_WARN("[SYCL] KQV debug override: skipping batched path (force_simple=%d disable_fp16=%d)\n",
                       g_ggml_sycl_kqv_force_simple, g_ggml_sycl_kqv_disable_fp16);
@@ -67165,10 +67172,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         }
         GGML_ABORT("[SYCL] Non-weight F16 matmul requires device-resident tensors or GPU cross-device recovery.");
     }
-    if (!split && !batched_has_weight && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) &&
-        ggml_is_permuted(src1) && src1->ne[1] == 1) {
+    const ggml_sycl_mul_mat_f16_route f16_route = ggml_sycl_mul_mat_f16_route_of(src0, src1, dst, route_env);
+    if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021 || f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED) {
         // TODO: Refactor and cleanup of mul mat dispatching.
-        if (src0->ne[3] == 1 && src1->ne[3] == 1) {
+        if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021) {
             // KQ single-batch
             // mmv p021 was specific for these dimensions
             GGML_SYCL_KTRACE("mul_mat_f16_kq_single", " ne3=%lld", (long long) src0->ne[3]);
@@ -67193,16 +67200,15 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                     "The per-layer KV allocator should leave headroom for compute scratch.");
             }
         }
-    } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) &&
-               src1->ne[1] == 1 && src1->ne[3] == 1) {
+    } else if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_VEC_NC) {
         // KQV single-batch
         GGML_SYCL_KTRACE("mul_mat_f16_kqv_single", " ne1=%lld", (long long) src1->ne[1]);
         ggml_sycl_mul_mat_vec_nc(ctx, src0, src1, dst);
-    } else if (!split && !batched_has_weight && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) &&
-               !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
+    } else if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED ||
+               f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_SCALAR) {
         // KQ + KQV multi-batch
         GGML_SYCL_KTRACE("mul_mat_f16_kqkv_multi", " batches=%lld", (long long) (src1->ne[2] * src1->ne[3]));
-        if (!force_simple_kqv) {
+        if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED) {
             try {
                 ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
             } catch (const std::exception & e) {

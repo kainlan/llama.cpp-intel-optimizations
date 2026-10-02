@@ -17,6 +17,7 @@
 #include "context-tenant-desc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "nonfa-stage.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -93,7 +94,17 @@ struct context_measure_view {
     void *                        sched_ctx                                              = nullptr;
     ggml_backend_t (*sched_backend)(void * sched_ctx, const ggml_tensor * tensor)        = nullptr;
     ggml_backend_buffer_type_t (*backend_buft)(void * sched_ctx, ggml_backend_t backend) = nullptr;
+    // The route environment of a MUL_MAT node (row-split, weight, debug override,
+    // staging path), filled by the same function the dispatch fills its own from.
+    // Returns false for a node it cannot answer for.
+    bool (*mul_mat_route_env)(void * sched_ctx, const ggml_tensor * node, ggml_sycl_mul_mat_route_env * env) = nullptr;
 };
+
+// The view's `mul_mat_route_env`, defined in ggml-sycl.cpp from the function the
+// dispatch routes on, so the measure walker, which lives with the backend, sets
+// `view.mul_mat_route_env = context_measure_mul_mat_route_env`. A host test that
+// links only this file supplies its own.
+bool context_measure_mul_mat_route_env(void * sched_ctx, const ggml_tensor * node, ggml_sycl_mul_mat_route_env * env);
 
 // What the visitors fill. Each slot is the maximum over every measured graph
 // of the demand recorded for it, so a visitor adds on every visit and never
@@ -140,6 +151,16 @@ struct context_measure_visitor {
     const char *               name;
     context_measure_visitor_fn fn;
 };
+
+// The context-nonfa-stage visitor: the batched f16 src1 staging of a MUL_MAT
+// node that the dispatch routes to ggml_sycl_mul_mat_batched_sycl, as bytes in
+// slot 0 of the NONFA_STAGE cohort on the view's device. The staging is event-
+// chained scratch, so the slot is the maximum over the nodes, not their sum.
+// The route and the size come from nonfa-stage.hpp, the functions the site
+// itself calls. A MUL_MAT with an f16 src0 and no way to learn its environment is
+// a named error, not a zero. The walker calls it only for nodes the scheduler
+// assigned to `view.device`.
+void context_nonfa_stage_visit(const ggml_tensor * node, const context_measure_view & view, context_demand_accum & acc);
 
 // The static visitor table, terminated by an entry with a null fn. Nothing
 // registers itself: a producer adds its row to the table in the .cpp.

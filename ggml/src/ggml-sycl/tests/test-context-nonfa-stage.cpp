@@ -21,7 +21,7 @@ using ggml_sycl::context_measure_view;
 namespace {
 
 // The environment the visitor's view hands back, set per case.
-ggml_sycl_mul_mat_route_env g_env = {};
+ggml_sycl_mul_mat_route_env g_env       = {};
 int                         g_env_calls = 0;
 
 bool env_of(void *, const ggml_tensor *, ggml_sycl_mul_mat_route_env * out) {
@@ -52,10 +52,10 @@ ggml_tensor * make_kq(const attn & a) {
 // view non-contiguous, as a cache that is not full is.
 ggml_tensor * make_kqv(const attn & a, int64_t kv_size) {
     ggml_tensor * v_cache = ggml_new_tensor_4d(a.ctx, GGML_TYPE_F16, kv_size, a.d, a.n_head_kv, a.n_seq);
-    ggml_tensor * v       = ggml_view_4d(a.ctx, v_cache, a.n_kv, a.d, a.n_head_kv, a.n_seq, v_cache->nb[1], v_cache->nb[2],
-                                         v_cache->nb[3], 0);
-    ggml_tensor * soft    = ggml_new_tensor_4d(a.ctx, GGML_TYPE_F32, a.n_kv, a.n_ub, a.n_head, a.n_seq);
-    ggml_tensor * kqv     = ggml_mul_mat(a.ctx, v, soft);
+    ggml_tensor * v    = ggml_view_4d(a.ctx, v_cache, a.n_kv, a.d, a.n_head_kv, a.n_seq, v_cache->nb[1], v_cache->nb[2],
+                                      v_cache->nb[3], 0);
+    ggml_tensor * soft = ggml_new_tensor_4d(a.ctx, GGML_TYPE_F32, a.n_kv, a.n_ub, a.n_head, a.n_seq);
+    ggml_tensor * kqv  = ggml_mul_mat(a.ctx, v, soft);
     ggml_set_name(kqv, "kqv-0");
     return kqv;
 }
@@ -73,10 +73,10 @@ uint64_t visit_bytes(const ggml_tensor * node, const ggml_sycl_mul_mat_route_env
     g_env = e;
     context_demand_accum acc;
     context_measure_view view;
-    view.device             = 0;
-    view.mul_mat_route_env  = env_of;
+    view.device            = 0;
+    view.mul_mat_route_env = env_of;
     ggml_sycl::context_nonfa_stage_visit(node, view, acc);
-    *ok = acc.ok();
+    *ok          = acc.ok();
     const auto t = acc.tenants();
     if (t.empty()) {
         return 0;
@@ -91,37 +91,38 @@ uint64_t visit_bytes(const ggml_tensor * node, const ggml_sycl_mul_mat_route_env
 }  // namespace
 
 int main() {
-    ggml_init_params ip = { 16 * 1024 * 1024, nullptr, /*no_alloc=*/true };
+    ggml_init_params ip  = { 16 * 1024 * 1024, nullptr, /*no_alloc=*/true };
     ggml_context *   ctx = ggml_init(ip);
     CHECK(ctx != nullptr, "ggml_init");
 
-    attn a = { ctx, 128, 8, 2, 256, 16, 1 };
+    attn                              a     = { ctx, 128, 8, 2, 256, 16, 1 };
     const ggml_sycl_mul_mat_route_env plain = env(false, false, false, true);
 
     // ---- the route classifier: the same chain ggml_sycl_mul_mat walks ----
     ggml_tensor * kq_pp = make_kq(a);  // n_ub 16: not the single-token branch
-    CHECK(ggml_sycl_mul_mat_f16_route(kq_pp->src[0], kq_pp->src[1], kq_pp, plain) ==
+    CHECK(ggml_sycl_mul_mat_f16_route_of(kq_pp->src[0], kq_pp->src[1], kq_pp, plain) ==
               GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED,
           "PP KQ is the multi-batch batched route");
     CHECK(ggml_sycl_mul_mat_routes_batched_f16(kq_pp->src[0], kq_pp->src[1], kq_pp, plain), "PP KQ routes batched");
 
-    attn a1 = a;
-    a1.n_ub = 1;
+    attn a1             = a;
+    a1.n_ub             = 1;
     ggml_tensor * kq_tg = make_kq(a1);  // one token, one sequence: the p021 kernel stages nothing
-    CHECK(ggml_sycl_mul_mat_f16_route(kq_tg->src[0], kq_tg->src[1], kq_tg, plain) == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021,
+    CHECK(ggml_sycl_mul_mat_f16_route_of(kq_tg->src[0], kq_tg->src[1], kq_tg, plain) ==
+              GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021,
           "single-token single-sequence KQ is the p021 kernel");
     CHECK(!ggml_sycl_mul_mat_routes_batched_f16(kq_tg->src[0], kq_tg->src[1], kq_tg, plain),
           "the p021 kernel is not the batched route");
 
-    attn a2 = a1;
-    a2.n_seq = 2;
+    attn a2              = a1;
+    a2.n_seq             = 2;
     ggml_tensor * kq_tg2 = make_kq(a2);  // two sequences: the p021 kernel does not support it, batched does
-    CHECK(ggml_sycl_mul_mat_f16_route(kq_tg2->src[0], kq_tg2->src[1], kq_tg2, plain) ==
+    CHECK(ggml_sycl_mul_mat_f16_route_of(kq_tg2->src[0], kq_tg2->src[1], kq_tg2, plain) ==
               GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED,
           "single-token two-sequence KQ is the batched route of the p021 branch");
 
     ggml_tensor * kqv_pp = make_kqv(a, 256);
-    CHECK(ggml_sycl_mul_mat_f16_route(kqv_pp->src[0], kqv_pp->src[1], kqv_pp, plain) ==
+    CHECK(ggml_sycl_mul_mat_f16_route_of(kqv_pp->src[0], kqv_pp->src[1], kqv_pp, plain) ==
               GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED,
           "PP KQV is the multi-batch batched route");
 
@@ -130,11 +131,17 @@ int main() {
           "single-token KQV over a contiguous cache is batched");
 
     ggml_tensor * kqv_tg_part = make_kqv(a1, 512);  // a partly full cache is a strided view: the nc kernel
-    CHECK(ggml_sycl_mul_mat_f16_route(kqv_tg_part->src[0], kqv_tg_part->src[1], kqv_tg_part, plain) ==
+    CHECK(ggml_sycl_mul_mat_f16_route_of(kqv_tg_part->src[0], kqv_tg_part->src[1], kqv_tg_part, plain) ==
               GGML_SYCL_MUL_MAT_F16_ROUTE_VEC_NC,
           "single-token KQV over a strided view is the nc kernel");
     CHECK(!ggml_sycl_mul_mat_routes_batched_f16(kqv_tg_part->src[0], kqv_tg_part->src[1], kqv_tg_part, plain),
           "the nc kernel is not the batched route");
+
+    // The nc kernel is the single-sequence case; two sequences fall through to batched.
+    ggml_tensor * kqv_tg_part2 = make_kqv(a2, 512);
+    CHECK(ggml_sycl_mul_mat_f16_route_of(kqv_tg_part2->src[0], kqv_tg_part2->src[1], kqv_tg_part2, plain) ==
+              GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED,
+          "single-token KQV over a strided view of two sequences is batched, not the nc kernel");
 
     // Each term of the predicate takes the node off the route.
     CHECK(!ggml_sycl_mul_mat_routes_batched_f16(kq_pp->src[0], kq_pp->src[1], kq_pp, env(true, false, false, true)),
@@ -143,7 +150,7 @@ int main() {
           "a weight operand never routes batched");
     CHECK(!ggml_sycl_mul_mat_routes_batched_f16(kqv_pp->src[0], kqv_pp->src[1], kqv_pp, env(false, true, false, true)),
           "a weight operand never routes batched (KQV)");
-    CHECK(ggml_sycl_mul_mat_f16_route(kqv_pp->src[0], kqv_pp->src[1], kqv_pp, env(false, false, true, true)) ==
+    CHECK(ggml_sycl_mul_mat_f16_route_of(kqv_pp->src[0], kqv_pp->src[1], kqv_pp, env(false, false, true, true)) ==
               GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_SCALAR,
           "the KQV debug override takes a kqv node to the scalar fallback");
     CHECK(ggml_sycl_mul_mat_routes_batched_f16(kq_pp->src[0], kq_pp->src[1], kq_pp, env(false, false, true, true)),
@@ -154,7 +161,7 @@ int main() {
         ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 128, 64);
         ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 4, 8);
         ggml_tensor * out = ggml_mul_mat(ctx, w, x);
-        CHECK(ggml_sycl_mul_mat_f16_route(w, x, out, plain) == GGML_SYCL_MUL_MAT_F16_ROUTE_NONE,
+        CHECK(ggml_sycl_mul_mat_f16_route_of(w, x, out, plain) == GGML_SYCL_MUL_MAT_F16_ROUTE_NONE,
               "a quantized src0 is not an f16 route");
     }
 
@@ -164,11 +171,11 @@ int main() {
     CHECK(ggml_sycl_batched_f16_src1_stage_elems(kq_pp->src[1], false) == 128u * 8u * 16u, "Q element count");
     // The GI4 softmax: 34816 x 512 x 32 f32, staged as f16.
     {
-        attn gi4 = { ctx, 128, 32, 8, 34816, 512, 1 };
+        attn          gi4 = { ctx, 128, 32, 8, 34816, 512, 1 };
         ggml_tensor * kqv = make_kqv(gi4, 34816);
         CHECK(ggml_sycl_batched_f16_src1_stage_elems(kqv->src[1], true) == 34816ull * 512ull * 32ull,
               "GI4 softmax elems");
-        bool ok = false;
+        bool           ok    = false;
         const uint64_t bytes = visit_bytes(kqv, plain, &ok);
         CHECK(ok && bytes == 1140850688ull, "GI4 stages 1088 MiB, the design's number");
     }
@@ -178,7 +185,8 @@ int main() {
         ggml_tensor * p       = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, 16, 8, 1);
         ggml_tensor * out     = ggml_mul_mat(ctx, v_cache, p);
         ggml_set_name(out, "kqv-f16");
-        CHECK(ggml_sycl_batched_f16_src1_stage_elems(p, true) == 0 && ggml_sycl_batched_f16_src1_stage_elems(p, false) == 0,
+        CHECK(ggml_sycl_batched_f16_src1_stage_elems(p, true) == 0 &&
+                  ggml_sycl_batched_f16_src1_stage_elems(p, false) == 0,
               "an f16 src1 stages nothing");
         bool ok = false;
         CHECK(visit_bytes(out, plain, &ok) == 0 && ok, "the visitor demands nothing for an f16 src1");
@@ -206,18 +214,17 @@ int main() {
 
     // ---- the visitor counts exactly what the routing selects ----
     {
-        std::vector<ggml_tensor *> nodes = { kq_pp,   kq_tg,       kq_tg2,        kqv_pp,
-                                             kqv_tg_full, kqv_tg_part, strided_out };
+        std::vector<ggml_tensor *> nodes = { kq_pp, kq_tg, kq_tg2, kqv_pp, kqv_tg_full, kqv_tg_part, strided_out };
         const ggml_sycl_mul_mat_route_env envs[] = {
             env(false, false, false, true), env(false, false, false, false), env(true, false, false, true),
             env(false, true, false, true),  env(false, false, true, true),   env(false, false, true, false),
         };
         for (const auto & e : envs) {
             for (ggml_tensor * n : nodes) {
-                const bool routed = ggml_sycl_mul_mat_routes_batched_f16(n->src[0], n->src[1], n, e);
+                const bool     routed = ggml_sycl_mul_mat_routes_batched_f16(n->src[0], n->src[1], n, e);
                 const uint64_t want =
                     routed ? 2ull * ggml_sycl_batched_f16_src1_stage_elems(n->src[1], e.stage_strided) : 0ull;
-                bool ok = false;
+                bool           ok  = false;
                 const uint64_t got = visit_bytes(n, e, &ok);
                 CHECK(ok, "the visitor records no error for a sized node");
                 CHECK(got == want, "the visitor's demand is the routing's elems at 2 B, or nothing");
@@ -246,10 +253,11 @@ int main() {
     {
         context_demand_accum acc;
         context_measure_view view;  // no mul_mat_route_env
-        ggml_tensor * add = ggml_add(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8));
+        ggml_tensor *        add =
+            ggml_add(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8));
         ggml_sycl::context_nonfa_stage_visit(add, view, acc);
-        ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 128, 64);
-        ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 4, 8);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 128, 64);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 4, 8);
         ggml_sycl::context_nonfa_stage_visit(ggml_mul_mat(ctx, w, x), view, acc);
         CHECK(acc.ok() && acc.tenants().empty(), "an op with no f16 route is not an error without an environment");
 
@@ -262,8 +270,8 @@ int main() {
 
     // ---- the registered table carries the visitor ----
     {
-        const ggml_sycl::context_measure_visitor * t = ggml_sycl::context_measure_visitors();
-        bool found = false;
+        const ggml_sycl::context_measure_visitor * t     = ggml_sycl::context_measure_visitors();
+        bool                                       found = false;
         for (size_t i = 0; t[i].fn != nullptr && i < 64; i++) {
             if (t[i].fn == ggml_sycl::context_nonfa_stage_visit) {
                 found = true;
