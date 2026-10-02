@@ -480,6 +480,11 @@ FLOOR_SWA_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onedn
 WITH_FLOOR_GETTER_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {"
 )
+# The getter reads the pair and the floor through ONE helper (so both describe the same plan); the helper is where the
+# floor formula is called with the shape's fields.
+PAIR_AND_FLOOR_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "static zone_onednn_plan onednn_planned_pair_and_floor(int device_id) {"
+)
 MAKE_ENGINE_BODY_CODE = extract_function_body(COMMON_HPP_CODE, "dnnl::engine make_engine(sycl::queue * q) {")
 # llama.cpp-pqgl: the size>cap early-out's ordering relative to the eviction
 # sweep, both inside this one function.
@@ -842,10 +847,15 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # (llama.cpp-o3a0 split the single n_head into n_head_ctx_max/
     # n_head_swa_max/n_swa), which clang-format is more likely to re-wrap
     # across lines than a shorter call ever was.
-    checks["graph scratch zone floor is additive"] = normalize_ws(
-        "bytes += onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, "
-        "shape.n_swa, shape.n_ubatch, shape.n_ctx);"
-    ) in normalize_ws(CACHE_CPP_CODE)
+    checks["graph scratch zone floor is additive"] = (
+        normalize_ws(
+            "plan.graph_floor_bytes = onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, "
+            "shape.n_head_swa_max, shape.n_swa, shape.n_ubatch, shape.n_ctx);"
+        )
+        in normalize_ws(PAIR_AND_FLOOR_BODY_CODE)
+        and "onednn_planned_pair_and_floor(device_id)" in WITH_FLOOR_GETTER_BODY_CODE
+        and "plan.bare_bytes + plan.graph_floor_bytes" in WITH_FLOOR_GETTER_BODY_CODE
+    )
     # llama.cpp-o3a0: mutation witness for the caller actually passing the
     # new SWA-class fields through, not just the pre-existing ubatch/ctx pair
     # -- narrower than the full-call check above (which a clang-format
@@ -853,14 +863,14 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # argument, since normalize_ws would still find SOME five-argument call
     # matching the full string only if every token survives; this check
     # isolates the two fields the full check could not easily localize a
-    # failure to). Scoped to WITH_FLOOR_GETTER_BODY_CODE, not the whole
+    # failure to). Scoped to PAIR_AND_FLOOR_BODY_CODE, not the whole
     # file -- the
     # DIRECT-allocation-failure error log elsewhere in this file passes the
     # identical field names to a DIFFERENT call, so a file-wide substring
     # search here would still pass after a partial revert of THIS caller
     # specifically (the actual bug this check exists to catch).
     checks["graph scratch zone floor caller passes the swa fields"] = (
-        "shape.n_head_swa_max" in WITH_FLOOR_GETTER_BODY_CODE and "shape.n_swa" in WITH_FLOOR_GETTER_BODY_CODE
+        "shape.n_head_swa_max" in PAIR_AND_FLOOR_BODY_CODE and "shape.n_swa" in PAIR_AND_FLOOR_BODY_CODE
     )
     checks["zone floor env var"] = "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB" in CACHE_CPP_CODE
     checks["allocator opt-out env var name"] = "GGML_SYCL_ONEDNN_CACHE_ALLOCATOR" in CACHE_CPP_CODE
