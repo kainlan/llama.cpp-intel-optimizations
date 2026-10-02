@@ -1789,9 +1789,11 @@ GGML_BACKEND_API size_t                     ggml_backend_sycl_plan_caps_freeze_c
                                                                                     size_t                        max_alloc);
 // The graph_compute exit's staging step on a real context, with the call's classification
 // chosen by the caller, and the tenant staging the exit and the re-plan's invalidation act on.
-// park_tenant_staging allocates through the production staging path, tags the slice as a
-// tenant cohort's, and parks it in the context's graph_input_staging; it returns the number
-// of tenant entries now parked (0 when it could not allocate).  graph_exit runs the exit hooks
+// park_tenant_staging allocates a host-pinned staging slice, tags it as a tenant cohort's, and
+// parks it in the context's graph_input_staging; it returns the number of tenant entries now
+// parked (0 when it could not allocate).  The exit and invalidation arms it exercises key on the
+// tenant tag, so they are tier-agnostic, but no test parks a device-tier slice: the production
+// staging path allocates one, this hook does not.  graph_exit runs the exit hooks
 // as a call that recorded and/or replayed a graph would, and returns the exit's success.
 GGML_BACKEND_API size_t ggml_backend_sycl_test_park_tenant_staging(ggml_backend_t backend, size_t nbytes);
 GGML_BACKEND_API size_t ggml_backend_sycl_test_tenant_staging_count(ggml_backend_t backend);

@@ -194,7 +194,7 @@
       "file": "ggml-sycl.cpp",
       "function": "ggml_backend_sycl_plan_scope_open",
       "count": 1,
-      "reason": "ggml_backend_sycl_plan_scope_open is a C-ABI constructor for the plan scope. Its try body is a bare allocation and counter bump with no planned-refusal path; the handler is the C-ABI boundary, which cannot let an exception cross into the caller and reports failure as a null return. Permanent."
+      "reason": "ggml_backend_sycl_plan_scope_open is a C-ABI constructor for the plan scope. Its try body is a bare allocation of the scope object and the filling of its three fields, with no planned-refusal path; the handler is the C-ABI boundary, which cannot let an exception cross into the caller and reports failure as a null return. Permanent."
     },
     {
       "id": "E-CABI-REPLAN-SCOPE-OPEN",

@@ -2993,13 +2993,17 @@ def clause_m(ix, out):
                     "row %d is covered by row %d's peak, which is not on the floor list" % (r, peak))
     fn = [(rel, func, node) for rel, func, node in ix.fdefs(M_FLOOR_FN) if rel == "unified-cache.cpp"]
     reads_floor = re.compile(r'getenv\s*\(\s*"%s"\s*\)' % M_FLOOR_ENV)
+    calls_reader = re.compile(r"(?<![A-Za-z0-9_])%s\s*\(" % M_FLOOR_READER)
+
+    def code_of(rel, node):
+        # comments dropped: a commented-out read or call applies nothing
+        return norm(txt(ix.files[rel], body_of(node)))
     # the floor is applied by a getenv in the zone-sizing function itself, or by a call of the one reader whose
     # body carries it
-    reader_ok = any(reads_floor.search(txt(ix.files[rel], body_of(node)))
+    reader_ok = any(reads_floor.search(code_of(rel, node))
                     for rel, _, node in ix.fdefs(M_FLOOR_READER) if rel == "unified-cache.cpp")
-    calls_reader = re.compile(r"(?<![A-Za-z0-9_])%s\s*\(" % M_FLOOR_READER)
-    has_floor = any(reads_floor.search(txt(ix.files[rel], body_of(node))) or
-                    (reader_ok and calls_reader.search(txt(ix.files[rel], body_of(node)))) for rel, _, node in fn)
+    has_floor = any(reads_floor.search(code_of(rel, node)) or
+                    (reader_ok and calls_reader.search(code_of(rel, node))) for rel, _, node in fn)
     if floor and not has_floor:
         out.add("M-FLOOR", "unified-cache.cpp", 0, M_FLOOR_FN, M_FLOOR_FN, "appendix::floor-tie",
                 "%d SCRATCH consumers still draw without a term, but %s does not apply the %s floor" % (len(floor), M_FLOOR_FN, M_FLOOR_ENV))
@@ -5354,6 +5358,14 @@ def matrix_cases_s2d1():
     A(Case("32", "ensure_planned_arena_zones stops calling the reader while rows still draw", replace_once(
         "unified-cache.cpp", "size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);",
         "size_t scratch_zone = 512ULL * 1024 * 1024;"), "FAIL", "M-FLOOR", "does not apply"))
+    A(Case("32", "the reader's getenv commented out while rows still draw", replace_once(
+        "unified-cache.cpp", 'const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");',
+        'const char * env = nullptr;  // const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");'),
+           "FAIL", "M-FLOOR", "does not apply"))
+    A(Case("32", "ensure_planned_arena_zones' call of the reader commented out while rows still draw", replace_once(
+        "unified-cache.cpp", "size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);",
+        "size_t scratch_zone = 512ULL * 1024 * 1024;  // was ggml_sycl_compute_arena_bytes(dev_id);"),
+           "FAIL", "M-FLOOR", "does not apply"))
     A(Case("32", "the unmutated tables and floor (control)", plant("void zzplant_m() {\n}\n"), "PASS", planted=False))
     return c
 
