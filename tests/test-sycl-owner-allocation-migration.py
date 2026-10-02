@@ -154,10 +154,13 @@ COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
 # not one of the baseline runtime sites is added as one (function, reason) line in NAMED_OWNER_FIRST_SITES below,
 # never by raising the baseline: a count says nothing about WHICH site was added or why it is legitimate, and the
 # list is a plain per-line merge when two branches each add a site. The census counts the code with every named
-# function's body cut out, so the baseline stays at the reviewed 24 runtime sites. Each named function must hold
-# exactly one owner-first allocation, refuse on failure, and hand the owner over only through
-# mem_handle::from_owned_alloc, with no legacy unified_alloc( / from_legacy_owned_alloc in it; a function named
-# ggml_backend_sycl_test_* is a PRIVATE_TESTING seam and must sit inside that guard.
+# function's body cut out, so the baseline stays at the reviewed 24 runtime sites. Each name must be listed once.
+# Each named function must hold exactly one owner-first allocation, refuse on failure (the `if (!allocation)` branch
+# must return or throw, an empty one does not count), and hand the owner over only through
+# mem_handle::from_owned_alloc, with no legacy unified_alloc( / from_legacy_owned_alloc in it. A function named
+# ggml_backend_sycl_test_* is a PRIVATE_TESTING seam and must sit inside an `#if defined(GGML_SYCL_PRIVATE_TESTING)`
+# block; several hooks may share one block. A function with any other name is production code, needs no guard, and
+# is not required to have one. The next adder is the L4 lane (impl/moua-l4).
 OWNER_FIRST_BASELINE_SITES = 24
 NAMED_OWNER_FIRST_SITES = (
     ("ggml_backend_sycl_test_park_tenant_staging",
@@ -179,9 +182,42 @@ def function_body_span(code: str, name: str):
             return start, index
 
 
+def inside_private_testing(code: str, position: int) -> bool:
+    """True when `position` sits in an `#if defined(GGML_SYCL_PRIVATE_TESTING)` / `#ifdef` block that no #else/#elif
+    has turned over: the preprocessor conditions open at that point are walked as a stack."""
+    stack = []  # [condition text, turned over by #else/#elif]
+    for line in code[:position].split("\n"):
+        directive = re.match(r"\s*#\s*(\w+)\s*(.*)", line)
+        if not directive:
+            continue
+        kind, rest = directive.group(1), " ".join(directive.group(2).split())
+        if kind in ("if", "ifdef", "ifndef"):
+            stack.append([("defined(%s)" % rest) if kind == "ifdef" else (None if kind == "ifndef" else rest), False])
+        elif kind in ("else", "elif") and stack:
+            stack[-1][1] = True
+        elif kind == "endif" and stack:
+            stack.pop()
+    return any(cond == "defined(GGML_SYCL_PRIVATE_TESTING)" and not turned for cond, turned in stack)
+
+
+def refusal_branch_refuses(body: str, start: int) -> bool:
+    """The `if (!allocation) { ... }` branch that begins at `start` in `body` returns or throws."""
+    open_brace = body.index("{", start)
+    depth, index = 0, open_brace
+    while True:
+        depth += (body[index] == "{") - (body[index] == "}")
+        index += 1
+        if depth == 0:
+            break
+    return re.search(r"\b(return|throw)\b", body[open_brace:index]) is not None
+
+
 RUNTIME_PRODUCTION_CODE = RUNTIME_CODE
 with gate("every named owner-first site in ggml-sycl.cpp is a guarded, owner-first site"):
-    _removed = 0
+    _names      = [name for name, _reason in NAMED_OWNER_FIRST_SITES]
+    _duplicates = sorted({name for name in _names if _names.count(name) > 1})
+    assert not _duplicates, "NAMED_OWNER_FIRST_SITES lists %s more than once" % ", ".join(_duplicates)
+    _spans = []
     for _function, _reason in NAMED_OWNER_FIRST_SITES:
         assert _reason, "%s has no reason" % _function
         _start, _end = function_body_span(RUNTIME_CODE, _function)
@@ -192,18 +228,21 @@ with gate("every named owner-first site in ggml-sycl.cpp is a guarded, owner-fir
         _refused    = _body.index("if (!allocation)", _allocation)
         _wrapped    = _body.index("from_owned_alloc(std::move(allocation.owner)", _refused)
         assert _allocation < _refused < _wrapped, "%s: allocate, refuse-check, from_owned_alloc out of order" % _function
+        assert refusal_branch_refuses(_body, _refused), "%s: the `if (!allocation)` branch does not return or throw" % _function
         if _function.startswith("ggml_backend_sycl_test_"):
-            # Between the guard and the definition there is only the return type: no `;`, `}` or #endif.
-            assert re.search(r"#if defined\(GGML_SYCL_PRIVATE_TESTING\)\s*[\w:<>*&\s]*$", RUNTIME_CODE[:_start]), \
+            assert inside_private_testing(RUNTIME_CODE, _start), \
                 "%s is a test seam outside GGML_SYCL_PRIVATE_TESTING" % _function
-        _removed += 1
-    # Cut the named bodies out (back to front, so earlier spans stay valid).
-    for _function, _reason in sorted(NAMED_OWNER_FIRST_SITES,
-                                     key=lambda entry: function_body_span(RUNTIME_CODE, entry[0])[0], reverse=True):
-        _start, _end = function_body_span(RUNTIME_CODE, _function)
-        RUNTIME_PRODUCTION_CODE = RUNTIME_PRODUCTION_CODE[:_start] + RUNTIME_PRODUCTION_CODE[_end:]
+        _spans.append((_start, _end))
+    # Cut the named bodies out of the ORIGINAL text; each name is unique, so no span is cut twice.
+    _kept, _from = [], 0
+    for _start, _end in sorted(_spans):
+        assert _start >= _from, "named owner-first functions overlap"
+        _kept.append(RUNTIME_CODE[_from:_start])
+        _from = _end
+    _kept.append(RUNTIME_CODE[_from:])
+    RUNTIME_PRODUCTION_CODE = "".join(_kept)
     assert RUNTIME_CODE.count("unified_allocate_owner(") == \
-        RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + _removed
+        RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + len(_spans)
 
 for _label, _code, _pins in (
     ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (54, 42, OWNER_FIRST_BASELINE_SITES)),
