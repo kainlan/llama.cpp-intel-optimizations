@@ -2359,56 +2359,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-// llama.cpp-rb2h: diagnostic arm. GGML_SYCL_RB2H_SCHED_HASH=1 hashes every CPU split's input
-// copies as the split consumes them and every CPU-computed node after the split ran; =2 does the
-// same for every split of every backend (which drains the device per split). Output is raw
-// stderr lines `[RB2H-SCHED] ...` so two runs can be diffed.
-static int rb2h_sched_hash_mode() {
-    static const int mode = []() {
-        const char * v = getenv("GGML_SYCL_RB2H_SCHED_HASH");
-        const int m = v ? atoi(v) : 0;
-        if (m != 0) {
-            GGML_LOG_WARN("[RB2H] diagnostic arm GGML_SYCL_RB2H_SCHED_HASH=%d is active\n", m);
-        }
-        return m;
-    }();
-    return mode;
-}
-
-static bool rb2h_sched_hash_tensor(const struct ggml_tensor * t, uint64_t * hash, size_t * nbytes_out) {
-    *hash = 0;
-    *nbytes_out = 0;
-    if (t == NULL || t->data == NULL || (t->buffer == NULL && (t->view_src == NULL || t->view_src->buffer == NULL))) {
-        return false;
-    }
-    const size_t nbytes = ggml_nbytes(t);
-    *nbytes_out = nbytes;
-    std::vector<uint8_t> buf(nbytes);
-    ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
-    uint64_t h = 1469598103934665603ULL;
-    for (size_t i = 0; i < nbytes; i++) {
-        h ^= buf[i];
-        h *= 1099511628211ULL;
-    }
-    *hash = h;
-    return true;
-}
-
-static void rb2h_sched_hash_print(int call, int split_id, const char * be, const char * what, int idx,
-        const struct ggml_tensor * t) {
-    uint64_t h = 0;
-    size_t   n = 0;
-    if (!rb2h_sched_hash_tensor(t, &h, &n)) {
-        return;
-    }
-    fprintf(stderr, "[RB2H-SCHED] call=%d split=%d be=%s %s=%d name=%s op=%s bytes=%zu hash=%016llx\n", call, split_id,
-            be, what, idx, t->name, ggml_op_name(t->op), n, (unsigned long long) h);
-}
-
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
-    static std::atomic<int> rb2h_call_counter{0};
-    const int rb2h_call = rb2h_sched_hash_mode() ? rb2h_call_counter.fetch_add(1) : 0;
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -2559,17 +2511,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        const bool rb2h_split_is_cpu = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        const bool rb2h_hash_split   = rb2h_sched_hash_mode() >= 2 || (rb2h_sched_hash_mode() == 1 && rb2h_split_is_cpu);
-        if (rb2h_hash_split) {
-            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-                struct ggml_tensor * input     = split->inputs[input_id];
-                struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
-                rb2h_sched_hash_print(rb2h_call, split_id, ggml_backend_name(split_backend), "src", input_id, input);
-                rb2h_sched_hash_print(rb2h_call, split_id, ggml_backend_name(split_backend), "cpy", input_id, input_cpy);
-            }
-        }
-
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2606,18 +2547,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 j0 = j1;
-            }
-        }
-
-        if (rb2h_hash_split) {
-            ggml_backend_synchronize(split_backend);
-            for (int j = 0; j < split->graph.n_nodes; j++) {
-                const struct ggml_tensor * node = split->graph.nodes[j];
-                if (node->view_src != NULL || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
-                        node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
-                    continue;
-                }
-                rb2h_sched_hash_print(rb2h_call, split_id, ggml_backend_name(split_backend), "node", j, node);
             }
         }
 

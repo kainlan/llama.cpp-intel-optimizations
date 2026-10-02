@@ -15,7 +15,6 @@
 #include "common.hpp"
 #include "dequantize.hpp"
 #include "get-rows-kquant.hpp"
-#include "rb2h-diag.hpp"
 #include "ggml-backend.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu/ops.h"
@@ -1182,161 +1181,6 @@ static void get_rows_q4_k_aos_sycl(ggml_backend_sycl_context & ctx,
     });
 
     GGML_UNUSED(ctx);
-}
-
-// llama.cpp-rb2h diagnostic (GGML_SYCL_RB2H_GET_ROWS_Q4K_VERIFY): after the device Q4_K GET_ROWS, drain and check
-// what it read and wrote. It reads back the ids, every referenced weight row (as the kernel saw it on the device),
-// and the output; compares the weight rows with the host copy of the weight when one is known, and the output with
-// ggml's own dequantisation of the row. A pending record is re-checked when the compute call that ran the op
-// returns (ggml_sycl_rb2h_getrows_recheck), which shows whether the output was overwritten afterwards. The ids and
-// weight-row hashes are printed so two runs can be compared call by call.
-namespace {
-struct rb2h_getrows_pending {
-    bool               valid = false;
-    const float *      dst_d = nullptr;
-    int64_t            n     = 0;
-    int64_t            ne00  = 0;
-    int                call  = 0;
-    std::vector<float> expect;
-};
-rb2h_getrows_pending g_rb2h_pending;
-int                  g_rb2h_calls = 0;
-
-uint64_t rb2h_fnv(const void * data, size_t n, uint64_t h = 1469598103934665603ULL) {
-    const uint8_t * p = static_cast<const uint8_t *>(data);
-    for (size_t i = 0; i < n; ++i) {
-        h ^= p[i];
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-int rb2h_count_bad_rows(const std::vector<float> & got,
-                        const std::vector<float> & expect,
-                        int64_t                    n,
-                        int64_t                    ne00,
-                        double *                   max_abs,
-                        int64_t *                  first_bad) {
-    int bad  = 0;
-    *max_abs = 0.0;
-    for (int64_t i = 0; i < n; ++i) {
-        bool row_bad = false;
-        for (int64_t j = 0; j < ne00; ++j) {
-            const double a = got[(size_t) (i * ne00 + j)];
-            const double b = expect[(size_t) (i * ne00 + j)];
-            const double d = std::fabs(a - b);
-            if (!(d <= 1e-5 * std::max(1.0, std::fabs(b)))) {
-                row_bad = true;
-            }
-            if (!(d <= *max_abs)) {
-                *max_abs = d;
-            }
-        }
-        if (row_bad) {
-            bad++;
-            if (*first_bad < 0) {
-                *first_bad = i;
-            }
-        }
-    }
-    return bad;
-}
-}  // namespace
-
-void ggml_sycl_rb2h_getrows_recheck(ggml_backend_sycl_context & ctx) {
-    if (!g_rb2h_pending.valid) {
-        return;
-    }
-    rb2h_getrows_pending pending = std::move(g_rb2h_pending);
-    g_rb2h_pending               = rb2h_getrows_pending{};
-    sycl::queue & q              = *ctx.stream();
-    q.wait_and_throw();
-    std::vector<float> out((size_t) (pending.n * pending.ne00));
-    q.memcpy(out.data(), pending.dst_d, out.size() * sizeof(float)).wait();
-    double    max_abs   = 0.0;
-    int64_t   first_bad = -1;
-    const int bad       = rb2h_count_bad_rows(out, pending.expect, pending.n, pending.ne00, &max_abs, &first_bad);
-    GGML_LOG_WARN("[RB2H-VERIFY] recheck at compute-call end: call=%d bad_rows=%d/%lld max_abs=%g first_bad=%lld\n",
-                  pending.call, bad, (long long) pending.n, max_abs, (long long) first_bad);
-}
-
-static void rb2h_verify_q4_k_get_rows(ggml_backend_sycl_context & ctx,
-                                      const ggml_tensor *         src0,
-                                      const ggml_tensor *         dst,
-                                      const void *                src0_d,
-                                      const int32_t *             ids_ptr,
-                                      float *                     dst_d) {
-    sycl::queue & q = *ctx.stream();
-    q.wait_and_throw();
-    const int           call      = ++g_rb2h_calls;
-    const ggml_tensor * src1      = dst->src[1];
-    const int64_t       ne00      = src0->ne[0];
-    const int64_t       n         = src1->ne[0];
-    const int64_t       nrows_src = src0->ne[1];
-    const size_t        row_bytes = ggml_row_size(GGML_TYPE_Q4_K, ne00);
-    if (!(src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && src0->nb[1] == row_bytes &&
-          dst->nb[1] == (size_t) ne00 * sizeof(float) && src0->ne[2] == 1 && src0->ne[3] == 1)) {
-        GGML_LOG_WARN("[RB2H-VERIFY] call=%d shape not simple enough to verify (n=%lld ne00=%lld)\n", call,
-                      (long long) n, (long long) ne00);
-        return;
-    }
-    std::vector<int32_t> ids((size_t) n);
-    q.memcpy(ids.data(), ids_ptr, (size_t) n * sizeof(int32_t)).wait();
-    std::vector<float> out((size_t) (n * ne00));
-    q.memcpy(out.data(), dst_d, out.size() * sizeof(float)).wait();
-
-    const uint8_t *      host_w = static_cast<const uint8_t *>(ggml_sycl_host_data(src0));
-    const auto *         traits = ggml_get_type_traits(GGML_TYPE_Q4_K);
-    std::vector<uint8_t> dev_row(row_bytes);
-    std::vector<float>   ref_dev((size_t) ne00);
-    std::vector<float>   ref_host((size_t) ne00);
-    std::vector<float>   expect((size_t) (n * ne00), 0.0f);
-    std::vector<float>   expect_dev((size_t) (n * ne00), 0.0f);
-    int                  ids_oob = 0;
-    int                  w_mis   = 0;
-    uint64_t             wh      = 1469598103934665603ULL;
-    for (int64_t i = 0; i < n; ++i) {
-        const int32_t id = ids[(size_t) i];
-        if (id < 0 || id >= nrows_src) {
-            ids_oob++;
-            continue;
-        }
-        q.memcpy(dev_row.data(), static_cast<const char *>(src0_d) + (size_t) id * row_bytes, row_bytes).wait();
-        wh = rb2h_fnv(dev_row.data(), row_bytes, wh);
-        traits->to_float(dev_row.data(), ref_dev.data(), ne00);
-        std::copy(ref_dev.begin(), ref_dev.end(), expect_dev.begin() + (size_t) (i * ne00));
-        if (host_w != nullptr) {
-            const uint8_t * hrow = host_w + (size_t) id * row_bytes;
-            if (std::memcmp(hrow, dev_row.data(), row_bytes) != 0) {
-                w_mis++;
-            }
-            traits->to_float(hrow, ref_host.data(), ne00);
-            std::copy(ref_host.begin(), ref_host.end(), expect.begin() + (size_t) (i * ne00));
-        } else {
-            std::copy(ref_dev.begin(), ref_dev.end(), expect.begin() + (size_t) (i * ne00));
-        }
-    }
-    double    max_abs = 0.0, max_abs_dev = 0.0;
-    int64_t   first_bad = -1, first_bad_dev = -1;
-    const int bad     = rb2h_count_bad_rows(out, expect, n, ne00, &max_abs, &first_bad);
-    const int bad_dev = rb2h_count_bad_rows(out, expect_dev, n, ne00, &max_abs_dev, &first_bad_dev);
-    GGML_LOG_WARN(
-        "[RB2H-VERIFY] call=%d n=%lld ne00=%lld host_weight=%d ids_oob=%d ids_hash=%016llx ids0=[%d,%d,%d,%d] "
-        "weight_rows_hash=%016llx weight_row_mismatch_vs_host=%d out_bad_rows_vs_ref=%d (max_abs=%g first=%lld) "
-        "out_bad_rows_vs_device_weight=%d (max_abs=%g) src0_d=%p alloc=%d ids=%p alloc=%d dst=%p alloc=%d\n",
-        call, (long long) n, (long long) ne00, host_w != nullptr ? 1 : 0, ids_oob,
-        (unsigned long long) rb2h_fnv(ids.data(), ids.size() * sizeof(int32_t)), n > 0 ? ids[0] : -1,
-        n > 1 ? ids[1] : -1, n > 2 ? ids[2] : -1, n > 3 ? ids[3] : -1, (unsigned long long) wh, w_mis, bad, max_abs,
-        (long long) first_bad, bad_dev, max_abs_dev, src0_d, (int) ggml_sycl_get_alloc_type(src0_d),
-        (const void *) ids_ptr, (int) ggml_sycl_get_alloc_type(ids_ptr), (const void *) dst_d,
-        (int) ggml_sycl_get_alloc_type(dst_d));
-
-    g_rb2h_pending.valid  = true;
-    g_rb2h_pending.dst_d  = dst_d;
-    g_rb2h_pending.n      = n;
-    g_rb2h_pending.ne00   = ne00;
-    g_rb2h_pending.call   = call;
-    g_rb2h_pending.expect = std::move(expect_dev);
 }
 
 // Specialized Q6_K SoA kernel for GET_ROWS
@@ -3345,18 +3189,7 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                                    (int) layout, src0->name ? src0->name : "?");
                     GGML_ABORT("fatal error");
                 }
-                // llama.cpp-rb2h diagnostic arm: drain the stream on both sides of the op.
-                const bool rb2h_sync = ggml_sycl_rb2h_arm("GGML_SYCL_RB2H_GET_ROWS_Q4K_SYNC");
-                if (rb2h_sync) {
-                    ctx.stream()->wait_and_throw();
-                }
                 get_rows_q4_k_aos_sycl(ctx, src0, dst->src[1], dst, src0_d, src1_i32, dst_d, ctx.stream());
-                if (rb2h_sync) {
-                    ctx.stream()->wait_and_throw();
-                }
-                if (ggml_sycl_rb2h_arm("GGML_SYCL_RB2H_GET_ROWS_Q4K_VERIFY")) {
-                    rb2h_verify_q4_k_get_rows(ctx, src0, dst, src0_d, src1_i32, dst_d);
-                }
             }
             break;
         default:

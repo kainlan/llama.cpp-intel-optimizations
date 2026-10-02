@@ -13,7 +13,6 @@
 #include "ggml.h"
 
 #include "concat.hpp"
-#include "rb2h-diag.hpp"
 
 static inline size_t elem_size(ggml_type t) {
     return ggml_type_size(t) / ggml_blck_size(t);
@@ -130,10 +129,9 @@ static void concat_T_sycl_non_cont(
   sycl::range<3> gridDim(ne3, ne2, ne1);
   // One work-group of SYCL_CONCAT_BLOCK_SIZE lanes per (i3, i2, i1) row; the kernel strides i0 by the local range.
   // (1,1,1) ran every row on a single lane.
-  // llama.cpp-rb2h diagnostic arm: the pre-qhfp one-lane-per-row geometry.
-  const int64_t rb2h_lanes = ggml_sycl_rb2h_arm("GGML_SYCL_RB2H_CONCAT_LEGACY") ? 1 : SYCL_CONCAT_BLOCK_SIZE;
   stream->parallel_for(
-      sycl::nd_range<3>(gridDim * sycl::range<3>(1, 1, rb2h_lanes), sycl::range<3>(1, 1, rb2h_lanes)),
+      sycl::nd_range<3>(gridDim * sycl::range<3>(1, 1, SYCL_CONCAT_BLOCK_SIZE),
+                        sycl::range<3>(1, 1, SYCL_CONCAT_BLOCK_SIZE)),
       [=](sycl::nd_item<3> item_ct1) {
       int64_t i3 = item_ct1.get_group(0);
       int64_t i2 = item_ct1.get_group(1);
@@ -191,10 +189,6 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor ds
             GGML_ASSERT(stream->has_property<sycl::property::queue::in_order>());
             SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_graph_safe_memcpy(*stream, dst_d, src0_d, size0)));
             SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_graph_safe_memcpy(*stream, dst_d + size0 / type_size, src1_d, size1)));
-            // llama.cpp-rb2h diagnostic arm: the pre-qhfp host wait.
-            if (!g_ggml_sycl_graph_recording && ggml_sycl_rb2h_arm("GGML_SYCL_RB2H_CONCAT_LEGACY")) {
-                stream->wait();
-            }
         }
     } else {
         concat_T_sycl_non_cont<T>(stream, static_cast<const char *>(src0.resolve_ptr()),
