@@ -442,6 +442,51 @@ PLANNED_REWRITES = (
 )
 
 
+# Growth that escapes the located executor bodies or the located statements. Each edit is (anchor, replacement) on the
+# whitespace-squeezed source; ANY failed check counts as the gate catching it.
+_CALL_BATCHED = "            if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {"
+_CALL_STAGING = ("                (void) cache->reserve_pp_moe_onednn_scratch(planned_weight_slot, planned_activation_slot,\n"
+                 "                                                            planned_output_slot, planned_ring_depth);")
+_ELSEWHERE = "static const char * ggml_sycl_planned_weight_residency_name("
+_SHAPE = "            const ggml_sycl::pp_moe_onednn_scratch_shape planned_shape = {\n                planned_weight,\n                planned_act,"
+_RING = "            const uint32_t ring_depth = pp_moe_onednn_runtime_ring_depth(planned_ring_depth);"
+_DECL_W = "            const size_t planned_weight =\n                " + PLANNED_W
+ESCAPES = (
+    ("third-site-std-max-elsewhere", [(_ELSEWHERE, "static bool third_site(ggml_sycl::unified_cache * c, size_t pw, size_t wb, "
+      "size_t pa, size_t po, uint32_t rd) {\n    return c->reserve_pp_moe_onednn_scratch(std::max(pw, wb), pa, po, rd);\n}\n" + _ELSEWHERE)]),
+    ("third-site-free-wrapper-elsewhere", [(_ELSEWHERE, "static bool third_site(int dev, size_t pw, size_t wb, size_t pa, size_t po, "
+      "uint32_t rd) {\n    return ggml_sycl::unified_cache_reserve_pp_moe_onednn_scratch(dev, std::max(pw, wb), pa, po, rd);\n}\n" + _ELSEWHERE)]),
+    ("second-reserve-free-wrapper-in-batched", [(_CALL_BATCHED, "            (void) ggml_sycl::unified_cache_reserve_pp_moe_onednn_scratch(ctx.device, "
+      "std::max(planned_weight, weight_bytes), planned_act, planned_out, ring_depth);\n" + _CALL_BATCHED)]),
+    ("second-reserve-dot-form-in-batched", [(_CALL_BATCHED, "            (void) (*cache).reserve_pp_moe_onednn_scratch(std::max(planned_weight, "
+      "weight_bytes), planned_act, planned_out, ring_depth);\n" + _CALL_BATCHED)]),
+    ("second-reserve-arrow-in-batched", [(_CALL_BATCHED, "            (void) cache->reserve_pp_moe_onednn_scratch(std::max(planned_weight, "
+      "weight_bytes), planned_act, planned_out, ring_depth);\n" + _CALL_BATCHED)]),
+    ("second-reserve-arrow-in-staging", [(_CALL_STAGING, _CALL_STAGING + "\n                (void) cache->reserve_pp_moe_onednn_scratch("
+      "std::max(planned_weight_slot, pp_mxfp4_src0_f16_bytes), planned_activation_slot, planned_output_slot, planned_ring_depth);")]),
+    ("staging-args-swapped", [(_CALL_STAGING, _CALL_STAGING.replace("planned_weight_slot, planned_activation_slot,", "planned_activation_slot, planned_weight_slot,"))]),
+    ("staging-nested-endif-truncates-the-region", [(_CALL_STAGING, _CALL_STAGING + "\n#if 1\n#endif\n                (void) cache->"
+      "reserve_pp_moe_onednn_scratch(std::max(planned_weight_slot, pp_mxfp4_src0_f16_bytes), planned_activation_slot, "
+      "planned_output_slot, planned_ring_depth);")]),
+    ("staging-nested-endif-then-a-write", [(_CALL_STAGING, "\n#if 1\n#endif\n                const_cast<size_t &>(planned_weight_slot) += pp_mxfp4_src0_f16_bytes;\n"
+      + _CALL_STAGING)]),
+    ("const-cast-write", [(_CALL_BATCHED, "            const_cast<size_t &>(planned_weight) = std::max(planned_weight, weight_bytes);\n" + _CALL_BATCHED)]),
+    ("const-cast-pointer-write", [(_CALL_BATCHED, "            *const_cast<size_t *>(&planned_weight) = std::max(planned_weight, weight_bytes);\n" + _CALL_BATCHED)]),
+    ("const-cast-reference-bind", [(_CALL_BATCHED, "            size_t & grow_w = const_cast<size_t &>(planned_weight);\n            grow_w = "
+      "std::max(grow_w, weight_bytes);\n" + _CALL_BATCHED)]),
+    ("reinterpret-cast-write", [(_CALL_BATCHED, "            reinterpret_cast<size_t &>(planned_weight) = std::max(planned_weight, weight_bytes);\n" + _CALL_BATCHED)]),
+    ("const-ref-alias-then-const-cast", [(_CALL_BATCHED, "            const size_t & pw_ref = planned_weight;\n            const_cast<size_t &>(pw_ref) += weight_bytes;\n" + _CALL_BATCHED)]),
+    ("macro-redefines-the-planned-name", [(_CALL_BATCHED, "#define planned_weight (planned_weight + 1)\n" + _CALL_BATCHED)]),
+    ("grown-value-in-the-admission-shape", [(_SHAPE, "            const ggml_sycl::pp_moe_onednn_scratch_shape planned_shape = {\n                "
+      "std::max(planned_weight, weight_bytes),\n                planned_act,")]),
+    ("ring-depth-grown", [(_RING, "            const uint32_t ring_depth = std::max(pp_moe_onednn_runtime_ring_depth(planned_ring_depth), 4u);")]),
+    ("ceiling-raised-before-the-read", [(_DECL_W, "            ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(ctx.device, std::max(weight_bytes, size_t(1)), "
+      "act_bytes, out_bytes, 1);\n" + _DECL_W)]),
+    ("helper-lambda-around-the-reserve", [(_CALL_BATCHED, "            auto do_reserve = [&](size_t w, size_t a, size_t o, uint32_t d) { return cache->reserve_pp_moe_onednn_"
+      "scratch(w, a, o, d); };\n            if (!do_reserve(std::max(planned_weight, weight_bytes), planned_act, planned_out, ring_depth)) {")]),
+)
+
+
 def self_test(sycl, cache, module, header, doc):
     """Every absence check must fail once its forbidden construct is injected."""
     problems = []
@@ -474,6 +519,16 @@ def self_test(sycl, cache, module, header, doc):
         _, failed, _ = evaluate(mutated, cache, module, header, doc)
         if "no PP MoE scratch reservation upsizes past the plan" not in failed:
             problems.append("reservation pin did not fire on: " + label)
+    for label, edits in ESCAPES:
+        mutated = squeeze(sycl)
+        if not all(squeeze(anchor) in mutated for anchor, _ in edits):
+            problems.append("mutation anchor missing for the escape: " + label)
+            continue
+        for anchor, replacement in edits:
+            mutated = mutated.replace(squeeze(anchor), squeeze(replacement), 1)
+        _, failed, _ = evaluate(mutated, cache, module, header, doc)
+        if not failed:
+            problems.append("no check fired on the escape: " + label)
     for name, (target, anchor, replacement) in ABSENCE_MUTANTS.items():
         sources = {"sycl": sycl, "cache": cache, "module": module, "header": header}
         anchor, replacement = squeeze(anchor), squeeze(replacement)
