@@ -22,7 +22,10 @@ Exit: 0 pass, 1 fail, 77 skip (sources not found).
 import argparse
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SYCL = os.path.join(HERE, "..", "ggml", "src", "ggml-sycl")
@@ -280,6 +283,15 @@ def report(title, results):
     return failed
 
 
+def missing_source_exit_status():
+    """Exit status of this gate run from a tree that lacks the source it pins (the copy sits in tmp/tests/)."""
+    with tempfile.TemporaryDirectory(prefix="gate-missing-source-") as tmp:
+        os.makedirs(os.path.join(tmp, "tests"))
+        copy = os.path.join(tmp, "tests", os.path.basename(__file__))
+        shutil.copy(__file__, copy)
+        return subprocess.run([sys.executable, copy], capture_output=True, text=True, timeout=60).returncode
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true",
@@ -323,6 +335,13 @@ def main():
         if len(survivors) != expected_survivors:
             print("FAIL: self-test expected %d absence checks to survive the poison, %d did: %s"
                   % (expected_survivors, len(survivors), survivors))
+            failed += 1
+        # A missing source must FAIL. 77 is ctest's skip, which reads as green, and a moved source is exactly what
+        # this gate exists to notice.
+        status = missing_source_exit_status()
+        print("missing source: exit status %d with the source absent (%s)"
+              % (status, "fails as required" if status not in (0, 77) else "VOID, passes or skips"))
+        if status in (0, 77):
             failed += 1
 
     total = len(presence) + len(absence)

@@ -19,8 +19,12 @@ green means nothing without a demonstrated red.
 """
 
 import argparse
+import os
 import pathlib
+import shutil
+import subprocess
 import sys
+import tempfile
 
 SOURCE = pathlib.Path(__file__).resolve().parent.parent / "ggml" / "src" / "ggml-sycl" / "ggml-sycl.cpp"
 
@@ -94,6 +98,15 @@ POISONS = {
 }
 
 
+def missing_source_exit_status():
+    """Exit status of this gate run from a tree that lacks the source it pins (the copy sits in tmp/tests/)."""
+    with tempfile.TemporaryDirectory(prefix="gate-missing-source-") as tmp:
+        os.makedirs(os.path.join(tmp, "tests"))
+        copy = os.path.join(tmp, "tests", os.path.basename(__file__))
+        shutil.copy(__file__, copy)
+        return subprocess.run([sys.executable, copy], capture_output=True, text=True, timeout=60).returncode
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true",
@@ -124,6 +137,14 @@ def main():
             print("%-20s %s  poisoned source" % (name, "VOID (still passed!)" if ok else "red as required"))
             if ok:
                 failures += 1
+
+        # A missing source must FAIL. 77 is ctest's skip, which reads as green, and a moved source is exactly what
+        # this gate exists to notice.
+        status = missing_source_exit_status()
+        print("%-20s %s  exit status %d with the source absent"
+              % ("missing source", "fails as required" if status not in (0, 77) else "VOID (passes or skips)", status))
+        if status in (0, 77):
+            failures += 1
 
     return 1 if failures else 0
 
