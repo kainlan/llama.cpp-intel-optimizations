@@ -42,6 +42,7 @@ parser.add_argument("--zone", default=str(sycl / "zone-sizing.hpp"))
 parser.add_argument("--context", default=str(root / "src/llama-context.cpp"))
 parser.add_argument("--header", default=str(root / "ggml/include/ggml-sycl.h"))
 parser.add_argument("--context-header", default=str(root / "src/llama-context.h"))
+parser.add_argument("--auto-header", default=str(root / "src/llama-auto-ubatch.h"))
 parser.add_argument("--cmake", default=str(root / "tests/CMakeLists.txt"))
 parser.add_argument("--gpu-test", default=str(root / "tests/test-sycl-compute-buffer-kv-zone.cpp"))
 parser.add_argument("--self-test", action="store_true")
@@ -871,8 +872,9 @@ def evaluate(backend, common, cache, zone):
     return results
 
 
-def evaluate_context(context, header, ctx_header=None):
+def evaluate_context(context, header, ctx_header=None, auto_header=None):
     ctx_header = ctx_header_src if ctx_header is None else ctx_header
+    auto_header = auto_header_src if auto_header is None else auto_header
     """r3 C1: WHERE the hold-spill fit check runs in the auto-ubatch trial. A rung's compute buffers exist only once
     sched_reserve() has returned, so the check belongs in try_candidate, after it, for every rung, every
     flash-attention mode and the cached rung -- not in the recheck inside the reserve."""
@@ -963,6 +965,44 @@ def evaluate_context(context, header, ctx_header=None):
         re.search(r"hold_spill_validated_ub\s*=\s*hold_spill_fn\s*\?\s*c\s*:\s*0\s*;\s*return nullptr;", try_fn) is not None and \
         re.search(r"sched_matches_last_good\s*=\s*false\s*;\s*hold_spill_validated_ub\s*=\s*0\s*;", try_fn[:probe_at]) is not None
 
+    # kpjw-g6 (item 0): the default rung refused must not turn a loadable model into an init failure. B50, Qwen3.6-27B,
+    # auto n_ubatch: 512 spills 495 MB outside the arena and leaves 107.7 MB against the 256 MB headroom, the settle's
+    # transaction refused it, and the context died with "result=19" and no guidance. A smaller -ub is not a smaller
+    # context: when nothing at or above the default wins, the trial continues DOWNWARD (256, 128, 64) and settles on
+    # the first rung that fits. A pinned -ub never reaches the trial and still refuses by name; when no rung fits,
+    # the refusal names the largest -ub that does.
+    results["the pure downward walk exists: halves to a multiple of 32, floor 64, rungs above the cap skipped"] = \
+        re.search(r"llama_auto_ubatch_descent_floor\s*=\s*64\s*;", auto_header) is not None and \
+        re.search(r"uint32_t\s+llama_auto_ubatch_next_lower\(\s*uint32_t\s+from\s*\)", auto_header) is not None and \
+        re.search(r"uint32_t\s+llama_auto_ubatch_descend\(\s*uint32_t\s+fallback\s*,\s*uint32_t\s+cap\s*,\s*F\s+try_rung\s*\)", auto_header) is not None and \
+        re.search(r"if\s*\(\s*c\s*>\s*cap\s*\)\s*\{\s*continue\s*;", auto_header) is not None and \
+        re.search(r"if\s*\(\s*try_rung\(\s*c\s*\)\s*\)\s*\{\s*return c\s*;", auto_header) is not None
+    loop_at = select_fn.find("for (uint32_t c : ladder) {")
+    fallback_assign_at = select_fn.find("if (last_good == 0) {")
+    descent_m = re.search(r"if\s*\(\s*last_good\s*==\s*0\s*&&\s*ladder_needed\s*&&\s*fallback_tried\s*&&\s*!stop_is_pure_race\s*\)\s*\{", select_fn)
+    descent_block = balanced_block(select_fn, descent_m.end() - 1) if descent_m else ""
+    results["the trial continues downward when the default rung and everything above it lost, and not for a race"] = \
+        descent_m is not None and 0 < loop_at < descent_m.start() < fallback_assign_at and \
+        re.search(r"llama_auto_ubatch_descend\(\s*fallback_ubatch\s*,\s*cap\s*,", descent_block) is not None and \
+        re.search(r"return try_candidate\(c\)\s*==\s*nullptr\s*;", descent_block) is not None and \
+        re.search(r"last_good\s*=\s*won\s*;", descent_block) is not None and \
+        re.search(r"lowered_from\s*=\s*fallback_ubatch\s*;", descent_block) is not None and \
+        re.search(r"descent_ran\s*=\s*true\s*;", descent_block) is not None
+    stop_race_at = select_fn.find("const bool stop_is_pure_race")
+    results["a rung that lost is only lowered from when the default itself was tried (a non-rung default is not skipped)"] = \
+        0 < stop_race_at < (descent_m.start() if descent_m else 0) and \
+        re.search(r"if\s*\(\s*c\s*==\s*fallback_ubatch\s*\)\s*\{\s*fallback_tried\s*=\s*true\s*;\s*\}\s*tried\s*\+=", select_fn) is not None
+    results["a lowered result is announced and is not persisted as a tuning-cache entry"] = \
+        "auto n_ubatch lowered from %u to %u" in descent_block and \
+        re.search(r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*lowered_from\s*==\s*0\s*&&", select_fn) is not None
+    settle_try = re.search(r"if\s*\(\s*need_publish\s*\)\s*\{\s*try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\)\s*;\s*\}\s*catch\s*\(\s*const std::exception\s*&\s*e\s*\)\s*\{", select_fn)
+    settle_catch = balanced_block(select_fn, settle_try.end() - 1) if settle_try else ""
+    results["when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code"] = \
+        settle_try is not None and \
+        re.search(r"if\s*\(\s*!descent_ran\s*\)\s*\{\s*throw\s*;\s*\}", settle_catch) is not None and \
+        "throw std::runtime_error(" in settle_catch and "no -ub from %u down to %u fits this context" in settle_catch and \
+        "largest -ub that fits is about" in settle_catch and "llama_auto_ubatch_descent_floor" in settle_catch and \
+        re.search(r"refusal_largest_ub\s*=\s*rung_largest_ub\s*;", try_fn) is not None
     # r5 R7/R8: releasing the previous rung's buffers means the cached graph results too, not only the sched.
     results["the release drops every cached graph result and the active pointer, not only the sched"] = \
         re.search(r"for\s*\(\s*auto\s*&\s*res\s*:\s*gf_res_prev\s*\)\s*\{\s*res\.reset\(\)\s*;\s*\}", try_fn[:probe_at]) is not None and \
@@ -1050,6 +1090,7 @@ backend, common, cache, zone = (read(args.backend), read(args.common), read(args
 context_src = read(args.context)
 header_src = read(args.header)
 ctx_header_src = read(args.context_header)
+auto_header_src = read(args.auto_header)
 failed = run("tree", (backend, common, cache, zone))
 failed += run_context("tree", (context_src, header_src))
 raw_inputs = (Path(args.backend).read_text(), Path(args.zone).read_text(), Path(args.cmake).read_text(),

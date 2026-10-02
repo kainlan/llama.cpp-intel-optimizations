@@ -1027,6 +1027,35 @@ int main() {
         }
     }
 
+    // ---- Case 22: the kpjw-g6 B50 / Qwen3.6-27B auto case, exact arithmetic (-c 512, n_batch 2048). The settle's F3
+    // read the card with every rung buffer released: 602.7 MB free, a 470.0 MB worst-case raw spill (the plan 75.6 MB
+    // plus the rung's 495.0 MB request, net of 100.6 MB of KV-zone room), 132.7 MB left against the 256 MB headroom.
+    // The refusal is arithmetic, and so is the way out: the share of the spill the card can take at the default 512
+    // names the rung the continuation lands on (256), whose own spill then fits with room to spare. ---------------
+    {
+        const double MiB     = 1024.0 * 1024.0;
+        const size_t free_mb = static_cast<size_t>(602.7 * MiB);
+        const size_t raw     = static_cast<size_t>(470.0 * MiB);
+        const size_t head    = 256ull * 1024 * 1024;
+        const size_t demand  = ggml_sycl::zone_hold_spill_raw_demand(
+            static_cast<size_t>((75.6 + 495.0) * MiB),
+            ggml_sycl::zone_kv_room_for_compute(static_cast<size_t>(100.6 * MiB), 0));
+        CHECK(demand + 1024 > raw && demand < raw + 1024,
+              "the settle's bound is 570.6 MB (plan + request) net of 100.6 MB of room: the 470.0 MB the log printed");
+        CHECK(!ggml_sycl::zone_hold_spill_realized_fits(free_mb - raw, head, raw),
+              "132.7 MB left after the 470 MB worst case is under the 256 MB headroom, and the spill is what put it "
+              "there");
+        const size_t spill512 = static_cast<size_t>(495.0 * MiB);
+        const size_t after512 = free_mb - spill512;
+        CHECK(!ggml_sycl::zone_hold_spill_realized_fits(after512, head, spill512),
+              "the realized 495 MB spill leaves 107.7 MB: the same figure that ran flash attention out of resources");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(512, spill512, after512, head) == 256,
+              "the share the card can take at 512 (about 358) names the rung 256");
+        const size_t spill256 = spill512 / 2;
+        CHECK(ggml_sycl::zone_hold_spill_realized_fits(free_mb - spill256, head, spill256),
+              "at 256 the spill is half and leaves 355 MB: the continuation's landing rung fits");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
