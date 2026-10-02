@@ -740,8 +740,10 @@ struct kv_region_entry {
     uint64_t                         tenant_key = 0;  // the tenant section's digest
     // What the context last published through ggml_backend_sycl_set_runtime_context_desc: the
     // geometry, the KV and recurrent-state shape, the sorted tenant slots and whether the tenant
-    // section is planned.  Null until a descriptor publish succeeds, and null again after any
-    // other publish, so a coverage query against a stale shape answers GROWTH.
+    // section is planned.  Null until a descriptor publish succeeds.  The registry does not clear it
+    // on any other publish (publish() below stores whatever entry it is given): the backend's publish
+    // tail clears it with set_published_section(ctx, nullptr) on every publish that goes live and the
+    // descriptor path then stores its own, so a coverage query against a stale shape answers GROWTH.
     std::shared_ptr<const runtime_context_section> published;
 
     bool empty() const { return extents.empty() && layout.empty() && !tenants && !published; }
@@ -797,14 +799,19 @@ class kv_region_registry {
         return it == entries_.end() ? nullptr : it->second.published;
     }
 
-    // Replace the section of `ctx` (creating an otherwise empty entry when there is none) and its
-    // tenant key.  Null `section` drops it; a null section on a context with no entry creates
-    // nothing, and an entry left empty by the drop is erased.  Returns the previous pointer,
-    // moved out: a section's last drop is the caller's, with no lock held.
-    std::shared_ptr<const runtime_context_section> set_published_section(
-        kv_context_id                                  ctx,
-        std::shared_ptr<const runtime_context_section> section,
-        uint64_t                                       tenant_key) {
+    // Replace the section of `ctx` (creating an otherwise empty entry when there is none).  A null
+    // `section` drops it (see drop_published_section, which needs no section type); a null section on a
+    // context with no entry creates nothing, and an entry left empty by the drop is erased.  Returns the
+    // previous pointer, moved out: a section's last drop is the caller's, with no lock held.
+    //
+    // The entry's tenant key is the section's own (section->tenant_key), read here and nowhere else, so
+    // the two cannot disagree.  A slot table owns the key once one is installed (it is the digest the
+    // held reservation was built for), so neither a replace nor a drop of the section changes it; with
+    // no table the key follows the section, and a drop clears it.  A template on the section type only
+    // because that type is incomplete here: every caller includes runtime-context-section.hpp.
+    template <typename Section = runtime_context_section>
+    std::shared_ptr<const runtime_context_section> set_published_section(kv_context_id                  ctx,
+                                                                         std::shared_ptr<const Section> section) {
         std::shared_ptr<const runtime_context_section> previous;
         std::lock_guard<kv_witnessed_mutex>            g(mu_);
         auto                                           it = entries_.find(ctx);
@@ -815,12 +822,30 @@ class kv_region_registry {
             it = entries_.emplace(ctx, kv_region_entry{}).first;
         }
         previous = std::move(it->second.published);
-        if (section) {
-            it->second.tenant_key = tenant_key;
-        } else if (!it->second.tenants) {
-            it->second.tenant_key = 0;  // the key described the section just dropped
+        if (!it->second.tenants) {
+            it->second.tenant_key = section ? section->tenant_key : 0;
         }
         it->second.published = std::move(section);
+        if (it->second.empty()) {
+            entries_.erase(it);
+        }
+        return previous;
+    }
+
+    // Drop the section of `ctx`: the same rule as set_published_section with a null section, without
+    // the section type (so a translation unit that never completes it can call it).  Returns the dropped
+    // pointer, moved out; its last drop is the caller's, with no lock held.
+    std::shared_ptr<const runtime_context_section> drop_published_section(kv_context_id ctx) {
+        std::shared_ptr<const runtime_context_section> previous;
+        std::lock_guard<kv_witnessed_mutex>            g(mu_);
+        auto                                           it = entries_.find(ctx);
+        if (it == entries_.end()) {
+            return previous;
+        }
+        previous = std::move(it->second.published);
+        if (!it->second.tenants) {
+            it->second.tenant_key = 0;
+        }
         if (it->second.empty()) {
             entries_.erase(it);
         }

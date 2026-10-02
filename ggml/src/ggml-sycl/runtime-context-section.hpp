@@ -18,7 +18,10 @@
 //                                with it.
 //
 // Nothing here is synchronized: the registry entry that holds a section is read and
-// written under the registry's leaf mutex, and the ledger belongs to one load.
+// written under the registry's leaf mutex.  The ledger is a plain value keyed by (load
+// transaction, device); it takes no lock, so a process-wide instance needs its owner's lock
+// (a load's record and check run on the loading thread and its clear can run from load_end on
+// another).
 
 #ifndef GGML_SYCL_RUNTIME_CONTEXT_SECTION_HPP
 #define GGML_SYCL_RUNTIME_CONTEXT_SECTION_HPP
@@ -31,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -275,19 +279,37 @@ inline runtime_context_desc_status parse_runtime_context_desc(const ggml_sycl_ru
     return status::OK;
 }
 
-// The KV and recurrent-state sections of two publishes, byte for byte.
+// The elements are compared member by member: a publisher copies a whole element, padding
+// included (ggml_sycl_kv_layer_desc ends in two padding bytes), and equal values with different
+// padding bytes are the same shape.
+inline bool runtime_context_layer_equal(const ggml_sycl_kv_layer_desc & a, const ggml_sycl_kv_layer_desc & b) {
+    return a.n_embd_k_gqa == b.n_embd_k_gqa && a.n_embd_v_gqa == b.n_embd_v_gqa && a.n_head_kv == b.n_head_kv &&
+           a.n_embd_head_k == b.n_embd_head_k && a.has_kv == b.has_kv && a.is_swa == b.is_swa;
+}
+
+inline bool runtime_context_layer_equal(const ggml_sycl_rs_layer_desc & a, const ggml_sycl_rs_layer_desc & b) {
+    return a.il == b.il && a.type_r == b.type_r && a.type_s == b.type_s && a.n_embd_r == b.n_embd_r &&
+           a.n_embd_s == b.n_embd_s && a.n_rows == b.n_rows;
+}
+
+// The KV and recurrent-state sections of two publishes, value for value.
 inline bool runtime_context_kv_shape_equal(const runtime_context_kv_shape & a, const runtime_context_kv_shape & b) {
     if (a.type_k != b.type_k || a.type_v != b.type_v || a.v_trans != b.v_trans || a.no_alloc != b.no_alloc ||
         a.sidecar != b.sidecar || a.n_stream != b.n_stream || a.layers.size() != b.layers.size() ||
         a.rs_layers.size() != b.rs_layers.size()) {
         return false;
     }
-    if (!a.layers.empty() &&
-        std::memcmp(a.layers.data(), b.layers.data(), a.layers.size() * sizeof(ggml_sycl_kv_layer_desc)) != 0) {
-        return false;
+    for (size_t i = 0; i < a.layers.size(); ++i) {
+        if (!runtime_context_layer_equal(a.layers[i], b.layers[i])) {
+            return false;
+        }
     }
-    return a.rs_layers.empty() || std::memcmp(a.rs_layers.data(), b.rs_layers.data(),
-                                              a.rs_layers.size() * sizeof(ggml_sycl_rs_layer_desc)) == 0;
+    for (size_t i = 0; i < a.rs_layers.size(); ++i) {
+        if (!runtime_context_layer_equal(a.rs_layers[i], b.rs_layers[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Would publishing `candidate` need a transaction, given what `published` already holds?
@@ -299,7 +321,9 @@ inline bool runtime_context_kv_shape_equal(const runtime_context_kv_shape & a, c
 // shape demands no more when the KV and recurrent-state sections are the same, kv_unified,
 // swa_full and flash_attn are the same (a flip changes the cell count or adds the non-FA staging
 // in a direction this reader does not model), the plan state (tenants_planned) is the same,
-// and each of n_ctx, n_ubatch and n_seq_max is at most the published value.
+// and each of n_ctx, n_ubatch and n_seq_max is at most the published value.  A candidate with
+// a zero n_ctx, n_ubatch or n_seq_max has no shape to compare (the ledger refuses a zero n_ctx
+// for the same reason), so it is GROWTH, never coverage.
 // EQUAL only when the geometry, the shape and every slot are byte-equal.
 inline ggml_sycl_tenant_coverage classify_tenant_coverage(const runtime_context_section * published,
                                                           const runtime_context_section & candidate) {
@@ -308,7 +332,8 @@ inline ggml_sycl_tenant_coverage classify_tenant_coverage(const runtime_context_
     }
     const runtime_context_geometry & p = published->geometry;
     const runtime_context_geometry & c = candidate.geometry;
-    if (!runtime_context_kv_shape_equal(published->kv, candidate.kv) ||
+    if (c.n_ctx == 0 || c.n_ubatch == 0 || c.n_seq_max == 0 ||
+        !runtime_context_kv_shape_equal(published->kv, candidate.kv) ||
         published->tenants_planned != candidate.tenants_planned || c.kv_unified != p.kv_unified ||
         c.swa_full != p.swa_full || c.flash_attn != p.flash_attn || c.n_ctx > p.n_ctx || c.n_ubatch > p.n_ubatch ||
         c.n_seq_max > p.n_seq_max) {
@@ -339,7 +364,7 @@ inline ggml_sycl_tenant_coverage classify_tenant_coverage(const runtime_context_
 // no candidate shape to measure, so a value recorded for it would be a guess; the record is
 // refused and the late check answers NOT_RECORDED, which no caller reads as a pass.
 //
-// The strings are canonical (moua design 2.4.2 (b), step 3; rulings Z13.1, Z23 m-4); zhcn and
+// The strings are canonical (moua design 2.4.2 (b), step 3; ruling Z13.1); zhcn and
 // 23mk mirror them by citation.
 class load_compute_ledger {
   public:
@@ -348,17 +373,14 @@ class load_compute_ledger {
     // The zone the compute term names in the refusal line: the cohort the term is measured for, from the
     // one cohort table (context-tenant-measure.cpp, "context-compute").  vram_zone_name() in unified-cache.cpp
     // has no zone for it (KV, WEIGHT, ONEDNN, RUNTIME, SCRATCH) and the design (sycl-kv-region-segregation.md,
-    // late-check, term `compute`) names the term only, so the cohort name is the one existing authority.
-    static const char * zone() {
-        const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(GGML_SYCL_CONTEXT_COHORT_COMPUTE);
-        return info != nullptr ? info->name : "context-compute";
-    }
+    // late-check, term `compute`) names the term only, so the cohort name is the one existing authority.  The
+    // lookup of an enumerator below GGML_SYCL_CONTEXT_COHORT_COUNT cannot fail, and the test pins the name.
+    static const char * zone() { return ggml_sycl_context_cohort_lookup(GGML_SYCL_CONTEXT_COHORT_COMPUTE)->name; }
 
     struct check_result {
         ggml_sycl_late_check_result result = GGML_SYCL_LATE_CHECK_NOT_RECORDED;
-        std::string                 line;                    // the line to log, empty for none
-        bool                        warn_shrink    = false;  // the line is the shrink WARN (log at WARN)
-        bool                        shrink_counted = false;  // the counter takes +1 for this call
+        std::string                 line;  // the line to log, empty for none
+        bool shrink_counted = false;       // an admitted shrink: the line is the WARN and the counter takes +1
     };
 
     // Records c(P) = `bytes` for (txn, device).  False, recording nothing, when `n_ctx` is 0 or
@@ -429,7 +451,6 @@ class load_compute_ledger {
                     "(admitted; the early reservation stands)",
                     TERM, (int) device, (size_t) e.admitted, (size_t) late_bytes);
                 r.line           = line;
-                r.warn_shrink    = true;
                 r.shrink_counted = true;
             }
             return r;

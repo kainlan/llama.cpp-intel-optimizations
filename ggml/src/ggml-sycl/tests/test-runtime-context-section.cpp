@@ -18,6 +18,7 @@
 #include "../runtime-context-section.hpp"
 #include "llama-context-tenant.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -432,6 +433,75 @@ void case_coverage_shape_and_plan_state() {
     CHECK(cover(unplanned, unplanned) == GGML_SYCL_TENANT_COVERAGE_EQUAL, "two unplanned equal sections are EQUAL");
 }
 
+// A publisher copies whole elements, padding included: equal values with different padding bytes
+// are one shape.
+void case_coverage_ignores_element_padding() {
+    const runtime_context_section pub   = base_section();
+    runtime_context_section       dirty = base_section();
+    unsigned char *               pad   = reinterpret_cast<unsigned char *>(&dirty.kv.layers[0]) +
+                          offsetof(ggml_sycl_kv_layer_desc, is_swa) + sizeof(uint8_t);
+    pad[0] = 0xAB;
+    pad[1] = 0xCD;
+    CHECK(std::memcmp(&pub.kv.layers[0], &dirty.kv.layers[0], sizeof(ggml_sycl_kv_layer_desc)) != 0,
+          "the two layer elements differ in their padding bytes");
+    CHECK(cover(pub, dirty) == GGML_SYCL_TENANT_COVERAGE_EQUAL, "padding bytes do not make a shape GROWTH");
+    dirty.kv.layers[0].n_head_kv += 1;
+    CHECK(cover(pub, dirty) == GGML_SYCL_TENANT_COVERAGE_GROWTH, "a changed member still does");
+    // every member is compared, one at a time
+    auto kv_edit = [&](auto edit) {
+        runtime_context_section c = base_section();
+        edit(c.kv.layers[1]);
+        return cover(pub, c);
+    };
+    CHECK(kv_edit([](ggml_sycl_kv_layer_desc & l) { l.n_embd_k_gqa += 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "n_embd_k_gqa is compared");
+    CHECK(kv_edit([](ggml_sycl_kv_layer_desc & l) { l.n_embd_v_gqa += 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "n_embd_v_gqa is compared");
+    CHECK(kv_edit([](ggml_sycl_kv_layer_desc & l) { l.n_head_kv += 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "n_head_kv is compared");
+    CHECK(kv_edit([](ggml_sycl_kv_layer_desc & l) { l.n_embd_head_k += 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "n_embd_head_k is compared");
+    CHECK(kv_edit([](ggml_sycl_kv_layer_desc & l) { l.has_kv ^= 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "has_kv is compared");
+    CHECK(kv_edit([](ggml_sycl_kv_layer_desc & l) { l.is_swa ^= 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "is_swa is compared");
+    auto rs_edit = [&](auto edit) {
+        runtime_context_section c = base_section();
+        edit(c.kv.rs_layers[0]);
+        return cover(pub, c);
+    };
+    CHECK(rs_edit([](ggml_sycl_rs_layer_desc & r) { r.il += 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "the recurrent-state il is compared");
+    CHECK(rs_edit([](ggml_sycl_rs_layer_desc & r) { r.type_r += 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "type_r is compared");
+    CHECK(rs_edit([](ggml_sycl_rs_layer_desc & r) { r.type_s += 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "type_s is compared");
+    CHECK(rs_edit([](ggml_sycl_rs_layer_desc & r) { r.n_embd_r += 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "n_embd_r is compared");
+    CHECK(rs_edit([](ggml_sycl_rs_layer_desc & r) { r.n_embd_s += 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "n_embd_s is compared");
+    CHECK(rs_edit([](ggml_sycl_rs_layer_desc & r) { r.n_rows += 1; }) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "n_rows is compared");
+}
+
+// A candidate with no geometry has nothing to compare: never coverage, as the ledger refuses a zero n_ctx.
+void case_coverage_refuses_zero_geometry() {
+    const runtime_context_section pub  = base_section();
+    auto                          with = [&](auto edit) {
+        runtime_context_geometry g = geometry();
+        edit(g);
+        return base_section(g);
+    };
+    CHECK(cover(pub, with([](runtime_context_geometry & g) { g.n_ctx = 0; })) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "a zero n_ctx is not covered");
+    CHECK(cover(pub, with([](runtime_context_geometry & g) { g.n_ubatch = 0; })) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "a zero n_ubatch is not covered");
+    CHECK(cover(pub, with([](runtime_context_geometry & g) { g.n_seq_max = 0; })) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+          "a zero n_seq_max is not covered");
+    const runtime_context_section zero = with([](runtime_context_geometry & g) { g.n_ctx = 0; });
+    CHECK(cover(zero, zero) == GGML_SYCL_TENANT_COVERAGE_GROWTH, "a zero geometry is not even EQUAL to itself");
+}
+
 void case_coverage_slots() {
     const runtime_context_section pub    = base_section();
     auto                          edited = [&](auto edit) {
@@ -513,7 +583,7 @@ void case_ledger_rule() {
               "context-compute on "
               "device 0, early 1000 B, late 1001 B (refused)",
           "the canonical late string");
-    CHECK(!big.shrink_counted && !big.warn_shrink, "a refusal counts no shrink");
+    CHECK(!big.shrink_counted, "a refusal counts no shrink");
 
     const load_compute_ledger::check_result small = l.check(7, 1, 1999, true);
     CHECK(small.result == GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED, "smaller: SHRINK_ADMITTED");
@@ -522,7 +592,7 @@ void case_ledger_rule() {
             "[ZONE-PLAN-BUG] the late inventory shrinks term compute on device 1: early 2000 B, late 1999 B (admitted; "
             "the early reservation stands)",
         "the canonical shrink WARN");
-    CHECK(small.warn_shrink && small.shrink_counted, "the first shrink logs at WARN and counts once");
+    CHECK(small.shrink_counted, "the first shrink logs at WARN and counts once");
     const load_compute_ledger::check_result again = l.check(7, 1, 1500, true);
     CHECK(again.result == GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED && again.line.empty() && !again.shrink_counted,
           "a second shrink on the same (load, device, term) is admitted without a second line or count");
@@ -578,11 +648,11 @@ std::shared_ptr<const runtime_context_section> watched_section(bool * dropped, b
 void case_registry_published_section() {
     kv_region_registry reg;
     CHECK(reg.published_section(5) == nullptr, "a context with no entry has no section");
-    CHECK(reg.set_published_section(5, nullptr, 0) == nullptr && reg.size() == 0,
+    CHECK(reg.drop_published_section(5) == nullptr && reg.size() == 0,
           "dropping a section the context never had creates no entry");
 
     auto first = std::make_shared<const runtime_context_section>(base_section());
-    CHECK(reg.set_published_section(5, first, first->tenant_key) == nullptr, "the first publish replaces nothing");
+    CHECK(reg.set_published_section(5, first) == nullptr, "the first publish replaces nothing");
     CHECK(reg.published_section(5) == first && reg.size() == 1, "the entry holds the section just published");
     CHECK(reg.published_section(6) == nullptr, "another context's entry is separate");
     kv_region_entry seen;
@@ -593,7 +663,7 @@ void case_registry_published_section() {
     changed.tenants[0].slot_bytes += 1;
     changed.tenant_key = runtime_context_tenant_key(changed.tenants);
     auto second        = std::make_shared<const runtime_context_section>(changed);
-    auto previous      = reg.set_published_section(5, second, second->tenant_key);
+    auto previous      = reg.set_published_section(5, second);
     CHECK(previous == first, "a republish returns the section it replaced, moved out");
     CHECK(reg.published_section(5) == second && reg.lookup(5, seen) && seen.tenant_key == second->tenant_key,
           "and the entry now holds the new section and its key");
@@ -605,7 +675,7 @@ void case_registry_published_section() {
     with_extent.published  = first;
     with_extent.tenant_key = first->tenant_key;
     (void) reg.publish(7, std::move(with_extent));
-    (void) reg.set_published_section(7, nullptr, 0);
+    (void) reg.drop_published_section(7);
     CHECK(reg.lookup(7, seen) && seen.extents.size() == 1 && seen.published == nullptr && seen.tenant_key == 0,
           "dropping the section keeps the extents and clears the key it described");
     kv_region_entry with_slots;
@@ -613,23 +683,52 @@ void case_registry_published_section() {
     with_slots.published  = first;
     with_slots.tenant_key = 99;
     (void) reg.publish(8, std::move(with_slots));
-    (void) reg.set_published_section(8, nullptr, 0);
+    (void) reg.drop_published_section(8);
     CHECK(reg.lookup(8, seen) && seen.tenants != nullptr && seen.tenant_key == 99,
           "a slot table keeps its own key when the section goes");
-    (void) reg.set_published_section(5, nullptr, 0);
-    CHECK(reg.published_section(5) == nullptr && !reg.lookup(5, seen) && reg.size() == 2,
+    // ... and when the section is replaced: the key is the one the held reservation was built for.
+    kv_region_entry replaced_slots;
+    replaced_slots.tenants    = std::make_shared<kv_tenant_slots>();
+    replaced_slots.published  = first;
+    replaced_slots.tenant_key = 99;
+    (void) reg.publish(11, std::move(replaced_slots));
+    CHECK(reg.set_published_section(11, second) == first, "a replace over a slot table returns the old section");
+    CHECK(reg.lookup(11, seen) && seen.published == second && seen.tenants != nullptr && seen.tenant_key == 99 &&
+              seen.tenant_key != second->tenant_key,
+          "a slot table keeps its own key when the section is replaced");
+    (void) reg.drop_published_section(11);
+    // With no slot table the key is the section's own, whatever the entry held before, and there is no
+    // argument to disagree with it.
+    kv_region_entry stale_key;
+    stale_key.extents.push_back(std::make_shared<int>(1));
+    stale_key.tenant_key = 12345;
+    (void) reg.publish(12, std::move(stale_key));
+    (void) reg.set_published_section(12, second);
+    CHECK(reg.lookup(12, seen) && seen.tenant_key == second->tenant_key, "the entry's key is the section's");
+    (void) reg.drop_published_section(12);
+    CHECK(reg.lookup(12, seen) && seen.tenant_key == 0 && seen.extents.size() == 1,
+          "and the drop clears it, keeping the extents");
+    // A typed null through set_published_section is the same drop.
+    const std::shared_ptr<const runtime_context_section> none;
+    CHECK(reg.set_published_section(13, none) == nullptr && !reg.lookup(13, seen),
+          "a typed null on a context with no entry creates nothing");
+    (void) reg.set_published_section(13, second);
+    CHECK(reg.set_published_section(13, none) == second && !reg.lookup(13, seen),
+          "a typed null drops the section and erases the entry it leaves empty");
+    (void) reg.drop_published_section(5);
+    CHECK(reg.published_section(5) == nullptr && !reg.lookup(5, seen) && reg.size() == 4,
           "dropping the section of an otherwise empty entry erases the entry");
 
     // A section's last drop is the caller's, with the leaf lock released.
     bool dropped = false, under_lock = true;
-    CHECK(reg.set_published_section(9, watched_section(&dropped, &under_lock), 1) == nullptr, "a watched section in");
+    CHECK(reg.set_published_section(9, watched_section(&dropped, &under_lock)) == nullptr, "a watched section in");
     CHECK(!dropped, "the registry keeps it alive");
-    (void) reg.set_published_section(9, nullptr, 0);
+    (void) reg.drop_published_section(9);
     CHECK(dropped && !under_lock, "its last drop ran after the leaf lock was released");
     dropped    = false;
     under_lock = true;
-    (void) reg.set_published_section(10, watched_section(&dropped, &under_lock), 1);
-    (void) reg.set_published_section(10, std::make_shared<const runtime_context_section>(base_section()), 2);
+    (void) reg.set_published_section(10, watched_section(&dropped, &under_lock));
+    (void) reg.set_published_section(10, std::make_shared<const runtime_context_section>(base_section()));
     CHECK(dropped && !under_lock, "so did the drop of a replaced section");
     CHECK(kv_lock_witness::violations() == 0, "the witness saw no lock-order violation");
 }
@@ -643,6 +742,8 @@ int main() {
     case_refusals();
     case_coverage_geometry();
     case_coverage_shape_and_plan_state();
+    case_coverage_ignores_element_padding();
+    case_coverage_refuses_zero_geometry();
     case_coverage_slots();
     case_ledger_records_only_with_an_n_ctx();
     case_ledger_rule();

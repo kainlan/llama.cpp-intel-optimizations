@@ -1512,6 +1512,9 @@ typedef struct ggml_sycl_rs_layer_desc {
 // insert after sidecar; it is named so the layout is visible and must be 0.
 // The tenants array is zhcn's section (n_tenants == 0 for a publisher that
 // has none), the layers array is moua's, and so is the recurrent-state one.
+// Each array is read by its own stride, so a publisher that grows an element lengthens the
+// stride and stays readable.  A count above 65536 (the reader's cap) is refused as a bad array,
+// as are a non-zero count with no array and a stride below the element.
 typedef struct ggml_sycl_runtime_context_desc {
     uint32_t struct_size;  // sizeof(*this) as the publisher built it; the reader gates every field on it
     uint32_t version;      // GGML_SYCL_RUNTIME_CONTEXT_DESC_VERSION; bumped on any change of meaning
