@@ -176,26 +176,61 @@ def function_body(source, signature_regex):
 
 
 def entry_blocks_graphs(compute):
-    """The compute entry's `if (moe_graphs_disabled) { use_sycl_graph = false; }` is a top-level statement of the
-    compute body (not under another `if`, not dead), consists of the assignment as a direct statement (plus an
-    optional debug line), comes before every consumer of use_sycl_graph, and nothing but `= false` assigns
-    use_sycl_graph between the block and those consumers. Strings are masked: an assignment in a message is text."""
+    """Returns "" when the compute entry turns graphs off after a failed retire, else the reason it does not.
+
+    Some `if (... moe_graphs_disabled ...) { use_sycl_graph = false; }` block must (a) be a top-level statement of the
+    compute body (not under another `if`, not dead, no `&&` and no negation in its condition, no preprocessor
+    conditional ahead of it), (b) consist of the assignment as a direct statement (plus an optional debug line either
+    side), (c) precede every consumer of use_sycl_graph, and (d) be followed, up to the LAST recording, by no
+    assignment to use_sycl_graph other than `= false` (or `&=`): a later `= true`, `|= true` or `= x || y` would
+    re-enable what the block turned off. Strings are masked: an assignment in a message is text, not code."""
     masked = mask_strings(compute or "")
-    m = re.search(r"\bif\s*\(\s*sycl_ctx->moe_graphs_disabled\s*\)\s*\{", masked)
-    if not m:
-        return False
-    depth = masked.count("{", 0, m.start()) - masked.count("}", 0, m.start())
-    if depth != 1:
-        return False
-    end = masked.find("}", m.end())
-    block = masked[m.end() - 1 : end + 1]
-    if re.fullmatch(r"\{\s*(GGML_SYCL_DEBUG\([^;{}]*\);\s*)?use_sycl_graph\s*=\s*false\s*;\s*\}", block) is None:
-        return False
-    consumers = [masked.find(c) for c in ("moe_graphlet_replay_probe =", "model_sycl_graph.begin_recording(", "descriptor_moe_graph_candidates")]
-    if any(c < 0 for c in consumers) or end >= min(consumers):
-        return False
-    between = masked[end + 1 : min(consumers)]
-    return all(re.match(r"\s*false\s*;", between[x.end():]) for x in re.finditer(r"\buse_sycl_graph\s*=(?!=)", between))
+    if not masked:
+        return "the compute function body was not found"
+    consumers = {"moe_graphlet_replay_probe =": masked.find("moe_graphlet_replay_probe ="),
+                 "descriptor_moe_graph_candidates": masked.find("descriptor_moe_graph_candidates"),
+                 "model_sycl_graph.begin_recording(": masked.rfind("model_sycl_graph.begin_recording(")}
+    for name, at in consumers.items():
+        if at < 0:
+            return f"consumer anchor missing from the compute body: {name}"
+    first_consumer = min(consumers.values())
+    last_consumer = max(consumers.values())
+    shape = r"\{\s*(GGML_SYCL_DEBUG\([^;{}]*\);\s*)?use_sycl_graph\s*=\s*false\s*;\s*(GGML_SYCL_DEBUG\([^;{}]*\);\s*)?\}"
+    reason = "no `if (... moe_graphs_disabled ...)` block in the compute body"
+    for m in re.finditer(r"\bif\s*\(([^(){};]*)\)\s*\{", masked):
+        cond = m.group(1)
+        if re.search(r"(?<![!\w>.])\s*sycl_ctx->moe_graphs_disabled\b", " " + cond) is None or "&&" in cond or "?" in cond \
+                or re.search(r"!\s*sycl_ctx->moe_graphs_disabled", cond):
+            continue
+        # The graph section of the function lives under the one `#ifdef GGML_SYCL_GRAPH`; any other conditional ahead of
+        # the block (an `#if 0` around it, an `#else` arm) could compile it away.
+        conditionals = [re.sub(r"#\s*", "#", re.sub(r"\s+", " ", x.strip()))
+                        for x in re.findall(r"^\s*#\s*(?:if|ifdef|ifndef|else|elif)\b.*$", masked[: m.start()], re.M)]
+        if conditionals != ["#ifdef GGML_SYCL_GRAPH"]:
+            reason = "a preprocessor conditional other than `#ifdef GGML_SYCL_GRAPH` sits ahead of the block: " + repr(conditionals)
+            continue
+        depth = masked.count("{", 0, m.start()) - masked.count("}", 0, m.start())
+        if depth != 1:
+            reason = "the moe_graphs_disabled block is not a top-level statement of the compute body"
+            continue
+        end = masked.find("}", m.end())
+        if re.fullmatch(shape, masked[m.end() - 1 : end + 1]) is None:
+            reason = "the moe_graphs_disabled block does not directly assign use_sycl_graph = false"
+            continue
+        if end >= first_consumer:
+            reason = "the moe_graphs_disabled block does not precede the first consumer"
+            continue
+        window = masked[end + 1 : last_consumer]
+        if re.search(r"(?<!&)&\s*(\w+\s*=\s*)?use_sycl_graph\b", window):
+            reason = "use_sycl_graph is aliased by reference after the moe_graphs_disabled block"
+            continue
+        bad = [x for x in re.finditer(r"\buse_sycl_graph\s*([|^+\-*/&]?)=(?!=)", window)
+               if not (x.group(1) == "&" or (x.group(1) == "" and re.match(r"\s*false\s*;", window[x.end():])))]
+        if bad:
+            reason = "use_sycl_graph is re-enabled after the moe_graphs_disabled block"
+            continue
+        return ""
+    return reason
 
 
 def evaluate(backend, common, memo_hdr):
@@ -486,7 +521,10 @@ def evaluate(backend, common, memo_hdr):
         re.search(r"if\s*\(\s*sycl_ctx->moe_block_graphs_disabled\s*\|\|[^{};]*\bsycl_ctx->moe_graphs_disabled\s*\)\s*\{", graphlets) is not None
     # With the post-gateway checks gone, this entry block is what stops a segment replay after a failed retire
     # (the segments stay marked valid): it must turn graphs off for the whole compute.
-    results["the compute entry turns graphs off when MoE graphs were disabled by a failed retire"] = entry_blocks_graphs(compute)
+    entry_reason = entry_blocks_graphs(compute)
+    if entry_reason:
+        print("NOTE: compute-entry check: " + entry_reason)
+    results["the compute entry turns graphs off when MoE graphs were disabled by a failed retire"] = entry_reason == ""
     results["the INPUT arm stages on the backend's own queue"] = \
         re.search(r"if\s*\(graph_tensor_is_input\(tensor\)\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{\s*"
                   r"sycl::queue\s*&\s*q\s*=\s*\*ctx->stream\(\);\s*void\s*\*\s*dev_ptr\s*=\s*ctx->graph_input_stage\(tensor, tensor->data, nbytes, q\);",
@@ -598,6 +636,15 @@ if args.self_test:
 
     mem_ = memo_hdr
     mutants = [
+        # review r12
+        ("use_sycl_graph is re-enabled just before the descriptor candidates", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"(\n\s*const int descriptor_moe_graph_candidates =)", r"\n    use_sycl_graph = true;\1"), common, mem_)),
+        ("use_sycl_graph is or-assigned true after the block", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"(if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;\s*\})", r"\1\n    use_sycl_graph |= true;"), common, mem_)),
+        ("the entry block is compiled away by #if 0", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"(if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;\s*\})", r"#if 0\n\1\n#endif"), common, mem_)),
+        ("use_sycl_graph is re-enabled through a reference", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"(if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;\s*\})", r"\1\n    { bool & g = use_sycl_graph; g = true; }"), common, mem_)),
         # review r11
         ("the entry block is moved under the later use_sycl_graph test", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
          (move_entry_block_into_later_if(backend), common, mem_)),

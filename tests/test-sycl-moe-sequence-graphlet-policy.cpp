@@ -1079,8 +1079,18 @@ static int test_sequence_graphlet_segmented_replay_uses_sequence_graphlets() {
     const std::string sycl = read_required_file("ggml/src/ggml-sycl/ggml-sycl.cpp");
 
     const std::string replay_segments = required_region(sycl, "static void moe_graph_replay_segments",
-                                                        "graph_prestage_leaf_tensors(ggml_backend_sycl_context",
+                                                        "static void graph_refresh_input_tensors(",
                                                         "segmented replay sequence graphlet bridge");
+    {
+        // The region must be exactly this one function: a region that ran on into later functions would let the
+        // needles below match code that is not part of the replay bridge.
+        size_t closes = 0;
+        for (size_t pos = replay_segments.find("\n}\n"); pos != std::string::npos;
+             pos = replay_segments.find("\n}\n", pos + 1)) {
+            closes++;
+        }
+        CHECK(closes == 1, "the segmented replay bridge region must hold exactly one function (its end marker drifted)");
+    }
     CHECK(contains(replay_segments, "try_sequence_graphlet_for_segmented_moe"),
           "segmented replay must try sequence graphlets for MoE dispatch gaps");
     CHECK(contains(replay_segments, "moe_graph_try_sequence_graphlet_for_node") &&
