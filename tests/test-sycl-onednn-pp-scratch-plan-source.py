@@ -187,7 +187,7 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
     # ---- review r1 I1/M4: ONE helper answers "the scratch supplies this op", for both consumers ----
     supplies_helper = function_body(
         backend, r"static bool ggml_sycl_onednn_pp_scratch_supplies\([^)]*\)\s*\{")
-    enabled_fn = function_body(backend, r"static bool onednn_pp_unified_scratch_enabled\([^)]*\)\s*\{")
+    enabled_fn = function_body(cache, r"bool onednn_pp_unified_scratch_enabled\(ggml_type type\)\s*\{")
     results["anchor: the shared supplies helper exists"] = supplies_helper is not None
     results["anchor: the type/env enablement function exists"] = enabled_fn is not None
     if supplies_helper is not None:
@@ -200,6 +200,22 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
     if enabled_fn is not None:
         results["the enablement function asks the pure predicate"] = \
             "zone_onednn_pp_scratch_type_enabled(" in enabled_fn
+    results["the enablement function is declared once, for the cache and the backend to share"] = \
+        re.search(r"bool onednn_pp_unified_scratch_enabled\(ggml_type type\);", cache_hpp) is not None and \
+        "static bool onednn_pp_unified_scratch_enabled(" not in backend
+
+    # ---- the dequant plan covers the ops the scratch will not supply (the adapter marks them; the pure classifier decides)
+    adapter = function_body(
+        cache, r"std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory\([^)]*\)\s*\{")
+    results["anchor: the zone-inventory adapter exists"] = adapter is not None
+    if adapter is not None:
+        results["the adapter marks the unified-kernel types for the conditional dequant plan"] = \
+            "should_use_unified(" in adapter and "dequant_f16_if_unsupplied_weight_bytes" in adapter and \
+            "dequant_f16_if_unsupplied_src1_bytes_per_token" in adapter
+        results["the adapter hands the classifier the type/env enablement, not its own copy"] = \
+            "pp_scratch_type_enabled" in adapter and "onednn_pp_unified_scratch_enabled(" in adapter
+        results["the adapter excludes expert stacks from the conditional mark too"] = \
+            adapter.count("expert_tensor_role_from_tensor_name(") >= 3
     SUPPLIES = "ggml_sycl_onednn_pp_scratch_supplies("
     results["the op arm's candidate asks the shared supplies helper with its column tile"] = \
         bool(op_candidate) and SUPPLIES in op_candidate.group(1) and "src1_ncols" in op_candidate.group(1) and \
@@ -380,7 +396,8 @@ if args.self_test and not failed:
     walk_sig = r"static bool ggml_sycl_dequant_f16_ensure_for_graph\("
     helper_sig = r"static bool ggml_sycl_onednn_pp_scratch_planned_bytes\("
     supplies_sig = r"static bool ggml_sycl_onednn_pp_scratch_supplies\("
-    enabled_sig = r"static bool onednn_pp_unified_scratch_enabled\("
+    enabled_sig = r"bool onednn_pp_unified_scratch_enabled\(ggml_type type\)"
+    adapter_sig = r"std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory\("
     route_a_sig = r"static bool ggml_sycl_mul_mat_unified_pp_dequant_route\("
     SUPPLIES_NAME = "ggml_sycl_onednn_pp_scratch_supplies("
     mutants = [
@@ -400,7 +417,16 @@ if args.self_test and not failed:
         ("supplies drops the zone", "the supplies helper asks the pure verdict",
          (mutate_in_func(backend, supplies_sig, "zone_onednn_pp_scratch_supplies(", "zone_XXXX("), cache, cache_hpp)),
         ("enablement bypasses the pure predicate", "the enablement function asks the pure predicate",
-         (mutate_in_func(backend, enabled_sig, "zone_onednn_pp_scratch_type_enabled(", "zone_XXXX("), cache, cache_hpp)),
+         (backend, mutate_in_func(cache, enabled_sig, "zone_onednn_pp_scratch_type_enabled(", "zone_XXXX("), cache_hpp)),
+        ("adapter forgets the unified types", "the adapter marks the unified-kernel types for the conditional dequant plan",
+         (backend, mutate_in_func(cache, adapter_sig, "should_use_unified(", "XXXX("), cache_hpp)),
+        ("adapter keeps its own enablement", "the adapter hands the classifier the type/env enablement, not its own copy",
+         (backend, mutate_in_func(cache, adapter_sig, "onednn_pp_unified_scratch_enabled(", "XXXX("), cache_hpp)),
+        ("adapter marks expert stacks", "the adapter excludes expert stacks from the conditional mark too",
+         (backend, mutate_in_func(cache, adapter_sig, "expert_tensor_role_from_tensor_name(", "XXXX("), cache_hpp)),
+        ("backend keeps a private enablement copy", "the enablement function is declared once, for the cache and the backend to share",
+         (backend + "\nstatic bool onednn_pp_unified_scratch_enabled(ggml_type t) { return true; }\n", cache,
+          cache_hpp)),
         ("walk forgets Route A", "the walk counts a Route A node with the answers it already has",
          (mutate_in_func(backend, walk_sig, "ggml_sycl_mul_mat_unified_pp_dequant_route(", "ggml_sycl_XXXX("),
           cache, cache_hpp)),

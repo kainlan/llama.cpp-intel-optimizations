@@ -864,6 +864,66 @@ int main() {
         CHECK(ggml_sycl::zone_onednn_pp_pair_bound(SIZE_MAX, 0, SIZE_MAX) == 0, "a saturated floor leaves nothing");
     }
 
+    // ---- Case 14g: the dequant plan covers the ops the oneDNN PP scratch will not supply (llama.cpp-8ony) ----------
+    // Mistral Q4_0 under the default scratch: the per-layer weights are the ONEDNN zone's own plan and are supplied by
+    // the scratch, but the LM head is outside that plan and (over the pair bound) draws the dequant buffers; with
+    // GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=0 every dense Q4_0 op draws them. Both used to allocate with planned=0.
+    {
+        CHECK(!ggml_sycl::zone_dequant_f16_planned_when_unsupplied(true, true),
+              "an enabled type's per-layer weight is the zone's own plan: supplied, nothing for the dequant plan");
+        CHECK(ggml_sycl::zone_dequant_f16_planned_when_unsupplied(true, false),
+              "a weight the zone was not sized for (the LM head) is planned into the dequant buffers");
+        CHECK(ggml_sycl::zone_dequant_f16_planned_when_unsupplied(false, true),
+              "a type the scratch is off for draws the dequant buffers even when it is a per-layer weight");
+        CHECK(ggml_sycl::zone_dequant_f16_planned_when_unsupplied(false, false), "neither: planned");
+
+        const size_t layer_w = 117440512;  // 4096 x 14336 f16
+        const size_t head_w  = 262144000;  // 4096 x 32000 f16
+        auto         marked  = [&](const char * name, int64_t ne0, int64_t ne1, size_t f16_w, bool enabled) {
+            zone_tensor_desc d                    = desc(name, 1000, TYPE_Q4_0, ne0, ne1, 1, 1);
+            d.dequant_f16_if_unsupplied_weight_bytes         = f16_w;
+            d.dequant_f16_if_unsupplied_src1_bytes_per_token = static_cast<size_t>(ne0) * F16_BYTES;
+            d.pp_scratch_type_enabled             = enabled;
+            return d;
+        };
+        std::vector<zone_tensor_desc> layers;
+        for (int i = 0; i < 4; i++) {
+            layers.push_back(marked("blk.0.ffn_gate.weight", 4096, 14336, layer_w, true));
+        }
+        CHECK(zone_scoped_maxima(layers).dequant_f16_weight_bytes == 0 &&
+                  zone_scoped_maxima(layers).dequant_f16_src1_bytes_per_token == 0,
+              "default scratch, layer weights only: the zone's plan supplies them all, the dequant plan is empty");
+
+        std::vector<zone_tensor_desc> with_head = layers;
+        with_head.push_back(marked("output.weight", 4096, 32000, head_w, true));
+        const path_scoped_maxima mh = zone_scoped_maxima(with_head);
+        CHECK(mh.dequant_f16_weight_bytes == head_w, "the LM head is the dequant plan's weight copy");
+        CHECK(mh.dequant_f16_src1_bytes_per_token == 4096 * F16_BYTES, "and its activation row");
+
+        std::vector<zone_tensor_desc> off;
+        for (int i = 0; i < 4; i++) {
+            off.push_back(marked("blk.0.ffn_gate.weight", 4096, 14336, layer_w, false));
+        }
+        CHECK(zone_scoped_maxima(off).dequant_f16_weight_bytes == layer_w,
+              "scratch off: the layer weights draw the dequant buffers, so they size the plan");
+
+        // The unconditional marks (dense Q8_0) still count, and the two sources take the larger.
+        std::vector<zone_tensor_desc> mixed = layers;
+        zone_tensor_desc              q8    = desc("blk.1.attn_q.weight", 1000, TYPE_Q8_0, 6144, 5120, 1, 1);
+        q8.dequant_f16_weight_bytes         = 62914560;
+        q8.dequant_f16_src1_bytes_per_token = 12288;
+        mixed.push_back(q8);
+        CHECK(zone_scoped_maxima(mixed).dequant_f16_weight_bytes == 62914560,
+              "an unconditionally planned Q8_0 weight counts although the Q4_0 layers do not");
+        mixed.push_back(marked("output.weight", 4096, 32000, head_w, true));
+        CHECK(zone_scoped_maxima(mixed).dequant_f16_weight_bytes == head_w, "the larger of the two sources");
+
+        // An expert stack never gets the mark (the adapter excludes it), so an unmarked tensor changes nothing.
+        std::vector<zone_tensor_desc> unmarked = layers;
+        unmarked.push_back(desc("output.weight", 1000, TYPE_Q4_0, 4096, 32000, 1, 1));
+        CHECK(zone_scoped_maxima(unmarked).dequant_f16_weight_bytes == 0, "no mark, no plan");
+    }
+
     // ---- Case 14: the planned dense scratch is ONE reservation that follows the runtime n_ubatch (llama.cpp-kpjw) --
     // B70, full card, Qwen3.6-27B perplexity (-c 512 gives n_ctx 2048 with 4 sequences, n_batch 2048): the plan was
     // sized at the load-time n_ubatch (512, 10027264 B), auto-ubatch then chose 2048 (40108288 B), and the compute

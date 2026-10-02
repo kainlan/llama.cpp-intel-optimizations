@@ -165,7 +165,8 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
 
         const size_t cardinality = group_cardinality_of(freq, tensor);
 
-        if (zone_is_onednn_reorder_eligible(tensor, cardinality)) {
+        const bool onednn_eligible = zone_is_onednn_reorder_eligible(tensor, cardinality);
+        if (onednn_eligible) {
             maxima.onednn_eligible = std::max(maxima.onednn_eligible, tensor.size);
             // Maxed independently of onednn_eligible, over the SAME eligible
             // set. The two winners need not be the same tensor: expansion is
@@ -185,8 +186,21 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
         maxima.dequant_f16_weight_bytes = std::max(maxima.dequant_f16_weight_bytes, tensor.dequant_f16_weight_bytes);
         maxima.dequant_f16_src1_bytes_per_token =
             std::max(maxima.dequant_f16_src1_bytes_per_token, tensor.dequant_f16_src1_bytes_per_token);
+        if (tensor.dequant_f16_if_unsupplied_weight_bytes != 0 &&
+            zone_dequant_f16_planned_when_unsupplied(tensor.pp_scratch_type_enabled, onednn_eligible)) {
+            maxima.dequant_f16_weight_bytes =
+                std::max(maxima.dequant_f16_weight_bytes, tensor.dequant_f16_if_unsupplied_weight_bytes);
+            maxima.dequant_f16_src1_bytes_per_token = std::max(
+                maxima.dequant_f16_src1_bytes_per_token, tensor.dequant_f16_if_unsupplied_src1_bytes_per_token);
+        }
     }
     return maxima;
+}
+
+bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool pair_eligible) {
+    (void) pp_scratch_type_enabled;
+    (void) pair_eligible;
+    return false;  // RED stub (llama.cpp-8ony)
 }
 
 bool zone_mmq_src1_row_bytes(int64_t ne10, size_t * out) {

@@ -88,6 +88,18 @@ struct zone_tensor_desc {
     // Supplied by the adapter, which knows the type and the expert role; zero means "not a candidate".
     size_t dequant_f16_weight_bytes         = 0;
     size_t dequant_f16_src1_bytes_per_token = 0;
+
+    // The same two figures for a dense weight the oneDNN PP scratch may or may not supply (llama.cpp-8ony): a type
+    // the unified kernel's oneDNN f16 route serves (Q4_0, MXFP4). Its f16 copies come from the scratch when the
+    // scratch is enabled for its type and the tensor is a per-layer weight the ONEDNN zone was sized for;
+    // otherwise they come from the planned dequant buffers, so only then do they count
+    // (zone_dequant_f16_planned_when_unsupplied). Zero means "not such a tensor". Unlike the two fields above,
+    // these are not planned unconditionally: that would reserve a copy for every layer weight the scratch supplies.
+    size_t dequant_f16_if_unsupplied_weight_bytes         = 0;
+    size_t dequant_f16_if_unsupplied_src1_bytes_per_token = 0;
+    // The adapter's answer to "is the oneDNN PP scratch enabled for this tensor's type" (environment and the
+    // default type set). Only read together with the two fields above.
+    bool pp_scratch_type_enabled = false;
 };
 
 struct path_scoped_maxima {
@@ -245,6 +257,15 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
                                  uint32_t n_ubatch,
                                  size_t * src0_bytes,
                                  size_t * src1_bytes);
+
+// Whether a dense weight's f16 copies are planned into the dequant buffers because the oneDNN PP scratch will not
+// supply them (llama.cpp-8ony). The scratch supplies an op when it is enabled for the weight's type and the pair
+// fits the ONEDNN zone; the zone's own plan covers exactly the per-layer weights (zone_is_onednn_reorder_eligible),
+// so an eligible weight of an enabled type is supplied by construction and needs no dequant plan. A weight the zone
+// was not sized for (the LM head, a tied embedding) or a type the scratch is off for (GGML_SYCL_ONEDNN_PP_UNIFIED_
+// SCRATCH=0) draws the dequant buffers instead. A head that the zone's slack happens to supply is still planned:
+// the plan cannot know the slack, and an unused plan is bounded by that one weight's f16 copy. Pure.
+bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool pair_eligible);
 
 // ---------------------------------------------------------------------------
 // oneDNN PP scratch admission (llama.cpp-8ony)
