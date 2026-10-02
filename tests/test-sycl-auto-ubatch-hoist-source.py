@@ -23,6 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX_CPP = (ROOT / "src/llama-context.cpp").read_text()
+CTX_H = (ROOT / "src/llama-context.h").read_text()
 
 _spec = importlib.util.spec_from_file_location("reserve_state_gate", ROOT / "tests/test-sycl-reserve-state-source.py")
 _gate = importlib.util.module_from_spec(_spec)
@@ -39,7 +40,7 @@ _CTOR_HEAD = (
 )
 _CTOR_END = "llama_context::~llama_context()"
 _PREPARE = "void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)"
-_SELECT = "void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v)"
+_SELECT = "void llama_context::sycl_select_auto_ubatch()"
 
 _SYCL_PLAN_LITERALS = [
     '"[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)\\n"',
@@ -60,7 +61,7 @@ def order_ok(code: str) -> bool:
         "llama_auto_ubatch_trial_runs(",
         "sycl_auto_ubatch_prepare(params.type_k, params.type_v);",
         "model.create_memory(",
-        "sycl_select_auto_ubatch(params.type_k, params.type_v);",
+        "sycl_select_auto_ubatch();",
         "auto_ubatch_prep.reset();",
     ]
     pos = []
@@ -88,12 +89,17 @@ def ownership_ok(code: str) -> bool:
     for n in owned:
         if prep.count(z(n)) != 1 or sel.count(z(n)) != 0:
             return False
+    # the floor of the rung set is the prep's too: the ladder reads it back, it does not read cparams.n_ubatch a second time
+    # (the residency fixpoint runs between the two)
+    if z("fallback_ubatch = cparams.n_ubatch") in sel or prep.count(z("prep->fallback_ubatch = fallback_ubatch;")) != 1:
+        return False
     # the ladder half reads them from the prep
     return all(
         z(read) in sel
         for read in (
             "const sycl_auto_ubatch_prep & prep = *auto_ubatch_prep;",
             "const uint32_t cap = prep.cap;",
+            "const uint32_t fallback_ubatch = prep.fallback_ubatch;",
             "const bool moe_bound = prep.moe_bound;",
             "const bool cache_usable = prep.cache_usable;",
             "const std::vector<uint32_t> & rung_ladder = prep.rung_ladder;",
@@ -106,8 +112,7 @@ def silent_ok(code: str) -> bool:
     if re.search(r"LLAMA_LOG_|GGML_LOG_|fprintf|printf\(", prep):
         return False
     sel = function_body(code, _SELECT)
-    stripped = code_of(CTX_CPP) if code is None else code
-    return all(stripped.count(z(lit)) == 1 and z(lit) in sel for lit in _SYCL_PLAN_LITERALS)
+    return all(code.count(z(lit)) == 1 and z(lit) in sel for lit in _SYCL_PLAN_LITERALS)
 
 
 def exits_ok(code: str) -> bool:
@@ -156,6 +161,30 @@ def lookup_after_exits_ok(code: str) -> bool:
     return re.search(r"\bmemory\b", prep) is None
 
 
+# `cache_devices` is written by the hoisted block and read by nobody in the ladder half: the cache key points into it
+_PREP_KEEPALIVE = {"cache_devices"}
+
+
+def prep_members_ok(code: str, header: str) -> bool:
+    """Every member the hoisted block stores is read by the ladder half (bar the one the key points into), the struct
+    declares no member the block never stores, and it is not copyable: the key points into its own cache_devices."""
+    prep = function_body(code, _PREPARE)
+    sel = function_body(code, _SELECT)
+    written = set(re.findall(r"prep->(\w+)", prep))
+    read = set(re.findall(r"prep\.(\w+)", sel))
+    if written - read != _PREP_KEEPALIVE or read - written:
+        return False
+    # `header` is code_of(llama-context.h); the struct runs to the unique_ptr member declared right after it
+    struct = header[header.index(z("struct sycl_auto_ubatch_prep {")) :]
+    body = struct[: struct.index(z("std::unique_ptr<sycl_auto_ubatch_prep> auto_ubatch_prep;"))]
+    if re.search(r"\bcache_(path|lookup)_fn\b", body):
+        return False
+    return (
+        z("sycl_auto_ubatch_prep(const sycl_auto_ubatch_prep &) = delete;") in body
+        and z("sycl_auto_ubatch_prep & operator=(const sycl_auto_ubatch_prep &) = delete;") in body
+    )
+
+
 def stored_once_ok(code: str) -> bool:
     prep = function_body(code, _PREPARE)
     store = z("auto_ubatch_prep = std::move(prep);")
@@ -188,6 +217,10 @@ def test_the_lookup_is_after_every_single_reserve_exit():
     assert lookup_after_exits_ok(code_of(CTX_CPP))
 
 
+def test_the_prep_has_no_dead_member_and_is_not_copyable():
+    assert prep_members_ok(code_of(CTX_CPP), code_of(CTX_H))
+
+
 def test_the_prep_is_stored_once_last():
     assert stored_once_ok(code_of(CTX_CPP))
 
@@ -211,8 +244,8 @@ def test_mutants():
     assert not order_ok(with_ctor(mutate(ctor, "if (sycl_auto_ubatch_trial) { sycl_auto_ubatch_prepare(params.type_k, params.type_v); }", "sycl_auto_ubatch_prepare(params.type_k, params.type_v);"))), \
         "mutant 'the block runs when the trial does not' slipped through"
     late = mutate(ctor, "if (sycl_auto_ubatch_trial) { sycl_auto_ubatch_prepare(params.type_k, params.type_v); }", "")
-    late = late.replace(z("if (sycl_auto_ubatch_trial) { sycl_select_auto_ubatch("),
-                        z("if (sycl_auto_ubatch_trial) { sycl_auto_ubatch_prepare(params.type_k, params.type_v); sycl_select_auto_ubatch("), 1)
+    late = late.replace(z("if (sycl_auto_ubatch_trial) { sycl_select_auto_ubatch();"),
+                        z("if (sycl_auto_ubatch_trial) { sycl_auto_ubatch_prepare(params.type_k, params.type_v); sycl_select_auto_ubatch();"), 1)
     assert not order_ok(with_ctor(late)), "mutant 'the block runs after the memory module' slipped through"
     assert not order_ok(with_ctor(mutate(ctor, "auto_ubatch_prep.reset();", ""))), "mutant 'the prep is kept' slipped through"
 
@@ -267,3 +300,21 @@ def test_mutants():
         "mutant 'the no-backend exit moved after the lookup' slipped through"
     assert not lookup_after_exits_ok(with_prep(mutate(prep, "const bool cache_available = ", "const bool cache_available = memory != nullptr && "))), \
         "mutant 'the hoisted block reads the memory module' slipped through"
+
+    # the floor is read once, from the prep
+    assert not ownership_ok(with_sel(sel.replace(z("const uint32_t fallback_ubatch = prep.fallback_ubatch;"),
+                                                 z("const uint32_t fallback_ubatch = cparams.n_ubatch;"), 1))), \
+        "mutant 'the ladder re-reads cparams.n_ubatch' slipped through"
+
+    # no dead member, no copy
+    header = code_of(CTX_H)
+    assert not prep_members_ok(with_prep(mutate(prep, "prep->cap = cap;", "prep->cap = cap; prep->cache_lookup_fn = cache_lookup_fn;")), header), \
+        "mutant 'a member the ladder never reads is stored' slipped through"
+    assert not prep_members_ok(code, header.replace(
+        z("sycl_auto_ubatch_prep(const sycl_auto_ubatch_prep &) = delete;"), "", 1)), \
+        "mutant 'the prep is copy-constructible' slipped through"
+    assert not prep_members_ok(code, header.replace(
+        z("sycl_auto_ubatch_prep & operator=(const sycl_auto_ubatch_prep &) = delete;"), "", 1)), \
+        "mutant 'the prep is copy-assignable' slipped through"
+    assert not prep_members_ok(code, header.replace(z("cache_store_fn = nullptr;"), z("cache_store_fn = nullptr; void * cache_lookup_fn = nullptr;"), 1)), \
+        "mutant 'the prep declares the dead lookup member again' slipped through"

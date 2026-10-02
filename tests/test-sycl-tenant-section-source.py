@@ -238,7 +238,7 @@ def test_the_cohort_ids_are_pinned_and_append_only():
 # --- the host tier's HOLD: one source for R_h, folded over the rung set ----------------------------------------
 
 _HOLD_FOLD = "void llama_context::tenant_host_hold_measure_and_fold(const std::vector<ggml_sycl_context_tenant_desc> & current)"
-_SELECT = "void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v)"
+_SELECT = "void llama_context::sycl_select_auto_ubatch()"
 # llama.cpp-7gno: the rung set is made, and handed to the hold, by the trial's hoisted block, which the constructor runs
 # before the memory module exists; the ladder half only reads it.
 _PREPARE = "void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)"

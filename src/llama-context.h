@@ -509,13 +509,11 @@ private:
     // largest candidate whose compute buffers land fully on-device (no
     // host-pinned fallback). See its definition in llama-context.cpp (right
     // before sched_reserve()) for the loop and its exact stop-reason
-    // vocabulary. `type_k`/`type_v` are the constructor's own
-    // llama_context_params fields, passed in because they are constructor
-    // locals this member function cannot otherwise see -- they feed the
-    // persisted tuning-cache key (llama.cpp-7n6n): the KV element type
-    // drives would_demote_kv, so a shape change there can change which
-    // candidates fit without changing anything else the key tracks.
-    void sycl_select_auto_ubatch(enum ggml_type type_k, enum ggml_type type_v);
+    // vocabulary. It reads what sycl_auto_ubatch_prepare() stored; the KV
+    // element types (the constructor's own llama_context_params fields) feed
+    // the persisted tuning-cache key (llama.cpp-7n6n) there, so a shape change
+    // in them is a different key, not an argument of this function.
+    void sycl_select_auto_ubatch();
 
     // llama.cpp-7gno: what the trial decides before the memory module exists, so the planned ladder's rung set is known
     // when the constructor's residency fixpoint runs. sycl_auto_ubatch_prepare() makes every decision the trial's
@@ -527,23 +525,29 @@ private:
         int            dev_index;
     };
     struct sycl_auto_ubatch_prep {
+        // The key below points into cache_devices, so the struct is copied and moved nowhere: it lives behind a
+        // unique_ptr, and the deleted copy operations leave no implicit move either.
+        sycl_auto_ubatch_prep()                                          = default;
+        sycl_auto_ubatch_prep(const sycl_auto_ubatch_prep &)             = delete;
+        sycl_auto_ubatch_prep & operator=(const sycl_auto_ubatch_prep &) = delete;
+
         std::vector<sycl_auto_ubatch_probe_backend> backends;
 
         decltype(&ggml_backend_sycl_probe_runtime_context_for_model) probe_fn      = nullptr;
         decltype(&ggml_backend_sycl_compute_buffer_host_fallbacks)   fallback_fn   = nullptr;
         decltype(&ggml_backend_sycl_planned_hold_spill_fits)         hold_spill_fn = nullptr;
 
-        decltype(&ggml_backend_sycl_ubatch_cache_enabled)        cache_enabled_fn = nullptr;
-        decltype(&ggml_backend_sycl_ubatch_cache_path)           cache_path_fn    = nullptr;
-        decltype(&ggml_backend_sycl_ubatch_cache_lookup_layout1) cache_lookup_fn  = nullptr;
-        decltype(&ggml_backend_sycl_ubatch_cache_store_layout1)  cache_store_fn   = nullptr;
+        // only what the ladder half uses: the lookup and the path are the hoisted block's alone
+        decltype(&ggml_backend_sycl_ubatch_cache_enabled)       cache_enabled_fn     = nullptr;
+        decltype(&ggml_backend_sycl_ubatch_cache_store_layout1) cache_store_fn       = nullptr;
         bool have_cache_accessors = false;
         bool cache_available      = false;
 
-        uint32_t cap       = 0;
-        bool     moe_bound = false;
+        uint32_t cap             = 0;
+        bool     moe_bound       = false;
+        uint32_t fallback_ubatch = 0;  // cparams.n_ubatch when the block ran: the rung set's floor, and the default
 
-        // The key points into cache_devices, so the struct is never copied: it lives behind a unique_ptr.
+        // The key points into cache_devices.
         std::vector<int>           cache_devices;
         ggml_sycl_ubatch_cache_key cache_key{};
         char                       cache_path_buf[512] = { 0 };
@@ -554,6 +558,9 @@ private:
         std::vector<uint32_t> rung_ladder;  // the rung set's ladder members, ascending
     };
     std::unique_ptr<sycl_auto_ubatch_prep> auto_ubatch_prep;
+    // `type_k`/`type_v` are the constructor's own llama_context_params fields, passed in because they are constructor
+    // locals this member function cannot otherwise see: they feed the tuning-cache key (the KV element type drives
+    // would_demote_kv, so a shape change there can change which candidates fit).
     void sycl_auto_ubatch_prepare(enum ggml_type type_k, enum ggml_type type_v);
 
     // llama.cpp-kpjw: the n_ubatch whose compute buffers the auto-ubatch trial already passed the realized hold-spill

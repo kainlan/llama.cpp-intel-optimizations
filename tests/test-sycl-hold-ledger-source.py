@@ -144,7 +144,7 @@ def claim_pinned_ub_refreshes_epoch_before_reserve(ctx: str) -> bool:
     c = norm(ctx)
     m = re.search(
         r"if \(llama_context_has_sycl_backend\(backends\)\) \{ llama_context_sycl_hold_epoch_refresh\(backends\); \} "
-        r"#endif if \(sycl_auto_ubatch_trial\) \{ sycl_select_auto_ubatch\(params\.type_k, params\.type_v\); \} "
+        r"#endif if \(sycl_auto_ubatch_trial\) \{ sycl_select_auto_ubatch\(\); \} "
         r"else \{ sched_reserve\(\); \}",
         c,
     )
@@ -503,8 +503,8 @@ def test_mutant_pinned_ub_refreshes_after_reserve_fails_the_claim():
     moved = _once(CTX, "            llama_context_sycl_hold_epoch_refresh(backends);\n", "")
     moved = _once(
         moved,
-        "        if (sycl_auto_ubatch_trial) {\n            sycl_select_auto_ubatch(params.type_k, params.type_v);\n        } else {\n            sched_reserve();\n        }\n",
-        "        if (sycl_auto_ubatch_trial) {\n            sycl_select_auto_ubatch(params.type_k, params.type_v);\n        } else {\n            sched_reserve();\n            llama_context_sycl_hold_epoch_refresh(backends);\n        }\n",
+        "        if (sycl_auto_ubatch_trial) {\n            sycl_select_auto_ubatch();\n        } else {\n            sched_reserve();\n        }\n",
+        "        if (sycl_auto_ubatch_trial) {\n            sycl_select_auto_ubatch();\n        } else {\n            sched_reserve();\n            llama_context_sycl_hold_epoch_refresh(backends);\n        }\n",
     )
     assert not claim_pinned_ub_refreshes_epoch_before_reserve(moved)
 

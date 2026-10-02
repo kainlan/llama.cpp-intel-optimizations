@@ -815,6 +815,9 @@ struct llama_context_sycl_plan_caps_procs {
 // residency probe, which L4 does not define yet. Until that probe is looked up here, and this flag flips with it, no
 // context is planned whatever the backend exports, so the three procs landing cannot turn the legacy publish path
 // into a construction failure.
+// This flag is an interim latch, not a second source of truth: the eventual single source of "the probe is wired" is
+// the probe proc's presence in llama_sycl_l4_procs::available(). llama.cpp-hdpd names the proc, adds it to available()
+// and deletes this constant in the same commit (llama_context_l4_ready then asks the proc, not the constant).
 static constexpr bool llama_context_residency_probe_wired = false;
 
 [[maybe_unused]] static bool llama_context_l4_ready(const std::vector<ggml_backend_ptr> & backends) {
@@ -1568,10 +1571,14 @@ llama_context::llama_context(
         // (llama_context_l4_ready): every context stays unplanned and takes the legacy publish path. The copy is
         // acquired straight into the member, so a fixpoint refusal frees it while the constructor unwinds.
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-        const llama_context_sycl_plan_caps_procs plan_procs    = llama_context_sycl_plan_caps_procs_for(backends);
-        const llama_plan_caps_decision           plan_decision = llama_plan_caps_decide(
-            llama_context_has_sycl_backend(backends), plan_procs.plan_active, plan_procs.caps_new != nullptr,
-            plan_procs.caps_free != nullptr, llama_context_l4_ready(backends));
+        // The proc lookups are made only once L4 is ready: decide() answers UNPLANNED before it reads them otherwise, so
+        // until then a SYCL context pays for none of them.
+        const bool                               plan_l4_ready = llama_context_l4_ready(backends);
+        const llama_context_sycl_plan_caps_procs plan_procs =
+            plan_l4_ready ? llama_context_sycl_plan_caps_procs_for(backends) : llama_context_sycl_plan_caps_procs{};
+        const llama_plan_caps_decision plan_decision =
+            llama_plan_caps_decide(llama_context_has_sycl_backend(backends), plan_procs.plan_active,
+                                   plan_procs.caps_new != nullptr, plan_procs.caps_free != nullptr, plan_l4_ready);
         if (plan_decision == LLAMA_PLAN_CAPS_REFUSE_NO_PROCS) {
             throw std::runtime_error(llama_plan_caps_missing_procs_reason());
         }
@@ -1628,7 +1635,7 @@ llama_context::llama_context(
         }
 #endif
         if (sycl_auto_ubatch_trial) {
-            sycl_select_auto_ubatch(params.type_k, params.type_v);
+            sycl_select_auto_ubatch();
         } else {
             sched_reserve();
         }
@@ -2181,12 +2188,11 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     prep->fallback_fn         = fallback_fn;
     prep->hold_spill_fn       = hold_spill_fn;
     prep->cache_enabled_fn    = cache_enabled_fn;
-    prep->cache_path_fn       = cache_path_fn;
-    prep->cache_lookup_fn     = cache_lookup_fn;
     prep->cache_store_fn      = cache_store_fn;
     prep->have_cache_accessors = have_cache_accessors;
     prep->cache_available     = cache_available;
     prep->cap                 = cap;
+    prep->fallback_ubatch      = fallback_ubatch;
     prep->moe_bound           = moe_bound;
     prep->cached_ubatch       = cached_ubatch;
     std::memcpy(prep->cached_reason_buf, cached_reason_buf, sizeof(prep->cached_reason_buf));
@@ -2262,13 +2268,9 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 // validation a ladder rung uses, so the ladder never ran). Candidate refusals
 // inside the probe itself log at GGML_LOG_INFO, not ERROR (Task 2), so a
 // multi-candidate trial does not print one scary refusal per losing candidate.
-void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) {
+void llama_context::sycl_select_auto_ubatch() {
     sycl_hold_spill_validated_ub = 0;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-    // The KV types feed the tuning-cache key, which the hoisted block builds now.
-    GGML_UNUSED(type_k);
-    GGML_UNUSED(type_v);
-
     // llama.cpp-7gno: the decisions below the SYCL backend enumeration (the procs, the cap, the cache lookup and the
     // rung set) were made by the constructor's hoisted block (sycl_auto_ubatch_prepare); an empty prep is the
     // single-reserve exit every one of them used to take here.
@@ -2293,9 +2295,9 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     const auto & owner = model.get_sycl_model_token();
     const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot, owner.slot_generation };
 
-    // Already clamped to n_batch by the constructor's own
-    // `cparams.n_ubatch = std::min(cparams.n_batch, ...)` assignment, above.
-    const uint32_t fallback_ubatch         = cparams.n_ubatch;
+    // The floor the hoisted block built the rung set over, read back: one source for it, not a second read of
+    // cparams.n_ubatch after the residency fixpoint's measures have run.
+    const uint32_t fallback_ubatch         = prep.fallback_ubatch;
     uint32_t       last_good               = 0;
     uint32_t       hold_spill_validated_ub = 0;  // the rung try_candidate last passed the realized hold-spill check for
     uint32_t       lowered_from            = 0;  // the default the downward continuation lowered from (0: it did not)
@@ -2883,11 +2885,6 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // reader to infer it.
     LLAMA_LOG_INFO("%s: n_ubatch = %u (auto, was %u)\n", __func__, cparams.n_ubatch, fallback_ubatch);
 #else
-    // type_k/type_v only feed the persisted tuning-cache key inside the
-    // #if branch above; a build with neither GGML_USE_SYCL nor
-    // GGML_BACKEND_DL defined never reaches that code, so they go unused.
-    (void) type_k;
-    (void) type_v;
     sched_reserve();
 #endif
 }

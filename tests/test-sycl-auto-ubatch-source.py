@@ -143,7 +143,7 @@ _CALL_SITE_START = "bool sycl_auto_ubatch_trial = false;"
 _CALL_SITE_END = "if (!cparams.flash_attn) {"
 # llama.cpp-7n6n (quality round 1, Q4): the signature grew two parameters
 # (type_k/type_v, forwarded from the constructor's own llama_context_params
-# -- see test_sycl_select_auto_ubatch_takes_type_k_and_type_v below) --
+# -- see test_the_hoisted_block_takes_type_k_and_type_v below) --
 # updated here since every other check in this file depends on this exact
 # string via _trial_body().
 # llama.cpp-7gno: the trial is two functions now. The hoisted block (sycl_auto_ubatch_prepare: the SYCL backends and
@@ -235,14 +235,13 @@ def test_call_site_gates_on_all_four_conditions():
 
     # And the trial itself must only run when sycl_auto_ubatch_trial ends up
     # true; otherwise today's single sched_reserve() call is unchanged.
-    # quality round 1, Q4: the call now forwards params.type_k/type_v (see
-    # test_sycl_select_auto_ubatch_takes_type_k_and_type_v).
+    # quality round 1, Q4 / llama.cpp-7gno: the KV types reach the cache key through the hoisted block's call (see
+    # test_the_hoisted_block_takes_type_k_and_type_v); the ladder half takes no arguments.
     assert re.search(
-        r"if\s*\(\s*sycl_auto_ubatch_trial\s*\)\s*\{\s*sycl_select_auto_ubatch\s*\(\s*params\.type_k\s*,\s*"
-        r"params\.type_v\s*\)\s*;",
+        r"if\s*\(\s*sycl_auto_ubatch_trial\s*\)\s*\{\s*sycl_select_auto_ubatch\s*\(\s*\)\s*;",
         body_norm,
     ), (
-        "the call site must call sycl_select_auto_ubatch(params.type_k, params.type_v) only when "
+        "the call site must call sycl_select_auto_ubatch() only when "
         "sycl_auto_ubatch_trial is true"
     )
     assert re.search(r"\}\s*else\s*\{\s*sched_reserve\s*\(\s*\)\s*;\s*\}", body_norm), (
@@ -1921,19 +1920,25 @@ def test_ubatch_cache_store_ladder_needed_gate_has_a_mutation_witness():
 # ---------------------------------------------------------------------------
 
 
-def test_sycl_select_auto_ubatch_takes_type_k_and_type_v():
-    """quality round 1, Q4: type_k/type_v are constructor-local
-    llama_context_params fields sycl_select_auto_ubatch() cannot otherwise
-    see (it is a separate member function, not inline in the constructor),
-    so they are passed in as parameters and forwarded from the one call
-    site."""
+def test_the_hoisted_block_takes_type_k_and_type_v():
+    """quality round 1, Q4 / llama.cpp-7gno: type_k/type_v are constructor-local llama_context_params fields that the
+    tuning-cache key needs, and the key is built by the hoisted block (a separate member function), so they are passed
+    in as parameters and forwarded from the one call site. The ladder half reads the key from the prep and takes no
+    parameters: a dead one would hide a second source of the key."""
     assert re.search(
-        r"void\s+llama_context::sycl_select_auto_ubatch\s*\(\s*ggml_type\s+type_k\s*,\s*ggml_type\s+type_v\s*\)\s*\{",
+        r"void\s+llama_context::sycl_auto_ubatch_prepare\s*\(\s*ggml_type\s+type_k\s*,\s*ggml_type\s+type_v\s*\)\s*\{",
         LLAMA_CONTEXT_CPP_CODE,
-    ), "sycl_select_auto_ubatch must take (ggml_type type_k, ggml_type type_v)"
+    ), "sycl_auto_ubatch_prepare must take (ggml_type type_k, ggml_type type_v)"
     assert re.search(
-        r"sycl_select_auto_ubatch\s*\(\s*params\.type_k\s*,\s*params\.type_v\s*\)\s*;", LLAMA_CONTEXT_CPP_CODE
+        r"sycl_auto_ubatch_prepare\s*\(\s*params\.type_k\s*,\s*params\.type_v\s*\)\s*;", LLAMA_CONTEXT_CPP_CODE
     ), "the call site must forward params.type_k, params.type_v"
+    assert re.search(r"void\s+llama_context::sycl_select_auto_ubatch\s*\(\s*\)\s*\{", LLAMA_CONTEXT_CPP_CODE), (
+        "sycl_select_auto_ubatch must take no parameters"
+    )
+    assert re.search(r"sycl_select_auto_ubatch\s*\(\s*\)\s*;", LLAMA_CONTEXT_CPP_CODE)
+    select = LLAMA_CONTEXT_CPP_CODE[LLAMA_CONTEXT_CPP_CODE.index("void llama_context::sycl_select_auto_ubatch()"):]
+    select = select[: select.index("static int llama_graph_n_input_tensors")]
+    assert not re.search(r"\btype_[kv]\b", select), "the ladder half must not mention type_k/type_v"
 
 
 def test_cache_key_populates_the_four_new_fields():

@@ -974,7 +974,7 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
         0 <= try_fn.find("release_rung_buffers();") < probe_at
     # r4 I1: the realized check also runs after a reserve the ladder did not make (a pinned -ub, a ladder that never
     # ran), by name, with the largest -ub that fits; and it runs after the WHOLE trial/else block.
-    trial_at = context.find("sycl_select_auto_ubatch(params.type_k, params.type_v);")
+    trial_at = context.find("sycl_select_auto_ubatch();")
     else_reserve_at = context.find("sched_reserve();", trial_at)
     call_at = context.find("llama_context_sycl_hold_spill_fits(backends", trial_at)
     guard_at = context.find("quantized V cache was requested", trial_at)

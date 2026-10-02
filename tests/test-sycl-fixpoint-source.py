@@ -42,7 +42,14 @@ _L4_READY = "static bool llama_context_l4_ready(const std::vector<ggml_backend_p
 
 _DECIDE = (
     "llama_plan_caps_decide(llama_context_has_sycl_backend(backends), plan_procs.plan_active, "
-    "plan_procs.caps_new != nullptr, plan_procs.caps_free != nullptr, llama_context_l4_ready(backends));"
+    "plan_procs.caps_new != nullptr, plan_procs.caps_free != nullptr, plan_l4_ready);"
+)
+# the proc lookups run only once L4 is ready: until then decide() answers UNPLANNED before it reads them, so a SYCL
+# context pays for none of them
+_L4_FIRST = "const bool plan_l4_ready = llama_context_l4_ready(backends);"
+_LAZY_PROCS = (
+    "const llama_context_sycl_plan_caps_procs plan_procs = "
+    "plan_l4_ready ? llama_context_sycl_plan_caps_procs_for(backends) : llama_context_sycl_plan_caps_procs{};"
 )
 _ACQUIRE = "plan_caps = llama_plan_caps_ptr(plan_procs.caps_new(), llama_plan_caps_deleter{ plan_procs.caps_free });"
 
@@ -87,7 +94,12 @@ def order_ok(code: str) -> bool:
 
 def decision_ok(code: str) -> bool:
     ctor = ctor_text(code)
-    return ctor.count(z("llama_plan_caps_decide(")) == 1 and z("plan_decision = " + _DECIDE) in ctor
+    return (
+        ctor.count(z("llama_plan_caps_decide(")) == 1
+        and z("plan_decision = " + _DECIDE) in ctor
+        and ctor.count(z("llama_context_sycl_plan_caps_procs_for(")) == 1
+        and z(_L4_FIRST + " " + _LAZY_PROCS) in ctor
+    )
 
 
 def refusal_ok(code: str) -> bool:
@@ -183,8 +195,14 @@ def test_mutants():
     # the decision
     assert not decision_ok(with_ctor(mutate(ctor, "plan_procs.plan_active,", "true,"))), \
         "mutant 'the plan predicate is a constant' slipped through"
-    assert not decision_ok(with_ctor(mutate(ctor, "llama_context_l4_ready(backends));", "true);"))), \
+    assert not decision_ok(with_ctor(mutate(ctor, "plan_procs.caps_free != nullptr, plan_l4_ready);",
+                                            "plan_procs.caps_free != nullptr, true);"))), \
         "mutant 'L4 readiness is a constant' slipped through"
+    assert not decision_ok(with_ctor(mutate(ctor, "plan_l4_ready ? llama_context_sycl_plan_caps_procs_for(backends) :",
+                                            "llama_context_sycl_plan_caps_procs_for(backends); true ? llama_context_sycl_plan_caps_procs_for(backends) :"))), \
+        "mutant 'the procs are looked up before L4 is known ready' slipped through"
+    assert not decision_ok(with_ctor(mutate(ctor, _L4_FIRST, "const bool plan_l4_ready = true;"))), \
+        "mutant 'readiness is not asked of llama_context_l4_ready' slipped through"
     assert not decision_ok(with_ctor(mutate(ctor, "plan_procs.caps_new != nullptr,", "true,"))), \
         "mutant 'the new proc is not consulted' slipped through"
 

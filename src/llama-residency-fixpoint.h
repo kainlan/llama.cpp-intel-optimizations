@@ -9,9 +9,8 @@
 //                                host test passes stubs.
 //
 // Both are production-unreachable: the constructor reaches the decision's ACQUIRE arm only when the
-// residency probe is wired (llama.cpp-7gno), and the probe is moua's tenant-aware L4 probe, which does
-// not exist yet. The fixpoint is the pure iteration; the constructor passes the backend's probe and
-// measure, a host test passes stubs.
+// residency probe is wired (llama.cpp-hdpd), and the probe is moua's tenant-aware L4 probe, which does
+// not exist yet.
 
 #include "ggml-sycl-cohort.h"
 #include "ggml-sycl.h"
@@ -39,10 +38,15 @@ inline const char * llama_plan_caps_missing_procs_reason() {
 //   otherwise                                                          -> REFUSE_NO_PROCS
 //
 // The L4 test comes first on purpose: while any of the three L4 procs is null the cap procs are never
-// consulted, so a backend that predates L4 keeps its legacy publish path whatever it exports. The
-// refusal becomes reachable when moua L4 step 3 lands; no code change needed here. (The caller's
-// `l4_available` is also false until the residency probe is wired, so the landing of the three procs
-// alone changes nothing: see llama_context_l4_ready in llama-context.cpp.)
+// consulted, so a backend that predates L4 keeps its legacy publish path whatever it exports. That
+// is a deliberate narrowing of design 2.4's "under an active plan a missing _new/_free is the named
+// refusal": the refusal is reachable only once L4 is. The L4 test comes off when the latch does.
+//
+// The refusal does NOT become reachable when moua's L4 step 3 lands by itself: the caller's
+// `l4_available` is also false until the residency probe is wired (llama_context_l4_ready in
+// llama-context.cpp, behind the interim latch llama_context_residency_probe_wired). Reaching it takes
+// one more edit, llama.cpp-hdpd's: name the probe proc, add it to llama_sycl_l4_procs::available() and
+// delete the latch together.
 inline llama_plan_caps_decision llama_plan_caps_decide(bool has_sycl_backend,
                                                        bool plan_active,
                                                        bool new_present,
@@ -82,12 +86,20 @@ struct llama_residency_fixpoint_result {
 //   verify: R_v := probe(T*) without the union; when R_v is strictly smaller than R*, measure over R_v
 //           and take (R_v, T_v) iff the probe over T_v keeps R_v
 //
+// The verify asks the probe the question the last round already answered (the same T*), on purpose: it
+// is the design's independent check, and its BUG arm (a verify answer holding a host layer R* does not)
+// can fire only when the probe is not deterministic over equal tenants -- the one contract the whole
+// iteration rests on. It costs one more probe per planned context construction.
+//
 //   probe(tenants)         the residency the backend would give with those tenants (nullptr: none)
 //   measure(R, tenants)    the tenant section measured over memory created with residency R;
 //                          false when the measure cannot be made
 //
 // The union makes R grow by at least one layer per round or stop, so n_layer + 1 rounds always
-// suffice. A verify answer that holds a host layer R* does not contradicts that, and is a BUG.
+// suffice: R0 may be empty, n_layer rounds then grow it to every layer, and one more sees it stop. A loop
+// that ends without stopping contradicts that, as does a verify answer holding a host layer R* does not;
+// both are a BUG, never a fit verdict. (The first cannot happen with a probe that answers a residency of
+// n_layer bytes, which is checked, so the BUG arm is a guard on the loop's own invariant.)
 template <typename Probe, typename Measure>
 llama_residency_fixpoint_result llama_residency_fixpoint(size_t n_layer, Probe probe, Measure measure) {
     llama_residency_fixpoint_result out;
@@ -109,7 +121,8 @@ llama_residency_fixpoint_result llama_residency_fixpoint(size_t n_layer, Probe p
     }
 
     llama_tenants tenants;
-    for (size_t round = 0; round <= n_layer + 1; round++) {
+    bool          converged = false;
+    for (size_t round = 0; round < n_layer + 1; round++) {
         if (!measure(residency, tenants)) {
             return measure_failed();
         }
@@ -124,9 +137,13 @@ llama_residency_fixpoint_result llama_residency_fixpoint(size_t n_layer, Probe p
             next[i] = next[i] || answer[i];
         }
         if (next == residency) {
+            converged = true;
             break;
         }
         residency = next;
+    }
+    if (!converged) {
+        return bug("the residency iteration did not stop within n_layer + 1 rounds");
     }
 
     // the verify: the probe over T* without the union
