@@ -612,12 +612,12 @@ def gate31(files, bad):
     if not re.search(r"ggml_sycl_replan_token\s+l0\(GGML_SYCL_REPLAN_KIND_LOAD\);\s*ggml_sycl_load_end_body_witness\s+\w+\s*;", lt):
         bad("gate 31: load_end does not construct its overlap witness right after the LOAD token")
     # The preload's check is held(LOAD), not weakened to any kind.
-    m = re.search(r"GGML_SYCL_WITNESS\(\s*(ggml_sycl_replan_token_held\([^)]*\))\s*,\s*\"\[REPLAN-TOKEN\] preload without a LOAD token\"",
+    m = re.search(r"GGML_SYCL_WITNESS\(\s*((?:ggml_sycl::)?ggml_sycl_replan_token_held\([^)]*\))\s*,\s*\"\[REPLAN-TOKEN\] preload without a LOAD token\"",
                   kk)
     if not m or "GGML_SYCL_REPLAN_KIND_LOAD" not in m.group(1):
         bad("gate 31: the preload's witness is not held(LOAD) with its literal message")
     # The graph-compute check is held(), any kind.
-    gm = re.search(r"GGML_SYCL_WITNESS\(\s*!ggml_sycl_replan_token_held\(\s*\)\s*,\s*\"\[REPLAN-TOKEN\] token held in graph compute\"", kk)
+    gm = re.search(r"GGML_SYCL_WITNESS\(\s*!(?:ggml_sycl::)?ggml_sycl_replan_token_held\(\s*\)\s*,\s*\"\[REPLAN-TOKEN\] token held in graph compute\"", kk)
     if not gm:
         bad("gate 31: the graph-compute witness is not `!held()` (any kind)")
 
@@ -1244,15 +1244,15 @@ def mutants(files):
                 "void ggml_backend_sycl_rollback_reactivate(void) {\n    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LOAD);", "g31d"),
            "constructs a LOAD token")
     yield ("a witness rewritten as assert",
-           edit(files, M, "GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(), \"[REPLAN-TOKEN] token held in graph compute\");",
-                "assert(!ggml_sycl_replan_token_held() && \"[REPLAN-TOKEN] token held in graph compute\");", "g31e"),
+           edit(files, M, "GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(), \"[REPLAN-TOKEN] token held in graph compute\");",
+                "assert(!ggml_sycl::ggml_sycl_replan_token_held() && \"[REPLAN-TOKEN] token held in graph compute\");", "g31e"),
            "is not a GGML_SYCL_WITNESS")
     yield ("a witness message changed",
            edit(files, M, "\"[REPLAN-TOKEN] token held in graph compute\"", "\"[REPLAN-TOKEN] held in graph compute\"", "g31f"),
            "witness message")
     yield ("the preload witness weakened to any kind",
-           edit(files, M, "GGML_SYCL_WITNESS(ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_LOAD),",
-                "GGML_SYCL_WITNESS(ggml_sycl_replan_token_held(),", "g31g"),
+           edit(files, M, "GGML_SYCL_WITNESS(ggml_sycl::ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_LOAD),",
+                "GGML_SYCL_WITNESS(ggml_sycl::ggml_sycl_replan_token_held(),", "g31g"),
            "preload's witness is not held(LOAD)")
     yield ("the load_end overlap witness removed",
            edit(files, M, "GGML_SYCL_WITNESS(running == 0, \"[REPLAN-TOKEN] two load_end bodies overlapped\");", "", "g31j"),
