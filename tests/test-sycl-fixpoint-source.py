@@ -240,3 +240,11 @@ def test_mutants():
         "mutant 'a measure-only context takes the planned decision' slipped through"
     assert not guarded_ok(with_ctor(mutate(ctor, opens, "bool sycl_auto_ubatch_trial = false; if (!measure_only)"))), \
         "mutant 'the planned decision is not skipped for a vocab-only context' slipped through"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

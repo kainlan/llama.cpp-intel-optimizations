@@ -684,3 +684,11 @@ def test_clean_helper_is_not_flagged():
                 'static void llama_gate_helper2() { LLAMA_LOG_INFO("x\\n"); }\n\nllama_context::llama_context(\n        const llama_model & model,\n              llama_context_params params) :',
                 src=src2)
     assert not _fails(src2), "a helper called only from a guarded block must pass"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -446,3 +446,11 @@ def test_comment_backoff_mutants():
     assert not comments_say_no_backoff(SYCL_CPP + "\n// via the caller's own retry loop a BUSY backoff\n")
     assert not comments_say_no_backoff(CONTEXT_CPP + "\n// the probe retries with a bounded exponential BUSY backoff\n")
     assert not comments_say_no_backoff(CONTEXT_CPP + "\n/* the full transaction's own Backoff */\n")
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

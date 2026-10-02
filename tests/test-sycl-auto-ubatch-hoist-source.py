@@ -338,3 +338,11 @@ def test_mutants():
         with_prep(mutate(prep, "prep->cap = cap;", "prep->cap = cap; prep->dead_member = true;")),
         header.replace(z("cache_store_fn = nullptr;"), z("cache_store_fn = nullptr; bool dead_member = false;"), 1),
     ), "mutant 'a member is stored and never read' slipped through"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

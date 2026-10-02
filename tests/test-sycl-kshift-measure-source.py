@@ -259,3 +259,11 @@ def test_the_graph_builder_is_reachable_from_the_context():
     private = h.index("private:", public)
     assert "ggml_cgraph * build_graph_shift(" in h[public:private]
     assert z("ggml_cgraph * graph_reserve_shift(sched_reserve_state & state, const llama_kv_cache * kv, size_t * sizes);") in code_of(CONTEXT_H)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

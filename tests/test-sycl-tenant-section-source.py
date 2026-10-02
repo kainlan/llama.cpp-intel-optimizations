@@ -390,3 +390,11 @@ def test_hold_mutants():
     sel = function_body(code, _SELECT)
     assert not hold_select_ok(code.replace(sel, sel.replace(z("sycl_hold_spill_validated_ub=0;"), z("sycl_hold_spill_validated_ub=0;" + assign), 1), 1)), \
         "mutant 'the ladder half writes the hold's set' slipped through"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -209,3 +209,11 @@ def test_measure_cover_mutants():
     ):
         assert old in code, old
         assert not measure_covers_ok(code.replace(old, "", 1)), f"mutant 'measure drops {old}' slipped through"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

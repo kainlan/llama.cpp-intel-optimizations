@@ -468,3 +468,11 @@ def test_the_measure_asks_the_unsupported_question_before_any_backend():
     b = function_body(code, _MEASURE)
     moved = mutate(b, "if (const std::string why = llama_measure_unsupported_reason(model); !why.empty()) {", "if (false) {")
     assert not measure_ok(code.replace(b, moved, 1))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

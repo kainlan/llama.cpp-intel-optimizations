@@ -413,3 +413,11 @@ def test_call_site_mutants():
         # a second reserve call
         doubled = b.replace(_CALL_SITE, _CALL_SITE + z("sched_reserve();"), 1)
         assert not call_sites_ok(code.replace(b, doubled, 1)), anchor_sig
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

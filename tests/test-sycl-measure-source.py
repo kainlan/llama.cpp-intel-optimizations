@@ -563,3 +563,11 @@ def test_transaction_mutants():
     # ALLOC dropped from the transaction
     no_alloc = b.replace(z("sched_reserve_state state = member_reserve_state(); fused_resolution resolution; state.resolution = &resolution; return sched_reserve_impl(sched_reserve_mode::ALLOC, state); }"), "return {}; }", 1)
     assert not txn_ok(code.replace(b, no_alloc, 1)), "mutant 'ALLOC dropped' slipped through"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

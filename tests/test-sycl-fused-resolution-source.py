@@ -342,3 +342,11 @@ def test_marks_mutants():
     moved = CONTEXT_H.replace("std::string fused_resolution_printed[FUSED_RESOLUTION_N_ENTRIES];", "", 1)
     moved = "std::string fused_resolution_printed[FUSED_RESOLUTION_N_ENTRIES];\n" + moved
     assert not marks_ok(moved), "mutant 'the marks outside the context' slipped through"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

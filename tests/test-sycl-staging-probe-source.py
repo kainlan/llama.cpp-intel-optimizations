@@ -13,7 +13,6 @@ their call sites is pinned to a bounded step, so a new waiting helper under any 
 definition unless it is defined inside a bounded block; that remaining case is the one this gate does not close.
 """
 import re
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -256,20 +255,9 @@ def test_each_pin_catches_its_mutant() -> None:
         assert violations(mutated), "mutant not caught: " + name
 
 
-def main() -> int:
-    text = PROBE.read_text(encoding="utf-8")
-    found = violations(text)
-    for v in found:
-        print("FAIL:", v)
-    mutants = mutants_of(text)
-    for name, mutated in mutants.items():
-        if mutated == text or not violations(mutated):
-            print("FAIL: mutant not caught:", name)
-            found.append(name)
-    if not found:
-        print("PASS: the probe counts physical devices (%d mutants caught)" % len(mutants))
-    return 1 if found else 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

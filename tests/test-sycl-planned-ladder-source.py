@@ -323,3 +323,11 @@ def test_header_mutants():
         assert renamed != AUTO_UBATCH_H, name
         assert not header_ok(renamed), name
     assert not header_ok(AUTO_UBATCH_H + "\ninline void f(llama_context *) {}\n")
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

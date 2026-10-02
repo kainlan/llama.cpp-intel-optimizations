@@ -368,3 +368,11 @@ def test_the_host_test_is_registered_and_links_ggml_base_only():
     assert z("add_executable(test-context-nonfa-stage tests/test-context-nonfa-stage.cpp context-tenant-measure.cpp)") in c
     assert z("target_link_libraries(test-context-nonfa-stage PRIVATE ggml-base)") in c
     assert z("add_test(NAME sycl-context-nonfa-stage COMMAND test-context-nonfa-stage)") in c
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
