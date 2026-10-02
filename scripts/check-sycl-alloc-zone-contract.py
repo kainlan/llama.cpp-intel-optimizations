@@ -118,7 +118,7 @@ be written a literal false. Write credit is positional and does not follow contr
       the census table is scripts/sycl-alloc-zone-contract/appendix-rows.json (M-DATA when missing).
       (n) the result of each declined-result consumer (DnnlGemmWrapper::gemm, row_gemm, ..., get_scratchpad_mem) is
       consumed, in the library and in the tests that call it: an expression statement, a comma's left operand or a
-      void cast fails (N-VOID); each listed declaration carries [[nodiscard]] (N-NODISCARD). Both may be debt.
+      void cast fails (N-VOID); each listed declaration carries [[nodiscard]] (N-NODISCARD). Neither may be debt.
       (o) each C-term consumer submits on its census row's queue, pinned at the call's argument; an acquire call
       with no row fails (O-NOROW, O-ROW, O-QUEUE).
       Witness 9: each model-shaped *_bytes() function is called by its allocation sites and by the zone sizing
@@ -275,7 +275,7 @@ LEDGER_RE = re.compile(r"(?<![A-Za-z0-9_])M\d{2,}(?![A-Za-z0-9_])|\(\s*[Rr]\d+\s
 
 SHARDS = 8   # the ctest registers this many shards; cmake_witness pins the registration to it
 
-DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h, n and q; only N-VOID and N-NODISCARD may be debt). Shrink-only: a violation not listed "
+DEBT_DOC = ("Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h and q; no clause (i)-(p) finding may be debt). Shrink-only: a violation not listed "
             "fails, and a listed entry that no longer violates fails. Every E-RAW and E-LIBC entry carries a fate (deleted-by-*, "
             "converted-by-*, sanctioned-internal, sanctioned-vendored or pending-disposition) and a cite, so an entry no step will ever "
             "shrink is visible as a mislabelled allowlist entry; the one G-CATCH entry for the CHECK_TRY_ERROR macro carries "
@@ -300,12 +300,11 @@ H_NEVER_EXEMPT = ("H-CASCADE-EXPR", "H-PASS-EXPR", "H-UNCONV-EXPR")
 H_OUTCOME = {"H-CASCADE": "CASCADE", "H-CASCADE-PARAM": "CASCADE", "H-PASS-TRUE": "CASCADE", "H-PASS-FORWARD": "CASCADE",
              "H-UNCONV": "UNCONVERTED"}
 
-# Clauses (i)-(o), witness 9 and the dormancy latch (S2d). Only a declined result that is dropped today (N-*) is debt; the rest
-# are clean on today's tree, so a finding of any other code is an allowlisted node or a fix, never a list entry.
+# Clauses (i)-(o), witness 9 and the dormancy latch (S2d). None is debt: the tree is clean of them (the last debt, the declined
+# results dropped before llama.cpp-23mk S3-4, is gone), so a finding is an allowlisted node or a fix, never a list entry.
 S2D_CODES = ("I-RETRY", "K-INTERIM", "L-CALLER", "L-FREE", "L-GUARD", "J-SOURCE", "J-DISPATCH", "M-SCRATCH", "M-STALE", "M-FLOOR",
              "M-DATA", "N-VOID", "N-NODISCARD", "O-NOROW", "O-ROW", "O-QUEUE", "Z9-SITE", "Z9-SIZING", "P-ROUTE", "P-HOME", "P-FILL",
              "P-LAYER", "P-CHARGE", "X-LATCH")
-S2D_DEBT = ("N-VOID", "N-NODISCARD")
 S2D_NEVER_ALLOW = ("X-LATCH", "P-ROUTE", "P-HOME", "P-FILL", "P-LAYER", "P-CHARGE")
 CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-FORM", "B-TIER", "C-COHORT", "C-SITE", "D-ZONE",
          "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "E-LIBC", "G-CATCH", "DEFER-C") + H_CODES + S2D_CODES
@@ -3740,9 +3739,8 @@ def validate_data(allowlist, debt):
             errs.append("FAIL debt entry %s %s has unknown code" % (d["code"], d["key"]))
         if d["code"] in H_CODES:
             errs.append("FAIL debt entry %s %s: a clause-(h) finding is allowlisted per node or fixed, never debt" % (d["code"], d["key"]))
-        if d["code"] in S2D_CODES and d["code"] not in S2D_DEBT:
-            errs.append("FAIL debt entry %s %s: a finding of this code is allowlisted per node or fixed, never debt (only N-VOID and "
-                        "N-NODISCARD, the declined results dropped today, are)" % (d["code"], d["key"]))
+        if d["code"] in S2D_CODES:
+            errs.append("FAIL debt entry %s %s: a finding of this code is allowlisted per node or fixed, never debt" % (d["code"], d["key"]))
         seen[(d["code"], d["key"])] += 1
         if d["code"] in RAW_CODES and not FATE_RE.match(str(d.get("fate", ""))):
             errs.append("FAIL debt entry %s %s has no valid fate (deleted-by-*, converted-by-*, sanctioned-internal, "
@@ -5388,14 +5386,9 @@ def matrix_cases_s2d1b():
         "bool zzplant_n(ggml_backend_sycl_context & ctx) {\n    sycl::event e = " + CALL + ";\n    e.wait();\n    return true;\n}\n", TN), "PASS"))
     A(Case("33", "a test source's discard is not hidden by the scope exclusion of tests: clause (a)-(h) findings stay out of it", plant(
         body(CALL + ";\n    sycl::malloc_device<char>(1, q);"), TN), "FAIL", "N-VOID", "tests/zz-n.cpp"))
-    A(Case("33", "the one real discard converted to a consumed result, its debt entry dropped (control)", replace_once(
-        "tests/test-onednn-woq.cpp", "        DnnlGemmWrapper::row_gemm(*ctx, batch, out_rows, k, act_dev,",
-        "        sycl::event zz_ev = DnnlGemmWrapper::row_gemm(*ctx, batch, out_rows, k, act_dev,"),
-        "PASS", planted=False, edit_debt=drop_debt("N-VOID", "test-onednn-woq", "row_gemm")))
-    A(Case("33", "the same conversion leaves its debt entry stale", replace_once(
-        "tests/test-onednn-woq.cpp", "        DnnlGemmWrapper::row_gemm(*ctx, batch, out_rows, k, act_dev,",
-        "        sycl::event zz_ev = DnnlGemmWrapper::row_gemm(*ctx, batch, out_rows, k, act_dev,"),
-        "FAIL", "debt", "test-onednn-woq"))
+    A(Case("33", "an N-VOID finding listed as debt is rejected", plant(body(CALL + ";"), TN), "FAIL", "data", "never debt",
+           edit_debt=lambda d: dict(d, violations=d["violations"] + [{
+               "code": "N-VOID", "key": "tests/zz-n.cpp::zzplant_n::discard:DnnlGemmWrapper::row_gemm:00000000#0"}]), planted=False))
     # N-NODISCARD
     A(Case("35", "a listed declaration without [[nodiscard]]", plant("struct DnnlBinaryWrapper {\n    static void binary_broadcast_row(int a);\n};\n"),
            "FAIL", "N-NODISCARD", "DnnlBinaryWrapper::binary_broadcast_row"))
@@ -5860,8 +5853,9 @@ def matrix_cases_s3q():
                planted=False))
     A(Case("s3q-pin", "another G-CATCH entry carrying converted-by-5.4a fails", lambda f: f, "FAIL", "data", "carries a fate",
            edit_debt=catch_debt(lambda e: dict(e, fate="converted-by-5.4a"), is_other_catch), planted=False))
-    A(Case("s3q-pin", "an N-VOID entry carrying a fate fails", lambda f: f, "FAIL", "data", "carries a fate",
-           edit_debt=catch_debt(lambda e: dict(e, fate="deleted-by-step-7"), lambda e: e["code"] == "N-VOID"), planted=False))
+    A(Case("s3q-pin", "an N-NODISCARD finding listed as debt is rejected", lambda f: f, "FAIL", "data", "never debt",
+           edit_debt=lambda d: dict(d, violations=d["violations"] + [{
+               "code": "N-NODISCARD", "key": "gemm.hpp::DnnlGemmWrapper::gemm::nodiscard:gemm#0"}]), planted=False))
     return c
 
 

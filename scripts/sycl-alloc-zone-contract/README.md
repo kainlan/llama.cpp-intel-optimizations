@@ -132,7 +132,7 @@ pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause
   malformed file, or a row without a key the clause reads, is `M-DATA`, never a traceback. The gate's own tables (`M_TABLES`: the floor list with each row's owner ticket, the
   covered-by-peak rows, the unreachable rows) are checked against it, and `ensure_planned_arena_zones` must apply the
   `GGML_SYCL_COMPUTE_ARENA_MB` floor while the floor list is non-empty (and must not once it is empty).
-- (n) `N-VOID` and `N-NODISCARD`, the only S2d codes that may be debt. The names are the declined-result consumers
+- (n) `N-VOID` and `N-NODISCARD`, which may not be debt (no S2d code may). The names are the declined-result consumers
   (`DnnlGemmWrapper::gemm`, `row_gemm`, `woq_gemm_*`, the softmax / eltwise / binary wrappers, `get_scratchpad_mem`,
   `ggml_sycl_mul_mat_batched_sycl`); a class member matches as `Class::name(` anywhere or a bare `name(` inside that class.
   Test sources that spell a listed name are read for this clause only (keys are `tests/...`); clauses (a)-(h) never see them.
