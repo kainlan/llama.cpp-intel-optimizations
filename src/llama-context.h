@@ -693,7 +693,7 @@ private:
 
     // llama.cpp-7gno: the constructor's residency fixpoint, run once by a context that owns plan_caps, before its
     // memory module exists (design 2.7). Throws by name until the backend's tenant-aware residency probe exists.
-    void sched_residency_fixpoint();
+    [[noreturn]] void sched_residency_fixpoint();  // drop [[noreturn]] with the throw, when the probe is wired
 
     bool sched_need_reserve = true;
 

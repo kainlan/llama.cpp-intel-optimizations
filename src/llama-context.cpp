@@ -2259,6 +2259,10 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) {
     sycl_hold_spill_validated_ub = 0;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    // The KV types feed the tuning-cache key, which the hoisted block builds now.
+    GGML_UNUSED(type_k);
+    GGML_UNUSED(type_v);
+
     // llama.cpp-7gno: the decisions below the SYCL backend enumeration (the procs, the cap, the cache lookup and the
     // rung set) were made by the constructor's hoisted block (sycl_auto_ubatch_prepare); an empty prep is the
     // single-reserve exit every one of them used to take here.

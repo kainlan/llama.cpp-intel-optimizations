@@ -195,7 +195,7 @@ static void test_worst_chain() {
     const size_t n_layer = 6;
     stub         s;
     s.n_layer  = n_layer;
-    s.probe_fn = [n_layer](const llama_tenants * t) {
+    s.probe_fn = [](const llama_tenants * t) {
         llama_residency r(n_layer, 0);
         if (t != nullptr) {
             r        = residency_of(*t, n_layer);
