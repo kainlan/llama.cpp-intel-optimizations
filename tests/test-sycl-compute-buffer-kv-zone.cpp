@@ -149,7 +149,7 @@ int main(int, char ** argv) {
     // The counters are per owner: publish an empty hold as a fresh context would, and start an epoch.
     const uint64_t owner = ggml_sycl::unified_cache_mint_planned_scratch_owner();
     ggml_sycl::unified_cache_set_planned_scratch_hold(device, 0, owner);
-    ggml_sycl::unified_cache_begin_planned_hold_epoch(device, owner, 512);
+    ggml_sycl::unified_cache_begin_planned_hold_epoch(device, owner, 512, 0);
 
     printf("zone-full request, flagged:\n");
     {
@@ -187,7 +187,7 @@ int main(int, char ** argv) {
     }
 
     printf("held-back request, flagged:\n");
-    ggml_sycl::unified_cache_begin_planned_hold_epoch(device, owner, 512);
+    ggml_sycl::unified_cache_begin_planned_hold_epoch(device, owner, 512, 0);
     // A hold as large as the whole zone keeps every spill-capable request out of it, however small.
     ggml_sycl::unified_cache_set_planned_scratch_hold(device, runtime_cap, owner);
     {
@@ -208,10 +208,24 @@ int main(int, char ** argv) {
         check(cache->zone_used(vram_zone_id::KV) == kv_before, "freeing returned KV zone_used to where it started");
     }
 
-    printf("held-back request, not flagged (control):\n");
-    ggml_sycl::unified_cache_begin_planned_hold_epoch(device, owner, 512);
+    // kpjw-g7 A: a rung's own compute requests are recorded per rung (the n_ubatch of the epoch they were made in).
     {
-        const size_t kv_before = cache->zone_used(vram_zone_id::KV);
+        zone_hold_rung_request rungs[8] = {};
+        const size_t           n        = ggml_sycl::unified_cache_get_hold_rung_requests(device, owner, rungs, 8);
+        bool                   found    = false;
+        for (size_t i = 0; i < n; ++i) {
+            found = found || (rungs[i].n_ubatch == 512 && rungs[i].bytes >= small);
+        }
+        check(found, "the flagged requests of the epoch are recorded under its n_ubatch (512)");
+    }
+
+    printf("held-back request, not flagged (a state-class buffer: the recurrent state, a LoRA):\n");
+    ggml_sycl::unified_cache_begin_planned_hold_epoch(device, owner, 1024, 0);
+    {
+        zone_hold_rung_request before[8] = {};
+        const size_t           n_before  = ggml_sycl::unified_cache_get_hold_rung_requests(device, owner, before, 8);
+        const size_t kv_before         = cache->zone_used(vram_zone_id::KV);
+        const int    warn_arena_before = g_warn_arena;
         alloc_handle handle;
         const bool   ok = alloc_compute(device, queue, small, /*kv_first=*/false, &handle);
         check(ok && handle.ptr != nullptr, "the unflagged held-back request was served (outside the arena)");
@@ -219,11 +233,17 @@ int main(int, char ** argv) {
         check(cache->zone_used(vram_zone_id::KV) == kv_before, "KV zone_used did not move");
         planned_hold_spill_totals totals;
         ggml_sycl::unified_cache_get_recent_planned_hold_spills(device, owner, &totals);
-        check(totals.raw_count == 1 && totals.raw_bytes >= small,
-              "counted as one raw hold spill of at least the request: the spill the flag exists to avoid");
-        check(totals.arena_count == 0 && totals.zone_full_count == 0,
-              "not counted as an in-arena spill or a zone-full placement");
-        check(g_warn_raw == 1, "warned once, as a spill outside the arena (raw device memory)");
+        check(totals.raw_count == 0 && totals.raw_bytes == 0 && totals.arena_count == 0 && totals.zone_full_count == 0,
+              "a state-class buffer is not a scheduler compute buffer: it feeds no hold-spill counter (it is not the "
+              "hold's doing, and the ledger sees it live)");
+        check(g_warn_raw == 0 && g_warn_arena == warn_arena_before, "and it raises no hold-spill WARN");
+        zone_hold_rung_request after[8] = {};
+        const size_t           n_after  = ggml_sycl::unified_cache_get_hold_rung_requests(device, owner, after, 8);
+        bool                   same     = n_after == n_before;
+        for (size_t i = 0; same && i < n_after; ++i) {
+            same = after[i].n_ubatch == before[i].n_ubatch && after[i].bytes == before[i].bytes;
+        }
+        check(same, "and it leaves the per-rung request records unchanged");
         if (ok) {
             check(unified_free(handle), "unified_free accepted the handle");
         }

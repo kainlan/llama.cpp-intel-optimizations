@@ -884,6 +884,54 @@ def evaluate(backend, common, cache, zone):
         re.search(r"if\s*\(\s*kv_zone_first\s*\)\s*\{\s*if\s*\(\s*runtime_h\.ptr\s*\)\s*\{\s*ggml_sycl_log_compute_buffer_landing\(\s*"
                   r"buft_ctx->device\s*,\s*buft_ctx->name\s*,\s*size\s*,\s*runtime_h\s*\)\s*;\s*\}\s*else\s*\{\s*legacy_landing_pending\s*=\s*true\s*;",
                   backend[backend.find('"backend-buffer-runtime-zone"'):backend.find('"backend-buffer-runtime-zone"') + 2600]) is not None
+
+    # kpjw-g7 unification (P4: one fact, one source). F3 (the transaction-time bound), the ladder's realized check
+    # and the pinned-ub check were three computations over one fact (two predicates, a history-carrying high-water
+    # mark, and a driver free-memory read taken after a release, whose credit lags: 602.7 MB read where 1097 MB was
+    # true). They are ONE function now, over the plan, the rung's own recorded request, the KV room net of what is
+    # pending, and the cache's own ledger of free memory.
+    hold_fit_fn = function_body(backend, r"static bool ggml_sycl_hold_spill_fit\([^)]*\)\s*\{") or ""
+    results["anchor: the one hold-spill fit function exists"] = hold_fit_fn != ""
+    unified_consumers = {"the F3 headroom check": hold_headroom_fn, "the realized check": realized_fn,
+                         "the spill-demand bound": bound_fn}
+    results["F3, the realized check and the demand bound all ask the one fit function"] = \
+        all("ggml_sycl_hold_spill_fit(" in body for body in unified_consumers.values())
+    own_formula = ("zone_hold_spill_bound_fits(", "zone_hold_spill_realized_fits(", "zone_hold_spill_bound(",
+                   "zone_hold_spill_raw_demand(", "zone_hold_spill_largest_ub", "ggml_backend_sycl_get_device_memory(",
+                   "unified_cache_get_runtime_request_hwm(")
+    results["none of the three keeps a formula, a free-memory read or a high-water mark of its own"] = \
+        all(not any(f in body for f in own_formula) for body in unified_consumers.values())
+    results["the fit function composes the zone predicate over the plan, the rung's record, the KV room and the ledger"] = \
+        hold_fit_fn != "" and all(f in hold_fit_fn for f in (
+            "zone_hold_fit(", "zone_hold_fit_largest_ub(", "unified_cache_hold_free_before(",
+            "unified_cache_get_hold_rung_requests(", "unified_cache_planned_dense_scratch_bytes_at(",
+            "kSyclArenaMinExternalHeadroomBytes", "zone_kv_room_for_compute(")) and \
+        "unified_cache_get_runtime_request_hwm(" not in hold_fit_fn
+    free_before_fn = function_body(cache, r"size_t unified_cache_hold_free_before\([^)]*\)\s*\{") or ""
+    results["the free memory is the cache's ledger: a cold reading plus live outside-arena bytes, never a re-read"] = \
+        free_before_fn != "" and all(f in free_before_fn for f in (
+            "unified_cache_raw_device_live_bytes(", "zone_hold_free_cold(", "zone_hold_free_before(")) and \
+        "get_device_memory" not in free_before_fn
+    results["the request mark is per rung and survives a publish (no history-carrying high-water mark)"] = \
+        "request_hwm" not in cache and "rung_requests" in cache and \
+        "rung_requests" not in epoch_fn and "epoch_kv_room" in epoch_fn
+    results["the zone header declares the one fit and the ledger arithmetic, and no second predicate walk"] = \
+        all(f in zone for f in ("zone_hold_fit_inputs", "zone_hold_fit(", "zone_hold_fit_largest_ub(",
+                                "zone_hold_free_cold(", "zone_hold_free_before(")) and \
+        "zone_hold_spill_largest_ub" not in zone
+    # kpjw-g7 A: a scheduler compute buffer is identified positively, by allocation origin. The recurrent-state
+    # buffer (461.3 MB, cache_r_l*/cache_s_l*) was allocated through the same buffer type outside a model load and
+    # was flagged compute by the `!in_model_load` timing discriminator, so it fed the request mark and the spill
+    # counters.
+    kv_first_m = re.search(r"const bool\s+kv_zone_first\s*=\s*([^;]*);", backend)
+    results["a compute buffer is flagged by an explicit scheduler scope, not by the absence of a model load"] = \
+        kv_first_m is not None and "g_sycl_compute_alloc_scope" in kv_first_m.group(1) and \
+        "g_sycl_in_model_load" not in kv_first_m.group(1) and \
+        re.search(r"void ggml_backend_sycl_compute_alloc_scope\(\s*bool\s+\w+\s*\)", backend) is not None and \
+        re.search(r'strcmp\(name,\s*"ggml_backend_sycl_compute_alloc_scope"\)\s*==\s*0\)\s*\{\s*return \(void \*\)\s*ggml_backend_sycl_compute_alloc_scope;', backend) is not None
+    results["only a flagged compute request feeds the request mark and the hold-spill counters"] = \
+        re.search(r"unified_cache_note_runtime_request\(\s*req\.device\s*,\s*alloc_size\s*,[^;]*spill_to_kv_zone_before_raw", unified_alloc_fn) is not None and \
+        re.search(r"if\s*\(\s*req\.intent\.constraints\.spill_to_kv_zone_before_raw\s*\)\s*\{\s*unified_cache_note_planned_hold_spill\([^;]*/\*in_arena=\*/false\s*\)", unified_alloc_fn) is not None
     return results
 
 

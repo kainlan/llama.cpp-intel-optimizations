@@ -1115,6 +1115,106 @@ int main() {
               "a plan that alone leaves the card under the headroom at every rung names no -ub");
     }
 
+    // ---- Case 24 (kpjw-g7 unification, P4: one fact, one source): ONE fit function answers the transaction-time
+    // bound (F3), the ladder's realized check and the pinned -ub check, over the same inputs: the plan at the rung,
+    // the rung's recorded worst-case request, the KV room net of what is pending, and the card's free memory with
+    // the rung's own buffers released. The B50 / Qwen3.6-27B case of g7 (-c 512): plan 75.6 MB, request 495.0 MB at
+    // 512 (990.0 MB at 1024), 100.6 MB of KV-zone room, 1097 MB free once the rung's buffers are gone. -------------
+    {
+        const size_t MiB  = 1024 * 1024;
+        const size_t head = 256 * MiB;
+        auto         plan = [](void *, uint32_t) -> size_t { return 76 * 1024 * 1024; };
+        ggml_sycl::zone_hold_rung_request rungs[] = { { 512, 495 * MiB }, { 1024, 990 * MiB } };
+        ggml_sycl::zone_hold_fit_inputs   in      = {};
+        in.headroom_target                        = head;
+        in.free_before                            = 1097 * MiB;
+        in.kv_room                                = 100 * MiB;
+        in.rungs                                  = rungs;
+        in.n_rungs                                = 2;
+        in.plan_of                                = plan;
+        CHECK(ggml_sycl::zone_hold_fit(in, 512), "512 fits the B50 once its own buffers are released (pinned 512 runs)");
+        CHECK(!ggml_sycl::zone_hold_fit(in, 1024), "1024 does not: 966 MB of demand leaves 131 MB of a 1097 MB card");
+        const uint32_t named = ggml_sycl::zone_hold_fit_largest_ub(in, 1024);
+        CHECK(named == 512, "the -ub a refusal at 1024 prints is 512, the same function's largest accepted rung");
+        CHECK(ggml_sycl::zone_hold_fit(in, named), "the printed N passes F3 under the same inputs");
+        CHECK(!ggml_sycl::zone_hold_fit(in, named * 2), "and N*2 fails");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 512) == 512, "a rung that fits is returned unchanged");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 0) == 0, "an unknown n_ubatch names nothing");
+        // The demand the function judges is the plan plus the rung's request net of the KV room, whatever consumer asks.
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 76 * MiB + 990 * MiB - 100 * MiB,
+              "demand = plan + the rung's own recorded request - KV room");
+        // The refusal is the hold's doing only when the card was above the headroom without it.
+        in.free_before = 200 * MiB;
+        CHECK(ggml_sycl::zone_hold_fit(in, 1024), "short without the demand too: not the hold's doing");
+        // No rung fits: 0, never a made-up -ub.
+        in.free_before = 1097 * MiB;
+        in.kv_room     = 0;
+        ggml_sycl::zone_hold_rung_request big[] = { { 1024, 1200 * MiB } };
+        in.rungs                                = big;
+        in.n_rungs                              = 1;
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) != 1024, "a rung whose own request cannot fit is not named");
+    }
+
+    // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and
+    // THAT rung's measured request, not of which other rungs ran before it or in what order. A rung with its own
+    // record uses it and only it; a rung without one is scaled from the SET of records (order never matters). -----
+    {
+        const size_t MiB  = 1024 * 1024;
+        auto         plan = [](void *, uint32_t) -> size_t { return 76 * 1024 * 1024; };
+        ggml_sycl::zone_hold_fit_inputs in = {};
+        in.headroom_target                 = 256 * MiB;
+        in.free_before                     = 1097 * MiB;
+        in.kv_room                         = 100 * MiB;
+        in.plan_of                         = plan;
+        ggml_sycl::zone_hold_rung_request own[]   = { { 512, 495 * MiB } };
+        ggml_sycl::zone_hold_rung_request other[] = { { 512, 495 * MiB }, { 1024, 990 * MiB }, { 2048, 4000 * MiB } };
+        ggml_sycl::zone_hold_rung_request rev[]   = { { 2048, 4000 * MiB }, { 1024, 990 * MiB }, { 512, 495 * MiB } };
+        in.rungs = own;
+        in.n_rungs = 1;
+        const bool first = ggml_sycl::zone_hold_fit(in, 512);
+        const size_t d1  = ggml_sycl::zone_hold_fit_demand(in, 512);
+        in.rungs = other;
+        in.n_rungs = 3;
+        CHECK(ggml_sycl::zone_hold_fit(in, 512) == first && ggml_sycl::zone_hold_fit_demand(in, 512) == d1,
+              "the same rung twice, with other rungs' history in between, gives the same demand and verdict");
+        in.rungs = rev;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == d1, "the order the records were made in does not matter");
+        // A rung nobody measured is scaled from the set, the same way whatever order the set is in.
+        ggml_sycl::zone_hold_rung_request sparse_a[] = { { 512, 495 * MiB }, { 2048, 1980 * MiB } };
+        ggml_sycl::zone_hold_rung_request sparse_b[] = { { 2048, 1980 * MiB }, { 512, 495 * MiB } };
+        in.rungs = sparse_a;
+        in.n_rungs = 2;
+        const size_t scaled_a = ggml_sycl::zone_hold_fit_demand(in, 1024);
+        in.rungs = sparse_b;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == scaled_a, "an unmeasured rung is scaled order-independently");
+        in.n_rungs = 0;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 0, "with no record the demand is the plan alone, less the room");
+        in.kv_room = 0;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 76 * MiB, "and the plan alone when there is no room (a lower bound)");
+    }
+
+    // ---- Case 26 (kpjw-g7 C, one model of free memory): the card's free memory is the cache's own ledger, never a
+    // driver read taken after a release (credit lags: 602.7 MB read where 1097 MB was true). cold = the driver's
+    // reading plus the outside-arena bytes the cache holds live; free_before = cold less what stays live without the
+    // rung. Releasing the rung's buffers and evaluating gives the answer evaluating before releasing gives, with the
+    // released bytes credited. -----------------------------------------------------------------------------------
+    {
+        const size_t MiB        = 1024 * 1024;
+        const size_t persistent = 461 * MiB;  // the recurrent-state buffer: live before the ladder, and after it
+        const size_t own        = 495 * MiB;  // the rung's raw compute landing
+        const size_t driver_true = 1097 * MiB;
+        // Evaluated live: the driver sees the rung's buffer, the ledger holds it.
+        const size_t cold_live   = ggml_sycl::zone_hold_free_cold(driver_true - own, persistent + own);
+        const size_t before_live = ggml_sycl::zone_hold_free_before(cold_live, persistent);
+        // After the release the ledger is not asked the driver again (its credit has not landed: it would read
+        // 602.7 MB where 1097 MB is true); the baseline taken before stands and the rung's bytes are simply not live.
+        const size_t before_released = ggml_sycl::zone_hold_free_before(cold_live, persistent);
+        CHECK(before_live == driver_true, "evaluated live, the rung's own bytes are credited back: the true free memory");
+        CHECK(before_released == before_live, "release-then-evaluate equals the pre-release fit with released bytes credited");
+        CHECK(ggml_sycl::zone_hold_free_before(100 * MiB, 300 * MiB) == 0, "never below zero");
+        CHECK(ggml_sycl::zone_hold_free_cold(SIZE_MAX, 1) == SIZE_MAX, "saturating");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
