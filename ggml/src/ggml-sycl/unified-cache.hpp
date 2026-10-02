@@ -6675,6 +6675,12 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
 // against. This is the one source for "does an op's pair fit what was planned" (zone_onednn_pp_scratch_planned).
 bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound);
 
+// llama.cpp-8ony: whether the oneDNN PP scratch may supply a dense op's f16 copies for a weight of `type`
+// (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH, and the default type set when it is unset). ONE answer for the op arm,
+// the graph-entry walk and the zone-inventory adapter that sizes the dequant plan for the ops the scratch does not
+// supply; the backend must not keep a copy.
+bool onednn_pp_unified_scratch_enabled(ggml_type type);
+
 struct pp_moe_onednn_scratch_result {
     uint32_t   slot            = std::numeric_limits<uint32_t>::max();
     uint64_t   generation      = 0;

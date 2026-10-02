@@ -27802,6 +27802,18 @@ static_assert(k_zone_mmq_src1_block_elems == QK8_1, "zone-sizing.hpp Q8_1 block 
 static_assert(k_zone_mmq_src1_block_bytes == sizeof(block_q8_1), "zone-sizing.hpp Q8_1 block size drifted");
 static_assert(k_zone_dequant_f16_elem_bytes == sizeof(sycl::half), "zone-sizing.hpp f16 element size drifted");
 
+bool onednn_pp_unified_scratch_enabled(ggml_type type) {
+    static const int mode = []() {
+        const char * env = std::getenv("GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH");
+        if (env) {
+            return std::atoi(env) != 0 ? 1 : 0;
+        }
+        return -1;
+    }();
+    return zone_onednn_pp_scratch_type_enabled(mode,
+                                               type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_MXFP4);
+}
+
 std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vector<placement_tensor_info> & inventory) {
     std::vector<zone_tensor_desc> zone_inventory;
     zone_inventory.reserve(inventory.size());
@@ -27850,6 +27862,24 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
                                                       item.ne[3] > 0 ? item.ne[3] : 1, &src1_bytes)) {
                 desc.dequant_f16_weight_bytes         = weight_bytes;
                 desc.dequant_f16_src1_bytes_per_token = src1_bytes;
+            }
+        }
+        // llama.cpp-8ony: a dense weight of a type the unified kernel's oneDNN f16 route serves (Q4_0, MXFP4) draws
+        // the planned dequant buffers whenever the oneDNN PP scratch does not supply its f16 copies: the scratch is
+        // off for the type, or the weight is one the ONEDNN zone was not sized for (the LM head). Whether it is
+        // one of those is decided by the pure classifier, which alone sees the group cardinality the zone's own
+        // eligibility rule needs; the adapter supplies the sizes and the type/env enablement. Experts are excluded
+        // by the same role function as above.
+        if (item.has_shape() && ggml_sycl_should_use_unified_type(item.type) &&
+            expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
+            size_t weight_bytes = 0;
+            size_t src1_bytes   = 0;
+            if (zone_dequant_f16_weight_bytes(item.ne[0], item.ne[1] > 0 ? item.ne[1] : 1, &weight_bytes) &&
+                zone_dequant_f16_src1_bytes_per_token(item.ne[0], item.ne[2] > 0 ? item.ne[2] : 1,
+                                                      item.ne[3] > 0 ? item.ne[3] : 1, &src1_bytes)) {
+                desc.dequant_f16_if_unsupplied_weight_bytes         = weight_bytes;
+                desc.dequant_f16_if_unsupplied_src1_bytes_per_token = src1_bytes;
+                desc.pp_scratch_type_enabled                        = onednn_pp_unified_scratch_enabled(item.type);
             }
         }
         zone_inventory.push_back(std::move(desc));

@@ -210,7 +210,7 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
     results["anchor: the zone-inventory adapter exists"] = adapter is not None
     if adapter is not None:
         results["the adapter marks the unified-kernel types for the conditional dequant plan"] = \
-            "should_use_unified(" in adapter and "dequant_f16_if_unsupplied_weight_bytes" in adapter and \
+            "ggml_sycl_should_use_unified_type(" in adapter and "dequant_f16_if_unsupplied_weight_bytes" in adapter and \
             "dequant_f16_if_unsupplied_src1_bytes_per_token" in adapter
         results["the adapter hands the classifier the type/env enablement, not its own copy"] = \
             "pp_scratch_type_enabled" in adapter and "onednn_pp_unified_scratch_enabled(" in adapter
@@ -419,7 +419,7 @@ if args.self_test and not failed:
         ("enablement bypasses the pure predicate", "the enablement function asks the pure predicate",
          (backend, mutate_in_func(cache, enabled_sig, "zone_onednn_pp_scratch_type_enabled(", "zone_XXXX("), cache_hpp)),
         ("adapter forgets the unified types", "the adapter marks the unified-kernel types for the conditional dequant plan",
-         (backend, mutate_in_func(cache, adapter_sig, "should_use_unified(", "XXXX("), cache_hpp)),
+         (backend, mutate_in_func(cache, adapter_sig, "ggml_sycl_should_use_unified_type(", "XXXX("), cache_hpp)),
         ("adapter keeps its own enablement", "the adapter hands the classifier the type/env enablement, not its own copy",
          (backend, mutate_in_func(cache, adapter_sig, "onednn_pp_unified_scratch_enabled(", "XXXX("), cache_hpp)),
         ("adapter marks expert stacks", "the adapter excludes expert stacks from the conditional mark too",

@@ -1450,18 +1450,6 @@ struct fp16_weight_cache {
 
 static fp16_weight_cache g_fp16_cache;
 
-static bool onednn_pp_unified_scratch_enabled(ggml_type type) {
-    static const int mode = []() {
-        const char * env = std::getenv("GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH");
-        if (env) {
-            return std::atoi(env) != 0 ? 1 : 0;
-        }
-        return -1;
-    }();
-    return ggml_sycl::zone_onednn_pp_scratch_type_enabled(
-        mode, type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_MXFP4);
-}
-
 struct onednn_pp_scratch_guard {
     int                            device = -1;
     ggml_sycl::onednn_scratch_token token{};
@@ -1508,7 +1496,7 @@ static bool acquire_onednn_pp_scratch(int                       device_id,
                                       sycl::half **             weights_scratch,
                                       sycl::half **             activations_scratch,
                                       onednn_pp_scratch_guard & scratch_guard) {
-    if (!weights_scratch || !activations_scratch || !onednn_pp_unified_scratch_enabled(type)) {
+    if (!weights_scratch || !activations_scratch || !ggml_sycl::onednn_pp_unified_scratch_enabled(type)) {
         return false;
     }
     // An op the plan did not put in the ONEDNN zone is turned away HERE, before the reserve (llama.cpp-8ony): the
@@ -28302,7 +28290,7 @@ static bool ggml_sycl_onednn_pp_scratch_supplies(int                 device,
     }
     size_t     pair_bound   = 0;
     const bool arena_active = ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound);
-    return ggml_sycl::zone_onednn_pp_scratch_supplies(pp_candidate, onednn_pp_unified_scratch_enabled(src0->type),
+    return ggml_sycl::zone_onednn_pp_scratch_supplies(pp_candidate, ggml_sycl::onednn_pp_unified_scratch_enabled(src0->type),
                                                       arena_active, pair_bound, w_elems * elem_bytes,
                                                       a_elems * elem_bytes);
 }

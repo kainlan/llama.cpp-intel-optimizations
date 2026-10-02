@@ -198,9 +198,7 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
 }
 
 bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool pair_eligible) {
-    (void) pp_scratch_type_enabled;
-    (void) pair_eligible;
-    return false;  // RED stub (llama.cpp-8ony)
+    return !(pp_scratch_type_enabled && pair_eligible);
 }
 
 bool zone_mmq_src1_row_bytes(int64_t ne10, size_t * out) {
