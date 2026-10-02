@@ -45,21 +45,45 @@ FUNCTION_SITES = [
 
 
 # What each bit0 site must hand to the gate, whitespace-insensitive: the output it writes (and, for the router,
-# the argsort), the operands it reads, whether each may be in place, and the counts. A different tensor, a
-# dropped operand or `in_place_ok` flipped on the router activation (read by every subgroup) is a wiring bug the
-# host test cannot see.
+# the argsort), the operands it reads, whether each may be in place, and the counts; and the decline itself, as the
+# whole `if (!gate(...)) { return ...; }` statement, so a decline cannot be dead behind `&& false`. A different
+# tensor, a dropped operand or `in_place_ok` flipped on the router activation (read by every subgroup) is a wiring
+# bug the host test cannot see.
 FUNCTION_PINS = {
     "GGML_SYCL_FUSION_SITE_MUL_MAT_ADD": [
         "constggml_sycl_fusion_operandwrites={add,out_ptr,true};",
         "constggml_sycl_fusion_operandreads={addend,addend_ptr,true};",
-        "ggml_sycl_fusion_alias_admit(GGML_SYCL_FUSION_SITE_MUL_MAT_ADD,add->name,&writes,1,&reads,1)",
+        "if(!ggml_sycl_fusion_alias_admit(GGML_SYCL_FUSION_SITE_MUL_MAT_ADD,add->name,&writes,1,&reads,1)){returnfalse;}",
     ],
     "GGML_SYCL_FUSION_SITE_ROUTER": [
         "constggml_sycl_fusion_operandwrites[2]={{add,probs_ptr,true},{sort,sort_ptr,true}};",
         "constggml_sycl_fusion_operandreads[2]={{act,act_ptr,false},{addend,bias_ptr,true}};",
-        "ggml_sycl_fusion_alias_admit(GGML_SYCL_FUSION_SITE_ROUTER,add->name,writes,2,reads,2)",
+        "if(!ggml_sycl_fusion_alias_admit(GGML_SYCL_FUSION_SITE_ROUTER,add->name,writes,2,reads,2)){returnreject(\"alias\");}",
     ],
 }
+
+
+# The three helpers every gate call goes through, whitespace-insensitive. The host test exercises the header's
+# predicate; these live in ggml-sycl.cpp next to the process-global counters, so a wrapper that answered `true`
+# after counting would pass the host test and every call-site pin above. Each must return the account's answer,
+# and the account must answer `true` only for a SAFE verdict.
+WRAPPER_PINS = [
+    (
+        "static bool ggml_sycl_fusion_alias_admit(",
+        ["returnggml_sycl_fusion_alias_account(site,start_name,ggml_sycl_fusion_alias_check(writes,n_writes,reads,n_reads));"],
+    ),
+    (
+        "static bool ggml_sycl_fusion_alias_admit_chain(",
+        [
+            "ggml_sycl_fusion_chain_alias_check(cgraph,node_idx,site,",
+            "returnggml_sycl_fusion_alias_account(site,cgraph&&node_idx>=0&&node_idx<cgraph->n_nodes?cgraph->nodes[node_idx]->name:nullptr,r);",
+        ],
+    ),
+    (
+        "static bool ggml_sycl_fusion_alias_account(",
+        ["if(r.verdict==GGML_SYCL_FUSION_ALIAS_SAFE){returntrue;}", "returnfalse;}"],
+    ),
+]
 
 
 def matching_brace(text: str, open_idx: int) -> int:
@@ -150,12 +174,14 @@ def matching_paren(text: str, open_idx: int) -> int:
     raise AssertionError("unclosed paren")
 
 
-def top_level_split(cond: str) -> tuple[list[str], bool]:
-    """Split a condition at its depth-0 `&&`; the bool says whether a depth-0 `||` is present."""
+def top_level_split(cond: str) -> tuple[list[str], bool, bool]:
+    """Split a condition at its depth-0 `&&`; the bools say whether a depth-0 `||` and a depth-0 `?` are present.
+    An unparenthesised `?:` binds looser than `&&`, so `a ? b : c && gate` makes the gate the false arm only."""
     parts: list[str] = []
     depth = 0
     start = 0
     has_or = False
+    has_ternary = False
     i = 0
     while i < len(cond):
         ch = cond[i]
@@ -170,9 +196,11 @@ def top_level_split(cond: str) -> tuple[list[str], bool]:
         elif depth == 0 and cond.startswith("||", i):
             has_or = True
             i += 1
+        elif depth == 0 and ch == "?":
+            has_ternary = True
         i += 1
     parts.append(cond[start:].strip())
-    return parts, has_or
+    return parts, has_or, has_ternary
 
 
 CONSTANT_CONJUNCTS = {"true", "false", "0", "1", "(true)", "(false)", "(0)", "(1)"}
@@ -200,9 +228,11 @@ def chain_wiring_violations(graph: str, site: str, gate_at: int, launch_at: int)
         return [f"{site}: the gate call is not inside an `if (...)` condition guarding the launch"]
     cond_close = matching_paren(graph, cond_open)
     cond = graph[cond_open + 1:cond_close]
-    conjuncts, has_or = top_level_split(cond)
+    conjuncts, has_or, has_ternary = top_level_split(cond)
     if has_or:
         found.append(f"{site}: the guarding condition contains a top-level `||`, so the gate need not hold")
+    if has_ternary:
+        found.append(f"{site}: the guarding condition contains a top-level `?:`, which can make the gate one arm only")
     if not any(exact.fullmatch(c) for c in conjuncts):
         found.append(
             f"{site}: the gate call is not a bare top-level `&&` conjunct of the guarding condition "
@@ -273,6 +303,16 @@ def gate_violations(source: str) -> list[str]:
         tail = body[gates[0]:gates[0] + 700]
         if "return false;" not in tail and "return reject(" not in tail:
             found.append(f"{site}: no `return false;` follows the gate call, so a decline would still launch")
+
+    for signature, pins in WRAPPER_PINS:
+        body = function(code, signature)
+        if body is None:
+            found.append(f"gate helper: {signature} is missing")
+            continue
+        squashed = re.sub(r"\s+", "", body)
+        for pin in pins:
+            if pin not in squashed:
+                found.append(f"gate helper: {signature} must return the account's answer; expected `{pin}`")
 
     return found
 
@@ -394,6 +434,59 @@ def test_neutralised_chain_gates_are_witnessed() -> None:
             assert any(v.startswith(site + ":") or v.startswith(other[site] + ":") for v in violations), (
                 f"{site}: the `{name}` mutant survived or died for another reason: {violations}"
             )
+
+
+def test_ternary_swallowing_the_gate_is_witnessed() -> None:
+    """`site_on ? true : !skip && ... && GATE` parses as `site_on ? true : (... && GATE)`: when the site is on the
+    fused launch is ungated, yet the gate still looks like a bare conjunct of the tail."""
+    source = SOURCE.read_text()
+    for site, _ in CHAIN_SITES:
+        m = chain_call_regex(site).search(source)
+        assert m is not None
+        cond_open = None
+        for open_m in reversed(list(re.finditer(r"\bif\s*\(", source[:m.start()]))):
+            if matching_paren(strip_comments(source), open_m.end() - 1) > m.start():
+                cond_open = open_m.end()
+                break
+        assert cond_open is not None
+        mutated = source[:cond_open] + "true ? true : " + source[cond_open:]
+        violations = gate_violations(mutated)
+        assert any(v.startswith(site + ":") and "?:" in v for v in violations), (
+            f"{site}: a leading ternary survived or died for another reason: {violations}"
+        )
+
+
+def test_dead_bit0_decline_is_witnessed() -> None:
+    """The decline return exists but can never run: `if (!gate(...) && false) { return ...; }`."""
+    source = SOURCE.read_text()
+    for site, signature, _ in FUNCTION_SITES:
+        body = function(source, signature)
+        assert body is not None
+        pattern = re.compile(r"(if\s*\(\s*!\s*ggml_sycl_fusion_alias_admit\(\s*" + re.escape(site) + r"\b[^;{]*?\))\s*\)\s*\{")
+        mutated_body, n = pattern.subn(lambda mm: mm.group(1) + " && false) {", body, count=1)
+        assert n == 1, f"could not find the {site} decline to kill"
+        violations = gate_violations(source.replace(body, mutated_body, 1))
+        assert any(v.startswith(site + ":") for v in violations), f"a dead {site} decline survived: {violations}"
+
+
+def test_gate_helpers_that_always_admit_are_witnessed() -> None:
+    """A helper that counts the check and then answers `true` hides every decline behind a green host test."""
+    source = SOURCE.read_text()
+    for signature, _ in WRAPPER_PINS:
+        body = function(source, signature)
+        assert body is not None
+        # Answer `true` at the helper's own final return (the lambda inside the chain helper returns a pointer).
+        if signature.endswith("_account("):
+            at = body.rindex("return false;")
+            mutated_body = body[:at] + "return true;" + body[at + len("return false;"):]
+        else:
+            at = body.rindex("return")
+            mutated_body = body[:at] + "(void) 0; return true; (void)" + body[at + len("return"):]
+        assert mutated_body != body
+        violations = gate_violations(source.replace(body, mutated_body, 1))
+        assert any(v.startswith("gate helper:") and signature in v for v in violations), (
+            f"{signature}: a helper that always admits survived: {violations}"
+        )
 
 
 def test_miswired_bit0_operands_are_witnessed() -> None:
