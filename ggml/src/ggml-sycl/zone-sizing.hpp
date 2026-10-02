@@ -284,7 +284,7 @@ void zone_onednn_scratch_reserve_target(bool    arena_active,
                                         size_t * activations_bytes);
 
 // Whether the oneDNN PP scratch is allowed to supply a dense op's f16 copies at all, as a function of the
-// GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH setting and the weight's type (llama.cpp-8ony r1). `env_mode` is the parsed
+// GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH setting and the weight's type (llama.cpp-8ony). `env_mode` is the parsed
 // variable: negative when unset, 0 when it turns the scratch off, positive when it turns it on for every type.
 // `default_type` is the type's default (Q4_0, Q8_0 and MXFP4). Unset, only the default types are supplied; set to
 // 0, none; set non-zero, all. Pure.
@@ -307,13 +307,20 @@ bool zone_onednn_pp_scratch_supplies(bool   pp_candidate,
 // buffers for a node: the router picked the unified kernel, the type is one the unified kernel serves, src1 is
 // plain (contiguous, not transposed or permuted), the node passes the PP admission, and the oneDNN scratch does
 // NOT supply its pair (zone_onednn_pp_scratch_supplies). That is the over-zone LM head or tied embedding of a
-// Q4_0 / MXFP4 model, which took a per-op pool copy of the whole weight that no plan sized (llama.cpp-8ony r1).
+// Q4_0 / MXFP4 model, which took a per-op pool copy of the whole weight that no plan sized (llama.cpp-8ony).
 // Pure.
 bool zone_unified_pp_draws_dequant(bool primary_unified,
                                    bool unified_type,
                                    bool src1_plain,
                                    bool pp_candidate,
                                    bool scratch_supplies);
+
+// Whether the graph-entry walk counts a node toward the planned f16 dequant buffers. Two arms can draw them and they
+// do not share a precision condition: the legacy f16 arm only runs for GGML_PREC_DEFAULT, the unified kernel's
+// oneDNN f16 route has no precision check at all. A walk that filtered every node on precision first would leave
+// an F32-precision node the unified route draws for unsized (growth, or a plan-breach abort where the old pool copy
+// degraded silently). Pure.
+bool zone_walk_f16_node_draws(bool prec_default, bool legacy_route_draws, bool unified_route_draws);
 
 // ---------------------------------------------------------------------------
 // The planned dense scratch as ONE reservation (llama.cpp-kpjw)

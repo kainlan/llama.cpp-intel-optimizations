@@ -760,7 +760,7 @@ int main() {
         ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 1, 1, 2, 2, nullptr, nullptr);
     }
 
-    // ---- Case 14c: the oneDNN scratch supplies an op only when its type is enabled too (llama.cpp-8ony r1) -----
+    // ---- Case 14c: the oneDNN scratch supplies an op only when its type is enabled too (llama.cpp-8ony) -----
     // acquire_onednn_pp_scratch also turns away every type but Q4_0 / Q8_0 / MXFP4 (unless the env var forces it),
     // and every type under GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=0. The graph-entry walk skipped an op on admission
     // plus plan alone, so a Q6_K op (Qwen3.5-9B-UD-Q6_K_XL, Mistral Q4_K_M) was skipped by the walk and refused by
@@ -791,7 +791,7 @@ int main() {
               "a pair that exactly fills the zone is supplied");
     }
 
-    // ---- Case 14d: the unified kernel's oneDNN f16 route draws the planned dequant buffers (llama.cpp-8ony r1) ----
+    // ---- Case 14d: the unified kernel's oneDNN f16 route draws the planned dequant buffers (llama.cpp-8ony) ----
     // A Q4_0 / MXFP4 dense op the unified kernel serves, outside a layer group (an LM head or tied embedding) with
     // a pair over the ONEDNN zone: acquire refuses it, the route fell back to a per-op pool copy of the whole
     // weight, and the walk never counted it (a unified-served node was "not counted").
@@ -808,6 +808,21 @@ int main() {
               "a non-plain src1 skips the unified route's f16 arm");
         CHECK(!ggml_sycl::zone_unified_pp_draws_dequant(true, true, true, false, false),
               "an op that fails the PP admission never takes the f16 arm");
+    }
+
+    // ---- Case 14e: the walk asks the unified route before it filters on precision (llama.cpp-8ony) -----------------
+    // The unified kernel's oneDNN f16 route has no precision check, the legacy f16 arm requires GGML_PREC_DEFAULT.
+    // A Q4_0 / MXFP4 node with GGML_PREC_F32 (a GLM4 attention output) that the scratch does not supply takes the
+    // unified route and draws the planned buffers, so the walk must count it.
+    {
+        CHECK(ggml_sycl::zone_walk_f16_node_draws(true, true, false), "a default-precision legacy node draws");
+        CHECK(ggml_sycl::zone_walk_f16_node_draws(true, false, true), "a default-precision unified node draws");
+        CHECK(!ggml_sycl::zone_walk_f16_node_draws(true, false, false), "a node no route draws for draws nothing");
+        CHECK(!ggml_sycl::zone_walk_f16_node_draws(false, true, false),
+              "a legacy-route node with another precision is not on the legacy f16 arm");
+        CHECK(ggml_sycl::zone_walk_f16_node_draws(false, false, true),
+              "a unified-route node draws whatever its precision: Route A has no precision check");
+        CHECK(ggml_sycl::zone_walk_f16_node_draws(false, true, true), "either arm that draws counts the node");
     }
 
     // ---- Case 14: the planned dense scratch is ONE reservation that follows the runtime n_ubatch (llama.cpp-kpjw) --

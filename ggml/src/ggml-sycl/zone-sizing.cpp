@@ -366,6 +366,11 @@ bool zone_unified_pp_draws_dequant(bool primary_unified,
     return primary_unified && unified_type && src1_plain && pp_candidate && !scratch_supplies;
 }
 
+// RED stub (llama.cpp-8ony): the walk's old shape, every node filtered on precision before any route is asked.
+bool zone_walk_f16_node_draws(bool prec_default, bool legacy_route_draws, bool unified_route_draws) {
+    return prec_default && (legacy_route_draws || unified_route_draws);
+}
+
 bool zone_dense_scratch_total_bytes(size_t   mmq_bytes_per_token,
                                     size_t   f16_weight_bytes,
                                     size_t   f16_src1_bytes_per_token,

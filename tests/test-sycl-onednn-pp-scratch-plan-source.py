@@ -244,6 +244,25 @@ def evaluate(backend, cache, cache_hpp):
             re.search(r"ggml_sycl_dequant_f16_scratch\(\s*ctx\.dequant_f16_src0_scratch", seg) is not None
         results["Route A draws the planned src1 dequant buffer before any pool copy"] = \
             re.search(r"ggml_sycl_dequant_f16_scratch\(\s*ctx\.dequant_f16_src1_scratch", seg) is not None
+
+    # ---- m1: Route A has no precision check, so the walk asks it before filtering on precision ----
+    pre = dq_walk.find("const ggml_tensor * src1 = node->src[1];")
+    post = dq_walk.find("const bool need_src0_f16")
+    results["anchor: the walk's node pre-filter exists"] = 0 <= pre < post
+    if 0 <= pre < post:
+        results["the walk's pre-filter does not drop a node on precision"] = \
+            "op_params[0]" not in dq_walk[pre:post]
+    results["the walk combines the two arms through the pure verdict"] = "zone_walk_f16_node_draws(" in dq_walk
+
+    # ---- m6: the walk asks the router, the admission and the supplies question once per node ----
+    results["the walk asks the PP admission only through the supplies helper"] = \
+        "ggml_sycl_onednn_pp_candidate(" not in dq_walk
+    results["the walk asks the router once per node"] = dq_walk.count(".select(") == 1
+    results["the walk asks the supplies helper once per node"] = dq_walk.count("ggml_sycl_onednn_pp_scratch_supplies(") == 1
+    if route_a is not None:
+        results["the Route A predicate reuses the walk's answers instead of asking again"] = \
+            ".select(" not in route_a and "ggml_sycl_onednn_pp_candidate(" not in route_a and \
+            "ggml_sycl_onednn_pp_scratch_supplies(" not in route_a
     return results
 
 
