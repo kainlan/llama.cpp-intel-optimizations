@@ -65,6 +65,7 @@ import ast
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -676,6 +677,17 @@ def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None, missing_al
 # --- positive controls --------------------------------------------------------------------------------------------
 
 SCRIPT_GATE = "print('ok')\n"
+RUN_AND_RECORD = ["try:", "    fn()", "except AssertionError:", "    failures += 1"]
+RUN_AND_RECORD_IN_IF = ["    " + line for line in RUN_AND_RECORD]
+
+
+def loop_main(iterable, body, tail="sys.exit(1 if failures else 0)"):
+    """A __main__ guard whose globals() loop has this body (a list of lines) and then this tail statement."""
+    lines = ["", 'if __name__ == "__main__":', "    import sys", "", "    failures = 0", "    for name, fn in %s:" % iterable]
+    lines += ["        " + line for line in body] + ["    " + tail, ""]
+    return "\n".join(lines)
+
+
 PYTEST_GATE = "def test_x():\n    assert True\n"
 OWN_MAIN = (
     '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n'
@@ -768,6 +780,34 @@ R3_CASES = [
      '    for name, fn in list(globals().items()):\n        if name.startswith("test_") and callable(fn):\n'
      '            try:\n                fn()\n            except unittest.SkipTest:\n                print("skip")\n'
      '            except AssertionError:\n                failures += 1\n    sys.exit(1 if failures else 0)\n', REG_P_PYTEST, None),
+    # More ways to run fewer tests than the loop appears to: a nested skip, a slice, an early break, a name-shape filter,
+    # a custom loader, and a loop that records failures and then exits 0 anyway.
+    ("r3-loop-nested-if-continue", PYTEST_GATE + loop_main("list(globals().items())", [
+        'if name.startswith("test_"):', "    if len(name) > 0:", "        continue", *RUN_AND_RECORD_IN_IF]),
+     REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-sliced-to-nothing", PYTEST_GATE + loop_main("list(globals().items())[:0]", [
+        'if name.startswith("test_"):', *RUN_AND_RECORD_IN_IF]), REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-breaks-after-the-first-test", PYTEST_GATE + loop_main("list(globals().items())", [
+        'if name.startswith("test_"):', *RUN_AND_RECORD_IN_IF, "    break"]), REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-endswith-narrowing", PYTEST_GATE + loop_main("list(globals().items())", [
+        'if name.startswith("test_") and name.endswith("_never"):', *RUN_AND_RECORD_IN_IF]), REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-records-then-exits-0", PYTEST_GATE + loop_main("list(globals().items())", [
+        'if name.startswith("test_"):', *RUN_AND_RECORD_IN_IF], tail="sys.exit(0)"), REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-unittest-main-test-loader", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(testLoader=object())\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-unittest-main-test-runner", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(testRunner=object())\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-ok-unittest-main-verbosity", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(verbosity=2, failfast=True)\n', REG_P_ADD, None),
+    ("r3-ok-loop-callable-and-isinstance", PYTEST_GATE + loop_main("sorted(globals().items())", [
+        'if name.startswith("test_") and callable(fn) and not isinstance(fn, type):', *RUN_AND_RECORD_IN_IF]), REG_P_PYTEST, None),
+    ("r3-ok-loop-continue-for-non-tests", PYTEST_GATE + loop_main("sorted(globals().items())", [
+        'if not name.startswith("test_") or not callable(fn):', "    continue", *RUN_AND_RECORD]), REG_P_PYTEST, None),
+    # The status a main() returns, dropped where the first version of the check did not look.
+    ("r3-script-main-dropped-under-if", MAIN_FN + '\nif __name__ == "__main__":\n    if len(sys.argv) > 0:\n        main()\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-script-main-dropped-under-try", MAIN_FN + '\nif __name__ == "__main__":\n    try:\n        main()\n    finally:\n        print("done")\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-script-main-dropped-under-with", MAIN_FN + '\nif __name__ == "__main__":\n    with open(__file__) as handle:\n        main()\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-script-main-assigned-and-printed", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    print(rc)\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-script-main-and-zero", MAIN_FN + '\nif __name__ == "__main__":\n    sys.exit(main() and 0)\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-ok-script-main-nested-forwarded", MAIN_FN + '\nif __name__ == "__main__":\n    if len(sys.argv) > 0:\n        sys.exit(main())\n', REG_P_ADD, None),
+    ("r3-ok-script-main-if-rc-exit", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        sys.exit(rc)\n', REG_P_ADD, None),
     ("r3-ok-loop-exits-only-on-failure", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n'
      '    for name, fn in list(globals().items()):\n        if name.startswith("test_") and callable(fn):\n'
      '            try:\n                fn()\n            except AssertionError:\n                failures += 1\n'
@@ -931,6 +971,10 @@ llama_test_pytest(${Python3_EXECUTABLE}
         (tree / "tests" / "CMakeLists.txt").write_text(clean_cmake)
         if not any("R6" in p for p in audit(tree, allowlist={}, missing_allowlist={}, min_gates=MIN_GATES)):
             failures.append("floor-moved: an empty tests/ passed the audit")
+        # The floor tracks the real count: a floor far below it would let many gates vanish silently.
+        real_count = len(list((Path(__file__).resolve().parents[1] / "tests").glob("test-sycl-*.py")))
+        if not (0.9 * real_count <= MIN_GATES <= real_count):
+            failures.append("MIN_GATES is %d but %d gates exist: keep the floor within 10%% below the real count" % (MIN_GATES, real_count))
         # A registration naming a file that is not in tests/ (R5), and the matching allowlist rules.
         tree = base / "missing-file"
         write_tree(tree, clean_gates, clean_cmake + "add_test(NAME g COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-ghost.py)\n")
@@ -1017,6 +1061,24 @@ def census(root, build_dir, absent_allowlist=None):
     return problems
 
 
+def _b(text):
+    return 'add_test([=[b]=] ' + text + ')\n'
+
+
+CENSUS_BAD_ENTRIES = (
+    ("a .pyc", _b('"/usr/bin/python3" "/x/tests/test-sycl-b.pyc"')),
+    ("a .orig backup", _b('"/usr/bin/python3" "/x/tests/test-sycl-b.py.orig"')),
+    ("a longer file name ending in the gate's", _b('"/usr/bin/python3" "/x/tests/old-test-sycl-b.py"')),
+    ("the gate as another script's argument", _b('"/usr/bin/python3" "/x/tests/test-sycl-a.py" "/x/tests/test-sycl-b.py"')),
+    ("echo", _b('"/usr/bin/cmake" "-E" "echo" "/x/tests/test-sycl-b.py"')),
+    ("python -m py_compile", _b('"/usr/bin/python3" "-m" "py_compile" "/x/tests/test-sycl-b.py"')),
+    ("python -c", _b('"/usr/bin/python3" "-c" "pass" "/x/tests/test-sycl-b.py"')),
+    ("a DISABLED test", _b('"/usr/bin/python3" "/x/tests/test-sycl-b.py"') + 'set_tests_properties([=[b]=] PROPERTIES  DISABLED "TRUE")\n'),
+    ("a WILL_FAIL test", _b('"/usr/bin/python3" "/x/tests/test-sycl-b.py"') + 'set_tests_properties([=[b]=] PROPERTIES  WILL_FAIL "TRUE")\n'),
+    ("SKIP_RETURN_CODE 1", _b('"/usr/bin/python3" "/x/tests/test-sycl-b.py"') + 'set_tests_properties([=[b]=] PROPERTIES  SKIP_RETURN_CODE "1")\n'),
+)
+
+
 def census_self_test(base):
     """The census reports an unconfigured registration, a stale allowlist entry and an empty build dir."""
     failures = []
@@ -1040,10 +1102,32 @@ def census_self_test(base):
     empty.mkdir()
     if not any("not a configured build" in p for p in census(tree, empty, {})):
         failures.append("census: an empty build directory passed")
-    # a longer file name that merely ends in the gate's must not count as the gate being configured
-    (build / "tests" / "CTestTestfile.cmake").write_text('add_test([=[a]=] "/usr/bin/python3" "/x/tests/old-test-sycl-a.py")\n')
-    if not any("R7 test-sycl-a.py" in p for p in census(tree, build, {"test-sycl-b.py": "r"})):
-        failures.append("census: old-test-sycl-a.py counted as test-sycl-a.py")
+    # a gate that is only in a nested directory's ctest file is still configured
+    (build / "tests" / "CTestTestfile.cmake").write_text('add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n')
+    nested = build / "ggml" / "src" / "ggml-sycl"
+    nested.mkdir(parents=True)
+    (nested / "CTestTestfile.cmake").write_text('add_test([=[b]=] "/usr/bin/python3" "/x/tests/test-sycl-b.py")\n')
+    if census(tree, build, {}):
+        failures.append("census: a gate present only in a nested ctest file was reported: %s" % census(tree, build, {}))
+    (nested / "CTestTestfile.cmake").unlink()
+    # What the build contains must RUN the gate: each of these names the file without running it, or runs it disabled.
+    for label, text in CENSUS_BAD_ENTRIES:
+        (build / "tests" / "CTestTestfile.cmake").write_text(
+            'add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n' + text)
+        if not any("R7 test-sycl-b.py" in p for p in census(tree, build, {})):
+            failures.append("census: %s counted as the gate being configured" % label)
+    (build / "tests" / "CTestTestfile.cmake").write_text(
+        'add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n'
+        'add_test([=[b]=] "/usr/bin/python3" "-B" "/x/tests/test-sycl-b.py" "--self-test")\n'
+        'set_tests_properties([=[b]=] PROPERTIES  LABELS "x" SKIP_RETURN_CODE "77" TIMEOUT "30")\n')
+    if census(tree, build, {}):
+        failures.append("census: a configured gate with flags, arguments and harmless properties was reported: %s"
+                        % census(tree, build, {}))
+    # main() must act on the census: run the script itself against a build dir that cannot pass.
+    done = subprocess.run([sys.executable, os.path.abspath(__file__), "--census", str(empty)], capture_output=True, text=True,
+                          timeout=120)
+    if done.returncode != 1 or "R7" not in done.stdout:
+        failures.append("census: `--census <empty dir>` exited %d (want 1) with output %r" % (done.returncode, done.stdout[:120]))
     return failures
 
 
