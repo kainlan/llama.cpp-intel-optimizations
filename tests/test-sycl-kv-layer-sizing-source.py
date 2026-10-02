@@ -1863,7 +1863,14 @@ def optional_layout_release_violations(sycl_cpp: str, cache_cpp: str) -> list[st
 
     compute = strip_comments(function(sycl_cpp, GRAPH_COMPUTE_SIGNATURE))
     clear = compute.find('sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");')
-    replay = compute.find("ext_oneapi_graph(")
+    # Every replay goes through ggml_sycl::graph_exec_submit since zhcn C7a (cec4a5f10), which counts and then calls
+    # ext_oneapi_graph; the bare call no longer appears in graph compute, so a search for it alone found nothing
+    # and let the ordering check below pass for any order. Look for either spelling, and refuse to pass when
+    # neither is there, so a further rename cannot make this vacuous again.
+    replays = [m.start() for m in re.finditer(r"graph_exec_submit\(|ext_oneapi_graph\(", compute)]
+    if not replays:
+        found.append("graph compute has no replay submit to order against the drop of recorded graphs")
+    replay = replays[0] if replays else -1
     if clear < 0 or (replay >= 0 and replay < clear):
         found.append("graph compute can replay before dropping graphs recorded before a yield")
 
@@ -1920,6 +1927,27 @@ def test_mutation_yield_keeps_graphs_is_witnessed() -> None:
 def test_mutation_graphs_not_dropped_is_witnessed() -> None:
     _release_sycl_mutation('sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");', "(void) 0;",
                            "replay before dropping graphs", "epoch check dropped")
+
+
+def test_mutation_graphs_dropped_after_the_replay_is_witnessed() -> None:
+    # The order half of the check: the drop is still there but sits after the first replay submit.
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    clear = 'sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");'
+    submit = "ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *(sycl_ctx->exec_graph));"
+    start = cpp.index(GRAPH_COMPUTE_SIGNATURE)
+    head, tail = cpp[:start], cpp[start:]
+    assert clear in tail and submit in tail
+    tail = tail.replace(clear, "(void) 0;", 1).replace(submit, submit + "\n" + clear, 1)
+    _assert_witnessed(cpp, head + tail, lambda c: optional_layout_release_violations(c, cache),
+                      "replay before dropping graphs", "drop moved after the replay")
+
+
+def test_mutation_graph_compute_without_replay_is_not_vacuous() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    start = cpp.index(GRAPH_COMPUTE_SIGNATURE)
+    tail = re.sub(r"ggml_sycl::graph_exec_submit\(|\.ext_oneapi_graph\(|->ext_oneapi_graph\(", "renamed_submit(", cpp[start:])
+    _assert_witnessed(cpp, cpp[:start] + tail, lambda c: optional_layout_release_violations(c, cache),
+                      "no replay submit", "replay spelling renamed away")
 
 
 def test_mutation_free_gated_on_write_event_is_witnessed() -> None:
